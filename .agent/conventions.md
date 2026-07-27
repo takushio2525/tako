@@ -53,6 +53,36 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
   `ui_text::tests_support::check_ja_en` に集約する（並列テストの競合防止）
 
+## リリース配布物の命名規約（Issue #594 / #595）
+
+配布アセットの命名は**リリース側（`scripts/release.sh`）と更新チェック側
+（`tako-app::update_checker`）の両方が同じ規則で判定する**。食い違うと
+「Windows クライアントが macOS の zip を掴む」「自 OS 用アセットが無いのに
+更新ありと通知する」事故になる（#595 の背景）。
+
+```text
+tako-<tag>-<platform>-<arch>.<ext>
+
+tako-v0.5.13-macos-arm64.zip        macOS / Apple Silicon
+tako-v0.6.0-test.1-macos-arm64.zip  テスト版（タグに `-` と `.` を含む）
+tako-v0.6.0-windows-x86_64.exe      Windows インストーラー（#587）
+tako-v0.6.0-windows-x86_64.zip      Windows ポータブル版
+```
+
+- `<platform>` = `macos` / `windows`、`<arch>` = `arm64` / `x86_64`。
+  **別名（`win` / `aarch64` / `amd64`）は使わない・受け付けない**
+  （規則外のファイルを配布物と誤認しないための厳格一致）
+- **判定ロジックの正は `crates/tako-core/src/platform/release_assets.rs` の 1 箇所**。
+  シェル側 `scripts/lib/release-assets.sh` はリリーススクリプト用の写しで、
+  両者の一致は同期テスト（`cargo test -p tako-core release_assets`）が機械検証する。
+  規則を変えるときは **Rust を直してからシェルを合わせる**（片方だけだとテストが落ちる）
+- 新しい配布形式（`.msi` 等）を足すときは `extensions()` に追加する。
+  **追加し忘れると更新チェックがそのアセットを見落とし、利用者に更新が届かない**
+- 更新候補は「最新リリース」ではなく**自分の環境向けアセットを含む最新リリース**。
+  該当アセットが無いリリースは読み飛ばす（#595）。この規則により、
+  macOS 先行リリース + Windows アセット後付けの運用をしても
+  Windows 側に「更新はあるがダウンロードできない」通知が出ない
+
 ## コマンド案内の規約（Issue #322）
 
 ユーザー体験の設計原則。setup に限らず、CLI 出力・system prompt・docs のすべてに適用する。

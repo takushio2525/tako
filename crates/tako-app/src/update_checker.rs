@@ -12,10 +12,19 @@
 //!
 //! レート制限対策（#416）: gh CLI 認証トークンがあれば 5000req/h で API を叩く。
 //! 2 チャンネル判定を /releases 一覧の 1 リクエストに統合。レート制限時はキャッシュ表示。
+//!
+//! プラットフォームフィルタ（#595）: 更新候補は「最新リリース」ではなく
+//! **自分の環境向けアセットを含む最新リリース**。該当アセットが無いリリースは読み飛ばす。
+//! macOS 先行リリース + Windows アセット後付け（#594 の運用）をしても、
+//! Windows 側に「更新はあるがダウンロードできない」通知が出ない。
+//! アセット命名規則の正は `tako_core::platform::release_assets`。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
+
+use tako_core::platform::release_assets::{self, Arch};
+use tako_core::platform::support::Platform;
 
 /// 更新チェック間隔（24 時間）
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -86,6 +95,30 @@ pub struct UpdateInfo {
     #[allow(dead_code)]
     pub html_url: String,
     pub download_url: Option<String>,
+    /// 実際に選ばれた配布物のファイル名（#595）。
+    /// 「自分の環境向けのどれを掴んだか」を CLI / MCP から確認できるようにする
+    pub asset_name: Option<String>,
+}
+
+/// 更新候補を選ぶ基準になる実行環境（#595）。
+///
+/// **`Platform::current()` を直に見ずに引数で受ける**のは、macOS 上から
+/// 「Windows クライアントにはどう見えるか」をテストするため
+/// （`platform::support` と同じ設計方針）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetEnv {
+    pub platform: Platform,
+    /// マトリクス外の CPU では `None` = 自分向けの配布物は存在しない
+    pub arch: Option<Arch>,
+}
+
+impl TargetEnv {
+    pub fn current() -> Self {
+        Self {
+            platform: Platform::current(),
+            arch: Arch::current(),
+        }
+    }
 }
 
 /// 2 チャンネル同時チェック結果
@@ -567,17 +600,66 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
     Ok(result)
 }
 
-/// /releases JSON 配列から ChannelUpdates をパースする（テスト用にも公開）
-fn parse_releases(releases: &[serde_json::Value]) -> ChannelUpdates {
-    let current = ParsedVersion::parse(CURRENT_VERSION);
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        other => other,
-    };
+/// 1 リリースの `assets` から自分の環境向けの配布物を選ぶ（#595）。
+///
+/// 戻り値は `(アセット名, ダウンロード URL)`。**該当が無ければ `None`** =
+/// このリリースは自分にとって「更新候補ではない」。
+fn select_asset(
+    release: &serde_json::Value,
+    platform: Platform,
+    arch: Arch,
+) -> Option<(String, String)> {
+    let assets = release["assets"].as_array()?;
+    let names: Vec<&str> = assets
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect::<Vec<_>>();
+    let chosen = release_assets::select(names.iter().copied(), platform, arch)?;
 
+    // 通常は GitHub が browser_download_url を返す。欠けていても命名規則から
+    // 復元できる（URL の組み立て規則はここ 1 箇所）
+    let url = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(chosen))
+        .and_then(|a| a["browser_download_url"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let tag = release["tag_name"].as_str().unwrap_or_default();
+            format!("https://github.com/{OWNER_REPO}/releases/download/{tag}/{chosen}")
+        });
+
+    Some((chosen.to_string(), url))
+}
+
+/// /releases JSON 配列から ChannelUpdates をパースする（実行環境で判定）
+fn parse_releases(releases: &[serde_json::Value]) -> ChannelUpdates {
+    parse_releases_for(releases, TargetEnv::current(), CURRENT_VERSION)
+}
+
+/// 実行環境と現在バージョンを明示して判定する純関数（#595 のテスト用の入口）。
+///
+/// **リリースは新しい順に並んでいる前提**で、チャンネルごとに
+/// 「現在より新しく、かつ自分の環境向けアセットを持つ」最初のリリースを採る。
+/// アセットが後から追加された（`gh release upload`）場合、その時点で初めて更新として見える。
+fn parse_releases_for(
+    releases: &[serde_json::Value],
+    env: TargetEnv,
+    current_version: &str,
+) -> ChannelUpdates {
+    let current = ParsedVersion::parse(current_version);
     let mut result = ChannelUpdates::default();
 
+    // 配布物が存在しないアーキテクチャでは更新候補を出さない
+    // （出しても掴めるアセットが無く「更新できない更新通知」になる）
+    let Some(arch) = env.arch else {
+        return result;
+    };
+
     for release in releases {
+        if result.stable.is_some() && result.test.is_some() {
+            break;
+        }
+
         let tag = release["tag_name"].as_str().unwrap_or_default();
         let version_str = tag.strip_prefix('v').unwrap_or(tag);
         let Some(ver) = ParsedVersion::parse(version_str) else {
@@ -590,33 +672,38 @@ fn parse_releases(releases: &[serde_json::Value]) -> ChannelUpdates {
             Channel::Stable
         };
 
+        // 既に埋まっているチャンネルは以降のリリースを見る必要がない
+        let slot_filled = match channel {
+            Channel::Stable => result.stable.is_some(),
+            Channel::Test => result.test.is_some(),
+        };
+        if slot_filled {
+            continue;
+        }
+
         if let Some(ref cur) = current {
             if ver <= *cur {
                 continue;
             }
         }
 
-        let html_url = release["html_url"].as_str().unwrap_or_default().to_string();
-        let download_url = format!(
-            "https://github.com/{OWNER_REPO}/releases/download/{tag}/tako-{tag}-macos-{arch}.zip"
-        );
+        // 自分の環境向けアセットが無いリリースは読み飛ばして次を探す（#595 要件 1）
+        let Some((asset_name, download_url)) = select_asset(release, env.platform, arch) else {
+            continue;
+        };
 
+        let html_url = release["html_url"].as_str().unwrap_or_default().to_string();
         let slot = match channel {
             Channel::Stable => &mut result.stable,
             Channel::Test => &mut result.test,
         };
-        if slot.is_none() {
-            *slot = Some(UpdateInfo {
-                version: version_str.to_string(),
-                channel,
-                html_url,
-                download_url: Some(download_url),
-            });
-        }
-
-        if result.stable.is_some() && result.test.is_some() {
-            break;
-        }
+        *slot = Some(UpdateInfo {
+            version: version_str.to_string(),
+            channel,
+            html_url,
+            download_url: Some(download_url),
+            asset_name: Some(asset_name),
+        });
     }
 
     result
@@ -772,11 +859,16 @@ pub fn update_status_json() -> serde_json::Value {
     } else {
         Channel::Stable
     };
+    let env = TargetEnv::current();
     let mut json = serde_json::json!({
         "current_version": CURRENT_VERSION,
         "current_channel": current_channel.label(),
         "install_method": method.label(),
         "duplicate_cli": duplicates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        // 更新候補のフィルタ条件（#595）。「なぜ更新が出ないのか」を診断できるようにする
+        "platform": env.platform.as_str(),
+        "arch": env.arch.map(Arch::as_str),
+        "asset_pattern": env.arch.map(|a| release_assets::asset_name(env.platform, a, "<tag>")),
     });
     if let Some(diag) = diagnose_broken_brew() {
         json["broken_brew"] = serde_json::json!({
@@ -1050,48 +1142,317 @@ mod tests {
 
     // --- #416: parse_releases / gh トークン / キャッシュ ---
 
+    /// リリース 1 件分の fixture。`assets` はアセット名の一覧から組み立てる
+    fn release(tag: &str, prerelease: bool, assets: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "tag_name": tag,
+            "prerelease": prerelease,
+            "html_url": format!("https://github.com/{OWNER_REPO}/releases/tag/{tag}"),
+            "assets": assets.iter().map(|name| serde_json::json!({
+                "name": name,
+                "browser_download_url":
+                    format!("https://github.com/{OWNER_REPO}/releases/download/{tag}/{name}"),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    const MAC: TargetEnv = TargetEnv {
+        platform: Platform::MacOs,
+        arch: Some(Arch::Arm64),
+    };
+    const WIN: TargetEnv = TargetEnv {
+        platform: Platform::Windows,
+        arch: Some(Arch::X86_64),
+    };
+
     #[test]
     fn test_parse_releases_both_channels() {
-        let releases = serde_json::json!([
-            {
-                "tag_name": "v99.0.0",
-                "prerelease": false,
-                "html_url": "https://github.com/takushio2525/tako/releases/tag/v99.0.0"
-            },
-            {
-                "tag_name": "v99.0.1-test.1",
-                "prerelease": true,
-                "html_url": "https://github.com/takushio2525/tako/releases/tag/v99.0.1-test.1"
-            },
-        ]);
-        let arr: Vec<serde_json::Value> = serde_json::from_value(releases).unwrap();
-        let result = parse_releases(&arr);
-        assert!(result.stable.is_some());
+        let arr = vec![
+            release(
+                "v99.0.1-test.1",
+                true,
+                &["tako-v99.0.1-test.1-macos-arm64.zip"],
+            ),
+            release("v99.0.0", false, &["tako-v99.0.0-macos-arm64.zip"]),
+        ];
+        let result = parse_releases_for(&arr, MAC, "0.5.13");
         assert_eq!(result.stable.as_ref().unwrap().version, "99.0.0");
-        assert!(result.test.is_some());
         assert_eq!(result.test.as_ref().unwrap().version, "99.0.1-test.1");
         assert!(result.rate_limit_note.is_none());
+        // 実アセットの URL をそのまま使う（合成 URL ではない）
+        assert_eq!(
+            result.stable.as_ref().unwrap().download_url.as_deref(),
+            Some("https://github.com/takushio2525/tako/releases/download/v99.0.0/tako-v99.0.0-macos-arm64.zip")
+        );
+        assert_eq!(
+            result.stable.as_ref().unwrap().asset_name.as_deref(),
+            Some("tako-v99.0.0-macos-arm64.zip")
+        );
     }
 
     #[test]
     fn test_parse_releases_skips_older() {
-        let releases = serde_json::json!([
-            { "tag_name": "v0.0.1", "prerelease": false, "html_url": "" },
-        ]);
-        let arr: Vec<serde_json::Value> = serde_json::from_value(releases).unwrap();
-        let result = parse_releases(&arr);
+        let arr = vec![release("v0.0.1", false, &["tako-v0.0.1-macos-arm64.zip"])];
+        let result = parse_releases_for(&arr, MAC, "0.5.13");
         assert!(result.stable.is_none());
         assert!(result.test.is_none());
     }
 
     #[test]
     fn test_parse_releases_invalid_tag() {
-        let releases = serde_json::json!([
-            { "tag_name": "nightly", "prerelease": false, "html_url": "" },
-        ]);
-        let arr: Vec<serde_json::Value> = serde_json::from_value(releases).unwrap();
-        let result = parse_releases(&arr);
+        let arr = vec![release("nightly", false, &["tako-nightly-macos-arm64.zip"])];
+        let result = parse_releases_for(&arr, MAC, "0.5.13");
         assert!(result.stable.is_none());
+    }
+
+    // --- #595: プラットフォームフィルタ ---
+
+    /// 受け入れ条件 1: mac のみのリリースを Windows クライアントがスキップする
+    #[test]
+    fn test_windows_skips_mac_only_release() {
+        let arr = vec![release("v0.6.0", false, &["tako-v0.6.0-macos-arm64.zip"])];
+
+        // macOS からは更新として見える
+        assert_eq!(
+            parse_releases_for(&arr, MAC, "0.5.13")
+                .stable
+                .map(|i| i.version),
+            Some("0.6.0".into())
+        );
+        // Windows からは「自分向けの配布物が無い」ので更新候補にならない
+        assert!(parse_releases_for(&arr, WIN, "0.5.13").stable.is_none());
+    }
+
+    /// 受け入れ条件 1: 両 OS 対応リリースは双方が更新候補にする
+    #[test]
+    fn test_both_platforms_release_visible_to_both() {
+        let arr = vec![release(
+            "v0.6.0",
+            false,
+            &[
+                "tako-v0.6.0-macos-arm64.zip",
+                "tako-v0.6.0-windows-x86_64.exe",
+            ],
+        )];
+        let mac = parse_releases_for(&arr, MAC, "0.5.13").stable.unwrap();
+        let win = parse_releases_for(&arr, WIN, "0.5.13").stable.unwrap();
+        assert_eq!(mac.version, "0.6.0");
+        assert_eq!(win.version, "0.6.0");
+        // 掴むアセットが OS ごとに正しく分かれている（相互に取り違えない）
+        assert_eq!(
+            mac.asset_name.as_deref(),
+            Some("tako-v0.6.0-macos-arm64.zip")
+        );
+        assert_eq!(
+            win.asset_name.as_deref(),
+            Some("tako-v0.6.0-windows-x86_64.exe")
+        );
+    }
+
+    /// 受け入れ条件 1: アセット後付け（`gh release upload`）で初めて更新として見える
+    #[test]
+    fn test_windows_asset_added_later_becomes_visible() {
+        let before = vec![release("v0.6.0", false, &["tako-v0.6.0-macos-arm64.zip"])];
+        assert!(parse_releases_for(&before, WIN, "0.5.13").stable.is_none());
+
+        // 同じタグに Windows アセットを追加した後
+        let after = vec![release(
+            "v0.6.0",
+            false,
+            &[
+                "tako-v0.6.0-macos-arm64.zip",
+                "tako-v0.6.0-windows-x86_64.exe",
+            ],
+        )];
+        assert_eq!(
+            parse_releases_for(&after, WIN, "0.5.13")
+                .stable
+                .map(|i| i.version),
+            Some("0.6.0".into())
+        );
+        // macOS 側の見え方は前後で変わらない（後付けが既存ユーザーに影響しない）
+        assert_eq!(
+            parse_releases_for(&before, MAC, "0.5.13")
+                .stable
+                .map(|i| i.version),
+            parse_releases_for(&after, MAC, "0.5.13")
+                .stable
+                .map(|i| i.version),
+        );
+    }
+
+    /// エッジケース: 最新リリースに自 OS アセットが無く、一つ前にはある
+    #[test]
+    fn test_falls_back_to_older_release_with_matching_asset() {
+        let arr = vec![
+            release("v0.6.2", false, &["tako-v0.6.2-macos-arm64.zip"]),
+            release("v0.6.1", false, &["tako-v0.6.1-macos-arm64.zip"]),
+            release(
+                "v0.6.0",
+                false,
+                &[
+                    "tako-v0.6.0-macos-arm64.zip",
+                    "tako-v0.6.0-windows-x86_64.exe",
+                ],
+            ),
+        ];
+        // macOS は最新の 0.6.2
+        assert_eq!(
+            parse_releases_for(&arr, MAC, "0.5.13")
+                .stable
+                .map(|i| i.version),
+            Some("0.6.2".into())
+        );
+        // Windows は 2 つ読み飛ばして 0.6.0 に落ちる（更新できないバージョンを掴まない）
+        let win = parse_releases_for(&arr, WIN, "0.5.13").stable.unwrap();
+        assert_eq!(win.version, "0.6.0");
+        assert_eq!(
+            win.asset_name.as_deref(),
+            Some("tako-v0.6.0-windows-x86_64.exe")
+        );
+    }
+
+    /// エッジケース: 命名規則外のアセットが混ざっていても掴まない
+    #[test]
+    fn test_irregular_asset_names_are_not_matched() {
+        let arr = vec![release(
+            "v0.6.0",
+            false,
+            &[
+                "checksums.txt",
+                "tako.zip",
+                "tako-v0.6.0-macos.zip",        // arch 欠落
+                "tako-v0.6.0-linux-x86_64.zip", // 対象外 OS
+                "SOURCE.tar.gz",
+            ],
+        )];
+        assert!(parse_releases_for(&arr, MAC, "0.5.13").stable.is_none());
+        assert!(parse_releases_for(&arr, WIN, "0.5.13").stable.is_none());
+
+        // 規則に沿ったものが 1 つでもあれば掴む
+        let arr = vec![release(
+            "v0.6.0",
+            false,
+            &["checksums.txt", "tako-v0.6.0-macos-arm64.zip"],
+        )];
+        assert_eq!(
+            parse_releases_for(&arr, MAC, "0.5.13")
+                .stable
+                .map(|i| i.version),
+            Some("0.6.0".into())
+        );
+    }
+
+    /// 受け入れ条件 3: チャンネル制（#403）との組み合わせ。
+    /// Windows アセットが test 版だけに付いている状況で、stable / test が独立に解決される
+    #[test]
+    fn test_platform_filter_combines_with_channels() {
+        let arr = vec![
+            release(
+                "v0.7.0-test.1",
+                true,
+                &[
+                    "tako-v0.7.0-test.1-macos-arm64.zip",
+                    "tako-v0.7.0-test.1-windows-x86_64.exe",
+                ],
+            ),
+            release("v0.6.0", false, &["tako-v0.6.0-macos-arm64.zip"]),
+            release(
+                "v0.5.14",
+                false,
+                &[
+                    "tako-v0.5.14-macos-arm64.zip",
+                    "tako-v0.5.14-windows-x86_64.exe",
+                ],
+            ),
+        ];
+        // macOS: 素直に最新同士
+        let mac = parse_releases_for(&arr, MAC, "0.5.13");
+        assert_eq!(mac.stable.map(|i| i.version), Some("0.6.0".into()));
+        assert_eq!(mac.test.map(|i| i.version), Some("0.7.0-test.1".into()));
+
+        // Windows: test は 0.7.0-test.1、stable は 0.6.0 を飛ばして 0.5.14
+        let win = parse_releases_for(&arr, WIN, "0.5.13");
+        assert_eq!(win.stable.map(|i| i.version), Some("0.5.14".into()));
+        assert_eq!(win.test.map(|i| i.version), Some("0.7.0-test.1".into()));
+    }
+
+    /// 受け入れ条件 2: 現行リリース群（macOS zip のみ）に対する macOS の判定が不変。
+    /// 実際に配布済みのアセット名・prerelease フラグをそのまま fixture にしている
+    #[test]
+    fn test_macos_judgement_unchanged_on_current_releases() {
+        let shipped: Vec<serde_json::Value> = [
+            ("v0.5.13", true),
+            ("v0.5.12", true),
+            ("v0.5.11", true),
+            ("v0.5.10", true),
+            ("v0.5.9", false),
+            ("v0.5.8", false),
+            ("v0.5.7", false),
+        ]
+        .iter()
+        .map(|(tag, pre)| release(tag, *pre, &[&format!("tako-{tag}-macos-arm64.zip")]))
+        .collect();
+
+        // v0.5.7 利用者から見た判定（修正前と同じ: stable=0.5.9 / test=0.5.13）
+        let r = parse_releases_for(&shipped, MAC, "0.5.7");
+        assert_eq!(
+            r.stable.as_ref().map(|i| i.version.clone()),
+            Some("0.5.9".into())
+        );
+        assert_eq!(
+            r.test.as_ref().map(|i| i.version.clone()),
+            Some("0.5.13".into())
+        );
+        assert_eq!(
+            r.stable.as_ref().unwrap().download_url.as_deref(),
+            Some("https://github.com/takushio2525/tako/releases/download/v0.5.9/tako-v0.5.9-macos-arm64.zip")
+        );
+
+        // 最新利用者には更新なし
+        let r = parse_releases_for(&shipped, MAC, "0.5.13");
+        assert!(r.stable.is_none() && r.test.is_none());
+
+        // 現行リリース群には Windows 版が無い = Windows には何も出さない（#595 の主眼）
+        let r = parse_releases_for(&shipped, WIN, "0.5.7");
+        assert!(r.stable.is_none() && r.test.is_none());
+    }
+
+    /// 対応する配布物が存在しないアーキテクチャでは更新候補を出さない
+    #[test]
+    fn test_unknown_arch_yields_no_update() {
+        let arr = vec![release("v0.6.0", false, &["tako-v0.6.0-macos-arm64.zip"])];
+        let env = TargetEnv {
+            platform: Platform::MacOs,
+            arch: None,
+        };
+        let r = parse_releases_for(&arr, env, "0.5.13");
+        assert!(r.stable.is_none() && r.test.is_none());
+    }
+
+    /// browser_download_url が欠けていても命名規則から URL を復元する
+    #[test]
+    fn test_download_url_recovered_when_missing() {
+        let arr = vec![serde_json::json!({
+            "tag_name": "v0.6.0",
+            "prerelease": false,
+            "html_url": "",
+            "assets": [{ "name": "tako-v0.6.0-macos-arm64.zip" }],
+        })];
+        let r = parse_releases_for(&arr, MAC, "0.5.13");
+        assert_eq!(
+            r.stable.unwrap().download_url.as_deref(),
+            Some("https://github.com/takushio2525/tako/releases/download/v0.6.0/tako-v0.6.0-macos-arm64.zip")
+        );
+    }
+
+    /// assets キーが無い（旧形式・取得漏れ）リリースは更新候補にしない
+    #[test]
+    fn test_release_without_assets_is_skipped() {
+        let arr = vec![serde_json::json!({
+            "tag_name": "v0.6.0", "prerelease": false, "html_url": "",
+        })];
+        assert!(parse_releases_for(&arr, MAC, "0.5.13").stable.is_none());
     }
 
     #[test]
