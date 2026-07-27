@@ -1,5 +1,6 @@
 tako_agents_sync_rules
 tako_auto_rename
+tako_autosuggest
 tako_background_kill
 tako_background_list
 tako_background_pane

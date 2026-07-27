@@ -658,6 +658,22 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_autosuggest",
+            "description": "tako 内の zsh に出す入力予測（履歴ベースのゴーストテキスト）の ON/OFF を\
+                切り替える（enabled 省略時は現在状態の取得のみ）。既定 ON。設定は永続化され、\
+                稼働中のペインにも次のプロンプトから反映される。予測は右矢印キーで確定する。\
+                同梱している zsh-autosuggestions を tako が起動したシェルにだけ読み込ませる方式なので、\
+                tako の外の zsh とユーザーの ~/.zshrc には一切影響しない。\
+                ユーザーが自前で zsh-autosuggestions を導入しているペインでは二重注入を避けて何もしない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = 予測を出す（既定）、false = 出さない（省略時は状態取得）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_auto_rename",
             "description": "タブ・ペイン名の AI 自動リネームの ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
@@ -3309,6 +3325,9 @@ fn build_request(
         "tako_port_detect" => Request::PortDetect {
             enabled: bool_arg(args, "enabled")?,
         },
+        "tako_autosuggest" => Request::Autosuggest {
+            enabled: bool_arg(args, "enabled")?,
+        },
         "tako_persist" => Request::Persist {
             enabled: bool_arg(args, "enabled")?,
         },
@@ -4667,6 +4686,25 @@ mod tests {
         );
     }
 
+    /// #600: 入力予測の ON/OFF が MCP から 1:1 で操作できる
+    #[test]
+    fn autosuggestは状態取得と切替をrequestへ写す() {
+        let (_, requests) = run(call("tako_autosuggest", json!({})), None, true);
+        assert_eq!(requests, vec![Request::Autosuggest { enabled: None }]);
+
+        let (_, requests) = run(
+            call("tako_autosuggest", json!({ "enabled": false })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Autosuggest {
+                enabled: Some(false)
+            }]
+        );
+    }
+
     #[test]
     fn preview_cacheは状態取得と上限変更をrequestへ写す() {
         let (_, requests) = run(call("tako_preview_cache", json!({})), None, true);
@@ -4687,7 +4725,7 @@ mod tests {
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）。
         // #549 の tako_welcome と #552 の tako_pin_tab_title が別 PR で同時に
         // 125 → 126 へ更新したため、両方 merge 後の main では 127 とずれていた
-        assert_eq!(tools.len(), 127);
+        assert_eq!(tools.len(), 128);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

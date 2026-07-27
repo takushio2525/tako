@@ -1454,6 +1454,23 @@ fn dispatch_inner(
             Ok(json!({ "enabled": host.port_detect_enabled() }))
         }
 
+        Request::Autosuggest { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_autosuggest(enabled);
+            }
+            let enabled = host.autosuggest_enabled();
+            Ok(json!({
+                "enabled": enabled,
+                // 何が同梱されているか / どのシェルに効くかを AI にも見せる
+                "shell": "zsh",
+                "provider": "zsh-autosuggestions",
+                "version": tako_core::shell_integration::AUTOSUGGEST_VERSION,
+                "applies_to": "既存ペインを含む tako 内の zsh（次のプロンプトから反映）",
+                "note": "ユーザーが自前で zsh-autosuggestions を導入しているペインでは \
+                    tako は注入せず、この設定も効かない（二重注入ガード）",
+            }))
+        }
+
         Request::ConfirmClose { enabled } => {
             if let Some(val) = enabled {
                 host.set_confirm_close(val);
@@ -7883,6 +7900,8 @@ mod tests {
         backend_sessions: std::collections::HashMap<u64, String>,
         /// #549: ウェルカムバナーの表示状態
         welcome_banner: bool,
+        /// #600: 入力予測（既定 ON）
+        autosuggest: bool,
     }
 
     impl MockHost {
@@ -7913,6 +7932,7 @@ mod tests {
                 },
                 backend_sessions: std::collections::HashMap::new(),
                 welcome_banner: false,
+                autosuggest: true,
             }
         }
 
@@ -8025,6 +8045,12 @@ mod tests {
         }
         fn set_limit_service(&mut self, service: tako_core::LimitService) {
             self.limit_service = service;
+        }
+        fn autosuggest_enabled(&self) -> bool {
+            self.autosuggest
+        }
+        fn set_autosuggest(&mut self, enabled: bool) {
+            self.autosuggest = enabled;
         }
     }
 
@@ -9587,6 +9613,48 @@ mod tests {
         .unwrap();
         assert_eq!(changed["enabled"], false);
         assert!(!host.preview_reload.enabled());
+    }
+
+    /// #600: 入力予測は既定 ON で、取得と切替が往復する
+    #[test]
+    fn autosuggestは状態を取得変更できる() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::Autosuggest { enabled: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["enabled"], true, "既定 ON");
+        // 何が効くのかを AI が判断できる情報を必ず返す
+        assert_eq!(initial["shell"], "zsh");
+        assert_eq!(initial["provider"], "zsh-autosuggestions");
+        assert_eq!(
+            initial["version"],
+            tako_core::shell_integration::AUTOSUGGEST_VERSION
+        );
+
+        let off = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: Some(false),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(off["enabled"], false);
+        assert!(!host.autosuggest);
+
+        let on = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: Some(true),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(on["enabled"], true);
+        assert!(host.autosuggest);
     }
 
     #[test]

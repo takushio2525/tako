@@ -1182,6 +1182,7 @@ impl SettingsWindow {
 
         let auto_rename = s.auto_rename;
         let port_detect = s.port_detect;
+        let autosuggest = s.autosuggest;
         let persist = s.tmux_persist;
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
@@ -1237,6 +1238,23 @@ impl SettingsWindow {
                         this.run(
                             Request::PortDetect {
                                 enabled: Some(!port_detect),
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // 入力予測（Issue #600）
+            .child(self.row(
+                txt::label_autosuggest(),
+                txt::desc_autosuggest(),
+                self.toggle(
+                    "autosuggest",
+                    autosuggest,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::Autosuggest {
+                                enabled: Some(!autosuggest),
                             },
                             cx,
                         );

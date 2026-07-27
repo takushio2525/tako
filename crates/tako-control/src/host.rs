@@ -154,6 +154,12 @@ pub trait UiStateHost {
     }
     /// listen ポート検知の ON/OFF 切替（永続化・検知済み情報の掃除は実装側の責務）
     fn set_port_detect(&mut self, _enabled: bool) {}
+    /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600）の現在状態
+    fn autosuggest_enabled(&self) -> bool {
+        true
+    }
+    /// 入力予測の ON/OFF 切替（永続化とシェル側の状態ファイル反映は実装側の責務）
+    fn set_autosuggest(&mut self, _enabled: bool) {}
     /// × ボタン close の確認ダイアログの現在状態（Issue #172）
     fn confirm_close_enabled(&self) -> bool {
         true

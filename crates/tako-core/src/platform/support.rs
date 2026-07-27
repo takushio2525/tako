@@ -151,6 +151,10 @@ pub mod notes {
     );
 
     /// 概念自体が存在しないもの
+    pub const WIN_NO_PSREADLINE_NEEDED: Note = Note::new(
+        "Windows の PowerShell は PSReadLine の予測入力を標準搭載しているため、tako 側の注入は要らない",
+        "Windows PowerShell ships PSReadLine predictive input, so tako does not need to inject anything",
+    );
     pub const WIN_NO_TCC: Note = Note::new(
         "Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い",
         "Windows has no equivalent of the macOS TCC (Full Disk Access) mechanism",
@@ -305,6 +309,14 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Pending {
             note: notes::WIN_TERMINAL,
             issue: 517,
+        },
+    },
+    Feature {
+        // #600: tako 内 zsh の入力予測（zsh-autosuggestions をシェル統合経路で注入）
+        key: "tako_autosuggest",
+        macos: Support::Supported,
+        windows: Support::Unsupported {
+            note: notes::WIN_NO_PSREADLINE_NEEDED,
         },
     },
     Feature {

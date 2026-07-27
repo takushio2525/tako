@@ -455,7 +455,19 @@ tako portdetect off
 # タブ・ペイン名の AI 自動リネームの ON/OFF
 tako autorename on
 tako autorename off
+
+# 入力予測（tako 内 zsh でコマンド履歴から続きを薄く表示。右矢印キーで確定）
+tako autosuggest        # 現在状態を表示（既定 ON）
+tako autosuggest off
+tako autosuggest on
 ```
+
+:::note[入力予測は tako の中だけ]
+`tako autosuggest` が有効にするのは **tako が起動した zsh だけ**です。
+`~/.zshrc` は書き換えないので、tako の外のターミナルの挙動は変わりません。
+すでに自分で zsh-autosuggestions を導入している場合、tako は二重に読み込まず
+何もしません（あなたの設定がそのまま使われます）。
+:::
 
 ## リモートアクセス
 
