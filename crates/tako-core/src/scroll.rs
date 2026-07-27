@@ -312,28 +312,28 @@ mod tests {
             socket: socket.clone(),
             session: "tako-e2e-scr0".into(),
         };
-        // alt-screen 切替（\033[?1049h）の完了を待つ。
-        // 切替前は history > 0（通常画面のシェル履歴）だが、
-        // alt-screen に入ると history == 0 になる
-        let mut state = None;
-        for _ in 0..100 {
-            state = scroll_state(&target);
-            if state.is_some_and(|s| s.history == 0) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            state.is_some_and(|s| s.history == 0),
-            "alt-screen 切替が完了しない: {state:?}"
+        // alt-screen 切替（\033[?1049h）の完了を tmux 自身の alternate_on で待つ。
+        // history == 0 を証跡にしてはいけない（非対話シェルのペインは spawn 直後から
+        // 履歴ゼロなので待ちにならない。詳細は wait_alt_screen のコメント = #625）
+        let alt = crate::tmux_backend::wait_alt_screen(&socket, "tako-e2e-scr0");
+        assert_eq!(
+            alt,
+            Some(true),
+            "alt-screen 切替が完了しない。画面: {:?}",
+            session.visible_lines().join("\n")
         );
+        // alt screen のペインは遡るものが無い（これが本テストの前提条件）
+        let state = scroll_state(&target).expect("状態が取れる");
+        assert_eq!(state.history, 0, "alt screen のペインは履歴ゼロ: {state:?}");
         let after = scroll_by(&target, 5).expect("状態が取れる");
         assert!(!after.in_mode, "履歴ゼロなのに copy-mode に入った");
-        // 念のため: その後のキー入力が普通に届く
+        // 念のため: その後のキー入力が普通に届く（alt screen へ切り替わり済みなので
+        // この入力を消去するものはもう無い）
         session.write(b"ok".to_vec());
         assert!(
             wait_until(&session, |lines| lines.iter().any(|l| l.contains("ok"))),
-            "キー入力が届かない"
+            "キー入力が届かない。画面: {:?}",
+            session.visible_lines().join("\n")
         );
     }
 
