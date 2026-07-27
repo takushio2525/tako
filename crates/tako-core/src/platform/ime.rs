@@ -310,10 +310,12 @@ pub fn is_associated(window_handle: Option<isize>) -> Option<bool> {
     assoc_imp::is_associated(handle)
 }
 
-/// IME を既定の入力コンテキストへ結合し直す。結合できたら `true`。
+/// IME を既定の入力コンテキストへ結合し直す。結合できたら `true`。macOS では何もしない。
 ///
-/// 既に結合済みのウィンドウへ呼んでも副作用は無い（IMM32 が既定コンテキストを
-/// 割り当て直すだけで、変換中の文字列には触らない）。macOS では何もしない
+/// **[`is_associated`] が `Some(false)` を返したときだけ呼ぶこと。**
+/// 切り離された状態では変換中の文字列は存在しないので、結合し直しても失うものが無い。
+/// 結合済みのウィンドウへ呼んだ場合に変換中の文字列がどうなるかは保証しない
+/// （[`guard_action`] はその条件を満たしたときだけ `reassociate` を立てる）
 pub fn reassociate(window_handle: Option<isize>) -> bool {
     let Some(handle) = window_handle else {
         return false;
