@@ -24278,6 +24278,10 @@ mod app_menu_tests {
         );
     }
 
+    /// macOS 慣習のショートカット（#485）。#602 で **macOS 限定**に変えたため、
+    /// 非 macOS では「存在しないこと」を逆向きに固定する（Win+Alt+H が届くと
+    /// `HideOthers` → `gpui_windows::hide_other_apps` = `unimplemented!()` で
+    /// アプリごと abort する。詳細は `keybindings::macos_only_bindings`）
     #[test]
     fn macos慣習のショートカットがバインドされている() {
         let bindings = key_bindings();
@@ -24286,10 +24290,12 @@ mod app_menu_tests {
             ("tako::HideOthers", "h", true),
             ("tako::MinimizeWindow", "m", false),
         ] {
-            let b = bindings
-                .iter()
-                .find(|b| b.action().name() == action)
-                .unwrap_or_else(|| panic!("{action} のバインドが無い"));
+            let found = bindings.iter().find(|b| b.action().name() == action);
+            if !cfg!(target_os = "macos") {
+                assert!(found.is_none(), "{action} が非 macOS に残っている (#602)");
+                continue;
+            }
+            let b = found.unwrap_or_else(|| panic!("{action} のバインドが無い"));
             let ks = b.keystrokes()[0].inner();
             assert_eq!(ks.key, key, "{action}");
             assert!(ks.modifiers.platform, "{action} は cmd 修飾");

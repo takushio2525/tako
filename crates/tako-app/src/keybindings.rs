@@ -109,15 +109,40 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-z", UndoPreview, None),
         KeyBinding::new("cmd-shift-z", RedoPreview, None),
         KeyBinding::new("cmd-f", FindPreview, None),
-        // macOS 慣習のショートカット（#485。cmd 付きの未バインドキーはシェルへ流れない
-        // ＝ ターミナル入力を奪わない。handle_key の platform 修飾ガードを参照）
+        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+    ];
+    bindings.extend(macos_only_bindings());
+    bindings.extend(platform_bindings());
+    bindings
+}
+
+/// macOS 固有の概念に張るバインド（#485）。**macOS でのみ張る**（#602）
+///
+/// `cmd-` は GPUI では platform 修飾で、Windows では Win キーへ解決される。
+/// Win+H（音声入力）・Win+M（最小化）は OS が奪うが、**Win+Alt+H は Windows の
+/// 予約ショートカット一覧に無い**（Win+Alt+ は Game Bar の B / G / R / PrtScn 等が
+/// 中心）。アプリまで届いた場合、`HideOthers` → `gpui_windows` の `hide_other_apps`
+/// が `unimplemented!()` のため **panic ＝ アプリごと abort し、器の無いペインは
+/// 全滅する**。実キーで届くかは未実測だが、届いたときの被害が全損なので経路ごと塞ぐ
+/// （`unhide_other_apps` も同じ地雷。ただし `ShowAllApps` はバインドが無く、
+/// Windows にはメニューバーも無いので到達経路が無い）。
+///
+/// 「アプリを隠す」「他を隠す」「最小化」はいずれも macOS の概念で、Windows 版に
+/// 対応するアクションが無い（最小化は #584 のウィンドウコントロールと Win+Down が担う）。
+/// ハンドラ側で防ぐのではなく**バインドを張らない**ことで経路ごと塞ぐ
+#[cfg(target_os = "macos")]
+fn macos_only_bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("cmd-h", HideApp, None),
         KeyBinding::new("cmd-alt-h", HideOthers, None),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
-        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-    ];
-    bindings.extend(platform_bindings());
-    bindings
+    ]
+}
+
+/// macOS 以外では張らない（[`macos_only_bindings`] の doc を参照）
+#[cfg(not(target_os = "macos"))]
+fn macos_only_bindings() -> Vec<KeyBinding> {
+    Vec::new()
 }
 
 /// macOS 以外（Windows / Linux）向けの追加バインド（#467 / #585）
@@ -146,8 +171,22 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 ///   よって `ctrl-shift-]` のようなバインドは**一致しない**（配列依存でもある）。
 ///   拡大は正規化後の字面 `ctrl-+` で書く
 ///
-/// 慣習の出典は Windows Terminal / VS Code / kitty / ブラウザ。見送り分
-/// （Quit・最小化・アプリを隠す）とキー 1 本ごとの根拠は #585 の対応表。
+/// ## ペイン分割に **Ctrl+D 単独を使わない**理由（#602。ユーザーからの名指し要望）
+///
+/// macOS の Cmd+D をそのまま読み替えると Ctrl+D になるが、Ctrl+D は
+/// **C0 制御コード 0x04 = EOF** で、[`keystroke_to_bytes`] は今も PTY へ 0x04 を
+/// 送っている（`ctrl_dはeofなので分割に使えない` テストが実際の変換で固定）。
+/// tako の主用途である**エージェント CLI ほど EOF を使う**（Claude Code / codex の
+/// 終了、Python・Node の REPL 終了、`cat > file` の入力終端、WSL の bash ログアウト）。
+/// GPUI はキーバインドのアクションを `on_key_down` より先に発火して伝播を止めるため、
+/// 奪うと**代替手段の無いまま EOF が送れなくなる**。
+///
+/// Windows Terminal も分割に Ctrl+D は使わない（Alt+Shift+D）。よって分割は
+/// 上の原則どおり `ctrl-shift-d`（= Cmd+D と同じ D。右分割）/ `ctrl-shift-e`
+/// （下分割）に置く。Ctrl+Shift+D は 0x04 へ潰れる ＝ Ctrl+D 側の EOF は無傷。
+///
+/// 慣習の出典は Windows Terminal / VS Code / kitty / ブラウザ。キー 1 本ごとの
+/// 根拠は #585 の対応表、今回の追加分（Quit）と削除分は #602。
 #[cfg(not(target_os = "macos"))]
 fn platform_bindings() -> Vec<KeyBinding> {
     vec![
@@ -169,6 +208,15 @@ fn platform_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-8", ActivateTab8, None),
         KeyBinding::new("ctrl-9", ActivateTab9, None),
         KeyBinding::new("ctrl-shift-n", NewWindow, None),
+        // アプリの終了（#602。#585 では「Windows は Alt+F4 と閉じるボタンが慣習」として
+        // 見送ったが、その前提が実測で崩れた: `TakoApp::handle_window_close` は最後の
+        // 1 枚でもプロセスを終了させず（macOS の Dock 復帰前提）、`gpui_windows` も
+        // `close_one_window` の「最後の 1 枚だったか」を捨てて `PostQuitMessage` を
+        // 出さない。しかも `on_reopen` は Windows では**一度も発火しない**（コールバックを
+        // 保存する側だけがあり呼び出し側が無い）。結果 Alt+F4 / ✕ はウィンドウ 0 枚の
+        // まま復帰も終了もできないプロセスを残す ＝ **Windows には正規の終了手段が無い**。
+        // Ctrl+Q は XON（フロー制御）なので shift 段へ逃がす）
+        KeyBinding::new("ctrl-shift-q", Quit, None),
         // --- ペイン ---
         // 分割は D = 右（macOS の cmd-d と字面一致。Windows Terminal の
         // Ctrl+Shift+D = ペイン複製とも一致）、E = 下（shift 段が埋まるため
@@ -748,11 +796,13 @@ mod tests {
     #[test]
     fn cmd_qはコンテキスト述語なしでquitにバインドされている() {
         let bindings = key_bindings();
+        // #602 で非 macOS に ctrl-shift-q を足したため、cmd 側だけを見る
         let quit: Vec<_> = bindings
             .iter()
             .filter(|b| b.action().name() == "tako::Quit")
+            .filter(|b| b.keystrokes().iter().all(|k| k.inner().modifiers.platform))
             .collect();
-        assert_eq!(quit.len(), 1, "Quit のバインドはちょうど 1 個");
+        assert_eq!(quit.len(), 1, "cmd 修飾の Quit バインドはちょうど 1 個");
         let ks = quit[0].keystrokes();
         assert_eq!(ks.len(), 1, "単発キーストローク");
         assert_eq!(ks[0].inner().key, "q");
@@ -867,6 +917,7 @@ mod tests {
             ("ctrl-8", "tako::ActivateTab8"),
             ("ctrl-9", "tako::ActivateTab9"),
             ("ctrl-shift-n", "tako::NewWindow"),
+            ("ctrl-shift-q", "tako::Quit"),
             // ペイン
             ("ctrl-shift-d", "tako::SplitRight"),
             ("ctrl-shift-e", "tako::SplitDown"),
@@ -1051,7 +1102,8 @@ mod tests {
         // ctrl+shift+英字 は ctrl+英字 と同じ C0 バイトに潰れる ＝ 奪っても
         // ctrl+英字 の側に同じ入力手段が残る
         for key in [
-            "a", "b", "c", "d", "e", "f", "k", "n", "o", "p", "r", "s", "t", "v", "w", "y", "z",
+            "a", "b", "c", "d", "e", "f", "k", "n", "o", "p", "q", "r", "s", "t", "v", "w", "y",
+            "z",
         ] {
             let mut shifted = ctrl(key);
             shifted.modifiers.shift = true;
@@ -1063,8 +1115,90 @@ mod tests {
         }
     }
 
+    /// #602: ユーザー要望の「Ctrl+D でペイン分割」を**採らない**根拠を、
+    /// 実際のバイト変換で残す。Ctrl+D は EOF（0x04）を PTY へ送っており、
+    /// tako の主用途であるエージェント CLI ほどこれを使う（Claude Code / codex の
+    /// 終了、REPL の終了、`cat > file` の入力終端）。GPUI はアクションを
+    /// `on_key_down` より先に発火して伝播を止めるので、奪うと代替手段が消える
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_dはeofなので分割に使えない() {
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_ctrl("d")),
+            Some(vec![0x04]),
+            "Ctrl+D が EOF(0x04) を送っていない（前提が変わったら判断をやり直すこと）"
+        );
+        assert!(
+            一致するアクション("ctrl-d").is_empty(),
+            "Ctrl+D を奪うと EOF の送出手段が無くなる"
+        );
+        // 代替として実在すべき分割キー（Cmd+D と同じ D を shift 段へ逃がした形）
+        assert!(
+            一致するアクション("ctrl-shift-d")
+                .iter()
+                .any(|a| a == "tako::SplitRight"),
+            "ctrl-shift-d → SplitRight が無い"
+        );
+        assert!(
+            一致するアクション("ctrl-shift-e")
+                .iter()
+                .any(|a| a == "tako::SplitDown"),
+            "ctrl-shift-e → SplitDown が無い"
+        );
+        // Ctrl+Shift+D を奪っても Ctrl+D 側の EOF は無傷（同じ 0x04 へ潰れる）
+        let mut shifted = ks_ctrl("d");
+        shifted.modifiers.shift = true;
+        assert_eq!(keystroke_to_bytes_default(&shifted), Some(vec![0x04]));
+    }
+
+    /// #602: Windows には正規の終了手段が無い（`handle_window_close` は最後の 1 枚でも
+    /// プロセスを残し、`gpui_windows::close_one_window` は「最後の 1 枚だったか」を
+    /// 捨てて `PostQuitMessage` を出さず、`on_reopen` は Windows で発火しない）。
+    /// キーボードから届く Quit を 1 本確保する
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macosにはplatform修飾なしのquitバインドがある() {
+        assert!(
+            !非platform修飾のバインド("tako::Quit").is_empty(),
+            "Quit に platform 修飾なしのバインドが無い（Windows から到達不能）"
+        );
+        assert!(
+            一致するアクション("ctrl-shift-q")
+                .iter()
+                .any(|a| a == "tako::Quit"),
+            "ctrl-shift-q → Quit が無い"
+        );
+        assert!(
+            一致するアクション("ctrl-q").is_empty(),
+            "Ctrl+Q 単独は XON（フロー制御）なので奪わない"
+        );
+    }
+
+    /// #602: macOS 固有アクションのバインドが非 macOS に漏れていない。
+    /// `cmd-alt-h` は Windows で **Win+Alt+H** になる。これが届いた場合
+    /// `HideOthers` → `gpui_windows::hide_other_apps` = `unimplemented!()` で
+    /// **panic ＝ アプリごと abort**（器の無いペインは全滅）するため、経路ごと塞ぐ
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macosにmacos固有アクションのバインドが無い() {
+        for action in ["tako::HideApp", "tako::HideOthers", "tako::MinimizeWindow"] {
+            assert!(
+                key_bindings().iter().all(|b| b.action().name() != action),
+                "{action} のバインドが非 macOS に残っている"
+            );
+        }
+        assert!(macos_only_bindings().is_empty());
+    }
+
+    /// macOS だけに張るバインド（#602）。Windows では Win キーへ解決されて
+    /// OS と衝突するうえ、`HideOthers` は `unimplemented!()` で app ごと落とす
+    const MACOS_ONLY: [&str; 3] = ["cmd-h", "cmd-alt-h", "cmd-m"];
+
     /// #585: macOS のバインド 45 本（cmd- 40 + ctrl-cmd- 5）は Windows 対応で
     /// 1 本も変えない。両プラットフォームで実行して固定する
+    /// （#602 で [`MACOS_ONLY`] の 3 本だけ非 macOS のビルドから外したので、
+    /// 表そのものは 45 行のまま保ち、**どちらのプラットフォームでも表を検査する**。
+    /// 非 macOS では 3 本が「存在しないこと」を逆向きに固定する）
     #[test]
     fn macos側のバインド45本は不変() {
         let macos割当表 = [
@@ -1117,6 +1251,14 @@ mod tests {
         assert_eq!(macos割当表.len(), 45, "macOS のバインドは 45 本");
         for (spec, action) in macos割当表 {
             let actions = 一致するアクション(spec);
+            // macOS 固有の 3 本は非 macOS のビルドに存在しない（#602）
+            if !cfg!(target_os = "macos") && MACOS_ONLY.contains(&spec) {
+                assert!(
+                    actions.is_empty(),
+                    "{spec} が非 macOS に残っている（Win+Alt+H は unimplemented! で app ごと落ちる）"
+                );
+                continue;
+            }
             assert!(
                 actions.iter().any(|a| a == action),
                 "{spec} → {action} が失われた（解決結果: {actions:?}）"
@@ -1126,8 +1268,13 @@ mod tests {
             .iter()
             .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
             .count();
+        let 期待 = if cfg!(target_os = "macos") {
+            45
+        } else {
+            45 - MACOS_ONLY.len()
+        };
         assert_eq!(
-            platform本数, 45,
+            platform本数, 期待,
             "platform（cmd / Win）修飾のバインド本数が変わった"
         );
     }
