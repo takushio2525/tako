@@ -40,6 +40,7 @@ pub mod sleep_guard;
 pub mod stale;
 pub mod update;
 pub mod webdock;
+pub mod welcome;
 
 #[cfg(test)]
 pub(crate) mod tests_support {

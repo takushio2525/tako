@@ -123,4 +123,5 @@ tako_video_playback
 tako_video_seek
 tako_video_volume
 tako_web
+tako_welcome
 tako_window

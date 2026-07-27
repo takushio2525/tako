@@ -56,6 +56,11 @@ pub struct Settings {
     /// エラーレポートの自動送信（Issue #333。既定 OFF = opt-in）
     #[serde(default)]
     pub telemetry: bool,
+    /// 初回起動のウェルカムバナーを閉じた（Issue #549。既定 false）。
+    /// 「初回かどうか」の主判定は settings.json の実在（`welcome::should_show`）で、
+    /// これはユーザーが明示的に閉じた記録。CLI / MCP `tako welcome` から操作できる
+    #[serde(default)]
+    pub welcome_dismissed: bool,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。既定 "claude"）
     #[serde(default = "default_limit_service")]
     pub limit_service: String,
@@ -139,6 +144,7 @@ impl Default for Settings {
             sidebar_width: default_sidebar_width(),
             show_hidden_files: false,
             telemetry: false,
+            welcome_dismissed: false,
             limit_service: default_limit_service(),
             language: default_language(),
             runner_defaults: std::collections::BTreeMap::new(),
@@ -217,7 +223,8 @@ pub fn load() -> Settings {
         .unwrap_or_default()
 }
 
-fn load_from(path: &std::path::Path) -> Option<Settings> {
+/// 指定パスから設定を読む（不在・破損は None）
+pub fn load_from(path: &std::path::Path) -> Option<Settings> {
     let json = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&json).ok()
 }
@@ -234,7 +241,8 @@ pub fn save(settings: &Settings) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn save_to(path: &std::path::Path, settings: &Settings) -> io::Result<()> {
+/// 指定パスへ設定を書き出す（`save` の本体。隔離した検証で使えるよう公開）
+pub fn save_to(path: &std::path::Path, settings: &Settings) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "親ディレクトリが無い"))?;
@@ -277,6 +285,7 @@ mod tests {
             sidebar_width: 300,
             show_hidden_files: true,
             telemetry: true,
+            welcome_dismissed: true,
             limit_service: "codex".into(),
             language: "en".into(),
             runner_defaults: std::collections::BTreeMap::new(),
@@ -328,6 +337,8 @@ mod tests {
         assert_eq!(parsed.sidebar_width, 244);
         // テレメトリの既定は OFF（Issue #333。opt-in）
         assert!(!parsed.telemetry);
+        // ウェルカムバナーの dismiss 記録の既定（Issue #549。旧ファイル後方互換）
+        assert!(!parsed.welcome_dismissed);
         // 利用制限サービスの既定は claude（Issue #321。旧ファイル後方互換）
         assert_eq!(parsed.limit_service, "claude");
         assert_eq!(parsed.limit_service(), tako_core::LimitService::Claude);

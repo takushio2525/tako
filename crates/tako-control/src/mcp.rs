@@ -2172,6 +2172,28 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_welcome",
+            "description": "初回起動のウェルカムバナー（Issue #549）。tako を初めて起動したユーザーへ\
+                「tako setup で初期設定 → tako master で AI 司令塔」の導線を画面上部に出す。\
+                action=status（既定）で表示状態（visible / dismissed / first_launch）と\
+                案内すべきコマンド（setup_command / master_command）を返す。\
+                action=show でバナーを再表示（初期設定がまだのユーザーへ導線を出し直したいとき）。\
+                action=dismiss で閉じて以後出さない（settings.json に永続化）。\
+                ユーザーが「何から始めればいいか」で迷っていたら status で状態を確認し、\
+                setup_command をそのまま案内するか tako_setup を実行すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "show", "dismiss"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_platform",
             "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
                 どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\
@@ -3730,6 +3752,9 @@ fn build_request(
         "tako_stale_binary" => Request::StaleBinary {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             pane: u64_arg(args, "pane")?,
+        },
+        "tako_welcome" => Request::Welcome {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
         "tako_platform" => Request::Platform {
             platform: str_arg(args, "platform")?.map(|s| s.to_string()),
