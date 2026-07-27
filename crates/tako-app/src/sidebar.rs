@@ -21,20 +21,43 @@ pub(crate) struct InlineInsertSlot {
     pub depth: usize,
 }
 
-/// 入力欄を **作成先ディレクトリ行の真下** に、その子と同じ深さで置く（#559）。
+/// 入力欄を **作成先ディレクトリの子として、確定後に並ぶのと同じ位置** へ置く（#559）。
 ///
 /// 旧実装は「展開済み子孫をすべて飛ばした末尾」へ入れていたため、深い木では
 /// 入力欄が親から何十行も離れた位置に出て「どこに作られるのか」が読めなかった。
-/// VSCode と同じく親の直下に置き、深さも親 +1 に揃える
+///
+/// 位置は VSCode の Explorer に合わせる（実機で挙動を確認済み）。ツリーの並びが
+/// 「ディレクトリ先 → 名前順」なので、
+///
+/// - 新規フォルダ: 親の真下（ディレクトリ群の先頭）
+/// - 新規ファイル: 同じ深さのディレクトリ兄弟（とその展開済み子孫）を飛ばした直後
+///   = ファイル群の先頭
+///
+/// とする。深さは常に親 +1 で、通常行と同じインデント規則で描く
 pub(crate) fn inline_insert_position(
     rows: &[filetree::Row],
     parent: &std::path::Path,
+    new_is_dir: bool,
 ) -> Option<InlineInsertSlot> {
     let parent_index = rows.iter().position(|r| r.entry.path == parent)?;
+    let depth = rows[parent_index].depth + 1;
+    let mut row_index = parent_index + 1;
+    if !new_is_dir {
+        // ディレクトリ兄弟（depth 一致 + is_dir）とその子孫（depth 超過）を飛ばす
+        while let Some(row) = rows.get(row_index) {
+            let is_descendant = row.depth > depth;
+            let is_dir_sibling = row.depth == depth && row.entry.is_dir;
+            if is_descendant || is_dir_sibling {
+                row_index += 1;
+            } else {
+                break;
+            }
+        }
+    }
     Some(InlineInsertSlot {
         parent_index,
-        row_index: parent_index + 1,
-        depth: rows[parent_index].depth + 1,
+        row_index,
+        depth,
     })
 }
 
@@ -142,7 +165,9 @@ impl TakoApp {
             .inline_edit
             .as_ref()
             .filter(|edit| edit.kind != InlineEditKind::Rename)
-            .and_then(|edit| inline_insert_position(&rows, &edit.parent));
+            .and_then(|edit| {
+                inline_insert_position(&rows, &edit.parent, edit.kind == InlineEditKind::NewDir)
+            });
         // 作成先ハイライトの対象パス（入力欄そのものではなく親の行）
         let inline_parent_path = inline_new_insert
             .and_then(|slot| rows.get(slot.parent_index))
@@ -1588,7 +1613,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn row(path: &str, depth: usize, root: bool) -> filetree::Row {
+    fn row(path: &str, depth: usize, root: bool, is_dir: bool) -> filetree::Row {
         let path = PathBuf::from(path);
         filetree::Row {
             entry: filetree::Entry {
@@ -1597,7 +1622,7 @@ mod tests {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 path,
-                is_dir: true,
+                is_dir,
             },
             depth,
             expanded: true,
@@ -1606,28 +1631,65 @@ mod tests {
         }
     }
 
-    /// #559: 入力欄は作成先の**真下**・親 +1 の深さ。展開済み子孫の末尾ではない
+    /// 木の形（`filetree` のソート = ディレクトリ先 → 名前順を再現）:
+    /// ```text
+    /// /r                 depth 0 root
+    ///   sub              depth 1 dir
+    ///     deep           depth 2 dir
+    ///       x.txt        depth 3 file
+    ///     a.txt          depth 2 file
+    ///     z.txt          depth 2 file
+    ///   other.txt        depth 1 file
+    /// ```
+    fn sample_rows() -> Vec<filetree::Row> {
+        vec![
+            row("/r", 0, true, true),
+            row("/r/sub", 1, false, true),
+            row("/r/sub/deep", 2, false, true),
+            row("/r/sub/deep/x.txt", 3, false, false),
+            row("/r/sub/a.txt", 2, false, false),
+            row("/r/sub/z.txt", 2, false, false),
+            row("/r/other.txt", 1, false, false),
+        ]
+    }
+
+    /// #559: 新規ファイルの入力欄は作成先の子の**ファイル群の先頭**（VSCode と同じ）。
+    /// 展開済み子孫を全部飛ばした末尾ではない
     #[test]
-    fn インライン入力は作成先の直下に親と揃った深さで入る() {
-        // /r (root) ├ /r/sub ├ /r/sub/deep ├ /r/sub/deep/x ├ /r/sub/z.txt └ /r/other
-        let rows = vec![
-            row("/r", 0, true),
-            row("/r/sub", 1, false),
-            row("/r/sub/deep", 2, false),
-            row("/r/sub/deep/x", 3, false),
-            row("/r/sub/z.txt", 2, false),
-            row("/r/other", 1, false),
-        ];
-        let slot = inline_insert_position(&rows, std::path::Path::new("/r/sub")).unwrap();
+    fn 新規ファイルの入力欄はファイル群の先頭に入る() {
+        let rows = sample_rows();
+        let slot = inline_insert_position(&rows, std::path::Path::new("/r/sub"), false).unwrap();
         assert_eq!(slot.parent_index, 1);
-        assert_eq!(slot.row_index, 2, "sub の真下（deep の手前）");
+        assert_eq!(slot.row_index, 4, "deep とその子孫を飛ばし a.txt の手前");
         assert_eq!(slot.depth, 2, "sub の子と同じ深さ");
 
-        // ルート見出しを作成先にした場合は深さ 1
-        let slot = inline_insert_position(&rows, std::path::Path::new("/r")).unwrap();
-        assert_eq!((slot.parent_index, slot.row_index, slot.depth), (0, 1, 1));
+        // ルート見出しを作成先にした場合は深さ 1・sub を飛ばして other.txt の手前
+        let slot = inline_insert_position(&rows, std::path::Path::new("/r"), false).unwrap();
+        assert_eq!((slot.parent_index, slot.row_index, slot.depth), (0, 6, 1));
 
         // 折りたたみ中などで作成先が行に無ければ入力欄は出さない
-        assert!(inline_insert_position(&rows, std::path::Path::new("/r/none")).is_none());
+        assert!(inline_insert_position(&rows, std::path::Path::new("/r/none"), false).is_none());
+    }
+
+    /// #559: 新規フォルダの入力欄は作成先の**真下**（ディレクトリ群の先頭）
+    #[test]
+    fn 新規フォルダの入力欄は作成先の真下に入る() {
+        let rows = sample_rows();
+        let slot = inline_insert_position(&rows, std::path::Path::new("/r/sub"), true).unwrap();
+        assert_eq!((slot.parent_index, slot.row_index, slot.depth), (1, 2, 2));
+
+        let slot = inline_insert_position(&rows, std::path::Path::new("/r"), true).unwrap();
+        assert_eq!((slot.parent_index, slot.row_index, slot.depth), (0, 1, 1));
+    }
+
+    /// 子がまったく無い（空 / 折りたたみ済み）作成先でも真下に入る
+    #[test]
+    fn 子が無い作成先でも直下に入る() {
+        let rows = vec![row("/r", 0, true, true), row("/r/empty", 1, false, true)];
+        for new_is_dir in [true, false] {
+            let slot = inline_insert_position(&rows, std::path::Path::new("/r/empty"), new_is_dir)
+                .unwrap();
+            assert_eq!((slot.row_index, slot.depth), (2, 2));
+        }
     }
 }

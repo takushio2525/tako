@@ -23661,11 +23661,12 @@ mod self_test {
                         // 挿入位置は render が使う純関数そのもので検証する
                         let rows = app.filetree.rows();
                         let parent_idx = rows.iter().position(|r| r.entry.path == sub).unwrap_or(0);
-                        let slot = crate::sidebar::inline_insert_position(&rows, &sub);
-                        // 入力欄は親（深さ 1）の真下・深さ 2。末尾（deep / z-last.txt の後）ではない
+                        let slot = crate::sidebar::inline_insert_position(&rows, &sub, false);
+                        // 入力欄は sub の子のうちファイル群の先頭（deep とその子孫の直後・
+                        // z-last.txt の手前）で深さ 2。展開済み子孫を全部飛ばした末尾ではない
                         let insert_ok = slot.is_some_and(|s| {
                             s.parent_index == parent_idx
-                                && s.row_index == parent_idx + 1
+                                && s.row_index == parent_idx + 2
                                 && s.depth == 2
                         });
                         // 名前を打ち込んで Enter で確定
