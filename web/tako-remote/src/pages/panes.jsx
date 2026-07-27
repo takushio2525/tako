@@ -1,16 +1,113 @@
+// ペイン選択画面（#621）。
+//
+// 設計のゴールはただ一つ「どれがどれだか分かる」こと。そのために出すのは
+//   1. 中身のスニペット — daemon が TUI のクロムを落として返す `preview`
+//   2. 誰か           — role（master / solo / worker / user）+ agent 種別 + cwd
+//   3. 今どうなのか   — activity（承認待ち / 実行中 / 待機 / 停止）
+// さらにタブでグループ化して「どのタブに何がいるか」を俯瞰できるようにしている。
+//
+// スニペットは daemon の `/api/v2/panes` に同梱される（#621 で N+1 リクエストを解消）。
+// 古い daemon やキャプチャ失敗でフィールドが無いときだけ screen API へフォールバックする。
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
-import { AgentIcon, agentColor } from '../components/agent-icon';
+import { AgentIcon } from '../components/agent-icon';
+
+const PREVIEW_LINES = 8;
+const PULL_THRESHOLD = 80;
+const POLL_MS = 3000;
+
+// --- ペインの分類 ---
+
+// 状態は daemon が画面から導いた activity を最優先で使う。
+// activity が無いペイン（素のシェル）は OSC 133 の state が正（#621）
+function stateOf(p) {
+  switch (p.activity) {
+    case 'permission': return 'permission';
+    case 'busy': return 'busy';
+    case 'error': return 'error';
+    case 'idle': return 'idle';
+    default: break;
+  }
+  // 旧 daemon 互換: permission_dialog だけが来ることがある
+  if (p.permission_dialog) return 'permission';
+  if (p.state === 'failed' || p.exit_code) return 'error';
+  if (p.state === 'running') return 'busy';
+  return 'idle';
+}
+
+const STATE_LABEL = {
+  permission: '承認待ち',
+  busy: '実行中',
+  error: '停止',
+  idle: '待機',
+};
+
+// 要対応 = 人が見ないと進まないもの
+function needsYou(st) {
+  return st === 'permission' || st === 'error';
+}
+
+function roleCategory(p) {
+  const role = (p.role || '').toLowerCase();
+  // worker の role は `orchestrator-worker-<agent>` で master / solo を含まないため
+  // 先に判定してよい。master / solo は `master:<suffix>` 形式も取る（#210）
+  if (role.includes('worker')) return 'worker';
+  if (role.includes('master')) return 'master';
+  if (role.includes('solo')) return 'solo';
+  return 'user';
+}
+
+const ROLE_LABEL = { master: 'master', solo: 'solo', worker: 'worker', user: 'shell' };
+
+// worker の担当を示すラベル（`orchestrator-worker-claude:fix-auth` の末尾など）
+function workerLabel(p) {
+  const role = p.role || '';
+  const idx = role.indexOf(':');
+  return idx >= 0 ? role.slice(idx + 1) : '';
+}
+
+// cwd はフルパスだと横に溢れるうえ識別に効かないので末尾 2 階層だけ出す
+function shortCwd(cwd) {
+  if (!cwd) return '';
+  const parts = cwd.replace(/\/+$/, '').split('/').filter(Boolean);
+  if (parts.length === 0) return '/';
+  return parts.slice(-2).join('/');
+}
+
+// 画面末尾から意味のある行だけを PREVIEW_LINES 行取る（screen API
+// フォールバック用）。daemon の `remote_preview` と同じ「末尾を見せる」方針。
+// 旧実装は配列の先頭から描画していたため、カードには**最も古い履歴**が出ていた
+function tailLines(lines) {
+  const trimmed = [...lines];
+  while (trimmed.length && !trimmed[trimmed.length - 1].trim()) trimmed.pop();
+  return trimmed.slice(-PREVIEW_LINES);
+}
+
+function groupByTab(panes) {
+  const groups = [];
+  const index = new Map();
+  for (const p of panes) {
+    const key = p.tab_id ?? p.tab_title ?? '-';
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      groups.push({ key, title: p.tab_title || 'tab', panes: [] });
+    }
+    groups[index.get(key)].panes.push(p);
+  }
+  return groups;
+}
+
+// --- 部品 ---
 
 function SkeletonCard() {
   return (
-    <div class="pane-card skeleton-card" style="opacity: .5;">
+    <div class="pane-card skeleton-card">
       <div class="pane-card-header">
         <div class="pane-card-left">
-          <span class="skeleton skeleton-dot" />
+          <span class="skeleton skeleton-icon" />
           <span class="skeleton skeleton-text" style="width: 120px" />
         </div>
-        <span class="skeleton skeleton-text" style="width: 40px" />
+        <span class="skeleton skeleton-text" style="width: 46px" />
       </div>
       <div class="pane-card-preview">
         <div class="pane-card-preview-box">
@@ -23,45 +120,135 @@ function SkeletonCard() {
   );
 }
 
-function stateOf(p) {
-  if (p.state === 'error' || p.exit_code) return 'error';
-  // permission ダイアログ実在 = ユーザーの承認待ち（#425。サーバーが画面から検知）
-  if (p.permission_dialog || p.state === 'busy' || p.state === 'needs_input') return 'busy';
-  if (p.state === 'running') return 'running';
-  return 'idle';
+function StatusPill({ state }) {
+  return (
+    <span class={`status-pill state-${state}`}>
+      <span class="status-pill-dot" />
+      {STATE_LABEL[state] || state}
+    </span>
+  );
 }
 
-function stateLabel(st) {
-  switch (st) {
-    case 'error': return 'error';
-    case 'busy': return 'needs input';
-    case 'running': return 'running';
-    default: return 'idle';
+function PreviewBox({ pane, fallback }) {
+  if (!pane.tmux_target) {
+    return (
+      <div class="pane-card-no-terminal">
+        <NoTerminalIcon />
+        <span>ターミナルなし（プレビュー等）</span>
+      </div>
+    );
   }
-}
-
-function roleCategory(p) {
-  const role = (p.role || '').toLowerCase();
-  if (role.includes('master')) return 'master';
-  if (role.includes('solo')) return 'master';
-  if (role.startsWith('orchestrator-worker') || role.includes('worker')) return 'worker';
-  return 'user';
-}
-
-function roleBadgeLabel(cat) {
-  switch (cat) {
-    case 'master': return 'master';
-    case 'worker': return 'worker';
-    default: return 'user';
+  // daemon 同梱の preview が正。無ければ screen API のフォールバック結果
+  const lines = Array.isArray(pane.preview) ? pane.preview : fallback;
+  if (lines === undefined) {
+    return <div class="pane-card-preview-box"><div class="mono-line faded">読み込み中...</div></div>;
   }
+  if (lines === null) {
+    return (
+      <div class="pane-card-preview-box preview-unavailable">
+        <div class="mono-line faded">画面を取得できませんでした</div>
+      </div>
+    );
+  }
+  if (lines.length === 0) {
+    return (
+      <div class="pane-card-preview-box preview-empty">
+        <div class="mono-line faded">出力はまだありません</div>
+      </div>
+    );
+  }
+  // 溢れるときだけ下端をフェードさせる（溢れていないのに掛けると
+  // 最後の 1 行がただ薄く見えて「読めない行がある」と誤解させる）
+  const cls = estimatedRows(lines) > VISIBLE_ROWS ? ' has-more' : '';
+  return (
+    <div class={`pane-card-preview-box${cls}`}>
+      {lines.map((line, i) => (
+        <div key={i} class="mono-line">{line || ' '}</div>
+      ))}
+    </div>
+  );
 }
 
-const PREVIEW_LINES = 12;
-const PULL_THRESHOLD = 80;
+// スニペット枠に収まる行数と、折り返しを含めた実表示行数の見積もり。
+// 端末幅 390px・10.5px の等幅で 1 行あたりおよそ 44 桁
+const VISIBLE_ROWS = 8;
+const WRAP_COLS = 44;
+function estimatedRows(lines) {
+  return lines.reduce((sum, l) => sum + Math.max(1, Math.ceil(l.length / WRAP_COLS)), 0);
+}
+
+function PaneCard({ pane, fallback, onOpen }) {
+  const st = stateOf(pane);
+  const cat = roleCategory(pane);
+  const agentType = pane.agent_type || 'plain';
+  const label = workerLabel(pane);
+  const cwd = shortCwd(pane.cwd);
+
+  return (
+    <div
+      class={`pane-card state-${st} role-${cat}`}
+      data-pane-id={pane.id}
+      onClick={onOpen}
+    >
+      <div class="edge-bar" />
+      <div class="pane-card-header">
+        <div class="pane-card-left">
+          <AgentIcon type={agentType} />
+          <div class="pane-card-titles">
+            <span class="pane-card-title">{pane.title || `Pane ${pane.id}`}</span>
+            <span class="pane-card-sub">
+              #{pane.id}{cwd ? ` · ${cwd}` : ''}
+            </span>
+          </div>
+        </div>
+        <StatusPill state={st} />
+      </div>
+
+      <div class="pane-card-chips">
+        {/* ターミナルを持たないペイン（プレビュー等）に shell と出すと嘘になる */}
+        {(pane.tmux_target || cat !== 'user') && (
+          <span class={`card-chip card-chip-role role-${cat}`}>{ROLE_LABEL[cat]}</span>
+        )}
+        {agentType !== 'plain' && (
+          <span class="card-chip card-chip-agent">{agentType}</span>
+        )}
+        {pane.model && <span class="card-chip">{pane.model}</span>}
+        {label && <span class="card-chip card-chip-task">{label}</span>}
+      </div>
+
+      {pane.permission_dialog && (
+        <div class="card-permission">
+          <span class="card-permission-label">承認待ち</span>
+          <code class="card-permission-cmd">{pane.permission_dialog.command || '確認'}</code>
+        </div>
+      )}
+      {pane.error && (
+        <div class="card-error">
+          <span class="card-error-kind">{pane.error.kind}</span>
+          <span class="card-error-detail">{pane.error.detail}</span>
+        </div>
+      )}
+
+      <div class="pane-card-preview">
+        <PreviewBox pane={pane} fallback={fallback} />
+      </div>
+
+      <div class="pane-card-footer">
+        <span class="footer-meta">{pane.position ? `pane ${pane.position}` : ''}</span>
+        <span class="footer-action">
+          {st === 'permission' ? '応答する' : st === 'error' ? '確認する' : '開く'}
+          <span class="footer-arrow">›</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// --- 画面本体 ---
 
 export function PanesPage({ me }) {
   const [panes, setPanes] = useState([]);
-  const [previews, setPreviews] = useState({});
+  const [fallbacks, setFallbacks] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [pulling, setPulling] = useState(false);
@@ -80,14 +267,12 @@ export function PanesPage({ me }) {
       setLoading(false);
       setError(null);
 
+      // daemon が preview を返せなかったペインだけ screen API で補う
       for (const p of list) {
-        if (!p.tmux_target) {
-          setPreviews(prev => ({ ...prev, [p.id]: null }));
-          continue;
-        }
-        c.screen(p.tmux_target || p.id, PREVIEW_LINES)
-          .then(s => setPreviews(prev => ({ ...prev, [p.id]: s.lines || [] })))
-          .catch(() => setPreviews(prev => ({ ...prev, [p.id]: null })));
+        if (Array.isArray(p.preview) || !p.tmux_target) continue;
+        c.screen(p.tmux_target || p.id)
+          .then(s => setFallbacks(prev => ({ ...prev, [p.id]: tailLines(s.lines || []) })))
+          .catch(() => setFallbacks(prev => ({ ...prev, [p.id]: null })));
       }
     } catch (e) {
       if (e.status === 403) { window.location.reload(); return; }
@@ -99,7 +284,7 @@ export function PanesPage({ me }) {
   useEffect(() => {
     const client = createClient();
     refresh(client);
-    timerRef.current = setInterval(() => refresh(client), 3000);
+    timerRef.current = setInterval(() => refresh(client), POLL_MS);
     return () => clearInterval(timerRef.current);
   }, []);
 
@@ -126,9 +311,29 @@ export function PanesPage({ me }) {
     }
   }
 
-  const counts = { all: panes.length, busy: 0, running: 0, idle: 0, error: 0 };
-  panes.forEach(p => { counts[stateOf(p)]++; });
-  const filtered = filter === 'all' ? panes : panes.filter(p => stateOf(p) === filter);
+  const counts = { all: panes.length, needs: 0, busy: 0, idle: 0 };
+  panes.forEach(p => {
+    const st = stateOf(p);
+    if (needsYou(st)) counts.needs++;
+    else if (st === 'busy') counts.busy++;
+    else counts.idle++;
+  });
+
+  const matches = (p) => {
+    const st = stateOf(p);
+    if (filter === 'all') return true;
+    if (filter === 'needs') return needsYou(st);
+    if (filter === 'busy') return st === 'busy';
+    return st === 'idle';
+  };
+  const groups = groupByTab(panes.filter(matches));
+
+  const FILTERS = [
+    { key: 'all', label: 'すべて', count: counts.all, color: null },
+    { key: 'needs', label: '要対応', count: counts.needs, color: 'var(--amber)' },
+    { key: 'busy', label: '実行中', count: counts.busy, color: 'var(--green)' },
+    { key: 'idle', label: '待機', count: counts.idle, color: 'var(--fg3)' },
+  ];
 
   return (
     <div class="page">
@@ -138,29 +343,27 @@ export function PanesPage({ me }) {
             <span class="dot online" style="width: 7px; height: 7px;" />
             <span class="chip-name">{(me && me.host) || 'tako'}</span>
           </div>
-        </div>
-        <div style="display: flex; gap: 7px; overflow-x: auto;">
-          <button class={`filter-chip${filter === 'all' ? ' active' : ''}`} onClick={() => setFilter('all')}>
-            all {counts.all}
+          <button
+            class={`refresh-btn${pulling ? ' spinning' : ''}`}
+            aria-label="更新"
+            onClick={() => { setPulling(true); refresh().then(() => setPulling(false)); }}
+          >
+            <RefreshIcon />
           </button>
-          {counts.busy > 0 && (
-            <button class={`filter-chip${filter === 'busy' ? ' active' : ''}`} onClick={() => setFilter('busy')}>
-              <span class="chip-dot" style="background: var(--amber);" />
-              needs you {counts.busy}
-            </button>
-          )}
-          {counts.running > 0 && (
-            <button class={`filter-chip${filter === 'running' ? ' active' : ''}`} onClick={() => setFilter('running')}>
-              <span class="chip-dot" style="background: var(--green);" />
-              running {counts.running}
-            </button>
-          )}
-          {counts.error > 0 && (
-            <button class={`filter-chip${filter === 'error' ? ' active' : ''}`} onClick={() => setFilter('error')}>
-              <span class="chip-dot" style="background: var(--red);" />
-              failed {counts.error}
-            </button>
-          )}
+        </div>
+        <div class="filter-row">
+          {FILTERS.map(f => (
+            (f.key === 'all' || f.count > 0) && (
+              <button
+                key={f.key}
+                class={`filter-chip${filter === f.key ? ' active' : ''}`}
+                onClick={() => setFilter(f.key)}
+              >
+                {f.color && <span class="chip-dot" style={`background: ${f.color};`} />}
+                {f.label} {f.count}
+              </button>
+            )
+          ))}
         </div>
       </div>
 
@@ -173,12 +376,20 @@ export function PanesPage({ me }) {
       ) : error ? (
         <div class="center-fill">
           <p class="error-text">{error}</p>
-          <button class="btn btn-primary" onClick={() => { window.location.hash = '#/'; }}>back</button>
+          <button class="btn btn-primary" onClick={() => refresh()}>再試行</button>
         </div>
       ) : panes.length === 0 ? (
         <div class="empty-state">
-          <h2>No panes</h2>
-          <p>No active panes</p>
+          <h2>ペインがありません</h2>
+          <p>Mac で tako を起動すると、タブとペインがここに並びます。</p>
+        </div>
+      ) : groups.length === 0 ? (
+        <div class="empty-state">
+          <h2>該当なし</h2>
+          <p>この絞り込みに合うペインはありません。</p>
+          <button class="btn" style="margin-top: 16px;" onClick={() => setFilter('all')}>
+            すべて表示
+          </button>
         </div>
       ) : (
         <div
@@ -187,66 +398,46 @@ export function PanesPage({ me }) {
           onTouchStart={onTouchStart}
           onTouchMove={onTouchMove}
           onTouchEnd={onTouchEnd}
-          style={`padding-top: 14px;${pullY > 0 ? ` transform: translateY(${pullY}px)` : ''}`}
+          style={pullY > 0 ? `transform: translateY(${pullY}px)` : ''}
         >
-          {filtered.map(p => {
-            const st = stateOf(p);
-            const agentType = p.agent_type || 'plain';
-            const cat = roleCategory(p);
-            const displayTitle = p.title || `Pane ${p.id}`;
-            const hasTerminal = !!p.tmux_target;
-            const previewData = previews[p.id];
-
-            return (
-              <div key={p.id} class={`pane-card state-${st} role-${cat}`} onClick={() => { window.location.hash = `#/panes/${p.id}`; }}>
-                <div class="edge-bar" />
-                <div class="pane-card-header">
-                  <div class="pane-card-left">
-                    <AgentIcon type={agentType} />
-                    <div class="pane-card-titles">
-                      <span class="pane-card-title">{displayTitle}</span>
-                      {p.tab_title && (
-                        <span class="pane-card-tab">{p.tab_title}</span>
-                      )}
-                    </div>
-                  </div>
-                  <div class="pane-card-badges">
-                    <span class={`role-badge role-${cat}`}>{roleBadgeLabel(cat)}</span>
-                    <span class="state-badge">{stateLabel(st)}</span>
-                  </div>
-                </div>
-                <div class="pane-card-meta">
-                  <span>#{p.id}{p.position ? ` · ${p.position}` : ''}</span>
-                  {p.role && cat === 'worker' && (
-                    <span class="worker-label">{p.role}</span>
-                  )}
-                </div>
-                <div class="pane-card-preview">
-                  {hasTerminal ? (
-                    <div class="pane-card-preview-box">
-                      {previewData === undefined && <div class="mono-line faded">...</div>}
-                      {previewData === null && <div class="mono-line faded">No terminal output</div>}
-                      {Array.isArray(previewData) && previewData.map((line, i) => (
-                        <div key={i} class="mono-line">{line || ' '}</div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div class="pane-card-no-terminal">
-                      <NoTerminalIcon />
-                      <span>No terminal (preview pane)</span>
-                    </div>
-                  )}
-                </div>
-                <div class="pane-card-footer">
-                  <span class="footer-meta">{agentType !== 'plain' ? agentType : 'shell'}</span>
-                  <span class="footer-action">{st === 'busy' ? 'respond' : 'view'}</span>
-                </div>
+          {groups.map(group => (
+            <div class="tab-group" key={group.key}>
+              <div class="tab-group-header">
+                <span class="tab-group-name">{group.title}</span>
+                <span class="tab-group-count">{group.panes.length}</span>
+                <span class="tab-group-states">
+                  {group.panes.map(p => (
+                    <span key={p.id} class={`group-dot state-${stateOf(p)}`} />
+                  ))}
+                </span>
               </div>
-            );
-          })}
+              {group.panes.map(p => (
+                <PaneCard
+                  key={p.id}
+                  pane={p}
+                  fallback={fallbacks[p.id]}
+                  onOpen={() => { window.location.hash = `#/panes/${p.id}`; }}
+                />
+              ))}
+            </div>
+          ))}
         </div>
       )}
     </div>
+  );
+}
+
+function RefreshIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path
+        d="M13.5 8a5.5 5.5 0 1 1-1.61-3.89"
+        stroke="currentColor"
+        stroke-width="1.4"
+        stroke-linecap="round"
+      />
+      <path d="M13.6 2.2v3.1h-3.1z" fill="currentColor" />
+    </svg>
   );
 }
 
