@@ -57,6 +57,7 @@ use tako_control::{
     IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost, SystemHost,
     TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
 };
+use tako_core::pane_log::CloseOrigin;
 use tako_core::{
     ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
     SessionNotice, SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme,
@@ -471,10 +472,26 @@ fn initial_tmux_persist() -> bool {
 /// layout.json も削除していた（2026-07-03 実機で全タブ消失）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
-    /// × ボタン・cmd+W・CLI / MCP の close 等、ユーザー / AI の明示操作
-    Explicit,
+    /// × ボタン・cmd+W・CLI / MCP の close 等、ユーザー / AI の明示操作。
+    /// Issue #566: どの操作だったかを発生源として保持し、ペインログへ書き残す
+    Explicit(CloseOrigin),
     /// PTY 子プロセスの終了（SessionNotice::Exited）
     Exited,
+}
+
+impl CloseReason {
+    /// ペインログのクローズマーカーに書く発生源（Issue #566）
+    fn origin(self) -> CloseOrigin {
+        match self {
+            CloseReason::Explicit(origin) => origin,
+            CloseReason::Exited => CloseOrigin::ProcessExit,
+        }
+    }
+
+    /// バックエンドセッション kill・layout.json 削除の対象となる明示 close か（Issue #30）
+    fn is_explicit(self) -> bool {
+        matches!(self, CloseReason::Explicit(_))
+    }
 }
 
 /// persist 診断ログ（Issue #30）: `<data_dir>/persist.log` へ追記 + stderr へも出す
@@ -1054,6 +1071,10 @@ struct TakoApp {
     confirm_close: bool,
     /// 確認ダイアログ表示中の対象（None = ダイアログ非表示）
     pending_close_confirm: Option<CloseConfirmTarget>,
+    /// 子プロセスが動いているバックエンドセッション名（Issue #566）。
+    /// sleep guard の定期スキャン（2 秒 tick の background 実行）結果を再利用し、
+    /// close 確認の判定で UI スレッドから tmux / ps を起こさないためのキャッシュ
+    busy_backend_sessions: std::collections::HashSet<String>,
     /// スリープ防止の最新状態（ステータスバーチップ + 詳細ポップオーバー表示用。
     /// ポーリングで更新。#173/#218/#440）
     sleep_guard_state: Option<tako_control::sleep_guard::SleepGuardState>,
@@ -1101,10 +1122,11 @@ struct TakoApp {
     menus_lang: Option<tako_core::i18n::Lang>,
 }
 
-/// × ボタン close の確認ダイアログ対象（Issue #172）
+/// × ボタン / cmd+W close の確認ダイアログ対象（Issue #172）。
+/// ペインは確認を挟んでも「どの操作から来たか」を失わないよう発生源を持ち回る（#566）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseConfirmTarget {
-    Pane(PaneId),
+    Pane(PaneId, CloseOrigin),
     Tab(TabId),
 }
 
@@ -2197,6 +2219,7 @@ impl TakoApp {
             hovered_link: None,
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
+            busy_backend_sessions: std::collections::HashSet::new(),
             sleep_guard_state: None,
             sleep_guard_popover_open: false,
             sleep_guard_popover_anchor: None,
@@ -2248,7 +2271,7 @@ impl TakoApp {
         }
         // 起動直後は Unknown バックエンドの子プロセス判定（tmux + ps）を待たず 0 で仮適用し、
         // 初回の 2 秒 tick が background 判定で正確な値に補正する（#340）
-        app.apply_sleep_guard(&tako_control::settings::load(), 0);
+        app.apply_sleep_guard(&tako_control::settings::load(), Vec::new());
 
         // 終了処理（layout 保存 + 接続情報の後片付け）はアプリ終了フックで一元化する
         // （#103）。Cmd-Q（グローバル Quit アクション）・メニュー・Dock 右クリック終了・
@@ -2277,7 +2300,9 @@ impl TakoApp {
                     .collect();
                 for pane in direct_panes {
                     if let Some(data) = this.pane_log_close_data(pane) {
-                        this.apply_pane_log_close(pane, data, CloseReason::Exited);
+                        // #566: ここは「アプリ終了に巻き込まれた」であって
+                        // 「プロセスが死んだ」ではない。マーカーで区別する
+                        this.apply_pane_log_close_from(pane, data, CloseOrigin::AppQuit, None);
                     }
                 }
                 // 蓋閉じ防止の解除（#218: 正常終了時に disablesleep を 0 に戻す）
@@ -2888,21 +2913,21 @@ impl TakoApp {
                 // #372: 旧実装は Unknown ペインのみ対象で、Idle のまま子プロセスが走る
                 // ペイン（TUI エージェント）を見落としていた。全バックエンドを対象にする
                 {
-                    let (settings, busy_agents) = cx
+                    let (settings, busy_sessions) = cx
                         .background_executor()
                         .spawn(async move {
                             let busy = if sleep_guard_backends.is_empty() {
-                                0
+                                Vec::new()
                             } else {
                                 let refs: Vec<&str> =
                                     sleep_guard_backends.iter().map(|s| s.as_str()).collect();
-                                tako_control::agents::count_sessions_with_running_children(&refs)
+                                tako_control::agents::sessions_with_running_children(&refs)
                             };
                             (tako_control::settings::load(), busy)
                         })
                         .await;
                     let ok = this.update(cx, |app: &mut TakoApp, _| {
-                        app.apply_sleep_guard(&settings, busy_agents);
+                        app.apply_sleep_guard(&settings, busy_sessions);
                     });
                     if ok.is_err() {
                         break;
@@ -4277,6 +4302,7 @@ impl TakoApp {
             tako_control::protocol::Request::Close {
                 pane: Some(pane.as_u64()),
                 force: true,
+                caller_role: None,
             },
             PaneOrigin::User,
         );
@@ -4531,9 +4557,16 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// フォーカス中ペインを閉じる。タブ最後の 1 ペインならタブを閉じ、最後のタブならアプリ終了
+    /// フォーカス中ペインを閉じる（cmd+W）。タブ最後の 1 ペインならタブを閉じ、
+    /// 最後のタブならアプリ終了。
+    /// Issue #566: エージェント稼働中のペインは確認を挟む。ブラウザのタブを閉じる
+    /// 筋肉記憶で master ペインが一撃死した事故（2026-07-27）の再発防止
     fn close_focused_pane(&mut self, cx: &mut Context<Self>) {
-        self.remove_pane(self.focused_pane(), cx);
+        // 確認ダイアログ表示中の cmd+W は無視する（対象が黙って差し替わらないように）
+        if self.pending_close_confirm.is_some() {
+            return;
+        }
+        self.close_pane_with_confirm(self.focused_pane(), false, CloseOrigin::Keyboard, cx);
     }
 
     /// フォーカス中ペインのフォントサイズを delta 分だけ変更する
@@ -4670,19 +4703,59 @@ impl TakoApp {
     /// 紐づく tmux セッション（backend の tako-* / view の tako-view-* ラッパー）を
     /// `remove_pane` が確実に kill するため、管理外 / orphan として残らない。
     /// 「閉じたいが処理は生かしたい」ときはタイトルバーの ー ボタン（`background_pane_button`）を使う
-    fn close_pane_button(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        self.remove_pane(pane_id, cx);
+    fn close_pane_button(&mut self, pane_id: PaneId, origin: CloseOrigin, cx: &mut Context<Self>) {
+        self.remove_pane_from(pane_id, origin, cx);
     }
 
-    /// × ボタン close の確認ダイアログ付きハンドラ（Issue #172）。
-    /// `cmd_held` = true なら確認スキップ（パワーユーザー動線）
-    fn close_pane_with_confirm(&mut self, pane_id: PaneId, cmd_held: bool, cx: &mut Context<Self>) {
-        if cmd_held || !self.confirm_close {
-            self.close_pane_button(pane_id, cx);
+    /// × ボタン / cmd+W close の確認ダイアログ付きハンドラ（Issue #172 / #566）。
+    /// `cmd_held` = true なら確認スキップ（パワーユーザー動線）。
+    /// #566: 確認は「失うものがあるペイン」に限る。空のシェルペインは従来どおり即クローズし、
+    /// 確認の価値がある局面（エージェント・実行中プロセス）だけで手を止める
+    fn close_pane_with_confirm(
+        &mut self,
+        pane_id: PaneId,
+        cmd_held: bool,
+        origin: CloseOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        if cmd_held || !self.confirm_close || !self.pane_close_needs_confirm(pane_id) {
+            self.close_pane_button(pane_id, origin, cx);
         } else {
-            self.pending_close_confirm = Some(CloseConfirmTarget::Pane(pane_id));
+            self.pending_close_confirm = Some(CloseConfirmTarget::Pane(pane_id, origin));
             cx.notify();
         }
+    }
+
+    /// このペインの close に確認が要るか（Issue #566）。
+    /// 「閉じると取り返しがつかないもの」がある場合だけ true にする:
+    ///
+    /// - role 付き（orchestrator-master / orchestrator-worker / solo 等）= エージェントのペイン
+    /// - シェルがコマンド実行中（OSC 133 の Running）
+    /// - バックエンドセッション配下で子プロセスが動いている（TUI エージェントは
+    ///   OSC 133 が出ないため Idle のまま。判定は sleep guard の定期スキャン結果を再利用し、
+    ///   UI スレッドでサブプロセスを起こさない。#340 / #372）
+    fn pane_close_needs_confirm(&self, pane_id: PaneId) -> bool {
+        let has_role = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .find(|p| p.id() == pane_id)
+            .and_then(|p| p.role())
+            .is_some_and(|r| !r.trim().is_empty());
+        if has_role {
+            return true;
+        }
+        if self
+            .terminals
+            .get(&pane_id)
+            .is_some_and(|s| s.command_state() == CommandState::Running)
+        {
+            return true;
+        }
+        self.backend_sessions
+            .get(&pane_id)
+            .is_some_and(|session| self.busy_backend_sessions.contains(session))
     }
 
     /// stale claude バイナリの張り直しボタンハンドラ（Issue #498）
@@ -4714,14 +4787,27 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// タブの × ボタン close の確認ダイアログ付きハンドラ（Issue #172）
+    /// タブの × ボタン close の確認ダイアログ付きハンドラ（Issue #172）。
+    /// #566: タブは中に何が入っているか一覧できないため、失うものがある
+    /// ペインが 1 つでもあれば確認する
     fn close_tab_with_confirm(&mut self, tab_id: TabId, cmd_held: bool, cx: &mut Context<Self>) {
-        if cmd_held || !self.confirm_close {
-            self.remove_tab(tab_id, cx);
+        if cmd_held || !self.confirm_close || !self.tab_close_needs_confirm(tab_id) {
+            self.remove_tab_from(tab_id, CloseOrigin::TabButton, cx);
         } else {
             self.pending_close_confirm = Some(CloseConfirmTarget::Tab(tab_id));
             cx.notify();
         }
+    }
+
+    /// このタブの close に確認が要るか（Issue #566）。中のどれか 1 ペインでも
+    /// 確認対象なら確認する
+    fn tab_close_needs_confirm(&self, tab_id: TabId) -> bool {
+        self.workspace.get_tab(tab_id).is_some_and(|tab| {
+            tab.tree()
+                .panes()
+                .iter()
+                .any(|p| self.pane_close_needs_confirm(p.id()))
+        })
     }
 
     /// 確認ダイアログで「閉じる」が選ばれたとき
@@ -4730,8 +4816,9 @@ impl TakoApp {
             return;
         };
         match target {
-            CloseConfirmTarget::Pane(id) => self.close_pane_button(id, cx),
-            CloseConfirmTarget::Tab(id) => self.remove_tab(id, cx),
+            // 発生源は確認前の操作（cmd+W / × ボタン）のものを引き継ぐ（#566）
+            CloseConfirmTarget::Pane(id, origin) => self.close_pane_button(id, origin, cx),
+            CloseConfirmTarget::Tab(id) => self.remove_tab_from(id, CloseOrigin::TabButton, cx),
         }
         cx.notify();
     }
@@ -4745,7 +4832,7 @@ impl TakoApp {
     /// タブ/ペインの close で「失われるもの」の要約を生成する（Issue #172）
     fn close_summary(&self, target: CloseConfirmTarget) -> String {
         match target {
-            CloseConfirmTarget::Pane(pane_id) => {
+            CloseConfirmTarget::Pane(pane_id, _) => {
                 let mut parts = Vec::new();
                 if let Some(session) = self.terminals.get(&pane_id) {
                     if session.command_state() == CommandState::Running {
@@ -4759,7 +4846,10 @@ impl TakoApp {
                     .flat_map(|t| t.tree().panes())
                     .find(|p| p.id() == pane_id)
                 {
-                    if let Some(role) = pane.role() {
+                    if let Some(role) = pane.role().filter(|r| !r.trim().is_empty()) {
+                        // #566: 確認が出た理由（= このペインはエージェント）を必ず見せる。
+                        // 事故では「何を閉じようとしているのか」が分からないまま消えた
+                        parts.push(crate::ui_text::dialog::lost_agent_pane(role));
                         if role.starts_with("orchestrator-worker") {
                             let busy = self
                                 .terminals
@@ -4935,8 +5025,16 @@ impl TakoApp {
         }
     }
 
+    /// アプリ内部の後始末としてペインを閉じる（PTY 起動失敗のロールバック・
+    /// 死亡した tmux ビューの掃除等）。ユーザー / AI 操作は発生源を明示する
+    /// `remove_pane_from` を使うこと（Issue #566）
     fn remove_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        self.remove_pane_with(pane_id, CloseReason::Explicit, cx);
+        self.remove_pane_from(pane_id, CloseOrigin::Internal, cx);
+    }
+
+    /// 発生源を明示してペインを閉じる（Issue #566。ペインログのクローズマーカーに残る）
+    fn remove_pane_from(&mut self, pane_id: PaneId, origin: CloseOrigin, cx: &mut Context<Self>) {
+        self.remove_pane_with(pane_id, CloseReason::Explicit(origin), cx);
     }
 
     /// ペインを閉じたときのバックエンドセッション後始末を理由で出し分ける（Issue #30）。
@@ -4946,11 +5044,10 @@ impl TakoApp {
     /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
         self.claude_resume_sessions.remove(&pane_id);
-        match reason {
-            CloseReason::Explicit => self.drop_backend_session(pane_id),
-            CloseReason::Exited => {
-                self.backend_sessions.remove(&pane_id);
-            }
+        if reason.is_explicit() {
+            self.drop_backend_session(pane_id);
+        } else {
+            self.backend_sessions.remove(&pane_id);
         }
     }
 
@@ -5039,8 +5136,14 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// タブを閉じる（既定の発生源は GUI のタブ ×。Issue #566）
     fn remove_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
-        self.remove_tab_with(tab_id, CloseReason::Explicit, cx);
+        self.remove_tab_from(tab_id, CloseOrigin::TabButton, cx);
+    }
+
+    /// 発生源を明示してタブを閉じる（Issue #566）
+    fn remove_tab_from(&mut self, tab_id: TabId, origin: CloseOrigin, cx: &mut Context<Self>) {
+        self.remove_tab_with(tab_id, CloseReason::Explicit(origin), cx);
     }
 
     fn remove_tab_with(&mut self, tab_id: TabId, reason: CloseReason, cx: &mut Context<Self>) {
@@ -5118,23 +5221,21 @@ impl TakoApp {
                 // セカンダリモードは layout.json の所有者ではないため削除もログも行わない
                 // （プライマリの復元情報を道連れにしない。Issue #113）
                 if std::env::var_os("TAKO_SELF_TEST").is_none() && !self.secondary {
-                    match reason {
-                        CloseReason::Explicit => {
-                            tako_control::layout::remove();
-                            persist_diag(
-                                "layout.json 削除: 最後のペインの明示クローズ（次回は空で起動）",
-                            );
-                        }
-                        CloseReason::Exited => {
-                            persist_diag(
-                                "全ペイン終了（PTY 死亡）: layout.json は保持して終了（次回起動で復元）",
-                            );
-                        }
+                    if reason.is_explicit() {
+                        tako_control::layout::remove();
+                        persist_diag(&format!(
+                            "layout.json 削除: 最後のペインの明示クローズ（発生源 {}。次回は空で起動）",
+                            reason.origin().marker()
+                        ));
+                    } else {
+                        persist_diag(
+                            "全ペイン終了（PTY 死亡）: layout.json は保持して終了（次回起動で復元）",
+                        );
                     }
                 }
                 // 明示 close は空で再開するため接続情報も片付ける。PTY 死亡由来は
                 // ⌘Q と同様、persist ON なら次回の同一ソケット再接続のため残す
-                if reason == CloseReason::Explicit || !self.tmux_persist {
+                if reason.is_explicit() || !self.tmux_persist {
                     tako_control::discovery::cleanup(std::process::id());
                 }
                 cx.quit();
@@ -5247,7 +5348,7 @@ impl TakoApp {
         }
         if recovered.is_empty() {
             if let Some(tab_id) = self.workspace.find_tab_of_pane(first_id) {
-                self.remove_tab_with(tab_id, CloseReason::Explicit, cx);
+                self.remove_tab_with(tab_id, CloseReason::Explicit(CloseOrigin::Internal), cx);
             }
         } else if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
             // 復帰タブを ID で直接均等化（#381 総点検: active タブ前提を除去）
@@ -5533,8 +5634,20 @@ impl TakoApp {
         })
     }
 
-    /// ペインログのクローズフラッシュ本体（`pane_log_close_data` と対）
+    /// ペインログのクローズフラッシュ本体（`pane_log_close_data` と対）。
+    /// 発生源つきで書くのは Issue #566（GUI × / cmd+W / CLI・MCP / プロセス終了の事後区別）
     fn apply_pane_log_close(&self, pane: PaneId, data: PaneLogCloseData, reason: CloseReason) {
+        self.apply_pane_log_close_from(pane, data, reason.origin(), None);
+    }
+
+    /// 発生源（+ dispatch の呼び出し元 role）を明示するクローズフラッシュ（Issue #566）
+    fn apply_pane_log_close_from(
+        &self,
+        pane: PaneId,
+        data: PaneLogCloseData,
+        origin: CloseOrigin,
+        caller: Option<&str>,
+    ) {
         use tako_core::pane_log::{ChunkKind, PaneObservation};
         let mut mgr = self.pane_logs_lock();
         if let Some((lines, delta, history)) = data.catch_up {
@@ -5550,11 +5663,7 @@ impl TakoApp {
                 },
             );
         }
-        let reason_str = match reason {
-            CloseReason::Explicit => "close",
-            CloseReason::Exited => "exit",
-        };
-        mgr.flush_close(pane.as_u64(), &data.meta, &data.visible, reason_str);
+        mgr.flush_close(pane.as_u64(), &data.meta, &data.visible, origin, caller);
     }
 
     /// カタログ同期用のペインメタ（Issue #112 A。backend セッション対応のあるペインのみ）
@@ -7849,19 +7958,21 @@ impl TakoApp {
         self.backend_sessions.values().cloned().collect()
     }
 
-    /// sleep guard の適用部。busy_agents（バックエンドセッションのうち実行中子プロセスを
-    /// 持つ数）は background で取得済みのものを受け取る
+    /// sleep guard の適用部。busy_sessions（バックエンドセッションのうち実行中子プロセスを
+    /// 持つもの）は background で取得済みのものを受け取る。
+    /// #566: 同じ結果を close 確認の判定でも使うため、セッション名の集合を保持する
     fn apply_sleep_guard(
         &mut self,
         settings: &tako_control::settings::Settings,
-        busy_agents: usize,
+        busy_sessions: Vec<String>,
     ) {
         let state = tako_control::sleep_guard::update(
             settings.sleep_guard_mode,
             settings.sleep_guard_power,
             settings.lid_sleep_mode,
-            busy_agents,
+            busy_sessions.len(),
         );
+        self.busy_backend_sessions = busy_sessions.into_iter().collect();
         self.sleep_guard_state = Some(state);
     }
 
@@ -12275,6 +12386,7 @@ impl TakoApp {
                                                 this.close_pane_with_confirm(
                                                     pane_id,
                                                     event.modifiers().platform,
+                                                    CloseOrigin::PaneButton,
                                                     cx,
                                                 );
                                             },
@@ -12695,11 +12807,12 @@ impl SessionHost for TakoApp {
         self.prompt_flows.push(PromptFlow::new_enter_only(pane));
     }
 
-    fn detach_session(&mut self, pane: PaneId) {
+    fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
         // ペインログの最終フラッシュ（Issue #112 B。CLI / MCP の close はこの経路で
-        // セッションを破棄するため、terminals から外す前に可視画面を書き残す）
+        // セッションを破棄するため、terminals から外す前に可視画面を書き残す）。
+        // #566: 発生源（cli / mcp + 呼び出し元 role）もここで記録する
         if let Some(data) = self.pane_log_close_data(pane) {
-            self.apply_pane_log_close(pane, data, CloseReason::Explicit);
+            self.apply_pane_log_close_from(pane, data, origin, caller);
         }
         self.terminals.remove(&pane);
         self.previews.remove(&pane);
@@ -14416,7 +14529,7 @@ impl TakoApp {
                                 this.background_pane_button(pane_id, cx);
                             }
                             "close" => {
-                                this.close_pane_button(pane_id, cx);
+                                this.close_pane_button(pane_id, CloseOrigin::PaneButton, cx);
                             }
                             _ => {}
                         }
@@ -15155,9 +15268,10 @@ impl TakoApp {
         let summary = self.close_summary(target);
         let theme = &self.theme;
 
+        // #566: タイトルもカタログ経由にする（#435 の日英必須。従来は日本語直書きだった）
         let label = match target {
-            CloseConfirmTarget::Pane(_) => "ペインを閉じる",
-            CloseConfirmTarget::Tab(_) => "タブを閉じる",
+            CloseConfirmTarget::Pane(..) => crate::ui_text::dialog::title_close_pane(),
+            CloseConfirmTarget::Tab(_) => crate::ui_text::dialog::title_close_tab(),
         };
 
         Some(
@@ -16711,6 +16825,7 @@ mod self_test {
                         tako_control::protocol::Request::Close {
                             pane: Some(pdf_pane.as_u64()),
                             force: true,
+                            caller_role: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -16809,6 +16924,12 @@ mod self_test {
             let wait = |cx: &mut AsyncApp, ms: u64| {
                 cx.background_executor().timer(Duration::from_millis(ms))
             };
+
+            // #566: セルフテストは cmd+W を「ペインを閉じる道具」として多用する
+            // （項目 6 / 62 / 63 等）。close 確認は項目 73 が専門に検証するので、
+            // ここでは既定 OFF にして道具としての cmd+W を素通しにする
+            // （73 / 87 は必要な瞬間だけ自分で ON / OFF する）
+            let _ = window.update(cx, |app, _, _| app.confirm_close = false);
 
             // 1. 起動 + 素の入力経路
             wait(cx, 2500).await;
@@ -18610,7 +18731,7 @@ mod self_test {
                 .update(cx, |app, _, cx| {
                     let before = app.workspace.active_tab().tree().len();
                     let target = app.focused_pane();
-                    app.close_pane_button(target, cx);
+                    app.close_pane_button(target, CloseOrigin::PaneButton, cx);
                     let tree = app.workspace.active_tab().tree();
                     before == 2
                         && tree.len() == 1
@@ -20044,7 +20165,7 @@ mod self_test {
                     // close で片付く（previews からも消える）
                     let closed = tako_control::dispatch(
                         app,
-                        tako_control::protocol::Request::Close { pane: Some(pane), force: true },
+                        tako_control::protocol::Request::Close { pane: Some(pane), force: true, caller_role: None },
                         PaneOrigin::Cli,
                     )
                     .is_ok()
@@ -21145,6 +21266,7 @@ mod self_test {
                             tako_control::protocol::Request::Close {
                                 pane: Some(pane.as_u64()),
                                 force: true,
+                                caller_role: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -21221,6 +21343,7 @@ mod self_test {
                         tako_control::protocol::Request::Close {
                             pane: Some(temp_pane),
                             force: true,
+                            caller_role: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -21314,6 +21437,7 @@ mod self_test {
                         tako_control::protocol::Request::Close {
                             pane: Some(opened_pane),
                             force: true,
+                            caller_role: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -21701,6 +21825,7 @@ mod self_test {
                         tako_control::protocol::Request::Close {
                             pane: Some(view_pane_raw),
                             force: true,
+                            caller_role: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -21818,7 +21943,7 @@ mod self_test {
                     for pane in [first, second["pane"].as_u64().unwrap_or(0)] {
                         let _ = tako_control::dispatch(
                             app,
-                            tako_control::protocol::Request::Close { pane: Some(pane), force: true },
+                            tako_control::protocol::Request::Close { pane: Some(pane), force: true, caller_role: None },
                             PaneOrigin::Cli,
                         );
                     }
@@ -21892,7 +22017,7 @@ mod self_test {
                     // 後片付け: 一時ペインを閉じて 1 ペイン構成へ戻す
                     let _ = tako_control::dispatch(
                         app,
-                        tako_control::protocol::Request::Close { pane: Some(p2), force: true },
+                        tako_control::protocol::Request::Close { pane: Some(p2), force: true, caller_role: None },
                         PaneOrigin::Cli,
                     );
                     moved
@@ -21970,6 +22095,7 @@ mod self_test {
                         tako_control::protocol::Request::Close {
                             pane: Some(pane_id),
                             force: true,
+                            caller_role: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -22265,6 +22391,7 @@ mod self_test {
                             tako_control::protocol::Request::Close {
                                 pane: Some(preview.as_u64()),
                                 force: true,
+                                caller_role: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -22292,6 +22419,7 @@ mod self_test {
                             tako_control::protocol::Request::Close {
                                 pane: Some(pane.as_u64()),
                                 force: true,
+                                caller_role: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -22369,6 +22497,7 @@ mod self_test {
                             tako_control::protocol::Request::Close {
                                 pane: Some(pane_id),
                                 force: true,
+                                caller_role: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -22829,6 +22958,7 @@ mod self_test {
                             tako_control::protocol::Request::Close {
                                 pane: Some(w2),
                                 force: true,
+                                caller_role: None,
                             },
                             PaneOrigin::Mcp,
                         )
@@ -22864,9 +22994,11 @@ mod self_test {
                 let _ = std::fs::remove_dir_all(&scratch);
             }
 
-            // 73. 確認ダイアログ（Issue #172）: × ボタン close の確認ダイアログが
-            //     正しく表示・承認・キャンセルされること。cmd+クリック相当のスキップ。
-            //     設定 OFF で即クローズ。
+            // 73. 確認ダイアログ（Issue #172 / #566）: × ボタン・cmd+W の確認が
+            //     「失うものがあるペイン」でだけ出て、正しく承認・キャンセルできること。
+            //     cmd+クリック相当のスキップ、設定 OFF で即クローズ。
+            //     #566: role を付けたペイン = エージェント稼働中の代表として扱う
+            //     （実 claude を起動せずに判定分岐だけを機械検証する）
             {
                 // ペインを 2 つにして対象を作る
                 type_text(
@@ -22877,34 +23009,72 @@ mod self_test {
                 );
                 wait(cx, 1500).await;
 
+                // 対象ペインへ role を付けて「確認が要るペイン」にする（#566）。
+                // 閉じずに残すペインは必ず clear_risky で戻す: role が残ると以降の項目で
+                // 意図しない確認ダイアログが開き、その escape 消費で後続項目が壊れる
+                let set_role = |app: &mut TakoApp, pane: PaneId, role: Option<String>| {
+                    if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(pane) {
+                        p.set_role(role);
+                    }
+                };
+                let mark_risky = |app: &mut TakoApp, pane: PaneId| {
+                    set_role(app, pane, Some("orchestrator-master:selftest".into()));
+                };
+                let clear_risky = |app: &mut TakoApp, pane: PaneId| set_role(app, pane, None);
+
                 // 73a. 確認ダイアログの表示 + Esc キャンセル
                 let esc_ok = window
                     .update(cx, |app, _, cx| {
                         let before = app.workspace.active_tab().tree().len();
                         let target = app.focused_pane();
+                        mark_risky(app, target);
                         app.confirm_close = true;
-                        app.close_pane_with_confirm(target, false, cx);
+                        app.close_pane_with_confirm(target, false, CloseOrigin::PaneButton, cx);
                         let dialog_shown = app.pending_close_confirm
-                            == Some(CloseConfirmTarget::Pane(target));
+                            == Some(CloseConfirmTarget::Pane(target, CloseOrigin::PaneButton));
                         let not_closed = app.workspace.active_tab().tree().len() == before;
                         app.close_confirm_cancelled(cx);
                         let dialog_gone = app.pending_close_confirm.is_none();
                         let still_there = app.workspace.active_tab().tree().len() == before;
+                        clear_risky(app, target);
+                        app.confirm_close = false;
                         dialog_shown && not_closed && dialog_gone && still_there
                     })
                     .unwrap_or(false);
                 check(esc_ok, "確認ダイアログ: 表示 + Esc キャンセル");
+
+                // 73a2. #566: cmd+W（ClosePane アクション）でも同じ確認が入る。
+                //       ブラウザの筋肉記憶で master ペインが一撃死した事故の回帰防止
+                let kbd_ok = window
+                    .update(cx, |app, _, cx| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let target = app.focused_pane();
+                        mark_risky(app, target);
+                        app.confirm_close = true;
+                        app.close_focused_pane(cx);
+                        let dialog_shown = app.pending_close_confirm
+                            == Some(CloseConfirmTarget::Pane(target, CloseOrigin::Keyboard));
+                        let not_closed = app.workspace.active_tab().tree().len() == before;
+                        app.close_confirm_cancelled(cx);
+                        clear_risky(app, target);
+                        app.confirm_close = false;
+                        dialog_shown && not_closed
+                    })
+                    .unwrap_or(false);
+                check(kbd_ok, "確認ダイアログ: cmd+W でも確認が入る（#566）");
 
                 // 73b. 確認ダイアログの表示 + Enter 承認
                 let enter_ok = window
                     .update(cx, |app, _, cx| {
                         let before = app.workspace.active_tab().tree().len();
                         let target = app.focused_pane();
+                        mark_risky(app, target);
                         app.confirm_close = true;
-                        app.close_pane_with_confirm(target, false, cx);
+                        app.close_pane_with_confirm(target, false, CloseOrigin::PaneButton, cx);
                         let dialog_shown = app.pending_close_confirm.is_some();
                         app.close_confirm_accepted(cx);
                         let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = false;
                         dialog_shown && after == before - 1
                     })
                     .unwrap_or(false);
@@ -22922,14 +23092,44 @@ mod self_test {
                     .update(cx, |app, _, cx| {
                         let before = app.workspace.active_tab().tree().len();
                         let target = app.focused_pane();
+                        mark_risky(app, target);
                         app.confirm_close = true;
-                        app.close_pane_with_confirm(target, true, cx);
+                        app.close_pane_with_confirm(target, true, CloseOrigin::PaneButton, cx);
                         let no_dialog = app.pending_close_confirm.is_none();
                         let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = false;
                         no_dialog && after == before - 1
                     })
                     .unwrap_or(false);
                 check(cmd_ok, "確認ダイアログ: cmd+クリックでスキップ");
+
+                // 73f. #566: 通常の（role 無し・アイドルの）シェルペインは確認なしで即 close。
+                //      確認を全ペインに出すと日常操作の邪魔になるため、対象を絞る不変条件
+                type_text(
+                    any,
+                    cx,
+                    &format!("{cli} split --right --focus >/dev/null"),
+                    true,
+                );
+                wait(cx, 1500).await;
+                let plain_ok = window
+                    .update(cx, |app, _, cx| {
+                        let before = app.workspace.active_tab().tree().len();
+                        let target = app.focused_pane();
+                        app.confirm_close = true;
+                        // role 無し + アイドル = 失うものが無い
+                        let needs = app.pane_close_needs_confirm(target);
+                        app.close_focused_pane(cx);
+                        let no_dialog = app.pending_close_confirm.is_none();
+                        let after = app.workspace.active_tab().tree().len();
+                        app.confirm_close = false; // セルフテスト既定へ戻す
+                        !needs && no_dialog && after == before - 1
+                    })
+                    .unwrap_or(false);
+                check(
+                    plain_ok,
+                    "確認ダイアログ: 通常ペインの cmd+W は確認なしで即 close（#566）",
+                );
 
                 // 75. ⌘K コマンドパレット（#217）: 開く → 絞り込み → Enter で実行 →
                 //     テーマが反転し settings は汚さない（TAKO_SELF_TEST ガード）
@@ -23001,11 +23201,15 @@ mod self_test {
                     .update(cx, |app, _, cx| {
                         let before = app.workspace.active_tab().tree().len();
                         let target = app.focused_pane();
+                        // role 付き（= 確認対象）でも設定 OFF なら即クローズすることを見る
+                        if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(target) {
+                            p.set_role(Some("orchestrator-master:selftest".into()));
+                        }
                         app.confirm_close = false;
-                        app.close_pane_with_confirm(target, false, cx);
+                        app.close_pane_with_confirm(target, false, CloseOrigin::PaneButton, cx);
                         let no_dialog = app.pending_close_confirm.is_none();
                         let after = app.workspace.active_tab().tree().len();
-                        app.confirm_close = true; // 元に戻す
+                        app.confirm_close = false; // セルフテスト既定（OFF）へ戻す
                         no_dialog && after == before - 1
                     })
                     .unwrap_or(false);
@@ -23015,16 +23219,118 @@ mod self_test {
                 let tab_ok = window
                     .update(cx, |app, _, cx| {
                         let tab_id = app.workspace.active_tab_id();
+                        // タブ内に確認対象のペインが 1 つあれば確認する（#566）
+                        let first = app.workspace.active_tab().tree().panes()[0].id();
+                        if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(first) {
+                            p.set_role(Some("orchestrator-master:selftest".into()));
+                        }
                         app.confirm_close = true;
                         app.close_tab_with_confirm(tab_id, false, cx);
                         let dialog_shown = app.pending_close_confirm
                             == Some(CloseConfirmTarget::Tab(tab_id));
                         app.close_confirm_cancelled(cx);
                         let dialog_gone = app.pending_close_confirm.is_none();
+                        // 長生きするペインなので必ず戻す（以降の項目を汚さない）
+                        if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(first) {
+                            p.set_role(None);
+                        }
+                        app.confirm_close = false; // セルフテスト既定へ戻す
                         dialog_shown && dialog_gone
                     })
                     .unwrap_or(false);
                 check(tab_ok, "確認ダイアログ: タブの × でダイアログ表示 + キャンセル");
+            }
+
+            // 87. #566: ペインログのクローズマーカーに発生源が残る。
+            //     cmd+W / GUI の × / CLI（dispatch）で閉じ分け、それぞれ別の
+            //     マーカーが実ファイルへ書かれることを確認する。2026-07-27 の
+            //     master ペイン消失調査では close / exit の 2 値しか無く、
+            //     発生源を消去法でしか絞れなかった
+            {
+                let log_dir = window
+                    .update(cx, |app, _, _| app.pane_logs_lock().dir().to_path_buf())
+                    .ok();
+                // 閉じたペインのログから最後のクローズマーカー行を拾う
+                let close_marker = |dir: &std::path::Path, pane: u64| -> String {
+                    tako_core::pane_log::list_files(dir)
+                        .into_iter()
+                        .find(|f| f.pane == Some(pane))
+                        .and_then(|f| std::fs::read_to_string(&f.path).ok())
+                        .and_then(|c| {
+                            c.lines()
+                                .rev()
+                                .find(|l| l.starts_with("--- [クローズ:"))
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default()
+                };
+                // 対象ペインを作り、ログ素材になる出力を残してから閉じる
+                let split_cmd = format!("{cli} split --right --focus >/dev/null");
+                type_text(any, cx, &split_cmd, true);
+                wait(cx, 1500).await;
+                type_text(any, cx, "echo TAKO-566-KBD", true);
+                wait(cx, 800).await;
+                let kbd_pane = window
+                    .update(cx, |app, _, cx| {
+                        let target = app.focused_pane();
+                        // この項目が見るのは「発生源が記録されるか」だけ。確認ゲートは
+                        // 73 が見ているので切っておく（開いたダイアログが残ると
+                        // 以降の項目の escape を食う）
+                        app.confirm_close = false;
+                        app.close_focused_pane(cx);
+                        target.as_u64()
+                    })
+                    .unwrap_or(0);
+                wait(cx, 500).await;
+
+                type_text(any, cx, &split_cmd, true);
+                wait(cx, 1500).await;
+                type_text(any, cx, "echo TAKO-566-GUI", true);
+                wait(cx, 800).await;
+                let gui_pane = window
+                    .update(cx, |app, _, cx| {
+                        let target = app.focused_pane();
+                        app.close_pane_button(target, CloseOrigin::PaneButton, cx);
+                        target.as_u64()
+                    })
+                    .unwrap_or(0);
+                wait(cx, 500).await;
+
+                type_text(any, cx, &split_cmd, true);
+                wait(cx, 1500).await;
+                type_text(any, cx, "echo TAKO-566-CLI", true);
+                wait(cx, 800).await;
+                let cli_pane = window.update(cx, |app, _, _| app.focused_pane().as_u64()).unwrap_or(0);
+                // 実 CLI（dispatch 経路）で閉じる。フォーカスを分割元へ戻してから叩く
+                let _ = window.update(cx, |app, _, cx| {
+                    app.focus_direction(SplitDirection::Left, cx);
+                });
+                type_text(any, cx, &format!("{cli} close --pane {cli_pane}"), true);
+                wait(cx, 1200).await;
+
+                let markers_ok = log_dir
+                    .as_ref()
+                    .map(|dir| {
+                        let kbd = close_marker(dir, kbd_pane);
+                        let gui = close_marker(dir, gui_pane);
+                        let cli_m = close_marker(dir, cli_pane);
+                        let ok = kbd.contains("close:kbd")
+                            && gui.contains("close:gui")
+                            && cli_m.contains("close:dispatch(cli)");
+                        if !ok {
+                            println!(
+                                "  クローズマーカー: kbd={kbd:?} gui={gui:?} cli={cli_m:?}"
+                            );
+                        }
+                        ok
+                    })
+                    .unwrap_or(false);
+                check(
+                    markers_ok,
+                    "ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）",
+                );
+                // 後始末: 確認ダイアログを残さない（残ると以降の項目のキー入力を食う）
+                let _ = window.update(cx, |app, _, cx| app.close_confirm_cancelled(cx));
             }
 
             // 75b. 動画プレビューの再生位置（#484）: 総尺の取得と、CLI / MCP の
@@ -23195,9 +23501,22 @@ mod self_test {
             // その状態で走らせると「blur → 復元しない」= 常に FAILED になり、
             // ここで exit するので以降の全項目が未実行になる（#501 と同じ穴）。
             // 前提が成立しないときは product の欠陥ではないので SKIPPED を明示する
-            let focused_before = window
-                .update(cx, |app, window, _| app.focus_handle.is_focused(window))
-                .unwrap_or(false);
+            // #566: この項目は escape の配送に依存する。確認ダイアログ（#172）や
+            // アプリ内テキスト入力が残っていると handle_key が escape を先に食い、
+            // 「blur したまま戻らない」= 常に FAILED になる。前段の項目が状態を
+            // 残していないかを必ず表示してから走らせる（原因の切り分け用）
+            let (focused_before, dialog_pending, input_swallows) = window
+                .update(cx, |app, window, _| {
+                    (
+                        app.focus_handle.is_focused(window),
+                        app.pending_close_confirm.is_some(),
+                        app.text_input_swallows_keys(),
+                    )
+                })
+                .unwrap_or((false, false, false));
+            println!(
+                "TAKO_SELF_TEST_76_PRECOND: focused={focused_before}                  close_dialog={dialog_pending} text_input={input_swallows}"
+            );
             if !focused_before {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 76（ウィンドウが focus を持っていない。\

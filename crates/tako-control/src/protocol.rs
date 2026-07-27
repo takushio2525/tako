@@ -178,6 +178,11 @@ pub enum Request {
         /// true にすると busy な worker でも強制 close（省略時 false）
         #[serde(default)]
         force: bool,
+        /// 呼び出し元の role（Issue #566。MCP は接続時の `TAKO_ORCHESTRATOR_ROLE`、
+        /// CLI は同名の環境変数から埋める）。ペインログのクローズマーカーへ
+        /// 「どのエージェントが閉じたか」を残す監査情報で、close の可否には影響しない
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
     },
     /// フォーカス移動（FR-2.5.5）。`direction` 指定時はアクティブタブ内の方向移動
     Focus {

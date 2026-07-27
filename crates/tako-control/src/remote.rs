@@ -2770,6 +2770,7 @@ fn dispatch_close(
     let result = client.request(crate::protocol::Request::Close {
         pane: Some(pid),
         force: false,
+        caller_role: None,
     });
     match result {
         Ok(v) => Ok(v),

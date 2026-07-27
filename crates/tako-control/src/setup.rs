@@ -250,7 +250,7 @@ impl SetupAnswers {
 
 // --- config.yaml のスキーマ ---
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupConfig {
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
@@ -271,6 +271,23 @@ pub struct SetupConfig {
     /// master の ctx% 閾値（#193。この値を超えると MASTER_CTX_HIGH 通知。既定 60）
     #[serde(default = "default_ctx_threshold")]
     pub ctx_threshold: u32,
+}
+
+/// #566: `#[derive(Default)]` だと `confirm_close` が `bool::default()` = false、
+/// `ctx_threshold` が 0 になり、**config.yaml が無い環境（新規ユーザー・隔離起動）で
+/// serde の既定値と食い違う**。`load_config` は不在時に `Ok(default())` を返すので、
+/// 「既定 true」と書かれた close 確認が実際には無効になっていた。手書きで揃える
+impl Default for SetupConfig {
+    fn default() -> Self {
+        Self {
+            orchestrator: OrchestratorConfig::default(),
+            setup: SetupState::default(),
+            agents_sync: crate::agents_sync::AgentsSyncConfig::default(),
+            spawn_layout: SpawnLayoutSection::default(),
+            confirm_close: default_true(),
+            ctx_threshold: default_ctx_threshold(),
+        }
+    }
 }
 
 /// config.yaml の spawn_layout セクション（Issue #165）。
@@ -755,6 +772,25 @@ pub fn render_pending_markdown(pending: &[SetupChange], applied_revision: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #566: config.yaml が無い環境（新規ユーザー・隔離起動）でも
+    /// serde の既定値（confirm_close=true / ctx_threshold=60）と一致すること。
+    /// derive(Default) のままだと close 確認が黙って無効になっていた
+    #[test]
+    fn config不在時の既定はserdeの既定と一致する() {
+        let dir = std::env::temp_dir().join(format!("tako-setup-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let missing = dir.join("config.yaml");
+        let loaded = load_config_from(&missing).expect("不在は default で成功する");
+        assert!(loaded.confirm_close, "close 確認は既定 ON");
+        assert_eq!(loaded.ctx_threshold, 60);
+
+        // 空 YAML（キー未設定）を読んだときの serde 既定とも一致する
+        let from_serde: SetupConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(from_serde.confirm_close, loaded.confirm_close);
+        assert_eq!(from_serde.ctx_threshold, loaded.ctx_threshold);
+        assert!(SetupConfig::default().confirm_close);
+    }
 
     #[test]
     fn setup値はdetected_previous_defaultの順で解決する() {

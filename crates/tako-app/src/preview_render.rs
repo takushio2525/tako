@@ -2552,7 +2552,11 @@ impl TakoApp {
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.close_pane_button(pane_id, cx);
+                                        this.close_pane_button(
+                                            pane_id,
+                                            tako_core::pane_log::CloseOrigin::PaneButton,
+                                            cx,
+                                        );
                                     }))
                                     .child(
                                         svg()

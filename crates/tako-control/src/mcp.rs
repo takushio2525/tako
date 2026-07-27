@@ -992,10 +992,12 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_confirm_close",
-            "description": "タブ / ペインの × ボタンで閉じる際の確認ダイアログの ON/OFF を\
-                切り替える（enabled 省略時は現在状態の取得のみ）。有効時、× クリックで\
+            "description": "タブ / ペインを閉じる際の確認ダイアログの ON/OFF を\
+                切り替える（enabled 省略時は現在状態の取得のみ）。有効時、× クリックと cmd+W で\
                 「失われるもの」を要約した確認ダイアログを表示し、⌘クリックでスキップできる。\
-                設定は config.yaml に永続化される。",
+                確認が入るのは role 付き（エージェント）ペインと実行中プロセスを持つペインだけで、\
+                空のシェルペインは従来どおり即クローズする。CLI / MCP からの close は\
+                確認なし（AI フルコントロール）。設定は config.yaml に永続化される。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3147,6 +3149,9 @@ fn build_request(
         "tako_close_pane" => Request::Close {
             pane: Some(target_pane(args, caller)?),
             force: bool_arg(args, "force")?.unwrap_or(false),
+            // #566: 「どのエージェントが閉じたか」をペインログへ残すための監査情報。
+            // ツール引数ではなく接続時の role を使う（呼び出し側が名乗り直せない）
+            caller_role: caller_role.map(str::to_string),
         },
         "tako_resize_pane" => Request::Resize {
             pane: Some(target_pane(args, caller)?),
@@ -5213,7 +5218,8 @@ mod tests {
                         incoming.request,
                         Request::Close {
                             pane: Some(42),
-                            force: false
+                            force: false,
+                            caller_role: None,
                         },
                         "X-Tako-Pane が呼び出し元として使われる"
                     );
