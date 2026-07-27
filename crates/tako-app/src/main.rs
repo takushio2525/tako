@@ -7331,6 +7331,19 @@ impl TakoApp {
                 // #623 の診断: ここを通ると Windows では GPUI の translate_accelerator が
                 // TranslateMessage / DispatchMessageW を飛ばすため、その打鍵は IME へ
                 // 一切届かなくなる。変換中に出ていたら「打鍵が消える」症状の犯人
+                //
+                // ## 調査済み: 変換中の打鍵はここへ来ない（#623。再調査しないこと）
+                //
+                // 「IME が食った打鍵まで奪っているのでは」という筋は**否定済み**。
+                // IME が処理する打鍵の WM_KEYDOWN は wParam = `VK_PROCESSKEY`(0xE5) で来るが、
+                // GPUI の `handle_key_event` に 0xE5 の分岐は無く `parse_normal_key` へ落ちる。
+                // そこでキー名を解決する `get_key_from_vkey` は
+                // `MapVirtualKeyW(0xE5, MAPVK_VK_TO_CHAR)` を使い、**実機で戻り値 0** を確認した
+                // （比較: 'N'(0x4E)=78 / Enter(0x0D)=13）。0 は解決不能なので
+                // `parse_normal_key` は `None` を返し、`handle_keydown_msg` は
+                // 「未処理」(`Some(1)`) を返す。よって translate_accelerator は素通りし、
+                // TranslateMessage / DispatchMessageW が走って IME へ正しく届く。
+                // 実測でも、実 IME で変換中にこの診断行が出るのは Esc のときだけだった
                 ime_diag_event("handle_key(ターミナルへ書き込み・IME を飛ばす)", 0);
                 cx.stop_propagation();
                 cx.notify();
