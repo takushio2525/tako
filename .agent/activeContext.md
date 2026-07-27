@@ -4,7 +4,28 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-27・#553 でパネルビューの語彙を GUI と一致させた）
+## 現在の対象（2026-07-27・#570 で git タブの UX 4 件を一括改善）
+
+直近: `fix/551-560-561-562-git-tab-ux` → PR #570（`b62c325`）を merge。#551 / #560 / #561 は close、
+**#562 は実機目視が残っているため open 維持**。
+
+- #551: git タブの本文順を 変更 → コミット → ブランチ → リモート → diff へ。既定の折りたたみは
+  「変更 + コミット = 展開 / ブランチ + リモート = 折りたたみ」。リポジトリ切替時は
+  `GitCollapsed::for_repo` で畳み直す（リモート 20 件超は必ず折りたたみ）
+- #560: 変更ファイル行のクリックでプレビュー表示（`open_file_row` = dispatch `OpenFile` 経由）。
+  + / − ボタンは伝播を止めるので両方は起きない。削除済み（D）はクリック対象外
+- #561: **コミット欄の IME が効かない根因は「変換対象がターミナルペインに束縛されていた」こと**。
+  `AppTextInput` + `ImeComposition.app_input` で宛先を型にし、下線のインライン描画・候補位置・
+  unmark の確定先を入力欄側へ。ブランチ名欄も同じ経路に載せた
+- #562: マージボタンが `opacity(0)` + 行ホバーでしか出ず「無い」と読まれていた。常時表示 +
+  アイコン + 案内行 + ブランチチップからの導線を追加
+
+副産物: UI アイコン定数が `EMBEDDED_ASSETS` に登録済みかの検査テストを新設（未登録だと
+`svg()` が無言で何も描かない）。既存の remote.svg が描かれていなかったのを検出して修正。
+
+`/Applications/tako.app` は `b62c325` を install 済み。**稼働中の GUI は旧バイナリなので再起動が要る**。
+
+## これまでの対象（2026-07-27 未明・#553 でパネルビューの語彙を GUI と一致させた）
 
 直近: `fix/553-fleet-vocab` で #553 を解消。GUI のタブは fleet / orch / git なのに CLI / MCP の
 `--view` は tmux / orch / git しか受けず、画面に見えている語で操作できなかった（設計原則 5 の前提崩れ）。
@@ -29,30 +50,16 @@ accounts.yaml の `inherit: true`（#512。既定パス明示 → Keychain 別�
 パースできないので tako の再起動が必須**。`~/.claude-univ` を検証事故で失っており、
 univ アカウントの worker は初回に 1 回ログインが要る。
 
-## これまでの対象（2026-07-26 未明・Windows 移植の基盤が一通り main に載った）
+## 次の一手
 
-今夜 main へ入った merge（新しい順）:
-
-- `ddfe3e1` #522 OS 連携の直呼びを境界 B8 へ集約
-- `11bf018` #496 git タブのブランチ操作 + コンフリクト解消エージェント
-- `a69f64c` #520 git タブのパス表記可搬性と CRLF 耐性
-- `d60fe30` #519 永続バックエンドの抽象境界 B2
-- `d9ea719` #516 system prompt / setup 配布物の単一ソース化
-- `6ea4f99` #515 プラットフォーム対応マトリクスとパリティテスト
-- `8bfc576` #518 Windows 永続バックエンドの設計 / `67fe297` #467 P0 抽象境界
-
-`/Applications/tako.app` は `11bf018` 時点の内容を install 済み（**#522 は未 install**）。
-**稼働中の GUI は旧バイナリのまま**なので、朝いちで tako を再起動すること。
-
-open PR は現時点でゼロ。
-
-## 次の一手（朝）
-
-1. **Windows 実機ビルド**: `.agent/windows-setup.md` の手順で `cargo build`。
+1. **tako を再起動**して `b62c325` を反映（git タブの 4 件はここから体感できる）
+2. **#561 の実 IME 目視**: この機には日本語入力ソースが有効化されていない
+   （`AppleEnabledInputSources` は ABC + パレットのみ）ため実変換を走らせられなかった。
+   Issue #561 のコメントにチェックリストがある
+3. **#562 / #496 の GUI チェックリスト**: マージ導線の目視 + コンフリクトカード / 狭幅 220pt
+4. **Windows 実機ビルド**: `.agent/windows-setup.md` の手順で `cargo build`。
    macOS 側は `scripts/check-windows.sh`（クロス check）が緑の状態
-2. **#496 の GUI チェックリスト**: Issue #496 のコメントにある (a)〜(e) を実機で目視。
-   **clamshell を開いた状態で**行うこと（下記の環境知見を参照）。終わるまで #496 は open 維持
-3. `worker_account: personal` への切替 / renewal/remote-transport の統合・v0.6.0 準備
+5. `worker_account: personal` への切替 / renewal/remote-transport の統合・v0.6.0 準備
 
 ## 未着手・持ち越し
 
@@ -67,14 +74,23 @@ open PR は現時点でゼロ。
 
 - **蓋が閉じている（外部ディスプレイ無し）と GUI 検証は一切できない**。ウィンドウは
   存在するが再描画されず、`screencapture` は「could not create image」、合成クリックも
-  届かない。`ioreg -r -k AppleClamshellState` で**最初に**確認する
-- 合成キーボード入力（cliclick / AppleScript keystroke）は日本語 IME に吸われて
-  アプリへ届かない。**キー入力の検証はセルフテスト項目（79 / 82 の形）で行う**
+  届かない。`ioreg -r -k AppleClamshellState` で**最初に**確認する（`= No` なら蓋は開いている）
+- 蓋が開いていれば **`cliclick` の実クリック + `screencapture -R<x,y,w,h>` で実機検証ができる**。
+  ウィンドウ位置は `osascript -e 'tell application "System Events" to tell (first process
+  whose unix id is <pid>) to get {position, size} of front window'`。#570 はこれで
+  #551 / #560 / #562 の目視まで完了させた
+- 合成**キーボード**入力は使えない（cliclick は「キーボードレイアウトを扱えない」で拒否、
+  AppleScript keystroke は IME に吸われる）。**キー入力の検証はセルフテスト項目で行う**
+- この機には**日本語入力ソースが有効化されていない**（`AppleEnabledInputSources` は
+  ABC + 文字ビューア / 絵文字パレットのみ）。IME 実変換の検証はユーザー実機でしかできない
+- **`git stash` はリポジトリ共有**。worktree で `git stash` → 他 worker が stash → 自分が
+  `git stash pop` すると**他人の stash を pop して drop する**。退避は `git diff > patch` を使う
+- セルフテスト項目 76（blur 後の focus 自己修復）は**実行ごとに成否が変わるフレーク**
+  （origin/main でも再現）。落ちたら再実行する
 - 本番 tako と他ワーカーの隔離インスタンスが同時に動いている。クリック前に
   「その座標の最前面が自分のウィンドウか」を CGWindowList で必ず確かめる
   （AppleScript の `whose unix id is N` は別プロセスに誤マッチする）
-- `main` は `~/dev/tako-wt-467` がチェックアウトしている。本体リポで `git checkout main`
-  はできないので、fast-forward はそのワークツリー側で行う
+- 本体リポ `~/dev/tako` が `main` をチェックアウトしている（2026-07-27 時点）
 
 ## 現フェーズで Read すべき設計書
 

@@ -1403,3 +1403,16 @@
   spawn / handoff / git resolve から起動先の config dir を渡す。e2e の後始末も同じ規則へ
 - 検証: `claude_tui_e2e --ignored` が 2 failed → 4 passed（109 秒 → 27 秒）。
   アカウント指定 spawn の書き先を before/after 実測。品質ゲート全緑（1389）
+
+## 2026-07-27（#551 / #560 / #561 / #562: git タブの UX 4 件を一括改善）
+- #551 本文順を 変更 → コミット → ブランチ → リモート → diff へ + 既定折りたたみ見直し（案 1/2/3）、
+  #560 変更ファイル行クリックでプレビュー（`open_file_row` = dispatch OpenFile 経由）、
+  #562 マージボタンの常時表示 + 案内行 + ブランチチップからの導線
+- #561 根因は実測で確定 = **変換がターミナルペインに束縛され、下線・候補ウィンドウ・unmark の
+  確定先がすべてターミナル側へ向いていた**（`bound_pane=PaneId(1)` / `candidate_bounds=(11px,87px)` /
+  `commit_msg_after_unmark=""`）。`AppTextInput` + `ImeComposition.app_input` で宛先を型にして根治
+- 副産物: UI アイコン定数の `EMBEDDED_ASSETS` 登録漏れ検査テストを新設し、既存 remote.svg が
+  無言で描かれていなかったのを検出・修正。セルフテスト 85 / 86 / 86b を新設
+- 関連コミット: `b62c325`（PR #570 squash merge）。品質ゲート全緑（1393 tests）+ パリティ 0 エラー +
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK` + 隔離 GUI 実クリック（証拠 ~/dev/tako-evidence/560/）
+- 次: tako 再起動 → #561 の実 IME 目視（この機は日本語入力ソース未有効）と #562 の導線目視。#562 は open 維持
