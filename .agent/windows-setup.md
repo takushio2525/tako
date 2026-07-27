@@ -63,14 +63,17 @@ Node.js が要るのは、リモート用 PWA（`web/tako-remote`）を `rust_em
 ## 3.5. psmux（セッション永続化の器。任意だが強く推奨。#519 M2）
 
 ```powershell
-winget install --id psmux.psmux    # または scoop install psmux
-psmux -V                           # 2 行目に psmux <version> が出れば OK
+winget install --id marlocarlo.psmux   # ID は marlocarlo.psmux（psmux.psmux は存在しない）
+psmux -V                               # 2 行目に psmux <version> が出れば OK
 ```
 
 Windows の永続バックエンド（tako を閉じても実行中プロセスと画面が生き残る器）は
 psmux が担う。**入れなくても tako は動く**が、その場合はタブ・ペイン構成と cwd だけの
 復元になり、実行中のエージェントは tako 終了時に止まる。
 
+- scoop で入れるなら**先にバケット追加が要る**（upstream README。素の `scoop install psmux` は
+  マニフェストが見つからず失敗する）:
+  `scoop bucket add psmux https://github.com/psmux/scoop-psmux` → `scoop install psmux`
 - 適合検証済みバージョンは `tako-core::backend::psmux::VERIFIED_VERSION`。
   違うバージョンでも起動時プローブ（器を作る → 見つける → 壊す）が通れば使う。
   通らなければ警告を出して構成のみ復元へ落ちる

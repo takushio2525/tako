@@ -411,7 +411,10 @@ const WINDOWS_DEPS: &[ExternalDep] = &[
         // 名前から推測した `psmux.psmux` は**存在しない**（実測: exit 20「パッケージが
         // 見つかりません」）。`psmux.TerminalMap` が同じ接頭辞で実在するのが紛らわしい
         package: Some("marlocarlo.psmux"),
-        install_hint: "scoop install psmux でも導入できます",
+        // scoop は**先にバケット追加が要る**（upstream README）。素の `scoop install psmux` は
+        // マニフェストが見つからず失敗するので、手順を削って案内してはいけない
+        install_hint: "scoop なら scoop bucket add psmux https://github.com/psmux/scoop-psmux \
+                       のあと scoop install psmux",
     },
     ExternalDep {
         bin: "git",
@@ -2452,6 +2455,17 @@ mod tests {
             PackageManager::install_command("winget", psmux.package.unwrap()),
             "winget install --id marlocarlo.psmux"
         );
+        // scoop を案内するならバケット追加も一緒に案内すること。psmux は専用バケットに
+        // しか無く、素の `scoop install psmux` はマニフェストが見つからず失敗する
+        for dep in WINDOWS_DEPS {
+            if dep.install_hint.contains("scoop install") {
+                assert!(
+                    dep.install_hint.contains("scoop bucket add"),
+                    "{} の scoop 案内にバケット追加が無い（素の scoop install は失敗する）",
+                    dep.bin
+                );
+            }
+        }
         // Windows 側の案内に Homebrew が混ざっていないこと
         for dep in WINDOWS_DEPS {
             assert!(
