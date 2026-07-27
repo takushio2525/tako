@@ -1050,6 +1050,9 @@ pub enum Request {
         /// "supported" / "degraded" / "pending" / "unsupported"（省略時は全件）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        /// リリースノート用の Known limitations 節を併せて返す（Issue #594）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        known_limitations: bool,
     },
     /// UI 表示言語の状態確認・切替（Issue #435。日英 i18n）。
     /// `action` = "status"（既定）/ "set"（`value` へ変更）。

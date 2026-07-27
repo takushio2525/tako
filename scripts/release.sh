@@ -8,6 +8,8 @@
 #   scripts/release.sh --skip-build # ビルド済み dist/tako.app を使って zip のみ再生成
 #   scripts/release.sh --test       # テスト版（prerelease）としてリリース（#403）
 #   scripts/release.sh --promote <test-tag>  # テスト版を安定版に昇格（#403）
+#   scripts/release.sh --notes-only # リリースノートを生成して表示するだけ（ビルド・公開しない）
+#   scripts/release.sh --update-notes [tag]  # 公開済みリリースのノートを実アセットから作り直す
 #
 # 前提:
 #   - macOS（build-app.sh と同じ）
@@ -16,6 +18,24 @@
 #
 # バージョンは Cargo.toml [workspace.package] から自動読み取り。
 # リリースノートは CHANGELOG.md から該当バージョンのセクションを自動抽出。
+#
+# --- プラットフォーム対応（Issue #594）---
+#
+# リリースノートは Mac / Windows で分けず、単一ノート + プラットフォーム明示で運用する。
+# ノートには実アセットから組み立てた**ダウンロード表**が入り、Windows 版の配布物が
+# 含まれるときだけ Windows のインストール手順と Known limitations 節が付く
+# （Known limitations は #515 のサポートマトリクスから `tako platform` 経由で自動生成）。
+#
+# macOS 先行リリース → 後から Windows 版を同じタグに足す運用:
+#
+#   1. Windows 版をビルドし、命名規則どおりの名前で dist/ に置く
+#      （例: dist/tako-v0.6.0-windows-x86_64.exe。規則は scripts/lib/release-assets.sh）
+#   2. gh release upload v0.6.0 dist/tako-v0.6.0-windows-x86_64.exe --clobber
+#   3. scripts/release.sh --update-notes v0.6.0
+#      （実アセットを読み直してノートを作り直し、gh release edit --notes で差し替える）
+#
+# アセットを足した時点で Windows クライアントの更新チェックにも初めて見えるようになる
+# （#595。自 OS 用アセットが無いリリースは更新候補にならない）。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -24,8 +44,14 @@ DIST="$REPO_ROOT/dist"
 APP="$DIST/tako.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 TAG="v${VERSION}"
+
+# アセット命名規則の写し（正は crates/tako-core/src/platform/release_assets.rs。
+# 一致は cargo test -p tako-core release_assets が機械検証する）
+# shellcheck source=lib/release-assets.sh
+source "$REPO_ROOT/scripts/lib/release-assets.sh"
+
 ARCH=$(uname -m)  # arm64 / x86_64
-ZIP_NAME="tako-${TAG}-macos-${ARCH}.zip"
+ZIP_NAME=$(tako_asset_name "$TAG" macos "$ARCH")
 ZIP_PATH="$DIST/$ZIP_NAME"
 
 PUBLISH=0
@@ -33,13 +59,23 @@ DRAFT=0
 SKIP_BUILD=0
 TEST_RELEASE=0
 PROMOTE_TAG=""
-args=()
+NOTES_ONLY=0
+UPDATE_NOTES_TAG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --publish)    PUBLISH=1; shift ;;
     --draft)      DRAFT=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --test)       TEST_RELEASE=1; PUBLISH=1; shift ;;
+    --notes-only) NOTES_ONLY=1; shift ;;
+    --update-notes)
+      shift
+      # タグ省略時は Cargo.toml のバージョン
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        UPDATE_NOTES_TAG="$1"; shift
+      else
+        UPDATE_NOTES_TAG="$TAG"
+      fi ;;
     --promote)
       shift
       if [[ $# -eq 0 ]]; then
@@ -47,9 +83,203 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       PROMOTE_TAG="$1"; shift ;;
-    *) echo "不明な引数: $1（--publish / --draft / --skip-build / --test / --promote <tag>）" >&2; exit 2 ;;
+    *) echo "不明な引数: $1（--publish / --draft / --skip-build / --test / --notes-only / --update-notes [tag] / --promote <tag>）" >&2; exit 2 ;;
   esac
 done
+
+# --- CHANGELOG.md から該当バージョンのセクションを抽出 ---
+# 注意: --promote / --update-notes からも呼ぶので、**必ず全処理より前に定義する**
+extract_changelog() {
+  local ver="$1"
+  local file="$REPO_ROOT/CHANGELOG.md"
+  if [[ ! -f "$file" ]]; then
+    return
+  fi
+  local escaped_ver="${ver//./\\.}"
+  sed -n "/^## \\[${escaped_ver}\\]/,/^## \\[/{
+    /^## \\[${escaped_ver}\\]/d
+    /^## \\[/d
+    p
+  }" "$file"
+}
+
+# --- リリースノートの組み立て（Issue #594）---
+
+# tako CLI の場所を解決する（Known limitations 生成に使う）。
+# ビルド済み .app 内 > release > debug の順。どれも無ければ空文字（節を省略する）
+resolve_tako_bin() {
+  local candidates=(
+    "$APP/Contents/MacOS/tako"
+    "$REPO_ROOT/target/release/tako"
+    "$REPO_ROOT/target/debug/tako"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+# assets_for_platform <platform> <name...> — 指定 OS 向けのアセット名だけを出力
+assets_for_platform() {
+  local platform="$1"; shift
+  local name
+  for name in "$@"; do
+    if tako_asset_is_for "$name" "$platform"; then
+      echo "$name"
+    fi
+  done
+}
+
+# build_download_table <name...> — ダウンロード表（アセットがある OS の行だけ）
+build_download_table() {
+  local platform matched rows=""
+  for platform in $TAKO_ASSET_PLATFORMS; do
+    matched=$(assets_for_platform "$platform" "$@")
+    [[ -n "$matched" ]] || continue
+    local label file
+    label=$(tako_asset_label "$platform")
+    while IFS= read -r file; do
+      [[ -n "$file" ]] || continue
+      rows+="| ${label} | \`${file}\` |
+"
+    done <<< "$matched"
+  done
+  [[ -n "$rows" ]] || return 0
+  printf '### ダウンロード / Download\n\n| OS | ファイル / File |\n|---|---|\n%s\n' "$rows"
+}
+
+# build_release_notes <tag> <version> <asset-name...>
+# ダウンロード表・OS 別インストール手順・Known limitations を実アセットに応じて出し分ける
+build_release_notes() {
+  local tag="$1" version="$2"; shift 2
+  local names=("$@")
+  local body mac_assets win_assets notes
+
+  notes="## tako ${tag}
+"
+  body=$(extract_changelog "$version")
+  if [[ -n "$body" ]]; then
+    notes+="
+${body}
+---
+"
+  fi
+
+  local table
+  table=$(build_download_table "${names[@]+"${names[@]}"}")
+  if [[ -n "$table" ]]; then
+    # $(...) は末尾改行を落とすので、次の節との間の空行はここで足す
+    notes+="
+${table}
+"
+  fi
+
+  mac_assets=$(assets_for_platform macos "${names[@]+"${names[@]}"}")
+  win_assets=$(assets_for_platform windows "${names[@]+"${names[@]}"}")
+
+  if [[ -n "$mac_assets" ]]; then
+    notes+="
+### インストール（macOS） / Install (macOS)
+
+1. 上の表の macOS 用 zip をダウンロード / Download the macOS zip from the table above
+2. zip を展開（ダブルクリック） / Extract the zip
+3. \`tako.app\` を \`/Applications\` フォルダへドラッグ / Drag \`tako.app\` to \`/Applications\`
+4. 初回起動時に Gatekeeper の警告が出たら:
+   **システム設定 → プライバシーとセキュリティ → 「tako」のブロック解除 → このまま開く**
+   If Gatekeeper warns on first launch:
+   **System Settings → Privacy & Security → Unblock \"tako\" → Open Anyway**
+"
+  fi
+
+  if [[ -n "$win_assets" ]]; then
+    notes+="
+### インストール（Windows） / Install (Windows)
+
+1. 上の表の Windows 用インストーラーをダウンロード / Download the Windows installer from the table above
+2. インストーラーを実行 / Run the installer
+   （SmartScreen の警告が出たら **詳細情報 → 実行** / If SmartScreen warns: **More info → Run anyway**）
+"
+    local tako_bin limits
+    tako_bin=$(resolve_tako_bin)
+    if [[ -n "$tako_bin" ]]; then
+      limits=$("$tako_bin" platform --platform windows --known-limitations 2>/dev/null || true)
+      if [[ -n "$limits" ]]; then
+        notes+="
+${limits}
+"
+      fi
+    else
+      echo "警告: tako バイナリが見つからないため Known limitations 節を省略しました" >&2
+    fi
+  fi
+
+  notes+="
+### Claude Code 連携（初回 1 回） / Claude Code Setup (one-time)
+
+\`\`\`sh
+claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve
+\`\`\`
+"
+  printf '%s' "$notes"
+}
+
+# dist/ にある、このタグ向けの配布物の**ファイル名**を列挙する。
+# macOS の zip 以外（後から置いた Windows 版など）も拾う
+collect_dist_asset_names() {
+  local tag="$1" platform ext f
+  for platform in $TAKO_ASSET_PLATFORMS; do
+    for ext in $(tako_asset_ext_list "$platform"); do
+      for f in "$DIST/${TAKO_ASSET_PREFIX}${tag}-${platform}-"*".${ext}"; do
+        [[ -f "$f" ]] && basename -- "$f"
+      done
+    done
+  done
+}
+
+# --- 公開済みリリースのノートを実アセットから作り直す（--update-notes）---
+if [[ -n "$UPDATE_NOTES_TAG" ]]; then
+  if ! command -v gh >/dev/null; then
+    echo "エラー: gh CLI が必要（brew install gh）" >&2
+    exit 1
+  fi
+  if ! gh release view "$UPDATE_NOTES_TAG" >/dev/null 2>&1; then
+    echo "エラー: リリース $UPDATE_NOTES_TAG が見つからない" >&2
+    exit 1
+  fi
+  UPDATE_VERSION="${UPDATE_NOTES_TAG#v}"
+  echo "==> $UPDATE_NOTES_TAG のノートを実アセットから再生成"
+  UPLOADED_NAMES=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && UPLOADED_NAMES+=("$n")
+  done < <(gh release view "$UPDATE_NOTES_TAG" --json assets -q '.assets[].name')
+  if [[ ${#UPLOADED_NAMES[@]} -eq 0 ]]; then
+    echo "警告: $UPDATE_NOTES_TAG にアセットが 1 つも無い（表は空になる）" >&2
+  else
+    printf '    アセット: %s\n' "${UPLOADED_NAMES[@]}"
+  fi
+  NEW_NOTES=$(build_release_notes "$UPDATE_NOTES_TAG" "$UPDATE_VERSION" "${UPLOADED_NAMES[@]+"${UPLOADED_NAMES[@]}"}")
+  gh release edit "$UPDATE_NOTES_TAG" --notes "$NEW_NOTES"
+  echo "==> ノートを更新した: $UPDATE_NOTES_TAG"
+  exit 0
+fi
+
+# --- ノート生成のドライラン（--notes-only）---
+if [[ $NOTES_ONLY -eq 1 ]]; then
+  DRY_NAMES=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && DRY_NAMES+=("$n")
+  done < <(collect_dist_asset_names "$TAG")
+  # まだビルドしていなくても、これから作る macOS zip は必ず含まれる
+  if ! printf '%s\n' "${DRY_NAMES[@]+"${DRY_NAMES[@]}"}" | grep -qx "$ZIP_NAME"; then
+    DRY_NAMES+=("$ZIP_NAME")
+  fi
+  build_release_notes "$TAG" "$VERSION" "${DRY_NAMES[@]+"${DRY_NAMES[@]}"}"
+  exit 0
+fi
 
 # --- 昇格（--promote）処理: テスト版と同一コミットに安定版リリースを作成 ---
 if [[ -n "$PROMOTE_TAG" ]]; then
@@ -89,27 +319,6 @@ if [[ -n "$PROMOTE_TAG" ]]; then
   echo "  アセットをダウンロード..."
   gh release download "$PROMOTE_TAG" --dir "$PROMOTE_TMPDIR" 2>/dev/null || true
 
-  # 安定版のリリースノート
-  CHANGELOG_BODY=$(extract_changelog "$STABLE_VERSION")
-  PROMOTE_NOTES="## tako $STABLE_TAG
-
-Promoted from test release $PROMOTE_TAG.
-テスト版 $PROMOTE_TAG からの昇格リリース。
-"
-  if [[ -n "$CHANGELOG_BODY" ]]; then
-    PROMOTE_NOTES+="
-${CHANGELOG_BODY}
----
-"
-  fi
-  PROMOTE_NOTES+="
-### インストール（macOS） / Install (macOS)
-
-1. **tako-${STABLE_TAG}-macos-*.zip** をダウンロード / Download the zip
-2. zip を展開 / Extract
-3. \`tako.app\` を \`/Applications\` へ / Drag to \`/Applications\`
-"
-
   # 安定版タグを同コミットに作成
   if git rev-parse "$STABLE_TAG" >/dev/null 2>&1; then
     echo "  安定版タグ $STABLE_TAG は既に存在。スキップ"
@@ -121,6 +330,7 @@ ${CHANGELOG_BODY}
 
   # アセットをリネーム（-test.N を除去）してリリース作成
   ASSETS=()
+  ASSET_NAMES=()
   for f in "$PROMOTE_TMPDIR"/*; do
     [[ -f "$f" ]] || continue
     BASENAME=$(basename "$f")
@@ -130,7 +340,14 @@ ${CHANGELOG_BODY}
       mv "$f" "$PROMOTE_TMPDIR/$NEWNAME"
     fi
     ASSETS+=("$PROMOTE_TMPDIR/$NEWNAME")
+    ASSET_NAMES+=("$NEWNAME")
   done
+
+  # 安定版のリリースノート（昇格の一文 + 通常と同じ構成 = ダウンロード表・OS 別手順）
+  PROMOTE_NOTES="Promoted from test release $PROMOTE_TAG.
+テスト版 $PROMOTE_TAG からの昇格リリース。
+
+$(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET_NAMES[@]}"}")"
 
   if gh release view "$STABLE_TAG" >/dev/null 2>&1; then
     echo "  安定版 Release $STABLE_TAG は既に存在。アセットのみアップロード"
@@ -155,21 +372,6 @@ if [[ "$(uname)" != "Darwin" ]]; then
   echo "エラー: macOS 専用" >&2
   exit 1
 fi
-
-# --- CHANGELOG.md から該当バージョンのセクションを抽出 ---
-extract_changelog() {
-  local ver="$1"
-  local file="$REPO_ROOT/CHANGELOG.md"
-  if [[ ! -f "$file" ]]; then
-    return
-  fi
-  local escaped_ver="${ver//./\\.}"
-  sed -n "/^## \\[${escaped_ver}\\]/,/^## \\[/{
-    /^## \\[${escaped_ver}\\]/d
-    /^## \\[/d
-    p
-  }" "$file"
-}
 
 # --- ビルド ---
 if [[ $SKIP_BUILD -eq 0 ]]; then
@@ -233,42 +435,28 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
     echo "  [テスト版] prerelease フラグ付きでリリース"
   fi
 
-  # CHANGELOG からリリースノートを組み立て
-  CHANGELOG_BODY=$(extract_changelog "$VERSION")
-
-  RELEASE_NOTES="## tako $TAG
-"
-  if [[ -n "$CHANGELOG_BODY" ]]; then
-    RELEASE_NOTES+="
-${CHANGELOG_BODY}
----
-"
+  # 添付するアセット: 生成した macOS zip + dist に置かれた他 OS の配布物（#594）
+  UPLOAD_PATHS=("$ZIP_PATH")
+  ASSET_NAMES=("$ZIP_NAME")
+  while IFS= read -r n; do
+    [[ -n "$n" && "$n" != "$ZIP_NAME" ]] || continue
+    UPLOAD_PATHS+=("$DIST/$n")
+    ASSET_NAMES+=("$n")
+  done < <(collect_dist_asset_names "$TAG")
+  if [[ ${#ASSET_NAMES[@]} -gt 1 ]]; then
+    printf '  同梱アセット: %s\n' "${ASSET_NAMES[@]}"
   fi
 
-  RELEASE_NOTES+="
-### インストール（macOS） / Install (macOS)
-
-1. **${ZIP_NAME}** をダウンロード / Download **${ZIP_NAME}**
-2. zip を展開（ダブルクリック） / Extract the zip
-3. \`tako.app\` を \`/Applications\` フォルダへドラッグ / Drag \`tako.app\` to \`/Applications\`
-4. 初回起動時に Gatekeeper の警告が出たら:
-   **システム設定 → プライバシーとセキュリティ → 「tako」のブロック解除 → このまま開く**
-   If Gatekeeper warns on first launch:
-   **System Settings → Privacy & Security → Unblock \"tako\" → Open Anyway**
-
-### Claude Code 連携（初回 1 回） / Claude Code Setup (one-time)
-
-\`\`\`sh
-claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve
-\`\`\`
-"
+  # CHANGELOG + 実アセットからリリースノートを組み立て（ダウンロード表・OS 別手順・
+  # Windows 版があれば Known limitations も。組み立ては build_release_notes が正）
+  RELEASE_NOTES=$(build_release_notes "$TAG" "$VERSION" "${ASSET_NAMES[@]}")
 
   echo "==> GitHub Release 作成: $TAG"
 
   # 冪等性: Release が既に存在する場合はアセット追加のみ（#256）
   if gh release view "$TAG" >/dev/null 2>&1; then
     echo "    Release $TAG は既に存在。アセットのアップロードのみ実行"
-    gh release upload "$TAG" "$ZIP_PATH" --clobber
+    gh release upload "$TAG" "${UPLOAD_PATHS[@]}" --clobber
   else
     # タグ push 直後は GitHub 側の伝播ラグで gh release create が失敗する
     # ことがあるため、指数バックオフ付きリトライで吸収する（#256）
@@ -289,7 +477,7 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
           --generate-notes \
           $DRAFT_FLAG \
           $PRERELEASE_FLAG \
-          "$ZIP_PATH" 2>"$GH_STDERR_FILE" || GH_EXIT=$?
+          "${UPLOAD_PATHS[@]}" 2>"$GH_STDERR_FILE" || GH_EXIT=$?
 
       if [[ $GH_EXIT -eq 0 ]]; then
         rm -f "$GH_STDERR_FILE"
@@ -305,7 +493,7 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
         # 部分成功（Release は作られたがアセット添付で失敗等）への対処
         if gh release view "$TAG" >/dev/null 2>&1; then
           echo "    Release $TAG が前回の試行で作成された。アセットをアップロード"
-          gh release upload "$TAG" "$ZIP_PATH" --clobber
+          gh release upload "$TAG" "${UPLOAD_PATHS[@]}" --clobber
           RELEASE_CREATED=1
           break
         fi

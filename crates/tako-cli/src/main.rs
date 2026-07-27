@@ -2023,6 +2023,10 @@ struct PlatformArgs {
     /// この状態のものだけに絞る（省略時は全件）
     #[arg(long, value_parser = ["supported", "degraded", "pending", "unsupported"])]
     status: Option<String>,
+    /// リリースノート用の Known limitations 節（日英併記の markdown）だけを出力する（Issue #594。
+    /// scripts/release.sh が使う。縮退が無ければ何も出力しない）
+    #[arg(long)]
+    known_limitations: bool,
     /// 生の JSON で出力する
     #[arg(long)]
     json: bool,
@@ -3488,9 +3492,22 @@ fn platform_local(args: &PlatformArgs) -> Result<(), String> {
     // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
     // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
     tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
-    let report = tako_control::platform::report(args.platform.as_deref(), args.status.as_deref())?;
+    let report = tako_control::platform::report(
+        args.platform.as_deref(),
+        args.status.as_deref(),
+        args.known_limitations,
+    )?;
     if args.json {
         println!("{}", pretty_json(&report));
+        return Ok(());
+    }
+    // リリースノートへ差し込むための素の markdown 出力（#594）。
+    // 他の表示を混ぜない = そのままリダイレクトできる
+    if args.known_limitations {
+        let md = report["known_limitations_markdown"].as_str().unwrap_or("");
+        if !md.is_empty() {
+            print!("{md}");
+        }
         return Ok(());
     }
 

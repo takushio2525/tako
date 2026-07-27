@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+Platform-specific entries are tagged with `[Windows]` / `[macOS]` right after the
+change-type tag. Entries without a platform tag apply to every platform.
+プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
+（無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
+
 ## [0.5.13] - 2026-07-27
 
 Nightly patch release (automated). Changes since v0.5.12:
