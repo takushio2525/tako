@@ -107,6 +107,15 @@ pub mod notes {
         "tmux バックエンドに依存。Windows の永続化戦略の決定が前提",
         "Depends on the tmux backend; requires deciding the Windows persistence strategy",
     );
+    /// #519 M2: Windows の永続化は psmux（外部の tmux 互換 CLI）を器にする。
+    /// **導入は任意**なので、有無で復元の深さが変わることをそのまま書く
+    pub const WIN_PERSIST_PSMUX: Note = Note::new(
+        "psmux（tmux 互換の永続化バックエンド）を導入すると実行中プロセスと画面ごと復元する。\
+         未導入ならタブ・ペイン構成と cwd のみ復元し、実行中プロセスは tako の終了時に停止する",
+        "With psmux (a tmux-compatible persistence backend) installed, running processes and \
+         screen contents are restored. Without it, only tabs, panes and cwd are restored; \
+         running processes stop when tako exits",
+    );
     /// #520 の担当範囲
     pub const WIN_GIT: Note = Note::new(
         "git タブの Windows 対応（パス表記と改行コードの可搬性）が前提",
@@ -725,9 +734,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_persist",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
+        // #519 M2 で器（psmux）が入った。**導入は任意**なので Pending ではなく Degraded:
+        // psmux があれば完全復元、無ければ構成のみ復元（どちらも動く）
+        windows: Support::Degraded {
+            note: notes::WIN_PERSIST_PSMUX,
         },
     },
     Feature {
