@@ -6175,6 +6175,31 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
 
+    // #577: 画面に permission ダイアログ（ツール実行の承認要求）が**実在すれば**
+    // waiting へ格上げする。旧実装は「agents の生 status が waiting」だけを根拠に
+    // していたため、**agents がその worker を見られない状況で丸ごと落ちていた**。
+    //
+    // 実測（2026-07-27 / claude v2.1.x。証拠は #577 の e2e）:
+    // - agents 解決に成功していれば生 status は `waiting` を返す（Issue 本文の
+    //   「claude は idle / busy しか返さない」は permission 待ちには当てはまらない）
+    // - ところが `claude agents --json` に載らない worker（別 config dir の継承・
+    //   `CLAUDE_CODE_CHILD_SESSION` つき起動・一覧の取りこぼし = #571 の環境）は
+    //   status_source=screen へ落ち、画面推定は `❯ 1. Yes` を入力欄と見なして idle。
+    //   結果 permission 待ちが「idle + question」として通知され、
+    //   `permission_dialog` は常に null だった（#577 の観測がこれ）
+    // - codex / agy には agents 相当の API が無く、常にこの画面推定経路を通る
+    //
+    // そこで判定を agents の語彙から切り離し、画面の実在検査
+    // （`detect_permission_dialog`）を一次の根拠にする。ダイアログは入力欄を
+    // 奪っている（= 応答するまで先へ進めない）ので、agents / 画面推定が
+    // どちらの状態を出していても停止側が正
+    let permission_dialog = recent_output
+        .as_deref()
+        .and_then(crate::orchestrator::wait::permission_dialog_json);
+    if permission_dialog.is_some() && status != "gone" {
+        status = "waiting".to_string();
+    }
+
     // 停止（idle）した worker の画面に既知のエラーパターン（API エラー・usage limit・
     // rate limit ダイアログ）があれば error へ細分類する（#157）。busy 中は判定しない
     // （自動リトライ・ツール実行ログへの誤検知防止。busy が明ければ idle 経由で判定される）
@@ -6297,21 +6322,6 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
             .to_json(),
         );
     }
-
-    // #319: waiting + 画面に permission ダイアログがあれば構造化情報を付与
-    let permission_dialog: Option<Value> = if status == "waiting" {
-        recent_output.as_ref().and_then(|out| {
-            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
-            let dialog = crate::claude_tui::detect_permission_dialog(&lines)?;
-            Some(json!({
-                "command": dialog.command,
-                "options": dialog.options,
-                "highlighted": dialog.highlighted,
-            }))
-        })
-    } else {
-        None
-    };
 
     // #364: 履歴サイズ計測（agent 非依存の busy シグナル布石）
     let history_info = tmux_session
@@ -11065,6 +11075,380 @@ mod tests {
             busy["status_source"], "agents-auto",
             "busy 中も config dir を跨いで claude セッションを解決できている（#571 の根因）: {busy}"
         );
+    }
+
+    // --- #577 E2E: 実 tmux + 実 claude で permission ダイアログの検知を通しで確認する ---
+    //
+    // Issue #577 の再現手順（brace expansion を含む Bash 実行 = 自動承認されない）を
+    // そのまま流し、watch が WORKER_QUESTION ではなく WORKER_PERMISSION を出すこと、
+    // `worker_status.permission_dialog` が構造化情報を返すことを確かめる。手動実行:
+    //
+    // ```sh
+    // cargo test -p tako-control --lib issue577_e2e -- --ignored --nocapture --test-threads=1
+    // ```
+    //
+    // 前提: `claude` CLI がログイン済み / `tmux` がある / ネットワーク接続。
+    // tmux ソケットと data ディレクトリは隔離するので本番の tako / tmux には触れない
+
+    const E2E_SOCKET_577: &str = "tako-e2e-577";
+
+    fn e2e_577_base() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/private/tmp/tako-e2e-577-{}", std::process::id()))
+    }
+
+    /// テスト用の一時ディレクトリだけを消す（#512 の事故を構造で防ぐ）
+    fn remove_e2e_577_dir(dir: &std::path::Path) {
+        let allowed = dir.parent() == Some(std::path::Path::new("/private/tmp"))
+            && dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("tako-e2e-577-"));
+        assert!(
+            allowed,
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct E2e577Guard {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for E2e577Guard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", E2E_SOCKET_577, "kill-server"])
+                .output();
+            remove_e2e_577_dir(&self.dir);
+        }
+    }
+
+    #[test]
+    #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
+    fn issue577_e2e_実claudeのpermissionダイアログをwatchが検知する() {
+        use std::time::{Duration, Instant};
+
+        let base = e2e_577_base();
+        remove_e2e_577_dir(&base);
+        let work = base.join("work");
+        let data = base.join("data");
+        for d in [&work, &data] {
+            std::fs::create_dir_all(d).expect("一時ディレクトリを作れる");
+        }
+        let guard = E2e577Guard { dir: base.clone() };
+
+        std::env::set_var("TAKO_TMUX_SOCKET", E2E_SOCKET_577);
+        std::env::set_var("TAKO_DATA_DIR", &data);
+
+        // 信頼ダイアログを出さない（出ると permission ダイアログまで到達しない）
+        let default_cfg = crate::orchestrator::claude_default_config_dir()
+            .expect("既定 config dir")
+            .display()
+            .to_string();
+        crate::claude_tui::ensure_trusted_in(Some(&default_cfg), &work.display().to_string())
+            .expect("事前信頼を書ける");
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", E2E_SOCKET_577, "kill-server"])
+            .output();
+        let session = "w577";
+        let status = std::process::Command::new("tmux")
+            // 親（tako の worker ペイン）の env を持ち込むと agents 一覧に載らない
+            .env_remove(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+            .env_remove("CLAUDE_CODE_CHILD_SESSION")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .args([
+                "-L",
+                E2E_SOCKET_577,
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "100",
+                "-y",
+                "35",
+                "-c",
+                work.to_str().expect("テストパスは UTF-8"),
+                // permission ダイアログを出させるので --dangerously-skip-permissions は付けない
+                "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; \
+                 exec claude --model haiku",
+            ])
+            .status()
+            .expect("tmux を実行できる");
+        assert!(status.success(), "tmux new-session が失敗した");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.backend_sessions.insert(pane, session.to_string());
+
+        // Issue #577 の再現プロンプト: brace expansion を含む Bash は
+        // 「Contains brace_expression」で必ず承認を求められる
+        let report = crate::claude_tui::deliver_via_tmux(
+            Some(E2E_SOCKET_577),
+            session,
+            "Use the Bash tool to run exactly this command, without asking me first: \
+             for i in {1..3}; do echo $i; done",
+            true,
+        )
+        .expect("送達が完了する");
+        assert!(
+            report.verified,
+            "プロンプトが入力欄へ反映される: {report:?}"
+        );
+
+        // ダイアログの実在は **検知関数に頼らず** 画面の文言で確認する
+        let dialog_deadline = Instant::now() + Duration::from_secs(180);
+        let mut screen = String::new();
+        while Instant::now() < dialog_deadline {
+            screen = tako_core::tmux::capture_session(Some(E2E_SOCKET_577), session)
+                .map(|l| l.join("\n"))
+                .unwrap_or_default();
+            if screen.contains("Do you want to proceed?") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(
+            screen.contains("Do you want to proceed?"),
+            "承認ダイアログが出るはず。画面:\n{screen}"
+        );
+
+        let worker_status = |host: &mut MockHost, session_id: Option<String>| -> Value {
+            dispatch(
+                host,
+                Request::OrchestratorWorkerStatus {
+                    pane_id: Some(pane),
+                    session_id,
+                    tmux_session: Some(session.to_string()),
+                    worker: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .expect("worker_status が引ける")
+        };
+
+        // ① agents 解決に成功する経路。この claude 版は permission 待ちで生 status
+        //    `waiting` を返すので、修正前からここは waiting になる（非回帰の確認）
+        let auto = worker_status(&mut host, None);
+        println!(
+            "[#577 e2e] agents 経路: status={} source={}",
+            auto["status"], auto["status_source"]
+        );
+        assert_eq!(auto["status"], "waiting", "{auto}");
+        assert!(auto["permission_dialog"].is_object(), "{auto}");
+
+        // ② **#577 の本体**: agents 一覧に載らない worker（別 config dir 継承・
+        //    CLAUDE_CODE_CHILD_SESSION つき起動・codex / agy）を模して、解決できない
+        //    session ID を渡し status_source=screen へ落とす。修正前はこの経路が
+        //    「idle + question」で、permission_dialog は常に null だった
+        const MISSING_SID: &str = "00000000-0000-4000-8000-000000000577";
+        let screened = worker_status(&mut host, Some(MISSING_SID.to_string()));
+        println!(
+            "[#577 e2e] 画面推定経路: status={} source={} events={}",
+            screened["status"], screened["status_source"], screened["events"]
+        );
+        assert_eq!(
+            screened["status_source"], "screen",
+            "agents が解決できない状況を作れている: {screened}"
+        );
+        assert_eq!(
+            screened["status"], "waiting",
+            "修正前は idle（`❯ 1. Yes` を入力欄と見なす）: {screened}"
+        );
+        assert!(
+            screened["permission_dialog"].is_object(),
+            "修正前は常に null: {screened}"
+        );
+        let options = screened["permission_dialog"]["options"]
+            .as_array()
+            .expect("選択肢が取れる");
+        assert!(options.len() >= 2, "選択肢が構造化される: {screened}");
+        let kinds: Vec<&str> = screened["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"permission_dialog"), "{kinds:?}");
+        assert!(
+            !kinds.contains(&"question"),
+            "question は出さない: {kinds:?}"
+        );
+
+        // ③ watch（画面推定経路）: WORKER_PERMISSION（修正前は WORKER_QUESTION）
+        let opts = crate::orchestrator::wait::WatchOptions {
+            pane_id: pane,
+            session_id: Some(MISSING_SID.to_string()),
+            tmux_session: Some(session.to_string()),
+            timeout: Some(Duration::from_secs(90)),
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(2),
+        };
+        let outcome = {
+            let mut exec =
+                |req: Request| dispatch(&mut host, req, PaneOrigin::Cli).map_err(|e| e.to_string());
+            crate::orchestrator::wait::wait_for_worker(&mut exec, &opts, None)
+        };
+        let crate::orchestrator::wait::WatchOutcome::PermissionWaiting {
+            ref permission_dialog,
+        } = outcome
+        else {
+            panic!("WORKER_PERMISSION を返す（修正前は Question）: {outcome:?}\n画面:\n{screen}");
+        };
+        println!("[#577 e2e] permission_dialog = {permission_dialog}");
+
+        // ④ 応答（choice 1 = Yes 一回だけ）で解除でき、以後は通常の完了検知に戻る
+        //    （#571 の非回帰。ダイアログを永続 waiting に固定していない）
+        dispatch(
+            &mut host,
+            Request::OrchestratorRespond {
+                pane_id: pane,
+                choice: "1".into(),
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("permission ダイアログへ応答できる");
+
+        let after = {
+            let mut exec =
+                |req: Request| dispatch(&mut host, req, PaneOrigin::Cli).map_err(|e| e.to_string());
+            crate::orchestrator::wait::wait_for_worker(&mut exec, &opts, None)
+        };
+        drop(guard);
+        assert!(
+            matches!(after, crate::orchestrator::wait::WatchOutcome::Idle { .. }),
+            "承認後は通常どおり Idle で完了する: {after:?}"
+        );
+    }
+
+    // --- #577: permission ダイアログ待ちを waiting へ格上げする ---
+
+    /// permission ダイアログ待ちの実画面（Issue #577 の再現時に採取した形。
+    /// brace expansion を含む Bash 実行の承認要求）
+    const PERMISSION_SCREEN_577: &str = "\
+⏺ Running 1 shell command…\n\
+────────────────────────────────────────────────\n\
+ Bash command\n\
+   for i in {1..12}; do echo $i; sleep 1; done; echo done\n\
+ Contains brace_expression\n\
+ Do you want to proceed?\n\
+ ❯ 1. Yes\n\
+   2. Yes, and don't ask again for echo commands\n\
+   3. No, and tell Claude what to do differently (esc)\n\
+ Esc to cancel · Tab to amend · ctrl+e to explain";
+
+    /// worker が **本文で** 質問して入力待ちになった画面（入力欄は最下部に健在）
+    const QUESTION_SCREEN_577: &str = "\
+⏺ 2 通りの直し方があります。どちらにしますか?\n\
+  1. 既存 API を変えずに互換レイヤを足す\n\
+  2. 破壊的変更として一気に置き換える\n\
+────────────────────────────────────────────────\n\
+❯ \n\
+────────────────────────────────────────────────\n\
+  claude-opus-5 · ctx 23%";
+
+    fn resolved_with_screen(status: &str, source: &str, screen: &str) -> ResolvedWorkerStatus {
+        let mut r = resolved(status, source, true);
+        r.recent_output = Some(screen.into());
+        r
+    }
+
+    #[test]
+    fn issue577_agentsがidleでも画面のダイアログでwaitingへ格上げする() {
+        // agents が idle を返す（一覧の取りこぼし・claude 以外・古い版）状況でも、
+        // 画面にダイアログが実在すれば停止側が正。旧実装は agents の waiting だけを
+        // 根拠にしていたので permission_dialog が null のままだった
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            PERMISSION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        let dialog = &v["permission_dialog"];
+        assert!(dialog.is_object(), "構造化情報が付く: {dialog}");
+        assert!(
+            dialog["command"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("for i in {1..12}"),
+            "承認対象のコマンドを抽出する: {dialog}"
+        );
+        let options = dialog["options"].as_array().expect("選択肢が配列");
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0], "Yes");
+        assert_eq!(dialog["highlighted"], 0);
+
+        // events は permission_dialog のみ（question は出さない = master が
+        // respond ではなく通常の質問応答へ流れるのを防ぐ）
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"permission_dialog"), "{kinds:?}");
+        assert!(!kinds.contains(&"question"), "{kinds:?}");
+    }
+
+    #[test]
+    fn issue577_画面推定経路でもwaitingへ格上げする() {
+        // codex / agy や agents 解決失敗時（status_source=screen）。
+        // `❯ 1. Yes` を入力欄と見なして idle になっていた経路
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "unknown",
+            "screen",
+            PERMISSION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(v["permission_dialog"].is_object());
+    }
+
+    #[test]
+    fn issue577_本物の質問はidleのままでpermission_dialogはnull() {
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            QUESTION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "idle", "格上げしない");
+        assert!(v["permission_dialog"].is_null());
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"question"),
+            "question は従来どおり: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn issue577_通常のidleはidleのまま() {
+        // #571 の非回帰: ダイアログの無い停止画面を waiting に化けさせない
+        let v = apply_worker_status_corrections(resolved("idle", "agents-auto", true)).unwrap();
+        assert_eq!(v["status"], "idle");
+        assert!(v["permission_dialog"].is_null());
+    }
+
+    #[test]
+    fn issue577_生成中はダイアログと判定しない() {
+        // busy 中の claude は入力欄が最下部に見えている（= 入力を奪われていない）。
+        // 会話ログ上流にダイアログの残骸があっても格上げしない
+        let mut screen = PERMISSION_SCREEN_577.to_string();
+        screen.push_str("\n✽ Misting… (1m 4s · ↓ 2.1k tokens)\n────────\n❯ \n────────\n  ctx 23%");
+        let v =
+            apply_worker_status_corrections(resolved_with_screen("busy", "agents-auto", &screen))
+                .unwrap();
+        assert_eq!(v["status"], "busy");
+        assert!(v["permission_dialog"].is_null());
     }
 
     #[test]
