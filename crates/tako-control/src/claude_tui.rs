@@ -13,7 +13,8 @@
 //! - **送達**: テキスト本体は bracketed paste で貼り付け、送信の Enter は貼り付けと分離した
 //!   単独キーとして遅延送信する（一括書き込みは改行が「送信」と解釈されず入力欄に残留する）。
 //!   送信後に入力欄が空へ戻ったことを検証し、残っていれば Enter を単独再送する
-//! - **事前信頼**: `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を spawn 前に
+//! - **事前信頼**: claude の `.claude.json`（`config_json_paths` が解決。既定は
+//!   `~/.claude/.claude.json`）の `projects.<cwd>.hasTrustDialogAccepted` を spawn 前に
 //!   立てることで信頼ダイアログ自体を出さない。ダイアログ検出 → 承諾はそのフォールバック
 //!   （codex / agy の事前信頼は `orchestrator::agent::ensure_trusted` が対応）
 //!
@@ -21,7 +22,7 @@
 //! 無害になるよう設計している: 空の入力欄への Enter は claude / codex / agy いずれも no-op
 //! （3 種とも実測確認済み）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -371,30 +372,134 @@ pub fn input_residual(lines: &[String], prompt: &str) -> bool {
     text_in_input(lines, prompt)
 }
 
+// --- 設定ファイル（.claude.json）の場所（Issue #558） ---
+
+/// claude が読み書きする `.claude.json` のパスを解決する。
+///
+/// **claude は config ディレクトリ配下の `.claude.json` を使う**
+/// （`$CLAUDE_CONFIG_DIR/.claude.json`、未設定なら `~/.claude/.claude.json`）。
+/// v2.1.220 で実測: 未信頼フォルダの信頼を承諾すると
+/// `~/.claude/.claude.json` の `projects` に記録され、ホーム直下の
+/// `~/.claude.json` は一切変化しない。tako は長らくホーム直下へ書いていたため、
+/// 事前信頼（#32）と bypass 事前承認（#407）が無効化されていた（#558）。
+///
+/// 返すのは書き込み対象のパス列（先頭が主）。ホーム直下の旧ファイルは
+/// **既に存在する場合だけ**併せて更新する（旧バージョンの claude を使う環境への互換。
+/// 存在しないなら新規作成はしない = 現行 claude が読まないファイルを増やさない）。
+///
+/// `config_dir` は呼び出し側が知っている config ディレクトリ（アカウント指定の
+/// `CLAUDE_CONFIG_DIR` 等）。None なら環境変数 → 既定 `~/.claude` の順に解決する
+pub fn config_json_paths(config_dir: Option<&str>) -> Vec<PathBuf> {
+    let dir = config_dir
+        .map(|d| PathBuf::from(crate::orchestrator::expand_tilde(d)))
+        .or_else(|| {
+            std::env::var_os(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(crate::orchestrator::claude_default_config_dir);
+    let home = crate::orchestrator::home_dir();
+    let legacy_exists = home
+        .as_ref()
+        .is_some_and(|h| h.join(".claude.json").is_file());
+    resolve_config_json_paths(dir, home.as_deref(), legacy_exists)
+}
+
+/// `config_json_paths` の解決規則そのもの（ファイルシステムに触らない純関数）。
+/// 実在判定は呼び出し側が済ませて `legacy_exists` で渡す
+fn resolve_config_json_paths(
+    config_dir: Option<PathBuf>,
+    home: Option<&Path>,
+    legacy_exists: bool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(dir) = config_dir {
+        paths.push(dir.join(".claude.json"));
+    }
+    // 旧世代の置き場所（ホーム直下）。現行 claude は読まないが、既存環境では
+    // 旧バージョンの claude が残っている可能性があるので存在すれば併せて更新する
+    if let Some(home) = home {
+        let legacy = home.join(".claude.json");
+        if legacy_exists && !paths.contains(&legacy) {
+            paths.push(legacy);
+        }
+    }
+    paths
+}
+
+/// 書き込み対象が 1 つも解決できないときのエラー文言
+fn no_config_path_err() -> String {
+    "claude の設定ファイル（.claude.json）の場所を特定できない".to_string()
+}
+
 // --- 事前信頼（Issue #32 問題 1） ---
 
-/// spawn 前の事前信頼: `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
-/// true にする。claude 起動前に呼ぶことで信頼ダイアログ自体を出さない（実機で
-/// スキップされることを確認済み）。実行中の別 claude が設定ファイルを書き戻す
-/// レースで負ける可能性があるため best-effort とし、失敗しても呼び出し側は
-/// ダイアログ検出 → 承諾のフォールバックで継続する。
+/// spawn 前の事前信頼: claude の `.claude.json` の
+/// `projects.<cwd>.hasTrustDialogAccepted` を true にする。claude 起動前に呼ぶことで
+/// 信頼ダイアログ自体を出さない（実機でスキップされることを確認済み）。
+/// 実行中の別 claude が設定ファイルを書き戻すレースで負ける可能性があるため
+/// best-effort とし、失敗しても呼び出し側はダイアログ検出 → 承諾のフォールバックで継続する。
 /// 戻り値: 新たに書き込んだ / 既に信頼済みなら Ok(true)
 pub fn ensure_trusted(cwd: &str) -> Result<bool, String> {
-    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
-    ensure_trusted_at(&home.join(".claude.json"), cwd)
+    ensure_trusted_in(None, cwd)
+}
+
+/// config ディレクトリを明示する版（Issue #558）。アカウント指定で
+/// `CLAUDE_CONFIG_DIR` を注入して spawn する場合、信頼はその config dir 配下の
+/// `.claude.json` に書かないと効かない
+pub fn ensure_trusted_in(config_dir: Option<&str>, cwd: &str) -> Result<bool, String> {
+    let paths = config_json_paths(config_dir);
+    if paths.is_empty() {
+        return Err(no_config_path_err());
+    }
+    let mut ok = false;
+    let mut last_err = None;
+    for path in &paths {
+        match ensure_trusted_at(path, cwd) {
+            Ok(_) => ok = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // 主（config dir 配下）が書ければ成功。旧ファイル側の失敗だけなら握り潰さず
+    // 呼び出し側の警告に載せる
+    if ok {
+        Ok(true)
+    } else {
+        Err(last_err.unwrap_or_else(no_config_path_err))
+    }
 }
 
 // --- Bypass Permissions 事前承認（Issue #407） ---
 
 /// `--dangerously-skip-permissions` の初回確認ダイアログを抑制する。
-/// `~/.claude.json` のルートに `bypassPermissionsModeAccepted: true` を書き込む。
+/// `.claude.json` のルートに `bypassPermissionsModeAccepted: true` を書き込む。
 /// claude CLI のソースで `ensureAgentsBypassConsent` がこのフラグを参照し、
 /// true ならダイアログ表示自体をスキップする（v2.1.215 で実測確認済み）。
 /// ensure_trusted と同様に best-effort: 失敗時は deliver_via_tmux のダイアログ検出
 /// → 承諾がフォールバックする
 pub fn ensure_bypass_accepted() -> Result<bool, String> {
-    let home = crate::orchestrator::home_dir().ok_or("ホームディレクトリを特定できない")?;
-    ensure_bypass_accepted_at(&home.join(".claude.json"))
+    ensure_bypass_accepted_in(None)
+}
+
+/// config ディレクトリを明示する版（Issue #558）
+pub fn ensure_bypass_accepted_in(config_dir: Option<&str>) -> Result<bool, String> {
+    let paths = config_json_paths(config_dir);
+    if paths.is_empty() {
+        return Err(no_config_path_err());
+    }
+    let mut ok = false;
+    let mut last_err = None;
+    for path in &paths {
+        match ensure_bypass_accepted_at(path) {
+            Ok(_) => ok = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if ok {
+        Ok(true)
+    } else {
+        Err(last_err.unwrap_or_else(no_config_path_err))
+    }
 }
 
 fn ensure_bypass_accepted_at(path: &Path) -> Result<bool, String> {
@@ -778,6 +883,95 @@ mod tests {
         );
         assert_eq!(prompt_head("short"), "short");
         assert_eq!(prompt_head(""), "");
+    }
+
+    // --- #558: .claude.json の場所（claude は config dir 配下を読む） ---
+
+    #[test]
+    fn 設定ファイルはconfig_dir配下を主にする() {
+        // 実測（claude v2.1.220）: 信頼の承諾は `<config dir>/.claude.json` に記録され、
+        // ホーム直下の `~/.claude.json` は変化しない。旧実装はホーム直下だけへ
+        // 書いていたため事前信頼が無効化されていた（#558）
+        let paths = resolve_config_json_paths(
+            Some(PathBuf::from("/opt/cfg")),
+            Some(Path::new("/home/u")),
+            false,
+        );
+        assert_eq!(paths, vec![PathBuf::from("/opt/cfg/.claude.json")]);
+    }
+
+    #[test]
+    fn 旧ファイルは存在するときだけ併記する() {
+        // 旧バージョンの claude が残っている環境への互換。存在しないなら
+        // 現行 claude が読まないファイルを新規作成しない
+        let with_legacy = resolve_config_json_paths(
+            Some(PathBuf::from("/home/u/.claude")),
+            Some(Path::new("/home/u")),
+            true,
+        );
+        assert_eq!(
+            with_legacy,
+            vec![
+                PathBuf::from("/home/u/.claude/.claude.json"),
+                PathBuf::from("/home/u/.claude.json"),
+            ]
+        );
+        let without_legacy = resolve_config_json_paths(
+            Some(PathBuf::from("/home/u/.claude")),
+            Some(Path::new("/home/u")),
+            false,
+        );
+        assert_eq!(
+            without_legacy,
+            vec![PathBuf::from("/home/u/.claude/.claude.json")]
+        );
+    }
+
+    #[test]
+    fn config_dirがホーム直下を指しても重複しない() {
+        // 病的な設定（CLAUDE_CONFIG_DIR=~ 等）でも同じパスを 2 回書かない
+        let paths = resolve_config_json_paths(
+            Some(PathBuf::from("/home/u")),
+            Some(Path::new("/home/u")),
+            true,
+        );
+        assert_eq!(paths, vec![PathBuf::from("/home/u/.claude.json")]);
+    }
+
+    #[test]
+    fn ensure_trusted_inはconfig_dir配下へ書く() {
+        let dir = std::env::temp_dir().join(format!("tako-t558-{}", std::process::id()));
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        assert_eq!(
+            ensure_trusted_in(Some(cfg.to_str().unwrap()), "/work/proj"),
+            Ok(true)
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            written["projects"]["/work/proj"]["hasTrustDialogAccepted"],
+            true
+        );
+
+        // bypass 事前承認も同じ config dir 配下へ
+        assert_eq!(
+            ensure_bypass_accepted_in(Some(cfg.to_str().unwrap())),
+            Ok(true)
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["bypassPermissionsModeAccepted"], true);
+        // 既存の信頼エントリを潰していない
+        assert_eq!(
+            written["projects"]["/work/proj"]["hasTrustDialogAccepted"],
+            true
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

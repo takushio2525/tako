@@ -168,8 +168,20 @@ pub(crate) fn sh_quote(s: &str) -> String {
 /// いずれも best-effort: 失敗しても PromptFlow のダイアログ検出 → 承諾が
 /// フォールバックするため、呼び出し側は警告ログのみで継続する
 pub fn ensure_trusted(agent: WorkerAgent, cwd: &str) -> Result<bool, String> {
+    ensure_trusted_in(agent, None, cwd)
+}
+
+/// claude の config ディレクトリを明示する版（Issue #558）。
+/// アカウント指定で `CLAUDE_CONFIG_DIR` を注入して起動する場合、信頼はその
+/// config dir 配下の `.claude.json` に書かないと効かない（claude は config dir 配下を読む）。
+/// codex / agy は config dir の概念が異なるため従来どおり固定パスへ書く
+pub fn ensure_trusted_in(
+    agent: WorkerAgent,
+    claude_config_dir: Option<&str>,
+    cwd: &str,
+) -> Result<bool, String> {
     match agent {
-        WorkerAgent::Claude => crate::claude_tui::ensure_trusted(cwd),
+        WorkerAgent::Claude => crate::claude_tui::ensure_trusted_in(claude_config_dir, cwd),
         WorkerAgent::Codex => ensure_codex_trusted(cwd),
         WorkerAgent::Agy => ensure_agy_trusted(cwd),
     }

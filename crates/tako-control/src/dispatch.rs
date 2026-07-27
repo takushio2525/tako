@@ -5247,12 +5247,17 @@ fn dispatch_orchestrator_handoff(
         env: &profile_env,
     });
 
-    // 事前信頼
-    let _ = orchestrator::agent::ensure_trusted(master_agent, &cwd.to_string_lossy())
-        .unwrap_or_else(|e| {
-            eprintln!("warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {e}");
-            false
-        });
+    // 事前信頼。claude は config dir 配下の .claude.json を読むので、アカウント指定で
+    // CLAUDE_CONFIG_DIR を注入する場合はその config dir へ書く（#558）
+    let _ = orchestrator::agent::ensure_trusted_in(
+        master_agent,
+        profile_env.claude_config_dir().as_deref(),
+        &cwd.to_string_lossy(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {e}");
+        false
+    });
 
     // コマンド送信（queue_write で遅延書き込み）
     let mut cmd_bytes = master_cmd.into_bytes();
@@ -5366,15 +5371,21 @@ fn dispatch_git_resolve_agent(
         env: &profile_env,
     });
 
-    // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）
-    let pre_trusted = orchestrator::agent::ensure_trusted(worker_agent, &cwd).unwrap_or_else(|e| {
-        eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        false
-    });
+    // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）。
+    // 書き先は起動する claude の config dir 配下（#558）
+    let claude_config_dir = profile_env.claude_config_dir();
+    let pre_trusted =
+        orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
+            .unwrap_or_else(|e| {
+                eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+                false
+            });
     if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
-        let _ = crate::claude_tui::ensure_bypass_accepted().map_err(|e| {
-            eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        });
+        let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref()).map_err(
+            |e| {
+                eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
+            },
+        );
     }
 
     let mut cmd_bytes = agent_cmd.clone().into_bytes();
@@ -5586,22 +5597,29 @@ fn dispatch_orchestrator_spawn(
 
     // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
     // 送信したプロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。
-    // 起動前に各 CLI の設定ファイル（claude: ~/.claude.json / codex: ~/.codex/config.toml /
-    // agy: ~/.gemini/antigravity-cli/settings.json）へ信頼済みを書き込んでダイアログ自体を
-    // 出さない。失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
-    let pre_trusted = orchestrator::agent::ensure_trusted(worker_agent, &cwd).unwrap_or_else(|e| {
-        eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        false
-    });
+    // 起動前に各 CLI の設定ファイル（claude: <config dir>/.claude.json /
+    // codex: ~/.codex/config.toml / agy: ~/.gemini/antigravity-cli/settings.json）へ
+    // 信頼済みを書き込んでダイアログ自体を出さない。claude の書き先は起動する
+    // config dir 配下でなければ効かない（#558。アカウント指定で変わる）。
+    // 失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
+    let claude_config_dir = profile_env.claude_config_dir();
+    let pre_trusted =
+        orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
+            .unwrap_or_else(|e| {
+                eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+                false
+            });
 
     // Bypass Permissions 事前承認（#407）: skip_permissions=true の claude worker は
     // --dangerously-skip-permissions で起動する。初回は確認ダイアログが出て既定選択
-    // 「No, exit」で即終了するため、起動前に ~/.claude.json へ承認済みを書き込む。
-    // フォールバック: deliver_via_tmux の bypass ダイアログ検出 → 承諾
+    // 「No, exit」で即終了するため、起動前に config dir 配下の .claude.json へ
+    // 承認済みを書き込む。フォールバック: deliver_via_tmux の bypass ダイアログ検出 → 承諾
     if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
-        let _ = crate::claude_tui::ensure_bypass_accepted().map_err(|e| {
-            eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        });
+        let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref()).map_err(
+            |e| {
+                eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
+            },
+        );
     }
 
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
