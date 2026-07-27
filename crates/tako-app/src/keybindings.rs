@@ -238,15 +238,61 @@ pub(crate) fn keystroke_to_bytes(ks: &Keystroke, csi_u: CsiUMode) -> Option<Vec<
         "pageup" => csi_tilde(5),
         "pagedown" => csi_tilde(6),
         "delete" => csi_tilde(3),
-        _ => {
-            let ch = ks.key_char.as_ref()?;
-            if ch.is_empty() {
-                return None;
-            }
-            return Some(ch.as_bytes().to_vec());
-        }
+        _ => return printable_to_bytes(ks, ALT_IS_META),
     };
     Some(bytes)
+}
+
+/// Alt（Option）を meta 修飾として扱い、印字文字に ESC を前置するか（#575）
+///
+/// macOS の Option は**文字入力の一部**（Option+V = 「√」、Option+8 = 「•」）なので
+/// false。ESC を前置すると特殊文字入力が丸ごと壊れる。
+/// Windows / Linux の Alt は文字を生まないため、ターミナルの慣習どおり
+/// meta = ESC 前置で送る（xterm の metaSendsEscape。Windows Terminal も同じ）。
+/// Claude Code の Alt+V（クリップボード画像の貼り付け）はこの経路を要求する。
+const ALT_IS_META: bool = !cfg!(target_os = "macos");
+
+/// 印字文字キー → PTY バイト列。`alt_is_meta` は [`ALT_IS_META`]
+/// （テストが macOS 相当 / 非 macOS 相当の両方を同じマシンで検証できるよう引数にしてある）
+fn printable_to_bytes(ks: &Keystroke, alt_is_meta: bool) -> Option<Vec<u8>> {
+    let m = &ks.modifiers;
+    // **素の Alt のみ** meta 扱いにする。Windows では AltGr が Ctrl+Alt として届き、
+    // 欧州配列の @ / { 等はこの経路で key_char に入るため、ESC を前置すると
+    // 入力そのものが壊れる（platform 修飾は handle_key が手前で弾いている）
+    let meta = alt_is_meta && m.alt && !m.control;
+    let ch = match ks.key_char.as_deref().filter(|s| !s.is_empty()) {
+        Some(ch) => ch.to_string(),
+        // Alt 単独押下では key_char が None になる（Windows の標準配列は Alt のみの
+        // 修飾組み合わせを未定義にしており、GPUI が呼ぶ ToUnicode が 0 を返す）。
+        // meta として送るときだけ key から組み立てる
+        None if meta => printable_char_from_key(ks)?,
+        None => return None,
+    };
+    Some(if meta {
+        let mut bytes = Vec::with_capacity(1 + ch.len());
+        bytes.push(0x1b);
+        bytes.extend_from_slice(ch.as_bytes());
+        bytes
+    } else {
+        ch.into_bytes()
+    })
+}
+
+/// `key`（"v" / "@" 等の 1 文字キー名）から送出文字を作る。
+/// 機能キー（"f5"）・名前つきキー（"space"）・制御文字は None
+fn printable_char_from_key(ks: &Keystroke) -> Option<String> {
+    let mut chars = ks.key.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() || c.is_control() {
+        return None;
+    }
+    // Shift+英字は key が小文字のまま届く（GPUI Windows は英字を shift 変換しない。
+    // 数字・記号は変換済みで shift が下ろされるので、ここでは何も変わらない）
+    Some(if ks.modifiers.shift {
+        c.to_ascii_uppercase().to_string()
+    } else {
+        c.to_string()
+    })
 }
 
 #[cfg(test)]
@@ -439,6 +485,168 @@ mod tests {
             Some("あ".as_bytes().to_vec())
         );
         assert_eq!(keystroke_to_bytes_default(&ks("f5")), None);
+    }
+
+    /// 修飾を明示したキーストローク（`key_char` は実機で来る形をそのまま渡す）
+    fn ks_mods(key: &str, key_char: Option<&str>, mods: Modifiers) -> Keystroke {
+        Keystroke {
+            modifiers: mods,
+            key: key.into(),
+            key_char: key_char.map(Into::into),
+        }
+    }
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        }
+    }
+    fn alt_shift() -> Modifiers {
+        Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::default()
+        }
+    }
+    /// AltGr（Windows では Ctrl+Alt として届く）
+    fn altgr() -> Modifiers {
+        Modifiers {
+            alt: true,
+            control: true,
+            ..Modifiers::default()
+        }
+    }
+
+    /// #575: 非 macOS では Alt = meta。印字文字に ESC を前置して PTY へ送る
+    /// （Claude Code の Alt+V = クリップボード画像貼り付けがこの形を要求する）
+    #[test]
+    fn alt付き印字文字は非macosでescを前置する() {
+        // Linux 等、key_char に文字が入って届く形
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", Some("v"), alt()), true),
+            Some(b"\x1bv".to_vec())
+        );
+        // Windows 実機の形: Alt 単独では ToUnicode が文字を返さず key_char が None。
+        // ここで key へフォールバックしないと従来どおり何も送れない（= 無反応の再現）
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", None, alt()), true),
+            Some(b"\x1bv".to_vec())
+        );
+        // Shift+Alt+英字。GPUI Windows は英字を shift 変換しないので key は小文字で届く
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", None, alt_shift()), true),
+            Some(b"\x1bV".to_vec())
+        );
+        // 記号は GPUI 側で shift 変換済み（shift が下ろされる）ため key をそのまま使う
+        assert_eq!(
+            printable_to_bytes(&ks_mods("@", None, alt()), true),
+            Some(b"\x1b@".to_vec())
+        );
+        // 空の key_char は「文字が無い」と同じ扱い（key へフォールバックする）
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", Some(""), alt()), true),
+            Some(b"\x1bv".to_vec())
+        );
+    }
+
+    /// alt なしの印字文字は従来どおり（ESC を付けない）
+    #[test]
+    fn alt無しの印字文字はkey_charをそのまま送る() {
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", Some("v"), Modifiers::default()), true),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            printable_to_bytes(&ks_mods("a", Some("あ"), Modifiers::default()), true),
+            Some("あ".as_bytes().to_vec())
+        );
+        // key へのフォールバックは meta のときだけ（key_char 無し = 送るものが無い）
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", None, Modifiers::default()), true),
+            None
+        );
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", Some(""), Modifiers::default()), true),
+            None
+        );
+    }
+
+    /// AltGr（Ctrl+Alt）は欧州配列の @ / { 等の**文字入力**。ESC を前置すると壊れる
+    #[test]
+    fn altgrの文字はescを前置しない() {
+        assert_eq!(
+            printable_to_bytes(&ks_mods("2", Some("@"), altgr()), true),
+            Some(b"@".to_vec())
+        );
+        assert_eq!(
+            printable_to_bytes(&ks_mods("7", Some("{"), altgr()), true),
+            Some(b"{".to_vec())
+        );
+        // AltGr で文字が出ないキーは従来どおり何も送らない（key へ落ちない）
+        assert_eq!(printable_to_bytes(&ks_mods("v", None, altgr()), true), None);
+    }
+
+    /// macOS の Option は文字入力の一部（Option+V = 「√」）。挙動を変えてはならない
+    #[test]
+    fn macos相当ではaltを素通しする() {
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", Some("√"), alt()), false),
+            Some("√".as_bytes().to_vec())
+        );
+        // key へのフォールバックもしない（修正前と同じく None）
+        assert_eq!(printable_to_bytes(&ks_mods("v", None, alt()), false), None);
+        assert_eq!(
+            printable_to_bytes(&ks_mods("v", None, alt_shift()), false),
+            None
+        );
+    }
+
+    /// 機能キー・名前つきキーは meta でも文字を作らない（"\x1bf5" のような化けを出さない）
+    #[test]
+    fn 機能キーはmetaでも文字にしない() {
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_mods("f5", None, alt())),
+            None
+        );
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_mods("space", None, alt())),
+            None
+        );
+    }
+
+    /// #575: 実プラットフォームの既定（`ALT_IS_META`）が `keystroke_to_bytes` に
+    /// 配線されていることを固定する。非 macOS で Alt+V が meta にならなければ
+    /// Claude Code の画像ペーストは届かない
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macosではalt_vがmetaで送られる() {
+        const { assert!(ALT_IS_META) };
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_mods("v", None, alt())),
+            Some(b"\x1bv".to_vec()),
+            "Alt+V が ESC 前置で送られない（Claude Code の画像ペーストが無反応になる）"
+        );
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_mods("v", Some("v"), alt())),
+            Some(b"\x1bv".to_vec())
+        );
+        // AltGr は素通し（回帰防止）
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_mods("2", Some("@"), altgr())),
+            Some(b"@".to_vec())
+        );
+    }
+
+    /// macOS 側は Option の文字入力（√）がそのまま PTY へ届く
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macosではaltにescを前置しない() {
+        const { assert!(!ALT_IS_META) };
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_mods("v", Some("√"), alt())),
+            Some("√".as_bytes().to_vec())
+        );
+        assert_eq!(keystroke_to_bytes_default(&ks_mods("v", None, alt())), None);
     }
 
     #[test]
