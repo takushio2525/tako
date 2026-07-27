@@ -3,6 +3,14 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
+	// Astro 6 では markdown.gfm の既定値が unified() 側へ移ったが、@astrojs/mdx v5 は
+	// 未設定（undefined）を「無効」と解釈するため、.mdx ページだけ GFM テーブルが
+	// 素通しになる。明示的に true を置いて .md / .mdx の描画を揃える。
+	// このオプション自体は deprecated 警告が出る。Astro / Starlight 側が
+	// unified() ベースの設定に揃ったら、そちらへ移すこと
+	markdown: {
+		gfm: true,
+	},
 	integrations: [
 		starlight({
 			title: 'tako',

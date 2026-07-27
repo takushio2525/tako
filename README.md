@@ -3,7 +3,7 @@
 **AI エージェント時代の、集約監視に特化した高速 GUI ターミナル**
 **A fast GUI terminal built for the AI-agent era — monitor your whole agent fleet in one tab.**
 
-> 🚧 開発中（macOS で動作）。 / In development — runs on macOS.
+> 🚧 開発中。macOS で動作、Windows はテスター向けプレビュー。 / In development — runs on macOS, with a tester preview for Windows.
 
 ## なぜ tako？ / Why tako?
 
@@ -28,10 +28,23 @@ The terminal core (tabs, splits, IME), the `tako` CLI, and the built-in MCP serv
 
 ## ダウンロード / Download
 
-[GitHub Releases](https://github.com/takushio2525/tako/releases) から最新の zip をダウンロードできます。
-Pre-built macOS binaries are available on the [Releases](https://github.com/takushio2525/tako/releases) page.
+**[GitHub Releases から最新版をダウンロード →](https://github.com/takushio2525/tako/releases/latest)**
 
-### インストール手順 / Installation
+macOS 版と Windows 版を同じリリースで配布しています。OS を切り替えながら読める手順は
+[セットアップガイド](https://tako-docs.pages.dev/getting-started/)にあります。
+macOS and Windows builds ship in the same release. See the
+[setup guide](https://tako-docs.pages.dev/getting-started/) for OS-switchable instructions.
+
+### macOS
+
+Homebrew（推奨） / Homebrew (recommended):
+
+```sh
+brew tap takushio2525/tako
+brew install --cask takushio2525/tako/tako
+```
+
+zip から入れる場合 / From the zip:
 
 1. `tako-vX.X.X-macos-arm64.zip` をダウンロード / Download the zip
 2. ダブルクリックで展開 / Extract by double-clicking
@@ -41,6 +54,30 @@ Pre-built macOS binaries are available on the [Releases](https://github.com/taku
    - **システム設定 → プライバシーとセキュリティ** を開く / Open **System Settings → Privacy & Security**
    - 下部に「"tako"は開発元を確認できないため〜」と表示されるので **「このまま開く」** をクリック / Click **"Open Anyway"** next to the tako warning
    - もう一度 `tako.app` を起動すると「開く」ボタンが表示される / Launch again and click **"Open"**
+
+### Windows（テスター向けプレビュー / tester preview）
+
+対象は 64bit（x64）の Windows 10 バージョン 1809 以降、または Windows 11。
+Windows 対応は進行中で、まずはターミナルとしての基本機能から段階的に対応しています。
+インストール後に `tako platform` を実行すると、その環境で使える機能を確認できます。
+Requires 64-bit (x64) Windows 10 1809+ or Windows 11. The Windows port is in progress —
+run `tako platform` after installing to see which features are available on your machine.
+
+1. `tako-setup-vX.X.X-x64.exe`（インストーラー、推奨）をダウンロードして実行 /
+   Download and run the installer (recommended)
+   - 管理者権限は不要（現在のユーザーにインストール） / No admin rights needed (per-user install)
+   - 「tako を PATH に追加する」は既定で有効 / The "add tako to PATH" task is enabled by default
+2. コード署名がないため SmartScreen の警告（「WindowsによってPCが保護されました」）が出る /
+   Unsigned, so Microsoft Defender SmartScreen will warn:
+   - **「詳細情報」** をクリック → **「実行」** をクリック / Click **"More info"**, then **"Run anyway"**
+3. **新しく** PowerShell を開いて `tako --version` を確認（PATH 変更は既存のウィンドウに反映されない） /
+   Open a **new** PowerShell and check `tako --version` (PATH changes don't apply to open windows)
+4. スタートメニューから **tako** を起動 / Launch **tako** from the Start menu
+
+インストーラーを使わない場合は `tako-vX.X.X-windows-x64.zip` を展開し、`tako-app.exe` を直接起動します
+（`tako` コマンドを使うには展開先を PATH に手動で追加）。 /
+Alternatively, extract `tako-vX.X.X-windows-x64.zip` and run `tako-app.exe` directly
+(add the folder to your PATH manually to use the `tako` command).
 
 ## ソースからビルド / Build from Source
 
@@ -58,6 +95,8 @@ scripts/build-app.sh --install
 無い場合は同梱の PNG から自動でフォールバックします。
 
 開発時はバンドル不要で `cargo run -p tako-app` がそのまま使えます。
+Windows でのビルド前提（VS Build Tools / Spectre 緩和ライブラリ等）は
+[ビルド方法](https://tako-docs.pages.dev/development/building/)を参照してください。
 
 To build `tako.app` on macOS, run `scripts/build-app.sh --verify` (creates `dist/tako.app` and
 runs the bundled self-test), then `scripts/build-app.sh --install` to copy it into `/Applications`.
