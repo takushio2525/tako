@@ -175,6 +175,28 @@ pub fn desc_autosuggest() -> &'static str {
     )
 }
 
+pub fn label_autosuggest_tab() -> &'static str {
+    tr!("Tab キーでも確定", "Accept with Tab too")
+}
+
+pub fn desc_autosuggest_tab() -> &'static str {
+    tr!(
+        "予測が出ていてカーソルが行末にあるときだけ Tab を確定にする（それ以外の Tab は従来の補完のまま）",
+        "Make Tab accept the suggestion, but only while one is shown and the cursor sits at the end of the line (Tab keeps completing otherwise)"
+    )
+}
+
+pub fn label_autosuggest_hint() -> &'static str {
+    tr!("確定キーの案内", "Show how to accept")
+}
+
+pub fn desc_autosuggest_hint() -> &'static str {
+    tr!(
+        "予測の後ろに確定キーを薄く出す（覚えるまでの案内。既定 10 回で自動的に消える）",
+        "Show the accept key faded after the suggestion — a short tutorial that disappears after 10 times by default"
+    )
+}
+
 pub fn label_persist() -> &'static str {
     tr!("セッション永続化", "Session persistence")
 }
@@ -789,6 +811,10 @@ mod tests {
                 desc_port_detect().into(),
                 label_autosuggest().into(),
                 desc_autosuggest().into(),
+                label_autosuggest_tab().into(),
+                desc_autosuggest_tab().into(),
+                label_autosuggest_hint().into(),
+                desc_autosuggest_hint().into(),
                 label_persist().into(),
                 desc_persist().into(),
                 desc_persist_no_tmux().into(),

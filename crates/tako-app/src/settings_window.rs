@@ -1183,6 +1183,8 @@ impl SettingsWindow {
         let auto_rename = s.auto_rename;
         let port_detect = s.port_detect;
         let autosuggest = s.autosuggest;
+        let autosuggest_hint = s.autosuggest_hint;
+        let autosuggest_tab = s.autosuggest_tab;
         let persist = s.tmux_persist;
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
@@ -1255,6 +1257,45 @@ impl SettingsWindow {
                         this.run(
                             Request::Autosuggest {
                                 enabled: Some(!autosuggest),
+                                hint: None,
+                                tab: None,
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // 確定キーの Tab 対応 + チュートリアル表示（Issue #614）
+            .child(self.row(
+                txt::label_autosuggest_tab(),
+                txt::desc_autosuggest_tab(),
+                self.toggle(
+                    "autosuggest_tab",
+                    autosuggest_tab,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::Autosuggest {
+                                enabled: None,
+                                hint: None,
+                                tab: Some(!autosuggest_tab),
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            .child(self.row(
+                txt::label_autosuggest_hint(),
+                txt::desc_autosuggest_hint(),
+                self.toggle(
+                    "autosuggest_hint",
+                    autosuggest_hint,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::Autosuggest {
+                                enabled: None,
+                                hint: Some(!autosuggest_hint),
+                                tab: None,
                             },
                             cx,
                         );

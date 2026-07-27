@@ -180,6 +180,7 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
 | FR-2.4.3 | 検知時に「プレビューを開く？」等の**提案チップ**を表示。承諾時のみペイン生成（強制分割はしない） | S |
 | FR-2.4.4 | パッシブ検知全体を設定で無効化できる | M |
 | FR-2.4.5 | シェル統合経路で tako 内の zsh に**履歴ベースの入力予測**（ゴーストテキスト）を提供する | S |
+| FR-2.4.5.1 | 入力予測の**確定キーをその場で案内**し（回数制限つきチュートリアル）、**ゴースト表示中だけ Tab でも確定**できる | S |
 | FR-2.4.6 | シェル統合経路で tako が開いたシェルの PATH に**同梱 CLI のディレクトリ**を自動追加する（tako の中では常に `tako` が打てる。FR-2.14.5 の tako 内側の解） | M |
 
 実装メモ（FR-2.4.2〜2.4.4 は 2026-06-12 完成）:
@@ -220,6 +221,43 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
 - 既知の限界: zinit turbo のような**遅延ローダー**でユーザーが後から
   zsh-autosuggestions を読み込む構成では、最初のプロンプト時点で判定できないため
   二重に読み込まれうる。その場合は `TAKO_NO_AUTOSUGGESTIONS=1` で tako 側を止める
+
+実装メモ（FR-2.4.5.1。2026-07-27 / Issue #614 完成）:
+
+- 解決するのは**確定キーの発見不能**。実機報告は「予測は出るが → で確定できると分からない。
+  多分みんな Tab を押す」。対処は「その場で案内する」と「実際に Tab でも確定できる」の 2 本立て
+- **案内はゴーストの直後に薄く出す**（`[→ か Tab で確定]` / `[→ or Tab to accept]`）。
+  ゴースト本体と同じ `POSTDISPLAY` へ足し、`ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE` で同じ薄さに塗る。
+  下段への `zle -M` 方式は採らない（1 打鍵遅れる・画面下端でスクロールが跳ね、
+  scrollback に空行が残る。実測で確認）
+- `POSTDISPLAY` は**プラグインが「確定するテキスト」として読む変数**でもあるので、
+  プラグインが触る前に必ず外す。関門は `_zsh_autosuggest_highlight_reset`（全 widget の入口）と
+  `_zsh_autosuggest_highlight_apply`（全 widget の出口・`zle -R` の直前）の 2 つだけを包む方式。
+  accept 系 widget を個別に包むより漏れが無く、**非同期で予測が届く経路**
+  （`zle -F` → `autosuggest-suggest` → `zle -R`）も同じ関門を通る
+  （`zle-line-pre-redraw` フックはこの非同期経路で発火しないため使えない。実測で確認）
+- 案内は**コマンドライン 1 本につき 1 回**残り回数を消費し、既定 10 回で自動的に消える。
+  「出す / 出さない」は**その行の最初の 1 回で決めて行のあいだ変えない**（残り回数を毎描画で
+  見ると、消費した瞬間＝残り 0 になった瞬間に同じ行から案内が消える）。
+  残り回数は `<data_dir>/shell-integration/autosuggest-hint`（`off` = 恒久 OFF。
+  **不在・壊れた値は既定回数**）に置き、zsh 側が減らして書き戻す。
+  文言は tako が `autosuggest-hint-text`（1 行目 = Tab 確定あり / 2 行目 = なし）へ言語別に書く
+  （i18n は Rust 側に閉じ、`tako lang` の切替がそのまま効く）
+- **Tab 確定はゴースト表示中かつカーソルが行末のときだけ**。それ以外は
+  `^I` に元々割り当てられていた widget へ委譲する（`.zshrc` の後に `bindkey '^I'` で捕まえるので、
+  fzf-tab 等でユーザーが張り替えていればそれを尊重する）。補完メニュー内の Tab は
+  `menuselect` キーマップなので触っていない = 巡回は不変。自前 widget は
+  `ZSH_AUTOSUGGEST_IGNORE_WIDGETS` に入れる（包まれると `POSTDISPLAY` が空で渡り判定できない）
+- **ゴーストが出ているが補完したいときの逃げ道**（この順で軽い）:
+  ① カーソルを 1 つ左へ動かす（行末でなくなるので Tab は補完に戻る）
+  ② 設定 / `tako autosuggest tab off` / MCP `tako_autosuggest {"tab": false}` で恒久的に OFF
+  ③ そのシェルだけなら `TAKO_NO_AUTOSUGGEST_TAB=1`
+- ON/OFF は `settings.json` の `autosuggest_hint` / `autosuggest_tab`（どちらも既定 ON）+
+  dispatch `Autosuggest { hint, tab }`（`tako autosuggest hint|tab [on|off]` /
+  MCP `tako_autosuggest` の `hint` / `tab`）+ env `TAKO_AUTOSUGGEST_HINT` / `TAKO_AUTOSUGGEST_TAB`。
+  シェル側の逃げ道は `TAKO_NO_AUTOSUGGEST_HINT=1` / `TAKO_NO_AUTOSUGGEST_TAB=1`。
+  `hint` を ON へ戻すと残り回数が既定へ戻る（= もう一度チュートリアルを見せる）
+- 案内が行を溢れさせるくらいなら出さない（`$#BUFFER + $#POSTDISPLAY + 案内 + 余白 <= COLUMNS`）
 
 実装メモ（FR-2.4.6。2026-07-27 / Issue #601 完成）:
 

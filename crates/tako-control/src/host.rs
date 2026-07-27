@@ -160,6 +160,18 @@ pub trait UiStateHost {
     }
     /// 入力予測の ON/OFF 切替（永続化とシェル側の状態ファイル反映は実装側の責務）
     fn set_autosuggest(&mut self, _enabled: bool) {}
+    /// 確定キーのヒント表示（Issue #614）の現在状態。`false` = 恒久 OFF
+    fn autosuggest_hint_enabled(&self) -> bool {
+        true
+    }
+    /// ヒント表示の ON/OFF 切替（ON は残り回数を既定へ戻す = もう一度案内する）
+    fn set_autosuggest_hint(&mut self, _enabled: bool) {}
+    /// ゴースト表示中の Tab 確定（Issue #614）の現在状態
+    fn autosuggest_tab_enabled(&self) -> bool {
+        true
+    }
+    /// Tab 確定の ON/OFF 切替
+    fn set_autosuggest_tab(&mut self, _enabled: bool) {}
     /// × ボタン close の確認ダイアログの現在状態（Issue #172）
     fn confirm_close_enabled(&self) -> bool {
         true

@@ -456,10 +456,19 @@ tako portdetect off
 tako autorename on
 tako autorename off
 
-# 入力予測（tako 内 zsh でコマンド履歴から続きを薄く表示。右矢印キーで確定）
-tako autosuggest        # 現在状態を表示（既定 ON）
+# 入力予測（tako 内 zsh でコマンド履歴から続きを薄く表示。右矢印か Tab で確定）
+tako autosuggest         # 現在状態を表示（既定 ON）
 tako autosuggest off
 tako autosuggest on
+
+# 確定キーの案内（予測の後ろに薄く出るチュートリアル。既定 10 回で自動的に消える）
+tako autosuggest hint    # 残り回数を表示
+tako autosuggest hint off  # 恒久 OFF
+tako autosuggest hint on   # もう一度案内する（残り回数が既定に戻る）
+
+# Tab でも確定する（既定 ON）
+tako autosuggest tab off   # Tab は常に従来の補完へ
+tako autosuggest tab on
 ```
 
 :::note[入力予測は tako の中だけ]
@@ -467,6 +476,13 @@ tako autosuggest on
 `~/.zshrc` は書き換えないので、tako の外のターミナルの挙動は変わりません。
 すでに自分で zsh-autosuggestions を導入している場合、tako は二重に読み込まず
 何もしません（あなたの設定がそのまま使われます）。
+:::
+
+:::note[Tab 確定は補完を奪わない]
+Tab が確定になるのは **予測が出ていて、かつカーソルが行末にあるとき**だけです。
+それ以外の Tab は今までどおりの補完で、補完メニューの中の Tab（候補の巡回）にも
+影響しません。予測が出ている状態で補完したいときは、カーソルを 1 つ左へ動かすか、
+`tako autosuggest tab off` で恒久的に切ってください。
 :::
 
 ## リモートアクセス

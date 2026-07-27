@@ -99,9 +99,10 @@ enum Command {
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップの ON/OFF・状態確認
     Portdetect(ToggleArgs),
-    /// tako 内 zsh の入力予測（履歴ベースのゴーストテキスト。右矢印で確定）の
-    /// ON/OFF・状態確認。既定 ON。tako の外の zsh には影響しない
-    Autosuggest(ToggleArgs),
+    /// tako 内 zsh の入力予測（履歴ベースのゴーストテキスト。右矢印か Tab で確定）の
+    /// ON/OFF・状態確認。既定 ON。tako の外の zsh には影響しない。
+    /// `hint` / `tab` で確定キーの案内と Tab 確定を個別に切り替える
+    Autosuggest(AutosuggestArgs),
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
@@ -1955,6 +1956,22 @@ struct PanelArgs {
 #[derive(Args)]
 struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+}
+
+/// 入力予測の引数（Issue #600 / #614）。
+///
+/// `tako autosuggest [on|off]` = 予測そのもの、
+/// `tako autosuggest hint|tab [on|off]` = 確定キーの案内 / Tab 確定。
+/// サブコマンドではなく位置引数にしているのは、素の `tako autosuggest` を
+/// 状態表示のままにするため（`tako theme` と同じ形）
+#[derive(Args)]
+struct AutosuggestArgs {
+    /// on / off（予測そのもの）、または hint / tab（切替対象）。省略時は現在状態を表示
+    #[arg(value_parser = ["on", "off", "hint", "tab"])]
+    target_or_state: Option<String>,
+    /// hint / tab を指定したときの on / off（省略時はその項目の現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
 }
@@ -4414,9 +4431,26 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
-        Command::Autosuggest(args) => Request::Autosuggest {
-            enabled: args.state.as_deref().map(|s| s == "on"),
-        },
+        Command::Autosuggest(args) => {
+            let on = |v: &Option<String>| v.as_deref().map(|s| s == "on");
+            match args.target_or_state.as_deref() {
+                Some("hint") => Request::Autosuggest {
+                    enabled: None,
+                    hint: on(&args.state),
+                    tab: None,
+                },
+                Some("tab") => Request::Autosuggest {
+                    enabled: None,
+                    hint: None,
+                    tab: on(&args.state),
+                },
+                other => Request::Autosuggest {
+                    enabled: other.map(|s| s == "on"),
+                    hint: None,
+                    tab: None,
+                },
+            }
+        }
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -6536,22 +6570,73 @@ mod tests {
         let status = parse(&["tako", "autosuggest"]);
         assert_eq!(
             build_request(&status).unwrap(),
-            Request::Autosuggest { enabled: None }
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None
+            }
         );
         let disable = parse(&["tako", "autosuggest", "off"]);
         assert_eq!(
             build_request(&disable).unwrap(),
             Request::Autosuggest {
-                enabled: Some(false)
+                enabled: Some(false),
+                hint: None,
+                tab: None
             }
         );
         let enable = parse(&["tako", "autosuggest", "on"]);
         assert_eq!(
             build_request(&enable).unwrap(),
             Request::Autosuggest {
-                enabled: Some(true)
+                enabled: Some(true),
+                hint: None,
+                tab: None
             }
         );
+    }
+
+    /// #614: `hint` / `tab` は本体を巻き込まずにその項目だけを触る。
+    /// 引数なしなら現在状態の取得（`tako autosuggest hint` = 表示のみ）
+    #[test]
+    fn autosuggestのヒントとtab確定を個別に切り替えられる() {
+        for (argv, expect) in [
+            (
+                vec!["tako", "autosuggest", "hint"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: None,
+                    tab: None,
+                },
+            ),
+            (
+                vec!["tako", "autosuggest", "hint", "off"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: Some(false),
+                    tab: None,
+                },
+            ),
+            (
+                vec!["tako", "autosuggest", "hint", "on"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: Some(true),
+                    tab: None,
+                },
+            ),
+            (
+                vec!["tako", "autosuggest", "tab", "off"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: None,
+                    tab: Some(false),
+                },
+            ),
+        ] {
+            let parsed = parse(&argv);
+            assert_eq!(build_request(&parsed).unwrap(), expect, "{argv:?}");
+        }
     }
 
     #[test]
