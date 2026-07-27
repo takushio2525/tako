@@ -11121,6 +11121,30 @@ mod tests {
                 .args(["-L", E2E_SOCKET_577, "kill-server"])
                 .output();
             remove_e2e_577_dir(&self.dir);
+            remove_e2e_trust_entry(&self.dir.join("work"));
+        }
+    }
+
+    /// e2e が書いた事前信頼エントリを claude の `.claude.json` から除去する（best-effort）。
+    /// 消さないと実行のたびに `/private/tmp/tako-e2e-577-<pid>/work` が溜まり続ける
+    /// （claude_tui_e2e の `remove_trust_entry` と同じ後始末）
+    fn remove_e2e_trust_entry(dir: &std::path::Path) {
+        let key = dir.display().to_string();
+        for path in crate::claude_tui::config_json_paths(None) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(mut root) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else {
+                continue;
+            };
+            if projects.remove(&key).is_some() {
+                if let Ok(serialized) = serde_json::to_string_pretty(&root) {
+                    let _ = std::fs::write(&path, serialized);
+                }
+            }
         }
     }
 
