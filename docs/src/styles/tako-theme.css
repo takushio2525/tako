@@ -792,6 +792,8 @@ nav[class*='sidebar'] a {
   font-family: var(--sl-font);
   font-size: 0.92rem;
   border-radius: var(--tako-radius-sm);
+  /* ナビゲーションは下線を引かない（本文リンクとの役割の違いを見た目で分ける） */
+  text-decoration: none !important;
   transition: background-color 0.18s var(--tako-ease-soft), color 0.18s var(--tako-ease-soft);
 }
 
@@ -848,6 +850,7 @@ nav[class*='sidebar'] a[aria-current='page']::before {
   font-family: var(--sl-font);
   font-size: 0.85rem;
   border-radius: var(--tako-radius-sm);
+  text-decoration: none !important;
   transition: color 0.18s var(--tako-ease-soft);
 }
 
@@ -1074,6 +1077,7 @@ a:hover {
   color: var(--tako-ink);
   border-radius: var(--tako-radius-md);
   padding: 0.9em 1.2em;
+  text-decoration: none !important;
   box-shadow: var(--tako-shadow-sm);
   transition: transform 0.25s var(--tako-ease), box-shadow 0.25s var(--tako-ease),
     border-color 0.2s var(--tako-ease-soft), color 0.2s var(--tako-ease-soft);
