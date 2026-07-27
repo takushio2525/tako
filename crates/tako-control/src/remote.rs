@@ -4543,8 +4543,34 @@ mod tests {
     fn kill_stale_daemonは存在しないpidで安全に完了する() {
         // cleanup_state_files が state_dir を掃除するため、env var 窓中の他テストを壊さないよう直列化
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // **state_dir をテンポラリへ差し替えてから呼ぶこと**。差し替えないと
+        // cleanup_state_files が本番 state（socket / pid / token）を消し、
+        // 稼働中の remote daemon が到達不能になる（`cargo test` のたびに
+        // スマホからの接続が黙って切れる。#621 の検証中に踏んだ）
+        let dir = std::env::temp_dir().join(format!("tako-test-kill-stale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
         // is_process_alive が false なので即 cleanup_state_files して return
         kill_stale_daemon(999_999_999);
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上のテストの回帰止め: state_dir 未差し替えで cleanup 系を呼ぶと
+    /// 本番 state を消しうることを、**消さずに**パス比較だけで示す
+    #[test]
+    fn state_dirは環境変数未設定なら本番ディレクトリを指す() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let production = state_dir();
+        let tmp = std::env::temp_dir().join(format!("tako-test-statedir-{}", std::process::id()));
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", tmp.as_os_str());
+        assert_eq!(state_dir(), tmp, "環境変数があればそちらを指す");
+        assert_ne!(
+            production, tmp,
+            "未設定時は本番 state を指す = 掃除系テストは必ず差し替えてから呼ぶ"
+        );
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
     }
 
     #[test]
