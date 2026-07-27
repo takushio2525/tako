@@ -1376,3 +1376,20 @@
 - 検証: 品質ゲート全緑（1377）+ 隔離セルフテスト FAILED 0 + 隔離インスタンスへの実測
   （fleet / tmux / git 切替・MCP 3 経路・tools/list の enum）。GUI スクショは蓋閉じで取得不可、
   代わりにセルフテスト 49 が `app.panel_view == PanelView::Fleet` と応答 `view=="fleet"` を同時判定
+
+## 2026-07-27（#550 + #559: ファイルツリーの初回印象と新規作成インライン入力）
+- #550: ドット始まりを既定で非表示（表示時フィルタ = トグル即反映。ルート見出しは対象外）+
+  トグル 3 経路（見出しの目アイコン / 右クリック / 設定画面の外観）+ 増えたルートを自動展開して
+  先頭へ（既存の並びは維持しポーリングで暴れない）。settings.json `show_hidden_files` 永続化 +
+  CLI `tako panel --show-hidden` / MCP `tako_panel` の `show_hidden` と 1:1
+- #559: インライン入力欄を「展開済み子孫を飛ばした末尾」→「確定後にその項目が並ぶ位置」へ。
+  位置計算は純関数 `sidebar::inline_insert_position` に切り出し、インデント規則を通常行と一致。
+  作成先の行を強調 + プレースホルダ + 確定後は `FileTree::refresh_dir` で即反映
+- 実測で判明した訂正: **VSCode / Zed の既定は `.git` 等の個別除外であり、ドット全体は隠さない**
+  （実機確認）。Issue 本文の「VSCode と同じ既定」は不正確なのでコメント / requirements を訂正。
+  VSCode の New File 入力位置も「親の真下」ではなく「ファイル群の先頭」だったので実装を合わせた
+- 関連コミット: `fe5e341`（PR #565 squash merge）。品質ゲート全緑（1384）+ セルフテスト項目
+  83 / 84 新設（修正を戻すと FAILED になることを実測）+ CLI・MCP・永続化・GUI 実クリックを隔離実測。
+  証拠は `~/dev/tako-evidence/550/`
+- 既知: 合成キー入力は IME に吸われるため入力欄への打鍵は GUI 未検証（セルフテスト 84 で代替）。
+  `cargo fmt --all --check` が `keybindings.rs:248` で落ちるのは **main 由来**（#546 merge 時点から）
