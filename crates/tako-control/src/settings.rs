@@ -16,6 +16,10 @@ pub struct Settings {
     /// listen ポート検知 + 提案チップ（FR-2.4.4。既定 ON）
     #[serde(default = "default_true")]
     pub port_detect: bool,
+    /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600。既定 ON）。
+    /// zsh 以外のシェル・ユーザーが自前で導入済みの環境では設定に関わらず無害に素通しする
+    #[serde(default = "default_true")]
+    pub autosuggest: bool,
     /// 表示中プレビューファイルのライブリロード（Issue #233。既定 ON）
     #[serde(default = "default_true")]
     pub preview_live_reload: bool,
@@ -131,6 +135,7 @@ impl Default for Settings {
         Self {
             auto_rename: true,
             port_detect: true,
+            autosuggest: true,
             preview_live_reload: true,
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
@@ -272,6 +277,7 @@ mod tests {
         let settings = Settings {
             auto_rename: false,
             port_detect: false,
+            autosuggest: false,
             preview_live_reload: false,
             preview_cache_max_mb: 768,
             tmux_persist: false,
@@ -309,6 +315,8 @@ mod tests {
         assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
+        // #600: 入力予測は既定 ON（旧ファイル後方互換）
+        assert!(parsed.autosuggest);
         // #550: 隠しファイルは既定で非表示（未知キーの後方互換も兼ねる）
         assert!(!parsed.show_hidden_files);
         assert!(parsed.preview_live_reload);

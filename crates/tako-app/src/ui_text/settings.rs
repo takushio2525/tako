@@ -164,6 +164,17 @@ pub fn desc_port_detect() -> &'static str {
     )
 }
 
+pub fn label_autosuggest() -> &'static str {
+    tr!("入力予測", "Input suggestions")
+}
+
+pub fn desc_autosuggest() -> &'static str {
+    tr!(
+        "tako 内の zsh でコマンド履歴から続きを薄く表示する（右矢印キーで確定）",
+        "Show a faded completion from shell history in tako's zsh (press the right arrow to accept)"
+    )
+}
+
 pub fn label_persist() -> &'static str {
     tr!("セッション永続化", "Session persistence")
 }
@@ -776,6 +787,8 @@ mod tests {
                 desc_auto_rename().into(),
                 label_port_detect().into(),
                 desc_port_detect().into(),
+                label_autosuggest().into(),
+                desc_autosuggest().into(),
                 label_persist().into(),
                 desc_persist().into(),
                 desc_persist_no_tmux().into(),

@@ -99,6 +99,9 @@ enum Command {
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップの ON/OFF・状態確認
     Portdetect(ToggleArgs),
+    /// tako 内 zsh の入力予測（履歴ベースのゴーストテキスト。右矢印で確定）の
+    /// ON/OFF・状態確認。既定 ON。tako の外の zsh には影響しない
+    Autosuggest(ToggleArgs),
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
@@ -4411,6 +4414,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Autosuggest(args) => Request::Autosuggest {
+            enabled: args.state.as_deref().map(|s| s == "on"),
+        },
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -5894,6 +5900,7 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Autorename(_)
         | Command::Portdetect(_)
+        | Command::Autosuggest(_)
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
@@ -6519,6 +6526,30 @@ mod tests {
             build_request(&disable).unwrap(),
             Request::PreviewReload {
                 enabled: Some(false)
+            }
+        );
+    }
+
+    /// #600: 入力予測は素の `tako autosuggest` で状態確認、on / off で切替
+    #[test]
+    fn autosuggestは状態取得と切替を操作へ写す() {
+        let status = parse(&["tako", "autosuggest"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::Autosuggest { enabled: None }
+        );
+        let disable = parse(&["tako", "autosuggest", "off"]);
+        assert_eq!(
+            build_request(&disable).unwrap(),
+            Request::Autosuggest {
+                enabled: Some(false)
+            }
+        );
+        let enable = parse(&["tako", "autosuggest", "on"]);
+        assert_eq!(
+            build_request(&enable).unwrap(),
+            Request::Autosuggest {
+                enabled: Some(true)
             }
         );
     }

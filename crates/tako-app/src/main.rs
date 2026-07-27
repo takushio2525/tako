@@ -497,6 +497,19 @@ fn initial_port_detect() -> bool {
     tako_control::settings::load().port_detect
 }
 
+/// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600）の起動時の有効判定。
+/// `TAKO_AUTOSUGGEST=0|false|off` は設定ファイルより優先して無効化する
+/// （シェル側の完全な逃げ道は `TAKO_NO_AUTOSUGGESTIONS=1`）。
+fn initial_autosuggest() -> bool {
+    if matches!(
+        std::env::var("TAKO_AUTOSUGGEST").ok().as_deref(),
+        Some("0" | "false" | "off")
+    ) {
+        return false;
+    }
+    tako_control::settings::load().autosuggest
+}
+
 /// プレビューライブリロード（Issue #233）の起動時の有効判定。
 /// `TAKO_PREVIEW_RELOAD=0|false|off` は設定ファイルより優先して無効化する。
 fn initial_preview_reload() -> bool {
@@ -903,6 +916,9 @@ struct TakoApp {
     auto_title_hints: HashMap<u64, std::time::Instant>,
     /// listen ポート検知 + 提案チップの有効状態（FR-2.4.4。dispatch から切替）
     port_detect: bool,
+    /// tako 内 zsh の入力予測の有効状態（FR-2.4.5 / Issue #600。dispatch から切替）。
+    /// 実際にシェルへ伝わるのは `shell_integration` の状態ファイル経由
+    autosuggest: bool,
     /// 表示中の提案チップ（FR-2.4.3。新規 listen ポートごとに 1 件）
     port_suggestions: Vec<PortSuggestion>,
     /// 却下済みの (ペイン, ポート)。ポートが消えるまで再提案しない
@@ -2194,6 +2210,7 @@ impl TakoApp {
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
+            autosuggest: initial_autosuggest(),
             port_suggestions: Vec::new(),
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
@@ -2345,6 +2362,10 @@ impl TakoApp {
             .map(|w| w.id())
             .filter(|w| *w != active_window)
             .collect();
+        // #600: 入力予測の状態ファイルを settings.json と揃える。
+        // シェル側は「不在 = ON」なので、OFF 設定のまま起動したときに必ず書き出す必要がある
+        // （書き先は data_dir 配下 = 隔離起動なら隔離される）
+        tako_core::shell_integration::set_autosuggest(app.autosuggest);
         // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
         tako_control::sleep_guard::disable_app_nap();
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
@@ -13350,6 +13371,25 @@ impl UiStateHost for TakoApp {
         }
     }
 
+    fn autosuggest_enabled(&self) -> bool {
+        self.autosuggest
+    }
+
+    fn set_autosuggest(&mut self, enabled: bool) {
+        self.autosuggest = enabled;
+        // シェル側へ即時反映（稼働中のペインにも次のプロンプトから効く）。
+        // 書き先は data_dir 配下なので TAKO_ISOLATED / TAKO_DATA_DIR の隔離に追従する
+        tako_core::shell_integration::set_autosuggest(enabled);
+        // 永続化（FR-2.4.5）。セルフテスト中はユーザー設定を汚さない
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.autosuggest = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
     fn confirm_close_enabled(&self) -> bool {
         self.confirm_close
     }
@@ -18864,6 +18904,180 @@ mod self_test {
             wait(cx, 800).await;
             type_text(any, cx, "true", true);
             wait(cx, 500).await;
+
+            // 41c. 入力予測（FR-2.4.5 / Issue #600）: シェル統合が同梱の
+            //      zsh-autosuggestions を tako 内の zsh にだけ読み込ませ、履歴からの
+            //      ゴーストテキスト → 右矢印で確定 → OFF で消える、が成り立つこと。
+            //      ログインシェルに依存しないよう、隔離 HOME の zsh を子として起こす
+            //      （本番と同じ ZDOTDIR / .zshenv / 同梱プラグインを実際に通す）
+            let zdotdir = tako_core::shell_integration::env()
+                .iter()
+                .find(|(k, _)| k == "ZDOTDIR")
+                .map(|(_, v)| v.clone());
+            if let (Some(zdotdir), true) = (zdotdir, std::path::Path::new("/bin/zsh").is_file()) {
+                let as_home = std::env::temp_dir().join(format!("tako-st600-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&as_home);
+                std::fs::create_dir_all(&as_home).expect("隔離 HOME を作れる");
+                // 予測のネタになる履歴を 1 行だけ置く
+                std::fs::write(as_home.join(".zsh_history"), "echo TAKO600-ghost-ok\n")
+                    .expect("履歴を置ける");
+                std::fs::write(
+                    as_home.join(".zshrc"),
+                    "PROMPT='ST600> '\nHISTFILE=$HOME/.zsh_history\nHISTSIZE=100\nSAVEHIST=100\n",
+                )
+                .expect(".zshrc を置ける");
+                let before = window
+                    .update(cx, |app, _, _| app.autosuggest)
+                    .unwrap_or(true);
+
+                // 予測 ON の状態から始める（既定 ON。dispatch 経由 = CLI / MCP と同じ経路）
+                let on = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Autosuggest {
+                                enabled: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .expect("autosuggest は常に成功する")
+                    })
+                    .expect("window");
+                check(
+                    on["enabled"] == true && on["provider"] == "zsh-autosuggestions",
+                    "入力予測 dispatch が ON と同梱プロバイダを返す",
+                );
+                check(
+                    tako_core::shell_integration::autosuggest_state(),
+                    "ON がシェル側の状態ファイルへ書かれる",
+                );
+
+                type_text(
+                    any,
+                    cx,
+                    &format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", as_home.display()),
+                    true,
+                );
+                wait(cx, 2500).await;
+                check(
+                    focused_contains(window, cx, "ST600>"),
+                    "検証用 zsh が起動する（入力予測）",
+                );
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                // 履歴 `echo TAKO600-ghost-ok` の接頭辞だけ打つ（Enter は押さない）
+                type_text(any, cx, "echo TAKO600-gh", false);
+                wait(cx, 1200).await;
+                check(
+                    focused_contains(window, cx, "ghost-ok"),
+                    "履歴からゴースト予測が出る",
+                );
+                // 右矢印（forward-char）で全確定 → 続きを打って実行できる
+                press(any, cx, "right");
+                type_text(any, cx, " 41c", true);
+                wait(cx, 1200).await;
+                check(
+                    focused_contains(window, cx, "TAKO600-ghost-ok 41c"),
+                    "右矢印で予測が確定する",
+                );
+
+                // エッジ 1: IME 変換中（未確定文字列）でも予測表示が壊れないこと。
+                // tako の未確定文字列はオーバーレイ描画で PTY へ流れないので、
+                // シェル側のバッファ = 予測はそのまま残るのが正しい挙動
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "clear", true);
+                wait(cx, 800).await;
+                type_text(any, cx, "echo TAKO600-gh", false);
+                wait(cx, 1200).await;
+                let ime_kept = window
+                    .update(cx, |app, window, cx| {
+                        app.replace_and_mark_text_in_range(None, "にほんご", Some(0..4), window, cx);
+                        app.marked_text_range(window, cx) == Some(0..4)
+                    })
+                    .unwrap_or(false);
+                wait(cx, 600).await;
+                check(ime_kept, "予測表示中でも IME 変換を開始できる");
+                check(
+                    focused_contains(window, cx, "ghost-ok")
+                        && !focused_contains(window, cx, "にほんご"),
+                    "IME 変換中も予測が保たれ未確定文字列は PTY へ流れない",
+                );
+                let ime_cleared = window
+                    .update(cx, |app, window, cx| {
+                        app.replace_and_mark_text_in_range(None, "", None, window, cx);
+                        app.ime.is_none()
+                    })
+                    .unwrap_or(false);
+                check(ime_cleared, "IME 変換をキャンセルできる");
+                wait(cx, 600).await;
+                check(
+                    focused_contains(window, cx, "ghost-ok"),
+                    "IME キャンセル後も予測が残る",
+                );
+
+                // エッジ 2: alt screen の TUI では zsh の line editor 自体が動かないので
+                // 干渉しない（打鍵はそのまま TUI へ届き、前のプロンプトの予測も残らない）
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "printf '\\033[?1049h'; cat; printf '\\033[?1049l'", true);
+                wait(cx, 1200).await;
+                type_text(any, cx, "TAKO600-alt", false);
+                wait(cx, 1000).await;
+                check(
+                    focused_contains(window, cx, "TAKO600-alt")
+                        && !focused_contains(window, cx, "ghost-ok"),
+                    "alt screen の TUI に予測が干渉しない",
+                );
+                // 抜けるのは EOF（ctrl-d）で。ctrl-c だと zsh が `;` リストごと中断し、
+                // 続く `printf '\e[?1049l'` が走らず alt screen に取り残される
+                press(any, cx, "enter");
+                press(any, cx, "ctrl-d");
+                wait(cx, 1000).await;
+                check(
+                    focused_contains(window, cx, "ST600>"),
+                    "alt screen から通常画面へ戻る",
+                );
+
+                // OFF にすると、次のプロンプトから予測が消える（稼働中のシェルに効く）
+                let off = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Autosuggest {
+                                enabled: Some(false),
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .expect("autosuggest は常に成功する")
+                    })
+                    .expect("window");
+                check(off["enabled"] == false, "入力予測 dispatch が OFF を返す");
+                check(
+                    !tako_core::shell_integration::autosuggest_state(),
+                    "OFF がシェル側の状態ファイルへ書かれる",
+                );
+                type_text(any, cx, "clear", true);
+                wait(cx, 1000).await;
+                type_text(any, cx, "echo TAKO600-gh", false);
+                wait(cx, 1200).await;
+                check(
+                    !focused_contains(window, cx, "ghost-ok"),
+                    "OFF で予測が消える（稼働中のシェルにも効く）",
+                );
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, "exit", true);
+                wait(cx, 800).await;
+                let _ = std::fs::remove_dir_all(&as_home);
+                // 元の設定値へ戻す（セルフテストはユーザー状態を変えない）
+                let _ = window.update(cx, |app, _, _| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Autosuggest {
+                            enabled: Some(before),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                });
+            }
 
             // 42. 接続情報の永続化と発見（FR-2.2.9）: 環境変数なしでもファイル発見で
             //     CLI が繋がる（アプリ再起動後に外部の長寿命プロセスが繋ぎ直す経路と同じ）

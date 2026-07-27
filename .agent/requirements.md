@@ -179,6 +179,7 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
 | FR-2.4.2 | ペイン内の子プロセスが TCP ポートを listen したことを検知 | S |
 | FR-2.4.3 | 検知時に「プレビューを開く？」等の**提案チップ**を表示。承諾時のみペイン生成（強制分割はしない） | S |
 | FR-2.4.4 | パッシブ検知全体を設定で無効化できる | M |
+| FR-2.4.5 | シェル統合経路で tako 内の zsh に**履歴ベースの入力予測**（ゴーストテキスト）を提供する | S |
 
 実装メモ（FR-2.4.2〜2.4.4 は 2026-06-12 完成）:
 
@@ -192,6 +193,32 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
   （`tako portdetect on|off` / MCP `tako_port_detect`、計 18 ツール）+
   env `TAKO_PORT_DETECT=0|false|off`。無効化時は検知済み情報（listen_ports・チップ・
   却下記録）も掃除する
+
+実装メモ（FR-2.4.5。2026-07-27 / Issue #600 完成）:
+
+- 実体は **zsh-autosuggestions v0.7.1（MIT）をバージョン固定で同梱**したもの
+  （`crates/tako-core/shell-integration/zsh-autosuggestions/`。実行時ダウンロードはしない。
+  出所は同ディレクトリの `PROVENANCE.md`、告知は `THIRD-PARTY-NOTICES.md`）。
+  予測ソースは上流既定（history）、確定は右矢印（`forward-char`）
+- **注入経路は FR-2.4.1 と同じ ZDOTDIR 一本**。`~/.zshrc` は書き換えず、
+  `TAKO_PANE_ID` があるインタラクティブ zsh だけが読み込む = **tako の外の zsh は不変**
+- **読み込みは `.zshenv` 直下ではなく最初の `precmd`**（= ユーザーの `.zshrc` の後）。
+  理由は 2 つあり、どちらも `.zshenv` 直下では成立しない:
+  1. 二重注入ガード（ユーザーが自前で導入済みか）は `.zshrc` を読み終えるまで判定できない。
+     判定できたら tako は**一切手を出さない**（この設定も効かない）
+  2. 上流の推奨読み込み順が「他プラグイン（zsh-syntax-highlighting 等）より後」
+- ON/OFF は `settings.json` の `autosuggest`（既定 ON）+ dispatch `Autosuggest`
+  （`tako autosuggest on|off` / MCP `tako_autosuggest`）+ env `TAKO_AUTOSUGGEST=0|false|off`。
+  シェル側の完全な逃げ道は `TAKO_NO_AUTOSUGGESTIONS=1`
+- 切替は**稼働中のペインにも次のプロンプトから効く**。環境変数は spawn 時に凍結して
+  既存シェルへ届かないので、状態は `<data_dir>/shell-integration/autosuggest`
+  （`on` / `off`。**不在は ON**）に置き、zsh 側が毎プロンプト読む
+- 対象は zsh のみ。fish は autosuggestions 標準搭載のため何もしない。bash は対象外
+  （ble.sh は重量級。将来検討）。Windows は PowerShell が PSReadLine の予測入力を
+  標準搭載しているため注入不要（対応マトリクスでは `Unsupported` + 理由を明示）
+- 既知の限界: zinit turbo のような**遅延ローダー**でユーザーが後から
+  zsh-autosuggestions を読み込む構成では、最初のプロンプト時点で判定できないため
+  二重に読み込まれうる。その場合は `TAKO_NO_AUTOSUGGESTIONS=1` で tako 側を止める
 
 ### FR-2.5 AI レイアウト操作セット（Layer 1 / Layer 2 共通）
 
