@@ -1418,6 +1418,111 @@ mod tests {
         assert!(r.stable.is_none() && r.test.is_none());
     }
 
+    /// 新旧比較用の判定結果（バージョン, ダウンロード URL）
+    type Judgement = Option<(String, String)>;
+
+    /// #595 修正前のアルゴリズム（assets を見ず URL を合成していた版）。
+    /// 実リリース群に対して**新旧の判定が一致する**ことを示すためだけに残す
+    fn parse_releases_before_595(
+        releases: &[serde_json::Value],
+        current_version: &str,
+        arch: &str,
+    ) -> (Judgement, Judgement) {
+        let current = ParsedVersion::parse(current_version);
+        let (mut stable, mut test) = (None, None);
+        for release in releases {
+            let tag = release["tag_name"].as_str().unwrap_or_default();
+            let version_str = tag.strip_prefix('v').unwrap_or(tag);
+            let Some(ver) = ParsedVersion::parse(version_str) else {
+                continue;
+            };
+            let slot = if release["prerelease"].as_bool().unwrap_or(false) {
+                &mut test
+            } else {
+                &mut stable
+            };
+            if let Some(ref cur) = current {
+                if ver <= *cur {
+                    continue;
+                }
+            }
+            if slot.is_none() {
+                *slot = Some((
+                    version_str.to_string(),
+                    format!("https://github.com/{OWNER_REPO}/releases/download/{tag}/tako-{tag}-macos-{arch}.zip"),
+                ));
+            }
+            if stable.is_some() && test.is_some() {
+                break;
+            }
+        }
+        (stable, test)
+    }
+
+    /// 受け入れ条件 2（実データ版）: **本番の実リリース一覧**に対して、
+    /// macOS / arm64 の判定が #595 修正の前後で完全に一致する。
+    ///
+    /// fixture は `gh api repos/takushio2525/tako/releases` の実応答
+    /// （testdata/releases_snapshot.json）。バージョンだけでなく URL まで一致を見る
+    #[test]
+    fn test_real_releases_macos_judgement_identical_to_before_595() {
+        let raw = include_str!("../testdata/releases_snapshot.json");
+        let releases: Vec<serde_json::Value> =
+            serde_json::from_str(raw).expect("releases_snapshot.json");
+        assert!(releases.len() > 20, "fixture が小さすぎる");
+
+        // 実在する全バージョン + 現在バージョンを起点に総当たりで突き合わせる
+        let mut versions: Vec<String> = releases
+            .iter()
+            .filter_map(|r| r["tag_name"].as_str())
+            .map(|t| t.trim_start_matches('v').to_string())
+            .collect();
+        versions.push(CURRENT_VERSION.to_string());
+
+        for v in &versions {
+            if ParsedVersion::parse(v).is_none() {
+                continue;
+            }
+            let (old_stable, old_test) = parse_releases_before_595(&releases, v, "arm64");
+            let new = parse_releases_for(&releases, MAC, v);
+
+            let as_pair = |i: &Option<UpdateInfo>| {
+                i.as_ref().map(|i| {
+                    (
+                        i.version.clone(),
+                        i.download_url.clone().unwrap_or_default(),
+                    )
+                })
+            };
+            assert_eq!(
+                as_pair(&new.stable),
+                old_stable,
+                "stable が変わった（現在 {v}）"
+            );
+            assert_eq!(as_pair(&new.test), old_test, "test が変わった（現在 {v}）");
+        }
+    }
+
+    /// #595 の主眼: 実リリース群には Windows 版が無いので Windows には何も出さない
+    /// （修正前は mac の zip URL を掴んで「更新あり」と出ていた）
+    #[test]
+    fn test_real_releases_offer_nothing_to_windows() {
+        let raw = include_str!("../testdata/releases_snapshot.json");
+        let releases: Vec<serde_json::Value> =
+            serde_json::from_str(raw).expect("releases_snapshot.json");
+
+        let r = parse_releases_for(&releases, WIN, "0.0.1");
+        assert!(
+            r.stable.is_none() && r.test.is_none(),
+            "Windows に更新候補が出ている: {:?} / {:?}",
+            r.stable,
+            r.test
+        );
+        // 修正前は同じ状況で「更新あり」と判定していた（対比）
+        let (old_stable, _) = parse_releases_before_595(&releases, "0.0.1", "x86_64");
+        assert!(old_stable.is_some(), "修正前の挙動の再現に失敗");
+    }
+
     /// 対応する配布物が存在しないアーキテクチャでは更新候補を出さない
     #[test]
     fn test_unknown_arch_yields_no_update() {
