@@ -1779,7 +1779,8 @@ fn device_json(d: &crate::remote_auth::Device) -> Value {
 
 /// ホスト名を取得する（表示用）
 pub fn hostname() -> String {
-    Command::new("hostname")
+    // #628: Windows の `hostname.exe` は素で起動するとコンソールウィンドウを出す
+    tako_core::platform::process::no_console_window(&mut Command::new("hostname"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()

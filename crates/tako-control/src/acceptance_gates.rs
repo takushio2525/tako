@@ -363,6 +363,8 @@ fn execute_command(cmd: &str, expect_exit_0: bool, cwd: Option<&str>) -> CheckRe
     }
 
     let mut command = std::process::Command::new("sh");
+    // #628: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut command);
     command.args(["-c", cmd]);
     if let Some(d) = cwd {
         command.current_dir(d);
@@ -405,7 +407,12 @@ fn check_pr_merged(pr_number: u32, repo: Option<&str>) -> CheckResult {
     }
     eprintln!("[gate check] gh {}", args.join(" "));
 
-    match std::process::Command::new("gh").args(&args).output() {
+    // #628: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    match tako_core::platform::process::no_console_window(
+        std::process::Command::new("gh").args(&args),
+    )
+    .output()
+    {
         Ok(output) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

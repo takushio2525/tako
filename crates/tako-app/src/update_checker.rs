@@ -297,7 +297,8 @@ fn applications_tako_app_exists() -> bool {
 
 /// brew コマンドが使えるか
 fn is_brew_available() -> bool {
-    std::process::Command::new("brew")
+    // #628: GUI プロセスからの起動なのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut std::process::Command::new("brew"))
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -307,7 +308,8 @@ fn is_brew_available() -> bool {
 
 /// brew の cask 台帳に tako が登録されているか
 fn is_brew_cask_registered() -> bool {
-    std::process::Command::new("brew")
+    // #628: GUI プロセスからの起動なのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut std::process::Command::new("brew"))
         .args(["list", "--cask", "takushio2525/tako/tako"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -346,10 +348,12 @@ pub fn repair_brew() -> Result<String, String> {
             method.label()
         ));
     }
-    let output = std::process::Command::new("brew")
-        .args(["install", "--cask", "takushio2525/tako/tako", "--force"])
-        .output()
-        .map_err(|e| format!("brew の実行に失敗: {e}"))?;
+    // #628: GUI プロセスからの起動なのでコンソールウィンドウを出させない
+    let output =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new("brew"))
+            .args(["install", "--cask", "takushio2525/tako/tako", "--force"])
+            .output()
+            .map_err(|e| format!("brew の実行に失敗: {e}"))?;
     if output.status.success() {
         Ok("brew の cask 台帳を再締結しました。以後 brew upgrade で更新できます".into())
     } else {
