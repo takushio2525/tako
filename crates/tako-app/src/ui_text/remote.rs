@@ -118,9 +118,13 @@ pub fn setup_checking() -> &'static str {
 pub fn setup_ready() -> &'static str {
     tr!("Tailscale の準備は完了", "Tailscale is ready")
 }
-/// 不足項目の見出し
+/// 不足項目の見出し（起動ボタンは押せるままにするので断定形にしない。押せば
+/// daemon が返す理由が出る = そちらが最終的な正）
 pub fn setup_missing_header() -> &'static str {
-    tr!("起動できません。不足項目:", "Cannot start. Missing:")
+    tr!(
+        "起動に必要な設定が不足しています:",
+        "Setup required before starting:"
+    )
 }
 /// 不足項目 1 件の説明（キーは `remote_setup::check_status` の item。言語非依存）
 pub fn setup_item_label(item: &str) -> &'static str {
