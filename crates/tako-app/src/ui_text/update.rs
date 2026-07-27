@@ -1,7 +1,10 @@
-//! アプリ内更新（#36 / #358）バナー・確認・進行表示の文言（キー: update.*）
+//! アプリ内更新（#36 / #358 / #616）の通知カード・専用画面の文言（キー: update.*）
 //!
 //! CLI / MCP `tako update` と共有されるエラーメッセージ（brew 実行結果等）は
-//! 技術情報のため対象外（現状維持）。ここは GUI ステータスバーに出る文言のみ
+//! 技術情報のため対象外（現状維持）。ここは GUI に出る文言のみ。
+//!
+//! #616 で表示先がステータスバー → 「上部通知カード + 専用ウィンドウ」へ移った。
+//! `banner_*` は案内の 1 行サマリとしてカード・専用画面の双方で使い続けている
 
 pub fn banner_both() -> &'static str {
     tr!(
@@ -79,12 +82,6 @@ pub fn restart_failed(e: &str) -> String {
         format!("Update finished but restart failed: {e}")
     )
 }
-pub fn current_line(ver: &str, channel: &str, method: &str) -> String {
-    tr!(
-        format!("現在: v{ver} ({channel}) / {method}"),
-        format!("Current: v{ver} ({channel}) / {method}")
-    )
-}
 pub fn latest() -> &'static str {
     tr!("最新版です", "Up to date")
 }
@@ -118,6 +115,102 @@ pub fn eta_soon() -> &'static str {
     tr!("まもなく", "soon")
 }
 
+// --- #616: 上部通知カード ---
+
+pub fn card_title() -> &'static str {
+    tr!("アップデートがあります", "An update is available")
+}
+/// カードの主ボタン（専用画面へ飛ぶ）
+pub fn card_details() -> &'static str {
+    tr!("詳細を見る", "View details")
+}
+/// × の意味を明示する短い添え書き（黙って消えると出し直し方が分からない。#549 と同方針）
+pub fn card_dismiss_hint() -> &'static str {
+    tr!(
+        "このバージョンは通知しない",
+        "Stop notifying for this version"
+    )
+}
+
+// --- #616: アップデート専用ウィンドウ ---
+
+pub fn window_title() -> &'static str {
+    tr!("tako のアップデート", "tako Update")
+}
+pub fn section_current() -> &'static str {
+    tr!("現在のバージョン", "Current version")
+}
+pub fn section_available() -> &'static str {
+    tr!("利用できるアップデート", "Available updates")
+}
+pub fn section_notes() -> &'static str {
+    tr!("リリースノート", "Release notes")
+}
+pub fn label_version() -> &'static str {
+    tr!("バージョン", "Version")
+}
+pub fn label_channel() -> &'static str {
+    tr!("チャンネル", "Channel")
+}
+pub fn label_install_method() -> &'static str {
+    tr!("配布系統", "Install method")
+}
+/// #595: どの配布物を掴むか（「更新が出ない」の診断に効く）
+pub fn label_asset() -> &'static str {
+    tr!("配布物", "Asset")
+}
+pub fn label_platform() -> &'static str {
+    tr!("実行環境", "Environment")
+}
+pub fn check_button() -> &'static str {
+    tr!("アップデートを確認", "Check for updates")
+}
+pub fn update_now() -> &'static str {
+    tr!("今すぐ更新", "Update now")
+}
+pub fn open_release_page() -> &'static str {
+    tr!("リリースページを開く", "Open release page")
+}
+pub fn no_updates() -> &'static str {
+    tr!(
+        "新しいバージョンはありません（最新版を使っています）",
+        "No newer version (you are up to date)"
+    )
+}
+pub fn not_checked_yet() -> &'static str {
+    tr!(
+        "まだ確認していません。「アップデートを確認」を押してください",
+        "Not checked yet. Press \"Check for updates\""
+    )
+}
+pub fn no_notes() -> &'static str {
+    tr!("リリースノートはありません", "No release notes")
+}
+/// 配布系統の表示名（zip / broken-brew は既存の method_zip* と一貫させる）
+pub fn install_method_display(method: &str) -> String {
+    match method {
+        "homebrew" => "Homebrew".to_string(),
+        "broken-brew" => method_zip_broken().to_string(),
+        _ => method_zip().to_string(),
+    }
+}
+pub fn repair_button() -> &'static str {
+    tr!("brew の登録を修復", "Repair brew registration")
+}
+pub fn broken_brew_note() -> &'static str {
+    tr!(
+        "brew の台帳と .app の実体が食い違っています。修復するか zip で更新してください",
+        "The brew ledger and the installed .app disagree. Repair it, or update via zip"
+    )
+}
+/// 更新は再起動を伴う（実行中プロセスが失われる）ことの常設の注意書き
+pub fn restart_warning() -> &'static str {
+    tr!(
+        "更新すると tako が再起動します（実行中のプロセスは失われます）",
+        "Updating restarts tako (running processes will be lost)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -142,7 +235,6 @@ mod tests {
                 updating_zip_fallback().to_string(),
                 restarting("done"),
                 restart_failed("spawn error"),
-                current_line("0.6.0", "stable", "Homebrew"),
                 latest().to_string(),
                 checking().to_string(),
                 up_to_date("0.6.0"),
@@ -152,7 +244,44 @@ mod tests {
                 eta_minutes(5),
                 eta_seconds(30),
                 eta_soon().to_string(),
+                // #616: 通知カード + 専用ウィンドウ
+                card_title().to_string(),
+                card_details().to_string(),
+                card_dismiss_hint().to_string(),
+                window_title().to_string(),
+                section_current().to_string(),
+                section_available().to_string(),
+                section_notes().to_string(),
+                label_version().to_string(),
+                label_channel().to_string(),
+                label_install_method().to_string(),
+                label_asset().to_string(),
+                label_platform().to_string(),
+                check_button().to_string(),
+                update_now().to_string(),
+                open_release_page().to_string(),
+                no_updates().to_string(),
+                not_checked_yet().to_string(),
+                no_notes().to_string(),
+                repair_button().to_string(),
+                broken_brew_note().to_string(),
+                restart_warning().to_string(),
             ]
         });
+    }
+
+    /// 配布系統の表示名は 3 系統すべてに解があり、未知の値でも空にならない（#616）
+    #[test]
+    fn install_method_display_covers_all_kinds() {
+        for m in ["homebrew", "zip", "broken-brew", "unknown"] {
+            assert!(
+                !install_method_display(m).is_empty(),
+                "{m} の表示名が空になっている"
+            );
+        }
+        assert_eq!(install_method_display("homebrew"), "Homebrew");
+        assert_eq!(install_method_display("broken-brew"), method_zip_broken());
+        // 未知の値は zip 扱い（表示が消えるより「zip です」と言い切るほうが安全）
+        assert_eq!(install_method_display("unknown"), method_zip());
     }
 }

@@ -584,6 +584,23 @@ pub trait SystemHost {
     fn update_repair(&mut self) -> Result<Value, String> {
         Err("この環境では修復を実行できない".into())
     }
+    /// アップデート専用画面を開く（Issue #616）
+    fn open_update_window(&mut self) {}
+    /// アップデート専用画面が開いているか（Issue #616）
+    fn update_window_open(&self) -> bool {
+        false
+    }
+    /// 上部通知カードの状態（Issue #616）。`key` は案内中バージョンの一意キーで、
+    /// 「同じバージョンでは再表示しない」の永続化に使う
+    fn update_card_status(&self) -> Value {
+        serde_json::json!({
+            "visible": false,
+            "key": Value::Null,
+            "dismissed_key": Value::Null,
+        })
+    }
+    /// 通知カードを閉じた / 出し直した（永続化は dispatch 側の責務。Issue #616）
+    fn set_update_card_dismissed(&mut self, _dismissed: bool) {}
     /// ペインログの現在設定（Issue #112 B）。GUI はライブの PaneLogManager から返す
     fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
         crate::settings::load().pane_log_config()

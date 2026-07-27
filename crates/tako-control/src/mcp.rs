@@ -2038,13 +2038,22 @@ pub fn tools() -> Vec<Value> {
                 channel で stable（既定）/ test を指定。\
                 action=apply-zip で zip 経由で強制更新する。\
                 action=repair で broken-brew 状態を修復する。\
-                apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。",
+                apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。\
+                action=open で GUI のアップデート専用画面を開く（#616。\
+                現在 / 最新バージョン・チャンネル・配布物・リリースノート・更新ボタンが載る。\
+                開いているかは action=status の window_open で分かる）。\
+                action=card で画面上部の更新通知カードの状態を返す。\
+                action=card-dismiss でカードを閉じる（そのバージョンは以後通知しない）。\
+                action=card-show で抑止を解除して出し直す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "check", "apply", "apply-zip", "repair"],
+                        "enum": [
+                            "status", "check", "apply", "apply-zip", "repair",
+                            "open", "card", "card-dismiss", "card-show",
+                        ],
                         "description": "操作種別（省略時は status）",
                     },
                     "channel": {

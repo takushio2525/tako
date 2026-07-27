@@ -14,6 +14,8 @@ pub fn cmd_label(id: &str) -> &'static str {
         "run-setup" => tr!("セットアップを実行", "Run setup"),
         "run-master" => tr!("master を起動", "Start master"),
         "open-settings" => tr!("設定を開く", "Open settings"),
+        // #616: アップデート画面（下部バーから撤去したぶんの入口）
+        "open-update" => tr!("アップデートを開く", "Open update screen"),
         "new-tab" => tr!("新しいタブ", "New tab"),
         "toggle-theme" => tr!("テーマをライト/ダーク切替", "Toggle light/dark theme"),
         "toggle-files" => tr!("ファイルツリーを開閉", "Toggle file tree"),
@@ -49,6 +51,7 @@ mod tests {
                 cmd_label("run-setup").to_string(),
                 cmd_label("run-master").to_string(),
                 cmd_label("open-settings").to_string(),
+                cmd_label("open-update").to_string(),
                 cmd_label("new-tab").to_string(),
                 cmd_label("toggle-theme").to_string(),
                 cmd_label("toggle-files").to_string(),
