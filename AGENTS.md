@@ -73,6 +73,8 @@ tako/
 | MCP セットアップ | `tako setup-mcp`（`~/.claude/settings.json` に自動追加。`--project` でプロジェクト単位） |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
+| **Windows 配布物生成** | `pwsh -File installer/windows/build-installer.ps1 [-Version v0.6.0]`（`dist/windows/` に `tako-setup-{tag}-x64.exe` + `tako-{tag}-windows-x64.zip`。Inno Setup 6 の ISCC が要る。#587） |
+| Windows アプリアイコン再生成 | `pwsh -File installer/windows/make-icon.ps1`（A 案 PNG → `assets/icon/tako.ico`。System.Drawing だけで動く） |
 | リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト） |
 | 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
 | マスターオーケストレーター起動 | `tako master [-profile]`（master system prompt 付きでエージェント CLI を起動。プロファイルの `master_agent` で claude（既定）/ codex を選択。#127） |
@@ -155,3 +157,16 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
 - ジョブ登録は `scripts/nightly-release.sh --install-launchd`（解除は `--uninstall-launchd`、
   確認は `launchctl list | grep tako-nightly`）。plist はリポに置かず実行時に生成する
 - minor / major リリース・Homebrew cask 更新・リリースノートの日英併記は従来どおり手動で行う
+
+### Windows 配布物（#587）
+
+- `.github/workflows/windows-release.yml` が `v*` タグの push（または `workflow_dispatch` で
+  タグ指定）で走り、windows-latest 上で release ビルド → Inno Setup → Release へ添付する。
+  中身は `installer/windows/build-installer.ps1` の呼び出しなのでローカルと同じ経路
+- アセット名は `tako-setup-{tag}-x64.exe`（インストーラー）と `tako-{tag}-windows-x64.zip`
+  （ポータブル）。インストーラーは per-user（`{localappdata}\Programs\tako`）で管理者権限を
+  要求せず、ユーザー PATH へインストール先を追加する
+- **Release を作るのは先に走った方**。macOS の `scripts/release.sh` と同じタグで両方回すときは
+  release.sh を先に流す（後発は既存 Release へアセットを足すだけになる）
+- Windows は MSVC CRT を静的リンクする（`.cargo/config.toml`）。VC++ 再頒布可能パッケージを
+  配布物の前提にしないための措置で、macOS ビルドには影響しない
