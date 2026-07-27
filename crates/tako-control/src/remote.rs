@@ -997,6 +997,9 @@ pub fn run_daemon() -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::sync::atomic::Ordering::Relaxed;
+        // #590: **シグナルマスクを空に戻す**。以後に spawn するスレッドは作成元の
+        // マスクを継承するので、ハンドラ設置より前・スレッド生成より前のここで戻す
+        reset_signal_mask();
         let _ = unsafe {
             libc::signal(
                 libc::SIGTERM,
@@ -1157,6 +1160,49 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
         .lines()
         .map(|l| l.to_string())
         .collect())
+}
+
+/// シグナルマスクを空に戻す（#590）。
+///
+/// シグナルマスクは fork + exec をまたいで継承される。GUI（tako-app = GPUI / AppKit）
+/// から起動した daemon は SIGTERM / SIGHUP がブロックされたまま生まれ、実測では
+/// ハンドラを設置しても発火せず（SIGHUP の既定動作すら起きず）、`tako remote stop` と
+/// GUI の kill switch（全遮断）が無言で失敗していた。daemon 側とプロセス起動側の
+/// 両方で戻すことで、どの経路から起動しても停止できることを保証する
+#[cfg(unix)]
+fn reset_signal_mask() {
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+}
+
+/// デーモン子プロセスの起動条件を整える（#590）。
+///
+/// - `setsid`: プロセスグループから切り離し、親（tmux セッション等）の終了に
+///   巻き添えで死なないようにする
+/// - シグナルマスクを空に戻す: 親（GUI = GPUI / AppKit）がブロックしている
+///   シグナルは exec をまたいで継承される。戻さないと生まれた daemon が SIGTERM を
+///   受け取れず、`tako remote stop` と GUI の kill switch が無言で失敗する
+///   （`pre_exec` は fork 後・exec 前の子プロセスで走るので、ここで呼ぶ
+///   `setsid` / `pthread_sigmask` はどちらも async-signal-safe）
+fn configure_daemon_child(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                reset_signal_mask();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
 }
 
 /// デーモンの状態を PID ファイルから確認する。
@@ -1543,17 +1589,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // setsid でプロセスグループから切り離し、親（tmux セッション）終了時に巻き添えで死なないようにする
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    configure_daemon_child(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -4805,6 +4841,82 @@ mod tests {
             Some(crate::dispatch::STABLE_APP_BINARY)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #590: シグナルマスクのリセットが効くこと。
+    /// GUI（GPUI / AppKit）から起動した daemon は SIGTERM がブロックされたまま
+    /// 生まれ、`tako remote stop` と kill switch が無言で失敗していた
+    #[cfg(unix)]
+    #[test]
+    fn reset_signal_maskはブロック中のsigtermを解除する() {
+        // 現在のスレッドのマスクに SIGTERM が入っているか
+        fn sigterm_blocked() -> bool {
+            unsafe {
+                let mut cur: libc::sigset_t = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+                libc::sigismember(&cur, libc::SIGTERM) == 1
+            }
+        }
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            assert!(sigterm_blocked(), "前提: SIGTERM をブロックできている");
+            reset_signal_mask();
+            assert!(
+                !sigterm_blocked(),
+                "reset_signal_mask 後は SIGTERM のブロックが解除される"
+            );
+            // テストスレッドのマスクを元に戻す（他テストへ影響させない）
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+    }
+
+    /// #590: `configure_daemon_child` を通した子プロセスは、親が SIGTERM を
+    /// ブロックしていても**ブロックを継承しない**。
+    ///
+    /// 判定は子（sh）に自分自身へ SIGTERM を送らせる方式:
+    /// ブロックが継承されていれば死なず "SURVIVED" を出力し、
+    /// 解除されていれば既定動作で死んで何も出力しない。
+    /// `reset_signal_mask()` の呼び出しを消すとこのテストは失敗する
+    #[cfg(unix)]
+    #[test]
+    fn configure_daemon_childは親のブロックを子へ継承しない() {
+        let run = |configure: bool| -> String {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "kill -s TERM $$; echo SURVIVED"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if configure {
+                configure_daemon_child(&mut cmd);
+            }
+            let out = cmd.output().expect("sh を起動できる");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            // このスレッドで SIGTERM をブロックする（GUI = 親の状態を再現）
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            // 素の spawn: ブロックが継承されるので SIGTERM で死なない（前提の確認）
+            let inherited = run(false);
+            // configure 済み: マスクが空に戻るので SIGTERM で死ぬ
+            let configured = run(true);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            assert_eq!(
+                inherited, "SURVIVED",
+                "前提: 素の spawn では親のブロックが子へ継承される"
+            );
+            assert_eq!(
+                configured, "",
+                "configure_daemon_child 後は SIGTERM が届いて子が終了する"
+            );
+        }
     }
 
     // --- #287 P1: cross-origin 遮断テスト ---

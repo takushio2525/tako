@@ -25110,6 +25110,266 @@ mod self_test {
                 }
             }
 
+            // 89. リモートインジケータは daemon 停止中も出て、クリックで起動導線になる（#590）。
+            // 実 daemon を起動すると本番のリモートを立ててしまうので、状態は手で作って
+            // 「表示状態の判定 → クリック → オーバーレイの種別 → 実際に render が通る」
+            // までを検査する（起動そのものの実測は隔離環境で別途行う）
+            {
+                use crate::remote_panel::{indicator_state, overlay_kind, RemoteIndicator};
+                let r = window
+                    .update(cx, |app, _, cx| {
+                        // --- 停止中 ---
+                        app.remote.running = false;
+                        app.remote.starting = false;
+                        app.remote.panel_open = false;
+                        app.remote.devices.clear();
+                        app.remote.pending.clear();
+                        app.remote.connections.clear();
+                        app.remote.start_error = None;
+                        app.remote.setup = None;
+                        // 停止中でもインジケータの表示状態が決まる（= 消えない）
+                        let off = indicator_state(&app.remote) == RemoteIndicator::Off;
+                        let off_label = !crate::ui_text::remote::indicator_off().is_empty();
+                        // 停止中の描画が通る（render_remote_indicator は Option ではない）
+                        let _ = app.render_remote_indicator(cx);
+                        // クリック相当（インジケータの on_click と同じ経路）
+                        app.toggle_remote_panel(cx);
+                        let start_kind = app.remote.panel_open
+                            && overlay_kind(&app.remote) == crate::remote_panel::RemoteOverlay::Start;
+                        // 不足項目つきの起動パネルが描画できる（黙って失敗させない案内）
+                        app.remote.setup = Some(serde_json::json!({
+                            "ready": false,
+                            "items": [
+                                { "item": "tailscale", "status": "ok" },
+                                { "item": "login", "status": "missing" },
+                                { "item": "serve", "status": "not_configured" },
+                            ],
+                        }));
+                        app.remote.start_error = Some("Tailscale のセットアップが未完了".into());
+                        let blockers = crate::remote_panel::setup_blockers(
+                            app.remote.setup.as_ref().expect("直前に設定した"),
+                        );
+                        // serve 未設定は不足に数えない（daemon が自分で設定する）
+                        let blockers_ok = blockers == vec!["login".to_string()];
+                        let start_panel_ok = app.render_remote_overlay(cx).is_some();
+                        // --- 稼働中（#590 の回帰ガード: 従来の端末一覧 + kill switch）---
+                        app.remote.running = true;
+                        app.remote.url = Some("https://mac.tail1234.ts.net".into());
+                        app.remote.devices = vec![serde_json::json!({
+                            "id": "nSELFTEST", "name": "self-test", "role": "observe"
+                        })];
+                        app.remote.connections.insert("nSELFTEST".into(), 1);
+                        let panel_kind =
+                            overlay_kind(&app.remote) == crate::remote_panel::RemoteOverlay::Panel;
+                        let connected =
+                            indicator_state(&app.remote) == RemoteIndicator::Connected(1);
+                        let device_panel_ok = app.render_remote_overlay(cx).is_some();
+                        // 起動中表示は daemon 状態より優先
+                        app.remote.starting = true;
+                        let starting =
+                            indicator_state(&app.remote) == RemoteIndicator::Starting;
+                        // 後始末（次の項目・実際の状態へ影響を残さない。次の 2 秒
+                        // ポーリングが実 daemon の状態で上書きする）
+                        app.remote.starting = false;
+                        app.remote.running = false;
+                        app.remote.url = None;
+                        app.remote.devices.clear();
+                        app.remote.connections.clear();
+                        app.remote.panel_open = false;
+                        app.remote.setup = None;
+                        app.remote.start_error = None;
+                        cx.notify();
+                        (
+                            off,
+                            off_label,
+                            start_kind,
+                            blockers_ok,
+                            start_panel_ok,
+                            panel_kind,
+                            connected,
+                            device_panel_ok,
+                            starting,
+                        )
+                    })
+                    .unwrap_or((
+                        false, false, false, false, false, false, false, false, false,
+                    ));
+                let (
+                    off,
+                    off_label,
+                    start_kind,
+                    blockers_ok,
+                    start_panel_ok,
+                    panel_kind,
+                    connected,
+                    device_panel_ok,
+                    starting,
+                ) = r;
+                check(
+                    off && off_label && start_kind && blockers_ok && start_panel_ok,
+                    "リモートインジケータは daemon 停止中も表示され、クリックで起動パネル + 不足項目案内になる (#590)",
+                );
+                check(
+                    panel_kind && connected && device_panel_ok && starting,
+                    "リモート稼働中のクリックは従来どおり端末一覧 + kill switch（起動中表示は状態より優先） (#590)",
+                );
+            }
+
+            // 88b. #590 の通し検証（opt-in）: 起動ボタン → 実 daemon 起動 → 稼働表示へ遷移 →
+            // kill switch → 停止表示へ戻る、を GUI のクリックハンドラそのままで実測する。
+            // 実 daemon を立てるので **既定では走らせない**:
+            //   TAKO_SELF_TEST_REMOTE=1 かつ TAKO_REMOTE_STATE_DIR が明示されているときだけ
+            // （本番の remote state を壊した事故 #445 の再発防止。実 tailnet の serve 設定に
+            // 触りたくない場合は TAKO_REMOTE_TEST_MODE=1 を併用する）。
+            // 実行例:
+            //   TAKO_SELF_TEST=1 TAKO_SELF_TEST_REMOTE=1 TAKO_ISOLATED=1 \
+            //   TAKO_REMOTE_STATE_DIR=/tmp/tk590/state TAKO_REMOTE_TEST_MODE=1 tako-app
+            if std::env::var("TAKO_SELF_TEST_REMOTE").as_deref() == Ok("1") {
+                use crate::remote_panel::{indicator_state, overlay_kind, RemoteIndicator};
+                let isolated = std::env::var("TAKO_REMOTE_STATE_DIR")
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false);
+                if !isolated {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 88b（TAKO_REMOTE_STATE_DIR 未指定。本番 remote state を触らない）"
+                    );
+                } else {
+                    // 前提: daemon は停止している（起動済みなら start は「既に起動中」で失敗する）
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.remote.panel_open = false;
+                        app.refresh_remote_state(cx);
+                    });
+                    wait(cx, 1500).await;
+                    let before_off = window
+                        .update(cx, |app, _, _| {
+                            indicator_state(&app.remote) == RemoteIndicator::Off
+                        })
+                        .unwrap_or(false);
+                    // ① インジケータのクリック → 起動パネル（停止中なので setup も取り直す）
+                    let _ = window.update(cx, |app, _, cx| app.toggle_remote_panel(cx));
+                    wait(cx, 2500).await; // setup 取得 + 目視キャプチャの猶予
+                    let (start_panel, setup_fetched) = window
+                        .update(cx, |app, _, _| {
+                            (
+                                overlay_kind(&app.remote)
+                                    == crate::remote_panel::RemoteOverlay::Start,
+                                app.remote.setup.is_some(),
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    // ② 起動ボタン（パネルの on_click と同じ経路）
+                    let _ = window.update(cx, |app, _, cx| app.remote_do_start(cx));
+                    let mut running = false;
+                    let mut err: Option<String> = None;
+                    for _ in 0..60 {
+                        wait(cx, 500).await;
+                        let r = window.update(cx, |app, _, _| {
+                            (
+                                app.remote.running,
+                                app.remote.starting,
+                                app.remote.start_error.clone(),
+                            )
+                        });
+                        if let Ok((run, starting, e)) = r {
+                            running = run;
+                            err = e;
+                            if run || (!starting && err.is_some()) {
+                                break;
+                            }
+                        }
+                    }
+                    wait(cx, 2500).await; // 稼働中パネルの目視キャプチャの猶予
+                    let (panel_now, ind_now, url_now) = window
+                        .update(cx, |app, _, _| {
+                            (
+                                overlay_kind(&app.remote),
+                                indicator_state(&app.remote),
+                                app.remote.url.clone(),
+                            )
+                        })
+                        .unwrap_or((crate::remote_panel::RemoteOverlay::None, RemoteIndicator::Off, None));
+                    check(
+                        before_off && start_panel && setup_fetched,
+                        "停止中のクリックで起動パネルが開き Tailscale 状態を取得する (#590)",
+                    );
+                    check(
+                        running && err.is_none(),
+                        &format!(
+                            "GUI の起動ボタンで実 daemon が起動する (#590): running={running} err={err:?}"
+                        ),
+                    );
+                    check(
+                        panel_now == crate::remote_panel::RemoteOverlay::Panel
+                            && matches!(
+                                ind_now,
+                                RemoteIndicator::Idle | RemoteIndicator::Connected(_)
+                            )
+                            && url_now.is_some(),
+                        &format!(
+                            "起動後はインジケータが稼働表示になりパネルが端末一覧へ切り替わる (#590): {ind_now:?} url={url_now:?}"
+                        ),
+                    );
+                    // ③ kill switch（稼働中パネルの on_click と同じ経路）→ 停止表示へ戻る
+                    let _ = window.update(cx, |app, _, cx| app.remote_kill_switch(cx));
+                    let mut stopped = false;
+                    for _ in 0..30 {
+                        wait(cx, 500).await;
+                        if let Ok(off) = window.update(cx, |app, _, _| {
+                            indicator_state(&app.remote) == RemoteIndicator::Off
+                        }) {
+                            stopped = off;
+                            if off {
+                                break;
+                            }
+                        }
+                    }
+                    check(
+                        stopped,
+                        "kill switch で daemon が止まりインジケータが停止表示へ戻る (#590)",
+                    );
+                    // ④ もう一度起動し、**外部から** daemon を止めても（GUI 操作ではなく
+                    // `tako remote stop` や他プロセスの kill）ポーリングで停止表示へ戻る
+                    let _ = window.update(cx, |app, _, cx| app.remote_do_start(cx));
+                    let mut running2 = false;
+                    for _ in 0..60 {
+                        wait(cx, 500).await;
+                        if let Ok((run, starting)) =
+                            window.update(cx, |app, _, _| (app.remote.running, app.remote.starting))
+                        {
+                            running2 = run;
+                            if run || !starting {
+                                break;
+                            }
+                        }
+                    }
+                    let pid = tako_control::remote::daemon_status()["pid"].as_u64();
+                    if let Some(pid) = pid {
+                        let _ = std::process::Command::new("kill")
+                            .arg(pid.to_string())
+                            .status();
+                    }
+                    let mut back_off = false;
+                    for _ in 0..30 {
+                        wait(cx, 500).await;
+                        if let Ok(off) = window.update(cx, |app, _, _| {
+                            indicator_state(&app.remote) == RemoteIndicator::Off
+                                && app.remote.url.is_none()
+                        }) {
+                            back_off = off;
+                            if off {
+                                break;
+                            }
+                        }
+                    }
+                    check(
+                        running2 && pid.is_some() && back_off,
+                        &format!(
+                            "外部から daemon を止めてもポーリングで停止表示へ戻る (#590): running2={running2} pid={pid:?}"
+                        ),
+                    );
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);

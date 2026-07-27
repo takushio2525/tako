@@ -1,4 +1,5 @@
-//! リモート接続パネル（承認ダイアログ + 端末一覧。#283）の文言（キー: remote.*）
+//! リモート接続パネル（承認ダイアログ + 端末一覧 + 起動導線。#283 / #590）の
+//! 文言（キー: remote.*）
 
 /// role 選択肢のラベル（キー: remote.role_*。role キー自体は言語非依存）
 pub fn role_label(role: &str) -> &'static str {
@@ -72,6 +73,111 @@ pub fn stop_all() -> &'static str {
     )
 }
 
+// --- 常時表示インジケータと起動導線（#590）---
+
+/// ステータスバーのラベル: daemon 稼働中・接続なし
+pub fn indicator_idle() -> &'static str {
+    tr!("リモート", "remote")
+}
+/// ステータスバーのラベル: daemon 停止中
+pub fn indicator_off() -> &'static str {
+    tr!("リモート オフ", "remote off")
+}
+/// ステータスバーのラベル: 起動処理中
+pub fn indicator_starting() -> &'static str {
+    tr!("リモート 起動中", "remote starting")
+}
+/// 起動パネルのタイトル
+pub fn start_panel_title() -> &'static str {
+    tr!("リモート接続", "Remote access")
+}
+/// 起動パネルの説明（何ができるのか）
+pub fn start_panel_desc() -> &'static str {
+    tr!(
+        "スマホやタブレットからこの Mac のターミナルを見る（Tailscale 経由・tailnet 内限定）。",
+        "View this Mac's terminals from your phone or tablet (via Tailscale, inside your tailnet)."
+    )
+}
+/// 起動ボタン
+pub fn start_button() -> &'static str {
+    tr!("リモートを起動", "Start remote access")
+}
+/// 起動中のボタン表示（押せない状態）
+pub fn start_button_busy() -> &'static str {
+    tr!("起動中…", "Starting…")
+}
+/// セットアップ状態の再確認ボタン
+pub fn recheck_button() -> &'static str {
+    tr!("再確認", "Re-check")
+}
+/// セットアップ状態の確認中
+pub fn setup_checking() -> &'static str {
+    tr!("Tailscale の状態を確認中…", "Checking Tailscale status…")
+}
+/// セットアップ完了（起動できる）
+pub fn setup_ready() -> &'static str {
+    tr!("Tailscale の準備は完了", "Tailscale is ready")
+}
+/// 不足項目の見出し（起動ボタンは押せるままにするので断定形にしない。押せば
+/// daemon が返す理由が出る = そちらが最終的な正）
+pub fn setup_missing_header() -> &'static str {
+    tr!(
+        "起動に必要な設定が不足しています:",
+        "Setup required before starting:"
+    )
+}
+/// 不足項目 1 件の説明（キーは `remote_setup::check_status` の item。言語非依存）
+pub fn setup_item_label(item: &str) -> &'static str {
+    match item {
+        "tailscale" => tr!(
+            "Tailscale が未導入（App Store 版アプリ または brew install tailscale）",
+            "Tailscale is not installed (App Store app or brew install tailscale)"
+        ),
+        "daemon" => tr!(
+            "Tailscale が起動していない（Tailscale アプリを起動）",
+            "Tailscale is not running (launch the Tailscale app)"
+        ),
+        "login" => tr!(
+            "Tailscale にログインしていない（tailscale up でブラウザ認証）",
+            "Not logged in to Tailscale (run tailscale up to authenticate)"
+        ),
+        "https" => tr!(
+            "tailnet の HTTPS 証明書が未有効（管理画面で MagicDNS と HTTPS Certificates を有効化）",
+            "tailnet HTTPS certificates are off (enable MagicDNS and HTTPS Certificates in the admin console)"
+        ),
+        "dns_name" => tr!(
+            "MagicDNS 名を取得できない（tailnet の DNS 設定を確認）",
+            "Cannot resolve the MagicDNS name (check the tailnet DNS settings)"
+        ),
+        "serve" => tr!(
+            "tailscale serve に tako 管理外の設定がある（tailscale serve status で確認）",
+            "tailscale serve has a non-tako configuration (check tailscale serve status)"
+        ),
+        // 未知のキーは黙って消さず、キーをそのまま出す（黙って失敗しない。#590）
+        _ => "",
+    }
+}
+/// セットアップ手順の案内（下のコマンドを実行する）
+pub fn setup_hint() -> &'static str {
+    tr!(
+        "ターミナルで次を実行するとセットアップできます（クリックでコピー）:",
+        "Run this in a terminal to set it up (click to copy):"
+    )
+}
+/// セットアップコマンド（言語非依存。#322 の最簡形）
+pub const SETUP_COMMAND: &str = "tako remote setup";
+/// 起動失敗の見出し
+pub fn start_failed() -> &'static str {
+    tr!("起動に失敗しました", "Failed to start")
+}
+/// 接続 URL の見出し（稼働中パネル）
+pub fn url_label() -> &'static str {
+    tr!(
+        "接続 URL（クリックでコピー）",
+        "Connect URL (click to copy)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -102,7 +208,34 @@ mod tests {
                 panel_title().to_string(),
                 connections_now(1),
                 stop_all().to_string(),
+                // #590 の起動導線
+                indicator_idle().to_string(),
+                indicator_off().to_string(),
+                indicator_starting().to_string(),
+                start_panel_title().to_string(),
+                start_panel_desc().to_string(),
+                start_button().to_string(),
+                start_button_busy().to_string(),
+                recheck_button().to_string(),
+                setup_checking().to_string(),
+                setup_ready().to_string(),
+                setup_missing_header().to_string(),
+                setup_item_label("tailscale").to_string(),
+                setup_item_label("daemon").to_string(),
+                setup_item_label("login").to_string(),
+                setup_item_label("https").to_string(),
+                setup_item_label("dns_name").to_string(),
+                setup_item_label("serve").to_string(),
+                setup_hint().to_string(),
+                start_failed().to_string(),
+                url_label().to_string(),
             ]
         });
+    }
+
+    /// 未知の item キーは空文字を返す（呼び出し側がキーそのものを出す。#590）
+    #[test]
+    fn setup_item_labelは未知キーで空を返す() {
+        assert!(setup_item_label("unknown_item").is_empty());
     }
 }

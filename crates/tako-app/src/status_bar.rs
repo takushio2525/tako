@@ -233,8 +233,9 @@ impl TakoApp {
                         )
                     })
             })
-            // リモート接続インジケータ（#283。daemon 稼働中のみ表示・クリックで端末一覧）
-            .children(self.render_remote_indicator(cx))
+            // リモート接続インジケータ（#283 / #590。daemon 停止中も常時表示。
+            // クリックで稼働中 = 端末一覧、停止中 = 起動パネル）
+            .child(self.render_remote_indicator(cx))
             // フォーカスペインの cwd breadcrumb（カンプ新設。クリックでコピー）
             .children(cwd_breadcrumb.map(|(parent, leaf, full)| {
                 div()
