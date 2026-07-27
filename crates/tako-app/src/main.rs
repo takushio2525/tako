@@ -7327,6 +7327,11 @@ impl TakoApp {
                 }
                 // ここで処理済みを宣言しないと、macOS が未処理キーを IME（input handler）へ
                 // 回送し insertText → replace_text_in_range で二重入力になる（FR-1.9）
+                //
+                // #623 の診断: ここを通ると Windows では GPUI の translate_accelerator が
+                // TranslateMessage / DispatchMessageW を飛ばすため、その打鍵は IME へ
+                // 一切届かなくなる。変換中に出ていたら「打鍵が消える」症状の犯人
+                ime_diag_event("handle_key(ターミナルへ書き込み・IME を飛ばす)", 0);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -13941,6 +13946,10 @@ impl EntityInputHandler for TakoApp {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ime_diag_event(
+            "unmark_text",
+            self.ime.as_ref().map(|i| utf16_len(&i.text)).unwrap_or(0),
+        );
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
             // 変換開始ペインが既に閉じられていたらフォーカスペインへ倒す（#332）
@@ -13984,6 +13993,7 @@ impl EntityInputHandler for TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        ime_diag_event("replace_text_in_range(確定)", utf16_len(text));
         // インライン編集中は IME 確定文字列をインライン入力に振り分ける
         if let Some(ref mut edit) = self.inline_edit {
             if !text.is_empty() {
@@ -14083,6 +14093,7 @@ impl EntityInputHandler for TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        ime_diag_event("replace_and_mark(未確定)", utf16_len(new_text));
         // IME は毎回未確定文字列の全文を渡してくるので丸ごと差し替える。
         // 空文字は変換キャンセル（esc）を意味する
         if new_text.is_empty() {
@@ -15554,11 +15565,6 @@ fn restore_window(window: &mut Window) {
     }
 }
 
-/// ウィンドウのネイティブハンドル（Windows の `HWND`）。他 OS では `None`。
-///
-/// `RawWindowHandle` の列挙子は全 OS で定義されているので `cfg` は要らない
-/// （macOS では `AppKit` に一致して `None` に落ちる）。プラットフォーム分岐は
-/// 受け取り側の境界（`tako_core::platform`）の内側に閉じる
 thread_local! {
     /// IME 結合状態を最後に IMM32 へ問い合わせた時刻（#623。UI スレッド専用）
     static IME_ASSOC_PROBED_AT: std::cell::Cell<Option<std::time::Instant>> =
@@ -15566,6 +15572,32 @@ thread_local! {
     /// 防御が発火したことを最後に記録した時刻（ログの間引き用）
     static IME_GUARD_LOGGED_AT: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
+    /// `TAKO_IME_DIAG=1` のときに前フレームで観測した状態（遷移だけ記録するため）
+    static IME_DIAG_LAST: std::cell::Cell<Option<(bool, Option<bool>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// IME コールバックの到達順を記録する（`TAKO_IME_DIAG=1` のときだけ）。
+///
+/// **文字列そのものは絶対に出さない**（AGENTS.md の絶対ルール: 送信テキストを
+/// 診断ログへ出さない）。出すのは呼ばれた種別と UTF-16 長だけで、
+/// 「未確定文字列が途中で確定された」「長さが巻き戻った」の判別にはこれで足りる
+fn ime_diag_event(kind: &str, utf16_len: usize) {
+    if ime_diag_enabled() {
+        tako_control::diag::perf_log(&format!("ime-diag: {kind} utf16_len={utf16_len}"));
+    }
+}
+
+/// IME の毎フレーム診断を出すか（`TAKO_IME_DIAG=1`）。既定は無効で、
+/// 有効にすると IMM32 への問い合わせが毎フレームに増える（#623 の追跡用）
+fn ime_diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_IME_DIAG").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
 }
 
 /// 防御の累積発火回数（#623 の実測用。診断ログにだけ出す）
@@ -15599,9 +15631,14 @@ static IME_REASSOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// 「フォーカスが自分に無い」正当な状態は存在しない。よってフォーカスの奪い合いは起きない
 fn ime_guard_frame(window: &mut Window, focus: &FocusHandle, cx: &mut App) {
     let focus_held = focus.is_focused(window);
+    // `TAKO_IME_DIAG=1` で毎フレーム問い合わせ、状態が変わった瞬間だけ記録する。
+    // 間引いていると「1 フレームだけ切り離されて戻る」振る舞いを取りこぼすため、
+    // #623 のような再現性の低い事象の追跡にはこれが要る
+    let diag = ime_diag_enabled();
     // IMM32 への問い合わせは毎フレームやる必要が無いので 500ms に 1 回へ間引く。
     // ただしフォーカスが外れたフレームは GPUI が切り離した直後の可能性が高いので必ず見る
-    let probe = !focus_held
+    let probe = diag
+        || !focus_held
         || IME_ASSOC_PROBED_AT.with(|at| {
             let now = std::time::Instant::now();
             match at.get() {
@@ -15619,6 +15656,18 @@ fn ime_guard_frame(window: &mut Window, focus: &FocusHandle, cx: &mut App) {
     };
     // probe しないフレームは `None` = 「結合状態は不明」となり、結合には触らない
     let associated = tako_core::platform::ime::is_associated(handle);
+    if diag {
+        // 状態が変わった瞬間だけ 1 行出す（毎フレーム出すとログが埋まる）
+        IME_DIAG_LAST.with(|last| {
+            let now = (focus_held, associated);
+            if last.get() != Some(now) {
+                last.set(Some(now));
+                tako_control::diag::perf_log(&format!(
+                    "ime-diag: focus_held={focus_held} associated={associated:?}"
+                ));
+            }
+        });
+    }
     let action = tako_core::platform::ime::guard_action(focus_held, associated);
     if action.is_noop() {
         return;
@@ -15654,6 +15703,11 @@ fn ime_guard_frame(window: &mut Window, focus: &FocusHandle, cx: &mut App) {
     }
 }
 
+/// ウィンドウのネイティブハンドル（Windows の `HWND`）。他 OS では `None`。
+///
+/// `RawWindowHandle` の列挙子は全 OS で定義されているので `cfg` は要らない
+/// （macOS では `AppKit` に一致して `None` に落ちる）。プラットフォーム分岐は
+/// 受け取り側の境界（`tako_core::platform`）の内側に閉じる
 fn native_window_handle(window: &Window) -> Option<isize> {
     let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
     match handle.as_raw() {
