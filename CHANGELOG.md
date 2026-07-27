@@ -23,6 +23,22 @@ change-type tag. Entries without a platform tag apply to every platform.
   while a suggestion is shown and the cursor is at the end of the line, so ordinary Tab
   completion and completion-menu cycling are untouched.*
 
+### Fixed
+
+- **[macOS] リモートサーバーの停止で子プロセスが defunct（ゾンビ）として残り、停止が
+  失敗と報告されていた問題を修正（#619）**: 起動した daemon は tako 本体の子プロセスの
+  ままなのに、終了ステータスを誰も回収していなかった。`kill(pid, 0)` はゾンビにも成功する
+  ため停止側は「終了しない」と誤判定し、実際には停止できているのに 5 秒待ってから
+  「SIGTERM 後 5 秒経っても終了しない」を返していた（GUI の停止ボタンもそのエラーを表示）。
+  起動した側で終了ステータスを回収するようにし、停止側もゾンビを終了済みと読むようにした。
+  *Fixes zombie (defunct) processes piling up after stopping the remote server, and the
+  bogus failure it caused. The daemon stayed a child of tako but nobody reaped its exit
+  status; since `kill(pid, 0)` succeeds for zombies, the stop path concluded the process
+  was still running and returned "did not exit 5 seconds after SIGTERM" — even though the
+  server had actually stopped (the GUI stop button surfaced that error too). tako now
+  reaps the daemon in the process that started it, and the stop path reads a zombie as
+  terminated.*
+
 ## [0.6.0] - 2026-07-27
 
 安定版ローンチ。v0.5.x のテスト版チャンネル（夜間パッチリリース）で検証してきた
