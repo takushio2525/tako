@@ -52,6 +52,15 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
   `ui_text::tests_support::check_ja_en` に集約する（並列テストの競合防止）
+- **言語グローバルを読む処理には言語を引数で受ける版を必ず添える**
+  （`Note::text` / `text_in`、`gate` / `gate_in`、`autosuggest_hint_texts` /
+  `autosuggest_hint_texts_for`）。1 つの出力を組み立てる間に `i18n::lang()` を
+  複数回読むと、その隙に言語が切り替わったとき日英が混ざる。**解決は入口で 1 回**にして
+  以降は引数で引き回す（#608）
+- **テストは言語グローバルに触らない**（上の `_in` / `_for` 版を使う）。
+  グローバルへの追従そのものが検査対象のときだけ `i18n::testing::lang_guard()` を取る。
+  cargo test は同一バイナリのテストを並列実行するので、素で `set_lang` すると
+  確率的に落ちる（#608 実測: 該当 3 本だけの反復で 26% が失敗）
 
 ## リリース配布物の命名規約（Issue #594 / #595）
 
