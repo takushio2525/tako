@@ -67,6 +67,7 @@ tako/
 | dev（最小ターミナル起動） | `cargo run -p tako-app` |
 | **実験・検証用の隔離起動（本番 GUI 稼働中は必須。#177）** | `TAKO_ISOLATED=1 cargo run -p tako-app`（discovery / persist / tmux socket を一括隔離。個別の `TAKO_DISCOVERY_DIR` だけの隔離は本番セッション強奪を起こすため**禁止**） |
 | セルフテスト起動（入力経路 + CLI / MCP e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
+| Windows 永続化の器（psmux）の明示指定 | `TAKO_BACKEND=psmux`（既定は自動判別。`TAKO_PSMUX_BIN=<path>` でバイナリ明示。未導入時は none へ縮退。導入手順は `.agent/windows-setup.md` §3.5） |
 | 実 claude の Shift+Enter 改行 e2e（#28。要 claude CLI + 認証） | `TAKO_SELF_TEST=1 TAKO_SELF_TEST_CLAUDE=1 cargo run -p tako-app`（セルフテスト 45c として実行） |
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
 | 自動セットアップ | `tako setup [--yes] [--answers <json|@file|->]`（質問ゼロ。`--review` だけ個別対話。MCP `tako_setup` と 1:1。#262） |
