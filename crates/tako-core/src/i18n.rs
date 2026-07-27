@@ -157,6 +157,51 @@ fn macos_preferred_language() -> Option<String> {
     defaults_read("AppleLocale")
 }
 
+/// 表示言語グローバルを触るテスト用の補助（#608）。
+///
+/// 表示言語はプロセス全体で共有される。cargo test は同一バイナリのテストを
+/// 並列スレッドで走らせるので、`set_lang` を呼ぶテストが複数あると
+/// 「A が En にしている間に B が Ja 前提で読む」競合で確率的に落ちる。
+///
+/// **原則は「テストは言語グローバルに触らない」**（`Note::text_in` / `gate_in` /
+/// `autosuggest_hint_texts_for` のように言語を引数で受ける版を使う）。
+/// グローバルへの追従そのものが検査対象のときだけ、ここのガードを取って直列化する。
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{lang, set_lang, Lang};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// 言語グローバルの排他を保持し、drop で元の言語へ戻すガード。
+    /// フィールドの drop より先に `Drop::drop` が走るので、
+    /// **言語を復元してからロックを解放する**（次のテストは復元後の状態から始まる）
+    pub(crate) struct LangGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: Lang,
+    }
+
+    impl Drop for LangGuard {
+        fn drop(&mut self) {
+            set_lang(self.original);
+        }
+    }
+
+    /// 言語グローバルを排他し、スコープを抜けたら元の言語へ戻す。
+    /// 途中で assert が落ちても復元されるので、後続テストへ汚染が漏れない
+    pub(crate) fn lang_guard() -> LangGuard {
+        // 先のテストが assert で落ちてロックが毒されても、検査自体は続行してよい
+        let _lock = lock().lock().unwrap_or_else(|e| e.into_inner());
+        LangGuard {
+            _lock,
+            original: lang(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +259,8 @@ mod tests {
 
     #[test]
     fn global_lang_set_and_get() {
-        // 他テストとグローバルを共有するため、最後に既定へ戻す
+        // 他テストとグローバルを共有するので、排他して元の言語へ戻す（#608）
+        let _guard = testing::lang_guard();
         set_lang(Lang::Ja);
         assert_eq!(lang(), Lang::Ja);
         set_lang(Lang::En);
