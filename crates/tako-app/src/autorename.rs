@@ -185,7 +185,8 @@ fn run_claude(bin: &Path, materials: &TabMaterials) -> Option<RenamePlan> {
     use std::process::{Command, Stdio};
 
     let prompt = build_prompt(materials);
-    let mut child = Command::new(bin)
+    // #586: GUI プロセスからの起動なので Windows でコンソールウィンドウを出させない
+    let mut child = tako_core::platform::process::no_console_window(&mut Command::new(bin))
         .args(["-p", "--model", MODEL])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

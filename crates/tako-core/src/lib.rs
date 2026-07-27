@@ -99,7 +99,8 @@ pub(crate) fn resolve_bin(
             return bin.to_string_lossy().into_owned();
         }
     }
-    if std::process::Command::new(name)
+    // #586: バイナリ存在確認も GUI プロセスから走る（コンソールウィンドウを出させない）
+    if platform::process::no_console_window(&mut std::process::Command::new(name))
         .arg(version_flag)
         .output()
         .map(|o| o.status.success())

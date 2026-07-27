@@ -9,5 +9,6 @@
 
 pub mod font;
 pub mod ime;
+pub mod process;
 pub mod shell;
 pub mod support;

@@ -6559,7 +6559,8 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let cli_version = cli_path
         .as_ref()
         .and_then(|path| {
-            std::process::Command::new(path)
+            // #586: GUI プロセス経由の診断でもコンソールウィンドウを出させない
+            tako_core::platform::process::no_console_window(&mut std::process::Command::new(path))
                 .arg("--version")
                 .output()
                 .ok()
