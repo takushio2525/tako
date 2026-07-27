@@ -53,6 +53,85 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
   `ui_text::tests_support::check_ja_en` に集約する（並列テストの競合防止）
 
+## リリース配布物の命名規約（Issue #594 / #595）
+
+配布アセットの命名は**リリース側（`scripts/release.sh`）と更新チェック側
+（`tako-app::update_checker`）の両方が同じ規則で判定する**。食い違うと
+「Windows クライアントが macOS の zip を掴む」「自 OS 用アセットが無いのに
+更新ありと通知する」事故になる（#595 の背景）。
+
+```text
+tako-<tag>-<platform>-<arch>.<ext>
+
+tako-v0.5.13-macos-arm64.zip        macOS / Apple Silicon
+tako-v0.6.0-test.1-macos-arm64.zip  テスト版（タグに `-` と `.` を含む）
+tako-v0.6.0-windows-x86_64.exe      Windows インストーラー（#587）
+tako-v0.6.0-windows-x86_64.zip      Windows ポータブル版
+```
+
+- `<platform>` = `macos` / `windows`、`<arch>` = `arm64` / `x86_64`。
+  **別名（`win` / `aarch64` / `amd64`）は使わない・受け付けない**
+  （規則外のファイルを配布物と誤認しないための厳格一致）
+- **判定ロジックの正は `crates/tako-core/src/platform/release_assets.rs` の 1 箇所**。
+  シェル側 `scripts/lib/release-assets.sh` はリリーススクリプト用の写しで、
+  両者の一致は同期テスト（`cargo test -p tako-core release_assets`）が機械検証する。
+  規則を変えるときは **Rust を直してからシェルを合わせる**（片方だけだとテストが落ちる）
+- 新しい配布形式（`.msi` 等）を足すときは `extensions()` に追加する。
+  **追加し忘れると更新チェックがそのアセットを見落とし、利用者に更新が届かない**
+- 更新候補は「最新リリース」ではなく**自分の環境向けアセットを含む最新リリース**。
+  該当アセットが無いリリースは読み飛ばす（#595）。この規則により、
+  macOS 先行リリース + Windows アセット後付けの運用をしても
+  Windows 側に「更新はあるがダウンロードできない」通知が出ない
+
+## CHANGELOG / リリースノートのプラットフォーム表記（Issue #594）
+
+リリースノートは **Mac / Windows で分けず、単一ノート + プラットフォーム明示**で運用する
+（VS Code / Zed 等クロスプラットフォームアプリの主流方式。2026-07-27 ユーザー承認済み）。
+
+### 項目タグ
+
+CHANGELOG.md の項目は、**種別タグの直後**にプラットフォームタグを置く。
+共通の変更は無印（大多数はこれ）。
+
+```markdown
+- [修正] [Windows] ConPTY のリサイズ追従を修正 (#123)
+- [機能追加] [macOS] Touch ID でのロック解除に対応 (#124)
+- [改善] 更新チェックを自 OS アセット基準にする (#595)   ← 共通なので無印
+```
+
+**タグは commit の件名に書く**。夜間リリース（`scripts/nightly-release.sh`）は
+commit 件名から CHANGELOG の節を自動生成するので、件名に無いタグはノートに出ない:
+
+```
+[修正] [Windows] ConPTY のリサイズ追従を修正 (#123)
+```
+
+### リリースノートの構成
+
+`scripts/release.sh` が CHANGELOG と**実アセット**から自動生成する。手で書かない。
+
+1. `## tako <tag>` + CHANGELOG 該当節
+2. **ダウンロード表**（アセットがある OS の行だけ。Windows 版が無い間は macOS のみ）
+3. OS 別インストール手順（その OS の配布物があるときだけ）
+4. **Known limitations (Windows)** — #515 のサポートマトリクスから
+   `tako platform --platform windows --known-limitations` で生成。
+   Windows 版の配布物が含まれるときだけ付く。**機能が Windows 対応すると節から自動的に消える**
+5. Claude Code 連携
+
+生成物なので**表示言語設定に依存しない**（日英を必ず併記する）。
+
+### macOS 先行リリース → Windows 版の後付け
+
+同じタグにアセットを足す運用を正式手順とする（#595 のフィルタと対で成立する）:
+
+```sh
+gh release upload v0.6.0 dist/tako-v0.6.0-windows-x86_64.exe --clobber
+scripts/release.sh --update-notes v0.6.0   # 実アセットを読み直してノートを作り直す
+```
+
+アセットを足した時点で、Windows クライアントの更新チェックに初めてそのリリースが見える。
+生成結果の確認は `scripts/release.sh --notes-only`（ビルドも公開もしない）。
+
 ## コマンド案内の規約（Issue #322）
 
 ユーザー体験の設計原則。setup に限らず、CLI 出力・system prompt・docs のすべてに適用する。

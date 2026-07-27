@@ -2215,6 +2215,11 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["supported", "degraded", "pending", "unsupported"],
                         "description": "この状態のものだけに絞る（省略時は全件）",
                     },
+                    "known_limitations": {
+                        "type": "boolean",
+                        "description": "リリースノート用の Known limitations 節（日英併記の markdown）を \
+                            known_limitations_markdown に併せて返す（Issue #594）",
+                    },
                 },
                 "additionalProperties": false,
             },
@@ -3759,6 +3764,7 @@ fn build_request(
         "tako_platform" => Request::Platform {
             platform: str_arg(args, "platform")?.map(|s| s.to_string()),
             status: str_arg(args, "status")?.map(|s| s.to_string()),
+            known_limitations: bool_arg(args, "known_limitations")?.unwrap_or(false),
         },
         "tako_lang" => Request::Lang {
             action: str_arg(args, "action")?.map(|s| s.to_string()),

@@ -14308,6 +14308,8 @@ impl SystemHost for TakoApp {
                 "version": info.version,
                 "channel": info.channel.label(),
                 "download_url": info.download_url,
+                // 自分の環境向けにどの配布物を掴んだか（#595）
+                "asset_name": info.asset_name,
             })
         };
         match ch {
