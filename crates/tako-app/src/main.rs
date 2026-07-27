@@ -23893,8 +23893,8 @@ mod self_test {
                 let log_dir = window
                     .update(cx, |app, _, _| app.pane_logs_lock().dir().to_path_buf())
                     .ok();
-                // 閉じたペインのログから最後のクローズマーカー行を拾う
-                let close_marker = |dir: &std::path::Path, pane: u64| -> String {
+                // 閉じたペインのログから最後のクローズマーカーの発生源を拾う
+                let close_reason = |dir: &std::path::Path, pane: u64| -> String {
                     tako_core::pane_log::list_files(dir)
                         .into_iter()
                         .find(|f| f.pane == Some(pane))
@@ -23902,10 +23902,23 @@ mod self_test {
                         .and_then(|c| {
                             c.lines()
                                 .rev()
-                                .find(|l| l.starts_with("--- [クローズ:"))
+                                .find_map(tako_core::pane_log::close_marker_reason)
                                 .map(str::to_string)
                         })
                         .unwrap_or_default()
+                };
+                // 発生源つきマーカー（#599）: dispatch 経路は呼び出し元 role があると
+                // "close:dispatch(cli)" ではなく "close:dispatch(cli, caller=<role>)" になる。
+                // worker ペインには TAKO_ORCHESTRATOR_ROLE が入っているので、そこから
+                // セルフテストを回すと必ず caller つきになる。期待値は CloseOrigin から
+                // 組み立て（role の正規化も同じ経路を通る）、素の形と caller つきの形の
+                // どちらかに完全一致することを見る
+                let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE")
+                    .ok()
+                    .filter(|r| !r.trim().is_empty());
+                let reason_is = |reason: &str, origin: CloseOrigin| -> bool {
+                    reason == origin.marker()
+                        || reason == origin.marker_with_caller(caller_role.as_deref())
                 };
                 // 対象ペインを作り、ログ素材になる出力を残してから閉じる
                 let split_cmd = format!("{cli} split --right --focus >/dev/null");
@@ -23954,15 +23967,17 @@ mod self_test {
                 let markers_ok = log_dir
                     .as_ref()
                     .map(|dir| {
-                        let kbd = close_marker(dir, kbd_pane);
-                        let gui = close_marker(dir, gui_pane);
-                        let cli_m = close_marker(dir, cli_pane);
-                        let ok = kbd.contains("close:kbd")
-                            && gui.contains("close:gui")
-                            && cli_m.contains("close:dispatch(cli)");
+                        let kbd = close_reason(dir, kbd_pane);
+                        let gui = close_reason(dir, gui_pane);
+                        let cli_m = close_reason(dir, cli_pane);
+                        let ok = reason_is(&kbd, CloseOrigin::Keyboard)
+                            && reason_is(&gui, CloseOrigin::PaneButton)
+                            && reason_is(&cli_m, CloseOrigin::Cli);
                         if !ok {
                             println!(
-                                "  クローズマーカー: kbd={kbd:?} gui={gui:?} cli={cli_m:?}"
+                                "  クローズマーカー: kbd={kbd:?} gui={gui:?} cli={cli_m:?} / \
+                                 期待 cli={:?}（caller={caller_role:?}）",
+                                CloseOrigin::Cli.marker_with_caller(caller_role.as_deref())
                             );
                         }
                         ok
