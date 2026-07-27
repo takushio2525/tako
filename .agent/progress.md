@@ -1437,3 +1437,17 @@
   `system_languages() = ["ja-JP", "en-US"]`。`TAKO_LANG` 優先は不変（テストで固定）
 - 検証: tako-core 460 passed（HEAD と同一の既知 6 失敗のみ・新規テスト 12 本）/ tako-app 220 全緑 /
   parity 11 全緑 / doc 再生成の差分なし。macOS は cfg 構造保証のみ（未コンパイル）
+
+## 2026-07-27（#623: Windows の IME 打鍵消失を調査 — 潜在欠陥を 1 件修正、症状の根治は未確認）
+- GPUI Windows は描画のたび `update_ime_enabled()` を呼び、入力ハンドラがスロットに無いだけで
+  `CPS_COMPLETE`（未確定文字列の強制確定）+ IME 切り離しを行う。ハンドラが戻るのは paint で
+  `handle_input` が呼ばれたときだけ = フォーカスが自分のハンドルにある時だけ。既存の自己修復は
+  「どこにもフォーカスが無い」しか見ておらず、`on_focus_lost` は同フレームの paint に間に合わない
+  → canvas の **prepaint** で取り戻す + 切り離しを検知したら再結合（B17 に `is_associated` /
+  `reassociate` / `guard_action`）+ `render` 冒頭の判定を「自分のハンドルに無い」へ強化
+- **ただし実測ではこの経路は一度も発火せず**（`focus_held=true associated=Some(true)` のまま。
+  OS フォーカスを 5 往復奪っても不変）。合成 IME 入力での再現も、ハーネスを直したら 7/7 正常。
+  症状は「未確定文字列が壊れる」ではなく**打鍵が IME へ届く前に落ちる / 重複する**線が濃い
+  （報告 3 例すべてその仮説で説明がつく）。切り分け用に `TAKO_IME_DIAG=1` の診断を新設
+- 次: 実機で症状再現時に `TAKO_IME_DIAG=1` のログを採取 → #623 §4（`translate_accelerator` が
+  処理済み打鍵の `TranslateMessage`/`DispatchMessageW` を飛ばす経路）の検証
