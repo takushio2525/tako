@@ -929,7 +929,8 @@ pub fn tail_lines(output: &str, n: usize) -> Vec<&str> {
 /// claude TUI のフッターは区切り線・入力欄・区切り線・モデル・ctx・5h・7d・auto mode の
 /// 8 行あり、スピナー行は末尾から 9 行目に来る（2026-07-27 実採取）。
 /// 旧実装の 5 行では**スピナーに一度も届かず** busy 判定が常に false だった（#571）。
-/// 将来フッターが伸びても届くよう余裕を取る（`recent_output` は 30 行）
+/// スピナー直下に Tip 等が挟まると 12 行目まで下がる実測もあるので余裕を取る
+/// （`recent_output` は 30 行）
 const BUSY_STRONG_TAIL: usize = 20;
 
 /// 弱マーカー（完了後の画面にも残る一般語）を探す範囲。
@@ -950,9 +951,9 @@ const BUSY_WEAK_TAIL: usize = 5;
 /// 「Claude Opus 4.6 (Thinking)」（常時表示）に誤爆して永遠に busy 判定になるため、
 /// claude スピナーの実表示「Thinking…」に限定する（実機検証 2026-07-10 で発見）
 pub fn screen_looks_busy(output: &str) -> bool {
-    let strong = tail_lines(output, BUSY_STRONG_TAIL).iter().any(|l| {
-        l.contains("esc to interrupt") || l.contains("esc to cancel") || spinner_with_elapsed(l)
-    });
+    let strong = tail_lines(output, BUSY_STRONG_TAIL)
+        .iter()
+        .any(|l| l.contains("esc to interrupt") || l.contains("esc to cancel") || is_spinner(l));
     if strong {
         return true;
     }
@@ -970,20 +971,41 @@ pub fn screen_looks_busy(output: &str) -> bool {
     })
 }
 
-/// 経過時間つきスピナー行か（強マーカー）。実採取例:
-/// claude `✽ Misting… (10m 49s · ↓ 35.8k tokens)` / codex `Working (12s • Esc to interrupt)`。
+/// スピナー行（作業中にしか描画されない）か。強マーカーとして広い範囲から探す。
 ///
-/// 完了行は `✻ Cogitated for 2h 3m 31s` のように**括弧つき経過時間を持たない**ため、
-/// 「マーカー直後の括弧が経過時間で始まる」ことを条件にすると実行中だけを拾える。
-/// スピナーの語は claude の気分次第で変わる（Misting / Cogitating / …）ので語には依存しない
-fn spinner_with_elapsed(line: &str) -> bool {
+/// 構造は `<glyph> <語>… (<詳細>)`。**glyph も語も当てにしない**（実測で
+/// `✻ ✶ ✳ ✽ ·` が現れ、語も Misting / Sautéing / Cogitating … と毎回変わる）。
+/// 見るのは「`… (` の中身が作業中を示すか」だけ。
+///
+/// 詳細部の実採取バリエーション（#571 の master 実測 2026-07-27 + 本タスクの採取）:
+///
+/// - `✽ Misting… (10m 49s · ↓ 35.8k tokens)` — 経過時間
+/// - `· Misting… (1h 22m 18s)` — 1 時間超えで `Nh` が付く
+/// - `✻ Misting… (3m 27s · ↓ 8.4k tokens · thinking with max effort)` — 拡張思考中
+/// - `✶ Sautéing… (thinking)` — **経過時間もトークン数も出ない**
+/// - codex `Working (12s • Esc to interrupt)`
+///
+/// 完了行は `✻ Cogitated for 2h 3m 31s` のように**括弧つきの詳細を持たない**ので、
+/// 「マーカー直後の括弧の中身」で見分けられる。
+/// 拡張思考中は `esc to interrupt` が消えるため、この判定が唯一の busy シグナルになる
+fn is_spinner(line: &str) -> bool {
     ["… (", "... (", "Working ("]
         .iter()
         .filter_map(|marker| line.split_once(marker))
-        .any(|(_, rest)| starts_with_elapsed(rest))
+        .any(|(_, rest)| spinner_detail_is_running(rest))
 }
 
-/// 文字列の先頭が経過時間表記（`12s` / `10m 49s` / `2h 3m` 等）か
+/// スピナーの括弧内が「作業中」を示すか。
+/// `thinking` は**小文字のみ**を見る: agy フッターのモデル名表記
+/// 「Claude Opus 4.6 (Thinking)」は常時表示なので、拾うと永遠に busy になる
+/// （実機検証 2026-07-10 で踏んだ罠）
+fn spinner_detail_is_running(detail: &str) -> bool {
+    starts_with_elapsed(detail)
+        || detail.starts_with("thinking")
+        || detail.starts_with("still thinking")
+}
+
+/// 文字列の先頭が経過時間表記（`12s` / `10m 49s` / `1h 22m 18s` 等）か
 fn starts_with_elapsed(s: &str) -> bool {
     let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
     digits > 0 && matches!(s[digits..].chars().next(), Some('s' | 'm' | 'h'))
@@ -1664,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn スピナー判定は経過時間つきの括弧だけを拾う() {
+    fn スピナー判定は括弧の中身で作業中を見分ける() {
         // 語には依存しない（claude のスピナー語は毎回変わる）
         assert!(screen_looks_busy("✽ Herding… (3s)"));
         assert!(screen_looks_busy("✽ Puzzling... (1m 12s · ↑ 2k tokens)"));
@@ -1675,6 +1697,66 @@ mod tests {
             "  Output written on main.pdf (10 pages)"
         ));
         assert!(!screen_looks_busy("  5h   20% ██░░░░░░░░ (→2h33m)"));
+    }
+
+    /// #571 で master が応急監視中に実測した「画面判定を破る表示状態」（2026-07-27）。
+    /// どれか 1 つでも busy と読めないと、画面フォールバック経路が偽 IDLE を出す
+    #[test]
+    fn masterが実測したスピナーの全バリエーションをbusyと読む() {
+        let busy_samples = [
+            // 拡張思考中は esc to interrupt が消える
+            "✻ Misting… (3m 27s · ↓ 8.4k tokens · thinking with max effort)",
+            "✳ Misting… (6m 30s · still thinking with max effort)",
+            // 経過時間もトークン数も出ない形
+            "✶ Sautéing… (thinking)",
+            // 1 時間超えで Nh が付く
+            "· Sautéing… (1h 7m 16s)",
+            // glyph は ✻ ✶ ✳ ✽ · と揺れる
+            "✽ Baking… (12s)",
+            "· Misting… (1h 22m 18s)",
+        ];
+        for s in busy_samples {
+            assert!(screen_looks_busy(s), "busy と読めていない: {s}");
+        }
+
+        // 逆方向: idle でのみ観測される行を busy と読まない
+        let idle_samples = [
+            "✻ Baked for 10m 55s",
+            "✻ Cogitated for 2h 3m 31s",
+            "                         new task? /clear to save 500k tokens",
+        ];
+        for s in idle_samples {
+            assert!(!screen_looks_busy(s), "busy と誤読している: {s}");
+        }
+        // agy フッターのモデル名（常時表示）に誤爆しない
+        assert!(!screen_looks_busy(
+            "? for shortcuts   Claude Opus 4.6 (Thinking)"
+        ));
+    }
+
+    #[test]
+    fn 拡張思考中のスピナーはフッター越しでも拾う() {
+        // 実配置（スピナー → Tip ブロック → 区切り線 → 入力欄 → フッター 5 行）で
+        // 末尾から 12 行目に来るケース。ここを外すと偽 IDLE になる
+        let screen = "\
+⏺ 調査を続けます\n\
+\n\
+✶ Sautéing… (thinking)\n\
+  ⎿  Tip: Use /clear to start\n\
+     fresh when switching topics\n\
+     and free up context\n\
+\n\
+─────────────────────────────────\n\
+❯ \n\
+─────────────────────────────────\n\
+  [Opus 5 · MAX]  🔧 worker: tako:571\n\
+  ctx  43% ████░░░░░░\n\
+  5h   38% ███░░░░░░░ (→1h21m)\n\
+  7d   20% ██░░░░░░░░ (→5d09h)\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+        assert!(screen_looks_busy(screen));
+        // 入力欄は見えているが busy が優先される
+        assert!(screen_looks_idle(screen));
     }
 
     /// codex 0.144.1 の実採取画面（Issue #120）
