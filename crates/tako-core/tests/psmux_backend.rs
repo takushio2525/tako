@@ -126,8 +126,9 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
         session: &mut tako_core::TerminalSession,
         rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
         needle: &str,
+        attempts: usize,
     ) -> bool {
-        for _ in 0..200 {
+        for _ in 0..attempts {
             while let Ok(event) = rx.try_recv() {
                 session.process_event(event);
             }
@@ -154,14 +155,24 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
     let (mut first, mut rx1) =
         tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base.clone(), &name))
             .expect("psmux クライアントを spawn できる");
-    // シェルの起動を待ってから打ち込む（pwsh は起動に数秒かかることがある）
-    std::thread::sleep(Duration::from_secs(3));
-    while let Ok(event) = rx1.try_recv() {
-        first.process_event(event);
+    // シェルが入力を受けられるようになるまで待つ。**固定 sleep では足りない**:
+    // 並列テストで負荷がかかると pwsh の起動が遅れ、先頭の数文字が食われる
+    // （実測: `Write-Output (AKO-PSMUX' …` のように打鍵が欠ける）。
+    // プロンプトを待ってから打ち、それでも駄目なら打ち直す
+    let prompt = if cfg!(windows) { "PS " } else { "$" };
+    let mut delivered = false;
+    for _ in 0..6 {
+        if !wait_for(&mut first, &mut rx1, prompt, 60) {
+            continue;
+        }
+        first.write(marker_command.to_vec());
+        if wait_for(&mut first, &mut rx1, "TAKO-PSMUX-OK", 60) {
+            delivered = true;
+            break;
+        }
     }
-    first.write(marker_command.to_vec());
     assert!(
-        wait_for(&mut first, &mut rx1, "TAKO-PSMUX-OK"),
+        delivered,
         "1 回目の器でマーカーが出力される。画面: {:?}",
         first.visible_lines().join("\n")
     );
@@ -178,7 +189,7 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
         tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base, &name))
             .expect("再 attach の psmux クライアントを spawn できる");
     assert!(
-        wait_for(&mut second, &mut rx2, "TAKO-PSMUX-OK"),
+        wait_for(&mut second, &mut rx2, "TAKO-PSMUX-OK", 200),
         "再 attach で画面内容（scrollback）が復元される。画面: {:?}",
         second.visible_lines().join("\n")
     );
@@ -456,17 +467,21 @@ fn 明示コマンドつきの器が起動する() {
     };
     let wrapped = f.backend.wrap_spawn(options, &name);
     let cmd = wrapped.command.expect("起動コマンドが組まれる");
-    let out = Command::new(&cmd.program)
-        .args(&cmd.args[..cmd.args.len()])
-        .env("TAKO_M2_TEST", "1")
-        .spawn();
-    // クライアントは PTY 無しでは即終了しうるので、器が立ったかどうかだけを見る
-    if let Ok(mut child) = out {
-        std::thread::sleep(Duration::from_millis(2500));
+    // クライアントは PTY 無しでは即終了しうるので、器の中身だけを見る
+    let child = Command::new(&cmd.program).args(&cmd.args).spawn();
+    // 並列テストで負荷がかかると器の起動は数秒ずれる。固定 sleep ではなくポーリングで待つ
+    let mut captured = String::new();
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(500));
+        captured = f.raw(&["capture-pane", "-t", name.as_str(), "-p"]).1;
+        if captured.contains("TAKO-M2-CMD-OK") {
+            break;
+        }
+    }
+    if let Ok(mut child) = child {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let (_, captured) = f.raw(&["capture-pane", "-t", name.as_str(), "-p"]);
     assert!(
         captured.contains("TAKO-M2-CMD-OK"),
         "明示コマンドが器の中で起動していない（引数の組み立て規則が壊れた）: {captured}"
