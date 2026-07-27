@@ -3955,6 +3955,11 @@ impl TakoApp {
                         // 入力欄（プロンプト記号）を確認して貼り付け。汎用送信（wait_tui=false）は
                         // 対象が claude TUI でなくても 2 秒待って貼る（他 TUI への送信）。
                         // bracketed paste はアプリが要求していれば paste() が括りを付ける
+                        flow_diag(&format!(
+                            "paste: {} バイト送出（pane={}）",
+                            flow.prompt.len(),
+                            flow.pane.as_u64()
+                        ));
                         session.paste(&flow.prompt);
                         flow.state = PromptFlowState::WaitTextInInput;
                         flow.state_entered_at = now;
@@ -3966,10 +3971,20 @@ impl TakoApp {
                     // 入力欄への反映（マルチラインは [Pasted text #N] 表示）を確認。
                     // 折り返し・全角幅で入力欄行にマッチしないケースは画面全体 or
                     // 10 秒タイムアウトで救済（従来挙動の維持）
-                    let reflected = claude_tui::text_in_input(&lines, &flow.prompt)
-                        || (!head.is_empty() && lines.iter().any(|l| l.contains(head.as_str())));
+                    let in_input = claude_tui::text_in_input(&lines, &flow.prompt);
+                    let anywhere =
+                        !head.is_empty() && lines.iter().any(|l| l.contains(head.as_str()));
+                    let reflected = in_input || anywhere;
                     let timed_out =
                         flow.state_entered_at.elapsed() > std::time::Duration::from_secs(10);
+                    // #623: どちらの判定で Enter を撃ったかを残す。`anywhere` だけが真なら
+                    // 「入力欄では確認できていないのに画面のどこかに断片が見えた」= 早撃ちの疑い
+                    flow_diag(&format!(
+                        "WaitTextInInput: in_input={in_input} anywhere={anywhere} timed_out={timed_out} \
+                         入力欄長={:?} 経過ms={}",
+                        claude_tui::input_line(&lines).map(str::len),
+                        flow.state_entered_at.elapsed().as_millis()
+                    ));
                     if reflected {
                         // 送信の Enter は貼り付けと分離した単独キーとして送る
                         // （貼り付けバーストに混ざると「次の行」と解釈される）
@@ -4016,6 +4031,14 @@ impl TakoApp {
                         } else {
                             claude_tui::input_residual(&lines, &flow.prompt)
                         };
+                        // #623: 残留判定は text_in_input と同じ「先頭 10 文字が見えるか」なので、
+                        // 貼り付けがまだ描画中だと「未送信」と誤判定して Enter を余分に撃つ
+                        flow_diag(&format!(
+                            "VerifySubmitted: residual={residual} enter_only={} 再送残={} 入力欄長={:?}",
+                            flow.enter_only,
+                            flow.enter_retries_left,
+                            claude_tui::input_line(&lines).map(str::len)
+                        ));
                         if !residual {
                             // 入力欄が空へ戻った = 送信された
                             flow.state = PromptFlowState::Done;
@@ -15598,6 +15621,28 @@ thread_local! {
 fn ime_diag_event(kind: &str, utf16_len: usize) {
     if ime_diag_enabled() {
         tako_control::diag::perf_log(&format!("ime-diag: {kind} utf16_len={utf16_len}"));
+    }
+}
+
+/// PromptFlow（alt screen への貼り付け → 分離 Enter）の分岐を記録する
+/// （`TAKO_FLOW_DIAG=1` のときだけ。#623）。
+///
+/// この経路は「画面に先頭 10 文字が見えるか」で反映・残留を判定しているため、
+/// 長文の貼り付けが描画し終わる前に真になると **Enter を早撃ちして本文が切れる**。
+/// どの判定で分岐したかを残さないと、切れた結果からは原因を切り分けられない。
+///
+/// **プロンプト本文は出さない**（AGENTS.md の絶対ルール: 送信テキストを診断ログへ
+/// 出さない）。出すのは判定の真偽・長さ・経過時間だけ
+fn flow_diag(msg: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_FLOW_DIAG").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    });
+    if on {
+        tako_control::diag::perf_log(&format!("flow-diag: {msg}"));
     }
 }
 
