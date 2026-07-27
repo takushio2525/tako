@@ -943,11 +943,11 @@ const BUSY_WEAK_TAIL: usize = 5;
 /// マーカーを 2 層に分けて、探す範囲を変える（Issue #571）:
 ///
 /// - **強マーカー** = 実行中にしか描画されない（`esc to interrupt` / `esc to cancel` /
-///   経過時間つきスピナー）。誤爆しないので末尾 20 行まで見る
+///   スピナー行。バリエーションは `is_spinner` 参照）。誤爆しないので末尾 20 行まで見る
 /// - **弱マーカー** = 完了後の出力にも現れる一般語（`Reading` / `Running` 等）。
 ///   従来どおり末尾 5 行に限定する
 ///
-/// 「Thinking」は素のままだと agy フッターのモデル名表記
+/// 弱マーカーの「Thinking」は素のままだと agy フッターのモデル名表記
 /// 「Claude Opus 4.6 (Thinking)」（常時表示）に誤爆して永遠に busy 判定になるため、
 /// claude スピナーの実表示「Thinking…」に限定する（実機検証 2026-07-10 で発見）
 pub fn screen_looks_busy(output: &str) -> bool {
