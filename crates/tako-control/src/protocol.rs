@@ -200,6 +200,19 @@ pub enum Request {
     Equalize { pane: Option<u64>, tab: Option<u64> },
     /// タブ / ペインのツリー構造・ジオメトリ・状態の取得（FR-2.2.4 / FR-2.5.1〜2）
     List,
+    /// 呼び出し元ペインの解決（Issue #567）。stale な `TAKO_PANE_ID`（アプリ再起動・
+    /// セッション再利用をまたいだ旧世代 ID）を現世代のペインへ読み替えるための問い合わせ。
+    /// 解決順は pid 祖先辿り → pane そのまま → stale pane map（#210）。
+    /// **role 検索へはフォールバックしない**（無関係な master ペインを掴まないため）。
+    /// 解決できなくてもエラーにせず `pane: null` を返す（呼び出し側がフォールバックを選ぶ）
+    ResolvePane {
+        /// 呼び出し元が自称するペイン ID（`TAKO_PANE_ID`。stale の可能性がある）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 呼び出しプロセスの pid（pid 祖先辿りで実ペインを特定する。#288 と同じ経路）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_pid: Option<u32>,
+    },
     /// ペインへのテキスト送信（FR-2.2.2）。`newline` で末尾に改行（CR）を付与。
     /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で送信する。
     /// `await_prompt` が true の場合、claude TUI の ❯ プロンプト表示を待ってから送信する。

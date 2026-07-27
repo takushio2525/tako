@@ -705,6 +705,10 @@ fn dispatch_inner(
 
         Request::List => Ok(list_json(host)),
 
+        Request::ResolvePane { pane, caller_pid } => {
+            Ok(resolve_pane_lenient_json(host, pane, caller_pid))
+        }
+
         Request::Send {
             pane,
             text,
@@ -6786,6 +6790,83 @@ pub(crate) fn resolve_pane(
     Err(DispatchError::PaneNotFound(raw))
 }
 
+/// 呼び出し元ペインの解決に使った手段（Issue #567。応答の `method` フィールド）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneResolveMethod {
+    /// caller_pid の祖先辿りで実ペインを特定した（環境変数より確か）
+    Pid,
+    /// 渡された pane ID がそのまま現世代に存在した
+    Pane,
+    /// stale pane map（#210）で旧 ID → 新 ID に読み替えた
+    Stale,
+}
+
+impl PaneResolveMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            PaneResolveMethod::Pid => "pid",
+            PaneResolveMethod::Pane => "pane",
+            PaneResolveMethod::Stale => "stale",
+        }
+    }
+}
+
+/// Issue #567: 呼び出し元ペインの寛容な解決。`resolve_pane` と違い**エラーにしない**。
+///
+/// 解決順は #288 の `resolve_caller_pane` と揃える（pid 祖先辿り → pane そのまま →
+/// stale pane map）。pid を先に見るのは、環境変数はシェルの再利用で古くなるのに対し
+/// プロセスの祖先関係は「今どのペインで動いているか」の実態だから。
+/// role 検索へのフォールバックは**しない**: `tako master` の起動先が無関係な master
+/// ペインになると実行中のエージェントを潰すため、呼び出し元が新規タブへ逃がす方が安全。
+fn resolve_pane_lenient(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_pid: Option<u32>,
+    pid_resolver: impl Fn(u32, &[(u64, String)]) -> Option<u64>,
+) -> Option<(PaneResolveMethod, TabId, PaneId)> {
+    if let Some(pid) = caller_pid {
+        let pane_backends = collect_pane_backends(host);
+        if let Some(raw) = pid_resolver(pid, &pane_backends) {
+            if let Ok((tab, target)) = resolve_pane(host.workspace(), Some(raw)) {
+                return Some((PaneResolveMethod::Pid, tab, target));
+            }
+        }
+    }
+    if let Ok((tab, target)) = resolve_pane(host.workspace(), pane) {
+        return Some((PaneResolveMethod::Pane, tab, target));
+    }
+    if let Some((tab, target)) = pane
+        .map(PaneId::from_raw)
+        .and_then(|stale| host.resolve_stale_pane(stale))
+        .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
+    {
+        return Some((PaneResolveMethod::Stale, tab, target));
+    }
+    None
+}
+
+/// `Request::ResolvePane` の応答（Issue #567）
+fn resolve_pane_lenient_json(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_pid: Option<u32>,
+) -> Value {
+    let resolved = resolve_pane_lenient(host, pane, caller_pid, crate::agents::resolve_pane_by_pid);
+    // 渡された ID が現世代のものと食い違っていたか（呼び出し元の案内文用）
+    let stale = match (pane, resolved) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(requested), Some((_, _, p))) => p.as_u64() != requested,
+    };
+    json!({
+        "requested": pane,
+        "pane": resolved.map(|(_, _, p)| p.as_u64()),
+        "tab": resolved.map(|(_, t, _)| t.as_u64()),
+        "method": resolved.map(|(m, _, _)| m.as_str()),
+        "stale": stale,
+    })
+}
+
 fn find_tab(ws: &Workspace, raw: u64) -> Result<TabId, DispatchError> {
     ws.tabs()
         .iter()
@@ -10736,6 +10817,116 @@ mod tests {
             Some(actual_pane),
             "stale pane ID が新 pane ID に解決される"
         );
+    }
+
+    // ---- Issue #567: ResolvePane（stale な TAKO_PANE_ID の救済） ----
+
+    #[test]
+    fn resolve_pane_現存ペインはそのまま返る() {
+        let mut host = MockHost::new();
+        let actual = host.root_pane();
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: Some(actual),
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["pane"].as_u64(), Some(actual));
+        assert_eq!(result["method"], "pane");
+        assert_eq!(result["stale"], false);
+    }
+
+    #[test]
+    fn resolve_pane_stale_mapで新idへ読み替える() {
+        let mut host = MockHost::new();
+        let actual = host.root_pane();
+        let stale_id = 99999_u64;
+        host.stale_pane_map
+            .insert(PaneId::from_raw(stale_id), PaneId::from_raw(actual));
+
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: Some(stale_id),
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            result["pane"].as_u64(),
+            Some(actual),
+            "stale ID が現世代のペインへ読み替わる"
+        );
+        assert_eq!(result["method"], "stale");
+        assert_eq!(result["stale"], true);
+        assert_eq!(result["requested"].as_u64(), Some(stale_id));
+    }
+
+    #[test]
+    fn resolve_pane_解決不能でもエラーにせずnullを返す() {
+        let mut host = MockHost::new();
+        // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: Some(305),
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("解決できなくてもエラーにしない（呼び出し元がフォールバックを選ぶ）");
+        assert!(result["pane"].is_null());
+        assert!(result["tab"].is_null());
+        assert!(result["method"].is_null());
+        assert_eq!(result["stale"], true);
+    }
+
+    #[test]
+    fn resolve_pane_pane未指定は解決不能かつstaleではない() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: None,
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(result["pane"].is_null());
+        assert_eq!(
+            result["stale"], false,
+            "自称 ID が無いのだから「古い」わけではない"
+        );
+    }
+
+    #[test]
+    fn resolve_pane_lenient_pid解決が環境変数より優先される() {
+        let host = MockHost::new();
+        let actual = host.root_pane();
+        // pane env は現存する別 ID を騙る（ID 再利用で他人のペインを掴む事故の再現）。
+        // pid 祖先辿りが実ペインを返せばそちらが勝つ
+        let resolved = resolve_pane_lenient(&host, Some(4242), Some(1234), |pid, _backends| {
+            assert_eq!(pid, 1234);
+            Some(actual)
+        })
+        .expect("pid で解決できる");
+        assert_eq!(resolved.0, PaneResolveMethod::Pid);
+        assert_eq!(resolved.2.as_u64(), actual);
+    }
+
+    #[test]
+    fn resolve_pane_lenient_pid不明ならpane指定へ落ちる() {
+        let host = MockHost::new();
+        let actual = host.root_pane();
+        let resolved = resolve_pane_lenient(&host, Some(actual), Some(1234), |_, _| None)
+            .expect("pane 指定で解決できる");
+        assert_eq!(resolved.0, PaneResolveMethod::Pane);
+        assert_eq!(resolved.2.as_u64(), actual);
     }
 
     #[test]

@@ -2714,28 +2714,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
-    // --tab 指定時: 従来の新タブ起動
-    let pane_id = if use_tab {
-        let tab_result = send_request(Request::TabNew {
-            title: Some(tab_title.clone()),
-            focus: Some(true),
-        })?;
-        tab_result["pane"]
-            .as_u64()
-            .ok_or("タブ作成の応答に pane が含まれない")?
-    } else {
-        let cp = caller_pane().ok_or(
-            "呼び出し元ペインが不明（tako 内から実行するか、--tab で新タブ起動してください）",
-        )?;
-        send_request(Request::TabRename {
-            tab: None,
-            pane: Some(cp),
-            title: tab_title.clone(),
-            source: None,
-        })
-        .ok();
-        cp
-    };
+    // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）: 新タブ起動
+    let target = resolve_launch_target(&tab_title, use_tab, &master_cmd_hint(profile_name))?;
+    let pane_id = target.pane;
 
     send_request(Request::Title {
         pane: Some(pane_id),
@@ -2751,12 +2732,10 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         await_prompt: false,
     })?;
 
-    let location = if use_tab {
-        format!("タブ '{tab_title}'（ペイン {pane_id}）")
-    } else {
-        format!("ペイン {pane_id}（インライン）")
-    };
-    eprintln!("master を起動しました: {location}");
+    eprintln!(
+        "master を起動しました: {}",
+        launch_location(&tab_title, &target)
+    );
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         master_agent.as_str(),
@@ -2911,27 +2890,9 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
     let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
 
-    let pane_id = if use_tab {
-        let tab_result = send_request(Request::TabNew {
-            title: Some(tab_title.clone()),
-            focus: Some(true),
-        })?;
-        tab_result["pane"]
-            .as_u64()
-            .ok_or("タブ作成の応答に pane が含まれない")?
-    } else {
-        let cp = caller_pane().ok_or(
-            "呼び出し元ペインが不明（tako 内から実行するか、--tab で新タブ起動してください）",
-        )?;
-        send_request(Request::TabRename {
-            tab: None,
-            pane: Some(cp),
-            title: tab_title.clone(),
-            source: None,
-        })
-        .ok();
-        cp
-    };
+    // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）は新タブ起動
+    let target = resolve_launch_target(&tab_title, use_tab, &solo_cmd_hint(profile_name))?;
+    let pane_id = target.pane;
 
     send_request(Request::Title {
         pane: Some(pane_id),
@@ -2947,12 +2908,10 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         await_prompt: false,
     })?;
 
-    let location = if use_tab {
-        format!("タブ '{tab_title}'（ペイン {pane_id}）")
-    } else {
-        format!("ペイン {pane_id}（インライン）")
-    };
-    eprintln!("solo を起動しました: {location}");
+    eprintln!(
+        "solo を起動しました: {}",
+        launch_location(&tab_title, &target)
+    );
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         solo_agent.as_str(),
@@ -3901,6 +3860,190 @@ fn run(command: Command) -> Result<(), String> {
 /// `TAKO_PANE_ID`（呼び出し元ペイン）。tako 内のシェルなら必ず入っている（FR-2.1.1）
 fn caller_pane() -> Option<u64> {
     std::env::var("TAKO_PANE_ID").ok()?.parse().ok()
+}
+
+/// master / solo の起動先ペイン（Issue #567）
+struct LaunchTarget {
+    pane: u64,
+    /// 新規タブを作ったか（表示文言と復旧案内の出し分けに使う）
+    new_tab: bool,
+}
+
+/// 起動場所の表示文言（Issue #567。フォールバックで新タブになった場合もタブ表記になる）
+fn launch_location(tab_title: &str, target: &LaunchTarget) -> String {
+    if target.new_tab {
+        format!("タブ '{tab_title}'（ペイン {}）", target.pane)
+    } else {
+        format!("ペイン {}（インライン）", target.pane)
+    }
+}
+
+/// 案内文に出す最簡形のコマンド（#322。既定プロファイルなら引数を付けない）
+fn master_cmd_hint(profile_name: &str) -> String {
+    profile_cmd_hint("tako master", profile_name)
+}
+
+fn solo_cmd_hint(profile_name: &str) -> String {
+    profile_cmd_hint("tako solo", profile_name)
+}
+
+fn profile_cmd_hint(base: &str, profile_name: &str) -> String {
+    if profile_name == "default" {
+        base.to_string()
+    } else {
+        format!("{base} -{profile_name}")
+    }
+}
+
+/// master / solo の起動先ペインを決める（Issue #567）。
+///
+/// `TAKO_PANE_ID` はシェルの再利用やアプリ再起動をまたぐと古くなる。古い ID のまま
+/// 起動しようとして「ペイン N が見つからない」で止まると、master 消失からの復旧という
+/// 最も急いでいる場面で手が止まるため、次の順で**必ず起動先を確保する**:
+///
+/// 1. アプリに現世代のペインを問い合わせる（pid 祖先辿り → pane → stale map。#210 / #288）
+/// 2. 解決できなければ「呼び出し元不明」として新規タブを作る
+///
+/// アプリへ届かないときだけエラーで止め、復旧手順を添える。
+/// `cmd_hint` は案内文に出す最簡形のコマンド（例: `tako master -fable`。#322）
+fn resolve_launch_target(
+    tab_title: &str,
+    use_tab: bool,
+    cmd_hint: &str,
+) -> Result<LaunchTarget, String> {
+    let requested = caller_pane();
+    if use_tab {
+        return new_tab_target(tab_title, cmd_hint, requested);
+    }
+    let resolved = resolve_caller_pane_via_app(requested)
+        .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
+    match resolved {
+        Some(caller) => {
+            let pane = caller.pane;
+            if let Some(old) = requested.filter(|old| *old != pane) {
+                if caller.method.as_deref() == Some("stale") {
+                    eprintln!(
+                        "ℹ TAKO_PANE_ID={old} は旧世代のペイン ID です（アプリ再起動をまたいだ値）"
+                    );
+                    eprintln!("  現世代のペイン {pane} へ読み替えて起動します");
+                } else {
+                    eprintln!(
+                        "ℹ TAKO_PANE_ID={old} は呼び出し元ペインと一致しません（シェルが古い値を持っています）"
+                    );
+                    eprintln!("  実際の呼び出し元ペイン {pane} で起動します");
+                }
+                eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
+            }
+            send_request(Request::TabRename {
+                tab: None,
+                pane: Some(pane),
+                title: tab_title.to_string(),
+                source: None,
+            })
+            .ok();
+            Ok(LaunchTarget {
+                pane,
+                new_tab: false,
+            })
+        }
+        None => {
+            match requested {
+                Some(old) => eprintln!(
+                    "ℹ 呼び出し元ペインを特定できません（TAKO_PANE_ID={old} は現在の tako に無い古い値）"
+                ),
+                None => {
+                    eprintln!("ℹ 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）")
+                }
+            }
+            eprintln!("  新しいタブ '{tab_title}' を作ってそこで起動します");
+            if requested.is_some() {
+                eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
+            }
+            new_tab_target(tab_title, cmd_hint, requested)
+        }
+    }
+}
+
+/// 新規タブを作って起動先にする（Issue #567 のフォールバック / `--tab` 指定時）
+fn new_tab_target(
+    tab_title: &str,
+    cmd_hint: &str,
+    requested: Option<u64>,
+) -> Result<LaunchTarget, String> {
+    let tab_result = send_request(Request::TabNew {
+        title: Some(tab_title.to_string()),
+        focus: Some(true),
+    })
+    .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
+    let pane = tab_result["pane"]
+        .as_u64()
+        .ok_or("タブ作成の応答に pane が含まれない")?;
+    Ok(LaunchTarget {
+        pane,
+        new_tab: true,
+    })
+}
+
+/// 起動先を確保できないときのエラー文（Issue #567）。
+/// フォールバック（新規タブ）まで届かない = アプリへ接続できていない状態なので、
+/// 復旧手順を必ず添える。コマンドは最簡形で示す（#322）
+fn launch_failure_message(cause: &str, cmd_hint: &str, requested: Option<u64>) -> String {
+    let mut message = format!(
+        "起動先ペインを確保できない: {cause}\n\
+         復旧: tako アプリを起動し、その中のターミナルで `{cmd_hint}` を実行してください"
+    );
+    if let Some(old) = requested {
+        message.push_str(&format!(
+            "\n      このシェルの TAKO_PANE_ID={old} は古い可能性があります: \
+             `unset TAKO_PANE_ID` してから再実行してください"
+        ));
+    }
+    message
+}
+
+/// 呼び出し元ペインの解決結果（Issue #567）
+struct ResolvedCaller {
+    pane: u64,
+    /// 解決手段（`pid` / `pane` / `stale`。縮退経路では `None`）。案内文の出し分けに使う
+    method: Option<String>,
+}
+
+/// アプリへ現世代の呼び出し元ペインを問い合わせる（Issue #567）。
+/// 解決できなければ `Ok(None)`（エラーではない）。アプリへ届かないときだけ `Err`。
+///
+/// 新旧バイナリ混在（`resolve_pane` を知らない古い GUI が動いている）でも止まらないよう、
+/// 問い合わせに失敗したら `list` でのペイン実在確認へ縮退する（stale map / pid 解決は
+/// 効かないが、少なくとも「古い ID のまま起動して失敗する」ことは無くなる）
+fn resolve_caller_pane_via_app(requested: Option<u64>) -> Result<Option<ResolvedCaller>, String> {
+    let request = Request::ResolvePane {
+        pane: requested,
+        caller_pid: Some(std::process::id()),
+    };
+    match send_request(request) {
+        Ok(value) => Ok(value["pane"].as_u64().map(|pane| ResolvedCaller {
+            pane,
+            method: value["method"].as_str().map(str::to_string),
+        })),
+        Err(e) => match send_request(Request::List) {
+            Ok(list) => Ok(requested
+                .filter(|p| list_contains_pane(&list, *p))
+                .map(|pane| ResolvedCaller { pane, method: None })),
+            Err(_) => Err(e),
+        },
+    }
+}
+
+/// `list` 応答に該当ペインが居るか（Issue #567 の縮退経路）
+fn list_contains_pane(list: &Value, pane: u64) -> bool {
+    list["tabs"]
+        .as_array()
+        .is_some_and(|tabs| tabs.iter().any(|t| tab_contains_pane(t, pane)))
+}
+
+fn tab_contains_pane(tab: &Value, pane: u64) -> bool {
+    tab["panes"]
+        .as_array()
+        .is_some_and(|panes| panes.iter().any(|p| p["id"].as_u64() == Some(pane)))
 }
 
 /// `--pane` 指定が無ければ呼び出し元へフォールバックする（FR-2.2.7）
@@ -6483,6 +6626,80 @@ mod tests {
         };
         assert!(err.contains("fleet"), "エラーに fleet が無い: {err}");
         assert!(err.contains("tmux"), "エラーに旧称 tmux が無い: {err}");
+    }
+
+    // ---- Issue #567: stale な TAKO_PANE_ID からの master / solo 起動 ----
+
+    fn list_with_panes(ids: &[u64]) -> Value {
+        serde_json::json!({
+            "tabs": [{
+                "id": 1,
+                "panes": ids.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
+            }],
+        })
+    }
+
+    #[test]
+    fn list_contains_paneは現存判定に使える() {
+        let list = list_with_panes(&[780, 781]);
+        assert!(list_contains_pane(&list, 780));
+        assert!(
+            !list_contains_pane(&list, 305),
+            "旧世代の ID は現存しないと判定される（#567 の実事象）"
+        );
+        // 応答が壊れていても panic せず「居ない」に倒す
+        assert!(!list_contains_pane(&serde_json::json!({}), 780));
+    }
+
+    #[test]
+    fn launch_locationはフォールバック時にタブ表記になる() {
+        let inline = LaunchTarget {
+            pane: 780,
+            new_tab: false,
+        };
+        assert_eq!(
+            launch_location("master", &inline),
+            "ペイン 780（インライン）"
+        );
+        let fallback = LaunchTarget {
+            pane: 900,
+            new_tab: true,
+        };
+        assert_eq!(
+            launch_location("master-fable", &fallback),
+            "タブ 'master-fable'（ペイン 900）"
+        );
+    }
+
+    /// 復旧案内は最簡形で出す（既定プロファイルに余計な引数を付けない。#322）
+    #[test]
+    fn 復旧案内のコマンドは最簡形() {
+        assert_eq!(master_cmd_hint("default"), "tako master");
+        assert_eq!(master_cmd_hint("fable"), "tako master -fable");
+        assert_eq!(solo_cmd_hint("default"), "tako solo");
+        assert_eq!(solo_cmd_hint("fast"), "tako solo -fast");
+    }
+
+    /// フォールバック不能（GUI 不在）のエラーには復旧手順が載る（#567 受け入れ条件 2）
+    #[test]
+    fn 起動失敗のエラーに復旧手順が載る() {
+        let with_stale = launch_failure_message(OUTSIDE_TAKO, "tako master -fable", Some(305));
+        assert!(with_stale.contains("tako アプリを起動"), "{with_stale}");
+        assert!(
+            with_stale.contains("unset TAKO_PANE_ID"),
+            "古い ID を持つシェルには unset を案内する: {with_stale}"
+        );
+        assert!(with_stale.contains("tako master -fable"), "{with_stale}");
+        assert!(
+            with_stale.contains(OUTSIDE_TAKO),
+            "原因も残す: {with_stale}"
+        );
+
+        let without = launch_failure_message(OUTSIDE_TAKO, "tako master", None);
+        assert!(
+            !without.contains("unset TAKO_PANE_ID"),
+            "そもそも設定されていないなら unset は案内しない: {without}"
+        );
     }
 }
 
