@@ -1440,14 +1440,16 @@ impl SettingsWindow {
             ),
         ));
 
-        // フォント
+        // フォント。プレースホルダは OS ごとの既定（境界 B16。Windows で "Menlo" と
+        // 案内すると存在しないフォントを勧めることになる）
+        let default_font = tako_core::platform::font::default_monospace_family();
         content = content.child(self.row(
             txt::label_font_family(),
             txt::desc_font_family(),
             self.text_field(
                 EditField::FontFamily,
                 self.settings.font_family.as_deref().unwrap_or(""),
-                "Menlo",
+                &default_font,
                 Some(px(180.)),
                 cx,
             ),

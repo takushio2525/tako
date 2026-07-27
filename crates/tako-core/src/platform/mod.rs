@@ -7,5 +7,6 @@
 //! 新しくプラットフォーム分岐が必要になったら、呼び出し側に `cfg` を足すのではなく
 //! ここに境界を追加する。
 
+pub mod font;
 pub mod shell;
 pub mod support;

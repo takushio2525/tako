@@ -962,6 +962,9 @@ struct TakoApp {
     /// テーマフォントに無いグリフ（⏺ ⎿ 等）はフォールバックフォントで描画され
     /// advance がセル幅とずれるため、描画グループ化から除外する判定に使う
     glyph_snap_cache: std::cell::RefCell<HashMap<char, bool>>,
+    /// 同上の ASCII 専用キャッシュ（#517）。ASCII は 1 行あたりの出現数が多いので
+    /// ハッシュ引きを避け、コードポイント直引きの配列で持つ
+    ascii_snap_cache: std::cell::RefCell<[Option<bool>; 128]>,
     /// グリフ advance 実測用のテキストシステム（new で App から取得して保持）
     text_system: std::sync::Arc<gpui::TextSystem>,
     /// cmd+ホバー中のリンク検出結果キャッシュ（ペインごと）
@@ -2068,6 +2071,7 @@ impl TakoApp {
             update_state: update_checker::UpdateState::Idle,
             update_dropdown_open: false,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
+            ascii_snap_cache: std::cell::RefCell::new([None; 128]),
             text_system: cx.text_system().clone(),
             pane_links: HashMap::new(),
             hovered_link: None,
@@ -5427,6 +5431,8 @@ impl TakoApp {
             // メモリ上の適用を正とする（セルフテストのテーマ検査が常に失敗していた）
             self.theme = Theme::for_mode(next);
         }
+        // 差し替えたテーマのフォントで測り直す（dispatch 経路と等価に保つ）
+        self.invalidate_font_metrics();
         cx.notify();
     }
 
@@ -9715,6 +9721,17 @@ impl TakoApp {
         cell
     }
 
+    /// フォント指標に依存するキャッシュを捨てる（#517）。
+    /// テーマの font_family / font_size を差し替えたら必ず呼ぶ。忘れると
+    /// 旧フォントのセル幅・グリフ判定が残り、変更が画面に出ない
+    /// （= 実行中にフォントを直しても直ったか確認できない）
+    fn invalidate_font_metrics(&mut self) {
+        self.cell_size = None;
+        self.pane_cell_sizes.clear();
+        self.glyph_snap_cache.borrow_mut().clear();
+        *self.ascii_snap_cache.borrow_mut() = [None; 128];
+    }
+
     const FONT_SIZE_MIN: f32 = 8.0;
     const FONT_SIZE_MAX: f32 = 32.0;
     const FONT_SIZE_STEP: f32 = 1.0;
@@ -9788,19 +9805,35 @@ impl TakoApp {
     /// ch のテーマフォントのグリフ advance が半角セル幅と一致するか（Issue #64）。
     /// テーマフォントにグリフが無い文字（⏺ ⎿ 等）はフォールバックフォントで描画され
     /// advance がセル幅とずれる。そのままグループ化するとずれが累積して後続文字を
-    /// 押し出すため、この判定でグループから除外して個別 div（セル幅固定）に隔離する
+    /// 押し出すため、この判定でグループから除外して個別 div（セル幅固定）に隔離する。
+    ///
+    /// ASCII も実測する（#517）。テーマフォント自体が解決できない環境
+    /// （Windows に無い macOS 専用フォントを指定した等）では GPUI が黙って
+    /// プロポーショナルな UI フォントへ落とすため、ASCII を無条件 true にすると
+    /// この安全弁が ASCII に効かず、行全体が重なり・欠けを起こす
     fn glyph_snaps_to_cell(&self, ch: char) -> bool {
-        // ASCII 印字文字はモノスペースフォント自身のグリフで advance == セル幅
         if ch.is_ascii() {
-            return true;
+            let idx = ch as usize;
+            if let Some(snaps) = self.ascii_snap_cache.borrow()[idx] {
+                return snaps;
+            }
+            let snaps = self.measure_glyph_snaps(ch);
+            self.ascii_snap_cache.borrow_mut()[idx] = Some(snaps);
+            return snaps;
         }
         if let Some(&snaps) = self.glyph_snap_cache.borrow().get(&ch) {
             return snaps;
         }
-        // テーマフォントでの advance を実測し、セル幅基準の 'M' と比較する。
-        // フォントにグリフが無ければ advance() が Err を返す（フォールバック解決は
-        // シェイプ時にしか起きない）ので、不一致扱いに倒れる
-        let snaps = (|| {
+        let snaps = self.measure_glyph_snaps(ch);
+        self.glyph_snap_cache.borrow_mut().insert(ch, snaps);
+        snaps
+    }
+
+    /// テーマフォントでの advance を実測し、セル幅基準の 'M' と比較する。
+    /// フォントにグリフが無ければ advance() が Err を返す（フォールバック解決は
+    /// シェイプ時にしか起きない）ので、不一致扱いに倒れる
+    fn measure_glyph_snaps(&self, ch: char) -> bool {
+        (|| {
             let font = Font {
                 family: SharedString::from(self.theme.font_family.clone()),
                 ..gpui::font(self.theme.font_family.clone())
@@ -9811,9 +9844,7 @@ impl TakoApp {
             let adv = self.text_system.advance(font_id, fs, ch).ok()?.width;
             Some((adv - cw).abs() <= cw * 0.02)
         })()
-        .unwrap_or(false);
-        self.glyph_snap_cache.borrow_mut().insert(ch, snaps);
-        snaps
+        .unwrap_or(false)
     }
 
     /// 1 行分の文字ごとの描画情報（スタイルラン・セル幅・セル幅整合）を組み立てる。
@@ -12639,12 +12670,14 @@ impl UiStateHost for TakoApp {
             return;
         }
         self.theme = Theme::for_mode(mode);
+        self.invalidate_font_metrics();
     }
 
     fn reload_theme(&mut self) {
         let settings = tako_control::settings::load();
         let (theme, _) = settings.resolve_theme();
         self.theme = theme;
+        self.invalidate_font_metrics();
     }
 
     fn open_settings_window(&mut self, tab: Option<&str>) {

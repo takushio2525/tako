@@ -70,7 +70,8 @@ pub struct Settings {
     /// 名前付きカスタムテーマプリセット（Issue #459）
     #[serde(default)]
     pub theme_presets: std::collections::BTreeMap<String, ThemePreset>,
-    /// フォントファミリー（省略時はビルトイン既定 Menlo。Issue #459）
+    /// フォントファミリー（省略時は OS ごとのビルトイン既定 =
+    /// `tako_core::platform::font::default_monospace_family()`。Issue #459）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
     /// フォントサイズ（省略時はビルトイン既定 13.0。Issue #459）

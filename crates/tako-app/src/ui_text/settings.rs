@@ -323,9 +323,10 @@ pub fn label_font_family() -> &'static str {
 }
 
 pub fn desc_font_family() -> &'static str {
+    // 既定フォントは OS で変わる（境界 B16）ため、固有名は入力欄のプレースホルダに任せる
     tr!(
-        "空欄で既定（Menlo）に戻る",
-        "Leave empty to use the default (Menlo)"
+        "空欄で既定フォントに戻る",
+        "Leave empty to use the default font"
     )
 }
 
