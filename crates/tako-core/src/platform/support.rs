@@ -15,6 +15,14 @@
 //!   縮退表を検証できる**。これが無いと「Windows でどう見えるか」をテストできない
 //! - 使えない機能を一覧から消してはいけない。消すと AI は「そんな機能は無い」と誤認し、
 //!   回避行動も取れなくなる。**存在させたうえで理由と追跡先を返す**
+//!
+//! ## この表を直したら
+//!
+//! 1. 縮退の理由は `PlatformFacts` 経由で **master / solo / setup の system prompt にも
+//!    注入される**（#516）。宣言が実態とずれると、テスターのエージェントに
+//!    「この環境では使えない」という誤情報がそのまま渡る
+//! 2. doc サイトの「Windows 対応状況」ページはこの表からの生成物なので、
+//!    `node scripts/gen-windows-support-docs.mjs` で再生成する（#591）
 
 /// 対応マトリクスが対象とするプラットフォーム
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,11 +105,6 @@ impl Note {
 pub mod notes {
     use super::Note;
 
-    /// #517 の担当範囲
-    pub const WIN_TERMINAL: Note = Note::new(
-        "GUI 起動とペイン / タブ管理の Windows 実装が前提",
-        "Requires the Windows implementation of GUI startup and pane / tab management",
-    );
     /// #519 の担当範囲
     pub const WIN_PERSIST: Note = Note::new(
         "tmux バックエンドに依存。Windows の永続化戦略の決定が前提",
@@ -116,42 +119,73 @@ pub mod notes {
          screen contents are restored. Without it, only tabs, panes and cwd are restored; \
          running processes stop when tako exits",
     );
-    /// #520 の担当範囲
-    pub const WIN_GIT: Note = Note::new(
-        "git タブの Windows 対応（パス表記と改行コードの可搬性）が前提",
-        "Requires Windows support for the git tab (path notation and line-ending portability)",
+    /// #519: 器がアウトオブプロセス到達（`DetachedAccess`）を持たない環境。
+    /// 「フォールバックが失敗した」ではなく「そもそも到達手段が無い」ことを言う
+    pub const WIN_NO_DETACHED_REACH: Note = Note::new(
+        "ペイン外からの採取（scrollback）に到達手段が要る。psmux 等の器を導入していない Windows では取得できない",
+        "Capturing a pane from outside the app (scrollback) needs out-of-process reach, which is \
+         unavailable on Windows without a session host such as psmux",
     );
-    /// #520 + #526 の担当範囲（#496 のコンフリクト解消エージェント）。
-    /// git タブの状態検出だけでなく**エージェントペインの spawn** にも依存するので、
-    /// WIN_GIT とは別に「両方が要る」ことを明示する
-    pub const WIN_GIT_RESOLVE_AGENT: Note = Note::new(
-        "git タブの Windows 対応に加えて、エージェントペインの spawn（orchestrator の Windows 縮退モード）が前提",
-        "Requires Windows support for the git tab plus agent pane spawning (the degraded orchestrator mode on Windows)",
+    /// #519: 任意の tmux サーバーを直接操作する機能面。psmux は tmux 互換だが
+    /// 「他人が立てた tmux セッションの発見と片付け」という用途自体が Windows には無い
+    pub const WIN_TMUX_SERVER: Note = Note::new(
+        "tmux サーバーそのものを操作する機能。Windows に tmux は無い",
+        "Operates the tmux server itself, which does not exist on Windows",
     );
-    /// #521 の担当範囲
-    pub const WIN_PREVIEW: Note = Note::new(
-        "プレビュー / Web ビューの Windows 実装（WebView2・PDF・動画）が前提",
-        "Requires the Windows implementation of preview / web view (WebView2, PDF, video)",
+    /// #521: PDF ラスタライズは CoreGraphics / PDFKit 実装なので macOS 限定
+    pub const WIN_PDF_ONLY: Note = Note::new(
+        "PDF プレビュー専用の操作。PDF の描画が macOS（PDFKit）実装のため Windows では開けない",
+        "PDF-only operation. PDF rendering is implemented with macOS PDFKit, so it cannot open on Windows",
     );
-    /// #522 の担当範囲
-    pub const WIN_OS_INTEGRATION: Note = Note::new(
-        "OS 連携（既定アプリ・ゴミ箱・ファイルマネージャ）の Windows 実装が前提",
-        "Requires the Windows implementation of OS integration (default app, trash, file manager)",
+    /// #521: 動画再生は AVFoundation 実装なので macOS 限定
+    pub const WIN_VIDEO_MACOS_ONLY: Note = Note::new(
+        "動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない",
+        "Video preview is implemented with macOS AVFoundation, so it cannot play on Windows",
+    );
+    /// #521: プレビューの中身のうち PDF / 動画だけが欠ける
+    pub const WIN_PREVIEW_NO_PDF: Note = Note::new(
+        "コード・Markdown・画像は表示できる。PDF と動画は macOS 実装のため表示できない",
+        "Code, Markdown and images render. PDF and video do not, as they are implemented for macOS only",
+    );
+    /// #521: ズーム / パンの対象は PDF と画像。Windows では画像だけが残る
+    pub const WIN_PREVIEW_VIEW_IMAGE_ONLY: Note = Note::new(
+        "画像のズーム・パンは動く。PDF は macOS 実装のため開けず操作対象にならない",
+        "Zoom and pan work for images. PDF cannot be opened on Windows, so it is not a target",
+    );
+    /// #522: OS 連携（B8）の Windows 実装が未了。**ゴミ箱が完全削除に劣化する**ことは
+    /// 取り返しがつかないので必ず書く
+    pub const WIN_FILE_OP_PARTIAL: Note = Note::new(
+        "パスのコピー・cd・作成・リネームは動く。ファイルマネージャ表示と既定アプリで開く操作は未対応で、\
+         ゴミ箱へ移動は完全削除になる（復元できない）",
+        "Copying paths, cd, create and rename work. Revealing in the file manager and opening with the \
+         default app are unavailable, and moving to trash deletes permanently (not recoverable)",
     );
     /// #524 の担当範囲
     pub const WIN_OS_API: Note = Note::new(
         "OS API（プロセス検査・スリープ防止）の Windows 実装が前提",
         "Requires the Windows implementation of OS APIs (process inspection, sleep prevention)",
     );
-    /// #525 の担当範囲
-    pub const WIN_SETUP: Note = Note::new(
-        "PowerShell シェル統合と setup の Windows 対応が前提",
-        "Requires PowerShell shell integration and Windows support in setup",
+    /// #525: 分割したペインを `/bin/sh -c` で起こす実装なので Windows では PTY 生成から失敗する
+    pub const WIN_RUN_POSIX_SHELL: Note = Note::new(
+        "コマンドの実行ペインを POSIX シェル（/bin/sh）で起こす実装のため Windows では起動できない",
+        "Spawns the command pane through a POSIX shell (/bin/sh), which does not exist on Windows",
     );
-    /// #526 の担当範囲
-    pub const WIN_ORCHESTRATOR: Note = Note::new(
-        "orchestrator の Windows 縮退モードが前提",
-        "Requires the degraded orchestrator mode on Windows",
+    /// #525: setup 本体は動くが案内とシェル統合が macOS 前提
+    pub const WIN_SETUP_PARTIAL: Note = Note::new(
+        "環境チェックと設定の生成は動く。PowerShell のシェル統合が未対応で、導入案内が Homebrew 前提のままになる",
+        "Environment checks and config generation work. PowerShell shell integration is missing and the \
+         install guidance still assumes Homebrew",
+    );
+    /// #525: `claude mcp add` の起動に失敗する（claude が POSIX パスのスクリプトとして解決される）
+    pub const WIN_SETUP_MCP_SPAWN: Note = Note::new(
+        "claude CLI の起動が Windows で解決できず、MCP の自動登録が失敗する",
+        "Cannot launch the claude CLI on Windows, so registering the MCP server automatically fails",
+    );
+    /// #525 と同根（claude バイナリの解決が POSIX シェル経由）。
+    /// 機能そのものは残り、命名の質だけが落ちるので Pending ではなく Degraded
+    pub const WIN_AUTO_RENAME_HEURISTIC: Note = Note::new(
+        "AI による命名は claude CLI の解決が Windows で効かないため働かず、ヒューリスティック命名にとどまる",
+        "AI naming does not run because the claude CLI cannot be resolved on Windows; naming falls back to heuristics",
     );
     /// #528 の担当範囲
     pub const WIN_REMOTE: Note = Note::new(
@@ -303,90 +337,59 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_agents_sync_rules",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_auto_rename",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+        windows: Support::Degraded {
+            note: notes::WIN_AUTO_RENAME_HEURISTIC,
         },
     },
     Feature {
         key: "tako_background_kill",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_background_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_background_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_check_health",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_close_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_collapse_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_confirm_close",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_create_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_equalize_layout",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_fda",
@@ -398,193 +401,125 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_file_op",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_OS_INTEGRATION,
-            issue: 522,
+        windows: Support::Degraded {
+            note: notes::WIN_FILE_OP_PARTIAL,
         },
     },
     Feature {
         key: "tako_focus_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_foreground_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_branch_create",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_checkout",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_commit",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_conflicts",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_diff",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_log",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_merge",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_merge_abort",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_pull",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_push",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_resolve_agent",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT_RESOLVE_AGENT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_show",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_stage",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_git_unstage",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_lang",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_limit_service",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_list_panes",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_logs",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_move_pane_to_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_open_dir",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_open_file",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+        windows: Support::Degraded {
+            note: notes::WIN_PREVIEW_NO_PDF,
         },
     },
     Feature {
@@ -598,138 +533,90 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_accounts",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_handoff",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_layout",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_ledger",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_profiles",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_projects",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_report",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_NO_DETACHED_REACH,
+            issue: 519,
         },
     },
     Feature {
         key: "tako_orchestrator_respond",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_run",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_run_result",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_run_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_self",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_spawn",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_supervisor",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_worker_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_workers",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_panel",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_persist",
@@ -743,10 +630,7 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_pin_preview",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_platform",
@@ -764,48 +648,33 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_apply",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_autosave",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_cache",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_changelog",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_edit",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_follow_link",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_PDF_ONLY,
             issue: 521,
         },
     },
@@ -813,89 +682,61 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_preview_link_list",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_PDF_ONLY,
             issue: 521,
         },
     },
     Feature {
         key: "tako_preview_outline",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_redo",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_reload",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_replace",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_save",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_search",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_undo",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_view",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+        windows: Support::Degraded {
+            note: notes::WIN_PREVIEW_VIEW_IMAGE_ONLY,
         },
     },
     Feature {
         key: "tako_read_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_recent",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_remote_agents",
@@ -964,90 +805,68 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_rename_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_reorder_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_resize_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_run",
         macos: Support::Supported,
+        // 分割したペインを `/bin/sh -c` で起こす実装なので Windows では PTY 生成から失敗する
+        //（実測 2026-07-27: `PTY を起動できなかった`）。#525 のシェル統合と一緒に直す
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_RUN_POSIX_SHELL,
+            issue: 525,
         },
     },
     Feature {
         key: "tako_run_defaults",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_run_interactive",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_RUN_POSIX_SHELL,
+            issue: 525,
         },
     },
     Feature {
         key: "tako_run_interactive_status",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_RUN_POSIX_SHELL,
+            issue: 525,
         },
     },
     Feature {
         key: "tako_run_resolve",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_scroll_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_select_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_send_input",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_sessions",
@@ -1060,40 +879,32 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_set_title",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_settings",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_setup",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
+        windows: Support::Degraded {
+            note: notes::WIN_SETUP_PARTIAL,
         },
     },
     Feature {
         key: "tako_setup_changes",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_setup_mcp",
         macos: Support::Supported,
+        // 実測 2026-07-27: `claude mcp add` の起動が os error 3 で失敗する
+        //（claude が POSIX パスのシェルスクリプトとして解決されるため）
         windows: Support::Pending {
-            note: notes::WIN_SETUP,
+            note: notes::WIN_SETUP_MCP_SPAWN,
             issue: 525,
         },
     },
@@ -1108,96 +919,63 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_split_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_ssh_hosts",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_stale_binary",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_task_checkpoint",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_task_gate",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_task_gate_check",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_task_gate_show",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_task_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_task_resume",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_telemetry",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_theme",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_tmux_cleanup",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_SERVER,
             issue: 519,
         },
     },
@@ -1205,7 +983,7 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_tmux_kill",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_SERVER,
             issue: 519,
         },
     },
@@ -1213,7 +991,7 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_tmux_list",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_SERVER,
             issue: 519,
         },
     },
@@ -1221,7 +999,7 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_tmux_open",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_SERVER,
             issue: 519,
         },
     },
@@ -1229,7 +1007,7 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_tmux_resize",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_SERVER,
             issue: 519,
         },
     },
@@ -1237,17 +1015,14 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_tmux_select_window",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_SERVER,
             issue: 519,
         },
     },
     Feature {
         key: "tako_tree_folder",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_update",
@@ -1261,7 +1036,7 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_video_playback",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_VIDEO_MACOS_ONLY,
             issue: 521,
         },
     },
@@ -1269,7 +1044,7 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_video_seek",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_VIDEO_MACOS_ONLY,
             issue: 521,
         },
     },
@@ -1277,25 +1052,19 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_video_volume",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_VIDEO_MACOS_ONLY,
             issue: 521,
         },
     },
     Feature {
         key: "tako_web",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_window",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
     },
 ];
 
@@ -1365,14 +1134,25 @@ mod tests {
         }
     }
 
+    /// 検証に使う「Windows で Pending の機能」を表から拾う。
+    /// キーを直書きすると、その機能が実装されて Supported になった瞬間にテストが
+    /// 「理由が無い」で落ちる（実際 #591 の棚卸しで `tako_git_log` がそうなった）
+    fn any_pending_on_windows() -> (&'static str, u32) {
+        MATRIX
+            .iter()
+            .find_map(|f| f.windows.issue().map(|issue| (f.key, issue)))
+            .expect("Windows に Pending が 1 件も無い（テストの前提が崩れている）")
+    }
+
     /// 表示言語を切り替えると理由文も切り替わること（`&'static str` 直書きへの退行防止）
     #[test]
     fn 理由文は表示言語に追従する() {
         let original = i18n::lang();
-        let note = support_for(Platform::Windows, "tako_git_log")
+        let (key, _) = any_pending_on_windows();
+        let note = support_for(Platform::Windows, key)
             .unwrap()
             .note()
-            .expect("Windows の tako_git_log には理由があるはず");
+            .expect("Pending には理由があるはず");
         i18n::set_lang(Lang::Ja);
         let ja = note.text();
         i18n::set_lang(Lang::En);
@@ -1387,17 +1167,19 @@ mod tests {
     #[test]
     fn gateの診断も表示言語に追従する() {
         let original = i18n::lang();
+        let (key, issue) = any_pending_on_windows();
         i18n::set_lang(Lang::En);
-        let en = gate(Platform::Windows, "tako_git_log").unwrap_err();
+        let en = gate(Platform::Windows, key).unwrap_err();
         i18n::set_lang(Lang::Ja);
-        let ja = gate(Platform::Windows, "tako_git_log").unwrap_err();
+        let ja = gate(Platform::Windows, key).unwrap_err();
         i18n::set_lang(original);
         assert!(
             !en.chars()
                 .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
             "英語の診断に日本語が残っている: {en}"
         );
-        assert!(en.contains("#520") && ja.contains("#520"));
+        let tag = format!("#{issue}");
+        assert!(en.contains(&tag) && ja.contains(&tag));
     }
 
     /// キーの重複と並び順。順序を固定しておくと差分レビューが読める
@@ -1441,14 +1223,15 @@ mod tests {
     /// 縮退時の診断メッセージはマトリクス由来（二重管理を作らない）
     #[test]
     fn gateの診断はマトリクスの理由と追跡先を含む() {
-        let err = gate(Platform::Windows, "tako_git_log").expect_err("Windows では未対応のはず");
-        let note = support_for(Platform::Windows, "tako_git_log")
-            .unwrap()
-            .note()
-            .unwrap();
+        let (key, issue) = any_pending_on_windows();
+        let err = gate(Platform::Windows, key).expect_err("Windows では未対応のはず");
+        let note = support_for(Platform::Windows, key).unwrap().note().unwrap();
         assert!(err.contains(note.text()), "診断に note が含まれない: {err}");
-        assert!(err.contains("#520"), "診断に追跡 Issue が含まれない: {err}");
-        assert!(gate(Platform::MacOs, "tako_git_log").is_ok());
+        assert!(
+            err.contains(&format!("#{issue}")),
+            "診断に追跡 Issue が含まれない: {err}"
+        );
+        assert!(gate(Platform::MacOs, key).is_ok());
     }
 
     /// マトリクス自身はどのプラットフォームでも引けないと意味がない

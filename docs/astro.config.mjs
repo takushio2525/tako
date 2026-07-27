@@ -36,6 +36,7 @@ export default defineConfig({
 						{ label: 'tako とは', slug: 'index' },
 						{ label: 'セットアップ', slug: 'getting-started' },
 						{ label: 'クイックスタート', slug: 'getting-started/quickstart' },
+						{ label: 'Windows 対応状況', slug: 'windows-support' },
 						{ label: 'リリースノート', slug: 'releases' },
 					],
 				},
