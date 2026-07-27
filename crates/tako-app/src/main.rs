@@ -13957,7 +13957,7 @@ impl EntityInputHandler for TakoApp {
         _range_utf16: Option<Range<usize>>,
         new_text: &str,
         new_selected_range: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // IME は毎回未確定文字列の全文を渡してくるので丸ごと差し替える。
@@ -13980,6 +13980,11 @@ impl EntityInputHandler for TakoApp {
                 selected_utf16: new_selected_range,
             });
         }
+        // 未確定文字列が伸び縮みするたびに IM へ文字座標を再通知する。
+        // Windows は `ImmSetCandidateWindow` によるプッシュが必要で、これが無いと
+        // 候補ウィンドウが変換開始時の位置に貼り付いたまま追従しない（#582）。
+        // macOS でも確定・unmark 側に同じ呼び出しがあり無害（#332）
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -13993,6 +13998,10 @@ impl EntityInputHandler for TakoApp {
         // 変換候補ウィンドウの位置出し。カーソルセル + 範囲先頭までの描画幅。
         // CursorShape::Hidden（claude 等の TUI アプリ）でもカーソル位置は有効なので
         // ime_cursor をフォールバックに使う（#29: 候補ウィンドウが画面左下に出る問題の修正）
+        //
+        // 縦方向は最後に `platform::ime::anchor_rect_y` を通す。OS ごとに矩形の解釈が
+        // 違う（macOS は矩形のまま / Windows は垂直中心の 1 点へ潰される）ため、
+        // その差の吸収は境界 B17 に任せてここでは素直にセル矩形を組む（#582）
         let ime_pane = self.ime_target();
         let origin = self
             .pane_cursor_origin_for_ime(ime_pane, window)
@@ -14012,9 +14021,11 @@ impl EntityInputHandler for TakoApp {
             }
             None => px(0.0),
         };
+        let (anchor_y, anchor_height) =
+            tako_core::platform::ime::anchor_rect_y(f32::from(origin.y), f32::from(cell.height));
         Some(Bounds::new(
-            point(origin.x + x_offset, origin.y),
-            size(cell.width, cell.height),
+            point(origin.x + x_offset, px(anchor_y)),
+            size(cell.width, px(anchor_height)),
         ))
     }
 

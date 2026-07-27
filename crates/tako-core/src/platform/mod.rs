@@ -8,5 +8,6 @@
 //! ここに境界を追加する。
 
 pub mod font;
+pub mod ime;
 pub mod shell;
 pub mod support;

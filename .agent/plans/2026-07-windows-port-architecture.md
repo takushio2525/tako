@@ -75,6 +75,7 @@ P0 完了以降、`cargo check --target x86_64-pc-windows-msvc` は **macOS 上�
 | B14 | 配布・自動更新 | `trait UpdateChannel`（detect / download / apply / restart） | `tako-app/src/update_checker.rs:261-286,707-733` | .app / Caskroom | winget / scoop / zip |
 | B15 | プライバシー許可ガイド | `trait PermissionGuide` | `tako-control/src/fda.rs` | TCC / FDA | `Unsupported`（Windows に TCC 相当なし） |
 | B16 | 既定等幅フォント | `platform::font::default_monospace_family()` **［#517 で新設済み］** | `tako-core/src/theme.rs`（既定テーマ 2 箇所）、`tako-app/src/settings_window.rs`（プレースホルダ） | `Menlo` | `Cascadia Mono` → `Consolas`（実ファイルの存在で選択） |
+| B17 | IME アンカー矩形 | `platform::ime::anchor_rect_y()` **［#582 で新設済み］** | `tako-app/src/main.rs` の `bounds_for_range` | 恒等（Cocoa が矩形のまま扱う） | 狙いの Y を `origin.y`・`height = 0`（GPUI が `y + height/2` へ潰すのを恒等化） |
 
 ### 2.1 モジュール配置の規約
 
