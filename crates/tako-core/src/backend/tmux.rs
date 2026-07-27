@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::{
-    BackendCapabilities, BackendError, DetachedAccess, HistoryProbe, Holder, ScrollbackAuthority,
-    SessionBackend, SessionInfo, SessionRef,
+    BackendCapabilities, BackendError, DetachedAccess, HistoryProbe, Holder, HolderKind,
+    ScrollbackAuthority, SessionBackend, SessionInfo, SessionRef,
 };
 use crate::terminal::SpawnOptions;
 
@@ -117,6 +117,9 @@ impl SessionBackend for TmuxBackend {
                 Some(Holder {
                     pid,
                     session: SessionRef::new(name).ok()?,
+                    // tmux が返すのはクライアントの PID。所有インスタンスは
+                    // 呼び出し側が祖先を辿って特定する（従来どおり）
+                    kind: HolderKind::Client,
                 })
             })
             .collect()

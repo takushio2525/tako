@@ -36,9 +36,14 @@ use std::time::Duration;
 use crate::terminal::SpawnOptions;
 
 mod null;
+mod owner;
+/// psmux 実装。**ここだけ `pub`** なのは、器の適合（conf の受理・起動時プローブ）を
+/// 実バイナリで確かめる統合テスト（`tests/psmux_backend.rs`）が自由関数を呼ぶため
+pub mod psmux;
 mod tmux;
 
 pub use null::NullBackend;
+pub use psmux::PsmuxBackend;
 pub use tmux::TmuxBackend;
 
 /// バックエンドセッション名の接頭辞。
@@ -176,12 +181,27 @@ pub fn capabilities() -> BackendCapabilities {
     backend().capabilities()
 }
 
-/// 器を握っている外部クライアント（#177 の復元強奪ガードの材料）
+/// [`Holder::pid`] が何の PID なのか。**器によって観測できるものが違う**ため、
+/// 「所有インスタンスが生きているか」を呼び出し側がどう確かめるべきかを型で言う
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HolderKind {
+    /// 器のクライアントプロセスの PID（tmux の `#{client_pid}`）。
+    /// クライアントは tako-app が spawn した PTY の子なので、
+    /// **呼び出し側が祖先を辿って**所有インスタンスを特定する
+    Client,
+    /// 所有インスタンス（tako-app）そのものの PID。
+    /// **生存は器の実装が確認済み**なので、呼び出し側は祖先辿りをしない
+    /// （psmux はクライアント PID を観測できず、tako 側のオーナー記録で答えるため。#519 M2）
+    Owner,
+}
+
+/// 器を握っている他インスタンス（#177 の復元強奪ガードの材料）
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holder {
-    /// クライアントプロセスの PID。所有インスタンスの特定は呼び出し側が祖先辿りで行う
+    /// PID。意味は [`Holder::kind`] で決まる
     pub pid: u32,
     pub session: SessionRef,
+    pub kind: HolderKind,
 }
 
 /// 器の一覧に載る 1 セッション
@@ -370,38 +390,164 @@ pub fn wrap_spawn_for_pane(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     Tmux,
+    /// psmux を器にする（Windows。#519 M2）
+    Psmux,
     None,
 }
 
-/// `TAKO_BACKEND` の値（`auto` / `tmux` / `none`）。既定は `auto`。
+/// `TAKO_BACKEND` の値（`auto` / `tmux` / `psmux` / `none`）。既定は `auto`。
 ///
 /// **`none` は Windows の縮退経路を macOS 上で実行するための鍵**（設計 §8.2 の R0）。
 /// `TAKO_PERSIST=0` は保存ごと止めてしまい（`main.rs` の `save_layout`）、
 /// Windows の「保存する・復元は構造のみ」とは別物になるため、縮退の再現には使えない。
 pub const ENV_BACKEND: &str = "TAKO_BACKEND";
 
+/// psmux 実行ファイルの明示指定（未設定なら PATH 上の `psmux` → `tmux` の順に探す）
+pub const ENV_PSMUX_BIN: &str = "TAKO_PSMUX_BIN";
+
+/// 見つかった「tmux を名乗るバイナリ」の正体。
+///
+/// **psmux は `psmux.exe` / `pmux.exe` / `tmux.exe` の 3 本を配る**ので、
+/// PATH に `tmux` があることは「本物の tmux がある」ことを意味しない。
+/// 判別せずに [`Choice::Tmux`] を選ぶと、器は作れるのに `kill-session -t =name` が
+/// 効かない（= ペインを閉じるたびに器がリークし 5 秒固まる）**半端に壊れた永続化**になる
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Binary {
+    /// 本物の tmux
+    Tmux { bin: String },
+    /// psmux（tmux 互換 CLI の別実装）
+    Psmux { bin: String, version: String },
+    /// 器になれるバイナリが無い
+    Absent,
+}
+
+/// 見つかったバイナリ（プロセス内で 1 回だけ解決してキャッシュする）
+pub fn binary() -> &'static Binary {
+    static BINARY: OnceLock<Binary> = OnceLock::new();
+    BINARY.get_or_init(detect_binary)
+}
+
+fn detect_binary() -> Binary {
+    // 明示指定が最優先（隔離検証・非 PATH 配置）
+    if let Some(bin) = std::env::var(ENV_PSMUX_BIN).ok().filter(|s| !s.is_empty()) {
+        if let Some(found) = probe_binary(&bin) {
+            return found;
+        }
+    }
+    // psmux は専用名でも配られる。tmux より先に見る（`tmux` が psmux の可能性があるため、
+    // 先に確定させておくとバージョン取得が 1 回で済む）
+    if let Some(found) = probe_binary("psmux") {
+        return found;
+    }
+    // 従来どおりの tmux 解決（PATH → 既知の場所 → ログインシェル）。
+    // ここで見つかったものが psmux であることもある（Windows で winget / scoop 導入時）
+    probe_binary(crate::tmux::tmux_bin()).unwrap_or(Binary::Absent)
+}
+
+/// `<bin> -V` を実行して正体を判別する。実行できなければ `None`
+fn probe_binary(bin: &str) -> Option<Binary> {
+    let mut command = std::process::Command::new(bin);
+    crate::platform::process::no_console_window(&mut command);
+    let output = command.arg("-V").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    classify_version_output(&text, bin)
+}
+
+/// `-V` の出力から正体を判別する（純関数）。
+///
+/// psmux は 1 行目で `tmux 3.3.7` を**詐称**し、2 行目に自分の素性を書く:
+///
+/// ```text
+/// tmux 3.3.7
+/// psmux 3.3.7 (05cc5d4 2026-07-20)
+/// ```
+///
+/// 本物の tmux は `tmux 3.6` の 1 行だけを返す
+fn classify_version_output(output: &str, bin: &str) -> Option<Binary> {
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("psmux ") {
+            return Some(Binary::Psmux {
+                bin: bin.to_string(),
+                version: rest.split_whitespace().next().unwrap_or("").to_string(),
+            });
+        }
+    }
+    output
+        .lines()
+        .any(|line| line.trim().starts_with("tmux "))
+        .then(|| Binary::Tmux {
+            bin: bin.to_string(),
+        })
+}
+
 /// 選択の解決（プロセス内で 1 回だけ。`available()` の従来のキャッシュ挙動を引き継ぐ）
 pub fn choice() -> Choice {
     static CHOICE: OnceLock<Choice> = OnceLock::new();
-    *CHOICE.get_or_init(|| resolve_choice(std::env::var(ENV_BACKEND).ok().as_deref()))
+    *CHOICE.get_or_init(|| {
+        let env = std::env::var(ENV_BACKEND).ok();
+        let decided = decide(env.as_deref(), binary(), cfg!(windows));
+        vet(decided, binary())
+    })
 }
 
-/// 純粋関数として切り出した解決ロジック（macOS 上で全分岐をテストできるようにするため）。
+/// 純粋関数として切り出した解決ロジック（**全分岐を macOS 上でもテストできる**ようにするため）。
 /// 未知の値は `auto` と同じに倒す（環境変数のタイポでユーザーの永続化を壊さない）
-fn resolve_choice(env: Option<&str>) -> Choice {
+fn decide(env: Option<&str>, binary: &Binary, windows: bool) -> Choice {
     match env.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("none" | "null" | "off") => Choice::None,
-        // 明示 tmux でも、tmux が無ければ器は作れない（嘘の能力を申告しない）
-        Some("tmux") => tmux_or_none(),
-        _ => tmux_or_none(),
+        // 明示指定でも、その器が無ければ嘘の能力を申告しない
+        Some("tmux") => match binary {
+            Binary::Tmux { .. } if !windows => Choice::Tmux,
+            _ => Choice::None,
+        },
+        Some("psmux") => match binary {
+            Binary::Psmux { .. } => Choice::Psmux,
+            _ => Choice::None,
+        },
+        _ => match binary {
+            Binary::Psmux { .. } => Choice::Psmux,
+            // **Windows で本物の tmux を選ばない**: POSIX 版 tmux（MSYS2 / Cygwin）は
+            // ネイティブの ConPTY シェルを抱える器にならず、`-f` に渡す Windows パスも
+            // 解釈できない。器があるように見えて壊れているより、構成のみ永続化へ倒す
+            Binary::Tmux { .. } if !windows => Choice::Tmux,
+            _ => Choice::None,
+        },
     }
 }
 
-fn tmux_or_none() -> Choice {
-    if crate::tmux_backend::tmux_binary_present() {
-        Choice::Tmux
-    } else {
-        Choice::None
+/// 未検証バージョンの psmux を **実際に試してから**採用する（#519 M2 要件 6）。
+///
+/// psmux は直近 30 日で 100+ コミットという速度で動いている。バージョン一致だけを
+/// 条件にすると patch が上がった翌日に全ユーザーの永続化が黙って落ち、
+/// 無条件に信じると壊れた器を掴む。だから**測って決める**。
+fn vet(choice: Choice, binary: &Binary) -> Choice {
+    let (Choice::Psmux, Binary::Psmux { bin, version }) = (choice, binary) else {
+        return choice;
+    };
+    if psmux::version_support(version) == psmux::VersionSupport::Verified {
+        return choice;
+    }
+    match psmux::behavior_probe(bin) {
+        Ok(()) => {
+            eprintln!(
+                "warning: psmux {version} は tako の適合検証済みバージョン（{}）と異なります。\
+                 起動時プローブは通ったので永続バックエンドとして使います",
+                psmux::VERIFIED_VERSION
+            );
+            choice
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: psmux {version} は永続バックエンドとして使えません（{e}）。\
+                 タブ・ペイン構成と cwd のみ復元する縮退モードで動きます\
+                 （適合検証済みは psmux {}）",
+                psmux::VERIFIED_VERSION
+            );
+            Choice::None
+        }
     }
 }
 
@@ -409,11 +555,22 @@ fn tmux_or_none() -> Choice {
 pub fn backend() -> &'static dyn SessionBackend {
     static BACKEND: OnceLock<Box<dyn SessionBackend>> = OnceLock::new();
     BACKEND
-        .get_or_init(|| match choice() {
-            Choice::Tmux => Box::new(TmuxBackend::new()) as Box<dyn SessionBackend>,
-            Choice::None => Box::new(NullBackend) as Box<dyn SessionBackend>,
+        .get_or_init(|| match (choice(), binary()) {
+            (Choice::Tmux, _) => Box::new(TmuxBackend::new()) as Box<dyn SessionBackend>,
+            (Choice::Psmux, Binary::Psmux { bin, version }) => {
+                Box::new(PsmuxBackend::new(bin.clone(), version.clone())) as Box<dyn SessionBackend>
+            }
+            _ => Box::new(NullBackend) as Box<dyn SessionBackend>,
         })
         .as_ref()
+}
+
+/// 現在時刻（unix epoch 秒）。器の実装が最終アクティビティの猶予判定に使う
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -437,23 +594,87 @@ mod tests {
         assert_eq!(ok.to_string(), "tako-0123456789ab");
     }
 
+    fn tmux_bin() -> Binary {
+        Binary::Tmux { bin: "tmux".into() }
+    }
+
+    fn psmux_bin() -> Binary {
+        Binary::Psmux {
+            bin: "tmux".into(),
+            version: "3.3.7".into(),
+        }
+    }
+
     #[test]
-    fn 環境変数noneはtmuxの有無によらず器なしへ倒れる() {
-        assert_eq!(resolve_choice(Some("none")), Choice::None);
-        assert_eq!(resolve_choice(Some("NONE")), Choice::None);
-        assert_eq!(resolve_choice(Some(" none ")), Choice::None);
-        assert_eq!(resolve_choice(Some("null")), Choice::None);
-        assert_eq!(resolve_choice(Some("off")), Choice::None);
+    fn 環境変数noneはバイナリの有無によらず器なしへ倒れる() {
+        for env in ["none", "NONE", " none ", "null", "off"] {
+            assert_eq!(decide(Some(env), &tmux_bin(), false), Choice::None);
+            assert_eq!(decide(Some(env), &psmux_bin(), true), Choice::None);
+        }
     }
 
     #[test]
     fn 未知の値と未設定はautoと同じ扱いになる() {
         // タイポで永続化が黙って落ちるのが最悪なので auto へ倒す
-        let auto = resolve_choice(None);
-        assert_eq!(resolve_choice(Some("tmuxx")), auto);
-        assert_eq!(resolve_choice(Some("")), auto);
-        // 明示 tmux も「tmux が無ければ None」= auto と同じ結果になる
-        assert_eq!(resolve_choice(Some("tmux")), auto);
+        for binary in [tmux_bin(), psmux_bin(), Binary::Absent] {
+            let auto = decide(None, &binary, false);
+            assert_eq!(decide(Some("tmuxx"), &binary, false), auto);
+            assert_eq!(decide(Some(""), &binary, false), auto);
+        }
+    }
+
+    /// **#519 M2 要件 8（tmux 誤判別ガード）**: psmux は `tmux.exe` を PATH に置くので、
+    /// `tmux -V` が成功することは本物の tmux がある証拠にならない。
+    /// 誤って [`Choice::Tmux`] を選ぶと「器は作れるが kill が効かない」
+    /// （`kill-session -t =name` が 5.1 秒ブロックの末に失敗）永続化になる
+    #[test]
+    fn psmuxをtmuxと誤判別しない() {
+        // `tmux` という名前で見つかっても、正体が psmux なら psmux backend を選ぶ
+        assert_eq!(decide(None, &psmux_bin(), true), Choice::Psmux);
+        assert_eq!(decide(None, &psmux_bin(), false), Choice::Psmux);
+        // 明示 tmux 指定でも psmux を tmux として使わない
+        assert_eq!(decide(Some("tmux"), &psmux_bin(), true), Choice::None);
+        assert_eq!(decide(Some("tmux"), &psmux_bin(), false), Choice::None);
+    }
+
+    /// `-V` の出力から正体を判別する（psmux は 1 行目で tmux を詐称する）
+    #[test]
+    fn バージョン出力から正体を判別する() {
+        assert_eq!(
+            classify_version_output("tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n", "tmux"),
+            Some(Binary::Psmux {
+                bin: "tmux".into(),
+                version: "3.3.7".into()
+            })
+        );
+        assert_eq!(
+            classify_version_output("tmux 3.6\n", "tmux"),
+            Some(Binary::Tmux { bin: "tmux".into() })
+        );
+        // tmux 系でない出力は器の候補にしない
+        assert_eq!(
+            classify_version_output("GNU screen 4.9.1\n", "screen"),
+            None
+        );
+        assert_eq!(classify_version_output("", "tmux"), None);
+    }
+
+    /// Windows では本物の tmux（MSYS2 / Cygwin 版）を器に選ばない。
+    /// ネイティブの ConPTY シェルを抱えられず、`-f` の Windows パスも解釈できないため
+    #[test]
+    fn windowsではposix版tmuxを器に選ばない() {
+        assert_eq!(decide(None, &tmux_bin(), true), Choice::None);
+        assert_eq!(decide(None, &tmux_bin(), false), Choice::Tmux);
+        assert_eq!(decide(None, &Binary::Absent, true), Choice::None);
+        assert_eq!(decide(None, &Binary::Absent, false), Choice::None);
+    }
+
+    /// psmux が無ければ psmux は選ばれない（明示指定でも器を捏造しない）
+    #[test]
+    fn psmuxが無ければ明示指定でも器なしへ倒れる() {
+        assert_eq!(decide(Some("psmux"), &tmux_bin(), false), Choice::None);
+        assert_eq!(decide(Some("psmux"), &Binary::Absent, true), Choice::None);
+        assert_eq!(decide(Some("psmux"), &psmux_bin(), true), Choice::Psmux);
     }
 
     #[test]

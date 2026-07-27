@@ -14,7 +14,6 @@
 //!   `~/.tmux.conf` は読まない（status バー・prefix キー等が見えない裏方に徹する）
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
@@ -35,19 +34,19 @@ pub fn socket_name() -> String {
         .unwrap_or_else(|| "tako".into())
 }
 
-/// tmux バイナリが実在して動くか（`tmux -V` が成功するか）。プロセス内でキャッシュする。
-/// バイナリは `tmux::tmux_bin`（ログインシェル解決込み）で引く（.app の最小 PATH 対策）。
+/// **本物の** tmux が実在して動くか。
+///
+/// 「`tmux -V` が成功するか」ではない点に注意: psmux は `tmux.exe` を PATH に置き
+/// `-V` の 1 行目で `tmux 3.3.7` を詐称するため、素朴な判定だと psmux を tmux と
+/// 誤認して半端に壊れた永続化になる（#519 M2 要件 8）。判別は境界側
+/// [`crate::backend::binary`] が一元的に行う。
 ///
 /// これは**環境の事実**であって選択ではない。選択は `backend::choice()` が決める
 pub fn tmux_binary_present() -> bool {
-    static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::tmux::tmux_command(None)
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    matches!(
+        crate::backend::binary(),
+        crate::backend::Binary::Tmux { .. }
+    )
 }
 
 /// バックエンドサーバーの設定。見えない裏方として振る舞うための最小構成:

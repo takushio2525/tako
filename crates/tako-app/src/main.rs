@@ -525,11 +525,21 @@ fn foreign_client_guard() -> Option<String> {
     if holders.is_empty() {
         return None;
     }
-    let parents = tako_control::agents::process_parent_map();
-    for tako_core::backend::Holder { pid, session } in &holders {
-        if let Some(owner) = live_foreign_tako_ancestor(*pid, &parents) {
+    // 祖先辿りは Client 種別のときだけ必要（プロセス一覧の取得はそれなりに重い）
+    let mut parents: Option<HashMap<u32, u32>> = None;
+    for tako_core::backend::Holder { pid, session, kind } in &holders {
+        let owner = match kind {
+            // 器がクライアント PID しか教えてくれない（tmux）。所有インスタンスまで辿る
+            tako_core::backend::HolderKind::Client => {
+                let parents = parents.get_or_insert_with(tako_control::agents::process_parent_map);
+                live_foreign_tako_ancestor(*pid, parents)
+            }
+            // 器の実装が所有インスタンスの生存まで確認済み（psmux のオーナー記録。#519 M2）
+            tako_core::backend::HolderKind::Owner => Some(*pid),
+        };
+        if let Some(owner) = owner {
             return Some(format!(
-                "復元対象の tmux セッション {session} に別の tako（pid {owner}）のクライアントが attach 中（表示中の資源は強奪しない）"
+                "復元対象のバックエンドセッション {session} を別の tako（pid {owner}）が使用中（表示中の資源は強奪しない）"
             ));
         }
     }
