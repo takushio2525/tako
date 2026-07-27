@@ -1453,7 +1453,8 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         }
     };
     let pid_num = pid_info.pid;
-    if !is_process_alive(pid_num) {
+    // ゾンビ（終了済みで未刈り取り）も「既に終了」として扱う（#619）
+    if has_terminated(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
     }
@@ -1468,10 +1469,12 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         ));
     }
     crate::platform::process::terminate(pid_num, force)?;
-    // プロセスの終了をポーリングで確認（最大 5 秒）
+    // プロセスの終了をポーリングで確認（最大 5 秒）。
+    // 刈り取り前のゾンビも終了として数える（#619。刈り取れるのは起動した親だけで、
+    // 停止側が別プロセスのときは自分では消せない）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if !is_process_alive(pid_num) {
+        if has_terminated(pid_num) {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -1672,17 +1675,54 @@ pub fn spawn_daemon() -> Result<Value, String> {
             return Err(format!("デーモンが起動情報を返さず終了した（{status}）"));
         }
         let _ = child.kill();
+        // kill しただけでは終了ステータスが残る（#619）。ここでも刈り取る
+        reap_daemon_child(child);
         return Err("デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into());
     };
 
-    // 子プロセスを切り離す（wait しない → init が引き取る）
-    std::mem::forget(child);
+    // 子プロセスの終了ステータスを刈り取る（#619）
+    reap_daemon_child(child);
 
     // 起動応答に serve へ使ったバイナリを含める（#432: start 直後に世代を確認できる）
     let mut info = info;
     info["serve_binary"] = json!(tako_bin);
 
     Ok(info)
+}
+
+/// 起動した daemon 子プロセスを刈り取る専用スレッドを立てる（#619）。
+///
+/// `configure_daemon_child` の `setsid()` は**セッションを切り離すだけで親子関係は
+/// 変えない**。親（GUI = tako-app）は長命なので、`Child` を捨てて誰も `wait(2)` しないと
+/// daemon 終了時に defunct（ゾンビ）がプロセステーブルへ残り続け、起動 / 停止のたびに溜まる。
+///
+/// 実害はプロセステーブルの残骸に留まらない: `kill(pid, 0)` は**ゾンビにも成功する**
+/// （macOS 実測）ため、`daemon_stop` の終了待ちが「終了しない」と誤判定し、実際は
+/// 停止できているのに 5 秒待って失敗を返していた（GUI の停止ボタンはそのエラーを表示する）。
+///
+/// 刈り取りは**起動した本人にしかできない**（`wait(2)` の対象は自分の子だけ）。CLI から
+/// GUI 起動の daemon を止める経路では停止側に打つ手が無いので、刈り取りは停止側ではなく
+/// 起動側のここに置く。停止側は「ゾンビ = 終了済み」と読めるようにして補う（`has_terminated`）
+fn reap_daemon_child(mut child: std::process::Child) {
+    let spawned = std::thread::Builder::new()
+        .name("daemon-reaper".into())
+        .spawn(move || {
+            // stderr は起動情報の受信後は誰も読まない。パイプを持ったまま放置すると
+            // daemon 側の書き込みがバッファ満杯（macOS: 64KB）で永久ブロックしうるので、
+            // 終了まで捨て続ける（閉じると daemon 側が EPIPE になるため閉じない）
+            if let Some(mut err) = child.stderr.take() {
+                let _ = std::io::copy(&mut err, &mut std::io::sink());
+            }
+            // daemon の終了までブロックし、終了ステータスを回収してプロセステーブルから消す
+            let _ = child.wait();
+        });
+    if spawned.is_err() {
+        // スレッドを立てられない極端な状況。旧挙動（刈り取らない）に落ちるだけで
+        // daemon 自体は動く。黙って失敗させないため診断だけ残す
+        eprintln!(
+            "警告: daemon 刈り取りスレッドを起動できませんでした（終了後に defunct が残ります）"
+        );
+    }
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -1697,6 +1737,38 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// プロセスがゾンビ（終了済みだが親が未刈り取り）か。
+///
+/// `kill(pid, 0)` はゾンビにも成功するため、生死だけでは終了を判定できない。
+/// 呼ぶのは停止の待ち合わせ中だけなので、`ps` 起動のコストは問題にならない
+/// （定常のポーリング経路には入れない。#340 の常駐サブプロセス削減方針）
+fn is_zombie_process(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// プロセスが**終了済み**か（ゾンビも終了済みとして扱う。#619）。
+///
+/// 停止の待ち合わせはこれを使う。刈り取れない別プロセスから停止したとき
+/// （GUI が起動した daemon を CLI から止める等）に、親がまだ刈り取っていない
+/// ゾンビを「終了しない」と誤判定してタイムアウトするのを防ぐ
+fn has_terminated(pid: u32) -> bool {
+    !is_process_alive(pid) || is_zombie_process(pid)
+}
+
 /// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
 /// SIGTERM → 最大 5 秒ポーリング → 終了しなければ SIGKILL
 fn kill_stale_daemon(pid: u32) {
@@ -1707,7 +1779,8 @@ fn kill_stale_daemon(pid: u32) {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if !is_process_alive(pid) {
+            // ゾンビも終了として扱う（#619）
+            if has_terminated(pid) {
                 cleanup_state_files();
                 return;
             }
@@ -5040,6 +5113,151 @@ mod tests {
                 "configure_daemon_child 後は SIGTERM が届いて子が終了する"
             );
         }
+    }
+
+    /// 使い捨ての子プロセスを起動する（#619 のテスト用）。
+    /// パイプ構成は `spawn_daemon` と同じにして、刈り取り側の stderr 処理も通す。
+    /// `argv` は `sh -c <script> $0 $1 …` の位置引数 = ps の args 欄に出る文字列。
+    /// P0-4 の同一性検証（args に tako / remote / serve を要求）を通したいときに使う
+    #[cfg(unix)]
+    fn spawn_throwaway_child(argv: &[&str]) -> std::process::Child {
+        Command::new("/bin/sh")
+            .args(["-c", "echo boot >&2; exit 0"])
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh を起動できる")
+    }
+
+    /// 条件が満たされるまで待つ（満たされたら true）
+    #[cfg(unix)]
+    fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// #619: 起動した daemon の子プロセスを刈り取らないと defunct（ゾンビ）が残る。
+    ///
+    /// 実 daemon を立てずに刈り取り機構だけを検証する。合わせて、旧実装が誤判定した
+    /// 前提（親が wait しない子はゾンビで残り、`kill(pid, 0)` はそれを alive と答える）と、
+    /// `has_terminated` がそこを終了済みと読めることも固定する。
+    /// `reap_daemon_child` の `child.wait()` を消すとこのテストは失敗する
+    #[cfg(unix)]
+    #[test]
+    fn reap_daemon_childは終了した子をプロセステーブルから消す() {
+        // 前提の確認: 誰も wait しない子は終了後もプロセステーブルに Z で残る
+        let mut leaked = spawn_throwaway_child(&[]);
+        let leaked_pid = leaked.id();
+        assert!(
+            wait_until(10, || is_zombie_process(leaked_pid)),
+            "前提: wait しない子は終了後 defunct になる"
+        );
+        assert!(
+            is_process_alive(leaked_pid),
+            "前提: kill(pid, 0) はゾンビにも成功する（旧実装が終了を検知できなかった原因）"
+        );
+        assert!(
+            has_terminated(leaked_pid),
+            "has_terminated はゾンビを終了済みと読む"
+        );
+        let _ = leaked.wait(); // テストプロセスに残骸を残さない
+
+        // 本題: reap_daemon_child に渡した子は刈り取られて消える
+        let child = spawn_throwaway_child(&[]);
+        let pid = child.id();
+        reap_daemon_child(child);
+        assert!(
+            wait_until(10, || !is_process_alive(pid) && !is_zombie_process(pid)),
+            "reap_daemon_child 後は defunct が残らない（zombie={}）",
+            is_zombie_process(pid)
+        );
+    }
+
+    /// #619: 停止側は刈り取り前のゾンビを「終了済み」と読む。
+    ///
+    /// GUI が起動した daemon を CLI から止める経路では停止側で `wait(2)` できない。
+    /// 旧実装はゾンビを生存と誤判定し、実際は停止できているのに 5 秒待って
+    /// 「SIGTERM 後 5 秒経っても終了しない」を返していた
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_implはゾンビpidを終了済みとして扱う() {
+        use std::os::unix::process::CommandExt as _;
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tako-test-zombie-{}", std::process::id()));
+        let pid_file = dir.join("tako-remote.pid");
+        // PID ファイルを置く。起動時刻は「今」= P0-4 の同一性検証を通す値にする
+        let arm = |pid: u32| {
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            std::fs::write(&pid_file, format!("{pid}\n/bin/sleep\n{now}\n")).unwrap();
+        };
+
+        // ① 停止の本筋: 生存中の daemon を止める。SIGTERM で即死するが、刈り取るのは
+        //    起動した親（ここではテストプロセス）なので、終了待ちの最中はゾンビに見える。
+        //    旧実装はこれを生存と誤判定し、5 秒待ってエラーを返していた。
+        //    ps の args を "tako remote serve" に見せるため arg0 を差し替える
+        let mut child = Command::new("/bin/sleep")
+            .arg0("tako remote serve")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep を起動できる");
+        let pid = child.id();
+        arm(pid);
+        let started = std::time::Instant::now();
+        let result = daemon_stop_impl(false);
+        let elapsed = started.elapsed();
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let pid_file_left = pid_file.exists();
+        let zombie_during_wait = is_zombie_process(pid);
+        let _ = child.wait(); // 起動した本人として刈り取る（= spawn_daemon 側の役目）
+        assert!(
+            result.is_ok(),
+            "ゾンビを終了と読めるので停止は成功する（実際: {result:?}、所要 {elapsed:?}）"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "終了待ちのタイムアウト（5 秒）に落ちない（実際: {elapsed:?}）"
+        );
+        assert!(
+            zombie_during_wait,
+            "前提: 停止直後の子は刈り取り前なので defunct として見える"
+        );
+        assert!(!pid_file_left, "停止に成功したら state ファイルを掃除する");
+
+        // ② 既にゾンビの PID を止めようとしたら「既に終了」と報告して掃除する
+        let mut leftover = spawn_throwaway_child(&["tako", "remote", "serve"]);
+        let leftover_pid = leftover.id();
+        assert!(
+            wait_until(10, || is_zombie_process(leftover_pid)),
+            "前提: 子が defunct になるまで待つ"
+        );
+        arm(leftover_pid);
+        let result = daemon_stop_impl(false);
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let pid_file_left = pid_file.exists();
+        let _ = leftover.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("既に終了しているのでエラーを返す");
+        assert!(
+            err.contains("既に終了"),
+            "ゾンビは「既に終了」と報告する（実際: {err}）"
+        );
+        assert!(!pid_file_left, "state ファイルを掃除する");
     }
 
     // --- #287 P1: cross-origin 遮断テスト ---
