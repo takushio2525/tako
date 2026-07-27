@@ -252,7 +252,11 @@ pub fn tools() -> Vec<Value> {
                 応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: \
                 style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、\
                 mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。\
-                重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。",
+                重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。\
+                queued_messages_pending が true なら、busy 中に人間が打った指示が claude の\
+                メッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても\
+                発火しない）。tako が idle 継続時に自動で送り出すので待つこと。\
+                このペインを閉じるとキューごと指示が失われる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1506,7 +1510,9 @@ pub fn tools() -> Vec<Value> {
                 events 配列に直近の検知イベントが入る（#243）: \
                 question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ \
                 model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ \
-                context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）。\
+                context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）/ \
+                queued_messages_pending = 人間が busy 中に打った指示が claude のキューに未送信で残っている（#572。\
+                入力欄は空なので Enter 代行では発火しない。tako が自動で送り出すまで待ち、このペインを閉じない）。\
                 session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
                 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
                 画面パターン推定にフォールバック（status_source が screen）。\

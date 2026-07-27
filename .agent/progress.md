@@ -1416,3 +1416,17 @@
 - 関連コミット: `b62c325`（PR #570 squash merge）。品質ゲート全緑（1393 tests）+ パリティ 0 エラー +
   隔離セルフテスト `TAKO_APP_SELF_TEST_OK` + 隔離 GUI 実クリック（証拠 ~/dev/tako-evidence/560/）
 - 次: tako 再起動 → #561 の実 IME 目視（この機は日本語入力ソース未有効）と #562 の導線目視。#562 は open 維持
+
+## 2026-07-27（#572: busy 中に人間が打った指示の消失を根治）
+- 根因を隔離実 claude で確定: **claude は生成中の打鍵を入力欄ではなく内部キューへ入れる**
+  （ターン終了時に送信）。その間の入力欄は空で dim のヒント `Press up to edit queued messages`
+  が出る。tako はこれを「残留テキスト」と誤認し、Enter 単独送達が no-op の Enter を 5 回
+  空撃ちして `verified=false`、`read` も `style=ghost` + テキストありに見えていた
+- 是正: ①「入力欄が空か」を **dim 属性**で判定（tmux 経路は `capture-pane -e`。文言リストでは
+  AI のゴースト提案を網羅できない）②キュー滞留を `queued_messages_pending` で検知し
+  `read` / `worker_status` / watch イベントへ公開 ③生成が止まっているのにキューが残っていたら
+  `Up` → `Enter` で送り出す。生成中かは `is_busy` の文言ではなく **画面が変化していないこと**
+  （実測で 120 行のリスト生成中に `is_busy` が false を返し救出が暴発した）
+- 検証: fmt / clippy(-D warnings) / test 全緑（1398）+ 実 claude e2e 新設（修正を戻すと
+  FAILED になることを実測）+ 隔離セルフテスト。既存 e2e 4/5 通過（残り 1 は `/tmp` が
+  信頼済みという環境要因で main でも同じく失敗）

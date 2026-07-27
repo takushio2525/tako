@@ -311,11 +311,160 @@ fn prompt_content(line: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// 入力欄の内容が「空」か。空の入力欄は `❯ ` 単独、または `Try "..."` の
-/// プレースホルダ付きで描画される（実画面採取より）。
+/// claude がメッセージキューの滞留時に入力欄へ出すヒント（#572）。
+/// claude v2.1.220 のバイナリ内文字列および実採取画面の両方で確認済み
+pub const QUEUED_MESSAGES_HINT: &str = "Press up to edit queued messages";
+
+/// 入力欄に **ユーザー入力の代わりに** 表示されるプレースホルダの先頭（実採取画面より）。
+///
+/// claude はこれらを **dim（`ESC[2m`）** で描画する = ユーザーが打った文字ではない。
+/// ここに載っていないプレースホルダを「残留テキスト」と誤認すると、Enter 単独送達
+/// （#95）が永久に空振りし、送達検証も偽陰性になる（#572 の master の観測がこれ）
+const INPUT_PLACEHOLDERS: &[&str] = &[
+    // 空欄時の使用例（`Try "fix the build"` 等）
+    "Try \"",
+    // キューに未送信メッセージがある（#572）
+    QUEUED_MESSAGES_HINT,
+];
+
+/// 入力欄の内容が「空」か。空の入力欄は `❯ ` 単独、または dim のプレースホルダ付きで
+/// 描画される（実画面採取より）。
 /// Enter 単独送達（Issue #95）の残留判定にも使うため公開
 pub fn input_content_is_empty(content: &str) -> bool {
-    content.is_empty() || content.starts_with("Try \"")
+    content.is_empty() || is_input_placeholder(content)
+}
+
+/// 入力欄の内容が claude のプレースホルダ（ユーザー入力ではない）か（#572）
+pub fn is_input_placeholder(content: &str) -> bool {
+    INPUT_PLACEHOLDERS.iter().any(|p| content.starts_with(p))
+}
+
+/// claude のメッセージキューに **未送信のまま滞留した** メッセージがあるか（#572）。
+///
+/// busy 中に打った指示は claude のキューへ入り、通常はターン終了時に送信される。
+/// ところがターン終了の直前に入ったものはドレインされずキューに残り、以後 Enter を
+/// 何回送っても送信されない（入力欄自体は空なので Enter は no-op）。
+/// この状態で claude は入力欄に `QUEUED_MESSAGES_HINT` を出すので、それを根拠に検知する。
+///
+/// 判定は「画面最下部のプロンプト行の内容がヒント文言」= 入力欄が空でキューが非空。
+/// ユーザーが何か打ち始めるとヒントは消えるため、**滞留していても検知できない状態**は
+/// 「ユーザーが今まさに入力中」= 触ってはいけない状態と一致する（自動復旧の安全弁）
+pub fn queued_messages_pending(lines: &[String]) -> bool {
+    bottom_prompt_content(lines).is_some_and(|c| c.starts_with(QUEUED_MESSAGES_HINT))
+}
+
+/// 画面が「もう動いていない」と言えるか（#572）。
+///
+/// `is_busy` はスピナー行の文言に依存するため、生成中でもその行が画面外・別表示に
+/// なっていると false を返す（実測: 実 claude の 120 行リスト生成中に false）。
+/// キュー救出のように **誤って割り込むと壊れる** 判定では、文言ではなく
+/// **画面が一定時間まったく変化していないこと** を主たる根拠にする
+pub fn screen_settled(before: &[String], after: &[String]) -> bool {
+    before == after && !is_busy(after)
+}
+
+// --- 入力欄の dim 判定（#572。文言に依存しない構造判定） ---
+
+/// 先頭が SGR（`ESC[<数字と ; >*m`）ならその「パラメータ部」と全体のバイト長を返す。
+/// SGR 以外のエスケープ（`ESC[2J` 等）で本文を食い潰さないよう、
+/// パラメータが数字と `;` だけで終端が `m` のときに限って SGR とみなす
+fn sgr_at(s: &str) -> Option<(&str, usize)> {
+    let body = s.strip_prefix("\u{1b}[")?;
+    let end = body.find(|c: char| !c.is_ascii_digit() && c != ';')?;
+    if body.as_bytes()[end] != b'm' {
+        return None;
+    }
+    Some((&body[..end], "\u{1b}[".len() + end + 1))
+}
+
+/// エスケープ付き（`capture-pane -p -e`）の 1 行から SGR を取り除く
+pub fn strip_sgr(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find('\u{1b}') {
+        out.push_str(&rest[..i]);
+        match sgr_at(&rest[i..]) {
+            Some((_, len)) => rest = &rest[i + len..],
+            None => {
+                out.push('\u{1b}');
+                rest = &rest[i + '\u{1b}'.len_utf8()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// エスケープ付き画面から、**入力欄のテキストが全て dim か**を判定する（#572）。
+///
+/// claude は「ユーザーが打った文字」を通常輝度、「プレースホルダ / AI のゴースト提案」を
+/// dim（`ESC[2m`）で描画する（#107 が GUI 側で使っている性質と同じ）。文言リストは
+/// AI 生成のゴースト提案（例: `now do 1 to 50`）を原理的に網羅できないため、
+/// tmux 経路でも属性を根拠にする。
+///
+/// 戻り値: `None` = 入力欄が見つからない / 内容が空、`Some(true)` = 全て dim
+/// （＝ユーザー入力ではない）、`Some(false)` = 通常輝度の文字を含む（＝ユーザー入力あり）
+pub fn input_text_is_all_dim(escaped_lines: &[String]) -> Option<bool> {
+    // 素の行で入力欄の位置（下から最初のプロンプト行）を決め、同じ行を属性つきで見る
+    let idx = escaped_lines
+        .iter()
+        .rposition(|l| prompt_content(&strip_sgr(l)).is_some())?;
+    let raw = &escaped_lines[idx];
+
+    let mut dim = false;
+    let mut seen_prompt = false;
+    let mut has_dim = false;
+    let mut has_normal = false;
+    // **属性の適用順に注意**: エスケープの手前の文字は「そのエスケープを適用する前」の
+    // 属性で描かれている。先に SGR を反映すると 1 チャンク分ずれる
+    let mut classify = |chunk: &str, dim: bool, seen_prompt: &mut bool| {
+        for ch in chunk.chars() {
+            if !*seen_prompt {
+                if ch == '❯' || ch == '›' || ch == '>' {
+                    *seen_prompt = true;
+                }
+                continue;
+            }
+            if ch.is_whitespace() {
+                continue;
+            }
+            if dim {
+                has_dim = true;
+            } else {
+                has_normal = true;
+            }
+        }
+    };
+    let mut rest = raw.as_str();
+    while let Some(i) = rest.find('\u{1b}') {
+        classify(&rest[..i], dim, &mut seen_prompt);
+        match sgr_at(&rest[i..]) {
+            Some((params, len)) => {
+                for p in params.split(';') {
+                    match p {
+                        "2" => dim = true,
+                        // 0（リセット）/ 22（通常輝度）/ 空（= 0 相当）
+                        "0" | "22" | "" => dim = false,
+                        _ => {}
+                    }
+                }
+                rest = &rest[i + len..];
+            }
+            // SGR ではないエスケープ（tmux -e は出さない想定）は 1 バイト読み飛ばす
+            None => rest = &rest[i + '\u{1b}'.len_utf8()..],
+        }
+    }
+    classify(rest, dim, &mut seen_prompt);
+    if !has_dim && !has_normal {
+        return None; // 入力欄は空
+    }
+    Some(!has_normal)
+}
+
+/// エスケープ付き画面から「入力欄にユーザーが打った実テキストがあるか」を判定する（#572）。
+/// dim だけの内容（プレースホルダ / ゴースト提案）は **無い** と扱う
+pub fn input_has_user_text(escaped_lines: &[String]) -> bool {
+    matches!(input_text_is_all_dim(escaped_lines), Some(false))
 }
 
 /// 応答生成中に見えるか（advisory）。claude / codex の「esc to interrupt」ヒント、
@@ -578,7 +727,16 @@ pub struct DeliveryReport {
     pub enter_retries: u32,
     /// 入力欄が空へ戻ったことを確認できたか（false = 未検証のまま打ち切り）
     pub verified: bool,
+    /// claude のメッセージキューから取り出して送った回数（#572。`Up` → `Enter`）
+    pub queued_drained: u32,
 }
+
+/// キュー滞留からの復旧で取り出しに使うキー（#572）。claude 自身が
+/// `Press up to edit queued messages` と案内している操作をそのまま使う
+pub const QUEUE_RECALL_KEY: &str = "Up";
+
+/// 復旧の試行上限（1 回の送達につき）。滞留が解けない場合に無限に叩かない
+pub const QUEUE_DRAIN_MAX: u32 = 4;
 
 /// tmux セッションへの送達確認つきプロンプト配送。
 /// capture-pane で画面を見ながら 信頼ダイアログ承諾 → 貼り付け（bracketed paste）→
@@ -658,23 +816,60 @@ pub fn deliver_via_tmux(
 
     // ①' Enter 単独送達（Issue #95）: 入力欄の残留テキストの送信代行。
     //    素の CR 1 発は claude TUI に取りこぼされることがある（busy 中に
-    //    入力欄へ溜まったテキスト等）ため、入力欄が空へ戻るまで再送する
+    //    入力欄へ溜まったテキスト等）ため、入力欄が空へ戻るまで再送する。
+    //
+    //    #572: 「入力欄が空に見えない」原因の大半は残留ではなく **claude の dim
+    //    プレースホルダ**（キュー滞留ヒント / ゴースト提案）だった。素の文字列だけを
+    //    見ると残留と区別できず、Enter を 5 回空撃ちして未検証で終わっていた。
+    //    ここでは属性つき採取（`-e`）で dim を見て「ユーザーが打った実テキスト」だけを
+    //    残留とみなし、キューに未送信メッセージがあるなら Up で取り出して送る
     if text.is_empty() {
+        tako_core::tmux::send_key(socket, session, "Enter")?;
+        let mut prev_plain: Option<Vec<String>> = None;
         loop {
-            tako_core::tmux::send_key(socket, session, "Enter")?;
             std::thread::sleep(Duration::from_millis(700));
-            let lines = tako_core::tmux::capture_session(socket, session)?;
-            if input_line(&lines)
-                .map(input_content_is_empty)
-                .unwrap_or(true)
+            let styled = tako_core::tmux::capture_session_styled(socket, session)?;
+            let plain: Vec<String> = styled.iter().map(|l| strip_sgr(l)).collect();
+
+            // キュー滞留（#572）: 入力欄は本当に空なので Enter は no-op。
+            // claude 自身の案内どおり Up で取り出してから Enter で送る。
+            // **生成中には絶対に触らない**（送り直しても再キューされるだけで、
+            // ターン終了時に claude 自身がドレインする。実測: probe v9）。
+            // 生成中かは文言ではなく「画面が 700ms 変化していない」で見る（#572）
+            let settled = prev_plain
+                .as_ref()
+                .is_some_and(|before| screen_settled(before, &plain));
+            if settled && queued_messages_pending(&plain) && report.queued_drained < QUEUE_DRAIN_MAX
             {
+                tako_core::tmux::send_key(socket, session, QUEUE_RECALL_KEY)?;
+                std::thread::sleep(Duration::from_millis(500));
+                tako_core::tmux::send_key(socket, session, "Enter")?;
+                report.queued_drained += 1;
+                prev_plain = None; // 画面が動くので安定判定をやり直す
+                continue;
+            }
+
+            // 入力欄に「ユーザーが打った実テキスト」が無ければ送信済み。
+            // dim だけの内容（プレースホルダ / ゴースト提案）は残留ではない（#572）
+            if !input_has_user_text(&styled) {
+                // キューが残っているなら、生成中かどうかを 1 回だけ見極める
+                // （生成中なら claude 自身がドレインするので触らない）
+                if queued_messages_pending(&plain)
+                    && prev_plain.is_none()
+                    && report.queued_drained < QUEUE_DRAIN_MAX
+                {
+                    prev_plain = Some(plain);
+                    continue;
+                }
                 report.verified = true;
                 return Ok(report);
             }
             if report.enter_retries >= 4 {
                 return Ok(report); // verified = false のまま返す（呼び出し側がログ）
             }
+            tako_core::tmux::send_key(socket, session, "Enter")?;
             report.enter_retries += 1;
+            prev_plain = None;
         }
     }
 
@@ -755,6 +950,20 @@ mod tests {
 ❯ Try "refactor <filepath>"
 ────────────────────────────────────────────────────
   ctx   0% ░░░░░░░░░░"#;
+
+    /// キュー滞留の実採取画面（claude v2.1.220。#572 のプローブ out572d/D-idle より）。
+    /// 背景色つきの `❯` 行が **未送信のキュー**、最下部の dim 行が空の入力欄
+    const QUEUED_STRANDED: &str = r#"⏺ 応答本文の最後の行
+
+✻ Cooked for 4s
+
+────────────────────────────────────────────────────────────────────────
+❯ Write a numbered list from 1 to 50, one short English sentence each.
+  ❯ ASCIIBURSTD572 fix it now
+────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────
+  ctx   5% ░░░░░░░░░░"#;
 
     const READY_BARE: &str = r#"❯ say only: ok
 
@@ -864,6 +1073,74 @@ mod tests {
             input_line(&screen("$ ls")).map(input_content_is_empty),
             None
         );
+    }
+
+    #[test]
+    fn キュー滞留のヒントは残留テキストではなく空とみなす() {
+        // #572: claude はキューに未送信メッセージがあると入力欄へ dim のヒントを出す。
+        // 旧実装はこれを「残留テキスト」と誤認し、Enter 単独送達（#95）が
+        // 永久に空振りしていた（master の「Enter 代行が発火しない」の正体）
+        assert!(input_content_is_empty(QUEUED_MESSAGES_HINT));
+        assert_eq!(
+            input_line(&screen(QUEUED_STRANDED)).map(input_content_is_empty),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn キュー滞留を検知する() {
+        // #572: 入力欄が空 + キュー非空 = 人間が busy 中に打った指示が未送信のまま残っている
+        assert!(queued_messages_pending(&screen(QUEUED_STRANDED)));
+        // 通常の空欄・入力中・シェルでは発火しない
+        assert!(!queued_messages_pending(&screen(READY_PLACEHOLDER)));
+        assert!(!queued_messages_pending(&screen(INPUT_PENDING)));
+        assert!(!queued_messages_pending(&screen("$ ls")));
+    }
+
+    #[test]
+    fn sgrを取り除ける() {
+        assert_eq!(strip_sgr("\u{1b}[2mdim\u{1b}[0m text"), "dim text");
+        assert_eq!(strip_sgr("plain"), "plain");
+        assert_eq!(strip_sgr("\u{1b}[38;5;231m❯\u{1b}[39m a"), "❯ a");
+        assert_eq!(strip_sgr("\u{1b}[m reset"), " reset");
+        // SGR 以外のエスケープで本文を食い潰さない（`m` を含む語がある行）
+        assert_eq!(strip_sgr("\u{1b}[2Jsome message"), "\u{1b}[2Jsome message");
+    }
+
+    #[test]
+    fn 入力欄のdim判定でゴースト提案とユーザー入力を分ける() {
+        // #572: 文言リストでは AI 生成のゴースト提案（`now do 1 to 50` 等）を
+        // 網羅できない。属性（dim）を根拠にすることで文言非依存にする
+        let ghost = vec!["\u{1b}[39m❯ \u{1b}[2mnow do 1 to 50\u{1b}[0m".to_string()];
+        assert_eq!(input_text_is_all_dim(&ghost), Some(true));
+        assert!(!input_has_user_text(&ghost));
+
+        let hint = vec![
+            "\u{1b}[38;5;246m❯ \u{1b}[2m\u{1b}[39mPress up to edit queued messages\u{1b}[0m"
+                .to_string(),
+        ];
+        assert_eq!(input_text_is_all_dim(&hint), Some(true));
+        assert!(!input_has_user_text(&hint));
+
+        let user = vec!["\u{1b}[39m❯ HUMANTYPED busy message alpha".to_string()];
+        assert_eq!(input_text_is_all_dim(&user), Some(false));
+        assert!(input_has_user_text(&user));
+
+        // 空欄は None（判定材料なし）
+        assert_eq!(input_text_is_all_dim(&["❯ ".to_string()]), None);
+        // ❯ 行が無ければ None
+        assert_eq!(input_text_is_all_dim(&["$ ls".to_string()]), None);
+        // 一部だけ dim（ゴースト補完 + 手入力）はユーザー入力ありとみなす
+        let mixed = vec!["❯ \u{1b}[2mghost\u{1b}[22m real".to_string()];
+        assert_eq!(input_text_is_all_dim(&mixed), Some(false));
+        assert!(input_has_user_text(&mixed));
+        // 入力欄は **画面最下部** のプロンプト行（キュー行に引きずられない）
+        let with_queue = vec![
+            "\u{1b}[48;5;237m❯ \u{1b}[38;5;231mqueued message\u{1b}[39m".to_string(),
+            "\u{1b}[38;5;246m❯ \u{1b}[2m\u{1b}[39mPress up to edit queued messages\u{1b}[0m"
+                .to_string(),
+        ];
+        assert_eq!(input_text_is_all_dim(&with_queue), Some(true));
     }
 
     #[test]
