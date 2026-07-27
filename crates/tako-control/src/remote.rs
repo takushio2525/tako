@@ -17,6 +17,11 @@
 //! - `POST /api/panes/:id/resize` — 明示リサイズ（`{cols, rows}` で tmux resize-window、
 //!   `{reset: true}` で manual 解除。CLI `tako tmux resize` / MCP 用。
 //!   PWA のリモート表示はこれを呼ばない — Issue #63「PC 非破壊」）
+//! - `GET  /api/v2/panes` — ペイン一覧（IPC 経由のリッチ情報）。ペイン選択画面が
+//!   「どれがどれだか分かる」ために、1 ペイン 1 回の画面キャプチャから
+//!   `preview`（TUI クロムを落とした中身のスニペット）・`activity`
+//!   （permission / busy / error / idle）・`permission_dialog`・`error` を付けて返す
+//!   （#621。要約ロジックは `remote_preview`）
 //! - `GET  /api/agents` — claude agents --json プロキシ + tmux ペイン対応付け
 //! - `GET  /api/sessions/:id/messages?tail=N` — Claude Code transcript の正規化読み取り
 //! - `GET  /ws?pane=<id>` — WebSocket 画面プッシュ（読み取り専用・ペインサイズ不干渉。
@@ -2628,41 +2633,66 @@ fn resolve_pane_session_info(
     (session_id, model)
 }
 
-/// 各 agent ペインの画面から permission ダイアログを検知し、ペインエントリへ
-/// `permission_dialog: {command, options, highlighted}` を付与する（#425）。
+/// 各ペインの画面を **1 回だけ**キャプチャし、カード表示に要る情報を付与する。
+///
+/// - `permission_dialog: {command, options, highlighted}`（agent ペインのみ。#425）
+/// - `preview: [String]` — TUI のクロムを落とした中身のスニペット（#621）
+/// - `activity: "permission" | "busy" | "error" | "idle"`（agent ペインのみ。#621）
+/// - `error: {kind, detail, recommended_action}` — 異常停止時（#157 と同じ形）
 ///
 /// 承認待ちの判定は transcript の推定ではなく**画面のダイアログ実在**を正とする
 /// （transcript は「ツール実行中」と「承認待ち停止」を区別できない。auto mode の
 /// 実行中ウィンドウで誤って承認カードが出ていた根因）。
-/// `capture` はバックエンドセッション名 → 画面行（テスト差し替え用）
-fn attach_permission_dialogs(result: &mut Value, capture: impl Fn(&str) -> Option<Vec<String>>) {
+///
+/// `preview` をここで作るのは、PWA が「ペイン一覧 + ペインごとの screen」で
+/// N+1 リクエストを打っていたのをやめるため。キャプチャ回数はむしろ減る
+/// （旧: agent ぶんのダイアログ検知 + 全ペインぶんの screen API → 新: 全ペイン 1 回）。
+/// `capture` は tmux ターゲット → 画面行（テスト差し替え用）
+fn attach_card_summaries(result: &mut Value, capture: impl Fn(&str) -> Option<Vec<String>>) {
     let Some(panes) = result["panes"].as_array_mut() else {
         return;
     };
     for pane in panes {
-        // ダイアログを出しうるのは agent ペインだけ（plain のシェルはスキップ）
-        let agent_type = pane["agent_type"].as_str().unwrap_or("plain");
-        if agent_type == "plain" {
-            continue;
-        }
-        let Some(session) = pane["tmux_target"]
+        let is_agent = pane["agent_type"].as_str().unwrap_or("plain") != "plain";
+        let Some(target) = pane["tmux_target"]
             .as_str()
-            .map(session_name_of)
+            .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
         else {
             continue;
         };
-        let Some(lines) = capture(&session) else {
+        // キャプチャ失敗時はフィールドごと省く。PWA は preview 欠落を見て
+        // 従来どおり screen API へフォールバックする
+        let Some(lines) = capture(&target) else {
             continue;
         };
-        if let Some(dialog) = crate::claude_tui::detect_permission_dialog(&lines) {
+        let dialog = if is_agent {
+            crate::claude_tui::detect_permission_dialog(&lines)
+        } else {
+            None
+        };
+        if let Some(dialog) = &dialog {
             pane["permission_dialog"] = json!({
                 "command": dialog.command,
                 "options": dialog.options,
                 "highlighted": dialog.highlighted,
             });
         }
+        let summary = crate::remote_preview::summarize(&lines, is_agent, dialog.is_some());
+        if let Some(obj) = summary.as_object() {
+            for (key, value) in obj {
+                pane[key.as_str()] = value.clone();
+            }
+        }
     }
+}
+
+/// カード用の画面キャプチャ（履歴なし・色なしの現在画面 1 枚）。
+/// v2 ペイン一覧の `tmux_target` をそのまま使い、`=` を付けて
+/// **セッション名の完全一致**にする（前方一致のままだと別セッションを掴む）。
+/// tmux-only モードの `session:win.pane` 形式もそのまま解決できる
+fn capture_pane_for_card(tmux_socket: &str, target: &str) -> Option<Vec<String>> {
+    tmux_capture_pane(tmux_socket, &format!("={target}"), false, None).ok()
 }
 
 /// tmux ターゲット（`session:0.0` / `session`）からセッション名部分を取り出す。
@@ -3048,9 +3078,10 @@ fn handle_request_v2(
         match refresh_pane_mapping(app_conn, pane_mapping) {
             Some(list) => {
                 let mut result = list_to_api_v2(&list, &live);
-                // 承認待ちの正 = 画面の permission ダイアログ実在（#425）
-                attach_permission_dialogs(&mut result, |session| {
-                    tako_core::tmux::capture_session(Some(tmux_socket), session).ok()
+                // 承認待ちの正 = 画面の permission ダイアログ実在（#425）。
+                // 同じキャプチャからカード用スニペット・活動状態も導く（#621）
+                attach_card_summaries(&mut result, |target| {
+                    capture_pane_for_card(tmux_socket, target)
                 });
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
@@ -3058,10 +3089,10 @@ fn handle_request_v2(
                 // app 不在: tmux-only のペイン一覧を v2 形式で返す（#424:
                 // v1 形式では role / agent_type がなく master の識別ができない）
                 let mut result = tmux_list_panes_v2(tmux_socket, &live);
-                attach_permission_dialogs(&mut result, |session| {
-                    tako_core::tmux::capture_session(Some(tmux_socket), session).ok()
+                attach_card_summaries(&mut result, |target| {
+                    capture_pane_for_card(tmux_socket, target)
                 });
-                return respond(request, 200, Some(result.to_string()));
+                return respond_sensitive(request, 200, Some(result.to_string()));
             }
         }
     }
@@ -4320,16 +4351,16 @@ mod tests {
     }
 
     #[test]
-    fn attach_permission_dialogsはagentペインの画面ダイアログを付与する() {
+    fn attach_card_summariesはagentペインの画面ダイアログを付与する() {
         let mut result = json!({ "panes": [
             { "id": 648, "agent_type": "claude", "tmux_target": "tako-a:0.0" },
             { "id": 700, "agent_type": "claude", "tmux_target": "tako-b:0.0" },
             { "id": 701, "agent_type": "plain", "tmux_target": "tako-c:0.0" },
         ]});
         let captured = std::cell::RefCell::new(Vec::new());
-        attach_permission_dialogs(&mut result, |session| {
-            captured.borrow_mut().push(session.to_string());
-            if session == "tako-a" {
+        attach_card_summaries(&mut result, |target| {
+            captured.borrow_mut().push(target.to_string());
+            if target == "tako-a:0.0" {
                 Some(dialog_screen())
             } else {
                 // tako-b は通常画面（入力欄のみ）
@@ -4346,17 +4377,83 @@ mod tests {
             "通常画面には付与しない"
         );
         assert!(panes[2]["permission_dialog"].is_null(), "plain は対象外");
-        // plain ペインはキャプチャ自体もしない
-        assert_eq!(*captured.borrow(), vec!["tako-a", "tako-b"]);
+        // キャプチャはペイン単位で 1 回ずつ（plain も preview のために撮る。#621）
+        assert_eq!(
+            *captured.borrow(),
+            vec!["tako-a:0.0", "tako-b:0.0", "tako-c:0.0"]
+        );
     }
 
     #[test]
-    fn attach_permission_dialogsはキャプチャ失敗を無視する() {
+    fn attach_card_summariesは活動状態とスニペットを付与する() {
+        let mut result = json!({ "panes": [
+            { "id": 648, "agent_type": "claude", "tmux_target": "tako-a:0.0" },
+            { "id": 700, "agent_type": "claude", "tmux_target": "tako-b:0.0" },
+            { "id": 701, "agent_type": "plain", "tmux_target": "tako-c:0.0" },
+        ]});
+        attach_card_summaries(&mut result, |target| match target {
+            "tako-a:0.0" => Some(dialog_screen()),
+            "tako-b:0.0" => Some(vec![
+                "⏺ テストを実行します".to_string(),
+                "✽ Herding… (12s)".to_string(),
+                "──────".to_string(),
+                "❯ ".to_string(),
+                "  ctx 30%".to_string(),
+            ]),
+            _ => Some(vec![
+                "$ npm run dev".to_string(),
+                "ready in 320 ms".to_string(),
+            ]),
+        });
+        let panes = result["panes"].as_array().unwrap();
+        assert_eq!(
+            panes[0]["activity"].as_str(),
+            Some("permission"),
+            "ダイアログ実在なら承認待ち"
+        );
+        assert_eq!(panes[1]["activity"].as_str(), Some("busy"));
+        assert_eq!(
+            panes[1]["preview"].as_array().unwrap().last().unwrap(),
+            "✽ Herding… (12s)",
+            "入力欄・フッターを落とした中身が載ること"
+        );
+        assert!(
+            panes[2]["activity"].is_null(),
+            "plain の状態は OSC 133 が正なので活動状態は付けない"
+        );
+        assert_eq!(
+            panes[2]["preview"].as_array().map(Vec::len),
+            Some(2),
+            "plain にもスニペットは載せる"
+        );
+    }
+
+    #[test]
+    fn attach_card_summariesはキャプチャ失敗時にフィールドを省く() {
         let mut result = json!({ "panes": [
             { "id": 648, "agent_type": "claude", "tmux_target": "tako-a:0.0" },
         ]});
-        attach_permission_dialogs(&mut result, |_| None);
+        attach_card_summaries(&mut result, |_| None);
         assert!(result["panes"][0]["permission_dialog"].is_null());
+        // preview 欠落 = PWA が screen API へフォールバックする合図
+        assert!(result["panes"][0]["preview"].is_null());
+        assert!(result["panes"][0]["activity"].is_null());
+    }
+
+    #[test]
+    fn attach_card_summariesはtmuxを持たないペインを飛ばす() {
+        let mut result = json!({ "panes": [
+            { "id": 900, "agent_type": "plain", "tmux_target": Value::Null },
+            { "id": 901, "agent_type": "plain", "tmux_target": "" },
+        ]});
+        let calls = std::cell::RefCell::new(0);
+        attach_card_summaries(&mut result, |_| {
+            *calls.borrow_mut() += 1;
+            Some(vec!["x".to_string()])
+        });
+        assert_eq!(*calls.borrow(), 0, "プレビューペイン等はキャプチャしない");
+        assert!(result["panes"][0]["preview"].is_null());
+        assert!(result["panes"][1]["preview"].is_null());
     }
 
     #[test]
@@ -4543,8 +4640,34 @@ mod tests {
     fn kill_stale_daemonは存在しないpidで安全に完了する() {
         // cleanup_state_files が state_dir を掃除するため、env var 窓中の他テストを壊さないよう直列化
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // **state_dir をテンポラリへ差し替えてから呼ぶこと**。差し替えないと
+        // cleanup_state_files が本番 state（socket / pid / token）を消し、
+        // 稼働中の remote daemon が到達不能になる（`cargo test` のたびに
+        // スマホからの接続が黙って切れる。#621 の検証中に踏んだ）
+        let dir = std::env::temp_dir().join(format!("tako-test-kill-stale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
         // is_process_alive が false なので即 cleanup_state_files して return
         kill_stale_daemon(999_999_999);
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上のテストの回帰止め: state_dir 未差し替えで cleanup 系を呼ぶと
+    /// 本番 state を消しうることを、**消さずに**パス比較だけで示す
+    #[test]
+    fn state_dirは環境変数未設定なら本番ディレクトリを指す() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let production = state_dir();
+        let tmp = std::env::temp_dir().join(format!("tako-test-statedir-{}", std::process::id()));
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", tmp.as_os_str());
+        assert_eq!(state_dir(), tmp, "環境変数があればそちらを指す");
+        assert_ne!(
+            production, tmp,
+            "未設定時は本番 state を指す = 掃除系テストは必ず差し替えてから呼ぶ"
+        );
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
     }
 
     #[test]

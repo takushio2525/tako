@@ -5,7 +5,7 @@ import { test, expect } from '@playwright/test';
 
 const EVIDENCE_DIR = process.env.HOME + '/Desktop/tako-285-evidence';
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
-const BASE = 'http://localhost:5174';
+const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
 
 const FAKE_ME = {
   registered: true,

@@ -168,12 +168,13 @@ body {
 
 .panes-header {
   flex: none;
-  padding: 6px 18px 14px;
+  padding: 6px 18px 12px;
   padding-top: calc(8px + env(safe-area-inset-top, 0px));
   border-bottom: 1px solid var(--line);
 }
 .panes-header-row {
-  display: flex; align-items: center; justify-content: space-between; margin-bottom: 13px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 11px;
 }
 
 .machine-chip {
@@ -185,11 +186,27 @@ body {
   font-family: var(--mono); font-size: 14px; font-weight: 600;
 }
 
+/* 手動更新（プルリフレッシュが効かない場面用。タップ領域 40px 確保） */
+.refresh-btn {
+  width: 40px; height: 40px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 1px solid var(--line); border-radius: var(--radius-xs);
+  color: var(--fg2); cursor: pointer; transition: background .12s;
+}
+.refresh-btn:active { background: var(--panel3); }
+.refresh-btn.spinning svg { animation: spin .8s linear infinite; }
+
+.filter-row {
+  display: flex; gap: 7px; overflow-x: auto;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.filter-row::-webkit-scrollbar { display: none; }
+
 .filter-chip {
-  padding: 5px 11px; border-radius: var(--radius-xs);
-  font-family: var(--mono); font-size: 11px; white-space: nowrap;
+  padding: 8px 12px; border-radius: var(--radius-xs); min-height: 34px;
+  font-family: var(--mono); font-size: 11.5px; white-space: nowrap;
   cursor: pointer; border: 1px solid transparent;
-  display: inline-flex; align-items: center; gap: 5px;
+  display: inline-flex; align-items: center; gap: 6px;
   transition: background .12s; background: none;
 }
 .filter-chip.active { background: var(--fg); color: var(--bg); font-weight: 600; }
@@ -198,95 +215,177 @@ body {
 .filter-chip .chip-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
 
 .card-list {
-  flex: 1; overflow-y: auto; padding: 0 18px 18px;
+  flex: 1; overflow-y: auto; padding: 0 18px 24px;
   -webkit-overflow-scrolling: touch;
   transition: transform 0.15s ease-out;
 }
 
+/* ============================================================
+   タブグループ（#621: どのタブに何がいるかの俯瞰）
+   ============================================================ */
+
+.tab-group { margin-bottom: 6px; }
+.tab-group-header {
+  position: sticky; top: 0; z-index: 3;
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 2px 8px;
+  background: var(--bg);
+  font-family: var(--mono);
+}
+.tab-group-name {
+  font-size: 12px; font-weight: 600; color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tab-group-count {
+  font-size: 10px; color: var(--fg3);
+  background: var(--panel2); border-radius: 20px; padding: 1px 7px; flex-shrink: 0;
+}
+.tab-group-states { display: flex; gap: 3px; margin-left: auto; flex-shrink: 0; }
+.group-dot { width: 6px; height: 6px; border-radius: 50%; display: block; }
+.group-dot.state-permission { background: var(--amber); animation: takopulse 1.6s ease-in-out infinite; }
+.group-dot.state-busy       { background: var(--green); animation: takopulse 2s ease-in-out infinite; }
+.group-dot.state-error      { background: var(--red); }
+.group-dot.state-idle       { background: var(--fg3); }
+
+/* ============================================================
+   ペインカード
+   ============================================================ */
+
 .pane-card {
   position: relative; background: var(--panel); border: 1px solid var(--line);
   border-radius: 15px; margin-bottom: 11px; cursor: pointer; overflow: hidden;
-  transition: background .12s;
+  transition: background .12s, transform .1s;
 }
-.pane-card:active { background: var(--panel2); }
+.pane-card:active { background: var(--panel2); transform: scale(.995); }
 .pane-card .edge-bar { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
-.pane-card.state-running .edge-bar  { background: var(--green); }
-.pane-card.state-busy .edge-bar     { background: var(--amber); }
-.pane-card.state-error .edge-bar    { background: var(--red); }
-.pane-card.state-idle .edge-bar     { background: var(--fg3); }
-.pane-card.state-busy { border-color: rgba(232, 178, 62, .3); background: var(--panel2); }
 
-/* role 別の視覚区別 */
+/* 左端バーは「役割」を表す（誰のペインか）。状態はピルとドットが表す */
+.pane-card.role-master .edge-bar { background: var(--claude); width: 4px; }
+.pane-card.role-solo .edge-bar   { background: var(--blue); width: 4px; }
+.pane-card.role-worker .edge-bar { background: var(--green); }
+.pane-card.role-user .edge-bar   { background: var(--line2); }
 .pane-card.role-master { border-color: rgba(214, 121, 92, .35); }
-.pane-card.role-master .edge-bar { background: var(--claude) !important; width: 4px; }
+.pane-card.role-solo   { border-color: rgba(116, 182, 255, .3); }
 .pane-card.role-worker { border-color: rgba(94, 227, 160, .18); }
-.pane-card.role-user.state-idle:not(:active) { opacity: .6; }
+
+/* 要対応（承認待ち・停止）は枠と背景でも目立たせる */
+.pane-card.state-permission {
+  border-color: rgba(232, 178, 62, .45); background: var(--panel2);
+  box-shadow: 0 0 0 1px rgba(232, 178, 62, .12);
+}
+.pane-card.state-error {
+  border-color: rgba(240, 101, 90, .4); background: var(--panel2);
+}
+/* 待機中の素のシェルは情報量が低いので少し引く（見失わない程度に） */
+.pane-card.role-user.state-idle:not(:active) { opacity: .75; }
 
 .pane-card-header {
-  display: flex; align-items: flex-start; justify-content: space-between; padding: 12px 14px 6px 16px; gap: 8px;
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 12px 13px 8px 17px; gap: 8px;
 }
-.pane-card-left { display: flex; align-items: flex-start; gap: 9px; min-width: 0; flex: 1; }
+.pane-card-left { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
 .pane-card-titles { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden; }
 .pane-card-title {
-  font-family: var(--mono); font-size: 13px; font-weight: 600;
+  font-family: var(--mono); font-size: 14px; font-weight: 600; line-height: 1.25;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.pane-card-tab {
-  font-family: var(--mono); font-size: 10px; color: var(--fg3);
+.pane-card-sub {
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg3);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.pane-card-badges { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
-.role-badge {
-  font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 5px;
-  letter-spacing: .03em; text-transform: uppercase; font-weight: 600; flex-shrink: 0;
-}
-.role-badge.role-master { color: var(--claude); background: rgba(214, 121, 92, .15); }
-.role-badge.role-worker { color: var(--green); background: rgba(94, 227, 160, .12); }
-.role-badge.role-user { color: var(--fg3); background: var(--panel2); }
-.pane-card .state-badge {
-  font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 5px;
-  letter-spacing: .02em; text-transform: uppercase; flex-shrink: 0;
-}
-.pane-card.state-running .state-badge { color: var(--green); }
-.pane-card.state-busy .state-badge { font-weight: 600; color: var(--amber); background: rgba(232, 178, 62, .12); }
-.pane-card.state-error .state-badge { color: var(--red); }
-.pane-card.state-idle .state-badge { color: var(--fg3); }
-
-.pane-card-meta {
-  font-family: var(--mono); font-size: 10px; color: var(--fg3);
-  padding: 0 16px 5px; display: flex; align-items: center; gap: 6px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.worker-label {
-  color: var(--fg2); background: var(--panel2); padding: 1px 5px; border-radius: 4px;
-  font-size: 9px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-.pane-card-preview { padding: 0 14px 10px 16px; }
+/* 状態ピル — 一目で分かる部分 */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+  padding: 4px 9px; border-radius: 20px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.status-pill-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.status-pill.state-permission {
+  color: var(--amber); background: rgba(232, 178, 62, .14); border-color: rgba(232, 178, 62, .4);
+}
+.status-pill.state-permission .status-pill-dot { animation: takopulse 1.4s ease-in-out infinite; }
+.status-pill.state-busy {
+  color: var(--green); background: rgba(94, 227, 160, .12); border-color: rgba(94, 227, 160, .3);
+}
+.status-pill.state-busy .status-pill-dot { animation: takopulse 1.8s ease-in-out infinite; }
+.status-pill.state-error {
+  color: var(--red); background: rgba(240, 101, 90, .13); border-color: rgba(240, 101, 90, .35);
+}
+.status-pill.state-idle { color: var(--fg3); background: var(--panel2); border-color: var(--line); }
+
+/* 識別チップ（役割・エージェント・モデル・担当） */
+.pane-card-chips {
+  display: flex; flex-wrap: wrap; gap: 5px;
+  padding: 0 13px 9px 17px;
+}
+.card-chip {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .02em;
+  color: var(--fg3); background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px;
+  max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-chip-role { font-weight: 600; text-transform: uppercase; }
+.card-chip-role.role-master { color: var(--claude); background: rgba(214, 121, 92, .15); border-color: rgba(214, 121, 92, .3); }
+.card-chip-role.role-solo   { color: var(--blue); background: rgba(116, 182, 255, .14); border-color: rgba(116, 182, 255, .3); }
+.card-chip-role.role-worker { color: var(--green); background: rgba(94, 227, 160, .12); border-color: rgba(94, 227, 160, .28); }
+.card-chip-role.role-user   { color: var(--fg3); }
+.card-chip-agent { color: var(--fg2); }
+.card-chip-task { color: var(--fg2); }
+
+/* 承認待ち・停止の要点をカードに出す（開かなくても何が起きたか分かる） */
+.card-permission, .card-error {
+  display: flex; align-items: baseline; gap: 7px;
+  margin: 0 13px 9px 17px; padding: 7px 9px;
+  border-radius: 8px; font-family: var(--mono); font-size: 10.5px;
+  line-height: 1.45; min-width: 0;
+}
+.card-permission { background: rgba(232, 178, 62, .1); border: 1px solid rgba(232, 178, 62, .28); }
+.card-permission-label { color: var(--amber); font-weight: 600; flex-shrink: 0; }
+.card-permission-cmd {
+  color: var(--fg); font-family: var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.card-error { background: rgba(240, 101, 90, .1); border: 1px solid rgba(240, 101, 90, .26); }
+.card-error-kind { color: var(--red); font-weight: 600; flex-shrink: 0; }
+.card-error-detail {
+  color: var(--fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+
+/* 中身のスニペット */
+.pane-card-preview { padding: 0 13px 10px 17px; }
 .pane-card-preview-box {
-  font-family: var(--mono); font-size: 10px; line-height: 1.45;
+  position: relative;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
   color: var(--fg2); background: var(--bg);
   border: 1px solid var(--line); border-radius: 9px;
-  padding: 7px 9px; overflow: hidden; max-height: 180px;
+  padding: 8px 10px; overflow: hidden; max-height: 136px;
+}
+/* 溢れたときだけ切り口をぼかす */
+.pane-card-preview-box.has-more {
+  -webkit-mask-image: linear-gradient(180deg, #000 74%, transparent 100%);
+  mask-image: linear-gradient(180deg, #000 74%, transparent 100%);
 }
 .pane-card-no-terminal {
   display: flex; align-items: center; gap: 8px; color: var(--fg3);
-  font-family: var(--mono); font-size: 11px;
+  font-size: 11px;
   background: var(--panel2); border: 1px dashed var(--line2);
   border-radius: 9px; padding: 14px 12px;
 }
 
 .pane-card-footer {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 14px; border-top: 1px solid var(--line);
+  padding: 9px 14px 9px 17px; border-top: 1px solid var(--line);
 }
 .pane-card-footer .footer-meta { font-family: var(--mono); font-size: 10px; color: var(--fg3); }
-.pane-card-footer .footer-action { font-family: var(--mono); font-size: 11px; font-weight: 600; }
-.pane-card.state-busy .footer-action { color: var(--amber); }
-.pane-card.state-running .footer-action,
-.pane-card.state-idle .footer-action,
-.pane-card.state-error .footer-action { color: var(--fg2); }
-.pane-card.role-user.state-idle:not(:active) { opacity: .6; }
+.pane-card-footer .footer-action {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--fg2);
+}
+.footer-arrow { font-size: 13px; }
+.pane-card.state-permission .footer-action { color: var(--amber); }
+.pane-card.state-error .footer-action { color: var(--red); }
 
 .mono-line { white-space: pre-wrap; word-break: break-all; }
 .mono-line.faded { color: var(--fg3); }
@@ -328,6 +427,7 @@ body {
   background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 4px;
 }
 .skeleton-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.skeleton-icon { width: 26px; height: 26px; border-radius: 8px; display: inline-block; }
 .skeleton-text { height: 14px; display: inline-block; }
 .skeleton-line { height: 12px; margin-bottom: 6px; width: 100%; }
 
