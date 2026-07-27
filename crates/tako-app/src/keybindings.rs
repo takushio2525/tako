@@ -951,9 +951,11 @@ mod tests {
             "ctrl-w",
             "ctrl-x",
             "ctrl-y",
-            "ctrl-z", // readline の単語移動（\x1b[1;5C）
+            "ctrl-z",
+            // readline の単語移動（\x1b[1;5C）
             "ctrl-left",
-            "ctrl-right", // 素のキーと TUI が使う修飾キー
+            "ctrl-right",
+            // 素のキーと TUI が使う修飾つきキー
             "tab",
             "shift-tab",
             "enter",
@@ -961,7 +963,8 @@ mod tests {
             "ctrl-enter",
             "escape",
             "space",
-            "backspace", // #575 の meta 経路
+            "backspace",
+            // #575 の meta 経路
             "alt-v",
             "alt-b",
             "alt-f",
