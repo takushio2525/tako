@@ -10058,6 +10058,11 @@ impl TakoApp {
         } else {
             theme.line_height
         };
+        let font_px = if has_custom_font {
+            self.pane_font_size(pane_id)
+        } else {
+            theme.font_size
+        };
         let cell_width = self
             .pane_cell_sizes
             .get(&pane_id)
@@ -10106,10 +10111,16 @@ impl TakoApp {
                         .iter()
                         .map(|run| (run.range.clone(), self.run_highlight(run)))
                         .collect();
-                    return div().h(px(line_h)).whitespace_nowrap().child(
-                        StyledText::new(line.text)
-                            .with_default_highlights(&default_style, highlights),
-                    );
+                    return div()
+                        .h(px(line_h))
+                        // 下記 row と同じ理由（#610）。行 div の高さと行ボックスを一致させる
+                        .text_size(px(font_px))
+                        .line_height(px(line_h))
+                        .whitespace_nowrap()
+                        .child(
+                            StyledText::new(line.text)
+                                .with_default_highlights(&default_style, highlights),
+                        );
                 }
                 // 同スタイルの連続半角文字をグループ化して描画要素数を削減。
                 // 全角文字（char_cols > 1）とセル幅不一致グリフ（snaps == false）は
@@ -10124,6 +10135,18 @@ impl TakoApp {
                 let cw = cell_width.unwrap();
                 let row = div()
                     .h(px(line_h))
+                    // ディセンダー（g / q / y / p）の欠けを防ぐ（#610）。
+                    // GPUI の StyledText は **フォントサイズと行高を `window.text_style()`
+                    // （= 要素ツリーを継承したテキストスタイル）から取る**。
+                    // `with_default_highlights` に渡す TextStyle は TextRun（フォント・色・
+                    // 装飾）にしか反映されず、そこに書いた line_height は行ボックスに効かない。
+                    // 継承側で行高を指定しないと GPUI 既定の `phi()`（= 1.618 × フォント
+                    // サイズ ≒ 21px）が使われ、17px の行 div より行ボックスが高くなる。
+                    // 行ボックス内でベースラインは (行高 - ascent - descent) / 2 + ascent に
+                    // 置かれるため、ベースラインが約 2px 下がってディセンダーが行 div の
+                    // overflow_hidden の外へ出て切れる。継承側を行 div と揃えて根治する
+                    .text_size(px(font_px))
+                    .line_height(px(line_h))
                     .flex()
                     .flex_row()
                     .overflow_hidden()

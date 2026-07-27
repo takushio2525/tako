@@ -1401,3 +1401,15 @@
 - B17 に `set_candidate_exclusion()`（`CFS_EXCLUDE` + 未確定文字列の矩形）を追加。基準点は不変
 - 実測（1920x1080 @ 125%・入力行セル 物理 y=930..951）: 候補ウィンドウ 662..948（覆う）→
   642..928（覆わない）。余白があるときは 335..621 → 312..598 で入力行の直下に密着
+
+## 2026-07-27（#610: ターミナルのディセンダー欠けを根治 — 行高の継承漏れ）
+- 真因は GPUI の `StyledText` が**行高とフォントサイズを `window.text_style()`（継承側）から取る**こと。
+  `with_default_highlights` に渡す TextStyle は TextRun にしか効かず、tako は行高を継承側で
+  一度も指定していなかったため既定の `phi()`（1.618×13px ≒ 21px）が使われ、17px の行 div +
+  `overflow_hidden` の外へベースラインが約 2px 落ちて g/q/y/p の下部が切れていた
+- 修正は行 div に `.text_size(px(font_px))` + `.line_height(px(line_h))` の 2 行のみ。
+  セル寸法・クリック判定・IME アンカーは不変（行ボックス内のベースライン位置だけが変わる）
+- 実測（125% DPI）: `q` の ink 10 → 12 物理行（あるべき 12.2）。副次的に SGR 4 の下線
+  （丸ごと消えていた）とペイン単位フォント拡大（グリフが 13px のままだった）も回復
+- 検証: fmt / clippy（baseline と完全一致・新規 0）/ tako-app 220 passed 0 failed +
+  隔離 GUI の before/after ピクセル実測。macOS は未コンパイル・未目視（mac 側で要確認）
