@@ -1832,14 +1832,54 @@ fn migrate_legacy_model_file(path: &Path) -> Option<String> {
     ))
 }
 
-/// `claude agents --json` をログインシェル経由で実行する。
+/// エージェント列挙の走査先（claude の config ディレクトリ。Issue #571）。
+///
+/// `claude agents --json` が返すのは**その config ディレクトリに属するエージェントだけ**。
+/// tako はアカウント切替（#504 / #512）で複数の config ディレクトリのペインを
+/// 同時に抱えるため、1 つだけを見ると他アカウントの worker が「存在しない」ことになる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentScanTarget {
+    /// `CLAUDE_CONFIG_DIR` を明示 unset して既定（`~/.claude`）を見る
+    Default,
+    /// `CLAUDE_CONFIG_DIR` にこのパスを設定して見る
+    ConfigDir(String),
+}
+
+/// エージェント列挙で走査すべき config ディレクトリ一覧（純関数。テスト可能）。
+///
+/// 先頭は必ず `Default`。tako 自身のプロセス環境に `CLAUDE_CONFIG_DIR` が紛れ込んでいても
+/// （GUI をアカウント env つきのペインから起動すると起きる。#571 の実害）
+/// 既定 config dir のエージェントを必ず観測するため。
+/// 続いて accounts.yaml の `config_dir` を重複排除して並べる
+pub fn agent_scan_targets(accounts: &AccountsConfig) -> Vec<AgentScanTarget> {
+    let mut targets = vec![AgentScanTarget::Default];
+    for (_, resolved) in accounts.list_resolved() {
+        let Ok(account) = resolved else { continue };
+        let Some(path) = account.config_dir.path() else {
+            continue; // inherit = 既定。Default で観測済み
+        };
+        if is_claude_default_config_dir(path) {
+            continue;
+        }
+        let target = AgentScanTarget::ConfigDir(path.to_string());
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+/// `claude agents --json` をログインシェル経由で、**登録済み config ディレクトリすべて**に
+/// 対して実行し、結果を 1 本の JSON 配列へマージして返す（Issue #571）。
+///
 /// .app バンドル（Dock 起動）の PATH は最小構成で `claude` が見つからないため、
-/// `$SHELL -l -c "claude agents --json"` でユーザーの PATH を使う。
+/// `$SHELL -l -c "…"` でユーザーの PATH を使う。
+/// `CLAUDE_CONFIG_DIR` は**プロセス環境から継承せず**、走査先ごとに明示指定する
+/// （継承すると、tako を起動したペインのアカウントに観測範囲が縛られる = #571 の根因）。
 ///
 /// Issue #168: ログインシェル + Node CLI の起動は 1 回 500ms〜1s かかる。master の
-/// watch / worker_status が数秒間隔 × worker 数で呼ぶため、TTL 内は前回結果を返し、
-/// 実行自体もロック保持で直列化する（多重呼び出しでプロセスが並んで起動しない。
-/// 並行呼び出しは実行完了を待って fresh な結果を受け取る）
+/// watch / worker_status が数秒間隔 × worker 数で呼ぶため、TTL 内は前回結果を返す。
+/// 走査先が複数あっても待ち時間を増やさないよう、各走査は並行に実行する
 pub(crate) fn run_claude_agents_json() -> Option<Vec<u8>> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -1853,18 +1893,51 @@ pub(crate) fn run_claude_agents_json() -> Option<Vec<u8>> {
             return value.clone();
         }
     }
-    let result = run_claude_agents_json_uncached();
+    let targets = agent_scan_targets(&AccountsConfig::load().unwrap_or(AccountsConfig {
+        accounts: std::collections::BTreeMap::new(),
+    }));
+    let result = run_claude_agents_json_uncached(&targets);
     *cache = Some((Instant::now(), result.clone()));
     result
 }
 
-fn run_claude_agents_json_uncached() -> Option<Vec<u8>> {
+/// 全走査先を並行実行し、`sessionId` で重複排除してマージする。
+/// 1 つでも成功すればその結果を返す（全滅時のみ None = 従来の「取得失敗」）
+fn run_claude_agents_json_uncached(targets: &[AgentScanTarget]) -> Option<Vec<u8>> {
+    let outputs: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|t| scope.spawn(move || run_claude_agents_json_for(t)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    });
+    merge_agents_json(&outputs)
+}
+
+/// 単一走査先に対する `claude agents --json` の実行
+fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
-    let output = std::process::Command::new(&shell)
-        .args(["-l", "-c", "claude agents --json"])
+    let mut command = std::process::Command::new(&shell);
+    // プロセス環境と、ログインシェルの rc（direnv 等）の両方に勝つ必要がある。
+    // rc はコマンド文字列より先に走るので、決め手は先頭の unset / export の方（#512 と同型）
+    let prefix = match target {
+        AgentScanTarget::Default => {
+            command.env_remove(CLAUDE_CONFIG_DIR_ENV);
+            format!("unset {CLAUDE_CONFIG_DIR_ENV}; ")
+        }
+        AgentScanTarget::ConfigDir(path) => {
+            command.env(CLAUDE_CONFIG_DIR_ENV, path);
+            format!("export {CLAUDE_CONFIG_DIR_ENV}={}; ", agent::sh_quote(path))
+        }
+    };
+    let output = command
+        .args(["-l", "-c", &format!("{prefix}claude agents --json")])
         .output()
         .ok()?;
     if output.status.success() {
@@ -1872,6 +1945,39 @@ fn run_claude_agents_json_uncached() -> Option<Vec<u8>> {
     } else {
         None
     }
+}
+
+/// 走査結果のマージ（純関数。テスト可能）。
+/// 配列としてパースできた出力だけを採用し、`sessionId` の重複は先勝ちで落とす
+fn merge_agents_json(outputs: &[Option<Vec<u8>>]) -> Option<Vec<u8>> {
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut any_ok = false;
+    for out in outputs.iter().flatten() {
+        let Ok(text) = std::str::from_utf8(out) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(text)
+        else {
+            continue;
+        };
+        any_ok = true;
+        for item in items {
+            // sessionId が引けないエントリは重複排除できないのでそのまま通す
+            match item["sessionId"].as_str() {
+                Some(sid) if !sid.is_empty() => {
+                    if seen.insert(sid.to_string()) {
+                        merged.push(item);
+                    }
+                }
+                _ => merged.push(item),
+            }
+        }
+    }
+    if !any_ok {
+        return None;
+    }
+    serde_json::to_vec(&serde_json::Value::Array(merged)).ok()
 }
 
 /// `claude agents --json` から指定 session_id の status と ctx% を取得する
@@ -3842,5 +3948,85 @@ worker_agents:
         // projects 未指定は常に OK
         let p3 = Profile::default();
         assert!(p3.validate_projects_with(&config).is_ok());
+    }
+
+    // --- #571: エージェント列挙を config ディレクトリ横断にする ---
+
+    fn accounts_from(yaml: &str) -> AccountsConfig {
+        serde_yaml::from_str(yaml).expect("accounts.yaml をパースできる")
+    }
+
+    #[test]
+    fn agent_scan_targetsは既定を先頭に置き登録済みconfig_dirを並べる() {
+        let config = accounts_from(
+            "accounts:\n  \
+             beta:\n    config_dir: /tmp/claude-beta\n  \
+             shared:\n    inherit: true\n  \
+             alpha:\n    config_dir: /tmp/claude-alpha\n",
+        );
+        assert_eq!(
+            agent_scan_targets(&config),
+            vec![
+                AgentScanTarget::Default,
+                AgentScanTarget::ConfigDir("/tmp/claude-alpha".into()),
+                AgentScanTarget::ConfigDir("/tmp/claude-beta".into()),
+            ],
+            "inherit は Default に含まれるので重複させない（列挙順は accounts の BTreeMap 順）"
+        );
+    }
+
+    #[test]
+    fn agent_scan_targetsは既定パスの明示指定と壊れたエントリを弾く() {
+        let default = claude_default_config_dir().expect("既定 config dir");
+        let config = accounts_from(&format!(
+            "accounts:\n  \
+             explicit:\n    config_dir: {}\n  \
+             broken:\n    inherit: true\n    config_dir: /tmp/x\n  \
+             empty:\n    description: dummy\n",
+            default.display()
+        ));
+        assert_eq!(
+            agent_scan_targets(&config),
+            vec![AgentScanTarget::Default],
+            "既定パスの明示指定は Default と同じ場所。壊れたエントリは無視する"
+        );
+    }
+
+    #[test]
+    fn agent_scan_targetsはアカウント未登録でも既定を返す() {
+        let config = accounts_from("accounts: {}\n");
+        assert_eq!(agent_scan_targets(&config), vec![AgentScanTarget::Default]);
+    }
+
+    #[test]
+    fn merge_agents_jsonはsession_idで重複排除して結合する() {
+        let a = br#"[{"sessionId":"s1","pid":1},{"sessionId":"s2","pid":2}]"#.to_vec();
+        let b = br#"[{"sessionId":"s2","pid":2},{"sessionId":"s3","pid":3}]"#.to_vec();
+        let merged = merge_agents_json(&[Some(a), Some(b)]).expect("結合できる");
+        let v: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        let ids: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["s1", "s2", "s3"]);
+    }
+
+    #[test]
+    fn merge_agents_jsonは一部失敗でも成功分を返し全滅でnoneになる() {
+        let ok = br#"[{"sessionId":"s1"}]"#.to_vec();
+        let merged = merge_agents_json(&[None, Some(ok), Some(b"not json".to_vec())])
+            .expect("成功した走査先があれば Some");
+        let v: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+
+        assert!(
+            merge_agents_json(&[None, None]).is_none(),
+            "全滅は従来どおり取得失敗（画面推定へフォールバック）"
+        );
+        // 「成功したが 0 件」は失敗ではない（該当アカウントに稼働中エージェントが無いだけ）
+        let empty = merge_agents_json(&[Some(b"[]".to_vec())]).expect("空配列は成功");
+        assert_eq!(empty, b"[]");
     }
 }
