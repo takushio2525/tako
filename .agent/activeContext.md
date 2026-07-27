@@ -4,36 +4,36 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-27 夜・検知系 + UX + リリース基盤の 12 件を完遂 → v0.6.0 準備）
+## 現在の対象（2026-07-27 夜・v0.6.0 安定版リリース完了）
 
-本日 merge 済み（すべて macOS CI 緑・install 済み・Issue CLOSED）:
-- 検知系根治: #571（watch WORKER_IDLE）/ #572（busy 中入力のキュー化誤検知）/ #577（PERMISSION 検知）/
-  #566（close ガード）/ #567（stale pane fallback）/ #599（セルフテスト 87）
-- CI: #574（PWA ビルド工程 + Windows 非ブロッキング。**以後の合格条件 = macOS 全ジョブ緑**）
-- UX: #549（初回バナー + パレット導線）/ #552（自動リネーム品質 4 点）/ #589（ツリー線）/
-  #590（リモートインジケータ常時表示 + GUI 起動）/ #600（入力予測 zsh-autosuggestions 既定 ON）/
-  #601（tako 内シェルへの PATH 自動注入）
-- リリース基盤: #594 + #595（アセット命名規則の一元化 / 更新チェッカの自 OS フィルタ /
-  release.sh の `--notes-only` `--update-notes`）
-
-main 先端 = `c2c9350`。/Applications = 0.5.13（今夜の全修正入り）。
+- tag `v0.6.0`（annotated）+ GitHub Release = **Latest**（prerelease/draft = false）。
+  アセット `tako-v0.6.0-macos-arm64.zip`（16,283,465 B / sha256 `33bad2e0…`）
+  https://github.com/takushio2525/tako/releases/tag/v0.6.0
+- CHANGELOG に `[0.6.0]` を新設（v0.5.9 以降 = nightly 0.5.10〜0.5.13 + 未リリース分 +
+  07-27 の 12 件を日英併記で統合）。`[Unreleased]` は空。main = `29837da`
+- homebrew-tako cask 0.5.9 → 0.6.0（`acf412e`）。`brew fetch --cask` で sha256 実検証済み
+- `/Applications/tako.app` = 0.6.0（CLI も 0.6.0）。**本番 GUI プロセスは 0.5.13 のまま**
+- リリースノートは #594 の新機構を初適用（ダウンロード表 + macOS 手順を実アセットから生成）
 
 ## 次の一手
 
-1. **GUI 再起動**（master が実施。必ず `env -u CLAUDE_CONFIG_DIR open -a /Applications/tako.app`）
-2. ユーザー目視: 初回バナー(#549)/リモートインジケータ(#590)/入力予測(#600)/ツリー線(#589)/
+1. **GUI 再起動**（必ず `env -u CLAUDE_CONFIG_DIR open -a /Applications/tako.app`）→ 0.6.0 反映
+2. 再起動後に `tako update check` が `{"available": false}` になることを本番でも確認
+   （0.6.0 の隔離インスタンスでは検証済み）
+3. ユーザー目視: 初回バナー(#549)/リモートインジケータ(#590)/入力予測(#600)/ツリー線(#589)/
    #562 マージ導線 / #496 カード / #561 実 IME
-3. **v0.6.0 安定版リリース**（ユーザー決定済み。#287 レビュー GO + スマホ実機確認 07-27 済み）:
-   CHANGELOG 整理（nightly 0.5.10〜14 分を [0.6.0] へ日英併記）→ Cargo.toml 0.6.0 →
-   `release.sh --publish` → homebrew-tako cask → install
-4. リリースノート運用は #594 の新機構（ダウンロード表 / Known limitations / タグ規約）を初適用
+4. #434 の宣伝タスク（紹介動画 v3・README・docs の v0.6.0 追従）
 
 ## 未着手・持ち越し
 
+- **Known limitations (Windows) 節はノートに出ていない**（#594 の設計どおり Windows
+  アセットがあるときだけ付く）。Windows 版を同タグに後付けしたら
+  `scripts/release.sh --update-notes v0.6.0` で作り直す
+- cask の caveats が「未署名のため」と書いているが実際は Apple Development 署名済み
+  （Developer ID / notarization が無いだけ）。文面の是正は未着手
 - #601 案 2（外部ターミナル向け PATH 設置）= FR-2.14.5 / #608（表示言語グローバル競合フレーク）/
   #592（Windows watch 検知）/ #583（Windows テスト 19 件）
 - キュー: #519 ⑤⑥ / #513 / #542 / #541 Phase 2 / Windows #467→#517
-- セルフテストは worker 並走の高負荷（load 16〜32）でフレークしやすい（#212 系。単独再実行で緑）
 
 ## GUI 検証の環境知見（次回の時間浪費を防ぐ）
 
@@ -41,18 +41,17 @@ main 先端 = `c2c9350`。/Applications = 0.5.13（今夜の全修正入り）�
 - **画面ロック / スクリーンセーバー中も不可**: `screencapture` が黒画かロック画面になり、
   `count of windows` = 0 になる（プロセス生死とは無関係。#549 検証で判明）
 - **`cargo test` は起動用バイナリを更新しない**: GUI 実測の前に `cargo build` が要る
-  （#549 検証で偽の不具合を 1 ラウンド追った）
 - **`open` は呼び出し元シェルの env を継承する**: master ペインからの再起動は
   `env -u CLAUDE_CONFIG_DIR open -a tako` が必須（素の open で univ が混入 = #571 の再現条件）
-- 蓋が開いていれば `cliclick` 実クリック + `screencapture -R` で実機検証可。合成キーボード入力は
-  IME に吸われるため不可（キー検証はセルフテストで）
-- この機には日本語入力ソースが無い（IME 実変換の検証はユーザー実機のみ）
+- **隔離インスタンスへの CLI 接続**: `TAKO_ISOLATED=1` の discovery は
+  `$TMPDIR/tako-iso-discovery-<pid>/control.json`。そこの socket / token を
+  `TAKO_SOCKET` / `TAKO_TOKEN` に渡すと本番に触れずに dispatch を叩ける
+  （v0.6.0 の「更新なし」検証はこの方法で実施）
 - **`git stash` はリポジトリ共有**（worktree でも）。退避は `git diff > patch` を使う
-- 本番 tako と隔離インスタンスの並走時、クリック前に CGWindowList で最前面を確認する
 
 ## 現フェーズで Read すべき設計書
 
-- リリース作業: `scripts/release.sh`（#594 で `--notes-only` / `--update-notes` 追加）+ `CHANGELOG.md`
+- リリース作業: `scripts/release.sh`（`--notes-only` / `--update-notes`）+ `CHANGELOG.md` +
+  `.agent/conventions.md`「CHANGELOG / リリースノートのプラットフォーム表記」
 - Windows 移植を進める: `.agent/plans/2026-07-windows-port-architecture.md` + `.agent/windows-setup.md`
 - 検知系に手を入れる: `crates/tako-control/src/claude_tui.rs` + `dispatch.rs` + `orchestrator/wait.rs`
-  （#571/#572/#577 で画面判定・キュー検知・permission 実在検査が入った）

@@ -1513,3 +1513,14 @@
   fish_prompt）で、tako が他に見つからないときだけ PATH 末尾へ追加。rc 非侵襲・
   `TAKO_NO_PATH_INJECTION=1` で無効化。`tako_check_health` に `injected_cli_dir`
 - 関連コミット: `c2c9350`（PR #613 squash merge）。案 2（外部ターミナル向け設置）は FR-2.14.5 に残
+
+## 2026-07-27（v0.6.0 安定版リリース）
+- CHANGELOG に `[0.6.0]` を新設（v0.5.9 以降 = nightly 0.5.10〜0.5.13 + 未リリース 2 ブロック +
+  本日の 12 件を日英併記で統合・タグ規約準拠）。`[Unreleased]` を空に、未公開だった
+  `[0.6.0-test.1]` 節に「未公開」注記。Cargo.toml / lock を 0.6.0 へ bump
+- tag `v0.6.0` + GitHub Release を **Latest** で公開（#594 の新ノート機構を初適用 =
+  実アセットからダウンロード表 + macOS 手順を生成。Known limitations は Windows アセットが
+  無いため設計どおり非表示）。cask 0.5.9→0.6.0（`brew fetch` で sha256 実検証）、
+  /Applications = 0.6.0、0.6.0 隔離インスタンスで `update check` = `{"available": false}` を実測
+- 関連コミット: `29837da`（tako）/ `acf412e`（homebrew-tako）、tag `v0.6.0`
+- 次: GUI 再起動で本番反映 → 目視確認 → #434 の宣伝タスク
