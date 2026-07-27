@@ -703,3 +703,92 @@ Windows 実機なしで先取りすることに等しい。#519 の主要な検�
 - `crates/tako-control/src/host.rs:74-135`（`ControlHost` の既存 backend 系メソッド）
 - `crates/tako-app/src/ui_text/settings.rs:167-190`（既存の縮退表示文言）
 - `crates/tako-app/testdata/mcp_tools_snapshot.txt`（116 ツール。マトリクスのキー体系）
+
+---
+
+## 11. M2 実装記録: 器は自作せず psmux を採る（2026-07-27・#519）
+
+§2.2 は案 B-1（器だけのセッションホスト）を「後から差し込む後継 impl」として温存し、
+§9-1 で「Windows 初期リリースが『tako を閉じるとエージェントが死ぬ』ことを受容するか」を
+master 判断に残していた。**受容しない**方向で判断が出たので、B-1 を実装した。
+ただし**自作（winmux）ではなく既存 OSS の psmux**（MIT / Rust 製 / tmux 互換 CLI）を器にする。
+
+適合検証は別途実施済み（レポート実体はリポジトリ外の作業ディレクトリ）。要旨:
+
+- M0（`poc/conpty-survival/`）が洗い出した 7 罠のうち **6 つを psmux は既に越えている**。
+  残り 1 つ（Job object 配下では永続化が無効）は自作でも同じ制約
+- tako を強制 kill してもサーバー・シェル・scrollback が**欠落ゼロで生存**
+- 能力は §2.2 の B-1 そのもの（`survives_app_exit=true` / `detached_access=false` /
+  `scrollback=InProcess`）
+
+**§3.6 の合格条件は満たされた**: `Choice` に実装を 1 つ足すだけで器が生え、
+呼び出し側の変更は #177 の強奪ガード 1 箇所のみ（下記 (7) の理由による意図的な変更）。
+
+### 11.1 案 1（TmuxBackend の流用）が不可である理由
+
+psmux は tmux 互換を名乗るが、**コマンドごとに互換の深さが違う**。tako は全経路で
+`=`（exact-match 接頭辞）付きターゲットを使うが、`kill-session -t =name` は psmux で
+**3/3 決定的に失敗する（各 5.1 秒ブロック）**。流用するとペインを閉じるたびに器と
+pwsh がリークし、close が 5 秒固まる。
+
+### 11.2 実装が満たしている受け入れ条件（すべてテストつき）
+
+| # | 条件 | 実装 |
+|---|---|---|
+| 1 | ターゲットに `=` を付けない | `PsmuxBackend::target`。前方一致で別の器を巻き込まないことも実測 |
+| 2 | `show-environment` は全変数から `K=` 行を選ぶ | `select_env_value`（純関数 + 実バイナリ往復） |
+| 3 | `#{history_bytes}` に依存しない | `detached()` が `None` = probe 経路を**構造的に持たない** |
+| 4 | `pane_tty` は `None` | psmux は実在しない `/dev/pty1` を返す。境界の外へ出さない |
+| 5 | conf に `set -g warm off` | 常駐 +243MB → +131MB/session。**psmux が知らない行を書くとペインへ警告が出る**ので、受理を実測した行だけを置く |
+| 6 | バージョン固定 + 起動時プローブ | `VERIFIED_VERSION` 以外は `behavior_probe`（作る → 見つける → 壊す）で採否を決め、駄目なら Null へ明示縮退 |
+| 7 | 多重起動安全性 | 下記 §11.3 |
+| 8 | tmux 誤判別ガード | 下記 §11.4 |
+
+### 11.3 多重起動安全性: 器に尋ねられないので tako 側で記録する
+
+psmux は `list-clients -F` を無視してクライアント PID を返さず、`new-session -D` でも
+他クライアントを切り離さない。**§8.1 の I3（#177 の復元強奪ガード）が器側から観測できない。**
+
+さらに Windows では `ports::is_live_tako_app` が常に `false` を返すため、
+discovery ベースの多重起動ガード（#113）も**構造的に効かない**。
+つまり 2 個目を止められる仕組みが 1 つも無い状態だった。
+
+対策として `backend/owner.rs` を新設し、**OS のファイルロックを生存の証明に使う**
+（`<data_dir>/backend-owners/<session>.<pid>.owner` を所有インスタンスが
+プロセスの生存中ずっと排他ロックする）。PID の生死判定もプロセス名の照合も要らず、
+tako が異常終了してもハンドルは OS が閉じるので記録が居座らない。
+
+`Holder` に `kind` を足し、tmux（クライアント PID = 呼び出し側が祖先辿り）と
+psmux（所有インスタンス PID = 生存確認済み）を型で区別する。**呼び出し側の変更は
+この 1 箇所だけ**で、tmux 側の判定は 1 ミリも変えていない。
+
+実測（隔離・Windows）: discovery だけ隔離した 2 個目を起動すると
+「復元スキップ: 復元対象のバックエンドセッション <名前> を別の tako（pid N）が使用中」で
+セカンダリへ降格し、1 個目のペインは attach を保ったまま操作できた。
+
+### 11.4 tmux 誤判別ガード（配布前に必須だった穴）
+
+psmux は `psmux.exe` / `pmux.exe` / `tmux.exe` の 3 本を配り、`-V` の 1 行目で
+`tmux 3.3.7` を**詐称**する（素性は 2 行目）。従来の `tmux -V` 判定では
+psmux を `Choice::Tmux` と誤認し、「器は作れるが kill が効かない」半端に壊れた
+永続化になっていた。`backend::Binary` を新設して `-V` の 2 行目で判別する。
+
+あわせて **Windows では本物の tmux（MSYS2 / Cygwin 版）も器に選ばない**。
+ネイティブの ConPTY シェルを抱えられず、`-f` の Windows パスも解釈できないため、
+器があるように見えて壊れているより構成のみ永続化へ倒す方が安全。
+
+### 11.5 psmux の導入経路（現時点の方針）
+
+**当面はユーザー導入**（winget / scoop）+ 未導入時は Null へ縮退して案内する。
+インストーラー同梱（MIT なので同梱自体は可能。7MB）は今回のスコープ外。
+同梱すると「ゼロコンフィグで完全復元」になる代わりに、psmux の更新追従と
+配布物の肥大を tako が抱える。判断は配布前（テスター展開時）に行う。
+
+### 11.6 M2 で変わらなかったもの
+
+- **macOS の挙動は不変**（分岐は `backend/` の内側。TmuxBackend の argv スナップショットも不変）
+- §4 の縮退定義と §6 の UI 表示方針は**そのまま必要**（psmux 未導入環境は NullBackend のまま）
+- §5 の orchestrator 縮退（PID レジストリ / report の pane_log 第 1 層 / delivery 表示）も
+  **そのまま残る**。psmux は `detached_access=false` なので役割 B は依然として無い
+- pane_log は器の中を記録しない（到達手段が無いため 2 秒ごとの probe を撃たない）。
+  §4.1 の #6 に対する Windows での確定挙動

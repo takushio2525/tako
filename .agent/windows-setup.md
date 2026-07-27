@@ -60,6 +60,28 @@ winget install --id OpenJS.NodeJS.LTS
 Node.js が要るのは、リモート用 PWA（`web/tako-remote`）を `rust_embed` でバイナリに
 埋め込むため。**`dist` が無いと `tako-control` がコンパイルできない。**
 
+## 3.5. psmux（セッション永続化の器。任意だが強く推奨。#519 M2）
+
+```powershell
+winget install --id psmux.psmux    # または scoop install psmux
+psmux -V                           # 2 行目に psmux <version> が出れば OK
+```
+
+Windows の永続バックエンド（tako を閉じても実行中プロセスと画面が生き残る器）は
+psmux が担う。**入れなくても tako は動く**が、その場合はタブ・ペイン構成と cwd だけの
+復元になり、実行中のエージェントは tako 終了時に止まる。
+
+- 適合検証済みバージョンは `tako-core::backend::psmux::VERIFIED_VERSION`。
+  違うバージョンでも起動時プローブ（器を作る → 見つける → 壊す）が通れば使う。
+  通らなければ警告を出して構成のみ復元へ落ちる
+- 導入したか・器として使われているかは `tako persist` の `backend.label` で分かる
+  （`psmux` なら器あり、`none` なら構成のみ）
+- PATH に置かず試すなら `TAKO_PSMUX_BIN=<psmux.exe のパス>` で明示指定できる
+- psmux は `tmux.exe` も PATH に置くが、tako は `-V` の 2 行目で正体を判別するので
+  本物の tmux と取り違えない。**素の `tmux kill-server` を打つと `-L` を越えて
+  tako の器まで全滅する**（psmux の実測挙動）ので、器を掃除したいときは
+  `tako recover` か `psmux -L tako kill-server` を使うこと
+
 ## 4. リポジトリの取得
 
 ```powershell
