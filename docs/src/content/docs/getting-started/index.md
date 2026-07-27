@@ -73,9 +73,11 @@ unzip tako-*.zip
 mv tako.app /Applications/
 ```
 
-#### PATH を通す（ZIP の場合のみ）
+**tako を起動して、その中のターミナルで使う分には、これで準備完了です。** tako が開くシェルには `tako` コマンドの置き場所が自動で追加されるので、[クイックスタート](/getting-started/quickstart/)の `tako setup` はそのまま打てます。
 
-「PATH を通す」とは、ターミナルのどこからでも `tako` とだけ打てばコマンドが使えるようにする設定です。Homebrew なら自動ですが、ZIP の場合は手動で登録します。
+#### 外部ターミナルでも使いたい場合（ZIP のみ・任意）
+
+Terminal.app や iTerm2 など **tako の外**のターミナルからも `tako` と打ちたいときだけ、PATH に登録します（Homebrew なら自動）。
 
 ```bash
 # zsh（macOS 標準のシェル）の場合
@@ -277,7 +279,7 @@ Homebrew 経由なら `brew upgrade --cask takushio2525/tako/tako` でも更新�
 
 ### `tako` コマンドが見つからない（command not found）
 
-PATH が通っていません。Homebrew でインストールした場合はターミナルを開き直してみてください。ZIP からインストールした場合は上記の「PATH を通す」手順を確認してください。
+**tako の中のターミナル**で出た場合は、tako を再起動してみてください（`tako` の置き場所は tako の起動時に解決されます）。**tako の外**のターミナルで出た場合は PATH が通っていません。Homebrew でインストールした場合はターミナルを開き直し、ZIP からインストールした場合は上記の「外部ターミナルでも使いたい場合」の手順を実施してください。
 
 ### `tako setup` が「エージェント CLI が見つかりません」と言う
 

@@ -6759,15 +6759,37 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let app_version = env!("CARGO_PKG_VERSION").to_string();
     let mut issues: Vec<Value> = Vec::new();
 
-    // tako CLI が PATH に通っているか
+    // tako CLI が PATH に通っているか。
+    // ここで見るのは tako-app のプロセス環境（Dock 起動だと最小構成）なので、
+    // 「tako 内のシェルから打てるか」とは別物である点に注意（#601）
     let cli_path = which("tako");
     let cli_in_path = cli_path.is_some();
+    // #601: tako が開くシェルへ自動注入している CLI ディレクトリ（解決できなければ null）
+    let injected_cli_dir = tako_core::shell_integration::cli_dir();
     if !cli_in_path {
+        // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも
+        // 使いたい人向けの案内に落とす（level を下げても対処法は示し続ける）
+        let (level, message) = match injected_cli_dir.as_deref() {
+            Some(dir) => (
+                "info",
+                format!(
+                    "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
+                     tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は\
+                     このディレクトリを PATH に追加すること",
+                    dir.display()
+                ),
+            ),
+            None => (
+                "error",
+                "tako CLI が PATH に見つからない。.app バンドル内の CLI を PATH に追加するか、\
+                 scripts/build-app.sh --install でインストールすること"
+                    .to_string(),
+            ),
+        };
         issues.push(json!({
-            "level": "error",
+            "level": level,
             "check": "cli_in_path",
-            "message": "tako CLI が PATH に見つからない。.app バンドル内の CLI を PATH に追加するか、\
-                scripts/build-app.sh --install でインストールすること",
+            "message": message,
         }));
     }
 
@@ -6836,6 +6858,8 @@ fn check_health(host: &dyn ControlHost) -> Value {
         "app_version": app_version,
         "cli_version": cli_version,
         "cli_in_path": cli_in_path,
+        // tako 内のシェルへ自動で PATH 追加している CLI ディレクトリ（#601）
+        "injected_cli_dir": injected_cli_dir.map(|d| d.display().to_string()),
         "version_match": version_match,
         "tmux_available": tmux_available,
         "persist_enabled": persist_enabled,
