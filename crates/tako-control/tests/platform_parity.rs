@@ -340,6 +340,10 @@ fn 器のライフサイクルの直呼びが境界の外に残っていない()
             "境界 B2 の tmux 実装（ここが唯一の委譲点）",
         ),
         (
+            "crates/tako-core/src/backend/psmux.rs",
+            "境界 B2 の psmux 実装（#519 M2。tmux 版との差分を doc で対比する）",
+        ),
+        (
             "crates/tako-core/src/tmux_backend.rs",
             "移設元の実装本体。内部の相互呼び出しと tmux e2e テストが含まれる",
         ),
