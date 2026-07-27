@@ -103,6 +103,27 @@ FR-2.2.2 実装メモ（Issue #32・2026-07-02）: claude 等の**全画面 TUI 
 改行を「送信」と解釈せず入力欄に残留するため（実測）。シェルへの送信は従来どおり即時
 書き込み（挙動・レイテンシ据え置き）。実装は `tako-control::claude_tui`（検出は実 TUI の
 採取画面フィクスチャでテスト、送達は実 claude E2E `claude_tui_e2e` で検証）。
+
+FR-2.2.2 追補（Issue #572・2026-07-27）: **claude は生成中に打たれた入力を入力欄では
+なく内部の「メッセージキュー」へ入れる**（ターン終了時に送信される）。この間の入力欄は
+空で、代わりに dim のヒント `Press up to edit queued messages` が出る。tako はこれを
+「残留テキスト」と誤認していたため、Enter 単独送達が発火しない Enter を 5 回空撃ちして
+未検証で終わり、`tako read` の `input_status` も `style=ghost` + テキストありに見えて
+master が「送達に失敗した」と読み違えていた。是正:
+
+- 入力欄が「空か」は **dim かどうか**で判定する（`claude_tui::input_text_is_all_dim` /
+  `input_has_user_text`。tmux 経路は `capture-pane -e` で属性つき採取）。dim =
+  プレースホルダ / AI のゴースト提案 = ユーザー入力ではない。文言リストでは
+  AI 生成のゴースト提案を原理的に網羅できないため属性を根拠にする
+- キュー滞留は `claude_tui::queued_messages_pending` で検知し、`tako read` の
+  `queued_messages_pending` / `worker_status` の同名フィールド + `queued_messages_pending`
+  イベントとして公開する（キューはペインが消えると失われるため、master が
+  ペインを閉じる前に気付けるようにする）
+- **生成が止まっているのにキューが残っている**ときは tako が送り出す（`Up` で
+  キュー先頭を入力欄へ戻して `Enter`。claude 自身の案内どおりの操作）。生成中かは
+  `is_busy` の文言ではなく **画面が変化していないこと**（`claude_tui::screen_settled`）
+  で判定する（実測で 120 行のリスト生成中に `is_busy` が false を返した）
+
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
 MCP stdio ブリッジ（`tako mcp serve`）のフォールバックは「環境変数がある = tako 内で

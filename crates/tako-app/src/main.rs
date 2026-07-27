@@ -262,6 +262,75 @@ enum PreviewNavigationPanel {
     Pages,
 }
 
+/// #572: claude のメッセージキューから未送信の指示を取り出すキー（`Up`）。
+/// claude 自身が `Press up to edit queued messages` と案内している操作
+const QUEUE_RECALL_BYTES: &[u8] = b"\x1b[A";
+
+/// #572: 「idle なのにキューが残っている」を何 tick（2 秒周期）連続で観測したら救出するか。
+/// claude 自身のドレインは実測でターン終了から 1 秒以内なので、3 tick = 6 秒あれば
+/// 正常な自動送信と競合しない
+const QUEUE_STRANDED_TICKS: u8 = 3;
+
+/// #572: 1 ペインあたりの救出試行の上限（滞留が解けないときに叩き続けない）
+const QUEUE_RECOVERY_MAX: u8 = 5;
+
+/// #572: キュー滞留の救出状態（ペインごと）
+#[derive(Debug, Default)]
+struct QueuedRecovery {
+    /// 「キュー滞留 + 画面が前 tick から変化なし」を連続観測した回数
+    idle_ticks: u8,
+    /// 直前 tick の画面（生成中かどうかを文言でなく変化の有無で見る）
+    last_screen: Option<Vec<String>>,
+    /// 救出（Enter 単独送達フロー）を積んだ回数
+    attempts: u8,
+    /// 上限到達の警告を出したか（毎 tick 出さないため）
+    gave_up: bool,
+}
+
+/// #572: 1 tick 観測した結果、何をすべきか
+#[derive(Debug, PartialEq, Eq)]
+enum QueuedRecoveryAction {
+    /// まだ様子を見る（生成中 / 観測回数が足りない / 打ち切り済み）
+    Wait,
+    /// 救出する（Enter 単独送達フローを積む）
+    Deliver,
+    /// 上限に達したので警告して打ち切る（この tick だけ警告を出す）
+    GiveUp,
+}
+
+impl QueuedRecovery {
+    /// 「キュー滞留を検知したペイン」の 1 tick 分の観測を反映して次の行動を決める。
+    ///
+    /// 生成中に割り込むと、取り出したメッセージが再びキューへ戻るだけで何も進まない。
+    /// 生成中かどうかは `is_busy` の文言ではなく **画面が前 tick から変化していない
+    /// こと** で見る（実測で 120 行のリスト生成中に `is_busy` が false を返した）
+    fn observe(&mut self, lines: Vec<String>) -> QueuedRecoveryAction {
+        let settled = self
+            .last_screen
+            .as_ref()
+            .is_some_and(|before| tako_control::claude_tui::screen_settled(before, &lines));
+        self.last_screen = Some(lines);
+        if !settled {
+            self.idle_ticks = 0;
+            return QueuedRecoveryAction::Wait;
+        }
+        self.idle_ticks = self.idle_ticks.saturating_add(1);
+        if self.idle_ticks < QUEUE_STRANDED_TICKS {
+            return QueuedRecoveryAction::Wait;
+        }
+        if self.attempts >= QUEUE_RECOVERY_MAX {
+            if self.gave_up {
+                return QueuedRecoveryAction::Wait;
+            }
+            self.gave_up = true;
+            return QueuedRecoveryAction::GiveUp;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        self.idle_ticks = 0;
+        QueuedRecoveryAction::Deliver
+    }
+}
+
 /// claude TUI へのプロンプト送信フローの状態（Issue #32 送達確認ループ）
 #[derive(Debug)]
 enum PromptFlowState {
@@ -306,6 +375,14 @@ struct PromptFlow {
     /// enter_only の残留判定基準: Enter 送信時点の入力欄内容。検証時に
     /// 同じ内容が残っていれば未送達とみなし Enter を再送する
     baseline: Option<String>,
+    /// 直前 tick の画面（#572。キュー救出の前に「生成中でない」を画面の
+    /// 変化の有無で見るために保持する。`is_busy` の文言判定は空振りする）
+    prev_screen: Option<Vec<String>>,
+    /// キュー滞留からの取り出し（`Up`）を送った回数（#572。上限 2）。
+    /// claude は busy 中に打たれた指示を内部キューへ入れる。ターン終了時に自動で
+    /// 送信されるが、残ったままになると入力欄自体は空なので Enter は no-op になり、
+    /// Enter 単独送達（#95）が永久に空振りする
+    queue_recalls: u8,
     /// 貼り付けが入力欄へ反映されたことを確認できたか（Issue #530）。
     /// 「入力欄が空」は送信の証拠にならない（貼り付けが届いていなければ最初から空）ため、
     /// 送達の確証はこのフラグと残留消失の**両方**が揃ったときだけとする
@@ -334,6 +411,8 @@ impl PromptFlow {
             wait_tui,
             enter_only: false,
             baseline: None,
+            prev_screen: None,
+            queue_recalls: 0,
             paste_reflected: false,
             unverified_reason: None,
         }
@@ -736,6 +815,8 @@ struct TakoApp {
     alt_screen_writes: Vec<(PaneId, Vec<u8>, std::time::Instant)>,
     /// claude TUI へのプロンプト送信ステートマシン
     prompt_flows: Vec<PromptFlow>,
+    /// #572: claude のメッセージキューに滞留した指示の救出状態（ペインごと）
+    queued_recovery: std::collections::HashMap<PaneId, QueuedRecovery>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
     /// dispatch 中に依頼された重量プレビュー（PDF / 動画）の background 読み込み
@@ -2041,6 +2122,7 @@ impl TakoApp {
             pending_writes: Vec::new(),
             alt_screen_writes: Vec::new(),
             prompt_flows: Vec::new(),
+            queued_recovery: std::collections::HashMap::new(),
             pending_highlights: Vec::new(),
             pending_preview_loads: Vec::new(),
             preview_device_scale: 1.0,
@@ -2811,6 +2893,12 @@ impl TakoApp {
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
                         app.check_stale_binaries();
+                    }
+                    {
+                        // #572: busy 中に人間が打った指示が claude のキューに滞留したまま
+                        // 止まっていないかを見張り、見つけたら送り出す
+                        let _s = tako_control::diag::perf_span("periodic_prep:queued_recovery");
+                        app.drive_queued_message_recovery();
                     }
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
@@ -4065,12 +4153,38 @@ impl TakoApp {
                         if claude_tui::input_line(&lines).is_some()
                             || flow.state_entered_at.elapsed() > std::time::Duration::from_secs(2)
                         {
-                            flow.baseline = claude_tui::input_line(&lines)
-                                .filter(|s| !claude_tui::input_content_is_empty(s))
-                                .map(str::to_string);
-                            session.write(b"\r".to_vec());
-                            flow.state = PromptFlowState::VerifySubmitted;
-                            flow.state_entered_at = now;
+                            // #572: claude のメッセージキューに未送信メッセージが残って
+                            // いるときは入力欄が **本当に空** なので Enter は no-op。
+                            // claude 自身の案内（`Press up to edit queued messages`）どおり
+                            // ↑ でキュー先頭を入力欄へ戻し、次 tick で Enter を送る。
+                            // 生成中は触らない（送り直しても再キューされるだけで、ターン
+                            // 終了時に claude 自身がドレインする）。生成中かは `is_busy` の
+                            // 文言ではなく **画面が前 tick から変化していないこと** で見る
+                            let settled = flow
+                                .prev_screen
+                                .as_ref()
+                                .is_some_and(|before| claude_tui::screen_settled(before, &lines));
+                            let queued = claude_tui::queued_messages_pending(&lines);
+                            if queued
+                                && !settled
+                                && flow.queue_recalls == 0
+                                && flow.prev_screen.is_none()
+                            {
+                                // 生成中かどうかを見極めるため **1 tick だけ** 待つ。
+                                // 生成中と分かったら（次 tick で settled=false）通常の
+                                // Enter 経路へ落ちる = claude 自身のドレインに任せる
+                                flow.prev_screen = Some(lines);
+                            } else if queued && settled && flow.queue_recalls < 2 {
+                                session.write(QUEUE_RECALL_BYTES.to_vec());
+                                flow.queue_recalls += 1;
+                                flow.prev_screen = None;
+                                flow.state_entered_at = now;
+                            } else {
+                                flow.baseline = Self::user_input_text(session);
+                                session.write(b"\r".to_vec());
+                                flow.state = PromptFlowState::VerifySubmitted;
+                                flow.state_entered_at = now;
+                            }
                         }
                     } else if claude_tui::input_line(&lines).is_some()
                         || (!flow.wait_tui
@@ -4138,8 +4252,10 @@ impl TakoApp {
                         let residual = if flow.enter_only {
                             // Enter 単独送達（Issue #95）: 基準と同じ非空テキストが
                             // 入力欄に残っている = Enter 未送達。空 / プレースホルダ /
-                            // 別内容（ユーザーが打ち直した等）なら完了とみなし干渉しない
-                            match (claude_tui::input_line(&lines), flow.baseline.as_deref()) {
+                            // 別内容（ユーザーが打ち直した等）なら完了とみなし干渉しない。
+                            // #572: 比較対象は「ユーザーが打った実テキスト」に限る
+                            // （dim のプレースホルダ・ゴースト提案は残留ではない）
+                            match (Self::user_input_text(session), flow.baseline.as_deref()) {
                                 (Some(content), Some(base)) => content == base,
                                 _ => false,
                             }
@@ -4236,6 +4352,79 @@ impl TakoApp {
         }
         self.prompt_flows
             .push(PromptFlow::new_enter_verify(pane, baseline));
+    }
+
+    /// 入力欄に **ユーザーが打った実テキスト** があればそれを返す（#572）。
+    ///
+    /// claude は空の入力欄に dim のプレースホルダ（`Try "..."` / キュー滞留ヒント）や
+    /// AI 生成のゴースト提案（`now do 1 to 50` 等）を出す。素の文字列だけを見ると
+    /// これらを「ユーザーの残留テキスト」と誤認し、Enter 単独送達（#95）が空撃ちを
+    /// 繰り返して未検証で終わる。属性（dim）で切り分けるので文言に依存しない
+    fn user_input_text(session: &tako_core::TerminalSession) -> Option<String> {
+        let status = session.analyze_input()?;
+        match status.style {
+            tako_core::InputStyle::User | tako_core::InputStyle::Mixed => Some(status.text),
+            tako_core::InputStyle::Ghost | tako_core::InputStyle::None => None,
+        }
+    }
+
+    /// #572: claude のメッセージキューに滞留した「人間が busy 中に打った指示」を送り出す。
+    ///
+    /// busy 中の打鍵は claude の内部キューへ入り、通常はターン終了時に自動送信される。
+    /// tako からはキューの中身が見えず、ペインは「idle・入力欄は空」に見えるため、
+    /// 滞留したまま止まっても誰も気付けない（Issue #572 の実害。Enter を送っても
+    /// 入力欄が空なので no-op で、指示は永久に届かない）。
+    ///
+    /// idle + キュー滞留が `QUEUE_STRANDED_TICKS` 回続いたら Enter 単独送達フローを積む
+    /// （フロー側が `Up` → `Enter` でキューから取り出して送る）。ペインごとに
+    /// `QUEUE_RECOVERY_MAX` 回で打ち切り、状態が解消したらカウンタを戻す
+    fn drive_queued_message_recovery(&mut self) {
+        use tako_control::claude_tui;
+        let panes: Vec<PaneId> = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.tree().panes())
+            .map(|p| p.id())
+            .collect();
+        for pane in panes {
+            let Some(session) = self.terminals.get(&pane) else {
+                self.queued_recovery.remove(&pane);
+                continue;
+            };
+            // TUI ペイン（alt screen）だけを対象にする（シェルの画面走査を避ける）
+            if !session.is_alt_screen() {
+                self.queued_recovery.remove(&pane);
+                continue;
+            }
+            let lines = session.visible_lines();
+            if !claude_tui::queued_messages_pending(&lines) {
+                self.queued_recovery.remove(&pane);
+                continue;
+            }
+            // 送達フローが走っている間は触らない（貼り付け・Enter と混線する）。
+            // 観測より先に判定して試行回数を無駄に消費しないようにする
+            if self.prompt_flows.iter().any(|f| f.pane == pane) {
+                continue;
+            }
+            let state = self.queued_recovery.entry(pane).or_default();
+            match state.observe(lines) {
+                QueuedRecoveryAction::Wait => continue,
+                QueuedRecoveryAction::GiveUp => {
+                    eprintln!(
+                        "warning: claude のメッセージキューに未送信の指示が残ったまま解消しない（pane={}）",
+                        pane.as_u64()
+                    );
+                    continue;
+                }
+                QueuedRecoveryAction::Deliver => {}
+            }
+            eprintln!(
+                "info: 未送信のキュー済み指示を送り出す（pane={}）",
+                pane.as_u64()
+            );
+            self.prompt_flows.push(PromptFlow::new_enter_only(pane));
+        }
     }
 
     fn collect_tmux_context(&self) -> tako_control::TmuxContext {
@@ -7477,11 +7666,10 @@ impl TakoApp {
                 // ある状態への Enter は busy 中などに取りこぼされることがある。
                 // 書き込み前の入力欄内容を控え、残留していれば Enter を単独再送する
                 if bytes.as_slice() == b"\r" && session.is_alt_screen() {
-                    use tako_control::claude_tui;
-                    let lines = session.visible_lines();
-                    enter_baseline = claude_tui::input_line(&lines)
-                        .filter(|s| !claude_tui::input_content_is_empty(s))
-                        .map(str::to_string);
+                    // #572: 基準は「ユーザーが打った実テキスト」に限る。dim の
+                    // プレースホルダ・ゴースト提案を基準にすると、消えるはずのない
+                    // 表示を残留とみなして Enter を 4 回空撃ちしてしまう
+                    enter_baseline = Self::user_input_text(session);
                 }
                 session.write(bytes);
                 wrote = true;
@@ -24152,6 +24340,86 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod queued_recovery_tests {
+    use super::{QueuedRecovery, QueuedRecoveryAction, QUEUE_RECOVERY_MAX, QUEUE_STRANDED_TICKS};
+
+    // #572: busy 中に人間が打った指示は claude のメッセージキューへ入る。
+    // 生成中に割り込むと取り出したメッセージが再びキューへ戻るだけなので、
+    // 「画面が変化していない」= 生成していない、を根拠に救出する
+
+    fn screen(marker: &str) -> Vec<String> {
+        vec![
+            format!("⏺ {marker}"),
+            "❯ Press up to edit queued messages".to_string(),
+        ]
+    }
+
+    #[test]
+    fn 画面が動いている間は救出しない() {
+        let mut state = QueuedRecovery::default();
+        for i in 0..10 {
+            // 生成中は毎 tick 画面が変わる
+            assert_eq!(
+                state.observe(screen(&format!("line {i}"))),
+                QueuedRecoveryAction::Wait
+            );
+        }
+    }
+
+    #[test]
+    fn 画面が安定してから規定回数で救出する() {
+        let mut state = QueuedRecovery::default();
+        // 1 回目は比較対象が無いので必ず Wait
+        assert_eq!(state.observe(screen("done")), QueuedRecoveryAction::Wait);
+        for _ in 0..QUEUE_STRANDED_TICKS - 1 {
+            assert_eq!(state.observe(screen("done")), QueuedRecoveryAction::Wait);
+        }
+        assert_eq!(state.observe(screen("done")), QueuedRecoveryAction::Deliver);
+    }
+
+    #[test]
+    fn 生成が再開したら観測をやり直す() {
+        let mut state = QueuedRecovery::default();
+        state.observe(screen("done"));
+        state.observe(screen("done"));
+        // 画面が動いた = 生成中に戻った
+        assert_eq!(state.observe(screen("more")), QueuedRecoveryAction::Wait);
+        // カウンタが戻るので、次に安定してもすぐには救出しない
+        assert_eq!(state.observe(screen("more")), QueuedRecoveryAction::Wait);
+    }
+
+    #[test]
+    fn 上限に達したら一度だけ警告して打ち切る() {
+        let mut state = QueuedRecovery::default();
+        let mut delivered = 0;
+        let mut gave_up = 0;
+        state.observe(screen("done"));
+        for _ in 0..200 {
+            match state.observe(screen("done")) {
+                QueuedRecoveryAction::Deliver => delivered += 1,
+                QueuedRecoveryAction::GiveUp => gave_up += 1,
+                QueuedRecoveryAction::Wait => {}
+            }
+        }
+        assert_eq!(delivered, QUEUE_RECOVERY_MAX as usize, "救出は上限まで");
+        assert_eq!(gave_up, 1, "警告は 1 回だけ");
+    }
+
+    #[test]
+    fn 生成中はスピナー文言だけでも救出しない() {
+        // 画面は同一でも `is_busy` が拾えるなら生成中とみなす（二重の安全弁）
+        let busy = vec![
+            "✻ Baked for 12s (esc to interrupt)".to_string(),
+            "❯ Press up to edit queued messages".to_string(),
+        ];
+        let mut state = QueuedRecovery::default();
+        for _ in 0..10 {
+            assert_eq!(state.observe(busy.clone()), QueuedRecoveryAction::Wait);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -125,6 +125,58 @@ fn dump_screen(session: &str) -> String {
         .unwrap_or_else(|e| format!("<capture 失敗: {e}>"))
 }
 
+fn capture(session: &str) -> Option<Vec<String>> {
+    tako_core::tmux::capture_session(Some(SOCKET), session).ok()
+}
+
+/// 条件が成立するまで待つ（500ms 間隔）
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// claude TUI の入力欄（❯）が現れるまで待つ
+fn wait_for_input_line(session: &str) {
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            capture(session).is_some_and(|l| claude_tui::input_line(&l).is_some())
+        }),
+        "claude TUI の入力欄が現れるはず。画面:\n{}",
+        dump_screen(session)
+    );
+}
+
+/// 人間のタイプ相当: 1 バイトずつ送る（GUI の handle_key は 1 キーずつ PTY へ書く）
+fn type_like_human(session: &str, text: &str) {
+    for byte in text.as_bytes() {
+        let status = Command::new("tmux")
+            .args([
+                "-L",
+                SOCKET,
+                "send-keys",
+                "-t",
+                &format!("={session}:"),
+                "-H",
+                &format!("{byte:02x}"),
+            ])
+            .status()
+            .expect("tmux を実行できる");
+        assert!(status.success(), "send-keys -H が失敗した");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+fn send_key(session: &str, key: &str) {
+    tako_core::tmux::send_key(Some(SOCKET), session, key).expect("キー送信できる");
+}
+
 /// Issue #32 問題 1（フォールバック経路）: 未信頼フォルダの初回起動で信頼ダイアログが
 /// 出ても、検出 → 承諾 → プロンプト送達が通る
 #[test]
@@ -252,6 +304,89 @@ fn 残留テキストをenter単独送達で送信できる() {
     assert!(
         wait_for_marker(&guard.session, "twenty-one", Duration::from_secs(90)),
         "残留テキストが送信され claude が応答するはず。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+}
+
+/// Issue #572: busy（生成中）の claude へ人間が打った指示は **入力欄ではなく
+/// claude のメッセージキュー** に入る。このとき入力欄自体は空で、代わりに dim の
+/// ヒント `Press up to edit queued messages` が表示される。
+///
+/// 修正前はこのヒントを「残留テキスト」と誤認していたため、Enter 単独送達
+/// （#95 / master の Enter 代行）が Enter を 5 回空撃ちして `verified=false` で終わり、
+/// master は「送達に失敗した」と読み違えていた（実際はキューにあり、ターン終了時に届く）。
+///
+/// ここでは「busy 中にタイプ → キューに入る → 誤検知しない → 実際に届く」を通す。
+/// キューに入ったまま止まった場合の救出（`Up` → `Enter`）は deliver_via_tmux 内の
+/// 実装と tako-app 側の定期チェックで行う（滞留は claude 側の状態のため、
+/// テストから決定的には作れない）
+#[test]
+#[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
+fn busy中にタイプした指示がキューに入り誤検知されない() {
+    let dir = untrusted_base_dir("busy-queue");
+    std::fs::create_dir_all(&dir).expect("作業ディレクトリを作れる");
+    assert_eq!(
+        claude_tui::ensure_trusted(&dir.display().to_string()),
+        Ok(true),
+        "事前信頼を書き込める"
+    );
+    let guard = launch_claude("busy-queue", &dir);
+    wait_for_input_line(&guard.session);
+
+    // ① 長めのタスクを送って busy にする
+    claude_tui::deliver_via_tmux(
+        Some(SOCKET),
+        &guard.session,
+        "Write a numbered list from 1 to 120. Each line is one short English sentence. No tools.",
+        true,
+    )
+    .expect("送達が完了する");
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            capture(&guard.session).is_some_and(|l| claude_tui::is_busy(&l))
+        }),
+        "claude が生成中になるはず。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+
+    // ② busy 中に人間が 1 バイトずつタイプ → Enter（GUI の handle_key と同じ形）
+    type_like_human(&guard.session, &format!("What is 6 * 7? {SPELL_SUFFIX}"));
+    send_key(&guard.session, "Enter");
+
+    // ③ キューに入ったことを検知でき、かつ「残留テキスト」とは誤認しない
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            capture(&guard.session).is_some_and(|l| claude_tui::queued_messages_pending(&l))
+        }),
+        "キューに入ったことを検知できるはず。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+    let lines = capture(&guard.session).expect("画面を読める");
+    assert_eq!(
+        claude_tui::input_line(&lines).map(claude_tui::input_content_is_empty),
+        Some(true),
+        "キュー滞留ヒントは残留テキストではない（修正前はここが Some(false)）。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+
+    // ④ この状態への Enter 単独送達は「送信済み」と正しく判定される
+    //    （修正前は 5 回空撃ちして enter_retries=4 / verified=false で終わっていた）
+    let report = claude_tui::deliver_via_tmux(Some(SOCKET), &guard.session, "", false)
+        .expect("送達が完了する");
+    assert!(
+        report.verified,
+        "キュー滞留ヒントを残留と誤認しないはず: {report:?}\n画面:\n{}",
+        dump_screen(&guard.session)
+    );
+    assert_eq!(
+        report.enter_retries, 0,
+        "空撃ちの Enter 再送は起きないはず: {report:?}"
+    );
+
+    // ⑤ 実際に claude へ届く（= 応答が返る）
+    assert!(
+        wait_for_marker(&guard.session, ANSWER_MARKER, Duration::from_secs(180)),
+        "busy 中に打った指示がターン終了後に処理されるはず。画面:\n{}",
         dump_screen(&guard.session)
     );
 }

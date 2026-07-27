@@ -3042,6 +3042,11 @@ fn orchestrator_watch(
                         if let Some(pct) = ev["percent"].as_u64() {
                             parts.push(format!("percent={pct}"));
                         }
+                        // #572: 対処を併記しないと master が画面から推測するしかなく、
+                        // 「Enter を代行すれば直る」のような誤読の温床になる
+                        if let Some(action) = ev["recommended_action"].as_str() {
+                            parts.push(format!("action={action}"));
+                        }
                         println!("{}", parts.join(" "));
                     }
                 }

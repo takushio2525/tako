@@ -840,6 +840,10 @@ fn dispatch_inner(
                 }
             };
 
+            // #572: claude のメッセージキューに未送信の指示が残っているか
+            // （画面を切り詰める前の全行で判定する）
+            let queued_pending = crate::claude_tui::queued_messages_pending(&all);
+
             while all.last().is_some_and(|l| l.is_empty()) {
                 all.pop();
             }
@@ -858,9 +862,17 @@ fn dispatch_inner(
                         tako_core::InputStyle::Mixed => "mixed",
                         tako_core::InputStyle::None => "none",
                     },
+                    // #572: true = busy 中に打たれた指示が claude のキューにあり未送信。
+                    // 入力欄自体は空なので Enter 単独送達では発火しない
+                    "queued_messages_pending": queued_pending,
                 })
             });
-            Ok(json!({ "pane": pane_id, "text": all.join("\n"), "input_status": input_json }))
+            Ok(json!({
+                "pane": pane_id,
+                "text": all.join("\n"),
+                "input_status": input_json,
+                "queued_messages_pending": queued_pending,
+            }))
         }
 
         Request::Scroll { pane, to, delta } => {
@@ -6148,6 +6160,21 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         );
     }
 
+    // #572: busy 中に人間が打った指示が claude のキューに未送信のまま残っていないか。
+    // 入力欄は空に見えるので、これが無いと master は「何も残っていない」と読み違える
+    let queued_messages_pending = recent_output.as_ref().is_some_and(|out| {
+        let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+        crate::claude_tui::queued_messages_pending(&lines)
+    });
+    if queued_messages_pending {
+        events.push(
+            crate::orchestrator::wait::WorkerEvent {
+                kind: crate::orchestrator::wait::WorkerEventKind::QueuedMessagesPending,
+            }
+            .to_json(),
+        );
+    }
+
     // #319: waiting + 画面に permission ダイアログがあれば構造化情報を付与
     let permission_dialog: Option<Value> = if status == "waiting" {
         recent_output.as_ref().and_then(|out| {
@@ -6183,6 +6210,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "has_running_children": has_children,
         "collapsed": collapsed,
         "events": events,
+        // #572: true = 人間が busy 中に打った指示がキューに未送信で残っている
+        "queued_messages_pending": queued_messages_pending,
         "permission_dialog": permission_dialog,
         "history": history_info,
         // #390: worker レジストリ由来の情報（未登録ペインは null）

@@ -1047,6 +1047,11 @@ pub enum WorkerEventKind {
     /// tmux セッション配下の実行中子プロセスが消えた場合に発火。
     /// `resume_command` があれば claude --resume で文脈ごと復旧できる
     AgentDead { resume_command: Option<String> },
+    /// 人間が busy 中に打った指示が claude のメッセージキューに未送信のまま残っている（#572）。
+    /// 入力欄自体は空なので Enter 単独送達では発火しない（`Up` で取り出してから送る）。
+    /// tako は idle が続けば自動で送り出すが、キューはペインが消えると失われるため
+    /// master にも知らせる（ペインを閉じる前に消化させる判断材料）
+    QueuedMessagesPending,
 }
 
 /// worker_status の events 配列に載せる 1 イベント
@@ -1080,6 +1085,12 @@ impl WorkerEvent {
                     "kind": "agent_dead",
                     "resume_command": resume_command,
                     "recommended_action": "resume_session",
+                })
+            }
+            WorkerEventKind::QueuedMessagesPending => {
+                json!({
+                    "kind": "queued_messages_pending",
+                    "recommended_action": "wait_for_delivery",
                 })
             }
         }
