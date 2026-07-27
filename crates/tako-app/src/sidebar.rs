@@ -10,6 +10,39 @@ use super::*;
 /// 行の判定は挿入位置（index）で行うのでパスは表示にも一致判定にも使わない
 const INLINE_NEW_MARKER: &str = "__tako_inline_new__";
 
+/// 1 階層ぶんのインデント幅（カンプ: margin-left 17px）
+const INDENT_STEP: f32 = 17.0;
+
+/// インデントガイド線（#589）。
+///
+/// 旧実装は行ボックスの `border-left` 1 本だけを引いていたため、**その行の深さの線しか
+/// 描かれず**、子孫の行が挟まった瞬間に祖先の深さの線が途切れた（深い木ほど破線に
+/// 見える）。行ごとに祖先ぶんの縦線も描くことで、深さごとに切れ目のない 1 本の
+/// 縦線になる（VSCode / Zed のインデントガイドと同じ見え方）。
+///
+/// 行ボックスは `ml(INDENT_STEP * depth)` に置かれる。絶対配置の子は行の padding box
+/// （枠線を持たせないのでボックス左端そのもの）が基準なので、深さ k の線は
+/// `left = -INDENT_STEP * (depth - k)` に来る。**自分の深さ（k == depth）も同じ仕組みで
+/// 描く**ので、線の太さ・位置が深さによってずれない（枠線と矩形で描き分けない）。
+///
+/// 高さは `top_0 + bottom_0` で行の高さちょうどに合わせる。行は隙間なく縦に積まれるので、
+/// 隣接する行の線どうしがそのまま繋がる（実測: 同じ深さの連続行は 1 本の run になる）
+fn indent_guides(
+    depth: usize,
+    own: gpui::Hsla,
+    ancestor: gpui::Hsla,
+) -> impl Iterator<Item = gpui::Div> {
+    (1..=depth).map(move |level| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-INDENT_STEP * (depth - level) as f32))
+            .w(px(1.0))
+            .bg(if level == depth { own } else { ancestor })
+    })
+}
+
 /// 新規作成のインライン入力欄を差し込む場所（#559）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InlineInsertSlot {
@@ -426,8 +459,9 @@ impl TakoApp {
                                 let after_cursor = &edit.text[edit.cursor..];
                                 let empty = edit.text.is_empty();
                                 // #559: インデントは通常行とまったく同じ規則で置く
-                                // （ml 17*depth + 左ガイド線 + pl 13）。ここが揃っていないと
-                                // 「どの階層に作られるのか」が読めない
+                                // （ml 17*depth + 左ガイド線 + pl 14）。ここが揃っていないと
+                                // 「どの階層に作られるのか」が読めない。自分の深さの線だけ
+                                // accent にして「ここに作られる」を強調する（#589）
                                 return div()
                                     .id(("filetree-row", index as u64))
                                     .flex()
@@ -436,10 +470,13 @@ impl TakoApp {
                                     .gap(px(4.0))
                                     .py(px(1.0))
                                     .when(row.depth >= 1, |d| {
-                                        d.ml(px(17.0 * row.depth as f32))
-                                            .border_l_1()
-                                            .border_color(hsla(theme.accent))
-                                            .pl(px(13.0))
+                                        d.ml(px(INDENT_STEP * row.depth as f32))
+                                            .pl(px(14.0))
+                                            .children(indent_guides(
+                                                row.depth,
+                                                hsla(theme.accent),
+                                                hsla(theme.border_subtle),
+                                            ))
                                     })
                                     .when(row.depth == 0, |d| d.pl(px(12.0)))
                                     .pr(px(6.0))
@@ -617,13 +654,17 @@ impl TakoApp {
                                         ("?", theme.tab_inactive_foreground)
                                     }
                                 });
-                                // インデントガイド線（カンプ: margin-left 17px + border-left）
+                                // インデントガイド線（カンプ: margin-left 17px + 1px の縦線）。
+                                // 祖先の深さの線も一緒に描いて 1 本の連続線にする（#589）
                                 let mut row_el = base
                                     .when(row.depth >= 1, |d| {
-                                        d.ml(px(17.0 * row.depth as f32))
-                                            .border_l_1()
-                                            .border_color(hsla(theme.border_subtle))
-                                            .pl(px(13.0))
+                                        d.ml(px(INDENT_STEP * row.depth as f32))
+                                            .pl(px(14.0))
+                                            .children(indent_guides(
+                                                row.depth,
+                                                hsla(theme.border_subtle),
+                                                hsla(theme.border_subtle),
+                                            ))
                                     })
                                     .when(row.depth == 0, |d| d.pl(px(12.0)))
                                     .py(px(2.0))

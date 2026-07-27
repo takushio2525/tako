@@ -16806,6 +16806,116 @@ mod self_test {
             .unwrap_or(false)
     }
 
+    /// ファイルツリーのインデントガイド線（#589）の実ピクセル検証。
+    ///
+    /// 縦線は「その深さに子が続くあいだ切れ目なく 1 本」でなければならない。
+    /// 各深さのガイド列（論理 x = 17 * depth）を実フレームから縦に舐め、
+    ///
+    /// - 連続性: 上端から下端まで背景色のピクセルが 1 つも挟まらない
+    /// - 均一性: 区間内の色が揃っている（隣接行の量子化で薄くなる継ぎ目が無い）
+    ///
+    /// を検査する。行の y 座標は使わず、点いているピクセルの上端・下端だけから
+    /// 区間を決めるので、行高さ・フォント・スクロール位置に依存しない。
+    ///
+    /// 戻り値は (連続か, 一様か, 診断文字列)。
+    ///
+    /// ガイド色（`border_subtle`）とサイドバー地色（`mantle`）はどちらも不透明なので、
+    /// 実測値はそのまま出る（許容 1）。ガイド列は 1 つ浅い行の chevron と 2 つ浅い行の
+    /// アイコンを必ず横切るが、それらの色はガイド色から遠いので線としては数えない
+    #[cfg(feature = "visual-test")]
+    fn indent_guide_continuity(
+        frame: &image::RgbaImage,
+        scale: f32,
+        depth: usize,
+        list: (f32, f32),
+        guide: tako_core::Rgb,
+        background: tako_core::Rgb,
+    ) -> (bool, bool, String) {
+        let (width, height) = frame.dimensions();
+        // 行ボックスの左端 = ml(17 * depth)。線は 1 論理 px なので device では scale ぶん
+        let x = ((17.0 * depth as f32) * scale).round() as u32;
+        if x >= width {
+            return (false, false, format!("depth={depth} 列が画面外"));
+        }
+        let top = (list.0 * scale).round().max(0.0) as u32;
+        let bottom = ((list.1 * scale).round() as u32).min(height);
+        let near = |p: &[u8; 4], c: tako_core::Rgb, tol: i32| {
+            (p[0] as i32 - c.r as i32).abs() <= tol
+                && (p[1] as i32 - c.g as i32).abs() <= tol
+                && (p[2] as i32 - c.b as i32).abs() <= tol
+        };
+        let column: Vec<(u32, [u8; 4])> = (top..bottom)
+            .map(|y| (y, frame.get_pixel(x, y).0))
+            .collect();
+        if std::env::var_os("TAKO_VISUAL_GUIDE_DEBUG").is_some() {
+            let mut seen: std::collections::HashMap<[u8; 4], usize> =
+                std::collections::HashMap::new();
+            for (_, p) in &column {
+                *seen.entry(*p).or_default() += 1;
+            }
+            let mut seen: Vec<_> = seen.into_iter().collect();
+            seen.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            for (y, p) in &column {
+                if near(p, guide, 1) {
+                    match runs.last_mut() {
+                        Some(last) if last.1 + 1 == *y => last.1 = *y,
+                        _ => runs.push((*y, *y)),
+                    }
+                }
+            }
+            println!(
+                "TAKO_VISUAL_GUIDE_DEBUG: depth={depth} guide={:?} bg={:?} colors={:?} runs={runs:?}",
+                (guide.r, guide.g, guide.b),
+                (background.r, background.g, background.b),
+                seen.iter().take(8).collect::<Vec<_>>()
+            );
+        }
+        let Some(first) = column
+            .iter()
+            .find(|(_, p)| near(p, guide, 1))
+            .map(|(y, _)| *y)
+        else {
+            return (false, false, format!("depth={depth} に線が 1 本も無い"));
+        };
+        let last = column
+            .iter()
+            .rev()
+            .find(|(_, p)| near(p, guide, 1))
+            .map(|(y, _)| *y)
+            .unwrap_or(first);
+        let span: Vec<[u8; 4]> = column
+            .iter()
+            .filter(|(y, _)| *y >= first && *y <= last)
+            .map(|(_, p)| *p)
+            .collect();
+        // 抜け = 区間の途中に地色がそのまま出ているピクセル
+        let gaps = span.iter().filter(|p| near(p, background, 1)).count();
+        // 継ぎ目 = 行の境目で線が薄くなったピクセル。ガイド色と地色の中間色
+        // （どちらでもないが両者のあいだに収まる色）を数える
+        let between = |p: &[u8; 4]| {
+            [
+                (p[0], guide.r, background.r),
+                (p[1], guide.g, background.g),
+                (p[2], guide.b, background.b),
+            ]
+            .iter()
+            .all(|(v, a, b)| *v >= (*a).min(*b) && *v <= (*a).max(*b))
+        };
+        let seams = span
+            .iter()
+            .filter(|p| !near(p, guide, 1) && !near(p, background, 1) && between(p))
+            .count();
+        (
+            gaps == 0,
+            seams == 0,
+            format!(
+                "depth={depth} x={x} span={first}..{last} ({} px) 抜け={gaps} 継ぎ目={seams}",
+                span.len()
+            ),
+        )
+    }
+
     /// #152 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の PTY / fd
     /// ストレス項目のタイミングに左右されず PDF・C++・Python の scene だけを検査する。
     #[cfg(feature = "visual-test")]
@@ -16815,6 +16925,151 @@ mod self_test {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
+
+            // #589: ファイルツリーのインデントガイド線が連続しているか。
+            // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
+            // 実フレームのピクセルを縦に舐める
+            {
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-visual-tree-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let deep = fixture.join("docs/guide/deep");
+                std::fs::create_dir_all(&deep).expect("visual-test ツリー fixture");
+                for (path, body) in [
+                    (deep.join("a.md"), "# a"),
+                    (deep.join("b.md"), "# b"),
+                    (fixture.join("docs/guide/intro.md"), "# intro"),
+                    (fixture.join("docs/handoff.md"), "# handoff"),
+                ] {
+                    std::fs::write(path, body).expect("visual-test ツリー fixture ファイル");
+                }
+                // ルート直下にファイルを積んでリストを溢れさせる（スクロール検証用）。
+                // 深さ 1 のガイドはこの全域に伸びるので、スクロールしても切れてはいけない
+                for i in 0..40 {
+                    std::fs::write(fixture.join(format!("note-{i:02}.md")), "# note")
+                        .expect("visual-test ツリー fixture ファイル");
+                }
+                // シェルの OSC 7（起動時に 1 回来る）を先に消化させてから撮る。
+                // 撮影中に飛んでくるとルートが cwd で置き換わってしまう
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                // ヘッダ（プロジェクト名 + パスボックス）の下から、ステータスバーの
+                // 手前までを見る。この範囲に 4 階層のチェーンが必ず収まる
+                let scan = (115.0, 420.0);
+                for state in ["dark", "dark-scrolled", "light"] {
+                    // 保留中のポーリング（2 秒ごとの sync_filetree_roots）を先に消化させる。
+                    // このあと await を挟まずに撮るので、貼り直したルートは奪われない
+                    cx.background_executor()
+                        .timer(Duration::from_millis(400))
+                        .await;
+                    let (max_depth, colors) = window
+                        .update(cx, |app, win, cx| {
+                            // ルートはシェルの cwd 通知とポーリングで上書きされるため、
+                            // 撮る直前に必ず貼り直す
+                            app.filetree.visible = true;
+                            app.filetree.set_show_hidden(false);
+                            app.filetree.set_roots(vec![fixture.clone()]);
+                            app.filetree.expand_dir(&fixture);
+                            app.filetree.expand_dir(&fixture.join("docs"));
+                            app.filetree.expand_dir(&fixture.join("docs/guide"));
+                            app.filetree.expand_dir(&deep);
+                            if state == "light" {
+                                let _ = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Theme {
+                                        action: Some("set".into()),
+                                        mode: Some("light".into()),
+                                        target: None,
+                                        key: None,
+                                        value: None,
+                                        name: None,
+                                        font_family: None,
+                                        font_size: None,
+                                    },
+                                    PaneOrigin::Cli,
+                                );
+                            }
+                            if state == "dark-scrolled" {
+                                // 行高さ（23.4375px）の整数倍にならない量でスクロールし、
+                                // 端数オフセットでも線が割れないことを見る
+                                win.dispatch_event(
+                                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                        position: point(px(120.0), px(300.0)),
+                                        delta: ScrollDelta::Pixels(point(px(0.0), px(-37.5))),
+                                        ..ScrollWheelEvent::default()
+                                    }),
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                            // 深さ 0..4 が並んでいること（ガイドは深さ 1〜4 に出る）
+                            (
+                                app.filetree
+                                    .rows()
+                                    .iter()
+                                    .map(|r| r.depth)
+                                    .max()
+                                    .unwrap_or(0),
+                                (app.theme.border_subtle, app.theme.mantle),
+                            )
+                        })
+                        .unwrap_or_else(|_| fail("visual-test ツリー: 状態の適用"));
+                    check(
+                        max_depth == 4,
+                        "visual-test ツリー: 4 階層のフィクスチャが並ぶ",
+                    );
+                    // capture_frame は同期で描き直すので、貼り直した直後の状態がそのまま写る
+                    let (frame, scale) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test ツリー: フレーム取得"));
+                    if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = frame
+                            .save(std::path::Path::new(&dir).join(format!("filetree-{state}.png")));
+                    }
+                    let mut all_continuous = true;
+                    let mut all_uniform = true;
+                    for depth in 1..=4 {
+                        let (continuous, uniform, note) = indent_guide_continuity(
+                            &frame, scale, depth, scan, colors.0, colors.1,
+                        );
+                        println!("TAKO_VISUAL_PIXEL: indent-guide {state} {note}");
+                        all_continuous &= continuous;
+                        all_uniform &= uniform;
+                    }
+                    check(
+                        all_continuous,
+                        &format!("visual-test インデントガイド({state}): 縦線が途切れない (#589)"),
+                    );
+                    check(
+                        all_uniform,
+                        &format!("visual-test インデントガイド({state}): 継ぎ目が無い (#589)"),
+                    );
+                }
+                window
+                    .update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Theme {
+                                action: Some("set".into()),
+                                mode: Some("dark".into()),
+                                target: None,
+                                key: None,
+                                value: None,
+                                name: None,
+                                font_family: None,
+                                font_size: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        app.filetree.visible = false;
+                        app.filetree.set_roots(Vec::new());
+                        cx.notify();
+                    })
+                    .ok();
+                let _ = std::fs::remove_dir_all(&fixture);
+            }
+
             let dir = std::env::temp_dir()
                 .join(format!("tako-visual-preview-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
