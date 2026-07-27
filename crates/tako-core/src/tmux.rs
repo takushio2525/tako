@@ -447,6 +447,10 @@ pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
 pub fn tmux_command(socket: Option<&str>) -> Command {
     let mut command = Command::new(tmux_bin());
     command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
+    // #628: ここは tmux / psmux を叩く全経路の合流点。セッション一覧は 2 秒間隔で
+    // ポーリングされるため、GUI プロセス（tako-app）から素で起動すると Windows が
+    // 毎回コンソールウィンドウを作り、明滅し続けてフォーカスまで奪う
+    crate::platform::process::no_console_window(&mut command);
     if let Some(name) = socket {
         command.args(["-L", name]);
     }

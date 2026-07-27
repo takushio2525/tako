@@ -191,7 +191,12 @@ struct DetectedAgent {
 }
 
 fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new(path).args(args).output().ok()
+    // #628: `tako setup` は dispatch（GUI 内）からも呼ばれる。そちらは既に
+    // コンソールを持たないので、ここを素で起動すると子ごとにウィンドウが出る
+    tako_core::platform::process::no_console_window(&mut std::process::Command::new(path))
+        .args(args)
+        .output()
+        .ok()
 }
 
 fn detect_agents() -> Vec<DetectedAgent> {
