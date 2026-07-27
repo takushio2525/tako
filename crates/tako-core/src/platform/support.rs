@@ -150,11 +150,13 @@ pub mod notes {
         "Requires the remote transport and the Windows distribution channel",
     );
 
-    /// 概念自体が存在しないもの
+    /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
     pub const WIN_NO_PSREADLINE_NEEDED: Note = Note::new(
         "Windows の PowerShell は PSReadLine の予測入力を標準搭載しているため、tako 側の注入は要らない",
         "Windows PowerShell ships PSReadLine predictive input, so tako does not need to inject anything",
     );
+
+    /// 概念自体が存在しないもの
     pub const WIN_NO_TCC: Note = Note::new(
         "Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い",
         "Windows has no equivalent of the macOS TCC (Full Disk Access) mechanism",
