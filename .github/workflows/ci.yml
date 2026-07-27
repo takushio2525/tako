@@ -22,6 +22,18 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+      # rust_embed が web/tako-remote/dist/ をコンパイル時に埋め込むため、
+      # cargo の全ステップ（clippy 含む）より前に PWA をビルドする必要がある。
+      # dist/ は .gitignore 対象なのでクリーンチェックアウトには存在しない（Issue #574）。
+      # 手順は scripts/build-app.sh の「PWA ビルド」節と同じ
+      - name: PWA をビルド（rust_embed が dist/ を要求する）
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
       # rust-toolchain.toml と同じバージョンをピン（git 版 gpui が新しめの stable を要求）
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -60,6 +72,17 @@ jobs:
             Write-Error "VS インストーラーが終了コード $($process.ExitCode) で失敗"
             exit 1
           }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+      # macOS ジョブと同じ理由（Issue #574）。bash 指定は pwsh の `&&` が
+      # 最後のコマンドの終了コードしか見ないため（npm ci の失敗を握り潰さない）
+      - name: PWA をビルド（rust_embed が dist/ を要求する）
+        shell: bash
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
