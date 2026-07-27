@@ -6151,12 +6151,20 @@ mod tests {
 
     #[test]
     fn openは絶対パスとモード別名を解釈する() {
-        let command = parse(&["tako", "open", "/tmp/a.md", "--pane", "5", "--mode", "md"]);
+        // 絶対パスの表記はプラットフォーム依存（Windows はドライブレターが要る。
+        // `/tmp/a.md` は Windows では相対パス扱いになり cwd のドライブで絶対化される）。
+        // ここで見たいのは「絶対パスはそのまま渡る」ことなので実行環境の表記に合わせる
+        let abs_md = if cfg!(windows) {
+            r"C:\tmp\a.md"
+        } else {
+            "/tmp/a.md"
+        };
+        let command = parse(&["tako", "open", abs_md, "--pane", "5", "--mode", "md"]);
         assert_eq!(
             build_request(&command).unwrap(),
             Request::OpenFile {
                 pane: Some(5),
-                path: "/tmp/a.md".into(),
+                path: abs_md.into(),
                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                 direction: None,
                 focus: None,
@@ -6178,7 +6186,7 @@ mod tests {
         assert_eq!(mode, None);
         assert_eq!(direction, None);
         // 方向指定（FR-3.11 = D&D のドロップ位置相当）
-        let command = parse(&["tako", "open", "/tmp/a.md", "--pane", "5", "--down"]);
+        let command = parse(&["tako", "open", abs_md, "--pane", "5", "--down"]);
         let Request::OpenFile { direction, .. } = build_request(&command).unwrap() else {
             panic!("OpenFile になる");
         };
