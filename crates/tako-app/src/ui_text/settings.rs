@@ -194,9 +194,10 @@ pub fn label_confirm_close() -> &'static str {
 }
 
 pub fn desc_confirm_close() -> &'static str {
+    // #566: 確認対象は「エージェント・実行中プロセスがあるペイン」に限る
     tr!(
-        "ペインを閉じるときに確認ダイアログを出す",
-        "Ask before closing a pane"
+        "エージェントや実行中プロセスがあるペインを閉じるとき確認する",
+        "Ask before closing a pane that runs an agent or a process"
     )
 }
 

@@ -442,6 +442,7 @@ pub fn run_worker(
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
+            caller_role: None,
         })
         .is_ok()
     } else {
@@ -809,6 +810,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
+            caller_role: None,
         })
         .is_ok()
     } else {
@@ -1468,7 +1470,8 @@ mod tests {
             r,
             Request::Close {
                 pane: Some(9),
-                force: true
+                force: true,
+                caller_role: None,
             }
         )));
     }

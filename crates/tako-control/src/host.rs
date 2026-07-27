@@ -5,6 +5,7 @@
 //! シグネチャ（`&mut dyn ControlHost`）は不変。
 
 use serde_json::Value;
+use tako_core::pane_log::CloseOrigin;
 use tako_core::{
     PaneId, PreviewOutline, PreviewOutlineTarget, PreviewViewState, PreviewViewUpdate,
     SpawnOptions, TabId, TerminalSession, Workspace,
@@ -39,8 +40,10 @@ pub trait SessionHost {
     /// ツリーへ挿入済みの新ペインに対しセッションを起動しイベント中継を張る。
     /// `TAKO_PANE_ID` 等の環境変数合成は実装側の責務（FR-2.1.1）
     fn attach_session(&mut self, pane: PaneId, options: SpawnOptions);
-    /// 閉じられたペインのセッションを破棄する
-    fn detach_session(&mut self, pane: PaneId);
+    /// 閉じられたペインのセッションを破棄する。
+    /// `origin` / `caller` は close の発生源（Issue #566）。この経路は CLI / MCP の
+    /// dispatch だけが通るため、ペインログのクローズマーカーへ「誰が閉じたか」を残す
+    fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>);
     /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
     /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
     fn reattach_backgrounded(&mut self, _pane: PaneId) {}

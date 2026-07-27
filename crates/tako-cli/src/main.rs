@@ -102,7 +102,8 @@ enum Command {
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
-    /// × ボタン close の確認ダイアログ ON/OFF・状態確認
+    /// close 確認ダイアログの ON/OFF・状態確認（× ボタン / cmd+W。
+    /// 確認が入るのはエージェント・実行中プロセスがあるペインのみ）
     #[command(name = "confirm-close")]
     ConfirmClose(ToggleArgs),
     /// UI テーマの確認・切替・色設定・プリセット・フォント（Issue #217/#459）
@@ -3971,6 +3972,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Close(args) => Request::Close {
             pane: target_pane(args.pane)?,
             force: args.force,
+            // #566: エージェントのペインから `tako close` を叩いたとき
+            // 「どの role が閉じたか」をペインログへ残す（監査情報。close の可否には影響しない）
+            caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE")
+                .ok()
+                .filter(|r| !r.trim().is_empty()),
         },
         Command::Title(args) => Request::Title {
             pane: target_pane(args.pane)?,

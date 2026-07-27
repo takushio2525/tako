@@ -588,7 +588,11 @@ fn dispatch_inner(
             Ok(json!({ "pane": new_id.as_u64() }))
         }
 
-        Request::Close { pane, force } => {
+        Request::Close {
+            pane,
+            force,
+            caller_role,
+        } => {
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
 
             // worker 保護: orchestrator-worker role のペインが busy なら拒否
@@ -635,7 +639,10 @@ fn dispatch_inner(
                 }
                 Err(e) => return Err(op_err(e)),
             }
-            host.detach_session(target);
+            // #566: 発生源（CLI / MCP + 呼び出し元 role）をペインログへ残す。
+            // dispatch 経由の close は確認を挟まない（AI フルコントロール維持）ぶん、
+            // 「誰が閉じたか」を事後に追える形にしておく
+            host.detach_session(target, close_origin_of(origin), caller_role.as_deref());
             // #390: worker レジストリの該当エントリを closed へ（worker でなければ no-op。
             // PTY 死亡（Exited）はここを通らないため「pane が消えても worker は生存」の
             // 追跡は維持される）
@@ -2236,7 +2243,7 @@ fn dispatch_inner(
             if host.workspace_mut().remove_shelved(pane_id).is_none() {
                 return Err(DispatchError::PaneNotFound(pane));
             }
-            host.detach_session(pane_id);
+            host.detach_session(pane_id, close_origin_of(origin), None);
             Ok(json!({ "killed": pane }))
         }
 
@@ -2664,7 +2671,7 @@ fn dispatch_inner(
                         }
                         Err(e) => return Err(op_err(e)),
                     }
-                    host.detach_session(target);
+                    host.detach_session(target, close_origin_of(origin), None);
                     Ok(())
                 };
             match action.as_str() {
@@ -3696,7 +3703,7 @@ fn dispatch_inner(
 
                     if should_close {
                         let _ = tree_mut(host.workspace_mut(), tab_id).close(target);
-                        host.detach_session(target);
+                        host.detach_session(target, close_origin_of(origin), None);
                     }
 
                     Ok(json!({
@@ -6785,6 +6792,18 @@ fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
         .tree_mut()
 }
 
+/// dispatch の呼び出し経路をペインログのクローズ発生源へ写す（Issue #566）。
+/// `PaneOrigin::User` は GUI が dispatch を直接呼ぶ経路（Web ビュー close 等）で、
+/// キーバインドや × ボタンとは区別できないため一般の dispatch として記録する
+fn close_origin_of(origin: PaneOrigin) -> tako_core::pane_log::CloseOrigin {
+    use tako_core::pane_log::CloseOrigin;
+    match origin {
+        PaneOrigin::Cli => CloseOrigin::Cli,
+        PaneOrigin::Mcp => CloseOrigin::Mcp,
+        PaneOrigin::User | PaneOrigin::Suggestion => CloseOrigin::Dispatch,
+    }
+}
+
 fn op_err(e: impl std::fmt::Display) -> DispatchError {
     DispatchError::Operation(e.to_string())
 }
@@ -7626,6 +7645,7 @@ fn dispatch_stale_binary_dismiss(
 mod tests {
     use super::*;
     use crate::protocol::Axis;
+    use tako_core::pane_log::CloseOrigin;
     use tako_core::TerminalSession;
 
     /// セッションを起動しないテスト用ホスト（レイアウト操作の検証に使う）
@@ -7634,6 +7654,8 @@ mod tests {
         attached: Vec<u64>,
         attached_options: std::collections::HashMap<u64, SpawnOptions>,
         detached: Vec<u64>,
+        /// #566: close の発生源マーカー（ペインログへ書かれる文字列と同一）
+        detached_markers: Vec<String>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
         preview_outlines: std::collections::HashMap<u64, tako_core::PreviewOutline>,
@@ -7661,6 +7683,7 @@ mod tests {
                 attached: Vec::new(),
                 attached_options: std::collections::HashMap::new(),
                 detached: Vec::new(),
+                detached_markers: Vec::new(),
                 previews: std::collections::HashMap::new(),
                 preview_views: std::collections::HashMap::new(),
                 preview_outlines: std::collections::HashMap::new(),
@@ -7716,8 +7739,10 @@ mod tests {
             self.attached.push(pane.as_u64());
             self.attached_options.insert(pane.as_u64(), options);
         }
-        fn detach_session(&mut self, pane: PaneId) {
+        fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
             self.detached.push(pane.as_u64());
+            self.detached_markers
+                .push(origin.marker_with_caller(caller));
             self.previews.remove(&pane.as_u64());
             self.preview_views.remove(&pane.as_u64());
             self.preview_outlines.remove(&pane.as_u64());
@@ -8003,6 +8028,7 @@ mod tests {
             Request::Close {
                 pane: Some(new_id),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -8010,6 +8036,69 @@ mod tests {
         assert_eq!(result["closed"].as_u64(), Some(new_id));
         assert_eq!(host.detached, vec![new_id]);
         assert_eq!(host.ws.active_tab().tree().len(), 1);
+    }
+
+    /// #566: dispatch 経由の close は確認を挟まない（AI フルコントロール維持）が、
+    /// 発生源は必ず記録する。CLI / MCP / 呼び出し元 role が事後に区別できること
+    #[test]
+    fn dispatch_closeは経路と呼び出し元をペインログへ記録する() {
+        // CLI 経由（role なし）
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let cli_pane = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(cli_pane),
+                force: false,
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.detached_markers,
+            vec!["close:dispatch(cli)".to_string()]
+        );
+
+        // MCP 経由（呼び出し元 role つき = どのエージェントが閉じたか）
+        let mcp_pane = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(mcp_pane),
+                force: false,
+                caller_role: Some("orchestrator-master:takodev".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            host.detached_markers[1],
+            "close:dispatch(mcp, caller=orchestrator-master:takodev)"
+        );
+    }
+
+    /// #566: BackgroundKill（たまり場からの kill）も発生源が残る
+    #[test]
+    fn background_killも発生源を記録する() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: Some(pane),
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        dispatch(&mut host, Request::BackgroundKill { pane }, PaneOrigin::Mcp).unwrap();
+        assert_eq!(
+            host.detached_markers,
+            vec!["close:dispatch(mcp)".to_string()]
+        );
     }
 
     #[test]
@@ -8031,6 +8120,7 @@ mod tests {
             Request::Close {
                 pane: Some(root),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -8048,6 +8138,7 @@ mod tests {
             Request::Close {
                 pane: Some(root),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -9403,6 +9494,7 @@ mod tests {
             Request::Close {
                 pane: None,
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -9413,6 +9505,7 @@ mod tests {
             Request::Close {
                 pane: Some(99999),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -11711,6 +11804,7 @@ mod tests {
                 Request::Close {
                     pane: Some(worker_pane),
                     force: true,
+                    caller_role: None,
                 },
                 PaneOrigin::Cli,
             )

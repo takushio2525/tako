@@ -359,27 +359,34 @@ pub fn has_running_children(backend_session: &str) -> bool {
 }
 
 /// バックエンドセッション群のうち実行中の子プロセスを持つものの数を返す。
-/// tmux list-panes + ps を各 1 回だけ実行し、全セッションをバッチ判定する。
 /// sleep_guard の busy_agents カウントで persist 復元後の worker を拾うために使う（#324）
 pub fn count_sessions_with_running_children(sessions: &[&str]) -> usize {
+    sessions_with_running_children(sessions).len()
+}
+
+/// バックエンドセッション群のうち実行中の子プロセスを持つものを列挙する。
+/// tmux list-panes + ps を各 1 回だけ実行し、全セッションをバッチ判定する。
+/// #566: close 確認の判定でも同じ結果を使う（UI スレッドから再実行しないよう
+/// 呼び出し側は結果をキャッシュする）
+pub fn sessions_with_running_children(sessions: &[&str]) -> Vec<String> {
     if sessions.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let socket = tako_core::tmux_backend::socket_name();
     let panes = tmux_pane_pids(Some(&socket));
     if panes.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let parents = process_parent_map();
-    count_sessions_with_children_inner(sessions, &panes, &parents)
+    sessions_with_children_inner(sessions, &panes, &parents)
 }
 
 /// バッチ判定の内部ロジック（テスト可能）
-fn count_sessions_with_children_inner(
+fn sessions_with_children_inner(
     sessions: &[&str],
     panes: &[(String, u32)],
     parents: &HashMap<u32, u32>,
-) -> usize {
+) -> Vec<String> {
     sessions
         .iter()
         .filter(|session| {
@@ -396,7 +403,8 @@ fn count_sessions_with_children_inner(
                 !pane_set.contains(&pid) && is_descendant_of(ppid, &pane_set, parents)
             })
         })
-        .count()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// pid が target_pids のいずれかの子孫（自身を含む）かどうか
@@ -518,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn count_sessions_with_children_innerで子プロセスありをカウント() {
+    fn sessions_with_children_innerで子プロセスありをカウント() {
         // セッション tako-s1 に pane_pid=100、子プロセス 200→100
         let panes = vec![
             ("tako-s1:0.0".to_string(), 100u32),
@@ -532,20 +540,20 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            count_sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
-            1 // tako-s1 だけ
+            sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
+            vec!["tako-s1".to_string()] // tako-s1 だけ
         );
     }
 
     #[test]
-    fn count_sessions_with_children_innerで空入力は0() {
+    fn sessions_with_children_innerで空入力は0() {
         let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
         let parents: HashMap<u32, u32> = [(100, 1), (200, 100)].into();
-        assert_eq!(count_sessions_with_children_inner(&[], &panes, &parents), 0);
+        assert!(sessions_with_children_inner(&[], &panes, &parents).is_empty());
     }
 
     #[test]
-    fn count_sessions_with_children_innerで複数セッションの子プロセスをカウント() {
+    fn sessions_with_children_innerで複数セッションの子プロセスをカウント() {
         let panes = vec![
             ("tako-s1:0.0".to_string(), 100u32),
             ("tako-s2:0.0".to_string(), 300u32),
@@ -558,19 +566,16 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            count_sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
-            2
+            sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
+            vec!["tako-s1".to_string(), "tako-s2".to_string()]
         );
     }
 
     #[test]
-    fn count_sessions_with_children_innerで存在しないセッションは無視() {
+    fn sessions_with_children_innerで存在しないセッションは無視() {
         let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
         let parents: HashMap<u32, u32> = [(100, 1)].into();
-        assert_eq!(
-            count_sessions_with_children_inner(&["tako-nonexist"], &panes, &parents),
-            0
-        );
+        assert!(sessions_with_children_inner(&["tako-nonexist"], &panes, &parents).is_empty());
     }
 
     // --- #439: live claude セッションの一括解決 ---

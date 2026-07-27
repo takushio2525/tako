@@ -797,6 +797,31 @@ FR-2.7.6 は画像ペインを並べて実現する）。
   バックエンドセッションは表示ペインを失っても生き続けられる（orphan として tmuxview に
   出る）構造が、ー 退避の前提となる
 
+### close の確認ガードと発生源の監査（Issue #566。2026-07-27 仕様化）
+
+2026-07-27、稼働中の master ペインが cmd+W の誤爆で確認なしに消え、原因調査に
+master 1 セッション分の工数がかかった。事故の内訳は「確認が無い」と「事後に追えない」の 2 つで、
+両方をここで塞ぐ。
+
+- **確認ガード**（既定 ON。`confirm_close` = config.yaml / `tako confirm-close` /
+  MCP `tako_confirm_close` で OFF 可）: GUI の × ボタン・**cmd+W** の close は、対象が
+  次のいずれかなら確認ダイアログを挟む。⌘ を押しながらの × クリックは従来どおりスキップ
+  - role 付きペイン（`orchestrator-master` / `orchestrator-worker` / `solo` 等 = エージェント）
+  - シェルがコマンド実行中（OSC 133 の Running）
+  - バックエンドセッション配下で子プロセスが動いている（TUI エージェントは OSC 133 を
+    出さないため。判定は sleep guard（FR-5 系）の 2 秒ごとの定期スキャン結果を再利用し、
+    UI スレッドから tmux / ps を起こさない）
+  - タブの × は、タブ内に上記のペインが 1 つでもあれば確認する
+  - 上記に当たらない**空のシェルペインは確認なしで即 close**（日常操作の邪魔をしない）
+- **CLI / MCP の close は確認を挟まない**（設計原則 5「AI フルコントロール」を維持）。
+  代わりに発生源を必ず記録する
+- **発生源の記録**: ペインログ（FR-5.13）のクローズマーカーへ発生源を書く。
+  `close:kbd`（cmd+W）/ `close:gui`（ペイン ×）/ `close:gui-tab`（タブ ×）/
+  `close:dispatch(cli)` / `close:dispatch(mcp[, caller=<role>])` / `close:internal`
+  （アプリ内部の後始末）/ `close:app-quit`（アプリ終了）/ `exit`（PTY 死亡）。
+  `caller` は接続時の `TAKO_ORCHESTRATOR_ROLE` 由来で、ツール引数からは詐称できない。
+  マーカー書式を壊さないよう英数と `-_:.` へ正規化し 64 文字で打ち切る
+
 実装詳細は `architecture.md`「Phase 5.5: tmux バックエンド永続化」節。
 
 ## FR-6 リモートアクセス（スマホから）
