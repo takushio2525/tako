@@ -217,6 +217,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_fda` | フルディスクアクセスの状態確認と設定画面の起動 |
 | `tako_telemetry` | エラーレポート自動送信（テレメトリ）の状態確認・切替 |
 | `tako_agents_sync_rules` | エージェント共通ルールを各 CLI の指示ファイルへ同期する |
+| `tako_config_share` | AI 系設定（claude のグローバル指示 + tako の宣言的設定）の git ベース共有 |
 | `tako_sessions` | セッションカタログの参照と会話の復元 |
 | `tako_logs` | ペインの平文ターミナルログの参照・設定 |
 

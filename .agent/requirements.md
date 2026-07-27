@@ -961,6 +961,22 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 | FR-5.12 | **セッションカタログ**（Issue #112 A）: 会話本文は保存せず（claude が `~/.claude/projects/` に永続化済み・二重保存回避）、session_id への参照 + メタデータ（ラベル・ロール master/worker/solo/pane・プロファイル・agent 種別・プロンプト由来の Issue 番号・プロジェクト・タブ/ペイン・cwd・開始/最終時刻・ペインログとの突き合わせ）を `<data_dir>/sessions.yaml`（config_io 保護。`TAKO_SESSIONS_FILE` で隔離可）へ索引化する。spawn 時は tmux セッション名キーの pending 記録 → GUI の定期スキャン（`claude agents --json` × pid 祖先照合）が session_id 検出時に昇格。`tako sessions list/show/resume` + MCP `tako_sessions` で 1:1。resume は記録 cwd で新ペインを分割し `claude --resume <id>` を注入（ペイン/タブ/tmux 全滅 + アプリ再起動後も会話文脈ごと復元できることを e2e 実証済み）。**制限**: resume は claude のみ（codex / agy はカタログに載るが復元不可を明示エラーで案内。session 参照手段が安定して取れないため） | M | ✅ 2026-07-14 |
 | FR-5.13 | **ペインの平文ターミナルログ**（Issue #112 B）: 全ペインのスクロールバック**確定行**（直接ペイン = alacritty history 増分、tmux バックエンド = `#{history_size}` 増分 + `capture-pane -p`）を平文でローテーション保存し、ペイン / タブ / アプリが死んでも `tako logs` / MCP `tako_logs` で遡れる。alt screen（TUI）中は history が増えないため claude 等の描画スパムは構造的に除外（「TUI 実行中」マーカーのみ）。close / exit 時は可視画面をフラッシュ。サイズ管理: ペインあたり上限（既定 5MB・`.1` 世代ローテーション）+ 全体上限（既定 200MB・古い順削除）+ 1 tick 400 行上限（超過は省略マーカー）。settings.json（`pane_logs` / `pane_log_max_mb` / `pane_log_total_max_mb`）で ON/OFF・上限調整可（既定 ON）。**プライバシー**: ログにはトークン等が写り込みうるため `<data_dir>/pane-logs/`（ユーザーローカル）限定・リポジトリ / 同期対象に置かない。「ペイン内容をログに出さない」規約（conventions）は tako 自身の診断ログに対するもので、本機能はユーザーが管理するローカルデータとして明示の例外とする | M | ✅ 2026-07-14 |
 
+### FR-5.14 AI 系設定の git ベース共有（Issue #513。2026-07-28 実装）
+
+複数デバイス（mac ⇔ Windows）で「AI の記憶」を揃えるための任意機能。
+`tako config` / MCP `tako_config_share` で、git リポジトリ 1 本を介して同期する。
+
+| ID | 要件 | 優先度 | 状況 |
+|---|---|---|---|
+| FR-5.14.1 | **共有対象はホワイトリスト**。分類カタログ（`config_share::catalog::CATALOG`）が正本で、`shared` / `local` / `secret` を日英の理由つきで宣言する。**カタログに無いファイルは共有しない**（fail-closed）。tako がデータディレクトリ配下へ書くパスの分類漏れは `tests/config_share_catalog.rs` が検出する（#515 のサポートマトリクスと同じ「忘れたらテストが落ちる」構造） | M | ✅ 2026-07-28 |
+| FR-5.14.2 | **秘匿情報を構造的に分離**。token / control.json / relay_secret / `~/.claude/.claude.json` / credentials は `secret` 分類で共有しない。さらに書き出し直前に内容を走査し、資格情報らしき文字列を見つけたら push を**止める**（多層防御。値はエラー文にも出さない） | M | ✅ 2026-07-28 |
+| FR-5.14.3 | **マシンローカル状態を分離**。layout.json / sessions.yaml / workers.yaml / ペインログ / handoff / 各種ログは `local` 分類。ファイル単位で切れないものは**フィールド単位**で切る（`accounts.*.config_dir` = 資格情報の在り処、profile の `env` = API キーが入りうる、`welcome_dismissed` 等の UI 操作履歴、`setup.completed_at` 等の実施記録）。取り込み時はローカル値を残し、埋める必要がある値を `needs_local` として報告する（`inherit: true` のアカウントのように「無くて当然」のものは免除） | M | ✅ 2026-07-28 |
+| FR-5.14.4 | **パス可搬性**: 設定内の絶対パスは、ホーム配下ならリポジトリ上で `~/…`（区切りは `/`）に正規化し、取り込み時にそのデバイスのホーム + そのプラットフォームの区切りへ戻す。markdown は `~` のままにする（人と AI が読む表記であり、展開すると実パスが本文へ混ざるため）。ホーム配下でない絶対パスは可搬化できないので `status` が警告する。判定は区切り文字を引数で受ける純粋関数で、**macOS 上から Windows 側の変換を検証できる** | M | ✅ 2026-07-28 |
+| FR-5.14.5 | **配線と同期**: `tako config init`（新規作成 + 初回書き出し）/ `link <パス\|URL>`（既存へ接続・URL は clone）/ `unlink` / `push`（変換 → 検査 → commit → push）/ `pull`（`--ff-only` + 世代バックアップつき取り込み）/ `status`（差分）/ `list`（分類表）。実体は**コピー同期**であって symlink ではない（`config_io::atomic_write` の rename が symlink を実ファイルに置き換えて配線を壊すため。Windows の symlink 権限問題も回避） | M | ✅ 2026-07-28 |
+| FR-5.14.6 | **リポジトリ側を信用しない**: pull は分類が `shared` のパスだけを実体へ書く（リポジトリに `tako/token` を置いても実体は書き換わらない）。利用者が手で置いたファイルは削除も取り込みもせず「管理外」として報告する。削除の伝播は tako が書いた `manifest.yaml` の記録に限る | M | ✅ 2026-07-28 |
+| FR-5.14.7 | **setup ではオプション**（#262 の質問ゼロ原則を壊さない）: 標準 `tako setup` は案内 1 行のみで質問を増やさない。`--review` の対話でだけ y/N を 1 回聞き、`--answers` / MCP `tako_setup` の `config_share` で非対話配線もできる | M | ✅ 2026-07-28 |
+| FR-5.14.8 | Windows 実機での配線確認（#467 と合流）。実装はプラットフォーム共通で、変換の Windows 表記は macOS 上の単体テストで検証済み | S | ⏳ #513 継続 |
+
 ### close 操作とバックエンドセッションの整合（2026-06-12 仕様化）
 
 - **ペインの明示 close**（× ボタン / cmd+W / CLI・MCP の close）= 対応するバックエンド

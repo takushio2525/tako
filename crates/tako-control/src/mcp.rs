@@ -2224,6 +2224,54 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_config_share",
+            "description": "AI 系設定の git ベース共有（Issue #513）。tako の宣言的設定\
+                （profiles / projects / accounts / local-rules / settings）と claude の\
+                グローバル指示（CLAUDE.md / snippets / commands / templates）を 1 つの git\
+                リポジトリでデバイス間（mac ⇔ Windows）共有する。\
+                action=status（既定）で配線状態と push / pull 待ちの差分。\
+                action=init で共有リポジトリを新規作成して配線（--remote で origin 登録）。\
+                action=link で既存リポジトリ（ローカルパスまたは git URL）へ配線。\
+                action=push で実体 → リポジトリへ書き出し + commit（+ push）。\
+                action=pull でリポジトリ → 実体へ取り込み（世代バックアップつき）。\
+                action=list で共有 / 非共有の分類表。\
+                秘匿情報（token / credentials / .claude.json）とマシンローカル状態\
+                （layout.json / sessions.yaml / workers.yaml）はホワイトリストで構造的に除外され、\
+                未分類のファイルは共有されない。設定内の絶対パスはホーム部分が ~ に置き換わる。\
+                ユーザーが「別の PC でも同じ設定を使いたい」と言ったらこれを使うこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "init", "link", "unlink", "push", "pull", "list"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "link の対象（ローカルパスまたは git URL）",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "リポジトリの配置先（init / URL clone 時。省略時は ~/tako-config-sync）",
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "init 時に origin として登録するリモート URL",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "push のコミットメッセージ",
+                    },
+                    "no_push": {
+                        "type": "boolean",
+                        "description": "true でリモートへ送らずコミットまでで止める",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_platform",
             "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
                 どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\
@@ -3796,6 +3844,14 @@ fn build_request(
         "tako_welcome" => Request::Welcome {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
+        "tako_config_share" => Request::ConfigShare {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            target: str_arg(args, "target")?.map(|s| s.to_string()),
+            path: str_arg(args, "path")?.map(|s| s.to_string()),
+            remote: str_arg(args, "remote")?.map(|s| s.to_string()),
+            message: str_arg(args, "message")?.map(|s| s.to_string()),
+            no_push: bool_arg(args, "no_push")?.unwrap_or(false),
+        },
         "tako_platform" => Request::Platform {
             platform: str_arg(args, "platform")?.map(|s| s.to_string()),
             status: str_arg(args, "status")?.map(|s| s.to_string()),
@@ -4651,6 +4707,69 @@ mod tests {
         );
     }
 
+    /// **#513 受け入れ条件 4**: MCP → dispatch の写像が CLI と 1:1 であること
+    #[test]
+    fn tako_config_shareはリクエストに変換される() {
+        // 省略 = status（CLI の `tako config` と同じ既定）
+        let (response, requests) = run(call("tako_config_share", json!({})), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::ConfigShare {
+                action: None,
+                target: None,
+                path: None,
+                remote: None,
+                message: None,
+                no_push: false,
+            }]
+        );
+        assert_eq!(response.unwrap()["result"]["isError"], false);
+
+        let (_, requests) = run(
+            call(
+                "tako_config_share",
+                json!({
+                    "action": "push",
+                    "message": "[改善] 設定を更新",
+                    "no_push": true,
+                }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::ConfigShare {
+                action: Some("push".into()),
+                target: None,
+                path: None,
+                remote: None,
+                message: Some("[改善] 設定を更新".into()),
+                no_push: true,
+            }]
+        );
+
+        let (_, requests) = run(
+            call(
+                "tako_config_share",
+                json!({ "action": "link", "target": "git@example.com:me/cfg.git", "path": "~/cfg" }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::ConfigShare {
+                action: Some("link".into()),
+                target: Some("git@example.com:me/cfg.git".into()),
+                path: Some("~/cfg".into()),
+                remote: None,
+                message: None,
+                no_push: false,
+            }]
+        );
+    }
+
     #[test]
     fn tako_orchestrator_layoutはリクエストに変換される() {
         // 全省略 = 取得
@@ -4765,7 +4884,8 @@ mod tests {
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）。
         // #549 の tako_welcome と #552 の tako_pin_tab_title が別 PR で同時に
         // 125 → 126 へ更新したため、両方 merge 後の main では 127 とずれていた
-        assert_eq!(tools.len(), 128);
+        // #513 の tako_config_share を追加して 129
+        assert_eq!(tools.len(), 129);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

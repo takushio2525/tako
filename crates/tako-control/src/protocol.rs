@@ -1334,6 +1334,27 @@ pub enum Request {
         #[serde(default)]
         action: Option<String>,
     },
+    /// AI 系設定（tako の宣言的設定 + claude のグローバル指示）の git ベース共有（Issue #513）。
+    /// `action` = "status"（既定）/ "init" / "link" / "unlink" / "push" / "pull" / "list"
+    ConfigShare {
+        #[serde(default)]
+        action: Option<String>,
+        /// link の対象（ローカルパスまたは git URL）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        /// リポジトリの配置先（init / URL からの clone 時。省略時は `~/tako-config-sync`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// init 時に origin として登録するリモート URL
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+        /// push のコミットメッセージ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// push でリモートへ送らない（コミットまでで止める）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_push: bool,
+    },
 }
 
 impl Request {

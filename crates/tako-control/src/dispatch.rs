@@ -2475,6 +2475,23 @@ fn dispatch_inner(
             default_effort.as_deref(),
         ),
 
+        // #513: AI 系設定の git ベース共有
+        Request::ConfigShare {
+            action,
+            target,
+            path,
+            remote,
+            message,
+            no_push,
+        } => dispatch_config_share(
+            action.as_deref().unwrap_or("status"),
+            target.as_deref(),
+            path.as_deref(),
+            remote.as_deref(),
+            message.as_deref(),
+            no_push,
+        ),
+
         Request::OrchestratorLayout {
             policy,
             master_ratio,
@@ -4859,6 +4876,42 @@ fn account_json(a: &crate::orchestrator::ResolvedAccount) -> Value {
         "default_model": a.default_model,
         "default_effort": a.default_effort,
     })
+}
+
+/// AI 系設定の git ベース共有（Issue #513）。host 非依存（ファイルと git だけ）のため
+/// pub にし、CLI `tako config` からもローカル呼び出しで共用する
+/// （MCP `tako_config_share` と 1:1。GUI が動いていなくても使える）
+pub fn dispatch_config_share(
+    action: &str,
+    target: Option<&str>,
+    path: Option<&str>,
+    remote: Option<&str>,
+    message: Option<&str>,
+    no_push: bool,
+) -> Result<Value, DispatchError> {
+    use crate::config_share;
+    let result = match action {
+        "status" => config_share::status(),
+        "list" => Ok(config_share::list()),
+        "init" => config_share::init(path, remote),
+        "link" => {
+            let target = target.ok_or_else(|| {
+                DispatchError::Operation(
+                    "link には対象（リポジトリのパスまたは URL）が必要です".into(),
+                )
+            })?;
+            config_share::link(target, path)
+        }
+        "unlink" => config_share::unlink(),
+        "push" => config_share::push(message, no_push),
+        "pull" => config_share::pull(),
+        other => {
+            return Err(DispatchError::Operation(format!(
+                "不明な action: {other}。status | init | link | unlink | push | pull | list"
+            )))
+        }
+    };
+    result.map_err(DispatchError::Operation)
 }
 
 /// アカウントレジストリの CRUD（Issue #504 / #512）。host 非依存

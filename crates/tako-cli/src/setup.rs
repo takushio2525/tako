@@ -1431,6 +1431,168 @@ fn print_next_steps(master_ready: bool) {
     eprintln!("  「品質重視にして」「利用回数を節約して」のような調整は master に日本語で頼めます");
 }
 
+/// 設定共有ステップの決定（Issue #513）。
+/// **標準 setup で質問が増えないこと**を機械検証できるよう、判定だけを純粋関数にする
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigShareStep {
+    /// 何もしない（明示的に無効と回答された）
+    Skip,
+    /// 案内 1 行だけ。**質問しない**
+    Info,
+    /// すでに配線済みなので状態だけ知らせる
+    AlreadyLinked,
+    /// 対話で 1 回だけ聞く（`--review` の TTY 経路のみ）
+    Ask,
+    /// 指定内容で配線する（非対話）
+    Link {
+        repo: Option<String>,
+        path: Option<String>,
+        remote: Option<String>,
+    },
+}
+
+fn decide_config_share_step(
+    review: bool,
+    assume_yes: bool,
+    is_tty: bool,
+    already_linked: bool,
+    answers: Option<&tako_control::setup::SetupConfigShareAnswers>,
+) -> ConfigShareStep {
+    // 明示指定が最優先（MCP `tako_setup` / `--answers` 経路）。配線済みでも指定に従う
+    if let Some(answer) = answers {
+        if answer.enable != Some(true) {
+            return ConfigShareStep::Skip;
+        }
+        return ConfigShareStep::Link {
+            repo: answer.repo.clone(),
+            path: answer.path.clone(),
+            remote: answer.remote.clone(),
+        };
+    }
+    if already_linked {
+        return ConfigShareStep::AlreadyLinked;
+    }
+    // 聞いてよいのは `--review` の対話だけ。標準 setup（#262 の質問ゼロ）は案内どまり
+    if review && !assume_yes && is_tty {
+        ConfigShareStep::Ask
+    } else {
+        ConfigShareStep::Info
+    }
+}
+
+/// 設定共有（Issue #513）の案内・配線。**標準 setup では質問を増やさない**（#262）。
+///
+/// - `answers.config_share` があれば非対話で配線する（MCP `tako_setup` / `--answers` 経路）
+/// - `--review` の対話では y/N で 1 回だけ聞く
+/// - それ以外は「こういう機能がある」の 1 行案内だけ（質問しない）
+///
+/// 失敗しても setup 全体は止めない（共有はオプションであって前提ではない）
+fn apply_config_share(
+    review: bool,
+    assume_yes: bool,
+    answers: Option<&tako_control::setup::SetupConfigShareAnswers>,
+) -> Result<(), String> {
+    let already_linked = tako_control::config_share::load_state()
+        .ok()
+        .flatten()
+        .is_some();
+    let step = decide_config_share_step(
+        review,
+        assume_yes,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        already_linked,
+        answers,
+    );
+    match step {
+        ConfigShareStep::Skip => return Ok(()),
+        ConfigShareStep::Link { repo, path, remote } => {
+            return run_config_share_link(repo.as_deref(), path.as_deref(), remote.as_deref())
+        }
+        ConfigShareStep::AlreadyLinked => {
+            eprintln!();
+            eprintln!("  [OK] 設定共有は配線済みです（`tako config status` で差分を確認できます）");
+            return Ok(());
+        }
+        ConfigShareStep::Info => {
+            eprintln!();
+            eprintln!("設定共有（任意）: 複数デバイスで同じ AI 設定を使うなら `tako config init`");
+            eprintln!("  claude のグローバル指示と tako の宣言的設定を git 1 本で共有します");
+            eprintln!("  秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます");
+            return Ok(());
+        }
+        ConfigShareStep::Ask => {}
+    }
+
+    eprintln!();
+    eprintln!("設定共有（任意。Issue #513）");
+    eprintln!("  claude のグローバル指示（CLAUDE.md / snippets / commands / templates）と");
+    eprintln!("  tako の宣言的設定（profiles / projects / accounts / local-rules）を");
+    eprintln!("  git リポジトリ 1 本で別デバイスと共有できます。");
+    eprintln!("  秘匿情報（token / credentials）とマシン固有の状態は構造的に除外されます。");
+    eprint!("  いま設定しますか？ [y/N]: ");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return Ok(());
+    }
+    let answer = input.trim().to_ascii_lowercase();
+    if answer != "y" && answer != "yes" {
+        eprintln!("  スキップしました（あとから `tako config init` で設定できます）");
+        return Ok(());
+    }
+
+    eprintln!("  既存の共有リポジトリがあればパスか URL を、無ければ Enter（新規作成）");
+    eprint!("  リポジトリ: ");
+    let mut repo = String::new();
+    if std::io::stdin().read_line(&mut repo).is_err() {
+        return Ok(());
+    }
+    let repo = repo.trim().to_string();
+    if !repo.is_empty() {
+        return run_config_share_link(Some(&repo), None, None);
+    }
+    eprintln!("  新規作成します。GitHub 等に置くならリモート URL を、ローカルだけなら Enter");
+    eprint!("  リモート URL: ");
+    let mut remote = String::new();
+    if std::io::stdin().read_line(&mut remote).is_err() {
+        return Ok(());
+    }
+    let remote = remote.trim().to_string();
+    run_config_share_link(None, None, (!remote.is_empty()).then_some(remote.as_str()))
+}
+
+/// 実際の配線（新規作成 or 既存への接続）。dispatch を通すので CLI / MCP と経路が同じ
+fn run_config_share_link(
+    repo: Option<&str>,
+    path: Option<&str>,
+    remote: Option<&str>,
+) -> Result<(), String> {
+    let (action, target) = match repo {
+        Some(repo) => ("link", Some(repo)),
+        None => ("init", None),
+    };
+    match tako_control::dispatch::dispatch_config_share(action, target, path, remote, None, false) {
+        Ok(result) => {
+            let repo_path = result["repo"]
+                .as_str()
+                .or_else(|| result["push"]["repo"].as_str())
+                .unwrap_or("?");
+            eprintln!("  [OK] 設定共有を配線しました: {repo_path}");
+            if action == "link" {
+                eprintln!("       `tako config pull` でこのデバイスへ取り込めます");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // 共有はオプション。ここで setup 全体を落とさない
+            eprintln!("  [警告] 設定共有の配線に失敗しました: {e}");
+            eprintln!(
+                "       あとから `tako config init` / `tako config link <パス>` で設定できます"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// グローバル指示ファイルを解決し、既存内容は同梱推奨ルールと項目レベルで比較する（Issue #322）。
 /// 戻り値は setup-context.yaml へ書かれ、`--review` の setup agent が裏取りに使う。
 /// None = 同梱既定で新規作成（既定は全項目カバー済みのため比較不要。機械検証は tako-control のテスト）
@@ -2065,6 +2227,9 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     eprintln!();
     eprintln!("スマホからリモート接続するには: tako remote setup");
 
+    // 設定共有（#513）。標準経路では案内 1 行だけ = 質問を増やさない（#262）
+    apply_config_share(review_mode, assume_yes, answers.config_share.as_ref())?;
+
     // --- 対話エージェント起動（Issue #295 / #322 / #391）---
     // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
     // スキップ条件: --yes / 非 TTY / --answers launch_agent=none
@@ -2388,5 +2553,88 @@ mod tests {
         // pending-changes.md への言及がある（Issue #94）
         assert!(SYSTEM_PROMPT.contains("pending-changes.md"));
         assert!(SYSTEM_PROMPT.contains("changes.yaml"));
+    }
+
+    /// **#513 受け入れ条件 3**: 設定共有はオプションであり、
+    /// 標準 setup（`--review` なし）では質問が 1 つも増えないこと
+    mod config_share_step {
+        use super::super::{decide_config_share_step, ConfigShareStep};
+        use tako_control::setup::SetupConfigShareAnswers;
+
+        fn decide(
+            review: bool,
+            assume_yes: bool,
+            is_tty: bool,
+            linked: bool,
+            answers: Option<&SetupConfigShareAnswers>,
+        ) -> ConfigShareStep {
+            decide_config_share_step(review, assume_yes, is_tty, linked, answers)
+        }
+
+        #[test]
+        fn 標準setupは対話端末でも質問しない() {
+            // review=false = 標準 setup。TTY があっても Ask にならない（#262 質問ゼロ）
+            assert_eq!(
+                decide(false, false, true, false, None),
+                ConfigShareStep::Info
+            );
+        }
+
+        #[test]
+        fn yesと非対話も質問しない() {
+            assert_eq!(decide(true, true, true, false, None), ConfigShareStep::Info);
+            assert_eq!(
+                decide(true, false, false, false, None),
+                ConfigShareStep::Info
+            );
+        }
+
+        #[test]
+        fn reviewの対話でだけ聞く() {
+            assert_eq!(decide(true, false, true, false, None), ConfigShareStep::Ask);
+        }
+
+        #[test]
+        fn 明示回答は非対話で配線する() {
+            let answers = SetupConfigShareAnswers {
+                enable: Some(true),
+                repo: Some("~/tako-config-sync".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                decide(false, true, false, false, Some(&answers)),
+                ConfigShareStep::Link {
+                    repo: Some("~/tako-config-sync".into()),
+                    path: None,
+                    remote: None,
+                }
+            );
+        }
+
+        #[test]
+        fn 明示的に無効なら何もしない() {
+            let answers = SetupConfigShareAnswers {
+                enable: Some(false),
+                ..Default::default()
+            };
+            assert_eq!(
+                decide(true, false, true, false, Some(&answers)),
+                ConfigShareStep::Skip
+            );
+            // enable 省略も「触らない」（既定で有効化しない）
+            let empty = SetupConfigShareAnswers::default();
+            assert_eq!(
+                decide(true, false, true, false, Some(&empty)),
+                ConfigShareStep::Skip
+            );
+        }
+
+        #[test]
+        fn 配線済みなら聞き直さない() {
+            assert_eq!(
+                decide(true, false, true, true, None),
+                ConfigShareStep::AlreadyLinked
+            );
+        }
     }
 }

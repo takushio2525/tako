@@ -15,12 +15,14 @@
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
 //! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
 //!   プロセス間ロック・世代バックアップ。Issue #169）
+//! - config_share: AI 系設定の git ベース共有（分類カタログ・可搬化・秘匿検査。Issue #513）
 
 pub mod acceptance_gates;
 pub mod agents;
 pub mod agents_sync;
 pub mod claude_tui;
 pub mod config_io;
+pub mod config_share;
 pub mod diag;
 pub mod discovery;
 pub mod dispatch;

@@ -12,6 +12,29 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ### Added
 
+- **[macOS] AI 系設定を git でデバイス間共有できるようにした（#513）**:
+  `tako config init` / `link` / `push` / `pull` / `status` / `list`（MCP `tako_config_share` と 1:1）。
+  claude のグローバル指示（`CLAUDE.md` / snippets / commands / templates）と tako の宣言的設定
+  （profiles / projects / accounts / local-rules / settings）を git リポジトリ 1 本で共有する。
+  共有対象は**ホワイトリスト**で、カタログに載っていないファイルは共有しない。
+  秘匿情報（token / credentials / `.claude.json`）とマシンローカル状態（layout.json /
+  sessions.yaml / workers.yaml / ペインログ）は構造的に除外し、ファイル単位で切れないもの
+  （アカウントの `config_dir`・profile の `env`・UI の操作履歴）はフィールド単位で切る。
+  設定内の絶対パスはホーム部分が `~` に正規化されるので、mac と Windows でホームの位置が
+  違っても同じリポジトリを使える。**任意機能**であり `tako setup` の質問は増えない。
+  *Share your AI configuration across devices through one git repository:
+  `tako config init` / `link` / `push` / `pull` / `status` / `list` (1:1 with MCP
+  `tako_config_share`). It covers Claude's global instructions (`CLAUDE.md`, snippets,
+  commands, templates) and tako's declarative settings (profiles, projects, accounts,
+  local rules, settings). What gets shared is an **allow-list** — anything not in the
+  catalog is never shared. Secrets (tokens, credentials, `.claude.json`) and machine-local
+  state (layout, sessions, workers, pane logs) are excluded structurally, and the parts
+  that cannot be split by file (an account's `config_dir`, a profile's `env`, UI dismissal
+  flags) are stripped field by field. Absolute paths are stored with the home prefix
+  normalized to `~`, so macOS and Windows can share the same repository. Entirely
+  optional: `tako setup` asks no new questions.*
+  Windows での実機配線確認は #467 と合流予定。
+  *Wiring on real Windows hardware is still pending, tracked with #467.*
 - **[macOS] 入力予測の確定キーを案内し、Tab でも確定できるようにした（#614）**:
   予測（薄いゴースト）の直後に `[→ か Tab で確定]` を薄く出す（既定 10 回で自動的に消え、
   設定 / `tako autosuggest hint off` / MCP で恒久 OFF にもできる）。加えて

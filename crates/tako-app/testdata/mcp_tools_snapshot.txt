@@ -7,6 +7,7 @@ tako_background_pane
 tako_check_health
 tako_close_pane
 tako_collapse_tab
+tako_config_share
 tako_confirm_close
 tako_create_tab
 tako_equalize_layout
