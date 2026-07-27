@@ -358,6 +358,25 @@ crates/tako-core/src/backend/
 `enum Backend { Tmux, None }` にはしない。呼び出し側が実装名で分岐した瞬間に
 B-1 の追加が全呼び出し側の変更になる。
 
+**M1（2026-07-27 実施）で合格条件を実際に満たした。** 段取り ①〜④ の時点では
+`main.rs` の本番 spawn 経路が `tmux_backend::wrap_options` を直呼びしており、
+B-1 を登録しても**その器は一度も使われない**状態だった。M1 で役割 A
+（生成・破棄・列挙・環境・tty）の呼び出しを `SessionBackend` 経由へ寄せた:
+
+- 器の割り当てと spawn の書き換えは `backend::wrap_spawn_for_pane` の 1 箇所
+  （`spawn_session` と `reserve_backend_session` が共有する）。問いは
+  「tmux があるか」でも「`survives_app_exit` か」でもなく **`reserve` が器を配るか**
+- 保護対象の名前が 1 件でも `SessionRef` にできないときは orphan 判定を**行わない**
+  （保護が欠けた集合で回すと守りたいセッションを誤爆する）
+- 再発防止は番犬テスト `器のライフサイクルの直呼びが境界の外に残っていない`
+  （`tests/platform_parity.rs`）。役割 B と `tako_tmux_*` の機能面は対象外
+
+**M2（session-host 本体）が触るのは `backend/` の中だけでよい。** 具体的には
+`Choice` へ実装を 1 つ足し、`SessionBackend` を実装する。呼び出し側は変更不要。
+M0 の実測（`poc/conpty-survival/`）が示す制約 — セッションホストは
+`DETACHED_PROCESS` で起動する — は `wrap_spawn` が返す `SpawnOptions` ではなく
+**ホストの起動側**の要件なので、この境界の形と矛盾しない。
+
 ---
 
 ## 4. 7 サブシステムの縮退時期待挙動

@@ -1325,3 +1325,19 @@
   縮退経路・セルフテスト・不変条件は ③ と同一の結果
 - 挙動差の申告: remote の起動拒否メッセージを「tmux が見つからない」から能力ベースの文面へ
 - 次: 段取り⑤（WorkerEntry.pid / report の pane_log フォールバック / delivery 表示）→ ⑥
+
+## 2026-07-27（Windows 永続化 M1: wrap_spawn の本番配線 — Windows 実機で作業）
+- 本番の spawn 経路が `tmux_backend::wrap_options` を直呼びしており、案 B-1（ConPTY
+  セッションホスト）を登録しても器が一度も使われない状態だった。役割 A（生成・破棄・
+  列挙・環境・tty）13 箇所を `SessionBackend` 経由へ寄せ、器の割り当てと spawn の
+  書き換えを `backend::wrap_spawn_for_pane` の 1 箇所に集約（設計 §3.6 の合格条件を充足）
+- 番犬テスト `器のライフサイクルの直呼びが境界の外に残っていない` を新設（違反注入で
+  FAILED を確認）。#522 の番犬が Windows で常に落ちていた原因（許可リストのパス比較が
+  `\` と `/` で不一致。#520 と同種）も共有スキャナ側で修正
+- 実測（隔離・Windows 実機・backend=none）: split / 明示コマンド / 復元の 3 経路で
+  ペイン生成 → シェル実動作、`session: null` の構造のみ永続化、強制終了 → 再起動で
+  1 タブ 2 ペイン + cwd 復元（再 attach 0 / 新規シェル 2）、persist OFF/ON の往復も通過
+- M0（ConPTY 生存検証）の使い捨てコードを `poc/conpty-survival/` として取り込み（罠 7 項目）
+- 関連コミット: `984de32`（境界）`7d4be2b`（本番配線）`9a995b4`（M0 PoC）。**push 禁止の
+  Windows 検証機のためローカルブランチ `windows/467-ipc-orchestration-local` に積むのみ**
+- 次: M2（session-host 本体）。触るのは `backend/` の中だけでよい状態になっている
