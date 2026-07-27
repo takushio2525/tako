@@ -299,6 +299,18 @@ pub fn wait_for_worker(
                     if let Some((kind, detail)) = error {
                         return WatchOutcome::Error { kind, detail };
                     }
+                    // #577: permission ダイアログは question より具体的な停止種別
+                    // （master の対応が `respond` になる）なので question より先に見る。
+                    // dispatch の応答を優先し、無ければ画面から自力検知する
+                    // （waiting へ格上げしない旧 tako-app に対しても watch 単体で
+                    // WORKER_PERMISSION を出せるフォールバック。判定関数は同一）
+                    let dialog = match val.get("permission_dialog") {
+                        Some(v) if !v.is_null() => Some(v.clone()),
+                        _ => permission_dialog_json(recent),
+                    };
+                    if let Some(permission_dialog) = dialog {
+                        return WatchOutcome::PermissionWaiting { permission_dialog };
+                    }
                     // #267: idle 確定後に events から question を判定。
                     // question がある場合は Question で通知（master の対応が異なるため）
                     let has_question = val["events"].as_array().is_some_and(|evts| {
@@ -1023,6 +1035,21 @@ pub fn screen_looks_idle(output: &str) -> bool {
     })
 }
 
+/// 画面テキストに permission ダイアログが実在すれば、その構造化 JSON を返す（#319 / #577）。
+///
+/// `worker_status` の `permission_dialog` フィールドと watch のフォールバック判定で
+/// **同じ関数・同じ形**を使うための入口（形が食い違うと master 側の分岐が壊れる）。
+/// 実在検査の厳密さは `claude_tui::detect_permission_dialog` が担保する
+pub fn permission_dialog_json(output: &str) -> Option<Value> {
+    let lines: Vec<String> = output.lines().map(|l| l.to_string()).collect();
+    let dialog = crate::claude_tui::detect_permission_dialog(&lines)?;
+    Some(json!({
+        "command": dialog.command,
+        "options": dialog.options,
+        "highlighted": dialog.highlighted,
+    }))
+}
+
 /// TUI が折りたたみ状態（「N new messages (click) ↓」等で途中省略されている）かを検出する。
 /// claude TUI は長いツール実行後に出力を折りたたみ、最終的に「95 new messages (click) ↓」
 /// のような表示になる。この状態では read_pane / capture-pane のどちらでも最新の会話が取れない
@@ -1257,9 +1284,17 @@ pub fn collect_worker_events(
     ctx_percent: Option<u32>,
 ) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
+    let stopped = status == "idle" || status == "error" || status == "waiting";
+
+    // permission ダイアログの実在（#319 / #577）。question より具体的な状態なので
+    // 先に判定し、両方を出さない（master が respond ではなく通常の質問応答へ
+    // 流れるのを防ぐ。permission ダイアログの文面は "Do you want to proceed?" 等で
+    // question パターンにも必ず掛かる）
+    let permission =
+        stopped && recent_output.is_some_and(|out| permission_dialog_json(out).is_some());
 
     // question: idle / error / waiting 時のみ（busy 中の質問文言はまだ作業途中）
-    if status == "idle" || status == "error" || status == "waiting" {
+    if stopped && !permission {
         if let Some(out) = recent_output {
             if detect_worker_question(out) {
                 events.push(WorkerEvent {
@@ -1269,16 +1304,13 @@ pub fn collect_worker_events(
         }
     }
 
-    // permission_dialog: waiting 時に画面に permission ダイアログがあれば記録（#319）
-    if status == "waiting" {
-        if let Some(out) = recent_output {
-            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
-            if crate::claude_tui::detect_permission_dialog(&lines).is_some() {
-                events.push(WorkerEvent {
-                    kind: WorkerEventKind::PermissionDialog,
-                });
-            }
-        }
+    // permission_dialog: 停止側の状態で画面に permission ダイアログがあれば記録
+    // （#319。#577 で `waiting` 限定をやめた: claude agents は waiting を返さないので
+    // status が idle のまま permission 待ちになる経路がある）
+    if permission {
+        events.push(WorkerEvent {
+            kind: WorkerEventKind::PermissionDialog,
+        });
     }
 
     // model_switched: status に関係なく画面に告知があれば記録
@@ -2542,5 +2574,105 @@ Running 1 shell command...\n\
     fn collect_worker_eventsはwaiting時も質問を検出する() {
         let events = collect_worker_events("waiting", Some(QUESTION_CONFIRM_SCREEN), Some(42u32));
         assert!(events.iter().any(|e| e.kind == WorkerEventKind::Question));
+    }
+
+    // --- #577: permission ダイアログ待ちを WORKER_PERMISSION として通知する ---
+
+    /// Issue #577 の再現画面（brace expansion を含む Bash 実行の承認要求）
+    const PERMISSION_SCREEN_577: &str = "\
+⏺ Running 1 shell command…\n\
+──────────────────────────────────────────\n\
+ Bash command\n\
+   for i in {1..12}; do echo $i; sleep 1; done; echo done\n\
+ Contains brace_expression\n\
+ Do you want to proceed?\n\
+ ❯ 1. Yes\n\
+   2. Yes, and don't ask again for echo commands\n\
+   3. No, and tell Claude what to do differently (esc)\n\
+ Esc to cancel · Tab to amend · ctrl+e to explain";
+
+    #[test]
+    fn issue577_dispatchがidleでも画面から検知してpermissionを返す() {
+        // 旧 tako-app（waiting へ格上げしない dispatch）に対するフォールバック。
+        // permission_dialog フィールドが無くても watch 単体で判定できる
+        let mut script = ExecScript::new(vec![
+            status("idle", PERMISSION_SCREEN_577, "agents"),
+            status("idle", PERMISSION_SCREEN_577, "agents"),
+            status("idle", PERMISSION_SCREEN_577, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        let WatchOutcome::PermissionWaiting { permission_dialog } = outcome else {
+            panic!("WORKER_PERMISSION を返す（修正前は Question）: {outcome:?}");
+        };
+        assert_eq!(permission_dialog["options"].as_array().unwrap().len(), 3);
+        assert!(permission_dialog["command"]
+            .as_str()
+            .unwrap()
+            .contains("for i in {1..12}"));
+    }
+
+    #[test]
+    fn issue577_waitingとpermission_dialogなら即座に発火する() {
+        // dispatch が格上げ済みなら streak を待たない（ダイアログは安定状態）
+        let mut script = ExecScript::new(vec![Ok(json!({
+            "status": "waiting",
+            "recent_output": PERMISSION_SCREEN_577,
+            "status_source": "agents",
+            "permission_dialog": { "command": "cmd", "options": ["Yes", "No"], "highlighted": 0 },
+        }))]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(matches!(outcome, WatchOutcome::PermissionWaiting { .. }));
+        assert_eq!(script.seen.len(), 1, "1 回の照会で発火する");
+    }
+
+    #[test]
+    fn issue577_本物の質問はquestionのまま() {
+        let question_resp = || -> Result<Value, String> {
+            Ok(json!({
+                "status": "idle",
+                "recent_output": QUESTION_CONFIRM_SCREEN,
+                "status_source": "agents",
+                "ctx_percent": 42,
+                "events": [{"kind": "question"}],
+            }))
+        };
+        let mut script = ExecScript::new(vec![question_resp(), question_resp(), question_resp()]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Question { .. }),
+            "ダイアログが無ければ Question のまま: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn issue577_通常のidleはidleのまま() {
+        // #571 の非回帰
+        let mut script = ExecScript::new(vec![
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(matches!(outcome, WatchOutcome::Idle { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn issue577_collect_worker_eventsはダイアログ時にquestionを出さない() {
+        // permission ダイアログの文面は question パターンにも掛かる。両方出すと
+        // master が respond ではなく通常の質問応答へ流れる
+        for status in ["idle", "waiting"] {
+            let events = collect_worker_events(status, Some(PERMISSION_SCREEN_577), None);
+            let kinds: Vec<_> = events.iter().map(|e| e.kind.clone()).collect();
+            assert!(
+                kinds.contains(&WorkerEventKind::PermissionDialog),
+                "{status}: {kinds:?}"
+            );
+            assert!(
+                !kinds.contains(&WorkerEventKind::Question),
+                "{status}: {kinds:?}"
+            );
+        }
+        // busy 中は停止側の判定をしない
+        assert!(collect_worker_events("busy", Some(PERMISSION_SCREEN_577), None).is_empty());
     }
 }

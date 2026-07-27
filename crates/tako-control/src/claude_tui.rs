@@ -47,8 +47,17 @@ pub struct PermissionDialog {
 /// 検知パターン（実採取画面由来。claude v2.x / codex 0.x / agy 1.x）:
 /// - 「Allow once」または「Allow for this session」を含む選択肢行
 /// - agy の「Do you want to proceed?」+ 選択肢
+/// - **ダイアログが入力欄を奪っていること**（`is_choice_dialog`。#577）
 /// - 信頼ダイアログ（`is_trust_dialog`）は除外（別経路で自動承諾済み）
 /// - rate limit ダイアログ（`Approaching rate limits`）は除外（#157 で WORKER_ERROR）
+///
+/// **「実在検査」であることが本関数の契約**（#577）。worker の停止種別を
+/// question から permission へ格上げする根拠になるため、文言だけで判定すると
+/// エージェントが本文に書いた「Do you want to proceed? / 1. はい / 2. いいえ」を
+/// ダイアログと誤認し、`WORKER_IDLE` が永久に出なくなる（#571 と同じ不検知）。
+/// そこで「画面最下部のプロンプト行が選択カーソル」= 入力欄がダイアログに
+/// 奪われている状態を必要条件にする。生成中・通常応答中は入力欄が最下部に
+/// 見えている（claude は busy 中も入力を受け付ける）ので構造で切り分けられる
 pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
     if is_trust_dialog(lines) {
         return None;
@@ -57,6 +66,10 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
         return None;
     }
     if lines.iter().any(|l| l.contains("Approaching rate limits")) {
+        return None;
+    }
+    // #577: 本文中の「選択肢つきの問いかけ」を弾く実在検査（詳細は関数コメント）
+    if !is_choice_dialog(lines) {
         return None;
     }
 
@@ -1757,5 +1770,53 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
         assert!(detect_permission_dialog(&screen(CODEX_READY)).is_none());
         assert!(detect_permission_dialog(&screen(AGY_READY)).is_none());
         assert!(detect_permission_dialog(&screen(AGY_BUSY)).is_none());
+    }
+
+    // --- #577: 「本文の問いかけ」と「実在するダイアログ」の切り分け ---
+
+    /// worker が **本文で** 確認してきた画面（入力欄は空のまま最下部に見えている）。
+    /// permission ダイアログの文言と番号付き選択肢を両方含むので、文言だけの判定では
+    /// ダイアログと区別できない。これを permission 扱いすると master は
+    /// `respond`（番号キー送信）を試み、実際には入力欄へ数字が打ち込まれる
+    const QUESTION_WITH_CHOICES: &str = r#"⏺ 移行スクリプトの準備ができました。
+
+  Do you want to proceed?
+  1. Yes, run the migration now
+  2. No, stop here
+
+────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────
+  claude-opus-5 · ctx 23%"#;
+
+    #[test]
+    fn issue577_本文の問いかけをpermissionダイアログと誤検知しない() {
+        let lines = screen(QUESTION_WITH_CHOICES);
+        // 入力欄が最下部に生きている = ダイアログは入力を奪っていない
+        assert_eq!(input_line(&lines), Some(""));
+        assert!(!is_choice_dialog(&lines));
+        assert!(
+            detect_permission_dialog(&lines).is_none(),
+            "文言が一致しても実在検査で落ちる"
+        );
+    }
+
+    #[test]
+    fn issue577_実在するダイアログは引き続き検知する() {
+        // 実採取ベースの 4 画面（claude Bash / claude ファイル / claude 罫線ボックス /
+        // agy）はいずれも選択カーソルが最下部 = 入力欄を奪っている
+        for (name, s) in [
+            ("claude bash", CLAUDE_BASH_PERMISSION),
+            ("claude file", CLAUDE_FILE_PERMISSION),
+            ("claude banner", CLAUDE_DIALOG_WITH_BANNER),
+            ("agy", AGY_PERMISSION_DIALOG),
+        ] {
+            let lines = screen(s);
+            assert!(is_choice_dialog(&lines), "{name} は入力欄を奪っている");
+            assert!(
+                detect_permission_dialog(&lines).is_some(),
+                "{name} は permission ダイアログとして検知される"
+            );
+        }
     }
 }
