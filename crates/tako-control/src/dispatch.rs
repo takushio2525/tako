@@ -5755,6 +5755,24 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
     }
 }
 
+/// `claude agents --json` の生 status を dispatch の語彙へ正規化する（#267）。
+///
+/// 正規化しないと watch ループの unknown フォールバック（画面推定）に落ち、
+/// 一次シグナルを持っているのに捨てることになる。
+///
+/// #571: claude の実出力は `idle` / `busy`（2026-07-27 実測。旧実装が想定していた
+/// `active` は現れない）。**未知の値は "unknown" に落ちて画面推定へ回る**ので、
+/// 語彙がずれても壊れはしないが検知精度が落ちる。実測で確認した値を並べる
+fn normalize_agent_status(raw: &str) -> &'static str {
+    match raw {
+        "idle" => "idle",
+        "busy" | "active" | "running" => "busy",
+        "waiting" | "waiting_for_input" => "waiting",
+        "gone" => "gone",
+        _ => "unknown",
+    }
+}
+
 fn finish_worker_status(
     ctx: WorkerStatusCtx,
     session_id: Option<&str>,
@@ -5810,14 +5828,10 @@ fn finish_worker_status(
     // 落ち、長時間ツール出力で busy パターンが流れた瞬間に偽 IDLE が出る
     let (status, ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
-        let normalized = match agent.status.as_str() {
-            "idle" => "idle",
-            "active" => "busy",
-            "waiting" | "waiting_for_input" => "waiting",
-            "gone" => "gone",
-            _ => "unknown",
-        };
-        (normalized.to_string(), agent.ctx_percent)
+        (
+            normalize_agent_status(&agent.status).to_string(),
+            agent.ctx_percent,
+        )
     } else if pane_exists {
         ("unknown".to_string(), None)
     } else {
@@ -5955,11 +5969,19 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
 
+    // #571: agents に問い合わせたのに状態を返せなかった（セッションが一覧に無い =
+    // gone → unknown へ降格 / コマンド自体が失敗 = unknown）なら、以降の根拠は画面しかない。
+    // status_source を "agents*" のままにすると、画面推定の結果を watch が
+    // 一次シグナル扱い（idle 連続 3 回で確定）してしまう。source を実態に合わせる
+    let mut status_source = status_source;
+    if status == "unknown" && status_source.starts_with("agents") {
+        status_source = "screen".to_string();
+    }
+
     // agents API（status_source = agents / agents-auto）はセッション状態の
     // 一次情報なので、idle を返したらプロセスツリー heuristic で覆さない。
     // バックグラウンドシェル（tailscaled 等）の常駐子プロセスが IDLE 検知を
     // 永久にブロックする問題を根治する（#289）。
-    // has_children による busy 補正は screen フォールバック時のみ使う。
     // 一時的な idle（サブエージェント完了瞬間）は watch の idle_streak（3 回連続）で防ぐ
     let agents_authoritative = status_source == "agents" || status_source == "agents-auto";
     if status == "idle" {
@@ -5974,13 +5996,21 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // agents シグナルの無い worker（codex / agy、または claude の解決失敗）は
     // 画面推定で busy / idle を判定する（#120。wait_for_worker の unknown ブランチと
     // 同じロジックを単発クエリの応答にも反映する。status_source=screen のため
-    // watch / run 側は従来どおり idle 連続 8 回を要求し、単発の誤判定では完了しない）
+    // watch / run 側は idle 連続 8 回を要求し、単発の誤判定では完了しない）。
+    //
+    // #571: `has_children` を画面より優先してはいけない。エージェント CLI（claude /
+    // codex / agy）の TUI プロセス自身がペインシェルの子なので、**生きている限り
+    // 必ず true** になる。以前は画面が入力欄を映していても busy に上書きされ、
+    // agents 解決に失敗した worker は永久に完了しなかった（watch が 40 分以上不発）。
+    // プロセスツリーは「画面から判断できないとき」の補助に留める
     if status == "unknown" {
         if let Some(ref out) = recent_output {
-            if crate::orchestrator::wait::screen_looks_busy(out) || has_children {
+            if crate::orchestrator::wait::screen_looks_busy(out) {
                 status = "busy".to_string();
             } else if crate::orchestrator::wait::screen_looks_idle(out) {
                 status = "idle".to_string();
+            } else if has_children {
+                status = "busy".to_string();
             }
         }
     }
@@ -7616,6 +7646,8 @@ mod tests {
         preview_cache: tako_core::PreviewCacheStats,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
+        /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
+        backend_sessions: std::collections::HashMap<u64, String>,
     }
 
     impl MockHost {
@@ -7644,6 +7676,7 @@ mod tests {
                     entries: 2,
                 },
                 window_state_ops: Vec::new(),
+                backend_sessions: std::collections::HashMap::new(),
             }
         }
 
@@ -7691,6 +7724,9 @@ mod tests {
     }
 
     impl TmuxHost for MockHost {
+        fn backend_session(&self, pane: PaneId) -> Option<String> {
+            self.backend_sessions.get(&pane.as_u64()).cloned()
+        }
         fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
             self.collapsed.contains(&tab.as_u64())
         }
@@ -10328,9 +10364,254 @@ mod tests {
     }
 
     #[test]
-    fn issue289_unknownではhas_childrenが引き続き有効() {
+    fn issue289_unknownでは画面が判断不能なときだけhas_childrenが効く() {
+        // #571: 画面が入力欄を映していれば idle。エージェント TUI 自身が常に
+        // 「子プロセス」なので、これを優先すると worker は永久に完了しない
+        let mut inconclusive = resolved("unknown", "screen", true);
+        inconclusive.recent_output = Some("... 出力の途中 ...".into());
+        let v = apply_worker_status_corrections(inconclusive).unwrap();
+        assert_eq!(
+            v["status"], "busy",
+            "画面から判断できなければ busy 側に倒す"
+        );
+    }
+
+    // --- #571: agents 解決に失敗した worker が永久 busy になる問題の根治 ---
+
+    #[test]
+    fn issue571_claudeの実status語彙をbusyへ正規化する() {
+        // 2026-07-27 実測: claude agents --json は idle / busy を返す。
+        // busy が unknown に落ちると一次シグナルを捨てて画面推定に回ってしまう
+        assert_eq!(normalize_agent_status("busy"), "busy");
+        assert_eq!(normalize_agent_status("idle"), "idle");
+        // 旧語彙も引き続き受ける
+        assert_eq!(normalize_agent_status("active"), "busy");
+        assert_eq!(normalize_agent_status("waiting_for_input"), "waiting");
+        assert_eq!(normalize_agent_status("gone"), "gone");
+        // 未知の値は unknown（画面推定へフォールバック）
+        assert_eq!(normalize_agent_status("nonsense"), "unknown");
+    }
+
+    #[test]
+    fn issue571_画面が入力欄ならhas_childrenがあってもidle() {
+        // claude / codex / agy の TUI プロセスはペインシェルの子なので常に has_children=true。
+        // 旧実装はこれで busy に上書きし、agents 解決失敗時に WORKER_IDLE が永久に出なかった
         let v = apply_worker_status_corrections(resolved("unknown", "screen", true)).unwrap();
-        assert_eq!(v["status"], "busy");
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["has_running_children"], true);
+    }
+
+    #[test]
+    fn issue571_画面がbusyならhas_childrenの有無によらずbusy() {
+        let mut r = resolved("unknown", "screen", false);
+        r.recent_output = Some(
+            "✽ Misting… (10m 49s · ↓ 35.8k tokens)\n──────\n❯ \n──────\n  ctx 23%\n  5h 20%\n  7d 16%\n  auto mode on"
+                .into(),
+        );
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "busy", "スピナーが見えていれば busy が勝つ");
+    }
+
+    #[test]
+    fn issue571_agentsが状態を返せなければstatus_sourceはscreenへ降格する() {
+        // agents 一覧にセッションが無い（= "gone" → pane 健在で "unknown" へ降格）ケース。
+        // source を agents のままにすると watch が画面推定を一次シグナル扱いして
+        // idle 連続 3 回で確定してしまう（本来は 8 回）
+        let mut r = resolved("gone", "agents-auto", true);
+        r.resolved_sid = Some("test-session".into());
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status_source"], "screen");
+        assert_eq!(v["status"], "idle");
+
+        // agents コマンド自体が失敗（unknown）でも同じ
+        let v2 = apply_worker_status_corrections(resolved("unknown", "agents", true)).unwrap();
+        assert_eq!(v2["status_source"], "screen");
+    }
+
+    // --- #571 E2E: 実 tmux + 実 claude で busy → idle の検知を通しで確認する ---
+    //
+    // 本番事故の条件（tako 側プロセスが別アカウントの `CLAUDE_CONFIG_DIR` を継承した状態）を
+    // 再現し、既定 config dir で走る worker の完了を watch が検知できることを確かめる。
+    // 手動実行:
+    //
+    // ```sh
+    // cargo test -p tako-control --lib issue571_e2e -- --ignored --nocapture --test-threads=1
+    // ```
+    //
+    // 前提: `claude` CLI がログイン済み / `tmux` がある / ネットワーク接続。
+    // tmux ソケットと data ディレクトリ（worker レジストリ）はどちらも隔離するので
+    // 本番の tako / tmux には触れない
+
+    const E2E_SOCKET_571: &str = "tako-e2e-571";
+
+    fn e2e_571_base() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/private/tmp/tako-e2e-571-{}", std::process::id()))
+    }
+
+    /// テスト用の一時ディレクトリだけを消す（実ディレクトリの巻き添え削除を構造で防ぐ）。
+    /// `/private/tmp` 直下の `tako-e2e-571-<pid>` 以外は panic して止める
+    fn remove_e2e_571_dir(dir: &std::path::Path) {
+        let allowed = dir.parent() == Some(std::path::Path::new("/private/tmp"))
+            && dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("tako-e2e-571-"));
+        assert!(
+            allowed,
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct E2e571Guard {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for E2e571Guard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", E2E_SOCKET_571, "kill-server"])
+                .output();
+            remove_e2e_571_dir(&self.dir);
+        }
+    }
+
+    #[test]
+    #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
+    fn issue571_e2e_実claudeのbusyからidleへの遷移をwatchが検知する() {
+        use std::time::{Duration, Instant};
+
+        let base = e2e_571_base();
+        remove_e2e_571_dir(&base);
+        let work = base.join("work");
+        let data = base.join("data");
+        let alt_config = base.join("claude-alt");
+        for d in [&work, &data, &alt_config] {
+            std::fs::create_dir_all(d).expect("一時ディレクトリを作れる");
+        }
+        let guard = E2e571Guard { dir: base.clone() };
+
+        // 隔離: tmux ソケットと data ディレクトリ（worker レジストリ / accounts.yaml）
+        std::env::set_var("TAKO_TMUX_SOCKET", E2E_SOCKET_571);
+        std::env::set_var("TAKO_DATA_DIR", &data);
+        // 本番事故の再現: tako 側プロセスが別アカウントの config dir を継承している。
+        // この状態で `claude agents --json` を素で実行すると worker が一覧に出ない
+        std::env::set_var(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV, &alt_config);
+
+        // worker は既定 config dir で走らせるので、事前信頼もそちらへ書く（#558）
+        let default_cfg = crate::orchestrator::claude_default_config_dir()
+            .expect("既定 config dir")
+            .display()
+            .to_string();
+        crate::claude_tui::ensure_trusted_in(Some(&default_cfg), &work.display().to_string())
+            .expect("事前信頼を書ける");
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", E2E_SOCKET_571, "kill-server"])
+            .output();
+        let session = "w571";
+        let status = std::process::Command::new("tmux")
+            // tmux サーバーへ汚染を伝播させない（worker は既定 config dir で動く必要がある）
+            .env_remove(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+            .args([
+                "-L",
+                E2E_SOCKET_571,
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "100",
+                "-y",
+                "35",
+                "-c",
+                work.to_str().expect("テストパスは UTF-8"),
+                "unset CLAUDE_CONFIG_DIR; exec claude --model haiku",
+            ])
+            .status()
+            .expect("tmux を実行できる");
+        assert!(status.success(), "tmux new-session が失敗した");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.backend_sessions.insert(pane, session.to_string());
+
+        // プロンプト送達。ここから worker は busy になる
+        let report = crate::claude_tui::deliver_via_tmux(
+            Some(E2E_SOCKET_571),
+            session,
+            "What is 40 + 2? Reply with only the answer spelled out in English words, lowercase.",
+            true,
+        )
+        .expect("送達が完了する");
+        assert!(
+            report.verified,
+            "プロンプトが入力欄へ反映される: {report:?}"
+        );
+
+        let opts = crate::orchestrator::wait::WatchOptions {
+            pane_id: pane,
+            session_id: None,
+            tmux_session: Some(session.to_string()),
+            timeout: Some(Duration::from_secs(60)),
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(2),
+        };
+
+        // ① busy を実際に観測する（「最初から idle」で素通りしていないことの担保）。
+        //    判定はワッチ結果の後で行う（本命は ② なので、失敗時にそちらを先に見せる）
+        let started = Instant::now();
+        let mut saw_busy = None;
+        while started.elapsed() < Duration::from_secs(30) {
+            let v = dispatch(
+                &mut host,
+                Request::OrchestratorWorkerStatus {
+                    pane_id: Some(pane),
+                    session_id: None,
+                    tmux_session: Some(session.to_string()),
+                    worker: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .expect("worker_status が引ける");
+            if v["status"] == "busy" {
+                saw_busy = Some(v);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        // ② busy → idle の遷移を watch が検知して完了すること（本命）
+        let outcome = {
+            let mut exec =
+                |req: Request| dispatch(&mut host, req, PaneOrigin::Cli).map_err(|e| e.to_string());
+            crate::orchestrator::wait::wait_for_worker(&mut exec, &opts, None)
+        };
+        drop(guard);
+        assert!(
+            matches!(
+                outcome,
+                crate::orchestrator::wait::WatchOutcome::Idle { .. }
+            ),
+            "busy → idle 遷移で Idle を返す（修正前は永久 busy のまま Timeout になる）: {outcome:?}"
+        );
+
+        let busy = saw_busy.expect("送達後に busy を観測できる");
+        assert_eq!(
+            busy["status_source"], "agents-auto",
+            "busy 中も config dir を跨いで claude セッションを解決できている（#571 の根因）: {busy}"
+        );
+    }
+
+    #[test]
+    fn issue571_agentsが状態を返せたらstatus_sourceは維持される() {
+        for source in ["agents", "agents-auto"] {
+            for status in ["idle", "busy", "waiting"] {
+                let v = apply_worker_status_corrections(resolved(status, source, false)).unwrap();
+                assert_eq!(v["status_source"], source, "{status} / {source}");
+            }
+        }
     }
 
     #[test]

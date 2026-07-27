@@ -5288,6 +5288,13 @@ impl TakoApp {
             }
             let meta = self.pane_log_meta(*pane_id);
             if let Some(backend) = self.backend_sessions.get(pane_id) {
+                // 器の中の履歴は役割 B（capture）でしか読めない。到達手段を持たない器
+                // （psmux = 案 B-1。#519 M2）では 2 秒ごとに空振りの probe を撃つだけなので
+                // 採らない。直接ペイン経路にも落とさない: 器の中身は in-process の
+                // alacritty から見ると全画面再描画で、記録しても意味のある行にならない
+                if !tako_core::backend::capabilities().detached_access {
+                    continue;
+                }
                 let (last_history, last_bytes) =
                     mgr.scan_baseline(pane_id.as_u64()).unwrap_or((0, 0));
                 jobs.push(PaneLogJob {
