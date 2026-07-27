@@ -1369,3 +1369,20 @@
 - 分岐は `UpdateTarget`（`cfg!` は 1 箇所）に閉じ、判定は純粋関数化して **macOS 上からでも
   Windows 側の挙動をテストできる**形にした（#515 と同じ方針）。macOS 経路は不変
 - 次: Windows アセット付き Release が出たら実機で通知 → 更新の通し確認（未検証）
+
+## 2026-07-27（#519 M2: Windows 永続化の器を psmux で実装）
+- 自作せず既存 OSS の psmux（MIT / Rust / tmux 互換 CLI）を器に採用し、設計 §2.2 の案 B-1
+  （器あり・到達なし）として `PsmuxBackend` を新設。`Choice` へ 1 つ足すだけで器が生え、
+  呼び出し側の変更は #177 の強奪ガード 1 箇所のみ（M1 の合格条件どおり）
+- TmuxBackend は流用不可（`kill-session -t =name` が 3/3 失敗・各 5.1 秒ブロック）。
+  `=` 不使用・`show-environment` の全変数出力・`history_bytes` 非依存・`pane_tty=None`・
+  conf の `warm off`・未検証バージョンの起動時プローブ、の 6 点で非互換を吸収
+- 多重起動安全性は器に尋ねられない（`list-clients -F` 無視 + `-D` が効かない + Windows では
+  `is_live_tako_app` が常に false）ため、OS ファイルロックを生存の証明に使う
+  オーナー記録 `backend/owner.rs` を新設。2 個目の tako がセカンダリへ降格することを実測
+- tmux 誤判別ガード: psmux は `tmux.exe` を配り `-V` の 1 行目で tmux を詐称する。
+  2 行目で判別し、Windows では POSIX 版 tmux も器に選ばない
+- 実測: kill 前 tick 6 → tako 不在中 21 → 再起動後 41、pane_pid 同一、
+  persist.log「tmux 再 attach 1 / 新規シェル 0」。単体 23 + 実バイナリ統合 10 本
+- 関連コミット: `cf6ee4a` `7b9b74c` `1ab42de` `501793a` `845966f` `8778d14` `5ed0859`
+- 次: psmux の導入経路（同梱するか）の判断。役割 B（到達）は引き続き無い
