@@ -2825,13 +2825,48 @@ fn dispatch_inner(
             let action = action.as_deref().unwrap_or("status");
             let ch = channel.as_deref();
             match action {
-                "status" => Ok(host.update_status()),
+                "status" => {
+                    let mut json = host.update_status();
+                    // #616: 専用画面が開いているか（設定画面の status と同じ役割）
+                    json["window_open"] = json!(host.update_window_open());
+                    Ok(json)
+                }
                 "check" => Ok(host.update_check(ch)),
                 "apply" => host.update_apply(ch).map_err(DispatchError::Operation),
                 "apply-zip" => host.update_apply_zip(ch).map_err(DispatchError::Operation),
                 "repair" => host.update_repair().map_err(DispatchError::Operation),
+                // #616: アップデート専用画面 + 上部通知カード
+                "open" => {
+                    host.open_update_window();
+                    Ok(json!({ "ok": true, "requested": true }))
+                }
+                "card" => Ok(host.update_card_status()),
+                "card-dismiss" | "card-show" => {
+                    let dismissed = action == "card-dismiss";
+                    // 閉じる対象のキーは「いま案内している内容」。set より先に読む
+                    let key = dismissed
+                        .then(|| {
+                            host.update_card_status()["key"]
+                                .as_str()
+                                .map(str::to_string)
+                        })
+                        .flatten();
+                    host.set_update_card_dismissed(dismissed);
+                    // ユーザー設定を汚さない（Theme / Welcome と同方針）
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.update_card_dismissed = key;
+                        if let Err(e) = crate::settings::save(&settings) {
+                            return Err(DispatchError::Operation(format!(
+                                "更新通知カードの状態を保存できない: {e}"
+                            )));
+                        }
+                    }
+                    Ok(host.update_card_status())
+                }
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / check / apply / apply-zip / repair のいずれか）"
+                    "不明な action: {other:?}（status / check / apply / apply-zip / repair / \
+                     open / card / card-dismiss / card-show のいずれか）"
                 ))),
             }
         }

@@ -74,6 +74,11 @@ pub struct Settings {
     /// これはユーザーが明示的に閉じた記録。CLI / MCP `tako welcome` から操作できる
     #[serde(default)]
     pub welcome_dismissed: bool,
+    /// 更新通知カードを閉じたときの対象バージョン（Issue #616。None = 閉じていない）。
+    /// 値は「どのバージョンを案内していたか」を表すキー（例 `"stable:0.6.1 test:0.7.0-test.1"`）。
+    /// 新しいバージョンを検知するとキーが変わり、カードは再び出る（= バージョン単位の抑止）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_card_dismissed: Option<String>,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。既定 "claude"）
     #[serde(default = "default_limit_service")]
     pub limit_service: String,
@@ -161,6 +166,7 @@ impl Default for Settings {
             show_hidden_files: false,
             telemetry: false,
             welcome_dismissed: false,
+            update_card_dismissed: None,
             limit_service: default_limit_service(),
             language: default_language(),
             runner_defaults: std::collections::BTreeMap::new(),
@@ -305,6 +311,7 @@ mod tests {
             show_hidden_files: true,
             telemetry: true,
             welcome_dismissed: true,
+            update_card_dismissed: Some("stable:9.9.9".into()),
             limit_service: "codex".into(),
             language: "en".into(),
             runner_defaults: std::collections::BTreeMap::new(),

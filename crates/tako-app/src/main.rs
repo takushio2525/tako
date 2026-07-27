@@ -31,6 +31,7 @@ mod status_bar;
 mod tab_bar;
 mod ui_text;
 mod update_checker;
+mod update_window;
 mod video_player;
 mod webview;
 
@@ -1176,10 +1177,15 @@ struct TakoApp {
     /// 起動時に settings.json の実在で判定し（`welcome::should_show_on_launch`）、
     /// 閉じたら settings.json へ永続化する
     welcome_banner: bool,
-    /// アプリ内自動更新の状態
+    /// アプリ内自動更新の状態。表示先は上部通知カードと専用ウィンドウ（#616）
     update_state: update_checker::UpdateState,
-    /// 更新チャンネルドロップダウンの開閉状態（#403）
-    update_dropdown_open: bool,
+    /// 更新通知カードを × で閉じたときのキー（`update_checker::card_key`。#616）。
+    /// settings.json の `update_card_dismissed` を起動時に読み、閉じたら書き戻す。
+    /// 新しいバージョンを検知するとキーが変わるのでカードは出直す
+    update_card_dismissed: Option<String>,
+    /// 確認フローへ入る直前の更新候補一覧（#616）。キャンセルで GitHub へ
+    /// 問い合わせ直さずに一覧へ戻すための控え
+    update_available: Option<update_checker::ChannelUpdates>,
     /// グリフ advance がセル幅（半角 1 セル）と一致するかのキャッシュ（Issue #64）。
     /// テーマフォントに無いグリフ（⏺ ⎿ 等）はフォールバックフォントで描画され
     /// advance がセル幅とずれるため、描画グループ化から除外する判定に使う
@@ -1239,6 +1245,10 @@ struct TakoApp {
     pending_settings_open: Option<Option<settings_window::SettingsTab>>,
     /// About ウィンドウのハンドル（単一インスタンス。Issue #485）
     about_window_handle: Option<gpui::AnyWindowHandle>,
+    /// アップデート画面ウィンドウのハンドル（単一インスタンス。Issue #616）
+    update_window_handle: Option<gpui::WindowHandle<update_window::UpdateWindow>>,
+    /// dispatch / カード / パレットからアップデート画面を開くための pending キュー（#616）
+    pending_update_open: bool,
     /// メニューバーを貼った時点の表示言語（Issue #485。言語切替で貼り直す）。
     /// 起動直後は None: 初回 `cx.set_menus` は TakoApp 生成前（＝ settings の
     /// 言語適用前）に走るため、初回 render で必ず貼り直して解決済み言語に合わせる
@@ -2344,7 +2354,9 @@ impl TakoApp {
             // 「このプロセスが最初の 1 回目か」を正しく反映する
             welcome_banner: tako_control::welcome::should_show_on_launch(),
             update_state: update_checker::UpdateState::Idle,
-            update_dropdown_open: false,
+            // #616: 前回 × で閉じたバージョンを引き継ぐ（再起動しても出直さない）
+            update_card_dismissed: tako_control::settings::load().update_card_dismissed,
+            update_available: None,
             glyph_snap_cache: std::cell::RefCell::new(HashMap::new()),
             text_system: cx.text_system().clone(),
             pane_links: HashMap::new(),
@@ -2380,6 +2392,8 @@ impl TakoApp {
             settings_window_handle: None,
             pending_settings_open: None,
             about_window_handle: None,
+            update_window_handle: None,
+            pending_update_open: false,
             menus_lang: None,
         };
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
@@ -2774,6 +2788,9 @@ impl TakoApp {
                     app.sync_viewports(cx);
                     if let Some(tab) = app.pending_settings_open.take() {
                         app.open_settings_window_impl(tab, cx);
+                    }
+                    if std::mem::take(&mut app.pending_update_open) {
+                        app.open_update_window_impl(cx);
                     }
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
@@ -3389,11 +3406,11 @@ impl TakoApp {
                     Ok(updates) => {
                         let has_any = updates.stable.is_some() || updates.test.is_some();
                         if has_any {
+                            // #616: 通知カードの表示は「閉じたバージョンかどうか」で
+                            // 決まる（`card_should_show`）。ここでは状態を最新にするだけで、
+                            // ユーザーが確認・更新の最中なら邪魔しない
                             let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                                if !matches!(
-                                    app.update_state,
-                                    update_checker::UpdateState::Dismissed
-                                ) {
+                                if app.update_state.is_replaceable_by_check() {
                                     app.update_state =
                                         update_checker::UpdateState::Available(updates);
                                     cx.notify();
@@ -3419,11 +3436,13 @@ impl TakoApp {
                         let retry = e.retry_duration();
                         let msg = e.to_string();
                         let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                            if !matches!(
-                                app.update_state,
-                                update_checker::UpdateState::Dismissed
-                                    | update_checker::UpdateState::Available(_)
-                            ) {
+                            // 「更新あり」を掴んでいるならエラーで塗り潰さない（既存の挙動）
+                            if app.update_state.is_replaceable_by_check()
+                                && !matches!(
+                                    app.update_state,
+                                    update_checker::UpdateState::Available(_)
+                                )
+                            {
                                 app.update_state = update_checker::UpdateState::CheckFailed(msg);
                                 cx.notify();
                             }
@@ -6291,6 +6310,7 @@ impl TakoApp {
             "run-setup",
             "run-master",
             "open-settings",
+            "open-update",
             "new-tab",
             "toggle-theme",
             "toggle-language",
@@ -6369,6 +6389,11 @@ impl TakoApp {
                 "run-master" => self.run_master_command(cx),
                 "open-settings" => {
                     self.pending_settings_open = Some(None);
+                    cx.notify();
+                }
+                // #616: 下部バーから撤去したアップデート導線をここに置く
+                "open-update" => {
+                    self.pending_update_open = true;
                     cx.notify();
                 }
                 "new-tab" => self.new_tab(cx),
@@ -6966,10 +6991,67 @@ impl TakoApp {
         });
     }
 
-    /// 手動のアップデート確認（Issue #485。tako メニュー / About ウィンドウのボタン）。
-    /// 起動時 + 24 時間ごとの自動チェックと同じ `update_checker` を使い、結果は
-    /// ステータスバーの更新バナー（既存 UI）に出す
+    /// アップデート画面を開く / 前面化する（Issue #616）。
+    /// 設定画面（#459）・About（#485）と同じ単一インスタンス方式
+    pub(crate) fn open_update_window_impl(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.update_window_handle {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _cx| {
+                    window.activate_window();
+                });
+            });
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let weak2 = weak.clone();
+            let (w, h) = update_window::WINDOW_SIZE;
+            let result = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(w), px(h)),
+                        cx,
+                    ))),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(crate::ui_text::update::window_title().into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    window_min_size: Some(size(px(460.), px(360.))),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|cx| update_window::UpdateWindow::new(weak2, cx)),
+            );
+            if let Ok(handle) = result {
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |app, _cx| {
+                        app.update_window_handle = Some(handle);
+                    });
+                }
+                let weak3 = weak.clone();
+                handle
+                    .update(cx, |_, window, cx| {
+                        window.on_window_should_close(cx, move |_, _cx| {
+                            if let Some(app) = weak3.upgrade() {
+                                app.update(_cx, |app, _| {
+                                    app.update_window_handle = None;
+                                });
+                            }
+                            true
+                        });
+                    })
+                    .ok();
+            }
+        });
+    }
+
+    /// 手動のアップデート確認（Issue #485。tako メニュー / About / アップデート画面のボタン）。
+    /// 起動時 + 24 時間ごとの自動チェックと同じ `update_checker` を使い、
+    /// 結果はアップデート画面に出す（#616 でステータスバーから移設）
     pub(crate) fn start_update_check(&mut self, cx: &mut Context<Self>) {
+        // 結果の行き先を必ず用意する（メニューから叩いても黙って終わらない）
+        self.pending_update_open = true;
         if matches!(
             self.update_state,
             update_checker::UpdateState::Updating(_)
@@ -14423,6 +14505,41 @@ impl SystemHost for TakoApp {
     fn update_status(&self) -> serde_json::Value {
         update_checker::update_status_json()
     }
+    fn open_update_window(&mut self) {
+        self.pending_update_open = true;
+    }
+    fn update_window_open(&self) -> bool {
+        self.update_window_handle.is_some()
+    }
+    /// 通知カードの状態（#616）。`key` は「いま案内している内容」の一意キーで、
+    /// dismiss の永続化に使う（dispatch 側が settings.json へ書く）
+    fn update_card_status(&self) -> serde_json::Value {
+        let updates = match &self.update_state {
+            update_checker::UpdateState::Available(u) => Some(u),
+            _ => None,
+        };
+        let key = updates.and_then(update_checker::card_key);
+        let visible = updates.is_some_and(|u| {
+            update_checker::card_should_show(u, self.update_card_dismissed.as_deref())
+        });
+        serde_json::json!({
+            "visible": visible,
+            "key": key,
+            "dismissed_key": self.update_card_dismissed,
+            "stable": updates.and_then(|u| u.stable.as_ref()).map(|i| i.version.clone()),
+            "test": updates.and_then(|u| u.test.as_ref()).map(|i| i.version.clone()),
+        })
+    }
+    fn set_update_card_dismissed(&mut self, dismissed: bool) {
+        self.update_card_dismissed = if dismissed {
+            match &self.update_state {
+                update_checker::UpdateState::Available(u) => update_checker::card_key(u),
+                _ => None,
+            }
+        } else {
+            None
+        };
+    }
     fn update_check(&self, channel: Option<&str>) -> serde_json::Value {
         let ch = channel.and_then(|s| s.parse::<update_checker::Channel>().ok());
         let format_info = |info: &update_checker::UpdateInfo| {
@@ -15253,6 +15370,9 @@ impl Render for TakoApp {
         if let Some(tab) = self.pending_settings_open.take() {
             self.open_settings_window_impl(tab, cx);
         }
+        if std::mem::take(&mut self.pending_update_open) {
+            self.open_update_window_impl(cx);
+        }
         // このウィンドウの表示タブ（Issue #339 ビューポート方式)。同一 entity を
         // 全ウィンドウの root view として共有するため、呼び出し元 window ごとに解決する
         let display_tab = self.display_tab_for(window);
@@ -15681,6 +15801,8 @@ impl Render for TakoApp {
             .child(self.render_tab_bar(window, cx))
             // #549: 初回起動のウェルカムバナー（タブバー直下・全幅。2 回目以降は出ない）
             .children(self.render_welcome_banner(cx))
+            // #616: アップデート通知カード（× で閉じるまで残る。ペインの上には被せない）
+            .children(self.render_update_card(cx))
             .child(
                 div()
                     .flex_1()
@@ -15716,7 +15838,6 @@ impl Render for TakoApp {
             .children(self.render_limit_service_overlay(cx))
             .children(self.render_run_menu_overlay(cx))
             .children(self.render_sleep_guard_overlay(cx))
-            .children(self.render_update_dropdown_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
             // #615: カードをインジケータ直上へ収めるためビューポート実寸を渡す
             .children(self.render_remote_overlay(window, cx))
@@ -26091,6 +26212,276 @@ mod self_test {
                         ),
                     );
                 }
+            }
+
+            // 90. アップデート UI の刷新（#616）。ステータスバーから撤去したぶん、
+            // 「上部通知カード + 専用ウィンドウ」が確かに受け皿になっていることを見る。
+            // (a) 更新ありでカードが出て、× で閉じると同じバージョンでは出ない
+            // (b) 新しいバージョンを検知したら出直す（しつこくないが黙りもしない）
+            // (c) dispatch（CLI / MCP と同一経路）と UI 状態・永続化キーが一致する
+            // (d) 専用ウィンドウが実際に開き、更新フローの各状態を描画できる
+            // (e) パレット導線が専用ウィンドウを開く
+            {
+                use crate::update_checker::{
+                    Channel, ChannelUpdates, UpdateInfo, UpdateState, CURRENT_VERSION,
+                };
+                let info = |v: &str, ch: Channel| UpdateInfo {
+                    version: v.into(),
+                    channel: ch,
+                    html_url: format!("https://example.invalid/releases/v{v}"),
+                    download_url: Some("https://example.invalid/tako.zip".into()),
+                    asset_name: Some(format!("tako-v{v}-macos-arm64.zip")),
+                    notes: Some("- セルフテスト用のリリースノート".into()),
+                };
+                let available = |stable: Option<&str>, test: Option<&str>| {
+                    UpdateState::Available(ChannelUpdates {
+                        stable: stable.map(|v| info(v, Channel::Stable)),
+                        test: test.map(|v| info(v, Channel::Test)),
+                        rate_limit_note: None,
+                    })
+                };
+                let card = |action: &str, app: &mut TakoApp| -> serde_json::Value {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Update {
+                            action: Some(action.into()),
+                            channel: None,
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                    .unwrap_or_else(|_| serde_json::json!({}))
+                };
+
+                let (card_flow, dismissed_key) = window
+                    .update(cx, |app, _, cx| {
+                        // --- (a) 更新ありでカードが出る（dispatch と UI が一致）---
+                        app.update_state = available(Some("99.0.0"), None);
+                        app.update_card_dismissed = None;
+                        let shown = app.render_update_card(cx).is_some();
+                        let status = card("card", app);
+                        let status_ok = status["visible"] == serde_json::json!(true)
+                            && status["key"] == serde_json::json!("stable:99.0.0")
+                            && status["stable"] == serde_json::json!("99.0.0");
+
+                        // --- × で閉じる（GUI のクリックハンドラそのままの経路）---
+                        app.dismiss_update_card(cx);
+                        let hidden = app.render_update_card(cx).is_none();
+                        let after = card("card", app);
+                        let dismissed_ok = after["visible"] == serde_json::json!(false)
+                            && after["dismissed_key"] == serde_json::json!("stable:99.0.0");
+                        let key = after["dismissed_key"].as_str().map(str::to_string);
+
+                        // --- (b) 新しいバージョンなら出直す ---
+                        app.update_state = available(Some("99.0.1"), None);
+                        let shown_again = app.render_update_card(cx).is_some()
+                            && card("card", app)["visible"] == serde_json::json!(true);
+
+                        // --- (c) card-show で抑止解除 / 更新フロー中はカードを出さない ---
+                        app.update_state = available(Some("99.0.0"), None);
+                        let re_shown = card("card-show", app)["visible"] == serde_json::json!(true)
+                            && app.update_card_dismissed.is_none();
+                        // 確認中・チェック中はカードを出さない（進行はすべて専用画面側に出る）。
+                        // 後者は「カード表示中に手動チェックした」ときに通る経路そのもの
+                        let mut no_card_during_flow = true;
+                        for flow in [
+                            UpdateState::ConfirmPending(info("99.0.0", Channel::Stable)),
+                            UpdateState::Updating(crate::ui_text::update::checking().into()),
+                        ] {
+                            app.update_state = flow;
+                            no_card_during_flow &= app.render_update_card(cx).is_none()
+                                && card("card", app)["visible"] == serde_json::json!(false);
+                        }
+
+                        // 自動チェックがユーザーの確認フローを裏で消さない（#616 の不変条件）
+                        let flow_protected = !app.update_state.is_replaceable_by_check()
+                            && available(Some("99.0.0"), None).is_replaceable_by_check();
+
+                        // 「今すぐ更新」→ キャンセルは**問い合わせ直さずに**一覧へ戻る
+                        app.update_state = available(Some("99.0.0"), Some("99.1.0-test.1"));
+                        app.show_update_confirm_for_channel(info("99.0.0", Channel::Stable), cx);
+                        let entered =
+                            matches!(app.update_state, UpdateState::ConfirmPending(_));
+                        app.cancel_update_flow(cx);
+                        let restored = match &app.update_state {
+                            // 両チャンネルとも取り消し前のまま戻る（片方だけ消えない）
+                            UpdateState::Available(u) => {
+                                u.stable.as_ref().map(|i| i.version.as_str()) == Some("99.0.0")
+                                    && u.test.as_ref().map(|i| i.version.as_str())
+                                        == Some("99.1.0-test.1")
+                            }
+                            _ => false,
+                        };
+                        let cancel_ok = entered && restored;
+
+                        cx.notify();
+                        (
+                            shown
+                                && status_ok
+                                && hidden
+                                && dismissed_ok
+                                && shown_again
+                                && re_shown
+                                && no_card_during_flow
+                                && flow_protected
+                                && cancel_ok,
+                            key,
+                        )
+                    })
+                    .unwrap_or((false, None));
+                check(
+                    card_flow,
+                    "更新通知カード: 表示 → × で抑止 → 新バージョンで再表示 / dispatch と一致 (#616)",
+                );
+
+                // 再起動をまたいだ抑止: 実 settings ファイルへ往復させ、起動時と同じ判定
+                // （load した値で `card_should_show`）が false になることを見る。
+                // TAKO_SELF_TEST 中は dispatch が保存しないので、保存経路はここで直接通す
+                {
+                    let fixture =
+                        std::env::temp_dir().join(format!("tako-st616-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&fixture);
+                    let path = fixture.join("settings.json");
+                    let saved = tako_control::settings::Settings {
+                        update_card_dismissed: dismissed_key.clone(),
+                        ..Default::default()
+                    };
+                    let wrote = tako_control::settings::save_to(&path, &saved).is_ok();
+                    let loaded = tako_control::settings::load_from(&path)
+                        .and_then(|s| s.update_card_dismissed);
+                    let updates = match available(Some("99.0.0"), None) {
+                        UpdateState::Available(u) => u,
+                        _ => unreachable!("直前に組み立てた Available"),
+                    };
+                    let newer = match available(Some("99.0.1"), None) {
+                        UpdateState::Available(u) => u,
+                        _ => unreachable!("直前に組み立てた Available"),
+                    };
+                    // 起動時にこの値を読む（TakoApp::new）= 同じバージョンでは出ない
+                    let suppressed_after_restart =
+                        !crate::update_checker::card_should_show(&updates, loaded.as_deref());
+                    let shows_newer_after_restart =
+                        crate::update_checker::card_should_show(&newer, loaded.as_deref());
+                    check(
+                        wrote
+                            && loaded.as_deref() == Some("stable:99.0.0")
+                            && suppressed_after_restart
+                            && shows_newer_after_restart,
+                        "更新通知カード: 閉じた記録が settings.json を往復し再起動後も抑止される (#616)",
+                    );
+                    if fixture.starts_with(std::env::temp_dir()) {
+                        let _ = std::fs::remove_dir_all(&fixture);
+                    }
+                }
+
+                // --- (d)(e) 専用ウィンドウ: dispatch / カード / パレットから開き、
+                // 更新フローの各状態を実際に描画できる ---
+                let requested = window
+                    .update(cx, |app, _, cx| {
+                        app.pending_update_open = false;
+                        // パレット導線（ラベルは言語で変わるので id で見る）
+                        let ids: Vec<&str> = app
+                            .palette_items("")
+                            .iter()
+                            .filter_map(|i| match i {
+                                PaletteItem::Command(_, id) => Some(*id),
+                                _ => None,
+                            })
+                            .collect();
+                        let has_entry = ids.contains(&"open-update");
+                        app.palette_execute(
+                            PaletteItem::Command(
+                                crate::ui_text::palette::cmd_label("open-update"),
+                                "open-update",
+                            ),
+                            cx,
+                        );
+                        let by_palette = app.pending_update_open;
+                        app.pending_update_open = false;
+                        // dispatch（CLI / MCP と同一経路）
+                        let ok = card("open", app)["ok"] == serde_json::json!(true);
+                        let by_dispatch = app.pending_update_open;
+                        // 画面に出すのは「更新あり」の状態（リリースノートまで描く）
+                        app.update_state = available(Some("99.0.0"), Some("99.1.0-test.1"));
+                        cx.notify();
+                        has_entry && by_palette && ok && by_dispatch
+                    })
+                    .unwrap_or(false);
+                // pending の消費は render / IPC ループと同じ 1 行。ウィンドウが不可視だと
+                // フレームが来ず render が走らないので、ここでは同じ処理を明示的に叩く
+                // （蓋閉じ・バックグラウンドでも項目が決定的に動くようにする）
+                let _ = window.update(cx, |app, _, cx| {
+                    if std::mem::take(&mut app.pending_update_open) {
+                        app.open_update_window_impl(cx);
+                    }
+                });
+                wait(cx, 600).await;
+                let update_win = window.update(cx, |app, _, _| app.update_window_handle).ok();
+                let opened = update_win.flatten();
+                let rendered = match opened {
+                    Some(handle) => {
+                        // 更新フローの各状態を実際に描画する（どれかが panic したらここで死ぬ）
+                        let states = [
+                            UpdateState::Idle,
+                            available(Some("99.0.0"), Some("99.1.0-test.1")),
+                            UpdateState::TestWarning(info("99.1.0-test.1", Channel::Test)),
+                            UpdateState::ConfirmPending(info("99.0.0", Channel::Stable)),
+                            UpdateState::Updating("...".into()),
+                            UpdateState::Done("done".into()),
+                            UpdateState::Failed("failed".into()),
+                            UpdateState::BrewFailedFallback {
+                                brew_error: "boom".into(),
+                                info: info("99.0.0", Channel::Stable),
+                            },
+                            UpdateState::CheckFailed("network".into()),
+                        ];
+                        let mut all = true;
+                        for state in states {
+                            let _ = window.update(cx, |app, _, cx| {
+                                app.update_state = state.clone();
+                                cx.notify();
+                            });
+                            all &= handle
+                                .update(cx, |view, win, cx| {
+                                    let _ = view.render(win, cx);
+                                    true
+                                })
+                                .unwrap_or(false);
+                        }
+                        // 「アップデートを確認」の行き先が必ず用意される（結果が迷子にならない）
+                        let routed = window
+                            .update(cx, |app, _, cx| {
+                                app.update_state = UpdateState::Updating("busy".into());
+                                app.pending_update_open = false;
+                                // 更新処理中は確認を走らせないが、画面は開く
+                                app.start_update_check(cx);
+                                let opened = app.pending_update_open;
+                                app.pending_update_open = false;
+                                app.update_state = UpdateState::Idle;
+                                opened
+                            })
+                            .unwrap_or(false);
+                        // 専用ウィンドウが開いていることは status からも分かる
+                        let reported = window
+                            .update(cx, |app, _, _| {
+                                card("status", app)["window_open"] == serde_json::json!(true)
+                            })
+                            .unwrap_or(false);
+                        all && routed && reported
+                    }
+                    None => false,
+                };
+                check(
+                    requested && rendered,
+                    "アップデート専用画面: パレット / dispatch から開き、更新フロー全状態を描画できる (#616)",
+                );
+                // 後片付け（後続の項目・実際の状態へ持ち越さない）
+                let _ = window.update(cx, |app, _, cx| {
+                    app.update_state = UpdateState::Idle;
+                    app.update_card_dismissed = None;
+                    app.pending_update_open = false;
+                    let _ = CURRENT_VERSION;
+                    cx.notify();
+                });
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

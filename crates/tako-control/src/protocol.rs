@@ -975,7 +975,11 @@ pub enum Request {
     /// `"apply"` → 配布系統に応じた更新を実行する（再起動は UI 側の責務）。
     ///   `channel` = "stable"（既定）/ "test" で対象チャンネルを指定。
     /// `"apply-zip"` → 配布系統を問わず zip 経由で強制更新する（brew 失敗時のフォールバック）。
-    /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）
+    /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）。
+    /// `"open"` → アップデート専用画面を開く（Issue #616）。
+    /// `"card"` → 上部通知カードの状態（表示中か / 案内中バージョンのキー）。
+    /// `"card-dismiss"` → カードを閉じ、そのバージョンは以後通知しない（settings.json へ永続化）。
+    /// `"card-show"` → 抑止を解除してカードを出し直す
     Update {
         #[serde(default)]
         action: Option<String>,

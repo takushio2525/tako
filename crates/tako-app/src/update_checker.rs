@@ -92,12 +92,14 @@ impl std::str::FromStr for Channel {
 pub struct UpdateInfo {
     pub version: String,
     pub channel: Channel,
-    #[allow(dead_code)]
     pub html_url: String,
     pub download_url: Option<String>,
     /// 実際に選ばれた配布物のファイル名（#595）。
     /// 「自分の環境向けのどれを掴んだか」を CLI / MCP から確認できるようにする
     pub asset_name: Option<String>,
+    /// リリースノート本文（GitHub Releases の `body`。#616 のアップデート画面で表示）。
+    /// 追加の API リクエストは要らない（/releases の応答に既に含まれている）
+    pub notes: Option<String>,
 }
 
 /// 更新候補を選ぶ基準になる実行環境（#595）。
@@ -240,8 +242,23 @@ pub enum UpdateState {
     },
     /// 更新チェック失敗（#59: エラーの可視化。静かにリトライする）
     CheckFailed(String),
-    /// ユーザーが閉じた（次回起動まで非表示）
-    Dismissed,
+}
+
+impl UpdateState {
+    /// 自動チェックの結果で上書きしてよい状態か（#616）。
+    ///
+    /// ユーザーが確認・更新の最中（TestWarning / ConfirmPending / Updating）や、
+    /// まだ読まれていない結果（Failed / BrewFailedFallback）を裏で消さないための判定。
+    /// 「一度閉じたら出さない」はここではなくカードのキー（`card_key`）が担う
+    pub fn is_replaceable_by_check(&self) -> bool {
+        matches!(
+            self,
+            UpdateState::Idle
+                | UpdateState::Available(_)
+                | UpdateState::Done(_)
+                | UpdateState::CheckFailed(_)
+        )
+    }
 }
 
 /// 配布系統の判定結果
@@ -690,6 +707,11 @@ fn parse_releases_for(
         };
 
         let html_url = release["html_url"].as_str().unwrap_or_default().to_string();
+        let notes = release["body"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let slot = match channel {
             Channel::Stable => &mut result.stable,
             Channel::Test => &mut result.test,
@@ -700,10 +722,36 @@ fn parse_releases_for(
             html_url,
             download_url: Some(download_url),
             asset_name: Some(asset_name),
+            notes,
         });
     }
 
     result
+}
+
+/// 更新通知カード（#616）が案内している内容の一意キー。
+///
+/// **バージョン単位で「一度閉じたらもう出さない」を成立させるための鍵**。
+/// 両チャンネルを含むので、片方だけ新しくなってもキーが変わり、カードが出直す。
+/// 更新が 1 件も無ければ `None`（= 出すものが無い）
+pub fn card_key(updates: &ChannelUpdates) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(ref s) = updates.stable {
+        parts.push(format!("stable:{}", s.version));
+    }
+    if let Some(ref t) = updates.test {
+        parts.push(format!("test:{}", t.version));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// カードを出すか（#616）。`dismissed` は前回 × で閉じたときのキー。
+/// 案内内容が変わればキーが変わるので、また出る
+pub fn card_should_show(updates: &ChannelUpdates, dismissed: Option<&str>) -> bool {
+    match card_key(updates) {
+        Some(key) => dismissed != Some(key.as_str()),
+        None => false,
+    }
 }
 
 /// 更新を実行する（ブロッキング。background executor で呼ぶ）。
@@ -1555,6 +1603,85 @@ mod tests {
             "tag_name": "v0.6.0", "prerelease": false, "html_url": "",
         })];
         assert!(parse_releases_for(&arr, MAC, "0.5.13").stable.is_none());
+    }
+
+    // --- #616: 更新通知カードのキー（バージョン単位の再表示抑止） ---
+
+    fn updates_of(stable: Option<&str>, test: Option<&str>) -> ChannelUpdates {
+        let info = |v: &str, ch: Channel| UpdateInfo {
+            version: v.into(),
+            channel: ch,
+            html_url: String::new(),
+            download_url: None,
+            asset_name: None,
+            notes: None,
+        };
+        ChannelUpdates {
+            stable: stable.map(|v| info(v, Channel::Stable)),
+            test: test.map(|v| info(v, Channel::Test)),
+            rate_limit_note: None,
+        }
+    }
+
+    #[test]
+    fn test_card_key_covers_both_channels() {
+        assert_eq!(card_key(&updates_of(None, None)), None);
+        assert_eq!(
+            card_key(&updates_of(Some("0.6.1"), None)).as_deref(),
+            Some("stable:0.6.1")
+        );
+        assert_eq!(
+            card_key(&updates_of(None, Some("0.7.0-test.1"))).as_deref(),
+            Some("test:0.7.0-test.1")
+        );
+        assert_eq!(
+            card_key(&updates_of(Some("0.6.1"), Some("0.7.0-test.1"))).as_deref(),
+            Some("stable:0.6.1 test:0.7.0-test.1")
+        );
+    }
+
+    #[test]
+    fn test_card_hidden_only_for_the_dismissed_version() {
+        let u = updates_of(Some("0.6.1"), None);
+        let key = card_key(&u).unwrap();
+        // 未操作なら出る / 閉じた本人のキーでだけ抑止される
+        assert!(card_should_show(&u, None));
+        assert!(!card_should_show(&u, Some(&key)));
+        // 新しいバージョンを検知したら出直す（しつこくはしないが、黙りもしない）
+        let newer = updates_of(Some("0.6.2"), None);
+        assert!(card_should_show(&newer, Some(&key)));
+        // 片方だけ増えた場合も出直す
+        let plus_test = updates_of(Some("0.6.1"), Some("0.7.0-test.1"));
+        assert!(card_should_show(&plus_test, Some(&key)));
+        // 更新が無ければ何があっても出さない
+        assert!(!card_should_show(&updates_of(None, None), None));
+    }
+
+    /// リリースノートは /releases の応答から拾う（追加リクエスト無し。#616）
+    #[test]
+    fn test_release_notes_captured_and_trimmed() {
+        let mut r = release("v99.0.0", false, &["tako-v99.0.0-macos-arm64.zip"]);
+        r["body"] = serde_json::json!("\n## 変更点\n- 何か\n");
+        let info = parse_releases_for(&[r], MAC, "0.5.13").stable.unwrap();
+        assert_eq!(info.notes.as_deref(), Some("## 変更点\n- 何か"));
+
+        // body が無い / 空白のみなら None（空欄を「ノートあり」と見せない）
+        let mut empty = release("v99.0.0", false, &["tako-v99.0.0-macos-arm64.zip"]);
+        empty["body"] = serde_json::json!("   \n ");
+        assert!(parse_releases_for(&[empty], MAC, "0.5.13")
+            .stable
+            .unwrap()
+            .notes
+            .is_none());
+        assert!(parse_releases_for(
+            &[release("v99.0.0", false, &["tako-v99.0.0-macos-arm64.zip"])],
+            MAC,
+            "0.5.13"
+        )
+        .stable
+        .unwrap()
+        .notes
+        .is_none());
     }
 
     #[test]

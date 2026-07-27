@@ -535,6 +535,14 @@ enum UpdateCommand {
     },
     /// broken-brew 状態の修復（brew install --cask --force で台帳を再締結）
     Repair,
+    /// アップデート専用画面（GUI）を開く
+    Open,
+    /// 上部通知カードの操作（引数なしで現在の状態）
+    Card {
+        /// dismiss = 閉じてこのバージョンは以後通知しない / show = 抑止を解除して出し直す
+        #[arg(value_parser = ["dismiss", "show"])]
+        action: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5109,6 +5117,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 UpdateCommand::Apply { channel } => ("apply", channel.clone()),
                 UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone()),
                 UpdateCommand::Repair => ("repair", None),
+                // #616: 専用画面 + 通知カード
+                UpdateCommand::Open => ("open", None),
+                UpdateCommand::Card { action } => (
+                    match action.as_deref() {
+                        Some("dismiss") => "card-dismiss",
+                        Some("show") => "card-show",
+                        _ => "card",
+                    },
+                    None,
+                ),
             };
             Request::Update {
                 action: Some(action.to_string()),
