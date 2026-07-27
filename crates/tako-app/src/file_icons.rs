@@ -150,6 +150,7 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("refresh"),
     ui_asset!("search"),
     ui_asset!("split"),
+    ui_asset!("stop"),
     ui_asset!("sun"),
     ui_asset!("trend"),
     ui_asset!("unshelve"),
@@ -202,6 +203,8 @@ pub mod ui_icon {
     pub const REMOTE: &str = "icons/ui/remote.svg";
     pub const SEARCH: &str = "icons/ui/search.svg";
     pub const SPLIT: &str = "icons/ui/split.svg";
+    /// 起動 ⇔ 停止トグルの停止側（#615。PLAY と対になる ■）
+    pub const STOP: &str = "icons/ui/stop.svg";
     pub const SUN: &str = "icons/ui/sun.svg";
     pub const TREND: &str = "icons/ui/trend.svg";
     pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
