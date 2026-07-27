@@ -1430,3 +1430,18 @@
 - 検証: fmt / clippy(-D warnings) / test 全緑（1398）+ 実 claude e2e 新設（修正を戻すと
   FAILED になることを実測）+ 隔離セルフテスト。既存 e2e 4/5 通過（残り 1 は `/tmp` が
   信頼済みという環境要因で main でも同じく失敗）
+
+## 2026-07-27（#571: orchestrator watch が WORKER_IDLE を発火しない問題の根治）
+- 3 層の欠陥を実測で確定して全部潰した: ①`claude agents --json` をプロセス環境の
+  `CLAUDE_CONFIG_DIR` ごと実行しており、アカウント env つきペインから起動した GUI では
+  他アカウントの worker が「存在しない」ことになる（本番汚染下の実測で 1 件 → 8 件）
+  ②画面フォールバックが `screen_looks_busy || has_children` で busy に上書きしていたが、
+  エージェント TUI 自身がペインシェルの子なので has_children は常に true = 構造的に idle を
+  出せない ③claude のフッターが 8 行あり `screen_looks_busy` の末尾 5 行がスピナーに届かない
+  （②を外すと今度は偽 IDLE になる関係）。併せて claude の実 status 語彙（idle / busy）への
+  正規化と、agents が状態を返せないときの `status_source` 降格も修正
+- 関連: PR #578 squash merge（Closes #571）。fmt / clippy / 1408 tests 緑 +
+  実 claude e2e（`issue571_e2e`）が修正前 Timeout(60s) → 修正後 Idle(13.9s) +
+  隔離 GUI + 実 CLI watch で WORKER_IDLE を idle から 16 秒で発火（復元またぎ・screen 経路も確認）
+- 副産物: permission ダイアログ待ちが WORKER_QUESTION になる（`waiting` へ到達する経路が
+  claude では存在しない）を #577 に起票。Stop hook error は無害と確認（Issue の疑いは外れ）

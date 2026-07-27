@@ -4,88 +4,67 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-27・#572 で busy 中の打鍵消失を根治）
+## 現在の対象（2026-07-27・#571 で orchestrator watch の不検知を根治）
 
-`fix/572-busy-input-loss`。**根因は claude のメッセージキューと tako の誤検知の二段構え**。
+直近: `fix/571-watch-idle` → PR #578 を merge。busy → idle 遷移を watch が 40 分以上
+見逃していた事故。**3 層の欠陥が重なっていた**（どれか 1 つでも直っていれば総損失は防げた）。
 
-- claude は **生成中に打たれた入力を入力欄ではなく内部キュー**へ入れる（ターン終了時に送信）。
-  この間の入力欄は空で、代わりに dim のヒント `Press up to edit queued messages` が出る
-- tako はこの dim を「残留テキスト」と誤認 → `input_status: style=ghost` +
-  Enter 単独送達が発火しない Enter を 5 回空撃ちして `verified=false`。
-  master はこれを「送達に失敗した」と読み違えていた（#572 の 10 件の正体）
-- 是正 ①「入力欄が空か」を **dim 属性**で判定（tmux 経路は `capture-pane -e`）。
-  文言リストでは AI 生成のゴースト提案を網羅できないため属性を根拠にする
-- 是正 ② キュー滞留を `queued_messages_pending` で検知し `read` / `worker_status` /
-  watch イベントに載せる（キューはペインが消えると失われるので閉じる前に気付ける）
-- 是正 ③ 生成が止まっているのにキューが残っていたら tako が `Up` → `Enter` で送り出す。
-  **生成中かの判定は `is_busy` の文言ではなく「画面が変化していないこと」**
-  （実測で 120 行のリスト生成中に `is_busy` が false を返し、救出が暴発した）
+- **トリガー**: `claude agents --json` は**その config dir のエージェントしか返さない**のに、
+  tako はプロセス環境の `CLAUDE_CONFIG_DIR` ごと実行していた。アカウント env つきのペインから
+  GUI を起動すると（07-26 23:42 の再起動がまさにこれ）、そのアカウントの worker しか見えなくなる。
+  `AgentScanTarget` を新設し、既定 + accounts.yaml の全 config dir を並行走査 → sessionId で
+  重複排除。継承ではなく走査先ごとに明示指定する（rc に勝つためコマンド先頭の unset / export も併用）
+- **増幅器**: `status == "unknown"` の画面フォールバックが `screen_looks_busy || has_children` で
+  busy に上書きしていた。**エージェント CLI の TUI プロセス自身がペインシェルの子**なので
+  has_children は生きている限り必ず true = 画面フォールバックは構造的に idle を出せなかった。
+  プロセスツリーは「画面から判断できないとき」の補助へ降格
+- **増幅器を隠していたもの**: claude のフッターは 8 行あり、スピナー行は末尾から 9 行目。
+  `screen_looks_busy` は末尾 5 行しか見ておらず busy 判定が常に false だった。マーカーを
+  強（実行中にしか出ない。末尾 20 行）と弱（完了行にも出る一般語。末尾 5 行のまま）に分割。
+  claude のスピナーは語ではなく「経過時間つきの括弧」（`… (10m 49s`）で拾う
+- 併せて: claude の実 status は `idle` / `busy`（実測。旧実装は `active` しか busy へ正規化せず
+  busy 中の一次シグナルを毎回捨てていた）/ agents が状態を返せないのに `status_source` が
+  `agents` のままで watch が画面推定を一次シグナル扱い（streak 3）していたのを `screen`（8）へ降格
 
-## これまでの対象（2026-07-27・#570 で git タブの UX 4 件を一括改善）
+レジストリの `prompt_delivery` が送達済みでも `undelivered` に残るのも同根（session 検出の
+lazy 昇格が agents 解決に依存）。修正後は隔離実測で `session_id` が記録されることを確認。
 
-直近: `fix/551-560-561-562-git-tab-ux` → PR #570（`b62c325`）を merge。#551 / #560 / #561 は close、
-**#562 は実機目視が残っているため open 維持**。
+Stop hook error は**無害**（隔離 worker でも同じ行が出るが検知に影響しない）= Issue の疑いは外れ。
 
-- #551: git タブの本文順を 変更 → コミット → ブランチ → リモート → diff へ。既定の折りたたみは
-  「変更 + コミット = 展開 / ブランチ + リモート = 折りたたみ」。リポジトリ切替時は
-  `GitCollapsed::for_repo` で畳み直す（リモート 20 件超は必ず折りたたみ）
-- #560: 変更ファイル行のクリックでプレビュー表示（`open_file_row` = dispatch `OpenFile` 経由）。
-  + / − ボタンは伝播を止めるので両方は起きない。削除済み（D）はクリック対象外
-- #561: **コミット欄の IME が効かない根因は「変換対象がターミナルペインに束縛されていた」こと**。
-  `AppTextInput` + `ImeComposition.app_input` で宛先を型にし、下線のインライン描画・候補位置・
-  unmark の確定先を入力欄側へ。ブランチ名欄も同じ経路に載せた
-- #562: マージボタンが `opacity(0)` + 行ホバーでしか出ず「無い」と読まれていた。常時表示 +
-  アイコン + 案内行 + ブランチチップからの導線を追加
+副産物: permission ダイアログ待ちが `WORKER_PERMISSION` ではなく `WORKER_QUESTION` になる
+（`status == "waiting"` へ到達する経路が claude では存在しない）のを実測 → **#577 に起票**。
 
-副産物: UI アイコン定数が `EMBEDDED_ASSETS` に登録済みかの検査テストを新設（未登録だと
-`svg()` が無言で何も描かない）。既存の remote.svg が描かれていなかったのを検出して修正。
+## これまでの対象（要点のみ。詳細は progress.md）
 
-`/Applications/tako.app` は `b62c325` を install 済み。**稼働中の GUI は旧バイナリなので再起動が要る**。
-
-## これまでの対象（2026-07-27 未明・#553 でパネルビューの語彙を GUI と一致させた）
-
-直近: `fix/553-fleet-vocab` で #553 を解消。GUI のタブは fleet / orch / git なのに CLI / MCP の
-`--view` は tmux / orch / git しか受けず、画面に見えている語で操作できなかった（設計原則 5 の前提崩れ）。
-**`PanelViewWire::Fleet` を正式値化**し、語彙の正本を protocol.rs の
-`VALUES` / `LEGACY_VALUES` / `parse` / `values_hint` に集約して CLI・MCP 双方がそこから引く形にした。
-旧称 `tmux` は `serde(alias)` + `parse` で受理し続けるが、応答 JSON は必ず `fleet` に正規化する。
-tako-app 側の `PanelView::Tmux` も `Fleet` へ改称（`PanelView::Tmux => PanelViewWire::Fleet` という
-食い違いの再発を構造で防ぐため）。
-
-その前: `fix/530-prompt-delivery` で #530 を根治。根因は疑われていた「シェル段階の誤判定」ではなく
-**claude の番号付き選択ダイアログ（初回テーマ選択 `❯ 2. Dark mode ✔` / ログイン方法選択）の
-選択カーソルを入力欄と誤認していたこと**。`CLAUDE_CONFIG_DIR` を切り替えると初回に必ず出るため、
-account env 注入つき spawn 特有の症状になっていた。`is_choice_dialog`（文言非依存の構造判定）を
-新設して `input_line` から除外し、送達の証拠を「入力欄が空」から「貼り付けが入力欄へ反映された」へ
-変更。未達は `prompt_delivery=undelivered` + `prompt_delivery_failure` + `resend_command` で報告する。
-
-その前: #548 で `tako orchestrator accounts` を追加し、アカウント系（#511 / #512 / #547 / #548）の
-欠落は全て解消。#547 で master_account を master / solo / handoff の起動へ適用。
-さらに前に `fix/511-512-account-polish` で CLI `spawn/run --account`（#511）と
-accounts.yaml の `inherit: true`（#512。既定パス明示 → Keychain 別エントリ問題の根治）を実装。
-**ローカル accounts.yaml の personal を inherit 形式へ更新済み → 古いバイナリでは
-パースできないので tako の再起動が必須**。`~/.claude-univ` を検証事故で失っており、
-univ アカウントの worker は初回に 1 回ログインが要る。
+- #572（07-27）: busy 中の打鍵消失を根治。**claude は生成中の打鍵を入力欄ではなく内部キュー**へ
+  入れる（入力欄は空 + dim ヒント）。tako はこの dim を残留テキストと誤認していた。
+  「入力欄が空か」は dim 属性で判定し、キュー滞留は `queued_messages_pending` で公開する
+- #570（07-27）: git タブ UX 4 件。**#562 はマージ導線の実機目視が残っていて open 維持**。
+  IME の根因は「変換対象がターミナルペインに束縛されていた」こと（`AppTextInput` で宛先を型に）
+- #553（07-27 未明）: パネルビューの語彙を GUI と一致（`PanelViewWire::Fleet` を正式値化。
+  旧称 `tmux` は受理しつつ応答は必ず `fleet` に正規化）
+- #530（07-26）: spawn プロンプト消失の根治。根因は claude の**番号付き選択ダイアログ**の
+  選択カーソルを入力欄と誤認していたこと（`is_choice_dialog` で除外）
+- #547 / #548 / #511 / #512（07-26）: アカウント系の欠落を解消。`accounts.yaml` の
+  `inherit: true` は「CLAUDE_CONFIG_DIR を設定しない」の意味。`~/.claude-univ` は検証事故で
+  失っており、univ アカウントの worker は初回に 1 回ログインが要る
 
 ## 次の一手
 
-1. **tako を再起動**して `b62c325` を反映（git タブの 4 件はここから体感できる）
-2. **#561 の実 IME 目視**: この機には日本語入力ソースが有効化されていない
-   （`AppleEnabledInputSources` は ABC + パレットのみ）ため実変換を走らせられなかった。
-   Issue #561 のコメントにチェックリストがある
-3. **#562 / #496 の GUI チェックリスト**: マージ導線の目視 + コンフリクトカード / 狭幅 220pt
-4. **Windows 実機ビルド**: `.agent/windows-setup.md` の手順で `cargo build`。
-   macOS 側は `scripts/check-windows.sh`（クロス check）が緑の状態
-5. `worker_account: personal` への切替 / renewal/remote-transport の統合・v0.6.0 準備
+1. **tako を再起動**して #571 の修正を反映（現在稼働中の GUI は旧バイナリ + `CLAUDE_CONFIG_DIR`
+   汚染ありなので、watch は依然として不発のまま）
+2. #577（permission ダイアログが WORKER_QUESTION になる）の着手判断
+3. **#561 の実 IME 目視**: この機には日本語入力ソースが有効化されていないため未検証
+4. **#562 / #496 の GUI チェックリスト**: マージ導線の目視 + コンフリクトカード / 狭幅 220pt
+5. **Windows 実機ビルド**: `.agent/windows-setup.md` の手順で `cargo build`
+6. `worker_account: personal` への切替 / renewal/remote-transport の統合・v0.6.0 準備
 
 ## 未着手・持ち越し
 
 - #496 のカード描画（コンフリクトカード / マージ確認カード / 狭幅 220pt）の**目視のみ**未確認。
   実装・CLI・dispatch・MCP・ペイン読み取りでの検証は完了済み
-- `claude_tui_e2e`（#32 系。`--ignored` の手動実行専用）が **main 時点で 2 件落ちている**:
-  `事前信頼でダイアログなしの送達が通る` / `残留テキストをenter単独送達で送信できる`。
-  どちらも `ensure_trusted` を書いたのに信頼ダイアログが出る（claude v2.1.220 で
-  `hasTrustDialogAccepted` だけでは足りなくなった疑い）。#530 の変更前後で同一結果 = 回帰ではない
+- `claude_tui_e2e`（#32 系。`--ignored` の手動実行専用）は #558 以降 4/5 通過。
+  残り 1 件は `/tmp` が信頼済みという環境要因で main でも同じく失敗する（#572 で実測）
 
 ## GUI 検証の環境知見（#496 で判明。次回の時間浪費を防ぐ）
 
@@ -108,6 +87,14 @@ univ アカウントの worker は初回に 1 回ログインが要る。
   「その座標の最前面が自分のウィンドウか」を CGWindowList で必ず確かめる
   （AppleScript の `whose unix id is N` は別プロセスに誤マッチする）
 - 本体リポ `~/dev/tako` が `main` をチェックアウトしている（2026-07-27 時点）
+- **GUI を「tako のペインの中」から起動すると env が丸ごと継承される**（#571 の根因）。
+  `CLAUDE_CONFIG_DIR` はもちろん `TAKO_SOCKET` / `TAKO_PANE_ID` / `CLAUDE_CODE_CHILD_SESSION` まで
+  引き継ぐ。`CLAUDE_CODE_CHILD_SESSION` が入ると spawn した worker が
+  `claude agents --json` に載らない（transcript 保存も off）ので、隔離検証では
+  `env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID ...` まで落とすこと
+- 隔離 GUI を Bash ツールのバックグラウンドで起動すると、`nohup` + `disown` でも
+  次のツール呼び出しで落ちる。`run_in_background: true` の**そのコマンド自体**を
+  tako-app にする（`exec ... tako-app`）と生き続ける
 
 ## 現フェーズで Read すべき設計書
 
@@ -117,3 +104,7 @@ univ アカウントの worker は初回に 1 回ログインが要る。
 - git タブに手を入れる: `crates/tako-app/src/right_panel.rs` の `GitScrollBody`（#494 構造不変条件）
 - プロンプト送達に手を入れる: `crates/tako-control/src/claude_tui.rs`（画面判定の純関数）+
   `main.rs` の `drive_prompt_flows`。遷移診断は `TAKO_PROMPT_FLOW_DEBUG=1`（画面内容は出さない）
+- worker の完了検知（watch / worker_status）に手を入れる: `orchestrator/wait.rs` の
+  `wait_for_worker` / `screen_looks_busy` と `dispatch.rs` の
+  `apply_worker_status_corrections`（#571 の不変条件: **画面の判断をプロセスツリーで覆さない** /
+  **agents が状態を返せなければ status_source は screen** / **エージェント列挙は config dir 横断**）
