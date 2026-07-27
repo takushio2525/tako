@@ -312,7 +312,7 @@ fn os連携の直呼びが境界の外に残っていない() {
     let mut offenders = Vec::new();
     for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
         let src = root.join("crates").join(crate_dir).join("src");
-        collect_os_shell_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
+        collect_direct_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
     }
     assert!(
         offenders.is_empty(),
@@ -322,7 +322,68 @@ fn os連携の直呼びが境界の外に残っていない() {
     );
 }
 
-fn collect_os_shell_calls(
+/// **#519 M1 の受け入れ**: 器のライフサイクル（役割 A）の直接呼び出しが、
+/// 抽象境界 B2 の外に残っていないこと。
+///
+/// spawn の書き換え・器の kill・orphan 判定・セッション環境変数を tmux 実装へ直接
+/// 呼ぶと、案 B-1（ConPTY セッションホスト）を差し込んでも**その器が一切使われない**。
+/// 設計 §3.6 の合格条件「B-1 を足したとき呼び出し側の変更が 0 行」を守る番犬。
+///
+/// **対象は役割 A だけ**である。役割 B（アウトオブプロセス到達 = capture / send /
+/// probe）と `tako_tmux_*` の機能面（任意の tmux サーバー操作）はここでは見ない
+/// （前者は #519 段取り ⑤、後者はマトリクス上 Windows = `Pending`）。
+#[test]
+fn 器のライフサイクルの直呼びが境界の外に残っていない() {
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/tako-core/src/backend/tmux.rs",
+            "境界 B2 の tmux 実装（ここが唯一の委譲点）",
+        ),
+        (
+            "crates/tako-core/src/tmux_backend.rs",
+            "移設元の実装本体。内部の相互呼び出しと tmux e2e テストが含まれる",
+        ),
+        (
+            "crates/tako-core/src/scroll.rs",
+            "スクロールの tmux e2e テストが器を自前で組み立てる（#159 / #181 の実挙動検証）",
+        ),
+        (
+            "crates/tako-core/src/scroll_mirror.rs",
+            "同上（ローカル履歴ミラーの e2e）",
+        ),
+    ];
+    // 役割 A（器の生成・破棄・列挙・環境）の関数だけを挙げる。
+    // `socket_name` は役割 B の経路も使うため対象にしない
+    const PATTERNS: &[&str] = &[
+        "tmux_backend::wrap_options",
+        "tmux_backend::kill_session",
+        "tmux_backend::find_orphans",
+        "tmux_backend::cleanup_orphans",
+        "tmux_backend::pane_tty",
+        "tmux_backend::session_cwd",
+        "tmux_backend::session_env",
+        "tmux_backend::set_session_env",
+        "tmux_backend::sync_conf",
+        "tmux_backend::SESSION_PREFIX",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let src = root.join("crates").join(crate_dir).join("src");
+        collect_direct_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "器のライフサイクルの直呼びが境界の外にある:\n  {}\n\
+         → tako_core::backend の SessionBackend 経由にしてください（#519 / 設計 §3 の B2）",
+        offenders.join("\n  ")
+    );
+}
+
+/// ソースを行走査して、`patterns` に当たる行のうち `allowed` 以外のファイルにあるものを集める。
+/// 境界の番犬テスト（B8 = OS 連携 / B2 = 永続バックエンド）が共有する
+fn collect_direct_calls(
     dir: &Path,
     root: &Path,
     patterns: &[&str],
@@ -335,17 +396,20 @@ fn collect_os_shell_calls(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_os_shell_calls(&path, root, patterns, allowed, out);
+            collect_direct_calls(&path, root, patterns, allowed, out);
             continue;
         }
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
+        // 許可リストは `/` 区切りで書くので、Windows の `\` を正規化してから突き合わせる
+        // （しないと Windows では許可が一切効かず、境界の実装本体そのものが違反として挙がる）
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .display()
-            .to_string();
+            .to_string()
+            .replace('\\', "/");
         if allowed.iter().any(|(p, _)| rel == *p) {
             continue;
         }

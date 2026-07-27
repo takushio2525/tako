@@ -57,6 +57,7 @@ use tako_control::{
     IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost, SystemHost,
     TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
 };
+use tako_core::backend::SessionRef;
 use tako_core::{
     ratio_for_position, AgentMetrics, CommandState, Pane, PaneId, PaneOrigin, Rect, SelectionKind,
     SessionNotice, SpawnOptions, SplitAxis, SplitDirection, TabId, TerminalSession, Theme,
@@ -502,20 +503,20 @@ fn foreign_client_guard() -> Option<String> {
         return None;
     }
     let file = tako_control::layout::try_load().ok()?;
-    let sessions: std::collections::HashSet<&str> = file.sessions().into_iter().collect();
+    let sessions: Vec<SessionRef> = file
+        .sessions()
+        .into_iter()
+        .filter_map(|s| session_ref(s.to_string()))
+        .collect();
     if sessions.is_empty() {
         return None;
     }
-    let socket = tako_core::tmux_backend::socket_name();
-    let clients: Vec<(u32, String)> = tako_core::tmux::list_client_pids(Some(&socket))
-        .into_iter()
-        .filter(|(_, session)| sessions.contains(session.as_str()))
-        .collect();
-    if clients.is_empty() {
+    let holders = tako_core::backend::backend().foreign_holders(&sessions);
+    if holders.is_empty() {
         return None;
     }
     let parents = tako_control::agents::process_parent_map();
-    for (pid, session) in &clients {
+    for tako_core::backend::Holder { pid, session } in &holders {
         if let Some(owner) = live_foreign_tako_ancestor(*pid, &parents) {
             return Some(format!(
                 "復元対象の tmux セッション {session} に別の tako（pid {owner}）のクライアントが attach 中（表示中の資源は強奪しない）"
@@ -555,7 +556,24 @@ fn new_backend_session_name() -> String {
     let token =
         tako_control::generate_token().unwrap_or_else(|_| format!("{:024x}", std::process::id()));
     let tail = &token[..12.min(token.len())];
-    format!("{}{tail}", tako_core::tmux_backend::SESSION_PREFIX)
+    format!("{}{tail}", tako_core::backend::SESSION_PREFIX)
+}
+
+/// 保存済み・外部由来のセッション名を器の参照へ。ターゲット式や空白混じりの名前
+/// （#428 の取り違え・壊れた layout.json）は器として扱わない = 無音で別セッションを掴まない
+fn session_ref(name: String) -> Option<SessionRef> {
+    SessionRef::new(name)
+        .map_err(|e| eprintln!("warning: 器のセッション名として扱えない: {e}"))
+        .ok()
+}
+
+/// 保護対象セッション名の集合を器の参照へ。**1 件でも表現できない名前があれば `None`**。
+/// 保護が欠けた集合で orphan 判定を回すと、守りたいセッションを kill / 二重 attach して
+/// しまうため、呼び出し側は判定自体を諦める（安全側 = 掃除も復帰もしない）
+fn protected_refs(
+    names: impl IntoIterator<Item = String>,
+) -> Option<std::collections::HashSet<SessionRef>> {
+    names.into_iter().map(|n| SessionRef::new(n).ok()).collect()
 }
 
 /// プレビューを開く（提案チップ承諾アクションの**差し替え点**）。
@@ -1812,10 +1830,10 @@ impl TakoApp {
         let backend_caps = tako_core::backend::capabilities();
         let tmux_available = backend_caps.survives_app_exit;
         if tmux_persist && tmux_available {
-            // 生き残っている既存サーバーへ最新 conf を再適用する（conf は
+            // 生き残っている既存の器へ最新設定を再適用する（tmux の conf は
             // サーバー起動時にしか読まれないため、バージョン更新の設定変更が
             // ここで同期されないと永久に届かない）
-            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+            tako_core::backend::backend().sync_config();
         }
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
         let mut collapsed_tmux_tabs: std::collections::HashSet<TabId> =
@@ -2248,10 +2266,8 @@ impl TakoApp {
                 }
                 let backend_alive = r.session.as_ref().is_some_and(|name| {
                     tmux_available
-                        && tako_core::tmux::has_session(
-                            Some(&tako_core::tmux_backend::socket_name()),
-                            name,
-                        )
+                        && SessionRef::new(name.as_str())
+                            .is_ok_and(|s| tako_core::backend::backend().exists(&s))
                 });
                 if let Some(name) = &r.session {
                     app.backend_sessions.insert(pane, name.clone());
@@ -4139,24 +4155,27 @@ impl TakoApp {
         // 明示コマンドはログインシェル経由で実行する（.app の最小 PATH では
         // `tmux attach` や `npm` が直接 exec で見つからない。2026-06-12 リグレッション (7)）
         options.command = options.command.map(tako_core::login_shell_command);
-        // tmux バックエンド（Phase 5.5 / FR-5）: persist 有効 + tmux ありなら、シェルを
-        // 直接ではなく専用サーバーのセッションとして spawn する。`new-session -A` なので
-        // 復元時（既存セッション名）は attach、新規ペインは作成と、同じ経路で済む
-        let mut backend_session = None;
-        if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
-            let name = self
-                .backend_sessions
-                .entry(pane_id)
-                .or_insert_with(new_backend_session_name)
-                .clone();
-            options = tako_core::tmux_backend::wrap_options(
-                options,
-                &tako_core::tmux_backend::socket_name(),
-                &name,
-            );
-            backend_session = Some(name);
-        } else {
-            self.backend_sessions.remove(&pane_id);
+        // 永続バックエンド（Phase 5.5 / FR-5 / 境界 B2）: persist 有効 + 器を持つ backend なら、
+        // シェルを直接ではなく器の中のセッションとして spawn する。tmux なら
+        // `new-session -A` なので復元時（既存セッション名）は attach、新規ペインは作成と、
+        // 同じ経路で済む。**どの器かは backend が決める**（#519 M1: 実装名で分岐しない）
+        let existing = self.backend_sessions.get(&pane_id).cloned();
+        let (options, backend_session) = tako_core::backend::wrap_spawn_for_pane(
+            tako_core::backend::backend(),
+            self.tmux_persist,
+            existing.as_deref(),
+            new_backend_session_name,
+            options,
+        );
+        match &backend_session {
+            Some(session) => {
+                self.backend_sessions
+                    .insert(pane_id, session.as_str().to_string());
+            }
+            // 器なし = 直接ペイン（#30 の「構造のみ永続化」経路）
+            None => {
+                self.backend_sessions.remove(&pane_id);
+            }
         }
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
         self.terminals.insert(pane_id, session);
@@ -4171,20 +4190,19 @@ impl TakoApp {
             }
         })
         .detach();
-        // バックエンド構成では配下プロセスの制御端末は tmux サーバー側のペイン tty になる。
+        // バックエンド構成では配下プロセスの制御端末は器の側のペイン tty になる。
         // ポート検知（FR-2.4.2）と tmuxview（FR-2.13.2）の突き合わせ先をそちらへ差し替える
         // （セッション起動直後はまだ取れないことがあるためバックグラウンドでリトライ）
-        if let Some(name) = backend_session {
-            let socket = tako_core::tmux_backend::socket_name();
+        if let Some(backend_session) = backend_session {
             cx.spawn(async move |this, cx| {
                 for _ in 0..20 {
                     cx.background_executor()
                         .timer(Duration::from_millis(250))
                         .await;
-                    let (socket, name) = (socket.clone(), name.clone());
+                    let session = backend_session.clone();
                     let tty = cx
                         .background_executor()
-                        .spawn(async move { tako_core::tmux_backend::pane_tty(&socket, &name) })
+                        .spawn(async move { tako_core::backend::backend().pane_tty(&session) })
                         .await;
                     let alive = this.update(cx, |app: &mut TakoApp, _| {
                         match (&tty, app.terminals.get_mut(&pane_id)) {
@@ -4695,9 +4713,10 @@ impl TakoApp {
     /// **明示 close のときだけ**呼ぶ（アプリ終了経路では呼ばない = セッションが残り永続化）。
     /// シェル exit 由来の close では既にセッションが消えており kill は無害な空振りになる
     fn drop_backend_session(&mut self, pane_id: PaneId) {
-        if let Some(name) = self.backend_sessions.remove(&pane_id) {
-            let socket = tako_core::tmux_backend::socket_name();
-            std::thread::spawn(move || tako_core::tmux_backend::kill_session(&socket, &name));
+        if let Some(session) = self.backend_sessions.remove(&pane_id).and_then(session_ref) {
+            std::thread::spawn(move || {
+                let _ = tako_core::backend::backend().kill(&session);
+            });
         }
     }
 
@@ -4938,10 +4957,13 @@ impl TakoApp {
     /// spawn_session を通すため backend_sessions に登録され、
     /// 後続の cleanup_orphan_tmux からは protected として保護される
     fn recover_orphan_sessions(&mut self, cx: &mut Context<Self>) -> Vec<String> {
-        let protected: std::collections::HashSet<String> =
-            self.backend_sessions.values().cloned().collect();
-        let socket = tako_core::tmux_backend::socket_name();
-        let orphans = tako_core::tmux_backend::find_orphans(&socket, &protected);
+        let backend = tako_core::backend::backend();
+        // 保護対象が 1 件でも表現できないなら復帰しない（保護漏れの二重 attach を避ける）
+        let Some(protected) = protected_refs(self.backend_sessions.values().cloned()) else {
+            eprintln!("warning: 保護対象に扱えないセッション名があるため orphan 復帰を見送る");
+            return Vec::new();
+        };
+        let orphans = backend.orphans(&protected);
         if orphans.is_empty() {
             return Vec::new();
         }
@@ -4981,8 +5003,9 @@ impl TakoApp {
                 }
                 new_id
             };
-            self.backend_sessions.insert(pane_id, name.clone());
-            let cwd = tako_core::tmux_backend::session_cwd(&socket, name);
+            self.backend_sessions
+                .insert(pane_id, name.as_str().to_string());
+            let cwd = backend.session_cwd(name);
             let options = SpawnOptions {
                 cwd: cwd.map(std::path::PathBuf::from).filter(|p| p.is_dir()),
                 ..SpawnOptions::default()
@@ -4993,9 +5016,9 @@ impl TakoApp {
                 continue;
             }
             // #210: orphan セッションの TAKO_ORCHESTRATOR_ROLE から role を引き継ぐ
-            let role =
-                tako_core::tmux_backend::session_env(&socket, name, "TAKO_ORCHESTRATOR_ROLE")
-                    .and_then(|env_role| role_from_orchestrator_env(&env_role));
+            let role = backend
+                .session_env(name, "TAKO_ORCHESTRATOR_ROLE")
+                .and_then(|env_role| role_from_orchestrator_env(&env_role));
             if let Some(role) = &role {
                 if let Some(pane_obj) = self
                     .workspace
@@ -5007,9 +5030,9 @@ impl TakoApp {
             }
             // #210: 旧 TAKO_PANE_ID → 新 pane ID のマッピングを記録
             // （既存 claude CLI が旧 ID で MCP を呼んだとき dispatch で解決する）
-            if let Some(old_id) =
-                tako_core::tmux_backend::session_env(&socket, name, "TAKO_PANE_ID")
-                    .and_then(|v| v.parse::<u64>().ok())
+            if let Some(old_id) = backend
+                .session_env(name, "TAKO_PANE_ID")
+                .and_then(|v| v.parse::<u64>().ok())
             {
                 let old_pane = PaneId::from_raw(old_id);
                 if old_pane != pane_id {
@@ -5017,19 +5040,9 @@ impl TakoApp {
                 }
             }
             // TAKO_PANE_ID / TAKO_TAB_ID を新 pane ID に更新
-            tako_core::tmux_backend::set_session_env(
-                &socket,
-                name,
-                "TAKO_PANE_ID",
-                &pane_id.as_u64().to_string(),
-            );
-            tako_core::tmux_backend::set_session_env(
-                &socket,
-                name,
-                "TAKO_TAB_ID",
-                &tab_id.as_u64().to_string(),
-            );
-            recovered.push(name.clone());
+            backend.set_session_env(name, "TAKO_PANE_ID", &pane_id.as_u64().to_string());
+            backend.set_session_env(name, "TAKO_TAB_ID", &tab_id.as_u64().to_string());
+            recovered.push(name.as_str().to_string());
         }
         if recovered.is_empty() {
             if let Some(tab_id) = self.workspace.find_tab_of_pane(first_id) {
@@ -5071,8 +5084,18 @@ impl TakoApp {
                 protected.insert(wrapper.clone());
             }
         }
-        let socket = tako_core::tmux_backend::socket_name();
-        tako_core::tmux_backend::cleanup_orphans(&socket, &protected, min_idle_secs)
+        // 保護対象が 1 件でも表現できないなら掃除しない（守りたいセッションの誤爆を避ける）
+        let Some(protected) = protected_refs(protected) else {
+            eprintln!(
+                "warning: 保護対象に扱えないセッション名があるため orphan クリーンアップを見送る"
+            );
+            return Vec::new();
+        };
+        tako_core::backend::backend()
+            .cleanup_orphans(&protected, min_idle_secs.map(Duration::from_secs))
+            .into_iter()
+            .map(|s| s.into_string())
+            .collect()
     }
 
     /// レイアウトの保存（Phase 5.5 / FR-5）。構造が変わったときだけ書き込む。
@@ -12548,7 +12571,7 @@ impl TmuxHost for TakoApp {
         }
         self.tmux_persist = enabled;
         if enabled && tako_core::backend::capabilities().survives_app_exit {
-            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+            tako_core::backend::backend().sync_config();
         }
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
@@ -13598,16 +13621,17 @@ impl SystemHost for TakoApp {
     }
 
     fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
-        if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
-            Some(
-                self.backend_sessions
-                    .entry(pane)
-                    .or_insert_with(new_backend_session_name)
-                    .clone(),
-            )
-        } else {
-            None
-        }
+        // 器を配るかは backend が決める（#519 M1。spawn_session と同じ 1 箇所を通す）
+        let existing = self.backend_sessions.get(&pane).cloned();
+        let session = tako_core::backend::reserve_for_pane(
+            tako_core::backend::backend(),
+            self.tmux_persist,
+            existing.as_deref(),
+            new_backend_session_name,
+        )?;
+        let name = session.into_string();
+        self.backend_sessions.insert(pane, name.clone());
+        Some(name)
     }
 
     fn update_status(&self) -> serde_json::Value {
@@ -18948,9 +18972,11 @@ mod self_test {
                 // 61. tty がバックエンド側ペイン tty へ差し替わり（ポート検知・tmuxview の
                 //     突き合わせ先）、tmux list が backend: true + 対応ペインで区別される
                 let mut tty_ok = false;
+                let backend_ref = SessionRef::new(backend_name.as_str())
+                    .unwrap_or_else(|_| fail("バックエンドセッション名が器の参照にならない"));
                 for _ in 0..20 {
                     wait(cx, 500).await;
-                    let inner = tako_core::tmux_backend::pane_tty(&backend_sock, &backend_name);
+                    let inner = tako_core::backend::backend().pane_tty(&backend_ref);
                     tty_ok = inner.is_some()
                         && window
                             .update(cx, |app, _, _| {
