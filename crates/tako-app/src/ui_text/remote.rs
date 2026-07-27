@@ -66,12 +66,6 @@ pub fn panel_title() -> &'static str {
 pub fn connections_now(n: usize) -> String {
     tr!(format!("{n} 接続中"), format!("{n} connected"))
 }
-pub fn stop_all() -> &'static str {
-    tr!(
-        "すべての接続を遮断（remote stop）",
-        "Stop all connections (remote stop)"
-    )
-}
 
 // --- 常時表示インジケータと起動導線（#590）---
 
@@ -178,6 +172,49 @@ pub fn url_label() -> &'static str {
     )
 }
 
+// --- 起動 ⇔ 停止トグル（#615）---
+
+/// 停止ボタン（起動ボタンと対。押すと確認を出す = kill switch の入口）
+pub fn stop_button() -> &'static str {
+    tr!("リモートを停止", "Stop remote access")
+}
+/// 停止処理中のボタン表示（押せない状態）
+pub fn stop_button_busy() -> &'static str {
+    tr!("停止中…", "Stopping…")
+}
+/// 停止確認の見出し
+pub fn stop_confirm_title() -> &'static str {
+    tr!("リモートを停止しますか？", "Stop remote access?")
+}
+/// 停止確認の本文（接続中の端末が切断されることを件数つきで伝える）。
+/// 0 件でも「何も起きない」わけではない（登録端末は次から繋げなくなる）ので明示する
+pub fn stop_confirm_body(connected: usize) -> String {
+    if connected == 0 {
+        tr!(
+            "いま接続中の端末はありません。停止するとすべての接続を受け付けなくなります。"
+                .to_string(),
+            "No devices are connected right now. Stopping will refuse all connections.".to_string()
+        )
+    } else {
+        tr!(
+            format!("接続中の端末 {connected} 台が切断されます。"),
+            format!("{connected} connected device(s) will be disconnected.")
+        )
+    }
+}
+/// 停止確認の実行ボタン
+pub fn stop_confirm_yes() -> &'static str {
+    tr!("停止する", "Stop")
+}
+/// 停止失敗の見出し
+pub fn stop_failed() -> &'static str {
+    tr!("停止に失敗しました", "Failed to stop")
+}
+/// ステータスバーのラベル: 停止処理中
+pub fn indicator_stopping() -> &'static str {
+    tr!("リモート 停止中", "remote stopping")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -207,7 +244,6 @@ mod tests {
                 revoke().to_string(),
                 panel_title().to_string(),
                 connections_now(1),
-                stop_all().to_string(),
                 // #590 の起動導線
                 indicator_idle().to_string(),
                 indicator_off().to_string(),
@@ -229,6 +265,15 @@ mod tests {
                 setup_hint().to_string(),
                 start_failed().to_string(),
                 url_label().to_string(),
+                // #615 の停止トグル
+                stop_button().to_string(),
+                stop_button_busy().to_string(),
+                stop_confirm_title().to_string(),
+                stop_confirm_body(0),
+                stop_confirm_body(2),
+                stop_confirm_yes().to_string(),
+                stop_failed().to_string(),
+                indicator_stopping().to_string(),
             ]
         });
     }

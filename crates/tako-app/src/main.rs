@@ -15639,7 +15639,8 @@ impl Render for TakoApp {
             .children(self.render_sleep_guard_overlay(cx))
             .children(self.render_update_dropdown_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
-            .children(self.render_remote_overlay(cx))
+            // #615: カードをインジケータ直上へ収めるためビューポート実寸を渡す
+            .children(self.render_remote_overlay(window, cx))
             .children(self.render_command_palette(cx))
     }
 }
@@ -25471,12 +25472,18 @@ mod self_test {
             // 「表示状態の判定 → クリック → オーバーレイの種別 → 実際に render が通る」
             // までを検査する（起動そのものの実測は隔離環境で別途行う）
             {
-                use crate::remote_panel::{indicator_state, overlay_kind, RemoteIndicator};
+                use crate::remote_panel::{
+                    indicator_state, overlay_kind, popover_position, primary_action, RemoteAction,
+                    RemoteIndicator, CARD_WIDTH,
+                };
                 let r = window
-                    .update(cx, |app, _, cx| {
+                    .update(cx, |app, win, cx| {
                         // --- 停止中 ---
                         app.remote.running = false;
                         app.remote.starting = false;
+                        app.remote.stopping = false;
+                        app.remote.stop_confirm = false;
+                        app.remote.stop_error = None;
                         app.remote.panel_open = false;
                         app.remote.devices.clear();
                         app.remote.pending.clear();
@@ -25507,7 +25514,9 @@ mod self_test {
                         );
                         // serve 未設定は不足に数えない（daemon が自分で設定する）
                         let blockers_ok = blockers == vec!["login".to_string()];
-                        let start_panel_ok = app.render_remote_overlay(cx).is_some();
+                        let start_panel_ok = app.render_remote_overlay(win, cx).is_some();
+                        // 停止中の主アクションは「起動」（#615 のトグル）
+                        let act_start = primary_action(&app.remote) == RemoteAction::Start;
                         // --- 稼働中（#590 の回帰ガード: 従来の端末一覧 + kill switch）---
                         app.remote.running = true;
                         app.remote.url = Some("https://mac.tail1234.ts.net".into());
@@ -25519,7 +25528,57 @@ mod self_test {
                             overlay_kind(&app.remote) == crate::remote_panel::RemoteOverlay::Panel;
                         let connected =
                             indicator_state(&app.remote) == RemoteIndicator::Connected(1);
-                        let device_panel_ok = app.render_remote_overlay(cx).is_some();
+                        let device_panel_ok = app.render_remote_overlay(win, cx).is_some();
+                        // --- #615: 停止トグルの往復（クリックハンドラそのままの経路）---
+                        // 稼働中は主アクションが「停止」
+                        let act_stop = primary_action(&app.remote) == RemoteAction::Stop;
+                        // 停止ボタン → 即実行せず確認（接続端末が切れる破壊的操作）
+                        app.remote_request_stop(cx);
+                        let act_confirm = primary_action(&app.remote) == RemoteAction::StopConfirm
+                            && app.remote.panel_open
+                            && app.render_remote_overlay(win, cx).is_some();
+                        // 確認文言に接続中の台数が入る
+                        let confirm_body =
+                            crate::ui_text::remote::stop_confirm_body(app.remote.connected_count());
+                        let confirm_has_count = confirm_body.contains('1');
+                        // キャンセルで元へ戻る（daemon は止めない）
+                        app.remote_cancel_stop(cx);
+                        let act_back = primary_action(&app.remote) == RemoteAction::Stop;
+                        // 停止処理中は押せない表示 + インジケータも停止中
+                        app.remote.stopping = true;
+                        let act_stopping = primary_action(&app.remote) == RemoteAction::Stopping
+                            && indicator_state(&app.remote) == RemoteIndicator::Stopping
+                            && app.render_remote_overlay(win, cx).is_some();
+                        app.remote.stopping = false;
+                        // 停止が完了したらカードは開いたまま起動パネルへ = 往復が 1 か所で完結
+                        app.remote.running = false;
+                        app.remote.connections.clear();
+                        let round_trip = app.remote.panel_open
+                            && overlay_kind(&app.remote) == crate::remote_panel::RemoteOverlay::Start
+                            && primary_action(&app.remote) == RemoteAction::Start;
+                        // --- #615: カード位置はインジケータ直上 + ウィンドウ端でクランプ ---
+                        let vw = f32::from(win.viewport_size().width);
+                        let vh = f32::from(win.viewport_size().height);
+                        // 実際に描かれたインジケータの矩形（canvas paint フックの書き戻し）
+                        let anchor = app
+                            .remote
+                            .anchor
+                            .get()
+                            .map(|b| (f32::from(b.origin.x), f32::from(b.origin.y)));
+                        let anchor_painted = anchor.is_some();
+                        let (left, bottom) = popover_position(anchor, CARD_WIDTH, (vw, vh));
+                        // ボタン左端にそろい（= 乖離しない）、ウィンドウ内に収まる
+                        let anchored = anchor.is_none_or(|(ax, _)| (left - ax).abs() < 0.5)
+                            && left >= 0.0
+                            && left + CARD_WIDTH <= vw;
+                        // ボタンのすぐ上（ステータスバー高 + 数 px の範囲）に出る
+                        let adjacent = anchor.is_none_or(|(_, ay)| {
+                            let top_of_button = vh - bottom;
+                            (top_of_button - ay).abs() < 12.0
+                        });
+                        // 右端ぎりぎりのボタンでも card がはみ出さない（狭ウィンドウのクランプ）
+                        let (narrow_left, _) = popover_position(Some((vw - 20.0, vh - 32.0)), CARD_WIDTH, (vw, vh));
+                        let clamped = narrow_left + CARD_WIDTH <= vw && narrow_left >= 0.0;
                         // 起動中表示は daemon 状態より優先
                         app.remote.starting = true;
                         let starting =
@@ -25534,45 +25593,45 @@ mod self_test {
                         app.remote.panel_open = false;
                         app.remote.setup = None;
                         app.remote.start_error = None;
+                        app.remote.stop_error = None;
+                        app.remote.stop_confirm = false;
                         cx.notify();
                         (
-                            off,
-                            off_label,
-                            start_kind,
-                            blockers_ok,
-                            start_panel_ok,
-                            panel_kind,
-                            connected,
-                            device_panel_ok,
-                            starting,
+                            off && off_label && start_kind && blockers_ok && start_panel_ok,
+                            panel_kind && connected && device_panel_ok && starting,
+                            act_start
+                                && act_stop
+                                && act_confirm
+                                && confirm_has_count
+                                && act_back
+                                && act_stopping
+                                && round_trip,
+                            anchor_painted && anchored && adjacent && clamped,
                         )
                     })
-                    .unwrap_or((
-                        false, false, false, false, false, false, false, false, false,
-                    ));
-                let (
-                    off,
-                    off_label,
-                    start_kind,
-                    blockers_ok,
-                    start_panel_ok,
-                    panel_kind,
-                    connected,
-                    device_panel_ok,
-                    starting,
-                ) = r;
+                    .unwrap_or((false, false, false, false));
+                let (off_ok, panel_ok, toggle_ok, anchor_ok) = r;
                 check(
-                    off && off_label && start_kind && blockers_ok && start_panel_ok,
+                    off_ok,
                     "リモートインジケータは daemon 停止中も表示され、クリックで起動パネル + 不足項目案内になる (#590)",
                 );
                 check(
-                    panel_kind && connected && device_panel_ok && starting,
+                    panel_ok,
                     "リモート稼働中のクリックは従来どおり端末一覧 + kill switch（起動中表示は状態より優先） (#590)",
+                );
+                check(
+                    toggle_ok,
+                    "カード内で起動 ⇔ 停止をトグルで往復でき、停止は台数つき確認を挟む (#615)",
+                );
+                check(
+                    anchor_ok,
+                    "リモートカードはインジケータ直上にアンカーされ、ウィンドウ端でクランプされる (#615)",
                 );
             }
 
-            // 88b. #590 の通し検証（opt-in）: 起動ボタン → 実 daemon 起動 → 稼働表示へ遷移 →
-            // kill switch → 停止表示へ戻る、を GUI のクリックハンドラそのままで実測する。
+            // 88b. #590 / #615 の通し検証（opt-in）: 起動ボタン → 実 daemon 起動 → 稼働表示 →
+            // 停止ボタン → 確認 → 停止 → **カードは開いたまま**起動パネルへ戻る（#615 の往復）、
+            // を GUI のクリックハンドラそのままで実測する。
             // 実 daemon を立てるので **既定では走らせない**:
             //   TAKO_SELF_TEST_REMOTE=1 かつ TAKO_REMOTE_STATE_DIR が明示されているときだけ
             // （本番の remote state を壊した事故 #445 の再発防止。実 tailnet の serve 設定に
@@ -25665,8 +25724,27 @@ mod self_test {
                             "起動後はインジケータが稼働表示になりパネルが端末一覧へ切り替わる (#590): {ind_now:?} url={url_now:?}"
                         ),
                     );
-                    // ③ kill switch（稼働中パネルの on_click と同じ経路）→ 停止表示へ戻る
-                    let _ = window.update(cx, |app, _, cx| app.remote_kill_switch(cx));
+                    // ③ 停止ボタン（稼働中パネルの on_click と同じ経路）→ まず確認が出る（#615）
+                    let _ = window.update(cx, |app, _, cx| app.remote_request_stop(cx));
+                    wait(cx, 1200).await; // 確認カードの目視キャプチャの猶予
+                    let (confirming, still_running) = window
+                        .update(cx, |app, _, _| {
+                            (
+                                crate::remote_panel::primary_action(&app.remote)
+                                    == crate::remote_panel::RemoteAction::StopConfirm
+                                    && app.remote.panel_open,
+                                app.remote.running,
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    check(
+                        confirming && still_running,
+                        &format!(
+                            "停止ボタンは即実行せずカード内に確認を出す (#615): confirming={confirming} running={still_running}"
+                        ),
+                    );
+                    // ④ 確認の実行 → daemon 停止 → 停止表示へ戻る
+                    let _ = window.update(cx, |app, _, cx| app.remote_do_stop(cx));
                     let mut stopped = false;
                     for _ in 0..30 {
                         wait(cx, 500).await;
@@ -25679,9 +25757,25 @@ mod self_test {
                             }
                         }
                     }
+                    // #615: 停止してもカードは開いたまま起動パネルへ = その場で往復できる
+                    let (card_open, back_to_start) = window
+                        .update(cx, |app, _, _| {
+                            (
+                                app.remote.panel_open,
+                                overlay_kind(&app.remote)
+                                    == crate::remote_panel::RemoteOverlay::Start,
+                            )
+                        })
+                        .unwrap_or((false, false));
                     check(
                         stopped,
-                        "kill switch で daemon が止まりインジケータが停止表示へ戻る (#590)",
+                        "停止の確認実行で daemon が止まりインジケータが停止表示へ戻る (#590 / #615)",
+                    );
+                    check(
+                        card_open && back_to_start,
+                        &format!(
+                            "停止後もカードは開いたまま起動パネルへ切り替わる = 往復できる (#615): open={card_open} start={back_to_start}"
+                        ),
                     );
                     // ④ もう一度起動し、**外部から** daemon を止めても（GUI 操作ではなく
                     // `tako remote stop` や他プロセスの kill）ポーリングで停止表示へ戻る
