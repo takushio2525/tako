@@ -2353,6 +2353,14 @@ impl TakoApp {
         let path = entry.path.clone();
         let repo = repo_root.to_string();
         let action_path = entry.path.clone();
+        // #560: 行クリックでそのファイルをプレビューペインへ開く。
+        // 削除済みは開く先が無いのでクリック対象から外す（押しても何も起きない
+        // 当たり判定を作らない = #494 で無効ボタンの理由を必ず言葉にしたのと同じ方針）
+        let can_preview = badge != 'D';
+        let preview_path = std::path::Path::new(repo_root)
+            .join(&entry.path)
+            .display()
+            .to_string();
         div()
             .id(id)
             .group("git-change-row")
@@ -2365,6 +2373,12 @@ impl TakoApp {
             .py(px(1.0))
             .text_size(px(11.0))
             .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.25)))
+            .when(can_preview, |d| {
+                d.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.git_open_change_file(&preview_path, cx);
+                    }))
+            })
             .child(
                 div()
                     .w(px(14.0))
@@ -2403,6 +2417,9 @@ impl TakoApp {
                             .text_color(hsla(theme.accent))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        // #560: 行クリック（プレビュー）へ伝播させない。
+                        // ステージのつもりで押したらプレビューまで開く、を防ぐ
+                        cx.stop_propagation();
                         let paths = vec![action_path.clone()];
                         if staged {
                             this.git_do_unstage(repo.clone(), paths, cx);
@@ -4472,6 +4489,27 @@ impl TakoApp {
                 true
             }
         }
+    }
+
+    /// 変更ファイル行のクリック → そのファイルをプレビューペインで開く（#560）。
+    ///
+    /// ファイルツリーの行クリックと同じ `open_file_row`（= dispatch `OpenFile` =
+    /// CLI `tako open` / MCP `tako_open_file`）を通す。git タブ独自の開き方を作ると
+    /// AI から同じことができなくなる（設計原則 5）。
+    ///
+    /// 存在しないパス（別 worktree で消えた等）は黙って何も起きないのではなく、
+    /// フィードバック行に理由を出す
+    pub(crate) fn git_open_change_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        let p = std::path::Path::new(path);
+        if !p.is_file() {
+            self.git_feedback = Some(GitFeedback {
+                message: crate::ui_text::panel::git_preview_missing(path),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.open_file_row(p, cx);
     }
 
     /// ファイル単位 / 全体の git add を background 実行する（#487。

@@ -229,6 +229,13 @@ pub fn git_cancel() -> &'static str {
 pub fn git_merge_btn() -> &'static str {
     tr!("マージ", "Merge")
 }
+/// 変更ファイル行クリックでプレビューを開けなかったとき（#560）
+pub fn git_preview_missing(path: &str) -> String {
+    tr!(
+        format!("ファイルが見つからないのでプレビューできません: {path}"),
+        format!("Cannot preview: file not found: {path}")
+    )
+}
 pub fn git_confirm_run() -> &'static str {
     tr!("実行", "Run")
 }
