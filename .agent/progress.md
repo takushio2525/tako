@@ -1452,6 +1452,18 @@
 - 次: 実機で症状再現時に `TAKO_IME_DIAG=1` のログを採取 → #623 §4（`translate_accelerator` が
   処理済み打鍵の `TranslateMessage`/`DispatchMessageW` を飛ばす経路）の検証
 
+## 2026-07-27（#623 続き: VK_PROCESSKEY 説を否定 + PTY 書き込み欠落の切り分け）
+- **VK_PROCESSKEY 経路は否定**（コード変更なし・doc に記録）。`translate_accelerator` が
+  「アプリが処理済み」の打鍵で `TranslateMessage`/`DispatchMessageW` を飛ばすのは事実だが、
+  IME が食う打鍵（wParam=0xE5）は `MapVirtualKeyW(0xE5, MAPVK_VK_TO_CHAR)` が **実測 0** のため
+  `parse_normal_key` が None → 「未処理」で返り、素通りして IME へ届く。実 IME 変換中に
+  `handle_key` の診断が出るのは Esc のときだけ、という実測とも一致
+- **PTY 書き込みの欠落は未確定**。直接 spawn（persist OFF）は 600/2000/8000 バイトがバイト一致、
+  psmux 本番ペインも**行が綺麗なら** 968 バイトまで 8/8 一致。長い掃引が NG に見えたのは
+  ①存在しない `--enter` を渡して CLI がエラー終了 ②失敗行が残ったまま次を送って連鎖、の
+  ハーネス由来。ユーザー実例（claude ペイン = alt screen の bracketed paste 経路）は未計測
+- 次: alt screen ペインでの `queue_send_flow`（paste + 分離 Enter）経路をバイト単位で測る
+
 ## 2026-07-28（#628: 使用中のコンソール窓チラつきを根治 — tmux 経路の抑止漏れ）
 - 真因は `tako_core::tmux::tmux_command()`（tmux / psmux を叩く全経路の合流点）に
   `no_console_window` が無かったこと。#586 で境界は作ったが被覆が 96 中 16 箇所に留まり、
