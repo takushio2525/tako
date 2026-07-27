@@ -32,6 +32,23 @@
 //! `origin.y` がそのままアンカーになる。**スケール係数に依存しない**のが効く
 //! （DPI ごとの場合分けも、GPUI 側の整数丸めの再現も要らない）。
 //!
+//! ## それだけでは足りなかった話（#582 再発）
+//!
+//! アンカーを入力行の下端へ正しく合わせても、**画面下端に余白が無いと候補ウィンドウが
+//! 入力行を覆う**。GPUI が渡す `CANDIDATEFORM` は `CFS_CANDIDATEPOS` = **点だけ**で、
+//! 「この矩形は覆うな」を伝えられないため、下に収まらないと IME は
+//! **その点に候補ウィンドウの下端を合わせて上へ反転**するからである。
+//! ターミナルの入力行はペイン下端にあるので、最大化して使うとこれが常態になる。
+//!
+//! 対処が [`set_candidate_exclusion`]（`CFS_EXCLUDE`）。基準点は今までと同じ値のまま、
+//! 未確定文字列の矩形を「覆ってはいけない領域」として足す。
+//! 実測（1920x1080 @ 125%・入力行のセルが物理 y=930..951）:
+//!
+//! | | 候補ウィンドウ | 入力行 |
+//! |---|---|---|
+//! | `CFS_CANDIDATEPOS` のみ | y=662..948 | **覆う** |
+//! | `CFS_EXCLUDE` あり | y=642..928 | 覆わない |
+//!
 //! ## GPUI を rev bump するときの注意
 //!
 //! この補正は「GPUI が `y + height/2` に潰す」という**上流の実装への対抗**である。
@@ -114,6 +131,166 @@ fn windows_anchor_rect_y(origin_y: f32, cell_height: f32, basis: AnchorBasis) ->
         AnchorBasis::CellBottom => origin_y + cell_height,
     };
     (anchor_y, 0.0)
+}
+
+/// 未確定文字列が画面上で占める矩形（論理ピクセル・ウィンドウ client 座標）。
+///
+/// 「候補ウィンドウがここに被ってはいけない」という**除外領域**を表す。
+/// 呼び出し側は変換中の文字列の描画矩形をそのまま組めばよい
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompositionRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+/// IMM32 の `CANDIDATEFORM`（`CFS_EXCLUDE`）へ渡す値（物理ピクセル・client 座標）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateExclusion {
+    /// 候補ウィンドウの左上を置きたい点（入力行の下端左）
+    pub pt: (i32, i32),
+    /// 覆ってはいけない矩形（left, top, right, bottom）
+    pub area: (i32, i32, i32, i32),
+}
+
+/// 除外領域つきの候補ウィンドウ位置を組む（純粋関数。**macOS 上でもテストできる**）。
+///
+/// 物理ピクセルへの丸めは GPUI と同じ切り捨て（`as i32`）にしてある。
+/// `pt` が `anchor_rect_y` 経由で GPUI が押し込む点と**同じ値**になり、
+/// 「余白があるときの位置」は今までと 1px も変わらない
+pub fn candidate_exclusion(
+    rect: &CompositionRect,
+    scale_factor: f32,
+) -> Option<CandidateExclusion> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    if !(rect.left.is_finite()
+        && rect.top.is_finite()
+        && rect.right.is_finite()
+        && rect.bottom.is_finite())
+    {
+        return None;
+    }
+    let left = (rect.left * scale_factor) as i32;
+    let top = (rect.top * scale_factor) as i32;
+    // 潰れた矩形を渡すと IME 側が「除外領域なし」と解釈して被りが戻るので、
+    // 最低 1px は厚みを持たせる（右下は左上より必ず大きい）
+    let right = ((rect.right * scale_factor) as i32).max(left + 1);
+    let bottom = ((rect.bottom * scale_factor) as i32).max(top + 1);
+    Some(CandidateExclusion {
+        pt: (left, bottom),
+        area: (left, top, right, bottom),
+    })
+}
+
+/// 候補ウィンドウが未確定文字列に被らないよう、IME へ除外領域を通知する。
+///
+/// `window_handle` は Windows の `HWND`（他 OS では `None` を渡す）。
+/// 通知できたら `true`。
+///
+/// ## なぜ要るか（#582 再発）
+///
+/// GPUI Windows は `CANDIDATEFORM` に **`CFS_CANDIDATEPOS`（点だけ）** を渡す。
+/// 点しか無いと、候補ウィンドウが画面下端に収まらないとき IME は
+/// **その点に候補ウィンドウの下端を合わせて上へ反転**する。実測（1920x1080 @ 125%）:
+/// 入力行のセルが物理 y=930..951 のとき候補ウィンドウは y=662..948 に出て、
+/// 入力行と未確定文字列を丸ごと覆った。ターミナルの入力行はペイン下端にあるので、
+/// 最大化して使っていると**これが常態**になる。
+///
+/// `CFS_EXCLUDE` は「`ptCurrentPos` に出すが `rcArea` は覆うな」という指定で、
+/// 反転先が `rcArea` の**上**になる。macOS は Cocoa が矩形から自動で避けるため何もしない
+pub fn set_candidate_exclusion(
+    window_handle: Option<isize>,
+    rect: &CompositionRect,
+    scale_factor: f32,
+) -> bool {
+    let Some(handle) = window_handle else {
+        return false;
+    };
+    let Some(form) = candidate_exclusion(rect, scale_factor) else {
+        return false;
+    };
+    exclude_imp::set_candidate_exclusion(handle, form)
+}
+
+#[cfg(not(windows))]
+mod exclude_imp {
+    use super::CandidateExclusion;
+
+    /// macOS（および非 Windows）は IMM32 が無い。呼ばれても何もしない
+    pub(super) fn set_candidate_exclusion(_handle: isize, _form: CandidateExclusion) -> bool {
+        false
+    }
+}
+
+#[cfg(windows)]
+mod exclude_imp {
+    use super::CandidateExclusion;
+
+    /// `CFS_EXCLUDE`（imm.h）。`ptCurrentPos` に出しつつ `rcArea` を覆わせない
+    const CFS_EXCLUDE: u32 = 0x0080;
+
+    #[repr(C)]
+    struct PointI32 {
+        x: i32,
+        y: i32,
+    }
+    #[repr(C)]
+    struct RectI32 {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    /// `CANDIDATEFORM`（imm.h）。`repr(C)` で C と同じレイアウトになる
+    #[repr(C)]
+    struct CandidateForm {
+        dw_index: u32,
+        dw_style: u32,
+        pt_current_pos: PointI32,
+        rc_area: RectI32,
+    }
+
+    // `windows-sys` を足さず必要な 3 関数だけ宣言する方針は
+    // `tako-control::agents` の Toolhelp32 / sleep_guard の IOKit と同じ
+    #[link(name = "imm32")]
+    unsafe extern "system" {
+        fn ImmGetContext(hwnd: isize) -> isize;
+        fn ImmReleaseContext(hwnd: isize, himc: isize) -> i32;
+        fn ImmSetCandidateWindow(himc: isize, form: *const CandidateForm) -> i32;
+    }
+
+    pub(super) fn set_candidate_exclusion(handle: isize, form: CandidateExclusion) -> bool {
+        let payload = CandidateForm {
+            // GPUI が押し込むのと同じ 0 番。別番号にすると上書きにならない
+            dw_index: 0,
+            dw_style: CFS_EXCLUDE,
+            pt_current_pos: PointI32 {
+                x: form.pt.0,
+                y: form.pt.1,
+            },
+            rc_area: RectI32 {
+                left: form.area.0,
+                top: form.area.1,
+                right: form.area.2,
+                bottom: form.area.3,
+            },
+        };
+        // SAFETY: HWND は GPUI が生きている間有効。IMC は取得直後に妥当性を検査し、
+        // 復帰経路すべてで ImmReleaseContext する。payload はこの関数より長生きしない
+        unsafe {
+            let himc = ImmGetContext(handle);
+            if himc == 0 {
+                // IME が無効化されている（入力を受け付けないウィンドウ）
+                return false;
+            }
+            let ok = ImmSetCandidateWindow(himc, &payload) != 0;
+            ImmReleaseContext(handle, himc);
+            ok
+        }
+    }
 }
 
 /// GPUI Windows がキャレット矩形を IMM32 の POINT へ潰すときの Y（物理ピクセル）。
@@ -219,6 +396,138 @@ mod tests {
             ((b - a) - 17.0).abs() < f32::EPSILON,
             "行間の差 17.0 が保存されていない: {a} -> {b}"
         );
+    }
+
+    /// 実機（1920x1080 @ 125%）で計測した値をそのまま固定する。
+    ///
+    /// 計測時の実値: カーソルセル左上 = 論理 (155.9, 104.2)、セル 7.6x17.0、
+    /// 未確定文字列「にほんご」の描画幅 41.3 論理px。
+    /// GPUI が `CFS_CANDIDATEPOS` へ押し込んだ点は client 物理 (194, 151) で、
+    /// セルの物理上端 130 / 下端 151 と一致していた（IMM32 の読み戻しで確認）
+    #[test]
+    fn 除外矩形は実機のセル物理位置と一致する() {
+        let rect = CompositionRect {
+            left: 155.9,
+            top: 104.2,
+            right: 155.9 + 41.3,
+            bottom: 104.2 + 17.0,
+        };
+        let got = candidate_exclusion(&rect, SCALE).expect("正常値では組める");
+        // 候補ウィンドウを置きたい点は GPUI が押し込むアンカーと同じ = 余白があるときの
+        // 位置が変わらないことの担保
+        assert_eq!(got.pt, (194, 151));
+        // 覆わせない矩形はカーソルセルの実ピクセル位置そのもの
+        assert_eq!(got.area, (194, 130, 246, 151));
+    }
+
+    /// `pt` は `anchor_rect_y` 経由で GPUI が押し込む点と**必ず同じ**でなければならない。
+    /// ずれると「余白があるとき」の見た目が変わってしまう
+    #[test]
+    fn 除外指定の基準点はgpuiのアンカーと一致する() {
+        for (top, cell_h) in [(104.2_f32, 17.0_f32), (0.0, 12.0), (700.5, 24.0)] {
+            let (anchor_y, anchor_h) = windows_anchor_rect_y(top, cell_h, AnchorBasis::CellBottom);
+            let pushed = collapse_to_ime_point_y(anchor_y, anchor_h, SCALE);
+            let rect = CompositionRect {
+                left: 10.0,
+                top,
+                right: 60.0,
+                bottom: top + cell_h,
+            };
+            let got = candidate_exclusion(&rect, SCALE).expect("正常値では組める");
+            assert_eq!(got.pt.1, pushed, "top={top} cell_h={cell_h}");
+        }
+    }
+
+    /// 全角と半角が混ざった行でも、除外矩形は実描画幅（呼び出し側が shaping で出す）を
+    /// そのまま物理へ写すだけであること
+    #[test]
+    fn 除外矩形は実描画幅をそのまま物理へ写す() {
+        for width in [7.6_f32, 41.3, 120.0] {
+            let rect = CompositionRect {
+                left: 100.0,
+                top: 200.0,
+                right: 100.0 + width,
+                bottom: 217.0,
+            };
+            let got = candidate_exclusion(&rect, SCALE).expect("正常値では組める");
+            assert_eq!(got.area.0, 125);
+            assert_eq!(
+                got.area.2,
+                ((100.0 + width) * SCALE) as i32,
+                "width={width}"
+            );
+        }
+    }
+
+    /// 潰れた矩形を渡すと IME 側が「除外領域なし」と解釈して被りが戻るので、
+    /// 最低 1px の厚みを保証する
+    #[test]
+    fn 潰れた矩形でも厚みを保つ() {
+        let rect = CompositionRect {
+            left: 100.0,
+            top: 200.0,
+            right: 100.0,
+            bottom: 200.0,
+        };
+        let got = candidate_exclusion(&rect, SCALE).expect("正常値では組める");
+        assert!(got.area.2 > got.area.0 && got.area.3 > got.area.1);
+    }
+
+    /// どの DPI でも除外矩形はセルの物理位置そのものになる（自前の丸めを持ち込まない）
+    #[test]
+    fn 除外矩形はどのdpiでもセルの物理位置() {
+        let rect = CompositionRect {
+            left: 100.0,
+            top: 200.0,
+            right: 140.0,
+            bottom: 217.0,
+        };
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let got = candidate_exclusion(&rect, scale).expect("正常値では組める");
+            assert_eq!(
+                got.area,
+                (
+                    (100.0 * scale) as i32,
+                    (200.0 * scale) as i32,
+                    (140.0 * scale) as i32,
+                    (217.0 * scale) as i32
+                ),
+                "scale={scale}"
+            );
+        }
+    }
+
+    /// 異常値では組まない（IME の位置決めのために不正な矩形を渡さない）
+    #[test]
+    fn 異常値では除外矩形を組まない() {
+        let ok = CompositionRect {
+            left: 0.0,
+            top: 0.0,
+            right: 10.0,
+            bottom: 10.0,
+        };
+        assert!(candidate_exclusion(&ok, 0.0).is_none(), "scale 0 は不正");
+        assert!(
+            candidate_exclusion(&ok, -1.0).is_none(),
+            "負のスケールは不正"
+        );
+        let nan = CompositionRect {
+            left: f32::NAN,
+            ..ok
+        };
+        assert!(candidate_exclusion(&nan, SCALE).is_none());
+    }
+
+    /// ハンドルが無い（macOS）なら通知しない。`cfg` を書かずに呼び出せることの担保
+    #[test]
+    fn ハンドルなしでは通知しない() {
+        let rect = CompositionRect {
+            left: 0.0,
+            top: 0.0,
+            right: 10.0,
+            bottom: 10.0,
+        };
+        assert!(!set_candidate_exclusion(None, &rect, SCALE));
     }
 
     /// 異常なセル高で補正が暴走しないこと（描画より IME の位置決めを優先させない）

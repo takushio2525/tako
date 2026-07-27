@@ -7449,6 +7449,50 @@ impl TakoApp {
             .width
     }
 
+    /// 変換中の未確定文字列が占める矩形（論理px・ウィンドウ client 座標）。
+    /// 候補ウィンドウに覆わせない除外領域として IME へ渡す（#582）
+    fn ime_composition_rect(
+        &mut self,
+        window: &mut Window,
+    ) -> Option<tako_core::platform::ime::CompositionRect> {
+        let text = self.ime.as_ref()?.text.clone();
+        let pane = self.ime_target();
+        let origin = self.pane_cursor_origin_for_ime(pane, window)?;
+        let cell = self.cell_size_for_pane(pane)?;
+        // 変換中の文字列は 1 セルより広いのが普通。狭い側に倒すと候補ウィンドウが
+        // 未確定文字列の右半分に被るので、実描画幅（最低 1 セル）を使う
+        let width = self.ime_prefix_width(&text, pane, window).max(cell.width);
+        Some(tako_core::platform::ime::CompositionRect {
+            left: f32::from(origin.x),
+            top: f32::from(origin.y),
+            right: f32::from(origin.x + width),
+            bottom: f32::from(origin.y + cell.height),
+        })
+    }
+
+    /// 候補ウィンドウの除外領域を「次フレーム」で IME へ通知する（#582）。
+    ///
+    /// **`invalidate_character_coordinates()` の直後に呼ぶこと**。GPUI は同じ
+    /// `on_next_frame` キューへ `CFS_CANDIDATEPOS`（点だけ）のプッシュを積むので、
+    /// あとから積んだこちらが後勝ちで `CFS_EXCLUDE` へ差し替わる
+    /// （`gpui/src/window.rs` の `next_frame_callbacks` は登録順に実行される）。
+    /// 同フレーム内で先に呼ぶと GPUI に上書きされて元の被りへ戻る
+    fn push_ime_exclusion_next_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime.is_none() {
+            return;
+        }
+        let entity = cx.entity();
+        window.on_next_frame(move |window, cx| {
+            let scale = window.scale_factor();
+            let handle = native_window_handle(window);
+            entity.update(cx, |app, _| {
+                if let Some(rect) = app.ime_composition_rect(window) {
+                    tako_core::platform::ime::set_candidate_exclusion(handle, &rect, scale);
+                }
+            });
+        });
+    }
+
     // --- マウス ---
 
     /// ウィンドウ座標をペイン内のセル座標へ変換する（col, row, セル右半分か）
@@ -14041,6 +14085,7 @@ impl EntityInputHandler for TakoApp {
         // 候補ウィンドウが変換開始時の位置に貼り付いたまま追従しない（#582）。
         // macOS でも確定・unmark 側に同じ呼び出しがあり無害（#332）
         window.invalidate_character_coordinates();
+        self.push_ime_exclusion_next_frame(window, cx);
         cx.notify();
     }
 
@@ -15472,6 +15517,19 @@ fn restore_window(window: &mut Window) {
     // 対象ウィンドウのスレッドへポストするだけで、この場でブロックしない
     unsafe {
         ShowWindowAsync(win32.hwnd.get(), SW_RESTORE);
+    }
+}
+
+/// ウィンドウのネイティブハンドル（Windows の `HWND`）。他 OS では `None`。
+///
+/// `RawWindowHandle` の列挙子は全 OS で定義されているので `cfg` は要らない
+/// （macOS では `AppKit` に一致して `None` に落ちる）。プラットフォーム分岐は
+/// 受け取り側の境界（`tako_core::platform`）の内側に閉じる
+fn native_window_handle(window: &Window) -> Option<isize> {
+    let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        raw_window_handle::RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
     }
 }
 
