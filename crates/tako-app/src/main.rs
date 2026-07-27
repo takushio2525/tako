@@ -3956,8 +3956,10 @@ impl TakoApp {
                         // 対象が claude TUI でなくても 2 秒待って貼る（他 TUI への送信）。
                         // bracketed paste はアプリが要求していれば paste() が括りを付ける
                         flow_diag(&format!(
-                            "paste: {} バイト送出（pane={}）",
+                            "paste: {} バイト送出 行数={} bracketed={}（pane={}）",
                             flow.prompt.len(),
+                            flow.prompt.lines().count(),
+                            session.bracketed_paste(),
                             flow.pane.as_u64()
                         ));
                         session.paste(&flow.prompt);
