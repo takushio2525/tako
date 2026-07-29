@@ -107,6 +107,26 @@ cd ..\..
 
 `web\tako-remote\dist` が生成されていることを確認する。
 
+### `npm ci` が lock 不整合で落ちるとき
+
+```
+npm error `npm ci` can only install packages when your package.json and package-lock.json ... are in sync
+npm error Missing: @next/swc-darwin-arm64@16.2.10 from lock file
+```
+
+`geist`（フォント）が `next` を引き連れており、`next` のプラットフォーム別オプション依存
+（`@next/swc-*`）が package-lock.json に揃っていないために起きる。**lock を書き換えずに
+回避する**なら次を使う。
+
+```powershell
+npm install --no-save
+npm run build
+```
+
+`--no-save` を付けると package-lock.json を更新しないので、作業ツリーを汚さずに `dist` だけ
+作れる（Windows の配布物ビルドは実際にこの経路を通している）。lock 自体の作り直しは macOS 側の
+PWA ビルドにも影響するので、直すなら別タスクで行う。
+
 ## 6. ビルド
 
 ```powershell
@@ -131,6 +151,7 @@ cargo build --workspace
 | `assert.h` などの C ヘッダが無い | Windows SDK が入っていない（手順 1 の SDK チェック） |
 | Spectre 関連のリンクエラー | 手順 1 の Spectre 緩和ライブラリ |
 | `RustEmbed folder ... does not exist` | 手順 5 の PWA ビルド未実施 |
+| `npm ci` が `Missing: @next/swc-*@... from lock file` で落ちる | 手順 5 の「lock 不整合で落ちるとき」 |
 | ビルドが極端に遅い | Defender の除外に `%USERPROFILE%\.cargo` と リポジトリの `target` を追加する |
 
 ## 7. 起動を試す（このフェーズでは失敗して構わない）
