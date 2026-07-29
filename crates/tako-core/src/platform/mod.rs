@@ -12,5 +12,6 @@ pub mod font;
 pub mod ime;
 pub mod locale;
 pub mod process;
+pub mod procinfo;
 pub mod shell;
 pub mod support;

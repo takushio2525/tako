@@ -8,7 +8,15 @@
 //! libc クレートに無い `socket_fdinfo` 系は SDK の `sys/proc_info.h` から転記した
 //! `#[repr(C)]` 定義を使う（カーネル ABI のため変更されない前提。転記ミスは
 //! 自プロセスで実際に listen して検知するユニットテストで捕まえる）。
-//! Linux / Windows は未対応で空を返す（Windows は Phase 6 で GetExtendedTcpTable）。
+//!
+//! Windows（#524）は tty の概念が無いため、**PTY 直下の子プロセスの子孫**で
+//! 「ペイン配下」を判定する。ポートの列挙は `GetExtendedTcpTable`、プロセスの
+//! 親子関係と名前は Toolhelp32 スナップショット（いずれも `platform::procinfo`）。
+//! Linux は未対応で空を返す。
+//!
+//! **ペインを指すキーはプラットフォームで実体が違う**（macOS = 制御端末の rdev、
+//! Windows = 子 pid）。呼び出し側に `cfg` を書かせないため、キーの作成は
+//! `pane_key()` に閉じ込め、以後は不透明な `u64` として扱う。
 
 use std::collections::HashMap;
 
@@ -28,10 +36,37 @@ pub fn tty_rdev(tty_name: &str) -> Option<u64> {
     std::fs::metadata(tty_name).ok().map(|m| m.rdev())
 }
 
-/// Windows に tty の概念は無い（ConPTY の対応付けは Phase 6 で別途設計する）
+/// Windows に tty の概念は無い（ペインの特定は `pane_key` が子 pid で行う）
 #[cfg(not(unix))]
 pub fn tty_rdev(_tty_name: &str) -> Option<u64> {
     None
+}
+
+/// ペイン配下を指すスキャンキーを作る（#524）。
+///
+/// 中身の意味はプラットフォームで違い、**呼び出し側は解釈してはいけない**:
+/// macOS は制御端末の rdev、Windows は PTY 直下の子プロセスの pid。
+/// `scan()` へ渡すキーはここでしか作らない。
+///
+/// どちらの材料も取れなければ `None`（そのペインはスキャン対象から外れるだけ）
+pub fn pane_key(tty_name: Option<&str>, child_pid: Option<u32>) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = child_pid;
+        return tty_name.and_then(tty_rdev);
+    }
+    #[cfg(windows)]
+    {
+        let _ = tty_name;
+        // pid 0 は System Idle Process。ペインの子として返ることは無いが、
+        // 万一 0 が来たら全プロセスを配下と誤認しかねないので弾く
+        return child_pid.filter(|&pid| pid != 0).map(u64::from);
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = (tty_name, child_pid);
+        None
+    }
 }
 
 /// 指定した tty（rdev）群に属するプロセスの listen ポートを一括スキャンする。
@@ -61,14 +96,68 @@ pub fn scan(ttys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
     result
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn scan(_ttys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
+/// Windows 版（#524）。キーは PTY 直下の子 pid で、その**子孫**が LISTEN している
+/// TCP ポートを集める。プロセス一覧と TCP テーブルはキーの数によらず 1 回ずつしか
+/// 取らない（3 秒毎に走るため、ペイン数に比例して重くしない）
+#[cfg(windows)]
+pub fn scan(keys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let procs = crate::platform::procinfo::snapshot();
+    let listeners = crate::platform::procinfo::tcp_listeners();
+    group_by_root(&procs, &listeners, keys)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn scan(_keys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
     HashMap::new()
 }
 
-/// 1 プロセスの LISTEN 中 TCP ポートを列挙する（IPv4 / IPv6。ポートで重複排除）
+/// スキャン結果の組み立て（純粋関数）。プロセス一覧・LISTEN 一覧・キー群から
+/// キー → ポート一覧を作る。**Windows 実機が無くてもテストできる**ように
+/// `cfg` の外に出してある（`platform::locale` の parse 関数と同じ方針）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn group_by_root(
+    procs: &[crate::platform::procinfo::ProcEntry],
+    listeners: &[crate::platform::procinfo::TcpListenEntry],
+    roots: &[u64],
+) -> HashMap<u64, Vec<ListenPort>> {
+    let names: HashMap<u32, &str> = procs.iter().map(|p| (p.pid, p.name.as_str())).collect();
+    let mut result: HashMap<u64, Vec<ListenPort>> = HashMap::new();
+    for &root in roots {
+        let Ok(root_pid) = u32::try_from(root) else {
+            continue;
+        };
+        let family = crate::platform::procinfo::descendants_of(procs, root_pid);
+        let mut ports: Vec<ListenPort> = listeners
+            .iter()
+            .filter(|e| family.contains(&e.pid))
+            .map(|e| ListenPort {
+                port: e.port,
+                // 実在の Windows pid は i32 に収まる（4 の倍数で 2^31 未満）
+                pid: e.pid as i32,
+                process: names.get(&e.pid).copied().unwrap_or_default().to_string(),
+            })
+            .collect();
+        if ports.is_empty() {
+            continue;
+        }
+        // macOS 実装と同じ整形: ポート昇順・同一ポートは 1 件（IPv4 / IPv6 の重複を畳む）
+        ports.sort_by_key(|p| p.port);
+        ports.dedup_by_key(|p| p.port);
+        result.insert(root, ports);
+    }
+    result
+}
+
+/// 1 プロセスの LISTEN 中 TCP ポートを列挙する（IPv4 / IPv6。ポートで重複排除）。
+///
+/// 抽象境界 B5 の検査 API。`scan` は複数ペインを一括で見るためこれを通らない
+/// 経路（Windows）もあるが、単一プロセスを調べる入口としては両プラットフォームで
+/// 同じ意味を持つ
 #[cfg(target_os = "macos")]
-pub(crate) fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
+pub fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
     let mut ports: Vec<u16> = socket_fds(pid)
         .into_iter()
         .filter_map(|fd| listen_port_of_fd(pid, fd))
@@ -89,11 +178,42 @@ pub(crate) fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
         .collect()
 }
 
-/// 非 macOS の `scan` は空を返すため現状この関数からの呼び出し元は無い。
-/// Windows 実装（`GetExtendedTcpTable`）を入れる差し込み口として残す
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-pub(crate) fn listening_ports_of_pid(_pid: i32) -> Vec<ListenPort> {
+/// Windows 版（#524）。`pid` **自身**が LISTEN している TCP ポートを列挙する
+/// （子孫は含めない。macOS 版と同じ粒度）
+#[cfg(windows)]
+pub fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
+    let Ok(pid) = u32::try_from(pid) else {
+        return Vec::new();
+    };
+    let listeners = crate::platform::procinfo::tcp_listeners();
+    let mut ports: Vec<u16> = listeners
+        .iter()
+        .filter(|e| e.pid == pid)
+        .map(|e| e.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    let name = crate::platform::procinfo::snapshot()
+        .into_iter()
+        .find(|p| p.pid == pid)
+        .map(|p| p.name)
+        .unwrap_or_default();
+    ports
+        .into_iter()
+        .map(|port| ListenPort {
+            port,
+            pid: pid as i32,
+            process: name.clone(),
+        })
+        .collect()
+}
+
+/// 検査手段を持たないプラットフォーム（Linux）
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn listening_ports_of_pid(_pid: i32) -> Vec<ListenPort> {
     Vec::new()
 }
 
@@ -375,6 +495,185 @@ pub fn is_live_tako_app(pid: u32) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn is_live_tako_app(_pid: u32) -> bool {
     false
+}
+
+/// プラットフォームを問わず走るテスト（純粋関数 + 実機の検知 e2e）
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use crate::platform::procinfo::{ProcEntry, TcpListenEntry};
+
+    fn proc(pid: u32, ppid: u32, name: &str) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            name: name.to_string(),
+        }
+    }
+
+    fn listener(pid: u32, port: u16) -> TcpListenEntry {
+        TcpListenEntry { port, pid }
+    }
+
+    #[test]
+    fn 子孫のlistenだけがそのペインのポートになる() {
+        let procs = vec![
+            proc(100, 1, "pwsh.exe"),
+            proc(200, 100, "node.exe"),
+            proc(300, 1, "other.exe"),
+        ];
+        let listeners = vec![listener(200, 5173), listener(300, 8080)];
+        let grouped = group_by_root(&procs, &listeners, &[100]);
+        let ports = grouped.get(&100).expect("ペイン 100 のポートが無い");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 5173);
+        assert_eq!(ports[0].pid, 200);
+        assert_eq!(ports[0].process, "node.exe");
+        assert!(
+            !grouped.contains_key(&300),
+            "キーに渡していないプロセスは結果に出ない"
+        );
+    }
+
+    #[test]
+    fn 同一ポートのipv4とipv6は1件に畳まれポート昇順に並ぶ() {
+        let procs = vec![proc(100, 1, "pwsh.exe"), proc(200, 100, "node.exe")];
+        // IPv4 / IPv6 の両待ち受け（同じポートが 2 行で返る）+ 別ポート
+        let listeners = vec![
+            listener(200, 8080),
+            listener(200, 3000),
+            listener(200, 8080),
+        ];
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        let ports = &ports[&100];
+        assert_eq!(
+            ports.iter().map(|p| p.port).collect::<Vec<_>>(),
+            vec![3000, 8080]
+        );
+    }
+
+    #[test]
+    fn listenが無いペインは結果に現れない() {
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        assert!(group_by_root(&procs, &[], &[100]).is_empty());
+    }
+
+    #[test]
+    fn 既に終了したpidをキーにしても壊れない() {
+        // スキャンとペイン終了のレース。空の結果になるだけで panic しない
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        let listeners = vec![listener(100, 5173)];
+        assert!(group_by_root(&procs, &listeners, &[999_999]).is_empty());
+    }
+
+    #[test]
+    fn u32に収まらないキーは無視する() {
+        // macOS の rdev をそのまま渡されても panic しない（キーは不透明 u64）
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        let listeners = vec![listener(100, 5173)];
+        assert!(group_by_root(&procs, &listeners, &[u64::MAX]).is_empty());
+    }
+
+    #[test]
+    fn プロセス名が取れなくてもポートは返す() {
+        // 権限不足などで名前だけ取れない場合（macOS 実装も空文字にする）
+        let listeners = vec![listener(200, 5173)];
+        let procs = vec![proc(100, 1, "pwsh.exe"), proc(200, 100, "")];
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        assert_eq!(ports[&100][0].process, "");
+    }
+
+    #[test]
+    fn キーが空ならスキャンしない() {
+        assert!(scan(&[]).is_empty());
+    }
+
+    #[test]
+    fn pane_keyは材料が無ければnone() {
+        assert!(pane_key(None, None).is_none());
+        // 子 pid 0（System Idle Process）は配下判定の材料にしない
+        assert!(pane_key(None, Some(0)).is_none());
+    }
+
+    /// 実機の検知 e2e。**自分で listen して自分で検知する**ので、
+    /// 構造体レイアウトの転記ミス・バイトオーダーの誤りはここで露見する
+    #[cfg(windows)]
+    #[test]
+    fn 自プロセスのlistenポートを検知できる() {
+        let l4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p4 = l4.local_addr().unwrap().port();
+        let l6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let p6 = l6.local_addr().unwrap().port();
+        let me = std::process::id() as i32;
+
+        let found = listening_ports_of_pid(me);
+        assert!(
+            found.iter().any(|p| p.port == p4),
+            "IPv4 の listen ポート {p4} が検知されない（検知結果: {found:?}）"
+        );
+        assert!(
+            found.iter().any(|p| p.port == p6),
+            "IPv6 の listen ポート {p6} が検知されない（検知結果: {found:?}）"
+        );
+        assert!(found
+            .iter()
+            .all(|p| p.process.to_ascii_lowercase().ends_with(".exe")));
+
+        drop(l4);
+        drop(l6);
+        let found = listening_ports_of_pid(me);
+        assert!(
+            !found.iter().any(|p| p.port == p4 || p.port == p6),
+            "閉じたポートが残っている: {found:?}"
+        );
+    }
+
+    /// 接続済み（ESTABLISHED）は LISTEN ではないので出てこない
+    #[cfg(windows)]
+    #[test]
+    fn 接続済みソケットはlistenとして検知しない() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_server, _) = l.accept().unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        let me = std::process::id() as i32;
+        let found: Vec<u16> = listening_ports_of_pid(me).iter().map(|p| p.port).collect();
+        assert!(found.contains(&port), "listen 側は検知される");
+        assert!(
+            !found.contains(&client_port),
+            "接続済みクライアント側は検知されない"
+        );
+    }
+
+    /// `scan` の実機経路（子孫の判定 + テーブル取得）を自プロセスで通す
+    #[cfg(windows)]
+    #[test]
+    fn scanは自プロセスをrootにすると自分のlistenを拾う() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let key = pane_key(None, Some(std::process::id())).expect("自 pid がキーになる");
+        let scanned = scan(&[key]);
+        let ports = scanned.get(&key).expect("自プロセスのポートが取れない");
+        assert!(
+            ports.iter().any(|p| p.port == port),
+            "listen 中の {port} が scan で拾えない: {ports:?}"
+        );
+        // 存在しないポートを名乗らないこと（キー外のプロセスの混入検査）
+        assert!(ports.iter().all(|p| p.pid == std::process::id() as i32));
+    }
+
+    /// 存在しない pid・権限の無いシステムプロセスを対象にしても panic しない
+    #[cfg(windows)]
+    #[test]
+    fn 存在しないpidやシステムプロセスでも壊れない() {
+        assert!(listening_ports_of_pid(0x7fff_fff0).is_empty());
+        assert!(listening_ports_of_pid(-1).is_empty());
+        // pid 4 = System。LSASS 等の LISTEN はこの pid の配下ではないので空、
+        // かつ OpenProcess を使わないので権限エラーにもならない
+        let _ = listening_ports_of_pid(4);
+        assert!(scan(&[0x7fff_fff0]).is_empty());
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

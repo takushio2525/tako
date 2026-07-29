@@ -293,8 +293,16 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   - macOS: libproc（`proc_listpids` → `proc_bsdinfo.e_tdev` とペインの PTY スレーブ rdev の
     突き合わせで「ペイン配下」を判定 → `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO` で
     LISTEN 中 TCP を列挙）。libc に無い `socket_fdinfo` 系は SDK ヘッダから転記し、
-    **自プロセスで実際に listen するユニットテストで ABI を e2e 検証**している。
-    Windows: `GetExtendedTcpTable`（Phase 6）
+    **自プロセスで実際に listen するユニットテストで ABI を e2e 検証**している
+  - Windows: `GetExtendedTcpTable`（TCP_TABLE_OWNER_PID_ALL・IPv4 / IPv6）で LISTEN 中 TCP と
+    所有 pid を取り、Toolhelp32 スナップショットの親子関係で「ペイン配下」を判定する
+    （✅ 2026-07-29 #524。`tako-core::platform::procinfo`）。tty が無いので判定材料は
+    **PTY 直下の子プロセス（`TerminalSession::child_pid`）の子孫**。ABI の検証方法は
+    macOS と同じ（自プロセスで listen して検知する）
+  - **ペインを指すキーの実体はプラットフォームで違う**（macOS = rdev、Windows = pid）ため、
+    キーの作成は `ports::pane_key` に閉じ込め、呼び出し側は不透明な `u64` として扱う
+  - どちらの方式も**永続化バックエンド（tmux / psmux）越しに起動されたプロセスは拾えない**
+    （器のサーバープロセス配下に移るため）。Windows 固有の縮退ではない
   - ポーリング方式（3 秒）。スキャンは background executor、結果は TerminalSession に保持し
     list / MCP の `listen_ports`（port / pid / process）として公開
 - 検知結果は**提案チップ**（「localhost:5173 をプレビューで開く？」）として UI に出すだけ。
