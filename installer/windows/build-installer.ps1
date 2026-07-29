@@ -22,15 +22,26 @@
 .PARAMETER IsccPath
     ISCC.exe のパス。省略時は PATH → 既定のインストール先の順に探す。
 
+.PARAMETER OutDir
+    配布物の出力先。省略時は dist/windows。リリース以外の配布物（テスター向けプレビュー等）を
+    リリース用の成果物と混ぜたくないときに分ける。
+
 .PARAMETER BinDir
     同梱する tako-app.exe / tako.exe の置き場。省略時は target/release。
     --target 付きでビルドした場合や、別の場所に用意した成果物を包む場合に指定する。
-    -SkipBuild と併用する前提のパラメータ。
+    -SkipBuild と併用するのが主な用途だが、$env:CARGO_TARGET_DIR を別の場所へ向けて
+    ビルドさせるときは -SkipBuild なしでも要る（cargo の出力先が target/release では
+    なくなるため。worktree でリリースビルドを回すときがこれに当たる）。
 
 .EXAMPLE
     pwsh -File installer/windows/build-installer.ps1
     pwsh -File installer/windows/build-installer.ps1 -Version v0.6.0
     pwsh -File installer/windows/build-installer.ps1 -SkipBuild -BinDir target/x86_64-pc-windows-msvc/release
+
+    # worktree でテスター向けプレビューを作る（target を共有し、出力先を分ける）
+    $env:CARGO_TARGET_DIR = 'C:\path\to\shared-target'
+    pwsh -File installer/windows/build-installer.ps1 -Version v0.5.13-win.1 `
+      -BinDir "$env:CARGO_TARGET_DIR\release" -OutDir C:\path\to\dist\v0.5.13-win.1
 #>
 [CmdletBinding()]
 param(
