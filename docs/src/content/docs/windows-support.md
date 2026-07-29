@@ -23,9 +23,9 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 91 | macOS 版と同じように使えます |
-| 一部対応 | 5 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 28 | まだ実装されていません（追跡 Issue つき） |
+| 対応済み | 92 | macOS 版と同じように使えます |
+| 一部対応 | 6 | 使えますが機能が落ちます（理由は各表に記載） |
+| 未対応 | 26 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **125** | |
 
@@ -190,15 +190,15 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
-| `tako_setup` | 一部対応 | 環境チェック・設定の生成・MCP 登録・winget での導入案内は動く。シェル統合（PowerShell）とスリープ防止は Windows 未対応のため、状態の表示だけで設定はできない |
+| `tako_setup` | 一部対応 | 環境チェック・設定の生成・MCP 登録・winget での導入案内は動く。シェル統合（PowerShell）は Windows 未対応のため、状態の表示だけで設定はできない |
 | `tako_setup_changes` | 対応済み | — |
 | `tako_setup_mcp` | 対応済み | — |
 | `tako_agents_sync_rules` | 対応済み | — |
 | `tako_stale_binary` | 対応済み | — |
 | `tako_tree_folder` | 対応済み | — |
 | `tako_file_op` | 対応済み | — |
-| `tako_port_detect` | 未対応 | OS API（プロセス検査・スリープ防止）の Windows 実装が前提 <br />追跡: [#524](https://github.com/takushio2525/tako/issues/524) |
-| `tako_sleep_guard` | 未対応 | OS API（プロセス検査・スリープ防止）の Windows 実装が前提 <br />追跡: [#524](https://github.com/takushio2525/tako/issues/524) |
+| `tako_port_detect` | 対応済み | — |
+| `tako_sleep_guard` | 一部対応 | アイドルスリープの防止は動く。蓋を閉じたまま走らせ続ける設定と本体温度の監視は macOS 固有の仕組みのため Windows には無い（蓋を閉じたときの動作は電源プランに従う） |
 | `tako_fda` | 対象外 | Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い |
 
 ## リモートアクセス・自動更新

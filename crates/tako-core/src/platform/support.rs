@@ -158,10 +158,20 @@ pub mod notes {
     // ので削除した。宣言が残っていると system prompt へ誤情報が注入される（このファイルの
     // モジュール doc「この表を直したら」を参照）
 
-    /// #524 の担当範囲
-    pub const WIN_OS_API: Note = Note::new(
-        "OS API（プロセス検査・スリープ防止）の Windows 実装が前提",
-        "Requires the Windows implementation of OS APIs (process inspection, sleep prevention)",
+    // #524 で B5（プロセス検査）と B9（スリープ防止）の Windows 実装が入り、
+    // `tako_port_detect` は Supported、`tako_sleep_guard` は下の理由で Degraded に
+    // なった。共通の縮退理由 WIN_OS_API（「OS API の Windows 実装が前提」）は
+    // 使う機能が無くなったので削除した（残すと system prompt へ誤情報が入る）
+
+    /// #524: アイドルスリープの抑止（`PowerCreateRequest`）は動く。
+    /// 蓋を閉じても走り続ける仕組みは macOS 固有（IOKit の clamshell 検知 +
+    /// sudoers 経由の `pmset disablesleep`）で、Windows に相当する API が無い
+    pub const WIN_SLEEP_GUARD_NO_LID: Note = Note::new(
+        "アイドルスリープの防止は動く。蓋を閉じたまま走らせ続ける設定と本体温度の監視は \
+         macOS 固有の仕組みのため Windows には無い（蓋を閉じたときの動作は電源プランに従う）",
+        "Idle sleep prevention works. Keeping the machine running with the lid closed, and \
+         thermal monitoring, rely on macOS-specific mechanisms that Windows does not have \
+         (lid-close behavior follows the Windows power plan)",
     );
     /// #525: 分割したペインを `/bin/sh -c` で起こす実装なので Windows では PTY 生成から失敗する
     pub const WIN_RUN_POSIX_SHELL: Note = Note::new(
@@ -172,10 +182,10 @@ pub mod notes {
     /// setup から設定**できない**項目だけが残る（何が残るかを具体的に書く）
     pub const WIN_SETUP_PARTIAL: Note = Note::new(
         "環境チェック・設定の生成・MCP 登録・winget での導入案内は動く。\
-         シェル統合（PowerShell）とスリープ防止は Windows 未対応のため、状態の表示だけで設定はできない",
+         シェル統合（PowerShell）は Windows 未対応のため、状態の表示だけで設定はできない",
         "Environment checks, config generation, MCP registration and winget install guidance all work. \
-         Shell integration (PowerShell) and sleep prevention are unavailable on Windows, so setup only \
-         reports their status instead of configuring them",
+         Shell integration (PowerShell) is unavailable on Windows, so setup only reports its status \
+         instead of configuring it",
     );
     /// #525: シェル統合（OSC 7 / 133）は zsh / bash / fish 用スクリプトしか同梱していない。
     /// PowerShell 版が無いと **cwd 追従とコマンド状態の検知が効かない**ので、
@@ -645,10 +655,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_port_detect",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_OS_API,
-            issue: 524,
-        },
+        // #524: GetExtendedTcpTable + Toolhelp32。ペイン配下の判定は
+        // 制御端末（macOS）ではなく PTY 直下プロセスの子孫で行う
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_apply",
@@ -914,9 +923,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_sleep_guard",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_OS_API,
-            issue: 524,
+        // #524: PowerCreateRequest / PowerSetRequest でアイドルスリープを抑止。
+        // 蓋閉じ継続と thermal は macOS 固有なので Degraded
+        windows: Support::Degraded {
+            note: notes::WIN_SLEEP_GUARD_NO_LID,
         },
     },
     Feature {
