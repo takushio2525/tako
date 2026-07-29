@@ -12,6 +12,10 @@ pub mod local_endpoint;
 #[cfg(windows)]
 pub mod named_pipe;
 pub mod os_integration;
+/// B9（スリープ防止）の **macOS 以外**の実装。macOS の IOKit 実装は
+/// `sleep_guard::iokit` が正なので、そちらが生きている環境では持ち込まない
+#[cfg(not(target_os = "macos"))]
+pub mod power;
 pub mod process;
 
 use serde_json::{json, Value};

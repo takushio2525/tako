@@ -154,7 +154,7 @@ pub struct SleepGuardState {
     pub on_ac_power: bool,
     /// busy なエージェントの数
     pub busy_agents: usize,
-    /// macOS でサポートされているか
+    /// この OS でスリープ防止が使えるか（macOS = IOKit、Windows = 電源要求。#524）
     pub platform_supported: bool,
     /// 蓋が閉じているか（#218）
     pub lid_closed: bool,
@@ -191,7 +191,8 @@ impl SleepGuardState {
 
     fn description(&self) -> String {
         if !self.platform_supported {
-            return "macOS 以外ではスリープ防止は使用できません".to_string();
+            // macOS（IOKit）と Windows（電源要求）は対応済み。ここへ来るのはそれ以外
+            return "この OS ではスリープ防止は使用できません".to_string();
         }
 
         let idle_desc = match self.mode {
@@ -501,6 +502,17 @@ const SUDOERS_CONTENT: &str = "\
 %admin ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
 ";
 
+/// 蓋を閉じたまま走らせ続ける制御（clamshell 検知 + sudoers + `pmset disablesleep`）を
+/// この OS が持つか（#524）。
+///
+/// **macOS 固有**。Windows で蓋を閉じたときの動作は電源プランのポリシーで決まり、
+/// アプリから一時的に上書きする API は無い。アイドルスリープの防止そのものは
+/// 両 OS で動くので、`platform_supported` とは別の軸として公開する
+/// （案内する側が「設定できるのに案内しない / できないのに案内する」を避けられる）
+pub fn lid_control_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// sudoers.d/tako-sleep-guard が登録済みか
 pub fn is_sudoers_installed() -> bool {
     std::path::Path::new(SUDOERS_FILE).exists()
@@ -607,6 +619,45 @@ pub fn set_disablesleep(enable: bool) -> Result<(), String> {
     }
 }
 
+/// アサーションを保持すべきかの判定（純粋関数）。
+///
+/// モードと電源条件の組み合わせは**プラットフォームを問わず同じ規則**なので、
+/// macOS（IOKit）と Windows（電源要求）の両経路がこの 1 本を通る（#524）
+fn should_hold_assertion(
+    mode: SleepGuardMode,
+    power_condition: PowerCondition,
+    on_ac: bool,
+    busy_agents: usize,
+) -> bool {
+    let wanted = match mode {
+        SleepGuardMode::Off => false,
+        SleepGuardMode::On => true,
+        SleepGuardMode::WhileAgentsRunning => busy_agents > 0,
+    };
+    wanted
+        && match power_condition {
+            PowerCondition::AcOnly => on_ac,
+            PowerCondition::Always => true,
+        }
+}
+
+/// 電源要求に添える理由文字列（#524）。
+///
+/// Windows では `powercfg /requests` にそのまま出る。診断ツールのコンソール出力で
+/// 文字化けさせないため **ASCII に固定**する（UI へは出ないので日英化の対象外。
+/// UI 文言は `tako-app::ui_text::sleep_guard` が持つ）
+#[cfg(not(target_os = "macos"))]
+fn assertion_reason(mode: SleepGuardMode, busy_agents: usize) -> String {
+    match mode {
+        SleepGuardMode::On => "tako: sleep guard (always on)".to_string(),
+        SleepGuardMode::WhileAgentsRunning => {
+            format!("tako: sleep guard (agents running: {busy_agents})")
+        }
+        // Off で保持することは無い（呼ばれても無害な既定値を返す）
+        SleepGuardMode::Off => "tako: sleep guard".to_string(),
+    }
+}
+
 /// 残留解除を行うべきかを判定する（#449: テスト可能な純粋関数）。
 /// Ok(()) なら解除すべき、Err(理由) ならスキップ
 fn should_clear_residual(
@@ -684,14 +735,19 @@ pub fn update(
     BUSY_AGENTS.store(busy_agents, Ordering::Relaxed);
     #[cfg(not(target_os = "macos"))]
     {
+        // 蓋閉じ継続（clamshell + sudoers + pmset）と thermal 監視は macOS 固有。
+        // Windows は電源要求でアイドルスリープだけを止める（B9・#524）
         let _ = lid_sleep_mode;
+        let on_ac = crate::platform::power::on_ac_power();
+        let should_hold = should_hold_assertion(mode, power_condition, on_ac, busy_agents);
+        crate::platform::power::set_hold(should_hold, &assertion_reason(mode, busy_agents));
         return SleepGuardState {
-            assertion_held: false,
+            assertion_held: crate::platform::power::is_held(),
             mode,
             power_condition,
-            on_ac_power: false,
+            on_ac_power: on_ac,
             busy_agents,
-            platform_supported: false,
+            platform_supported: crate::platform::power::supported(),
             lid_closed: false,
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::Off,
@@ -707,17 +763,8 @@ pub fn update(
         let thermal = iokit::thermal_state();
         let sudoers = is_sudoers_installed();
 
-        // --- アイドルスリープ防止（既存ロジック） ---
-        let should_hold = match mode {
-            SleepGuardMode::Off => false,
-            SleepGuardMode::On => true,
-            SleepGuardMode::WhileAgentsRunning => busy_agents > 0,
-        };
-        let should_hold = should_hold
-            && match power_condition {
-                PowerCondition::AcOnly => on_ac,
-                PowerCondition::Always => true,
-            };
+        // --- アイドルスリープ防止（既存ロジック。判定は #524 で共通化） ---
+        let should_hold = should_hold_assertion(mode, power_condition, on_ac, busy_agents);
 
         if should_hold && !iokit::is_held() {
             let reason = match mode {
@@ -781,14 +828,15 @@ pub fn status(
     let busy_agents = BUSY_AGENTS.load(Ordering::Relaxed);
     #[cfg(not(target_os = "macos"))]
     {
+        // 副作用なし: 取得・解放は行わず、いまの保持状態と電源だけを読む
         let _ = lid_sleep_mode;
         return SleepGuardState {
-            assertion_held: false,
+            assertion_held: crate::platform::power::is_held(),
             mode,
             power_condition,
-            on_ac_power: false,
+            on_ac_power: crate::platform::power::on_ac_power(),
             busy_agents,
-            platform_supported: false,
+            platform_supported: crate::platform::power::supported(),
             lid_closed: false,
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::Off,
@@ -843,7 +891,7 @@ pub fn check_qos() -> Value {
     }
 }
 
-/// tako 終了時に disablesleep を解除する（正常終了フック）
+/// tako 終了時に残ったスリープ防止を解除する（正常終了フック）
 pub fn cleanup_on_exit() {
     #[cfg(target_os = "macos")]
     {
@@ -851,6 +899,10 @@ pub fn cleanup_on_exit() {
             let _ = set_disablesleep(false);
         }
     }
+    // Windows の電源要求はプロセス終了で OS が回収するが、明示的に解除しておく
+    // （`powercfg /requests` に残らないことを終了直後に確認できる）
+    #[cfg(not(target_os = "macos"))]
+    crate::platform::power::set_hold(false, "");
 }
 
 #[cfg(test)]
@@ -1098,7 +1150,106 @@ mod tests {
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
-        assert!(state.description().contains("macOS 以外"));
+        assert!(state.description().contains("この OS では"));
+    }
+
+    // --- #524: 保持判定の共通化（macOS / Windows 両経路がこの 1 本を通る） ---
+
+    #[test]
+    fn offモードは常に保持しない() {
+        for on_ac in [true, false] {
+            for busy in [0, 3] {
+                assert!(!should_hold_assertion(
+                    SleepGuardMode::Off,
+                    PowerCondition::Always,
+                    on_ac,
+                    busy
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn onモードはac接続なら保持する() {
+        assert!(should_hold_assertion(
+            SleepGuardMode::On,
+            PowerCondition::AcOnly,
+            true,
+            0
+        ));
+        assert!(
+            !should_hold_assertion(SleepGuardMode::On, PowerCondition::AcOnly, false, 0),
+            "ac-only で AC 未接続なら保持しない"
+        );
+        assert!(
+            should_hold_assertion(SleepGuardMode::On, PowerCondition::Always, false, 0),
+            "always ならバッテリーでも保持する"
+        );
+    }
+
+    #[test]
+    fn 自動モードはエージェント稼働中だけ保持する() {
+        let m = SleepGuardMode::WhileAgentsRunning;
+        assert!(!should_hold_assertion(m, PowerCondition::Always, true, 0));
+        assert!(should_hold_assertion(m, PowerCondition::Always, true, 1));
+        assert!(
+            !should_hold_assertion(m, PowerCondition::AcOnly, false, 1),
+            "稼働中でも AC 未接続なら保持しない"
+        );
+    }
+
+    /// 診断ツールに出る文字列。`powercfg /requests` で読めるよう ASCII 固定
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 電源要求の理由はasciiで体数を含む() {
+        let r = assertion_reason(SleepGuardMode::WhileAgentsRunning, 3);
+        assert!(r.is_ascii(), "理由文字列に非 ASCII が混ざっている: {r}");
+        assert!(r.contains("tako") && r.contains('3'), "{r}");
+        assert!(assertion_reason(SleepGuardMode::On, 0).is_ascii());
+    }
+
+    /// 実機での取得 → 解除（#524）。
+    ///
+    /// macOS では走らせない。`update()` の macOS 経路は蓋の状態と disablesleep 次第で
+    /// `pmset displaysleepnow`（ディスプレイ消灯）まで到達しうるので、テストの副作用に
+    /// してはいけない。macOS 側の実装は #173 / #218 / #311 のまま触っていない
+    #[cfg(windows)]
+    #[test]
+    fn updateで保持と解除ができる() {
+        // On + always なら電源条件（AC / バッテリー）によらず保持する状態
+        let held = update(
+            SleepGuardMode::On,
+            PowerCondition::Always,
+            LidSleepMode::Off,
+            0,
+        );
+        assert!(held.platform_supported, "Windows は対応済みのはず");
+        assert!(held.assertion_held, "保持できていない: {held:?}");
+        // 副作用なしの status も同じ状態を返す
+        let s = status(
+            SleepGuardMode::On,
+            PowerCondition::Always,
+            LidSleepMode::Off,
+        );
+        assert!(s.assertion_held);
+        assert_eq!(s.lid_sleep_mode, LidSleepMode::Off, "蓋閉じ制御は持たない");
+        assert!(!s.sudoers_installed);
+
+        let released = update(
+            SleepGuardMode::Off,
+            PowerCondition::Always,
+            LidSleepMode::Off,
+            0,
+        );
+        assert!(!released.assertion_held, "解除できていない: {released:?}");
+        assert!(
+            !status(
+                SleepGuardMode::Off,
+                PowerCondition::Always,
+                LidSleepMode::Off
+            )
+            .assertion_held
+        );
     }
 
     #[test]
