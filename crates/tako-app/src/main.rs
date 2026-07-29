@@ -14949,16 +14949,36 @@ impl Render for TakoApp {
             if clause.end < text.len() {
                 highlights.push((clause.end..text.len(), thin));
             }
+            // 箱・文字・行ボックスはすべて **IME 対象ペイン**のメトリクスで揃える（#642）。
+            // アンカー（anchor）は `cell_size_for_pane` 由来のペイン単位の値なので、
+            // ここだけ theme のグローバル値を使うと Ctrl+= でフォントを変えたペインでずれる
+            let font_px = self.pane_font_size(ime.pane);
+            let line_h = self.pane_line_height(ime.pane);
             Some(
                 div()
                     .absolute()
                     .left(anchor.x - content_origin.x)
                     .top(anchor.y - content_origin.y)
-                    .h(px(theme.line_height))
+                    .h(px(line_h))
+                    // ターミナル本文の行 div と同じ理由（#610 の取りこぼし = #642）。
+                    // GPUI の StyledText は**行ボックスの高さとフォントサイズを
+                    // `window.text_style()`（= 要素ツリーを継承したテキストスタイル）から取る**
+                    // （`gpui/src/elements/text.rs:633-638`）。`with_default_highlights` に
+                    // 渡す TextStyle は TextRun にしか効かず、そこに書いた line_height は
+                    // 行ボックスに効かない。継承側を明示しないと GPUI 既定の `phi()`
+                    // （1.618034 × フォントサイズ ≒ 21px）が行ボックスになり、ベースラインが
+                    // `(行高 - ascent - descent) / 2 + ascent` へ置かれる
+                    // （`gpui/src/text_system/line.rs:353-354`）ため、17px の箱に対して
+                    // (21 - 17) / 2 ≒ 2 論理px だけテキストが下へずれる。
+                    // #610 で行 div 側だけ直したので、オーバーレイだけが取り残されて
+                    // 「本文より少し下」に見えていた。単位は論理 px のままで、
+                    // 物理 px への変換は GPUI が行う（DPI 依存の変換はここには無い）
+                    .text_size(px(font_px))
+                    .line_height(px(line_h))
                     .bg(rgba(theme.background))
                     .child(
                         StyledText::new(text)
-                            .with_default_highlights(&self.text_style(), highlights),
+                            .with_default_highlights(&self.pane_text_style(ime.pane), highlights),
                     ),
             )
         });
@@ -24725,5 +24745,136 @@ mod app_menu_tests {
             assert!(ks.modifiers.platform, "{action} は cmd 修飾");
             assert_eq!(ks.modifiers.alt, alt, "{action} の alt 修飾");
         }
+    }
+}
+
+/// IME 未確定文字列オーバーレイの縦位置（#642）。
+///
+/// 症状は「変換中のプレビューが本来の行より少し下に出る」。根因は GPUI の
+/// `StyledText` が**行ボックスの高さを `window.text_style()`（継承側）から取る**ことで、
+/// 継承側に行高を書かないと既定の `phi()`（1.618034 × フォントサイズ）が使われる。
+/// ベースラインは行ボックス内の `(行高 - ascent - descent) / 2 + ascent` に置かれるため、
+/// 行ボックスが要素の高さより高いと**その差の半分だけテキストが下がる**。
+///
+/// #610 でターミナル本文の行 div は直したが、IME オーバーレイは取りこぼしていた。
+/// 直す前は本文側も同じだけずれていたので相対ずれが見えず、#610 の後に顕在化した。
+#[cfg(test)]
+mod ime_overlay_metrics_tests {
+    /// GPUI 既定の行高係数（`gpui/src/geometry.rs` の `phi()`）
+    const PHI: f32 = 1.618_034;
+
+    /// `gpui::Window::pixel_snap` と同じ丸め（物理ピクセル格子へ載せる）。
+    /// 継承行高は `TextLayout::layout` の中でこれを通るので、ずれ量の計算にも要る。
+    ///
+    /// **`f32::round()` ではない**。GPUI は `round_half_toward_zero`
+    /// （`gpui/src/util.rs:130` = `(|v| - 0.5).ceil().copysign(v)`）を使う。
+    /// ちょうど .5 になる値で結果が変わり、150% の 17px × 1.5 = 25.5 は
+    /// 26 ではなく **25** へ落ちる（この 1 物理px の差でずれ量が 3.0 と 3.5 に分かれる）
+    fn pixel_snap(logical: f32, scale: f32) -> f32 {
+        let scaled = logical * scale;
+        (scaled.abs() - 0.5).ceil().copysign(scaled) / scale
+    }
+
+    /// 継承側に行高を明示しなかったときに生じるベースラインの下方向ずれ（論理 px）。
+    /// `gpui/src/text_system/line.rs:353` の `padding_top` の差そのもの
+    fn baseline_drift(inherited_line_height: f32, box_height: f32) -> f32 {
+        (inherited_line_height - box_height) / 2.0
+    }
+
+    /// 継承側を明示しなかった場合（= 修正前）の行ボックス
+    fn inherited_line_box(font_px: f32, scale: f32) -> f32 {
+        pixel_snap(font_px * PHI, scale)
+    }
+
+    /// テーマ既定（13px / 行高 17px）で、DPI ごとのずれ量を数値で固定する。
+    /// 報告は 125% 実機。物理 2.5px = 行高 21.25px の約 12% で「若干下」と整合する
+    #[test]
+    fn 行高を明示しないと各dpiでベースラインが下へずれる() {
+        // (scale, 期待ずれ(論理px), 期待ずれ(物理px))
+        for (scale, want_logical, want_physical) in
+            [(1.0, 2.0, 2.0), (1.25, 2.0, 2.5), (1.5, 7.0 / 3.0, 3.5)]
+        {
+            let box_h = pixel_snap(17.0, scale);
+            let drift = baseline_drift(inherited_line_box(13.0, scale), box_h);
+            assert!(
+                (drift - want_logical).abs() < 0.01,
+                "scale={scale}: 論理ずれ {drift} != {want_logical}"
+            );
+            assert!(
+                (drift * scale - want_physical).abs() < 0.01,
+                "scale={scale}: 物理ずれ {} != {want_physical}",
+                drift * scale
+            );
+        }
+    }
+
+    /// 修正後（継承側 = 箱の高さ）はどの DPI でもずれ 0。
+    /// 100% / 150% でも破綻しないことの根拠
+    #[test]
+    fn 行高を明示すればどのdpiでもずれない() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for (font_px, line_h) in [(13.0, 17.0), (8.0, 10.5), (19.0, 24.8), (32.0, 41.8)] {
+                let box_h = pixel_snap(line_h, scale);
+                // 継承側に box と同じ値を渡す = 同じ pixel_snap を通るので完全一致する
+                let drift = baseline_drift(pixel_snap(line_h, scale), box_h);
+                assert_eq!(drift, 0.0, "scale={scale} font={font_px} line_h={line_h}");
+            }
+        }
+    }
+
+    /// ペイン単位フォントサイズ（Ctrl+=）で theme 固定のままだと、ずれが
+    /// 行の高さそのもののオーダーまで育つ。箱をペイン値に揃える必要があることの根拠。
+    ///
+    /// 期待値は `TakoApp::pane_line_height`（`theme.line_height * fs / theme.font_size`）と
+    /// 同じ式。ここが変わったらこのテストも一緒に直す
+    #[test]
+    fn ペイン単位フォントでは箱をペイン値に揃えないと行単位でずれる() {
+        // theme = 13px / 行高 17px。ペインを 6 段拡大した 19px 相当（行高は同比率）
+        let pane_line_h = 17.0 * 19.0 / 13.0;
+        let gap = pane_line_h - 17.0;
+        assert!(
+            gap > 0.4 * 17.0,
+            "拡大ペインの行高とテーマ行高の差 {gap} が行高の 4 割を下回る（前提が変わった）"
+        );
+    }
+
+    /// **#642 の番犬**: IME オーバーレイの div が、箱・フォントサイズ・行ボックスを
+    /// 「IME 対象ペインの値」で明示していること。
+    ///
+    /// #610 と同じ取りこぼしの再発（`.line_height()` を落とす / `theme` へ戻す）を
+    /// 構造的に検出する。数値の一致はピクセル実測でしか見えないので、ここでは
+    /// **宣言が残っていること**を固定する
+    #[test]
+    fn imeオーバーレイがペイン単位の行ボックスを宣言している() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs を読めない");
+        let start = src
+            .find("let ime_overlay = self.ime.as_ref()")
+            .expect("ime_overlay の定義が見つからない（名前を変えたらこのテストも直す）");
+        let end = src[start..]
+            .find("let ime_registration")
+            .expect("ime_overlay ブロックの終端が見つからない")
+            + start;
+        let block = &src[start..end];
+
+        for needed in [
+            ".h(px(line_h))",
+            ".text_size(px(font_px))",
+            ".line_height(px(line_h))",
+            "self.pane_font_size(ime.pane)",
+            "self.pane_line_height(ime.pane)",
+            "self.pane_text_style(ime.pane)",
+        ] {
+            assert!(
+                block.contains(needed),
+                "IME オーバーレイに `{needed}` が無い。GPUI は行ボックスを継承側から取るため、\n\
+                 落とすとベースラインが約 2 論理px 下へずれる（#610 / #642）"
+            );
+        }
+        assert!(
+            !block.contains("px(theme.line_height)"),
+            "IME オーバーレイの箱が theme のグローバル行高に戻っている。\n\
+             アンカーはペイン単位（cell_size_for_pane）なのでペイン値に揃えること（#642）"
+        );
     }
 }
