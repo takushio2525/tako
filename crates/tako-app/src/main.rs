@@ -821,6 +821,82 @@ struct DragScrollState {
     preview: bool,
 }
 
+/// ペインを並べるコンテナ（絶対配置ペインの containing block）のジオメトリ（#684）。
+///
+/// ペイン矩形は `render()` の中で「ビューポート寸法から引き算」して求めるが、
+/// `render()` はレイアウト前に走るので、その式は**推定**にしかならない。
+/// タブバー・ステータスバー以外にも高さを食う要素（ウェルカムバナー #549 /
+/// アップデート通知カード #616 / たまり場ドロワー / Web ビュー dock）が縦に積まれる
+/// ため、引き算だけでは実コンテナより大きい矩形が出て、PTY の行数が可視行数を超える
+/// （= 画面外の行が生まれる。#684 の症状）。
+///
+/// そこで実描画時にコンテナの矩形を採取して**次フレームの正**として使う。
+/// 実測はコンテナのレイアウト結果のみに依存し（ペインは absolute なので内在サイズに
+/// 寄与しない）、こちらが与えた値には依存しないので、ずれは 1 フレームで収束する。
+#[derive(Clone, Copy, Debug, Default)]
+struct PaneContentGeometry {
+    /// 直近の `render()` がペイン矩形の計算に実際に使った矩形
+    used: Option<Bounds<Pixels>>,
+    /// 実描画で採取した矩形（= 正。まだ描かれていなければ `None`）
+    measured: Option<Bounds<Pixels>>,
+    /// 古い矩形で描いてしまい、次のフレームで直した回数（収束の機械検証用。#684）
+    corrections: u32,
+}
+
+/// 実描画（prepaint）からの採取スロット（#684）。
+///
+/// **エンティティを触らない**のが要点。描画は「root view が貸し出されている最中」に
+/// 走ることがあり（`WindowHandle::update` の中から `Window::draw` を呼ぶ経路）、
+/// そこで `Entity::update` を呼ぶと
+/// `cannot update ... while it is already being updated` で**プロセスごと abort する**
+/// （= 全ペイン消失）。`Cell` への書き込みだけなら借用に触れないので構造的に安全。
+/// 再描画の要求も `App::defer` 経由（貸し出しが解けた後に走る）にしてある
+#[derive(Default)]
+struct PaneContentProbe {
+    /// 直近の実描画で採取した矩形
+    measured: std::cell::Cell<Option<Bounds<Pixels>>>,
+    /// 再描画を要求済みの実測値（安全弁）。同じ値で何度も要求しないことで、
+    /// 万一収束しない経路が生まれても vsync ごとの再描画へ落ちない
+    requested: std::cell::Cell<Option<Bounds<Pixels>>>,
+}
+
+impl PaneContentProbe {
+    /// 採取した矩形を記録し、「再描画して直す価値がある」かを返す。
+    /// `used` = そのフレームがペイン矩形の計算に使った矩形
+    fn record(&self, used: Bounds<Pixels>, bounds: Bounds<Pixels>) -> bool {
+        self.measured.set(Some(bounds));
+        if !pane_content_rect_differs(used, bounds) {
+            // 収束した。次にずれたときは（同じ値でも）また要求してよい
+            self.requested.set(None);
+            return false;
+        }
+        // 同じ実測値で再要求しない（収束しない経路が生まれても毎フレーム
+        // 再描画を要求し続けない安全弁。ジオメトリが変われば値も変わる）
+        if self
+            .requested
+            .get()
+            .is_some_and(|prev| !pane_content_rect_differs(prev, bounds))
+        {
+            return false;
+        }
+        self.requested.set(Some(bounds));
+        true
+    }
+}
+
+/// 実測とのずれが「再描画して直す価値のある差」か（#684）。
+///
+/// 収束後は同じ値を渡し返すので通常は完全一致する。デバイスピクセル未満の揺れで
+/// 毎フレーム再描画を要求しないよう下限を設ける（0.5px = 2x Retina の 1 物理ピクセル）
+fn pane_content_rect_differs(used: Bounds<Pixels>, measured: Bounds<Pixels>) -> bool {
+    const EPSILON: f32 = 0.5;
+    let d = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs() > EPSILON;
+    d(used.origin.x, measured.origin.x)
+        || d(used.origin.y, measured.origin.y)
+        || d(used.size.width, measured.size.width)
+        || d(used.size.height, measured.size.height)
+}
+
 /// IME 変換状態の対象ペインを解決する（#332）。変換開始時のペインが既に閉じられて
 /// いる場合、候補ウィンドウの位置出しと確定文字列が死んだペインへ向かわないよう
 /// 現在のフォーカスペインへ倒す
@@ -852,6 +928,12 @@ struct TakoApp {
     drag_scroll: Option<DragScrollState>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
+    /// ペインを並べるコンテナ（絶対配置ペインの containing block）の実描画矩形。
+    /// ウィンドウ単位（#339 の複数ウィンドウは同一 entity を共有するためキーが要る）。
+    /// #684: ここが「正」。詳細は `PaneContentGeometry`
+    pane_content: HashMap<gpui::WindowId, PaneContentGeometry>,
+    /// 実描画からの採取スロット（ウィンドウ単位）。詳細は `PaneContentProbe`
+    pane_content_probes: HashMap<gpui::WindowId, std::rc::Rc<PaneContentProbe>>,
     /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
     ipc: Option<IpcServer>,
     /// Layer 2 内蔵 MCP サーバー（FR-2.3 の受け口。起動失敗時は None で MCP なし動作）
@@ -2232,6 +2314,8 @@ impl TakoApp {
             selecting: None,
             drag_scroll: None,
             pane_text_areas: Vec::new(),
+            pane_content: HashMap::new(),
+            pane_content_probes: HashMap::new(),
             ipc,
             mcp,
             token,
@@ -15822,12 +15906,51 @@ impl Render for TakoApp {
         } else {
             px(0.0)
         };
-        let content_origin = point(sidebar_width, px(TAB_BAR_HEIGHT));
-        // 下部ステータスバー（FR-2.16.4）の分も差し引く
-        let content_size = size(
-            viewport.width - sidebar_width - panel_width,
-            viewport.height - px(TAB_BAR_HEIGHT) - px(STATUS_BAR_HEIGHT),
+        // 初回フレーム用の推定値（タブバー + 下部ステータスバー FR-2.16.4 を差し引く）。
+        // 2 フレーム目以降は実描画で採取したコンテナ矩形（= 正）に置き換わる。#684:
+        // この式だけを正にすると、あいだに積まれる要素（ウェルカムバナー #549 /
+        // アップデート通知カード #616 / たまり場ドロワー / Web ビュー dock）の高さが
+        // 抜け落ち、ペインが実コンテナより縦に大きくなって画面外の行が生まれていた
+        let estimated = Bounds::new(
+            point(sidebar_width, px(TAB_BAR_HEIGHT)),
+            size(
+                viewport.width - sidebar_width - panel_width,
+                viewport.height - px(TAB_BAR_HEIGHT) - px(STATUS_BAR_HEIGHT),
+            ),
         );
+        let window_id = window.window_handle().window_id();
+        // 閉じたウィンドウの採取結果は残さない（複数ウィンドウ #339 は同一 entity を共有）
+        if self.pane_content.len() > 1 {
+            let live: std::collections::HashSet<gpui::WindowId> = self
+                .viewports
+                .iter()
+                .map(|(_, h)| h.window_id())
+                .chain(std::iter::once(window_id))
+                .collect();
+            self.pane_content.retain(|id, _| live.contains(id));
+            self.pane_content_probes.retain(|id, _| live.contains(id));
+        }
+        // 前フレームの実描画で採取した矩形（あればそれが正。無ければ推定値）
+        let probe = self
+            .pane_content_probes
+            .entry(window_id)
+            .or_default()
+            .clone();
+        let measured = probe.measured.get();
+        let content_rect = measured.unwrap_or(estimated);
+        {
+            let entry = self.pane_content.entry(window_id).or_default();
+            // 前フレームが古い矩形で描いていたなら、このフレームで直る（収束の記録）
+            if let (Some(prev), Some(m)) = (entry.used, measured) {
+                if pane_content_rect_differs(prev, m) {
+                    entry.corrections = entry.corrections.saturating_add(1);
+                }
+            }
+            entry.measured = measured;
+            entry.used = Some(content_rect);
+        }
+        let content_origin = content_rect.origin;
+        let content_size = content_rect.size;
         let tree = self
             .workspace
             .get_tab(display_tab)
@@ -15999,6 +16122,39 @@ impl Render for TakoApp {
                     ),
             )
         });
+
+        // #684: ペインを並べるコンテナの実矩形を採取するプローブ。ペインとまったく同じ
+        // 指定（absolute + 原点 + size_full）にしてあるので、採取した矩形は
+        // `content_origin` / `content_size` が本来一致すべき箱そのものになる。
+        // 何も描かないので見た目には出ず、absolute なのでレイアウトにも参加しない
+        let content_probe = {
+            let weak = cx.entity().downgrade();
+            let slot = probe.clone();
+            let used = content_rect;
+            canvas(
+                move |bounds, _, cx| {
+                    // ここでは Cell へ書くだけ（`Entity::update` は使わない）。
+                    // 描画は root view が貸し出されている最中に走ることがあり、
+                    // そこで entity を触ると abort する（`PaneContentProbe` 参照）
+                    if slot.record(used, bounds) {
+                        // 描画中の notify は GPUI が捨てるので
+                        // （`WindowInvalidator::invalidate_view` は draw_phase != None で
+                        // dirty を立てない）、effect の flush まで遅らせて次フレームを起こす
+                        let weak = weak.clone();
+                        cx.defer(move |cx| {
+                            if let Some(entity) = weak.upgrade() {
+                                entity.update(cx, |_, cx| cx.notify());
+                            }
+                        });
+                    }
+                },
+                |_, _, _, _| (),
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
 
         // IME（確定・未確定入力）の受け口を OS へ登録する。`Window::handle_input` は
         // paint フェーズ限定 API のため、何も描かない canvas の paint フックから呼ぶ
@@ -16225,6 +16381,8 @@ impl Render for TakoApp {
                             .flex_1()
                             .relative()
                             .p(px(8.0))
+                            // #684: 実矩形の採取はペインより先（最背面）に置く
+                            .child(content_probe)
                             .children(panes)
                             .children(border_handles)
                             .children(drop_overlays)
@@ -17439,6 +17597,45 @@ mod self_test {
         })
         .ok()
         .flatten()
+    }
+
+    /// 実際にインクが乗っているターミナル行の数（#684）。`text_top` から 1 行ずつ
+    /// 帯（行の中央 60%）を見て、インクがあった一番下の行までを数える。
+    /// クリップされて描かれなかった行は数えられないので、PTY の行数と突き合わせると
+    /// 「画面外に行が生まれていないか」がジオメトリの計算とは独立に分かる
+    #[cfg(feature = "visual-test")]
+    fn drawn_row_count(
+        frame: &image::RgbaImage,
+        scale: f32,
+        x_range: (f32, f32),
+        text_top: f32,
+        cell_h: f32,
+        clip_bottom: f32,
+        background: tako_core::Rgb,
+    ) -> usize {
+        let (width, height) = frame.dimensions();
+        let left = ((x_range.0 * scale).round().max(0.0) as u32).min(width);
+        let right = ((x_range.1 * scale).round().max(0.0) as u32).min(width);
+        let ink = |p: [u8; 4]| {
+            (i32::from(p[0]) - i32::from(background.r)).abs()
+                + (i32::from(p[1]) - i32::from(background.g)).abs()
+                + (i32::from(p[2]) - i32::from(background.b)).abs()
+                > 24
+        };
+        let mut count = 0;
+        for row in 0..1000 {
+            let band_top = text_top + cell_h * (row as f32 + 0.2);
+            let band_bottom = text_top + cell_h * (row as f32 + 0.8);
+            if band_bottom > clip_bottom {
+                break;
+            }
+            let top = ((band_top * scale).round().max(0.0) as u32).min(height);
+            let bottom = ((band_bottom * scale).round().max(0.0) as u32).min(height);
+            if (top..bottom).any(|y| (left..right).any(|x| ink(frame.get_pixel(x, y).0))) {
+                count = row + 1;
+            }
+        }
+        count
     }
 
     /// 指定した論理座標矩形内で RGBA が変化したピクセル数。Metal 読み戻しの上下方向が
@@ -19501,6 +19698,152 @@ mod self_test {
                     cx.notify();
                 })
                 .ok();
+
+            // #684: 高さを食う要素（ウェルカムバナー #549 / たまり場ドロワー）が縦に積まれても、
+            // PTY の行数が「実際に描かれる行数」と一致する。
+            //
+            // 画面いっぱいにインクを流し、**実際にインクが乗っている行を数える**。
+            // 期待値はターミナルのグリッド（visible_lines）から出すので、
+            // 「グリッドにある行が全部描かれているか」をジオメトリ計算とは独立に見られる。
+            // 修正前はバナー / ドロワーぶんだけ計算上の領域が実コンテナより大きく、
+            // グリッド 44 行に対して描かれるのは 38 / 30 行だけだった
+            {
+                // 幅のあるインクで埋める（プロンプトの行数・見た目に依存しない）。
+                // 有限本数で止める = 撮るときは画面が静止していて描画負荷も無い
+                type_text(
+                    any,
+                    cx,
+                    "yes ################################ | head -300",
+                    true,
+                );
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                let mut all_counted = true;
+                let mut all_aligned = true;
+                let mut all_full = true;
+                for state in ["none", "banner", "drawer", "banner+drawer"] {
+                    window
+                        .update(cx, |app, _, cx| {
+                            app.welcome_banner = state.contains("banner");
+                            app.drawer_visible = state.contains("drawer");
+                            cx.notify();
+                        })
+                        .ok();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(700))
+                        .await;
+                    // 1 枚目の描画で矩形を採取 → 訂正フレーム → 2 枚目が確定状態
+                    let _ = capture_frame(any, cx);
+                    let Some((frame, scale)) = capture_frame(any, cx) else {
+                        fail("visual-test #684: フレーム取得")
+                    };
+                    let (rect, container, cell_h, rows, expected, background) = window
+                        .update(cx, |app, win, _| {
+                            let pane = app.focused_pane();
+                            let container = app
+                                .pane_content
+                                .get(&win.window_handle().window_id())
+                                .and_then(|g| g.measured);
+                            // 実描画のペイン矩形 = 実コンテナ × ペインの単位矩形
+                            let unit = app
+                                .workspace
+                                .active_tab()
+                                .tree()
+                                .layout(Rect::UNIT)
+                                .into_iter()
+                                .find(|(id, _)| *id == pane)
+                                .map(|(_, r)| r);
+                            let cell_h = app
+                                .cell_size_for_pane(pane)
+                                .map(|c| f32::from(c.height))
+                                .unwrap_or(17.0);
+                            let session = app.terminals.get(&pane);
+                            let rows = session.map(|s| s.size().1).unwrap_or(0);
+                            // グリッド側の「描かれるべき行数」= 末尾の非空行まで
+                            let expected = session
+                                .map(|s| {
+                                    let lines = s.visible_lines();
+                                    lines
+                                        .iter()
+                                        .rposition(|l| !l.trim().is_empty())
+                                        .map(|i| i + 1)
+                                        .unwrap_or(0)
+                                })
+                                .unwrap_or(0);
+                            let area = app
+                                .pane_text_areas
+                                .iter()
+                                .find(|(id, _)| *id == pane)
+                                .map(|(_, b)| *b);
+                            (
+                                unit.zip(area),
+                                container,
+                                cell_h,
+                                rows,
+                                expected,
+                                app.theme.background,
+                            )
+                        })
+                        .unwrap_or_else(|_| fail("visual-test #684: 状態の取得"));
+                    let (unit, area) = rect.unwrap_or_else(|| fail("visual-test #684: ペイン矩形"));
+                    let container =
+                        container.unwrap_or_else(|| fail("visual-test #684: コンテナ矩形"));
+                    // 実描画のテキスト開始位置（枠 + ヘッダ + 余白の内側）。
+                    // 実測コンテナから出すので、計算側の推定とは独立
+                    let pane_top =
+                        f32::from(container.top()) + f32::from(container.size.height) * unit.y;
+                    let pane_bottom = pane_top + f32::from(container.size.height) * unit.height;
+                    let text_top = pane_top + PANE_BORDER + PANE_TITLE_BAR + PANE_PADDING;
+                    let drawn = drawn_row_count(
+                        &frame,
+                        scale,
+                        (
+                            f32::from(area.left()) + 2.0,
+                            f32::from(area.right()) - 16.0,
+                        ),
+                        text_top,
+                        cell_h,
+                        pane_bottom - PANE_BORDER,
+                        background,
+                    );
+                    // 計算上のテキスト領域が実描画の位置と一致する（上端・下端とも）
+                    let text_bottom = pane_bottom - PANE_BORDER - PANE_PADDING;
+                    let aligned = (f32::from(area.top()) - text_top).abs() <= 0.5
+                        && (f32::from(area.bottom()) - text_bottom).abs() <= 0.5;
+                    println!(
+                        "TAKO_VISUAL_PIXEL: content-geom {state} rows={rows} expected={expected} \
+                         drawn={drawn} area_top={:.1} real_text_top={text_top:.1} \
+                         area_bottom={:.1} real_text_bottom={text_bottom:.1}",
+                        f32::from(area.top()),
+                        f32::from(area.bottom()),
+                    );
+                    // インクの行数がグリッドと一致 = 画面外に押し出された行が無い
+                    all_counted &= drawn == expected;
+                    // グリッドがほぼ埋まっている（検査が空振りしていない）
+                    all_full &= expected + 1 >= rows && rows > 0;
+                    all_aligned &= aligned;
+                }
+                window
+                    .update(cx, |app, _, cx| {
+                        app.welcome_banner = false;
+                        app.drawer_visible = false;
+                        cx.notify();
+                    })
+                    .ok();
+                check(
+                    all_full,
+                    "visual-test #684: 検査対象の画面がグリッドで埋まっている（空振りでない）",
+                );
+                check(
+                    all_counted,
+                    "visual-test #684: グリッドの行数 = 実際にインクが乗る行数（画面外の行が無い）",
+                );
+                check(
+                    all_aligned,
+                    "visual-test #684: 計算上のテキスト領域が実描画の位置と一致する",
+                );
+            }
 
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);
@@ -28971,6 +29314,369 @@ mod self_test {
                 }
             }
 
+            // 92. ペインの PTY 行数が「実際に描かれる行数」と一致する（#684）。
+            //
+            // ペイン矩形は render の中でビューポート寸法から引き算して作るが、
+            // タブバー・ステータスバー以外にも縦に積まれる要素があるため、引き算だけでは
+            // 実コンテナより縦に大きい矩形が出て画面外の行が生まれていた
+            // （バナー表示中にヘッダは 119x27 と出しつつ実描画は約 21 行）。
+            //
+            // ここでは**高さを食う要素を全部列挙**し（ルートの flex 列の子のうち、
+            // absolute でないもの = タブバー / ウェルカムバナー / アップデート通知カード /
+            // ペインエリア / たまり場ドロワー / Web ビュー dock / ステータスバー)、
+            // 可変なものを 1 つずつ ON にして
+            //   (a) ペイン矩形の計算に使った矩形 == 実描画で採取した矩形（収束する）
+            //   (b) その要素が実際に高さを食っている（検査が空振りしていない）
+            //   (c) 各ペインのテキスト領域が実コンテナの内側に収まる
+            //   (d) PTY 最終行の座標がマウス変換でも最終行へ解決する（座標解像の一致）
+            //   (e) 全部 OFF に戻すと元の矩形へ戻る（= 閉じた瞬間に行数が追従する）
+            // を見る。ずれの訂正が振動しないことは corrections の増分で確認する
+            {
+                use crate::update_checker::{Channel, ChannelUpdates, UpdateInfo, UpdateState};
+                // 項目 78 でウィンドウを開き直しているので handle を取り直す（#381）。
+                // 以降の `any` / `window` はこのスコープのものを使う
+                let any = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window = any.downcast::<TakoApp>().unwrap_or(window);
+                // 状態を作る側（キャプチャ無しなので fn ポインタで置ける）
+                type HeightCase = (&'static str, fn(&mut TakoApp));
+                let cases: [HeightCase; 5] = [
+                    ("welcome-banner", |app| app.welcome_banner = true),
+                    ("update-card", |app| {
+                        app.update_card_dismissed = None;
+                        app.update_state = UpdateState::Available(ChannelUpdates {
+                            stable: Some(UpdateInfo {
+                                version: "99.0.0".into(),
+                                channel: Channel::Stable,
+                                html_url: "https://example.invalid/releases/v99.0.0".into(),
+                                download_url: None,
+                                asset_name: None,
+                                notes: None,
+                            }),
+                            test: None,
+                            rate_limit_note: None,
+                        });
+                    }),
+                    ("shelf-drawer", |app| app.drawer_visible = true),
+                    ("webview-dock", |app| app.webview_dock_open = true),
+                    ("all-at-once", |app| {
+                        app.welcome_banner = true;
+                        app.drawer_visible = true;
+                        app.webview_dock_open = true;
+                    }),
+                ];
+                let reset: fn(&mut TakoApp) = |app| {
+                    app.welcome_banner = false;
+                    app.drawer_visible = false;
+                    app.webview_dock_open = false;
+                    app.update_state = UpdateState::Idle;
+                };
+                // 実描画に依存する検査なので**フレームを明示的に回す**。GPUI は完全に
+                // 隠れたウィンドウの描画を止めるため、待つだけでは前の状態の採取結果が
+                // 凍結したまま返り、状態を変えても検査が空振りする（実際に踏んだ）。
+                // 1 枚目で新しい矩形を採取 → `App::defer` の訂正 notify → 2 枚目で反映。
+                // 3 枚回して余裕を持たせる（`wait` はこのスコープのクロージャなので
+                // 入れ子の fn には書けず、マクロで畳む）。
+                // draw は **AnyWindowHandle 経由**で呼ぶ（`WindowHandle::update` は
+                // root view を貸し出すので、その中の draw は二重貸し出しで abort する）
+                macro_rules! settled {
+                    () => {{
+                        for _ in 0..3 {
+                            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                        }
+                        let g = window
+                            .update(cx, |app, win, _| {
+                                app.pane_content
+                                    .get(&win.window_handle().window_id())
+                                    .copied()
+                            })
+                            .ok()
+                            .flatten();
+                        let seen = g.is_some_and(|g| g.measured.is_some());
+                        let out = g.and_then(|g| match (g.used, g.measured) {
+                            (Some(used), Some(measured))
+                                if !pane_content_rect_differs(used, measured) =>
+                            {
+                                Some((used, measured, g.corrections))
+                            }
+                            _ => None,
+                        });
+                        (out, seen)
+                    }};
+                }
+                let _ = window.update(cx, |app, _, cx| {
+                    reset(app);
+                    cx.notify();
+                });
+                let (baseline_geom, baseline_seen) = settled!();
+                if !baseline_seen {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 92（ペインコンテナが未描画。\
+                         ウィンドウを前面にして再実行すると検証できる）"
+                    );
+                }
+                match baseline_geom {
+                    None if !baseline_seen => {}
+                    None => check(
+                        false,
+                        "ペイン矩形の計算値が実描画のコンテナ矩形と一致する (#684)",
+                    ),
+                    Some((_, baseline, base_corrections)) => {
+                        let mut all_converged = true;
+                        let mut all_consumed = true;
+                        let mut all_inside = true;
+                        let mut all_mapped = true;
+                        let mut prev_corrections = base_corrections;
+                        let mut stable_corrections = true;
+                        for (label, apply) in cases {
+                            let _ = window.update(cx, |app, _, cx| {
+                                reset(app);
+                                apply(app);
+                                cx.notify();
+                            });
+                            let (geom, _) = settled!();
+                            let Some((used, measured, corrections)) = geom else {
+                                all_converged = false;
+                                eprintln!("TAKO_SELF_TEST_684: {label} 収束せず");
+                                continue;
+                            };
+                            // (b) 実際に高さを食っている（食っていなければ以下は空振り）
+                            let consumed =
+                                f32::from(measured.size.height) < f32::from(baseline.size.height);
+                            // (c)(d) 各ペインのテキスト領域と最終行の座標
+                            let (inside, mapped, note) = window
+                                .update(cx, |app, win, _| {
+                                    // サブライン端数（#159 のスムーススクロール）が残っていると
+                                    // 座標→行の変換が意図的に半行ずれるので、最下部へ戻して
+                                    // 端数を 0 にしてから見る（visual-test と同じ前処理）
+                                    for session in app.terminals.values() {
+                                        session.scroll_to_bottom();
+                                    }
+                                    let tab = app.display_tab_for(win);
+                                    let panes: Vec<PaneId> = app
+                                        .workspace
+                                        .get_tab(tab)
+                                        .map(|t| t.tree().panes().iter().map(|p| p.id()).collect())
+                                        .unwrap_or_default();
+                                    let mut inside = !panes.is_empty();
+                                    let mut mapped = !panes.is_empty();
+                                    let mut note = String::new();
+                                    for pane in panes {
+                                        let Some(area) = app
+                                            .pane_text_areas
+                                            .iter()
+                                            .find(|(id, _)| *id == pane)
+                                            .map(|(_, b)| *b)
+                                        else {
+                                            continue;
+                                        };
+                                        let cell = app.cell_size_for_pane(pane);
+                                        let rows = app
+                                            .terminals
+                                            .get(&pane)
+                                            .map(|s| s.size().1)
+                                            .unwrap_or(0);
+                                        inside &= f32::from(area.bottom())
+                                            <= f32::from(measured.bottom()) + 0.5
+                                            && f32::from(area.top())
+                                                >= f32::from(measured.top()) - 0.5;
+                                        // 「見えるべき最終行」の中心座標がマウス変換でも
+                                        // その行へ解決する。PTY の行数は下限 2 で
+                                        // クランプされる（`TerminalSession::resize`）ので、
+                                        // 領域に収まる行数の方が少ないときはそちらを見る
+                                        if let Some(cell) = cell {
+                                            let cell_h = f32::from(cell.height);
+                                            let fit = (f32::from(area.size.height) / cell_h)
+                                                .floor()
+                                                .max(0.0) as usize;
+                                            // 「見えるべき行」の中心座標が、マウス変換でも
+                                            // その行へ解決する（先頭行と最終行）。PTY の行数は
+                                            // 下限 2 でクランプされる（`TerminalSession::resize`）
+                                            // ので、領域に収まる行数の方が少ないときはそちら
+                                            let last = rows.min(fit);
+                                            let mut ng: Vec<String> = Vec::new();
+                                            for row in [0, last.saturating_sub(1)] {
+                                                if last == 0 {
+                                                    break;
+                                                }
+                                                let y = f32::from(area.origin.y)
+                                                    + cell_h * (row as f32 + 0.5);
+                                                let pos = point(area.origin.x + px(2.0), px(y));
+                                                let got = app.cell_at(pane, pos, win);
+                                                let ok = y <= f32::from(measured.bottom()) + 0.5
+                                                    && got.is_some_and(|(_, r, _)| r == row);
+                                                if !ok {
+                                                    ng.push(format!(
+                                                        "row={row} y={y:.1} got={:?}",
+                                                        got.map(|(_, r, _)| r)
+                                                    ));
+                                                }
+                                            }
+                                            if !ng.is_empty() {
+                                                mapped = false;
+                                                note = format!(
+                                                    "pane={} rows={rows} fit={fit} cell_h={cell_h:.1} \
+                                                     area=({:.1},{:.1},{:.1}x{:.1}) NG[{}]",
+                                                    pane.as_u64(),
+                                                    f32::from(area.origin.x),
+                                                    f32::from(area.origin.y),
+                                                    f32::from(area.size.width),
+                                                    f32::from(area.size.height),
+                                                    ng.join(" / ")
+                                                );
+                                            } else if note.is_empty() {
+                                                note = format!(
+                                                    "pane={} rows={rows} fit={fit} area_bottom={:.1} container_bottom={:.1}",
+                                                    pane.as_u64(),
+                                                    f32::from(area.bottom()),
+                                                    f32::from(measured.bottom())
+                                                );
+                                            }
+                                        }
+                                    }
+                                    (inside, mapped, note)
+                                })
+                                .unwrap_or((false, false, String::new()));
+                            // ずれの訂正は 1 往復（要素の出現ぶん）で収まる = 振動しない
+                            let delta = corrections.saturating_sub(prev_corrections);
+                            stable_corrections &= delta <= 2;
+                            prev_corrections = corrections;
+                            eprintln!(
+                                "TAKO_SELF_TEST_684: {label} used=({:.1},{:.1},{:.1}x{:.1}) \
+                                 container=({:.1},{:.1},{:.1}x{:.1}) baseline_h={:.1} \
+                                 corrections+{delta} {note}",
+                                f32::from(used.origin.x),
+                                f32::from(used.origin.y),
+                                f32::from(used.size.width),
+                                f32::from(used.size.height),
+                                f32::from(measured.origin.x),
+                                f32::from(measured.origin.y),
+                                f32::from(measured.size.width),
+                                f32::from(measured.size.height),
+                                f32::from(baseline.size.height),
+                            );
+                            all_consumed &= consumed;
+                            all_inside &= inside;
+                            all_mapped &= mapped;
+                        }
+                        // (f) 極端に低いウィンドウ + 全要素 ON でも壊れない
+                        // （コンテナが潰れても矩形は内側に収まり、行数は下限 2 でクランプ）
+                        let original = window.update(cx, |_, win, _| win.viewport_size()).ok();
+                        let low_ok = if let Some(original) = original {
+                            let _ = window.update(cx, |app, win, cx| {
+                                reset(app);
+                                app.welcome_banner = true;
+                                app.drawer_visible = true;
+                                app.webview_dock_open = true;
+                                win.resize(size(original.width, px(220.0)));
+                                cx.notify();
+                            });
+                            // ウィンドウのリサイズは OS 経由で非同期に届くので反映を待つ
+                            let mut applied = false;
+                            for _ in 0..20 {
+                                wait(cx, 100).await;
+                                let _ = settled!();
+                                applied = window
+                                    .update(cx, |_, win, _| {
+                                        f32::from(win.viewport_size().height) <= 260.0
+                                    })
+                                    .unwrap_or(false);
+                                if applied {
+                                    break;
+                                }
+                            }
+                            eprintln!("TAKO_SELF_TEST_684: low-window resize_applied={applied}");
+                            let ok = match settled!().0 {
+                                Some((used, measured, _)) => window
+                                    .update(cx, |app, _, _| {
+                                        let pane = app.focused_pane();
+                                        let rows = app
+                                            .terminals
+                                            .get(&pane)
+                                            .map(|s| s.size().1)
+                                            .unwrap_or(0);
+                                        let area = app
+                                            .pane_text_areas
+                                            .iter()
+                                            .find(|(id, _)| *id == pane)
+                                            .map(|(_, b)| *b);
+                                        eprintln!(
+                                            "TAKO_SELF_TEST_684: low-window container_h={:.1} rows={rows}",
+                                            f32::from(measured.size.height)
+                                        );
+                                        rows >= 2
+                                            && !pane_content_rect_differs(used, measured)
+                                            && area.is_some_and(|a| {
+                                                f32::from(a.bottom())
+                                                    <= f32::from(measured.bottom()) + 0.5
+                                            })
+                                    })
+                                    .unwrap_or(false),
+                                None => false,
+                            };
+                            let _ = window.update(cx, |app, win, cx| {
+                                reset(app);
+                                win.resize(original);
+                                cx.notify();
+                            });
+                            for _ in 0..20 {
+                                wait(cx, 100).await;
+                                let _ = settled!();
+                                let back = window
+                                    .update(cx, |_, win, _| {
+                                        (f32::from(win.viewport_size().height)
+                                            - f32::from(original.height))
+                                        .abs()
+                                            <= 1.0
+                                    })
+                                    .unwrap_or(false);
+                                if back {
+                                    break;
+                                }
+                            }
+                            ok
+                        } else {
+                            false
+                        };
+                        // (e) 全部 OFF で元の矩形へ戻る（閉じた瞬間に行数が追従する）
+                        let _ = window.update(cx, |app, _, cx| {
+                            reset(app);
+                            cx.notify();
+                        });
+                        let restored = match settled!().0 {
+                            Some((_, measured, _)) => {
+                                !pane_content_rect_differs(baseline, measured)
+                            }
+                            None => false,
+                        };
+                        check(
+                            all_converged,
+                            "ペイン矩形の計算値が実描画のコンテナ矩形と一致する (#684)",
+                        );
+                        check(
+                            all_consumed,
+                            "検査対象の要素が実際に高さを食っている（空振りでない）(#684)",
+                        );
+                        check(
+                            all_inside,
+                            "テキスト領域が実コンテナの内側に収まる = 画面外の行が無い (#684)",
+                        );
+                        check(
+                            all_mapped,
+                            "PTY 最終行の座標がマウス変換でも最終行へ解決する (#684)",
+                        );
+                        check(
+                            stable_corrections,
+                            "矩形の訂正が 1 往復で収束する（振動しない）(#684)",
+                        );
+                        check(
+                            low_ok,
+                            "極端に低いウィンドウ + 全要素 ON でも矩形が内側に収まる (#684)",
+                        );
+                        check(restored, "要素を閉じると矩形が元へ戻る = 行数が追従する (#684)");
+                    }
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -29808,5 +30514,157 @@ mod app_menu_tests {
             assert!(ks.modifiers.platform, "{action} は cmd 修飾");
             assert_eq!(ks.modifiers.alt, alt, "{action} の alt 修飾");
         }
+    }
+}
+
+/// ペイン矩形の基準になるコンテナ矩形の扱い（#684）。
+///
+/// `render()` はレイアウト前に走るので「ビューポートからの引き算」は推定にしかならず、
+/// 縦に積まれる要素（ウェルカムバナー / アップデート通知カード / たまり場ドロワー /
+/// Web ビュー dock）の高さが抜けると PTY の行数が可視行数を超える。
+/// 実描画で採取した矩形を正として使うこと自体を、ここで構造的に固定する
+#[cfg(test)]
+mod pane_content_geometry_tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
+
+    #[test]
+    fn 一致とサブピクセルの揺れでは再描画を要求しない() {
+        let used = rect(0.0, 44.0, 1200.0, 700.0);
+        assert!(!pane_content_rect_differs(used, used), "完全一致");
+        // 0.5px 以下（2x Retina の 1 物理ピクセル未満）は無視する。
+        // ここで拾うと毎フレーム再描画を要求し続けることになる
+        assert!(
+            !pane_content_rect_differs(used, rect(0.4, 44.3, 1199.7, 700.4)),
+            "サブピクセルの揺れ"
+        );
+    }
+
+    #[test]
+    fn 四辺のいずれのずれも検出する() {
+        let used = rect(0.0, 44.0, 1200.0, 700.0);
+        for (label, measured) in [
+            ("サイドバー出現", rect(240.0, 44.0, 960.0, 700.0)),
+            ("バナー出現で原点が下がる", rect(0.0, 112.0, 1200.0, 632.0)),
+            ("右パネル出現で幅が縮む", rect(0.0, 44.0, 900.0, 700.0)),
+            ("ドロワー展開で高さが縮む", rect(0.0, 44.0, 1200.0, 460.0)),
+        ] {
+            assert!(
+                pane_content_rect_differs(used, measured),
+                "{label} を検出できない"
+            );
+        }
+    }
+
+    #[test]
+    fn ずれた実測は一度だけ再描画を要求し収束したら要求しない() {
+        let probe = PaneContentProbe::default();
+        let baseline = rect(0.0, 44.0, 1200.0, 732.0);
+        let banner = rect(0.0, 153.0, 1200.0, 623.0);
+        // 推定値で描いてしまったフレームへ、バナーぶん縮んだ実測が来る
+        assert!(probe.record(baseline, banner), "ずれたら再描画を要求する");
+        assert_eq!(probe.measured.get(), Some(banner));
+        // 同じ実測が続くあいだは再要求しない（収束しない経路の安全弁）
+        assert!(
+            !probe.record(baseline, banner),
+            "同じ実測値で再要求しない（vsync ごとの再描画へ落ちない）"
+        );
+        // 実測を使って描き直せば収束する
+        assert!(!probe.record(banner, banner), "収束したら要求しない");
+        // バナーを閉じて元へ戻る = 以前要求した値と同じでも改めて要求できる
+        assert!(probe.record(banner, baseline), "閉じた側への戻りも要求する");
+    }
+
+    #[test]
+    fn 実測がペインと同じコンテナで採取され推定は初回フレームだけに使われる() {
+        // 空白を畳んで走査する（rustfmt の改行位置に依存させない）。
+        // 探す文字列は組み立てる（この検査自身のソースに一致してしまうのを防ぐ）
+        let source = include_str!("main.rs");
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        // プローブはペインとまったく同じ div の子でなければならない
+        // （別のコンテナへ移すと測る箱が変わり #684 が再発する）
+        let probe = format!(".child({}) .children(panes)", "content_probe");
+        assert!(
+            flat.contains(&probe),
+            "実測プローブがペインと同じコンテナに無い"
+        );
+        // ジオメトリの式は 1 か所だけ（推定は measured が無いときのフォールバック）
+        let formula = format!("viewport.height - px({})", "TAB_BAR_HEIGHT");
+        assert_eq!(
+            flat.matches(&formula).count(),
+            1,
+            "ペイン矩形の高さを手計算する式が増えている"
+        );
+        let fallback = format!("unwrap_or({})", "estimated");
+        assert_eq!(
+            flat.matches(&fallback).count(),
+            1,
+            "推定値がフォールバック以外で使われている"
+        );
+    }
+
+    #[test]
+    fn プローブは描画中にエンティティを触らない() {
+        // 描画は root view が貸し出されている最中に走ることがあり
+        // （`WindowHandle::update` の中から `Window::draw` を呼ぶ経路）、そこで
+        // `Entity::update` を呼ぶと abort する = 全ペイン消失。実際に踏んだので、
+        // プローブのクロージャが entity を直接触らないことを構造として固定する
+        let source = include_str!("main.rs");
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let probe_body = flat
+            .split(&format!("let {} = {{", "content_probe"))
+            .nth(1)
+            .and_then(|rest| rest.split(".size_full() };").next())
+            .expect("プローブの定義が見つからない");
+        // 採取は Cell への書き込みだけ。entity へ触るのは defer の中（貸し出しが解けた後）
+        let deferred = probe_body.split("cx.defer").nth(1).unwrap_or("");
+        let outside = probe_body.split("cx.defer").next().unwrap_or("");
+        assert!(
+            outside.contains(&format!("{}.record(used, bounds)", "slot")),
+            "採取が Cell 経由でない"
+        );
+        assert!(
+            !outside.contains("entity.update"),
+            "描画中に entity を触っている（abort の原因になる）"
+        );
+        assert!(
+            deferred.contains("entity.update"),
+            "再描画要求が defer 経由でない"
+        );
+    }
+
+    /// ルートの flex 列に積まれる「高さを食う子」の棚卸し（#684 受け入れ条件 3）。
+    /// 新しい要素が増えても実測経路が正なので破綻しないが、
+    /// **absolute を付け忘れたオーバーレイ**は静かに高さを食うので、
+    /// 積まれる要素の一覧が想定どおりであることを固定する
+    #[test]
+    fn ルートに積まれる高さを食う要素は想定どおり() {
+        let source = include_str!("main.rs");
+        let render = source
+            .split(".child(self.render_tab_bar(window, cx))")
+            .nth(1)
+            .expect("ルート render が見つからない");
+        let render = render
+            .split(".child(ime_registration)")
+            .next()
+            .expect("ルート render の終端が見つからない");
+        let stacked: Vec<&str> = [
+            "render_welcome_banner",
+            "render_update_card",
+            "render_drawer",
+            "render_webview_dock",
+            "render_status_bar",
+        ]
+        .into_iter()
+        .filter(|name| render.contains(name))
+        .collect();
+        assert_eq!(
+            stacked.len(),
+            5,
+            "積まれる要素が変わっている: {stacked:?}（実測経路の検証対象を見直すこと）"
+        );
     }
 }
