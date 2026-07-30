@@ -11,6 +11,7 @@ pub mod git;
 pub mod header_layout;
 pub mod i18n;
 pub mod links;
+pub mod md_links;
 pub mod osc_tap;
 pub mod pane;
 pub mod pane_log;
@@ -51,6 +52,7 @@ pub use git::{
 };
 pub use header_layout::{truncate_path_middle, HeaderVisibility, PreviewHeaderVisibility};
 pub use links::{detect_links, detect_links_with_cwd, link_at, DetectedLink, LinkKind};
+pub use md_links::MdLink;
 pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
 pub use pane_tree::{

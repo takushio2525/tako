@@ -14,7 +14,12 @@ use super::*;
 pub(crate) struct MdLineSel {
     sel_range: Option<(usize, usize)>,
     hit_ranges: Vec<(usize, usize, bool)>,
+    /// ⌘ 押下中にホバーしているリンクのバイト範囲（#680。この行に無ければ None）
+    hovered_link: Option<std::ops::Range<usize>>,
 }
+
+/// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
+pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(2200);
 
 /// PDF / 画像 / 動画サムネの描画用 gpui::Image キャッシュ（Issue #168）。
 /// `gpui::Image::from_bytes` は id 生成のために全バイトのハッシュを計算するので、
@@ -1053,6 +1058,8 @@ impl TakoApp {
         // Code / Markdown は StyledText 自身の TextLayout を保持し、ヒットテストと
         // キャレット描画を実際の shaping 結果に一致させる。
         let mut line_layouts: Vec<Option<TextLayout>> = Vec::new();
+        // Markdown のリンク当たり判定（#680。md 以外は None = 前フレームの残骸を消す）
+        let mut md_link_hits: Option<Vec<MdLinkHit>> = None;
 
         // 検索ヒット情報（ハイライト描画用）
         let search_hits = edit_snap
@@ -1129,6 +1136,18 @@ impl TakoApp {
                     // 保つ（目次ジャンプ #232 がブロック番号で子要素を指すため）
                     let mut doc_offset: usize = 0;
                     let mut line_index: usize = 0;
+                    // #680: リンクの当たり判定（行・バイト範囲・遷移先）を選択と同じ
+                    // 座標系で集める。コードブロックはコピー用に出現順で番号を振る
+                    let mut code_blocks: usize = 0;
+                    let hovered = self
+                        .preview_md_hovered_link
+                        .filter(|(pid, _)| *pid == pane_id)
+                        .and_then(|(_, idx)| {
+                            self.preview_md_link_hits
+                                .get(&pane_id)
+                                .and_then(|links| links.get(idx))
+                                .map(|hit| (hit.line, hit.range.clone()))
+                        });
                     let mut elements: Vec<gpui::AnyElement> = Vec::with_capacity(blocks.len());
                     for block in blocks.iter() {
                         let texts = md_block_line_texts(block);
@@ -1145,17 +1164,33 @@ impl TakoApp {
                                     search_hits_for_line(hits, idx, line_start, line_end)
                                 })
                                 .unwrap_or_default();
+                            let hovered_link = hovered
+                                .as_ref()
+                                .filter(|(line, _)| *line == line_index)
+                                .map(|(_, range)| range.clone());
                             line_index += 1;
                             line_texts.push(text);
                             sels.push(MdLineSel {
                                 sel_range,
                                 hit_ranges,
+                                hovered_link,
                             });
                         }
-                        let (element, layouts) = self.preview_md_block_sel(block, &sels);
+                        let code_index =
+                            matches!(block.kind, preview::MdBlockKind::CodeBlock { .. }).then(
+                                || {
+                                    code_blocks += 1;
+                                    code_blocks - 1
+                                },
+                            );
+                        let (element, layouts) =
+                            self.preview_md_block_sel(pane_id, block, &sels, code_index, cx);
                         line_layouts.extend(layouts);
                         elements.push(element);
                     }
+                    // 当たり判定は「render とまったく同じ並び」でなければ索引が
+                    // 食い違うので、CLI / MCP 一覧と同じ純関数から作る（#680）
+                    md_link_hits = Some(md_document_links(blocks));
                     elements
                 }
                 preview::PreviewContent::Image(_) => {
@@ -2919,6 +2954,10 @@ impl TakoApp {
                 // 古い bounds は同じフレームの paint で上書きされるため実害なし。
                 // ペイン削除時は remove_pane_with で除去される。
                 self.preview_text_layouts.insert(pane_id, line_layouts);
+                // #680: md 以外のプレビューへ切り替わったら当たり判定も空にする
+                // （行番号は content ごとに意味が変わるため、残すと誤ヒットになる）
+                self.preview_md_link_hits
+                    .insert(pane_id, md_link_hits.take().unwrap_or_default());
                 let scroll_handle = self
                     .preview_scroll_handles
                     .entry(pane_id)
@@ -2938,6 +2977,9 @@ impl TakoApp {
                         if self
                             .preview_pdf_hovered_link
                             .is_some_and(|(pid, _)| pid == pane_id)
+                            || self
+                                .preview_md_hovered_link
+                                .is_some_and(|(pid, _)| pid == pane_id)
                         {
                             CursorStyle::PointingHand
                         } else if mode == preview::PreviewMode::Image {
@@ -3013,6 +3055,22 @@ impl TakoApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            // ⌘クリック: Markdown リンクを既定ブラウザで開く（#680）。
+                            // ホバー状態を優先し、⌘ 単独押下の直後（ホバー未更新）でも
+                            // 位置から引き直して開く
+                            if ev.modifiers.platform && ev.click_count == 1 {
+                                let md_index = this
+                                    .preview_md_hovered_link
+                                    .filter(|(pid, _)| *pid == pane_id)
+                                    .map(|(_, idx)| idx)
+                                    .or_else(|| this.md_link_at_position(pane_id, ev.position));
+                                if let Some(index) = md_index {
+                                    this.open_md_link(pane_id, index);
+                                    this.preview_md_hovered_link = None;
+                                    cx.notify();
+                                    return;
+                                }
+                            }
                             // ⌘クリック: PDF リンクを開く（#271）
                             if ev.modifiers.platform && ev.click_count == 1 {
                                 if let Some(link_idx) = this.preview_pdf_hovered_link
@@ -3115,6 +3173,7 @@ impl TakoApp {
     fn preview_md_text(
         &self,
         spans: &[preview::MdSpan],
+        hovered_link: Option<&std::ops::Range<usize>>,
     ) -> (String, Vec<(std::ops::Range<usize>, HighlightStyle)>) {
         let theme = &self.theme;
         let mut text = String::new();
@@ -3122,7 +3181,8 @@ impl TakoApp {
         for span in spans {
             let start = text.len();
             text.push_str(&span.text);
-            let styled = span.bold || span.italic || span.code || span.strike || span.link;
+            let is_link = span.is_link();
+            let styled = span.bold || span.italic || span.code || span.strike || is_link;
             if !styled {
                 continue;
             }
@@ -3131,7 +3191,7 @@ impl TakoApp {
                 HighlightStyle {
                     color: if span.code {
                         Some(hsla(theme.peach))
-                    } else if span.link {
+                    } else if is_link {
                         Some(hsla(theme.accent))
                     } else if span.strike {
                         Some(hsla(theme.text_muted))
@@ -3141,7 +3201,7 @@ impl TakoApp {
                     background_color: span.code.then(|| hsla_alpha(theme.surface_highlight, 0.75)),
                     font_weight: span.bold.then_some(FontWeight::BOLD),
                     font_style: span.italic.then_some(FontStyle::Italic),
-                    underline: span.link.then(|| UnderlineStyle {
+                    underline: is_link.then(|| UnderlineStyle {
                         thickness: px(1.0),
                         color: Some(hsla_alpha(theme.accent, 0.6)),
                         wavy: false,
@@ -3153,6 +3213,27 @@ impl TakoApp {
                     ..HighlightStyle::default()
                 },
             ));
+        }
+        // ⌘+ホバー中のリンクだけ「押せる」ことが分かる装飾へ強める（#680）。
+        // ターミナル内リンク（#153）と同じ = 下線を実線化 + accent 背景を
+        // リンク文字列だけに限定する。merge_highlights は後の指定が勝つ
+        if let Some(range) = hovered_link {
+            let end = range.end.min(text.len());
+            if range.start < end {
+                highlights.push((
+                    range.start..end,
+                    HighlightStyle {
+                        color: Some(hsla(theme.accent)),
+                        background_color: Some(hsla_alpha(theme.accent, 0.18)),
+                        underline: Some(UnderlineStyle {
+                            thickness: px(1.5),
+                            color: Some(hsla(theme.accent)),
+                            wavy: false,
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
         }
         (text, highlights)
     }
@@ -3294,8 +3375,11 @@ impl TakoApp {
     /// 表だけが 1 ブロック = 複数行（セル）になる（Issue #656）。
     fn preview_md_block_sel(
         &self,
+        pane_id: PaneId,
         block: &preview::MdBlock,
         lines: &[MdLineSel],
+        code_index: Option<usize>,
+        cx: &mut Context<Self>,
     ) -> (gpui::AnyElement, Vec<Option<TextLayout>>) {
         let theme = self.theme.clone();
         let base = theme.font_size;
@@ -3351,7 +3435,7 @@ impl TakoApp {
                            sel: &MdLineSel,
                            color: tako_core::Rgb,
                            weight: Option<FontWeight>| {
-            let (mut text, mut highlights) = self.preview_md_text(spans);
+            let (mut text, mut highlights) = self.preview_md_text(spans, sel.hovered_link.as_ref());
             add_search_and_sel(&mut highlights, &text, sel);
             if text.is_empty() {
                 // 空セル・空項目でも 1 行分の高さと選択の当たり判定を残す
@@ -3549,9 +3633,15 @@ impl TakoApp {
                     merge_highlights(highlights),
                 );
                 let layout = styled.layout().clone();
+                let group = SharedString::from(format!(
+                    "md-code-{}-{}",
+                    pane_id.as_u64(),
+                    code_index.unwrap_or(usize::MAX)
+                ));
                 let element = div()
                     .relative()
                     .flex_shrink_0()
+                    .group(group.clone())
                     .my(px(base * 0.5))
                     .px(px(base * 0.8))
                     .py(px(base * 0.55))
@@ -3562,6 +3652,10 @@ impl TakoApp {
                     .text_size(px(base * 0.95))
                     .line_height(px(base * 1.45))
                     .child(styled)
+                    .children(
+                        code_index
+                            .map(|index| self.md_code_copy_button(pane_id, index, group, base, cx)),
+                    )
                     .into_any_element();
                 (element, vec![Some(layout)])
             }
@@ -3606,6 +3700,107 @@ impl TakoApp {
                 .into_any_element();
         }
         (element, layouts)
+    }
+
+    /// コードブロック右上のコピーボタン（#680）。
+    ///
+    /// 常時表示だが待機中はアイコンのみ・淡色で控えめにし、ホバーとコピー直後だけ
+    /// 濃くする。**「ホバーで初めて現れる」方式（`opacity(0)` + `group_hover`）は
+    /// 採らない**: 実機（隔離 GUI + 実マウス）でホバーしても復帰せず、ボタンが
+    /// 一度も見えないことを実測したため。見えないボタンは押せないので常時表示が正。
+    /// コピー本体は CLI / MCP と同じ `copy_preview_code_block` を通す（開発不変条件）
+    fn md_code_copy_button(
+        &self,
+        pane_id: PaneId,
+        index: usize,
+        group: SharedString,
+        base: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = &self.theme;
+        let copied = self.preview_md_copied.is_some_and(|(pid, i, at)| {
+            pid == pane_id && i == index && at.elapsed() < MD_COPY_FEEDBACK
+        });
+        let (icon, color) = if copied {
+            (crate::file_icons::ui_icon::CHECK, theme.green)
+        } else {
+            (crate::file_icons::ui_icon::COPY, theme.text_secondary)
+        };
+        let icon_size = base * 0.85;
+        div()
+            .id(("md-code-copy", (pane_id.as_u64() << 20) | index as u64))
+            .absolute()
+            .top(px(base * 0.25))
+            .right(px(base * 0.25))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(base * 0.3))
+            .px(px(base * 0.4))
+            .py(px(base * 0.2))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(hsla_alpha(
+                if copied {
+                    theme.green
+                } else {
+                    theme.border_default
+                },
+                if copied { 1.0 } else { 0.7 },
+            ))
+            .bg(hsla_alpha(
+                theme.surface_highlight,
+                if copied { 1.0 } else { 0.8 },
+            ))
+            .text_size(px(base * 0.78))
+            .line_height(px(base))
+            .text_color(hsla(color))
+            // 常時表示だが控えめ（アイコンのみ・淡色）。ホバー・コピー直後だけ濃くする。
+            // 「ホバーで初めて現れる」方式（opacity 0 + group_hover）は GPUI で
+            // 実機のホバー復帰が発火しないことを実測したので採らない（#680）
+            .opacity(if copied { 1.0 } else { 0.55 })
+            .group_hover(group, |d| d.opacity(1.0))
+            .hover(|d| d.opacity(1.0).bg(hsla(theme.surface_hover)))
+            .cursor(CursorStyle::PointingHand)
+            .child(
+                svg()
+                    .path(icon)
+                    .w(px(icon_size))
+                    .h(px(icon_size))
+                    .flex_none()
+                    .text_color(hsla(color)),
+            )
+            // 待機中はアイコンだけ（狭いペインで本文へ被る面積を最小にする）。
+            // コピー直後は文字で成功をはっきり伝える
+            .children(copied.then(|| SharedString::from(crate::ui_text::preview::code_copied())))
+            // 下のプレビューでテキスト選択が始まらないようにする（他のボタンと同じ）
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match this.copy_preview_code_block(pane_id, Some(index)) {
+                    Ok(_) => this.flush_pending_clipboard(cx),
+                    Err(e) => eprintln!("warning: コードブロックのコピーに失敗: {e}"),
+                }
+                // フィードバックの終わりで元の見た目へ戻す（2 秒ポーリング待ちにしない）
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(MD_COPY_FEEDBACK).await;
+                    let _ = this.update(cx, |app, cx| {
+                        if app
+                            .preview_md_copied
+                            .is_some_and(|(_, _, at)| at.elapsed() >= MD_COPY_FEEDBACK)
+                        {
+                            app.preview_md_copied = None;
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// GFM テーブルを罫線つきグリッドで描く（Issue #656）。

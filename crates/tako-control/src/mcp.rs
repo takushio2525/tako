@@ -814,27 +814,43 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_link_list",
-            "description": "PDF プレビュー内のリンク（外部 URL・内部ページ参照）を一覧する。\
-                ページインデックスは 0 始まり、リンクの index は follow-link で使う。",
+            "description": "プレビュー内のリンクを一覧する。Markdown なら [text](url) のリンク\
+                （kind=markdown。text / url / openable / line）、PDF なら注釈リンク（kind=pdf。\
+                外部 URL・内部ページ参照）。リンクの index は follow-link で使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": pane_schema("対象 PDF プレビューペイン ID（省略時は呼び出し元）"),
+                    "pane": pane_schema("対象 Markdown・PDF プレビューペイン ID（省略時は呼び出し元）"),
                 },
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "tako_preview_follow_link",
-            "description": "PDF プレビュー内のリンクをフォローする。外部 URL はブラウザで開き、\
-                内部リンクは該当ページへジャンプする。index は link-list の結果で得られる 0 始まりインデックス。",
+            "description": "プレビュー内のリンクをフォローする。URL は OS 既定ブラウザで開き\
+                （http / https のみ。それ以外はエラー）、PDF の内部リンクは該当ページへジャンプする。\
+                index は link-list の結果で得られる 0 始まりインデックス。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": pane_schema("対象 PDF プレビューペイン ID（省略時は呼び出し元）"),
+                    "pane": pane_schema("対象 Markdown・PDF プレビューペイン ID（省略時は呼び出し元）"),
                     "index": { "type": "integer", "minimum": 0, "description": "フォローするリンクのインデックス（0 始まり）" },
                 },
                 "required": ["index"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_copy_code",
+            "description": "Markdown プレビューのコードブロック全文（装飾なし・インデントと空行を保持）を\
+                クリップボードへ入れる。UI のコピーボタンと同じ経路。index は出現順の 0 始まり（省略時は先頭）。\
+                応答にコピーした text も含む。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象 Markdown プレビューペイン ID（省略時は呼び出し元）"),
+                    "index": { "type": "integer", "minimum": 0, "description": "コードブロックの出現順（0 始まり。省略時は先頭）" },
+                },
                 "additionalProperties": false,
             },
         }),
@@ -3487,6 +3503,10 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             index: u64_arg(args, "index")?.ok_or("index を指定する")? as usize,
         },
+        "tako_preview_copy_code" => Request::PreviewCopyCode {
+            pane: Some(target_pane(args, caller)?),
+            index: u64_arg(args, "index")?.map(|index| index as usize),
+        },
         "tako_preview_reload" => Request::PreviewReload {
             enabled: bool_arg(args, "enabled")?,
         },
@@ -4970,7 +4990,8 @@ mod tests {
         // 125 → 126 へ更新したため、両方 merge 後の main では 127 とずれていた
         // #513 の tako_config_share を追加して 129
         // #666 の tako_show_command を追加して 130
-        assert_eq!(tools.len(), 130);
+        // #680 の tako_preview_copy_code を追加して 131
+        assert_eq!(tools.len(), 131);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

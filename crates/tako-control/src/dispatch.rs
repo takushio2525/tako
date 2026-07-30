@@ -1752,21 +1752,41 @@ fn dispatch_inner(
         }
         Request::PreviewLinkList { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
+            // Markdown（#680）と PDF（#271）でリンクの持ち方が違うので、表示中の
+            // 内容に合わせて一覧を出し分ける（応答の `kind` でどちらか分かる）
+            if let Some(links) = host.preview_md_links(target) {
+                return Ok(json!({
+                    "pane": target.as_u64(),
+                    "kind": "markdown",
+                    "links": links,
+                }));
+            }
             let links = host.preview_pdf_links(target).ok_or_else(|| {
                 DispatchError::Operation(format!(
-                    "PDF プレビューペインではない: {}",
+                    "Markdown・PDF プレビューペインではない: {}",
                     target.as_u64()
                 ))
             })?;
             Ok(json!({
                 "pane": target.as_u64(),
+                "kind": "pdf",
                 "links": links.links,
             }))
         }
         Request::PreviewFollowLink { pane, index } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = if host.preview_md_links(target).is_some() {
+                host.follow_preview_md_link(target, index)
+            } else {
+                host.follow_preview_pdf_link(target, index)
+            }
+            .map_err(DispatchError::Operation)?;
+            Ok(result)
+        }
+        Request::PreviewCopyCode { pane, index } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
             let result = host
-                .follow_preview_pdf_link(target, index)
+                .copy_preview_code_block(target, index)
                 .map_err(DispatchError::Operation)?;
             Ok(result)
         }

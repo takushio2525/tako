@@ -834,6 +834,14 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        key: "tako_preview_copy_code",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_PREVIEW,
+            issue: 521,
+        },
+    },
+    Feature {
         key: "tako_preview_edit",
         macos: Support::Supported,
         windows: Support::Pending {
