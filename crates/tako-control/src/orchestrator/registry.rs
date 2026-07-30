@@ -420,13 +420,29 @@ pub fn resend_command(entry: &WorkerEntry) -> Option<String> {
 
 /// レジストリの session ID から復旧コマンドを組み立てる（#390: SIGSEGV 等の
 /// 突然死からの復旧提示）。claude のみ（--resume の互換が確認できているのは claude）。
-/// master はこのコマンドを死んだペインのシェルへ send_input するか、新ペインで実行する
+/// master はこのコマンドを死んだペインのシェルへ send_input するか、新ペインで実行する。
+///
+/// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する
+/// （`--account` で spawn した worker の会話は `~/.claude` に無い。Issue #652）
 pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
+    let env_prefix = entry
+        .session_id
+        .as_deref()
+        .filter(|_| entry.agent == "claude")
+        .and_then(crate::transcript::resume_env_prefix);
+    resume_command_with_env(entry, env_prefix.as_deref())
+}
+
+/// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
+fn resume_command_with_env(entry: &WorkerEntry, env_prefix: Option<&str>) -> Option<String> {
     if entry.agent != "claude" {
         return None;
     }
     let sid = entry.session_id.as_deref()?;
     let mut cmd = String::new();
+    if let Some(prefix) = env_prefix {
+        cmd.push_str(prefix);
+    }
     if let Some(cwd) = entry.cwd.as_deref().filter(|c| !c.is_empty()) {
         cmd.push_str(&format!("cd '{}' && ", cwd.replace('\'', "'\\''")));
     }
@@ -891,7 +907,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resume_command(&entry).as_deref(),
+            resume_command_with_env(&entry, None).as_deref(),
             Some("cd '/tmp/proj' && claude --model opus --effort high --resume abc-123")
         );
         // model / effort / cwd 省略時は最簡形
@@ -901,7 +917,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resume_command(&minimal).as_deref(),
+            resume_command_with_env(&minimal, None).as_deref(),
             Some("claude --resume abc-123")
         );
         // session 未検出 / claude 以外は None
@@ -909,13 +925,36 @@ mod tests {
             agent: "claude".into(),
             ..Default::default()
         };
-        assert!(resume_command(&no_sid).is_none());
+        assert!(resume_command_with_env(&no_sid, None).is_none());
         let codex = WorkerEntry {
             agent: "codex".into(),
             session_id: Some("abc".into()),
             ..Default::default()
         };
-        assert!(resume_command(&codex).is_none());
+        assert!(resume_command_with_env(&codex, None).is_none());
+    }
+
+    /// Issue #652: `--account` で spawn した worker の会話は別 config ディレクトリに
+    /// あるため、突然死からの復旧コマンドにも `CLAUDE_CONFIG_DIR` の前置が要る
+    #[test]
+    fn resume_commandはconfigdirを先頭に前置する() {
+        let entry = WorkerEntry {
+            agent: "claude".into(),
+            session_id: Some("abc-123".into()),
+            cwd: Some("/tmp/proj".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_command_with_env(
+                &entry,
+                Some("export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; ")
+            )
+            .as_deref(),
+            Some(
+                "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; \
+                 cd '/tmp/proj' && claude --resume abc-123"
+            )
+        );
     }
 
     #[test]

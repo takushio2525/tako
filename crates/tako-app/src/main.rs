@@ -78,16 +78,21 @@ const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
 /// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
+///
+/// `env_prefix` は transcript の所在から決まる `CLAUDE_CONFIG_DIR` の指定
+/// （`tako_control::transcript::resume_env_prefix`）。`None` = transcript が
+/// 見つからない = 会話が残っていないので resume しない（Issue #652）
 fn claude_resume_command(
     backend_alive: bool,
     session_id: Option<&str>,
-    transcript_exists: bool,
+    env_prefix: Option<&str>,
 ) -> Option<Vec<u8>> {
-    let session_id = (!backend_alive && transcript_exists)
+    let session_id = (!backend_alive)
         .then_some(session_id)
         .flatten()
         .filter(|id| tako_control::transcript::is_valid_session_id(id))?;
-    Some(format!("claude --resume {session_id}\r").into_bytes())
+    let env_prefix = env_prefix?;
+    Some(format!("{env_prefix}claude --resume {session_id}\r").into_bytes())
 }
 
 /// タブバーの高さ（px）
@@ -2569,14 +2574,17 @@ impl TakoApp {
                     app.pane_logs_lock()
                         .seed_history(pane.as_u64(), &meta, history as usize);
                 }
-                let transcript_exists = r
+                // transcript の所在から resume 時の CLAUDE_CONFIG_DIR を決める（Issue #652）。
+                // アカウント（#504）のペインは会話が `~/.claude` に無いため、
+                // 既定 config dir のままだと会話が見つからず新規シェルに落ちていた
+                let resume_env = r
                     .claude_session_id
                     .as_deref()
-                    .is_some_and(|id| tako_control::transcript::find_transcript(id).is_some());
+                    .and_then(tako_control::transcript::resume_env_prefix);
                 let resume_command = claude_resume_command(
                     backend_alive,
                     r.claude_session_id.as_deref(),
-                    transcript_exists,
+                    resume_env.as_deref(),
                 );
                 if let Some(session_id) = &r.claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
@@ -26894,16 +26902,38 @@ mod persist_resume_tests {
     #[test]
     fn backend消失時だけ検証済みclaudeをresumeする() {
         let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
+        let default_env = "unset CLAUDE_CONFIG_DIR; ";
         assert_eq!(
-            claude_resume_command(false, Some(id), true),
-            Some(format!("claude --resume {id}\r").into_bytes())
+            claude_resume_command(false, Some(id), Some(default_env)),
+            Some(format!("{default_env}claude --resume {id}\r").into_bytes())
         );
         // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
-        assert_eq!(claude_resume_command(true, Some(id), true), None);
-        // transcript 不在・不正 ID・ID 不明を推測で起動しない
-        assert_eq!(claude_resume_command(false, Some(id), false), None);
-        assert_eq!(claude_resume_command(false, Some("../../bad"), true), None);
-        assert_eq!(claude_resume_command(false, None, true), None);
+        assert_eq!(
+            claude_resume_command(true, Some(id), Some(default_env)),
+            None
+        );
+        // transcript 不在（= env プレフィクス不明）・不正 ID・ID 不明を推測で起動しない
+        assert_eq!(claude_resume_command(false, Some(id), None), None);
+        assert_eq!(
+            claude_resume_command(false, Some("../../bad"), Some(default_env)),
+            None
+        );
+        assert_eq!(claude_resume_command(false, None, Some(default_env)), None);
+    }
+
+    /// Issue #652: アカウント（`CLAUDE_CONFIG_DIR`）のペインは、その config
+    /// ディレクトリを明示しないと `No conversation found` で resume に失敗する
+    #[test]
+    fn アカウントのconfigdirをresumeコマンドへ前置する() {
+        let id = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
+        let env = "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; ";
+        assert_eq!(
+            claude_resume_command(false, Some(id), Some(env)),
+            Some(
+                format!("export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; claude --resume {id}\r")
+                    .into_bytes()
+            )
+        );
     }
 }
 
