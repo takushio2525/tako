@@ -1272,6 +1272,9 @@ struct TakoApp {
     command_card_copied: Option<(u64, usize, std::time::Instant)>,
     /// カード操作の失敗表示（#666。`(カード ID, 表示開始時刻)`。理由は診断ログへ）
     command_card_error: Option<(u64, std::time::Instant)>,
+    /// カードのアンカー（#681。カード ID → 生成時点のターミナル内容に紐付く位置）。
+    /// 揮発（カードと同じ寿命）で、初回描画時に採取する
+    card_anchors: HashMap<u64, command_card_ui::CardAnchorState>,
 }
 
 /// × ボタン / cmd+W close の確認ダイアログ対象（Issue #172）。
@@ -2419,6 +2422,7 @@ impl TakoApp {
             pending_clipboard: Vec::new(),
             command_card_copied: None,
             command_card_error: None,
+            card_anchors: HashMap::new(),
         };
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
         // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
@@ -12338,13 +12342,16 @@ impl TakoApp {
             .find(|s| s.pane == pane_id)
             .map(|s| (s.port, s.process.clone()));
 
-        // AI コマンド提案カード（FR-2.22 / #666）。提案チップと重ならないようチップの
-        // ぶんだけ上へ寄せ、ペインヘッダを覆わないよう残り高さを上限として渡す
-        let command_cards = {
-            let bottom_offset = if suggestion.is_some() { 32.0 } else { 6.0 };
-            let available = f32::from(area.size.height) - PANE_TITLE_BAR - bottom_offset - 6.0;
-            self.render_command_cards(pane_id, bottom_offset, available, cx)
-        };
+        // AI コマンド提案カード（FR-2.22 / #666。位置は #681）。生成時点のターミナル
+        // 内容にアンカーするので、テキスト領域の寸法と行の高さを渡す。要素はテキスト
+        // 領域の中に入れる（上端で切り取られる = 上へ流れて消える見え方）
+        let command_cards = self.render_command_cards(
+            pane_id,
+            f32::from(area.size.height).max(0.0),
+            f32::from(cell.height),
+            suggestion.is_some(),
+            cx,
+        );
 
         // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
         // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
@@ -13040,7 +13047,11 @@ impl TakoApp {
                             .flex()
                             .flex_col()
                             .children(lines),
-                    ),
+                    )
+                    // AI コマンド提案カード（#681）: 行スタックより後に積んで前面へ。
+                    // テキスト領域の中なので overflow_hidden が上端で切り取り、
+                    // ペインヘッダを覆わずに「上へ流れて消える」
+                    .children(command_cards),
             )
             .children(scrollbar.map(|(top, thumb_h, track_h, alpha, emphasized)| {
                 // オーバーレイスクロールバー（macOS 慣行 #159）: スクロール中に表示 →
@@ -13146,8 +13157,6 @@ impl TakoApp {
                             .child("×"),
                     )
             }))
-            // AI コマンド提案カード（FR-2.22 / #666）。提案チップより後に積んで前面に出す
-            .children(command_cards)
             // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
             // ターミナルテキストエリアより後に描画し、背後が透けないようにする（#341）
             .when(workers_menu_open, |d| {
@@ -26103,17 +26112,18 @@ mod self_test {
                      前面にして再実行すると検証できる）"
                 );
             } else {
-                let _ = any.update(cx, |_, window, _| window.blur());
-                let mut blurred = false;
-                for _ in 0..10 {
-                    wait(cx, 50).await;
-                    blurred = window
-                        .update(cx, |app, window, _| !app.focus_handle.is_focused(window))
-                        .unwrap_or(false);
-                    if blurred {
-                        break;
-                    }
-                }
+                // blur は同期（`Window::blur` が focus を None にする）なので、
+                // **同じ update の中で**観測する。別 update へ跨いで poll すると
+                // on_focus_lost（draw 末尾の自己修復）がポーリングより先に走った
+                // フレームで「blur を観測できない」= 復元は効いているのに FAILED に
+                // なる取りこぼしレースになる（CPU 競合下で頻発。実測 blurred=false /
+                // refocused=true）
+                let blurred = window
+                    .update(cx, |app, window, _| {
+                        window.blur();
+                        !app.focus_handle.is_focused(window)
+                    })
+                    .unwrap_or(false);
                 press(any, cx, "escape");
                 let mut refocused = false;
                 for _ in 0..15 {
@@ -26125,6 +26135,9 @@ mod self_test {
                         break;
                     }
                 }
+                // どちら側で落ちたかを残す（blur も refocus も draw 待ちなので、
+                // CPU 競合下では待ち時間切れと本物の壊れを取り違えやすい）
+                println!("TAKO_SELF_TEST_76_FOCUS: blurred={blurred} refocused={refocused}");
                 check(
                     blurred && refocused,
                     "IME 経路: blur 後の focus 自己修復 (#332)",
@@ -27888,6 +27901,243 @@ mod self_test {
                     dismissed_ok,
                     "カードの × で閉じ、消えたカードへの操作は無害 (#666)",
                 );
+
+                // 91b. カードの表示位置アンカー（#681）。下端固定オーバーレイは claude の
+                // 入力欄・フッターに被るのでやめた。機械検証は 4 点:
+                // (a) カード下端がライブ領域（入力欄 / プロンプト行）より上にある
+                //     （上に空きが無いときは内容の下へ回るので、その場合は「覆わない」を見る）
+                // (b) スクロール（バックエンド = tmux 履歴ミラー経路）で内容と一緒に動く
+                // (c) 流れ去って描画されなくなっても CLI / MCP の操作は効く
+                // (d) 直接ペインでは出力が流れた行数ぶん上へ動く
+                {
+                    // 判定に使う寸法は描画と同じ関数から作る（二重管理しない）
+                    let layout = TakoApp::card_layout(340.0, 17.0, false);
+                    let anchor_card = window
+                        .update(cx, |app, _, cx| {
+                            let v = show(app, vec!["echo anchored".into()], pane);
+                            cx.notify();
+                            v["card"]["id"].as_u64().unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    // (a) ライブ領域の上辺 = カーソル行（またはその上の区切り罫線）より上
+                    let (row, below, cursor_row, screen_rows, mirror_pane, alt) = window
+                        .update(cx, |app, _, _| {
+                            let p = PaneId::from_raw(pane);
+                            let anchored = app.command_card_anchor_row(p, &layout);
+                            let theme = app.theme.clone();
+                            let s = app.terminals.get(&p);
+                            let screen = s.map(|s| s.screen_opts(&theme, false));
+                            let cursor = screen.as_ref().and_then(|s| s.ime_cursor).map(|(_, r)| r);
+                            let rows = screen.as_ref().map(|s| s.rows).unwrap_or(0);
+                            (
+                                anchored.map(|(r, _)| r),
+                                anchored.is_some_and(|(_, b)| b),
+                                cursor,
+                                rows,
+                                app.mirror_scroll_pane(p),
+                                s.is_some_and(|s| s.is_alt_screen()),
+                            )
+                        })
+                        .unwrap_or((None, false, None, 0, false, false));
+                    eprintln!(
+                        "TAKO_SELF_TEST_681_ANCHOR: row={row:?} below={below} cursor_row={cursor_row:?} rows={screen_rows} mirror={mirror_pane} alt={alt}"
+                    );
+                    check(
+                        matches!((row, cursor_row), (Some(r), Some(c)) if r <= c as f32 + 0.001),
+                        "カードがライブ領域（入力欄・プロンプト行）を覆わない位置に付く (#681)",
+                    );
+
+                    // (b) スクロール遡り量ぶん、カードが内容と一緒に下へ動く。
+                    //     本番（persist ON）のバックエンドペインは tmux 履歴ミラー経路
+                    let scrolled = window
+                        .update(cx, |app, _, _| {
+                            use tako_core::scroll_mirror::ScrollMirror;
+                            let p = PaneId::from_raw(pane);
+                            let before = app.command_card_anchor_row(p, &layout).map(|(r, _)| r);
+                            let blank = tako_core::ScreenLine {
+                                text: String::new(),
+                                runs: Vec::new(),
+                                cell_cols: Vec::new(),
+                                has_wide: false,
+                            };
+                            let ctl = app.scroll_ctls.entry(p).or_default();
+                            ctl.mirror = Some(ScrollMirror {
+                                lines: vec![blank; 50],
+                                total_history: 50,
+                                position: 10.0,
+                            });
+                            let after = app.command_card_anchor_row(p, &layout).map(|(r, _)| r);
+                            app.scroll_ctls.remove(&p);
+                            (before, after)
+                        })
+                        .unwrap_or((None, None));
+                    eprintln!(
+                        "TAKO_SELF_TEST_681_SCROLL: before={:?} after={:?}",
+                        scrolled.0, scrolled.1
+                    );
+                    check(
+                        matches!(
+                            (scrolled.0, scrolled.1),
+                            (Some(b), Some(a)) if (a - b - 10.0).abs() < 0.001
+                        ),
+                        "スクロール遡り 10 行でカードも 10 行下へ動く (#681)",
+                    );
+
+                    // (c) 流れ去ったカードは描画されないが CLI / MCP の操作は効く
+                    let off_screen_ok = window
+                        .update(cx, |app, _, cx| {
+                            use tako_core::scroll_mirror::ScrollMirror;
+                            let p = PaneId::from_raw(pane);
+                            let blank = tako_core::ScreenLine {
+                                text: String::new(),
+                                runs: Vec::new(),
+                                cell_cols: Vec::new(),
+                                has_wide: false,
+                            };
+                            let ctl = app.scroll_ctls.entry(p).or_default();
+                            ctl.mirror = Some(ScrollMirror {
+                                lines: vec![blank; 400],
+                                total_history: 400,
+                                position: 400.0,
+                            });
+                            let hidden = app
+                                .render_command_cards(p, 340.0, 17.0, false, cx)
+                                .is_none();
+                            // 描かれていない状態でも copy は効く（#681 受け入れ 3）
+                            app.copy_command_card(anchor_card, 1, cx);
+                            app.flush_pending_clipboard(cx);
+                            app.scroll_ctls.remove(&p);
+                            hidden
+                        })
+                        .unwrap_or(false);
+                    let copied_off = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()));
+                    check(
+                        off_screen_ok && copied_off.as_deref() == Some("echo anchored"),
+                        "流れ去ったカードは描かないが CLI / MCP の操作は効く (#681)",
+                    );
+
+                    // (直接ペインのみ) 出力が流れるとカードも上へ流れる。
+                    // tmux バックエンドペインは外側 alacritty に履歴が積まれないため
+                    // 「ライブ領域からの距離を保つ」挙動が正で、この判定は対象外
+                    if !mirror_pane && !alt {
+                        // 素のシェルを 1 枚生やして測る（既存ペインは前段の項目の出力が
+                        // 残っていて `seq` が走らないことがあり、押し出し行数が読めない）
+                        let flow_pane = window
+                            .update(cx, |app, _, cx| {
+                                let v = tako_control::dispatch(
+                                    app,
+                                    Request::Split {
+                                        pane: Some(pane),
+                                        tab: None,
+                                        direction: Some(tako_control::protocol::Direction::Down),
+                                        ratio: None,
+                                        command: None,
+                                        cwd: None,
+                                        focus: Some(false),
+                                    },
+                                    PaneOrigin::Mcp,
+                                )
+                                .unwrap_or_default();
+                                let id = v["pane"].as_u64().unwrap_or(0);
+                                for (p, options) in std::mem::take(&mut app.pending_attach) {
+                                    let _ = app.spawn_session(p, options, cx);
+                                }
+                                cx.notify();
+                                id
+                            })
+                            .unwrap_or(0);
+                        // シェルのプロンプトが出るまで待つ（起動直後に打つと取りこぼす）
+                        for _ in 0..20 {
+                            wait(cx, 300).await;
+                            let ready = window
+                                .update(cx, |app, _, _| {
+                                    app.terminals
+                                        .get(&PaneId::from_raw(flow_pane))
+                                        .is_some_and(|s| {
+                                            s.visible_lines().iter().any(|l| !l.trim().is_empty())
+                                        })
+                                })
+                                .unwrap_or(false);
+                            if ready {
+                                break;
+                            }
+                        }
+                        // 「行数」ではなく**不変条件**で見る: カードは
+                        // 「スクロールバックへ押し出された行数」ぶんだけ上へ動く
+                        let flow_state = |app: &mut TakoApp| -> (Option<f32>, usize) {
+                            let p = PaneId::from_raw(flow_pane);
+                            let row = app.command_card_anchor_row(p, &layout).map(|(r, _)| r);
+                            let hist = app
+                                .terminals
+                                .get(&p)
+                                .map(|s| s.history_size())
+                                .unwrap_or(0);
+                            (row, hist)
+                        };
+                        let before = window
+                            .update(cx, |app, _, cx| {
+                                show(app, vec!["echo flow-anchored".into()], flow_pane);
+                                cx.notify();
+                                flow_state(app)
+                            })
+                            .unwrap_or((None, 0));
+                        let _ = window.update(cx, |app, _, _| {
+                            if let Some(s) = app.terminals.get(&PaneId::from_raw(flow_pane)) {
+                                s.paste("seq 1 60");
+                                s.write(vec![b'\r']);
+                            }
+                        });
+                        let mut after = (None, 0);
+                        for _ in 0..20 {
+                            wait(cx, 300).await;
+                            after = window.update(cx, |app, _, _| flow_state(app)).unwrap_or((None, 0));
+                            if after.1 >= before.1 + 20 {
+                                break;
+                            }
+                        }
+                        let flowed = after.1.saturating_sub(before.1);
+                        let tail = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&PaneId::from_raw(flow_pane))
+                                    .map(|s| {
+                                        let v = s.visible_lines();
+                                        v.iter()
+                                            .filter(|l| !l.trim().is_empty())
+                                            .rev()
+                                            .take(2)
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                        eprintln!(
+                            "TAKO_SELF_TEST_681_FLOW: pane={flow_pane} row {:?} -> {:?} history {} -> {} (flowed={flowed}) tail={tail:?}",
+                            before.0, after.0, before.1, after.1
+                        );
+                        check(
+                            flowed >= 20
+                                && matches!(
+                                    (before.0, after.0),
+                                    (Some(b), Some(a)) if (a - (b - flowed as f32)).abs() < 0.001
+                                ),
+                            "出力が流れるとカードも押し出された行数ぶん上へ流れる (#681、直接ペイン)",
+                        );
+                        // 後片付け（検証用ペインを残さない）
+                        let _ = window.update(cx, |app, _, cx| {
+                            app.remove_pane(PaneId::from_raw(flow_pane), cx);
+                            cx.notify();
+                        });
+                    } else {
+                        eprintln!(
+                            "TAKO_SELF_TEST_681_FLOW: skipped (backend/alt pane: 履歴は tmux 側 = ライブ領域からの距離を保つのが正)"
+                        );
+                    }
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.dismiss_command_card(anchor_card, cx);
+                    });
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
