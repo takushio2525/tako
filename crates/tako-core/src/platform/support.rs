@@ -575,6 +575,15 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
     },
+    // #662: ダイアログの内容取得と応答。tako-app が保持しているペインは
+    // in-process（画面採取もキー送出も）で完結するため Windows でも動く。
+    // ペイン消失後の detached 経路は #519 の役割 B 待ちだが、
+    // 「ダイアログが出ている」= ペインは生きているので実用上の縮退はない
+    Feature {
+        key: "tako_orchestrator_dialog",
+        macos: Support::Supported,
+        windows: Support::Supported,
+    },
     Feature {
         key: "tako_orchestrator_handoff",
         macos: Support::Supported,
@@ -607,15 +616,6 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_NO_DETACHED_REACH,
             issue: 519,
         },
-    },
-    // #662: ダイアログの内容取得と応答。tako-app が保持しているペインは
-    // in-process（画面採取もキー送出も）で完結するため Windows でも動く。
-    // ペイン消失後の detached 経路は #519 の役割 B 待ちだが、
-    // 「ダイアログが出ている」= ペインは生きているので実用上の縮退はない
-    Feature {
-        key: "tako_orchestrator_dialog",
-        macos: Support::Supported,
-        windows: Support::Supported,
     },
     Feature {
         key: "tako_orchestrator_respond",

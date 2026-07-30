@@ -6795,6 +6795,15 @@ fn dispatch_send_keys(
     if keys.is_empty() {
         return Err(DispatchError::InvalidParams("keys が空".into()));
     }
+    // **キー名の妥当性はペインの状態より先に見る**。壊れた指定は届く / 届かないに
+    // 関係なく InvalidParams であり、先に見ておけば「途中まで撃ってから失敗」も防げる。
+    // 名前が有効かどうかは端末モードに依存しないので、ここは既定の符号化で判定してよい
+    for key in keys {
+        if tako_core::keys::encode_key(key, Default::default()).is_none() {
+            return Err(DispatchError::InvalidParams(unknown_key_message(key)));
+        }
+    }
+
     // 到達手段の解決。in-process 優先（`PaneReach` と同じ規律）
     let reach = match crate::reach::PaneReach::resolve(host, pane, tmux_session) {
         crate::reach::PaneReach::InProcess(target) => {
@@ -6808,19 +6817,6 @@ fn dispatch_send_keys(
             return Err(DispatchError::Operation(reason.note()))
         }
     };
-
-    // 先に全キーを符号化してから送る（途中まで撃ってから失敗するのを防ぐ）。
-    // detached 経路は名前渡しなので、ここでは名前の妥当性だけを検査する
-    if let DialogReach::InProcess(session) = reach {
-        tako_core::keys::encode_keys(keys, session.key_encoding())
-            .map_err(|name| DispatchError::InvalidParams(unknown_key_message(&name)))?;
-    } else {
-        for key in keys {
-            if tako_core::keys::encode_key(key, Default::default()).is_none() {
-                return Err(DispatchError::InvalidParams(unknown_key_message(key)));
-            }
-        }
-    }
 
     let delay = delay_ms.unwrap_or(30).min(2000);
     for (i, key) in keys.iter().enumerate() {
