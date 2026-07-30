@@ -31,6 +31,20 @@ fn marker_command() -> String {
     }
 }
 
+/// 日本語を含む本文。worker の label はそのまま `TAKO_ORCHESTRATOR_ROLE` に入るので、
+/// 実運用の起動コマンドには日本語が混ざりうる。
+///
+/// 全角文字はセルを 2 つ使い、画面スナップショットでは 2 セル目が `'\0'` になる。
+/// 行のテキスト組み立てでそれが落ちる前提に照合が乗っているので、実シェルで確かめる
+fn marker_command_ja() -> String {
+    if cfg!(windows) {
+        "$env:TAKO_TEST_ROLE = 'worker:検証:日本語ラベル'; Write-Output (\"TAKOMARK\" + \"640\")"
+            .to_string()
+    } else {
+        "export TAKO_TEST_ROLE='worker:検証:日本語ラベル'; echo \"TAKOMARK\"\"640\"".to_string()
+    }
+}
+
 fn psmux_bin() -> Option<String> {
     let bin = std::env::var("TAKO_PSMUX_BIN").unwrap_or_else(|_| "psmux".into());
     std::process::Command::new(&bin)
@@ -138,9 +152,13 @@ fn trial_old(bin: &str, socket: &str, tag: &str) -> bool {
 
 /// 新経路: `ShellSendFlow` を 500ms tick で回す（tako-app の `drive_command_flows` と同じ）
 fn trial_new(bin: &str, socket: &str, tag: &str) -> bool {
+    trial_new_with(bin, socket, tag, marker_command())
+}
+
+fn trial_new_with(bin: &str, socket: &str, tag: &str, command: String) -> bool {
     let trial = start_trial(bin, socket, tag);
     let session = &trial.session;
-    let mut flow = ShellSendFlow::new(marker_command());
+    let mut flow = ShellSendFlow::new(command);
     let t0 = Instant::now();
     let verbose = std::env::var_os("TAKO_E2E_VERBOSE").is_some();
     while t0.elapsed() < TRIAL_LIMIT {
@@ -172,6 +190,33 @@ fn trial_new(bin: &str, socket: &str, tag: &str) -> bool {
     }
     // フロー完了後にコマンドが実際に走ったか（実行の観測は画面が正）
     ran(session) || wait_ran(session, Duration::from_secs(20)).is_some()
+}
+
+/// 日本語を含む起動コマンドでも送達確認が成立するか（worker の label が日本語のとき）。
+///
+/// 全角はセルを 2 つ使い、2 セル目は画面スナップショットで `'\0'` になる。
+/// 照合はその `'\0'` が行のテキスト組み立てで落ちる前提に乗っているので、
+/// ここが崩れると**日本語ラベルの worker だけ永遠に書き直す**ことになる
+#[test]
+#[ignore = "psmux と実シェルを起動する実測用"]
+fn 実測_日本語を含む起動コマンドの到達() {
+    let Some(bin) = psmux_bin() else {
+        eprintln!("psmux が無いのでスキップ");
+        return;
+    };
+    let socket = format!("tako-e640ja-{}", std::process::id());
+    let rounds = 3;
+    let mut ok = 0;
+    for i in 0..rounds {
+        if trial_new_with(&bin, &socket, &format!("ja{i}"), marker_command_ja()) {
+            ok += 1;
+        } else {
+            println!("[ja{i}] 未達");
+        }
+    }
+    kill(&bin, &socket);
+    println!("日本語入り本文: {ok}/{rounds} 到達");
+    assert_eq!(ok, rounds, "日本語を含んでも送達確認が成立する");
 }
 
 /// 旧経路と新経路を同じ条件で N 回ずつ回して到達率を比べる

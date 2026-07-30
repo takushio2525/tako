@@ -58,6 +58,14 @@ const READY_MAX_TICKS: u32 = 60;
 /// 書き直すと、残りが流れ込んで `Write-Output (TAKOMARW` + 書き直し分、のように
 /// **混ざった行**ができる。進みが止まったときだけ壊れたと判断する
 const ECHO_IDLE_TICKS: u32 = 4;
+/// エコー待ちの絶対上限 tick 数。
+///
+/// 「進みが止まったら」だけを頼りにすると、**画面が常に動いている環境で永久に待つ**。
+/// 時計入りプロンプトやスピナーを出すシェルが相手だと、書いたバイトが落ちていても
+/// 据え置き判定が一度も成立せず、書き直しにも打ち切りにも進めない
+/// （= 修正前より悪い。修正前は少なくとも 1 回は書けていた）。
+/// 実測の最悪ケース（33 バイトの反映に 8 秒）に十分な余裕を取ったうえで頭を打つ
+const ECHO_MAX_TICKS: u32 = 40;
 /// 本文の書き直し回数の上限。
 ///
 /// 実機（psmux + 並行負荷あり）では欠落が 12 秒続いた試行がある。1 回の書き直しに
@@ -261,7 +269,7 @@ impl ShellSendFlow {
             self.echo_idle_ticks = 0;
             self.last_echo_screen = Some(now);
         }
-        if self.echo_idle_ticks < ECHO_IDLE_TICKS {
+        if self.echo_idle_ticks < ECHO_IDLE_TICKS && self.ticks_in_stage < ECHO_MAX_TICKS {
             return ShellSendAction::Wait;
         }
         if self.rewrites >= MAX_REWRITES {
@@ -445,6 +453,34 @@ mod tests {
             Some("\u{3}"),
             "欠けたまま Enter を撃たず、行を捨てて撃ち直す"
         );
+    }
+
+    #[test]
+    fn 画面が常に動く環境でも書き直しへ進める() {
+        // 時計入りプロンプトやスピナーが相手だと据え置き判定が一度も成立しない。
+        // 「進みが止まったら」だけを頼りにすると永久に待ち、書いたバイトが落ちていても
+        // 書き直しにも打ち切りにも進めない（修正前より悪い）
+        let mut f = ShellSendFlow::new(CMD);
+        let animated = |n: usize| vec![format!("PS C:\\Users\\x> [{n}]")];
+        f.tick(&animated(0));
+        // WaitReady は上限（READY_MAX_TICKS）で抜ける
+        let mut wrote = false;
+        for n in 1..=(READY_MAX_TICKS as usize + 2) {
+            if write_of(&f.tick(&animated(n))).is_some() {
+                wrote = true;
+                break;
+            }
+        }
+        assert!(wrote, "動き続ける画面でも上限で本文を書き始める");
+        // エコーは一度も現れず、画面は動き続ける → 上限で書き直しへ進む
+        let mut recovered = false;
+        for n in 100..(100 + ECHO_MAX_TICKS as usize + 2) {
+            if write_of(&f.tick(&animated(n))).as_deref() == Some("\u{3}") {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "据え置きが成立しなくても上限で書き直しへ進む");
     }
 
     #[test]
