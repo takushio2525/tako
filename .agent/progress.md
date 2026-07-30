@@ -1576,3 +1576,14 @@
   再アームしない。イベントは `supervisor-events.jsonl` + cursor でプロセス跨ぎ配送
 - 関連: PR #682（Closes #665、#663 の 1・2 も消化）。隔離 E2E で実 claude を含む 7 ケース実測。
   E2E 中に実バグ 3 件（PowerShell 7 の文言違い / 空行で窓が埋まりエラー見逃し / 常駐の残留）を発見・修正
+
+## 2026-07-30（#654: Windows でホイールスクロールが全ペインで効かない問題を根治）
+- 真因は `mirror_scroll_pane` が器の `ScrollbackAuthority` を見ず、`InProcess` を申告している
+  psmux ペインまでミラー経路へ載せていたこと。psmux は `#{mouse_any_flag}` / `send-keys -H` を
+  持たない（実測）ので `history_state` が None を返し続け、ホイール・スクロールバー・CLI Scroll が
+  全ペインで無反応になっていた。判定を純粋関数化して器の申告を通し、直接ペイン経路へ落とす
+- ホイール量も是正: Windows の `ScrollDelta::Lines` は gpui が `SPI_GETWHEELSCROLLLINES` を
+  掛けた値なので、tako 側の ×3 で 1 ノッチ = 9 行になっていた（倍率を OS 別に分離）
+- 関連: PR #688（Closes #654）。before/after を別 worktree の baseline バイナリと合成ホイールで
+  実測（シェル: scroll_position 0→0 が 0→24 / 偽 claude TUI: 受信報告 0 → 8）。
+  副産物 #686（copy mode 居残りで打鍵が食われる）/ #687（CLI scroll の縮退とマトリクスの嘘）起票
