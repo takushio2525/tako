@@ -277,9 +277,15 @@ fn build_windows_run_pane_command(
 /// - 逆に `$?` は「直前が成功したか」の真偽値しか持たないので、
 ///   ネイティブ exe の**実際の終了コード**が取れない
 ///
-/// そこで `$?` を先に見て（false のときだけ）`$LASTEXITCODE` を採る。
-/// この順なら「ネイティブ exe が失敗 → 実コード」「cmdlet が失敗 → 1」
-/// 「exe 成功のあと cmdlet 成功 → 0」がすべて POSIX の `;` と同じ結果になる
+/// そこで `$?` を先に見て（false のときだけ）`$LASTEXITCODE` を採る。この順なら
+/// 混在した場合まで POSIX の `;` と一致する（実測。順を逆にすると最後の 2 行が食い違う）:
+///
+/// | コマンド | POSIX 相当 | この式 |
+/// |---|---|---|
+/// | ネイティブ exe が 7 で失敗 | `sh -c 'exit 7'` = 7 | 7 |
+/// | cmdlet が失敗（`$LASTEXITCODE` は付かない） | — | 1 |
+/// | exe 失敗 → cmdlet 成功 | `sh -c 'false; true'` = 0 | 0 |
+/// | exe 成功 → cmdlet 失敗 | `sh -c 'true; false'` = 1 | 1 |
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
     let marker = powershell_single_quoted(marker_prefix);
