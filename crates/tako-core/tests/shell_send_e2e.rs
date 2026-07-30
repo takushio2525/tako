@@ -18,6 +18,11 @@ use tako_core::terminal::{SpawnOptions, TerminalSession};
 /// 実行できたときだけ画面に出る目印。コマンド側は連結して書くのでエコーには出ない
 const MARK: &str = "TAKOMARK640";
 
+/// 1 試行あたりの観測時間。本番（tako-app）がフローを回す上限と揃えてある。
+/// ここで短く切ると「製品の挙動」ではなく「ハーネスの上限」を測ることになる
+/// （並行ビルドで CPU を潰した状態で 60 秒に切ったら未達が多発した）
+const TRIAL_LIMIT: Duration = Duration::from_secs(120);
+
 fn marker_command() -> String {
     if cfg!(windows) {
         "Write-Output (\"TAKOMARK\" + \"640\")".to_string()
@@ -119,13 +124,16 @@ fn kill(bin: &str, socket: &str) {
         .output();
 }
 
-/// 旧経路: PTY 起動直後に「本文 + Enter」を 1 回書いて、あとは放置する
+/// 旧経路: PTY 起動直後に「本文 + Enter」を 1 回書いて、あとは放置する。
+///
+/// 待ち時間は新経路と揃える。短く切ると「落ちた」と「遅れているだけ」を区別できず、
+/// 旧経路に不利な比較になる（#640 の「大幅遅延」モードの検証も兼ねる）
 fn trial_old(bin: &str, socket: &str, tag: &str) -> bool {
     let trial = start_trial(bin, socket, tag);
     let mut bytes = marker_command().into_bytes();
     bytes.push(b'\r');
     trial.session.write(bytes);
-    wait_ran(&trial.session, Duration::from_secs(30)).is_some()
+    wait_ran(&trial.session, TRIAL_LIMIT).is_some()
 }
 
 /// 新経路: `ShellSendFlow` を 500ms tick で回す（tako-app の `drive_command_flows` と同じ）
@@ -135,10 +143,7 @@ fn trial_new(bin: &str, socket: &str, tag: &str) -> bool {
     let mut flow = ShellSendFlow::new(marker_command());
     let t0 = Instant::now();
     let verbose = std::env::var_os("TAKO_E2E_VERBOSE").is_some();
-    // 本番（tako-app）はフローを 120 秒まで回す。ここで短く切ると
-    // 「製品の挙動」ではなく「ハーネスの上限」を測ることになる（実際、並行ビルドで
-    // machine を潰した状態で 60 秒に切ったら未達が多発した）
-    while t0.elapsed() < Duration::from_secs(120) {
+    while t0.elapsed() < TRIAL_LIMIT {
         let lines = session.visible_lines();
         let action = flow.tick(&lines);
         if verbose {
