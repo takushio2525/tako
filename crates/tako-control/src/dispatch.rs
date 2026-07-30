@@ -3809,10 +3809,10 @@ fn dispatch_inner(
                 )));
             }
 
-            // シェル指定時はコマンドを包む
+            // シェル指定時はコマンドを包む（包み方は境界 B1 が持つ。
+            // 引用符の書き方が POSIX シェルと PowerShell で違うため）
             let final_command = if let Some(shell) = &plan.shell {
-                let escaped = plan.command.replace('\'', "'\\''");
-                format!("{shell} -c '{escaped}'")
+                tako_core::platform::shell::declared_shell_command(shell, &plan.command)
             } else {
                 plan.command.clone()
             };
@@ -4027,18 +4027,15 @@ fn spawn_command_pane(
         .split_with_ratio(target, direction.to_core(), ratio, new_pane)
         .map_err(op_err)?;
 
-    let wrapped =
-        format!("{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true");
-    // 複合シェルコード（`;` / `||` 入り）は program 1 語に詰めず /bin/sh -c の引数で渡す。
-    // program に詰めると login_shell_command の shell_quoted が全文を 1 語にクォートし、
-    // シェルが「セミコロン込みの 1 コマンド名」として探して 127 で即死する（#453）
+    // 実行ペインの組み立てはプラットフォーム境界 B1 に委ねる（POSIX は /bin/sh -c、
+    // Windows は PowerShell）。ここに `#[cfg]` は書かない
     host.attach_session(
         new_id,
         SpawnOptions {
-            command: Some(SpawnCommand {
-                program: "/bin/sh".to_string(),
-                args: vec!["-c".to_string(), wrapped],
-            }),
+            command: Some(tako_core::platform::shell::run_pane_command(
+                command,
+                EXIT_MARKER_PREFIX,
+            )),
             cwd,
             env: Vec::new(),
         },
@@ -4663,12 +4660,17 @@ fn send_is_enter_only(text: &str, newline: bool) -> bool {
     text.chars().all(|c| c == '\n' || c == '\r') && (newline || !text.is_empty())
 }
 
+/// 実行ペインが終了コードを知らせるマーカー。
+/// **出力側（`platform::shell::run_pane_command`）と読み取り側（`find_exit_marker`）の
+/// 唯一の接点**なので、片方だけ変えられないよう定数を共有する
+const EXIT_MARKER_PREFIX: &str = "__TAKO_EXIT=";
+
 /// `__TAKO_EXIT=<code>` マーカーを画面行から検索する。
 /// 行頭以外の位置（read プロンプトと同一行等）にも対応する（#325）
 fn find_exit_marker(lines: &[String]) -> Option<i32> {
     lines.iter().rev().find_map(|line| {
-        line.find("__TAKO_EXIT=").and_then(|pos| {
-            let after = &line[pos + "__TAKO_EXIT=".len()..];
+        line.find(EXIT_MARKER_PREFIX).and_then(|pos| {
+            let after = &line[pos + EXIT_MARKER_PREFIX.len()..];
             after.trim().parse::<i32>().ok()
         })
     })
@@ -11856,23 +11858,39 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
-        // 複合シェルコードは /bin/sh -c の引数（program 1 語詰めは 127 即死。#453）
-        assert_eq!(cmd.program, "/bin/sh");
-        assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
-        let sh_code = cmd.args.get(1).expect("-c の引数");
-        assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
-        assert!(sh_code.contains(r#"read "ans?input: ""#), "{sh_code}");
-        assert!(
-            sh_code.ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
-            "{sh_code}"
-        );
+        assert_run_pane_shape(cmd, r#"read "ans?input: ""#);
+
+        // #453 の回帰検査（POSIX）: 複合シェルコードは /bin/sh -c の引数へ。
+        // program 1 語に詰めると login_shell_command のクォートで 127 即死する
+        #[cfg(unix)]
+        {
+            assert_eq!(cmd.program, "/bin/sh");
+            assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
+            let sh_code = cmd.args.get(1).expect("-c の引数");
+            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            assert!(sh_code.contains(r#"read "ans?input: ""#), "{sh_code}");
+            assert!(
+                sh_code.ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
+                "{sh_code}"
+            );
+        }
+    }
+
+    /// 実行ペインの組み立てそのものは境界 B1（`platform::shell`）の責務なので、
+    /// dispatch 側で見るのは**渡したコマンド文字列が正しいか**だけにする（#525）。
+    /// 「その組み立てが実際に走るか」は `tako-core` 側で実 PowerShell / 実 sh に対して検証する
+    fn assert_run_pane_shape(cmd: &SpawnCommand, expected_command: &str) {
+        let want = tako_core::platform::shell::run_pane_command(expected_command, "__TAKO_EXIT=");
+        assert_eq!(cmd.program, want.program);
+        assert_eq!(cmd.args, want.args);
     }
 
     #[test]
-    fn runはコマンドをsh_c構造でspawnする() {
+    fn runはコマンドをプラットフォームの実行ペイン構造でspawnする() {
         // #453: Run ペインの SpawnCommand が /bin/sh -c 構造であること
         //（program に複合コマンド全文を詰めると login_shell_command のクォートで
-        // 1 コマンド名扱いになり command not found で即死する）
+        // 1 コマンド名扱いになり command not found で即死する）。
+        // #525: Windows は PowerShell の -EncodedCommand になる
         let dir = std::env::temp_dir().join(format!("tako-run-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hello.command");
@@ -11899,11 +11917,21 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
-        assert_eq!(cmd.program, "/bin/sh");
-        assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
-        let sh_code = cmd.args.get(1).expect("-c の引数");
-        assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
-        assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        // 拡張子既定（`.command`）から組み立てたコマンドが、そのまま実行ペインへ渡る
+        let expected_command = tako_core::merged_defaults(&Default::default())
+            .get("command")
+            .expect("組み込み既定に command がある")
+            .replace("${fileBase}", "hello.command");
+        assert_run_pane_shape(cmd, &expected_command);
+
+        #[cfg(unix)]
+        {
+            assert_eq!(cmd.program, "/bin/sh");
+            assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
+            let sh_code = cmd.args.get(1).expect("-c の引数");
+            assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
+            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

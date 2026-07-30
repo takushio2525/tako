@@ -730,6 +730,36 @@ mod tests {
     }
 
     #[test]
+    fn 実行ペインのbase64引数は器の引数解釈を素通りする() {
+        // #525: 実行ペインは PowerShell へスクリプトを base64（`-EncodedCommand`）で渡す。
+        // その狙いは「psmux の引数解釈を通っても中身が書き換えられない」こと。
+        // base64 の文字（`A-Za-z0-9+/=`）は `quote_for_shell` の安全集合に入るので
+        // 引用符が付かない、という前提をここで固定する。
+        // **崩れると引用符入り・日本語入りのコマンドだけが静かに壊れる**
+        let encoded = "JABnAG8AbwBkACsAZQBuAGMALwBvAGQAZQBkAD0A";
+        let cmd = SpawnCommand {
+            program: "pwsh.exe".into(),
+            args: vec!["-NoLogo".into(), "-EncodedCommand".into(), encoded.into()],
+        };
+        assert_eq!(
+            inner_command(&cmd),
+            format!("pwsh.exe -NoLogo -EncodedCommand {encoded}"),
+        );
+
+        // 空白入りのプログラムパス（pwsh 7 の既定インストール先）で cmd.exe 経由に
+        // 包まれても、base64 はやはり素のまま通る
+        let cmd = SpawnCommand {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            args: vec!["-NoLogo".into(), "-EncodedCommand".into(), encoded.into()],
+        };
+        let line = inner_command(&cmd);
+        assert!(
+            line.contains(&format!("-EncodedCommand {encoded}'")),
+            "base64 が引用・改変された: {line}"
+        );
+    }
+
+    #[test]
     fn list_sessionsの3列出力をパースする() {
         let out = "tako-aaaaaaaaaaaa\t0\t1785138302\ntako-bbbbbbbbbbbb\t1\t1785138999\n\
                    壊れた行\n";
