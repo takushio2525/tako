@@ -813,6 +813,14 @@ fn dispatch_inner(
             }
         }
 
+        // #662: 特殊キー送出（PromptFlow を通さない生キー）
+        Request::SendKeys {
+            pane,
+            keys,
+            delay_ms,
+            tmux_session,
+        } => dispatch_send_keys(host, pane, &keys, delay_ms, tmux_session.as_deref()),
+
         Request::Read {
             pane,
             lines,
@@ -2532,12 +2540,27 @@ fn dispatch_inner(
             crate::orchestrator::wait::run_result(&run_id, exec).map_err(DispatchError::Operation)
         }
 
-        // #319: permission ダイアログへの構造化応答
+        // #319 / #662: permission ダイアログ・対話ダイアログへの構造化応答
         Request::OrchestratorRespond {
             pane_id,
             choice,
+            answers,
+            dry_run,
             caller_role,
-        } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
+        } => dispatch_orchestrator_respond(
+            host,
+            pane_id,
+            choice.as_deref(),
+            answers.as_deref(),
+            dry_run,
+            caller_role.as_deref(),
+        ),
+
+        // #662: worker が表示中の対話ダイアログの内容取得
+        Request::OrchestratorDialog { pane_id, worker } => {
+            let q = resolve_worker_query(pane_id, worker.as_deref(), None, None)?;
+            dispatch_orchestrator_dialog(host, q)
+        }
 
         // #364: worker の報告内容を scrollback + transcript から取得
         // #390: worker 指定 / pane 消失時はレジストリの追跡キーで継続
@@ -6246,36 +6269,129 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     }))
 }
 
-/// #319: permission ダイアログへの構造化応答
-fn dispatch_orchestrator_respond(
+/// ダイアログ操作の到達手段（#662）。
+///
+/// **in-process を必ず先に試す**のが要点。旧実装は `reach::detached_session` だけを見ており、
+/// tako-app が当該ペインを保持していても「アウトオブプロセス到達手段が無い」で失敗していた
+/// （Windows の psmux backend は `DetachedAccess` を持たないので**常に**失敗した）。
+/// 画面採取もキー送出も in-process なら tmux に一切依存せず完結する
+enum DialogReach<'a> {
+    InProcess(&'a tako_core::TerminalSession),
+    Detached(
+        tako_core::backend::SessionRef,
+        &'static dyn tako_core::backend::DetachedAccess,
+    ),
+}
+
+impl DialogReach<'_> {
+    /// 可視画面の採取
+    fn capture(&self) -> Result<Vec<String>, DispatchError> {
+        match self {
+            Self::InProcess(session) => Ok(session.visible_lines()),
+            Self::Detached(s, access) => access
+                .capture_screen(s)
+                .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}"))),
+        }
+    }
+
+    /// キー名 1 個の送出
+    fn send_key(&self, key: &str) -> Result<(), DispatchError> {
+        match self {
+            Self::InProcess(session) => {
+                let bytes = tako_core::keys::encode_key(key, session.key_encoding())
+                    .ok_or_else(|| DispatchError::InvalidParams(unknown_key_message(key)))?;
+                session.write(bytes);
+                Ok(())
+            }
+            // detached はバックエンドのキー名語彙（`Enter` / `Down`）へ渡す。
+            // tmux は先頭大文字の名前を取るので合わせる
+            Self::Detached(s, access) => access
+                .send_key(s, &detached_key_name(key))
+                .map_err(|e| DispatchError::Operation(format!("キー送出に失敗: {e}"))),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::InProcess(_) => "in-process",
+            Self::Detached(..) => "detached",
+        }
+    }
+}
+
+fn unknown_key_message(key: &str) -> String {
+    format!(
+        "不明なキー名 '{key}'（使えるキー: {} / ctrl-<英字> / 1 文字リテラル）",
+        tako_core::keys::KEY_NAMES.join(" / ")
+    )
+}
+
+/// in-process のキー名を detached バックエンド（tmux 系）の語彙へ写す。
+/// 1 文字リテラルはそのまま（tmux の send-keys はリテラルを受ける）
+fn detached_key_name(key: &str) -> String {
+    match key.to_ascii_lowercase().as_str() {
+        "enter" | "return" => "Enter".to_string(),
+        "escape" | "esc" => "Escape".to_string(),
+        "tab" => "Tab".to_string(),
+        "backtab" | "shift-tab" => "BTab".to_string(),
+        "space" => "Space".to_string(),
+        "backspace" => "BSpace".to_string(),
+        "delete" | "del" => "DC".to_string(),
+        "up" => "Up".to_string(),
+        "down" => "Down".to_string(),
+        "left" => "Left".to_string(),
+        "right" => "Right".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        "pageup" | "pgup" => "PageUp".to_string(),
+        "pagedown" | "pgdn" => "PageDown".to_string(),
+        other => {
+            // ctrl-c → C-c（tmux 記法）
+            if let Some(rest) = other.strip_prefix("ctrl-") {
+                format!("C-{rest}")
+            } else {
+                key.to_string()
+            }
+        }
+    }
+}
+
+/// ダイアログ操作の到達手段を解決する。in-process 優先（#662）
+fn resolve_dialog_reach(
     host: &dyn ControlHost,
     pane_id: u64,
-    choice: &str,
-    caller_role: Option<&str>,
-) -> Result<Value, DispatchError> {
+) -> Result<DialogReach<'_>, DispatchError> {
     let target = PaneId::from_raw(pane_id);
-
-    // バックエンドセッションの取得
+    if let Some(session) = host.session(target) {
+        return Ok(DialogReach::InProcess(session));
+    }
+    // tako-app が保持していない = ペイン消失 or GUI 不在。バックエンドの到達手段に頼る
     let backend_session = host.backend_session(target).ok_or_else(|| {
-        DispatchError::Operation(format!(
-            "ペイン {pane_id} のバックエンドセッションが見つからない"
-        ))
+        DispatchError::Operation(crate::reach::UnreachableReason::NoSession(pane_id).note())
     })?;
-
-    // 画面から permission ダイアログの存在を検証。
-    // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
-    let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
-        DispatchError::Operation(
+    match crate::reach::detached_session(&backend_session) {
+        Some((s, access)) => Ok(DialogReach::Detached(s, access)),
+        None => Err(DispatchError::Operation(
             crate::reach::UnreachableReason::NoDetachedAccess {
                 session: backend_session.clone(),
                 note: crate::reach::no_detached_access_note(),
             }
             .note(),
-        )
-    })?;
-    let lines = access
-        .capture_screen(&session)
-        .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))?;
+        )),
+    }
+}
+
+/// #319: permission ダイアログへの構造化応答
+fn dispatch_orchestrator_respond_permission(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    choice: &str,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    // #662: in-process 優先で到達手段を解決する（旧実装は detached 固定で
+    // Windows/psmux では必ず失敗していた）
+    let reach = resolve_dialog_reach(host, pane_id)?;
+    let lines = reach.capture()?;
     let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
         DispatchError::Operation(
             "ペイン画面に permission ダイアログが見つからない（既に解消済みか、別の画面状態です）"
@@ -6310,13 +6426,9 @@ fn dispatch_orchestrator_respond(
     }
 
     // 選択キーを送信: 番号キー → 短い待ち → Enter
-    access
-        .send_key(&session, &choice_num.to_string())
-        .map_err(|e| DispatchError::Operation(format!("番号キーの送信に失敗: {e}")))?;
+    reach.send_key(&choice_num.to_string())?;
     std::thread::sleep(std::time::Duration::from_millis(200));
-    access
-        .send_key(&session, "Enter")
-        .map_err(|e| DispatchError::Operation(format!("Enter の送信に失敗: {e}")))?;
+    reach.send_key("enter")?;
 
     let chosen_text = dialog
         .options
@@ -6327,16 +6439,367 @@ fn dispatch_orchestrator_respond(
     // 監査記録（persist.log。ペイン出力自体はキー入力の結果として画面に残る）
     let caller = caller_role.unwrap_or("unknown");
     crate::diag::persist_log(&format!(
-        "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={}",
-        dialog.command
+        "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={} reach={}",
+        dialog.command,
+        reach.label(),
     ));
 
     Ok(json!({
         "pane_id": pane_id,
         "responded": true,
+        "kind": "permission",
         "choice": choice_num,
         "choice_text": chosen_text,
         "command": dialog.command,
+        "reach": reach.label(),
+    }))
+}
+
+/// ダイアログ操作の 1 ステップに許す待ち時間（#662）。
+///
+/// dispatch は tako-app の UI スレッドで走るため、ここで長く眠ると画面が固まる。
+/// 期待する変化が出た瞬間に進むポーリング方式にして、実測（数字キーの反映は
+/// 概ね 100ms 以内）に対して十分な上限だけを置く
+const DIALOG_STEP_BUDGET_MS: u64 = 800;
+/// ポーリング間隔
+const DIALOG_POLL_MS: u64 = 40;
+
+/// 画面が条件を満たすまで待つ。満たさないまま予算を使い切ったら最後の画面を返す。
+/// 戻り値は (画面, 条件を満たしたか)
+fn wait_for_screen(
+    reach: &DialogReach<'_>,
+    budget_ms: u64,
+    cond: impl Fn(&[String]) -> bool,
+) -> Result<(Vec<String>, bool), DispatchError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    let mut last = reach.capture()?;
+    if cond(&last) {
+        return Ok((last, true));
+    }
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(DIALOG_POLL_MS));
+        last = reach.capture()?;
+        if cond(&last) {
+            return Ok((last, true));
+        }
+    }
+    Ok((last, false))
+}
+
+/// #662: worker が表示中の対話ダイアログの内容を取得する
+fn dispatch_orchestrator_dialog(
+    host: &dyn ControlHost,
+    q: WorkerQuery,
+) -> Result<Value, DispatchError> {
+    let pane_id = q.pane_id;
+    let target = PaneId::from_raw(pane_id);
+
+    // transcript（第一ソース。ペイン幅に依存しない全文）
+    let backend_session = host.backend_session(target);
+    let pane_pid = host.session(target).and_then(|s| s.child_pid());
+    let session_id = q
+        .session_id
+        .clone()
+        .or_else(|| auto_resolve_session(backend_session.as_deref(), pane_pid));
+    let pending = session_id
+        .as_deref()
+        .and_then(crate::dialog::pending_for_session);
+
+    // ライブ画面（第二ソース。現在位置・ハイライト・回答済みマーカー）。
+    // ペインへ届かない場合も transcript 側は返せるので、ここは失敗を許容する
+    let (screen_lines, reach_label) = match resolve_dialog_reach(host, pane_id) {
+        Ok(reach) => {
+            let label = reach.label();
+            (reach.capture().ok(), Some(label))
+        }
+        Err(_) => (None, None),
+    };
+    let dialog_screen = screen_lines
+        .as_deref()
+        .and_then(crate::dialog::parse_dialog_screen);
+    let permission = screen_lines.as_deref().and_then(|lines| {
+        let d = crate::claude_tui::detect_permission_dialog(lines)?;
+        Some(json!({
+            "command": d.command,
+            "options": d.options,
+            "highlighted": d.highlighted,
+        }))
+    });
+
+    // 種別の判定: AskUserQuestion（画面にダイアログが見えている or transcript が保留中）
+    // > permission ダイアログ > なし
+    let kind = if dialog_screen.is_some() || pending.is_some() {
+        "ask_user_question"
+    } else if permission.is_some() {
+        "permission"
+    } else {
+        "none"
+    };
+
+    Ok(json!({
+        "pane_id": pane_id,
+        "kind": kind,
+        "session_id": session_id,
+        "reach": reach_label,
+        // transcript 由来の全文（幅に依存しない。master はこれを読んで判断する）
+        "questions": pending.as_ref().map(|p| p.to_json()),
+        // ライブ画面由来の現在位置
+        "screen": dialog_screen.as_ref().map(|s| s.to_json()),
+        "permission_dialog": permission,
+    }))
+}
+
+/// #662: AskUserQuestion への構造化応答。
+///
+/// 実測した TUI 操作モデル（`crate::dialog` の doc）に沿って
+/// 「番号キー → 画面で反映を確認 → 次の質問」を繰り返し、確認画面で
+/// **選んだ内容が意図と一致することを検証してから** submit する
+fn dispatch_orchestrator_respond_dialog(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    answers: &[crate::protocol::DialogAnswer],
+    dry_run: bool,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use crate::dialog;
+
+    let target = PaneId::from_raw(pane_id);
+    let reach = resolve_dialog_reach(host, pane_id)?;
+
+    // ダイアログが実際に表示されていることを確認（誤爆防止。#319 から維持）
+    let lines = reach.capture()?;
+    let screen = dialog::parse_dialog_screen(&lines).ok_or_else(|| {
+        DispatchError::Operation(
+            "ペイン画面に対話ダイアログ（AskUserQuestion）が見つからない\
+             （既に回答済みか、別の画面状態です）"
+                .to_string(),
+        )
+    })?;
+
+    // 質問の全文は transcript から取る（画面はペイン幅で切り詰められている）
+    let backend_session = host.backend_session(target);
+    let pane_pid = host.session(target).and_then(|s| s.child_pid());
+    let session_id = auto_resolve_session(backend_session.as_deref(), pane_pid);
+    let pending = session_id
+        .as_deref()
+        .and_then(dialog::pending_for_session)
+        .ok_or_else(|| {
+            DispatchError::Operation(
+                "transcript から質問内容を読めない（session_id を解決できないか、\
+                 保留中の AskUserQuestion が無い）。tako_orchestrator_dialog で状態を確認すること"
+                    .to_string(),
+            )
+        })?;
+
+    let specs: Vec<dialog::AnswerSpec> = answers
+        .iter()
+        .map(|a| dialog::AnswerSpec {
+            question: a.question.clone(),
+            options: a.option_list(),
+        })
+        .collect();
+    let resolved = dialog::resolve_answers(&pending.questions, &specs)
+        .map_err(DispatchError::InvalidParams)?;
+
+    // 既に確認画面にいる場合は選択フェーズを飛ばす（再実行の冪等性）
+    let mut current = screen;
+    if current.stage == dialog::DialogStage::Question {
+        // 表示中の質問から順に答える。TUI は先頭から前進するので、
+        // 現在位置より前の質問には戻れない（＝既に回答済みのはず）
+        let start = current.current_question_index().unwrap_or(0);
+        for answer in resolved.iter().filter(|r| r.question_index >= start) {
+            let question = &pending.questions[answer.question_index];
+            let keys = dialog::keys_for_answer(question, answer);
+            for key in &keys {
+                reach.send_key(key)?;
+                // 各キーの反映を待つ。multiSelect のトグルは同一画面なので
+                // 「画面が変わった」だけでは判定できず、短い固定待ちで足りる
+                std::thread::sleep(std::time::Duration::from_millis(DIALOG_POLL_MS));
+            }
+            // この質問が回答済みになったこと（タブが ☒ / 確認画面へ遷移）を待つ
+            let qi = answer.question_index;
+            let (after, ok) = wait_for_screen(&reach, DIALOG_STEP_BUDGET_MS, |lines| {
+                match dialog::parse_dialog_screen(lines) {
+                    Some(s) => {
+                        s.stage == dialog::DialogStage::Review
+                            || s.tabs.get(qi).is_some_and(|t| t.answered)
+                    }
+                    // ダイアログが消えた = 想定外（Esc 等）。待ち続けない
+                    None => true,
+                }
+            })?;
+            if !ok {
+                return Err(DispatchError::Operation(format!(
+                    "質問 {} への選択が画面に反映されない（送ったキー: {}）。\
+                     tako_orchestrator_dialog で状態を確認すること",
+                    qi + 1,
+                    keys.join(" ")
+                )));
+            }
+            current = dialog::parse_dialog_screen(&after).ok_or_else(|| {
+                DispatchError::Operation(
+                    "回答中にダイアログが消えた（取消されたか、別の画面へ遷移した）".to_string(),
+                )
+            })?;
+            if current.stage == dialog::DialogStage::Review {
+                break;
+            }
+        }
+    }
+
+    // 確認画面へ遷移するのを待つ（単一選択の最終問は自動遷移、multiSelect は Tab 済み）
+    if current.stage != dialog::DialogStage::Review {
+        let (after, _) = wait_for_screen(&reach, DIALOG_STEP_BUDGET_MS, |lines| {
+            dialog::parse_dialog_screen(lines)
+                .is_some_and(|s| s.stage == dialog::DialogStage::Review)
+        })?;
+        if let Some(s) = dialog::parse_dialog_screen(&after) {
+            current = s;
+        }
+    }
+
+    // **送信前の検証**: 確認画面に写っている選択結果が意図と一致するか。
+    // 一致しなければ submit しない（撃ちっぱなしにしないための要）
+    if let Err(e) = dialog::verify_review(&pending.questions, &resolved, &current) {
+        return Err(DispatchError::Operation(format!(
+            "確認画面の内容が指定と一致しないため送信しませんでした: {e}"
+        )));
+    }
+
+    let chosen: Vec<Value> = resolved
+        .iter()
+        .map(|r| {
+            let q = &pending.questions[r.question_index];
+            json!({
+                "question": q.question,
+                "header": q.header,
+                "labels": r.option_indices.iter()
+                    .map(|i| q.options[*i].label.clone())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    if dry_run {
+        return Ok(json!({
+            "pane_id": pane_id,
+            "kind": "ask_user_question",
+            "responded": false,
+            "dry_run": true,
+            "stage": "review",
+            "chosen": chosen,
+            "review_answers": current.review_answers,
+            "reach": reach.label(),
+        }));
+    }
+
+    // 送信
+    for key in dialog::keys_for_submit(&current) {
+        reach.send_key(&key)?;
+    }
+    // ダイアログが消えたことを確認（送達の確認。消えなければ未送信の可能性を返す）
+    let (_, gone) = wait_for_screen(&reach, DIALOG_STEP_BUDGET_MS, |lines| {
+        dialog::parse_dialog_screen(lines).is_none()
+    })?;
+
+    let caller = caller_role.unwrap_or("unknown");
+    crate::diag::persist_log(&format!(
+        "[dialog-respond] caller={caller} pane={pane_id} tool_use={} answers={} submitted={gone} reach={}",
+        pending.tool_use_id,
+        chosen.len(),
+        reach.label(),
+    ));
+
+    Ok(json!({
+        "pane_id": pane_id,
+        "kind": "ask_user_question",
+        "responded": true,
+        "submitted": gone,
+        "tool_use_id": pending.tool_use_id,
+        "chosen": chosen,
+        "review_answers": current.review_answers,
+        "reach": reach.label(),
+    }))
+}
+
+/// #319 / #662: ダイアログへの応答。`answers` があれば AskUserQuestion、
+/// `choice` だけなら permission ダイアログへ振り分ける
+fn dispatch_orchestrator_respond(
+    host: &dyn ControlHost,
+    pane_id: u64,
+    choice: Option<&str>,
+    answers: Option<&[crate::protocol::DialogAnswer]>,
+    dry_run: bool,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    match (answers, choice) {
+        (Some(answers), _) => {
+            if answers.is_empty() {
+                return Err(DispatchError::InvalidParams(
+                    "answers が空。質問ごとに 1 要素を指定すること".into(),
+                ));
+            }
+            dispatch_orchestrator_respond_dialog(host, pane_id, answers, dry_run, caller_role)
+        }
+        (None, Some(choice)) => {
+            dispatch_orchestrator_respond_permission(host, pane_id, choice, caller_role)
+        }
+        (None, None) => Err(DispatchError::InvalidParams(
+            "choice（permission ダイアログ）または answers（AskUserQuestion）が必要".into(),
+        )),
+    }
+}
+
+/// #662: ペインへの特殊キー送出。送達確認ループ（PromptFlow）を通らない
+fn dispatch_send_keys(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    keys: &[String],
+    delay_ms: Option<u64>,
+    tmux_session: Option<&str>,
+) -> Result<Value, DispatchError> {
+    if keys.is_empty() {
+        return Err(DispatchError::InvalidParams("keys が空".into()));
+    }
+    // 到達手段の解決。in-process 優先（`PaneReach` と同じ規律）
+    let reach = match crate::reach::PaneReach::resolve(host, pane, tmux_session) {
+        crate::reach::PaneReach::InProcess(target) => {
+            let session = host
+                .session(target)
+                .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            DialogReach::InProcess(session)
+        }
+        crate::reach::PaneReach::Detached(s, access) => DialogReach::Detached(s, access),
+        crate::reach::PaneReach::Unreachable(reason) => {
+            return Err(DispatchError::Operation(reason.note()))
+        }
+    };
+
+    // 先に全キーを符号化してから送る（途中まで撃ってから失敗するのを防ぐ）。
+    // detached 経路は名前渡しなので、ここでは名前の妥当性だけを検査する
+    if let DialogReach::InProcess(session) = reach {
+        tako_core::keys::encode_keys(keys, session.key_encoding())
+            .map_err(|name| DispatchError::InvalidParams(unknown_key_message(&name)))?;
+    } else {
+        for key in keys {
+            if tako_core::keys::encode_key(key, Default::default()).is_none() {
+                return Err(DispatchError::InvalidParams(unknown_key_message(key)));
+            }
+        }
+    }
+
+    let delay = delay_ms.unwrap_or(30).min(2000);
+    for (i, key) in keys.iter().enumerate() {
+        if i > 0 && delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+        reach.send_key(key)?;
+    }
+
+    Ok(json!({
+        "sent": keys.len(),
+        "keys": keys,
+        "reach": reach.label(),
     }))
 }
 

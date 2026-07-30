@@ -9,6 +9,7 @@ pub mod byte_lru;
 pub mod git;
 pub mod header_layout;
 pub mod i18n;
+pub mod keys;
 pub mod links;
 pub mod osc_tap;
 pub mod pane;

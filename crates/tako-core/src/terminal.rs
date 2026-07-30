@@ -655,6 +655,22 @@ impl TerminalSession {
             .contains(TermMode::DISAMBIGUATE_ESC_CODES)
     }
 
+    /// DECCKM（application cursor keys）が有効か。有効時、矢印キーは `ESC O A` 形式で
+    /// 送る（`ESC [ A` ではない）。AI からのキー送出（#662）が
+    /// [`crate::keys::KeyEncoding`] を組み立てるのに使う
+    pub fn app_cursor(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// このセッションへキーを送るときの符号化（#662）。
+    /// TUI が要求したモードをそのまま反映する
+    pub fn key_encoding(&self) -> crate::keys::KeyEncoding {
+        crate::keys::KeyEncoding {
+            app_cursor: self.app_cursor(),
+            disambiguate: self.disambiguate_keys(),
+        }
+    }
+
     /// mouse reporting が要求されているか（ホイール転送の出し分けと同じ判定。
     /// tmux バックエンドの e2e 検証・デバッグ用）
     pub fn mouse_reporting(&self) -> bool {

@@ -37,6 +37,7 @@ tako_open_dir
 tako_open_file
 tako_open_remote
 tako_orchestrator_accounts
+tako_orchestrator_dialog
 tako_orchestrator_handoff
 tako_orchestrator_layout
 tako_orchestrator_ledger
@@ -93,6 +94,7 @@ tako_run_resolve
 tako_scroll_pane
 tako_select_tab
 tako_send_input
+tako_send_keys
 tako_sessions
 tako_set_title
 tako_settings

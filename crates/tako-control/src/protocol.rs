@@ -187,6 +187,39 @@ impl PreviewModeWire {
     }
 }
 
+/// 対話ダイアログ（AskUserQuestion）1 問への回答（#662）。
+/// `option` / `options` はどちらも「1 始まりの番号」か「ラベルの前方一致」で指定する
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogAnswer {
+    /// 対象の質問（1 始まりの番号 or header の前方一致）。省略時は表示順に割り当て
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// 選ぶ選択肢（単一選択）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<String>,
+    /// 選ぶ選択肢（multiSelect。複数指定）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+}
+
+impl DialogAnswer {
+    /// `option` / `options` を 1 本の並びへまとめる
+    pub fn option_list(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(ref o) = self.option {
+            out.push(o.clone());
+        }
+        if let Some(ref os) = self.options {
+            for o in os {
+                if !out.contains(o) {
+                    out.push(o.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
 /// 操作リクエスト。`pane` 省略時は呼び出し元ペイン（クライアント側で `TAKO_PANE_ID` から
 /// 解決して詰める。FR-2.2.7）。各操作のセマンティクスは tako-core の API と 1:1
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,6 +277,24 @@ pub enum Request {
         tmux_session: Option<String>,
         #[serde(default)]
         await_prompt: bool,
+    },
+    /// ペインへの特殊キー送出（#662）。`keys` はキー名の並び
+    /// （`enter` / `esc` / `up` / `ctrl-c` / 1 文字リテラル）。
+    ///
+    /// **`Send` と違い送達確認ループ（PromptFlow）を通らない**。TUI の対話ダイアログは
+    /// `❯` 入力欄を持たないため、入力欄基準の残留判定が誤爆して Enter を撃ち直す
+    /// （#662 の根本原因 2）。キー送出は「押した」だけを保証し、結果の確認は
+    /// 呼び出し側（`Read` / `OrchestratorDialog`）に委ねる
+    SendKeys {
+        pane: Option<u64>,
+        /// 送るキー名の並び（前から順に送る）
+        keys: Vec<String>,
+        /// キーの間に挟む待ち（ms）。TUI の再描画を待たせたいときに使う（既定 30）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u64>,
+        /// tmux session 名（pane ID 解決不能時のフォールバック）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_session: Option<String>,
     },
     /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限。
     /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で読む
@@ -829,13 +880,33 @@ pub enum Request {
     /// オーケストレーター: worker の permission ダイアログへの応答（#319）。
     /// ダイアログが画面上に存在することを検証してから選択キーを送る。
     /// 不在時はエラー（誤爆防止）
+    /// #662: `answers` 指定で AskUserQuestion（対話ダイアログ）にも応答する
     OrchestratorRespond {
         pane_id: u64,
-        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
-        choice: String,
+        /// permission ダイアログの選択肢番号（1-based）または "yes"/"no" エイリアス。
+        /// AskUserQuestion に答えるときは `answers` を使う（`choice` は省略可）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<String>,
+        /// AskUserQuestion への回答（#662）。質問ごとに 1 要素。
+        /// `question` 省略時は表示順に割り当てる
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<DialogAnswer>>,
+        /// 確認画面まで進めるが送信しない（#662。master が内容を見て判断したいとき）
+        #[serde(default)]
+        dry_run: bool,
         /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE（監査ログ用）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
+    },
+    /// オーケストレーター: worker が表示中の対話ダイアログの内容取得（#662）。
+    /// transcript（幅非依存の全文）+ ライブ画面（現在位置・ハイライト）の 2 ソース。
+    /// permission ダイアログも同じ応答に載る
+    OrchestratorDialog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
+        /// worker レジストリの ID（pane_id と排他。両方指定時は worker 優先）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
     },
     /// オーケストレーター: worker の報告内容を取得する（#364）。
     /// 第 1 層 scrollback（全 agent 共通）+ 第 2 層 transcript アダプタ（claude 等）。

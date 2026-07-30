@@ -143,6 +143,35 @@ tako send --pane 3 --await-prompt "テストを実行して結果を教えて"
 Claude Code のような全画面アプリへの送信は、貼り付け → Enter 送信 → 届いたかの検証、という確認ループ付きで配送されます。長い指示文が入力欄に残ったままになる心配はありません。
 :::
 
+### tako keys
+
+ペインに**特殊キー**を送ります。矢印キーで選択したり Esc で閉じたりする TUI の画面は、テキスト送信では動かせません。そういう画面を操作するためのコマンドです。
+
+```bash
+# 下・下・Enter（選択肢を 2 つ下げて決定）
+tako keys --pane 3 down down enter
+
+# Esc で閉じる
+tako keys --pane 3 escape
+
+# Ctrl+C で中断
+tako keys --pane 3 ctrl-c
+
+# 数字キーで選択肢を選ぶ
+tako keys --pane 3 2
+```
+
+使えるキー名: `enter` / `escape` / `tab` / `backtab` / `backspace` / `delete` / `space` / `up` / `down` / `left` / `right` / `home` / `end` / `pageup` / `pagedown` / `insert` / `f1`〜`f12` / `ctrl-<英字>` / `shift-` `alt-` の前置 / 1 文字リテラル（`1`・`y` 等）。
+
+| オプション | 説明 |
+|---|---|
+| `--pane <ID>` | 送信先ペイン（省略時は呼び出し元） |
+| `--delay-ms <N>` | キーの間に挟む待ち（既定 30ms、上限 2000ms） |
+
+:::tip
+Claude Code が選択肢を出して止まっているとき（AskUserQuestion）は、キーを手で組み立てるより `tako orchestrator dialog` で内容を読み、`tako orchestrator respond --answer` で答える方が安全です（送信前に「選ばれた内容」が照合されます）。
+:::
+
 ### tako read
 
 ペインの画面内容をテキストとして取得します。「隣のペインに何が表示されているか見る」操作です。
@@ -646,6 +675,40 @@ tako orchestrator watch --pane 5 --session-id <S>
 # タイムアウト付き
 tako orchestrator watch --pane 5 --timeout 600
 ```
+
+### tako orchestrator dialog / respond
+
+worker が選択肢を出して止まっているときに、内容を読んで答えるコマンドです。
+
+```bash
+# worker が出しているダイアログの内容を読む（質問文と選択肢を全文で）
+tako orchestrator dialog --pane 5
+
+# 1 問目に 2 番、2 問目にラベル指定で答える（表示順）
+tako orchestrator respond --pane 5 --answer 2 --answer カレー
+
+# 質問を明示指定する（順不同でよい）
+tako orchestrator respond --pane 5 --answer 色=青い海 --answer 食べ物=カレー
+
+# 複数選択の質問（カンマ区切り）
+tako orchestrator respond --pane 5 --answer りんご,ぶどう
+
+# 確認画面まで進めて内容だけ見る（送信しない）
+tako orchestrator respond --pane 5 --answer 2 --dry-run
+
+# 承認ダイアログ（ツール実行の許可要求）に答える
+tako orchestrator respond --pane 5 --choice yes
+```
+
+`dialog` は質問文と選択肢を **claude の transcript から** 取るので、ペインが狭くて画面が折り返していても全文が読めます。`respond` は送信前に確認画面の内容を照合し、指定と一致しなければ送信せずエラーにします（誤爆防止）。
+
+| オプション | 説明 |
+|---|---|
+| `--pane <ID>` | 対象 worker ペイン |
+| `--worker <ID>` | worker レジストリの ID（`dialog` のみ。`--pane` と排他） |
+| `--answer <値>` | 対話ダイアログへの回答。質問ごとに 1 回指定する |
+| `--choice <値>` | 承認ダイアログの選択（番号 / `yes` / `no`） |
+| `--dry-run` | 確認画面まで進めて表示し、送信しない |
 
 ### tako orchestrator run
 

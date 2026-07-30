@@ -289,7 +289,9 @@ pub fn recover_usage_limit(
     // respond で既存のダイアログを確定させる（respond が無いときは Enter で確定）
     let respond_result = (ctx.exec)(Request::OrchestratorRespond {
         pane_id: ctx.pane_id,
-        choice: "1".to_string(),
+        choice: Some("1".to_string()),
+        answers: None,
+        dry_run: false,
         caller_role: Some("supervisor".to_string()),
     });
 

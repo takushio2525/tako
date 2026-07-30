@@ -22,6 +22,7 @@ pub mod agents_sync;
 pub mod claude_tui;
 pub mod config_io;
 pub mod diag;
+pub mod dialog;
 pub mod discovery;
 pub mod dispatch;
 pub mod fda;
