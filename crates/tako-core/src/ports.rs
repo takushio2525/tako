@@ -658,12 +658,14 @@ mod portable_tests {
         let key = pane_key(None, Some(std::process::id())).expect("自 pid がキーになる");
         let scanned = scan(&[key]);
         let ports = scanned.get(&key).expect("自プロセスのポートが取れない");
-        assert!(
-            ports.iter().any(|p| p.port == port),
-            "listen 中の {port} が scan で拾えない: {ports:?}"
-        );
-        // 存在しないポートを名乗らないこと（キー外のプロセスの混入検査）
-        assert!(ports.iter().all(|p| p.pid == std::process::id() as i32));
+        let mine = ports
+            .iter()
+            .find(|p| p.port == port)
+            .unwrap_or_else(|| panic!("listen 中の {port} が scan で拾えない: {ports:?}"));
+        // キーの持ち主に正しく紐付いていること（別プロセスのポートを混ぜていない）。
+        // 同じテストバイナリの子プロセスが listen していれば結果に混ざりうるので、
+        // 「全件が自分」ではなく「自分のポートが自分の pid で返る」を検査する
+        assert_eq!(mine.pid, std::process::id() as i32);
     }
 
     /// 存在しない pid・権限の無いシステムプロセスを対象にしても panic しない
