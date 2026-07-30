@@ -153,6 +153,23 @@ cargo build --workspace
 | `RustEmbed folder ... does not exist` | 手順 5 の PWA ビルド未実施 |
 | `npm ci` が `Missing: @next/swc-*@... from lock file` で落ちる | 手順 5 の「lock 不整合で落ちるとき」 |
 | ビルドが極端に遅い | Defender の除外に `%USERPROFILE%\.cargo` と リポジトリの `target` を追加する |
+| 直したはずの関数が「無い」とコンパイルエラーになる | **複数 worktree で `CARGO_TARGET_DIR` を共有していないか**（下記） |
+
+### 複数 worktree で target ディレクトリを共有しない（#524 で実測）
+
+同じワークスペースの別 worktree に同じ `CARGO_TARGET_DIR` を割り当てると、
+**同名・同ハッシュの `libtako_control-*.rlib` が互いに上書きされる**。すると自分の
+worktree で `cargo build` しても依存クレートだけ別ブランチの成果物が link され、
+「今まさに足した関数が `cannot find function` になる」「実行しても直前の修正が
+効いていない」という形で出る（実測: 別 worker のビルドで rlib が置き換わり、
+`tako-control` だけ baseline の内容に戻っていた）。
+
+**worktree ごとに別の target ディレクトリを使う**こと。ロック待ちを避けるために
+共有すると、待ち時間の代わりに検証の信頼性を失う。
+
+```powershell
+$env:CARGO_TARGET_DIR = "C:\path\to\target-<worktree 名>"
+```
 
 ## 7. 起動を試す（このフェーズでは失敗して構わない）
 
