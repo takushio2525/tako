@@ -17965,6 +17965,126 @@ mod self_test {
             "visual-test md: ⌘C 相当のコピーで選択テキストがクリップボードへ入る",
         );
 
+        // エッジケース（#656 の検証手順 3）: 巨大な表・壊れた表・折り返せない長い語・
+        // 深いネスト・フェンス内の ``` を 1 本の md に詰めて、panic / フリーズ / 崩れが
+        // 起きないことを確かめる。同じペインを差し替えて使う
+        let stress_path = dir.join("stress.md");
+        let mut stress = String::from("# エッジケース\n\n");
+        stress.push_str(
+            "## 巨大な表（60 行）\n\n| # | 名前 | 値 | 備考 |\n|--:|:-----|:--:|------|\n",
+        );
+        for row in 1..=60 {
+            stress.push_str(&format!(
+                "| {row} | item-{row:03} | {} | 説明テキスト {row} |\n",
+                row * 7 % 13
+            ));
+        }
+        stress.push_str("\n## 列数が行ごとに違う表\n\n| a | b | c |\n|---|---|---|\n| 1 |\n");
+        stress.push_str("| 1 | 2 | 3 | 4 | 5 |\n|  |  |  |\n\n");
+        stress.push_str("## 折り返せない長い語を含む表\n\n| キー | 値 |\n|:-----|:---|\n");
+        stress.push_str("| path | /very/long/path/that/cannot/be/broken/at/spaces/because-it-is-one-token.md |\n");
+        stress.push_str(
+            "| word | Supercalifragilisticexpialidocious_Supercalifragilisticexpialidocious |\n\n",
+        );
+        stress.push_str("## 深いネスト\n\n");
+        for depth in 0..6 {
+            stress.push_str(&format!("{}- 第 {} 段\n", "  ".repeat(depth), depth + 1));
+        }
+        stress.push_str("\n> > > 3 段引用の中に\n> > >\n> > > - リスト\n> > > - もう 1 つ\n> > >\n> > > | x | y |\n> > > |---|---|\n> > > | 1 | 2 |\n\n");
+        stress.push_str("## フェンスの中の ```\n\n````md\n```rust\nfn main() {}\n```\n````\n\n");
+        stress.push_str("## 空の項目\n\n-\n- [ ]\n- 通常\n");
+        std::fs::write(&stress_path, &stress).expect("visual-test md ストレス fixture");
+
+        let opened_at = std::time::Instant::now();
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(md_pane.as_u64()),
+                        path: stress_path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                        direction: None,
+                        focus: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            })
+            .ok();
+        let stress_loaded = wait_for_preview_state(window, cx, Duration::from_secs(10), |app| {
+            app.previews.get(&md_pane).is_some_and(|state| {
+                state.path.ends_with("stress.md")
+                    && matches!(&state.content, preview::PreviewContent::Markdown(blocks)
+                        if blocks.iter().filter(|b| matches!(&b.kind, preview::MdBlockKind::Table { .. })).count() >= 4)
+            })
+        })
+        .await;
+        check(
+            stress_loaded.is_some(),
+            "visual-test md ストレス: 表 4 本を含む本文がロードされる",
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: md stress load={:?} bytes={}",
+            opened_at.elapsed(),
+            stress.len()
+        );
+        // 巨大表でもロードが実用時間内（フリーズしない）
+        check(
+            opened_at.elapsed() < Duration::from_secs(6),
+            "visual-test md ストレス: ロードがフリーズしない",
+        );
+
+        let stress_max = window
+            .update(cx, |app, _, _| {
+                app.preview_scroll_handles
+                    .get(&md_pane)
+                    .map(|handle| f32::from(handle.max_offset().y))
+                    .unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
+        let steps = 12;
+        for step in 0..=steps {
+            let y = -stress_max * step as f32 / steps as f32;
+            window
+                .update(cx, |app, _, cx| {
+                    if let Some(handle) = app.preview_scroll_handles.get(&md_pane) {
+                        handle.set_offset(point(px(0.0), px(y)));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            let frame = capture_frame(any, cx);
+            if let (Ok(dump), Some((frame, _))) =
+                (std::env::var("TAKO_VISUAL_DUMP_DIR"), frame.as_ref())
+            {
+                if step % 4 == 0 {
+                    let _ = frame.save(
+                        std::path::Path::new(&dump).join(format!("markdown-stress{step}.png")),
+                    );
+                }
+            }
+            let (layouts, line_texts, pane_bounds, _) = md_visual_state(window, cx, md_pane);
+            let (no_overlap, no_overflow, note) =
+                md_layout_invariants(&layouts, &line_texts, &pane_bounds);
+            if !no_overlap || !no_overflow {
+                println!("TAKO_VISUAL_PIXEL: md stress step={step} {note}");
+            }
+            check(
+                no_overlap,
+                &format!(
+                    "visual-test md ストレス: スクロール {step}/{steps} で行が重ならない (#656)"
+                ),
+            );
+            check(
+                no_overflow,
+                &format!(
+                    "visual-test md ストレス: スクロール {step}/{steps} で横に溢れない (#656)"
+                ),
+            );
+        }
+        println!("TAKO_VISUAL_PIXEL: md stress sweep steps={steps} max_y={stress_max:.0} ok");
+
         // 後片付け（以降の検証へ影響を残さない）
         window
             .update(cx, |app, _, cx| {
