@@ -6346,12 +6346,23 @@ fn detached_key_name(key: &str) -> String {
         "pageup" | "pgup" => "PageUp".to_string(),
         "pagedown" | "pgdn" => "PageDown".to_string(),
         other => {
-            // ctrl-c → C-c（tmux 記法）
-            if let Some(rest) = other.strip_prefix("ctrl-") {
-                format!("C-{rest}")
-            } else {
-                key.to_string()
+            // 修飾前置を tmux 記法へ（ctrl-c → C-c / shift-up → S-Up / alt-v → M-v）。
+            // 基底名は再帰で写す（`shift-up` の `up` を `Up` にするため）
+            for (prefix, tmux) in [
+                ("ctrl-", "C-"),
+                ("control-", "C-"),
+                ("shift-", "S-"),
+                ("alt-", "M-"),
+                ("option-", "M-"),
+                ("meta-", "M-"),
+            ] {
+                if let Some(rest) = other.strip_prefix(prefix) {
+                    if !rest.is_empty() {
+                        return format!("{tmux}{}", detached_key_name(rest));
+                    }
+                }
             }
+            key.to_string()
         }
     }
 }
@@ -6733,7 +6744,15 @@ fn dispatch_orchestrator_respond(
     caller_role: Option<&str>,
 ) -> Result<Value, DispatchError> {
     match (answers, choice) {
-        (Some(answers), _) => {
+        // 両方指定は「どのダイアログに答えたいのか」が決まらない。
+        // 黙ってどちらかを選ぶと誤爆になるので拒否する
+        (Some(_), Some(_)) => Err(DispatchError::InvalidParams(
+            "choice と answers は同時に指定できない（choice = permission ダイアログ / \
+             answers = AskUserQuestion）。tako_orchestrator_dialog の kind で\
+             どちらが出ているか確認すること"
+                .into(),
+        )),
+        (Some(answers), None) => {
             if answers.is_empty() {
                 return Err(DispatchError::InvalidParams(
                     "answers が空。質問ごとに 1 要素を指定すること".into(),
@@ -10945,6 +10964,102 @@ mod tests {
         // 存在しないペイン
         let gone = collect_worker_status_ctx(&host, 999_999);
         assert!(!gone.pane_exists);
+    }
+
+    // --- #662: ダイアログ操作の入力検証と到達解決 ---
+
+    /// choice と answers の同時指定は「どのダイアログに答えるか」が決まらない。
+    /// 黙ってどちらかを選ぶと誤爆になるので拒否する
+    #[test]
+    fn respondはchoiceとanswersの同時指定を拒否する() {
+        let host = MockHost::new();
+        let answer = crate::protocol::DialogAnswer {
+            question: None,
+            option: Some("1".into()),
+            options: None,
+        };
+        let err = dispatch_orchestrator_respond(
+            &host,
+            host.root_pane(),
+            Some("1"),
+            Some(&[answer]),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("同時に指定できない"),
+            "err={err:?}"
+        );
+    }
+
+    #[test]
+    fn respondはchoiceもanswersも無ければ拒否する() {
+        let host = MockHost::new();
+        let err =
+            dispatch_orchestrator_respond(&host, host.root_pane(), None, None, false, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("answers"), "err={err:?}");
+    }
+
+    #[test]
+    fn respondは空のanswersを拒否する() {
+        let host = MockHost::new();
+        let err =
+            dispatch_orchestrator_respond(&host, host.root_pane(), None, Some(&[]), false, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("answers が空"), "err={err:?}");
+    }
+
+    /// キー名の妥当性はキーを 1 つも撃つ前に検査する
+    /// （途中まで送ってから失敗すると TUI が中途半端な状態で残る）
+    #[test]
+    fn send_keysは不明なキー名を送信前に弾く() {
+        let host = MockHost::new();
+        let err = dispatch_send_keys(
+            &host,
+            Some(host.root_pane()),
+            &["enter".into(), "nosuchkey".into()],
+            None,
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nosuchkey"), "msg={msg}");
+        // 使えるキー名の一覧を添える（master が撃ち直せるように）
+        assert!(msg.contains("enter"), "msg={msg}");
+    }
+
+    #[test]
+    fn send_keysは空のkeysを拒否する() {
+        let host = MockHost::new();
+        let err = dispatch_send_keys(&host, Some(host.root_pane()), &[], None, None).unwrap_err();
+        assert!(err.to_string().contains("keys が空"), "err={err:?}");
+    }
+
+    /// MockHost は `TerminalSession` を持たないので in-process では届かない。
+    /// バックエンドのヒントも無いので「セッションが無い」を返す
+    /// （「到達手段が無い」と混同しない = #519 の区別を保つ）
+    #[test]
+    fn ダイアログ到達はセッション不在を構造化して返す() {
+        let host = MockHost::new();
+        let err = resolve_dialog_reach(&host, host.root_pane()).unwrap_err();
+        assert!(err.to_string().contains("セッション"), "err={err:?}");
+    }
+
+    /// detached バックエンド（tmux 系）へのキー名の写し。
+    /// in-process 側と語彙が違う（tmux は `Enter` / `S-Up` / `C-c`）
+    #[test]
+    fn detachedのキー名はtmux記法へ写す() {
+        assert_eq!(detached_key_name("enter"), "Enter");
+        assert_eq!(detached_key_name("escape"), "Escape");
+        assert_eq!(detached_key_name("down"), "Down");
+        assert_eq!(detached_key_name("backtab"), "BTab");
+        assert_eq!(detached_key_name("ctrl-c"), "C-c");
+        assert_eq!(detached_key_name("shift-up"), "S-Up");
+        assert_eq!(detached_key_name("alt-v"), "M-v");
+        // 1 文字リテラルはそのまま（tmux の send-keys が受ける）
+        assert_eq!(detached_key_name("2"), "2");
     }
 
     // --- #592: 器を持たないペイン（Windows の backend=none）の pane→session 解決 ---

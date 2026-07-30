@@ -5974,6 +5974,142 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    // --- #662: ダイアログ操作 ---
+
+    #[test]
+    fn keysコマンドはキー名を並びで受ける() {
+        match parse(&["tako", "keys", "--pane", "3", "down", "down", "enter"]) {
+            Command::Keys(a) => {
+                assert_eq!(a.pane, Some(3));
+                assert_eq!(a.keys, vec!["down", "down", "enter"]);
+                assert_eq!(a.delay_ms, None);
+            }
+            _ => panic!("keys ではない"),
+        }
+        // ハイフン始まりに見える ctrl-c もそのまま値として通る
+        match parse(&["tako", "keys", "ctrl-c"]) {
+            Command::Keys(a) => assert_eq!(a.keys, vec!["ctrl-c"]),
+            _ => panic!("keys ではない"),
+        }
+    }
+
+    /// `--answer` は「選択肢」「質問=選択肢」「カンマ区切りの複数選択」を受ける
+    #[test]
+    fn answerの書式を解釈する() {
+        let parsed = parse_dialog_answers(&["2".into(), "カレー".into()])
+            .unwrap()
+            .expect("2 件");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].question, None);
+        assert_eq!(parsed[0].option_list(), vec!["2"]);
+        assert_eq!(parsed[1].option_list(), vec!["カレー"]);
+
+        // 質問を明示指定（= の左が質問）
+        let parsed = parse_dialog_answers(&["色=青い海".into()]).unwrap().unwrap();
+        assert_eq!(parsed[0].question.as_deref(), Some("色"));
+        assert_eq!(parsed[0].option_list(), vec!["青い海"]);
+
+        // multiSelect（カンマ区切り）
+        let parsed = parse_dialog_answers(&["りんご,ぶどう".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].option_list(), vec!["りんご", "ぶどう"]);
+
+        // 質問指定 + 複数選択の併用
+        let parsed = parse_dialog_answers(&["果物=りんご,もも".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].question.as_deref(), Some("果物"));
+        assert_eq!(parsed[0].option_list(), vec!["りんご", "もも"]);
+
+        // 指定なしは None（permission ダイアログ用の --choice 経路を壊さない）
+        assert!(parse_dialog_answers(&[]).unwrap().is_none());
+    }
+
+    /// ラベル自身に `=` が入る場合は最初の `=` で切る。
+    /// 左側が空・右側が空なら質問指定とみなさずラベル全体として扱う
+    #[test]
+    fn answerのイコールは最初の一個で切る() {
+        let parsed = parse_dialog_answers(&["方針=A=B 案".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].question.as_deref(), Some("方針"));
+        assert_eq!(parsed[0].option_list(), vec!["A=B 案"]);
+
+        // 右が空 = 質問指定として成立しないのでラベル扱い
+        let parsed = parse_dialog_answers(&["=".into()]);
+        assert!(parsed.is_err(), "選択肢が無いのでエラー");
+    }
+
+    #[test]
+    fn answerが空文字だけならエラー() {
+        let err = parse_dialog_answers(&[",".into()]).unwrap_err();
+        assert!(err.contains("選択肢が無い"), "err={err}");
+    }
+
+    #[test]
+    fn respondはanswerとchoiceの両方を受け付ける形をしている() {
+        match parse(&[
+            "tako",
+            "orchestrator",
+            "respond",
+            "--pane",
+            "5",
+            "--answer",
+            "2",
+            "--dry-run",
+        ]) {
+            Command::Orchestrator(OrchestratorCommand::Respond {
+                pane,
+                choice,
+                answers,
+                dry_run,
+            }) => {
+                assert_eq!(pane, 5);
+                assert_eq!(choice, None);
+                assert_eq!(answers, vec!["2"]);
+                assert!(dry_run);
+            }
+            _ => panic!("respond ではない"),
+        }
+        // permission ダイアログ経路（従来の --choice。後方互換）
+        match parse(&[
+            "tako",
+            "orchestrator",
+            "respond",
+            "--pane",
+            "5",
+            "--choice",
+            "yes",
+        ]) {
+            Command::Orchestrator(OrchestratorCommand::Respond {
+                choice, answers, ..
+            }) => {
+                assert_eq!(choice.as_deref(), Some("yes"));
+                assert!(answers.is_empty());
+            }
+            _ => panic!("respond ではない"),
+        }
+    }
+
+    #[test]
+    fn dialogコマンドはpaneとworkerを受ける() {
+        match parse(&["tako", "orchestrator", "dialog", "--pane", "7"]) {
+            Command::Orchestrator(OrchestratorCommand::Dialog { pane, worker }) => {
+                assert_eq!(pane, Some(7));
+                assert_eq!(worker, None);
+            }
+            _ => panic!("dialog ではない"),
+        }
+        match parse(&["tako", "orchestrator", "dialog", "--worker", "w-1"]) {
+            Command::Orchestrator(OrchestratorCommand::Dialog { pane, worker }) => {
+                assert_eq!(pane, None);
+                assert_eq!(worker.as_deref(), Some("w-1"));
+            }
+            _ => panic!("dialog ではない"),
+        }
+    }
+
     #[test]
     fn splitの方向と末尾コマンド() {
         let command = parse(&[
