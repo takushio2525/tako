@@ -3185,7 +3185,8 @@ impl TakoApp {
             let start = text.len();
             text.push_str(&span.text);
             let style = HighlightStyle {
-                color: span.color.map(hsla),
+                // syntect はダーク配色固定。ライトの面で読める明度へ落とす（#669）
+                color: span.color.map(|c| hsla(theme.adapt_syntax_color(c))),
                 font_weight: span.bold.then_some(FontWeight::BOLD),
                 font_style: span.italic.then_some(FontStyle::Italic),
                 ..HighlightStyle::default()
@@ -3298,7 +3299,6 @@ impl TakoApp {
     ) -> (gpui::AnyElement, Vec<Option<TextLayout>>) {
         let theme = self.theme.clone();
         let base = theme.font_size;
-        let light = theme.mode == tako_core::theme::ThemeMode::Light;
         let in_quote = block.quote_depth > 0;
         // 引用の中は本文より一段淡く。引用の入れ子はさらに淡くして深さが分かるようにする
         let body_color = if in_quote {
@@ -3521,15 +3521,12 @@ impl TakoApp {
                         let start = text.len();
                         text.push_str(&span.text);
                         // 言語指定なしフェンスは syntect の既定色（ダーク前提の淡色）を
-                        // 使わず、テーマの本文色で素直に出す
-                        let color = lang.as_ref().and(span.color).map(|c| {
-                            if light {
-                                // syntect はダーク配色固定。ライトの面で読める明度へ落とす
-                                c.adapt_for_light_bg(0.12)
-                            } else {
-                                c
-                            }
-                        });
+                        // 使わず、テーマの本文色で素直に出す。色を出す場合は
+                        // ライトの面で読める明度へ落とす（#656 / #669。非 md と同一経路）
+                        let color = lang
+                            .as_ref()
+                            .and(span.color)
+                            .map(|c| theme.adapt_syntax_color(c));
                         if color.is_some() || span.bold || span.italic {
                             highlights.push((
                                 start..text.len(),
