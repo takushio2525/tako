@@ -337,6 +337,27 @@ pub trait PreviewHost {
     ) -> Result<serde_json::Value, String> {
         Err("PDF リンクフォローは未対応".into())
     }
+    /// Markdown プレビュー内のリンク一覧（Issue #680）。md プレビューでなければ None。
+    fn preview_md_links(&self, _pane: PaneId) -> Option<Vec<tako_core::MdLink>> {
+        None
+    }
+    /// Markdown プレビュー内のリンクをフォローする（Issue #680。http / https のみ開く）。
+    fn follow_preview_md_link(
+        &mut self,
+        _pane: PaneId,
+        _index: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("Markdown リンクフォローは未対応".into())
+    }
+    /// Markdown プレビューのコードブロック全文をクリップボードへ入れる（Issue #680）。
+    /// `index` は出現順の 0 始まり（省略時は先頭）。UI のコピーボタンと同じ経路。
+    fn copy_preview_code_block(
+        &mut self,
+        _pane: PaneId,
+        _index: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        Err("コードブロックのコピーは未対応".into())
+    }
     /// 表示中ファイルのライブリロード設定（Issue #233）。
     fn preview_reload_enabled(&self) -> bool {
         true
