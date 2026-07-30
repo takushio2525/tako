@@ -16,6 +16,10 @@
     コピー = 論理 1 行・新規ペイン実行。master/solo/worker prompt に提示規範入り。PR #675）
   - #669 コードプレビュー本体のライトテーマ構文色（`Theme::adapt_syntax_color` で md と構造統一。PR #677）
   - #676 `tako run` が focus 未指定でフォーカスを奪う問題（spawn_command_pane で統一。PR #678）
+- 追加 merge（07-30 午後）: #680 md プレビューのリンク ⌘+クリック（http/https のみ）+
+  コードブロックのコピーボタン（常時表示・アイコンのみ。`opacity(0)`+group_hover は
+  実機で復帰しないため不採用）+ `tako preview-copy-code`（131 ツール）。PR #685 = `9758a6b`。
+  /Applications へ install 済み（GUI 再起動待ち）
 - GUI 再起動後の実機確認済み: 復元 3 タブ / 4 ペイン（tmux 再 attach、喪失ゼロ）、
   #666 カードの実描画・コピー pbpaste 一致・新規ペイン実行・フォーカス不変（スクショ確認）
 - worker アカウント既定を univ（opus-5 解禁済み）へ変更（profiles: worker_account=univ /
@@ -23,8 +27,9 @@
 
 ## 次の一手
 
-1. ユーザー目視: md プレビューの見た目（表・コード・ライト構文色）が好みに合うか /
-   #666 カードの使用感。フィードバックがあれば追加 Issue
+1. ユーザー目視: md プレビューの見た目（表・コード・ライト構文色）/ #666 カードの使用感 /
+   **#680 のコピーボタンの控えめさ（常時表示のアイコン）とリンク ⌘+クリック**。
+   フィードバックがあれば追加 Issue
 2. #658（セルフテスト由来の worker レジストリ残留 + GC 不全）— 起票済み・未着手
 3. #652 の真の実地検証は次回 PC 再起動時（persist.log の Claude resume 数と master 復元を確認）
 4. 今夜の nightly が本日 6 件を 0.6.2 として自動リリース見込み

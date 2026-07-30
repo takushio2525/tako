@@ -1584,3 +1584,18 @@
 - 既知の限界: 硬いクランプなので**ライトではコメント灰と既定文字色がほぼ同じ濃さ**になる
   （`#63625a` vs `#63625e`）。色相で分かれない灰系は見分けが付かない → 別途 Issue 化を提案
 - 関連コミット: PR（Closes #669）
+
+## 2026-07-30（#680: md プレビューのリンク ⌘+クリック + コードブロックのコピーボタン）
+- `MdSpan.link: bool` → `link_url: Option<String>` で遷移先をモデル保持し、⌘+ホバー装飾
+  （下線実線化 + accent 背景）+ ⌘+クリックで `os_integration::open_url`。**開くのは
+  http / https のみ**（`tako_core::md_links::browser_url` が正）。当たり判定は
+  `TextLayout::index_for_position` の `Ok` だけ = ⌘ 無しの選択は不変。索引の正は
+  `md_document_links` 1 本で render とCLI 一覧が同じ並びを共有
+- コードブロック右上にコピーボタン（装飾なし全文 + 2.2 秒「コピーしました」）。
+  **`opacity(0)` + `group_hover` の「ホバーで初めて現れる」方式は実機で復帰せず
+  ボタンが一度も見えないと実測**したので常時表示（待機中はアイコンのみ淡色）へ
+- CLI / MCP: `preview-link-list` / `preview-follow-link` を md へ拡張（応答に `kind`）+
+  `tako preview-copy-code` / `tako_preview_copy_code` 新設（131 ツール）
+- 関連コミット: `9758a6b`（PR #685 squash merge）。品質ゲート全緑 + セルフテスト項目 90 +
+  visual-test 全節完走（3 連続）+ 実マウスの ⌘+クリックでローカル HTTP サーバへの
+  実アクセスをログで確認。副産物: `wait_for_preview_maps` の PDF 待ちを 2s → 4s
