@@ -135,7 +135,10 @@ fn trial_new(bin: &str, socket: &str, tag: &str) -> bool {
     let mut flow = ShellSendFlow::new(marker_command());
     let t0 = Instant::now();
     let verbose = std::env::var_os("TAKO_E2E_VERBOSE").is_some();
-    while t0.elapsed() < Duration::from_secs(60) {
+    // 本番（tako-app）はフローを 120 秒まで回す。ここで短く切ると
+    // 「製品の挙動」ではなく「ハーネスの上限」を測ることになる（実際、並行ビルドで
+    // machine を潰した状態で 60 秒に切ったら未達が多発した）
+    while t0.elapsed() < Duration::from_secs(120) {
         let lines = session.visible_lines();
         let action = flow.tick(&lines);
         if verbose {
