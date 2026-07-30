@@ -1565,3 +1565,14 @@
   `find_transcript` が CLAUDE_CONFIG_DIR / アカウント別 config dir を見ていない実バグも修正
 - 関連: PR #679。証拠は #662 のコメント（内容取得 / dry_run / 本送信 / worker 受領 /
   矢印キーのハイライト前後比較 / 誤爆防止）
+
+## 2026-07-30（#665: orchestrator の運用保証 — spawn の起動保証 + 再アーム不要の常時監視）
+- spawn の投げっぱなしを段階検証つきの状態機械へ（queued → shell_ready → launch_sent →
+  agent_started → prompt_sent → prompt_delivered、確認できなければ再送）。画面分類は
+  tako-control の純粋関数に置き GUI なしで検証可。#640 とは「シェルに届いたか」/
+  「エージェントが起動したか」で役割分担し、送出は `queue_command_flow` へ委ねる
+- #401 の supervisor は**呼び出し元ゼロ**（自動復旧は一度も動いていなかった）→ 多 worker を
+  1 本で見る非ブロッキング版へ置き換えて配線。毎周期レジストリを読み直すので master は
+  再アームしない。イベントは `supervisor-events.jsonl` + cursor でプロセス跨ぎ配送
+- 関連: PR #682（Closes #665、#663 の 1・2 も消化）。隔離 E2E で実 claude を含む 7 ケース実測。
+  E2E 中に実バグ 3 件（PowerShell 7 の文言違い / 空行で窓が埋まりエラー見逃し / 常駐の残留）を発見・修正
