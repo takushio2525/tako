@@ -516,6 +516,10 @@ pub fn resolve_question(questions: &[DialogQuestion], spec: &str) -> Result<usiz
     }
 }
 
+/// 数字キーで選べる選択肢の上限。TUI は選択肢を `1.`〜`9.` と振り、
+/// 選択は数字キー 1 発（実測モデル）。2 桁は 1 打鍵にならないのでここで打ち切る
+pub const MAX_NUMBER_KEY_OPTION: usize = 9;
+
 /// 解決済みの回答（質問 index → 選択肢 index の集合）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAnswer {
@@ -573,6 +577,16 @@ pub fn resolve_answers(
             if indices.contains(&oi) {
                 return Err(format!(
                     "質問 {} で選択肢 {} が重複している",
+                    qi + 1,
+                    oi + 1
+                ));
+            }
+            // 選択は数字キー 1 発で行う（実測モデル）ので 2 桁は撃てない。
+            // 黙って壊れたキーを送らず、代替手段を添えて断る
+            if oi + 1 > MAX_NUMBER_KEY_OPTION {
+                return Err(format!(
+                    "質問 {} の選択肢 {} は数字キーで選べない（{MAX_NUMBER_KEY_OPTION} 番まで）。\
+                     tako_send_keys で down / enter を送って操作すること",
                     qi + 1,
                     oi + 1
                 ));
@@ -1033,6 +1047,28 @@ Do you want to proceed?\n\
         ];
         let e = resolve_answers(&qs, &specs).unwrap_err();
         assert!(e.contains("単一選択"), "{e}");
+    }
+
+    /// 10 番目以降は数字キー 1 発で選べない。壊れたキー（"10"）を送らずに断り、
+    /// 代替手段（tako_send_keys の矢印操作）を案内する
+    #[test]
+    fn 十番目以降の選択肢は数字キーで選べないと断る() {
+        let labels: Vec<String> = (1..=12).map(|i| format!("案 {i}")).collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let qs = vec![q("案", "どれ?", false, &refs)];
+        let specs = vec![AnswerSpec {
+            question: None,
+            options: vec!["10".into()],
+        }];
+        let e = resolve_answers(&qs, &specs).unwrap_err();
+        assert!(e.contains("数字キーで選べない"), "{e}");
+        assert!(e.contains("tako_send_keys"), "{e}");
+        // 9 番目までは通る
+        let specs = vec![AnswerSpec {
+            question: None,
+            options: vec!["9".into()],
+        }];
+        assert_eq!(resolve_answers(&qs, &specs).unwrap()[0].option_indices, [8]);
     }
 
     #[test]

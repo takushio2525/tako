@@ -6602,6 +6602,8 @@ mod platform_matrix_parity {
         ("git abort", "tako_git_merge_abort"),
         ("git branch", "tako_git_branch_create"),
         ("git resolve", "tako_git_resolve_agent"),
+        // #662: CLI は `tako keys`（最短形。#322）、MCP は `tako_send_keys`（送信系と分かる名前）
+        ("keys", "tako_send_keys"),
         ("list", "tako_list_panes"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),
