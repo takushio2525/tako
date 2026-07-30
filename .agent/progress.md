@@ -1502,6 +1502,18 @@
   単体テスト 4 本（DPI 表 + 修正後 0 + 番犬）を追加。tako-app 228 passed 0 failed
 - 実機目視は未検証（人手確認待ち）。候補ウィンドウ側（#582 の `CFS_EXCLUDE`）は不変
 
+## 2026-07-29（#643: 「ちらつき・描画が不安定」を実測で 2 原因に切り分け）
+- ちらつきは #628 のコンソール窓で確定。稼働バイナリ（0.5.13・07-28 01:37）が修正
+  `88f91ac`（02:07）より 30 分古く、毎秒 1.5 個の conhost が明滅していた（修正入りの
+  隔離起動では 45 秒で 1 個 = 起動時 ConPTY のみ）。**コード修正は不要・版の入れ替えだけ**
+- 「描画が不安定」= perf.log の「UI ストール」の誤認。foreground executor の再開遅延は
+  Windows では WinRT スレッドプール + メインスレッドキューの 2 段で、どちらの遅れか
+  区別できていなかった（98 件中 94 件が perf_span と非共起。#168 では 1021 件全件共起）。
+  watchdog の素の OS スレッドの sleep 超過を物差しに `classify_stall` で 3 分類へ
+- 端末イベントを 1 件 = 1 往復で `update` していた経路をまとめ処理化（上限 256・
+  `TAKO_TERM_EVENT_DRAIN=0` で旧挙動）+ `term_events` スパン新設（従来は計測の外）
+- アイドル計測で「常時 dirty で毎 vsync 描画」説は否定（10 秒窓 5 本中 render 8 回）
+
 ## 2026-07-30（#524: Windows のポート検知とスリープ防止を実装）
 - B5 検査側: `GetExtendedTcpTable`（v4/v6）+ Toolhelp32 で「PTY 直下プロセスの子孫」から
   listen ポートを検知（`platform::procinfo` 新設）。ペインのキーは OS で実体が違うので
@@ -1513,3 +1525,4 @@
   sleep_guard = degraded（蓋閉じ非対応の理由つき）
 - 罠: 並行 worker と `CARGO_TARGET_DIR` を共有すると同一ハッシュの rlib が上書きされ、
   **別ブランチの成果物が link される**（baseline のまま動く）。検証は worktree 専用 target dir で行う
+
