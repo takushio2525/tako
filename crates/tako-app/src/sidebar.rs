@@ -417,6 +417,7 @@ impl TakoApp {
                         .flex_1()
                         .flex()
                         .flex_col()
+                        .track_scroll(&self.filetree_scroll_handle)
                         .overflow_y_scroll()
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let path = row.entry.path.clone();

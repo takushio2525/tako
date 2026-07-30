@@ -1125,6 +1125,10 @@ struct TakoApp {
     preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
     /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
     preview_scroll_handles: HashMap<PaneId, gpui::ScrollHandle>,
+    /// ファイルツリーの行リストのスクロールハンドル。行ごとの実描画矩形
+    /// （`bounds_for_item`）が取れるので、インデントガイドの検査（#589 / #668）が
+    /// 「今どの行がどこに描かれているか」を推測せず参照できる
+    filetree_scroll_handle: gpui::ScrollHandle,
     /// シークバー要素の実測 bounds（paint 時に canvas で記録）
     video_seek_bar_bounds: HashMap<PaneId, Bounds<Pixels>>,
     /// シークバーのドラッグ中フラグ（ペイン ID。ドラッグ中はマウス移動でシーク位置を追従）
@@ -2330,6 +2334,7 @@ impl TakoApp {
             preview_changelogs: HashMap::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
+            filetree_scroll_handle: gpui::ScrollHandle::new(),
             video_seek_bar_bounds: HashMap::new(),
             video_seek_dragging: None,
             video_seek_hover: None,
@@ -17277,6 +17282,94 @@ mod self_test {
         )
     }
 
+    /// 深さごとのインデントガイド走査範囲（論理 px の top..bottom）を、
+    /// ファイルツリーの**実際に描かれた行矩形**から求める（#668）。
+    ///
+    /// ガイド線は「深さ d 以上の行が連なるあいだ 1 本の縦線」なので、その連なりの
+    /// 先頭行の上端から末尾行の下端までが検査すべき区間。可視範囲外の行は prepaint
+    /// されず矩形が前フレームのまま残るため、リストの見える範囲でクリップする。
+    #[cfg(feature = "visual-test")]
+    fn md_tree_guide_windows(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) -> std::collections::HashMap<usize, (f32, f32)> {
+        window
+            .update(cx, |app, _, _| {
+                let handle = app.filetree_scroll_handle.clone();
+                let list = handle.bounds();
+                let (list_top, list_bottom) = (f32::from(list.top()), f32::from(list.bottom()));
+                // `bounds_for_item` はスクロールオフセットを掛ける前（コンテンツ座標系）の
+                // 矩形を返す（GPUI は prepaint で子へ offset を掛ける）。画面座標へ直す
+                let offset_y = f32::from(handle.offset().y);
+                let depths: Vec<usize> = app.filetree.rows().iter().map(|row| row.depth).collect();
+                let mut windows = std::collections::HashMap::new();
+                for depth in 1..=4usize {
+                    // 深さ d 以上が途切れずに続く区間のうち、可視行を含む最長のもの
+                    let mut best: Option<(f32, f32, usize)> = None;
+                    let mut run: Option<(f32, f32, usize)> = None;
+                    for (index, row_depth) in depths.iter().enumerate() {
+                        let visible = handle.bounds_for_item(index).map(|b| {
+                            (
+                                (f32::from(b.top()) + offset_y).max(list_top),
+                                (f32::from(b.bottom()) + offset_y).min(list_bottom),
+                            )
+                        });
+                        let inside = visible.filter(|(top, bottom)| bottom > top);
+                        match (row_depth >= &depth, inside) {
+                            (true, Some((top, bottom))) => {
+                                run = Some(match run {
+                                    Some((start, _, count)) => (start, bottom, count + 1),
+                                    None => (top, bottom, 1),
+                                });
+                            }
+                            _ => {
+                                if let Some(current) = run.take() {
+                                    if best.is_none_or(|(_, _, n)| current.2 > n) {
+                                        best = Some(current);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(current) = run.take() {
+                        if best.is_none_or(|(_, _, n)| current.2 > n) {
+                            best = Some(current);
+                        }
+                    }
+                    if std::env::var_os("TAKO_VISUAL_GUIDE_DEBUG").is_some() {
+                        let rows: Vec<String> = depths
+                            .iter()
+                            .enumerate()
+                            .take(9)
+                            .map(|(index, row_depth)| {
+                                let b = handle.bounds_for_item(index);
+                                format!(
+                                    "{index}:d{row_depth}@{}",
+                                    b.map(|b| format!(
+                                        "{:.0}..{:.0}",
+                                        f32::from(b.top()) + offset_y,
+                                        f32::from(b.bottom()) + offset_y
+                                    ))
+                                    .unwrap_or_else(|| "none".into())
+                                )
+                            })
+                            .collect();
+                        println!(
+                            "TAKO_VISUAL_GUIDE_DEBUG: depth={depth} list={list_top:.0}..{list_bottom:.0} offset={offset_y:.1} best={best:?} rows=[{}]",
+                            rows.join(" ")
+                        );
+                    }
+                    // 1 行だけでは「連続しているか」を問えないので 2 行以上を要求する
+                    if let Some((top, bottom, count)) = best.filter(|(_, _, n)| *n >= 2) {
+                        windows.insert(depth, (top, bottom));
+                        let _ = count;
+                    }
+                }
+                windows
+            })
+            .unwrap_or_default()
+    }
+
     /// サブラインスクロール（#159）の実ピクセル検証: `after` を `dy_logical`（論理 px）
     /// ぶん y 方向へ戻して `before` と比較する。ピクセル単位スクロールが機能していれば
     /// 「そのまま比較 = 大差分 / 戻して比較 = ほぼ一致」になる。
@@ -18239,9 +18332,19 @@ mod self_test {
                 cx.background_executor()
                     .timer(Duration::from_millis(1500))
                     .await;
-                // ヘッダ（プロジェクト名 + パスボックス）の下から、ステータスバーの
-                // 手前までを見る。この範囲に 4 階層のチェーンが必ず収まる
-                let scan = (115.0, 420.0);
+                // 走査範囲は固定値にしない（#668）。旧実装は「ヘッダの下からステータスバーの
+                // 手前まで」を論理 px の定数（115.0, 420.0）で決めていたが、上に載る
+                // クロームが増える（初回起動バナー #549 等）とサイドバーのヘッダが範囲へ
+                // ずり込み、パスボックスの枠（色が border_subtle = ガイドと同色）を
+                // ガイドの一部と誤認して、実際には連続している線を「途切れている」と
+                // 判定していた。深さごとに**実際に描かれた行の矩形**から範囲を出す。
+                // バナーはこの検査の対象外なので、環境を決めるために先に閉じておく
+                window
+                    .update(cx, |app, _, cx| {
+                        app.welcome_banner = false;
+                        cx.notify();
+                    })
+                    .ok();
                 for state in ["dark", "dark-scrolled", "light"] {
                     // 保留中のポーリング（2 秒ごとの sync_filetree_roots）を先に消化させる。
                     // このあと await を挟まずに撮るので、貼り直したルートは奪われない
@@ -18249,7 +18352,7 @@ mod self_test {
                         .timer(Duration::from_millis(400))
                         .await;
                     let (max_depth, colors) = window
-                        .update(cx, |app, win, cx| {
+                        .update(cx, |app, _, cx| {
                             // ルートはシェルの cwd 通知とポーリングで上書きされるため、
                             // 撮る直前に必ず貼り直す
                             app.filetree.visible = true;
@@ -18277,15 +18380,16 @@ mod self_test {
                             }
                             if state == "dark-scrolled" {
                                 // 行高さ（23.4375px）の整数倍にならない量でスクロールし、
-                                // 端数オフセットでも線が割れないことを見る
-                                win.dispatch_event(
-                                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                        position: point(px(120.0), px(300.0)),
-                                        delta: ScrollDelta::Pixels(point(px(0.0), px(-37.5))),
-                                        ..ScrollWheelEvent::default()
-                                    }),
-                                    cx,
-                                );
+                                // 端数オフセットでも線が割れないことを見る。
+                                // #668: 合成ホイールイベントは（貼り直し直後の hitbox が
+                                // 前フレームのままなので）ツリーのリストへ届かず、
+                                // 「スクロール後」の状態を実際には作れていなかった。
+                                // スクロールハンドルへ直接オフセットを入れて確実に動かす
+                                app.filetree_scroll_handle
+                                    .set_offset(point(px(0.0), px(-37.5)));
+                            } else {
+                                app.filetree_scroll_handle
+                                    .set_offset(point(px(0.0), px(0.0)));
                             }
                             cx.notify();
                             // 深さ 0..4 が並んでいること（ガイドは深さ 1〜4 に出る）
@@ -18312,13 +18416,24 @@ mod self_test {
                         let _ = frame
                             .save(std::path::Path::new(&dir).join(format!("filetree-{state}.png")));
                     }
+                    // 深さごとの走査範囲を、実際に描かれた行の矩形から出す（#668）。
+                    // 「深さ d 以上の行が連なる区間」= その深さのガイドが 1 本に見える区間
+                    let windows = md_tree_guide_windows(window, cx);
                     let mut all_continuous = true;
                     let mut all_uniform = true;
                     for depth in 1..=4 {
+                        let Some(scan) = windows.get(&depth).copied() else {
+                            fail(&format!(
+                                "visual-test インデントガイド({state}): 深さ {depth} の行が描かれていない"
+                            ));
+                        };
                         let (continuous, uniform, note) = indent_guide_continuity(
                             &frame, scale, depth, scan, colors.0, colors.1,
                         );
-                        println!("TAKO_VISUAL_PIXEL: indent-guide {state} {note}");
+                        println!(
+                            "TAKO_VISUAL_PIXEL: indent-guide {state} scan={:.0}..{:.0} {note}",
+                            scan.0, scan.1
+                        );
                         all_continuous &= continuous;
                         all_uniform &= uniform;
                     }
