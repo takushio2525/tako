@@ -2630,3 +2630,144 @@ mod syntax_resolution_tests {
         assert_ne!(syn.name, "Plain Text", "shebang で構文が特定される");
     }
 }
+
+/// Issue #669: コードプレビューの構文色がライトテーマの面で読めること。
+///
+/// サンプル値ではなく**実ハイライタの出力を全走査**して検証する（構文セットや
+/// syntect の既定テーマが変わっても穴が空かないように）。
+#[cfg(test)]
+mod light_theme_contrast_tests {
+    use super::*;
+    use tako_core::theme::{Theme, ThemeMode};
+
+    const RUST_SAMPLE: &str = r#"use std::collections::HashMap;
+
+/// ドキュメントコメント
+pub fn main() -> Result<(), String> {
+    let mut map: HashMap<&str, u32> = HashMap::new();
+    map.insert("answer", 42);
+    if let Some(v) = map.get("answer") {
+        println!("{v} {:?}", 3.14_f32);
+    }
+    Ok(())
+}
+"#;
+
+    const PYTHON_SAMPLE: &str = r#"import os
+from typing import Optional
+
+# コメント
+class Greeter:
+    """docstring"""
+
+    def __init__(self, name: str = "world") -> None:
+        self.name = name
+
+    def greet(self) -> Optional[str]:
+        return f"hello {self.name}" if os.environ.get("OK") else None
+"#;
+
+    const CPP_SAMPLE: &str = r#"#include <string>
+#include <vector>
+
+// コメント
+namespace demo {
+template <typename T>
+class Box {
+ public:
+  explicit Box(T value) : value_(std::move(value)) {}
+  const T& get() const noexcept { return value_; }
+
+ private:
+  T value_;
+};
+}  // namespace demo
+"#;
+
+    /// ハイライト結果に現れる構文色をすべて集める
+    fn syntax_colors(filename: &str, text: &str) -> Vec<tako_core::Rgb> {
+        let hl = SyntectHighlighter::new();
+        let mut colors: Vec<tako_core::Rgb> = hl
+            .highlight(Path::new(filename), text)
+            .iter()
+            .flat_map(|line| line.iter())
+            .filter_map(|span| span.color)
+            .collect();
+        colors.sort_by_key(|c| (c.r, c.g, c.b));
+        colors.dedup();
+        colors
+    }
+
+    const SAMPLES: [(&str, &str); 3] = [
+        ("sample.rs", RUST_SAMPLE),
+        ("sample.py", PYTHON_SAMPLE),
+        ("sample.cpp", CPP_SAMPLE),
+    ];
+
+    /// 受け入れ条件 1: ライトの実描画面（コードプレビュー本体 = `background`、
+    /// Markdown のコードブロック = `mantle`）に対して全構文色が 4.5:1 以上
+    #[test]
+    fn 代表言語の構文色がライトの実描画面で読める明度になる() {
+        let light = Theme::for_mode(ThemeMode::Light);
+        for (name, text) in SAMPLES {
+            let colors = syntax_colors(name, text);
+            assert!(colors.len() > 1, "{name} に複数の構文色が付く");
+            for (surface_name, surface) in
+                [("background", light.background), ("mantle", light.mantle)]
+            {
+                for raw in &colors {
+                    let after = light.adapt_syntax_color(*raw).contrast_ratio(surface);
+                    assert!(
+                        after >= 4.5,
+                        "{name} の {} が {surface_name} で AA 未達: 変換前 {:.2}:1 → 変換後 {after:.2}:1",
+                        raw.to_hex(),
+                        raw.contrast_ratio(surface)
+                    );
+                }
+            }
+        }
+    }
+
+    /// 受け入れ条件 2: ダークテーマの色は 1 ビットも変わらない
+    #[test]
+    fn ダークテーマの構文色は変換されない() {
+        let dark = Theme::for_mode(ThemeMode::Dark);
+        for (name, text) in SAMPLES {
+            for raw in syntax_colors(name, text) {
+                assert_eq!(
+                    dark.adapt_syntax_color(raw),
+                    raw,
+                    "{name} の {} がダークで変換された",
+                    raw.to_hex()
+                );
+            }
+        }
+    }
+
+    /// エッジ: 構文情報が無い入力（プレーンテキスト / 不明拡張子 / 空ファイル）でも
+    /// 変換が破綻せず、色が付くならライトで読めること
+    #[test]
+    fn 構文情報のない入力でも破綻しない() {
+        let light = Theme::for_mode(ThemeMode::Light);
+        for (name, text) in [
+            ("notes.txt", "ただの平文\nsecond line\n"),
+            ("data.unknownext", "no syntax for this\n"),
+            ("empty.rs", ""),
+            ("empty.txt", ""),
+        ] {
+            let lines = SyntectHighlighter::new().highlight(Path::new(name), text);
+            // 空ファイルは 0 行、平文は行数どおり（表示が欠けない）
+            assert_eq!(lines.len(), text.lines().count(), "{name} の行数");
+            for raw in syntax_colors(name, text) {
+                let after = light
+                    .adapt_syntax_color(raw)
+                    .contrast_ratio(light.background);
+                assert!(
+                    after >= 4.5,
+                    "{name} の {} が AA 未達: {after:.2}:1",
+                    raw.to_hex()
+                );
+            }
+        }
+    }
+}

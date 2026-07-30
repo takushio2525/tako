@@ -77,6 +77,13 @@ impl Rgb {
     }
 }
 
+/// syntect（ダーク配色固定）由来の構文色をライトの面へ載せるときの相対輝度の上限。
+///
+/// ライトテーマの描画面（コードプレビュー本体 = `background` / Markdown のコードブロック =
+/// `mantle`）に対して WCAG AA（本文 4.5:1）を満たす値。境界は
+/// `adapt_syntax_colorがライトの実描画面で読める明度になる` で固定している。
+pub const SYNTAX_LIGHT_MAX_LUMINANCE: f32 = 0.12;
+
 /// テーマモード（ライト / ダーク。Issue #217）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeMode {
@@ -612,6 +619,21 @@ impl Theme {
         }
     }
 
+    /// syntect 由来の構文色を、このテーマの面で読める色へ整える（Issue #656 / #669）。
+    ///
+    /// syntect のテーマは `base16-eighties.dark` 固定なので、ライトテーマの淡い面へ
+    /// そのまま載せると既定文字色が 1.3:1 まで落ちてほぼ見えない。ライトのときだけ
+    /// 相対輝度を [`SYNTAX_LIGHT_MAX_LUMINANCE`] まで落とす（チャンネル比は保つので
+    /// 構文色の識別は残る）。ダークは原色をそのまま返し従来の見た目を保つ。
+    ///
+    /// 描画時の変換なので、テーマ切替はハイライトの作り直し無しで即座に反映される。
+    pub fn adapt_syntax_color(&self, color: Rgb) -> Rgb {
+        match self.mode {
+            ThemeMode::Dark => color,
+            ThemeMode::Light => color.adapt_for_light_bg(SYNTAX_LIGHT_MAX_LUMINANCE),
+        }
+    }
+
     /// 256 色パレットのインデックスを解決する。
     /// 0–15 はテーマの ANSI 色、16–231 は 6x6x6 カラーキューブ、232–255 はグレースケール
     pub fn indexed_color(&self, index: u8) -> Rgb {
@@ -668,6 +690,61 @@ mod tests {
         // 色相（チャンネルの大小関係）は変換後も保たれる
         let green = Rgb::from_hex(0x99cc99).adapt_for_light_bg(0.12);
         assert!(green.g > green.r && green.g > green.b);
+    }
+
+    /// base16-eighties.dark（syntect の既定テーマ）の代表色。
+    /// 既定文字色 / 緑（文字列）/ 黄（関数名）/ 青（キーワード）/ 赤 / 紫 / コメント灰 / 白
+    const SYNTECT_SAMPLE_COLORS: [(u32, &str); 8] = [
+        (0xd3d0c8, "既定文字色"),
+        (0x99cc99, "緑（文字列）"),
+        (0xffcc66, "黄（関数名）"),
+        (0x6699cc, "青（キーワード）"),
+        (0xf2777a, "赤"),
+        (0xcc99cc, "紫"),
+        (0x747369, "コメント灰"),
+        (0xffffff, "白"),
+    ];
+
+    /// Issue #669: ライトテーマの**実描画面**すべてで AA（4.5:1）を満たすこと。
+    /// コードプレビュー本体は `background`、Markdown のコードブロックは `mantle` に載る。
+    #[test]
+    fn adapt_syntax_colorがライトの実描画面で読める明度になる() {
+        let light = Theme::default_light();
+        for (surface_name, surface) in [("background", light.background), ("mantle", light.mantle)]
+        {
+            for (hex, label) in SYNTECT_SAMPLE_COLORS {
+                let raw = Rgb::from_hex(hex);
+                let before = raw.contrast_ratio(surface);
+                let after = light.adapt_syntax_color(raw).contrast_ratio(surface);
+                assert!(
+                    after >= 4.5,
+                    "{label}（{}）が {surface_name} で AA 未達: {before:.2} → {after:.2}",
+                    raw.to_hex()
+                );
+            }
+        }
+    }
+
+    /// ダークテーマでは 1 ビットも変えない（Issue #669 の受け入れ条件 2）
+    #[test]
+    fn adapt_syntax_colorはダークで原色を返す() {
+        let dark = Theme::default_dark();
+        for (hex, label) in SYNTECT_SAMPLE_COLORS {
+            let raw = Rgb::from_hex(hex);
+            assert_eq!(dark.adapt_syntax_color(raw), raw, "{label} が変換された");
+        }
+    }
+
+    /// ライト変換後も色相（チャンネルの大小関係）が保たれ、構文色を見分けられること
+    #[test]
+    fn adapt_syntax_colorはライトでも色相を保つ() {
+        let light = Theme::default_light();
+        let green = light.adapt_syntax_color(Rgb::from_hex(0x99cc99));
+        assert!(green.g > green.r && green.g > green.b, "緑が緑でない");
+        let blue = light.adapt_syntax_color(Rgb::from_hex(0x6699cc));
+        assert!(blue.b > blue.g && blue.g > blue.r, "青が青でない");
+        let red = light.adapt_syntax_color(Rgb::from_hex(0xf2777a));
+        assert!(red.r > red.g && red.r > red.b, "赤が赤でない");
     }
 
     #[test]
