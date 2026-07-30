@@ -305,6 +305,16 @@ impl TerminalSession {
         // 器（tmux）を持たない環境で「このペインで何が動いているか」を辿る唯一の起点になる
         // （#592: Windows は backend=none なので tty / セッション名では対応付けられない）
         let child_pid = pty_child_pid(&pty);
+        // 疑似コンソールの文字コードを UTF-8 に固定する（#655。Windows のみ実体を持つ）。
+        // ConPTY は OEM コードページ（日本語版 Windows なら CP932）で始まるため、
+        // 放っておくと子が吐いた UTF-8 バイトを conhost が CP932 として解釈し、
+        // **tako が受け取る前に**文字が壊れる。上の `LC_CTYPE=UTF-8` 注入と同じ趣旨で、
+        // tako が自分の前提（描画経路は UTF-8 専用）を自分で敷く。
+        // 子が疑似コンソールへ接続し終えるまで数十 ms かかるので、待ちは別スレッドへ逃がす
+        // （UI スレッドは止めない）。失敗してもペインは起動する
+        if let Some(pid) = child_pid {
+            crate::platform::console::pin_pane_to_utf8_when_ready(pid);
+        }
         // PTY 読み取りを OSC 7 / 133 タップで観測する（バイト列は変更しない。`osc_tap`）
         let pty = TapPty::new(
             pty,
