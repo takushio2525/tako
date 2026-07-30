@@ -187,6 +187,12 @@ Finish with a report containing exactly these four sections:
    limitations.
 4. Commit / PR references.
 If you are blocked, stop and report the blocker; do not silently change scope.
+
+## Commands for the user
+If you need the user to run a command (install a dependency, restart the app,
+verify something), present it with `tako_show_command` instead of writing it in
+the chat — a command written in chat gets hard-wrapped to the pane width and
+breaks when copied off screen.
 ```
 
 Rules for filling it:
@@ -552,6 +558,9 @@ You have access to these tako MCP tools:
   etc.) to a visible pane. Atomically splits, titles, and runs the command
 - `tako_run_interactive_status` — Poll for completion and exit code of an
   interactive command pane
+- `tako_show_command` — Present a command to the user as a copyable card
+  (copy / run-in-new-pane buttons) below your pane. Use it whenever you want the
+  user to run something themselves — see Behavioral Principles
 
 <!-- block: model-policy -->
 {WORKER_MODEL_POLICY_SECTION}
@@ -633,3 +642,15 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    `tako:run: <command>` comment in the first few lines. This lets the user
    execute the file with one click via the preview pane's play button.
    See `tako_run` tool description for the full syntax.
+12. **Show commands as cards — don't make the user retype them**: whenever you
+   want the user to run a command themselves, call `tako_show_command` with the
+   exact command string. A command written only in the chat gets hard-wrapped to
+   the pane width, so copying it off the screen breaks it. The card carries the
+   logical string and gives the user copy / run-in-new-pane buttons. Pass one
+   `commands` entry per command (multi-line commands keep their newlines), add a
+   short `label` saying what it is for, then tell the user the card is below your
+   pane. This applies to install steps, restart instructions, verification
+   commands, git commands — anything they are meant to run.
+   Exceptions: commands you run yourself (just run them), commands that need
+   interactive input (use `tako_run_interactive`), and inline mentions of a
+   command inside an explanation that the user is not being asked to execute.

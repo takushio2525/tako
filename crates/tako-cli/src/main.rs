@@ -117,6 +117,12 @@ enum Command {
     /// 初回起動のウェルカムバナーの状態確認・再表示・非表示（Issue #549）。
     /// 引数なしで現在の表示状態と案内すべきコマンドを表示する
     Welcome(WelcomeArgs),
+    /// ユーザーに実行してほしいコマンドをコピー可能なカードとして提示する（Issue #666）。
+    /// `tako show-command "コマンド"` で対象ペイン下部にカードが出る
+    // 変異名が enum 名（Command）で終わるが、CLI 名 `show-command` は FR-2.7 の
+    // show_file / show_diff / show_url と揃えた提示系の語彙。名前を崩さず allow する
+    #[allow(clippy::enum_variant_names)]
+    ShowCommand(ShowCommandArgs),
     /// プラットフォーム対応マトリクスの参照（Issue #515）。
     /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     Platform(PlatformArgs),
@@ -2044,6 +2050,58 @@ struct SettingsArgs {
 struct WelcomeArgs {
     /// show（再表示）/ dismiss（閉じて以後出さない）。省略時は状態表示
     action: Option<String>,
+}
+
+/// コマンド提案カードの引数（Issue #666）。
+/// 標準の使い方は `tako show-command "コマンド"` の 1 形（#322 の最簡形）
+#[derive(Args)]
+struct ShowCommandArgs {
+    /// 提示するコマンド（複数指定でそのぶんカードに並ぶ）
+    commands: Vec<String>,
+    /// 何のためのコマンドかの短い説明（カード見出しに出る）
+    #[arg(long)]
+    label: Option<String>,
+    /// 対象ペイン（省略時は呼び出し元ペイン）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 表示中のカードと保管されている論理文字列を一覧する
+    #[arg(long, conflicts_with_all = ["label", "copy", "run", "dismiss"])]
+    list: bool,
+    /// カードのコマンドをクリップボードへコピーする（カードの「コピー」と同じ）
+    #[arg(long, conflicts_with_all = ["label", "run", "dismiss"])]
+    copy: bool,
+    /// カードのコマンドを新しいペインで実行する（カードの「新規ペインで実行」と同じ）
+    #[arg(long, conflicts_with_all = ["label", "dismiss"])]
+    run: bool,
+    /// カードを閉じる（--card 省略時はそのペインの全カード）
+    #[arg(long)]
+    dismiss: bool,
+    /// 対象カード ID（copy / run / dismiss。省略時は最新カード）
+    #[arg(long)]
+    card: Option<u64>,
+    /// 対象コマンド番号（copy / run。1 始まり。省略時は 1）
+    #[arg(long)]
+    index: Option<usize>,
+    /// run で新しいペインへフォーカスを移す（既定は移さない）
+    #[arg(long)]
+    focus: bool,
+}
+
+impl ShowCommandArgs {
+    /// フラグから dispatch の action を決める（既定は show）
+    fn action(&self) -> &'static str {
+        if self.list {
+            "list"
+        } else if self.copy {
+            "copy"
+        } else if self.run {
+            "run"
+        } else if self.dismiss {
+            "dismiss"
+        } else {
+            "show"
+        }
+    }
 }
 
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
@@ -4894,6 +4952,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Welcome(args) => Request::Welcome {
             action: args.action.clone(),
         },
+        Command::ShowCommand(args) => Request::ShowCommand {
+            action: Some(args.action().to_string()),
+            commands: args.commands.clone(),
+            label: args.label.clone(),
+            pane: args.pane,
+            card: args.card,
+            index: args.index,
+            focus: Some(args.focus).filter(|f| *f),
+        },
         Command::Lang(args) => Request::Lang {
             action: args.value.as_deref().map(|_| "set".to_string()),
             value: args.value.clone(),
@@ -6250,6 +6317,8 @@ fn print_result(command: &Command, result: &Value) {
         Command::PreviewReload(_) | Command::PreviewCache(_) | Command::PreviewChangelog(_) => {
             println!("{result}")
         }
+        // #666: カードの内容（論理文字列）は改行込みで読みたいので整形して出す
+        Command::ShowCommand(_) => println!("{}", pretty_json(result)),
         Command::Autorename(_)
         | Command::Portdetect(_)
         | Command::Autosuggest(_)

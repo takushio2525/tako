@@ -2224,6 +2224,62 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_show_command",
+            "description": "ユーザーに実行してほしいコマンドを、コピー可能なカードとして画面に出す\
+                （FR-2.22 / Issue #666）。**ユーザーへコマンドを実行してもらうときは必ずこれを使う**。\
+                会話本文にコマンドを書くだけだと、TUI がペイン幅で物理改行を入れるため\
+                ユーザーが画面からコピーすると壊れる。このツールに渡した文字列はそのまま保管され、\
+                カードは「コピー」（論理文字列を丸ごとクリップボードへ）と「新規ペインで実行」\
+                （同じタブに別ペインを開いて実行。対話中のペインは触らない）のボタンを持つ。\
+                action=show（既定）でカードを出す。commands は 1 件でも複数でもよく、\
+                改行を含む複数行コマンドは 1 要素として渡す（改行はそのまま保たれる）。\
+                label には「何のためのコマンドか」を短く書く。\
+                action=list で表示中カードと保管されている論理文字列を確認できる。\
+                action=copy / action=run はカードのボタンと同じ操作を AI から行う\
+                （run は確認なしで実行されるので、ユーザーが明示的に頼んだときだけ使う）。\
+                action=dismiss でカードを閉じる（card 省略時はそのペインの全カード）。\
+                会話に書いたコマンドの代わりに出すこと。カードを出したら\
+                「ペイン下部のカードからコピーか実行ができます」と一言添える。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["show", "list", "copy", "run", "dismiss"],
+                        "description": "操作種別（省略時は show）",
+                    },
+                    "commands": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "提示するコマンド（action=show で必須）。\
+                            改行を含む複数行コマンドは 1 要素として渡す",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "何のためのコマンドかの短い説明（任意。カード見出しに出る）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "カードを出すペイン ID（省略時は呼び出し元ペイン = 自分の会話ペイン）",
+                    },
+                    "card": {
+                        "type": "integer",
+                        "description": "対象カード ID（copy / run / dismiss。省略時は最新カード。\
+                            dismiss は省略でそのペインの全カード）",
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "対象コマンド番号（copy / run。1 始まり。省略時は 1）",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "run で新しいペインへフォーカスを移すか（既定 false）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_config_share",
             "description": "AI 系設定の git ベース共有（Issue #513）。tako の宣言的設定\
                 （profiles / projects / accounts / local-rules / settings）と claude の\
@@ -3844,6 +3900,15 @@ fn build_request(
         "tako_welcome" => Request::Welcome {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
+        "tako_show_command" => Request::ShowCommand {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            commands: command_array_arg(args, "commands")?,
+            label: str_arg(args, "label")?.map(|s| s.to_string()),
+            pane: u64_arg(args, "pane")?,
+            card: u64_arg(args, "card")?,
+            index: u64_arg(args, "index")?.map(|i| i as usize),
+            focus: bool_arg(args, "focus")?,
+        },
         "tako_config_share" => Request::ConfigShare {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             target: str_arg(args, "target")?.map(|s| s.to_string()),
@@ -4209,6 +4274,25 @@ fn bool_arg(args: &Value, key: &str) -> Result<Option<bool>, String> {
             .as_bool()
             .map(Some)
             .ok_or_else(|| format!("{key} は真偽値で指定する")),
+    }
+}
+
+/// #666: コマンド提案カードのコマンド配列。要素が文字列でなければ**黙って捨てずに
+/// エラーにする**（提示するコマンドを取りこぼすと、ユーザーへ渡る内容が変わってしまう）。
+/// 単一文字列も 1 件として受理する（配列を忘れた呼び出しを弾かない）
+fn command_array_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| format!("{key} の要素は文字列で指定する"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{key} は文字列の配列で指定する")),
     }
 }
 
@@ -4885,7 +4969,8 @@ mod tests {
         // #549 の tako_welcome と #552 の tako_pin_tab_title が別 PR で同時に
         // 125 → 126 へ更新したため、両方 merge 後の main では 127 とずれていた
         // #513 の tako_config_share を追加して 129
-        assert_eq!(tools.len(), 129);
+        // #666 の tako_show_command を追加して 130
+        assert_eq!(tools.len(), 130);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -4898,6 +4983,58 @@ mod tests {
             .find(|t| t["name"] == "tako_split_pane")
             .unwrap();
         assert!(split["description"].as_str().unwrap().contains("レビュー"));
+        // #666: 「会話に書かずカードで出せ」の行動規範を説明文へ埋め込む（FR-2.22.9）
+        let card = tools
+            .iter()
+            .find(|t| t["name"] == "tako_show_command")
+            .unwrap();
+        let desc = card["description"].as_str().unwrap();
+        assert!(desc.contains("実行してほしいコマンド"), "{desc}");
+        assert!(desc.contains("物理改行"), "壊れる理由を書くこと: {desc}");
+    }
+
+    /// #666: コマンド提案カードの引数マッピング。commands は取りこぼしを許さない
+    #[test]
+    fn show_commandの引数が正しく写る() {
+        let (_, requests) = run(
+            call(
+                "tako_show_command",
+                json!({ "commands": ["brew install tmux", "tako setup"], "label": "依存を入れる" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::ShowCommand {
+                action: None,
+                commands: vec!["brew install tmux".into(), "tako setup".into()],
+                label: Some("依存を入れる".into()),
+                pane: None,
+                card: None,
+                index: None,
+                focus: None,
+            }]
+        );
+        // 単一文字列も 1 件として受理する（配列を忘れた呼び出しを弾かない）
+        let (_, requests) = run(
+            call("tako_show_command", json!({ "commands": "tako master" })),
+            Some(7),
+            true,
+        );
+        assert!(matches!(
+            requests.first(),
+            Some(Request::ShowCommand { commands, .. }) if commands == &vec!["tako master".to_string()]
+        ));
+        // 文字列以外の要素は黙って捨てずエラーにする（提示内容が変わってしまうため）
+        let (response, requests) = run(
+            call("tako_show_command", json!({ "commands": ["ok", 42] })),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty(), "不正な引数で dispatch しない");
+        let text = response.unwrap().to_string();
+        assert!(text.contains("commands"), "{text}");
     }
 
     #[test]

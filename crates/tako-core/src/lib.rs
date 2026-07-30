@@ -6,6 +6,7 @@
 pub mod acceptance_gate;
 pub mod backend;
 pub mod byte_lru;
+pub mod command_card;
 pub mod git;
 pub mod header_layout;
 pub mod i18n;
@@ -41,6 +42,7 @@ pub mod tmux_backend;
 pub mod workspace;
 
 pub use byte_lru::ByteLru;
+pub use command_card::{CommandCard, CommandCardError, CommandCardId, CommandCards};
 pub use git::{
     CheckoutPreview, CommitBlock, CommitDetail, CommitFileChange, ConflictState, DiffFile,
     DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus, GitStatusEntry,

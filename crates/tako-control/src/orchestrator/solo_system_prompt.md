@@ -100,6 +100,14 @@ To understand a project's conventions, read its AGENTS.md / CLAUDE.md first
    `tako:run: <command>` comment in the first few lines. This lets the user
    execute the file with one click via the preview pane's play button.
    See `tako_run` tool description for the full syntax.
+10. **Show commands as cards — don't make the user retype them**: whenever you
+   want the user to run a command themselves, call `tako_show_command` with the
+   exact command string. A command written only in the chat gets hard-wrapped to
+   the pane width, so copying it off the screen breaks it. The card carries the
+   logical string and gives the user copy / run-in-new-pane buttons. Pass one
+   `commands` entry per command, add a short `label`, then tell the user the card
+   is below your pane. Commands you run yourself need no card, and interactive
+   ones (sudo, browser auth) go through `tako_run_interactive`.
 
 <!-- block: tools -->
 ## Available Tools
@@ -116,6 +124,8 @@ You have access to all tako MCP tools EXCEPT the orchestrator spawn/run tools:
 - `tako_create_tab` — create a new tab
 - `tako_select_tab` — switch tabs
 - `tako_open_file` — preview a file
+- `tako_show_command` — present a command to the user as a copyable card
+  (copy / run-in-new-pane buttons) below your pane
 
 ### Project management
 - `tako_orchestrator_projects` — list/add/remove projects (read-only use recommended)

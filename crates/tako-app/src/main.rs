@@ -15,6 +15,7 @@
 
 mod about_window;
 mod autorename;
+mod command_card_ui;
 mod drawer;
 mod file_icons;
 mod filetree;
@@ -1262,6 +1263,15 @@ struct TakoApp {
     /// 起動直後は None: 初回 `cx.set_menus` は TakoApp 生成前（＝ settings の
     /// 言語適用前）に走るため、初回 render で必ず貼り直して解決済み言語に合わせる
     menus_lang: Option<tako_core::i18n::Lang>,
+    /// AI コマンド提案カード（FR-2.22 / #666）。揮発 = layout 永続化の対象外
+    command_cards: tako_core::CommandCards,
+    /// dispatch からのクリップボード書き込み待ち（#666。GPUI の clipboard API は
+    /// `App` を要するため render で流す。`pending_settings_open` と同じ方式）
+    pending_clipboard: Vec<String>,
+    /// コピー成功フィードバックの対象（#666。`(カード ID, コマンド番号, 表示開始時刻)`）
+    command_card_copied: Option<(u64, usize, std::time::Instant)>,
+    /// カード操作の失敗表示（#666。`(カード ID, 表示開始時刻)`。理由は診断ログへ）
+    command_card_error: Option<(u64, std::time::Instant)>,
 }
 
 /// × ボタン / cmd+W close の確認ダイアログ対象（Issue #172）。
@@ -2405,6 +2415,10 @@ impl TakoApp {
             update_window_handle: None,
             pending_update_open: false,
             menus_lang: None,
+            command_cards: tako_core::CommandCards::new(),
+            pending_clipboard: Vec::new(),
+            command_card_copied: None,
+            command_card_error: None,
         };
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
         // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
@@ -2805,6 +2819,8 @@ impl TakoApp {
                     if std::mem::take(&mut app.pending_update_open) {
                         app.open_update_window_impl(cx);
                     }
+                    // コマンドカードのコピー（#666）。CLI / MCP から copy されたぶんを流す
+                    app.flush_pending_clipboard(cx);
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
@@ -3025,6 +3041,8 @@ impl TakoApp {
                         app.poll_webview_state();
                         app.process_pending_new_windows(wcx);
                     }
+                    // #666: 閉じたペインのコマンドカードを掃除する（メモリ操作のみ）
+                    app.prune_command_cards();
                     let sleep_guard_backends = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
                         app.sleep_guard_backends()
@@ -12320,6 +12338,14 @@ impl TakoApp {
             .find(|s| s.pane == pane_id)
             .map(|s| (s.port, s.process.clone()));
 
+        // AI コマンド提案カード（FR-2.22 / #666）。提案チップと重ならないようチップの
+        // ぶんだけ上へ寄せ、ペインヘッダを覆わないよう残り高さを上限として渡す
+        let command_cards = {
+            let bottom_offset = if suggestion.is_some() { 32.0 } else { 6.0 };
+            let available = f32::from(area.size.height) - PANE_TITLE_BAR - bottom_offset - 6.0;
+            self.render_command_cards(pane_id, bottom_offset, available, cx)
+        };
+
         // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
         // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
         let lines = self.terminal_screen_lines(pane_id, true);
@@ -13120,6 +13146,8 @@ impl TakoApp {
                             .child("×"),
                     )
             }))
+            // AI コマンド提案カード（FR-2.22 / #666）。提案チップより後に積んで前面に出す
+            .children(command_cards)
             // 子ワーカードロップダウン（カンプ: w282 / radius 9。ヘッダ下に絶対配置）
             // ターミナルテキストエリアより後に描画し、背後が透けないようにする（#341）
             .when(workers_menu_open, |d| {
@@ -13651,6 +13679,21 @@ impl UiStateHost for TakoApp {
 
     fn set_welcome_banner_visible(&mut self, visible: bool) {
         self.welcome_banner = visible;
+    }
+
+    // #666: AI コマンド提案カード。判定・検証・実行は dispatch 側に置き、
+    // ここは保管庫の受け渡しだけを行う（UI 層に閉じたロジックを作らない）
+    fn command_cards(&self) -> Option<&tako_core::CommandCards> {
+        Some(&self.command_cards)
+    }
+
+    fn command_cards_mut(&mut self) -> Option<&mut tako_core::CommandCards> {
+        Some(&mut self.command_cards)
+    }
+
+    fn queue_clipboard_copy(&mut self, text: String) -> bool {
+        self.pending_clipboard.push(text);
+        true
     }
 
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
@@ -15431,6 +15474,8 @@ impl Render for TakoApp {
         if std::mem::take(&mut self.pending_update_open) {
             self.open_update_window_impl(cx);
         }
+        // コマンドカードのコピー（#666。GPUI の clipboard API は App が要るのでここで流す）
+        self.flush_pending_clipboard(cx);
         // このウィンドウの表示タブ（Issue #339 ビューポート方式)。同一 entity を
         // 全ウィンドウの root view として共有するため、呼び出し元 window ごとに解決する
         let display_tab = self.display_tab_for(window);
@@ -27486,6 +27531,226 @@ mod self_test {
                     let _ = CURRENT_VERSION;
                     cx.notify();
                 });
+            }
+
+            // 91. AI コマンド提案カード（#666）。この機能の存在意義は「画面の折り返しで
+            // コピーが壊れない」ことなので、実クリップボードとの一致まで見る。
+            // (a) ペイン幅より長い 1 行が改行なしでコピーされる
+            // (b) 改行・引用符・$ 変数・日本語を含むコマンドが 1 文字も変わらない
+            // (c) UI ボタンの経路（copy_command_card / run_command_card）と dispatch
+            //     （CLI / MCP と同一）が同じ結果になる
+            // (d) 「新規ペインで実行」で同じタブにペインが生え、実際にコマンドが走る
+            // (e) 狭幅ペインでもカードの描画が落ちない
+            {
+                use tako_control::protocol::Request;
+                let show = |app: &mut TakoApp, cmds: Vec<String>, pane: u64| -> serde_json::Value {
+                    tako_control::dispatch(
+                        app,
+                        Request::ShowCommand {
+                            action: None, // 既定 = show
+                            commands: cmds,
+                            label: Some("セルフテスト".into()),
+                            pane: Some(pane),
+                            card: None,
+                            index: None,
+                            focus: None,
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }))
+                };
+                // 折り返しが必ず起きる長さの 1 行 + 実運用で壊れやすい要素を含む複数行
+                let long = format!(
+                    "cargo test --workspace -- --nocapture --test-threads=1 {}",
+                    "abcdefghij".repeat(20)
+                );
+                let tricky = "echo \"日本語 と $HOME と 'クォート'\" \\\n  && ls -la /tmp";
+                let (pane, card_id) = window
+                    .update(cx, |app, _, cx| {
+                        let pane = app.focused_pane().as_u64();
+                        let v = show(app, vec![long.clone(), tricky.to_string()], pane);
+                        cx.notify();
+                        (pane, v["card"]["id"].as_u64().unwrap_or(0))
+                    })
+                    .unwrap_or((0, 0));
+                check(card_id > 0 && pane > 0, "コマンドカードの表示 (#666)");
+
+                // list（CLI / MCP と同一経路）が論理文字列をそのまま返す
+                let listed_ok = window
+                    .update(cx, |app, _, _| {
+                        let v = tako_control::dispatch(
+                            app,
+                            Request::ShowCommand {
+                                action: Some("list".into()),
+                                commands: Vec::new(),
+                                label: None,
+                                pane: Some(pane),
+                                card: None,
+                                index: None,
+                                focus: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .unwrap_or_default();
+                        v["cards"][0]["commands"][0] == serde_json::json!(long)
+                            && v["cards"][0]["commands"][1] == serde_json::json!(tricky)
+                    })
+                    .unwrap_or(false);
+                check(listed_ok, "コマンドカードの list が論理文字列を返す (#666)");
+
+                // (a)(b)(c) UI のコピーボタンと同じ経路 → 実クリップボードで照合
+                let copy_via_button = |index: usize, cx: &mut AsyncApp| -> Option<String> {
+                    window
+                        .update(cx, |app, _, cx| {
+                            app.copy_command_card(card_id, index, cx);
+                            // render と同じ 1 行（GPUI の clipboard API は App が要る）
+                            app.flush_pending_clipboard(cx);
+                        })
+                        .ok()?;
+                    cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()))
+                };
+                let copied_long = copy_via_button(1, cx);
+                check(
+                    copied_long.as_deref() == Some(long.as_str())
+                        && !copied_long.as_deref().unwrap_or("\n").contains('\n'),
+                    "長いコマンドが改行なしの論理 1 行でコピーされる (#666)",
+                );
+                let copied_tricky = copy_via_button(2, cx);
+                check(
+                    copied_tricky.as_deref() == Some(tricky),
+                    "改行・引用符・変数・日本語を含むコマンドがそのままコピーされる (#666)",
+                );
+                // コピー成功フィードバックが立つ（ボタン表示が変わる根拠）
+                let feedback = window
+                    .update(cx, |app, _, _| {
+                        app.command_card_copied
+                            .is_some_and(|(id, idx, _)| id == card_id && idx == 2)
+                    })
+                    .unwrap_or(false);
+                check(feedback, "コピー成功のフィードバックが立つ (#666)");
+
+                // (e) 狭幅でも描画が落ちない: サイドバー + パネルを広げてペインを狭くし、
+                // 実際にフレームを描く（要素構築で panic すればここで死ぬ）
+                let narrow_ok = window
+                    .update(cx, |app, win, cx| {
+                        let (sidebar, panel) = (app.sidebar_width, app.panel_width);
+                        let (fv, pv) = (app.filetree.visible, app.panel_visible);
+                        app.filetree.visible = true;
+                        app.panel_visible = true;
+                        app.sidebar_width = f32::from(win.viewport_size().width) * 0.45;
+                        app.panel_width = f32::from(win.viewport_size().width) * 0.4;
+                        cx.notify();
+                        let _ = app.render(win, cx);
+                        app.sidebar_width = sidebar;
+                        app.panel_width = panel;
+                        app.filetree.visible = fv;
+                        app.panel_visible = pv;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                check(narrow_ok, "狭幅ペインでもカードを描画できる (#666)");
+
+                // (d) UI の「新規ペインで実行」ボタン → 同じタブにペインが生えて実行される
+                let marker = "TAKO-CARD-RUN-OK";
+                let run_cmd = format!("echo {marker}");
+                let before = window
+                    .update(cx, |app, _, _| {
+                        let ids: Vec<PaneId> = app
+                            .workspace
+                            .active_tab()
+                            .tree()
+                            .panes()
+                            .iter()
+                            .map(|p| p.id())
+                            .collect();
+                        (
+                            ids.len(),
+                            app.workspace.tabs().len(),
+                            app.focused_pane(),
+                            ids,
+                        )
+                    })
+                    .unwrap_or((0, 0, PaneId::from_raw(0), Vec::new()));
+                let (run_card, run_pane) = window
+                    .update(cx, |app, _, cx| {
+                        let v = show(app, vec![run_cmd.clone()], pane);
+                        let id = v["card"]["id"].as_u64().unwrap_or(0);
+                        app.run_command_card(id, 1, cx);
+                        // run 応答のペインは dispatch が返すが、UI ボタン経路では
+                        // 戻り値を捨てるので「増えたペイン」を差分で拾う
+                        let grown = app
+                            .workspace
+                            .active_tab()
+                            .tree()
+                            .panes()
+                            .iter()
+                            .map(|p| p.id())
+                            .find(|id| !before.3.contains(id));
+                        (id, grown)
+                    })
+                    .unwrap_or((0, None));
+                // 構造（同じタブに 1 枚増える / タブは増えない / フォーカス不動）は同期で決まる
+                let (structure_ok, after_len, tabs_len, focus_kept) = window
+                    .update(cx, |app, _, _| {
+                        let after = app.workspace.active_tab().tree().panes().len();
+                        let tabs = app.workspace.tabs().len();
+                        let focus_kept = app.focused_pane() == before.2;
+                        (
+                            after == before.0 + 1 && tabs == before.1 && focus_kept,
+                            after,
+                            tabs,
+                            focus_kept,
+                        )
+                    })
+                    .unwrap_or((false, 0, 0, false));
+                // 構造の判定はここで確定する。**出力待ちの前に出す**ことで、
+                // 待ち中にウィンドウが閉じた等でこの項目が最後まで走らなかったときも
+                // 「どこまで進んだか」がログに残る
+                eprintln!(
+                    "TAKO_SELF_TEST_666_STRUCTURE: panes {} -> {} tabs={} focus_kept={} new_pane={:?}",
+                    before.0, after_len, tabs_len, focus_kept, run_pane
+                );
+                // 実行はシェル起動 → 出力 → パースを待つ（tmux バックエンド時は attach ぶん遅い）
+                let mut ran = false;
+                for _ in 0..20 {
+                    wait(cx, 400).await;
+                    ran = window
+                        .update(cx, |app, _, _| {
+                            run_pane.and_then(|p| app.terminals.get(&p)).is_some_and(|s| {
+                                s.visible_lines().iter().any(|l| l.contains(marker))
+                            })
+                        })
+                        .unwrap_or(false);
+                    if ran {
+                        break;
+                    }
+                }
+                eprintln!(
+                    "TAKO_SELF_TEST_666_RUN: panes {} -> {} tabs={} focus_kept={} new_pane={:?} ran={}",
+                    before.0, after_len, tabs_len, focus_kept, run_pane, ran
+                );
+                check(
+                    structure_ok && ran,
+                    "カードの新規ペイン実行: 同じタブに生えて実行され、フォーカスは動かない (#666)",
+                );
+
+                // 閉じたカードのボタンを押しても壊れない（× → 再クリック相当）
+                let dismissed_ok = window
+                    .update(cx, |app, _, cx| {
+                        app.dismiss_command_card(card_id, cx);
+                        app.dismiss_command_card(run_card, cx);
+                        // 二重クリック（もう無いカード）でも panic しない
+                        app.dismiss_command_card(card_id, cx);
+                        app.copy_command_card(card_id, 1, cx);
+                        app.run_command_card(card_id, 1, cx);
+                        app.command_cards.list(Some(PaneId::from_raw(pane))).is_empty()
+                    })
+                    .unwrap_or(false);
+                check(
+                    dismissed_ok,
+                    "カードの × で閉じ、消えたカードへの操作は無害 (#666)",
+                );
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

@@ -1355,6 +1355,33 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         no_push: bool,
     },
+    /// AI コマンド提案カード（FR-2.22 / Issue #666）。AI が「ユーザーに実行してほしい
+    /// コマンド」を渡すと、対象ペイン下部にコピー / 新規ペイン実行つきのカードを出す。
+    /// `action` = "show"（既定。カードを出す）/ "list"（表示中カードと論理文字列）/
+    /// "copy"（クリップボードへコピー）/ "run"（新しいペインで実行）/ "dismiss"（閉じる）
+    ShowCommand {
+        #[serde(default)]
+        action: Option<String>,
+        /// 提示するコマンド（action=show で必須。改行を含む複数行コマンドも 1 要素として渡す）
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<String>,
+        /// 何のためのコマンドかの説明（任意。カードの見出しに出る）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// 対象ペイン（省略時は呼び出し元ペイン）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 対象カード ID（copy / run / dismiss。省略時は対象ペインの最新カード。
+        /// dismiss は省略でそのペインの全カード）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<u64>,
+        /// 対象コマンド番号（copy / run。1 始まり。省略時は 1）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// run で新ペインへフォーカスを移すか（既定 false = 手元のペインを触らない）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
+    },
 }
 
 impl Request {
