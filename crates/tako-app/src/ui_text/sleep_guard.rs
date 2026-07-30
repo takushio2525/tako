@@ -4,8 +4,11 @@ use tako_control::sleep_guard::{SleepGuardMode, SleepGuardState};
 
 // --- チップ（キー: sleep_guard.chip_*） ---
 
+// #524: Windows でもスリープ防止が働くようになったため、**両 OS で表示されうる**
+// 文言から "Mac" を外した。macOS 固有の経路（pmset disablesleep / 蓋閉じ / thermal）
+// でしか出ない文言はそのまま
 pub fn chip_active() -> &'static str {
-    tr!("スリープ防止中", "Keeping Mac awake")
+    tr!("スリープ防止中", "Keeping this computer awake")
 }
 pub fn chip_active_lid() -> &'static str {
     tr!("スリープ防止中・蓋閉じOK", "Keeping awake / lid-close OK")
@@ -74,8 +77,8 @@ pub fn mode_label(mode: SleepGuardMode) -> &'static str {
 
 pub fn reason_always_on() -> &'static str {
     tr!(
-        "常時オンの設定のため、Mac を自動スリープさせていません",
-        "Always-on is enabled, so the Mac is kept from sleeping"
+        "常時オンの設定のため、自動スリープを止めています",
+        "Always-on is enabled, so automatic sleep is being held off"
     )
 }
 pub fn reason_agents_finishing() -> &'static str {
@@ -100,8 +103,8 @@ pub fn reason_idle() -> &'static str {
 /// エージェント稼働による防止理由（キー: sleep_guard.reason_agents_running）
 pub fn reason_agents_running(n: usize) -> String {
     tr!(
-        format!("エージェント {n} 体が稼働中のため、Mac を自動スリープさせていません"),
-        format!("{n} agent(s) running — keeping the Mac awake")
+        format!("エージェント {n} 体が稼働中のため、自動スリープを止めています"),
+        format!("{n} agent(s) running — holding off automatic sleep")
     )
 }
 
@@ -133,7 +136,7 @@ pub fn lid_keeps_running() -> &'static str {
 pub fn lid_sleeps() -> &'static str {
     tr!(
         "通常どおりスリープし、実行中の処理は止まります",
-        "The Mac sleeps as usual, stopping running processes"
+        "It sleeps as usual, stopping running processes"
     )
 }
 

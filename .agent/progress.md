@@ -1513,3 +1513,16 @@
 - 端末イベントを 1 件 = 1 往復で `update` していた経路をまとめ処理化（上限 256・
   `TAKO_TERM_EVENT_DRAIN=0` で旧挙動）+ `term_events` スパン新設（従来は計測の外）
 - アイドル計測で「常時 dirty で毎 vsync 描画」説は否定（10 秒窓 5 本中 render 8 回）
+
+## 2026-07-30（#524: Windows のポート検知とスリープ防止を実装）
+- B5 検査側: `GetExtendedTcpTable`（v4/v6）+ Toolhelp32 で「PTY 直下プロセスの子孫」から
+  listen ポートを検知（`platform::procinfo` 新設）。ペインのキーは OS で実体が違うので
+  `ports::pane_key` に閉じ込め、呼び出し側は不透明 u64 のまま単一経路
+- B9: `PowerCreateRequest` + `PowerSetRequest` でアイドルスリープを抑止（`platform::power` 新設）。
+  蓋閉じ / sudoers / thermal は macOS 固有 capability として `lid_control_supported()` で分離
+- 実機検証で `POWER_REQUEST_TYPE` の値取り違え（3 = ExecutionRequired）を検出・修正。
+  `powercfg /requests` の SYSTEM 欄に出ることまで確認。マトリクスは port_detect = supported /
+  sleep_guard = degraded（蓋閉じ非対応の理由つき）
+- 罠: 並行 worker と `CARGO_TARGET_DIR` を共有すると同一ハッシュの rlib が上書きされ、
+  **別ブランチの成果物が link される**（baseline のまま動く）。検証は worktree 専用 target dir で行う
+

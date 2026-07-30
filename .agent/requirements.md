@@ -152,8 +152,9 @@ MCP stdio ブリッジ（`tako mcp serve`）のフォールバックは「環境
 
 実装メモ（FR-2.4.2〜2.4.4 は 2026-06-12 完成）:
 
-- 検知は `tako-core::ports`（libproc + tty 突き合わせ、3 秒ポーリング）→ list / MCP の
-  `listen_ports`。詳細は `architecture.md`「Layer 3」節
+- 検知は `tako-core::ports`（3 秒ポーリング）→ list / MCP の `listen_ports`。
+  ペイン配下の判定は macOS = libproc + tty 突き合わせ、Windows = `GetExtendedTcpTable` +
+  Toolhelp32 の子孫判定（#524）。詳細は `architecture.md`「Layer 3」節
 - チップは検知ペイン下端のインライン表示（新規ポートごとに 1 件、却下でそのポートが
   消えるまで再提案しない）。承諾アクション = **Web ビューペイン生成**（FR-3.8。
   検知元ペインの右に開く。✅ 2026-07-13 #155 で外部ブラウザ `open` から差し替え。

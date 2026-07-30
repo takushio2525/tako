@@ -522,3 +522,20 @@ eval / hide / show / close を機械検証する。実マウス・キーボー�
 - [ ] ポップオーバーの外側（ターミナル領域など）をクリック → 閉じる。
       チップ再クリックでも閉じる（開いたまま残らない）
 - [ ] ダーク / ライト両テーマで文字が読める（ポップオーバーの背景・境界のコントラスト）
+
+## Windows のポート検知とスリープ防止（#524、2026-07-30）
+
+Windows 実機での動作は e2e で実測済み（`tako list` の `listen_ports` が netstat と一致、
+`powercfg /requests` の SYSTEM 欄に電源要求が出る）。**残るのは macOS 側の目視**で、
+Windows 実装のために触った共通部分に回帰が無いかを見る。
+
+macOS の CI（build + clippy + test）は緑だが、次の 3 点は見た目・体感なので人手で確認する。
+
+- [ ] ポート検知が macOS で従来どおり動く（`npm run dev` 等で listen → 提案チップが出る）。
+      判定材料の作り方が `ports::pane_key()` 経由に変わったが、macOS は従来と同じ
+      「制御端末の rdev」を返すので挙動は不変のはず
+- [ ] sleep-guard チップの英語表記が "Keeping this computer awake"（旧 "Keeping Mac awake"）
+      になっている。日本語表記「スリープ防止中」は不変。蓋閉じ・thermal・pmset 経路の
+      文言は macOS 専用なので変えていない
+- [ ] `tako sleep-guard status` の説明文で、蓋閉じ継続・sudoers・thermal の表示が従来どおり
+      （Windows 向けに capability を分離したが macOS は `lid_control_supported() = true`）
