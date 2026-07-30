@@ -412,6 +412,21 @@ impl PromptFlow {
     }
 }
 
+/// 新規ペインの素のシェルへ起動コマンドを送り届けるフロー（Issue #640）。
+/// 判断は純粋な `tako_core::shell_send::ShellSendFlow` が持ち、ここは
+/// 「どのペインか」と「いつ諦めるか」だけを持つ
+#[derive(Debug)]
+struct ShellCommandFlow {
+    pane: PaneId,
+    flow: tako_core::shell_send::ShellSendFlow,
+    created_at: std::time::Instant,
+}
+
+/// 起動コマンド送達フローの打ち切り時間。
+/// シェルの起動待ち（最大 30 秒）+ 書き直し 10 回（約 35 秒）+ Enter 再送（約 12 秒）を
+/// 足しても収まる長さ。ここを過ぎたら諦めて痕跡だけ残す
+const COMMAND_FLOW_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn rgba(c: tako_core::Rgb) -> Rgba {
     Rgba {
         r: c.r as f32 / 255.0,
@@ -753,6 +768,8 @@ struct TakoApp {
     alt_screen_writes: Vec<(PaneId, Vec<u8>, std::time::Instant)>,
     /// claude TUI へのプロンプト送信ステートマシン
     prompt_flows: Vec<PromptFlow>,
+    /// 新規ペインの素のシェルへ起動コマンドを送り届けるステートマシン（Issue #640）
+    command_flows: Vec<ShellCommandFlow>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
     /// dispatch 中に依頼された重量プレビュー（PDF / 動画）の background 読み込み
@@ -2020,6 +2037,7 @@ impl TakoApp {
             pending_writes: Vec::new(),
             alt_screen_writes: Vec::new(),
             prompt_flows: Vec::new(),
+            command_flows: Vec::new(),
             pending_highlights: Vec::new(),
             pending_preview_loads: Vec::new(),
             preview_device_scale: 1.0,
@@ -2745,6 +2763,9 @@ impl TakoApp {
             let ok = this.update(cx, |app: &mut TakoApp, _| {
                 if !app.alt_screen_writes.is_empty() {
                     app.flush_alt_screen_writes();
+                }
+                if !app.command_flows.is_empty() {
+                    app.drive_command_flows();
                 }
                 if !app.prompt_flows.is_empty() {
                     app.drive_prompt_flows();
@@ -3941,6 +3962,67 @@ impl TakoApp {
         self.alt_screen_writes = remaining;
     }
 
+    /// 新規ペインへの起動コマンド送達フローを駆動する（Issue #640）。
+    ///
+    /// 500ms tick で画面を見ながら「準備待ち → 本文 → エコー確認 → 分離 Enter →
+    /// 実行確認」を進める。書きっぱなしだと器（psmux）が起動直後の入力を落とし、
+    /// worker が素のプロンプトのまま何時間も止まる
+    fn drive_command_flows(&mut self) {
+        let mut remaining = Vec::new();
+        for mut entry in std::mem::take(&mut self.command_flows) {
+            if entry.created_at.elapsed() > COMMAND_FLOW_TIMEOUT {
+                eprintln!(
+                    "warning: 起動コマンドの送達フローがタイムアウト（pane={}, {}）",
+                    entry.pane.as_u64(),
+                    entry.flow.stage_name()
+                );
+                tako_control::diag::perf_log(&format!(
+                    "起動コマンド送達フロー打ち切り: pane={} 段階={} 書き直し={} 長さ={}",
+                    entry.pane.as_u64(),
+                    entry.flow.stage_name(),
+                    entry.flow.rewrites(),
+                    entry.flow.command_len()
+                ));
+                continue;
+            }
+            // セッションがまだ起動していない / 既に閉じた場合は次 tick へ持ち越す
+            let Some(session) = self.terminals.get(&entry.pane) else {
+                remaining.push(entry);
+                continue;
+            };
+            let before = entry.flow.stage_name();
+            match entry.flow.tick(&session.visible_lines()) {
+                tako_core::shell_send::ShellSendAction::Wait => {}
+                tako_core::shell_send::ShellSendAction::Write(bytes) => session.write(bytes),
+                tako_core::shell_send::ShellSendAction::Done { verified } => {
+                    if !verified {
+                        // 確認できないまま従来どおり書き切った経路。あとで
+                        // 「なぜ動かないのか」を追えるように痕跡だけ残す
+                        tako_control::diag::perf_log(&format!(
+                            "起動コマンドの送達を確認できずに送信: pane={} 書き直し={} 長さ={}",
+                            entry.pane.as_u64(),
+                            entry.flow.rewrites(),
+                            entry.flow.command_len()
+                        ));
+                    }
+                    continue;
+                }
+            }
+            let after = entry.flow.stage_name();
+            if before != after {
+                // 本文・画面内容は出さない（AGENTS.md の絶対ルール）。経路と回数だけ
+                tako_control::diag::flow_log(&format!(
+                    "起動コマンド送達: pane={} {before} → {after}（書き直し {} 回・長さ {}）",
+                    entry.pane.as_u64(),
+                    entry.flow.rewrites(),
+                    entry.flow.command_len()
+                ));
+            }
+            remaining.push(entry);
+        }
+        self.command_flows = remaining;
+    }
+
     /// claude TUI へのプロンプト送達フローを駆動する（Issue #32 送達確認ループ）。
     /// 画面内容を確認しながら各ステップを進める（sleep ベースではない）。
     /// 検出ロジックは実 TUI の採取画面に基づく `tako_control::claude_tui` を使う
@@ -3953,6 +4035,18 @@ impl TakoApp {
         let now = std::time::Instant::now();
         let prev_len = self.prompt_flows.len();
         for mut flow in std::mem::take(&mut self.prompt_flows) {
+            // 起動コマンドがまだ届いていないペインでは、プロンプトを送り始めない（#640）。
+            // WaitAltScreen は 15 秒で「未知の TUI」とみなして先へ進むので、
+            // 起動コマンドの送達に手間取っている間に発火すると、**素のシェルへ
+            // プロンプト本文を貼り付けて**しまう。待っている間は時計も止める
+            // （フロー自体はまだ始まっていないため）
+            if self.command_flows.iter().any(|c| c.pane == flow.pane) {
+                flow.created_at = now;
+                flow.state_entered_at = now;
+                active_panes.insert(flow.pane);
+                remaining.push(flow);
+                continue;
+            }
             if flow.created_at.elapsed() > std::time::Duration::from_secs(120) {
                 eprintln!(
                     "warning: プロンプト送達フローがタイムアウト（pane={}）",
@@ -12748,6 +12842,14 @@ impl SessionHost for TakoApp {
 
     fn queue_enter_flow(&mut self, pane: PaneId) {
         self.prompt_flows.push(PromptFlow::new_enter_only(pane));
+    }
+
+    fn queue_command_flow(&mut self, pane: PaneId, command: String) {
+        self.command_flows.push(ShellCommandFlow {
+            pane,
+            flow: tako_core::shell_send::ShellSendFlow::new(command),
+            created_at: std::time::Instant::now(),
+        });
     }
 
     fn detach_session(&mut self, pane: PaneId) {
