@@ -145,6 +145,115 @@ fn macos_only_bindings() -> Vec<KeyBinding> {
     Vec::new()
 }
 
+/// コマンドパレットの項目 ID から、そこに併記するショートカットの表示文字列を引く（#648）
+///
+/// Windows には GPUI のメニューバーが無く（#602）、ドキュメントを読まないと
+/// `Ctrl+Shift+D`（分割）のような **`cmd-` から機械的に読み替えられないキー**を
+/// 知る手段が無かった。パレットに併記して発見できるようにする。
+///
+/// 表示は必ず [`key_bindings`] から導出する。手書きの一覧を別に持つと、
+/// プラットフォーム差や将来のキー変更で確実に食い違うため
+/// （`パレットのショートカット表示はバインド表と一致する` テストが番犬）
+pub(crate) fn palette_shortcut(command_id: &str) -> Option<String> {
+    shortcut_hint(action_for_palette_command(command_id)?)
+}
+
+/// パレット項目 ID → アクション名。ショートカットを持たない項目は `None`
+/// （テーマ切替・パネル系はキーバインドが無く、パレットと CLI / MCP が入口）
+fn action_for_palette_command(command_id: &str) -> Option<&'static str> {
+    match command_id {
+        "new-tab" => Some("tako::NewTab"),
+        "split-right" => Some("tako::SplitRight"),
+        "split-down" => Some("tako::SplitDown"),
+        "toggle-files" => Some("tako::ToggleSidebar"),
+        _ => None,
+    }
+}
+
+/// アクション名から、**このプラットフォームで実際に届く**バインドの表示文字列を作る
+///
+/// 非 macOS で `cmd-` のバインドを案内してはいけない。GPUI の `cmd` は platform
+/// 修飾で Windows では Win キーへ解決され、シェルが先に奪うので届かない（#585）。
+/// ＝ 案内に出すと「書いてあるのに効かない」という最悪の体験になる
+fn shortcut_hint(action: &str) -> Option<String> {
+    let binding = key_bindings().into_iter().find(|b| {
+        b.action().name() == action
+            && !(cfg!(not(target_os = "macos"))
+                && b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
+    })?;
+    let hint = binding
+        .keystrokes()
+        .iter()
+        .map(|k| format_keystroke(k.inner()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!hint.is_empty()).then_some(hint)
+}
+
+/// 1 打鍵をその OS の慣習で表記する（macOS は記号、Windows / Linux は語）
+fn format_keystroke(k: &Keystroke) -> String {
+    let m = k.modifiers;
+    let key = format_key(&k.key);
+    if cfg!(target_os = "macos") {
+        // macOS のメニュー表記順（⌃⌥⇧⌘）
+        let mut s = String::new();
+        if m.control {
+            s.push('\u{2303}');
+        }
+        if m.alt {
+            s.push('\u{2325}');
+        }
+        if m.shift {
+            s.push('\u{21e7}');
+        }
+        if m.platform {
+            s.push('\u{2318}');
+        }
+        s.push_str(&key);
+        s
+    } else {
+        let mut parts: Vec<&str> = Vec::new();
+        if m.control {
+            parts.push("Ctrl");
+        }
+        if m.alt {
+            parts.push("Alt");
+        }
+        if m.shift {
+            parts.push("Shift");
+        }
+        let mut s = parts.join("+");
+        if !s.is_empty() {
+            s.push('+');
+        }
+        s.push_str(&key);
+        s
+    }
+}
+
+/// キー名の表示形。英字 1 文字は大文字、矢印は記号、それ以外は先頭大文字
+fn format_key(key: &str) -> String {
+    match key {
+        "left" => "\u{2190}".into(),
+        "right" => "\u{2192}".into(),
+        "up" => "\u{2191}".into(),
+        "down" => "\u{2193}".into(),
+        "tab" => "Tab".into(),
+        "enter" => "Enter".into(),
+        "escape" => "Esc".into(),
+        "insert" => "Insert".into(),
+        _ if key.len() == 1 => key.to_uppercase(),
+        // f11 → F11
+        _ => {
+            let mut c = key.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
 /// macOS 以外（Windows / Linux）向けの追加バインド（#467 / #585）
 ///
 /// 上の一覧の `cmd-` は GPUI では **platform 修飾**に解決され、Windows では
@@ -1290,6 +1399,85 @@ mod tests {
                 .all(|b| b.keystrokes().iter().all(|k| k.inner().modifiers.platform)),
             "macOS に非 platform 修飾のバインドが混入している"
         );
+    }
+
+    /// #648: パレットに併記するショートカットが**バインド表と一致する**。
+    /// 表示を手書きすると「書いてあるのに効かない」案内になるため、
+    /// 導出元（[`key_bindings`]）と突き合わせて固定する
+    #[test]
+    fn パレットのショートカット表示はバインド表と一致する() {
+        for (id, action) in [
+            ("new-tab", "tako::NewTab"),
+            ("split-right", "tako::SplitRight"),
+            ("split-down", "tako::SplitDown"),
+            ("toggle-files", "tako::ToggleSidebar"),
+        ] {
+            let hint = palette_shortcut(id)
+                .unwrap_or_else(|| panic!("{id}: パレットにショートカットが出ていない"));
+            // 表示の元になったバインドが、このプラットフォームで実際に届く形で実在する
+            let matched = key_bindings().into_iter().any(|b| {
+                b.action().name() == action
+                    && b.keystrokes()
+                        .iter()
+                        .map(|k| format_keystroke(k.inner()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        == hint
+            });
+            assert!(matched, "{id}: 表示 \"{hint}\" に対応するバインドが無い");
+        }
+        // バインドを持たない項目に嘘のショートカットを出さない
+        for id in ["toggle-theme", "panel-git", "toggle-drawer", "存在しないid"] {
+            assert_eq!(
+                palette_shortcut(id),
+                None,
+                "{id}: バインドが無いのにショートカットを表示している"
+            );
+        }
+    }
+
+    /// #648: 非 macOS のパレット表示に `cmd-` 由来のキーが混ざらない。
+    /// GPUI の `cmd` は platform 修飾で Windows では Win キーへ解決され、
+    /// シェルが先に奪って**届かない**（#585）。案内に出したら嘘になる
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn 非macosのパレット表示はcmd由来のキーを出さない() {
+        for id in ["new-tab", "split-right", "split-down", "toggle-files"] {
+            let hint = palette_shortcut(id).expect("ショートカットが出ていない");
+            assert!(
+                !hint.contains('\u{2318}') && !hint.contains("Cmd") && !hint.contains("Win"),
+                "{id}: 非 macOS で届かない修飾キーを案内している: {hint}"
+            );
+            assert!(
+                hint.starts_with("Ctrl") || hint.starts_with("Alt") || hint.starts_with('F'),
+                "{id}: Windows 慣習の表記になっていない: {hint}"
+            );
+        }
+        // ユーザーが探していた分割キー（#648 の発端）が実際にこの字面で出る
+        assert_eq!(
+            palette_shortcut("split-right").as_deref(),
+            Some("Ctrl+Shift+D")
+        );
+        assert_eq!(
+            palette_shortcut("split-down").as_deref(),
+            Some("Ctrl+Shift+E")
+        );
+    }
+
+    /// #648: macOS のパレット表示は従来どおり ⌘ 記号。Windows 対応で
+    /// macOS の見た目を変えていないことを固定する
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macosのパレット表示はcmd記号を使う() {
+        assert_eq!(
+            palette_shortcut("split-right").as_deref(),
+            Some("\u{2318}D")
+        );
+        assert_eq!(
+            palette_shortcut("split-down").as_deref(),
+            Some("\u{21e7}\u{2318}D")
+        );
+        assert_eq!(palette_shortcut("new-tab").as_deref(), Some("\u{2318}T"));
     }
 
     /// macOS 側は従来どおり cmd- のみ（#467 の追加バインドが漏れ出していない）

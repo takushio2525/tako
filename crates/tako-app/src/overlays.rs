@@ -131,6 +131,13 @@ impl TakoApp {
                                         let is_selected = i == selected;
                                         let label = item.label();
                                         let is_pane = matches!(item, PaletteItem::Pane(..));
+                                        // 固定コマンドだけがショートカットを持つ（#648）
+                                        let shortcut = match item {
+                                            PaletteItem::Command(_, id) => {
+                                                crate::keybindings::palette_shortcut(id)
+                                            }
+                                            _ => None,
+                                        };
                                         div()
                                             .id(("palette-item", i as u64))
                                             .flex()
@@ -189,6 +196,17 @@ impl TakoApp {
                                                     })
                                                     .child(SharedString::from(label)),
                                             )
+                                            // ショートカット併記（#648）。Windows には
+                                            // メニューバーが無く、`cmd-` から機械的に
+                                            // 読み替えられないキー（分割 = Ctrl+Shift+D 等）を
+                                            // 知る手段がここしか無い
+                                            .children(shortcut.map(|keys| {
+                                                div()
+                                                    .flex_none()
+                                                    .text_size(px(11.0))
+                                                    .text_color(hsla(theme.text_muted))
+                                                    .child(SharedString::from(keys))
+                                            }))
                                     },
                                 )),
                         ),
