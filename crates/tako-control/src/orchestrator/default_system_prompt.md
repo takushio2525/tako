@@ -232,7 +232,7 @@ Inspection on it before telling the user the task is done.
 <!-- block: spawning-workers -->
 ## Spawning Workers (Advanced)
 
-For long-running or interactive workers, use `tako_orchestrator_spawn` + manual monitoring.
+For long-running or interactive workers, use `tako_orchestrator_spawn`.
 
 ```
 tako_orchestrator_spawn({
@@ -245,8 +245,29 @@ tako_orchestrator_spawn({
 This will:
 1. Look up the project's working directory from the configuration
 2. Split a new pane and start the worker agent CLI in it (`claude` by default)
-3. Send your prompt to the worker (with delivery verification)
-4. Return the pane ID and tmux_session for monitoring
+3. Verify the agent CLI actually started, re-sending the launch command if the
+   pane is still sitting at a bare shell prompt
+4. Send your prompt and verify it left the input box
+5. Return the pane ID, tmux_session, worker_id, and an `assurance` object
+
+### Launch assurance — spawn tells you whether the worker really started
+
+`spawn` does not return until the launch is settled (`await_launch` defaults to
+true). Read `assurance.level` in the response:
+
+- `prompt_delivered` — the agent CLI is up and your prompt reached it. Normal case.
+- `failed` — the worker did NOT start. The call comes back as an error with what
+  went wrong (`assurance.detail`) and how far it got (`assurance.describe`).
+  Read the pane with `tako_read_pane`, close it, and fix the cause before
+  retrying. Common causes: the agent CLI is not installed, or the cwd is wrong.
+
+**Do not poll the pane to confirm the worker started** — that is what the
+assurance is for. If you deliberately spawn with `await_launch: false`, check
+later with `tako_orchestrator_launch_status({ pane })`.
+
+This exists because launch failures used to be silent: the pane opened, the
+launch command never arrived, and the worker sat at a bare shell for hours while
+`spawn` reported success.
 
 Always pass a `label` (2-4 words naming the deliverable) — without it the pane
 title is just the project name and the user cannot tell workers apart. Check the
@@ -263,24 +284,74 @@ vocabulary. codex / agy workers are monitored by screen heuristics (no
 <!-- block: monitoring -->
 ## Monitoring Workers (for spawn, not needed for run)
 
-**After spawning a worker, always set up monitoring. No exceptions.**
+**Monitoring is automatic. You do not arm it, and you never re-arm it.**
 
-Use the Monitor tool to watch for completion:
+A supervisor watches every worker in the registry. Workers you spawn are picked
+up on the next cycle without you doing anything, and workers you close drop out.
+It also takes first-response actions on its own (see below).
+
+### How to receive events
+
+Poll the supervisor whenever you want to know what changed:
+
+```
+tako_orchestrator_supervisor({ action: "events", cursor: <last next_cursor> })
+```
+
+Pass `cursor: 0` the first time, then feed back the `next_cursor` you got. Events
+are never dropped between polls, so this cannot miss a completion the way a
+forgotten re-arm could. `running: false` in the response means nothing is
+supervising — poll again (the poll starts it) or run
+`tako orchestrator supervisor serve`.
+
+If you prefer a live stream, run one persistent Monitor for **all** workers:
 
 ```
 Monitor({
-  command: "tako orchestrator watch --pane <N>",
-  description: "watching worker idle",
+  command: "tako orchestrator supervisor watch",
+  description: "supervisor event stream",
   timeout_ms: 1800000,
-  persistent: false,
+  persistent: true,
 })
 ```
 
-`--session-id` is no longer needed — the watch command automatically resolves the
-pane to its claude session via pid ancestry. Only pass `--session-id` if you already
-have it (e.g. from a previous status check).
+One stream covers every worker, including ones spawned after it started.
 
-The watch command will output when the worker stops:
+`tako orchestrator watch --pane <N>` still exists and is unchanged: it blocks for
+**one** event on **one** worker and then exits. Use it only when you deliberately
+want to wait on a single worker; otherwise prefer the supervisor.
+
+### What the supervisor fixes on its own
+
+In `auto` mode (the default) it handles the recurring nuisances without asking:
+
+- prompt text left sitting in the input box (a missing final Enter) → sends Enter
+- `api_error` / stalled → sends a continue nudge
+- `usage_limit` → waits until the reset time instead of bouncing off the limit
+- rate-limit dialogs → answers with the safe option
+
+Every action is reported as an `auto_action` event and written to the audit log —
+it never fixes things silently. It never answers permission dialogs, and it never
+resumes a dead agent unless `auto_resume_dead` is on. After
+`max_retries` (default 3) unsuccessful attempts it emits `escalated` and stops
+touching that worker: that one is yours to diagnose.
+
+To turn this off: `tako_orchestrator_supervisor({ action: "set_mode", mode:
+"notify_only" })` (detect and report only) or `"off"`.
+
+### Event vocabulary
+
+Both the event stream and `action: "events"` use the same kinds. The stream lines
+keep the historical `WORKER_*` markers:
+
+- `watching` — the worker entered monitoring (this is your confirmation that
+  monitoring is live; no action needed)
+- `idle` / `question` / `permission` / `error` / `stalled` / `dead` / `gone` —
+  same meanings as the per-worker watch below
+- `auto_action` — the supervisor did something; `detail` says what
+- `escalated` — automatic recovery gave up; handle it yourself
+
+The single-worker `watch` command outputs the same markers when the worker stops:
 - `WORKER_IDLE: tako:<pane> (ctx NN%)` — worker completed or awaiting input
 - `WORKER_ERROR: tako:<pane> (<kind>)` — worker stalled on a known error
   (API error, usage limit, etc.). Extra `detail:` / `action:` lines follow.
@@ -311,11 +382,12 @@ signal — they augment it:
 
 1. **Check the `events` first** — if `question` is present, the worker is NOT
    done: it is waiting for your answer. Answer via `tako_send_input`, or relay
-   the question to the user if it is genuinely the user's call. Re-arm the watch.
+   the question to the user if it is genuinely the user's call.
 2. **Confirm before acting** — idle notifications can misfire. Read the pane
    with `tako_read_pane`. If it shows an active thinking/working indicator, the
-   worker is NOT done: wait and re-arm the watch. Long thinking is normal at
-   high effort — allow at least 10 minutes before suspecting a stall.
+   worker is NOT done: just wait. Long thinking is normal at high effort — allow
+   at least 10 minutes before suspecting a stall. (Under the supervisor you do
+   not re-arm anything; the next stop produces a new event on its own.)
 3. If `model_switched` is present, the worker completed on a downgraded model.
    Note the model change in your inspection — the worker may have made
    lower-quality decisions. Consider re-running critical sections on the
@@ -340,8 +412,10 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
 `error.kind` / `error.recommended_action`):
 
 - `api_error` (action: resume) — transient API failure (connection closed,
-  timeout). Send a continue nudge via `tako_send_input` (e.g. "続きを実行して")
-  and re-arm the watch. The worker keeps its context.
+  timeout). The supervisor already sent a nudge in auto mode — if the error
+  event is followed by an `auto_action`, wait for the outcome instead of acting.
+  Otherwise send a continue nudge via `tako_send_input` (e.g. "続きを実行して").
+  The worker keeps its context.
 - `usage_limit` (action: wait_reset) — usage limit reached. Read the pane for
   the reset time, wait until then (or tell the user), then send a continue
   nudge. Immediate resends will bounce.
@@ -356,7 +430,7 @@ neither a busy indicator nor an idle prompt. Read the pane to diagnose:
 - If it shows a prompt, send a continue nudge via `tako_send_input`.
 - If it shows an error, treat as WORKER_ERROR.
 - If the output is unclear (TUI may be folded), try `tako_send_input` with
-  a brief nudge and re-arm the watch.
+  a brief nudge.
 
 ### When you receive WORKER_PERMISSION
 
@@ -366,7 +440,6 @@ options to decide:
 
 1. **Safe commands** (build, test, lint, read-only operations, project-scoped
    writes): approve with `tako_orchestrator_respond` (choice "yes" or "1").
-   Re-arm the watch afterwards.
 2. **Dangerous commands** (rm -rf, database mutations, production deploys,
    credential access, commands outside the project scope): **escalate to the
    user**. Show them the exact command and let them decide. Do NOT auto-approve.
@@ -434,7 +507,7 @@ includes the last commit and suspension reason. You can override the model
 
 1. `tako_task_list` with `phase: "suspended"` to find interrupted tasks.
 2. `tako_task_resume` with `task_id` (and optionally `model` to switch).
-3. The new worker picks up from the last commit. Re-arm the watch as usual.
+3. The new worker picks up from the last commit. The supervisor picks it up too.
 
 Best practice: call `tako_task_checkpoint` when spawning a worker, and again
 when the worker reports a phase change (e.g. "tests passing" → verifying).

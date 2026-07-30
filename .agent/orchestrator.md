@@ -281,6 +281,32 @@ master は結果を確認してユーザーに報告する。
 | `--agent` | | worker のエージェント CLI（claude / codex / agy。省略時はプロファイルの worker_agent → claude） |
 | `--model` | | worker のモデル（agent のネイティブ表記。省略時はプロファイル設定） |
 | `--effort` | | thinking / reasoning effort（claude・codex のみ。省略時はプロファイル設定） |
+| `--no-await-launch` | | 起動保証を待たずに即座に返す（従来の投げっぱなし。#665） |
+| `--launch-timeout` | | 起動保証を待つ上限秒数（既定 90） |
+
+#### 起動保証（Issue #665）
+
+spawn は既定で「**エージェント CLI が実際に起動し、プロンプトが届いた**」ことを
+確認してから返す。段階は次の順に進み、各段階を画面から検証する:
+
+```
+queued → shell_ready → launch_sent → agent_started → prompt_sent → prompt_delivered
+                           ↑____________|  確認できなければ起動コマンドを再送（最大 3 回）
+```
+
+- **早く再送するのはシェルプロンプトが最終行に見えているとき（= 届いていない確証が
+  あるとき）だけ**。判断がつかない画面では逆に長く待つ: 起動が遅いだけの
+  エージェントへ再送すると、起動中の stdin へ起動コマンドを打ち込むことになる。
+  起動済みのペインへ再送すると入力欄が汚れるため、判定は全体に保守的に倒している
+  （判定は `orchestrator::launch::classify_launch_screen` = GUI 非依存の純粋関数）
+- **プロンプトは起動を確認してから積む**。従来は起動コマンドと同時に積んでおり、
+  シェル初期化・raw mode 切替と競合していた
+- コマンドが見つからない（`command not found` / 「認識されません」）場合は再送せず即失敗
+- 段階は `workers.yaml` の `launch` に残り、プロセス外から
+  `tako orchestrator launch-status` / MCP `tako_orchestrator_launch_status` で読める
+
+これが無かった頃は、ペインは開くのに起動コマンドが届かず、worker が素の
+PowerShell のまま 6 時間空回りしても spawn は成功を返していた（#640）。
 
 プロンプト送達は送達確認ループで行う（Issue #32）:
 
@@ -306,9 +332,48 @@ error（異常停止。#157）のときは応答に `error.kind` / `error.detail
 | `--pane` | ○ | ペイン ID |
 | `--session-id` | | claude の session ID |
 
-### `tako orchestrator watch`
+### `tako orchestrator supervisor`（常時監視。Issue #665）
 
-worker が停止するまでブロックし、結果を出力する。Monitor から呼ばれる想定。
+**全 worker を 1 本のループで監視する。master は監視を張らないし、張り直さない。**
+
+| action | 用途 |
+|---|---|
+| `watch` | イベントを流し続ける（Monitor から persistent で 1 本張るだけ）。監視役が居なければ起こす |
+| `events [--cursor N] [--limit N]` | カーソル以降のイベントを 1 回読む。取りこぼしゼロ |
+| `serve` | 常駐本体（シングルトン。ロックファイルで二重起動しない） |
+| `status` / `set_mode` / `history` | 設定・常駐状況・監査ログ |
+| `stop` | 常駐を止める |
+
+毎周期 `workers.yaml` を読み直すので、**spawn した worker はその場で監視対象に入り**、
+閉じた worker は自動的に外れる。監視対象がゼロのまま 10 分経つと自分から終了する
+（常駐が残り続けない）。
+
+イベント種別: `watching`（監視開始）/ `idle` / `question` / `permission` / `error` /
+`stalled` / `dead` / `gone` / `auto_action`（自動対応を実行）/ `escalated`（自動復旧を諦めた）。
+ストリーム出力は既存 watch と同じ `WORKER_*` マーカーを使う（master 側の読み取りを
+作り直させないため）。
+
+`auto` モード（既定）の自動一次対応:
+
+| 検知 | 自動アクション |
+|---|---|
+| 入力欄に本文が残ったまま idle（末尾 Enter の欠落） | Enter 単独送達でフラッシュ |
+| `api_error` / `stalled` | 続行ナッジ |
+| `usage_limit` | 解除時刻まで**触らない**（即時再送は弾かれるだけ） |
+| `limit_dialog` | 安全な選択肢（1 番）へ応答 |
+| 上限（既定 3 回）超過 | `escalated` を出して手を引く |
+
+permission ダイアログには**絶対に自動応答しない**（承認は master と人間の判断）。
+突然死の自動 resume も既定 off（`auto_resume_dead` で opt-in）。
+すべてのアクションは `auto_action` イベント + 監査ログ（`<data_dir>/supervisor.log`）に残る。
+
+イベントは `<data_dir>/supervisor-events.jsonl` に追記され、これがプロセスを跨いだ
+配送路になる（MCP の `action=events` はここをカーソル指定で読む）。
+
+### `tako orchestrator watch`（単発）
+
+worker が停止するまでブロックし、**1 イベント出力して終了する**。
+1 体だけを待ちたいときに使う。常時監視は上の supervisor を使うこと。
 
 | オプション | 必須 | 説明 |
 |---|---|---|
@@ -344,7 +409,9 @@ master（または任意の claude エージェント）から使える MCP ツ�
 |---|---|
 | `tako_orchestrator_projects` | プロジェクト管理（list / add / remove） |
 | `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除） |
-| `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択） |
+| `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択。既定で起動保証つき = `await_launch`。応答の `assurance` にどこまで確認できたかが入る。#665） |
+| `tako_orchestrator_launch_status` | 起動保証の到達段階の照会（#665） |
+| `tako_orchestrator_supervisor` | 常時監視（`action: "events"` でイベント取得。再アーム不要。#665） |
 | `tako_orchestrator_worker_status` | worker の状態確認（codex / agy は画面推定。異常停止は status=error + error.kind / recommended_action（#157）。停滞は status=stalled + stalled.detail / recommended_action（#224）。has_running_children / collapsed フラグ付き） |
 
 | `tako_orchestrator_dialog` | worker が表示中のダイアログの内容取得（#662。AskUserQuestion の質問文と選択肢を transcript から全文で。ライブ画面から現在位置・ハイライト・回答済みも） |

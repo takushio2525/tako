@@ -590,6 +590,11 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        key: "tako_orchestrator_launch_status",
+        macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
         key: "tako_orchestrator_layout",
         macos: Support::Supported,
         windows: Support::Supported,

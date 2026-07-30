@@ -29,6 +29,7 @@ mod drawer;
 mod file_icons;
 mod filetree;
 mod keybindings;
+mod launch_assurance;
 mod menu_bar;
 mod overlays;
 mod preview;
@@ -796,6 +797,8 @@ struct TakoApp {
     pending_writes: Vec<(PaneId, Vec<u8>)>,
     /// alt_screen 遷移後に書き込むデータ（非プロンプト用の汎用遅延書き込み）
     alt_screen_writes: Vec<(PaneId, Vec<u8>, std::time::Instant)>,
+    /// spawn の起動保証ステートマシン（Issue #665）
+    launch_watches: Vec<launch_assurance::LaunchWatch>,
     /// claude TUI へのプロンプト送信ステートマシン
     prompt_flows: Vec<PromptFlow>,
     /// 新規ペインの素のシェルへ起動コマンドを送り届けるステートマシン（Issue #640）
@@ -2077,6 +2080,7 @@ impl TakoApp {
             pending_attach: Vec::new(),
             pending_writes: Vec::new(),
             alt_screen_writes: Vec::new(),
+            launch_watches: Vec::new(),
             prompt_flows: Vec::new(),
             command_flows: Vec::new(),
             pending_highlights: Vec::new(),
@@ -2810,6 +2814,12 @@ impl TakoApp {
                 if !app.alt_screen_writes.is_empty() {
                     app.flush_alt_screen_writes();
                 }
+                // #665: 起動保証は他のフローより先に回す。同 tick 内で
+                // 「起動を確認 → 起動コマンドを積む / プロンプトを積む」まで進めるため
+                if !app.launch_watches.is_empty() {
+                    app.drive_launch_assurance();
+                }
+                // #640: 起動コマンドのシェルへの送達確認（起動保証が積む）
                 if !app.command_flows.is_empty() {
                     app.drive_command_flows();
                 }
@@ -13009,6 +13019,25 @@ impl SessionHost for TakoApp {
 
     fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
         self.prompt_flows.push(PromptFlow::new(pane, prompt, true));
+    }
+
+    fn queue_launch_assurance(
+        &mut self,
+        pane: PaneId,
+        spec: tako_control::host::LaunchAssuranceSpec,
+    ) {
+        self.launch_watches
+            .push(launch_assurance::LaunchWatch::new(pane, spec));
+    }
+
+    fn launch_assurance_status(
+        &self,
+        pane: PaneId,
+    ) -> Option<tako_control::host::LaunchAssuranceStatus> {
+        self.launch_watches
+            .iter()
+            .find(|w| w.pane == pane)
+            .map(|w| w.status())
     }
 
     fn queue_send_flow(&mut self, pane: PaneId, text: String) {

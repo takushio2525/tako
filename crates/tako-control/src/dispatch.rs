@@ -2574,6 +2574,10 @@ fn dispatch_inner(
             dispatch_orchestrator_report(host, q, lines.unwrap_or(2000), messages.unwrap_or(1))
         }
 
+        Request::OrchestratorLaunchStatus { pane, worker } => {
+            dispatch_orchestrator_launch_status(host, pane, worker.as_deref())
+        }
+
         Request::OrchestratorSupervisor {
             action,
             mode,
@@ -5456,6 +5460,11 @@ fn dispatch_git_resolve_agent(
     }))
 }
 
+/// 起動コマンドの最大送信回数（初回 + 再送 2 回。Issue #665）。
+/// 再送は「シェルプロンプトが見えている = 届いていない」ときだけ行うため、
+/// 多くしても実害は小さいが、壊れた環境で延々と打ち込み続けないよう上限を置く
+const LAUNCH_MAX_ATTEMPTS: u32 = 3;
+
 /// OrchestratorSpawn のパラメータ（Request と 1:1）
 struct SpawnParams<'a> {
     project: &'a str,
@@ -5630,17 +5639,13 @@ fn dispatch_orchestrator_spawn(
         });
     }
 
-    // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
-    // かつ、起動した直後の PTY へ書いたバイトは器（psmux）に落とされる（#640 実測:
-    // PTY 起動から 0〜500ms の書き込みは全損、1500〜3000ms は途中欠落）。
-    // 「シェルの準備待ち → エコー確認 → 分離 Enter → 実行確認」を回す送達確認フローで送る
-    host.queue_command_flow(new_id, worker_cmd.clone());
-
-    // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
-    // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
-    // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
-    // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
-    host.queue_prompt_flow(new_id, prompt.to_string());
+    // 起動コマンドとプロンプトの送出は**起動保証の状態機械**へ委ねる（Issue #665）。
+    // 従来はここで queue_write（起動コマンド）+ queue_prompt_flow（プロンプト）を
+    // 投げっぱなしにしており、どちらも届いたか誰も確認していなかった。
+    // 起動コマンドの送達そのものは #640 の送達確認フロー（queue_command_flow）を
+    // そのまま使い、その上に「エージェントが実際に起動したか」「プロンプトが
+    // 入力欄から消えたか」の検証と再送を重ねる。実際の登録はレジストリの
+    // worker_id が決まってから行う（段階を workers.yaml へ記録するため）
 
     // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
@@ -5731,6 +5736,31 @@ fn dispatch_orchestrator_spawn(
             String::new()
         });
 
+    // 起動保証の登録（Issue #665）。シェル起動 → 起動コマンド送出 →
+    // エージェント CLI 起動の確認 → プロンプト送達 を段階ごとに検証し、
+    // 届いていなければ起動コマンドを再送する。段階は workers.yaml へ記録され、
+    // `OrchestratorLaunchStatus`（CLI / MCP）からプロセス外で読める
+    host.queue_launch_assurance(
+        new_id,
+        crate::host::LaunchAssuranceSpec {
+            worker_id: worker_id.clone(),
+            command: worker_cmd.clone(),
+            prompt: prompt.to_string(),
+            agent: worker_agent.as_str().to_string(),
+            max_attempts: LAUNCH_MAX_ATTEMPTS,
+        },
+    );
+
+    // 監視役を確実に立てる（Issue #665）。master が watch を張り忘れる余地を無くすため、
+    // spawn した時点で supervisor が居なければ起こす。既に居れば何もしない
+    // （シングルトン）。プロセス起動だけなので UI スレッドを塞がない
+    {
+        let profile_mode = profile
+            .supervisor_mode
+            .unwrap_or(crate::orchestrator::supervisor::SupervisorMode::Auto);
+        crate::orchestrator::supervisor::ensure_running(profile_mode);
+    }
+
     // #368: spawn 完了 → claude session スキャンを即時トリガー
     crate::request_claude_scan();
 
@@ -5761,7 +5791,100 @@ fn dispatch_orchestrator_spawn(
         "env_keys": env_keys,
         "config_dir": config_dir_value,
         "account": account_name,
+        // 起動保証（Issue #665）。この時点では「登録した」だけで、実際の到達段階は
+        // 状態機械が進める。呼び出し側（MCP ハンドラスレッド / CLI プロセス）は
+        // OrchestratorLaunchStatus をポーリングして prompt_delivered / failed を待つ
+        "assurance": {
+            "level": crate::orchestrator::launch::LaunchPhase::Queued.as_str(),
+            "attempts": 0,
+            "max_attempts": LAUNCH_MAX_ATTEMPTS,
+            "poll": "tako orchestrator launch-status --pane <pane_id>",
+        },
     }))
+}
+
+/// OrchestratorLaunchStatus の dispatch（Issue #665）。
+/// UI スレッドで即座に返る軽量照会。稼働中の状態機械があればそれを、
+/// 無ければレジストリの永続記録を返す（状態機械は完了後に破棄されるため）
+fn dispatch_orchestrator_launch_status(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    worker: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator::launch::LaunchPhase;
+    use crate::orchestrator::registry::WorkerRegistry;
+
+    // worker 指定ならレジストリから pane を引く（ペイン消失後も照会できる）
+    let (pane_id, worker_id) = match (pane, worker) {
+        (_, Some(w)) => {
+            let reg = WorkerRegistry::load().map_err(DispatchError::Operation)?;
+            let (id, entry) = reg.resolve(w).map_err(DispatchError::Operation)?;
+            (entry.pane, Some(id.clone()))
+        }
+        (Some(p), None) => {
+            let worker_id = WorkerRegistry::load()
+                .ok()
+                .and_then(|reg| reg.find_active_by_pane(p).map(|(id, _)| id.clone()));
+            (p, worker_id)
+        }
+        (None, None) => {
+            return Err(DispatchError::InvalidParams(
+                "pane または worker を指定してください".into(),
+            ))
+        }
+    };
+
+    // ① 稼働中の状態機械（最新・権威）
+    if let Some(status) = host.launch_assurance_status(PaneId::from_raw(pane_id)) {
+        return Ok(json!({
+            "pane": pane_id,
+            "worker_id": worker_id,
+            "level": status.phase.as_str(),
+            "attempts": status.attempts,
+            "elapsed_ms": status.elapsed_ms,
+            "detail": status.detail,
+            "describe": status.phase.describe(),
+            "settled": status.phase.is_terminal(),
+            "agent_running": status.phase.agent_running(),
+            "source": "live",
+        }));
+    }
+
+    // ② 完了・破棄済み → レジストリの永続記録
+    let record = worker_id.as_deref().and_then(|id| {
+        WorkerRegistry::load()
+            .ok()
+            .and_then(|reg| reg.workers.get(id).and_then(|e| e.launch.clone()))
+    });
+    match record {
+        Some(rec) => {
+            let phase = rec.phase().unwrap_or(LaunchPhase::Queued);
+            Ok(json!({
+                "pane": pane_id,
+                "worker_id": worker_id,
+                "level": phase.as_str(),
+                "attempts": rec.attempts,
+                "detail": rec.detail,
+                "describe": phase.describe(),
+                "settled": phase.is_terminal(),
+                "agent_running": phase.agent_running(),
+                "updated_at": rec.updated_at,
+                "source": "registry",
+            }))
+        }
+        // 記録が無い = #665 以前に spawn された / レジストリ登録に失敗した worker。
+        // 「保証の対象外」であることを明示する（不明を成功と誤読させない）
+        None => Ok(json!({
+            "pane": pane_id,
+            "worker_id": worker_id,
+            "level": Value::Null,
+            "settled": true,
+            "agent_running": Value::Null,
+            "source": "none",
+            "detail": "起動保証の記録が無い（#665 以前に spawn された worker、\
+                       またはレジストリ登録に失敗した）",
+        })),
+    }
 }
 
 /// OrchestratorWorkerStatus の UI スレッド必須部分（workspace / ライブ画面の読み取り）の
@@ -8142,11 +8265,16 @@ fn dispatch_orchestrator_supervisor(
             let auto_dead = profile.auto_resume_dead.unwrap_or(false);
             let retries = profile.supervisor_max_retries.unwrap_or(3);
             let log = supervisor::read_audit_log(lines.unwrap_or(20));
+            // latest_cursor: master が「ここから読めば取りこぼさない」起点として使う
+            let (_, cursor, _) = supervisor::read_events(0, 1).unwrap_or_default();
             Ok(json!({
                 "mode": sv_mode.as_str(),
                 "auto_resume_dead": auto_dead,
                 "max_retries": retries,
                 "audit_log": log,
+                // #665: 常駐しているか。false なら誰も監視していない
+                "running": supervisor::is_running(),
+                "latest_cursor": cursor,
             }))
         }
         "set_mode" => {

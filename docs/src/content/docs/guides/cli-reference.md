@@ -660,17 +660,50 @@ tako orchestrator spawn --project webapp --prompt "ログインページを実�
 | `--label` | | ペインタイトルに付けるラベル |
 | `--model` / `--effort` | | worker のモデル・思考量（省略時はプロファイル設定に従う） |
 | `--pane` / `--tab` | | worker ペインをどこに出すか（分割元の指定） |
+| `--no-await-launch` | | 起動の確認を待たずに即座に返す |
+| `--launch-timeout <秒>` | | 起動の確認を待つ上限（既定 90） |
+
+spawn は既定で「**エージェントが実際に起動して、プロンプトが届いた**」ことを
+確認してから返します。確認できなければエラーになり、どこまで進んだかが応答の
+`assurance` に入ります。エージェントが起動していなければ起動コマンドを自動で送り直します。
+
+```bash
+# 後から確認する（--no-await-launch で投げた場合など）
+tako orchestrator launch-status --pane 5
+```
+
+### tako orchestrator supervisor
+
+全 worker をまとめて監視します。**spawn した worker は自動で監視対象に入る**ので、
+worker ごとに監視を張り直す必要はありません。
+
+```bash
+# イベントを流し続ける（1 本張るだけで全 worker ぶん流れてきます）
+tako orchestrator supervisor watch
+
+# 前回の続きから読む（next_cursor を渡すと取りこぼしません）
+tako orchestrator supervisor events --cursor 12
+
+# 設定・状態・停止
+tako orchestrator supervisor status
+tako orchestrator supervisor set_mode --mode notify_only
+tako orchestrator supervisor stop
+```
+
+既定（`auto`）では、入力欄に残ったプロンプトの送信・API エラー時の続行指示・
+利用上限の解除待ちといった一次対応を自動で行い、その内容もイベントに残します。
+承認ダイアログには自動応答しません。`notify_only` は検知の通知だけ、`off` は監視を止めます。
 
 ### tako orchestrator status / watch
 
-worker の状態確認と完了待ちです。
+1 体だけを確認・待機します（常時監視は上の supervisor を使ってください）。
 
 ```bash
 # 状態を 1 回確認
 tako orchestrator status --pane 5
 
-# 完了まで待ち続け、結果を 1 行出力（WORKER_IDLE = 完了 / WORKER_GONE = 消滅）
-tako orchestrator watch --pane 5 --session-id <S>
+# 停止するまで待ち、結果を 1 行出力して終了（WORKER_IDLE = 完了 / WORKER_GONE = 消滅）
+tako orchestrator watch --pane 5
 
 # タイムアウト付き
 tako orchestrator watch --pane 5 --timeout 600
