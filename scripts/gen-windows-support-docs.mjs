@@ -35,12 +35,12 @@ const CATEGORIES = [
   },
   {
     title: 'タブ・ペイン・ウィンドウ',
-    intro: '分割 / 移動 / リサイズ、たまり場（バックグラウンド退避）、複数ウィンドウ。',
+    intro: '分割 / 移動 / リサイズ、たまり場（バックグラウンド退避）、複数ウィンドウ、メニューバー。',
     keys: [
       'tako_split_pane', 'tako_close_pane', 'tako_focus_pane', 'tako_resize_pane',
       'tako_equalize_layout', 'tako_create_tab', 'tako_select_tab', 'tako_rename_tab',
       'tako_reorder_tab', 'tako_move_pane_to_tab', 'tako_collapse_tab', 'tako_confirm_close',
-      'tako_set_title', 'tako_auto_rename', 'tako_window', 'tako_panel',
+      'tako_set_title', 'tako_auto_rename', 'tako_window', 'tako_menu', 'tako_panel',
       'tako_background_pane', 'tako_foreground_pane', 'tako_background_list',
       'tako_background_kill', 'tako_open_dir', 'tako_recent', 'tako_ssh_hosts',
       'tako_open_remote',

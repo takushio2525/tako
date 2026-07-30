@@ -142,6 +142,15 @@ pub mod notes {
         "動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない",
         "Video preview is implemented with macOS AVFoundation, so it cannot play on Windows",
     );
+    /// #657: メニューは macOS では OS のグローバルメニューバーが所有するので、
+    /// tako 側から開閉できない（項目の実行と一覧は OS メニューでも成立する）。
+    /// **これは Windows の縮退ではなく macOS 側の縮退**という珍しい向きの例
+    pub const MAC_MENU_IS_OS_OWNED: Note = Note::new(
+        "メニューは OS のメニューバーが所有するため tako から開閉できない（open / close は不可）。\
+         構成の取得 list と項目の実行 invoke は使える",
+        "The menu is owned by the OS menu bar, so tako cannot open or close it \
+         (open / close unavailable). Listing the structure and invoking items both work",
+    );
     /// #521: プレビューの中身のうち PDF / 動画だけが欠ける
     pub const WIN_PREVIEW_NO_PDF: Note = Note::new(
         "コード・Markdown・画像は表示できる。PDF と動画は macOS 実装のため表示できない",
@@ -524,6 +533,16 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_logs",
         macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
+        key: "tako_menu",
+        // macOS はメニューが OS のメニューバーに載るので tako から開閉できない
+        // （構成の取得 list と項目の実行 invoke は動く）。Windows は自前描画の
+        // メニューバー行なので全操作が使える（#657）
+        macos: Support::Degraded {
+            note: notes::MAC_MENU_IS_OS_OWNED,
+        },
         windows: Support::Supported,
     },
     Feature {
