@@ -50,23 +50,26 @@ pub fn tty_rdev(_tty_name: &str) -> Option<u64> {
 ///
 /// どちらの材料も取れなければ `None`（そのペインはスキャン対象から外れるだけ）
 pub fn pane_key(tty_name: Option<&str>, child_pid: Option<u32>) -> Option<u64> {
+    // 実装選択は `let` への cfg で行う。`return` で書くと、有効な分岐が末尾に
+    // 来ないぶん clippy の `needless_return` に当たる（macOS の `-D warnings` が落ちる）
     #[cfg(target_os = "macos")]
-    {
+    let key = {
         let _ = child_pid;
-        return tty_name.and_then(tty_rdev);
-    }
+        tty_name.and_then(tty_rdev)
+    };
     #[cfg(windows)]
-    {
+    let key = {
         let _ = tty_name;
         // pid 0 は System Idle Process。ペインの子として返ることは無いが、
         // 万一 0 が来たら全プロセスを配下と誤認しかねないので弾く
-        return child_pid.filter(|&pid| pid != 0).map(u64::from);
-    }
+        child_pid.filter(|&pid| pid != 0).map(u64::from)
+    };
     #[cfg(not(any(target_os = "macos", windows)))]
-    {
+    let key = {
         let _ = (tty_name, child_pid);
         None
-    }
+    };
+    key
 }
 
 /// 指定した tty（rdev）群に属するプロセスの listen ポートを一括スキャンする。
