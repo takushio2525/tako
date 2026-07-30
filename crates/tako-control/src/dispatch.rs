@@ -4321,8 +4321,9 @@ fn dispatch_show_command(
                 .and_then(|s| s.cwd())
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_path_buf());
+            // focus=false のときのフォーカス保持は spawn_command_pane が担う（#676）。
+            // カードの実行は「手元のペインに触らない」が要件（FR-2.22.4）
             let focus = focus.unwrap_or(false);
-            let focused_before = host.workspace().get_tab(tab_id).map(|t| t.tree().focused());
             let new_id = spawn_command_pane(
                 host,
                 origin,
@@ -4335,14 +4336,6 @@ fn dispatch_show_command(
                 "never",
                 focus,
             )?;
-            // `split_with_ratio` は新ペインへフォーカスを移す仕様なので、
-            // focus 指定が無いときは元のペインへ戻す（カードの実行は
-            // 「手元のペインに触らない」が要件。FR-2.22.4）
-            if !focus {
-                if let Some(prev) = focused_before.filter(|p| *p != new_id) {
-                    let _ = tree_mut(host.workspace_mut(), tab_id).focus(prev);
-                }
-            }
             // タイトルは Code Runner (#453) と同じ `(>)` 接頭辞 + コマンド先頭
             let head: String = command
                 .lines()
@@ -4392,7 +4385,12 @@ fn dispatch_show_command(
     }
 }
 
-/// RunInteractive / Run 共通: 分割 → コマンド付きセッション起動 → exit マーカーラップ
+/// RunInteractive / Run / ShowCommand 共通: 分割 → コマンド付きセッション起動 →
+/// exit マーカーラップ。
+///
+/// **`focus` の規約は `Request::Split` と同じ**: false なら分割前のフォーカスを保つ
+/// （ユーザーの入力を奪わない）。`PaneTree::split_with_ratio` は無条件で新ペインへ
+/// フォーカスを移すので、ここで戻さないと「既定 false」が効かない（#676）
 #[allow(clippy::too_many_arguments)]
 fn spawn_command_pane(
     host: &mut dyn ControlHost,
@@ -4408,6 +4406,9 @@ fn spawn_command_pane(
 ) -> Result<PaneId, DispatchError> {
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
+
+    // 分割前のフォーカス（focus=false のときここへ戻す。#676）
+    let focused_before = host.workspace().get_tab(tab_id).map(|t| t.tree().focused());
 
     tree_mut(host.workspace_mut(), tab_id)
         .split_with_ratio(target, direction.to_core(), ratio, new_pane)
@@ -4432,6 +4433,9 @@ fn spawn_command_pane(
 
     if focus {
         let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+    } else if let Some(prev) = focused_before.filter(|p| *p != new_id) {
+        // 分割の副作用で移ったフォーカスを元へ戻す（#676）
+        let _ = tree_mut(host.workspace_mut(), tab_id).focus(prev);
     }
 
     // interactive_meta を設定（RunInteractiveStatus で exit code 回収 + auto_close に使う）
@@ -13245,6 +13249,178 @@ mod tests {
         assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
         assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #676 の実行対象ファイル（`tako run` のテスト用。呼び出しごとに別ディレクトリ）
+    fn issue676_run_target(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-676-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.command");
+        std::fs::write(&file, "#!/usr/bin/env bash\necho hello\n").unwrap();
+        (dir, file)
+    }
+
+    /// #676 受け入れ条件 1 / 3: `tako run` は focus 未指定（既定 false）で
+    /// **手元のペインのフォーカスを奪わない**。CLI と MCP は同じ dispatch を通るので
+    /// 1 本で両経路を担保する（origin だけ差し替えて 2 回検証する）
+    #[test]
+    fn issue676_runはfocus未指定でフォーカスを奪わない() {
+        let (dir, file) = issue676_run_target("default");
+        for origin in [PaneOrigin::Cli, PaneOrigin::Mcp] {
+            let mut host = MockHost::new();
+            let root = host.ws.active_tab().tree().focused();
+            let result = dispatch(
+                &mut host,
+                Request::Run {
+                    path: file.display().to_string(),
+                    pane: Some(root.as_u64()),
+                    tab: None,
+                    profile: None,
+                    command: None,
+                    direction: None,
+                    ratio: None,
+                    auto_close: None,
+                    focus: None, // 既定 = false
+                },
+                origin,
+            )
+            .unwrap();
+            let new_pane = result["pane"].as_u64().unwrap();
+            assert_ne!(new_pane, root.as_u64());
+            assert_eq!(
+                host.ws.active_tab().tree().focused(),
+                root,
+                "{origin:?}: focus 未指定ではフォーカスが動かない（#676）"
+            );
+            // 明示 false でも同じ
+            let result = dispatch(
+                &mut host,
+                Request::Run {
+                    path: file.display().to_string(),
+                    pane: Some(root.as_u64()),
+                    tab: None,
+                    profile: None,
+                    command: None,
+                    direction: None,
+                    ratio: None,
+                    auto_close: None,
+                    focus: Some(false),
+                },
+                origin,
+            )
+            .unwrap();
+            assert_ne!(result["pane"].as_u64().unwrap(), root.as_u64());
+            assert_eq!(
+                host.ws.active_tab().tree().focused(),
+                root,
+                "{origin:?}: focus=false でもフォーカスが動かない（#676）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #676 受け入れ条件 2: `--focus` / `focus: true` を明示したときは新ペインへ移る
+    #[test]
+    fn issue676_runはfocus指定で新ペインへ移る() {
+        let (dir, file) = issue676_run_target("explicit");
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(root.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            result["pane"].as_u64().unwrap(),
+            "focus=true では新ペインへ移る"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #676 受け入れ条件 4: `run_interactive` は従来どおり新ペインへフォーカスを移す
+    /// （ユーザーの入力を待つペインなので、こちらは移すのが正しい）
+    #[test]
+    fn issue676_run_interactiveは新ペインへフォーカスを移す() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "sudo true".into(),
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            result["pane"].as_u64().unwrap(),
+            "run_interactive は入力待ちのため新ペインへ移る（回帰させない）"
+        );
+    }
+
+    /// #676 受け入れ条件 5: `split` の既定（フォーカスを移さない）に回帰がないこと。
+    /// `spawn_command_pane` と同じ規約であることを 1 本で並べて固定する
+    #[test]
+    fn issue676_splitの既定はフォーカスを移さない() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let r = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root.as_u64()),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_ne!(r["pane"].as_u64().unwrap(), root.as_u64());
+        assert_eq!(host.ws.active_tab().tree().focused(), root);
+        // 明示 true では移る（既存仕様）
+        let r = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root.as_u64()),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            r["pane"].as_u64().unwrap()
+        );
     }
 
     // === 複数ウィンドウ（Issue #339） ===
