@@ -1099,6 +1099,14 @@ struct TakoApp {
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
     /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
+    /// Markdown プレビュー内リンクの当たり判定（#680）。render で「選択と同じ
+    /// 行・バイト範囲」の座標系で記録し、⌘+ホバー / ⌘+クリックがこれを引く
+    /// （CLI / MCP 一覧は PreviewHost::preview_md_links が別途数え直す）
+    preview_md_link_hits: HashMap<PaneId, Vec<MdLinkHit>>,
+    /// Markdown リンクのホバー状態（#680）。⌘ 押下中のみ有効
+    preview_md_hovered_link: Option<(PaneId, usize)>,
+    /// コードブロックのコピー成功フィードバック（ペイン, コードブロック番号, 押した時刻。#680）
+    preview_md_copied: Option<(PaneId, usize, std::time::Instant)>,
     /// ネイティブ Web ビュー（FR-3.8 / #155）。表示中 + dock 退避中の全ページを
     /// ペインから独立に保持する（ペインを閉じてもページ = wry WebView が生きる）
     webviews: Vec<webview::WebViewEntry>,
@@ -1188,6 +1196,10 @@ struct TakoApp {
     settings_window_handle: Option<gpui::WindowHandle<settings_window::SettingsWindow>>,
     /// dispatch から設定画面を開くための pending キュー（Issue #459）
     pending_settings_open: Option<Option<settings_window::SettingsTab>>,
+    /// dispatch からのクリップボード書き込み待ち（#680）。GPUI の clipboard API は
+    /// `App` を要するため、dispatch では積むだけにして render / dispatch 完了時に流す
+    /// （`pending_settings_open` と同じ方式）
+    pending_clipboard: Vec<String>,
     /// About ウィンドウのハンドル（単一インスタンス。Issue #485）
     about_window_handle: Option<gpui::AnyWindowHandle>,
     /// メニューバーを貼った時点の表示言語（Issue #485。言語切替で貼り直す）。
@@ -1288,6 +1300,19 @@ fn process_pane_log_jobs(
             },
         );
     }
+}
+
+/// Markdown プレビュー内リンク 1 件の当たり判定（#680）。
+///
+/// 座標系はテキスト選択と同一（`line` = プレビューの選択行番号、`range` =
+/// その行のプレーンテキスト上の UTF-8 バイト範囲）。GPUI の実 shaping による
+/// 逆写像をそのまま使うので、折り返し・日本語混在・見出しサイズでもずれない。
+#[derive(Debug, Clone)]
+pub(crate) struct MdLinkHit {
+    pub(crate) line: usize,
+    pub(crate) range: std::ops::Range<usize>,
+    /// md に書かれた遷移先（開けないものも記録する）
+    pub(crate) url: String,
 }
 
 /// cmd+ホバーで検出されたリンク情報
@@ -2244,6 +2269,9 @@ impl TakoApp {
             preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_line_texts: HashMap::new(),
+            preview_md_link_hits: HashMap::new(),
+            preview_md_hovered_link: None,
+            preview_md_copied: None,
             webviews: Vec::new(),
             webview_next_id: 1,
             webview_marks: std::collections::HashSet::new(),
@@ -2293,6 +2321,7 @@ impl TakoApp {
             pending_window_states: Vec::new(),
             settings_window_handle: None,
             pending_settings_open: None,
+            pending_clipboard: Vec::new(),
             about_window_handle: None,
             menus_lang: None,
             menu_bar: menu_bar::MenuBarState::default(),
@@ -2685,6 +2714,9 @@ impl TakoApp {
                     if let Some(tab) = app.pending_settings_open.take() {
                         app.open_settings_window_impl(tab, cx);
                     }
+                    // Markdown コードブロックのコピー（#680）。CLI / MCP から copy された
+                    // ぶんを、render を待たずにここで実クリップボードへ流す
+                    app.flush_pending_clipboard(cx);
                     // AI / CLI 操作によるレイアウト変化を即座に永続化する（Phase 5.5）
                     app.save_layout();
                     cx.notify();
@@ -5195,6 +5227,7 @@ impl TakoApp {
                 self.preview_pdf_page_image_bounds.remove(&pane_id);
                 self.preview_text_layouts.remove(&pane_id);
                 self.preview_line_texts.remove(&pane_id);
+                self.forget_md_links(pane_id);
                 self.pane_links.remove(&pane_id);
                 self.known_failed.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
@@ -5259,6 +5292,7 @@ impl TakoApp {
                     self.preview_pdf_page_image_bounds.remove(&id);
                     self.preview_text_layouts.remove(&id);
                     self.preview_line_texts.remove(&id);
+                    self.forget_md_links(id);
                     self.pane_links.remove(&id);
                     self.known_failed.remove(&id);
                     self.scroll_accum.remove(&id);
@@ -6643,6 +6677,16 @@ impl TakoApp {
         }
     }
 
+    /// クリップボード書き込みの保留分を流す（#680）。GPUI の clipboard API は `App` を
+    /// 要するため dispatch では積むだけにしてある。render と dispatch 完了の両方から
+    /// 呼ぶ: ウィンドウが隠れているとフレームが来ないので、CLI / MCP 経路は
+    /// render を待たずにここで確定させる
+    pub(crate) fn flush_pending_clipboard(&mut self, cx: &mut Context<Self>) {
+        for text in std::mem::take(&mut self.pending_clipboard) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+    }
+
     /// 設定ウィンドウを開く / 前面化する（Issue #459）
     fn open_settings_window_impl(
         &mut self,
@@ -6915,6 +6959,101 @@ impl TakoApp {
             return preview_render::pdf_text_hit_test(line_bounds, char_bounds, texts, position);
         }
         texts.last().map(|last| (texts.len() - 1, last.len()))
+    }
+
+    /// Markdown リンクのヒットテスト（#680）。マウス位置にあるリンクの索引を返す。
+    ///
+    /// 選択のヒットテスト（`preview_hit_test`）は行間・行末をクリックしても近傍の行へ
+    /// 寄せる（キャレットを置くため）。リンクは「文字の上にあるか」が要るので
+    /// `TextLayout::index_for_position` の **Ok だけ**を採る（Err = 文字の外）。
+    /// 開けない URL（相対パス・`javascript:` 等）はホバーもクリックも対象にしない。
+    fn md_link_at_position(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<usize> {
+        let links = self.preview_md_link_hits.get(&pane_id)?;
+        if links.is_empty() {
+            return None;
+        }
+        let layouts = self.preview_text_layouts.get(&pane_id)?;
+        for (index, hit) in links.iter().enumerate() {
+            if tako_core::md_links::browser_url(&hit.url).is_none() {
+                continue;
+            }
+            let Some(Some(layout)) = layouts.get(hit.line) else {
+                continue;
+            };
+            // 行の矩形に入っていなければ shaping 逆写像まで行かない（⌘ 押下中は
+            // マウス移動ごとに全リンクを見るので、矩形判定で先に落とす）
+            if !layout.bounds().contains(&position) {
+                continue;
+            }
+            let Ok(byte) = layout.index_for_position(position) else {
+                continue;
+            };
+            if hit.range.contains(&byte) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Markdown プレビューのリンクホバー状態を更新する（#680）。
+    /// 描画済みの md プレビューペインをすべて見る（focused_pane に依存しない）
+    fn update_md_link_hover(
+        &mut self,
+        position: Point<Pixels>,
+        cmd_held: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self.preview_md_hovered_link;
+        if !cmd_held {
+            if old.is_some() {
+                self.preview_md_hovered_link = None;
+                cx.notify();
+            }
+            return;
+        }
+        let pane_ids: Vec<PaneId> = self
+            .preview_md_link_hits
+            .iter()
+            .filter(|(_, links)| !links.is_empty())
+            .map(|(pane, _)| *pane)
+            .collect();
+        let mut found = None;
+        for pane_id in pane_ids {
+            if let Some(index) = self.md_link_at_position(pane_id, position) {
+                found = Some((pane_id, index));
+                break;
+            }
+        }
+        if found != old {
+            self.preview_md_hovered_link = found;
+            cx.notify();
+        }
+    }
+
+    /// ペインの Markdown リンク状態を捨てる（ペイン削除・プレビュー差し替え時。#680）。
+    /// ホバー中・コピー中の索引は残すと別内容の別ブロックを指すので一緒に落とす
+    fn forget_md_links(&mut self, pane: PaneId) {
+        self.preview_md_link_hits.remove(&pane);
+        if self
+            .preview_md_hovered_link
+            .is_some_and(|(pid, _)| pid == pane)
+        {
+            self.preview_md_hovered_link = None;
+        }
+        if self
+            .preview_md_copied
+            .is_some_and(|(pid, _, _)| pid == pane)
+        {
+            self.preview_md_copied = None;
+        }
+    }
+
+    /// Markdown リンクを既定ブラウザで開く（UI の ⌘+クリック経路。#680）。
+    /// 実処理は CLI / MCP と同じ `follow_preview_md_link` を通す（開発不変条件）
+    fn open_md_link(&mut self, pane_id: PaneId, index: usize) {
+        if let Err(e) = self.follow_preview_md_link(pane_id, index) {
+            eprintln!("warning: Markdown リンクを開けない: {e}");
+        }
     }
 
     /// PDF リンクのヒットテスト（#271 / #315）。マウス位置にある PDF リンクのインデックスを返す。
@@ -9024,6 +9163,8 @@ impl TakoApp {
         self.update_hovered_link_at(event.position, event.modifiers.platform, window, cx);
         // PDF プレビューのリンクホバー（#271）
         self.update_pdf_link_hover(event.position, event.modifiers.platform, cx);
+        // Markdown プレビューのリンクホバー（#680）
+        self.update_md_link_hover(event.position, event.modifiers.platform, cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -9409,6 +9550,8 @@ impl TakoApp {
         );
         // PDF プレビューのリンクホバーも更新（#271）
         self.update_pdf_link_hover(window.mouse_position(), event.modifiers.platform, cx);
+        // Markdown プレビューも同様（#680）
+        self.update_md_link_hover(window.mouse_position(), event.modifiers.platform, cx);
     }
 
     /// ペインのリンク検出キャッシュを更新する
@@ -13254,11 +13397,9 @@ fn md_block_line_texts(block: &preview::MdBlock) -> Vec<String> {
         preview::MdBlockKind::Heading { spans, .. }
         | preview::MdBlockKind::Paragraph { spans }
         | preview::MdBlockKind::ListItem { spans, .. } => vec![inline(spans)],
-        preview::MdBlockKind::CodeBlock { lines, .. } => vec![lines
-            .iter()
-            .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")],
+        preview::MdBlockKind::CodeBlock { lines, .. } => {
+            vec![preview::md_code_block_text(lines)]
+        }
         preview::MdBlockKind::Table {
             header,
             rows,
@@ -13269,6 +13410,70 @@ fn md_block_line_texts(block: &preview::MdBlock) -> Vec<String> {
             .collect(),
         preview::MdBlockKind::Rule => vec![String::new()],
     }
+}
+
+/// Markdown ブロック内のリンクを「ブロック内の行番号 + バイト範囲 + 遷移先」で返す（#680）。
+///
+/// 行番号は [`md_block_line_texts`] と同じ並び（表はヘッダ → 各行のセル行優先）。
+/// コードブロック・罫線にはインラインリンクが無いので空になる。
+/// ブロックが占める「選択行」の本数（[`md_block_line_texts`] の長さと同じ）。
+///
+/// 当たり判定は毎フレーム作り直すので、行番号を数えるだけの用途で
+/// 行テキスト（= 文字列の連結とアロケーション）を作らないための軽い版。
+/// 一致は単体テストで固定する（ずれると行番号が全部ずれる）
+fn md_block_line_count(block: &preview::MdBlock) -> usize {
+    match &block.kind {
+        preview::MdBlockKind::Heading { .. }
+        | preview::MdBlockKind::Paragraph { .. }
+        | preview::MdBlockKind::ListItem { .. }
+        | preview::MdBlockKind::CodeBlock { .. }
+        | preview::MdBlockKind::Rule => 1,
+        // 表はセル 1 つ = 選択 1 行（ヘッダ → 各行の行優先）
+        preview::MdBlockKind::Table { header, rows, .. } => {
+            header.len() + rows.iter().map(Vec::len).sum::<usize>()
+        }
+    }
+}
+
+fn md_block_link_ranges(block: &preview::MdBlock) -> Vec<(usize, std::ops::Range<usize>, String)> {
+    let flat = |line: usize, spans: &[preview::MdSpan]| {
+        preview::md_link_ranges(spans)
+            .into_iter()
+            .map(move |(range, url)| (line, range, url))
+            .collect::<Vec<_>>()
+    };
+    match &block.kind {
+        preview::MdBlockKind::Heading { spans, .. }
+        | preview::MdBlockKind::Paragraph { spans }
+        | preview::MdBlockKind::ListItem { spans, .. } => flat(0, spans),
+        preview::MdBlockKind::Table { header, rows, .. } => std::iter::once(header)
+            .chain(rows.iter())
+            .flat_map(|row| row.iter())
+            .enumerate()
+            .flat_map(|(line, cell)| flat(line, cell))
+            .collect(),
+        preview::MdBlockKind::CodeBlock { .. } | preview::MdBlockKind::Rule => Vec::new(),
+    }
+}
+
+/// Markdown 文書全体のリンクを、プレビューの選択行番号つきで並べる（#680）。
+///
+/// **render のヒットテストと CLI / MCP の一覧はこの 1 本から作る**。並びが 1 つでも
+/// 食い違うと「ホバーしたリンクとは別の URL が開く」ので、索引の正をここに集約する。
+fn md_document_links(blocks: &[preview::MdBlock]) -> Vec<MdLinkHit> {
+    let mut out = Vec::new();
+    let mut line_index = 0usize;
+    for block in blocks {
+        for (block_line, range, url) in md_block_link_ranges(block) {
+            out.push(MdLinkHit {
+                line: line_index + block_line,
+                range,
+                url,
+            });
+        }
+        line_index += md_block_line_count(block);
+    }
+    out
 }
 
 /// tako-control の dispatch がドメイン状態へ触るためのホスト実装。
@@ -13908,6 +14113,111 @@ impl PreviewHost for TakoApp {
         Ok(target)
     }
 
+    /// Markdown プレビュー内リンクの一覧（CLI / MCP 公開用。#680）。ヒットテスト用の
+    /// `preview_md_link_hits` とは別で、こちらは表示中ブロック列から数え直す
+    /// md プレビューでなければ None（PDF と区別して案内できるようにする）
+    fn preview_md_links(&self, pane: PaneId) -> Option<Vec<tako_core::MdLink>> {
+        let preview = self.previews.get(&pane)?;
+        // 未描画（開いた直後）でも一覧できるよう、当たり判定キャッシュではなく
+        // ブロック列から数え直す。索引の正は md_document_links なので render と一致する
+        let preview::PreviewContent::Markdown(blocks) = &preview.content else {
+            return None;
+        };
+        // 表示テキストは一覧のときだけ要る（当たり判定は行 + 範囲だけで足りる）
+        let line_texts: Vec<String> = blocks.iter().flat_map(md_block_line_texts).collect();
+        Some(
+            md_document_links(blocks)
+                .into_iter()
+                .map(|hit| tako_core::MdLink {
+                    text: line_texts
+                        .get(hit.line)
+                        .and_then(|text| text.get(hit.range.start..hit.range.end.min(text.len())))
+                        .unwrap_or_default()
+                        .to_string(),
+                    openable: tako_core::md_links::browser_url(&hit.url).is_some(),
+                    url: hit.url,
+                    line: hit.line,
+                })
+                .collect(),
+        )
+    }
+
+    /// Markdown リンクをフォローする（#680）。UI の ⌘+クリックと CLI / MCP の共通経路。
+    /// 開いてよい URL（http / https）だけを OS 既定ブラウザへ渡す
+    fn follow_preview_md_link(
+        &mut self,
+        pane: PaneId,
+        index: usize,
+    ) -> Result<serde_json::Value, String> {
+        let links = self
+            .preview_md_links(pane)
+            .ok_or_else(|| "Markdown プレビューではない".to_string())?;
+        let link = links
+            .get(index)
+            .ok_or_else(|| format!("リンクインデックス範囲外: {index}（全 {} 件）", links.len()))?;
+        let url = tako_core::md_links::browser_url(&link.url).ok_or_else(|| {
+            format!(
+                "ブラウザで開けないリンク（http / https のみ対応）: {}",
+                link.url
+            )
+        })?;
+        tako_control::platform::os_integration::open_url(url)?;
+        Ok(serde_json::json!({
+            "pane": pane.as_u64(),
+            "action": "opened_url",
+            "url": url,
+        }))
+    }
+
+    /// Markdown プレビューのコードブロック全文をクリップボードへ入れる（#680）。
+    /// UI のコピーボタンと CLI / MCP の共通経路（`index` = 出現順、省略時は先頭）。
+    /// GPUI の clipboard API は `App` を要するので、実書き込みは render の
+    /// `flush_pending_clipboard` に任せてここでは積むだけにする（カードと同方式）
+    fn copy_preview_code_block(
+        &mut self,
+        pane: PaneId,
+        index: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        let preview = self
+            .previews
+            .get(&pane)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        let preview::PreviewContent::Markdown(blocks) = &preview.content else {
+            return Err("Markdown プレビューではない".into());
+        };
+        let codes: Vec<String> = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                preview::MdBlockKind::CodeBlock { lines, .. } => {
+                    Some(preview::md_code_block_text(lines))
+                }
+                _ => None,
+            })
+            .collect();
+        if codes.is_empty() {
+            return Err("コードブロックが無い".into());
+        }
+        let index = index.unwrap_or(0);
+        let text = codes.get(index).ok_or_else(|| {
+            format!(
+                "コードブロック範囲外: {index}（全 {} 個。0 始まり）",
+                codes.len()
+            )
+        })?;
+        let lines = text.split('\n').count();
+        let bytes = text.len();
+        self.pending_clipboard.push(text.clone());
+        self.preview_md_copied = Some((pane, index, std::time::Instant::now()));
+        Ok(serde_json::json!({
+            "pane": pane.as_u64(),
+            "index": index,
+            "total": codes.len(),
+            "lines": lines,
+            "bytes": bytes,
+            "text": text,
+        }))
+    }
+
     fn preview_pdf_links(&self, pane: PaneId) -> Option<tako_core::PdfLinks> {
         let preview = self.previews.get(&pane)?;
         let data = match &preview.content {
@@ -14111,6 +14421,7 @@ impl PreviewHost for TakoApp {
         self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_line_texts.remove(&pane);
+        self.forget_md_links(pane);
         self.remove_preview_image_cache(pane);
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
@@ -15502,6 +15813,8 @@ impl Render for TakoApp {
         if let Some(tab) = self.pending_settings_open.take() {
             self.open_settings_window_impl(tab, cx);
         }
+        // Markdown コードブロックのコピー（#680。GPUI の clipboard API は App が要るのでここで流す）
+        self.flush_pending_clipboard(cx);
         // このウィンドウの表示タブ（Issue #339 ビューポート方式)。同一 entity を
         // 全ウィンドウの root view として共有するため、呼び出し元 window ごとに解決する
         let display_tab = self.display_tab_for(window);
@@ -17689,7 +18002,10 @@ mod self_test {
         pane: PaneId,
         pdf: bool,
     ) -> bool {
-        for _ in 0..40 {
+        // PDF は background ラスタライズ待ち = 実時間依存。同じ実行の中で前の節が
+        // 重い（#680 でフレーム採取が増えた等）だけで落ちる余地を残さないよう、
+        // 上限は余裕を持たせる（判定内容は不変。揃わなければ結局 false になる）
+        for _ in 0..80 {
             // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
             // なる。root entity を借用しない AnyWindowHandle 境界から描画する。
             let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
@@ -18708,6 +19024,269 @@ mod self_test {
             code_pasted.as_deref() == code_selected.as_deref(),
             "visual-test md: コードブロックのコピーが pbpaste で読める (#656)",
         );
+
+        // #680: ⌘+ホバーのリンク装飾とコードブロックのコピーボタンが実ピクセルで出るか。
+        // ホバー・コピー状態は「マウスがそこに無い」状態では描かれないので、状態を
+        // 直接立てて before / after を比較する（描画経路が生きていることの証明）。
+        // コピー本体は UI ボタンの on_click と同じ関数を通し pbpaste まで確認する
+        for theme_state in ["dark", "light"] {
+            let applied = window
+                .update(cx, |app, _, cx| {
+                    let ok = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some(theme_state.into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .is_ok();
+                    cx.notify();
+                    ok
+                })
+                .unwrap_or(false);
+            check(
+                applied,
+                &format!("visual-test md({theme_state}): テーマ適用 (#680)"),
+            );
+
+            // (1) リンクの ⌘+ホバー装飾。開ける（http/https）リンクの行を見る
+            let link_target = window
+                .update(cx, |app, _, _| {
+                    let hits = app.preview_md_link_hits.get(&md_pane)?;
+                    let (index, hit) = hits
+                        .iter()
+                        .enumerate()
+                        .find(|(_, hit)| tako_core::md_links::browser_url(&hit.url).is_some())?;
+                    Some((index, hit.line, hit.url.clone()))
+                })
+                .ok()
+                .flatten();
+            let (link_index, link_line, link_url) =
+                link_target.unwrap_or_else(|| fail("visual-test md: 開けるリンクが無い (#680)"));
+            scroll_md_to_line(window, cx, md_pane, link_line).await;
+            let link_bounds = window
+                .update(cx, |app, _, _| {
+                    app.preview_text_layouts
+                        .get(&md_pane)
+                        .and_then(|l| l.get(link_line).cloned())
+                        .flatten()
+                        .map(|layout| layout.bounds())
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fail("visual-test md: リンク行の bounds (#680)"));
+            let plain = capture_frame(any, cx);
+            let hovered = {
+                window
+                    .update(cx, |app, _, cx| {
+                        app.preview_md_hovered_link = Some((md_pane, link_index));
+                        cx.notify();
+                    })
+                    .ok();
+                capture_frame(any, cx)
+            };
+            let hover_diff = match (plain.as_ref(), hovered.as_ref()) {
+                (Some((a, scale)), Some((b, _))) => {
+                    changed_pixels_in_bounds(a, b, std::slice::from_ref(&link_bounds), *scale)
+                }
+                _ => 0,
+            };
+            let restored = {
+                window
+                    .update(cx, |app, _, cx| {
+                        app.preview_md_hovered_link = None;
+                        cx.notify();
+                    })
+                    .ok();
+                capture_frame(any, cx)
+            };
+            let hover_roundtrip = match (plain.as_ref(), restored.as_ref()) {
+                (Some((a, scale)), Some((b, _))) => {
+                    changed_pixels_in_bounds(a, b, std::slice::from_ref(&link_bounds), *scale)
+                }
+                _ => usize::MAX,
+            };
+            println!(
+                "TAKO_VISUAL_PIXEL: md({theme_state}) link-hover url={link_url} \
+                 line={link_line} diff={hover_diff} roundtrip={hover_roundtrip}"
+            );
+            check(
+                hover_diff >= 8,
+                &format!(
+                    "visual-test md({theme_state}): ⌘+ホバーでリンク装飾が実描画で変わる (#680)"
+                ),
+            );
+            check(
+                hover_roundtrip == 0,
+                &format!("visual-test md({theme_state}): ⌘ 解放でリンク装飾が元に戻る (#680)"),
+            );
+
+            // (2) コードブロックのコピーボタン。コピー成功状態は常時表示なので
+            //     idle との差分でボタンが実際に描かれていることを確かめる
+            scroll_md_to_line(window, cx, md_pane, code_line).await;
+            let boxes = window
+                .update(cx, |app, _, _| {
+                    let layout = app
+                        .preview_text_layouts
+                        .get(&md_pane)
+                        .and_then(|l| l.get(code_line).cloned())
+                        .flatten()?;
+                    // ボタンはコードブロックの枠（テキストの外側 = padding 分）の右上に出る
+                    let bounds = layout.bounds();
+                    let base = app.theme.font_size;
+                    let pad = px(base);
+                    let band = Bounds {
+                        origin: point(bounds.left() - pad, bounds.top() - pad),
+                        size: gpui::size(bounds.size.width + pad * 2.0, pad * 2.0),
+                    };
+                    // ボタンだけを囲む小さな矩形（待機中も描かれていることの確認用）
+                    let button = Bounds {
+                        origin: point(band.right() - px(base * 2.6), band.top() + px(base * 0.2)),
+                        size: gpui::size(px(base * 2.4), px(base * 1.7)),
+                    };
+                    Some((band, button, app.theme.mantle))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fail("visual-test md: コードブロックの bounds (#680)"));
+            let (code_box, button_box, code_surface) = boxes;
+            // 前のループで立てたコピー表示が残っていると idle フレームに写り込む
+            window
+                .update(cx, |app, _, cx| {
+                    app.preview_md_copied = None;
+                    app.preview_md_hovered_link = None;
+                    cx.notify();
+                })
+                .ok();
+            let code_idle = capture_frame(any, cx);
+            let code_copied = {
+                window
+                    .update(cx, |app, _, cx| {
+                        app.preview_md_copied = Some((md_pane, 0, std::time::Instant::now()));
+                        cx.notify();
+                    })
+                    .ok();
+                capture_frame(any, cx)
+            };
+            let button_diff = match (code_idle.as_ref(), code_copied.as_ref()) {
+                (Some((a, scale)), Some((b, _))) => {
+                    changed_pixels_in_bounds(a, b, std::slice::from_ref(&code_box), *scale)
+                }
+                _ => 0,
+            };
+            // 待機中（ホバーもコピー直後でもない状態）でもボタンが描かれている =
+            // コードブロックの面から見分けが付くピクセルが右上にある（#680 は常時表示）
+            let button_idle_pixels = match code_idle.as_ref() {
+                Some((frame, scale)) => readable_pixels_in_bounds(
+                    frame,
+                    std::slice::from_ref(&button_box),
+                    *scale,
+                    code_surface,
+                    1.15,
+                ),
+                None => 0,
+            };
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dump);
+                if let Some((frame, _)) = code_copied.as_ref() {
+                    let _ = frame.save(
+                        std::path::Path::new(&dump)
+                            .join(format!("markdown-{theme_state}-copy-button.png")),
+                    );
+                }
+            }
+            // UI ボタンの on_click と同じ関数 → 実クリップボード
+            let (copy_result, expected_code) = window
+                .update(cx, |app, _, cx| {
+                    app.preview_md_copied = None;
+                    let result = app.copy_preview_code_block(md_pane, Some(0));
+                    app.flush_pending_clipboard(cx);
+                    let expected = app
+                        .preview_line_texts
+                        .get(&md_pane)
+                        .and_then(|texts| texts.get(code_line).cloned());
+                    cx.notify();
+                    (result.ok(), expected)
+                })
+                .unwrap_or((None, None));
+            let button_pasted = cx
+                .background_executor()
+                .spawn(async {
+                    std::process::Command::new("pbpaste")
+                        .output()
+                        .ok()
+                        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+                })
+                .await;
+            println!(
+                "TAKO_VISUAL_PIXEL: md({theme_state}) code-copy-button diff={button_diff} \
+                 idle_pixels={button_idle_pixels} pasted_len={:?} expected_len={:?}",
+                button_pasted.as_deref().map(str::len),
+                expected_code.as_deref().map(str::len)
+            );
+            check(
+                button_diff >= 8,
+                &format!(
+                    "visual-test md({theme_state}): コピー直後の表示へ実描画で切り替わる (#680)"
+                ),
+            );
+            check(
+                button_idle_pixels >= 8,
+                &format!(
+                    "visual-test md({theme_state}): 待機中もコピーボタンが右上に描かれる (#680)"
+                ),
+            );
+            check(
+                copy_result.is_some()
+                    && button_pasted.as_deref() == expected_code.as_deref()
+                    && expected_code.as_deref().is_some_and(|t| t.contains('\n')),
+                &format!(
+                    "visual-test md({theme_state}): コピーボタンの全文が pbpaste と一致 (#680)"
+                ),
+            );
+            // 次のループ・後続の節へコピー表示を持ち込まない
+            window
+                .update(cx, |app, _, cx| {
+                    app.preview_md_copied = None;
+                    cx.notify();
+                })
+                .ok();
+        }
+
+        // #680 の節は light で終わるので、後続の節（エッジケース / PDF）へ
+        // テーマと描画負荷を持ち越さない。PDF 節は background ラスタライズの
+        // 完了を 2 秒で待つので、直前を落ち着かせてから渡す
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Theme {
+                        action: Some("set".into()),
+                        mode: Some("dark".into()),
+                        target: None,
+                        key: None,
+                        value: None,
+                        name: None,
+                        font_family: None,
+                        font_size: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.preview_md_copied = None;
+                app.preview_md_hovered_link = None;
+                cx.notify();
+            })
+            .ok();
+        cx.background_executor()
+            .timer(Duration::from_millis(500))
+            .await;
 
         // エッジケース（#656 の検証手順 3）: 巨大な表・壊れた表・折り返せない長い語・
         // 深いネスト・フェンス内の ``` を 1 本の md に詰めて、panic / フリーズ / 崩れが
@@ -23126,6 +23705,278 @@ mod self_test {
                 .ok();
             wait(cx, 300).await;
 
+            // 90. Markdown プレビューのリンク ⌘+クリックとコードブロックのコピー（#680）。
+            // 実描画の TextLayout から座標を作り、①⌘+ホバーがリンク文字の上でだけ立つ
+            // ②開けないリンク（アンカー / 相対パス / javascript:）は当たらない・開かない
+            // ③⌘ 無しでは当たり判定が立たず、同じ位置の選択座標は従来どおり解決する
+            // ④コピーは CLI / MCP と同じ dispatch 経路で全文が一致し実クリップボードへ届く
+            // を機械検証する。実ブラウザ起動だけは副作用が出るので手動確認に回す
+            {
+                let md680 = preview_dir.join("links680.md");
+                let code680 = "def f(x):\n    if x:\n\n        return 1\n    return 0";
+                let _ = std::fs::write(
+                    &md680,
+                    format!(
+                        "# 見出し\n\n開ける [tako](https://example.com/tako) と開けない \
+                         [章](#見出し)・[相対](./x.md)・[script](javascript:alert%281%29)。\n\n\
+                         ```python\n{code680}\n```\n\n```\n```\n"
+                    ),
+                );
+                let pane = PaneId::from_raw(code_pane);
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        let ok = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(code_pane),
+                                path: md680.display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                                direction: None,
+                                focus: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok();
+                        cx.notify();
+                        ok
+                    })
+                    .unwrap_or(false);
+                check(opened, "#680: リンク検証用 md を開く");
+                check(
+                    wait_for_preview_maps(any, window, cx, pane, false).await,
+                    "#680: リンク md の座標キャッシュ生成",
+                );
+
+                // (a) 一覧（dispatch = CLI / MCP と同一経路）。kind と openable の出し分け
+                let listed = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::PreviewLinkList {
+                                pane: Some(code_pane),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                    })
+                    .ok()
+                    .flatten();
+                let list_ok = listed.as_ref().is_some_and(|v| {
+                    let links = v["links"].as_array().cloned().unwrap_or_default();
+                    v["kind"] == "markdown"
+                        && links.len() == 4
+                        && links[0]["url"] == "https://example.com/tako"
+                        && links[0]["openable"] == true
+                        && links[0]["text"] == "tako"
+                        && links[1..]
+                            .iter()
+                            .all(|l| l["openable"] == false && l["line"] == links[0]["line"])
+                });
+                println!(
+                    "TAKO_PREVIEW_LINK680: list={}",
+                    listed
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into())
+                );
+                check(
+                    list_ok,
+                    "#680: preview-link-list が md のリンクを openable 付きで返す",
+                );
+
+                // (b) ⌘+ホバー: リンク文字の上でだけ立つ。座標は実描画から作る
+                let hover = window
+                    .update(cx, |app, _, cx| {
+                        let hits = app.preview_md_link_hits.get(&pane)?.clone();
+                        let target = hits.first()?.clone();
+                        let layout = app
+                            .preview_text_layouts
+                            .get(&pane)?
+                            .get(target.line)?
+                            .clone()?;
+                        let mid = target.range.start
+                            + (target.range.end - target.range.start).min(2);
+                        let mut on_link = layout.position_for_index(mid)?;
+                        on_link.y += layout.line_height() / 2.0;
+                        // 同じ行の行頭（"開ける " の中）= リンク外。行頭は必ず非リンク
+                        let mut off_link = layout.position_for_index(0)?;
+                        off_link.y += layout.line_height() / 2.0;
+
+                        app.update_md_link_hover(on_link, true, cx);
+                        let on = app.preview_md_hovered_link == Some((pane, 0));
+                        app.update_md_link_hover(off_link, true, cx);
+                        let off_text = app.preview_md_hovered_link.is_none();
+                        // ⌘ を離すと消える（装飾も戻る）
+                        app.update_md_link_hover(on_link, true, cx);
+                        let on_again = app.preview_md_hovered_link.is_some();
+                        app.update_md_link_hover(on_link, false, cx);
+                        let released = app.preview_md_hovered_link.is_none();
+                        // ⌘ 無しでも選択の当たり判定は従来どおりその行を返す（回帰防止）
+                        let selection_still_works =
+                            app.preview_hit_test(pane, on_link).map(|(line, _)| line)
+                                == Some(target.line);
+                        // 開けないリンク（2 本目以降）はどこを指しても当たらない
+                        let mut unopenable_hit = false;
+                        for hit in hits.iter().skip(1) {
+                            let Some(layout) = app
+                                .preview_text_layouts
+                                .get(&pane)
+                                .and_then(|l| l.get(hit.line).cloned())
+                                .flatten()
+                            else {
+                                continue;
+                            };
+                            let mid =
+                                hit.range.start + (hit.range.end - hit.range.start).min(2);
+                            if let Some(mut position) = layout.position_for_index(mid) {
+                                position.y += layout.line_height() / 2.0;
+                                unopenable_hit |=
+                                    app.md_link_at_position(pane, position).is_some_and(
+                                        |index| index != 0,
+                                    );
+                            }
+                        }
+                        Some((
+                            on,
+                            off_text,
+                            on_again,
+                            released,
+                            selection_still_works,
+                            !unopenable_hit,
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                println!("TAKO_PREVIEW_LINK680: hover={hover:?}");
+                check(
+                    hover == Some((true, true, true, true, true, true)),
+                    "#680: ⌘+ホバーがリンク文字の上だけで立ち、⌘ 解放で消え、選択は不変",
+                );
+
+                // (c) 開けないリンクは follow でもエラー（ブラウザを起こさない）
+                let refused = window
+                    .update(cx, |app, _, _| {
+                        (1..4).all(|index| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::PreviewFollowLink {
+                                    pane: Some(code_pane),
+                                    index,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .is_err()
+                        })
+                    })
+                    .unwrap_or(false);
+                check(
+                    refused,
+                    "#680: アンカー / 相対パス / javascript: は follow-link が拒否する",
+                );
+                let out_of_range = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::PreviewFollowLink {
+                                pane: Some(code_pane),
+                                index: 99,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_err()
+                    })
+                    .unwrap_or(false);
+                check(out_of_range, "#680: 範囲外のリンク index はエラー");
+
+                // (d) コピー: dispatch（= CLI / MCP）→ 実クリップボード。空行・インデント保持
+                let copied = window
+                    .update(cx, |app, _, cx| {
+                        let result = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::PreviewCopyCode {
+                                pane: Some(code_pane),
+                                index: Some(0),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        app.flush_pending_clipboard(cx);
+                        Some(result)
+                    })
+                    .ok()
+                    .flatten();
+                let clipboard = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()));
+                let copy_ok = copied.as_ref().is_some_and(|v| {
+                    v["text"] == code680 && v["total"] == 2 && v["index"] == 0
+                }) && clipboard.as_deref() == Some(code680);
+                println!(
+                    "TAKO_PREVIEW_LINK680: copy_lines={:?} clipboard_match={} refused={refused} out_of_range={out_of_range}",
+                    copied.as_ref().map(|v| v["lines"].clone()),
+                    clipboard.as_deref() == Some(code680)
+                );
+                check(
+                    copy_ok,
+                    "#680: preview-copy-code がコードブロック全文を実クリップボードへ入れる",
+                );
+                // 空のコードブロック（2 個目）と範囲外
+                let edge = window
+                    .update(cx, |app, _, _| {
+                        let empty = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::PreviewCopyCode {
+                                pane: Some(code_pane),
+                                index: Some(1),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .is_some_and(|v| v["text"] == "" && v["lines"] == 1);
+                        let over = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::PreviewCopyCode {
+                                pane: Some(code_pane),
+                                index: Some(9),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_err();
+                        // フィードバック状態（ボタン表示が変わる根拠）が立っている
+                        let feedback = app
+                            .preview_md_copied
+                            .is_some_and(|(p, i, at)| {
+                                p == pane
+                                    && i == 1
+                                    && at.elapsed() < crate::preview_render::MD_COPY_FEEDBACK
+                            });
+                        empty && over && feedback
+                    })
+                    .unwrap_or(false);
+                check(
+                    edge,
+                    "#680: 空のコードブロックはコピー可・範囲外はエラー・成功表示が立つ",
+                );
+
+                let _ = std::fs::remove_file(&md680);
+                // 後続の e2e は note.md を対象にするため戻す
+                window
+                    .update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(code_pane),
+                                path: preview_dir.join("note.md").display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                                direction: None,
+                                focus: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                wait(cx, 300).await;
+            }
+
             // 66c. プレビューのライブリロード（#233）。実 CLI の ON/OFF、OS イベント、
             //      300ms デバウンス、background 差し替えを一気通貫で検証する。
             let (reload_pane, reload_terminal, reload_tab) = window
@@ -26932,6 +27783,86 @@ mod persist_resume_tests {
     fn resumeコマンドに改行を含めない() {
         let cmd = claude_resume_command(false, Some(ID), Some(&account_location())).unwrap();
         assert!(!cmd.contains('\r') && !cmd.contains('\n'), "{cmd}");
+    }
+}
+
+#[cfg(test)]
+mod md_link_tests {
+    use super::*;
+
+    /// 行テキストとリンク範囲が同じ座標系（`md_block_line_texts` の 1 行）を指すこと。
+    /// ここが崩れると ⌘+ホバーの下線が別の文字に付き、別 URL が開く（#680）
+    #[test]
+    fn 文書全体のリンクは選択行番号とバイト範囲で並ぶ() {
+        // 実ファイル相当の md（行継続を使うと字下げがインデントコードになるので連結で書く）
+        let md = concat!(
+            "# [見出しリンク](https://h.example)\n\n",
+            "段落の [本文リンク](https://p.example) です\n\n",
+            "```rust\nfn f() {}\n```\n\n",
+            "| 列A | 列B |\n| --- | --- |\n| [表リンク](https://t.example) | 素 |\n",
+        );
+        let blocks = preview::markdown_blocks(md);
+        // 行テキストは render と同じ並びで作る
+        let line_texts: Vec<String> = blocks.iter().flat_map(md_block_line_texts).collect();
+        let links = md_document_links(&blocks);
+        let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://h.example",
+                "https://p.example",
+                "https://t.example"
+            ],
+            "文書順（見出し → 段落 → 表セル）に並ぶ"
+        );
+        let text_of = |link: &MdLinkHit| -> String {
+            let line = line_texts
+                .get(link.line)
+                .unwrap_or_else(|| panic!("行 {} がある: {line_texts:?}", link.line));
+            line[link.range.clone()].to_string()
+        };
+        assert_eq!(text_of(&links[0]), "見出しリンク");
+        assert_eq!(text_of(&links[1]), "本文リンク");
+        assert_eq!(text_of(&links[2]), "表リンク");
+        // 表は 1 ブロックで 4 行（ヘッダ 2 セル + 本文 2 セル）を占めるので、
+        // 表セルのリンク行はコードブロックより後ろ = 行番号が飛ばずに進む
+        assert!(links[1].line < links[2].line);
+        assert!(links[2].line < line_texts.len());
+    }
+
+    /// コードブロックはリンクを持たない（``` の中は素のテキスト）
+    #[test]
+    fn コードブロックはリンクを持たない() {
+        let blocks = preview::markdown_blocks("```\n[x](https://example.com)\n```\n");
+        assert!(md_document_links(&blocks).is_empty());
+    }
+
+    #[test]
+    fn リンクの無い文書では空になる() {
+        let blocks = preview::markdown_blocks("# 見出し\n\n本文だけ\n");
+        assert!(md_document_links(&blocks).is_empty());
+    }
+
+    /// 行数の軽い版（文字列を作らない `md_block_line_count`）が
+    /// `md_block_line_texts` の長さと必ず一致すること。ずれると当たり判定の
+    /// 行番号が文書の途中から全部ずれる（#680）
+    #[test]
+    fn ブロックの行数は行テキストの本数と一致する() {
+        for md in [
+            preview::MARKDOWN_SHOWCASE,
+            "# h\n\np\n\n- a\n  - b\n\n```rs\nfn f() {}\n```\n\n---\n",
+            "| a | b | c |\n| --- | --- | --- |\n| 1 |\n| 1 | 2 | 3 | 4 |\n",
+            "> 引用\n>\n> > 深い引用\n",
+            "",
+        ] {
+            for block in preview::markdown_blocks(md) {
+                assert_eq!(
+                    md_block_line_count(&block),
+                    md_block_line_texts(&block).len(),
+                    "行数が食い違う: {block:?}"
+                );
+            }
+        }
     }
 }
 

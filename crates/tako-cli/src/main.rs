@@ -74,12 +74,15 @@ enum Command {
     /// Markdown・PDF プレビューのアウトラインを表示し、項目へジャンプする
     #[command(name = "preview-outline")]
     PreviewOutline(PreviewOutlineArgs),
-    /// PDF プレビュー内のリンク一覧を表示する
+    /// Markdown・PDF プレビュー内のリンク一覧を表示する
     #[command(name = "preview-link-list")]
     PreviewLinkList(PaneArg),
-    /// PDF プレビュー内のリンクをフォローする（外部 URL はブラウザ、内部はページジャンプ）
+    /// プレビュー内のリンクをフォローする（URL はブラウザ、PDF 内部リンクはページジャンプ）
     #[command(name = "preview-follow-link")]
     PreviewFollowLink(PreviewFollowLinkArgs),
+    /// Markdown プレビューのコードブロック全文をクリップボードへコピーする
+    #[command(name = "preview-copy-code")]
+    PreviewCopyCode(PreviewCopyCodeArgs),
     /// 表示中プレビューファイルのライブリロード ON/OFF・状態確認
     #[command(name = "preview-reload")]
     PreviewReload(ToggleArgs),
@@ -2004,6 +2007,15 @@ struct PreviewFollowLinkArgs {
     pane: Option<u64>,
     /// フォローするリンクのインデックス（0 始まり。preview-link-list の結果で確認）
     index: usize,
+}
+
+#[derive(Args)]
+struct PreviewCopyCodeArgs {
+    /// 対象ペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// コードブロックの出現順（0 始まり。省略時は先頭）
+    index: Option<usize>,
 }
 
 #[derive(Args)]
@@ -4725,6 +4737,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(args.pane)?,
             index: args.index,
         },
+        Command::PreviewCopyCode(args) => Request::PreviewCopyCode {
+            pane: target_pane(args.pane)?,
+            index: args.index,
+        },
         Command::PreviewReload(args) => Request::PreviewReload {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
@@ -6373,6 +6389,8 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
         Command::PreviewFollowLink(_) => println!("{result}"),
+        // #680: コピーしたコード全文は改行込みで読みたいので整形して出す
+        Command::PreviewCopyCode(_) => println!("{}", pretty_json(result)),
         Command::PreviewReload(_) | Command::PreviewCache(_) | Command::PreviewChangelog(_) => {
             println!("{result}")
         }

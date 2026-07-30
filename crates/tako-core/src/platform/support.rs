@@ -751,6 +751,13 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        key: "tako_preview_copy_code",
+        macos: Support::Supported,
+        // Markdown のコードブロックをクリップボードへ渡すだけで PDF もレンダラも介さない。
+        // main では #521 未完了を理由に Pending だったが、本ブランチでは #521 が入っている
+        windows: Support::Supported,
+    },
+    Feature {
         key: "tako_preview_edit",
         macos: Support::Supported,
         windows: Support::Supported,
@@ -758,13 +765,15 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_follow_link",
         macos: Support::Supported,
-        // #693: lopdf で PDF 構造を解析しリンク注釈を取得。テキスト選択はできない
+        // #693: lopdf で PDF 構造を解析しリンク注釈を取得。テキスト選択はできない。
+        // #680 で Markdown の `[text](url)` も対象に加わり、そちらも Windows で開ける
         windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_link_list",
         macos: Support::Supported,
-        // #693: lopdf で PDF 構造を解析しリンク注釈を取得
+        // #693: lopdf で PDF 構造を解析しリンク注釈を取得。
+        // #680 で Markdown のリンクも一覧に載るようになった
         windows: Support::Supported,
     },
     Feature {
