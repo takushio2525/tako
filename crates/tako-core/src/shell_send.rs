@@ -15,10 +15,17 @@
 //! 器を挟まない直接 spawn では 20/20 全到達、psmux 経由では同条件で欠落が出る。
 //! つまり **落とすのは器の側**で、tako から直せるのは「書いた結果を確かめる」ことだけ。
 //!
-//! 全損すると画面は素のプロンプトのまま何時間でも止まる。途中欠落すると
-//! シェルが構文的に未完の行を受け取って継続プロンプト（`>>`）で待つため、
-//! **後から届いた別の入力がくっついて遅れて発火**する。#640 で報告された
-//! 「完全消失」と「大幅遅延」の 2 モードは、どちらもこの 1 つの欠落で説明がつく。
+//! #640 で報告された 4 つの症状は、いずれもこの欠落 1 つで説明がつく:
+//!
+//! 1. **完全消失** — 全損モード。画面は素のプロンプトのまま何時間でも止まる
+//! 2. **大幅遅延** — 途中欠落でシェルが構文的に未完の行を受け取り、継続プロンプト（`>>`）で
+//!    待つ。後から届いた別の入力がくっついて初めて実行される
+//! 3. **文字単位のドロップ** — 中抜けモードそのもの（実機で `$env:CAUDE_CO` = `L` の欠落を目撃）
+//! 4. **Enter だけ欠落** — 本文と Enter は独立に落ちる。本文が全文入っても Enter が落ちれば
+//!    実行されない（そのため本文の確認と実行の確認を分けてある）
+//!
+//! **欠落は末尾の切り詰めではなく中抜け**なので、送達確認は先頭一致でも末尾一致でもなく
+//! **全文一致**でなければならない。
 //!
 //! # 設計
 //!
@@ -287,8 +294,11 @@ impl ShellSendFlow {
             return ShellSendAction::Wait;
         }
         if self.enter_resends >= MAX_ENTER_RESENDS {
+            // 本文は通ったが実行された気配が無いまま打ち切る。ここを verified 扱いにすると
+            // 「動かないのに成功と記録される」ので、確認できなかったこととして残す
             self.stage = Stage::Done;
-            return ShellSendAction::Done { verified: true };
+            self.verified = false;
+            return ShellSendAction::Done { verified: false };
         }
         self.enter_resends += 1;
         self.ticks_in_stage = 0;
@@ -526,6 +536,23 @@ mod tests {
             Some("\r"),
             "Enter を単独で再送する"
         );
+    }
+
+    #[test]
+    fn enterが最後まで効かなければ未確認として終わる() {
+        // 「本文は入ったが実行されない」を成功扱いにすると、動かないのに記録だけ残る
+        let mut f = ShellSendFlow::new(CMD);
+        f.tick(&prompt());
+        f.tick(&prompt());
+        f.tick(&echoed(CMD));
+        let mut last = ShellSendAction::Wait;
+        for _ in 0..200 {
+            last = f.tick(&echoed(CMD)); // 画面が一度も動かない
+            if matches!(last, ShellSendAction::Done { .. }) {
+                break;
+            }
+        }
+        assert_eq!(last, ShellSendAction::Done { verified: false });
     }
 
     #[test]
