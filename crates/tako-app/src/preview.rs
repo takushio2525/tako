@@ -74,8 +74,17 @@ pub struct MdSpan {
     pub italic: bool,
     pub code: bool,
     pub strike: bool,
-    /// リンクテキスト（アクセント色で描く。URL 自体は開かない = Web ペインは FR-3.8）
-    pub link: bool,
+    /// リンクなら md に書かれた遷移先（`None` = リンクではない）。
+    /// 装飾（accent + 下線）は `is_some()` で判定し、⌘+クリックで開くかは
+    /// `tako_core::md_links::browser_url` の判定に従う（#680）
+    pub link_url: Option<String>,
+}
+
+impl MdSpan {
+    /// リンクの一部か（装飾判定用）
+    pub fn is_link(&self) -> bool {
+        self.link_url.is_some()
+    }
 }
 
 /// 表セルの配置（GFM の `:---` / `:---:` / `---:`。FR-3.3）
@@ -1163,7 +1172,10 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
 
     let mut blocks: Vec<MdBlock> = Vec::new();
     let mut spans: Vec<MdSpan> = Vec::new();
-    let (mut bold, mut italic, mut strike, mut link) = (0u32, 0u32, 0u32, 0u32);
+    let (mut bold, mut italic, mut strike) = (0u32, 0u32, 0u32);
+    // リンクは深さカウンタではなく遷移先のスタックで持つ（⌘+クリックで開くため。#680）。
+    // md にリンクの入れ子は無いが、閉じ忘れの入力でも `last()` が現在のリンクを指す
+    let mut link_urls: Vec<String> = Vec::new();
     let mut state = MdParseState::default();
     // コードブロック蓄積（lang, 本文）
     let mut code: Option<(Option<String>, String)> = None;
@@ -1176,7 +1188,7 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
                      bold: u32,
                      italic: u32,
                      strike: u32,
-                     link: u32| {
+                     link: Option<&str>| {
         if text.is_empty() {
             return;
         }
@@ -1186,7 +1198,7 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
             italic: italic > 0,
             code: code_span,
             strike: strike > 0,
-            link: link > 0,
+            link_url: link.map(str::to_string),
         });
     };
     // 段落・見出し等の区切りで溜まったスパンをブロック化する
@@ -1325,8 +1337,10 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
             Event::Start(Tag::Strikethrough) => strike += 1,
             Event::End(TagEnd::Strikethrough) => strike = strike.saturating_sub(1),
-            Event::Start(Tag::Link { .. }) => link += 1,
-            Event::End(TagEnd::Link) => link = link.saturating_sub(1),
+            Event::Start(Tag::Link { dest_url, .. }) => link_urls.push(dest_url.to_string()),
+            Event::End(TagEnd::Link) => {
+                link_urls.pop();
+            }
             Event::Rule => {
                 flush(&mut blocks, &mut spans, &mut state);
                 blocks.push(MdBlock::new(MdBlockKind::Rule));
@@ -1335,19 +1349,47 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
                 if let Some((_, body)) = code.as_mut() {
                     body.push_str(&t);
                 } else {
-                    push_span(&mut spans, &t, false, bold, italic, strike, link);
+                    push_span(
+                        &mut spans,
+                        &t,
+                        false,
+                        bold,
+                        italic,
+                        strike,
+                        link_urls.last().map(String::as_str),
+                    );
                 }
             }
-            Event::Code(t) => push_span(&mut spans, &t, true, bold, italic, strike, link),
-            Event::SoftBreak | Event::HardBreak => {
-                push_span(&mut spans, " ", false, bold, italic, strike, link)
-            }
+            Event::Code(t) => push_span(
+                &mut spans,
+                &t,
+                true,
+                bold,
+                italic,
+                strike,
+                link_urls.last().map(String::as_str),
+            ),
+            Event::SoftBreak | Event::HardBreak => push_span(
+                &mut spans,
+                " ",
+                false,
+                bold,
+                italic,
+                strike,
+                link_urls.last().map(String::as_str),
+            ),
             // チェックボックスは描画側が図形で描く（絵文字全廃 #217）。ここでは状態だけ持つ
             Event::TaskListMarker(done) => state.task = Some(done),
             // HTML 等はインラインテキストとして劣化（内容を落とさない）
-            Event::Html(t) | Event::InlineHtml(t) => {
-                push_span(&mut spans, &t, false, bold, italic, strike, link)
-            }
+            Event::Html(t) | Event::InlineHtml(t) => push_span(
+                &mut spans,
+                &t,
+                false,
+                bold,
+                italic,
+                strike,
+                link_urls.last().map(String::as_str),
+            ),
             _ => {}
         }
     }
@@ -1454,6 +1496,44 @@ pub fn md_bullet_for_depth(list_depth: usize) -> MdBullet {
         2 => MdBullet::Ring,
         _ => MdBullet::Square,
     }
+}
+
+/// インライン列の中のリンクを「連結テキスト上のバイト範囲 + 遷移先」で返す（#680）。
+///
+/// 範囲の原点は `md_block_line_texts` が作る 1 行分のテキスト（= スパンの text を
+/// 連結したもの）で、テキスト選択・ヒットテストと同じ座標系。`**強調**` 混在で
+/// 1 リンクが複数スパンに割れるので、同じ遷移先が隣接していれば 1 本へ束ねる。
+pub fn md_link_ranges(spans: &[MdSpan]) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut offset = 0usize;
+    for span in spans {
+        let start = offset;
+        offset += span.text.len();
+        let Some(url) = span.link_url.as_deref() else {
+            continue;
+        };
+        match out.last_mut() {
+            Some((range, prev)) if prev == url && range.end == start => range.end = offset,
+            _ => out.push((start..offset, url.to_string())),
+        }
+    }
+    out
+}
+
+/// コードブロックの装飾なし論理テキスト（コピー用。行は `\n` 区切り）。
+///
+/// ハイライトのスパン分割・色を落として元のコードへ戻す。インデントと空行は
+/// そのまま残る（`md_block_line_texts` のコードブロック行と同一の文字列）
+pub fn md_code_block_text(lines: &[Line]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 表の組み立て。列数は必ずヘッダ（= 配置指定）の長さに正規化するので、
@@ -1875,6 +1955,35 @@ mod tests {
             MdBlockKind::Table { align, .. }
                 if align.contains(&MdAlign::Center) && align.contains(&MdAlign::Right)
         )));
+        // #680: ⌘+クリックの検証に必要な「開けるリンク」と「開けないリンク」が両方要る
+        let urls: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| match &b.kind {
+                MdBlockKind::Heading { spans, .. }
+                | MdBlockKind::Paragraph { spans }
+                | MdBlockKind::ListItem { spans, .. } => md_link_ranges(spans),
+                MdBlockKind::Table { header, rows, .. } => std::iter::once(header)
+                    .chain(rows.iter())
+                    .flat_map(|row| row.iter())
+                    .flat_map(|cell| md_link_ranges(cell))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .map(|(_, url)| url)
+            .collect();
+        assert!(
+            urls.iter()
+                .filter(|u| tako_core::md_links::browser_url(u).is_some())
+                .count()
+                >= 2,
+            "開ける http(s) リンクが 2 本以上要る: {urls:?}"
+        );
+        for expected in ["#", "./", "javascript:"] {
+            assert!(
+                urls.iter().any(|u| u.starts_with(expected)),
+                "開けないリンク（{expected}）がフィクスチャに無い: {urls:?}"
+            );
+        }
     }
 
     #[test]
@@ -2769,5 +2878,137 @@ class Box {
                 );
             }
         }
+    }
+    // --- #680: リンクの遷移先保持とコードブロックのコピー本文 ---
+
+    /// パースしたブロック列から (行内テキスト, リンク範囲) を取り出す小道具
+    fn spans_of(md: &str) -> Vec<MdSpan> {
+        let blocks = markdown_blocks(md);
+        blocks
+            .into_iter()
+            .flat_map(|b| match b.kind {
+                MdBlockKind::Heading { spans, .. }
+                | MdBlockKind::Paragraph { spans }
+                | MdBlockKind::ListItem { spans, .. } => spans,
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn リンクは遷移先を保持する() {
+        let spans = spans_of("見て [tako](https://github.com/takushio2525/tako) ね\n");
+        let link: Vec<_> = spans.iter().filter(|s| s.is_link()).collect();
+        assert_eq!(link.len(), 1, "リンクスパンは 1 つ");
+        assert_eq!(link[0].text, "tako");
+        assert_eq!(
+            link[0].link_url.as_deref(),
+            Some("https://github.com/takushio2525/tako")
+        );
+        // リンク外のスパンには遷移先が漏れない
+        assert!(spans
+            .iter()
+            .filter(|s| !s.is_link())
+            .all(|s| s.link_url.is_none()));
+    }
+
+    #[test]
+    fn リンク範囲は連結テキスト上のバイト範囲になる() {
+        let spans = spans_of("あ [tako](https://example.com) い\n");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let ranges = md_link_ranges(&spans);
+        assert_eq!(ranges.len(), 1);
+        let (range, url) = &ranges[0];
+        assert_eq!(url, "https://example.com");
+        // 日本語混在でもバイト範囲がリンク文字列そのものを指す
+        assert_eq!(&text[range.clone()], "tako");
+    }
+
+    #[test]
+    fn リンク内の装飾は一本の範囲へ束ねる() {
+        let spans = spans_of("[**太字**と普通](https://example.com)\n");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        // 装飾で 2 スパンに割れている前提を明示（束ねの意味がある入力か）
+        assert!(spans.iter().filter(|s| s.is_link()).count() >= 2);
+        let ranges = md_link_ranges(&spans);
+        assert_eq!(ranges.len(), 1, "同じ遷移先の隣接スパンは 1 本になる");
+        assert_eq!(&text[ranges[0].0.clone()], "太字と普通");
+    }
+
+    #[test]
+    fn 隣接する別リンクは別範囲になる() {
+        let spans = spans_of("[a](https://a.example)[b](https://b.example)\n");
+        let ranges = md_link_ranges(&spans);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].1, "https://a.example");
+        assert_eq!(ranges[1].1, "https://b.example");
+        assert_eq!(
+            ranges[0].0.end, ranges[1].0.start,
+            "範囲は隣接して重ならない"
+        );
+    }
+
+    #[test]
+    fn 相対パスやアンカーも遷移先として保持する() {
+        // 保持はする（一覧に出す）。開くかどうかは md_links::browser_url が決める
+        let spans = spans_of("[章へ](#section) [ファイル](./doc/readme.md)\n");
+        let urls: Vec<_> = spans.iter().filter_map(|s| s.link_url.as_deref()).collect();
+        assert_eq!(urls, vec!["#section", "./doc/readme.md"]);
+        assert!(urls
+            .iter()
+            .all(|u| tako_core::md_links::browser_url(u).is_none()));
+    }
+
+    #[test]
+    fn リンクの無い文書では範囲が空() {
+        let spans = spans_of("ただの段落 `code` **強調**\n");
+        assert!(md_link_ranges(&spans).is_empty());
+    }
+
+    #[test]
+    fn コードブロックのコピー本文は空行とインデントを保つ() {
+        let md = "```python\ndef f():\n    return 1\n\n\nprint(f())\n```\n";
+        let blocks = markdown_blocks(md);
+        let MdBlockKind::CodeBlock { lines, .. } = &blocks[0].kind else {
+            panic!("コードブロックがある: {blocks:?}");
+        };
+        assert_eq!(
+            md_code_block_text(lines),
+            "def f():\n    return 1\n\n\nprint(f())"
+        );
+    }
+
+    #[test]
+    fn 空のコードブロックのコピー本文は空文字列() {
+        let blocks = markdown_blocks("```\n```\n");
+        let MdBlockKind::CodeBlock { lines, .. } = &blocks[0].kind else {
+            panic!("コードブロックがある: {blocks:?}");
+        };
+        assert_eq!(md_code_block_text(lines), "");
+    }
+
+    #[test]
+    fn コードブロック内のリンク風文字列はリンクにならない() {
+        // ``` の中は素のテキスト = ⌘+クリックの対象にしない（コピー対象のみ）
+        let blocks = markdown_blocks("```\nsee [x](https://example.com)\n```\n");
+        let MdBlockKind::CodeBlock { lines, .. } = &blocks[0].kind else {
+            panic!("コードブロックがある");
+        };
+        assert_eq!(md_code_block_text(lines), "see [x](https://example.com)");
+    }
+
+    #[test]
+    fn 表セル内のリンクも範囲が取れる() {
+        let md = "| 名前 | 先 |\n| --- | --- |\n| tako | [repo](https://example.com/r) |\n";
+        let blocks = markdown_blocks(md);
+        let MdBlockKind::Table { rows, .. } = &blocks[0].kind else {
+            panic!("表がある: {blocks:?}");
+        };
+        let cell = &rows[0][1];
+        let ranges = md_link_ranges(cell);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].1, "https://example.com/r");
+        let text: String = cell.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(&text[ranges[0].0.clone()], "repo");
     }
 }
