@@ -231,7 +231,7 @@ mod tests {
     /// 応答が `"102  "`（履歴だけ + 空文字 2 つ）になる。ここで None を返すと
     /// 呼び出し側が `wants_mouse` を永久に解決できず**ホイールが全ペインで無反応**になる
     #[test]
-    fn history_stateはマウスフラグ未対応の器でもNoneにならない() {
+    fn history_stateはマウスフラグ未対応の器でも失敗しない() {
         let s = parse_history_state("102  ").expect("フラグが欠けても解けること");
         assert_eq!(s.history, 102);
         assert!(
@@ -247,7 +247,7 @@ mod tests {
 
     /// 履歴行数だけは必須。数値にならない応答（セッション消滅・器の異常）は None
     #[test]
-    fn history_stateは履歴が数値でなければNone() {
+    fn history_stateは履歴が数値でなければ失敗する() {
         assert!(parse_history_state("").is_none());
         assert!(parse_history_state("can't find session").is_none());
     }
