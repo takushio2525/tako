@@ -146,10 +146,7 @@ pub fn wait_for_worker(
     let deadline = opts.timeout.map(|t| start + t);
     std::thread::sleep(opts.initial_delay);
 
-    let mut idle_streak: u32 = 0;
-    let mut gone_streak: u32 = 0;
-    let mut stalled_streak: u32 = 0;
-    let mut agent_dead_streak: u32 = 0;
+    let mut streaks = WatchStreaks::default();
 
     loop {
         if let Some(dl) = deadline {
@@ -165,170 +162,199 @@ pub fn wait_for_worker(
             worker: None,
         });
 
-        match result {
-            Ok(val) => {
-                let status = val["status"].as_str().unwrap_or("unknown");
-                let recent = val["recent_output"].as_str().unwrap_or("");
-                let source = val["status_source"].as_str().unwrap_or("screen");
-                // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8
-                let need_streak: u32 = if source == "screen" { 8 } else { 3 };
-
-                // 非同期 run 用: 中間スナップショットを更新（#121）
-                if let Some(snap) = progress {
-                    if let Ok(mut s) = snap.lock() {
-                        s.worker_status = status.to_string();
-                        s.elapsed_secs = start.elapsed().as_secs();
-                    }
-                }
-
-                // #390: エージェント CLI プロセスの突然死（SIGSEGV 等）。
-                // dispatch がレジストリ + 子プロセス走査から events に agent_dead を
-                // 積む。ps のタイミング取りこぼしによる誤爆を防ぐため 2 回連続で確定
-                // （dead は安定状態なので連続観測できる）。idle streak を待たない:
-                // SIGSEGV 後の画面はシェルプロンプトで idle 判定できないことがあり、
-                // 従来はここで永遠に unknown のまま検出不能だった
-                let agent_dead_ev = val["events"].as_array().and_then(|evts| {
-                    evts.iter()
-                        .find(|e| e["kind"].as_str() == Some("agent_dead"))
-                        .cloned()
-                });
-                if let Some(ev) = agent_dead_ev {
-                    agent_dead_streak += 1;
-                    if agent_dead_streak >= 2 {
-                        return WatchOutcome::AgentDead {
-                            resume_command: ev["resume_command"].as_str().map(str::to_string),
-                        };
-                    }
-                } else {
-                    agent_dead_streak = 0;
-                }
-
-                match status {
-                    "gone" => {
-                        // tmux session が生きていれば pane 消滅は tako 再起動中とみなす
-                        if tmux_session_alive(opts.tmux_session.as_deref()) {
-                            gone_streak = 0;
-                            idle_streak = 0;
-                        } else {
-                            gone_streak += 1;
-                            if gone_streak >= 3 {
-                                return WatchOutcome::Gone;
-                            }
-                        }
-                        stalled_streak = 0;
-                    }
-                    // "error" は「idle + 画面にエラーパターン」の細分類（#157）。
-                    // 停止していることは同じなので idle と同じ streak で確定させ、
-                    // 確定時にどちらの outcome かを画面から再判定する
-                    "idle" | "error" => {
-                        gone_streak = 0;
-                        stalled_streak = 0;
-                        // 画面内容で busy パターンがあれば idle を取り消す
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else {
-                            idle_streak += 1;
-                        }
-                    }
-                    // #224: dispatch が stalled と判定した場合。3 回連続で確定
-                    "stalled" => {
-                        gone_streak = 0;
-                        idle_streak = 0;
-                        stalled_streak += 1;
-                        if stalled_streak >= 3 {
-                            let detail = val["stalled"]
-                                .as_object()
-                                .and_then(|s| s.get("detail"))
-                                .and_then(|d| d.as_str())
-                                .unwrap_or(
-                                    "busy だが実行中の子プロセスが無く、画面の busy パターンも無い",
-                                )
-                                .to_string();
-                            return WatchOutcome::Stalled { detail };
-                        }
-                    }
-                    // #267: "waiting" は permission ダイアログ等の待機状態。
-                    // idle_streak を加算しない（IDLE として発火させない）。
-                    // #319: permission_dialog が応答に含まれていれば即発火する
-                    // （ダイアログは安定状態で一時的に現れて消えることはない）
-                    "waiting" => {
-                        gone_streak = 0;
-                        idle_streak = 0;
-                        stalled_streak = 0;
-                        if val.get("permission_dialog").is_some_and(|v| !v.is_null()) {
-                            return WatchOutcome::PermissionWaiting {
-                                permission_dialog: val["permission_dialog"].clone(),
-                            };
-                        }
-                    }
-                    "busy" => {
-                        gone_streak = 0;
-                        idle_streak = 0;
-                        stalled_streak = 0;
-                    }
-                    _ => {
-                        // unknown: 画面内容から推定（判定不能は busy 扱い = 誤 idle 防止）
-                        gone_streak = 0;
-                        stalled_streak = 0;
-                        if screen_looks_busy(recent) {
-                            idle_streak = 0;
-                        } else if screen_looks_idle(recent) {
-                            idle_streak += 1;
-                        } else {
-                            idle_streak = 0;
-                        }
-                    }
-                }
-
-                if idle_streak >= need_streak {
-                    // 停止確定。dispatch が判定済みの error（新 tako-app）を優先し、
-                    // 無ければ画面から自力検知する（tako-app 更新前でも watch 単体で
-                    // WORKER_ERROR を出せるようにするフォールバック。判定関数は同一）
-                    let error = val["error"]
-                        .as_object()
-                        .and_then(|e| {
-                            let kind = WorkerErrorKind::from_slug(e.get("kind")?.as_str()?)?;
-                            let detail = e
-                                .get("detail")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            Some((kind, detail))
-                        })
-                        .or_else(|| detect_worker_error(recent));
-                    if let Some((kind, detail)) = error {
-                        return WatchOutcome::Error { kind, detail };
-                    }
-                    // #267: idle 確定後に events から question を判定。
-                    // question がある場合は Question で通知（master の対応が異なるため）
-                    let has_question = val["events"].as_array().is_some_and(|evts| {
-                        evts.iter().any(|e| e["kind"].as_str() == Some("question"))
-                    });
-                    if has_question {
-                        return WatchOutcome::Question {
-                            ctx_percent: val["ctx_percent"].as_u64(),
-                        };
-                    }
-                    return WatchOutcome::Idle {
-                        ctx_percent: val["ctx_percent"].as_u64(),
-                    };
-                }
+        // 非同期 run 用: 中間スナップショットを更新（#121）
+        if let (Some(snap), Ok(val)) = (progress, &result) {
+            if let Ok(mut s) = snap.lock() {
+                s.worker_status = val["status"].as_str().unwrap_or("unknown").to_string();
+                s.elapsed_secs = start.elapsed().as_secs();
             }
+        }
+
+        if let Some(outcome) = streaks.evaluate(&result, opts.tmux_session.as_deref()) {
+            return outcome;
+        }
+
+        std::thread::sleep(opts.interval);
+    }
+}
+
+/// 完了待ちの判定ストリーク（1 worker 分）。
+///
+/// `wait_for_worker` のポーリングループと supervisor の周期監視（#665）が
+/// **同じ判定ロジック**を通るための切り出し。判定を二重に書くと必ず食い違う
+/// （#273 / #289 の教訓）ので、状態の見立てはここ 1 箇所だけに置く。
+/// ポーリング間隔の管理（sleep / タイムアウト）は呼び出し側の責務
+#[derive(Debug, Default, Clone)]
+pub struct WatchStreaks {
+    idle: u32,
+    gone: u32,
+    stalled: u32,
+    agent_dead: u32,
+}
+
+impl WatchStreaks {
+    /// 1 回ぶんのポーリング結果（`OrchestratorWorkerStatus` の応答）を食わせる。
+    /// 停止が確定したら `Some(outcome)`、まだ続行中なら `None` を返す
+    pub fn evaluate(
+        &mut self,
+        result: &Result<Value, String>,
+        tmux_session: Option<&str>,
+    ) -> Option<WatchOutcome> {
+        let val = match result {
+            Ok(val) => val,
             Err(_) => {
                 // 実行エラー = tako が再起動中の可能性。tmux で実在確認
-                if tmux_session_alive(opts.tmux_session.as_deref()) {
-                    gone_streak = 0;
+                if tmux_session_alive(tmux_session) {
+                    self.gone = 0;
                 } else {
-                    gone_streak += 1;
+                    self.gone += 1;
                     // #267: 閾値を 2→3 に引き上げ（一時的な IPC 断での偽 GONE 防止）
-                    if gone_streak >= 3 {
-                        return WatchOutcome::Gone;
+                    if self.gone >= 3 {
+                        return Some(WatchOutcome::Gone);
                     }
+                }
+                return None;
+            }
+        };
+
+        let status = val["status"].as_str().unwrap_or("unknown");
+        let recent = val["recent_output"].as_str().unwrap_or("");
+        let source = val["status_source"].as_str().unwrap_or("screen");
+        // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8
+        let need_streak: u32 = if source == "screen" { 8 } else { 3 };
+
+        // #390: エージェント CLI プロセスの突然死（SIGSEGV 等）。
+        // dispatch がレジストリ + 子プロセス走査から events に agent_dead を
+        // 積む。ps のタイミング取りこぼしによる誤爆を防ぐため 2 回連続で確定
+        // （dead は安定状態なので連続観測できる）。idle streak を待たない:
+        // SIGSEGV 後の画面はシェルプロンプトで idle 判定できないことがあり、
+        // 従来はここで永遠に unknown のまま検出不能だった
+        let agent_dead_ev = val["events"].as_array().and_then(|evts| {
+            evts.iter()
+                .find(|e| e["kind"].as_str() == Some("agent_dead"))
+                .cloned()
+        });
+        if let Some(ev) = agent_dead_ev {
+            self.agent_dead += 1;
+            if self.agent_dead >= 2 {
+                return Some(WatchOutcome::AgentDead {
+                    resume_command: ev["resume_command"].as_str().map(str::to_string),
+                });
+            }
+        } else {
+            self.agent_dead = 0;
+        }
+
+        match status {
+            "gone" => {
+                // tmux session が生きていれば pane 消滅は tako 再起動中とみなす
+                if tmux_session_alive(tmux_session) {
+                    self.gone = 0;
+                    self.idle = 0;
+                } else {
+                    self.gone += 1;
+                    if self.gone >= 3 {
+                        return Some(WatchOutcome::Gone);
+                    }
+                }
+                self.stalled = 0;
+            }
+            // "error" は「idle + 画面にエラーパターン」の細分類（#157）。
+            // 停止していることは同じなので idle と同じ streak で確定させ、
+            // 確定時にどちらの outcome かを画面から再判定する
+            "idle" | "error" => {
+                self.gone = 0;
+                self.stalled = 0;
+                // 画面内容で busy パターンがあれば idle を取り消す
+                if screen_looks_busy(recent) {
+                    self.idle = 0;
+                } else {
+                    self.idle += 1;
+                }
+            }
+            // #224: dispatch が stalled と判定した場合。3 回連続で確定
+            "stalled" => {
+                self.gone = 0;
+                self.idle = 0;
+                self.stalled += 1;
+                if self.stalled >= 3 {
+                    let detail = val["stalled"]
+                        .as_object()
+                        .and_then(|s| s.get("detail"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("busy だが実行中の子プロセスが無く、画面の busy パターンも無い")
+                        .to_string();
+                    return Some(WatchOutcome::Stalled { detail });
+                }
+            }
+            // #267: "waiting" は permission ダイアログ等の待機状態。
+            // idle_streak を加算しない（IDLE として発火させない）。
+            // #319: permission_dialog が応答に含まれていれば即発火する
+            // （ダイアログは安定状態で一時的に現れて消えることはない）
+            "waiting" => {
+                self.gone = 0;
+                self.idle = 0;
+                self.stalled = 0;
+                if val.get("permission_dialog").is_some_and(|v| !v.is_null()) {
+                    return Some(WatchOutcome::PermissionWaiting {
+                        permission_dialog: val["permission_dialog"].clone(),
+                    });
+                }
+            }
+            "busy" => {
+                self.gone = 0;
+                self.idle = 0;
+                self.stalled = 0;
+            }
+            _ => {
+                // unknown: 画面内容から推定（判定不能は busy 扱い = 誤 idle 防止）
+                self.gone = 0;
+                self.stalled = 0;
+                if screen_looks_busy(recent) {
+                    self.idle = 0;
+                } else if screen_looks_idle(recent) {
+                    self.idle += 1;
+                } else {
+                    self.idle = 0;
                 }
             }
         }
 
-        std::thread::sleep(opts.interval);
+        if self.idle >= need_streak {
+            // 停止確定。dispatch が判定済みの error（新 tako-app）を優先し、
+            // 無ければ画面から自力検知する（tako-app 更新前でも watch 単体で
+            // WORKER_ERROR を出せるようにするフォールバック。判定関数は同一）
+            let error = val["error"]
+                .as_object()
+                .and_then(|e| {
+                    let kind = WorkerErrorKind::from_slug(e.get("kind")?.as_str()?)?;
+                    let detail = e
+                        .get("detail")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some((kind, detail))
+                })
+                .or_else(|| detect_worker_error(recent));
+            if let Some((kind, detail)) = error {
+                return Some(WatchOutcome::Error { kind, detail });
+            }
+            // #267: idle 確定後に events から question を判定。
+            // question がある場合は Question で通知（master の対応が異なるため）
+            let has_question = val["events"]
+                .as_array()
+                .is_some_and(|evts| evts.iter().any(|e| e["kind"].as_str() == Some("question")));
+            if has_question {
+                return Some(WatchOutcome::Question {
+                    ctx_percent: val["ctx_percent"].as_u64(),
+                });
+            }
+            return Some(WatchOutcome::Idle {
+                ctx_percent: val["ctx_percent"].as_u64(),
+            });
+        }
+
+        None
     }
 }
 
@@ -367,6 +393,35 @@ pub struct RunOptions {
 /// `on_spawned(pane_id, tmux_session)` は spawn 直後に呼ばれる進捗フック
 /// （CLI の経過表示用。不要なら no-op を渡す）。
 /// 返り値は `{pane_id, spawned_by, status, output, duration_seconds, closed}`
+/// 起動保証（#665）が失敗で確定していれば理由を返す。
+///
+/// `budget` の上限まで段階を見る（既定は run の initial_delay = claude 起動 +
+/// プロンプト送達の見込み時間と同じ）。確定しないまま budget を使い切った場合は
+/// 「失敗ではない」として通常の完了待ちへ進む（保証が付かない古い経路との互換）
+fn launch_failure(exec: Exec, pane_id: u64, budget: Duration) -> Option<String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match exec(Request::OrchestratorLaunchStatus {
+            pane: Some(pane_id),
+            worker: None,
+        }) {
+            Ok(v) if v["settled"].as_bool() == Some(true) => {
+                if v["level"].as_str() == Some("failed") {
+                    return Some(v["detail"].as_str().unwrap_or("詳細不明").to_string());
+                }
+                return None;
+            }
+            // 記録が無い（保証の対象外）/ IPC 断は通常経路へ倒す
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 pub fn run_worker(
     exec: Exec,
     opts: &RunOptions,
@@ -391,6 +446,15 @@ pub fn run_worker(
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
     let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
     on_spawned(pane_id, tmux_session.as_deref());
+
+    // --- 1.5. 起動保証（Issue #665）---
+    // 起動できなかった worker を timeout（既定 30 分）まで待つのは無駄。
+    // 段階が failed で確定した時点で切り上げ、理由を返す
+    if let Some(detail) = launch_failure(exec, pane_id, opts.initial_delay) {
+        return Err(format!(
+            "worker の起動を保証できなかった（pane {pane_id}）: {detail}"
+        ));
+    }
 
     // --- 2. 完了待ち ---
     let start = Instant::now();
@@ -659,18 +723,26 @@ pub fn run_start(
         .spawn(move || {
             let mut exec_fn = exec_factory();
             let start = Instant::now();
-            let outcome = wait_for_worker(
-                &mut *exec_fn,
-                &WatchOptions {
-                    pane_id,
-                    session_id,
-                    tmux_session: tmux_for_thread,
-                    timeout: Some(timeout),
-                    initial_delay,
-                    interval,
+            // 起動保証（#665）: 起動できなかった worker を timeout まで待たない。
+            // 素のシェルは idle 判定に乗らないため、従来はここで 30 分待っていた
+            let outcome = match launch_failure(&mut *exec_fn, pane_id, initial_delay) {
+                Some(detail) => WatchOutcome::Error {
+                    kind: WorkerErrorKind::ApiError,
+                    detail: format!("worker の起動を保証できなかった: {detail}"),
                 },
-                Some(&snapshot),
-            );
+                None => wait_for_worker(
+                    &mut *exec_fn,
+                    &WatchOptions {
+                        pane_id,
+                        session_id,
+                        tmux_session: tmux_for_thread,
+                        timeout: Some(timeout),
+                        initial_delay,
+                        interval,
+                    },
+                    Some(&snapshot),
+                ),
+            };
             let elapsed_secs = start.elapsed().as_secs();
             {
                 *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(RunCompleted {
@@ -1362,6 +1434,23 @@ mod tests {
                 seen: Vec::new(),
             }
         }
+
+        /// 1 リクエストぶん応答する。
+        ///
+        /// 起動保証の照会（#665）はスクリプトを消費せず「保証の記録が無い」を返す。
+        /// この照会は run のたびに 1 回入るので、キューを消費させると
+        /// 既存テストのシナリオが全部 1 つずつずれる。起動保証そのものは
+        /// `orchestrator::launch` と launch_assurance 側で検証している
+        fn respond(&mut self, req: Request) -> Result<Value, String> {
+            let is_launch_probe = matches!(req, Request::OrchestratorLaunchStatus { .. });
+            self.seen.push(req);
+            if is_launch_probe {
+                return Ok(json!({ "level": Value::Null, "settled": true }));
+            }
+            self.responses
+                .pop_front()
+                .expect("スクリプトの応答が尽きた")
+        }
     }
 
     fn status(status: &str, recent: &str, source: &str) -> Result<Value, String> {
@@ -1386,13 +1475,7 @@ mod tests {
     }
 
     fn run_wait(script: &mut ExecScript, opts: &WatchOptions) -> WatchOutcome {
-        let mut exec = |req: Request| {
-            script.seen.push(req);
-            script
-                .responses
-                .pop_front()
-                .expect("スクリプトの応答が尽きた")
-        };
+        let mut exec = |req: Request| script.respond(req);
         wait_for_worker(&mut exec, opts, None)
     }
 
@@ -1504,13 +1587,7 @@ mod tests {
         };
         let mut spawned = None;
         let result = {
-            let mut exec = |req: Request| {
-                script.seen.push(req);
-                script
-                    .responses
-                    .pop_front()
-                    .expect("スクリプトの応答が尽きた")
-            };
+            let mut exec = |req: Request| script.respond(req);
             run_worker(&mut exec, &opts, &mut |pane, tmux| {
                 spawned = Some((pane, tmux.map(String::from)));
             })
@@ -1562,13 +1639,7 @@ mod tests {
             account: None,
         };
         let result = {
-            let mut exec = |req: Request| {
-                script.seen.push(req);
-                script
-                    .responses
-                    .pop_front()
-                    .expect("スクリプトの応答が尽きた")
-            };
+            let mut exec = |req: Request| script.respond(req);
             run_worker(&mut exec, &opts, &mut |_, _| {}).expect("成功する")
         };
         assert_eq!(result["status"], "timeout");
@@ -2093,13 +2164,7 @@ mod tests {
             account: None,
         };
         let result = {
-            let mut exec = |req: Request| {
-                script.seen.push(req);
-                script
-                    .responses
-                    .pop_front()
-                    .expect("スクリプトの応答が尽きた")
-            };
+            let mut exec = |req: Request| script.respond(req);
             run_worker(&mut exec, &opts, &mut |_, _| {}).expect("成功する")
         };
         assert_eq!(result["status"], "worker_error");
@@ -2338,13 +2403,7 @@ mod tests {
             account: None,
         };
         let result = {
-            let mut exec = |req: Request| {
-                script.seen.push(req);
-                script
-                    .responses
-                    .pop_front()
-                    .expect("スクリプトの応答が尽きた")
-            };
+            let mut exec = |req: Request| script.respond(req);
             run_worker(&mut exec, &opts, &mut |_, _| {}).expect("成功する")
         };
         assert_eq!(result["status"], "worker_stalled");

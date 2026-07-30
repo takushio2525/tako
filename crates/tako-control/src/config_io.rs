@@ -56,6 +56,28 @@ pub fn lock_exclusive(target: &Path) -> Result<ConfigLock, String> {
     Ok(ConfigLock { _file: file })
 }
 
+/// `lock_exclusive` の非ブロッキング版。既に他プロセスが保持していれば `Ok(None)`。
+/// 「常駐プロセスが動いているか」を待たずに判定する用途（supervisor のシングルトン。#665）
+pub fn try_lock_exclusive(target: &Path) -> Result<Option<ConfigLock>, String> {
+    let lock_path = sibling_with_suffix(target, ".lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("ロックファイルを開けない ({}): {e}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(ConfigLock { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(format!("ロックの取得に失敗 ({}): {e}", lock_path.display()))
+        }
+    }
+}
+
 /// tmp ファイル + rename によるアトミック書き込み。
 /// rename は同一ファイルシステム内で原子的なので、並行プロセスの読み取りには
 /// 「旧内容」か「新内容」しか見えない（空・書きかけが見える瞬間がない）

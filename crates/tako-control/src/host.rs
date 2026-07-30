@@ -63,6 +63,7 @@ pub trait SessionHost {
     /// テキストの送信代行: 貼り付けせず Enter を送り、入力欄が空へ戻るまで
     /// 単独再送する。既定実装は何もしない（テスト用モック等）
     fn queue_enter_flow(&mut self, _pane: PaneId) {}
+
     /// **新規に作ったペイン**の素のシェルへ起動コマンドを送達確認つきで送る（Issue #640）。
     ///
     /// `queue_write` で本文 + Enter を書きっぱなしにすると、器（psmux）が入力を
@@ -72,6 +73,56 @@ pub trait SessionHost {
     /// 届かなければ書き直す（状態遷移は `tako_core::shell_send`）。
     /// 既定実装は何もしない（テスト用モック等）
     fn queue_command_flow(&mut self, _pane: PaneId, _command: String) {}
+
+    /// spawn の起動保証を登録する（Issue #665）。
+    ///
+    /// 「起動コマンドを流してプロンプトを積む」だけだった経路を、
+    /// **シェル起動 → 起動コマンド送出 → エージェント CLI 起動の確認 → プロンプト送達**
+    /// を段階的に検証し、届いていなければ再送する状態機械へ置き換える。
+    ///
+    /// 役割分担: 起動コマンドが**シェルに届いたか**（バイトの送達・エコー確認）は
+    /// #640 の `queue_command_flow` が見る。こちらはその上に
+    /// 「**エージェントが本当に起動したか**」「プロンプトが入力欄から消えたか」の
+    /// 層を足す。届いたのに起動していない（コマンドが無い・即終了した）は
+    /// 送達確認だけでは分からないため、両方が要る。
+    ///
+    /// 既定実装は素の投げっぱなしへフォールバックする。GUI を持たないホスト
+    /// （テスト用モック）でも spawn の挙動が変わらないようにするため
+    fn queue_launch_assurance(&mut self, pane: PaneId, spec: LaunchAssuranceSpec) {
+        self.queue_command_flow(pane, spec.command);
+        self.queue_prompt_flow(pane, spec.prompt);
+    }
+
+    /// 起動保証の現在の到達段階を返す（Issue #665）。
+    /// dispatch の `OrchestratorLaunchStatus` が UI スレッドで即座に読む。
+    /// 状態機械が完了・破棄済みなら None（呼び出し側はレジストリへフォールバックする）
+    fn launch_assurance_status(&self, _pane: PaneId) -> Option<LaunchAssuranceStatus> {
+        None
+    }
+}
+
+/// 起動保証の発射指示（`queue_launch_assurance` の入力。Issue #665）
+#[derive(Debug, Clone)]
+pub struct LaunchAssuranceSpec {
+    /// レジストリの worker ID（段階の永続記録先。空なら記録しない）
+    pub worker_id: String,
+    /// エージェント CLI の起動コマンド（末尾 CR は状態機械が付ける）
+    pub command: String,
+    /// 起動確認後に送るプロンプト
+    pub prompt: String,
+    /// エージェント種別（診断メッセージ用）
+    pub agent: String,
+    /// 起動コマンドの最大送信回数（初回 + 再送）
+    pub max_attempts: u32,
+}
+
+/// 起動保証の現在状態（`launch_assurance_status` の返り値。Issue #665）
+#[derive(Debug, Clone)]
+pub struct LaunchAssuranceStatus {
+    pub phase: crate::orchestrator::launch::LaunchPhase,
+    pub attempts: u32,
+    pub elapsed_ms: u64,
+    pub detail: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

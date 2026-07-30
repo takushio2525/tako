@@ -119,6 +119,10 @@ pub struct WorkerEntry {
     /// claude transcript（session_id）を最初に観測した時刻 = プロンプト到達の証跡
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_delivered_at: Option<String>,
+    /// 起動保証の到達段階（Issue #665）。tako-app の状態機械が遷移のたびに書く。
+    /// プロセス外（CLI / MCP）から「どこまで確認できたか」を読むための永続記録
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<super::launch::LaunchRecord>,
 }
 
 impl WorkerEntry {
@@ -291,10 +295,73 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 closed_at: None,
                 close_reason: None,
                 prompt_delivered_at: None,
+                launch: None,
             },
         );
         reg.gc();
         id
+    })
+}
+
+/// 起動保証の段階（Issue #665）をレジストリへ記録する。
+///
+/// tako-app の状態機械が遷移のたびに呼ぶ。**後退は書かない**（一度 AgentStarted まで
+/// 行った worker が、後続の観測ゆらぎで LaunchSent へ巻き戻るのを防ぐ）。
+/// `Failed` だけは例外で、どの段階からでも上書きできる（明示的な打ち切り）。
+/// 書き込み失敗は呼び出し側で無視してよい（レジストリの都合で spawn を止めない。#390 の方針）
+pub fn record_launch_phase(
+    worker_id: &str,
+    phase: super::launch::LaunchPhase,
+    attempts: u32,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    let path = registry_path().ok_or("ホームディレクトリが取得できない")?;
+    record_launch_phase_at(&path, worker_id, phase, attempts, detail)
+}
+
+/// `record_launch_phase` のパス指定版（テスト用。実体はこちら）
+pub fn record_launch_phase_at(
+    path: &Path,
+    worker_id: &str,
+    phase: super::launch::LaunchPhase,
+    attempts: u32,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    use super::launch::{LaunchPhase, LaunchRecord};
+    if worker_id.is_empty() {
+        return Ok(());
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(path, |reg| {
+        let Some(entry) = reg.workers.get_mut(worker_id) else {
+            return;
+        };
+        let prev = entry.launch.as_ref().and_then(LaunchRecord::phase);
+        if let Some(prev) = prev {
+            // 後退禁止。ただし Failed への遷移と、完了済みからの再宣言でない限り
+            if phase != LaunchPhase::Failed && phase.rank() <= prev.rank() {
+                // 進捗は変わらないが attempts / detail の更新は許す
+                if let Some(rec) = entry.launch.as_mut() {
+                    rec.attempts = rec.attempts.max(attempts);
+                    if detail.is_some() {
+                        rec.detail = detail.map(str::to_string);
+                    }
+                    rec.updated_at = now.clone();
+                }
+                return;
+            }
+        }
+        entry.launch = Some(LaunchRecord {
+            phase: phase.as_str().to_string(),
+            attempts,
+            updated_at: now.clone(),
+            detail: detail.map(str::to_string),
+        });
+        // 送達を確認できた時点で prompt_delivered_at も埋める（既存の #390 判定と整合させる。
+        // claude 以外の agent は transcript を持たないため、ここが唯一の到達証跡になる）
+        if phase == LaunchPhase::PromptDelivered && entry.prompt_delivered_at.is_none() {
+            entry.prompt_delivered_at = Some(now.clone());
+        }
     })
 }
 
@@ -572,6 +639,7 @@ mod tests {
                     closed_at: None,
                     close_reason: None,
                     prompt_delivered_at: None,
+                    launch: None,
                 },
             );
             reg.gc();
@@ -898,6 +966,87 @@ mod tests {
             false,
         );
         assert_eq!(payload["workers"][0]["pane_alive"], true);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 起動保証の段階を記録し後退を拒む() {
+        use super::super::launch::LaunchPhase;
+        let path = temp_registry_file("launch-phase");
+        let id = register_at(&path, sample_record(7));
+
+        record_launch_phase_at(&path, &id, LaunchPhase::LaunchSent, 1, None).unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let rec = reg.workers[&id].launch.clone().unwrap();
+        assert_eq!(rec.phase(), Some(LaunchPhase::LaunchSent));
+        assert_eq!(rec.attempts, 1);
+
+        // 前進は反映される
+        record_launch_phase_at(
+            &path,
+            &id,
+            LaunchPhase::AgentStarted,
+            2,
+            Some("入力欄を検出"),
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let rec = reg.workers[&id].launch.clone().unwrap();
+        assert_eq!(rec.phase(), Some(LaunchPhase::AgentStarted));
+        assert_eq!(rec.detail.as_deref(), Some("入力欄を検出"));
+
+        // 後退（観測ゆらぎ）は無視され、attempts だけ更新される
+        record_launch_phase_at(&path, &id, LaunchPhase::LaunchSent, 3, None).unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let rec = reg.workers[&id].launch.clone().unwrap();
+        assert_eq!(
+            rec.phase(),
+            Some(LaunchPhase::AgentStarted),
+            "後退は書かれないはず"
+        );
+        assert_eq!(rec.attempts, 3, "attempts は更新される");
+
+        // Failed はどの段階からでも上書きできる
+        record_launch_phase_at(&path, &id, LaunchPhase::Failed, 3, Some("再送を使い切った"))
+            .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(
+            reg.workers[&id].launch.as_ref().unwrap().phase(),
+            Some(LaunchPhase::Failed)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 送達確認はprompt_delivered_atも埋める() {
+        use super::super::launch::LaunchPhase;
+        let path = temp_registry_file("launch-delivered");
+        let id = register_at(&path, sample_record(8));
+        assert!(WorkerRegistry::load_from(&path).unwrap().workers[&id]
+            .prompt_delivered_at
+            .is_none());
+
+        record_launch_phase_at(&path, &id, LaunchPhase::PromptDelivered, 1, None).unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert!(
+            reg.workers[&id].prompt_delivered_at.is_some(),
+            "送達確認は #390 の到達証跡も埋めるべき（claude 以外は transcript を持たない）"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 起動保証フィールドが無い既存yamlをそのまま読める() {
+        // 後方互換: #665 以前に書かれた workers.yaml
+        let path = temp_registry_file("launch-compat");
+        std::fs::write(
+            &path,
+            "next_id: 1\nworkers:\n  '1':\n    pane: 3\n    status: active\n    agent: claude\n",
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(reg.workers["1"].pane, 3);
+        assert!(reg.workers["1"].launch.is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

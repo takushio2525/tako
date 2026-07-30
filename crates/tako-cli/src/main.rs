@@ -1335,6 +1335,30 @@ enum OrchestratorCommand {
         /// 委任台帳の task_type（省略時は investigation）
         #[arg(long)]
         task_type: Option<String>,
+        /// 起動保証（#665）を待たずに即座に返す。既定は
+        /// 「エージェント CLI が起動しプロンプトが届いた」ことを確認してから返す
+        #[arg(long)]
+        no_await_launch: bool,
+        /// 起動保証を待つ上限秒数（既定 90）
+        #[arg(long)]
+        launch_timeout: Option<u64>,
+    },
+    /// spawn の起動保証の到達段階を照会する（#665）。
+    /// シェル起動 → 起動コマンド → エージェント CLI 起動 → プロンプト送達 の
+    /// どこまで確認できたかを返す
+    LaunchStatus {
+        /// ペイン ID（--worker と排他。どちらか必須）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// worker レジストリの ID（ペインが消えても照会できる）
+        #[arg(long)]
+        worker: Option<String>,
+        /// 段階が確定（prompt_delivered / failed）するまで待つ
+        #[arg(long)]
+        wait: bool,
+        /// --wait の上限秒数（既定 90）
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
@@ -1419,10 +1443,23 @@ enum OrchestratorCommand {
         #[arg(long)]
         all: bool,
     },
-    /// worker 自動復旧 supervisor の操作（#401）
+    /// worker の常時監視 supervisor の操作（#401 / #665）。
+    /// serve = 常駐して全 worker を監視する（シングルトン）/
+    /// watch = イベントを流し続ける（再アーム不要。Monitor から張る）/
+    /// events = カーソル以降のイベントを 1 回読む /
+    /// status・set_mode・history = 設定と監査ログ / stop = 常駐を止める
     Supervisor {
-        /// status / set_mode / history
+        /// serve / watch / events / status / set_mode / history / stop
         action: String,
+        /// events / watch: このカーソルより後のイベントを返す（既定 0 = 最初から）
+        #[arg(long)]
+        cursor: Option<u64>,
+        /// events: 返す最大件数（既定 50）
+        #[arg(long)]
+        limit: Option<usize>,
+        /// watch: JSON 行で出す（既定は WORKER_* の人間可読行）
+        #[arg(long)]
+        json: bool,
         /// set_mode 時のモード（auto / notify_only / off）
         #[arg(long)]
         mode: Option<String>,
@@ -2378,18 +2415,59 @@ fn cli_main() -> ExitCode {
         }
         Command::Orchestrator(OrchestratorCommand::Supervisor {
             ref action,
+            cursor,
+            limit,
+            json,
             ref mode,
             auto_resume_dead,
             max_retries,
             lines,
-        }) => send_request(Request::OrchestratorSupervisor {
-            action: action.clone(),
-            mode: mode.clone(),
-            auto_resume_dead,
-            max_retries,
-            lines,
-        })
-        .map(|result| println!("{}", pretty_json(&result))),
+        }) => match action.as_str() {
+            // 常駐・ストリームはこのプロセスで回す（IPC 越しに長時間ブロックさせない）
+            "serve" => supervisor_serve(),
+            "watch" => supervisor_watch(cursor, json),
+            "events" => supervisor_events(cursor.unwrap_or(0), limit.unwrap_or(50)),
+            "stop" => supervisor_stop(),
+            _ => send_request(Request::OrchestratorSupervisor {
+                action: action.clone(),
+                mode: mode.clone(),
+                auto_resume_dead,
+                max_retries,
+                lines,
+            })
+            .map(|result| println!("{}", pretty_json(&result))),
+        },
+        Command::Orchestrator(OrchestratorCommand::LaunchStatus {
+            pane,
+            ref worker,
+            wait,
+            timeout,
+        }) => orchestrator_launch_status(pane, worker.as_deref(), wait, timeout),
+        Command::Orchestrator(OrchestratorCommand::Spawn {
+            ref project,
+            ref prompt,
+            ref label,
+            ref agent,
+            ref model,
+            ref effort,
+            pane,
+            tab,
+            ref task_type,
+            no_await_launch,
+            launch_timeout,
+        }) => orchestrator_spawn(SpawnCliArgs {
+            project,
+            prompt,
+            label: label.as_deref(),
+            agent: agent.as_deref(),
+            model: model.as_deref(),
+            effort: effort.as_deref(),
+            pane,
+            tab,
+            task_type: task_type.as_deref(),
+            await_launch: !no_await_launch,
+            launch_timeout: launch_timeout.unwrap_or(DEFAULT_LAUNCH_TIMEOUT_SECS),
+        }),
         Command::Orchestrator(OrchestratorCommand::Run {
             ref project,
             ref prompt,
@@ -2953,6 +3031,242 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         }
     }
     eprintln!("system prompt: {}", prompt_path.display());
+    Ok(())
+}
+
+/// 起動保証（#665）を待つ既定の上限秒数。エージェント CLI の起動（数秒）+
+/// 信頼ダイアログ + プロンプトの貼り付け・送達検証に十分な余裕を取る
+const DEFAULT_LAUNCH_TIMEOUT_SECS: u64 = 90;
+
+/// `tako orchestrator spawn` の引数（Request と 1:1 + CLI 固有の待ち設定）
+struct SpawnCliArgs<'a> {
+    project: &'a str,
+    prompt: &'a str,
+    label: Option<&'a str>,
+    agent: Option<&'a str>,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    pane: Option<u64>,
+    tab: Option<u64>,
+    task_type: Option<&'a str>,
+    await_launch: bool,
+    launch_timeout: u64,
+}
+
+/// `tako orchestrator spawn` — worker を起こし、既定では**起動とプロンプト送達を
+/// 確認してから**返す（Issue #665）。
+///
+/// dispatch（UI スレッド）は待てないので、待つのはこの CLI プロセスの仕事。
+/// `tako_orchestrator_run` が完了待ちをハンドラ側で回すのと同じ構図
+fn orchestrator_spawn(args: SpawnCliArgs) -> Result<(), String> {
+    let pane_resolved = if args.pane.is_some() {
+        args.pane
+    } else if args.tab.is_some() {
+        None
+    } else {
+        caller_pane()
+    };
+    let tab_resolved = if args.pane.is_some() { None } else { args.tab };
+    if pane_resolved.is_none() && tab_resolved.is_none() {
+        return Err("--pane または --tab を指定してください".into());
+    }
+    let mut result = send_request(Request::OrchestratorSpawn {
+        project: args.project.to_string(),
+        prompt: args.prompt.to_string(),
+        label: args.label.map(str::to_string),
+        model: args.model.map(str::to_string),
+        effort: args.effort.map(str::to_string),
+        pane: pane_resolved,
+        tab: tab_resolved,
+        caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
+        agent: args.agent.map(str::to_string),
+        caller_pid: Some(std::process::id()),
+        task_type: args.task_type.map(str::to_string),
+        account: None,
+    })?;
+
+    if args.await_launch {
+        let pane = result["pane_id"].as_u64();
+        let worker = result["worker_id"].as_str().map(str::to_string);
+        let assurance = await_launch(pane, worker.as_deref(), args.launch_timeout)?;
+        let failed = assurance["level"].as_str() == Some("failed");
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("assurance".to_string(), assurance.clone());
+        }
+        println!("{}", pretty_json(&result));
+        if failed {
+            return Err(format!(
+                "worker の起動を保証できなかった: {}",
+                assurance["detail"].as_str().unwrap_or("(詳細なし)")
+            ));
+        }
+        return Ok(());
+    }
+    println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// 起動保証の段階が確定するまでポーリングする
+fn await_launch(
+    pane: Option<u64>,
+    worker: Option<&str>,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last = serde_json::json!({ "level": null });
+    loop {
+        match send_request(Request::OrchestratorLaunchStatus {
+            pane,
+            worker: worker.map(str::to_string),
+        }) {
+            Ok(v) => {
+                if v["settled"].as_bool() == Some(true) {
+                    return Ok(v);
+                }
+                last = v;
+            }
+            // IPC の一時断（tako 再起動中等）は待って再試行する
+            Err(e) => last = serde_json::json!({ "level": null, "detail": e }),
+        }
+        if std::time::Instant::now() >= deadline {
+            let mut timed_out = last;
+            if let Some(obj) = timed_out.as_object_mut() {
+                obj.insert("timed_out".to_string(), serde_json::json!(true));
+            }
+            return Ok(timed_out);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// `tako orchestrator launch-status` — 起動保証の到達段階を照会する（#665）
+fn orchestrator_launch_status(
+    pane: Option<u64>,
+    worker: Option<&str>,
+    wait: bool,
+    timeout: Option<u64>,
+) -> Result<(), String> {
+    let pane = pane.or_else(|| {
+        if worker.is_none() {
+            caller_pane()
+        } else {
+            None
+        }
+    });
+    let result = if wait {
+        await_launch(pane, worker, timeout.unwrap_or(DEFAULT_LAUNCH_TIMEOUT_SECS))?
+    } else {
+        send_request(Request::OrchestratorLaunchStatus {
+            pane,
+            worker: worker.map(str::to_string),
+        })?
+    };
+    println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// `tako orchestrator supervisor serve` — 常駐して全 worker を監視する（#665）。
+/// シングルトン: 既に別プロセスが常駐していれば何もせず終わる
+fn supervisor_serve() -> Result<(), String> {
+    use tako_control::orchestrator::supervisor;
+    let Some(_guard) = supervisor::acquire_singleton() else {
+        println!("supervisor は既に常駐している");
+        return Ok(());
+    };
+    let profile = tako_control::orchestrator::Profile::load("default").unwrap_or_default();
+    let opts = supervisor::SupervisorOptions {
+        mode: profile.supervisor_mode.unwrap_or_default(),
+        auto_resume_dead: profile.auto_resume_dead.unwrap_or(false),
+        max_retries: profile.supervisor_max_retries.unwrap_or(3),
+        ..supervisor::SupervisorOptions::default()
+    };
+    if opts.mode == supervisor::SupervisorMode::Off {
+        println!("supervisor は off に設定されている（tako orchestrator supervisor set_mode --mode auto で有効化）");
+        return Ok(());
+    }
+    let mut exec = |req: Request| send_request(req);
+    let mut workers = supervisor::registry_workers;
+    supervisor::supervisor_run(&mut exec, &mut workers, &opts, &mut |ev| {
+        for line in ev.to_lines() {
+            println!("{line}");
+        }
+        flush_stdout();
+    });
+    Ok(())
+}
+
+/// ストリーム出力を即座に届ける。
+///
+/// 標準出力はリダイレクト（Monitor / パイプ / ログファイル）だとブロック
+/// バッファされるため、flush しないと「イベントは起きているのに何分も
+/// 出てこない」ストリームになる
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// `tako orchestrator supervisor watch` — イベントを流し続ける（#665）。
+///
+/// **再アームが要らないのはここ**: 監視そのものは serve（常駐）が全 worker に対して
+/// 行い、watch はその journal を追うだけなので、途中で spawn された worker の
+/// イベントも同じストリームに流れてくる。読み手は何人居てもよい
+fn supervisor_watch(cursor: Option<u64>, json: bool) -> Result<(), String> {
+    use tako_control::orchestrator::supervisor;
+    // 監視役が居なければ起こす（master に張り忘れの余地を残さない）
+    let profile = tako_control::orchestrator::Profile::load("default").unwrap_or_default();
+    supervisor::ensure_running(profile.supervisor_mode.unwrap_or_default());
+
+    let mut cursor = cursor.unwrap_or(0);
+    loop {
+        let (events, next, truncated) = supervisor::read_events(cursor, 200)?;
+        if truncated {
+            eprintln!("warning: イベントログがローテートされ、一部を取りこぼした可能性がある");
+        }
+        for ev in &events {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(ev).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+                );
+            } else {
+                for line in ev.to_lines() {
+                    println!("{line}");
+                }
+            }
+        }
+        if !events.is_empty() {
+            flush_stdout();
+        }
+        cursor = next.max(cursor);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// `tako orchestrator supervisor events` — カーソル以降のイベントを 1 回読む
+fn supervisor_events(cursor: u64, limit: usize) -> Result<(), String> {
+    use tako_control::orchestrator::supervisor;
+    let (events, next, truncated) = supervisor::read_events(cursor, limit)?;
+    println!(
+        "{}",
+        pretty_json(&serde_json::json!({
+            "events": events,
+            "next_cursor": next,
+            "truncated": truncated,
+            "running": supervisor::is_running(),
+        }))
+    );
+    Ok(())
+}
+
+/// `tako orchestrator supervisor stop` — 常駐へ停止を要求する
+fn supervisor_stop() -> Result<(), String> {
+    use tako_control::orchestrator::supervisor;
+    if !supervisor::is_running() {
+        println!("supervisor は常駐していない");
+        return Ok(());
+    }
+    supervisor::request_stop()?;
+    println!("supervisor へ停止を要求した（次の周期で終了する）");
     Ok(())
 }
 
@@ -4624,42 +4938,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             volume: *volume,
         },
-        Command::Orchestrator(OrchestratorCommand::Spawn {
-            project,
-            prompt,
-            label,
-            agent,
-            model,
-            effort,
-            pane,
-            tab,
-            task_type,
-        }) => {
-            let pane_resolved = if pane.is_some() {
-                *pane
-            } else if tab.is_some() {
-                None
-            } else {
-                caller_pane()
-            };
-            let tab_resolved = if pane.is_some() { None } else { *tab };
-            if pane_resolved.is_none() && tab_resolved.is_none() {
-                return Err("--pane または --tab を指定してください".into());
-            }
-            Request::OrchestratorSpawn {
-                project: project.clone(),
-                prompt: prompt.clone(),
-                label: label.clone(),
-                model: model.clone(),
-                effort: effort.clone(),
-                pane: pane_resolved,
-                tab: tab_resolved,
-                caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
-                agent: agent.clone(),
-                caller_pid: Some(std::process::id()),
-                task_type: task_type.clone(),
-                account: None,
-            }
+        Command::Orchestrator(OrchestratorCommand::Spawn { .. }) => {
+            unreachable!("orchestrator spawn は run() を通らない（main() で起動保証つき処理済み）")
+        }
+        Command::Orchestrator(OrchestratorCommand::LaunchStatus { .. }) => {
+            unreachable!("orchestrator launch-status は run() を通らない（main() で処理済み）")
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
             unreachable!("orchestrator self は run() を通らない（main() でローカル処理済み）")

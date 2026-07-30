@@ -50,7 +50,8 @@ const CATEGORIES = [
     title: 'オーケストレーション（tako master）',
     intro: 'worker の spawn・監視・報告・タスク管理。',
     keys: [
-      'tako_orchestrator_spawn', 'tako_orchestrator_self', 'tako_orchestrator_worker_status',
+      'tako_orchestrator_spawn', 'tako_orchestrator_launch_status', 'tako_orchestrator_self',
+      'tako_orchestrator_worker_status',
       'tako_orchestrator_workers', 'tako_orchestrator_report', 'tako_orchestrator_respond',
       'tako_orchestrator_dialog',
       'tako_orchestrator_handoff', 'tako_orchestrator_run', 'tako_orchestrator_run_status',

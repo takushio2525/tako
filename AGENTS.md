@@ -83,8 +83,10 @@ tako/
 | ソロエージェント起動（オーケストレーション無しの 1 対 1 対話） | `tako solo [-profile]`（solo system prompt 付きで起動。worker spawn 禁止・エコ運用 effort=high。master と同じプロファイル引数・`master_agent` 対応） |
 | オーケストレーター master 自己情報 | `tako orchestrator self [--pane N]`（自 pane/tab/ctx%/handoff 状態。#123/#193） |
 | オーケストレーター master 引き継ぎ | `tako orchestrator handoff [--pane N] [--tab T]`（handoff ファイルを読み新 master spawn。#193） |
-| オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
-| オーケストレーター worker 監視 | `tako orchestrator watch --pane <N>` または `--worker <ID>`（レジストリ自動補完でペイン消失後も追跡継続。#390） |
+| オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."`（既定で**起動保証**つき: エージェント CLI の起動とプロンプト送達を確認してから返す。`--no-await-launch` で従来の投げっぱなし。#665） |
+| **起動保証の確認（#665）** | `tako orchestrator launch-status --pane <N> [--worker <ID>] [--wait]`（シェル起動 → 起動コマンド → CLI 起動 → プロンプト送達 のどこまで確認できたか。MCP `tako_orchestrator_launch_status` と 1:1） |
+| **worker 常時監視（再アーム不要。#665）** | `tako orchestrator supervisor watch`（全 worker のイベントを流し続ける。Monitor から 1 本張るだけ）/ `serve`（常駐本体・シングルトン）/ `events [--cursor N]`（取りこぼしなく 1 回読む）/ `stop`。MCP は `tako_orchestrator_supervisor { action: "events", cursor }` |
+| オーケストレーター worker 監視（単発） | `tako orchestrator watch --pane <N>` または `--worker <ID>`（1 イベントで終了。レジストリ自動補完でペイン消失後も追跡継続。#390） |
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]`（scrollback + transcript 2 層。`--worker <ID>` でペイン消失後も取得可。MCP `tako_orchestrator_report` と 1:1。#364/#390） |
 | オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]`（spawn 済み worker をペインの生死と無関係に列挙。prompt 未達・突然死の resume コマンドも表示。MCP `tako_orchestrator_workers` と 1:1。#390） |
 | **worker の対話ダイアログを読む（#662）** | `tako orchestrator dialog --pane <N>`（AskUserQuestion の質問文・選択肢を **transcript から全文で** 取得。ペイン幅に依存しない。MCP `tako_orchestrator_dialog` と 1:1） |

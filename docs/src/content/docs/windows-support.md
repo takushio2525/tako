@@ -23,11 +23,11 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 95 | macOS 版と同じように使えます |
+| 対応済み | 96 | macOS 版と同じように使えます |
 | 一部対応 | 9 | 使えますが機能が落ちます（理由は各表に記載） |
 | 未対応 | 23 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
-| **合計** | **128** | |
+| **合計** | **129** | |
 
 ## ターミナルの基本
 
@@ -88,6 +88,7 @@ worker の spawn・監視・報告・タスク管理。（このカテゴリ全�
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
 | `tako_orchestrator_spawn` | 対応済み | — |
+| `tako_orchestrator_launch_status` | 対応済み | — |
 | `tako_orchestrator_self` | 対応済み | — |
 | `tako_orchestrator_worker_status` | 対応済み | — |
 | `tako_orchestrator_workers` | 対応済み | — |

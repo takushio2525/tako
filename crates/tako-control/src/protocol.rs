@@ -932,6 +932,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         all: Option<bool>,
     },
+    /// オーケストレーター: spawn の起動保証の到達段階を照会する（Issue #665）。
+    /// 「シェル起動 → 起動コマンド → エージェント CLI 起動 → プロンプト送達」の
+    /// どこまで確認できたかを返す。UI スレッドで即返る軽量照会で、
+    /// spawn 直後のポーリング（CLI プロセス / MCP ハンドラスレッド）から使う
+    OrchestratorLaunchStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// worker レジストリの ID（ペイン消失後も照会できる）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
+    },
     /// オーケストレーター: supervisor の操作（Issue #401）。
     /// action: status / set_mode / history
     OrchestratorSupervisor {

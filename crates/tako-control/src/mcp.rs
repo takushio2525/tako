@@ -1534,8 +1534,38 @@ pub fn tools() -> Vec<Value> {
                             spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
                     },
                     "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
+                    "await_launch": {
+                        "type": "boolean",
+                        "description": "既定 true。エージェント CLI が実際に起動しプロンプトが届いたことを\
+                            確認してから返す（#665）。false にすると従来どおり即座に返るが、\
+                            起動コマンドが届かず worker が空回りしても気づけない",
+                    },
+                    "launch_timeout_secs": {
+                        "type": "integer", "minimum": 5, "maximum": 600,
+                        "description": "await_launch の上限秒数（既定 90）",
+                    },
                 },
                 "required": ["project", "prompt"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_launch_status",
+            "description": "spawn の起動保証（#665）の到達段階を照会する。\
+                level は queued（ペイン起動待ち）/ shell_ready（シェルは動いた）/ \
+                launch_sent（起動コマンドを送った）/ agent_started（エージェント CLI の起動を画面で確認）/ \
+                prompt_sent（プロンプトを送った）/ prompt_delivered（入力欄から消えた = 送達確認）/ \
+                failed（起動できなかった）。\
+                settled=true は確定（prompt_delivered か failed）、agent_running=true は worker が実際に動き出したこと。\
+                attempts は起動コマンドの送信回数（再送を含む）。\
+                await_launch=true で spawn した場合は spawn の応答に同じ内容が assurance として入るので、\
+                このツールは「後から確認したい」「spawn を非同期で投げた」ときに使う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("照会対象のペイン ID"),
+                    "worker": { "type": "string", "description": "worker レジストリの ID（ペインが消えても照会できる）" },
+                },
                 "additionalProperties": false,
             },
         }),
@@ -1841,20 +1871,34 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_supervisor",
-            "description": "worker 自動復旧 supervisor の操作（#401）。\
-                usage_limit / api_error / agent_dead / prompt_undelivered に対する自動リカバリの設定・状態照会・履歴参照。\
-                action=status: 現在の設定（mode / auto_resume_dead / max_retries）と監査ログ末尾。\
-                action=set_mode: supervisor モードを変更する（auto = 自動復旧 / notify_only = 通知のみ / off = 無効）。\
-                action=history: 監査ログの末尾を取得する（復旧アクションの全記録）。\
-                WORKER_DEAD の自動 resume は既定 notify-only（auto_resume_dead=false）。\
-                opt-in するには set_mode で auto_resume_dead=true を設定する。",
+            "description": "worker の常時監視 supervisor の操作（#401 / #665）。\
+                supervisor は spawn した worker を**自動で監視対象に入れて**、停止・異常・質問を検知し、\
+                入力欄の残留（末尾 Enter 欠落）や api_error の続行ナッジといった一次対応を自動で打つ。\
+                **master は watch を張り直す必要がない**（再アーム不要）。\
+                action=events: cursor 以降の監視イベントを取得する（**これが主な使い方**。\
+                返る next_cursor を次回そのまま渡せば取りこぼしがない）。\
+                action=status: 現在の設定（mode / auto_resume_dead / max_retries）と常駐状況・監査ログ末尾。\
+                action=set_mode: モードを変更する（auto = 自動一次対応あり / notify_only = 通知のみ / off = 無効）。\
+                action=history: 監査ログの末尾（自動アクションの全記録）。\
+                action=stop: 常駐を停止する。\
+                イベントの kind は watching（監視開始）/ idle / question / permission / error / stalled / \
+                dead / gone / auto_action（自動対応を実行）/ escalated（自動復旧を諦め master へ委ねる）。\
+                WORKER_DEAD の自動 resume は既定 notify-only（auto_resume_dead=false）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "set_mode", "history"],
-                        "description": "status: 現在の設定と監査ログ / set_mode: モード変更 / history: 監査ログ"
+                        "enum": ["events", "status", "set_mode", "history", "stop"],
+                        "description": "events: cursor 以降のイベント / status: 設定と常駐状況 / set_mode: モード変更 / history: 監査ログ / stop: 常駐停止"
+                    },
+                    "cursor": {
+                        "type": "integer", "minimum": 0,
+                        "description": "events: このカーソルより後のイベントを返す（既定 0 = 最初から）。前回の next_cursor を渡す"
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 500,
+                        "description": "events: 返す最大件数（既定 50）"
                     },
                     "mode": {
                         "type": "string",
@@ -2988,6 +3032,29 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         return orchestrator_run(&args, session, ipc_tx.as_ref());
     }
 
+    // spawn の起動保証（#665）も同じ理由でハンドラスレッドで待つ。
+    // dispatch は「発射指示を登録して即返す」だけで、到達段階のポーリングはここ
+    if name == "tako_orchestrator_spawn"
+        && bool_arg(&args, "await_launch")
+            .map_err(|e| (-32602, e))?
+            .unwrap_or(true)
+    {
+        return orchestrator_spawn_awaited(&args, session);
+    }
+
+    // supervisor の events / stop は journal・フラグファイルの読み書きだけで
+    // 完結する（GUI 不要）。dispatch を経由せずハンドラスレッドで処理する
+    if name == "tako_orchestrator_supervisor" {
+        match str_arg(&args, "action")
+            .map_err(|e| (-32602, e))?
+            .as_deref()
+        {
+            Some("events") => return supervisor_events_tool(&args),
+            Some("stop") => return supervisor_stop_tool(),
+            _ => {}
+        }
+    }
+
     let request = build_request(
         name,
         &args,
@@ -3006,6 +3073,134 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
     // 接続時の認証は機器ペアリング二層認証が行う）ため、除去処理は不要になった
 
     exec_and_wrap(request, session)
+}
+
+/// `tako_orchestrator_spawn` を「起動とプロンプト送達を確認してから返す」形で実行する（#665）。
+///
+/// dispatch（UI スレッド）は待てないので、待つのは MCP ハンドラスレッドの仕事。
+/// 応答の `assurance` に到達段階を載せ、失敗なら isError で返して master に気づかせる
+fn orchestrator_spawn_awaited(
+    args: &Value,
+    session: &mut McpSession,
+) -> Result<Value, (i64, String)> {
+    let request = build_request(
+        "tako_orchestrator_spawn",
+        args,
+        session.caller_pane,
+        session.caller_role.as_deref(),
+    )
+    .map_err(|e| (-32602, e))?;
+    let mut spawned = match (session.exec)(request) {
+        Ok(v) => v,
+        Err(message) => {
+            return Ok(json!({
+                "content": [{ "type": "text", "text": message }],
+                "isError": true,
+            }))
+        }
+    };
+
+    let timeout = u64_arg(args, "launch_timeout_secs")
+        .map_err(|e| (-32602, e))?
+        .unwrap_or(90);
+    let pane = spawned["pane_id"].as_u64();
+    let worker = spawned["worker_id"].as_str().map(str::to_string);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let mut assurance = json!({ "level": Value::Null });
+    loop {
+        let probe = (session.exec)(Request::OrchestratorLaunchStatus {
+            pane,
+            worker: worker.clone(),
+        });
+        if let Ok(v) = probe {
+            let settled = v["settled"].as_bool() == Some(true);
+            assurance = v;
+            if settled {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            if let Some(obj) = assurance.as_object_mut() {
+                obj.insert("timed_out".to_string(), json!(true));
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let failed = assurance["level"].as_str() == Some("failed")
+        || assurance["timed_out"].as_bool() == Some(true);
+    if let Some(obj) = spawned.as_object_mut() {
+        obj.insert("assurance".to_string(), assurance.clone());
+    }
+    let mut text = spawned.to_string();
+    if failed {
+        // 何が起きたかと次の一手を本文に足す（master が読んで自己修正できるように）
+        text = format!(
+            "{text}\n\nworker の起動を保証できなかった: {}\n到達段階: {}\n\
+             ペインの画面を tako_read_pane で確認し、必要なら close して spawn し直すこと。",
+            assurance["detail"].as_str().unwrap_or("(詳細なし)"),
+            assurance["describe"].as_str().unwrap_or("(不明)"),
+        );
+    }
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": failed,
+    }))
+}
+
+/// `tako_orchestrator_supervisor { action: "events" }`（#665）
+fn supervisor_events_tool(args: &Value) -> Result<Value, (i64, String)> {
+    use crate::orchestrator::supervisor;
+    let cursor = u64_arg(args, "cursor")
+        .map_err(|e| (-32602, e))?
+        .unwrap_or(0);
+    let limit = u64_arg(args, "limit")
+        .map_err(|e| (-32602, e))?
+        .unwrap_or(50) as usize;
+    // 監視役が居なければ起こす（master に張り忘れの余地を残さない）
+    let profile = crate::orchestrator::Profile::load("default").unwrap_or_default();
+    let started = supervisor::ensure_running(profile.supervisor_mode.unwrap_or_default());
+    match supervisor::read_events(cursor, limit) {
+        Ok((events, next, truncated)) => {
+            let value = json!({
+                "events": events,
+                "next_cursor": next,
+                "truncated": truncated,
+                "running": supervisor::is_running(),
+                "started_now": started,
+            });
+            Ok(json!({
+                "content": [{ "type": "text", "text": value.to_string() }],
+                "isError": false,
+            }))
+        }
+        Err(message) => Ok(json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+        })),
+    }
+}
+
+/// `tako_orchestrator_supervisor { action: "stop" }`（#665）
+fn supervisor_stop_tool() -> Result<Value, (i64, String)> {
+    use crate::orchestrator::supervisor;
+    if !supervisor::is_running() {
+        return Ok(json!({
+            "content": [{ "type": "text", "text": json!({"running": false, "stopped": false}).to_string() }],
+            "isError": false,
+        }));
+    }
+    match supervisor::request_stop() {
+        Ok(()) => Ok(json!({
+            "content": [{ "type": "text", "text": json!({"running": true, "stopped": true}).to_string() }],
+            "isError": false,
+        })),
+        Err(message) => Ok(json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+        })),
+    }
 }
 
 fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i64, String)> {
@@ -3726,6 +3921,11 @@ fn build_request(
         },
         "tako_orchestrator_workers" => Request::OrchestratorWorkers {
             all: bool_arg(args, "all")?,
+        },
+        // caller へフォールバックしない: 省略時に master 自身のペインを照会しても意味がない
+        "tako_orchestrator_launch_status" => Request::OrchestratorLaunchStatus {
+            pane: u64_arg(args, "pane")?,
+            worker: str_arg(args, "worker")?,
         },
         "tako_orchestrator_run_status" => Request::OrchestratorRunStatus {
             run_id: str_arg(args, "run_id")?,
@@ -4786,7 +4986,7 @@ mod tests {
         let tools = tools();
         // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 128);
+        assert_eq!(tools.len(), 129);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
@@ -5174,7 +5374,7 @@ mod tests {
         let (_, requests) = run(
             call(
                 "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi", "pane": 5 }),
+                json!({ "project": "p", "prompt": "hi", "pane": 5 , "await_launch": false }),
             ),
             Some(99),
             true,
@@ -5192,7 +5392,7 @@ mod tests {
         let (_, requests) = run(
             call(
                 "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi", "tab": 2 }),
+                json!({ "project": "p", "prompt": "hi", "tab": 2 , "await_launch": false }),
             ),
             Some(99),
             true,
@@ -5209,7 +5409,7 @@ mod tests {
         let (_, requests) = run(
             call(
                 "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi", "pane": 5, "tab": 2 }),
+                json!({ "project": "p", "prompt": "hi", "pane": 5, "tab": 2 , "await_launch": false }),
             ),
             Some(99),
             true,
@@ -5226,7 +5426,7 @@ mod tests {
         let (_, requests) = run(
             call(
                 "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi" }),
+                json!({ "project": "p", "prompt": "hi" , "await_launch": false }),
             ),
             Some(42),
             true,
@@ -5243,7 +5443,7 @@ mod tests {
         let (response, requests) = run(
             call(
                 "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi" }),
+                json!({ "project": "p", "prompt": "hi" , "await_launch": false }),
             ),
             None,
             true,
