@@ -157,12 +157,47 @@ impl EventListener for EventProxy {
     }
 }
 
+/// [`resize_plan`] の判断結果（#647）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizePlan {
+    /// グリッドを作り直す（= reflow が起きる）か
+    pub reflow_grid: bool,
+    /// PTY へ winsize を通知するか
+    pub notify_pty: bool,
+}
+
+/// リサイズで何をすべきかを決める純粋関数（#647）。
+///
+/// **cols/rows が同じでもセル寸法が変われば PTY へ通知する**のがこの関数の要点。
+/// フォントサイズを変えたのに cols/rows が偶然一致する場面（ペイン単位ズーム中、
+/// 端数の丸めで同数になる等）では、旧実装は早期 return してピクセル寸法
+/// （`ws_xpixel` / `ws_ypixel`）を古いまま残していた。
+///
+/// 逆に、セル寸法だけ変わったときにグリッドを作り直してはいけない。
+/// reflow は行構成を壊すので、必要が無いなら触らない
+pub fn resize_plan(
+    current_grid: (usize, usize),
+    current_cell_px: (u16, u16),
+    next_grid: (usize, usize),
+    next_cell_px: (u16, u16),
+) -> ResizePlan {
+    let reflow_grid = next_grid != current_grid;
+    let cell_changed = next_cell_px != current_cell_px;
+    ResizePlan {
+        reflow_grid,
+        notify_pty: reflow_grid || cell_changed,
+    }
+}
+
 /// 1 ペイン分のターミナルセッション（シェルプロセス + VT グリッド）
 pub struct TerminalSession {
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: Notifier,
     cols: usize,
     rows: usize,
+    /// 直近に PTY へ通知したセル寸法（px）。cols/rows が同じでもここが変われば
+    /// 通知し直す（#647。フォントサイズ変更で `ws_xpixel` が古いまま残るのを防ぐ）
+    cell_px: (u16, u16),
     title: Option<String>,
     /// 起動時 working directory または OSC 7 で通知された cwd
     cwd: Option<PathBuf>,
@@ -289,6 +324,8 @@ impl TerminalSession {
                 notifier,
                 cols,
                 rows,
+                // spawn 時に PTY へ渡した初期セル寸法（上の `window_size` と一致させる）
+                cell_px: (window_size.cell_width, window_size.cell_height),
                 title: None,
                 cwd: working_directory,
                 command_state: CommandState::default(),
@@ -336,15 +373,31 @@ impl TerminalSession {
         self.title.as_deref()
     }
 
-    /// グリッドと PTY（TIOCSWINSZ）の両方をリサイズする。セル寸法は px
+    /// グリッドと PTY（TIOCSWINSZ / ConPTY）の両方をリサイズする。セル寸法は px。
+    ///
+    /// cols/rows が同じでもセル寸法（`ws_xpixel` / `ws_ypixel`）が変われば PTY へ
+    /// 通知し直す（#647）。フォントサイズを変えたのに cols/rows が偶然一致する
+    /// 場面（ペイン単位ズーム中など）では、通知しないとピクセル寸法が古いまま残る
     pub fn resize(&mut self, cols: usize, rows: usize, cell_width: u16, cell_height: u16) {
         let (cols, rows) = (cols.max(2), rows.max(2));
-        if (cols, rows) == (self.cols, self.rows) {
+        let plan = resize_plan(
+            (self.cols, self.rows),
+            self.cell_px,
+            (cols, rows),
+            (cell_width, cell_height),
+        );
+        let ResizePlan {
+            reflow_grid: grid_changed,
+            notify_pty,
+        } = plan;
+        if !notify_pty {
             return;
         }
-        // リサイズは reflow で行構成が変わるため端数はリセット（整数位置へスナップ）
-        *self.fract_lock() = 0.0;
-        self.term.lock().resize(TermSize::new(cols, rows));
+        if grid_changed {
+            // リサイズは reflow で行構成が変わるため端数はリセット（整数位置へスナップ）
+            *self.fract_lock() = 0.0;
+            self.term.lock().resize(TermSize::new(cols, rows));
+        }
         self.notifier.on_resize(WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
@@ -353,6 +406,7 @@ impl TerminalSession {
         });
         self.cols = cols;
         self.rows = rows;
+        self.cell_px = (cell_width, cell_height);
     }
 
     /// PTY（シェルの stdin）へバイト列を書き込む。
@@ -1285,6 +1339,46 @@ fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #647: フォントサイズを変えると cols/rows は変わるので通知される。
+    /// **cols/rows が偶然一致してもセル寸法が変われば通知する**のが本題
+    #[test]
+    fn リサイズ計画はセル寸法の変化だけでも_pty_へ通知する() {
+        // 何も変わっていない = 何もしない（毎 render で呼ばれる経路なので必須）
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (80, 24), (8, 16)),
+            ResizePlan {
+                reflow_grid: false,
+                notify_pty: false,
+            }
+        );
+        // グリッドが変わった = reflow + 通知（従来どおり）
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (48, 11), (12, 26)),
+            ResizePlan {
+                reflow_grid: true,
+                notify_pty: true,
+            }
+        );
+        // グリッドは同じでセル寸法だけ変わった（フォントサイズ変更で cols/rows が
+        // 偶然一致した場面）= reflow はしないが通知はする。旧実装はここで
+        // 早期 return し ws_xpixel が古いまま残っていた
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (80, 24), (12, 26)),
+            ResizePlan {
+                reflow_grid: false,
+                notify_pty: true,
+            }
+        );
+        // 高さだけ変わる（行高だけ変えた場合）
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (80, 24), (8, 26)),
+            ResizePlan {
+                reflow_grid: false,
+                notify_pty: true,
+            }
+        );
+    }
 
     #[test]
     fn コマンド実行状態の遷移とエラー保持() {
