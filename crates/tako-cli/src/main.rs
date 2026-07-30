@@ -6038,9 +6038,15 @@ mod tests {
         assert_eq!(parsed[0].question.as_deref(), Some("方針"));
         assert_eq!(parsed[0].option_list(), vec!["A=B 案"]);
 
-        // 右が空 = 質問指定として成立しないのでラベル扱い
-        let parsed = parse_dialog_answers(&["=".into()]);
-        assert!(parsed.is_err(), "選択肢が無いのでエラー");
+        // 左右どちらかが空なら質問指定として成立しない → 全体をラベルとして扱う
+        // （解決できなければ resolve 側が候補つきで断るので、ここでは弾かない）
+        let parsed = parse_dialog_answers(&["=".into()]).unwrap().unwrap();
+        assert_eq!(parsed[0].question, None);
+        assert_eq!(parsed[0].option_list(), vec!["="]);
+
+        let parsed = parse_dialog_answers(&["=青い海".into()]).unwrap().unwrap();
+        assert_eq!(parsed[0].question, None);
+        assert_eq!(parsed[0].option_list(), vec!["=青い海"]);
     }
 
     #[test]
