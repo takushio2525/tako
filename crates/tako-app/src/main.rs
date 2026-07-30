@@ -17964,6 +17964,90 @@ mod self_test {
             clipboard == two_cells,
             "visual-test md: ⌘C 相当のコピーで選択テキストがクリップボードへ入る",
         );
+        // 実クリップボード（pbpaste）まで届いているか。GPUI の read_from_clipboard は
+        // NSPasteboard 越しだが、外部プロセスから見えることを直接確かめる
+        let pasted = cx
+            .background_executor()
+            .spawn(async {
+                std::process::Command::new("pbpaste")
+                    .output()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+            })
+            .await;
+        println!("TAKO_VISUAL_PIXEL: md cell-copy pbpaste={pasted:?}");
+        check(
+            pasted.as_deref() == two_cells.as_deref(),
+            "visual-test md: 表セルのコピーが pbpaste で読める (#656)",
+        );
+
+        // コードブロックのドラッグ選択（1 行目の先頭 → 2 行目の途中）を実ヒットテストで作り、
+        // ⌘C 相当のコピーが pbpaste まで届くこと。md のコードブロックは 1 要素 =
+        // 複数行の StyledText なので、行内 byte offset が正しく解決される必要がある
+        let (code_from, code_to, code_selected) = window
+            .update(cx, |app, _, cx| {
+                let bounds = app
+                    .preview_text_layouts
+                    .get(&md_pane)
+                    .and_then(|l| l.get(code_line).cloned())
+                    .flatten()
+                    .map(|layout| layout.bounds());
+                let Some(bounds) = bounds else {
+                    return (None, None, None);
+                };
+                let line_h = px(app.theme.line_height);
+                let from = app.preview_hit_test(
+                    md_pane,
+                    point(bounds.left() + px(1.0), bounds.top() + px(3.0)),
+                );
+                let to = app.preview_hit_test(
+                    md_pane,
+                    point(
+                        bounds.left() + bounds.size.width * 0.4,
+                        bounds.top() + line_h + px(3.0),
+                    ),
+                );
+                if let (Some(anchor), Some(head)) = (from, to) {
+                    app.preview_selections
+                        .insert(md_pane, PreviewSelection { anchor, head });
+                }
+                let text = app.preview_selected_text();
+                app.copy_selection(cx);
+                (from, to, text)
+            })
+            .unwrap_or_else(|_| fail("visual-test md: コードブロックの選択"));
+        let code_pasted = cx
+            .background_executor()
+            .spawn(async {
+                std::process::Command::new("pbpaste")
+                    .output()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+            })
+            .await;
+        println!(
+            "TAKO_VISUAL_PIXEL: md code-copy from={code_from:?} to={code_to:?} \
+             selected={:?} pbpaste_len={:?}",
+            code_selected
+                .as_deref()
+                .map(|t| t.chars().take(24).collect::<String>()),
+            code_pasted.as_deref().map(str::len)
+        );
+        check(
+            code_from.map(|(line, _)| line) == Some(code_line)
+                && code_to.map(|(line, _)| line) == Some(code_line),
+            "visual-test md: コードブロックのヒットテストがそのブロックの行を返す",
+        );
+        check(
+            code_selected
+                .as_deref()
+                .is_some_and(|t| t.contains('\n') && t.len() > 8),
+            "visual-test md: コードブロックのドラッグ選択が複数行のテキストを返す (#656)",
+        );
+        check(
+            code_pasted.as_deref() == code_selected.as_deref(),
+            "visual-test md: コードブロックのコピーが pbpaste で読める (#656)",
+        );
 
         // エッジケース（#656 の検証手順 3）: 巨大な表・壊れた表・折り返せない長い語・
         // 深いネスト・フェンス内の ``` を 1 本の md に詰めて、panic / フリーズ / 崩れが
