@@ -119,8 +119,7 @@ pub fn pending_from_transcript_lines<I: Iterator<Item = String>>(
 
     pending
         .into_iter()
-        .filter(|p| !answered.contains(&p.tool_use_id))
-        .next_back()
+        .rfind(|p| !answered.contains(&p.tool_use_id))
 }
 
 fn parse_questions(input: &Value) -> Vec<DialogQuestion> {

@@ -11043,8 +11043,12 @@ mod tests {
     #[test]
     fn ダイアログ到達はセッション不在を構造化して返す() {
         let host = MockHost::new();
-        let err = resolve_dialog_reach(&host, host.root_pane()).unwrap_err();
-        assert!(err.to_string().contains("セッション"), "err={err:?}");
+        // `DialogReach` は `&dyn DetachedAccess` を持ち Debug を実装できないので
+        // unwrap_err ではなく match で取り出す
+        match resolve_dialog_reach(&host, host.root_pane()) {
+            Err(e) => assert!(e.to_string().contains("セッション"), "err={e:?}"),
+            Ok(_) => panic!("MockHost はセッションを持たないので到達できないはず"),
+        }
     }
 
     /// detached バックエンド（tmux 系）へのキー名の写し。
