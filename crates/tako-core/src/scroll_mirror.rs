@@ -120,7 +120,12 @@ pub struct HistoryState {
 }
 
 /// 現在の履歴行数とマウス要求状態を取得する（ミラー更新の増分検知 +
-/// マウス要求アプリの判定 + レポート形式の判定）。セッション消滅では None
+/// マウス要求アプリの判定 + レポート形式の判定）。セッション消滅では None。
+///
+/// **マウス系フラグは器が答えられないことがある**（#654。psmux は
+/// `#{mouse_any_flag}` / `#{mouse_sgr_flag}` を知らず空文字に展開する）。
+/// パースは [`parse_history_state`] に分けてあり、欠けたフラグで
+/// 関数ごと None にはしない
 pub fn history_state(target: &ScrollTarget) -> Option<HistoryState> {
     let (socket, t) = target.locate();
     let output = run_tmux(
@@ -134,10 +139,23 @@ pub fn history_state(target: &ScrollTarget) -> Option<HistoryState> {
         ],
     )
     .ok()?;
-    let line = output.lines().next()?;
+    parse_history_state(output.lines().next()?)
+}
+
+/// `display-message -p "#{history_size} #{mouse_any_flag} #{mouse_sgr_flag}"` の 1 行を解く。
+///
+/// **フラグが欠けていても None を返さない**のが要点（#654）。器が変数を知らないと
+/// 空文字へ展開され、以前はここで `?` により関数ごと None になっていた。すると
+/// 呼び出し側（`pump_mirror` / `backend_scroll_view`）は `wants_mouse` を永久に
+/// 解決できず、ミラーもロードされないまま**ホイールが全ペインで無反応**になる。
+/// 答えられない器は「マウス要求なし」= ミラー表示として扱う（内側アプリへ
+/// ホイール報告を撃つ方が危険。psmux では `send-keys -H` が 16 進をリテラル文字として
+/// 送るため、撃つとゴミ文字が入力欄へ入る）。`history_size` だけは必須
+/// （数値が取れない = セッション消滅 or 器の応答が壊れている）
+fn parse_history_state(line: &str) -> Option<HistoryState> {
     let mut m = line.split_whitespace();
     let history: usize = m.next()?.parse().ok()?;
-    let mouse = m.next()? == "1";
+    let mouse = m.next() == Some("1");
     let sgr = m.next() == Some("1");
     Some(HistoryState {
         history,
@@ -196,6 +214,42 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::default_dark()
+    }
+
+    /// tmux（全変数に答えられる器）の応答
+    #[test]
+    fn history_stateはtmuxの3値応答を解く() {
+        let s = parse_history_state("102 1 1").expect("解けること");
+        assert_eq!(s.history, 102);
+        assert!(s.mouse && s.sgr);
+        let s = parse_history_state("0 0 0").expect("解けること");
+        assert_eq!(s.history, 0);
+        assert!(!s.mouse && !s.sgr);
+    }
+
+    /// #654 の回帰: psmux は `#{mouse_any_flag}` / `#{mouse_sgr_flag}` を知らず、
+    /// 応答が `"102  "`（履歴だけ + 空文字 2 つ）になる。ここで None を返すと
+    /// 呼び出し側が `wants_mouse` を永久に解決できず**ホイールが全ペインで無反応**になる
+    #[test]
+    fn history_stateはマウスフラグ未対応の器でもNoneにならない() {
+        let s = parse_history_state("102  ").expect("フラグが欠けても解けること");
+        assert_eq!(s.history, 102);
+        assert!(
+            !s.mouse,
+            "答えられない器はマウス要求なし扱い（ゴミ注入を避ける）"
+        );
+        assert!(!s.sgr);
+        // フラグが 1 つも無い（末尾空白すら無い）形も同じ扱い
+        let s = parse_history_state("77").expect("履歴だけでも解けること");
+        assert_eq!(s.history, 77);
+        assert!(!s.mouse && !s.sgr);
+    }
+
+    /// 履歴行数だけは必須。数値にならない応答（セッション消滅・器の異常）は None
+    #[test]
+    fn history_stateは履歴が数値でなければNone() {
+        assert!(parse_history_state("").is_none());
+        assert!(parse_history_state("can't find session").is_none());
     }
 
     #[test]

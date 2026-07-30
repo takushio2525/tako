@@ -9346,9 +9346,22 @@ impl TakoApp {
     /// または `tako tmux open` で表示している外部セッション）。ミラースクロール・
     /// スクロールバー・CLI/MCP Scroll の分岐はすべてこれで判定する（#181: 再アタッチ・
     /// ビューラッパーペインは外側 alacritty が alt screen（履歴なし）のため、
-    /// backend_sessions だけの判定では直接ペイン扱いに落ちてスクロール不能だった）
+    /// backend_sessions だけの判定では直接ペイン扱いに落ちてスクロール不能だった）。
+    ///
+    /// **器が履歴の権威を持つと申告しているときだけミラーへ載せる**（#654）。
+    /// ミラーは器へ 2 つの前提を置いている: ①`#{mouse_any_flag}` / `#{mouse_sgr_flag}` で
+    /// 内側アプリのマウス要求を答えられる ②`send-keys -H` でホイール報告をバイト列として
+    /// 注入できる。psmux（Windows の器）はどちらも持たない（実測: フラグは空文字で返り
+    /// `send-keys -H` は 16 進引数をリテラル文字として送る）ため、ミラーに載せると
+    /// `history_state` が None を返し続け、ホイール・スクロールバー・CLI Scroll が
+    /// 全ペインで恒久的に無反応になっていた。`ScrollbackAuthority::InProcess` を申告する
+    /// 器では、外側 alacritty が履歴を持つ直接ペイン経路（#159）がそのまま正しい
     fn mirror_scroll_pane(&self, pane_id: PaneId) -> bool {
-        self.backend_sessions.contains_key(&pane_id) || self.tmux_view_panes.contains_key(&pane_id)
+        mirror_route(
+            self.tmux_view_panes.contains_key(&pane_id),
+            self.backend_sessions.contains_key(&pane_id),
+            tako_core::backend::capabilities().scrollback,
+        )
     }
 
     /// ミラースクロールの実体解決の起点。**TmuxOpen ビューを最優先**する: persist ON では
@@ -9385,18 +9398,22 @@ impl TakoApp {
         let Some(cell) = self.cell_size_for_pane(pane_id) else {
             return;
         };
-        // トラックパッドは Pixels（そのまま行小数へ）、マウスホイールは Lines
-        // （1 ノッチ = 3 行。iTerm2 / Terminal.app と同等）。慣性は macOS が
-        // momentum イベントとして Pixels デルタを流し続けるため、加算だけで効く
-        let delta_rows = match event.delta {
-            ScrollDelta::Lines(l) => l.y * 3.0,
-            ScrollDelta::Pixels(p) => f32::from(p.y) / f32::from(cell.height),
-        };
+        let delta_rows = wheel_delta_rows(event.delta, cell.height, wheel_lines_per_unit());
         let (col, row) = self
             .cell_at(pane_id, event.position, window)
             .map(|(c, r, _)| (c, r))
             .unwrap_or((0, 0));
-        if self.mirror_scroll_pane(pane_id) {
+        let mirror = self.mirror_scroll_pane(pane_id);
+        if scroll_diag_enabled() {
+            // #654: 経路と外側 term のモードを残す（無反応の切り分けはここが要る）
+            let (mouse, alt) = self
+                .terminals
+                .get(&pane_id)
+                .map(|s| (s.mouse_reporting(), s.is_alt_screen()))
+                .unwrap_or((false, false));
+            scroll_diag_route(pane_id.as_u64(), mirror, mouse, alt);
+        }
+        if mirror {
             // バックエンド / TmuxOpen ビューペイン: tmux 履歴のローカルミラー上で
             // ピクセル単位にスクロールする（マウス要求アプリへの SGR 転送も内部で出し分け。#159/#181）
             self.backend_scroll_px(pane_id, delta_rows, (col, row), cx);
@@ -16348,6 +16365,75 @@ pub(crate) fn scroll_diag_wheel(target: &str, delta: &ScrollDelta) {
             scroll_delta_note(delta)
         ));
     }
+}
+
+/// ターミナルペインのホイールが**どちらの経路へ入ったか**を残す（#654）。
+///
+/// 到達（`scroll_diag_wheel`）とスクロール余地だけでは、ミラー経路に載ったまま
+/// 器が答えられず無反応、という壊れ方が読めなかった（#654 の実際の症状）。
+/// 経路・器・履歴の権威・外側 term のモードを 1 行に並べる
+pub(crate) fn scroll_diag_route(pane: u64, mirror: bool, mouse_reporting: bool, alt_screen: bool) {
+    if !scroll_diag_enabled() {
+        return;
+    }
+    let caps = tako_core::backend::capabilities();
+    tako_control::diag::perf_log(&format!(
+        "scroll-diag: pane {pane} route={} backend={} authority={} mouse_reporting={mouse_reporting} alt_screen={alt_screen}",
+        if mirror { "mirror" } else { "direct" },
+        caps.label,
+        match caps.scrollback {
+            tako_core::backend::ScrollbackAuthority::Backend => "backend",
+            tako_core::backend::ScrollbackAuthority::InProcess => "in_process",
+        },
+    ));
+}
+
+/// `ScrollDelta::Lines` 1.0 が何行を意味するか。**プラットフォームで違う**（#654 実測）。
+///
+/// - macOS: gpui は AppKit の `scrollingDeltaY` をそのまま流す（マウスホイール
+///   1 ノッチ = 1.0）。tako は iTerm2 / Terminal.app と同じ「1 ノッチ = 3 行」の
+///   規約なので 3 を掛ける（従来どおり）
+/// - Windows: gpui が `WM_MOUSEWHEEL` のノッチ数へ OS 設定
+///   （`SPI_GETWHEELSCROLLLINES`。既定 3）を**掛けたあとの値**を流す
+///   （`gpui_windows/src/events.rs` の `wheel_distance`）。ここで更に 3 を掛けると
+///   1 ノッチ = 9 行になり、TUI へは 1 ノッチで 9 個のホイール報告が飛ぶ
+///   （実測: 5 ノッチ = 45 行要求 → 転送レート制限で 9 個着弾 = 体感 2 倍以上の行き過ぎ）。
+///   OS の「スクロールする行数」を尊重するのが Windows の作法なので、そのまま行数として使う
+const fn wheel_lines_per_unit() -> f32 {
+    if cfg!(target_os = "windows") {
+        1.0
+    } else {
+        3.0
+    }
+}
+
+/// ホイール / トラックパッドのデルタを行小数へ換算する（純粋関数）。
+///
+/// トラックパッドは `Pixels`（セル高で割ってそのまま行小数へ）、マウスホイールは
+/// `Lines`（`lines_per_unit` を掛ける。意味は [`wheel_lines_per_unit`] 参照）。
+/// 慣性は macOS が momentum イベントとして `Pixels` を流し続けるため加算だけで効く。
+/// **`Lines` にも `Pixels` にも DPI（`scale_factor`）は掛かっていない**
+/// （gpui は scale_factor をイベント座標の論理座標化にだけ使う）ので、
+/// 表示スケールを変えてもスクロール量は変わらない
+fn wheel_delta_rows(delta: ScrollDelta, cell_height: Pixels, lines_per_unit: f32) -> f32 {
+    match delta {
+        ScrollDelta::Lines(l) => l.y * lines_per_unit,
+        ScrollDelta::Pixels(p) => f32::from(p.y) / f32::from(cell_height),
+    }
+}
+
+/// ミラースクロール経路を使うかの判定（`TakoApp::mirror_scroll_pane` の本体）。
+///
+/// **器の申告（`ScrollbackAuthority`）を必ず通す**のが要点。ここを
+/// 「バックエンドセッションがあるか」だけで決めると、履歴の権威を持たない器
+/// （psmux）でもミラーへ載り、ミラーの前提（`#{mouse_any_flag}` /
+/// `send-keys -H`）が無いためホイールが恒久的に無反応になる（#654）
+pub(crate) fn mirror_route(
+    has_view: bool,
+    has_backend: bool,
+    authority: tako_core::backend::ScrollbackAuthority,
+) -> bool {
+    has_view || (has_backend && authority == tako_core::backend::ScrollbackAuthority::Backend)
 }
 
 /// 各コンテナの「スクロールできる余地」と現在位置を一覧する（1 秒に 1 回）
@@ -24915,8 +25001,110 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
 
 #[cfg(test)]
 mod scroll_diag_tests {
-    use super::{scroll_delta_note, scroll_diag_line};
+    use super::{
+        mirror_route, scroll_delta_note, scroll_diag_line, wheel_delta_rows, wheel_lines_per_unit,
+    };
     use gpui::{point, px, size, Bounds, ScrollDelta};
+    use tako_core::backend::ScrollbackAuthority;
+
+    // #654 の回帰: バックエンドペインをミラーへ載せるかは**器の申告**で決める。
+    // 「バックエンドセッションがあるか」だけで決めていたため、履歴の権威を持たない
+    // 器（psmux）でもミラーへ載り、ミラーの前提（`#{mouse_any_flag}` /
+    // `send-keys -H`）が無いためホイール・スクロールバー・CLI Scroll が
+    // 全ペインで無反応になっていた
+
+    #[test]
+    fn 器が権威を持つバックエンドペインはミラー経路() {
+        assert!(mirror_route(false, true, ScrollbackAuthority::Backend));
+    }
+
+    #[test]
+    fn 権威を持たない器のバックエンドペインは直接経路() {
+        assert!(
+            !mirror_route(false, true, ScrollbackAuthority::InProcess),
+            "psmux（InProcess 申告）はミラーに載せない。載せるとホイールが恒久的に無反応になる"
+        );
+    }
+
+    #[test]
+    fn tmuxopenビューは器の申告に関わらずミラー経路() {
+        // ビュー先の履歴は見に行った先のサーバー側にあり、器の権威とは別問題
+        assert!(mirror_route(true, false, ScrollbackAuthority::InProcess));
+        assert!(mirror_route(true, true, ScrollbackAuthority::InProcess));
+        assert!(mirror_route(true, false, ScrollbackAuthority::Backend));
+    }
+
+    #[test]
+    fn バックエンドもビューも無いペインは直接経路() {
+        assert!(!mirror_route(false, false, ScrollbackAuthority::Backend));
+        assert!(!mirror_route(false, false, ScrollbackAuthority::InProcess));
+    }
+
+    // #654: ホイール量。`ScrollDelta::Lines` の意味がプラットフォームで違うので、
+    // 倍率は引数に出して**どちらの OS からでも両方の意味を検証できる**ようにしてある
+    // （#515 の作法）。DPI（scale_factor）はデルタに掛かっていないため、
+    // 表示スケールを変えても下の数値は変わらない
+
+    #[test]
+    fn ホイール行換算はmacos規約で1ノッチ3行() {
+        // macOS: gpui は 1 ノッチ = 1.0 を流す → 3 行
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Lines(point(0.0, 1.0)), px(17.0), 3.0),
+            3.0
+        );
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Lines(point(0.0, -2.0)), px(17.0), 3.0),
+            -6.0
+        );
+    }
+
+    #[test]
+    fn ホイール行換算はwindowsのos設定済み行数をそのまま使う() {
+        // Windows: gpui が SPI_GETWHEELSCROLLLINES を掛けた値（既定 3 なら 1 ノッチ = 3.0）
+        // を流す → そのまま 3 行。旧実装は更に 3 倍して 9 行にしていた（#654）
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Lines(point(0.0, 3.0)), px(17.0), 1.0),
+            3.0
+        );
+        // 5 ノッチ分がまとめて 1 イベントで来ても 15 行（旧実装は 45 行）
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Lines(point(0.0, 15.0)), px(17.0), 1.0),
+            15.0
+        );
+        // 「スクロールする行数 = 1」設定なら 1 ノッチ = 1 行（OS 設定を尊重する）
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Lines(point(0.0, 1.0)), px(17.0), 1.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn トラックパッドのピクセルデルタはセル高で行小数になる() {
+        // 倍率は Pixels 経路に影響しない（プラットフォーム差はホイールだけ）
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Pixels(point(px(0.0), px(34.0))), px(17.0), 3.0),
+            2.0
+        );
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Pixels(point(px(0.0), px(34.0))), px(17.0), 1.0),
+            2.0
+        );
+        // 行未満の端数はそのまま行小数（サブライン描画 #159 が使う）
+        assert_eq!(
+            wheel_delta_rows(ScrollDelta::Pixels(point(px(0.0), px(8.5))), px(17.0), 1.0),
+            0.5
+        );
+    }
+
+    #[test]
+    fn 実行中プラットフォームの倍率が規約どおり() {
+        let expected = if cfg!(target_os = "windows") {
+            1.0
+        } else {
+            3.0
+        };
+        assert_eq!(wheel_lines_per_unit(), expected);
+    }
 
     // #654: 「スクロールできない」の切り分けは、まず OS から届いたホイール量を
     // 見分けられることが前提。Windows は SPI_GETWHEELSCROLLLINES をそのまま
