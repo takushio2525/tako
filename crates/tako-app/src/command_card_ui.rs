@@ -16,17 +16,22 @@ use crate::file_icons::ui_icon;
 /// コピー成功・失敗の表示を維持する時間。2 秒ポーリング（periodic）の再描画で自然に消える
 const FEEDBACK_DURATION: std::time::Duration = std::time::Duration::from_millis(2200);
 
-/// カード 1 枚の最大表示行数。長いコマンドは折り返して全文出すが、
+/// コマンド 1 件の本文の最大表示高さ。長いコマンドは折り返して全文出すが、
 /// 極端に長いものでターミナルを覆い尽くさないよう高さで止める（スクロールで読める）
-const CARD_MAX_HEIGHT: f32 = 190.0;
+const COMMAND_MAX_HEIGHT: f32 = 190.0;
 
 impl TakoApp {
-    /// 指定ペインのコマンドカード（FR-2.22）。ペイン下端に新しいものが下に来る形で積む。
-    /// `bottom_offset` はポート検知チップ（FR-2.4.3）と重ならないための下端余白
+    /// 指定ペインのコマンドカード（FR-2.22）。ペイン下端に**新しいものを上**にして積む。
+    ///
+    /// `bottom_offset` はポート検知チップ（FR-2.4.3）と重ならないための下端余白、
+    /// `max_height` はペインの残り高さ。**新しいカードを必ず見せる**ため、
+    /// 収まらない古いカードが下（スクロール領域）へ押し出される順序にしている
+    /// （逆順にすると最新カードの見出しがペイン上端で切れる。実機で確認済み）
     pub(crate) fn render_command_cards(
         &mut self,
         pane_id: PaneId,
         bottom_offset: f32,
+        max_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let theme = self.theme.clone();
@@ -53,7 +58,10 @@ impl TakoApp {
             .command_card_error
             .filter(|(_, at)| at.elapsed() < FEEDBACK_DURATION);
 
+        // 本文はペインの半分までに抑える（1 枚でもボタン行が押し出されないように）
+        let command_max = COMMAND_MAX_HEIGHT.min((max_height * 0.5).max(48.0));
         let stack = div()
+            .id(("command-card-stack", pane_id.as_u64()))
             .absolute()
             .bottom(px(bottom_offset))
             .left(px(8.0))
@@ -61,13 +69,16 @@ impl TakoApp {
             .flex()
             .flex_col()
             .gap(px(6.0))
+            // ペインからはみ出さない。溢れた古いカードはスクロールで読める
+            .max_h(px(max_height.max(60.0)))
+            .overflow_y_scroll()
             // 下のペインへ選択・スクロールを漏らさない（提案チップと同じ）
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
             )
-            .children(cards.into_iter().map(|(card_id, label, commands)| {
+            .children(cards.into_iter().rev().map(|(card_id, label, commands)| {
                 let total = commands.len();
                 let heading =
                     label.unwrap_or_else(|| crate::ui_text::command_card::heading().to_string());
@@ -147,7 +158,7 @@ impl TakoApp {
                             .child(
                                 div()
                                     .id(("command-card-text", card_id * 100 + index as u64))
-                                    .max_h(px(CARD_MAX_HEIGHT))
+                                    .max_h(px(command_max))
                                     // 極端に長いコマンドは高さで止めてスクロールで読ませる
                                     .overflow_y_scroll()
                                     // 折り返して全文表示（コピーは論理文字列なので無関係）
@@ -301,9 +312,9 @@ impl TakoApp {
         action: &str,
         card: u64,
         index: usize,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
-        tako_control::dispatch(
+        let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::ShowCommand {
                 action: Some(action.to_string()),
@@ -316,7 +327,24 @@ impl TakoApp {
             },
             PaneOrigin::User,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+        // UI から dispatch を直接呼ぶので、IPC / MCP ループがやっている後処理を
+        // ここで肩代わりする。**これを欠くと run でツリーにペインだけができて
+        // PTY が起動しない**（#153 で同じ穴を踏んでいる）
+        for (pane, options) in std::mem::take(&mut self.pending_attach) {
+            if let Err(e) = self.spawn_session(pane, options, cx) {
+                eprintln!("warning: コマンドカードの実行ペインを起動できない: {e}");
+                self.remove_pane(pane, cx);
+            }
+        }
+        for (pane, data) in std::mem::take(&mut self.pending_writes) {
+            if let Some(session) = self.terminals.get(&pane) {
+                session.write(data);
+            }
+        }
+        // コピーは押した瞬間に効いてほしいので、render を待たずここで流す
+        self.flush_pending_clipboard(cx);
+        result
     }
 
     /// 失敗は画面に一言 + 理由は診断ログへ（dispatch のエラー文は日本語固定 =

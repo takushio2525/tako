@@ -12338,10 +12338,13 @@ impl TakoApp {
             .find(|s| s.pane == pane_id)
             .map(|s| (s.port, s.process.clone()));
 
-        // AI コマンド提案カード（FR-2.22 / #666）。提案チップと重ならないよう
-        // チップがあるぶんだけ上へ寄せる
-        let command_cards =
-            self.render_command_cards(pane_id, if suggestion.is_some() { 32.0 } else { 6.0 }, cx);
+        // AI コマンド提案カード（FR-2.22 / #666）。提案チップと重ならないようチップの
+        // ぶんだけ上へ寄せ、ペインヘッダを覆わないよう残り高さを上限として渡す
+        let command_cards = {
+            let bottom_offset = if suggestion.is_some() { 32.0 } else { 6.0 };
+            let available = f32::from(area.size.height) - PANE_TITLE_BAR - bottom_offset - 6.0;
+            self.render_command_cards(pane_id, bottom_offset, available, cx)
+        };
 
         // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
         // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
@@ -27653,45 +27656,82 @@ mod self_test {
                 let run_cmd = format!("echo {marker}");
                 let before = window
                     .update(cx, |app, _, _| {
-                        (
-                            app.workspace.active_tab().tree().panes().len(),
-                            app.workspace.tabs().len(),
-                            app.focused_pane(),
-                        )
-                    })
-                    .unwrap_or((0, 0, PaneId::from_raw(0)));
-                let run_card = window
-                    .update(cx, |app, _, cx| {
-                        let v = show(app, vec![run_cmd.clone()], pane);
-                        let id = v["card"]["id"].as_u64().unwrap_or(0);
-                        app.run_command_card(id, 1, cx);
-                        id
-                    })
-                    .unwrap_or(0);
-                wait(cx, 1500).await;
-                let run_ok = window
-                    .update(cx, |app, _, _| {
-                        let after = app.workspace.active_tab().tree().panes().len();
-                        let same_tab_count = app.workspace.tabs().len() == before.1;
-                        let focus_kept = app.focused_pane() == before.2;
-                        // 新しく増えたペインで実際にコマンドが走ったか（出力にマーカー）
-                        let ran = app
+                        let ids: Vec<PaneId> = app
                             .workspace
                             .active_tab()
                             .tree()
                             .panes()
                             .iter()
-                            .filter(|p| p.id() != before.2)
-                            .any(|p| {
-                                app.terminals.get(&p.id()).is_some_and(|s| {
-                                    s.visible_lines().iter().any(|l| l.contains(marker))
-                                })
-                            });
-                        after == before.0 + 1 && same_tab_count && focus_kept && ran
+                            .map(|p| p.id())
+                            .collect();
+                        (
+                            ids.len(),
+                            app.workspace.tabs().len(),
+                            app.focused_pane(),
+                            ids,
+                        )
                     })
-                    .unwrap_or(false);
+                    .unwrap_or((0, 0, PaneId::from_raw(0), Vec::new()));
+                let (run_card, run_pane) = window
+                    .update(cx, |app, _, cx| {
+                        let v = show(app, vec![run_cmd.clone()], pane);
+                        let id = v["card"]["id"].as_u64().unwrap_or(0);
+                        app.run_command_card(id, 1, cx);
+                        // run 応答のペインは dispatch が返すが、UI ボタン経路では
+                        // 戻り値を捨てるので「増えたペイン」を差分で拾う
+                        let grown = app
+                            .workspace
+                            .active_tab()
+                            .tree()
+                            .panes()
+                            .iter()
+                            .map(|p| p.id())
+                            .find(|id| !before.3.contains(id));
+                        (id, grown)
+                    })
+                    .unwrap_or((0, None));
+                // 構造（同じタブに 1 枚増える / タブは増えない / フォーカス不動）は同期で決まる
+                let (structure_ok, after_len, tabs_len, focus_kept) = window
+                    .update(cx, |app, _, _| {
+                        let after = app.workspace.active_tab().tree().panes().len();
+                        let tabs = app.workspace.tabs().len();
+                        let focus_kept = app.focused_pane() == before.2;
+                        (
+                            after == before.0 + 1 && tabs == before.1 && focus_kept,
+                            after,
+                            tabs,
+                            focus_kept,
+                        )
+                    })
+                    .unwrap_or((false, 0, 0, false));
+                // 構造の判定はここで確定する。**出力待ちの前に出す**ことで、
+                // 待ち中にウィンドウが閉じた等でこの項目が最後まで走らなかったときも
+                // 「どこまで進んだか」がログに残る
+                eprintln!(
+                    "TAKO_SELF_TEST_666_STRUCTURE: panes {} -> {} tabs={} focus_kept={} new_pane={:?}",
+                    before.0, after_len, tabs_len, focus_kept, run_pane
+                );
+                // 実行はシェル起動 → 出力 → パースを待つ（tmux バックエンド時は attach ぶん遅い）
+                let mut ran = false;
+                for _ in 0..20 {
+                    wait(cx, 400).await;
+                    ran = window
+                        .update(cx, |app, _, _| {
+                            run_pane.and_then(|p| app.terminals.get(&p)).is_some_and(|s| {
+                                s.visible_lines().iter().any(|l| l.contains(marker))
+                            })
+                        })
+                        .unwrap_or(false);
+                    if ran {
+                        break;
+                    }
+                }
+                eprintln!(
+                    "TAKO_SELF_TEST_666_RUN: panes {} -> {} tabs={} focus_kept={} new_pane={:?} ran={}",
+                    before.0, after_len, tabs_len, focus_kept, run_pane, ran
+                );
                 check(
-                    run_ok,
+                    structure_ok && ran,
                     "カードの新規ペイン実行: 同じタブに生えて実行され、フォーカスは動かない (#666)",
                 );
 

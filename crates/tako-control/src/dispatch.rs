@@ -4321,6 +4321,8 @@ fn dispatch_show_command(
                 .and_then(|s| s.cwd())
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_path_buf());
+            let focus = focus.unwrap_or(false);
+            let focused_before = host.workspace().get_tab(tab_id).map(|t| t.tree().focused());
             let new_id = spawn_command_pane(
                 host,
                 origin,
@@ -4331,8 +4333,16 @@ fn dispatch_show_command(
                 cwd.clone(),
                 &command,
                 "never",
-                focus.unwrap_or(false),
+                focus,
             )?;
+            // `split_with_ratio` は新ペインへフォーカスを移す仕様なので、
+            // focus 指定が無いときは元のペインへ戻す（カードの実行は
+            // 「手元のペインに触らない」が要件。FR-2.22.4）
+            if !focus {
+                if let Some(prev) = focused_before.filter(|p| *p != new_id) {
+                    let _ = tree_mut(host.workspace_mut(), tab_id).focus(prev);
+                }
+            }
             // タイトルは Code Runner (#453) と同じ `(>)` 接頭辞 + コマンド先頭
             let head: String = command
                 .lines()
@@ -4355,7 +4365,7 @@ fn dispatch_show_command(
                 "index": idx,
                 "command": command,
                 "cwd": cwd.map(|p| p.display().to_string()),
-                "focus": focus.unwrap_or(false),
+                "focus": focus,
             }))
         }
 
@@ -13976,6 +13986,13 @@ mod tests {
             "論理文字列がそのまま渡る: {:?}",
             cmd.args[1]
         );
+        // 手元のペインのフォーカスを奪わない（split は新ペインへフォーカスを移す仕様なので
+        // 明示的に戻している。この assert を消すと退行が見えなくなる）
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            pane,
+            "既定ではフォーカスが手元のペインに残る"
+        );
         // カードは実行後も残る（他のコマンドを続けて実行できる）
         let listed = dispatch(
             &mut host,
@@ -13984,6 +14001,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(listed["cards"].as_array().unwrap().len(), 1);
+
+        // focus=true を明示したときだけ新ペインへ移る
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("run".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: Some(pane),
+                card: None,
+                index: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["focus"], true);
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            v["pane"].as_u64().unwrap(),
+            "focus=true では新ペインへ移る"
+        );
     }
 
     #[test]
