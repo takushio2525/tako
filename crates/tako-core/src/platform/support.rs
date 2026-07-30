@@ -1138,6 +1138,14 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        key: "tako_show_command",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_sleep_guard",
         macos: Support::Supported,
         windows: Support::Pending {

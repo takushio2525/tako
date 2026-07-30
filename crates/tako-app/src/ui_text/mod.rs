@@ -25,6 +25,7 @@ macro_rules! tr {
 // 移動しないこと
 
 pub mod about;
+pub mod command_card;
 pub mod common;
 pub mod dialog;
 pub mod drawer;

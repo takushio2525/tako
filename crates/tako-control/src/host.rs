@@ -266,6 +266,21 @@ pub trait UiStateHost {
             "agy": { "status": "unsupported" },
         })
     }
+    /// AI コマンド提案カードの保管庫（FR-2.22 / #666）。
+    /// **判定と操作は dispatch に置き、ホストは保管だけ担う**（GUI 不在のホストは None）
+    fn command_cards(&self) -> Option<&tako_core::CommandCards> {
+        None
+    }
+    /// 同上（可変）。カードを持たないホストでは show / run が「未対応」で失敗する
+    fn command_cards_mut(&mut self) -> Option<&mut tako_core::CommandCards> {
+        None
+    }
+    /// クリップボードへの書き込みを要求する（#666 のコピー）。
+    /// GPUI のクリップボード API は `App` を要するため、実装側は保留キューへ積み
+    /// 次の render で流す（`pending_settings_open` と同じ方式）
+    fn queue_clipboard_copy(&mut self, _text: String) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

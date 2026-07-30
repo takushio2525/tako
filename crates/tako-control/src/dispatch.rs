@@ -2475,6 +2475,27 @@ fn dispatch_inner(
             default_effort.as_deref(),
         ),
 
+        // #666: AI コマンド提案カード
+        Request::ShowCommand {
+            action,
+            commands,
+            label,
+            pane,
+            card,
+            index,
+            focus,
+        } => dispatch_show_command(
+            host,
+            origin,
+            action.as_deref().unwrap_or("show"),
+            &commands,
+            label.as_deref(),
+            pane,
+            card,
+            index,
+            focus,
+        ),
+
         // #513: AI 系設定の git ベース共有
         Request::ConfigShare {
             action,
@@ -4165,6 +4186,200 @@ fn welcome_status(host: &dyn ControlHost) -> Value {
         "setup_command": crate::welcome::SETUP_COMMAND,
         "master_command": crate::welcome::MASTER_COMMAND,
     })
+}
+
+// --- AI コマンド提案カード (#666) ---
+
+/// カード 1 枚の JSON 表現。`commands` は**AI が渡した論理文字列そのもの**
+/// （画面の折り返しは一切混ざらない）
+fn command_card_json(card: &tako_core::CommandCard) -> Value {
+    json!({
+        "id": card.id().as_u64(),
+        "pane": card.pane().as_u64(),
+        "label": card.label(),
+        "commands": card.commands(),
+        "count": card.commands().len(),
+    })
+}
+
+/// カード保管庫を持たないホスト（GUI 不在）向けのエラー
+fn cards_unsupported() -> DispatchError {
+    DispatchError::Operation(
+        "コマンド提案カードは GUI（tako-app）が必要（この接続先には保管庫が無い）".into(),
+    )
+}
+
+/// `CommandCardError` → `DispatchError`。入力の不備は InvalidParams、
+/// 対象が見つからないのは Operation（呼び出し方は正しいが状態が合わない）
+fn command_card_err(e: tako_core::CommandCardError) -> DispatchError {
+    match e {
+        tako_core::CommandCardError::CardNotFound { id } => DispatchError::Operation(if id == 0 {
+            "このペインに表示中のコマンドカードが無い".into()
+        } else {
+            e.to_string()
+        }),
+        _ => DispatchError::InvalidParams(e.to_string()),
+    }
+}
+
+/// AI コマンド提案カードの操作（FR-2.22 / #666）。
+///
+/// **UI のボタンもここを通る**（カードのコピー / 実行は UI から dispatch を呼ぶ）。
+/// UI 層に独自のコピー・実行ロジックを置かないことで、CLI / MCP と挙動が一致する
+#[allow(clippy::too_many_arguments)]
+fn dispatch_show_command(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    action: &str,
+    commands: &[String],
+    label: Option<&str>,
+    pane: Option<u64>,
+    card: Option<u64>,
+    index: Option<usize>,
+    focus: Option<bool>,
+) -> Result<Value, DispatchError> {
+    let card_id = card.map(tako_core::CommandCardId::from_raw);
+
+    // 対象カードの所在ペイン。カード ID が明示されていればそこから引ける
+    // （ペイン指定なしの CLI からでも copy / run / dismiss ができる）
+    let card_pane = card_id.and_then(|id| {
+        host.command_cards()
+            .and_then(|c| c.get(id))
+            .map(|c| c.pane().as_u64())
+    });
+
+    match action {
+        "show" => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let store = host.command_cards_mut().ok_or_else(cards_unsupported)?;
+            let id = store
+                .show(target, commands, label)
+                .map_err(command_card_err)?;
+            let store = host.command_cards().ok_or_else(cards_unsupported)?;
+            let shown = store
+                .get(id)
+                .ok_or_else(|| DispatchError::Operation("カードの登録直後に見失った".into()))?;
+            let value = json!({
+                "card": command_card_json(shown),
+                "pane_cards": store.list(Some(shown.pane())).len(),
+                "max_cards_per_pane": tako_core::command_card::MAX_CARDS_PER_PANE,
+            });
+            Ok(value)
+        }
+
+        "list" => {
+            let (_, target) = resolve_pane(host.workspace(), pane.or(card_pane))?;
+            let store = host.command_cards().ok_or_else(cards_unsupported)?;
+            Ok(json!({
+                "pane": target.as_u64(),
+                "cards": store
+                    .list(Some(target))
+                    .into_iter()
+                    .map(command_card_json)
+                    .collect::<Vec<_>>(),
+                "total": store.len(),
+            }))
+        }
+
+        "copy" | "run" => {
+            // カード ID を指定したのに見つからない = 既に閉じたカード（UI のボタンが
+            // 古い ID を握っている等）。「ペイン未指定」より先にこれを言う
+            if let (Some(id), None) = (card_id, card_pane) {
+                return Err(command_card_err(
+                    tako_core::CommandCardError::CardNotFound { id: id.as_u64() },
+                ));
+            }
+            let (tab_id, target) = resolve_pane(host.workspace(), card_pane.or(pane))?;
+            let idx = index.unwrap_or(1);
+            let (resolved_id, command) = {
+                let store = host.command_cards().ok_or_else(cards_unsupported)?;
+                let card = store.resolve(target, card_id).map_err(command_card_err)?;
+                (
+                    card.id().as_u64(),
+                    card.command(idx).map_err(command_card_err)?.to_string(),
+                )
+            };
+            if action == "copy" {
+                if !host.queue_clipboard_copy(command.clone()) {
+                    return Err(DispatchError::Operation(
+                        "クリップボードへ書き込めない（GUI が必要）".into(),
+                    ));
+                }
+                return Ok(json!({
+                    "copied": true,
+                    "card": resolved_id,
+                    "index": idx,
+                    // 論理文字列をそのまま返す（AI 側でも同一性を検証できる）
+                    "command": command,
+                    "bytes": command.len(),
+                }));
+            }
+            // run: 同じタブに新しいペインを分割してそこで実行する。
+            // 手元のペイン（AI と対話中のペイン）には一切書き込まない
+            let cwd = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_path_buf());
+            let new_id = spawn_command_pane(
+                host,
+                origin,
+                tab_id,
+                target,
+                Direction::Down,
+                0.35,
+                cwd.clone(),
+                &command,
+                "never",
+                focus.unwrap_or(false),
+            )?;
+            // タイトルは Code Runner (#453) と同じ `(>)` 接頭辞 + コマンド先頭
+            let head: String = command
+                .lines()
+                .next()
+                .unwrap_or(&command)
+                .chars()
+                .take(24)
+                .collect();
+            if let Some(p) = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .and_then(|t| t.tree_mut().get_mut(new_id))
+            {
+                p.set_title(Some(format!("(>) {head}")));
+            }
+            Ok(json!({
+                "pane": new_id.as_u64(),
+                "from_pane": target.as_u64(),
+                "card": resolved_id,
+                "index": idx,
+                "command": command,
+                "cwd": cwd.map(|p| p.display().to_string()),
+                "focus": focus.unwrap_or(false),
+            }))
+        }
+
+        "dismiss" => {
+            // カード ID 指定なら所在ペインを問わず消せる。省略時は対象ペインの全件
+            let target = if card_id.is_some() {
+                None
+            } else {
+                Some(resolve_pane(host.workspace(), pane)?.1)
+            };
+            let store = host.command_cards_mut().ok_or_else(cards_unsupported)?;
+            let removed = store.dismiss(target, card_id);
+            Ok(json!({
+                "dismissed": removed,
+                "pane": target.map(|p| p.as_u64()),
+                "card": card,
+                "remaining": store.len(),
+            }))
+        }
+
+        other => Err(DispatchError::InvalidParams(format!(
+            "不明な action: {other:?}（show / list / copy / run / dismiss のいずれか）"
+        ))),
+    }
 }
 
 /// RunInteractive / Run 共通: 分割 → コマンド付きセッション起動 → exit マーカーラップ
@@ -8045,6 +8260,10 @@ mod tests {
         /// #614: 確定キーのヒント表示 / ゴースト表示中の Tab 確定（どちらも既定 ON）
         autosuggest_hint: bool,
         autosuggest_tab: bool,
+        /// #666: コマンド提案カードの保管庫
+        command_cards: tako_core::CommandCards,
+        /// #666: クリップボードへ書いた内容（コピー検証用）
+        clipboard: Vec<String>,
     }
 
     impl MockHost {
@@ -8078,6 +8297,8 @@ mod tests {
                 autosuggest: true,
                 autosuggest_hint: true,
                 autosuggest_tab: true,
+                command_cards: tako_core::CommandCards::new(),
+                clipboard: Vec::new(),
             }
         }
 
@@ -8208,6 +8429,16 @@ mod tests {
         }
         fn set_autosuggest_tab(&mut self, enabled: bool) {
             self.autosuggest_tab = enabled;
+        }
+        fn command_cards(&self) -> Option<&tako_core::CommandCards> {
+            Some(&self.command_cards)
+        }
+        fn command_cards_mut(&mut self) -> Option<&mut tako_core::CommandCards> {
+            Some(&mut self.command_cards)
+        }
+        fn queue_clipboard_copy(&mut self, text: String) -> bool {
+            self.clipboard.push(text);
+            true
         }
     }
 
@@ -13610,5 +13841,345 @@ mod tests {
         .unwrap();
         assert_eq!(v["dismissed"], true);
         assert_eq!(v["pane"], pane);
+    }
+
+    // --- #666: AI コマンド提案カード ---
+
+    /// テスト用のリクエスト組み立て（既定値ばかりなので毎回書くと読めない）
+    fn show_command_req(action: &str, commands: &[&str], pane: Option<u64>) -> Request {
+        Request::ShowCommand {
+            action: Some(action.into()),
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+            label: None,
+            pane,
+            card: None,
+            index: None,
+            focus: None,
+        }
+    }
+
+    #[test]
+    fn issue666_showしたコマンドは論理文字列のまま返る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // ペイン幅より確実に長い 1 行（画面から拾うと物理改行が入る種類の文字列）
+        let long = format!("cargo test --workspace -- --nocapture {}", "x".repeat(240));
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: None, // 既定は show
+                commands: vec![long.clone()],
+                label: Some("テストを回す".into()),
+                pane: Some(pane),
+                card: None,
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(v["card"]["pane"], pane);
+        assert_eq!(v["card"]["count"], 1);
+        assert_eq!(v["card"]["label"], "テストを回す");
+        assert_eq!(v["card"]["commands"][0], long);
+        assert_eq!(v["pane_cards"], 1);
+
+        // list でも同じ論理文字列が返る（AI 側で同一性を検証できる）
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(listed["cards"][0]["commands"][0], long);
+        assert_eq!(listed["total"], 1);
+    }
+
+    #[test]
+    fn issue666_copyは論理文字列をクリップボードへ渡す() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let multi = "cd /tmp \\\n  && ls -la";
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo one", multi], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        // index 省略で 1 件目
+        let v = dispatch(
+            &mut host,
+            show_command_req("copy", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["copied"], true);
+        assert_eq!(v["index"], 1);
+        assert_eq!(host.clipboard, vec!["echo one".to_string()]);
+        // index=2 は改行込みでそのまま渡る
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("copy".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: Some(pane),
+                card: None,
+                index: Some(2),
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["command"], multi);
+        assert_eq!(host.clipboard.last().unwrap(), multi);
+    }
+
+    #[test]
+    fn issue666_runは同じタブに新ペインを分割して実行する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let before_panes = host.ws.active_tab().tree().panes().len();
+        let before_tabs = host.ws.tabs().len();
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo 'カード実行' && pwd"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let v = dispatch(
+            &mut host,
+            show_command_req("run", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let new_pane = v["pane"].as_u64().unwrap();
+        assert_ne!(new_pane, pane, "手元のペインで実行してはならない");
+        assert_eq!(v["from_pane"], pane);
+        assert_eq!(v["focus"], false, "既定でフォーカスを奪わない");
+        assert_eq!(host.ws.tabs().len(), before_tabs, "タブを増やさない");
+        assert_eq!(
+            host.ws.active_tab().tree().panes().len(),
+            before_panes + 1,
+            "同じタブにペインが 1 枚増える"
+        );
+        // 新ペインには /bin/sh -c で構造化して渡る（#453 の 127 即死を避ける形）
+        let opts = host
+            .attached_options
+            .get(&new_pane)
+            .expect("セッション起動");
+        let cmd = opts.command.as_ref().expect("コマンド付き起動");
+        assert_eq!(cmd.program, "/bin/sh");
+        assert_eq!(cmd.args[0], "-c");
+        assert!(
+            cmd.args[1].starts_with("echo 'カード実行' && pwd"),
+            "論理文字列がそのまま渡る: {:?}",
+            cmd.args[1]
+        );
+        // カードは実行後も残る（他のコマンドを続けて実行できる）
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(listed["cards"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn issue666_カードid指定はペイン指定なしでも解決できる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let shown = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let card = shown["card"]["id"].as_u64().unwrap();
+        // pane 省略 + card 指定（TAKO_PANE_ID が無い外部シェルからの操作）
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("copy".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: None,
+                card: Some(card),
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["card"], card);
+        assert_eq!(host.clipboard, vec!["echo hi".to_string()]);
+    }
+
+    #[test]
+    fn issue666_dismissはカード単位とペイン単位で効く() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let first = dispatch(
+            &mut host,
+            show_command_req("show", &["echo 1"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo 2"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("dismiss".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: None,
+                card: Some(first),
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["dismissed"], 1);
+        assert_eq!(v["remaining"], 1);
+        // card 省略 = そのペインの全件
+        let v = dispatch(
+            &mut host,
+            show_command_req("dismiss", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["dismissed"], 1);
+        assert_eq!(v["remaining"], 0);
+    }
+
+    #[test]
+    fn issue666_不正な入力は理由つきで拒否される() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // コマンド無し
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &[], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("コマンドが 1 件も"), "{err}");
+        // 空文字列
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &["   "], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("空のコマンド"), "{err}");
+        // エスケープシーケンス混入
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &["echo \x1b[2J"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("制御文字"), "{err}");
+        // 不明 action は選べる値を案内する
+        let err = dispatch(
+            &mut host,
+            show_command_req("explode", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("show / list / copy / run / dismiss"),
+            "{err}"
+        );
+        // カードが無いペインでの copy / run
+        let err = dispatch(
+            &mut host,
+            show_command_req("copy", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("表示中のコマンドカードが無い"),
+            "{err}"
+        );
+        // 範囲外のコマンド番号
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let err = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("run".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: Some(pane),
+                card: None,
+                index: Some(5),
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("コマンド番号が範囲外"), "{err}");
+        assert!(
+            host.clipboard.is_empty(),
+            "失敗した操作で副作用を起こさない"
+        );
+    }
+
+    #[test]
+    fn issue666_消えたカードやペインへの操作はエラーで返る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let card = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        dispatch(
+            &mut host,
+            show_command_req("dismiss", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // 閉じたカードのボタンを押した相当（panic せずエラー）
+        let err = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("run".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: None,
+                card: Some(card),
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("見つからない"), "{err}");
+        // 存在しないペインへの show
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(999_999)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::PaneNotFound(999_999)));
     }
 }
