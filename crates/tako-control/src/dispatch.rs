@@ -6497,7 +6497,12 @@ fn wait_for_screen(
     Ok((last, false))
 }
 
-/// #662: worker が表示中の対話ダイアログの内容を取得する
+/// #662: worker が表示中の対話ダイアログの内容を取得する。
+///
+/// **保留中のダイアログの正はライブ画面**。claude は
+/// ダイアログを表示している間 transcript に何も書かず、`tool_use:AskUserQuestion` は
+/// 回答が確定してから `tool_result` と一緒に現れる（隔離 E2E で実測）。
+/// transcript は「回答後の照会」と将来の claude 変更に備えた補助ソースとして併せて返す
 fn dispatch_orchestrator_dialog(
     host: &dyn ControlHost,
     q: WorkerQuery,
@@ -6505,7 +6510,7 @@ fn dispatch_orchestrator_dialog(
     let pane_id = q.pane_id;
     let target = PaneId::from_raw(pane_id);
 
-    // transcript（第一ソース。ペイン幅に依存しない全文）
+    // transcript（補助ソース。回答確定後にだけ埋まる）
     let backend_session = host.backend_session(target);
     let pane_pid = host.session(target).and_then(|s| s.child_pid());
     let session_id = q
@@ -6574,33 +6579,17 @@ fn dispatch_orchestrator_respond_dialog(
 ) -> Result<Value, DispatchError> {
     use crate::dialog;
 
-    let target = PaneId::from_raw(pane_id);
     let reach = resolve_dialog_reach(host, pane_id)?;
 
     // ダイアログが実際に表示されていることを確認（誤爆防止。#319 から維持）
     let lines = reach.capture()?;
-    let screen = dialog::parse_dialog_screen(&lines).ok_or_else(|| {
+    let mut current = dialog::parse_dialog_screen(&lines).ok_or_else(|| {
         DispatchError::Operation(
             "ペイン画面に対話ダイアログ（AskUserQuestion）が見つからない\
              （既に回答済みか、別の画面状態です）"
                 .to_string(),
         )
     })?;
-
-    // 質問の全文は transcript から取る（画面はペイン幅で切り詰められている）
-    let backend_session = host.backend_session(target);
-    let pane_pid = host.session(target).and_then(|s| s.child_pid());
-    let session_id = auto_resolve_session(backend_session.as_deref(), pane_pid);
-    let pending = session_id
-        .as_deref()
-        .and_then(dialog::pending_for_session)
-        .ok_or_else(|| {
-            DispatchError::Operation(
-                "transcript から質問内容を読めない（session_id を解決できないか、\
-                 保留中の AskUserQuestion が無い）。tako_orchestrator_dialog で状態を確認すること"
-                    .to_string(),
-            )
-        })?;
 
     let specs: Vec<dialog::AnswerSpec> = answers
         .iter()
@@ -6609,53 +6598,75 @@ fn dispatch_orchestrator_respond_dialog(
             options: a.option_list(),
         })
         .collect();
-    let resolved = dialog::resolve_answers(&pending.questions, &specs)
-        .map_err(DispatchError::InvalidParams)?;
 
-    // 既に確認画面にいる場合は選択フェーズを飛ばす（再実行の冪等性）
-    let mut current = screen;
-    if current.stage == dialog::DialogStage::Question {
-        // 表示中の質問から順に答える。TUI は先頭から前進するので、
-        // 現在位置より前の質問には戻れない（＝既に回答済みのはず）
-        let start = current.current_question_index().unwrap_or(0);
-        for answer in resolved.iter().filter(|r| r.question_index >= start) {
-            let question = &pending.questions[answer.question_index];
-            let keys = dialog::keys_for_answer(question, answer);
-            for key in &keys {
-                reach.send_key(key)?;
-                // 各キーの反映を待つ。multiSelect のトグルは同一画面なので
-                // 「画面が変わった」だけでは判定できず、短い固定待ちで足りる
-                std::thread::sleep(std::time::Duration::from_millis(DIALOG_POLL_MS));
-            }
-            // この質問が回答済みになったこと（タブが ☒ / 確認画面へ遷移）を待つ
-            let qi = answer.question_index;
-            let (after, ok) = wait_for_screen(&reach, DIALOG_STEP_BUDGET_MS, |lines| {
-                match dialog::parse_dialog_screen(lines) {
-                    Some(s) => {
-                        s.stage == dialog::DialogStage::Review
-                            || s.tabs.get(qi).is_some_and(|t| t.answered)
-                    }
-                    // ダイアログが消えた = 想定外（Esc 等）。待ち続けない
-                    None => true,
-                }
-            })?;
-            if !ok {
-                return Err(DispatchError::Operation(format!(
-                    "質問 {} への選択が画面に反映されない（送ったキー: {}）。\
-                     tako_orchestrator_dialog で状態を確認すること",
-                    qi + 1,
-                    keys.join(" ")
-                )));
-            }
-            current = dialog::parse_dialog_screen(&after).ok_or_else(|| {
-                DispatchError::Operation(
-                    "回答中にダイアログが消えた（取消されたか、別の画面へ遷移した）".to_string(),
-                )
-            })?;
-            if current.stage == dialog::DialogStage::Review {
-                break;
-            }
+    // 全問ぶんの回答が揃っているかは**タブの数**で先に確かめる
+    // （画面は 1 問ずつしか映さないので、選択肢の解決はその質問が出てから）
+    let assigned =
+        dialog::assign_answers(&current.tabs, &specs).map_err(DispatchError::InvalidParams)?;
+
+    // 選んだラベル（確認画面との照合と応答に使う）
+    let mut chosen: Vec<Value> = Vec::new();
+    let mut chosen_labels: Vec<String> = Vec::new();
+
+    // 表示中の質問から順に答える。TUI は先頭から前進するので、
+    // 現在位置より前の質問には戻れない（＝既に回答済みのはず）
+    while current.stage == dialog::DialogStage::Question {
+        let Some(qi) = current.current_question_index() else {
+            break;
+        };
+        let Some((_, spec)) = assigned.iter().find(|(q, _)| *q == qi) else {
+            return Err(DispatchError::InvalidParams(format!(
+                "質問 {} への回答が指定されていない",
+                qi + 1
+            )));
+        };
+        // **今映っている画面**に対して選択肢を解決する（#662 実測: transcript は
+        // ダイアログ表示中には書かれないので、内容の正は画面しかない）
+        let (keys, labels) =
+            dialog::keys_for_screen_answer(&current, spec).map_err(DispatchError::InvalidParams)?;
+        let header = current
+            .tabs
+            .get(qi)
+            .map(|t| t.header.clone())
+            .unwrap_or_default();
+        chosen.push(json!({
+            "index": qi + 1,
+            "header": header,
+            "question": current.question,
+            "labels": labels,
+        }));
+        chosen_labels.extend(labels);
+
+        for key in &keys {
+            reach.send_key(key)?;
+            // 各キーの反映を待つ。multiSelect のトグルは同一画面なので
+            // 「画面が変わった」だけでは判定できず、短い固定待ちで足りる
+            std::thread::sleep(std::time::Duration::from_millis(DIALOG_POLL_MS));
         }
+        // この質問が回答済みになったこと（タブが ☒ / 確認画面へ遷移）を待つ
+        let (after, ok) = wait_for_screen(&reach, DIALOG_STEP_BUDGET_MS, |lines| {
+            match dialog::parse_dialog_screen(lines) {
+                Some(s) => {
+                    s.stage == dialog::DialogStage::Review
+                        || s.tabs.get(qi).is_some_and(|t| t.answered)
+                }
+                // ダイアログが消えた = 想定外（Esc 等）。待ち続けない
+                None => true,
+            }
+        })?;
+        if !ok {
+            return Err(DispatchError::Operation(format!(
+                "質問 {} への選択が画面に反映されない（送ったキー: {}）。\
+                 tako_orchestrator_dialog で状態を確認すること",
+                qi + 1,
+                keys.join(" ")
+            )));
+        }
+        current = dialog::parse_dialog_screen(&after).ok_or_else(|| {
+            DispatchError::Operation(
+                "回答中にダイアログが消えた（取消されたか、別の画面へ遷移した）".to_string(),
+            )
+        })?;
     }
 
     // 確認画面へ遷移するのを待つ（単一選択の最終問は自動遷移、multiSelect は Tab 済み）
@@ -6670,26 +6681,32 @@ fn dispatch_orchestrator_respond_dialog(
     }
 
     // **送信前の検証**: 確認画面に写っている選択結果が意図と一致するか。
-    // 一致しなければ submit しない（撃ちっぱなしにしないための要）
-    if let Err(e) = dialog::verify_review(&pending.questions, &resolved, &current) {
+    // 一致しなければ submit しない（撃ちっぱなしにしないための要）。
+    //
+    // この呼び出しで 1 問も答えていない = 呼び出し時点で既に確認画面だった
+    // （前回の dry_run 等）。そのときは「自分が選んだラベル」を持っていないので、
+    // 検証を呼び出し側の指定と画面テキストの突き合わせへ切り替える。
+    // 空の `chosen_labels` で `verify_review` を通すと**検証が素通り**になり、
+    // 画面に出ている別の回答をそのまま確定させてしまう
+    let verified = if chosen_labels.is_empty() {
+        dialog::verify_specs_against_review(&specs, &current)
+    } else {
+        dialog::verify_review(&chosen_labels, &current)
+    };
+    if let Err(e) = verified {
         return Err(DispatchError::Operation(format!(
             "確認画面の内容が指定と一致しないため送信しませんでした: {e}"
         )));
     }
 
-    let chosen: Vec<Value> = resolved
-        .iter()
-        .map(|r| {
-            let q = &pending.questions[r.question_index];
-            json!({
-                "question": q.question,
-                "header": q.header,
-                "labels": r.option_indices.iter()
-                    .map(|i| q.options[*i].label.clone())
-                    .collect::<Vec<_>>(),
-            })
-        })
-        .collect();
+    // 既に確認画面だった場合、応答の chosen は画面から埋める（空を返さない）
+    if chosen.is_empty() {
+        chosen = current
+            .review_answers
+            .iter()
+            .map(|a| json!({ "labels": [a] }))
+            .collect();
+    }
 
     if dry_run {
         return Ok(json!({
@@ -6715,8 +6732,7 @@ fn dispatch_orchestrator_respond_dialog(
 
     let caller = caller_role.unwrap_or("unknown");
     crate::diag::persist_log(&format!(
-        "[dialog-respond] caller={caller} pane={pane_id} tool_use={} answers={} submitted={gone} reach={}",
-        pending.tool_use_id,
+        "[dialog-respond] caller={caller} pane={pane_id} answers={} submitted={gone} reach={}",
         chosen.len(),
         reach.label(),
     ));
@@ -6726,7 +6742,6 @@ fn dispatch_orchestrator_respond_dialog(
         "kind": "ask_user_question",
         "responded": true,
         "submitted": gone,
-        "tool_use_id": pending.tool_use_id,
         "chosen": chosen,
         "review_answers": current.review_answers,
         "reach": reach.label(),
@@ -10996,9 +11011,8 @@ mod tests {
     #[test]
     fn respondはchoiceもanswersも無ければ拒否する() {
         let host = MockHost::new();
-        let err =
-            dispatch_orchestrator_respond(&host, host.root_pane(), None, None, false, None)
-                .unwrap_err();
+        let err = dispatch_orchestrator_respond(&host, host.root_pane(), None, None, false, None)
+            .unwrap_err();
         assert!(err.to_string().contains("answers"), "err={err:?}");
     }
 

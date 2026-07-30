@@ -4,14 +4,20 @@
 //! 「内容の取得」と「応答キーの合成」を分け、どちらも純関数として書いてある
 //! （画面文字列と transcript の JSON を渡せばテストできる）。
 //!
-//! # 内容の取得は 2 ソース
+//! # 内容の取得（**保留中の正はライブ画面**）
 //!
-//! - **transcript（第一ソース）**: claude の session JSONL にある `tool_use`
-//!   （name = `AskUserQuestion`）が全文を持つ。**ペイン幅に一切依存しない**のが決定的で、
-//!   幅 11〜25 桁の worker ペインでは画面パースは原理的に成立しない（#662 の報告 3）
-//! - **ライブ画面（第二ソース）**: 「今どの質問を表示しているか」「どの選択肢が
-//!   ハイライトされているか」「どれが回答済みか」はここからしか取れない。
-//!   キー合成と送信前検証に使う
+//! - **ライブ画面（保留中の唯一のソース）**: 表示中の質問・選択肢・ハイライト・
+//!   回答済みタブ・multiSelect のチェック状態。キー合成と送信前検証もここが根拠。
+//!   画面は **1 問ずつしか映さない**ので、選択肢の解決も 1 問ずつ行う
+//! - **transcript（補助）**: session JSONL の `tool_use`（name = `AskUserQuestion`）は
+//!   質問と選択肢の全文を持つ。当初はこちらを第一ソースにする設計だったが、
+//!   **claude はダイアログを表示している間 transcript に何も書かない**ことを
+//!   隔離 E2E で実測した（`tool_use` の行は回答が確定してから `tool_result` と
+//!   一緒に現れる）。保留中の内容取得には使えないので、回答後の照会と、
+//!   将来 claude が挙動を変えた場合に備えて読める形だけ残してある
+//!
+//! ペイン幅の制約は残る（狭いペインではラベルが折り返しで欠ける）。
+//! **番号指定は常に確実**なので、エラー文はそちらへ誘導する
 //!
 //! # 実測した操作モデル（claude v2.1.220。#662 に採取画面あり）
 //!
@@ -396,118 +402,139 @@ fn is_rule_line(t: &str) -> bool {
 // ---------------------------------------------------------------------------
 // 応答キーの合成
 // ---------------------------------------------------------------------------
+//
+// **解決の対象はライブ画面**であって transcript ではない。#662 の隔離 E2E で
+// 「claude はダイアログを表示している間 transcript に何も書かない」ことを実測した
+// （`tool_use:AskUserQuestion` の行は **回答が確定してから** `tool_result` と一緒に
+// 現れる）。したがって保留中のダイアログの内容は画面からしか取れない。
+//
+// 画面は 1 問ずつしか映さないので、解決も 1 問ずつ「今映っている画面に対して」行う。
 
 /// 1 問への回答指定（呼び出し側 = master が渡す）
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnswerSpec {
-    /// 対象の質問。1 始まりの番号、または header の前方一致。省略時は順番に割り当てる
+    /// 対象の質問。1 始まりの番号、またはタブ見出しの前方一致。省略時は順番に割り当てる
     pub question: Option<String>,
     /// 選ぶ選択肢。1 始まりの番号、または label の前方一致。multiSelect では複数指定可
     pub options: Vec<String>,
 }
 
-/// 回答を選択肢インデックス（0 始まり）へ解決する。
-/// 番号指定とラベル前方一致の両方を受ける
-pub fn resolve_option(question: &DialogQuestion, spec: &str) -> Result<usize, String> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return Err("選択肢が空".to_string());
+/// 数字キーで選べる選択肢の上限。TUI は選択肢を `1.`〜`9.` と振り、
+/// 選択は数字キー 1 発（実測モデル）。2 桁は 1 打鍵にならないのでここで打ち切る
+pub const MAX_NUMBER_KEY_OPTION: usize = 9;
+
+impl DialogScreen {
+    /// この画面が multiSelect の質問か（チェックボックス付きの選択肢がある）
+    pub fn is_multi_select(&self) -> bool {
+        self.options.iter().any(|o| o.checked.is_some())
     }
-    // 番号指定
-    if let Ok(n) = spec.parse::<usize>() {
-        if n == 0 || n > question.options.len() {
-            return Err(format!(
-                "選択肢 {n} は範囲外（1〜{}）: {}",
-                question.options.len(),
-                labels_hint(question)
-            ));
-        }
-        return Ok(n - 1);
-    }
-    // ラベルの完全一致 → 前方一致 → 部分一致（曖昧なら拒否）
-    let lower = spec.to_lowercase();
-    let exact: Vec<usize> = question
-        .options
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| o.label.to_lowercase() == lower)
-        .map(|(i, _)| i)
-        .collect();
-    if exact.len() == 1 {
-        return Ok(exact[0]);
-    }
-    let matches: Vec<usize> = question
-        .options
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| o.label.to_lowercase().starts_with(&lower))
-        .map(|(i, _)| i)
-        .collect();
-    match matches.len() {
-        1 => Ok(matches[0]),
-        0 => {
-            let contains: Vec<usize> = question
-                .options
-                .iter()
-                .enumerate()
-                .filter(|(_, o)| o.label.to_lowercase().contains(&lower))
-                .map(|(i, _)| i)
-                .collect();
-            match contains.len() {
-                1 => Ok(contains[0]),
-                0 => Err(format!(
-                    "選択肢 '{spec}' に一致するものが無い: {}",
-                    labels_hint(question)
-                )),
-                _ => Err(format!(
-                    "選択肢 '{spec}' が複数に一致して曖昧: {}",
-                    labels_hint(question)
-                )),
-            }
-        }
-        _ => Err(format!(
-            "選択肢 '{spec}' が複数に一致して曖昧: {}",
-            labels_hint(question)
-        )),
+
+    /// 「Type something.」「Chat about this」のような、質問の選択肢ではない項目を除いた一覧。
+    /// 番号を撃ち間違えないよう **番号は画面のまま**保持する
+    pub fn answer_options(&self) -> Vec<&ScreenOption> {
+        self.options
+            .iter()
+            .filter(|o| !is_meta_option(&o.label))
+            .collect()
     }
 }
 
-fn labels_hint(question: &DialogQuestion) -> String {
-    question
+/// TUI が常に足す定型項目（回答の選択肢ではない）
+fn is_meta_option(label: &str) -> bool {
+    let l = label.trim().to_lowercase();
+    l.starts_with("type something") || l.starts_with("chat about this")
+}
+
+/// 画面の選択肢一覧を「1. ラベル / 2. ラベル」の形にした案内文（エラーに添える）
+fn screen_labels_hint(screen: &DialogScreen) -> String {
+    screen
         .options
         .iter()
-        .enumerate()
-        .map(|(i, o)| format!("{}. {}", i + 1, o.label))
+        .map(|o| format!("{}. {}", o.number, o.label))
         .collect::<Vec<_>>()
         .join(" / ")
 }
 
-/// 質問の指定（番号 or header）を index へ解決する
-pub fn resolve_question(questions: &[DialogQuestion], spec: &str) -> Result<usize, String> {
+/// 回答指定を、**今画面に映っている選択肢**へ解決する。
+///
+/// 番号指定（`"2"`）とラベル一致（完全 → 前方 → 部分）の両方を受ける。
+/// ラベルは狭いペインだと折り返しで欠けることがあるため、**番号指定が最も確実**
+pub fn resolve_screen_option<'a>(
+    screen: &'a DialogScreen,
+    spec: &str,
+) -> Result<&'a ScreenOption, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("選択肢が空".to_string());
+    }
+    if let Ok(n) = spec.parse::<usize>() {
+        return screen
+            .options
+            .iter()
+            .find(|o| o.number == n)
+            .ok_or_else(|| format!("選択肢 {n} は画面に無い: {}", screen_labels_hint(screen)));
+    }
+
+    let lower = spec.to_lowercase();
+    let pick = |pred: &dyn Fn(&str) -> bool| -> Vec<&'a ScreenOption> {
+        screen
+            .options
+            .iter()
+            .filter(|o| pred(&o.label.to_lowercase()))
+            .collect()
+    };
+    let exact = pick(&|l: &str| l == lower);
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    let prefix = pick(&|l: &str| l.starts_with(&lower));
+    match prefix.len() {
+        1 => return Ok(prefix[0]),
+        n if n > 1 => {
+            return Err(format!(
+                "選択肢 '{spec}' が複数に一致して曖昧: {}",
+                screen_labels_hint(screen)
+            ))
+        }
+        _ => {}
+    }
+    let contains = pick(&|l: &str| l.contains(&lower));
+    match contains.len() {
+        1 => Ok(contains[0]),
+        0 => Err(format!(
+            "選択肢 '{spec}' に一致するものが無い: {}（狭いペインではラベルが折り返しで欠けます。番号で指定してください）",
+            screen_labels_hint(screen)
+        )),
+        _ => Err(format!(
+            "選択肢 '{spec}' が複数に一致して曖昧: {}",
+            screen_labels_hint(screen)
+        )),
+    }
+}
+
+/// 質問の指定（番号 or タブ見出し）を index へ解決する
+pub fn resolve_question_tab(tabs: &[QuestionTab], spec: &str) -> Result<usize, String> {
     let spec = spec.trim();
     if let Ok(n) = spec.parse::<usize>() {
-        if n == 0 || n > questions.len() {
-            return Err(format!("質問 {n} は範囲外（1〜{}）", questions.len()));
+        if n == 0 || n > tabs.len() {
+            return Err(format!("質問 {n} は範囲外（1〜{}）", tabs.len()));
         }
         return Ok(n - 1);
     }
     let lower = spec.to_lowercase();
-    let matches: Vec<usize> = questions
+    let matches: Vec<usize> = tabs
         .iter()
         .enumerate()
-        .filter(|(_, q)| {
-            q.header.to_lowercase().starts_with(&lower) || q.header.to_lowercase() == lower
-        })
+        .filter(|(_, t)| t.header.to_lowercase().starts_with(&lower))
         .map(|(i, _)| i)
         .collect();
     match matches.len() {
         1 => Ok(matches[0]),
         0 => Err(format!(
             "質問 '{spec}' に一致するものが無い: {}",
-            questions
-                .iter()
+            tabs.iter()
                 .enumerate()
-                .map(|(i, q)| format!("{}. {}", i + 1, q.header))
+                .map(|(i, t)| format!("{}. {}", i + 1, t.header))
                 .collect::<Vec<_>>()
                 .join(" / ")
         )),
@@ -515,108 +542,84 @@ pub fn resolve_question(questions: &[DialogQuestion], spec: &str) -> Result<usiz
     }
 }
 
-/// 数字キーで選べる選択肢の上限。TUI は選択肢を `1.`〜`9.` と振り、
-/// 選択は数字キー 1 発（実測モデル）。2 桁は 1 打鍵にならないのでここで打ち切る
-pub const MAX_NUMBER_KEY_OPTION: usize = 9;
-
-/// 解決済みの回答（質問 index → 選択肢 index の集合）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedAnswer {
-    pub question_index: usize,
-    pub option_indices: Vec<usize>,
-}
-
-/// `AnswerSpec` の並びを質問 index つきへ解決する。
+/// 回答指定の並びを「質問 index → 回答指定」へ割り当てる。
 ///
-/// - `question` 省略時は「先頭から順に 1 問ずつ」割り当てる
-/// - 全問に回答が要る（claude は未回答のまま submit できない）ので、
-///   質問数と回答数の不一致はここで弾く
-/// - multiSelect でない質問に複数指定したらエラー
-pub fn resolve_answers(
-    questions: &[DialogQuestion],
-    specs: &[AnswerSpec],
-) -> Result<Vec<ResolvedAnswer>, String> {
-    if specs.len() != questions.len() {
+/// 画面は 1 問ずつしか映さないので、**ここでは選択肢まで解決しない**
+/// （その質問が表示された時点で `resolve_screen_option` する）。
+/// 全問に答えないと送信できないので、件数の不一致はここで弾く
+pub fn assign_answers<'a>(
+    tabs: &[QuestionTab],
+    specs: &'a [AnswerSpec],
+) -> Result<Vec<(usize, &'a AnswerSpec)>, String> {
+    if specs.len() != tabs.len() {
         return Err(format!(
             "回答数が質問数と一致しない（質問 {} 問に対し回答 {} 件）。\
              全問に答えないと送信できない: {}",
-            questions.len(),
+            tabs.len(),
             specs.len(),
-            questions
-                .iter()
+            tabs.iter()
                 .enumerate()
-                .map(|(i, q)| format!("{}. {}", i + 1, q.header))
+                .map(|(i, t)| format!("{}. {}", i + 1, t.header))
                 .collect::<Vec<_>>()
                 .join(" / ")
         ));
     }
-    let mut out: Vec<ResolvedAnswer> = Vec::new();
+    let mut out: Vec<(usize, &AnswerSpec)> = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
         let qi = match spec.question.as_deref() {
-            Some(s) => resolve_question(questions, s)?,
+            Some(s) => resolve_question_tab(tabs, s)?,
             None => i,
         };
-        if out.iter().any(|r| r.question_index == qi) {
+        if out.iter().any(|(q, _)| *q == qi) {
             return Err(format!("質問 {} への回答が重複している", qi + 1));
         }
-        let q = &questions[qi];
         if spec.options.is_empty() {
             return Err(format!("質問 {} への選択肢が空", qi + 1));
         }
-        if spec.options.len() > 1 && !q.multi_select {
-            return Err(format!(
-                "質問 {} は単一選択なのに {} 件指定されている",
-                qi + 1,
-                spec.options.len()
-            ));
-        }
-        let mut indices = Vec::new();
-        for o in &spec.options {
-            let oi = resolve_option(q, o)?;
-            if indices.contains(&oi) {
-                return Err(format!(
-                    "質問 {} で選択肢 {} が重複している",
-                    qi + 1,
-                    oi + 1
-                ));
-            }
-            // 選択は数字キー 1 発で行う（実測モデル）ので 2 桁は撃てない。
-            // 黙って壊れたキーを送らず、代替手段を添えて断る
-            if oi + 1 > MAX_NUMBER_KEY_OPTION {
-                return Err(format!(
-                    "質問 {} の選択肢 {} は数字キーで選べない（{MAX_NUMBER_KEY_OPTION} 番まで）。\
-                     tako_send_keys で down / enter を送って操作すること",
-                    qi + 1,
-                    oi + 1
-                ));
-            }
-            indices.push(oi);
-        }
-        out.push(ResolvedAnswer {
-            question_index: qi,
-            option_indices: indices,
-        });
+        out.push((qi, spec));
     }
-    // 質問の表示順に並べる（TUI は先頭から順に前進する）
-    out.sort_by_key(|r| r.question_index);
+    out.sort_by_key(|(qi, _)| *qi);
     Ok(out)
 }
 
-/// 1 問に答えるためのキー列。
+/// 今映っている質問に答えるためのキー列と、選んだラベル。
 ///
 /// 単一選択は「番号キー 1 発」（選択 + 自動前進）。multiSelect は
 /// 「番号キーで各選択肢をトグル → Tab で次へ」。実測モデルどおり
-pub fn keys_for_answer(question: &DialogQuestion, answer: &ResolvedAnswer) -> Vec<String> {
-    let mut keys: Vec<String> = answer
-        .option_indices
-        .iter()
-        .map(|i| (i + 1).to_string())
-        .collect();
-    if question.multi_select {
+pub fn keys_for_screen_answer(
+    screen: &DialogScreen,
+    spec: &AnswerSpec,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    if spec.options.len() > 1 && !screen.is_multi_select() {
+        return Err(format!(
+            "この質問は単一選択なのに {} 件指定されている",
+            spec.options.len()
+        ));
+    }
+    let mut keys = Vec::new();
+    let mut labels = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    for s in &spec.options {
+        let option = resolve_screen_option(screen, s)?;
+        if seen.contains(&option.number) {
+            return Err(format!("選択肢 {} が重複している", option.number));
+        }
+        if option.number > MAX_NUMBER_KEY_OPTION {
+            return Err(format!(
+                "選択肢 {} は数字キーで選べない（{MAX_NUMBER_KEY_OPTION} 番まで）。\
+                 tako_send_keys で down / enter を送って操作すること",
+                option.number
+            ));
+        }
+        seen.push(option.number);
+        keys.push(option.number.to_string());
+        labels.push(option.label.clone());
+    }
+    if screen.is_multi_select() {
         // multiSelect はトグルするだけでは前進しないので明示的に Tab
         keys.push("tab".to_string());
     }
-    keys
+    Ok((keys, labels))
 }
 
 /// 確認画面で「送信」を選ぶキー。ハイライトは既定で `1. Submit answers` に乗っているので
@@ -633,29 +636,58 @@ pub fn keys_for_submit(screen: &DialogScreen) -> Vec<String> {
     }
 }
 
-/// 確認画面の内容が意図と一致するかを検証する。
+/// **既に確認画面に居る状態**で呼ばれたときの検証（#662）。
 ///
-/// 画面はペイン幅で切り詰められている可能性があるので、**完全一致は求めない**。
-/// 「選んだラベルの先頭部分が確認画面の該当行に現れているか」を見る。
-/// 一致しなければ呼び出し側は submit してはいけない
-pub fn verify_review(
-    questions: &[DialogQuestion],
-    answers: &[ResolvedAnswer],
+/// この呼び出しでは 1 問も答えていない（前回の `dry_run` 等で選択済み）ため、
+/// 「何を選んだか」を自分で知らない。確認画面のテキストと**呼び出し側の指定**を
+/// 突き合わせるしかない:
+///
+/// - ラベル指定（`"青い海"`）: 確認画面に現れているかを見れば検証できる
+/// - 番号指定（`"2"`）: 参照先の選択肢一覧がもう画面に無いので**検証不能**。
+///   検証できないものを黙って送信すると「指定と違う回答を確定させる」事故になるため断る
+pub fn verify_specs_against_review(
+    specs: &[AnswerSpec],
     screen: &DialogScreen,
 ) -> Result<(), String> {
     if screen.stage != DialogStage::Review {
         return Err("確認画面に到達していない".to_string());
     }
     let joined = screen.review_answers.join(" / ");
-    for answer in answers {
-        let q = &questions[answer.question_index];
-        for oi in &answer.option_indices {
-            let label = &q.options[*oi].label;
-            if !review_mentions(&joined, label) {
+    for spec in specs {
+        for option in &spec.options {
+            if option.trim().parse::<usize>().is_ok() {
                 return Err(format!(
-                    "確認画面に '{label}' が見つからない（画面: {joined}）"
+                    "既に確認画面まで進んでいるため、番号指定 '{option}' が\
+                     何を指すか検証できません（選択肢一覧が画面に無い）。\
+                     確認画面の内容は「{joined}」です。この内容でよければ\
+                     ラベルで指定し直してください"
                 ));
             }
+            if !review_mentions(&joined, option) {
+                return Err(format!(
+                    "確認画面に '{option}' が見つからない（画面: {joined}）"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 確認画面の内容が意図と一致するかを検証する。
+///
+/// 画面はペイン幅で切り詰められている可能性があるので、**完全一致は求めない**。
+/// 「選んだラベルの先頭部分が確認画面の該当行に現れているか」を見る。
+/// 一致しなければ呼び出し側は submit してはいけない
+pub fn verify_review(chosen_labels: &[String], screen: &DialogScreen) -> Result<(), String> {
+    if screen.stage != DialogStage::Review {
+        return Err("確認画面に到達していない".to_string());
+    }
+    let joined = screen.review_answers.join(" / ");
+    for label in chosen_labels {
+        if !review_mentions(&joined, label) {
+            return Err(format!(
+                "確認画面に '{label}' が見つからない（画面: {joined}）"
+            ));
         }
     }
     Ok(())
@@ -772,38 +804,6 @@ Do you want to proceed?\n\
 
     fn screen(s: &str) -> Vec<String> {
         s.lines().map(str::to_string).collect()
-    }
-
-    fn q(header: &str, question: &str, multi: bool, labels: &[&str]) -> DialogQuestion {
-        DialogQuestion {
-            question: question.into(),
-            header: header.into(),
-            multi_select: multi,
-            options: labels
-                .iter()
-                .map(|l| DialogOption {
-                    label: (*l).into(),
-                    description: String::new(),
-                })
-                .collect(),
-        }
-    }
-
-    fn two_questions() -> Vec<DialogQuestion> {
-        vec![
-            q(
-                "色",
-                "好きな色はどれ?",
-                false,
-                &["赤い夕焼け", "青い海", "緑の森"],
-            ),
-            q(
-                "食べ物",
-                "好きな食べ物はどれ?",
-                false,
-                &["寿司", "ラーメン", "カレー"],
-            ),
-        ]
     }
 
     // --- transcript 側 ---
@@ -934,53 +934,82 @@ Do you want to proceed?\n\
         assert!(parse_dialog_screen(&[]).is_none());
     }
 
-    // --- 回答の解決 ---
+    // --- 回答の解決（**画面が対象**。transcript は保留中に書かれない = #662 実測） ---
 
-    #[test]
-    fn 選択肢は番号でもラベルでも解決できる() {
-        let qs = two_questions();
-        assert_eq!(resolve_option(&qs[0], "2").unwrap(), 1);
-        assert_eq!(resolve_option(&qs[0], "青い海").unwrap(), 1);
-        // 前方一致
-        assert_eq!(resolve_option(&qs[0], "青い").unwrap(), 1);
-        // 部分一致
-        assert_eq!(resolve_option(&qs[0], "夕焼け").unwrap(), 0);
+    fn q1() -> DialogScreen {
+        parse_dialog_screen(&screen(SINGLE_Q1)).unwrap()
+    }
+    fn multi() -> DialogScreen {
+        parse_dialog_screen(&screen(MULTI)).unwrap()
     }
 
     #[test]
-    fn 範囲外や不一致の選択肢はエラー() {
-        let qs = two_questions();
-        let e = resolve_option(&qs[0], "9").unwrap_err();
-        assert!(e.contains("範囲外"), "{e}");
-        let e = resolve_option(&qs[0], "0").unwrap_err();
-        assert!(e.contains("範囲外"), "{e}");
-        let e = resolve_option(&qs[0], "紫").unwrap_err();
+    fn 選択肢は番号でもラベルでも解決できる() {
+        let s = q1();
+        assert_eq!(resolve_screen_option(&s, "2").unwrap().label, "青い海");
+        assert_eq!(resolve_screen_option(&s, "青い海").unwrap().number, 2);
+        // 前方一致
+        assert_eq!(resolve_screen_option(&s, "青い").unwrap().number, 2);
+        // 部分一致
+        assert_eq!(resolve_screen_option(&s, "夕焼け").unwrap().number, 1);
+    }
+
+    #[test]
+    fn 画面に無い番号や不一致ラベルはエラー() {
+        let s = q1();
+        let e = resolve_screen_option(&s, "9").unwrap_err();
+        assert!(e.contains("画面に無い"), "{e}");
+        let e = resolve_screen_option(&s, "紫").unwrap_err();
         assert!(e.contains("一致するものが無い"), "{e}");
-        // 候補が示されるので master が撃ち直せる
+        // 候補と「番号で指定せよ」の案内が付く（master が撃ち直せる）
         assert!(e.contains("青い海"), "{e}");
+        assert!(e.contains("番号で指定"), "{e}");
+        assert!(resolve_screen_option(&s, "").is_err());
     }
 
     #[test]
     fn 曖昧なラベル指定は拒否する() {
-        let q1 = q("色", "Q", false, &["青い海", "青い空"]);
-        let e = resolve_option(&q1, "青い").unwrap_err();
+        let s = DialogScreen {
+            stage: DialogStage::Question,
+            tabs: vec![QuestionTab {
+                header: "色".into(),
+                answered: false,
+            }],
+            question: "Q".into(),
+            options: vec![
+                ScreenOption {
+                    number: 1,
+                    label: "青い海".into(),
+                    highlighted: true,
+                    checked: None,
+                },
+                ScreenOption {
+                    number: 2,
+                    label: "青い空".into(),
+                    highlighted: false,
+                    checked: None,
+                },
+            ],
+            review_answers: vec![],
+        };
+        let e = resolve_screen_option(&s, "青い").unwrap_err();
         assert!(e.contains("曖昧"), "{e}");
         // 完全一致なら曖昧でも解決できる
-        assert_eq!(resolve_option(&q1, "青い海").unwrap(), 0);
+        assert_eq!(resolve_screen_option(&s, "青い海").unwrap().number, 1);
     }
 
     #[test]
-    fn 質問は番号でもheaderでも解決できる() {
-        let qs = two_questions();
-        assert_eq!(resolve_question(&qs, "2").unwrap(), 1);
-        assert_eq!(resolve_question(&qs, "食べ物").unwrap(), 1);
-        assert!(resolve_question(&qs, "9").is_err());
-        assert!(resolve_question(&qs, "音楽").is_err());
+    fn 質問はタブの番号でも見出しでも解決できる() {
+        let tabs = q1().tabs;
+        assert_eq!(resolve_question_tab(&tabs, "2").unwrap(), 1);
+        assert_eq!(resolve_question_tab(&tabs, "食べ物").unwrap(), 1);
+        assert!(resolve_question_tab(&tabs, "9").is_err());
+        assert!(resolve_question_tab(&tabs, "音楽").is_err());
     }
 
     #[test]
     fn 回答は順番に割り当てられる() {
-        let qs = two_questions();
+        let tabs = q1().tabs;
         let specs = vec![
             AnswerSpec {
                 question: None,
@@ -991,16 +1020,16 @@ Do you want to proceed?\n\
                 options: vec!["カレー".into()],
             },
         ];
-        let r = resolve_answers(&qs, &specs).unwrap();
-        assert_eq!(r[0].question_index, 0);
-        assert_eq!(r[0].option_indices, vec![1]);
-        assert_eq!(r[1].question_index, 1);
-        assert_eq!(r[1].option_indices, vec![2]);
+        let assigned = assign_answers(&tabs, &specs).unwrap();
+        assert_eq!(assigned[0].0, 0);
+        assert_eq!(assigned[0].1.options, vec!["2"]);
+        assert_eq!(assigned[1].0, 1);
+        assert_eq!(assigned[1].1.options, vec!["カレー"]);
     }
 
     #[test]
     fn 質問を明示指定すると順不同でも並べ替える() {
-        let qs = two_questions();
+        let tabs = q1().tabs;
         let specs = vec![
             AnswerSpec {
                 question: Some("食べ物".into()),
@@ -1011,68 +1040,29 @@ Do you want to proceed?\n\
                 options: vec!["緑の森".into()],
             },
         ];
-        let r = resolve_answers(&qs, &specs).unwrap();
-        assert_eq!(r[0].question_index, 0);
-        assert_eq!(r[0].option_indices, vec![2]);
-        assert_eq!(r[1].question_index, 1);
-        assert_eq!(r[1].option_indices, vec![0]);
+        let assigned = assign_answers(&tabs, &specs).unwrap();
+        assert_eq!(assigned[0].0, 0);
+        assert_eq!(assigned[0].1.options, vec!["緑の森"]);
+        assert_eq!(assigned[1].0, 1);
+        assert_eq!(assigned[1].1.options, vec!["寿司"]);
     }
 
     #[test]
     fn 回答数が質問数と違えばエラー() {
-        let qs = two_questions();
+        let tabs = q1().tabs;
         let specs = vec![AnswerSpec {
             question: None,
             options: vec!["1".into()],
         }];
-        let e = resolve_answers(&qs, &specs).unwrap_err();
+        let e = assign_answers(&tabs, &specs).unwrap_err();
         assert!(e.contains("回答数が質問数と一致しない"), "{e}");
         // どの質問が残っているかを示す
         assert!(e.contains("食べ物"), "{e}");
     }
 
     #[test]
-    fn 単一選択に複数指定はエラー() {
-        let qs = two_questions();
-        let specs = vec![
-            AnswerSpec {
-                question: None,
-                options: vec!["1".into(), "2".into()],
-            },
-            AnswerSpec {
-                question: None,
-                options: vec!["1".into()],
-            },
-        ];
-        let e = resolve_answers(&qs, &specs).unwrap_err();
-        assert!(e.contains("単一選択"), "{e}");
-    }
-
-    /// 10 番目以降は数字キー 1 発で選べない。壊れたキー（"10"）を送らずに断り、
-    /// 代替手段（tako_send_keys の矢印操作）を案内する
-    #[test]
-    fn 十番目以降の選択肢は数字キーで選べないと断る() {
-        let labels: Vec<String> = (1..=12).map(|i| format!("案 {i}")).collect();
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let qs = vec![q("案", "どれ?", false, &refs)];
-        let specs = vec![AnswerSpec {
-            question: None,
-            options: vec!["10".into()],
-        }];
-        let e = resolve_answers(&qs, &specs).unwrap_err();
-        assert!(e.contains("数字キーで選べない"), "{e}");
-        assert!(e.contains("tako_send_keys"), "{e}");
-        // 9 番目までは通る
-        let specs = vec![AnswerSpec {
-            question: None,
-            options: vec!["9".into()],
-        }];
-        assert_eq!(resolve_answers(&qs, &specs).unwrap()[0].option_indices, [8]);
-    }
-
-    #[test]
     fn 同じ質問への重複回答はエラー() {
-        let qs = two_questions();
+        let tabs = q1().tabs;
         let specs = vec![
             AnswerSpec {
                 question: Some("色".into()),
@@ -1083,7 +1073,7 @@ Do you want to proceed?\n\
                 options: vec!["2".into()],
             },
         ];
-        let e = resolve_answers(&qs, &specs).unwrap_err();
+        let e = assign_answers(&tabs, &specs).unwrap_err();
         assert!(e.contains("重複"), "{e}");
     }
 
@@ -1091,23 +1081,91 @@ Do you want to proceed?\n\
 
     #[test]
     fn 単一選択のキーは番号一発() {
-        let qs = two_questions();
-        let a = ResolvedAnswer {
-            question_index: 0,
-            option_indices: vec![1],
+        let s = q1();
+        let spec = AnswerSpec {
+            question: None,
+            options: vec!["青い海".into()],
         };
-        assert_eq!(keys_for_answer(&qs[0], &a), vec!["2"]);
+        let (keys, labels) = keys_for_screen_answer(&s, &spec).unwrap();
+        assert_eq!(keys, vec!["2"]);
+        assert_eq!(labels, vec!["青い海"]);
     }
 
     /// multiSelect は「番号でトグル → Tab で前進」（数字だけでは前進しない実測モデル）
     #[test]
     fn multiselectのキーはトグルとtab() {
-        let mq = q("果物", "Q", true, &["りんご", "みかん", "ぶどう", "もも"]);
-        let a = ResolvedAnswer {
-            question_index: 0,
-            option_indices: vec![0, 2],
+        let s = multi();
+        assert!(s.is_multi_select());
+        let spec = AnswerSpec {
+            question: None,
+            options: vec!["りんご".into(), "ぶどう".into()],
         };
-        assert_eq!(keys_for_answer(&mq, &a), vec!["1", "3", "tab"]);
+        let (keys, labels) = keys_for_screen_answer(&s, &spec).unwrap();
+        assert_eq!(keys, vec!["1", "3", "tab"]);
+        assert_eq!(labels, vec!["りんご", "ぶどう"]);
+    }
+
+    #[test]
+    fn 単一選択に複数指定はエラー() {
+        let s = q1();
+        assert!(!s.is_multi_select());
+        let spec = AnswerSpec {
+            question: None,
+            options: vec!["1".into(), "2".into()],
+        };
+        let e = keys_for_screen_answer(&s, &spec).unwrap_err();
+        assert!(e.contains("単一選択"), "{e}");
+    }
+
+    #[test]
+    fn 同じ選択肢の重複指定はエラー() {
+        let s = multi();
+        let spec = AnswerSpec {
+            question: None,
+            options: vec!["1".into(), "りんご".into()],
+        };
+        let e = keys_for_screen_answer(&s, &spec).unwrap_err();
+        assert!(e.contains("重複"), "{e}");
+    }
+
+    /// 10 番目以降は数字キー 1 発で選べない。壊れたキー（"10"）を送らずに断り、
+    /// 代替手段（tako_send_keys の矢印操作）を案内する
+    #[test]
+    fn 十番目以降の選択肢は数字キーで選べないと断る() {
+        let mut s = q1();
+        s.options.push(ScreenOption {
+            number: 10,
+            label: "十番目".into(),
+            highlighted: false,
+            checked: None,
+        });
+        let spec = AnswerSpec {
+            question: None,
+            options: vec!["十番目".into()],
+        };
+        let e = keys_for_screen_answer(&s, &spec).unwrap_err();
+        assert!(e.contains("数字キーで選べない"), "{e}");
+        assert!(e.contains("tako_send_keys"), "{e}");
+    }
+
+    /// TUI が常に足す定型項目は「回答の選択肢」から外して数える
+    /// （番号自体は画面のまま保つので撃ち間違えない）
+    #[test]
+    fn 定型項目は回答選択肢から外れる() {
+        let s = q1();
+        let real: Vec<&str> = s
+            .answer_options()
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(real, vec!["赤い夕焼け", "青い海", "緑の森"]);
+        // 番号は画面のまま
+        assert_eq!(s.answer_options()[1].number, 2);
+        // それでも Type something を明示指定すれば選べる（自由記述へ入る導線）
+        assert_eq!(
+            resolve_screen_option(&s, "4").unwrap().label,
+            "Type something."
+        );
     }
 
     #[test]
@@ -1140,61 +1198,68 @@ Do you want to proceed?\n\
 
     #[test]
     fn 確認画面が意図と一致すれば検証を通る() {
-        let qs = two_questions();
-        let answers = vec![
-            ResolvedAnswer {
-                question_index: 0,
-                option_indices: vec![1],
-            },
-            ResolvedAnswer {
-                question_index: 1,
-                option_indices: vec![2],
-            },
-        ];
         let s = parse_dialog_screen(&screen(REVIEW)).unwrap();
-        verify_review(&qs, &answers, &s).expect("青い海 / カレー が一致する");
+        verify_review(&["青い海".to_string(), "カレー".to_string()], &s)
+            .expect("青い海 / カレー が一致する");
     }
 
     /// 別の選択肢が写っていたら submit させない（撃ちっぱなし防止の要）
     #[test]
     fn 確認画面が意図と違えば検証で落ちる() {
-        let qs = two_questions();
-        let answers = vec![
-            ResolvedAnswer {
-                question_index: 0,
-                option_indices: vec![0], // 赤い夕焼けを選んだつもり
-            },
-            ResolvedAnswer {
-                question_index: 1,
-                option_indices: vec![2],
-            },
-        ];
         let s = parse_dialog_screen(&screen(REVIEW)).unwrap();
-        let e = verify_review(&qs, &answers, &s).unwrap_err();
+        let e = verify_review(&["赤い夕焼け".to_string(), "カレー".to_string()], &s).unwrap_err();
         assert!(e.contains("赤い夕焼け"), "{e}");
     }
 
     #[test]
     fn 確認画面に到達していなければ検証で落ちる() {
-        let qs = two_questions();
-        let s = parse_dialog_screen(&screen(SINGLE_Q1)).unwrap();
-        let e = verify_review(&qs, &[], &s).unwrap_err();
+        let s = q1();
+        let e = verify_review(&[], &s).unwrap_err();
         assert!(e.contains("到達していない"), "{e}");
+    }
+
+    /// 既に確認画面まで進んでいる状態（前回の dry_run 等）での再呼び出し。
+    /// このとき「選んだラベル」を持っていないので、空の `chosen_labels` で
+    /// `verify_review` を通すと検証が素通りしてしまう。指定と画面を突き合わせる
+    #[test]
+    fn 確認画面から再開したときは指定と画面を突き合わせる() {
+        let s = parse_dialog_screen(&screen(REVIEW)).unwrap();
+        // ラベル指定は画面と照合できる
+        let ok = vec![
+            AnswerSpec {
+                question: None,
+                options: vec!["青い海".into()],
+            },
+            AnswerSpec {
+                question: None,
+                options: vec!["カレー".into()],
+            },
+        ];
+        verify_specs_against_review(&ok, &s).expect("画面と一致する");
+
+        // 画面と違うラベルは弾く
+        let ng = vec![AnswerSpec {
+            question: None,
+            options: vec!["赤い夕焼け".into()],
+        }];
+        let e = verify_specs_against_review(&ng, &s).unwrap_err();
+        assert!(e.contains("赤い夕焼け"), "{e}");
+
+        // 番号指定は参照先が画面に無いので検証不能 → 送信しない
+        let num = vec![AnswerSpec {
+            question: None,
+            options: vec!["2".into()],
+        }];
+        let e = verify_specs_against_review(&num, &s).unwrap_err();
+        assert!(e.contains("検証できません"), "{e}");
+        // 何が確定しようとしているかを示して、やり直し方を案内する
+        assert!(e.contains("青い海"), "{e}");
+        assert!(e.contains("ラベルで指定"), "{e}");
     }
 
     /// ペイン幅で切り詰められた確認画面でも照合できる
     #[test]
     fn 幅で切れた確認画面でも先頭一致で検証できる() {
-        let qs = vec![q(
-            "方針",
-            "Q",
-            false,
-            &["既存ビルドで今すぐ差し替え（推奨）"],
-        )];
-        let answers = vec![ResolvedAnswer {
-            question_index: 0,
-            option_indices: vec![0],
-        }];
         let s = DialogScreen {
             stage: DialogStage::Review,
             tabs: vec![],
@@ -1203,22 +1268,31 @@ Do you want to proceed?\n\
             // 画面幅で途中まで
             review_answers: vec!["既存ビルドで今".into()],
         };
-        verify_review(&qs, &answers, &s).expect("先頭 6 文字で一致する");
+        verify_review(&["既存ビルドで今すぐ差し替え（推奨）".to_string()], &s)
+            .expect("先頭 6 文字で一致する");
     }
 
     #[test]
     fn json化に必要なフィールドが載る() {
         let p = PendingDialog {
             tool_use_id: "t1".into(),
-            questions: two_questions(),
+            questions: vec![DialogQuestion {
+                question: "好きな色はどれ?".into(),
+                header: "色".into(),
+                multi_select: false,
+                options: vec![DialogOption {
+                    label: "青い海".into(),
+                    description: "寒色系".into(),
+                }],
+            }],
         };
         let v = p.to_json();
         assert_eq!(v["tool_use_id"], "t1");
         assert_eq!(v["questions"][0]["index"], 1);
         assert_eq!(v["questions"][0]["header"], "色");
         assert_eq!(v["questions"][0]["multi_select"], false);
-        assert_eq!(v["questions"][0]["options"][1]["index"], 2);
-        assert_eq!(v["questions"][0]["options"][1]["label"], "青い海");
+        assert_eq!(v["questions"][0]["options"][0]["index"], 1);
+        assert_eq!(v["questions"][0]["options"][0]["label"], "青い海");
 
         let s = parse_dialog_screen(&screen(REVIEW)).unwrap();
         let sv = s.to_json();

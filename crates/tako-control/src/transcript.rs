@@ -453,7 +453,9 @@ mod tests {
         assert_eq!(sorted.len(), roots.len(), "探索先に重複がある: {roots:?}");
         // 既定の ~/.claude/projects は必ず候補に入る（後方互換）
         if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            let default = std::path::PathBuf::from(home).join(".claude").join("projects");
+            let default = std::path::PathBuf::from(home)
+                .join(".claude")
+                .join("projects");
             assert!(
                 roots.contains(&default),
                 "既定の探索先が落ちている: {roots:?}"

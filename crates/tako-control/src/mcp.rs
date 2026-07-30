@@ -1757,13 +1757,17 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_dialog",
             "description": "worker が表示中の対話ダイアログの内容を構造化して取得する（#662）。\
                 worker が AskUserQuestion で選択を求めて止まっているとき、\
-                質問文と選択肢の**全文**を JSON で読める。\
-                内容は claude の transcript から取るのでペイン幅に依存しない\
-                （tako_read_pane は狭いペインだと折り返しで判読できない）。\
+                生画面を読まずに質問・選択肢・現在位置を JSON で取れる。\
                 応答の kind は ask_user_question / permission / none。\
-                questions が transcript 由来の全文（質問ごとの options と multi_select）、\
-                screen がライブ画面由来の現在位置（stage=question|review、どのタブが回答済みか、\
-                どの選択肢がハイライト中か、multiSelect のチェック状態）。\
+                screen が本体で、stage（question = 質問表示中 / review = 送信前の確認画面）、\
+                tabs（質問ごとの見出しと回答済みフラグ）、question（表示中の質問文）、\
+                options（番号・ラベル・ハイライト・multiSelect のチェック状態）を返す。\
+                **画面は 1 問ずつしか映さない**ので、次の質問の選択肢は前の質問に答えると見える。\
+                questions は claude の transcript 由来の全文だが、claude は\
+                **ダイアログ表示中は transcript に書かない**（回答確定後に書く）ため、\
+                保留中は基本 null になる（実測。回答後の照会では埋まる）。\
+                狭いペインではラベルが折り返しで欠けることがあるので、\
+                回答は**番号指定が最も確実**。全文を読みたいときは tako_resize_pane で広げる。\
                 回答は tako_orchestrator_respond の answers で行う。",
             "inputSchema": {
                 "type": "object",
@@ -1781,10 +1785,13 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_respond",
             "description": "worker のダイアログに応答する（#319 / #662）。2 種類のダイアログを扱う。\
                 \n(1) 対話ダイアログ = AskUserQuestion（worker が選択肢を出して止まっている）: \
-                answers に質問ごとの選択を渡す。選択肢は番号（\"2\"）でもラベルの前方一致（\"青い海\"）でもよい。\
+                answers に質問ごとの選択を渡す。選択肢は番号（\"2\"）でもラベルの前方一致（\"青い海\"）でもよいが、\
+                狭いペインではラベルが折り返しで欠けるため**番号が最も確実**。\
                 複数質問はそれぞれに 1 要素を渡す（全問に答えないと送信できない）。\
                 multiSelect の質問は options に複数指定する。\
                 内容は先に tako_orchestrator_dialog で確認すること。\
+                2 問目以降の選択肢は画面に出るまで見えないので、\
+                ラベル指定が不安なときは 1 問ずつ答えて dialog で確認するとよい。\
                 \n(2) permission ダイアログ（ツール実行の承認要求）: choice に番号または yes/no を渡す。\
                 \n誤爆防止: ダイアログが画面に無ければエラー。さらに AskUserQuestion では\
                 送信前に確認画面へ写った選択結果を照合し、指定と一致しなければ**送信せずエラー**を返す。\

@@ -6005,7 +6005,9 @@ mod tests {
         assert_eq!(parsed[1].option_list(), vec!["カレー"]);
 
         // 質問を明示指定（= の左が質問）
-        let parsed = parse_dialog_answers(&["色=青い海".into()]).unwrap().unwrap();
+        let parsed = parse_dialog_answers(&["色=青い海".into()])
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed[0].question.as_deref(), Some("色"));
         assert_eq!(parsed[0].option_list(), vec!["青い海"]);
 
