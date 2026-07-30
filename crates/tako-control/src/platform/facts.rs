@@ -147,8 +147,13 @@ mod tests {
             !win.degraded.is_empty(),
             "Windows は現状 pending があるはず"
         );
+        // #657 まで macOS 側の縮退はゼロだったが、in-window メニューバーだけは
+        // 「Windows は自前描画なので開閉できる / macOS はメニューを OS が所有するので
+        // tako から開閉できない」という逆向きの差になった。ここで「macOS は縮退ゼロ」を
+        // 固定し直すと宣言と実態の食い違いを通してしまうので、**両方向とも
+        // マトリクスから生成されている**ことだけを見る
         let mac = PlatformFacts::for_platform(Platform::MacOs);
-        assert!(mac.degraded.is_empty(), "macOS に縮退は無いはず");
+        assert_eq!(mac.degraded, support::degraded_note_items(Platform::MacOs));
     }
 
     /// **受け入れ条件 2**: 縮退が 1 件増えると注記も自動で 1 件増える。

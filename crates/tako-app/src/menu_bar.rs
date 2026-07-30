@@ -1123,9 +1123,10 @@ mod tests {
         let top = MENU_TRIGGER_TOP;
         let height = MENU_TRIGGER_HEIGHT;
         assert!(top > 0.0);
-        assert!(
-            top + height <= MENU_BAR_HEIGHT.max(height),
-            "トリガーが行から溢れない"
-        );
+        // 「行から溢れない」は行を持つ環境（Windows）だけの不変条件。
+        // macOS は `MENU_BAR_HEIGHT == 0` で行を描かないので対象外
+        if MENU_BAR_HEIGHT > 0.0 {
+            assert!(top + height <= MENU_BAR_HEIGHT, "トリガーが行から溢れない");
+        }
     }
 }

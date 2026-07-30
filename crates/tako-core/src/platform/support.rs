@@ -1293,16 +1293,28 @@ mod tests {
         assert!(features(Platform::MacOs, Some("pending")).is_empty());
     }
 
-    /// prompt 注入用。同じ理由文が何十件も並ばないよう重複は畳む
+    /// prompt 注入用。同じ理由文が何十件も並ばないよう重複は畳む。
+    ///
+    /// **#657 まで macOS 側の縮退はゼロだった**（macOS 先行開発なので当然）。
+    /// in-window メニューバーだけは「Windows は自前描画なので開閉できる / macOS は
+    /// メニューを OS が所有するので tako から開閉できない」という**逆向きの差**に
+    /// なったため、macOS 側にも縮退が入りうる前提へ改めた。ここを
+    /// 「macOS は縮退ゼロ」で固定し直すと、宣言と実態の食い違い（= AI への誤情報）を
+    /// 通してしまう（このファイルのモジュール doc「この表を直したら」を参照）
     #[test]
     fn 縮退理由の一覧は重複しない() {
-        let notes = degraded_notes(Platform::Windows);
-        assert!(!notes.is_empty());
-        let mut dedup = notes.clone();
-        dedup.sort_unstable();
-        dedup.dedup();
-        assert_eq!(dedup.len(), notes.len(), "degraded_notes に重複がある");
-        assert!(degraded_notes(Platform::MacOs).is_empty());
+        for platform in [Platform::Windows, Platform::MacOs] {
+            let notes = degraded_notes(platform);
+            assert!(!notes.is_empty(), "{platform:?} の縮退理由が空");
+            let mut dedup = notes.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(
+                dedup.len(),
+                notes.len(),
+                "{platform:?} の degraded_notes に重複がある"
+            );
+        }
     }
 
     #[test]
