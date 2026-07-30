@@ -142,6 +142,15 @@ pub mod notes {
         "動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない",
         "Video preview is implemented with macOS AVFoundation, so it cannot play on Windows",
     );
+    /// #657: メニューは macOS では OS のグローバルメニューバーが所有するので、
+    /// tako 側から開閉できない（項目の実行と一覧は OS メニューでも成立する）。
+    /// **これは Windows の縮退ではなく macOS 側の縮退**という珍しい向きの例
+    pub const MAC_MENU_IS_OS_OWNED: Note = Note::new(
+        "メニューは OS のメニューバーが所有するため tako から開閉できない（open / close は不可）。\
+         構成の取得 list と項目の実行 invoke は使える",
+        "The menu is owned by the OS menu bar, so tako cannot open or close it \
+         (open / close unavailable). Listing the structure and invoking items both work",
+    );
     /// #521: プレビューの中身のうち PDF / 動画だけが欠ける
     pub const WIN_PREVIEW_NO_PDF: Note = Note::new(
         "コード・Markdown・画像は表示できる。PDF と動画は macOS 実装のため表示できない",
@@ -524,6 +533,16 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_logs",
         macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
+        key: "tako_menu",
+        // macOS はメニューが OS のメニューバーに載るので tako から開閉できない
+        // （構成の取得 list と項目の実行 invoke は動く）。Windows は自前描画の
+        // メニューバー行なので全操作が使える（#657）
+        macos: Support::Degraded {
+            note: notes::MAC_MENU_IS_OS_OWNED,
+        },
         windows: Support::Supported,
     },
     Feature {
@@ -1274,16 +1293,28 @@ mod tests {
         assert!(features(Platform::MacOs, Some("pending")).is_empty());
     }
 
-    /// prompt 注入用。同じ理由文が何十件も並ばないよう重複は畳む
+    /// prompt 注入用。同じ理由文が何十件も並ばないよう重複は畳む。
+    ///
+    /// **#657 まで macOS 側の縮退はゼロだった**（macOS 先行開発なので当然）。
+    /// in-window メニューバーだけは「Windows は自前描画なので開閉できる / macOS は
+    /// メニューを OS が所有するので tako から開閉できない」という**逆向きの差**に
+    /// なったため、macOS 側にも縮退が入りうる前提へ改めた。ここを
+    /// 「macOS は縮退ゼロ」で固定し直すと、宣言と実態の食い違い（= AI への誤情報）を
+    /// 通してしまう（このファイルのモジュール doc「この表を直したら」を参照）
     #[test]
     fn 縮退理由の一覧は重複しない() {
-        let notes = degraded_notes(Platform::Windows);
-        assert!(!notes.is_empty());
-        let mut dedup = notes.clone();
-        dedup.sort_unstable();
-        dedup.dedup();
-        assert_eq!(dedup.len(), notes.len(), "degraded_notes に重複がある");
-        assert!(degraded_notes(Platform::MacOs).is_empty());
+        for platform in [Platform::Windows, Platform::MacOs] {
+            let notes = degraded_notes(platform);
+            assert!(!notes.is_empty(), "{platform:?} の縮退理由が空");
+            let mut dedup = notes.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(
+                dedup.len(),
+                notes.len(),
+                "{platform:?} の degraded_notes に重複がある"
+            );
+        }
     }
 
     #[test]

@@ -603,6 +603,24 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_menu",
+            "description": "アプリメニュー（ファイル / 編集 / 表示 / ウインドウ / ヘルプ）の操作。\
+                action: list = メニュー構成と開閉状態を取得（項目のアクション名とショートカットつき）、\
+                open = メニューを開く、close = 閉じる、invoke = 項目を実行。\
+                open / close は Windows の in-window メニューバーだけで使える（macOS はメニューが\
+                OS のメニューバーに載るため tako から開閉できない）。invoke は両 OS で使える。\
+                メニューに実在する項目だけが対象。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "open", "close", "invoke"], "description": "省略時は list" },
+                    "menu": { "type": "string", "description": "open: メニュー名（完全一致 → 前方一致 → 部分一致で解決。添字も可）" },
+                    "path": { "type": "string", "description": "invoke: 「メニュー名/項目名」または項目名のみ（例: ファイル/新規タブ、新規タブ、表示/パネル/git ビュー）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_move_pane_to_tab",
             "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、\
                 target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = \
@@ -3222,6 +3240,26 @@ fn build_request(
                 }
             }
         }
+        "tako_menu" => {
+            let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
+            match action.as_str() {
+                "list" => Request::MenuList,
+                "open" => Request::MenuOpen {
+                    menu: str_arg(args, "menu")?
+                        .ok_or_else(|| "open には menu が必要".to_string())?,
+                },
+                "close" => Request::MenuClose,
+                "invoke" => Request::MenuInvoke {
+                    path: str_arg(args, "path")?
+                        .ok_or_else(|| "invoke には path が必要".to_string())?,
+                },
+                other => {
+                    return Err(format!(
+                        "action が不正: {other}（list | open | close | invoke）"
+                    ))
+                }
+            }
+        }
         "tako_move_pane_to_tab" => {
             let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);
             Request::MovePane {
@@ -4606,7 +4644,7 @@ mod tests {
         let tools = tools();
         // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 125);
+        assert_eq!(tools.len(), 126);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -92,6 +92,55 @@ impl WindowStateOp {
     }
 }
 
+/// in-window メニューバー（Issue #657）への操作。`WindowStateOp` と同じく、
+/// dispatch は「何をするか」だけを UI 層へ渡し、実適用は UI 層が行う
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuOp {
+    /// 指定メニューを開く（`MenuBarSnapshot::menus` の添字）
+    Open(usize),
+    /// 開いているメニューを閉じる
+    Close,
+    /// 項目のアクションを発火する（`tako::NewTab` のようなアクション名）
+    Invoke(String),
+}
+
+/// メニューバーの構成と状態のスナップショット（Issue #657）。
+///
+/// UI 層がメニュー定義を持つので、`UiStateHost` 経由で受け取って JSON 化する
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MenuBarSnapshot {
+    /// この環境で in-window メニューバーを描くか（macOS は OS のメニューバーへ
+    /// 載るので false。`false` のとき open / close は行えない）
+    pub in_window: bool,
+    /// 開いているメニュー名（`in_window == false` なら常に None）
+    pub open: Option<String>,
+    pub menus: Vec<MenuSnapshot>,
+}
+
+/// メニュー 1 枚（Issue #657）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MenuSnapshot {
+    pub name: String,
+    pub items: Vec<MenuItemSnapshot>,
+}
+
+/// メニュー項目 1 つ（Issue #657）。サブメニューは 1 段だけ入れ子になる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuItemSnapshot {
+    Separator,
+    Action {
+        label: String,
+        /// アクション名（`tako::NewTab`）。`MenuOp::Invoke` に渡す値
+        action: String,
+        /// 表示用のショートカット（`Ctrl+Shift+T`）
+        shortcut: Option<String>,
+    },
+    Submenu {
+        label: String,
+        items: Vec<MenuItemSnapshot>,
+    },
+}
+
 /// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。FR-2.16.6 で agents は
 /// tmux ビューへ統合済み。git は git graph（FR-3.6）実装までプレースホルダ表示）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +358,17 @@ pub enum Request {
         #[serde(default)]
         window: Option<u64>,
     },
+    /// メニューバーの構成と開閉状態を返す（Issue #657）
+    MenuList,
+    /// メニューを開く（Issue #657）。`menu` はメニュー名（完全一致 → 前方一致 →
+    /// 部分一致の順に解決）。in-window メニューバーを持たない環境ではエラー
+    MenuOpen { menu: String },
+    /// 開いているメニューを閉じる（Issue #657）
+    MenuClose,
+    /// メニュー項目のアクションを発火する（Issue #657）。`path` は
+    /// 「メニュー名/項目名」または項目名のみ（全メニュー横断で解決）。
+    /// サブメニュー内は「表示/パネル/git ビュー」のように 3 段で書ける
+    MenuInvoke { path: String },
     /// ペインの移動（FR-2.5.10 / FR-1.10）。`tab` 指定 = 別タブの末尾へ移送（従来動作）、
     /// `target` 指定 = そのペインを `direction`（省略時は右）へ分割した位置に挿し直す
     /// （同タブ内の並べ替え = タイトルバー D&D と同等。タブまたぎも可）。

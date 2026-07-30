@@ -160,6 +160,12 @@ pub fn minimize() -> &'static str {
 pub fn zoom_window() -> &'static str {
     tr!("拡大 / 縮小", "Zoom")
 }
+/// Windows 版の「拡大 / 縮小」（#657）。GPUI Windows の `zoom()` は `SW_MAXIMIZE`
+/// 固定でトグルにならないため、tako 側で最大化 ↔ 復元を出し分ける。macOS の
+/// 「拡大 / 縮小」と違って**状態が明確な 2 択**なので、Windows 慣習の語で書く
+pub fn maximize_restore() -> &'static str {
+    tr!("最大化 / 元のサイズに戻す", "Maximize / Restore")
+}
 pub fn next_tab() -> &'static str {
     tr!("次のタブ", "Next Tab")
 }
@@ -243,6 +249,7 @@ mod tests {
                 toggle_fullscreen().to_string(),
                 minimize().to_string(),
                 zoom_window().to_string(),
+                maximize_restore().to_string(),
                 next_tab().to_string(),
                 prev_tab().to_string(),
                 select_pane().to_string(),
