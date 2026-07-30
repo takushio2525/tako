@@ -15991,11 +15991,20 @@ fn view_menu() -> gpui::Menu {
     ])
 }
 
-/// 「ウインドウ」メニュー（#657）。`zoom_label` だけプラットフォームで違う
-/// （macOS = 「拡大 / 縮小」のトグル、Windows = 「最大化 / 元のサイズに戻す」）
-fn window_menu(zoom_label: &'static str) -> gpui::Menu {
+/// 「ウインドウ」メニュー（#657）。ズーム項目のラベルだけプラットフォームで違う
+/// （macOS = 「拡大 / 縮小」のトグル、Windows = 「最大化 / 元のサイズに戻す」）。
+///
+/// ラベルの選択は呼び出し側の `#[cfg]` ではなく**この中の `cfg!`** で行う。
+/// `#[cfg]` で片方の呼び出しを消すと、使われなくなった `ui_text::menu` の関数が
+/// **dead_code になり `clippy -D warnings` の CI が落ちる**（macOS で実際に落ちた）
+fn window_menu() -> gpui::Menu {
     use crate::ui_text::menu as m;
     use gpui::{Menu, MenuItem};
+    let zoom_label = if cfg!(target_os = "macos") {
+        m::zoom_window()
+    } else {
+        m::maximize_restore()
+    };
     Menu::new(m::window()).items(vec![
         MenuItem::action(m::minimize(), MinimizeWindow),
         MenuItem::action(zoom_label, ZoomWindow),
@@ -16039,7 +16048,7 @@ fn app_menus() -> Vec<gpui::Menu> {
         Menu::new(m::file()).items(file_menu_common_items()),
         edit_menu(),
         view_menu(),
-        window_menu(m::zoom_window()),
+        window_menu(),
         Menu::new(m::help()).items(vec![
             MenuItem::action(m::documentation(), OpenDocumentation),
             MenuItem::action(m::report_issue(), ReportIssue),
@@ -16076,7 +16085,7 @@ fn app_menus() -> Vec<gpui::Menu> {
         Menu::new(m::file()).items(file_items),
         edit_menu(),
         view_menu(),
-        window_menu(m::maximize_restore()),
+        window_menu(),
         Menu::new(m::help()).items(vec![
             MenuItem::action(m::about(), AboutTako),
             MenuItem::action(m::check_updates(), CheckForUpdates),
