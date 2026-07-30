@@ -323,6 +323,9 @@ impl TakoApp {
                         .flex()
                         .flex_col()
                         .overflow_y_scroll()
+                        .when_some(crate::scroll_diag_handle("filetree"), |d, h| {
+                            d.track_scroll(&h)
+                        })
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let path = row.entry.path.clone();
                             let is_dir = row.entry.is_dir;

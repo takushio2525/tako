@@ -9203,6 +9203,8 @@ impl TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // #654: 生デルタを残す（OS 設定由来の 0 / 巨大値をここで見分ける）
+        scroll_diag_wheel("terminal-pane", &event.delta);
         let Some(cell) = self.cell_size_for_pane(pane_id) else {
             return;
         };
@@ -14692,6 +14694,7 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        scroll_diag_report();
         // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
         // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
         // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
@@ -15741,6 +15744,156 @@ thread_local! {
     /// `TAKO_IME_DIAG=1` のときに前フレームで観測した状態（遷移だけ記録するため）
     static IME_DIAG_LAST: std::cell::Cell<Option<(bool, Option<bool>)>> =
         const { std::cell::Cell::new(None) };
+}
+
+// ===== スクロール不能の切り分け診断（`TAKO_SCROLL_DIAG=1`。#654） =====
+//
+// 「スクロールできない」は原因が 3 層に散らばり、症状からは区別できない:
+//
+// 1. **OS から届くホイール量がおかしい**。Windows は `SPI_GETWHEELSCROLLLINES`
+//    をそのまま倍率に使う（gpui rev `cafbf4b5` の `handle_mouse_wheel_msg`）ので、
+//    「スクロールする行数」が 0 なら delta が常に 0 になり、
+//    「一画面ずつ」（`WHEEL_PAGESCROLL` = `u32::MAX`）なら 1 ノッチで端まで飛ぶ。
+//    どちらもユーザーには「スクロールできない」に見えるが、tako 側は無罪
+// 2. **イベントが対象要素へ届いていない**。gpui はカーソル位置の hit test に
+//    そのコンテナの hitbox が積まれていることを要求し、手前に `occlude()` した
+//    要素があるとそこで打ち切られる（`Window::hit_test`）
+// 3. **そもそもスクロールできる余地が無い**（`max_offset` が 0）。コンテンツが
+//    コンテナに収まっている、または taffy が子を圧縮している（#494）
+//
+// この診断は 1〜3 を分離して perf.log へ出す。**既定では何もしない**。
+//
+// 制限: ハンドルは名前 1 個につき 1 本なので、複数ウィンドウで同じビューが描かれて
+// いる場合は**最後に描かれた方**の値が出る（#339 のビューポート方式では同じ
+// `TakoApp` が全ウィンドウの root になる）。切り分けのときはウィンドウを 1 枚にする。
+thread_local! {
+    /// 名前 → スクロールコンテナのハンドル（診断が有効なときだけ積む）
+    static SCROLL_DIAG_HANDLES: std::cell::RefCell<Vec<(&'static str, gpui::ScrollHandle)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// 直近に一覧を出した時刻（毎フレーム出すと perf.log が溢れる）
+    static SCROLL_DIAG_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 一覧を出す間隔。ホイール到達ログは間引かないので、動かない瞬間の
+/// 「余地はあるのに offset が動かない」は 1 秒以内に必ず突き合わせられる
+const SCROLL_DIAG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// 診断が有効かどうか。**render とホイールごとに呼ばれるので必ずキャッシュする**
+/// （`std::env::var` は毎回ロックと確保を伴う。#168 / #212 で UI スレッドの毎フレーム
+/// 処理を削ってきた経緯があり、診断で増やしては本末転倒）。`ime_diag_enabled` と同じ作法
+pub(crate) fn scroll_diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_SCROLL_DIAG").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 名前つき `ScrollHandle` を貸す（診断が有効なときだけ）。
+///
+/// 呼び出し側は `when_some` で `track_scroll` に渡す。診断 OFF なら `None` =
+/// 要素の組み立ては一切変わらない（スクロール位置は従来どおり element state 側）
+pub(crate) fn scroll_diag_handle(name: &'static str) -> Option<gpui::ScrollHandle> {
+    if !scroll_diag_enabled() {
+        return None;
+    }
+    SCROLL_DIAG_HANDLES.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some((_, h)) = m.iter().find(|(n, _)| *n == name) {
+            return Some(h.clone());
+        }
+        let h = gpui::ScrollHandle::new();
+        m.push((name, h.clone()));
+        Some(h)
+    })
+}
+
+/// 既に `track_scroll` されているコンテナ（プレビュー等）を名前で登録する
+pub(crate) fn scroll_diag_track(name: &'static str, h: &gpui::ScrollHandle) {
+    if !scroll_diag_enabled() {
+        return;
+    }
+    SCROLL_DIAG_HANDLES.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.iter().any(|(n, _)| *n == name) {
+            m.push((name, h.clone()));
+        }
+    });
+}
+
+/// ホイールの生デルタを 1 行にする（層 1 の切り分け。純粋関数）。
+///
+/// Windows の `ScrollDelta::Lines` は OS 設定を掛けた値がそのまま来るので、
+/// ここに出るのが 0 なら「スクロールする行数 = 0」、極端に大きければ
+/// 「一画面ずつ」設定であって tako 側の不具合ではない
+pub(crate) fn scroll_delta_note(delta: &ScrollDelta) -> String {
+    match delta {
+        ScrollDelta::Lines(l) => format!("lines x={:.3} y={:.3}", l.x, l.y),
+        ScrollDelta::Pixels(p) => {
+            format!("pixels x={:.1} y={:.1}", f32::from(p.x), f32::from(p.y))
+        }
+    }
+}
+
+/// スクロールコンテナ 1 個の状態を 1 行にする（層 2・3 の切り分け。純粋関数）
+pub(crate) fn scroll_diag_line(
+    name: &str,
+    max_offset_y: f32,
+    offset_y: f32,
+    bounds: gpui::Bounds<Pixels>,
+) -> String {
+    format!(
+        "scroll-diag: {name} scrollable_y={max_offset_y:.1} offset_y={offset_y:.1} \
+         bounds=({:.1},{:.1} {:.1}x{:.1})",
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.y),
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height)
+    )
+}
+
+/// ホイールが届いた事実と生デルタを残す（間引かない）
+pub(crate) fn scroll_diag_wheel(target: &str, delta: &ScrollDelta) {
+    if scroll_diag_enabled() {
+        tako_control::diag::perf_log(&format!(
+            "scroll-diag: wheel -> {target} ({})",
+            scroll_delta_note(delta)
+        ));
+    }
+}
+
+/// 各コンテナの「スクロールできる余地」と現在位置を一覧する（1 秒に 1 回）
+pub(crate) fn scroll_diag_report() {
+    if !scroll_diag_enabled() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if SCROLL_DIAG_AT
+        .with(|c| c.get())
+        .is_some_and(|t| now.duration_since(t) < SCROLL_DIAG_INTERVAL)
+    {
+        return;
+    }
+    SCROLL_DIAG_AT.with(|c| c.set(Some(now)));
+    let lines: Vec<String> = SCROLL_DIAG_HANDLES.with(|m| {
+        m.borrow()
+            .iter()
+            .map(|(name, h)| {
+                scroll_diag_line(
+                    name,
+                    f32::from(h.max_offset().y),
+                    f32::from(h.offset().y),
+                    h.bounds(),
+                )
+            })
+            .collect()
+    });
+    for line in lines {
+        tako_control::diag::perf_log(&line);
+    }
 }
 
 /// IME コールバックの到達順を記録する（`TAKO_IME_DIAG=1` のときだけ）。
@@ -24156,6 +24309,57 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod scroll_diag_tests {
+    use super::{scroll_delta_note, scroll_diag_line};
+    use gpui::{point, px, size, Bounds, ScrollDelta};
+
+    // #654: 「スクロールできない」の切り分けは、まず OS から届いたホイール量を
+    // 見分けられることが前提。Windows は SPI_GETWHEELSCROLLLINES をそのまま
+    // 倍率に使うので、設定が 0 なら delta も 0、「一画面ずつ」なら u32::MAX 倍に
+    // なる。この 2 つがログから読めなければ tako の不具合と切り分けられない
+
+    #[test]
+    fn 行デルタが0なら0と読める() {
+        let note = scroll_delta_note(&ScrollDelta::Lines(point(0.0, 0.0)));
+        assert_eq!(note, "lines x=0.000 y=0.000");
+    }
+
+    #[test]
+    fn 極端に大きい行デルタも桁が読める() {
+        // 「一画面ずつ」設定（WHEEL_PAGESCROLL）で起きる桁。丸めて 0 に見せない
+        let note = scroll_delta_note(&ScrollDelta::Lines(point(0.0, 4.294967e9)));
+        assert!(
+            note.contains("4294967"),
+            "巨大デルタが読める形で出る: {note}"
+        );
+    }
+
+    #[test]
+    fn ピクセルデルタは種別が区別できる() {
+        let note = scroll_delta_note(&ScrollDelta::Pixels(point(px(0.0), px(-57.5))));
+        assert_eq!(note, "pixels x=0.0 y=-57.5");
+    }
+
+    #[test]
+    fn コンテナ行はスクロール余地と位置を両方持つ() {
+        // 余地 0 =「そもそも動かせない」、余地ありで offset が動かない =
+        // 「イベントが届いていない」。この 2 語が同じ行に無いと切り分けられない
+        let line = scroll_diag_line(
+            "fleet",
+            786.4,
+            -285.0,
+            Bounds {
+                origin: point(px(640.8), px(81.6)),
+                size: size(px(319.2), px(486.4)),
+            },
+        );
+        assert!(line.contains("scrollable_y=786.4"), "{line}");
+        assert!(line.contains("offset_y=-285.0"), "{line}");
+        assert!(line.contains("bounds=(640.8,81.6 319.2x486.4)"), "{line}");
+    }
 }
 
 #[cfg(test)]
