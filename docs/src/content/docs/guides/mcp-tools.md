@@ -26,6 +26,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | ツール名 | 説明 |
 |---|---|
 | `tako_send_input` | ペインにテキストを送信（claude TUI へは送達確認付き） |
+| `tako_send_keys` | ペインに特殊キーを送信（enter / esc / 矢印 / ctrl-c 等。TUI の選択 UI 操作用） |
 | `tako_read_pane` | ペインの画面内容を取得 |
 | `tako_set_title` | ペインのタイトル・役割ラベルを設定 |
 
@@ -118,6 +119,8 @@ start / stop / status / devices は従来どおり AI から操作できます�
 | `tako_orchestrator_spawn` | 子 worker を起動（`tab` / `pane` で出力先を指定） |
 | `tako_orchestrator_run` | spawn + 完了待ち + 出力回収 + 片付けをワンショット実行 |
 | `tako_orchestrator_worker_status` | worker の状態確認 |
+| `tako_orchestrator_dialog` | worker が表示中の対話ダイアログの内容取得（質問文・選択肢を全文で） |
+| `tako_orchestrator_respond` | worker のダイアログに応答（対話ダイアログ / 承認ダイアログ） |
 | `tako_orchestrator_projects` | プロジェクト管理（一覧 / 追加 / 削除） |
 | `tako_orchestrator_profiles` | プロファイル管理（一覧 / 表示 / 設定） |
 

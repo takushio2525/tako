@@ -1554,3 +1554,14 @@
 - **見た目と操作感は実機未検証**（稼働中の tako を終了できない制約。次のプレビュービルドで
   ユーザー確認）。上端 8px 前後が OS のリサイズエッジに食われる件はトリガーを下げて回避済み
 
+
+## 2026-07-30（#662: master が MCP で worker の対話ダイアログを操作できるようにする）
+- `tako_orchestrator_dialog`（内容取得）+ `tako_orchestrator_respond --answers`（複数質問 /
+  multiSelect / dry_run）+ `tako_send_keys` / `tako keys`（生キー送出）を新設。計 128 ツール
+- respond が Windows で必ず死んでいた根因 = 到達手段を detached 固定で解決していたこと。
+  in-process 優先の `DialogReach` を新設して psmux（detached_access:false）でも動く形に
+- **設計変更**: claude はダイアログ表示中 transcript に何も書かない（`tool_use` は回答確定後に
+  `tool_result` と同時出現）と隔離 E2E で実測 → 保留中の正はライブ画面へ。副産物として
+  `find_transcript` が CLAUDE_CONFIG_DIR / アカウント別 config dir を見ていない実バグも修正
+- 関連: PR #679。証拠は #662 のコメント（内容取得 / dry_run / 本送信 / worker 受領 /
+  矢印キーのハイライト前後比較 / 誤爆防止）

@@ -580,6 +580,70 @@ mod tests {
         keystroke_to_bytes(ks, CsiUMode::ModifiedOnly)
     }
 
+    /// #662: AI からのキー送出（`tako_core::keys`）と GUI のキー入力が
+    /// **同じバイト列**を出すことを固定する。
+    ///
+    /// 片方だけ直すと「手で押すと動くのに AI から送ると動かない（or 逆）」という
+    /// 再現の難しい差になる。GPUI 依存の有無で実装は共有できないので、
+    /// 契約はここで縛る
+    #[test]
+    fn 新旧のキー符号化が一致する() {
+        use tako_core::keys::{encode_key, KeyEncoding};
+
+        for name in [
+            "enter",
+            "tab",
+            "escape",
+            "backspace",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "delete",
+        ] {
+            assert_eq!(
+                keystroke_to_bytes_default(&ks(name)),
+                encode_key(name, KeyEncoding::default()),
+                "修飾なし {name} のバイト列が GUI 経路と AI 経路で違う"
+            );
+        }
+
+        // Shift 付き（CSI u / xterm 形式の分岐を含む）
+        for name in ["up", "delete", "enter", "tab", "backspace", "escape"] {
+            assert_eq!(
+                keystroke_to_bytes_default(&ks_shift(name)),
+                encode_key(&format!("shift-{name}"), KeyEncoding::default()),
+                "Shift+{name} のバイト列が GUI 経路と AI 経路で違う"
+            );
+        }
+
+        // Ctrl+英字（C0 制御コード）
+        for c in ['a', 'c', 'd', 'z'] {
+            assert_eq!(
+                keystroke_to_bytes_default(&ks_ctrl(&c.to_string())),
+                encode_key(&format!("ctrl-{c}"), KeyEncoding::default()),
+                "Ctrl+{c} のバイト列が GUI 経路と AI 経路で違う"
+            );
+        }
+
+        // kitty disambiguate 時の Esc 単押し（CsiUMode::Full 相当）
+        assert_eq!(
+            keystroke_to_bytes(&ks("escape"), CsiUMode::Full),
+            encode_key(
+                "escape",
+                KeyEncoding {
+                    disambiguate: true,
+                    ..Default::default()
+                }
+            ),
+            "disambiguate 時の Esc が GUI 経路と AI 経路で違う"
+        );
+    }
+
     #[test]
     fn 特殊キーは正しいバイト列を送る() {
         assert_eq!(

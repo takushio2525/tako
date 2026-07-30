@@ -347,8 +347,44 @@ master（または任意の claude エージェント）から使える MCP ツ�
 | `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択） |
 | `tako_orchestrator_worker_status` | worker の状態確認（codex / agy は画面推定。異常停止は status=error + error.kind / recommended_action（#157）。停滞は status=stalled + stalled.detail / recommended_action（#224）。has_running_children / collapsed フラグ付き） |
 
+| `tako_orchestrator_dialog` | worker が表示中のダイアログの内容取得（#662。AskUserQuestion の質問文と選択肢を transcript から全文で。ライブ画面から現在位置・ハイライト・回答済みも） |
+| `tako_orchestrator_respond` | worker のダイアログへの応答（#319 / #662。`answers` = AskUserQuestion / `choice` = permission ダイアログ） |
+
 既存の tako MCP ツール（`tako_read_pane` / `tako_send_input` / `tako_close_pane` 等）
 と組み合わせて worker のライフサイクルを管理する。
+
+## worker が選択肢を出して止まったとき（#662）
+
+worker が **AskUserQuestion**（複数選択肢のダイアログ）で停止することがある。
+`tako_read_pane` で読もうとしてはいけない — worker ペインは幅が狭く、質問文も選択肢も
+折り返しで判読できない（幅 11〜25 桁が普通）。専用の 2 ツールを使う。
+
+```bash
+# 1. 内容を読む（transcript 由来なのでペイン幅に依存しない）
+tako orchestrator dialog --pane 5
+
+# 2. 答える（表示順に 1 問 1 指定。番号でもラベル前方一致でもよい）
+tako orchestrator respond --pane 5 --answer 2 --answer カレー
+
+# multiSelect はカンマ区切り、質問の明示指定は `質問=選択肢`
+tako orchestrator respond --pane 5 --answer 果物=りんご,ぶどう
+
+# 送信前に選択結果だけ見たい
+tako orchestrator respond --pane 5 --answer 2 --dry-run
+```
+
+**誤爆防止の仕組み**: ダイアログが画面に無ければエラー。さらに送信前に確認画面
+（`Review your answers`）へ写った選択結果を照合し、指定と食い違えば**送信せずエラー**を返す。
+「撃ったが違う選択肢が入った」は構造的に起きない（食い違えば送信自体をしない）。
+
+**誰が決めるかの線引き**: 割り当てたタスクから一意に決まる選択なら master が答えてよい。
+ユーザーの好み・予算・リスク許容度・成果物の範囲が変わる選択は、質問と選択肢をそのまま
+ユーザーへ上げて判断を仰ぐ。worker を止めておく費用はゼロだが、誤答は作業をまるごと
+別方向へ走らせる。
+
+TUI を直接叩きたいときは `tako keys`（`tako_send_keys`）で生キーを送れる
+（`enter` / `escape` / 矢印 / `ctrl-c` / 1 文字リテラル）。10 番目以降の選択肢は
+数字キー 1 発で選べないので、そのときだけ `down` の連打 + `enter` を使う。
 
 ## 品質パイプライン（全プロファイル共通）
 

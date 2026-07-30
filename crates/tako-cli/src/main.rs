@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 use tako_control::orchestrator::wait;
-use tako_control::protocol::{Axis, Direction, Request};
+use tako_control::protocol::{Axis, DialogAnswer, Direction, Request};
 
 /// tako の外で実行されたときのエラー（FR-2.2.8）。
 /// 接続情報は環境変数 → 発見ファイル（FR-2.2.9）の順で解決した上での不在を意味する
@@ -47,6 +47,9 @@ enum Command {
     /// ペインへテキストを送信する（既定で末尾に改行を付与）。claude 等の全画面 TUI へは
     /// 送達確認ループ（貼り付け → 分離 Enter → 入力欄の空検証 + 再送）で配送する
     Send(SendArgs),
+    /// ペインへ特殊キーを送る（enter / esc / up / ctrl-c 等。#662）。
+    /// TUI の選択 UI・ダイアログを操作するための生キー送出（送達確認ループを通らない）
+    Keys(KeysArgs),
     /// ペインへフォーカスを移す（ID 指定または --left 等の方向指定）
     Focus(FocusArgs),
     /// タブ / ペインのツリー構造・ジオメトリ・状態を JSON で出力する
@@ -1365,15 +1368,34 @@ enum OrchestratorCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
-    /// worker の permission ダイアログに応答する（#319）。
+    /// worker のダイアログに応答する（#319 / #662）。
     /// ダイアログ不在時はエラー（誤爆防止）
     Respond {
         /// 対象ペイン ID
         #[arg(long)]
         pane: u64,
-        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+        /// permission ダイアログの選択肢番号（1-based）または "yes"/"no" エイリアス
         #[arg(long)]
-        choice: String,
+        choice: Option<String>,
+        /// AskUserQuestion への回答（#662）。質問ごとに 1 回指定する（表示順）。
+        /// 番号（`2`）でもラベルの前方一致（`青い海`）でもよい。multiSelect は
+        /// カンマ区切りで複数指定（`りんご,ぶどう`）。
+        /// `質問=選択肢` の形式で質問を明示指定できる（`色=青い海`）
+        #[arg(long = "answer", value_name = "ANSWER")]
+        answers: Vec<String>,
+        /// 確認画面まで進めて内容を表示し、送信はしない
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// worker が表示中の対話ダイアログの内容を取得する（#662）。
+    /// 質問文と選択肢を transcript から全文で読む（ペイン幅に依存しない）
+    Dialog {
+        /// 対象ペイン ID（--worker と排他。どちらか必須）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// worker レジストリの ID（ペインが消えても取得できる）
+        #[arg(long)]
+        worker: Option<String>,
     },
     /// worker の報告内容を取得する（scrollback 主 + transcript 補強。#364）
     Report {
@@ -1689,6 +1711,25 @@ struct SendArgs {
     /// 送信するテキスト（複数引数はスペース連結）
     #[arg(required = true)]
     text: Vec<String>,
+}
+
+#[derive(Args)]
+struct KeysArgs {
+    /// 送信先ペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// キーの間に挟む待ち（ミリ秒。既定 30、上限 2000）
+    #[arg(long)]
+    delay_ms: Option<u64>,
+    /// tmux session 名（pane ID 解決不能時のフォールバック）
+    #[arg(long)]
+    tmux_session: Option<String>,
+    /// 送るキー名（前から順に送る）。
+    /// enter / escape / tab / backtab / backspace / delete / space /
+    /// up / down / left / right / home / end / pageup / pagedown / insert / f1〜f12 /
+    /// ctrl-<英字> / shift- alt- の前置 / 1 文字リテラル
+    #[arg(required = true)]
+    keys: Vec<String>,
 }
 
 #[derive(Args)]
@@ -2291,12 +2332,29 @@ fn cli_main() -> ExitCode {
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))
         }
-        Command::Orchestrator(OrchestratorCommand::Respond { pane, ref choice }) => {
+        Command::Orchestrator(OrchestratorCommand::Respond {
+            pane,
+            ref choice,
+            ref answers,
+            dry_run,
+        }) => {
             let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
-            send_request(Request::OrchestratorRespond {
+            parse_dialog_answers(answers)
+                .and_then(|parsed| {
+                    send_request(Request::OrchestratorRespond {
+                        pane_id: pane,
+                        choice: choice.clone(),
+                        answers: parsed,
+                        dry_run,
+                        caller_role,
+                    })
+                })
+                .map(|result| println!("{}", pretty_json(&result)))
+        }
+        Command::Orchestrator(OrchestratorCommand::Dialog { pane, ref worker }) => {
+            send_request(Request::OrchestratorDialog {
                 pane_id: pane,
-                choice: choice.clone(),
-                caller_role,
+                worker: worker.clone(),
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
@@ -3866,6 +3924,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tmux_session: args.tmux_session.clone(),
             await_prompt: args.await_prompt,
         },
+        Command::Keys(args) => Request::SendKeys {
+            pane: target_pane(args.pane)?,
+            keys: args.keys.clone(),
+            delay_ms: args.delay_ms,
+            tmux_session: args.tmux_session.clone(),
+        },
         Command::Focus(args) => {
             let direction = match (args.left, args.right, args.up, args.down) {
                 (true, _, _, _) => Some(Direction::Left),
@@ -4659,6 +4723,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Orchestrator(OrchestratorCommand::Respond { .. }) => {
             unreachable!("orchestrator respond は run() を通らない")
         }
+        Command::Orchestrator(OrchestratorCommand::Dialog { .. }) => {
+            unreachable!("orchestrator dialog は run() を通らない")
+        }
         Command::Orchestrator(OrchestratorCommand::Ledger(_)) => {
             unreachable!("orchestrator ledger は run() を通らない（ローカル処理）")
         }
@@ -5450,6 +5517,40 @@ fn pretty_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
+/// `tako orchestrator respond --answer` の文字列を `DialogAnswer` へ（#662）。
+///
+/// 書式は `選択肢` / `質問=選択肢` / `選択肢1,選択肢2`（multiSelect）。
+/// ラベルに `=` や `,` が入りうるので、`=` は**最初の 1 個**で分け、
+/// `,` 区切りは「複数指定したいとき」に限って使ってもらう
+fn parse_dialog_answers(raw: &[String]) -> Result<Option<Vec<DialogAnswer>>, String> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    for item in raw {
+        let (question, rest) = match item.split_once('=') {
+            Some((q, r)) if !q.trim().is_empty() && !r.trim().is_empty() => {
+                (Some(q.trim().to_string()), r)
+            }
+            _ => (None, item.as_str()),
+        };
+        let options: Vec<String> = rest
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if options.is_empty() {
+            return Err(format!("--answer '{item}' に選択肢が無い"));
+        }
+        out.push(DialogAnswer {
+            question,
+            option: None,
+            options: Some(options),
+        });
+    }
+    Ok(Some(out))
+}
+
 /// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）
 fn print_sessions_list(result: &Value) {
     let sessions = result["sessions"].as_array().cloned().unwrap_or_default();
@@ -5871,6 +5972,150 @@ mod tests {
     fn 引数定義が壊れていない() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    // --- #662: ダイアログ操作 ---
+
+    #[test]
+    fn keysコマンドはキー名を並びで受ける() {
+        match parse(&["tako", "keys", "--pane", "3", "down", "down", "enter"]) {
+            Command::Keys(a) => {
+                assert_eq!(a.pane, Some(3));
+                assert_eq!(a.keys, vec!["down", "down", "enter"]);
+                assert_eq!(a.delay_ms, None);
+            }
+            _ => panic!("keys ではない"),
+        }
+        // ハイフン始まりに見える ctrl-c もそのまま値として通る
+        match parse(&["tako", "keys", "ctrl-c"]) {
+            Command::Keys(a) => assert_eq!(a.keys, vec!["ctrl-c"]),
+            _ => panic!("keys ではない"),
+        }
+    }
+
+    /// `--answer` は「選択肢」「質問=選択肢」「カンマ区切りの複数選択」を受ける
+    #[test]
+    fn answerの書式を解釈する() {
+        let parsed = parse_dialog_answers(&["2".into(), "カレー".into()])
+            .unwrap()
+            .expect("2 件");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].question, None);
+        assert_eq!(parsed[0].option_list(), vec!["2"]);
+        assert_eq!(parsed[1].option_list(), vec!["カレー"]);
+
+        // 質問を明示指定（= の左が質問）
+        let parsed = parse_dialog_answers(&["色=青い海".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].question.as_deref(), Some("色"));
+        assert_eq!(parsed[0].option_list(), vec!["青い海"]);
+
+        // multiSelect（カンマ区切り）
+        let parsed = parse_dialog_answers(&["りんご,ぶどう".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].option_list(), vec!["りんご", "ぶどう"]);
+
+        // 質問指定 + 複数選択の併用
+        let parsed = parse_dialog_answers(&["果物=りんご,もも".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].question.as_deref(), Some("果物"));
+        assert_eq!(parsed[0].option_list(), vec!["りんご", "もも"]);
+
+        // 指定なしは None（permission ダイアログ用の --choice 経路を壊さない）
+        assert!(parse_dialog_answers(&[]).unwrap().is_none());
+    }
+
+    /// ラベル自身に `=` が入る場合は最初の `=` で切る。
+    /// 左側が空・右側が空なら質問指定とみなさずラベル全体として扱う
+    #[test]
+    fn answerのイコールは最初の一個で切る() {
+        let parsed = parse_dialog_answers(&["方針=A=B 案".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed[0].question.as_deref(), Some("方針"));
+        assert_eq!(parsed[0].option_list(), vec!["A=B 案"]);
+
+        // 左右どちらかが空なら質問指定として成立しない → 全体をラベルとして扱う
+        // （解決できなければ resolve 側が候補つきで断るので、ここでは弾かない）
+        let parsed = parse_dialog_answers(&["=".into()]).unwrap().unwrap();
+        assert_eq!(parsed[0].question, None);
+        assert_eq!(parsed[0].option_list(), vec!["="]);
+
+        let parsed = parse_dialog_answers(&["=青い海".into()]).unwrap().unwrap();
+        assert_eq!(parsed[0].question, None);
+        assert_eq!(parsed[0].option_list(), vec!["=青い海"]);
+    }
+
+    #[test]
+    fn answerが空文字だけならエラー() {
+        let err = parse_dialog_answers(&[",".into()]).unwrap_err();
+        assert!(err.contains("選択肢が無い"), "err={err}");
+    }
+
+    #[test]
+    fn respondはanswerとchoiceの両方を受け付ける形をしている() {
+        match parse(&[
+            "tako",
+            "orchestrator",
+            "respond",
+            "--pane",
+            "5",
+            "--answer",
+            "2",
+            "--dry-run",
+        ]) {
+            Command::Orchestrator(OrchestratorCommand::Respond {
+                pane,
+                choice,
+                answers,
+                dry_run,
+            }) => {
+                assert_eq!(pane, 5);
+                assert_eq!(choice, None);
+                assert_eq!(answers, vec!["2"]);
+                assert!(dry_run);
+            }
+            _ => panic!("respond ではない"),
+        }
+        // permission ダイアログ経路（従来の --choice。後方互換）
+        match parse(&[
+            "tako",
+            "orchestrator",
+            "respond",
+            "--pane",
+            "5",
+            "--choice",
+            "yes",
+        ]) {
+            Command::Orchestrator(OrchestratorCommand::Respond {
+                choice, answers, ..
+            }) => {
+                assert_eq!(choice.as_deref(), Some("yes"));
+                assert!(answers.is_empty());
+            }
+            _ => panic!("respond ではない"),
+        }
+    }
+
+    #[test]
+    fn dialogコマンドはpaneとworkerを受ける() {
+        match parse(&["tako", "orchestrator", "dialog", "--pane", "7"]) {
+            Command::Orchestrator(OrchestratorCommand::Dialog { pane, worker }) => {
+                assert_eq!(pane, Some(7));
+                assert_eq!(worker, None);
+            }
+            _ => panic!("dialog ではない"),
+        }
+        match parse(&["tako", "orchestrator", "dialog", "--worker", "w-1"]) {
+            Command::Orchestrator(OrchestratorCommand::Dialog { pane, worker }) => {
+                assert_eq!(pane, None);
+                assert_eq!(worker.as_deref(), Some("w-1"));
+            }
+            _ => panic!("dialog ではない"),
+        }
     }
 
     #[test]
@@ -6365,6 +6610,8 @@ mod platform_matrix_parity {
         ("git abort", "tako_git_merge_abort"),
         ("git branch", "tako_git_branch_create"),
         ("git resolve", "tako_git_resolve_agent"),
+        // #662: CLI は `tako keys`（最短形。#322）、MCP は `tako_send_keys`（送信系と分かる名前）
+        ("keys", "tako_send_keys"),
         ("list", "tako_list_panes"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),

@@ -245,6 +245,39 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_send_keys",
+            "description": "指定ペインへ特殊キーを送る（#662）。TUI の選択 UI・ダイアログ・\
+                ページャ等、テキスト送信では操作できない画面を動かすのに使う。\
+                tako_send_input と違い送達確認ループを通らないので、Enter が\
+                勝手に再送されることがない（結果の確認は tako_read_pane で行う）。\
+                使えるキー名: enter / escape / tab / backtab / backspace / delete / space / \
+                up / down / left / right / home / end / pageup / pagedown / insert / f1〜f12、\
+                ctrl-<英字>（ctrl-c 等）、shift- / alt- の前置、1 文字リテラル（\"1\" / \"y\" 等）。\
+                Claude Code の対話ダイアログ（AskUserQuestion）に答えるだけなら、\
+                内容の取得と検証つき送信までやってくれる tako_orchestrator_respond を使うこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "minimum": 0, "description": "送信先ペイン ID（必須）" },
+                    "keys": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "送るキー名の並び（前から順に送る）。例: [\"down\",\"down\",\"enter\"]",
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": "キーの間に挟む待ち（ミリ秒。省略時 30、上限 2000）。TUI の再描画を待たせたいときに増やす",
+                    },
+                    "tmux_session": {
+                        "type": "string",
+                        "description": "tmux session 名（pane ID 解決不能時のフォールバック）",
+                    },
+                },
+                "required": ["pane", "keys"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_read_pane",
             "description": "指定ペインの画面内容（表示中のテキスト）を返す。\
                 別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。\
@@ -1721,22 +1754,88 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_orchestrator_dialog",
+            "description": "worker が表示中の対話ダイアログの内容を構造化して取得する（#662）。\
+                worker が AskUserQuestion で選択を求めて止まっているとき、\
+                生画面を読まずに質問・選択肢・現在位置を JSON で取れる。\
+                応答の kind は ask_user_question / permission / none。\
+                screen が本体で、stage（question = 質問表示中 / review = 送信前の確認画面）、\
+                tabs（質問ごとの見出しと回答済みフラグ）、question（表示中の質問文）、\
+                options（番号・ラベル・ハイライト・multiSelect のチェック状態）を返す。\
+                **画面は 1 問ずつしか映さない**ので、次の質問の選択肢は前の質問に答えると見える。\
+                questions は claude の transcript 由来の全文だが、claude は\
+                **ダイアログ表示中は transcript に書かない**（回答確定後に書く）ため、\
+                保留中は基本 null になる（実測。回答後の照会では埋まる）。\
+                狭いペインではラベルが折り返しで欠けることがあるので、\
+                回答は**番号指定が最も確実**。全文を読みたいときは tako_resize_pane で広げる。\
+                回答は tako_orchestrator_respond の answers で行う。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
+                    "worker": {
+                        "type": "string",
+                        "description": "worker レジストリの ID（pane_id と排他。ペイン消失後も追跡できる）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_orchestrator_respond",
-            "description": "worker の permission ダイアログ（ツール実行の承認要求）に応答する（#319）。\
-                watch の WORKER_PERMISSION イベントで検知されたダイアログに対し、選択肢を指定して解除する。\
-                ダイアログが画面に存在しない場合はエラーを返す（誤爆防止）。\
+            "description": "worker のダイアログに応答する（#319 / #662）。2 種類のダイアログを扱う。\
+                \n(1) 対話ダイアログ = AskUserQuestion（worker が選択肢を出して止まっている）: \
+                answers に質問ごとの選択を渡す。選択肢は番号（\"2\"）でもラベルの前方一致（\"青い海\"）でもよいが、\
+                狭いペインではラベルが折り返しで欠けるため**番号が最も確実**。\
+                複数質問はそれぞれに 1 要素を渡す（全問に答えないと送信できない）。\
+                multiSelect の質問は options に複数指定する。\
+                内容は先に tako_orchestrator_dialog で確認すること。\
+                2 問目以降の選択肢は画面に出るまで見えないので、\
+                ラベル指定が不安なときは 1 問ずつ答えて dialog で確認するとよい。\
+                \n(2) permission ダイアログ（ツール実行の承認要求）: choice に番号または yes/no を渡す。\
+                \n誤爆防止: ダイアログが画面に無ければエラー。さらに AskUserQuestion では\
+                送信前に確認画面へ写った選択結果を照合し、指定と一致しなければ**送信せずエラー**を返す。\
+                dry_run: true にすると確認画面まで進めて内容を返し、送信はしない。\
                 応答内容は persist.log に監査記録される。\
-                危険なコマンド（rm -rf / 本番 DB 操作等）への承認はユーザーに確認すること。",
+                危険なコマンド（rm -rf / 本番 DB 操作等）への承認、および\
+                ユーザーの好み・方針を問う質問への代理回答はユーザーに確認すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
                     "choice": {
                         "type": "string",
-                        "description": "選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
+                        "description": "permission ダイアログの選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
+                    },
+                    "answers": {
+                        "type": "array",
+                        "description": "AskUserQuestion への回答。質問ごとに 1 要素（表示順。question を書けば順不同でもよい）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "対象の質問: 番号（\"1\"）または header の前方一致。省略時は表示順に割り当て",
+                                },
+                                "option": {
+                                    "type": "string",
+                                    "description": "選ぶ選択肢: 番号（\"2\"）または label の前方一致（\"青い海\"）",
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "multiSelect の質問で複数選ぶとき",
+                                },
+                            },
+                            "additionalProperties": false,
+                        },
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "true にすると確認画面まで進めて選択結果を返し、送信はしない（省略時 false）",
                     },
                 },
-                "required": ["pane_id", "choice"],
+                "required": ["pane_id"],
                 "additionalProperties": false,
             },
         }),
@@ -3103,6 +3202,12 @@ fn build_request(
             tmux_session: str_arg(args, "tmux_session")?,
             await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
         },
+        "tako_send_keys" => Request::SendKeys {
+            pane: Some(required_u64(args, "pane")?),
+            keys: str_vec_arg(args, "keys")?.ok_or("keys を指定する")?,
+            delay_ms: u64_arg(args, "delay_ms")?,
+            tmux_session: str_arg(args, "tmux_session")?,
+        },
         "tako_read_pane" => Request::Read {
             pane: Some(required_u64(args, "pane")?),
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
@@ -3630,8 +3735,14 @@ fn build_request(
         },
         "tako_orchestrator_respond" => Request::OrchestratorRespond {
             pane_id: required_u64(args, "pane_id")?,
-            choice: str_arg(args, "choice")?.ok_or("choice を指定する")?,
+            choice: str_arg(args, "choice")?,
+            answers: dialog_answers_arg(args)?,
+            dry_run: bool_arg(args, "dry_run")?.unwrap_or(false),
             caller_role: caller_role.map(str::to_string),
+        },
+        "tako_orchestrator_dialog" => Request::OrchestratorDialog {
+            pane_id: u64_arg(args, "pane_id")?,
+            worker: str_arg(args, "worker")?,
         },
         "tako_orchestrator_supervisor" => Request::OrchestratorSupervisor {
             action: str_arg(args, "action")?.ok_or("action を指定する")?,
@@ -4101,6 +4212,37 @@ fn direction_arg(args: &Value) -> Result<Option<Direction>, String> {
             "direction が不正: {other}（right / down / left / up のいずれか）"
         )),
     }
+}
+
+/// `tako_orchestrator_respond` の `answers`（#662）。
+/// 質問ごとに `{question?, option?, options?}`。option / options のどちらも無い要素は拒否する
+/// （空回答のまま送信して worker を進めてしまうのを防ぐ）
+fn dialog_answers_arg(args: &Value) -> Result<Option<Vec<crate::protocol::DialogAnswer>>, String> {
+    let items = match args.get("answers") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err("answers は配列で指定する".to_string()),
+    };
+    let mut out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if !item.is_object() {
+            return Err(format!(
+                "answers[{i}] はオブジェクトで指定する（{{option: \"2\"}} 等）"
+            ));
+        }
+        let answer = crate::protocol::DialogAnswer {
+            question: str_arg(item, "question")?,
+            option: str_arg(item, "option")?,
+            options: str_vec_arg(item, "options")?,
+        };
+        if answer.option_list().is_empty() {
+            return Err(format!(
+                "answers[{i}] に option / options のどちらも無い（選ぶ選択肢を指定する）"
+            ));
+        }
+        out.push(answer);
+    }
+    Ok(Some(out))
 }
 
 fn str_vec_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
@@ -4644,7 +4786,7 @@ mod tests {
         let tools = tools();
         // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
         // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 126);
+        assert_eq!(tools.len(), 128);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

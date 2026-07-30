@@ -294,7 +294,10 @@ After WORKER_IDLE, WORKER_ERROR, or WORKER_PERMISSION, `event:` lines may
 follow with additional context (Issue #243). These do NOT change the primary
 signal — they augment it:
 - `event: question` — the worker is asking a question (idle + question pattern
-  on screen). Answer via `tako_send_input` or relay to the user.
+  on screen). If it is an interactive dialog (AskUserQuestion), read it with
+  `tako_orchestrator_dialog` and answer with `tako_orchestrator_respond`
+  (see "When a worker shows an interactive dialog" below). For a free-form
+  question, answer via `tako_send_input` or relay to the user.
 - `event: permission_dialog` — the worker is blocked on a permission dialog.
   Use `tako_orchestrator_respond` to answer (see WORKER_PERMISSION below).
 - `event: model_switched from=<model> to=<model>` — the worker's model was
@@ -373,6 +376,38 @@ options to decide:
 The `tako_orchestrator_respond` tool verifies the dialog is still present before
 sending the response — if the user already dismissed it manually, you will get
 an error (not an accidental keypress).
+
+### When a worker shows an interactive dialog (AskUserQuestion)
+
+A worker can stop on a multiple-choice dialog it raised itself (asking which
+approach to take, which option you prefer, etc.). Do NOT try to drive it with
+`tako_send_input` or by reading the raw pane — narrow worker panes wrap the text
+and the choices become unreadable. Use the dedicated pair:
+
+1. `tako_orchestrator_dialog --pane <N>` — returns the full question text and
+   options from the transcript (width-independent), plus which question is
+   currently displayed. `kind` tells you what is on screen:
+   `ask_user_question` / `permission` / `none`.
+2. `tako_orchestrator_respond` with `answers` — one entry per question, in
+   display order. `option` accepts a number ("2") or a label prefix ("青い海").
+   For a `multi_select` question pass `options` with several values.
+   Before submitting, tako checks the review screen and **refuses to submit** if
+   what is selected does not match what you asked for.
+
+**Who decides matters.** A worker's dialog is often asking about a preference,
+a trade-off, or a scope decision that is the user's call, not yours:
+
+- **Answer it yourself** when the choice follows unambiguously from the task you
+  assigned (the worker is asking which of two equivalent paths to take, or
+  re-confirming something you already specified).
+- **Escalate to the user** when the dialog asks about their preference, budget,
+  risk tolerance, or anything that changes what gets delivered. Relay the
+  question and the options verbatim, then answer with their decision.
+  Use `dry_run: true` if you want to stage the selection and show the review
+  screen before committing.
+
+Never guess on the user's behalf just to unblock a worker. A worker parked on a
+question costs nothing; a wrong answer sends it down the wrong path.
 
 Do NOT close → respawn on WORKER_ERROR, WORKER_STALLED, or WORKER_PERMISSION:
 the worker's context is intact and a resume is almost always cheaper than a

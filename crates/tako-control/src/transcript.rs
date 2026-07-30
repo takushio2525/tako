@@ -31,21 +31,63 @@ pub fn is_valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// `~/.claude/projects/` 配下から session_id の transcript ファイルを探す
+/// transcript を探す `projects/` ディレクトリの候補（優先順）。
+///
+/// `~/.claude/projects` **だけ**を見ていると、config ディレクトリを分けている
+/// セッションの transcript が 1 件も見つからない（#662 の隔離 E2E で実測）。
+/// claude は config ディレクトリ配下へ transcript を書くので、候補は 3 系統ある:
+///
+/// 1. `CLAUDE_CONFIG_DIR` 環境変数（tako-app がその環境で起動されていれば、
+///    ペイン内の claude も同じ config を使う）
+/// 2. **アカウント登録された config ディレクトリ**（#504）。`agent_scan_targets` は
+///    これらも `claude agents --json` の走査先にしているので、session_id は解決できるのに
+///    transcript だけ引けない、という食い違いが起きていた
+/// 3. 既定の `~/.claude/projects`
+///
+/// transcript を第一ソースにする機能（対話ダイアログの内容取得 #662 /
+/// report --messages #364 / sessions #112 / remote の会話表示）が全部ここを通る
+fn transcript_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |dir: PathBuf| {
+        let projects = dir.join("projects");
+        if !roots.contains(&projects) {
+            roots.push(projects);
+        }
+    };
+
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            push(PathBuf::from(dir));
+        }
+    }
+    if let Ok(accounts) = crate::orchestrator::AccountsConfig::load() {
+        for account in accounts.list_resolved() {
+            if !account.config_dir.trim().is_empty() {
+                push(PathBuf::from(account.config_dir));
+            }
+        }
+    }
+    // Windows は HOME が未設定のことが多いため USERPROFILE へフォールバックする
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        push(PathBuf::from(home).join(".claude"));
+    }
+    roots
+}
+
+/// session_id の transcript ファイルを探す（`CLAUDE_CONFIG_DIR` →`~/.claude` の順）
 pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
     if !is_valid_session_id(session_id) {
         return None;
     }
-    // Windows は HOME が未設定のことが多いため USERPROFILE へフォールバックする
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let projects = PathBuf::from(home).join(".claude").join("projects");
-    let entries = std::fs::read_dir(&projects).ok()?;
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(format!("{session_id}.jsonl"));
-        if candidate.is_file() {
-            return Some(candidate);
+    for projects in transcript_roots() {
+        let Ok(entries) = std::fs::read_dir(&projects) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(format!("{session_id}.jsonl"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -385,6 +427,50 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    /// #662: config ディレクトリを分けているセッションの transcript を取りこぼさない。
+    ///
+    /// 環境変数やアカウント設定を書き換えるテストは並行実行で干渉するため、
+    /// 実環境から組み立てた候補の**不変条件**だけを検証する
+    #[test]
+    fn transcriptの探索先は候補を重複なく並べ既定を必ず含む() {
+        let roots = transcript_roots();
+        assert!(!roots.is_empty(), "探索先が空");
+        // どの候補も末尾は projects
+        for r in &roots {
+            assert_eq!(
+                r.file_name().and_then(|s| s.to_str()),
+                Some("projects"),
+                "探索先が projects で終わっていない: {}",
+                r.display()
+            );
+        }
+        // 重複が無い（同じディレクトリを 2 度 read_dir しない）
+        let mut sorted = roots.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), roots.len(), "探索先に重複がある: {roots:?}");
+        // 既定の ~/.claude/projects は必ず候補に入る（後方互換）
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let default = std::path::PathBuf::from(home)
+                .join(".claude")
+                .join("projects");
+            assert!(
+                roots.contains(&default),
+                "既定の探索先が落ちている: {roots:?}"
+            );
+        }
+        // CLAUDE_CONFIG_DIR があるならそれが先頭（明示指定を最優先する）
+        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+            if !dir.trim().is_empty() {
+                assert_eq!(
+                    roots[0],
+                    std::path::PathBuf::from(dir).join("projects"),
+                    "CLAUDE_CONFIG_DIR が先頭に来ていない"
+                );
+            }
+        }
     }
 
     #[test]

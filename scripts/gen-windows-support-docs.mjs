@@ -28,7 +28,7 @@ const CATEGORIES = [
     title: 'ターミナルの基本',
     intro: 'シェルの起動・入出力・スクロール・コピー & ペースト。',
     keys: [
-      'tako_send_input', 'tako_read_pane', 'tako_scroll_pane', 'tako_list_panes',
+      'tako_send_input', 'tako_send_keys', 'tako_read_pane', 'tako_scroll_pane', 'tako_list_panes',
       'tako_logs', 'tako_limit_service', 'tako_theme', 'tako_lang', 'tako_settings',
       'tako_check_health', 'tako_telemetry', 'tako_platform',
     ],
@@ -52,6 +52,7 @@ const CATEGORIES = [
     keys: [
       'tako_orchestrator_spawn', 'tako_orchestrator_self', 'tako_orchestrator_worker_status',
       'tako_orchestrator_workers', 'tako_orchestrator_report', 'tako_orchestrator_respond',
+      'tako_orchestrator_dialog',
       'tako_orchestrator_handoff', 'tako_orchestrator_run', 'tako_orchestrator_run_status',
       'tako_orchestrator_run_result', 'tako_orchestrator_supervisor', 'tako_orchestrator_ledger',
       'tako_orchestrator_projects', 'tako_orchestrator_profiles', 'tako_orchestrator_accounts',

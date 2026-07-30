@@ -2696,7 +2696,9 @@ fn dispatch_respond(
 ) -> Result<Value, (u16, String)> {
     let request = crate::protocol::Request::OrchestratorRespond {
         pane_id,
-        choice: choice.to_string(),
+        choice: Some(choice.to_string()),
+        answers: None,
+        dry_run: false,
         caller_role: Some(format!("remote:{device_name}")),
     };
     let mut conn = app_conn
