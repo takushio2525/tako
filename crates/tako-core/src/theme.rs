@@ -34,6 +34,47 @@ impl Rgb {
             b: (self.b as f32 * factor) as u8,
         }
     }
+
+    /// WCAG の相対輝度（0.0–1.0）
+    pub fn relative_luminance(self) -> f32 {
+        let channel = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(self.r) + 0.7152 * channel(self.g) + 0.0722 * channel(self.b)
+    }
+
+    /// 2 色のコントラスト比（WCAG。1.0〜21.0）
+    pub fn contrast_ratio(self, other: Self) -> f32 {
+        let a = self.relative_luminance();
+        let b = other.relative_luminance();
+        let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 明るい面に載せても読める明度まで落とす（色相・彩度の比は保つ）。
+    ///
+    /// Markdown のコードブロックは syntect のダーク配色で色付けされるため、ライトテーマの
+    /// 淡い面にそのまま載せるとコントラストが 2:1 前後まで落ちて読めない（Issue #656）。
+    /// 相対輝度が `max_luminance` を超える色だけを、sRGB のガンマ（≒2.2 乗）から逆算した
+    /// 係数で一律に暗くする。チャンネル比を変えないので構文色の識別は残る。
+    pub fn adapt_for_light_bg(self, max_luminance: f32) -> Self {
+        let luminance = self.relative_luminance();
+        if luminance <= max_luminance || luminance <= 0.0 {
+            return self;
+        }
+        // sRGB 値を k 倍すると輝度は概ね k^2.2 倍になるので、逆に解いて係数を出す
+        let factor = (max_luminance / luminance).powf(1.0 / 2.2).clamp(0.1, 1.0);
+        Self {
+            r: (self.r as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            g: (self.g as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            b: (self.b as f32 * factor).round().clamp(0.0, 255.0) as u8,
+        }
+    }
 }
 
 /// テーマモード（ライト / ダーク。Issue #217）
@@ -599,6 +640,43 @@ mod tests {
     fn from_hexで各成分が取れる() {
         let c = Rgb::from_hex(0x1e2e3e);
         assert_eq!((c.r, c.g, c.b), (0x1e, 0x2e, 0x3e));
+    }
+
+    /// Issue #656: syntect のダーク配色をライトの面に載せても読めること。
+    /// 期待値は「ライトのコードパネル面（mantle）に対して 4.5:1 以上」
+    #[test]
+    fn adapt_for_light_bgでライト面のコントラストが確保される() {
+        let panel = Theme::default_light().mantle;
+        // base16-eighties.dark の実値（既定文字色 / 緑 / 黄 / 青）
+        for raw in [0xd3d0c8, 0x99cc99, 0xffcc66, 0x6699cc, 0xffffff] {
+            let raw = Rgb::from_hex(raw);
+            let before = raw.contrast_ratio(panel);
+            let after = raw.adapt_for_light_bg(0.12).contrast_ratio(panel);
+            assert!(
+                after >= 4.5,
+                "{} は変換後もコントラスト不足: {before:.2} → {after:.2}",
+                raw.to_hex()
+            );
+            assert!(after > before, "変換でコントラストが上がっていない");
+        }
+    }
+
+    #[test]
+    fn adapt_for_light_bgは暗い色をそのまま返す() {
+        let dark = Rgb::from_hex(0x1e1e2e);
+        assert_eq!(dark.adapt_for_light_bg(0.12), dark);
+        // 色相（チャンネルの大小関係）は変換後も保たれる
+        let green = Rgb::from_hex(0x99cc99).adapt_for_light_bg(0.12);
+        assert!(green.g > green.r && green.g > green.b);
+    }
+
+    #[test]
+    fn contrast_ratioは対称で範囲内() {
+        let a = Rgb::from_hex(0xffffff);
+        let b = Rgb::from_hex(0x000000);
+        assert!((a.contrast_ratio(b) - 21.0).abs() < 0.1);
+        assert!((b.contrast_ratio(a) - 21.0).abs() < 0.1);
+        assert!((a.contrast_ratio(a) - 1.0).abs() < 0.001);
     }
 
     #[test]

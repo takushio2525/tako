@@ -78,9 +78,56 @@ pub struct MdSpan {
     pub link: bool,
 }
 
-/// Markdown のブロック（描画単位。FR-3.3）
+/// 表セルの配置（GFM の `:---` / `:---:` / `---:`。FR-3.3）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MdAlign {
+    /// 指定なし（`---`）。左寄せで描く
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// 表の 1 セル（インライン装飾を保持する）
+pub type MdCell = Vec<MdSpan>;
+
+/// Markdown のブロック（描画単位。FR-3.3）。
+///
+/// 引用・リストの入れ子は「ブロックを再帰させる」のではなく、各ブロックが自分の
+/// 引用深さ・リスト段を持つフラット構造で表す。1 ブロック = 1 描画要素を保てるので
+/// 目次ジャンプ（Issue #232）のブロック番号がそのまま子要素の添字になる。
 #[derive(Debug, Clone, PartialEq)]
-pub enum MdBlock {
+pub struct MdBlock {
+    pub kind: MdBlockKind,
+    /// 引用のネスト深さ（0 = 引用外）。引用内のリスト・コードブロックも同じ帯に入る
+    pub quote_depth: usize,
+    /// リストのネスト段（1 = 最上位のリスト項目、0 = リスト外）。
+    /// リスト項目に属する段落・コードブロックの字下げにも使う
+    pub list_depth: usize,
+}
+
+impl MdBlock {
+    fn new(kind: MdBlockKind) -> Self {
+        Self {
+            kind,
+            quote_depth: 0,
+            list_depth: 0,
+        }
+    }
+
+    fn nested(kind: MdBlockKind, quote_depth: usize, list_depth: usize) -> Self {
+        Self {
+            kind,
+            quote_depth,
+            list_depth,
+        }
+    }
+}
+
+/// ブロックの種別
+#[derive(Debug, Clone, PartialEq)]
+pub enum MdBlockKind {
     Heading {
         level: u8,
         spans: Vec<MdSpan>,
@@ -88,18 +135,28 @@ pub enum MdBlock {
     Paragraph {
         spans: Vec<MdSpan>,
     },
-    /// リスト項目。`marker` は "•" / "1." 等、`depth` はネスト段
+    /// リスト項目
     ListItem {
-        depth: usize,
-        marker: String,
+        /// 番号付きなら表示番号、箇条書きなら None
+        ordered: Option<u64>,
+        /// タスクリスト（`- [ ]` / `- [x]`）なら完了フラグ
+        task: Option<bool>,
+        /// 同じ項目の 2 つ目以降のブロック（マーカーを描かず字下げだけ揃える）
+        continuation: bool,
         spans: Vec<MdSpan>,
     },
     /// コードブロック（```lang はハイライトして保持する）
     CodeBlock {
+        /// フェンスの info 文字列（言語指定なし / インデントコードは None）
+        lang: Option<String>,
         lines: Vec<Line>,
     },
-    Quote {
-        spans: Vec<MdSpan>,
+    /// GFM テーブル（Issue #656）
+    Table {
+        /// 列ごとの配置。列数の正はこの長さ
+        align: Vec<MdAlign>,
+        header: Vec<MdCell>,
+        rows: Vec<Vec<MdCell>>,
     },
     Rule,
 }
@@ -1079,25 +1136,39 @@ impl Highlighter for SyntectHighlighter {
     }
 }
 
-/// Markdown をブロック列へパースする（FR-3.3）。表など未対応の構造は
-/// テキストとして段落へ劣化させ、内容を落とさない。
+/// パース中に持ち回る構造の状態。`flush` がここを見てブロック種別を決める
+#[derive(Default)]
+struct MdParseState {
+    /// リストのネスト（None = 箇条書き、Some(n) = 番号付きの次番号）
+    lists: Vec<Option<u64>>,
+    quote_depth: usize,
+    heading: Option<u8>,
+    /// 直近の `- [ ]` / `- [x]` マーカー（項目の先頭ブロックにだけ効く）
+    task: Option<bool>,
+    /// 今のリスト項目でまだブロックを出していない（= マーカーを描く番）
+    item_pending_marker: bool,
+}
+
+/// Markdown をブロック列へパースする（FR-3.3）。GFM テーブルは表構造として保持し、
+/// HTML など未対応の構造はテキストとして段落へ劣化させ、内容を落とさない。
 fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
+    // Issue #656: 表を表構造として受け取る（従来は素のテキストへ潰れていた）
+    options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(text, options);
 
-    let mut blocks = Vec::new();
+    let mut blocks: Vec<MdBlock> = Vec::new();
     let mut spans: Vec<MdSpan> = Vec::new();
     let (mut bold, mut italic, mut strike, mut link) = (0u32, 0u32, 0u32, 0u32);
-    // リストのネスト（None = 箇条書き、Some(n) = 番号付きの次番号）
-    let mut lists: Vec<Option<u64>> = Vec::new();
-    let mut quote_depth = 0u32;
-    let mut heading: Option<u8> = None;
+    let mut state = MdParseState::default();
     // コードブロック蓄積（lang, 本文）
-    let mut code: Option<(String, String)> = None;
+    let mut code: Option<(Option<String>, String)> = None;
+    // 表の蓄積（Some の間はセル単位でスパンを回収する）
+    let mut table: Option<MdTableBuilder> = None;
 
     let push_span = |spans: &mut Vec<MdSpan>,
                      text: &str,
@@ -1119,93 +1190,134 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
         });
     };
     // 段落・見出し等の区切りで溜まったスパンをブロック化する
-    fn flush(
-        blocks: &mut Vec<MdBlock>,
-        spans: &mut Vec<MdSpan>,
-        heading: Option<u8>,
-        lists: &[Option<u64>],
-        quote_depth: u32,
-    ) {
+    fn flush(blocks: &mut Vec<MdBlock>, spans: &mut Vec<MdSpan>, state: &mut MdParseState) {
         if spans.is_empty() {
             return;
         }
         let spans = std::mem::take(spans);
-        if let Some(level) = heading {
-            blocks.push(MdBlock::Heading { level, spans });
-        } else if let Some(counter) = lists.last() {
-            blocks.push(MdBlock::ListItem {
-                depth: lists.len().saturating_sub(1),
-                marker: match counter {
-                    Some(n) => format!("{}.", n.saturating_sub(1)),
-                    None => "•".to_string(),
-                },
+        let kind = if let Some(level) = state.heading {
+            MdBlockKind::Heading { level, spans }
+        } else if let Some(counter) = state.lists.last() {
+            let first = state.item_pending_marker;
+            state.item_pending_marker = false;
+            MdBlockKind::ListItem {
+                ordered: counter.map(|n| n.saturating_sub(1)),
+                task: if first { state.task.take() } else { None },
+                continuation: !first,
                 spans,
-            });
-        } else if quote_depth > 0 {
-            blocks.push(MdBlock::Quote { spans });
+            }
         } else {
-            blocks.push(MdBlock::Paragraph { spans });
-        }
+            MdBlockKind::Paragraph { spans }
+        };
+        blocks.push(MdBlock::nested(kind, state.quote_depth, state.lists.len()));
     }
 
     for event in parser {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                heading = Some(level as u8);
+                flush(&mut blocks, &mut spans, &mut state);
+                state.heading = Some(level as u8);
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                heading = None;
+                flush(&mut blocks, &mut spans, &mut state);
+                state.heading = None;
             }
             Event::Start(Tag::List(start)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                lists.push(start);
+                flush(&mut blocks, &mut spans, &mut state);
+                state.lists.push(start);
             }
             Event::End(TagEnd::List(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                lists.pop();
+                flush(&mut blocks, &mut spans, &mut state);
+                state.lists.pop();
             }
             Event::Start(Tag::Item) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                if let Some(Some(counter)) = lists.last_mut() {
+                flush(&mut blocks, &mut spans, &mut state);
+                if let Some(Some(counter)) = state.lists.last_mut() {
                     *counter += 1;
                 }
+                state.item_pending_marker = true;
+                state.task = None;
             }
             Event::End(TagEnd::Item) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
+                // 中身が空の項目（`-` だけの行）でもマーカーは残す
+                if state.item_pending_marker {
+                    flush_empty_item(&mut blocks, &mut state);
+                }
             }
             Event::Start(Tag::BlockQuote(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                quote_depth += 1;
+                flush(&mut blocks, &mut spans, &mut state);
+                state.quote_depth += 1;
             }
             Event::End(TagEnd::BlockQuote(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                quote_depth = quote_depth.saturating_sub(1);
+                flush(&mut blocks, &mut spans, &mut state);
+                state.quote_depth = state.quote_depth.saturating_sub(1);
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
                 let lang = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().unwrap_or("").to_string()
-                    }
-                    CodeBlockKind::Indented => String::new(),
+                    CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .filter(|token| !token.is_empty())
+                        .map(str::to_string),
+                    CodeBlockKind::Indented => None,
                 };
                 code = Some((lang, String::new()));
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some((lang, body)) = code.take() {
                     let body = body.strip_suffix('\n').unwrap_or(&body);
-                    blocks.push(MdBlock::CodeBlock {
-                        lines: highlighter().highlight_lang(&lang, body),
-                    });
+                    let lines = highlighter().highlight_lang(lang.as_deref().unwrap_or(""), body);
+                    let kind = MdBlockKind::CodeBlock { lang, lines };
+                    // リスト項目の中のコードブロックも項目の続きとして字下げする
+                    state.item_pending_marker = false;
+                    blocks.push(MdBlock::nested(kind, state.quote_depth, state.lists.len()));
+                }
+            }
+            Event::Start(Tag::Table(alignments)) => {
+                flush(&mut blocks, &mut spans, &mut state);
+                spans.clear();
+                table = Some(MdTableBuilder::new(&alignments));
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(builder) = table.take() {
+                    state.item_pending_marker = false;
+                    blocks.push(MdBlock::nested(
+                        builder.finish(),
+                        state.quote_depth,
+                        state.lists.len(),
+                    ));
+                }
+            }
+            Event::Start(Tag::TableHead) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.in_head = true;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.end_row();
+                    builder.in_head = false;
+                }
+            }
+            Event::Start(Tag::TableRow) => {}
+            Event::End(TagEnd::TableRow) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.end_row();
+                }
+            }
+            Event::Start(Tag::TableCell) => spans.clear(),
+            Event::End(TagEnd::TableCell) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.push_cell(std::mem::take(&mut spans));
                 }
             }
             Event::Start(Tag::Paragraph) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
             }
             Event::End(TagEnd::Paragraph) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
             }
             Event::Start(Tag::Strong) => bold += 1,
             Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
@@ -1216,8 +1328,8 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
             Event::Start(Tag::Link { .. }) => link += 1,
             Event::End(TagEnd::Link) => link = link.saturating_sub(1),
             Event::Rule => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                blocks.push(MdBlock::Rule);
+                flush(&mut blocks, &mut spans, &mut state);
+                blocks.push(MdBlock::new(MdBlockKind::Rule));
             }
             Event::Text(t) => {
                 if let Some((_, body)) = code.as_mut() {
@@ -1230,25 +1342,186 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
             Event::SoftBreak | Event::HardBreak => {
                 push_span(&mut spans, " ", false, bold, italic, strike, link)
             }
-            Event::TaskListMarker(done) => push_span(
-                &mut spans,
-                // MD ソース表記のまま描画（絵文字全廃 #217。[x] / [ ] は mono で揃う）
-                if done { "[x] " } else { "[ ] " },
-                false,
-                bold,
-                italic,
-                strike,
-                link,
-            ),
-            // 表・HTML 等はインラインテキストとして劣化（内容を落とさない）
+            // チェックボックスは描画側が図形で描く（絵文字全廃 #217）。ここでは状態だけ持つ
+            Event::TaskListMarker(done) => state.task = Some(done),
+            // HTML 等はインラインテキストとして劣化（内容を落とさない）
             Event::Html(t) | Event::InlineHtml(t) => {
                 push_span(&mut spans, &t, false, bold, italic, strike, link)
             }
             _ => {}
         }
     }
-    flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+    flush(&mut blocks, &mut spans, &mut state);
     blocks
+}
+
+/// 中身が空のリスト項目（`- [ ]` だけ / `-` だけ）でもマーカー行を残す
+fn flush_empty_item(blocks: &mut Vec<MdBlock>, state: &mut MdParseState) {
+    let Some(counter) = state.lists.last() else {
+        return;
+    };
+    state.item_pending_marker = false;
+    blocks.push(MdBlock::nested(
+        MdBlockKind::ListItem {
+            ordered: counter.map(|n| n.saturating_sub(1)),
+            task: state.task.take(),
+            continuation: false,
+            spans: Vec::new(),
+        },
+        state.quote_depth,
+        state.lists.len(),
+    ));
+}
+
+/// 等幅フォントでの表示幅の近似（全角 = 2、半角 = 1）。表の列幅の初期配分に使うだけなので
+/// East Asian Width の厳密判定までは要らない（Issue #656）
+pub fn md_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| {
+            let cp = c as u32;
+            let wide = matches!(cp,
+                0x1100..=0x115F      // ハングル字母
+                | 0x2E80..=0x303E    // CJK 部首・記号
+                | 0x3041..=0x33FF    // かな・注音・囲み CJK
+                | 0x3400..=0x4DBF    // CJK 拡張 A
+                | 0x4E00..=0x9FFF    // CJK 統合漢字
+                | 0xA000..=0xA4CF    // イ文字
+                | 0xAC00..=0xD7A3    // ハングル音節
+                | 0xF900..=0xFAFF    // CJK 互換漢字
+                | 0xFE30..=0xFE6F    // CJK 互換形
+                | 0xFF00..=0xFF60    // 全角形
+                | 0xFFE0..=0xFFE6
+                | 0x1F300..=0x1FAFF  // 絵文字（幅 2 で数える）
+                | 0x20000..=0x3FFFD  // CJK 拡張 B 以降
+            );
+            if wide {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// 表の列幅の比（合計 1.0）。内容の表示幅から決めるが、極端な比率にならないよう
+/// 1 列あたり 4〜30 文字相当へ丸め、さらにセルの左右パディング相当を全列へ一律に足す。
+/// パディング分を足さないと「短いが折り返せない語」（`dark` 等）の列が痩せすぎて
+/// 1 語が 2 行に割れる。狭いペインでも全列が見えるよう flex で伸縮させる前提の
+/// 初期配分なので、厳密な実測幅ではなく表示幅の近似で足りる（Issue #656）
+pub fn md_table_column_shares(header: &[MdCell], rows: &[Vec<MdCell>], columns: usize) -> Vec<f32> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let cell_width = |cell: &MdCell| -> usize {
+        cell.iter()
+            .map(|span| md_display_width(&span.text))
+            .sum::<usize>()
+    };
+    let mut widths = vec![0usize; columns];
+    for row in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
+        for (index, cell) in row.iter().enumerate().take(columns) {
+            widths[index] = widths[index].max(cell_width(cell));
+        }
+    }
+    // セル左右パディング（描画側の `base * 0.6` × 2）を文字幅へ換算した分
+    const PADDING_COLUMNS: f32 = 2.0;
+    let weighted: Vec<f32> = widths
+        .iter()
+        .map(|w| (*w).clamp(4, 30) as f32 + PADDING_COLUMNS)
+        .collect();
+    let total: f32 = weighted.iter().sum();
+    if total <= 0.0 {
+        return vec![1.0 / columns as f32; columns];
+    }
+    weighted.iter().map(|w| w / total).collect()
+}
+
+/// 箇条書きマーカーの字形（絵文字を使わず図形で描く。#217 の絵文字全廃に従う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdBullet {
+    /// 塗りの丸（第 1 階層）
+    Dot,
+    /// 中抜きの丸（第 2 階層）
+    Ring,
+    /// 塗りの四角（第 3 階層以降）
+    Square,
+}
+
+/// リストのネスト段（1 始まり）からマーカー字形を決める
+pub fn md_bullet_for_depth(list_depth: usize) -> MdBullet {
+    match list_depth {
+        0 | 1 => MdBullet::Dot,
+        2 => MdBullet::Ring,
+        _ => MdBullet::Square,
+    }
+}
+
+/// 表の組み立て。列数は必ずヘッダ（= 配置指定）の長さに正規化するので、
+/// 行ごとにセル数が違う壊れた表でもグリッドがずれない（Issue #656）
+struct MdTableBuilder {
+    align: Vec<MdAlign>,
+    header: Vec<MdCell>,
+    rows: Vec<Vec<MdCell>>,
+    row: Vec<MdCell>,
+    in_head: bool,
+}
+
+impl MdTableBuilder {
+    fn new(alignments: &[pulldown_cmark::Alignment]) -> Self {
+        use pulldown_cmark::Alignment;
+        Self {
+            align: alignments
+                .iter()
+                .map(|a| match a {
+                    Alignment::None => MdAlign::None,
+                    Alignment::Left => MdAlign::Left,
+                    Alignment::Center => MdAlign::Center,
+                    Alignment::Right => MdAlign::Right,
+                })
+                .collect(),
+            header: Vec::new(),
+            rows: Vec::new(),
+            row: Vec::new(),
+            in_head: false,
+        }
+    }
+
+    fn push_cell(&mut self, cell: MdCell) {
+        self.row.push(cell);
+    }
+
+    fn end_row(&mut self) {
+        let row = std::mem::take(&mut self.row);
+        if row.is_empty() {
+            return;
+        }
+        if self.in_head {
+            self.header = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+
+    fn finish(mut self) -> MdBlockKind {
+        // 未確定の行（End(TableRow) が来ない壊れた入力）も取りこぼさない
+        self.end_row();
+        let columns = self
+            .align
+            .len()
+            .max(self.header.len())
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1);
+        self.align.resize(columns, MdAlign::None);
+        let fit = |mut row: Vec<MdCell>| {
+            row.resize(columns, Vec::new());
+            row
+        };
+        MdBlockKind::Table {
+            align: self.align,
+            header: fit(self.header),
+            rows: self.rows.into_iter().map(fit).collect(),
+        }
+    }
 }
 
 /// Markdown 本文とアウトラインを 1 回のロードで完成させる（Issue #232）。
@@ -1259,7 +1532,7 @@ fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
         .iter()
         .enumerate()
         .filter_map(|(block, entry)| {
-            let MdBlock::Heading { level, spans } = entry else {
+            let MdBlockKind::Heading { level, spans } = &entry.kind else {
                 return None;
             };
             let title = spans
@@ -1283,6 +1556,12 @@ fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
 pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
     parse_markdown_blocks(text)
 }
+
+/// 表示品質確認用の代表 Markdown（Issue #656）。全ブロック種別・全見出しレベル・
+/// 配置指定つき表・ネスト引用・深いリスト・タスクリストを 1 本に収めてある。
+/// 単体テストと visual-test（実ピクセル検査）が同じ内容を見るため定数で共有する。
+#[cfg(any(test, feature = "visual-test"))]
+pub const MARKDOWN_SHOWCASE: &str = include_str!("../resources/fixtures/markdown-showcase.md");
 
 #[cfg(test)]
 mod tests {
@@ -1334,34 +1613,268 @@ mod tests {
         let text = "# 見出し\n\n本文 **強調** と `code`。\n\n- 項目1\n- 項目2\n\n```rust\nfn f() {}\n```\n\n---\n";
         let blocks = markdown_blocks(text);
         assert!(matches!(
-            &blocks[0],
-            MdBlock::Heading { level: 1, spans } if spans[0].text == "見出し"
+            &blocks[0].kind,
+            MdBlockKind::Heading { level: 1, spans } if spans[0].text == "見出し"
         ));
-        let MdBlock::Paragraph { spans } = &blocks[1] else {
+        let MdBlockKind::Paragraph { spans } = &blocks[1].kind else {
             panic!("段落になる: {:?}", blocks[1]);
         };
         assert!(spans.iter().any(|s| s.bold && s.text == "強調"));
         assert!(spans.iter().any(|s| s.code && s.text == "code"));
         let items: Vec<_> = blocks
             .iter()
-            .filter_map(|b| match b {
-                MdBlock::ListItem { marker, spans, .. } => {
-                    Some((marker.clone(), spans[0].text.clone()))
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { ordered, spans, .. } => {
+                    Some((*ordered, spans[0].text.clone()))
                 }
                 _ => None,
             })
             .collect();
         assert_eq!(
             items,
-            vec![
-                ("•".to_string(), "項目1".to_string()),
-                ("•".to_string(), "項目2".to_string())
-            ]
+            vec![(None, "項目1".to_string()), (None, "項目2".to_string())]
         );
         assert!(blocks
             .iter()
-            .any(|b| matches!(b, MdBlock::CodeBlock { lines } if !lines.is_empty())));
-        assert!(blocks.iter().any(|b| matches!(b, MdBlock::Rule)));
+            .any(|b| matches!(&b.kind, MdBlockKind::CodeBlock { lang, lines }
+                if lang.as_deref() == Some("rust") && !lines.is_empty())));
+        assert!(blocks.iter().any(|b| matches!(b.kind, MdBlockKind::Rule)));
+    }
+
+    /// Issue #656: GFM テーブルが表構造として保持され、配置指定も残る
+    #[test]
+    fn gfmテーブルが表構造へパースされる() {
+        let text = "| 左 | 中央 | 右 |\n|:---|:---:|---:|\n| a | `b` | **c** |\n| d |  | f |\n";
+        let blocks = markdown_blocks(text);
+        let table = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                MdBlockKind::Table {
+                    align,
+                    header,
+                    rows,
+                } => Some((align, header, rows)),
+                _ => None,
+            })
+            .expect("表ブロックになる");
+        let (align, header, rows) = table;
+        assert_eq!(align, &vec![MdAlign::Left, MdAlign::Center, MdAlign::Right]);
+        assert_eq!(header.len(), 3);
+        assert_eq!(header[1][0].text, "中央");
+        assert_eq!(rows.len(), 2);
+        // セル内のインライン装飾は保持される
+        assert!(rows[0][1].iter().any(|s| s.code && s.text == "b"));
+        assert!(rows[0][2].iter().any(|s| s.bold && s.text == "c"));
+        // 空セルは空スパン列（列数はヘッダに合わせて正規化）
+        assert_eq!(rows[1].len(), 3);
+        assert!(rows[1][1].is_empty());
+    }
+
+    /// 行ごとにセル数が違う壊れた表でも列数を正規化してグリッドを崩さない
+    #[test]
+    fn 列数が揃わない表は正規化される() {
+        let text = "| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |\n";
+        let blocks = markdown_blocks(text);
+        let MdBlockKind::Table {
+            align,
+            header,
+            rows,
+        } = &blocks
+            .iter()
+            .find(|b| matches!(b.kind, MdBlockKind::Table { .. }))
+            .expect("表ブロックになる")
+            .kind
+        else {
+            unreachable!()
+        };
+        let columns = align.len();
+        assert_eq!(header.len(), columns);
+        for row in rows {
+            assert_eq!(row.len(), columns, "全行が同じ列数へ揃う");
+        }
+    }
+
+    /// タスクリストはテキストではなく状態として持つ（描画側が図形で描く）
+    #[test]
+    fn タスクリストは完了状態を持つ() {
+        let blocks = markdown_blocks("- [x] done\n- [ ] todo\n- plain\n");
+        let tasks: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { task, spans, .. } => {
+                    Some((*task, spans[0].text.trim().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tasks,
+            vec![
+                (Some(true), "done".to_string()),
+                (Some(false), "todo".to_string()),
+                (None, "plain".to_string()),
+            ]
+        );
+        // 旧実装は "[x] " をテキストへ混ぜていた。混ざっていないことを固定する
+        assert!(blocks.iter().all(|b| match &b.kind {
+            MdBlockKind::ListItem { spans, .. } => !spans.iter().any(|s| s.text.contains("[x]")),
+            _ => true,
+        }));
+    }
+
+    /// 引用のネストと、引用の中のリスト・コードブロックが引用深さを持つ
+    #[test]
+    fn 引用の深さが各ブロックに載る() {
+        let blocks = markdown_blocks("> 外側\n>\n> > 内側\n>\n> - 引用内リスト\n\n平文\n");
+        let depths: Vec<_> = blocks
+            .iter()
+            .map(|b| {
+                (
+                    b.quote_depth,
+                    match &b.kind {
+                        MdBlockKind::Paragraph { spans } => spans[0].text.clone(),
+                        MdBlockKind::ListItem { spans, .. } => spans[0].text.clone(),
+                        other => format!("{other:?}"),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(depths[0], (1, "外側".to_string()));
+        assert_eq!(depths[1], (2, "内側".to_string()));
+        assert_eq!(depths[2], (1, "引用内リスト".to_string()));
+        assert_eq!(depths[3], (0, "平文".to_string()));
+    }
+
+    /// リスト項目の 2 つ目以降のブロックはマーカーを重複させない
+    #[test]
+    fn リスト項目内の継続ブロックはマーカーを出さない() {
+        let blocks = markdown_blocks("- 一段落目\n\n  二段落目\n\n  ```sh\n  ls\n  ```\n");
+        let items: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem {
+                    continuation,
+                    spans,
+                    ..
+                } => Some((*continuation, spans[0].text.clone(), b.list_depth)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items[0], (false, "一段落目".to_string(), 1));
+        assert_eq!(items[1], (true, "二段落目".to_string(), 1));
+        // 項目内のコードブロックもリスト段を持ち、字下げが揃う
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(&b.kind, MdBlockKind::CodeBlock { .. }) && b.list_depth == 1));
+    }
+
+    #[test]
+    fn md_display_widthは全角を2で数える() {
+        assert_eq!(md_display_width("dark"), 4);
+        assert_eq!(md_display_width("既定値"), 6);
+        assert_eq!(md_display_width("UI テーマ"), 3 + 6);
+        // 記号・アクセント付きラテンは半角扱い
+        assert_eq!(md_display_width("café"), 4);
+        assert_eq!(md_display_width(""), 0);
+    }
+
+    /// Issue #656: 短くて折り返せない列（`dark`）が痩せて 1 語 2 行に割れないこと。
+    /// パディング相当を足さない旧実装ではこの列の取り分が足りなかった
+    #[test]
+    fn md_table_column_sharesは短い列にも取り分を残す() {
+        let cell = |text: &str| -> MdCell {
+            vec![MdSpan {
+                text: text.to_string(),
+                ..MdSpan::default()
+            }]
+        };
+        let header = vec![cell("コマンド"), cell("既定値"), cell("説明")];
+        let rows = vec![
+            vec![
+                cell("tako autosuggest"),
+                cell("dark"),
+                cell("UI テーマの切替。引数なしで現在値"),
+            ],
+            vec![cell("tako lang"), cell("auto"), cell("表示言語")],
+        ];
+        let shares = md_table_column_shares(&header, &rows, 3);
+        assert_eq!(shares.len(), 3);
+        assert!((shares.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        // 450px 相当の表幅で「dark」(4 文字 ≒ 34px) + パディング 16px が入ること
+        let table_width = 450.0;
+        let value_column = shares[1] * table_width;
+        assert!(
+            value_column >= 50.0,
+            "既定値の列が痩せすぎ: {value_column:.1}px"
+        );
+        // 一番広い列が全体を占有しない（他列が読める幅を保つ）
+        assert!(shares[2] < 0.7, "説明の列が占有しすぎ: {}", shares[2]);
+        // 列数だけ渡して中身が空でも均等割りで返る
+        let empty = md_table_column_shares(&[], &[], 3);
+        assert_eq!(empty.len(), 3);
+        assert!((empty[0] - 1.0 / 3.0).abs() < 1e-5);
+        assert!(md_table_column_shares(&[], &[], 0).is_empty());
+    }
+
+    #[test]
+    fn md_bullet_for_depthは階層で字形を変える() {
+        assert_eq!(md_bullet_for_depth(1), MdBullet::Dot);
+        assert_eq!(md_bullet_for_depth(2), MdBullet::Ring);
+        assert_eq!(md_bullet_for_depth(3), MdBullet::Square);
+        assert_eq!(md_bullet_for_depth(9), MdBullet::Square);
+    }
+
+    /// 言語指定なしフェンスは lang=None（描画側が等幅の素表示にする）
+    #[test]
+    fn 言語指定なしコードフェンス() {
+        let blocks = markdown_blocks("```\nplain text\n```\n");
+        assert!(blocks.iter().any(|b| matches!(
+            &b.kind,
+            MdBlockKind::CodeBlock { lang: None, lines } if !lines.is_empty()
+        )));
+    }
+
+    /// 代表 md（フィクスチャ）に全要素が含まれ、全部パースできること
+    #[test]
+    fn 代表フィクスチャに全ブロック種別が含まれる() {
+        let blocks = markdown_blocks(MARKDOWN_SHOWCASE);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut heading_levels = std::collections::BTreeSet::new();
+        for block in &blocks {
+            seen.insert(match &block.kind {
+                MdBlockKind::Heading { level, .. } => {
+                    heading_levels.insert(*level);
+                    "heading"
+                }
+                MdBlockKind::Paragraph { .. } => "paragraph",
+                MdBlockKind::ListItem { .. } => "list",
+                MdBlockKind::CodeBlock { .. } => "code",
+                MdBlockKind::Table { .. } => "table",
+                MdBlockKind::Rule => "rule",
+            });
+        }
+        for kind in ["heading", "paragraph", "list", "code", "table", "rule"] {
+            assert!(seen.contains(kind), "{kind} がフィクスチャに無い");
+        }
+        assert_eq!(
+            heading_levels,
+            (1u8..=6).collect(),
+            "H1〜H6 すべてがフィクスチャに要る"
+        );
+        // 引用・タスク・言語なしフェンス・配置指定つき表も揃っていること
+        assert!(blocks.iter().any(|b| b.quote_depth >= 2), "ネスト引用");
+        assert!(blocks.iter().any(|b| b.list_depth >= 3), "深いネストリスト");
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(&b.kind, MdBlockKind::ListItem { task: Some(_), .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(&b.kind, MdBlockKind::CodeBlock { lang: None, .. })));
+        assert!(blocks.iter().any(|b| matches!(
+            &b.kind,
+            MdBlockKind::Table { align, .. }
+                if align.contains(&MdAlign::Center) && align.contains(&MdAlign::Right)
+        )));
     }
 
     #[test]
@@ -1392,23 +1905,35 @@ mod tests {
         let blocks = markdown_blocks("1. one\n2. two\n   - sub\n");
         let items: Vec<_> = blocks
             .iter()
-            .filter_map(|b| match b {
-                MdBlock::ListItem {
-                    depth,
-                    marker,
-                    spans,
-                } => Some((*depth, marker.clone(), spans[0].text.clone())),
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { ordered, spans, .. } => {
+                    Some((b.list_depth, *ordered, spans[0].text.clone()))
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(
             items,
             vec![
-                (0, "1.".to_string(), "one".to_string()),
-                (0, "2.".to_string(), "two".to_string()),
-                (1, "•".to_string(), "sub".to_string()),
+                (1, Some(1), "one".to_string()),
+                (1, Some(2), "two".to_string()),
+                (2, None, "sub".to_string()),
             ]
         );
+    }
+
+    /// 開始番号を指定した番号付きリスト（`5.` から始まる）でも表示番号が続く
+    #[test]
+    fn 番号付きリストの開始番号を尊重する() {
+        let blocks = markdown_blocks("5. five\n6. six\n");
+        let numbers: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { ordered, .. } => *ordered,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![5, 6]);
     }
 
     #[test]
@@ -1439,7 +1964,7 @@ mod tests {
         assert!(matches!(
             &loaded.state.content,
             PreviewContent::Markdown(blocks)
-                if matches!(&blocks[0], MdBlock::Heading { spans, .. }
+                if matches!(&blocks[0].kind, MdBlockKind::Heading { spans, .. }
                     if spans[0].text == "変更後")
         ));
         assert_eq!(
