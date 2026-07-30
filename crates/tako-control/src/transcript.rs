@@ -1,7 +1,9 @@
 //! transcript — Claude Code の会話ログ（transcript JSONL）の読み取りと正規化
 //!
-//! `~/.claude/projects/<プロジェクトスラグ>/<session-id>.jsonl` を探し、
+//! `<claude config dir>/projects/<プロジェクトスラグ>/<session-id>.jsonl` を探し、
 //! スマホリモート UI が描画しやすい正規化 JSON へ変換する（Issue #23）。
+//! config ディレクトリはアカウント（`CLAUDE_CONFIG_DIR`）ごとに分かれるため、
+//! 既定の `~/.claude` だけでなく登録済みアカウントの分も走査する（Issue #652）。
 //!
 //! 正規化の方針:
 //! - `type: "user"`（本文が文字列のもの）と `type: "assistant"` だけを拾う。
@@ -14,7 +16,7 @@
 
 use std::collections::VecDeque;
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -31,21 +33,131 @@ pub fn is_valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// `~/.claude/projects/` 配下から session_id の transcript ファイルを探す
-pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
+/// transcript の所在（Issue #652）。どの claude config ディレクトリに属するかまで返す。
+/// resume はその config ディレクトリで実行しないと会話を見つけられない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLocation {
+    /// `<config dir>/projects/<プロジェクトスラグ>/<session-id>.jsonl`
+    pub path: PathBuf,
+    /// この transcript が属する claude config ディレクトリ
+    pub config_dir: PathBuf,
+    /// `config_dir` が claude の既定（`~/.claude`）か
+    pub is_default: bool,
+}
+
+/// パス比較用の正規化（`a/./b` や末尾スラッシュの表記ゆれを吸収する。
+/// 存在しないパスも比較できるよう canonicalize には頼らない）
+fn normalize(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+fn push_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    let normalized = normalize(&path);
+    if !dirs.contains(&normalized) {
+        dirs.push(normalized);
+    }
+}
+
+/// transcript を探す claude config ディレクトリの一覧（先頭が既定 `~/.claude`）。
+///
+/// claude は会話を `<config dir>/projects/` 配下へ保存するため、`CLAUDE_CONFIG_DIR` を
+/// 使うアカウント（#504 / #512）の会話は既定ディレクトリには存在しない。既定だけを見ると
+/// 別アカウントのペインは「会話が無い」と判定され resume されない（Issue #652 の根因）。
+///
+/// 走査順: 既定 → tako 自身のプロセス env の `CLAUDE_CONFIG_DIR`（アカウント env つきの
+/// ペインから GUI を起動すると紛れ込む。#571）→ accounts.yaml の `config_dir`。
+/// 同じ場所を指すものは重複排除する
+pub fn claude_config_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(default) = crate::orchestrator::claude_default_config_dir() {
+        push_dir(&mut dirs, default);
+    }
+    if let Some(env) = std::env::var_os(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV) {
+        let value = env.to_string_lossy().to_string();
+        if !value.trim().is_empty() {
+            push_dir(
+                &mut dirs,
+                PathBuf::from(crate::orchestrator::expand_tilde(&value)),
+            );
+        }
+    }
+    if let Ok(accounts) = crate::orchestrator::AccountsConfig::load() {
+        for (_, resolved) in accounts.list_resolved() {
+            let Ok(account) = resolved else { continue };
+            let Some(path) = account.config_dir.path() else {
+                continue; // inherit = 既定。先頭で走査済み
+            };
+            push_dir(&mut dirs, PathBuf::from(path));
+        }
+    }
+    dirs
+}
+
+/// 与えられた config ディレクトリ群から transcript の所在を特定する（走査対象を
+/// 引数で受け取る純粋版。テストから HOME を触らずに検証できる）
+pub fn locate_transcript_in(
+    dirs: &[PathBuf],
+    default_dir: Option<&Path>,
+    session_id: &str,
+) -> Option<TranscriptLocation> {
     if !is_valid_session_id(session_id) {
         return None;
     }
-    let home = std::env::var("HOME").ok()?;
-    let projects = PathBuf::from(home).join(".claude").join("projects");
-    let entries = std::fs::read_dir(&projects).ok()?;
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(format!("{session_id}.jsonl"));
-        if candidate.is_file() {
-            return Some(candidate);
+    let default_dir = default_dir.map(normalize);
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir.join("projects")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(format!("{session_id}.jsonl"));
+            if candidate.is_file() {
+                return Some(TranscriptLocation {
+                    path: candidate,
+                    is_default: default_dir.as_deref() == Some(dir.as_path()),
+                    config_dir: dir.clone(),
+                });
+            }
         }
     }
     None
+}
+
+/// 全 config ディレクトリ（`claude_config_dirs`）から session_id の transcript を探す
+pub fn locate_transcript(session_id: &str) -> Option<TranscriptLocation> {
+    let default_dir = crate::orchestrator::claude_default_config_dir();
+    locate_transcript_in(&claude_config_dirs(), default_dir.as_deref(), session_id)
+}
+
+/// session_id の transcript ファイルを探す（所在の config ディレクトリは問わない）
+pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
+    locate_transcript(session_id).map(|l| l.path)
+}
+
+/// resume 実行時にコマンドへ前置するシェル env プレフィクス（Issue #652）。
+///
+/// claude は `CLAUDE_CONFIG_DIR` で会話の保存先が変わるため、resume は**その会話が
+/// 保存されている config ディレクトリ**で実行しないと
+/// `No conversation found with session ID` で失敗する。tako 自身のプロセス env や
+/// ログインシェルの rc / direnv が別の値を持っていても勝てるよう、
+/// `export` / `unset` を明示する（#500 / #512 と同型）
+pub fn resume_env_prefix_for(location: &TranscriptLocation) -> String {
+    let key = crate::orchestrator::CLAUDE_CONFIG_DIR_ENV;
+    if location.is_default {
+        format!("unset {key}; ")
+    } else {
+        format!(
+            "export {key}={}; ",
+            crate::orchestrator::agent::sh_quote(&location.config_dir.display().to_string())
+        )
+    }
+}
+
+/// session_id の transcript を探し、resume に必要な env プレフィクスを返す。
+/// 見つからない = その会話は resume できないので None
+pub fn resume_env_prefix(session_id: &str) -> Option<String> {
+    locate_transcript(session_id)
+        .as_ref()
+        .map(resume_env_prefix_for)
 }
 
 /// transcript の末尾 `tail` 件を正規化 JSON で返す。
@@ -382,6 +494,106 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    /// `<config dir>/projects/<スラグ>/<id>.jsonl` を作る（Issue #652 のテスト用）
+    fn seed_transcript(config_dir: &Path, slug: &str, session_id: &str) -> PathBuf {
+        let dir = config_dir.join("projects").join(slug);
+        std::fs::create_dir_all(&dir).expect("create_dir_all");
+        let path = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, "{}\n").expect("write");
+        path
+    }
+
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実アカウントの config dir を消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Issue #652: アカウント（`CLAUDE_CONFIG_DIR`）の会話は既定 `~/.claude` に無い。
+    /// 走査は全 config ディレクトリを見て、所在（既定か否か）まで返す
+    #[test]
+    fn transcriptを全configディレクトリから探し所在を返す() {
+        let root = std::env::temp_dir().join(format!("tako-652-locate-{}", std::process::id()));
+        remove_temp_dir(&root);
+        let default_dir = root.join(".claude");
+        let univ_dir = root.join(".claude-univ");
+        let default_id = "11111111-2222-3333-4444-555555555555";
+        let univ_id = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
+        let default_path = seed_transcript(&default_dir, "-tmp-proj", default_id);
+        let univ_path = seed_transcript(&univ_dir, "-tmp-proj", univ_id);
+        let dirs = vec![default_dir.clone(), univ_dir.clone()];
+
+        let found = locate_transcript_in(&dirs, Some(&default_dir), default_id).expect("既定側");
+        assert_eq!(found.path, default_path);
+        assert_eq!(found.config_dir, default_dir);
+        assert!(found.is_default);
+
+        // 既定だけを見ていた旧実装が resume を諦めていたケース
+        let found = locate_transcript_in(&dirs, Some(&default_dir), univ_id).expect("univ 側");
+        assert_eq!(found.path, univ_path);
+        assert_eq!(found.config_dir, univ_dir);
+        assert!(!found.is_default);
+        // 既定だけを走査対象にすると見つからない（= 修正前の挙動）
+        assert!(locate_transcript_in(
+            std::slice::from_ref(&default_dir),
+            Some(&default_dir),
+            univ_id
+        )
+        .is_none());
+
+        // 実在しない ID / 不正な ID は None（パストラバーサル防止）
+        assert!(locate_transcript_in(
+            &dirs,
+            Some(&default_dir),
+            "99999999-0000-0000-0000-000000000000"
+        )
+        .is_none());
+        assert!(locate_transcript_in(&dirs, Some(&default_dir), "../../etc/passwd").is_none());
+
+        remove_temp_dir(&root);
+    }
+
+    /// resume 時の env プレフィクス。既定は明示 unset（tako 側 env / direnv の
+    /// 漏れに勝つ）、アカウントは export（#500 / #512 と同型）
+    #[test]
+    fn resume_env_prefixは所在に応じてexportとunsetを出し分ける() {
+        let default_loc = TranscriptLocation {
+            path: PathBuf::from("/home/me/.claude/projects/p/a.jsonl"),
+            config_dir: PathBuf::from("/home/me/.claude"),
+            is_default: true,
+        };
+        assert_eq!(
+            resume_env_prefix_for(&default_loc),
+            "unset CLAUDE_CONFIG_DIR; "
+        );
+
+        let univ_loc = TranscriptLocation {
+            path: PathBuf::from("/home/me/.claude-univ/projects/p/a.jsonl"),
+            config_dir: PathBuf::from("/home/me/.claude-univ"),
+            is_default: false,
+        };
+        assert_eq!(
+            resume_env_prefix_for(&univ_loc),
+            "export CLAUDE_CONFIG_DIR=/home/me/.claude-univ; "
+        );
+
+        // 空白入りパスはクォートされる（シェルへ渡すため）
+        let spaced = TranscriptLocation {
+            path: PathBuf::from("/home/me/My Configs/.claude/projects/p/a.jsonl"),
+            config_dir: PathBuf::from("/home/me/My Configs/.claude"),
+            is_default: false,
+        };
+        assert_eq!(
+            resume_env_prefix_for(&spaced),
+            "export CLAUDE_CONFIG_DIR='/home/me/My Configs/.claude'; "
+        );
     }
 
     #[test]
