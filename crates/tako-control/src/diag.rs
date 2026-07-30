@@ -284,8 +284,82 @@ fn span_log_rate_ok() -> bool {
     }
 }
 
+// ===== スケジューラ遅延の観測と、UI ストールの原因分類（#643） =====
+//
+// 「UI ストール」は foreground executor の再開遅延で測っている。ところが Windows では
+// タイマーが WinRT スレッドプール、再開がメインスレッドのキューという 2 段構えなので、
+// **遅れたのがどちらなのか区別できない**。実測（2026-07-29 の本番 perf.log）では
+// 98 件中 94 件が perf_span と共起せず、tako の専有では説明できなかった
+// （#168 のときは 1021 件すべてが dispatch のスパンと共起していた = 対照的）。
+//
+// そこで watchdog の**素の OS スレッド**自身の sleep 超過を「スケジューラ遅延」として
+// 記録する。この値はメインスレッドがどれだけ塞がっても・スレッドプールがどれだけ
+// 詰まっても伸びない（伸びるのはマシン全体が過負荷のときだけ）ので、
+// 「マシンが重い」と「tako が専有している」を切り分ける物差しになる。
+/// 前回の取り出し以降に観測したスケジューラ遅延のピーク（ms）
+static SCHED_LAG_PEAK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// watchdog スレッドの sleep 超過を記録する（ピークだけ保持）
+fn record_scheduler_lag(over: Duration) {
+    SCHED_LAG_PEAK_MS.fetch_max(over.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// 前回の呼び出し以降に観測したスケジューラ遅延のピークを取り出してリセットする。
+/// UI ストール監視ループが 1 秒ごとに呼ぶ想定（= 直近 1 秒のピークが取れる）
+pub fn take_scheduler_lag_peak() -> Duration {
+    Duration::from_millis(SCHED_LAG_PEAK_MS.swap(0, Ordering::Relaxed))
+}
+
+/// いまメインスレッドで走っている計測区間（タグ, 経過 ms）。無ければ `None`
+pub fn current_span_snapshot() -> Option<(String, u64)> {
+    let w = watch_lock();
+    w.current.as_ref().map(|s| {
+        (
+            s.tag.as_ref().to_string(),
+            s.started.elapsed().as_millis() as u64,
+        )
+    })
+}
+
+/// スケジューラ遅延がこの値以上なら「マシン全体が過負荷」と断じる。
+/// 素の OS スレッドの 50ms sleep が 0.5 秒を超えて返らないのは、
+/// tako 側の事情では起こせない（= CPU が他所で飽和している証拠）
+const SCHED_OVERLOAD_OVER: Duration = Duration::from_millis(500);
+
+/// UI ストールの原因を、実測値だけから分類して 1 行にする（#643）。
+///
+/// - `ui_lag`: foreground executor の再開遅延
+/// - `sched_lag`: 素の OS スレッドの sleep 超過（[`take_scheduler_lag_peak`]）
+/// - `span`: 記録時点でメインスレッドが走らせていた計測区間
+///
+/// 断定するのは根拠がある場合だけで、それ以外は「どこが遅れたか分からない」と
+/// 分かるように書く（原因を騙ると次の調査が丸ごと無駄になる）
+pub fn classify_stall(ui_lag: Duration, sched_lag: Duration, span: Option<(&str, u64)>) -> String {
+    let head = format!(
+        "UI ストール: foreground executor の再開が {:.2}s 遅延",
+        ui_lag.as_secs_f64()
+    );
+    if sched_lag >= SCHED_OVERLOAD_OVER {
+        return format!(
+            "{head}（素の OS スレッドの sleep も {:.2}s 超過 = マシン全体の過負荷。\
+             tako のメインスレッド専有ではない）",
+            sched_lag.as_secs_f64()
+        );
+    }
+    match span {
+        Some((tag, ms)) => format!(
+            "{head}（OS スレッドは正常。メインスレッドで {tag} が {ms}ms 継続中 = tako の専有）"
+        ),
+        None => format!(
+            "{head}（OS スレッドは正常・メインスレッドの計測区間も無し = \
+             再開経路（タイマー / キュー）側の遅延。#643）"
+        ),
+    }
+}
+
 /// メインスレッド・ウォッチドッグを起動する（多重呼び出しは無視）。
 /// 50ms ごとに現在区間を確認し、ハング級（2 秒超え継続）を drop を待たず記録する。
+/// 同時に自分自身の sleep 超過を[`record_scheduler_lag`]へ積む（#643）。
 /// verbose 時は 10 秒ごとにタグ別の所要分布も出力する
 pub fn spawn_stall_watchdog() {
     static STARTED: AtomicBool = AtomicBool::new(false);
@@ -297,7 +371,10 @@ pub fn spawn_stall_watchdog() {
         .spawn(|| {
             let mut last_stats = Instant::now();
             loop {
+                let tick = Instant::now();
                 std::thread::sleep(Duration::from_millis(50));
+                // #643: 自分の遅れ = マシン全体の混み具合。tako 側の専有では伸びない
+                record_scheduler_lag(tick.elapsed().saturating_sub(Duration::from_millis(50)));
                 // ハング級の中間報告（ロック中に I/O しない: メッセージだけ組んで出る）
                 let hang_msg = {
                     let mut w = watch_lock();
@@ -366,6 +443,64 @@ mod tests {
         assert_eq!(format_utc(1_709_210_096), "2024-02-29T12:34:56Z");
         // 年末境界 2023-12-31 23:59:59 UTC = 1_704_067_199
         assert_eq!(format_utc(1_704_067_199), "2023-12-31T23:59:59Z");
+    }
+
+    // --- #643: UI ストールの原因分類 ---
+
+    #[test]
+    fn os_スレッドまで遅れていればマシン全体の過負荷と断じる() {
+        // 素の OS スレッドの 50ms sleep が 3 秒超過 = tako 側の事情では起こせない
+        let msg = classify_stall(
+            Duration::from_millis(5500),
+            Duration::from_millis(3000),
+            // 計測区間が走っていても、OS スレッドの遅れが勝つ（そちらが上流の原因）
+            Some(("render", 40)),
+        );
+        assert!(msg.contains("マシン全体の過負荷"), "{msg}");
+        assert!(msg.contains("5.50s"), "{msg}");
+        assert!(msg.contains("3.00s"), "{msg}");
+    }
+
+    #[test]
+    fn os_スレッドが正常で計測区間が走っていれば_tako_の専有と分かる() {
+        let msg = classify_stall(
+            Duration::from_millis(2000),
+            Duration::from_millis(10),
+            Some(("dispatch:GitLog", 1900)),
+        );
+        assert!(msg.contains("tako の専有"), "{msg}");
+        assert!(msg.contains("dispatch:GitLog"), "{msg}");
+        assert!(msg.contains("1900ms"), "{msg}");
+        assert!(!msg.contains("マシン全体の過負荷"), "{msg}");
+    }
+
+    #[test]
+    fn どちらでもなければ再開経路の遅延として原因を騙らない() {
+        let msg = classify_stall(Duration::from_millis(4000), Duration::from_millis(20), None);
+        assert!(msg.contains("再開経路"), "{msg}");
+        assert!(!msg.contains("tako の専有"), "{msg}");
+        assert!(!msg.contains("マシン全体の過負荷"), "{msg}");
+    }
+
+    #[test]
+    fn 過負荷判定の境界はちょうど_500ms() {
+        let ui = Duration::from_secs(3);
+        let just_under = classify_stall(ui, SCHED_OVERLOAD_OVER - Duration::from_millis(1), None);
+        let exactly = classify_stall(ui, SCHED_OVERLOAD_OVER, None);
+        assert!(!just_under.contains("マシン全体の過負荷"), "{just_under}");
+        assert!(exactly.contains("マシン全体の過負荷"), "{exactly}");
+    }
+
+    #[test]
+    fn スケジューラ遅延のピークは取り出しでリセットされる() {
+        // 他テストとの相互作用を避けるため、まず溜まっているぶんを捨てる
+        let _ = take_scheduler_lag_peak();
+        record_scheduler_lag(Duration::from_millis(120));
+        record_scheduler_lag(Duration::from_millis(40)); // ピークは下がらない
+        record_scheduler_lag(Duration::from_millis(300));
+        assert_eq!(take_scheduler_lag_peak(), Duration::from_millis(300));
+        // 取り出したら次の窓はゼロから始まる
+        assert_eq!(take_scheduler_lag_peak(), Duration::ZERO);
     }
 
     #[test]
