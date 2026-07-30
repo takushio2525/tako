@@ -173,10 +173,16 @@ pub mod notes {
          thermal monitoring, rely on macOS-specific mechanisms that Windows does not have \
          (lid-close behavior follows the Windows power plan)",
     );
-    /// #525: 分割したペインを `/bin/sh -c` で起こす実装なので Windows では PTY 生成から失敗する
-    pub const WIN_RUN_POSIX_SHELL: Note = Note::new(
-        "コマンドの実行ペインを POSIX シェル（/bin/sh）で起こす実装のため Windows では起動できない",
-        "Spawns the command pane through a POSIX shell (/bin/sh), which does not exist on Windows",
+    /// #525: 実行ペインは PowerShell で起こすようにした（pwsh 7 → Windows PowerShell 5.1 の順に解決）。
+    /// 残る差は `&&` / `||` だけ。**何が落ちて何をすれば直るか**まで書く
+    /// （「Windows では使えない」と誤解されると回避行動を取られてしまうため）
+    pub const WIN_RUN_NO_CHAIN_ON_PS51: Note = Note::new(
+        "実行ペインは PowerShell で動く。ただし PowerShell 7 が無く Windows PowerShell 5.1 だけの環境では、\
+         `&&` / `||` でつないだコマンド（C / C++ / Rust の拡張子既定を含む）が構文エラーになる。\
+         PowerShell 7 を入れると解消する",
+        "The run pane works through PowerShell. On machines that only have Windows PowerShell 5.1 \
+         (no PowerShell 7), commands chained with `&&` or `||` — including the built-in extension \
+         defaults for C / C++ / Rust — fail to parse. Installing PowerShell 7 resolves this",
     );
     /// #525: 環境チェック・設定生成・MCP 登録・winget 案内まで通る。
     /// setup から設定**できない**項目だけが残る（何が残るかを具体的に書く）
@@ -834,11 +840,11 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_run",
         macos: Support::Supported,
-        // 分割したペインを `/bin/sh -c` で起こす実装なので Windows では PTY 生成から失敗する
-        //（実測 2026-07-27: `PTY を起動できなかった`）。#525 のシェル統合と一緒に直す
-        windows: Support::Pending {
-            note: notes::WIN_RUN_POSIX_SHELL,
-            issue: 525,
+        // #525 で実行ペインを PowerShell 経由にした（実測 2026-07-29: pwsh 7.6.4 /
+        // Windows PowerShell 5.1 の両方で終了コードの回収まで動作）。
+        // 残るのは 5.1 のみの環境で `&&` / `||` が構文エラーになる点だけ
+        windows: Support::Degraded {
+            note: notes::WIN_RUN_NO_CHAIN_ON_PS51,
         },
     },
     Feature {
@@ -849,17 +855,17 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_run_interactive",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_RUN_POSIX_SHELL,
-            issue: 525,
+        windows: Support::Degraded {
+            note: notes::WIN_RUN_NO_CHAIN_ON_PS51,
         },
     },
     Feature {
         key: "tako_run_interactive_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_RUN_POSIX_SHELL,
-            issue: 525,
+        // 終了コードは実行ペインが出すマーカー行から拾うので、経路は macOS と同一。
+        // cmdlet が `$LASTEXITCODE` を設定しない差は `platform::shell` 側で吸収済み
+        windows: Support::Degraded {
+            note: notes::WIN_RUN_NO_CHAIN_ON_PS51,
         },
     },
     Feature {

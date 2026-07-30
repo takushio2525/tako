@@ -24,8 +24,8 @@ tako platform --status pending # 未対応のものだけ
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
 | 対応済み | 92 | macOS 版と同じように使えます |
-| 一部対応 | 6 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 26 | まだ実装されていません（追跡 Issue つき） |
+| 一部対応 | 9 | 使えますが機能が落ちます（理由は各表に記載） |
+| 未対応 | 23 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **125** | |
 
@@ -178,11 +178,11 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
-| `tako_run` | 未対応 | コマンドの実行ペインを POSIX シェル（/bin/sh）で起こす実装のため Windows では起動できない <br />追跡: [#525](https://github.com/takushio2525/tako/issues/525) |
+| `tako_run` | 一部対応 | 実行ペインは PowerShell で動く。ただし PowerShell 7 が無く Windows PowerShell 5.1 だけの環境では、`&&` / `\|\|` でつないだコマンド（C / C++ / Rust の拡張子既定を含む）が構文エラーになる。PowerShell 7 を入れると解消する |
 | `tako_run_resolve` | 対応済み | — |
 | `tako_run_defaults` | 対応済み | — |
-| `tako_run_interactive` | 未対応 | コマンドの実行ペインを POSIX シェル（/bin/sh）で起こす実装のため Windows では起動できない <br />追跡: [#525](https://github.com/takushio2525/tako/issues/525) |
-| `tako_run_interactive_status` | 未対応 | コマンドの実行ペインを POSIX シェル（/bin/sh）で起こす実装のため Windows では起動できない <br />追跡: [#525](https://github.com/takushio2525/tako/issues/525) |
+| `tako_run_interactive` | 一部対応 | 実行ペインは PowerShell で動く。ただし PowerShell 7 が無く Windows PowerShell 5.1 だけの環境では、`&&` / `\|\|` でつないだコマンド（C / C++ / Rust の拡張子既定を含む）が構文エラーになる。PowerShell 7 を入れると解消する |
+| `tako_run_interactive_status` | 一部対応 | 実行ペインは PowerShell で動く。ただし PowerShell 7 が無く Windows PowerShell 5.1 だけの環境では、`&&` / `\|\|` でつないだコマンド（C / C++ / Rust の拡張子既定を含む）が構文エラーになる。PowerShell 7 を入れると解消する |
 
 ## セットアップ・OS 連携
 
