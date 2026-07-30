@@ -113,6 +113,7 @@ impl GitScrollBody {
     fn finish(self) -> gpui::Stateful<gpui::Div> {
         div()
             .id("git-scroll")
+            .when_some(crate::scroll_diag_handle("git"), |d, h| d.track_scroll(&h))
             .flex_1()
             .flex()
             .flex_col()
@@ -685,6 +686,7 @@ impl TakoApp {
                     .flex()
                     .flex_col()
                     .overflow_y_scroll()
+                    .when_some(crate::scroll_diag_handle("orch"), |d, h| d.track_scroll(&h))
                     .px(px(8.0))
                     .pb(px(8.0))
                     .when(cards.is_empty(), |d| {
@@ -2210,6 +2212,9 @@ impl TakoApp {
             root = root.child(card);
         }
 
+        if let Some(h) = crate::scroll_diag_handle("fleet") {
+            root = root.track_scroll(&h);
+        }
         root
     }
 

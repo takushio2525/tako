@@ -852,8 +852,8 @@ impl SettingsWindow {
             .min_w(px(0.))
             .flex()
             .flex_col()
-            .child(
-                div()
+            .child({
+                let mut body = div()
                     // タブごとにスクロール状態を分ける（同一 id だと前のタブの
                     // スクロール位置が残り、切替後に途中から表示される。#486）
                     .id(SharedString::from(format!(
@@ -866,8 +866,15 @@ impl SettingsWindow {
                     .bg(to_hsla(theme.surface_0))
                     .px_5()
                     .py_4()
-                    .child(content),
-            )
+                    .child(content);
+                // #654: 設定ページは別ウィンドウなのでメインの render を通らない。
+                // ここで一覧も出す（診断 OFF なら両方とも何もしない）
+                if let Some(h) = crate::scroll_diag_handle("settings") {
+                    body = body.track_scroll(&h);
+                }
+                crate::scroll_diag_report();
+                body
+            })
             .children(self.message.as_ref().map(|(text, is_error)| {
                 div()
                     .flex_none()

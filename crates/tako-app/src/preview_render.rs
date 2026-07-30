@@ -2903,6 +2903,7 @@ impl TakoApp {
                     .entry(pane_id)
                     .or_default()
                     .clone();
+                crate::scroll_diag_track("preview", &scroll_handle);
 
                 div()
                     .id(("preview-scroll", pane_id.as_u64()))
@@ -2913,6 +2914,13 @@ impl TakoApp {
                     .track_scroll(&scroll_handle)
                     .when(zoomable, |d| d.overflow_scroll())
                     .when(!zoomable, |d| d.overflow_y_scroll())
+                    // #654: ホイールがこのコンテナまで届いているかを残す（診断時のみ）。
+                    // gpui の組み込みスクロール処理とは独立で、伝播も止めない
+                    .when(crate::scroll_diag_enabled(), |d| {
+                        d.on_scroll_wheel(move |ev: &ScrollWheelEvent, _, _| {
+                            crate::scroll_diag_wheel("preview", &ev.delta);
+                        })
+                    })
                     .cursor(
                         if self
                             .preview_pdf_hovered_link
