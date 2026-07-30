@@ -106,6 +106,26 @@ fn 引数に空白を含むパスを渡しても1語に潰れない() {
 }
 
 #[test]
+fn 長時間実行でもマーカーは完了後にだけ出る() {
+    // status ポーリングは「マーカーがまだ無い = running」で判断する（`find_exit_marker`）。
+    // コマンドの完了より先にマーカーが出ると、走っている最中に完了扱いされてしまう
+    let started = std::time::Instant::now();
+    let out = run("Start-Sleep -Milliseconds 1500; Write-Host DONE");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1400),
+        "コマンドの完了を待たずに抜けた: {elapsed:?}"
+    );
+    assert!(out.contains("DONE"), "{out}");
+    assert_eq!(exit_code(&out), Some(0));
+    let marker_pos = out.rfind(MARKER).expect("マーカーがある");
+    assert!(
+        marker_pos > out.rfind("DONE").expect("DONE がある"),
+        "マーカーがコマンド出力より前に出ている: {out}"
+    );
+}
+
+#[test]
 fn 出力が長くてもマーカーは最後に出る() {
     // マーカーは画面の末尾から探されるので、出力に紛れて先に出ないこと
     let out = run("1..50 | ForEach-Object { Write-Host \"line $_\" }");
