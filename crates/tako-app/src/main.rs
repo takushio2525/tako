@@ -17878,6 +17878,49 @@ mod self_test {
         count(false).max(count(true))
     }
 
+    /// 指定した論理座標矩形内で、`surface` に対するコントラストが `min_ratio` 以上の
+    /// 実描画ピクセル数（Issue #669）。アンチエイリアスで淡くなった縁は落ちるので、
+    /// 「読める濃さで実際に塗られたグリフ」の量を数える指標になる
+    #[cfg(feature = "visual-test")]
+    fn readable_pixels_in_bounds(
+        frame: &image::RgbaImage,
+        bounds: &[Bounds<Pixels>],
+        scale: f32,
+        surface: tako_core::Rgb,
+        min_ratio: f32,
+    ) -> usize {
+        let (width, height) = frame.dimensions();
+        let count = |flip_y: bool| {
+            let mut pixels = std::collections::HashSet::new();
+            for bounds in bounds {
+                let left = (f32::from(bounds.left()) * scale).floor().max(0.0) as u32;
+                let right = ((f32::from(bounds.right()) * scale).ceil().max(0.0) as u32).min(width);
+                let raw_top = (f32::from(bounds.top()) * scale).floor().max(0.0) as u32;
+                let raw_bottom =
+                    ((f32::from(bounds.bottom()) * scale).ceil().max(0.0) as u32).min(height);
+                let (top, bottom) = if flip_y {
+                    (
+                        height.saturating_sub(raw_bottom),
+                        height.saturating_sub(raw_top),
+                    )
+                } else {
+                    (raw_top.min(height), raw_bottom.min(height))
+                };
+                for y in top..bottom {
+                    for x in left..right {
+                        let p = frame.get_pixel(x, y);
+                        let color = tako_core::Rgb::new(p[0], p[1], p[2]);
+                        if color.contrast_ratio(surface) >= min_ratio {
+                            pixels.insert((x, y));
+                        }
+                    }
+                }
+            }
+            pixels.len()
+        };
+        count(false).max(count(true))
+    }
+
     /// 指定した論理座標矩形の平均 RGB（Issue #656 の塗り分け検証）。
     /// Metal 読み戻しの上下方向はプラットフォームで異なる可能性があるので flip を選べる
     #[cfg(feature = "visual-test")]
@@ -19034,6 +19077,100 @@ mod self_test {
                             .expect("visual-test 編集終了");
                     })
                     .ok();
+
+                // Issue #669: コードプレビュー（非 md）の構文色がライトテーマでも読めること。
+                // 描画時変換なので (a) ハイライトの作り直し無しに即時反映され、
+                // (b) ダークへ戻すと元のピクセルに完全一致する
+                let set_theme = |mode: &str, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, cx| {
+                            let ok = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Theme {
+                                    action: Some("set".into()),
+                                    mode: Some(mode.into()),
+                                    target: None,
+                                    key: None,
+                                    value: None,
+                                    name: None,
+                                    font_family: None,
+                                    font_size: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .is_ok();
+                            cx.notify();
+                            ok
+                        })
+                        .unwrap_or(false)
+                };
+                let span_colors = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            match app.previews.get(&pdf_pane).map(|state| &state.content) {
+                                Some(preview::PreviewContent::Code(lines)) => lines
+                                    .iter()
+                                    .flat_map(|line| line.iter())
+                                    .filter_map(|span| span.color)
+                                    .map(|c| (c.r, c.g, c.b))
+                                    .collect::<Vec<_>>(),
+                                _ => Vec::new(),
+                            }
+                        })
+                        .unwrap_or_default()
+                };
+                let dark_frame = capture_frame(any, cx);
+                let dark_colors = span_colors(cx);
+                check(set_theme("light", cx), &format!("{language} theme light"));
+                let light_frame = capture_frame(any, cx);
+                let light_colors = span_colors(cx);
+                let theme_changed = match (dark_frame.as_ref(), light_frame.as_ref()) {
+                    (Some((dark, scale)), Some((light, _))) => {
+                        changed_pixels_in_bounds(dark, light, &text_bounds, *scale)
+                    }
+                    _ => 0,
+                };
+                let light_readable = match light_frame.as_ref() {
+                    Some((light, scale)) => readable_pixels_in_bounds(
+                        light,
+                        &text_bounds,
+                        *scale,
+                        tako_core::theme::Theme::for_mode(tako_core::theme::ThemeMode::Light)
+                            .background,
+                        4.5,
+                    ),
+                    None => 0,
+                };
+                check(set_theme("dark", cx), &format!("{language} theme dark 復帰"));
+                let dark_again = capture_frame(any, cx);
+                let dark_diff = match (dark_frame.as_ref(), dark_again.as_ref()) {
+                    (Some((first, scale)), Some((again, _))) => {
+                        changed_pixels_in_bounds(first, again, &text_bounds, *scale)
+                    }
+                    _ => usize::MAX,
+                };
+                println!(
+                    "TAKO_VISUAL_PIXEL: {language} light theme_changed={theme_changed} \
+                     light_readable={light_readable} dark_roundtrip_diff={dark_diff} \
+                     span_colors_stable={}",
+                    dark_colors == light_colors
+                );
+                check(
+                    theme_changed >= 8,
+                    &format!("visual-test {language} テーマ切替が即時反映される (#669)"),
+                );
+                check(
+                    light_readable >= 8,
+                    &format!("visual-test {language} ライトの実描画が 4.5:1 以上 (#669)"),
+                );
+                check(
+                    !dark_colors.is_empty() && dark_colors == light_colors,
+                    &format!("visual-test {language} 再ハイライト無しで反映される (#669)"),
+                );
+                check(
+                    dark_diff == 0,
+                    &format!("visual-test {language} ダークの描画が不変 (#669)"),
+                );
             }
 
             window
