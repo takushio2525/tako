@@ -13127,53 +13127,87 @@ impl TakoApp {
 /// GPUI が描画に使った TextLayout から、ウィンドウ座標を論理行と UTF-8 byte index へ戻す。
 /// bounds はスクロール後のウィンドウ座標を含むため、別途 padding / scroll / HiDPI 補正を
 /// 重ねず、描画と逆写像を同じデータに揃える。
+/// クリック位置と行の水平距離（行の内側なら 0）。表のセル選び分けに使う（#656）
+fn horizontal_gap(bounds: &Bounds<Pixels>, x: Pixels) -> f32 {
+    if x < bounds.left() {
+        f32::from(bounds.left() - x)
+    } else if x > bounds.right() {
+        f32::from(x - bounds.right())
+    } else {
+        0.0
+    }
+}
+
+/// 同じ y 帯に並ぶ行（= 表のセル。#656）から、クリック x に最も近い行を選ぶ。
+/// 単一カラムの本文では候補が 1 本しかないので従来と同じ結果になる
+fn pick_line_by_x(candidates: &[(usize, Bounds<Pixels>)], x: Pixels) -> Option<usize> {
+    candidates
+        .iter()
+        .min_by(|(_, a), (_, b)| horizontal_gap(a, x).total_cmp(&horizontal_gap(b, x)))
+        .map(|(index, _)| *index)
+}
+
 fn preview_text_layout_hit_test(
     layouts: &[Option<TextLayout>],
     texts: &[String],
     position: Point<Pixels>,
 ) -> Option<(usize, usize)> {
+    // 表は 1 行（セル）が横に並ぶので、y だけで最初に当たった行を採るとつねに
+    // 左端のセルへ寄ってしまう。y が重なる候補を集めてから x で選び分ける（#656）
+    let mut candidates: Vec<(usize, Bounds<Pixels>)> = Vec::new();
+    let mut first_below = None;
     let mut last_text_line = None;
     for (i, layout) in layouts.iter().enumerate() {
         let Some(layout) = layout else {
             continue;
         };
-        let line_text = texts.get(i).map(String::as_str).unwrap_or("");
         let bounds = layout.bounds();
         if position.y < bounds.top() {
-            return Some((i, 0));
+            if first_below.is_none() {
+                first_below = Some(i);
+            }
+        } else if position.y <= bounds.bottom() {
+            candidates.push((i, bounds));
+        } else {
+            last_text_line = Some(i);
         }
-        if position.y <= bounds.bottom() {
-            // GPUI の index_for_position は glyph の内側判定で、キャレット境界ちょうどでは
-            // 直前 glyph の開始 byte を返す。raw と次の UTF-8 境界それぞれの実キャレット
-            // 座標を比較し、クリック点に近い挿入位置へ丸める。
-            let raw = layout
-                .index_for_position(position)
-                .unwrap_or_else(|nearest| nearest)
-                .min(line_text.len());
-            let before = snap_to_char_boundary(line_text, raw);
-            let after = line_text[before..]
-                .chars()
-                .next()
-                .map(|ch| before + ch.len_utf8())
-                .unwrap_or(before);
-            let distance = |byte| {
-                layout
-                    .position_for_index(byte)
-                    .map(|caret| {
-                        let dx = f32::from(caret.x - position.x);
-                        let dy = f32::from(caret.y - position.y);
-                        dx * dx + dy * dy
-                    })
-                    .unwrap_or(f32::INFINITY)
-            };
-            let byte_offset = if distance(after) < distance(before) {
-                after
-            } else {
-                before
-            };
-            return Some((i, byte_offset));
-        }
-        last_text_line = Some(i);
+    }
+    if let Some(i) = pick_line_by_x(&candidates, position.x) {
+        let layout = layouts[i].as_ref()?;
+        let line_text = texts.get(i).map(String::as_str).unwrap_or("");
+        // GPUI の index_for_position は glyph の内側判定で、キャレット境界ちょうどでは
+        // 直前 glyph の開始 byte を返す。raw と次の UTF-8 境界それぞれの実キャレット
+        // 座標を比較し、クリック点に近い挿入位置へ丸める。
+        let raw = layout
+            .index_for_position(position)
+            .unwrap_or_else(|nearest| nearest)
+            .min(line_text.len());
+        let before = snap_to_char_boundary(line_text, raw);
+        let after = line_text[before..]
+            .chars()
+            .next()
+            .map(|ch| before + ch.len_utf8())
+            .unwrap_or(before);
+        let distance = |byte| {
+            layout
+                .position_for_index(byte)
+                .map(|caret| {
+                    let dx = f32::from(caret.x - position.x);
+                    let dy = f32::from(caret.y - position.y);
+                    dx * dx + dy * dy
+                })
+                .unwrap_or(f32::INFINITY)
+        };
+        let byte_offset = if distance(after) < distance(before) {
+            after
+        } else {
+            before
+        };
+        return Some((i, byte_offset));
+    }
+    // 行間・ブロック間をクリックしたときは直下の行の先頭へ寄せる（従来動作）
+    if let Some(i) = first_below {
+        return Some((i, 0));
     }
     last_text_line.map(|i| (i, texts.get(i).map_or(0, String::len)))
 }
@@ -13227,21 +13261,32 @@ fn merge_highlights(
     result
 }
 
-fn md_block_plain_text(block: &preview::MdBlock) -> String {
-    match block {
-        preview::MdBlock::Heading { spans, .. }
-        | preview::MdBlock::Paragraph { spans }
-        | preview::MdBlock::Quote { spans } => spans.iter().map(|s| s.text.as_str()).collect(),
-        preview::MdBlock::ListItem { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
-        preview::MdBlock::CodeBlock { lines } => lines
+/// Markdown ブロック 1 つが占める「選択行」のテキスト列（Issue #656）。
+///
+/// 選択・コピー・ヒットテストは「1 行 = 1 TextLayout」で動く。表は 1 ブロックの中に
+/// セルごとの StyledText を持つので、セル 1 つを 1 行として行方向へ展開する
+/// （行の並びは行優先: ヘッダ → 各行）。表以外は従来どおり 1 ブロック = 1 行。
+fn md_block_line_texts(block: &preview::MdBlock) -> Vec<String> {
+    let inline =
+        |spans: &[preview::MdSpan]| -> String { spans.iter().map(|s| s.text.as_str()).collect() };
+    match &block.kind {
+        preview::MdBlockKind::Heading { spans, .. }
+        | preview::MdBlockKind::Paragraph { spans }
+        | preview::MdBlockKind::ListItem { spans, .. } => vec![inline(spans)],
+        preview::MdBlockKind::CodeBlock { lines, .. } => vec![lines
             .iter()
             .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            ),
-        preview::MdBlock::Rule => String::new(),
+            .join("\n")],
+        preview::MdBlockKind::Table {
+            header,
+            rows,
+            align: _,
+        } => std::iter::once(header)
+            .chain(rows.iter())
+            .flat_map(|row| row.iter().map(|cell| inline(cell)))
+            .collect(),
+        preview::MdBlockKind::Rule => vec![String::new()],
     }
 }
 
@@ -17088,6 +17133,150 @@ mod self_test {
         count(false).max(count(true))
     }
 
+    /// 指定した論理座標矩形の平均 RGB（Issue #656 の塗り分け検証）。
+    /// Metal 読み戻しの上下方向はプラットフォームで異なる可能性があるので flip を選べる
+    #[cfg(feature = "visual-test")]
+    fn sample_mean_rgb(
+        frame: &image::RgbaImage,
+        scale: f32,
+        bounds: &Bounds<Pixels>,
+        flip_y: bool,
+    ) -> Option<[f32; 3]> {
+        let (width, height) = frame.dimensions();
+        let left = (f32::from(bounds.left()) * scale).round().max(0.0) as u32;
+        let right = ((f32::from(bounds.right()) * scale).round().max(0.0) as u32).min(width);
+        let raw_top = (f32::from(bounds.top()) * scale).round().max(0.0) as u32;
+        let raw_bottom = ((f32::from(bounds.bottom()) * scale).round().max(0.0) as u32).min(height);
+        let (top, bottom) = if flip_y {
+            (
+                height.saturating_sub(raw_bottom),
+                height.saturating_sub(raw_top),
+            )
+        } else {
+            (raw_top.min(height), raw_bottom.min(height))
+        };
+        let mut sum = [0f64; 3];
+        let mut count = 0u32;
+        for y in top..bottom {
+            for x in left..right {
+                let p = frame.get_pixel(x, y);
+                sum[0] += p[0] as f64;
+                sum[1] += p[1] as f64;
+                sum[2] += p[2] as f64;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| {
+            [
+                (sum[0] / count as f64) as f32,
+                (sum[1] / count as f64) as f32,
+                (sum[2] / count as f64) as f32,
+            ]
+        })
+    }
+
+    /// 平均 RGB とテーマ色のチャンネル最大差
+    #[cfg(feature = "visual-test")]
+    fn rgb_gap(sample: [f32; 3], color: tako_core::Rgb) -> f32 {
+        (sample[0] - color.r as f32)
+            .abs()
+            .max((sample[1] - color.g as f32).abs())
+            .max((sample[2] - color.b as f32).abs())
+    }
+
+    /// 2 つの平均 RGB のチャンネル最大差
+    #[cfg(feature = "visual-test")]
+    fn rgb_diff(a: [f32; 3], b: [f32; 3]) -> f32 {
+        (a[0] - b[0])
+            .abs()
+            .max((a[1] - b[1]).abs())
+            .max((a[2] - b[2]).abs())
+    }
+
+    /// Markdown プレビューのレイアウト不変条件（Issue #656）。
+    ///
+    /// 「行が縦に重ならない」= 次の行が前の行より下にある、または**同じ行の右隣にある**
+    /// （表のセルだけが横に並ぶ）。「横に溢れない」= 全行がペイン幅の内側にある。
+    /// 実 shaping の bounds を見るので、狭幅・ライト / ダーク・折り返しの全条件で効く
+    #[cfg(feature = "visual-test")]
+    fn md_layout_invariants(
+        layouts: &[Option<TextLayout>],
+        texts: &[String],
+        pane: &Bounds<Pixels>,
+    ) -> (bool, bool, String) {
+        // 画面外の行は prepaint されず bounds が前フレームのまま残るので、
+        // 今フレームで実際に描かれた（= ペインの見える範囲に収まる）行だけを見る
+        let bounds: Vec<(usize, Bounds<Pixels>)> = layouts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, layout)| layout.as_ref().map(|l| (i, l.bounds())))
+            .filter(|(_, b)| {
+                f32::from(b.bottom()) > f32::from(pane.top())
+                    && f32::from(b.top()) < f32::from(pane.bottom())
+            })
+            .collect();
+        let tolerance = 1.0f32;
+        let mut overlaps = 0usize;
+        let mut overflow = 0usize;
+        let mut detail = String::new();
+        let rect = |b: &Bounds<Pixels>| {
+            format!(
+                "{:.0},{:.0}-{:.0},{:.0}",
+                f32::from(b.left()),
+                f32::from(b.top()),
+                f32::from(b.right()),
+                f32::from(b.bottom())
+            )
+        };
+        let label = |line: usize| -> String {
+            texts
+                .get(line)
+                .map(|t| t.chars().take(12).collect::<String>())
+                .unwrap_or_default()
+        };
+        for pair in bounds.windows(2) {
+            let ((pi, prev), (ni, next)) = (pair[0], pair[1]);
+            let below = f32::from(next.top()) >= f32::from(prev.bottom()) - tolerance;
+            let right_of = f32::from(next.left()) >= f32::from(prev.right()) - tolerance;
+            if !below && !right_of {
+                overlaps += 1;
+                if overlaps <= 4 {
+                    detail.push_str(&format!(
+                        " overlap(prev#{pi} {:?} {} next#{ni} {:?} {})",
+                        label(pi),
+                        rect(&prev),
+                        label(ni),
+                        rect(&next)
+                    ));
+                }
+            }
+        }
+        for (line, b) in bounds.iter() {
+            if f32::from(b.right()) > f32::from(pane.right()) + tolerance
+                || f32::from(b.left()) < f32::from(pane.left()) - tolerance
+            {
+                overflow += 1;
+                if overflow <= 4 {
+                    detail.push_str(&format!(
+                        " overflow#{line}({:?} {} pane {})",
+                        label(*line),
+                        rect(b),
+                        rect(pane)
+                    ));
+                }
+            }
+        }
+        (
+            overlaps == 0,
+            overflow == 0,
+            format!(
+                "lines={} overlaps={overlaps} overflow={overflow} pane_w={:.0}{detail}",
+                bounds.len(),
+                f32::from(pane.size.width)
+            ),
+        )
+    }
+
     /// サブラインスクロール（#159）の実ピクセル検証: `after` を `dy_logical`（論理 px）
     /// ぶん y 方向へ戻して `before` と比較する。ピクセル単位スクロールが機能していれば
     /// 「そのまま比較 = 大差分 / 戻して比較 = ほぼ一致」になる。
@@ -17320,8 +17509,692 @@ mod self_test {
         )
     }
 
-    /// #152 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の PTY / fd
-    /// ストレス項目のタイミングに左右されず PDF・C++・Python の scene だけを検査する。
+    /// 指定した選択行（Markdown のブロック / 表セル）がペイン上端付近へ来るまでスクロールする
+    #[cfg(feature = "visual-test")]
+    async fn scroll_md_to_line(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        line: usize,
+    ) {
+        window
+            .update(cx, |app, _, cx| {
+                if let (Some(handle), Some(target_bounds)) = (
+                    app.preview_scroll_handles.get(&pane),
+                    app.preview_text_layouts
+                        .get(&pane)
+                        .and_then(|l| l.get(line).cloned())
+                        .flatten()
+                        .map(|layout| layout.bounds()),
+                ) {
+                    let target = handle.bounds().top() + px(56.0);
+                    let offset = handle.offset();
+                    handle.set_offset(point(offset.x, offset.y + (target - target_bounds.top())));
+                }
+                cx.notify();
+            })
+            .ok();
+        cx.background_executor()
+            .timer(Duration::from_millis(200))
+            .await;
+    }
+
+    /// Markdown プレビューの検証に使う状態（行レイアウト・ペイン矩形・テーマ）を取る
+    #[cfg(feature = "visual-test")]
+    fn md_visual_state(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> (Vec<Option<TextLayout>>, Vec<String>, Bounds<Pixels>, Theme) {
+        window
+            .update(cx, |app, _, _| {
+                (
+                    app.preview_text_layouts
+                        .get(&pane)
+                        .cloned()
+                        .unwrap_or_default(),
+                    app.preview_line_texts
+                        .get(&pane)
+                        .cloned()
+                        .unwrap_or_default(),
+                    app.preview_scroll_handles
+                        .get(&pane)
+                        .map(|handle| handle.bounds())
+                        .unwrap_or_default(),
+                    app.theme.clone(),
+                )
+            })
+            .unwrap_or_else(|_| fail("visual-test md: 状態取得"))
+    }
+
+    /// Markdown プレビュー表示品質の実フレーム検証（Issue #656）。
+    /// ダーク / ライト / 狭幅の 3 状態で、レイアウト不変条件・塗り分け・
+    /// 表セルのヒットテストと選択コピーを機械検証する
+    #[cfg(feature = "visual-test")]
+    async fn markdown_preview_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let dir = std::env::temp_dir().join(format!("tako-visual-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test md 一時ディレクトリ");
+        let path = dir.join("showcase.md");
+        std::fs::write(&path, preview::MARKDOWN_SHOWCASE).expect("visual-test md fixture");
+
+        let (base, md_pane) = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test md を dispatch で開ける");
+                cx.notify();
+                (
+                    base,
+                    PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane")),
+                )
+            })
+            .unwrap_or_else(|_| fail("visual-test md dispatch"));
+
+        // background ロード完了（Markdown ブロックへの差し替え）を待つ
+        let loaded = wait_for_preview_state(window, cx, Duration::from_secs(5), |app| {
+            matches!(
+                app.previews.get(&md_pane).map(|state| &state.content),
+                Some(preview::PreviewContent::Markdown(blocks))
+                    if blocks.iter().any(|b| matches!(&b.kind, preview::MdBlockKind::Table { .. }))
+            )
+        })
+        .await;
+        check(
+            loaded.is_some(),
+            "visual-test md: 表を含む本文がロードされる",
+        );
+
+        // 最初の表と最初のコードブロックの選択行番号を求める（描画順 = 行優先）
+        let (table_line, table_columns, code_line, total_lines) = window
+            .update(cx, |app, _, _| {
+                let Some(preview::PreviewContent::Markdown(blocks)) =
+                    app.previews.get(&md_pane).map(|s| &s.content)
+                else {
+                    return (None, 0usize, None, 0usize);
+                };
+                let mut line = 0usize;
+                let mut table = None;
+                let mut columns = 0usize;
+                let mut code = None;
+                for block in blocks {
+                    match &block.kind {
+                        preview::MdBlockKind::Table { align, header, .. } if table.is_none() => {
+                            table = Some(line);
+                            columns = align.len().max(header.len());
+                        }
+                        preview::MdBlockKind::CodeBlock { lang, .. }
+                            if code.is_none() && lang.is_some() =>
+                        {
+                            code = Some(line);
+                        }
+                        _ => {}
+                    }
+                    line += md_block_line_texts(block).len();
+                }
+                (table, columns, code, line)
+            })
+            .unwrap_or((None, 0, None, 0));
+        let table_line = table_line.unwrap_or_else(|| fail("visual-test md: 表ブロックが無い"));
+        let code_line = code_line.unwrap_or_else(|| fail("visual-test md: コードブロックが無い"));
+        check(table_columns >= 3, "visual-test md: 表が 3 列以上ある");
+        println!(
+            "TAKO_VISUAL_PIXEL: md fixture lines={total_lines} table_line={table_line} \
+             columns={table_columns} code_line={code_line}"
+        );
+
+        for state in ["dark", "light", "narrow"] {
+            window
+                .update(cx, |app, _, cx| {
+                    let mode = if state == "light" { "light" } else { "dark" };
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some(mode.into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    // 狭幅（全幅の約 1/3）でも崩れないことを見る
+                    let share = if state == "narrow" { 0.33 } else { 0.5 };
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Resize {
+                            pane: Some(md_pane.as_u64()),
+                            axis: tako_control::protocol::Axis::X,
+                            delta: None,
+                            share: Some(share),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+
+            // (1) 表のヘッダ行が見える位置。画面外の要素は prepaint されず bounds が
+            // 前フレームのまま残るので、検証も採取も「今フレームで見えている行」で行う
+            scroll_md_to_line(window, cx, md_pane, table_line).await;
+            let (frame, scale) =
+                capture_frame(any, cx).unwrap_or_else(|| fail("visual-test md: フレーム取得"));
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dump);
+                let _ = frame
+                    .save(std::path::Path::new(&dump).join(format!("markdown-{state}-table.png")));
+            }
+            let (layouts, line_texts, pane_bounds, theme) = md_visual_state(window, cx, md_pane);
+            check(
+                layouts.len() == total_lines,
+                &format!(
+                    "visual-test md({state}): 選択行数と TextLayout 数が一致する（{} vs {total_lines}）",
+                    layouts.len()
+                ),
+            );
+            let (no_overlap, no_overflow, note) =
+                md_layout_invariants(&layouts, &line_texts, &pane_bounds);
+            println!("TAKO_VISUAL_PIXEL: md layout {state}/table {note}");
+            check(
+                no_overlap,
+                &format!("visual-test md({state}/table): 行が縦に重ならない (#656)"),
+            );
+            check(
+                no_overflow,
+                &format!("visual-test md({state}/table): 行がペイン幅を超えない (#656)"),
+            );
+
+            // 表のヘッダ行と本文行の塗り分け（ヘッダは surface_2 の帯）
+            let header_band = layouts
+                .get(table_line)
+                .and_then(|l| l.as_ref())
+                .map(TextLayout::bounds);
+            let body_band = layouts
+                .get(table_line + table_columns)
+                .and_then(|l| l.as_ref())
+                .map(TextLayout::bounds);
+            if let (Some(header), Some(body)) = (header_band, body_band) {
+                // セルの内側（文字の左のパディング部分）を細く舐める。
+                // ペイン左端は表の外＝地色なので、セル bounds を基準にする
+                let strip = |b: Bounds<Pixels>| {
+                    Bounds::new(
+                        point(b.left() - px(5.0), b.center().y - px(2.0)),
+                        size(px(3.0), px(4.0)),
+                    )
+                };
+                let mut best: Option<(bool, f32, f32)> = None;
+                for flip in [false, true] {
+                    let h = sample_mean_rgb(&frame, scale, &strip(header), flip);
+                    let b = sample_mean_rgb(&frame, scale, &strip(body), flip);
+                    if let (Some(h), Some(b)) = (h, b) {
+                        let gap = rgb_gap(h, theme.surface_highlight);
+                        let diff = rgb_diff(h, b);
+                        if best.is_none_or(|(_, best_gap, _)| gap < best_gap) {
+                            best = Some((flip, gap, diff));
+                        }
+                    }
+                }
+                let (flip, gap, diff) =
+                    best.unwrap_or_else(|| fail("visual-test md: 表の帯を採取"));
+                println!(
+                    "TAKO_VISUAL_PIXEL: md table-header {state} flip={flip} \
+                     gap_to_header_fill={gap:.1} header_vs_body={diff:.1}"
+                );
+                check(
+                    gap <= 10.0,
+                    &format!(
+                        "visual-test md({state}): 表ヘッダ行が surface_highlight で塗られる (#656)"
+                    ),
+                );
+                check(
+                    diff >= 4.0,
+                    &format!("visual-test md({state}): 表ヘッダと本文行の塗りが違う (#656)"),
+                );
+            } else {
+                fail("visual-test md: 表セルの TextLayout が無い");
+            }
+
+            // (2) コードブロックが見える位置
+            scroll_md_to_line(window, cx, md_pane, code_line).await;
+            let (frame, scale) =
+                capture_frame(any, cx).unwrap_or_else(|| fail("visual-test md: フレーム取得"));
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = frame
+                    .save(std::path::Path::new(&dump).join(format!("markdown-{state}-code.png")));
+            }
+            let (layouts, line_texts, pane_bounds, theme) = md_visual_state(window, cx, md_pane);
+            let (no_overlap, no_overflow, note) =
+                md_layout_invariants(&layouts, &line_texts, &pane_bounds);
+            println!("TAKO_VISUAL_PIXEL: md layout {state}/code {note}");
+            check(
+                no_overlap,
+                &format!("visual-test md({state}/code): 行が縦に重ならない (#656)"),
+            );
+            check(
+                no_overflow,
+                &format!("visual-test md({state}/code): 行がペイン幅を超えない (#656)"),
+            );
+
+            // コードブロックのパネル面（mantle）が本文背景と塗り分かれている
+            if let Some(code) = layouts
+                .get(code_line)
+                .and_then(|l| l.as_ref())
+                .map(TextLayout::bounds)
+            {
+                let inside = Bounds::new(
+                    point(code.left() - px(6.0), code.origin.y + px(2.0)),
+                    size(px(4.0), px(6.0).min(code.size.height)),
+                );
+                let mut best: Option<(bool, f32)> = None;
+                for flip in [false, true] {
+                    if let Some(sample) = sample_mean_rgb(&frame, scale, &inside, flip) {
+                        let gap = rgb_gap(sample, theme.mantle);
+                        if best.is_none_or(|(_, best_gap)| gap < best_gap) {
+                            best = Some((flip, gap));
+                        }
+                    }
+                }
+                let (flip, gap) = best.unwrap_or_else(|| fail("visual-test md: コード面を採取"));
+                let panel_vs_page = rgb_diff(
+                    [
+                        theme.mantle.r as f32,
+                        theme.mantle.g as f32,
+                        theme.mantle.b as f32,
+                    ],
+                    [
+                        theme.background.r as f32,
+                        theme.background.g as f32,
+                        theme.background.b as f32,
+                    ],
+                );
+                println!(
+                    "TAKO_VISUAL_PIXEL: md code-panel {state} flip={flip} \
+                     gap_to_mantle={gap:.1} panel_vs_page={panel_vs_page:.1}"
+                );
+                check(
+                    gap <= 10.0,
+                    &format!("visual-test md({state}): コードブロックがパネル面で塗られる (#656)"),
+                );
+                check(
+                    panel_vs_page >= 4.0,
+                    &format!("visual-test md({state}): パネル面が本文背景と区別できる (#656)"),
+                );
+            } else {
+                fail("visual-test md: コードブロックの TextLayout が無い");
+            }
+
+            // (3) 先頭から末尾までスクロールで舐める。どのスクロール位置でも
+            // 行が重ならず横に溢れないことを、実 shaping の bounds で確認する
+            let max_y = window
+                .update(cx, |app, _, _| {
+                    app.preview_scroll_handles
+                        .get(&md_pane)
+                        .map(|handle| f32::from(handle.max_offset().y))
+                        .unwrap_or(0.0)
+                })
+                .unwrap_or(0.0);
+            check(
+                max_y > 0.0,
+                "visual-test md: 本文がスクロールできる長さある",
+            );
+            let steps = 8;
+            let mut swept = 0usize;
+            for step in 0..=steps {
+                let y = -max_y * step as f32 / steps as f32;
+                window
+                    .update(cx, |app, _, cx| {
+                        if let Some(handle) = app.preview_scroll_handles.get(&md_pane) {
+                            handle.set_offset(point(px(0.0), px(y)));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                // capture_frame は同期で描き直すので、直後の bounds は今の状態のもの
+                let swept_frame = capture_frame(any, cx);
+                if let (Ok(dump), Some((frame, _))) =
+                    (std::env::var("TAKO_VISUAL_DUMP_DIR"), swept_frame.as_ref())
+                {
+                    let _ = frame.save(
+                        std::path::Path::new(&dump)
+                            .join(format!("markdown-{state}-sweep{step}.png")),
+                    );
+                }
+                let (layouts, line_texts, pane_bounds, _) = md_visual_state(window, cx, md_pane);
+                let (no_overlap, no_overflow, note) =
+                    md_layout_invariants(&layouts, &line_texts, &pane_bounds);
+                if !no_overlap || !no_overflow {
+                    println!("TAKO_VISUAL_PIXEL: md sweep {state} step={step} {note}");
+                }
+                check(
+                    no_overlap,
+                    &format!("visual-test md({state}): スクロール {step}/{steps} で行が重ならない (#656)"),
+                );
+                check(
+                    no_overflow,
+                    &format!(
+                        "visual-test md({state}): スクロール {step}/{steps} で横に溢れない (#656)"
+                    ),
+                );
+                swept += 1;
+            }
+            println!("TAKO_VISUAL_PIXEL: md sweep {state} steps={swept} max_y={max_y:.0} ok");
+        }
+
+        // 表セルのヒットテストと選択コピー（#656 の受け入れ条件 4）。
+        // 2 列目のセル中央をクリックしたとき、左端セルではなくそのセルが選ばれること
+        let cell_index = table_line + table_columns + 1;
+        let (hit, cell_text, two_cells, clipboard) = window
+            .update(cx, |app, _, cx| {
+                let center = app
+                    .preview_text_layouts
+                    .get(&md_pane)
+                    .and_then(|l| l.get(cell_index).cloned())
+                    .flatten()
+                    .map(|layout| layout.bounds().center());
+                let hit = center.and_then(|pos| app.preview_hit_test(md_pane, pos));
+                let texts = app
+                    .preview_line_texts
+                    .get(&md_pane)
+                    .cloned()
+                    .unwrap_or_default();
+                let cell = texts.get(cell_index).cloned().unwrap_or_default();
+                let next = texts.get(cell_index + 1).cloned().unwrap_or_default();
+                // 1 セル分の選択 → 抽出テキスト
+                app.preview_selections.insert(
+                    md_pane,
+                    PreviewSelection {
+                        anchor: (cell_index, 0),
+                        head: (cell_index, cell.len()),
+                    },
+                );
+                let single = app.preview_selected_text();
+                // 隣のセルまで伸ばした選択（セルは 1 行ずつなので改行で連結される）
+                app.preview_selections.insert(
+                    md_pane,
+                    PreviewSelection {
+                        anchor: (cell_index, 0),
+                        head: (cell_index + 1, next.len()),
+                    },
+                );
+                let two = app.preview_selected_text();
+                app.copy_selection(cx);
+                let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+                (hit, single, two, clipboard)
+            })
+            .unwrap_or_else(|_| fail("visual-test md: 表セルの選択"));
+        println!(
+            "TAKO_VISUAL_PIXEL: md cell-hit index={cell_index} hit={hit:?} \
+             text={cell_text:?} two={two_cells:?}"
+        );
+        check(
+            hit.map(|(line, _)| line) == Some(cell_index),
+            "visual-test md: 表セルのクリックがそのセルの行を返す (#656)",
+        );
+        check(
+            cell_text.as_deref().is_some_and(|t| !t.trim().is_empty()),
+            "visual-test md: 表セル 1 つの選択テキストが取れる",
+        );
+        check(
+            two_cells
+                .as_deref()
+                .is_some_and(|t| t.contains('\n') && t.lines().count() == 2),
+            "visual-test md: 隣のセルまでの選択が 2 行で取れる",
+        );
+        check(
+            clipboard == two_cells,
+            "visual-test md: ⌘C 相当のコピーで選択テキストがクリップボードへ入る",
+        );
+        // 実クリップボード（pbpaste）まで届いているか。GPUI の read_from_clipboard は
+        // NSPasteboard 越しだが、外部プロセスから見えることを直接確かめる
+        let pasted = cx
+            .background_executor()
+            .spawn(async {
+                std::process::Command::new("pbpaste")
+                    .output()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+            })
+            .await;
+        println!("TAKO_VISUAL_PIXEL: md cell-copy pbpaste={pasted:?}");
+        check(
+            pasted.as_deref() == two_cells.as_deref(),
+            "visual-test md: 表セルのコピーが pbpaste で読める (#656)",
+        );
+
+        // コードブロックのドラッグ選択（1 行目の先頭 → 2 行目の途中）を実ヒットテストで作り、
+        // ⌘C 相当のコピーが pbpaste まで届くこと。md のコードブロックは 1 要素 =
+        // 複数行の StyledText なので、行内 byte offset が正しく解決される必要がある
+        let (code_from, code_to, code_selected) = window
+            .update(cx, |app, _, cx| {
+                let bounds = app
+                    .preview_text_layouts
+                    .get(&md_pane)
+                    .and_then(|l| l.get(code_line).cloned())
+                    .flatten()
+                    .map(|layout| layout.bounds());
+                let Some(bounds) = bounds else {
+                    return (None, None, None);
+                };
+                let line_h = px(app.theme.line_height);
+                let from = app.preview_hit_test(
+                    md_pane,
+                    point(bounds.left() + px(1.0), bounds.top() + px(3.0)),
+                );
+                let to = app.preview_hit_test(
+                    md_pane,
+                    point(
+                        bounds.left() + bounds.size.width * 0.4,
+                        bounds.top() + line_h + px(3.0),
+                    ),
+                );
+                if let (Some(anchor), Some(head)) = (from, to) {
+                    app.preview_selections
+                        .insert(md_pane, PreviewSelection { anchor, head });
+                }
+                let text = app.preview_selected_text();
+                app.copy_selection(cx);
+                (from, to, text)
+            })
+            .unwrap_or_else(|_| fail("visual-test md: コードブロックの選択"));
+        let code_pasted = cx
+            .background_executor()
+            .spawn(async {
+                std::process::Command::new("pbpaste")
+                    .output()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+            })
+            .await;
+        println!(
+            "TAKO_VISUAL_PIXEL: md code-copy from={code_from:?} to={code_to:?} \
+             selected={:?} pbpaste_len={:?}",
+            code_selected
+                .as_deref()
+                .map(|t| t.chars().take(24).collect::<String>()),
+            code_pasted.as_deref().map(str::len)
+        );
+        check(
+            code_from.map(|(line, _)| line) == Some(code_line)
+                && code_to.map(|(line, _)| line) == Some(code_line),
+            "visual-test md: コードブロックのヒットテストがそのブロックの行を返す",
+        );
+        check(
+            code_selected
+                .as_deref()
+                .is_some_and(|t| t.contains('\n') && t.len() > 8),
+            "visual-test md: コードブロックのドラッグ選択が複数行のテキストを返す (#656)",
+        );
+        check(
+            code_pasted.as_deref() == code_selected.as_deref(),
+            "visual-test md: コードブロックのコピーが pbpaste で読める (#656)",
+        );
+
+        // エッジケース（#656 の検証手順 3）: 巨大な表・壊れた表・折り返せない長い語・
+        // 深いネスト・フェンス内の ``` を 1 本の md に詰めて、panic / フリーズ / 崩れが
+        // 起きないことを確かめる。同じペインを差し替えて使う
+        let stress_path = dir.join("stress.md");
+        let mut stress = String::from("# エッジケース\n\n");
+        stress.push_str(
+            "## 巨大な表（60 行）\n\n| # | 名前 | 値 | 備考 |\n|--:|:-----|:--:|------|\n",
+        );
+        for row in 1..=60 {
+            stress.push_str(&format!(
+                "| {row} | item-{row:03} | {} | 説明テキスト {row} |\n",
+                row * 7 % 13
+            ));
+        }
+        stress.push_str("\n## 列数が行ごとに違う表\n\n| a | b | c |\n|---|---|---|\n| 1 |\n");
+        stress.push_str("| 1 | 2 | 3 | 4 | 5 |\n|  |  |  |\n\n");
+        stress.push_str("## 折り返せない長い語を含む表\n\n| キー | 値 |\n|:-----|:---|\n");
+        stress.push_str("| path | /very/long/path/that/cannot/be/broken/at/spaces/because-it-is-one-token.md |\n");
+        stress.push_str(
+            "| word | Supercalifragilisticexpialidocious_Supercalifragilisticexpialidocious |\n\n",
+        );
+        stress.push_str("## 深いネスト\n\n");
+        for depth in 0..6 {
+            stress.push_str(&format!("{}- 第 {} 段\n", "  ".repeat(depth), depth + 1));
+        }
+        stress.push_str("\n> > > 3 段引用の中に\n> > >\n> > > - リスト\n> > > - もう 1 つ\n> > >\n> > > | x | y |\n> > > |---|---|\n> > > | 1 | 2 |\n\n");
+        stress.push_str("## フェンスの中の ```\n\n````md\n```rust\nfn main() {}\n```\n````\n\n");
+        stress.push_str("## 空の項目\n\n-\n- [ ]\n- 通常\n");
+        std::fs::write(&stress_path, &stress).expect("visual-test md ストレス fixture");
+
+        let opened_at = std::time::Instant::now();
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(md_pane.as_u64()),
+                        path: stress_path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                        direction: None,
+                        focus: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            })
+            .ok();
+        let stress_loaded = wait_for_preview_state(window, cx, Duration::from_secs(10), |app| {
+            app.previews.get(&md_pane).is_some_and(|state| {
+                state.path.ends_with("stress.md")
+                    && matches!(&state.content, preview::PreviewContent::Markdown(blocks)
+                        if blocks.iter().filter(|b| matches!(&b.kind, preview::MdBlockKind::Table { .. })).count() >= 4)
+            })
+        })
+        .await;
+        check(
+            stress_loaded.is_some(),
+            "visual-test md ストレス: 表 4 本を含む本文がロードされる",
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: md stress load={:?} bytes={}",
+            opened_at.elapsed(),
+            stress.len()
+        );
+        // 巨大表でもロードが実用時間内（フリーズしない）
+        check(
+            opened_at.elapsed() < Duration::from_secs(6),
+            "visual-test md ストレス: ロードがフリーズしない",
+        );
+
+        let stress_max = window
+            .update(cx, |app, _, _| {
+                app.preview_scroll_handles
+                    .get(&md_pane)
+                    .map(|handle| f32::from(handle.max_offset().y))
+                    .unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
+        let steps = 12;
+        for step in 0..=steps {
+            let y = -stress_max * step as f32 / steps as f32;
+            window
+                .update(cx, |app, _, cx| {
+                    if let Some(handle) = app.preview_scroll_handles.get(&md_pane) {
+                        handle.set_offset(point(px(0.0), px(y)));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            let frame = capture_frame(any, cx);
+            if let (Ok(dump), Some((frame, _))) =
+                (std::env::var("TAKO_VISUAL_DUMP_DIR"), frame.as_ref())
+            {
+                if step % 4 == 0 {
+                    let _ = frame.save(
+                        std::path::Path::new(&dump).join(format!("markdown-stress{step}.png")),
+                    );
+                }
+            }
+            let (layouts, line_texts, pane_bounds, _) = md_visual_state(window, cx, md_pane);
+            let (no_overlap, no_overflow, note) =
+                md_layout_invariants(&layouts, &line_texts, &pane_bounds);
+            if !no_overlap || !no_overflow {
+                println!("TAKO_VISUAL_PIXEL: md stress step={step} {note}");
+            }
+            check(
+                no_overlap,
+                &format!(
+                    "visual-test md ストレス: スクロール {step}/{steps} で行が重ならない (#656)"
+                ),
+            );
+            check(
+                no_overflow,
+                &format!(
+                    "visual-test md ストレス: スクロール {step}/{steps} で横に溢れない (#656)"
+                ),
+            );
+        }
+        println!("TAKO_VISUAL_PIXEL: md stress sweep steps={steps} max_y={stress_max:.0} ok");
+
+        // 後片付け（以降の検証へ影響を残さない）
+        window
+            .update(cx, |app, _, cx| {
+                app.preview_selections.remove(&md_pane);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Close {
+                        pane: Some(md_pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                let _ = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .focus(PaneId::from_raw(base));
+                cx.notify();
+            })
+            .ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #152 / #589 / #656 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の
+    /// PTY / fd ストレス項目のタイミングに左右されず scene だけを検査する。
     #[cfg(feature = "visual-test")]
     pub fn run_visual(window: WindowHandle<TakoApp>, cx: &mut App) {
         cx.spawn(async move |cx| {
@@ -17329,6 +18202,14 @@ mod self_test {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
+
+            // #656: Markdown プレビューの表示品質。代表 md（全ブロック種別）を
+            // ダーク / ライト / 狭幅の 3 状態で実フレーム描画し、
+            // ①レイアウトの不変条件（行が重ならない・横に溢れない）
+            // ②ヘッダ行とコードパネルの塗り分け（実ピクセル）
+            // ③表セルのヒットテストと選択コピー
+            // を機械検証する
+            markdown_preview_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -21203,8 +22084,8 @@ mod self_test {
                                 matches!(
                                     &state.content,
                                     preview::PreviewContent::Markdown(blocks)
-                                        if matches!(blocks.first(),
-                                            Some(preview::MdBlock::Heading { level: 1, .. }))
+                                        if matches!(blocks.first().map(|b| &b.kind),
+                                            Some(preview::MdBlockKind::Heading { level: 1, .. }))
                                 ) && state.outline.items.len() == 1
                                     && state.outline.items[0].title == "Title"
                             })
@@ -22231,8 +23112,8 @@ mod self_test {
                     app.previews.get(&reload_pane).map(|state| &state.content),
                     Some(preview::PreviewContent::Markdown(blocks))
                         if blocks.iter().any(|block| matches!(
-                            block,
-                            preview::MdBlock::Heading { spans, .. }
+                            &block.kind,
+                            preview::MdBlockKind::Heading { spans, .. }
                                 if spans.iter().any(|span| span.text == "Live baseline")
                         ))
                             && app.previews.get(&reload_pane).is_some_and(|state|
@@ -22293,8 +23174,8 @@ mod self_test {
                         app.previews.get(&reload_pane).map(|state| &state.content),
                         Some(preview::PreviewContent::Markdown(blocks))
                             if blocks.iter().any(|block| matches!(
-                                block,
-                                preview::MdBlock::Heading { spans, .. }
+                                &block.kind,
+                                preview::MdBlockKind::Heading { spans, .. }
                                     if spans.iter().any(|span| span.text == "Live reload 5")
                             ))
                                 && app.previews.get(&reload_pane).is_some_and(|state|
@@ -22355,8 +23236,8 @@ mod self_test {
                     app.previews.get(&reload_pane).map(|state| &state.content),
                     Some(preview::PreviewContent::Markdown(blocks))
                         if blocks.iter().any(|block| matches!(
-                            block,
-                            preview::MdBlock::Heading { spans, .. }
+                            &block.kind,
+                            preview::MdBlockKind::Heading { spans, .. }
                                 if spans.iter().any(|span| span.text == "Live reload 5")
                         ))
                 )
@@ -22380,8 +23261,8 @@ mod self_test {
                     app.previews.get(&reload_pane).map(|state| &state.content),
                     Some(preview::PreviewContent::Markdown(blocks))
                         if blocks.iter().any(|block| matches!(
-                            block,
-                            preview::MdBlock::Heading { spans, .. }
+                            &block.kind,
+                            preview::MdBlockKind::Heading { spans, .. }
                                 if spans.iter().any(|span| span.text == "Restored")
                         ))
                 )
