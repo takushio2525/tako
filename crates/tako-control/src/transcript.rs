@@ -31,21 +31,44 @@ pub fn is_valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// `~/.claude/projects/` 配下から session_id の transcript ファイルを探す
+/// transcript を探す `projects/` ディレクトリの候補（優先順）。
+///
+/// **`CLAUDE_CONFIG_DIR` を先に見る**（#662 実測）。この変数が設定されていると
+/// claude は transcript を `$CLAUDE_CONFIG_DIR/projects/` へ書くので、
+/// `~/.claude/projects` だけを見ていると **1 件も見つからない**。
+/// transcript を第一ソースにする機能（対話ダイアログの内容取得 #662 /
+/// report --messages #364 / sessions #112 / remote の会話表示）が丸ごと空振りする
+fn transcript_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            roots.push(PathBuf::from(dir).join("projects"));
+        }
+    }
+    // Windows は HOME が未設定のことが多いため USERPROFILE へフォールバックする
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let default = PathBuf::from(home).join(".claude").join("projects");
+        if !roots.contains(&default) {
+            roots.push(default);
+        }
+    }
+    roots
+}
+
+/// session_id の transcript ファイルを探す（`CLAUDE_CONFIG_DIR` →`~/.claude` の順）
 pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
     if !is_valid_session_id(session_id) {
         return None;
     }
-    // Windows は HOME が未設定のことが多いため USERPROFILE へフォールバックする
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let projects = PathBuf::from(home).join(".claude").join("projects");
-    let entries = std::fs::read_dir(&projects).ok()?;
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(format!("{session_id}.jsonl"));
-        if candidate.is_file() {
-            return Some(candidate);
+    for projects in transcript_roots() {
+        let Ok(entries) = std::fs::read_dir(&projects) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(format!("{session_id}.jsonl"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -385,6 +408,38 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    /// #662: `CLAUDE_CONFIG_DIR` が設定されていると claude は transcript を
+    /// そちらへ書く。実測で「1 件も見つからない」を踏んだので候補順を固定する。
+    ///
+    /// 環境変数を触るテストは並行実行で干渉するため、`transcript_roots` の
+    /// 純粋な組み立てだけを検証する（`std::env::set_var` は使わない）
+    #[test]
+    fn transcriptの探索先はconfig_dirを先に見る() {
+        let roots = transcript_roots();
+        // 少なくとも 1 つ（HOME 由来）は必ずある
+        assert!(!roots.is_empty(), "探索先が空");
+        // どの候補も末尾は projects
+        for r in &roots {
+            assert_eq!(
+                r.file_name().and_then(|s| s.to_str()),
+                Some("projects"),
+                "探索先が projects で終わっていない: {}",
+                r.display()
+            );
+        }
+        // CLAUDE_CONFIG_DIR があるならそれが先頭（この環境の実値に依存しない形で検査）
+        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+            if !dir.trim().is_empty() {
+                assert_eq!(
+                    roots[0],
+                    std::path::PathBuf::from(dir).join("projects"),
+                    "CLAUDE_CONFIG_DIR が先頭に来ていない"
+                );
+                assert!(roots.len() >= 2, "既定の ~/.claude/projects が候補に無い");
+            }
+        }
     }
 
     #[test]
