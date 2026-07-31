@@ -215,6 +215,65 @@ fn 正常終了で蓋設定が元へ戻る() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 受け入れ条件 2 を **`powercfg` の目**で確認する。
+///
+/// 製品コードは Power API（`PowerWriteACValueIndex`）を使うが、それが確かに
+/// 「電源プランの LIDACTION」を動かしていることを、OS 標準ツールの出力で裏取りする。
+///
+/// **`powercfg /query` ではなく `/qh`（hidden 込み）を使う**。この設定は定義側の
+/// `Attributes = 1` で UI から隠されていて、値を明示的に書いたあとでも `/query` には
+/// 現れない（実測。`/qh` なら `LIDACTION` として出る）
+#[test]
+fn powercfgの目でもlidactionが倒れて見える() {
+    let _serial = serial();
+    let dir = std::env::temp_dir().join(format!("tako-lid-pcfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+    // SAFETY: 統合テストは 1 ファイル 1 プロセス
+    unsafe { std::env::set_var("TAKO_DATA_DIR", &dir) };
+
+    let original = probe::read_ac();
+    let _guard = Restore(original);
+
+    /// `powercfg /qh` の出力から AC 側のインデックスを取り出す
+    fn powercfg_ac_index() -> String {
+        let out = std::process::Command::new("powercfg")
+            .args([
+                "/qh",
+                "SCHEME_CURRENT",
+                "4f971e89-eebd-4455-a8de-9e59040e7347",
+                "5ca83367-6e45-459f-a27b-476b1d01c936",
+            ])
+            .output()
+            .expect("powercfg を起動できる");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        // 表示言語に依存しないよう、AC 行は「最初に現れる 0x???????? の並び」で拾う
+        // （日本語 = 「現在の AC 電源設定のインデックス」/ 英語 = "Current AC Power Setting Index"）
+        text.split_whitespace()
+            .filter(|t| t.starts_with("0x"))
+            .map(|t| t.to_string())
+            .next()
+            .unwrap_or_else(|| format!("(AC インデックスを読めない: {text})"))
+    }
+
+    lid::set_stay_awake(true, false).expect("倒せる");
+    assert_eq!(
+        powercfg_ac_index(),
+        "0x00000000",
+        "powercfg から見ても LIDACTION の AC が「何もしない」になっている"
+    );
+
+    lid::set_stay_awake(false, false).expect("戻せる");
+    assert_eq!(
+        powercfg_ac_index(),
+        format!("0x{original:08x}"),
+        "powercfg から見ても元の値へ戻っている"
+    );
+
+    // SAFETY: 同上
+    unsafe { std::env::remove_var("TAKO_DATA_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 受け入れ条件 3: ユーザーが自分で設定を変えていたら、解除で勝手に戻さない
 #[test]
 fn ユーザーが蓋設定を変えていたら解除で上書きしない() {
