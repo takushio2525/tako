@@ -60,6 +60,10 @@ pub struct Settings {
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// UI 表示モード（Issue #691 / #694。"terminal"（既定）/ "gui"）。
+    /// 既定が terminal なので、この項目を知らない既存ユーザーの体験は変わらない
+    #[serde(default = "default_ui_mode")]
+    pub ui_mode: String,
     /// 左サイドバー（ファイルツリー）の幅（px 整数。Issue #307。既定 244）
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u32,
@@ -116,6 +120,10 @@ fn default_theme() -> String {
     "dark".into()
 }
 
+fn default_ui_mode() -> String {
+    tako_core::ui_mode::UiMode::default().as_str().into()
+}
+
 fn default_sidebar_width() -> u32 {
     244
 }
@@ -162,6 +170,7 @@ impl Default for Settings {
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             theme: default_theme(),
+            ui_mode: default_ui_mode(),
             sidebar_width: default_sidebar_width(),
             show_hidden_files: false,
             telemetry: false,
@@ -220,6 +229,11 @@ impl Settings {
     /// テーマモードを tako-core の型へ解決する（不明値は既定ダーク。Issue #217）
     pub fn theme_mode(&self) -> tako_core::theme::ThemeMode {
         tako_core::theme::ThemeMode::parse(&self.theme).unwrap_or_default()
+    }
+
+    /// UI 表示モードを tako-core の型へ解決する（不明値は既定 terminal。Issue #694）
+    pub fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+        tako_core::ui_mode::UiMode::parse(&self.ui_mode).unwrap_or_default()
     }
 
     /// 利用制限表示の選択サービスを解決する（不明値は既定 Claude。Issue #321）
@@ -307,6 +321,7 @@ mod tests {
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
             theme: "light".into(),
+            ui_mode: "gui".into(),
             sidebar_width: 300,
             show_hidden_files: true,
             telemetry: true,
@@ -373,6 +388,24 @@ mod tests {
         // 利用制限サービスの既定は claude（Issue #321。旧ファイル後方互換）
         assert_eq!(parsed.limit_service, "claude");
         assert_eq!(parsed.limit_service(), tako_core::LimitService::Claude);
+        // UI 表示モードの既定は terminal（Issue #694。旧ファイル後方互換 =
+        // この項目を持たない既存ユーザーの表示は従来どおり）
+        assert_eq!(parsed.ui_mode, "terminal");
+        assert_eq!(parsed.ui_mode(), tako_core::ui_mode::UiMode::Terminal);
+    }
+
+    #[test]
+    fn ui_modeが不明値でterminalへフォールバックする() {
+        let gui = Settings {
+            ui_mode: "gui".into(),
+            ..Settings::default()
+        };
+        assert_eq!(gui.ui_mode(), tako_core::ui_mode::UiMode::Gui);
+        let unknown = Settings {
+            ui_mode: "simple".into(),
+            ..Settings::default()
+        };
+        assert_eq!(unknown.ui_mode(), tako_core::ui_mode::UiMode::Terminal);
     }
 
     #[test]

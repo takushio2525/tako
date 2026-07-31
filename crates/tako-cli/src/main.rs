@@ -136,6 +136,11 @@ enum Command {
     /// UI 表示言語（日本語/英語）の確認・切替（Issue #435）。
     /// 引数なしで現在言語を表示、ja / en で指定、system で OS ロケール追従
     Lang(LangArgs),
+    /// UI 表示モード（GUI ライク表示 / ターミナル表示）の確認・切替（Issue #691）。
+    /// 引数なしで現在モードを表示、gui / terminal で指定、toggle で反転。
+    /// release / restore は指定ペインだけを一時的にターミナル表示へ（揮発）
+    #[command(name = "ui-mode")]
+    UiMode(UiModeArgs),
     /// ステータスバーの利用制限表示サービスの確認・切替（Issue #321）。
     /// 引数なしで現在サービスを表示、claude / codex / agy で指定
     #[command(name = "limit-service")]
@@ -2140,6 +2145,19 @@ struct LangArgs {
     /// ja / en = 指定言語へ、system = OS ロケール追従（省略時は現在言語を表示）
     #[arg(value_parser = ["ja", "en", "system"])]
     value: Option<String>,
+}
+
+/// UI 表示モードの引数（Issue #691 / #694）
+#[derive(Args)]
+struct UiModeArgs {
+    /// gui / terminal = そのモードへ、toggle = 反転、
+    /// release / restore = 対象ペインだけターミナル表示へ / その解除を戻す
+    /// （省略時は現在モードを表示）
+    #[arg(value_parser = ["gui", "terminal", "toggle", "release", "restore"])]
+    action: Option<String>,
+    /// release / restore の対象ペイン ID（省略時は呼び出し元ペイン）
+    #[arg(long)]
+    pane: Option<u64>,
 }
 
 /// 利用制限表示サービスの引数（Issue #321）
@@ -4981,6 +4999,30 @@ fn build_request(command: &Command) -> Result<Request, String> {
             action: args.value.as_deref().map(|_| "set".to_string()),
             value: args.value.clone(),
         },
+        // #694: `tako ui-mode` は `tako theme` と同型（引数なし = 現在値、値 = set、
+        // toggle = 反転）。release / restore だけペイン単位の揮発操作
+        Command::UiMode(args) => match args.action.as_deref() {
+            Some(action @ ("release" | "restore")) => Request::UiMode {
+                action: Some(action.to_string()),
+                mode: None,
+                pane: target_pane(args.pane)?,
+            },
+            Some("toggle") => Request::UiMode {
+                action: Some("toggle".into()),
+                mode: None,
+                pane: None,
+            },
+            Some(mode) => Request::UiMode {
+                action: Some("set".into()),
+                mode: Some(mode.to_string()),
+                pane: None,
+            },
+            None => Request::UiMode {
+                action: None,
+                mode: None,
+                pane: None,
+            },
+        },
         Command::LimitService(args) => Request::LimitService {
             action: if args.refresh {
                 Some("refresh".to_string())
@@ -6346,6 +6388,7 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Settings(_)
         | Command::Welcome(_)
         | Command::Lang(_)
+        | Command::UiMode(_)
         | Command::LimitService(_)
         | Command::Telemetry(_)
         | Command::Panel(_)

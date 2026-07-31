@@ -28,6 +28,7 @@ mod remote_panel;
 mod right_panel;
 mod settings_window;
 mod sidebar;
+mod starter;
 mod status_bar;
 mod tab_bar;
 mod ui_text;
@@ -1277,6 +1278,13 @@ struct TakoApp {
     /// 起動時に settings.json の実在で判定し（`welcome::should_show_on_launch`）、
     /// 閉じたら settings.json へ永続化する
     welcome_banner: bool,
+    /// UI 表示モード（Issue #691 / #694。settings.json `ui_mode` 永続化）。
+    /// 既定 terminal = 従来どおりの描画。gui のときだけ判定表（`tako_core::ui_mode`）で
+    /// ペインごとに表示を出し分ける
+    ui_mode: tako_core::ui_mode::UiMode,
+    /// スターターの「コマンド入力へ」でターミナル表示に戻したペイン（Issue #694）。
+    /// **永続化しない**揮発フラグ（仕様 §1.3。再起動すると GUI 表示に戻る）
+    starter_released: std::collections::HashSet<PaneId>,
     /// アプリ内自動更新の状態。表示先は上部通知カードと専用ウィンドウ（#616）
     update_state: update_checker::UpdateState,
     /// 更新通知カードを × で閉じたときのキー（`update_checker::card_key`。#616）。
@@ -2484,6 +2492,10 @@ impl TakoApp {
             // 起動処理は settings を読むだけで書かないため、ここでの判定は
             // 「このプロセスが最初の 1 回目か」を正しく反映する
             welcome_banner: tako_control::welcome::should_show_on_launch(),
+            // #694: 表示モードは settings.json 由来（既定 terminal）。
+            // 復元（layout.json）とは無関係なので persist の挙動には影響しない
+            ui_mode: tako_control::settings::load().ui_mode(),
+            starter_released: std::collections::HashSet::new(),
             update_state: update_checker::UpdateState::Idle,
             // #616: 前回 × で閉じたバージョンを引き継ぐ（再起動しても出直さない）
             update_card_dismissed: tako_control::settings::load().update_card_dismissed,
@@ -6236,6 +6248,119 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// UI 表示モードのトグル（Issue #694。タブバーのボタン + ⌘K パレット用）。
+    ///
+    /// **dispatch を直接呼ぶ**ので、CLI / MCP の `ui-mode toggle` と完全に同じ
+    /// コードパス（= 永続化と応答も同じ）を通る。GUI とだけ挙動がずれることがない
+    pub(crate) fn toggle_ui_mode(&mut self, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::UiMode {
+                action: Some("toggle".into()),
+                mode: None,
+                pane: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: 表示モードを切り替えられない: {e}");
+        }
+        cx.notify();
+    }
+
+    /// このペインをどう描くか（Issue #694。判定表は `tako_core::ui_mode`）。
+    ///
+    /// 材料はすべて**すでに手元にある値**で、ここで新しいサブプロセスは起動しない
+    /// （毎 render 呼ばれる。子プロセス判定は sleep_guard の 2 秒 tick の結果を流用）
+    fn pane_display_for(&self, pane_id: PaneId) -> tako_core::ui_mode::PaneDisplay {
+        use tako_core::ui_mode::{pane_display, PaneDisplayInput};
+        // terminal モードでは材料を一切見ずに即決する（既存経路への影響をゼロにする）
+        if !self.ui_mode.is_gui() {
+            return tako_core::ui_mode::PaneDisplay::Terminal;
+        }
+        let session = self.terminals.get(&pane_id);
+        let has_role = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .find(|p| p.id() == pane_id)
+            .and_then(|p| p.role())
+            .is_some_and(|r| !r.trim().is_empty());
+        pane_display(PaneDisplayInput {
+            mode: self.ui_mode,
+            released: self.starter_released.contains(&pane_id),
+            alt_screen: session.is_some_and(|s| s.is_alt_screen()),
+            // G2 で claude 判定を配線する。G1 はチャット化しない
+            claude_chat: false,
+            state: session
+                .map(|s| s.command_state())
+                .unwrap_or(tako_core::CommandState::Unknown),
+            has_role,
+            busy_children: self
+                .backend_sessions
+                .get(&pane_id)
+                .is_some_and(|s| self.busy_backend_sessions.contains(s)),
+        })
+    }
+
+    /// スターターのカード押下（Issue #694）。master / solo はシェルへコマンド行を
+    /// 書き込み（welcome バナー #549 と同じ方式 = ユーザーが自分で打つのと同じ経路）、
+    /// 「コマンド入力へ」はこのペインだけ揮発的にターミナル表示へ戻す。
+    ///
+    /// 戻り値は「実際に何かした」か（セルフテストの判定に使う）
+    pub(crate) fn starter_action(
+        &mut self,
+        pane_id: PaneId,
+        action: tako_core::ui_mode::StarterAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use tako_core::ui_mode::StarterAction;
+        // どのカードでもまずこのペインへフォーカスを移す（押した場所で話が始まる）
+        if self.focused_pane() != pane_id {
+            self.jump_to_pane(pane_id, cx);
+        }
+        let done = match action {
+            StarterAction::UseTerminal => {
+                // 揮発解除は dispatch 経由（CLI / MCP の release と同一コードパス）
+                let result = tako_control::dispatch(
+                    self,
+                    tako_control::protocol::Request::UiMode {
+                        action: Some("release".into()),
+                        mode: None,
+                        pane: Some(pane_id.as_u64()),
+                    },
+                    PaneOrigin::User,
+                );
+                if let Err(e) = result {
+                    eprintln!("warning: ターミナル表示へ戻せない: {e}");
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => {
+                let Some(sub) = action.subcommand() else {
+                    return false;
+                };
+                // 実体パスで組み立てるので tako が PATH に無い zip 配布でも動く（#549）
+                let line = format!("{}\n", tako_control::welcome::launch_command_line(sub));
+                match self.terminals.get(&pane_id) {
+                    Some(session) => {
+                        session.write(line.into_bytes());
+                        true
+                    }
+                    None => {
+                        eprintln!("warning: ペイン {} のシェルが無い", pane_id.as_u64());
+                        false
+                    }
+                }
+            }
+        };
+        cx.notify();
+        done
+    }
+
     /// UI 表示言語の 日→英→日 トグル（Issue #435。コマンドパレット用。
     /// dispatch::Lang と同じ状態遷移 + settings 永続化で UI / AI 操作の等価性を保つ）
     pub(crate) fn toggle_language(&mut self, cx: &mut Context<Self>) {
@@ -6458,6 +6583,8 @@ impl TakoApp {
             "open-update",
             "new-tab",
             "toggle-theme",
+            // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
+            "toggle-ui-mode",
             "toggle-language",
             "toggle-files",
             "toggle-drawer",
@@ -6543,6 +6670,7 @@ impl TakoApp {
                 }
                 "new-tab" => self.new_tab(cx),
                 "toggle-theme" => self.toggle_theme(cx),
+                "toggle-ui-mode" => self.toggle_ui_mode(cx),
                 "toggle-language" => self.toggle_language(cx),
                 "toggle-files" => {
                     self.toggle_filetree();
@@ -12414,6 +12542,22 @@ impl TakoApp {
             );
         }
 
+        // GUI ライク表示モード（#694）: このペインをスターターに差し替える。
+        // **PTY のサイズ追従を済ませてから**分岐するので、スターター表示中に
+        // ウィンドウをリサイズしても、起動したエージェントは正しい端末サイズで始まる。
+        // terminal モード（既定）では `pane_display_for` が即 Terminal を返すため
+        // ここは分岐 1 つぶんの差でしかない（既存の描画経路は不変）
+        match self.pane_display_for(pane_id) {
+            tako_core::ui_mode::PaneDisplay::Starter => {
+                return self
+                    .render_starter_pane(pane_id, rect, area, focused, cx)
+                    .into_any_element();
+            }
+            // チャットビューは G2 で実装する。それまではターミナル表示のまま
+            // （`pane_display_for` は claude_chat=false 固定なのでここには来ない）
+            tako_core::ui_mode::PaneDisplay::Chat | tako_core::ui_mode::PaneDisplay::Terminal => {}
+        }
+
         // タイトルとロールを分離取得（ロールは独立バッジとして表示）
         let pane_info = self.workspace.active_tab().tree().get(pane_id);
         let pane_title = pane_info.and_then(|p| p.title().map(str::to_string));
@@ -13941,6 +14085,28 @@ impl UiStateHost for TakoApp {
         let settings = tako_control::settings::load();
         let (theme, _) = settings.resolve_theme();
         self.theme = theme;
+    }
+
+    // #694: UI 表示モード（GUI ライク表示）。TakoApp は全ウィンドウ共有 entity（#339）
+    // なので、値を差し替えれば次の render で全窓に反映される
+    fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+        self.ui_mode
+    }
+
+    fn set_ui_mode(&mut self, mode: tako_core::ui_mode::UiMode) {
+        self.ui_mode = mode;
+    }
+
+    fn starter_released_panes(&self) -> Vec<PaneId> {
+        self.starter_released.iter().copied().collect()
+    }
+
+    fn set_starter_released(&mut self, pane: PaneId, released: bool) {
+        if released {
+            self.starter_released.insert(pane);
+        } else {
+            self.starter_released.remove(&pane);
+        }
     }
 
     fn open_settings_window(&mut self, tab: Option<&str>) {
@@ -19843,6 +20009,155 @@ mod self_test {
                     all_aligned,
                     "visual-test #684: 計算上のテキスト領域が実描画の位置と一致する",
                 );
+            }
+
+            // GUI ライク表示モードのスターター（#694）: **実ピクセルで**
+            // 「ターミナルが描かれていた場所に 3 ボタンが描かれる」ことと、
+            // dark / light の両方で読める濃さで描かれることを見る。
+            // 見た目の検査を機械化しておかないと、テーマ片側だけ潰れていても気付けない
+            // （#669 のライトテーマ構文色と同じ失敗の形）
+            {
+                use tako_core::ui_mode::UiMode;
+                // 画面を空にして「ターミナル表示ならインクが無い帯」を作る
+                type_text(any, cx, "clear", true);
+                cx.background_executor()
+                    .timer(Duration::from_millis(900))
+                    .await;
+                // 素のシェルがアイドル（プロンプト表示）になるまで待つ = スターターの条件
+                let mut ready = false;
+                for _ in 0..40 {
+                    ready = window
+                        .update(cx, |app, _, _| {
+                            let pane = app.focused_pane();
+                            app.terminals
+                                .get(&pane)
+                                .map(|s| s.command_state() == tako_core::CommandState::Idle)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                check(ready, "visual-test スターター: 素のシェルがアイドルになる (#694)");
+                let area = window
+                    .update(cx, |app, _, _| {
+                        let pane = app.focused_pane();
+                        app.pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == pane)
+                            .map(|(_, b)| *b)
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| fail("visual-test スターター: ペイン領域"));
+                // カードが並ぶ中央帯（上端のプロンプト行と重ならない範囲）
+                let band = Bounds::new(
+                    point(area.left(), area.top() + area.size.height * 0.3),
+                    size(area.size.width, area.size.height * 0.4),
+                );
+                let (before, scale) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test スターター: 前フレーム"));
+                let bg_dark = window.update(cx, |app, _, _| app.theme.background).ok();
+                let bg_dark = bg_dark.unwrap_or_else(|| fail("visual-test スターター: 背景色"));
+                let terminal_band =
+                    readable_pixels_in_bounds(&before, &[band], scale, bg_dark, 2.0);
+
+                // GUI モードへ（実際のトグルと同じ dispatch 経路）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::UiMode {
+                            action: Some("set".into()),
+                            mode: Some("gui".into()),
+                            pane: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (gui_dark, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test スターター: GUI フレーム(dark)"));
+                let starter_band =
+                    readable_pixels_in_bounds(&gui_dark, &[band], scale, bg_dark, 2.0);
+                let changed = changed_pixels_in_bounds(&before, &gui_dark, &[band], scale);
+
+                // ライトテーマでも同じ帯が読める濃さで描かれる
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("light".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (gui_light, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test スターター: GUI フレーム(light)"));
+                let bg_light = window
+                    .update(cx, |app, _, _| app.theme.background)
+                    .unwrap_or(bg_dark);
+                let starter_band_light =
+                    readable_pixels_in_bounds(&gui_light, &[band], scale, bg_light, 2.0);
+                let theme_changed =
+                    changed_pixels_in_bounds(&gui_dark, &gui_light, &[band], scale);
+
+                if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let base = std::path::Path::new(&dir);
+                    let _ = before.save(base.join("starter-terminal.png"));
+                    let _ = gui_dark.save(base.join("starter-gui-dark.png"));
+                    let _ = gui_light.save(base.join("starter-gui-light.png"));
+                }
+                println!(
+                    "TAKO_VISUAL_PIXEL: starter terminal_band={terminal_band} \
+                     starter_band={starter_band} starter_band_light={starter_band_light} \
+                     changed={changed} theme_changed={theme_changed}"
+                );
+                check(
+                    terminal_band < 200,
+                    "visual-test スターター: ターミナル表示では中央帯がほぼ空 (#694)",
+                );
+                check(
+                    starter_band > 1000 && changed > 1000,
+                    "visual-test スターター: GUI モードで中央帯にカードが描かれる (#694)",
+                );
+                check(
+                    starter_band_light > 1000 && theme_changed > 1000,
+                    "visual-test スターター: ライトテーマでも読める濃さで描かれる (#694)",
+                );
+
+                // 後片付け: 既定（dark / terminal）へ戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("dark".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    app.ui_mode = UiMode::Terminal;
+                    cx.notify();
+                });
+                let _ = capture_frame(any, cx);
             }
 
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
@@ -29675,6 +29990,269 @@ mod self_test {
                         check(restored, "要素を閉じると矩形が元へ戻る = 行数が追従する (#684)");
                     }
                 }
+            }
+
+            // 93. GUI ライク表示モード（#691 / #694 = G1）。この機能の危険は
+            // 「見えているものを勝手に置き換える」ことなので、判定と操作経路を機械検証する:
+            // (a) settings.json への往復（= 再起動で復元される値。既定は terminal）
+            // (b) MCP tako_ui_mode の toggle 応答と GUI の状態が一致する
+            // (c) 判定表: GUI モードのアイドルシェルはスターター、同じペインが
+            //     terminal モードではターミナル表示（既存ユーザーへの影響ゼロの裏付け）
+            // (d) スターターの「AI チームに任せる」押下で、そのペインのシェル入力行へ
+            //     `tako master` が現れる（送り先を間違えない）
+            // (e) 「コマンド入力へ」= 揮発解除でそのペインだけターミナル表示に戻り、
+            //     restore で GUI 表示へ戻る（永続化しないので再起動でも戻る）
+            {
+                use tako_core::ui_mode::{PaneDisplay, StarterAction, UiMode};
+
+                // (a) 保存 → 読み戻し。セルフテスト中は実 settings.json を汚さないため
+                // 一時パスへ書く（`TakoApp::new` が読むのと同じ `ui_mode()` で解決する）
+                let fixture =
+                    std::env::temp_dir().join(format!("tako-st694-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&fixture);
+                let path = fixture.join("settings.json");
+                let saved_gui = {
+                    let s = tako_control::settings::Settings {
+                        ui_mode: "gui".into(),
+                        ..Default::default()
+                    };
+                    tako_control::settings::save_to(&path, &s).is_ok()
+                };
+                let restored_gui = tako_control::settings::load_from(&path)
+                    .map(|s| s.ui_mode())
+                    .unwrap_or_default();
+                // ui_mode を持たない古い settings.json は terminal（後方互換）
+                let legacy_path = fixture.join("legacy.json");
+                let legacy_terminal = std::fs::write(&legacy_path, "{}").is_ok()
+                    && tako_control::settings::load_from(&legacy_path)
+                        .map(|s| s.ui_mode())
+                        .unwrap_or(UiMode::Gui)
+                        == UiMode::Terminal;
+                check(
+                    saved_gui && restored_gui == UiMode::Gui && legacy_terminal,
+                    "表示モードが settings.json へ往復する / 旧ファイルは terminal (#694)",
+                );
+                if fixture.starts_with(std::env::temp_dir()) {
+                    let _ = std::fs::remove_dir_all(&fixture);
+                }
+
+                // (b) MCP toggle → 応答と GUI 状態の一致（GUI 側の反映は非同期なので待つ）
+                let (status, response) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":694,"method":"tools/call","params":{"name":"tako_ui_mode","arguments":{"action":"toggle"}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP ui_mode toggle 接続"));
+                let mut gui_applied = false;
+                for _ in 0..30 {
+                    gui_applied = window
+                        .update(cx, |app, _, _| app.ui_mode == UiMode::Gui)
+                        .unwrap_or(false);
+                    if gui_applied {
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                check(
+                    status == 200
+                        && response.contains(r#"\"ui_mode\":\"gui\""#)
+                        && gui_applied,
+                    "MCP ui_mode toggle → 応答と GUI 状態が一致 (#694)",
+                );
+
+                // (c)(d)(e) 実ペインでの判定と操作。ここまでの項目で使い回された
+                // ペインは role 付き / 実行中 / alt screen などの履歴を持つので、
+                // **この項目用に素のシェルペインを 1 枚作って**判定を見る。
+                // 送達先の検証には `cat` のペインを使う: tty がそのまま入力行を
+                // エコーするので「シェル入力行に現れる」ことを見つつ、
+                // セルフテストが本物のエージェントを起動してしまうのを避けられる
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#694: 基準ペインの取得")
+                };
+                // dispatch を直接呼ぶので、セッション起動依頼（pending_attach）も
+                // ここで処理する（IPC ループ相当。残すと PTY が起動しない）
+                let split_pane = |app: &mut TakoApp,
+                                  cx: &mut Context<TakoApp>,
+                                  command: Option<Vec<String>>| {
+                    let pane = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(anchor.as_u64()),
+                            tab: None,
+                            direction: Some(tako_control::protocol::Direction::Down),
+                            ratio: None,
+                            command,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|v| v["pane"].as_u64())
+                    .map(PaneId::from_raw);
+                    for (p, options) in std::mem::take(&mut app.pending_attach) {
+                        if app.spawn_session(p, options, cx).is_err() {
+                            app.remove_pane(p, cx);
+                        }
+                    }
+                    pane
+                };
+                let base = window
+                    .update(cx, |app, _, cx| split_pane(app, cx, None))
+                    .ok()
+                    .flatten();
+                let cat_pane = window
+                    .update(cx, |app, _, cx| split_pane(app, cx, Some(vec!["cat".into()])))
+                    .ok()
+                    .flatten();
+                let (Some(base), Some(cat_pane)) = (base, cat_pane) else {
+                    fail("#694: 検証用ペインの作成")
+                };
+                wait(cx, 700).await;
+
+                // (c) 判定表: 素のシェルペインは GUI モードでスターター、
+                // terminal モードでは同じペインがターミナル表示になる
+                let mut idle_starter = false;
+                for _ in 0..40 {
+                    idle_starter = window
+                        .update(cx, |app, _, _| {
+                            app.pane_display_for(base) == PaneDisplay::Starter
+                        })
+                        .unwrap_or(false);
+                    if idle_starter {
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                // 落ちたときに材料が見えるように、判定の入力をそのまま出す
+                if !idle_starter {
+                    let note = window
+                        .update(cx, |app, _, _| {
+                            let s = app.terminals.get(&base);
+                            format!(
+                                "state={:?} alt={:?} role={:?} backend={:?} busy={:?}",
+                                s.map(|s| s.command_state()),
+                                s.map(|s| s.is_alt_screen()),
+                                app.workspace
+                                    .tabs()
+                                    .iter()
+                                    .flat_map(|t| t.tree().panes())
+                                    .find(|p| p.id() == base)
+                                    .and_then(|p| p.role().map(str::to_string)),
+                                app.backend_sessions.get(&base).cloned(),
+                                app.backend_sessions
+                                    .get(&base)
+                                    .map(|s| app.busy_backend_sessions.contains(s)),
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!("TAKO_SELF_TEST_694: pane={} {note}", base.as_u64());
+                }
+                let (terminal_mode_same, cat_stays_terminal) = window
+                    .update(cx, |app, _, _| {
+                        let gui = app.ui_mode;
+                        app.ui_mode = UiMode::Terminal;
+                        let in_terminal_mode =
+                            app.pane_display_for(base) == PaneDisplay::Terminal;
+                        app.ui_mode = gui;
+                        // `cat` が動いているペインは「アイドルシェル」ではないので
+                        // GUI モードでもターミナル表示のまま（保守的判定）
+                        (
+                            in_terminal_mode,
+                            app.pane_display_for(cat_pane) == PaneDisplay::Terminal,
+                        )
+                    })
+                    .unwrap_or((false, false));
+                check(
+                    idle_starter && terminal_mode_same && cat_stays_terminal,
+                    "判定表: アイドルシェル → スターター / terminal モードと実行中は据え置き (#694)",
+                );
+
+                // 実際に 1 フレーム描く（スターター描画そのものが通ることの確認。
+                // 描画で panic すればここでプロセスが落ちる = 検出できる）
+                for _ in 0..2 {
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                }
+
+                // (d) 「AI チームに任せる」押下 → そのペインのシェルへコマンド行が届く
+                let clicked = window
+                    .update(cx, |app, _, cx| {
+                        app.starter_action(cat_pane, StarterAction::Master, cx)
+                    })
+                    .unwrap_or(false);
+                let mut delivered = false;
+                for _ in 0..40 {
+                    wait(cx, 100).await;
+                    delivered = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&cat_pane)
+                                .map(|s| s.visible_lines().join(""))
+                                .unwrap_or_default()
+                                .contains("tako master")
+                        })
+                        .unwrap_or(false);
+                    if delivered {
+                        break;
+                    }
+                }
+                check(
+                    clicked && delivered,
+                    "スターターの「AI チームに任せる」で対象ペインへ tako master が届く (#694)",
+                );
+
+                // (e) 「コマンド入力へ」= 揮発解除 → そのペインだけターミナル表示。
+                // dispatch（CLI / MCP と同じ経路）の restore で GUI 表示へ戻る
+                let released = window
+                    .update(cx, |app, _, cx| {
+                        app.starter_action(base, StarterAction::UseTerminal, cx)
+                            && app.starter_released.contains(&base)
+                            && app.pane_display_for(base) == PaneDisplay::Terminal
+                    })
+                    .unwrap_or(false);
+                let restored_display = window
+                    .update(cx, |app, _, _| {
+                        let ok = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("restore".into()),
+                                mode: None,
+                                pane: Some(base.as_u64()),
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .is_ok();
+                        ok && !app.starter_released.contains(&base)
+                            && app.pane_display_for(base) == PaneDisplay::Starter
+                    })
+                    .unwrap_or(false);
+                check(
+                    released && restored_display,
+                    "「コマンド入力へ」でそのペインだけ解除 → restore で戻る (#694)",
+                );
+
+                // 後片付け: 検証用ペインを閉じて terminal モードへ戻す
+                // （以降の項目と最終終了処理を既定の表示で通す）
+                let _ = window.update(cx, |app, _, cx| {
+                    for pane in [cat_pane, base] {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane.as_u64()),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    app.ui_mode = UiMode::Terminal;
+                    app.starter_released.clear();
+                    cx.notify();
+                });
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

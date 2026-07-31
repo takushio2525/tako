@@ -32,6 +32,9 @@
 2. #658（セルフテスト由来の worker レジストリ残留 + GC 不全）— 起票済み・未着手
 3. #652 の真の実地検証は次回 PC 再起動時（persist.log の Claude resume 数と master 復元を確認）
 4. 今夜の nightly が本日 6 件を 0.6.2 として自動リリース見込み
+5. **#691 GUI モード: G1（#694）完了** = `tako ui-mode` / `tako_ui_mode`（132 ツール）+
+   タブバートグル + スターター 3 ボタン。既定 terminal なので既存の見た目は不変。
+   次は G2（チャットビュー読み取り）の worker 割当
 
 ## 未着手・持ち越し
 
@@ -53,6 +56,8 @@
 
 ## 現フェーズで Read すべき設計書
 
+- GUI モード（#691 G2 以降）に手を入れる: `.agent/plans/2026-07-gui-mode.md`（正）+
+  `crates/tako-core/src/ui_mode.rs`（判定表）+ `crates/tako-app/src/starter.rs`
 - Markdown プレビューに手を入れる: `crates/tako-app/src/preview_render.rs` + `.agent/requirements.md` FR-3.3
 - コマンド提案カードに手を入れる: `crates/tako-core/src/command_card.rs` + dispatch の ShowCommand 系
 - 復元・resume 系: `crates/tako-control/src/transcript.rs` + `sessions.rs` + `.agent/requirements.md` FR-5.9/FR-5.12

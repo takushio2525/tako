@@ -40,6 +40,7 @@ pub mod text_edit;
 pub mod theme;
 pub mod tmux;
 pub mod tmux_backend;
+pub mod ui_mode;
 pub mod workspace;
 
 pub use byte_lru::ByteLru;
@@ -88,6 +89,7 @@ pub use terminal::{
 pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
+pub use ui_mode::{pane_display, PaneDisplay, PaneDisplayInput, StarterAction, UiMode};
 pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。

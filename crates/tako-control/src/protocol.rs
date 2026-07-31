@@ -1089,6 +1089,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<String>,
     },
+    /// UI 表示モードの状態確認・切替（Issue #691 / #694。GUI ライク表示）。
+    /// `action` = "status"（既定）/ "set"（`mode` へ変更）/ "toggle"（反転）/
+    ///            "release"（`pane` をターミナル表示に。揮発）/ "restore"（解除を戻す）。
+    /// set / toggle は settings.json に永続化され、全ウィンドウへ即時反映される。
+    /// release / restore は永続化しない（再起動で GUI 表示に戻る）
+    UiMode {
+        #[serde(default)]
+        action: Option<String>,
+        /// 表示モード: "terminal" / "gui"（set 時に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// release / restore の対象ペイン（省略時は呼び出し元ペイン）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+    },
     /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。
     /// `action` = "status"（既定）/ "on" / "off"。設定は settings.json に永続化される
     Telemetry {

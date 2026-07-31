@@ -61,11 +61,20 @@
 ### 1.4 永続化と dispatch / CLI / MCP
 
 - settings.json に `ui_mode: String` を追加（`theme` と同パターン、serde default = "terminal"）
-- dispatch `Request::UiMode { mode: Option<String> }` 新設 — 省略 = 現在値取得、
-  `gui | terminal | toggle` = 変更 + settings 保存 + 全ウィンドウ即時反映
-  （TakoApp は全窓共有 entity #339 のため cx.notify で足りる）
-- CLI `tako ui-mode [gui|terminal|toggle]`（引数なしで現在値。`tako theme` と同型）
+- dispatch `Request::UiMode { action, mode, pane }` 新設（`Theme` と同型）—
+  `action` 省略 / `status` = 現在値取得、`set`（`mode` = `gui | terminal`）/ `toggle` =
+  変更 + settings 保存 + 全ウィンドウ即時反映（TakoApp は全窓共有 entity #339 のため
+  cx.notify で足りる）、`release` / `restore` = §1.3 の**揮発フラグ**をペイン単位で操作
+  （永続化しない）。応答は `{ ui_mode, available, released_panes }`
+  （release / restore は `pane` / `released` も返す）
+- CLI `tako ui-mode [gui|terminal|toggle|release|restore] [--pane N]`
+  （引数なしで現在値。`tako theme` と同型）
 - MCP `tako_ui_mode`（131 → **132 ツール**。セルフテストのツール数期待値を更新）
+
+> G1 実装時の追加（2026-07-31 / #694）: 当初案は `mode` 1 個だけだったが、
+> スターターの「コマンド入力へ」に対応する AI 操作が存在しないと開発不変条件
+> （UI でできることは AI からもできる）を満たせないため、`release` / `restore` を
+> 同じ `UiMode` に足した。新設 dispatch は依然 `UiMode` の 1 本だけ。
 
 ## 2. GUI モードの画面仕様
 
@@ -85,6 +94,15 @@ GUI モード時、各ペインは毎 render 時に以下で表示を決める�
 （誤ってチャット化する方が、ターミナルのままより実害が大きい）。判定関数は
 tako-core / tako-control 側に純関数で切り出し、unit test 可能にする。
 
+> G1 実装（#694）: 純関数は `tako_core::ui_mode::pane_display(PaneDisplayInput)`。
+> 材料は毎 render 組み立てるので**新しいサブプロセスを要する材料は入れない**:
+> 「アイドルシェル」= OSC 133 由来の `CommandState::Idle`（プロンプト表示中 = 前のコマンドは
+> 終わっている）+ role なし + バックエンドセッションに実行中の子プロセスなし
+> （sleep_guard の 2 秒 tick が背景で計算した `busy_backend_sessions` を流用。#372）。
+> `Failed`（直前のコマンドがエラー）と `Unknown`（シェル統合の signal が無い）は
+> 画面を隠さずターミナル表示にする。terminal モードでは材料を一切見ずに即決する
+> （既存描画への影響を分岐 1 つに抑えるため）。
+
 ### 2.2 スターター（空ペインの 3 ボタン）
 
 アイドルシェルのペインに、縦並びの大きなカード 3 枚（アイコン + タイトル + 1 行説明）:
@@ -102,8 +120,15 @@ tako-core / tako-control 側に純関数で切り出し、unit test 可能にす
 - プロファイル選択（G4）: カード右端のシェブロン ▾ で `profiles_dir()` / `solo_profiles_dir()` の
   一覧をドロップダウン表示し `tako master -<profile>` を書き込む。既定プロファイルは
   1 クリック（Code Runner #453 の再生ボタン + ▾ と同じパターン、#322 最簡原則）
-- 開発不変条件の充足: ボタン押下の等価操作は既存 CLI そのもの（`tako master` /
-  `tako ui-mode` 等）なので新設 dispatch は不要。この対応を各フェーズの 1:1 表に明記する
+- 開発不変条件の充足: master / solo ボタンの等価操作は既存 CLI そのもの（`tako master` /
+  `tako solo`）。「コマンド入力へ」だけは等価な既存操作が無いので `tako ui-mode release`
+  （MCP `tako_ui_mode` の `release`）を §1.4 に足した。この対応を各フェーズの 1:1 表に明記する
+
+> G1 実装（#694）: カードは `crates/tako-app/src/starter.rs`（描画とクリック配線のみ）、
+> 押下時の実処理は `TakoApp::starter_action`（master / solo = シェルへ書き込み、
+> コマンド入力へ = `UiMode` dispatch の `release`）。ヘッダには cwd と × を置く
+> （GUI モードでもペインを閉じられるようにするため）。狭いペインでは説明文 →
+> コマンド併記 → 脚注の順に落とす（見切れさせない。#185 と同方針）。
 
 ### 2.3 チャットビュー（claude 稼働ペイン）
 
@@ -187,6 +212,18 @@ PWA のコードには触れない。将来 codex 対応等でデータ源を拡
   ②MCP `tako_ui_mode` toggle → 応答と GUI 状態が一致 ③セルフテストでスターターの
   「AI チーム」押下 → ペインのシェル入力行に `tako master` が現れる ④terminal モードでは
   描画が現行と同一（既存セルフテスト全項目が無変更で通る）
+
+> **G1 実装済み（2026-07-31 / #694）**。G2 以降が触る場所:
+> - 判定表の純関数 + モード型: `crates/tako-core/src/ui_mode.rs`
+>   （`PaneDisplay::Chat` は enum に用意済み。`PaneDisplayInput.claude_chat` を
+>   `true` にできるようにするのが G2 の仕事）
+> - 判定材料の組み立て: `TakoApp::pane_display_for`（`crates/tako-app/src/main.rs`）
+> - 分岐点: `render_pane` 冒頭（webview / preview の次。**PTY リサイズの後**に置いてある =
+>   スターター表示中にリサイズしてもエージェントは正しい端末サイズで起動する）
+> - スターター: `crates/tako-app/src/starter.rs` + 文言 `ui_text/ui_mode.rs`
+> - トグル: `tab_bar.rs`（テーマボタンの左隣 + `HintTooltip`）/ パレット `toggle-ui-mode`
+> - 検証: セルフテスト項目 93（判定 / MCP / 送達 / 揮発解除）+ visual-test
+>   「スターター」節（dark / light の実ピクセル。`TAKO_VISUAL_DUMP_DIR` で PNG 保存）
 
 ### G2: チャットビュー（読み取り）
 

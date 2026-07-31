@@ -122,6 +122,7 @@ tako_tmux_open
 tako_tmux_resize
 tako_tmux_select_window
 tako_tree_folder
+tako_ui_mode
 tako_update
 tako_video_playback
 tako_video_seek
