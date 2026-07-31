@@ -1635,3 +1635,21 @@
   （`TAKO_PDF_NO_DEVICE_PIN=1` で回避の要否を再確認できる）
 - テキストレイヤ・しおり・リンク注釈は API が無いので `PdfCapabilities` で構造化して空を返す（→ #693）
 - 次: macOS でのビルドと目視（この機ではコンパイル不可）/ 実機ユーザー目視
+
+## 2026-07-31（#519 / #687: psmux へ読み取り専用の到達手段を新設し、Windows の採取系を通した）
+- 役割 B を**読みと書きに割った**（`DetachedCapture` を新設し `DetachedAccess` をその
+  supertrait に）。psmux は `capture-pane` は動くが `paste-buffer` / `send-keys -H` が
+  信頼できないので、フル実装して送出だけ Unsupported を返すのではなく**型で分ける**。
+  `capabilities()` に `detached_capture` が増え「器あり・採取あり・送出なし」を表現できる
+- 読むだけの 4 経路（read フォールバック / report の scrollback / worker_status の
+  recent_output と履歴サイズ）を `reach::detached_capture` へ。before は全部
+  「到達手段が無い」で即エラーだった
+- #687: psmux ペインの `tako scroll` は外側 alacritty が alt screen（履歴 0）で
+  動かせる余地が無く、応答だけ成功を装っていた。**ユーザーのホイールと同じ in-process の
+  PTY へ SGR 報告を書き、位置は読み取り専用の到達で読み戻す**形に。粒度（psmux は実測 3 行）は
+  1 往復目で学習してキャッシュ、最下部へは撃ち足して copy mode 居残り（#686）を避ける
+- psmux 実測で確定した非互換: `-J` は無視される / **複合コマンド（`;`）は後半が捨てられる** /
+  `#{history_bytes}` は空。`#{scroll_position}` `#{pane_in_mode}` `#{alternate_on}` は動く
+- 関連: PR（Closes #687、Refs #519）。before/after を別 worktree の baseline バイナリで実測
+  （report: エラー → 208 行 + 日本語折返し / scroll: `offset:0` 固定 → 器の実位置に一致）。
+  マトリクスは `tako_orchestrator_report` Pending→Degraded、`tako_scroll_pane` Supported→Degraded
