@@ -2679,6 +2679,48 @@ fn check_mcp_health_warning() {
     }
 }
 
+/// master / solo が実際に使うアカウントを起動時に表示する（Issue #653）。
+///
+/// 「プロファイルを見ても master がどのアカウントで動くか分からない」のが #653 の実害
+/// （既定ログインが別アカウントへ変わっていて worker と同一サブスク枠に相乗りしていた）。
+/// 設定値ではなく**実際に効く config dir** と、そこから読んだログインメールを出す
+fn print_account_banner(
+    profile: &tako_control::orchestrator::Profile,
+    account: Option<&tako_control::orchestrator::ResolvedAccount>,
+) {
+    use tako_control::orchestrator;
+
+    // ペインは起動シェルの CLAUDE_CONFIG_DIR を継承する。tako が何も注入していなくても
+    // 「既定ログイン」とは限らないので、継承値も出どころとして数える。
+    // 継承元として見るのはこの CLI 自身の env（既定のインライン起動 = 同じペインで
+    // claude が動くので一致する。--tab の新ペインは tako-app の env を継承するため、
+    // このプロセスと食い違う可能性が残る）
+    let ambient = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let resolved = profile.resolve_master_config_dir(account, ambient.as_deref());
+    let config_dir = resolved.config_dir().map(str::to_string);
+    eprintln!("アカウント: {}", resolved.source_label());
+    if let Some(ref dir) = config_dir {
+        eprintln!("  config dir: {dir}");
+    }
+    let login = orchestrator::read_account_login(config_dir.as_deref());
+    match login.email {
+        Some(email) => eprintln!("  ログイン: {email}"),
+        None => {
+            let path = login
+                .config_json
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(パス不明)".into());
+            let cause = if login.config_exists {
+                "ログイン情報が入っていません"
+            } else {
+                "設定ファイルがありません"
+            };
+            eprintln!("  ⚠ ログイン未確認: {path} に{cause}");
+            eprintln!("    このアカウントは未ログインの可能性があります（起動後に claude のログインを求められたらその場で実行してください）");
+        }
+    }
+}
+
 /// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
 /// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
@@ -2713,6 +2755,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env()?;
+
+    // #653: master のアカウント解決。未登録キーはタブ・ペインを作る前にここで落とす
+    let master_account = profile.resolve_master_account()?;
 
     // Part 5: cwd 解決（存在しなければ診断つきエラー）
     let resolved_cwd = profile.resolve_cwd()?;
@@ -2766,7 +2811,13 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
 
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
+    let master_cmd = orchestrator::build_master_cmd_with_account(
+        &role_env,
+        &profile,
+        &prompt_path,
+        &tako_bin,
+        master_account.as_ref(),
+    )?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
     // --tab 指定時: 従来の新タブ起動
@@ -2838,14 +2889,12 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
     };
     eprintln!("worker モデルポリシー: {policy_desc}");
+    // #653: master がどのアカウントで動くかを常に表示する（設定と実態のドリフト検知）
+    print_account_banner(&profile, master_account.as_ref());
     // Part 4: env の可視化（キー名のみ。Issue #500）
     if !profile.env.is_empty() {
         let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
         eprintln!("env: {}", keys.join(", "));
-        // CLAUDE_CONFIG_DIR が設定されている場合、config dir を明示表示
-        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
-            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
-        }
     }
     if let Some(ref projects) = profile.projects {
         eprintln!("projects 制限: {}", projects.join(", "));
@@ -2935,6 +2984,9 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env()?;
 
+    // #653: solo も master と同じ起動経路（build_master_cmd）なのでアカウント解決は対称
+    let solo_account = profile.resolve_master_account()?;
+
     // Part 5: cwd 解決
     let resolved_cwd = profile.resolve_cwd()?;
     if let Some(ref cwd) = resolved_cwd {
@@ -2971,7 +3023,13 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
 
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
+    let solo_cmd = orchestrator::build_master_cmd_with_account(
+        &role,
+        &profile,
+        &prompt_path,
+        &tako_bin,
+        solo_account.as_ref(),
+    )?;
 
     let pane_id = if use_tab {
         let tab_result = send_request(Request::TabNew {
@@ -3022,13 +3080,12 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.effort
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
+    // #653: どのアカウントで動くかを常に表示する（master と対称）
+    print_account_banner(&profile, solo_account.as_ref());
     // Part 4: env の可視化（キー名のみ。Issue #500）
     if !profile.env.is_empty() {
         let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
         eprintln!("env: {}", keys.join(", "));
-        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
-            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
-        }
     }
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())

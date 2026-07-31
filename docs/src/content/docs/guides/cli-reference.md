@@ -635,11 +635,44 @@ tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --ef
 | `--worker-effort` | 子 worker の思考量 |
 | `--worker-agent` / `--clear-worker-agent` | worker の既定エージェント CLI（claude / codex / agy） |
 | `--agent` + `--agent-model` 等 | エージェント別の worker 設定（`worker_agents.<agent>` の編集） |
+| `--master-account` / `--clear-master-account` | master が使う claude アカウント（登録済みアカウント名）の固定 / 解除 |
+| `--worker-account` / `--clear-worker-account` | 子 worker が使う claude アカウントの固定 / 解除 |
 
 master のエージェント CLI を codex にすると、`tako master -<プロファイル名>` で codex が
 tako の MCP ツール（ペイン操作・worker spawn 等）に接続された状態で立ち上がります。
 master が claude 以外のとき、プロファイルの `model` / `effort` は claude worker へ
 継承されません（worker 側は `--worker-model` や `--agent claude --agent-model` で明示します）。
+
+#### アカウントを固定する
+
+master と worker で別々の claude アカウント（＝別々のサブスク枠）を使い分けたいときは、
+アカウントを名前で登録しておき、プロファイルから名前で指定します。アカウントの登録は
+master に「このアカウントを登録して」と頼む（MCP の `tako_orchestrator_accounts`）のが簡単です。
+
+```bash
+# master はアカウント personal、worker はアカウント work を使う
+tako orchestrator profiles set default --master-account personal --worker-account work
+
+# 固定を解除して、シェルから引き継ぐ従来の挙動に戻す
+tako orchestrator profiles set default --clear-master-account
+```
+
+指定したアカウントの `config_dir` が `CLAUDE_CONFIG_DIR` として起動コマンドに渡ります。
+**未指定のときは今までどおり**、起動したシェルの環境をそのまま引き継いで起動します
+（`CLAUDE_CONFIG_DIR` が設定されていなければ claude の既定ログイン `~/.claude.json`）。
+
+`tako master` / `tako solo` は起動時に、実際に使うアカウントを表示します。
+
+```
+アカウント: personal（master_account）
+  config dir: /Users/you/.claude-personal
+  ログイン: you@example.com
+```
+
+アカウントを固定していないときは、シェルから引き継いだ `CLAUDE_CONFIG_DIR` があればそれも表示します。
+既定ログインの中身が知らないうちに別アカウントへ変わっていた、という取り違えはこの表示で気づけます。
+アカウント名が未登録のときは、登録済みの名前を添えたエラーになり master は起動しません。
+config dir にログイン情報が無いときは警告が出ますが起動は続行するので、そのまま claude のログインを済ませられます。
 
 :::caution
 `[1m]` 付きモデル（1M コンテキスト版）は Max / API プラン限定です。Pro プランで指定すると master が起動できません。

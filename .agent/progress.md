@@ -1587,3 +1587,13 @@
 - 関連: PR #688（Closes #654）。before/after を別 worktree の baseline バイナリと合成ホイールで
   実測（シェル: scroll_position 0→0 が 0→24 / 偽 claude TUI: 受信報告 0 → 8）。
   副産物 #686（copy mode 居残りで打鍵が食われる）/ #687（CLI scroll の縮退とマトリクスの嘘）起票
+
+## 2026-07-31（#653: master のアカウントをプロファイルで固定できるようにする）
+- worker（#504）と対称に、プロファイルの `master_account` で master / solo の
+  `CLAUDE_CONFIG_DIR` を宣言的に固定。未指定時の起動コマンドは #653 以前と完全に同一
+- 起動時に「実際に使う config dir + ログインメール」を表示。tako が注入しない場合でも
+  ペインは起動シェルの `CLAUDE_CONFIG_DIR` を継承するため、表示は Account / ProfileEnv /
+  Inherited / Default の 4 種を区別する（一律「既定ログイン」だと #653 のドリフトを隠す。
+  隔離実測で発覚して設計変更）。未登録キーはペインを作る前に登録済みキーを添えて失敗
+- 関連: PR（Closes #653）。claude をスタブへ差し替えた隔離 e2e で、起動プロセスが受け取った
+  `CLAUDE_CONFIG_DIR` を継承あり / なしの 2 条件 × 5 ケースで実測
