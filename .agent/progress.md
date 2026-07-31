@@ -1599,3 +1599,12 @@
 - 関連コミット: `9758a6b`（PR #685 squash merge）。品質ゲート全緑 + セルフテスト項目 90 +
   visual-test 全節完走（3 連続）+ 実マウスの ⌘+クリックでローカル HTTP サーバへの
   実アクセスをログで確認。副産物: `wait_for_preview_maps` の PDF 待ちを 2s → 4s
+
+## 2026-07-31（#691: GUI ライク表示モード（初心者向け UI）の詳細仕様策定 — docs のみ）
+- 仕様書 `.agent/plans/2026-07-gui-mode.md` 新設（243 行）: グローバル `ui_mode` トグル
+  （テーマボタン隣 + settings.json + dispatch/CLI/MCP 1:1）/ スターター 3 ボタン
+  （welcome バナーと同じ「シェルへ `tako master`/`solo` 書き込み」方式）/ claude ペインの
+  チャットビュー（transcript 正規化 + agents ctx% + Send/Respond = PWA と同一データ源の再利用）/
+  表示レイヤのみの切替で PTY・tmux・persist 不変を裏付けつきで明記。フェーズ G1〜G4
+- 関連: エピック Issue #691、PR #692 squash merge（`200d889`）。CI は macOS 全ジョブ緑で合格
+- 次: G1（モード基盤 + スターター）の worker 割当は master 判断
