@@ -597,6 +597,11 @@ pub fn resume_command(id: &str, entry: &SessionEntry) -> Result<String, String> 
         Some(role) => crate::orchestrator::agent::launch_with_role(&role, "claude"),
         None => "claude".to_string(),
     };
+    // 会話の所在（config ディレクトリ）を先頭で明示する。無いと別アカウントの会話は
+    // `No conversation found with session ID` になる（#652）
+    if let Some(prefix) = crate::transcript::resume_env_prefix(id) {
+        cmd.insert_str(0, &prefix);
+    }
     if let Some(model) = entry.model.as_deref() {
         cmd.push_str(&format!(
             " --model {}",

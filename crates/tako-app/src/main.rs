@@ -107,16 +107,25 @@ const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
 /// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
+///
+/// `location` は transcript の所在（`None` = 会話が見つからない = resume 不可）。
+/// **所在の config ディレクトリを env で明示する**のが要点で、これが無いと
+/// アカウント（`CLAUDE_CONFIG_DIR`）で動いていたペインは復元後に
+/// `No conversation found with session ID` になり会話が戻らない（Issue #652）。
+///
+/// 末尾に改行は付けない。送達は `shell_send`（#640）が本文と Enter を分けて送り、
+/// エコーを確認してから実行させる（書きっぱなしだと器が起動直後の入力を落とす）
 fn claude_resume_command(
     backend_alive: bool,
     session_id: Option<&str>,
-    transcript_exists: bool,
-) -> Option<Vec<u8>> {
-    let session_id = (!backend_alive && transcript_exists)
-        .then_some(session_id)
-        .flatten()
-        .filter(|id| tako_control::transcript::is_valid_session_id(id))?;
-    Some(format!("claude --resume {session_id}\r").into_bytes())
+    location: Option<&tako_control::transcript::TranscriptLocation>,
+) -> Option<String> {
+    if backend_alive {
+        return None;
+    }
+    let session_id = session_id.filter(|id| tako_control::transcript::is_valid_session_id(id))?;
+    let prefix = tako_control::transcript::resume_env_prefix_for(location?);
+    Some(format!("{prefix}claude --resume {session_id}"))
 }
 
 /// タブバーの高さ（px）
@@ -2426,14 +2435,16 @@ impl TakoApp {
                     app.pane_logs_lock()
                         .seed_history(pane.as_u64(), &meta, history as usize);
                 }
-                let transcript_exists = r
+                // 会話の所在（どの claude config ディレクトリか）まで解決する。
+                // 見つからなければ resume 不可 = 新規シェルへ落とす（#652）
+                let transcript_location = r
                     .claude_session_id
                     .as_deref()
-                    .is_some_and(|id| tako_control::transcript::find_transcript(id).is_some());
+                    .and_then(tako_control::transcript::locate_transcript);
                 let resume_command = claude_resume_command(
                     backend_alive,
                     r.claude_session_id.as_deref(),
-                    transcript_exists,
+                    transcript_location.as_ref(),
                 );
                 if let Some(session_id) = &r.claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
@@ -2458,10 +2469,12 @@ impl TakoApp {
                     // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
                     // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
                     // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
-                    if let Some(session) = app.terminals.get(&pane) {
-                        session.write(command);
-                        resumed_claude += 1;
-                    }
+                    //
+                    // #640: ここは**書きっぱなしにしてはいけない**。器（psmux）は起動直後の
+                    // 入力を落とすので、素の write だと復元直後の resume が無言で消える。
+                    // エコー確認つきの送達フローへ載せる（起動が間に合わなければ次 tick へ持ち越す）
+                    app.queue_command_flow(pane, command);
+                    resumed_claude += 1;
                 } else {
                     fresh_shells += 1;
                 }
@@ -25557,20 +25570,77 @@ mod self_test_isolation_tests {
 #[cfg(test)]
 mod persist_resume_tests {
     use super::claude_resume_command;
+    use std::path::PathBuf;
+    use tako_control::transcript::TranscriptLocation;
+
+    const ID: &str = "a45899a8-96a6-4fa6-9bf6-71df53307878";
+
+    /// 既定 config dir に会話がある所在
+    fn default_location() -> TranscriptLocation {
+        TranscriptLocation {
+            path: PathBuf::from("/home/u/.claude/projects/p").join(format!("{ID}.jsonl")),
+            config_dir: PathBuf::from("/home/u/.claude"),
+            is_default: true,
+        }
+    }
+
+    /// アカウント（別 config dir）に会話がある所在
+    fn account_location() -> TranscriptLocation {
+        TranscriptLocation {
+            path: PathBuf::from("/home/u/.claude-univ/projects/p").join(format!("{ID}.jsonl")),
+            config_dir: PathBuf::from("/home/u/.claude-univ"),
+            is_default: false,
+        }
+    }
 
     #[test]
     fn backend消失時だけ検証済みclaudeをresumeする() {
-        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
-        assert_eq!(
-            claude_resume_command(false, Some(id), true),
-            Some(format!("claude --resume {id}\r").into_bytes())
-        );
+        let loc = default_location();
+        let cmd = claude_resume_command(false, Some(ID), Some(&loc)).expect("resume されるはず");
+        assert!(cmd.ends_with(&format!("claude --resume {ID}")), "{cmd}");
         // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
-        assert_eq!(claude_resume_command(true, Some(id), true), None);
-        // transcript 不在・不正 ID・ID 不明を推測で起動しない
-        assert_eq!(claude_resume_command(false, Some(id), false), None);
-        assert_eq!(claude_resume_command(false, Some("../../bad"), true), None);
-        assert_eq!(claude_resume_command(false, None, true), None);
+        assert_eq!(claude_resume_command(true, Some(ID), Some(&loc)), None);
+        // transcript 不在（所在が引けない）・不正 ID・ID 不明を推測で起動しない
+        assert_eq!(claude_resume_command(false, Some(ID), None), None);
+        assert_eq!(
+            claude_resume_command(false, Some("../../bad"), Some(&loc)),
+            None
+        );
+        assert_eq!(claude_resume_command(false, None, Some(&loc)), None);
+    }
+
+    /// #652 の本丸: 所在の config ディレクトリがコマンドの**先頭**に必ず載る。
+    /// 載っていないと復元後の claude は既定 config dir で会話を探して
+    /// `No conversation found with session ID` になる
+    #[test]
+    fn resumeコマンドは会話の所在をenvで明示する() {
+        let cmd = claude_resume_command(false, Some(ID), Some(&account_location())).unwrap();
+        assert!(
+            cmd.starts_with(&tako_control::transcript::resume_env_prefix_for(
+                &account_location()
+            )),
+            "アカウントの config dir を先頭で指定する: {cmd}"
+        );
+        assert!(cmd.contains(".claude-univ"), "{cmd}");
+
+        // 既定 config dir の会話は「未設定へ戻す」。tako 自身が CLAUDE_CONFIG_DIR つきで
+        // 起動されていても、既定の会話を既定で開けるようにするため
+        let cmd = claude_resume_command(false, Some(ID), Some(&default_location())).unwrap();
+        assert!(!cmd.contains(".claude-univ"), "{cmd}");
+        assert!(
+            cmd.starts_with(&tako_control::transcript::resume_env_prefix_for(
+                &default_location()
+            )),
+            "{cmd}"
+        );
+    }
+
+    /// 送達は shell_send（#640）が本文と Enter を分けて送るので、
+    /// ここで改行を混ぜてはいけない（混ぜるとエコー照合が本文と一致しなくなる）
+    #[test]
+    fn resumeコマンドに改行を含めない() {
+        let cmd = claude_resume_command(false, Some(ID), Some(&account_location())).unwrap();
+        assert!(!cmd.contains('\r') && !cmd.contains('\n'), "{cmd}");
     }
 }
 
