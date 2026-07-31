@@ -8,6 +8,17 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.3] - 2026-08-01
+
+Nightly patch release (automated). Changes since v0.6.2:
+夜間パッチリリース（自動）。v0.6.2 以降の変更:
+
+- [改善] アップデート詳細のリリースノートを Markdown レンダリング表示へ (#690) (#699)
+- [機能追加] GUI ライク表示モード G1: モード基盤 + スターター 3 ボタン (#694) (#698)
+- [ドキュメント] progress: #691 GUI モード仕様策定の完了を記録
+- [ドキュメント] GUI ライク表示モード（初心者向け UI）の詳細仕様書 (#691) (#692)
+- [ドキュメント] activeContext: 07-30 バッチのユーザー目視 OK を反映
+
 ## [0.6.2] - 2026-07-31
 
 Nightly patch release (automated). Changes since v0.6.1:
