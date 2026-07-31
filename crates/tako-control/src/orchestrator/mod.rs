@@ -249,6 +249,123 @@ impl AccountsConfig {
             })
             .collect()
     }
+
+    /// 登録済みアカウント名を並べた案内文（未登録キーの診断用。Issue #653）
+    fn known_names_hint(&self) -> String {
+        if self.accounts.is_empty() {
+            "accounts.yaml にアカウントが 1 件も登録されていない".into()
+        } else {
+            format!(
+                "登録済み: {}",
+                self.accounts.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        }
+    }
+}
+
+// --- アカウントのログイン状態（Issue #653） ---
+
+/// claude の設定ファイル名（config ディレクトリ直下 / ホーム直下のどちらも同名）
+const CLAUDE_CONFIG_JSON: &str = ".claude.json";
+
+/// claude の設定ファイルのパス。
+///
+/// `CLAUDE_CONFIG_DIR` を指定した場合は `<config_dir>/.claude.json`、
+/// 未指定（既定ログイン）の場合は `~/.claude.json`（`~/.claude/` の**隣**）。
+/// この非対称は claude CLI 側の仕様（実測で確認済み）
+pub fn claude_config_json_path(config_dir: Option<&str>) -> Option<PathBuf> {
+    match config_dir {
+        Some(dir) if !dir.is_empty() => {
+            Some(PathBuf::from(expand_tilde(dir)).join(CLAUDE_CONFIG_JSON))
+        }
+        _ => home_dir().map(|h| h.join(CLAUDE_CONFIG_JSON)),
+    }
+}
+
+/// claude の config ディレクトリのログイン状態（Issue #653）。
+/// master がどのアカウントで動くかを起動時に見せ、設定と実態のドリフトに気づけるようにする
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccountLogin {
+    /// 読み取り対象の設定ファイル（パスを解決できなければ None）
+    pub config_json: Option<PathBuf>,
+    /// 設定ファイルが実在したか
+    pub config_exists: bool,
+    /// ログイン中のメールアドレス（未ログイン・読めない場合は None）
+    pub email: Option<String>,
+}
+
+impl AccountLogin {
+    /// ログイン済みと見なせるか（メールが読めたか）
+    pub fn is_logged_in(&self) -> bool {
+        self.email.is_some()
+    }
+}
+
+/// `.claude.json` の JSON からログイン中のメールアドレスを取り出す（純関数）
+fn parse_oauth_email(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let email = value
+        .get("oauthAccount")?
+        .get("emailAddress")?
+        .as_str()?
+        .trim();
+    if email.is_empty() {
+        None
+    } else {
+        Some(email.to_string())
+    }
+}
+
+/// master が使う config dir と、その出どころ（Issue #653）。
+/// 「tako が注入した値」と「起動シェルから継承しただけの値」を区別するために種別を持つ
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasterConfigDir {
+    /// プロファイルの `master_account`（tako が注入する）
+    Account { name: String, config_dir: String },
+    /// プロファイルの `env.CLAUDE_CONFIG_DIR`（tako が注入する）
+    ProfileEnv { config_dir: String },
+    /// 起動シェルの `CLAUDE_CONFIG_DIR` をペインが継承する（tako は何も注入していない）
+    Inherited { config_dir: String },
+    /// どこにも指定が無い = claude の既定ログイン（`~/.claude.json`）
+    Default,
+}
+
+impl MasterConfigDir {
+    /// 実際に効く config dir（既定ログインなら None）
+    pub fn config_dir(&self) -> Option<&str> {
+        match self {
+            Self::Account { config_dir, .. }
+            | Self::ProfileEnv { config_dir }
+            | Self::Inherited { config_dir } => Some(config_dir),
+            Self::Default => None,
+        }
+    }
+
+    /// 出どころの説明（起動時表示用）
+    pub fn source_label(&self) -> String {
+        match self {
+            Self::Account { name, .. } => format!("{name}（master_account）"),
+            Self::ProfileEnv { .. } => "プロファイルの env: CLAUDE_CONFIG_DIR".into(),
+            Self::Inherited { .. } => {
+                "起動シェルの CLAUDE_CONFIG_DIR を継承（master_account 未指定）".into()
+            }
+            Self::Default => "既定ログイン（master_account 未指定）".into(),
+        }
+    }
+}
+
+/// config ディレクトリ（None = 既定ログイン）のログイン状態を読む。
+/// 読み取り失敗は「未ログイン」と同じ扱い（起動を止めないための best-effort）
+pub fn read_account_login(config_dir: Option<&str>) -> AccountLogin {
+    let Some(path) = claude_config_json_path(config_dir) else {
+        return AccountLogin::default();
+    };
+    let content = std::fs::read_to_string(&path).ok();
+    AccountLogin {
+        config_exists: content.is_some(),
+        email: content.as_deref().and_then(parse_oauth_email),
+        config_json: Some(path),
+    }
 }
 
 // --- projects.yaml ---
@@ -717,6 +834,76 @@ impl Profile {
     /// master のアカウント名を解決する（Issue #504）
     pub fn resolve_master_account_name(&self) -> Option<&str> {
         self.master_account.as_deref()
+    }
+
+    /// master のアカウントを解決する（純関数。Issue #653）。
+    ///
+    /// - `master_account` 未指定 → `Ok(None)` = 既定ログインのまま（後方互換）
+    /// - 未登録キー → 登録済みキーを添えた診断つき Err（ペインを作る前に落とすため）
+    pub fn resolve_master_account_in(
+        &self,
+        accounts: &AccountsConfig,
+    ) -> Result<Option<ResolvedAccount>, String> {
+        let Some(name) = self.master_account.as_deref() else {
+            return Ok(None);
+        };
+        match accounts.resolve(name) {
+            Ok(account) => Ok(Some(account)),
+            Err(_) => Err(format!(
+                "プロファイルの master_account '{name}' が accounts.yaml に見つからない（{}）。\n  \
+                 MCP の tako_orchestrator_accounts（action: add）で登録するか、\
+                 master_account を解除してください（tako orchestrator profiles set <名前> --clear-master-account）",
+                accounts.known_names_hint()
+            )),
+        }
+    }
+
+    /// master のアカウントを accounts.yaml から解決する（Issue #653）。
+    /// `master_account` 未指定なら accounts.yaml を読まずに `Ok(None)` を返す
+    pub fn resolve_master_account(&self) -> Result<Option<ResolvedAccount>, String> {
+        if self.master_account.is_none() {
+            return Ok(None);
+        }
+        let accounts = AccountsConfig::load()?;
+        self.resolve_master_account_in(&accounts)
+    }
+
+    /// tako が起動コマンドへ**注入する** `CLAUDE_CONFIG_DIR`（Issue #653）。
+    /// 解決順は master_account > プロファイルの env > None（= 注入しない）で、
+    /// `resolved_env_with_account` の結果と一致する（表示と実際の注入をずらさない）
+    pub fn injected_master_config_dir(&self, account: Option<&ResolvedAccount>) -> Option<String> {
+        self.resolved_env_with_account(account)
+            .into_iter()
+            .find(|(k, _)| k == CLAUDE_CONFIG_DIR_ENV)
+            .map(|(_, v)| v)
+    }
+
+    /// master が実際に使う config dir と、その出どころ（純関数。Issue #653）。
+    ///
+    /// tako が何も注入しない場合でも、ペインは**起動シェルの `CLAUDE_CONFIG_DIR` を継承する**。
+    /// 「master_account 未指定 = 既定ログイン」と決めつけて表示すると、まさに #653 の
+    /// ドリフト（意図しないアカウントで動いている）を隠してしまうため、
+    /// 継承値（`ambient`）も出どころとして区別する
+    pub fn resolve_master_config_dir(
+        &self,
+        account: Option<&ResolvedAccount>,
+        ambient: Option<&str>,
+    ) -> MasterConfigDir {
+        if let Some(acct) = account {
+            return MasterConfigDir::Account {
+                name: acct.name.clone(),
+                config_dir: acct.config_dir.clone(),
+            };
+        }
+        if let Some(dir) = self.injected_master_config_dir(None) {
+            return MasterConfigDir::ProfileEnv { config_dir: dir };
+        }
+        match ambient.map(str::trim).filter(|d| !d.is_empty()) {
+            Some(dir) => MasterConfigDir::Inherited {
+                config_dir: expand_tilde(dir),
+            },
+            None => MasterConfigDir::Default,
+        }
     }
 
     /// worker のアカウント名を解決する。解決順:
@@ -1401,6 +1588,22 @@ pub fn build_master_cmd(
     prompt_path: &Path,
     tako_bin: &str,
 ) -> Result<String, String> {
+    // アカウント解決（Issue #653）。未指定なら None = 既定ログイン（従来どおり）
+    let account = profile.resolve_master_account()?;
+    build_master_cmd_with_account(role_env, profile, prompt_path, tako_bin, account.as_ref())
+}
+
+/// master 起動コマンドの組み立て本体（解決済みアカウントを受け取る純関数。Issue #653）。
+///
+/// アカウントの `config_dir` を `CLAUDE_CONFIG_DIR` として注入する（worker の spawn と対称）。
+/// `account` が None のときの出力は #653 以前と完全に同一（後方互換）
+pub fn build_master_cmd_with_account(
+    role_env: &str,
+    profile: &Profile,
+    prompt_path: &Path,
+    tako_bin: &str,
+    account: Option<&ResolvedAccount>,
+) -> Result<String, String> {
     // env 検証（内部変数の上書きを拒否。Issue #500）
     profile.validate_env()?;
 
@@ -1408,7 +1611,7 @@ pub fn build_master_cmd(
     // プロファイル env をコマンド先頭で設定する。direnv より後勝ちで上書きする
     // （シェル方言の吸収は agent.rs のペインシェル部品に集約。Windows 対応）
     let mut cmd = String::new();
-    for (k, v) in profile.resolved_env() {
+    for (k, v) in profile.resolved_env_with_account(account) {
         cmd.push_str(&agent::env_assign(&k, &v));
     }
     cmd.push_str(&agent::launch_with_role(role_env, agent.as_str()));
@@ -3428,6 +3631,295 @@ worker_agents:
         assert_eq!(p.resolve_worker_account_name(None), Some("master-acct"));
         p.master_account = None;
         assert_eq!(p.resolve_worker_account_name(None), None);
+    }
+
+    // --- master のアカウント固定 (#653) ---
+
+    /// テスト用のアカウント 1 件を持つレジストリ
+    fn accounts_with(name: &str, config_dir: &str) -> AccountsConfig {
+        let mut accounts = std::collections::BTreeMap::new();
+        accounts.insert(
+            name.to_string(),
+            AccountEntry {
+                config_dir: config_dir.to_string(),
+                description: None,
+                default_model: None,
+                default_effort: None,
+            },
+        );
+        AccountsConfig { accounts }
+    }
+
+    #[test]
+    fn master_accountを解決するとconfig_dirが得られる() {
+        let p = Profile {
+            master_account: Some("personal".into()),
+            ..Default::default()
+        };
+        let accounts = accounts_with("personal", "/home/test/.claude-personal");
+        let resolved = p.resolve_master_account_in(&accounts).unwrap().unwrap();
+        assert_eq!(resolved.name, "personal");
+        assert_eq!(resolved.config_dir, "/home/test/.claude-personal");
+    }
+
+    #[test]
+    fn master_account未指定ならアカウントを解決しない() {
+        let p = Profile::default();
+        let accounts = accounts_with("personal", "/home/test/.claude-personal");
+        assert!(p.resolve_master_account_in(&accounts).unwrap().is_none());
+        // 未指定なら accounts.yaml を読まずに None（ファイル不在でも失敗しない）
+        assert!(p.resolve_master_account().unwrap().is_none());
+    }
+
+    #[test]
+    fn master_accountの未登録キーは登録済みを添えて失敗する() {
+        let p = Profile {
+            master_account: Some("typo".into()),
+            ..Default::default()
+        };
+        let accounts = accounts_with("personal", "/home/test/.claude-personal");
+        let err = p.resolve_master_account_in(&accounts).unwrap_err();
+        assert!(err.contains("typo"), "指定キーを含む: {err}");
+        assert!(err.contains("personal"), "登録済みキーを列挙する: {err}");
+        assert!(
+            err.contains("--clear-master-account"),
+            "解除手段を案内する: {err}"
+        );
+
+        // 1 件も登録が無い場合も「見つからない」で落ちる（案内文は別）
+        let empty = AccountsConfig {
+            accounts: std::collections::BTreeMap::new(),
+        };
+        let err = p.resolve_master_account_in(&empty).unwrap_err();
+        assert!(err.contains("1 件も登録されていない"), "{err}");
+    }
+
+    #[test]
+    fn master起動コマンドにアカウントのconfig_dirが注入される() {
+        let p = Profile {
+            master_account: Some("personal".into()),
+            ..Default::default()
+        };
+        let accounts = accounts_with("personal", "/home/test/.claude-personal");
+        let account = p.resolve_master_account_in(&accounts).unwrap();
+        let cmd = build_master_cmd_with_account(
+            "master",
+            &p,
+            Path::new("/tmp/prompt.md"),
+            "tako",
+            account.as_ref(),
+        )
+        .unwrap();
+        assert!(
+            cmd.contains("CLAUDE_CONFIG_DIR") && cmd.contains("/home/test/.claude-personal"),
+            "CLAUDE_CONFIG_DIR が注入される: {cmd}"
+        );
+        // 注入は claude の起動より前（シェルの代入文として先頭側にある）。
+        // config_dir 自体が "claude" を含むので、起動位置は launch_with_role の実文字列で探す
+        let launch = agent::launch_with_role("master", "claude");
+        let env_pos = cmd.find("CLAUDE_CONFIG_DIR").unwrap();
+        let launch_pos = cmd.find(&launch).unwrap();
+        assert!(env_pos < launch_pos, "起動前に代入する: {cmd}");
+    }
+
+    #[test]
+    fn master_account未指定の起動コマンドは従来と同一() {
+        let p = Profile::default();
+        let with_none =
+            build_master_cmd_with_account("master", &p, Path::new("/tmp/prompt.md"), "tako", None)
+                .unwrap();
+        // #653 以前の実装（profile.resolved_env() をそのまま流す）と同じ出力であること
+        let mut legacy = String::new();
+        for (k, v) in p.resolved_env() {
+            legacy.push_str(&agent::env_assign(&k, &v));
+        }
+        legacy.push_str(&agent::launch_with_role("master", "claude"));
+        legacy.push_str(" --effort max");
+        legacy.push_str(&format!(
+            " --append-system-prompt-file {}",
+            agent::quote(&Path::new("/tmp/prompt.md").display().to_string())
+        ));
+        assert_eq!(with_none, legacy);
+        assert!(!with_none.contains("CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn アカウント指定はプロファイルenvのconfig_dirに勝つ() {
+        let mut p = Profile {
+            master_account: Some("personal".into()),
+            ..Default::default()
+        };
+        p.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "/home/test/.claude-old".into());
+        let accounts = accounts_with("personal", "/home/test/.claude-personal");
+        let account = p.resolve_master_account_in(&accounts).unwrap();
+
+        assert_eq!(
+            p.injected_master_config_dir(account.as_ref()).as_deref(),
+            Some("/home/test/.claude-personal")
+        );
+        let cmd = build_master_cmd_with_account(
+            "master",
+            &p,
+            Path::new("/tmp/prompt.md"),
+            "tako",
+            account.as_ref(),
+        )
+        .unwrap();
+        assert!(!cmd.contains(".claude-old"), "旧 env は残らない: {cmd}");
+    }
+
+    #[test]
+    fn 注入するconfig_dirはアカウントenv未指定の順で解決する() {
+        // 何も指定なし = 注入しない
+        let plain = Profile::default();
+        assert_eq!(plain.injected_master_config_dir(None), None);
+
+        // env のみ（アカウント無し）
+        let mut env_only = Profile::default();
+        env_only
+            .env
+            .insert("CLAUDE_CONFIG_DIR".into(), "~/.claude-env".into());
+        assert_eq!(
+            env_only.injected_master_config_dir(None),
+            Some(expand_tilde("~/.claude-env"))
+        );
+    }
+
+    #[test]
+    fn 表示用config_dirは出どころを区別する() {
+        let plain = Profile::default();
+        let acct = ResolvedAccount {
+            name: "personal".into(),
+            config_dir: "/home/test/.claude-personal".into(),
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+
+        // アカウント指定 > プロファイル env > 継承 > 既定
+        let mut with_env = Profile::default();
+        with_env
+            .env
+            .insert("CLAUDE_CONFIG_DIR".into(), "/home/test/.claude-env".into());
+        assert_eq!(
+            with_env.resolve_master_config_dir(Some(&acct), Some("/home/test/.claude-amb")),
+            MasterConfigDir::Account {
+                name: "personal".into(),
+                config_dir: "/home/test/.claude-personal".into()
+            }
+        );
+        assert_eq!(
+            with_env.resolve_master_config_dir(None, Some("/home/test/.claude-amb")),
+            MasterConfigDir::ProfileEnv {
+                config_dir: "/home/test/.claude-env".into()
+            }
+        );
+
+        // #653 の肝: tako が何も注入しなくても、ペインは起動シェルの値を継承する。
+        // これを「既定ログイン」と表示するとドリフトを隠してしまう
+        assert_eq!(
+            plain.resolve_master_config_dir(None, Some("/home/test/.claude-amb")),
+            MasterConfigDir::Inherited {
+                config_dir: "/home/test/.claude-amb".into()
+            }
+        );
+        // 空・空白のみの継承値は「未設定」と同じ
+        assert_eq!(
+            plain.resolve_master_config_dir(None, Some("  ")),
+            MasterConfigDir::Default
+        );
+        assert_eq!(
+            plain.resolve_master_config_dir(None, None),
+            MasterConfigDir::Default
+        );
+
+        // 継承は表示だけの話で、注入は増えない（後方互換）
+        assert_eq!(plain.injected_master_config_dir(None), None);
+
+        assert_eq!(
+            plain
+                .resolve_master_config_dir(None, Some("/home/test/.claude-amb"))
+                .config_dir(),
+            Some("/home/test/.claude-amb")
+        );
+        assert_eq!(
+            plain.resolve_master_config_dir(None, None).config_dir(),
+            None
+        );
+        // 出どころのラベルは 4 種すべて別物（表示で取り違えないこと）
+        let labels: Vec<String> = [
+            plain.resolve_master_config_dir(Some(&acct), None),
+            with_env.resolve_master_config_dir(None, None),
+            plain.resolve_master_config_dir(None, Some("/home/test/.claude-amb")),
+            plain.resolve_master_config_dir(None, None),
+        ]
+        .iter()
+        .map(|r| r.source_label())
+        .collect();
+        let unique: std::collections::BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+    }
+
+    // --- アカウントのログイン状態 (#653) ---
+
+    #[test]
+    fn config_dir指定時の設定ファイルはその直下() {
+        let path = claude_config_json_path(Some("/home/test/.claude-personal")).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/home/test/.claude-personal").join(".claude.json")
+        );
+        // 未指定（既定ログイン）は ~/.claude.json（~/.claude/ の隣）
+        let default = claude_config_json_path(None).unwrap();
+        assert_eq!(default, home_dir().unwrap().join(".claude.json"));
+    }
+
+    #[test]
+    fn ログインメールをoauth_accountから読む() {
+        assert_eq!(
+            parse_oauth_email(r#"{"oauthAccount":{"emailAddress":"user@example.com"}}"#).as_deref(),
+            Some("user@example.com")
+        );
+        // 未ログイン・欠損・壊れた JSON は None（起動は止めない）
+        assert_eq!(parse_oauth_email(r#"{"numStartups":3}"#), None);
+        assert_eq!(parse_oauth_email(r#"{"oauthAccount":{}}"#), None);
+        assert_eq!(
+            parse_oauth_email(r#"{"oauthAccount":{"emailAddress":"  "}}"#),
+            None
+        );
+        assert_eq!(parse_oauth_email("not json"), None);
+    }
+
+    #[test]
+    fn ログイン状態を実ファイルから読む() {
+        let dir = std::env::temp_dir().join(format!("tako-653-login-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dir_str = dir.display().to_string();
+
+        // 設定ファイルなし
+        let login = read_account_login(Some(&dir_str));
+        assert!(!login.config_exists);
+        assert!(!login.is_logged_in());
+        assert_eq!(login.config_json, Some(dir.join(".claude.json")));
+
+        // 設定ファイルはあるがログイン情報なし
+        std::fs::write(dir.join(".claude.json"), r#"{"numStartups":1}"#).unwrap();
+        let login = read_account_login(Some(&dir_str));
+        assert!(login.config_exists);
+        assert!(!login.is_logged_in());
+
+        // ログイン済み
+        std::fs::write(
+            dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"user@example.com"}}"#,
+        )
+        .unwrap();
+        let login = read_account_login(Some(&dir_str));
+        assert!(login.is_logged_in());
+        assert_eq!(login.email.as_deref(), Some("user@example.com"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- Part 5: cwd (#500) ---

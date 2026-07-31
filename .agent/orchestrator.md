@@ -174,6 +174,55 @@ worker_agents:               # エージェント別の worker 設定（任意�
   「軽い調査は codex (gpt-5.6-luna)、重実装は claude」等と書くと、master がタスクごとに
   agent / model を選んで spawn する（system prompt に Available Worker Agents 一覧が注入される）
 
+### アカウント固定（accounts.yaml + master_account / worker_account。Issue #504 / #653）
+
+master と worker で別々の claude アカウント（サブスク枠）を使い分けるための仕組み。
+名前つきアカウントを `<data_dir>/orchestrator/accounts.yaml` に登録し、
+プロファイルから**名前で**参照する（エントリの `config_dir` は claude 側の
+`CLAUDE_CONFIG_DIR` であって、tako の設定ディレクトリではない）。
+
+```yaml
+# accounts.yaml（登録は MCP の tako_orchestrator_accounts。action: list / show / add / remove）
+accounts:
+  personal:
+    config_dir: ~/.claude-personal   # CLAUDE_CONFIG_DIR に入る値
+    description: 個人アカウント
+  work:
+    config_dir: ~/.claude-work
+    default_model: claude-opus-4-6   # worker の model / effort フォールバック（任意）
+```
+
+```yaml
+# profiles/<name>.yaml
+master_account: personal   # master / solo が使うアカウント（#653）
+worker_account: work       # worker が使うアカウント（#504）
+```
+
+- **注入**: 指定したアカウントの `config_dir` を `CLAUDE_CONFIG_DIR` として起動コマンドの先頭で
+  設定する（シェル方言の吸収は `agent::env_assign` = unix は `export`、Windows は `$env:`）。
+  master / solo は `build_master_cmd`、worker は spawn（dispatch）が入口で、
+  どちらも `Profile::resolved_env_with_account` を通る = **アカウント指定はプロファイルの
+  `env.CLAUDE_CONFIG_DIR` に勝つ**
+- **未指定時**: `CLAUDE_CONFIG_DIR` を注入しない = 起動シェルの環境をそのまま使う
+  （そこにも無ければ claude の既定ログイン `~/.claude.json`）。
+  #653 以前と完全に同一の起動コマンドになる（後方互換）
+- **解決順**: master = `master_account` のみ。worker = spawn の `account` 引数 >
+  `worker_account` > `master_account`
+- **未登録キー**: master 起動は**タブ・ペインを作る前に**エラーで止まる
+  （登録済みキーの列挙 + 解除コマンドを添える）。worker 側は spawn がエラーを返す
+- **起動時表示**: `tako master` / `tako solo` は実効 config dir と、そこから読んだ
+  ログインメール（`<config_dir>/.claude.json` の `oauthAccount.emailAddress`）を出す。
+  「プロファイルを見ても master がどのアカウントで動くか分からず、既定ログインが別アカウントへ
+  変わっていて worker と同一枠に相乗りしていた」（#653 の実害）に気づくための表示。
+  ログイン情報が読めない場合は**警告のみで起動は続行**する（その場でログインできるようにするため）
+- **出どころの区別**（`MasterConfigDir`）: tako が注入しない場合でもペインは**起動シェルの
+  `CLAUDE_CONFIG_DIR` を継承する**ため、表示は Account / ProfileEnv / Inherited（継承）/
+  Default（既定ログイン）の 4 種を区別する。未指定を一律「既定ログイン」と表示すると
+  ドリフトそのものを隠すことになる（隔離実測で発覚）。
+  注入の正は `injected_master_config_dir`、表示の正は `resolve_master_config_dir`
+- **設定ファイルの位置**: `CLAUDE_CONFIG_DIR` 指定時は `<config_dir>/.claude.json`、
+  未指定時は `~/.claude.json`（`~/.claude/` の**隣**）。この非対称は claude CLI 側の仕様
+
 ### CLI でプロファイルを管理する
 
 ```bash
@@ -198,6 +247,10 @@ tako orchestrator profiles set default --clear-worker-agent   # claude 既定へ
 # master のエージェント種別（#127。model / effort はそのエージェントのネイティブ表記で）
 tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
 tako orchestrator profiles set sol --clear-master-agent       # claude 既定へ戻す
+
+# アカウント固定（#504 / #653。値は accounts.yaml のキー）
+tako orchestrator profiles set default --master-account personal --worker-account work
+tako orchestrator profiles set default --clear-master-account  # 既定ログインへ戻す
 ```
 
 MCP からは `tako_orchestrator_profiles`（action: list / show / set。master_agent /
