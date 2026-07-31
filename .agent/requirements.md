@@ -748,6 +748,7 @@ tako-app `remove_pane_with` の両方から `reflow_workers` を呼ぶ。設定�
 | FR-2.21.5 | 更新フローの**全状態**（テスト版警告・更新確認・進行・完了・失敗・brew 失敗の zip フォールバック・チェック失敗）は専用画面に出す。ステータスバーへ戻る経路は残さない。tako メニュー・About の「アップデートを確認」も結果の行き先として専用画面を開く | M |
 | FR-2.21.6 | 自動チェックの結果でユーザーの確認・更新フロー（TestWarning / ConfirmPending / Updating）や未読の失敗表示を上書きしない（`UpdateState::is_replaceable_by_check`） | M |
 | FR-2.21.7 | 専用画面を開く操作とカードの状態照会・閉じる・出し直しを CLI `tako update open` / `tako update card [dismiss\|show]` と MCP `tako_update`（action = open / card / card-dismiss / card-show）へ 1:1 公開する。⌘K パレットにも「アップデートを開く」を常設し、画面が開いているかは `tako update status` の `window_open` で分かる（開発不変条件） | M |
+| FR-2.21.8 | リリースノートは **Markdown としてレンダリング**する（✅ 2026-07-31、#690）。ノートの生成元は `scripts/release.sh` のノート生成（#594）が作る md（見出し・ダウンロード表・リスト・リンク・コード・日英併記）なので、生テキストでは読めない。描画は**プレビューペイン（FR-3.3 / FR-3.3.1）と同じ実装**を通し、見た目の一貫性を構造で担保する。リンクは ⌘+クリックで既定ブラウザ（FR-3.3.2 / #680 と同じ規則 = http / https のみ）。ノートが空のリリースは案内文へ落とし、壊れた md・極端に長いノートでも描画が落ちない | M |
 
 実装メモ（2026-07-28）: UI は `tako-app/src/update_window.rs`（`UpdateWindow` = 専用画面、
 `TakoApp::render_update_card` = 通知カード、更新フローの実体もここ）。表示判定は
@@ -756,6 +757,19 @@ dispatch 側（`crate::settings`）で行い、`TAKO_SELF_TEST` 中は書かな�
 機械検証はセルフテスト項目 90（カード表示 → × → 新版で再表示 / settings 往復 /
 パレット・dispatch から専用画面が開き更新フロー 9 状態を描画）+ 番犬テスト
 `ステータスバーにアップデート表示が残っていない`。
+
+実装メモ（2026-07-31、FR-2.21.8 / #690）: md の**幾何とテーマ色は
+`tako-app/src/md_view.rs` の 1 実装**（`render_block`）に集約し、プレビューペインと
+専用画面はインタラクション層（選択・検索ハイライト・`TextLayout` の控え・コピーボタン）
+だけを `MdTextSink` で差し替える。パースは `preview::markdown_blocks`
+（`pulldown-cmark`）、リンク索引は `md_document_links` が正で、いずれもプレビューと共有。
+**GPUI の `TextLayout::bounds()` は prepaint 前に呼ぶと panic してアプリごと落ちる**ので、
+ヒットテストは「描き終わった世代」だけを対象にする（`ParsedNotes::painted` を
+canvas の paint で立てる）。機械検証はセルフテスト項目 90(f)（実描画でブロック数 / 表 /
+リンク数 / 行レイアウト数 + ノートなし・壊れた md・巨大ノートのエッジ）と
+visual-test「update-notes」節（**実リリース v0.6.2 のノート本文**を流し込み、
+scene の実ピクセルで見出しサイズ・インラインコード・コードパネル・表のヘッダ帯・
+リンクの accent 色・⌘ホバー差分・テーマ往復を検査）。
 
 ### FR-2.22 AI コマンド提案カード（✅ 2026-07-30、#666）
 

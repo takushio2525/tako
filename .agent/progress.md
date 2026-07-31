@@ -1621,3 +1621,14 @@
   （terminal 帯 0 → GUI dark 21097 / light 18416 の可読ピクセル）+ 隔離実機の
   CLI / MCP / 再起動往復。既存ファイルの削除行は 2 行（タブバー幅・ツール数）のみ
 - 次: G2（チャットビュー読み取り）。`PaneDisplay::Chat` と `claude_chat` は配線待ちで用意済み
+## 2026-07-31（#690: アップデート詳細のリリースノートを Markdown レンダリングへ）
+- md の**幾何とテーマ色を `md_view.rs` の 1 実装へ集約**し、プレビューペインと
+  アップデート詳細画面が同じ `render_block` を通る形に。差は `MdTextSink`
+  （選択・検索・TextLayout の控え・コピーボタン）だけ。パースと リンク索引も共有
+- アップデート詳細のノートを md 描画 + ⌘+クリックでブラウザ（http/https のみ）へ。
+  **GPUI の `TextLayout::bounds()` は prepaint 前に呼ぶとアプリごと panic する**ので、
+  ヒットテストは canvas の paint で立てた「描き終わった世代」だけを対象にした
+- 検証: 品質ゲート全緑（1701 tests）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 90(f)
+  新設）+ visual-test 全節完走（新節 update-notes = **実リリース v0.6.2 のノート本文**を
+  実ピクセル検査）。生テキストへ戻すと単体 / セルフテスト / visual-test の 3 つとも
+  FAILED になることを実測（検出力の実証）

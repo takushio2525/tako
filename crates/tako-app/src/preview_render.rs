@@ -1,7 +1,7 @@
 use gpui::{
     canvas, div, fill, point, prelude::*, px, relative, Bounds, BoxShadow, Context, CursorStyle,
     FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, Pixels, SharedString, StyledText,
-    UnderlineStyle, Window,
+    Window,
 };
 use std::path::PathBuf;
 use tako_core::{PaneId, Rect};
@@ -20,6 +20,107 @@ pub(crate) struct MdLineSel {
 
 /// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
 pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(2200);
+
+/// プレビューペインの Markdown 受け皿（#690）。
+///
+/// 幾何は [`crate::md_view::render_block`] に任せ、ここは「選択・検索・⌘ホバーの
+/// ハイライトを重ねる」「実描画の `TextLayout` を行順に控える」「コードブロックの
+/// コピーボタンを差す」の 3 つだけを担う。呼ばれる順序が `md_block_line_texts` の
+/// 並びと一致するので、自前のカウンタで選択行情報と突き合わせられる。
+struct MdSelectionSink<'a, 'w> {
+    app: &'a TakoApp,
+    cx: &'a mut Context<'w, TakoApp>,
+    pane_id: PaneId,
+    lines: &'a [MdLineSel],
+    /// 次に描く行（`lines` の添字）
+    line: usize,
+    layouts: Vec<Option<TextLayout>>,
+}
+
+impl MdSelectionSink<'_, '_> {
+    /// 検索ヒット → 選択の順に重ねる（選択が上に来る）
+    fn add_search_and_sel(
+        &self,
+        highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
+        text: &str,
+        sel: &MdLineSel,
+    ) {
+        let theme = &self.app.theme;
+        for &(start, end, is_current) in &sel.hit_ranges {
+            let s = snap_to_char_boundary(text, start.min(text.len()));
+            let e = snap_to_char_boundary(text, end.min(text.len()));
+            if s < e {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        background_color: Some(if is_current {
+                            hsla_alpha(theme.yellow, 0.5)
+                        } else {
+                            hsla_alpha(theme.yellow, 0.2)
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
+        }
+        if let Some((start, end)) = sel.sel_range {
+            let s = snap_to_char_boundary(text, start.min(text.len()));
+            let e = snap_to_char_boundary(text, end.min(text.len()));
+            if s < e {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        background_color: Some(hsla_alpha(theme.accent, 0.35)),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
+        }
+    }
+}
+
+impl crate::md_view::MdTextSink for MdSelectionSink<'_, '_> {
+    fn text(
+        &mut self,
+        text: String,
+        mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+        color: tako_core::Rgb,
+        weight: Option<FontWeight>,
+    ) -> gpui::AnyElement {
+        let empty = MdLineSel::default();
+        let sel = self.lines.get(self.line).unwrap_or(&empty);
+        // md 由来 → ⌘ホバー → 検索 → 選択の順（merge_highlights は後の指定が勝つ）
+        if let Some(range) = sel.hovered_link.as_ref() {
+            crate::md_view::push_hovered_link_highlight(
+                &mut highlights,
+                &text,
+                range,
+                &self.app.theme,
+            );
+        }
+        self.add_search_and_sel(&mut highlights, &text, sel);
+        let styled =
+            crate::md_view::styled_line(text, highlights, &self.app.md_text_style(color, weight));
+        let layout = styled.layout().clone();
+        self.line += 1;
+        self.layouts.push(Some(layout));
+        styled.into_any_element()
+    }
+
+    fn spacer(&mut self) {
+        self.line += 1;
+        self.layouts.push(None);
+    }
+
+    fn code_overlay(&mut self, index: usize) -> Option<crate::md_view::MdCodeOverlay> {
+        let app = self.app;
+        let pane_id = self.pane_id;
+        let base = app.theme.font_size;
+        let group = SharedString::from(format!("md-code-{}-{index}", pane_id.as_u64()));
+        let element = app.md_code_copy_button(pane_id, index, group.clone(), base, self.cx);
+        Some(crate::md_view::MdCodeOverlay { group, element })
+    }
+}
 
 /// PDF / 画像 / 動画サムネの描画用 gpui::Image キャッシュ（Issue #168）。
 /// `gpui::Image::from_bytes` は id 生成のために全バイトのハッシュを計算するので、
@@ -3167,85 +3268,11 @@ impl TakoApp {
             }))
     }
 
-    /// Markdown インラインスパン列 → (テキスト, ハイライト範囲)。
-    /// 色はすべて Theme 経由（FR-4）。インラインコードは背景 + peach、リンクは accent + 下線、
-    /// 取り消し線は線色まで淡くして「消した」ことが分かるようにする（Issue #656）
-    fn preview_md_text(
-        &self,
-        spans: &[preview::MdSpan],
-        hovered_link: Option<&std::ops::Range<usize>>,
-    ) -> (String, Vec<(std::ops::Range<usize>, HighlightStyle)>) {
-        let theme = &self.theme;
-        let mut text = String::new();
-        let mut highlights = Vec::new();
-        for span in spans {
-            let start = text.len();
-            text.push_str(&span.text);
-            let is_link = span.is_link();
-            let styled = span.bold || span.italic || span.code || span.strike || is_link;
-            if !styled {
-                continue;
-            }
-            highlights.push((
-                start..text.len(),
-                HighlightStyle {
-                    color: if span.code {
-                        Some(hsla(theme.peach))
-                    } else if is_link {
-                        Some(hsla(theme.accent))
-                    } else if span.strike {
-                        Some(hsla(theme.text_muted))
-                    } else {
-                        None
-                    },
-                    background_color: span.code.then(|| hsla_alpha(theme.surface_highlight, 0.75)),
-                    font_weight: span.bold.then_some(FontWeight::BOLD),
-                    font_style: span.italic.then_some(FontStyle::Italic),
-                    underline: is_link.then(|| UnderlineStyle {
-                        thickness: px(1.0),
-                        color: Some(hsla_alpha(theme.accent, 0.6)),
-                        wavy: false,
-                    }),
-                    strikethrough: span.strike.then_some(StrikethroughStyle {
-                        thickness: px(1.0),
-                        color: Some(hsla(theme.text_muted)),
-                    }),
-                    ..HighlightStyle::default()
-                },
-            ));
-        }
-        // ⌘+ホバー中のリンクだけ「押せる」ことが分かる装飾へ強める（#680）。
-        // ターミナル内リンク（#153）と同じ = 下線を実線化 + accent 背景を
-        // リンク文字列だけに限定する。merge_highlights は後の指定が勝つ
-        if let Some(range) = hovered_link {
-            let end = range.end.min(text.len());
-            if range.start < end {
-                highlights.push((
-                    range.start..end,
-                    HighlightStyle {
-                        color: Some(hsla(theme.accent)),
-                        background_color: Some(hsla_alpha(theme.accent, 0.18)),
-                        underline: Some(UnderlineStyle {
-                            thickness: px(1.5),
-                            color: Some(hsla(theme.accent)),
-                            wavy: false,
-                        }),
-                        ..HighlightStyle::default()
-                    },
-                ));
-            }
-        }
-        (text, highlights)
-    }
-
     /// Markdown 用のテキスト既定スタイル。`StyledText` の run は色とフォントを焼き込むため
-    /// （サイズと行高だけが親要素から継承される）、文字色・太さはここで渡す必要がある
+    /// （サイズと行高だけが親要素から継承される）、文字色・太さはここで渡す必要がある。
+    /// 実体は `md_view`（アップデート詳細画面と共有。#690）
     fn md_text_style(&self, color: tako_core::Rgb, weight: Option<FontWeight>) -> TextStyle {
-        TextStyle {
-            color: hsla(color),
-            font_weight: weight.unwrap_or_default(),
-            ..self.text_style()
-        }
+        crate::md_view::md_text_style(&self.theme, color, weight)
     }
 
     /// 選択ハイライト + 検索ヒットハイライト付きコード行。返した TextLayout は
@@ -3370,6 +3397,10 @@ impl TakoApp {
 
     /// 選択ハイライト + 検索ヒットハイライト付き Markdown ブロック + 実描画 TextLayout。
     ///
+    /// 幾何とテーマ色は [`crate::md_view::render_block`] に一本化してあり（アップデート
+    /// 詳細画面と共有。#690）、ここは**インタラクション層**だけを受け皿として足す:
+    /// 選択・検索・⌘ホバーのハイライト、TextLayout の控え、コピーボタン。
+    ///
     /// `lines` は `md_block_line_texts` と同じ順序・同じ個数の選択行情報。返す TextLayout も
     /// 同じ順序・同じ個数で、ヒットテストと選択の座標系を実描画の shaping に一致させる。
     /// 表だけが 1 ブロック = 複数行（セル）になる（Issue #656）。
@@ -3382,323 +3413,21 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> (gpui::AnyElement, Vec<Option<TextLayout>>) {
         let theme = self.theme.clone();
-        let base = theme.font_size;
-        let in_quote = block.quote_depth > 0;
-        // 引用の中は本文より一段淡く。引用の入れ子はさらに淡くして深さが分かるようにする
-        let body_color = if in_quote {
-            theme.text_secondary
-        } else {
-            theme.foreground
+        let mut sink = MdSelectionSink {
+            app: self,
+            cx,
+            pane_id,
+            lines,
+            line: 0,
+            layouts: Vec::with_capacity(lines.len()),
         };
-        let empty = MdLineSel::default();
-        let sel_for = |index: usize| lines.get(index).unwrap_or(&empty);
-
-        // 検索ヒット → 選択の順に重ねる（選択が上に来る）
-        let add_search_and_sel =
-            |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
-             text: &str,
-             sel: &MdLineSel| {
-                for &(start, end, is_current) in &sel.hit_ranges {
-                    let s = snap_to_char_boundary(text, start.min(text.len()));
-                    let e = snap_to_char_boundary(text, end.min(text.len()));
-                    if s < e {
-                        highlights.push((
-                            s..e,
-                            HighlightStyle {
-                                background_color: Some(if is_current {
-                                    hsla_alpha(theme.yellow, 0.5)
-                                } else {
-                                    hsla_alpha(theme.yellow, 0.2)
-                                }),
-                                ..HighlightStyle::default()
-                            },
-                        ));
-                    }
-                }
-                if let Some((start, end)) = sel.sel_range {
-                    let s = snap_to_char_boundary(text, start.min(text.len()));
-                    let e = snap_to_char_boundary(text, end.min(text.len()));
-                    if s < e {
-                        highlights.push((
-                            s..e,
-                            HighlightStyle {
-                                background_color: Some(hsla_alpha(theme.accent, 0.35)),
-                                ..HighlightStyle::default()
-                            },
-                        ));
-                    }
-                }
-            };
-
-        // インライン列 1 本を StyledText へ。色・太さは run に焼き込まれるので style で渡す
-        let inline_text = |spans: &[preview::MdSpan],
-                           sel: &MdLineSel,
-                           color: tako_core::Rgb,
-                           weight: Option<FontWeight>| {
-            let (mut text, mut highlights) = self.preview_md_text(spans, sel.hovered_link.as_ref());
-            add_search_and_sel(&mut highlights, &text, sel);
-            if text.is_empty() {
-                // 空セル・空項目でも 1 行分の高さと選択の当たり判定を残す
-                text.push(' ');
-            }
-            let styled = StyledText::new(text).with_default_highlights(
-                &self.md_text_style(color, weight),
-                merge_highlights(highlights),
-            );
-            let layout = styled.layout().clone();
-            (styled, layout)
-        };
-
-        let (element, layouts): (gpui::AnyElement, Vec<Option<TextLayout>>) = match &block.kind {
-            preview::MdBlockKind::Heading { level, spans } => {
-                // レベル差はサイズ・太さ・色の 3 点で付ける。H1 / H2 は下罫線で区切る
-                let scale = match level {
-                    1 => 1.65,
-                    2 => 1.38,
-                    3 => 1.18,
-                    4 => 1.06,
-                    5 => 1.0,
-                    _ => 0.94,
-                };
-                let size = base * scale;
-                let color = match level {
-                    1..=3 => body_color,
-                    4 => theme.text_secondary,
-                    5 => theme.text_tertiary,
-                    _ => theme.text_muted,
-                };
-                let weight = if *level <= 2 {
-                    FontWeight::EXTRA_BOLD
-                } else {
-                    FontWeight::BOLD
-                };
-                let (styled, layout) = inline_text(spans, sel_for(0), color, Some(weight));
-                let element = div()
-                    .relative()
-                    .flex_shrink_0()
-                    .pt(px(base * if *level == 1 { 1.1 } else { 0.85 }))
-                    .pb(px(base * 0.35))
-                    .text_size(px(size))
-                    .line_height(px(size * 1.4))
-                    .when(*level <= 2, |d| {
-                        d.mb(px(base * 0.25)).border_b_1().border_color(hsla_alpha(
-                            if *level == 1 {
-                                theme.border_heavy
-                            } else {
-                                theme.border_default
-                            },
-                            0.9,
-                        ))
-                    })
-                    .child(styled)
-                    .into_any_element();
-                (element, vec![Some(layout)])
-            }
-            preview::MdBlockKind::Paragraph { spans } => {
-                let (styled, layout) = inline_text(spans, sel_for(0), body_color, None);
-                let element = div()
-                    .relative()
-                    .flex_shrink_0()
-                    .py(px(base * 0.3))
-                    .line_height(px(base * 1.7))
-                    .child(styled)
-                    .into_any_element();
-                (element, vec![Some(layout)])
-            }
-            preview::MdBlockKind::ListItem {
-                ordered,
-                task,
-                continuation,
-                spans,
-            } => {
-                let line_height = base * 1.7;
-                let step = base * 1.45;
-                let marker_width = base * 1.55;
-                let (styled, layout) = inline_text(spans, sel_for(0), body_color, None);
-                // マーカー列: 行高と同じ高さの箱に入れて 1 行目の中央へ合わせる
-                let marker = div()
-                    .flex_none()
-                    .w(px(marker_width))
-                    .h(px(line_height))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .pr(px(base * 0.35))
-                    .children((!*continuation).then(|| -> gpui::AnyElement {
-                        match (task, ordered) {
-                            // タスクリストのチェックボックス（絵文字は使わず図形 + SVG。#217）
-                            (Some(done), _) => {
-                                let box_size = base * 0.85;
-                                div()
-                                    .w(px(box_size))
-                                    .h(px(box_size))
-                                    .rounded(px(2.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .border_1()
-                                    .border_color(hsla(if *done {
-                                        theme.green
-                                    } else {
-                                        theme.border_heavy
-                                    }))
-                                    .when(*done, |d| d.bg(hsla_alpha(theme.green, 0.9)))
-                                    .children(done.then(|| {
-                                        svg()
-                                            .path(crate::file_icons::ui_icon::CHECK)
-                                            .w(px(box_size - 2.0))
-                                            .h(px(box_size - 2.0))
-                                            .text_color(hsla(theme.background))
-                                    }))
-                                    .into_any_element()
-                            }
-                            (None, Some(number)) => div()
-                                .text_size(px(base * 0.92))
-                                .text_color(hsla(theme.accent_muted))
-                                .child(SharedString::from(format!("{number}.")))
-                                .into_any_element(),
-                            (None, None) => {
-                                let dot = base * 0.35;
-                                match preview::md_bullet_for_depth(block.list_depth) {
-                                    preview::MdBullet::Dot => div()
-                                        .w(px(dot))
-                                        .h(px(dot))
-                                        .rounded_full()
-                                        .bg(hsla(theme.text_muted)),
-                                    preview::MdBullet::Ring => div()
-                                        .w(px(dot + 1.0))
-                                        .h(px(dot + 1.0))
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(hsla(theme.text_muted)),
-                                    preview::MdBullet::Square => {
-                                        div().w(px(dot)).h(px(dot)).bg(hsla(theme.text_muted))
-                                    }
-                                }
-                                .into_any_element()
-                            }
-                        }
-                    }));
-                let element = div()
-                    .relative()
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .py(px(base * 0.12))
-                    .pl(px(step * block.list_depth.saturating_sub(1) as f32))
-                    .line_height(px(line_height))
-                    .child(marker)
-                    .child(div().flex_1().min_w(px(0.0)).child(styled))
-                    .into_any_element();
-                (element, vec![Some(layout)])
-            }
-            preview::MdBlockKind::CodeBlock { lang, lines: code } => {
-                let sel = sel_for(0);
-                let mut text = String::new();
-                let mut highlights = Vec::new();
-                for (line_i, line) in code.iter().enumerate() {
-                    if line_i > 0 {
-                        text.push('\n');
-                    }
-                    for span in line {
-                        let start = text.len();
-                        text.push_str(&span.text);
-                        // 言語指定なしフェンスは syntect の既定色（ダーク前提の淡色）を
-                        // 使わず、テーマの本文色で素直に出す。色を出す場合は
-                        // ライトの面で読める明度へ落とす（#656 / #669。非 md と同一経路）
-                        let color = lang
-                            .as_ref()
-                            .and(span.color)
-                            .map(|c| theme.adapt_syntax_color(c));
-                        if color.is_some() || span.bold || span.italic {
-                            highlights.push((
-                                start..text.len(),
-                                HighlightStyle {
-                                    color: color.map(hsla),
-                                    font_weight: span.bold.then_some(FontWeight::BOLD),
-                                    font_style: span.italic.then_some(FontStyle::Italic),
-                                    ..HighlightStyle::default()
-                                },
-                            ));
-                        }
-                    }
-                }
-                add_search_and_sel(&mut highlights, &text, sel);
-                if text.is_empty() {
-                    text.push(' ');
-                }
-                let styled = StyledText::new(text).with_default_highlights(
-                    &self.md_text_style(theme.text_secondary, None),
-                    merge_highlights(highlights),
-                );
-                let layout = styled.layout().clone();
-                let group = SharedString::from(format!(
-                    "md-code-{}-{}",
-                    pane_id.as_u64(),
-                    code_index.unwrap_or(usize::MAX)
-                ));
-                let element = div()
-                    .relative()
-                    .flex_shrink_0()
-                    .group(group.clone())
-                    .my(px(base * 0.5))
-                    .px(px(base * 0.8))
-                    .py(px(base * 0.55))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(hsla(theme.border_subtle))
-                    .bg(hsla(theme.mantle))
-                    .text_size(px(base * 0.95))
-                    .line_height(px(base * 1.45))
-                    .child(styled)
-                    .children(
-                        code_index
-                            .map(|index| self.md_code_copy_button(pane_id, index, group, base, cx)),
-                    )
-                    .into_any_element();
-                (element, vec![Some(layout)])
-            }
-            preview::MdBlockKind::Table {
-                align,
-                header,
-                rows,
-            } => self.preview_md_table(block, align, header, rows, lines, &inline_text),
-            preview::MdBlockKind::Rule => (
-                div()
-                    .relative()
-                    .flex_shrink_0()
-                    .my(px(base * 0.9))
-                    .h(px(1.0))
-                    .bg(hsla(theme.border_heavy))
-                    .into_any_element(),
-                vec![None],
-            ),
-        };
-
-        // 引用は「ブロックを包む帯」で表す。連続する引用ブロックは隣接して 1 本に見える
-        let mut element = element;
-        for level in 0..block.quote_depth {
-            let outermost = level + 1 == block.quote_depth;
-            element = div()
-                .flex_shrink_0()
-                .flex()
-                .flex_col()
-                .pl(px(base * 0.85))
-                .py(px(base * 0.15))
-                .border_l_2()
-                .border_color(hsla_alpha(
-                    if outermost {
-                        theme.accent_muted
-                    } else {
-                        theme.text_faint
-                    },
-                    0.85,
-                ))
-                .when(outermost, |d| d.bg(hsla_alpha(theme.surface_0, 0.6)))
-                .child(element)
-                .into_any_element();
-        }
+        let element = crate::md_view::render_block(&theme, block, code_index, &mut sink);
+        let layouts = sink.layouts;
+        debug_assert_eq!(
+            layouts.len(),
+            lines.len(),
+            "描画した行数と選択行数が一致していない（md_block_line_texts と順序を揃える）"
+        );
         (element, layouts)
     }
 
@@ -3801,135 +3530,6 @@ impl TakoApp {
                 cx.notify();
             }))
             .into_any_element()
-    }
-
-    /// GFM テーブルを罫線つきグリッドで描く（Issue #656）。
-    /// セル 1 つが選択 1 行なので、`lines` はヘッダ → 各行の行優先順で対応する。
-    #[allow(clippy::type_complexity)]
-    fn preview_md_table(
-        &self,
-        block: &preview::MdBlock,
-        align: &[preview::MdAlign],
-        header: &[preview::MdCell],
-        rows: &[Vec<preview::MdCell>],
-        lines: &[MdLineSel],
-        inline_text: &dyn Fn(
-            &[preview::MdSpan],
-            &MdLineSel,
-            tako_core::Rgb,
-            Option<FontWeight>,
-        ) -> (StyledText, TextLayout),
-    ) -> (gpui::AnyElement, Vec<Option<TextLayout>>) {
-        let theme = &self.theme;
-        let base = theme.font_size;
-        let columns = align.len().max(header.len()).max(1);
-        let shares = preview::md_table_column_shares(header, rows, columns);
-        let empty = MdLineSel::default();
-        let mut layouts: Vec<Option<TextLayout>> = Vec::with_capacity(lines.len());
-        let mut line_index = 0usize;
-
-        // 1 行分（ヘッダ / 本文）を組む。セルは flex_basis で列幅比を配り、min_w(0) +
-        // 既定の flex_shrink で狭いペインでも溢れさせない（折り返しで縦に伸びる）
-        let row_element = |cells: &[preview::MdCell],
-                           is_header: bool,
-                           zebra: bool,
-                           last_row: bool,
-                           layouts: &mut Vec<Option<TextLayout>>,
-                           line_index: &mut usize| {
-            let color = if is_header {
-                theme.foreground
-            } else if block.quote_depth > 0 {
-                theme.text_secondary
-            } else {
-                theme.foreground
-            };
-            let weight = is_header.then_some(FontWeight::BOLD);
-            let mut row = div()
-                .flex_shrink_0()
-                .flex()
-                .flex_row()
-                .items_stretch()
-                // ヘッダ帯は surface_highlight（背景階層のうち地色と明確に差が出る面）。
-                // surface_0〜2 はダークの地色と 2/255 しか違わず帯として見えない
-                .when(is_header, |d| {
-                    d.bg(hsla(theme.surface_highlight))
-                        .border_b_1()
-                        .border_color(hsla(theme.border_heavy))
-                })
-                .when(!is_header && !last_row, |d| {
-                    d.border_b_1().border_color(hsla(theme.border_inner))
-                })
-                .when(zebra, |d| d.bg(hsla_alpha(theme.surface_highlight, 0.35)));
-            for column in 0..columns {
-                let cell = cells.get(column).cloned().unwrap_or_default();
-                let sel = lines.get(*line_index).unwrap_or(&empty);
-                *line_index += 1;
-                let (styled, layout) = inline_text(&cell, sel, color, weight);
-                layouts.push(Some(layout));
-                let alignment = align.get(column).copied().unwrap_or_default();
-                row = row.child(
-                    div()
-                        .relative()
-                        .flex()
-                        .flex_row()
-                        // 配置は flex の寄せで行う。StyledText 自身に text_align を
-                        // 掛けると index_for_position が寄せ量を見ないため、
-                        // クリック位置と文字位置がずれる（GPUI 実装由来）
-                        .map(|d| match alignment {
-                            preview::MdAlign::Center => d.justify_center(),
-                            preview::MdAlign::Right => d.justify_end(),
-                            _ => d.justify_start(),
-                        })
-                        .flex_basis(relative(shares.get(column).copied().unwrap_or(0.0)))
-                        .min_w(px(0.0))
-                        .px(px(base * 0.6))
-                        .py(px(base * 0.35))
-                        .when(column + 1 < columns, |d| {
-                            d.border_r_1().border_color(hsla(theme.border_inner))
-                        })
-                        // StyledText を直接 flex 子にすると、GPUI のテキスト計測が
-                        // min-content 幅として「折り返しなしの 1 行分」を返すため、
-                        // flex の自動最小サイズで縮まず隣のセルへ溢れる。min_w(0) の
-                        // 箱で包むと列幅まで縮み、テキストは列内で折り返す（#656）
-                        .child(div().min_w(px(0.0)).child(styled)),
-                );
-            }
-            row
-        };
-
-        let header_row = row_element(header, true, false, false, &mut layouts, &mut line_index);
-        let mut table = div()
-            .relative()
-            // 縦に縮まないことを明示する。overflow_hidden を付けた要素は flex の
-            // 自動最小サイズ（min-content 高さ）が無効になるため、これが無いと
-            // 本文が長いときに親の flex 列が表を潰し、後続ブロックと重なる（#656 / #494）
-            .flex_shrink_0()
-            .my(px(base * 0.6))
-            .flex()
-            .flex_col()
-            .rounded_md()
-            .overflow_hidden()
-            .border_1()
-            .border_color(hsla(theme.border_default))
-            .line_height(px(base * 1.5))
-            .child(header_row);
-        for (index, row) in rows.iter().enumerate() {
-            let element = row_element(
-                row,
-                false,
-                index % 2 == 1,
-                index + 1 == rows.len(),
-                &mut layouts,
-                &mut line_index,
-            );
-            table = table.child(element);
-        }
-        debug_assert_eq!(
-            layouts.len(),
-            lines.len(),
-            "表のセル数と選択行数が一致していない（md_block_line_texts と順序を揃える）"
-        );
-        (table.into_any_element(), layouts)
     }
 
     /// チェンジログビューのトグル（Issue #338）
