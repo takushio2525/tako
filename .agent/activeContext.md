@@ -58,6 +58,8 @@
 
 - GUI モード（#691 G2 以降）に手を入れる: `.agent/plans/2026-07-gui-mode.md`（正）+
   `crates/tako-core/src/ui_mode.rs`（判定表）+ `crates/tako-app/src/starter.rs`
-- Markdown プレビューに手を入れる: `crates/tako-app/src/preview_render.rs` + `.agent/requirements.md` FR-3.3
+- **Markdown の描画に手を入れる**: `crates/tako-app/src/md_view.rs`（幾何とテーマ色の唯一の
+  実装。プレビューペインとアップデート詳細画面が共有。#690）+ `.agent/requirements.md` FR-3.3.1
+- Markdown プレビュー固有（選択・検索・コピーボタン）: `crates/tako-app/src/preview_render.rs`
 - コマンド提案カードに手を入れる: `crates/tako-core/src/command_card.rs` + dispatch の ShowCommand 系
 - 復元・resume 系: `crates/tako-control/src/transcript.rs` + `sessions.rs` + `.agent/requirements.md` FR-5.9/FR-5.12

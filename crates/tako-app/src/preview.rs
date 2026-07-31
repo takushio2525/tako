@@ -2380,8 +2380,10 @@ fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
     (blocks, PreviewOutline::new(items))
 }
 
-/// Markdown ブロックだけを必要とする既存のテスト・補助経路。
-#[cfg(test)]
+/// Markdown ブロックだけを必要とする経路（アウトライン不要のとき）。
+///
+/// アップデート詳細画面のリリースノート（#690）と単体テストが使う。
+/// **md のパースはこの 1 本（`pulldown-cmark`）が正**で、表示側が独自に解くことはしない。
 pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
     parse_markdown_blocks(text)
 }

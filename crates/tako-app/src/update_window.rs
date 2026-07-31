@@ -22,6 +22,7 @@ use gpui::*;
 use tako_core::theme::{Rgb, Theme};
 
 use crate::file_icons::ui_icon;
+use crate::preview;
 use crate::ui_text::update as txt;
 use crate::update_checker::{
     self, Channel, ChannelUpdates, InstallMethod, UpdateInfo, UpdateState, CURRENT_VERSION,
@@ -37,6 +38,52 @@ pub struct UpdateWindow {
     /// 配布系統・実行環境の診断（`update_status_json`）。brew サブプロセスを呼びうるので
     /// render では絶対に取らず、開いた時と「確認」の後に background で取り直す
     status: Option<serde_json::Value>,
+    /// リリースノートの Markdown パース結果（#690）。
+    ///
+    /// `pulldown-cmark` によるパースは render 毎フレームには重いので、
+    /// 「どのノート文字列を解いた結果か」を鍵にして持ち回す。
+    notes: Option<ParsedNotes>,
+    /// ⌘ 押下中にホバーしているノート内リンクの索引（`notes.links` の添字。#690）
+    hovered_note_link: Option<usize>,
+    /// リリースノート枠のスクロール位置（#690）。ノートは枠内で縦スクロールするので、
+    /// 位置を持っておくと再描画で先頭へ戻らない。visual-test も同じ経路で送る
+    notes_scroll: ScrollHandle,
+}
+
+/// パース済みリリースノート（#690）
+struct ParsedNotes {
+    /// パース元の md 本文。これが変われば解き直す
+    source: String,
+    blocks: Vec<preview::MdBlock>,
+    /// ⌘+クリックの当たり判定（行番号 + バイト範囲 + 遷移先）。
+    /// 索引の正はプレビューと同じ `md_document_links` 1 本（#680）
+    links: Vec<crate::MdLinkHit>,
+    /// 直近の描画で得た行ごとの実 shaping。ヒットテストはこれを使う
+    layouts: std::cell::RefCell<Vec<Option<TextLayout>>>,
+    /// この世代のノートが実際に描き終わったか。
+    ///
+    /// **GPUI の `TextLayout::bounds()` は prepaint 前に呼ぶと `unwrap` で panic する**
+    /// （= アプリ全体が落ちる）。ヒットテストはこれが立ってからしか行わない。
+    /// 立てるのはノートと同じ親に置いた canvas の paint で、GPUI の div は
+    /// 「全子の prepaint → 全子の paint」の順に回すため、paint が呼ばれた時点で
+    /// 兄弟のテキストは測り終わっている（描いた世代だけ触るのが構造で保証される）
+    painted: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl ParsedNotes {
+    /// md 本文を解く。**パースは `preview::markdown_blocks`（`pulldown-cmark`）が正**で、
+    /// リンク索引は `md_document_links`（プレビューと同じ 1 本）が正（#680 / #690）
+    fn parse(source: &str) -> Self {
+        let blocks = preview::markdown_blocks(source);
+        let links = crate::md_document_links(&blocks);
+        Self {
+            source: source.to_string(),
+            blocks,
+            links,
+            layouts: std::cell::RefCell::new(Vec::new()),
+            painted: std::rc::Rc::new(std::cell::Cell::new(false)),
+        }
+    }
 }
 
 impl UpdateWindow {
@@ -50,6 +97,9 @@ impl UpdateWindow {
             tako_app,
             focus: cx.focus_handle(),
             status: None,
+            notes: None,
+            hovered_note_link: None,
+            notes_scroll: ScrollHandle::new(),
         };
         this.reload_status(cx);
         this
@@ -109,6 +159,8 @@ impl Render for UpdateWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
         let state = self.update_state(cx);
+        // リリースノートの md パースは本文が変わったときだけ（#690）
+        self.sync_notes(&state);
 
         div()
             .key_context("UpdateWindow")
@@ -140,7 +192,7 @@ impl Render for UpdateWindow {
                     .children(self.render_broken_brew(&theme, cx))
                     .child(self.render_available(&theme, &state, cx))
                     .children(self.render_flow(&theme, &state, cx))
-                    .children(self.render_notes(&theme, &state)),
+                    .children(self.render_notes(&theme, &state, cx)),
             )
             .child(self.render_footer(&theme, &state, cx))
     }
@@ -434,33 +486,242 @@ impl UpdateWindow {
 
     // --- リリースノート ---
 
-    fn render_notes(&self, theme: &Theme, state: &UpdateState) -> Option<Div> {
+    /// 表示対象のリリースノート（安定版を主に見せる。無ければテスト版）
+    fn notes_source(state: &UpdateState) -> Option<(&UpdateInfo, &str)> {
         let updates = match state {
             UpdateState::Available(u) => u,
             _ => return None,
         };
-        // 安定版を主に見せる（無ければテスト版）。両方あるときは章題にバージョンを添える
         let info: &UpdateInfo = updates.stable.as_ref().or(updates.test.as_ref())?;
+        Some((info, info.notes.as_deref().unwrap_or_default()))
+    }
+
+    /// リリースノートの md パース結果を必要なときだけ作り直す（#690）。
+    ///
+    /// `render` は毎フレーム走るので、同じ本文なら解き直さない。ノートが差し替わったら
+    /// ホバー索引は別の URL を指すので一緒に落とす（#680 の `forget_md_links` と同じ理屈）
+    fn sync_notes(&mut self, state: &UpdateState) {
+        let source = Self::notes_source(state)
+            .map(|(_, notes)| notes)
+            .unwrap_or("");
+        if source.is_empty() {
+            if self.notes.is_some() {
+                self.notes = None;
+                self.hovered_note_link = None;
+            }
+            return;
+        }
+        if self.notes.as_ref().is_some_and(|n| n.source == source) {
+            return;
+        }
+        self.notes = Some(ParsedNotes::parse(source));
+        self.hovered_note_link = None;
+    }
+
+    /// リリースノート欄（#690: Markdown レンダリング）。
+    ///
+    /// 生成元は #594 の機構が作る md（見出し・ダウンロード表・リスト・リンク・日英併記）
+    /// なので、プレビューペインと**同じ** `md_view::render_block` で描く。
+    /// リンクは ⌘+クリックで既定ブラウザ（#680 と同じ UX。http / https のみ）
+    fn render_notes(
+        &self,
+        theme: &Theme,
+        state: &UpdateState,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let (info, _) = Self::notes_source(state)?;
         let title = format!("{} (v{})", txt::section_notes(), info.version);
+        let Some(notes) = self.notes.as_ref() else {
+            // ノートが無いリリース（body 空）はプレーンな案内文だけ出す
+            return Some(
+                section(theme, &title)
+                    .child(notes_box(theme).child(muted(theme, txt::no_notes().to_string()))),
+            );
+        };
+        let hovered = self
+            .hovered_note_link
+            .and_then(|index| notes.links.get(index))
+            .map(|hit| (hit.line, hit.range.clone()));
+        let (elements, layouts) = crate::md_view::render_document(theme, &notes.blocks, hovered);
+        *notes.layouts.borrow_mut() = layouts;
+        // 新しい世代はまだ測られていない。描き終わりを canvas の paint で受けてから
+        // ヒットテストを許す（GPUI の TextLayout は測る前に触ると panic する）
+        notes.painted.set(false);
+        let painted = notes.painted.clone();
+        // 描き終わりの合図だけを受ける 1px の canvas（ノートと同じ親に置く）
+        let paint_probe = canvas(|_, _, _| (), move |_, _, _, _| painted.set(true))
+            .w_full()
+            .h(px(1.));
+        let has_openable_link = notes
+            .links
+            .iter()
+            .any(|hit| tako_core::md_links::browser_url(&hit.url).is_some());
         Some(
-            section(theme, &title).child(
-                div()
-                    .id("update-notes")
-                    .max_h(px(220.))
-                    .overflow_y_scroll()
-                    .p(px(10.))
-                    .rounded(px(6.))
-                    .bg(to_hsla(theme.surface_1))
-                    .font_family(theme.font_family.clone())
-                    .text_size(px(11.5))
-                    .text_color(to_hsla(theme.text_secondary))
-                    .child(SharedString::from(
-                        info.notes
-                            .clone()
-                            .unwrap_or_else(|| txt::no_notes().to_string()),
-                    )),
-            ),
+            section(theme, &title)
+                .child(
+                    notes_box(theme)
+                        .track_scroll(&self.notes_scroll)
+                        .when(self.hovered_note_link.is_some(), |d| {
+                            d.cursor(CursorStyle::PointingHand)
+                        })
+                        // ⌘+ホバーで下線を強め、⌘+クリックで既定ブラウザへ（#680 と同じ規則）。
+                        // リンクが 1 本も無いノートではイベント経路自体を載せない
+                        .when(has_openable_link, |d| {
+                            d.on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                                this.update_note_link_hover(ev.position, ev.modifiers.platform, cx);
+                            }))
+                            .on_modifiers_changed(cx.listener(
+                                |this, ev: &ModifiersChangedEvent, window, cx| {
+                                    let position = window.mouse_position();
+                                    this.update_note_link_hover(
+                                        position,
+                                        ev.modifiers.platform,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                    if !ev.modifiers.platform || ev.click_count != 1 {
+                                        return;
+                                    }
+                                    // ⌘ 単独押下の直後（ホバー未更新）でも位置から引き直す
+                                    let index = this
+                                        .hovered_note_link
+                                        .or_else(|| this.note_link_at(ev.position));
+                                    if let Some(index) = index {
+                                        this.open_note_link(index);
+                                        this.hovered_note_link = None;
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                        })
+                        .children(elements),
+                )
+                .child(paint_probe),
         )
+    }
+
+    /// セルフテスト用の観測点（#690）。リリースノートの解析・描画状態を返す:
+    /// (ブロック数, 表を含むか, 開けるリンク数, 直近描画で控えた行数)。
+    /// 「生テキストではなく md として描かれた」を GUI 経路で機械検証するために公開する
+    pub(crate) fn notes_probe(&self) -> (usize, bool, usize, usize) {
+        let Some(notes) = self.notes.as_ref() else {
+            return (0, false, 0, 0);
+        };
+        (
+            notes.blocks.len(),
+            notes
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, preview::MdBlockKind::Table { .. })),
+            notes
+                .links
+                .iter()
+                .filter(|l| tako_core::md_links::browser_url(&l.url).is_some())
+                .count(),
+            notes.layouts.borrow().len(),
+        )
+    }
+
+    /// visual-test 用（#690）: 描き終わったノート枠の実 bounds（実ピクセルの走査範囲）。
+    /// 矩形はスクロール容器そのものから取る（ヒットテストと同じ「描いた世代」条件つき）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn notes_bounds(&self) -> Option<Bounds<Pixels>> {
+        let notes = self.notes.as_ref()?;
+        notes.painted.get().then(|| self.notes_scroll.bounds())
+    }
+
+    /// visual-test 用（#690）: この画面が描くのに使っているテーマ（期待色の出所）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn visual_theme(&self) -> Theme {
+        self.theme()
+    }
+
+    /// visual-test 用（#690）: ノート枠を縦にスクロールさせる（GUI のホイールと同じ経路）。
+    /// 戻り値は「実際に動いたか」（下端に着いていれば false）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn scroll_notes_to(&self, y: f32) -> bool {
+        let before = self.notes_scroll.offset();
+        self.notes_scroll.set_offset(gpui::point(before.x, px(-y)));
+        f32::from(self.notes_scroll.offset().y) != f32::from(before.y)
+    }
+
+    /// visual-test 用（#690）: ⌘+ホバー中のリンクを指定して装飾差分を作る。
+    /// `None` でホバー解除。戻り値は「そのリンクが存在したか」
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn set_hovered_note_link(&mut self, index: Option<usize>) -> bool {
+        let exists = match (index, self.notes.as_ref()) {
+            (Some(i), Some(notes)) => notes.links.get(i).is_some(),
+            (None, _) => true,
+            _ => false,
+        };
+        self.hovered_note_link = index.filter(|_| exists);
+        exists
+    }
+
+    /// visual-test 用（#690）: 最初に開けるリンクの索引（ホバー装飾の対象）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn first_openable_note_link(&self) -> Option<usize> {
+        let notes = self.notes.as_ref()?;
+        notes
+            .links
+            .iter()
+            .position(|hit| tako_core::md_links::browser_url(&hit.url).is_some())
+    }
+
+    /// セルフテスト用（#690）: ⌘+クリックの経路をそのまま叩く。
+    /// 実ブラウザは `open_external_url` が `TAKO_SELF_TEST` で抑止する
+    pub(crate) fn probe_note_link_click(&mut self, position: Point<Pixels>) -> Option<usize> {
+        let index = self.note_link_at(position);
+        if let Some(index) = index {
+            self.open_note_link(index);
+        }
+        index
+    }
+
+    /// ノート内リンクのヒットテスト（#690）。
+    /// 未描画の世代には触らない（`ParsedNotes::painted` の注記のとおり panic 防止）
+    fn note_link_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let notes = self.notes.as_ref()?;
+        if !notes.painted.get() {
+            return None;
+        }
+        crate::md_view::md_link_at_layouts(&notes.links, &notes.layouts.borrow(), position)
+    }
+
+    fn update_note_link_hover(
+        &mut self,
+        position: Point<Pixels>,
+        cmd_held: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let found = if cmd_held {
+            self.note_link_at(position)
+        } else {
+            None
+        };
+        if found != self.hovered_note_link {
+            self.hovered_note_link = found;
+            cx.notify();
+        }
+    }
+
+    /// ノート内リンクを既定ブラウザで開く。開いてよい URL の判定は
+    /// `md_links::browser_url` が正（http / https のみ。#680）
+    fn open_note_link(&self, index: usize) {
+        let Some(notes) = self.notes.as_ref() else {
+            return;
+        };
+        let Some(hit) = notes.links.get(index) else {
+            return;
+        };
+        match tako_core::md_links::browser_url(&hit.url) {
+            Some(url) => crate::open_external_url(url),
+            None => eprintln!("warning: 開けないリンク（http / https のみ）: {}", hit.url),
+        }
     }
 
     // --- フッター（確認ボタン + 常設の注意書き）---
@@ -846,6 +1107,21 @@ fn kv(theme: &Theme, label: &str, value: String) -> Div {
         )
 }
 
+/// リリースノートの囲み（#690）。中身は md レンダリング結果なので、文字色・サイズは
+/// ブロック側が決める。ここは面と枠と縦スクロールだけを持つ
+fn notes_box(theme: &Theme) -> Stateful<Div> {
+    div()
+        .id("update-notes")
+        .max_h(px(260.))
+        .overflow_y_scroll()
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .bg(to_hsla(theme.surface_1))
+        .flex()
+        .flex_col()
+}
+
 fn muted(theme: &Theme, s: String) -> Div {
     div()
         .py(px(4.))
@@ -976,5 +1252,193 @@ mod tests {
             src.contains("card_should_show"),
             "カードの表示判定（バージョン単位の抑止）を通っていない"
         );
+    }
+
+    // --- リリースノートの Markdown レンダリング（#690）---
+
+    // `use super::*` は gpui の `test` 属性マクロまで取り込んで `#[test]` を
+    // 無限展開させるので、必要なものだけ名指しする
+    use super::{ParsedNotes, UpdateWindow};
+    use crate::preview;
+    use crate::update_checker::{Channel, ChannelUpdates, UpdateInfo, UpdateState};
+
+    /// #594 の機構が生成する実物に近いリリースノート（見出し・ダウンロード表・
+    /// リスト・リンク・コード・日英併記）。表示側の検証はこれを正とする
+    const RELEASE_NOTES: &str = "\
+## Highlights / ハイライト
+
+- **Markdown** release notes / リリースノートの md 表示
+- Fixed [#680](https://github.com/takushio2525/tako/issues/680)
+
+## Download / ダウンロード
+
+| OS | Arch | Asset |
+|---|:-:|---:|
+| macOS | arm64 | `tako-v0.6.2-macos-arm64.zip` |
+| Windows | x64 | `tako-v0.6.2-windows-x64.zip` |
+
+### Install / インストール手順
+
+```sh
+brew upgrade --cask tako
+```
+
+> Known limitations / 既知の制限
+";
+
+    fn info(version: &str, channel: Channel, notes: Option<&str>) -> UpdateInfo {
+        UpdateInfo {
+            version: version.into(),
+            channel,
+            html_url: "https://example.invalid/r".into(),
+            download_url: Some("https://example.invalid/tako.zip".into()),
+            asset_name: Some("tako.zip".into()),
+            notes: notes.map(str::to_string),
+        }
+    }
+
+    fn available(stable: Option<UpdateInfo>, test: Option<UpdateInfo>) -> UpdateState {
+        UpdateState::Available(ChannelUpdates {
+            stable,
+            test,
+            rate_limit_note: None,
+        })
+    }
+
+    /// 番犬テスト（#690 受け入れ条件 1）: リリースノートが md の描画経路を通っている。
+    ///
+    /// 生テキスト表示（`info.notes` をそのまま child へ渡す旧実装）へ戻ると落ちる。
+    /// **検査対象はテストモジュールより手前だけ**にする: このファイル全体を見ると
+    /// 下の `assert!` に書いた探し文字列自身に当たってしまい、実装を消しても通る
+    /// （実測で確認済み）。実行時側の保証はセルフテスト項目 90(f) が受け持つ
+    #[test]
+    fn リリースノートはmdレンダリング経路を通る() {
+        let src = include_str!("update_window.rs");
+        let impl_src = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("実装部（テストモジュールより手前）");
+        assert!(
+            impl_src.contains("md_view::render_document"),
+            "リリースノートが md_view の描画を通っていない（#690）"
+        );
+        assert!(
+            impl_src.contains("preview::markdown_blocks"),
+            "md のパースを preview::markdown_blocks（正）に任せていない"
+        );
+    }
+
+    /// 表示対象は安定版が主、無ければテスト版（章題のバージョンもそれに従う）
+    #[test]
+    fn ノートは安定版優先でテスト版へ落ちる() {
+        let stable = info("1.0.0", Channel::Stable, Some("stable notes"));
+        let test = info("1.1.0-test.1", Channel::Test, Some("test notes"));
+
+        let both = available(Some(stable.clone()), Some(test.clone()));
+        let (picked, notes) = UpdateWindow::notes_source(&both).expect("両方あるとき");
+        assert_eq!(picked.version, "1.0.0");
+        assert_eq!(notes, "stable notes");
+
+        let only_test = available(None, Some(test));
+        let (picked, notes) = UpdateWindow::notes_source(&only_test).expect("テスト版のみ");
+        assert_eq!(picked.version, "1.1.0-test.1");
+        assert_eq!(notes, "test notes");
+
+        // 更新なし・チェック前・更新中はノート欄そのものを出さない
+        for state in [
+            UpdateState::Idle,
+            UpdateState::Updating("x".into()),
+            UpdateState::CheckFailed("x".into()),
+            available(None, None),
+        ] {
+            assert!(UpdateWindow::notes_source(&state).is_none());
+        }
+
+        // body 空のリリースは「ノートなし」の案内へ落ちる（パースしない）
+        let empty = available(Some(info("1.0.0", Channel::Stable, None)), None);
+        let (_, notes) = UpdateWindow::notes_source(&empty).expect("ノート空でも欄は出す");
+        assert_eq!(notes, "");
+    }
+
+    /// 実物に近いノートが見出し・表・リスト・コード・引用・リンクとして解ける
+    /// （受け入れ条件 1 の「レンダリングされる」の中身）
+    #[test]
+    fn 実リリースノートが見出しと表とリストとリンクに解ける() {
+        let parsed = ParsedNotes::parse(RELEASE_NOTES);
+        let kinds = &parsed.blocks;
+        let heading_levels: Vec<u8> = kinds
+            .iter()
+            .filter_map(|b| match &b.kind {
+                preview::MdBlockKind::Heading { level, .. } => Some(*level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heading_levels, vec![2, 2, 3], "見出しが解けていない");
+        let table = kinds
+            .iter()
+            .find_map(|b| match &b.kind {
+                preview::MdBlockKind::Table {
+                    align,
+                    header,
+                    rows,
+                } => Some((align.clone(), header.len(), rows.len())),
+                _ => None,
+            })
+            .expect("ダウンロード表が解けていない");
+        assert_eq!(table.1, 3, "表のヘッダが 3 列");
+        assert_eq!(table.2, 2, "表の本文が 2 行");
+        assert_eq!(
+            table.0,
+            vec![
+                preview::MdAlign::None,
+                preview::MdAlign::Center,
+                preview::MdAlign::Right
+            ],
+            "列の配置指定が解けていない"
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|b| matches!(b.kind, preview::MdBlockKind::ListItem { .. }))
+                .count(),
+            2,
+            "リスト項目が解けていない"
+        );
+        assert!(
+            kinds.iter().any(
+                |b| matches!(&b.kind, preview::MdBlockKind::CodeBlock { lang, .. }
+                    if lang.as_deref() == Some("sh"))
+            ),
+            "コードブロックが解けていない"
+        );
+        assert!(
+            kinds.iter().any(|b| b.quote_depth > 0),
+            "引用が解けていない"
+        );
+        // リンクは 1 本（http なので開ける）。索引はプレビューと同じ経路で作る
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            parsed.links[0].url,
+            "https://github.com/takushio2525/tako/issues/680"
+        );
+        assert!(tako_core::md_links::browser_url(&parsed.links[0].url).is_some());
+    }
+
+    /// エッジ（受け入れ条件 3）: 空・壊れた md・巨大なノートを解いても落ちない。
+    /// 描画側の頑健性は `md_view` の単体テストが見る
+    #[test]
+    fn 空と壊れたmdと巨大なノートを解いても落ちない() {
+        assert!(ParsedNotes::parse("").blocks.is_empty());
+        let broken = "```\n| a |\n|--\n### \n[x](javascript:alert(1))\n> >\n";
+        let parsed = ParsedNotes::parse(broken);
+        // 開けない URL は当たり判定に載っていても browser_url で弾かれる
+        assert!(parsed
+            .links
+            .iter()
+            .all(|l| tako_core::md_links::browser_url(&l.url).is_none()));
+        let big = RELEASE_NOTES.repeat(400);
+        let parsed = ParsedNotes::parse(&big);
+        assert_eq!(parsed.links.len(), 400);
+        assert!(parsed.blocks.len() > 400);
     }
 }

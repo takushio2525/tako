@@ -20,6 +20,7 @@ mod drawer;
 mod file_icons;
 mod filetree;
 mod keybindings;
+mod md_view;
 mod overlays;
 mod preview;
 mod preview_render;
@@ -18420,6 +18421,379 @@ mod self_test {
     /// ダーク / ライト / 狭幅の 3 状態で、レイアウト不変条件・塗り分け・
     /// 表セルのヒットテストと選択コピーを機械検証する
     #[cfg(feature = "visual-test")]
+    /// アップデート詳細画面のリリースノートが Markdown として描かれているかの
+    /// 実フレーム検証（Issue #690）。
+    ///
+    /// 専用ウィンドウの scene を直接読み戻す（`render_to_image`）ので、画面収録権限・
+    /// ウィンドウ前面化・画面ロックに依存しない。検証は 2 段:
+    ///
+    /// - **実リリース（v0.6.2）のノート本文そのもの**を流し込み、ダーク / ライト両テーマで
+    ///   ①見出しが本文より高い ②インラインコードが peach で描かれる
+    ///   ③コードフェンスが mantle のパネルになる ④表のヘッダ帯が塗られる
+    ///   ⑤テーマを戻すと元のフレームへ戻る（配色が焼き付いていない）
+    /// - **リンクを含む小さなノート**で ⑥リンクが accent 色になる
+    ///   ⑦⌘+ホバーで装飾が変わる（#680 と同じ UX）
+    ///
+    /// 生テキスト表示ではどれも成立しない（全行同じ高さ・地色のみ・装飾ゼロ）。
+    #[cfg(feature = "visual-test")]
+    async fn update_notes_visual(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+        use crate::update_checker::{Channel, ChannelUpdates, UpdateInfo, UpdateState};
+
+        /// 実リリース v0.6.2 のノート本文（見出し・ダウンロード表・箇条書き・
+        /// 番号付きリスト・コードフェンス・インラインコード・罫線を含む）
+        const REAL_NOTES: &str = include_str!("../resources/fixtures/release-notes-v0.6.2.md");
+        /// 実リリースのノートは `[text](url)` 形式のリンクを含まない（素の URL だけ）ので、
+        /// リンク装飾は別のノートで見る
+        const LINK_NOTES: &str = "## リンク\n\n\
+            詳細は [Issue #690](https://example.com/issues/690) を参照。\n\n\
+            - [ダウンロード](https://example.com/download)\n";
+
+        let notes_state = |notes: &str| {
+            UpdateState::Available(ChannelUpdates {
+                stable: Some(UpdateInfo {
+                    version: "0.6.2".into(),
+                    channel: Channel::Stable,
+                    html_url: "https://example.invalid/releases/v0.6.2".into(),
+                    download_url: Some("https://example.invalid/tako.zip".into()),
+                    asset_name: Some("tako-v0.6.2-macos-arm64.zip".into()),
+                    notes: Some(notes.to_string()),
+                }),
+                test: None,
+                rate_limit_note: None,
+            })
+        };
+
+        // 専用ウィンドウを開く（render / IPC ループと同じ 1 行を明示的に叩く）
+        let _ = window.update(cx, |app, _, cx| {
+            app.update_state = notes_state(REAL_NOTES);
+            app.open_update_window_impl(cx);
+            cx.notify();
+        });
+        cx.background_executor()
+            .timer(Duration::from_millis(400))
+            .await;
+        let Some(update_win) = window
+            .update(cx, |app, _, _| app.update_window_handle)
+            .ok()
+            .flatten()
+        else {
+            fail("visual-test #690: アップデート専用画面が開かない");
+        };
+        let update_any: AnyWindowHandle = update_win.into();
+
+        let set_theme = |mode: &'static str, cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Theme {
+                        action: Some("set".into()),
+                        mode: Some(mode.into()),
+                        target: None,
+                        key: None,
+                        value: None,
+                        name: None,
+                        font_family: None,
+                        font_size: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        };
+
+        // --- 実リリースのノート: ダーク / ライトで md の特徴を実ピクセルで数える ---
+        //
+        // ノートは 260px の枠内で縦スクロールするので 1 フレームでは一部しか見えない。
+        // 枠を上から下まで舐めて「文書のどこかに描かれている」を集計する
+        // （どの要素が何 px 目に来るかは本文次第なので、位置には依存させない）
+        for state in ["dark", "light"] {
+            set_theme(state, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+
+            let mut inline_code = 0usize;
+            let mut code_panel = 0usize;
+            let mut header_band = 0usize;
+            let mut heading_taller = false;
+            let mut steps = 0usize;
+
+            for step in 0..8 {
+                let _ = update_win.update(cx, |view, _, cx| {
+                    view.scroll_notes_to(step as f32 * 300.0);
+                    cx.notify();
+                });
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                let Some(measured) = measure_notes_frame(update_win, update_any, cx) else {
+                    fail("visual-test #690: ノート枠のフレームを読み戻せない");
+                };
+                steps = step + 1;
+                inline_code += measured.peach;
+                code_panel += measured.mantle;
+                header_band += measured.surface_highlight;
+                heading_taller |= measured.heading_taller;
+                if let (Ok(dump), 0) = (std::env::var("TAKO_VISUAL_DUMP_DIR"), step) {
+                    let _ = measured.frame.save(
+                        std::path::Path::new(&dump).join(format!("update-notes-{state}-top.png")),
+                    );
+                }
+                // 表が見えたフレームも証拠に残す（表は文書の中ほど）
+                if measured.surface_highlight > 2000 {
+                    if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                        let _ = measured.frame.save(
+                            std::path::Path::new(&dump)
+                                .join(format!("update-notes-{state}-table.png")),
+                        );
+                    }
+                }
+            }
+
+            println!(
+                "TAKO_VISUAL_PIXEL: update-notes({state}) steps={steps} inline_code={inline_code} \
+                 code_panel={code_panel} header_band={header_band} heading_taller={heading_taller}"
+            );
+            check(
+                steps >= 4,
+                &format!("visual-test #690({state}): ノートを枠内で舐められる"),
+            );
+            check(
+                heading_taller,
+                &format!("visual-test #690({state}): 見出しが本文より高い（md の見出し）"),
+            );
+            check(
+                inline_code > 50,
+                &format!(
+                    "visual-test #690({state}): インラインコードが peach で描かれている（{inline_code} px）"
+                ),
+            );
+            check(
+                code_panel > 500,
+                &format!(
+                    "visual-test #690({state}): コードフェンスが mantle のパネルになっている（{code_panel} px）"
+                ),
+            );
+            check(
+                header_band > 500,
+                &format!(
+                    "visual-test #690({state}): 表のヘッダ帯が塗られている（{header_band} px）"
+                ),
+            );
+
+            let _ = update_win.update(cx, |view, _, cx| {
+                view.scroll_notes_to(0.0);
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+        }
+
+        // ⑤テーマ追従: ダーク → ライト → ダークで絵が変わり、戻すと一致する。
+        //   診断情報（配布系統・実行環境）は background で遅れて届き、届くと行が増えて
+        //   全体がずれるので、**掃き終わってから 3 枚を続けて撮る**（先頭フレームとは比べない）
+        let mut roundtrip_frames: Vec<image::RgbaImage> = Vec::new();
+        for mode in ["dark", "light", "dark"] {
+            set_theme(mode, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let Some((frame, _)) = capture_frame(update_any, cx) else {
+                fail("visual-test #690: テーマ追従のフレームを読み戻せない");
+            };
+            roundtrip_frames.push(frame);
+        }
+        let diff = |a: &image::RgbaImage, b: &image::RgbaImage| {
+            a.pixels().zip(b.pixels()).filter(|(p, q)| p != q).count()
+        };
+        let theme_changed = diff(&roundtrip_frames[0], &roundtrip_frames[1]);
+        let roundtrip = diff(&roundtrip_frames[0], &roundtrip_frames[2]);
+        println!(
+            "TAKO_VISUAL_PIXEL: update-notes theme_changed={theme_changed} \
+             roundtrip_diff={roundtrip}"
+        );
+        check(
+            theme_changed > 1000 && roundtrip == 0,
+            "visual-test #690: ダーク / ライトで描画が変わり、戻すと一致する",
+        );
+
+        // --- リンクを含むノート: accent 色と ⌘+ホバーの装飾差分 ---
+        for state in ["dark", "light"] {
+            set_theme(state, cx);
+            let _ = window.update(cx, |app, _, cx| {
+                app.update_state = notes_state(LINK_NOTES);
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let Some(plain) = measure_notes_frame(update_win, update_any, cx) else {
+                fail("visual-test #690: リンクノートのフレームを読み戻せない");
+            };
+            let hovered = update_win
+                .update(cx, |view, _, cx| {
+                    let index = view.first_openable_note_link();
+                    let ok = index.is_some() && view.set_hovered_note_link(index);
+                    cx.notify();
+                    ok
+                })
+                .unwrap_or(false);
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let hover_diff = measure_notes_frame(update_win, update_any, cx)
+                .map(|m| {
+                    m.frame
+                        .pixels()
+                        .zip(plain.frame.pixels())
+                        .filter(|(a, b)| a != b)
+                        .count()
+                })
+                .unwrap_or(0);
+            let _ = update_win.update(cx, |view, _, cx| {
+                view.set_hovered_note_link(None);
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            println!(
+                "TAKO_VISUAL_PIXEL: update-notes-link({state}) accent={} hovered={hovered} \
+                 hover_diff={hover_diff}",
+                plain.accent
+            );
+            check(
+                plain.accent > 30,
+                &format!(
+                    "visual-test #690({state}): リンクが accent 色で描かれている（{} px）",
+                    plain.accent
+                ),
+            );
+            check(
+                hovered && hover_diff > 0,
+                &format!("visual-test #690({state}): ⌘ホバーでリンクの装飾が変わる"),
+            );
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = plain.frame.save(
+                    std::path::Path::new(&dump).join(format!("update-notes-{state}-link.png")),
+                );
+            }
+        }
+
+        // 後片付け（後続の節へ状態を持ち越さない）
+        let _ = update_win.update(cx, |_, window, _| window.remove_window());
+        let _ = window.update(cx, |app, _, cx| {
+            app.update_window_handle = None;
+            app.update_state = UpdateState::Idle;
+            cx.notify();
+        });
+        cx.background_executor()
+            .timer(Duration::from_millis(200))
+            .await;
+    }
+
+    /// #690 の実ピクセル計測 1 フレームぶん。走査範囲は「描き終わったノート枠」の内側だけ
+    /// （章題・ボタン・現在バージョン欄を含めない）
+    #[cfg(feature = "visual-test")]
+    struct NotesFrameMeasure {
+        frame: image::RgbaImage,
+        /// リンクの文字色（accent）に近いピクセル数
+        accent: usize,
+        /// インラインコードの文字色（peach）に近いピクセル数
+        peach: usize,
+        /// コードフェンスのパネル地色（mantle）に近いピクセル数
+        mantle: usize,
+        /// 表のヘッダ帯（surface_highlight）に近いピクセル数
+        surface_highlight: usize,
+        /// インクの連なりの最大が中央値より明確に高い（= 見出しが本文より大きい）
+        heading_taller: bool,
+    }
+
+    #[cfg(feature = "visual-test")]
+    fn measure_notes_frame(
+        update_win: WindowHandle<crate::update_window::UpdateWindow>,
+        update_any: AnyWindowHandle,
+        cx: &mut AsyncApp,
+    ) -> Option<NotesFrameMeasure> {
+        let (frame, scale) = capture_frame(update_any, cx)?;
+        let (bounds, theme) = update_win
+            .update(cx, |view, _, _| (view.notes_bounds(), view.visual_theme()))
+            .ok()?;
+        let bounds = bounds?;
+        let (w, h) = frame.dimensions();
+        let px_of = |v: f32, max: u32| ((v * scale).round().max(0.0) as u32).min(max);
+        let x0 = px_of(f32::from(bounds.origin.x), w);
+        let y0 = px_of(f32::from(bounds.origin.y), h);
+        let x1 = px_of(f32::from(bounds.origin.x) + f32::from(bounds.size.width), w);
+        let y1 = px_of(
+            f32::from(bounds.origin.y) + f32::from(bounds.size.height),
+            h,
+        );
+        check(
+            x1 > x0 + 100 && y1 > y0 + 40,
+            "visual-test #690: ノート枠に描画面積がある",
+        );
+
+        // 色の一致は量子化・アンチエイリアスを見込んで近傍で数える
+        let near = |p: &image::Rgba<u8>, c: tako_core::Rgb, tol: i32| {
+            (i32::from(p.0[0]) - i32::from(c.r)).abs() <= tol
+                && (i32::from(p.0[1]) - i32::from(c.g)).abs() <= tol
+                && (i32::from(p.0[2]) - i32::from(c.b)).abs() <= tol
+        };
+        let mut m = NotesFrameMeasure {
+            frame: image::RgbaImage::new(0, 0),
+            accent: 0,
+            peach: 0,
+            mantle: 0,
+            surface_highlight: 0,
+            heading_taller: false,
+        };
+        let mut runs: Vec<u32> = Vec::new();
+        let mut run = 0u32;
+        for y in y0..y1 {
+            let mut ink = false;
+            for x in x0..x1 {
+                let p = frame.get_pixel(x, y);
+                if near(p, theme.accent, 26) {
+                    m.accent += 1;
+                }
+                if near(p, theme.peach, 26) {
+                    m.peach += 1;
+                }
+                if near(p, theme.mantle, 2) {
+                    m.mantle += 1;
+                }
+                if near(p, theme.surface_highlight, 3) {
+                    m.surface_highlight += 1;
+                }
+                // 地色（枠の面 / コードパネルの面）以外はインク扱い
+                if !near(p, theme.surface_1, 10) && !near(p, theme.mantle, 10) {
+                    ink = true;
+                }
+            }
+            if ink {
+                run += 1;
+            } else if run > 0 {
+                runs.push(run);
+                run = 0;
+            }
+        }
+        if run > 0 {
+            runs.push(run);
+        }
+        runs.sort_unstable();
+        let tallest = runs.last().copied().unwrap_or(0);
+        let typical = runs.get(runs.len() / 2).copied().unwrap_or(0).max(1);
+        m.heading_taller = runs.len() >= 4 && tallest as f32 > typical as f32 * 1.3;
+        m.frame = frame;
+        Some(m)
+    }
+
+    /// Markdown プレビュー表示品質の実フレーム検証（Issue #656）。
+    /// ダーク / ライト / 狭幅の 3 状態で、レイアウト不変条件・塗り分け・
+    /// 表セルのヒットテストと選択コピーを機械検証する
+    #[cfg(feature = "visual-test")]
     async fn markdown_preview_visual(
         any: AnyWindowHandle,
         window: WindowHandle<TakoApp>,
@@ -20159,6 +20533,13 @@ mod self_test {
                 });
                 let _ = capture_frame(any, cx);
             }
+
+            // #690: アップデート詳細画面のリリースノートが Markdown として描かれるか。
+            // 実リリース v0.6.2 のノート本文を専用ウィンドウへ流し込み、scene の実ピクセルで
+            // 見出しサイズ・インラインコード・コードパネル・表のヘッダ帯・リンク色・
+            // ⌘ホバー差分を見る。**最後に回す**: 別ウィンドウを開いてフレームを何枚も撮るので、
+            // 実時間に依存する節（PDF の background ラスタライズ待ち等）を遅らせない
+            update_notes_visual(window, cx).await;
 
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);
@@ -28909,17 +29290,32 @@ mod self_test {
             // (c) dispatch（CLI / MCP と同一経路）と UI 状態・永続化キーが一致する
             // (d) 専用ウィンドウが実際に開き、更新フローの各状態を描画できる
             // (e) パレット導線が専用ウィンドウを開く
+            // (f) リリースノートが Markdown としてレンダリングされる（#690）。
+            //     実物に近いノート（見出し・ダウンロード表・リスト・リンク・コード・引用）と
+            //     エッジ（ノートなし / 壊れた md / 巨大）を実描画で通す
             {
                 use crate::update_checker::{
                     Channel, ChannelUpdates, UpdateInfo, UpdateState, CURRENT_VERSION,
                 };
+                // #594 の生成物に近い形（日英併記・配置指定つき表・コードフェンス・引用）
+                const NOTES_MD: &str = "\
+## Highlights / ハイライト\n\n\
+- **Markdown** release notes / リリースノートの md 表示\n\
+- Fixed [#690](https://github.com/takushio2525/tako/issues/690)\n\n\
+## Download / ダウンロード\n\n\
+| OS | Arch | Asset |\n|---|:-:|---:|\n\
+| macOS | arm64 | `tako-macos-arm64.zip` |\n\
+| Windows | x64 | `tako-windows-x64.zip` |\n\n\
+### Install / インストール手順\n\n\
+```sh\nbrew upgrade --cask tako\n```\n\n\
+> Known limitations / 既知の制限\n";
                 let info = |v: &str, ch: Channel| UpdateInfo {
                     version: v.into(),
                     channel: ch,
                     html_url: format!("https://example.invalid/releases/v{v}"),
                     download_url: Some("https://example.invalid/tako.zip".into()),
                     asset_name: Some(format!("tako-v{v}-macos-arm64.zip")),
-                    notes: Some("- セルフテスト用のリリースノート".into()),
+                    notes: Some(NOTES_MD.to_string()),
                 };
                 let available = |stable: Option<&str>, test: Option<&str>| {
                     UpdateState::Available(ChannelUpdates {
@@ -29162,6 +29558,74 @@ mod self_test {
                     requested && rendered,
                     "アップデート専用画面: パレット / dispatch から開き、更新フロー全状態を描画できる (#616)",
                 );
+
+                // --- (f) リリースノートの Markdown レンダリング（#690）---
+                if let Some(handle) = opened {
+                    // 実物に近いノート: 見出し・表・リスト・リンクへ解けて実描画まで通る
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.update_state = available(Some("99.0.0"), None);
+                        cx.notify();
+                    });
+                    let real = handle
+                        .update(cx, |view, win, cx| {
+                            let _ = view.render(win, cx);
+                            let (blocks, has_table, links, layouts) = view.notes_probe();
+                            // ⌘+クリックの経路（描画前・範囲外でも panic しない）
+                            let clicked = view.probe_note_link_click(gpui::point(
+                                gpui::px(-10.0),
+                                gpui::px(-10.0),
+                            ));
+                            (blocks, has_table, links, layouts, clicked)
+                        })
+                        .unwrap_or((0, false, 0, 0, None));
+                    // 生テキストなら 1 ブロック（段落）にしかならない。表・リンクが
+                    // 解けていて、行ごとの TextLayout が控えられている = md として描いた
+                    let md_ok = real.0 >= 8
+                        && real.1
+                        && real.2 == 1
+                        && real.3 >= real.0
+                        && real.4.is_none();
+
+                    // エッジ: ノートなし / 壊れた md / 巨大ノートでも描画が落ちない
+                    let mut edges = true;
+                    let broken = "```rust\nfn main() {\n\n| a | b\n|---\n| 1 |\n\n\
+                                  [x](javascript:alert(1))\n\n> > 深い引用\n\n#\n\n|||\n";
+                    let huge = NOTES_MD.repeat(200);
+                    for notes in [None, Some(String::new()), Some(broken.into()), Some(huge)] {
+                        let _ = window.update(cx, |app, _, cx| {
+                            let mut i = info("99.0.0", Channel::Stable);
+                            i.notes = notes.clone();
+                            app.update_state = UpdateState::Available(ChannelUpdates {
+                                stable: Some(i),
+                                test: None,
+                                rate_limit_note: None,
+                            });
+                            cx.notify();
+                        });
+                        edges &= handle
+                            .update(cx, |view, win, cx| {
+                                let _ = view.render(win, cx);
+                                // ノートが空なら解析結果も空（案内文へ落ちる）
+                                let (blocks, ..) = view.notes_probe();
+                                notes.as_deref().unwrap_or("").is_empty() == (blocks == 0)
+                            })
+                            .unwrap_or(false);
+                    }
+                    println!(
+                        "TAKO_UPDATE_NOTES690: blocks={} table={} openable_links={} \
+                         layouts={} click={:?} edges={edges}",
+                        real.0, real.1, real.2, real.3, real.4
+                    );
+                    check(
+                        md_ok && edges,
+                        &format!(
+                            "アップデート詳細のリリースノートが Markdown として描かれる (#690): \
+                             blocks={} table={} links={} layouts={} click={:?} edges={edges}",
+                            real.0, real.1, real.2, real.3, real.4
+                        ),
+                    );
+                }
+
                 // 後片付け（後続の項目・実際の状態へ持ち越さない）
                 let _ = window.update(cx, |app, _, cx| {
                     app.update_state = UpdateState::Idle;
