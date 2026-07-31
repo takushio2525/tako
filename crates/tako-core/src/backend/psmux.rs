@@ -25,6 +25,7 @@
 //! | `list-clients -F` が書式指定を無視（クライアント PID が取れない） | [`super::owner`] のオーナー記録で代替（#177 の強奪ガード） |
 //! | `new-session -D` が他クライアントを切り離さない | 同上。**器に収束を期待しない** |
 //! | 既定の warm pane 先読みが 1 セッションあたり pwsh を 1 本余計に常駐させる | conf に `set -g warm off`（+243MB → +131MB/session） |
+//! | 器の中のシェルは tako の ConPTY の子ではない（コードページ固定が届かない） | [`SessionBackend::pane_pids`] で器へ `#{pane_pid}` を尋ね、器の内側にも B19 の固定を当てる（#659） |
 //!
 //! ## バージョン固定と起動時プローブ
 //!
@@ -337,6 +338,26 @@ impl SessionBackend for PsmuxBackend {
         None
     }
 
+    /// `list-panes -F "#{pane_pid}"`（実測で正しい pid を返す。`pane_tty` と違って
+    /// psmux も嘘をつかない）。**器の中のシェルの疑似コンソールを UTF-8 へ固定する**
+    /// ために使う（#659）。セッションがまだ無い間はエラーになるので空を返す。
+    ///
+    /// 返すのは器がそのセッションに持つ**全ペイン**の pid。tako は 1 セッション =
+    /// 1 ペインで使うが、ユーザーが器の中で分割した分もここに載る。コードページは
+    /// 疑似コンソール単位なので、載った分だけ固定しておくのが素直（余分に固定しても害は無い）
+    fn pane_pids(&self, session: &SessionRef) -> Vec<u32> {
+        let out = self
+            .run(&[
+                "list-panes",
+                "-t",
+                self.target(session),
+                "-F",
+                "#{pane_pid}",
+            ])
+            .unwrap_or_default();
+        parse_pane_pids(&out)
+    }
+
     fn session_cwd(&self, session: &SessionRef) -> Option<String> {
         let out = self
             .run(&[
@@ -403,6 +424,15 @@ impl PsmuxBackend {
         let me = std::process::id();
         !matches!(self.owners.holder(&info.session), Some(pid) if pid != me)
     }
+}
+
+/// `list-panes -F "#{pane_pid}"` の出力をパースする（純関数。#659）。
+/// 数字以外の行（psmux が警告を混ぜた場合など）は捨てる
+fn parse_pane_pids(out: &str) -> Vec<u32> {
+    out.lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .collect()
 }
 
 /// `list-sessions -F` の 3 列出力をパースする（純関数）
@@ -632,6 +662,21 @@ mod tests {
     #[test]
     fn pane_ttyは常にnone() {
         assert!(backend().pane_tty(&session("tako-0123456789ab")).is_none());
+    }
+
+    /// **#659**: 器の中のシェルの pid を取り出せる。
+    /// これが取れないと、器の内側の疑似コンソールを UTF-8 に固定できない
+    /// （psmux ペインだけ CP932 のまま残る = #655 の対処が届かない）
+    #[test]
+    fn 器の中のペインのpidを取り出す() {
+        assert_eq!(parse_pane_pids("13144\n"), vec![13144]);
+        // 器の中で分割された分もそのまま載る（コードページは疑似コンソール単位）
+        assert_eq!(parse_pane_pids("13144\n18248\n"), vec![13144, 18248]);
+        // 空・非数値・0 は捨てる（psmux が警告を混ぜても pid と誤認しない）
+        assert!(parse_pane_pids("").is_empty());
+        assert!(parse_pane_pids("psmux: no server running\n").is_empty());
+        assert!(parse_pane_pids("0\n").is_empty());
+        assert_eq!(parse_pane_pids(" 42 \r\n"), vec![42]);
     }
 
     /// **要件 3**: `#{history_bytes}` に依存する経路を**構造的に持たない**。

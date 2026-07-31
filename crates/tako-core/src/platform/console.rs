@@ -85,6 +85,16 @@ pub fn force_pin_pane_to_utf8(pid: u32) -> PinOutcome {
     imp::force_pin_pane_to_utf8(pid)
 }
 
+/// このプラットフォームで固定が要るか（Windows だけ `true`）。
+///
+/// **固定の呼び出し側が「pid をどう調べるか」を決める前に問う**ためにある。
+/// 器（psmux）の中のシェルの pid は器へ問い合わせないと分からず、その問い合わせは
+/// サブプロセス起動である。unix では固定自体が [`PinOutcome::NotNeeded`] になるので、
+/// これを先に見ておけば**無駄なサブプロセスもスレッドも作らない**（#659）
+pub fn pin_needed() -> bool {
+    cfg!(windows)
+}
+
 #[cfg(not(windows))]
 mod imp {
     use super::PinOutcome;

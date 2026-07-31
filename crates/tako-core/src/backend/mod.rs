@@ -274,6 +274,17 @@ pub trait SessionBackend: Send + Sync {
     /// 器の中のペインの制御端末。listen ポート検知（FR-2.4.2）の突き合わせに使う
     fn pane_tty(&self, session: &SessionRef) -> Option<String>;
 
+    /// 器の中で動いているプロセスの PID。
+    ///
+    /// **器の中のシェルは tako の PTY の子ではない**（器のサーバーが自前に作った
+    /// 疑似コンソールの中に居る）ので、`TerminalSession::spawn` が握っている
+    /// 「PTY 直下の子」からは辿れない。器の内側のプロセスへ何かを届ける経路
+    /// （疑似コンソールのコードページ固定 = 境界 B19。#659）はここから pid を得る。
+    /// 器を持たない実装・まだセッションが出来ていない場合は空を返す
+    fn pane_pids(&self, _session: &SessionRef) -> Vec<u32> {
+        Vec::new()
+    }
+
     /// 器の中の現在の作業ディレクトリ。orphan 復帰（#191）が復元ペインの cwd に使う
     fn session_cwd(&self, session: &SessionRef) -> Option<String>;
 
@@ -369,7 +380,7 @@ pub fn reserve_for_pane(
 /// そのペインを直接ペインとして扱う（`SpawnOptions` は素通し）。
 /// **PTY を所有するのは呼び出し側の `TerminalSession::spawn` のまま**である点に注意
 pub fn wrap_spawn_for_pane(
-    backend: &dyn SessionBackend,
+    backend: &'static dyn SessionBackend,
     persist: bool,
     existing: Option<&str>,
     candidate: impl FnOnce() -> String,
@@ -378,10 +389,60 @@ pub fn wrap_spawn_for_pane(
     match reserve_for_pane(backend, persist, existing, candidate) {
         Some(session) => {
             let wrapped = backend.wrap_spawn(options, &session);
+            // 器の中のシェルは tako の ConPTY の子ではないので、
+            // `TerminalSession::spawn` のコードページ固定（B19）が届かない。
+            // **器を配るこの 1 箇所**から器の内側にも同じ固定を届ける（#659）
+            pin_container_encoding(backend, session.clone());
             (wrapped, Some(session))
         }
         None => (options, None),
     }
+}
+
+/// 器の中のペインの pid が見えるようになるまでの上限。
+/// `new-session` の完了待ちで、実測（この Windows 機・psmux 3.3.7）は 1 秒未満
+const CONTAINER_PID_TIMEOUT: Duration = Duration::from_secs(15);
+/// 器への問い合わせ間隔。1 回がサブプロセス起動（実測 30〜50ms）なので細かくしない
+const CONTAINER_PID_INTERVAL: Duration = Duration::from_millis(120);
+
+/// 器の中のシェルの疑似コンソールを UTF-8 へ固定する（#659。Windows のみ実体を持つ）。
+///
+/// `backend=psmux` のとき、tako の ConPTY 直下の子は **psmux クライアント**であって
+/// シェルではない。シェルは psmux サーバーが自前に作った別の疑似コンソールの中で動くので、
+/// [`crate::platform::console`] の固定を PTY 直下の子へ当てても器の内側には届かない
+/// （#655 の対処が psmux ペインに効かなかった理由そのもの）。
+///
+/// **呼び出しは即座に返る**。器へ pid を尋ねるのはサブプロセス起動なので、
+/// 待ちも問い合わせも別スレッドへ逃がす（UI スレッドは止めない）。
+/// 固定できなくてもペインは起動する（描画が化けるだけで、動かなくなるよりはよい）
+fn pin_container_encoding(backend: &'static dyn SessionBackend, session: SessionRef) {
+    // unix は `LC_CTYPE` 注入側で担保済み。ここで器へ問い合わせる意味が無いので
+    // **スレッドもサブプロセスも作らない**
+    if !crate::platform::console::pin_needed() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("tako-pin-container-cp".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + CONTAINER_PID_TIMEOUT;
+            loop {
+                // 新規作成なら器のセッションが出来るまで空。再 attach（復元）なら即座に返る
+                // （既に走っているシェルでも固定は効く = 実測。#659）
+                let pids = backend.pane_pids(&session);
+                if !pids.is_empty() {
+                    for pid in pids {
+                        crate::platform::console::pin_pane_to_utf8_when_ready(pid);
+                    }
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::debug!("器の中のペイン pid を取得できず: {session}");
+                    return;
+                }
+                std::thread::sleep(CONTAINER_PID_INTERVAL);
+            }
+        })
+        .ok();
 }
 
 // --- 実装の選択 -----------------------------------------------------------
@@ -786,13 +847,20 @@ mod tests {
     /// 呼ばれた `wrap_spawn` のセッション名を記録する
     struct FakeSessionHost {
         wrapped: std::sync::Mutex<Vec<String>>,
+        /// `pane_pids` が呼ばれたことを試験側へ伝える（#659 の配線検証）
+        pid_asked: std::sync::mpsc::SyncSender<String>,
     }
 
     impl FakeSessionHost {
-        fn new() -> Self {
-            Self {
+        /// `wrap_spawn_for_pane` は `&'static` を要る（器の内側へコードページ固定を
+        /// 届けるバックグラウンド作業が backend を持ち越すため）。試験では意図的に leak する
+        fn leaked() -> (&'static Self, std::sync::mpsc::Receiver<String>) {
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            let host = Box::leak(Box::new(Self {
                 wrapped: std::sync::Mutex::new(Vec::new()),
-            }
+                pid_asked: tx,
+            }));
+            (host, rx)
         }
     }
 
@@ -845,6 +913,11 @@ mod tests {
         fn pane_tty(&self, _session: &SessionRef) -> Option<String> {
             None
         }
+        fn pane_pids(&self, session: &SessionRef) -> Vec<u32> {
+            let _ = self.pid_asked.try_send(session.as_str().to_string());
+            // 器の中の pid が「まだ無い」状態を返す（配線だけを見たいので固定はさせない）
+            Vec::new()
+        }
         fn session_cwd(&self, _session: &SessionRef) -> Option<String> {
             None
         }
@@ -861,14 +934,14 @@ mod tests {
     /// B-1 を足したときの呼び出し側の変更は 0 行になる
     #[test]
     fn spawn配線はtmux以外の器でも器の中で起動する() {
-        let host = FakeSessionHost::new();
+        let (host, _pids) = FakeSessionHost::leaked();
         let options = SpawnOptions {
             command: None,
             cwd: Some(std::path::PathBuf::from("/tmp/work")),
             env: vec![("TAKO_PANE_ID".into(), "7".into())],
         };
         let (wrapped, session) = wrap_spawn_for_pane(
-            &host,
+            host,
             true,
             None,
             || "tako-0123456789ab".to_string(),
@@ -888,15 +961,54 @@ mod tests {
     fn 既存の器がある再spawnは同じセッションを使い候補名を払い出さない() {
         // 復元・再 spawn。ここで新しい名前を払い出すと、生きている器を取り残して
         // 別の器を作る（= 実行中プロセスの置き去り）ことになる
-        let host = FakeSessionHost::new();
+        let (host, _pids) = FakeSessionHost::leaked();
         let (_, session) = wrap_spawn_for_pane(
-            &host,
+            host,
             true,
             Some("tako-ffffffffffff"),
             || panic!("既存名があるのに候補名を払い出した"),
             SpawnOptions::default(),
         );
         assert_eq!(session.unwrap().as_str(), "tako-ffffffffffff");
+    }
+
+    /// **#659 の配線**: 器を配ったら、器の**内側**のプロセスへコードページ固定を
+    /// 届ける経路が起動する。#655 の固定は tako の ConPTY 直下の子（= psmux では
+    /// クライアント）にしか当たらず、器の中のシェルに届いていなかった。
+    ///
+    /// 固定が要るのは Windows だけなので、**unix では器へ問い合わせすらしない**
+    /// （器への問い合わせはサブプロセス起動。無駄なスレッドも作らない）ことも同時に固定する
+    #[test]
+    fn 器を配ったら器の内側のpidを問い合わせる() {
+        let (host, pids) = FakeSessionHost::leaked();
+        let (_, session) = wrap_spawn_for_pane(
+            host,
+            true,
+            None,
+            || "tako-0123456789ab".to_string(),
+            SpawnOptions::default(),
+        );
+        assert!(session.is_some());
+        let pinning = crate::platform::console::pin_needed();
+        // 起きないことの確認に 5 秒待たない（unix 側は短く打ち切る）
+        let wait = if pinning {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(300)
+        };
+        let asked = pids.recv_timeout(wait);
+        if pinning {
+            assert_eq!(
+                asked.ok().as_deref(),
+                Some("tako-0123456789ab"),
+                "器を配ったのに器の内側の pid を尋ねていない（#659 の再発）"
+            );
+        } else {
+            assert!(
+                asked.is_err(),
+                "固定が不要なプラットフォームで器へ問い合わせている（無駄なサブプロセス）"
+            );
+        }
     }
 
     #[test]
@@ -911,9 +1023,9 @@ mod tests {
         };
 
         // persist OFF: 器を持つ backend でも器は配らない（ユーザー設定が最優先）
-        let host = FakeSessionHost::new();
+        let (host, _pids) = FakeSessionHost::leaked();
         let (passthrough, session) = wrap_spawn_for_pane(
-            &host,
+            host,
             false,
             None,
             || "tako-0123456789ab".to_string(),
@@ -939,8 +1051,8 @@ mod tests {
     fn 壊れた既存名は器として採用しない() {
         // layout.json 由来の名前がターゲット式に化けていても（#428）、
         // reserve が弾いて直接ペインへ倒れる（無音で別セッションを掴まない）
-        let host = FakeSessionHost::new();
-        let session = reserve_for_pane(&host, true, Some("tako-abc:0.0"), || {
+        let (host, _pids) = FakeSessionHost::leaked();
+        let session = reserve_for_pane(host, true, Some("tako-abc:0.0"), || {
             "tako-0123456789ab".to_string()
         });
         assert!(session.is_none());

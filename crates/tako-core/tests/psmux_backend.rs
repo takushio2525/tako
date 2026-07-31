@@ -488,3 +488,135 @@ fn 明示コマンドつきの器が起動する() {
     );
     let _ = f.backend.kill(&name);
 }
+
+// --- 器の中のペインの品質（#659 / #686。いずれも Windows 固有） -----------------
+
+/// 器の中のシェルの pid が取れること。**#659 の要**で、これが取れないと
+/// 器の内側の疑似コンソールに触れず、psmux ペインだけ CP932 のまま残る
+/// （#655 の固定は tako の ConPTY 直下 = psmux クライアントにしか当たらない）
+#[test]
+fn 器の中のシェルのpidが取れる() {
+    let f = fixture!("panepid");
+    let name = session("tako-m2pid00000001");
+    let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+    assert!(ok, "器を作れる: {out}");
+
+    let mut pids = Vec::new();
+    for _ in 0..40 {
+        pids = f.backend.pane_pids(&name);
+        if !pids.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !pids.is_empty(),
+        "器の中のペインの pid が取れない（#659 の再発。コードページ固定が届かなくなる）"
+    );
+    assert!(pids.iter().all(|pid| *pid != 0));
+    // 存在しない器には答えない（`unwrap_or_default` が空を返す経路）
+    assert!(f
+        .backend
+        .pane_pids(&session("tako-m2pidnothere"))
+        .is_empty());
+    let _ = f.backend.kill(&name);
+}
+
+/// **#659 の症状そのもの**: 器の中のシェルが吐く UTF-8 の日本語が化ける。
+/// 器の中の pid へコードページ固定を当てれば直る（`force_` を使うのは
+/// テストプロセスが自分のコンソールを持つため。出荷構成は GUI サブシステム）
+#[cfg(windows)]
+#[test]
+fn 器の中のシェルのコードページをutf8へ固定できる() {
+    use tako_core::platform::console::{force_pin_pane_to_utf8, PinOutcome};
+
+    /// 化けの判定に使う文字列（CP932 にも UTF-8 にもある常用漢字）
+    const JP: &str = "日本語テスト";
+    /// UTF-8 を CP932 として解釈したときの既知の並び
+    const MOJIBAKE: &str = "譌･譛ｬ隱";
+
+    let f = fixture!("panecp");
+    let name = session("tako-m2cp0000001");
+    let fixture_path =
+        std::env::temp_dir().join(format!("tako-psmux-enc-{}.txt", std::process::id()));
+    std::fs::write(&fixture_path, format!("{JP}\r\n").as_bytes()).expect("fixture を書ける");
+
+    // psmux の既定シェル（pwsh 7）は自分で UTF-8 にしてしまうので、
+    // **自分では直さない** cmd.exe を明示して #659 の条件を作る
+    let (ok, out) = f.raw(&[
+        "new-session",
+        "-d",
+        "-s",
+        name.as_str(),
+        "cmd.exe /d /k prompt $G",
+    ]);
+    assert!(ok, "器を作れる: {out}");
+
+    let capture = |f: &Fixture| f.raw(&["capture-pane", "-t", name.as_str(), "-p"]).1;
+    let wait_for = |f: &Fixture, needle: &str| -> bool {
+        for _ in 0..50 {
+            if capture(f).contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    };
+    let send = |f: &Fixture, line: &str| {
+        f.raw(&["send-keys", "-t", name.as_str(), line, "Enter"]);
+    };
+
+    assert!(wait_for(&f, ">"), "プロンプトが出ない: {}", capture(&f));
+
+    // 修正前の状態（器の内側は OEM コードページのまま）を先に見ておく
+    send(&f, &format!("type {}", fixture_path.display()));
+    let before_ok = wait_for(&f, JP);
+    let before = capture(&f);
+
+    // 器の中の pid へ固定を当てる（**ここが #659 の修正**）
+    let pids = f.backend.pane_pids(&name);
+    assert!(!pids.is_empty(), "器の中の pid が取れない: {}", capture(&f));
+    for pid in &pids {
+        assert_eq!(
+            force_pin_pane_to_utf8(*pid),
+            PinOutcome::Pinned,
+            "器の中のペイン（pid {pid}）を固定できない"
+        );
+    }
+
+    send(&f, "cls");
+    send(&f, "chcp");
+    assert!(
+        wait_for(&f, "65001"),
+        "器の中のコードページが UTF-8 になっていない: {}",
+        capture(&f)
+    );
+    send(&f, &format!("type {}", fixture_path.display()));
+    assert!(
+        wait_for(&f, JP),
+        "固定後も UTF-8 の日本語が化ける: {}",
+        capture(&f)
+    );
+    assert!(
+        !capture(&f).contains(MOJIBAKE),
+        "CP932 誤解釈の化け方が残っている: {}",
+        capture(&f)
+    );
+
+    // 前提（固定前は化けていた）が崩れていたら、このテストは #659 を検出できていない。
+    // OEM コードページが元から UTF-8 の環境ではありえるので、失敗ではなく明示する
+    if before_ok {
+        eprintln!(
+            "note: 固定前から化けていなかった（この機の OEM コードページが UTF-8 か、\
+             シェルが自分で直している）。before の画面: {before}"
+        );
+    } else {
+        assert!(
+            before.contains(MOJIBAKE),
+            "固定前は CP932 誤解釈で化けているはず（前提が崩れている）: {before}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&fixture_path);
+    let _ = f.backend.kill(&name);
+}
