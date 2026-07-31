@@ -23,22 +23,22 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 96 | macOS 版と同じように使えます |
-| 一部対応 | 9 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 23 | まだ実装されていません（追跡 Issue つき） |
+| 対応済み | 95 | macOS 版と同じように使えます |
+| 一部対応 | 11 | 使えますが機能が落ちます（理由は各表に記載） |
+| 未対応 | 22 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **129** | |
 
 ## ターミナルの基本
 
-シェルの起動・入出力・スクロール・コピー & ペースト。（このカテゴリ全体としては **対応済み**）
+シェルの起動・入出力・スクロール・コピー & ペースト。（このカテゴリ全体としては **一部対応**）
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
 | `tako_send_input` | 対応済み | — |
 | `tako_send_keys` | 対応済み | — |
 | `tako_read_pane` | 対応済み | — |
-| `tako_scroll_pane` | 対応済み | — |
+| `tako_scroll_pane` | 一部対応 | psmux ペインではスクロール位置を器（psmux）が持つ。tako はユーザーのホイールと同じ経路で 器を動かし実位置を読み戻すが、器の粒度でしか位置を指定できない。ペイン内のアプリが全画面（claude 等）のときはそのアプリが位置を持つため、スクロールは効くが位置は返せず、to での絶対指定もできない |
 | `tako_list_panes` | 対応済み | — |
 | `tako_logs` | 対応済み | — |
 | `tako_limit_service` | 対応済み | — |
@@ -92,7 +92,7 @@ worker の spawn・監視・報告・タスク管理。（このカテゴリ全�
 | `tako_orchestrator_self` | 対応済み | — |
 | `tako_orchestrator_worker_status` | 対応済み | — |
 | `tako_orchestrator_workers` | 対応済み | — |
-| `tako_orchestrator_report` | 未対応 | ペイン外からの採取（scrollback）に到達手段が要る。psmux 等の器を導入していない Windows では取得できない <br />追跡: [#519](https://github.com/takushio2525/tako/issues/519) |
+| `tako_orchestrator_report` | 一部対応 | psmux（tmux 互換の永続化バックエンド）を導入していれば scrollback を採れる。未導入なら claude の transcript からのみ報告を作る（他のエージェントでは報告が取れない）。psmux は折返し行の結合に対応しないため、長い行は折り返されたまま出る |
 | `tako_orchestrator_respond` | 対応済み | — |
 | `tako_orchestrator_dialog` | 対応済み | — |
 | `tako_orchestrator_handoff` | 対応済み | — |
