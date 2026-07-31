@@ -154,9 +154,9 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
-| `tako_open_file` | 一部対応 | コード・Markdown・画像は表示できる。PDF と動画は macOS 実装のため表示できない |
-| `tako_preview_view` | 一部対応 | 画像のズーム・パンは動く。PDF は macOS 実装のため開けず操作対象にならない |
-| `tako_preview_outline` | 対応済み | — |
+| `tako_open_file` | 一部対応 | コード・Markdown・画像・PDF は表示できる。動画は macOS 実装のため表示できない |
+| `tako_preview_view` | 対応済み | — |
+| `tako_preview_outline` | 一部対応 | Markdown の目次と PDF のページ送りは動く。PDF 自身の目次（しおり）を取り出す API が Windows の PDF レンダラに無いため、しおりだけが空になる |
 | `tako_preview_reload` | 対応済み | — |
 | `tako_preview_cache` | 対応済み | — |
 | `tako_preview_changelog` | 対応済み | — |
@@ -168,8 +168,8 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_preview_undo` | 対応済み | — |
 | `tako_preview_redo` | 対応済み | — |
 | `tako_preview_autosave` | 対応済み | — |
-| `tako_preview_link_list` | 未対応 | PDF プレビュー専用の操作。PDF の描画が macOS（PDFKit）実装のため Windows では開けない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
-| `tako_preview_follow_link` | 未対応 | PDF プレビュー専用の操作。PDF の描画が macOS（PDFKit）実装のため Windows では開けない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
+| `tako_preview_link_list` | 未対応 | PDF の表示・ズーム・ページ送りは動く。リンク注釈を取り出す API が Windows の PDF レンダラに無いため、リンクは常に 0 件になる <br />追跡: [#693](https://github.com/takushio2525/tako/issues/693) |
+| `tako_preview_follow_link` | 未対応 | PDF の表示・ズーム・ページ送りは動く。リンク注釈を取り出す API が Windows の PDF レンダラに無いため、リンクは常に 0 件になる <br />追跡: [#693](https://github.com/takushio2525/tako/issues/693) |
 | `tako_pin_preview` | 対応済み | — |
 | `tako_video_playback` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
 | `tako_video_seek` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |

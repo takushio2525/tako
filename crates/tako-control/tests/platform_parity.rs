@@ -390,6 +390,49 @@ fn 器のライフサイクルの直呼びが境界の外に残っていない()
     );
 }
 
+/// **#521 の受け入れ**: PDF レンダラの直接呼び出しが、抽象境界 B12 の外に残っていないこと。
+///
+/// PDF は OS ごとにまったく別の API（macOS = Core Graphics / PDFKit、
+/// Windows = `Windows.Data.Pdf`）で描く。呼び出し側に `#[cfg(target_os = …)]` を足して
+/// 分岐すると、OS が増えるたびに `preview.rs` が膨らむ。**分岐は境界の内側だけ**という
+/// 設計原則 1 を守る番犬で、新しい直呼びが増えたらここで落ちる。
+#[test]
+fn pdfレンダラの直呼びが境界の外に残っていない() {
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/tako-app/src/platform/pdf/macos.rs",
+            "境界 B12 の macOS 実装（Core Graphics / PDFKit）",
+        ),
+        (
+            "crates/tako-app/src/platform/pdf/windows.rs",
+            "境界 B12 の Windows 実装（Windows.Data.Pdf）",
+        ),
+    ];
+    // OS 固有の PDF API を名指しで見る（コメント中の言及ではなく、実際に呼ぶ形）
+    const PATTERNS: &[&str] = &[
+        // macOS
+        "CGPDFDocument",
+        "CGContextDrawPDFPage",
+        "name = \"PDFKit\"",
+        // Windows
+        "windows::Data::Pdf",
+        "PdfPageRenderOptions",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let src = root.join("crates").join(crate_dir).join("src");
+        collect_direct_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "PDF レンダラの直呼びが境界の外にある:\n  {}\n\
+         → tako-app の platform::pdf 経由にしてください（#521 / 設計 §2 の B12）",
+        offenders.join("\n  ")
+    );
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///
