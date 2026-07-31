@@ -386,10 +386,15 @@ pub fn mark_closed_by_pane(pane: u64, reason: &str) -> Result<(), String> {
     let Some(path) = registry_path() else {
         return Ok(());
     };
+    mark_closed_by_pane_at(&path, pane, reason)
+}
+
+/// `mark_closed_by_pane` のパス指定版（テスト用。実体はこちら）
+pub fn mark_closed_by_pane_at(path: &Path, pane: u64, reason: &str) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
-    let hit = WorkerRegistry::load_from(&path)?
+    let hit = WorkerRegistry::load_from(path)?
         .workers
         .values()
         .any(|e| e.pane == pane && e.is_active());
@@ -397,7 +402,7 @@ pub fn mark_closed_by_pane(pane: u64, reason: &str) -> Result<(), String> {
         return Ok(());
     }
     let now = crate::sessions::now_iso();
-    WorkerRegistry::mutate_at(&path, |reg| {
+    WorkerRegistry::mutate_at(path, |reg| {
         for entry in reg.workers.values_mut() {
             if entry.pane == pane && entry.is_active() {
                 entry.status = "closed".into();
@@ -1361,21 +1366,20 @@ mod tests {
 
     #[test]
     fn mark_closed_by_paneは該当が無ければ書き込まない() {
-        // registry_path() は cfg(test) でプロセス固有の一時ファイルへ固定される
-        let Some(path) = registry_path() else {
-            return;
-        };
+        // 専用ファイルで検証する（registry_path() の共有ファイルを使うと
+        // 同じプロセスの他テストの登録と混ざる）
+        let path = temp_registry_file("mark-closed-noop");
         let id = register_at(&path, sample_record(1234));
         let before = std::fs::read_to_string(&path).unwrap();
         // worker でないペインの close（全ペインの close 経路から呼ばれる）
-        mark_closed_by_pane(999_999, "explicit_close").unwrap();
+        mark_closed_by_pane_at(&path, 999_999, "explicit_close").unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             before,
             "該当なしでファイルを書き換えない"
         );
         // 該当があれば倒す
-        mark_closed_by_pane(1234, "explicit_close").unwrap();
+        mark_closed_by_pane_at(&path, 1234, "explicit_close").unwrap();
         let reg = WorkerRegistry::load_from(&path).unwrap();
         assert_eq!(reg.workers[&id].status, "closed");
         let _ = std::fs::remove_file(&path);
