@@ -5072,6 +5072,26 @@ impl TakoApp {
         }
     }
 
+    /// 明示 close されたペインの worker レジストリエントリを closed にする（#658）。
+    ///
+    /// dispatch の Close（CLI / MCP 経由）は以前から記録していたが、GUI 経路
+    /// （× ボタン・cmd+W・タブ close）は記録しておらず、**器ごと殺した worker が
+    /// active のまま残り続けていた**（#658 の残骸の主因）。
+    /// `CloseReason::Exited`（PTY 死亡）は #390 の方針どおり倒さない
+    /// ——「ペインが消えても worker は生きている」追跡を維持するため。
+    /// セカンダリモードはプライマリのレジストリを触らない
+    fn mark_worker_closed(&self, pane_id: PaneId, reason: CloseReason) {
+        if reason != CloseReason::Explicit || self.secondary {
+            return;
+        }
+        if let Err(e) = tako_control::orchestrator::registry::mark_closed_by_pane(
+            pane_id.as_u64(),
+            "explicit_close",
+        ) {
+            eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+        }
+    }
+
     fn remove_pane_with(&mut self, pane_id: PaneId, reason: CloseReason, cx: &mut Context<Self>) {
         let Some(tab_id) = self
             .workspace
@@ -5148,6 +5168,7 @@ impl TakoApp {
                 self.dock_webview_of(pane_id);
                 self.drop_tmux_view_session(pane_id);
                 self.drop_backend_session_with(pane_id, reason);
+                self.mark_worker_closed(pane_id, reason);
             }
             Err(_) => {
                 // LastPane: タブごと閉じる
@@ -5207,6 +5228,7 @@ impl TakoApp {
                     self.dock_webview_of(id);
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
+                    self.mark_worker_closed(id, reason);
                 }
             }
             Err(_) => {
@@ -5229,6 +5251,7 @@ impl TakoApp {
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
+                    self.mark_worker_closed(id, reason);
                 }
                 // ペインログの最終フラッシュ（Issue #112 B。アプリ終了直前に書き残す）
                 for (id, data) in log_closes {
@@ -16741,6 +16764,43 @@ fn open_viewport_window(
     }
 }
 
+/// セルフテスト起動（`TAKO_SELF_TEST=1`）で本番から隔離する env の既定値（Issue #658）。
+///
+/// セルフテストは**データディレクトリを本番のまま**使う（layout.json は secondary
+/// モードで触らない、settings.json は書かない、という個別の作り込みで守ってきた）。
+/// そのため data_dir 配下に新しい永続ファイルが増えるたびに隔離漏れが生まれる:
+/// 実際 workers.yaml（#390）と orchestrator/（ledger.yaml・projects.yaml）は漏れており、
+/// 項目 72（#165 のレイアウト検証）の spawn 4 件が**本番のレジストリと台帳**に
+/// 積まれていた（#658 で 9 日間 active のまま残っているのを実測）。
+///
+/// 隔離対象を 1 箇所に集めて宣言し、テストで固定する。呼び出し側は「未設定のときだけ
+/// 入れる」ので、明示指定（TAKO_ISOLATED / 検証スクリプト）は常に尊重される
+fn self_test_isolation_defaults(
+    pid: u32,
+    tmp: &std::path::Path,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    vec![
+        // セッションカタログ / ペインログ（Issue #112）
+        (
+            "TAKO_SESSIONS_FILE",
+            tmp.join(format!("tako-st-sessions-{pid}.yaml")),
+        ),
+        (
+            "TAKO_PANE_LOG_DIR",
+            tmp.join(format!("tako-st-pane-logs-{pid}")),
+        ),
+        // worker レジストリ（Issue #390）と orchestrator 設定 = 台帳 / プロジェクト（#292 / #303）
+        (
+            "TAKO_WORKERS_FILE",
+            tmp.join(format!("tako-st-workers-{pid}.yaml")),
+        ),
+        (
+            "TAKO_ORCHESTRATOR_DIR",
+            tmp.join(format!("tako-st-orchestrator-{pid}")),
+        ),
+    ]
+}
+
 fn main() {
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
@@ -16823,19 +16883,14 @@ fn main() {
             std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
     }
-    // セルフテストはセッションカタログ / ペインログ（Issue #112）も本番から隔離する
+    // セルフテストは本番の永続ファイルへ触らない（Issue #112 / #658）。
+    // 隔離対象の一覧は self_test_isolation_defaults が正（漏れをテストで固定してある）
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
-        if std::env::var_os("TAKO_SESSIONS_FILE").is_none() {
-            std::env::set_var(
-                "TAKO_SESSIONS_FILE",
-                std::env::temp_dir().join(format!("tako-st-sessions-{}.yaml", std::process::id())),
-            );
-        }
-        if std::env::var_os("TAKO_PANE_LOG_DIR").is_none() {
-            std::env::set_var(
-                "TAKO_PANE_LOG_DIR",
-                std::env::temp_dir().join(format!("tako-st-pane-logs-{}", std::process::id())),
-            );
+        for (key, value) in self_test_isolation_defaults(std::process::id(), &std::env::temp_dir())
+        {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+            }
         }
     }
     // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
@@ -17901,6 +17956,31 @@ mod self_test {
             let wait = |cx: &mut AsyncApp, ms: u64| {
                 cx.background_executor().timer(Duration::from_millis(ms))
             };
+
+            // 0. 隔離の前提条件（#658）: セルフテストが本番の orchestrator 状態
+            //    （workers.yaml / orchestrator/ の ledger・projects）へ書かないこと。
+            //    項目 72 の spawn 4 件が本番レジストリに積まれ、9 日間 active のまま
+            //    残っていた実害の再発防止。**必ず最初に検査する**——隔離は他の全項目の
+            //    前提であり、どれか 1 つでも本番へ書いてしまってからでは遅い
+            {
+                let data_dir = tako_core::paths::data_dir();
+                let registry = tako_control::orchestrator::registry::registry_path();
+                let orch = tako_control::orchestrator::config_dir();
+                // データディレクトリ配下（= 実運用の workers.yaml / orchestrator/）を
+                // 指していたら隔離漏れ。TAKO_ISOLATED の有無に関係なく専用の一時パスを使う
+                let outside = |p: &Option<std::path::PathBuf>| match (p, &data_dir) {
+                    (Some(p), Some(dir)) => !p.starts_with(dir),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if let (Some(r), Some(o)) = (&registry, &orch) {
+                    println!("selftest isolation: workers={} orchestrator={}", r.display(), o.display());
+                }
+                check(
+                    outside(&registry) && outside(&orch),
+                    "セルフテストの worker レジストリ / orchestrator 設定が本番の外",
+                );
+            }
 
             // 1. 起動 + 素の入力経路
             wait(cx, 2500).await;
@@ -25432,6 +25512,45 @@ mod scroll_tests {
         let (lines, carry) = accumulate_scroll(0.9, -0.4);
         assert_eq!(lines, 0);
         assert!((carry + 0.4).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod self_test_isolation_tests {
+    use super::self_test_isolation_defaults;
+
+    /// #658: セルフテストが本番の永続ファイルへ書かないことを、隔離対象の宣言で固定する。
+    /// data_dir 配下に永続ファイルが増えたらここへ足す（足し忘れ = 本番汚染）
+    #[test]
+    fn セルフテストはorchestrator状態を本番から隔離する() {
+        let tmp = std::path::Path::new("/tmp/isolated");
+        let vars = self_test_isolation_defaults(4242, tmp);
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        for required in [
+            "TAKO_SESSIONS_FILE",
+            "TAKO_PANE_LOG_DIR",
+            // #658 の本体: worker レジストリ（workers.yaml）と台帳 / プロジェクト
+            "TAKO_WORKERS_FILE",
+            "TAKO_ORCHESTRATOR_DIR",
+        ] {
+            assert!(
+                keys.contains(&required),
+                "{required} がセルフテストの隔離対象から漏れている"
+            );
+        }
+        // 全ての行き先が隔離ディレクトリ配下 + プロセス固有（並行実行で衝突しない）
+        for (key, path) in &vars {
+            assert!(
+                path.starts_with(tmp),
+                "{key} の行き先が隔離ディレクトリの外にある: {}",
+                path.display()
+            );
+            assert!(
+                path.to_string_lossy().contains("4242"),
+                "{key} の行き先が pid で分かれていない: {}",
+                path.display()
+            );
+        }
     }
 }
 

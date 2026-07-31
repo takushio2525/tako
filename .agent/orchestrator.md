@@ -385,6 +385,26 @@ error（異常停止。#157）のときは応答に `error.kind` / `error.detail
 | `--pane` | ○ | ペイン ID |
 | `--session-id` | | claude の session ID |
 
+### `tako orchestrator workers`（レジストリ。Issue #390 / #658）
+
+spawn 済み worker を**ペインの生死と無関係に**列挙する（`<data_dir>/workers.yaml`）。
+tako を再起動してペインが消えても、`tmux_session` / `session_id` 経由で
+watch / status / report を続けられる。既定は active のみ、`--all` で closed も出す。
+
+エントリの寿命:
+
+| 遷移 | きっかけ |
+|---|---|
+| active → closed（`explicit_close`） | ペイン / タブを明示的に閉じた（CLI・MCP・GUI のどの経路でも） |
+| active → closed（`superseded`） | 同じペイン番号へ新しい worker を spawn した |
+| active → closed（`gone`） | ペインも器（tmux / psmux）も **5 分以上続けて**観測できない（GC。#658） |
+
+GC は `workers` の列挙のついでに走る（別コマンドは要らない）。**1 回の観測では倒さない**
+——器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、といった
+過渡状態で生きている worker を落とさないため、`dead_since` を刻んでから確認期間を待つ。
+closed にしても `resume_command` / `report --worker` / `workers --all` は引けるので、
+突然死からの復旧材料（#390）は失われない。
+
 ### `tako orchestrator supervisor`（常時監視。Issue #665）
 
 **全 worker を 1 本のループで監視する。master は監視を張らないし、張り直さない。**

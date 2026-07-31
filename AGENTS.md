@@ -88,7 +88,7 @@ tako/
 | **worker 常時監視（再アーム不要。#665）** | `tako orchestrator supervisor watch`（全 worker のイベントを流し続ける。Monitor から 1 本張るだけ）/ `serve`（常駐本体・シングルトン）/ `events [--cursor N]`（取りこぼしなく 1 回読む）/ `stop`。MCP は `tako_orchestrator_supervisor { action: "events", cursor }` |
 | オーケストレーター worker 監視（単発） | `tako orchestrator watch --pane <N>` または `--worker <ID>`（1 イベントで終了。レジストリ自動補完でペイン消失後も追跡継続。#390） |
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]`（scrollback + transcript 2 層。`--worker <ID>` でペイン消失後も取得可。MCP `tako_orchestrator_report` と 1:1。#364/#390） |
-| オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]`（spawn 済み worker をペインの生死と無関係に列挙。prompt 未達・突然死の resume コマンドも表示。MCP `tako_orchestrator_workers` と 1:1。#390） |
+| オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]`（spawn 済み worker をペインの生死と無関係に列挙。prompt 未達・突然死の resume コマンドも表示。列挙のついでに、ペインも器も 5 分以上見えない active を closed（gone）へ倒す。MCP `tako_orchestrator_workers` と 1:1。#390 / #658） |
 | **worker の対話ダイアログを読む（#662）** | `tako orchestrator dialog --pane <N>`（AskUserQuestion の質問文・選択肢を **transcript から全文で** 取得。ペイン幅に依存しない。MCP `tako_orchestrator_dialog` と 1:1） |
 | **worker のダイアログに答える（#319/#662）** | `tako orchestrator respond --pane <N> --answer <値>...`（質問ごとに 1 回。番号 or ラベル前方一致、multiSelect はカンマ区切り、`質問=選択肢` で明示指定。`--dry-run` で確認画面まで。承認ダイアログは `--choice`。送信前に確認画面を照合し不一致なら送らない。MCP `tako_orchestrator_respond` と 1:1） |
 | **ペインへ特殊キーを送る（#662）** | `tako keys --pane <N> <キー名>...`（`enter` / `escape` / `tab` / 矢印 / `ctrl-<英字>` / 1 文字リテラル。送達確認ループを通らない生キー送出。MCP `tako_send_keys` と 1:1） |

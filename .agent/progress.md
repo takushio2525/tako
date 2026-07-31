@@ -1597,3 +1597,16 @@
   隔離実測で発覚して設計変更）。未登録キーはペインを作る前に登録済みキーを添えて失敗
 - 関連: PR（Closes #653）。claude をスタブへ差し替えた隔離 e2e で、起動プロセスが受け取った
   `CLAUDE_CONFIG_DIR` を継承あり / なしの 2 条件 × 5 ケースで実測
+
+## 2026-07-31（#658: セルフテストのレジストリ汚染 + 死んだ worker エントリの GC）
+- 隔離漏れ: `TAKO_SELF_TEST=1` は data_dir を本番のまま使う作りで、あとから増えた
+  workers.yaml（#390）と orchestrator/（ledger・projects）に逃げ先が無く、項目 72 の
+  spawn 4 件が本番へ積まれていた。隔離対象を `self_test_isolation_defaults` へ集約 +
+  `TAKO_ORCHESTRATOR_DIR` 新設 + セルフテスト項目 0（最初に走る隔離検査）
+- GC: GUI 経路の close（× / cmd+W / タブ close）が無記録だったのを dispatch と同じ扱いに。
+  加えて `workers` の列挙で「ペインも器も見えない」active に `dead_since` を刻み、
+  5 分続いたものだけ closed（gone）へ倒す。1 回の観測では倒さないので過渡状態で生き物を
+  落とさない。表示と GC の判定は `liveness()` に一本化
+- 関連: PR #701（Closes #658）。擬似本番 data_dir での A/B 実測（修正前 = 70→71 件へ混入 /
+  修正後 = ハッシュ不変）+ 人工 dead エントリの回収 + 稼働中 worker の非回収を隔離実測。
+  本番の残骸 3 件（44/46/55）は死亡を 2 系統で確認して closed へ（active 9 → 6）
