@@ -859,17 +859,20 @@ fn dispatch_inner(
                 Some(r) => r,
                 None => {
                     if let Some(ref ts) = tmux_session {
-                        let (session, access) =
-                            crate::reach::detached_session(ts).ok_or_else(|| {
+                        // 読むだけなので**採取の到達手段**を問う（#519）。
+                        // 送出を問うと psmux のように「読めるが送れない」器で
+                        // 読めるはずの経路まで塞がる
+                        let (session, capture) =
+                            crate::reach::detached_capture(ts).ok_or_else(|| {
                                 DispatchError::Operation(
                                     crate::reach::UnreachableReason::NoDetachedAccess {
                                         session: ts.clone(),
-                                        note: crate::reach::no_detached_access_note(),
+                                        note: crate::reach::no_detached_capture_note(),
                                     }
                                     .note(),
                                 )
                             })?;
-                        let captured = access
+                        let captured = capture
                             .capture_screen(&session)
                             .map_err(|e| DispatchError::Operation(e.to_string()))?;
                         (pane.unwrap_or(0), captured, None)
@@ -930,6 +933,17 @@ fn dispatch_inner(
                     "offset": offset,
                     "history": history,
                 }));
+            }
+            // 器がスクロールを持つペイン（psmux。#687）。外側 alacritty は器の
+            // attach クライアントの alt screen なので履歴が 1 行も積まれず、
+            // 下の `scroll_to` / `scroll_display` には動かせる余地が無い
+            // （応答だけ offset 0 / history 0 で成功を装っていた）
+            if let Some(backend_session) = host.backend_session(target) {
+                if let Some(result) =
+                    scroll_backend_owned_pane(session, &backend_session, target.as_u64(), to, delta)
+                {
+                    return Ok(result);
+                }
             }
             match (to, delta) {
                 (Some(offset), None) => session.scroll_to(offset as usize),
@@ -5199,11 +5213,202 @@ fn dispatch_orchestrator_report(
     Ok(result)
 }
 
-/// 折返し結合済みのスクロールバックを取得する（報告の第 1 層）。
-/// 実際の採取は永続バックエンドの到達手段（`DetachedAccess`）が担う
+// --- 器がスクロールを持つペインの CLI / MCP スクロール（#687） -----------------
+
+/// 1 リクエストで許す位置読み戻し（サブプロセス）の回数。
+/// **UI スレッドで動く**ので、正確さより上限の固さを優先する
+const BACKEND_SCROLL_MAX_PROBES: u32 = 4;
+
+/// 送ったホイール報告が器へ届いて位置に反映されるまでの猶予。
+///
+/// 経路は tako → 外側 PTY → 器のクライアント（別プロセス）→ 器のサーバー、と
+/// **プロセスを 2 回跨ぐ**。40ms では反映前に読んでしまい「動かなかった」と誤判定して
+/// 余分に撃つ（隔離実測で確認）。とくに**初回は器が copy mode へ入る分だけ遅い**ので、
+/// 動きが見えないときは [`BACKEND_SCROLL_SETTLE_RETRIES`] 回まで待ち直す
+const BACKEND_SCROLL_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 1 発ぶんの反映を待ち直す回数。動きが見えたら即抜けるので、
+/// 追加コストを払うのは「まだ届いていない」ときだけ
+const BACKEND_SCROLL_SETTLE_RETRIES: u32 = 2;
+
+/// 最下部へ戻すときに上乗せするイベント数。
+///
+/// **最下部で止まりきらないと器が copy mode に居残り、以後の打鍵が食われる**（#686）。
+/// 下方向へ行き過ぎるのは無害（器が最下部でクランプして copy mode を抜ける）なので、
+/// ユーザーがホイールを余分に回すのと同じことを明示的にやる
+const BACKEND_SCROLL_BOTTOM_MARGIN: i32 = 12;
+
+/// 器が 1 ホイールイベントで何行動くか（ミリ単位。プロセス内で学習してキャッシュする）。
+///
+/// 器の実装で決まる定数（tmux 既定は 3 行 / 5 行。**psmux 3.3.7 は実測 3 行**）だが、
+/// 器に問い合わせる手段が無いので**実際に動かして測る**。1 度測れば以降の
+/// リクエストは 1 発で寄るので、往復（= サブプロセスと待ち）が減る。
+/// 初期値を 1.0 にしてあるのは、粒度が分かるまでは**行き過ぎない側**に倒すため
+static BACKEND_SCROLL_LINES_PER_EVENT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1000);
+
+fn learned_lines_per_event() -> f32 {
+    BACKEND_SCROLL_LINES_PER_EVENT.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+fn learn_lines_per_event(value: f32) {
+    let milli = (value.clamp(0.05, 50.0) * 1000.0) as u32;
+    BACKEND_SCROLL_LINES_PER_EVENT.store(milli, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 器がスクロールを持つペインを CLI / MCP から動かす（#687）。
+///
+/// psmux の attach クライアントは alt screen なので、外側 alacritty には履歴が
+/// 1 行も積まれない。`TerminalSession::scroll_display` / `scroll_to` には動かせる
+/// 余地が無く、これまでは応答だけ `offset: 0 / history: 0` で成功を装っていた。
+///
+/// ここでやること:
+///
+/// 1. **書きはユーザーのホイールと同じ経路**（in-process の PTY への SGR 報告）。
+///    器へサブプロセスで書き込まない（#212 / #168 で UI スレッドから排除した
+///    種類の同期サブプロセスを打鍵経路へ戻さない）。#654 が確立した
+///    「psmux 自身に copy mode / 内側アプリ転送を振り分けさせる」形をそのまま使う
+/// 2. **読みは読み取り専用の到達手段**（`DetachedCapture::scroll_probe`）。
+///    応答に器の実位置を載せるので、もう嘘をつかない
+/// 3. 1 ホイールイベントが何行動くかは器の実装依存（tmux 既定は 3 / 5 行）なので、
+///    1 往復目の実測から学習して 1 回だけ補正する
+///
+/// `None` を返す = この経路の対象外（呼び出し側は従来の直接ペイン経路へ倒す）
+fn scroll_backend_owned_pane(
+    session: &tako_core::TerminalSession,
+    backend_session: &str,
+    pane: u64,
+    to: Option<u64>,
+    delta: Option<i32>,
+) -> Option<Value> {
+    // 外側 alacritty が履歴を持っているなら、そちらが正（macOS の直接ペイン・
+    // persist OFF のペインはここへ来ない）
+    if session.history_size() > 0 {
+        return None;
+    }
+    // 器へホイールを届けられないペインでは何もできない。**サブプロセスを起こす前に**
+    // 弾く（`send_wheel_report` の判定と同じ条件を先取りする粗いフィルタ）
+    if !session.mouse_reporting() && !session.is_alt_screen() {
+        return None;
+    }
+    let (sref, capture) = crate::reach::detached_capture(backend_session)?;
+    let probe = capture.scroll_probe(&sref)?;
+
+    // 内側アプリが alt screen（claude 等の TUI）= スクロール位置は内側アプリが持つ。
+    // ホイール報告は器が内側へ転送するのでスクロール自体は効くが、位置は読めない
+    if probe.alternate {
+        let lines = delta.unwrap_or(0);
+        let sent = session.send_wheel_report(lines, 0, 0);
+        return Some(json!({
+            "pane": pane,
+            "offset": 0,
+            "history": 0,
+            "via": "app",
+            "sent_events": sent.unsigned_abs(),
+            "note": "ペイン内のアプリが全画面（alt screen）のため、スクロール位置はそのアプリが持つ。\
+                     ホイール報告は転送したが位置は読み取れない（to での絶対指定はできない）",
+        }));
+    }
+
+    let goal = scroll_goal(probe.position, probe.history, to, delta);
+    let mut current = probe;
+    // 1 イベント = 何行か。プロセス内で学習済みの値から始め、実測で更新する
+    let mut lines_per_event = learned_lines_per_event();
+    let mut sent_total: u32 = 0;
+    let mut probes: u32 = 1;
+    while probes < BACKEND_SCROLL_MAX_PROBES {
+        let mut events = wheel_events_for(goal as i64 - current.position as i64, lines_per_event);
+        // 最下部へ戻すときは撃ち足す（止まりきらないと copy mode に居残る。#686）
+        if goal == 0 && events < 0 {
+            events -= BACKEND_SCROLL_BOTTOM_MARGIN;
+        }
+        if events == 0 {
+            break;
+        }
+        let sent = session.send_wheel_report(events, 0, 0);
+        if sent == 0 {
+            // 転送経路ではない = 器へホイールを届けられない。嘘をつかず対象外にする
+            return None;
+        }
+        sent_total += sent.unsigned_abs();
+        // 反映を待つ。**動きが見えるまで待ち直す**のが要点で、1 回読んで動いていない
+        // だけで諦めると、まだ届いていない位置をそのまま応答に載せてしまう（#687 の嘘）
+        let mut moved = 0i64;
+        for _ in 0..BACKEND_SCROLL_SETTLE_RETRIES {
+            if probes >= BACKEND_SCROLL_MAX_PROBES {
+                break;
+            }
+            std::thread::sleep(BACKEND_SCROLL_SETTLE);
+            let next = capture.scroll_probe(&sref)?;
+            probes += 1;
+            moved = next.position as i64 - current.position as i64;
+            current = next;
+            if moved != 0 {
+                break;
+            }
+        }
+        if moved == 0 {
+            break; // これ以上寄らない（履歴端 / 器が受け取っていない）
+        }
+        // 最下部へのクランプが混ざった往復は粒度の材料にしない（実際より小さく見える）
+        if !(goal == 0 && current.position == 0) {
+            lines_per_event = (moved.unsigned_abs() as f32 / sent.unsigned_abs() as f32).max(0.05);
+            learn_lines_per_event(lines_per_event);
+        }
+    }
+
+    Some(json!({
+        "pane": pane,
+        "offset": current.position,
+        "history": current.history,
+        "via": "backend_wheel",
+        "requested": goal,
+        "sent_events": sent_total,
+        "in_mode": current.in_mode,
+        "lines_per_event": lines_per_event,
+    }))
+}
+
+/// スクロールの目標位置（最下部からの遡り行数）を決める（純関数）。
+/// `to` は絶対、`delta` は現在位置からの相対。どちらも履歴の範囲へクランプする
+fn scroll_goal(position: usize, history: usize, to: Option<u64>, delta: Option<i32>) -> usize {
+    let raw = match (to, delta) {
+        (Some(t), _) => t as i64,
+        (None, Some(d)) => position as i64 + d as i64,
+        (None, None) => position as i64,
+    };
+    raw.clamp(0, history as i64) as usize
+}
+
+/// 残り行数を埋めるために撃つホイールイベント数（純関数）。
+///
+/// **四捨五入**して、器の粒度より細かい残りでは撃たない（0 を返す）のが要点。
+/// 器が 1 イベントで複数行動く実装（tmux 既定は 3 / 5 行）では、残り 1 行のために
+/// 1 イベント撃つと必ず行き過ぎ、次の往復で逆へ撃ち返して振動する。
+/// **器の粒度で表せない位置には寄せられない**ので、そこで止めて実位置を正直に返す
+fn wheel_events_for(remaining: i64, lines_per_event: f32) -> i32 {
+    if remaining == 0 {
+        return 0;
+    }
+    let per = lines_per_event.max(0.05);
+    let raw = (remaining.unsigned_abs() as f32 / per).round();
+    // 粒度が 1 行以下なら必ず 1 イベントは撃てる（残り 1 行を埋められる）
+    let raw = raw.max(if per <= 1.0 { 1.0 } else { 0.0 });
+    let events = raw.min(tako_core::terminal::PROGRAMMATIC_WHEEL_MAX as f32) as i32;
+    if remaining > 0 {
+        events
+    } else {
+        -events
+    }
+}
+
+/// スクロールバックを 1 本のテキストで取得する（報告の第 1 層）。
+///
+/// 実際の採取は永続バックエンドの**採取**手段（`DetachedCapture`）が担う（#519）。
+/// tmux は折返し行を結合して返し、psmux は結合せず行のまま返す（中身は落ちない）
 fn capture_scrollback_joined(session: &str, lines: usize) -> Option<String> {
-    let (session, access) = crate::reach::detached_session(session)?;
-    access.capture_history_joined(&session, lines)
+    let (session, capture) = crate::reach::detached_capture(session)?;
+    capture.capture_history_joined(&session, lines)
 }
 
 /// OrchestratorHandoff — master の引き継ぎ（#193）。
@@ -6070,14 +6275,15 @@ fn finish_worker_status(
         ("gone".to_string(), None)
     };
 
-    // ペインの最近の出力（pane のライブ画面 → tmux session フォールバック）
+    // ペインの最近の出力（pane のライブ画面 → backend session フォールバック）。
+    // 読むだけなので採取の到達手段で足りる（#519。psmux でも通る）
     let recent_output = live_tail.or_else(|| {
         let ts = tmux_session?;
         if !crate::reach::session_alive(ts) {
             return None;
         }
-        let (session, access) = crate::reach::detached_session(ts)?;
-        Some(tail_join(access.capture_screen(&session).ok()?))
+        let (session, capture) = crate::reach::detached_capture(ts)?;
+        Some(tail_join(capture.capture_screen(&session).ok()?))
     });
 
     // #390: エージェントプロセスの生存シグナル（突然死判定専用）。
@@ -6382,12 +6588,13 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         None
     };
 
-    // #364: 履歴サイズ計測（agent 非依存の busy シグナル布石）
+    // #364: 履歴サイズ計測（agent 非依存の busy シグナル布石）。
+    // 採取の到達手段で足りる（#519）。`bytes` は器によっては観測できず 0 になる
     let history_info = tmux_session
         .as_ref()
         .and_then(|ts| {
-            let (session, access) = crate::reach::detached_session(ts)?;
-            access.history_probe(&session)
+            let (session, capture) = crate::reach::detached_capture(ts)?;
+            capture.history_probe(&session)
         })
         .map(|p| json!({ "lines": p.history, "bytes": p.bytes }));
 
@@ -8556,6 +8763,74 @@ mod tests {
     use super::*;
     use crate::protocol::Axis;
     use tako_core::TerminalSession;
+
+    // --- #687: 器がスクロールを持つペインのスクロール計算 ---
+
+    #[test]
+    fn スクロール目標は履歴の範囲へクランプされる() {
+        // to = 絶対位置（0 = 最下部）
+        assert_eq!(scroll_goal(0, 279, Some(100), None), 100);
+        assert_eq!(scroll_goal(50, 279, Some(0), None), 0);
+        // 履歴より先へは行けない（器が持っていない行は表示できない）
+        assert_eq!(scroll_goal(0, 279, Some(9999), None), 279);
+        // delta = 現在位置からの相対
+        assert_eq!(scroll_goal(10, 279, None, Some(5)), 15);
+        assert_eq!(scroll_goal(10, 279, None, Some(-5)), 5);
+        // 最下部より下へは行けない
+        assert_eq!(scroll_goal(3, 279, None, Some(-99)), 0);
+        assert_eq!(scroll_goal(3, 279, None, Some(9999)), 279);
+        // 履歴 0（alt screen 直後など）はどう指定しても最下部
+        assert_eq!(scroll_goal(0, 0, Some(50), None), 0);
+        // 引数なしは現在位置のまま（呼び出し側が上流で弾くが、ここでも動かさない）
+        assert_eq!(scroll_goal(7, 279, None, None), 7);
+    }
+
+    #[test]
+    fn ホイールイベント数は器の粒度で決まる() {
+        // 1 イベント = 1 行の器: 残りをそのままイベント数にできる
+        assert_eq!(wheel_events_for(10, 1.0), 10);
+        assert_eq!(wheel_events_for(-10, 1.0), -10);
+        assert_eq!(wheel_events_for(0, 1.0), 0);
+
+        // 1 イベント = 3 行の器: 四捨五入で寄せる
+        assert_eq!(wheel_events_for(9, 3.0), 3);
+        assert_eq!(wheel_events_for(10, 3.0), 3);
+        assert_eq!(wheel_events_for(11, 3.0), 4);
+
+        // **器の粒度より細かい残りでは撃たない**（撃つと行き過ぎて振動する）
+        assert_eq!(wheel_events_for(1, 5.0), 0);
+        assert_eq!(wheel_events_for(-2, 5.0), 0);
+        // 粒度が 1 行以下なら残り 1 行も埋められる
+        assert_eq!(wheel_events_for(1, 1.0), 1);
+        assert_eq!(wheel_events_for(1, 0.5), 2);
+
+        // 1 リクエストの上限で頭打ちにする（単一 write のサイズを抑える）
+        let max = tako_core::terminal::PROGRAMMATIC_WHEEL_MAX;
+        assert_eq!(wheel_events_for(100_000, 1.0), max);
+        assert_eq!(wheel_events_for(-100_000, 1.0), -max);
+    }
+
+    /// 学習した粒度で 2 往復目が目標へ寄ることの確認（閉ループの算数だけを検証する）
+    #[test]
+    fn 粒度を学習すると2往復目で目標へ寄る() {
+        // 器は 1 イベント 5 行動く。1 往復目は「1 行 = 1 イベント」と仮置きするので
+        // 行き過ぎるが、実測から粒度を学習して 2 往復目で戻る
+        let per_actual = 5.0f32;
+        let goal = 40i64;
+        let mut position = 0i64;
+
+        let events = wheel_events_for(goal - position, 1.0);
+        assert_eq!(events, 40, "1 往復目は仮置きの粒度で撃つ");
+        position += (events as f32 * per_actual) as i64;
+        assert_eq!(position, 200, "行き過ぎる");
+
+        let learned = (position as f32 / events as f32).max(0.05);
+        assert_eq!(learned, per_actual, "1 往復の実測から粒度が分かる");
+        let events2 = wheel_events_for(goal - position, learned);
+        assert_eq!(events2, -32);
+        position += (events2 as f32 * per_actual) as i64;
+        assert_eq!(position, goal, "2 往復目で目標へ乗る");
+    }
 
     /// セッションを起動しないテスト用ホスト（レイアウト操作の検証に使う）
     struct MockHost {

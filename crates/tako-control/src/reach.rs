@@ -17,8 +17,16 @@
 //! [`PaneReach`] はその 3 状態を網羅 match で扱わせる。バリアントを増やすと
 //! 全呼び出し側がコンパイルエラーになるため、フォールバック未記述の経路が
 //! テストより早い段階で露出する。
+//!
+//! ## 採取（読み）と送出（書き）は別に問う（#519）
+//!
+//! detached には**読みだけできる器**がある（psmux は `capture-pane` が動く一方で
+//! `paste-buffer` / `send-keys -H` が信頼できない）。だから
+//! 「画面を採りたい」経路は [`detached_capture`] を、「入力を送りたい」経路は
+//! [`detached_session`] を問う。**採取しかしない経路が送出の有無で塞がれない**ように
+//! するためで、Windows の report / read フォールバック / worker 監視はこれで通る。
 
-use tako_core::backend::{backend, DetachedAccess, SessionRef};
+use tako_core::backend::{backend, DetachedAccess, DetachedCapture, SessionRef};
 use tako_core::PaneId;
 
 use crate::host::ControlHost;
@@ -62,13 +70,33 @@ impl UnreachableReason {
     }
 }
 
-/// このバックエンドに到達手段が無いことの説明。UI・エラー・診断で同じ文字列を使う
+/// このバックエンドに**送出**の到達手段が無いことの説明。
+/// UI・エラー・診断で同じ文字列を使う。
+///
+/// 採取だけできる器（psmux）では「読めるのに送れない」が起こるので、
+/// **何ができないのかを具体的に言う**（縮退の切り分けを AI / ユーザーに委ねない）
 pub fn no_detached_access_note() -> String {
     let caps = backend().capabilities();
+    if caps.detached_capture {
+        return format!(
+            "永続バックエンド（{}）はアウトオブプロセスの画面採取だけができ、入力送出はできないため、\
+             tako-app が保持していないペインへはキーを送れない",
+            caps.label
+        );
+    }
     format!(
         "永続バックエンド（{}）にアウトオブプロセス到達手段が無いため、\
          tako-app が保持していないペインの画面採取・入力送出はできない",
         caps.label
+    )
+}
+
+/// このバックエンドに**採取**の到達手段が無いことの説明
+pub fn no_detached_capture_note() -> String {
+    format!(
+        "永続バックエンド（{}）にアウトオブプロセスの画面採取手段が無いため、\
+         tako-app が保持していないペインの画面・履歴は読めない",
+        backend().capabilities().label
     )
 }
 
@@ -133,15 +161,28 @@ pub fn session_alive(hint: &str) -> bool {
     }
 }
 
-/// セッションヒントから到達手段を引く。
+/// セッションヒントから**送出まで**できる到達手段を引く。
 ///
-/// `None` は「そのセッションへは届かない」= 名前が不正か、backend に
-/// アウトオブプロセス到達手段が無いか、のいずれか。
-/// 理由まで要るなら [`PaneReach::resolve`] を使う
+/// `None` は「そのセッションへは送れない」= 名前が不正か、backend に
+/// 送出の到達手段が無いか、のいずれか。
+/// 理由まで要るなら [`PaneReach::resolve`] を使う。
+///
+/// **採取しかしない経路でこれを使ってはいけない**（psmux のように読めるのに
+/// 送れない器で、読めるはずの経路まで塞がる）。採取は [`detached_capture`] を使う
 pub fn detached_session(hint: &str) -> Option<(SessionRef, &'static dyn DetachedAccess)> {
     let session = SessionRef::new(hint).ok()?;
     let access = backend().detached()?;
     Some((session, access))
+}
+
+/// セッションヒントから**採取**の到達手段を引く（#519）。
+///
+/// 送出できる器（tmux）はこちらも通る（`detached_capture` の既定実装が
+/// `detached` から引き上げる）。psmux は**こちらだけ**通る
+pub fn detached_capture(hint: &str) -> Option<(SessionRef, &'static dyn DetachedCapture)> {
+    let session = SessionRef::new(hint).ok()?;
+    let capture = backend().detached_capture()?;
+    Some((session, capture))
 }
 
 #[cfg(test)]
@@ -184,5 +225,36 @@ mod tests {
         let note = no_detached_access_note();
         let label = backend().capabilities().label;
         assert!(note.contains(label), "note={note} label={label}");
+        assert!(no_detached_capture_note().contains(label));
+    }
+
+    /// **#519**: 採取と送出は別々に問える。
+    /// 「読めるのに送れない」器（psmux）で、採取経路が送出の有無に巻き込まれないこと
+    #[test]
+    fn 採取と送出は別の入口として解決される() {
+        let caps = backend().capabilities();
+        // 名前が不正ならどちらも通らない（#428 の防御は両方に効く）
+        assert!(detached_session("tako-abc:0.0").is_none());
+        assert!(detached_capture("tako-abc:0.0").is_none());
+
+        // 能力の申告と入口の開閉が一致している（実装名ではなく能力で決まる）
+        assert_eq!(detached_session("tako-abc").is_some(), caps.detached_access);
+        assert_eq!(
+            detached_capture("tako-abc").is_some(),
+            caps.detached_capture
+        );
+        // 送出できるなら採取もできる（trait の supertrait 関係と 1:1）
+        assert!(!caps.detached_access || caps.detached_capture);
+    }
+
+    /// 採取だけできる器では、送出できない理由の文面が
+    /// 「何も読めない」ではなく「送れない」と言う（縮退の切り分けを誤らせない）
+    #[test]
+    fn 採取だけできる器の説明は送れないことだけを言う() {
+        let caps = backend().capabilities();
+        let note = no_detached_access_note();
+        if caps.detached_capture && !caps.detached_access {
+            assert!(note.contains("画面採取だけができ"), "note={note}");
+        }
     }
 }
