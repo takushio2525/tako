@@ -162,8 +162,14 @@ pub struct SleepGuardState {
     pub lid_sleep_disabled: bool,
     /// 蓋閉じ防止モード（#218）
     pub lid_sleep_mode: LidSleepMode,
-    /// sudoers 登録済みか（#218）
+    /// sudoers 登録済みか（#218。**macOS 固有の手段**なので Windows では常に false）
     pub sudoers_installed: bool,
+    /// 蓋閉じ継続を使うのに初回セットアップが要るか（#697）。
+    ///
+    /// `sudoers_installed` を直接見ると「sudoers を登録してください」という
+    /// macOS 専用の案内が Windows にも出てしまう。手段ではなく
+    /// **未完了かどうか**を持つことで、文言側が OS を知らずに済む
+    pub lid_setup_required: bool,
     /// thermal 状態（#218）
     pub thermal_state: ThermalState,
     /// ディスプレイ消灯を強制送信済みか（#311）
@@ -183,6 +189,8 @@ impl SleepGuardState {
             "lid_sleep_disabled": self.lid_sleep_disabled,
             "lid_sleep_mode": self.lid_sleep_mode.as_str(),
             "sudoers_installed": self.sudoers_installed,
+            "lid_control_supported": lid_control_supported(),
+            "lid_setup_required": self.lid_setup_required,
             "thermal_state": self.thermal_state.as_str(),
             "display_sleep_forced": self.display_sleep_forced,
             "description": self.description(),
@@ -227,7 +235,9 @@ impl SleepGuardState {
             match self.lid_sleep_mode {
                 LidSleepMode::Off => "蓋閉じ継続: 未設定",
                 LidSleepMode::WhileAgentsRunning => {
-                    if !self.sudoers_installed {
+                    // 手段（sudoers）ではなく「未完了か」で分岐する。
+                    // Windows は権限が要らないのでこの枝に入らない（#697）
+                    if self.lid_setup_required {
                         "蓋閉じ継続: sudoers 未登録（tako setup --lid-sleep で登録）"
                     } else if self.busy_agents == 0 {
                         "蓋閉じ継続: エージェント待機中のため無効"
@@ -502,20 +512,113 @@ const SUDOERS_CONTENT: &str = "\
 %admin ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
 ";
 
-/// 蓋を閉じたまま走らせ続ける制御（clamshell 検知 + sudoers + `pmset disablesleep`）を
-/// この OS が持つか（#524）。
+/// 蓋を閉じたまま走らせ続ける制御をこの OS が持つか（#524 / #697）。
 ///
-/// **macOS 固有**。Windows で蓋を閉じたときの動作は電源プランのポリシーで決まり、
-/// アプリから一時的に上書きする API は無い。アイドルスリープの防止そのものは
-/// 両 OS で動くので、`platform_supported` とは別の軸として公開する
-/// （案内する側が「設定できるのに案内しない / できないのに案内する」を避けられる）
+/// アイドルスリープの防止そのものとは**別の軸**として公開する
+/// （案内する側が「設定できるのに案内しない / できないのに案内する」を避けられる）。
+///
+/// 実現手段は OS で違うが、どちらも「永続設定を一時的に倒す」形なので意味は同じ:
+///
+/// | OS | 手段 | 権限 |
+/// |---|---|---|
+/// | macOS | clamshell 検知 + sudoers + `pmset disablesleep` | 初回に管理者パスワード |
+/// | Windows | 電源プランの `GUID_LIDCLOSE_ACTION` を 0 へ（`platform::lid`） | **不要** |
+///
+/// #524 の時点では Windows を「相当する API が無い」として落としていたが、
+/// これは誤りだった（#697 で実測して訂正）。設定は `powercfg /q` の一覧に出ない
+/// （定義側の `Attributes = 1` で UI から hidden）だけで、GUID を明示すれば
+/// 非管理者のまま読み書きできる
 pub fn lid_control_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::platform::lid::supported()
+    }
+}
+
+/// sudoers.d/tako-sleep-guard が登録済みか（**macOS 固有の手段**）
+pub fn is_sudoers_installed() -> bool {
+    std::path::Path::new(SUDOERS_FILE).exists()
+}
+
+/// 蓋の開閉状態（`lid_closed`）をこの OS で観測できるか（#697）。
+///
+/// macOS は IORegistry の `AppleClamshellState` で root なしに読める。Windows は
+/// `RegisterPowerSettingNotification` にウィンドウハンドルが要り、状態表示のためだけに
+/// 持つには重いので**観測しない**。`lid_closed` が常に false になるので、
+/// 表示側はこの関数で「開いている」と「分からない」を区別する
+pub fn lid_state_detectable() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// sudoers.d/tako-sleep-guard が登録済みか
-pub fn is_sudoers_installed() -> bool {
-    std::path::Path::new(SUDOERS_FILE).exists()
+/// この OS の蓋閉じ継続が、管理者権限を伴う初回登録を要する仕組みか（#697）。
+///
+/// **OS ごとに固定**で、登録が済んだかどうかでは変わらない（そこは `lid_setup_pending`）。
+/// 設定画面の説明文のように「この OS ではどういう仕組みか」を書く場所で使う
+pub fn lid_requires_privileged_setup() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// 蓋閉じ継続を使うのに、この機械でまだ初回セットアップが要るか（#697）。
+///
+/// macOS は sudoers 登録が必要。Windows は電源プランを非管理者で書けるので**不要**。
+/// 呼び出し側（setup / 状態表示）が「sudoers」という macOS 固有の手段を知らずに済むよう、
+/// **手段ではなく未完了かどうか**を返す
+pub fn lid_setup_pending() -> bool {
+    if !lid_control_supported() {
+        return false; // 使えない OS では「セットアップ待ち」ですらない
+    }
+    #[cfg(target_os = "macos")]
+    {
+        !is_sudoers_installed()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 蓋閉じ継続を使える状態にする（#697）。
+///
+/// macOS は sudoers 登録（管理者プロンプト）、Windows は権限が要らないので何もしない。
+/// **呼び出し側は OS を意識しない**
+pub fn prepare_lid_control() -> Result<String, String> {
+    if !lid_control_supported() {
+        return Err("この OS では蓋閉じ継続に対応していません".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        install_sudoers()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok("この OS では追加の権限も登録も不要です（電源プランの設定で実現します）".to_string())
+    }
+}
+
+/// 蓋閉じ継続の後始末（#697）。macOS は sudoers 削除 + `disablesleep 0`、
+/// Windows は倒してある lid action を元へ戻す
+pub fn teardown_lid_control() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        remove_sudoers()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // tako が動いていない状態で叩かれても、その場で元へ戻せるようにする
+        crate::platform::lid::set_stay_awake(false, false)
+            .map(|changed| {
+                if changed {
+                    "蓋閉じ継続を解除し、電源プランの設定を元へ戻しました".to_string()
+                } else {
+                    "蓋閉じ継続は有効化されていません（解除不要）".to_string()
+                }
+            })
+            .map_err(|e| format!("蓋閉じ継続の解除に失敗: {e}"))
+    }
 }
 
 /// osascript 経由で sudoers.d に書き込む（管理者プロンプト表示）
@@ -641,6 +744,32 @@ fn should_hold_assertion(
         }
 }
 
+/// 蓋閉じ継続を効かせるべきかの判定（純粋関数）。
+///
+/// `should_hold_assertion` と同じく**プラットフォームを問わず同じ規則**にする（#697）。
+/// macOS（sudoers + `pmset disablesleep`）と Windows（電源プランの lid action）の
+/// 両経路がこの 1 本を通るので、OS で挙動がずれない。
+///
+/// - `setup_done`: 初回セットアップが済んでいるか。macOS は sudoers 登録、
+///   Windows は権限が要らないので常に `true`
+/// - `thermal_warning`: 本体が高温か。macOS のみ取得でき、Windows は常に `false`
+///
+/// **AC 接続を条件にするのは意図的**。蓋を閉じて持ち歩くのはたいていバッテリー駆動なので、
+/// バッテリー時まで蓋閉じ継続を効かせると鞄の中で電池が尽きる
+fn should_disable_lid_sleep(
+    lid_sleep_mode: LidSleepMode,
+    setup_done: bool,
+    busy_agents: usize,
+    on_ac: bool,
+    thermal_warning: bool,
+) -> bool {
+    lid_sleep_mode == LidSleepMode::WhileAgentsRunning
+        && setup_done
+        && busy_agents > 0
+        && on_ac
+        && !thermal_warning
+}
+
 /// 電源要求に添える理由文字列（#524）。
 ///
 /// Windows では `powercfg /requests` にそのまま出る。診断ツールのコンソール出力で
@@ -681,9 +810,60 @@ fn should_clear_residual(
     Ok(())
 }
 
-/// 起動時の残留チェック: disablesleep=1 が残っていて busy エージェントがいなければ 0 に戻す。
+/// 蓋制御のエラーを出しすぎないための直近の文言（#697）。
+///
+/// `update()` は 2 秒ごとに呼ばれるので、書き込みが恒久的に失敗する環境
+/// （グループポリシーで電源プランが固定されている等）だと同じ行が延々と出る。
+/// **文言が変わったときだけ**出す
+#[cfg(not(target_os = "macos"))]
+static LAST_LID_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(not(target_os = "macos"))]
+fn report_lid_error(msg: &str) {
+    let mut last = match LAST_LID_ERROR.lock() {
+        Ok(v) => v,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last.as_deref() == Some(msg) {
+        return;
+    }
+    eprintln!("[sleep-guard] 蓋閉じ継続に失敗: {msg}");
+    crate::diag::persist_log(&format!("lid-sleep error: {msg}"));
+    *last = Some(msg.to_string());
+}
+
+/// 成功したらエラーの記憶を捨てる（次に失敗したらまた 1 回出る）
+#[cfg(not(target_os = "macos"))]
+fn clear_lid_error() {
+    if let Ok(mut last) = LAST_LID_ERROR.lock() {
+        *last = None;
+    }
+}
+
+/// 起動時の残留チェック: 蓋閉じ継続の上書きが残っていれば元へ戻す。
 /// セカンダリモードでは呼び出し側でスキップすること（#449）
+///
+/// macOS は `pmset disablesleep=1`、Windows は電源プランの lid action が対象。
+/// **呼び出し側は OS を意識しない**（#697 で Windows 経路を足しても main.rs は無変更）
 pub fn check_disablesleep_residual() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let is_isolated = matches!(
+            std::env::var("TAKO_ISOLATED").ok().as_deref(),
+            Some("1" | "true" | "on")
+        );
+        match crate::platform::lid::clear_residual(
+            is_isolated,
+            tako_core::ports::other_tako_running(),
+        ) {
+            Ok(Some(msg)) => {
+                eprintln!("[sleep-guard] {msg}");
+                crate::diag::persist_log("lid-sleep residual cleared on startup");
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[sleep-guard] 蓋閉じ継続の残留解除に失敗: {e}"),
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         let is_isolated = matches!(
@@ -735,12 +915,36 @@ pub fn update(
     BUSY_AGENTS.store(busy_agents, Ordering::Relaxed);
     #[cfg(not(target_os = "macos"))]
     {
-        // 蓋閉じ継続（clamshell + sudoers + pmset）と thermal 監視は macOS 固有。
-        // Windows は電源要求でアイドルスリープだけを止める（B9・#524）
-        let _ = lid_sleep_mode;
+        // thermal 監視と蓋の開閉検知は macOS 固有のまま
+        // （Windows の蓋の開閉は `RegisterPowerSettingNotification` にウィンドウハンドルが
+        // 要り、ここからは取れない）。蓋閉じ継続そのものは電源プランの lid action で行う（#697）
         let on_ac = crate::platform::power::on_ac_power();
         let should_hold = should_hold_assertion(mode, power_condition, on_ac, busy_agents);
         crate::platform::power::set_hold(should_hold, &assertion_reason(mode, busy_agents));
+
+        // --- 蓋閉じ継続（#697: 電源プランの lid action を倒す） ---
+        let lid_supported = lid_control_supported();
+        if lid_supported {
+            // Windows は初回セットアップが要らないので setup_done = true、
+            // thermal は取得できないので警告なし扱い（判定関数は macOS と同一）
+            let should_disable =
+                should_disable_lid_sleep(lid_sleep_mode, true, busy_agents, on_ac, false);
+            // 倒すのは AC レールだけ。macOS 側も蓋閉じ継続は AC 接続時のみなので挙動が揃うし、
+            // バッテリー側を触らないことが残留時の安全弁にもなる
+            match crate::platform::lid::set_stay_awake(should_disable, false) {
+                Ok(true) => {
+                    crate::diag::persist_log(if should_disable {
+                        "lid-sleep: 蓋閉じ継続を有効化（電源プランの lid action を倒した）"
+                    } else {
+                        "lid-sleep: 蓋閉じ継続を解除（lid action を元へ戻した）"
+                    });
+                    clear_lid_error();
+                }
+                Ok(false) => {}
+                Err(e) => report_lid_error(&e),
+            }
+        }
+
         return SleepGuardState {
             assertion_held: crate::platform::power::is_held(),
             mode,
@@ -749,9 +953,16 @@ pub fn update(
             busy_agents,
             platform_supported: crate::platform::power::supported(),
             lid_closed: false,
-            lid_sleep_disabled: false,
-            lid_sleep_mode: LidSleepMode::Off,
+            lid_sleep_disabled: crate::platform::lid::is_active(),
+            // 制御できない OS（Linux 等）で設定値をそのまま返すと
+            // 「設定してあるのに効かない」と読めてしまうので Off を返す
+            lid_sleep_mode: if lid_supported {
+                lid_sleep_mode
+            } else {
+                LidSleepMode::Off
+            },
             sudoers_installed: false,
+            lid_setup_required: false,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -780,9 +991,16 @@ pub fn update(
         }
 
         // --- 蓋閉じ防止（#218: pmset disablesleep） ---
+        // 判定は #697 で Windows と共通化した（真理値は従来と同じ）
         let current_disabled = iokit::sleep_disabled();
         if lid_sleep_mode == LidSleepMode::WhileAgentsRunning && sudoers {
-            let should_disable = busy_agents > 0 && on_ac && !thermal.is_warning();
+            let should_disable = should_disable_lid_sleep(
+                lid_sleep_mode,
+                sudoers,
+                busy_agents,
+                on_ac,
+                thermal.is_warning(),
+            );
             if should_disable && !current_disabled {
                 let _ = set_disablesleep(true);
             } else if !should_disable && current_disabled {
@@ -813,6 +1031,8 @@ pub fn update(
             lid_sleep_disabled,
             lid_sleep_mode,
             sudoers_installed: sudoers,
+            // macOS は sudoers 登録が初回セットアップ
+            lid_setup_required: !sudoers,
             thermal_state: thermal,
             display_sleep_forced: iokit::display_sleep_sent(),
         }
@@ -829,7 +1049,7 @@ pub fn status(
     #[cfg(not(target_os = "macos"))]
     {
         // 副作用なし: 取得・解放は行わず、いまの保持状態と電源だけを読む
-        let _ = lid_sleep_mode;
+        let lid_supported = lid_control_supported();
         return SleepGuardState {
             assertion_held: crate::platform::power::is_held(),
             mode,
@@ -838,9 +1058,14 @@ pub fn status(
             busy_agents,
             platform_supported: crate::platform::power::supported(),
             lid_closed: false,
-            lid_sleep_disabled: false,
-            lid_sleep_mode: LidSleepMode::Off,
+            lid_sleep_disabled: crate::platform::lid::is_active(),
+            lid_sleep_mode: if lid_supported {
+                lid_sleep_mode
+            } else {
+                LidSleepMode::Off
+            },
             sudoers_installed: false,
+            lid_setup_required: false,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -858,6 +1083,7 @@ pub fn status(
             lid_sleep_disabled: iokit::sleep_disabled(),
             lid_sleep_mode,
             sudoers_installed: is_sudoers_installed(),
+            lid_setup_required: !is_sudoers_installed(),
             thermal_state: iokit::thermal_state(),
             display_sleep_forced: iokit::display_sleep_sent(),
         }
@@ -902,7 +1128,16 @@ pub fn cleanup_on_exit() {
     // Windows の電源要求はプロセス終了で OS が回収するが、明示的に解除しておく
     // （`powercfg /requests` に残らないことを終了直後に確認できる）
     #[cfg(not(target_os = "macos"))]
-    crate::platform::power::set_hold(false, "");
+    {
+        crate::platform::power::set_hold(false, "");
+        // **蓋の設定は OS が回収してくれない**（電源プランに書かれた永続設定なので、
+        // 倒したまま終了すると次に tako を起動するまで蓋を閉じてもスリープしない）。
+        // 起動時の残留復元（#697）は最後の砦であって、正常終了ではここで必ず戻す
+        if let Err(e) = crate::platform::lid::set_stay_awake(false, false) {
+            eprintln!("[sleep-guard] 終了時の蓋設定の復元に失敗: {e}");
+            crate::diag::persist_log(&format!("lid-sleep cleanup on exit failed: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -988,6 +1223,7 @@ mod tests {
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
+            lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -1052,6 +1288,7 @@ mod tests {
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
+            lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -1071,6 +1308,7 @@ mod tests {
             lid_sleep_disabled: true,
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: true,
+            lid_setup_required: false,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -1090,6 +1328,7 @@ mod tests {
             lid_sleep_disabled: true,
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: true,
+            lid_setup_required: false,
             thermal_state: ThermalState::Serious,
             display_sleep_forced: false,
         };
@@ -1109,6 +1348,7 @@ mod tests {
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: false,
+            lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -1128,6 +1368,7 @@ mod tests {
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
+            lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -1147,6 +1388,7 @@ mod tests {
             lid_sleep_disabled: false,
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
+            lid_setup_required: true,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: false,
         };
@@ -1195,6 +1437,92 @@ mod tests {
         assert!(
             !should_hold_assertion(m, PowerCondition::AcOnly, false, 1),
             "稼働中でも AC 未接続なら保持しない"
+        );
+    }
+
+    // --- #697: 蓋閉じ継続の判定の共通化（macOS / Windows 両経路がこの 1 本を通る） ---
+
+    /// macOS の従来ロジック（`busy > 0 && on_ac && !thermal`）と同じ真理値であることを固定する。
+    /// ここが崩れると OS 間で挙動がずれる
+    #[test]
+    fn 蓋閉じ継続はエージェント稼働中かつac接続のときだけ有効() {
+        let m = LidSleepMode::WhileAgentsRunning;
+        assert!(should_disable_lid_sleep(m, true, 1, true, false));
+        assert!(
+            !should_disable_lid_sleep(m, true, 0, true, false),
+            "エージェントが居なければ倒さない"
+        );
+        assert!(
+            !should_disable_lid_sleep(m, true, 1, false, false),
+            "AC 未接続なら倒さない（鞄の中で電池が尽きるため）"
+        );
+    }
+
+    #[test]
+    fn 蓋閉じ継続はoffモードなら常に無効() {
+        for busy in [0, 5] {
+            for on_ac in [true, false] {
+                assert!(!should_disable_lid_sleep(
+                    LidSleepMode::Off,
+                    true,
+                    busy,
+                    on_ac,
+                    false
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn 初回セットアップが済むまでは倒さない() {
+        // macOS の sudoers 未登録に相当。Windows は setup_done = true で呼ぶ
+        assert!(!should_disable_lid_sleep(
+            LidSleepMode::WhileAgentsRunning,
+            false,
+            3,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn 高温警告中は蓋閉じ継続を倒さない() {
+        // macOS のみ観測できる。Windows は常に false で呼ぶので影響しない
+        assert!(!should_disable_lid_sleep(
+            LidSleepMode::WhileAgentsRunning,
+            true,
+            3,
+            true,
+            true
+        ));
+    }
+
+    /// 蓋閉じ継続の案内は「手段」ではなく「未完了か」で出し分ける（#697）。
+    /// これが崩れると Windows で「sudoers を登録してください」と出る
+    #[test]
+    fn セットアップ待ちの案内は未完了のときだけ出る() {
+        let mut state = SleepGuardState {
+            assertion_held: false,
+            mode: SleepGuardMode::WhileAgentsRunning,
+            power_condition: PowerCondition::AcOnly,
+            on_ac_power: true,
+            busy_agents: 0,
+            platform_supported: true,
+            lid_closed: false,
+            lid_sleep_disabled: false,
+            lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+            sudoers_installed: false,
+            lid_setup_required: true,
+            thermal_state: ThermalState::Nominal,
+            display_sleep_forced: false,
+        };
+        assert!(state.description().contains("sudoers 未登録"));
+        // Windows のように初回セットアップが要らない OS では出さない
+        state.lid_setup_required = false;
+        assert!(
+            !state.description().contains("sudoers"),
+            "セットアップ不要の OS へ macOS 専用の案内を出してはいけない: {}",
+            state.description()
         );
     }
 
@@ -1265,6 +1593,7 @@ mod tests {
             lid_sleep_disabled: true,
             lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
             sudoers_installed: true,
+            lid_setup_required: false,
             thermal_state: ThermalState::Nominal,
             display_sleep_forced: true,
         };

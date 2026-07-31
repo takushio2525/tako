@@ -1653,3 +1653,21 @@
 - 関連: PR（Closes #687、Refs #519）。before/after を別 worktree の baseline バイナリで実測
   （report: エラー → 208 行 + 日本語折返し / scroll: `offset:0` 固定 → 器の実位置に一致）。
   マトリクスは `tako_orchestrator_report` Pending→Degraded、`tako_scroll_pane` Supported→Degraded
+
+## 2026-07-31（#697: Windows の蓋閉じ継続 — #524 の「API が無い」を実測で否定）
+
+- #646 が `lid_control_supported()` を macOS 固有として落とした前提（「Windows に相当する
+  API が無い」）は誤り。`GUID_LIDCLOSE_ACTION` は `powercfg /q` に出ないだけ（定義側
+  `Attributes = 1` で hidden）で、**非管理者のまま**読み書き・適用・復元できると実測。
+  macOS の sudoers 登録に相当する初回セットアップすら要らない
+- `platform::lid`（B9 の蓋ぶん）を新設し電源プランの lid action を倒す / 戻す。Modern Standby 機は
+  「アイドル」と「蓋」が別の引き金なので、#646 の電源要求と本実装の**両方**で初めて蓋閉じ継続が成立する。
+  判定は macOS と同一の純粋関数（`should_disable_lid_sleep`）を通し、倒すのは AC レールのみ
+- 残留対策 3 段: 倒す前に元値をディスクへ保存 / 正常終了で即復元（**電源要求と違い OS が回収しない**）/
+  起動時の残留復元。ユーザーが手で変えていたら復元しない。文言も「sudoers」から
+  「初回セットアップの要否」へ抽象化し、Windows に macOS 専用の案内が出ないようにした
+- 関連: PR #706（Closes #697）。実機テスト 5 本（独立 FFI プローブで電源プランを外から観測）+
+  単体 21 本。終了時復元は**修正を外すと FAILED になること**まで確認。マトリクスの note を
+  実態へ直し doc 再生成。tako-control 836 passed / 失敗 11 件は baseline と同一
+- 次: macOS のコンパイルは未検証（`ring` が絡み Windows からクロスチェック不可）→ CI 待ち。
+  実際に蓋を閉じての確認は manual-checks.md に手順を追加

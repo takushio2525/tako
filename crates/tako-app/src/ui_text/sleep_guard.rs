@@ -192,6 +192,7 @@ mod tests {
             lid_sleep_disabled,
             lid_sleep_mode: LidSleepMode::Off,
             sudoers_installed: false,
+            lid_setup_required: true,
             thermal_state,
             display_sleep_forced: false,
         }

@@ -209,15 +209,20 @@ pub mod notes {
     // なった。共通の縮退理由 WIN_OS_API（「OS API の Windows 実装が前提」）は
     // 使う機能が無くなったので削除した（残すと system prompt へ誤情報が入る）
 
-    /// #524: アイドルスリープの抑止（`PowerCreateRequest`）は動く。
-    /// 蓋を閉じても走り続ける仕組みは macOS 固有（IOKit の clamshell 検知 +
-    /// sudoers 経由の `pmset disablesleep`）で、Windows に相当する API が無い
-    pub const WIN_SLEEP_GUARD_NO_LID: Note = Note::new(
-        "アイドルスリープの防止は動く。蓋を閉じたまま走らせ続ける設定と本体温度の監視は \
-         macOS 固有の仕組みのため Windows には無い（蓋を閉じたときの動作は電源プランに従う）",
-        "Idle sleep prevention works. Keeping the machine running with the lid closed, and \
-         thermal monitoring, rely on macOS-specific mechanisms that Windows does not have \
-         (lid-close behavior follows the Windows power plan)",
+    /// #524 + #697: アイドルスリープの抑止（`PowerCreateRequest`）も
+    /// 蓋を閉じたままの継続稼働（電源プランの `GUID_LIDCLOSE_ACTION` を倒す）も動く。
+    ///
+    /// 残る差は 2 つだけ。**本体温度の監視**（macOS の `NSProcessInfo.thermalState` 相当が無い）と、
+    /// **蓋の開閉状態の表示**（`RegisterPowerSettingNotification` にウィンドウハンドルが要り、
+    /// 状態表示のためだけに持つには重い）。どちらも蓋閉じ継続の動作そのものには影響しない
+    /// （#524 時点の「相当する API が無い」は誤りだった。#697 で実測して訂正）
+    pub const WIN_SLEEP_GUARD_NO_THERMAL: Note = Note::new(
+        "アイドルスリープの防止と蓋を閉じたままの継続稼働はどちらも動く。\
+         本体温度の監視と蓋の開閉状態の表示だけが macOS 固有のため Windows には無い\
+         （動作そのものには影響しない）",
+        "Both idle-sleep prevention and keeping the machine running with the lid closed work. \
+         Only thermal monitoring and showing the lid open/closed state are macOS-specific and \
+         unavailable on Windows (neither affects how lid-close continuation behaves)",
     );
     /// #525: 実行ペインは PowerShell で起こすようにした（pwsh 7 → Windows PowerShell 5.1 の順に解決）。
     /// 残る差は `&&` / `||` だけ。**何が落ちて何をすれば直るか**まで書く
@@ -1012,9 +1017,10 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_sleep_guard",
         macos: Support::Supported,
         // #524: PowerCreateRequest / PowerSetRequest でアイドルスリープを抑止。
-        // 蓋閉じ継続と thermal は macOS 固有なので Degraded
+        // #697: 蓋閉じ継続も電源プランの lid action を倒して動くようになった。
+        // 残るのは thermal 監視と蓋の開閉表示だけなので Degraded は維持
         windows: Support::Degraded {
-            note: notes::WIN_SLEEP_GUARD_NO_LID,
+            note: notes::WIN_SLEEP_GUARD_NO_THERMAL,
         },
     },
     Feature {

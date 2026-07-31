@@ -658,14 +658,19 @@ fn run_sleep_guard_check(interactive: bool) {
     eprintln!("      エージェントが長時間動いている間に PC がスリープすると作業が止まります。");
     eprintln!("      スリープ防止の稼働レベルを選んでください:");
     eprintln!();
-    // 蓋閉じ継続は macOS 固有（#524）。持たない OS では選択肢自体を出さない
+    // 蓋閉じ継続を持たない OS では選択肢自体を出さない（#524）
     // （設定できたように見せて何も起きないのが一番たちが悪い）
     let lid = tako_control::sleep_guard::lid_control_supported();
     eprintln!("      [0] OS 任せ（機能オフ）");
     eprintln!("      [1] AC 接続時のみアイドルスリープ防止（推奨）");
     eprintln!("      [2] バッテリー時もアイドルスリープ防止（電池消耗に注意）");
     if lid {
-        eprintln!("      [3] 蓋閉じでも稼働（案内のみ — 手動設定が必要）");
+        // 初回セットアップの要否で見出しを変える（macOS = 要管理者登録、Windows = 即有効）
+        if tako_control::sleep_guard::lid_setup_pending() {
+            eprintln!("      [3] 蓋閉じでも稼働（案内のみ — 手動設定が必要）");
+        } else {
+            eprintln!("      [3] 蓋閉じでも稼働（そのまま有効にできます）");
+        }
     }
     eprintln!();
     let current_level = match (mode, power) {
@@ -711,10 +716,21 @@ fn run_sleep_guard_check(interactive: bool) {
             eprintln!();
             eprintln!("      蓋閉じでの継続稼働:");
             eprintln!("      ─────────────────────────────────────────────");
-            eprintln!("      tako sleep-guard install-lid-sleep");
-            eprintln!("        初回のみ管理者パスワードが必要。以後 tako が");
-            eprintln!("        エージェント稼働中だけ自動で蓋閉じ継続を有効にします。");
-            eprintln!("        解除: tako sleep-guard remove-lid-sleep");
+            if tako_control::sleep_guard::lid_setup_pending() {
+                // macOS: 管理者パスワードを伴う登録が要るので、ここでは案内に留める
+                eprintln!("      tako sleep-guard install-lid-sleep");
+                eprintln!("        初回のみ管理者パスワードが必要。以後 tako が");
+                eprintln!("        エージェント稼働中だけ自動で蓋閉じ継続を有効にします。");
+                eprintln!("        解除: tako sleep-guard remove-lid-sleep");
+            } else {
+                // Windows: 権限が要らないのでその場で有効化まで済ませる（#697）
+                new_settings.lid_sleep_mode =
+                    tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning;
+                eprintln!("        追加の権限も登録も不要です。有効にしました。");
+                eprintln!("        エージェント稼働中に蓋を閉じても処理が続きます");
+                eprintln!("        （AC 接続時のみ。画面は消灯します）。");
+                eprintln!("        解除: tako sleep-guard remove-lid-sleep");
+            }
             eprintln!("      ─────────────────────────────────────────────");
         }
         other => {
@@ -1866,10 +1882,11 @@ pub fn run_check() -> Result<(), String> {
                 );
             }
         }
-        // 蓋閉じ継続は macOS 固有（#524）。持たない OS では案内しない
+        // 蓋閉じ継続を持たない OS では案内しない（#524）
         if tako_control::sleep_guard::lid_control_supported() {
             let lid_mode = settings.lid_sleep_mode;
-            let sudoers = tako_control::sleep_guard::is_sudoers_installed();
+            // 未完了かどうかだけを見る。手段（macOS の sudoers）は sleep_guard の内側（#697）
+            let setup_pending = tako_control::sleep_guard::lid_setup_pending();
             match lid_mode {
                 tako_control::sleep_guard::LidSleepMode::Off => {
                     eprintln!(
@@ -1877,10 +1894,10 @@ pub fn run_check() -> Result<(), String> {
                     );
                 }
                 tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning => {
-                    if sudoers {
-                        eprintln!("  [OK] 蓋閉じ防止: while-agents-running（sudoers 登録済み）");
-                    } else {
+                    if setup_pending {
                         eprintln!("  [不足] 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
+                    } else {
+                        eprintln!("  [OK] 蓋閉じ防止: while-agents-running");
                     }
                 }
             }

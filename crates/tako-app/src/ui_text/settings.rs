@@ -578,10 +578,19 @@ pub fn sleep_lid_header() -> &'static str {
 }
 
 pub fn desc_sleep_lid() -> &'static str {
-    tr!(
-        "蓋を閉じても動かし続ける（sudoers の登録が必要）",
-        "Keep running with the lid closed (requires a sudoers entry)"
-    )
+    // 仕組みが OS で違うので説明も分ける（#697）。macOS は sudoers 登録が要るが、
+    // Windows は電源プランを非管理者で書けるので登録の話をしてはいけない
+    if tako_control::sleep_guard::lid_requires_privileged_setup() {
+        tr!(
+            "蓋を閉じても動かし続ける（sudoers の登録が必要）",
+            "Keep running with the lid closed (requires a sudoers entry)"
+        )
+    } else {
+        tr!(
+            "蓋を閉じても動かし続ける（AC 接続時・エージェント稼働中のみ）",
+            "Keep running with the lid closed (only on AC power, while agents are running)"
+        )
+    }
 }
 
 pub fn sleep_lid_install() -> &'static str {
