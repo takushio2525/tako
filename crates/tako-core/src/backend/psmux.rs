@@ -2,10 +2,11 @@
 //!
 //! [psmux](https://github.com/psmux/psmux)（MIT / Rust 製 / tmux 互換 CLI）を
 //! 「生存の器」として使う。設計 §2.2 が後継として温存していた **B-1（器あり・到達なし）**
-//! そのもので、`survives_app_exit = true` / `detached_access = false` /
-//! `scrollback = InProcess` を申告する。tako を強制終了しても psmux サーバー・シェル・
+//! から出発し、#519 で**採取（読み）だけ**を足した形になっている:
+//! `survives_app_exit = true` / `detached_capture = true` / `detached_access = false` /
+//! `scrollback = InProcess`。tako を強制終了しても psmux サーバー・シェル・
 //! scrollback が生き残ることは実測済み（適合検証 2026-07-27。M0 の罠 7 項目のうち 6 つを
-//! psmux は既に越えている）。
+//! psmux は既に越えている）。採取の実装と実測は [`PsmuxCapture`] を参照。
 //!
 //! ## なぜ [`super::TmuxBackend`] を流用できないのか
 //!
@@ -20,7 +21,7 @@
 //! |---|---|
 //! | `-t =name` の解釈がコマンドごとにバラバラ（kill-session は失敗） | **`=` を一切使わない**（[`Self::target`]） |
 //! | `show-environment -t s NAME` が名前指定を無視して全変数を出す | 出力から `NAME=` 行を選ぶ（[`select_env_value`]） |
-//! | `#{history_bytes}` が空 | 依存しない。`detached()` が `None` なので probe 経路自体を持たない |
+//! | `#{history_bytes}` が空 | 依存しない（[`parse_history_probe`] が 0 へ倒す。変化の検知にしか使わせない） |
 //! | `pane_tty` が実在しない `/dev/pty1` を返す | [`SessionBackend::pane_tty`] は `None` を返す |
 //! | `list-clients -F` が書式指定を無視（クライアント PID が取れない） | [`super::owner`] のオーナー記録で代替（#177 の強奪ガード） |
 //! | `new-session -D` が他クライアントを切り離さない | 同上。**器に収束を期待しない** |
@@ -40,8 +41,8 @@ use std::time::Duration;
 
 use super::owner::{Claim, OwnerRecords};
 use super::{
-    BackendCapabilities, BackendError, Holder, HolderKind, ScrollbackAuthority, SessionBackend,
-    SessionInfo, SessionRef, SESSION_PREFIX,
+    BackendCapabilities, BackendError, DetachedCapture, HistoryProbe, Holder, HolderKind,
+    ScrollProbe, ScrollbackAuthority, SessionBackend, SessionInfo, SessionRef, SESSION_PREFIX,
 };
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
@@ -81,6 +82,9 @@ pub struct PsmuxBackend {
     version: String,
     /// セッション単位のオーナー記録（#177 の強奪ガードの材料）
     owners: OwnerRecords,
+    /// 役割 B の読み側（採取）。**器の一部としてここに持つ**ので、
+    /// `detached_capture()` が借用を返せる
+    capture: PsmuxCapture,
 }
 
 impl PsmuxBackend {
@@ -97,6 +101,10 @@ impl PsmuxBackend {
     /// **隔離検証・統合テスト用**（プロセス全体の環境変数を触らずに器を隔離できる）
     pub fn with_parts(bin: String, version: String, socket: String, owner_dir: PathBuf) -> Self {
         Self {
+            capture: PsmuxCapture {
+                bin: bin.clone(),
+                socket: socket.clone(),
+            },
             bin,
             socket,
             version,
@@ -179,13 +187,19 @@ pub fn ensure_conf() -> Option<PathBuf> {
 }
 
 impl SessionBackend for PsmuxBackend {
-    /// **案 B-1 の能力**（設計 §2.2）。器はあるが到達は無い。
-    /// `scrollback` を `InProcess` にしてあるのは「役割 B が無い = capture で履歴を
-    /// 取り直せない」ため。psmux 自身は履歴を持つが、tako から読む手段が無い以上、
-    /// 権威を `Backend` と申告するのは嘘になる
+    /// **器あり・採取あり・送出なし**（設計 §2.2 の案 B-1 に採取を足した形。#519）。
+    ///
+    /// - `detached_capture = true`: `capture-pane` / `display-message` は実測で動く
+    ///   （UTF-8・LF・`-S` のクランプまで tmux と同じ。[`PsmuxCapture`] 参照）
+    /// - `detached_access = false`: `paste-buffer` が改行を literal `\n` に化けさせ、
+    ///   `send-keys -H` が 16 進引数をリテラル文字として送る。送達経路として信頼できない
+    /// - `scrollback = InProcess`: **履歴の所在ではなく UI の描き方**の申告。
+    ///   ミラー経路は `#{mouse_any_flag}` と `send-keys -H` を要求するが psmux は
+    ///   どちらも持たない（#654）。外側 alacritty を使う直接ペイン経路が正しい
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             survives_app_exit: true,
+            detached_capture: true,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             label: "psmux",
@@ -374,14 +388,165 @@ impl SessionBackend for PsmuxBackend {
             .map(|_| ());
     }
 
-    /// **役割 B は持たない**（案 B-1）。psmux 側には capture / send-keys が在るが、
-    /// `#{history_bytes}` が空・`resize-window` が無効果・`paste-buffer` が改行を
-    /// literal `\n` に化けさせる等、到達手段として信頼できないものが混ざっている。
-    /// 「フォールバックが半端に動く」より「到達手段が無い」と型で言う方が安全
-    /// （呼び出し側は `PaneReach::Unreachable` で構造化エラーになる）
+    /// **採取だけ**を持つ（#519）。psmux の `capture-pane` / `display-message` は
+    /// 実測で tmux 同等に動くので、ここを `None` のままにしておく理由が無い
+    /// （report / read フォールバック / worker 監視が Windows で全滅していた）
+    fn detached_capture(&self) -> Option<&dyn DetachedCapture> {
+        Some(&self.capture)
+    }
+
+    /// **送出は持たない**。psmux 側に send-keys / paste-buffer は在るが、
+    /// `paste-buffer` が改行を literal `\n` に化けさせ、`send-keys -H` が 16 進引数を
+    /// リテラル文字として送る（#654 実測）。到達手段として信頼できないものを
+    /// 「使える」と型で申告すると失敗が握り潰されるので、`None` のままにする。
+    /// **送出の正は in-process の PTY**（#662 で respond をそちらへ寄せたのと同じ方針）
     fn detached(&self) -> Option<&dyn super::DetachedAccess> {
         None
     }
+}
+
+/// 役割 B の読み側（採取）の psmux 実装（#519）。
+///
+/// **読み取りしかしない**のが約束。psmux CLI へ投げるのは `capture-pane` /
+/// `display-message` / `list-panes` の 3 つだけで、器の状態を変えるコマンド
+/// （`copy-mode` / `send-keys` / `resize-window`）は 1 つも呼ばない。
+/// 器へ書く経路を増やすと #212 / #168 で UI スレッドから排除した種類の
+/// 同期サブプロセスが戻ってくるため、そこは in-process の PTY に任せる。
+///
+/// 実測（psmux 3.3.7 / 隔離ソケット / 2026-07-31）で分かった tmux との差:
+///
+/// | | psmux | ここでの扱い |
+/// |---|---|---|
+/// | `-J`（折返し結合） | **無視される**（エラーにはならない） | 付けたまま。結合されない前提で使う |
+/// | `#{history_bytes}` | **空** | `bytes = 0`。呼び出し側は変化の検知にしか使わない |
+/// | 複合コマンド（`;` 区切り） | **後半が黙って捨てられる** | **コマンドを分けて 2 回叩く** |
+/// | `-t =name`（exact-match） | コマンドごとに解釈が違う | [`PsmuxBackend::target`] と同じく **`=` を使わない** |
+/// | 出力 | UTF-8 / LF のみ | `from_utf8_lossy` + `lines()` で足りる |
+pub struct PsmuxCapture {
+    bin: String,
+    socket: String,
+}
+
+impl PsmuxCapture {
+    fn run(&self, args: &[&str]) -> Result<String, String> {
+        run_with(&self.bin, Some(&self.socket), args)
+    }
+
+    /// `display-message -p` で 1 行のフォーマットを引く（読み取り専用）
+    fn format(&self, session: &SessionRef, format: &str) -> Option<String> {
+        self.run(&["display-message", "-p", "-t", session.as_str(), format])
+            .ok()
+    }
+}
+
+impl DetachedCapture for PsmuxCapture {
+    fn capture_screen(&self, session: &SessionRef) -> Result<Vec<String>, BackendError> {
+        self.run(&["capture-pane", "-t", session.as_str(), "-p"])
+            .map(|out| out.lines().map(str::to_string).collect())
+            .map_err(BackendError::Operation)
+    }
+
+    fn capture_history(&self, session: &SessionRef, lines: usize) -> Option<Vec<String>> {
+        if lines == 0 {
+            return Some(Vec::new());
+        }
+        let start = format!("-{lines}");
+        let out = self
+            .run(&[
+                "capture-pane",
+                "-p",
+                "-t",
+                session.as_str(),
+                "-S",
+                &start,
+                "-E",
+                "-1",
+            ])
+            .ok()?;
+        Some(out.lines().map(|l| l.trim_end().to_string()).collect())
+    }
+
+    /// `-J` は psmux に無視されるので**折返しは行のまま残る**（中身は落ちない）。
+    /// それでも付けておくのは、psmux が実装したときに tmux と同じ出力へ揃うため
+    fn capture_history_joined(&self, session: &SessionRef, lines: usize) -> Option<String> {
+        let start = format!("-{lines}");
+        let out = self
+            .run(&[
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                session.as_str(),
+                "-S",
+                &start,
+            ])
+            .ok()?;
+        // 行単位で組み直してから末尾を落とす（CRLF 正規化。tmux 実装と同一）
+        let text = out.lines().collect::<Vec<_>>().join("\n");
+        let text = text.trim_end();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// `#{history_bytes}` は psmux では空なので **0 を返す**。
+    /// これは「バイト数 0」ではなく「観測できない」の意味で、
+    /// 履歴飽和時のバイト差分検知（pane_log）はこの器では働かない
+    fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe> {
+        let out = self.format(
+            session,
+            "#{history_size}\t#{history_limit}\t#{history_bytes}\t#{alternate_on}",
+        )?;
+        parse_history_probe(&out)
+    }
+
+    fn history_probe_batch(&self) -> Vec<(SessionRef, HistoryProbe)> {
+        let out = self
+            .run(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{history_size}\t#{history_limit}\t#{history_bytes}\t#{alternate_on}",
+            ])
+            .unwrap_or_default();
+        parse_history_probe_batch(&out)
+    }
+
+    fn scroll_probe(&self, session: &SessionRef) -> Option<ScrollProbe> {
+        let out = self.format(
+            session,
+            "#{scroll_position}\t#{history_size}\t#{pane_in_mode}\t#{alternate_on}",
+        )?;
+        super::parse_scroll_probe(&out)
+    }
+}
+
+/// `#{history_size}\t#{history_limit}\t#{history_bytes}\t#{alternate_on}` のパース（純関数）。
+/// **空フィールドで `None` を返さない**（psmux の `#{history_bytes}` は常に空）。
+/// 器の応答として壊れているのは `history_size` すら読めない場合だけ
+fn parse_history_probe(out: &str) -> Option<HistoryProbe> {
+    let mut f = out.lines().next()?.split('\t');
+    let history = f.next()?.trim().parse().ok()?;
+    let limit = f.next().unwrap_or("").trim().parse().unwrap_or(0);
+    let bytes = f.next().unwrap_or("").trim().parse().unwrap_or(0);
+    let alternate = f.next().unwrap_or("").trim() == "1";
+    Some(HistoryProbe {
+        history,
+        limit,
+        bytes,
+        alternate,
+    })
+}
+
+/// `list-panes -a -F` の 5 列出力のパース（純関数）
+fn parse_history_probe_batch(out: &str) -> Vec<(SessionRef, HistoryProbe)> {
+    out.lines()
+        .filter_map(|line| {
+            let (name, rest) = line.split_once('\t')?;
+            Some((
+                SessionRef::new(name.trim()).ok()?,
+                parse_history_probe(rest)?,
+            ))
+        })
+        .collect()
 }
 
 impl PsmuxBackend {
@@ -542,29 +707,51 @@ mod tests {
     use super::*;
 
     fn backend() -> PsmuxBackend {
-        PsmuxBackend {
-            bin: "psmux".into(),
-            socket: "tako-unit".into(),
-            version: VERIFIED_VERSION.into(),
-            owners: OwnerRecords::new(
-                std::env::temp_dir().join(format!("tako-psmux-unit-{}", std::process::id())),
-            ),
-        }
+        PsmuxBackend::with_parts(
+            "psmux".into(),
+            VERIFIED_VERSION.into(),
+            "tako-unit".into(),
+            std::env::temp_dir().join(format!("tako-psmux-unit-{}", std::process::id())),
+        )
     }
 
     fn session(name: &str) -> SessionRef {
         SessionRef::new(name).unwrap()
     }
 
+    /// [`PsmuxCapture`] の定義から採取実装の終わりまでのソース。
+    /// **読み取り専用の約束**を機械検査するための材料（下の 2 つのテストが使う）
+    fn capture_impl_source() -> &'static str {
+        let src = include_str!("psmux.rs");
+        let start = src
+            .find("pub struct PsmuxCapture")
+            .expect("採取実装が見つからない");
+        let end = src[start..]
+            .find("fn parse_history_probe")
+            .expect("採取実装の終端（次の自由関数）");
+        &src[start..start + end]
+    }
+
+    /// **#519 の中核**: psmux は「器あり・採取あり・送出なし」という、
+    /// これまで存在しなかった組み合わせを申告する。
+    /// bool 集合で能力を持つ設計（設計 §3.6）がこれを表現できることの実証でもある
     #[test]
-    fn 能力は器ありかつ到達なし() {
+    fn 能力は器ありかつ採取ありかつ送出なし() {
         let caps = backend().capabilities();
         assert!(caps.survives_app_exit, "器は tako の終了を生き延びる");
-        assert!(!caps.detached_access, "役割 B は持たない（案 B-1）");
+        assert!(
+            caps.detached_capture,
+            "capture-pane は動く（役割 B の読み側）"
+        );
+        assert!(
+            !caps.detached_access,
+            "送出は信頼できないので持たない（役割 B の書き側）"
+        );
         assert_eq!(caps.scrollback, ScrollbackAuthority::InProcess);
         assert_eq!(caps.label, "psmux");
         assert!(caps.degraded_note().is_none(), "器があるので縮退ではない");
-        assert!(backend().detached().is_none());
+        assert!(backend().detached().is_none(), "送出の入口は開けない");
+        assert!(backend().detached_capture().is_some(), "採取の入口は開く");
     }
 
     /// **要件 1**: `=`（exact-match 接頭辞）を使わない。
@@ -585,6 +772,11 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.starts_with("=tako-")),
             "argv に = 付きターゲットが混ざっている: {args:?}"
+        );
+        // 採取側も同じ約束（`={name}` の組み立てをしていない）
+        assert!(
+            !capture_impl_source().contains("\"={"),
+            "採取実装が = 付きターゲットを組み立てている"
         );
     }
 
@@ -634,14 +826,88 @@ mod tests {
         assert!(backend().pane_tty(&session("tako-0123456789ab")).is_none());
     }
 
-    /// **要件 3**: `#{history_bytes}` に依存する経路を**構造的に持たない**。
-    /// `detached()` が `None` である限り、probe / capture は境界越しに呼べない
+    /// **要件 3**: `#{history_bytes}` が空でも probe を落とさない。
+    ///
+    /// M2 では「役割 B を持たない」ことで `#{history_bytes}` 依存を構造的に避けていた。
+    /// 採取を持たせた以上、**空フィールドで `None` を返さない**ことを固定して
+    /// 同じ結果（bytes に依存しない）を保証する（#654 の `parse_history_state` と同じ設計）
     #[test]
-    fn 履歴probeの経路を持たない() {
-        assert!(
-            backend().detached().is_none(),
-            "役割 B を持つと history_probe（#{{history_bytes}} 依存）が呼ばれてしまう"
+    fn 履歴probeはhistory_bytesが空でも成立する() {
+        let p = parse_history_probe("279\t10000\t\t0").expect("bytes が空でも読める");
+        assert_eq!(p.history, 279);
+        assert_eq!(p.limit, 10000);
+        assert_eq!(
+            p.bytes, 0,
+            "観測できない値は 0（バイト数 0 の意味ではない）"
         );
+        assert!(!p.alternate);
+        // alt screen の申告は拾う（履歴 0 の理由を呼び出し側が説明できる）
+        assert!(parse_history_probe("0\t10000\t\t1").unwrap().alternate);
+        // history_size すら読めない出力は器の応答として壊れている
+        assert!(parse_history_probe("").is_none());
+        assert!(parse_history_probe("\t10000\t\t0").is_none());
+    }
+
+    /// `list-panes -a -F` の一括 probe（#369 の probe 一括化を psmux でも通す）
+    #[test]
+    fn 一括probeはセッション名ごとに履歴を返す() {
+        let out = "tako-aaaaaaaaaaaa\t279\t10000\t\t0\n\
+                   tako-bbbbbbbbbbbb\t0\t10000\t\t1\n\
+                   壊れた行\n";
+        let parsed = parse_history_probe_batch(out);
+        assert_eq!(parsed.len(), 2, "壊れた行は捨てる: {parsed:?}");
+        assert_eq!(parsed[0].0.as_str(), "tako-aaaaaaaaaaaa");
+        assert_eq!(parsed[0].1.history, 279);
+        assert!(parsed[1].1.alternate);
+    }
+
+    /// 器の表示位置の読み戻し（#687）。copy mode の外は 0 / 非モード
+    #[test]
+    fn スクロール位置の読み戻し() {
+        let p = super::super::parse_scroll_probe("0\t279\t0\t0").unwrap();
+        assert_eq!(p.position, 0);
+        assert_eq!(p.history, 279);
+        assert!(!p.in_mode);
+        assert!(!p.alternate);
+
+        let p = super::super::parse_scroll_probe("24\t279\t1\t0").unwrap();
+        assert_eq!(p.position, 24);
+        assert!(p.in_mode);
+
+        // tmux は copy mode の外で #{scroll_position} を空にする
+        let p = super::super::parse_scroll_probe("\t279\t0\t0").unwrap();
+        assert_eq!(p.position, 0);
+        assert_eq!(p.history, 279);
+
+        // alt screen（内側 TUI）は履歴 0 + alternate=1
+        let p = super::super::parse_scroll_probe("\t0\t0\t1").unwrap();
+        assert!(p.alternate);
+        assert_eq!(p.history, 0);
+
+        assert!(super::super::parse_scroll_probe("").is_none());
+    }
+
+    /// **読み取り専用の約束**: 採取実装が器の状態を変えるコマンドを呼ばない。
+    /// 送出・モード変更を足したくなったらここが落ちる（設計の意図を残すための番犬）
+    #[test]
+    fn 採取実装は読み取りコマンドしか使わない() {
+        let body = capture_impl_source();
+        for forbidden in [
+            "send-keys",
+            "copy-mode",
+            "resize-window",
+            "paste-buffer",
+            "kill-session",
+            "set-environment",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "採取実装に器を変えるコマンド {forbidden} が入っている（読み取り専用の約束違反）"
+            );
+        }
+        for expected in ["capture-pane", "display-message", "list-panes"] {
+            assert!(body.contains(expected), "{expected} を使っていない");
+        }
     }
 
     #[test]
