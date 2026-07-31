@@ -8,6 +8,10 @@
 //! ここに境界を追加する。
 
 pub mod facts;
+/// B9 のうち**蓋閉じ継続**の macOS 以外の実装（#697）。macOS の clamshell + sudoers +
+/// `pmset disablesleep` は `sleep_guard` が持っているので、そちらが生きている環境では持ち込まない
+#[cfg(not(target_os = "macos"))]
+pub mod lid;
 pub mod local_endpoint;
 #[cfg(windows)]
 pub mod named_pipe;
