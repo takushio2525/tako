@@ -3357,6 +3357,71 @@ fn dispatch_inner(
             }
         }
 
+        // UI 表示モード（#691 / #694）。テーマと同型の「状態確認 / 設定 / 反転」に、
+        // スターターの「コマンド入力へ」に相当するペイン単位の揮発解除を足したもの。
+        // GUI のトグル・カードも同じここを通るので UI と AI の操作が構造的に一致する
+        Request::UiMode { action, mode, pane } => {
+            use tako_core::ui_mode::UiMode;
+            let action = action.as_deref().unwrap_or("status");
+            let status_json = |host: &dyn ControlHost| {
+                let mut released: Vec<u64> = host
+                    .starter_released_panes()
+                    .iter()
+                    .map(|p| p.as_u64())
+                    .collect();
+                released.sort_unstable();
+                serde_json::json!({
+                    "ui_mode": host.ui_mode().as_str(),
+                    "available": UiMode::VALUES,
+                    "released_panes": released,
+                })
+            };
+            let apply = |host: &mut dyn ControlHost,
+                         next: UiMode|
+             -> Result<Value, DispatchError> {
+                // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。Theme と同方針）
+                if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                    let mut settings = crate::settings::load();
+                    settings.ui_mode = next.as_str().into();
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                }
+                host.set_ui_mode(next);
+                Ok(status_json(host))
+            };
+            match action {
+                "status" => Ok(status_json(host)),
+                "set" => {
+                    let raw = mode.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("set には mode が必要（terminal / gui）".into())
+                    })?;
+                    let next = UiMode::parse(raw).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!(
+                            "不明な mode: {raw:?}（terminal / gui のいずれか）"
+                        ))
+                    })?;
+                    apply(host, next)
+                }
+                "toggle" => {
+                    let next = host.ui_mode().toggled();
+                    apply(host, next)
+                }
+                // ペイン単位の揮発解除（スターターの「コマンド入力へ」と同経路）。
+                // 永続化しないので再起動すると GUI 表示に戻る（仕様 §1.3）
+                "release" | "restore" => {
+                    let (_, target) = resolve_pane(host.workspace(), pane)?;
+                    host.set_starter_released(target, action == "release");
+                    let mut json = status_json(host);
+                    json["pane"] = serde_json::json!(target.as_u64());
+                    json["released"] = serde_json::json!(action == "release");
+                    Ok(json)
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set / toggle / release / restore のいずれか）"
+                ))),
+            }
+        }
+
         Request::Telemetry { action } => {
             let action = action.as_deref().unwrap_or("status");
             match action {
@@ -8279,6 +8344,9 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        /// #694: UI 表示モードとペイン単位の揮発解除
+        ui_mode: tako_core::ui_mode::UiMode,
+        starter_released: std::collections::HashSet<u64>,
         lang_setting: tako_core::i18n::LangSetting,
         lang_resolved: Option<tako_core::i18n::Lang>,
         /// #321: 利用制限表示サービス
@@ -8317,6 +8385,8 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                ui_mode: tako_core::ui_mode::UiMode::Terminal,
+                starter_released: std::collections::HashSet::new(),
                 lang_setting: tako_core::i18n::LangSetting::System,
                 lang_resolved: None,
                 limit_service: tako_core::LimitService::Claude,
@@ -8421,6 +8491,26 @@ mod tests {
         }
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
+        }
+        // #694: UI 表示モード（GUI ライク表示）
+        fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+            self.ui_mode
+        }
+        fn set_ui_mode(&mut self, mode: tako_core::ui_mode::UiMode) {
+            self.ui_mode = mode;
+        }
+        fn starter_released_panes(&self) -> Vec<PaneId> {
+            self.starter_released
+                .iter()
+                .map(|id| PaneId::from_raw(*id))
+                .collect()
+        }
+        fn set_starter_released(&mut self, pane: PaneId, released: bool) {
+            if released {
+                self.starter_released.insert(pane.as_u64());
+            } else {
+                self.starter_released.remove(&pane.as_u64());
+            }
         }
         // #549: ウェルカムバナー
         fn welcome_banner_visible(&self) -> bool {
@@ -12530,6 +12620,73 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+    }
+
+    /// #694: UI 表示モードの status / set / toggle と、ペイン単位の揮発解除
+    #[test]
+    fn ui_modeのstatus_set_toggleが機能する() {
+        use tako_core::ui_mode::UiMode;
+        let mut host = MockHost::new();
+        let ui_mode = |host: &mut MockHost, action: Option<&str>, mode: Option<&str>| {
+            dispatch(
+                host,
+                Request::UiMode {
+                    action: action.map(str::to_string),
+                    mode: mode.map(str::to_string),
+                    pane: None,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+        // status: 既定は terminal（既存ユーザーの表示は変わらない）
+        let v = ui_mode(&mut host, None, None).unwrap();
+        assert_eq!(v["ui_mode"], "terminal");
+        assert_eq!(v["available"].as_array().unwrap().len(), 2);
+        assert_eq!(v["released_panes"].as_array().unwrap().len(), 0);
+        // set gui → host へ反映
+        let v = ui_mode(&mut host, Some("set"), Some("gui")).unwrap();
+        assert_eq!(v["ui_mode"], "gui");
+        assert_eq!(host.ui_mode, UiMode::Gui);
+        // toggle → terminal へ戻る
+        let v = ui_mode(&mut host, Some("toggle"), None).unwrap();
+        assert_eq!(v["ui_mode"], "terminal");
+        assert_eq!(host.ui_mode, UiMode::Terminal);
+        // set の不明 mode / mode 無し / 不明 action はエラー
+        assert!(ui_mode(&mut host, Some("set"), Some("simple")).is_err());
+        assert!(ui_mode(&mut host, Some("set"), None).is_err());
+        assert!(ui_mode(&mut host, Some("kiosk"), None).is_err());
+    }
+
+    /// #694: スターターの「コマンド入力へ」= ペイン単位の揮発解除も
+    /// dispatch から操作できる（開発不変条件: UI でできることは AI からもできる）
+    #[test]
+    fn ui_modeのペイン単位解除が機能する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let release = |host: &mut MockHost, action: &str, pane: Option<u64>| {
+            dispatch(
+                host,
+                Request::UiMode {
+                    action: Some(action.into()),
+                    mode: None,
+                    pane,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+        let v = release(&mut host, "release", Some(pane)).unwrap();
+        assert_eq!(v["pane"], pane);
+        assert_eq!(v["released"], true);
+        assert_eq!(v["released_panes"], serde_json::json!([pane]));
+        assert!(host.starter_released.contains(&pane));
+        // restore で戻る
+        let v = release(&mut host, "restore", Some(pane)).unwrap();
+        assert_eq!(v["released"], false);
+        assert_eq!(v["released_panes"].as_array().unwrap().len(), 0);
+        assert!(host.starter_released.is_empty());
+        // 対象ペインを解決できないときはエラー（黙って別ペインへ効かせない）
+        assert!(release(&mut host, "release", Some(9999)).is_err());
+        assert!(release(&mut host, "release", None).is_err());
     }
 
     #[test]

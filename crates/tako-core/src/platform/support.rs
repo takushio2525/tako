@@ -1306,6 +1306,15 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #694: 表示レイヤだけの切替なので、GUI 本体（#517）が動けばそのまま動く
+        key: "tako_ui_mode",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_update",
         macos: Support::Supported,
         windows: Support::Pending {

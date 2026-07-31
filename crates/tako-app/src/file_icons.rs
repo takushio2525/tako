@@ -155,6 +155,9 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("trend"),
     ui_asset!("unshelve"),
     ui_asset!("warning"),
+    // GUI ライク表示モードのトグル（#694。現在モードのアイコンを出す）
+    ui_asset!("chat_bubble"),
+    ui_asset!("prompt"),
 ];
 
 /// UI アイコンのアセットパス定数（#217。`gpui::svg().path(...)` に渡す）
@@ -209,6 +212,10 @@ pub mod ui_icon {
     pub const TREND: &str = "icons/ui/trend.svg";
     pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
     pub const WARNING: &str = "icons/ui/warning.svg";
+    /// GUI ライク表示モード中の印（#694。吹き出し = チャット）
+    pub const CHAT_BUBBLE: &str = "icons/ui/chat_bubble.svg";
+    /// ターミナル表示モード中の印（#694。プロンプト記号 `>_`）
+    pub const PROMPT: &str = "icons/ui/prompt.svg";
 }
 
 impl AssetSource for TakoAssets {

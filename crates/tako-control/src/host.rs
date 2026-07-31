@@ -224,6 +224,19 @@ pub trait UiStateHost {
     }
     /// UI テーマモードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_theme_mode(&mut self, _mode: tako_core::theme::ThemeMode) {}
+    /// UI 表示モードの現在値（Issue #694。GUI ライク表示 ⇔ ターミナル表示）
+    fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+        tako_core::ui_mode::UiMode::Terminal
+    }
+    /// UI 表示モードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
+    fn set_ui_mode(&mut self, _mode: tako_core::ui_mode::UiMode) {}
+    /// スターターの「コマンド入力へ」でターミナル表示に戻したペイン（Issue #694）。
+    /// 揮発フラグなので永続化しない = 再起動すると GUI 表示に戻る
+    fn starter_released_panes(&self) -> Vec<PaneId> {
+        Vec::new()
+    }
+    /// 同上の設定（`released=false` で GUI 表示へ戻す。再描画は実装側の責務）
+    fn set_starter_released(&mut self, _pane: PaneId, _released: bool) {}
     /// UI 表示言語の設定値（Issue #435。system / ja / en）
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
         tako_core::i18n::LangSetting::System

@@ -1608,3 +1608,16 @@
   表示レイヤのみの切替で PTY・tmux・persist 不変を裏付けつきで明記。フェーズ G1〜G4
 - 関連: エピック Issue #691、PR #692 squash merge（`200d889`）。CI は macOS 全ジョブ緑で合格
 - 次: G1（モード基盤 + スターター）の worker 割当は master 判断
+
+## 2026-07-31（#694: GUI モード G1 — モード基盤 + スターター 3 ボタン）
+- `ui_mode`（既定 terminal）を settings.json / dispatch `UiMode` / CLI `tako ui-mode` /
+  MCP `tako_ui_mode`（132 ツール）へ。判定表は `tako-core::ui_mode` の純関数
+  （材料は OSC 133 の Idle + role なし + sleep_guard の子プロセスキャッシュ = 新規ポーリング無し）、
+  分岐は render_pane の 1 箇所（**PTY リサイズの後**）。スターターは `starter.rs`
+- 仕様との差分 1 件: 「コマンド入力へ」の AI 等価操作が無いと開発不変条件を満たせないため
+  `UiMode` に `release` / `restore`（揮発・非永続）を追加。仕様書 §1.4 / §2.2 に反映
+- 検証: 品質ゲート全緑（app 290 / cli 46 / control 852 / core 497 / parity 10）+
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 93 新設）+ visual-test 新節
+  （terminal 帯 0 → GUI dark 21097 / light 18416 の可読ピクセル）+ 隔離実機の
+  CLI / MCP / 再起動往復。既存ファイルの削除行は 2 行（タブバー幅・ツール数）のみ
+- 次: G2（チャットビュー読み取り）。`PaneDisplay::Chat` と `claude_chat` は配線待ちで用意済み

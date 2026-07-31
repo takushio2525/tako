@@ -39,6 +39,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod sleep_guard;
 pub mod stale;
+pub mod ui_mode;
 pub mod update;
 pub mod webdock;
 pub mod welcome;

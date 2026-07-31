@@ -18,6 +18,11 @@ pub fn cmd_label(id: &str) -> &'static str {
         "open-update" => tr!("アップデートを開く", "Open update screen"),
         "new-tab" => tr!("新しいタブ", "New tab"),
         "toggle-theme" => tr!("テーマをライト/ダーク切替", "Toggle light/dark theme"),
+        // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
+        "toggle-ui-mode" => tr!(
+            "表示モードを切り替え（かんたん / ターミナル）",
+            "Switch view mode (simple / terminal)"
+        ),
         "toggle-files" => tr!("ファイルツリーを開閉", "Toggle file tree"),
         "toggle-drawer" => tr!("バックグラウンドドロワーを開閉", "Toggle background drawer"),
         "panel-fleet" => tr!("fleet パネルを開く", "Open fleet panel"),
@@ -54,6 +59,7 @@ mod tests {
                 cmd_label("open-update").to_string(),
                 cmd_label("new-tab").to_string(),
                 cmd_label("toggle-theme").to_string(),
+                cmd_label("toggle-ui-mode").to_string(),
                 cmd_label("toggle-files").to_string(),
                 cmd_label("toggle-drawer").to_string(),
                 cmd_label("panel-fleet").to_string(),

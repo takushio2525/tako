@@ -2375,6 +2375,38 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_ui_mode",
+            "description": "UI 表示モード（GUI ライク表示 ⇔ ターミナル表示）の状態確認・切替（Issue #691）。\
+                action=status（既定）: 現在のモードと、ターミナル表示へ戻してあるペインを返す。\
+                action=set: mode（terminal / gui）へ切り替える。action=toggle: 反転する。\
+                gui モードでは、アイドルなシェルのペインが「AI チームに任せる / AI と 1 対 1 で話す / \
+                コマンド入力へ」の 3 ボタン（スターター）になる。set / toggle は settings.json へ \
+                永続化され、全ウィンドウへ即時反映される。\
+                action=release: pane で指定したペインだけをターミナル表示に戻す（揮発。\
+                再起動すると gui 表示へ戻る）。action=restore: その解除を取り消す。\
+                表示レイヤだけの切替なので PTY・tmux セッション・実行中プロセスには影響しない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set", "toggle", "release", "restore"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["terminal", "gui"],
+                        "description": "表示モード（set 時に必須）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "release / restore の対象ペイン ID（省略時は呼び出し元ペイン）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_lang",
             "description": "UI 表示言語（日本語/英語）の状態確認・切替（Issue #435）。\
                 action=status（既定）: 言語設定（system / ja / en）と実際の表示言語を返す。\
@@ -3946,6 +3978,13 @@ fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             value: str_arg(args, "value")?.map(|s| s.to_string()),
         },
+        "tako_ui_mode" => Request::UiMode {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            mode: str_arg(args, "mode")?.map(|s| s.to_string()),
+            // release / restore 以外は pane を使わないので、ここでは既定補完だけして
+            // 必須判定は dispatch 側（action ごとの意味を知っている側）に任せる
+            pane: u64_arg(args, "pane")?.or(caller),
+        },
         "tako_limit_service" => Request::LimitService {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             service: str_arg(args, "service")?.map(|s| s.to_string()),
@@ -4991,7 +5030,8 @@ mod tests {
         // #513 の tako_config_share を追加して 129
         // #666 の tako_show_command を追加して 130
         // #680 の tako_preview_copy_code を追加して 131
-        assert_eq!(tools.len(), 131);
+        // #694 の tako_ui_mode を追加して 132
+        assert_eq!(tools.len(), 132);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -31,8 +31,32 @@ const CHAR_WIDTH_PX: f32 = 7.0;
 const LABEL_MAX_CHARS: usize = 24;
 /// タブラベルの最小文字数（縮小限界）
 const LABEL_MIN_CHARS: usize = 6;
-/// 右端コントロール群の概算幅（⌘K(210+px) + bell(30) + theme(30) + gap + margin）
-const RIGHT_CONTROLS_PX: f32 = 300.0;
+/// 右端コントロール群の概算幅
+/// （⌘K(210+px) + bell(30) + ui-mode(30) + theme(30) + gap + margin。#694 で +30）
+const RIGHT_CONTROLS_PX: f32 = 330.0;
+
+/// 1 行のヒント表示（#694 のツールチップ用の最小ビュー）。
+/// GPUI のツールチップは `AnyView` を要求するので、ドラッグゴースト（`DragGhost`）と
+/// 同じ「小さな Render 実装」パターンで用意する
+pub(crate) struct HintTooltip {
+    label: String,
+    theme: Theme,
+}
+
+impl Render for HintTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgba(self.theme.surface_2))
+            .border_1()
+            .border_color(hsla(self.theme.border_default))
+            .text_size(px(11.0))
+            .text_color(hsla(self.theme.foreground))
+            .child(SharedString::from(self.label.clone()))
+    }
+}
 
 impl TakoApp {
     /// タブ数と利用可能幅からラベルの truncate 上限文字数を決定する
@@ -705,6 +729,57 @@ impl TakoApp {
                                 .child(SharedString::from(attention.to_string())),
                         )
                     }),
+            )
+            // 表示モード切替（#694。GUI ライク ⇔ ターミナル。テーマボタンの左隣 =
+            // 「アプリ全体の見た目」と同格の概念という位置づけ。現在モードのアイコンを出す）
+            .child(
+                div()
+                    .id("ui-mode-toggle")
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_ui_mode(cx);
+                    }))
+                    // 新設ボタンなので何が起きるかを言葉で出す（アイコンだけでは
+                    // 「表示モードが変わる」と分からない）
+                    .tooltip({
+                        let theme = theme.clone();
+                        let gui = self.ui_mode.is_gui();
+                        move |_, cx| {
+                            let label = if gui {
+                                crate::ui_text::ui_mode::toggle_to_terminal()
+                            } else {
+                                crate::ui_text::ui_mode::toggle_to_gui()
+                            };
+                            cx.new(|_| HintTooltip {
+                                label: label.to_string(),
+                                theme: theme.clone(),
+                            })
+                            .into()
+                        }
+                    })
+                    .child(
+                        svg()
+                            .path(if self.ui_mode.is_gui() {
+                                ui_icon::CHAT_BUBBLE
+                            } else {
+                                ui_icon::PROMPT
+                            })
+                            .w(px(15.0))
+                            .h(px(15.0))
+                            .text_color(hsla(if self.ui_mode.is_gui() {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })),
+                    ),
             )
             // テーマ切替（カンプ: 太陽アイコン。ライト時は月。Issue #217）
             .child(
