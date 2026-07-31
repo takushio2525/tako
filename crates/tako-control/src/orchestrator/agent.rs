@@ -159,6 +159,23 @@ pub(crate) fn env_assign(k: &str, v: &str) -> String {
     }
 }
 
+/// 環境変数を**未設定へ戻す**文（コマンド行の先頭に置く。末尾に区切りを含む）。
+///
+/// 「空文字を代入する」では駄目で、変数自体を消す必要がある。PowerShell で
+/// `$env:X = ''` とすると子プロセスからは**空文字が設定された状態**に見え
+/// （実測: `Test-Path Env:X` が True）、claude は空の config パスを掴む。
+/// `$null` 代入なら子プロセスから完全に未設定として見える（実測で確認。#652）
+pub(crate) fn env_unset(k: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("$env:{k} = $null; ")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("unset {k}; ")
+    }
+}
+
 /// TAKO_ORCHESTRATOR_ROLE を設定してエージェント CLI を起動するコマンドの先頭部分
 pub(crate) fn launch_with_role(role: &str, program: &str) -> String {
     #[cfg(windows)]

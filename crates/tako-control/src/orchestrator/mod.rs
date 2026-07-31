@@ -151,6 +151,15 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// claude の既定 config ディレクトリ（`~/.claude`）。
+///
+/// `CLAUDE_CONFIG_DIR` を指定しないときに claude が使う場所で、会話は
+/// `<config dir>/projects/` 配下に保存される。transcript の所在判定（#652）と
+/// エージェント走査先の重複排除（#571）が同じ定義を共有するためにここに置く
+pub(crate) fn claude_default_config_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".claude"))
+}
+
 // --- accounts.yaml (#504) ---
 
 /// accounts.yaml のパス
@@ -1904,10 +1913,9 @@ pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// このパスが claude の既定 config ディレクトリ（`~/.claude`）を指すか。
 /// 既定を明示指定したアカウントを `Default` と二重に走査しないための判定
 fn is_claude_default_config_dir(path: &str) -> bool {
-    let Some(home) = home_dir() else {
+    let Some(default) = claude_default_config_dir() else {
         return false;
     };
-    let default = home.join(".claude");
     let given = Path::new(path.trim_end_matches(['/', '\\']));
     given == default
 }

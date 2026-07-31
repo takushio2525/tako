@@ -501,6 +501,12 @@ pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
     }
     let sid = entry.session_id.as_deref()?;
     let mut cmd = String::new();
+    // 会話の所在（config ディレクトリ）を先頭で明示する。worker がアカウント
+    // （`CLAUDE_CONFIG_DIR`）で動いていると、これが無い復旧コマンドは
+    // `No conversation found with session ID` で必ず失敗する（#652）
+    if let Some(prefix) = crate::transcript::resume_env_prefix(sid) {
+        cmd.push_str(&prefix);
+    }
     if let Some(cwd) = entry.cwd.as_deref().filter(|c| !c.is_empty()) {
         cmd.push_str(&format!("cd '{}' && ", cwd.replace('\'', "'\\''")));
     }

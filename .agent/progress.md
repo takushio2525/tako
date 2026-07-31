@@ -1610,3 +1610,17 @@
 - 関連: PR #701（Closes #658）。擬似本番 data_dir での A/B 実測（修正前 = 70→71 件へ混入 /
   修正後 = ハッシュ不変）+ 人工 dead エントリの回収 + 稼働中 worker の非回収を隔離実測。
   本番の残骸 3 件（44/46/55）は死亡を 2 系統で確認して closed へ（active 9 → 6）
+
+## 2026-07-31（#652: 復元時の claude resume が config ディレクトリを外していた問題を修正）
+- 根因は 2 段のうち②だけが Windows 側に残っていた。①transcript の多 config dir 走査は #662 で
+  既に入っていたが、②復元が組み立てるコマンドが素の `claude --resume <id>` で、会話の所在
+  （`CLAUDE_CONFIG_DIR`）を指定していなかった。claude は config dir + cwd の両方で会話をスコープ
+  するため、別 config dir の会話は `No conversation found with session ID` になる（実機実測）
+- 所在を `TranscriptLocation` として返し、非既定なら代入・既定なら未設定化を前置。**前置は
+  `orchestrator::agent` のシェル方言部品を通す**（mac 版 #661 の `export`/`unset` 直書きを
+  そのまま移植すると PowerShell ペインで構文エラーになり resume ごと落ちる）。`$env:X = ''` は
+  子プロセスから「空文字が設定済み」に見えるため `$null` 代入で消す（実測で確認）
+- 投入経路も `session.write()` の書きっぱなしから `shell_send`（#640）の送達確認フローへ移した
+- 関連: PR #696（Closes #652）。隔離実測で before = `No conversation found` /
+  after = `Claude resume 1` + 会話復元。既定 config dir の回帰 + 実在しない/不正/無しの
+  3 ケースは `新規シェル 1` でクラッシュなし
