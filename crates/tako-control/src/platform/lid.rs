@@ -99,6 +99,17 @@ impl SavedLidState {
             Rail::Dc => self.dc.is_some(),
         }
     }
+
+    /// 倒したいレールと**過不足なく**一致しているか。
+    ///
+    /// 「足りているか」（`wanted` を全部覆っているか）では**不十分**。
+    /// 電源条件を `always` → `ac-only` へ変えたとき、覆えてはいるので何もせず
+    /// **DC を倒しっぱなしにしてしまう**（バッテリー駆動で蓋を閉じてもスリープしない機械が残る）
+    pub fn covers_exactly(&self, wanted: &[Rail]) -> bool {
+        [Rail::Ac, Rail::Dc]
+            .iter()
+            .all(|r| self.covers(*r) == wanted.contains(r))
+    }
 }
 
 /// 元値へ戻してよいかを判定する純粋関数。
@@ -226,11 +237,11 @@ pub fn set_stay_awake(enable: bool, include_battery: bool) -> Result<bool, Strin
     if enable {
         let wanted = rails_for(include_battery);
         if let Some(ref cur) = saved {
-            // 既に目的のレールを倒しているなら何もしない
-            if wanted.iter().all(|r| cur.covers(*r)) {
+            // 既に目的のレールと過不足なく一致しているなら何もしない
+            if cur.covers_exactly(wanted) {
                 return Ok(false);
             }
-            // 電源条件が ac-only → always へ変わった等。いったん戻してから倒し直す
+            // 電源条件が変わった（ac-only ⇔ always）。いったん全部戻してから倒し直す
             restore(cur)?;
         }
         acquire(wanted).map(|_| true)
@@ -625,6 +636,37 @@ mod tests {
         assert_eq!(back.entries(), vec![(Rail::Ac, 1)]);
         assert!(back.covers(Rail::Ac));
         assert!(!back.covers(Rail::Dc), "DC は倒していない");
+    }
+
+    /// 電源条件の切り替えで倒しっぱなしを作らないこと（#697）。
+    /// 「足りているか」で判定すると always → ac-only のときに DC が残る
+    #[test]
+    fn レールの一致は過不足なく見る() {
+        let ac_only = SavedLidState {
+            scheme: "x".to_string(),
+            ac: Some(1),
+            dc: None,
+        };
+        let both = SavedLidState {
+            scheme: "x".to_string(),
+            ac: Some(1),
+            dc: Some(1),
+        };
+
+        assert!(
+            ac_only.covers_exactly(rails_for(false)),
+            "ac-only 同士は一致"
+        );
+        assert!(both.covers_exactly(rails_for(true)), "always 同士は一致");
+
+        assert!(
+            !ac_only.covers_exactly(rails_for(true)),
+            "ac-only → always は倒し足りない"
+        );
+        assert!(
+            !both.covers_exactly(rails_for(false)),
+            "always → ac-only は DC が余る（ここを見落とすと倒しっぱなしになる）"
+        );
     }
 
     #[test]

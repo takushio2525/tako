@@ -120,7 +120,9 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 直列化の錠を取る。**`Restore` より先に宣言する**こと
 /// （変数は宣言と逆順に落ちるので、錠が最後に外れて後始末まで保護される）
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 失敗しても必ず元の蓋設定へ戻すための番人
