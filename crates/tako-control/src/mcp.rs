@@ -1621,7 +1621,10 @@ pub fn tools() -> Vec<Value> {
                 session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
                 prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
                 resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。\
-                既定は active のみ。all = true で closed（明示 close 済み）も含める。",
+                既定は active のみ。all = true で closed（明示 close 済み）も含める。\
+                列挙のついでに、ペインも tmux session も 5 分以上続けて観測できない active エントリを \
+                closed（close_reason = gone）へ倒す（#658。resume_command / report は closed でも引けるので \
+                突然死からの復旧材料は失われない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

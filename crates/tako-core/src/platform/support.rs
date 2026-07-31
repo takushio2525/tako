@@ -132,10 +132,23 @@ pub mod notes {
         "tmux サーバーそのものを操作する機能。Windows に tmux は無い",
         "Operates the tmux server itself, which does not exist on Windows",
     );
-    /// #521: PDF ラスタライズは CoreGraphics / PDFKit 実装なので macOS 限定
-    pub const WIN_PDF_ONLY: Note = Note::new(
-        "PDF プレビュー専用の操作。PDF の描画が macOS（PDFKit）実装のため Windows では開けない",
-        "PDF-only operation. PDF rendering is implemented with macOS PDFKit, so it cannot open on Windows",
+    /// #521 → #693: PDF の表示・ズーム・ページ送りは Windows でも動くようになった
+    /// （OS 標準の Windows.Data.Pdf）。ただしリンク注釈を取り出す API がそのレンダラに
+    /// **存在しない**ので、リンク系の操作だけが残った。「PDF が開けない」ではないことを明記する
+    /// （誤解されると PDF を開く回避行動を取られてしまう）
+    pub const WIN_PDF_NO_LINK_API: Note = Note::new(
+        "PDF の表示・ズーム・ページ送りは動く。リンク注釈を取り出す API が \
+         Windows の PDF レンダラに無いため、リンクは常に 0 件になる",
+        "Displaying, zooming and paging through PDFs all work. The Windows PDF renderer has no API \
+         for reading link annotations, so the link list is always empty",
+    );
+    /// #521 → #693: PDF 自身の目次（しおり）を取り出す API が Windows の PDF レンダラに無い。
+    /// 目次パネルの「ページへ移動」は総ページ数から作っているのでそちらは動く
+    pub const WIN_PDF_NO_OUTLINE_API: Note = Note::new(
+        "Markdown の目次と PDF のページ送りは動く。PDF 自身の目次（しおり）を取り出す API が \
+         Windows の PDF レンダラに無いため、しおりだけが空になる",
+        "Markdown outlines and PDF page navigation work. The Windows PDF renderer has no API for \
+         reading a PDF's own bookmarks, so only the bookmark tree is empty",
     );
     /// #521: 動画再生は AVFoundation 実装なので macOS 限定
     pub const WIN_VIDEO_MACOS_ONLY: Note = Note::new(
@@ -151,15 +164,11 @@ pub mod notes {
         "The menu is owned by the OS menu bar, so tako cannot open or close it \
          (open / close unavailable). Listing the structure and invoking items both work",
     );
-    /// #521: プレビューの中身のうち PDF / 動画だけが欠ける
-    pub const WIN_PREVIEW_NO_PDF: Note = Note::new(
-        "コード・Markdown・画像は表示できる。PDF と動画は macOS 実装のため表示できない",
-        "Code, Markdown and images render. PDF and video do not, as they are implemented for macOS only",
-    );
-    /// #521: ズーム / パンの対象は PDF と画像。Windows では画像だけが残る
-    pub const WIN_PREVIEW_VIEW_IMAGE_ONLY: Note = Note::new(
-        "画像のズーム・パンは動く。PDF は macOS 実装のため開けず操作対象にならない",
-        "Zoom and pan work for images. PDF cannot be opened on Windows, so it is not a target",
+    /// #521: PDF は Windows でも開けるようになった（Windows.Data.Pdf）。
+    /// プレビューの中身で残る欠けは動画だけ
+    pub const WIN_PREVIEW_NO_VIDEO: Note = Note::new(
+        "コード・Markdown・画像・PDF は表示できる。動画は macOS 実装のため表示できない",
+        "Code, Markdown, images and PDFs render. Video does not, as it is implemented for macOS only",
     );
     // #617 で B8 の Windows 実装（explorer.exe /select, / ShellExecuteW /
     // SHFileOperationW + FOF_ALLOWUNDO）が入り、`tako_file_op` は全操作が動くようになった。
@@ -563,8 +572,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_file",
         macos: Support::Supported,
+        // #521: PDF は OS 標準の Windows.Data.Pdf で開けるようになった。残るのは動画だけ
         windows: Support::Degraded {
-            note: notes::WIN_PREVIEW_NO_PDF,
+            note: notes::WIN_PREVIEW_NO_VIDEO,
         },
     },
     Feature {
@@ -731,23 +741,28 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_follow_link",
         macos: Support::Supported,
+        // #521 で PDF は開けるようになったが、リンク注釈の抽出 API が
+        // Windows.Data.Pdf に無い（#693）
         windows: Support::Pending {
-            note: notes::WIN_PDF_ONLY,
-            issue: 521,
+            note: notes::WIN_PDF_NO_LINK_API,
+            issue: 693,
         },
     },
     Feature {
         key: "tako_preview_link_list",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PDF_ONLY,
-            issue: 521,
+            note: notes::WIN_PDF_NO_LINK_API,
+            issue: 693,
         },
     },
     Feature {
         key: "tako_preview_outline",
         macos: Support::Supported,
-        windows: Support::Supported,
+        // Markdown の目次と PDF のページ送りは動く。PDF のしおりだけ取れない（#693）
+        windows: Support::Degraded {
+            note: notes::WIN_PDF_NO_OUTLINE_API,
+        },
     },
     Feature {
         key: "tako_preview_redo",
@@ -782,9 +797,8 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_view",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_PREVIEW_VIEW_IMAGE_ONLY,
-        },
+        // #521: ズーム / パンの対象は PDF と画像。両方 Windows で動くようになった
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_read_pane",

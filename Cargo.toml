@@ -75,6 +75,10 @@ ureq = "3"
 # 未メンテの winres（最終更新 2021）ではなく、その保守フォークである winresource を採る。
 # .rc を自前で書く embed-resource と違い Cargo のメタデータからバージョン情報を組める
 winresource = "0.1"
+# Windows の OS 標準 PDF レンダラ `Windows.Data.Pdf` を呼ぶ WinRT バインディング（#521）。
+# Microsoft 公式・MIT OR Apache-2.0。既に gpui / wry 経由で依存グラフの中にいる 0.62 系へ揃える。
+# 参照するのは cfg(windows) のときだけなので macOS のビルドグラフには載らない
+windows = { version = "0.62", features = ["Data_Pdf", "Foundation", "Storage_Streams"] }
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）

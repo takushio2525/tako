@@ -84,11 +84,19 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
 }
 
 /// オーケストレーター設定ディレクトリのパス。
-/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）
+/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）。
+/// `TAKO_ORCHESTRATOR_DIR` で直接差し替えられる（隔離用。#658: セルフテストは
+/// data_dir を本番のまま使うため、これが無いと projects.yaml / ledger.yaml へ
+/// 検証用のエントリが混ざる）
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = test_config_dir_override().get() {
         return Some(dir.clone());
+    }
+    if let Some(dir) = std::env::var_os("TAKO_ORCHESTRATOR_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
     }
     tako_core::paths::data_dir().map(|d| d.join("orchestrator"))
 }
@@ -141,6 +149,15 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
+}
+
+/// claude の既定 config ディレクトリ（`~/.claude`）。
+///
+/// `CLAUDE_CONFIG_DIR` を指定しないときに claude が使う場所で、会話は
+/// `<config dir>/projects/` 配下に保存される。transcript の所在判定（#652）と
+/// エージェント走査先の重複排除（#571）が同じ定義を共有するためにここに置く
+pub(crate) fn claude_default_config_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".claude"))
 }
 
 // --- accounts.yaml (#504) ---
@@ -1896,10 +1913,9 @@ pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// このパスが claude の既定 config ディレクトリ（`~/.claude`）を指すか。
 /// 既定を明示指定したアカウントを `Default` と二重に走査しないための判定
 fn is_claude_default_config_dir(path: &str) -> bool {
-    let Some(home) = home_dir() else {
+    let Some(default) = claude_default_config_dir() else {
         return false;
     };
-    let default = home.join(".claude");
     let given = Path::new(path.trim_end_matches(['/', '\\']));
     given == default
 }

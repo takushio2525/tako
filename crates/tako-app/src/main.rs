@@ -32,6 +32,7 @@ mod keybindings;
 mod launch_assurance;
 mod menu_bar;
 mod overlays;
+mod platform;
 mod preview;
 mod preview_render;
 mod preview_watch;
@@ -107,16 +108,25 @@ const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 復元時に新しいシェルへ投入する Claude resume コマンドを安全条件つきで組み立てる。
 /// backend 生存時はプロセスごと再 attach するため、二重起動を避けて None。
+///
+/// `location` は transcript の所在（`None` = 会話が見つからない = resume 不可）。
+/// **所在の config ディレクトリを env で明示する**のが要点で、これが無いと
+/// アカウント（`CLAUDE_CONFIG_DIR`）で動いていたペインは復元後に
+/// `No conversation found with session ID` になり会話が戻らない（Issue #652）。
+///
+/// 末尾に改行は付けない。送達は `shell_send`（#640）が本文と Enter を分けて送り、
+/// エコーを確認してから実行させる（書きっぱなしだと器が起動直後の入力を落とす）
 fn claude_resume_command(
     backend_alive: bool,
     session_id: Option<&str>,
-    transcript_exists: bool,
-) -> Option<Vec<u8>> {
-    let session_id = (!backend_alive && transcript_exists)
-        .then_some(session_id)
-        .flatten()
-        .filter(|id| tako_control::transcript::is_valid_session_id(id))?;
-    Some(format!("claude --resume {session_id}\r").into_bytes())
+    location: Option<&tako_control::transcript::TranscriptLocation>,
+) -> Option<String> {
+    if backend_alive {
+        return None;
+    }
+    let session_id = session_id.filter(|id| tako_control::transcript::is_valid_session_id(id))?;
+    let prefix = tako_control::transcript::resume_env_prefix_for(location?);
+    Some(format!("{prefix}claude --resume {session_id}"))
 }
 
 /// タブバーの高さ（px）
@@ -2426,14 +2436,16 @@ impl TakoApp {
                     app.pane_logs_lock()
                         .seed_history(pane.as_u64(), &meta, history as usize);
                 }
-                let transcript_exists = r
+                // 会話の所在（どの claude config ディレクトリか）まで解決する。
+                // 見つからなければ resume 不可 = 新規シェルへ落とす（#652）
+                let transcript_location = r
                     .claude_session_id
                     .as_deref()
-                    .is_some_and(|id| tako_control::transcript::find_transcript(id).is_some());
+                    .and_then(tako_control::transcript::locate_transcript);
                 let resume_command = claude_resume_command(
                     backend_alive,
                     r.claude_session_id.as_deref(),
-                    transcript_exists,
+                    transcript_location.as_ref(),
                 );
                 if let Some(session_id) = &r.claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
@@ -2458,10 +2470,12 @@ impl TakoApp {
                     // tmux サーバーごと消える PC 再起動では新しいログインシェルを起動し、
                     // 保存済みの会話だけを明示 resume する。入力を PTY にキューすることで、
                     // Claude 終了後は元のシェルへ戻れる（明示コマンド spawn だとペインも終了する）。
-                    if let Some(session) = app.terminals.get(&pane) {
-                        session.write(command);
-                        resumed_claude += 1;
-                    }
+                    //
+                    // #640: ここは**書きっぱなしにしてはいけない**。器（psmux）は起動直後の
+                    // 入力を落とすので、素の write だと復元直後の resume が無言で消える。
+                    // エコー確認つきの送達フローへ載せる（起動が間に合わなければ次 tick へ持ち越す）
+                    app.queue_command_flow(pane, command);
+                    resumed_claude += 1;
                 } else {
                     fresh_shells += 1;
                 }
@@ -5072,6 +5086,26 @@ impl TakoApp {
         }
     }
 
+    /// 明示 close されたペインの worker レジストリエントリを closed にする（#658）。
+    ///
+    /// dispatch の Close（CLI / MCP 経由）は以前から記録していたが、GUI 経路
+    /// （× ボタン・cmd+W・タブ close）は記録しておらず、**器ごと殺した worker が
+    /// active のまま残り続けていた**（#658 の残骸の主因）。
+    /// `CloseReason::Exited`（PTY 死亡）は #390 の方針どおり倒さない
+    /// ——「ペインが消えても worker は生きている」追跡を維持するため。
+    /// セカンダリモードはプライマリのレジストリを触らない
+    fn mark_worker_closed(&self, pane_id: PaneId, reason: CloseReason) {
+        if reason != CloseReason::Explicit || self.secondary {
+            return;
+        }
+        if let Err(e) = tako_control::orchestrator::registry::mark_closed_by_pane(
+            pane_id.as_u64(),
+            "explicit_close",
+        ) {
+            eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+        }
+    }
+
     fn remove_pane_with(&mut self, pane_id: PaneId, reason: CloseReason, cx: &mut Context<Self>) {
         let Some(tab_id) = self
             .workspace
@@ -5148,6 +5182,7 @@ impl TakoApp {
                 self.dock_webview_of(pane_id);
                 self.drop_tmux_view_session(pane_id);
                 self.drop_backend_session_with(pane_id, reason);
+                self.mark_worker_closed(pane_id, reason);
             }
             Err(_) => {
                 // LastPane: タブごと閉じる
@@ -5207,6 +5242,7 @@ impl TakoApp {
                     self.dock_webview_of(id);
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
+                    self.mark_worker_closed(id, reason);
                 }
             }
             Err(_) => {
@@ -5229,6 +5265,7 @@ impl TakoApp {
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
+                    self.mark_worker_closed(id, reason);
                 }
                 // ペインログの最終フラッシュ（Issue #112 B。アプリ終了直前に書き残す）
                 for (id, data) in log_closes {
@@ -16741,6 +16778,43 @@ fn open_viewport_window(
     }
 }
 
+/// セルフテスト起動（`TAKO_SELF_TEST=1`）で本番から隔離する env の既定値（Issue #658）。
+///
+/// セルフテストは**データディレクトリを本番のまま**使う（layout.json は secondary
+/// モードで触らない、settings.json は書かない、という個別の作り込みで守ってきた）。
+/// そのため data_dir 配下に新しい永続ファイルが増えるたびに隔離漏れが生まれる:
+/// 実際 workers.yaml（#390）と orchestrator/（ledger.yaml・projects.yaml）は漏れており、
+/// 項目 72（#165 のレイアウト検証）の spawn 4 件が**本番のレジストリと台帳**に
+/// 積まれていた（#658 で 9 日間 active のまま残っているのを実測）。
+///
+/// 隔離対象を 1 箇所に集めて宣言し、テストで固定する。呼び出し側は「未設定のときだけ
+/// 入れる」ので、明示指定（TAKO_ISOLATED / 検証スクリプト）は常に尊重される
+fn self_test_isolation_defaults(
+    pid: u32,
+    tmp: &std::path::Path,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    vec![
+        // セッションカタログ / ペインログ（Issue #112）
+        (
+            "TAKO_SESSIONS_FILE",
+            tmp.join(format!("tako-st-sessions-{pid}.yaml")),
+        ),
+        (
+            "TAKO_PANE_LOG_DIR",
+            tmp.join(format!("tako-st-pane-logs-{pid}")),
+        ),
+        // worker レジストリ（Issue #390）と orchestrator 設定 = 台帳 / プロジェクト（#292 / #303）
+        (
+            "TAKO_WORKERS_FILE",
+            tmp.join(format!("tako-st-workers-{pid}.yaml")),
+        ),
+        (
+            "TAKO_ORCHESTRATOR_DIR",
+            tmp.join(format!("tako-st-orchestrator-{pid}")),
+        ),
+    ]
+}
+
 fn main() {
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
@@ -16823,19 +16897,14 @@ fn main() {
             std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
     }
-    // セルフテストはセッションカタログ / ペインログ（Issue #112）も本番から隔離する
+    // セルフテストは本番の永続ファイルへ触らない（Issue #112 / #658）。
+    // 隔離対象の一覧は self_test_isolation_defaults が正（漏れをテストで固定してある）
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
-        if std::env::var_os("TAKO_SESSIONS_FILE").is_none() {
-            std::env::set_var(
-                "TAKO_SESSIONS_FILE",
-                std::env::temp_dir().join(format!("tako-st-sessions-{}.yaml", std::process::id())),
-            );
-        }
-        if std::env::var_os("TAKO_PANE_LOG_DIR").is_none() {
-            std::env::set_var(
-                "TAKO_PANE_LOG_DIR",
-                std::env::temp_dir().join(format!("tako-st-pane-logs-{}", std::process::id())),
-            );
+        for (key, value) in self_test_isolation_defaults(std::process::id(), &std::env::temp_dir())
+        {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+            }
         }
     }
     // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
@@ -17901,6 +17970,31 @@ mod self_test {
             let wait = |cx: &mut AsyncApp, ms: u64| {
                 cx.background_executor().timer(Duration::from_millis(ms))
             };
+
+            // 0. 隔離の前提条件（#658）: セルフテストが本番の orchestrator 状態
+            //    （workers.yaml / orchestrator/ の ledger・projects）へ書かないこと。
+            //    項目 72 の spawn 4 件が本番レジストリに積まれ、9 日間 active のまま
+            //    残っていた実害の再発防止。**必ず最初に検査する**——隔離は他の全項目の
+            //    前提であり、どれか 1 つでも本番へ書いてしまってからでは遅い
+            {
+                let data_dir = tako_core::paths::data_dir();
+                let registry = tako_control::orchestrator::registry::registry_path();
+                let orch = tako_control::orchestrator::config_dir();
+                // データディレクトリ配下（= 実運用の workers.yaml / orchestrator/）を
+                // 指していたら隔離漏れ。TAKO_ISOLATED の有無に関係なく専用の一時パスを使う
+                let outside = |p: &Option<std::path::PathBuf>| match (p, &data_dir) {
+                    (Some(p), Some(dir)) => !p.starts_with(dir),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if let (Some(r), Some(o)) = (&registry, &orch) {
+                    println!("selftest isolation: workers={} orchestrator={}", r.display(), o.display());
+                }
+                check(
+                    outside(&registry) && outside(&orch),
+                    "セルフテストの worker レジストリ / orchestrator 設定が本番の外",
+                );
+            }
 
             // 1. 起動 + 素の入力経路
             wait(cx, 2500).await;
@@ -25436,22 +25530,118 @@ mod scroll_tests {
 }
 
 #[cfg(test)]
+mod self_test_isolation_tests {
+    use super::self_test_isolation_defaults;
+
+    /// #658: セルフテストが本番の永続ファイルへ書かないことを、隔離対象の宣言で固定する。
+    /// data_dir 配下に永続ファイルが増えたらここへ足す（足し忘れ = 本番汚染）
+    #[test]
+    fn セルフテストはorchestrator状態を本番から隔離する() {
+        let tmp = std::path::Path::new("/tmp/isolated");
+        let vars = self_test_isolation_defaults(4242, tmp);
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        for required in [
+            "TAKO_SESSIONS_FILE",
+            "TAKO_PANE_LOG_DIR",
+            // #658 の本体: worker レジストリ（workers.yaml）と台帳 / プロジェクト
+            "TAKO_WORKERS_FILE",
+            "TAKO_ORCHESTRATOR_DIR",
+        ] {
+            assert!(
+                keys.contains(&required),
+                "{required} がセルフテストの隔離対象から漏れている"
+            );
+        }
+        // 全ての行き先が隔離ディレクトリ配下 + プロセス固有（並行実行で衝突しない）
+        for (key, path) in &vars {
+            assert!(
+                path.starts_with(tmp),
+                "{key} の行き先が隔離ディレクトリの外にある: {}",
+                path.display()
+            );
+            assert!(
+                path.to_string_lossy().contains("4242"),
+                "{key} の行き先が pid で分かれていない: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod persist_resume_tests {
     use super::claude_resume_command;
+    use std::path::PathBuf;
+    use tako_control::transcript::TranscriptLocation;
+
+    const ID: &str = "a45899a8-96a6-4fa6-9bf6-71df53307878";
+
+    /// 既定 config dir に会話がある所在
+    fn default_location() -> TranscriptLocation {
+        TranscriptLocation {
+            path: PathBuf::from("/home/u/.claude/projects/p").join(format!("{ID}.jsonl")),
+            config_dir: PathBuf::from("/home/u/.claude"),
+            is_default: true,
+        }
+    }
+
+    /// アカウント（別 config dir）に会話がある所在
+    fn account_location() -> TranscriptLocation {
+        TranscriptLocation {
+            path: PathBuf::from("/home/u/.claude-univ/projects/p").join(format!("{ID}.jsonl")),
+            config_dir: PathBuf::from("/home/u/.claude-univ"),
+            is_default: false,
+        }
+    }
 
     #[test]
     fn backend消失時だけ検証済みclaudeをresumeする() {
-        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
-        assert_eq!(
-            claude_resume_command(false, Some(id), true),
-            Some(format!("claude --resume {id}\r").into_bytes())
-        );
+        let loc = default_location();
+        let cmd = claude_resume_command(false, Some(ID), Some(&loc)).expect("resume されるはず");
+        assert!(cmd.ends_with(&format!("claude --resume {ID}")), "{cmd}");
         // 通常の tako 再起動は既存プロセスへ再 attach し、Claude を二重起動しない
-        assert_eq!(claude_resume_command(true, Some(id), true), None);
-        // transcript 不在・不正 ID・ID 不明を推測で起動しない
-        assert_eq!(claude_resume_command(false, Some(id), false), None);
-        assert_eq!(claude_resume_command(false, Some("../../bad"), true), None);
-        assert_eq!(claude_resume_command(false, None, true), None);
+        assert_eq!(claude_resume_command(true, Some(ID), Some(&loc)), None);
+        // transcript 不在（所在が引けない）・不正 ID・ID 不明を推測で起動しない
+        assert_eq!(claude_resume_command(false, Some(ID), None), None);
+        assert_eq!(
+            claude_resume_command(false, Some("../../bad"), Some(&loc)),
+            None
+        );
+        assert_eq!(claude_resume_command(false, None, Some(&loc)), None);
+    }
+
+    /// #652 の本丸: 所在の config ディレクトリがコマンドの**先頭**に必ず載る。
+    /// 載っていないと復元後の claude は既定 config dir で会話を探して
+    /// `No conversation found with session ID` になる
+    #[test]
+    fn resumeコマンドは会話の所在をenvで明示する() {
+        let cmd = claude_resume_command(false, Some(ID), Some(&account_location())).unwrap();
+        assert!(
+            cmd.starts_with(&tako_control::transcript::resume_env_prefix_for(
+                &account_location()
+            )),
+            "アカウントの config dir を先頭で指定する: {cmd}"
+        );
+        assert!(cmd.contains(".claude-univ"), "{cmd}");
+
+        // 既定 config dir の会話は「未設定へ戻す」。tako 自身が CLAUDE_CONFIG_DIR つきで
+        // 起動されていても、既定の会話を既定で開けるようにするため
+        let cmd = claude_resume_command(false, Some(ID), Some(&default_location())).unwrap();
+        assert!(!cmd.contains(".claude-univ"), "{cmd}");
+        assert!(
+            cmd.starts_with(&tako_control::transcript::resume_env_prefix_for(
+                &default_location()
+            )),
+            "{cmd}"
+        );
+    }
+
+    /// 送達は shell_send（#640）が本文と Enter を分けて送るので、
+    /// ここで改行を混ぜてはいけない（混ぜるとエコー照合が本文と一致しなくなる）
+    #[test]
+    fn resumeコマンドに改行を含めない() {
+        let cmd = claude_resume_command(false, Some(ID), Some(&account_location())).unwrap();
+        assert!(!cmd.contains('\r') && !cmd.contains('\n'), "{cmd}");
     }
 }
 

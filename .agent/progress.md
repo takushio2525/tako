@@ -1598,6 +1598,44 @@
 - 関連: PR（Closes #653）。claude をスタブへ差し替えた隔離 e2e で、起動プロセスが受け取った
   `CLAUDE_CONFIG_DIR` を継承あり / なしの 2 条件 × 5 ケースで実測
 
+## 2026-07-31（#658: セルフテストのレジストリ汚染 + 死んだ worker エントリの GC）
+- 隔離漏れ: `TAKO_SELF_TEST=1` は data_dir を本番のまま使う作りで、あとから増えた
+  workers.yaml（#390）と orchestrator/（ledger・projects）に逃げ先が無く、項目 72 の
+  spawn 4 件が本番へ積まれていた。隔離対象を `self_test_isolation_defaults` へ集約 +
+  `TAKO_ORCHESTRATOR_DIR` 新設 + セルフテスト項目 0（最初に走る隔離検査）
+- GC: GUI 経路の close（× / cmd+W / タブ close）が無記録だったのを dispatch と同じ扱いに。
+  加えて `workers` の列挙で「ペインも器も見えない」active に `dead_since` を刻み、
+  5 分続いたものだけ closed（gone）へ倒す。1 回の観測では倒さないので過渡状態で生き物を
+  落とさない。表示と GC の判定は `liveness()` に一本化
+- 関連: PR #701（Closes #658）。擬似本番 data_dir での A/B 実測（修正前 = 70→71 件へ混入 /
+  修正後 = ハッシュ不変）+ 人工 dead エントリの回収 + 稼働中 worker の非回収を隔離実測。
+  本番の残骸 3 件（44/46/55）は死亡を 2 系統で確認して closed へ（active 9 → 6）
+
+## 2026-07-31（#652: 復元時の claude resume が config ディレクトリを外していた問題を修正）
+- 根因は 2 段のうち②だけが Windows 側に残っていた。①transcript の多 config dir 走査は #662 で
+  既に入っていたが、②復元が組み立てるコマンドが素の `claude --resume <id>` で、会話の所在
+  （`CLAUDE_CONFIG_DIR`）を指定していなかった。claude は config dir + cwd の両方で会話をスコープ
+  するため、別 config dir の会話は `No conversation found with session ID` になる（実機実測）
+- 所在を `TranscriptLocation` として返し、非既定なら代入・既定なら未設定化を前置。**前置は
+  `orchestrator::agent` のシェル方言部品を通す**（mac 版 #661 の `export`/`unset` 直書きを
+  そのまま移植すると PowerShell ペインで構文エラーになり resume ごと落ちる）。`$env:X = ''` は
+  子プロセスから「空文字が設定済み」に見えるため `$null` 代入で消す（実測で確認）
+- 投入経路も `session.write()` の書きっぱなしから `shell_send`（#640）の送達確認フローへ移した
+- 関連: PR #696（Closes #652）。隔離実測で before = `No conversation found` /
+  after = `Claude resume 1` + 会話復元。既定 config dir の回帰 + 実在しない/不正/無しの
+  3 ケースは `新規シェル 1` でクラッシュなし
+
+## 2026-07-31（#521: Windows の PDF プレビュー（MVP）— 抽象境界 B12 の新設）
+- OS 標準の `Windows.Data.Pdf`（WinRT）を採用。PDFium は `pdfium.dll` 約 6〜11MB の配布物追加が
+  MVP に見合わず、MuPDF は AGPL、pdf-rs は描画品質不足で見送り。`windows` crate は既に
+  gpui / wry 経由で依存グラフにいるため Cargo.lock の差分は 1 行。macOS 実装は無改変で
+  `platform/pdf/macos.rs` へ移設（トークン列一致を機械確認）し、呼び出し側から cfg が消えた
+- 罠: 1 ページでも描画すると終了処理で GPU ドライバ DLL の中で `0xC0000005`。1 度描画した
+  `PdfDocument` を 1 つ解放せず残すと消えることを実測し、「番人」を境界の内側に置いた
+  （`TAKO_PDF_NO_DEVICE_PIN=1` で回避の要否を再確認できる）
+- テキストレイヤ・しおり・リンク注釈は API が無いので `PdfCapabilities` で構造化して空を返す（→ #693）
+- 次: macOS でのビルドと目視（この機ではコンパイル不可）/ 実機ユーザー目視
+
 ## 2026-07-31（#697: Windows の蓋閉じ継続 — #524 の「API が無い」を実測で否定）
 
 - #646 が `lid_control_supported()` を macOS 固有として落とした前提（「Windows に相当する
@@ -1610,6 +1648,8 @@
 - 残留対策 3 段: 倒す前に元値をディスクへ保存 / 正常終了で即復元（**電源要求と違い OS が回収しない**）/
   起動時の残留復元。ユーザーが手で変えていたら復元しない。文言も「sudoers」から
   「初回セットアップの要否」へ抽象化し、Windows に macOS 専用の案内が出ないようにした
-- 関連: PR（Closes #697）。実機テスト 5 本（独立 FFI プローブで電源プランを外から観測）+
-  単体 20 本。終了時復元は**修正を外すと FAILED になること**まで確認。マトリクスの note を
+- 関連: PR #706（Closes #697）。実機テスト 5 本（独立 FFI プローブで電源プランを外から観測）+
+  単体 21 本。終了時復元は**修正を外すと FAILED になること**まで確認。マトリクスの note を
   実態へ直し doc 再生成。tako-control 823 passed / 失敗 11 件は baseline と同一
+- 次: macOS のコンパイルは未検証（`ring` が絡み Windows からクロスチェック不可）→ CI 待ち。
+  実際に蓋を閉じての確認は manual-checks.md に手順を追加
