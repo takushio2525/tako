@@ -1624,3 +1624,14 @@
 - 関連: PR #696（Closes #652）。隔離実測で before = `No conversation found` /
   after = `Claude resume 1` + 会話復元。既定 config dir の回帰 + 実在しない/不正/無しの
   3 ケースは `新規シェル 1` でクラッシュなし
+
+## 2026-07-31（#521: Windows の PDF プレビュー（MVP）— 抽象境界 B12 の新設）
+- OS 標準の `Windows.Data.Pdf`（WinRT）を採用。PDFium は `pdfium.dll` 約 6〜11MB の配布物追加が
+  MVP に見合わず、MuPDF は AGPL、pdf-rs は描画品質不足で見送り。`windows` crate は既に
+  gpui / wry 経由で依存グラフにいるため Cargo.lock の差分は 1 行。macOS 実装は無改変で
+  `platform/pdf/macos.rs` へ移設（トークン列一致を機械確認）し、呼び出し側から cfg が消えた
+- 罠: 1 ページでも描画すると終了処理で GPU ドライバ DLL の中で `0xC0000005`。1 度描画した
+  `PdfDocument` を 1 つ解放せず残すと消えることを実測し、「番人」を境界の内側に置いた
+  （`TAKO_PDF_NO_DEVICE_PIN=1` で回避の要否を再確認できる）
+- テキストレイヤ・しおり・リンク注釈は API が無いので `PdfCapabilities` で構造化して空を返す（→ #693）
+- 次: macOS でのビルドと目視（この機ではコンパイル不可）/ 実機ユーザー目視

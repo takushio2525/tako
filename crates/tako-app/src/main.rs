@@ -32,6 +32,7 @@ mod keybindings;
 mod launch_assurance;
 mod menu_bar;
 mod overlays;
+mod platform;
 mod preview;
 mod preview_render;
 mod preview_watch;
