@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::{
-    BackendCapabilities, BackendError, DetachedAccess, HistoryProbe, Holder, HolderKind,
-    ScrollbackAuthority, SessionBackend, SessionInfo, SessionRef,
+    BackendCapabilities, BackendError, DetachedAccess, DetachedCapture, HistoryProbe, Holder,
+    HolderKind, ScrollProbe, ScrollbackAuthority, SessionBackend, SessionInfo, SessionRef,
 };
 use crate::terminal::SpawnOptions;
 
@@ -68,6 +68,7 @@ impl SessionBackend for TmuxBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             survives_app_exit: true,
+            detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
             label: "tmux",
@@ -169,7 +170,7 @@ impl SessionBackend for TmuxBackend {
     }
 }
 
-impl DetachedAccess for TmuxBackend {
+impl DetachedCapture for TmuxBackend {
     fn capture_screen(&self, session: &SessionRef) -> Result<Vec<String>, BackendError> {
         crate::tmux::capture_session(self.sock(), session.as_str()).map_err(BackendError::Operation)
     }
@@ -236,6 +237,27 @@ impl DetachedAccess for TmuxBackend {
             .collect()
     }
 
+    /// tmux の `#{scroll_position}` は copy mode の外では**空文字**に展開される
+    /// （psmux は 0 を返す）。どちらも「最下部」なので 0 へ寄せる
+    fn scroll_probe(&self, session: &SessionRef) -> Option<ScrollProbe> {
+        let output = crate::tmux::tmux_command(self.sock())
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={}:", session.as_str()),
+                "#{scroll_position}\t#{history_size}\t#{pane_in_mode}\t#{alternate_on}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        super::parse_scroll_probe(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+impl DetachedAccess for TmuxBackend {
     fn send_text(&self, session: &SessionRef, text: &str) -> Result<(), BackendError> {
         crate::tmux::send_keys(self.sock(), session.as_str(), text).map_err(BackendError::Operation)
     }
