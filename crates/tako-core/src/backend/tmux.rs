@@ -176,6 +176,11 @@ impl SessionBackend for TmuxBackend {
             .collect()
     }
 
+    // `pane_in_mode` / `copy_mode_exit_bytes` は**あえて既定（None）のまま**にしてある。
+    // tmux ペインは `ScrollbackAuthority::Backend` なのでホイールはミラー経路
+    // （#159）を通り、tako が tmux を copy mode に置くことがそもそも無い（#686 は
+    // ミラーが使えない psmux 固有の縮退）。実装しても一度も呼ばれない死にコードになる
+
     fn session_cwd(&self, session: &SessionRef) -> Option<String> {
         crate::tmux_backend::session_cwd(&self.socket, session.as_str())
     }

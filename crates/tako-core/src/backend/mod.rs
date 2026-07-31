@@ -285,6 +285,25 @@ pub trait SessionBackend: Send + Sync {
         Vec::new()
     }
 
+    /// 器がそのペインを copy mode（履歴閲覧）に置いているか。
+    /// **答えられない器は `None`**（呼び出し側は「分からない」として扱い、
+    /// 器へ副作用のある操作をしない）。#686
+    fn pane_in_mode(&self, _session: &SessionRef) -> Option<bool> {
+        None
+    }
+
+    /// copy mode から抜けるために **PTY へ前置する**バイト列（in-band 解除。#686）。
+    ///
+    /// ソケット経由（`send-keys -X cancel`）ではなく in-band にするのは**順序のため**。
+    /// 打鍵は PTY へ書かれるので、解除も同じバイト列に混ぜれば器が必ず先に解除を見る。
+    /// ソケット側へ撃つと「解除が届く前に打鍵が copy mode に食われる」競合が残り、
+    /// 打鍵経路に器のサブプロセスを同期で挟めば #212 / #168 で排除した UI 停止が戻る。
+    /// **解除の要否を知らないまま撃ってはいけない**（copy mode でなければ
+    /// このバイト列はそのままシェルへ入力される）
+    fn copy_mode_exit_bytes(&self) -> Option<&'static [u8]> {
+        None
+    }
+
     /// 器の中の現在の作業ディレクトリ。orphan 復帰（#191）が復元ペインの cwd に使う
     fn session_cwd(&self, session: &SessionRef) -> Option<String>;
 

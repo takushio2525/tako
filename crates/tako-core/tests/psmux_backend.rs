@@ -620,3 +620,258 @@ fn 器の中のシェルのコードページをutf8へ固定できる() {
     let _ = std::fs::remove_file(&fixture_path);
     let _ = f.backend.kill(&name);
 }
+
+#[cfg(windows)]
+type Events = futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>;
+
+/// 画面に `needle` が出るまで PTY イベントを汲む
+#[cfg(windows)]
+fn pump(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    needle: &str,
+    attempts: usize,
+) -> bool {
+    pump_with(term, rx, attempts, |line| line.contains(needle))
+}
+
+/// `needle` **ちょうど**の行が出るまで汲む。
+/// 計算結果（`42`）のように短いマーカーは、入力エコーや `LINE 42` と
+/// 区別するために行全体の一致で見る
+#[cfg(windows)]
+fn pump_line(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    needle: &str,
+    attempts: usize,
+) -> bool {
+    pump_with(term, rx, attempts, |line| line.trim() == needle)
+}
+
+#[cfg(windows)]
+fn pump_with(
+    term: &mut tako_core::TerminalSession,
+    rx: &mut Events,
+    attempts: usize,
+    hit: impl Fn(&str) -> bool,
+) -> bool {
+    for _ in 0..attempts {
+        while let Ok(event) = rx.try_recv() {
+            term.process_event(event);
+        }
+        if term.visible_lines().iter().any(|l| hit(l)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// 遡れるだけの履歴を持つ psmux ペインを開く（#686 の 2 本が共有）。
+///
+/// **打鍵の再送が要る**: 並列テストで負荷がかかると pwsh の起動が遅れ、
+/// 先頭の数文字が食われる（既存テストと同じ実測。psmux_backend.rs の
+/// `器はクライアント切断後もattachで内容ごと戻る` を参照）
+#[cfg(windows)]
+fn open_pane_with_history(f: &Fixture, name: &SessionRef) -> (tako_core::TerminalSession, Events) {
+    let (mut term, mut rx) = tako_core::TerminalSession::spawn(
+        100,
+        30,
+        f.backend.wrap_spawn(
+            SpawnOptions {
+                command: None,
+                cwd: Some(std::env::temp_dir()),
+                env: vec![],
+            },
+            name,
+        ),
+    )
+    .expect("psmux クライアントを spawn できる");
+
+    let mut made = false;
+    for _ in 0..6 {
+        if !pump(&mut term, &mut rx, "PS ", 100) {
+            continue;
+        }
+        term.write(b"1..80 | ForEach-Object { \"LINE $_\" }\r".to_vec());
+        if pump(&mut term, &mut rx, "LINE 80", 100) {
+            made = true;
+            break;
+        }
+    }
+    assert!(
+        made,
+        "遡るための履歴が作れない: {}",
+        term.visible_lines().join("\n")
+    );
+    (term, rx)
+}
+
+/// **#686 の症状と修正**: 器が copy mode に居るあいだ打鍵はシェルへ届かない。
+/// 器へ確かめてから in-band 解除を仕込むと、同じ打鍵が届くようになる。
+///
+/// tako 本番と同じ経路（実 PTY のクライアント + `TerminalSession` のホイール転送 +
+/// `write`）で測るので、ここが通れば GUI でも同じ結果になる
+#[cfg(windows)]
+#[test]
+fn copy_mode滞在中の打鍵がin_band解除で届く() {
+    let f = fixture!("copymode");
+    let name = session("tako-m2copy000001");
+    let (mut term, mut rx) = open_pane_with_history(&f, &name);
+
+    // psmux クライアントはマウス報告を要求している（= ホイールは PTY へ転送される）
+    assert!(
+        term.mouse_reporting(),
+        "psmux クライアントがマウス報告を要求していない（前提が崩れている）"
+    );
+
+    // 器を copy mode に置き直す（前の試行で抜けているため。ホイールは tako と同じ経路）
+    let enter_copy_mode = |term: &mut tako_core::TerminalSession| -> bool {
+        // 一度 cancel してから入れ直す（飲まれた打鍵が copy mode を中途半端な
+        // 状態に残すことがあるので、毎回きれいな状態から測る）
+        f.raw(&["send-keys", "-X", "-t", &format!("{name}:"), "cancel"]);
+        std::thread::sleep(Duration::from_millis(300));
+        term.scroll_wheel(3, 10, 10);
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(150));
+            if f.backend.pane_in_mode(&name) == Some(true) {
+                return true;
+            }
+        }
+        false
+    };
+
+    // --- 上へ遡る → 器が copy mode に入る ---
+    assert!(
+        enter_copy_mode(&mut term),
+        "ホイール上で器が copy mode に入らない（前提が崩れている）"
+    );
+    assert!(term.wheel_scrolled_back(), "遡り量の勘定が付いていない");
+
+    // 打鍵は**1 キー = 1 回の `write`** で送る（GUI の `handle_key` と同じ形）。
+    // まとめて 1 回で書くと、この機の pwsh が負荷時に入力の途中数文字を落とす揺らぎ
+    // （`器はクライアント切断後もattachで内容ごと戻る` が再送している理由と同じ）に
+    // 巻き込まれ、#686 と無関係な理由で落ちる。
+    // 式は短く: 入力エコーは `20+20` / `31+11`、実行結果は `40` / `42` で取り違えない
+    let type_keys = |term: &mut tako_core::TerminalSession, keys: &str| {
+        for ch in keys.chars() {
+            let mut buf = [0u8; 4];
+            term.write(ch.encode_utf8(&mut buf).as_bytes().to_vec());
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        term.write(b"\r".to_vec());
+    };
+
+    // --- before: 解除を仕込まずに打鍵 → copy mode に食われて届かない ---
+    type_keys(&mut term, "20+20");
+    assert!(
+        !pump_line(&mut term, &mut rx, "40", 20),
+        "copy mode 中なのに打鍵が届いている（症状が再現していない）"
+    );
+
+    // --- after: 器へ確かめてから in-band 解除を仕込む → 同じ打鍵が届く ---
+    let exit = f
+        .backend
+        .copy_mode_exit_bytes()
+        .expect("psmux は in-band 解除キーを申告する");
+    // **打鍵の再送が要る**: この機の pwsh は負荷がかかると入力の途中数文字を落とす
+    // （`器はクライアント切断後もattachで内容ごと戻る` が同じ理由で再送している）。
+    // #686 の検証はあくまで「copy mode を抜けて打鍵がシェルへ届くか」なので、
+    // 化けたら遡り直して打ち直す
+    let mut delivered = false;
+    for _ in 0..6 {
+        if !enter_copy_mode(&mut term) {
+            continue;
+        }
+        term.arm_copy_mode_exit(exit);
+        type_keys(&mut term, "31+11");
+        if pump_line(&mut term, &mut rx, "42", 100) {
+            delivered = true;
+            break;
+        }
+    }
+    assert!(
+        delivered,
+        "in-band 解除を仕込んでも打鍵が届かない（器の状態: in_mode={:?}）: {}",
+        f.backend.pane_in_mode(&name),
+        term.visible_lines().join("\n")
+    );
+    assert_eq!(
+        f.backend.pane_in_mode(&name),
+        Some(false),
+        "解除後も copy mode に居る"
+    );
+    assert!(!term.wheel_scrolled_back(), "解除後は遡り量も 0 に戻る");
+    // 解除キーがシェルへ漏れていないこと（漏れると入力欄に q が残る）
+    assert!(
+        !term
+            .visible_lines()
+            .iter()
+            .any(|l| l.contains("q31+11") || l.contains("q20+20")),
+        "解除キーがシェルへ漏れている: {}",
+        term.visible_lines().join("\n")
+    );
+
+    let _ = f.backend.kill(&name);
+}
+
+/// **#686 の誤射防止の前提**: 器の**ホイール**は上下対称で、最下部へ戻ると
+/// copy mode を抜ける。だから tako は「転送したホイール報告の上下差」だけで
+/// 「器へ聞かずに copy mode ではないと言い切れる」瞬間を判定できる。
+/// ここが崩れると「下まで戻してから打鍵」でシェルへ解除キーが漏れる。
+///
+/// **ホイール限定の性質**である点が重要: 同じことをソケット側の
+/// `send-keys -X scroll-down` でやると位置は 0 に戻るが copy mode は**抜けない**
+/// （実測）。tako が使う経路（PTY へ転送する SGR 報告）で測らなければ意味が無い
+#[cfg(windows)]
+#[test]
+fn 器のホイールは上下対称で最下部でcopy_modeを抜ける() {
+    let f = fixture!("symmetry");
+    let name = session("tako-m2sym0000001");
+    let (term, _rx) = open_pane_with_history(&f, &name);
+
+    let target = format!("{name}:");
+    let pos = |f: &Fixture| -> i64 {
+        f.raw(&["display-message", "-p", "-t", &target, "#{scroll_position}"])
+            .1
+            .trim()
+            .parse()
+            .unwrap_or(-1)
+    };
+    let settle = |f: &Fixture, want: Option<bool>| -> Option<bool> {
+        let mut got = None;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(150));
+            got = f.backend.pane_in_mode(&name);
+            if got == want {
+                break;
+            }
+        }
+        got
+    };
+
+    assert_eq!(f.backend.pane_in_mode(&name), Some(false), "初期状態");
+    term.scroll_wheel(3, 10, 10);
+    assert_eq!(
+        settle(&f, Some(true)),
+        Some(true),
+        "ホイール上で copy mode へ"
+    );
+    assert!(term.wheel_scrolled_back(), "tako 側の勘定も遡り中になる");
+    let up = pos(&f);
+    assert!(up > 0, "遡れていない: pos={up}");
+
+    // 同じ報告数だけ下げると最下部へ戻り copy mode を抜ける（= 上下対称）
+    term.scroll_wheel(-3, 10, 10);
+    assert_eq!(
+        settle(&f, Some(false)),
+        Some(false),
+        "同数の下げで copy mode を抜けない（tako の即時判定の前提が崩れている）"
+    );
+    assert_eq!(pos(&f), 0, "最下部へ戻っていない");
+    assert!(
+        !term.wheel_scrolled_back(),
+        "tako 側の勘定も最下部に戻る（ここがずれると解除キーがシェルへ漏れる）"
+    );
+    let _ = f.backend.kill(&name);
+}
