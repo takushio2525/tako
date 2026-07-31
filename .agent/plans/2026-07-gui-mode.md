@@ -1,0 +1,243 @@
+# GUI ライク表示モード（初心者向け UI）詳細設計 — エピック Issue #691
+
+> 作成: 2026-07-31。対象コミット: `3eaf4f3`（main）。
+> テーマトグルの横に「GUI ⇔ ターミナル」表示切替を新設し、GUI モードでは
+> ペインを「ボタンとチャット」の画面にする。ターミナルに抵抗感がある初心者が、
+> 黒い画面を一度も直視せずに AI オーケストレーションを使い始められるようにする。
+
+## 0. コンセプトと設計原則
+
+**ターゲット**: ターミナル未経験・抵抗感のあるユーザー。障壁は「黒い画面に流れる文字」
+「何を打てばいいか分からない」「壊しそうで怖い」の 3 つ。GUI モードはこれを
+①最初の画面がボタン 3 つ（次の行動が常に明確）②AI との対話が Claude アプリ風チャット
+③スラッシュコマンドやコンテキスト管理を「知らなくても押せるボタン」に翻訳、で解消する。
+
+**設計原則**:
+
+- **表示レイヤのみの切替**: PTY / tmux バックエンド / TerminalSession / persist は両モード完全共通。
+  GUI モードは同じペインの**別レンダラ**にすぎない（`render_pane` の分岐）。だからトグルを
+  ターミナル側へ倒せば「バックで動いていたターミナル」がそのまま見える（§2.5 で裏付け）
+- **dispatch フロントエンド原則**（settings-ui 設計と同じ）: GUI の各操作は既存 / 新設の
+  dispatch を GUI 内から直接呼ぶ。CLI / MCP と同一コードパスで 1:1 が構造的に成立
+- **既存部品の再利用**: md レンダリング（preview_render）・AppTextInput（IME #561）・
+  カード UI（#666）・バナー / パレット（#549）・transcript 正規化（PWA で本番稼働中）。
+  GPUI pre-1.0 のため新規 UI 表現は増やさない
+- **規約**: 絵文字禁止（SVG アイコン）/ 色は Theme 経由 / 文言は `tr!` 日英必須
+
+**Non-goals（v1 でやらないこと）**:
+
+- codex / agy ペインのチャット化（transcript 正規化が claude 形式のみ。将来 #120 の agent 抽象で拡張）
+- alt_screen TUI（vim 等）のチャット化（構造的に不可能。ターミナル表示へフォールバック）
+- ペイン単位の表示モード永続化（§1.3。「コマンド入力へ」ボタンによる揮発的な解除のみ）
+- リモート PWA の置き換え・変更（データ源を共有するだけ。§3.3）
+- チャット履歴の横断検索・過去セッション一覧（sessions カタログ #112 との統合は将来）
+
+## 1. モードの定義と切替 UX
+
+### 1.1 モードの意味
+
+`ui_mode: "terminal"（既定） | "gui"` のグローバル 2 値。既定 terminal なので
+**既存ユーザーの体験は一切変わらない**。GUI モードにしても全ペインが変貌するのではなく、
+ペイン種別ごとに表示を決める（§2.1 判定表）。チャット化するのは claude 対話ペインだけ。
+
+### 1.2 トグル UI
+
+タブバー右端コントロール群（⌘K・ベル・テーマ）のテーマボタンの**左隣**に配置
+（tab_bar.rs の右端概算幅を +30px 更新）。アイコンは SVG 2 種を新設
+（GUI = チャット吹き出し、terminal = プロンプト記号 `>_`）。現在モードのアイコンを表示し、
+クリックでトグル。ツールチップ「かんたん表示に切り替え / ターミナル表示に切り替え」（日英）。
+⌘K パレットにも「表示モードを切り替え」を常設（welcome 3 項目と同じ流儀）。
+
+### 1.3 グローバル単位にする設計判断
+
+タブ・ペイン単位ではなく**アプリ全体で 1 つ**にする。理由:
+(a) 要望が「ナイトモード（テーマ）のトグルの横」= アプリ全体の見た目と同格の概念
+(b) 初心者にモードの入れ子（アプリは GUI だがこのタブはターミナル…）を持たせない
+(c) ペイン単位の永続状態は layout.json・復元・CLI 粒度を複雑化させる。
+判定表により GUI モード内でも自然にハイブリッド表示になるため、粒度の不足は実害がない。
+唯一の例外はスターターの「コマンド入力へ」= そのペインだけターミナル表示にする
+**揮発フラグ**（`HashSet<PaneId>`、永続化しない。再起動で GUI 表示に戻る）。
+
+### 1.4 永続化と dispatch / CLI / MCP
+
+- settings.json に `ui_mode: String` を追加（`theme` と同パターン、serde default = "terminal"）
+- dispatch `Request::UiMode { mode: Option<String> }` 新設 — 省略 = 現在値取得、
+  `gui | terminal | toggle` = 変更 + settings 保存 + 全ウィンドウ即時反映
+  （TakoApp は全窓共有 entity #339 のため cx.notify で足りる）
+- CLI `tako ui-mode [gui|terminal|toggle]`（引数なしで現在値。`tako theme` と同型）
+- MCP `tako_ui_mode`（131 → **132 ツール**。セルフテストのツール数期待値を更新）
+
+## 2. GUI モードの画面仕様
+
+### 2.1 ペイン種別ごとの表示決定（判定表）
+
+GUI モード時、各ペインは毎 render 時に以下で表示を決める（上から先勝ち）:
+
+| 条件 | 表示 |
+|---|---|
+| スターター揮発解除フラグあり | ターミナル表示 |
+| alt_screen 中（`is_alt_screen()`） | ターミナル表示 |
+| claude 対話 TUI 稼働（`agents::live_claude_sessions` の pid 祖先解決で session_id が取れる、または role が master / solo / worker で claude） | チャットビュー |
+| 子プロセスなしのアイドルシェル（既存 sleep_guard 系の子プロセス判定を再利用） | スターター |
+| それ以外（コマンド実行中・不明 TUI・codex / agy） | ターミナル表示 |
+
+判定は**保守的**に倒す: チャット化は claude と確定したときだけ。不明はターミナル表示
+（誤ってチャット化する方が、ターミナルのままより実害が大きい）。判定関数は
+tako-core / tako-control 側に純関数で切り出し、unit test 可能にする。
+
+### 2.2 スターター（空ペインの 3 ボタン）
+
+アイドルシェルのペインに、縦並びの大きなカード 3 枚（アイコン + タイトル + 1 行説明）:
+
+| カード | 押下時の動作 | 裏で起きること |
+|---|---|---|
+| AI チームに任せる（オーケストレーション） | シェルへ `tako master` + Enter を書き込み | master が claude TUI を起動 → 判定表によりチャットビューへ自動遷移 |
+| AI と 1 対 1 で話す | 同 `tako solo` | 同上 |
+| コマンド入力へ（ターミナルを使う） | 揮発解除フラグを立てターミナル表示に | 何も起動しない |
+
+- 実行方式は welcome バナーの `launch_tako_command` と同じ**シェルへのコマンド文字列書き込み**。
+  `master` / `solo` は CLI_ONLY（エージェント CLI の起動そのもので dispatch 化できない）のため
+  この方式が正であり、副次効果としてターミナル表示に切り替えるといま実行されたコマンドが
+  履歴に見える = 初心者の学習経路になる
+- プロファイル選択（G4）: カード右端のシェブロン ▾ で `profiles_dir()` / `solo_profiles_dir()` の
+  一覧をドロップダウン表示し `tako master -<profile>` を書き込む。既定プロファイルは
+  1 クリック（Code Runner #453 の再生ボタン + ▾ と同じパターン、#322 最簡原則）
+- 開発不変条件の充足: ボタン押下の等価操作は既存 CLI そのもの（`tako master` /
+  `tako ui-mode` 等）なので新設 dispatch は不要。この対応を各フェーズの 1:1 表に明記する
+
+### 2.3 チャットビュー（claude 稼働ペイン）
+
+Claude アプリ風の 3 段構成。**v1 に含める要素**:
+
+- **ヘッダ**: モデル名 + busy / idle 状態（busy = スピナー + 「考え中…」、キュー滞留 =
+  「送信済み・生成後に届きます」）+ **コンテキスト残量バー**（`claude agents --json` の
+  `contextPercentUsed`。80% 超で警告色 + 「/compact で会話を軽くできます」ヒント表示）+
+  右端に「ターミナルを表示」小ボタン（揮発解除フラグ = スターターの「コマンド入力へ」と同経路）
+- **メッセージ一覧**: `transcript::read_messages(session_id, tail=50)` を描画。
+  user = 薄い背景ブロック / assistant = 地の文で md レンダリング（preview_render の
+  Markdown 資産を再利用。コードブロック・テーブル・リンク #680 も同じ描画）。
+  tool_use = 折りたたみカード（PWA ToolCard 相当: ツール名 + summary、クリック展開）。
+  thinking は既定折りたたみ。下端自動追従 + 手動スクロールで追従解除 / 再開
+  （リモート #63 のリーダービューと同じ振る舞い）
+- **承認カード**: `detect_permission_dialog` が画面に実在を検知したときだけ表示
+  （PWA #425 と同じ条件）。選択肢をボタン化し、押下で `Respond` dispatch。
+- **入力欄**: AppTextInput（IME 対応 #561）。Enter = 送信 / Shift+Enter = 改行。
+  送信は `Send` dispatch（PromptFlow: 送達検証 #95・busy 中キュー #572 がそのまま効く）
+- **スラッシュボタン列**（入力欄の下）: v1 は 3 つ固定 —
+  「会話を軽くする（/compact）」「新しい会話（/clear、確認ダイアログつき）」「ヘルプ（/help）」。
+  平易なラベル + 実コマンドを小さく併記（学習経路）。押下 = 入力欄を経由せず Send
+
+**将来に回す**: 画像・ファイル添付 / @ファイル参照補完 / 過去セッション一覧と resume /
+メッセージ単位のコピーボタン / カスタムスラッシュボタン設定 / codex 対応。
+
+### 2.4 チャット化しない / できないペイン
+
+判定表の「ターミナル表示」に落ちたペインは既存描画そのまま（v1 では装飾を足さない)。
+alt_screen TUI は原理的にチャット化できず、シェル実行中は下手に隠すと危険なため。
+worker ペインは role=worker でも claude なら**チャットビューにする**（master が並べた worker の
+進捗を初心者も同じ見た目で読める）。ただし worker への入力は master 経由が原則のため、
+入力欄の代わりに「この AI は自動で動いています」の説明行を出す(read-only チャット)。
+
+### 2.5 「ターミナルに戻すと見える」の実現方式（裏付け）
+
+トグルは `render_pane` 内の分岐を切り替えるだけで、`TerminalSession`（PTY）・tmux
+バックエンドセッション・persist(layout.json)・スクロールミラーには一切触れない。
+チャットの送信も承認も**同じ PTY への書き込み**（Send / Respond は claude TUI に打鍵する）
+なので、ターミナル表示に切り替えると claude TUI 上に同じ会話が描画されている。
+既存で「同じペインの表示だけ切替」は preview ペインの code ⇔ markdown ⇔ 履歴トグル
+（FR-3.3 / #338）が先例。復元(#30/#177/#381)への影響もゼロ（layout.json 不変。
+`ui_mode` は settings.json 側）。
+
+## 3. データフロー設計
+
+### 3.1 読み（3 ソース、すべて既存）
+
+| データ | ソース | 更新方式 |
+|---|---|---|
+| 会話本文 | `transcript::read_messages(session_id, tail)`（正規化 JSON: role / text / thinking / tools / timestamp） | 既存 2 秒 periodic tick に相乗り + transcript ファイル mtime が変わったときだけ再読込 |
+| session_id / モデル / ctx% | `agents::live_claude_sessions`（`claude agents --json`、TTL 2s キャッシュ #168、sticky 解決 #466） | 同上（キャッシュ済みのため追加コストほぼゼロ） |
+| busy / 承認 / キュー | 画面採取（`claude_tui::is_busy` / `detect_permission_dialog` / `queued_messages_pending`） | worker_status と同じ offload 経路（UI スレッド非ブロック #168） |
+
+**楽観 echo**: 送信直後に自分の発話をローカルで即時挿入し、transcript 反映（1〜2 秒）の
+ラグを隠す。次回 transcript 読込で同内容が来たら echo を破棄して transcript を正とする。
+
+### 3.2 書き（2 経路、すべて既存 dispatch）
+
+テキスト送信 = `Send`（PromptFlow）、承認 = `Respond`。GUI 内から dispatch() を直接呼ぶ。
+新設は `UiMode` のみで、書き系の新規経路は作らない。
+
+### 3.3 リモート PWA との関係
+
+PWA チャットビュー（#23/#42/#63/#425/#439）は同じ tako-control の関数群を HTTP 越しに
+使っている。本機能は**同じデータ源を GPUI から関数直呼び**する別フロントエンド。
+表示仕様（ToolCard / ApprovalCard の表示条件、承認の実在検知原則）を PWA と揃えるが、
+PWA のコードには触れない。将来 codex 対応等でデータ源を拡張するときに両者が同時に恩恵を受ける。
+
+## 4. 実装フェーズ分割
+
+各フェーズ = worker 1 タスク。すべて品質ゲート（fmt / clippy -D warnings / test）+
+隔離セルフテスト完走が前提で、下記は追加の受け入れ条件。
+
+### G1: モード基盤 + スターター 3 ボタン
+
+- settings.json `ui_mode` / `Request::UiMode` / CLI `tako ui-mode` / MCP `tako_ui_mode`（132）/
+  タブバートグル + ⌘K パレット項目 / 判定表の「アイドルシェル → スターター」「それ以外 →
+  ターミナル」（チャット判定は G2）/ スターター 3 カード（既定プロファイル、▾ なし）
+- 受け入れ: ①ui_mode roundtrip（settings 保存 + 再起動復元）を unit + セルフテストで機械検証
+  ②MCP `tako_ui_mode` toggle → 応答と GUI 状態が一致 ③セルフテストでスターターの
+  「AI チーム」押下 → ペインのシェル入力行に `tako master` が現れる ④terminal モードでは
+  描画が現行と同一（既存セルフテスト全項目が無変更で通る）
+
+### G2: チャットビュー（読み取り）
+
+- claude 判定（§2.1）+ ヘッダ（モデル / busy / ctx バー）+ メッセージ一覧（md・ツールカード・
+  thinking 折りたたみ・自動追従）+ worker の read-only 表示 + 「ターミナルを表示」ボタン
+- 受け入れ: ①隔離実 claude ペインで対話 → user / assistant がチャットに表示される e2e
+  ②vim（alt_screen）ペインはターミナル表示のまま ③GUI ⇔ terminal 往復で tmux セッション・
+  PTY が同一（`tako list` の session が不変）④transcript 正規化の unit は既存を流用
+
+### G3: チャット操作（入力・承認）
+
+- AppTextInput 入力欄 + Send 送信 + 楽観 echo + スラッシュボタン 3 つ + 承認カード + キュー表示
+- 受け入れ: ①実 claude e2e: チャット入力欄から送信 → transcript に user 発話が現れ応答が
+  表示される ②busy 中送信 → キュー表示 → 生成完了後に自動送達（#572 経路の再利用を確認）
+  ③承認カード: permission ダイアログ実在時のみ表示され、ボタン押下でダイアログが解決する
+  ④/clear ボタンは確認ダイアログを挟む
+
+### G4: 磨き込み
+
+- プロファイル選択 ▾（master / solo 両カード）/ ctx 80% 警告 + /compact ヒント /
+  i18n 総点検（tr! 検査）/ プラットフォームマトリクス #515 への登録 / manual-checks.md 追記
+  （IME 実機・見た目）/ docs（features ページ + CLI / MCP リファレンス）
+- 受け入れ: ①▾ からプロファイル指定起動 → シェルに `tako master -<name>` が入る
+  ②パリティテスト T1〜T6 緑 ③docs build 緑
+
+## 5. リスクと対策
+
+| リスク | 対策 |
+|---|---|
+| GPUI pre-1.0 の破壊的変更 | 新規 UI は設定画面・カード・md レンダラで実績あるパターンのみで構成。独立ウィンドウや新規 FFI を使わない |
+| transcript 反映ラグ（1〜2 秒）で「反応しない」と感じる | 楽観 echo（§3.1）+ 送信直後に busy スピナー即時表示 |
+| transcript 肥大・md 描画コスト（#656 のテーブルレイアウトは重め） | tail=50 固定 + メッセージ単位の描画キャッシュ（内容ハッシュ不変なら再レイアウトしない）。perf.log の既存 watchdog で実測 |
+| IME: 複数行入力・変換中の Enter | AppTextInput は git コミット欄で実績（#561）だが複数行は未検証 → G3 の manual-checks に実 IME 項目を立てる |
+| 判定誤爆（チャット化すべきでないペインをチャット化） | 判定は claude 確定時のみ + 純関数化して unit test。誤爆時も「ターミナルを表示」ボタンで即脱出できる |
+| `claude agents --json` の一時失敗で表示が揺れる | sticky 解決（#466）が既に吸収。チャット判定も直近成功値を保持 |
+| ポーリング負荷の増加 | 新規ポーリングを作らず既存 periodic / TTL キャッシュ / offload（#168）に相乗り |
+
+## 6. 調査結果（この設計の根拠）
+
+- settings 永続化: `tako-control/src/settings.rs`（`theme: String` と同型で追加。serde default）
+- dispatch: `tako-control/src/protocol.rs:159` `Request`（`Theme` / `Welcome` が引数省略 = 現在値の先例）
+- トグル位置: `tako-app/src/tab_bar.rs:34`（右端コントロール群の概算幅コメント）
+- スターターの起動方式: `tako-app/src/main.rs:6313` `run_setup_command` / `run_master_command` →
+  `launch_tako_command`（シェルへコマンド文字列書き込み）。CLI_ONLY の根拠は
+  `tako-cli/src/main.rs:7353`（master / solo は「エージェント CLI の起動そのもの」）
+- transcript 正規化: `tako-control/src/transcript.rs:211` `normalize_lines`（role / text /
+  thinking / tools / timestamp、requestId 統合、sidechain 除外）。`read_messages(session_id, tail)`
+- session 解決: `tako-control/src/agents.rs`（pid 祖先辿り + sticky #466）。ctx% は
+  `tako-control/src/orchestrator/mod.rs:2019` `contextPercentUsed`
+- 画面採取: `tako-control/src/claude_tui.rs`（`is_busy` / `detect_permission_dialog` /
+  `queued_messages_pending` / `is_alt_screen` は dispatch Read 応答 `alt_screen` にも公開済み）
+- PWA チャットの先例: `web/tako-remote/src/components/chat-view.jsx`（ToolCard / ApprovalCard /
+  md 表示）と `api.js`（messages / input / respond）
+- md のペイン外再利用は #690（アップデート画面のリリースノート md 化、**進行中**）が並行の先例
