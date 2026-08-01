@@ -237,6 +237,12 @@ pub trait UiStateHost {
     }
     /// 同上の設定（`released=false` で GUI 表示へ戻す。再描画は実装側の責務）
     fn set_starter_released(&mut self, _pane: PaneId, _released: bool) {}
+    /// いま各ペインが何として描かれているか（Issue #720）。
+    /// terminal モードでは全部 `Terminal`。**AI が「画面に何が出ているか」を知る手段**で、
+    /// 準備中（過渡期）かどうかもここで分かる。揮発なので永続化しない
+    fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
+        Vec::new()
+    }
     /// UI 表示言語の設定値（Issue #435。system / ja / en）
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
         tako_core::i18n::LangSetting::System

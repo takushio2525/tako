@@ -3378,10 +3378,24 @@ fn dispatch_inner(
                     .map(|p| p.as_u64())
                     .collect();
                 released.sort_unstable();
+                // #720: いま各ペインが何として描かれているか（terminal / starter / chat /
+                // preparing）。揮発なので永続化しない。「チャットがまだ出ない」理由
+                // （= 過渡期の preparing なのか、判定がターミナルに倒れたのか）が分かる
+                let mut displays: Vec<(u64, &str)> = host
+                    .pane_displays()
+                    .into_iter()
+                    .map(|(pane, display)| (pane.as_u64(), display.as_str()))
+                    .collect();
+                displays.sort_unstable();
+                let pane_display: serde_json::Map<String, Value> = displays
+                    .into_iter()
+                    .map(|(pane, display)| (pane.to_string(), serde_json::json!(display)))
+                    .collect();
                 serde_json::json!({
                     "ui_mode": host.ui_mode().as_str(),
                     "available": UiMode::VALUES,
                     "released_panes": released,
+                    "pane_display": pane_display,
                 })
             };
             let apply = |host: &mut dyn ControlHost,

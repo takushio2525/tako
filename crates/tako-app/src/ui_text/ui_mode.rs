@@ -62,6 +62,29 @@ pub fn card_terminal_desc() -> &'static str {
 /// カードに小さく併記する実行コマンド（言語非依存なので tr! しない）
 pub const CARD_MASTER_COMMAND: &str = "tako master";
 pub const CARD_SOLO_COMMAND: &str = "tako solo";
+pub const CARD_SETUP_COMMAND: &str = "tako setup";
+
+/// スターター下部の控えめなリンク（#720）。カードと同格にはしない
+pub fn starter_setup_link() -> &'static str {
+    tr!("初期設定をやり直す", "Run the initial setup again")
+}
+
+// --- 準備中プレースホルダ（#720） ---
+
+/// 表示種別が確定するまでの見出し
+pub fn preparing_title() -> &'static str {
+    tr!("準備中…", "Getting ready...")
+}
+
+/// 素のシェルの起動待ち（新しいペインを作った直後）
+pub fn preparing_shell() -> &'static str {
+    tr!("この画面を用意しています", "Setting this pane up for you")
+}
+
+/// エージェント TUI の起動待ち（master / solo / worker）
+pub fn preparing_agent() -> &'static str {
+    tr!("AI を起動しています", "Starting the AI")
+}
 
 /// スターター下部の脚注。**アイコンの位置には言及しない**
 /// （「右上のボタン」と書くとペインの × と紛れる。実機スクショで確認して差し替えた）
@@ -272,6 +295,10 @@ mod tests {
                 card_terminal_title().to_string(),
                 card_terminal_desc().to_string(),
                 starter_footnote().to_string(),
+                starter_setup_link().to_string(),
+                preparing_title().to_string(),
+                preparing_shell().to_string(),
+                preparing_agent().to_string(),
                 chat_show_terminal().to_string(),
                 chat_status_busy().to_string(),
                 chat_status_idle().to_string(),
