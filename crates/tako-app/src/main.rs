@@ -32017,12 +32017,62 @@ mod self_test {
                 //      「チャット入力欄に日本語を書いて送る → transcript に自分の発話が
                 //      現れる」通し e2e（#716 の受け入れ条件 1 そのもの）。
                 //      claude CLI + 認証 + tmux が必要なため既定ではスキップする。
-                //      45c と同格の実機検証ツールという位置付け
-                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed {
-                    // 注入した仮の会話を捨てて、実 claude を起動する
+                //      45c と同格の実機検証ツールという位置付け。
+                //
+                //      **claude セッションの中から起動するときは `CLAUDE_CODE_*` を外す**:
+                //      ペイン内の claude が `CLAUDE_CODE_CHILD_SESSION` を継承すると
+                //      transcript 保存が無効化され（画面に `Transcript saving is off`）、
+                //      session_id が解決できずここは必ず落ちる（実測して突き止めた）
+                let claude_e2e = std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed;
+                // 実 claude 用に**専用の広いペイン**を用意する。項目 94 / 95 で使ったペインは
+                // ①分割を重ねて背が低い ②項目 95 の送信テストでシェルに文字が残っている
+                // ので、そのまま claude を起動すると入力欄に残骸が混ざる（実測した）
+                let claude_pane = if claude_e2e {
                     let _ = window.update(cx, |app, _, cx| {
-                        app.chat_panes.remove(&chat_pane);
-                        app.chat_echo.remove(&chat_pane);
+                        for pane in [direct_pane, alt_pane, chat_pane] {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                        }
+                        app.chat_panes.clear();
+                        app.chat_echo.clear();
+                        // 会話の実体（tmux バックエンド）が要るので persist を戻す
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Persist {
+                                enabled: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                    });
+                    wait(cx, 500).await;
+                    window.update(cx, |app, _, cx| make_pane(app, cx)).ok().flatten()
+                } else {
+                    None
+                };
+                if let Some(chat_pane) = claude_pane {
+                    // シェルがプロンプトを出すまで待つ（打鍵が捨てられないように）
+                    for _ in 0..40 {
+                        wait(cx, 100).await;
+                        let ready = window
+                            .update(cx, |app, _, _| {
+                                app.terminals.get(&chat_pane).is_some_and(|s| {
+                                    s.command_state() == tako_core::CommandState::Idle
+                                })
+                            })
+                            .unwrap_or(false);
+                        if ready {
+                            break;
+                        }
+                    }
+                    let _ = window.update(cx, |app, _, cx| {
                         app.jump_to_pane(chat_pane, cx);
                         if let Some(session) = app.terminals.get(&chat_pane) {
                             session.write(b"claude\n".to_vec());
@@ -32199,7 +32249,7 @@ mod self_test {
                         "95c: busy 中に送った 2 通目も自動で届く（#572 経路。#716）",
                     );
 
-                    // 片付け: claude を終了させてシェルへ戻す（45c と同じ 3 連打）
+                    // 片付け: claude を終了させてペインを閉じる（45c と同じ 3 連打）
                     for _ in 0..3 {
                         let _ = window.update(cx, |app, _, _| {
                             if let Some(session) = app.terminals.get(&chat_pane) {
@@ -32209,6 +32259,17 @@ mod self_test {
                         wait(cx, 600).await;
                     }
                     wait(cx, 1500).await;
+                    let _ = window.update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(chat_pane.as_u64()),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                    });
                 }
 
                 // 後片付け: 検証用ペインを閉じて terminal モードへ戻す

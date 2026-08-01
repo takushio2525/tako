@@ -67,7 +67,7 @@ tako/
 | dev（最小ターミナル起動） | `cargo run -p tako-app` |
 | **実験・検証用の隔離起動（本番 GUI 稼働中は必須。#177）** | `TAKO_ISOLATED=1 cargo run -p tako-app`（discovery / persist / tmux socket を一括隔離。個別の `TAKO_DISCOVERY_DIR` だけの隔離は本番セッション強奪を起こすため**禁止**） |
 | セルフテスト起動（入力経路 + CLI / MCP e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
-| 実 claude の Shift+Enter 改行 e2e（#28。要 claude CLI + 認証） | `TAKO_SELF_TEST=1 TAKO_SELF_TEST_CLAUDE=1 cargo run -p tako-app`（セルフテスト 45c として実行） |
+| 実 claude の e2e（#28 の Shift+Enter = 45c / #716 のチャット送信 = 95c。要 claude CLI + 認証 + tmux） | `env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDECODE -u CLAUDE_CONFIG_DIR TAKO_SELF_TEST=1 TAKO_SELF_TEST_CLAUDE=1 cargo run -p tako-app`<br>**claude セッションの中から起動するときは `CLAUDE_CODE_*` を必ず外す**: ペイン内の claude が `CLAUDE_CODE_CHILD_SESSION` を継承すると **transcript 保存が無効化**され（画面に `Transcript saving is off` が出る）、transcript を読む機能（チャットビュー #702/#716・sessions #112・resume #652）の検証が全部空振りする |
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
 | 自動セットアップ | `tako setup [--yes] [--answers <json|@file|->]`（質問ゼロ。`--review` だけ個別対話。MCP `tako_setup` と 1:1。#262） |
 | MCP セットアップ | `tako setup-mcp`（`~/.claude/settings.json` に自動追加。`--project` でプロジェクト単位） |
