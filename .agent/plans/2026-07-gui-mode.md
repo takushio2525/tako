@@ -102,6 +102,19 @@ tako-core / tako-control 側に純関数で切り出し、unit test 可能にす
 > `Failed`（直前のコマンドがエラー）と `Unknown`（シェル統合の signal が無い）は
 > 画面を隠さずターミナル表示にする。terminal モードでは材料を一切見ずに即決する
 > （既存描画への影響を分岐 1 つに抑えるため）。
+>
+> **G2 で判明した重要な訂正（#702）: `alt_screen` は「中で動くプログラム」の状態でなければ
+> ならない**。表の 2 行目を素直に `TerminalSession::is_alt_screen()` で実装すると、
+> persist が有効な環境（= 既定）では**全ペインが常に alt screen 扱い**になり、GUI モードが
+> まったく機能しない。tmux バックエンド越しのペインでは、外側のエミュレータが見ているのは
+> **tmux クライアント自身の alt screen** だから（実測: 素のシェルのバックエンドペインで
+> 外側 `alt=true` / tmux 側 `#{alternate_on}=0`）。
+>
+> 対処は `TakoApp::pane_inner_alt_screen`: バックエンドペインでは外側のフラグを使わない。
+> 中身の alt screen を毎 render 引くには tmux への問い合わせが要るが、**表の他の材料が
+> 同じ役割を果たす**ので不要 — 全画面 TUI はペインの子プロセスとして動くため
+> `busy_children` が真になりアイドルシェルの条件から外れ、チャット化は claude 確定時
+> だけなので未知の TUI には及ばない。
 
 ### 2.2 スターター（空ペインの 3 ボタン）
 
@@ -232,6 +245,40 @@ PWA のコードには触れない。将来 codex 対応等でデータ源を拡
 - 受け入れ: ①隔離実 claude ペインで対話 → user / assistant がチャットに表示される e2e
   ②vim（alt_screen）ペインはターミナル表示のまま ③GUI ⇔ terminal 往復で tmux セッション・
   PTY が同一（`tako list` の session が不変）④transcript 正規化の unit は既存を流用
+
+> **G2 実装済み（2026-07-31 / #702）**。実装場所と、仕様から動かした点:
+>
+> - チャット状態と描画: `crates/tako-app/src/chat_view.rs`（文言は `ui_text/ui_mode.rs`）。
+>   md 本文は #690 の `md_view::render_document` を通すので、プレビューペイン・
+>   アップデート詳細と**同じ見た目**（見出し / GFM 表 / コード / 引用 / 強調）になる
+> - 読み取りは定期更新（2 秒）へ相乗り: `collect_chat_targets`（UI・材料集め）→
+>   `load_chat_refresh`（background・`live_claude_sessions_by_backend` 1 回 +
+>   transcript の mtime / サイズが変わったときだけ再読込）→ `apply_chat_refresh`。
+>   **新規ポーリングはゼロ**。terminal モードでは collect が即空を返す
+> - **判定を仕様より 1 段厳しくした**（§2.1 の「または role が master / solo / worker で
+>   claude」は採らなかった）。理由は 2 つ: ①session_id が無いと描く会話が無く、
+>   カタログへフォールバックすると凍結した旧世代 transcript を見せる失敗（#466）に
+>   戻る ②sticky 解決は agents の一時失敗に耐えるため **claude 終了後も記憶を保持する**
+>   ので、生存の根拠をプロセス側（実行中の子プロセス）から取る必要がある。
+>   結果、`tako_core::ui_mode::chat_session` は session_id + interactive +
+>   子プロセス実行中の 3 点が揃ったときだけチャットにする
+> - 上の帰結として、**チャットになるのは tmux バックエンドを持つペインだけ**
+>   （live 解決の対応キーがバックエンドセッション名のため）。tmux 不在環境の直接
+>   spawn ペインは GUI モードでもターミナル表示のまま
+> - busy の判定は `claude agents --json` の `status` を優先し、取れないときだけ
+>   画面採取（`claude_tui::is_busy`）へ落とす（#571 の階層に合わせた）
+> - ctx バーは 80% 超で警告色まで実装。**「/compact で会話を軽くできます」ヒントは
+>   G4 に残した**（押せるボタンとして出すのがスラッシュボタン（G3）と地続きのため）
+> - 発話単位の md パースキャッシュ（内容ハッシュ）+ 状態は `Rc` 保持（毎フレームの
+>   50 件 clone を避ける）。折りたたみ状態も内容ハッシュに紐づけるので、
+>   tail=50 から古い発話が押し出されても開閉がずれない
+> - モデル名は `claude agents --json` が返さない版がある（実測: claude 2.1.220 は
+>   `model` も `contextPercentUsed` も欠落）。TUI フッターの `[Opus 5 (1M context) · xH]`
+>   から拾う経路（`AgentMetrics.model`）を足し、agents 由来を優先・画面採取を予備にした
+> - 下端追従は**内容が変わったフレームだけ** `scroll_to_bottom` する。毎フレーム寄せると
+>   追従を外す前の 1 フレームでユーザーのホイールを巻き戻してしまう
+> - 検証: セルフテスト項目 94（判定 / 描画 / 往復での tmux 不変 / 追従 / alt screen 除外）+
+>   visual-test「チャット」節（dark / light の実ピクセル）+ 隔離実 claude の e2e
 
 ### G3: チャット操作（入力・承認）
 

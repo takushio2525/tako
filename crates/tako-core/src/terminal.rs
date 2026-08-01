@@ -771,6 +771,9 @@ pub struct AgentMetrics {
     pub limit_week: Option<u32>,
     /// メトリクスの取得元（#357: サービス別にルーティングするため）
     pub source: MetricsSource,
+    /// モデル表示名（例: "Opus 5"。フッターの `[Opus 5 (1M context) · xH]` から。#702）。
+    /// `claude agents --json` は版によって `model` を返さないので、画面が実データの拠り所
+    pub model: Option<String>,
 }
 
 /// メトリクスの取得元 CLI 種別（#357）
@@ -795,6 +798,7 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
     let mut codex_primary = None;
     let mut codex_secondary = None;
     let mut source = MetricsSource::Unknown;
+    let mut model = None;
 
     for line in &scan_lines {
         // --- Claude パターン ---
@@ -847,6 +851,11 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
             }
         }
 
+        // モデル名（#702。`[Opus 5 (1M context) · xH]` の角括弧セグメント）
+        if model.is_none() {
+            model = extract_model_name(line);
+        }
+
         // usage パターン: `Nh NN%` / `Nm NN%` (時間残量) や `$N.NN` (コスト) やトークン数
         if usage_text.is_none() {
             if let Some(usage) = extract_usage_text(line) {
@@ -876,7 +885,28 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         limit_5h,
         limit_week,
         source,
+        model,
     })
+}
+
+/// フッターの角括弧からモデル表示名を取り出す（#702）。
+///
+/// 実測の形: `  [Opus 5 (1M context) · xH]  user@example.com`。
+/// **既知のモデルファミリで始まるときだけ**採る — TUI の表示は版で変わるので、
+/// 知らない文字列をモデル名としてヘッダに出すより、何も出さないほうが良い
+fn extract_model_name(line: &str) -> Option<String> {
+    let start = line.find('[')?;
+    let rest = &line[start + 1..];
+    let end = rest.find(']')?;
+    // `·` 区切りの先頭要素がモデル、後続は effort 等
+    let first = rest[..end].split('·').next()?.trim();
+    // 括弧の補足（`(1M context)`）は落とす
+    let name = first.split('(').next()?.trim();
+    let known = ["Opus", "Sonnet", "Haiku", "Fable"];
+    if name.is_empty() || !known.iter().any(|k| name.starts_with(k)) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// 「<label> NN%」形式のパーセント値を抽出する（#217。ラベルの直前が英数字なら
@@ -1476,6 +1506,35 @@ mod tests {
         let m = parse_agent_metrics(&lines).unwrap();
         assert_eq!(m.ctx_percent, Some(50));
         assert_eq!(m.usage_text.as_deref(), Some("$1.23"));
+    }
+
+    #[test]
+    fn agent_metricsのモデル名抽出() {
+        // 実測フッター（claude 2.1.220）。GUI モードのチャットヘッダが使う（#702）
+        let lines = vec![
+            "  [Opus 5 (1M context) · xH]  user@example.com".into(),
+            "  ctx   5% ░░░░░░░░░░".into(),
+        ];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.model.as_deref(), Some("Opus 5"));
+        assert_eq!(m.ctx_percent, Some(5));
+
+        // 括弧無し・effort 無しでも拾える
+        let lines = vec!["  [Sonnet 5]".into(), "ctx 10%".into()];
+        assert_eq!(
+            parse_agent_metrics(&lines).unwrap().model.as_deref(),
+            Some("Sonnet 5")
+        );
+    }
+
+    #[test]
+    fn agent_metricsは知らない角括弧をモデル名にしない() {
+        // 版差でフッターの中身が変わっても、知らない文字列をモデル名として出さない
+        for line in ["  [tako-14]", "  [2026-08-01]", "  []", "  no brackets"] {
+            let lines = vec![line.to_string(), "ctx 12%".into()];
+            let m = parse_agent_metrics(&lines).unwrap();
+            assert!(m.model.is_none(), "{line} をモデル名にしてはいけない");
+        }
     }
 
     #[test]

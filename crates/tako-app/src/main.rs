@@ -15,6 +15,7 @@
 
 mod about_window;
 mod autorename;
+mod chat_view;
 mod command_card_ui;
 mod drawer;
 mod file_icons;
@@ -1287,6 +1288,21 @@ struct TakoApp {
     /// スターターの「コマンド入力へ」でターミナル表示に戻したペイン（Issue #694）。
     /// **永続化しない**揮発フラグ（仕様 §1.3。再起動すると GUI 表示に戻る）
     starter_released: std::collections::HashSet<PaneId>,
+    /// GUI モードでチャット表示にするペインと、その読み取り結果（Issue #702）。
+    /// **このマップに載っていること = 判定表の「claude 対話 TUI 稼働」が成立**という
+    /// 対応にしてあるので、`pane_display_for`（毎 render）は材料を調べ直さない
+    chat_panes: HashMap<PaneId, std::rc::Rc<chat_view::ChatPaneState>>,
+    /// チャットの折りたたみ（thinking / tool_use）を開いている箇所。
+    /// キーは (ペイン, 発話の内容キー, 区画) で、再読込で並びが変わっても付いて回る
+    chat_expanded: std::collections::HashSet<(PaneId, u64, chat_view::ChatSection)>,
+    /// チャットが下端に追従しているか（未登録 = 追従。手動スクロールで外れる）
+    chat_follow: HashMap<PaneId, bool>,
+    chat_scroll_handles: HashMap<PaneId, gpui::ScrollHandle>,
+    /// 直近に描いた会話の内容キー（新着があったフレームだけ下端へ寄せるため）
+    chat_content_keys: HashMap<PaneId, u64>,
+    /// 発話本文の md パース結果（内容キー → ブロック列）。
+    /// pulldown-cmark + syntect を毎フレーム回さないためのキャッシュ（仕様書 §5）
+    chat_md_cache: HashMap<u64, std::rc::Rc<Vec<preview::MdBlock>>>,
     /// アプリ内自動更新の状態。表示先は上部通知カードと専用ウィンドウ（#616）
     update_state: update_checker::UpdateState,
     /// 更新通知カードを × で閉じたときのキー（`update_checker::card_key`。#616）。
@@ -2500,6 +2516,12 @@ impl TakoApp {
             // 復元（layout.json）とは無関係なので persist の挙動には影響しない
             ui_mode: tako_control::settings::load().ui_mode(),
             starter_released: std::collections::HashSet::new(),
+            chat_panes: HashMap::new(),
+            chat_expanded: std::collections::HashSet::new(),
+            chat_follow: HashMap::new(),
+            chat_scroll_handles: HashMap::new(),
+            chat_content_keys: HashMap::new(),
+            chat_md_cache: HashMap::new(),
             update_state: update_checker::UpdateState::Idle,
             // #616: 前回 × で閉じたバージョンを引き継ぐ（再起動しても出直さない）
             update_card_dismissed: tako_control::settings::load().update_card_dismissed,
@@ -3261,6 +3283,33 @@ impl TakoApp {
                     });
                     if ok.is_err() {
                         break;
+                    }
+                }
+                // ② background: GUI モードのチャット読み取り（#702）。sleep_guard の
+                // 直後に置くのは、チャット判定が「子プロセスが動いているか」
+                // （= いま適用したばかりの busy_backend_sessions）を根拠にするため。
+                // terminal モードでは collect が即空を返すので実質ゼロコスト
+                {
+                    let targets = this.update(cx, |app: &mut TakoApp, _| {
+                        let _s = tako_control::diag::perf_span("periodic_prep:chat");
+                        app.collect_chat_targets()
+                    });
+                    let Ok(targets) = targets else {
+                        break;
+                    };
+                    if !targets.is_empty() {
+                        let results = cx
+                            .background_executor()
+                            .spawn(async move { chat_view::load_chat_refresh(targets) })
+                            .await;
+                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                            if app.apply_chat_refresh(results) {
+                                cx.notify();
+                            }
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
                     }
                 }
                 // ② background: バックエンドペインのペインログ取り込み（probe + capture。
@@ -5592,6 +5641,7 @@ impl TakoApp {
                 self.preview_changelogs.remove(&pane_id);
                 self.preview_views.remove(&pane_id);
                 self.preview_scroll_handles.remove(&pane_id);
+                self.drop_gui_pane_state(pane_id);
                 self.pending_pdf_rasters.remove(&pane_id);
                 self.active_pdf_rasters.remove(&pane_id);
                 self.video_seek_bar_bounds.remove(&pane_id);
@@ -6273,6 +6323,27 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// **ペインの中で動いているプログラム**が alt screen（vim 等の全画面 TUI）か。
+    ///
+    /// バックエンド（tmux）ペインでは外側のエミュレータの alt screen フラグを使えない:
+    /// tmux クライアント自身が alt screen へ入るため、**中身がただのシェルでも常に true**
+    /// になる（実測: 素のシェルのバックエンドペインで外側 alt=true / tmux 側
+    /// `#{alternate_on}`=0）。これを判定表へそのまま渡すと、persist が有効な環境
+    /// （= 既定）の全ペインが「alt screen」扱いになり GUI モードが機能しない。
+    ///
+    /// 中身の alt screen を知るには tmux へ問い合わせが要る（毎 render では引けない）。
+    /// ただし判定表の他の材料が同じ役割を果たす — 全画面 TUI はペインの子プロセスとして
+    /// 動くので `busy_children` が真になり、アイドルシェルの条件から外れる。
+    /// チャット化は claude 確定時だけなので、そもそも未知の TUI には及ばない
+    fn pane_inner_alt_screen(&self, pane_id: PaneId) -> bool {
+        if self.backend_sessions.contains_key(&pane_id) {
+            return false;
+        }
+        self.terminals
+            .get(&pane_id)
+            .is_some_and(|s| s.is_alt_screen())
+    }
+
     /// このペインをどう描くか（Issue #694。判定表は `tako_core::ui_mode`）。
     ///
     /// 材料はすべて**すでに手元にある値**で、ここで新しいサブプロセスは起動しない
@@ -6295,9 +6366,10 @@ impl TakoApp {
         pane_display(PaneDisplayInput {
             mode: self.ui_mode,
             released: self.starter_released.contains(&pane_id),
-            alt_screen: session.is_some_and(|s| s.is_alt_screen()),
-            // G2 で claude 判定を配線する。G1 はチャット化しない
-            claude_chat: false,
+            alt_screen: self.pane_inner_alt_screen(pane_id),
+            // claude 判定（#702）は 2 秒ごとの読み取り側で確定させ、ここでは
+            // その結果を見るだけにする（毎 render で ps / claude agents を叩かない）
+            claude_chat: self.chat_panes.contains_key(&pane_id),
             state: session
                 .map(|s| s.command_state())
                 .unwrap_or(tako_core::CommandState::Unknown),
@@ -12558,9 +12630,12 @@ impl TakoApp {
                     .render_starter_pane(pane_id, rect, area, focused, cx)
                     .into_any_element();
             }
-            // チャットビューは G2 で実装する。それまではターミナル表示のまま
-            // （`pane_display_for` は claude_chat=false 固定なのでここには来ない）
-            tako_core::ui_mode::PaneDisplay::Chat | tako_core::ui_mode::PaneDisplay::Terminal => {}
+            tako_core::ui_mode::PaneDisplay::Chat => {
+                return self
+                    .render_chat_pane(pane_id, rect, area, focused, cx)
+                    .into_any_element();
+            }
+            tako_core::ui_mode::PaneDisplay::Terminal => {}
         }
 
         // タイトルとロールを分離取得（ロールは独立バッジとして表示）
@@ -13811,6 +13886,7 @@ impl SessionHost for TakoApp {
         self.remove_preview_image_cache(pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
+        self.drop_gui_pane_state(pane);
         self.video_players.remove(&pane);
         self.remove_video_frame_cache(pane);
         self.pane_links.remove(&pane);
@@ -20812,6 +20888,153 @@ mod self_test {
                     "visual-test カード帯: 閉じると帯が消えて行数が戻る (#703)",
                 );
             }
+            // GUI モードのチャットビュー（#702）: **実ピクセルで**「ターミナルが
+            // 描かれていた場所に会話が描かれる」ことと、dark / light の両方で読める
+            // 濃さになることを見る。md 本文（見出し / 表 / コード）を含む会話を入れるので、
+            // md_view 経由の描画がチャット側でも破綻していないことまで一緒に押さえられる
+            {
+                use tako_core::ui_mode::UiMode;
+                type_text(any, cx, "clear", true);
+                cx.background_executor()
+                    .timer(Duration::from_millis(900))
+                    .await;
+                let pane = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(pane) = pane else {
+                    fail("visual-test チャット: 基準ペイン")
+                };
+                let area = window
+                    .update(cx, |app, _, _| {
+                        app.pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == pane)
+                            .map(|(_, b)| *b)
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| fail("visual-test チャット: ペイン領域"));
+                // 会話が流れる帯（ヘッダ直下から下端まで）
+                let band = Bounds::new(
+                    point(area.left(), area.top() + area.size.height * 0.15),
+                    size(area.size.width, area.size.height * 0.7),
+                );
+                let (before, scale) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: 前フレーム"));
+                let bg_dark = window
+                    .update(cx, |app, _, _| app.theme.background)
+                    .unwrap_or_else(|_| fail("visual-test チャット: 背景色"));
+                let terminal_band =
+                    readable_pixels_in_bounds(&before, &[band], scale, bg_dark, 2.0);
+
+                // GUI モード + 会話を注入（本番と同じ `messages_from_json` を通す）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::UiMode {
+                            action: Some("set".into()),
+                            mode: Some("gui".into()),
+                            pane: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    let messages = chat_view::messages_from_json(&[
+                        serde_json::json!({ "role": "user", "text": "この表とコードを見せて" }),
+                        serde_json::json!({
+                            "role": "assistant",
+                            "text": "## 結果\n\n| 項目 | 値 |\n|---|---|\n| 件数 | 42 |\n\n                                     ```rust\nfn main() { println!(\"hi\"); }\n```\n\n                                     詳しくは **こちら**。",
+                            "thinking": "表 → コード → 補足の順に出す",
+                            "tools": [{ "name": "Bash", "summary": "cargo test --workspace" }],
+                        }),
+                    ]);
+                    app.chat_panes.insert(
+                        pane,
+                        std::rc::Rc::new(chat_view::ChatPaneState {
+                            session_id: "visual-702".into(),
+                            messages,
+                            model: Some("claude-opus-5".into()),
+                            ctx_percent: Some(37.0),
+                            ..Default::default()
+                        }),
+                    );
+                    cx.notify();
+                });
+                let (gui_dark, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: GUI フレーム(dark)"));
+                let chat_band = readable_pixels_in_bounds(&gui_dark, &[band], scale, bg_dark, 2.0);
+                let changed = changed_pixels_in_bounds(&before, &gui_dark, &[band], scale);
+
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("light".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (gui_light, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: GUI フレーム(light)"));
+                let bg_light = window
+                    .update(cx, |app, _, _| app.theme.background)
+                    .unwrap_or(bg_dark);
+                let chat_band_light =
+                    readable_pixels_in_bounds(&gui_light, &[band], scale, bg_light, 2.0);
+                let theme_changed =
+                    changed_pixels_in_bounds(&gui_dark, &gui_light, &[band], scale);
+
+                if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let base = std::path::Path::new(&dir);
+                    let _ = gui_dark.save(base.join("chat-gui-dark.png"));
+                    let _ = gui_light.save(base.join("chat-gui-light.png"));
+                }
+                println!(
+                    "TAKO_VISUAL_PIXEL: chat terminal_band={terminal_band}                      chat_band={chat_band} chat_band_light={chat_band_light}                      changed={changed} theme_changed={theme_changed}"
+                );
+                check(
+                    terminal_band < 200,
+                    "visual-test チャット: ターミナル表示では帯がほぼ空 (#702)",
+                );
+                check(
+                    chat_band > 1000 && changed > 1000,
+                    "visual-test チャット: GUI モードで会話が描かれる (#702)",
+                );
+                check(
+                    chat_band_light > 1000 && theme_changed > 1000,
+                    "visual-test チャット: ライトテーマでも読める濃さで描かれる (#702)",
+                );
+
+                // 後片付け: 既定（dark / terminal）へ戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("dark".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    app.ui_mode = UiMode::Terminal;
+                    app.chat_panes.clear();
+                    app.chat_expanded.clear();
+                    cx.notify();
+                });
+                let _ = capture_frame(any, cx);
+            }
+
             // #690: アップデート詳細画面のリリースノートが Markdown として描かれるか。
             // 実リリース v0.6.2 のノート本文を専用ウィンドウへ流し込み、scene の実ピクセルで
             // 見出しサイズ・インラインコード・コードパネル・表のヘッダ帯・リンク色・
@@ -30925,6 +31148,470 @@ mod self_test {
                     }
                     app.ui_mode = UiMode::Terminal;
                     app.starter_released.clear();
+                    cx.notify();
+                });
+            }
+
+            // 94. GUI ライク表示モード G2 = チャットビュー（#691 / #702）。
+            // 実 claude を起動せずに機械検証できるのは「表示レイヤの配線」なので、
+            // ここは会話データを注入して次を見る（実 claude での通し確認は隔離 GUI で行う）:
+            // (a) チャット状態を持つペインが Chat 表示になり、terminal モードでは
+            //     同じペインがターミナル表示のまま（既存ユーザーへの影響ゼロ）
+            // (b) md 本文 + thinking + tool_use を含む会話が描画経路を通る
+            //     （panic すればここでプロセスが落ちる = 検出できる）
+            // (c) ヘッダの「ターミナルを表示」で揮発解除 → restore で戻る
+            // (d) **GUI ⇔ terminal の往復で tmux セッションが変わらない**
+            //     （表示レイヤだけの切替であることの機械的裏付け。仕様 §2.5）
+            // (e) alt screen のペインは読み取り対象にしない（保守的判定）
+            {
+                use tako_core::ui_mode::{PaneDisplay, StarterAction, UiMode};
+
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#702: 基準ペインの取得")
+                };
+                // チャットの判定と読み取りはバックエンドセッション名を live 解決の
+                // キーにするので、実体が無いと (d)(e) が素通りしてしまう。
+                // セルフテストは persist 既定 OFF なので、この項目のあいだだけ ON にする
+                let tmux_backed = tako_core::backend::capabilities().survives_app_exit
+                    && window
+                        .update(cx, |app, _, _| {
+                            matches!(
+                                tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Persist {
+                                        enabled: Some(true),
+                                    },
+                                    PaneOrigin::Cli,
+                                ),
+                                Ok(v) if v["enabled"].as_bool() == Some(true)
+                            )
+                        })
+                        .unwrap_or(false);
+                let make_pane = |app: &mut TakoApp, cx: &mut Context<TakoApp>| {
+                    let pane = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(anchor.as_u64()),
+                            tab: None,
+                            direction: Some(tako_control::protocol::Direction::Down),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .ok()
+                    .and_then(|v| v["pane"].as_u64())
+                    .map(PaneId::from_raw);
+                    for (p, options) in std::mem::take(&mut app.pending_attach) {
+                        if app.spawn_session(p, options, cx).is_err() {
+                            app.remove_pane(p, cx);
+                        }
+                    }
+                    pane
+                };
+                let chat_pane = window.update(cx, |app, _, cx| make_pane(app, cx)).ok().flatten();
+                let alt_pane = window.update(cx, |app, _, cx| make_pane(app, cx)).ok().flatten();
+                let (Some(chat_pane), Some(alt_pane)) = (chat_pane, alt_pane) else {
+                    fail("#702: 検証用ペインの作成")
+                };
+                wait(cx, 700).await;
+
+                // 実 transcript と同じ正規化 JSON から会話を組み立てる
+                // （`messages_from_json` は本番と同じ関数 = 形の取り違えを検出できる）
+                let messages = chat_view::messages_from_json(&[
+                    serde_json::json!({ "role": "user", "text": "テーブルとコードを見せて" }),
+                    serde_json::json!({
+                        "role": "assistant",
+                        "text": "## 結果\n\n| 列 | 値 |\n|---|---|\n| a | 1 |\n\n                                 ```rust\nfn main() { println!(\"hi\"); }\n```\n\n                                 詳しくは [docs](https://example.com/docs) を参照。",
+                        "thinking": "まず表を作り、次にコード例を出す",
+                        "tools": [{ "name": "Bash", "summary": "cargo test --workspace" }],
+                    }),
+                ]);
+                let injected = messages.len();
+                let message_key = messages.last().map(|m| m.key).unwrap_or_default();
+                let backend_before = window
+                    .update(cx, |app, _, _| app.backend_sessions.get(&chat_pane).cloned())
+                    .ok()
+                    .flatten();
+
+                // GUI モードへ（実トグルと同じ dispatch 経路）+ 会話を注入
+                let gui_chat = window
+                    .update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("set".into()),
+                                mode: Some("gui".into()),
+                                pane: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        app.chat_panes.insert(
+                            chat_pane,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-702".into(),
+                                messages,
+                                model: Some("claude-opus-5".into()),
+                                ctx_percent: Some(37.0),
+                                busy: true,
+                                ..Default::default()
+                            }),
+                        );
+                        cx.notify();
+                        // (a) 判定表: チャット状態があるペインは Chat 表示
+                        let chat = app.pane_display_for(chat_pane) == PaneDisplay::Chat;
+                        let gui = app.ui_mode;
+                        app.ui_mode = UiMode::Terminal;
+                        // terminal モードでは同じペインがターミナル表示
+                        let terminal = app.pane_display_for(chat_pane) == PaneDisplay::Terminal;
+                        app.ui_mode = gui;
+                        chat && terminal
+                    })
+                    .unwrap_or(false);
+                // ヘッダの実値（モデル名 / ctx 残量）が注入値と一致する
+                let header_ok = window
+                    .update(cx, |app, _, _| {
+                        let state = app.chat_state(chat_pane);
+                        state.is_some_and(|s| {
+                            s.model_label() == "Opus 5"
+                                && s.messages.len() == injected
+                                && s.ctx_gauge()
+                                    .is_some_and(|(left, warn)| (left - 0.63).abs() < 1e-5 && !warn)
+                        })
+                    })
+                    .unwrap_or(false);
+                check(
+                    gui_chat && header_ok && injected == 2,
+                    "判定表: claude ペインはチャット表示 / terminal モードは据え置き (#702)",
+                );
+
+                // (b) 描画: md 本文・折りたたみ（閉 → 開）の両方を実際に描く。
+                // **全ウィンドウを描く**: この時点でウィンドウは複数あり（#339 / #380。
+                // 項目 78 が開き直す）、外側の `any` は別のタブを表示していることがある。
+                // 1 枚だけ描くと「描かれていないのに素通り」になる
+                let draw_all_windows = |cx: &mut AsyncApp| {
+                    let handles = cx.update(|cx| cx.windows());
+                    for handle in handles {
+                        for _ in 0..2 {
+                            let _ = handle.update(cx, |_, win, cx| win.draw(cx).clear());
+                        }
+                    }
+                };
+                draw_all_windows(cx);
+                let expanded = window
+                    .update(cx, |app, _, _| {
+                        app.chat_expanded.insert((
+                            chat_pane,
+                            message_key,
+                            chat_view::ChatSection::Thinking,
+                        ));
+                        app.chat_expanded.insert((
+                            chat_pane,
+                            message_key,
+                            chat_view::ChatSection::Tool(0),
+                        ));
+                        app.chat_md_cache.contains_key(&message_key)
+                    })
+                    .unwrap_or(false);
+                draw_all_windows(cx);
+                if !expanded {
+                    let note = window
+                        .update(cx, |app, _, _| {
+                            format!(
+                                "display={:?} in_chat_panes={} md_cache={} active_tab_panes={:?}",
+                                app.pane_display_for(chat_pane),
+                                app.chat_panes.contains_key(&chat_pane),
+                                app.chat_md_cache.len(),
+                                app.workspace
+                                    .active_tab()
+                                    .tree()
+                                    .panes()
+                                    .iter()
+                                    .map(|p| p.id().as_u64())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "TAKO_SELF_TEST_702: pane={} windows={} {note}",
+                        chat_pane.as_u64(),
+                        cx.update(|cx| cx.windows().len()),
+                    );
+                }
+                check(
+                    expanded,
+                    "チャットの md 本文が描画され、パース結果がキャッシュされる (#702)",
+                );
+
+                // (d) 表示モードを往復しても tmux セッション（実体）は同じまま
+                let backend_after = window
+                    .update(cx, |app, _, cx| {
+                        for mode in ["terminal", "gui"] {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::UiMode {
+                                    action: Some("set".into()),
+                                    mode: Some(mode.into()),
+                                    pane: None,
+                                },
+                                PaneOrigin::User,
+                            );
+                            cx.notify();
+                        }
+                        app.backend_sessions.get(&chat_pane).cloned()
+                    })
+                    .ok()
+                    .flatten();
+                let listed = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::List,
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| {
+                            v["tabs"].as_array().map(|tabs| {
+                                tabs.iter()
+                                    .flat_map(|t| {
+                                        t["panes"].as_array().cloned().unwrap_or_default()
+                                    })
+                                    .find(|p| p["id"].as_u64() == Some(chat_pane.as_u64()))
+                                    .map(|p| p["tmux_session"].clone())
+                            })
+                        })
+                        .flatten()
+                    })
+                    .ok()
+                    .flatten();
+                let listed_session = listed
+                    .as_ref()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                // tmux が無い環境では実体が作れないので「変わらない」ことだけを見る
+                let session_stable = backend_before.is_some() == tmux_backed
+                    && backend_before == backend_after
+                    && listed_session == backend_before;
+                if !session_stable {
+                    eprintln!(
+                        "TAKO_SELF_TEST_702_SESSION: before={backend_before:?}                          after={backend_after:?} listed={listed:?}"
+                    );
+                }
+                check(
+                    session_stable,
+                    "GUI ⇔ terminal の往復で tmux セッションが変わらない (#702)",
+                );
+
+                // (c) ヘッダの「ターミナルを表示」= 揮発解除 → restore で戻る
+                let toggled = window
+                    .update(cx, |app, _, cx| {
+                        let released = app.starter_action(chat_pane, StarterAction::UseTerminal, cx)
+                            && app.pane_display_for(chat_pane) == PaneDisplay::Terminal;
+                        let restored = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("restore".into()),
+                                mode: None,
+                                pane: Some(chat_pane.as_u64()),
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .is_ok()
+                            && app.pane_display_for(chat_pane) == PaneDisplay::Chat;
+                        released && restored
+                    })
+                    .unwrap_or(false);
+                check(
+                    toggled,
+                    "チャットの「ターミナルを表示」で解除 → restore で戻る (#702)",
+                );
+
+                // (f) 下端追従: 上へホイールすると外れ、下端へ戻すと復帰する。
+                // 描画のリスナーと同じ `on_chat_scroll` を通す（経路差を作らない）
+                let follow_cycle = window
+                    .update(cx, |app, _, _| {
+                        let following_by_default = app.chat_following(chat_pane);
+                        app.on_chat_scroll(
+                            chat_pane,
+                            &ScrollWheelEvent {
+                                delta: ScrollDelta::Lines(point(0.0, 3.0)),
+                                ..ScrollWheelEvent::default()
+                            },
+                        );
+                        let released = !app.chat_following(chat_pane);
+                        // 下方向のホイールだけでは復帰しない（下端に着いたかは render が見る）
+                        app.on_chat_scroll(
+                            chat_pane,
+                            &ScrollWheelEvent {
+                                delta: ScrollDelta::Lines(point(0.0, -3.0)),
+                                ..ScrollWheelEvent::default()
+                            },
+                        );
+                        let still_released = !app.chat_following(chat_pane);
+                        following_by_default && released && still_released
+                    })
+                    .unwrap_or(false);
+                // 下端まで戻す（ユーザーが下向きにスクロールし切ったのと同じ状態）。
+                // 折りたたみを開いた分だけ本文が伸びているので、明示的に戻さないと
+                // 下端には居ない（内容が変わらない限り勝手には引き戻さない仕様）
+                let _ = window.update(cx, |app, _, _| {
+                    if let Some(handle) = app.chat_scroll_handles.get(&chat_pane) {
+                        handle.scroll_to_bottom();
+                    }
+                });
+                draw_all_windows(cx);
+                let follow_resumed = window
+                    .update(cx, |app, _, _| app.chat_following(chat_pane))
+                    .unwrap_or(false);
+                if !(follow_cycle && follow_resumed) {
+                    eprintln!(
+                        "TAKO_SELF_TEST_702_FOLLOW: cycle={follow_cycle} resumed={follow_resumed}"
+                    );
+                }
+                check(
+                    follow_cycle && follow_resumed,
+                    "チャットの下端追従: 上スクロールで解除 → 下端で復帰 (#702)",
+                );
+
+                // (e) alt screen の扱い。**外側のエミュレータのフラグは tmux クライアント
+                // 自身のもの**なので、そのまま使うと persist 有効環境の全ペインが
+                // alt screen 扱いになり GUI モードが死ぬ（#702 で実測して根治した点）。
+                //  e1: バックエンドペインは外側 alt=true でもチャット読み取りの対象に残る
+                //  e2: 直接ペイン（persist OFF）が本当に alt screen なら、チャット状態が
+                //      あってもターミナル表示のまま（vim 等を勝手に隠さない）
+                let e1 = !tmux_backed
+                    || window
+                        .update(cx, |app, _, _| {
+                            let outer_alt = app
+                                .terminals
+                                .get(&alt_pane)
+                                .is_some_and(|s| s.is_alt_screen());
+                            let inner_alt = app.pane_inner_alt_screen(alt_pane);
+                            let listed = app
+                                .collect_chat_targets()
+                                .iter()
+                                .any(|t| t.pane() == alt_pane);
+                            if !(outer_alt && !inner_alt && listed) {
+                                eprintln!(
+                                    "TAKO_SELF_TEST_702_ALT: outer={outer_alt} inner={inner_alt} listed={listed}"
+                                );
+                            }
+                            outer_alt && !inner_alt && listed
+                        })
+                        .unwrap_or(false);
+
+                // persist を OFF へ戻してから直接ペインを作る（バックエンドを挟まない）
+                let _ = window.update(cx, |app, _, _| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Persist {
+                            enabled: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                });
+                let direct_pane = window
+                    .update(cx, |app, _, cx| make_pane(app, cx))
+                    .ok()
+                    .flatten();
+                let Some(direct_pane) = direct_pane else {
+                    fail("#702: alt screen 検証用ペインの作成")
+                };
+                window
+                    .update(cx, |app, _, cx| {
+                        app.jump_to_pane(direct_pane, cx);
+                    })
+                    .ok();
+                // シェルが立ち上がってプロンプトを出すまで待つ（打鍵が捨てられないように）
+                for _ in 0..40 {
+                    wait(cx, 100).await;
+                    let ready = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&direct_pane)
+                                .is_some_and(|s| s.command_state() == tako_core::CommandState::Idle)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                // 打鍵ではなく PTY へ直接書く（キーの配送先ウィンドウに依存させない。
+                // スターターの master 起動と同じ経路）。cat で alt screen に留まる
+                let _ = window.update(cx, |app, _, _| {
+                    if let Some(session) = app.terminals.get(&direct_pane) {
+                        session.write(b"printf '\\033[?1049h'; cat\n".to_vec());
+                    }
+                });
+                let mut e2 = false;
+                for _ in 0..60 {
+                    wait(cx, 100).await;
+                    e2 = window
+                        .update(cx, |app, _, _| {
+                            if !app.pane_inner_alt_screen(direct_pane) {
+                                return false;
+                            }
+                            // チャット状態があっても alt screen が勝つ（保守的判定）
+                            app.chat_panes.insert(
+                                direct_pane,
+                                std::rc::Rc::new(chat_view::ChatPaneState {
+                                    session_id: "selftest-702-alt".into(),
+                                    ..Default::default()
+                                }),
+                            );
+                            let display = app.pane_display_for(direct_pane);
+                            app.chat_panes.remove(&direct_pane);
+                            display == PaneDisplay::Terminal
+                        })
+                        .unwrap_or(false);
+                    if e2 {
+                        break;
+                    }
+                }
+                if !e2 {
+                    let note = window
+                        .update(cx, |app, _, _| {
+                            format!(
+                                "inner_alt={} backend={:?} tail={:?}",
+                                app.pane_inner_alt_screen(direct_pane),
+                                app.backend_sessions.get(&direct_pane).cloned(),
+                                app.terminals
+                                    .get(&direct_pane)
+                                    .map(|s| s.visible_lines().join("|"))
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .rev()
+                                    .take(80)
+                                    .collect::<String>(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!("TAKO_SELF_TEST_702_ALT2: {note}");
+                }
+                check(
+                    e1 && e2,
+                    "alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)",
+                );
+
+                // 後片付け: 検証用ペインを閉じて terminal モードへ戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    for pane in [direct_pane, alt_pane, chat_pane] {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane.as_u64()),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    app.ui_mode = UiMode::Terminal;
+                    app.starter_released.clear();
+                    app.chat_panes.clear();
+                    app.chat_expanded.clear();
                     cx.notify();
                 });
             }

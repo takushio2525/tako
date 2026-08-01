@@ -212,13 +212,34 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
 }
 
 /// バックエンドセッションで**今まさに動いている** claude エージェント（live 解決）
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LiveClaudeSession {
     /// claude の session_id（transcript 参照キー）
     pub session_id: String,
     /// 対話型 TUI か（`claude agents --json` の kind == "interactive"。
     /// `claude -p` 等の一時セッションと区別し、ペインの agent 種別判定に使う）
     pub interactive: bool,
+    /// モデル名（`model`。GUI モードのチャットヘッダ表示用。#702）
+    pub model: Option<String>,
+    /// コンテキスト使用率 %（`contextPercentUsed`。残量バー用。#702）
+    pub ctx_percent: Option<f64>,
+    /// claude 自身が申告する状態（`status`。実測の語彙は idle / busy。#571）
+    pub status: Option<String>,
+}
+
+impl LiveClaudeSession {
+    /// 正規化済み agent JSON（`normalize_agent`）から作る。
+    /// session_id が空のエントリは live 解決の対象外なので None
+    fn from_agent(agent: &Value) -> Option<Self> {
+        let session_id = agent["session_id"].as_str().filter(|s| !s.is_empty())?;
+        Some(Self {
+            session_id: session_id.to_string(),
+            interactive: agent["kind"].as_str() == Some("interactive"),
+            model: agent["model"].as_str().map(|s| s.to_string()),
+            ctx_percent: agent["ctx_percent"].as_f64(),
+            status: agent["status"].as_str().map(|s| s.to_string()),
+        })
+    }
 }
 
 /// 全バックエンドセッションの live claude セッションを一括解決する
@@ -293,7 +314,7 @@ fn live_sessions_inner(
         let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
             continue;
         };
-        let Some(session_id) = agent["session_id"].as_str().filter(|s| !s.is_empty()) else {
+        let Some(live) = LiveClaudeSession::from_agent(agent) else {
             continue;
         };
         let Some(pane_id) = find_ancestor_pane(pid, parents, &pane_by_pid) else {
@@ -302,21 +323,17 @@ fn live_sessions_inner(
         let Some(backend) = pane_id.split(':').next().filter(|s| !s.is_empty()) else {
             continue;
         };
-        let interactive = agent["kind"].as_str() == Some("interactive");
         // 同一セッションに複数 agent が居る場合は interactive を優先して残す
         map.entry(backend.to_string())
             .and_modify(|existing: &mut LiveClaudeSession| {
-                if interactive && !existing.interactive {
-                    *existing = LiveClaudeSession {
-                        session_id: session_id.to_string(),
-                        interactive,
-                    };
+                if live.interactive && !existing.interactive {
+                    *existing = live.clone();
+                } else if live.interactive == existing.interactive {
+                    // 同格なら新しい方の計測値（ctx% / status）で更新する
+                    *existing = live.clone();
                 }
             })
-            .or_insert(LiveClaudeSession {
-                session_id: session_id.to_string(),
-                interactive,
-            });
+            .or_insert(live);
     }
     map
 }
@@ -597,20 +614,35 @@ mod tests {
         ];
         let map = live_sessions_inner(&panes, &agents, &parents);
         assert_eq!(map.len(), 2);
-        assert_eq!(
-            map["tako-s1"],
-            LiveClaudeSession {
-                session_id: "sid-interactive".into(),
-                interactive: true
-            }
-        );
+        assert_eq!(map["tako-s1"], live("sid-interactive"));
         assert_eq!(
             map["tako-s2"],
             LiveClaudeSession {
                 session_id: "sid-headless".into(),
-                interactive: false
+                interactive: false,
+                ..live("sid-headless")
             }
         );
+    }
+
+    #[test]
+    fn live_sessionsはモデルとコンテキスト使用率を運ぶ() {
+        // #702: GUI モードのチャットヘッダ（モデル名 / ctx 残量 / 状態）は
+        // この 1 回の解決で一緒に取れる（追加のサブプロセスを増やさない）
+        let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
+        let parents: HashMap<u32, u32> = [(300, 100), (100, 1)].into();
+        let agents = vec![normalize_agent(&json!({
+            "sessionId": "sid-1",
+            "pid": 300,
+            "kind": "interactive",
+            "model": "claude-opus-5",
+            "contextPercentUsed": 42.5,
+            "status": "busy",
+        }))];
+        let map = live_sessions_inner(&panes, &agents, &parents);
+        assert_eq!(map["tako-s1"].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(map["tako-s1"].ctx_percent, Some(42.5));
+        assert_eq!(map["tako-s1"].status.as_deref(), Some("busy"));
     }
 
     #[test]
@@ -639,6 +671,9 @@ mod tests {
         LiveClaudeSession {
             session_id: sid.into(),
             interactive: true,
+            model: None,
+            ctx_percent: None,
+            status: None,
         }
     }
 
