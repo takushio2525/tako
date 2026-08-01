@@ -40,6 +40,10 @@ struct Cli {
     command: Command,
 }
 
+// `orchestrator profiles set` のオプション数で variant サイズ差 lint が出る
+// （ProfilesCommand 側と同じ理由）。CLI 引数のパースはプロセスで 1 回きりなので
+// 実害がなく、clap は Subcommand / Args を Box 化できないため許容する
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// 対象ペインの隣に新ペインを生やす（既定は右）。新ペイン ID を出力する
@@ -1611,22 +1615,68 @@ enum ProjectsCommand {
     },
 }
 
+/// プロファイル種別の指定（#721）。既定は master なので、master を使うときは
+/// 何も付けない（「最も簡単なコマンドを提案する」原則。#322）
+#[derive(Args, Clone, Copy)]
+struct ProfileKindArgs {
+    /// solo プロファイル（tako solo が読む solo-profiles/）を対象にする（省略時 master）
+    #[arg(long)]
+    solo: bool,
+}
+
+impl ProfileKindArgs {
+    /// dispatch の kind パラメータ。master は None（既定）で送る
+    fn kind(&self) -> Option<String> {
+        self.solo.then(|| "solo".to_string())
+    }
+}
+
 // Set のオプション数で variant サイズ差 lint が出るが、CLI 引数のパースは
 // プロセスで 1 回きりのため実害がなく許容する（clap は Box variant を扱えない）
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum ProfilesCommand {
     /// プロファイルの一覧（model が null のものは claude CLI の既定モデルで起動する）
-    List,
+    List {
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
     /// プロファイルの内容と解決結果を表示する
     Show {
         /// プロファイル名（省略時 default）
         name: Option<String>,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
+    /// プロファイルを新規作成する（既存があればエラー。中身は set で埋める）
+    Create {
+        /// プロファイル名（英数字と - _ . のみ）
+        name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
+    /// 既存プロファイルを複製する
+    Copy {
+        /// 複製元のプロファイル名
+        from: String,
+        /// 複製先のプロファイル名
+        name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
+    /// プロファイルを削除する（default は削除できない）
+    Delete {
+        /// プロファイル名
+        name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
     },
     /// プロファイルを作成・更新する。[1m] 付きモデルは Max / API プラン限定なので注意
     Set {
         /// プロファイル名
         name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
         /// master のエージェント種別（claude / codex。agy は master 非対応。--clear-master-agent と排他）
         #[arg(long, conflicts_with = "clear_master_agent")]
         master_agent: Option<String>,
@@ -1702,6 +1752,12 @@ enum ProfilesCommand {
         /// worker_account を解除する
         #[arg(long)]
         clear_worker_account: bool,
+        /// 割り当てるプロジェクトキー（カンマ区切り。丸ごと置き換え。#721）
+        #[arg(long, value_delimiter = ',', conflicts_with = "clear_projects")]
+        projects: Option<Vec<String>>,
+        /// projects の割り当てを解除する（#721）
+        #[arg(long)]
+        clear_projects: bool,
     },
 }
 
@@ -2057,7 +2113,7 @@ struct ThemeArgs {
 /// 設定画面コマンドの引数（Issue #459）
 #[derive(Args)]
 struct SettingsArgs {
-    /// 開くタブ指定
+    /// 開くタブ指定（general / appearance / runner / profiles / setup / sleep / remote / advanced）
     #[arg(long)]
     tab: Option<String>,
 }
@@ -3387,17 +3443,39 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
     use tako_control::dispatch::{dispatch_orchestrator_profiles, ProfilesParams};
 
     let params = match sub {
-        ProfilesCommand::List => ProfilesParams {
+        ProfilesCommand::List { kind } => ProfilesParams {
             action: "list".into(),
+            kind: kind.kind(),
             ..Default::default()
         },
-        ProfilesCommand::Show { name } => ProfilesParams {
+        ProfilesCommand::Show { name, kind } => ProfilesParams {
             action: "show".into(),
             name: name.clone(),
+            kind: kind.kind(),
+            ..Default::default()
+        },
+        ProfilesCommand::Create { name, kind } => ProfilesParams {
+            action: "create".into(),
+            name: Some(name.clone()),
+            kind: kind.kind(),
+            ..Default::default()
+        },
+        ProfilesCommand::Copy { from, name, kind } => ProfilesParams {
+            action: "copy".into(),
+            name: Some(name.clone()),
+            from: Some(from.clone()),
+            kind: kind.kind(),
+            ..Default::default()
+        },
+        ProfilesCommand::Delete { name, kind } => ProfilesParams {
+            action: "delete".into(),
+            name: Some(name.clone()),
+            kind: kind.kind(),
             ..Default::default()
         },
         ProfilesCommand::Set {
             name,
+            kind,
             master_agent,
             clear_master_agent,
             model,
@@ -3423,9 +3501,15 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_master_account,
             worker_account,
             clear_worker_account,
+            projects,
+            clear_projects,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
+            kind: kind.kind(),
+            from: None,
+            projects: projects.clone(),
+            clear_projects: *clear_projects,
             master_agent: master_agent.clone(),
             clear_master_agent: *clear_master_agent,
             model: model.clone(),

@@ -642,15 +642,29 @@ pub enum Request {
         cwd: Option<String>,
         description: Option<String>,
     },
-    /// オーケストレーター: プロファイル管理（list / show / set）。
+    /// オーケストレーター: プロファイル管理（list / show / set / create / copy / delete）。
     /// model 未指定のプロファイルは claude CLI の既定モデルで起動する（Issue #27）。
     /// set は model / worker_model / effort / worker_effort の更新と、
     /// clear_model / clear_worker_model による解除（claude 既定へ戻す）に対応。
     /// worker_agent（既定エージェント種別）と agent_* 系（`worker_agents.<agent>` の
-    /// エージェント別 worker 設定）は Issue #120、master_agent は Issue #127 で追加
+    /// エージェント別 worker 設定）は Issue #120、master_agent は Issue #127 で追加。
+    /// kind（master / solo）と create / copy / delete、projects は Issue #721 で追加
     OrchestratorProfiles {
         action: String,
         name: Option<String>,
+        /// プロファイル種別（"master" = tako master の profiles/ / "solo" = tako solo の
+        /// solo-profiles/。省略時 master = 完全後方互換。Issue #721）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// copy の複製元プロファイル名（Issue #721）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// このプロファイルに割り当てるプロジェクトキー（丸ごと置き換え。Issue #721）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projects: Option<Vec<String>>,
+        /// projects の指定を解除する（Issue #721）
+        #[serde(default)]
+        clear_projects: bool,
         /// master のエージェント種別（claude / codex。agy は master 非対応）を設定する
         #[serde(default, skip_serializing_if = "Option::is_none")]
         master_agent: Option<String>,
@@ -1335,7 +1349,7 @@ pub enum Request {
     Settings {
         #[serde(default)]
         action: Option<String>,
-        /// タブ指定: general / appearance / runner / setup / sleep / remote / advanced
+        /// タブ指定: general / appearance / runner / profiles / setup / sleep / remote / advanced
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab: Option<String>,
     },

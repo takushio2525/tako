@@ -32298,6 +32298,230 @@ mod self_test {
                 });
             }
 
+            // 96. 設定画面のプロファイルタブ（#721）。この画面の危険は見た目ではなく
+            // 状態遷移側にある（別のプロファイルを保存する / 確認なしで消える /
+            // 外部変更に追随せず古い値で上書きする）。ピクセルを見なくても検証できる
+            // 経路（ボタン・入力欄が通る内部関数）で次を確かめる:
+            // (a) 種別で一覧が分かれる（master の profiles/ と solo の solo-profiles/）
+            // (b) GUI の保存内容が `profiles show`（CLI / MCP と同一 dispatch）と一致する
+            // (c) CLI / MCP 相当の外部変更が再表示で反映される
+            // (d) 未登録 project / [1m] モデルの警告がフォームの表示データに載る
+            // (e) 削除は 1 回目で消えず、確認後にだけ消える
+            {
+                use settings_window::profiles::ProfileField;
+                use tako_control::orchestrator::ProfileKind;
+                use tako_control::protocol::Request as Req;
+
+                // 設定画面を開く（⌘, / パレット / MCP tako_settings と同じ経路）
+                window
+                    .update(cx, |app, _, cx| {
+                        app.open_settings_window_impl(Some(settings_window::SettingsTab::Profiles), cx);
+                    })
+                    .ok();
+                let mut settings = None;
+                for _ in 0..40 {
+                    settings = window
+                        .update(cx, |app, _, _| app.settings_window_handle)
+                        .ok()
+                        .flatten();
+                    if settings.is_some() {
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                let Some(settings) = settings else {
+                    fail("#721: 設定ウィンドウが開かない")
+                };
+
+                // 実ユーザーのプロファイルを壊さないよう、専用の名前だけを作って最後に消す
+                let probe = "st721probe";
+                let copy = "st721copy";
+                let req = |action: &str, kind: &str, name: Option<&str>| Req::OrchestratorProfiles {
+                    action: action.into(),
+                    name: name.map(String::from),
+                    kind: Some(kind.into()),
+                    from: None,
+                    projects: None,
+                    clear_projects: false,
+                    master_agent: None,
+                    clear_master_agent: false,
+                    model: None,
+                    worker_model: None,
+                    effort: None,
+                    worker_effort: None,
+                    clear_model: false,
+                    clear_worker_model: false,
+                    worker_agent: None,
+                    clear_worker_agent: false,
+                    agent: None,
+                    agent_model: None,
+                    clear_agent_model: false,
+                    agent_effort: None,
+                    clear_agent_effort: false,
+                    agent_skip_permissions: None,
+                    agent_args: None,
+                    worker_model_policy: None,
+                    tab_naming_convention: None,
+                    env_set: None,
+                    env_unset: None,
+                    master_account: None,
+                    clear_master_account: false,
+                    worker_account: None,
+                    clear_worker_account: false,
+                };
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                // 前回の残骸を消してから始める（両種別）
+                for kind in ["master", "solo"] {
+                    for name in [probe, copy] {
+                        fire(req("delete", kind, Some(name)), cx);
+                    }
+                }
+
+                // (a) master 側だけに作り、solo 側の一覧に出ないことを見る
+                let created = fire(req("create", "master", Some(probe)), cx).is_some();
+                let (master_has, solo_has) = settings
+                    .update(cx, |view, _, cx| {
+                        view.st_profiles_set_kind(ProfileKind::Master, cx);
+                        let m = view.st_profiles_names().contains(&probe.to_string());
+                        view.st_profiles_set_kind(ProfileKind::Solo, cx);
+                        let s = view.st_profiles_names().contains(&probe.to_string());
+                        view.st_profiles_set_kind(ProfileKind::Master, cx);
+                        (m, s)
+                    })
+                    .unwrap_or((false, true));
+                check(
+                    created && master_has && !solo_has,
+                    "プロファイルタブ: master / solo の一覧が分かれる (#721)",
+                );
+
+                // (b) 入力欄・チップからの保存が yaml へ届き、show と一致する
+                settings
+                    .update(cx, |view, _, cx| {
+                        view.st_profiles_select(probe, cx);
+                        view.st_profiles_commit(ProfileField::Model, "st721-model", cx);
+                        view.st_profiles_pick_effort("low", cx);
+                    })
+                    .ok();
+                let shown = fire(req("show", "master", Some(probe)), cx);
+                let roundtrip = shown
+                    .as_ref()
+                    .map(|v| {
+                        v["model"].as_str() == Some("st721-model")
+                            && v["effort"].as_str() == Some("low")
+                    })
+                    .unwrap_or(false);
+                // 表示データも同じ値を持つ（表示と実値がずれていない）
+                let form_matches = settings
+                    .update(cx, |view, _, _| {
+                        view.st_profiles_detail()
+                            .map(|d| {
+                                d["model"].as_str() == Some("st721-model")
+                                    && d["effort"].as_str() == Some("low")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                check(
+                    roundtrip && form_matches,
+                    "プロファイルタブ: GUI の保存が profiles show と一致する (#721)",
+                );
+
+                // (c) 外部変更（CLI / MCP 相当の dispatch）→ 再表示で反映される
+                let copied = {
+                    let mut r = req("copy", "master", Some(copy));
+                    if let Req::OrchestratorProfiles { ref mut from, .. } = r {
+                        *from = Some(probe.to_string());
+                    }
+                    fire(r, cx).is_some()
+                };
+                let followed = settings
+                    .update(cx, |view, _, cx| {
+                        // タブ表示のたびに読み直す経路（set_tab → refresh_tab_status）
+                        view.set_tab(settings_window::SettingsTab::General, cx);
+                        view.set_tab(settings_window::SettingsTab::Profiles, cx);
+                        view.st_profiles_names().contains(&copy.to_string())
+                    })
+                    .unwrap_or(false);
+                check(
+                    copied && followed,
+                    "プロファイルタブ: 外部からの変更が再表示で反映される (#721)",
+                );
+
+                // (d) 参照整合性の警告が表示データに載る（保存前の確認材料）
+                let warned = {
+                    let mut r = req("set", "master", Some(probe));
+                    if let Req::OrchestratorProfiles {
+                        ref mut projects,
+                        ref mut model,
+                        ..
+                    } = r
+                    {
+                        *projects = Some(vec!["st721-nonexistent".into()]);
+                        *model = Some("claude-opus-4-6[1m]".into());
+                    }
+                    fire(r, cx).is_some()
+                };
+                let shows_warnings = settings
+                    .update(cx, |view, _, cx| {
+                        view.st_profiles_select(probe, cx);
+                        view.st_profiles_detail()
+                            .and_then(|d| {
+                                d["warnings"].as_array().map(|w| {
+                                    let all = w
+                                        .iter()
+                                        .filter_map(|x| x.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    all.contains("st721-nonexistent") && all.contains("[1m]")
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                check(
+                    warned && shows_warnings,
+                    "プロファイルタブ: 未登録 project と [1m] モデルを警告する (#721)",
+                );
+
+                // (e) 削除は 1 回目で消えない（確認つき）。2 回目で実際に消える
+                let (survives_first, gone_after_confirm) = settings
+                    .update(cx, |view, _, cx| {
+                        view.st_profiles_request_delete(copy);
+                        view.set_tab(settings_window::SettingsTab::General, cx);
+                        view.set_tab(settings_window::SettingsTab::Profiles, cx);
+                        let still_there = view.st_profiles_names().contains(&copy.to_string());
+                        view.st_profiles_request_delete(copy);
+                        view.st_profiles_confirm_delete(cx);
+                        (
+                            still_there,
+                            !view.st_profiles_names().contains(&copy.to_string()),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                check(
+                    survives_first && gone_after_confirm,
+                    "プロファイルタブ: 削除は確認を経てから実行される (#721)",
+                );
+
+                // 後片付け: 検証用プロファイルを消して設定ウィンドウを閉じる
+                for name in [probe, copy] {
+                    fire(req("delete", "master", Some(name)), cx);
+                }
+                settings
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+                window
+                    .update(cx, |app, _, _| app.settings_window_handle = None)
+                    .ok();
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);

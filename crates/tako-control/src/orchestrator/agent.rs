@@ -56,6 +56,22 @@ impl WorkerAgent {
         matches!(self, Self::Claude)
     }
 
+    /// この CLI が受け付ける effort の既知の値（選択式 UI 用。#721）。
+    /// **語彙の網羅ではなく「よく使う既知の値」**: 上流 CLI が値を増やしても既存の
+    /// 設定値は保持され、CLI（`profiles set --effort`）から任意の値を指定できる。
+    /// agy は effort 指定手段が無い（モデル名の "(High)" 等に組み込み）ため空を返す
+    pub fn effort_options(&self) -> &'static [&'static str] {
+        match self {
+            // claude の --effort
+            Self::Claude => &["low", "medium", "high", "max"],
+            // codex の -c model_reasoning_effort=
+            Self::Codex => &[
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ],
+            Self::Agy => &[],
+        }
+    }
+
     /// プロファイルで明示設定されていない場合の skip_permissions 既定値。
     /// codex / agy は承認ダイアログで worker が停止するため既定でスキップする。
     /// claude は従来どおり承認あり（auto accept は Claude Code 側の設定に委ねる）

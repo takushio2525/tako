@@ -1376,8 +1376,13 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_profiles",
-            "description": "オーケストレーターのプロファイル（tako master の起動設定）を管理する。\
-                action=list で一覧、show で単一表示、set で作成・更新。\
+            "description": "オーケストレーターのプロファイル（tako master / tako solo の起動設定）を管理する。\
+                action=list で一覧、show で単一表示、set で作成・更新、create で新規作成、\
+                copy で複製（from に複製元）、delete で削除（default は削除不可）。\
+                kind=master（既定。tako master が読む profiles/）と kind=solo（tako solo が読む \
+                solo-profiles/）を切り替える。スキーマは両者共通。\
+                list / show / set は参照整合性の警告（未登録 project / 未登録アカウント / \
+                [1m] モデル）を warnings フィールドで返す。\
                 プロファイルは profiles/<name>.yaml に保存され、master のエージェント種別・\
                 モデル・effort と子 worker のモデル決定に使われる。model が null / 未指定の\
                 プロファイルはその CLI の既定モデルで起動する（プラン非依存・推奨）。\
@@ -1395,10 +1400,21 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "show", "set"],
+                        "enum": ["list", "show", "set", "create", "copy", "delete"],
                         "description": "操作種別（省略時は list）",
                     },
-                    "name": { "type": "string", "description": "プロファイル名（set 時に必須。show 省略時は default）" },
+                    "name": { "type": "string", "description": "プロファイル名（set / create / copy / delete 時に必須。show 省略時は default）" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["master", "solo"],
+                        "description": "プロファイル種別（master = tako master の profiles/ 既定 / solo = tako solo の solo-profiles/）",
+                    },
+                    "from": { "type": "string", "description": "複製元プロファイル名（copy 時に必須）" },
+                    "projects": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "このプロファイルに割り当てるプロジェクトキー（projects.yaml のキー。丸ごと置き換え。空配列でクリア。set 時）",
+                    },
+                    "clear_projects": { "type": "boolean", "description": "projects の割り当てを解除する（set 時）" },
                     "master_agent": {
                         "type": "string",
                         "enum": ["claude", "codex"],
@@ -2187,8 +2203,8 @@ pub fn tools() -> Vec<Value> {
                     },
                     "tab": {
                         "type": "string",
-                        "enum": ["general", "appearance", "runner", "setup", "sleep", "remote", "advanced"],
-                        "description": "開くタブ指定（省略時は現在タブ維持）",
+                        "enum": ["general", "appearance", "runner", "profiles", "setup", "sleep", "remote", "advanced"],
+                        "description": "開くタブ指定（省略時は現在タブ維持）。profiles = master / solo の起動プロファイル編集（#721）",
                     },
                 },
                 "additionalProperties": false,
@@ -3755,6 +3771,10 @@ fn build_request(
         "tako_orchestrator_profiles" => Request::OrchestratorProfiles {
             action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
             name: str_arg(args, "name")?,
+            kind: str_arg(args, "kind")?,
+            from: str_arg(args, "from")?,
+            projects: str_vec_arg(args, "projects")?,
+            clear_projects: bool_arg(args, "clear_projects")?.unwrap_or(false),
             model: str_arg(args, "model")?,
             master_agent: str_arg(args, "master_agent")?,
             clear_master_agent: bool_arg(args, "clear_master_agent")?.unwrap_or(false),

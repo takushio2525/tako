@@ -1717,7 +1717,119 @@ fn profile_path(name: &str) -> Result<PathBuf, String> {
 
 /// 利用可能なプロファイル名の一覧を返す
 pub fn list_profiles() -> Result<Vec<String>, String> {
-    let dir = match profiles_dir() {
+    list_profiles_of(ProfileKind::Master)
+}
+
+// --- プロファイル種別（master / solo。Issue #721）---
+//
+// `tako master` は profiles/、`tako solo` は solo-profiles/ を読む。両者はスキーマが
+// 同一（Profile 構造体を共用）でディレクトリだけが違うので、種別を型にして
+// パス解決・一覧・CRUD を 1 本にまとめる。GUI・CLI・MCP はこの API だけを通る
+
+/// プロファイルの種別。保存先ディレクトリだけが違い、スキーマは共通
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProfileKind {
+    /// `tako master` 用（profiles/）
+    #[default]
+    Master,
+    /// `tako solo` 用（solo-profiles/）
+    Solo,
+}
+
+impl ProfileKind {
+    /// CLI / MCP / IPC で受け取る文字列表現（正本）
+    pub const VALUES: &[&str] = &["master", "solo"];
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "master" => Ok(Self::Master),
+            "solo" => Ok(Self::Solo),
+            other => Err(format!(
+                "kind が不正: '{other}'（{}）",
+                Self::VALUES.join(" / ")
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Master => "master",
+            Self::Solo => "solo",
+        }
+    }
+
+    /// 保存先ディレクトリ
+    pub fn dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Master => profiles_dir(),
+            Self::Solo => solo_profiles_dir(),
+        }
+    }
+
+    /// このプロファイルを使う起動コマンド（`tako master` / `tako solo`）
+    pub fn launch_bin(&self) -> &'static str {
+        match self {
+            Self::Master => "tako master",
+            Self::Solo => "tako solo",
+        }
+    }
+
+    /// 種別ごとの既定プロファイル（solo は effort が低い）
+    pub fn default_profile(&self) -> Profile {
+        match self {
+            Self::Master => Profile::default(),
+            Self::Solo => solo_default_profile(),
+        }
+    }
+
+    /// ディレクトリとデフォルトプロファイルを用意する
+    pub fn ensure_defaults(&self) -> Result<PathBuf, String> {
+        match self {
+            Self::Master => ensure_defaults().and_then(|_| {
+                profiles_dir().ok_or_else(|| "ホームディレクトリが取得できない".into())
+            }),
+            Self::Solo => ensure_solo_defaults(),
+        }
+    }
+
+    fn path(&self, name: &str) -> Result<PathBuf, String> {
+        validate_profile_name(name)?;
+        self.dir()
+            .map(|d| d.join(format!("{name}.yaml")))
+            .ok_or_else(|| "ホームディレクトリが取得できない".into())
+    }
+}
+
+/// プロファイル名の検証。ファイル名にもシェルコマンド（`tako master -<name>`）にも
+/// 入るので、パス区切り・空白・記号を弾いて英数と `-` `_` `.` だけを許す。
+/// 先頭の `.` は隠しファイル・親ディレクトリ参照（`..`）になるため拒否し、
+/// 先頭の `-` は `tako master --x` としてオプション扱いされるため拒否する
+pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("プロファイル名が空".into());
+    }
+    if name.starts_with('.') {
+        return Err(format!("プロファイル名は '.' で始められない: '{name}'"));
+    }
+    if name.starts_with('-') {
+        return Err(format!(
+            "プロファイル名は '-' で始められない（起動コマンドのオプションと紛れる）: '{name}'"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'))
+    {
+        return Err(format!(
+            "プロファイル名に使えない文字が含まれる: '{bad}'（英数字と - _ . のみ）"
+        ));
+    }
+    Ok(())
+}
+
+/// 指定種別の利用可能なプロファイル名の一覧を返す
+pub fn list_profiles_of(kind: ProfileKind) -> Result<Vec<String>, String> {
+    let dir = match kind.dir() {
         Some(d) if d.is_dir() => d,
         _ => return Ok(vec![]),
     };
@@ -1734,6 +1846,172 @@ pub fn list_profiles() -> Result<Vec<String>, String> {
     }
     names.sort();
     Ok(names)
+}
+
+/// 指定種別のプロファイルを読み込む（不在・パース失敗は Err）
+pub fn load_profile_of(kind: ProfileKind, name: &str) -> Result<Profile, String> {
+    let path = kind.path(name)?;
+    if !path.is_file() {
+        return Err(format!(
+            "{} プロファイル '{name}' が見つからない: {}",
+            kind.as_str(),
+            path.display()
+        ));
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
+    serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+}
+
+/// 指定種別のプロファイルのロック付き read-modify-write（#169）。
+/// パース失敗した既存ファイルは default に丸めず Err で中断する（設定消失を防ぐ）
+pub fn mutate_profile_of<R>(
+    kind: ProfileKind,
+    name: &str,
+    f: impl FnOnce(&mut Profile) -> R,
+) -> Result<(PathBuf, R), String> {
+    let path = kind.path(name)?;
+    let _lock = crate::config_io::lock_exclusive(&path)?;
+    let mut profile = Profile::load_from_or_default(&path)?;
+    let result = f(&mut profile);
+    let content =
+        serde_yaml::to_string(&profile).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+    crate::config_io::atomic_write_with_backup(&path, &content)?;
+    Ok((path, result))
+}
+
+/// プロファイルを新規作成する（既存があれば Err = 誤上書きを防ぐ）。
+/// `base` 省略時は種別の既定値から始める
+pub fn create_profile_of(
+    kind: ProfileKind,
+    name: &str,
+    base: Option<Profile>,
+) -> Result<(PathBuf, Profile), String> {
+    let path = kind.path(name)?;
+    kind.ensure_defaults()?;
+    let profile = base.unwrap_or_else(|| kind.default_profile());
+    create_profile_at(&path, &profile).map_err(|e| match e {
+        CreateError::Exists => format!(
+            "{} プロファイル '{name}' は既に存在する（上書きするなら set を使う）",
+            kind.as_str()
+        ),
+        CreateError::Failed(msg) => msg,
+    })?;
+    Ok((path, profile))
+}
+
+/// `create_profile_of` の失敗理由（既存衝突だけは呼び出し側が文言を作る）
+pub enum CreateError {
+    Exists,
+    Failed(String),
+}
+
+/// パス指定版 create。**ロックを取ってから存在確認する**ので、並行 create で
+/// 「両方が不在と判断して片方が消える」TOCTOU が起きない（#169 と同じ方針）
+pub fn create_profile_at(path: &Path, profile: &Profile) -> Result<(), CreateError> {
+    let _lock = crate::config_io::lock_exclusive(path).map_err(CreateError::Failed)?;
+    if path.is_file() {
+        return Err(CreateError::Exists);
+    }
+    let content = serde_yaml::to_string(profile)
+        .map_err(|e| CreateError::Failed(format!("YAML のシリアライズに失敗: {e}")))?;
+    crate::config_io::atomic_write_with_backup(path, &content).map_err(CreateError::Failed)
+}
+
+/// プロファイルを削除する。`default` は起動時のフォールバック先なので拒否する
+pub fn delete_profile_of(kind: ProfileKind, name: &str) -> Result<PathBuf, String> {
+    let path = kind.path(name)?;
+    if name == "default" {
+        return Err(format!(
+            "既定プロファイル 'default' は削除できない（{} が参照する）",
+            kind.launch_bin()
+        ));
+    }
+    delete_profile_at(&path).map_err(|e| {
+        e.unwrap_or_else(|| {
+            format!(
+                "{} プロファイル '{name}' が見つからない: {}",
+                kind.as_str(),
+                path.display()
+            )
+        })
+    })?;
+    Ok(path)
+}
+
+/// パス指定版 delete。`Err(None)` = 不在（呼び出し側が名前つきの文言を作る）
+pub fn delete_profile_at(path: &Path) -> Result<(), Option<String>> {
+    if !path.is_file() {
+        return Err(None);
+    }
+    // 削除も他プロセスの RMW と直列化する（#169 の config_io と同じロックを使う）
+    let _lock = crate::config_io::lock_exclusive(path).map_err(Some)?;
+    std::fs::remove_file(path).map_err(|e| Some(format!("プロファイルの削除に失敗: {e}")))
+}
+
+/// プロファイルの参照整合性を検査して警告を返す（GUI / CLI / MCP 共用の単一ソース）。
+/// **保存を妨げない警告**として返す: 未登録 project / 未登録アカウントは後から
+/// 登録される場合があり、`[1m]` モデルは明示 opt-in を尊重する（#27）。
+///
+/// projects.yaml / accounts.yaml は**参照があるときだけ**読む（list は全プロファイル
+/// 分呼ばれるので、無条件に読むとプロファイル数ぶんのファイル読み込みが増える）
+pub fn profile_warnings(profile: &Profile) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // [1m] モデル（Max / API プラン限定）。inherit で master と同一なら master 分のみ。
+    // claude 以外の master の model は claude 表記でないため対象外（#127）
+    if let Some(w) = profile
+        .model
+        .as_deref()
+        .filter(|_| profile.master_agent_is_claude())
+        .and_then(|m| one_m_model_warning(m, "master"))
+    {
+        warnings.push(w);
+    }
+    if let Some(w) = profile
+        .resolve_worker_model()
+        .filter(|m| Some(*m) != profile.model.as_deref())
+        .and_then(|m| one_m_model_warning(m, "worker"))
+    {
+        warnings.push(w);
+    }
+
+    // 未登録の project キー（master 起動時に明示エラーになる。#500 Part 7）
+    if let Some(keys) = profile.projects.as_ref().filter(|k| !k.is_empty()) {
+        let known: Vec<String> = ProjectsConfig::load()
+            .map(|c| c.list_resolved().into_iter().map(|p| p.key).collect())
+            .unwrap_or_default();
+        for key in keys {
+            if !known.iter().any(|k| k == key) {
+                warnings.push(format!(
+                    "プロジェクト '{key}' は projects.yaml に登録されていません（この状態では起動時にエラーになります）。\n  `tako orchestrator projects add {key} <パス>` で登録してください"
+                ));
+            }
+        }
+    }
+
+    // 未登録のアカウント名（master / worker 起動時に明示エラーになる。#504 / #547）
+    let referenced: Vec<(&str, &str)> = [
+        ("master_account", profile.master_account.as_deref()),
+        ("worker_account", profile.worker_account.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(label, name)| name.map(|n| (label, n)))
+    .collect();
+    if !referenced.is_empty() {
+        let known: Vec<String> = AccountsConfig::load()
+            .map(|c| c.list_resolved().into_iter().map(|(n, _)| n).collect())
+            .unwrap_or_default();
+        for (label, name) in referenced {
+            if !known.iter().any(|n| n == name) {
+                warnings.push(format!(
+                    "{label} のアカウント '{name}' は accounts.yaml に登録されていません（この状態では起動時にエラーになります）。\n  `tako orchestrator accounts add {name} --inherit` で登録してください"
+                ));
+            }
+        }
+    }
+
+    warnings
 }
 
 /// 新規生成する default.yaml の内容。
@@ -4028,5 +4306,110 @@ worker_agents:
         // 「成功したが 0 件」は失敗ではない（該当アカウントに稼働中エージェントが無いだけ）
         let empty = merge_agents_json(&[Some(b"[]".to_vec())]).expect("空配列は成功");
         assert_eq!(empty, b"[]");
+    }
+
+    // --- プロファイル種別と CRUD（Issue #721）---
+
+    /// プロファイル名はファイル名にも `tako master -<name>` にも入るので、
+    /// パス区切り・親ディレクトリ参照・空白・記号を通してはいけない
+    #[test]
+    fn プロファイル名の検証がパス脱出と記号を拒否する() {
+        for ok in ["default", "sol", "my-profile", "a_b.2", "Team1"] {
+            assert!(validate_profile_name(ok).is_ok(), "'{ok}' は許可されるべき");
+        }
+        for bad in [
+            "", "..", ".hidden", "../evil", "a/b", "a\\b", "a b", "a;rm -rf", "a$(id)", "-x",
+        ] {
+            // 先頭 '-' はコマンド引数と紛れるので不許可（記号チェックで落ちる）
+            assert!(
+                validate_profile_name(bad).is_err(),
+                "'{bad}' は拒否されるべき"
+            );
+        }
+    }
+
+    /// 種別の文字列表現は CLI / MCP / IPC の正本。VALUES と parse/as_str が一致すること
+    #[test]
+    fn プロファイル種別の文字列表現が往復する() {
+        for value in ProfileKind::VALUES {
+            let kind = ProfileKind::parse(value).expect("VALUES はパースできる");
+            assert_eq!(kind.as_str(), *value);
+        }
+        assert!(ProfileKind::parse("Master").is_err(), "大文字は受理しない");
+        assert!(ProfileKind::parse("worker").is_err());
+        // 起動コマンドと既定 effort が種別ごとに違う（solo はエコ運用）
+        assert_eq!(ProfileKind::Master.launch_bin(), "tako master");
+        assert_eq!(ProfileKind::Solo.launch_bin(), "tako solo");
+        assert_eq!(
+            ProfileKind::Master.default_profile().effort,
+            DEFAULT_PROFILE_EFFORT
+        );
+        assert_eq!(
+            ProfileKind::Solo.default_profile().effort,
+            SOLO_DEFAULT_EFFORT
+        );
+    }
+
+    /// create は既存を上書きしない（誤操作で設定を消さない）。delete は不在を報告する
+    #[test]
+    fn createは既存を上書きせずdeleteは不在を報告する() {
+        let dir = std::env::temp_dir().join(format!("tako-721-crud-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        let path = dir.join("p.yaml");
+
+        let first = Profile {
+            effort: "high".into(),
+            model: Some("keep-me".into()),
+            ..Default::default()
+        };
+        assert!(create_profile_at(&path, &first).is_ok());
+        let loaded = Profile::load_from_or_default(&path).expect("読み直せる");
+        assert_eq!(loaded.model.as_deref(), Some("keep-me"));
+        assert_eq!(loaded.effort, "high");
+
+        // 2 回目は Exists で拒否され、中身は 1 回目のまま
+        let second = Profile::default();
+        assert!(
+            matches!(create_profile_at(&path, &second), Err(CreateError::Exists)),
+            "既存があれば Exists"
+        );
+        let after = Profile::load_from_or_default(&path).expect("読み直せる");
+        assert_eq!(after.model.as_deref(), Some("keep-me"), "上書きされない");
+
+        assert!(delete_profile_at(&path).is_ok());
+        assert!(!path.is_file());
+        assert!(
+            matches!(delete_profile_at(&path), Err(None)),
+            "不在は Err(None)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [1m] 警告は master / worker で別々に出る。inherit で同一モデルなら master 分のみ
+    #[test]
+    fn 参照整合性の警告が1mモデルを検出する() {
+        // projects / accounts を参照しないプロファイルなので設定ファイルを読まない
+        let plain = Profile::default();
+        assert!(profile_warnings(&plain).is_empty(), "既定は警告なし");
+
+        let one_m = Profile {
+            model: Some("claude-opus-4-6[1m]".into()),
+            ..Default::default()
+        };
+        let w = profile_warnings(&one_m);
+        assert_eq!(w.len(), 1, "inherit で同一モデルなら master 分のみ: {w:?}");
+        assert!(w[0].contains("master"));
+
+        let both = Profile {
+            model: Some("claude-opus-4-6".into()),
+            worker_model_policy: WorkerModelPolicy::Fixed,
+            worker_model: Some("claude-sonnet-5[1m]".into()),
+            ..Default::default()
+        };
+        let w = profile_warnings(&both);
+        assert_eq!(w.len(), 1, "worker 側だけ [1m]: {w:?}");
+        assert!(w[0].contains("worker"));
     }
 }
