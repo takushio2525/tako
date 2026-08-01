@@ -3386,7 +3386,12 @@ fn handle_api_v2_routes(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(30);
             match crate::transcript::read_messages(&session_id, tail) {
-                Ok(result) => respond_sensitive(request, 200, Some(result.to_string())),
+                // #715: システム通知は PWA が描き分けられないので配る手前で落とす
+                Ok(result) => respond_sensitive(
+                    request,
+                    200,
+                    Some(crate::transcript::without_system_notices(result).to_string()),
+                ),
                 Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
             }
         }
