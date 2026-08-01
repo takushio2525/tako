@@ -1345,6 +1345,10 @@ struct TakoApp {
     chat_md_cache: HashMap<u64, std::rc::Rc<Vec<preview::MdBlock>>>,
     /// 送信直後の楽観 echo（#716 / 仕様 §3.1）。transcript へ現れたら破棄する
     chat_echo: HashMap<PaneId, Vec<chat_view::ChatEcho>>,
+    /// visual-test 用（#718）: 描き終わった入力欄の実 bounds。
+    /// 「1 行入力なら 1 行ぶんの高さ」を**実ピクセルの数値**で押さえるために使う
+    #[cfg(feature = "visual-test")]
+    chat_input_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// 「新しい会話」（/clear）の確認待ちペイン（#716。破壊的なので必ず 1 段挟む）
     chat_clear_confirm: Option<PaneId>,
     /// 送信・承認が失敗したときの表示（ペイン, 文言, 時刻）。時間経過で消える
@@ -2573,6 +2577,8 @@ impl TakoApp {
             chat_content_keys: HashMap::new(),
             chat_md_cache: HashMap::new(),
             chat_echo: HashMap::new(),
+            #[cfg(feature = "visual-test")]
+            chat_input_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             chat_clear_confirm: None,
             chat_action_error: None,
             chat_long_expanded: std::collections::HashSet::new(),
@@ -8452,7 +8458,16 @@ impl TakoApp {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let item = cx.read_from_clipboard();
+        let Some(text) = item.as_ref().and_then(|item| item.text()) else {
+            // #719 要件 1: 画像だけがクリップボードにあるときの ⌘V。
+            // tako 側で画像を扱わず **Ctrl+V をそのまま TUI へ流す**（エージェント CLI は
+            // 自分でクリップボードを読み `[Image #N]` をカーソル位置へ差し込む）。
+            // tako が画像を一時ファイル化して経路を作ると、TUI の採番・添付形式と
+            // 二重管理になり送信時の形がズレる
+            if item.as_ref().is_some_and(Self::clipboard_has_image) {
+                self.forward_image_paste(cx);
+            }
             return;
         };
         // handle_key と同じ優先順位で入力先を振り分ける（#414）。
@@ -8510,6 +8525,40 @@ impl TakoApp {
             self.start_autosave_timer(pane_id, cx);
         } else if let Some(session) = self.focused_session() {
             session.paste(&text);
+        }
+        cx.notify();
+    }
+
+    /// クリップボードに画像エントリがあるか（#719 要件 1）。
+    /// テキストが無い ⌘V を「何もしない」で終わらせないための判定
+    fn clipboard_has_image(item: &ClipboardItem) -> bool {
+        item.entries()
+            .iter()
+            .any(|e| matches!(e, gpui::ClipboardEntry::Image(_)))
+    }
+
+    /// 画像ペースト（⌘V）をエージェント TUI へ素通しする（#719 要件 1）。
+    ///
+    /// 送るのは Ctrl+V（`0x16`）1 バイトだけ。claude / codex はこれを受けて
+    /// **自分で**システムクリップボードから画像を読み、入力欄のカーソル位置へ
+    /// `[Image #N]` を挿入する。だからチャット入力欄（TUI 入力行のミラー）にも
+    /// そのまま現れるし、送信時の添付形式も TUI で打ったときと完全に一致する。
+    ///
+    /// 素のシェルへ送ると `0x16` は「次の文字をそのまま入れる」の意味になって
+    /// 化けるので、**エージェント TUI が出ているペインに限る**
+    fn forward_image_paste(&mut self, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        let is_agent_tui = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.screen_opts(&self.theme, false))
+            .and_then(|screen| tako_core::screen::input_region(&screen))
+            .is_some();
+        if !is_agent_tui {
+            return;
+        }
+        if let Some(session) = self.terminals.get(&pane_id) {
+            session.write(vec![0x16]);
         }
         cx.notify();
     }
@@ -21410,6 +21459,70 @@ mod self_test {
                     .unwrap_or_else(|| fail("visual-test チャット: 入力後フレーム"));
                 let typed_changed =
                     changed_pixels_in_bounds(&gui_light, &typed, &[composer], scale);
+                // #718: 「行数 = 高さ」を**実ピクセルの数値**で押さえる。
+                // 1 行 → 2 行 → 4 行と描いて、増分がちょうど 1 行ぶんずつになること、
+                // 1 行のときの高さが「1 行 + 上下パディング」に収まっていることを見る
+                let line_h = window
+                    .update(cx, |app, _, _| app.pane_line_height(pane))
+                    .unwrap_or(17.0);
+                let mut heights: Vec<f32> = Vec::new();
+                for rows in [1usize, 2, 4] {
+                    let body: Vec<String> = (0..rows)
+                        .map(|i| {
+                            if i == 0 {
+                                "\\u276F row0".to_string()
+                            } else {
+                                format!("  row{i}")
+                            }
+                        })
+                        .collect();
+                    let rule = "\\u2500".repeat(16);
+                    let cmd = format!(
+                        "printf '%b' '{rule}\\n{}\\n{rule}\\n'",
+                        body.join("\\n")
+                    );
+                    let _ = window.update(cx, |app, _, _| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Send {
+                                pane: Some(pane.as_u64()),
+                                text: cmd,
+                                newline: true,
+                                tmux_session: None,
+                                await_prompt: false,
+                            },
+                            PaneOrigin::User,
+                        );
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_millis(800))
+                        .await;
+                    let _ = capture_frame(any, cx);
+                    let h = window
+                        .update(cx, |app, _, _| {
+                            app.chat_input_bounds.get().map(|b| f32::from(b.size.height))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0.0);
+                    heights.push(h);
+                }
+                println!(
+                    "TAKO_VISUAL_PIXEL: chat-input line_h={line_h:.1} h1={:.1} h2={:.1} h4={:.1}",
+                    heights[0], heights[1], heights[2]
+                );
+                // 1 行のときの箱は「1 行 + 上下パディング（12px）+ 枠 2px」に収まる。
+                // 送信ボタン（26px）が高さを押し上げていた頃はここが 40px 付近だった
+                check(
+                    heights[0] > line_h && heights[0] <= line_h + 20.0,
+                    "visual-test 入力欄: 1 行入力は 1 行ぶん + パディングの高さ (#718)",
+                );
+                // 行が増えたぶんだけきっちり伸びる（1 行あたり line_h。誤差 2px）
+                check(
+                    (heights[1] - heights[0] - line_h).abs() < 2.0
+                        && (heights[2] - heights[0] - line_h * 3.0).abs() < 2.0,
+                    "visual-test 入力欄: 行数に比例して伸びる (#718 オートグロー)",
+                );
                 // 承認カード + インラインカードを出す
                 let _ = window.update(cx, |app, _, cx| {
                     if let Some(state) = app.chat_panes.get(&pane) {

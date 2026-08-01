@@ -371,7 +371,8 @@ impl TakoApp {
         let start = rendered.len().saturating_sub(from_bottom_first).min(end);
         let rows: Vec<gpui::Div> = rendered.drain(start..end).collect();
         // 入力欄に「ユーザーが打った文字」があるか（dim のゴースト提案は無しと扱う。#572）
-        let has_text = tako_core::screen::analyze_input_line(&screen)
+        // **箱と同じ行**を見る（探し直すと走査範囲の違いで食い違う。#719 実スクショ）
+        let has_text = tako_core::screen::analyze_input_line_at(&screen, region.prompt_row)
             .map(|s| {
                 !s.text.is_empty()
                     && !tako_control::claude_tui::input_content_is_empty(&s.text)
@@ -862,6 +863,24 @@ impl TakoApp {
                             this.focus_chat_input(pane_id, cx);
                         }),
                     )
+                    // #718: 実ピクセルで高さを見るための記録（absolute なのでレイアウト不変）
+                    .child({
+                        #[cfg(feature = "visual-test")]
+                        {
+                            let slot = self.chat_input_bounds.clone();
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| slot.set(Some(bounds)),
+                            )
+                            .absolute()
+                            .size_full()
+                            .into_any_element()
+                        }
+                        #[cfg(not(feature = "visual-test"))]
+                        {
+                            gpui::Empty.into_any_element()
+                        }
+                    })
                     .child(
                         // 映した行をそのまま縦に積む。**行数 = 箱の高さ**なので、
                         // 1 行なら 1 行ぶんの高さに落ち着く（#718）。送信ボタンは

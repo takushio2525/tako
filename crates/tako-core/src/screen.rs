@@ -355,18 +355,36 @@ pub struct InputStatus {
 /// dim 状態を分析する。❯ 行が見つからなければ None
 pub fn analyze_input_line(screen: &Screen) -> Option<InputStatus> {
     // Claude TUI は ❯ の下にフッター（区切り線・モデル情報・ctx%）が 4〜6 行あるため、
-    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）
-    let start = screen.lines.len().saturating_sub(10);
-    let mut found: Option<(usize, usize)> = None; // (行 index, ❯ のバイト位置)
-    for i in start..screen.lines.len() {
-        let trimmed = screen.lines[i].text.trim_start();
-        if trimmed.starts_with('❯') {
-            let leading_spaces = screen.lines[i].text.len() - trimmed.len();
-            found = Some((i, leading_spaces));
+    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）。
+    // 起点は「行数」ではなく**中身がある最後の行**にする。ビューポートを埋めない画面では
+    // 下端に空行が並び、行数基準だと入力行が範囲外に落ちる（#719 の実スクショで発覚）
+    let bottom = screen
+        .lines
+        .iter()
+        .rposition(|l| !l.text.trim().is_empty())
+        .map(|i| i + 1)?;
+    let start = bottom.saturating_sub(10);
+    let mut found: Option<usize> = None;
+    for i in start..bottom {
+        if screen.lines[i].text.trim_start().starts_with('❯') {
+            found = Some(i);
         }
     }
-    let (line_idx, prompt_byte_pos) = found?;
-    let line = &screen.lines[line_idx];
+    analyze_input_line_at(screen, found?)
+}
+
+/// 行 index を指定して入力行を分析する（#719）。
+///
+/// チャット入力欄は [`input_region`] が決めた**まさにその行**を見る必要がある。
+/// 探し直すと走査範囲の違いで「箱は見つかったのに入力テキストは無いことになる」
+/// という食い違いが起きる（実スクショでプレースホルダが本文に重なって発覚した）
+pub fn analyze_input_line_at(screen: &Screen, line_idx: usize) -> Option<InputStatus> {
+    let line = screen.lines.get(line_idx)?;
+    let trimmed = line.text.trim_start();
+    if !trimmed.starts_with('❯') {
+        return None;
+    }
+    let prompt_byte_pos = line.text.len() - trimmed.len();
     let full_line = line.text.trim_end().to_string();
 
     // ❯ の右側のテキストを抽出
@@ -952,6 +970,84 @@ mod tests {
         let r = region_of(&lines).expect("空行の上にある入力ボックスを見つける");
         assert_eq!(r.rows(), 1);
         assert_eq!(lines[r.prompt_row], "❯ こんにちは");
+    }
+
+    /// 行テキストだけから最小の Screen を組む（走査範囲の検査用。runs は空でよい）
+    fn screen_of(texts: &[&str]) -> Screen {
+        Screen {
+            cols: 80,
+            rows: texts.len(),
+            lines: texts
+                .iter()
+                .map(|t| ScreenLine {
+                    text: (*t).to_string(),
+                    runs: Vec::new(),
+                    cell_cols: Vec::new(),
+                    has_wide: false,
+                })
+                .collect(),
+            cursor: None,
+            ime_cursor: None,
+            display_offset: 0,
+            fract: 0.0,
+            extra_bottom: None,
+        }
+    }
+
+    #[test]
+    fn 入力行の分析も末尾空行に耐える() {
+        // ビューポートを埋めない画面（下端に空行が並ぶ）。行数基準で末尾 10 行を切ると
+        // 入力行を見失い、「箱はあるのにテキストは無い」食い違いが起きる（#719 実スクショ）
+        let mut texts: Vec<&str> = vec!["out", "────────", "❯ hello", "────────", "footer"];
+        texts.extend(std::iter::repeat_n("", 12));
+        let s = screen_of(&texts);
+        let status = analyze_input_line(&s).expect("末尾に空行があっても入力行を見つける");
+        assert_eq!(status.text, "hello");
+        // 箱の判定と同じ行を指定した場合も同じ結果になる（食い違いを構造的に防ぐ）
+        let region = input_region(&s).expect("入力ボックスがある");
+        let at = analyze_input_line_at(&s, region.prompt_row).expect("同じ行から取れる");
+        assert_eq!(at.text, status.text);
+    }
+
+    #[test]
+    fn 実採取した_claude_の複数行入力ボックスに追従する() {
+        // claude v2.1.220 を隔離 tmux で動かし Shift+Enter で 4 行入れたときの実採取。
+        // 箱の中には「次の行」用の空行が 1 つ入るので 5 行になる（TUI の見た目どおり）
+        let lines: Vec<String> = [
+            "                                        ctrl+g to edit in VS Code",
+            "──────────────────────────────────────────────────────────────",
+            "❯ line1",
+            "  line2",
+            "  line3",
+            "  line4",
+            "",
+            "──────────────────────────────────────────────────────────────",
+            "  [Opus 5 (1M context) · xH]  user@example.com",
+            "  ctx   0% ░░░░░░░░░░",
+            "  5h   --",
+            "  7d   --",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(
+            r.rows(),
+            5,
+            "TUI が描いた行数（末尾の空行を含む）に一致する"
+        );
+        assert_eq!(lines[r.start], "❯ line1");
+        assert_eq!(lines[r.end - 1], "");
+    }
+
+    #[test]
+    fn 実採取した_claude_の画像プレースホルダ入り入力行を拾う() {
+        // ⌘V（= Ctrl+V 素通し）で claude 自身が差し込む形（実採取: `❯ abc[Image #1]`）
+        let lines = claude_bottom(&["❯ abc[Image #1]"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+        assert!(lines[r.prompt_row].contains("[Image #1]"));
     }
 
     #[test]
