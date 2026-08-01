@@ -917,6 +917,41 @@ fn resolve_ime_pane(
     }
 }
 
+/// GUI モードの過渡期（Issue #720）: ペインを作った / エージェントを起動した瞬間から、
+/// 表示種別（チャット / スターター）が確定するまでの猶予。
+///
+/// 猶予中は生ターミナルではなく準備中プレースホルダを描く。**上限つき**なので、
+/// 確定しないまま終わっても必ず通常判定（= ターミナル表示）へ落ちる
+#[derive(Debug, Clone, Copy)]
+struct PaneSettle {
+    kind: tako_core::ui_mode::SettleKind,
+    since: std::time::Instant,
+}
+
+impl PaneSettle {
+    fn new(kind: tako_core::ui_mode::SettleKind) -> Self {
+        Self {
+            kind,
+            since: std::time::Instant::now(),
+        }
+    }
+
+    /// 判定表へ渡す形。`has_role` が真のペイン（worker / master / solo）は、
+    /// 素のシェルとして始まっても行き先がエージェントなので長い方の猶予を使う
+    fn state(self, has_role: bool) -> tako_core::ui_mode::SettleState {
+        use tako_core::ui_mode::SettleKind;
+        let kind = if has_role {
+            SettleKind::Agent
+        } else {
+            self.kind
+        };
+        tako_core::ui_mode::SettleState {
+            kind,
+            elapsed: self.since.elapsed(),
+        }
+    }
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -1290,6 +1325,11 @@ struct TakoApp {
     /// スターターの「コマンド入力へ」でターミナル表示に戻したペイン（Issue #694）。
     /// **永続化しない**揮発フラグ（仕様 §1.3。再起動すると GUI 表示に戻る）
     starter_released: std::collections::HashSet<PaneId>,
+    /// 表示種別の確定を待っている過渡期のペイン（Issue #720）。
+    /// 値は「いつ始まったか」と「何を待っているか」。**永続化しない**（生成直後だけの状態）。
+    /// 確定したペインの entry は 2 秒 tick が落とす（`prune_pane_settle`）ので、
+    /// 後から走ったコマンドの出力が覆われることはない
+    pane_settle: HashMap<PaneId, PaneSettle>,
     /// GUI モードでチャット表示にするペインと、その読み取り結果（Issue #702）。
     /// **このマップに載っていること = 判定表の「claude 対話 TUI 稼働」が成立**という
     /// 対応にしてあるので、`pane_display_for`（毎 render）は材料を調べ直さない
@@ -2534,6 +2574,7 @@ impl TakoApp {
             // 復元（layout.json）とは無関係なので persist の挙動には影響しない
             ui_mode: tako_control::settings::load().ui_mode(),
             starter_released: std::collections::HashSet::new(),
+            pane_settle: HashMap::new(),
             chat_panes: HashMap::new(),
             chat_expanded: std::collections::HashSet::new(),
             chat_follow: HashMap::new(),
@@ -3334,6 +3375,14 @@ impl TakoApp {
                         if ok.is_err() {
                             break;
                         }
+                    }
+                    // #720: 確定した / 期限切れの過渡期を落とす。チャット判定を反映した
+                    // 直後にやるので、チャットになったペインは同じ tick で猶予が外れる
+                    if this
+                        .update(cx, |app: &mut TakoApp, _| app.prune_pane_settle())
+                        .is_err()
+                    {
+                        break;
                     }
                 }
                 // ② background: バックエンドペインのペインログ取り込み（probe + capture。
@@ -4928,6 +4977,14 @@ impl TakoApp {
         if let Some(tab_id) = self.workspace.find_tab_of_pane(pane_id) {
             options.env.push(("TAKO_TAB_ID".into(), tab_id.to_string()));
         }
+        // #720: 素のシェルで始まるペインは、プロンプトが出るまで表示種別が決まらない。
+        // その数秒を生ターミナル（direnv のロードログ・起動途中のプロンプト）で
+        // 埋めないよう、GUI モードの過渡期として記録する。
+        // **明示コマンド付きのペイン（Code Runner #453 等）は対象外** —
+        // そのコマンドの出力こそがユーザーの見たいものなので、待たせずすぐ描く
+        if options.command.is_none() {
+            self.begin_pane_settle(pane_id, tako_core::ui_mode::SettleKind::Shell);
+        }
         if let Some(ipc) = &self.ipc {
             options
                 .env
@@ -6371,6 +6428,18 @@ impl TakoApp {
             .is_some_and(|s| s.is_alt_screen())
     }
 
+    /// role（master / solo / worker 等）が付いたペインか = エージェント用途。
+    /// 判定表の材料と、過渡期の猶予の長さ（#720）の両方で使う
+    fn pane_has_role(&self, pane_id: PaneId) -> bool {
+        self.workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .find(|p| p.id() == pane_id)
+            .and_then(|p| p.role())
+            .is_some_and(|r| !r.trim().is_empty())
+    }
+
     /// このペインをどう描くか（Issue #694。判定表は `tako_core::ui_mode`）。
     ///
     /// 材料はすべて**すでに手元にある値**で、ここで新しいサブプロセスは起動しない
@@ -6382,14 +6451,7 @@ impl TakoApp {
             return tako_core::ui_mode::PaneDisplay::Terminal;
         }
         let session = self.terminals.get(&pane_id);
-        let has_role = self
-            .workspace
-            .tabs()
-            .iter()
-            .flat_map(|t| t.tree().panes())
-            .find(|p| p.id() == pane_id)
-            .and_then(|p| p.role())
-            .is_some_and(|r| !r.trim().is_empty());
+        let has_role = self.pane_has_role(pane_id);
         pane_display(PaneDisplayInput {
             mode: self.ui_mode,
             released: self.starter_released.contains(&pane_id),
@@ -6405,7 +6467,65 @@ impl TakoApp {
                 .backend_sessions
                 .get(&pane_id)
                 .is_some_and(|s| self.busy_backend_sessions.contains(s)),
+            // #720: 生成直後 / エージェント起動直後の猶予。ここに載っている間は
+            // 「不明 → ターミナル」ではなく準備中プレースホルダで覆う
+            settle: self
+                .pane_settle
+                .get(&pane_id)
+                .map(|settle| settle.state(has_role)),
         })
+    }
+
+    /// 過渡期（#720）の開始。`spawn_session`（新規ペイン）と
+    /// スターターのエージェント起動から呼ぶ。**terminal モードでも記録する**:
+    /// 生成直後に GUI モードへ切り替えたときも同じ扱いにしたいのと、
+    /// 判定は `pane_display_for` 側でモードを見て捨てられるため
+    fn begin_pane_settle(&mut self, pane_id: PaneId, kind: tako_core::ui_mode::SettleKind) {
+        self.pane_settle.insert(pane_id, PaneSettle::new(kind));
+    }
+
+    /// 確定済み・期限切れの過渡期エントリを落とす（2 秒 tick から呼ぶ）。
+    ///
+    /// これをやらないと、あとからユーザー / AI がそのペインで走らせたコマンドの出力まで
+    /// 猶予の残り時間だけ覆ってしまう。
+    ///
+    /// **「行き先に着いたか」で判定する**のが肝（実測で直した点。#720）。
+    /// エージェント待ちの行き先はチャットだけで、押した直後の「まだシェルがアイドル」
+    /// = スターター表示は通過点にすぎない。ここを確定扱いにすると、コマンドが走り出す
+    /// 前に猶予が外れて、結局その先で生ターミナルが出てしまう
+    fn prune_pane_settle(&mut self) {
+        if self.pane_settle.is_empty() {
+            return;
+        }
+        use tako_core::ui_mode::{PaneDisplay, SettleKind};
+        let done: Vec<PaneId> = self
+            .pane_settle
+            .iter()
+            .filter(|(pane, settle)| {
+                let state = settle.state(self.pane_has_role(**pane));
+                // 上限を過ぎた（もう覆っていない）
+                if !state.active() {
+                    return true;
+                }
+                // 明示的にターミナルへ戻された
+                if self.starter_released.contains(*pane) {
+                    return true;
+                }
+                // terminal モードでは判定が常に Terminal なので確定扱いにしない
+                // （GUI へ戻したときに猶予が残っていてほしい）
+                if !self.ui_mode.is_gui() {
+                    return false;
+                }
+                matches!(
+                    (state.kind, self.pane_display_for(**pane)),
+                    (_, PaneDisplay::Chat) | (SettleKind::Shell, PaneDisplay::Starter)
+                )
+            })
+            .map(|(pane, _)| *pane)
+            .collect();
+        for pane in done {
+            self.pane_settle.remove(&pane);
+        }
     }
 
     /// スターターのカード押下（Issue #694）。master / solo はシェルへコマンド行を
@@ -6452,6 +6572,12 @@ impl TakoApp {
                 match self.terminals.get(&pane_id) {
                     Some(session) => {
                         session.write(line.into_bytes());
+                        // #720: エージェント起動はチャット確定まで数秒〜十数秒かかる。
+                        // その間にシェルの実行中画面（起動ログ・claude の起動途中）を
+                        // 見せないよう、押した瞬間から過渡期を張り直す
+                        if action.expects_chat() {
+                            self.begin_pane_settle(pane_id, tako_core::ui_mode::SettleKind::Agent);
+                        }
                         true
                     }
                     None => {
@@ -12692,6 +12818,17 @@ impl TakoApp {
                     .render_chat_pane(pane_id, rect, area, focused, cx)
                     .into_any_element();
             }
+            // #720: 表示種別が確定するまでの過渡期。生ターミナルを見せない
+            tako_core::ui_mode::PaneDisplay::Preparing => {
+                let kind = self
+                    .pane_settle
+                    .get(&pane_id)
+                    .map(|s| s.state(self.pane_has_role(pane_id)).kind)
+                    .unwrap_or(tako_core::ui_mode::SettleKind::Shell);
+                return self
+                    .render_preparing_pane(pane_id, kind, rect, area, focused, cx)
+                    .into_any_element();
+            }
             tako_core::ui_mode::PaneDisplay::Terminal => {}
         }
 
@@ -14246,6 +14383,16 @@ impl UiStateHost for TakoApp {
         } else {
             self.starter_released.remove(&pane);
         }
+    }
+
+    // #720: 全ペインの表示種別。判定表そのものを通すので、GUI が描いているものと必ず一致する
+    fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
+        self.workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .map(|p| (p.id(), self.pane_display_for(p.id())))
+            .collect()
     }
 
     fn open_settings_window(&mut self, tab: Option<&str>) {
@@ -20750,6 +20897,171 @@ mod self_test {
                     app.ui_mode = UiMode::Terminal;
                     cx.notify();
                 });
+                let _ = capture_frame(any, cx);
+            }
+
+            // GUI モードの準備中プレースホルダ（#720）: **実ピクセルで**
+            // 「過渡期のあいだ生ターミナルの行が 1 本も見えない」ことを見る。
+            // 表示種別の遷移を見るだけでは「覆っているつもりで透けている」を捕まえられない
+            // ので、ターミナルを一面インクで埋めた状態から測る
+            {
+                use tako_core::ui_mode::{SettleKind, UiMode};
+                type_text(any, cx, "clear", true);
+                cx.background_executor()
+                    .timer(Duration::from_millis(600))
+                    .await;
+                type_text(
+                    any,
+                    cx,
+                    "for i in $(seq 1 80); do echo \"#### line $i ####\"; done; sleep 30",
+                    true,
+                );
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                let area = window
+                    .update(cx, |app, _, _| {
+                        let pane = app.focused_pane();
+                        app.pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == pane)
+                            .map(|(_, b)| *b)
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| fail("visual-test 準備中: ペイン領域"));
+                // 上端の帯 = ターミナルなら必ず行が乗る場所（覆えていれば空になる）
+                let top = Bounds::new(area.origin, size(area.size.width, area.size.height * 0.25));
+                // 中央の帯 = プレースホルダの文言が出る場所
+                let center = Bounds::new(
+                    point(area.left(), area.top() + area.size.height * 0.35),
+                    size(area.size.width, area.size.height * 0.3),
+                );
+                let (terminal_frame, scale) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test 準備中: ターミナルのフレーム"));
+                let bg_dark = window
+                    .update(cx, |app, _, _| app.theme.background)
+                    .unwrap_or_else(|_| fail("visual-test 準備中: 背景色"));
+                let terminal_top = readable_pixels_in_bounds(
+                    &terminal_frame,
+                    &[top],
+                    scale,
+                    bg_dark,
+                    2.0,
+                );
+
+                // GUI モード + 過渡期（= master を押した直後と同じ状態）。
+                // シェルはコマンド実行中なので、過渡期が無ければ判定表はターミナル表示に
+                // 落ちる = このフレームに 80 行のインクがそのまま出る
+                let _ = window.update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    app.ui_mode = UiMode::Gui;
+                    app.begin_pane_settle(pane, SettleKind::Agent);
+                    cx.notify();
+                });
+                let (gui_dark, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test 準備中: GUI フレーム(dark)"));
+                let covered_top =
+                    readable_pixels_in_bounds(&gui_dark, &[top], scale, bg_dark, 2.0);
+                let placeholder_dark =
+                    readable_pixels_in_bounds(&gui_dark, &[center], scale, bg_dark, 2.0);
+
+                // ライトテーマでも読める濃さで描かれる（#669 と同じ失敗の形を防ぐ）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("light".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (gui_light, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test 準備中: GUI フレーム(light)"));
+                let bg_light = window
+                    .update(cx, |app, _, _| app.theme.background)
+                    .unwrap_or(bg_dark);
+                let placeholder_light =
+                    readable_pixels_in_bounds(&gui_light, &[center], scale, bg_light, 2.0);
+
+                // 猶予を外すと同じペインのターミナルがそのまま戻る
+                // （覆っていただけで PTY には触れていないことの実ピクセル裏付け。§2.5）
+                let _ = window.update(cx, |app, _, cx| {
+                    let pane = app.focused_pane();
+                    app.pane_settle.remove(&pane);
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("dark".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (restored, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test 準備中: 復帰フレーム"));
+                let restored_top =
+                    readable_pixels_in_bounds(&restored, &[top], scale, bg_dark, 2.0);
+
+                if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let base = std::path::Path::new(&dir);
+                    let _ = terminal_frame.save(base.join("preparing-terminal.png"));
+                    let _ = gui_dark.save(base.join("preparing-gui-dark.png"));
+                    let _ = gui_light.save(base.join("preparing-gui-light.png"));
+                    let _ = restored.save(base.join("preparing-restored.png"));
+                }
+                println!(
+                    "TAKO_VISUAL_PIXEL: preparing terminal_top={terminal_top} \
+                     covered_top={covered_top} restored_top={restored_top} \
+                     placeholder_dark={placeholder_dark} placeholder_light={placeholder_light}"
+                );
+                check(
+                    terminal_top > 2000,
+                    "visual-test 準備中: 前提としてターミナルに行が出ている (#720)",
+                );
+                check(
+                    covered_top == 0,
+                    "visual-test 準備中: 過渡期は生ターミナルの行が 1 ピクセルも見えない (#720)",
+                );
+                check(
+                    placeholder_dark > 200 && placeholder_light > 200,
+                    "visual-test 準備中: dark / light の両方で文言が読める濃さで出る (#720)",
+                );
+                check(
+                    restored_top > 2000,
+                    "visual-test 準備中: 猶予が切れると同じ画面がそのまま戻る (#720)",
+                );
+
+                // 後片付け: sleep を止めて既定（dark / terminal）へ戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    app.ui_mode = UiMode::Terminal;
+                    app.pane_settle.clear();
+                    cx.notify();
+                });
+                press(any, cx, "ctrl-c");
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                type_text(any, cx, "clear", true);
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
                 let _ = capture_frame(any, cx);
             }
 
@@ -32520,6 +32832,467 @@ mod self_test {
                 window
                     .update(cx, |app, _, _| app.settings_window_handle = None)
                     .ok();
+            }
+
+            // 97. GUI モードの過渡期プレースホルダ + スターターの setup リンク（#720）。
+            // 見るのは「表示種別が確定するまでの間、生ターミナルへ落ちないこと」。
+            // 判定表の純関数は unit test 済みなので、ここは**配線**（いつ猶予が張られ、
+            // いつ外れるか）を実ペインで確かめる
+            {
+                use tako_core::ui_mode::{PaneDisplay, SettleKind, StarterAction, UiMode};
+                let _ = window.update(cx, |app, _, cx| {
+                    app.ui_mode = UiMode::Gui;
+                    app.starter_released.clear();
+                    cx.notify();
+                });
+
+                // (a) 素のシェルの新規ペイン: 生成した瞬間から確定まで一度も
+                //     ターミナル表示にならず、プロンプトが出たらスターターへ抜ける
+                let fresh = window
+                    .update(cx, |app, _, cx| {
+                        let anchor = app.focused_pane().as_u64();
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(anchor),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(fresh) = fresh else {
+                    fail("#720: 検証用ペインの作成")
+                };
+                // 生成直後から 20ms 刻みで表示を全部拾う（フレームの取りこぼしを減らす）
+                let mut seen: Vec<PaneDisplay> = Vec::new();
+                let mut reached_starter = false;
+                for _ in 0..250 {
+                    let display = window
+                        .update(cx, |app, _, _| app.pane_display_for(fresh))
+                        .unwrap_or(PaneDisplay::Terminal);
+                    if seen.last() != Some(&display) {
+                        seen.push(display);
+                    }
+                    if display == PaneDisplay::Starter {
+                        reached_starter = true;
+                        break;
+                    }
+                    wait(cx, 20).await;
+                }
+                let no_raw_terminal = !seen.contains(&PaneDisplay::Terminal);
+                println!("97-SETTLE: sequence={seen:?} reached_starter={reached_starter}");
+                check(
+                    reached_starter && no_raw_terminal && seen.first() == Some(&PaneDisplay::Preparing),
+                    "新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)",
+                );
+
+                // (b) 明示コマンド付きのペインは過渡期に入らない（出力をすぐ見せる）
+                let cmd_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(fresh.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Right),
+                                ratio: None,
+                                command: Some(vec!["cat".into()]),
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(cmd_pane) = cmd_pane else {
+                    fail("#720: コマンド付きペインの作成")
+                };
+                let cmd_immediate = window
+                    .update(cx, |app, _, _| {
+                        !app.pane_settle.contains_key(&cmd_pane)
+                            && app.pane_display_for(cmd_pane) == PaneDisplay::Terminal
+                    })
+                    .unwrap_or(false);
+                check(
+                    cmd_immediate,
+                    "コマンド付きペイン（Code Runner 等）は覆わず即ターミナル (#720)",
+                );
+
+                // (c) 上限で必ず抜ける（永遠ローディングにならない）+ tick で掃除される
+                let timed_out = window
+                    .update(cx, |app, _, _| {
+                        let expired = std::time::Instant::now()
+                            .checked_sub(tako_core::ui_mode::SETTLE_AGENT_LIMIT)
+                            .and_then(|t| t.checked_sub(Duration::from_secs(1)));
+                        let Some(expired) = expired else { return false };
+                        app.pane_settle.insert(
+                            cmd_pane,
+                            PaneSettle {
+                                kind: SettleKind::Agent,
+                                since: expired,
+                            },
+                        );
+                        let fell_back = app.pane_display_for(cmd_pane) == PaneDisplay::Terminal;
+                        app.prune_pane_settle();
+                        fell_back && !app.pane_settle.contains_key(&cmd_pane)
+                    })
+                    .unwrap_or(false);
+                check(
+                    timed_out,
+                    "過渡期は上限で通常表示へ落ち、掃除で記録も消える (#720)",
+                );
+
+                // (d) スターター下部の setup リンク → そのペインのシェルへ tako setup。
+                //     setup はターミナルの対話ウィザードなので**覆わない**
+                let setup_clicked = window
+                    .update(cx, |app, _, cx| {
+                        app.pane_settle.clear();
+                        let done = app.starter_action(fresh, StarterAction::Setup, cx);
+                        done && !app.pane_settle.contains_key(&fresh)
+                    })
+                    .unwrap_or(false);
+                let mut setup_delivered = false;
+                for _ in 0..40 {
+                    wait(cx, 100).await;
+                    setup_delivered = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&fresh)
+                                .map(|s| s.visible_lines().join(""))
+                                .unwrap_or_default()
+                                .contains("tako setup")
+                        })
+                        .unwrap_or(false);
+                    if setup_delivered {
+                        break;
+                    }
+                }
+                check(
+                    setup_clicked && setup_delivered,
+                    "スターターの setup リンクで tako setup が届く（覆わない）(#720)",
+                );
+
+                // (e) 「AI チームに任せる」押下 = エージェント待ちの過渡期が張られ、
+                //     起動が終わるまでの間ずっと準備中（= 生ターミナルを見せない）。
+                //
+                //     **tmux バックエンドの構成で見る**（= 既定。ユーザーの環境）。
+                //     直接 spawn のペインでは claude の TUI が外側の alt screen として
+                //     見えるため判定表がターミナル表示へ落とす（G2 のとおりチャットに
+                //     できない構成なので、それが正しい行き先）。実測でここを踏んだ
+                let tmux_backed = tako_core::backend::capabilities().survives_app_exit
+                    && window
+                        .update(cx, |app, _, _| {
+                            matches!(
+                                tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Persist {
+                                        enabled: Some(true),
+                                    },
+                                    PaneOrigin::Cli,
+                                ),
+                                Ok(v) if v["enabled"].as_bool() == Some(true)
+                            )
+                        })
+                        .unwrap_or(false);
+                let master_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(fresh.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(master_pane) = master_pane else {
+                    fail("#720: master 用ペインの作成")
+                };
+                // role 付きペイン（= worker spawn。`attach_session` はコマンド無しで
+                // 呼ばれ、あとから claude の起動コマンドが書き込まれる）は、素のシェルとして
+                // 始まってもエージェント待ちの長い猶予を使う。Issue の主訴がこの経路
+                fn set_role(app: &mut TakoApp, pane: PaneId, role: Option<String>) {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Title {
+                            pane: Some(pane.as_u64()),
+                            title: None,
+                            role,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                }
+                let worker_grace = window
+                    .update(cx, |app, _, _| {
+                        set_role(app, master_pane, Some("orchestrator-worker:test".into()));
+                        let has_role = app.pane_has_role(master_pane);
+                        let kind = app
+                            .pane_settle
+                            .get(&master_pane)
+                            .map(|s| s.state(has_role).kind);
+                        let display = app.pane_display_for(master_pane);
+                        set_role(app, master_pane, None);
+                        has_role && kind == Some(SettleKind::Agent)
+                            && display == PaneDisplay::Preparing
+                    })
+                    .unwrap_or(false);
+                check(
+                    worker_grace,
+                    "role 付き（worker spawn）ペインはエージェント待ちの猶予になる (#720)",
+                );
+
+                // シェルのプロンプトを待ってから押す（スターターが出ている状態が起点）
+                for _ in 0..40 {
+                    wait(cx, 100).await;
+                    let ready = window
+                        .update(cx, |app, _, _| {
+                            app.pane_display_for(master_pane) == PaneDisplay::Starter
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                let armed = window
+                    .update(cx, |app, _, cx| {
+                        let done = app.starter_action(master_pane, StarterAction::Master, cx);
+                        let kind = app.pane_settle.get(&master_pane).map(|s| s.kind);
+                        done && kind == Some(SettleKind::Agent)
+                    })
+                    .unwrap_or(false);
+                // 押下からしばらく（2 秒 tick を数回跨ぐ長さ）追い、生ターミナルへ
+                // 落ちるフレームが 1 枚も無いことを見る。押した直後はシェルがまだ
+                // アイドルなのでスターターのまま = 通過点として許す
+                let mut master_seen: Vec<PaneDisplay> = Vec::new();
+                let mut covered = false;
+                let mut why_terminal = String::new();
+                for _ in 0..140 {
+                    let display = window
+                        .update(cx, |app, _, _| app.pane_display_for(master_pane))
+                        .unwrap_or(PaneDisplay::Terminal);
+                    if master_seen.last() != Some(&display) {
+                        master_seen.push(display);
+                    }
+                    covered |= display == PaneDisplay::Preparing;
+                    if display == PaneDisplay::Terminal && why_terminal.is_empty() {
+                        why_terminal = window
+                            .update(cx, |app, _, _| {
+                                format!(
+                                    "released={} alt={} chat={} state={:?} role={} \
+                                     backend={:?} settle={:?}",
+                                    app.starter_released.contains(&master_pane),
+                                    app.pane_inner_alt_screen(master_pane),
+                                    app.chat_panes.contains_key(&master_pane),
+                                    app.terminals
+                                        .get(&master_pane)
+                                        .map(|s| s.command_state()),
+                                    app.pane_has_role(master_pane),
+                                    app.backend_sessions.get(&master_pane).cloned(),
+                                    app.pane_settle.get(&master_pane).map(|s| s
+                                        .state(app.pane_has_role(master_pane))),
+                                )
+                            })
+                            .unwrap_or_default();
+                    }
+                    if display == PaneDisplay::Chat {
+                        break;
+                    }
+                    wait(cx, 50).await;
+                }
+                if !why_terminal.is_empty() {
+                    eprintln!("TAKO_SELF_TEST_720_MASTER: {why_terminal}");
+                }
+                println!(
+                    "97-MASTER: tmux_backed={tmux_backed} armed={armed} covered={covered} \
+                     sequence={master_seen:?}"
+                );
+                check(
+                    armed
+                        && covered
+                        && (!tmux_backed || !master_seen.contains(&PaneDisplay::Terminal)),
+                    "master 起動の過渡期は生ターミナルを見せない (#720)",
+                );
+
+                // 97c.（任意・TAKO_SELF_TEST_CLAUDE=1 のときだけ）**実 claude** で
+                //      「スターター押下 → チャット確定」までの全フレームを追い、
+                //      生ターミナルへ落ちるフレームが 1 枚も無いことを見る
+                //      （#720 受け入れ条件 1 そのもの）。ここで測った所要時間が
+                //      `SETTLE_AGENT_LIMIT` の根拠になる。95c と同じく claude CLI +
+                //      認証 + tmux が要るので既定ではスキップする
+                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed {
+                    let e2e_pane = window
+                        .update(cx, |app, _, cx| {
+                            let pane = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Split {
+                                    pane: Some(master_pane.as_u64()),
+                                    tab: None,
+                                    direction: Some(tako_control::protocol::Direction::Right),
+                                    ratio: None,
+                                    command: None,
+                                    cwd: None,
+                                    focus: Some(true),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["pane"].as_u64())
+                            .map(PaneId::from_raw);
+                            for (p, options) in std::mem::take(&mut app.pending_attach) {
+                                if app.spawn_session(p, options, cx).is_err() {
+                                    app.remove_pane(p, cx);
+                                }
+                            }
+                            pane
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(e2e_pane) = e2e_pane {
+                        for _ in 0..60 {
+                            wait(cx, 100).await;
+                            let ready = window
+                                .update(cx, |app, _, _| {
+                                    app.pane_display_for(e2e_pane) == PaneDisplay::Starter
+                                })
+                                .unwrap_or(false);
+                            if ready {
+                                break;
+                            }
+                        }
+                        // スターターの主ボタンをそのまま押す（ユーザーの操作と同じ経路）
+                        let _ = window.update(cx, |app, _, cx| {
+                            app.starter_action(e2e_pane, StarterAction::Solo, cx)
+                        });
+                        let started = std::time::Instant::now();
+                        let mut seq: Vec<PaneDisplay> = Vec::new();
+                        let mut became_chat = false;
+                        for _ in 0..600 {
+                            let display = window
+                                .update(cx, |app, _, _| {
+                                    // 起動時の信頼ダイアログは承諾しておく（#32 の経路）
+                                    let lines = app
+                                        .terminals
+                                        .get(&e2e_pane)
+                                        .map(|s| s.visible_lines())
+                                        .unwrap_or_default();
+                                    if lines.iter().any(|l| {
+                                        l.contains("trust this folder") || l.contains("Yes, I trust")
+                                    }) {
+                                        if let Some(session) = app.terminals.get(&e2e_pane) {
+                                            session.write(b"\r".to_vec());
+                                        }
+                                    }
+                                    app.pane_display_for(e2e_pane)
+                                })
+                                .unwrap_or(PaneDisplay::Terminal);
+                            if seq.last() != Some(&display) {
+                                seq.push(display);
+                            }
+                            if display == PaneDisplay::Chat {
+                                became_chat = true;
+                                break;
+                            }
+                            wait(cx, 50).await;
+                        }
+                        let elapsed_ms = started.elapsed().as_millis();
+                        println!(
+                            "97c-CLAUDE: became_chat={became_chat} elapsed_ms={elapsed_ms} \
+                             limit_ms={} sequence={seq:?}",
+                            tako_core::ui_mode::SETTLE_AGENT_LIMIT.as_millis()
+                        );
+                        check(
+                            became_chat && !seq.contains(&PaneDisplay::Terminal),
+                            "97c: 実 claude 起動でもチャット確定まで生ターミナルが出ない (#720)",
+                        );
+                        // 猶予の上限は実測より十分に長い（= 途中で諦めない）
+                        check(
+                            !became_chat
+                                || elapsed_ms
+                                    < tako_core::ui_mode::SETTLE_AGENT_LIMIT.as_millis(),
+                            "97c: チャット確定が猶予の上限内に収まる (#720)",
+                        );
+                        for _ in 0..3 {
+                            let _ = window.update(cx, |app, _, _| {
+                                if let Some(session) = app.terminals.get(&e2e_pane) {
+                                    session.write(b"\x03".to_vec());
+                                }
+                            });
+                            wait(cx, 600).await;
+                        }
+                        let _ = window.update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(e2e_pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                        });
+                    }
+                }
+
+                // 後片付け: 検証用ペインを閉じて terminal モードへ戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    for pane in [master_pane, cmd_pane, fresh] {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane.as_u64()),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    app.ui_mode = UiMode::Terminal;
+                    app.pane_settle.clear();
+                    app.starter_released.clear();
+                    cx.notify();
+                });
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

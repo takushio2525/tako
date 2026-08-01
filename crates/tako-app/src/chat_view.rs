@@ -2177,6 +2177,8 @@ impl TakoApp {
         self.chat_expanded.retain(|(pane, _, _)| *pane != pane_id);
         self.chat_content_keys.remove(&pane_id);
         self.starter_released.remove(&pane_id);
+        // #720: 過渡期の記録もペインと一緒に落とす（ペイン ID は再利用される。#390）
+        self.pane_settle.remove(&pane_id);
         // #716: 入力の下書き・echo・確認待ちもペインと一緒に落とす
         // （ペイン ID は再利用されるので残すと他人の下書きが現れる。#390）
         self.chat_inputs.remove(&pane_id);
