@@ -84,6 +84,7 @@ tako/
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]`（scrollback + transcript 2 層。`--worker <ID>` でペイン消失後も取得可。MCP `tako_orchestrator_report` と 1:1。#364/#390） |
 | オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]`（spawn 済み worker をペインの生死と無関係に列挙。prompt 未達・突然死の resume コマンドも表示。MCP `tako_orchestrator_workers` と 1:1。#390） |
 | オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
+| オーケストレーター プロファイル管理（#721） | `tako orchestrator profiles list/show/set/create/copy/delete`（`--solo` で `tako solo` の solo-profiles/ を対象。既定は master。`set --projects a,b` で担当プロジェクト割り当て。`default` は削除不可。list / show / set は未登録 project・未登録アカウント・`[1m]` モデルを `warnings` で返す。**GUI は設定画面の「プロファイル」タブ**（Cmd+, → プロファイル）が同じ dispatch を通る。MCP `tako_orchestrator_profiles` と 1:1） |
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove`（既定の資格情報を使うアカウントは `add <名前> --inherit`。既定パスの明示指定は警告。MCP `tako_orchestrator_accounts` と 1:1） |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved\|legacy] [--master-ratio 0.5] [--algorithm grid\|spiral]`（全省略で現在値表示。#165） |
 | build | `cargo build --workspace` |
@@ -114,7 +115,7 @@ tako/
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]`（ファイル内 `tako:run:` 宣言 or 拡張子既定で新ペイン分割実行。`--list` でプロファイル一覧、`--wait` で完了待ち。MCP `tako_run` / `tako_run_resolve` / `tako_run_defaults` と 1:1） |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]`（引数なし = 一覧。`--remove` で削除。MCP `tako_run_defaults` と 1:1） |
 | AI コマンド提案カード（#666/#703） | `tako show-command <コマンド>...`（**ターミナル領域を縮めて作った専用帯**にコピー / 新規ペイン実行つきのカードを出す = 会話・入力欄・フッターと重ならない。`--label` で説明、`--pane` で対象、`--list` / `--copy` / `--run` / `--dismiss` でカード操作、`--card` / `--index` で対象指定）。**AI が会話本文に書いたコマンドは TUI の物理改行でコピーが壊れる**ため、実行を頼むコマンドはこれで提示する。カードは揮発（永続化しない）。MCP `tako_show_command` と 1:1 |
-| 設定画面（#459） | `tako settings [--tab <名>]`（Cmd+, / パレット / MCP `tako_settings`。独立ウィンドウで一般・外観・Code Runner・セットアップ・スリープ防止・リモート・高度の 7 タブ） |
+| 設定画面（#459/#721） | `tako settings [--tab <名>]`（Cmd+, / パレット / MCP `tako_settings`。独立ウィンドウで一般・外観・Code Runner・**プロファイル**・セットアップ・スリープ防止・リモート・高度の 8 タブ。`--tab profiles` で master / solo の起動プロファイルをフォーム編集 = `tako orchestrator profiles` と同じ dispatch） |
 | 初回起動バナー（#549） | `tako welcome [show\|dismiss]`（引数なしで表示状態 + 案内コマンド。初回起動時だけ `tako setup` → `tako master` の導線をタブバー直下に出す。⌘K パレットにも同じ 3 項目が常設。MCP `tako_welcome` と 1:1） |
 | アプリ内更新（#36/#403/#616/#690） | `tako update [status\|check\|apply\|apply-zip\|repair]` に加え、`tako update open` = 専用画面（設定画面と同じ独立ウィンドウ。現在 / 最新バージョン・チャンネル・配布系統・配布物・リリースノート・「今すぐ更新」+ 更新フロー全状態）、`tako update card [dismiss\|show]` = 上部通知カード（引数なしで状態。× で閉じるとそのバージョンは以後通知しない）。**下部ステータスバーには一切出さない**（#616）。リリースノートは **Markdown レンダリング**（見出し / 表 / リスト / コード / 引用。リンクは ⌘+クリックで既定ブラウザ = http / https のみ）で、描画はプレビューペインと同じ `md_view`（#690）。⌘K パレット「アップデートを開く」/ MCP `tako_update` と 1:1 |
 | target 掃除 | `scripts/clean-target.sh`（dry-run。`--run` で実行。cargo clean + worktree prune） |

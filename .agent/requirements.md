@@ -1022,6 +1022,25 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 引かれる構造を最初から守り、後の AI テーマ操作（Phase 3 以降）で手戻りしないようにする。
 設定ファイルの形式・読み込み・テーマ操作の MCP / CLI 公開は Phase 3 以降で設計する。
 
+### FR-4.7 プロファイルの GUI 編集（Issue #721。✅ 2026-08-01）
+
+> `tako master` / `tako solo` の起動設定（`profiles/*.yaml` / `solo-profiles/*.yaml`）は
+> これまでセットアップエージェントか手編集でしか触れなかった。スキーマは #127 / #500 / #504 で
+> 出揃っているので、設定画面（FR-4 / #459）の 1 タブとしてフォームで編集できるようにする。
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-4.7.1 | 設定画面に「プロファイル」タブを置き、**種別（master / solo）で一覧を切り替え**て選択・編集する。保存形式（yaml のキー構成）は変えない（#513 の設定共有と互換維持） | M |
+| FR-4.7.2 | 編集可能項目は `tako orchestrator profiles set` の全項目 + `projects`: master_agent / model / effort / worker_model_policy / worker_model / worker_effort / worker_agent / エージェント別設定（model・effort・skip_permissions・args）/ master_account・worker_account / projects / tab_naming_convention / env | M |
+| FR-4.7.3 | **書き込みは既存 dispatch（`OrchestratorProfiles`）経由**とし、UI から yaml を直接書かない（#169 の config_io のロック・アトミック書き込み・世代バックアップと、CLI / MCP 側の検証がそのまま効く） | M |
+| FR-4.7.4 | 新規作成・複製・削除を GUI から行える。**削除は確認つき**で、`default` は起動時のフォールバック先なので削除できない | M |
+| FR-4.7.5 | 選択肢が既知の項目（エージェント種別・effort・worker ポリシー・アカウント・プロジェクト）は**選択式**にして自由入力を排除する。モデル名は上流 CLI のリリースごとに変わるため既知の選択肢を持てず、自由入力 + 空欄 = 「その CLI の既定」とする（#27 の推奨を既定に置く） | M |
+| FR-4.7.6 | **参照整合性の警告**（未登録 project キー / 未登録アカウント名 / `[1m]` モデル）を保存前に表示する。アカウント・プロジェクトは登録済みの値しか選べないので GUI から未登録参照を作れず、手編集・CLI 由来の既存の不整合は警告として見せて直せるようにする。判定は `orchestrator::profile_warnings` の 1 実装で、list / show / set の応答に `warnings` として載る（CLI / MCP も同じ文言を得る） | M |
+| FR-4.7.7 | 変更は**次回の起動から有効**（実行中の master / worker には影響しない）ことを UI に明記する。プロファイルは起動時に 1 度だけ読まれるので、使用中プロファイルの編集・削除でも稼働中セッションは落ちない | M |
+| FR-4.7.8 | パースできない yaml のプロファイルは一覧に**エラー付きで表示**し（隠さない）、フォームの編集は止める（既定値に丸めた上書きで設定を失わせない。#169 と同じ方針） | M |
+| FR-4.7.9 | GUI で増えた操作は CLI / MCP へ 1:1 公開する（開発不変条件）: `tako orchestrator profiles create/copy/delete` と `--solo` / `--projects`、MCP `tako_orchestrator_profiles` の `action: create/copy/delete` + `kind` / `from` / `projects` / `clear_projects` | M |
+| FR-4.7.10 | プロファイル名は英数字と `-` `_` `.` のみ許す。先頭の `.`（隠しファイル・`..` の親参照）と先頭の `-`（`tako master --x` としてオプション扱いされる）は拒否する | M |
+
 ## FR-5 セッション永続性（tmux バックエンド。Phase 5.5 で再設計・実装済み）
 
 > **長寿命のエージェントセッションをアプリの生死から切り離す**。全ペインの PTY を

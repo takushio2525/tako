@@ -2421,6 +2421,10 @@ fn dispatch_inner(
         Request::OrchestratorProfiles {
             action,
             name,
+            kind,
+            from,
+            projects,
+            clear_projects,
             master_agent,
             clear_master_agent,
             model,
@@ -2449,6 +2453,10 @@ fn dispatch_inner(
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
+            kind,
+            from,
+            projects,
+            clear_projects,
             master_agent,
             clear_master_agent,
             model,
@@ -4798,6 +4806,14 @@ fn dispatch_orchestrator_projects(
 pub struct ProfilesParams {
     pub action: String,
     pub name: Option<String>,
+    /// プロファイル種別（"master" = tako master / "solo" = tako solo。省略時 master。#721）
+    pub kind: Option<String>,
+    /// copy の複製元プロファイル名（#721）
+    pub from: Option<String>,
+    /// このプロファイルに割り当てるプロジェクトキー（丸ごと置き換え。#721）
+    pub projects: Option<Vec<String>>,
+    /// projects の指定を解除する（#721）
+    pub clear_projects: bool,
     /// master のエージェント種別（claude / codex。agy は master 非対応。#127）
     pub master_agent: Option<String>,
     pub clear_master_agent: bool,
@@ -4835,11 +4851,17 @@ pub struct ProfilesParams {
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
-/// model が null のときは claude CLI の既定モデルで起動することを表す
-fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value {
+/// model が null のときは claude CLI の既定モデルで起動することを表す。
+/// `kind` は保存先ディレクトリ（master = profiles/ / solo = solo-profiles/。#721）
+fn profile_to_json(
+    kind: crate::orchestrator::ProfileKind,
+    name: &str,
+    profile: &crate::orchestrator::Profile,
+) -> Value {
     use crate::orchestrator;
     let mut v = json!({
         "name": name,
+        "kind": kind.as_str(),
         "model": profile.model,
         "effort": profile.effort,
         "worker_model_policy": profile.worker_model_policy,
@@ -4847,9 +4869,15 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
         "worker_effort": profile.worker_effort,
         "resolved_worker_model": profile.resolve_worker_model(),
         "resolved_worker_effort": profile.resolve_worker_effort(),
-        "path": orchestrator::profiles_dir()
+        "path": kind.dir()
             .map(|d| d.join(format!("{name}.yaml")).display().to_string()),
     });
+    // 参照整合性の警告（未登録 project / アカウント / [1m] モデル）は list / show /
+    // set のすべてに載せる。GUI は保存前の確認に、CLI / MCP は起動前の気づきに使う（#721）
+    let warnings = orchestrator::profile_warnings(profile);
+    if !warnings.is_empty() {
+        v["warnings"] = json!(warnings);
+    }
     // worker エージェント設定（#120）は使用時のみ出力（既存出力形の互換維持）
     if profile.worker_agent.is_some() || !profile.worker_agents.is_empty() {
         v["worker_agent"] = json!(profile.worker_agent.as_deref().unwrap_or("claude"));
@@ -4892,29 +4920,77 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     v
 }
 
-/// プロファイル管理（list / show / set）。ファイル直読みなので tako-core の状態に依存しない
+/// プロファイル管理（list / show / set / create / copy / delete）。
+/// ファイル直読みなので tako-core の状態に依存しない。kind で master / solo を切り替える（#721）
 pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, DispatchError> {
     use crate::orchestrator;
+    // 種別（master / solo）。省略時は従来どおり master（完全後方互換。#721）
+    let kind = match params.kind.as_deref() {
+        Some(k) => orchestrator::ProfileKind::parse(k).map_err(DispatchError::InvalidParams)?,
+        None => orchestrator::ProfileKind::Master,
+    };
     match params.action.as_str() {
         "list" => {
-            let names = orchestrator::list_profiles().map_err(DispatchError::Operation)?;
+            let names = orchestrator::list_profiles_of(kind).map_err(DispatchError::Operation)?;
             let profiles: Vec<Value> = names
                 .iter()
-                .map(|n| {
-                    let p = orchestrator::Profile::load(n).unwrap_or_default();
-                    profile_to_json(n, &p)
+                .map(|n| match orchestrator::load_profile_of(kind, n) {
+                    Ok(p) => profile_to_json(kind, n, &p),
+                    // 壊れた yaml も一覧から隠さない（直し方は error 文言に入っている）。
+                    // default に丸めて表示すると「壊れていない」と誤認させる
+                    Err(e) => json!({ "name": n, "kind": kind.as_str(), "error": e }),
                 })
                 .collect();
-            Ok(json!({ "profiles": profiles }))
+            Ok(json!({ "kind": kind.as_str(), "profiles": profiles }))
         }
         "show" => {
             let name = params.name.as_deref().unwrap_or("default");
-            let profile = match orchestrator::Profile::load(name) {
+            let profile = match orchestrator::load_profile_of(kind, name) {
                 Ok(p) => p,
-                Err(_) if name == "default" => orchestrator::Profile::default(),
+                Err(_) if name == "default" => kind.default_profile(),
                 Err(e) => return Err(DispatchError::Operation(e)),
             };
-            Ok(profile_to_json(name, &profile))
+            Ok(profile_to_json(kind, name, &profile))
+        }
+        "create" => {
+            let name = params
+                .name
+                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let (path, profile) = orchestrator::create_profile_of(kind, &name, None)
+                .map_err(DispatchError::Operation)?;
+            let mut result = profile_to_json(kind, &name, &profile);
+            result["path"] = json!(path.display().to_string());
+            result["created"] = json!(true);
+            Ok(result)
+        }
+        "copy" => {
+            let name = params.name.ok_or(DispatchError::InvalidParams(
+                "name（複製先）を指定する".into(),
+            ))?;
+            let from = params.from.ok_or(DispatchError::InvalidParams(
+                "from（複製元）を指定する".into(),
+            ))?;
+            let base =
+                orchestrator::load_profile_of(kind, &from).map_err(DispatchError::Operation)?;
+            let (path, profile) = orchestrator::create_profile_of(kind, &name, Some(base))
+                .map_err(DispatchError::Operation)?;
+            let mut result = profile_to_json(kind, &name, &profile);
+            result["path"] = json!(path.display().to_string());
+            result["copied_from"] = json!(from);
+            Ok(result)
+        }
+        "delete" => {
+            let name = params
+                .name
+                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let path =
+                orchestrator::delete_profile_of(kind, &name).map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "kind": kind.as_str(),
+                "name": name,
+                "deleted": true,
+                "path": path.display().to_string(),
+            }))
         }
         "set" => {
             let name = params
@@ -4996,15 +5072,22 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     }
                 }
             }
+            if params.projects.is_some() && params.clear_projects {
+                return Err(DispatchError::InvalidParams(
+                    "projects と clear_projects は同時に指定できない".into(),
+                ));
+            }
             let env_set_clone = params.env_set.clone();
             let env_unset_clone = params.env_unset.clone();
             let master_account_clone = params.master_account.clone();
             let worker_account_clone = params.worker_account.clone();
             let clear_master_account = params.clear_master_account;
             let clear_worker_account = params.clear_worker_account;
+            let projects_clone = params.projects.clone();
+            let clear_projects = params.clear_projects;
             // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
             // default に丸めて上書き保存すると設定が消えるため、Err で中断する
-            let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
+            let (path, profile) = orchestrator::mutate_profile_of(kind, &name, |profile| {
                 if let Some(a) = params.master_agent {
                     profile.master_agent = Some(a);
                 } else if params.clear_master_agent {
@@ -5093,6 +5176,12 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 } else if clear_worker_account {
                     profile.worker_account = None;
                 }
+                // プロジェクト割り当て（丸ごと置き換え。空配列はクリアと同義。#721）
+                if let Some(keys) = projects_clone {
+                    profile.projects = if keys.is_empty() { None } else { Some(keys) };
+                } else if clear_projects {
+                    profile.projects = None;
+                }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
                     .worker_agents
@@ -5100,32 +5189,14 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 profile.clone()
             })
             .map_err(DispatchError::Operation)?;
-            let mut result = profile_to_json(&name, &profile);
+            // 参照整合性の警告（[1m] モデル・未登録 project / アカウント）は
+            // profile_to_json が profile_warnings から載せる（GUI / CLI / MCP 共通。#721）
+            let mut result = profile_to_json(kind, &name, &profile);
             result["path"] = json!(path.display().to_string());
-            // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
-            // （inherit で master と同一モデルの場合は master 分のみ警告。
-            //  claude 以外の master の model は claude 表記でないため対象外。#127）
-            let warnings: Vec<String> = [
-                profile
-                    .model
-                    .as_deref()
-                    .filter(|_| profile.master_agent_is_claude())
-                    .and_then(|m| orchestrator::one_m_model_warning(m, "master")),
-                profile
-                    .resolve_worker_model()
-                    .filter(|m| Some(*m) != profile.model.as_deref())
-                    .and_then(|m| orchestrator::one_m_model_warning(m, "worker")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            if !warnings.is_empty() {
-                result["warnings"] = json!(warnings);
-            }
             Ok(result)
         }
         other => Err(DispatchError::InvalidParams(format!(
-            "action が不正: {other}（list / show / set）"
+            "action が不正: {other}（list / show / set / create / copy / delete）"
         ))),
     }
 }

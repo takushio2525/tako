@@ -1632,3 +1632,14 @@
   新設）+ visual-test 全節完走（新節 update-notes = **実リリース v0.6.2 のノート本文**を
   実ピクセル検査）。生テキストへ戻すと単体 / セルフテスト / visual-test の 3 つとも
   FAILED になることを実測（検出力の実証）
+
+## 2026-08-01（#721: プロファイル（master / solo）の GUI 編集）
+- 設定画面に「プロファイル」タブを新設（8 タブ目）。種別切替・一覧・全項目フォーム編集・
+  新規/複製/削除（確認つき・default は不可）。書き込みは既存 `OrchestratorProfiles` dispatch 経由で
+  UI 直書きなし（#169 の config_io と CLI/MCP 検証がそのまま効く）。FR-4.7 として要件化
+- dispatch を kind（master/solo）+ create/copy/delete + projects へ拡張し CLI（`profiles
+  create/copy/delete`・`--solo`・`--projects`）と MCP へ 1:1 公開（ツール数は 132 で不変）。
+  参照整合性の警告は `orchestrator::profile_warnings` の 1 実装で list/show/set 共通
+- 検証: 品質ゲート全緑（1752 tests）+ 隔離セルフテスト完走（項目 96 新設。refresh を外すと
+  FAILED になることを実測）+ 隔離 GUI で `tako master -<新規>` の実起動・使用中プロファイルの
+  編集/削除・壊れた yaml・全項目 roundtrip を実測。GUI スクショは蓋閉じで未取得

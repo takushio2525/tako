@@ -22,11 +22,18 @@ use crate::file_icons::ui_icon;
 use crate::ui_text::settings as txt;
 use crate::TakoApp;
 
+/// プロファイルタブ（Issue #721）。SettingsWindow の非公開フィールドへ触るため
+/// 子モジュールにしてある（兄弟モジュールからは private フィールドが見えない）
+pub mod profiles;
+
+use profiles::{ProfileField, ProfilesTabState};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
     Appearance,
     Runner,
+    Profiles,
     Setup,
     Sleep,
     Remote,
@@ -38,6 +45,7 @@ impl SettingsTab {
         SettingsTab::General,
         SettingsTab::Appearance,
         SettingsTab::Runner,
+        SettingsTab::Profiles,
         SettingsTab::Setup,
         SettingsTab::Sleep,
         SettingsTab::Remote,
@@ -49,6 +57,7 @@ impl SettingsTab {
             SettingsTab::General => txt::tab_general(),
             SettingsTab::Appearance => txt::tab_appearance(),
             SettingsTab::Runner => txt::tab_runner(),
+            SettingsTab::Profiles => txt::tab_profiles(),
             SettingsTab::Setup => txt::tab_setup(),
             SettingsTab::Sleep => txt::tab_sleep(),
             SettingsTab::Remote => txt::tab_remote(),
@@ -61,6 +70,7 @@ impl SettingsTab {
             "general" => Some(SettingsTab::General),
             "appearance" => Some(SettingsTab::Appearance),
             "runner" => Some(SettingsTab::Runner),
+            "profiles" => Some(SettingsTab::Profiles),
             "setup" => Some(SettingsTab::Setup),
             "sleep" => Some(SettingsTab::Sleep),
             "remote" => Some(SettingsTab::Remote),
@@ -88,6 +98,8 @@ enum EditField {
     PaneLogTotalMaxMb,
     /// settings.json 直接編集（複数行）
     AdvancedJson,
+    /// プロファイルタブの入力欄（Issue #721）
+    Profile(ProfileField),
 }
 
 impl EditField {
@@ -98,6 +110,7 @@ impl EditField {
     /// 要素 ID 用の安定した文字列
     fn slug(&self) -> String {
         match self {
+            EditField::Profile(f) => f.slug(),
             EditField::ColorHex(k) => format!("color-{k}"),
             EditField::FontFamily => "font-family".into(),
             EditField::FontSize => "font-size".into(),
@@ -155,6 +168,8 @@ pub struct SettingsWindow {
     /// Code Runner 新規追加行の確定前バッファ
     runner_new_ext: String,
     runner_new_cmd: String,
+    /// プロファイルタブの状態（Issue #721）
+    profiles: ProfilesTabState,
 }
 
 impl SettingsWindow {
@@ -195,6 +210,7 @@ impl SettingsWindow {
             status: StatusCache::default(),
             runner_new_ext: String::new(),
             runner_new_cmd: String::new(),
+            profiles: ProfilesTabState::default(),
         };
         this.refresh_tab_status(cx);
         this
@@ -285,6 +301,8 @@ impl SettingsWindow {
             SettingsTab::Remote => {
                 self.status.remote = self.query(Request::RemoteStatus, cx);
             }
+            // タブ表示のたびに読み直すので CLI / MCP / 手編集の変更に追随する（#721）
+            SettingsTab::Profiles => self.refresh_profiles(cx),
             _ => {}
         }
     }
@@ -409,6 +427,8 @@ impl SettingsWindow {
                 Err(_) => self.message = Some((txt::error_number().to_string(), true)),
             },
             EditField::AdvancedJson => self.save_advanced_json(edit.text, cx),
+            // プロファイルタブの確定はすべて OrchestratorProfiles dispatch 経由（#721）
+            EditField::Profile(field) => self.commit_profile_field(field, value, cx),
         }
         cx.notify();
     }
@@ -839,6 +859,7 @@ impl SettingsWindow {
             SettingsTab::General => self.render_general_tab(cx),
             SettingsTab::Appearance => self.render_appearance_tab(cx),
             SettingsTab::Runner => self.render_runner_tab(cx),
+            SettingsTab::Profiles => self.render_profiles_tab(cx),
             SettingsTab::Setup => self.render_setup_tab(cx),
             SettingsTab::Sleep => self.render_sleep_tab(cx),
             SettingsTab::Remote => self.render_remote_tab(cx),

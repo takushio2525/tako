@@ -33,6 +33,10 @@ pub fn tab_advanced() -> &'static str {
     tr!("高度", "Advanced")
 }
 
+pub fn tab_profiles() -> &'static str {
+    tr!("プロファイル", "Profiles")
+}
+
 // --- 共通ボタン・メッセージ ---
 
 pub fn button_reset() -> &'static str {
@@ -761,6 +765,302 @@ pub fn advanced_saved() -> &'static str {
     tr!("保存しました", "Saved")
 }
 
+// --- プロファイルタブ（Issue #721）---
+
+pub fn prof_kind_master() -> &'static str {
+    tr!("master（tako master）", "master (tako master)")
+}
+
+pub fn prof_kind_solo() -> &'static str {
+    tr!("solo（tako solo）", "solo (tako solo)")
+}
+
+pub fn prof_kind_header() -> &'static str {
+    tr!("プロファイルの種類", "Profile type")
+}
+
+pub fn desc_prof_kind() -> &'static str {
+    tr!(
+        "master はチームを率いるオーケストレーター、solo は 1 対 1 で話す単独エージェント",
+        "master orchestrates a team; solo is a single agent you talk to one-on-one"
+    )
+}
+
+pub fn prof_list_header() -> &'static str {
+    tr!("プロファイル", "Profiles")
+}
+
+pub fn prof_empty() -> &'static str {
+    tr!(
+        "プロファイルがありません。名前を入れて「新規作成」してください",
+        "No profiles yet. Enter a name and select Create"
+    )
+}
+
+pub fn prof_new_placeholder() -> &'static str {
+    tr!("新しいプロファイル名", "New profile name")
+}
+
+pub fn prof_create() -> &'static str {
+    tr!("新規作成", "Create")
+}
+
+pub fn prof_duplicate() -> &'static str {
+    tr!("複製", "Duplicate")
+}
+
+pub fn prof_delete_confirm() -> &'static str {
+    tr!(
+        "このプロファイルを削除しますか？（元に戻せません）",
+        "Delete this profile? This cannot be undone."
+    )
+}
+
+pub fn prof_restart_note() -> &'static str {
+    tr!(
+        "変更は次回の起動から有効です（実行中の master / worker には影響しません）",
+        "Changes take effect on the next launch; running master / worker sessions are unaffected."
+    )
+}
+
+pub fn prof_launch_label() -> &'static str {
+    tr!("起動コマンド", "Launch command")
+}
+
+pub fn prof_path_label() -> &'static str {
+    tr!("保存先", "Saved to")
+}
+
+pub fn prof_warnings_header() -> &'static str {
+    tr!("確認が必要な設定", "Settings that need attention")
+}
+
+pub fn prof_broken() -> &'static str {
+    tr!(
+        "この yaml は読み込めません。壊れた設定を上書きしないよう編集を止めています（高度タブか CLI で修正してください）",
+        "This YAML cannot be parsed. Editing is disabled so the broken file is not overwritten; fix it via the Advanced tab or the CLI."
+    )
+}
+
+pub fn prof_section_master() -> &'static str {
+    tr!(
+        "master（あなたが話す相手）",
+        "Master (the agent you talk to)"
+    )
+}
+
+pub fn prof_section_worker() -> &'static str {
+    tr!(
+        "worker（master が立てる子エージェント）",
+        "Worker (children spawned by master)"
+    )
+}
+
+pub fn prof_section_agent() -> &'static str {
+    tr!("エージェント別の worker 設定", "Per-agent worker settings")
+}
+
+pub fn prof_section_projects() -> &'static str {
+    tr!("担当プロジェクト", "Assigned projects")
+}
+
+pub fn prof_section_env() -> &'static str {
+    tr!("環境変数", "Environment variables")
+}
+
+pub fn prof_section_other() -> &'static str {
+    tr!("その他", "Other")
+}
+
+pub fn prof_label_agent() -> &'static str {
+    tr!("エージェント", "Agent")
+}
+
+pub fn desc_prof_master_agent() -> &'static str {
+    tr!(
+        "master を起動する CLI（agy は master 非対応）",
+        "CLI that runs master (agy cannot act as master)"
+    )
+}
+
+pub fn desc_prof_worker_agent() -> &'static str {
+    tr!(
+        "spawn 時に種別を指定しなかった worker が使う CLI",
+        "CLI used by workers spawned without an explicit agent"
+    )
+}
+
+pub fn prof_label_model() -> &'static str {
+    tr!("モデル", "Model")
+}
+
+pub fn desc_prof_model() -> &'static str {
+    tr!(
+        "空欄 = その CLI の既定モデル（どのプランでも起動する。推奨）",
+        "Empty = that CLI's default model (works on any plan; recommended)"
+    )
+}
+
+pub fn prof_label_effort() -> &'static str {
+    tr!("思考の深さ（effort）", "Thinking effort")
+}
+
+pub fn prof_label_policy() -> &'static str {
+    tr!("worker のモデル決定", "How workers pick a model")
+}
+
+pub fn prof_policy_inherit() -> &'static str {
+    tr!("master と同じ", "Same as master")
+}
+
+pub fn prof_policy_delegate() -> &'static str {
+    tr!("master が都度選ぶ", "Master decides per task")
+}
+
+pub fn prof_policy_fixed() -> &'static str {
+    tr!("下の値で固定", "Fixed to the value below")
+}
+
+pub fn prof_label_worker_model() -> &'static str {
+    tr!("worker のモデル", "Worker model")
+}
+
+pub fn desc_prof_worker_model() -> &'static str {
+    tr!(
+        "「下の値で固定」のときに使われる",
+        "Used when workers are fixed to a single model"
+    )
+}
+
+pub fn prof_label_worker_effort() -> &'static str {
+    tr!("worker の思考の深さ", "Worker thinking effort")
+}
+
+pub fn prof_label_master_account() -> &'static str {
+    tr!("master のアカウント", "Master account")
+}
+
+pub fn prof_label_worker_account() -> &'static str {
+    tr!("worker のアカウント", "Worker account")
+}
+
+pub fn desc_prof_account() -> &'static str {
+    tr!(
+        "登録済みアカウントから選ぶ（未設定 = 既定の資格情報）",
+        "Pick a registered account (Not set = default credentials)"
+    )
+}
+
+pub fn prof_no_accounts() -> &'static str {
+    tr!(
+        "登録済みアカウントがありません（`tako orchestrator accounts add` で追加）",
+        "No accounts registered (add one with `tako orchestrator accounts add`)"
+    )
+}
+
+pub fn prof_no_projects() -> &'static str {
+    tr!(
+        "登録済みプロジェクトがありません（`tako orchestrator projects add` で追加）",
+        "No projects registered (add one with `tako orchestrator projects add`)"
+    )
+}
+
+pub fn desc_prof_projects() -> &'static str {
+    tr!(
+        "選んだプロジェクトが master の system prompt に注入される（複数選択可）",
+        "Selected projects are injected into the master system prompt (multi-select)"
+    )
+}
+
+pub fn prof_option_default() -> &'static str {
+    tr!("既定", "Default")
+}
+
+pub fn prof_option_unset() -> &'static str {
+    tr!("未設定", "Not set")
+}
+
+pub fn prof_agent_target() -> &'static str {
+    tr!("設定するエージェント", "Agent to configure")
+}
+
+pub fn desc_prof_agent_target() -> &'static str {
+    tr!(
+        "この種別の worker だけに適用される設定",
+        "Settings applied only to workers of this kind"
+    )
+}
+
+pub fn prof_label_skip_permissions() -> &'static str {
+    tr!("許可プロンプトをスキップ", "Skip permission prompts")
+}
+
+pub fn desc_prof_skip_permissions() -> &'static str {
+    tr!(
+        "worker が承認ダイアログで止まらなくなる（codex / agy は既定でオン）",
+        "Keeps workers from stalling on approval dialogs (on by default for codex / agy)"
+    )
+}
+
+pub fn prof_label_agent_args() -> &'static str {
+    tr!("追加の CLI 引数", "Extra CLI arguments")
+}
+
+pub fn desc_prof_agent_args() -> &'static str {
+    tr!(
+        "スペース区切り（上級者向け）",
+        "Space separated (for advanced users)"
+    )
+}
+
+pub fn prof_effort_ignored() -> &'static str {
+    tr!(
+        "agy に effort 指定はありません（モデル名に含まれます）",
+        "agy has no effort setting (it is part of the model name)"
+    )
+}
+
+pub fn prof_label_tab_naming() -> &'static str {
+    tr!("タブ名の命名規則", "Tab naming convention")
+}
+
+pub fn desc_prof_tab_naming() -> &'static str {
+    tr!(
+        "自動命名の指示（空欄 = 既定の規則）",
+        "Instruction for automatic naming (empty = default rule)"
+    )
+}
+
+pub fn prof_env_add() -> &'static str {
+    tr!("追加", "Add")
+}
+
+pub fn prof_env_masked() -> &'static str {
+    tr!("（値は非表示）", "(value hidden)")
+}
+
+pub fn desc_prof_env() -> &'static str {
+    tr!(
+        "master と worker に注入される。値は画面にもログにも出さない",
+        "Injected into master and workers. Values are never shown on screen or in logs."
+    )
+}
+
+pub fn prof_model_1m_warning() -> &'static str {
+    tr!(
+        "1M コンテキスト版は Max / API プラン限定です（Pro では起動できません）",
+        "The 1M-context model requires a Max / API plan (it will not start on Pro)."
+    )
+}
+
+pub fn prof_name_required() -> &'static str {
+    tr!("プロファイル名を入力してください", "Enter a profile name")
+}
+
+pub fn prof_cancel() -> &'static str {
+    tr!("キャンセル", "Cancel")
+}
+
 #[cfg(test)]
 // 注意: このクレートは #[test] の展開がコンパイラの recursion limit ぎりぎりで、
 // テストを 1 本増やす / 1 本に詰め込むだけで `recursion limit reached while
@@ -941,6 +1241,65 @@ mod tests {
                 advanced_related_header().into(),
                 advanced_parse_error().into(),
                 advanced_saved().into(),
+                // プロファイルタブ（#721）
+                tab_profiles().into(),
+                prof_kind_master().into(),
+                prof_kind_solo().into(),
+                prof_kind_header().into(),
+                desc_prof_kind().into(),
+                prof_list_header().into(),
+                prof_empty().into(),
+                prof_new_placeholder().into(),
+                prof_create().into(),
+                prof_duplicate().into(),
+                prof_delete_confirm().into(),
+                prof_restart_note().into(),
+                prof_launch_label().into(),
+                prof_path_label().into(),
+                prof_warnings_header().into(),
+                prof_broken().into(),
+                prof_section_master().into(),
+                prof_section_worker().into(),
+                prof_section_agent().into(),
+                prof_section_projects().into(),
+                prof_section_env().into(),
+                prof_section_other().into(),
+                prof_label_agent().into(),
+                desc_prof_master_agent().into(),
+                desc_prof_worker_agent().into(),
+                prof_label_model().into(),
+                desc_prof_model().into(),
+                prof_label_effort().into(),
+                prof_label_policy().into(),
+                prof_policy_inherit().into(),
+                prof_policy_delegate().into(),
+                prof_policy_fixed().into(),
+                prof_label_worker_model().into(),
+                desc_prof_worker_model().into(),
+                prof_label_worker_effort().into(),
+                prof_label_master_account().into(),
+                prof_label_worker_account().into(),
+                desc_prof_account().into(),
+                prof_no_accounts().into(),
+                prof_no_projects().into(),
+                desc_prof_projects().into(),
+                prof_option_default().into(),
+                prof_option_unset().into(),
+                prof_agent_target().into(),
+                desc_prof_agent_target().into(),
+                prof_label_skip_permissions().into(),
+                desc_prof_skip_permissions().into(),
+                prof_label_agent_args().into(),
+                desc_prof_agent_args().into(),
+                prof_effort_ignored().into(),
+                prof_label_tab_naming().into(),
+                desc_prof_tab_naming().into(),
+                prof_env_add().into(),
+                prof_env_masked().into(),
+                desc_prof_env().into(),
+                prof_model_1m_warning().into(),
+                prof_name_required().into(),
+                prof_cancel().into(),
             ]
         });
     }
