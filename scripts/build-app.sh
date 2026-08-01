@@ -103,6 +103,54 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>ja</string>
 	<key>CFBundleDisplayName</key>
 	<string>tako</string>
+	<!-- Finder の「このアプリケーションで開く」候補に出す（FR-3.22 / Issue #708）。
+	     LSHandlerRank は**すべて Alternate 固定**: Default / Owner にすると
+	     Launch Services が tako を既定ハンドラに選び得るため、既定アプリを奪う。
+	     Alternate は「開けるが既定ではない」= 候補一覧に並ぶだけ。
+	     この不変条件は tako-app の open_files.rs のテストが機械検証している。
+
+	     対象は UTI（LSItemContentTypes）だけで宣言し、CFBundleTypeExtensions は
+	     使わない。拡張子指定は macOS が UTI を持たない拡張子（実測: .rs / .toml /
+	     .go / .conf 等は dyn.* = public.data 止まり）にも候補を出せる反面、
+	     その拡張子を他アプリが 1 つも宣言していないと Alternate でも tako が
+	     既定ハンドラになってしまう。既定を一切動かさないことを優先する。 -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Text Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.text</string>
+				<string>public.plain-text</string>
+				<string>public.utf8-plain-text</string>
+				<string>public.source-code</string>
+				<string>public.script</string>
+				<string>public.json</string>
+				<string>public.yaml</string>
+				<string>public.xml</string>
+				<string>net.daringfireball.markdown</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Preview Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.adobe.pdf</string>
+				<string>public.image</string>
+				<string>public.movie</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>tako-app</string>
 	<key>CFBundleIconFile</key>
@@ -196,5 +244,13 @@ if [[ $INSTALL -eq 1 ]]; then
   echo "==> /Applications へ配置"
   rm -rf /Applications/tako.app
   cp -R "$APP" /Applications/tako.app
+  # Launch Services へ登録し直す（#708）。/Applications への配置でも通常は自動で
+  # 登録されるが、rm -rf → cp -R の差し替えでは古い登録が残り「このアプリケーションで
+  # 開く」の候補・アイコンが更新されないことがある。明示登録して決定論的にする
+  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Support/lsregister
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -f /Applications/tako.app || true
+    echo "==> Launch Services へ登録（CFBundleDocumentTypes の反映）"
+  fi
   echo "==> /Applications/tako.app 配置完了"
 fi
