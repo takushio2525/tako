@@ -8,6 +8,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.4] - 2026-08-02
+
+Nightly patch release (automated). Changes since v0.6.3:
+夜間パッチリリース（自動）。v0.6.3 以降の変更:
+
+- [改善] GUI モード: 起動の過渡期に生ターミナルを見せない + スターターに setup 導線 (#720) (#734)
+- [機能追加] 設定画面に「プロファイル」タブを新設し master / solo の起動設定を GUI 編集できるようにする (#721) (#731)
+- [改善] GUI モードのチャットビューを「ちゃんと使えるチャット UI」にする（#715 表示品質 + #716 G3） (#717)
+- [ドキュメント] activeContext: 08-01 完了分（#702/#703/#708）を反映 (#714)
+- [機能追加] GUI モード G2: チャットビュー（読み取り）— claude ペインを会話表示にする (#702) (#713)
+- [機能追加] Finder の「このアプリケーションで開く」に tako を出す (#708) (#711)
+- [改善] コマンド提案カードをターミナル領域を縮めた専用帯へ移し会話との重なりをゼロにする (#703) (#710)
+
 ## [0.6.3] - 2026-08-01
 
 Nightly patch release (automated). Changes since v0.6.2:
