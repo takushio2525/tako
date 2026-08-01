@@ -107,9 +107,16 @@ impl std::fmt::Display for SessionRef {
     }
 }
 
-/// スクロールバックの権威がどちらにあるか。
-/// `Backend` なら履歴は器の側にあり、ローカルミラー（`scroll_mirror`）で読む。
-/// `InProcess` なら alacritty が履歴を持ち、直接ペイン経路（#159）がそのまま効く
+/// **UI のスクロール表示**をどちらの履歴で描くか。
+///
+/// `Backend` = 器の履歴をローカルへ写して描く（`scroll_mirror`。#159）。
+/// `InProcess` = 外側 alacritty が持つ履歴をそのまま描く（直接ペイン経路）。
+///
+/// **「器が履歴を持っているか」ではない**点に注意。ミラー経路は器へ 2 つの前提を置く
+/// （`#{mouse_any_flag}` で内側アプリのマウス要求を答えられる /
+/// `send-keys -H` でホイール報告をバイト列として注入できる）。psmux は履歴を持つが
+/// この 2 つを持たないため `InProcess` を申告する（#654）。
+/// 器の履歴を**採取できるか**は [`BackendCapabilities::detached_capture`] が答える
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbackAuthority {
     Backend,
@@ -127,7 +134,11 @@ pub enum ScrollbackAuthority {
 pub struct BackendCapabilities {
     /// tako 終了後もセッション内のプロセスが生き残るか（役割 A）
     pub survives_app_exit: bool,
-    /// tako-app 不在 / ペイン消失時に画面採取・入力送出ができるか（役割 B）
+    /// tako-app 不在 / ペイン消失時に**画面・履歴を採取**できるか（役割 B の読み側）。
+    /// psmux はここだけ `true`（`capture-pane` は動くが送出系は信頼できない。#519）
+    pub detached_capture: bool,
+    /// tako-app 不在 / ペイン消失時に**入力を送出**できるか（役割 B の書き側）。
+    /// `detached_capture` を含意する（送れる器は読めもする）
     pub detached_access: bool,
     /// スクロールバックの権威
     pub scrollback: ScrollbackAuthority,
@@ -162,6 +173,7 @@ impl BackendCapabilities {
         serde_json::json!({
             "label": self.label,
             "survives_app_exit": self.survives_app_exit,
+            "detached_capture": self.detached_capture,
             "detached_access": self.detached_access,
             "scrollback": match self.scrollback {
                 ScrollbackAuthority::Backend => "backend",
@@ -218,8 +230,28 @@ pub struct SessionInfo {
 pub struct HistoryProbe {
     pub history: usize,
     pub limit: usize,
+    /// 履歴のバイト数。**器によっては観測できない**（psmux の `#{history_bytes}` は空）。
+    /// 観測できない器は 0 を返すので、**変化の検知にだけ使い、絶対値を信じない**
     pub bytes: u64,
     /// 内側アプリが alt screen（TUI 実行中）か
+    pub alternate: bool,
+}
+
+/// 器が持つ**表示位置**の観測結果（#687。CLI / MCP のスクロールが使う）。
+///
+/// 器の中でスクロールバックを遡っている状態を外から読む。tako-app の
+/// `TerminalSession::display_offset()` は**外側** alacritty の位置なので、
+/// 器がスクロールを持つペイン（psmux の attach クライアントは alt screen で
+/// 外側に履歴が積まれない）では常に 0 になり、実態を答えられない
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ScrollProbe {
+    /// 最下部からの遡り行数（0 = 最下部）。`TerminalSession::display_offset` と同じ向き
+    pub position: usize,
+    /// 器の履歴行数
+    pub history: usize,
+    /// 器がスクロールモード（tmux / psmux の copy mode）に居るか
+    pub in_mode: bool,
+    /// 内側アプリが alt screen（= スクロール位置は内側アプリが所有する）か
     pub alternate: bool,
 }
 
@@ -314,22 +346,32 @@ pub trait SessionBackend: Send + Sync {
     /// 稼働中の器へ最新設定を再適用する（器が tako の再起動を生き残るため必要）
     fn sync_config(&self) {}
 
-    /// 役割 B の入口。**持たない実装は `None`**
+    /// 役割 B の**読み側**の入口。**持たない実装は `None`**。
+    ///
+    /// 送出まで持つ器は [`Self::detached`] を実装すればよく、こちらは既定実装が
+    /// そこから引き上げる。psmux のように**採取だけできる器**はこちらだけを実装する
+    fn detached_capture(&self) -> Option<&dyn DetachedCapture> {
+        self.detached().map(|a| a as &dyn DetachedCapture)
+    }
+
+    /// 役割 B の**書き側まで**含む入口。**持たない実装は `None`**
     fn detached(&self) -> Option<&dyn DetachedAccess> {
         None
     }
 }
 
-/// 役割 B: アウトオブプロセス到達。
+/// 役割 B の読み側: アウトオブプロセス**採取**。
 ///
-/// **これを持たない = tako-app が居ないと何も読めない・送れない**。
-/// Windows 初期リリース（`NullBackend`）はこれを持たない。
+/// **これを持たない = tako-app が居ないと画面も履歴も読めない**（`NullBackend`）。
+/// psmux はここまでは持つ（`capture-pane` / `display-message` は動く）が、
+/// 送出系（[`DetachedAccess`]）は持たない。
 ///
-/// 現時点で載せているのは、tako-core の既存関数へ正直に委譲できるものだけ。
-/// スクロールのホイール転送（`scroll_mirror::send_wheel`）はネスト tmux の
-/// ターゲット解決（#181）という別の抽象を必要とし、ペイン PID 列挙・子プロセス判定は
-/// tako-control 側にあるため、呼び出し側の移行（段取り ③）と同時に加える。
-pub trait DetachedAccess: Send + Sync {
+/// **読みと書きを別の trait にしてある**のは、
+/// 「採取はできるが送出はできない」を型で表せるようにするため。
+/// 1 つの trait にして送出だけ `Unsupported` を返す形にすると、
+/// 「`Detached` に解決できた = 送れる」という段取り ③ の不変条件が崩れ、
+/// 失敗がランタイムまで落ちる（設計 §3.6 と同じ「能力が違うものは型で分ける」）。
+pub trait DetachedCapture: Send + Sync {
     /// 可視画面の採取
     fn capture_screen(&self, session: &SessionRef) -> Result<Vec<String>, BackendError>;
 
@@ -337,9 +379,12 @@ pub trait DetachedAccess: Send + Sync {
     /// （`#{history_size}` の行数カウントと 1:1 で対応する。pane_log が使う）
     fn capture_history(&self, session: &SessionRef, lines: usize) -> Option<Vec<String>>;
 
-    /// 履歴末尾 `lines` 行を**折り返し結合して** 1 本のテキストで返す。
+    /// 履歴末尾 `lines` 行を 1 本のテキストで返す。
     /// 人間・エージェントが読む報告（`orchestrator report` 第 1 層）が使う。
-    /// [`capture_history`] とは折り返しの扱いが違うので混同しないこと
+    ///
+    /// tmux は折り返し行を結合する（`-J`）。**psmux は `-J` を無視する**ので
+    /// 折り返しは行のまま残る（中身は失われない）。折り返しの扱いが器で違う点を除けば
+    /// [`Self::capture_history`] との差は「1 本のテキストか行の列か」
     fn capture_history_joined(&self, session: &SessionRef, lines: usize) -> Option<String>;
 
     fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe>;
@@ -347,6 +392,19 @@ pub trait DetachedAccess: Send + Sync {
     /// 全セッションの履歴観測を 1 コマンドで（#369 の probe 一括化）
     fn history_probe_batch(&self) -> Vec<(SessionRef, HistoryProbe)>;
 
+    /// 器の中の表示位置（#687）。器がスクロールを持たない実装は `None`
+    fn scroll_probe(&self, session: &SessionRef) -> Option<ScrollProbe>;
+}
+
+/// 役割 B の書き側まで: アウトオブプロセス**送出**（採取を含む）。
+///
+/// Windows 初期リリース（`NullBackend` / `PsmuxBackend`）はこれを持たない。
+///
+/// 現時点で載せているのは、tako-core の既存関数へ正直に委譲できるものだけ。
+/// スクロールのホイール転送（`scroll_mirror::send_wheel`）はネスト tmux の
+/// ターゲット解決（#181）という別の抽象を必要とし、ペイン PID 列挙・子プロセス判定は
+/// tako-control 側にあるため、呼び出し側の移行（段取り ③）と同時に加える。
+pub trait DetachedAccess: DetachedCapture {
     /// テキスト送出（改行は呼び出し側で正規化済みの前提）
     fn send_text(&self, session: &SessionRef, text: &str) -> Result<(), BackendError>;
 
@@ -655,6 +713,29 @@ pub fn backend() -> &'static dyn SessionBackend {
         .as_ref()
 }
 
+/// `#{scroll_position}\t#{history_size}\t#{pane_in_mode}\t#{alternate_on}` の
+/// 出力を [`ScrollProbe`] にする（純関数。tmux / psmux が共有する）。
+///
+/// **欠けたフィールドで `None` を返さない**のが要点（#654 と同じ設計）。
+/// tmux は copy mode の外で `#{scroll_position}` を空にし、psmux は
+/// フォーマットによっては空文字へ展開する。答えられない器を
+/// 「観測できなかった」ではなく「既定値（最下部・非スクロールモード）」として扱う。
+/// ただし `history_size` すら読めない出力は器の応答として壊れているので `None`
+pub(crate) fn parse_scroll_probe(output: &str) -> Option<ScrollProbe> {
+    let line = output.lines().next()?;
+    let mut f = line.split('\t');
+    let position = f.next().unwrap_or("").trim().parse().unwrap_or(0);
+    let history = f.next()?.trim().parse().ok()?;
+    let in_mode = f.next().unwrap_or("").trim() == "1";
+    let alternate = f.next().unwrap_or("").trim() == "1";
+    Some(ScrollProbe {
+        position,
+        history,
+        in_mode,
+        alternate,
+    })
+}
+
 /// 現在時刻（unix epoch 秒）。器の実装が最終アクティビティの猶予判定に使う
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -813,6 +894,7 @@ mod tests {
     fn 器が無いときだけ縮退の説明が出る() {
         let with_container = BackendCapabilities {
             survives_app_exit: true,
+            detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
             label: "tmux",
@@ -822,6 +904,7 @@ mod tests {
 
         let without = BackendCapabilities {
             survives_app_exit: false,
+            detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             label: "none",
@@ -837,6 +920,7 @@ mod tests {
     fn describeは能力をそのまま構造化して返す() {
         let caps = BackendCapabilities {
             survives_app_exit: false,
+            detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             label: "none",
@@ -844,12 +928,14 @@ mod tests {
         let v = caps.describe();
         assert_eq!(v["label"], "none");
         assert_eq!(v["survives_app_exit"], false);
+        assert_eq!(v["detached_capture"], false);
         assert_eq!(v["detached_access"], false);
         assert_eq!(v["scrollback"], "in_process");
         assert!(v["note"].is_string(), "縮退時は note が入る");
 
         let tmux = BackendCapabilities {
             survives_app_exit: true,
+            detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
             label: "tmux",
@@ -859,6 +945,20 @@ mod tests {
             tmux.describe()["note"].is_null(),
             "縮退していなければ note は無い"
         );
+
+        // psmux（採取だけできる器）は 2 つの bool が食い違う。
+        // **`describe()` が両方を別々に出す**ので、AI / CLI は
+        // 「読めるが送れない」をこの 1 箇所から読める
+        let psmux = BackendCapabilities {
+            survives_app_exit: true,
+            detached_capture: true,
+            detached_access: false,
+            scrollback: ScrollbackAuthority::InProcess,
+            label: "psmux",
+        };
+        let v = psmux.describe();
+        assert_eq!(v["detached_capture"], true);
+        assert_eq!(v["detached_access"], false);
     }
 
     /// 案 B-1（器だけの ConPTY セッションホスト）の形をした偽 backend。
@@ -887,6 +987,7 @@ mod tests {
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities {
                 survives_app_exit: true,
+                detached_capture: false,
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
                 label: "session-host",
@@ -1083,11 +1184,141 @@ mod tests {
         // これが表現できない trait は切り方を間違えている（設計 §3.6）
         let b1 = BackendCapabilities {
             survives_app_exit: true,
+            detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             label: "session-host",
         };
         assert!(b1.full_restore());
         assert!(!b1.detached_access);
+
+        // #519: psmux で実際に現れた「器あり・採取あり・送出なし」。
+        // 読みと書きを 1 つの bool にまとめていたら表現できなかった中間状態
+        let psmux = BackendCapabilities {
+            detached_capture: true,
+            ..b1
+        };
+        assert!(psmux.detached_capture && !psmux.detached_access);
+    }
+
+    /// 採取だけを持つ器（psmux 形）。**`detached()` は `None` のまま
+    /// `detached_capture()` が開く**ことを、実装名に依存せず境界の形だけで固定する
+    struct FakeCaptureOnly {
+        capture: FakeCapture,
+    }
+
+    struct FakeCapture;
+
+    impl DetachedCapture for FakeCapture {
+        fn capture_screen(&self, _s: &SessionRef) -> Result<Vec<String>, BackendError> {
+            Ok(vec!["live".into()])
+        }
+        fn capture_history(&self, _s: &SessionRef, _lines: usize) -> Option<Vec<String>> {
+            Some(vec!["old".into()])
+        }
+        fn capture_history_joined(&self, _s: &SessionRef, _lines: usize) -> Option<String> {
+            Some("old".into())
+        }
+        fn history_probe(&self, _s: &SessionRef) -> Option<HistoryProbe> {
+            Some(HistoryProbe {
+                history: 3,
+                limit: 10,
+                bytes: 0,
+                alternate: false,
+            })
+        }
+        fn history_probe_batch(&self) -> Vec<(SessionRef, HistoryProbe)> {
+            Vec::new()
+        }
+        fn scroll_probe(&self, _s: &SessionRef) -> Option<ScrollProbe> {
+            Some(ScrollProbe {
+                position: 2,
+                history: 3,
+                in_mode: true,
+                alternate: false,
+            })
+        }
+    }
+
+    impl SessionBackend for FakeCaptureOnly {
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                survives_app_exit: true,
+                detached_capture: true,
+                detached_access: false,
+                scrollback: ScrollbackAuthority::InProcess,
+                label: "capture-only",
+            }
+        }
+        fn reserve(&self, candidate: &str) -> Option<SessionRef> {
+            SessionRef::new(candidate).ok()
+        }
+        fn wrap_spawn(&self, options: SpawnOptions, _s: &SessionRef) -> SpawnOptions {
+            options
+        }
+        fn exists(&self, _s: &SessionRef) -> bool {
+            true
+        }
+        fn kill(&self, _s: &SessionRef) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<SessionInfo> {
+            Vec::new()
+        }
+        fn foreign_holders(&self, _s: &[SessionRef]) -> Vec<Holder> {
+            Vec::new()
+        }
+        fn orphans(&self, _p: &HashSet<SessionRef>) -> Vec<SessionRef> {
+            Vec::new()
+        }
+        fn cleanup_orphans(
+            &self,
+            _p: &HashSet<SessionRef>,
+            _min_idle: Option<Duration>,
+        ) -> Vec<SessionRef> {
+            Vec::new()
+        }
+        fn pane_tty(&self, _s: &SessionRef) -> Option<String> {
+            None
+        }
+        fn session_cwd(&self, _s: &SessionRef) -> Option<String> {
+            None
+        }
+        fn session_env(&self, _s: &SessionRef, _n: &str) -> Option<String> {
+            None
+        }
+        fn set_session_env(&self, _s: &SessionRef, _n: &str, _v: &str) {}
+        fn detached_capture(&self) -> Option<&dyn DetachedCapture> {
+            Some(&self.capture)
+        }
+    }
+
+    /// **読みと書きが型で分かれている**ことの検証。
+    /// 採取だけの器では `detached()`（送出）が閉じたまま `detached_capture()` が開く
+    #[test]
+    fn 採取だけの器は読みの入口だけを開く() {
+        let b = FakeCaptureOnly {
+            capture: FakeCapture,
+        };
+        let s = SessionRef::new("tako-0123456789ab").unwrap();
+        assert!(b.detached().is_none(), "送出の入口は閉じたまま");
+        let capture = b.detached_capture().expect("採取の入口は開く");
+        assert_eq!(
+            capture.capture_screen(&s).unwrap(),
+            vec!["live".to_string()]
+        );
+        assert_eq!(capture.scroll_probe(&s).unwrap().position, 2);
+    }
+
+    /// 逆向き: 送出まで持つ器は `detached_capture()` の既定実装で
+    /// **何も書かずに**読みの入口も開く（tmux が該当）
+    #[test]
+    fn 送出できる器は既定実装で読みの入口も開く() {
+        let b = TmuxBackend::new();
+        assert!(b.detached().is_some());
+        assert!(
+            b.detached_capture().is_some(),
+            "detached_capture の既定実装が detached から引き上げる"
+        );
     }
 }

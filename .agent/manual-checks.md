@@ -539,3 +539,27 @@ macOS の CI（build + clippy + test）は緑だが、次の 3 点は見た目�
       文言は macOS 専用なので変えていない
 - [ ] `tako sleep-guard status` の説明文で、蓋閉じ継続・sudoers・thermal の表示が従来どおり
       （Windows 向けに capability を分離したが macOS は `lid_control_supported() = true`）
+
+## Windows の蓋閉じ継続（#697、2026-07-31）
+
+電源プランの `GUID_LIDCLOSE_ACTION` を倒す / 戻すところまでは実機で機械検証済み
+（`cargo test -p tako-control --lib platform::lid` に実機テスト 2 本 + CLI e2e）。
+**実際に蓋を閉じて処理が続くかだけは物理操作なので人手で確認する。**
+
+前提: AC 電源に接続し、`tako sleep-guard set --mode while-agents-running --lid-sleep-mode
+while-agents-running` にしてエージェントを 1 体以上動かしておく（`tako sleep-guard status` の
+`蓋閉じ継続: 有効` を確認してから蓋を閉じる）。
+
+- [ ] **蓋を閉じても処理が続く**: 長時間かかるコマンド（`cargo build` 等）を走らせた状態で
+      蓋を閉じ、数分後に開く。処理が中断せず進んでいる（ログの時刻が飛んでいない）
+- [ ] **画面は消灯する**: 蓋を閉じている間、外部ディスプレイがあればそこは点いたままでよいが、
+      内蔵パネルは消えている（Windows が自動で消すので tako は何もしない = #311 の
+      macOS 用ディスプレイ消灯処理は Windows に無い）
+- [ ] **エージェントが終われば元へ戻る**: 全エージェントが idle になったあと `powercfg /q
+      SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936`
+      …ではなく（この設定は hidden で出ない）、`tako sleep-guard status` が
+      `蓋閉じ継続: エージェント待機中のため無効` になり、蓋を閉じると普通にスリープする
+- [ ] **バッテリー駆動では効かない**: AC を抜くと `蓋閉じ継続: AC 未接続のため無効` になり、
+      蓋を閉じるとスリープする（鞄の中で電池が尽きないための意図的な仕様）
+- [ ] **設定画面の文言**: Cmd+, → 一般（スリープ防止）の「蓋閉じ継続」の説明が
+      「AC 接続時・エージェント稼働中のみ」で、**sudoers の話が出ていない**

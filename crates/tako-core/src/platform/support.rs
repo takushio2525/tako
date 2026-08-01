@@ -120,11 +120,39 @@ pub mod notes {
          running processes stop when tako exits",
     );
     /// #519: 器がアウトオブプロセス到達（`DetachedAccess`）を持たない環境。
-    /// 「フォールバックが失敗した」ではなく「そもそも到達手段が無い」ことを言う
+    /// 「フォールバックが失敗した」ではなく「そもそも到達手段が無い」ことを言う。
+    ///
+    /// **採取（読み）だけは psmux で動くようになった**（#519 の読み取り専用到達）ので、
+    /// この理由文が当てはまるのは送出まで要る機能だけになっている
     pub const WIN_NO_DETACHED_REACH: Note = Note::new(
         "ペイン外からの採取（scrollback）に到達手段が要る。psmux 等の器を導入していない Windows では取得できない",
         "Capturing a pane from outside the app (scrollback) needs out-of-process reach, which is \
          unavailable on Windows without a session host such as psmux",
+    );
+    /// #519: psmux の `capture-pane` で scrollback を採れるようになった。
+    /// **psmux の導入は任意**なので、あるとき / 無いときで何が変わるかをそのまま書く。
+    /// 折返し結合（tmux の `-J`）が psmux では効かない点も、報告の見た目が変わるので書く
+    pub const WIN_REPORT_PSMUX: Note = Note::new(
+        "psmux（tmux 互換の永続化バックエンド）を導入していれば scrollback を採れる。\
+         未導入なら claude の transcript からのみ報告を作る（他のエージェントでは報告が取れない）。\
+         psmux は折返し行の結合に対応しないため、長い行は折り返されたまま出る",
+        "With psmux (a tmux-compatible persistence backend) installed, scrollback is captured. \
+         Without it, reports come only from the claude transcript (no report for other agents). \
+         psmux does not join wrapped lines, so long lines stay hard-wrapped",
+    );
+    /// #687: psmux ペインでは器（psmux）がスクロールを持つ。tako はユーザーのホイールと
+    /// 同じ経路で器を動かし、位置を読み戻して返す。**全画面 TUI では位置を読めない**ので、
+    /// 何ができて何ができないかを具体的に書く（「使えない」と誤解されると回避行動を取られる）
+    pub const WIN_SCROLL_BACKEND_OWNED: Note = Note::new(
+        "psmux ペインではスクロール位置を器（psmux）が持つ。tako はユーザーのホイールと同じ経路で \
+         器を動かし実位置を読み戻すが、器の粒度でしか位置を指定できない。\
+         ペイン内のアプリが全画面（claude 等）のときはそのアプリが位置を持つため、\
+         スクロールは効くが位置は返せず、to での絶対指定もできない",
+        "In psmux panes the session host owns the scroll position. tako drives it through the same \
+         path as the user's wheel and reads the real position back, but can only land on positions \
+         the host's granularity allows. When a full-screen app (such as claude) runs in the pane, \
+         that app owns the position: scrolling works, but the position cannot be read back and \
+         absolute positioning with `to` is unavailable",
     );
     /// #519: 任意の tmux サーバーを直接操作する機能面。psmux は tmux 互換だが
     /// 「他人が立てた tmux セッションの発見と片付け」という用途自体が Windows には無い
@@ -181,15 +209,20 @@ pub mod notes {
     // なった。共通の縮退理由 WIN_OS_API（「OS API の Windows 実装が前提」）は
     // 使う機能が無くなったので削除した（残すと system prompt へ誤情報が入る）
 
-    /// #524: アイドルスリープの抑止（`PowerCreateRequest`）は動く。
-    /// 蓋を閉じても走り続ける仕組みは macOS 固有（IOKit の clamshell 検知 +
-    /// sudoers 経由の `pmset disablesleep`）で、Windows に相当する API が無い
-    pub const WIN_SLEEP_GUARD_NO_LID: Note = Note::new(
-        "アイドルスリープの防止は動く。蓋を閉じたまま走らせ続ける設定と本体温度の監視は \
-         macOS 固有の仕組みのため Windows には無い（蓋を閉じたときの動作は電源プランに従う）",
-        "Idle sleep prevention works. Keeping the machine running with the lid closed, and \
-         thermal monitoring, rely on macOS-specific mechanisms that Windows does not have \
-         (lid-close behavior follows the Windows power plan)",
+    /// #524 + #697: アイドルスリープの抑止（`PowerCreateRequest`）も
+    /// 蓋を閉じたままの継続稼働（電源プランの `GUID_LIDCLOSE_ACTION` を倒す）も動く。
+    ///
+    /// 残る差は 2 つだけ。**本体温度の監視**（macOS の `NSProcessInfo.thermalState` 相当が無い）と、
+    /// **蓋の開閉状態の表示**（`RegisterPowerSettingNotification` にウィンドウハンドルが要り、
+    /// 状態表示のためだけに持つには重い）。どちらも蓋閉じ継続の動作そのものには影響しない
+    /// （#524 時点の「相当する API が無い」は誤りだった。#697 で実測して訂正）
+    pub const WIN_SLEEP_GUARD_NO_THERMAL: Note = Note::new(
+        "アイドルスリープの防止と蓋を閉じたままの継続稼働はどちらも動く。\
+         本体温度の監視と蓋の開閉状態の表示だけが macOS 固有のため Windows には無い\
+         （動作そのものには影響しない）",
+        "Both idle-sleep prevention and keeping the machine running with the lid closed work. \
+         Only thermal monitoring and showing the lid open/closed state are macOS-specific and \
+         unavailable on Windows (neither affects how lid-close continuation behaves)",
     );
     /// #525: 実行ペインは PowerShell で起こすようにした（pwsh 7 → Windows PowerShell 5.1 の順に解決）。
     /// 残る差は `&&` / `||` だけ。**何が落ちて何をすれば直るか**まで書く
@@ -627,9 +660,8 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_report",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_NO_DETACHED_REACH,
-            issue: 519,
+        windows: Support::Degraded {
+            note: notes::WIN_REPORT_PSMUX,
         },
     },
     Feature {
@@ -923,7 +955,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_scroll_pane",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_SCROLL_BACKEND_OWNED,
+        },
     },
     Feature {
         key: "tako_select_tab",
@@ -983,9 +1017,10 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_sleep_guard",
         macos: Support::Supported,
         // #524: PowerCreateRequest / PowerSetRequest でアイドルスリープを抑止。
-        // 蓋閉じ継続と thermal は macOS 固有なので Degraded
+        // #697: 蓋閉じ継続も電源プランの lid action を倒して動くようになった。
+        // 残るのは thermal 監視と蓋の開閉表示だけなので Degraded は維持
         windows: Support::Degraded {
-            note: notes::WIN_SLEEP_GUARD_NO_LID,
+            note: notes::WIN_SLEEP_GUARD_NO_THERMAL,
         },
     },
     Feature {

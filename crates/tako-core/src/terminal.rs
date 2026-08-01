@@ -619,6 +619,37 @@ impl TerminalSession {
         }
     }
 
+    /// プログラム経由（CLI / MCP）のホイール送出（#687）。
+    ///
+    /// **ユーザーのホイールと同じバイト列を同じ PTY へ書く**が、慣性のレート制限
+    /// （[`Self::limit_forwarded_wheel`]）は通さない。あれは trackpad の慣性で
+    /// 無制限にイベントが流れ込むのを止めるためのもので、1 回の明示リクエストには
+    /// 当てはまらない（8 イベントで頭打ちになると AI からのスクロールが動かない）。
+    /// 代わりに [`PROGRAMMATIC_WHEEL_MAX`] で 1 リクエストの上限を切る:
+    /// `wheel_action` はイベントを 1 本の buffer に畳んで**単一の write** にするので、
+    /// #167 の「洪水の部分 write が escape-time を跨いで断片化する」経路には乗らない。
+    ///
+    /// 返り値は実際に送ったイベント数（符号は `delta_lines` と同じ）。
+    /// **0 = このペインは転送経路ではない**（＝ 呼び出し側は表示スクロールを使うべき）
+    pub fn send_wheel_report(&self, delta_lines: i32, col: usize, row: usize) -> i32 {
+        let mode = *self.term.lock().mode();
+        if !wheel_forwarded_to_pty(mode) {
+            return 0;
+        }
+        let clamped = delta_lines.clamp(-PROGRAMMATIC_WHEEL_MAX, PROGRAMMATIC_WHEEL_MAX);
+        match wheel_action(mode, clamped, col, row) {
+            WheelAction::Write(bytes) => {
+                // ユーザーのホイールと同じ扱いで遡り量を勘定する（#686）。
+                // 器の copy mode 判定は「PTY へ転送した報告の上下差」なので、
+                // 送出元が GUI か CLI かで数え方が変わってはいけない
+                self.note_mouse_report(mode, clamped);
+                self.notifier.notify(bytes);
+                clamped
+            }
+            WheelAction::ScrollDisplay(_) | WheelAction::None => 0,
+        }
+    }
+
     /// マウスホイール入力の行小数版（GPUI のホイール / トラックパッドイベント用）。
     /// 表示スクロールは `scroll_pixels`（サブライン描画）、PTY 転送（mouse reporting /
     /// alternate scroll）は行未満を `wheel_carry` で積分して整数行だけ送る
@@ -1335,6 +1366,13 @@ pub fn wheel_report_bytes(sgr: bool, up: bool, col: usize, row: usize) -> Vec<u8
         ]
     }
 }
+
+/// プログラム経由（CLI / MCP）のホイール送出で 1 リクエストに許す最大イベント数（#687）。
+///
+/// 1 イベント 6 バイト前後なので、上限でも 2KB 弱の**単一 write** にしかならない。
+/// 器が 1 イベントあたり複数行スクロールする実装（tmux 既定は 3 行 / 5 行）でも、
+/// 10000 行の履歴を数往復で走破できる大きさ
+pub const PROGRAMMATIC_WHEEL_MAX: i32 = 300;
 
 /// ホイールが PTY への書き込み（mouse reporting / alternate scroll の矢印変換）に
 /// なるモードか。`wheel_action` が `Write` を返す条件と 1:1 に保つこと

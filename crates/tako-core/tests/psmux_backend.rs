@@ -489,6 +489,234 @@ fn 明示コマンドつきの器が起動する() {
     let _ = f.backend.kill(&name);
 }
 
+// --- 役割 B の読み側（採取。#519） ---------------------------------------
+
+/// セッションの履歴が `want` 行を超えるまで待つ（並列テストの負荷でずれるので固定 sleep にしない）
+fn wait_for_history(f: &Fixture, name: &SessionRef, want: usize) -> usize {
+    let mut history = 0;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        history = f
+            .backend
+            .detached_capture()
+            .and_then(|c| c.history_probe(name))
+            .map(|p| p.history)
+            .unwrap_or(0);
+        if history >= want {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    history
+}
+
+/// **#519 の本命**: tako-app が保持していないセッションから画面と履歴を採れる。
+///
+/// 長い出力（200 行）と日本語の折返しを含めるのは、この経路が
+/// `orchestrator report` の材料そのものだから（CJK が壊れると報告が読めなくなる）。
+/// **psmux は `-J` を無視する**ので折返しは行のまま残る。中身が落ちないことを確かめる
+#[test]
+fn 保持していないセッションの画面と履歴を採れる() {
+    let f = fixture!("capture");
+    let name = session("tako-m2cap000001");
+    let (ok, out) = f.raw(&[
+        "new-session",
+        "-d",
+        "-s",
+        name.as_str(),
+        "-x",
+        "60",
+        "-y",
+        "20",
+    ]);
+    assert!(ok, "器を作れる: {out}");
+
+    let capture = f
+        .backend
+        .detached_capture()
+        .expect("psmux は採取の到達手段を持つ");
+    assert!(
+        f.backend.detached().is_none(),
+        "送出の到達手段は持たない（信頼できないものを申告しない）"
+    );
+
+    // シェルが入力を受けられるようになるまで待ってから流し込む
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        let screen = capture.capture_screen(&name).unwrap_or_default().join("\n");
+        if screen.contains(if cfg!(windows) { "PS " } else { "$" }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let long_output = if cfg!(windows) {
+        "1..200 | ForEach-Object { \"CAP-LINE-$_\" }"
+    } else {
+        "for i in $(seq 1 200); do echo CAP-LINE-$i; done"
+    };
+    let (ok, out) = f.raw(&["send-keys", "-t", name.as_str(), long_output, "Enter"]);
+    assert!(ok, "出力を積める: {out}");
+    let history = wait_for_history(&f, &name, 175);
+    assert!(history >= 175, "履歴が積まれている: {history}");
+
+    // 日本語の長行（幅 60 のペインなので必ず折り返す）。
+    // **非 ASCII を psmux の argv へ渡さない**（Windows のコンソール既定コードページで
+    // 化けるのは別件 #686 系の話で、ここで検証したいのは採取の側）ため、
+    // 文字はシェルにコードポイントから組み立てさせる
+    let jp = if cfg!(windows) {
+        "Write-Output ((-join ([char]0x3042,[char]0x3044,[char]0x3046,[char]0x3048,[char]0x304A)) * 24)"
+    } else {
+        "printf '\\u3042\\u3044\\u3046\\u3048\\u304a%.0s' $(seq 1 24); echo"
+    };
+    f.raw(&["send-keys", "-t", name.as_str(), jp, "Enter"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if capture
+            .capture_history_joined(&name, 400)
+            .unwrap_or_default()
+            .contains("あいうえお")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // 可視画面: 画面 1 枚ぶんだけが返る
+    let screen = capture.capture_screen(&name).expect("可視画面を採れる");
+    assert!(
+        (1..=25).contains(&screen.len()),
+        "可視画面はペイン 1 枚ぶん: {} 行",
+        screen.len()
+    );
+
+    // 履歴: `capture_history` は **履歴だけ**（`-E -1`）を返す。
+    // 末尾 20 行前後は可視画面に残っているのでここには出ない（tmux と同じ意味論で、
+    // `#{history_size}` の行数と 1:1 に保つため pane_log がこの形を要求する）
+    let lines = capture.capture_history(&name, 400).expect("履歴を採れる");
+    for needle in ["CAP-LINE-1", "CAP-LINE-100"] {
+        assert!(
+            lines.iter().any(|l| l.trim_end() == needle),
+            "{needle} が履歴に無い（採取が途中で切れている）"
+        );
+    }
+    assert!(
+        !lines.iter().any(|l| l.trim_end() == "CAP-LINE-200"),
+        "可視画面の行は履歴に混ざらない"
+    );
+
+    // 1 本のテキスト（report の第 1 層）: **履歴 + 可視画面**が端から端まで入る
+    let joined = capture
+        .capture_history_joined(&name, 400)
+        .expect("結合テキストを採れる");
+    assert!(joined.contains("CAP-LINE-1\n"), "履歴の先頭から入る");
+    assert!(joined.contains("CAP-LINE-200"), "可視画面の末尾まで入る");
+    // **日本語の折返し**: 幅 60 のペインで 120 文字（240 桁）ぶんを出しているので
+    // 必ず複数行に割れる。psmux は `-J` を無視するので割れたまま出るが、
+    // **中身は 1 文字も落ちない**ことをここで固定する
+    let jp_lines: Vec<&str> = joined
+        .lines()
+        .filter(|l| l.contains('あ') && !l.contains("Write-Output"))
+        .collect();
+    assert!(
+        jp_lines.len() >= 2,
+        "折返しが行として割れている（psmux は -J で結合しない）: {jp_lines:?}"
+    );
+    let jp_chars: usize = jp_lines
+        .iter()
+        .map(|l| l.chars().filter(|c| *c == 'あ').count())
+        .sum();
+    assert_eq!(
+        jp_chars, 24,
+        "日本語 24 回ぶんが折返しをまたいで全部入っている:\n{joined}"
+    );
+
+    // probe: 行数は取れる。`#{history_bytes}` は空なので bytes は 0 に倒れる
+    let probe = capture.history_probe(&name).expect("probe が返る");
+    assert!(probe.history >= 175, "履歴行数: {}", probe.history);
+    assert!(probe.limit > 0, "history-limit: {}", probe.limit);
+    assert!(!probe.alternate, "alt screen ではない");
+    assert_eq!(probe.bytes, 0, "psmux では観測できない（0 へ倒す）");
+
+    // 一括 probe にも同じセッションが載る（#369 の probe 一括化）
+    let batch = capture.history_probe_batch();
+    let found = batch
+        .iter()
+        .find(|(s, _)| *s == name)
+        .expect("一括 probe に載る");
+    assert!(found.1.history >= 175);
+
+    // スクロール位置（#687）: copy mode の外は 0 / 非モード
+    let scroll = capture.scroll_probe(&name).expect("位置を読める");
+    assert_eq!(scroll.position, 0, "copy mode の外は最下部");
+    assert!(!scroll.in_mode);
+    assert!(scroll.history >= 175);
+
+    let _ = f.backend.kill(&name);
+}
+
+/// **#687 の読み側**: 器を copy mode へ入れると `scroll_probe` がその位置を返す。
+///
+/// ここは器の CLI（`copy-mode` / `send-keys -X`）で位置を作るが、それは
+/// **テストが器を動かしているだけ**で、本番の tako は in-process の PTY へ
+/// ホイール報告を書く（読み取り専用の約束は `backend/psmux.rs` の番犬テストが守る）
+#[test]
+fn copy_mode_の位置を読み戻せる() {
+    let f = fixture!("scrollpos");
+    let name = session("tako-m2scr000001");
+    let (ok, out) = f.raw(&[
+        "new-session",
+        "-d",
+        "-s",
+        name.as_str(),
+        "-x",
+        "60",
+        "-y",
+        "20",
+    ]);
+    assert!(ok, "器を作れる: {out}");
+    let capture = f.backend.detached_capture().expect("採取の到達手段");
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        let screen = capture.capture_screen(&name).unwrap_or_default().join("\n");
+        if screen.contains(if cfg!(windows) { "PS " } else { "$" }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let long_output = if cfg!(windows) {
+        "1..150 | ForEach-Object { \"SCR-$_\" }"
+    } else {
+        "for i in $(seq 1 150); do echo SCR-$i; done"
+    };
+    f.raw(&["send-keys", "-t", name.as_str(), long_output, "Enter"]);
+    let history = wait_for_history(&f, &name, 125);
+    assert!(history >= 125, "履歴が積まれている: {history}");
+
+    f.raw(&["copy-mode", "-t", name.as_str()]);
+    for _ in 0..7 {
+        f.raw(&["send-keys", "-t", name.as_str(), "-X", "scroll-up"]);
+    }
+    let scrolled = capture.scroll_probe(&name).expect("位置を読める");
+    assert!(
+        scrolled.in_mode,
+        "copy mode に入っていることが読める: {scrolled:?}"
+    );
+    assert_eq!(
+        scrolled.position, 7,
+        "遡った行数がそのまま読める（tako はこれを応答の offset に載せる）"
+    );
+    assert!(scrolled.history >= 125);
+
+    // 抜ければ最下部へ戻る
+    f.raw(&["send-keys", "-t", name.as_str(), "-X", "cancel"]);
+    let back = capture.scroll_probe(&name).expect("位置を読める");
+    assert_eq!(back.position, 0);
+    assert!(!back.in_mode);
+
+    let _ = f.backend.kill(&name);
+}
+
 // --- 器の中のペインの品質（#659 / #686。いずれも Windows 固有） -----------------
 
 /// 器の中のシェルの pid が取れること。**#659 の要**で、これが取れないと
