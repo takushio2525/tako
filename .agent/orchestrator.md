@@ -182,7 +182,7 @@ master と worker で別々の claude アカウント（サブスク枠）を使
 `CLAUDE_CONFIG_DIR` であって、tako の設定ディレクトリではない）。
 
 ```yaml
-# accounts.yaml（登録は MCP の tako_orchestrator_accounts。action: list / show / add / remove）
+# accounts.yaml（操作は `tako account` / MCP tako_orchestrator_accounts）
 accounts:
   personal:
     config_dir: ~/.claude-personal   # CLAUDE_CONFIG_DIR に入る値
@@ -190,7 +190,16 @@ accounts:
   work:
     config_dir: ~/.claude-work
     default_model: claude-opus-4-6   # worker の model / effort フォールバック（任意）
+  default-login:
+    inherit: true                    # CLAUDE_CONFIG_DIR を「設定しない」（#512）
 ```
+
+**`inherit` は既定パスの明示と等価ではない**（#512）。claude は `CLAUDE_CONFIG_DIR` が
+**設定されているだけで**資格情報のエントリ名を分けるため、値が `~/.claude` でも
+既定ログインとは別アカウント扱いになる。「既定の資格情報を使う」は
+`config_dir: ~/.claude` ではなく `inherit: true` でしか表現できない。
+`inherit` のアカウントを選ぶと、起動コマンドは代入ではなく**明示 unset** を出す
+（direnv 等がシェル側で設定していても取り下げるため。空文字代入では駄目）。
 
 ```yaml
 # profiles/<name>.yaml
@@ -222,6 +231,42 @@ worker_account: work       # worker が使うアカウント（#504）
   注入の正は `injected_master_config_dir`、表示の正は `resolve_master_config_dir`
 - **設定ファイルの位置**: `CLAUDE_CONFIG_DIR` 指定時は `<config_dir>/.claude.json`、
   未指定時は `~/.claude.json`（`~/.claude/` の**隣**）。この非対称は claude CLI 側の仕様
+
+### アカウントを切り替える（`tako account`。Issue #709）
+
+一覧・ログイン・割り当てを 1 コマンド系統に束ねたもの。CLI と MCP
+（`tako_orchestrator_accounts`）は同じ dispatch を通るので表示が食い違わない。
+
+```bash
+# 一覧（ログイン状態 + ログインメール + 割り当て先プロファイル）
+tako account
+
+# 追加（別 config dir を持つアカウント / 既定の資格情報を使うアカウント）
+tako account add univ --config-dir ~/.claude-univ --description 大学アカウント
+tako account add default-login --inherit
+
+# ログイン（config dir が無ければ作り、そのアカウントで claude を起動するペインを開く）
+tako account login univ
+
+# 割り当て（--master 省略時は master。反映タイミングを表示する）
+tako account use univ                 # 次回の tako master / solo から
+tako account use personal --worker    # 次回 spawn から（起動済み worker は変わらない）
+tako account use univ --master --worker --profile side
+```
+
+- **ログイン状態は 3 値**: `logged_in`（`oauthAccount.emailAddress` が読めた）/
+  `logged_out`（config dir はあるが未ログイン）/ `missing`（config dir 自体が無い）。
+  `missing` と `logged_out` を分けるのは**次の一手が違う**ため（作るところからか、認証だけか）。
+  エントリ自体が壊れている場合は `invalid` + 直し方を返す（一覧で握り潰さない）
+- **login の挙動**: 未ログインなら claude 自身がログインを促すので何も送らない。
+  **すでにログイン済みの config dir を別アカウントへ切り替えるときだけ** `/login` を送る
+- **inherit のアカウントは login できない**: tako が作る config dir が無いため、
+  理由（既定ログインの切替は通常のターミナルで行う）を添えて断る
+- **削除時の警告**: まだプロファイルに割り当てられているアカウントを消すと
+  master 起動 / spawn が未登録キーで失敗するので、`remove` は使用箇所を添えて警告する
+- **GUI 導線**: コマンドパレット（⌘K / Ctrl+Shift+P）の「claude アカウントを切り替え」。
+  選ぶと default プロファイルの `master_account` に割り当て、一覧を出し直して
+  「(現在)」マークの移動で結果を示す（worker への割り当ては CLI / MCP から）
 
 ### CLI でプロファイルを管理する
 

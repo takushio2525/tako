@@ -778,20 +778,38 @@ pub enum Request {
         #[serde(default)]
         clear_worker_account: bool,
     },
-    /// オーケストレーター: アカウントレジストリの CRUD（Issue #504）。
-    /// action: list / show / add / remove
+    /// オーケストレーター: アカウントレジストリの操作（Issue #504 / #709）。
+    /// action: list / show / add / remove / use / login
     OrchestratorAccounts {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config_dir: Option<String>,
+        /// CLAUDE_CONFIG_DIR を設定しない（既定の資格情報を使う。#512）
+        #[serde(default)]
+        inherit: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_effort: Option<String>,
+        /// use: master へ割り当てる（#709）
+        #[serde(default)]
+        master: bool,
+        /// use: worker へ割り当てる（#709）
+        #[serde(default)]
+        worker: bool,
+        /// use: 対象プロファイル（省略時 default。#709）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// login: ペインを生やす基準ペイン（省略時は呼び出し元。#709）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// login: ペインを生やすタブ（#709）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
     },
     /// オーケストレーター: worker spawn のレイアウト設定の取得・変更（Issue #165）。
     /// 全パラメータ省略で現在値の取得、いずれか指定でその項目を更新して結果を返す。

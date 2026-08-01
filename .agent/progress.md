@@ -1688,3 +1688,23 @@
   実態へ直し doc 再生成。tako-control 836 passed / 失敗 11 件は baseline と同一
 - 次: macOS のコンパイルは未検証（`ring` が絡み Windows からクロスチェック不可）→ CI 待ち。
   実際に蓋を閉じての確認は manual-checks.md に手順を追加
+
+## 2026-08-01（#709: claude ログインアカウントの高速切替）
+
+- 部品（accounts.yaml #504 / ログイン状態読み取り #653 / master_account・worker_account）は
+  揃っていたが**束ねる導線が無かった**（ログイン状態は読めるのに一覧に出ず、割り当ては
+  `profiles set --master-account` と長く、config dir 作成と `/login` は完全に手作業）。
+  `tako account`（list / add / remove / show / login / use）へ 1 本化。MCP は**新ツールを
+  増やさず** `tako_orchestrator_accounts` に action を足して 1:1 を保つ
+- 着手前に **main のアカウントモデル（#512 / #543）だけ先に移植**した。この機のブランチは
+  `AccountEntry.config_dir: String` のままで「既定の資格情報を使う」を表現できず、
+  ログイン導線がまさにそこを踏み抜くため（claude は `CLAUDE_CONFIG_DIR` が**設定されている
+  だけで**資格情報エントリを分ける = 既定パスの明示は別アカウント扱いになる）。
+  `Option<String>` + `inherit` + `AccountConfigDir` + `EnvPlan`（代入と **unset** を区別）へ
+- ログイン状態は 3 値（`missing` / `logged_out` / `logged_in`）。`missing` を分けるのは
+  次の一手が「作るところから」か「認証だけ」かで変わるため。壊れたエントリは握り潰さず
+  `invalid` + 直し方を出す
+- 検証: 隔離 `TAKO_ORCHESTRATOR_DIR` + ダミー config dir で 4 状態を実測、割り当ての
+  profiles 書き込みと未登録キー・排他違反・破損 YAML のエラー、`inherit` が起動コマンドで
+  **unset** になること（代入に化けたら FAILED になるテスト）まで確認
+- 関連: PR（Closes #709）。tako-control +14 / tako-app +3 テスト。fmt / clippy は baseline と同一

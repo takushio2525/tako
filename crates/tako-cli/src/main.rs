@@ -194,6 +194,11 @@ enum Command {
         #[arg(long)]
         tab: bool,
     },
+    /// claude ログインアカウントの一覧・切替（引数なしで一覧。Issue #709）
+    Account {
+        #[command(subcommand)]
+        command: Option<AccountCommand>,
+    },
     /// オーケストレーター操作（projects / spawn / status / watch）
     #[command(subcommand)]
     Orchestrator(OrchestratorCommand),
@@ -1263,6 +1268,70 @@ enum VideoCommand {
     },
 }
 
+/// `tako account` — claude ログインアカウントの一覧・切替（Issue #709）。
+/// MCP `tako_orchestrator_accounts` と同じ dispatch 関数を呼ぶ
+/// （表示・検証を二重実装しない。#83 の教訓）
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// 一覧（ログイン状態 + 割り当て先つき。引数なしの `tako account` と同じ）
+    List,
+    /// 1 件の詳細
+    Show {
+        /// アカウント名
+        name: String,
+    },
+    /// アカウントの追加 / 更新
+    Add {
+        /// アカウント名
+        name: String,
+        /// CLAUDE_CONFIG_DIR に設定するパス（~ は $HOME に展開。--inherit と排他）
+        #[arg(long)]
+        config_dir: Option<String>,
+        /// CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。#512）
+        #[arg(long, conflicts_with = "config_dir")]
+        inherit: bool,
+        /// 説明
+        #[arg(long)]
+        description: Option<String>,
+        /// このアカウントの既定モデル（spawn で model 未指定時のフォールバック）
+        #[arg(long)]
+        default_model: Option<String>,
+        /// このアカウントの既定 effort
+        #[arg(long)]
+        default_effort: Option<String>,
+    },
+    /// アカウントの削除
+    Remove {
+        /// アカウント名
+        name: String,
+    },
+    /// master / worker への割り当てを切り替える（プロファイルを書き換える）
+    Use {
+        /// アカウント名
+        name: String,
+        /// master に割り当てる（既定。次回の tako master / solo 起動から反映）
+        #[arg(long)]
+        master: bool,
+        /// worker に割り当てる（次回 spawn から反映）
+        #[arg(long)]
+        worker: bool,
+        /// 対象プロファイル名（省略時 default）
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// そのアカウントで claude を起動するペインを開く（config dir が無ければ作る）
+    Login {
+        /// アカウント名
+        name: String,
+        /// 分割元ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// ペインを生やすタブ ID
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum OrchestratorCommand {
@@ -2329,6 +2398,7 @@ fn cli_main() -> ExitCode {
             tmux_session.as_deref(),
             timeout,
         ),
+        Command::Account { ref command } => account_cli(command.as_ref()),
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
@@ -3580,6 +3650,213 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             eprintln!("削除しました: {key}");
             Ok(())
         }
+    }
+}
+
+/// `tako account` — claude ログインアカウントの一覧・切替（Issue #709）。
+///
+/// `login` はペインを生やすので IPC 経由、それ以外は accounts.yaml / profiles の
+/// 読み書きだけなので dispatch を直接呼ぶ（tako アプリの起動は不要）。
+/// どちらの経路も MCP `tako_orchestrator_accounts` と同じ関数を通る
+fn account_cli(sub: Option<&AccountCommand>) -> Result<(), String> {
+    use tako_control::{dispatch_orchestrator_accounts, AccountParams};
+
+    // login だけは GUI のペイン操作が要るので IPC で本体へ送る
+    if let Some(AccountCommand::Login { name, pane, tab }) = sub {
+        let result = send_request(Request::OrchestratorAccounts {
+            action: "login".into(),
+            name: Some(name.clone()),
+            pane: pane.or_else(caller_pane),
+            tab: *tab,
+            config_dir: None,
+            inherit: false,
+            description: None,
+            default_model: None,
+            default_effort: None,
+            master: false,
+            worker: false,
+            profile: None,
+        })?;
+        print_account_login(&result);
+        return Ok(());
+    }
+
+    let params = match sub {
+        // 引数なしは list（最も簡単なコマンドを提案する原則。#322）
+        None | Some(AccountCommand::List) => AccountParams {
+            action: "list",
+            ..account_params_empty()
+        },
+        Some(AccountCommand::Show { name }) => AccountParams {
+            action: "show",
+            name: Some(name),
+            ..account_params_empty()
+        },
+        Some(AccountCommand::Add {
+            name,
+            config_dir,
+            inherit,
+            description,
+            default_model,
+            default_effort,
+        }) => AccountParams {
+            action: "add",
+            name: Some(name),
+            config_dir: config_dir.as_deref(),
+            inherit: *inherit,
+            description: description.as_deref(),
+            default_model: default_model.as_deref(),
+            default_effort: default_effort.as_deref(),
+            ..account_params_empty()
+        },
+        Some(AccountCommand::Remove { name }) => AccountParams {
+            action: "remove",
+            name: Some(name),
+            ..account_params_empty()
+        },
+        Some(AccountCommand::Use {
+            name,
+            master,
+            worker,
+            profile,
+        }) => AccountParams {
+            action: "use",
+            name: Some(name),
+            // どちらも省略なら master（一番よく使う操作を既定にする。#322）
+            master: *master || !*worker,
+            worker: *worker,
+            profile: profile.as_deref(),
+            ..account_params_empty()
+        },
+        Some(AccountCommand::Login { .. }) => unreachable!("login は上で処理済み"),
+    };
+
+    let is_list = params.action == "list";
+    // login 以外は host を触らないので origin は使われない（型を満たすためだけ）
+    let result = dispatch_orchestrator_accounts(None, tako_core::PaneOrigin::Cli, params)
+        .map_err(|e| e.to_string())?;
+
+    if is_list {
+        print_account_list(&result);
+    } else {
+        println!("{}", pretty_json(&result));
+        // 警告（既定 config dir の明示・割り当て残り）は見落とさないよう stderr にも出す
+        if let Some(w) = result.get("warning").and_then(|v| v.as_str()) {
+            eprintln!("{w}");
+        }
+        if let Some(applies) = result.get("applies_when").and_then(|v| v.as_array()) {
+            for line in applies.iter().filter_map(|v| v.as_str()) {
+                eprintln!("反映: {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `AccountParams` の空データ（`..` で埋めるための土台。Default を持たない借用構造体のため）
+fn account_params_empty() -> tako_control::AccountParams<'static> {
+    tako_control::AccountParams {
+        action: "list",
+        name: None,
+        config_dir: None,
+        inherit: false,
+        description: None,
+        default_model: None,
+        default_effort: None,
+        master: false,
+        worker: false,
+        profile: None,
+        pane: None,
+        tab: None,
+    }
+}
+
+/// 一覧を人が読める表で出す（機械可読が要るときは MCP / --json 相当の他コマンドを使う）
+fn print_account_list(result: &serde_json::Value) {
+    let accounts = result
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if accounts.is_empty() {
+        println!("登録済みアカウントはありません。");
+        println!("追加: tako account add <名前> --config-dir ~/.claude-<名前>");
+        return;
+    }
+    for a in accounts {
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+        // 状態は日本語で意味が分かる語にする（機械可読値は JSON 側にある）
+        let (label, detail) = match status {
+            "logged_in" => (
+                "ログイン済み",
+                a.get("email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "logged_out" => ("未ログイン", "tako account login で認証できます".into()),
+            "missing" => (
+                "config dir 未作成",
+                "tako account login で作成 + 認証できます".into(),
+            ),
+            _ => (
+                "設定エラー",
+                a.get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+        };
+        let mut assigned = Vec::new();
+        for (key, role) in [("master_of", "master"), ("worker_of", "worker")] {
+            let profiles: Vec<&str> = a
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|v| v.iter().filter_map(|p| p.as_str()).collect())
+                .unwrap_or_default();
+            if !profiles.is_empty() {
+                assigned.push(format!("{role}={}", profiles.join(",")));
+            }
+        }
+        let dir = if a.get("inherit").and_then(|v| v.as_bool()) == Some(true) {
+            "（既定の資格情報を使う）".to_string()
+        } else {
+            a.get("config_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string()
+        };
+        println!("{name}  [{label}] {detail}");
+        println!("    config_dir: {dir}");
+        if !assigned.is_empty() {
+            println!("    割り当て: {}", assigned.join(" / "));
+        }
+    }
+    println!();
+    println!("切替: tako account use <名前>            （master。次回の tako master から反映）");
+    println!("      tako account use <名前> --worker   （次回 spawn から反映）");
+    println!("ログイン: tako account login <名前>");
+}
+
+/// login の結果を人が読める形で出す（次にやることを明示する）
+fn print_account_login(result: &serde_json::Value) {
+    let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let dir = result
+        .get("config_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    println!("アカウント '{name}' のペインを開きました。");
+    if result.get("created").and_then(|v| v.as_bool()) == Some(true) {
+        println!("  config dir を作成しました: {dir}");
+    } else {
+        println!("  config dir: {dir}");
+    }
+    if let Some(pane) = result.get("pane_id").and_then(|v| v.as_u64()) {
+        println!("  ペイン: {pane}");
+    }
+    if let Some(next) = result.get("next_step").and_then(|v| v.as_str()) {
+        println!("  {next}");
     }
 }
 
@@ -5080,6 +5357,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
+        }
+        Command::Account { .. } => {
+            unreachable!("account は run() を通らない（account_cli が自前で dispatch / IPC する）")
         }
         Command::Orchestrator(OrchestratorCommand::Report { .. }) => {
             unreachable!("orchestrator report は run() を通らない")
@@ -6950,6 +7230,9 @@ mod platform_matrix_parity {
     /// 規則（`tako_` + コマンドパス）で解けない対応を明示する表。
     /// 前方一致で最長のものが勝つ
     const CLI_KEY_OVERRIDES: &[(&str, &str)] = &[
+        // #709: CLI は最短形の `tako account`（#322）、MCP は既存ツールを拡張したので
+        // `tako_orchestrator_accounts`（新ツールを増やさず action を足す方針）
+        ("account", "tako_orchestrator_accounts"),
         ("agents", "tako_agents_sync_rules"),
         ("autorename", "tako_auto_rename"),
         ("backgrounded", "tako_background_list"),

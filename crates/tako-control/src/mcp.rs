@@ -1443,20 +1443,35 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_accounts",
-            "description": "アカウントレジストリの管理（Issue #504）。名前つきアカウント（accounts.yaml）の CRUD。\
-                アカウントは config_dir（CLAUDE_CONFIG_DIR の値）と既定モデル/effort を持ち、\
-                spawn の account パラメータやプロファイルの master_account/worker_account で使う。\
-                action: list（全アカウント一覧）/ show（name 必須。1 件の詳細）/ \
-                add（name + config_dir 必須。追加または更新）/ remove（name 必須。削除）",
+            "description": "claude ログインアカウントの管理と切替（Issue #504 / #709）。\
+                名前つきアカウント（accounts.yaml）は config_dir（CLAUDE_CONFIG_DIR の値）と\
+                既定モデル/effort を持ち、spawn の account やプロファイルの\
+                master_account/worker_account で使う。\
+                action: list（一覧。ログイン状態 status = logged_in / logged_out / missing / invalid と\
+                ログインメール・割り当て先プロファイルつき）/ show（name 必須。1 件の詳細）/ \
+                add（name 必須 + config_dir か inherit のどちらか。追加または更新）/ \
+                remove（name 必須。削除。割り当てが残っていれば warning を返す）/ \
+                use（name + master / worker のどちらか必須。プロファイルの割り当てを切り替え、\
+                反映タイミングを applies_when で返す）/ \
+                login（name 必須。config dir が無ければ作り、そのアカウントで claude を\
+                起動するペインを生やす。ログイン済みなら /login を送って切替を促す）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "show", "add", "remove"], "description": "操作（list / show / add / remove）" },
-                    "name": { "type": "string", "description": "アカウント名（show / add / remove 時に必須）" },
-                    "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時に必須。~ は $HOME に展開される）" },
+                    "action": { "type": "string", "enum": ["list", "show", "add", "remove", "use", "login"], "description": "操作（list / show / add / remove / use / login）" },
+                    "name": { "type": "string", "description": "アカウント名（list 以外で必須）" },
+                    "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時。~ は $HOME に展開される。inherit と排他）" },
+                    "inherit": { "type": "boolean", "description": "CLAUDE_CONFIG_DIR を設定しない = 既定の資格情報を使う（add 時。config_dir と排他）。\
+                        claude は CLAUDE_CONFIG_DIR が設定されているだけで資格情報のエントリを分けるため、\
+                        既定ログインを使うアカウントは既定パスの明示ではなくこれで表す（#512）" },
                     "description": { "type": "string", "description": "アカウントの説明（add 時。任意）" },
                     "default_model": { "type": "string", "description": "このアカウントの既定モデル（add 時。任意。spawn で model 未指定時のフォールバック）" },
                     "default_effort": { "type": "string", "description": "このアカウントの既定 effort（add 時。任意）" },
+                    "master": { "type": "boolean", "description": "use 時: master_account に割り当てる（次回の tako master / solo 起動から反映）" },
+                    "worker": { "type": "boolean", "description": "use 時: worker_account に割り当てる（次回 spawn から反映。起動済み worker は変わらない）" },
+                    "profile": { "type": "string", "description": "use 時: 対象プロファイル名（省略時 default）" },
+                    "pane": { "type": "integer", "minimum": 0, "description": "login 時: 分割元ペイン ID（省略時は呼び出し元）" },
+                    "tab": { "type": "integer", "minimum": 0, "description": "login 時: ペインを生やすタブ ID（pane より優先度は低い）" },
                 },
                 "required": ["action"],
                 "additionalProperties": false,
@@ -3861,9 +3876,15 @@ fn build_request(
             action: str_arg(args, "action")?.ok_or("action を指定する")?,
             name: str_arg(args, "name")?,
             config_dir: str_arg(args, "config_dir")?,
+            inherit: bool_arg(args, "inherit")?.unwrap_or(false),
             description: str_arg(args, "description")?,
             default_model: str_arg(args, "default_model")?,
             default_effort: str_arg(args, "default_effort")?,
+            master: bool_arg(args, "master")?.unwrap_or(false),
+            worker: bool_arg(args, "worker")?.unwrap_or(false),
+            profile: str_arg(args, "profile")?,
+            pane: u64_arg(args, "pane")?,
+            tab: u64_arg(args, "tab")?,
         },
         "tako_orchestrator_layout" => Request::OrchestratorLayout {
             policy: str_arg(args, "policy")?,
