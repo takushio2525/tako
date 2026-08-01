@@ -5916,6 +5916,54 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// アカウント切替パレット（#709）。
+    /// 一覧の組み立ては dispatch と同じ経路（CLI / MCP と表示が食い違わない）
+    fn open_accounts_palette(&mut self, cx: &mut Context<Self>) {
+        let choices = match account_palette_choices() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warning: アカウント一覧の取得に失敗: {e}");
+                Vec::new()
+            }
+        };
+        self.command_palette = Some(CommandPalette {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::Accounts(choices),
+        });
+        cx.notify();
+    }
+
+    /// パレットで選ばれたアカウントを master へ割り当てる（#709）。
+    ///
+    /// 割り当て後はパレットを開いたまま一覧を作り直す。トースト機構が無いので、
+    /// 「(現在)」マークが移動することを結果の可視化に使う（Esc で閉じる）
+    fn apply_account_choice(&mut self, choice: AccountChoice, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch_orchestrator_accounts(
+            None,
+            tako_core::PaneOrigin::User,
+            tako_control::AccountParams {
+                action: "use",
+                name: Some(&choice.name),
+                config_dir: None,
+                inherit: false,
+                description: None,
+                default_model: None,
+                default_effort: None,
+                // パレットからの切替は master（一番よく使う操作。worker は CLI / MCP で）
+                master: true,
+                worker: false,
+                profile: None,
+                pane: None,
+                tab: None,
+            },
+        );
+        if let Err(e) = result {
+            eprintln!("warning: アカウント切替に失敗: {e}");
+        }
+        self.open_accounts_palette(cx);
+    }
+
     /// コマンドパレットの候補（#217。query の部分一致で絞り込み済み）
     fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
         let q = query.to_lowercase();
@@ -5941,6 +5989,20 @@ impl TakoApp {
                     let items: Vec<PaletteItem> = entries
                         .iter()
                         .map(|e| PaletteItem::Recent(e.clone()))
+                        .collect();
+                    return if q.is_empty() {
+                        items
+                    } else {
+                        items
+                            .into_iter()
+                            .filter(|item| item.label().to_lowercase().contains(&q))
+                            .collect()
+                    };
+                }
+                PaletteMode::Accounts(choices) => {
+                    let items: Vec<PaletteItem> = choices
+                        .iter()
+                        .map(|a| PaletteItem::Account(a.clone()))
                         .collect();
                     return if q.is_empty() {
                         items
@@ -6006,6 +6068,7 @@ impl TakoApp {
             "panel-git",
             "split-right",
             "split-down",
+            "switch-account",
         ];
         for id in COMMANDS {
             items.push(PaletteItem::Command(
@@ -6084,6 +6147,8 @@ impl TakoApp {
                 "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
                 "split-right" => self.split(SplitDirection::Right, cx),
                 "split-down" => self.split(SplitDirection::Down, cx),
+                // #709: サブモードへ入り直す（アカウント一覧を出す）
+                "switch-account" => self.open_accounts_palette(cx),
                 _ => {}
             },
             PaletteItem::SshHost(host) => {
@@ -6091,6 +6156,9 @@ impl TakoApp {
             }
             PaletteItem::Recent(entry) => {
                 self.open_recent_entry(entry, cx);
+            }
+            PaletteItem::Account(choice) => {
+                self.apply_account_choice(choice, cx);
             }
         }
     }
@@ -15118,6 +15186,19 @@ enum PaletteMode {
     Normal,
     SshHost(Vec<tako_core::ssh_config::SshHost>),
     RecentItems(Vec<tako_core::recent::RecentEntry>),
+    /// アカウント切替（#709）。選ぶと master へ割り当てる
+    Accounts(Vec<AccountChoice>),
+}
+
+/// パレットに出すアカウント 1 件（#709）。
+/// dispatch の応答から必要な分だけ抜き出した表示用のデータ
+#[derive(Clone)]
+pub(crate) struct AccountChoice {
+    pub name: String,
+    /// 状態の表示ラベル（ログイン済みならメール）
+    pub detail: String,
+    /// 既に master に割り当て済みか（現在値を示す）
+    pub is_current_master: bool,
 }
 
 /// コマンドパレットの候補 1 件（#217）
@@ -15130,6 +15211,8 @@ enum PaletteItem {
     SshHost(tako_core::ssh_config::SshHost),
     /// Recent エントリ
     Recent(tako_core::recent::RecentEntry),
+    /// アカウント切替の候補（#709）
+    Account(AccountChoice),
 }
 
 impl PaletteItem {
@@ -15155,8 +15238,78 @@ impl PaletteItem {
                 };
                 format!("[{prefix}] {}", e.label())
             }
+            PaletteItem::Account(a) => {
+                // 現在 master に割り当て済みのものが一目で分かるようにする
+                let mark = if a.is_current_master { " (現在)" } else { "" };
+                format!("{}{mark}  {}", a.name, a.detail)
+            }
         }
     }
+}
+
+/// アカウント切替パレットの候補を作る（#709）。
+/// 一覧の取得は dispatch 経由なので、CLI / MCP と状態判定が食い違わない
+fn account_palette_choices() -> Result<Vec<AccountChoice>, String> {
+    let result = tako_control::dispatch_orchestrator_accounts(
+        None,
+        tako_core::PaneOrigin::User,
+        tako_control::AccountParams {
+            action: "list",
+            name: None,
+            config_dir: None,
+            inherit: false,
+            description: None,
+            default_model: None,
+            default_effort: None,
+            master: false,
+            worker: false,
+            profile: None,
+            pane: None,
+            tab: None,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(account_choices_from(&result))
+}
+
+/// dispatch の list 応答を表示用の候補へ落とす（純関数。表示文言のテストが書ける）
+fn account_choices_from(result: &serde_json::Value) -> Vec<AccountChoice> {
+    result
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|a| {
+            let name = a
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let detail = match status {
+                "logged_in" => a
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                "logged_out" => crate::ui_text::palette::account_logged_out().to_string(),
+                "missing" => crate::ui_text::palette::account_missing().to_string(),
+                _ => crate::ui_text::palette::account_invalid().to_string(),
+            };
+            // default プロファイルの master に割り当て済みかを現在値として示す
+            let is_current_master = a
+                .get("master_of")
+                .and_then(|v| v.as_array())
+                .map(|v| v.iter().any(|p| p.as_str() == Some("default")))
+                .unwrap_or(false);
+            AccountChoice {
+                name,
+                detail,
+                is_current_master,
+            }
+        })
+        .collect()
 }
 
 /// ペインのテキスト領域（枠・パディング・タイトルバーの内側）を求める（#647 で共通化）。
@@ -26237,6 +26390,72 @@ mod app_menu_tests {
 ///
 /// #610 でターミナル本文の行 div は直したが、IME オーバーレイは取りこぼしていた。
 /// 直す前は本文側も同じだけずれていたので相対ずれが見えず、#610 の後に顕在化した。
+/// アカウント切替パレット（#709）の表示ロジック。
+/// dispatch の応答 JSON → 候補の写像だけを見る（GUI 不要で回る）
+#[cfg(test)]
+mod account_palette_tests {
+    use super::{account_choices_from, AccountChoice, PaletteItem};
+    use serde_json::json;
+
+    fn label_of(choice: &AccountChoice) -> String {
+        PaletteItem::Account(choice.clone()).label()
+    }
+
+    #[test]
+    fn ログイン状態が候補の説明に出る() {
+        let result = json!({
+            "accounts": [
+                {
+                    "name": "personal",
+                    "status": "logged_in",
+                    "email": "user@example.com",
+                    "master_of": ["default"],
+                    "worker_of": [],
+                },
+                { "name": "univ", "status": "logged_out", "master_of": [], "worker_of": [] },
+                { "name": "fresh", "status": "missing", "master_of": [], "worker_of": [] },
+                { "name": "broken", "status": "invalid", "master_of": [], "worker_of": [] },
+            ]
+        });
+        let choices = account_choices_from(&result);
+        assert_eq!(choices.len(), 4);
+
+        // ログイン済みはメールが出る（アカウントの見分けが付く）
+        assert_eq!(choices[0].detail, "user@example.com");
+        // default プロファイルの master に付いているものだけ「現在」扱い
+        assert!(choices[0].is_current_master);
+        assert!(label_of(&choices[0]).contains("(現在)"));
+
+        // 3 状態がそれぞれ別の説明になる（一覧で次の一手が分かる）
+        assert!(!choices[1].detail.is_empty());
+        assert!(!choices[2].detail.is_empty());
+        assert_ne!(choices[1].detail, choices[2].detail);
+        assert!(!choices[1].is_current_master);
+        assert!(!label_of(&choices[1]).contains("(現在)"));
+        assert!(!choices[3].detail.is_empty());
+    }
+
+    #[test]
+    fn 空の応答でも壊れない() {
+        assert!(account_choices_from(&json!({})).is_empty());
+        assert!(account_choices_from(&json!({ "accounts": [] })).is_empty());
+    }
+
+    /// 別プロファイルの master 割り当ては「現在」にしない
+    /// （パレットは default プロファイルを操作するため）
+    #[test]
+    fn 別プロファイルの割り当ては現在扱いしない() {
+        let result = json!({
+            "accounts": [
+                { "name": "univ", "status": "logged_in", "email": "a@example.com",
+                  "master_of": ["side"], "worker_of": [] },
+            ]
+        });
+        let choices = account_choices_from(&result);
+        assert!(!choices[0].is_current_master);
+    }
+}
+
 #[cfg(test)]
 mod ime_overlay_metrics_tests {
     /// GPUI 既定の行高係数（`gpui/src/geometry.rs` の `phi()`）

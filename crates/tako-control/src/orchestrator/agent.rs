@@ -83,6 +83,9 @@ pub struct WorkerLaunch<'a> {
     /// プロファイルの env（展開済み）。コマンド先頭で `export K=V;` として注入し、
     /// direnv が同変数を設定していても明示値が勝つようにする（Issue #500）
     pub env: &'a [(String, String)],
+    /// 明示的に**未設定へ戻す**変数（`inherit` のアカウントで `CLAUDE_CONFIG_DIR` を
+    /// 取り下げる。空文字代入では駄目なので unset する。Issue #512）
+    pub env_unsets: &'a [String],
 }
 
 /// worker 起動用のシェルコマンドを組み立てる。
@@ -92,6 +95,10 @@ pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
     // プロファイル env をコマンド先頭で設定する。ログインシェルが direnv で
     // 同変数を設定していても、明示の代入が後勝ちで上書きする（Issue #500）
     let mut cmd = String::new();
+    // 先に unset してから代入する（inherit のアカウントで direnv 等の設定を取り下げる。#512）
+    for k in launch.env_unsets {
+        cmd.push_str(&env_unset(k));
+    }
     if !launch.env.is_empty() {
         for (k, v) in launch.env {
             cmd.push_str(&env_assign(k, v));

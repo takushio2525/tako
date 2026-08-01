@@ -4,34 +4,27 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-07-27 夜・Windows 実機開発 — テスター配布直前）
+## 現在の対象（2026-08-01・Windows 実機 — #709 アカウント高速切替）
 
-**PR #588**（`windows/467-ipc-orchestration-local`、34 コミット）が open。Windows 実機での
-1 日集中開発の成果一式。マージ → 初回 Windows リリース（インストーラー配布）目前。
+`windows/709-account-switch`（`windows/467-ipc-orchestration-local` から分岐）で
+claude ログインアカウントの切替導線を実装中。
 
-入っているもの（詳細は各 Issue の実測証拠コメント）:
-- 修正: Alt+meta エンコード #575 / タブバーボタンクリック #576 / IME 半行ずれ #582 /
-  ショートカット 45 本 #585 / 起動時コンソール窓 #586 / 更新通知の 404 死 #528 /
-  worker 状態検知の全滅 #592 / **setup のコマンド検出全滅 #525**（`$SHELL` 直呼びで
-  claude / git が導入済みでも exit 1 だった。抽象境界 B16 `platform::exe` で根治。
-  MCP 自動登録も同根で成立 → `tako_setup_mcp` は supported へ）
-- 機能: ウィンドウコントロール + Snap Layouts #584 / 永続化 M1+M2（**psmux 採用**、
-  自作 winmux は中止）#518 #519 / Inno インストーラー + ローカルリリース #587 /
-  アプリアイコン埋め込み #587 / doc の Windows 導線 + 対応状況ページ #528 #591 /
-  対応マトリクス棚卸し（supported 1→89）#591 / CRT 静的リンク
-- リリースは **GitHub Actions 不使用**（ユーザー決定）。`installer/windows/release-windows.ps1`
-  でこの Windows 機からローカル実行
+- `tako account`（list / add / remove / show / login / use）を新設。MCP は新ツールを増やさず
+  `tako_orchestrator_accounts` に action を足して 1:1 を保つ
+- 着手前に **main のアカウントモデル #512 / #543 だけ先に移植**した（`config_dir: Option<String>`
+  + `inherit` + `AccountConfigDir` + `EnvPlan`）。claude は `CLAUDE_CONFIG_DIR` が**設定されて
+  いるだけで**資格情報エントリを分けるので、「既定の資格情報を使う」は既定パスの明示ではなく
+  **未設定**でしか表現できない。ログイン導線はここを踏み抜くため先に土台を揃える必要があった
+- ログイン状態は 3 値（`missing` / `logged_out` / `logged_in`）+ 壊れたエントリの `invalid`
+- GUI 導線は ⌘K パレットの「claude アカウントを切り替え」（default プロファイルの master へ割り当て）
 
 ## 次の一手
 
-1. PR #588 マージ（マージで doc サイトが Cloudflare Pages へ自動デプロイ）
-2. `release-windows.ps1 -Upload` で v0.5.12 Release に Windows アセット 2 点添付
-3. ユーザーがインストーラーで乗り換え（インストーラーテスト兼用）→ 実機確認
-   （IME 位置 / Alt+V / ウィンドウコントロール / Ctrl+Shift+T / コンソール非表示 / アイコン / psmux 復元）
-4. **#623 の実機確認（未決）**: 日本語入力の打鍵消失は**まだ直った確証が無い**。
-   潜在欠陥（描画のたびに IME を強制確定しうる経路）は塞いだが実測では一度も発火せず、
-   合成入力でも再現できなかった。症状が出たら
-   `TAKO_IME_DIAG=1 TAKO_PERF_LOG=<path>` で採取し #623 のコメント §5 で切り分ける
+1. `login` の実機確認（隔離 GUI でペイン生成 → claude 起動 → `/login` 到達まで）
+2. PR 作成（Closes #709）→ CI 緑 → squash merge
+3. マージ後に **main とのアカウントモデル統合**: main には CLI `tako orchestrator accounts`
+   （#548/#556）が別途あるので、両方の CLI パスを同じ dispatch へ向ける（ロジックは二重化しない）。
+   master への account 適用も本ブランチ #653 と main #555 が独立実装で衝突する既知の債務
 
 ## mac 側 master への引き継ぎ（マージ後に要対応）
 

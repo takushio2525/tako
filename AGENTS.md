@@ -93,6 +93,7 @@ tako/
 | **worker のダイアログに答える（#319/#662）** | `tako orchestrator respond --pane <N> --answer <値>...`（質問ごとに 1 回。番号 or ラベル前方一致、multiSelect はカンマ区切り、`質問=選択肢` で明示指定。`--dry-run` で確認画面まで。承認ダイアログは `--choice`。送信前に確認画面を照合し不一致なら送らない。MCP `tako_orchestrator_respond` と 1:1） |
 | **ペインへ特殊キーを送る（#662）** | `tako keys --pane <N> <キー名>...`（`enter` / `escape` / `tab` / 矢印 / `ctrl-<英字>` / 1 文字リテラル。送達確認ループを通らない生キー送出。MCP `tako_send_keys` と 1:1） |
 | オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
+| **claude アカウントの一覧・切替（#709）** | `tako account`（一覧。ログイン状態 + メール + 割り当て先）/ `add <key> --config-dir <path>`（既定の資格情報を使うなら `--inherit`。#512）/ `login <key>`（config dir を作り claude 起動ペインを開く）/ `use <key> [--master] [--worker] [--profile p]`（既定は master。反映タイミングを表示）。GUI は ⌘K パレットの「claude アカウントを切り替え」。MCP `tako_orchestrator_accounts` と 1:1 |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved\|legacy] [--master-ratio 0.5] [--algorithm grid\|spiral]`（全省略で現在値表示。#165） |
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |

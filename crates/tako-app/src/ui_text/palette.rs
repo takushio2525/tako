@@ -7,6 +7,18 @@ pub fn no_match() -> &'static str {
     tr!("該当なし", "No matches")
 }
 
+// --- アカウント切替（#709。キー: palette.account_*） ---
+
+pub fn account_logged_out() -> &'static str {
+    tr!("未ログイン", "Not logged in")
+}
+pub fn account_missing() -> &'static str {
+    tr!("config dir 未作成", "Config dir not created")
+}
+pub fn account_invalid() -> &'static str {
+    tr!("設定エラー", "Invalid entry")
+}
+
 /// 固定コマンドの表示ラベル（キー: palette.cmd_<id>）
 pub fn cmd_label(id: &str) -> &'static str {
     match id {
@@ -19,6 +31,7 @@ pub fn cmd_label(id: &str) -> &'static str {
         "panel-git" => tr!("git パネルを開く", "Open git panel"),
         "split-right" => tr!("ペインを右に分割", "Split pane right"),
         "split-down" => tr!("ペインを下に分割", "Split pane down"),
+        "switch-account" => tr!("claude アカウントを切り替え", "Switch claude account"),
         // 言語切替は両言語でネイティブ表記を併記（切替先を字面で探せるように）。
         // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外
         "toggle-language" => tr!(
@@ -49,6 +62,10 @@ mod tests {
                 cmd_label("panel-git").to_string(),
                 cmd_label("split-right").to_string(),
                 cmd_label("split-down").to_string(),
+                cmd_label("switch-account").to_string(),
+                account_logged_out().to_string(),
+                account_missing().to_string(),
+                account_invalid().to_string(),
                 // toggle-language は意図的にネイティブ表記併記のため対象外（上記コメント）
             ]
         });

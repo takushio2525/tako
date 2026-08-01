@@ -2463,16 +2463,32 @@ fn dispatch_inner(
             action,
             name,
             config_dir,
+            inherit,
             description,
             default_model,
             default_effort,
+            master,
+            worker,
+            profile,
+            pane,
+            tab,
         } => dispatch_orchestrator_accounts(
-            &action,
-            name.as_deref(),
-            config_dir.as_deref(),
-            description.as_deref(),
-            default_model.as_deref(),
-            default_effort.as_deref(),
+            Some(host),
+            origin,
+            AccountParams {
+                action: &action,
+                name: name.as_deref(),
+                config_dir: config_dir.as_deref(),
+                inherit,
+                description: description.as_deref(),
+                default_model: default_model.as_deref(),
+                default_effort: default_effort.as_deref(),
+                master,
+                worker,
+                profile: profile.as_deref(),
+                pane,
+                tab,
+            },
         ),
 
         Request::OrchestratorLayout {
@@ -4795,52 +4811,122 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
 
 /// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
 /// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
-/// アカウントレジストリの CRUD（Issue #504）
-fn dispatch_orchestrator_accounts(
-    action: &str,
-    name: Option<&str>,
-    config_dir: Option<&str>,
-    description: Option<&str>,
-    default_model: Option<&str>,
-    default_effort: Option<&str>,
+/// アカウント操作のパラメータ（Request と 1:1。Issue #504 / #709）
+pub struct AccountParams<'a> {
+    pub action: &'a str,
+    pub name: Option<&'a str>,
+    pub config_dir: Option<&'a str>,
+    /// `CLAUDE_CONFIG_DIR` を設定しない（既定の資格情報を使う。#512）
+    pub inherit: bool,
+    pub description: Option<&'a str>,
+    pub default_model: Option<&'a str>,
+    pub default_effort: Option<&'a str>,
+    /// `use` の割り当て先: master
+    pub master: bool,
+    /// `use` の割り当て先: worker
+    pub worker: bool,
+    /// `use` の対象プロファイル（省略時 default）
+    pub profile: Option<&'a str>,
+    /// `login` でペインを生やす基準（省略時は呼び出し元ペイン）
+    pub pane: Option<u64>,
+    pub tab: Option<u64>,
+}
+
+/// アカウント 1 件の JSON 表現（一覧・詳細で同じ形にする）
+fn account_view_json(view: &crate::orchestrator::accounts::AccountView) -> Value {
+    json!({
+        "name": view.name,
+        "config_dir": view.config_dir,
+        "inherit": view.inherit,
+        "description": view.description,
+        "default_model": view.default_model,
+        "default_effort": view.default_effort,
+        "status": view.status.as_str(),
+        "email": view.status.email(),
+        "error": match &view.status {
+            crate::orchestrator::accounts::AccountStatus::Invalid { error } => Some(error.clone()),
+            _ => None,
+        },
+        "master_of": view.master_of,
+        "worker_of": view.worker_of,
+    })
+}
+
+/// アカウントレジストリの操作（Issue #504 / #709）。
+///
+/// `login` 以外は accounts.yaml / profiles の読み書きだけで完結するので host 非依存。
+/// CLI `tako account` と MCP `tako_orchestrator_accounts` が同じ関数を呼ぶ
+/// （表示・検証を二重実装しない。#83 の教訓）
+pub fn dispatch_orchestrator_accounts(
+    host: Option<&mut dyn ControlHost>,
+    origin: PaneOrigin,
+    params: AccountParams<'_>,
 ) -> Result<Value, DispatchError> {
-    use crate::orchestrator;
+    use crate::orchestrator::{self, accounts as acct};
+    let AccountParams {
+        action,
+        name,
+        config_dir,
+        inherit,
+        description,
+        default_model,
+        default_effort,
+        master,
+        worker,
+        profile,
+        pane,
+        tab,
+    } = params;
+
     match action {
         "list" => {
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
-            let accounts: Vec<Value> = config
-                .list_resolved()
-                .into_iter()
-                .map(|a| {
-                    json!({
-                        "name": a.name,
-                        "config_dir": a.config_dir,
-                        "description": a.description,
-                        "default_model": a.default_model,
-                        "default_effort": a.default_effort,
-                    })
-                })
-                .collect();
-            Ok(json!({ "accounts": accounts }))
+            let views = acct::collect_views(&config);
+            Ok(json!({
+                "accounts": views.iter().map(account_view_json).collect::<Vec<_>>(),
+            }))
         }
         "show" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
-            let a = config.resolve(name).map_err(DispatchError::Operation)?;
-            Ok(json!({
-                "name": a.name,
-                "config_dir": a.config_dir,
-                "description": a.description,
-                "default_model": a.default_model,
-                "default_effort": a.default_effort,
-            }))
+            if !config.accounts.contains_key(name) {
+                return Err(DispatchError::Operation(format!(
+                    "アカウント '{name}' が accounts.yaml に見つからない"
+                )));
+            }
+            let view = acct::collect_views(&config)
+                .into_iter()
+                .find(|v| v.name == name)
+                .expect("直前に存在確認済み");
+            Ok(account_view_json(&view))
         }
         "add" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
-            let cd =
-                config_dir.ok_or(DispatchError::InvalidParams("config_dir を指定する".into()))?;
+            // #512: config_dir と inherit は排他。どちらも無いと解決できない
+            if inherit && config_dir.is_some() {
+                return Err(DispatchError::InvalidParams(
+                    "config_dir と inherit は同時に指定できない（既定の資格情報を使うなら inherit のみ）"
+                        .into(),
+                ));
+            }
+            if !inherit && config_dir.is_none() {
+                return Err(DispatchError::InvalidParams(
+                    "config_dir を指定する（既定の資格情報を使うなら inherit: true）".into(),
+                ));
+            }
+            // #512: 既定パスの明示は「別アカウント扱い」になる罠なので警告する
+            let warning = config_dir
+                .filter(|d| orchestrator::is_claude_default_config_dir(d))
+                .map(|d| {
+                    format!(
+                        "警告: {d} は claude の既定 config ディレクトリです。\
+                         明示指定すると既定ログインとは別の資格情報エントリになります。\
+                         既定のログインを使いたい場合は inherit を指定してください（#512）"
+                    )
+                });
             let entry = orchestrator::AccountEntry {
-                config_dir: cd.to_string(),
+                config_dir: config_dir.map(str::to_string),
+                inherit,
                 description: description.map(str::to_string),
                 default_model: default_model.map(str::to_string),
                 default_effort: default_effort.map(str::to_string),
@@ -4850,33 +4936,224 @@ fn dispatch_orchestrator_accounts(
             })
             .map_err(DispatchError::Operation)?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
-            let a = config.resolve(name).map_err(DispatchError::Operation)?;
-            Ok(json!({
-                "name": a.name,
-                "config_dir": a.config_dir,
-                "description": a.description,
-                "default_model": a.default_model,
-                "default_effort": a.default_effort,
-            }))
+            let view = acct::collect_views(&config)
+                .into_iter()
+                .find(|v| v.name == name)
+                .ok_or_else(|| DispatchError::Operation("追加直後の読み直しに失敗".into()))?;
+            let mut out = account_view_json(&view);
+            if let (Some(obj), Some(w)) = (out.as_object_mut(), warning) {
+                obj.insert("warning".into(), json!(w));
+            }
+            Ok(out)
         }
         "remove" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            // 割り当て済みのまま消すと master / worker の起動が未登録キーで失敗するので、
+            // 消す前に使用箇所を数えて応答へ載せる（#709）
+            let assignments = acct::load_profile_assignments();
+            let (master_of, worker_of) = acct::assignments_for(name, &assignments);
             let removed = orchestrator::AccountsConfig::mutate(|config| {
                 config.accounts.remove(name).is_some()
             })
             .map_err(DispatchError::Operation)?;
-            if removed {
-                Ok(json!({ "removed": name }))
-            } else {
-                Err(DispatchError::Operation(format!(
+            if !removed {
+                return Err(DispatchError::Operation(format!(
                     "アカウント '{name}' は登録されていない"
-                )))
+                )));
             }
+            let mut out = json!({ "removed": name });
+            if !master_of.is_empty() || !worker_of.is_empty() {
+                out.as_object_mut().expect("object").insert(
+                    "warning".into(),
+                    json!(format!(
+                        "このアカウントはまだプロファイルに割り当てられています\
+                         （master: {}, worker: {}）。該当プロファイルの割り当てを解除しないと、\
+                         master 起動 / worker spawn が未登録キーで失敗します",
+                        if master_of.is_empty() {
+                            "-".into()
+                        } else {
+                            master_of.join(", ")
+                        },
+                        if worker_of.is_empty() {
+                            "-".into()
+                        } else {
+                            worker_of.join(", ")
+                        },
+                    )),
+                );
+            }
+            Ok(out)
+        }
+        "use" => dispatch_account_use(name, profile, master, worker),
+        "login" => {
+            let host = host.ok_or_else(|| {
+                DispatchError::Operation(
+                    "login は tako の GUI が動いているときだけ使えます（ペインを生やすため）"
+                        .into(),
+                )
+            })?;
+            dispatch_account_login(host, origin, name, pane, tab)
         }
         other => Err(DispatchError::InvalidParams(format!(
-            "action が不正: {other}（list / show / add / remove）"
+            "action が不正: {other}（list / show / add / remove / use / login）"
         ))),
     }
+}
+
+/// `use` — プロファイルの master_account / worker_account を書き換える（Issue #709）
+fn dispatch_account_use(
+    name: Option<&str>,
+    profile: Option<&str>,
+    master: bool,
+    worker: bool,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator::{self, accounts as acct};
+
+    let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+    let roles = acct::AssignRoles { master, worker };
+    if roles.is_empty() {
+        return Err(DispatchError::InvalidParams(
+            "割り当て先を指定する（master / worker の少なくとも一方）".into(),
+        ));
+    }
+    let profile_name = profile.unwrap_or("default");
+
+    // 書き込む前に必ず解決する（未登録キーや壊れたエントリを profiles へ書かない）
+    let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+    let resolved = config
+        .resolve(name)
+        .map_err(|e| DispatchError::Operation(format!("{e}（{}）", config.known_names_hint())))?;
+
+    orchestrator::Profile::mutate_named(profile_name, |p| {
+        if master {
+            p.master_account = Some(name.to_string());
+        }
+        if worker {
+            p.worker_account = Some(name.to_string());
+        }
+    })
+    .map_err(DispatchError::Operation)?;
+
+    let status = acct::probe_status(resolved.config_dir.path());
+    Ok(json!({
+        "name": name,
+        "profile": profile_name,
+        "master": master,
+        "worker": worker,
+        "config_dir": resolved.config_dir.path(),
+        "inherit": resolved.config_dir.is_inherit(),
+        "status": status.as_str(),
+        "email": status.email(),
+        "applies_when": roles.applies_when(),
+    }))
+}
+
+/// `login` — config dir を用意し、そのアカウントで claude を起動するペインを生やす（Issue #709）
+fn dispatch_account_login(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    name: Option<&str>,
+    pane: Option<u64>,
+    tab: Option<u64>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator::{self, accounts as acct};
+
+    let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+    let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+    let resolved = config
+        .resolve(name)
+        .map_err(|e| DispatchError::Operation(format!("{e}（{}）", config.known_names_hint())))?;
+    // inherit のアカウントは tako が作る config dir が無い（理由つきで断る）
+    let plan = acct::login_plan(&resolved).map_err(DispatchError::Operation)?;
+
+    let status_before = acct::probe_status(Some(&plan.config_dir));
+    if plan.needs_create {
+        std::fs::create_dir_all(&plan.config_dir).map_err(|e| {
+            DispatchError::Operation(format!(
+                "config ディレクトリの作成に失敗: {} ({e})",
+                plan.config_dir
+            ))
+        })?;
+    }
+
+    // 分割先の解決（tab 指定 > 呼び出し元ペイン）。git resolve（#496）と同じ方式
+    let (tab_id, split_target) = if let Some(raw_tab) = tab {
+        let tid = find_tab(host.workspace(), raw_tab)?;
+        let focused = host
+            .workspace()
+            .get_tab(tid)
+            .ok_or_else(|| op_err("タブが見つかりません"))?
+            .tree()
+            .focused();
+        (tid, focused)
+    } else {
+        resolve_pane(host.workspace(), pane)?
+    };
+
+    let new_pane = Pane::new(origin);
+    let new_id = new_pane.id();
+    let layout = crate::setup::spawn_layout_config();
+    tree_mut(host.workspace_mut(), tab_id)
+        .spawn_worker(split_target, new_pane, &layout)
+        .map_err(op_err)?;
+    // フォーカスは新しいペインへ移す（ユーザーがそのままログイン操作を続けるため）
+    let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+
+    host.attach_session(
+        new_id,
+        SpawnOptions {
+            command: None,
+            cwd: None,
+            env: vec![(
+                orchestrator::CLAUDE_CONFIG_DIR_ENV.to_string(),
+                plan.config_dir.clone(),
+            )],
+        },
+    );
+
+    // セッション env に加えてコマンド先頭でも代入する。ログインシェルの direnv 等が
+    // CLAUDE_CONFIG_DIR を設定してくる環境で後勝ちにするため（master / worker と同じ方針）
+    let mut command =
+        orchestrator::agent::env_assign(orchestrator::CLAUDE_CONFIG_DIR_ENV, &plan.config_dir);
+    command.push_str("claude");
+    host.queue_command_flow(new_id, command.clone());
+
+    // 未ログインなら claude 自身がログインを促すので何も送らない。
+    // すでにログイン済みの config dir を「別アカウントへ切り替える」ときだけ /login を送る
+    let sent_slash_command = status_before.is_logged_in();
+    if sent_slash_command {
+        host.queue_prompt_flow(new_id, acct::LOGIN_SLASH_COMMAND.to_string());
+    }
+
+    let title = format!("login: {name}");
+    let pane_obj = tree_mut(host.workspace_mut(), tab_id)
+        .get_mut(new_id)
+        .expect("直前に split で追加済み");
+    pane_obj.set_title(Some(title.clone()));
+    pane_obj.set_spawned_by(Some(split_target));
+
+    let tmux_session = host
+        .reserve_backend_session(new_id)
+        .or_else(|| host.backend_session(new_id));
+
+    Ok(json!({
+        "name": name,
+        "config_dir": plan.config_dir,
+        "created": plan.needs_create,
+        "status_before": status_before.as_str(),
+        "email_before": status_before.email(),
+        "pane_id": new_id.as_u64(),
+        "tab_id": tab_id.as_u64(),
+        "title": title,
+        "command": command,
+        "sent_slash_command": sent_slash_command,
+        "next_step": if sent_slash_command {
+            "ペインで /login の案内に従ってアカウントを切り替えてください"
+        } else {
+            "ペインで claude のログイン手順（ブラウザ認証）を完了してください"
+        },
+        "tmux_session": tmux_session,
+    }))
 }
 
 /// （二重実装を作らない。#83 の教訓）。
@@ -5502,6 +5779,7 @@ fn dispatch_orchestrator_handoff(
         skip_permissions: master_agent.default_skip_permissions(),
         extra_args: &launch.extra_args,
         env: &profile_env,
+        env_unsets: &[],
     });
 
     // 事前信頼
@@ -5619,6 +5897,7 @@ fn dispatch_git_resolve_agent(
         skip_permissions: launch.skip_permissions,
         extra_args: &launch.extra_args,
         env: &profile_env,
+        env_unsets: &[],
     });
 
     // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）
@@ -5778,7 +6057,8 @@ fn dispatch_orchestrator_spawn(
     } else {
         None
     };
-    let profile_env = profile.resolved_env_with_account(resolved_account.as_ref());
+    let env_plan = profile.resolved_env_with_account(resolved_account.as_ref());
+    let profile_env = env_plan.exports.clone();
 
     let worker_agent = profile
         .resolve_worker_agent(agent)
@@ -5841,6 +6121,8 @@ fn dispatch_orchestrator_spawn(
         skip_permissions: launch.skip_permissions,
         extra_args: &launch.extra_args,
         env: &profile_env,
+        // inherit のアカウントは CLAUDE_CONFIG_DIR を明示 unset する（#512）
+        env_unsets: &env_plan.unsets,
     });
 
     // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
@@ -6014,6 +6296,9 @@ fn dispatch_orchestrator_spawn(
         "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
         "env_keys": env_keys,
         "config_dir": config_dir_value,
+        // inherit のアカウントでは config_dir が null になるので、
+        // 「未設定に戻した」ことを別フィールドで示す（#512 / #709）
+        "env_unsets": env_plan.unsets,
         "account": account_name,
         // 起動保証（Issue #665）。この時点では「登録した」だけで、実際の到達段階は
         // 状態機械が進める。呼び出し側（MCP ハンドラスレッド / CLI プロセス）は

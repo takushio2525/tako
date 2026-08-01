@@ -88,7 +88,9 @@ pub fn claude_config_dirs() -> Vec<PathBuf> {
         .map(|a| {
             a.list_resolved()
                 .into_iter()
-                .map(|acct| acct.config_dir)
+                // 壊れたエントリと inherit（既定 config dir を使う）は走査先を増やさない。
+                // 既定 config dir は config_dirs_from が先頭に置く
+                .filter_map(|(_, resolved)| resolved.ok()?.config_dir.path().map(str::to_string))
                 .filter(|d| !d.trim().is_empty())
                 .collect()
         })
