@@ -494,11 +494,18 @@ fn starts_with_prompt(line: &str) -> bool {
 /// **入力欄が消えることはない**（最悪 1 行に縮退するだけ）。
 /// 番号付き選択ダイアログの選択カーソルはプロンプトではないので除外する（#530 と同じ判断）
 pub fn input_region_in_lines(lines: &[&str]) -> Option<InputRegion> {
+    // 走査の基準は「行数」ではなく**中身がある最後の行**。ビューポートを埋めない
+    // TUI（起動直後・出力が短いとき）では下端に空行が続き、行数基準だと
+    // 入力ボックスが走査範囲から丸ごと外れる（セルフテストで実測して直した）
+    let bottom = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)?;
     // 下端 24 行の中の**最後の**プロンプト行。会話ログ側の `❯` を拾わないための範囲制限。
     // フッター（区切り線 + モデル / ctx / モード行で最大 8 行）を挟んでも、入力が
     // 十数行に伸びたところまで届く幅にしてある（表示上限 8 行より広い）
-    let scan_from = lines.len().saturating_sub(24);
-    let prompt_row = (scan_from..lines.len())
+    let scan_from = bottom.saturating_sub(24);
+    let prompt_row = (scan_from..bottom)
         .rev()
         .find(|&i| starts_with_prompt(lines[i]))?;
     // 上へ: 一番近い罫線の 1 つ下が入力ボックスの先頭
@@ -508,7 +515,7 @@ pub fn input_region_in_lines(lines: &[&str]) -> Option<InputRegion> {
         .map(|i| i + 1)
         .unwrap_or(prompt_row);
     // 下へ: 一番近い罫線の手前が終端。罫線が無ければプロンプト行だけ
-    let end = (prompt_row + 1..lines.len())
+    let end = (prompt_row + 1..bottom)
         .find(|&i| is_frame_line(lines[i]))
         .unwrap_or(prompt_row + 1);
     Some(InputRegion {
@@ -934,6 +941,17 @@ mod tests {
         lines.extend(claude_bottom(&["❯ いまの入力"]));
         let r = region_of(&lines).expect("入力ボックスがある");
         assert_eq!(lines[r.prompt_row], "❯ いまの入力");
+    }
+
+    #[test]
+    fn 画面下端に空行が続いても入力ボックスを見つけられる() {
+        // ビューポートを埋めない TUI（起動直後・出力が短いとき）。
+        // 行数基準で下端 24 行を切ると入力ボックスごと走査範囲から外れる
+        let mut lines = claude_bottom(&["❯ こんにちは"]);
+        lines.extend((0..30).map(|_| String::new()));
+        let r = region_of(&lines).expect("空行の上にある入力ボックスを見つける");
+        assert_eq!(r.rows(), 1);
+        assert_eq!(lines[r.prompt_row], "❯ こんにちは");
     }
 
     #[test]
