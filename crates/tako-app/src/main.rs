@@ -21,6 +21,7 @@ mod file_icons;
 mod filetree;
 mod keybindings;
 mod md_view;
+mod open_files;
 mod overlays;
 mod preview;
 mod preview_render;
@@ -17231,7 +17232,18 @@ fn main() {
             cx.activate(true);
         }
     });
-    app.run(|cx: &mut App| {
+    // Finder の「このアプリケーションで開く」（FR-3.22 / #708）。macOS は対象を
+    // `application:openURLs:` で渡す。未起動から開かれたときはこのコールバックが
+    // `run` のクロージャより**先に**届き得るため、登録は run の前に置き、受け取りは
+    // channel へ積んで取りこぼさない（消費側は run の中で spawn する）
+    let (open_files_tx, mut open_files_rx) = unbounded::<Vec<std::path::PathBuf>>();
+    app.on_open_urls(move |urls| {
+        let paths = open_files::file_urls_to_paths(&urls);
+        if !paths.is_empty() {
+            let _ = open_files_tx.unbounded_send(paths);
+        }
+    });
+    app.run(move |cx: &mut App| {
         cx.bind_keys(key_bindings());
         cx.set_menus(app_menus());
         webview::install_key_monitor();
@@ -17309,6 +17321,16 @@ fn main() {
         };
         let window = open_primary_window(window_bounds, cx);
         cx.activate(true);
+
+        // Finder から渡されたファイルの消費側（#708）。ここへ来る時点で
+        // `TakoApp::new` の復元は同期的に終わっている = タブ・ペインが揃っている。
+        // 未起動から開かれた場合に先に積まれた分も、この最初の await で拾う
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            while let Some(paths) = open_files_rx.next().await {
+                cx.update(|cx| open_files::open_paths(paths, cx));
+            }
+        })
+        .detach();
 
         if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
             #[cfg(feature = "visual-test")]
