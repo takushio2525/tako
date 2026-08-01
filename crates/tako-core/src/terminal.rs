@@ -222,6 +222,68 @@ pub struct TerminalSession {
     wheel_carry: std::sync::Mutex<f32>,
     /// 転送系ホイールのレート制限状態（トークンバケット。#167）
     wheel_rate: std::sync::Mutex<WheelRateState>,
+    /// 器（psmux）の copy mode 滞在の追跡と in-band 解除の仕込み（#686）
+    copy_mode: std::sync::Mutex<CopyModeGate>,
+}
+
+/// 器（psmux）が copy mode（履歴閲覧）に居るあいだ打鍵を飲んでしまう問題への門番（#686）。
+///
+/// psmux はマウス要求のない内側アプリ（通常シェル）のペインでホイール報告を受けると
+/// copy mode に入り、滞在中の打鍵を copy-mode コマンドとして解釈して**シェルへ渡さない**。
+/// 実端末の作法は「スクロール中に打鍵したら最下部へ戻ってキーが通る」なので、
+/// 打鍵の直前に解除キーを **同じ PTY へ前置**して器を抜けさせる。
+///
+/// 状態は 2 つ:
+///
+/// - `depth`: PTY へ転送したホイール報告の上下差。psmux は 1 報告 = 3 行を上下**対称**に
+///   動かし、最下部に戻った時点で copy mode を抜ける（実測）。つまり `depth == 0` は
+///   **器へ問い合わせずに**「copy mode ではない」と言い切れる
+/// - `exit`: 前置する解除バイト列。**器へ問い合わせて copy mode だと確かめたときだけ**入る。
+///   マウス要求 TUI（claude 等）のペインでは psmux は copy mode に入らず報告を内側アプリへ
+///   転送するので、確かめずに撃つと TUI の入力欄へゴミ文字が入る
+#[derive(Default)]
+struct CopyModeGate {
+    depth: i32,
+    exit: Option<Vec<u8>>,
+}
+
+impl CopyModeGate {
+    /// 器へ転送したホイール報告を記録する。正 = 過去方向（上）
+    fn note_wheel(&mut self, lines: i32) {
+        self.depth = self.depth.saturating_add(lines).max(0);
+        if self.depth == 0 {
+            // 最下部へ戻った = 器は copy mode を抜けている（実測）。
+            // ここで降ろさないと「下まで戻してから打鍵」でゴミ文字が入る
+            self.exit = None;
+        }
+    }
+
+    /// 器の履歴を遡っている最中か（器へ問い合わせずに答えられる）
+    fn scrolled_back(&self) -> bool {
+        self.depth > 0
+    }
+
+    /// 解除を仕込む。**既に最下部へ戻っていれば何もしない**
+    /// （器へ問い合わせた返事が届くまでの間にユーザーが下まで戻していた場合）
+    fn arm(&mut self, bytes: &[u8]) {
+        if self.scrolled_back() {
+            self.exit = Some(bytes.to_vec());
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.exit = None;
+    }
+
+    /// 仕込んである解除バイト列を取り出す（1 回だけ効く）。
+    /// 解除が入れば器は最下部へ戻るので、遡り量の勘定も 0 に戻す
+    fn take(&mut self) -> Option<Vec<u8>> {
+        let taken = self.exit.take();
+        if taken.is_some() {
+            self.depth = 0;
+        }
+        taken
+    }
 }
 
 /// ホイール転送レート制限（#167）の状態。tokens = 残イベント数、last = 最終補充時刻
@@ -349,6 +411,7 @@ impl TerminalSession {
                     tokens: WHEEL_FORWARD_BURST,
                     last: std::time::Instant::now(),
                 }),
+                copy_mode: std::sync::Mutex::new(CopyModeGate::default()),
             },
             rx,
         ))
@@ -420,10 +483,46 @@ impl TerminalSession {
     }
 
     /// PTY（シェルの stdin）へバイト列を書き込む。
-    /// キー入力時はスクロールバック表示を最下部へ戻す（一般的なターミナルの挙動）
+    /// キー入力時はスクロールバック表示を最下部へ戻す（一般的なターミナルの挙動）。
+    ///
+    /// 器（psmux）が copy mode に居ると分かっている場合は、**同じ書き込みの先頭に**
+    /// 解除バイト列を混ぜる（#686）。実端末の作法「スクロール中に打鍵したら最下部へ
+    /// 戻ってキーが通る」を、器へ別経路で命令せずに満たすためで、同じバイト列に
+    /// 載せるので器が解除より先に打鍵を見ることが構造的に起こらない
     pub fn write(&self, bytes: Vec<u8>) {
         self.scroll_to_bottom();
+        let bytes = match self.copy_mode_lock().take() {
+            Some(mut prefix) => {
+                prefix.extend_from_slice(&bytes);
+                prefix
+            }
+            None => bytes,
+        };
         self.notifier.notify(bytes);
+    }
+
+    /// 器の履歴を遡っている最中か（転送したホイールの上下差 > 0。#686）。
+    /// **器へ問い合わせずに答えられる**ので、問い合わせるかどうかの門番に使う
+    pub fn wheel_scrolled_back(&self) -> bool {
+        self.copy_mode_lock().scrolled_back()
+    }
+
+    /// 次の打鍵へ copy mode の in-band 解除を仕込む（#686）。
+    /// 器へ問い合わせて copy mode だと**確かめてから**呼ぶこと
+    pub fn arm_copy_mode_exit(&self, bytes: &[u8]) {
+        self.copy_mode_lock().arm(bytes);
+    }
+
+    /// copy mode 解除の仕込みを降ろす（器が「copy mode ではない」と答えた / 答えられない）
+    pub fn disarm_copy_mode_exit(&self) {
+        self.copy_mode_lock().disarm();
+    }
+
+    /// `copy_mode` のロック（毒化耐性は `fract_lock` と同じ理由）
+    fn copy_mode_lock(&self) -> std::sync::MutexGuard<'_, CopyModeGate> {
+        self.copy_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// クリップボード文字列の貼り付け。アプリが要求していればブラケットペーストで包む
@@ -502,9 +601,21 @@ impl TerminalSession {
         };
         match wheel_action(mode, delta_lines, col, row) {
             // 転送はスクロールバック表示を動かさない（write() の bottom 戻しも不要）
-            WheelAction::Write(bytes) => self.notifier.notify(bytes),
+            WheelAction::Write(bytes) => {
+                self.note_mouse_report(mode, delta_lines);
+                self.notifier.notify(bytes)
+            }
             WheelAction::ScrollDisplay(lines) => self.scroll_display(lines),
             WheelAction::None => {}
+        }
+    }
+
+    /// マウス報告としてホイールを転送したときだけ遡り量を勘定する（#686）。
+    /// alternate scroll（矢印キー代替）は内側アプリのスクロールで、
+    /// 器の copy mode とは無関係なので数えない
+    fn note_mouse_report(&self, mode: TermMode, delta_lines: i32) {
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            self.copy_mode_lock().note_wheel(delta_lines);
         }
     }
 
@@ -528,6 +639,10 @@ impl TerminalSession {
         let clamped = delta_lines.clamp(-PROGRAMMATIC_WHEEL_MAX, PROGRAMMATIC_WHEEL_MAX);
         match wheel_action(mode, clamped, col, row) {
             WheelAction::Write(bytes) => {
+                // ユーザーのホイールと同じ扱いで遡り量を勘定する（#686）。
+                // 器の copy mode 判定は「PTY へ転送した報告の上下差」なので、
+                // 送出元が GUI か CLI かで数え方が変わってはいけない
+                self.note_mouse_report(mode, clamped);
                 self.notifier.notify(bytes);
                 clamped
             }
@@ -554,7 +669,10 @@ impl TerminalSession {
             };
             if lines != 0 {
                 match wheel_action(mode, lines, col, row) {
-                    WheelAction::Write(bytes) => self.notifier.notify(bytes),
+                    WheelAction::Write(bytes) => {
+                        self.note_mouse_report(mode, lines);
+                        self.notifier.notify(bytes)
+                    }
                     // ALT_SCREEN + alternate scroll OFF は何もしない（履歴が無い）
                     WheelAction::ScrollDisplay(_) | WheelAction::None => {}
                 }
@@ -1457,6 +1575,58 @@ mod tests {
         assert_eq!(next_command_state(Failed(1), PromptStart), Failed(1));
         assert_eq!(next_command_state(Failed(1), CommandStart), Failed(1));
         assert_eq!(next_command_state(Failed(1), CommandExecuted), Running);
+    }
+
+    /// **#686**: 器（psmux）が copy mode に居るあいだ打鍵が飲まれる問題の門番。
+    /// 「確かめてから撃つ」「最下部へ戻ったら降ろす」「1 回だけ効く」を固定する
+    #[test]
+    fn copy_mode解除は確かめたときだけ仕込まれる() {
+        let mut gate = CopyModeGate::default();
+        // 最下部なら器へ聞くまでもなく copy mode ではない
+        assert!(!gate.scrolled_back());
+        // 確かめる前（= 遡ってもいない）に仕込もうとしても入らない
+        gate.arm(b"q");
+        assert_eq!(gate.take(), None, "確かめずに解除キーを撃ってはいけない");
+
+        // 上へ遡る → 器へ問い合わせて copy mode と判明 → 打鍵に前置される
+        gate.note_wheel(3);
+        assert!(gate.scrolled_back());
+        gate.arm(b"q");
+        assert_eq!(gate.take(), Some(b"q".to_vec()));
+        // 1 回だけ効く（解除後は器も最下部へ戻っている）
+        assert_eq!(gate.take(), None);
+        assert!(!gate.scrolled_back(), "解除後は遡り量も 0 に戻る");
+    }
+
+    /// **#686 の誤射防止**: 下まで戻せば器は copy mode を抜ける（実測）ので、
+    /// 仕込みは器へ聞き直さずに降ろす。降ろさないとシェルへ `q` が入力される
+    #[test]
+    fn 最下部へ戻したら解除の仕込みを降ろす() {
+        let mut gate = CopyModeGate::default();
+        gate.note_wheel(5);
+        gate.arm(b"q");
+        gate.note_wheel(-2); // まだ遡り中
+        assert!(gate.scrolled_back());
+        gate.note_wheel(-3); // 最下部へ到達
+        assert!(!gate.scrolled_back());
+        assert_eq!(gate.take(), None, "最下部で解除キーを撃ってはいけない");
+        // 行き過ぎても負にならない（器も最下部で止まる）
+        gate.note_wheel(-10);
+        assert!(!gate.scrolled_back());
+        gate.note_wheel(1);
+        assert!(gate.scrolled_back(), "1 報告で再び遡り中になる");
+    }
+
+    /// 器が「copy mode ではない」/「答えられない」と言ったら仕込みを降ろす。
+    /// マウス要求 TUI（claude 等）のペインで `q` が入力欄へ入るのを防ぐ経路
+    #[test]
+    fn 器の否定で仕込みを降ろす() {
+        let mut gate = CopyModeGate::default();
+        gate.note_wheel(2);
+        gate.arm(b"q");
+        gate.disarm();
+        assert_eq!(gate.take(), None);
+        assert!(gate.scrolled_back(), "降ろしても遡り量の勘定は残る");
     }
 
     #[test]

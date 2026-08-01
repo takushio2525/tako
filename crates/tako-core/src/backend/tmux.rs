@@ -149,6 +149,39 @@ impl SessionBackend for TmuxBackend {
         crate::tmux_backend::pane_tty(&self.socket, session.as_str())
     }
 
+    /// 器の中のペインの pid（#659）。tmux は `#{pane_pid}` に正しく答える。
+    ///
+    /// 用途である疑似コンソールのコードページ固定（B19）は Windows だけの話で、
+    /// Windows では tmux を器に選ばない（`decide` の実測理由）。それでも
+    /// **API が嘘をつかない**よう実装しておく（「器の中の pid が取れない器」ではない）
+    fn pane_pids(&self, session: &SessionRef) -> Vec<u32> {
+        let Ok(output) = crate::tmux::tmux_command(self.sock())
+            .args([
+                "list-panes",
+                "-t",
+                &format!("={}:", session.as_str()),
+                "-F",
+                "#{pane_pid}",
+            ])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+            .collect()
+    }
+
+    // `pane_in_mode` / `copy_mode_exit_bytes` は**あえて既定（None）のまま**にしてある。
+    // tmux ペインは `ScrollbackAuthority::Backend` なのでホイールはミラー経路
+    // （#159）を通り、tako が tmux を copy mode に置くことがそもそも無い（#686 は
+    // ミラーが使えない psmux 固有の縮退）。実装しても一度も呼ばれない死にコードになる
+
     fn session_cwd(&self, session: &SessionRef) -> Option<String> {
         crate::tmux_backend::session_cwd(&self.socket, session.as_str())
     }

@@ -187,6 +187,25 @@ fn drag_scroll_delta_px(factor_abs: f32) -> f32 {
     speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
 }
 
+/// 器（psmux）へ copy mode を問い合わせるまでの待ち（#686）。
+///
+/// **1 回聞いて終わりにはできない**: ホイール報告を受けてから器が copy mode に入る
+/// までの実測は数百 ms〜1.3 秒（この Windows 機・隔離インスタンス）で、しかも
+/// 負荷で伸びる。早く聞くと「まだ copy mode ではない」と答えるので、
+/// 間隔を空けながら数回聞き、**入ったと分かった時点で打ち切る**。
+/// 器が「答えられない」（`None`）ときは繰り返しても無駄なので即やめる
+const COPY_MODE_PROBE_DELAYS: [Duration; 5] = [
+    Duration::from_millis(150),
+    Duration::from_millis(250),
+    Duration::from_millis(400),
+    Duration::from_millis(700),
+    Duration::from_millis(1000),
+];
+/// 同じペインへ続けて問い合わせ**列**を始める最短間隔（#686）。
+/// 1 回がサブプロセス起動（実測 30〜50ms）なので、慣性スクロールの
+/// 1 イベントごとには撃たない。上の合計より少し長くして列を重ねない
+const COPY_MODE_PROBE_INTERVAL: Duration = Duration::from_millis(2600);
+
 /// スクロールバーの当たり領域の幅（px。サムはこの内側に描く）
 const SCROLLBAR_WIDTH: f32 = 10.0;
 /// スクロールバーの表示維持時間とフェード時間（iTerm2 流の出し方。FR-2.5.13）
@@ -839,6 +858,9 @@ struct TakoApp {
     scroll_accum: HashMap<PaneId, f32>,
     /// バックエンド / ネスト tmux スクロールの UI 状態（ミラー + フェード表示）
     scroll_ctls: HashMap<PaneId, ScrollCtl>,
+    /// 器の copy mode を最後に問い合わせた時刻（#686 のスロットリング）。
+    /// 1 回がサブプロセス起動なので、ホイールの 1 イベントごとには撃たない
+    copy_mode_probe_at: HashMap<PaneId, std::time::Instant>,
     /// フェード再描画・ミラー増分追従ティッカーの稼働中フラグ
     scroll_ticker: bool,
     /// 右サイドバー情報パネル（tmux 一覧 FR-2.13 / 集約センター FR-2.10）の表示状態。
@@ -2105,6 +2127,7 @@ impl TakoApp {
             hovered_scrollbar: None,
             scroll_accum: HashMap::new(),
             scroll_ctls: HashMap::new(),
+            copy_mode_probe_at: HashMap::new(),
             scroll_ticker: false,
             panel_visible: false,
             panel_view: PanelView::default(),
@@ -5176,6 +5199,7 @@ impl TakoApp {
                 self.known_failed.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
+                self.copy_mode_probe_at.remove(&pane_id);
                 self.pane_font_sizes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
                 self.pane_last_text_areas.remove(&pane_id);
@@ -5239,6 +5263,7 @@ impl TakoApp {
                     self.known_failed.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
+                    self.copy_mode_probe_at.remove(&id);
                     self.dock_webview_of(id);
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
@@ -9460,8 +9485,102 @@ impl TakoApp {
             // 出し分け・転送時の整数化はセッション側（scroll_wheel_px）
             session.scroll_wheel_px(delta_rows, col, row);
             self.mark_scroll_activity(pane_id, cx);
+            // 器（psmux）が copy mode に入ったかを非同期に確かめておく（#686）
+            self.schedule_copy_mode_probe(pane_id, cx);
             cx.notify();
         }
+    }
+
+    /// 器が copy mode（履歴閲覧）に入ったかを**非同期に**確かめ、入っていれば
+    /// 次の打鍵へ in-band 解除を仕込む（#686）。
+    ///
+    /// ここで解決しておかないと、打鍵の瞬間に器へ問い合わせることになり、
+    /// #212 / #168 で UI スレッドから排除したサブプロセス同期実行が打鍵経路に戻る。
+    /// 逆に問い合わせずに「たぶん copy mode」で解除キーを撃つと、マウス要求 TUI
+    /// （claude 等。psmux は copy mode に入らず報告を内側アプリへ転送する = 実測）の
+    /// 入力欄へゴミ文字が入る。だから**撃つ前に器へ聞く**
+    fn schedule_copy_mode_probe(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let backend = tako_core::backend::backend();
+        // 器が in-band 解除の手段を持たない（tmux / 器なし）なら何もしない
+        let Some(exit) = backend.copy_mode_exit_bytes() else {
+            return;
+        };
+        let Some(name) = self.backend_sessions.get(&pane_id).cloned() else {
+            return;
+        };
+        // 最下部に居るなら copy mode ではありえない（器へ聞くまでもない）
+        if !self
+            .terminals
+            .get(&pane_id)
+            .is_some_and(|s| s.wheel_scrolled_back())
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .copy_mode_probe_at
+            .get(&pane_id)
+            .is_some_and(|at| now.duration_since(*at) < COPY_MODE_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.copy_mode_probe_at.insert(pane_id, now);
+        cx.spawn(async move |this, cx| {
+            let Ok(session) = tako_core::backend::SessionRef::new(name) else {
+                return;
+            };
+            for delay in COPY_MODE_PROBE_DELAYS {
+                cx.background_executor().timer(delay).await;
+                // 途中で最下部へ戻していたら聞く意味が無い（器も copy mode を抜けている）
+                let still = this
+                    .read_with(cx, |app: &TakoApp, _| {
+                        app.terminals
+                            .get(&pane_id)
+                            .is_some_and(|s| s.wheel_scrolled_back())
+                    })
+                    .unwrap_or(false);
+                if !still {
+                    return;
+                }
+                let target = session.clone();
+                let in_mode = cx
+                    .background_executor()
+                    .spawn(async move { tako_core::backend::backend().pane_in_mode(&target) })
+                    .await;
+                let done = this
+                    .update(cx, |app: &mut TakoApp, _| {
+                        let Some(term) = app.terminals.get(&pane_id) else {
+                            return true;
+                        };
+                        match in_mode {
+                            Some(true) => {
+                                term.arm_copy_mode_exit(exit);
+                                true
+                            }
+                            // まだ入っていないだけかもしれないので聞き直す。
+                            // 撃たない側（仕込みなし）のまま次の回へ
+                            Some(false) => false,
+                            // 器が答えられない = 解除の要否が分からない。繰り返しても無駄
+                            None => {
+                                term.disarm_copy_mode_exit();
+                                true
+                            }
+                        }
+                    })
+                    .unwrap_or(true);
+                if done {
+                    return;
+                }
+            }
+            // 最後まで「copy mode ではない」なら仕込まない
+            // （マウス要求 TUI のペインはここへ来る）
+            let _ = this.update(cx, |app: &mut TakoApp, _| {
+                if let Some(term) = app.terminals.get(&pane_id) {
+                    term.disarm_copy_mode_exit();
+                }
+            });
+        })
+        .detach();
     }
 
     // --- バックエンド / ネスト tmux スクロール（ローカルミラー方式。#159） ---

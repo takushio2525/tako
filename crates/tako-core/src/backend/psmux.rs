@@ -26,6 +26,9 @@
 //! | `list-clients -F` が書式指定を無視（クライアント PID が取れない） | [`super::owner`] のオーナー記録で代替（#177 の強奪ガード） |
 //! | `new-session -D` が他クライアントを切り離さない | 同上。**器に収束を期待しない** |
 //! | 既定の warm pane 先読みが 1 セッションあたり pwsh を 1 本余計に常駐させる | conf に `set -g warm off`（+243MB → +131MB/session） |
+//! | 器の中のシェルは tako の ConPTY の子ではない（コードページ固定が届かない） | [`SessionBackend::pane_pids`] で器へ `#{pane_pid}` を尋ね、器の内側にも B19 の固定を当てる（#659） |
+//! | ホイールで copy mode に入り、滞在中の打鍵をシェルへ渡さない | `#{pane_in_mode}` で確かめてから、解除キー `q` を打鍵と同じ PTY へ前置する（#686） |
+//! | `bind-key -T copy-mode …` が無反応（キーテーブル未実装。`list-keys -T copy-mode` が空） | conf での解決を諦め、上記の in-band 解除を採る |
 //!
 //! ## バージョン固定と起動時プローブ
 //!
@@ -351,6 +354,51 @@ impl SessionBackend for PsmuxBackend {
         None
     }
 
+    /// `list-panes -F "#{pane_pid}"`（実測で正しい pid を返す。`pane_tty` と違って
+    /// psmux も嘘をつかない）。**器の中のシェルの疑似コンソールを UTF-8 へ固定する**
+    /// ために使う（#659）。セッションがまだ無い間はエラーになるので空を返す。
+    ///
+    /// 返すのは器がそのセッションに持つ**全ペイン**の pid。tako は 1 セッション =
+    /// 1 ペインで使うが、ユーザーが器の中で分割した分もここに載る。コードページは
+    /// 疑似コンソール単位なので、載った分だけ固定しておくのが素直（余分に固定しても害は無い）
+    fn pane_pids(&self, session: &SessionRef) -> Vec<u32> {
+        let out = self
+            .run(&[
+                "list-panes",
+                "-t",
+                self.target(session),
+                "-F",
+                "#{pane_pid}",
+            ])
+            .unwrap_or_default();
+        parse_pane_pids(&out)
+    }
+
+    /// psmux は `#{pane_in_mode}` に答える（実測。`#{mouse_any_flag}` 等の
+    /// 未対応変数と違って空文字にならない）。#686
+    fn pane_in_mode(&self, session: &SessionRef) -> Option<bool> {
+        let out = self
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:", self.target(session)),
+                "#{pane_in_mode}",
+            ])
+            .ok()?;
+        parse_in_mode(&out)
+    }
+
+    /// psmux の copy mode は `q` で抜ける（実測: in-band の `q` で `pane_in_mode`
+    /// が 1 → 0。キーは copy mode に消費されシェルへは漏れない）。
+    ///
+    /// **`bind-key -T copy-mode Any send-keys -X cancel` は使えない**: psmux は
+    /// copy-mode のキーテーブルを実装しておらず（`list-keys -T copy-mode` が空）、
+    /// bind は成功を返すが何も起きない（実測）
+    fn copy_mode_exit_bytes(&self) -> Option<&'static [u8]> {
+        Some(COPY_MODE_EXIT)
+    }
+
     fn session_cwd(&self, session: &SessionRef) -> Option<String> {
         let out = self
             .run(&[
@@ -567,6 +615,31 @@ impl PsmuxBackend {
         }
         let me = std::process::id();
         !matches!(self.owners.holder(&info.session), Some(pid) if pid != me)
+    }
+}
+
+/// copy mode を抜けるキー（psmux 既定。実測で確定）
+const COPY_MODE_EXIT: &[u8] = b"q";
+
+/// `list-panes -F "#{pane_pid}"` の出力をパースする（純関数。#659）。
+/// 数字以外の行（psmux が警告を混ぜた場合など）は捨てる
+fn parse_pane_pids(out: &str) -> Vec<u32> {
+    out.lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .collect()
+}
+
+/// `display-message -p "#{pane_in_mode}"` の出力をパースする（純関数。#686）。
+///
+/// **未対応変数は空文字に展開される**（psmux の `#{mouse_any_flag}` で実測）ので、
+/// 「0 でも 1 でもない」を `None` へ倒す。ここを `Some(false)` に倒すと、
+/// 器が答えられなくなった日に「copy mode ではない」と誤って断定してしまう
+fn parse_in_mode(out: &str) -> Option<bool> {
+    match out.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
     }
 }
 
@@ -824,6 +897,40 @@ mod tests {
     #[test]
     fn pane_ttyは常にnone() {
         assert!(backend().pane_tty(&session("tako-0123456789ab")).is_none());
+    }
+
+    /// **#659**: 器の中のシェルの pid を取り出せる。
+    /// これが取れないと、器の内側の疑似コンソールを UTF-8 に固定できない
+    /// （psmux ペインだけ CP932 のまま残る = #655 の対処が届かない）
+    #[test]
+    fn 器の中のペインのpidを取り出す() {
+        assert_eq!(parse_pane_pids("13144\n"), vec![13144]);
+        // 器の中で分割された分もそのまま載る（コードページは疑似コンソール単位）
+        assert_eq!(parse_pane_pids("13144\n18248\n"), vec![13144, 18248]);
+        // 空・非数値・0 は捨てる（psmux が警告を混ぜても pid と誤認しない）
+        assert!(parse_pane_pids("").is_empty());
+        assert!(parse_pane_pids("psmux: no server running\n").is_empty());
+        assert!(parse_pane_pids("0\n").is_empty());
+        assert_eq!(parse_pane_pids(" 42 \r\n"), vec![42]);
+    }
+
+    /// **#686**: copy mode の在否は 0/1 のときだけ断定する。
+    /// psmux は**未対応の書式変数を空文字に展開する**（`#{mouse_any_flag}` で実測）ので、
+    /// 空を `false` に倒すと「答えられない器」を「copy mode ではない」と誤断定する
+    #[test]
+    fn copy_modeの判定は0と1のときだけ断定する() {
+        assert_eq!(parse_in_mode("1\n"), Some(true));
+        assert_eq!(parse_in_mode("0\n"), Some(false));
+        assert_eq!(parse_in_mode(""), None);
+        assert_eq!(parse_in_mode("\n"), None);
+        assert_eq!(parse_in_mode("#{pane_in_mode}"), None);
+    }
+
+    /// **#686**: in-band 解除キーを申告する。ソケット経由の `send-keys -X cancel` は
+    /// 打鍵との順序が保証できず、打鍵経路にサブプロセスを同期で挟むことにもなる
+    #[test]
+    fn copy_mode解除キーを申告する() {
+        assert_eq!(backend().copy_mode_exit_bytes(), Some(&b"q"[..]));
     }
 
     /// **要件 3**: `#{history_bytes}` が空でも probe を落とさない。
