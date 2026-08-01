@@ -1371,9 +1371,11 @@ struct TakoApp {
     command_card_copied: Option<(u64, usize, std::time::Instant)>,
     /// カード操作の失敗表示（#666。`(カード ID, 表示開始時刻)`。理由は診断ログへ）
     command_card_error: Option<(u64, std::time::Instant)>,
-    /// カードのアンカー（#681。カード ID → 生成時点のターミナル内容に紐付く位置）。
-    /// 揮発（カードと同じ寿命）で、初回描画時に採取する
-    card_anchors: HashMap<u64, command_card_ui::CardAnchorState>,
+    /// カード帯（#703。ペイン → このフレームでテキスト領域から差し引いた高さ）。
+    /// `render()` がペイン矩形を作るときに決め、`render_pane` が同じ値で帯を描く
+    card_bands: HashMap<PaneId, command_card_ui::CardBandFrame>,
+    /// カード帯に要る高さの実描画からの採取スロット（#703。詳細は `CardBandProbe`）
+    card_band_probes: HashMap<PaneId, std::rc::Rc<command_card_ui::CardBandProbe>>,
 }
 
 /// × ボタン / cmd+W close の確認ダイアログ対象（Issue #172）。
@@ -2543,7 +2545,8 @@ impl TakoApp {
             pending_clipboard: Vec::new(),
             command_card_copied: None,
             command_card_error: None,
-            card_anchors: HashMap::new(),
+            card_bands: HashMap::new(),
+            card_band_probes: HashMap::new(),
         };
         // 複数ウィンドウの復元（Issue #339）: アクティブ以外の論理ウィンドウは
         // 初回 render / dispatch の sync_viewports が保存フレームで開き直す
@@ -12696,16 +12699,15 @@ impl TakoApp {
             .find(|s| s.pane == pane_id)
             .map(|s| (s.port, s.process.clone()));
 
-        // AI コマンド提案カード（FR-2.22 / #666。位置は #681）。生成時点のターミナル
-        // 内容にアンカーするので、テキスト領域の寸法と行の高さを渡す。要素はテキスト
-        // 領域の中に入れる（上端で切り取られる = 上へ流れて消える見え方）
-        let command_cards = self.render_command_cards(
-            pane_id,
-            f32::from(area.size.height).max(0.0),
-            f32::from(cell.height),
-            suggestion.is_some(),
-            cx,
-        );
+        // AI コマンド提案カード（FR-2.22 / #666。位置は #703）。帯の高さは
+        // `render()` がペイン矩形を作るときに決めており（`area` はすでにそのぶん
+        // 縮めてある）、ここではテキスト領域の**外**に同じ高さで描くだけ
+        let band_height = self
+            .card_bands
+            .get(&pane_id)
+            .map(|f| f.height)
+            .unwrap_or(0.0);
+        let command_card_band = self.render_command_card_band(pane_id, band_height, cx);
 
         // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
         // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
@@ -13401,12 +13403,12 @@ impl TakoApp {
                             .flex()
                             .flex_col()
                             .children(lines),
-                    )
-                    // AI コマンド提案カード（#681）: 行スタックより後に積んで前面へ。
-                    // テキスト領域の中なので overflow_hidden が上端で切り取り、
-                    // ペインヘッダを覆わずに「上へ流れて消える」
-                    .children(command_cards),
+                    ),
             )
+            // AI コマンド提案カードの帯（#703）: ターミナル領域の**兄弟**として下に置く。
+            // 重ねるのではなく領域を分け合うので、会話・入力欄・フッターとは 1px も
+            // 重ならない（PTY の行数は `render()` がこの高さぶん減らしてある）
+            .children(command_card_band)
             .children(scrollbar.map(|(top, thumb_h, track_h, alpha, emphasized)| {
                 // オーバーレイスクロールバー（macOS 慣行 #159）: スクロール中に表示 →
                 // 停止 1 秒でフェードアウト。ホバー / ドラッグ中は表示を維持し、
@@ -13468,7 +13470,9 @@ impl TakoApp {
                 div()
                     .id(("port-chip", pane_id.as_u64()))
                     .absolute()
-                    .bottom(px(4.0))
+                    // カード帯（#703）が出ているときはその上へ逃がす（帯はペインの
+                    // 下端を占めるので、下端固定のままだとチップが帯の上に重なる）
+                    .bottom(px(4.0 + band_height))
                     .left(px(8.0))
                     .flex()
                     .flex_row()
@@ -16141,10 +16145,28 @@ impl Render for TakoApp {
                     snap(content_origin.x + content_size.width * r.x + px(inset)),
                     snap(content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR)),
                 );
-                let area_size = size(
+                let full = size(
                     snap(content_size.width * r.width - px(inset * 2.0)),
                     snap(content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR)),
                 );
+                // AI コマンド提案カードの帯（#703）はテキスト領域の**外**（下）に置く。
+                // ここで先に差し引いておくことで、PTY の行数・マウス座標変換・IME 位置が
+                // すべて「カードに隠されていない領域」だけを指すようになる
+                // （= 会話とカードが重なることが構造的に起きない）
+                let cell_h = self
+                    .cell_size_for_pane(*id)
+                    .map(|c| f32::from(c.height))
+                    .unwrap_or(f32::from(cell.height));
+                let band = self.card_band_height(
+                    *id,
+                    f32::from(full.height),
+                    f32::from(full.width),
+                    cell_h,
+                );
+                // 引くだけで 0 クランプはしない: 極端に低いウィンドウでは元から
+                // 負の高さになり、下端が実コンテナの内側に来ることで整合していた
+                // （0 に丸めると下端がコンテナの外へ飛び出す。#684 の検査で捕まえた）
+                let area_size = size(full.width, full.height - px(band));
                 (*id, Bounds::new(origin, area_size))
             })
             .collect();
@@ -17800,6 +17822,48 @@ mod self_test {
             let bottom = ((band_bottom * scale).round().max(0.0) as u32).min(height);
             if (top..bottom).any(|y| (left..right).any(|x| ink(frame.get_pixel(x, y).0))) {
                 count = row + 1;
+            }
+        }
+        count
+    }
+
+    /// 指定した論理座標矩形内で「ある色にほぼ一致する」ピクセル数（#703）。
+    ///
+    /// **上下反転を呼び出し側に決めさせる**のが要点。「この矩形にこの色が 1 つも無い」を
+    /// 主張したい検査で反転した側の多い方を採ると、別の場所を見て偽陽性になる。
+    /// 反転の向きは「その色があるはずの矩形」で先に決め、同じ向きでこちらを見る
+    #[cfg(feature = "visual-test")]
+    fn color_pixels_in_bounds(
+        frame: &image::RgbaImage,
+        bounds: Bounds<Pixels>,
+        scale: f32,
+        color: tako_core::Rgb,
+        tolerance: i32,
+        flip_y: bool,
+    ) -> usize {
+        let (width, height) = frame.dimensions();
+        let left = (f32::from(bounds.left()) * scale).floor().max(0.0) as u32;
+        let right = ((f32::from(bounds.right()) * scale).ceil().max(0.0) as u32).min(width);
+        let raw_top = (f32::from(bounds.top()) * scale).floor().max(0.0) as u32;
+        let raw_bottom = ((f32::from(bounds.bottom()) * scale).ceil().max(0.0) as u32).min(height);
+        let (top, bottom) = if flip_y {
+            (
+                height.saturating_sub(raw_bottom),
+                height.saturating_sub(raw_top),
+            )
+        } else {
+            (raw_top.min(height), raw_bottom.min(height))
+        };
+        let mut count = 0;
+        for y in top..bottom {
+            for x in left..right.min(width) {
+                let p = frame.get_pixel(x, y).0;
+                let near = (i32::from(p[0]) - i32::from(color.r)).abs() <= tolerance
+                    && (i32::from(p[1]) - i32::from(color.g)).abs() <= tolerance
+                    && (i32::from(p[2]) - i32::from(color.b)).abs() <= tolerance;
+                if near {
+                    count += 1;
+                }
             }
         }
         count
@@ -20534,6 +20598,198 @@ mod self_test {
                 let _ = capture_frame(any, cx);
             }
 
+            // AI コマンド提案カードの帯（#703）: **実ピクセルで**「カードがターミナルの
+            // どの行にも重ならない」ことを見る。座標が一致していることの検査だけでは
+            // 「重なっていないつもりで重なっている」を捕まえられない（#681 で実際に踏んだ）。
+            // ターミナルを一面インクで埋めた状態で
+            //   (a) カードの地色が帯の中にはある
+            //   (b) 同じ地色がテキスト領域には 1 ピクセルも無い（= 重なりゼロ）
+            //   (c) インクの行数 = PTY 行数（帯のぶん縮んだ領域をきっちり使い切っている）
+            //   (d) 閉じると (a) が消えて行数が戻る
+            // を見る。上下反転の向きは (a) の矩形で先に決める（(b) は「無い」を主張する
+            // 検査なので、多い方を採ると別の場所を見て偽陽性になる）
+            {
+                // 画面を一面インクで埋める（重なりがあれば必ずインクが消える）
+                type_text(any, cx, "clear", true);
+                cx.background_executor()
+                    .timer(Duration::from_millis(600))
+                    .await;
+                type_text(
+                    any,
+                    cx,
+                    "for i in $(seq 1 80); do echo \"#### line $i ####\"; done",
+                    true,
+                );
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                for _ in 0..2 {
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                }
+                // 帯なしの基準
+                let geom = |app: &mut TakoApp| {
+                    let pane = app.focused_pane();
+                    let area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == pane)
+                        .map(|(_, b)| *b);
+                    let rows = app.terminals.get(&pane).map(|s| s.size().1).unwrap_or(0);
+                    let band = app.card_bands.get(&pane).map(|f| f.height).unwrap_or(0.0);
+                    let cell_h = app
+                        .cell_size_for_pane(pane)
+                        .map(|c| f32::from(c.height))
+                        .unwrap_or(0.0);
+                    (
+                        pane.as_u64(),
+                        area,
+                        rows,
+                        band,
+                        cell_h,
+                        app.theme.background,
+                        // 目印にする色はカード内のコマンド枠の地色（`crust`）。
+                        // カードの外枠 `surface_1` はダークテーマで背景とほぼ同値
+                        // （0x1c1d2b vs 0x1e1e2e）で判別に使えない（実測で空振りした）
+                        app.theme.crust,
+                    )
+                };
+                let (pane, base_area, base_rows, base_band, cell_h, background, card_fill) = window
+                    .update(cx, |app, _, _| geom(app))
+                    .unwrap_or_else(|_| fail("visual-test #703: 基準状態の取得"));
+                let base_area = base_area.unwrap_or_else(|| fail("visual-test #703: ペイン領域"));
+                let (before, scale) =
+                    capture_frame(any, cx).unwrap_or_else(|| fail("visual-test #703: 前フレーム"));
+                let ink_rows = |frame: &image::RgbaImage, area: Bounds<Pixels>| {
+                    drawn_row_count(
+                        frame,
+                        scale,
+                        (
+                            f32::from(area.left()) + 2.0,
+                            f32::from(area.right()) - 16.0,
+                        ),
+                        f32::from(area.top()),
+                        cell_h,
+                        f32::from(area.bottom()),
+                        background,
+                    )
+                };
+                let base_drawn = ink_rows(&before, base_area);
+
+                // カードを 1 枚出して帯を作る（CLI / MCP と同じ dispatch 経路）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::ShowCommand {
+                            action: None,
+                            commands: vec!["cargo test --workspace".into()],
+                            label: Some("visual-test".into()),
+                            pane: Some(pane),
+                            card: None,
+                            index: None,
+                            focus: None,
+                        },
+                        PaneOrigin::Mcp,
+                    );
+                    cx.notify();
+                });
+                for _ in 0..4 {
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                }
+                let (_, area, rows, band, _, _, _) = window
+                    .update(cx, |app, _, _| geom(app))
+                    .unwrap_or_else(|_| fail("visual-test #703: カード状態の取得"));
+                let area = area.unwrap_or_else(|| fail("visual-test #703: カード時のペイン領域"));
+                let (after, _) =
+                    capture_frame(any, cx).unwrap_or_else(|| fail("visual-test #703: 後フレーム"));
+                // 帯の矩形 = テキスト領域の下端 + パディング から帯の高さぶん
+                let band_bounds = Bounds::new(
+                    point(area.left(), area.bottom() + px(PANE_PADDING)),
+                    size(area.size.width, px(band)),
+                );
+                let flip = color_pixels_in_bounds(&after, band_bounds, scale, card_fill, 6, true)
+                    > color_pixels_in_bounds(&after, band_bounds, scale, card_fill, 6, false);
+                let in_band = color_pixels_in_bounds(&after, band_bounds, scale, card_fill, 6, flip);
+                let intruding = color_pixels_in_bounds(&after, area, scale, card_fill, 6, flip);
+                let drawn = ink_rows(&after, area);
+                let band_rows = if cell_h > 0.0 {
+                    (band / cell_h).round() as usize
+                } else {
+                    0
+                };
+                // 地色が背景と紛らわしいと (b) が意味を失うので、離れていることを先に見る
+                let distinct = (i32::from(card_fill.r) - i32::from(background.r)).abs()
+                    + (i32::from(card_fill.g) - i32::from(background.g)).abs()
+                    + (i32::from(card_fill.b) - i32::from(background.b)).abs()
+                    > 24;
+
+                // 閉じると帯が消えて行数が戻る
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::ShowCommand {
+                            action: Some("dismiss".into()),
+                            commands: Vec::new(),
+                            label: None,
+                            pane: Some(pane),
+                            card: None,
+                            index: None,
+                            focus: None,
+                        },
+                        PaneOrigin::Mcp,
+                    );
+                    cx.notify();
+                });
+                for _ in 0..4 {
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                }
+                let (_, closed_area, closed_rows, closed_band, _, _, _) = window
+                    .update(cx, |app, _, _| geom(app))
+                    .unwrap_or_else(|_| fail("visual-test #703: 復帰状態の取得"));
+                let closed_area =
+                    closed_area.unwrap_or_else(|| fail("visual-test #703: 復帰時のペイン領域"));
+                let (closed, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test #703: 復帰フレーム"));
+                let band_after_close =
+                    color_pixels_in_bounds(&closed, band_bounds, scale, card_fill, 6, flip);
+                let closed_drawn = ink_rows(&closed, closed_area);
+
+                if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let base = std::path::Path::new(&dir);
+                    let _ = before.save(base.join("card-band-before.png"));
+                    let _ = after.save(base.join("card-band-with-card.png"));
+                    let _ = closed.save(base.join("card-band-closed.png"));
+                }
+                println!(
+                    "TAKO_VISUAL_PIXEL: card-band flip={flip} base=(rows={base_rows} band={base_band:.1} \
+                     drawn={base_drawn}) card=(rows={rows} band={band:.1} band_rows={band_rows} \
+                     drawn={drawn} in_band={in_band} intruding={intruding}) \
+                     closed=(rows={closed_rows} band={closed_band:.1} drawn={closed_drawn} \
+                     in_band={band_after_close}) distinct={distinct}"
+                );
+                check(
+                    distinct && band_rows > 0 && in_band > 2000,
+                    "visual-test カード帯: 帯にカードが実際に描かれている (#703)",
+                );
+                check(
+                    intruding == 0,
+                    "visual-test カード帯: カードの地色がターミナル領域に 1px も無い (#703)",
+                );
+                check(
+                    base_drawn == base_rows
+                        && drawn == rows
+                        && rows + band_rows == base_rows
+                        && rows > 0,
+                    "visual-test カード帯: 縮んだ領域を端末がきっちり使い切る (#703)",
+                );
+                check(
+                    band_after_close == 0
+                        && closed_band == 0.0
+                        && closed_rows == base_rows
+                        && closed_drawn == closed_rows,
+                    "visual-test カード帯: 閉じると帯が消えて行数が戻る (#703)",
+                );
+            }
             // #690: アップデート詳細画面のリリースノートが Markdown として描かれるか。
             // 実リリース v0.6.2 のノート本文を専用ウィンドウへ流し込み、scene の実ピクセルで
             // 見出しサイズ・インラインコード・コードパネル・表のヘッダ帯・リンク色・
@@ -26191,9 +26447,10 @@ mod self_test {
                     })
                     .ok();
                 let mut view_scrolled = false;
+                let mut view_scroll_detail = (false, false, false);
                 for _ in 0..20 {
                     wait(cx, 300).await;
-                    view_scrolled = window
+                    let detail = window
                         .update(cx, |app, _, _| {
                             let mirrored = app
                                 .scroll_ctls
@@ -26222,13 +26479,19 @@ mod self_test {
                                     },
                                 )
                                 .is_some();
-                            mirrored && composed_differs && bar
+                            (mirrored, composed_differs, bar)
                         })
-                        .unwrap_or(false);
+                        .unwrap_or((false, false, false));
+                    view_scroll_detail = detail;
+                    view_scrolled = detail.0 && detail.1 && detail.2;
                     if view_scrolled {
                         break;
                     }
                 }
+                eprintln!(
+                    "TAKO_SELF_TEST_181_VIEW: mirrored={} composed_differs={} bar={}",
+                    view_scroll_detail.0, view_scroll_detail.1, view_scroll_detail.2
+                );
                 check(
                     view_scrolled,
                     "TmuxOpen ペインのホイールがミラー表示 + スクロールバーに乗る（#181）",
@@ -29855,241 +30118,166 @@ mod self_test {
                     "カードの × で閉じ、消えたカードへの操作は無害 (#666)",
                 );
 
-                // 91b. カードの表示位置アンカー（#681）。下端固定オーバーレイは claude の
-                // 入力欄・フッターに被るのでやめた。機械検証は 4 点:
-                // (a) カード下端がライブ領域（入力欄 / プロンプト行）より上にある
-                //     （上に空きが無いときは内容の下へ回るので、その場合は「覆わない」を見る）
-                // (b) スクロール（バックエンド = tmux 履歴ミラー経路）で内容と一緒に動く
-                // (c) 流れ去って描画されなくなっても CLI / MCP の操作は効く
-                // (d) 直接ペインでは出力が流れた行数ぶん上へ動く
+                // 91b. カード帯（#703）。オーバーレイ（#666 の下端固定 / #681 の内容
+                // アンカー）はどちらも「ターミナルが描いた絵の上に重ねる」方式なので、
+                // claude のように画面全体を使う TUI では会話文が隠れる。カードを
+                // 出しているあいだは**ターミナル領域そのものを帯のぶん縮める**。
+                // 見るのは「重なりがレイアウトの不変条件になっている」ことの裏取り 5 点:
+                // (a) カード出現で PTY 行数が帯の行数ぶん**ちょうど**減る
+                //     （= 会話が描かれる領域とカードの領域が排他 = どの行にも重ならない）
+                // (b) テキスト領域の下端 + 帯 = 帯が無いときの下端（領域を分け合っている）
+                // (c) 落ち着いたら何フレーム回しても行数が動かない
+                //     （出現・消滅以外で PTY resize を起こさない = TUI を無駄に描き直さない）
+                // (d) dismiss で行数も領域も完全に元へ戻る
+                // (e) 上限: 3 枚 × 長いコマンドでも帯は上限までで、端末には最低行数が残る
                 {
-                    // 判定に使う寸法は描画と同じ関数から作る（二重管理しない）
-                    let layout = TakoApp::card_layout(340.0, 17.0, false);
-                    let anchor_card = window
+                    // 実描画に依存する検査なのでフレームを明示的に回す（#684 の項目 92 と
+                    // 同じ理由: GPUI は隠れたウィンドウの描画を止めるので待つだけでは
+                    // 採取結果が凍結する）。1 枚目で高さを採取 → defer の notify →
+                    // 2 枚目で帯が確定 → 3 枚目で収束を確認する。
+                    // **全ウィンドウを回す**: ここまでの項目（#381 の開き直し / #380 の
+                    // 共有タブバー）でウィンドウが増減しており、対象タブがどのウィンドウに
+                    // 表示されているかは決め打ちできない（決め打ちにして空振りした）
+                    macro_rules! frames {
+                        ($n:expr) => {{
+                            for _ in 0..$n {
+                                let handles = cx.update(|cx| cx.windows());
+                                for handle in handles {
+                                    let _ = handle.update(cx, |_, win, cx| win.draw(cx).clear());
+                                }
+                            }
+                        }};
+                    }
+                    // (rows, 帯の高さ, テキスト領域の下端, 帯を描いたか)
+                    let band_state = |app: &mut TakoApp| -> (usize, f32, f32, bool) {
+                        let p = PaneId::from_raw(pane);
+                        let rows = app.terminals.get(&p).map(|s| s.size().1).unwrap_or(0);
+                        let band = app.card_bands.get(&p).map(|f| f.height).unwrap_or(0.0);
+                        let bottom = app
+                            .pane_text_areas
+                            .iter()
+                            .find(|(id, _)| *id == p)
+                            .map(|(_, b)| f32::from(b.bottom()))
+                            .unwrap_or(0.0);
+                        (rows, band, bottom, band > 0.0)
+                    };
+                    let cell_h = window
+                        .update(cx, |app, _, _| {
+                            app.cell_size_for_pane(PaneId::from_raw(pane))
+                                .map(|c| f32::from(c.height))
+                                .unwrap_or(0.0)
+                        })
+                        .unwrap_or(0.0);
+                    frames!(2);
+                    let base = window.update(cx, |app, _, _| band_state(app)).unwrap_or((0, 0.0, 0.0, false));
+
+                    // (a)(b) カードを 1 枚出す
+                    let band_card = window
                         .update(cx, |app, _, cx| {
-                            let v = show(app, vec!["echo anchored".into()], pane);
+                            let v = show(app, vec!["echo banded".into()], pane);
                             cx.notify();
                             v["card"]["id"].as_u64().unwrap_or(0)
                         })
                         .unwrap_or(0);
-                    // (a) ライブ領域の上辺 = カーソル行（またはその上の区切り罫線）より上
-                    let (row, below, cursor_row, screen_rows, mirror_pane, alt) = window
-                        .update(cx, |app, _, _| {
-                            let p = PaneId::from_raw(pane);
-                            let anchored = app.command_card_anchor_row(p, &layout);
-                            let theme = app.theme.clone();
-                            let s = app.terminals.get(&p);
-                            let screen = s.map(|s| s.screen_opts(&theme, false));
-                            let cursor = screen.as_ref().and_then(|s| s.ime_cursor).map(|(_, r)| r);
-                            let rows = screen.as_ref().map(|s| s.rows).unwrap_or(0);
-                            (
-                                anchored.map(|(r, _)| r),
-                                anchored.is_some_and(|(_, b)| b),
-                                cursor,
-                                rows,
-                                app.mirror_scroll_pane(p),
-                                s.is_some_and(|s| s.is_alt_screen()),
-                            )
-                        })
-                        .unwrap_or((None, false, None, 0, false, false));
-                    eprintln!(
-                        "TAKO_SELF_TEST_681_ANCHOR: row={row:?} below={below} cursor_row={cursor_row:?} rows={screen_rows} mirror={mirror_pane} alt={alt}"
-                    );
-                    check(
-                        matches!((row, cursor_row), (Some(r), Some(c)) if r <= c as f32 + 0.001),
-                        "カードがライブ領域（入力欄・プロンプト行）を覆わない位置に付く (#681)",
-                    );
-
-                    // (b) スクロール遡り量ぶん、カードが内容と一緒に下へ動く。
-                    //     本番（persist ON）のバックエンドペインは tmux 履歴ミラー経路
-                    let scrolled = window
-                        .update(cx, |app, _, _| {
-                            use tako_core::scroll_mirror::ScrollMirror;
-                            let p = PaneId::from_raw(pane);
-                            let before = app.command_card_anchor_row(p, &layout).map(|(r, _)| r);
-                            let blank = tako_core::ScreenLine {
-                                text: String::new(),
-                                runs: Vec::new(),
-                                cell_cols: Vec::new(),
-                                has_wide: false,
-                            };
-                            let ctl = app.scroll_ctls.entry(p).or_default();
-                            ctl.mirror = Some(ScrollMirror {
-                                lines: vec![blank; 50],
-                                total_history: 50,
-                                position: 10.0,
-                            });
-                            let after = app.command_card_anchor_row(p, &layout).map(|(r, _)| r);
-                            app.scroll_ctls.remove(&p);
-                            (before, after)
-                        })
-                        .unwrap_or((None, None));
-                    eprintln!(
-                        "TAKO_SELF_TEST_681_SCROLL: before={:?} after={:?}",
-                        scrolled.0, scrolled.1
-                    );
-                    check(
-                        matches!(
-                            (scrolled.0, scrolled.1),
-                            (Some(b), Some(a)) if (a - b - 10.0).abs() < 0.001
-                        ),
-                        "スクロール遡り 10 行でカードも 10 行下へ動く (#681)",
-                    );
-
-                    // (c) 流れ去ったカードは描画されないが CLI / MCP の操作は効く
-                    let off_screen_ok = window
-                        .update(cx, |app, _, cx| {
-                            use tako_core::scroll_mirror::ScrollMirror;
-                            let p = PaneId::from_raw(pane);
-                            let blank = tako_core::ScreenLine {
-                                text: String::new(),
-                                runs: Vec::new(),
-                                cell_cols: Vec::new(),
-                                has_wide: false,
-                            };
-                            let ctl = app.scroll_ctls.entry(p).or_default();
-                            ctl.mirror = Some(ScrollMirror {
-                                lines: vec![blank; 400],
-                                total_history: 400,
-                                position: 400.0,
-                            });
-                            let hidden = app
-                                .render_command_cards(p, 340.0, 17.0, false, cx)
-                                .is_none();
-                            // 描かれていない状態でも copy は効く（#681 受け入れ 3）
-                            app.copy_command_card(anchor_card, 1, cx);
-                            app.flush_pending_clipboard(cx);
-                            app.scroll_ctls.remove(&p);
-                            hidden
-                        })
-                        .unwrap_or(false);
-                    let copied_off = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()));
-                    check(
-                        off_screen_ok && copied_off.as_deref() == Some("echo anchored"),
-                        "流れ去ったカードは描かないが CLI / MCP の操作は効く (#681)",
-                    );
-
-                    // (直接ペインのみ) 出力が流れるとカードも上へ流れる。
-                    // tmux バックエンドペインは外側 alacritty に履歴が積まれないため
-                    // 「ライブ領域からの距離を保つ」挙動が正で、この判定は対象外
-                    if !mirror_pane && !alt {
-                        // 素のシェルを 1 枚生やして測る（既存ペインは前段の項目の出力が
-                        // 残っていて `seq` が走らないことがあり、押し出し行数が読めない）
-                        let flow_pane = window
-                            .update(cx, |app, _, cx| {
-                                let v = tako_control::dispatch(
-                                    app,
-                                    Request::Split {
-                                        pane: Some(pane),
-                                        tab: None,
-                                        direction: Some(tako_control::protocol::Direction::Down),
-                                        ratio: None,
-                                        command: None,
-                                        cwd: None,
-                                        focus: Some(false),
-                                    },
-                                    PaneOrigin::Mcp,
-                                )
-                                .unwrap_or_default();
-                                let id = v["pane"].as_u64().unwrap_or(0);
-                                for (p, options) in std::mem::take(&mut app.pending_attach) {
-                                    let _ = app.spawn_session(p, options, cx);
-                                }
-                                cx.notify();
-                                id
-                            })
-                            .unwrap_or(0);
-                        // シェルのプロンプトが出るまで待つ（起動直後に打つと取りこぼす）
-                        for _ in 0..20 {
-                            wait(cx, 300).await;
-                            let ready = window
-                                .update(cx, |app, _, _| {
-                                    app.terminals
-                                        .get(&PaneId::from_raw(flow_pane))
-                                        .is_some_and(|s| {
-                                            s.visible_lines().iter().any(|l| !l.trim().is_empty())
-                                        })
-                                })
-                                .unwrap_or(false);
-                            if ready {
-                                break;
-                            }
-                        }
-                        // 「行数」ではなく**不変条件**で見る: カードは
-                        // 「スクロールバックへ押し出された行数」ぶんだけ上へ動く
-                        let flow_state = |app: &mut TakoApp| -> (Option<f32>, usize) {
-                            let p = PaneId::from_raw(flow_pane);
-                            let row = app.command_card_anchor_row(p, &layout).map(|(r, _)| r);
-                            let hist = app
-                                .terminals
-                                .get(&p)
-                                .map(|s| s.history_size())
-                                .unwrap_or(0);
-                            (row, hist)
-                        };
-                        let before = window
-                            .update(cx, |app, _, cx| {
-                                show(app, vec!["echo flow-anchored".into()], flow_pane);
-                                cx.notify();
-                                flow_state(app)
-                            })
-                            .unwrap_or((None, 0));
-                        let _ = window.update(cx, |app, _, _| {
-                            if let Some(s) = app.terminals.get(&PaneId::from_raw(flow_pane)) {
-                                s.paste("seq 1 60");
-                                s.write(vec![b'\r']);
-                            }
-                        });
-                        let mut after = (None, 0);
-                        for _ in 0..20 {
-                            wait(cx, 300).await;
-                            after = window.update(cx, |app, _, _| flow_state(app)).unwrap_or((None, 0));
-                            if after.1 >= before.1 + 20 {
-                                break;
-                            }
-                        }
-                        let flowed = after.1.saturating_sub(before.1);
-                        let tail = window
-                            .update(cx, |app, _, _| {
-                                app.terminals
-                                    .get(&PaneId::from_raw(flow_pane))
-                                    .map(|s| {
-                                        let v = s.visible_lines();
-                                        v.iter()
-                                            .filter(|l| !l.trim().is_empty())
-                                            .rev()
-                                            .take(2)
-                                            .cloned()
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .unwrap_or_default();
-                        eprintln!(
-                            "TAKO_SELF_TEST_681_FLOW: pane={flow_pane} row {:?} -> {:?} history {} -> {} (flowed={flowed}) tail={tail:?}",
-                            before.0, after.0, before.1, after.1
-                        );
-                        check(
-                            flowed >= 20
-                                && matches!(
-                                    (before.0, after.0),
-                                    (Some(b), Some(a)) if (a - (b - flowed as f32)).abs() < 0.001
-                                ),
-                            "出力が流れるとカードも押し出された行数ぶん上へ流れる (#681、直接ペイン)",
-                        );
-                        // 後片付け（検証用ペインを残さない）
-                        let _ = window.update(cx, |app, _, cx| {
-                            app.remove_pane(PaneId::from_raw(flow_pane), cx);
-                            cx.notify();
-                        });
+                    frames!(3);
+                    let with_card = window.update(cx, |app, _, _| band_state(app)).unwrap_or((0, 0.0, 0.0, false));
+                    let band_rows = if cell_h > 0.0 {
+                        (with_card.1 / cell_h).round() as usize
                     } else {
-                        eprintln!(
-                            "TAKO_SELF_TEST_681_FLOW: skipped (backend/alt pane: 履歴は tmux 側 = ライブ領域からの距離を保つのが正)"
-                        );
-                    }
+                        0
+                    };
+                    eprintln!(
+                        "TAKO_SELF_TEST_703_BAND: cell_h={cell_h:.1} base=(rows={} band={:.1} bottom={:.1}) \
+                         with_card=(rows={} band={:.1} bottom={:.1} drawn={})",
+                        base.0, base.1, base.2, with_card.0, with_card.1, with_card.2, with_card.3
+                    );
+                    check(
+                        base.1 == 0.0
+                            && with_card.3
+                            && band_rows > 0
+                            && with_card.0 + band_rows == base.0,
+                        "カード出現でターミナルの行数が帯のぶんちょうど減る (#703)",
+                    );
+                    check(
+                        (with_card.2 + with_card.1 - base.2).abs() <= 0.5,
+                        "テキスト領域と帯が縦を分け合う（重なる余地が無い） (#703)",
+                    );
+
+                    // (c) 落ち着いたら resize が走らない。コピー成功表示のように
+                    //     カード内の見た目だけが変わっても行数は動かない
+                    frames!(4);
+                    let settled = window.update(cx, |app, _, _| band_state(app)).unwrap_or((0, 0.0, 0.0, false));
                     let _ = window.update(cx, |app, _, cx| {
-                        app.dismiss_command_card(anchor_card, cx);
+                        app.copy_command_card(band_card, 1, cx);
+                        app.flush_pending_clipboard(cx);
                     });
+                    frames!(3);
+                    let after_copy = window.update(cx, |app, _, _| band_state(app)).unwrap_or((0, 0.0, 0.0, false));
+                    eprintln!(
+                        "TAKO_SELF_TEST_703_STABLE: settled=(rows={} band={:.1}) after_copy=(rows={} band={:.1})",
+                        settled.0, settled.1, after_copy.0, after_copy.1
+                    );
+                    check(
+                        settled.0 == with_card.0
+                            && after_copy.0 == with_card.0
+                            && (after_copy.1 - with_card.1).abs() <= 0.5,
+                        "帯が落ち着いた後は再描画でもコピー操作でも行数が動かない (#703)",
+                    );
+
+                    // (e) 上限。3 枚（FR-2.22.5 の上限）× 折り返す長いコマンドを積む
+                    let long_cmd = format!("echo {}", "long-command-segment ".repeat(12));
+                    let _ = window.update(cx, |app, _, cx| {
+                        show(app, vec![long_cmd.clone(), long_cmd.clone()], pane);
+                        show(app, vec![long_cmd.clone(), long_cmd.clone()], pane);
+                        cx.notify();
+                    });
+                    frames!(4);
+                    let stacked = window.update(cx, |app, _, _| band_state(app)).unwrap_or((0, 0.0, 0.0, false));
+                    let full_area_h = stacked.1 + stacked.0 as f32 * cell_h;
+                    let cap_rows = tako_core::command_card::band_rows(f32::MAX, full_area_h, cell_h);
+                    let stacked_rows = if cell_h > 0.0 {
+                        (stacked.1 / cell_h).round() as usize
+                    } else {
+                        0
+                    };
+                    eprintln!(
+                        "TAKO_SELF_TEST_703_CAP: stacked=(rows={} band={:.1} band_rows={stacked_rows}) \
+                         cap_rows={cap_rows} area_h={full_area_h:.1}",
+                        stacked.0, stacked.1
+                    );
+                    check(
+                        stacked_rows > 0
+                            && stacked_rows <= cap_rows
+                            && stacked.0 >= tako_core::command_card::MIN_TERMINAL_ROWS,
+                        "3 枚スタックでも帯は上限までで端末に最低行数が残る (#703)",
+                    );
+
+                    // (d) 全部閉じると行数も領域も完全に元へ戻る
+                    let _ = window.update(cx, |app, _, cx| {
+                        let ids: Vec<u64> = app
+                            .command_cards
+                            .list(Some(PaneId::from_raw(pane)))
+                            .iter()
+                            .map(|c| c.id().as_u64())
+                            .collect();
+                        for id in ids {
+                            app.dismiss_command_card(id, cx);
+                        }
+                        cx.notify();
+                    });
+                    frames!(3);
+                    let restored = window.update(cx, |app, _, _| band_state(app)).unwrap_or((0, 0.0, 0.0, false));
+                    eprintln!(
+                        "TAKO_SELF_TEST_703_RESTORE: restored=(rows={} band={:.1} bottom={:.1}) \
+                         base=(rows={} bottom={:.1})",
+                        restored.0, restored.1, restored.2, base.0, base.2
+                    );
+                    check(
+                        restored.0 == base.0
+                            && restored.1 == 0.0
+                            && (restored.2 - base.2).abs() <= 0.5,
+                        "カードを閉じるとターミナルの行数と領域が元へ戻る (#703)",
+                    );
                 }
             }
 
