@@ -72,6 +72,68 @@ pub fn starter_footnote() -> &'static str {
     )
 }
 
+// --- チャットビュー（#702 / G2） ---
+
+/// ヘッダ右の「ターミナルを表示」ボタン（スターターの「コマンド入力へ」と同じ動作）
+pub fn chat_show_terminal() -> &'static str {
+    tr!("ターミナルを表示", "Show terminal")
+}
+
+/// 生成中
+pub fn chat_status_busy() -> &'static str {
+    tr!("考え中…", "Thinking...")
+}
+
+/// 応答待ち（人の入力を待っている状態）
+pub fn chat_status_idle() -> &'static str {
+    tr!("待機中", "Ready")
+}
+
+/// busy 中に打たれた指示が claude のキューに滞留している（#572）
+pub fn chat_status_queued() -> &'static str {
+    tr!(
+        "送信済み・生成後に届きます",
+        "Sent - will be delivered after this reply"
+    )
+}
+
+/// コンテキスト残量（残り N%）
+pub fn chat_ctx_label(left_percent: i32) -> String {
+    tr!(
+        format!("残り {left_percent}%"),
+        format!("{left_percent}% left")
+    )
+}
+
+/// 会話がまだ 1 件も無いとき
+pub fn chat_empty() -> &'static str {
+    tr!(
+        "まだ会話はありません。話しかけると、ここにやり取りが並びます",
+        "No messages yet - your conversation will appear here"
+    )
+}
+
+/// transcript ファイルがまだ作られていない（起動直後の新規セッション）
+pub fn chat_transcript_pending() -> &'static str {
+    tr!(
+        "会話の記録を待っています",
+        "Waiting for the conversation log"
+    )
+}
+
+/// assistant の思考（既定は折りたたみ）
+pub fn chat_thinking() -> &'static str {
+    tr!("考えの過程", "Thinking")
+}
+
+/// worker ペインの説明行（入力欄の代わり。§2.4）
+pub fn chat_worker_note() -> &'static str {
+    tr!(
+        "この AI は自動で動いています（指示は司令塔の AI から届きます）",
+        "This AI runs on its own - instructions come from the lead AI"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -92,6 +154,15 @@ mod tests {
                 card_terminal_title().to_string(),
                 card_terminal_desc().to_string(),
                 starter_footnote().to_string(),
+                chat_show_terminal().to_string(),
+                chat_status_busy().to_string(),
+                chat_status_idle().to_string(),
+                chat_status_queued().to_string(),
+                chat_ctx_label(42),
+                chat_empty().to_string(),
+                chat_transcript_pending().to_string(),
+                chat_thinking().to_string(),
+                chat_worker_note().to_string(),
             ]
         });
     }

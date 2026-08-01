@@ -69,7 +69,11 @@ pub struct PaneDisplayInput {
     pub mode: UiMode,
     /// スターターの「コマンド入力へ」でこのペインだけ解除されている（揮発フラグ）
     pub released: bool,
-    /// alt screen（vim 等の TUI）。構造的に置き換え不可
+    /// alt screen（vim 等の TUI）。構造的に置き換え不可。
+    ///
+    /// **ペインの中で動いているプログラム**の状態を渡すこと。tmux バックエンド越しの
+    /// ペインでは、外側のエミュレータのフラグは tmux クライアント自身の alt screen を
+    /// 指していて中身とは無関係（実測で確認済み。#702）
     pub alt_screen: bool,
     /// claude 対話 TUI が稼働していると確定した（G2 で配線。G1 は常に false）
     pub claude_chat: bool,
@@ -122,6 +126,43 @@ pub fn pane_display(input: PaneDisplayInput) -> PaneDisplay {
         return PaneDisplay::Starter;
     }
     PaneDisplay::Terminal
+}
+
+/// チャットビューにしてよいかの材料（判定表の「claude 対話 TUI 稼働」行。#702）。
+///
+/// 材料はどれも既存の仕組みから取れるものだけにしてある:
+/// `session_id` / `interactive` は `agents::live_claude_sessions_by_backend`
+/// （pid 祖先辿り + sticky #466）、`agent_running` は sleep_guard の子プロセス判定（#372）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChatEligibility<'a> {
+    /// live 解決で得た claude の session_id（transcript の参照キー）
+    pub session_id: Option<&'a str>,
+    /// `claude agents --json` の `kind == "interactive"` = 対話 TUI
+    pub interactive: bool,
+    /// ペインに実行中の子プロセスがある = claude のプロセスがまだ生きている
+    pub agent_running: bool,
+}
+
+/// チャット化する場合に描画対象の session_id を返す（しないなら None）。
+///
+/// **3 つの証拠が揃ったときだけ**チャットにする。1 つでも欠けたらターミナル表示のまま:
+/// - session_id が無い → 描く会話が無い（空のチャットで画面を覆うのが最悪の失敗）
+/// - interactive でない → `claude -p` 等の一時セッション。人が読む会話ではない
+/// - 子プロセスが無い → claude はもう終了している。sticky（#466）は agents の一時失敗に
+///   耐えるため記憶を保持し続けるので、**生存の根拠はプロセス側から取る**
+pub fn chat_session(input: ChatEligibility<'_>) -> Option<&str> {
+    let session = input.session_id?.trim();
+    if session.is_empty() || !input.interactive || !input.agent_running {
+        return None;
+    }
+    Some(session)
+}
+
+/// 入力を受け付けない（read-only チャットにする）ペインか（§2.4）。
+/// worker への指示は master 経由が原則なので、worker のチャットは読むだけにする
+pub fn is_read_only_role(role: &str) -> bool {
+    let role = role.trim();
+    role.contains("orchestrator-worker") || role.starts_with("worker")
 }
 
 /// スターターの 3 ボタン（`.agent/plans/2026-07-gui-mode.md` §2.2）
@@ -275,6 +316,80 @@ mod tests {
                 "保守的判定が崩れている: {input:?}"
             );
             assert!(!input.is_idle_shell());
+        }
+    }
+
+    /// チャット判定の起点（3 つの証拠が揃った状態）
+    fn chat_ok<'a>(session: &'a str) -> ChatEligibility<'a> {
+        ChatEligibility {
+            session_id: Some(session),
+            interactive: true,
+            agent_running: true,
+        }
+    }
+
+    #[test]
+    fn 証拠が揃ったときだけチャット化する() {
+        assert_eq!(chat_session(chat_ok("abc-123")), Some("abc-123"));
+        // 前後の空白は落として返す（transcript の参照キーになる）
+        assert_eq!(chat_session(chat_ok("  abc-123 ")), Some("abc-123"));
+
+        let missing = [
+            // session_id が無い / 空 = 描く会話が無い
+            ChatEligibility {
+                session_id: None,
+                ..chat_ok("x")
+            },
+            ChatEligibility {
+                session_id: Some("   "),
+                ..chat_ok("x")
+            },
+            // `claude -p` 等の非対話セッション
+            ChatEligibility {
+                interactive: false,
+                ..chat_ok("abc-123")
+            },
+            // claude が終了済み（sticky の記憶だけが残っている状態）
+            ChatEligibility {
+                agent_running: false,
+                ..chat_ok("abc-123")
+            },
+        ];
+        for input in missing {
+            assert_eq!(
+                chat_session(input),
+                None,
+                "証拠が欠けたらチャット化しない: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn チャット判定はpane_displayの表に載る() {
+        // 判定の結果を claude_chat に入れれば表が Chat を返す（配線の契約）
+        let session = chat_session(chat_ok("abc-123"));
+        let input = PaneDisplayInput {
+            claude_chat: session.is_some(),
+            state: CommandState::Running,
+            busy_children: true,
+            has_role: true,
+            ..gui_idle()
+        };
+        assert_eq!(pane_display(input), PaneDisplay::Chat);
+    }
+
+    #[test]
+    fn workerロールだけ読み取り専用() {
+        for role in [
+            "orchestrator-worker",
+            "orchestrator-worker:3",
+            "worker",
+            "worker-2",
+        ] {
+            assert!(is_read_only_role(role), "worker は read-only: {role}");
+        }
+        for role in ["orchestrator-master", "master", "solo", "master:sol", ""] {
+            assert!(!is_read_only_role(role), "master / solo は入力可: {role}");
         }
     }
 

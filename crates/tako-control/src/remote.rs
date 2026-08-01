@@ -4353,6 +4353,9 @@ mod tests {
             crate::agents::LiveClaudeSession {
                 session_id: "sid-648".into(),
                 interactive: true,
+                model: None,
+                ctx_percent: None,
+                status: None,
             },
         )]
         .into();
@@ -4381,6 +4384,9 @@ mod tests {
             crate::agents::LiveClaudeSession {
                 session_id: "sid-p".into(),
                 interactive: false,
+                model: None,
+                ctx_percent: None,
+                status: None,
             },
         )]
         .into();

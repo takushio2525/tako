@@ -177,6 +177,17 @@ pub fn read_messages(session_id: &str, tail: usize) -> Result<Value, String> {
     }))
 }
 
+/// **所在が分かっている** transcript の末尾 `tail` 件を正規化して返す（#702）。
+///
+/// [`read_messages`] は毎回 config ディレクトリを走査して所在を探すが、GUI モードの
+/// チャットビューは 2 秒ごとに同じファイルを見るので、解決済みのパスを使い回して
+/// `read_dir` を省く（同時に「更新の有無」を mtime で判断する呼び出し側の前提とも合う）
+pub fn read_messages_at(path: &Path, tail: usize) -> Result<Vec<Value>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("transcript を開けない: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+    Ok(normalize_lines(reader.lines().map_while(Result::ok), tail))
+}
+
 /// 会話の最初のユーザー発話を返す（`max_chars` で切り詰め）。
 /// セッションカタログ（Issue #112）の `show` 用。ファイルは先頭から
 /// ストリーム読みして最初の該当行で打ち切るため、巨大 transcript でも軽い
