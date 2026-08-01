@@ -127,6 +127,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("fail_x"),
     ui_asset!("file_generic"),
     ui_asset!("fleet"),
+    ui_asset!("image"),
+    ui_asset!("info"),
     ui_asset!("folder_ui"),
     ui_asset!("git_branch"),
     ui_asset!("git_merge"),
@@ -216,6 +218,10 @@ pub mod ui_icon {
     pub const CHAT_BUBBLE: &str = "icons/ui/chat_bubble.svg";
     /// ターミナル表示モード中の印（#694。プロンプト記号 `>_`）
     pub const PROMPT: &str = "icons/ui/prompt.svg";
+    /// 画像添付のプレースホルダ（#715。transcript には画像の実体が無いので印だけ出す）
+    pub const IMAGE: &str = "icons/ui/image.svg";
+    /// システム通知の印（#715。警告ではないので WARNING とは分ける）
+    pub const INFO: &str = "icons/ui/info.svg";
 }
 
 impl AssetSource for TakoAssets {

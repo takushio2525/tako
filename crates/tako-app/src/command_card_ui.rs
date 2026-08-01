@@ -314,6 +314,47 @@ impl TakoApp {
         .size_full()
     }
 
+    /// このペインのカードを**描画済み要素**として返す（#716）。
+    ///
+    /// GUI モードのチャットビューは帯ではなく会話の流れの中にカードを置くので、
+    /// 器（帯）だけを持たずカード本体を借りる。カードの見た目・コピー・実行は
+    /// 帯と**同じ関数**を通るので、片方だけ直る事故が起きない。
+    /// 新しいカードほど上（帯と同じ並び）
+    pub(crate) fn command_card_elements(
+        &mut self,
+        pane_id: PaneId,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        if self.command_cards.is_empty() {
+            return Vec::new();
+        }
+        let cards = self.command_card_rows(pane_id);
+        if cards.is_empty() {
+            return Vec::new();
+        }
+        let copied = self
+            .command_card_copied
+            .filter(|(_, _, at)| at.elapsed() < FEEDBACK_DURATION);
+        let errored = self
+            .command_card_error
+            .filter(|(_, at)| at.elapsed() < FEEDBACK_DURATION);
+        cards
+            .iter()
+            .rev()
+            .map(|(card_id, label, commands)| {
+                self.render_command_card(
+                    *card_id,
+                    label.clone(),
+                    commands.clone(),
+                    copied,
+                    errored,
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+
     /// カード 1 枚
     fn render_command_card(
         &self,

@@ -3361,6 +3361,9 @@ impl TakoApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            // #716: 他のテキスト入力（チャット入力欄）との排他を保つ。
+                            // 両方フォーカス扱いだと IME の宛先が優先順位で決まってしまう
+                            this.clear_text_input_focus();
                             this.git_commit_input_focused = true;
                             this.git_commit_cursor = this.git_commit_message.len();
                             cx.stop_propagation();
@@ -3897,6 +3900,8 @@ impl TakoApp {
             &theme,
             cx.listener(|this, _, _, cx| {
                 this.git_collapsed.branches = false;
+                // #716: チャット入力欄とのフォーカス排他（IME の宛先を 1 つに保つ）
+                this.clear_text_input_focus();
                 // 基点は現在の HEAD（= 今いるブランチ）。入力欄に明示表示する
                 this.git_branch_input = Some(GitBranchInput {
                     text: String::new(),

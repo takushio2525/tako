@@ -126,12 +126,130 @@ pub fn chat_thinking() -> &'static str {
     tr!("考えの過程", "Thinking")
 }
 
+// --- #715: システム注入コンテンツの表示 ---
+
+/// 画像添付のプレースホルダ（本文が空でも「画像を送った」ことを伝える）
+pub fn chat_image_attachment(count: usize) -> String {
+    if count <= 1 {
+        tr!("画像".to_string(), "Image".to_string())
+    } else {
+        tr!(format!("画像 {count} 件"), format!("{count} images"))
+    }
+}
+
+/// システム通知の 1 行（`summary` は正規化層が生 XML を除いた要約）。
+/// `count` は連続してまとめられた件数
+pub fn chat_system_notice(summary: &str, count: u64) -> String {
+    let label = tr!("システム通知", "System notice");
+    let body = if summary.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}: {summary}")
+    };
+    if count > 1 {
+        tr!(format!("{body}（{count} 件）"), format!("{body} ({count})"))
+    } else {
+        body
+    }
+}
+
 /// worker ペインの説明行（入力欄の代わり。§2.4）
 pub fn chat_worker_note() -> &'static str {
     tr!(
         "この AI は自動で動いています（指示は司令塔の AI から届きます）",
         "This AI runs on its own - instructions come from the lead AI"
     )
+}
+
+// --- #716 / G3: 入力・承認・スラッシュボタン ---
+
+/// 入力欄のプレースホルダ（生成中は「あとで届く」ことを先に伝える）
+pub fn chat_placeholder(busy: bool) -> String {
+    if busy {
+        tr!(
+            "いま考え中です。続けて書くと、終わったら届きます".to_string(),
+            "Still thinking - anything you write now is delivered when it finishes".to_string()
+        )
+    } else {
+        tr!(
+            "やってほしいことを書いてください".to_string(),
+            "Tell the AI what you would like done".to_string()
+        )
+    }
+}
+
+/// 送信キーの案内（初心者向けの学習経路）
+pub fn chat_send_hint() -> &'static str {
+    tr!(
+        "Enter で送信・Shift+Enter で改行",
+        "Enter to send, Shift+Enter for a new line"
+    )
+}
+
+pub fn chat_slash_compact() -> &'static str {
+    tr!("会話を軽くする", "Shrink the conversation")
+}
+
+pub fn chat_slash_clear() -> &'static str {
+    tr!("新しい会話", "Start over")
+}
+
+pub fn chat_slash_help() -> &'static str {
+    tr!("ヘルプ", "Help")
+}
+
+/// 「新しい会話」の確認（何が失われるかを言い切る）
+pub fn chat_clear_confirm_title() -> &'static str {
+    tr!("新しい会話を始めますか？", "Start a new conversation?")
+}
+
+pub fn chat_clear_confirm_body() -> &'static str {
+    tr!(
+        "いまの会話の内容を AI が忘れます（ファイルや実行中の作業は消えません）",
+        "The AI forgets this conversation. Your files and running work are untouched"
+    )
+}
+
+pub fn chat_clear_cancel() -> &'static str {
+    tr!("やめる", "Cancel")
+}
+
+pub fn chat_clear_ok() -> &'static str {
+    tr!("新しく始める", "Start over")
+}
+
+/// 承認カードの見出し
+pub fn chat_approval_title() -> &'static str {
+    tr!("確認が必要です", "Your approval is needed")
+}
+
+/// 送信に失敗した（dispatch のエラーをそのまま添える）
+pub fn chat_send_failed(reason: &str) -> String {
+    tr!(
+        format!("送信できませんでした: {reason}"),
+        format!("Could not send: {reason}")
+    )
+}
+
+/// 承認の応答に失敗した
+pub fn chat_respond_failed(reason: &str) -> String {
+    tr!(
+        format!("応答できませんでした: {reason}"),
+        format!("Could not respond: {reason}")
+    )
+}
+
+/// 長い発話を畳んでいるときの「続きを表示」（`chars` は全体の文字数）
+pub fn chat_expand_long(chars: usize) -> String {
+    tr!(
+        format!("続きを表示（全 {chars} 文字）"),
+        format!("Show all ({chars} characters)")
+    )
+}
+
+/// 展開済みの長い発話を畳む
+pub fn chat_collapse_long() -> &'static str {
+    tr!("折りたたむ", "Collapse")
 }
 
 #[cfg(test)]
@@ -163,6 +281,26 @@ mod tests {
                 chat_transcript_pending().to_string(),
                 chat_thinking().to_string(),
                 chat_worker_note().to_string(),
+                chat_image_attachment(1),
+                chat_image_attachment(3),
+                chat_system_notice("Monitor event", 1),
+                chat_system_notice("Monitor event", 4),
+                chat_placeholder(false),
+                chat_placeholder(true),
+                chat_send_hint().to_string(),
+                chat_slash_compact().to_string(),
+                chat_slash_clear().to_string(),
+                chat_slash_help().to_string(),
+                chat_clear_confirm_title().to_string(),
+                chat_clear_confirm_body().to_string(),
+                chat_clear_cancel().to_string(),
+                chat_clear_ok().to_string(),
+                chat_approval_title().to_string(),
+                // 差し込む理由は dispatch のエラー文字列なので、検査には言語非依存の値を使う
+                chat_send_failed("timeout"),
+                chat_respond_failed("timeout"),
+                chat_expand_long(9000),
+                chat_collapse_long().to_string(),
             ]
         });
     }

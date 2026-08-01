@@ -732,6 +732,8 @@ enum AppTextInput {
     GitCommit,
     /// git タブの新規ブランチ名欄
     GitBranch,
+    /// GUI モードのチャット入力欄（#716）
+    ChatInput,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -1303,6 +1305,22 @@ struct TakoApp {
     /// 発話本文の md パース結果（内容キー → ブロック列）。
     /// pulldown-cmark + syntect を毎フレーム回さないためのキャッシュ（仕様書 §5）
     chat_md_cache: HashMap<u64, std::rc::Rc<Vec<preview::MdBlock>>>,
+    /// チャット入力欄の下書き（ペインごと。#716）。
+    /// ペインを移っても書きかけが残るようペイン単位で持つ
+    chat_inputs: HashMap<PaneId, chat_view::ChatInput>,
+    /// いまキーボード入力を受けているチャット入力欄（#716）。
+    /// `git_commit_input_focused` と同じ「フラグ 1 個」方式で、
+    /// `clear_text_input_focus` の一括クリア対象に入れる（#503 の不変条件）
+    chat_input_focused: Option<PaneId>,
+    /// 送信直後の楽観 echo（#716 / 仕様 §3.1）。transcript へ現れたら破棄する
+    chat_echo: HashMap<PaneId, Vec<chat_view::ChatEcho>>,
+    /// 「新しい会話」（/clear）の確認待ちペイン（#716。破壊的なので必ず 1 段挟む）
+    chat_clear_confirm: Option<PaneId>,
+    /// 送信・承認が失敗したときの表示（ペイン, 文言, 時刻）。時間経過で消える
+    chat_action_error: Option<(PaneId, String, std::time::Instant)>,
+    /// 本文が長い発話を畳んでいるか（#716。既定は畳む = 会話が読める）。
+    /// キーは (ペイン, 発話の内容キー) で、`chat_expanded` と同じ流儀
+    chat_long_expanded: std::collections::HashSet<(PaneId, u64)>,
     /// アプリ内自動更新の状態。表示先は上部通知カードと専用ウィンドウ（#616）
     update_state: update_checker::UpdateState,
     /// 更新通知カードを × で閉じたときのキー（`update_checker::card_key`。#616）。
@@ -2522,6 +2540,12 @@ impl TakoApp {
             chat_scroll_handles: HashMap::new(),
             chat_content_keys: HashMap::new(),
             chat_md_cache: HashMap::new(),
+            chat_inputs: HashMap::new(),
+            chat_input_focused: None,
+            chat_echo: HashMap::new(),
+            chat_clear_confirm: None,
+            chat_action_error: None,
+            chat_long_expanded: std::collections::HashSet::new(),
             update_state: update_checker::UpdateState::Idle,
             // #616: 前回 × で閉じたバージョンを引き継ぐ（再起動しても出直さない）
             update_card_dismissed: tako_control::settings::load().update_card_dismissed,
@@ -5050,6 +5074,9 @@ impl TakoApp {
     /// キー入力がターミナルペインへ届くようにする。
     /// タブ切替・ペインフォーカス移動・パネル非表示化など、入力対象が変わる全経路で呼ぶ
     fn clear_text_input_focus(&mut self) {
+        // #716: チャット入力欄も同じ経路で落とす（#503 の不変条件）。
+        // 下書き（`chat_inputs`）は残す = 戻ってきたら書きかけが続く
+        self.chat_input_focused = None;
         self.git_commit_input_focused = false;
         // #496: 新規ブランチ名の入力もキーを奪うので同じ経路で落とす（#503 の不変条件）
         self.git_branch_input = None;
@@ -8344,6 +8371,11 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        // #716: チャット入力欄（貼り付け先の振り分けも handle_key と同じ優先順位）
+        if let Some(pane) = self.chat_input_pane() {
+            self.chat_input_insert(pane, &text, cx);
+            return;
+        }
         // #496: ブランチ名入力が優先（コミット欄と同時にフォーカスされることはない）
         if self.git_branch_input.is_some() {
             self.git_branch_input_insert(&text, cx);
@@ -8383,6 +8415,8 @@ impl TakoApp {
         self.command_palette.is_some()
             || self.inline_edit.is_some()
             || self.git_branch_input.is_some()
+            // #716: チャット入力欄（実際にチャット表示のペインに限る）
+            || self.chat_input_pane().is_some()
             // #503 と同じ条件で「見えているコミット欄」に限る（stale フラグで拾わない）
             || (self.git_commit_input_focused
                 && self.panel_visible
@@ -8419,6 +8453,19 @@ impl TakoApp {
             self.handle_inline_edit_key(keystroke, cx);
             cx.stop_propagation();
             return;
+        }
+
+        // #716: GUI モードのチャット入力欄。git の入力欄より先に見るのは、
+        // チャットは「ペインそのものの入力欄」= より内側の対象だから
+        // （git パネルとチャットが同時にフォーカスを持つことはない）
+        if let Some(pane) = self.chat_input_pane() {
+            if self.handle_chat_input_key(pane, keystroke, cx) {
+                cx.stop_propagation();
+                return;
+            }
+        } else {
+            // 表示がターミナルへ戻った / read-only になったらフラグを落とす（#503 の防御）
+            self.chat_input_focused = None;
         }
 
         // #503: git 入力欄が見えない（パネル非表示 or git 以外のビュー）のに
@@ -8615,6 +8662,11 @@ impl TakoApp {
         if self.inline_edit.is_some() || self.webview_dock_url_focused {
             return None;
         }
+        // #716: チャット入力欄。**いま実際にチャット表示のペイン**に限る
+        // （#503 と同じ考えで、stale なフラグで IME を奪わない）
+        if self.chat_input_pane().is_some() {
+            return Some(AppTextInput::ChatInput);
+        }
         if self.git_branch_input.is_some() {
             return Some(AppTextInput::GitBranch);
         }
@@ -8635,6 +8687,11 @@ impl TakoApp {
         match target {
             AppTextInput::GitCommit => self.git_commit_insert(text, cx),
             AppTextInput::GitBranch => self.git_branch_input_insert(text, cx),
+            AppTextInput::ChatInput => {
+                if let Some(pane) = self.chat_input_pane() {
+                    self.chat_input_insert(pane, text, cx);
+                }
+            }
         }
     }
 
@@ -20936,15 +20993,48 @@ mod self_test {
                         },
                         PaneOrigin::User,
                     );
-                    let messages = chat_view::messages_from_json(&[
-                        serde_json::json!({ "role": "user", "text": "この表とコードを見せて" }),
+                    // #715: **実 transcript と同じ生 JSONL** を本番の正規化
+                    // （`transcript::normalize_lines`）に通す。画像メタ・
+                    // task-notification が混ざった会話でも、生 XML が 1 文字も
+                    // 描かれないこと（= 描画用モデルに残っていないこと）まで見る
+                    let raw_lines: Vec<String> = vec![
+                        r#"{"type":"user","message":{"content":"この表とコードを見せて"}}"#.into(),
+                        r#"{"type":"user","message":{"content":"[Image: original 3024x1964, displayed at 2000x1299. Multiply coordinates by 1.51 to map to original image.]"}}"#.into(),
+                        r#"{"type":"user","message":{"content":"<task-notification>\n<task-id>vt715</task-id>\n<summary>Monitor event: visual-test</summary>\n</task-notification>"}}"#.into(),
                         serde_json::json!({
-                            "role": "assistant",
-                            "text": "## 結果\n\n| 項目 | 値 |\n|---|---|\n| 件数 | 42 |\n\n                                     ```rust\nfn main() { println!(\"hi\"); }\n```\n\n                                     詳しくは **こちら**。",
-                            "thinking": "表 → コード → 補足の順に出す",
-                            "tools": [{ "name": "Bash", "summary": "cargo test --workspace" }],
-                        }),
-                    ]);
+                            "type": "assistant",
+                            "requestId": "vt1",
+                            "message": { "content": [
+                                { "type": "thinking", "thinking": "表 → コード → 補足の順に出す" },
+                                { "type": "tool_use", "name": "Bash", "input": { "command": "cargo test --workspace" } },
+                                { "type": "text", "text": "## 結果\n\n| 項目 | 値 |\n|---|---|\n| 件数 | 42 |\n\n```rust\nfn main() { println!(\"hi\"); }\n```\n\n詳しくは **こちら**。" },
+                            ] },
+                        })
+                        .to_string(),
+                    ];
+                    let normalized = tako_control::transcript::normalize_lines(
+                        raw_lines.into_iter(),
+                        chat_view::CHAT_TAIL,
+                    );
+                    let messages = chat_view::messages_from_json(&normalized);
+                    // 描画用モデルに生システムテキストが残っていないこと（#715）
+                    let leaked = messages.iter().any(|m| {
+                        ["task-notification", "Multiply coordinates", "<summary>"]
+                            .iter()
+                            .any(|pat| m.text.contains(pat))
+                    });
+                    check(
+                        !leaked,
+                        "visual-test チャット: 生システムテキストが描画対象に残らない (#715)",
+                    );
+                    // 画像プレースホルダとシステム通知の行が両方あること
+                    check(
+                        messages.iter().any(|m| m.images == 1)
+                            && messages
+                                .iter()
+                                .any(|m| m.role == chat_view::ChatRole::System),
+                        "visual-test チャット: 画像プレースホルダとシステム通知が並ぶ (#715)",
+                    );
                     app.chat_panes.insert(
                         pane,
                         std::rc::Rc::new(chat_view::ChatPaneState {
@@ -21010,6 +21100,117 @@ mod self_test {
                     chat_band_light > 1000 && theme_changed > 1000,
                     "visual-test チャット: ライトテーマでも読める濃さで描かれる (#702)",
                 );
+
+                // #716 / G3: 入力欄・スラッシュボタン・承認カード・インラインカードを
+                // 実ピクセルで見る。ペイン下端の帯（入力欄 + ボタン列）に必ずインクが
+                // 乗っていることと、承認カードを出すと会話側の絵が変わることを確かめる
+                let composer = Bounds::new(
+                    point(area.left(), area.bottom() - area.size.height * 0.22),
+                    size(area.size.width, area.size.height * 0.22),
+                );
+                let composer_light =
+                    readable_pixels_in_bounds(&gui_light, &[composer], scale, bg_light, 2.0);
+                // 入力して見た目が変わること（打鍵経路ではなく挿入 API = IME 確定と同じ経路）
+                let _ = window.update(cx, |app, _, cx| {
+                    app.focus_chat_input(pane, cx);
+                    // 複数行（Shift+Enter 相当）でもキャレット位置と折り返しが崩れないか見る
+                    app.chat_input_insert(pane, "テストの依頼を書きました\n2 行目もあります", cx);
+                });
+                let (typed, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: 入力後フレーム"));
+                let typed_changed =
+                    changed_pixels_in_bounds(&gui_light, &typed, &[composer], scale);
+                // 承認カード + インラインカードを出す
+                let _ = window.update(cx, |app, _, cx| {
+                    if let Some(state) = app.chat_panes.get(&pane) {
+                        let mut next = (**state).clone();
+                        next.permission = Some(tako_control::claude_tui::PermissionDialog {
+                            command: "rm -rf build/".into(),
+                            options: vec!["Allow once".into(), "No, tell Claude".into()],
+                            highlighted: Some(0),
+                        });
+                        app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                    }
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::ShowCommand {
+                            action: None,
+                            pane: Some(pane.as_u64()),
+                            commands: vec!["brew upgrade tako".into()],
+                            label: Some("最新版へ更新".into()),
+                            card: None,
+                            index: None,
+                            focus: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (with_cards, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: カード付きフレーム"));
+                let cards_changed =
+                    changed_pixels_in_bounds(&typed, &with_cards, &[band], scale);
+                // ダーク側も同じ状態で 1 枚撮る（目視用。両テーマの仕上げ確認に使う）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("dark".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let g3_dark = capture_frame(any, cx).map(|(f, _)| f);
+                let g3_dark_ink = g3_dark
+                    .as_ref()
+                    .map(|f| readable_pixels_in_bounds(f, &[composer], scale, bg_dark, 2.0))
+                    .unwrap_or(0);
+                if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                    let base = std::path::Path::new(&dir);
+                    let _ = with_cards.save(base.join("chat-g3-light.png"));
+                    if let Some(frame) = g3_dark.as_ref() {
+                        let _ = frame.save(base.join("chat-g3-dark.png"));
+                    }
+                }
+                check(
+                    g3_dark_ink > 300,
+                    "visual-test チャット: ダークでも入力欄が読める濃さで描かれる (#716)",
+                );
+                println!(
+                    "TAKO_VISUAL_PIXEL: chat-g3 composer_light={composer_light}                      typed_changed={typed_changed} cards_changed={cards_changed}                      composer_dark={g3_dark_ink}"
+                );
+                check(
+                    composer_light > 300,
+                    "visual-test チャット: 入力欄とスラッシュボタンが描かれる (#716)",
+                );
+                check(
+                    typed_changed > 100,
+                    "visual-test チャット: 入力した文字が入力欄に出る (#716)",
+                );
+                check(
+                    cards_changed > 500,
+                    "visual-test チャット: 承認カードと提案カードが会話内に出る (#716)",
+                );
+                // 後片付け: カード・承認・下書きを落とす（後続の節へ持ち越さない）
+                let _ = window.update(cx, |app, _, cx| {
+                    app.chat_inputs.clear();
+                    app.chat_input_focused = None;
+                    app.command_cards.dismiss(Some(pane), None);
+                    if let Some(state) = app.chat_panes.get(&pane) {
+                        let mut next = (**state).clone();
+                        next.permission = None;
+                        app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                    }
+                    cx.notify();
+                });
 
                 // 後片付け: 既定（dark / terminal）へ戻す
                 let _ = window.update(cx, |app, _, cx| {
@@ -31595,6 +31796,421 @@ mod self_test {
                     "alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)",
                 );
 
+                // 95. GUI ライク表示モード G3 = チャット操作（#691 / #716）。
+                // 項目 94 が組んだチャットペインをそのまま使い、書き系の配線を見る:
+                // (a) 入力欄がキーを握り、IME の宛先もチャットになる（#561 の型で判別）
+                // (b) Enter = 送信 / Shift+Enter = 改行 / 空入力の Enter は無視
+                // (c) 送信すると楽観 echo が積まれ、下書きが空になる
+                // (d) スラッシュボタン: /compact は即送信、/clear は確認を挟む
+                // (e) 承認: ダイアログが**実在しない**ペインへの respond は失敗する（誤爆防止）
+                // (f) terminal 表示へ倒すと入力欄はキーを握らない（ターミナルへ届く）
+                {
+                    let ime_target = window
+                        .update(cx, |app, _, cx| {
+                            // 項目 94 の (e) には待ちがあり、そのあいだに定期更新が走って
+                            // 注入した会話が消える（このペインで動いているのは素のシェルなので
+                            // `apply_chat_refresh` が正しく「チャットではない」と判断する）。
+                            // ここから先は書き系の配線を見るので、会話を作り直してから始める
+                            app.ui_mode = UiMode::Gui;
+                            app.starter_released.remove(&chat_pane);
+                            app.chat_panes.insert(
+                                chat_pane,
+                                std::rc::Rc::new(chat_view::ChatPaneState {
+                                    session_id: "selftest-716".into(),
+                                    model: Some("claude-opus-5".into()),
+                                    ..Default::default()
+                                }),
+                            );
+                            app.focus_chat_input(chat_pane, cx);
+                            (
+                                app.chat_input_pane() == Some(chat_pane),
+                                app.app_text_input() == Some(AppTextInput::ChatInput),
+                                app.text_input_swallows_keys(),
+                            )
+                        })
+                        .unwrap_or((false, false, false));
+                    check(
+                        ime_target.0 && ime_target.1 && ime_target.2,
+                        "チャット入力欄がキーと IME の宛先になる (#716)",
+                    );
+
+                    // (b)(c) 打鍵 → 改行 → 送信。打鍵は描画のリスナーと同じ
+                    // `handle_chat_input_key` を通す（経路差を作らない）
+                    let typing = window
+                        .update(cx, |app, _, cx| {
+                            let ch = |k: &str, c: &str| Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: k.to_string(),
+                                key_char: Some(c.to_string()),
+                            };
+                            let shift_enter = Keystroke {
+                                modifiers: Modifiers {
+                                    shift: true,
+                                    ..Modifiers::default()
+                                },
+                                key: "enter".to_string(),
+                                key_char: None,
+                            };
+                            let enter = Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: "enter".to_string(),
+                                key_char: None,
+                            };
+                            // 空入力の Enter は何も起こさない（claude へ空行を送らない）
+                            app.handle_chat_input_key(chat_pane, &enter, cx);
+                            let empty_ignored = !app.chat_echo.contains_key(&chat_pane);
+                            app.handle_chat_input_key(chat_pane, &ch("a", "a"), cx);
+                            app.handle_chat_input_key(chat_pane, &shift_enter, cx);
+                            app.handle_chat_input_key(chat_pane, &ch("b", "b"), cx);
+                            let multiline = app.chat_input_text(chat_pane) == "a\nb";
+                            // IME 確定と同じ経路（#561 の振り分け）でも入る
+                            app.insert_app_text_input(AppTextInput::ChatInput, "です", cx);
+                            let ime_ok = app.chat_input_text(chat_pane) == "a\nbです";
+                            app.handle_chat_input_key(chat_pane, &enter, cx);
+                            let sent = app
+                                .chat_echo
+                                .get(&chat_pane)
+                                .is_some_and(|e| e.len() == 1 && e[0].text == "a\nbです");
+                            let cleared = app.chat_input_text(chat_pane).is_empty();
+                            if !(empty_ignored && multiline && ime_ok && sent && cleared) {
+                                eprintln!(
+                                    "TAKO_SELF_TEST_716_INPUT: empty={empty_ignored}                                      multi={multiline} ime={ime_ok} sent={sent} cleared={cleared}"
+                                );
+                            }
+                            empty_ignored && multiline && ime_ok && sent && cleared
+                        })
+                        .unwrap_or(false);
+                    check(
+                        typing,
+                        "Enter で送信 / Shift+Enter で改行 / 空入力は無視 (#716)",
+                    );
+
+                    // 楽観 echo は表示に混ざり、transcript に同じ発話が来たら消える
+                    let echo_lifecycle = window
+                        .update(cx, |app, _, _| {
+                            let state = app.chat_panes.get(&chat_pane).cloned();
+                            let shown = state.as_ref().is_some_and(|s| {
+                                app.chat_visible_messages(chat_pane, s)
+                                    .iter()
+                                    .any(|m| m.text == "a\nbです")
+                            });
+                            // transcript 側に同じ発話が現れた状況を作る
+                            if let Some(state) = state {
+                                let mut next = (*state).clone();
+                                next.messages
+                                    .extend(chat_view::messages_from_json(&[serde_json::json!({
+                                        "role": "user", "text": "a\nbです",
+                                    })]));
+                                app.chat_panes.insert(chat_pane, std::rc::Rc::new(next));
+                            }
+                            app.prune_chat_echo(chat_pane);
+                            let dropped = !app.chat_echo.contains_key(&chat_pane);
+                            shown && dropped
+                        })
+                        .unwrap_or(false);
+                    check(
+                        echo_lifecycle,
+                        "楽観 echo は即表示され transcript 反映で二重にならない (#716)",
+                    );
+
+                    // (d) スラッシュボタン
+                    let slash = window
+                        .update(cx, |app, _, cx| {
+                            use chat_view::SlashButton;
+                            app.chat_slash_action(chat_pane, SlashButton::Compact, cx);
+                            let compact_sent = app
+                                .chat_echo
+                                .get(&chat_pane)
+                                .is_some_and(|e| e.iter().any(|x| x.text == "/compact"));
+                            // /clear は確認を挟む = この時点では送られていない
+                            app.chat_slash_action(chat_pane, SlashButton::Clear, cx);
+                            let confirming = app.chat_clear_confirm == Some(chat_pane)
+                                && !app
+                                    .chat_echo
+                                    .get(&chat_pane)
+                                    .is_some_and(|e| e.iter().any(|x| x.text == "/clear"));
+                            app.chat_clear_accept(cx);
+                            let cleared_sent = app.chat_clear_confirm.is_none()
+                                && app
+                                    .chat_echo
+                                    .get(&chat_pane)
+                                    .is_some_and(|e| e.iter().any(|x| x.text == "/clear"));
+                            if !(compact_sent && confirming && cleared_sent) {
+                                eprintln!(
+                                    "TAKO_SELF_TEST_716_SLASH: compact={compact_sent}                                      confirm={confirming} clear={cleared_sent}"
+                                );
+                            }
+                            compact_sent && confirming && cleared_sent
+                        })
+                        .unwrap_or(false);
+                    check(
+                        slash,
+                        "スラッシュボタン: /compact は即送信・/clear は確認つき (#716)",
+                    );
+
+                    // (e) 承認の誤爆防止: 画面にダイアログが無ければ respond は失敗する。
+                    // 表示だけ差し込んでも「送れてしまう」ことがないことを見る
+                    let respond_guard = window
+                        .update(cx, |app, _, cx| {
+                            if let Some(state) = app.chat_panes.get(&chat_pane) {
+                                let mut next = (**state).clone();
+                                next.permission =
+                                    Some(tako_control::claude_tui::PermissionDialog {
+                                        command: "rm -rf /".into(),
+                                        options: vec!["Allow once".into(), "No".into()],
+                                        highlighted: Some(0),
+                                    });
+                                app.chat_panes.insert(chat_pane, std::rc::Rc::new(next));
+                            }
+                            let respond = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OrchestratorRespond {
+                                    pane_id: chat_pane.as_u64(),
+                                    choice: "1".into(),
+                                    caller_role: None,
+                                },
+                                PaneOrigin::User,
+                            );
+                            let _ = cx;
+                            respond.is_err()
+                        })
+                        .unwrap_or(false);
+                    check(
+                        respond_guard,
+                        "承認: 画面にダイアログが無ければ応答は拒否される (#716)",
+                    );
+
+                    // (f) terminal 表示へ倒すと入力欄はキーを握らない
+                    let terminal_release = window
+                        .update(cx, |app, _, cx| {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::UiMode {
+                                    action: Some("set".into()),
+                                    mode: Some("terminal".into()),
+                                    pane: None,
+                                },
+                                PaneOrigin::User,
+                            );
+                            let released =
+                                app.chat_input_pane().is_none() && !app.text_input_swallows_keys();
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::UiMode {
+                                    action: Some("set".into()),
+                                    mode: Some("gui".into()),
+                                    pane: None,
+                                },
+                                PaneOrigin::User,
+                            );
+                            let _ = cx;
+                            released
+                        })
+                        .unwrap_or(false);
+                    check(
+                        terminal_release,
+                        "terminal 表示ではチャット入力欄がキーを握らない (#716)",
+                    );
+                }
+
+                // 95c.（任意・TAKO_SELF_TEST_CLAUDE=1 のときだけ）**実 claude** で
+                //      「チャット入力欄に日本語を書いて送る → transcript に自分の発話が
+                //      現れる」通し e2e（#716 の受け入れ条件 1 そのもの）。
+                //      claude CLI + 認証 + tmux が必要なため既定ではスキップする。
+                //      45c と同格の実機検証ツールという位置付け
+                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed {
+                    // 注入した仮の会話を捨てて、実 claude を起動する
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.chat_panes.remove(&chat_pane);
+                        app.chat_echo.remove(&chat_pane);
+                        app.jump_to_pane(chat_pane, cx);
+                        if let Some(session) = app.terminals.get(&chat_pane) {
+                            session.write(b"claude\n".to_vec());
+                        }
+                    });
+                    // claude が起動して判定表がこのペインをチャットにするまで待つ。
+                    // **TUI のフッター文字列を目印にしない**: このペインは分割で
+                    // 背が低いことがあり、フッターが画面に出ないだけで落ちてしまう。
+                    // 「チャット表示になったか」= session_id が解決できたか、が本当の前提条件
+                    let mut became_chat = false;
+                    for _ in 0..150 {
+                        wait(cx, 1000).await;
+                        let trust = window
+                            .update(cx, |app, _, _| {
+                                if app.pane_display_for(chat_pane) == PaneDisplay::Chat {
+                                    return None;
+                                }
+                                let lines = app
+                                    .terminals
+                                    .get(&chat_pane)
+                                    .map(|s| s.visible_lines())
+                                    .unwrap_or_default();
+                                Some(lines.iter().any(|l| {
+                                    l.contains("trust this folder") || l.contains("Yes, I trust")
+                                }))
+                            })
+                            .unwrap_or(Some(false));
+                        match trust {
+                            None => {
+                                became_chat = true;
+                                break;
+                            }
+                            Some(true) => {
+                                let _ = window.update(cx, |app, _, _| {
+                                    if let Some(session) = app.terminals.get(&chat_pane) {
+                                        session.write(b"\r".to_vec());
+                                    }
+                                });
+                            }
+                            Some(false) => {}
+                        }
+                    }
+                    if !became_chat {
+                        let note = window
+                            .update(cx, |app, _, _| {
+                                format!(
+                                    "display={:?} backend={:?} tail={}",
+                                    app.pane_display_for(chat_pane),
+                                    app.backend_sessions.get(&chat_pane).cloned(),
+                                    app.terminals
+                                        .get(&chat_pane)
+                                        .map(|s| s
+                                            .visible_lines()
+                                            .into_iter()
+                                            .filter(|l| !l.trim().is_empty())
+                                            .collect::<Vec<_>>()
+                                            .join(" | "))
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        eprintln!("TAKO_SELF_TEST_716_CLAUDE_START: {note}");
+                    }
+                    check(became_chat, "95c: 実 claude ペインがチャット表示になる");
+
+                    // 入力欄へ日本語を入れて Enter（IME 確定と同じ経路 + 描画と同じキー経路）
+                    let probe = format!("これはテストです716-{}", std::process::id());
+                    let sent = window
+                        .update(cx, |app, _, cx| {
+                            app.focus_chat_input(chat_pane, cx);
+                            app.insert_app_text_input(AppTextInput::ChatInput, &probe, cx);
+                            let typed = app.chat_input_text(chat_pane) == probe;
+                            app.handle_chat_input_key(
+                                chat_pane,
+                                &Keystroke {
+                                    modifiers: Modifiers::default(),
+                                    key: "enter".to_string(),
+                                    key_char: None,
+                                },
+                                cx,
+                            );
+                            typed && app.chat_input_text(chat_pane).is_empty()
+                        })
+                        .unwrap_or(false);
+                    check(sent, "95c: 入力欄の日本語を Enter で送信して下書きが空になる");
+
+                    // transcript に自分の発話が現れる = GUI → Send → PromptFlow → claude →
+                    // transcript → チャット表示の全経路が繋がっている
+                    let mut in_transcript = false;
+                    for _ in 0..90 {
+                        wait(cx, 1000).await;
+                        in_transcript = window
+                            .update(cx, |app, _, _| {
+                                app.chat_state(chat_pane).is_some_and(|s| {
+                                    s.messages.iter().any(|m| {
+                                        m.role == chat_view::ChatRole::User && m.text.contains(&probe)
+                                    })
+                                })
+                            })
+                            .unwrap_or(false);
+                        if in_transcript {
+                            break;
+                        }
+                    }
+                    if !in_transcript {
+                        let note = window
+                            .update(cx, |app, _, _| {
+                                app.chat_state(chat_pane)
+                                    .map(|s| {
+                                        format!(
+                                            "session={} busy={} queued={} messages={}",
+                                            s.session_id,
+                                            s.busy,
+                                            s.queued,
+                                            s.messages.len()
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "チャット状態なし".to_string())
+                            })
+                            .unwrap_or_default();
+                        eprintln!("TAKO_SELF_TEST_716_CLAUDE: {note}");
+                    }
+                    check(
+                        in_transcript,
+                        "95c: 送った日本語が transcript に現れチャットに並ぶ (#716)",
+                    );
+
+                    // busy 中の送信（#716 受け入れ条件 2）。生成が始まっているうちに
+                    // 2 通目を送り、claude のキューに滞留してから自動で届くことを見る
+                    // （#572 の経路をそのまま使う）。`queued` は生成が短いと観測できない
+                    // ことがあるので、判定は「最終的に transcript へ届く」ことに置く
+                    let probe2 = format!("2通目です716-{}", std::process::id());
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.focus_chat_input(chat_pane, cx);
+                        app.insert_app_text_input(AppTextInput::ChatInput, &probe2, cx);
+                        app.handle_chat_input_key(
+                            chat_pane,
+                            &Keystroke {
+                                modifiers: Modifiers::default(),
+                                key: "enter".to_string(),
+                                key_char: None,
+                            },
+                            cx,
+                        );
+                    });
+                    let mut queued_seen = false;
+                    let mut delivered2 = false;
+                    for _ in 0..120 {
+                        wait(cx, 1000).await;
+                        let (queued, landed) = window
+                            .update(cx, |app, _, _| {
+                                app.chat_state(chat_pane)
+                                    .map(|s| {
+                                        (
+                                            s.queued,
+                                            s.messages.iter().any(|m| {
+                                                m.role == chat_view::ChatRole::User
+                                                    && m.text.contains(&probe2)
+                                            }),
+                                        )
+                                    })
+                                    .unwrap_or((false, false))
+                            })
+                            .unwrap_or((false, false));
+                        queued_seen |= queued;
+                        delivered2 = landed;
+                        if landed {
+                            break;
+                        }
+                    }
+                    println!("95c-QUEUE: queued_observed={queued_seen}");
+                    check(
+                        delivered2,
+                        "95c: busy 中に送った 2 通目も自動で届く（#572 経路。#716）",
+                    );
+
+                    // 片付け: claude を終了させてシェルへ戻す（45c と同じ 3 連打）
+                    for _ in 0..3 {
+                        let _ = window.update(cx, |app, _, _| {
+                            if let Some(session) = app.terminals.get(&chat_pane) {
+                                session.write(b"\x03".to_vec());
+                            }
+                        });
+                        wait(cx, 600).await;
+                    }
+                    wait(cx, 1500).await;
+                }
+
                 // 後片付け: 検証用ペインを閉じて terminal モードへ戻す
                 let _ = window.update(cx, |app, _, cx| {
                     for pane in [direct_pane, alt_pane, chat_pane] {
@@ -31612,6 +32228,11 @@ mod self_test {
                     app.starter_released.clear();
                     app.chat_panes.clear();
                     app.chat_expanded.clear();
+                    app.chat_inputs.clear();
+                    app.chat_echo.clear();
+                    app.chat_input_focused = None;
+                    app.chat_clear_confirm = None;
+                    app.chat_action_error = None;
                     cx.notify();
                 });
             }
