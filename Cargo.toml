@@ -79,6 +79,10 @@ winresource = "0.1"
 # Microsoft 公式・MIT OR Apache-2.0。既に gpui / wry 経由で依存グラフの中にいる 0.62 系へ揃える。
 # 参照するのは cfg(windows) のときだけなので macOS のビルドグラフには載らない
 windows = { version = "0.62", features = ["Data_Pdf", "Foundation", "Storage_Streams"] }
+# PDF 構造パーサ（#693）。Windows.Data.Pdf にはリンク注釈・目次・テキスト抽出 API が無いため、
+# PDF オブジェクトツリーを自前で読んで補う。pure Rust・MIT。default features の
+# chrono/jiff/rayon/time は PDF 解析に不要なので切ってバイナリを抑える
+lopdf = { version = "0.44", default-features = false }
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）

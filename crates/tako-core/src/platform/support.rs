@@ -160,23 +160,13 @@ pub mod notes {
         "tmux サーバーそのものを操作する機能。Windows に tmux は無い",
         "Operates the tmux server itself, which does not exist on Windows",
     );
-    /// #521 → #693: PDF の表示・ズーム・ページ送りは Windows でも動くようになった
-    /// （OS 標準の Windows.Data.Pdf）。ただしリンク注釈を取り出す API がそのレンダラに
-    /// **存在しない**ので、リンク系の操作だけが残った。「PDF が開けない」ではないことを明記する
-    /// （誤解されると PDF を開く回避行動を取られてしまう）
-    pub const WIN_PDF_NO_LINK_API: Note = Note::new(
-        "PDF の表示・ズーム・ページ送りは動く。リンク注釈を取り出す API が \
-         Windows の PDF レンダラに無いため、リンクは常に 0 件になる",
-        "Displaying, zooming and paging through PDFs all work. The Windows PDF renderer has no API \
-         for reading link annotations, so the link list is always empty",
-    );
-    /// #521 → #693: PDF 自身の目次（しおり）を取り出す API が Windows の PDF レンダラに無い。
-    /// 目次パネルの「ページへ移動」は総ページ数から作っているのでそちらは動く
-    pub const WIN_PDF_NO_OUTLINE_API: Note = Note::new(
-        "Markdown の目次と PDF のページ送りは動く。PDF 自身の目次（しおり）を取り出す API が \
-         Windows の PDF レンダラに無いため、しおりだけが空になる",
-        "Markdown outlines and PDF page navigation work. The Windows PDF renderer has no API for \
-         reading a PDF's own bookmarks, so only the bookmark tree is empty",
+    /// #693: PDF のテキスト選択・コピーは Windows では使えない。content stream のパースと
+    /// フォントエンコーディングの解決が必要で、lopdf 単体では困難なため
+    pub const WIN_PDF_NO_TEXT_LAYER: Note = Note::new(
+        "PDF のテキスト選択・コピーは Windows では使えない。PDF 内部のテキスト抽出には \
+         フォントエンコーディングの解決が必要で、現在の構成では困難なため",
+        "PDF text selection and copy are not available on Windows. Extracting text from PDF \
+         internals requires font encoding resolution, which is not feasible with the current stack",
     );
     /// #521: 動画再生は AVFoundation 実装なので macOS 限定
     pub const WIN_VIDEO_MACOS_ONLY: Note = Note::new(
@@ -768,28 +758,20 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_follow_link",
         macos: Support::Supported,
-        // #521 で PDF は開けるようになったが、リンク注釈の抽出 API が
-        // Windows.Data.Pdf に無い（#693）
-        windows: Support::Pending {
-            note: notes::WIN_PDF_NO_LINK_API,
-            issue: 693,
-        },
+        // #693: lopdf で PDF 構造を解析しリンク注釈を取得。テキスト選択はできない
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_link_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PDF_NO_LINK_API,
-            issue: 693,
-        },
+        // #693: lopdf で PDF 構造を解析しリンク注釈を取得
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_outline",
         macos: Support::Supported,
-        // Markdown の目次と PDF のページ送りは動く。PDF のしおりだけ取れない（#693）
-        windows: Support::Degraded {
-            note: notes::WIN_PDF_NO_OUTLINE_API,
-        },
+        // #693: lopdf で PDF のアウトライン（しおり）を取得
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_preview_redo",

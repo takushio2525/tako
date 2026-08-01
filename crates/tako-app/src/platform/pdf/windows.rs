@@ -1,14 +1,21 @@
-//! 抽象境界 B12（ドキュメントレンダラ）の Windows 実装 — `Windows.Data.Pdf`（#521）。
+//! 抽象境界 B12（ドキュメントレンダラ）の Windows 実装 — `Windows.Data.Pdf` + `lopdf`（#521 / #693）。
 //!
 //! Windows 10 以降に OS 同梱の WinRT PDF レンダラ（Edge の PDF 表示と同じエンジン）を使う。
 //! 追加の配布物は要らず、`windows` crate は既に依存グラフの中にいる（gpui / wry 経由）ので
 //! feature を足すだけで済む。macOS が OS 標準の PDFKit / Core Graphics を使っているのと
 //! 同じ構造になる。
 //!
-//! ## 取れないもの
+//! ## リンク注釈・目次・テキスト (#693)
 //!
-//! テキストレイヤ・目次（しおり）・リンク注釈は **API 自体が存在しない**。
-//! [`CAPABILITIES`] で false を立て、空の結果を返す（追跡は #693）。
+//! Windows.Data.Pdf にはリンク注釈・目次（しおり）・テキスト抽出の API が**存在しない**。
+//! そこで PDF オブジェクトツリーの構造パーサ `lopdf`（pure Rust・MIT）を併用し、
+//! ラスタライズは WinRT、メタデータ抽出は lopdf で補う。
+//!
+//! - **リンク注釈**: ページの `/Annots` → `/Link` サブタイプ → `/A`（URI アクション）/
+//!   `/Dest`（内部ページ）を読む。`/Rect` から PDF 座標の矩形を取得
+//! - **目次**: ドキュメントカタログの `/Outlines` ツリーを走査
+//! - **テキスト抽出**: content stream のパースとフォントエンコーディングの解決が要るため
+//!   lopdf 単体では困難。[`CAPABILITIES`] で `text_layer: false` を立てる
 //!
 //! ## 単位の違い（罠）
 //!
@@ -46,7 +53,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use futures::executor::block_on;
-use tako_core::{PdfLinks, PreviewOutline};
+use lopdf::Document as LopdfDocument;
+use tako_core::{
+    PdfLink, PdfLinkTarget, PdfLinks, PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget,
+};
 use windows::Data::Pdf::{PdfDocument, PdfPage, PdfPageRenderOptions};
 use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
 
@@ -55,10 +65,11 @@ use crate::preview::{PdfRasterKey, PdfRasterizedPages, PdfTextLine};
 
 pub(super) const CAPABILITIES: PdfCapabilities = PdfCapabilities {
     rasterize: true,
-    // 以下 3 つは Windows.Data.Pdf に API が無い（#693）
+    // content stream + font encoding が要るので lopdf 単体では困難（#693）
     text_layer: false,
-    outline: false,
-    links: false,
+    // lopdf で PDF オブジェクトツリーから読む（#693）
+    outline: true,
+    links: true,
 };
 
 pub fn render_all_pages(
@@ -148,9 +159,9 @@ pub fn render_all_pages(
     })
 }
 
-/// Windows.Data.Pdf にテキスト抽出の API は無い（#693）。
-/// テキストレイヤの無い PDF は macOS でも普通にあり、描画側はその分岐を持っているので
-/// エラーではなく空で返す
+/// テキスト抽出には content stream のパースとフォントエンコーディングの解決が必要で、
+/// lopdf 単体では困難（#693）。テキストレイヤの無い PDF は macOS でも普通にあり、
+/// 描画側はその分岐を持っているのでエラーではなく空で返す
 pub fn extract_text_layers(
     _path: &Path,
     _total_pages: usize,
@@ -158,15 +169,411 @@ pub fn extract_text_layers(
     Ok(Vec::new())
 }
 
-/// しおりの API は無い（#693）。目次パネルの「ページへ移動」は `total_pages` 由来なので
-/// これが空でもページ送りは効く
-pub fn extract_outline(_path: &Path, _total_pages: usize) -> Result<PreviewOutline, String> {
-    Ok(PreviewOutline::default())
+/// lopdf で PDF の `/Outlines` ツリー（しおり）を走査する（#693）。
+/// 壊れた PDF や取れない場合はエラーではなく空を返す（macOS 実装と同じ縮退）
+pub fn extract_outline(path: &Path, total_pages: usize) -> Result<PreviewOutline, String> {
+    let doc = match LopdfDocument::load(path) {
+        Ok(d) => d,
+        Err(_) => return Ok(PreviewOutline::default()),
+    };
+    Ok(lopdf_extract_outline(&doc, total_pages))
 }
 
-/// リンク注釈の API は無い（#693）
-pub fn extract_links(_path: &Path, _total_pages: usize) -> Result<PdfLinks, String> {
-    Ok(PdfLinks::default())
+/// lopdf でリンク注釈を抽出する（#693）。
+/// `/Annots` → `/Link` サブタイプ → `/A`（URI）/ `/Dest`（内部ページ）
+pub fn extract_links(path: &Path, total_pages: usize) -> Result<PdfLinks, String> {
+    let doc = match LopdfDocument::load(path) {
+        Ok(d) => d,
+        Err(_) => return Ok(PdfLinks::default()),
+    };
+    Ok(lopdf_extract_links(&doc, total_pages))
+}
+
+// --- lopdf によるリンク注釈抽出 ---
+
+/// ページの `/Annots` 配列から `/Link` サブタイプの注釈を読み、
+/// `/A`（URI アクション）と `/Dest`（内部ページジャンプ）を取り出す。
+fn lopdf_extract_links(doc: &LopdfDocument, total_pages: usize) -> PdfLinks {
+    let pages = doc.get_pages();
+    let mut links = Vec::new();
+
+    for (&page_num, &page_id) in &pages {
+        let page_index = (page_num as usize).saturating_sub(1);
+        if page_index >= total_pages {
+            continue;
+        }
+        let Ok(page_obj) = doc.get_object(page_id) else {
+            continue;
+        };
+        let Ok(page_dict) = page_obj.as_dict() else {
+            continue;
+        };
+        let annots = match page_dict.get(b"Annots") {
+            Ok(annots_ref) => annots_ref,
+            Err(_) => continue,
+        };
+        let annot_ids = match resolve_array(doc, annots) {
+            Some(ids) => ids,
+            None => continue,
+        };
+        for annot_ref in annot_ids {
+            let annot_id = match annot_ref.as_reference() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let Ok(annot_obj) = doc.get_object(annot_id) else {
+                continue;
+            };
+            let Ok(annot_dict) = annot_obj.as_dict() else {
+                continue;
+            };
+            if !is_link_annotation(annot_dict) {
+                continue;
+            }
+            let bbox = match extract_rect(annot_dict) {
+                Some(r) => r,
+                None => continue,
+            };
+            if let Some(target) = extract_link_target(doc, annot_dict, &pages) {
+                links.push(PdfLink {
+                    page_index,
+                    bbox,
+                    target,
+                });
+            }
+        }
+    }
+    PdfLinks::new(links)
+}
+
+/// `/Subtype` が `/Link` であるか
+fn is_link_annotation(dict: &lopdf::Dictionary) -> bool {
+    dict.get(b"Subtype")
+        .ok()
+        .and_then(|v| v.as_name().ok())
+        .is_some_and(|name| name == b"Link")
+}
+
+/// `/Rect [x1, y1, x2, y2]` を `[x, y, width, height]`（PDF 座標、左下原点）に変換。
+/// macOS の PDFKit と同じ形式にする
+fn extract_rect(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+    let rect_obj = dict.get(b"Rect").ok()?;
+    let rect_arr = rect_obj.as_array().ok()?;
+    if rect_arr.len() < 4 {
+        return None;
+    }
+    let x1 = obj_to_f64(&rect_arr[0])?;
+    let y1 = obj_to_f64(&rect_arr[1])?;
+    let x2 = obj_to_f64(&rect_arr[2])?;
+    let y2 = obj_to_f64(&rect_arr[3])?;
+    let x = x1.min(x2);
+    let y = y1.min(y2);
+    Some([x, y, (x2 - x1).abs(), (y2 - y1).abs()])
+}
+
+/// リンクの飛び先を取り出す。`/A`（アクション辞書）を優先し、無ければ `/Dest` を試す
+fn extract_link_target(
+    doc: &LopdfDocument,
+    annot_dict: &lopdf::Dictionary,
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+) -> Option<PdfLinkTarget> {
+    if let Ok(action) = annot_dict.get(b"A") {
+        let action_dict = resolve_dict(doc, action)?;
+        let action_type = action_dict.get(b"S").ok()?.as_name().ok()?;
+        match action_type {
+            b"URI" => {
+                let uri = action_dict.get(b"URI").ok()?;
+                let url = resolve_string(doc, uri)?;
+                if !url.is_empty() {
+                    return Some(PdfLinkTarget::Url { url });
+                }
+            }
+            b"GoTo" => {
+                let dest = action_dict.get(b"D").ok()?;
+                return resolve_destination(doc, dest, pages);
+            }
+            _ => {}
+        }
+    }
+    if let Ok(dest) = annot_dict.get(b"Dest") {
+        return resolve_destination(doc, dest, pages);
+    }
+    None
+}
+
+/// `/Dest` の値（配列 or 名前 or 文字列）からページ番号を解決する。
+/// 配列形式: `[page_ref /XYZ ...]` — 最初の要素がページオブジェクトへの参照
+fn resolve_destination(
+    doc: &LopdfDocument,
+    dest: &lopdf::Object,
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+) -> Option<PdfLinkTarget> {
+    match dest {
+        lopdf::Object::Array(arr) if !arr.is_empty() => {
+            let page_ref = arr[0].as_reference().ok()?;
+            let page_num = page_id_to_number(page_ref, pages)?;
+            Some(PdfLinkTarget::Page {
+                page: page_num as usize,
+            })
+        }
+        lopdf::Object::Name(name) | lopdf::Object::String(name, _) => {
+            resolve_named_dest(doc, name, pages)
+        }
+        lopdf::Object::Reference(id) => {
+            let resolved = doc.get_object(*id).ok()?;
+            resolve_destination(doc, resolved, pages)
+        }
+        _ => None,
+    }
+}
+
+/// ページオブジェクト ID から 1 始まりのページ番号を引く
+fn page_id_to_number(
+    page_id: lopdf::ObjectId,
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+) -> Option<u32> {
+    pages
+        .iter()
+        .find(|(_, &id)| id == page_id)
+        .map(|(&num, _)| num)
+}
+
+/// `/Names` → `/Dests` ツリーから名前付き行き先を解決する
+fn resolve_named_dest(
+    doc: &LopdfDocument,
+    name: &[u8],
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+) -> Option<PdfLinkTarget> {
+    let catalog = doc.catalog().ok()?;
+    let names_ref = catalog.get(b"Names").ok()?;
+    let names_dict = resolve_dict(doc, names_ref)?;
+    let dests_ref = names_dict.get(b"Dests").ok()?;
+    let dests_dict = resolve_dict(doc, dests_ref)?;
+    lookup_name_tree(doc, &dests_dict, name, pages)
+}
+
+/// PDF の Name Tree をたどる
+fn lookup_name_tree(
+    doc: &LopdfDocument,
+    node: &lopdf::Dictionary,
+    name: &[u8],
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+) -> Option<PdfLinkTarget> {
+    if let Ok(names_arr) = node.get(b"Names") {
+        let arr = resolve_array(doc, names_arr)?;
+        let mut i = 0;
+        while i + 1 < arr.len() {
+            let key = match &arr[i] {
+                lopdf::Object::String(s, _) => s.as_slice(),
+                lopdf::Object::Name(n) => n.as_slice(),
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            };
+            if key == name {
+                return resolve_destination(doc, &arr[i + 1], pages);
+            }
+            i += 2;
+        }
+    }
+    if let Ok(kids_arr) = node.get(b"Kids") {
+        let kids = resolve_array(doc, kids_arr)?;
+        for kid in kids {
+            let kid_dict = resolve_dict(doc, kid)?;
+            if let Some(result) = lookup_name_tree(doc, &kid_dict, name, pages) {
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+// --- lopdf によるアウトライン（しおり）抽出 ---
+
+/// `/Outlines` ツリーを走査して平坦な目次を組み立てる
+fn lopdf_extract_outline(doc: &LopdfDocument, total_pages: usize) -> PreviewOutline {
+    const MAX_ITEMS: usize = 5_000;
+    const MAX_DEPTH: u8 = 32;
+
+    let pages = doc.get_pages();
+    let catalog = match doc.catalog() {
+        Ok(c) => c,
+        Err(_) => return PreviewOutline::default(),
+    };
+    let outlines_ref = match catalog.get(b"Outlines") {
+        Ok(r) => r,
+        Err(_) => return PreviewOutline::default(),
+    };
+    let outlines_dict = match resolve_dict(doc, outlines_ref) {
+        Some(d) => d,
+        None => return PreviewOutline::default(),
+    };
+    let first = match outlines_dict.get(b"First") {
+        Ok(f) => f,
+        Err(_) => return PreviewOutline::default(),
+    };
+
+    let mut items = Vec::new();
+    collect_outline_items(
+        doc,
+        first,
+        1,
+        total_pages,
+        &pages,
+        &mut items,
+        MAX_DEPTH,
+        MAX_ITEMS,
+    );
+    PreviewOutline::new(items)
+}
+
+fn collect_outline_items(
+    doc: &LopdfDocument,
+    item_ref: &lopdf::Object,
+    level: u8,
+    total_pages: usize,
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+    items: &mut Vec<PreviewOutlineItem>,
+    max_depth: u8,
+    max_items: usize,
+) {
+    if level > max_depth || items.len() >= max_items {
+        return;
+    }
+    let dict = match resolve_dict(doc, item_ref) {
+        Some(d) => d,
+        None => return,
+    };
+    let title = dict
+        .get(b"Title")
+        .ok()
+        .and_then(|t| resolve_string(doc, t))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if !title.is_empty() {
+        let page_target = resolve_outline_dest(doc, &dict, pages);
+        if let Some(page) = page_target {
+            if page <= total_pages {
+                items.push(PreviewOutlineItem {
+                    title,
+                    level,
+                    target: PreviewOutlineTarget::PdfPage { page },
+                });
+            }
+        }
+    }
+
+    if let Ok(first_child) = dict.get(b"First") {
+        collect_outline_items(
+            doc,
+            first_child,
+            level.saturating_add(1),
+            total_pages,
+            pages,
+            items,
+            max_depth,
+            max_items,
+        );
+    }
+
+    if let Ok(next) = dict.get(b"Next") {
+        collect_outline_items(
+            doc,
+            next,
+            level,
+            total_pages,
+            pages,
+            items,
+            max_depth,
+            max_items,
+        );
+    }
+}
+
+/// アウトライン項目の飛び先（`/Dest` または `/A` の GoTo）を 1 始まりのページ番号に解決する
+fn resolve_outline_dest(
+    doc: &LopdfDocument,
+    dict: &lopdf::Dictionary,
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+) -> Option<usize> {
+    if let Ok(dest) = dict.get(b"Dest") {
+        if let Some(PdfLinkTarget::Page { page }) = resolve_destination(doc, dest, pages) {
+            return Some(page);
+        }
+    }
+    if let Ok(action) = dict.get(b"A") {
+        let action_dict = resolve_dict(doc, action)?;
+        let action_type = action_dict.get(b"S").ok()?.as_name().ok()?;
+        if action_type == b"GoTo" {
+            let dest = action_dict.get(b"D").ok()?;
+            if let Some(PdfLinkTarget::Page { page }) = resolve_destination(doc, dest, pages) {
+                return Some(page);
+            }
+        }
+    }
+    None
+}
+
+// --- lopdf ヘルパー ---
+
+/// 参照を解決して辞書を取り出す
+fn resolve_dict<'a>(
+    doc: &'a LopdfDocument,
+    obj: &'a lopdf::Object,
+) -> Option<&'a lopdf::Dictionary> {
+    match obj {
+        lopdf::Object::Dictionary(d) => Some(d),
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| o.as_dict().ok()),
+        _ => None,
+    }
+}
+
+/// 参照を解決して配列を取り出す
+fn resolve_array<'a>(
+    doc: &'a LopdfDocument,
+    obj: &'a lopdf::Object,
+) -> Option<&'a Vec<lopdf::Object>> {
+    match obj {
+        lopdf::Object::Array(a) => Some(a),
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| o.as_array().ok()),
+        _ => None,
+    }
+}
+
+/// PDF オブジェクトから文字列を取り出す（Name / String / 参照を解決）
+fn resolve_string(doc: &LopdfDocument, obj: &lopdf::Object) -> Option<String> {
+    match obj {
+        lopdf::Object::String(bytes, _) => {
+            if bytes.starts_with(&[0xFE, 0xFF]) {
+                // UTF-16BE BOM 付き
+                let u16s: Vec<u16> = bytes[2..]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16(&u16s).ok()
+            } else {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+        }
+        lopdf::Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+        lopdf::Object::Reference(id) => {
+            let resolved = doc.get_object(*id).ok()?;
+            resolve_string(doc, resolved)
+        }
+        _ => None,
+    }
+}
+
+/// 数値（Integer / Real）を f64 に変換
+fn obj_to_f64(obj: &lopdf::Object) -> Option<f64> {
+    match obj {
+        lopdf::Object::Integer(i) => Some(*i as f64),
+        lopdf::Object::Real(f) => Some(*f as f64),
+        _ => None,
+    }
 }
 
 /// ファイルを読み、WinRT のメモリストリーム経由で `PdfDocument` を開く。
@@ -358,12 +765,287 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 縮退している 3 つは Err ではなく空を返す（描画側が正常系として扱えるように）
+    /// テキストレイヤは取れないが Err ではなく空を返す
     #[test]
-    fn 取れない情報はエラーではなく空で返る() {
+    fn テキストレイヤは空で返る() {
         let path = Path::new("no-such.pdf");
         assert!(extract_text_layers(path, 3).unwrap().is_empty());
-        assert!(extract_outline(path, 3).unwrap().is_empty());
-        assert!(extract_links(path, 3).unwrap().is_empty());
+    }
+
+    /// 壊れた PDF や不在ファイルでリンク・アウトラインはパニックせず空を返す
+    #[test]
+    fn 異常なpdfでリンクとアウトラインは空で返る() {
+        let dir = std::env::temp_dir().join("tako_pdf_win_link_error_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("no-such.pdf");
+        assert!(extract_links(&missing, 1).unwrap().is_empty());
+        assert!(extract_outline(&missing, 1).unwrap().is_empty());
+
+        let broken = dir.join("broken.pdf");
+        std::fs::write(&broken, b"not a pdf").unwrap();
+        assert!(extract_links(&broken, 1).unwrap().is_empty());
+        assert!(extract_outline(&broken, 1).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// リンク入り PDF を自前生成し、lopdf で URI リンクと内部リンクの両方が読めることを検証
+    #[test]
+    fn リンク注釈を抽出できる() {
+        let dir = std::env::temp_dir().join("tako_pdf_win_links_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("with_links.pdf");
+        std::fs::write(&path, pdf_with_links()).unwrap();
+
+        let links = extract_links(&path, 2).unwrap();
+        assert!(!links.is_empty(), "リンクが 1 つ以上ある");
+
+        let url_links: Vec<_> = links
+            .links
+            .iter()
+            .filter(|l| matches!(&l.target, PdfLinkTarget::Url { .. }))
+            .collect();
+        assert!(
+            !url_links.is_empty(),
+            "URI リンクが 1 つ以上ある: {:?}",
+            links.links
+        );
+        if let PdfLinkTarget::Url { url } = &url_links[0].target {
+            assert_eq!(url, "https://example.com/");
+        }
+
+        let page_links: Vec<_> = links
+            .links
+            .iter()
+            .filter(|l| matches!(&l.target, PdfLinkTarget::Page { .. }))
+            .collect();
+        assert!(
+            !page_links.is_empty(),
+            "内部リンクが 1 つ以上ある: {:?}",
+            links.links
+        );
+        if let PdfLinkTarget::Page { page } = &page_links[0].target {
+            assert_eq!(*page, 2, "2 ページ目への内部リンク");
+        }
+
+        // 矩形が妥当な値を持つ
+        for link in &links.links {
+            assert!(link.bbox[2] > 0.0, "幅 > 0");
+            assert!(link.bbox[3] > 0.0, "高さ > 0");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// アウトライン入り PDF でしおりが読めることを検証
+    #[test]
+    fn アウトラインを抽出できる() {
+        let dir = std::env::temp_dir().join("tako_pdf_win_outline_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("with_outline.pdf");
+        std::fs::write(&path, pdf_with_outline()).unwrap();
+
+        let outline = extract_outline(&path, 2).unwrap();
+        assert!(!outline.is_empty(), "アウトラインが空でない");
+        let items = outline.items;
+        assert!(items.len() >= 2, "2 項目以上ある: {:?}", items);
+        assert_eq!(items[0].title, "Chapter 1");
+        assert_eq!(items[1].title, "Chapter 2");
+        if let PreviewOutlineTarget::PdfPage { page } = &items[0].target {
+            assert_eq!(*page, 1);
+        }
+        if let PreviewOutlineTarget::PdfPage { page } = &items[1].target {
+            assert_eq!(*page, 2);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// リンク注釈を含む 2 ページ PDF を生成。
+    /// ページ 1: URI リンク（https://example.com/）+ 内部リンク（2 ページ目へ）
+    fn pdf_with_links() -> Vec<u8> {
+        // obj 1: Catalog
+        // obj 2: Pages
+        // obj 3: Page 1（リンク注釈あり）
+        // obj 4: Page 2
+        // obj 5: Page 1 の Contents
+        // obj 6: Page 2 の Contents
+        // obj 7: URI リンク注釈
+        // obj 8: 内部リンク注釈
+        let content1 = b"BT /F1 12 Tf 50 700 Td (Page 1) Tj ET";
+        let content2 = b"BT /F1 12 Tf 50 700 Td (Page 2) Tj ET";
+
+        let mut pdf = Vec::with_capacity(2048);
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(8);
+
+        // 1: Catalog
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        // 2: Pages
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        // 3: Page 1（Annots 付き）
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 5 0 R /Annots [7 0 R 8 0 R] \
+              /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n",
+        );
+
+        // 4: Page 2
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 6 0 R \
+              /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n",
+        );
+
+        // 5: Contents for page 1
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            format!("5 0 obj\n<< /Length {} >>\nstream\n", content1.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content1);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // 6: Contents for page 2
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            format!("6 0 obj\n<< /Length {} >>\nstream\n", content2.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content2);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // 7: URI Link annotation
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"7 0 obj\n<< /Type /Annot /Subtype /Link /Rect [50 680 200 700] \
+              /A << /S /URI /URI (https://example.com/) >> >>\nendobj\n",
+        );
+
+        // 8: Internal link annotation (GoTo page 2)
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"8 0 obj\n<< /Type /Annot /Subtype /Link /Rect [50 650 200 670] \
+              /Dest [4 0 R /XYZ 0 792 0] >>\nendobj\n",
+        );
+
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+        );
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+                offsets.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// アウトライン入り 2 ページ PDF を生成
+    fn pdf_with_outline() -> Vec<u8> {
+        // obj 1: Catalog（Outlines 付き）
+        // obj 2: Pages
+        // obj 3: Page 1
+        // obj 4: Page 2
+        // obj 5: Page 1 Contents
+        // obj 6: Page 2 Contents
+        // obj 7: Outlines root
+        // obj 8: Outline item "Chapter 1"
+        // obj 9: Outline item "Chapter 2"
+        let content = b"BT /F1 12 Tf 50 700 Td (text) Tj ET";
+
+        let mut pdf = Vec::with_capacity(2048);
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(9);
+
+        // 1: Catalog
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R >>\nendobj\n",
+        );
+
+        // 2: Pages
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        // 3: Page 1
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R \
+              /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n",
+        );
+
+        // 4: Page 2
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R \
+              /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n",
+        );
+
+        // 5: Contents 1
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // 6: Contents 2
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            format!("6 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // 7: Outlines root
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"7 0 obj\n<< /Type /Outlines /First 8 0 R /Last 9 0 R /Count 2 >>\nendobj\n",
+        );
+
+        // 8: Outline item 1
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"8 0 obj\n<< /Title (Chapter 1) /Parent 7 0 R /Next 9 0 R \
+              /Dest [3 0 R /XYZ 0 792 0] >>\nendobj\n",
+        );
+
+        // 9: Outline item 2
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"9 0 obj\n<< /Title (Chapter 2) /Parent 7 0 R /Prev 8 0 R \
+              /Dest [4 0 R /XYZ 0 792 0] >>\nendobj\n",
+        );
+
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+        );
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+                offsets.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
     }
 }
