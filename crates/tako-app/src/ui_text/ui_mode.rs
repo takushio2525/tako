@@ -97,6 +97,15 @@ pub fn starter_footnote() -> &'static str {
 
 // --- チャットビュー（#702 / G2） ---
 
+/// 「ターミナルを表示」（#720 のスターター準備中画面の脱出導線）。
+///
+/// **チャットビューのヘッダからは撤去した**（#719 追加要件 4: 押すとそのペインだけ
+/// ターミナル表示になるがチャットへ戻る導線が無く迷子になるため）。モード切替は
+/// タブバーのグローバルトグルに一本化してある
+pub fn chat_show_terminal() -> &'static str {
+    tr!("ターミナルを表示", "Show terminal")
+}
+
 /// 入力欄が上限行数に達して隠れているぶん（#718 / #719。無音で切り捨てない）
 pub fn chat_input_more_rows(rows: usize) -> String {
     tr!(format!("上に {rows} 行"), format!("{rows} more above"))
@@ -300,6 +309,7 @@ mod tests {
                 preparing_title().to_string(),
                 preparing_shell().to_string(),
                 preparing_agent().to_string(),
+                chat_show_terminal().to_string(),
                 chat_input_more_rows(3),
                 chat_status_busy().to_string(),
                 chat_status_idle().to_string(),

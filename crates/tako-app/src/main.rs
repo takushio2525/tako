@@ -21513,6 +21513,41 @@ mod self_test {
                 );
                 // 1 行のときの箱は「1 行 + 上下パディング（12px）+ 枠 2px」に収まる。
                 // 送信ボタン（26px）が高さを押し上げていた頃はここが 40px 付近だった
+                // #719 追加要件 5: worker（read_only）でも入力欄が出る。
+                // 説明行が 1 本増えるだけで、入力欄そのものは同じ高さで描かれる
+                let readonly_height = {
+                    let _ = window.update(cx, |app, _, cx| {
+                        if let Some(state) = app.chat_panes.get(&pane) {
+                            let mut next = (**state).clone();
+                            next.read_only = true;
+                            app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                        }
+                        cx.notify();
+                    });
+                    let _ = capture_frame(any, cx);
+                    let h = window
+                        .update(cx, |app, _, _| {
+                            app.chat_input_bounds.get().map(|b| f32::from(b.size.height))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0.0);
+                    let _ = window.update(cx, |app, _, cx| {
+                        if let Some(state) = app.chat_panes.get(&pane) {
+                            let mut next = (**state).clone();
+                            next.read_only = false;
+                            app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                        }
+                        cx.notify();
+                    });
+                    let _ = capture_frame(any, cx);
+                    h
+                };
+                println!("TAKO_VISUAL_PIXEL: chat-input readonly_h={readonly_height:.1}");
+                check(
+                    (readonly_height - heights[2]).abs() < 2.0,
+                    "visual-test 入力欄: worker(read_only) でも同じ入力欄が出る (#719)",
+                );
                 check(
                     heights[0] > line_h && heights[0] <= line_h + 20.0,
                     "visual-test 入力欄: 1 行入力は 1 行ぶん + パディングの高さ (#718)",
@@ -32623,8 +32658,8 @@ mod self_test {
                     // （#572 の経路をそのまま使う）。`queued` は生成が短いと観測できない
                     // ことがあるので、判定は「最終的に transcript へ届く」ことに置く
                     let probe2 = format!("2通目です716-{}", std::process::id());
-                    let _ = window.update(cx, |app, _, cx| {
-                        let _ = tako_control::dispatch(
+                    let _ = window.update(cx, |app, _, _| {
+                        tako_control::dispatch(
                             app,
                             tako_control::protocol::Request::Send {
                                 pane: Some(chat_pane.as_u64()),
@@ -32634,9 +32669,31 @@ mod self_test {
                                 await_prompt: false,
                             },
                             PaneOrigin::User,
-                        );
-                        app.chat_submit_input(chat_pane, cx);
+                        )
                     });
+                    // 入力行へ echo が返るのを待ってから確定する。busy 中は claude が
+                    // 打鍵を入力行ではなく内部キューへ入れる（#572）ので、その場合は
+                    // 入力行に現れないまま = 確定不要（ターン終了時に自動で送られる）
+                    for _ in 0..30 {
+                        wait(cx, 500).await;
+                        let in_line = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&chat_pane)
+                                    .and_then(|t| {
+                                        tako_core::screen::analyze_input_line(
+                                            &t.screen_opts(&app.theme, false),
+                                        )
+                                    })
+                                    .is_some_and(|st| st.text.contains(&probe2))
+                            })
+                            .unwrap_or(false);
+                        if in_line {
+                            let _ = window
+                                .update(cx, |app, _, cx| app.chat_submit_input(chat_pane, cx));
+                            break;
+                        }
+                    }
                     let mut queued_seen = false;
                     let mut delivered2 = false;
                     for _ in 0..120 {
