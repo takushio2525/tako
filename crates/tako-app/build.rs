@@ -25,6 +25,11 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // TAKO_FULL_VERSION: Cargo.toml の version に、リリースビルド時の TAKO_WIN_NUM
+    // （例: "3"）があれば `-win.3` を付与。update_checker.rs が自バイナリの正確な版数として
+    // 使い、-win.N 間の更新検知を可能にする。全プラットフォーム・全プロファイルで emit する
+    emit_full_version();
+
     // `cfg!(target_os = "windows")` はビルドスクリプト自身（= ホスト）を指してしまうので使わない。
     // CARGO_CFG_TARGET_OS が「これから作るバイナリ」の OS。
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
@@ -70,4 +75,13 @@ fn embed_windows_resources() {
              配布用の exe は Windows 実機（installer/windows/release-windows.ps1）で作ること"
         );
     }
+}
+
+fn emit_full_version() {
+    let pkg = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let full = match std::env::var("TAKO_WIN_NUM") {
+        Ok(n) if !n.is_empty() => format!("{pkg}-win.{n}"),
+        _ => pkg,
+    };
+    println!("cargo:rustc-env=TAKO_FULL_VERSION={full}");
 }

@@ -1197,15 +1197,17 @@ impl TakoApp {
                 .mb(px(4.0))
                 .border_b_1()
                 .border_color(hsla(theme.border_subtle))
-                .child(SharedString::from(crate::ui_text::update::current_line(
-                    super::update_checker::CURRENT_VERSION,
-                    if super::update_checker::CURRENT_VERSION.contains("-test.") {
+                .child(SharedString::from({
+                    // 表示も更新判定と同じ版数を使う（#723）。ビルド埋め込みの
+                    // CURRENT_VERSION だと -win.N 配布で実体とずれる
+                    let current = super::update_checker::effective_current_version();
+                    let channel = if current.contains("-test.") {
                         "test"
                     } else {
                         "stable"
-                    },
-                    method_label,
-                )))
+                    };
+                    crate::ui_text::update::current_line(&current, channel, method_label)
+                }))
                 .into_any_element(),
         );
 

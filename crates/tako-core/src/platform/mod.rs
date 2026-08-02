@@ -11,6 +11,7 @@ pub mod console;
 pub mod exe;
 pub mod font;
 pub mod ime;
+pub mod install_info;
 pub mod locale;
 pub mod process;
 pub mod procinfo;
