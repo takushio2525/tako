@@ -151,6 +151,12 @@ pub fn chat_status_queued() -> &'static str {
     )
 }
 
+/// 生成中に打った指示がまだ claude へ渡っていない（#737 追加要件 5）。
+/// 吹き出しの中に小さく添えるので、ヘッダの文言より短くする
+pub fn chat_queued_badge() -> &'static str {
+    tr!("送信待ち", "Waiting to send")
+}
+
 /// コンテキスト残量（残り N%）
 pub fn chat_ctx_label(left_percent: i32) -> String {
     tr!(
@@ -355,6 +361,7 @@ mod tests {
                 chat_status_busy().to_string(),
                 chat_status_idle().to_string(),
                 chat_status_queued().to_string(),
+                chat_queued_badge().to_string(),
                 chat_ctx_label(42),
                 chat_ctx_hint().to_string(),
                 chat_empty().to_string(),

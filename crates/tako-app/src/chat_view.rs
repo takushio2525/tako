@@ -68,6 +68,10 @@ pub(crate) struct ChatMessage {
     pub images: usize,
     /// まとめられたシステム通知の件数（#715。`role == System` のときだけ意味を持つ）
     pub notices: u64,
+    /// 生成中に打たれてまだ claude へ渡っていない（#737 追加要件 5）。
+    /// 表示だけの状態なので**内容キーには混ぜない**（配送された瞬間に鍵が変わると
+    /// 折りたたみ状態と md キャッシュが無駄に作り直される）
+    pub queued: bool,
     /// 内容から決まる安定キー。**折りたたみ状態の記憶**と md パースキャッシュに使う。
     /// 添字ではなく内容で持つので、上限で古い発話が押し出されても展開状態がずれない
     pub key: u64,
@@ -211,10 +215,22 @@ pub(crate) fn messages_from_json(values: &[serde_json::Value]) -> Vec<ChatMessag
                 tools,
                 images,
                 notices,
+                // #737: 正規化層が「まだ claude へ渡っていない」と印を付けたもの
+                queued: v["queued"].as_bool().unwrap_or(false),
                 key,
             })
         })
         .collect()
+}
+
+/// tako 自前のプレースホルダを出すか（#737。**重なりを決める唯一の判断**）。
+///
+/// `has_text` = ユーザーが打った文字がある / `tui_shows_text` = TUI が箱の中へ
+/// 何か描いている（自前の dim な案内文を含む）。
+/// 旧実装は `!has_text` だけで出していたので、claude の案内文の上へ重なった
+/// （#737 の実測根因 O1）。純関数にしてセルフテストから同じ判断を検査する
+pub(crate) fn chat_placeholder_visible(has_text: bool, tui_shows_text: bool) -> bool {
+    !has_text && !tui_shows_text
 }
 
 /// 楽観 echo の発話キー（transcript 由来の同一本文とは別空間にする）
@@ -260,8 +276,20 @@ pub(crate) struct ChatInputMirror {
     pub rows: Vec<gpui::Div>,
     /// TUI 入力ボックスの総行数（`rows.len()` は上限で頭打ちになる）
     pub total_rows: usize,
-    /// 入力欄に**ユーザーの文字が入っているか**（プレースホルダを出すかの判断）
+    /// 入力欄に**ユーザーの文字が入っているか**（送信ボタンを押せるかの判断）
     pub has_text: bool,
+    /// TUI が入力ボックスに**自前で何か描いているか**（#737）。
+    ///
+    /// `has_text` とは別物で、claude 自身の dim な案内文
+    /// （空欄時の `Try "how does <filepath> work?"` / キュー滞留時の
+    /// `Press up to edit queued messages`）も true になる。
+    /// これを見ずに `has_text` だけで tako 自前のプレースホルダを重ねていたため、
+    /// **claude の案内文と tako の案内文が同じ座標に重なって読めなくなっていた**
+    /// （#737 の実測根因 O1。col 2 から始まる dim テキストの上に、
+    /// 絶対配置 left(24) のプレースホルダが乗っていた）
+    pub tui_shows_text: bool,
+    /// カーソルのセル位置（映した行の中での (列, 行)）。IME の位置出しに使う（#737）
+    pub caret_cell: Option<(usize, usize)>,
     /// スピナー行（`Manifesting… (5m 16s · ↓ 16.4k tokens)`）。生成中だけ Some（#719）
     pub activity: Option<String>,
 }
@@ -553,13 +581,18 @@ impl TakoApp {
         let rows: Vec<gpui::Div> = rendered.drain(start..end).collect();
         // 入力欄に「ユーザーが打った文字」があるか（dim のゴースト提案は無しと扱う。#572）
         // **箱と同じ行**を見る（探し直すと走査範囲の違いで食い違う。#719 実スクショ）
-        let has_text = tako_core::screen::analyze_input_line_at(&screen, region.prompt_row)
+        let analyzed = tako_core::screen::analyze_input_line_at(&screen, region.prompt_row);
+        let has_text = analyzed
+            .as_ref()
             .map(|s| {
                 !s.text.is_empty()
                     && !tako_control::claude_tui::input_content_is_empty(&s.text)
                     && s.style != tako_core::screen::InputStyle::Ghost
             })
             .unwrap_or(false);
+        // #737: 判定はどちらも tako-core の純関数が正（合成画面で単体テストできる）
+        let tui_shows_text = tako_core::screen::input_box_has_content(&screen, &region);
+        let caret_cell = tako_core::screen::input_caret_cell(&screen, &region, shown);
         // スピナー行は入力ボックスより上だけを見る（フッターの `(→4h44m)` を拾わない）
         let above: Vec<String> = screen.lines[..region.start.min(screen.lines.len())]
             .iter()
@@ -570,8 +603,37 @@ impl TakoApp {
             rows,
             total_rows: region.rows(),
             has_text,
+            tui_shows_text,
+            caret_cell,
             activity,
         })
+    }
+
+    /// IME のキャレットが**入力欄の内側**にあるか（#737 の検査点）。
+    ///
+    /// 位置ズレの正体は「キャレットが箱の外（ターミナルグリッド上の座標）を
+    /// 指していた」ことなので、内側であることを機械検証できる形で持つ。
+    /// 返り値は (キャレット矩形が採れたか, 箱の内側か)
+    pub(crate) fn chat_caret_inside_input(&self, pane_id: PaneId) -> (bool, bool) {
+        let caret = self
+            .chat_caret_bounds
+            .get()
+            .filter(|(p, _)| *p == pane_id)
+            .map(|(_, b)| b);
+        let Some(caret) = caret else {
+            return (false, false);
+        };
+        let Some(box_bounds) = self.chat_input_bounds.get() else {
+            return (true, false);
+        };
+        // 1px の丸め誤差は許す（枠線・サブピクセル配置のぶん）
+        let slack = px(1.0);
+        let inside = caret.origin.x >= box_bounds.origin.x - slack
+            && caret.origin.y >= box_bounds.origin.y - slack
+            && caret.origin.x <= box_bounds.origin.x + box_bounds.size.width + slack
+            && caret.origin.y + caret.size.height
+                <= box_bounds.origin.y + box_bounds.size.height + slack;
+        (true, inside)
     }
 
     /// 入力欄クリック = そのペインへフォーカスするだけ（#719）。
@@ -607,6 +669,36 @@ impl TakoApp {
         // 本文は送らず Enter だけ（#95 の Enter 単独送達フロー）。楽観 echo には
         // 画面から読んだ本文を使うので、transcript が追いつくまでの見た目は変わらない
         self.chat_send_newline(pane_id, &text, cx);
+    }
+
+    /// 楽観 echo を積む（#716 / #737）。
+    ///
+    /// **送信経路が複数あっても見た目は 1 通り**にするための唯一の入口:
+    /// 送信ボタン（`chat_send_inner`）と、素通しで打たれた Enter
+    /// （`handle_key`。#735 でこちらが既定の送信経路になった）が同じここを通る。
+    /// 空・空白だけなら何もしない（claude に送っていないものを吹き出しにしない）
+    pub(crate) fn push_chat_echo(&mut self, pane_id: PaneId, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        // 同じ本文の echo を二重に積まない（Enter の再送検証 #95 で 2 回来ても 1 個）
+        let echoes = self.chat_echo.entry(pane_id).or_default();
+        if echoes
+            .iter()
+            .any(|e| e.text.trim() == text.trim() && e.at.elapsed() < ECHO_MAX_AGE)
+        {
+            return;
+        }
+        echoes.push(ChatEcho {
+            text: text.to_string(),
+            at: std::time::Instant::now(),
+        });
+        // 送った直後に「考え中」を出す（transcript / 画面採取の 2 秒を待たない）
+        if let Some(state) = self.chat_panes.get(&pane_id) {
+            let mut next = (**state).clone();
+            next.busy = true;
+            self.chat_panes.insert(pane_id, std::rc::Rc::new(next));
+        }
     }
 
     /// スラッシュボタンの押下（#716 / §2.3）。
@@ -670,17 +762,8 @@ impl TakoApp {
         );
         match result {
             Ok(_) => {
-                self.chat_echo.entry(pane_id).or_default().push(ChatEcho {
-                    text: echo.to_string(),
-                    at: std::time::Instant::now(),
-                });
+                self.push_chat_echo(pane_id, echo);
                 self.chat_action_error = None;
-                // 送った直後に「考え中」を出す（transcript / 画面採取の 2 秒を待たない）
-                if let Some(state) = self.chat_panes.get(&pane_id) {
-                    let mut next = (**state).clone();
-                    next.busy = true;
-                    self.chat_panes.insert(pane_id, std::rc::Rc::new(next));
-                }
                 cx.notify();
                 true
             }
@@ -760,6 +843,9 @@ impl TakoApp {
                 tools: Vec::new(),
                 images: 0,
                 notices: 1,
+                // 楽観 echo は「まだ transcript に無い自分の発話」なので送信待ち扱い。
+                // transcript（キュー行 or 本物の user 行）が追いつけばそちらへ入れ替わる
+                queued: true,
                 // echo は「まだ届いていない自分の発話」なので専用のキー空間にする
                 // （transcript 由来の同じ本文と折りたたみ状態を共有させない）
                 key: echo_key(&echo.text),
@@ -1226,7 +1312,7 @@ impl TakoApp {
         // 判断材料は**実際に描く列**にする（送信直後の echo でも下端へ付いていく）。
         // **ドラッグ選択中は寄せない**（#725。選択の最中に新着で飛ぶと選択が壊れる）
         let content_changed =
-            self.chat_content_changed(pane_id, &visible, state.permission.is_some());
+            self.chat_content_changed(pane_id, &visible, state.permission.is_some(), state.busy);
         if content_changed && following && self.chat_selecting != Some(pane_id) {
             scroll_handle.scroll_to_bottom();
         }
@@ -1246,6 +1332,11 @@ impl TakoApp {
         // ターミナル表示のときは従来どおり専用帯（#703。`pane_shows_terminal` が
         // Chat を除外しているので二重には出ない）
         messages.extend(self.render_chat_inline_cards(pane_id, cx));
+        // #737 追加要件 3: 作業中インジケータは会話末尾の AI 側。
+        // ヘッダではなくここに出すので、下端追従スクロールにそのまま乗る
+        if state.busy {
+            messages.push(self.render_chat_activity(pane_id, activity.clone(), state.queued));
+        }
         // 承認カードは会話の末尾（いま答えるべきことが一番下にある）
         if let Some(dialog) = state.permission.clone() {
             messages.push(self.render_chat_approval(pane_id, &dialog, cx));
@@ -1285,7 +1376,7 @@ impl TakoApp {
                     cx.notify();
                 }),
             )
-            .child(self.render_chat_header(pane_id, &state, focused, activity, compact, cx))
+            .child(self.render_chat_header(pane_id, &state, focused, compact, cx))
             // worker も入力できる（#719 追加要件 5）。説明は残すが入力は妨げない
             .when(state.read_only, |d| {
                 d.child(self.render_chat_readonly_note())
@@ -1391,12 +1482,44 @@ impl TakoApp {
             .map(|(_, message, _)| message.clone());
         // 入力欄の中身は **TUI の入力行そのもの**（#719。採取は呼び出し元で 1 回だけ）
         let has_text = mirror.as_ref().is_some_and(|m| m.has_text);
+        // #737: TUI が箱の中に自前で何か描いているなら、tako のプレースホルダは出さない。
+        // claude は空欄でも dim の案内文（`Try "…"`）を、キュー滞留時は
+        // `Press up to edit queued messages` を箱の中へ描くので、`has_text` だけで
+        // 判断すると**その上に自前の案内文を重ねて読めなくしていた**（実測根因 O1）
+        let tui_shows_text = mirror.as_ref().is_some_and(|m| m.tui_shows_text);
         let line_h = self.pane_line_height(pane_id);
+        let cell_w = self
+            .pane_cell_sizes
+            .get(&pane_id)
+            .map(|c| c.width)
+            .or_else(|| self.cell_size.map(|c| c.width))
+            .unwrap_or(px(8.0));
         // 上限に達したら「あと N 行ある」ことが分かるようにしておく（無音の切り捨てにしない）
         let hidden_rows = mirror
             .as_ref()
             .map(|m| m.total_rows.saturating_sub(m.rows.len()))
             .unwrap_or(0);
+        // #737: キャレット矩形の置き場は 1 つしかないので、**誰が書くかを決めておく**。
+        // 変換中ならそのペイン、そうでなければフォーカスペインだけが書く。
+        // 「最後に描いたペインが勝つ」ままだと、master + worker のように
+        // チャットペインが複数あるとき IME の宛先と食い違うことがある
+        let ime_pane = self.ime.as_ref().map(|ime| ime.pane);
+        let owns_caret = match ime_pane {
+            Some(pane) => pane == pane_id,
+            None => focused,
+        };
+        let caret_cell = mirror
+            .as_ref()
+            .and_then(|m| m.caret_cell)
+            .filter(|_| owns_caret);
+        // #737: 未確定文字列は**この入力欄の中**へ描く（ウィンドウ側のオーバーレイは
+        // `ime_overlay_anchor` が抑止する）。箱の中なので overflow_hidden で clip され、
+        // 長い未確定文字列がスラッシュボタンや隣のペインへはみ出すことがない
+        let preedit = self
+            .ime
+            .as_ref()
+            .filter(|ime| ime.pane == pane_id && !ime.text.is_empty())
+            .map(|ime| ime.text.clone());
 
         div()
             .flex_none()
@@ -1423,6 +1546,19 @@ impl TakoApp {
             })
             // 「新しい会話」の確認（破壊的なので必ず 1 段挟む。§受け入れ条件 4）
             .when(confirming, |d| d.child(self.render_chat_clear_confirm(cx)))
+            // 上限行数に達して隠れているぶんの案内（#718 / #719）。
+            // #737: 旧実装は箱の中へ absolute で重ねていたので **1 行目の文字の上に
+            // 乗っていた**。行として箱の上へ出す = 何にも重ならない
+            .when(hidden_rows > 0, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .px(px(9.0))
+                        .text_size(px(9.5))
+                        .text_color(hsla(theme.text_faint))
+                        .child(SharedString::from(txt::chat_input_more_rows(hidden_rows))),
+                )
+            })
             .child(
                 div()
                     .id(("chat-input", pane_id.as_u64()))
@@ -1449,29 +1585,22 @@ impl TakoApp {
                             this.focus_chat_input(pane_id, cx);
                         }),
                     )
-                    // #718: 実ピクセルで高さを見るための記録（absolute なのでレイアウト不変）
+                    // #718 / #737: 実ピクセルで高さを見るための記録
+                    // （absolute なのでレイアウト不変）。#737 からは
+                    // 「IME キャレットが箱の内側か」の検査にも使う
                     .child({
-                        #[cfg(feature = "visual-test")]
-                        {
-                            let slot = self.chat_input_bounds.clone();
-                            gpui::canvas(
-                                |_, _, _| (),
-                                move |bounds, _, _, _| slot.set(Some(bounds)),
-                            )
+                        let slot = self.chat_input_bounds.clone();
+                        gpui::canvas(|_, _, _| (), move |bounds, _, _, _| slot.set(Some(bounds)))
                             .absolute()
                             .size_full()
                             .into_any_element()
-                        }
-                        #[cfg(not(feature = "visual-test"))]
-                        {
-                            gpui::Empty.into_any_element()
-                        }
                     })
                     .child(
                         // 映した行をそのまま縦に積む。**行数 = 箱の高さ**なので、
                         // 1 行なら 1 行ぶんの高さに落ち着く（#718）。送信ボタンは
                         // absolute なので箱の高さを一切押し上げない
                         div()
+                            .relative()
                             .flex_1()
                             .min_w(px(0.0))
                             // 上限までは伸び、超えたら `chat_input_mirror` が頭を落とす
@@ -1484,11 +1613,64 @@ impl TakoApp {
                             .when_some(mirror, |d, m: ChatInputMirror| d.children(m.rows))
                             // TUI が入力行を出していない状態（選択ダイアログ等）でも
                             // 箱が潰れないように 1 行ぶんは確保する
-                            .min_h(px(line_h)),
+                            .min_h(px(line_h))
+                            // #737: キャレット矩形の採取。ミラー行と**同じ箱**の中で
+                            // 採るので、パディング・枠・スクロール位置の分を数え直す
+                            // 必要がない（座標系の取り違えが構造的に起きない）
+                            .child({
+                                let slot = self.chat_caret_bounds.clone();
+                                gpui::canvas(
+                                    |_, _, _| (),
+                                    move |bounds, _, _, _| {
+                                        // 書く権利が無いペインは触らない（他ペインの
+                                        // キャレットを上書きしない）
+                                        if !owns_caret {
+                                            return;
+                                        }
+                                        let Some((col, row)) = caret_cell else {
+                                            // 権利があるのに箱の外（スクロールバック中
+                                            // 等）なら、古い矩形を残さず消す
+                                            slot.set(None);
+                                            return;
+                                        };
+                                        let origin = point(
+                                            bounds.origin.x + cell_w * col as f32,
+                                            bounds.origin.y + px(line_h * row as f32),
+                                        );
+                                        slot.set(Some((
+                                            pane_id,
+                                            gpui::Bounds::new(
+                                                origin,
+                                                gpui::size(cell_w, px(line_h)),
+                                            ),
+                                        )));
+                                    },
+                                )
+                                .absolute()
+                                .size_full()
+                                .into_any_element()
+                            })
+                            // #737: 未確定文字列はキャレット位置へインラインで置く。
+                            // カーソルより右のセルは TUI 側が空なので、ここに重なる
+                            // 文字は無い（重ならないことが幾何で保証される）
+                            .when_some(preedit, |d, text: String| {
+                                let (col, row) = caret_cell.unwrap_or((0, 0));
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .left(cell_w * col as f32)
+                                        .top(px(line_h * row as f32))
+                                        .h(px(line_h))
+                                        .whitespace_nowrap()
+                                        .bg(rgba(theme.background))
+                                        .child(self.ime_preedit_text(text)),
+                                )
+                            }),
                     )
                     // 空のときの案内。実画面には何も無いので**重ねて**出す
-                    // （行を足すと高さが変わってしまう）
-                    .when(!has_text, |d| {
+                    // （行を足すと高さが変わってしまう）。
+                    // #737: TUI が自前の案内文を出しているときは重ねない
+                    .when(chat_placeholder_visible(has_text, tui_shows_text), |d| {
                         d.child(
                             div()
                                 .absolute()
@@ -1500,17 +1682,6 @@ impl TakoApp {
                                 .text_size(px(11.5))
                                 .text_color(hsla(theme.text_faint))
                                 .child(SharedString::from(txt::chat_placeholder(state.busy))),
-                        )
-                    })
-                    .when(hidden_rows > 0, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left(px(9.0))
-                                .top(px(2.0))
-                                .text_size(px(9.5))
-                                .text_color(hsla(theme.text_faint))
-                                .child(SharedString::from(txt::chat_input_more_rows(hidden_rows))),
                         )
                     })
                     .child(
@@ -2091,8 +2262,6 @@ impl TakoApp {
         pane_id: PaneId,
         state: &ChatPaneState,
         focused: bool,
-        // TUI から採ったスピナー行（`Manifesting… (5m 16s · ↓ 16.4k tokens)`。#719）
-        activity: Option<String>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -2123,12 +2292,12 @@ impl TakoApp {
             status_dot.into_any_element()
         };
 
-        // #719: 生成中は TUI のスピナー行（作業内容 + 経過時間 + 受信トークン数）を
-        // そのまま出す。取れないときだけ従来の「考え中…」へ落とす
+        // #737 追加要件 3: 生きたスピナー行（作業内容 + 経過 + トークン数）は
+        // **会話末尾の AI 側**（`render_chat_activity`）へ移した。ヘッダは
+        // 「いまどっちの手番か」だけを短く出す簡素な表示に留める
+        // （同じ情報を 2 か所で動かすと目が散る）
         let status_label: String = if state.queued {
             txt::chat_status_queued().to_string()
-        } else if let Some(live) = activity.filter(|_| state.busy) {
-            live
         } else if state.busy {
             txt::chat_status_busy().to_string()
         } else {
@@ -2296,6 +2465,79 @@ impl TakoApp {
             .into_any_element()
     }
 
+    /// 作業中インジケータ（#737 追加要件 3）。
+    ///
+    /// **会話の末尾 = assistant の発話位置**に出す（Web 版 Claude のタイピング
+    /// インジケータと同じ位置感）。中身は TUI のスピナー行そのもの
+    /// （`Manifesting… (5m 16s · ↓ 16.4k tokens)` = 作業内容 + 経過 + 受信トークン）で、
+    /// 取れないときだけ「考え中…」へ落ちる。
+    /// 生成が終われば busy が false になり、本文の発話に自然に置き換わる
+    fn render_chat_activity(
+        &self,
+        pane_id: PaneId,
+        activity: Option<String>,
+        queued: bool,
+    ) -> gpui::AnyElement {
+        let theme = &self.theme;
+        use crate::ui_text::ui_mode as txt;
+        let label = activity.unwrap_or_else(|| txt::chat_status_busy().to_string());
+        // 明滅する点（タブバー・ヘッダの実行中ドットと同じ表現。新しい表現を増やさない）
+        let dot = div()
+            .w(px(7.0))
+            .h(px(7.0))
+            .flex_none()
+            .rounded_full()
+            .bg(hsla(theme.accent))
+            .with_animation(
+                ("chat-activity-pulse", pane_id.as_u64()),
+                Animation::new(Duration::from_secs(2)).repeat(),
+                |el, t| el.opacity(1.0 - 0.65 * (std::f32::consts::PI * t).sin()),
+            );
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_start()
+            .w_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .rounded(px(10.0))
+                    .bg(rgba(theme.surface_0))
+                    .border_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .child(dot)
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.text_secondary))
+                            .child(SharedString::from(label)),
+                    )
+                    // キューに滞留しているなら「あとで届く」ことも同じ場所で伝える
+                    .when(queued, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.text_faint))
+                                .child(SharedString::from(txt::chat_status_queued().to_string())),
+                        )
+                    }),
+            )
+            // コピーボタン列と幅を揃える（発話と左右の位置が揃う）
+            .child(div().flex_none().w(px(CHAT_COPY_GUTTER)))
+            .into_any_element()
+    }
+
     /// worker ペインの説明行（§2.4。入力欄の代わりに「自動で動いている」ことを伝える）
     fn render_chat_readonly_note(&self) -> gpui::AnyElement {
         let theme = &self.theme;
@@ -2409,7 +2651,22 @@ impl TakoApp {
                             .when(message.images > 0, |d| {
                                 d.child(self.render_chat_attachment(message.images))
                             })
-                            .children(self.render_chat_user_text(pane_id, message, index, cx)),
+                            .children(self.render_chat_user_text(pane_id, message, index, cx))
+                            // #737 追加要件 5: 生成中に打った指示は、届くのが
+                            // ターン終了後になる。吹き出しはすぐ出しつつ、
+                            // 「まだ渡っていない」ことを小さく添える
+                            .when(message.queued, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(9.5))
+                                        .text_color(hsla(theme.text_faint))
+                                        .child(SharedString::from(
+                                            crate::ui_text::ui_mode::chat_queued_badge()
+                                                .to_string(),
+                                        )),
+                                )
+                            }),
                     )
                     .child(self.render_chat_message_gutter(pane_id, message, group, cx))
                     .into_any_element()
@@ -2490,7 +2747,26 @@ impl TakoApp {
                     .items_start()
                     .w_full()
                     .group(group.clone())
-                    .child(body)
+                    // #737 追加要件 4: assistant も枠付きブロックにする。
+                    // 地の文だと ①どこまでが 1 発話か分からない ②コピーボタンの
+                    // 対象範囲が見えない。user（右寄せ・`surface_1` の濃い背景）とは
+                    // 「左寄せ・`surface_0` + subtle な枠」で区別する。
+                    // thinking / ツール / コードブロック / インラインカードは
+                    // すべて `body` の中なので枠の内側に収まる
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .rounded(px(10.0))
+                            .bg(rgba(theme.surface_0))
+                            .border_1()
+                            .border_color(hsla(theme.border_subtle))
+                            .child(body),
+                    )
                     .child(self.render_chat_message_gutter(pane_id, message, group, cx))
                     .into_any_element()
             }
@@ -2785,10 +3061,16 @@ impl TakoApp {
         pane_id: PaneId,
         messages: &[ChatMessage],
         approval: bool,
+        // #737: 会話末尾の作業中インジケータの **有無**（文言は入れない）。
+        // スピナー行は経過秒とトークン数が毎秒変わるので、文言を鍵に混ぜると
+        // 毎フレーム「新着」になり、上へスクロールして読んでいる最中に下端へ
+        // 引き戻してしまう（追従を外す仕組みが無効化される）
+        activity: bool,
     ) -> bool {
         let key = messages.last().map(|m| m.key).unwrap_or(0)
             ^ (messages.len() as u64).rotate_left(32)
-            ^ u64::from(approval).rotate_left(16);
+            ^ u64::from(approval).rotate_left(16)
+            ^ u64::from(activity).rotate_left(8);
         if self.chat_content_keys.get(&pane_id) == Some(&key) {
             return false;
         }

@@ -468,6 +468,47 @@ impl InputRegion {
     }
 }
 
+/// 入力ボックスの中に **TUI 自身が何か描いているか**（Issue #737）。
+///
+/// 「ユーザーが打った文字があるか」とは別物で、claude 自身の dim な案内文も
+/// true になる（空欄時の `Try "how does <filepath> work?"`、キュー滞留時の
+/// `Press up to edit queued messages` を実採取で確認）。
+///
+/// GUI モードのチャット入力欄は TUI の入力行をそのまま映すので、ここが true の
+/// ときに tako 自前のプレースホルダを重ねると**同じ座標に 2 つの文字列が出て
+/// 読めなくなる**（#737 の実測根因。dim テキストは列 2 から始まり、
+/// プレースホルダの絶対配置とほぼ一致していた）
+pub fn input_box_has_content(screen: &Screen, region: &InputRegion) -> bool {
+    // プロンプト行は記号（`❯`）を除いた中身を見る。記号だけの行は「空」
+    if analyze_input_line_at(screen, region.prompt_row).is_some_and(|s| !s.text.trim().is_empty()) {
+        return true;
+    }
+    // 箱が複数行なら 2 行目以降の本文も見る（プロンプト行は上で判定済み）
+    let end = region.end.min(screen.lines.len());
+    (region.start..end).any(|i| i != region.prompt_row && !screen.lines[i].text.trim().is_empty())
+}
+
+/// 入力ボックスの中でのキャレット位置 `(列, 映した行の先頭から数えた行)`（Issue #737）。
+///
+/// `shown_rows` は実際に映している行数（上限で頭打ちになり、超えたぶんは
+/// **頭が落ちる**）。返す行番号は映した行の中での index なので、描画側は
+/// 「行の高さ × これ」でそのままキャレットの y が出る。
+///
+/// GUI モードのチャット表示はターミナルグリッドを描かないため、IME の未確定文字列と
+/// 候補ウィンドウをセル座標（`pane_text_areas` 由来）へ向けると画面上のどこも
+/// 指さない。**入力欄の実座標へ向けるための唯一の写像**がこれ
+pub fn input_caret_cell(
+    screen: &Screen,
+    region: &InputRegion,
+    shown_rows: usize,
+) -> Option<(usize, usize)> {
+    let (col, row) = screen.ime_anchor_cell()?;
+    let shown = region.rows().min(shown_rows.max(1));
+    let first = region.end.saturating_sub(shown);
+    // 箱の外（会話ログ側・フッター側）にカーソルがあるなら入力欄には出さない
+    (first..region.end).position(|r| r == row).map(|w| (col, w))
+}
+
 /// 罫線だけでできた行か（`────` / `╭────╮` / `│` 単独は除く）。
 ///
 /// claude は入力欄を上下の水平罫線で挟んで描く（実採取画面 v2.1 系）。
@@ -1069,4 +1110,146 @@ mod tests {
         assert!(s.lines[r.prompt_row].text.trim_start().starts_with('❯'));
         assert_eq!(r.rows(), 1);
     }
+
+    // ─────── #737: 入力欄の重なり描画と IME キャレット ───────
+
+    /// 実 claude と同じ広さの端末を作る（20 列だと案内文が折り返してしまう）
+    fn wide_term(bytes: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TermSize::new(60, 12), VoidListener);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    /// 実採取した claude の下端（`737probe` の tmux キャプチャそのまま）を組む。
+    /// `input` はプロンプト行の生バイト列（SGR 込み）
+    fn claude_screen(input: &str) -> Screen {
+        let rule = "─".repeat(40);
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n{input}\r\n\x1b[38;5;244m{rule}\r\n\
+             \x1b[39m  \x1b[32m[Opus 5 (1M context) \u{b7} xH]\x1b[0m\r\n  ctx   0%",
+        );
+        let term = wide_term(bytes.as_bytes());
+        snapshot_opts(&term, &theme(), true, 0.0)
+    }
+
+    /// 空欄の claude は **自前の dim な案内文**を箱の中に描く（実採取）。
+    /// これを「中身なし」と扱うと、tako のプレースホルダを同じ座標へ重ねてしまう
+    /// （#737 の実測根因 O1）
+    #[test]
+    fn 空欄のclaudeは自前の案内文を箱に描いている() {
+        // 実採取: '\x1b[39m❯\xa0\x1b[2mTry "how does <filepath> work?"\x1b[0m'
+        let s = claude_screen("\x1b[39m❯\u{a0}\x1b[2mTry \"how does <filepath> work?\"\x1b[0m");
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(
+            input_box_has_content(&s, &r),
+            "dim の案内文も「箱に何か描いてある」として扱う: {:?}",
+            s.lines[r.prompt_row].text
+        );
+    }
+
+    /// キュー滞留中の案内文（実採取）も同じ扱い。
+    /// ここを取りこぼすと busy キューの状態で重なりが起きる（受け入れ条件 1 の 1 状態）
+    #[test]
+    fn キュー滞留の案内文も箱の中身として扱う() {
+        let s = claude_screen(
+            "\x1b[38;5;246m❯\u{a0}\x1b[2m\x1b[39mPress up to edit queued messages\x1b[0m",
+        );
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(input_box_has_content(&s, &r));
+    }
+
+    /// 生成中で本当に空の箱（`❯ ` だけ。実採取）は「中身なし」。
+    /// ここまで true にしてしまうと tako の案内文が一切出なくなる
+    #[test]
+    fn 本当に空の箱は中身なしと判定する() {
+        let s = claude_screen("\x1b[38;5;246m❯\u{a0}\x1b[39m");
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(
+            !input_box_has_content(&s, &r),
+            "記号だけの行は空: {:?}",
+            s.lines[r.prompt_row].text
+        );
+    }
+
+    /// ユーザーが打った文字は当然「中身あり」
+    #[test]
+    fn 打った文字は箱の中身として扱う() {
+        let s = claude_screen("\x1b[38;5;246m❯\u{a0}\x1b[39mbusy中の追加指示です");
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(input_box_has_content(&s, &r));
+    }
+
+    /// 複数行入力の 2 行目以降だけに本文があるときも中身ありとする
+    #[test]
+    fn 複数行入力の2行目の本文も拾う() {
+        let rule = "─".repeat(40);
+        let bytes =
+            format!("out\r\n\x1b[38;5;244m{rule}\r\n❯\u{a0}\r\n  2行目の本文\r\n\x1b[38;5;244m{rule}\r\n  ctx 0%");
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(r.rows() >= 2, "2 行の箱として取れている: {r:?}");
+        assert!(input_box_has_content(&s, &r));
+    }
+
+    /// キャレットは「箱の中の (列, 行)」へ写る。
+    /// 実採取の値（空欄 = 列 2 / 14 文字打つと列 16）と同じ関係になることを見る
+    #[test]
+    fn キャレットは箱の中の座標へ写る() {
+        // プロンプト行は上から 2 行目（0 始まりで index 2）。CSI H は 1 始まり
+        let rule = "─".repeat(40);
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n❯\u{a0}G4 mo susumete\r\n\x1b[38;5;244m{rule}\r\n  ctx 0%\x1b[3;17H",
+        );
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        let (col, row) = input_caret_cell(&s, &r, CHAT_INPUT_MAX_ROWS_FOR_TEST)
+            .expect("箱の中にキャレットがある");
+        assert_eq!(col, 16, "実採取と同じ列（`❯ ` の 2 列 + 14 文字）");
+        assert_eq!(row, 0, "1 行の箱なので先頭行");
+    }
+
+    /// カーソルが箱の外（会話ログ側）にあるときは入力欄へ出さない。
+    /// ここで Some を返すと、スクロールバック中に未確定文字列が入力欄へ化けて出る
+    #[test]
+    fn 箱の外のカーソルは入力欄のキャレットにしない() {
+        let rule = "─".repeat(40);
+        // カーソルを 1 行目（会話ログ側）へ置く
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n❯\u{a0}hi\r\n\x1b[38;5;244m{rule}\r\n  ctx 0%\x1b[1;1H",
+        );
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert_eq!(input_caret_cell(&s, &r, CHAT_INPUT_MAX_ROWS_FOR_TEST), None);
+    }
+
+    /// 上限行数を超えて**頭が落ちている**ときは、落ちたぶんだけ行番号が詰まる。
+    /// ここを region.start 基準で数えると、映していない行のぶん下へずれる
+    #[test]
+    fn 頭が落ちた箱でも行番号は映した行を基準にする() {
+        let rule = "─".repeat(40);
+        let mut body = String::new();
+        for i in 0..4 {
+            body.push_str(&format!("❯\u{a0}row{i}\r\n"));
+        }
+        // 4 行の箱。カーソルは最終行（画面 index 5 = CSI H の 6 行目）
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n{body}\x1b[38;5;244m{rule}\r\n  ctx 0%\x1b[6;3H"
+        );
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 4, "4 行の箱: {r:?}");
+        // 全部映すなら最終行 = index 3
+        assert_eq!(input_caret_cell(&s, &r, 4).map(|(_, row)| row), Some(3));
+        // 2 行しか映さない（頭 2 行が落ちる）なら最終行 = index 1
+        assert_eq!(input_caret_cell(&s, &r, 2).map(|(_, row)| row), Some(1));
+    }
+
+    /// 描画側の上限（`chat_view::CHAT_INPUT_MAX_ROWS`）と同値。
+    /// core は GPUI に依存しないのでテスト用に持つ
+    const CHAT_INPUT_MAX_ROWS_FOR_TEST: usize = 8;
 }

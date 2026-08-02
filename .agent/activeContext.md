@@ -41,6 +41,12 @@
    発話単位のコピーボタン、`tako chat copy` / MCP `tako_chat_copy` = 133 ツール）
 8. 08-02 完了分: #738 設定画面プロファイルタブの描画崩壊（`flex_wrap` の幅未確定でチップが
    1 個ずつ縦に落ち次の行へ重なる問題を `row_wrapping` で根治。visual-test に重なり検査を常設）
+9. 08-02 完了分: #737 チャット入力欄の重なり描画 + IME 位置ズレ + 追加要件 3〜5。
+   重なりの根因は **claude が空欄でも箱の中へ dim の案内文を描く**のに tako が
+   その上へ自前プレースホルダを重ねていたこと。IME はミラー行の実 bounds 由来の
+   キャレットへ。作業中インジケータは会話末尾の AI 側へ / assistant にも枠 /
+   busy 中の指示は transcript の `queue-operation` を読んで即吹き出し化。
+   **実 IME だけこの機に日本語入力ソースが無く未検証**（manual-checks 記載）
 
 ## 未着手・持ち越し
 
@@ -66,6 +72,9 @@
 
 ## 現フェーズで Read すべき設計書
 
+- **チャット入力欄・IME に手を入れる**: `crates/tako-core/src/screen.rs` の
+  `input_box_has_content` / `input_caret_cell`（判定の正）+ `chat_view::render_chat_composer`
+  + main.rs の `ime_overlay_anchor` / `bounds_for_range`（#737）
 - GUI モード（#691 G2 以降）に手を入れる: `.agent/plans/2026-07-gui-mode.md`（正）+
   `crates/tako-core/src/ui_mode.rs`（判定表）+ `crates/tako-app/src/starter.rs`
 - **Markdown の描画に手を入れる**: `crates/tako-app/src/md_view.rs`（幾何とテーマ色の唯一の
