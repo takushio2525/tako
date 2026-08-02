@@ -1327,6 +1327,22 @@ struct TakoApp {
     /// スターターの「コマンド入力へ」でターミナル表示に戻したペイン（Issue #694）。
     /// **永続化しない**揮発フラグ（仕様 §1.3。再起動すると GUI 表示に戻る）
     starter_released: std::collections::HashSet<PaneId>,
+    /// スターターの起動カードから選べるプロファイル（Issue #739）。
+    /// 読み直しは 2 秒 tick に相乗りし、**スターターが画面に出ている間だけ**
+    /// TTL（`starter::STARTER_PROFILES_TTL`）で更新する = 常駐ポーリングを増やさない
+    starter_profiles: starter::StarterProfiles,
+    starter_profiles_at: Option<std::time::Instant>,
+    /// 開いているプロファイルドロップダウン（ペイン, どのカード, アンカー座標）。
+    /// **永続化しない**（開閉はその場のジェスチャ）
+    starter_profile_menu: Option<(PaneId, tako_core::ui_mode::StarterAction, Point<Pixels>)>,
+    /// ドロップダウン内のスクロール位置。件数が上限高さを超えたときに使う
+    /// （visual-test はこのハンドルを動かして「本当にスクロールする」ことを実測する）
+    starter_profile_scroll: gpui::ScrollHandle,
+    /// visual-test 用（#739）: 描き終わった ▾ の実 bounds。
+    /// **合成マウスで実際に ▾ を押す**ための座標源で、これが無いと
+    /// 「▾ は描かれている」「押下の処理は動く」までしか押さえられない
+    #[cfg(feature = "visual-test")]
+    starter_chevron_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// 表示種別の確定を待っている過渡期のペイン（Issue #720）。
     /// 値は「いつ始まったか」と「何を待っているか」。**永続化しない**（生成直後だけの状態）。
     /// 確定したペインの entry は 2 秒 tick が落とす（`prune_pane_settle`）ので、
@@ -2630,6 +2646,12 @@ impl TakoApp {
             // 復元（layout.json）とは無関係なので persist の挙動には影響しない
             ui_mode: tako_control::settings::load().ui_mode(),
             starter_released: std::collections::HashSet::new(),
+            starter_profiles: starter::StarterProfiles::default(),
+            starter_profiles_at: None,
+            starter_profile_menu: None,
+            starter_profile_scroll: gpui::ScrollHandle::new(),
+            #[cfg(feature = "visual-test")]
+            starter_chevron_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             pane_settle: HashMap::new(),
             chat_panes: HashMap::new(),
             chat_expanded: std::collections::HashSet::new(),
@@ -3443,6 +3465,32 @@ impl TakoApp {
                         .is_err()
                     {
                         break;
+                    }
+                    // #739: スターターのプロファイル選択肢。**スターターが画面に
+                    // 出ているときだけ** TTL 切れで読み直す（ターミナル利用中は
+                    // ディスクを触らない = 常駐ポーリングを増やさない）。
+                    // 過渡期を落とした直後に判定するので、いま出たばかりの
+                    // スターターも同じ tick で選択肢を得る
+                    let stale = this.update(cx, |app: &mut TakoApp, _| {
+                        let _s = tako_control::diag::perf_span("periodic_prep:starter_profiles");
+                        app.starter_profiles_stale()
+                    });
+                    let Ok(stale) = stale else {
+                        break;
+                    };
+                    if stale {
+                        let loaded = cx
+                            .background_executor()
+                            .spawn(async move { starter::load_starter_profiles() })
+                            .await;
+                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                            if app.apply_starter_profiles(loaded) {
+                                cx.notify();
+                            }
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
                     }
                 }
                 // ② background: バックエンドペインのペインログ取り込み（probe + capture。
@@ -6598,7 +6646,21 @@ impl TakoApp {
         action: tako_core::ui_mode::StarterAction,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.starter_action_with_profile(pane_id, action, None, cx)
+    }
+
+    /// カード押下の実体（#739）。`profile` は ▾ から選んだプロファイル名で、
+    /// `None`（カード本体クリック）は既定プロファイル = 引数なしの最簡形（#322）
+    pub(crate) fn starter_action_with_profile(
+        &mut self,
+        pane_id: PaneId,
+        action: tako_core::ui_mode::StarterAction,
+        profile: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         use tako_core::ui_mode::StarterAction;
+        // 押した時点で開きっぱなしのドロップダウンは畳む
+        self.starter_profile_menu = None;
         // どのカードでもまずこのペインへフォーカスを移す（押した場所で話が始まる）
         if self.focused_pane() != pane_id {
             self.jump_to_pane(pane_id, cx);
@@ -6623,11 +6685,13 @@ impl TakoApp {
                 }
             }
             _ => {
-                let Some(sub) = action.subcommand() else {
+                // #739: プロファイル名は検証を通ったものだけがコマンドになる
+                // （シェルへ書き込む文字列なので、奇妙なファイル名を混ぜない）
+                let Some(sub) = starter::starter_subcommand(action, profile) else {
                     return false;
                 };
                 // 実体パスで組み立てるので tako が PATH に無い zip 配布でも動く（#549）
-                let line = format!("{}\n", tako_control::welcome::launch_command_line(sub));
+                let line = format!("{}\n", tako_control::welcome::launch_command_line(&sub));
                 match self.terminals.get(&pane_id) {
                     Some(session) => {
                         session.write(line.into_bytes());
@@ -14428,6 +14492,9 @@ impl UiStateHost for TakoApp {
 
     fn set_ui_mode(&mut self, mode: tako_core::ui_mode::UiMode) {
         self.ui_mode = mode;
+        // #739: モードが変わればスターターごと消えるので、開いたままの
+        // プロファイル選択も畳む（ターミナル表示の上に浮いたまま残さない）
+        self.starter_profile_menu = None;
     }
 
     fn starter_released_panes(&self) -> Vec<PaneId> {
@@ -16939,6 +17006,9 @@ impl Render for TakoApp {
             .children(pinned_overlays)
             .children(self.render_limit_service_overlay(cx))
             .children(self.render_run_menu_overlay(cx))
+            // #739: スターターのプロファイル選択。ビューポート実寸を渡して
+            // 画面外へはみ出さないよう詰める（#615 のリモートカードと同じ理由）
+            .children(self.render_starter_profile_menu_overlay(window, cx))
             .children(self.render_sleep_guard_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
             // #615: カードをインジケータ直上へ収めるためビューポート実寸を渡す
@@ -21475,6 +21545,185 @@ mod self_test {
                     "visual-test スターター: ライトテーマでも読める濃さで描かれる (#694)",
                 );
 
+                // #739: プロファイル選択 ▾ とドロップダウン。受け入れ条件は
+                // 「狭幅・多プロファイル（10 件）で崩れない」なので、**実ピクセルで**
+                // ①カードに ▾ が増える ②一覧が画面内に収まって描かれる
+                // ③上限高さで頭打ちになり、中でスクロールする（下の項目に手が届く）
+                // ④ライトテーマでも読める、を見る
+                {
+                    // ライト → ダークへ戻してから測る（既定の見た目を基準にする）
+                    let _ = window.update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Theme {
+                                action: Some("set".into()),
+                                mode: Some("dark".into()),
+                                target: None,
+                                key: None,
+                                value: None,
+                                name: None,
+                                font_family: None,
+                                font_size: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        cx.notify();
+                    });
+                    let (base_frame, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test プロファイル ▾: 前フレーム"));
+
+                    // 10 件（既定 + 9 個）を流し込む。名前は実物と同じ検証規則を通る形
+                    let many = starter::StarterProfiles {
+                        master: (0..10)
+                            .map(|i| starter::StarterProfile {
+                                name: if i == 0 {
+                                    "default".to_string()
+                                } else {
+                                    format!("visual-profile-{i:02}")
+                                },
+                                summary: format!("担当: visual-project-{i:02} / another-{i:02}"),
+                            })
+                            .collect(),
+                        solo: Vec::new(),
+                    };
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.apply_starter_profiles(many);
+                        cx.notify();
+                    });
+                    // ① ▾ が増えたぶんカードの描画が変わる（一覧が空のときは出ない）
+                    let (with_chevron, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test プロファイル ▾: ▾ フレーム"));
+                    let chevron_changed =
+                        changed_pixels_in_bounds(&base_frame, &with_chevron, &[band], scale);
+
+                    // ② **実際に ▾ を押して**ドロップダウンを開く（#725 と同じ合成マウス）。
+                    // 関数を直呼びすると「押下の処理は動く」までしか押さえられず、
+                    // リスナーの配線が外れていても気付けない
+                    let chevron = window
+                        .update(cx, |app, _, _| app.starter_chevron_bounds.get())
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| fail("visual-test プロファイル ▾: ▾ の実矩形"));
+                    let anchor = chevron.center();
+                    let _ = window.update(cx, |app, _, _| {
+                        app.starter_profile_scroll
+                            .set_offset(point(px(0.0), px(0.0)));
+                    });
+                    let _ = any.update(cx, |_, win, cx| {
+                        win.dispatch_event(
+                            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: anchor,
+                                modifiers: gpui::Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        );
+                        win.dispatch_event(
+                            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: anchor,
+                                modifiers: gpui::Modifiers::default(),
+                                click_count: 1,
+                            }),
+                            cx,
+                        );
+                    });
+                    let opened_by_click = window
+                        .update(cx, |app, _, _| app.starter_profile_menu.is_some())
+                        .unwrap_or(false);
+                    check(
+                        opened_by_click,
+                        "visual-test プロファイル ▾: ▾ の実クリックで一覧が開く (#739)",
+                    );
+                    let (menu_dark, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test プロファイル ▾: 一覧フレーム(dark)"));
+                    // 一覧が出る領域（アンカーの下 300px ぶん）。ビューポート内に収まる
+                    let viewport = window
+                        .update(cx, |_, win, _| win.viewport_size())
+                        .unwrap_or_else(|_| fail("visual-test プロファイル ▾: ビューポート"));
+                    let menu_area = Bounds::new(
+                        point(px(0.0), anchor.y),
+                        size(viewport.width, px(320.0).min(viewport.height - anchor.y)),
+                    );
+                    let menu_ink =
+                        readable_pixels_in_bounds(&menu_dark, &[menu_area], scale, bg_dark, 2.0);
+                    let menu_changed =
+                        changed_pixels_in_bounds(&with_chevron, &menu_dark, &[menu_area], scale);
+
+                    // ③ 中でスクロールする（上限高さで頭打ち = 画面外へ伸ばさない）
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.starter_profile_scroll
+                            .set_offset(point(px(0.0), px(-90.0)));
+                        cx.notify();
+                    });
+                    let (scrolled, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test プロファイル ▾: スクロール後"));
+                    let scroll_changed =
+                        changed_pixels_in_bounds(&menu_dark, &scrolled, &[menu_area], scale);
+
+                    // ④ ライトテーマでも読める濃さ
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.starter_profile_scroll.set_offset(point(px(0.0), px(0.0)));
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Theme {
+                                action: Some("set".into()),
+                                mode: Some("light".into()),
+                                target: None,
+                                key: None,
+                                value: None,
+                                name: None,
+                                font_family: None,
+                                font_size: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        cx.notify();
+                    });
+                    let (menu_light, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test プロファイル ▾: 一覧フレーム(light)"));
+                    let menu_ink_light =
+                        readable_pixels_in_bounds(&menu_light, &[menu_area], scale, bg_light, 2.0);
+
+                    if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                        let base = std::path::Path::new(&dir);
+                        let _ = with_chevron.save(base.join("starter-profiles-chevron.png"));
+                        let _ = menu_dark.save(base.join("starter-profiles-menu-dark.png"));
+                        let _ = scrolled.save(base.join("starter-profiles-menu-scrolled.png"));
+                        let _ = menu_light.save(base.join("starter-profiles-menu-light.png"));
+                    }
+                    println!(
+                        "TAKO_VISUAL_PIXEL: starter-profiles chevron_changed={chevron_changed} \
+                         menu_ink={menu_ink} menu_changed={menu_changed} \
+                         scroll_changed={scroll_changed} menu_ink_light={menu_ink_light}"
+                    );
+                    check(
+                        chevron_changed > 20,
+                        "visual-test プロファイル ▾: 選択肢があるとカードに ▾ が増える (#739)",
+                    );
+                    check(
+                        menu_ink > 800 && menu_changed > 800,
+                        "visual-test プロファイル ▾: 10 件の一覧が画面内に描かれる (#739)",
+                    );
+                    check(
+                        scroll_changed > 200,
+                        "visual-test プロファイル ▾: 上限を超えた一覧は中でスクロールする (#739)",
+                    );
+                    check(
+                        menu_ink_light > 800,
+                        "visual-test プロファイル ▾: ライトテーマでも読める濃さ (#739)",
+                    );
+                    // 後片付け: 一覧と選択状態を戻す（以降の節へ持ち越さない）
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.starter_profile_menu = None;
+                        app.starter_profiles = starter::StarterProfiles::default();
+                        app.starter_profiles_at = None;
+                        cx.notify();
+                    });
+                }
+
                 // 後片付け: 既定（dark / terminal）へ戻す
                 let _ = window.update(cx, |app, _, cx| {
                     let _ = tako_control::dispatch(
@@ -22009,6 +22258,107 @@ mod self_test {
                     chat_band_light > 1000 && theme_changed > 1000,
                     "visual-test チャット: ライトテーマでも読める濃さで描かれる (#702)",
                 );
+
+                // #739: コンテキスト残量の警告と `/compact` ヒント。ヘッダ帯を
+                // 「余裕あり（37%）」と「残り少ない（85%）」で撮り比べ、
+                // **警告色の赤が実際に増えている**ことをピクセルで見る
+                // （色の指定を落としても数字だけ変わって気付かない、を防ぐ）
+                {
+                    // ヘッダはペインの**テキスト領域より上**にある（`area` は本文の矩形。
+                    // ここを取り違えると本文を測ってしまい、色を変えても差分 0 になる）
+                    let header_top = (f32::from(area.top()) - PANE_TITLE_BAR - 6.0).max(0.0);
+                    let header = Bounds::new(
+                        point(area.left(), px(header_top)),
+                        size(
+                            area.size.width,
+                            px((f32::from(area.top()) - header_top).max(1.0)),
+                        ),
+                    );
+                    let _ = window.update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Theme {
+                                action: Some("set".into()),
+                                mode: Some("dark".into()),
+                                target: None,
+                                key: None,
+                                value: None,
+                                name: None,
+                                font_family: None,
+                                font_size: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        cx.notify();
+                    });
+                    let (calm, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test ctx ヒント: 余裕ありフレーム"));
+                    let (warn_ctx, red) = window
+                        .update(cx, |app, _, cx| {
+                            if let Some(state) = app.chat_panes.get(&pane) {
+                                let mut next = (**state).clone();
+                                next.ctx_percent = Some(85.0);
+                                let hinted = next.ctx_hint();
+                                app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                                cx.notify();
+                                return (hinted, app.theme.red);
+                            }
+                            (false, app.theme.red)
+                        })
+                        .unwrap_or_else(|_| fail("visual-test ctx ヒント: 状態の適用"));
+                    let (warned, _) = capture_frame(any, cx)
+                        .unwrap_or_else(|| fail("visual-test ctx ヒント: 警告フレーム"));
+                    let header_changed =
+                        changed_pixels_in_bounds(&calm, &warned, &[header], scale);
+                    // ヘッダ帯に「テーマの赤」に近い画素が増えている
+                    // （Metal 読み戻しの上下方向差は多い方を採る = 他の検査と同じ流儀）
+                    let red_count = |frame: &image::RgbaImage| {
+                        color_pixels_in_bounds(frame, header, scale, red, 40, false)
+                            .max(color_pixels_in_bounds(frame, header, scale, red, 40, true))
+                    };
+                    let red_before = red_count(&calm);
+                    let red_after = red_count(&warned);
+                    if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                        let base = std::path::Path::new(&dir);
+                        let _ = calm.save(base.join("chat-ctx-calm.png"));
+                        let _ = warned.save(base.join("chat-ctx-warn.png"));
+                    }
+                    println!(
+                        "TAKO_VISUAL_PIXEL: chat-ctx header_changed={header_changed} \
+                         red_before={red_before} red_after={red_after}"
+                    );
+                    check(
+                        warn_ctx && header_changed > 100,
+                        "visual-test ctx ヒント: 80% 超でヘッダの絵が変わる (#739)",
+                    );
+                    check(
+                        red_after > red_before + 100,
+                        "visual-test ctx ヒント: 警告色（赤）の画素が増える (#739)",
+                    );
+                    // 以降の節（G3）は 37% の状態を前提にしているので戻す
+                    let _ = window.update(cx, |app, _, cx| {
+                        if let Some(state) = app.chat_panes.get(&pane) {
+                            let mut next = (**state).clone();
+                            next.ctx_percent = Some(37.0);
+                            app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                        }
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Theme {
+                                action: Some("set".into()),
+                                mode: Some("light".into()),
+                                target: None,
+                                key: None,
+                                value: None,
+                                name: None,
+                                font_family: None,
+                                font_size: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        cx.notify();
+                    });
+                }
 
                 // #716 / G3: 入力欄・スラッシュボタン・承認カード・インラインカードを
                 // 実ピクセルで見る。ペイン下端の帯（入力欄 + ボタン列）に必ずインクが
@@ -34655,6 +35005,278 @@ mod self_test {
                     app.ui_mode = UiMode::Terminal;
                     cx.notify();
                 });
+            }
+
+            // 99. GUI モード G4（#739）= スターターのプロファイル選択 ▾ と
+            // ctx 警告の `/compact` ヒント。この 2 つの危険はどちらも
+            // 「押した結果が見た目と違う」ことなので、押下の行き先を実物で見る:
+            // (a) ▾ は選択肢が 2 つ以上のときだけ出る（既定 1 件ならノイズにしない）
+            // (b) 一覧に実在のプロファイルが手がかり（担当プロジェクト）つきで並ぶ
+            // (c) 選ぶとそのペインのシェルへ `tako master -<name>` が届く
+            //     （カード本体クリックは既定 = 引数なしのまま。#322）
+            // (d) 選択後はドロップダウンが閉じる / ペインを閉じても浮いたまま残らない
+            // (e) ctx 80% 超でヒントが立ち、押下が /compact の送信経路へ入る
+            {
+                use tako_core::ui_mode::{StarterAction, UiMode};
+                use tako_control::protocol::Request as Req;
+
+                let probe = "st739probe";
+                let profiles_req = |action: &str, projects: Option<Vec<String>>| {
+                    Req::OrchestratorProfiles {
+                        action: action.into(),
+                        name: Some(probe.into()),
+                        kind: Some("master".into()),
+                        from: None,
+                        projects,
+                        clear_projects: false,
+                        master_agent: None,
+                        clear_master_agent: false,
+                        model: None,
+                        worker_model: None,
+                        effort: None,
+                        worker_effort: None,
+                        clear_model: false,
+                        clear_worker_model: false,
+                        worker_agent: None,
+                        clear_worker_agent: false,
+                        agent: None,
+                        agent_model: None,
+                        clear_agent_model: false,
+                        agent_effort: None,
+                        clear_agent_effort: false,
+                        agent_skip_permissions: None,
+                        agent_args: None,
+                        worker_model_policy: None,
+                        tab_naming_convention: None,
+                        env_set: None,
+                        env_unset: None,
+                        master_account: None,
+                        clear_master_account: false,
+                        worker_account: None,
+                        clear_worker_account: false,
+                    }
+                };
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                // 実ユーザーのプロファイルを壊さないよう、専用の名前だけを作って最後に消す
+                fire(profiles_req("delete", None), cx);
+
+                // (a) 既定しか無い状態では ▾ を出さない
+                let only_default = starter::load_starter_profiles();
+                let hidden_without_choice = !only_default.has_choice(StarterAction::Master);
+
+                // 専用プロファイルを作り、担当プロジェクトを持たせる（手がかりの材料）
+                let created = fire(profiles_req("create", None), cx).is_some()
+                    && fire(
+                        profiles_req("set", Some(vec!["st739-project".into()])),
+                        cx,
+                    )
+                    .is_some();
+                let listed = starter::load_starter_profiles();
+                let master = listed.for_action(StarterAction::Master);
+                let entry = master.iter().find(|p| p.name == probe);
+                println!(
+                    "TAKO_SELF_TEST_739_PROFILES: before={} after={} first={:?} summary={:?} solo={}",
+                    only_default.for_action(StarterAction::Master).len(),
+                    master.len(),
+                    master.first().map(|p| p.name.as_str()),
+                    entry.map(|p| p.summary.as_str()),
+                    listed.for_action(StarterAction::Solo).len(),
+                );
+                check(
+                    hidden_without_choice
+                        && created
+                        && listed.has_choice(StarterAction::Master)
+                        // 既定は必ず先頭（1 クリック起動の行き先が動かない）
+                        && master.first().map(|p| p.name.as_str()) == Some("default")
+                        // (b) 手がかりに担当プロジェクトが載る
+                        && entry.is_some_and(|p| p.summary.contains("st739-project"))
+                        // solo 側（solo-profiles/）には出ない
+                        && !listed
+                            .for_action(StarterAction::Solo)
+                            .iter()
+                            .any(|p| p.name == probe),
+                    "スターターのプロファイル一覧: 選択肢が増えたときだけ ▾ / 既定が先頭 / 手がかりつき (#739)",
+                );
+
+                // 検証用のペイン（素のシェル）を 1 枚作ってスターターを出す
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#739: 基準ペインの取得")
+                };
+                let starter_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            Req::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(starter_pane) = starter_pane else {
+                    fail("#739: 検証用ペインの作成")
+                };
+                wait(cx, 800).await;
+
+                // GUI モードにして一覧を流し込む（本番は 2 秒 tick が同じ経路で入れる）
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            Req::UiMode {
+                                action: Some("set".into()),
+                                mode: Some("gui".into()),
+                                pane: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        app.apply_starter_profiles(listed.clone());
+                        app.toggle_starter_profile_menu(
+                            starter_pane,
+                            StarterAction::Master,
+                            point(px(200.0), px(200.0)),
+                            cx,
+                        );
+                        app.starter_profile_menu.is_some()
+                    })
+                    .unwrap_or(false);
+                // 実描画（ドロップダウンのオーバーレイが描けることの確認。
+                // 描画で panic すればここでプロセスが落ちる = 検出できる）
+                for _ in 0..2 {
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                }
+
+                // (c) 一覧から選ぶ → そのペインのシェルへ `tako master -<name>`
+                let selected = window
+                    .update(cx, |app, _, cx| {
+                        app.starter_action_with_profile(
+                            starter_pane,
+                            StarterAction::Master,
+                            Some(probe),
+                            cx,
+                        )
+                    })
+                    .unwrap_or(false);
+                let mut delivered = false;
+                for _ in 0..40 {
+                    wait(cx, 100).await;
+                    delivered = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&starter_pane)
+                                .map(|s| s.visible_lines().join(""))
+                                .unwrap_or_default()
+                                .contains(&format!("tako master -{probe}"))
+                        })
+                        .unwrap_or(false);
+                    if delivered {
+                        break;
+                    }
+                }
+                // (d) 選んだらドロップダウンは閉じている
+                let closed = window
+                    .update(cx, |app, _, _| app.starter_profile_menu.is_none())
+                    .unwrap_or(false);
+                println!(
+                    "TAKO_SELF_TEST_739_LAUNCH: opened={opened} selected={selected} \
+                     delivered={delivered} closed={closed} line={:?}",
+                    starter::starter_subcommand(StarterAction::Master, Some(probe)),
+                );
+                check(
+                    opened && selected && delivered && closed,
+                    "▾ から選んだプロファイルで `tako master -<name>` が届き、選択後は閉じる (#739)",
+                );
+
+                // (d') ペインが消えたら開きっぱなしの選択も落ちる（消えたペインへ起動しない）
+                let dropped = window
+                    .update(cx, |app, _, cx| {
+                        app.toggle_starter_profile_menu(
+                            starter_pane,
+                            StarterAction::Master,
+                            point(px(200.0), px(200.0)),
+                            cx,
+                        );
+                        let opened = app.starter_profile_menu.is_some();
+                        app.drop_gui_pane_state(starter_pane);
+                        opened && app.starter_profile_menu.is_none()
+                    })
+                    .unwrap_or(false);
+                check(
+                    dropped,
+                    "ペインが消えたらプロファイル選択も閉じる（浮いたまま残さない）(#739)",
+                );
+
+                // (e) ctx 80% 超のヒント。押下は G3 のスラッシュボタンと同じ送信経路
+                let hint = window
+                    .update(cx, |app, _, cx| {
+                        let state = |used: f64| {
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-739".into(),
+                                messages: chat_view::messages_from_json(&[
+                                    serde_json::json!({ "role": "user", "text": "長い会話" }),
+                                ]),
+                                model: Some("claude-opus-5".into()),
+                                ctx_percent: Some(used),
+                                ..Default::default()
+                            })
+                        };
+                        // 余裕があるうちは出さない / 80% 超で出す
+                        let calm = !state(40.0).ctx_hint();
+                        let warned = state(85.0).ctx_hint();
+                        app.chat_panes.insert(starter_pane, state(85.0));
+                        cx.notify();
+                        calm && warned
+                    })
+                    .unwrap_or(false);
+                for _ in 0..2 {
+                    let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+                }
+                println!("TAKO_SELF_TEST_739_CTX: calm_and_warned={hint} dropped={dropped}");
+                check(hint, "ctx 80% 超で /compact ヒントが立つ（余裕時は出ない）(#739)");
+
+                // 後片付け: 検証用ペイン・プロファイル・モードを元へ戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        Req::Close {
+                            pane: Some(starter_pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    app.ui_mode = UiMode::Terminal;
+                    app.chat_panes.clear();
+                    app.starter_profile_menu = None;
+                    app.starter_profiles = starter::StarterProfiles::default();
+                    app.starter_profiles_at = None;
+                    cx.notify();
+                });
+                fire(profiles_req("delete", None), cx);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

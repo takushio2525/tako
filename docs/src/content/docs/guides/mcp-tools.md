@@ -1,16 +1,16 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 128 個の MCP ツールの全リスト（v0.6.0 時点）
+description: tako が AI エージェントに公開する 133 個の MCP ツールの全リスト
 ---
 
-tako は **128 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **133 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
 :::
 
 :::note[この一覧の作り方]
-このページの一覧は tako 本体のツール定義（`tako-control` の `mcp::tools()`）から機械的に抽出したものです。数と名前は v0.6.0 時点の実装と一致しています。
+このページの一覧は tako 本体のツール定義（`tako-control` の `mcp::tools()`）から機械的に抽出したものです。数と名前は実装のスナップショット（`crates/tako-app/testdata/mcp_tools_snapshot.txt`）と一致しています。
 :::
 
 ## 画面とレイアウト
@@ -34,6 +34,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_send_input` | ペインへテキストを送信する（全画面 TUI へは送達確認付きで配送） |
 | `tako_read_pane` | ペインの画面内容をテキストで取得する |
 | `tako_set_title` | ペインの表示タイトルと役割ラベル（role）を設定する |
+| `tako_show_command` | コピー / 実行ボタンつきのコマンド提案カードを出す（会話に直書きすると折り返しでコピーが壊れるため） |
 
 ## タブ
 
@@ -58,6 +59,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_link_list` | PDF 内のリンク一覧を取得する |
 | `tako_preview_follow_link` | PDF 内のリンクをたどる |
 | `tako_preview_reload` | プレビューのライブリロードの ON/OFF・状態確認 |
+| `tako_preview_copy_code` | Markdown プレビューのコードブロックを装飾なしでコピーする |
 | `tako_preview_cache` | デコード済みプレビュー画像キャッシュの上限と使用状況 |
 | `tako_preview_changelog` | プレビューのチェンジログ（git 履歴）ビュー切替・diff 展開 |
 | `tako_pin_preview` | プレビューをピン留めしてフローティングウィンドウ化する |
@@ -191,6 +193,8 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 
 | ツール名 | 説明 |
 |---|---|
+| `tako_ui_mode` | かんたん表示（GUI モード）とターミナル表示の切替・ペイン単位の解除 / 復帰 |
+| `tako_chat_copy` | かんたん表示の会話本文・コードブロックをコピーする |
 | `tako_theme` | UI テーマの確認・切替・色設定・プリセット・フォント |
 | `tako_lang` | UI 表示言語（日本語 / 英語）の確認・切替 |
 | `tako_settings` | 設定画面を開く |

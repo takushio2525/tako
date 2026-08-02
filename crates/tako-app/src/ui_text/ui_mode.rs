@@ -69,6 +69,28 @@ pub fn starter_setup_link() -> &'static str {
     tr!("初期設定をやり直す", "Run the initial setup again")
 }
 
+// --- プロファイル選択ドロップダウン（#739 / G4） ---
+
+/// ドロップダウンの見出し
+pub fn starter_profile_menu_title() -> &'static str {
+    tr!("設定を選んで始める", "Start with a specific setup")
+}
+
+/// 既定プロファイルの表示名（内部名 `default` は出さない）
+pub fn starter_profile_default() -> &'static str {
+    tr!("既定", "Default")
+}
+
+/// 担当プロジェクトの手がかり行
+pub fn starter_profile_projects(list: &str) -> String {
+    tr!(format!("担当: {list}"), format!("Projects: {list}"))
+}
+
+/// 手がかり行が長いときの畳み（`rest` は残り件数）
+pub fn starter_profile_more(list: String, rest: usize) -> String {
+    tr!(format!("{list} 他 {rest} 件"), format!("{list} +{rest}"))
+}
+
 // --- 準備中プレースホルダ（#720） ---
 
 /// 表示種別が確定するまでの見出し
@@ -134,6 +156,15 @@ pub fn chat_ctx_label(left_percent: i32) -> String {
     tr!(
         format!("残り {left_percent}%"),
         format!("{left_percent}% left")
+    )
+}
+
+/// 残量が少ないときのヒント（#739 / §2.3）。**押せるボタンとして出す**ので
+/// 「〜できます」ではなく、押した結果が分かる書き方にする
+pub fn chat_ctx_hint() -> &'static str {
+    tr!(
+        "/compact で会話を軽くする",
+        "Shrink the conversation with /compact"
     )
 }
 
@@ -311,6 +342,11 @@ mod tests {
                 card_terminal_desc().to_string(),
                 starter_footnote().to_string(),
                 starter_setup_link().to_string(),
+                starter_profile_menu_title().to_string(),
+                starter_profile_default().to_string(),
+                // 差し込む値はプロファイル名・件数なので、検査には言語非依存の値を使う
+                starter_profile_projects("alpha / beta"),
+                starter_profile_more("alpha".to_string(), 2),
                 preparing_title().to_string(),
                 preparing_shell().to_string(),
                 preparing_agent().to_string(),
@@ -320,6 +356,7 @@ mod tests {
                 chat_status_idle().to_string(),
                 chat_status_queued().to_string(),
                 chat_ctx_label(42),
+                chat_ctx_hint().to_string(),
                 chat_empty().to_string(),
                 chat_transcript_pending().to_string(),
                 chat_thinking().to_string(),
