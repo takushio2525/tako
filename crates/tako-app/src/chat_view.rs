@@ -116,6 +116,15 @@ impl ChatPaneState {
         let used = self.ctx_percent?.clamp(0.0, 100.0);
         Some((((100.0 - used) / 100.0) as f32, used >= CTX_WARN_PERCENT))
     }
+
+    /// 残量が少ないときの `/compact` ヒントを出すか（#739 / §2.3）。
+    ///
+    /// **ヒントは押せるボタン**（押下は G3 のスラッシュボタンと同じ経路）なので、
+    /// 「出すかどうか」を警告色と同じ 1 つの根拠から決める = 色だけ赤くて
+    /// 逃げ道が出ない / 逆にヒントだけ出る、というズレが構造的に起きない
+    pub(crate) fn ctx_hint(&self) -> bool {
+        self.ctx_gauge().is_some_and(|(_, warn)| warn)
+    }
 }
 
 /// モデル ID を人が読む短い名前へ（`claude-opus-5` → `Opus 5`、
@@ -2178,6 +2187,39 @@ impl TakoApp {
                 )
             })
             .child(div().flex_grow(1.0))
+            // #739: 残量が少ないときは「/compact で軽くする」を**押せるボタン**で出す。
+            // 警告色（下の ctx バー）と同じ根拠（`ctx_hint`）で出すので、赤いのに
+            // 逃げ道が無い状態にならない。押下は G3 のスラッシュボタンと同一経路
+            .when(state.ctx_hint() && !compact, |d| {
+                d.child(
+                    div()
+                        .id(("chat-ctx-hint", pane_id.as_u64()))
+                        .flex()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .px(px(7.0))
+                        .h(px(18.0))
+                        .rounded(px(9.0))
+                        .cursor_pointer()
+                        .bg(rgba_alpha(theme.red, 0.14))
+                        .border_1()
+                        .border_color(hsla_alpha(theme.red, 0.45))
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.red))
+                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.24)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.chat_slash_action(pane_id, SlashButton::Compact, cx);
+                        }))
+                        .child(SharedString::from(txt::chat_ctx_hint().to_string())),
+                )
+            })
             .when_some(
                 state.ctx_gauge().filter(|_| !compact),
                 |d, (left, warn): (f32, bool)| {
@@ -2960,6 +3002,13 @@ impl TakoApp {
         self.chat_expanded.retain(|(pane, _, _)| *pane != pane_id);
         self.chat_content_keys.remove(&pane_id);
         self.starter_released.remove(&pane_id);
+        // #739: 開いたままのプロファイル選択も落とす（消えたペインへ起動しない）
+        if self
+            .starter_profile_menu
+            .is_some_and(|(p, ..)| p == pane_id)
+        {
+            self.starter_profile_menu = None;
+        }
         // #720: 過渡期の記録もペインと一緒に落とす（ペイン ID は再利用される。#390）
         self.pane_settle.remove(&pane_id);
         // #716: echo・確認待ちもペインと一緒に落とす
@@ -3164,6 +3213,29 @@ mod tests {
         // 範囲外の値でもバーは 0〜1 に収まる
         let (left, _) = state(Some(140.0)).ctx_gauge().expect("値がある");
         assert_eq!(left, 0.0);
+    }
+
+    /// #739: `/compact` ヒントは警告色と同じ境界（80% 使用）で出る。
+    /// ctx% が取れないときは出さない（根拠が無いのに急かさない）
+    #[test]
+    fn compactヒントは残量警告と同じ境界で出る() {
+        let state = |ctx: Option<f64>| ChatPaneState {
+            ctx_percent: ctx,
+            ..Default::default()
+        };
+        assert!(!state(None).ctx_hint(), "ctx% 不明ならヒントも出さない");
+        assert!(!state(Some(79.9)).ctx_hint());
+        assert!(state(Some(80.0)).ctx_hint(), "境界そのものは警告側");
+        assert!(state(Some(97.0)).ctx_hint());
+        // 警告色とヒントは必ず同時（片方だけ出る状態を作らない）
+        for used in [0.0, 50.0, 79.9, 80.0, 99.0, 140.0] {
+            let s = state(Some(used));
+            assert_eq!(
+                s.ctx_hint(),
+                s.ctx_gauge().expect("値がある").1,
+                "使用率 {used}% でヒントと警告色がずれた"
+            );
+        }
     }
 
     #[test]

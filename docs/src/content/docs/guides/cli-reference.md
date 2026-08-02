@@ -98,11 +98,14 @@ tako orchestrator spawn --help
 | [`task`](#tako-task) | タスクチェックポイントと受け入れゲート |
 | [`mcp serve`](#tako-mcp-serve) | MCP stdio ブリッジ |
 | [`agents`](#tako-agents) | エージェント共通ルールの同期 |
+| [`show-command`](#tako-show-command) | コピー / 実行ボタンつきのコマンド提案カードを出す |
 
 ### 表示と設定
 
 | コマンド | 何をするか |
 |---|---|
+| [`ui-mode`](#tako-ui-mode) | かんたん表示（GUI モード）とターミナル表示の切替 |
+| [`chat copy`](#tako-chat-copy) | かんたん表示の会話本文をコピーする |
 | [`theme`](#tako-theme) | テーマ・色・フォント |
 | [`lang`](#tako-lang) | UI 表示言語（日本語 / 英語） |
 | [`settings`](#tako-settings) | 設定画面を開く |
@@ -385,9 +388,13 @@ tako preview
 tako preview-outline
 tako preview-outline --item 4
 
-# PDF 内のリンク
+# Markdown / PDF のリンク（開くのは http / https のみ）
 tako preview-link-list
 tako preview-follow-link
+
+# Markdown のコードブロックを装飾なしでコピー（出現順 0 始まり・省略で先頭）
+tako preview-copy-code
+tako preview-copy-code 2
 
 # ファイルが書き換わったら自動で反映（既定 ON）
 tako preview-reload          # 現在値
@@ -630,6 +637,50 @@ tako confirm-close off
 # ステータスバーの利用制限表示をどのサービスにするか
 tako limit-service               # 現在値
 tako limit-service codex
+```
+
+### tako ui-mode
+
+かんたん表示（GUI モード）とターミナル表示を切り替えます。**既定は `terminal`**（従来どおりの表示）です。詳しくは[かんたん表示（GUI モード）](/features/gui-mode/)を参照してください。
+
+```bash
+tako ui-mode                     # 現在のモードと、各ペインに出ている表示種別
+tako ui-mode gui                 # かんたん表示へ
+tako ui-mode terminal            # ターミナル表示へ
+tako ui-mode toggle
+
+tako ui-mode release --pane 3    # そのペインだけターミナル表示に戻す（揮発）
+tako ui-mode restore --pane 3    # 戻した指定を解除する
+```
+
+応答の `pane_display` が、いま各ペインに出ているもの（`terminal` / `starter` / `chat` / `preparing`）を返します。AI はこれを見てから案内できます。
+
+:::note[表示レイヤだけの切替です]
+モードを変えても PTY・tmux セッション・実行中のプロセスには影響しません。`release` / `restore` は永続化されないので、再起動すると全ペインがモードどおりの表示に戻ります。
+:::
+
+### tako chat copy
+
+かんたん表示の会話本文をクリップボードへコピーします。UI のコピーボタンと同じ経路です。
+
+```bash
+tako chat copy                       # 最後の AI 発話（画面と同じプレーンテキスト）
+tako chat copy --list                # 添字・role・文字数・コードブロック数の下見
+tako chat copy --message 3           # 添字 3 の発話（0 始まり）
+tako chat copy --message 3 --code 0  # その発話の 1 つ目のコードブロックだけ（0 始まり）
+tako chat copy --markdown            # Markdown ソースのまま
+```
+
+### tako show-command
+
+ターミナル領域を縮めて作った専用の帯に、コピー・実行ボタンつきのコマンドカードを出します。**AI が会話本文に書いたコマンドは折り返しでコピーが壊れる**ため、実行を頼むコマンドはこれで提示します（カードは永続化されません）。
+
+```bash
+tako show-command "cargo test --workspace" --label "テストを流す"
+tako show-command --list          # 出ているカードの一覧
+tako show-command --copy --index 1   # コマンド番号は 1 始まり
+tako show-command --run --index 1    # 新しいペインで実行する（既定はフォーカスを移さない）
+tako show-command --dismiss
 ```
 
 ### tako theme

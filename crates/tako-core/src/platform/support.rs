@@ -150,6 +150,17 @@ pub mod notes {
         "Requires the remote transport and the Windows distribution channel",
     );
 
+    /// GUI ライク表示モードのチャットビュー（#691 の G2 以降）。
+    /// 表示レイヤだけの機能なので #517 で足りそうに見えるが、**会話の解決が
+    /// 永続バックエンドのセッション名を鍵にしている**（`.agent/plans/2026-07-gui-mode.md`
+    /// §4 G2 の帰結: チャット化されるのはバックエンドを持つペインだけ）ため、
+    /// GUI 起動と永続化戦略の両方が要る。スターター側（#694 / #739）は GUI 起動だけで
+    /// 動くので `tako_ui_mode` は `WIN_TERMINAL` のまま
+    pub const WIN_GUI_CHAT: Note = Note::new(
+        "GUI 起動に加えて、チャットビューが会話をひも付けるための永続バックエンド（tmux 相当）の決定が前提",
+        "Requires GUI startup plus deciding the persistent backend (the tmux equivalent) that the chat view resolves conversations through",
+    );
+
     /// #513 の担当範囲。実装はプラットフォーム共通（ファイル操作 + git のみ）で、
     /// パス可搬化の Windows 表記も macOS 上の単体テストで検証済み。
     /// 残っているのは**実機での配線確認**だけなので、その一点だけを理由として書く
@@ -364,12 +375,13 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
-        // #725: GUI モードのチャットビュー本文コピー（表示レイヤなので GUI 起動が前提）
+        // #725: GUI モードのチャットビュー本文コピー。表示レイヤの機能だが、
+        // 会話の解決に永続バックエンドが要る（#739 で理由を精緻化）
         key: "tako_chat_copy",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_GUI_CHAT,
+            issue: 519,
         },
     },
     Feature {
@@ -1315,7 +1327,10 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
-        // #694: 表示レイヤだけの切替なので、GUI 本体（#517）が動けばそのまま動く
+        // #694 / #739: 表示レイヤだけの切替で、モードトグルとスターター
+        // （プロファイル選択 ▾ を含む）は GUI 本体（#517）が動けばそのまま動く。
+        // チャットビューだけは永続バックエンドにも依存するが、それは
+        // `tako_chat_copy`（WIN_GUI_CHAT）側で追跡する
         key: "tako_ui_mode",
         macos: Support::Supported,
         windows: Support::Pending {

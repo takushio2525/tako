@@ -27,6 +27,20 @@ change-type tag. Entries without a platform tag apply to every platform.
   返答の中のコードブロックには Markdown プレビューと同じコピーボタン（#680）が出る。
   CLI `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` と
   MCP `tako_chat_copy`（計 133 ツール）からも同じ操作ができる。
+- GUI mode starter: pick a profile before launching (#739). When you have more than one
+  profile, the "Let an AI team handle it" / "Talk with one AI" cards get a **▾** on their
+  right edge; the dropdown lists every profile with a hint (assigned projects, working
+  folder or model) and writes `tako master -<name>` into the shell. Clicking the card
+  itself still launches the default profile with no arguments. The chat header now also
+  offers a clickable "Shrink the conversation with /compact" hint once the context is
+  more than 80% used, next to the existing warning-coloured remaining-context bar.
+- GUI モードのスターターでプロファイルを選んで起動できる（#739）。プロファイルが
+  2 つ以上あるとき「AI チームに任せる」「AI と 1 対 1 で話す」のカード右端に **▾** が出て、
+  一覧から選ぶと `tako master -<名前>` がシェルに入る。各項目には担当プロジェクト /
+  起動フォルダ / モデルの手がかりが付く。カード本体のクリックは従来どおり
+  既定プロファイル（引数なし）の起動。あわせてチャットのヘッダに、コンテキスト使用率が
+  80% を超えたときだけ**押せる**「/compact で会話を軽くする」ヒントが出るようにした
+  （従来からの警告色の残量バーの隣）。
 
 ## [0.6.4] - 2026-08-02
 
