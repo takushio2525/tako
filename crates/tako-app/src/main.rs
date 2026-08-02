@@ -20,6 +20,10 @@ mod command_card_ui;
 mod drawer;
 mod file_icons;
 mod filetree;
+/// フォームの重なり検査（#738）。実測矩形を突き合わせる検証専用の道具なので、
+/// テストと visual-test ビルドにだけ載せる
+#[cfg(any(test, feature = "visual-test"))]
+mod form_layout;
 mod keybindings;
 mod md_view;
 mod open_files;
@@ -19124,6 +19128,518 @@ mod self_test {
             .await;
     }
 
+    /// #738: 設定画面「プロファイル」タブのフォームが崩れないか。
+    ///
+    /// 見るのは**実際に描かれた矩形**（絶対配置 canvas で記録した実測値）で、
+    /// ①コントロール同士が重ならない ②チップが自分のチップ群の枠から出ない
+    /// ③本文の横幅からはみ出さない ④行同士が重ならない、の 4 点。
+    /// 加えて、見えている位置のクリックでその値が選ばれること（当たり判定と見た目の
+    /// 一致）と、低いウィンドウでもスクロールで最後の項目へ届くことを見る。
+    /// **アカウントが複数ある実データ**でしか再現しないので、ここで作ってから撮り、
+    /// 最後に消す
+    #[cfg(feature = "visual-test")]
+    async fn profiles_form_visual(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+        use crate::settings_window::SettingsTab;
+        use tako_control::protocol::Request as Req;
+
+        // 実ユーザーより多い規模で回す（アカウント 5 / プロジェクト 6 / プロファイル 10 /
+        // 環境変数 10）。#738 は「アカウントが複数ある実データ」で初めて出たので、
+        // 常設の回帰検査は**崩れやすい側**を既定にしておく
+        const PROFILE: &str = "vt738probe";
+        const ACCOUNTS: [&str; 5] = [
+            "vt738-personal",
+            "vt738-work",
+            "vt738-univ",
+            "vt738-client-a",
+            "vt738-sandbox",
+        ];
+        const PROJECTS: [&str; 6] = [
+            "vt738-alpha",
+            "vt738-beta",
+            "vt738-gamma",
+            "vt738-delta",
+            "vt738-epsilon",
+            "vt738-zeta",
+        ];
+        /// 一覧チップを溢れさせるための埋め草（選択はしない）
+        const FILLERS: usize = 9;
+        /// 環境変数の行数
+        const ENV_ROWS: usize = 10;
+
+        let fire = |r: Req, cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                })
+                .ok()
+                .flatten()
+        };
+        let account_req = |action: &str, name: &str| Req::OrchestratorAccounts {
+            action: action.into(),
+            name: Some(name.into()),
+            config_dir: None,
+            inherit: Some(action == "add"),
+            description: None,
+            default_model: None,
+            default_effort: None,
+        };
+        let project_req = |action: &str, key: &str| Req::OrchestratorProjects {
+            action: action.into(),
+            key: Some(key.into()),
+            cwd: (action == "add").then(|| std::env::temp_dir().display().to_string()),
+            description: None,
+        };
+        let profile_req = |action: &str, name: &str| Req::OrchestratorProfiles {
+            action: action.into(),
+            name: Some(name.into()),
+            kind: Some("master".into()),
+            from: None,
+            projects: None,
+            clear_projects: false,
+            master_agent: None,
+            clear_master_agent: false,
+            model: None,
+            worker_model: None,
+            effort: None,
+            worker_effort: None,
+            clear_model: false,
+            clear_worker_model: false,
+            worker_agent: None,
+            clear_worker_agent: false,
+            agent: None,
+            agent_model: None,
+            clear_agent_model: false,
+            agent_effort: None,
+            clear_agent_effort: false,
+            agent_skip_permissions: None,
+            agent_args: None,
+            worker_model_policy: None,
+            tab_naming_convention: None,
+            env_set: None,
+            env_unset: None,
+            master_account: None,
+            clear_master_account: false,
+            worker_account: None,
+            clear_worker_account: false,
+        };
+
+        // --- 実データ規模を用意する ---
+        for name in ACCOUNTS {
+            fire(account_req("add", name), cx);
+        }
+        for key in PROJECTS {
+            fire(project_req("add", key), cx);
+        }
+        fire(profile_req("delete", PROFILE), cx);
+        fire(profile_req("create", PROFILE), cx);
+        for i in 0..FILLERS {
+            let name = format!("vt738fill{i}");
+            fire(profile_req("delete", &name), cx);
+            fire(profile_req("create", &name), cx);
+        }
+        {
+            let mut r = profile_req("set", PROFILE);
+            if let Req::OrchestratorProfiles {
+                ref mut master_account,
+                ref mut worker_account,
+                ref mut projects,
+                ref mut env_set,
+                ref mut master_agent,
+                ref mut worker_agent,
+                ..
+            } = r
+            {
+                *master_account = Some(ACCOUNTS[0].into());
+                *worker_account = Some(ACCOUNTS[2].into());
+                *projects = Some(PROJECTS.iter().map(|p| p.to_string()).collect());
+                *env_set = Some(
+                    (0..ENV_ROWS)
+                        .map(|i| format!("VT738_VAR_{i:02}=dummy"))
+                        .collect(),
+                );
+                *master_agent = Some("claude".into());
+                *worker_agent = Some("codex".into());
+            }
+            fire(r, cx);
+        }
+
+        // --- 設定画面をプロファイルタブで開く ---
+        let _ = window.update(cx, |app, _, cx| {
+            app.open_settings_window_impl(Some(SettingsTab::Profiles), cx);
+        });
+        let mut settings = None;
+        for _ in 0..40 {
+            settings = window
+                .update(cx, |app, _, _| app.settings_window_handle)
+                .ok()
+                .flatten();
+            if settings.is_some() {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
+        let Some(settings) = settings else {
+            fail("visual-test #738: 設定ウィンドウが開かない");
+        };
+        let settings_any: AnyWindowHandle = settings.into();
+        let _ = settings.update(cx, |view, _, cx| {
+            view.set_tab(SettingsTab::Profiles, cx);
+            view.st_profiles_select(PROFILE, cx);
+        });
+
+        let set_theme = |mode: &'static str, cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Theme {
+                        action: Some("set".into()),
+                        mode: Some(mode.into()),
+                        target: None,
+                        key: None,
+                        value: None,
+                        name: None,
+                        font_family: None,
+                        font_size: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        };
+
+        // 幅 760（既定）と最小サイズ（620x420）の 2 通り × dark / light。
+        // 狭いほどチップが折り返す = 崩れるなら必ずここで出る
+        for (state, win_size) in [
+            ("dark", size(px(760.), px(600.))),
+            ("light", size(px(760.), px(600.))),
+            ("dark-min", size(px(620.), px(420.))),
+        ] {
+            set_theme(if state == "light" { "light" } else { "dark" }, cx);
+            let _ = settings.update(cx, |_, window, cx| {
+                window.resize(win_size);
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let Some((frame, _scale)) = capture_frame(settings_any, cx) else {
+                fail("visual-test #738: 設定ウィンドウのフレームを読み戻せない");
+            };
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dump);
+                let _ =
+                    frame.save(std::path::Path::new(&dump).join(format!("profiles-{state}.png")));
+            }
+            let (probes, viewport, max_offset) = settings
+                .update(cx, |view, _, _| {
+                    let handle = view.scroll_handle(SettingsTab::Profiles);
+                    (
+                        view.vt_probe_bounds(),
+                        crate::settings_window::to_rect(handle.bounds()),
+                        handle.max_offset(),
+                    )
+                })
+                .unwrap_or_else(|_| fail("visual-test #738: 実測矩形を読み戻せない"));
+
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                // 実測矩形そのものを証拠として残す（崩れの機序はこの数字でしか追えない）
+                let mut body = format!(
+                    "viewport {:.1} {:.1} {:.1} {:.1}\n",
+                    viewport.x0, viewport.y0, viewport.x1, viewport.y1
+                );
+                for (key, r) in &probes {
+                    body.push_str(&format!(
+                        "{key} {:.1} {:.1} {:.1} {:.1} (w={:.1} h={:.1})\n",
+                        r.x0,
+                        r.y0,
+                        r.x1,
+                        r.y1,
+                        r.x1 - r.x0,
+                        r.y1 - r.y0
+                    ));
+                }
+                let _ = std::fs::write(
+                    std::path::Path::new(&dump).join(format!("profiles-{state}-rects.txt")),
+                    body,
+                );
+            }
+            let report = crate::form_layout::probe_report(&probes, viewport);
+            println!(
+                "TAKO_VISUAL_PIXEL: profiles-form({state}) controls={} rows={} \
+                 overlaps={} escaped={} outside={} scrollable={:.0}",
+                report.controls,
+                report.rows,
+                report.overlaps.len(),
+                report.escaped.len(),
+                report.outside.len(),
+                f32::from(max_offset.y),
+            );
+            if report.is_clean() {
+                println!("TAKO_VISUAL_PIXEL:   clean");
+            }
+            for note in report
+                .overlaps
+                .iter()
+                .chain(&report.escaped)
+                .chain(&report.outside)
+            {
+                println!("TAKO_VISUAL_PIXEL:   {note}");
+            }
+            check(
+                report.controls >= 20,
+                &format!("visual-test #738({state}): 全項目のコントロールが描かれている"),
+            );
+            check(
+                report.overlaps.is_empty(),
+                &format!(
+                    "visual-test #738({state}): コントロールが重ならない（{} 件）",
+                    report.overlaps.len()
+                ),
+            );
+            check(
+                report.escaped.is_empty(),
+                &format!(
+                    "visual-test #738({state}): チップが自分のチップ群の枠から出ない（{} 件）",
+                    report.escaped.len()
+                ),
+            );
+            check(
+                report.outside.is_empty(),
+                &format!(
+                    "visual-test #738({state}): 本文の幅からはみ出さない（{} 件）",
+                    report.outside.len()
+                ),
+            );
+        }
+
+        // --- 低いウィンドウでもスクロールで最後の項目に届く（受け入れ条件 2）---
+        let (max_offset, view_top, view_bottom) = settings
+            .update(cx, |view, _, _| {
+                let handle = view.scroll_handle(SettingsTab::Profiles);
+                let b = crate::settings_window::to_rect(handle.bounds());
+                (handle.max_offset(), b.y0, b.y1)
+            })
+            .unwrap_or_else(|_| fail("visual-test #738: スクロール量を読み戻せない"));
+        check(
+            f32::from(max_offset.y) > 0.,
+            "visual-test #738: 低いウィンドウでは本文がスクロールできる",
+        );
+        let _ = settings.update(cx, |view, _, cx| {
+            view.scroll_handle(SettingsTab::Profiles)
+                .set_offset(point(px(0.), -max_offset.y));
+            cx.notify();
+        });
+        cx.background_executor()
+            .timer(Duration::from_millis(250))
+            .await;
+        let _ = capture_frame(settings_any, cx);
+        let bottom_visible = settings
+            .update(cx, |view, _, _| {
+                // 最後の行（削除ボタン）が枠の中に入ってくる
+                view.vt_probe_bounds().iter().any(|(key, r)| {
+                    key == "ctl:btn-prof-delete" && r.y0 >= view_top && r.y1 <= view_bottom
+                })
+            })
+            .unwrap_or(false);
+        check(
+            bottom_visible,
+            "visual-test #738: スクロールで最後の項目（削除）まで到達できる",
+        );
+        let _ = settings.update(cx, |view, _, cx| {
+            view.scroll_handle(SettingsTab::Profiles)
+                .set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        });
+        cx.background_executor()
+            .timer(Duration::from_millis(200))
+            .await;
+        let _ = capture_frame(settings_any, cx);
+
+        // --- 見えている位置を実クリックすると、その値が選ばれる（受け入れ条件 3）---
+        //
+        // 「チップの当たり判定が見た目と一致する」は、実測矩形の中心へ合成マウスを
+        // 落として**別の値が選ばれないこと**でしか確かめられない。
+        // 枠の外にある（スクロールで隠れている）チップは押せないので、
+        // まず既定サイズへ戻し、対象が枠へ入るところまでスクロールしてから押す
+        let _ = settings.update(cx, |_, window, cx| {
+            window.resize(size(px(760.), px(600.)));
+            cx.notify();
+        });
+        cx.background_executor()
+            .timer(Duration::from_millis(250))
+            .await;
+        let _ = capture_frame(settings_any, cx);
+        let find_target = |cx: &mut AsyncApp, want_key: &str| {
+            let want_key = want_key.to_string();
+            settings
+                .update(cx, |view, _, _| {
+                    let handle = view.scroll_handle(SettingsTab::Profiles);
+                    (
+                        view.vt_probe_bounds()
+                            .iter()
+                            .find(|(key, _)| *key == want_key)
+                            .map(|(_, r)| *r),
+                        crate::settings_window::to_rect(handle.bounds()),
+                        f32::from(handle.offset().y),
+                    )
+                })
+                .unwrap_or_else(|_| fail("visual-test #738: effort チップの実測矩形"))
+        };
+        // 隣り合う 2 個を続けて押す。座標が 1 段でもずれていれば、
+        // どちらかで**別の値**が保存されるので取り違えを検出できる
+        for value in ["low", "high"] {
+            let key = format!("ctl:prof-effort-{value}");
+            let (target, view, offset) = find_target(cx, &key);
+            let Some(mut target) = target else {
+                fail(&format!(
+                    "visual-test #738: effort チップ（{value}）が描かれていない"
+                ));
+            };
+            // 枠からはみ出しているぶんだけスクロールしてから押す
+            if target.y0 < view.y0 || target.y1 > view.y1 {
+                let want = offset - (target.y0 - view.y0 - 60.0);
+                let _ = settings.update(cx, |view, _, cx| {
+                    view.scroll_handle(SettingsTab::Profiles)
+                        .set_offset(point(px(0.), px(want)));
+                    cx.notify();
+                });
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let _ = capture_frame(settings_any, cx);
+                let (again, _, _) = find_target(cx, &key);
+                let Some(again) = again else {
+                    fail("visual-test #738: スクロール後に effort チップが消えた");
+                };
+                target = again;
+            }
+            let center = point(
+                px((target.x0 + target.x1) / 2.),
+                px((target.y0 + target.y1) / 2.),
+            );
+            println!(
+                "TAKO_VISUAL_PIXEL: profiles-click {value} target={:.1},{:.1}..{:.1},{:.1} \
+                 center={:.1},{:.1}",
+                target.x0,
+                target.y0,
+                target.x1,
+                target.y1,
+                f32::from(center.x),
+                f32::from(center.y)
+            );
+            click_at(settings_any, cx, center);
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let picked = fire(profile_req("show", PROFILE), cx)
+                .and_then(|v| v["effort"].as_str().map(String::from));
+            check(
+                picked.as_deref() == Some(value),
+                &format!(
+                    "visual-test #738: 見えている位置のクリックでその値が選ばれる（{value} を押して effort={picked:?}）"
+                ),
+            );
+            // 次の 1 個を撮り直す（押した結果で選択色が変わる = 再描画される）
+            let _ = capture_frame(settings_any, cx);
+        }
+
+        // --- 他タブへの巻き添えが無いこと（row() は全タブ共有）---
+        //
+        // #738 の修正はチップ行だけを `row_wrapping` へ移したが、共通の `row()` にも
+        // 手を入れている。トグル・ボタン・入力欄しかないタブでも重なりが出ないことを
+        // 同じ物差しで見る
+        for tab in [SettingsTab::General, SettingsTab::Appearance] {
+            let _ = settings.update(cx, |view, _, cx| {
+                view.set_tab(tab, cx);
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let Some((frame, _)) = capture_frame(settings_any, cx) else {
+                fail("visual-test #738: 他タブのフレームを読み戻せない");
+            };
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = frame
+                    .save(std::path::Path::new(&dump).join(format!("settings-{tab:?}-dark.png")));
+            }
+            let (probes, viewport) = settings
+                .update(cx, |view, _, _| {
+                    (
+                        view.vt_probe_bounds(),
+                        crate::settings_window::to_rect(view.scroll_handle(tab).bounds()),
+                    )
+                })
+                .unwrap_or_else(|_| fail("visual-test #738: 他タブの実測矩形"));
+            let report = crate::form_layout::probe_report(&probes, viewport);
+            println!(
+                "TAKO_VISUAL_PIXEL: settings-form({tab:?}) controls={} rows={} \
+                 overlaps={} outside={}",
+                report.controls,
+                report.rows,
+                report.overlaps.len(),
+                report.outside.len()
+            );
+            for note in report.overlaps.iter().chain(&report.outside) {
+                println!("TAKO_VISUAL_PIXEL:   {note}");
+            }
+            check(
+                report.overlaps.is_empty() && report.outside.is_empty(),
+                &format!("visual-test #738({tab:?}): 既存タブのフォームが崩れていない"),
+            );
+        }
+
+        // --- 後片付け ---
+        let _ = settings.update(cx, |_, window, _| window.remove_window());
+        let _ = window.update(cx, |app, _, _| app.settings_window_handle = None);
+        fire(profile_req("delete", PROFILE), cx);
+        for i in 0..FILLERS {
+            fire(profile_req("delete", &format!("vt738fill{i}")), cx);
+        }
+        for name in ACCOUNTS {
+            fire(account_req("remove", name), cx);
+        }
+        for key in PROJECTS {
+            fire(project_req("remove", key), cx);
+        }
+        set_theme("dark", cx);
+        cx.background_executor()
+            .timer(Duration::from_millis(200))
+            .await;
+    }
+
+    /// 実測矩形の中心を、実 OS マウスと同じ `PlatformInput` 経路で押す（#738）。
+    /// GPUI のヒットテストとリスナー配線まで通るので「見えている位置を押すと
+    /// その値が選ばれる」を確かめられる。`AnyWindowHandle` から呼ぶこと
+    /// （`WindowHandle<V>::update` の中だとルートビューの二重借用で panic する）
+    #[cfg(feature = "visual-test")]
+    fn click_at(any: AnyWindowHandle, cx: &mut AsyncApp, position: Point<Pixels>) {
+        for input in [
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }),
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+        ] {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        }
+    }
+
     /// #690 の実ピクセル計測 1 フレームぶん。走査範囲は「描き終わったノート枠」の内側だけ
     /// （章題・ボタン・現在バージョン欄を含めない）
     #[cfg(feature = "visual-test")]
@@ -20119,6 +20635,22 @@ mod self_test {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
+
+            // #738: 節を 1 本だけ回す。崩れを直しては実測し直す往復で、
+            // 無関係な節（PDF の background ラスタライズ待ち等の実時間依存）に
+            // 足を取られないため。未設定なら従来どおり全節を通す（最終確認はこちら）
+            match std::env::var("TAKO_VISUAL_ONLY").unwrap_or_default().as_str() {
+                "" => {}
+                "profiles" => {
+                    profiles_form_visual(window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                other => {
+                    eprintln!("TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは profiles）");
+                    std::process::exit(1);
+                }
+            }
 
             // #656: Markdown プレビューの表示品質。代表 md（全ブロック種別）を
             // ダーク / ライト / 狭幅の 3 状態で実フレーム描画し、
@@ -21900,6 +22432,11 @@ mod self_test {
             // ⌘ホバー差分を見る。**最後に回す**: 別ウィンドウを開いてフレームを何枚も撮るので、
             // 実時間に依存する節（PDF の background ラスタライズ待ち等）を遅らせない
             update_notes_visual(window, cx).await;
+
+            // #738: 設定画面「プロファイル」タブのフォームが重ならないか。
+            // 実データ規模（アカウント複数・プロジェクト複数・全項目表示）で開き、
+            // **実際に描かれた矩形**（絶対配置 canvas で記録）から重なり・食み出しを数える
+            profiles_form_visual(window, cx).await;
 
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);

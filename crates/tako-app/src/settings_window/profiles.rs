@@ -284,12 +284,15 @@ impl SettingsWindow {
             .gap(px(2.))
             .p(px(2.))
             .rounded(px(7.))
-            .bg(to_hsla(theme.surface_1));
+            .bg(to_hsla(theme.surface_1))
+            .child(self.probe("chips:prof-kind"));
         for kind in [ProfileKind::Master, ProfileKind::Solo] {
             let active = kind == current;
             row = row.child(
                 div()
                     .id(SharedString::from(format!("prof-kind-{}", kind.as_str())))
+                    .flex_none()
+                    .child(self.probe(format!("ctl:prof-kind-{}", kind.as_str())))
                     .px_3()
                     .py(px(4.))
                     .rounded(px(5.))
@@ -334,7 +337,12 @@ impl SettingsWindow {
                 .child(txt::prof_empty());
         }
         let selected = self.profiles.selected.clone();
-        let mut row = div().flex().flex_wrap().gap(px(4.)).py(px(2.));
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(4.))
+            .py(px(2.))
+            .child(self.probe("chips:prof-chip"));
         for profile in &self.profiles.list {
             let Some(name) = profile["name"].as_str().map(String::from) else {
                 continue;
@@ -347,6 +355,8 @@ impl SettingsWindow {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("prof-chip-{name}")))
+                    .flex_none()
+                    .child(self.probe(format!("ctl:prof-chip-{name}")))
                     .px_3()
                     .py(px(4.))
                     .rounded(px(6.))
@@ -520,7 +530,7 @@ impl SettingsWindow {
                 .children(self.profile_warnings(&detail))
                 // --- master ---
                 .child(self.section(txt::prof_section_master()))
-                .child(self.row(
+                .child(self.row_wrapping(
                     txt::prof_label_agent(),
                     txt::desc_prof_master_agent(),
                     self.option_chips(
@@ -581,7 +591,7 @@ impl SettingsWindow {
                 ))
                 // --- worker ---
                 .child(self.section(txt::prof_section_worker()))
-                .child(self.row(
+                .child(self.row_wrapping(
                     txt::prof_label_agent(),
                     txt::desc_prof_worker_agent(),
                     self.option_chips(
@@ -608,7 +618,7 @@ impl SettingsWindow {
                         },
                     ),
                 ))
-                .child(self.row(
+                .child(self.row_wrapping(
                     txt::prof_label_policy(),
                     "",
                     self.option_chips(
@@ -760,7 +770,7 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.row(
+            .child(self.row_wrapping(
                 txt::prof_agent_target(),
                 txt::desc_prof_agent_target(),
                 self.option_chips(
@@ -863,7 +873,12 @@ impl SettingsWindow {
                 keys.push(key.clone());
             }
         }
-        let mut row = div().flex().flex_wrap().gap(px(4.)).py(px(2.));
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(4.))
+            .py(px(2.))
+            .child(self.probe("chips:prof-project"));
         for key in keys {
             let active = assigned.contains(&key);
             let known = self.profiles.projects.contains(&key);
@@ -876,6 +891,8 @@ impl SettingsWindow {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("prof-project-{key}")))
+                    .flex_none()
+                    .child(self.probe(format!("ctl:prof-project-{key}")))
                     .px_3()
                     .py(px(4.))
                     .rounded(px(6.))
@@ -1099,7 +1116,15 @@ impl SettingsWindow {
         on_pick: impl Fn(&mut Self, String, &mut Context<Self>) + Clone + 'static,
     ) -> Div {
         let theme = self.theme();
-        let mut row = div().flex().flex_wrap().gap(px(3.)).justify_end();
+        // 幅は `row_wrapping` のセル（= 行の残り幅）いっぱい。**確定した幅**を
+        // 持たせないと折り返し位置が決まらず、チップが 1 個ずつ縦に落ちる（#738）
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .w_full()
+            .gap(px(3.))
+            .justify_end()
+            .child(self.probe(format!("chips:{id}")));
         for (value, label) in values {
             let active = value == current;
             let value_owned = value.clone();
@@ -1107,6 +1132,8 @@ impl SettingsWindow {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("{id}-{value}")))
+                    .flex_none()
+                    .child(self.probe(format!("ctl:{id}-{value}")))
                     .px_2()
                     .py(px(4.))
                     .rounded(px(5.))
@@ -1206,7 +1233,7 @@ impl SettingsWindow {
         if !current.is_empty() && !options.contains(&current) {
             values.push((current.to_string(), current.to_string()));
         }
-        self.row(
+        self.row_wrapping(
             label,
             "",
             self.option_chips(id, &values, current, cx, on_pick),
@@ -1242,7 +1269,7 @@ impl SettingsWindow {
         if !current.is_empty() && !self.profiles.accounts.iter().any(|a| a == current) {
             values.push((current.to_string(), current.to_string()));
         }
-        self.row(
+        self.row_wrapping(
             label,
             txt::desc_prof_account(),
             self.option_chips(id, &values, current, cx, on_pick),
