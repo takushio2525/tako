@@ -1666,3 +1666,21 @@
 - 再発防止: visual-test に `profiles-form` 節（実測矩形の総当たり = 重なり / 枠外 / 幅溢れ +
   合成マウスのクリック一致 + 低いウィンドウのスクロール到達 + 他タブの巻き添え検査）と
   GPUI 非依存の `form_layout`（unit 6 本）。before 14 重なり → after 0（dark / light / 最小サイズ）
+
+## 2026-08-02（#737: チャット入力欄の重なり描画 + IME 位置ズレ + 追加要件 3〜5）
+- 重なりの実測根因は「claude が空欄でも dim の案内文（`Try "…"` / キュー滞留時の
+  `Press up to edit queued messages`）を箱の中へ描く」のに、tako が `has_text` だけを見て
+  自前プレースホルダを同座標へ重ねていたこと。判定を `input_box_has_content` へ替えて根治
+  （「上に N 行」の absolute 重ねも行として箱の上へ出す）
+- IME 位置ズレはチャット表示がターミナルグリッドを描かないのにセル座標を
+  アンカーにしていたため。ミラー行の実 bounds + TUI カーソルセル（`input_caret_cell`）から
+  キャレット矩形を作り、未確定はその位置へインライン描画・候補ウィンドウも同じ矩形へ。
+  未確定の見た目は `ime_preedit_text` の 1 実装をターミナル経路と共有
+- 追加要件 3 = 作業中インジケータを会話末尾の AI 側へ / 4 = assistant にも枠 /
+  5 = busy 中の指示は transcript の `queue-operation`（enqueue）を読んで即吹き出し化。
+  **Issue の推定（system-reminder 過剰フィルタ）は実 transcript 3416 本の全数走査で棄却**
+- 検証: 品質ゲート全緑（1801）+ 隔離セルフテスト項目 100 新設で完走 + visual-test 新節
+  （dark/light の枠 + インジケータ差分）+ **実 claude e2e**（95c 拡張: 実スピナー行
+  `Brewing… (running stop hook · 2s · ↓ 38 tokens)` 採取 / 配送前の吹き出し / 配送後 1 個）。
+  検出力は 5 通りの revert で FAILED を実測
+- 実 IME は**この開発機に日本語入力ソースが無く未検証**（manual-checks へ項目化）

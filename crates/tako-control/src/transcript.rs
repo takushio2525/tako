@@ -533,11 +533,77 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
             continue;
         }
         match obj["type"].as_str() {
+            // #737: 生成中に打たれた指示は claude のキューへ入り、その時点で
+            // `queue-operation` 行として記録される。**本物の user 行になるのは
+            // 配送された後**（長いターンでは数分後）で、ターン内へ差し込まれた場合は
+            // 一生 user 行にならない。ここを読まないと「busy 中に送った発話が
+            // 吹き出しとして出ない」（実測で確定した #737 追加要件 5 の根因）
+            Some("queue-operation") => {
+                match obj["operation"].as_str() {
+                    // content を持つのは enqueue だけ（実 transcript 3416 本で
+                    // enqueue 6555 件が全件 content つき）
+                    Some("enqueue") => {
+                        // 中身は user 行と同じ分類にかける。`<task-notification>` 等の
+                        // システム注入がキューに入ることもあるため（実測 1760 件）、
+                        // 通し方を user 行と揃えないと生 XML が吹き出しになる。
+                        // 通知は本物の user 行として後から必ず来るのでここでは出さない
+                        let UserContent::Speech { text, images } =
+                            classify_user_content(&obj["content"])
+                        else {
+                            continue;
+                        };
+                        // `queued` = 表示用の「送信待ち」印（キューから出たら消える）。
+                        // `from_queue` = 本物の user 行と突き合わせるための印
+                        // （配送のされ方が 2 通りあるので、表示状態とは別に持つ）
+                        let mut entry = json!({
+                            "role": "user", "text": text,
+                            "queued": true, "from_queue": true,
+                        });
+                        if images > 0 {
+                            entry["attachments"] = json!(vec![json!({ "kind": "image" }); images]);
+                        }
+                        if let Some(ts) = obj["timestamp"].as_str() {
+                            entry["timestamp"] = json!(ts);
+                        }
+                        out.push_back(entry);
+                        last_request_id = None;
+                        if out.len() > tail {
+                            out.pop_front();
+                        }
+                    }
+                    // キューから出た = 送信された。どのメッセージかは content が
+                    // 無い（dequeue）ので特定できないため、FIFO で最も古い
+                    // 「送信待ち」の印を落とす
+                    Some("dequeue") | Some("remove") | Some("popAll") => {
+                        if let Some(entry) = out.iter_mut().find(|e| e["queued"] == json!(true)) {
+                            entry["queued"] = json!(false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Some("user") => {
                 // #715: 本物の発話 / システム注入 / 表示なし を分類する
                 let mut entry = match classify_user_content(&obj["message"]["content"]) {
                     UserContent::Skip => continue,
                     UserContent::Speech { text, images } => {
+                        // #737: キュー経由で既に出してある発話が配送されてきた。
+                        // 同じ本文を 2 回並べない（1 対 1 で消費するので、同じ文面を
+                        // 2 回送った場合はきちんと 2 個出る）。**まだ手元に残っている
+                        // ものだけ**を対象にするので、tail から押し出された後に
+                        // 本物が来ても取り違えて消すことはない
+                        if let Some(queued) = out
+                            .iter_mut()
+                            .find(|e| e["from_queue"] == json!(true) && e["text"] == json!(&text))
+                        {
+                            queued["from_queue"] = json!(false);
+                            queued["queued"] = json!(false);
+                            if let Some(ts) = obj["timestamp"].as_str() {
+                                queued["timestamp"] = json!(ts);
+                            }
+                            last_request_id = None;
+                            continue;
+                        }
                         let mut entry = json!({ "role": "user", "text": text });
                         if images > 0 {
                             entry["attachments"] = json!(vec![json!({ "kind": "image" }); images]);
@@ -1177,6 +1243,135 @@ mod tests {
         assert_eq!(msgs[1]["count"], 3);
         // まとめても最新の要約を出す
         assert_eq!(msgs[1]["text"], "通知3");
+    }
+
+    // ─────────── #737: busy 中に打たれた指示（queue-operation） ───────────
+
+    /// 実 transcript の形（実測 3416 本より）で 1 行を組む
+    fn queue_line(operation: &str, content: Option<&str>) -> String {
+        let mut v = json!({
+            "type": "queue-operation",
+            "operation": operation,
+            "timestamp": "2026-08-02T10:40:21.015Z",
+            "sessionId": "s",
+        });
+        if let Some(c) = content {
+            v["content"] = json!(c);
+        }
+        v.to_string()
+    }
+
+    fn user_line(text: &str) -> String {
+        json!({
+            "type": "user",
+            "timestamp": "2026-08-02T10:45:00.000Z",
+            "message": { "role": "user", "content": text },
+        })
+        .to_string()
+    }
+
+    /// busy 中に打たれた指示は enqueue の時点で吹き出しになる（配送を待たない）。
+    /// これが無いと長いターンの最中は自分の発話がどこにも出ない（#737 追加要件 5）
+    #[test]
+    fn キューに入った指示はその時点で発話として出る() {
+        let msgs = normalize_lines(
+            vec![
+                user_line("最初のお願い"),
+                queue_line("enqueue", Some("busy中の追加指示です")),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(msgs.len(), 2, "{msgs:#?}");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["text"], "busy中の追加指示です");
+        assert_eq!(msgs[1]["queued"], json!(true), "送信待ちの印が付く");
+    }
+
+    /// 配送されたら「送信待ち」は消え、**本物の user 行が来ても二重に並べない**。
+    /// 実測した 2 通りの配送（dequeue → user 行 / ターン内差し込みで remove のみ）を両方見る
+    #[test]
+    fn キュー発話は配送後に二重化しない() {
+        // 経路 A: enqueue → dequeue → 本物の user 行（実測 = 次のターンとして配送）
+        let a = normalize_lines(
+            vec![
+                queue_line("enqueue", Some("あとで届く指示")),
+                queue_line("dequeue", None),
+                user_line("あとで届く指示"),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(a.len(), 1, "同じ発話を 2 個並べない: {a:#?}");
+        assert_eq!(a[0]["text"], "あとで届く指示");
+        assert_eq!(
+            a[0]["queued"],
+            json!(false),
+            "配送済みなので送信待ちは消える"
+        );
+
+        // 経路 B: enqueue → remove のみ（ターン内へ差し込まれ user 行にならない）
+        let b = normalize_lines(
+            vec![
+                queue_line("enqueue", Some("ターン内へ差し込まれる指示")),
+                queue_line("remove", Some("ターン内へ差し込まれる指示")),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(b.len(), 1, "{b:#?}");
+        assert_eq!(b[0]["text"], "ターン内へ差し込まれる指示");
+        assert_eq!(b[0]["queued"], json!(false));
+    }
+
+    /// 同じ文面を 2 回送ったら 2 個出る（重複排除は 1 対 1 で消費する）
+    #[test]
+    fn 同じ文面を2回送れば2個出る() {
+        let msgs = normalize_lines(
+            vec![
+                queue_line("enqueue", Some("もう一度")),
+                queue_line("dequeue", None),
+                user_line("もう一度"),
+                user_line("もう一度"),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(msgs.len(), 2, "2 回の発話は 2 個出る: {msgs:#?}");
+    }
+
+    /// キューへ入るのはユーザー発話だけではない（実測 = `<task-notification>` 1760 件）。
+    /// システム注入がキュー経由で生 XML の吹き出しになってはいけない（#715 の保証）
+    #[test]
+    fn キュー経由のシステム注入は吹き出しにしない() {
+        let msgs = normalize_lines(
+            vec![queue_line(
+                "enqueue",
+                Some("<task-notification>\n<summary>Monitor event</summary>\n</task-notification>"),
+            )]
+            .into_iter(),
+            50,
+        );
+        assert!(
+            msgs.is_empty(),
+            "システム注入はキュー経由でも発話にしない: {msgs:#?}"
+        );
+    }
+
+    /// tail から押し出された後に本物の user 行が来ても、取り違えて消さない
+    #[test]
+    fn tail外へ出たキュー発話は本物を消さない() {
+        let mut lines = vec![queue_line("enqueue", Some("古い指示"))];
+        // tail=2 なので後続の 2 発話で押し出される
+        lines.push(user_line("別の話1"));
+        lines.push(user_line("別の話2"));
+        lines.push(user_line("古い指示"));
+        let msgs = normalize_lines(lines.into_iter(), 2);
+        assert_eq!(msgs.len(), 2, "{msgs:#?}");
+        assert_eq!(
+            msgs[1]["text"], "古い指示",
+            "本物の配送が消えてはいけない: {msgs:#?}"
+        );
     }
 
     /// PWA へ配る手前でシステム通知を落とす（role 判定できないフロント向け）
