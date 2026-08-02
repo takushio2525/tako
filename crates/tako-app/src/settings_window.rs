@@ -28,7 +28,7 @@ pub mod profiles;
 
 use profiles::{ProfileField, ProfilesTabState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsTab {
     General,
     Appearance,
@@ -152,6 +152,34 @@ struct StatusCache {
     agents: Option<Vec<(String, bool)>>,
 }
 
+/// 実測矩形の記録（キー, 矩形）
+#[cfg(feature = "visual-test")]
+type ProbedBounds = Vec<(String, Bounds<Pixels>)>;
+
+/// visual-test 用（#738）: 描き終わった要素の実 bounds を種別つきで拾う記録。
+///
+/// レイアウトへ影響しない絶対配置の canvas で撮るので、ここに入る矩形が
+/// **画面に見えている座標そのもの**になる（推定矩形と実描画がずれた #684 の教訓）。
+/// 「重なっていないか」「枠から食み出していないか」を数値で押さえるために使う
+#[cfg(feature = "visual-test")]
+#[derive(Clone, Default)]
+pub(crate) struct VtProbes(std::rc::Rc<std::cell::RefCell<ProbedBounds>>);
+
+#[cfg(feature = "visual-test")]
+impl VtProbes {
+    fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    fn record(&self, key: String, bounds: Bounds<Pixels>) {
+        self.0.borrow_mut().push((key, bounds));
+    }
+
+    fn snapshot(&self) -> ProbedBounds {
+        self.0.borrow().clone()
+    }
+}
+
 pub struct SettingsWindow {
     tako_app: WeakEntity<TakoApp>,
     tab: SettingsTab,
@@ -170,6 +198,12 @@ pub struct SettingsWindow {
     runner_new_cmd: String,
     /// プロファイルタブの状態（Issue #721）
     profiles: ProfilesTabState,
+    /// タブごとのスクロール位置（#486 の「タブごとに分ける」を保ったまま、
+    /// スクロール枠の実寸・スクロール量を取り出せるようにハンドルを持つ。#738）
+    scroll: std::cell::RefCell<std::collections::HashMap<SettingsTab, ScrollHandle>>,
+    /// visual-test の実測記録（#738）
+    #[cfg(feature = "visual-test")]
+    vt: VtProbes,
 }
 
 impl SettingsWindow {
@@ -211,6 +245,9 @@ impl SettingsWindow {
             runner_new_ext: String::new(),
             runner_new_cmd: String::new(),
             profiles: ProfilesTabState::default(),
+            scroll: std::cell::RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "visual-test")]
+            vt: VtProbes::default(),
         };
         this.refresh_tab_status(cx);
         this
@@ -759,6 +796,9 @@ impl Focusable for SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
+        // 実測記録はフレームごとに撮り直す（#738）
+        #[cfg(feature = "visual-test")]
+        self.vt.clear();
 
         // IME の受け口を OS へ登録する（paint フェーズ限定 API なので canvas 経由）
         let ime_registration = {
@@ -853,6 +893,47 @@ impl SettingsWindow {
             }))
     }
 
+    /// タブ本文のスクロールハンドル（#738）。タブごとに別インスタンスなので
+    /// 「切り替えたら前のタブの位置が残る」（#486）は起きない
+    pub(crate) fn scroll_handle(&self, tab: SettingsTab) -> ScrollHandle {
+        self.scroll.borrow_mut().entry(tab).or_default().clone()
+    }
+
+    /// visual-test 用（#738）: 直近のフレームで**実際に描かれた**要素の矩形。
+    /// 重なり・食み出しはこの実測値だけで判定する（推定に頼らない）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn vt_probe_bounds(&self) -> Vec<(String, crate::form_layout::Rect)> {
+        self.vt
+            .snapshot()
+            .into_iter()
+            .map(|(key, bounds)| (key, to_rect(bounds)))
+            .collect()
+    }
+
+    /// visual-test の実測マーカー（#738）。絶対配置なのでレイアウトには一切効かない。
+    /// 非 visual-test ビルドでは空要素になり、描画にも当たり判定にも影響しない
+    fn probe(&self, key: impl Into<String>) -> AnyElement {
+        #[cfg(feature = "visual-test")]
+        {
+            let probes = self.vt.clone();
+            let key = key.into();
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, _, _| probes.record(key.clone(), bounds),
+            )
+            // `size_full` だと親の padding ぶん原点がずれた矩形になる（実測）。
+            // 四辺を 0 で留めると親の padding box = **見えている箱**そのものが撮れる
+            .absolute()
+            .inset_0()
+            .into_any_element()
+        }
+        #[cfg(not(feature = "visual-test"))]
+        {
+            let _ = key.into();
+            gpui::Empty.into_any_element()
+        }
+    }
+
     fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
         let content = match self.tab {
@@ -882,6 +963,7 @@ impl SettingsWindow {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle(self.tab))
                     .bg(to_hsla(theme.surface_0))
                     .px_5()
                     .py_4()
@@ -911,15 +993,51 @@ impl SettingsWindow {
 
     // --- 共通ウィジェット ---
 
-    /// ラベル + 説明 + 右コントロールの 1 行
+    /// ラベル + 説明 + 右コントロールの 1 行。
+    /// コントロールは内容ぶんの幅（`flex_none`）で、行の残り幅はラベルが使う
     fn row(&self, label: &str, desc: &str, control: impl IntoElement) -> Div {
+        self.row_with(label, desc, div().flex_none().child(control))
+    }
+
+    /// 折り返すコントロール（チップ群）を持つ 1 行（#738）。
+    ///
+    /// `flex_wrap` のコンテナは**幅が確定していないと折り返し幅を決められない**。
+    /// 幅 auto の親（`row()` の `flex_none` セル）の中では、taffy が返す wrap
+    /// コンテナの max-content 幅が「一番広い項目 1 個ぶん」になるため、
+    /// 幅がチップ 1 個ぶんに潰れて全チップが 1 個ずつ縦に折り返される。しかも行の
+    /// 高さは「1 行ぶん」で見積もられるので、縦に伸びたチップ群が**次の行の上へ
+    /// 重なって描かれる**（#738 の実測: effort 群が 5 段 149.5px に伸びる一方、
+    /// 行の高さは 39.5px のまま）。
+    ///
+    /// コントロール側を「行の残り幅を持つ右寄せの箱」にして幅を確定させると、
+    /// 見積もりと実配置が一致し、行内で素直に折り返す。自動最小サイズ
+    /// （= 一番広いチップ）より狭くはならないので横へも溢れない
+    fn row_wrapping(&self, label: &str, desc: &str, control: impl IntoElement) -> Div {
+        self.row_with(
+            label,
+            desc,
+            div()
+                .flex()
+                .justify_end()
+                .flex_grow(1.)
+                .flex_shrink(1.)
+                .flex_basis(relative(0.))
+                .child(control),
+        )
+    }
+
+    /// `row()` / `row_wrapping()` の共通部分。右セルの作り方だけが違う
+    fn row_with(&self, label: &str, desc: &str, cell: impl IntoElement) -> Div {
         let theme = self.theme();
         div()
             .flex()
             .items_center()
             .justify_between()
             .gap_4()
+            // スクロール本文の直接の子が縦に潰れないようにする（#494 と同じ理由）
+            .flex_shrink_0()
             .py(px(6.))
+            .child(self.probe(format!("row:{label}")))
             .child(
                 div()
                     .flex()
@@ -942,7 +1060,7 @@ impl SettingsWindow {
                         )
                     }),
             )
-            .child(div().flex_none().child(control))
+            .child(cell)
     }
 
     fn section(&self, title: &str) -> Div {
@@ -964,6 +1082,7 @@ impl SettingsWindow {
         let theme = self.theme();
         div()
             .id(SharedString::from(format!("toggle-{id}")))
+            .flex_none()
             .w(px(38.))
             .h(px(22.))
             .rounded(px(11.))
@@ -973,6 +1092,7 @@ impl SettingsWindow {
                 to_hsla(theme.border_default)
             })
             .cursor_pointer()
+            .child(self.probe(format!("ctl:toggle-{id}")))
             .child(
                 div()
                     .w(px(18.))
@@ -1059,6 +1179,7 @@ impl SettingsWindow {
             .bg(bg)
             .text_color(fg)
             .text_size(px(12.))
+            .child(self.probe(format!("ctl:btn-{id}")))
             .child(label.to_string());
         if !matches!(kind, BtnKind::Disabled) {
             b = b.cursor_pointer().on_click(handler);
@@ -1153,6 +1274,7 @@ impl SettingsWindow {
         div()
             .id(SharedString::from(format!("field-{id}")))
             .children(bounds_probe)
+            .child(self.probe(format!("ctl:field-{id}")))
             .map(|d| match width {
                 Some(w) => d.w(w).flex_none(),
                 None => d.flex_1().min_w(px(0.)),
@@ -2884,6 +3006,17 @@ fn summarize_devices(v: &serde_json::Value) -> String {
 
 fn to_hsla(c: Rgb) -> Hsla {
     gpui::rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)).into()
+}
+
+/// 実測矩形を GPUI 非依存の形へ（#738。判定ロジックは `form_layout` が持つ）
+#[cfg(feature = "visual-test")]
+pub(crate) fn to_rect(b: Bounds<Pixels>) -> crate::form_layout::Rect {
+    crate::form_layout::Rect::new(
+        f32::from(b.origin.x),
+        f32::from(b.origin.y),
+        f32::from(b.size.width),
+        f32::from(b.size.height),
+    )
 }
 
 // このモジュールに #[test] は置かない: tako-app は #[test] の展開量が
