@@ -1790,6 +1790,19 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation)?;
             Ok(result)
         }
+        Request::ChatCopy {
+            pane,
+            list,
+            message,
+            code,
+            markdown,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = host
+                .chat_copy(target, list, message, code, markdown)
+                .map_err(DispatchError::Operation)?;
+            Ok(result)
+        }
         Request::PreviewReload { enabled } => {
             if let Some(enabled) = enabled {
                 host.set_preview_reload(enabled);

@@ -285,6 +285,11 @@ pub fn chat_collapse_long() -> &'static str {
     tr!("折りたたむ", "Collapse")
 }
 
+/// コピーボタンの成功フィードバック（#725。押した直後だけ文字で出す）
+pub fn chat_copied() -> &'static str {
+    tr!("コピーしました", "Copied")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -339,6 +344,7 @@ mod tests {
                 chat_respond_failed("timeout"),
                 chat_expand_long(9000),
                 chat_collapse_long().to_string(),
+                chat_copied().to_string(),
             ]
         });
     }

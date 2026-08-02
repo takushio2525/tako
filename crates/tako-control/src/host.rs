@@ -243,6 +243,18 @@ pub trait UiStateHost {
     fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
         Vec::new()
     }
+    /// チャットビュー本文のコピー（Issue #725）。UI のコピーボタンと同じ経路。
+    /// 引数の意味は [`crate::protocol::Request::ChatCopy`] を参照。
+    fn chat_copy(
+        &mut self,
+        _pane: PaneId,
+        _list: bool,
+        _message: Option<usize>,
+        _code: Option<usize>,
+        _markdown: bool,
+    ) -> Result<serde_json::Value, String> {
+        Err("チャットビューのコピーは未対応".into())
+    }
     /// UI 表示言語の設定値（Issue #435。system / ja / en）
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
         tako_core::i18n::LangSetting::System

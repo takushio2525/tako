@@ -243,6 +243,9 @@ enum Command {
     /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）
     #[command(subcommand)]
     Telemetry(TelemetryCommand),
+    /// GUI モードのチャットビュー本文のコピー（Issue #725。UI のコピーボタンと同じ経路）
+    #[command(subcommand)]
+    Chat(ChatCommand),
     /// ファイルツリーへのフォルダの追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダを明示追加する
     #[command(subcommand)]
@@ -627,6 +630,29 @@ enum SleepGuardCommand {
     InstallLidSleep,
     /// 蓋閉じ防止の sudoers 登録を削除
     RemoveLidSleep,
+}
+
+#[derive(Subcommand)]
+enum ChatCommand {
+    /// 発話（またはその中のコードブロック）をクリップボードへコピーする。
+    /// 既定は最後の assistant 発話を「画面と同じプレーンテキスト」で
+    Copy {
+        /// 対象ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 発話の表示順（0 始まり。省略時は最後の assistant 発話）
+        #[arg(long)]
+        message: Option<usize>,
+        /// その発話の中のコードブロック出現順（0 始まり。省略時は本文全体）
+        #[arg(long)]
+        code: Option<usize>,
+        /// md ソースをそのままコピーする（既定は画面と同じプレーンテキスト）
+        #[arg(long)]
+        markdown: bool,
+        /// コピーせずに発話の一覧（添字・role・文字数・コードブロック数）だけ出す
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5684,6 +5710,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 lid_sleep_mode: None,
             },
         },
+        Command::Chat(sub) => match sub {
+            ChatCommand::Copy {
+                pane,
+                message,
+                code,
+                markdown,
+                list,
+            } => Request::ChatCopy {
+                pane: pane.or_else(caller_pane),
+                list: *list,
+                message: *message,
+                code: *code,
+                markdown: *markdown,
+            },
+        },
         Command::Tree(sub) => match sub {
             TreeCommand::Add { path, tab } => Request::TreeFolder {
                 action: "add".to_string(),
@@ -6528,6 +6569,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::Web(_) => println!("{}", pretty_json(result)),
         Command::StaleBinary(_) => println!("{}", pretty_json(result)),
         Command::Update(_) => println!("{}", pretty_json(result)),
+        Command::Chat(_) => println!("{}", pretty_json(result)),
         Command::Tree(_) => println!("{}", pretty_json(result)),
         Command::Sessions(SessionsCommand::List { json, .. }) => {
             if *json {

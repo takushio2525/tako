@@ -8,6 +8,26 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+### Added / 追加
+
+- Chat view text selection and copy (#725): drag to select the conversation body and press
+  ⌘C — the selection spans multiple messages, uses the same real-shaping hit test as the
+  preview pane (so Japanese, bold, heading sizes and table cells all land where you click),
+  and ⌘A selects the whole conversation. Each message gets a copy button on its right
+  (plain text exactly as shown, full text even while collapsed), and code blocks inside a
+  reply get the same copy button as the Markdown preview (#680). Also available as
+  `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` and the
+  MCP tool `tako_chat_copy` (133 tools).
+- チャットビューのテキスト選択・コピー（#725）: 会話本文をドラッグで選択して ⌘C。
+  選択は**発話をまたいで**掃け、プレビューと同じ実 shaping ヒットテストを使うので
+  日本語・太字・見出しサイズ・表のセルでも狙った位置が取れる。⌘A で会話全体を選択。
+  発話の右にはコピーボタン（画面と同じプレーンテキスト。折りたたみ中でも全文）が付き、
+  返答の中のコードブロックには Markdown プレビューと同じコピーボタン（#680）が出る。
+  CLI `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` と
+  MCP `tako_chat_copy`（計 133 ツール）からも同じ操作ができる。
+
 ## [0.6.4] - 2026-08-02
 
 Nightly patch release (automated). Changes since v0.6.3:

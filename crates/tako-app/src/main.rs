@@ -1356,6 +1356,14 @@ struct TakoApp {
     /// 本文が長い発話を畳んでいるか（#716。既定は畳む = 会話が読める）。
     /// キーは (ペイン, 発話の内容キー) で、`chat_expanded` と同じ流儀
     chat_long_expanded: std::collections::HashSet<(PaneId, u64)>,
+    /// チャット本文の行索引（#725。描画のたびに作り直す = 選択の座標系の正）
+    chat_text_index: HashMap<PaneId, chat_view::ChatTextIndex>,
+    /// チャット本文のドラッグ選択（プレビューと同じ (行, byte) 座標系）
+    chat_selections: HashMap<PaneId, PreviewSelection>,
+    /// 左ボタンを押したまま選択を伸ばしている最中のペイン
+    chat_selecting: Option<PaneId>,
+    /// コピー成功のフィードバック（ペイン, 発話キー, 対象, 時刻）。時間経過で消える
+    chat_copied: Option<(PaneId, u64, chat_view::ChatCopyTarget, std::time::Instant)>,
     /// アプリ内自動更新の状態。表示先は上部通知カードと専用ウィンドウ（#616）
     update_state: update_checker::UpdateState,
     /// 更新通知カードを × で閉じたときのキー（`update_checker::card_key`。#616）。
@@ -1798,11 +1806,15 @@ fn link_byte_range_in_chunk(
     start.map(|start| start..end)
 }
 
-/// プレビューペインのテキスト選択状態
+/// 行単位テキストの選択状態（アンカーとヘッドの (行番号, UTF-8 byte)）。
+///
+/// プレビューペイン（#145 / #656）とチャットビュー（#725）が**同じ座標系**で共有する。
+/// 「行」の意味は描画側が決める（md はブロック内の 1 行 / 表はセル 1 つ / チャットは
+/// 発話をまたいだ通し番号）が、切り出しの規則は [`selection_text`] 1 本に集約してある
 #[derive(Debug, Clone)]
-struct PreviewSelection {
-    anchor: (usize, usize),
-    head: (usize, usize),
+pub(crate) struct PreviewSelection {
+    pub(crate) anchor: (usize, usize),
+    pub(crate) head: (usize, usize),
 }
 
 /// 最新の PDF 再ラスタライズ要求。path と量子化済みキーが一致した結果だけを採用する。
@@ -1810,6 +1822,51 @@ struct PreviewSelection {
 struct PendingPdfRaster {
     path: std::path::PathBuf,
     key: preview::PdfRasterKey,
+}
+
+/// (行, byte) 選択から実テキストを切り出す（プレビュー #145 / チャット #725 共有）。
+///
+/// 複数行にまたがるときは改行で連結する。選択が空なら `None` を返すので、
+/// 「クリックしただけ」の状態で ⌘C が空文字を書き込むことはない。
+fn selection_text(texts: &[String], selection: &PreviewSelection) -> Option<String> {
+    if texts.is_empty() {
+        return None;
+    }
+    let last_line = texts.len() - 1;
+    let ((start_line, start_col), (end_line, end_col)) = selection.ordered();
+    if start_line > last_line {
+        return None;
+    }
+    if start_line == end_line {
+        let line = texts.get(start_line)?;
+        let start = snap_to_char_boundary(line, start_col.min(line.len()));
+        let end = snap_to_char_boundary(line, end_col.min(line.len()));
+        if start >= end {
+            return None;
+        }
+        return Some(line[start..end].to_string());
+    }
+    let end_line = end_line.min(last_line);
+    let mut result = String::new();
+    for (i, line) in texts.iter().enumerate().take(end_line + 1).skip(start_line) {
+        if i == start_line {
+            let start = snap_to_char_boundary(line, start_col.min(line.len()));
+            result.push_str(&line[start..]);
+        } else if i == end_line {
+            let end = snap_to_char_boundary(line, end_col.min(line.len()));
+            result.push_str(&line[..end]);
+        } else {
+            result.push_str(line);
+        }
+        if i < end_line {
+            result.push('\n');
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 impl PreviewSelection {
@@ -2582,6 +2639,10 @@ impl TakoApp {
             chat_clear_confirm: None,
             chat_action_error: None,
             chat_long_expanded: std::collections::HashSet::new(),
+            chat_text_index: HashMap::new(),
+            chat_selections: HashMap::new(),
+            chat_selecting: None,
+            chat_copied: None,
             update_state: update_checker::UpdateState::Idle,
             // #616: 前回 × で閉じたバージョンを引き継ぐ（再起動しても出直さない）
             update_card_dismissed: tako_control::settings::load().update_card_dismissed,
@@ -7594,7 +7655,8 @@ impl TakoApp {
         });
     }
 
-    fn select_all_preview(&mut self, cx: &mut Context<Self>) {
+    /// ⌘A。編集中バッファ → チャット本文 → プレビュー本文の順に効く
+    fn select_all_text(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.focused_pane();
         if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
             if edit.editing {
@@ -7603,6 +7665,11 @@ impl TakoApp {
                 cx.notify();
                 return;
             }
+        }
+        // #725: チャット表示のペインは会話本文を全選択（⌘C とセットで使える）
+        if self.select_all_chat(pane_id) {
+            cx.notify();
+            return;
         }
         if !self.previews.contains_key(&pane_id) {
             return;
@@ -7626,6 +7693,12 @@ impl TakoApp {
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        // #725: チャット表示のペインは会話本文の選択が最優先
+        // （同じペインの端末側にも古い選択が残り得るため、表示中のものを採る）
+        if let Some(text) = self.chat_selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
         // プレビューペインの選択テキストを優先
         if let Some(text) = self.preview_selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -7641,40 +7714,7 @@ impl TakoApp {
         let pane_id = self.focused_pane();
         let sel = self.preview_selections.get(&pane_id)?;
         let texts = self.preview_line_texts.get(&pane_id)?;
-        if texts.is_empty() {
-            return None;
-        }
-        let ((sl, sc), (el, ec)) = sel.ordered();
-        if sl == el {
-            let line = texts.get(sl)?;
-            let sc = snap_to_char_boundary(line, sc.min(line.len()));
-            let ec = snap_to_char_boundary(line, ec.min(line.len()));
-            if sc >= ec {
-                return None;
-            }
-            return Some(line[sc..ec].to_string());
-        }
-        let mut result = String::new();
-        for i in sl..=el.min(texts.len() - 1) {
-            let line = &texts[i];
-            if i == sl {
-                let sc = snap_to_char_boundary(line, sc.min(line.len()));
-                result.push_str(&line[sc..]);
-            } else if i == el {
-                let ec = snap_to_char_boundary(line, ec.min(line.len()));
-                result.push_str(&line[..ec]);
-            } else {
-                result.push_str(line);
-            }
-            if i < el.min(texts.len() - 1) {
-                result.push('\n');
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+        selection_text(texts, sel)
     }
 
     fn preview_hit_test(&self, pane_id: PaneId, position: Point<Pixels>) -> Option<(usize, usize)> {
@@ -14398,6 +14438,18 @@ impl UiStateHost for TakoApp {
         }
     }
 
+    /// チャットビュー本文のコピー（#725）。UI のコピーボタンと**同じ実体**を通す
+    fn chat_copy(
+        &mut self,
+        pane: PaneId,
+        list: bool,
+        message: Option<usize>,
+        code: Option<usize>,
+        markdown: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.chat_copy_dispatch(pane, list, message, code, markdown)
+    }
+
     // #720: 全ペインの表示種別。判定表そのものを通すので、GUI が描いているものと必ず一致する
     fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
         self.workspace
@@ -16787,7 +16839,7 @@ impl Render for TakoApp {
                 this.zoom_focused_pane(-Self::FONT_SIZE_STEP, cx)
             }))
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.reset_zoom_focused_pane(cx)))
-            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all_preview(cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all_text(cx)))
             .on_action(cx.listener(|this, _: &OpenDirectory, _, cx| {
                 this.open_directory(cx);
             }))
@@ -21636,6 +21688,176 @@ mod self_test {
                 check(
                     cards_changed > 500,
                     "visual-test チャット: 承認カードと提案カードが会話内に出る (#716)",
+                );
+
+                // #725: 本文の選択・コピー。**実描画の座標から**選択を作り、
+                // ①選択の帯が実ピクセルで塗られる（dark / light 両方）
+                // ②⌘C 相当のコピーが pbpaste まで届く
+                // ③発話ホバーのコピーボタンが実際に描かれている
+                // を見る。ここは「見えているものと違うものがコピーされる」事故の検出が目的。
+                //
+                // まず会話の先頭（ユーザー発話）が見える位置へ戻す。
+                // 下端追従のままだと先頭の発話が画面外にいて bounds が使えない
+                let _ = window.update(cx, |app, _, cx| {
+                    app.chat_follow.insert(pane, false);
+                    if let Some(handle) = app.chat_scroll_handles.get(&pane) {
+                        handle.set_offset(point(px(0.0), px(0.0)));
+                    }
+                    cx.notify();
+                });
+                let (scrolled_dark, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: 先頭フレーム"));
+                // 実描画のレイアウトから「行 0（ユーザー発話）」「行 1（assistant 本文）」の
+                // 座標と、コピーボタンの当たり領域を取り出す。
+                // ボタンの領域を**ユーザー発話の右**に取るのは、assistant 側の右上には
+                // md コードブロックのコピーボタン（#680）が来ることがあり、そこを測ると
+                // 「どちらのボタンか」が区別できないため
+                let (start, end, gutter) = window
+                    .update(cx, |app, _, _| {
+                        let bounds = |line: usize| {
+                            app.chat_text_index
+                                .get(&pane)
+                                .and_then(|i| i.layouts.get(line).cloned())
+                                .flatten()
+                                .map(|layout| layout.bounds())
+                        };
+                        let gutter = bounds(0).map(|b| {
+                            Bounds::new(
+                                point(b.right() + px(8.0), b.top() - px(6.0)),
+                                size(px(40.0), px(26.0)),
+                            )
+                        });
+                        (
+                            bounds(0).map(|b| b.center()),
+                            bounds(1).map(|b| b.center()),
+                            gutter,
+                        )
+                    })
+                    .unwrap_or_else(|_| fail("visual-test チャット: 行レイアウトの取得"));
+                let (Some(start), Some(end), Some(gutter)) = (start, end, gutter) else {
+                    fail("visual-test チャット: 選択対象の行が描かれていない (#725)")
+                };
+                let _ = window.update(cx, |app, _, _| {
+                    app.chat_selections.remove(&pane);
+                });
+                // **実 OS マウスと同じ `PlatformInput` 経路**でドラッグする。選択状態を
+                // 直に作るのではなく GPUI のヒットテストとリスナー配線まで通すので、
+                // 「マウスで選べない」回帰をここで検出できる。
+                // dispatch はルートビューを再入更新するため `AnyWindowHandle` から呼ぶ
+                // （`WindowHandle<V>::update` の中だと二重借用で panic する。poc/README.md）
+                for input in [
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: start,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                        position: end,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Modifiers::default(),
+                    }),
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: end,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    }),
+                ] {
+                    let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+                }
+                let (sel_from, sel_to, sel_text) = window
+                    .update(cx, |app, _, cx| {
+                        let selection = app.chat_selections.get(&pane).cloned();
+                        let text = app.chat_selected_text();
+                        app.copy_selection(cx);
+                        cx.notify();
+                        (
+                            selection.as_ref().map(|s| s.anchor),
+                            selection.as_ref().map(|s| s.head),
+                            text,
+                        )
+                    })
+                    .unwrap_or_else(|_| fail("visual-test チャット: 選択の読み出し"));
+                let (with_sel, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: 選択フレーム(dark)"));
+                let sel_changed_dark =
+                    changed_pixels_in_bounds(&scrolled_dark, &with_sel, &[band], scale);
+                let gutter_ink =
+                    readable_pixels_in_bounds(&with_sel, &[gutter], scale, bg_dark, 2.0);
+                // ライトでも同じ選択が塗られる（テーマ非依存であることの裏付け）
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Theme {
+                            action: Some("set".into()),
+                            mode: Some("light".into()),
+                            target: None,
+                            key: None,
+                            value: None,
+                            name: None,
+                            font_family: None,
+                            font_size: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                });
+                let (sel_light, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: 選択フレーム(light)"));
+                let cleared_light = window
+                    .update(cx, |app, _, cx| {
+                        app.chat_selections.remove(&pane);
+                        cx.notify();
+                    })
+                    .is_ok();
+                let (no_sel_light, _) = capture_frame(any, cx)
+                    .unwrap_or_else(|| fail("visual-test チャット: 選択解除フレーム(light)"));
+                let sel_changed_light =
+                    changed_pixels_in_bounds(&no_sel_light, &sel_light, &[band], scale);
+                if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                    let base = std::path::Path::new(&dir);
+                    let _ = with_sel.save(base.join("chat-select-dark.png"));
+                    let _ = sel_light.save(base.join("chat-select-light.png"));
+                }
+                // 実クリップボード（外部プロセスから見えるか）
+                let pasted = cx
+                    .background_executor()
+                    .spawn(async {
+                        std::process::Command::new("pbpaste")
+                            .output()
+                            .ok()
+                            .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+                    })
+                    .await;
+                println!(
+                    "TAKO_VISUAL_PIXEL: chat-select from={sel_from:?} to={sel_to:?} \
+                     sel_changed_dark={sel_changed_dark} sel_changed_light={sel_changed_light} \
+                     gutter_ink={gutter_ink} cleared={cleared_light} \
+                     selected={:?} pbpaste_match={}",
+                    sel_text
+                        .as_deref()
+                        .map(|t| t.chars().take(24).collect::<String>()),
+                    pasted.as_deref() == sel_text.as_deref()
+                );
+                check(
+                    sel_text.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        && sel_from.is_some_and(|(line, _)| line == 0)
+                        && sel_to.is_some_and(|(line, _)| line == 1),
+                    "visual-test チャット: 合成マウスのドラッグで発話をまたいで選択できる (#725)",
+                );
+                check(
+                    sel_changed_dark > 200 && sel_changed_light > 200,
+                    "visual-test チャット: 選択の帯が dark / light 両方で塗られる (#725)",
+                );
+                check(
+                    gutter_ink > 20,
+                    "visual-test チャット: 発話のコピーボタンが実際に描かれる (#725)",
+                );
+                check(
+                    pasted.as_deref() == sel_text.as_deref(),
+                    "visual-test チャット: 選択のコピーが pbpaste で読める (#725)",
                 );
                 // 後片付け: カード・承認・下書きを落とす（後続の節へ持ち越さない）
                 let _ = window.update(cx, |app, _, cx| {
@@ -33453,6 +33675,447 @@ mod self_test {
                     app.ui_mode = UiMode::Terminal;
                     app.pane_settle.clear();
                     app.starter_released.clear();
+                    cx.notify();
+                });
+            }
+
+            // 98. チャットビューのテキスト選択・コピー（#725）。
+            // この機能の危険は「見えているものと違うものがクリップボードへ入る」ことなので、
+            // 実描画の座標から選択を作り、実クリップボードまで通して見る:
+            // (a) 行索引が**発話をまたいで通し**で採番される（複数発話の選択が成立する前提）
+            // (b) 実ヒットテスト（マウス位置 → 行番号）が狙った行を返す
+            // (c) user → assistant にまたがる選択が改行連結でクリップボードへ入る
+            // (d) コピーボタンと同じ経路（`copy_chat_message`）で発話全文が入る。
+            //     md 記法は落ちる = 画面と同じプレーンテキスト
+            // (e) MCP `tako_chat_copy` が UI と同じ結果を返す（list / code / markdown）
+            // (g) 折りたたみ中は見えているぶんだけ選択でき、コピーは全文
+            // (h) 本文の無い発話は選択の行にもコピー対象にもならない
+            // (i) ドラッグ選択中は新着で下端へ飛ばない（掃いている途中の選択が壊れない）
+            // (f) ターミナル表示へ戻したら ⌘C はチャットを返さない（既存挙動を奪わない）
+            {
+                use tako_core::ui_mode::UiMode;
+
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#725: 基準ペインの取得")
+                };
+                let chat_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(chat_pane) = chat_pane else {
+                    fail("#725: 検証用ペインの作成")
+                };
+                wait(cx, 500).await;
+
+                // 実 transcript と同じ正規化 JSON から会話を作る（本番と同じ関数）
+                let messages = chat_view::messages_from_json(&[
+                    serde_json::json!({ "role": "user", "text": "選択できるようにして" }),
+                    serde_json::json!({
+                        "role": "assistant",
+                        "text": "## できます\n\n**強調**つきの本文。\n\n```sh\necho hello\necho world\n```",
+                    }),
+                ]);
+                let assistant_key = messages.last().map(|m| m.key).unwrap_or_default();
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::UiMode {
+                            action: Some("set".into()),
+                            mode: Some("gui".into()),
+                            pane: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    app.chat_panes.insert(
+                        chat_pane,
+                        std::rc::Rc::new(chat_view::ChatPaneState {
+                            session_id: "selftest-725".into(),
+                            messages,
+                            model: Some("claude-opus-5".into()),
+                            ..Default::default()
+                        }),
+                    );
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(chat_pane);
+                    cx.notify();
+                });
+                // 実描画（`TextLayout` は描き終わらないと bounds を持たない）。
+                // ウィンドウは複数あり得るので全部描く（項目 94 と同じ理由）
+                let draw_all = |cx: &mut AsyncApp| {
+                    let handles = cx.update(|cx| cx.windows());
+                    for handle in handles {
+                        for _ in 0..2 {
+                            let _ = handle.update(cx, |_, win, cx| win.draw(cx).clear());
+                        }
+                    }
+                };
+                draw_all(cx);
+
+                // (a) 索引の中身。発話をまたいで通し番号になっているか
+                let texts = window
+                    .update(cx, |app, _, _| {
+                        app.chat_text_index
+                            .get(&chat_pane)
+                            .map(|index| index.texts.clone())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let user_line = texts.iter().position(|t| t == "選択できるようにして");
+                let heading_line = texts.iter().position(|t| t == "できます");
+                let code_line = texts.iter().position(|t| t == "echo hello\necho world");
+                println!(
+                    "TAKO_SELF_TEST_725_INDEX: lines={} user={user_line:?} heading={heading_line:?} \
+                     code={code_line:?}",
+                    texts.len()
+                );
+                check(
+                    matches!(
+                        (user_line, heading_line, code_line),
+                        (Some(u), Some(h), Some(c)) if u < h && h < c
+                    ),
+                    "チャットの行索引が発話をまたいで表示順に採番される (#725)",
+                );
+                let (Some(user_line), Some(heading_line)) = (user_line, heading_line) else {
+                    fail("#725: 行索引の取得")
+                };
+
+                // (b)(c) 実描画の座標からヒットテスト → user 行 → assistant 見出し行の選択
+                let (hit, selected, clipboard) = window
+                    .update(cx, |app, _, cx| {
+                        let center = |app: &TakoApp, line: usize| {
+                            app.chat_text_index
+                                .get(&chat_pane)
+                                .and_then(|index| index.layouts.get(line).cloned())
+                                .flatten()
+                                .map(|layout| layout.bounds().center())
+                        };
+                        let from =
+                            center(app, user_line).and_then(|p| app.chat_hit_test(chat_pane, p));
+                        let to =
+                            center(app, heading_line).and_then(|p| app.chat_hit_test(chat_pane, p));
+                        if let (Some(anchor), Some(head)) = (from, to) {
+                            app.chat_selections
+                                .insert(chat_pane, PreviewSelection { anchor, head });
+                        }
+                        let selected = app.chat_selected_text();
+                        app.copy_selection(cx);
+                        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+                        (from.map(|(line, _)| line), selected, clipboard)
+                    })
+                    .unwrap_or_else(|_| fail("#725: 選択の作成"));
+                println!(
+                    "TAKO_SELF_TEST_725_SELECT: hit={hit:?} selected={:?} clipboard_match={}",
+                    selected.as_deref().map(|t| t.chars().take(32).collect::<String>()),
+                    clipboard == selected
+                );
+                check(
+                    hit == Some(user_line),
+                    "チャット本文のヒットテストが狙った行を返す (#725)",
+                );
+                check(
+                    selected
+                        .as_deref()
+                        .is_some_and(|t| t.contains('\n') && t.contains("できます"))
+                        && clipboard == selected,
+                    "発話をまたぐ選択が ⌘C でそのままクリップボードへ入る (#725)",
+                );
+
+                // (d) コピーボタンと同じ経路。md 記法が落ちた画面どおりの本文が入る
+                let (copied, button_clip) = window
+                    .update(cx, |app, _, cx| {
+                        let ok = app
+                            .copy_chat_message(
+                                chat_pane,
+                                assistant_key,
+                                chat_view::ChatCopyTarget::Message,
+                                false,
+                            )
+                            .is_ok();
+                        app.flush_pending_clipboard(cx);
+                        (ok, cx.read_from_clipboard().and_then(|item| item.text()))
+                    })
+                    .unwrap_or_else(|_| fail("#725: コピーボタン経路"));
+                check(
+                    copied
+                        && button_clip.as_deref()
+                            == Some("できます\n\n強調つきの本文。\n\necho hello\necho world"),
+                    "コピーボタンで発話全文が画面どおりのプレーンテキストで入る (#725)",
+                );
+
+                // (e) MCP からの同一操作（list / code / markdown）
+                let pane_header = chat_pane.as_u64().to_string();
+                let (status, list_res) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[("X-Tako-Pane", &pane_header)],
+                    r#"{"jsonrpc":"2.0","id":725,"method":"tools/call","params":{"name":"tako_chat_copy","arguments":{"list":true}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP tako_chat_copy list 接続"));
+                let (_, code_res) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[("X-Tako-Pane", &pane_header)],
+                    r#"{"jsonrpc":"2.0","id":726,"method":"tools/call","params":{"name":"tako_chat_copy","arguments":{"code":0}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP tako_chat_copy code 接続"));
+                let code_clip = window
+                    .update(cx, |app, _, cx| {
+                        app.flush_pending_clipboard(cx);
+                        cx.read_from_clipboard().and_then(|item| item.text())
+                    })
+                    .unwrap_or_default();
+                let (_, md_res) = mcp_post_bg(
+                    cx,
+                    &mcp_url,
+                    Some(&token),
+                    &[("X-Tako-Pane", &pane_header)],
+                    r#"{"jsonrpc":"2.0","id":727,"method":"tools/call","params":{"name":"tako_chat_copy","arguments":{"markdown":true}}}"#,
+                )
+                .await
+                .unwrap_or_else(|| fail("MCP tako_chat_copy markdown 接続"));
+                let md_clip = window
+                    .update(cx, |app, _, cx| {
+                        app.flush_pending_clipboard(cx);
+                        cx.read_from_clipboard().and_then(|item| item.text())
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_725_COPY: button={button_clip:?} code={code_clip:?} \
+                     md_has_fence={}",
+                    md_clip.as_deref().is_some_and(|t| t.contains("```sh"))
+                );
+                check(
+                    status == 200
+                        && list_res.contains(r#"\"total\":2"#)
+                        && list_res.contains(r#"\"code_blocks\":1"#)
+                        && code_res.contains(r#"\"code\":0"#)
+                        && code_clip.as_deref() == Some("echo hello\necho world")
+                        && md_res.contains(r#"\"markdown\":true"#)
+                        && md_clip.as_deref().is_some_and(|t| t.contains("```sh")),
+                    "MCP tako_chat_copy の list / code / markdown が UI と同じ結果 (#725)",
+                );
+
+                // (g) エッジ: 長文の折りたたみ境界。索引には**見えているぶんだけ**が載り、
+                // コピーボタンは畳まれていても全文を返す（表示の都合とコピーの対象は別）
+                let long_text: String = "あ".repeat(1500);
+                let (shown_chars, copied_chars) = window
+                    .update(cx, |app, _, cx| {
+                        let messages = chat_view::messages_from_json(&[serde_json::json!({
+                            "role": "user",
+                            "text": long_text,
+                        })]);
+                        let key = messages[0].key;
+                        app.chat_panes.insert(
+                            chat_pane,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-725-long".into(),
+                                messages,
+                                ..Default::default()
+                            }),
+                        );
+                        app.chat_long_expanded.remove(&(chat_pane, key));
+                        cx.notify();
+                        key
+                    })
+                    .ok()
+                    .map(|key| {
+                        draw_all(cx);
+                        window
+                            .update(cx, |app, _, _| {
+                                let shown = app
+                                    .chat_text_index
+                                    .get(&chat_pane)
+                                    .and_then(|i| i.texts.first())
+                                    .map(|t| t.chars().count())
+                                    .unwrap_or(0);
+                                let copied = app
+                                    .copy_chat_message(
+                                        chat_pane,
+                                        key,
+                                        chat_view::ChatCopyTarget::Message,
+                                        false,
+                                    )
+                                    .ok()
+                                    .and_then(|v| v["bytes"].as_u64())
+                                    .unwrap_or(0);
+                                (shown, copied)
+                            })
+                            .unwrap_or((0, 0))
+                    })
+                    .unwrap_or((0, 0));
+                println!(
+                    "TAKO_SELF_TEST_725_LONG: shown_chars={shown_chars} copied_bytes={copied_chars}"
+                );
+                check(
+                    shown_chars == 1200 && copied_chars == 1500 * 3,
+                    "折りたたみ中は見えているぶんだけ選択でき、コピーは全文 (#725)",
+                );
+
+                // (h) エッジ: 本文の無い発話（画像だけ）は索引にもコピーにも出ない
+                let empty_ok = window
+                    .update(cx, |app, _, cx| {
+                        let messages = chat_view::messages_from_json(&[serde_json::json!({
+                            "role": "user",
+                            "text": "",
+                            "attachments": [{ "kind": "image" }],
+                        })]);
+                        let key = messages.first().map(|m| m.key).unwrap_or_default();
+                        app.chat_panes.insert(
+                            chat_pane,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-725-empty".into(),
+                                messages,
+                                ..Default::default()
+                            }),
+                        );
+                        cx.notify();
+                        key
+                    })
+                    .ok()
+                    .map(|key| {
+                        draw_all(cx);
+                        window
+                            .update(cx, |app, _, _| {
+                                let lines = app
+                                    .chat_text_index
+                                    .get(&chat_pane)
+                                    .map(|i| i.texts.len())
+                                    .unwrap_or(99);
+                                let copy_err = app
+                                    .copy_chat_message(
+                                        chat_pane,
+                                        key,
+                                        chat_view::ChatCopyTarget::Message,
+                                        false,
+                                    )
+                                    .is_err();
+                                lines == 0 && copy_err
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                check(
+                    empty_ok,
+                    "本文の無い発話は選択の行にもコピー対象にもならない (#725)",
+                );
+
+                // (i) エッジ: ドラッグ選択の最中は新着で下端へ飛ばない
+                // （飛ぶと掃いている途中の選択が壊れる）。選択中フラグの有無で比べる
+                let scroll_guard = {
+                    let offsets = |cx: &mut AsyncApp, selecting: bool| {
+                        let _ = window.update(cx, |app, _, cx| {
+                            // 追従中・先頭表示・新着ありの状態を作る
+                            app.chat_follow.insert(chat_pane, true);
+                            app.chat_selecting = selecting.then_some(chat_pane);
+                            if let Some(handle) = app.chat_scroll_handles.get(&chat_pane) {
+                                handle.set_offset(point(px(0.0), px(0.0)));
+                            }
+                            let messages = chat_view::messages_from_json(&[
+                                serde_json::json!({ "role": "user", "text": "1 通目" }),
+                                serde_json::json!({
+                                    "role": "assistant",
+                                    "text": "本文\n\n".repeat(60),
+                                }),
+                                serde_json::json!({
+                                    "role": "user",
+                                    "text": format!("新着 {selecting}"),
+                                }),
+                            ]);
+                            app.chat_panes.insert(
+                                chat_pane,
+                                std::rc::Rc::new(chat_view::ChatPaneState {
+                                    session_id: "selftest-725-scroll".into(),
+                                    messages,
+                                    ..Default::default()
+                                }),
+                            );
+                            cx.notify();
+                        });
+                        draw_all(cx);
+                        window
+                            .update(cx, |app, _, _| {
+                                app.chat_scroll_handles
+                                    .get(&chat_pane)
+                                    .map(|h| f32::from(h.offset().y))
+                                    .unwrap_or(0.0)
+                            })
+                            .unwrap_or(0.0)
+                    };
+                    let while_selecting = offsets(cx, true);
+                    let while_idle = offsets(cx, false);
+                    println!(
+                        "TAKO_SELF_TEST_725_SCROLL: selecting={while_selecting} idle={while_idle}"
+                    );
+                    while_selecting == 0.0 && while_idle < 0.0
+                };
+                check(
+                    scroll_guard,
+                    "ドラッグ選択中は新着で下端へ飛ばない（選択が壊れない）(#725)",
+                );
+                let _ = window.update(cx, |app, _, _| app.chat_selecting = None);
+
+                // (f) ターミナル表示へ戻したら ⌘C はチャットを返さない
+                let released = window
+                    .update(cx, |app, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("release".into()),
+                                mode: None,
+                                pane: Some(chat_pane.as_u64()),
+                            },
+                            PaneOrigin::User,
+                        );
+                        cx.notify();
+                        // 選択はそのまま残っているのに、表示がターミナルなら返さない
+                        app.chat_selections.contains_key(&chat_pane)
+                            && app.chat_selected_text().is_none()
+                    })
+                    .unwrap_or(false);
+                check(
+                    released,
+                    "ターミナル表示に戻したペインでは ⌘C がチャットを返さない (#725)",
+                );
+
+                // 後片付け
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(chat_pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    app.ui_mode = UiMode::Terminal;
                     cx.notify();
                 });
             }
