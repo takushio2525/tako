@@ -855,6 +855,25 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_chat_copy",
+            "description": "GUI モードのチャットビュー（claude 対話ペイン）の発話をクリップボードへ入れる。\
+                UI のコピーボタンと同じ経路。list=true なら発話一覧（添字・role・文字数・コードブロック数）を\
+                返すだけでコピーしない。message は表示順の 0 始まりで、省略時は最後の assistant 発話。\
+                code を指定するとその発話の中のコードブロック（出現順 0 始まり）だけをコピーする。\
+                既定は画面と同じプレーンテキストで、markdown=true のときだけ md ソースをそのまま渡す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象チャット表示ペイン ID（省略時は呼び出し元）"),
+                    "list": { "type": "boolean", "description": "true = 発話一覧を返すだけ（コピーしない）" },
+                    "message": { "type": "integer", "minimum": 0, "description": "発話の表示順（0 始まり。省略時は最後の assistant 発話）" },
+                    "code": { "type": "integer", "minimum": 0, "description": "その発話の中のコードブロック出現順（0 始まり。省略時は本文全体）" },
+                    "markdown": { "type": "boolean", "description": "true = md ソースをそのままコピー（既定は画面と同じプレーンテキスト）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_preview_reload",
             "description": "表示中プレビューファイルのライブリロードを設定する。enabled 省略時は現在状態を返す。\
                 有効時は外部変更をイベント駆動で検知し、デバウンス後に background で再構築する。\
@@ -3555,6 +3574,13 @@ fn build_request(
             pane: Some(target_pane(args, caller)?),
             index: u64_arg(args, "index")?.map(|index| index as usize),
         },
+        "tako_chat_copy" => Request::ChatCopy {
+            pane: Some(target_pane(args, caller)?),
+            list: bool_arg(args, "list")?.unwrap_or(false),
+            message: u64_arg(args, "message")?.map(|index| index as usize),
+            code: u64_arg(args, "code")?.map(|index| index as usize),
+            markdown: bool_arg(args, "markdown")?.unwrap_or(false),
+        },
         "tako_preview_reload" => Request::PreviewReload {
             enabled: bool_arg(args, "enabled")?,
         },
@@ -5051,7 +5077,8 @@ mod tests {
         // #666 の tako_show_command を追加して 130
         // #680 の tako_preview_copy_code を追加して 131
         // #694 の tako_ui_mode を追加して 132
-        assert_eq!(tools.len(), 132);
+        // #725 の tako_chat_copy を追加して 133
+        assert_eq!(tools.len(), 133);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

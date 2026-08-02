@@ -460,6 +460,24 @@ pub enum Request {
         pane: Option<u64>,
         index: Option<usize>,
     },
+    /// GUI モードのチャットビュー本文をクリップボードへ入れる（Issue #725）。
+    ///
+    /// `list` = true なら発話の一覧を返すだけでコピーしない（添字の下見用）。
+    /// `message` は表示順の 0 始まりで、省略時は**最後の assistant 発話**。
+    /// `code` はその発話の中のコードブロック出現順 0 始まり（省略時は本文全体）。
+    /// `markdown` = true のときだけ md ソースをそのまま渡す（既定は画面と同じ
+    /// プレーンテキスト）。UI のコピーボタンと同じ経路。
+    ChatCopy {
+        pane: Option<u64>,
+        #[serde(default)]
+        list: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<usize>,
+        #[serde(default)]
+        markdown: bool,
+    },
     /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewReload { enabled: Option<bool> },

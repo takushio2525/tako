@@ -364,6 +364,15 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #725: GUI モードのチャットビュー本文コピー（表示レイヤなので GUI 起動が前提）
+        key: "tako_chat_copy",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_check_health",
         macos: Support::Supported,
         windows: Support::Pending {

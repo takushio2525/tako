@@ -37,6 +37,8 @@
    無反応）も同梱修正。次は G3（入力・承認・スラッシュボタン + カードのインライン埋め込み）
 6. 08-01 完了分: #703 カード専用帯（会話と重なりゼロ）/ #708 Finder「このアプリケーションで開く」
    （21 拡張子・既定アプリ不変）。全 merge・install・GUI 再起動・実機確認済み
+7. 08-02 完了分: #725 チャットビューの選択・コピー（発話をまたぐドラッグ選択 + ⌘C / ⌘A、
+   発話単位のコピーボタン、`tako chat copy` / MCP `tako_chat_copy` = 133 ツール）
 
 ## 未着手・持ち越し
 
@@ -53,6 +55,10 @@
 - **隔離インスタンスへの CLI 接続**: `TAKO_ISOLATED=1` の discovery は
   `$TMPDIR/tako-iso-discovery-<pid>/control.json`。socket / token を `TAKO_SOCKET` /
   `TAKO_TOKEN` に渡すと本番に触れず dispatch を叩ける
+- **マウス操作は visual-test から合成できる**（#725）: `window.dispatch_event(
+  gpui::PlatformInput::MouseDown/MouseMove/MouseUp)` で GPUI のヒットテストとリスナー配線まで
+  通せるので、画面ロック中でもドラッグ選択・クリックを機械検証できる。**`AnyWindowHandle::update`
+  から呼ぶ**こと（`WindowHandle<V>::update` の中だとルートビューの二重借用で panic する）
 - **`git stash` はリポジトリ共有**（worktree でも）。退避は `git diff > patch` を使う
 - master の Bash には `TAKO_PANE_ID` が入っていないことがある → tako CLI は `--pane` 明示
 

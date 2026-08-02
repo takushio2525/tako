@@ -4,6 +4,7 @@ tako_autosuggest
 tako_background_kill
 tako_background_list
 tako_background_pane
+tako_chat_copy
 tako_check_health
 tako_close_pane
 tako_collapse_tab
