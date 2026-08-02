@@ -20,7 +20,7 @@ use super::*;
 use crate::file_icons::ui_icon;
 
 /// コピー成功・失敗の表示を維持する時間。2 秒ポーリング（periodic）の再描画で自然に消える
-const FEEDBACK_DURATION: std::time::Duration = std::time::Duration::from_millis(2200);
+pub(crate) const FEEDBACK_DURATION: std::time::Duration = std::time::Duration::from_millis(2200);
 
 /// コマンド 1 件の本文の最大表示高さ。長いコマンドは折り返して全文出すが、
 /// 極端に長いものが帯を占有しないよう高さで止める（帯の中でスクロールして読める）
@@ -163,7 +163,10 @@ impl TakoApp {
     }
 
     /// 描画に必要な情報だけ取り出す（描画中に保管庫を借り続けない）
-    fn command_card_rows(&self, pane_id: PaneId) -> Vec<(u64, Option<String>, Vec<String>)> {
+    pub(crate) fn command_card_rows(
+        &self,
+        pane_id: PaneId,
+    ) -> Vec<(u64, Option<String>, Vec<String>)> {
         self.command_cards
             .list(Some(pane_id))
             .into_iter()
@@ -312,47 +315,6 @@ impl TakoApp {
         .top_0()
         .left_0()
         .size_full()
-    }
-
-    /// このペインのカードを**描画済み要素**として返す（#716）。
-    ///
-    /// GUI モードのチャットビューは帯ではなく会話の流れの中にカードを置くので、
-    /// 器（帯）だけを持たずカード本体を借りる。カードの見た目・コピー・実行は
-    /// 帯と**同じ関数**を通るので、片方だけ直る事故が起きない。
-    /// 新しいカードほど上（帯と同じ並び）
-    pub(crate) fn command_card_elements(
-        &mut self,
-        pane_id: PaneId,
-        cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
-        if self.command_cards.is_empty() {
-            return Vec::new();
-        }
-        let cards = self.command_card_rows(pane_id);
-        if cards.is_empty() {
-            return Vec::new();
-        }
-        let copied = self
-            .command_card_copied
-            .filter(|(_, _, at)| at.elapsed() < FEEDBACK_DURATION);
-        let errored = self
-            .command_card_error
-            .filter(|(_, at)| at.elapsed() < FEEDBACK_DURATION);
-        cards
-            .iter()
-            .rev()
-            .map(|(card_id, label, commands)| {
-                self.render_command_card(
-                    *card_id,
-                    label.clone(),
-                    commands.clone(),
-                    copied,
-                    errored,
-                    cx,
-                )
-                .into_any_element()
-            })
-            .collect()
     }
 
     /// カード 1 枚

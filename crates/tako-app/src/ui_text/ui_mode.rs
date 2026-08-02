@@ -97,9 +97,18 @@ pub fn starter_footnote() -> &'static str {
 
 // --- チャットビュー（#702 / G2） ---
 
-/// ヘッダ右の「ターミナルを表示」ボタン（スターターの「コマンド入力へ」と同じ動作）
+/// 「ターミナルを表示」（#720 のスターター準備中画面の脱出導線）。
+///
+/// **チャットビューのヘッダからは撤去した**（#719 追加要件 4: 押すとそのペインだけ
+/// ターミナル表示になるがチャットへ戻る導線が無く迷子になるため）。モード切替は
+/// タブバーのグローバルトグルに一本化してある
 pub fn chat_show_terminal() -> &'static str {
     tr!("ターミナルを表示", "Show terminal")
+}
+
+/// 入力欄が上限行数に達して隠れているぶん（#718 / #719。無音で切り捨てない）
+pub fn chat_input_more_rows(rows: usize) -> String {
+    tr!(format!("上に {rows} 行"), format!("{rows} more above"))
 }
 
 /// 生成中
@@ -178,9 +187,10 @@ pub fn chat_system_notice(summary: &str, count: u64) -> String {
 
 /// worker ペインの説明行（入力欄の代わり。§2.4）
 pub fn chat_worker_note() -> &'static str {
+    // #719 追加要件 5: 直接指示もできるようになったので「入力できない」とは言わない
     tr!(
-        "この AI は自動で動いています（指示は司令塔の AI から届きます）",
-        "This AI runs on its own - instructions come from the lead AI"
+        "通常は司令塔の AI が指示します（ここから直接お願いすることもできます）",
+        "The lead AI usually drives this one - you can also ask it directly here"
     )
 }
 
@@ -300,6 +310,7 @@ mod tests {
                 preparing_shell().to_string(),
                 preparing_agent().to_string(),
                 chat_show_terminal().to_string(),
+                chat_input_more_rows(3),
                 chat_status_busy().to_string(),
                 chat_status_idle().to_string(),
                 chat_status_queued().to_string(),

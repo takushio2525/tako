@@ -355,18 +355,36 @@ pub struct InputStatus {
 /// dim 状態を分析する。❯ 行が見つからなければ None
 pub fn analyze_input_line(screen: &Screen) -> Option<InputStatus> {
     // Claude TUI は ❯ の下にフッター（区切り線・モデル情報・ctx%）が 4〜6 行あるため、
-    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）
-    let start = screen.lines.len().saturating_sub(10);
-    let mut found: Option<(usize, usize)> = None; // (行 index, ❯ のバイト位置)
-    for i in start..screen.lines.len() {
-        let trimmed = screen.lines[i].text.trim_start();
-        if trimmed.starts_with('❯') {
-            let leading_spaces = screen.lines[i].text.len() - trimmed.len();
-            found = Some((i, leading_spaces));
+    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）。
+    // 起点は「行数」ではなく**中身がある最後の行**にする。ビューポートを埋めない画面では
+    // 下端に空行が並び、行数基準だと入力行が範囲外に落ちる（#719 の実スクショで発覚）
+    let bottom = screen
+        .lines
+        .iter()
+        .rposition(|l| !l.text.trim().is_empty())
+        .map(|i| i + 1)?;
+    let start = bottom.saturating_sub(10);
+    let mut found: Option<usize> = None;
+    for i in start..bottom {
+        if screen.lines[i].text.trim_start().starts_with('❯') {
+            found = Some(i);
         }
     }
-    let (line_idx, prompt_byte_pos) = found?;
-    let line = &screen.lines[line_idx];
+    analyze_input_line_at(screen, found?)
+}
+
+/// 行 index を指定して入力行を分析する（#719）。
+///
+/// チャット入力欄は [`input_region`] が決めた**まさにその行**を見る必要がある。
+/// 探し直すと走査範囲の違いで「箱は見つかったのに入力テキストは無いことになる」
+/// という食い違いが起きる（実スクショでプレースホルダが本文に重なって発覚した）
+pub fn analyze_input_line_at(screen: &Screen, line_idx: usize) -> Option<InputStatus> {
+    let line = screen.lines.get(line_idx)?;
+    let trimmed = line.text.trim_start();
+    if !trimmed.starts_with('❯') {
+        return None;
+    }
+    let prompt_byte_pos = line.text.len() - trimmed.len();
     let full_line = line.text.trim_end().to_string();
 
     // ❯ の右側のテキストを抽出
@@ -427,6 +445,111 @@ pub fn analyze_input_line(screen: &Screen) -> Option<InputStatus> {
         text: input_text,
         style,
     })
+}
+
+/// エージェント TUI の入力ボックスが占めている**画面行の範囲**（#719）。
+///
+/// チャットビューの入力欄はこの範囲を実画面からミラーする（下書きを別に持たない）ので、
+/// 「入力欄が何行あるか」= 箱の高さ、がここで決まる（#718 のオートグローもこれに従う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputRegion {
+    /// 入力ボックスの先頭行（画面行 index。上の罫線は含まない）
+    pub start: usize,
+    /// 入力ボックスの終端行の**次**（下の罫線は含まない）
+    pub end: usize,
+    /// プロンプト記号（`❯` 等）がある行
+    pub prompt_row: usize,
+}
+
+impl InputRegion {
+    /// 行数（必ず 1 以上）
+    pub fn rows(&self) -> usize {
+        self.end.saturating_sub(self.start).max(1)
+    }
+}
+
+/// 罫線だけでできた行か（`────` / `╭────╮` / `│` 単独は除く）。
+///
+/// claude は入力欄を上下の水平罫線で挟んで描く（実採取画面 v2.1 系）。
+/// バージョンによっては角丸ボックス（`╭─╮` / `╰─╯`）になるのでどちらも受ける
+fn is_frame_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let mut horizontal = 0usize;
+    for c in t.chars() {
+        match c {
+            '─' | '━' | '═' | '╌' | '┄' | '┈' | '⎯' => horizontal += 1,
+            // 角・接続・縦棒は許すが、水平線の本数には数えない
+            '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '│' | '┃' | ' ' =>
+                {}
+            _ => return false,
+        }
+    }
+    horizontal >= 3
+}
+
+/// エージェント TUI のプロンプト記号で始まる行か。
+///
+/// 枠線つきで描かれるバージョン（`│ ❯ hello │`）でも拾えるよう、行頭の縦罫線は
+/// 1 つだけ剥がしてから見る。記号は claude `❯` / codex `›` / agy `>` の和集合（#120）
+fn starts_with_prompt(line: &str) -> bool {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix('│')
+        .or_else(|| t.strip_prefix('┃'))
+        .unwrap_or(t)
+        .trim_start();
+    // ASCII の `>` はシェルの PS2 と衝突するので「`>` 単独 or `> `＋内容」だけ
+    t.starts_with('❯') || t.starts_with('›') || t.starts_with("> ") || t.trim_end() == ">"
+}
+
+/// 画面から入力ボックスの行範囲を求める（#719 のミラー描画の基準）。
+///
+/// 手順は「プロンプト行を見つける → 上下の一番近い罫線で挟む」。罫線が無い
+/// バージョンでもプロンプト行 1 行として成立するので、TUI の描き方が変わっても
+/// **入力欄が消えることはない**（最悪 1 行に縮退するだけ）。
+/// 番号付き選択ダイアログの選択カーソルはプロンプトではないので除外する（#530 と同じ判断）
+pub fn input_region_in_lines(lines: &[&str]) -> Option<InputRegion> {
+    // 走査の基準は「行数」ではなく**中身がある最後の行**。ビューポートを埋めない
+    // TUI（起動直後・出力が短いとき）では下端に空行が続き、行数基準だと
+    // 入力ボックスが走査範囲から丸ごと外れる（セルフテストで実測して直した）
+    let bottom = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)?;
+    // 下端 24 行の中の**最後の**プロンプト行。会話ログ側の `❯` を拾わないための範囲制限。
+    // フッター（区切り線 + モデル / ctx / モード行で最大 8 行）を挟んでも、入力が
+    // 十数行に伸びたところまで届く幅にしてある（表示上限 8 行より広い）
+    let scan_from = bottom.saturating_sub(24);
+    let prompt_row = (scan_from..bottom)
+        .rev()
+        .find(|&i| starts_with_prompt(lines[i]))?;
+    // 上へ: 一番近い罫線の 1 つ下が入力ボックスの先頭
+    let start = (scan_from..prompt_row)
+        .rev()
+        .find(|&i| is_frame_line(lines[i]))
+        .map(|i| i + 1)
+        .unwrap_or(prompt_row);
+    // 下へ: 一番近い罫線の手前が終端。罫線が無ければプロンプト行だけ
+    let end = (prompt_row + 1..bottom)
+        .find(|&i| is_frame_line(lines[i]))
+        .unwrap_or(prompt_row + 1);
+    Some(InputRegion {
+        start,
+        end: end.max(prompt_row + 1),
+        prompt_row,
+    })
+}
+
+/// [`input_region_in_lines`] の `Screen` 版（描画側はこちらを使う）。
+///
+/// 返す index は `screen.lines` の添字なので、**同じ `Screen` から作った描画行**と
+/// 1:1 で対応する（ミラーの行ズレを構造的に防ぐ）
+pub fn input_region(screen: &Screen) -> Option<InputRegion> {
+    let texts: Vec<&str> = screen.lines.iter().map(|l| l.text.as_str()).collect();
+    input_region_in_lines(&texts)
 }
 
 #[cfg(test)]
@@ -732,5 +855,218 @@ mod tests {
         let extra = s.extra_bottom.expect("追加行が付く");
         let run = run_for(&extra, "line");
         assert_eq!(run.bg, Some(t.selection_background));
+    }
+
+    // --- 入力ボックスの行範囲（#719 のミラー描画。#718 の高さもここが決める） ---
+
+    /// 実採取した claude v2.1 系の下端（罫線で挟まれた `❯` + フッター）
+    fn claude_bottom(input: &[&str]) -> Vec<String> {
+        let mut lines: Vec<String> = vec![
+            "  ⎿  Tip: Use /btw to ask a quick side question".into(),
+            "".into(),
+            "────────────────────────────────".into(),
+        ];
+        lines.extend(input.iter().map(|s| s.to_string()));
+        lines.extend(
+            [
+                "────────────────────────────────",
+                "  [Opus 5 · MAX]  user@example.com",
+                "  ctx  18% █░░░░░░░░░",
+                "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        lines
+    }
+
+    fn region_of(lines: &[String]) -> Option<InputRegion> {
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        input_region_in_lines(&refs)
+    }
+
+    #[test]
+    fn 入力ボックスは罫線に挟まれた範囲になる() {
+        let lines = claude_bottom(&["❯ こんにちは"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1, "1 行入力は 1 行ぶんの高さ");
+        assert_eq!(lines[r.prompt_row], "❯ こんにちは");
+        assert_eq!(r.start, r.prompt_row);
+    }
+
+    #[test]
+    fn 複数行入力では行数が増える() {
+        let lines = claude_bottom(&["❯ 1 行目", "  2 行目", "  3 行目"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 3, "TUI の行数にそのまま追従する");
+        assert_eq!(lines[r.start], "❯ 1 行目");
+        assert_eq!(lines[r.end - 1], "  3 行目");
+    }
+
+    #[test]
+    fn 空の入力欄でも1行として取れる() {
+        let lines = claude_bottom(&["❯"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+    }
+
+    #[test]
+    fn 角丸ボックスの描き方でも挟める() {
+        // 将来 claude が枠線に変えても縮退しないこと
+        let lines: Vec<String> = [
+            "text above",
+            "╭──────────────────────╮",
+            "│ ❯ hello              │",
+            "│   world              │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 2);
+    }
+
+    #[test]
+    fn 罫線が無くてもプロンプト行だけに縮退する() {
+        let lines: Vec<String> = ["output line", "❯ hello"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+        assert_eq!(r.start, 1);
+    }
+
+    #[test]
+    fn プロンプトが無ければ範囲は取れない() {
+        let lines: Vec<String> = ["$ ls", "a.txt  b.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            region_of(&lines).is_none(),
+            "素のシェルは入力ボックス扱いしない"
+        );
+    }
+
+    #[test]
+    fn 会話ログの古いプロンプト行は拾わない() {
+        // 画面上端に残った過去の `❯` ではなく、下端の入力欄を採る
+        let mut lines: Vec<String> = vec!["❯ 昔の入力".into()];
+        lines.extend((0..26).map(|i| format!("出力 {i}")));
+        lines.extend(claude_bottom(&["❯ いまの入力"]));
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(lines[r.prompt_row], "❯ いまの入力");
+    }
+
+    #[test]
+    fn 画面下端に空行が続いても入力ボックスを見つけられる() {
+        // ビューポートを埋めない TUI（起動直後・出力が短いとき）。
+        // 行数基準で下端 24 行を切ると入力ボックスごと走査範囲から外れる
+        let mut lines = claude_bottom(&["❯ こんにちは"]);
+        lines.extend((0..30).map(|_| String::new()));
+        let r = region_of(&lines).expect("空行の上にある入力ボックスを見つける");
+        assert_eq!(r.rows(), 1);
+        assert_eq!(lines[r.prompt_row], "❯ こんにちは");
+    }
+
+    /// 行テキストだけから最小の Screen を組む（走査範囲の検査用。runs は空でよい）
+    fn screen_of(texts: &[&str]) -> Screen {
+        Screen {
+            cols: 80,
+            rows: texts.len(),
+            lines: texts
+                .iter()
+                .map(|t| ScreenLine {
+                    text: (*t).to_string(),
+                    runs: Vec::new(),
+                    cell_cols: Vec::new(),
+                    has_wide: false,
+                })
+                .collect(),
+            cursor: None,
+            ime_cursor: None,
+            display_offset: 0,
+            fract: 0.0,
+            extra_bottom: None,
+        }
+    }
+
+    #[test]
+    fn 入力行の分析も末尾空行に耐える() {
+        // ビューポートを埋めない画面（下端に空行が並ぶ）。行数基準で末尾 10 行を切ると
+        // 入力行を見失い、「箱はあるのにテキストは無い」食い違いが起きる（#719 実スクショ）
+        let mut texts: Vec<&str> = vec!["out", "────────", "❯ hello", "────────", "footer"];
+        texts.extend(std::iter::repeat_n("", 12));
+        let s = screen_of(&texts);
+        let status = analyze_input_line(&s).expect("末尾に空行があっても入力行を見つける");
+        assert_eq!(status.text, "hello");
+        // 箱の判定と同じ行を指定した場合も同じ結果になる（食い違いを構造的に防ぐ）
+        let region = input_region(&s).expect("入力ボックスがある");
+        let at = analyze_input_line_at(&s, region.prompt_row).expect("同じ行から取れる");
+        assert_eq!(at.text, status.text);
+    }
+
+    #[test]
+    fn 実採取した_claude_の複数行入力ボックスに追従する() {
+        // claude v2.1.220 を隔離 tmux で動かし Shift+Enter で 4 行入れたときの実採取。
+        // 箱の中には「次の行」用の空行が 1 つ入るので 5 行になる（TUI の見た目どおり）
+        let lines: Vec<String> = [
+            "                                        ctrl+g to edit in VS Code",
+            "──────────────────────────────────────────────────────────────",
+            "❯ line1",
+            "  line2",
+            "  line3",
+            "  line4",
+            "",
+            "──────────────────────────────────────────────────────────────",
+            "  [Opus 5 (1M context) · xH]  user@example.com",
+            "  ctx   0% ░░░░░░░░░░",
+            "  5h   --",
+            "  7d   --",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(
+            r.rows(),
+            5,
+            "TUI が描いた行数（末尾の空行を含む）に一致する"
+        );
+        assert_eq!(lines[r.start], "❯ line1");
+        assert_eq!(lines[r.end - 1], "");
+    }
+
+    #[test]
+    fn 実採取した_claude_の画像プレースホルダ入り入力行を拾う() {
+        // ⌘V（= Ctrl+V 素通し）で claude 自身が差し込む形（実採取: `❯ abc[Image #1]`）
+        let lines = claude_bottom(&["❯ abc[Image #1]"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+        assert!(lines[r.prompt_row].contains("[Image #1]"));
+    }
+
+    #[test]
+    fn 罫線判定は本文を誤検出しない() {
+        assert!(is_frame_line("────────"));
+        assert!(is_frame_line("╭──────╮"));
+        assert!(!is_frame_line("─"), "1〜2 本の水平線は罫線扱いしない");
+        assert!(!is_frame_line("│"), "縦棒だけは罫線ではない");
+        assert!(!is_frame_line("ハイフン--- 区切り"));
+        assert!(!is_frame_line(""));
+    }
+
+    #[test]
+    fn screen_からも同じ範囲が取れる() {
+        // 描画行と同じ添字で返ること（ミラーの行ズレ防止）
+        let term = term_with("out\n────────\n❯ hi\n────────\nfooter".as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(s.lines[r.prompt_row].text.trim_start().starts_with('❯'));
+        assert_eq!(r.rows(), 1);
     }
 }

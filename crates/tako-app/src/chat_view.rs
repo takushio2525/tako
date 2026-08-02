@@ -23,6 +23,7 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use super::*;
+use crate::command_card_ui::FEEDBACK_DURATION;
 use crate::file_icons::ui_icon;
 
 /// 会話の読み込み件数（§2.3。古い発話は claude TUI 側 / `tako logs` で辿れる）
@@ -31,8 +32,12 @@ pub(crate) const CHAT_TAIL: usize = 50;
 /// コンテキスト使用率がこれを超えたら残量バーを警告色にする（§2.3）
 const CTX_WARN_PERCENT: f64 = 80.0;
 
-/// 入力欄の最大高さ（px。#716）。長文を書いても会話が全部隠れないように止める
-const CHAT_INPUT_MAX_HEIGHT: f32 = 120.0;
+/// 入力欄に見せる最大行数（#718 / #719）。
+///
+/// 高さは TUI 入力ボックスの行数にそのまま追従する（1 行なら 1 行ぶん）が、
+/// 長文を書いたときに会話が全部隠れないようここで止め、以降は入力欄の中で
+/// カーソル側へスクロールする（Web 版 Claude の入力欄と同じ感覚）
+pub(crate) const CHAT_INPUT_MAX_ROWS: usize = 8;
 
 /// 発話者
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -232,21 +237,23 @@ fn message_key(
     hasher.finish()
 }
 
-/// チャット入力欄の下書き（#716）。ペインごとに持つので書きかけが消えない
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ChatInput {
-    pub text: String,
-    /// キャレット位置（バイト。**必ず文字境界**に丸めて使う。#494 と同じ約束）
-    pub cursor: usize,
-}
-
-impl ChatInput {
-    /// キャレットを文字境界へ丸める（split / drain の panic を構造的に防ぐ）
-    fn snap(&mut self) -> usize {
-        self.cursor =
-            crate::right_panel::floor_char_boundary(&self.text, self.cursor.min(self.text.len()));
-        self.cursor
-    }
+/// 入力欄に映す TUI 入力ボックスの実測（#719）。
+///
+/// **下書きを別に持たない**のが要点。チャット入力欄は claude TUI の入力行を
+/// そのまま映すだけの窓で、打鍵は素通しで PTY へ行く。したがって
+///
+/// - 入力状態は常に 1 つ（TUI が正）= 表示モードを往復してもズレない
+/// - IME・Enter / Shift+Enter・画像ペーストは TUI の挙動そのもの
+/// - 箱の高さは TUI の行数に追従する（#718 のオートグロー）
+pub(crate) struct ChatInputMirror {
+    /// 映す行（`terminal_screen_lines` が作った実描画行の切り出し）
+    pub rows: Vec<gpui::Div>,
+    /// TUI 入力ボックスの総行数（`rows.len()` は上限で頭打ちになる）
+    pub total_rows: usize,
+    /// 入力欄に**ユーザーの文字が入っているか**（プレースホルダを出すかの判断）
+    pub has_text: bool,
+    /// スピナー行（`Manifesting… (5m 16s · ↓ 16.4k tokens)`）。生成中だけ Some（#719）
+    pub activity: Option<String>,
 }
 
 /// 送信直後の楽観 echo（#716 / 仕様 §3.1）。
@@ -333,202 +340,92 @@ impl TakoApp {
         self.chat_panes.get(&pane_id).map(|s| s.as_ref())
     }
 
-    // --- 入力と送信（#716 / G3。書きは既存 dispatch のみ。§3.2） ---
+    // --- 入力（#719。TUI 入力行のミラー + 打鍵パススルー。§3.2） ---
 
-    /// いまキー入力を受けているチャット入力欄のペイン（#716）。
+    /// チャット入力欄に映す TUI 入力ボックスを実画面から採る（#719）。
     ///
-    /// フラグだけでなく**そのペインが実際にチャット表示か**まで見る。
-    /// フラグだけを信じると、claude が終了してターミナル表示へ戻ったあとも
-    /// 打鍵が入力欄に吸われてターミナルへ届かなくなる（#503 で潰した形の再発）
-    pub(crate) fn chat_input_pane(&self) -> Option<PaneId> {
-        let pane = self.chat_input_focused?;
-        let state = self.chat_panes.get(&pane)?;
-        (!state.read_only
-            // 表示中のタブでフォーカスを持っていること。タブ移動・ペイン移動で
-            // 画面から消えたら打鍵はターミナルへ戻す（#503 の不変条件の一部）
-            && self.focused_pane() == pane
-            && self.pane_display_for(pane) == tako_core::ui_mode::PaneDisplay::Chat)
-            .then_some(pane)
-    }
-
-    /// 入力欄の下書き（表示・セルフテスト共用）
-    pub(crate) fn chat_input_text(&self, pane_id: PaneId) -> &str {
-        self.chat_inputs
+    /// 描画行（`terminal_screen_lines`）とスクリーン行は**下端からの距離**で
+    /// 対応付ける。ミラースクロール中は先頭に履歴行が積まれることがあるので、
+    /// 先頭からの添字で切ると 1 行ずれる（#159 の合成経路）
+    pub(crate) fn chat_input_mirror(
+        &self,
+        pane_id: PaneId,
+        show_cursor: bool,
+    ) -> Option<ChatInputMirror> {
+        let screen = self
+            .terminals
             .get(&pane_id)
-            .map(|i| i.text.as_str())
-            .unwrap_or_default()
+            .map(|s| s.screen_opts(&self.theme, show_cursor))?;
+        let region = tako_core::screen::input_region(&screen)?;
+        let total = screen.lines.len();
+        // 上限を超えたぶんは頭を落とす（打鍵は末尾で進むので、カーソル側が残る）
+        let shown = region.rows().min(CHAT_INPUT_MAX_ROWS);
+        let first = region.end.saturating_sub(shown);
+        // 下端からの距離へ変換してから描画行を切り出す
+        let (from_bottom_first, from_bottom_end) = (
+            total.saturating_sub(first),
+            total.saturating_sub(region.end),
+        );
+        let mut rendered = self.terminal_screen_lines(pane_id, show_cursor);
+        let end = rendered.len().saturating_sub(from_bottom_end);
+        let start = rendered.len().saturating_sub(from_bottom_first).min(end);
+        let rows: Vec<gpui::Div> = rendered.drain(start..end).collect();
+        // 入力欄に「ユーザーが打った文字」があるか（dim のゴースト提案は無しと扱う。#572）
+        // **箱と同じ行**を見る（探し直すと走査範囲の違いで食い違う。#719 実スクショ）
+        let has_text = tako_core::screen::analyze_input_line_at(&screen, region.prompt_row)
+            .map(|s| {
+                !s.text.is_empty()
+                    && !tako_control::claude_tui::input_content_is_empty(&s.text)
+                    && s.style != tako_core::screen::InputStyle::Ghost
+            })
+            .unwrap_or(false);
+        // スピナー行は入力ボックスより上だけを見る（フッターの `(→4h44m)` を拾わない）
+        let above: Vec<String> = screen.lines[..region.start.min(screen.lines.len())]
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        let activity = tako_control::claude_tui::activity_line(&above);
+        Some(ChatInputMirror {
+            rows,
+            total_rows: region.rows(),
+            has_text,
+            activity,
+        })
     }
 
-    /// 入力欄へフォーカスを移す（他のテキスト入力とは排他）
+    /// 入力欄クリック = そのペインへフォーカスするだけ（#719）。
+    ///
+    /// 打鍵は素通しで PTY へ行くので、専用のフォーカス状態は持たない
+    /// （アプリ内テキスト入力のフラグが残らない = #503 の再発経路が構造的に無い）
     pub(crate) fn focus_chat_input(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        if self.chat_state(pane_id).is_some_and(|s| s.read_only) {
-            return; // worker は read-only（§2.4）
-        }
-        self.clear_text_input_focus();
-        self.chat_input_focused = Some(pane_id);
         if self.focused_pane() != pane_id {
             self.jump_to_pane(pane_id, cx);
-            // jump_to_pane はフォーカス移動の一環で入力欄フラグを落とすので立て直す
-            self.chat_input_focused = Some(pane_id);
         }
         cx.notify();
     }
 
-    /// 入力欄へ文字列を挿入する（打鍵・IME 確定・貼り付けの全経路がここを通る）。
-    /// 制御文字は改行とタブ以外を落とす（TUI へ生の ESC を流し込まない）
-    pub(crate) fn chat_input_insert(
-        &mut self,
-        pane_id: PaneId,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let insert: String = text
-            .chars()
-            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-            .collect();
-        if insert.is_empty() {
-            return;
-        }
-        let input = self.chat_inputs.entry(pane_id).or_default();
-        let cursor = input.snap();
-        input.text.insert_str(cursor, &insert);
-        input.cursor = cursor + insert.len();
-        cx.notify();
-    }
-
-    /// 入力欄のキーハンドラ。true を返すとイベントを消費する。
+    /// 送信ボタン（#719）。TUI の入力行をそのまま確定させる = **Enter だけ**送る。
     ///
-    /// git のコミット欄（#487 / #494）と同じ約束で組む: `key_char` を使う（shift 付きの
-    /// 大文字が打てるように）/ 修飾なしキーは必ず消費する（ターミナルへ漏らさない）/
-    /// キャレットは常に文字境界へ丸める
-    pub(crate) fn handle_chat_input_key(
-        &mut self,
-        pane_id: PaneId,
-        keystroke: &gpui::Keystroke,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        // 確認ダイアログ中は Enter / Esc だけ受ける（誤って本文が流れないように）
-        if self.chat_clear_confirm == Some(pane_id) {
-            match keystroke.key.as_str() {
-                "enter" => self.chat_clear_accept(cx),
-                "escape" => {
-                    self.chat_clear_confirm = None;
-                    cx.notify();
-                }
-                _ => {}
-            }
-            return true;
+    /// 本文を組み立て直さないので、`[Image #1]` やペースト畳み込みが入っていても
+    /// TUI が持っているものがそのまま送られる（キーボードの Enter と完全に同じ結果）
+    pub(crate) fn chat_submit_input(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let text = self
+            .chat_input_mirror(pane_id, false)
+            .filter(|m| m.has_text)
+            .and_then(|_| {
+                self.terminals
+                    .get(&pane_id)
+                    .map(|s| s.screen_opts(&self.theme, false))
+            })
+            .and_then(|screen| tako_core::screen::analyze_input_line(&screen))
+            .map(|s| s.text)
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            return; // 空送信は無視（claude に空行を送らない）
         }
-        let input = self.chat_inputs.entry(pane_id).or_default();
-        let cursor = input.snap();
-        match keystroke.key.as_str() {
-            // Enter = 送信 / Shift+Enter = 改行（§2.3）。
-            // cmd / ctrl + Enter も送信（リモート #429 と同じ操作を受ける）
-            "enter" if keystroke.modifiers.shift => {
-                input.text.insert(cursor, '\n');
-                input.cursor = cursor + 1;
-                cx.notify();
-                true
-            }
-            "enter" => {
-                self.chat_send_input(pane_id, cx);
-                true
-            }
-            "escape" => {
-                self.chat_input_focused = None;
-                cx.notify();
-                true
-            }
-            "backspace" => {
-                if cursor > 0 {
-                    let prev = input.text[..cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    input.text.drain(prev..cursor);
-                    input.cursor = prev;
-                }
-                cx.notify();
-                true
-            }
-            "delete" => {
-                if cursor < input.text.len() {
-                    let next = cursor
-                        + input.text[cursor..]
-                            .chars()
-                            .next()
-                            .map(char::len_utf8)
-                            .unwrap_or(0);
-                    input.text.drain(cursor..next);
-                }
-                cx.notify();
-                true
-            }
-            "left" => {
-                input.cursor = input.text[..cursor]
-                    .char_indices()
-                    .next_back()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                cx.notify();
-                true
-            }
-            "right" => {
-                if cursor < input.text.len() {
-                    input.cursor = cursor
-                        + input.text[cursor..]
-                            .chars()
-                            .next()
-                            .map(char::len_utf8)
-                            .unwrap_or(0);
-                }
-                cx.notify();
-                true
-            }
-            // 複数行なので Home / End は「その行の端」へ（上下は行移動ではなく端へ倒す。
-            // 行移動は折り返しを含む幾何が必要で、v1 では持たない）
-            "home" | "up" => {
-                input.cursor = input.text[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                cx.notify();
-                true
-            }
-            "end" | "down" => {
-                input.cursor = input.text[cursor..]
-                    .find('\n')
-                    .map(|i| cursor + i)
-                    .unwrap_or(input.text.len());
-                cx.notify();
-                true
-            }
-            // cmd / ctrl 付きはアプリのキーバインド（⌘V 等）へ通す
-            _ if keystroke.modifiers.platform || keystroke.modifiers.control => false,
-            _ => {
-                if let Some(ch) = keystroke.key_char.as_deref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.chat_input_insert(pane_id, ch, cx);
-                        return true;
-                    }
-                }
-                // 空白は key_char が来ないことがある（#487 で実機観測）
-                if keystroke.key == "space" {
-                    self.chat_input_insert(pane_id, " ", cx);
-                    return true;
-                }
-                true
-            }
-        }
-    }
-
-    /// 入力欄の内容を送信する（Enter / 送信ボタン共通）
-    pub(crate) fn chat_send_input(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        let text = self.chat_input_text(pane_id).trim().to_string();
-        if text.is_empty() {
-            return; // 空送信は無視（Enter 連打で claude に空行を送らない）
-        }
-        if self.chat_send_text(pane_id, &text, cx) {
-            self.chat_inputs.remove(&pane_id);
-        }
+        // 本文は送らず Enter だけ（#95 の Enter 単独送達フロー）。楽観 echo には
+        // 画面から読んだ本文を使うので、transcript が追いつくまでの見た目は変わらない
+        self.chat_send_newline(pane_id, &text, cx);
     }
 
     /// スラッシュボタンの押下（#716 / §2.3）。
@@ -562,6 +459,23 @@ impl TakoApp {
     /// MCP `tako_send_text` と同一コードパス = 開発不変条件を構造で満たす。
     /// 成功したら楽観 echo を積む（transcript 反映のラグを隠す。§3.1）
     fn chat_send_text(&mut self, pane_id: PaneId, text: &str, cx: &mut Context<Self>) -> bool {
+        self.chat_send_inner(pane_id, text, text, cx)
+    }
+
+    /// 入力行の確定（#719）。本文は組み立て直さず **Enter だけ**送る。
+    /// `echo` は画面から読んだ入力内容で、楽観 echo の見た目にだけ使う
+    fn chat_send_newline(&mut self, pane_id: PaneId, echo: &str, cx: &mut Context<Self>) -> bool {
+        self.chat_send_inner(pane_id, "", echo, cx)
+    }
+
+    /// 送信の実体（`chat_send_text` / `chat_send_newline` 共通）
+    fn chat_send_inner(
+        &mut self,
+        pane_id: PaneId,
+        text: &str,
+        echo: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let result = tako_control::dispatch(
             self,
             tako_control::protocol::Request::Send {
@@ -576,7 +490,7 @@ impl TakoApp {
         match result {
             Ok(_) => {
                 self.chat_echo.entry(pane_id).or_default().push(ChatEcho {
-                    text: text.to_string(),
+                    text: echo.to_string(),
                     at: std::time::Instant::now(),
                 });
                 self.chat_action_error = None;
@@ -747,6 +661,10 @@ impl TakoApp {
         };
         let width = f32::from(area.size.width);
         let compact = width < 420.0;
+        // 実画面の採取は**このフレームで 1 回だけ**（ヘッダのライブ表示と入力欄が共有する）。
+        // 描画のたびに何度も採ると #168 で潰したのと同じ形の無駄になる
+        let mirror = self.chat_input_mirror(pane_id, focused);
+        let activity = mirror.as_ref().and_then(|m| m.activity.clone());
 
         // 追従の再開: 手動スクロールで外れていても、下端まで戻ったら追従に復帰する
         // （前フレームの実測 bounds で判断する。リモートのリーダービュー #63 と同じ振る舞い）
@@ -811,7 +729,8 @@ impl TakoApp {
                     cx.notify();
                 }),
             )
-            .child(self.render_chat_header(pane_id, &state, focused, compact, cx))
+            .child(self.render_chat_header(pane_id, &state, focused, activity, compact, cx))
+            // worker も入力できる（#719 追加要件 5）。説明は残すが入力は妨げない
             .when(state.read_only, |d| {
                 d.child(self.render_chat_readonly_note())
             })
@@ -860,45 +779,38 @@ impl TakoApp {
                     })
                     .children(messages),
             )
-            // 入力欄 + スラッシュボタン（#716）。worker は read-only なので出さない
-            .when(!state.read_only, |d| {
-                d.child(self.render_chat_composer(pane_id, &state, compact, cx))
-            })
+            // 入力欄 + スラッシュボタン。**worker も含めて全チャットペインに出す**
+            // （#719 追加要件 5。実運用では worker への直接指示が日常的にある）
+            .child(self.render_chat_composer(pane_id, &state, mirror, compact, cx))
     }
 
-    /// 入力欄 + スラッシュボタン列（#716 / §2.3）。
+    /// 入力欄 + スラッシュボタン列（#716 / §2.3。中身は #719 でミラー方式）。
     /// 会話の下に固定し、メッセージ一覧だけがスクロールする
     fn render_chat_composer(
         &mut self,
         pane_id: PaneId,
         state: &ChatPaneState,
+        mirror: Option<ChatInputMirror>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme.clone();
         use crate::ui_text::ui_mode as txt;
-        let focused = self.chat_input_focused == Some(pane_id);
-        let text = self.chat_input_text(pane_id).to_string();
-        let empty = text.trim().is_empty();
+        let focused = self.focused_pane() == pane_id;
         let confirming = self.chat_clear_confirm == Some(pane_id);
         let error = self
             .chat_action_error
             .as_ref()
             .filter(|(pane, _, at)| *pane == pane_id && at.elapsed() < ACTION_ERROR_DURATION)
             .map(|(_, message, _)| message.clone());
-        // キャレットの前後で本文を割って、間にキャレットと未確定文字列を挟む
-        let cursor = crate::right_panel::floor_char_boundary(
-            &text,
-            self.chat_inputs
-                .get(&pane_id)
-                .map(|i| i.cursor.min(text.len()))
-                .unwrap_or(text.len()),
-        );
-        let (head, tail) = text.split_at(cursor);
-        // キャレットのある行より前の行（`head` の最後の行だけを別扱いにする）
-        let head_lines: Vec<String> = head.split('\n').map(str::to_string).collect();
-        let head_before_caret_line: Vec<String> =
-            head_lines[..head_lines.len().saturating_sub(1)].to_vec();
+        // 入力欄の中身は **TUI の入力行そのもの**（#719。採取は呼び出し元で 1 回だけ）
+        let has_text = mirror.as_ref().is_some_and(|m| m.has_text);
+        let line_h = self.pane_line_height(pane_id);
+        // 上限に達したら「あと N 行ある」ことが分かるようにしておく（無音の切り捨てにしない）
+        let hidden_rows = mirror
+            .as_ref()
+            .map(|m| m.total_rows.saturating_sub(m.rows.len()))
+            .unwrap_or(0);
 
         div()
             .flex_none()
@@ -928,13 +840,13 @@ impl TakoApp {
             .child(
                 div()
                     .id(("chat-input", pane_id.as_u64()))
+                    .relative()
                     .flex()
                     .flex_row()
-                    .items_end()
-                    .gap(px(6.0))
+                    .items_start()
                     .w_full()
                     .px(px(9.0))
-                    .py(px(7.0))
+                    .py(px(6.0))
                     .rounded(px(9.0))
                     .bg(rgba(theme.background))
                     .border_1()
@@ -951,71 +863,77 @@ impl TakoApp {
                             this.focus_chat_input(pane_id, cx);
                         }),
                     )
+                    // #718: 実ピクセルで高さを見るための記録（absolute なのでレイアウト不変）
+                    .child({
+                        #[cfg(feature = "visual-test")]
+                        {
+                            let slot = self.chat_input_bounds.clone();
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| slot.set(Some(bounds)),
+                            )
+                            .absolute()
+                            .size_full()
+                            .into_any_element()
+                        }
+                        #[cfg(not(feature = "visual-test"))]
+                        {
+                            gpui::Empty.into_any_element()
+                        }
+                    })
                     .child(
-                        // 本文。**行ごとに要素を分ける**のが要点（#716）: 改行入りの文字列を
-                        // 1 個の div に入れるとキャレットはその塊の「隣」に置かれるため、
-                        // 複数行では縦位置がずれる（実機スクショで確認して直した）
+                        // 映した行をそのまま縦に積む。**行数 = 箱の高さ**なので、
+                        // 1 行なら 1 行ぶんの高さに落ち着く（#718）。送信ボタンは
+                        // absolute なので箱の高さを一切押し上げない
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .max_h(px(CHAT_INPUT_MAX_HEIGHT))
+                            // 上限までは伸び、超えたら `chat_input_mirror` が頭を落とす
+                            .max_h(px(line_h * CHAT_INPUT_MAX_ROWS as f32))
+                            // 送信ボタンのぶんだけ右を空ける（重なり防止）
+                            .pr(px(30.0))
                             .overflow_hidden()
                             .flex()
                             .flex_col()
-                            .text_size(px(12.0))
-                            .text_color(hsla(theme.foreground))
-                            .when(text.is_empty() && !focused, |d| {
-                                d.child(
-                                    div().text_color(hsla(theme.text_muted)).child(
-                                        SharedString::from(txt::chat_placeholder(state.busy)),
-                                    ),
-                                )
-                            })
-                            // キャレットのある行より前
-                            .children(head_before_caret_line.iter().map(|line| {
-                                div()
-                                    .w_full()
-                                    .child(SharedString::from(line.clone()))
-                                    .into_any_element()
-                            }))
-                            // キャレットのある行（前半 + 未確定文字列 + キャレット + 後半）
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .flex_row()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .when_some(
-                                        head.rsplit('\n').next().filter(|s| !s.is_empty()),
-                                        |d, line: &str| {
-                                            d.child(SharedString::from(line.to_string()))
-                                        },
-                                    )
-                                    .children(
-                                        self.text_input_marked(AppTextInput::ChatInput, &theme),
-                                    )
-                                    .when(focused, |d| {
-                                        d.child(
-                                            self.text_input_caret(AppTextInput::ChatInput, &theme),
-                                        )
-                                    })
-                                    .when_some(
-                                        tail.split('\n').next().filter(|s| !s.is_empty()),
-                                        |d, line: &str| {
-                                            d.child(SharedString::from(line.to_string()))
-                                        },
-                                    ),
-                            )
-                            // キャレットのある行より後
-                            .children(tail.split('\n').skip(1).map(|line| {
-                                div()
-                                    .w_full()
-                                    .child(SharedString::from(line.to_string()))
-                                    .into_any_element()
-                            })),
+                            .when_some(mirror, |d, m: ChatInputMirror| d.children(m.rows))
+                            // TUI が入力行を出していない状態（選択ダイアログ等）でも
+                            // 箱が潰れないように 1 行ぶんは確保する
+                            .min_h(px(line_h)),
                     )
-                    .child(self.render_chat_send_button(pane_id, empty, cx)),
+                    // 空のときの案内。実画面には何も無いので**重ねて**出す
+                    // （行を足すと高さが変わってしまう）
+                    .when(!has_text, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(24.0))
+                                .top(px(6.0))
+                                .h(px(line_h))
+                                .flex()
+                                .items_center()
+                                .text_size(px(11.5))
+                                .text_color(hsla(theme.text_faint))
+                                .child(SharedString::from(txt::chat_placeholder(state.busy))),
+                        )
+                    })
+                    .when(hidden_rows > 0, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(9.0))
+                                .top(px(2.0))
+                                .text_size(px(9.5))
+                                .text_color(hsla(theme.text_faint))
+                                .child(SharedString::from(txt::chat_input_more_rows(hidden_rows))),
+                        )
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(6.0))
+                            .bottom(px(5.0))
+                            .child(self.render_chat_send_button(pane_id, !has_text, cx)),
+                    ),
             )
             .child(
                 div()
@@ -1073,7 +991,7 @@ impl TakoApp {
             )
             .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                 cx.stop_propagation();
-                this.chat_send_input(pane_id, cx);
+                this.chat_submit_input(pane_id, cx);
             }))
             .child(
                 svg()
@@ -1323,25 +1241,246 @@ impl TakoApp {
             .into_any_element()
     }
 
-    /// コマンド提案カード（#666）を会話の中へインラインで置く（#716）。
+    /// コマンド提案カード（#666）を会話の中へインラインで置く（#716 / #719 追加要件 6）。
     ///
-    /// カード自体の描画・コピー・実行は `command_card_ui` の**同じ経路**を使う
-    /// （見た目の実装を 2 つ持たない = 片方だけ直る事故が起きない）
+    /// 見た目は **md のコードブロック**（`md_view` の `CodeBlock`）に揃える:
+    /// `mantle` の背景パネル + `border_subtle` + 等幅 + 右上のコピーボタン。
+    /// Web 版 Claude の会話に出るコードブロックと同じ読み方・押し方になる。
+    /// 押したあとの処理（コピー / 新規ペイン実行 / 破棄）は `command_card_ui` の
+    /// **同じ経路**を通す = CLI `tako show-command --copy/--run` と 1:1 のまま。
+    /// ターミナル表示側の専用帯（#703）はこの変更の影響を受けない
     fn render_chat_inline_cards(
         &mut self,
         pane_id: PaneId,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        self.command_card_elements(pane_id, cx)
-            .into_iter()
-            .map(|card| {
-                div()
-                    .flex_shrink_0()
-                    .w_full()
-                    .child(card)
-                    .into_any_element()
+        let rows = self.command_card_rows(pane_id);
+        rows.into_iter()
+            .rev()
+            .map(|(card_id, label, commands)| {
+                self.render_chat_command_block(card_id, label, commands, cx)
             })
             .collect()
+    }
+
+    /// コマンド提案 1 枚を「コードブロック風」に描く（#719 追加要件 6）
+    fn render_chat_command_block(
+        &self,
+        card_id: u64,
+        label: Option<String>,
+        commands: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::ui_text::command_card as ctxt;
+        let theme = self.theme.clone();
+        let total = commands.len();
+        let errored = self
+            .command_card_error
+            .is_some_and(|(id, at)| id == card_id && at.elapsed() < FEEDBACK_DURATION);
+        div()
+            .flex_shrink_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            // ラベル（説明）はブロックの上に控えめに置く
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_muted))
+                            .child(SharedString::from(
+                                label.unwrap_or_else(|| ctxt::heading().to_string()),
+                            )),
+                    )
+                    .when(errored, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.red))
+                                .child(SharedString::from(ctxt::run_failed().to_string())),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(("chat-cmd-close", card_id))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .w(px(15.0))
+                            .h(px(15.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba(theme.surface_hover)))
+                            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_command_card(card_id, cx);
+                            }))
+                            .child(
+                                svg()
+                                    .path(ui_icon::CLOSE)
+                                    .w(px(9.0))
+                                    .h(px(9.0))
+                                    .text_color(hsla(theme.text_faint)),
+                            ),
+                    ),
+            )
+            .children(commands.into_iter().enumerate().map(|(index, command)| {
+                self.render_chat_command_line(card_id, index, total, command, cx)
+            }))
+            .into_any_element()
+    }
+
+    /// コマンド 1 行ぶんのコードパネル（背景 + 等幅 + 右上のコピー / 実行）
+    fn render_chat_command_line(
+        &self,
+        card_id: u64,
+        index: usize,
+        total: usize,
+        command: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::ui_text::command_card as ctxt;
+        let theme = self.theme.clone();
+        let copied = self.command_card_copied.is_some_and(|(id, i, at)| {
+            id == card_id && i == index && at.elapsed() < FEEDBACK_DURATION
+        });
+        // ボタンの見た目は md コードブロックのコピーボタン（#680）に合わせる
+        let button = |id: (&'static str, u64), icon: &'static str, text: String, on: bool| {
+            div()
+                .id((id.0, id.1))
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap(px(3.0))
+                .px(px(5.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(hsla_alpha(
+                    if on {
+                        theme.green
+                    } else {
+                        theme.border_default
+                    },
+                    if on { 1.0 } else { 0.7 },
+                ))
+                .bg(hsla_alpha(
+                    theme.surface_highlight,
+                    if on { 1.0 } else { 0.8 },
+                ))
+                .text_size(px(9.5))
+                .text_color(hsla(if on {
+                    theme.green
+                } else {
+                    theme.text_secondary
+                }))
+                .opacity(if on { 1.0 } else { 0.75 })
+                .hover(|d| d.opacity(1.0).bg(hsla(theme.surface_hover)))
+                .cursor_pointer()
+                .child(
+                    svg()
+                        .path(icon)
+                        .w(px(9.5))
+                        .h(px(9.5))
+                        .flex_none()
+                        .text_color(hsla(if on {
+                            theme.green
+                        } else {
+                            theme.text_secondary
+                        })),
+                )
+                .child(SharedString::from(text))
+        };
+        let slot = (card_id << 8) | index as u64;
+        div()
+            .relative()
+            .flex_shrink_0()
+            .w_full()
+            .px(px(9.0))
+            .py(px(7.0))
+            .rounded_md()
+            .border_1()
+            .border_color(hsla(theme.border_subtle))
+            .bg(hsla(theme.mantle))
+            .child(
+                div()
+                    // 等幅（コードブロックと同じ読み方）。長いコマンドは折り返す
+                    .font_family(theme.font_family.clone())
+                    .text_size(px(11.5))
+                    .line_height(px(16.0))
+                    // ボタンのぶんだけ 1 行目の右を空ける
+                    .pr(px(if total > 1 { 132.0 } else { 118.0 }))
+                    .text_color(hsla(theme.foreground))
+                    .child(SharedString::from(command)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.0))
+                    .right(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    // 複数行のカードでは何番目かを添える（帯 #703 と同じ表示）
+                    .when(total > 1, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(9.0))
+                                .text_color(hsla(theme.text_faint))
+                                .child(SharedString::from(ctxt::index_label(index, total))),
+                        )
+                    })
+                    .child(
+                        button(
+                            ("chat-cmd-copy", slot),
+                            if copied {
+                                ui_icon::CHECK
+                            } else {
+                                ui_icon::COPY
+                            },
+                            if copied {
+                                ctxt::copied().to_string()
+                            } else {
+                                ctxt::copy().to_string()
+                            },
+                            copied,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.copy_command_card(card_id, index, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        button(
+                            ("chat-cmd-run", slot),
+                            ui_icon::PLAY,
+                            ctxt::run().to_string(),
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.run_command_card(card_id, index, cx);
+                            },
+                        )),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// ヘッダ: モデル名 / 状態 / コンテキスト残量 / 「ターミナルを表示」/ ×
@@ -1350,6 +1489,8 @@ impl TakoApp {
         pane_id: PaneId,
         state: &ChatPaneState,
         focused: bool,
+        // TUI から採ったスピナー行（`Manifesting… (5m 16s · ↓ 16.4k tokens)`。#719）
+        activity: Option<String>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -1380,12 +1521,16 @@ impl TakoApp {
             status_dot.into_any_element()
         };
 
-        let status_label = if state.queued {
-            txt::chat_status_queued()
+        // #719: 生成中は TUI のスピナー行（作業内容 + 経過時間 + 受信トークン数）を
+        // そのまま出す。取れないときだけ従来の「考え中…」へ落とす
+        let status_label: String = if state.queued {
+            txt::chat_status_queued().to_string()
+        } else if let Some(live) = activity.filter(|_| state.busy) {
+            live
         } else if state.busy {
-            txt::chat_status_busy()
+            txt::chat_status_busy().to_string()
         } else {
-            txt::chat_status_idle()
+            txt::chat_status_idle().to_string()
         };
 
         div()
@@ -1436,7 +1581,7 @@ impl TakoApp {
                         .text_ellipsis()
                         .whitespace_nowrap()
                         .text_color(hsla(theme.text_muted))
-                        .child(SharedString::from(status_label.to_string())),
+                        .child(SharedString::from(status_label)),
                 )
             })
             .child(div().flex_grow(1.0))
@@ -1479,50 +1624,6 @@ impl TakoApp {
                             ),
                     )
                 },
-            )
-            // 「ターミナルを表示」= スターターの「コマンド入力へ」と同じ揮発解除（§2.3）
-            .child(
-                div()
-                    .id(("chat-to-terminal", pane_id.as_u64()))
-                    .flex()
-                    .flex_none()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(hsla(theme.border_subtle))
-                    .text_color(hsla(theme.text_secondary))
-                    .hover(|d| {
-                        d.bg(rgba(theme.surface_hover))
-                            .border_color(hsla(theme.border_default))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
-                    )
-                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.starter_action(
-                            pane_id,
-                            tako_core::ui_mode::StarterAction::UseTerminal,
-                            cx,
-                        );
-                    }))
-                    .child(
-                        svg()
-                            .path(ui_icon::PROMPT)
-                            .w(px(11.0))
-                            .h(px(11.0))
-                            .flex_none()
-                            .text_color(hsla(theme.text_secondary)),
-                    )
-                    .when(!compact, |d| {
-                        d.child(SharedString::from(txt::chat_show_terminal().to_string()))
-                    }),
             )
             .child(
                 div()
@@ -2179,14 +2280,11 @@ impl TakoApp {
         self.starter_released.remove(&pane_id);
         // #720: 過渡期の記録もペインと一緒に落とす（ペイン ID は再利用される。#390）
         self.pane_settle.remove(&pane_id);
-        // #716: 入力の下書き・echo・確認待ちもペインと一緒に落とす
-        // （ペイン ID は再利用されるので残すと他人の下書きが現れる。#390）
-        self.chat_inputs.remove(&pane_id);
+        // #716: echo・確認待ちもペインと一緒に落とす
+        // （ペイン ID は再利用されるので残すと他人の表示が現れる。#390）。
+        // #719 以降は下書きを持たない = 入力は TUI 側にあり、ペインと運命を共にする
         self.chat_echo.remove(&pane_id);
         self.chat_long_expanded.retain(|(pane, _)| *pane != pane_id);
-        if self.chat_input_focused == Some(pane_id) {
-            self.chat_input_focused = None;
-        }
         if self.chat_clear_confirm == Some(pane_id) {
             self.chat_clear_confirm = None;
         }

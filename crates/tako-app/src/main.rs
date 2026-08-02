@@ -732,8 +732,6 @@ enum AppTextInput {
     GitCommit,
     /// git タブの新規ブランチ名欄
     GitBranch,
-    /// GUI モードのチャット入力欄（#716）
-    ChatInput,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -1345,15 +1343,12 @@ struct TakoApp {
     /// 発話本文の md パース結果（内容キー → ブロック列）。
     /// pulldown-cmark + syntect を毎フレーム回さないためのキャッシュ（仕様書 §5）
     chat_md_cache: HashMap<u64, std::rc::Rc<Vec<preview::MdBlock>>>,
-    /// チャット入力欄の下書き（ペインごと。#716）。
-    /// ペインを移っても書きかけが残るようペイン単位で持つ
-    chat_inputs: HashMap<PaneId, chat_view::ChatInput>,
-    /// いまキーボード入力を受けているチャット入力欄（#716）。
-    /// `git_commit_input_focused` と同じ「フラグ 1 個」方式で、
-    /// `clear_text_input_focus` の一括クリア対象に入れる（#503 の不変条件）
-    chat_input_focused: Option<PaneId>,
     /// 送信直後の楽観 echo（#716 / 仕様 §3.1）。transcript へ現れたら破棄する
     chat_echo: HashMap<PaneId, Vec<chat_view::ChatEcho>>,
+    /// visual-test 用（#718）: 描き終わった入力欄の実 bounds。
+    /// 「1 行入力なら 1 行ぶんの高さ」を**実ピクセルの数値**で押さえるために使う
+    #[cfg(feature = "visual-test")]
+    chat_input_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// 「新しい会話」（/clear）の確認待ちペイン（#716。破壊的なので必ず 1 段挟む）
     chat_clear_confirm: Option<PaneId>,
     /// 送信・承認が失敗したときの表示（ペイン, 文言, 時刻）。時間経過で消える
@@ -2581,9 +2576,9 @@ impl TakoApp {
             chat_scroll_handles: HashMap::new(),
             chat_content_keys: HashMap::new(),
             chat_md_cache: HashMap::new(),
-            chat_inputs: HashMap::new(),
-            chat_input_focused: None,
             chat_echo: HashMap::new(),
+            #[cfg(feature = "visual-test")]
+            chat_input_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             chat_clear_confirm: None,
             chat_action_error: None,
             chat_long_expanded: std::collections::HashSet::new(),
@@ -5131,9 +5126,8 @@ impl TakoApp {
     /// キー入力がターミナルペインへ届くようにする。
     /// タブ切替・ペインフォーカス移動・パネル非表示化など、入力対象が変わる全経路で呼ぶ
     fn clear_text_input_focus(&mut self) {
-        // #716: チャット入力欄も同じ経路で落とす（#503 の不変条件）。
-        // 下書き（`chat_inputs`）は残す = 戻ってきたら書きかけが続く
-        self.chat_input_focused = None;
+        // #719: チャット入力欄は TUI の入力行を映すだけで打鍵を横取りしないので、
+        // ここで落とすフラグを持たない（#503 の再発経路が構造的に無い）
         self.git_commit_input_focused = false;
         // #496: 新規ブランチ名の入力もキーを奪うので同じ経路で落とす（#503 の不変条件）
         self.git_branch_input = None;
@@ -8464,7 +8458,16 @@ impl TakoApp {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let item = cx.read_from_clipboard();
+        let Some(text) = item.as_ref().and_then(|item| item.text()) else {
+            // #719 要件 1: 画像だけがクリップボードにあるときの ⌘V。
+            // tako 側で画像を扱わず **Ctrl+V をそのまま TUI へ流す**（エージェント CLI は
+            // 自分でクリップボードを読み `[Image #N]` をカーソル位置へ差し込む）。
+            // tako が画像を一時ファイル化して経路を作ると、TUI の採番・添付形式と
+            // 二重管理になり送信時の形がズレる
+            if item.as_ref().is_some_and(Self::clipboard_has_image) {
+                self.forward_image_paste(cx);
+            }
             return;
         };
         // handle_key と同じ優先順位で入力先を振り分ける（#414）。
@@ -8497,11 +8500,6 @@ impl TakoApp {
             cx.notify();
             return;
         }
-        // #716: チャット入力欄（貼り付け先の振り分けも handle_key と同じ優先順位）
-        if let Some(pane) = self.chat_input_pane() {
-            self.chat_input_insert(pane, &text, cx);
-            return;
-        }
         // #496: ブランチ名入力が優先（コミット欄と同時にフォーカスされることはない）
         if self.git_branch_input.is_some() {
             self.git_branch_input_insert(&text, cx);
@@ -8531,6 +8529,40 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// クリップボードに画像エントリがあるか（#719 要件 1）。
+    /// テキストが無い ⌘V を「何もしない」で終わらせないための判定
+    fn clipboard_has_image(item: &ClipboardItem) -> bool {
+        item.entries()
+            .iter()
+            .any(|e| matches!(e, gpui::ClipboardEntry::Image(_)))
+    }
+
+    /// 画像ペースト（⌘V）をエージェント TUI へ素通しする（#719 要件 1）。
+    ///
+    /// 送るのは Ctrl+V（`0x16`）1 バイトだけ。claude / codex はこれを受けて
+    /// **自分で**システムクリップボードから画像を読み、入力欄のカーソル位置へ
+    /// `[Image #N]` を挿入する。だからチャット入力欄（TUI 入力行のミラー）にも
+    /// そのまま現れるし、送信時の添付形式も TUI で打ったときと完全に一致する。
+    ///
+    /// 素のシェルへ送ると `0x16` は「次の文字をそのまま入れる」の意味になって
+    /// 化けるので、**エージェント TUI が出ているペインに限る**
+    fn forward_image_paste(&mut self, cx: &mut Context<Self>) {
+        let pane_id = self.focused_pane();
+        let is_agent_tui = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.screen_opts(&self.theme, false))
+            .and_then(|screen| tako_core::screen::input_region(&screen))
+            .is_some();
+        if !is_agent_tui {
+            return;
+        }
+        if let Some(session) = self.terminals.get(&pane_id) {
+            session.write(vec![0x16]);
+        }
+        cx.notify();
+    }
+
     // --- キー入力 ---
 
     /// キー入力を丸ごと消費するアプリ内テキスト入力が有効か（#546）。
@@ -8541,8 +8573,6 @@ impl TakoApp {
         self.command_palette.is_some()
             || self.inline_edit.is_some()
             || self.git_branch_input.is_some()
-            // #716: チャット入力欄（実際にチャット表示のペインに限る）
-            || self.chat_input_pane().is_some()
             // #503 と同じ条件で「見えているコミット欄」に限る（stale フラグで拾わない）
             || (self.git_commit_input_focused
                 && self.panel_visible
@@ -8581,18 +8611,9 @@ impl TakoApp {
             return;
         }
 
-        // #716: GUI モードのチャット入力欄。git の入力欄より先に見るのは、
-        // チャットは「ペインそのものの入力欄」= より内側の対象だから
-        // （git パネルとチャットが同時にフォーカスを持つことはない）
-        if let Some(pane) = self.chat_input_pane() {
-            if self.handle_chat_input_key(pane, keystroke, cx) {
-                cx.stop_propagation();
-                return;
-            }
-        } else {
-            // 表示がターミナルへ戻った / read-only になったらフラグを落とす（#503 の防御）
-            self.chat_input_focused = None;
-        }
+        // #719: GUI モードのチャット入力欄は**打鍵を横取りしない**。
+        // 入力欄は TUI の入力行を映しているだけなので、打鍵はそのまま PTY へ流す
+        // = Enter / Shift+Enter / IME / 画像ペーストが TUI と完全に一致する
 
         // #503: git 入力欄が見えない（パネル非表示 or git 以外のビュー）のに
         // フラグが残っていたら強制クリア（防御。通常は経路別クリアで落ちる）
@@ -8788,11 +8809,8 @@ impl TakoApp {
         if self.inline_edit.is_some() || self.webview_dock_url_focused {
             return None;
         }
-        // #716: チャット入力欄。**いま実際にチャット表示のペイン**に限る
-        // （#503 と同じ考えで、stale なフラグで IME を奪わない）
-        if self.chat_input_pane().is_some() {
-            return Some(AppTextInput::ChatInput);
-        }
+        // #719: チャット入力欄は宛先にしない。IME はターミナルペイン宛ての
+        // 既存経路をそのまま使う（入力状態を 1 つに保つ）
         if self.git_branch_input.is_some() {
             return Some(AppTextInput::GitBranch);
         }
@@ -8813,11 +8831,6 @@ impl TakoApp {
         match target {
             AppTextInput::GitCommit => self.git_commit_insert(text, cx),
             AppTextInput::GitBranch => self.git_branch_input_insert(text, cx),
-            AppTextInput::ChatInput => {
-                if let Some(pane) = self.chat_input_pane() {
-                    self.chat_input_insert(pane, text, cx);
-                }
-            }
         }
     }
 
@@ -21422,16 +21435,129 @@ mod self_test {
                 );
                 let composer_light =
                     readable_pixels_in_bounds(&gui_light, &[composer], scale, bg_light, 2.0);
-                // 入力して見た目が変わること（打鍵経路ではなく挿入 API = IME 確定と同じ経路）
+                // #719: 入力欄は TUI の入力行のミラーなので、**画面に入力ボックスを描いて**
+                // 見た目が変わること（= 箱が伸びて中身が映ること）を見る。複数行にするのは
+                // #718 のオートグローぶんの高さ変化まで実ピクセルに出すため
                 let _ = window.update(cx, |app, _, cx| {
                     app.focus_chat_input(pane, cx);
-                    // 複数行（Shift+Enter 相当）でもキャレット位置と折り返しが崩れないか見る
-                    app.chat_input_insert(pane, "テストの依頼を書きました\n2 行目もあります", cx);
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Send {
+                            pane: Some(pane.as_u64()),
+                            text: "clear; printf '\\n────────────────\\n❯ テストの依頼を書きました\\n  2 行目もあります\\n────────────────\\n'".into(),
+                            newline: true,
+                            tmux_session: None,
+                            await_prompt: false,
+                        },
+                        PaneOrigin::User,
+                    );
                 });
+                cx.background_executor()
+                    .timer(Duration::from_millis(800))
+                    .await;
                 let (typed, _) = capture_frame(any, cx)
                     .unwrap_or_else(|| fail("visual-test チャット: 入力後フレーム"));
                 let typed_changed =
                     changed_pixels_in_bounds(&gui_light, &typed, &[composer], scale);
+                // #718: 「行数 = 高さ」を**実ピクセルの数値**で押さえる。
+                // 1 行 → 2 行 → 4 行と描いて、増分がちょうど 1 行ぶんずつになること、
+                // 1 行のときの高さが「1 行 + 上下パディング」に収まっていることを見る
+                let line_h = window
+                    .update(cx, |app, _, _| app.pane_line_height(pane))
+                    .unwrap_or(17.0);
+                let mut heights: Vec<f32> = Vec::new();
+                for rows in [1usize, 2, 4] {
+                    let body: Vec<String> = (0..rows)
+                        .map(|i| {
+                            if i == 0 {
+                                "\\u276F row0".to_string()
+                            } else {
+                                format!("  row{i}")
+                            }
+                        })
+                        .collect();
+                    let rule = "\\u2500".repeat(16);
+                    let cmd = format!(
+                        "printf '%b' '{rule}\\n{}\\n{rule}\\n'",
+                        body.join("\\n")
+                    );
+                    let _ = window.update(cx, |app, _, _| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Send {
+                                pane: Some(pane.as_u64()),
+                                text: cmd,
+                                newline: true,
+                                tmux_session: None,
+                                await_prompt: false,
+                            },
+                            PaneOrigin::User,
+                        );
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_millis(800))
+                        .await;
+                    let _ = capture_frame(any, cx);
+                    let h = window
+                        .update(cx, |app, _, _| {
+                            app.chat_input_bounds.get().map(|b| f32::from(b.size.height))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0.0);
+                    heights.push(h);
+                }
+                println!(
+                    "TAKO_VISUAL_PIXEL: chat-input line_h={line_h:.1} h1={:.1} h2={:.1} h4={:.1}",
+                    heights[0], heights[1], heights[2]
+                );
+                // 1 行のときの箱は「1 行 + 上下パディング（12px）+ 枠 2px」に収まる。
+                // 送信ボタン（26px）が高さを押し上げていた頃はここが 40px 付近だった
+                // #719 追加要件 5: worker（read_only）でも入力欄が出る。
+                // 説明行が 1 本増えるだけで、入力欄そのものは同じ高さで描かれる
+                let readonly_height = {
+                    let _ = window.update(cx, |app, _, cx| {
+                        if let Some(state) = app.chat_panes.get(&pane) {
+                            let mut next = (**state).clone();
+                            next.read_only = true;
+                            app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                        }
+                        cx.notify();
+                    });
+                    let _ = capture_frame(any, cx);
+                    let h = window
+                        .update(cx, |app, _, _| {
+                            app.chat_input_bounds.get().map(|b| f32::from(b.size.height))
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0.0);
+                    let _ = window.update(cx, |app, _, cx| {
+                        if let Some(state) = app.chat_panes.get(&pane) {
+                            let mut next = (**state).clone();
+                            next.read_only = false;
+                            app.chat_panes.insert(pane, std::rc::Rc::new(next));
+                        }
+                        cx.notify();
+                    });
+                    let _ = capture_frame(any, cx);
+                    h
+                };
+                println!("TAKO_VISUAL_PIXEL: chat-input readonly_h={readonly_height:.1}");
+                check(
+                    (readonly_height - heights[2]).abs() < 2.0,
+                    "visual-test 入力欄: worker(read_only) でも同じ入力欄が出る (#719)",
+                );
+                check(
+                    heights[0] > line_h && heights[0] <= line_h + 20.0,
+                    "visual-test 入力欄: 1 行入力は 1 行ぶん + パディングの高さ (#718)",
+                );
+                // 行が増えたぶんだけきっちり伸びる（1 行あたり line_h。誤差 2px）
+                check(
+                    (heights[1] - heights[0] - line_h).abs() < 2.0
+                        && (heights[2] - heights[0] - line_h * 3.0).abs() < 2.0,
+                    "visual-test 入力欄: 行数に比例して伸びる (#718 オートグロー)",
+                );
                 // 承認カード + インラインカードを出す
                 let _ = window.update(cx, |app, _, cx| {
                     if let Some(state) = app.chat_panes.get(&pane) {
@@ -21513,8 +21639,6 @@ mod self_test {
                 );
                 // 後片付け: カード・承認・下書きを落とす（後続の節へ持ち越さない）
                 let _ = window.update(cx, |app, _, cx| {
-                    app.chat_inputs.clear();
-                    app.chat_input_focused = None;
                     app.command_cards.dismiss(Some(pane), None);
                     if let Some(state) = app.chat_panes.get(&pane) {
                         let mut next = (**state).clone();
@@ -32108,16 +32232,17 @@ mod self_test {
                     "alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)",
                 );
 
-                // 95. GUI ライク表示モード G3 = チャット操作（#691 / #716）。
+                // 95. GUI ライク表示モード G3 = チャット操作（#691 / #716 / #719）。
                 // 項目 94 が組んだチャットペインをそのまま使い、書き系の配線を見る:
-                // (a) 入力欄がキーを握り、IME の宛先もチャットになる（#561 の型で判別）
-                // (b) Enter = 送信 / Shift+Enter = 改行 / 空入力の Enter は無視
-                // (c) 送信すると楽観 echo が積まれ、下書きが空になる
+                // (a) 入力欄は**打鍵を横取りしない**（#719 のミラー + パススルー方式。
+                //     キーも IME もターミナル宛てのまま = 入力状態が常に 1 つ）
+                // (b) 入力欄の中身が TUI の入力行のミラーになる（#719）
+                // (c) 行数が増えると箱も伸び、上限で頭打ちになる（#718 のオートグロー）
                 // (d) スラッシュボタン: /compact は即送信、/clear は確認を挟む
                 // (e) 承認: ダイアログが**実在しない**ペインへの respond は失敗する（誤爆防止）
-                // (f) terminal 表示へ倒すと入力欄はキーを握らない（ターミナルへ届く）
+                // (f) terminal 表示へ倒しても打鍵はターミナルへ届く
                 {
-                    let ime_target = window
+                    let passthrough = window
                         .update(cx, |app, _, cx| {
                             // 項目 94 の (e) には待ちがあり、そのあいだに定期更新が走って
                             // 注入した会話が消える（このペインで動いているのは素のシェルなので
@@ -32134,84 +32259,65 @@ mod self_test {
                                 }),
                             );
                             app.focus_chat_input(chat_pane, cx);
+                            // #719: 入力欄をクリックしてもキー・IME はターミナル宛てのまま。
+                            // ここが true に戻ると打鍵が入力欄に吸われて TUI と二重化する
                             (
-                                app.chat_input_pane() == Some(chat_pane),
-                                app.app_text_input() == Some(AppTextInput::ChatInput),
-                                app.text_input_swallows_keys(),
+                                app.focused_pane() == chat_pane,
+                                app.app_text_input().is_none(),
+                                !app.text_input_swallows_keys(),
                             )
                         })
                         .unwrap_or((false, false, false));
                     check(
-                        ime_target.0 && ime_target.1 && ime_target.2,
-                        "チャット入力欄がキーと IME の宛先になる (#716)",
+                        passthrough.0 && passthrough.1 && passthrough.2,
+                        "チャット入力欄は打鍵と IME を横取りしない (#719)",
                     );
 
-                    // (b)(c) 打鍵 → 改行 → 送信。打鍵は描画のリスナーと同じ
-                    // `handle_chat_input_key` を通す（経路差を作らない）
-                    let typing = window
-                        .update(cx, |app, _, cx| {
-                            let ch = |k: &str, c: &str| Keystroke {
-                                modifiers: Modifiers::default(),
-                                key: k.to_string(),
-                                key_char: Some(c.to_string()),
-                            };
-                            let shift_enter = Keystroke {
-                                modifiers: Modifiers {
-                                    shift: true,
-                                    ..Modifiers::default()
-                                },
-                                key: "enter".to_string(),
-                                key_char: None,
-                            };
-                            let enter = Keystroke {
-                                modifiers: Modifiers::default(),
-                                key: "enter".to_string(),
-                                key_char: None,
-                            };
-                            // 空入力の Enter は何も起こさない（claude へ空行を送らない）
-                            app.handle_chat_input_key(chat_pane, &enter, cx);
-                            let empty_ignored = !app.chat_echo.contains_key(&chat_pane);
-                            app.handle_chat_input_key(chat_pane, &ch("a", "a"), cx);
-                            app.handle_chat_input_key(chat_pane, &shift_enter, cx);
-                            app.handle_chat_input_key(chat_pane, &ch("b", "b"), cx);
-                            let multiline = app.chat_input_text(chat_pane) == "a\nb";
-                            // IME 確定と同じ経路（#561 の振り分け）でも入る
-                            app.insert_app_text_input(AppTextInput::ChatInput, "です", cx);
-                            let ime_ok = app.chat_input_text(chat_pane) == "a\nbです";
-                            app.handle_chat_input_key(chat_pane, &enter, cx);
-                            let sent = app
-                                .chat_echo
-                                .get(&chat_pane)
-                                .is_some_and(|e| e.len() == 1 && e[0].text == "a\nbです");
-                            let cleared = app.chat_input_text(chat_pane).is_empty();
-                            if !(empty_ignored && multiline && ime_ok && sent && cleared) {
-                                eprintln!(
-                                    "TAKO_SELF_TEST_716_INPUT: empty={empty_ignored}                                      multi={multiline} ime={ime_ok} sent={sent} cleared={cleared}"
-                                );
-                            }
-                            empty_ignored && multiline && ime_ok && sent && cleared
+                    // (b)(c) ミラーとオートグロー。**実画面に** TUI 風の入力ボックスを
+                    // 描いて（= claude が描くのと同じ絵）、入力欄がそれを映すかを見る。
+                    // 下書きを持たない方式なので、検査対象は「画面 → 入力欄」の写像そのもの
+                    // シェルのプロンプトが `❯` 系だと入力欄と競合するので、まず衝突しない
+                    // 形へ変えておく（`$` はプロンプト記号の和集合に入っていない）。
+                    // `clear` は使わない: 画面上端に描くと下端 24 行の走査範囲から外れる
+                    // （実 claude は全画面 TUI なので入力ボックスは必ず下端にある）
+                    // (b)(c) 入力欄が TUI 入力行のミラーになること・行数に追従すること
+                    // （#718 / #719）は、切り出しの純関数を tako-core の unit
+                    // （`screen::input_region` = 9 本）で、端から端までの経路を
+                    // 95c の実 claude e2e で見る。この項目のペインは素のシェルで、
+                    // 合成打鍵が届かない（実測: 6 回描き直しても画面が変化しない）ため
+                    // ここでは画面を作らない。**下書きを持たない**ことだけ確かめておく
+                    let no_draft = window
+                        .update(cx, |app, _, _| {
+                            app.chat_input_mirror(chat_pane, true).is_none()
+                                && app.app_text_input().is_none()
                         })
                         .unwrap_or(false);
                     check(
-                        typing,
-                        "Enter で送信 / Shift+Enter で改行 / 空入力は無視 (#716)",
+                        no_draft,
+                        "入力欄はローカル下書きを持たない（TUI が無ければ空）(#719)",
                     );
 
-                    // 楽観 echo は表示に混ざり、transcript に同じ発話が来たら消える
+                    // 楽観 echo は表示に混ざり、transcript に同じ発話が来たら消える。
+                    // #719 で下書きが無くなったので、echo はスラッシュボタンと同じ
+                    // `chat_send_text` 経路（= 送信の実体）で積む
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.chat_echo.remove(&chat_pane);
+                        app.chat_slash_action(chat_pane, chat_view::SlashButton::Compact, cx);
+                    });
                     let echo_lifecycle = window
                         .update(cx, |app, _, _| {
                             let state = app.chat_panes.get(&chat_pane).cloned();
                             let shown = state.as_ref().is_some_and(|s| {
                                 app.chat_visible_messages(chat_pane, s)
                                     .iter()
-                                    .any(|m| m.text == "a\nbです")
+                                    .any(|m| m.text == "/compact")
                             });
                             // transcript 側に同じ発話が現れた状況を作る
                             if let Some(state) = state {
                                 let mut next = (*state).clone();
                                 next.messages
                                     .extend(chat_view::messages_from_json(&[serde_json::json!({
-                                        "role": "user", "text": "a\nbです",
+                                        "role": "user", "text": "/compact",
                                     })]));
                                 app.chat_panes.insert(chat_pane, std::rc::Rc::new(next));
                             }
@@ -32304,8 +32410,9 @@ mod self_test {
                                 },
                                 PaneOrigin::User,
                             );
+                            // #719: どちらの表示でも打鍵はターミナルへ届く（横取り無し）
                             let released =
-                                app.chat_input_pane().is_none() && !app.text_input_swallows_keys();
+                                app.app_text_input().is_none() && !app.text_input_swallows_keys();
                             let _ = tako_control::dispatch(
                                 app,
                                 tako_control::protocol::Request::UiMode {
@@ -32450,26 +32557,60 @@ mod self_test {
                     }
                     check(became_chat, "95c: 実 claude ペインがチャット表示になる");
 
-                    // 入力欄へ日本語を入れて Enter（IME 確定と同じ経路 + 描画と同じキー経路）
+                    // #719 受け入れ条件 1: 打鍵は素通しで TUI の入力行へ入り、
+                    // チャット入力欄はそれを**映す**（両者が同じ 1 つの状態を見ている）。
+                    // 文字入力は既存のターミナル書き経路（= 貼り付け・IME 確定と同じ）を使う
                     let probe = format!("これはテストです716-{}", std::process::id());
+                    let _ = window.update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Send {
+                                pane: Some(chat_pane.as_u64()),
+                                text: probe.clone(),
+                                newline: false,
+                                tmux_session: None,
+                                await_prompt: false,
+                            },
+                            PaneOrigin::User,
+                        )
+                    });
+                    let mut mirrored = false;
+                    for _ in 0..30 {
+                        wait(cx, 500).await;
+                        mirrored = window
+                            .update(cx, |app, _, _| {
+                                app.chat_input_mirror(chat_pane, true)
+                                    .is_some_and(|m| m.has_text)
+                                    && app
+                                        .terminals
+                                        .get(&chat_pane)
+                                        .and_then(|t| {
+                                            tako_core::screen::analyze_input_line(
+                                                &t.screen_opts(&app.theme, false),
+                                            )
+                                        })
+                                        .is_some_and(|st| st.text.contains(&probe))
+                            })
+                            .unwrap_or(false);
+                        if mirrored {
+                            break;
+                        }
+                    }
+                    check(
+                        mirrored,
+                        "95c: 打鍵が TUI の入力行に入り、チャット入力欄がそれを映す (#719)",
+                    );
+                    // 送信 = 入力行の確定（本文は組み立て直さない）
                     let sent = window
                         .update(cx, |app, _, cx| {
-                            app.focus_chat_input(chat_pane, cx);
-                            app.insert_app_text_input(AppTextInput::ChatInput, &probe, cx);
-                            let typed = app.chat_input_text(chat_pane) == probe;
-                            app.handle_chat_input_key(
-                                chat_pane,
-                                &Keystroke {
-                                    modifiers: Modifiers::default(),
-                                    key: "enter".to_string(),
-                                    key_char: None,
-                                },
-                                cx,
-                            );
-                            typed && app.chat_input_text(chat_pane).is_empty()
+                            app.chat_echo.remove(&chat_pane);
+                            app.chat_submit_input(chat_pane, cx);
+                            app.chat_echo
+                                .get(&chat_pane)
+                                .is_some_and(|e| e.iter().any(|x| x.text.contains(&probe)))
                         })
                         .unwrap_or(false);
-                    check(sent, "95c: 入力欄の日本語を Enter で送信して下書きが空になる");
+                    check(sent, "95c: 入力欄の日本語を送信できる (#719)");
 
                     // transcript に自分の発話が現れる = GUI → Send → PromptFlow → claude →
                     // transcript → チャット表示の全経路が繋がっている
@@ -32517,19 +32658,42 @@ mod self_test {
                     // （#572 の経路をそのまま使う）。`queued` は生成が短いと観測できない
                     // ことがあるので、判定は「最終的に transcript へ届く」ことに置く
                     let probe2 = format!("2通目です716-{}", std::process::id());
-                    let _ = window.update(cx, |app, _, cx| {
-                        app.focus_chat_input(chat_pane, cx);
-                        app.insert_app_text_input(AppTextInput::ChatInput, &probe2, cx);
-                        app.handle_chat_input_key(
-                            chat_pane,
-                            &Keystroke {
-                                modifiers: Modifiers::default(),
-                                key: "enter".to_string(),
-                                key_char: None,
+                    let _ = window.update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Send {
+                                pane: Some(chat_pane.as_u64()),
+                                text: probe2.clone(),
+                                newline: false,
+                                tmux_session: None,
+                                await_prompt: false,
                             },
-                            cx,
-                        );
+                            PaneOrigin::User,
+                        )
                     });
+                    // 入力行へ echo が返るのを待ってから確定する。busy 中は claude が
+                    // 打鍵を入力行ではなく内部キューへ入れる（#572）ので、その場合は
+                    // 入力行に現れないまま = 確定不要（ターン終了時に自動で送られる）
+                    for _ in 0..30 {
+                        wait(cx, 500).await;
+                        let in_line = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&chat_pane)
+                                    .and_then(|t| {
+                                        tako_core::screen::analyze_input_line(
+                                            &t.screen_opts(&app.theme, false),
+                                        )
+                                    })
+                                    .is_some_and(|st| st.text.contains(&probe2))
+                            })
+                            .unwrap_or(false);
+                        if in_line {
+                            let _ = window
+                                .update(cx, |app, _, cx| app.chat_submit_input(chat_pane, cx));
+                            break;
+                        }
+                    }
                     let mut queued_seen = false;
                     let mut delivered2 = false;
                     for _ in 0..120 {
@@ -32601,9 +32765,7 @@ mod self_test {
                     app.starter_released.clear();
                     app.chat_panes.clear();
                     app.chat_expanded.clear();
-                    app.chat_inputs.clear();
                     app.chat_echo.clear();
-                    app.chat_input_focused = None;
                     app.chat_clear_confirm = None;
                     app.chat_action_error = None;
                     cx.notify();

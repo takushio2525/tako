@@ -502,6 +502,28 @@ fn has_elapsed_marker(line: &str) -> bool {
         })
 }
 
+/// 生成中の**ライブなスピナー行**を返す（#719）。
+///
+/// claude は生成中、会話の下に `✻ Manifesting… (5m 16s · ↓ 16.4k tokens)` の 1 行を
+/// 出す（実採取画面）。「何をしているか」「経過時間」「受信トークン数」が全部
+/// 入っているので、チャットビューはこれをそのまま見せる（独自に数え直さない）。
+///
+/// 呼び出し側は**入力ボックスより上の行だけ**を渡すこと。フッターの `(→4h44m)`
+/// のような括弧つき表示を拾わないための約束
+pub fn activity_line(lines: &[String]) -> Option<String> {
+    // 下から探して最初に見つかったものが「いまの」スピナー行
+    lines.iter().rev().take(20).find_map(|line| {
+        let t = line.trim();
+        // 経過時間つきの短い 1 行だけを相手にする（本文の混入を避ける）
+        if t.chars().count() > 120 || !t.contains('(') || !has_elapsed_marker(t) {
+            return None;
+        }
+        // 先頭のスピナー記号（✻ ✽ ✢ · * 等）と余白を落として本文だけにする
+        let body = t.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
+        (!body.is_empty()).then(|| body.to_string())
+    })
+}
+
 /// プロンプト照合用の先頭断片（最初の非空行の先頭 10 文字）。
 /// 画面上での折り返し・省略に耐えるよう短い断片で照合する
 pub fn prompt_head(prompt: &str) -> String {
@@ -1818,5 +1840,62 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
                 "{name} は permission ダイアログとして検知される"
             );
         }
+    }
+
+    // --- 生成中のライブ表示（#719） ---
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn スピナー行から作業内容と経過時間とトークン数が取れる() {
+        // 実採取（claude v2.1 系）
+        let screen = lines(&[
+            "⏺ 直しました",
+            "",
+            "✻ Manifesting… (5m 16s · ↓ 16.4k tokens)",
+            "  ⎿  Tip: Use /btw to ask a quick side question",
+        ]);
+        assert_eq!(
+            activity_line(&screen).as_deref(),
+            Some("Manifesting… (5m 16s · ↓ 16.4k tokens)")
+        );
+    }
+
+    #[test]
+    fn 生成していないときはスピナー行を返さない() {
+        let screen = lines(&["⏺ 直しました", "", "  ⎿  Tip: use /btw"]);
+        assert!(activity_line(&screen).is_none());
+    }
+
+    #[test]
+    fn フッターの残り時間表示はスピナーと誤認しない() {
+        // 呼び出し側は入力欄より上だけを渡す約束だが、混ざっても拾わないこと
+        let screen = lines(&[
+            "  [Opus 5 · MAX]  user@example.com",
+            "  5h   12% █░░░░░░░░░ (→4h44m)",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]);
+        assert!(activity_line(&screen).is_none());
+    }
+
+    #[test]
+    fn 長い本文行はスピナーとして拾わない() {
+        let long = format!("これは本文です (3s) {}", "あ".repeat(140));
+        assert!(activity_line(&lines(&[&long])).is_none());
+    }
+
+    #[test]
+    fn 直近のスピナー行を採る() {
+        let screen = lines(&[
+            "✻ Thinking… (1s · ↓ 0.1k tokens)",
+            "⏺ 中間報告",
+            "✻ Baking… (12s · ↓ 2.0k tokens)",
+        ]);
+        assert_eq!(
+            activity_line(&screen).as_deref(),
+            Some("Baking… (12s · ↓ 2.0k tokens)")
+        );
     }
 }
