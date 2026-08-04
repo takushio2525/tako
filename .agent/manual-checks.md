@@ -630,3 +630,20 @@ Enter 素通しの楽観 echo・会話末尾の作業中インジケータは、
 - [ ] 生成中は会話の末尾に作業中インジケータ（作業内容 + 経過 + トークン数）が出て、
       生成が終わると本文の発話に置き換わる
 - [ ] user / assistant とも枠付きブロックで、発話の境界が一目で分かる（dark / light 両方）
+
+## チャット内の md テーブルと画像つき発話（#745 / #746、2026-08-04）
+
+どちらも**機械検証済みなので手で確かめ直す必要はない**。何がどこで担保されているかだけ記す。
+
+- #745（表のセルが 1 文字ずつ縦に折り返される）: visual-test の `chat-table` 節
+  （`TAKO_ISOLATED=1 TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=chat-table cargo run -p tako-app
+  --features visual-test`）が、**同じ md をチャットとプレビューへ同じ幅で並べて**描き、
+  「列に余裕があるのに折り返したセル」が 1 つでもあれば落ちる（dark / light / 狭幅の 3 状態。
+  2 列の日本語表 + 3 列 + 折り返せない長い英単語 + 右寄せを含む）。判定規則そのものは
+  `md_view::md_table_cell_collapsed` のユニットテストが実測値で固定している
+- #746（画像つき発話の二重表示・「送信待ち」残留）: セルフテスト項目（#746）が
+  `chat_visible_messages` 経路で本文・画像枚数・件数を見る。加えて **実 claude e2e**
+  （95c の `#746` ブロック。`TAKO_SELF_TEST_CLAUDE=1`）が ⌘V を素通しして claude 自身に
+  `[Image #N]` を挿入させ、送信直後と配送後の吹き出し件数・「送信待ち」の解除を実測する
+  （実測ログ: `raw_line="[Image #1] 画像つき746-…" chip=true leaked=false bubbles=1` →
+  `bubbles=1 queued=false`）。クリップボードへ画像を置けない環境では自動スキップする

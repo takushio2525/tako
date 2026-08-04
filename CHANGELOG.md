@@ -53,6 +53,47 @@ Nightly patch release (automated). Changes since v0.6.4:
   80% を超えたときだけ**押せる**「/compact で会話を軽くする」ヒントが出るようにした
   （従来からの警告色の残量バーの隣）。
 
+### Fixed / 修正
+
+- Markdown tables inside the chat view no longer wrap one character per line (#745).
+  A cell whose text fitted its column collapsed to zero width and stacked its characters
+  vertically, so a single row grew past half the pane; the same table in the preview pane
+  was fine. The trigger was a `min-width: 0` on the assistant message body — a no-op there
+  (it is a child of a **column** flex container, where the automatic minimum size applies
+  to the height), but it changed how taffy measured the subtree and left the cell text laid
+  out with a wrap width of 0. Measured at an identical pane width of 478px, the cell
+  「入力欄のテキスト重なり」 went from `w=0.0 h=214.5` (11 lines) to `w=143.0 h=19.5` —
+  the exact geometry the preview pane produces. A new `chat-table` visual-test section
+  renders the same Markdown into a chat pane and a preview pane side by side at the same
+  width and fails if any cell wraps while its column still has room.
+- チャットビュー内の Markdown テーブルでセルが 1 文字ずつ縦に折り返される問題を修正
+  （#745）。列に入る幅があるセルが幅 0 まで潰れて文字が縦積みになり、1 行だけで
+  ペインの半分以上に伸びていた（同じ表をプレビューペインで開くと正常）。引き金は
+  assistant 発話の本文コンテナに付いていた `min_w(0)` で、**縦並び**の中の子では
+  自動最小サイズが掛かるのは高さ側なので意味を持たないのに、taffy の採寸経路が変わって
+  セルのテキストが折り返し幅 0 でレイアウトされたまま残っていた。同一ペイン幅 478px の
+  実測で、セル「入力欄のテキスト重なり」は `w=0.0 h=214.5`（11 行）から
+  `w=143.0 h=19.5`（プレビューと同値）になった。再発防止として visual-test に
+  `chat-table` 節を新設し、同じ md をチャットとプレビューへ**同じ幅で並べて**描き、
+  列に余裕があるのに折り返したセルが 1 つでもあれば落ちるようにした。
+- Sending a message with an image attachment no longer shows the same message twice in the
+  chat view (#746). The optimistic echo (the bubble shown before the transcript catches up)
+  stored the **raw** TUI input line, which contains Claude's internal `[Image #13]`
+  placeholder. The transcript stores the same message with the placeholder stripped, so the
+  two never matched: the echo survived for up to 45 seconds beside the real bubble, still
+  labelled 「送信待ち」 and showing the raw placeholder as if it were part of the text. The
+  echo now goes through the very same classifier the transcript uses, so it carries the same
+  text plus an image chip and is dropped the moment the transcript catches up. Sending the
+  same text twice still produces two bubbles.
+- 画像を添付した発話がチャットビューで二重に表示される問題を修正（#746）。楽観 echo
+  （transcript が追いつくまで見せる吹き出し）が**生の TUI 入力行**を持っていたため、
+  claude の内部表記 `[Image #13]` が入ったままだった。transcript 側は同じ発話を
+  マーカー除去済みで持つので突き合わせが必ず外れ、echo が本物の吹き出しの隣に最長
+  45 秒残り、「送信待ち」ラベルのまま内部表記を本文の一部のように見せていた。echo を
+  **transcript とまったく同じ分類器**へ通すようにしたので、本文と画像チップが本物と
+  一致し、transcript が追いついた時点で消える。同じ文面を 2 回送れば従来どおり
+  吹き出しは 2 個出る。
+
 ## [0.6.4] - 2026-08-02
 
 Nightly patch release (automated). Changes since v0.6.3:

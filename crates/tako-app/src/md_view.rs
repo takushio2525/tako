@@ -560,6 +560,40 @@ fn list_marker(
     }
 }
 
+/// 表セル 1 個の実描画サイズ（`TextLayout::bounds` の幅・高さ）。
+/// 判定を GPUI 非依存の素の数値にしておき、単体テストから同じ規則を検査する
+#[cfg(any(test, feature = "visual-test"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MdCellBox {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// 表セルが「入る幅があるのに折り返された」= #745 の崩れかを判定する（純関数）。
+///
+/// 判定の根拠は 2 本立て:
+///
+/// 1. **絶対**: 折り返しているのにセル幅が 1 行の高さ（≒ 全角 1 文字ぶん）より
+///    狭い。列ごと潰れた場合（列の最大幅そのものが 1 文字）はこれで捕まる
+/// 2. **相対**: 折り返しているのに、**同じ列の一番広いセル**より目に見えて狭い。
+///    列の取り分は行をまたいで同じなので、折り返したセルは列幅をほぼ使い切って
+///    いなければおかしい。#745 の実測（同一幅 478px）では同じ列で
+///    「幅 0 で 11 行」のセルと「幅 181 で 2 行」のセルが並んでいた
+///
+/// `column_width` はその列で実描画された幅の最大値、`line_height` は 1 行の高さ。
+#[cfg(any(test, feature = "visual-test"))]
+pub(crate) fn md_table_cell_collapsed(
+    cell: MdCellBox,
+    column_width: f32,
+    line_height: f32,
+) -> bool {
+    // 1 行に収まっているセルは（列より広くて溢れていても）折り返しの崩れではない
+    if cell.height <= line_height * 1.5 {
+        return false;
+    }
+    cell.width < line_height || cell.width < column_width * 0.9
+}
+
 /// GFM テーブルを罫線つきグリッドで描く（Issue #656）。
 /// セル 1 つが 1 行なので、受け皿の呼び出し順はヘッダ → 各行の行優先順になる
 fn render_table(
@@ -908,6 +942,30 @@ mod tests {
         assert_eq!(sink.rows[0].3, Some(FontWeight::BOLD), "ヘッダは太字");
         assert_eq!(sink.rows[4].0, "", "欠けたセルは空文字で埋まる");
         assert_eq!(sink.rows[3].3, None, "本文は太字にしない");
+    }
+
+    /// 表セルの「入る幅があるのに折り返した」判定（#745）。
+    /// 数値は実測値そのままで、修正前後の両方を固定する
+    #[test]
+    fn 表セルの潰れ判定は実測値を切り分ける() {
+        let lh = 19.5;
+        let cell = |width: f32, height: f32| MdCellBox { width, height };
+        // #745 修正前（同一ペイン幅 478px・列の最大幅 181）:
+        // 「入力欄のテキスト重なり」が幅 0 で 11 行、「IME の位置ズレ」が幅 0 で 9 行
+        assert!(md_table_cell_collapsed(cell(0.0, 214.5), 181.0, lh));
+        assert!(md_table_cell_collapsed(cell(0.0, 175.5), 181.0, lh));
+        // 同じ列で正しく折り返していたセルは崩れではない
+        assert!(!md_table_cell_collapsed(cell(181.0, 39.0), 181.0, lh));
+        // #745 修正後: 自然幅で 1 行に収まったセル（幅は列最大より狭い）
+        assert!(!md_table_cell_collapsed(cell(143.0, 19.5), 181.0, lh));
+        assert!(!md_table_cell_collapsed(cell(97.0, 19.5), 181.0, lh));
+        // 狭幅（share=0.3 / 0.22 の実測）: 列幅を使い切って折り返している
+        assert!(!md_table_cell_collapsed(cell(91.0, 39.0), 91.0, lh));
+        assert!(!md_table_cell_collapsed(cell(52.5, 58.5), 52.5, lh));
+        // 列ごと 1 文字幅に潰れた場合（列最大も 17px）は絶対条件で捕まえる
+        assert!(md_table_cell_collapsed(cell(17.0, 39.0), 17.0, lh));
+        // 折り返せない長い単語で列より広く 1 行に出たセルは崩れではない
+        assert!(!md_table_cell_collapsed(cell(260.0, 19.5), 91.0, lh));
     }
 
     /// 罫線は spacer として通知され、コードブロックは出現順の番号で装飾を求める
