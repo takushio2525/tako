@@ -23,6 +23,28 @@ Nightly patch release (automated). Changes since v0.6.4:
 
 ### Added / 追加
 
+- Automatic master handoff (#749): when the master's context usage crosses the threshold
+  (default 60%, settable per profile between 50% and 60%), tako tells the master to hand
+  over — no user action needed. The master refreshes its handoff file and calls
+  `tako_orchestrator_handoff`; the successor starts in the same tab with the same role and
+  profile, cross-checks the handoff file against reality, verifies that no undelivered user
+  instruction is sitting in the predecessor's input box, and only then closes the
+  predecessor's pane. The call itself never closes the old pane, so a failed successor
+  launch cannot leave you without a master. `/compact` is deliberately not automated —
+  it makes the conversation lose its thread. Configure with
+  `tako orchestrator profiles set <name> --ctx-threshold 55` / `--auto-handoff false`
+  (also in Settings → Profiles, and via `tako_orchestrator_profiles`); each nudge is
+  recorded in `<data_dir>/supervisor.log`.
+- master の自動ハンドオフ（#749）: master のコンテキスト使用率が閾値
+  （既定 60%。プロファイルごとに 50〜60% で設定可）を超えると、tako が master へ
+  引き継ぎ開始を指示する（ユーザーの操作は不要）。master は引き継ぎファイルを最新化して
+  `tako_orchestrator_handoff` を呼び、後任 master が同じタブ・同じ role・同じプロファイルで
+  立ち上がって引き継ぎファイルと実態を突き合わせ、**前任の入力欄にユーザーの未送達の指示が
+  残っていないかを確認してから**前任ペインを閉じる。呼び出し自体は前任を閉じないので、
+  後任の起動に失敗しても master を失わない。`/compact` の自動実行は「話が通じなくなる」ため
+  意図的に採らない。設定は `tako orchestrator profiles set <名前> --ctx-threshold 55` /
+  `--auto-handoff false`（設定画面 → プロファイル、MCP `tako_orchestrator_profiles` も同じ）。
+  送った記録は `<data_dir>/supervisor.log` に残る。
 - Chat view text selection and copy (#725): drag to select the conversation body and press
   ⌘C — the selection spans multiple messages, uses the same real-shaping hit test as the
   preview pane (so Japanese, bold, heading sizes and table cells all land where you click),

@@ -1031,6 +1031,39 @@ pub fn desc_prof_tab_naming() -> &'static str {
     )
 }
 
+pub fn prof_section_handoff() -> &'static str {
+    tr!("自動ハンドオフ", "Automatic handoff")
+}
+
+pub fn prof_label_ctx_threshold() -> &'static str {
+    tr!("引き継ぎ閾値", "Handoff threshold")
+}
+
+pub fn desc_prof_ctx_threshold() -> &'static str {
+    tr!(
+        "この ctx 使用率（%）を超えたら後任 master に引き継ぐ。50〜60、空欄 = 既定 60",
+        "Hand off to a successor master above this context usage (%). 50-60, empty = default 60"
+    )
+}
+
+pub fn prof_label_auto_handoff() -> &'static str {
+    tr!("引き継ぎを自動で促す", "Prompt for handoff automatically")
+}
+
+pub fn desc_prof_auto_handoff() -> &'static str {
+    tr!(
+        "閾値を超えたら tako が master へ引き継ぎ開始を指示する（OFF でも手動の引き継ぎは使える）",
+        "tako tells the master to start the handoff once the threshold is crossed (manual handoff still works when off)"
+    )
+}
+
+pub fn prof_ctx_threshold_range() -> &'static str {
+    tr!(
+        "引き継ぎ閾値は 50〜60 の数字で指定してください",
+        "The handoff threshold must be a number between 50 and 60"
+    )
+}
+
 pub fn prof_env_add() -> &'static str {
     tr!("追加", "Add")
 }
@@ -1294,6 +1327,12 @@ mod tests {
                 prof_effort_ignored().into(),
                 prof_label_tab_naming().into(),
                 desc_prof_tab_naming().into(),
+                prof_section_handoff().into(),
+                prof_label_ctx_threshold().into(),
+                desc_prof_ctx_threshold().into(),
+                prof_label_auto_handoff().into(),
+                desc_prof_auto_handoff().into(),
+                prof_ctx_threshold_range().into(),
                 prof_env_add().into(),
                 prof_env_masked().into(),
                 desc_prof_env().into(),

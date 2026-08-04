@@ -8,6 +8,7 @@ pub mod backend;
 pub mod byte_lru;
 pub mod command_card;
 pub mod git;
+pub mod handoff;
 pub mod header_layout;
 pub mod i18n;
 pub mod links;
@@ -51,6 +52,7 @@ pub use git::{
     GraphLayout, GraphLine, GraphRow, MergeKind, MergeOutcome, MergePreview, RepoOperation,
     COMMIT_MESSAGE_MAX, CONFLICT_BADGE, GRAPH_PALETTE,
 };
+pub use handoff::{NudgeDecision, NudgeInput, NudgeSkip};
 pub use header_layout::{truncate_path_middle, HeaderVisibility, PreviewHeaderVisibility};
 pub use links::{detect_links, detect_links_with_cwd, link_at, DetectedLink, LinkKind};
 pub use md_links::MdLink;

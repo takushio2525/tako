@@ -290,6 +290,28 @@ const QUEUE_STRANDED_TICKS: u8 = 3;
 /// #572: 1 ペインあたりの救出試行の上限（滞留が解けないときに叩き続けない）
 const QUEUE_RECOVERY_MAX: u8 = 5;
 
+/// #749: master ペインごとの自動ハンドオフ通知の追跡状態。
+/// 判定そのものは `tako_core::handoff::nudge_decision` が持つ（ここは観測値の保管だけ）
+#[derive(Debug)]
+struct HandoffNudgeTracker {
+    /// このペインを最初に観測した時刻（起動直後の猶予 NUDGE_GRACE の基準）
+    first_seen: std::time::Instant,
+    /// 最後にナッジを送った時刻
+    last_sent: Option<std::time::Instant>,
+    /// 送った回数
+    sent: u32,
+}
+
+impl HandoffNudgeTracker {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            first_seen: now,
+            last_sent: None,
+            sent: 0,
+        }
+    }
+}
+
 /// #572: キュー滞留の救出状態（ペインごと）
 #[derive(Debug, Default)]
 struct QueuedRecovery {
@@ -1215,6 +1237,12 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// master ペインごとの自動ハンドオフ通知の状態（Issue #749）。
+    /// 揮発（再起動でリセット = 復元直後の誤爆は NUDGE_GRACE が受け止める）
+    handoff_nudges: HashMap<PaneId, HandoffNudgeTracker>,
+    /// ctx 閾値・auto_handoff の解決結果のキャッシュ（プロファイル名 → 値）。
+    /// 2 秒 tick 毎に profiles/*.yaml + config.yaml を読むのを避ける（Issue #749）
+    handoff_policy_cache: HashMap<String, (std::time::Instant, u32, bool)>,
     /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
     codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
@@ -2601,6 +2629,8 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            handoff_nudges: HashMap::new(),
+            handoff_policy_cache: HashMap::new(),
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             lang_setting: {
@@ -3350,6 +3380,11 @@ impl TakoApp {
                         // 止まっていないかを見張り、見つけたら送り出す
                         let _s = tako_control::diag::perf_span("periodic_prep:queued_recovery");
                         app.drive_queued_message_recovery();
+                    }
+                    {
+                        // #749: master の ctx% が閾値を超えていたら引き継ぎを促す
+                        let _s = tako_control::diag::perf_span("periodic_prep:handoff_nudge");
+                        app.drive_handoff_nudge();
                     }
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
@@ -9154,6 +9189,108 @@ impl TakoApp {
                     self.usage_history.pop_front();
                 }
             }
+        }
+    }
+
+    /// ctx 閾値と auto_handoff を解決する（Issue #749）。
+    /// profiles/*.yaml + config.yaml の読み取りは 30 秒 TTL でキャッシュし、
+    /// 2 秒 tick 毎のファイル I/O を避ける（設定変更は次の TTL 切れで反映される）
+    fn handoff_policy_for(&mut self, profile: &str) -> (u32, bool) {
+        const TTL: Duration = Duration::from_secs(30);
+        let now = std::time::Instant::now();
+        if let Some((at, threshold, auto)) = self.handoff_policy_cache.get(profile) {
+            if now.duration_since(*at) < TTL {
+                return (*threshold, *auto);
+            }
+        }
+        let (resolved, auto) = tako_control::orchestrator::handoff_policy_for(profile);
+        self.handoff_policy_cache
+            .insert(profile.to_string(), (now, resolved.value, auto));
+        (resolved.value, auto)
+    }
+
+    /// master の自動ハンドオフ通知（Issue #749）。
+    ///
+    /// 閾値超過を master が「気づく」ことに任せず、tako が気づいて促す。
+    /// ctx% は画面（TUI フッター）由来なので `claude agents --json` を叩かずに済み、
+    /// 追加のポーリングコストはゼロ。判定は tako-core の純粋関数が持つ
+    fn drive_handoff_nudge(&mut self) {
+        use tako_core::handoff;
+
+        // 対象 master ペインの収集（role が orchestrator-master のもの）。
+        // handoff 済み判定は「このペインを spawned_by に持つ master ペインがある」で導く
+        // （新 master が立っている = すでに引き継ぎが動いている）
+        let mut masters: Vec<(PaneId, String)> = Vec::new();
+        let mut successor_of: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+        for tab in self.workspace.tabs() {
+            for pane in tab.tree().panes() {
+                let Some(role) = pane.role() else { continue };
+                if handoff::master_profile_of_role(role).is_none() {
+                    continue;
+                }
+                if let Some(parent) = pane.spawned_by() {
+                    successor_of.insert(parent);
+                }
+                masters.push((pane.id(), role.to_string()));
+            }
+        }
+        // 消えたペインの追跡状態を掃除する（ペイン ID 再利用で誤って黙らないように）
+        let alive: std::collections::HashSet<PaneId> = masters.iter().map(|(id, _)| *id).collect();
+        self.handoff_nudges.retain(|id, _| alive.contains(id));
+
+        let now = std::time::Instant::now();
+        for (pane_id, role) in masters {
+            let profile = handoff::master_profile_of_role(&role)
+                .expect("収集時に master だけを残している")
+                .to_string();
+            let ctx_percent = self
+                .terminals
+                .get(&pane_id)
+                .and_then(|s| s.agent_metrics())
+                .and_then(|m| m.ctx_percent);
+            let tracker = self
+                .handoff_nudges
+                .entry(pane_id)
+                .or_insert_with(|| HandoffNudgeTracker::new(now));
+            let pane_age = now.duration_since(tracker.first_seen);
+            let since_last_nudge = tracker.last_sent.map(|t| now.duration_since(t));
+            let sent_count = tracker.sent;
+
+            // 設定ファイルを読むのは「発動しうる ctx%」のときだけ。閾値の下限を下回って
+            // いれば、どんな設定でも超過にはならないので I/O ごと省く（通常運転では
+            // ここで抜けるので 2 秒 tick に yaml 読みがぶら下がらない。NFR-8）
+            let Some(pct) = ctx_percent else { continue };
+            if pct < handoff::CTX_THRESHOLD_MIN {
+                continue;
+            }
+            let (threshold, auto_handoff) = self.handoff_policy_for(&profile);
+            let decision = handoff::nudge_decision(&handoff::NudgeInput {
+                auto_handoff,
+                ctx_percent: Some(pct),
+                threshold,
+                pane_age,
+                since_last_nudge,
+                sent_count,
+                handoff_started: successor_of.contains(&pane_id),
+            });
+            if !decision.should_send() {
+                continue;
+            }
+            let handoff_path =
+                tako_control::orchestrator::handoff_path(&profile).map(|p| p.display().to_string());
+            let prompt = handoff::nudge_prompt(pct, threshold, handoff_path.as_deref());
+            self.queue_prompt_flow(pane_id, prompt);
+            if let Some(tracker) = self.handoff_nudges.get_mut(&pane_id) {
+                tracker.last_sent = Some(now);
+                tracker.sent += 1;
+            }
+            // 黙って動かさない（#401 の監査ログと同じ場所へ残す）
+            tako_control::orchestrator::supervisor::audit_log(
+                &format!("master:{profile}"),
+                pane_id.as_u64(),
+                "ctx_handoff_nudge",
+                &format!("ctx={pct}% threshold={threshold}% count={}", sent_count + 1),
+            );
         }
     }
 
@@ -34823,6 +34960,10 @@ mod self_test {
                     clear_master_account: false,
                     worker_account: None,
                     clear_worker_account: false,
+                    ctx_threshold: None,
+                    clear_ctx_threshold: false,
+                    auto_handoff: None,
+                    clear_auto_handoff: false,
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
                     window
@@ -35926,6 +36067,10 @@ mod self_test {
                         clear_master_account: false,
                         worker_account: None,
                         clear_worker_account: false,
+                        ctx_threshold: None,
+                        clear_ctx_threshold: false,
+                        auto_handoff: None,
+                        clear_auto_handoff: false,
                     }
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
@@ -36556,6 +36701,426 @@ mod self_test {
                     );
                     app.ui_mode = UiMode::Terminal;
                     app.chat_echo.clear();
+                    cx.notify();
+                });
+            }
+
+            // 101. master の自動ハンドオフ通知（#749）。
+            // この機能の危険は「必要なときに黙っている」と「余計なときに喋る」の両方なので、
+            // 送る / 送らないを実画面 + 実 dispatch で両方見る:
+            // (a) 閾値超過で【tako 自動通知】が master ペインへ積まれる（本文に実数値と手順）
+            // (b) 同じ状態でもう一度呼んでも二重に積まない（再送間隔）
+            // (c) 同じ画面で閾値を上げ下げすると送る / 黙るが切り替わる（受け入れ 2）
+            // (d) auto_handoff=false で黙る
+            // (e) role が master でないペインには一切送らない
+            // (f) すでに後任が立っている（handoff 済み）なら送らない
+            // (g) orchestrator self が同じ閾値・出どころ・auto_handoff を返す
+            {
+                use tako_control::protocol::Request as Req;
+                let probe = "_st749_";
+
+                let profiles_req = |threshold: Option<u32>, auto: Option<bool>, action: &str| {
+                    Req::OrchestratorProfiles {
+                        action: action.into(),
+                        name: Some(probe.into()),
+                        kind: Some("master".into()),
+                        from: None,
+                        projects: None,
+                        clear_projects: false,
+                        master_agent: None,
+                        clear_master_agent: false,
+                        model: None,
+                        worker_model: None,
+                        effort: None,
+                        worker_effort: None,
+                        clear_model: false,
+                        clear_worker_model: false,
+                        worker_agent: None,
+                        clear_worker_agent: false,
+                        agent: None,
+                        agent_model: None,
+                        clear_agent_model: false,
+                        agent_effort: None,
+                        clear_agent_effort: false,
+                        agent_skip_permissions: None,
+                        agent_args: None,
+                        worker_model_policy: None,
+                        tab_naming_convention: None,
+                        env_set: None,
+                        env_unset: None,
+                        master_account: None,
+                        clear_master_account: false,
+                        worker_account: None,
+                        clear_worker_account: false,
+                        ctx_threshold: threshold,
+                        clear_ctx_threshold: false,
+                        auto_handoff: auto,
+                        clear_auto_handoff: false,
+                    }
+                };
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                // handoff ファイルを用意する（ナッジ本文に出るパスの検証にも使う）
+                let handoff_path = tako_control::orchestrator::handoff_path(probe);
+                if let Some(ref path) = handoff_path {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(path, "## 状態\nselftest 749\n");
+                }
+                fire(profiles_req(Some(50), Some(true), "set"), cx);
+
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#749: 基準ペインの取得")
+                };
+                let make_pane = |cx: &mut AsyncApp,
+                                 from: PaneId,
+                                 dir,
+                                 command: Option<Vec<String>>| {
+                    window
+                        .update(cx, |app, _, cx| {
+                            let pane = tako_control::dispatch(
+                                app,
+                                Req::Split {
+                                    pane: Some(from.as_u64()),
+                                    tab: None,
+                                    direction: Some(dir),
+                                    ratio: None,
+                                    command,
+                                    cwd: None,
+                                    focus: Some(false),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["pane"].as_u64())
+                            .map(PaneId::from_raw);
+                            for (p, options) in std::mem::take(&mut app.pending_attach) {
+                                if app.spawn_session(p, options, cx).is_err() {
+                                    app.remove_pane(p, cx);
+                                }
+                            }
+                            pane
+                        })
+                        .ok()
+                        .flatten()
+                };
+                // claude TUI のフッターは**ペイン自身のコマンド**として描く。シェルへ
+                // 打ち込む形は起動が間に合わず取りこぼす（実測でここがフレークした）。
+                // `agent_metrics` は画面の末尾 8 行しか走査しないので、先に改行でグリッドを
+                // 流してフッターを最下部へ置く（`clear` は最上段に出てしまうので使えない）。
+                // 55% にするのは設定可能な値域（50〜60）の**内側**だから: 閾値 50 なら超過 /
+                // 60 なら未達 になり、1 枚の画面で送る / 黙るの両方向を測れる。
+                // 末尾の sleep は次の行（プロンプト等）で上書きされないための保持
+                let filler = "\\n".repeat(60);
+                let fixture = format!(
+                    "printf '%b' '{filler} Auto  5h 12%   ctx 55% ....  110K/200K\\n'; sleep 120"
+                );
+                let Some(master_pane) = make_pane(
+                    cx,
+                    anchor,
+                    tako_control::protocol::Direction::Down,
+                    Some(vec!["/bin/sh".into(), "-c".into(), fixture]),
+                ) else {
+                    fail("#749: 検証用ペインの作成")
+                };
+                let set_role = |cx: &mut AsyncApp, pane: PaneId, role: String| {
+                    window
+                        .update(cx, |app, _, _| {
+                            if let Some(obj) =
+                                app.workspace.active_tab_mut().tree_mut().get_mut(pane)
+                            {
+                                obj.set_role(if role.is_empty() { None } else { Some(role) });
+                            }
+                        })
+                        .ok();
+                };
+                set_role(cx, master_pane, format!("orchestrator-master:{probe}"));
+
+                // 画面から ctx% が読めるまで待つ（以降の判定の前提。固定待ちにしない）
+                let mut seen = None;
+                for _ in 0..30 {
+                    wait(cx, 300).await;
+                    seen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&master_pane)
+                                .and_then(|s| s.agent_metrics())
+                                .and_then(|m| m.ctx_percent)
+                        })
+                        .ok()
+                        .flatten();
+                    if seen == Some(55) {
+                        break;
+                    }
+                }
+                if seen != Some(55) {
+                    fail(&format!("#749: 画面から ctx% を読めない: {seen:?}"));
+                }
+
+                // NUDGE_GRACE（起動直後の猶予）を待たずに検査するため、観測開始時刻を
+                // さかのぼらせる。判定そのものは tako-core の純粋関数なので触らない
+                let probe_nudge = |cx: &mut AsyncApp| -> Vec<String> {
+                    window
+                        .update(cx, |app, _, _| {
+                            let old = std::time::Instant::now()
+                                - tako_core::handoff::NUDGE_GRACE
+                                - Duration::from_secs(10);
+                            app.handoff_nudges
+                                .insert(master_pane, HandoffNudgeTracker::new(old));
+                            app.handoff_policy_cache.clear();
+                            app.prompt_flows.clear();
+                            app.drive_handoff_nudge();
+                            app.prompt_flows
+                                .iter()
+                                .filter(|f| f.pane == master_pane)
+                                .map(|f| f.prompt.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+
+                // (a) 閾値 50 / 画面 55% → 積まれる
+                let sent = probe_nudge(cx);
+                if sent.len() != 1 {
+                    fail(&format!("#749 (a): ナッジが 1 本積まれない: {}", sent.len()));
+                }
+                let text = sent[0].clone();
+                for needle in ["55", "50", "tako_orchestrator_handoff"] {
+                    if !text.contains(needle) {
+                        fail(&format!("#749 (a): ナッジ本文に {needle} が無い: {text}"));
+                    }
+                }
+                if let Some(ref path) = handoff_path {
+                    if !text.contains(&path.display().to_string()) {
+                        fail("#749 (a): ナッジ本文に handoff ファイルのパスが無い");
+                    }
+                }
+
+                // (b) 続けて呼んでも二重に積まない（再送間隔。backdate せず素で呼ぶ）
+                let again = window
+                    .update(cx, |app, _, _| {
+                        app.prompt_flows.clear();
+                        app.drive_handoff_nudge();
+                        app.prompt_flows
+                            .iter()
+                            .filter(|f| f.pane == master_pane)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if again != 0 {
+                    fail("#749 (b): 再送間隔を無視して二重に積んだ");
+                }
+
+                // (c) 同じ画面（55%）のまま閾値だけ動かす: 60 → 黙る / 50 → 送る
+                //     （受け入れ 2 = 閾値設定が発動判定に効くことの直接検証）
+                fire(profiles_req(Some(60), None, "set"), cx);
+                if !probe_nudge(cx).is_empty() {
+                    fail("#749 (c): 閾値 60 / 画面 55% で送ってしまった");
+                }
+                fire(profiles_req(Some(50), None, "set"), cx);
+                if probe_nudge(cx).len() != 1 {
+                    fail("#749 (c): 閾値 50 / 画面 55% で送らなかった");
+                }
+
+                // (d) auto_handoff=false で黙る
+                fire(profiles_req(None, Some(false), "set"), cx);
+                if !probe_nudge(cx).is_empty() {
+                    fail("#749 (d): auto_handoff=false でも送った");
+                }
+                fire(profiles_req(None, Some(true), "set"), cx);
+
+                // (e) role を外すと対象から消える（ユーザーのペインには送らない）
+                set_role(cx, master_pane, String::new());
+                if !probe_nudge(cx).is_empty() {
+                    fail("#749 (e): master 以外のペインへ送った");
+                }
+                set_role(cx, master_pane, format!("orchestrator-master:{probe}"));
+
+                // (f) 後任 master が立っていれば送らない（spawned_by で導出）
+                let successor = make_pane(
+                    cx,
+                    master_pane,
+                    tako_control::protocol::Direction::Right,
+                    None,
+                );
+                if let Some(p) = successor {
+                    let _ = window.update(cx, |app, _, _| {
+                        if let Some(obj) = app.workspace.active_tab_mut().tree_mut().get_mut(p) {
+                            obj.set_role(Some(format!("orchestrator-master:{probe}")));
+                            obj.set_spawned_by(Some(master_pane));
+                        }
+                    });
+                }
+                if !probe_nudge(cx).is_empty() {
+                    fail("#749 (f): 後任がいるのに前任へ送った");
+                }
+
+                // (g) orchestrator self が同じ閾値と出どころを返す
+                match fire(
+                    Req::OrchestratorSelf {
+                        pane: Some(master_pane.as_u64()),
+                        caller_role: Some(format!("master:{probe}")),
+                        caller_pid: None,
+                    },
+                    cx,
+                ) {
+                    Some(v) => {
+                        if v["ctx_threshold"].as_u64() != Some(50) {
+                            fail(&format!("#749 (g): self の閾値が 50 でない: {v}"));
+                        }
+                        if v["ctx_threshold_source"].as_str() != Some("profile") {
+                            fail(&format!("#749 (g): 閾値の出どころが profile でない: {v}"));
+                        }
+                        if v["auto_handoff"].as_bool() != Some(true) {
+                            fail(&format!("#749 (g): auto_handoff が true でない: {v}"));
+                        }
+                        if !v["handoff_exists"].as_bool().unwrap_or(false) {
+                            fail(&format!("#749 (g): handoff_exists が false: {v}"));
+                        }
+                    }
+                    None => fail("#749 (g): orchestrator self が失敗"),
+                }
+
+                // 101c.（任意・TAKO_SELF_TEST_CLAUDE=1 のときだけ）**実 claude** で
+                //      引き継ぎの通し: 閾値超過を模擬した前任 → handoff → 後任が起動して
+                //      引き継ぎファイルを読み実態を突き合わせ → 前任ペインを閉じる。
+                //      claude CLI + 認証 + tmux が要るので既定ではスキップする（#749 受け入れ 1）
+                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() {
+                    // 引き継ぎファイルへ目印を入れる（後任が読んだことを画面で確認するため）
+                    if let Some(ref path) = handoff_path {
+                        let _ = std::fs::write(
+                            path,
+                            "## 引き継ぎ（セルフテスト）\n\
+                             - 目印: TAKO749-HANDOFF-MARKER\n\
+                             - 進行中タスク: なし（この引き継ぎの検証のみ）\n\
+                             - spawn 済み worker: なし\n\
+                             - 次の一手: 引き継ぎを確認したら手順どおり前任ペインを閉じる\n",
+                        );
+                    }
+                    // 前任は「閾値超過を模擬した ctx 55% の master ペイン」（上で作ったもの）
+                    let handoff = fire(
+                        Req::OrchestratorHandoff {
+                            pane: Some(master_pane.as_u64()),
+                            caller_role: Some(format!("master:{probe}")),
+                            tab: None,
+                            caller_pid: None,
+                        },
+                        cx,
+                    );
+                    let Some(handoff) = handoff else {
+                        fail("#749 (101c): handoff が失敗した")
+                    };
+                    if handoff["previous_master_pane_id"].as_u64() != Some(master_pane.as_u64()) {
+                        fail(&format!("#749 (101c): 退役対象が前任でない: {handoff}"));
+                    }
+                    let Some(new_pane) = handoff["new_master_pane_id"].as_u64().map(PaneId::from_raw)
+                    else {
+                        fail("#749 (101c): 後任のペイン ID が取れない")
+                    };
+                    // dispatch が積んだ attach を実行する（セルフテストは自前で drain する）
+                    let _ = window.update(cx, |app, _, cx| {
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                    });
+
+                    // 後任の起動 → 引き継ぎ読了 → 前任 close を待つ。
+                    // 実 LLM の判断が入るので長めに待ち、信頼ダイアログは承諾しておく
+                    let mut closed = false;
+                    let mut saw_marker = false;
+                    let mut saw_done = false;
+                    for _ in 0..600 {
+                        let (c, m, d) = window
+                            .update(cx, |app, _, _| {
+                                let lines = app
+                                    .terminals
+                                    .get(&new_pane)
+                                    .map(|s| s.visible_lines())
+                                    .unwrap_or_default();
+                                if lines.iter().any(|l| {
+                                    l.contains("trust this folder") || l.contains("Yes, I trust")
+                                }) {
+                                    if let Some(session) = app.terminals.get(&new_pane) {
+                                        session.write(b"\r".to_vec());
+                                    }
+                                }
+                                let joined = lines.join("\n");
+                                let gone = app
+                                    .workspace
+                                    .tabs()
+                                    .iter()
+                                    .all(|t| t.tree().get(master_pane).is_none());
+                                (
+                                    gone,
+                                    joined.contains("TAKO749-HANDOFF-MARKER"),
+                                    joined.contains("引き継ぎ完了")
+                                        || joined.to_lowercase().contains("handoff complete"),
+                                )
+                            })
+                            .unwrap_or((false, false, false));
+                        saw_marker |= m;
+                        saw_done |= d;
+                        closed = c;
+                        if closed {
+                            break;
+                        }
+                        wait(cx, 500).await;
+                    }
+                    println!(
+                        "101c-CLAUDE: closed={closed} saw_marker={saw_marker} saw_done={saw_done}"
+                    );
+                    check(
+                        closed,
+                        "101c: 後任 master が引き継ぎ確認後に前任ペインを閉じる (#749)",
+                    );
+                    // 後任は後片付けで閉じる（前任はもう閉じられている）
+                    for _ in 0..3 {
+                        let _ = window.update(cx, |app, _, _| {
+                            if let Some(session) = app.terminals.get(&new_pane) {
+                                session.write(b"\x03".to_vec());
+                            }
+                        });
+                        wait(cx, 500).await;
+                    }
+                    fire(
+                        Req::Close {
+                            pane: Some(new_pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        cx,
+                    );
+                }
+
+                // 後片付け（プロファイル・handoff ファイル・検証用ペイン）
+                fire(profiles_req(None, None, "delete"), cx);
+                if let Some(ref path) = handoff_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                for pane in [successor, Some(master_pane)].into_iter().flatten() {
+                    fire(
+                        Req::Close {
+                            pane: Some(pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        cx,
+                    );
+                }
+                let _ = window.update(cx, |app, _, cx| {
+                    app.handoff_nudges.clear();
+                    app.handoff_policy_cache.clear();
+                    app.prompt_flows.clear();
                     cx.notify();
                 });
             }

@@ -198,6 +198,11 @@ tako orchestrator profiles set default --clear-worker-agent   # claude 既定へ
 # master のエージェント種別（#127。model / effort はそのエージェントのネイティブ表記で）
 tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
 tako orchestrator profiles set sol --clear-master-agent       # claude 既定へ戻す
+
+# 自動ハンドオフ（#749。閾値は 50〜60。範囲外はエラー）
+tako orchestrator profiles set default --ctx-threshold 55
+tako orchestrator profiles set default --auto-handoff false   # 自動通知だけ止める
+tako orchestrator profiles set default --clear-ctx-threshold   # config.yaml → 既定 60 へ
 ```
 
 MCP からは `tako_orchestrator_profiles`（action: list / show / set。master_agent /
@@ -388,12 +393,46 @@ master（または任意の claude エージェント）から使える MCP ツ�
 | ツール | 説明 |
 |---|---|
 | `tako_orchestrator_projects` | プロジェクト管理（list / add / remove） |
-| `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除） |
+| `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除、ctx_threshold / auto_handoff（#749）） |
+| `tako_orchestrator_self` | 自分の pane / tab / ctx% / 引き継ぎ閾値の取得（`ctx_over_threshold` が true なら引き継ぎ時） |
+| `tako_orchestrator_handoff` | 後任 master への引き継ぎ（handoff ファイルを読んで spawn。前任ペインは後任が閉じる） |
 | `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択） |
 | `tako_orchestrator_worker_status` | worker の状態確認（codex / agy は画面推定。異常停止は status=error + error.kind / recommended_action（#157）。停滞は status=stalled + stalled.detail / recommended_action（#224）。has_running_children / collapsed フラグ付き） |
 
 既存の tako MCP ツール（`tako_read_pane` / `tako_send_input` / `tako_close_pane` 等）
 と組み合わせて worker のライフサイクルを管理する。
+
+## master の自動ハンドオフ（Issue #749）
+
+master のコンテキストが埋まると判断が劣化する。tako は `/compact` を自動実行せず
+（会話の文脈が飛んで「話が通じなくなる」）、**新しい master へ乗り換える**。
+
+流れは 4 手で、**ユーザーは何もしなくてよい**:
+
+1. tako が master ペインの ctx% を見張り、閾値（既定 60%・50〜60% で設定可）を
+   超えたら `【tako 自動通知】…` をそのペインへ送る
+2. master が引き継ぎファイル（`<data_dir>/orchestrator/handoff/<プロファイル>.md`）を
+   今の状況で上書きし、`tako_orchestrator_handoff` を呼ぶ
+3. 後任 master が同じタブ・同じ role・同じプロファイルで立ち上がり、引き継ぎファイルと
+   実態（`tako_orchestrator_workers` / `tako_list_panes`）を突き合わせて「引き継ぎ完了」を報告する
+4. 後任が前任ペインの入力欄を確認（ユーザーの未送達の指示が残っていないか）してから
+   前任ペインを閉じる
+
+**閉じるのは後任だけ**なので、後任の起動に失敗しても前任の master は失われない。
+
+```bash
+# 今の閾値と超過状態を見る（master 自身が使う）
+tako orchestrator self
+
+# 閾値を 55% に下げる（プロファイル単位）
+tako orchestrator profiles set default --ctx-threshold 55
+
+# 自動通知を止める（手動の tako orchestrator handoff は使える）
+tako orchestrator profiles set default --auto-handoff false
+```
+
+自動通知を送った記録は `<data_dir>/supervisor.log` に残る（`action=ctx_handoff_nudge`）。
+GUI からは設定画面（⌘,）→ プロファイル → 「自動ハンドオフ」でも同じ設定を変えられる。
 
 ## 品質パイプライン（全プロファイル共通）
 
