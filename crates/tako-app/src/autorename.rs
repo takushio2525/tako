@@ -12,6 +12,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -23,8 +24,18 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DEBOUNCE: Duration = Duration::from_secs(4);
 /// 同じタブへの連続発火を抑える最小間隔（claude 呼び出しの浪費防止）
 const COOLDOWN: Duration = Duration::from_secs(30);
-/// claude 子プロセスの待ち時間上限（超過は kill してヒューリスティックへ）
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(30);
+/// claude 子プロセスの待ち時間上限（超過は kill してヒューリスティックへ）。
+///
+/// #722 の実測（Windows 11・claude 実呼び出し・この関数と同じ起動形）で 30 秒では足りないと
+/// 判明したので広げた。**アイドル状態でも 19.8 / 25.2 / 31.0 秒**（起動そのものは 0.5 秒なので
+/// 待ち時間の大半は応答待ち）で 3 回に 1 回は 30 秒を超え、release ビルド並走のような
+/// 高負荷では 60 秒でも足りなかった。上限に張り付くと「AI 命名が黙って
+/// ヒューリスティックへ落ちる」= #722 と見分けの付かない症状になる。
+///
+/// 呼び出しはバックグラウンドスレッドで、同じタブへは [`COOLDOWN`] 以内に再発火しない。
+/// 伸ばして困るのは「claude が本当にハングしたとき検知ループが止まる時間」だけなので、
+/// 取りこぼしを無くす側へ倒す
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 安価・高速なモデルを固定で使う（FR-2.12.2）
 const MODEL: &str = "claude-haiku-4-5-20251001";
 /// プロンプトに含めるペイン末尾の行数と 1 行の最大文字数
@@ -132,52 +143,91 @@ pub fn fingerprint<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
+/// 診断出力（`TAKO_AUTORENAME_DIAG=1` のときだけ）。
+///
+/// この機能の失敗は全部「黙ってヒューリスティックへ落ちる」形で出る。#722 は
+/// claude が解決できていないせいだったが、それを突き止めるのに毎回ビルドし直す
+/// 羽目になった（タイムアウト超過・非ゼロ終了・パース失敗が外から見分けられない）。
+///
+/// **中身は絶対に出さない**（プロンプト・claude の出力・画面末尾はペイン内容そのもの。
+/// 診断ログへ出さないのは AGENTS.md の絶対ルール）。出すのは解決したパス・終了コード・
+/// 所要時間・出力バイト数といったメタ情報だけ
+fn diag(args: std::fmt::Arguments<'_>) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("TAKO_AUTORENAME_DIAG").is_some()) {
+        eprintln!("[autorename] {args}");
+    }
+}
+
 /// 名前の生成。claude CLI があればプロンプト 1 本で生成し、
 /// 無い・失敗した場合はヒューリスティック命名へフォールバックする（FR-2.12.5）
 pub fn generate(materials: &TabMaterials) -> RenamePlan {
     if let Some(bin) = claude_bin() {
         if let Some(plan) = run_claude(bin, materials) {
+            diag(format_args!("tab {}: AI 命名を採用", materials.tab));
             return plan;
         }
+        diag(format_args!(
+            "tab {}: AI 命名に失敗 → ヒューリスティックへ",
+            materials.tab
+        ));
     }
     heuristic_plan(materials)
 }
 
 /// claude CLI の場所（プロセス内で 1 回だけ解決してキャッシュする）。
-/// GUI アプリの PATH は最小構成のため、ログインシェル経由でユーザーの PATH を引く
+/// 探索の作法は OS で違うので抽象境界 B16（`platform::exe`）に任せる
 pub fn claude_bin() -> Option<&'static Path> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BIN.get_or_init(detect_claude).as_deref()
+    BIN.get_or_init(|| {
+        let found = detect_claude();
+        match &found {
+            Some(p) => diag(format_args!("claude を解決: {}", p.display())),
+            None => diag(format_args!(
+                "claude を解決できない → 以後ヒューリスティック命名のみ（#722）"
+            )),
+        }
+        found
+    })
+    .as_deref()
 }
 
 fn detect_claude() -> Option<PathBuf> {
+    resolve_claude(
+        std::env::var_os("TAKO_SELF_TEST").is_some(),
+        std::env::var_os("TAKO_CLAUDE_BIN"),
+        &|| tako_core::platform::exe::find("claude"),
+        &|p| p.is_file(),
+    )
+}
+
+/// claude の解決手順（純粋関数。探索と実ファイル判定を注入して**両プラットフォームから
+/// テストできる**ようにしてある）。
+///
+/// 探索そのものは抽象境界 B16（`platform::exe`）に委ねる。**ここでログインシェル経由の
+/// `command -v claude` を直に叩いてはいけない**（#722）:
+/// Windows には `SHELL` も `/bin/sh` も無いため起動が失敗し、`Option` に化けて
+/// 静かに握り潰され、AI 命名が永久に無効化される（`claude_bin()` は `OnceLock`）。
+/// B16 なら macOS はログインシェル経由（`.app` の痩せた PATH 対策）、
+/// Windows は PATH + `PATHEXT` + ユーザー導入先の走査、と作法が分かれる
+fn resolve_claude(
+    self_test: bool,
+    explicit: Option<OsString>,
+    lookup: &dyn Fn() -> Option<String>,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     // セルフテスト中は実 LLM を呼ばない（ヒューリスティック経路のみ機械検証する）
-    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+    if self_test {
         return None;
     }
-    // 明示指定（検証・差し替え用）
-    if let Some(path) = std::env::var_os("TAKO_CLAUDE_BIN") {
+    // 明示指定（検証・差し替え用）。指定があるのに実在しないなら探索へ落とさず None
+    // ＝ 差し替えたつもりで本物が動く事故を防ぐ
+    if let Some(path) = explicit {
         let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
+        return is_file(&path).then_some(path);
     }
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    // #628: GUI プロセスからの起動なのでコンソールウィンドウを出させない
-    let output =
-        tako_core::platform::process::no_console_window(&mut std::process::Command::new(shell))
-            .args(["-l", "-c", "command -v claude"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let path = PathBuf::from(path);
-    path.is_file().then_some(path)
+    let path = PathBuf::from(lookup()?);
+    is_file(&path).then_some(path)
 }
 
 /// claude -p を 1 回叩いて応答をパースする。失敗（起動不可・タイムアウト・パース不能）は
@@ -187,14 +237,21 @@ fn run_claude(bin: &Path, materials: &TabMaterials) -> Option<RenamePlan> {
     use std::process::{Command, Stdio};
 
     let prompt = build_prompt(materials);
+    let started = Instant::now();
     // #586: GUI プロセスからの起動なので Windows でコンソールウィンドウを出させない
-    let mut child = tako_core::platform::process::no_console_window(&mut Command::new(bin))
+    let mut child = match tako_core::platform::process::no_console_window(&mut Command::new(bin))
         .args(["-p", "--model", MODEL])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            diag(format_args!("claude の起動に失敗: {e}"));
+            return None;
+        }
+    };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
         // drop で stdin が閉じ、-p は EOF までをプロンプトとして読む
@@ -209,11 +266,25 @@ fn run_claude(bin: &Path, materials: &TabMaterials) -> Option<RenamePlan> {
     let deadline = Instant::now() + CLAUDE_TIMEOUT;
     let finished = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    diag(format_args!(
+                        "claude が非ゼロ終了: code={:?} ({:.1}s)",
+                        status.code(),
+                        started.elapsed().as_secs_f32()
+                    ));
+                }
+                break status.success();
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(200));
             }
             _ => {
+                diag(format_args!(
+                    "claude を打ち切り: {:.1}s（上限 {}s）",
+                    started.elapsed().as_secs_f32(),
+                    CLAUDE_TIMEOUT.as_secs()
+                ));
                 let _ = child.kill();
                 let _ = child.wait();
                 break false;
@@ -224,7 +295,14 @@ fn run_claude(bin: &Path, materials: &TabMaterials) -> Option<RenamePlan> {
     if !finished {
         return None;
     }
-    parse_plan(&output, materials)
+    let plan = parse_plan(&output, materials);
+    diag(format_args!(
+        "claude 応答: {:.1}s / {} バイト / パース{}",
+        started.elapsed().as_secs_f32(),
+        output.len(),
+        if plan.is_some() { "成功" } else { "失敗" }
+    ));
+    plan
 }
 
 /// プロンプト 1 本（FR-2.12.2。判断・調整はすべてこの文面に閉じる）
@@ -455,6 +533,106 @@ mod tests {
         renamer.tick(&[(2, 200)], t0 + Duration::from_secs(1));
         assert!(!renamer.watches.contains_key(&1));
         assert!(renamer.watches.contains_key(&2));
+    }
+
+    /// #722: Windows で AI 命名が一度も走らなかったのは、この解決がログインシェル経由の
+    /// `command -v claude` 直呼びで、`SHELL` も `/bin/sh` も無い
+    /// Windows では起動に失敗して静かに `None` へ化けていたため。
+    /// 探索を B16 へ委ねたので、**この関数自身に OS 分岐が無い**ことを型で示す
+    #[test]
+    fn claudeの解決は探索結果をそのまま使い実在するものだけ返す() {
+        let found = |p: &'static str| move || Some(p.to_string());
+        let exists = |want: &'static str| move |p: &Path| p == Path::new(want);
+
+        // Windows のシム（.cmd）でも .exe でも、B16 が返した値をそのまま採る
+        let win = resolve_claude(
+            false,
+            None,
+            &found("C:\\Users\\u\\.local\\bin\\claude.exe"),
+            &exists("C:\\Users\\u\\.local\\bin\\claude.exe"),
+        );
+        assert_eq!(
+            win.as_deref(),
+            Some(Path::new("C:\\Users\\u\\.local\\bin\\claude.exe"))
+        );
+        let mac = resolve_claude(
+            false,
+            None,
+            &found("/opt/homebrew/bin/claude"),
+            &exists("/opt/homebrew/bin/claude"),
+        );
+        assert_eq!(mac.as_deref(), Some(Path::new("/opt/homebrew/bin/claude")));
+
+        // 探索が空振り（claude 未導入）→ None。呼び出し側はヒューリスティックへ落ちる
+        assert_eq!(resolve_claude(false, None, &|| None, &|_| true), None);
+        // 見つかったのに実ファイルでない（シェル関数・壊れたシム）も採らない
+        assert_eq!(
+            resolve_claude(false, None, &found("/opt/homebrew/bin/claude"), &|_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn セルフテストと明示指定は探索より先に効く() {
+        // セルフテスト中は実 LLM を呼ばない。探索すら走らせない
+        let looked_up = std::cell::Cell::new(false);
+        let plan = resolve_claude(
+            true,
+            Some(OsString::from("C:\\bin\\claude.exe")),
+            &|| {
+                looked_up.set(true);
+                None
+            },
+            &|_| true,
+        );
+        assert_eq!(plan, None);
+        assert!(!looked_up.get(), "セルフテスト中に探索を走らせない");
+
+        // 明示指定があれば探索しない
+        let explicit = resolve_claude(
+            false,
+            Some(OsString::from("/tmp/fake-claude")),
+            &|| panic!("明示指定があるのに探索した"),
+            &|_| true,
+        );
+        assert_eq!(explicit.as_deref(), Some(Path::new("/tmp/fake-claude")));
+
+        // 明示指定が実在しないときは探索へ落とさない
+        // （差し替えたつもりで本物の claude が動く事故を防ぐ）
+        let missing = resolve_claude(
+            false,
+            Some(OsString::from("/tmp/does-not-exist")),
+            &|| panic!("明示指定があるのに探索した"),
+            &|_| false,
+        );
+        assert_eq!(missing, None);
+    }
+
+    /// #722 の受け入れ 2: **実 claude を呼ぶ** e2e。AI 経路が実際に走り、
+    /// ヒューリスティックとは違う名前が返ることを確かめる。
+    /// 認証と課金が要るので既定では走らせない:
+    ///
+    /// ```text
+    /// cargo test -p tako-app --bin tako-app -- --ignored --nocapture ai命名
+    /// ```
+    #[test]
+    #[ignore = "実 claude CLI を呼ぶ（認証必須・課金あり）"]
+    fn ai命名が実claudeで走りヒューリスティックと異なる名前になる() {
+        let bin = claude_bin().expect("claude を解決できない（#722 の回帰）");
+        println!("解決した claude: {}", bin.display());
+        let m = materials();
+        let ai = generate(&m);
+        let heuristic = heuristic_plan(&m);
+        println!("AI 経路        = {ai:?}");
+        println!("ヒューリスティック = {heuristic:?}");
+        assert!(
+            ai.tab.is_some() || !ai.panes.is_empty(),
+            "名前が 1 つも返っていない"
+        );
+        assert_ne!(
+            ai, heuristic,
+            "AI 経路が走らずヒューリスティックへ落ちている（#722 の回帰）"
+        );
     }
 
     #[test]

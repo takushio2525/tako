@@ -243,12 +243,6 @@ pub mod notes {
         "Shell integration (OSC 7 / 133) ships only for zsh / bash / fish; there is no PowerShell \
          version. Pane cwd tracking and command state detection do not work",
     );
-    /// #525 と同根（claude バイナリの解決が POSIX シェル経由）。
-    /// 機能そのものは残り、命名の質だけが落ちるので Pending ではなく Degraded
-    pub const WIN_AUTO_RENAME_HEURISTIC: Note = Note::new(
-        "AI による命名は claude CLI の解決が Windows で効かないため働かず、ヒューリスティック命名にとどまる",
-        "AI naming does not run because the claude CLI cannot be resolved on Windows; naming falls back to heuristics",
-    );
     /// #528 の担当範囲
     pub const WIN_REMOTE: Note = Note::new(
         "remote トランスポートと Windows 配布系統が前提",
@@ -404,9 +398,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_auto_rename",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_AUTO_RENAME_HEURISTIC,
-        },
+        // #722 で claude の解決を B16 へ寄せ、AI 命名が Windows でも走るようになった。
+        // シェル統合が無い（#525）ぶん素材の osc_title は付かないが、cwd・実行状態・
+        // 画面末尾は同じように渡るので、命名の経路そのものは macOS と等価
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_background_kill",

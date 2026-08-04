@@ -433,6 +433,66 @@ fn pdfレンダラの直呼びが境界の外に残っていない() {
     );
 }
 
+/// **#722 の受け入れ**: 実行ファイルの探索（`$SHELL -l -c "command -v …"` / `which`）が、
+/// 抽象境界 B16 の外に残っていないこと。
+///
+/// この直呼びは **Windows で必ず失敗するのに `Option` へ化けて握り潰される**のが厄介で、
+/// 「機能が無い」ではなく「機能が黙って無効になる」形で現れる。#525 は `tako setup` が
+/// 全滅し、#722 は AI 自動命名が一度も走らなかった。どちらもエラーは一切出ていない。
+///
+/// 素の名前へフォールバックする実装（`CreateProcess` の PATH 探索に委ねる形）は
+/// Windows でも機能するので許可する。**握り潰す形だけ**を落とす。
+#[test]
+fn 実行ファイルの探索が境界の外に残っていない() {
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/tako-core/src/platform/exe.rs",
+            "境界 B16 の実装本体",
+        ),
+        (
+            "crates/tako-core/src/lib.rs",
+            "resolve_bin(): command -v 経路を #[cfg(unix)] で囲ったうえで素の名前へ\
+             フォールバックするので Windows でも解決できる（PATHEXT とユーザー導入先を\
+             見ないぶん B16 より弱いだけ）",
+        ),
+        (
+            "crates/tako-app/src/preview.rs",
+            "resolve_bin() と同型のヘルパー。理由も同じ（素の名前へフォールバックする）",
+        ),
+        (
+            "crates/tako-app/src/settings_window.rs",
+            "#726: 設定画面のエージェント CLI 検出が which 直呼びで Windows では常に未検出。\
+             既知の未修正箇所として固定する（直したらこの行を消す）",
+        ),
+        (
+            "crates/tako-control/src/stale_binary.rs",
+            "#726: stale binary 検知が which 直呼びで Windows では一度も発火しない。\
+             既知の未修正箇所として固定する（直したらこの行を消す）",
+        ),
+    ];
+    // 「探索して結果を受け取る」形だけを見る。ペインで実行させるシェルスクリプト片
+    // （`"if command -v tmux >/dev/null; then …"`）は別物なので、引用符の直後に
+    // `command -v` が来る形＝探索文字列そのものだけを対象にする
+    const PATTERNS: &[&str] = &[
+        "\"command -v ",
+        "Command::new(\"which\")",
+        "Command::new(\"where",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let src = root.join("crates").join(crate_dir).join("src");
+        collect_direct_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "実行ファイルの探索が境界の外にある:\n  {}\n\
+         → tako_core::platform::exe::find へ寄せてください（#525 / #722 / 設計 §2 の B16）",
+        offenders.join("\n  ")
+    );
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///
