@@ -1777,6 +1777,21 @@ mod tests {
                         "縦はアスペクト比どおり: got {pixels:?}, want ~{expected_h}"
                     );
                 }
+                // テキストレイヤが load() を通って PdfData まで届いている（#693）。
+                // 抽出関数の単体テストとは別に、**ロード経路の配線**をここで固定する
+                if crate::platform::pdf::capabilities().text_layer {
+                    let joined: String = data
+                        .text_layers
+                        .iter()
+                        .flatten()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        joined.contains("Page One") && joined.contains("Page Three"),
+                        "各ページのテキストが PdfData に載る: got {joined:?}"
+                    );
+                }
             }
             other => panic!("Pdf になる: {other:?}"),
         }
@@ -1877,9 +1892,15 @@ mod tests {
         std::fs::remove_dir_all(pdf_path.parent().unwrap()).ok();
     }
 
+    /// テキストレイヤを持つ環境（macOS = PDFKit / Windows = pdf-extract）で、
+    /// **同じ PDF から同じものが取れる**ことを確かめる（#693）。
+    /// 実装は別物なので、両方をこの 1 本で縛って挙動を揃える
     #[test]
-    #[cfg(target_os = "macos")]
     fn pdfテキストレイヤ抽出() {
+        if !crate::platform::pdf::capabilities().text_layer {
+            eprintln!("[skip] この環境には PDF のテキストレイヤが無い");
+            return;
+        }
         // 手動構築 PDF（英語テキストのみ）で extract_text_layers が動くか。
         // T* に使う leading は TL で明示する
         let pdf_path = write_test_pdf(
@@ -1890,7 +1911,7 @@ mod tests {
         let scratchpad = pdf_path.parent().unwrap().to_path_buf();
 
         let layers = crate::platform::pdf::extract_text_layers(&pdf_path, 1)
-            .expect("PDFKit のテキスト抽出は成功する");
+            .expect("テキスト抽出は成功する");
         assert_eq!(layers.len(), 1, "1 ページ分");
         let page = &layers[0];
         assert!(page.len() >= 2, "2 行のテキストがある: {page:?}");

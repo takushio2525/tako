@@ -27,6 +27,27 @@ pub struct PdfLink {
     pub target: PdfLinkTarget,
 }
 
+/// 外部リンクとして OS のハンドラへ渡してよい URL か（#693）。
+///
+/// PDF のリンク注釈は**文書の作者が握る入力**で、tako が開く PDF は論文や配布資料など
+/// 出所の様々なファイルになる。`follow_link` が中身をそのまま OS へ渡すと、文書側から
+/// 任意のスキーム（`file:` / `javascript:` / OS に登録された独自プロトコル）を
+/// 起動させられるので、外部リンクとして扱うのは **http / https だけ**に限る。
+///
+/// スキーム名の大文字小文字は区別しない（RFC 3986）。制御文字を含むものは受け取り側の
+/// パーサ次第で解釈が割れるので弾く。
+pub fn is_openable_url(url: &str) -> bool {
+    if url.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let lower = url.trim().to_ascii_lowercase();
+    // スキームだけで中身の無い URL は開いても意味がない
+    lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 /// ページごとのリンク一覧。ロード時に 1 回構築する。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PdfLinks {
@@ -91,5 +112,30 @@ mod tests {
         let links = PdfLinks::default();
         assert!(links.is_empty());
         assert_eq!(links.len(), 0);
+    }
+
+    /// 文書が指定したスキームをそのまま OS へ渡さない（#693）。
+    /// PDF は出所の様々なファイルなので、ここが緩いと文書に任意のハンドラを起動される
+    #[test]
+    fn 外部リンクはhttpとhttpsだけを開く() {
+        assert!(is_openable_url("https://example.com"));
+        assert!(is_openable_url("http://example.com/a?b=1&c=2#frag"));
+        // スキーム名の大文字小文字は区別しない
+        assert!(is_openable_url("HTTPS://example.com"));
+        assert!(is_openable_url("  https://example.com  "));
+
+        // 文書から起動されると危ないもの
+        assert!(!is_openable_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!is_openable_url("javascript:alert(1)"));
+        assert!(!is_openable_url("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_openable_url("ms-msdt:/id"));
+        assert!(!is_openable_url("mailto:someone@example.com"));
+        assert!(!is_openable_url("\\\\server\\share\\payload.exe"));
+
+        // 中身が無い / 相対 / 制御文字
+        assert!(!is_openable_url(""));
+        assert!(!is_openable_url("https://"));
+        assert!(!is_openable_url("../other.pdf"));
+        assert!(!is_openable_url("https://example.com\r\nX-Injected: 1"));
     }
 }
