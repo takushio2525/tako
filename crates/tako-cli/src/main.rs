@@ -1431,15 +1431,17 @@ enum OrchestratorCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
-    /// worker の permission ダイアログに応答する（#319）。
-    /// ダイアログ不在時はエラー（誤爆防止）
+    /// worker の選択肢ダイアログに応答する（#319 → #748 で permission 以外も対象）。
+    /// ダイアログ不在時はエラー（誤爆防止）。
+    /// `--choice` を省略すると**送信せず**選択肢の構造だけを表示する（下見）
     Respond {
         /// 対象ペイン ID
         #[arg(long)]
         pane: u64,
-        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+        /// 選択肢の番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致／
+        /// "yes"/"no" エイリアス。省略すると構造だけ表示する
         #[arg(long)]
-        choice: String,
+        choice: Option<String>,
     },
     /// worker の報告内容を取得する（scrollback 主 + transcript 補強。#364）
     Report {
@@ -3353,6 +3355,48 @@ fn orchestrator_watch(
                 }
             }
             println!("  action: respond");
+            print_events(&mut exec);
+        }
+        // #748: permission 以外の選択肢ダイアログ待ち。旧実装ではこの状態が
+        // WORKER_IDLE / WORKER_QUESTION として出ていたため、master は
+        // 「完了した」「本文で質問された」と読み違えていた
+        wait::WatchOutcome::ChoiceWaiting { choice_dialog } => {
+            let kind = choice_dialog
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("select");
+            println!("WORKER_DIALOG: tako:{pane} ({kind})");
+            if let Some(title) = choice_dialog.get("title").and_then(|v| v.as_str()) {
+                if !title.is_empty() {
+                    println!("  title: {title}");
+                }
+            }
+            if let Some(opts) = choice_dialog.get("options").and_then(|v| v.as_array()) {
+                for (i, opt) in opts.iter().enumerate() {
+                    let number = opt
+                        .get("number")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or((i + 1) as u64);
+                    let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                    let mark = if opt.get("highlighted").and_then(|v| v.as_bool()) == Some(true) {
+                        " ← 現在の選択"
+                    } else {
+                        ""
+                    };
+                    println!("  {number}. {label}{mark}");
+                }
+            }
+            if choice_dialog.get("numbered").and_then(|v| v.as_bool()) == Some(false) {
+                println!("  note: 番号キーは無反応なダイアログ（tako が矢印移動で応答する）");
+            }
+            println!(
+                "  action: {}",
+                choice_dialog
+                    .get("recommended_action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("respond")
+            );
+            println!("  respond: tako orchestrator respond --pane {pane} --choice <番号|ラベル>");
             print_events(&mut exec);
         }
         wait::WatchOutcome::AgentDead { resume_command } => {

@@ -29314,6 +29314,258 @@ mod self_test {
                 let _ = std::fs::remove_file(&ws_out);
             }
 
+            // 102. 選択肢ダイアログの検知・取得・送信ガード（#748。#749 が 101 を使うため 102）:
+            //      実ペインに limit 対処ダイアログの画面を描き、
+            //      ① read が choice_dialog を返し input_status を null にする
+            //      ② テキスト送信 / Enter 単独送信が選択肢つきのエラーで断られる
+            //      ③ respond の下見（choice 省略）が構造だけ返す
+            //      ④ ダイアログが消えれば送信が通常どおり通る
+            //      を機械検証する。実 claude を使わず画面テキストで再現できるのは、
+            //      検知が文言リストではなく**構造**で判定しているため（#530 の教訓）
+            {
+                // 専用ペインを分割して使う（他の項目が残した状態に依存しない。
+                // 途中で Ctrl-C を送るので、根プロセスが必ずシェルであることが要る）
+                let dlg_pane = window
+                    .update(cx, |app, _, cx| {
+                        let base = app
+                            .workspace
+                            .tabs()
+                            .iter()
+                            .flat_map(|t| t.tree().panes())
+                            .map(|p| p.id())
+                            .find(|id| app.terminals.contains_key(id))
+                            .unwrap_or_else(|| app.focused_pane());
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(base.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                        // dispatch を直接呼ぶと PTY 起動依頼は pending_attach へ積まれるだけ
+                        // なので、ここで消化する（IPC ループ相当。残すとペインに端末が付かない）
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        r.ok()
+                            .and_then(|v| v["pane"].as_u64())
+                            .unwrap_or(base.as_u64())
+                    })
+                    .unwrap_or(0);
+                // 分割直後はシェルの起動途中で打鍵が落ちることがあるので、
+                // プロンプトが出る（= 画面に中身がある）まで待つ
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    let ready = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&tako_core::PaneId::from_raw(dlg_pane))
+                                .is_some_and(|t| {
+                                    t.visible_lines().iter().any(|l| !l.trim().is_empty())
+                                })
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                // ダイアログ画面を描いて `sleep` で保持する（プロンプトが下に戻ると
+                // 最下部のカーソル行がシェルのプロンプトになり画面状態が変わる）
+                // 罫線と選択カーソルは**実文字**で書く（`\uXXXX` エスケープはシェルの
+                // printf 実装差で展開されないことがあり、画面が別物になる）
+                let dialog_cmd = concat!(
+                    "clear; printf '%b' '",
+                    "▔▔▔▔▔▔▔▔▔▔\\n",
+                    "   What do you want to do?\\n\\n",
+                    "   ❯ 1. Stop and wait for limit to reset\\n",
+                    "     2. Upgrade to Max 20x for higher session limits every month\\n\\n",
+                    "   Enter to confirm\\n",
+                    "'; sleep 30"
+                );
+                let send = |app: &mut TakoApp, text: &str| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Send {
+                            pane: Some(dlg_pane),
+                            text: text.to_string(),
+                            newline: true,
+                            tmux_session: None,
+                            await_prompt: false,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                };
+                let read = |app: &mut TakoApp| {
+                    tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Read {
+                            pane: Some(dlg_pane),
+                            lines: Some(40),
+                            tmux_session: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                };
+                let _ = window.update(cx, |app, _, _| send(app, dialog_cmd));
+                let mut shown = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    shown = window
+                        .update(cx, |app, _, _| {
+                            read(app)
+                                .ok()
+                                .is_some_and(|v| v["choice_dialog"].is_object())
+                        })
+                        .unwrap_or(false);
+                    if shown {
+                        break;
+                    }
+                }
+                if !shown {
+                    // 失敗時の診断: 何が画面に出ているのかを残す（検知の材料は画面テキスト）
+                    let tail = window
+                        .update(cx, |app, _, _| {
+                            read(app)
+                                .ok()
+                                .and_then(|v| v["text"].as_str().map(str::to_string))
+                                .unwrap_or_else(|| "(read 失敗)".into())
+                        })
+                        .unwrap_or_default();
+                    eprintln!("TAKO_SELF_TEST_748: 画面=\n{tail}");
+                }
+                check(shown, "選択肢ダイアログが read の choice_dialog に出る (#748)");
+                let (kind_ok, input_null, first_label) = window
+                    .update(cx, |app, _, _| {
+                        let v = read(app).expect("read できる");
+                        (
+                            v["choice_dialog"]["kind"] == "usage_limit",
+                            v["input_status"].is_null(),
+                            v["choice_dialog"]["options"][0]["label"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    })
+                    .unwrap_or((false, false, String::new()));
+                check(kind_ok, "ダイアログ種別が usage_limit として分類される (#748)");
+                check(
+                    input_null,
+                    "ダイアログ中の input_status は null（選択肢を残留入力と報告しない。#748）",
+                );
+                check(
+                    first_label == "Stop and wait for limit to reset",
+                    "選択肢のラベルが構造化されて取れる (#748)",
+                );
+                // ② 送信は断られる（テキストも Enter 単独も）
+                let (text_err, enter_err) = window
+                    .update(cx, |app, _, _| {
+                        let t = send(app, "これは混線するはずの指示").err().map(|e| e.to_string());
+                        let e = send(app, "").err().map(|e| e.to_string());
+                        (t, e)
+                    })
+                    .unwrap_or((None, None));
+                let text_err = text_err.unwrap_or_default();
+                check(
+                    text_err.contains("選択肢ダイアログ")
+                        && text_err.contains("Stop and wait for limit to reset")
+                        && text_err.contains("orchestrator respond"),
+                    "ダイアログ中のテキスト送信が選択肢つきで断られる (#748)",
+                );
+                check(
+                    enter_err.is_some_and(|e| e.contains("選択肢ダイアログ")),
+                    "ダイアログ中の Enter 単独送信も断られる（勝手に確定させない。#748）",
+                );
+                // ③ respond の下見（バックエンドセッションが要る = tmux 環境のみ）
+                let has_backend = window
+                    .update(cx, |app, _, _| {
+                        app.backend_sessions
+                            .contains_key(&tako_core::PaneId::from_raw(dlg_pane))
+                    })
+                    .unwrap_or(false);
+                if has_backend {
+                    let probe = window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OrchestratorRespond {
+                                    pane_id: dlg_pane,
+                                    choice: None,
+                                    caller_role: Some("selftest".into()),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                        })
+                        .ok()
+                        .and_then(|r| r.ok());
+                    check(
+                        probe.as_ref().is_some_and(|v| {
+                            v["responded"] == false
+                                && v["options"].as_array().map(|o| o.len()) == Some(2)
+                                && v["kind"] == "usage_limit"
+                        }),
+                        "respond の choice 省略が送信せず構造を返す (#748)",
+                    );
+                } else {
+                    eprintln!("（バックエンドセッション不在のため respond 下見をスキップ）");
+                }
+                // ④ ダイアログを消せば送信は通常どおり通る（ガードが居座らない）。
+                // Ctrl-C（sleep を止める）→ clear（画面からダイアログの絵を消す）を
+                // PTY へ直接書く。dispatch の Send はいま断られる状態なので使えない
+                // （それ自体が ② の検証内容）。画面テキストが残っている限り検知は
+                // 続くのが正しい挙動なので、絵を消すところまでやる
+                let _ = window.update(cx, |app, _, cx| {
+                    if let Some(term) = app.terminals.get(&tako_core::PaneId::from_raw(dlg_pane)) {
+                        term.write(vec![0x03]);
+                    }
+                    cx.notify();
+                });
+                wait(cx, 600).await;
+                let _ = window.update(cx, |app, _, cx| {
+                    if let Some(term) = app.terminals.get(&tako_core::PaneId::from_raw(dlg_pane)) {
+                        term.write(b"clear\r".to_vec());
+                    }
+                    cx.notify();
+                });
+                let mut cleared = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    cleared = window
+                        .update(cx, |app, _, _| {
+                            read(app).ok().is_some_and(|v| v["choice_dialog"].is_null())
+                        })
+                        .unwrap_or(false);
+                    if cleared {
+                        break;
+                    }
+                }
+                check(cleared, "ダイアログが消えれば choice_dialog は null (#748)");
+                let send_ok = window
+                    .update(cx, |app, _, _| send(app, "echo TAKO748_SEND_OK").is_ok())
+                    .unwrap_or(false);
+                check(send_ok, "ダイアログ解消後は送信が通る (#748)");
+                wait(cx, 400).await;
+                let _ = window.update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(dlg_pane),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                });
+                wait(cx, 400).await;
+            }
+
             // 68b. OpenFile の direction（ファイル D&D のドロップ位置。FR-3.11）:
             //      既存プレビューがあっても再利用せず指定方向に分割して開く
             let dnd_dir =
@@ -34268,7 +34520,7 @@ mod self_test {
                                 app,
                                 tako_control::protocol::Request::OrchestratorRespond {
                                     pane_id: chat_pane.as_u64(),
-                                    choice: "1".into(),
+                                    choice: Some("1".into()),
                                     caller_role: None,
                                 },
                                 PaneOrigin::User,

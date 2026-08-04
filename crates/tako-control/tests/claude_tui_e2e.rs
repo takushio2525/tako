@@ -423,3 +423,199 @@ fn 長文マルチラインsendが送達される() {
         dump_screen(&guard.session)
     );
 }
+
+// --- Issue #748: 選択肢ダイアログの検知・構造化取得・応答 ---
+
+/// 指定モードで claude を起動する（#748。permission ダイアログを出すには
+/// `--permission-mode manual` が要る。既定は auto でツール実行が自動承認される）
+fn launch_claude_mode(session: &str, dir: &Path, mode: &str) -> SessionGuard {
+    std::fs::create_dir_all(dir).expect("作業ディレクトリを作れる");
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            SOCKET,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            "110",
+            "-y",
+            "40",
+            "-c",
+            dir.to_str().expect("テストパスは UTF-8"),
+            &format!("claude --model haiku --permission-mode {mode}"),
+        ])
+        .status()
+        .expect("tmux を実行できる");
+    assert!(status.success(), "tmux new-session が失敗した");
+    SessionGuard {
+        session: session.to_string(),
+        dir: dir.to_path_buf(),
+    }
+}
+
+/// ダイアログが実在するまで待って構造を返す
+fn wait_for_dialog(session: &str, timeout: Duration) -> Option<claude_tui::ChoiceDialog> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(lines) = capture(session) {
+            if let Some(d) = claude_tui::detect_choice_dialog(&lines) {
+                return Some(d);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+/// #748 受け入れ 1〜3（permission ダイアログ = 番号つき選択肢の実物）:
+/// 検知（種別つき）→ 構造化取得 → 応答 → 解決 が実 claude で通り、
+/// ダイアログ中のテキスト送達は入力欄へ混入しない。
+///
+/// **番号キーだけで確定する**ことを実測で固定するのがこのテストの主眼
+/// （旧 respond は番号 + Enter を送っており、余分な Enter が解消後の入力欄へ抜けていた）
+#[test]
+#[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
+fn issue748_実permissionダイアログを構造化して番号キーで確定できる() {
+    let dir = untrusted_base_dir("dialog-permission");
+    assert_eq!(
+        claude_tui::ensure_trusted(&dir.display().to_string()),
+        Ok(true),
+        "事前信頼を書き込める（信頼ダイアログを本題から外す）"
+    );
+    let guard = launch_claude_mode("dialog-permission", &dir, "manual");
+    wait_for_input_line(&guard.session);
+
+    // 許可リストに無いコマンド（perl）を頼む → permission ダイアログが出る
+    let report = claude_tui::deliver_via_tmux(
+        Some(SOCKET),
+        &guard.session,
+        "Run exactly this with the Bash tool and nothing else: perl -e 'print 7'",
+        true,
+    )
+    .expect("送達が完了する");
+    assert!(report.verified, "依頼が送達される: {report:?}");
+
+    // ① 検知: 種別つきで拾える
+    let dialog = wait_for_dialog(&guard.session, Duration::from_secs(120)).unwrap_or_else(|| {
+        panic!(
+            "permission ダイアログを検知するはず。画面:\n{}",
+            dump_screen(&guard.session)
+        )
+    });
+    assert_eq!(
+        dialog.kind,
+        claude_tui::DialogKind::Permission,
+        "種別は permission: {dialog:?}"
+    );
+    assert!(dialog.numbered, "番号つき: {dialog:?}");
+    assert!(dialog.options.len() >= 2, "選択肢が並ぶ: {dialog:?}");
+    assert_eq!(dialog.highlighted, Some(0), "既定は先頭: {dialog:?}");
+    assert!(
+        dialog.options[0].label.to_lowercase().starts_with("yes"),
+        "先頭は承認: {dialog:?}"
+    );
+
+    // ② 入力欄は存在しない（= テキストを貼ってはいけない状態）
+    let lines = capture(&guard.session).expect("画面が採れる");
+    assert_eq!(
+        claude_tui::input_line(&lines),
+        None,
+        "ダイアログ中は入力欄を返さない。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+
+    // ③ ダイアログ中のテキスト送達は貼らずに失敗する（入力欄へ混入しない）
+    let blocked = claude_tui::deliver_via_tmux(
+        Some(SOCKET),
+        &guard.session,
+        "この指示はダイアログに食われてはいけない",
+        false,
+    );
+    assert!(
+        blocked.is_err(),
+        "ダイアログ中の送達は失敗するはず: {blocked:?}\n画面:\n{}",
+        dump_screen(&guard.session)
+    );
+    let after_block = capture(&guard.session).expect("画面が採れる");
+    assert!(
+        !after_block.iter().any(|l| l.contains("食われてはいけない")),
+        "送ろうとしたテキストが画面に現れない（貼っていない）。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+    let still = claude_tui::detect_choice_dialog(&after_block).expect("ダイアログは残っている");
+    assert_eq!(still.labels(), dialog.labels(), "選択肢が変わっていない");
+
+    // ④ 応答: **番号キーだけ**で確定する（Enter を送らない）
+    let number = dialog.options[0].number.expect("番号がある").to_string();
+    send_key(&guard.session, &number);
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            capture(&guard.session).is_some_and(|l| claude_tui::detect_choice_dialog(&l).is_none())
+        }),
+        "番号キーだけでダイアログが解消するはず（Enter 不要の実測）。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+    // ⑤ 解決: 承認したコマンドが実行される
+    assert!(
+        wait_for_marker(&guard.session, "perl", Duration::from_secs(60)),
+        "承認したコマンドが実行されるはず。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+}
+
+/// #748 受け入れ 1（permission 以外の実ダイアログ）: `/model` の選択ダイアログを
+/// 「一般の選択肢ダイアログ」として検知し、入力欄と混同しない。
+/// API を消費しない（スラッシュコマンドはローカル処理）
+#[test]
+#[ignore = "実 tmux + 実 claude を使う（手動実行専用。API 消費なし）"]
+fn issue748_モデル選択ダイアログを一般の選択肢として検知する() {
+    let dir = untrusted_base_dir("dialog-select");
+    assert_eq!(
+        claude_tui::ensure_trusted(&dir.display().to_string()),
+        Ok(true),
+        "事前信頼を書き込める"
+    );
+    let guard = launch_claude_mode("dialog-select", &dir, "manual");
+    wait_for_input_line(&guard.session);
+
+    type_like_human(&guard.session, "/model");
+    send_key(&guard.session, "Enter");
+
+    let dialog = wait_for_dialog(&guard.session, Duration::from_secs(30)).unwrap_or_else(|| {
+        panic!(
+            "/model の選択ダイアログを検知するはず。画面:\n{}",
+            dump_screen(&guard.session)
+        )
+    });
+    assert_eq!(
+        dialog.kind,
+        claude_tui::DialogKind::Select,
+        "permission でも limit でもない一般の選択: {dialog:?}"
+    );
+    assert!(dialog.numbered, "番号つき: {dialog:?}");
+    assert!(dialog.options.len() >= 3, "モデルが並ぶ: {dialog:?}");
+    assert!(
+        dialog.highlighted.is_some(),
+        "現在の選択が取れる: {dialog:?}"
+    );
+    let lines = capture(&guard.session).expect("画面が採れる");
+    assert_eq!(
+        claude_tui::input_line(&lines),
+        None,
+        "選択肢を入力欄と誤認しない（旧実装はここでモデル名を入力テキストとして返した）"
+    );
+    // Esc で閉じれば通常の入力欄に戻る（ダイアログ判定が居座らない）
+    send_key(&guard.session, "Escape");
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            capture(&guard.session).is_some_and(|l| {
+                claude_tui::detect_choice_dialog(&l).is_none()
+                    && claude_tui::input_line(&l).is_some()
+            })
+        }),
+        "Esc で閉じれば入力欄が戻るはず。画面:\n{}",
+        dump_screen(&guard.session)
+    );
+}

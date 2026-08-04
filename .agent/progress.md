@@ -1707,3 +1707,18 @@
 - 判定と文面は `tako-core::handoff` の純関数。MCP ツールは増やさず
   `tako_orchestrator_profiles` に `ctx_threshold` / `auto_handoff` を載せた（CLI / GUI も同経路）
 - 次: 実 claude の通し e2e（項目 101c）の実測を Issue にコメント
+
+## 2026-08-04（#748: worker の選択肢ダイアログ対応の総点検）
+- ダイアログの**存在判定を構造検知へ一般化**（`tako-core::dialog`。番号つき + 番号なしの 2 経路、
+  罫線で挟まれた入力ボックスは棄却）+ 種別分類は文言（`claude_tui::DialogKind`: permission /
+  trust / bypass / usage_limit / plan_confirm / select）。実採取は permission / `/model` /
+  plan 確認 / `/mcp`（番号なし）/ AskUserQuestion（全角・5 択）
+- 公開: `worker_status` / `read` の `choice_dialog`（ダイアログ中は `input_status` を null）、
+  watch の `WORKER_DIALOG`（種別つき。question は同時に出さない）、respond の一般化
+  （番号 / ラベル / `--choice` 省略で下見。**番号キーだけで確定** = 実測、番号なしは矢印 +
+  ラベル一致検証 + Enter）、**ダイアログ中の send は選択肢つきエラーで拒否**、
+  supervisor の limit 復旧を盲目 Enter → 安全な選択肢のラベル選択へ
+- 検証: 品質ゲート全緑（1838）+ 実 claude e2e 2 本（permission の構造取得と番号キー確定 /
+  `/model` を select として検知）+ セルフテスト項目 101 新設。limit ダイアログは実文言
+  （バイナリ由来）+ 実レイアウト（`/model`）の合成 fixture
+- 次: 隔離セルフテストの完走は環境負荷（load 25〜50）で未達 = main でも別項目で落ちる

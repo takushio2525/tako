@@ -734,6 +734,18 @@ fn dispatch_inner(
                 };
             }
 
+            // #748: 選択肢ダイアログ表示中の送信を**入口で断る**。
+            // ダイアログは入力欄を奪っているので、テキストを書けば 1 文字ずつが
+            // ダイアログのキー操作として食われ（数字なら選択が確定してしまう）、
+            // Enter は「今ハイライトされている選択肢の確定」になる。
+            // 実際に観測されたのは limit ダイアログの選択肢テキストが入力欄に
+            // 残ったまま混線する状態（#748 の観測 1 / 4）。
+            // 正しい操作は respond（番号 / ラベル指定 + 実在再検証）なので、
+            // 選択肢一覧つきの明示エラーでそちらへ誘導する
+            if let Some(err) = dialog_blocks_send(host, pane, tmux_session.as_deref(), &text) {
+                return Err(err);
+            }
+
             // pane ID で解決を試み、失敗時に tmux session フォールバック
             match resolve_pane(host.workspace(), pane) {
                 Ok((_, target)) => {
@@ -855,6 +867,14 @@ fn dispatch_inner(
             // （画面を切り詰める前の全行で判定する）
             let queued_pending = crate::claude_tui::queued_messages_pending(&all);
 
+            // #748: 選択肢ダイアログが実在するか（画面を切り詰める前の全行で判定）。
+            // ダイアログの選択カーソル（`❯ 1. Stop and wait for limit to reset`）は
+            // 入力欄と同じ字面なので、旧実装は `input_status.style=user` として
+            // 「入力欄にテキストが残っている」と報告していた（#748 の観測 1）。
+            // ダイアログ中は**入力欄が存在しない**ので input_status は null にし、
+            // 代わりに構造化した選択肢を返す
+            let dialog = crate::claude_tui::detect_choice_dialog(&all);
+
             while all.last().is_some_and(|l| l.is_empty()) {
                 all.pop();
             }
@@ -863,7 +883,7 @@ fn dispatch_inner(
                     all.drain(..all.len() - n);
                 }
             }
-            let input_json = input_status.map(|s| {
+            let input_json = input_status.filter(|_| dialog.is_none()).map(|s| {
                 json!({
                     "line": s.line,
                     "text": s.text,
@@ -883,6 +903,9 @@ fn dispatch_inner(
                 "text": all.join("\n"),
                 "input_status": input_json,
                 "queued_messages_pending": queued_pending,
+                // #748: 選択肢ダイアログ（null = ダイアログなし）。
+                // 非 null のときは入力欄が無いので send ではなく respond で応答する
+                "choice_dialog": dialog.as_ref().map(|d| d.to_json()),
             }))
         }
 
@@ -2664,7 +2687,9 @@ fn dispatch_inner(
             pane_id,
             choice,
             caller_role,
-        } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
+        } => {
+            dispatch_orchestrator_respond(host, pane_id, choice.as_deref(), caller_role.as_deref())
+        }
 
         // #364: worker の報告内容を scrollback + transcript から取得
         // #390: worker 指定 / pane 消失時はレジストリの追跡キーで継続
@@ -6803,7 +6828,24 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     let permission_dialog = recent_output
         .as_deref()
         .and_then(crate::orchestrator::wait::permission_dialog_json);
-    if permission_dialog.is_some() && status != "gone" {
+    // #748: permission 以外の選択肢ダイアログ（usage limit の対処選択・モデル選択・
+    // plan 確認・AskUserQuestion・`/mcp` の一覧等）も同じ構造検知から拾う。
+    // どの種別でも**入力欄を奪っている = 応答するまで先へ進めない**ので waiting へ格上げする。
+    // 旧実装は permission だけを見ており、それ以外は idle（= 完了）として通知されていた
+    // （#748 の観測 2。master は WORKER_IDLE を受けて報告を待ち続ける）
+    let choice_dialog = recent_output
+        .as_deref()
+        .and_then(crate::orchestrator::wait::choice_dialog_json);
+    // usage limit の対処ダイアログだけは waiting へ格上げしない（#748）。
+    // 「解除まで待ってから続行」という復旧は error 側（#157 の WorkerErrorKind +
+    // #401 の supervisor）が持っているので、そこを迂回させない。
+    // 選択肢の構造は下の `choice_dialog` フィールドに載るので respond もできる
+    let limit_dialog = choice_dialog
+        .as_ref()
+        .and_then(|d| d["kind"].as_str())
+        .is_some_and(|k| k == "usage_limit");
+    if (permission_dialog.is_some() || choice_dialog.is_some()) && status != "gone" && !limit_dialog
+    {
         status = "waiting".to_string();
     }
 
@@ -6953,6 +6995,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         // #572: true = 人間が busy 中に打った指示がキューに未送信で残っている
         "queued_messages_pending": queued_messages_pending,
         "permission_dialog": permission_dialog,
+        // #748: 種別つきの選択肢ダイアログ（permission も含む全種別）。
+        // `tako orchestrator respond` に渡す番号 / ラベルはここから読む
+        "choice_dialog": choice_dialog,
         "history": history_info,
         // #390: worker レジストリ由来の情報（未登録ペインは null）
         "worker_id": registry_worker_id,
@@ -6961,11 +7006,21 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     }))
 }
 
-/// #319: permission ダイアログへの構造化応答
+/// 選択肢ダイアログへの構造化応答（#319 permission → #748 で全種別に一般化）。
+///
+/// `choice` を省略すると**送信せずに構造だけ返す**（下見。#322 の「最簡形」に沿って
+/// 新しいツールを増やさず、同じコマンドで一覧と応答の両方を賄う）。
+///
+/// キー送出は実測に基づく（#748。claude v2.1.220 の permission / AskUserQuestion で観測）:
+/// - 番号つきダイアログは**番号キーだけで確定する**（Enter 不要）。旧実装は番号 + Enter を
+///   送っていたので、余分な Enter がダイアログ解消後の入力欄へ抜けていた
+/// - 番号なしダイアログ（`/mcp` 等）では番号キーは**無反応**。`↑`/`↓` で移動して Enter。
+///   移動後は**ラベル一致で着地を検証**してから Enter を送る（見出し行が選択肢に混ざる
+///   TUI でも誤選択を confirm しない）
 fn dispatch_orchestrator_respond(
     host: &dyn ControlHost,
     pane_id: u64,
-    choice: &str,
+    choice: Option<&str>,
     caller_role: Option<&str>,
 ) -> Result<Value, DispatchError> {
     let target = PaneId::from_raw(pane_id);
@@ -6977,7 +7032,7 @@ fn dispatch_orchestrator_respond(
         ))
     })?;
 
-    // 画面から permission ダイアログの存在を検証。
+    // 画面からダイアログの存在を検証。
     // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
     let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
         DispatchError::Operation(
@@ -6988,71 +7043,302 @@ fn dispatch_orchestrator_respond(
             .note(),
         )
     })?;
-    let lines = access
-        .capture_screen(&session)
-        .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))?;
-    let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
+    let capture = || -> Result<Vec<String>, DispatchError> {
+        access
+            .capture_screen(&session)
+            .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))
+    };
+    let lines = capture()?;
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines).ok_or_else(|| {
         DispatchError::Operation(
-            "ペイン画面に permission ダイアログが見つからない（既に解消済みか、別の画面状態です）"
+            "ペイン画面に選択肢ダイアログが見つからない（既に解消済みか、別の画面状態です）"
                 .to_string(),
         )
     })?;
 
-    // choice を番号に解決
-    let choice_num: usize = match choice.to_lowercase().as_str() {
-        "yes" | "allow" => 1,
-        "no" | "deny" => {
-            // Deny は最後の選択肢（通常は 3 番目）
-            dialog
-                .options
-                .iter()
-                .position(|o| o.to_lowercase().contains("deny") || o.to_lowercase() == "no")
-                .map(|i| i + 1)
-                .unwrap_or(dialog.options.len())
-        }
-        n => n.parse().map_err(|_| {
-            DispatchError::Operation(format!(
-                "choice は番号（1-{}）または yes/no/allow/deny を指定してください: {choice}",
-                dialog.options.len()
-            ))
-        })?,
-    };
-    if choice_num == 0 || choice_num > dialog.options.len() {
-        return Err(DispatchError::Operation(format!(
-            "choice {choice_num} は範囲外です（1-{}）",
+    // choice 省略 = 下見（構造だけ返す。送信しない）
+    let Some(choice) = choice else {
+        let mut result = dialog.to_json();
+        result["pane_id"] = json!(pane_id);
+        result["responded"] = json!(false);
+        result["hint"] = json!(format!(
+            "応答するには choice に番号（1-{}）かラベルの一部を渡す",
             dialog.options.len()
-        )));
+        ));
+        return Ok(result);
+    };
+
+    let index = resolve_choice_index(&dialog, choice)?;
+    let chosen = dialog.options[index].clone();
+
+    // --- キー送出（種別ではなく「番号つきか」で分岐する） ---
+    let mut keys_sent: Vec<String> = Vec::new();
+    let send = |key: &str| -> Result<(), DispatchError> {
+        access
+            .send_key(&session, key)
+            .map_err(|e| DispatchError::Operation(format!("キー {key} の送信に失敗: {e}")))
+    };
+    if dialog.numbered {
+        let number = chosen.number.unwrap_or((index + 1) as u32).to_string();
+        send(&number)?;
+        keys_sent.push(number);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // 番号キーで確定しない TUI（codex の「Press enter to confirm」等）のための
+        // フォールバック。**ダイアログが残っているときだけ** Enter を送る
+        // （確定済みの画面へ送ると入力欄の残留テキストを送信してしまう）
+        if dialog_still_open(&capture()?, &dialog) {
+            send("Enter")?;
+            keys_sent.push("Enter".to_string());
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+    } else {
+        // 番号なし: ハイライトから目標までカーソルを動かし、着地をラベルで検証する
+        let mut current = dialog.highlighted.ok_or_else(|| {
+            DispatchError::Operation(
+                "番号なしダイアログでハイライト位置を特定できない（手動で応答してください）"
+                    .to_string(),
+            )
+        })?;
+        for _ in 0..NAV_ATTEMPTS {
+            if current == index {
+                break;
+            }
+            let (key, steps) = if index > current {
+                ("Down", index - current)
+            } else {
+                ("Up", current - index)
+            };
+            for _ in 0..steps {
+                send(key)?;
+                keys_sent.push(key.to_string());
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            // 移動後の実画面から現在位置を読み直す（キーを飲まれた場合の再試行）
+            let after = crate::claude_tui::detect_choice_dialog(&capture()?).ok_or_else(|| {
+                DispatchError::Operation(
+                    "カーソル移動中にダイアログが消えた（応答は送っていません）".to_string(),
+                )
+            })?;
+            current = after
+                .highlighted
+                .ok_or_else(|| DispatchError::Operation("ハイライト位置を再取得できない".into()))?;
+            if after.options.get(current).map(|o| o.label.as_str()) == Some(chosen.label.as_str()) {
+                break;
+            }
+        }
+        // ラベル一致を確認できないまま Enter は押さない（誤選択の確定を構造的に防ぐ）
+        let landed = crate::claude_tui::detect_choice_dialog(&capture()?)
+            .and_then(|d| d.highlighted.and_then(|i| d.options.get(i).cloned()))
+            .is_some_and(|o| o.label == chosen.label);
+        if !landed {
+            return Err(DispatchError::Operation(format!(
+                "選択肢「{}」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）",
+                chosen.label
+            )));
+        }
+        send("Enter")?;
+        keys_sent.push("Enter".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(400));
     }
 
-    // 選択キーを送信: 番号キー → 短い待ち → Enter
-    access
-        .send_key(&session, &choice_num.to_string())
-        .map_err(|e| DispatchError::Operation(format!("番号キーの送信に失敗: {e}")))?;
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    access
-        .send_key(&session, "Enter")
-        .map_err(|e| DispatchError::Operation(format!("Enter の送信に失敗: {e}")))?;
-
-    let chosen_text = dialog
-        .options
-        .get(choice_num - 1)
-        .cloned()
-        .unwrap_or_default();
+    // 解消の検証（ダイアログが残っていれば responded=true でも resolved=false を返す）
+    let after = capture()?;
+    let resolved = !dialog_still_open(&after, &dialog);
+    // 検知と送出のあいだにダイアログが自然消滅していた場合、送ったキーは入力欄へ
+    // 素通りする。入力欄にそれが残っていたら**黙って成功と言わずに**報告する
+    // （番号キーだけで Enter を送らない設計なので、送信されることはない）
+    let stray_input = keys_sent
+        .iter()
+        .any(|k| crate::claude_tui::input_line(&after).is_some_and(|c| c.trim() == k));
 
     // 監査記録（persist.log。ペイン出力自体はキー入力の結果として画面に残る）
     let caller = caller_role.unwrap_or("unknown");
     crate::diag::persist_log(&format!(
-        "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={}",
-        dialog.command
+        "[dialog-respond] caller={caller} pane={pane_id} kind={} choice={} ({}) keys={} resolved={resolved} stray={stray_input} title={}",
+        dialog.kind.as_str(),
+        index + 1,
+        chosen.label,
+        keys_sent.join("+"),
+        dialog.title
     ));
 
     Ok(json!({
         "pane_id": pane_id,
         "responded": true,
-        "choice": choice_num,
-        "choice_text": chosen_text,
-        "command": dialog.command,
+        "resolved": resolved,
+        "kind": dialog.kind.as_str(),
+        "choice": index + 1,
+        "choice_number": chosen.number,
+        "choice_text": chosen.label,
+        "keys_sent": keys_sent,
+        "numbered": dialog.numbered,
+        // true = ダイアログが応答直前に消えており、送ったキーが入力欄に残っている
+        // （選択は成立していない。入力欄を消してから再試行する）
+        "stray_input": stray_input,
+        // 後方互換（#319 の応答フィールド。permission 以外では本文の説明が入る）
+        "command": dialog.title,
     }))
+}
+
+/// 番号なしダイアログでカーソル移動を試みる回数（キーを飲まれたときの再試行込み）
+const NAV_ATTEMPTS: u32 = 3;
+
+/// `choice` 文字列を選択肢の添字（0-based）へ解決する（#748）。
+///
+/// 受け付ける形:
+/// - 番号（画面に出ている番号を優先。番号なしダイアログでは 1-based の順番）
+/// - ラベルの部分一致（大小無視。複数一致は曖昧としてエラー）
+/// - `yes` / `allow` / `no` / `deny` のエイリアス（#319 の互換）
+fn resolve_choice_index(
+    dialog: &crate::claude_tui::ChoiceDialog,
+    choice: &str,
+) -> Result<usize, DispatchError> {
+    let labels = || {
+        dialog
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}. {}", o.number.unwrap_or((i + 1) as u32), o.label))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
+    let lower = choice.trim().to_lowercase();
+    if lower.is_empty() {
+        return Err(DispatchError::Operation(format!(
+            "choice が空。選択肢: {}",
+            labels()
+        )));
+    }
+    // 1. 番号
+    if let Ok(n) = lower.parse::<u32>() {
+        if let Some(i) = dialog.options.iter().position(|o| o.number == Some(n)) {
+            return Ok(i);
+        }
+        let i = (n as usize)
+            .checked_sub(1)
+            .filter(|i| *i < dialog.options.len());
+        return i.ok_or_else(|| {
+            DispatchError::Operation(format!(
+                "choice {n} は範囲外（1-{}）。選択肢: {}",
+                dialog.options.len(),
+                labels()
+            ))
+        });
+    }
+    // 2. yes / no エイリアス（#319 の互換。permission ダイアログの実文言に合わせる）
+    let alias: Option<Vec<&str>> = match lower.as_str() {
+        "yes" | "allow" => Some(vec!["yes", "allow once", "allow"]),
+        "no" | "deny" => Some(vec!["no,", "deny", "no"]),
+        _ => None,
+    };
+    if let Some(candidates) = alias {
+        for needle in candidates {
+            if let Some(i) = dialog
+                .options
+                .iter()
+                .position(|o| o.label.to_lowercase().starts_with(needle))
+            {
+                return Ok(i);
+            }
+        }
+        return Err(DispatchError::Operation(format!(
+            "{choice} に対応する選択肢が見つからない。選択肢: {}",
+            labels()
+        )));
+    }
+    // 3. ラベルの部分一致
+    let hits: Vec<usize> = dialog
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.label.to_lowercase().contains(&lower))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(DispatchError::Operation(format!(
+            "「{choice}」に一致する選択肢が無い。選択肢: {}",
+            labels()
+        ))),
+        _ => Err(DispatchError::Operation(format!(
+            "「{choice}」が複数の選択肢に一致する（{}件）。番号で指定する。選択肢: {}",
+            hits.len(),
+            labels()
+        ))),
+    }
+}
+
+/// 応答後もダイアログが残っているか（同じ選択肢構成のダイアログが見えているか）。
+/// 別のダイアログへ遷移した場合（承認 → 次の承認）は「解消済み」と扱う
+fn dialog_still_open(lines: &[String], before: &crate::claude_tui::ChoiceDialog) -> bool {
+    crate::claude_tui::detect_choice_dialog(lines)
+        .is_some_and(|now| now.labels() == before.labels())
+}
+
+/// #748: 選択肢ダイアログ表示中の `Send` を断る。
+///
+/// 返り値が `Some` なら送信せずそのエラーを返す。生のエスケープシーケンス
+/// （矢印キー等の低レベルなキー送信）は意図的な TUI 操作として通す
+fn dialog_blocks_send(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tmux_session: Option<&str>,
+    text: &str,
+) -> Option<DispatchError> {
+    if text.contains('\u{1b}') {
+        return None;
+    }
+    let (pane_id, lines) = send_target_screen(host, pane, tmux_session)?;
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines)?;
+    dialog_send_refusal(&dialog, pane_id).map(DispatchError::Operation)
+}
+
+/// 送信拒否の文面（純関数。`None` = 送信して良い）。
+/// trust / bypass は tako 自身が承諾する（送達フローが承諾 → 貼り付けまで面倒を見る）ので通す
+fn dialog_send_refusal(
+    dialog: &crate::claude_tui::ChoiceDialog,
+    pane_id: Option<u64>,
+) -> Option<String> {
+    if dialog.kind.auto_accepted() {
+        return None;
+    }
+    let options = dialog
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| format!("{}. {}", o.number.unwrap_or((i + 1) as u32), o.label))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let pane_arg = pane_id
+        .map(|p| format!("--pane {p}"))
+        .unwrap_or_else(|| "--pane <N>".to_string());
+    Some(format!(
+        "選択肢ダイアログ（{}）が表示中のため送信を中止した。\
+         入力欄が奪われているので、テキストや Enter はダイアログのキー操作として食われる\
+         （数字なら選択が確定してしまう）。選択肢: {options}。\
+         応答は `tako orchestrator respond {pane_arg} --choice <番号|ラベル>`\
+         （choice を省略すると構造だけ確認できる）",
+        dialog.kind.as_str()
+    ))
+}
+
+/// `Send` の対象ペインの画面を採る（in-process セッション優先、無ければ detached 経由）
+fn send_target_screen(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tmux_session: Option<&str>,
+) -> Option<(Option<u64>, Vec<String>)> {
+    if let Ok((_, target)) = resolve_pane(host.workspace(), pane) {
+        if let Some(session) = host.session(target) {
+            return Some((Some(target.as_u64()), session.visible_lines()));
+        }
+    }
+    let ts = tmux_session?;
+    let (session, access) = crate::reach::detached_session(ts)?;
+    access
+        .capture_screen(&session)
+        .ok()
+        .map(|lines| (pane, lines))
 }
 
 /// worker が busy かどうかを画面出力で判定する。
@@ -12091,7 +12377,7 @@ mod tests {
             &mut host,
             Request::OrchestratorRespond {
                 pane_id: pane,
-                choice: "1".into(),
+                choice: Some("1".into()),
                 caller_role: None,
             },
             PaneOrigin::Cli,
@@ -12235,6 +12521,220 @@ mod tests {
                 .unwrap();
         assert_eq!(v["status"], "busy");
         assert!(v["permission_dialog"].is_null());
+    }
+
+    // --- #748: permission 以外の選択肢ダイアログ ---
+
+    /// `/model` のモデル選択（実採取。#748 の screens/02）。
+    /// **raw string で書く**こと: `"\<改行>"` の継続は次行の行頭空白を落とすので、
+    /// 桁揃えが意味を持つダイアログ画面は再現できない
+    const MODEL_SELECT_748: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models.
+
+     1. Default (recommended)  Opus 5
+   ❯ 2. Opus (1M context)      Opus 5 with 1M context
+     3. Sonnet                 Sonnet 5
+
+   Enter to set as default · Esc to cancel"#;
+
+    /// claude の usage limit 対処ダイアログ（実文言 = バイナリ内文字列。#748）
+    const LIMIT_DIALOG_748: &str = r#"⏺ 実装を続けます
+  ⎿  Claude usage limit reached. Your limit will reset at 3am.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Upgrade to Max 20x for higher session limits every month
+
+   Enter to confirm · Esc to cancel"#;
+
+    /// `/mcp` の一覧（実採取。**番号なし** + セクション見出し混在）
+    const MCP_LIST_748: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Manage MCP servers
+
+     User MCPs
+   ❯ context7 · ✔ connected · 2 tools
+     filesystem · ✔ connected · 14 tools
+     tako · ✔ connected · 133 tools
+
+   ↑/↓ to navigate · Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn issue748_モデル選択ダイアログでwaitingとchoice_dialogを返す() {
+        // 旧実装は permission ダイアログしか見ておらず、この画面は
+        // 「idle + question」= 完了扱いで通知されていた（#748 の観測 2）
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            MODEL_SELECT_748,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(v["permission_dialog"].is_null(), "permission ではない");
+        let dialog = &v["choice_dialog"];
+        assert_eq!(dialog["kind"], "select");
+        assert_eq!(dialog["numbered"], true);
+        assert_eq!(dialog["highlighted"], 1);
+        assert_eq!(dialog["options"].as_array().unwrap().len(), 3);
+        assert_eq!(dialog["recommended_action"], "respond");
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"choice_dialog"), "{kinds:?}");
+        assert!(
+            !kinds.contains(&"question"),
+            "ダイアログ待ちを質問として出さない: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn issue748_limitダイアログはerrorのままchoice_dialogが付く() {
+        // 「解除まで待つ」復旧は error 側（#157 / #401 の supervisor）が持っている。
+        // waiting へ格上げしてその経路を迂回させない。ただし選択肢の構造は返す
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            LIMIT_DIALOG_748,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["kind"], "usage_limit");
+        assert_eq!(v["error"]["recommended_action"], "wait_reset");
+        let dialog = &v["choice_dialog"];
+        assert_eq!(dialog["kind"], "usage_limit");
+        assert_eq!(
+            dialog["options"][0]["label"],
+            "Stop and wait for limit to reset"
+        );
+        assert_eq!(dialog["recommended_action"], "respond_wait");
+    }
+
+    #[test]
+    fn issue748_permissionダイアログはchoice_dialogにも載る() {
+        // 既存の permission_dialog は互換のまま、種別つきの構造も並べて返す
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            PERMISSION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(v["permission_dialog"].is_object());
+        assert_eq!(v["choice_dialog"]["kind"], "permission");
+        // events は permission_dialog のみ（choice_dialog と二重に出さない）
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"permission_dialog"), "{kinds:?}");
+        assert!(!kinds.contains(&"choice_dialog"), "{kinds:?}");
+    }
+
+    #[test]
+    fn issue748_ダイアログの無い画面ではchoice_dialogはnull() {
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            QUESTION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "idle");
+        assert!(v["choice_dialog"].is_null());
+    }
+
+    fn dialog_of(screen: &str) -> crate::claude_tui::ChoiceDialog {
+        let lines: Vec<String> = screen.lines().map(|l| l.to_string()).collect();
+        crate::claude_tui::detect_choice_dialog(&lines).expect("ダイアログが検知される")
+    }
+
+    #[test]
+    fn issue748_choiceは番号とラベルとエイリアスで解決する() {
+        let dialog = dialog_of(PERMISSION_SCREEN_577);
+        // 番号
+        assert_eq!(resolve_choice_index(&dialog, "1").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "3").unwrap(), 2);
+        // エイリアス（#319 互換）
+        assert_eq!(resolve_choice_index(&dialog, "yes").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "no").unwrap(), 2);
+        // ラベルの部分一致（大小無視）
+        assert_eq!(resolve_choice_index(&dialog, "don't ask again").unwrap(), 1);
+        // 範囲外・不一致はエラー（選択肢一覧を添える）
+        let err = resolve_choice_index(&dialog, "9").unwrap_err().to_string();
+        assert!(err.contains("範囲外") && err.contains("1. Yes"), "{err}");
+        let err = resolve_choice_index(&dialog, "存在しない")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("一致する選択肢が無い"), "{err}");
+    }
+
+    #[test]
+    fn issue748_曖昧なラベルは確定させずエラーにする() {
+        // モデル選択の「opus」は 2 つの選択肢に一致する（Default … Opus 5 /
+        // Opus (1M context)）。勝手にどちらかを選ぶと worker のモデルが変わるので
+        // 番号を要求する（黙って推測しない）
+        let dialog = dialog_of(MODEL_SELECT_748);
+        let err = resolve_choice_index(&dialog, "opus")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("複数の選択肢に一致"), "{err}");
+    }
+
+    #[test]
+    fn issue748_番号なしダイアログはラベルで選べる() {
+        let dialog = dialog_of(MCP_LIST_748);
+        assert!(!dialog.numbered);
+        let i = resolve_choice_index(&dialog, "tako").unwrap();
+        assert_eq!(dialog.options[i].label, "tako · ✔ connected · 133 tools");
+        // 1 始まりの順番でも指定できる
+        let by_number = resolve_choice_index(&dialog, "1").unwrap();
+        assert_eq!(by_number, 0);
+    }
+
+    #[test]
+    fn issue748_ダイアログ中のsendは選択肢つきで断る() {
+        // #748 の観測 1 / 4: テキストや Enter はダイアログのキー操作として食われる
+        let refusal = dialog_send_refusal(&dialog_of(LIMIT_DIALOG_748), Some(5)).expect("断る");
+        assert!(refusal.contains("usage_limit"), "{refusal}");
+        assert!(
+            refusal.contains("1. Stop and wait for limit to reset"),
+            "選択肢を提示する: {refusal}"
+        );
+        assert!(
+            refusal.contains("tako orchestrator respond --pane 5"),
+            "respond へ誘導する: {refusal}"
+        );
+        // trust / bypass は tako 自身が承諾するので送信を止めない（送達フローが面倒を見る）
+        let trust = r#" Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel"#;
+        assert!(dialog_send_refusal(&dialog_of(trust), Some(5)).is_none());
+    }
+
+    #[test]
+    fn issue748_応答後の解消判定は選択肢構成で見る() {
+        let before = dialog_of(PERMISSION_SCREEN_577);
+        let same: Vec<String> = PERMISSION_SCREEN_577
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(dialog_still_open(&same, &before), "同じダイアログは残存");
+        let cleared: Vec<String> = "⏺ 実行しました\n────\n❯ \n────\n  ctx 5%"
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!dialog_still_open(&cleared, &before), "消えたら解消");
+        // 別のダイアログへ遷移した場合も「このダイアログは解消」と扱う
+        let next: Vec<String> = MODEL_SELECT_748.lines().map(|l| l.to_string()).collect();
+        assert!(!dialog_still_open(&next, &before));
     }
 
     #[test]

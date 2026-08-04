@@ -219,7 +219,10 @@ pub fn tools() -> Vec<Value> {
                 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。\
                 応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。\
                 text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残った\
-                テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。",
+                テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。\
+                #748: **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（入力欄が奪われており、\
+                テキストはダイアログのキー操作として食われ、数字なら選択が確定してしまう）。\
+                エラー本文に選択肢一覧が入るので、tako_orchestrator_respond で応答すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -256,7 +259,11 @@ pub fn tools() -> Vec<Value> {
                 queued_messages_pending が true なら、busy 中に人間が打った指示が claude の\
                 メッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても\
                 発火しない）。tako が idle 継続時に自動で送り出すので待つこと。\
-                このペインを閉じるとキューごと指示が失われる。",
+                このペインを閉じるとキューごと指示が失われる。\
+                choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。\
+                このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、\
+                かつては選択肢テキストが style=user の残留入力として報告されていた）。\
+                応答は tako_send_text ではなく tako_orchestrator_respond を使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1627,7 +1634,14 @@ pub fn tools() -> Vec<Value> {
                 session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。\
                 events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
                 応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
-                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。",
+                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。\
+                #748: 選択肢ダイアログ（permission だけでなく usage limit の対処選択・モデル選択・\
+                plan 確認・AskUserQuestion・一覧選択も）が画面にあるときは status が waiting になり、\
+                応答の choice_dialog に構造（kind / title / options[number,label,highlighted] / numbered / \
+                recommended_action）が入る。events には choice_dialog（dialog_kind つき）が積まれ、\
+                このとき question は出さない（ダイアログ待ちは本文への返信では解けない）。\
+                kind が trust / bypass のものは tako 自身が承諾するので触らないこと（auto_accepted: true）。\
+                応答は tako_orchestrator_respond（choice 省略で下見できる）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1830,21 +1844,26 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_respond",
-            "description": "worker の permission ダイアログ（ツール実行の承認要求）に応答する（#319）。\
-                watch の WORKER_PERMISSION イベントで検知されたダイアログに対し、選択肢を指定して解除する。\
-                ダイアログが画面に存在しない場合はエラーを返す（誤爆防止）。\
+            "description": "worker の**選択肢ダイアログ**に応答する（#319 permission → #748 で全種別）。\
+                対象は permission（ツール承認）のほか usage limit の対処選択・モデル選択（/model）・\
+                plan モードの実行確認・AskUserQuestion の質問・一覧選択（/mcp）など。\
+                watch の WORKER_PERMISSION / WORKER_DIALOG、または worker_status / read_pane の \
+                choice_dialog で検知されたダイアログに対して使う。\
+                **choice を省略すると送信せず構造だけ返す**（下見。選択肢一覧・現在のハイライト・番号キーの可否）。\
+                ダイアログが画面に存在しない場合はエラー（誤爆防止）。\
+                番号つきダイアログは番号キーだけで確定し、番号なしダイアログは矢印移動 + ラベル一致検証 + Enter で応答する。\
                 応答内容は persist.log に監査記録される。\
-                危険なコマンド（rm -rf / 本番 DB 操作等）への承認はユーザーに確認すること。",
+                危険なコマンド（rm -rf / 本番 DB 操作等）への承認、および課金・モデル変更を伴う選択肢はユーザーに確認すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
                     "choice": {
                         "type": "string",
-                        "description": "選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
+                        "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
                     },
                 },
-                "required": ["pane_id", "choice"],
+                "required": ["pane_id"],
                 "additionalProperties": false,
             },
         }),
@@ -3927,7 +3946,8 @@ fn build_request(
         },
         "tako_orchestrator_respond" => Request::OrchestratorRespond {
             pane_id: required_u64(args, "pane_id")?,
-            choice: str_arg(args, "choice")?.ok_or("choice を指定する")?,
+            // #748: choice 省略 = 送信せず構造だけ返す（下見）
+            choice: str_arg(args, "choice")?,
             caller_role: caller_role.map(str::to_string),
         },
         "tako_orchestrator_supervisor" => Request::OrchestratorSupervisor {
