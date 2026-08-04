@@ -8,6 +8,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.6] - 2026-08-05
+
+Nightly patch release (automated). Changes since v0.6.5:
+夜間パッチリリース（自動）。v0.6.5 以降の変更:
+
+- [修正] 実 claude 引き継ぎ e2e（101c）を実際に測れるようにする (#749) (#756)
+- [リファクタ] MCP 133ツール実装を責務別モジュールへ分割 (#755)
+- [改善] worker の選択肢ダイアログ対応を総点検: 構造検知・種別つき通知・安全な応答 (#748) (#753)
+- [リファクタ] MCP公開契約の完全スナップショットを追加 (#750) (#752)
+- [機能追加] master の自動ハンドオフ: ctx 閾値超過で引き継ぎ → 後任が前任ペインを閉じる (#749) (#751)
+- [修正] チャットビューの md テーブル崩れと画像つき発話の二重表示を根治 (#745) (#746) (#747)
+- [ドキュメント] activeContext: #691 全フェーズ完了と 08-04 再起動を反映 (#744)
+
 ## [0.6.5] - 2026-08-04
 
 Nightly patch release (automated). Changes since v0.6.4:
