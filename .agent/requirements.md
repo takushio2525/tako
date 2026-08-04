@@ -887,7 +887,46 @@ master のコンテキストが埋まると判断が劣化する。`/compact` �
 （実画面 55% × 閾値 50 / 60 で送る・黙るの両方向 / 再送間隔 / auto_handoff=false /
 master 以外のペイン / 後任が立っている場合 / self の実効値）。
 
-FR-2.8〜2.24 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
+### FR-2.25 worker の選択肢ダイアログの検知・構造化取得・応答（✅ 2026-08-04、#748。基盤は #319 / #530 / #577 / #157）
+
+> エージェント TUI が出すダイアログは permission（ツール承認）だけではない。usage limit の
+> 対処選択・`/model` のモデル選択・`/mcp` の一覧・plan モードの実行確認・AskUserQuestion の
+> 質問がいずれも**入力欄を奪う**。旧実装は permission だけを構造化していたため、
+> それ以外は「idle + question」= 完了として通知され、master は本文へ返信しようとして
+> 送達が入力欄と混線した（2026-08-04 の実運用観測: limit ダイアログの選択肢テキストが
+> `style=user` の残留入力として報告され続けた）。
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-2.25.1 | **ダイアログの存在判定は文言ではなく構造**で行う（#530 の教訓を全種別へ拡張）。判定は 2 経路: ①番号つき（カーソル行が `N. …` + 画面に番号つき行が 2 つ以上。番号は多桁も可）②番号なし（カーソル行の中身の開始桁に揃った兄弟行が隣接して 2 つ以上。ただしカーソル行が上下とも罫線で挟まれていれば入力ボックスとみなして棄却する）。実装は `tako-core::dialog` の 1 本で、**入力欄判定・送達フロー・worker 状態がすべて同じ関数を通る** | M |
+| FR-2.25.2 | **種別は文言で分類する**（`permission` / `trust` / `bypass` / `usage_limit` / `plan_confirm` / `select`）。分類できないものは `select` に落ちるだけで、ダイアログとしては検知され続ける（未知のダイアログを素通りさせない）。`trust` / `bypass` は tako 自身が承諾するので `auto_accepted` を立て、master には「触るな」を伝える | M |
+| FR-2.25.3 | `worker_status` / `read_pane` が **`choice_dialog`**（kind / title / options[number,label,highlighted] / numbered / recommended_action / auto_accepted）を返す。ダイアログ実在時は `input_status` を null にする（選択カーソルは入力欄と同じ字面なので、選択肢テキストを残留入力として報告してはならない） | M |
+| FR-2.25.4 | watch は permission を `WORKER_PERMISSION`、それ以外を **`WORKER_DIALOG`（種別つき）** として発火する。ダイアログ実在時は `question` イベントを出さない（本文への返信では解けない）。`trust` / `bypass` は停止として通知しない（待てば消える）。usage limit の対処ダイアログは `WORKER_ERROR`（#157 の kind）のまま扱い、`choice_dialog` を併せて返す（「解除まで待つ」復旧経路を迂回させない） | M |
+| FR-2.25.5 | **応答は番号かラベルで指定する**。番号は画面の番号（無ければ 1 始まりの順番）、ラベルは部分一致（大小無視）で、複数一致は曖昧として拒否する（黙って推測しない）。`choice` を省略すると**送信せず構造だけ返す**（下見。ツールを増やさず一覧と応答を同じコマンドで賄う） | M |
+| FR-2.25.6 | キー送出は実測に従う: **番号つきダイアログは番号キーだけで確定する**（Enter を足すと解消後の入力欄へ抜ける）。番号キーで確定しない TUI 向けに、ダイアログが残っているときだけ Enter を追送する。**番号なしダイアログでは番号キーが無反応**なので `↑`/`↓` で移動し、**ラベル一致で着地を検証してから** Enter を送る（着地できなければ Enter を送らずエラー = 誤選択を確定させない） | M |
+| FR-2.25.7 | 応答前にダイアログの実在を再検証し（#319 の原則を維持）、応答後に解消を検証して `resolved` を返す。応答は `persist.log` へ監査記録する（種別・選択・送ったキー・解消結果） | M |
+| FR-2.25.8 | **ダイアログ表示中の `Send`（テキスト / Enter 単独）は選択肢一覧つきのエラーで拒否する**。テキストは 1 文字ずつダイアログのキー操作として食われ、数字なら選択が確定し、Enter はハイライト中の選択肢を確定させるため。生のエスケープシーケンス（矢印キー等の低レベルキー送信）と、tako 自身が承諾する `trust` / `bypass` は通す | M |
+| FR-2.25.9 | supervisor（#401）の limit 系自動復旧は**盲目的な Enter / 固定番号をやめ**、下見 → 「解除まで待つ / 現状維持 / 停止」をラベルで選ぶ。課金・モデル変更しか選べないダイアログでは自動応答せず通知のみに落ちる（黙って課金プランやモデルを変えない） | M |
+| FR-2.25.10 | master のデフォルト system prompt に種別ごとの対応規範を書く（下見してから答える / usage_limit は待つ選択肢を選び課金系はユーザーへエスカレーション / plan_confirm は計画の一致を確認 / select は AskUserQuestion なら自分が答える / trust・bypass は触らない / 番号なしは矢印移動で tako が確定させる） | M |
+
+実装メモ（2026-08-04）: 構造検知は `tako-core::dialog`（`detect_choice_list` / `is_choice_dialog` /
+`numbered_choice` / `is_rule_line`。実採取画面 = permission / `/model` / plan 確認 / `/mcp` /
+AskUserQuestion / codex・agy を fixture 化）、種別分類と JSON 化は
+`tako-control::claude_tui`（`DialogKind` / `ChoiceDialog` / `detect_choice_dialog`。
+`detect_permission_dialog` は kind=permission の薄いラッパとして互換維持）、
+公開は `worker_status` / `Read` / `wait::WatchOutcome::ChoiceWaiting` /
+`dispatch_orchestrator_respond`（`choice: Option<String>`）/ CLI `tako orchestrator respond`
+（`--choice` 省略可）/ MCP `tako_orchestrator_respond`（ツール数は不変）。
+機械検証は tako-core 13 本 + claude_tui 6 本 + wait 3 本 + dispatch 8 本 + supervisor 2 本 +
+セルフテスト項目 102（実ペインに描いたダイアログで read の `choice_dialog` / `input_status`=null /
+テキスト送信と Enter 単独の拒否 / respond の下見 / 解消後に送信が通る）+
+実 claude e2e 2 本（permission の構造取得と**番号キーだけの確定** / `/model` を select として検知）。
+limit ダイアログは実機を limit まで使い切らずに再現できないため、
+**文言は claude v2.1.220 バイナリ内の実文字列**（`What do you want to do?` /
+`Stop and wait for limit to reset` / `Wait for limit to reset`）、
+**レイアウトは実採取の `/model` ダイアログ**から合成した fixture で固定している。
+
+FR-2.8〜2.25 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
 対応する MCP / CLI 操作（表示・読み取り・応答送信）を同時に提供する。
 提示系の体験は FR-2.7（AI 成果物プレゼンテーション）と一体で設計する。
 

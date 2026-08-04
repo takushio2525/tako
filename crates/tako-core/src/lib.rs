@@ -7,6 +7,7 @@ pub mod acceptance_gate;
 pub mod backend;
 pub mod byte_lru;
 pub mod command_card;
+pub mod dialog;
 pub mod git;
 pub mod handoff;
 pub mod header_layout;

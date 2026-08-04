@@ -60,7 +60,7 @@
     "name": "tako_split_pane"
   },
   {
-    "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行を付けて実行する）。対象の誤指定はそのまま誤実行になるため、必ず tako_list_panes で確認したペイン ID を渡すこと。tmux_session を指定するとペインが見つからない場合でも tmux session 経由で送信できる。await_prompt を true にすると、claude TUI のプロンプト（❯）が表示されるまで待ってからテキストを送信する。claude 等の全画面 TUI への改行つき送信は送達確認ループで配送される: 信頼ダイアログの自動承諾 → bracketed paste 貼り付け → 分離 Enter → 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残ったテキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。",
+    "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行を付けて実行する）。対象の誤指定はそのまま誤実行になるため、必ず tako_list_panes で確認したペイン ID を渡すこと。tmux_session を指定するとペインが見つからない場合でも tmux session 経由で送信できる。await_prompt を true にすると、claude TUI のプロンプト（❯）が表示されるまで待ってからテキストを送信する。claude 等の全画面 TUI への改行つき送信は送達確認ループで配送される: 信頼ダイアログの自動承諾 → bracketed paste 貼り付け → 分離 Enter → 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残ったテキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。#748: **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（入力欄が奪われており、テキストはダイアログのキー操作として食われ、数字なら選択が確定してしまう）。エラー本文に選択肢一覧が入るので、tako_orchestrator_respond で応答すること。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -95,7 +95,7 @@
     "name": "tako_send_input"
   },
   {
-    "description": "指定ペインの画面内容（表示中のテキスト）を返す。別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。queued_messages_pending が true なら、busy 中に人間が打った指示が claude のメッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても発火しない）。tako が idle 継続時に自動で送り出すので待つこと。このペインを閉じるとキューごと指示が失われる。",
+    "description": "指定ペインの画面内容（表示中のテキスト）を返す。別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。queued_messages_pending が true なら、busy 中に人間が打った指示が claude のメッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても発火しない）。tako が idle 継続時に自動で送り出すので待つこと。このペインを閉じるとキューごと指示が失われる。choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、かつては選択肢テキストが style=user の残留入力として報告されていた）。応答は tako_send_input ではなく tako_orchestrator_respond を使う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2089,7 +2089,7 @@
     "name": "tako_orchestrator_spawn"
   },
   {
-    "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ error（API エラー・usage limit 等の異常で停止。#157）/ gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。error 時は応答の error オブジェクトに kind（api_error = 続行指示で復帰可 / usage_limit = 解除時刻まで待つ / limit_dialog = モデル切替等のダイアログに応答）と detail（検知した画面上の行）、recommended_action（resume / wait_reset / respond_dialog）が入る。events 配列に直近の検知イベントが入る（#243）: question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）/ queued_messages_pending = 人間が busy 中に打った指示が claude のキューに未送信で残っている（#572。入力欄は空なので Enter 代行では発火しない。tako が自動で送り出すまで待ち、このペインを閉じない）。session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ 画面パターン推定にフォールバック（status_source が screen）。codex / agy worker は agents API が無いため常に画面推定で判定される（claude / codex / agy すべての入力欄・busy パターンに対応済み）。tmux_session を渡すとペインが消えても tmux session が生きている限り recent_output を取得でき、gone にならない。退避（shelved）されたペインも追跡可能。recent_output はペインの最近 30 行の出力。resolved_session_id に自動解決された session_id が入る。#390: spawn 済み worker はレジストリに登録済みのため、pane_id 指定でも tmux_session / session_id が自動補完され、ペイン消失後も追跡が切れない。worker（レジストリ ID）指定なら pane_id 省略可。応答の prompt_delivery（delivered / pending / undelivered）と events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる （undelivered なら tako_send_input でプロンプトを再送する）。#530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: 応答の resume_command（レジストリの session ID から組み立てた claude --resume）を ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。",
+    "description": "子 worker の状態を確認する。status は busy（作業中）/ idle（入力待ち・完了）/ error（API エラー・usage limit 等の異常で停止。#157）/ gone（ペイン消滅かつ tmux session も消滅）/ unknown（agents 不可）。error 時は応答の error オブジェクトに kind（api_error = 続行指示で復帰可 / usage_limit = 解除時刻まで待つ / limit_dialog = モデル切替等のダイアログに応答）と detail（検知した画面上の行）、recommended_action（resume / wait_reset / respond_dialog）が入る。events 配列に直近の検知イベントが入る（#243）: question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）/ queued_messages_pending = 人間が busy 中に打った指示が claude のキューに未送信で残っている（#572。入力欄は空なので Enter 代行では発火しない。tako が自動で送り出すまで待ち、このペインを閉じない）。session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ 画面パターン推定にフォールバック（status_source が screen）。codex / agy worker は agents API が無いため常に画面推定で判定される（claude / codex / agy すべての入力欄・busy パターンに対応済み）。tmux_session を渡すとペインが消えても tmux session が生きている限り recent_output を取得でき、gone にならない。退避（shelved）されたペインも追跡可能。recent_output はペインの最近 30 行の出力。resolved_session_id に自動解決された session_id が入る。#390: spawn 済み worker はレジストリに登録済みのため、pane_id 指定でも tmux_session / session_id が自動補完され、ペイン消失後も追跡が切れない。worker（レジストリ ID）指定なら pane_id 省略可。応答の prompt_delivery（delivered / pending / undelivered）と events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる （undelivered なら tako_send_input でプロンプトを再送する）。#530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: 応答の resume_command（レジストリの session ID から組み立てた claude --resume）を ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。#748: 選択肢ダイアログ（permission だけでなく usage limit の対処選択・モデル選択・plan 確認・AskUserQuestion・一覧選択も）が画面にあるときは status が waiting になり、応答の choice_dialog に構造（kind / title / options[number,label,highlighted] / numbered / recommended_action）が入る。events には choice_dialog（dialog_kind つき）が積まれ、このとき question は出さない（ダイアログ待ちは本文への返信では解けない）。kind が trust / bypass のものは tako 自身が承諾するので触らないこと（auto_accepted: true）。応答は tako_orchestrator_respond（choice 省略で下見できる）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2356,12 +2356,12 @@
     "name": "tako_orchestrator_run_result"
   },
   {
-    "description": "worker の permission ダイアログ（ツール実行の承認要求）に応答する（#319）。watch の WORKER_PERMISSION イベントで検知されたダイアログに対し、選択肢を指定して解除する。ダイアログが画面に存在しない場合はエラーを返す（誤爆防止）。応答内容は persist.log に監査記録される。危険なコマンド（rm -rf / 本番 DB 操作等）への承認はユーザーに確認すること。",
+    "description": "worker の**選択肢ダイアログ**に応答する（#319 permission → #748 で全種別）。対象は permission（ツール承認）のほか usage limit の対処選択・モデル選択（/model）・plan モードの実行確認・AskUserQuestion の質問・一覧選択（/mcp）など。watch の WORKER_PERMISSION / WORKER_DIALOG、または worker_status / read_pane の choice_dialog で検知されたダイアログに対して使う。**choice を省略すると送信せず構造だけ返す**（下見。選択肢一覧・現在のハイライト・番号キーの可否）。ダイアログが画面に存在しない場合はエラー（誤爆防止）。番号つきダイアログは番号キーだけで確定し、番号なしダイアログは矢印移動 + ラベル一致検証 + Enter で応答する。応答内容は persist.log に監査記録される。危険なコマンド（rm -rf / 本番 DB 操作等）への承認、および課金・モデル変更を伴う選択肢はユーザーに確認すること。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "choice": {
-          "description": "選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
+          "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
           "type": "string"
         },
         "pane_id": {
@@ -2370,8 +2370,7 @@
         }
       },
       "required": [
-        "pane_id",
-        "choice"
+        "pane_id"
       ],
       "type": "object"
     },

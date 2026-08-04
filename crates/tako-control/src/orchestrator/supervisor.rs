@@ -147,6 +147,58 @@ impl SupervisorState {
     }
 }
 
+/// limit 系ダイアログから「勝手に課金・モデル変更をしない」選択肢の番号を選ぶ（#748）。
+///
+/// 旧実装は `choice: "1"` 固定 / 素の Enter（= ハイライトされている選択肢の確定）だった。
+/// claude の limit ダイアログは実装上「待つ」選択肢が先頭とは限らず
+/// （バイナリ内の組み立てが `[...options, cancel]` になる分岐がある）、
+/// codex のダイアログは既定ハイライトが「Switch to <安いモデル>」なので、
+/// 盲目的な Enter は**黙って課金プラン変更 / モデル変更を確定させる**危険がある。
+///
+/// 優先順: 解除まで待つ > 現状維持 > 停止。いずれも無ければ `None`
+/// （呼び出し側は自動操作をやめて通知のみに落ちる）
+pub fn safe_limit_choice(dialog: &Value) -> Option<u32> {
+    let options = dialog.get("options")?.as_array()?;
+    let labeled: Vec<(u32, String)> = options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let number = o
+                .get("number")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or((i + 1) as u32);
+            let label = o
+                .get("label")
+                .and_then(|l| l.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            (number, label)
+        })
+        .collect();
+    for needle in ["wait for limit to reset", "keep current model"] {
+        if let Some((n, _)) = labeled.iter().find(|(_, l)| l.contains(needle)) {
+            return Some(*n);
+        }
+    }
+    labeled
+        .iter()
+        .find(|(_, l)| l == "stop" || l.starts_with("stop "))
+        .map(|(n, _)| *n)
+}
+
+/// ダイアログの構造を下見する（choice 省略 = 送信しない。#748）。
+/// ダイアログが無ければ `None`
+fn probe_dialog(ctx: &mut SupervisorContext) -> Option<Value> {
+    (ctx.exec)(Request::OrchestratorRespond {
+        pane_id: ctx.pane_id,
+        choice: None,
+        caller_role: Some("supervisor".to_string()),
+    })
+    .ok()
+    .filter(|v| v.get("options").is_some_and(|o| o.is_array()))
+}
+
 /// usage_limit のリセット時刻をパースする。
 /// claude: 「Your limit will reset at 3:00 AM JST」
 /// codex: 「try again at 4:24 AM」
@@ -284,53 +336,61 @@ pub fn recover_usage_limit(
         return false;
     }
 
-    // 1. usage limit ダイアログの安全選択肢を確定する
-    // claude: 「1. Stop and wait for limit to reset」を選択
-    // respond で既存のダイアログを確定させる（respond が無いときは Enter で確定）
-    let respond_result = (ctx.exec)(Request::OrchestratorRespond {
-        pane_id: ctx.pane_id,
-        choice: "1".to_string(),
-        caller_role: Some("supervisor".to_string()),
-    });
-
-    match respond_result {
-        Ok(_) => {
-            audit_log(
+    // 1. usage limit ダイアログの安全選択肢を確定する。
+    // #748: まず構造を下見し（choice 省略 = 送信しない）、「解除まで待つ」選択肢を
+    // **ラベルで**選ぶ。旧実装は choice="1" 固定で、選択肢の並びが変わると
+    // 課金プラン変更を確定させかねなかった。安全な選択肢が無ければ触らずに待つ
+    if let Some(dialog) = probe_dialog(ctx) {
+        match safe_limit_choice(&dialog) {
+            Some(number) => {
+                let respond_result = (ctx.exec)(Request::OrchestratorRespond {
+                    pane_id: ctx.pane_id,
+                    choice: Some(number.to_string()),
+                    caller_role: Some("supervisor".to_string()),
+                });
+                match respond_result {
+                    Ok(_) => audit_log(
+                        &ctx.worker_id,
+                        ctx.pane_id,
+                        action,
+                        &format!("dialog confirmed (choice {number} = wait/keep)"),
+                    ),
+                    Err(ref e) => {
+                        audit_log(
+                            &ctx.worker_id,
+                            ctx.pane_id,
+                            action,
+                            &format!("respond failed: {e}"),
+                        );
+                        state.failure_count += 1;
+                        state.record(RecoveryEntry {
+                            timestamp: crate::sessions::now_iso(),
+                            worker_id: ctx.worker_id.clone(),
+                            pane: ctx.pane_id,
+                            trigger: "usage_limit".into(),
+                            action: action.into(),
+                            success: false,
+                            detail: format!("respond failed: {e}"),
+                        });
+                        return false;
+                    }
+                }
+            }
+            None => audit_log(
                 &ctx.worker_id,
                 ctx.pane_id,
                 action,
-                "dialog confirmed (choice 1)",
-            );
+                "dialog found but no safe option (wait/keep/stop) — leaving it to master",
+            ),
         }
-        Err(ref e) if e.contains("ダイアログが見つからない") || e.contains("not found") =>
-        {
-            // ダイアログが既に確定済みの可能性 — 続行ナッジを試す
-            audit_log(
-                &ctx.worker_id,
-                ctx.pane_id,
-                action,
-                "no dialog found, proceeding to wait",
-            );
-        }
-        Err(ref e) => {
-            audit_log(
-                &ctx.worker_id,
-                ctx.pane_id,
-                action,
-                &format!("respond failed: {e}"),
-            );
-            state.failure_count += 1;
-            state.record(RecoveryEntry {
-                timestamp: crate::sessions::now_iso(),
-                worker_id: ctx.worker_id.clone(),
-                pane: ctx.pane_id,
-                trigger: "usage_limit".into(),
-                action: action.into(),
-                success: false,
-                detail: format!("respond failed: {e}"),
-            });
-            return false;
-        }
+    } else {
+        // ダイアログが無い（既に確定済み / limit メッセージのみ）— 待ちへ進む
+        audit_log(
+            &ctx.worker_id,
+            ctx.pane_id,
+            action,
+            "no dialog found, proceeding to wait",
+        );
     }
 
     // 2. リセット時刻を解析して待機
@@ -503,8 +563,41 @@ pub fn recover_limit_dialog(
         return false;
     }
 
-    // codex の「Approaching rate limits / Switch to gpt-…」は Enter で確定
-    let nudge = (ctx.exec)(send_request(ctx.pane_id, "\r".to_string()));
+    // #748: 旧実装は素の Enter（= ハイライト確定）で、codex の既定ハイライトが
+    // 「Switch to <安いモデル>」なので黙ってモデルを変えていた。構造を下見して
+    // 「現状維持 / 解除まで待つ」をラベルで選び、無ければ触らず master に委ねる
+    let Some(dialog) = probe_dialog(ctx) else {
+        audit_log(
+            &ctx.worker_id,
+            ctx.pane_id,
+            action,
+            "no dialog on screen (already resolved?)",
+        );
+        return false;
+    };
+    let Some(number) = safe_limit_choice(&dialog) else {
+        audit_log(
+            &ctx.worker_id,
+            ctx.pane_id,
+            action,
+            "no safe option (wait/keep/stop) — notify only",
+        );
+        state.record(RecoveryEntry {
+            timestamp: crate::sessions::now_iso(),
+            worker_id: ctx.worker_id.clone(),
+            pane: ctx.pane_id,
+            trigger: "limit_dialog".into(),
+            action: action.into(),
+            success: false,
+            detail: "安全な選択肢が無いため自動応答しない（master が respond する）".into(),
+        });
+        return false;
+    };
+    let nudge = (ctx.exec)(Request::OrchestratorRespond {
+        pane_id: ctx.pane_id,
+        choice: Some(number.to_string()),
+        caller_role: Some("supervisor".to_string()),
+    });
     if let Err(ref e) = nudge {
         audit_log(
             &ctx.worker_id,
@@ -524,6 +617,12 @@ pub fn recover_limit_dialog(
         });
         return false;
     }
+    audit_log(
+        &ctx.worker_id,
+        ctx.pane_id,
+        action,
+        &format!("dialog confirmed (choice {number} = wait/keep)"),
+    );
 
     let verified = verify_recovery(ctx, Duration::from_secs(30));
     audit_log(
@@ -1060,6 +1159,8 @@ mod tests {
         respond_result: Result<Value, String>,
         status_sequence: Vec<&'static str>,
         status_idx: Arc<Mutex<usize>>,
+        /// #748: `respond`（choice 省略）が返すダイアログ構造
+        dialog: Value,
     }
 
     impl ExecRecorder {
@@ -1073,6 +1174,17 @@ mod tests {
                 },
                 status_sequence: statuses,
                 status_idx: Arc::new(Mutex::new(0)),
+                // 実 claude の limit ダイアログ相当（「待つ」が先頭ではない並びにして、
+                // choice="1" 固定だと課金プラン変更を選んでしまう配置を再現する）
+                dialog: json!({
+                    "kind": "usage_limit",
+                    "numbered": true,
+                    "highlighted": 0,
+                    "options": [
+                        {"number": 1, "label": "Upgrade to Max 20x for higher session limits every month", "highlighted": true},
+                        {"number": 2, "label": "Stop and wait for limit to reset", "highlighted": false},
+                    ],
+                }),
             }
         }
 
@@ -1081,6 +1193,9 @@ mod tests {
             self.calls.lock().unwrap().push(kind.clone());
 
             match req {
+                // #748: choice 省略 = 下見（送信しない）。構造を返さないと
+                // supervisor は「ダイアログ無し」と判断して自動応答しない
+                Request::OrchestratorRespond { choice: None, .. } => Ok(self.dialog.clone()),
                 Request::OrchestratorRespond { .. } => self.respond_result.clone(),
                 Request::Send { .. } => Ok(json!({"ok": true})),
                 Request::OrchestratorWorkerStatus { .. } => {
@@ -1239,11 +1354,88 @@ mod tests {
         assert!(ok);
 
         let kinds = rec.call_kinds();
+        // #748: 素の Enter（Send）ではなく respond（下見 → 安全な選択肢）で確定する
         assert!(
-            kinds.iter().any(|k| k == "Send"),
-            "should confirm dialog: {kinds:?}"
+            !kinds.iter().any(|k| k == "Send"),
+            "盲目的な Enter は送らない: {kinds:?}"
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "OrchestratorRespond").count(),
+            2,
+            "下見 + 応答の 2 回: {kinds:?}"
         );
         assert_eq!(state.history[0].trigger, "limit_dialog");
+    }
+
+    #[test]
+    fn issue748_safe_limit_choiceは待つ選択肢を選ぶ() {
+        // 「待つ」が先頭でない並び（claude の実装は cancel を末尾に置く分岐がある）。
+        // 旧実装の choice="1" 固定ならプラン変更を確定させていた
+        let dialog = json!({
+            "options": [
+                {"number": 1, "label": "Upgrade to Max 20x for higher session limits every month"},
+                {"number": 2, "label": "Continue with usage credits"},
+                {"number": 3, "label": "Stop and wait for limit to reset"},
+            ],
+        });
+        assert_eq!(safe_limit_choice(&dialog), Some(3));
+
+        // codex のモデル切替ダイアログ: 現状維持を選ぶ（既定ハイライトは切替側）
+        let codex = json!({
+            "options": [
+                {"number": 1, "label": "Switch to gpt-5.4-mini"},
+                {"number": 2, "label": "Keep current model"},
+                {"number": 3, "label": "Keep current model (never show again)"},
+            ],
+        });
+        assert_eq!(safe_limit_choice(&codex), Some(2));
+
+        // 「Stop」だけの短縮ラベル（バイナリ内で `VfS?"Stop":…` の分岐がある）
+        let short = json!({
+            "options": [
+                {"number": 1, "label": "Upgrade to Team plan"},
+                {"number": 2, "label": "Stop"},
+            ],
+        });
+        assert_eq!(safe_limit_choice(&short), Some(2));
+
+        // 課金・変更しかない並びでは自動では選ばない（master / user に委ねる）
+        let unsafe_only = json!({
+            "options": [
+                {"number": 1, "label": "Upgrade to Max 20x"},
+                {"number": 2, "label": "Buy usage credits"},
+            ],
+        });
+        assert_eq!(safe_limit_choice(&unsafe_only), None);
+    }
+
+    #[test]
+    fn issue748_安全な選択肢が無ければ自動応答しない() {
+        let mut rec = ExecRecorder::new(true, vec!["busy"]);
+        // 課金・変更しかないダイアログを返す
+        rec.dialog = json!({
+            "kind": "usage_limit",
+            "numbered": true,
+            "highlighted": 0,
+            "options": [
+                {"number": 1, "label": "Upgrade to Max 20x", "highlighted": true},
+                {"number": 2, "label": "Buy usage credits", "highlighted": false},
+            ],
+        });
+        let mut exec = |r: Request| rec.exec(r);
+        let mut ctx = make_ctx(&mut exec, SupervisorMode::Auto);
+        let mut state = SupervisorState::default();
+
+        let ok = recover_limit_dialog(&mut ctx, "Approaching rate limits", &mut state);
+        assert!(!ok, "自動では確定しない");
+        let kinds = rec.call_kinds();
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "OrchestratorRespond").count(),
+            1,
+            "下見だけで応答は送らない: {kinds:?}"
+        );
+        assert!(!kinds.iter().any(|k| k == "Send"), "{kinds:?}");
+        assert!(!state.history[0].success);
     }
 
     #[test]

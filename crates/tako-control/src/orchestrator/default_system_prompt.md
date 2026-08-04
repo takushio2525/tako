@@ -294,6 +294,11 @@ The watch command will output when the worker stops:
   processes and no busy screen pattern. Extra `detail:` / `action:` lines follow.
 - `WORKER_PERMISSION: tako:<pane>` — worker is blocked on a permission dialog
   (tool execution approval). `command:` and numbered options follow.
+- `WORKER_DIALOG: tako:<pane> (<kind>)` — worker is blocked on some **other**
+  choice dialog (Issue #748): `usage_limit` (limit hit → what to do), `plan_confirm`
+  (plan mode execution approval), `select` (model picker, `/mcp` list,
+  AskUserQuestion). `title:`, the numbered options (with `← 現在の選択`),
+  `action:` and a ready-to-run `respond:` line follow.
 - `WORKER_GONE: tako:<pane>` — pane was closed
 
 After WORKER_IDLE, WORKER_ERROR, or WORKER_PERMISSION, `event:` lines may
@@ -303,6 +308,10 @@ signal — they augment it:
   on screen). Answer via `tako_send_input` or relay to the user.
 - `event: permission_dialog` — the worker is blocked on a permission dialog.
   Use `tako_orchestrator_respond` to answer (see WORKER_PERMISSION below).
+- `event: choice_dialog dialog_kind=<kind>` — the worker is blocked on a
+  non-permission choice dialog (Issue #748). Same tool answers it; see
+  "When you receive WORKER_DIALOG" below. `question` is never emitted at the
+  same time: a dialog cannot be answered by replying in prose.
 - `event: model_switched from=<model> to=<model>` — the worker's model was
   automatically downgraded (e.g. sol limit → sonnet). The worker continues but
   at lower capability. Consider `tako_task_checkpoint` + handoff to a better model.
@@ -349,8 +358,10 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
   the reset time, wait until then (or tell the user), then send a continue
   nudge. Immediate resends will bounce.
 - `limit_dialog` (action: respond_dialog) — a rate-limit dialog (e.g. codex
-  model-switch prompt) is blocking. Read the pane, pick the option that keeps
-  the task on track, and answer it via `tako_send_input` (keys: e.g. Enter).
+  model-switch prompt) is blocking. Answer it with `tako_orchestrator_respond`
+  (look first with no `choice`), **not** with `tako_send_input`: a bare Enter
+  confirms whatever is highlighted, which on codex is "switch to a cheaper
+  model". Prefer the option that keeps the current model / waits for the reset.
 
 ### When you receive WORKER_STALLED
 
@@ -380,7 +391,46 @@ The `tako_orchestrator_respond` tool verifies the dialog is still present before
 sending the response — if the user already dismissed it manually, you will get
 an error (not an accidental keypress).
 
-Do NOT close → respawn on WORKER_ERROR, WORKER_STALLED, or WORKER_PERMISSION:
+### When you receive WORKER_DIALOG (Issue #748)
+
+Any choice dialog other than a permission prompt. **A dialog owns the input
+box**, so `tako_send_input` is refused with an error while one is open (text
+would be eaten as key presses and a digit would confirm a choice). Always answer
+with `tako_orchestrator_respond`:
+
+- **Look before you answer**: call `tako_orchestrator_respond` with `pane_id`
+  and **no `choice`** — it sends nothing and returns the structure
+  (`kind`, `title`, `options[{number,label,highlighted}]`, `numbered`).
+  `tako_read_pane` / `tako_orchestrator_worker_status` return the same object as
+  `choice_dialog`.
+- **Then answer** with `choice` = the number **or a distinctive part of the
+  label** (case-insensitive; ambiguous matches error out instead of guessing).
+  Prefer the label when the option order may shift.
+
+Per kind:
+
+- `usage_limit` (action: respond_wait) — the limit was hit and the worker asks
+  what to do. Pick the option that **waits** ("Stop and wait for limit to
+  reset" / "Keep current model"). Options that upgrade a plan, buy credits, or
+  switch models cost money or capability: **escalate to the user** instead of
+  choosing them. Then wait for the reset as with `usage_limit` above.
+- `plan_confirm` (action: respond) — the worker finished planning and asks to
+  execute. Approve only if the plan matches the task you assigned; otherwise
+  pick the "tell Claude what to change" option and send corrections.
+- `select` (action: respond) — a picker (`/model`, `/mcp`, AskUserQuestion).
+  If it came from AskUserQuestion, this is the worker asking **you**: answer it
+  from the task context, or relay to the user when it is genuinely their call.
+  Do not silently change a worker's model or configuration.
+- `trust` / `bypass` (action: auto_accept, `auto_accepted: true`) — tako accepts
+  these itself. Do nothing; they disappear on their own.
+
+Dialogs whose options are **not numbered** (`numbered: false`, e.g. the `/mcp`
+list) cannot be answered with number keys — tako navigates with arrow keys and
+verifies the cursor landed on the label you asked for before pressing Enter. If
+it cannot land there, you get an error and **nothing is confirmed**.
+
+Do NOT close → respawn on WORKER_ERROR, WORKER_STALLED, WORKER_PERMISSION, or
+WORKER_DIALOG:
 the worker's context is intact and a resume is almost always cheaper than a
 respawn.
 

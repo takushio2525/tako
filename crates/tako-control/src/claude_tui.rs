@@ -29,7 +29,159 @@ use serde_json::json;
 
 // --- 画面状態の検出（純関数） ---
 
-// --- permission ダイアログ検知（#319） ---
+// --- 選択肢ダイアログ検知（#319 permission → #748 で一般化） ---
+
+/// 選択肢ダイアログの種別（Issue #748）。
+///
+/// **存在判定は構造**（`tako_core::dialog`）、**種別だけが文言**という切り分けにしている。
+/// 文言リストで種別が分からなくても `Select` に落ちるだけで、ダイアログとしては
+/// 検知され続ける（未知のダイアログを素通りさせない = #530 の教訓）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    /// ツール実行の承認要求（Allow once / Do you want to proceed?）
+    Permission,
+    /// フォルダ信頼（tako が自動承諾する）
+    Trust,
+    /// Bypass Permissions の確認（tako が ↓ + Enter で承諾する）
+    Bypass,
+    /// usage limit / rate limit 到達時の対処選択
+    /// （claude「What do you want to do?」/ codex「Approaching rate limits」）
+    UsageLimit,
+    /// plan モードの実行確認（`Would you like to proceed?`）
+    PlanConfirm,
+    /// それ以外の選択（`/model` のモデル選択・`/mcp` の一覧・AskUserQuestion 等）
+    Select,
+}
+
+impl DialogKind {
+    /// JSON / イベント行に載せる機械可読 slug
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Trust => "trust",
+            Self::Bypass => "bypass",
+            Self::UsageLimit => "usage_limit",
+            Self::PlanConfirm => "plan_confirm",
+            Self::Select => "select",
+        }
+    }
+
+    /// master 向けの推奨アクション（worker_status / watch の JSON にそのまま載せる）
+    pub fn recommended_action(self) -> &'static str {
+        match self {
+            // tako 自身が承諾するので master は待てばよい（勝手に respond しない）
+            Self::Trust | Self::Bypass => "auto_accept",
+            // 解除まで待つ選択肢を選ぶ（他の選択肢は課金・モデル変更を伴う）
+            Self::UsageLimit => "respond_wait",
+            _ => "respond",
+        }
+    }
+
+    /// tako が自動で承諾する種別か（master が触ってはいけないもの）
+    pub fn auto_accepted(self) -> bool {
+        matches!(self, Self::Trust | Self::Bypass)
+    }
+}
+
+/// 画面に実在する選択肢ダイアログの構造化情報（Issue #748）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceDialog {
+    /// 種別（文言由来。不明なら `Select`）
+    pub kind: DialogKind,
+    /// ダイアログ本文（罫線の内側だけを連結したもの）
+    pub title: String,
+    /// 選択肢（表示順）
+    pub options: Vec<tako_core::dialog::ChoiceOption>,
+    /// ハイライト位置（`options` の添字）
+    pub highlighted: Option<usize>,
+    /// 番号キーで選べるか（false = `↑`/`↓` 移動 + Enter が必要）
+    pub numbered: bool,
+}
+
+impl ChoiceDialog {
+    /// worker_status / read / watch が返す共通の JSON 形（形が食い違うと master の分岐が壊れる）
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "kind": self.kind.as_str(),
+            "title": self.title,
+            "numbered": self.numbered,
+            "highlighted": self.highlighted,
+            "recommended_action": self.kind.recommended_action(),
+            "auto_accepted": self.kind.auto_accepted(),
+            "options": self.options.iter().map(|o| json!({
+                "number": o.number,
+                "label": o.label,
+                "highlighted": o.highlighted,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// 選択肢のラベル一覧（エラーメッセージ・後方互換の `PermissionDialog` 用）
+    pub fn labels(&self) -> Vec<String> {
+        self.options.iter().map(|o| o.label.clone()).collect()
+    }
+}
+
+/// 画面から選択肢ダイアログを検知する（Issue #748）。
+///
+/// 存在判定は `tako_core::dialog::detect_choice_list`（構造）、種別は文言。
+/// permission だけを見ていた `detect_permission_dialog` の一般化で、
+/// usage limit の対処選択・`/model`・`/mcp`・plan 確認・AskUserQuestion を
+/// **同じ形**で拾えるようにする（実採取画面は `tako_core::dialog` のテスト参照）
+pub fn detect_choice_dialog(lines: &[String]) -> Option<ChoiceDialog> {
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let list = tako_core::dialog::detect_choice_list(&refs)?;
+    let kind = classify_dialog(lines, &list);
+    Some(ChoiceDialog {
+        kind,
+        title: list.header.join(" ").trim().to_string(),
+        options: list.options,
+        highlighted: list.highlighted,
+        numbered: list.numbered,
+    })
+}
+
+/// ダイアログの種別を文言で分類する。判定順は「復帰手段が特殊なものから」
+fn classify_dialog(lines: &[String], list: &tako_core::dialog::ChoiceList) -> DialogKind {
+    if is_trust_dialog(lines) {
+        return DialogKind::Trust;
+    }
+    if is_bypass_dialog(lines) {
+        return DialogKind::Bypass;
+    }
+    // usage limit の対処選択。文言は claude v2.1.220 のバイナリ内文字列
+    // （「What do you want to do?」「Stop and wait for limit to reset」
+    // 「Wait for limit to reset」）と codex の実採取（「Approaching rate limits」）由来
+    let limit_option = list
+        .options
+        .iter()
+        .any(|o| o.label.to_lowercase().contains("wait for limit to reset"));
+    let limit_title = list
+        .header
+        .iter()
+        .any(|h| h.contains("What do you want to do?"))
+        && lines.iter().any(|l| l.contains("limit"));
+    if lines.iter().any(|l| l.contains("Approaching rate limits")) || limit_option || limit_title {
+        return DialogKind::UsageLimit;
+    }
+    if lines.iter().any(|l| {
+        l.contains("Allow once")
+            || l.contains("Allow for this session")
+            || l.contains("Always allow")
+            || l.contains("Do you want to proceed?")
+    }) {
+        return DialogKind::Permission;
+    }
+    // plan モードの実行確認（実採取: 「Claude has written up a plan and is ready to
+    // execute. Would you like to proceed?」）
+    if lines
+        .iter()
+        .any(|l| l.contains("ready to execute") || l.contains("Would you like to proceed?"))
+    {
+        return DialogKind::PlanConfirm;
+    }
+    DialogKind::Select
+}
 
 /// Claude Code / codex / agy の permission ダイアログ（ツール実行の承認要求）の構造化情報
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,104 +211,20 @@ pub struct PermissionDialog {
 /// 奪われている状態を必要条件にする。生成中・通常応答中は入力欄が最下部に
 /// 見えている（claude は busy 中も入力を受け付ける）ので構造で切り分けられる
 pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
-    if is_trust_dialog(lines) {
+    let dialog = detect_choice_dialog(lines)?;
+    if dialog.kind != DialogKind::Permission {
+        // trust / bypass は別経路で自動承諾、usage limit は #157 の WORKER_ERROR、
+        // その他の選択は #748 の `choice_dialog` が扱う
         return None;
     }
-    if is_bypass_dialog(lines) {
-        return None;
-    }
-    if lines.iter().any(|l| l.contains("Approaching rate limits")) {
-        return None;
-    }
-    // #577: 本文中の「選択肢つきの問いかけ」を弾く実在検査（詳細は関数コメント）
-    if !is_choice_dialog(lines) {
-        return None;
-    }
-
-    // permission ダイアログの選択肢パターンを探す
-    let has_permission_marker = lines.iter().any(|l| {
-        l.contains("Allow once")
-            || l.contains("Allow for this session")
-            || l.contains("Always allow")
-            || (l.contains("Do you want to proceed?"))
-    });
-    if !has_permission_marker {
-        return None;
-    }
-
-    // コマンド/操作の説明を抽出。ダイアログ本体は罫線ボックスで囲まれ、選択肢の
-    // 直前に説明行が並ぶ。画面全体を capture すると上端のバナー・cwd・ユーザー発話も
-    // 含まれるため、「区切り（空行・罫線）から選択肢までの**連続ブロック**」だけを
-    // command とする（区切りに当たるたびにブロックをリセット）
-    let mut command_block: Vec<String> = Vec::new();
-    let mut options = Vec::new();
-    let mut highlighted: Option<usize> = None;
-    let mut in_choices = false;
-
-    for line in lines {
-        let trimmed = line.trim();
-        // 空行はスキップ（リセットしない: claude の実ダイアログは本体に空行を挟む）。
-        // 選択肢下のヘルプ行もスキップ
-        if trimmed.is_empty() || trimmed.starts_with("Press enter") || trimmed.starts_with("Esc ") {
-            continue;
-        }
-        // 選択カーソル ❯ / > を除去した内容テキスト。
-        // ❯ は UTF-8 で 3 バイト（U+276F）、> は ASCII 1 バイト
-        let (is_highlighted, inner) = if let Some(rest) = trimmed.strip_prefix("❯ ") {
-            (true, rest.trim_start())
-        } else if let Some(rest) = trimmed.strip_prefix("> ") {
-            (true, rest.trim_start())
-        } else {
-            (false, trimmed)
-        };
-
-        // 番号付き選択肢行: 「N. テキスト」（N=1〜9）
-        let numbered = is_numbered_choice(inner);
-
-        if numbered {
-            in_choices = true;
-            if is_highlighted {
-                highlighted = Some(options.len());
-            }
-            options.push(inner[3..].trim().to_string());
-        } else if !in_choices {
-            // 選択肢の前 = コマンド説明部分の候補
-            let desc = trimmed
-                .trim_start_matches("? ")
-                .trim_start_matches("❯ ")
-                .trim_start_matches("> ");
-            if is_box_rule(desc) {
-                // 罫線 = ダイアログボックスの境界。直前までのブロック（画面上端の
-                // バナー・cwd・ユーザー発話等）を捨て、ボックス内だけを command にする
-                command_block.clear();
-            } else if !desc.contains("Navigate") && !desc.contains("ctrl+g") {
-                command_block.push(desc.to_string());
-            }
-        }
-    }
-
-    if options.is_empty() {
-        return None;
-    }
-
-    let command = command_block.join(" ").trim().to_string();
     Some(PermissionDialog {
-        command,
-        options,
-        highlighted,
+        command: dialog.title.clone(),
+        options: dialog.labels(),
+        highlighted: dialog.highlighted,
     })
 }
 
-/// 番号付き選択肢の本文か（「N. テキスト」。N は 1 桁の数字）。
-/// 選択カーソル（`❯` / `›` / `>`）は呼び出し側で剥がしてから渡す
-fn is_numbered_choice(inner: &str) -> bool {
-    inner.len() > 2
-        && inner.as_bytes()[0].is_ascii_digit()
-        && inner.as_bytes()[1] == b'.'
-        && inner.as_bytes()[2] == b' '
-}
-
-/// 番号付き選択ダイアログが表示されているか（Issue #530）。
+/// 選択ダイアログが表示されているか（Issue #530 → #748 で番号なしも対象）。
 ///
 /// **文言ではなく構造で判定する**のが要点。`is_trust_dialog` / `is_bypass_dialog` は
 /// 既知の文言に依存するため、未知のダイアログを素通りさせる。実際 `CLAUDE_CONFIG_DIR`
@@ -166,58 +234,12 @@ fn is_numbered_choice(inner: &str) -> bool {
 /// その結果プロンプトがダイアログに食われて消え、後段の「入力欄が空 = 送信成功」判定が
 /// 偽陽性になる（#530 の根因）。
 ///
-/// 判定条件は「画面最下部のプロンプト行の内容が `N. …` の形」かつ
-/// 「画面に番号付き選択肢が 2 つ以上ある」。単発の `1. ` 入力や、応答本文中の
-/// 箇条書き（最下部の入力欄は空）を誤ってダイアログ扱いしない
+/// 判定の実装は `tako_core::dialog`（番号つき / 番号なしの 2 経路）に 1 本化してある。
+/// **入力欄判定・送達フロー・worker 状態がすべて同じ関数を通る**のが要点で、
+/// 片方だけ古い判定を使っていると `/mcp` の一覧行が入力欄に見える（#748 の観測 1）
 pub fn is_choice_dialog(lines: &[String]) -> bool {
-    let Some(bottom) = bottom_prompt_content(lines) else {
-        return false;
-    };
-    if !is_numbered_choice(bottom) {
-        return false;
-    }
-    lines
-        .iter()
-        .filter(|l| {
-            let t = l.trim();
-            let inner = t
-                .strip_prefix("❯ ")
-                .or_else(|| t.strip_prefix("› "))
-                .or_else(|| t.strip_prefix("> "))
-                .unwrap_or(t)
-                .trim_start();
-            is_numbered_choice(inner)
-        })
-        .count()
-        >= 2
-}
-
-/// 罫線ボックスの境界行か（罫線文字と空白のみで構成される非空行）。
-/// これに当たると、それより前の説明候補（画面上端のバナー・cwd 等）を切り捨てる。
-/// 空行は境界にしない（claude の実ダイアログは本体に空行を挟むため）
-fn is_box_rule(desc: &str) -> bool {
-    !desc.is_empty()
-        && desc.chars().all(|c| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    '─' | '━'
-                        | '│'
-                        | '┃'
-                        | '╭'
-                        | '╮'
-                        | '╰'
-                        | '╯'
-                        | '┌'
-                        | '┐'
-                        | '└'
-                        | '┘'
-                        | '├'
-                        | '┤'
-                        | '╌'
-                        | '╍'
-                )
-        })
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    tako_core::dialog::is_choice_dialog(&refs)
 }
 
 /// claude TUI の画面状態
@@ -1671,14 +1693,17 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
     }
 
     #[test]
-    fn is_box_ruleは罫線行のみtrue() {
-        assert!(is_box_rule("──────────"));
-        assert!(is_box_rule("╭──────╮"));
-        assert!(is_box_rule("  │   │  "));
+    fn 罫線行の判定はcoreの実装を通る() {
+        // #748: 罫線判定は `tako_core::dialog::is_rule_line` に 1 本化した
+        // （`▔▔▔` 系を足したのは `/model` / `/mcp` の実採取に合わせたため）
+        use tako_core::dialog::is_rule_line;
+        assert!(is_rule_line("──────────"));
+        assert!(is_rule_line("╭──────╮"));
+        assert!(is_rule_line("  │───│  "));
         // 空行は境界にしない（本体に空行を挟む claude 版を壊さないため）
-        assert!(!is_box_rule(""));
-        assert!(!is_box_rule("Bash command"));
-        assert!(!is_box_rule("Allow this command?"));
+        assert!(!is_rule_line(""));
+        assert!(!is_rule_line("Bash command"));
+        assert!(!is_rule_line("Allow this command?"));
     }
 
     // --- #530: CLAUDE_CONFIG_DIR 切替時の初回ダイアログ（実採取。claude v2.1.220） ---
@@ -1840,6 +1865,160 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
                 "{name} は permission ダイアログとして検知される"
             );
         }
+    }
+
+    // --- #748: 選択肢ダイアログの一般化（種別分類） ---
+
+    /// claude の usage limit 対処ダイアログ。
+    /// **文言は claude v2.1.220 バイナリ内の実文字列**（`What do you want to do?` /
+    /// `Stop and wait for limit to reset` / `Upgrade to Max 20x for higher session limits
+    /// every month`）、**レイアウトは実採取の `/model` 選択ダイアログ**から合成した
+    /// （実機を limit まで使い切らずに再現できないため。#748 のコメントに経緯を記録）
+    const CLAUDE_LIMIT_DIALOG: &str = r#"⏺ 続けて実装します
+  ⎿  Claude usage limit reached. Your limit will reset at 3am.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Upgrade to Max 20x for higher session limits every month
+     3. Continue with usage credits
+
+   Enter to confirm · Esc to cancel"#;
+
+    /// `/model` のモデル選択（#748 実採取。permission でも limit でもない一般の選択）
+    const MODEL_SELECT: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models.
+
+     1. Default (recommended)  Opus 5 with 1M context
+   ❯ 2. Opus (1M context)      Opus 5 with 1M context
+     3. Sonnet                 Sonnet 5 · Efficient for routine tasks
+
+   Enter to set as default · Esc to cancel"#;
+
+    /// plan モードの実行確認（#748 実採取）
+    const PLAN_CONFIRM: &str = r#"  ────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change"#;
+
+    /// `/mcp` の一覧（#748 実採取。**番号なし** = 番号キーが無反応なダイアログ）
+    const MCP_LIST: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Manage MCP servers
+   3 servers
+
+     User MCPs
+   ❯ context7 · ✔ connected · 2 tools
+     filesystem · ✔ connected · 14 tools
+     tako · ✔ connected · 133 tools
+
+   ↑/↓ to navigate · Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn issue748_limitダイアログをusage_limitとして分類する() {
+        let lines = screen(CLAUDE_LIMIT_DIALOG);
+        let dialog = detect_choice_dialog(&lines).expect("検知される");
+        assert_eq!(dialog.kind, DialogKind::UsageLimit);
+        assert!(dialog.numbered, "番号キーで選べる");
+        assert_eq!(dialog.options.len(), 3);
+        assert_eq!(dialog.options[0].label, "Stop and wait for limit to reset");
+        assert_eq!(dialog.highlighted, Some(0));
+        assert_eq!(dialog.kind.recommended_action(), "respond_wait");
+        // permission ではないので承認カード / permission_dialog には出さない（既存互換）
+        assert!(detect_permission_dialog(&lines).is_none());
+        // #748 観測 1: 選択肢テキストを入力欄と見なさない
+        assert_eq!(input_line(&lines), None);
+    }
+
+    #[test]
+    fn issue748_モデル選択とplan確認とmcp一覧を種別つきで検知する() {
+        for (name, src, kind, numbered) in [
+            ("model", MODEL_SELECT, DialogKind::Select, true),
+            ("plan", PLAN_CONFIRM, DialogKind::PlanConfirm, true),
+            ("mcp", MCP_LIST, DialogKind::Select, false),
+        ] {
+            let lines = screen(src);
+            let dialog =
+                detect_choice_dialog(&lines).unwrap_or_else(|| panic!("{name} が検知されない"));
+            assert_eq!(dialog.kind, kind, "{name} の種別");
+            assert_eq!(dialog.numbered, numbered, "{name} の番号キー可否");
+            assert!(dialog.highlighted.is_some(), "{name} のハイライト");
+            // permission ダイアログとしては出さない（master の対応が別）
+            assert!(detect_permission_dialog(&lines).is_none(), "{name}");
+            // 入力欄を奪っている = プロンプトを貼ってはいけない
+            assert_eq!(input_line(&lines), None, "{name}");
+            assert_eq!(detect(&lines), ClaudeScreen::ChoiceDialog, "{name}");
+        }
+    }
+
+    #[test]
+    fn issue748_permission系は種別permissionで既存apiと一致する() {
+        for (name, src) in [
+            ("claude bash", CLAUDE_BASH_PERMISSION),
+            ("claude file", CLAUDE_FILE_PERMISSION),
+            ("claude banner", CLAUDE_DIALOG_WITH_BANNER),
+            ("agy", AGY_PERMISSION_DIALOG),
+        ] {
+            let lines = screen(src);
+            let dialog = detect_choice_dialog(&lines).expect(name);
+            assert_eq!(dialog.kind, DialogKind::Permission, "{name}");
+            let legacy = detect_permission_dialog(&lines).expect(name);
+            assert_eq!(legacy.options, dialog.labels(), "{name} の選択肢が一致");
+            assert_eq!(legacy.highlighted, dialog.highlighted, "{name}");
+            assert_eq!(legacy.command, dialog.title, "{name}");
+        }
+    }
+
+    #[test]
+    fn issue748_trustとbypassは自動承諾扱いで種別が分かれる() {
+        let trust = detect_choice_dialog(&screen(TRUST_DIALOG)).expect("検知される");
+        assert_eq!(trust.kind, DialogKind::Trust);
+        assert!(
+            trust.kind.auto_accepted(),
+            "tako が承諾するので master は触らない"
+        );
+        let bypass = detect_choice_dialog(&screen(BYPASS_DIALOG)).expect("検知される");
+        assert_eq!(bypass.kind, DialogKind::Bypass);
+        assert!(bypass.kind.auto_accepted());
+    }
+
+    #[test]
+    fn issue748_通常画面ではダイアログを検知しない() {
+        for (name, src) in [
+            ("claude ready", READY_BARE),
+            ("claude placeholder", READY_PLACEHOLDER),
+            ("claude 入力中", INPUT_PENDING),
+            ("codex ready", CODEX_READY),
+            ("agy ready", AGY_READY),
+            ("キュー滞留", QUEUED_STRANDED),
+            ("本文の問いかけ", QUESTION_WITH_CHOICES),
+        ] {
+            assert!(
+                detect_choice_dialog(&screen(src)).is_none(),
+                "{name} はダイアログではない"
+            );
+        }
+    }
+
+    #[test]
+    fn issue748_ダイアログのjsonは共通形を返す() {
+        let dialog = detect_choice_dialog(&screen(CLAUDE_LIMIT_DIALOG)).expect("検知される");
+        let v = dialog.to_json();
+        assert_eq!(v["kind"], "usage_limit");
+        assert_eq!(v["numbered"], true);
+        assert_eq!(v["highlighted"], 0);
+        assert_eq!(v["recommended_action"], "respond_wait");
+        assert_eq!(v["auto_accepted"], false);
+        assert_eq!(v["options"][0]["number"], 1);
+        assert_eq!(v["options"][0]["label"], "Stop and wait for limit to reset");
+        assert_eq!(v["options"][0]["highlighted"], true);
+        assert!(v["title"]
+            .as_str()
+            .unwrap()
+            .contains("What do you want to do?"));
     }
 
     // --- 生成中のライブ表示（#719） ---

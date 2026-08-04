@@ -861,13 +861,15 @@ pub enum Request {
     /// 未完了なら `phase: "running"` を返す。完了済みなら出力取得 + auto_close +
     /// レジストリから除去
     OrchestratorRunResult { run_id: String },
-    /// オーケストレーター: worker の permission ダイアログへの応答（#319）。
+    /// オーケストレーター: worker の選択肢ダイアログへの応答（#319 → #748 で一般化）。
     /// ダイアログが画面上に存在することを検証してから選択キーを送る。
     /// 不在時はエラー（誤爆防止）
     OrchestratorRespond {
         pane_id: u64,
-        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
-        choice: String,
+        /// 選択肢の番号（画面の番号 or 1-based の順番）／ラベルの部分一致／
+        /// "yes"/"no" エイリアス。**省略すると送信せず構造だけ返す**（下見。#748）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<String>,
         /// 呼び出し元の TAKO_ORCHESTRATOR_ROLE（監査ログ用）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,

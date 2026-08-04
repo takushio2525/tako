@@ -840,7 +840,7 @@ impl TakoApp {
             self,
             tako_control::protocol::Request::OrchestratorRespond {
                 pane_id: pane_id.as_u64(),
-                choice: choice.to_string(),
+                choice: Some(choice.to_string()),
                 caller_role: None,
             },
             PaneOrigin::User,
