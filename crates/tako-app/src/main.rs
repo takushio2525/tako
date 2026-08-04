@@ -19888,6 +19888,369 @@ mod self_test {
         Some(m)
     }
 
+    /// #745 のフィクスチャ: 報告そのままの形（2 列 / 短い左列 + 長い右列 / 日本語）に、
+    /// エッジ（3 列 + 折り返せない長い英単語 + 右寄せ）を足したもの。
+    /// チャットとプレビューへ**同じ md** を流すので、差は文脈だけになる
+    #[cfg(feature = "visual-test")]
+    const CHAT_TABLE_MD: &str = "## チャット UI のフィードバック対応\n\n\
+        | ご指摘 | 対応 |\n|---|---|\n\
+        | 入力欄のテキスト重なり | 根治（真因: claude 自身が空欄に薄い案内文を描くのに tako がプレースホルダを重ねていた） |\n\
+        | IME の位置ズレ | キャレット実座標に修正（実 IME の目視だけこの機に日本語入力ソースがなく未検証） |\n\
+        | busy 中に送った吹き出しが出ない | 真因は transcript の queue-operation 行を読んでいなかったこと。送った瞬間に吹き出し化 |\n\
+        | スターターにプロファイル選択 | 実装（カード右端の選択から起動、本体クリックは既定のまま） |\n\n\
+        | 種別 | 識別子 | 備考 |\n|---|:-:|--:|\n\
+        | 折り返せない語 | ThisIsOneVeryLongUnbreakableIdentifierToken | 列より広く 1 行で出る |\n\
+        | 短い | ok | 右寄せ |\n";
+
+    /// チャットビュー内の md テーブルの実フレーム検証（Issue #745）。
+    ///
+    /// **同じ md を「チャット」と「プレビュー」へ同時に流し、同じペイン幅で並べて**
+    /// 実測矩形を突き合わせる。#745 の崩れ（セルが 1 文字ずつ縦に折り返され行が
+    /// 異常に伸びる）はチャット文脈だけで起きたので、プレビューを同じフレームの中に
+    /// 置いておくと「崩れているのはどちらか」が 1 回の測定で切り分けられる。
+    ///
+    /// 検査は 4 本:
+    /// 1. 表セルが「入る幅があるのに折り返した」= 0 件（[`md_view::md_table_cell_collapsed`]）
+    /// 2. 表セルの行が縦に重ならない（#656 / #494 の不変条件をチャットでも）
+    /// 3. 実ピクセルで表が読める濃さで出ている（dark / light 両面）
+    /// 4. 同一幅のときチャットの表がプレビューより極端に縦へ伸びていない
+    #[cfg(feature = "visual-test")]
+    async fn chat_table_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let dir = std::env::temp_dir().join(format!("tako-visual-745-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test #745 一時ディレクトリ");
+        let path = dir.join("table.md");
+        std::fs::write(&path, CHAT_TABLE_MD).expect("visual-test #745 fixture");
+
+        // 表ブロックごとの (先頭行番号, 列数, 行数)。チャットもプレビューも
+        // `md_block_line_texts` の並びで行番号が決まるので、同じ表から 1 度だけ作る
+        let tables: Vec<(usize, usize, usize)> = {
+            let blocks = preview::markdown_blocks(CHAT_TABLE_MD);
+            let mut line = 0usize;
+            let mut out = Vec::new();
+            for block in &blocks {
+                let lines = md_block_line_texts(block).len();
+                if let preview::MdBlockKind::Table { align, header, .. } = &block.kind {
+                    let columns = align.len().max(header.len()).max(1);
+                    out.push((line, columns, lines / columns));
+                }
+                line += lines;
+            }
+            out
+        };
+        check(
+            tables.len() == 2 && tables[0].1 == 2 && tables[1].1 == 3,
+            "visual-test #745: フィクスチャに 2 列と 3 列の表がある",
+        );
+
+        // 左 = チャット、右 = 同じ md のプレビュー
+        let (chat_pane, md_pane) = window
+            .update(cx, |app, _, cx| {
+                let chat = app.focused_pane();
+                let opened = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(chat.as_u64()),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(false),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test #745: プレビューを開く");
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::UiMode {
+                        action: Some("set".into()),
+                        mode: Some("gui".into()),
+                        pane: None,
+                    },
+                    PaneOrigin::User,
+                );
+                app.chat_panes.insert(
+                    chat,
+                    std::rc::Rc::new(chat_view::ChatPaneState {
+                        session_id: "visual-745".into(),
+                        messages: chat_view::messages_from_json(&[serde_json::json!({
+                            "role": "assistant", "text": CHAT_TABLE_MD,
+                        })]),
+                        model: Some("claude-opus-5".into()),
+                        ..Default::default()
+                    }),
+                );
+                cx.notify();
+                (
+                    chat,
+                    PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane")),
+                )
+            })
+            .unwrap_or_else(|_| fail("visual-test #745: 準備"));
+        // プレビューの background ロード（Markdown ブロックへの差し替え）を待つ
+        let loaded = wait_for_preview_state(window, cx, Duration::from_secs(5), |app| {
+            matches!(
+                app.previews.get(&md_pane).map(|state| &state.content),
+                Some(preview::PreviewContent::Markdown(blocks))
+                    if blocks.iter().any(|b| matches!(&b.kind, preview::MdBlockKind::Table { .. }))
+            )
+        })
+        .await;
+        check(
+            loaded.is_some(),
+            "visual-test #745: プレビュー側に表がロードされる",
+        );
+
+        for state in ["dark", "light", "narrow"] {
+            // dark / light は 50:50（チャットとプレビューが**同じ幅**）、
+            // narrow はチャットだけを絞って狭幅の折り返しを見る
+            let share = if state == "narrow" { 0.28 } else { 0.5 };
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Theme {
+                        action: Some("set".into()),
+                        mode: Some(if state == "light" { "light" } else { "dark" }.into()),
+                        target: None,
+                        key: None,
+                        value: None,
+                        name: None,
+                        font_family: None,
+                        font_size: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Resize {
+                        pane: Some(chat_pane.as_u64()),
+                        axis: tako_control::protocol::Axis::X,
+                        delta: None,
+                        share: Some(share),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            // 会話を先頭へ寄せる。#745 の崩れは 1 つ目の表で起きるので、下端追従の
+            // ままだと**画面外**になり、実ピクセルの検査にも目視の証拠にも乗らない
+            let _ = window.update(cx, |app, _, cx| {
+                app.chat_follow.insert(chat_pane, false);
+                if let Some(handle) = app.chat_scroll_handles.get(&chat_pane) {
+                    handle.set_offset(point(px(0.0), px(0.0)));
+                }
+                cx.notify();
+            });
+            // 1 フレーム目は前フレームの bounds が混ざるので、描き直してから採る
+            let _ = capture_frame(any, cx);
+            let (frame, scale) =
+                capture_frame(any, cx).unwrap_or_else(|| fail("visual-test #745: フレーム取得"));
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dump);
+                let _ =
+                    frame.save(std::path::Path::new(&dump).join(format!("chat-table-{state}.png")));
+            }
+            let (chat_cells, prev_cells, chat_body, chat_width, prev_width, line_height, bg) =
+                window
+                    .update(cx, |app, _, _| {
+                        let bounds_of =
+                            |layouts: &[Option<TextLayout>]| -> Vec<Option<Bounds<Pixels>>> {
+                                layouts
+                                    .iter()
+                                    .map(|l| l.as_ref().map(|l| l.bounds()))
+                                    .collect()
+                            };
+                        let chat = app
+                            .chat_text_index
+                            .get(&chat_pane)
+                            .map(|i| bounds_of(&i.layouts))
+                            .unwrap_or_default();
+                        let prev = app
+                            .preview_text_layouts
+                            .get(&md_pane)
+                            .map(|l| bounds_of(l))
+                            .unwrap_or_default();
+                        let chat_body = app
+                            .chat_scroll_handles
+                            .get(&chat_pane)
+                            .map(|h| h.bounds())
+                            .unwrap_or_default();
+                        (
+                            chat,
+                            prev,
+                            chat_body,
+                            f32::from(chat_body.size.width),
+                            app.preview_scroll_handles
+                                .get(&md_pane)
+                                .map(|h| f32::from(h.bounds().size.width))
+                                .unwrap_or_default(),
+                            app.theme.line_height,
+                            app.theme.background,
+                        )
+                    })
+                    .unwrap_or_else(|_| fail("visual-test #745: 状態取得"));
+
+            // 表ごとに「列の最大幅」を出してからセルを判定する（同じ列の取り分は
+            // 行をまたいで同じなので、折り返したセルは列幅を使い切っていないと崩れ）
+            let inspect = |cells: &[Option<Bounds<Pixels>>]| -> (usize, f32, String) {
+                let mut collapsed = 0usize;
+                let mut total_height = 0.0f32;
+                let mut detail = String::new();
+                let cell_box = |cells: &[Option<Bounds<Pixels>>], i: usize| {
+                    cells.get(i).copied().flatten().map(|b| md_view::MdCellBox {
+                        width: f32::from(b.size.width),
+                        height: f32::from(b.size.height),
+                    })
+                };
+                for (first, columns, rows) in tables.iter().copied() {
+                    let mut column_width = vec![0.0f32; columns];
+                    for row in 0..rows {
+                        for column in 0..columns {
+                            if let Some(b) = cell_box(cells, first + row * columns + column) {
+                                column_width[column] = column_width[column].max(b.width);
+                            }
+                        }
+                    }
+                    for row in 0..rows {
+                        let mut row_height = 0.0f32;
+                        for column in 0..columns {
+                            let Some(b) = cell_box(cells, first + row * columns + column) else {
+                                continue;
+                            };
+                            row_height = row_height.max(b.height);
+                            if md_view::md_table_cell_collapsed(
+                                b,
+                                column_width[column],
+                                line_height,
+                            ) {
+                                collapsed += 1;
+                                if collapsed <= 4 {
+                                    detail.push_str(&format!(
+                                        " collapsed(t{first} r{row} c{column} w={:.1} h={:.1} colw={:.1})",
+                                        b.width, b.height, column_width[column]
+                                    ));
+                                }
+                            }
+                        }
+                        total_height += row_height;
+                    }
+                }
+                (collapsed, total_height, detail)
+            };
+            let (chat_collapsed, chat_height, chat_detail) = inspect(&chat_cells);
+            let (prev_collapsed, prev_height, prev_detail) = inspect(&prev_cells);
+
+            // 表の行が縦に重ならない（#656 / #494 の不変条件をチャットでも見る）
+            let mut overlaps = 0usize;
+            for (first, columns, rows) in tables.iter().copied() {
+                let edge = |row: usize,
+                            pick: fn(&Bounds<Pixels>) -> f32,
+                            init: f32,
+                            agg: fn(f32, f32) -> f32| {
+                    (0..columns)
+                        .filter_map(|c| {
+                            chat_cells.get(first + row * columns + c).copied().flatten()
+                        })
+                        .map(|b| pick(&b))
+                        .fold(init, agg)
+                };
+                for row in 1..rows {
+                    let bottom = edge(row - 1, |b| f32::from(b.bottom()), f32::MIN, f32::max);
+                    let top = edge(row, |b| f32::from(b.top()), f32::MAX, f32::min);
+                    if bottom > f32::MIN && top < f32::MAX && top < bottom - 1.0 {
+                        overlaps += 1;
+                    }
+                }
+            }
+            // 実ピクセル: 会話領域に表の絵が地色から浮いて出ている
+            let ink = readable_pixels_in_bounds(&frame, &[chat_body], scale, bg, 2.0);
+            let ratio = if prev_height > 0.0 {
+                chat_height / prev_height
+            } else {
+                0.0
+            };
+            println!(
+                "TAKO_VISUAL_PIXEL: chat-table {state} chat_w={chat_width:.0} prev_w={prev_width:.0} \
+                 collapsed={chat_collapsed} prev_collapsed={prev_collapsed} \
+                 chat_h={chat_height:.0} prev_h={prev_height:.0} ratio={ratio:.2} \
+                 overlaps={overlaps} ink={ink}{chat_detail}{prev_detail}"
+            );
+            check(
+                chat_collapsed == 0,
+                &format!(
+                    "visual-test #745({state}): チャットの表セルが 1 文字ずつ折り返されない{chat_detail}"
+                ),
+            );
+            check(
+                prev_collapsed == 0,
+                &format!("visual-test #745({state}): プレビューの表セルに回帰がない{prev_detail}"),
+            );
+            check(
+                overlaps == 0,
+                &format!("visual-test #745({state}): チャットの表の行が縦に重ならない"),
+            );
+            check(
+                ink > 500,
+                &format!("visual-test #745({state}): 表が読める濃さで描かれる（ink={ink}）"),
+            );
+            // 同じ幅のときは、チャットの表がプレビューより極端に縦へ伸びていない
+            // （#745 の崩れは 2.2 倍以上に伸びていた。正常時は 1.2 倍前後）
+            if state != "narrow" {
+                check(
+                    (chat_width - prev_width).abs() < 4.0,
+                    &format!(
+                        "visual-test #745({state}): チャットとプレビューが同じ幅で並ぶ \
+                         ({chat_width:.0} vs {prev_width:.0})"
+                    ),
+                );
+                check(
+                    ratio < 1.6,
+                    &format!(
+                        "visual-test #745({state}): 表の高さがプレビュー比 1.6 倍未満（{ratio:.2}）"
+                    ),
+                );
+            }
+        }
+
+        // 後片付け: 既定（dark / terminal）へ戻し、フィクスチャのペインも閉じる
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Theme {
+                    action: Some("set".into()),
+                    mode: Some("dark".into()),
+                    target: None,
+                    key: None,
+                    value: None,
+                    name: None,
+                    font_family: None,
+                    font_size: None,
+                },
+                PaneOrigin::Cli,
+            );
+            app.ui_mode = tako_core::ui_mode::UiMode::Terminal;
+            app.chat_panes.clear();
+            app.chat_text_index.clear();
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Close {
+                    pane: Some(md_pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Markdown プレビュー表示品質の実フレーム検証（Issue #656）。
     /// ダーク / ライト / 狭幅の 3 状態で、レイアウト不変条件・塗り分け・
     /// 表セルのヒットテストと選択コピーを機械検証する
@@ -20797,8 +21160,15 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                "chat-table" => {
+                    chat_table_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
-                    eprintln!("TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは profiles）");
+                    eprintln!(
+                        "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは profiles / chat-table）"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -20810,6 +21180,10 @@ mod self_test {
             // ③表セルのヒットテストと選択コピー
             // を機械検証する
             markdown_preview_visual(any, window, cx).await;
+
+            // #745: チャットビュー内の md テーブル。同じ md をプレビューと並べて
+            // 同じ幅で描き、「入る幅があるのに 1 文字ずつ折り返した」セルを 0 件で固定する
+            chat_table_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -33637,6 +34011,73 @@ mod self_test {
                         "楽観 echo は即表示され transcript 反映で二重にならない (#716)",
                     );
 
+                    // #746: 画像つきの発話でも二重にならない。画面から読んだ入力行は
+                    // `[Image #13] …` という内部表記を含むので、正規化しないまま echo に
+                    // すると本物の user 行（マーカー除去済み）と一致せず、「送信待ち」
+                    // ラベルの吹き出しが最長 45 秒残る。判定材料は描画に使う経路
+                    // （`chat_visible_messages`）そのもので、本文・枚数・件数を見る
+                    let image_echo = window
+                        .update(cx, |app, _, _| {
+                            app.chat_echo.remove(&chat_pane);
+                            // 送信ボタン / Enter と同じ入口へ**生の入力行**を渡す
+                            app.push_chat_echo(chat_pane, "[Image #13] めっちゃなんかのびてる");
+                            let Some(state) = app.chat_panes.get(&chat_pane).cloned() else {
+                                return (false, true, 0usize, None);
+                            };
+                            let visible = app.chat_visible_messages(chat_pane, &state);
+                            // 送信直後: 本文はマーカー無し・画像チップつき・送信待ち
+                            let echoed = visible.iter().any(|m| {
+                                m.role == chat_view::ChatRole::User
+                                    && m.text == "めっちゃなんかのびてる"
+                                    && m.images == 1
+                                    && m.queued
+                            });
+                            let leaked = visible.iter().any(|m| m.text.contains("[Image"));
+                            // 配送後（本物の user 行が transcript に現れた状態）を作る
+                            let mut next = (*state).clone();
+                            next.messages
+                                .extend(chat_view::messages_from_json(&[serde_json::json!({
+                                    "role": "user",
+                                    "text": "めっちゃなんかのびてる",
+                                    "attachments": [{ "kind": "image" }],
+                                })]));
+                            let after = std::rc::Rc::new(next);
+                            app.chat_panes.insert(chat_pane, after.clone());
+                            app.prune_chat_echo(chat_pane);
+                            let visible = app.chat_visible_messages(chat_pane, &after);
+                            // 件数は**部分一致**で数える。修正前の echo は
+                            // `[Image #13] めっちゃ…` という別文面なので、完全一致で
+                            // 数えると二重表示そのものを取りこぼす
+                            let same: Vec<&chat_view::ChatMessage> = visible
+                                .iter()
+                                .filter(|m| {
+                                    m.role == chat_view::ChatRole::User
+                                        && m.text.contains("めっちゃなんかのびてる")
+                                })
+                                .collect();
+                            let still_queued = same.iter().any(|m| m.queued);
+                            // 後続の項目（#725 のコピー等）は会話の並びを前提にするので、
+                            // 差し込んだ user 行は戻す（この項目だけの作り物にする）
+                            (echoed && !leaked, still_queued, same.len(), Some(state))
+                        })
+                        .unwrap_or((false, true, 0, None));
+                    let _ = window.update(cx, |app, _, _| {
+                        app.chat_echo.remove(&chat_pane);
+                        if let Some(state) = image_echo.3.clone() {
+                            app.chat_panes.insert(chat_pane, state);
+                        }
+                    });
+                    if (image_echo.0, image_echo.1, image_echo.2) != (true, false, 1) {
+                        eprintln!(
+                            "TAKO_SELF_TEST_746: echoed_ok={} still_queued={} count={}",
+                            image_echo.0, image_echo.1, image_echo.2
+                        );
+                    }
+                    check(
+                        (image_echo.0, image_echo.1, image_echo.2) == (true, false, 1),
+                        "画像つき発話は吹き出し 1 個・送信待ちが解除される (#746)",
+                    );
+
                     // (d) スラッシュボタン
                     let slash = window
                         .update(cx, |app, _, cx| {
@@ -34100,6 +34541,170 @@ mod self_test {
                         dup == 1,
                         &format!("95c/#737: 配送後も吹き出しは 1 個（実測 {dup} 個）"),
                     );
+
+                    // #746: **画像つき**の発話でも二重にならない。⌘V を素通しして
+                    // claude 自身に `[Image #N]` を入力行へ挿入させるので、楽観 echo が
+                    // 受け取る文字列は実運用とまったく同じ「マーカー入りの生の入力行」に
+                    // なる。生のまま echo にすると本物の user 行（マーカー除去済み）と
+                    // 一致せず、「送信待ち」の吹き出しが 45 秒残って二重になる（#746）
+                    // クリップボードへは **GPUI の API** で置く。OS シェルの直呼び
+                    // （`osascript` 等）は境界 B8 の外では禁止で、#522 の番犬テストが
+                    // 見張っている（実際にこの e2e を書いたとき CI で捕まった）
+                    let png_bytes: Vec<u8> = vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+                        0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+                        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+                        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ];
+                    let png_ok = window
+                        .update(cx, |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+                                gpui::ImageFormat::Png,
+                                png_bytes,
+                            )));
+                        })
+                        .is_ok();
+                    let probe3 = format!("画像つき746-{}", std::process::id());
+                    let mut marker_in_line = false;
+                    if png_ok {
+                        // 生成中に打つ（busy 中のキュー滞留経路をそのまま通す）
+                        let _ = window.update(cx, |app, _, cx| {
+                            let _ = app.workspace.active_tab_mut().tree_mut().focus(chat_pane);
+                            app.forward_image_paste(cx);
+                        });
+                        // claude が clipboard を読んで `[Image #N]` を挿入するのを待つ
+                        for _ in 0..30 {
+                            wait(cx, 500).await;
+                            marker_in_line = window
+                                .update(cx, |app, _, _| {
+                                    app.terminals
+                                        .get(&chat_pane)
+                                        .and_then(|t| {
+                                            tako_core::screen::analyze_input_line(
+                                                &t.screen_opts(&app.theme, false),
+                                            )
+                                        })
+                                        .is_some_and(|st| st.text.contains("[Image"))
+                                })
+                                .unwrap_or(false);
+                            if marker_in_line {
+                                break;
+                            }
+                        }
+                    }
+                    println!("95c-746-PASTE: png_ok={png_ok} marker_in_line={marker_in_line}");
+                    if marker_in_line {
+                        // マーカーの後ろに本文を打ってから確定（送信は Enter 素通し）
+                        let _ = window.update(cx, |app, _, _| {
+                            if let Some(session) = app.terminals.get(&chat_pane) {
+                                session.write(probe3.as_bytes().to_vec());
+                            }
+                        });
+                        wait(cx, 1200).await;
+                        // 画面から読んだ生の入力行（= echo の材料）を記録しておく
+                        let raw_line = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&chat_pane)
+                                    .and_then(|t| {
+                                        tako_core::screen::analyze_input_line(
+                                            &t.screen_opts(&app.theme, false),
+                                        )
+                                    })
+                                    .map(|st| st.text)
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let _ =
+                            window.update(cx, |app, _, cx| app.chat_submit_input(chat_pane, cx));
+                        // 送信直後: 吹き出しは 1 個・マーカーは出さない・画像チップつき
+                        let mut immediate = (false, false, 0usize);
+                        for _ in 0..20 {
+                            immediate = window
+                                .update(cx, |app, _, _| {
+                                    let state =
+                                        app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
+                                    let visible = app.chat_visible_messages(chat_pane, &state);
+                                    let same: Vec<&chat_view::ChatMessage> = visible
+                                        .iter()
+                                        .filter(|m| {
+                                            m.role == chat_view::ChatRole::User
+                                                && m.text.contains(&probe3)
+                                        })
+                                        .collect();
+                                    (
+                                        same.iter().any(|m| m.images >= 1),
+                                        same.iter().any(|m| m.text.contains("[Image")),
+                                        same.len(),
+                                    )
+                                })
+                                .unwrap_or((false, false, 0));
+                            if immediate.2 > 0 {
+                                break;
+                            }
+                            wait(cx, 500).await;
+                        }
+                        println!(
+                            "95c-746-ECHO: raw_line={raw_line:?} chip={} leaked={} bubbles={}",
+                            immediate.0, immediate.1, immediate.2
+                        );
+                        check(
+                            raw_line.contains("[Image"),
+                            "95c/#746: 画面から読んだ入力行に `[Image #N]` が入っている（前提）",
+                        );
+                        check(
+                            immediate.2 == 1 && immediate.0 && !immediate.1,
+                            "95c/#746: 送信直後は吹き出し 1 個・画像チップつき・内部表記なし",
+                        );
+                        // 配送後: 吹き出しは 1 個のまま・「送信待ち」が解除される
+                        let mut after = (0usize, true);
+                        for _ in 0..180 {
+                            wait(cx, 1000).await;
+                            after = window
+                                .update(cx, |app, _, _| {
+                                    let state =
+                                        app.chat_panes.get(&chat_pane).cloned().unwrap_or_default();
+                                    let landed = state.messages.iter().any(|m| {
+                                        m.role == chat_view::ChatRole::User
+                                            && m.text.contains(&probe3)
+                                    });
+                                    let visible = app.chat_visible_messages(chat_pane, &state);
+                                    let same: Vec<&chat_view::ChatMessage> = visible
+                                        .iter()
+                                        .filter(|m| {
+                                            m.role == chat_view::ChatRole::User
+                                                && m.text.contains(&probe3)
+                                        })
+                                        .collect();
+                                    (
+                                        if landed { same.len() } else { 0 },
+                                        same.iter().any(|m| m.queued),
+                                    )
+                                })
+                                .unwrap_or((0, true));
+                            if after.0 > 0 && !after.1 {
+                                break;
+                            }
+                        }
+                        println!("95c-746-DELIVERED: bubbles={} queued={}", after.0, after.1);
+                        check(
+                            after.0 == 1 && !after.1,
+                            &format!(
+                                "95c/#746: 配送後も吹き出しは 1 個で「送信待ち」が解除される（実測 {} 個 / queued={}）",
+                                after.0, after.1
+                            ),
+                        );
+                    } else {
+                        // クリップボードへ画像を置けない環境（CI 等）ではスキップする。
+                        // 判定ロジック自体はセルフテスト項目（#746）と単体テストが持つ
+                        println!(
+                            "TAKO_SELF_TEST_SKIPPED: 95c/#746（画像を貼れない環境。\
+                             png_ok={png_ok} marker={marker_in_line}）"
+                        );
+                    }
 
                     // 片付け: claude を終了させてペインを閉じる（45c と同じ 3 連打）
                     for _ in 0..3 {

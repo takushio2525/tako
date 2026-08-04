@@ -297,16 +297,68 @@ pub(crate) struct ChatInputMirror {
 /// 送信直後の楽観 echo（#716 / 仕様 §3.1）。
 ///
 /// transcript へ自分の発話が現れるまで 1〜2 秒あるので、その間だけローカルで見せる。
-/// 同じ本文が transcript から返ってきたら破棄して transcript を正とする
+/// 同じ本文が transcript から返ってきたら破棄して transcript を正とする。
+///
+/// `text` / `images` は**transcript と同じ正規化を通した後**の値を持つ（#746。
+/// [`normalize_echo`] 参照）。生の画面文字列を持つと突き合わせが外れる
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatEcho {
     pub text: String,
+    /// 添付画像の枚数（`[Image #N]` を数えたもの）
+    pub images: usize,
     pub at: std::time::Instant,
+}
+
+/// 画面から読んだ入力行を、**transcript と同じ規則**で「本文 + 画像枚数」へ正規化する（#746）。
+///
+/// claude TUI の入力行には画像添付が `[Image #13] めっちゃ…` のようなプレースホルダで
+/// 入っている。transcript 側はこれを `strip_image_markers` で落として
+/// 「本文 + 画像ブロック」に分ける（`classify_user_content`）ので、生の画面文字列を
+/// そのまま楽観 echo にすると
+///
+/// - 吹き出しに `[Image #13]` という内部表記がそのまま出る
+/// - 本物の user 行（マーカー除去済み）と文面が一致せず**重複排除に失敗**して、
+///   「送信待ち」ラベルつきの echo が最長 45 秒残り二重表示になる（#746 の症状）
+///
+/// ので、**分類器そのもの**（`tako_control::transcript::classify_user_content`）を
+/// 通して同じ正規形にする。判定を 1 実装に寄せるので、正規化規則が増えても
+/// 表示と突き合わせが同時に追従する。
+///
+/// 分類できない入力（通知扱い・空）はユーザーが打ったものを失わないよう素の文字列へ倒す
+pub(crate) fn normalize_echo(raw: &str) -> (String, usize) {
+    match tako_control::transcript::classify_user_content(&serde_json::Value::String(
+        raw.to_string(),
+    )) {
+        tako_control::transcript::UserContent::Speech { text, images } => (text, images),
+        _ => (raw.trim().to_string(), 0),
+    }
 }
 
 /// 楽観 echo を諦める時間（#716）。送達に失敗しても永遠に残らないようにする。
 /// PromptFlow の送達確認（#95）は数秒かかることがあるので短くしすぎない
 const ECHO_MAX_AGE: Duration = Duration::from_secs(45);
+
+/// この echo は transcript 側に現れたので**もう出さなくていい**か（#716 / #746）。
+///
+/// 判定を 1 実装に寄せる（表示する `chat_visible_messages` と捨てる
+/// `prune_chat_echo` が別々の条件を持つと、片方だけ残って二重表示になる）。
+/// `echo.text` は [`normalize_echo`] を通した正規形なので、transcript 側の
+/// `ChatMessage::text`（同じ正規化を経ている）とそのまま突き合わせられる。
+///
+/// **1 対 1 では消さない**（同じ文面を 2 回送れば吹き出しは 2 個出る、という #737 の
+/// 保証は transcript 側の `queue-operation` 突き合わせが持っている）。echo は
+/// 「transcript が追いつくまでの繋ぎ」なので、同じ発話が 1 件でも現れたら役目は終わり。
+///
+/// 画像だけの発話（本文が空）は本文で見分けられないので、枚数も一致を要求する
+/// （無関係な空本文の user 行に吸われて echo が消えるのを防ぐ）
+fn echo_superseded(echo: &ChatEcho, messages: &[ChatMessage]) -> bool {
+    let text = echo.text.trim();
+    messages.iter().any(|m| {
+        m.role == ChatRole::User
+            && m.text.trim() == text
+            && (!text.is_empty() || m.images == echo.images)
+    })
+}
 
 /// これを超える本文の発話は既定で畳む（#716）。
 /// スキル本文の注入のような数万文字の「発話」が会話を埋めるのを防ぐ
@@ -676,21 +728,23 @@ impl TakoApp {
     /// **送信経路が複数あっても見た目は 1 通り**にするための唯一の入口:
     /// 送信ボタン（`chat_send_inner`）と、素通しで打たれた Enter
     /// （`handle_key`。#735 でこちらが既定の送信経路になった）が同じここを通る。
-    /// 空・空白だけなら何もしない（claude に送っていないものを吹き出しにしない）
-    pub(crate) fn push_chat_echo(&mut self, pane_id: PaneId, text: &str) {
-        if text.trim().is_empty() {
+    /// 渡すのは**画面から読んだ生の入力行**で、正規化はここで 1 回だけ行う（#746）。
+    /// 空（本文も画像も無い）なら何もしない（claude に送っていないものを吹き出しにしない）
+    pub(crate) fn push_chat_echo(&mut self, pane_id: PaneId, raw: &str) {
+        let (text, images) = normalize_echo(raw);
+        if text.trim().is_empty() && images == 0 {
             return;
         }
-        // 同じ本文の echo を二重に積まない（Enter の再送検証 #95 で 2 回来ても 1 個）
+        // 同じ発話の echo を二重に積まない（Enter の再送検証 #95 で 2 回来ても 1 個）
         let echoes = self.chat_echo.entry(pane_id).or_default();
-        if echoes
-            .iter()
-            .any(|e| e.text.trim() == text.trim() && e.at.elapsed() < ECHO_MAX_AGE)
-        {
+        if echoes.iter().any(|e| {
+            e.text.trim() == text.trim() && e.images == images && e.at.elapsed() < ECHO_MAX_AGE
+        }) {
             return;
         }
         echoes.push(ChatEcho {
-            text: text.to_string(),
+            text,
+            images,
             at: std::time::Instant::now(),
         });
         // 送った直後に「考え中」を出す（transcript / 画面採取の 2 秒を待たない）
@@ -814,7 +868,7 @@ impl TakoApp {
 
     /// 表示する発話（transcript + 生きている楽観 echo）。
     ///
-    /// transcript に同じ本文の user 発話が現れた echo は捨てる。
+    /// transcript に同じ発話が現れた echo は捨てる。
     /// 時間切れ（[`ECHO_MAX_AGE`]）の echo も捨てるので、送達に失敗しても残り続けない
     pub(crate) fn chat_visible_messages(
         &self,
@@ -826,14 +880,7 @@ impl TakoApp {
             return messages;
         };
         for echo in echoes {
-            if echo.at.elapsed() >= ECHO_MAX_AGE {
-                continue;
-            }
-            if state
-                .messages
-                .iter()
-                .any(|m| m.role == ChatRole::User && m.text.trim() == echo.text.trim())
-            {
+            if echo.at.elapsed() >= ECHO_MAX_AGE || echo_superseded(echo, &state.messages) {
                 continue;
             }
             messages.push(ChatMessage {
@@ -841,7 +888,9 @@ impl TakoApp {
                 text: echo.text.clone(),
                 thinking: None,
                 tools: Vec::new(),
-                images: 0,
+                // #746: 画像添付は本物の吹き出しと同じ「画像」チップで見せる
+                // （生の `[Image #N]` はここへ来る前に normalize_echo が落としている）
+                images: echo.images,
                 notices: 1,
                 // 楽観 echo は「まだ transcript に無い自分の発話」なので送信待ち扱い。
                 // transcript（キュー行 or 本物の user 行）が追いつけばそちらへ入れ替わる
@@ -863,11 +912,7 @@ impl TakoApp {
         };
         if let Some(echoes) = self.chat_echo.get_mut(&pane_id) {
             echoes.retain(|echo| {
-                echo.at.elapsed() < ECHO_MAX_AGE
-                    && !state
-                        .messages
-                        .iter()
-                        .any(|m| m.role == ChatRole::User && m.text.trim() == echo.text.trim())
+                echo.at.elapsed() < ECHO_MAX_AGE && !echo_superseded(echo, &state.messages)
             });
             if echoes.is_empty() {
                 self.chat_echo.remove(&pane_id);
@@ -2673,12 +2718,27 @@ impl TakoApp {
             }
             ChatRole::Assistant => {
                 let group = self.chat_message_group(pane_id, message.key);
+                // #745: **ここに `min_w(px(0.0))` を付けてはいけない**。
+                //
+                // これは縦並び（`flex_col`）の中の子なので、flex の自動最小サイズが
+                // 掛かるのは主軸 = 高さ側で、横幅の最小値はもともと 0 相当。つまり
+                // `min_w(0)` は意味を持たないのに、定値の min-width が入ると taffy の
+                // 採寸経路が変わり、**表のセルのテキストが折り返し幅 0 でレイアウト
+                // されたまま残る**（GPUI の `TextLayout` は最後の 1 回ぶんしか持たない
+                // ので、縮める必要がなかったセルはそれが確定してしまう）。結果が
+                // 「1 文字ずつ縦に折り返されて行が異常に伸びる」= #745 の症状。
+                //
+                // 実測（同一ペイン幅 478px / セル「入力欄のテキスト重なり」= 11 文字）:
+                //   min_w(0) あり → w=0.0   h=214.5（11 行 = 1 文字ずつ）
+                //   min_w(0) なし → w=143.0 h=19.5（プレビューと同値）
+                //
+                // 横方向に縮めたいのは**横並びの中にいる吹き出しそのもの**なので、
+                // `min_w(0)` は下の bubble（`flex_row` の子 = 主軸が横）に付ける。
                 let mut body = div()
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
                     .gap(px(4.0));
                 if let Some(thinking) = message.thinking.clone() {
                     body = body.child(self.render_chat_fold(
@@ -3407,6 +3467,114 @@ fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn echo_of(raw: &str) -> ChatEcho {
+        let (text, images) = normalize_echo(raw);
+        ChatEcho {
+            text,
+            images,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// #746: 画面から読んだ入力行は transcript と同じ正規形へ落ちる。
+    ///
+    /// 実 transcript の enqueue 実データ（マーカーが行頭・行中・単独行）をそのまま
+    /// 材料にしている。`[Image #N]` が残ると吹き出しに内部表記が出て、かつ本物の
+    /// user 行と文面が一致せず二重表示になる
+    #[test]
+    fn 入力行の画像マーカーはtranscriptと同じ正規形へ落ちる() {
+        // 行頭のマーカー（実データ: '[Image #13] めっちゃなんかのびてる'）
+        assert_eq!(
+            normalize_echo("[Image #13] めっちゃなんかのびてる"),
+            ("めっちゃなんかのびてる".to_string(), 1)
+        );
+        // 行中のマーカー（実データ: 'あと，制限表示のやつ[Image #2] 週じゃなくて…'）
+        assert_eq!(
+            normalize_echo("あと，バグ，[Image #4] 背景色がない"),
+            ("あと，バグ， 背景色がない".to_string(), 1)
+        );
+        // マーカーだけの行は行ごと落ちる（実データ: '[Image #10]\nあと，…'）
+        assert_eq!(
+            normalize_echo("[Image #1]\nあと，ここのとこ"),
+            ("あと，ここのとこ".to_string(), 1)
+        );
+        // 画像だけ貼った発話は本文が空で枚数だけ残る
+        assert_eq!(normalize_echo("[Image #1] [Image #2]"), (String::new(), 2));
+        // 画像の無い普通の発話は素通し（前後の空白だけ落ちる）
+        assert_eq!(
+            normalize_echo("  ふつうの指示  "),
+            ("ふつうの指示".to_string(), 0)
+        );
+        // 閉じ括弧が無いものはマーカーではない（本文として残す）
+        assert_eq!(
+            normalize_echo("[Image #1 と書いた"),
+            ("[Image #1 と書いた".to_string(), 0)
+        );
+    }
+
+    /// #746: 正規化した echo は本物の user 行と 1 件でも一致したら役目を終える。
+    /// 修正前は生の `[Image #13] …` と正規化済み `…` が一致せず、
+    /// 「送信待ち」ラベルつきの echo が最長 45 秒残って二重表示になっていた
+    #[test]
+    fn 画像つき発話のechoは本物の吹き出しに置き換わる() {
+        let echo = echo_of("[Image #13] めっちゃなんかのびてる");
+        // 配送後の本物の user 行（transcript 側も同じ正規化を経ている）
+        let delivered = messages_from_json(&[json!({
+            "role": "user",
+            "text": "めっちゃなんかのびてる",
+            "attachments": [{ "kind": "image" }],
+        })]);
+        assert!(echo_superseded(&echo, &delivered), "重複排除が外れている");
+        // まだ来ていない間は残る（transcript が空 / 別の発話だけ）
+        assert!(!echo_superseded(&echo, &[]));
+        let other = messages_from_json(&[json!({ "role": "user", "text": "別の指示" })]);
+        assert!(!echo_superseded(&echo, &other));
+        // assistant の同じ本文では消えない（役割まで見る）
+        let assistant = messages_from_json(&[json!({
+            "role": "assistant", "text": "めっちゃなんかのびてる",
+        })]);
+        assert!(!echo_superseded(&echo, &assistant));
+    }
+
+    /// #746: 画像だけの発話（本文が空）は枚数まで一致しないと消さない。
+    /// 本文が空の user 行は他にもあり得るので、無関係な行に吸われないようにする
+    #[test]
+    fn 画像だけのechoは枚数まで一致して初めて消える() {
+        let echo = echo_of("[Image #1] [Image #2]");
+        assert_eq!((echo.text.as_str(), echo.images), ("", 2));
+        let one = messages_from_json(&[json!({
+            "role": "user", "text": "", "attachments": [{ "kind": "image" }],
+        })]);
+        assert!(!echo_superseded(&echo, &one), "枚数違いで消えてしまう");
+        let two = messages_from_json(&[json!({
+            "role": "user", "text": "",
+            "attachments": [{ "kind": "image" }, { "kind": "image" }],
+        })]);
+        assert!(echo_superseded(&echo, &two));
+    }
+
+    /// #746 の回帰防止（#737 の保証を維持）: 同じ文面を 2 回送っても
+    /// transcript 側は 2 件として残る（echo は繋ぎなので 1 件で足りる）
+    #[test]
+    fn 同じ文面を2回送ると吹き出しは2個残る() {
+        let echo = echo_of("同じことを言う");
+        let twice = messages_from_json(&[
+            json!({ "role": "user", "text": "同じことを言う" }),
+            json!({ "role": "assistant", "text": "はい" }),
+            json!({ "role": "user", "text": "同じことを言う" }),
+        ]);
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|m| m.role == ChatRole::User && m.text == "同じことを言う")
+                .count(),
+            2,
+            "transcript 側で 2 件にならない"
+        );
+        // echo は transcript が追いついたので消える（合計はちょうど 2 個）
+        assert!(echo_superseded(&echo, &twice));
+    }
 
     #[test]
     fn 正規化jsonから発話を組み立てる() {
