@@ -37070,10 +37070,13 @@ mod self_test {
                 // 流してフッターを最下部へ置く（`clear` は最上段に出てしまうので使えない）。
                 // 55% にするのは設定可能な値域（50〜60）の**内側**だから: 閾値 50 なら超過 /
                 // 60 なら未達 になり、1 枚の画面で送る / 黙るの両方向を測れる。
-                // 末尾の sleep は次の行（プロンプト等）で上書きされないための保持
+                // 末尾の sleep は次の行（プロンプト等）で上書きされないための保持。
+                // **観測窓（101c の 300 秒）より十分長くする**のが要点: 短いと sh が
+                // 自然終了してペインが自動で閉じ、「後任が閉じた」と誤判定する
+                // （実測でこの偽陽性を踏んだ。#749）
                 let filler = "\\n".repeat(60);
                 let fixture = format!(
-                    "printf '%b' '{filler} Auto  5h 12%   ctx 55% ....  110K/200K\\n'; sleep 120"
+                    "printf '%b' '{filler} Auto  5h 12%   ctx 55% ....  110K/200K\\n'; sleep 3600"
                 );
                 let Some(master_pane) = make_pane(
                     cx,
@@ -37330,6 +37333,13 @@ mod self_test {
                     }
                     println!(
                         "101c-CLAUDE: closed={closed} saw_marker={saw_marker} saw_done={saw_done}"
+                    );
+                    // **`saw_marker` を必須にする**: これが後任へプロンプトが実際に届いた
+                    // 唯一の証拠。届かないまま closed になったら、それは後任の仕事ではなく
+                    // 前任ペインが別の理由で消えただけ（実測で踏んだ偽陽性。#749）
+                    check(
+                        saw_marker,
+                        "101c: 後任 master へ引き継ぎファイルの内容が届く (#749)",
                     );
                     check(
                         closed,
