@@ -530,6 +530,9 @@ enum UpdateCommand {
         /// 対象チャンネル（stable / test。省略で stable）
         #[arg(long)]
         channel: Option<String>,
+        /// 配布物の取得と整合検証まで行い、置き換えは実行しない（#723）
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// zip 経由で強制更新する（brew 失敗時のフォールバック）
     ApplyZip {
@@ -5505,16 +5508,19 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }
         }
         Command::Update(sub) => {
-            let (action, channel) = match sub {
-                UpdateCommand::Status => ("status", None),
-                UpdateCommand::Check { channel } => ("check", channel.clone()),
-                UpdateCommand::Apply { channel } => ("apply", channel.clone()),
-                UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone()),
-                UpdateCommand::Repair => ("repair", None),
+            let (action, channel, dry_run) = match sub {
+                UpdateCommand::Status => ("status", None, false),
+                UpdateCommand::Check { channel } => ("check", channel.clone(), false),
+                UpdateCommand::Apply { channel, dry_run } => ("apply", channel.clone(), *dry_run),
+                UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone(), false),
+                UpdateCommand::Repair => ("repair", None, false),
             };
             Request::Update {
                 action: Some(action.to_string()),
                 channel,
+                // 既定は None のまま送る（false を明示すると古い tako-app が
+                // 未知フィールドで弾く余地を残さない）
+                dry_run: dry_run.then_some(true),
             }
         }
         Command::Telemetry(sub) => Request::Telemetry {
@@ -6437,7 +6443,22 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Web(_) => println!("{}", pretty_json(result)),
         Command::StaleBinary(_) => println!("{}", pretty_json(result)),
-        Command::Update(_) => println!("{}", pretty_json(result)),
+        Command::Update(sub) => {
+            println!("{}", pretty_json(result));
+            // --dry-run を頼んだのに応答が dry-run を名乗らないなら、受け取った tako-app が
+            // dry_run を解釈しない古い版で、**実際に更新が走った**可能性がある。
+            // Request は unknown field を無視する（deny_unknown_fields していない）ので、
+            // 黙って握り潰すと「試すだけのつもりが置き換わっていた」になる（#723）
+            if matches!(sub, UpdateCommand::Apply { dry_run: true, .. })
+                && result.get("dry_run").and_then(|v| v.as_bool()) != Some(true)
+            {
+                eprintln!("警告: --dry-run を指定したが、応答が dry-run のものではない。");
+                eprintln!("      接続先の tako が --dry-run を解釈しない版の可能性がある");
+                eprintln!("      （その場合は更新が実際に実行されている）。");
+                eprintln!("      `tako update status` で current_version を確認すること。");
+                std::process::exit(1);
+            }
+        }
         Command::Tree(_) => println!("{}", pretty_json(result)),
         Command::Sessions(SessionsCommand::List { json, .. }) => {
             if *json {

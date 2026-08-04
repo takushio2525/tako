@@ -2857,12 +2857,27 @@ fn dispatch_inner(
             }
         }
 
-        Request::Update { action, channel } => {
+        Request::Update {
+            action,
+            channel,
+            dry_run,
+        } => {
             let action = action.as_deref().unwrap_or("status");
             let ch = channel.as_deref();
+            let dry = dry_run.unwrap_or(false);
+            // dry_run は apply でしか意味を持たない。黙って無視すると
+            // 「実行しないつもりで叩いたのに実行された」を招くので、はっきり断る
+            if dry && action != "apply" {
+                return Err(DispatchError::InvalidParams(format!(
+                    "dry_run は action=apply でのみ指定できる（渡された action: {action:?}）"
+                )));
+            }
             match action {
                 "status" => Ok(host.update_status()),
                 "check" => Ok(host.update_check(ch)),
+                "apply" if dry => host
+                    .update_apply_dry_run(ch)
+                    .map_err(DispatchError::Operation),
                 "apply" => host.update_apply(ch).map_err(DispatchError::Operation),
                 "apply-zip" => host.update_apply_zip(ch).map_err(DispatchError::Operation),
                 "repair" => host.update_repair().map_err(DispatchError::Operation),
@@ -14379,5 +14394,123 @@ mod tests {
         .unwrap();
         assert_eq!(v["dismissed"], true);
         assert_eq!(v["pane"], pane);
+    }
+
+    // --- #723: update の dry_run 分岐 ---
+    //
+    // 「試すだけのつもりが本当に置き換わった」が最悪の事故なので、
+    // **本物の apply が呼ばれていないこと**を型ではなく実測で固定する
+
+    /// どちらの apply が呼ばれたかだけを記録する host。
+    /// ControlHost は多くの上位 trait をまとめたものなので、素の struct ではなく
+    /// 実装済みの MockHost を包んで update 系だけ差し替える
+    struct UpdateSpy {
+        inner: MockHost,
+        applied: Vec<Option<String>>,
+        staged: Vec<Option<String>>,
+    }
+
+    impl UpdateSpy {
+        fn new() -> Self {
+            Self {
+                inner: MockHost::new(),
+                applied: Vec::new(),
+                staged: Vec::new(),
+            }
+        }
+    }
+
+    impl WorkspaceHost for UpdateSpy {
+        fn workspace(&self) -> &Workspace {
+            self.inner.workspace()
+        }
+        fn workspace_mut(&mut self) -> &mut Workspace {
+            self.inner.workspace_mut()
+        }
+    }
+    impl SessionHost for UpdateSpy {
+        fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
+            self.inner.session(pane)
+        }
+        fn attach_session(&mut self, pane: PaneId, options: SpawnOptions) {
+            self.inner.attach_session(pane, options)
+        }
+        fn detach_session(&mut self, pane: PaneId) {
+            self.inner.detach_session(pane)
+        }
+    }
+    impl TmuxHost for UpdateSpy {}
+    impl UiStateHost for UpdateSpy {}
+    impl PreviewHost for UpdateSpy {}
+    impl WebViewHost for UpdateSpy {}
+    impl RemoteHost for UpdateSpy {}
+    impl SystemHost for UpdateSpy {
+        fn update_apply(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
+            self.applied.push(channel.map(|s| s.to_string()));
+            Ok(serde_json::json!({ "updated": true }))
+        }
+        fn update_apply_dry_run(
+            &mut self,
+            channel: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            self.staged.push(channel.map(|s| s.to_string()));
+            Ok(serde_json::json!({ "dry_run": true, "applied": false }))
+        }
+    }
+
+    fn update_req(action: &str, channel: Option<&str>, dry_run: Option<bool>) -> Request {
+        Request::Update {
+            action: Some(action.to_string()),
+            channel: channel.map(|s| s.to_string()),
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn update_applyのdry_runは本物のapplyを呼ばない() {
+        let mut host = UpdateSpy::new();
+        let v = dispatch(
+            &mut host,
+            update_req("apply", Some("test"), Some(true)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["applied"], false);
+        assert!(
+            host.applied.is_empty(),
+            "dry_run なのに本物の apply が走った"
+        );
+        assert_eq!(host.staged, vec![Some("test".to_string())]);
+    }
+
+    #[test]
+    fn update_applyはdry_run無指定なら本物を呼ぶ() {
+        for dry in [None, Some(false)] {
+            let mut host = UpdateSpy::new();
+            let v = dispatch(&mut host, update_req("apply", None, dry), PaneOrigin::Cli).unwrap();
+            assert_eq!(v["updated"], true, "dry={dry:?}");
+            assert_eq!(host.applied, vec![None], "dry={dry:?}");
+            assert!(host.staged.is_empty(), "dry={dry:?}");
+        }
+    }
+
+    #[test]
+    fn update_dry_runはapply以外では拒否する() {
+        // 黙って無視すると「実行しないつもりだったのに実行された」を招く
+        for action in ["status", "check", "apply-zip", "repair"] {
+            let mut host = UpdateSpy::new();
+            let err = dispatch(
+                &mut host,
+                update_req(action, None, Some(true)),
+                PaneOrigin::Cli,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, DispatchError::InvalidParams(_)),
+                "{action} で dry_run が素通りした: {err:?}"
+            );
+            assert!(host.applied.is_empty() && host.staged.is_empty());
+        }
     }
 }

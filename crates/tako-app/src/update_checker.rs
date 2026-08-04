@@ -843,6 +843,87 @@ pub fn perform_update(info: &UpdateInfo) -> Result<String, String> {
     }
 }
 
+/// 配布物の取得と整合検証まで行い、**置き換えはしない**（#723）。
+///
+/// 適用は後戻りできず、実機で試すと本番インストールを壊してしまうので、
+/// 「落とす・確かめる」だけを独立して叩けるようにしてある。返す JSON には
+/// このあと実際に走らせるコマンド行も入れて、次に何が起きるかを見えるようにする。
+pub fn stage_update(info: &UpdateInfo) -> Result<serde_json::Value, String> {
+    let target = UpdateTarget::current();
+    let url = info.download_url.as_deref().ok_or_else(|| {
+        "このプラットフォーム向けの配布物が見つかりません（更新できるリリースがない）".to_string()
+    })?;
+
+    let tmp_dir = std::env::temp_dir().join("tako-update-dry-run");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("一時ディレクトリの作成に失敗: {e}"))?;
+    let file_name = match target {
+        UpdateTarget::Windows => windows_setup_asset_name(&format!("v{}", info.version)),
+        UpdateTarget::MacOs => format!("tako-{}.zip", info.version),
+    };
+    let dest = tmp_dir.join(&file_name);
+
+    let downloaded = download_to_file(url, &dest)?;
+
+    // 検証の中身はプラットフォームで違う。Windows は PE ヘッダまで見る
+    let (verified, verify_note) = match target {
+        UpdateTarget::Windows => {
+            let head = read_file_head(&dest, 2);
+            match verify_installer_bytes(&head, downloaded, info.download_size) {
+                Ok(()) => (true, "サイズ一致 + PE ヘッダ確認".to_string()),
+                Err(e) => (false, e),
+            }
+        }
+        UpdateTarget::MacOs => {
+            // macOS はアセット一覧を見ない（申告サイズを持たない）ので空でないことだけ見る
+            if downloaded > 0 {
+                (
+                    true,
+                    "ダウンロード済み（macOS は申告サイズなし）".to_string(),
+                )
+            } else {
+                (false, "ダウンロードしたファイルが空です".to_string())
+            }
+        }
+    };
+
+    let would_run = match target {
+        UpdateTarget::Windows => {
+            let mut argv = vec![dest.display().to_string()];
+            argv.extend(windows_installer_args().iter().map(|s| s.to_string()));
+            argv
+        }
+        UpdateTarget::MacOs => vec![
+            "ditto".into(),
+            "-xk".into(),
+            dest.display().to_string(),
+            "/Applications/tako.app".into(),
+        ],
+    };
+
+    if !verified {
+        // 壊れた配布物を残さない（次の dry-run が古い残骸を掴まないように）
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!(
+            "配布物の検証に失敗: {verify_note}（適用は行いません）"
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "dry_run": true,
+        "applied": false,
+        "version": info.version,
+        "channel": info.channel.label(),
+        "download_url": url,
+        "downloaded_path": dest.display().to_string(),
+        "downloaded_bytes": downloaded,
+        "expected_bytes": info.download_size,
+        "verified": verified,
+        "verify_note": verify_note,
+        "would_run": would_run,
+    }))
+}
+
 /// zip 強制更新（brew 失敗時のフォールバック用。配布系統を問わず zip で更新する）
 pub fn perform_update_zip(info: &UpdateInfo) -> Result<String, String> {
     // zip フォールバックは brew 詰まりの救済手段（macOS 専用）。Windows には brew 経路が
@@ -2033,6 +2114,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。約 15MB 落とす。--ignored で明示実行する"]
+    fn real_release_stage_update_does_not_apply() {
+        // apply の一歩手前（取得 + 検証）だけを実 Release に対して通す。
+        // dispatch の action=apply&dry_run=true / CLI の `tako update apply --dry-run`
+        // / MCP の tako_update{dry_run:true} が最終的に呼ぶのがこの関数
+        let releases = fetch_real_releases();
+        let info = parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", "0.5.13")
+            .stable
+            .expect("Windows 配布物のあるリリースが無い");
+
+        let staged = stage_update(&info).expect("取得と検証に失敗");
+        eprintln!("{}", serde_json::to_string_pretty(&staged).unwrap());
+
+        assert_eq!(staged["dry_run"], true);
+        assert_eq!(staged["applied"], false, "dry-run なのに適用済みを名乗った");
+        assert_eq!(staged["verified"], true);
+        assert_eq!(staged["downloaded_bytes"], staged["expected_bytes"]);
+
+        // 落ちたものが本当に存在して、これから起動するコマンドが指しているファイルと同じ
+        let path = staged["downloaded_path"].as_str().unwrap();
+        assert!(std::path::Path::new(path).is_file(), "配布物が残っていない");
+        let would_run: Vec<String> = serde_json::from_value(staged["would_run"].clone()).unwrap();
+        assert_eq!(would_run[0], path);
+        assert!(would_run.contains(&"/SILENT".to_string()));
+        assert!(would_run.contains(&"/NORESTART".to_string()));
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("tako-update-dry-run"));
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。--ignored で明示実行する"]
+    fn real_release_stage_update_rejects_size_mismatch() {
+        // 申告サイズを 1 バイトずらすと検証で落ち、壊れた配布物を残さない
+        let releases = fetch_real_releases();
+        let mut info =
+            parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", "0.5.13")
+                .stable
+                .expect("Windows 配布物のあるリリースが無い");
+        info.download_size = Some(info.download_size.unwrap() + 1);
+
+        let err = stage_update(&info).unwrap_err();
+        assert!(err.contains("検証に失敗"), "{err}");
+        assert!(err.contains("適用は行いません"), "{err}");
+        assert!(
+            !std::env::temp_dir().join("tako-update-dry-run").exists(),
+            "検証に失敗した配布物が残っている"
+        );
     }
 
     #[test]

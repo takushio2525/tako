@@ -620,6 +620,14 @@ pub trait SystemHost {
     fn update_apply(&mut self, _channel: Option<&str>) -> Result<Value, String> {
         Err("この環境では更新を実行できない".into())
     }
+    /// 更新の**取得と検証まで**を行い、置き換えはしない（#723）。
+    ///
+    /// 適用は後戻りできないうえ、実機で試すと本番インストールを壊してしまうので、
+    /// 「配布物を落として整合を確かめる」ところまでを独立して叩けるようにしてある。
+    /// 段階（チェック / 取得・検証 / 適用）ごとの機械検証はここを使う
+    fn update_apply_dry_run(&mut self, _channel: Option<&str>) -> Result<Value, String> {
+        Err("この環境では更新を実行できない".into())
+    }
     /// zip 強制更新（#50）。brew 失敗時のフォールバック。配布系統を問わず zip で更新する
     fn update_apply_zip(&mut self, _channel: Option<&str>) -> Result<Value, String> {
         Err("この環境では更新を実行できない".into())

@@ -23,9 +23,9 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 95 | macOS 版と同じように使えます |
+| 対応済み | 96 | macOS 版と同じように使えます |
 | 一部対応 | 11 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 22 | まだ実装されていません（追跡 Issue つき） |
+| 未対応 | 21 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **129** | |
 
@@ -207,7 +207,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 ## リモートアクセス・自動更新
 
-スマホからの接続（tako remote）とアプリ内アップデート。（このカテゴリ全体としては **未対応**）
+スマホからの接続（tako remote）とアプリ内アップデート。（このカテゴリ全体としては **一部対応**）
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
@@ -219,7 +219,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_remote_agents` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
 | `tako_remote_messages` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
 | `tako_remote_scrollback` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
-| `tako_update` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
+| `tako_update` | 対応済み | — |
 
 ## この表の読み方
 

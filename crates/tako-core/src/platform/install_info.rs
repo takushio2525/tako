@@ -108,8 +108,10 @@ mod imp {
         if rc != ERROR_SUCCESS || kind != REG_SZ || len == 0 {
             return None;
         }
-        // len はバイト数。UTF-16 なので 2 で割って要素数にする（奇数長は不正なので弾く）
-        if len % 2 != 0 {
+        // len はバイト数。UTF-16 なので 2 で割って要素数にする（奇数長は不正なので弾く）。
+        // `% 2` ではなく下位ビットを見るのは clippy の manual_is_multiple_of を踏まないため
+        // （`is_multiple_of` は比較的新しい安定化 API なので MSRV を上げたくない）
+        if len & 1 != 0 {
             return None;
         }
         let mut buf = vec![0u16; (len / 2) as usize];
@@ -143,7 +145,12 @@ mod imp {
 }
 
 /// UTF-16 バッファから末尾の NUL 以降を落として `String` にする。
-/// レジストリの REG_SZ は NUL 終端が値に含まれることも含まれないこともある
+/// レジストリの REG_SZ は NUL 終端が値に含まれることも含まれないこともある。
+///
+/// 呼ぶのは Windows の `imp` だけだが、**純粋関数なので macOS からも検証できるように**
+/// cfg で切らず常にコンパイルする（#515 と同じ方針）。非 Windows では
+/// テストからしか呼ばれず dead_code になるので、そこだけ黙らせる
+#[cfg_attr(not(windows), allow(dead_code))]
 fn trim_nul(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end]).trim().to_string()

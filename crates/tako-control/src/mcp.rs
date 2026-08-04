@@ -2159,6 +2159,8 @@ pub fn tools() -> Vec<Value> {
                 channel で stable / test を指定可。省略で全チャンネル同時チェック。\
                 action=apply で配布系統に応じた更新を実行する。\
                 channel で stable（既定）/ test を指定。\
+                dry_run=true（apply のみ）なら配布物の取得と整合検証まで行い置き換えはしない。\
+                更新チェック / 取得・検証 / 適用を段階ごとに確かめるときに使う（#723）。\
                 action=apply-zip で zip 経由で強制更新する。\
                 action=repair で broken-brew 状態を修復する。\
                 apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。",
@@ -2174,6 +2176,10 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["stable", "test"],
                         "description": "対象チャンネル。check 時は省略で全チャンネル、apply 時は省略で stable",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "true なら取得と検証だけ行い置き換えない（action=apply でのみ有効）",
                     },
                 },
                 "additionalProperties": false,
@@ -4032,6 +4038,7 @@ fn build_request(
         "tako_update" => Request::Update {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             channel: str_arg(args, "channel")?.map(|s| s.to_string()),
+            dry_run: bool_arg(args, "dry_run")?,
         },
         "tako_fda" => Request::Fda {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
@@ -5716,5 +5723,70 @@ mod tests {
             "正規パラメータでエラー: {:?}",
             resp
         );
+    }
+
+    // --- #723: tako_update の dry_run が MCP からも CLI と同じに叩ける ---
+
+    #[test]
+    fn tako_updateのスキーマにdry_runがある() {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t["name"] == "tako_update")
+            .expect("tako_update が公開されていない");
+        let props = &tool["inputSchema"]["properties"];
+        assert_eq!(
+            props["dry_run"]["type"], "boolean",
+            "dry_run が boolean で公開されていない: {props}"
+        );
+        // additionalProperties:false なので、載せ忘れると引数ごと弾かれる
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn tako_updateのdry_runがrequestまで届く() {
+        let msg = call("tako_update", json!({ "action": "apply", "dry_run": true }));
+        let (resp, seen) = run(msg, Some(0), true);
+        assert!(
+            resp.as_ref().unwrap().get("error").is_none(),
+            "dry_run つきでエラー: {resp:?}"
+        );
+        assert_eq!(
+            seen,
+            vec![Request::Update {
+                action: Some("apply".into()),
+                channel: None,
+                dry_run: Some(true),
+            }],
+            "MCP から dry_run が Request へ届いていない"
+        );
+    }
+
+    #[test]
+    fn tako_updateのdry_run省略は未指定のまま() {
+        let msg = call("tako_update", json!({ "action": "apply" }));
+        let (_, seen) = run(msg, Some(0), true);
+        assert_eq!(
+            seen,
+            vec![Request::Update {
+                action: Some("apply".into()),
+                channel: None,
+                dry_run: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn tako_updateのdry_runは真偽値以外を拒否する() {
+        let msg = call(
+            "tako_update",
+            json!({ "action": "apply", "dry_run": "yes" }),
+        );
+        let (resp, seen) = run(msg, Some(0), true);
+        // 文字列 "yes" を truthy 扱いして本物の apply が走る、が最悪の事故
+        assert!(
+            resp.as_ref().unwrap().get("error").is_some(),
+            "dry_run に文字列を渡したのに通った: {resp:?}"
+        );
+        assert!(seen.is_empty(), "不正な引数なのに Request が組み立てられた");
     }
 }
