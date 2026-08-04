@@ -25658,7 +25658,7 @@ mod self_test {
             //     まさに Issue #28 で死んでいた経路を実 claude で通す。
             //     claude CLI + 認証が必要なため既定ではスキップ。verify-claude-mcp.sh と同格の
             //     実機検証ツールという位置付け）
-            if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() {
+            if claude_e2e_enabled("28") {
                 type_text(any, cx, "claude", true);
                 let mut claude_ready = false;
                 for _ in 0..80 {
@@ -34578,7 +34578,7 @@ mod self_test {
                 //      ペイン内の claude が `CLAUDE_CODE_CHILD_SESSION` を継承すると
                 //      transcript 保存が無効化され（画面に `Transcript saving is off`）、
                 //      session_id が解決できずここは必ず落ちる（実測して突き止めた）
-                let claude_e2e = std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed;
+                let claude_e2e = claude_e2e_enabled("716") && tmux_backed;
                 // 実 claude 用に**専用の広いペイン**を用意する。項目 94 / 95 で使ったペインは
                 // ①分割を重ねて背が低い ②項目 95 の送信テストでシェルに文字が残っている
                 // ので、そのまま claude を起動すると入力欄に残骸が混ざる（実測した）
@@ -35697,7 +35697,7 @@ mod self_test {
                 //      （#720 受け入れ条件 1 そのもの）。ここで測った所要時間が
                 //      `SETTLE_AGENT_LIMIT` の根拠になる。95c と同じく claude CLI +
                 //      認証 + tmux が要るので既定ではスキップする
-                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed {
+                if claude_e2e_enabled("720") && tmux_backed {
                     let e2e_pane = window
                         .update(cx, |app, _, cx| {
                             let pane = tako_control::dispatch(
@@ -37070,10 +37070,13 @@ mod self_test {
                 // 流してフッターを最下部へ置く（`clear` は最上段に出てしまうので使えない）。
                 // 55% にするのは設定可能な値域（50〜60）の**内側**だから: 閾値 50 なら超過 /
                 // 60 なら未達 になり、1 枚の画面で送る / 黙るの両方向を測れる。
-                // 末尾の sleep は次の行（プロンプト等）で上書きされないための保持
+                // 末尾の sleep は次の行（プロンプト等）で上書きされないための保持。
+                // **観測窓（101c の 300 秒）より十分長くする**のが要点: 短いと sh が
+                // 自然終了してペインが自動で閉じ、「後任が閉じた」と誤判定する
+                // （実測でこの偽陽性を踏んだ。#749）
                 let filler = "\\n".repeat(60);
                 let fixture = format!(
-                    "printf '%b' '{filler} Auto  5h 12%   ctx 55% ....  110K/200K\\n'; sleep 120"
+                    "printf '%b' '{filler} Auto  5h 12%   ctx 55% ....  110K/200K\\n'; sleep 3600"
                 );
                 let Some(master_pane) = make_pane(
                     cx,
@@ -37245,7 +37248,7 @@ mod self_test {
                 //      引き継ぎの通し: 閾値超過を模擬した前任 → handoff → 後任が起動して
                 //      引き継ぎファイルを読み実態を突き合わせ → 前任ペインを閉じる。
                 //      claude CLI + 認証 + tmux が要るので既定ではスキップする（#749 受け入れ 1）
-                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() {
+                if claude_e2e_enabled("749") {
                     // 引き継ぎファイルへ目印を入れる（後任が読んだことを画面で確認するため）
                     if let Some(ref path) = handoff_path {
                         let _ = std::fs::write(
@@ -37277,13 +37280,24 @@ mod self_test {
                     else {
                         fail("#749 (101c): 後任のペイン ID が取れない")
                     };
-                    // dispatch が積んだ attach を実行する（セルフテストは自前で drain する）
+                    // dispatch が積んだ後処理を**本来の IPC / MCP 経路と同じ順で**実行する。
+                    // セルフテストの `fire` は dispatch を直呼びするのでこの後処理を通らず、
+                    // `pending_writes`（= claude 起動コマンド）を drain し忘れると
+                    // **claude が起動せず PromptFlow が必ず 60 秒でタイムアウトする**
+                    // （実測でこれを踏み、資源不足と誤診した。#749）
                     let _ = window.update(cx, |app, _, cx| {
                         for (p, options) in std::mem::take(&mut app.pending_attach) {
                             if app.spawn_session(p, options, cx).is_err() {
                                 app.remove_pane(p, cx);
                             }
                         }
+                        // セッション起動の**後**に書き込む（順序が逆だと write が捨てられる）
+                        for (p, data) in std::mem::take(&mut app.pending_writes) {
+                            if let Some(session) = app.terminals.get(&p) {
+                                session.write(data);
+                            }
+                        }
+                        app.flush_alt_screen_writes();
                     });
 
                     // 後任の起動 → 引き継ぎ読了 → 前任 close を待つ。
@@ -37330,6 +37344,13 @@ mod self_test {
                     }
                     println!(
                         "101c-CLAUDE: closed={closed} saw_marker={saw_marker} saw_done={saw_done}"
+                    );
+                    // **`saw_marker` を必須にする**: これが後任へプロンプトが実際に届いた
+                    // 唯一の証拠。届かないまま closed になったら、それは後任の仕事ではなく
+                    // 前任ペインが別の理由で消えただけ（実測で踏んだ偽陽性。#749）
+                    check(
+                        saw_marker,
+                        "101c: 後任 master へ引き継ぎファイルの内容が届く (#749)",
                     );
                     check(
                         closed,
@@ -37426,6 +37447,22 @@ fn shell_escape(path: &std::path::Path) -> String {
         format!("'{}'", s.replace('\'', "'\\''"))
     } else {
         s.into_owned()
+    }
+}
+
+/// 実 claude を要するセルフテスト項目を走らせるか（`TAKO_SELF_TEST_CLAUDE`）。
+///
+/// 値がタグ（項目に付けた Issue 番号）と一致するときは**その項目だけ**を走らせる。
+/// claude e2e は 1 本ごとに数十秒かかるうえタイミング判定を含むので、
+/// 並列ビルドで負荷が高いマシンでは全部通すと関係ない項目のフレークに当たり続ける
+/// （#749 の検証で実測: 4 連続で別々の項目が落ち 101c へ到達しなかった）。
+/// `=1` のような非タグ値は従来どおり全項目を走らせる
+fn claude_e2e_enabled(tag: &str) -> bool {
+    const TAGS: [&str; 4] = ["28", "716", "720", "749"];
+    match std::env::var("TAKO_SELF_TEST_CLAUDE") {
+        Ok(v) if TAGS.contains(&v.as_str()) => v == tag,
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 
