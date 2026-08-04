@@ -456,8 +456,11 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
     const BASELINE: &[(&str, usize, &str)] = &[
         (
             "crates/tako-app/src/main.rs",
-            13,
-            "tmux 経路（#[cfg(unix)]）と visual-test feature 限定の検証コード",
+            16,
+            "tmux 経路（#[cfg(unix)]）と visual-test feature 限定の検証コード。\
+             13 → 16 は #656 / #680 の `markdown_preview_visual`（visual-test feature 限定）が \
+             コピー結果を実クリップボードから読み戻す `pbpaste` 3 箇所ぶん。\
+             pbpaste は macOS のツールで、Windows の GUI からは到達しない",
         ),
         (
             "crates/tako-app/src/preview.rs",
