@@ -263,7 +263,7 @@ pub fn tools() -> Vec<Value> {
                 choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。\
                 このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、\
                 かつては選択肢テキストが style=user の残留入力として報告されていた）。\
-                応答は tako_send_text ではなく tako_orchestrator_respond を使う。",
+                応答は tako_send_input ではなく tako_orchestrator_respond を使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

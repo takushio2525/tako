@@ -95,7 +95,7 @@
     "name": "tako_send_input"
   },
   {
-    "description": "指定ペインの画面内容（表示中のテキスト）を返す。別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。queued_messages_pending が true なら、busy 中に人間が打った指示が claude のメッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても発火しない）。tako が idle 継続時に自動で送り出すので待つこと。このペインを閉じるとキューごと指示が失われる。choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、かつては選択肢テキストが style=user の残留入力として報告されていた）。応答は tako_send_text ではなく tako_orchestrator_respond を使う。",
+    "description": "指定ペインの画面内容（表示中のテキスト）を返す。別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。tmux_session を指定するとペインが見つからない場合でも tmux session 経由で読める。応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。queued_messages_pending が true なら、busy 中に人間が打った指示が claude のメッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても発火しない）。tako が idle 継続時に自動で送り出すので待つこと。このペインを閉じるとキューごと指示が失われる。choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、かつては選択肢テキストが style=user の残留入力として報告されていた）。応答は tako_send_input ではなく tako_orchestrator_respond を使う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
