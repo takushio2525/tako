@@ -1784,6 +1784,18 @@ enum ProfilesCommand {
         /// projects の割り当てを解除する（#721）
         #[arg(long)]
         clear_projects: bool,
+        /// 引き継ぎを始める ctx 使用率の閾値（%。50〜60。#749）
+        #[arg(long, conflicts_with = "clear_ctx_threshold")]
+        ctx_threshold: Option<u32>,
+        /// ctx_threshold を解除する（config.yaml → 既定 60 へ戻る。#749）
+        #[arg(long)]
+        clear_ctx_threshold: bool,
+        /// 閾値超過時に tako が引き継ぎを促す自動通知（既定 true。#749）
+        #[arg(long, conflicts_with = "clear_auto_handoff")]
+        auto_handoff: Option<bool>,
+        /// auto_handoff を解除して既定（有効）へ戻す（#749）
+        #[arg(long)]
+        clear_auto_handoff: bool,
     },
 }
 
@@ -3529,6 +3541,10 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_worker_account,
             projects,
             clear_projects,
+            ctx_threshold,
+            clear_ctx_threshold,
+            auto_handoff,
+            clear_auto_handoff,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -3561,6 +3577,10 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_master_account: *clear_master_account,
             worker_account: worker_account.clone(),
             clear_worker_account: *clear_worker_account,
+            ctx_threshold: *ctx_threshold,
+            clear_ctx_threshold: *clear_ctx_threshold,
+            auto_handoff: *auto_handoff,
+            clear_auto_handoff: *clear_auto_handoff,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;

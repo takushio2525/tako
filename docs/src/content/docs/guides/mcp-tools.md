@@ -134,10 +134,10 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_orchestrator_report` | worker の報告内容を取得する（scrollback + transcript の 2 層） |
 | `tako_orchestrator_respond` | worker の権限確認ダイアログに応答する |
 | `tako_orchestrator_supervisor` | worker 自動復旧 supervisor の操作 |
-| `tako_orchestrator_self` | master / solo が自分の pane・tab・コンテキスト残量を取得する |
-| `tako_orchestrator_handoff` | master の引き継ぎ（新しい master へバトンを渡す） |
+| `tako_orchestrator_self` | master / solo が自分の pane・tab・コンテキスト残量・引き継ぎ閾値を取得する |
+| `tako_orchestrator_handoff` | master の引き継ぎ（新しい master へバトンを渡す。前任のペインは後任が確認後に閉じる） |
 | `tako_orchestrator_projects` | 管理対象プロジェクトの一覧 / 追加 / 削除 |
-| `tako_orchestrator_profiles` | プロファイル（モデル・思考量・エージェント CLI）の管理 |
+| `tako_orchestrator_profiles` | プロファイル（モデル・思考量・エージェント CLI・自動ハンドオフ）の管理 |
 | `tako_orchestrator_accounts` | アカウントレジストリの管理（worker ごとの使い分け） |
 | `tako_orchestrator_layout` | worker spawn 時のレイアウト方針の設定 |
 | `tako_orchestrator_ledger` | 委任台帳の操作 |

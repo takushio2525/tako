@@ -125,6 +125,78 @@ pub fn read_handoff(profile: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// 解決済みの ctx 閾値（Issue #749）。`source` は値の出どころ、
+/// `raw` は丸める前の生値（範囲外の手書き設定を診断で見せるため）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCtxThreshold {
+    pub value: u32,
+    pub source: CtxThresholdSource,
+    pub raw: u32,
+}
+
+impl ResolvedCtxThreshold {
+    /// 生値が値域外で丸められたか
+    pub fn clamped(&self) -> bool {
+        self.raw != self.value
+    }
+}
+
+/// ctx 閾値の出どころ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtxThresholdSource {
+    /// profiles/<name>.yaml の ctx_threshold
+    Profile,
+    /// config.yaml の ctx_threshold
+    Config,
+    /// どちらにも無い（既定値）
+    Default,
+}
+
+impl CtxThresholdSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Config => "config",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// ctx 閾値を解決する（Issue #749）。
+/// 優先順位は プロファイル → config.yaml → 既定 60。いずれも 50〜60 へ丸める
+/// （手書きで範囲外の値が入っていても発動判定が壊れないようにする）。
+/// `config_value` は config.yaml の生値（呼び出し側が I/O を担う = 純粋関数に保つ）
+pub fn resolve_ctx_threshold(profile: &Profile, config_value: Option<u32>) -> ResolvedCtxThreshold {
+    let (raw, source) = match (profile.ctx_threshold, config_value) {
+        (Some(v), _) => (v, CtxThresholdSource::Profile),
+        (None, Some(v)) => (v, CtxThresholdSource::Config),
+        (None, None) => (
+            tako_core::handoff::CTX_THRESHOLD_DEFAULT,
+            CtxThresholdSource::Default,
+        ),
+    };
+    ResolvedCtxThreshold {
+        value: tako_core::handoff::clamp_ctx_threshold(raw),
+        source,
+        raw,
+    }
+}
+
+/// プロファイル名から「閾値」と「自動通知の有効／無効」をまとめて解決する（#749）。
+/// 読めない環境（$HOME 無し・破損 YAML）でも既定値へフォールバックし、判定を止めない
+pub fn handoff_policy_for(profile_name: &str) -> (ResolvedCtxThreshold, bool) {
+    let profile = Profile::load(profile_name).unwrap_or_default();
+    (
+        profile.resolved_ctx_threshold(),
+        auto_handoff_enabled(&profile),
+    )
+}
+
+/// 自動ハンドオフ通知が有効か（Issue #749。省略時 true）
+pub fn auto_handoff_enabled(profile: &Profile) -> bool {
+    profile.auto_handoff.unwrap_or(true)
+}
+
 /// `~` を `$HOME` に展開する
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -648,6 +720,16 @@ pub struct Profile {
     /// 省略時は master_account → env の CLAUDE_CONFIG_DIR → 従来挙動の順で解決
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_account: Option<String>,
+
+    /// このプロファイルの master が引き継ぎを始める ctx 閾値（%。Issue #749）。
+    /// 省略時は config.yaml の `ctx_threshold` → 既定 60。値域は 50〜60
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_threshold: Option<u32>,
+    /// 閾値超過時に tako が master へ引き継ぎを促すか（Issue #749。省略時 true）。
+    /// false にすると通知は止まるが、master 自身の `tako_orchestrator_self` 経由の
+    /// 気づきと手動の `tako_orchestrator_handoff` は従来どおり使える
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_handoff: Option<bool>,
 }
 
 /// master / claude worker の既定 effort
@@ -680,11 +762,21 @@ impl Default for Profile {
             env: std::collections::BTreeMap::new(),
             master_account: None,
             worker_account: None,
+            ctx_threshold: None,
+            auto_handoff: None,
         }
     }
 }
 
 impl Profile {
+    /// このプロファイルの実効 ctx 閾値（#749。config.yaml の読み取りを含む）
+    pub fn resolved_ctx_threshold(&self) -> ResolvedCtxThreshold {
+        let config_value = crate::setup::load_config()
+            .ok()
+            .and_then(|c| c.ctx_threshold);
+        resolve_ctx_threshold(self, config_value)
+    }
+
     /// master のエージェント種別が claude か（未指定 = claude）。
     /// false のとき、profile.model / effort はそのエージェントのネイティブ表記なので
     /// claude worker への継承・claude 固有の警告（[1m] 等）から除外する（Issue #127）
@@ -1157,6 +1249,12 @@ impl Profile {
             "Naming rule: describe the current activity concisely in the user's language.",
         );
         let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+        // 引き継ぎ閾値の注入（#749）。実効値を prompt に焼くので、master は
+        // 自分の閾値を知るために毎回 tako_orchestrator_self を呼ばなくて済む
+        let result = result.replace(
+            "{CTX_THRESHOLD}",
+            &self.resolved_ctx_threshold().value.to_string(),
+        );
         // プラットフォーム事実の注入（#516）。正本は 1 本に保ち、差分はここで入れる
         let result = crate::platform::facts::render_current(&result);
 
@@ -1450,6 +1548,12 @@ impl Profile {
             "Naming rule: describe the current activity concisely in the user's language.",
         );
         let result = result.replace("{TAB_NAMING_CONVENTION}", naming_convention);
+        // 引き継ぎ閾値の注入（#749。solo は handoff を持たないが、カスタム prompt /
+        // prompt_blocks が同じプレースホルダを使えるよう master と同じ置換を通す）
+        let result = result.replace(
+            "{CTX_THRESHOLD}",
+            &self.resolved_ctx_threshold().value.to_string(),
+        );
         // プラットフォーム事実の注入（#516）
         let result = crate::platform::facts::render_current(&result);
 
@@ -3664,6 +3768,88 @@ worker_agents:
             .insert("CLAUDE_CONFIG_DIR".into(), "~/.claude-univ".into());
         p.env.insert("MY_CUSTOM_VAR".into(), "hello".into());
         assert!(p.validate_env().is_ok());
+    }
+
+    // --- #749: 自動ハンドオフ（閾値解決 + プロンプト注入） ---
+
+    #[test]
+    fn ctx閾値はプロファイルconfig既定の順で解決する() {
+        // プロファイル指定が最優先
+        let p = Profile {
+            ctx_threshold: Some(52),
+            ..Default::default()
+        };
+        let r = resolve_ctx_threshold(&p, Some(58));
+        assert_eq!(r.value, 52);
+        assert_eq!(r.source, CtxThresholdSource::Profile);
+
+        // プロファイル未設定なら config.yaml
+        let p = Profile::default();
+        let r = resolve_ctx_threshold(&p, Some(58));
+        assert_eq!(r.value, 58);
+        assert_eq!(r.source, CtxThresholdSource::Config);
+
+        // どちらも無ければ既定
+        let r = resolve_ctx_threshold(&p, None);
+        assert_eq!(r.value, tako_core::handoff::CTX_THRESHOLD_DEFAULT);
+        assert_eq!(r.source, CtxThresholdSource::Default);
+        assert!(!r.clamped());
+    }
+
+    #[test]
+    fn 範囲外の手書き設定は丸めて丸めたことを残す() {
+        let p = Profile {
+            ctx_threshold: Some(90),
+            ..Default::default()
+        };
+        let r = resolve_ctx_threshold(&p, None);
+        assert_eq!(r.value, 60, "上限へ丸める");
+        assert_eq!(r.raw, 90, "生値は診断用に残す");
+        assert!(r.clamped());
+
+        let r = resolve_ctx_threshold(&Profile::default(), Some(10));
+        assert_eq!(r.value, 50, "下限へ丸める");
+        assert!(r.clamped());
+    }
+
+    #[test]
+    fn 自動ハンドオフは既定で有効() {
+        assert!(auto_handoff_enabled(&Profile::default()));
+        assert!(auto_handoff_enabled(&Profile {
+            auto_handoff: Some(true),
+            ..Default::default()
+        }));
+        assert!(!auto_handoff_enabled(&Profile {
+            auto_handoff: Some(false),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn プロンプトに実効閾値が焼かれ自動発動の規範が入る() {
+        let p = Profile {
+            ctx_threshold: Some(53),
+            ..Default::default()
+        };
+        let master = p.build_system_prompt("default");
+        assert!(!master.contains("{CTX_THRESHOLD}"), "置換漏れ");
+        assert!(master.contains("**53% context usage**"), "実効値が焼かれる");
+        // 自動発動の規範（ユーザー許可不要 / 区切りの良いタイミング / 事前に最新化）
+        assert!(
+            master.contains("Do not ask the user for permission"),
+            "許可不要の規範がある"
+        );
+        assert!(
+            master.contains("next clean break"),
+            "区切りの良いタイミングの規範がある"
+        );
+        assert!(
+            master.contains("Refresh the handoff file first"),
+            "handoff 最新化が前提条件だと書いてある"
+        );
+        // solo にも未置換のプレースホルダを残さない
+        let solo = p.build_solo_system_prompt("default");
+        assert!(!solo.contains("{CTX_THRESHOLD}"));
     }
 
     #[test]

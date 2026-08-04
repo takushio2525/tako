@@ -748,6 +748,16 @@ pub enum Request {
         worker_account: Option<String>,
         #[serde(default)]
         clear_worker_account: bool,
+        /// master が引き継ぎを始める ctx 閾値（%。50〜60。範囲外はエラー。#749）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ctx_threshold: Option<u32>,
+        #[serde(default)]
+        clear_ctx_threshold: bool,
+        /// 閾値超過時に tako が master へ引き継ぎを促すか（既定 true。#749）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_handoff: Option<bool>,
+        #[serde(default)]
+        clear_auto_handoff: bool,
     },
     /// オーケストレーター: アカウントレジストリの CRUD（Issue #504）。
     /// action: list / show / add / remove

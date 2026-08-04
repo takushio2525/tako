@@ -1697,3 +1697,13 @@
   （`chat-table` 節新設 = 同じ md をチャット / プレビューへ同じ幅で並べて実測）+
   実 claude e2e（95c 拡張: ⌘V で実画像 → `raw_line="[Image #1] …"` → 吹き出し 1 個 / queued=false）。
   検出力は #745 = visual-test が collapsed=2 で FAILED、#746 = ユニット 3 本 + セルフテスト項目で実証
+
+## 2026-08-04（#749: master の自動ハンドオフ）
+- ctx 閾値を 50〜60 で設定可能化（プロファイル → config.yaml → 既定 60。範囲外は明示指定は
+  エラー / 手書きは丸めて warnings）+ tako が 2 秒 tick で閾値超過を検知して master へ
+  引き継ぎを促す（画面由来の ctx% なので追加ポーリングゼロ）+ handoff の後任プロンプトへ
+  「実態突き合わせ → 旧ペインの入力欄確認 → close」の順序つき手順を埋め込み（前任を
+  閉じるのは後任だけ = 後任の起動失敗で master を失わない）+ master prompt に自動発動規範
+- 判定と文面は `tako-core::handoff` の純関数。MCP ツールは増やさず
+  `tako_orchestrator_profiles` に `ctx_threshold` / `auto_handoff` を載せた（CLI / GUI も同経路）
+- 次: 実 claude の通し e2e（項目 101c）の実測を Issue にコメント

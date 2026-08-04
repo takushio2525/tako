@@ -1413,7 +1413,10 @@ pub fn tools() -> Vec<Value> {
                 master の model / effort は claude worker へ継承されない。\
                 worker のエージェント種別（claude / codex / agy）は worker_agent（既定種別）と\
                 agent_* 系（worker_agents.<agent> のエージェント別 worker 設定: モデル・effort・\
-                許可スキップ・追加引数）で指定する。",
+                許可スキップ・追加引数）で指定する。\
+                自動ハンドオフ（#749）は ctx_threshold（50〜60%）と auto_handoff で調整する。\
+                応答の resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff が\
+                実効値（プロファイル → config.yaml → 既定 60 の解決結果）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1480,6 +1483,10 @@ pub fn tools() -> Vec<Value> {
                     "clear_master_account": { "type": "boolean", "description": "master_account を解除する（set 時。#504）" },
                     "worker_account": { "type": "string", "description": "worker の既定アカウント名（空文字でクリア。set 時。#504）" },
                     "clear_worker_account": { "type": "boolean", "description": "worker_account を解除する（set 時。#504）" },
+                    "ctx_threshold": { "type": "integer", "minimum": 50, "maximum": 60, "description": "master が引き継ぎを始める ctx 使用率の閾値（%。50〜60。範囲外はエラー。未設定なら config.yaml → 既定 60。set 時。#749）" },
+                    "clear_ctx_threshold": { "type": "boolean", "description": "ctx_threshold の指定を解除する（config.yaml → 既定 60 へ戻る。set 時。#749）" },
+                    "auto_handoff": { "type": "boolean", "description": "閾値超過時に tako が master へ引き継ぎを促す自動通知（既定 true）。false にすると通知は止まるが tako_orchestrator_self / tako_orchestrator_handoff は従来どおり使える（set 時。#749）" },
+                    "clear_auto_handoff": { "type": "boolean", "description": "auto_handoff の指定を解除して既定（有効）へ戻す（set 時。#749）" },
                 },
                 "additionalProperties": false,
             },
@@ -1660,8 +1667,13 @@ pub fn tools() -> Vec<Value> {
             "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。\
                 master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、\
                 このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、\
-                ctx_threshold は引き継ぎ閾値（config.yaml の ctx_threshold、既定 60）、\
+                ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → \
+                既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、\
                 ctx_over_threshold は閾値超えフラグ。\
+                ctx_over_threshold が true になったら、ユーザーの許可を待たずに \
+                handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。\
+                auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で \
+                「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。\
                 handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。\
                 pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）\
                 から自動解決する。",
@@ -1677,7 +1689,14 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_handoff",
             "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、\
                 同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。\
-                旧 master のペインは閉じない（ユーザー判断）。\
+                role / プロファイル / タブは旧 master と同一を引き継ぐ。\
+                呼ぶ前に handoff ファイルを今の状況で最新化すること（このツールはファイルの\
+                内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。\
+                #749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**\
+                （初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄に\
+                ユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、\
+                後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が\
+                退役予定のペイン（null なら後任に close を指示していない）。\
                 handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。\
                 tab を省略すると呼び出し元と同タブに新 master を spawn する。",
             "inputSchema": {
@@ -3826,6 +3845,10 @@ fn build_request(
             clear_master_account: bool_arg(args, "clear_master_account")?.unwrap_or(false),
             worker_account: str_arg(args, "worker_account")?,
             clear_worker_account: bool_arg(args, "clear_worker_account")?.unwrap_or(false),
+            ctx_threshold: u64_arg(args, "ctx_threshold")?.map(|v| v as u32),
+            clear_ctx_threshold: bool_arg(args, "clear_ctx_threshold")?.unwrap_or(false),
+            auto_handoff: bool_arg(args, "auto_handoff")?,
+            clear_auto_handoff: bool_arg(args, "clear_auto_handoff")?.unwrap_or(false),
         },
         "tako_orchestrator_accounts" => Request::OrchestratorAccounts {
             action: str_arg(args, "action")?.ok_or("action を指定する")?,

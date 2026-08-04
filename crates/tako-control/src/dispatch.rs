@@ -2463,6 +2463,10 @@ fn dispatch_inner(
             clear_master_account,
             worker_account,
             clear_worker_account,
+            ctx_threshold,
+            clear_ctx_threshold,
+            auto_handoff,
+            clear_auto_handoff,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2495,6 +2499,10 @@ fn dispatch_inner(
             clear_master_account,
             worker_account,
             clear_worker_account,
+            ctx_threshold,
+            clear_ctx_threshold,
+            auto_handoff,
+            clear_auto_handoff,
         }),
 
         // #504: アカウントレジストリの CRUD
@@ -4875,6 +4883,12 @@ pub struct ProfilesParams {
     /// worker の既定アカウント名（Issue #504）
     pub worker_account: Option<String>,
     pub clear_worker_account: bool,
+    /// 引き継ぎを始める ctx 閾値（%。50〜60。Issue #749）
+    pub ctx_threshold: Option<u32>,
+    pub clear_ctx_threshold: bool,
+    /// 閾値超過時に tako が master へ引き継ぎを促すか（Issue #749）
+    pub auto_handoff: Option<bool>,
+    pub clear_auto_handoff: bool,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -4944,6 +4958,18 @@ fn profile_to_json(
     if profile.worker_account.is_some() {
         v["worker_account"] = json!(profile.worker_account);
     }
+    // 自動ハンドオフ設定（#749）。実効値（config.yaml / 既定へのフォールバック込み）も
+    // 併記する = master が「今どの閾値で動くのか」を 1 回の呼び出しで確定できる
+    if profile.ctx_threshold.is_some() {
+        v["ctx_threshold"] = json!(profile.ctx_threshold);
+    }
+    if profile.auto_handoff.is_some() {
+        v["auto_handoff"] = json!(profile.auto_handoff);
+    }
+    let resolved = profile.resolved_ctx_threshold();
+    v["resolved_ctx_threshold"] = json!(resolved.value);
+    v["ctx_threshold_source"] = json!(resolved.source.as_str());
+    v["resolved_auto_handoff"] = json!(orchestrator::auto_handoff_enabled(profile));
     v
 }
 
@@ -5104,6 +5130,20 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "projects と clear_projects は同時に指定できない".into(),
                 ));
             }
+            // #749: 閾値は範囲外を黙って丸めず、設定時点でエラーにする
+            if let Some(v) = params.ctx_threshold {
+                tako_core::handoff::parse_ctx_threshold(v).map_err(DispatchError::InvalidParams)?;
+            }
+            if params.ctx_threshold.is_some() && params.clear_ctx_threshold {
+                return Err(DispatchError::InvalidParams(
+                    "ctx_threshold と clear_ctx_threshold は同時に指定できない".into(),
+                ));
+            }
+            if params.auto_handoff.is_some() && params.clear_auto_handoff {
+                return Err(DispatchError::InvalidParams(
+                    "auto_handoff と clear_auto_handoff は同時に指定できない".into(),
+                ));
+            }
             let env_set_clone = params.env_set.clone();
             let env_unset_clone = params.env_unset.clone();
             let master_account_clone = params.master_account.clone();
@@ -5208,6 +5248,17 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     profile.projects = if keys.is_empty() { None } else { Some(keys) };
                 } else if clear_projects {
                     profile.projects = None;
+                }
+                // 自動ハンドオフ設定（#749）
+                if let Some(v) = params.ctx_threshold {
+                    profile.ctx_threshold = Some(v);
+                } else if params.clear_ctx_threshold {
+                    profile.ctx_threshold = None;
+                }
+                if let Some(v) = params.auto_handoff {
+                    profile.auto_handoff = Some(v);
+                } else if params.clear_auto_handoff {
+                    profile.auto_handoff = None;
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
@@ -5523,14 +5574,15 @@ fn dispatch_orchestrator_self(
         ("unknown".to_string(), None)
     };
 
-    let ctx_threshold = crate::setup::load_config()
-        .map(|c| c.ctx_threshold)
-        .unwrap_or(60);
+    // #749: 閾値はプロファイル → config.yaml → 既定 60 の順で解決し 50〜60 へ丸める
+    let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    let threshold = profile.resolved_ctx_threshold();
+    let ctx_threshold = threshold.value;
 
     let handoff_path = orchestrator::handoff_path(profile_name);
     let handoff_exists = handoff_path.as_ref().is_some_and(|p| p.is_file());
 
-    Ok(json!({
+    let mut result = json!({
         "pane_id": pane_id.as_u64(),
         "tab_id": tab_id.as_u64(),
         "profile": profile_name,
@@ -5539,10 +5591,24 @@ fn dispatch_orchestrator_self(
         "status": status,
         "ctx_percent": ctx_percent,
         "ctx_threshold": ctx_threshold,
+        "ctx_threshold_source": threshold.source.as_str(),
         "ctx_over_threshold": ctx_percent.map(|c| c >= ctx_threshold),
+        "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
         "handoff_path": handoff_path,
         "handoff_exists": handoff_exists,
-    }))
+    });
+    // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
+    if threshold.clamped() {
+        result["ctx_threshold_raw"] = json!(threshold.raw);
+        result["warnings"] = json!([format!(
+            "ctx_threshold={} は値域外のため {} へ丸めた（{}〜{}）",
+            threshold.raw,
+            ctx_threshold,
+            tako_core::handoff::CTX_THRESHOLD_MIN,
+            tako_core::handoff::CTX_THRESHOLD_MAX
+        )]);
+    }
+    Ok(result)
 }
 
 /// #288: caller のペインを解決する共通関数
@@ -5774,9 +5840,13 @@ fn capture_scrollback_joined(session: &str, lines: usize) -> Option<String> {
     access.capture_history_joined(&session, lines)
 }
 
-/// OrchestratorHandoff — master の引き継ぎ（#193）。
+/// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
-/// handoff 内容を含むプロンプトを注入する。旧 master は閉じない（ユーザー判断）。
+/// handoff 内容を含むプロンプトを注入する。
+///
+/// #749: 旧 master のペインは **新 master が引き継ぎを確認したあとに新 master 自身が
+/// 閉じる**（初期プロンプトにその手順を埋め込む）。ここで旧ペインを閉じないのは、
+/// 新 master の起動が失敗したときに旧 master を失わないため（順序が安全側に倒れる）。
 /// spawn には既存の OrchestratorSpawn（project 経由）を使わず、直接 Split + attach
 /// を行う（handoff は「プロジェクト」ではないため projects.yaml に依存しない）
 fn dispatch_orchestrator_handoff(
@@ -5809,14 +5879,28 @@ fn dispatch_orchestrator_handoff(
             ))
         })?;
 
-    // #288: 分割元ペインの解決
-    let (tab_id, split_target) = if let Some(raw_tab) = tab {
-        let tid = find_tab(host.workspace(), raw_tab)?;
-        let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
-        (tid, focused)
-    } else {
-        resolve_caller_pane(host, pane, caller_role, caller_pid)?
+    // #288: 分割元ペインの解決。`tab` 指定時はそのタブのフォーカスペインを分割元にする
+    // ので、呼び出し元（= 退役する master）とは別物になりうる
+    let caller = resolve_caller_pane(host, pane, caller_role, caller_pid).ok();
+    let (tab_id, split_target) = match tab {
+        Some(raw_tab) => {
+            let tid = find_tab(host.workspace(), raw_tab)?;
+            let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
+            (tid, focused)
+        }
+        // caller が解決できないときは従来どおり解決エラーをそのまま返す
+        None => resolve_caller_pane(host, pane, caller_role, caller_pid)?,
     };
+
+    // #749: 退役する旧 master のペイン。**role が master のペインだけ**を対象にし、
+    // ユーザーが開いたペインを後任に閉じさせる事故を構造的に防ぐ
+    let previous_pane = caller.map(|(_, p)| p).filter(|p| {
+        host.workspace()
+            .get_tab(tab_id)
+            .and_then(|t| t.tree().get(*p))
+            .and_then(|pane| pane.role())
+            .is_some_and(|r| r.starts_with("orchestrator-master"))
+    });
 
     // プロファイルの読み込みとエージェント解決
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
@@ -5887,14 +5971,11 @@ fn dispatch_orchestrator_handoff(
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
-    // handoff プロンプトの構成と送信
-    let handoff_prompt = format!(
-        "あなたは前任 master から引き継ぎを受けた新しい master です。\n\
-         以下の引き継ぎファイルの内容を読み、前任の状態を把握してから業務を開始してください。\n\n\
-         --- handoff/{profile_name}.md ---\n\
-         {handoff_content}\n\
-         --- end ---\n\n\
-         引き継ぎ内容を把握したら「引き継ぎ完了」と報告し、待機してください。"
+    // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）
+    let handoff_prompt = tako_core::handoff::successor_prompt(
+        profile_name,
+        &handoff_content,
+        previous_pane.map(PaneId::as_u64),
     );
     host.queue_prompt_flow(new_id, handoff_prompt.clone());
 
@@ -5915,6 +5996,14 @@ fn dispatch_orchestrator_handoff(
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
+        // #749: 退役するペイン。null なら後任に kill を指示していない
+        // （旧 master を特定できなかった = 安全側に倒した）
+        "previous_master_pane_id": previous_pane.map(PaneId::as_u64),
+        "previous_master_close": if previous_pane.is_some() {
+            "後任 master が引き継ぎ確認後に閉じる"
+        } else {
+            "旧 master ペインを特定できなかったため閉じない"
+        },
     }))
 }
 
@@ -8464,6 +8553,8 @@ mod tests {
         command_cards: tako_core::CommandCards,
         /// #666: クリップボードへ書いた内容（コピー検証用）
         clipboard: Vec<String>,
+        /// #749: 積まれたプロンプト送達フロー（後任 master への初期プロンプト検証用）
+        prompt_flows: Vec<(PaneId, String)>,
     }
 
     impl MockHost {
@@ -8501,6 +8592,7 @@ mod tests {
                 autosuggest_tab: true,
                 command_cards: tako_core::CommandCards::new(),
                 clipboard: Vec::new(),
+                prompt_flows: Vec::new(),
             }
         }
 
@@ -8537,6 +8629,9 @@ mod tests {
         fn attach_session(&mut self, pane: PaneId, options: SpawnOptions) {
             self.attached.push(pane.as_u64());
             self.attached_options.insert(pane.as_u64(), options);
+        }
+        fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+            self.prompt_flows.push((pane, prompt));
         }
         fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
             self.detached.push(pane.as_u64());
@@ -12229,6 +12324,10 @@ mod tests {
 
     #[test]
     fn orchestrator_handoffがファイル不在でエラー() {
+        // config_dir はプロセス共有なので、handoff ファイルを作るテスト（#749）と直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut host = MockHost::new();
         let pane = host.root_pane();
         dispatch(
@@ -12255,6 +12354,230 @@ mod tests {
         assert!(result.is_err(), "handoff ファイル不在はエラー");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("handoff ファイルが見つからない"), "{err}");
+    }
+
+    // --- #749: 自動ハンドオフ（閾値反映 + 後任への kill 手順） ---
+
+    /// 隔離した config_dir に handoff ファイルを置いて f を呼ぶ（実運用の設定に触らない）
+    fn with_handoff_file<F: FnOnce()>(profile: &str, content: &str, f: F) {
+        use crate::orchestrator;
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+        let path = orchestrator::handoff_path(profile).expect("override 済み");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("handoff ディレクトリ");
+        }
+        std::fs::write(&path, content).expect("handoff ファイル");
+        f();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// role 付きの master ペインを 1 つ持つ MockHost
+    fn master_host(role: &str) -> (MockHost, u64) {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some(role.into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        (host, pane)
+    }
+
+    #[test]
+    fn handoffは後任へ旧ペインの確認とkillを指示する() {
+        let profile = "_tako_749_ho_";
+        with_handoff_file(
+            profile,
+            "## 状態\n進行中: worker A（pane 7）",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                let tab_id = host.workspace().tabs()[0].id();
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorHandoff {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        tab: None,
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .expect("handoff は成功する");
+
+                // 退役予定のペインが応答に出る（後任の close 対象）
+                assert_eq!(result["previous_master_pane_id"].as_u64(), Some(pane));
+                // role / プロファイル / タブは旧 master と同一を引き継ぐ（#210 の維持）
+                assert_eq!(
+                    result["role"].as_str(),
+                    Some(format!("orchestrator-master:{profile}").as_str())
+                );
+                assert_eq!(result["profile"].as_str(), Some(profile));
+                let new_pane = result["new_master_pane_id"].as_u64().expect("新 master");
+                assert_ne!(new_pane, pane, "新旧は別ペイン");
+                assert_eq!(
+                    result["new_master_tab_id"].as_u64(),
+                    Some(tab_id.as_u64()),
+                    "同じタブに立つ"
+                );
+                assert_eq!(
+                    host.workspace()
+                        .get_tab(tab_id)
+                        .and_then(|t| t.tree().get(PaneId::from_raw(new_pane)))
+                        .and_then(|p| p.role())
+                        .map(str::to_string),
+                    Some(format!("orchestrator-master:{profile}")),
+                    "後任ペインの role も引き継がれる"
+                );
+
+                // 旧 master ペインはこの呼び出しでは閉じない（後任の起動失敗で master を失わない）
+                assert!(
+                    host.workspace()
+                        .get_tab(tab_id)
+                        .and_then(|t| t.tree().get(PaneId::from_raw(pane)))
+                        .is_some(),
+                    "旧 master は生きたまま"
+                );
+
+                // 後任へ送るプロンプトに handoff 内容 + 確認 → kill の手順が入る
+                let prompt = host
+                    .prompt_flows
+                    .iter()
+                    .find(|(p, _)| p.as_u64() == new_pane)
+                    .map(|(_, text)| text.clone())
+                    .expect("後任へのプロンプトが積まれる");
+                assert!(prompt.contains("worker A（pane 7）"), "{prompt}");
+                let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+                let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+                assert!(read_at < close_at, "確認より先に kill を書かない: {prompt}");
+                assert!(
+                    prompt.contains(&pane.to_string()),
+                    "閉じる対象の pane ID が入る: {prompt}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn handoffはmaster以外のペインをkill対象にしない() {
+        let profile = "_tako_749_nk_";
+        with_handoff_file(profile, "state", || {
+            // role 無しのユーザーペインを分割元にして呼ぶ（旧 master が特定できない状況）
+            let mut host = MockHost::new();
+            let user_pane = host.root_pane();
+            let tab_id = host.workspace().tabs()[0].id().as_u64();
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(user_pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: Some(tab_id),
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff 自体は成功する");
+            assert!(
+                result["previous_master_pane_id"].is_null(),
+                "master でないペインは kill 対象にしない: {result}"
+            );
+            let new_pane = result["new_master_pane_id"].as_u64().unwrap();
+            let prompt = host
+                .prompt_flows
+                .iter()
+                .find(|(p, _)| p.as_u64() == new_pane)
+                .map(|(_, text)| text.clone())
+                .unwrap();
+            assert!(!prompt.contains("tako_close_pane"), "{prompt}");
+        });
+    }
+
+    #[test]
+    fn selfの閾値はプロファイル設定を反映する() {
+        use crate::orchestrator;
+        with_handoff_file("_tako_749_", "state", || {
+            let (mut host, pane) = master_host("orchestrator-master:_tako_749_");
+            let call = |host: &mut MockHost| {
+                dispatch(
+                    host,
+                    Request::OrchestratorSelf {
+                        pane: Some(pane),
+                        caller_role: Some("master:_tako_749_".into()),
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .unwrap()
+            };
+
+            // 未設定は既定 60
+            let before = call(&mut host);
+            assert_eq!(before["ctx_threshold"].as_u64(), Some(60));
+            assert_eq!(before["auto_handoff"].as_bool(), Some(true));
+            assert!(before["handoff_exists"].as_bool().unwrap_or(false));
+
+            // プロファイルで 50 に下げると self にも発動判定にも反映される
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some("_tako_749_".into()),
+                ctx_threshold: Some(50),
+                auto_handoff: Some(false),
+                ..Default::default()
+            })
+            .expect("set は成功する");
+            let after = call(&mut host);
+            assert_eq!(after["ctx_threshold"].as_u64(), Some(50));
+            assert_eq!(after["ctx_threshold_source"].as_str(), Some("profile"));
+            assert_eq!(after["auto_handoff"].as_bool(), Some(false));
+
+            // 同じ設定が tako-core の発動判定へそのまま渡る（55% は 50 で発動 / 60 では未発動）
+            let input = |threshold: u32| tako_core::handoff::NudgeInput {
+                auto_handoff: true,
+                ctx_percent: Some(55),
+                threshold,
+                pane_age: tako_core::handoff::NUDGE_GRACE * 2,
+                since_last_nudge: None,
+                sent_count: 0,
+                handoff_started: false,
+            };
+            let effective = after["ctx_threshold"].as_u64().unwrap() as u32;
+            assert!(tako_core::handoff::nudge_decision(&input(effective)).should_send());
+            assert!(!tako_core::handoff::nudge_decision(&input(60)).should_send());
+
+            // 後始末（プロファイルファイルを残さない）
+            let _ = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "delete".into(),
+                name: Some("_tako_749_".into()),
+                ..Default::default()
+            });
+            let _ = orchestrator::handoff_path("_tako_749_");
+        });
+    }
+
+    #[test]
+    fn プロファイルのctx閾値は範囲外を拒否する() {
+        for bad in [0u32, 49, 61, 100] {
+            let err = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some("_tako_749_range_".into()),
+                ctx_threshold: Some(bad),
+                ..Default::default()
+            })
+            .expect_err("範囲外は拒否する");
+            assert!(err.to_string().contains("50〜60"), "{err}");
+        }
     }
 
     #[test]

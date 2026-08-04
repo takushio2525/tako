@@ -858,7 +858,36 @@ dark / light の可読ピクセル）。
 マウスの `PlatformInput` でドラッグ**して選択を作り、dark / light の塗りとコピーボタンの
 実ピクセル、pbpaste 一致まで見る）。
 
-FR-2.8〜2.23 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
+### FR-2.24 master の自動ハンドオフ（✅ 2026-08-04、#749。基盤は #123 / #193 / #210）
+
+master のコンテキストが埋まると判断が劣化する。`/compact` の自動実行は
+「明らかに話が通じなくなる」ため**採らない**（ユーザー方針 2026-08-04）。代わりに
+**新しい master へ乗り換える**（引き継ぎファイル更新 → 後任 spawn → 引き継ぎ確認 →
+前任のペインを後任が閉じる）を、master 自身が閾値超過で自動的に行えるようにする。
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-2.24.1 | 引き継ぎ閾値は **50〜60%** の範囲で設定できる（既定 60）。解決順は **プロファイル（`profiles/<name>.yaml` の `ctx_threshold`）→ config.yaml の `ctx_threshold` → 既定 60** で、`tako_orchestrator_self` が実効値と出どころ（`ctx_threshold_source`）を返す。CLI / MCP から範囲外を指定したら**黙って丸めずエラー**にする（設定したつもりの値と実効値を食い違わせない）。一方**手書きの設定ファイル**に範囲外の値が入っていたときは丸めて動き続け、丸めたことを応答の `warnings` に出す（発動判定を壊さない） | M |
+| FR-2.24.2 | **閾値超過に master が確実に気づく**: tako が 2 秒 tick で master ペインの ctx% を見張り、超過したら「引き継ぎを始めろ」という指示をそのペインへ送り込む（`【tako 自動通知】` / `[tako auto-notice]` で始まる文面）。ctx% は**画面（TUI フッター）由来**なので新しいポーリングもサブプロセスも増えない（NFR-8）。判定は純関数（`tako_core::handoff::nudge_decision`）で、`auto_handoff=false` / ctx% 不明 / 閾値未満 / 起動直後 60 秒 / 前回から 10 分未満 / 同一ペインで 3 回送信済み / すでに後任が立っている、のいずれかなら送らない。busy かどうかは**見ない**（claude は生成中の入力をキューへ入れターン終了時に処理するので、待つと長時間走る master に永遠に届かない）。送った事実は監査ログ（`<data_dir>/supervisor.log`）へ残す（黙って動かさない） | M |
+| FR-2.24.3 | **前任のペインは後任が閉じる**。`tako_orchestrator_handoff` は後任の初期プロンプトへ順序つきの手順を埋め込む: ①`tako_orchestrator_workers` / `tako_list_panes` で引き継ぎファイルと**実態**を突き合わせる ②「引き継ぎ完了」と食い違いを報告する ③前任ペインを `tako_read_pane` で読み、**入力欄にユーザーの未送達の指示が残っていないか**（`input_status` = user / mixed、`queued_messages_pending`）を確認して引き取る ④そのあとで `tako_close_pane`。**この呼び出し自体は前任を閉じない**ので、後任の起動が失敗しても master を失わない（順序が安全側に倒れる） | M |
+| FR-2.24.4 | 閉じる対象は **role が `orchestrator-master*` のペインだけ**に限る（`tab` 指定で呼ばれたときの分割元はユーザーのペインになりうる）。特定できなければ後任へ close を指示せず、応答の `previous_master_pane_id` を null にして「閉じない」ことを明示する | M |
+| FR-2.24.5 | 後任の role / プロファイル / タブは前任と同一を引き継ぐ（#210 の維持）。文面（ナッジ・後任プロンプト）は `tako_core::handoff` の純関数 1 本が正で、日英対応（FR-4 の i18n 規約） | M |
+| FR-2.24.6 | master の default system prompt に**自動発動の規範**を書く: 閾値超過で（a）**ユーザーの許可を求めない** （b）**区切りの良いタイミング**を選ぶ（返しかけの報告は先に片付ける） （c）**引き継ぎファイルの最新化が前提条件**（このツールは中身の鮮度を確認しないので、古いファイルのまま呼ぶと後任が盲目で始まる） （d）自分のペインは自分で閉じない。実効閾値は `{CTX_THRESHOLD}` として prompt へ焼き込む（毎回 self を呼ばなくても自分の閾値が分かる） | M |
+| FR-2.24.7 | 設定は CLI `tako orchestrator profiles set --ctx-threshold N` / `--auto-handoff <bool>`（+ `--clear-*`）と MCP `tako_orchestrator_profiles` の同名パラメータへ 1:1 公開する（**新しい MCP ツールは増やさない** = 既存のプロファイル操作の一部として載せる）。GUI は設定画面「プロファイル」タブの「自動ハンドオフ」節（FR-4.7 と同じ dispatch 経路） | M |
+
+実装メモ（2026-08-04 / #749）: 判定と文面は `tako-core::handoff`（GPUI / I/O 非依存の
+純関数 + 定数）、閾値の解決は `tako-control::orchestrator::resolve_ctx_threshold`
+（プロファイル / config の値を引数で受ける純関数）と `Profile::resolved_ctx_threshold`
+（I/O 込みの唯一のアクセサ）、通知の送信は `tako-app` の 2 秒 tick
+（`drive_handoff_nudge`）。**機構（tako が気づいて促す）と規範（prompt に自動発動を書く）
+の両輪**で成立させる設計で、MCP 応答へ ctx 警告を同梱する案は採らなかった（ctx% を MCP
+ハンドラスレッドで得るには `claude agents --json` のサブプロセスか UI スレッドへの往復が
+必要で、tick + 画面由来のほうが安く確実。加えて JSON の 1 フィールドはユーザーターンの
+指示より弱い）。機械検証は tako-core 16 本 + tako-control 8 本 + セルフテスト項目 101
+（実画面 55% × 閾値 50 / 60 で送る・黙るの両方向 / 再送間隔 / auto_handoff=false /
+master 以外のペイン / 後任が立っている場合 / self の実効値）。
+
+FR-2.8〜2.24 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
 対応する MCP / CLI 操作（表示・読み取り・応答送信）を同時に提供する。
 提示系の体験は FR-2.7（AI 成果物プレゼンテーション）と一体で設計する。
 

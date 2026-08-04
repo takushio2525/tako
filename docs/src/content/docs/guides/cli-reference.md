@@ -831,6 +831,7 @@ tako orchestrator profiles show
 tako orchestrator profiles set default --model claude-opus-4-6 --effort max
 tako orchestrator profiles set default --clear-model   # claude 既定モデルに戻す
 tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
+tako orchestrator profiles set default --ctx-threshold 55   # 自動ハンドオフの閾値（50〜60）
 ```
 
 | `set` の主なオプション | 説明 |
@@ -842,6 +843,8 @@ tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --ef
 | `--worker-effort` | 子 worker の思考量 |
 | `--worker-agent` / `--clear-worker-agent` | worker の既定エージェント CLI（claude / codex / agy） |
 | `--worker-model-policy` | `inherit` / `fixed` / `delegate` |
+| `--ctx-threshold` / `--clear-ctx-threshold` | 自動ハンドオフを始めるコンテキスト使用率（%。50〜60。既定 60） |
+| `--auto-handoff` | 閾値を超えたら tako が引き継ぎを促すか（既定 true） |
 
 master のエージェント CLI を codex にすると、`tako master -<プロファイル名>` で codex が tako の MCP ツールに接続された状態で立ち上がります。master が claude 以外のとき、プロファイルの `model` / `effort` は claude worker へ継承されません。
 
@@ -908,13 +911,24 @@ tako orchestrator report --pane 5 --messages 3   # 直近の発話だけ
 
 `watch` は `WORKER_IDLE`（完了）/ `WORKER_ERROR`（異常停止）/ `WORKER_GONE`（消滅）などを 1 行で出力します。`status` はエラー時に種別（`api_error` / `usage_limit` など）と推奨アクションも返します。
 
+#### 自動ハンドオフ（コンテキストが埋まる前に master を交代させる）
+
+master のコンテキスト使用率が閾値（既定 60%）を超えると、tako が master へ引き継ぎ開始を指示します。master は引き継ぎファイルを最新化して `handoff` を呼び、**後任 master が引き継ぎ内容と実態を確認してから前任のペインを閉じます**（後任の起動に失敗しても前任は残ります）。ユーザーの操作は要りません。
+
+閾値は 50〜60% の範囲でプロファイルごとに変えられます。自動で促されるのが煩わしい場合は通知だけ切れます（`handoff` の手動実行は使えます）。
+
+```bash
+tako orchestrator profiles set default --ctx-threshold 55
+tako orchestrator profiles set default --auto-handoff false
+```
+
 ### tako orchestrator workers / respond / self / handoff
 
 ```bash
 tako orchestrator workers          # spawn 済み worker の一覧（ペインの生死と無関係）
 tako orchestrator workers --all
 tako orchestrator respond --pane 5 # 権限確認ダイアログへ応答（不在時はエラー）
-tako orchestrator self             # master/solo が自分の pane・tab・コンテキスト残量を知る
+tako orchestrator self             # master/solo が自分の pane・tab・コンテキスト残量と引き継ぎ閾値を知る
 tako orchestrator handoff          # master のバトンを新しい master へ渡す
 tako orchestrator layout --policy master-reserved --master-ratio 0.5
 tako orchestrator supervisor       # worker 自動復旧 supervisor の操作

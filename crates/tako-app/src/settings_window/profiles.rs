@@ -39,6 +39,8 @@ pub enum ProfileField {
     Model,
     WorkerModel,
     TabNaming,
+    /// 引き継ぎ閾値（%。#749）
+    CtxThreshold,
     /// エージェント別設定のモデル（対象エージェント名）
     AgentModel(String),
     /// エージェント別設定の追加引数（対象エージェント名）
@@ -54,6 +56,7 @@ impl ProfileField {
             Self::Model => "prof-model".into(),
             Self::WorkerModel => "prof-worker-model".into(),
             Self::TabNaming => "prof-tab-naming".into(),
+            Self::CtxThreshold => "prof-ctx-threshold".into(),
             Self::AgentModel(a) => format!("prof-agent-model-{a}"),
             Self::AgentArgs(a) => format!("prof-agent-args-{a}"),
             Self::EnvKey => "prof-env-key".into(),
@@ -205,6 +208,18 @@ impl SettingsWindow {
             // 空文字でクリアする仕様が dispatch 側にあるのでそのまま渡す
             ProfileField::TabNaming => {
                 self.set_profile(|p| p.tab_naming_convention = Some(value), cx)
+            }
+            // #749: 空欄 = 解除（config.yaml → 既定 60 へ戻る）。数字でなければ保存しない
+            ProfileField::CtxThreshold => {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    self.set_profile(|p| p.clear_ctx_threshold = true, cx);
+                } else if let Ok(v) = trimmed.parse::<u32>() {
+                    self.set_profile(|p| p.ctx_threshold = Some(v), cx);
+                } else {
+                    self.message = Some((txt::prof_ctx_threshold_range().to_string(), true));
+                    cx.notify();
+                }
             }
             ProfileField::AgentModel(agent) => self.set_profile(
                 |p| {
@@ -477,6 +492,10 @@ impl SettingsWindow {
             clear_master_account: false,
             worker_account: None,
             clear_worker_account: false,
+            ctx_threshold: None,
+            clear_ctx_threshold: false,
+            auto_handoff: None,
+            clear_auto_handoff: false,
         };
         match self.dispatch(request, cx) {
             Ok(_) => {
@@ -677,6 +696,9 @@ impl SettingsWindow {
                 // --- 環境変数 ---
                 .child(self.section(txt::prof_section_env()))
                 .child(self.env_editor(&detail, cx))
+                // --- 自動ハンドオフ（#749）---
+                .child(self.section(txt::prof_section_handoff()))
+                .child(self.handoff_settings(&detail, cx))
                 // --- その他 ---
                 .child(self.section(txt::prof_section_other()))
                 .child(self.row(
@@ -937,6 +959,44 @@ impl SettingsWindow {
                     .child(txt::desc_prof_projects()),
             )
             .child(row)
+    }
+
+    /// 自動ハンドオフの設定（#749）。閾値は空欄で解除、トグルは通知の ON/OFF。
+    /// 実効値（`resolved_*`）は dispatch が返すので、未設定でも「今どうなるか」が読める
+    fn handoff_settings(&self, detail: &serde_json::Value, cx: &mut Context<Self>) -> Div {
+        let threshold = detail["ctx_threshold"]
+            .as_u64()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let resolved_threshold = detail["resolved_ctx_threshold"]
+            .as_u64()
+            .unwrap_or(u64::from(tako_core::handoff::CTX_THRESHOLD_DEFAULT));
+        let auto = detail["resolved_auto_handoff"].as_bool().unwrap_or(true);
+        div()
+            .flex()
+            .flex_col()
+            .child(self.row(
+                txt::prof_label_ctx_threshold(),
+                txt::desc_prof_ctx_threshold(),
+                self.text_field(
+                    EditField::Profile(ProfileField::CtxThreshold),
+                    &threshold,
+                    &resolved_threshold.to_string(),
+                    Some(px(80.)),
+                    cx,
+                ),
+            ))
+            .child(self.row(
+                txt::prof_label_auto_handoff(),
+                txt::desc_prof_auto_handoff(),
+                self.toggle(
+                    "prof-auto-handoff",
+                    auto,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_profile(|p| p.auto_handoff = Some(!auto), cx);
+                    }),
+                ),
+            ))
     }
 
     /// 環境変数の一覧（値はマスク）と追加・削除。
@@ -1393,6 +1453,10 @@ fn profiles_request(action: &str, kind: ProfileKind, name: Option<&str>) -> Requ
         clear_master_account: false,
         worker_account: None,
         clear_worker_account: false,
+        ctx_threshold: None,
+        clear_ctx_threshold: false,
+        auto_handoff: None,
+        clear_auto_handoff: false,
     }
 }
 
@@ -1427,6 +1491,10 @@ struct ProfilesSet {
     clear_worker_account: bool,
     projects: Option<Vec<String>>,
     clear_projects: bool,
+    ctx_threshold: Option<u32>,
+    clear_ctx_threshold: bool,
+    auto_handoff: Option<bool>,
+    clear_auto_handoff: bool,
 }
 
 impl ProfilesSet {
@@ -1463,6 +1531,10 @@ impl ProfilesSet {
             clear_master_account: self.clear_master_account,
             worker_account: self.worker_account,
             clear_worker_account: self.clear_worker_account,
+            ctx_threshold: self.ctx_threshold,
+            clear_ctx_threshold: self.clear_ctx_threshold,
+            auto_handoff: self.auto_handoff,
+            clear_auto_handoff: self.clear_auto_handoff,
         }
     }
 }

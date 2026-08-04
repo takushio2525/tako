@@ -77,14 +77,15 @@ tako/
 | 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
 | マスターオーケストレーター起動 | `tako master [-profile]`（master system prompt 付きでエージェント CLI を起動。プロファイルの `master_agent` で claude（既定）/ codex を選択。#127） |
 | ソロエージェント起動（オーケストレーション無しの 1 対 1 対話） | `tako solo [-profile]`（solo system prompt 付きで起動。worker spawn 禁止・エコ運用 effort=high。master と同じプロファイル引数・`master_agent` 対応） |
-| オーケストレーター master 自己情報 | `tako orchestrator self [--pane N]`（自 pane/tab/ctx%/handoff 状態。#123/#193） |
-| オーケストレーター master 引き継ぎ | `tako orchestrator handoff [--pane N] [--tab T]`（handoff ファイルを読み新 master spawn。#193） |
+| オーケストレーター master 自己情報 | `tako orchestrator self [--pane N]`（自 pane/tab/ctx%/handoff 状態 + 引き継ぎ閾値（`ctx_threshold` / `ctx_threshold_source` / `ctx_over_threshold` / `auto_handoff`）。#123/#193/#749） |
+| オーケストレーター master 引き継ぎ（#193/#749） | `tako orchestrator handoff [--pane N] [--tab T]`（handoff ファイルを読み後任 master を同タブ・同 role・同プロファイルで spawn）。**前任ペインはこの呼び出しでは閉じない**: 後任が「引き継ぎファイルと実態の突き合わせ → 前任の入力欄にユーザーの未送達指示が残っていないか確認 → `tako_close_pane`」の順で閉じる（後任の起動が失敗しても master を失わない）。応答の `previous_master_pane_id` が退役予定のペイン（null なら閉じるよう指示していない） |
+| **master の自動ハンドオフ（#749）** | ctx% が閾値（既定 60。**50〜60 で設定可**）を超えると tako が master ペインへ `【tako 自動通知】` を送り、master が「handoff ファイル最新化 → `tako_orchestrator_handoff`」を**ユーザーの許可を待たずに**実行する。閾値の解決順は プロファイル → config.yaml → 既定 60（範囲外の明示指定はエラー、手書き設定は丸めて `warnings`）。設定は `tako orchestrator profiles set <名前> --ctx-threshold 55` / `--auto-handoff false`（GUI は設定画面 → プロファイル → 自動ハンドオフ）。送った記録は `<data_dir>/supervisor.log` の `action=ctx_handoff_nudge`。詳細は `.agent/orchestrator.md`「master の自動ハンドオフ」 |
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."`（`--account <名>` でその worker だけ別アカウント。#504/#511） |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N>` または `--worker <ID>`（レジストリ自動補完でペイン消失後も追跡継続。#390） |
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]`（scrollback + transcript 2 層。`--worker <ID>` でペイン消失後も取得可。MCP `tako_orchestrator_report` と 1:1。#364/#390） |
 | オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]`（spawn 済み worker をペインの生死と無関係に列挙。prompt 未達・突然死の resume コマンドも表示。MCP `tako_orchestrator_workers` と 1:1。#390） |
 | オーケストレーター プロジェクト管理 | `tako orchestrator projects list/add/remove` |
-| オーケストレーター プロファイル管理（#721） | `tako orchestrator profiles list/show/set/create/copy/delete`（`--solo` で `tako solo` の solo-profiles/ を対象。既定は master。`set --projects a,b` で担当プロジェクト割り当て。`default` は削除不可。list / show / set は未登録 project・未登録アカウント・`[1m]` モデルを `warnings` で返す。**GUI は設定画面の「プロファイル」タブ**（Cmd+, → プロファイル）が同じ dispatch を通る。MCP `tako_orchestrator_profiles` と 1:1） |
+| オーケストレーター プロファイル管理（#721/#749） | `tako orchestrator profiles list/show/set/create/copy/delete`（`--solo` で `tako solo` の solo-profiles/ を対象。既定は master。`set --projects a,b` で担当プロジェクト割り当て。`set --ctx-threshold 50〜60` / `--auto-handoff <bool>` で自動ハンドオフ（#749）。`default` は削除不可。list / show / set は未登録 project・未登録アカウント・`[1m]` モデルを `warnings` で返す。**GUI は設定画面の「プロファイル」タブ**（Cmd+, → プロファイル）が同じ dispatch を通る。MCP `tako_orchestrator_profiles` と 1:1） |
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove`（既定の資格情報を使うアカウントは `add <名前> --inherit`。既定パスの明示指定は警告。MCP `tako_orchestrator_accounts` と 1:1） |
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved\|legacy] [--master-ratio 0.5] [--algorithm grid\|spiral]`（全省略で現在値表示。#165） |
 | build | `cargo build --workspace` |

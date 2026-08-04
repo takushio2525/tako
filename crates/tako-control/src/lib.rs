@@ -17,6 +17,11 @@
 //!   プロセス間ロック・世代バックアップ。Issue #169）
 //! - config_share: AI 系設定の git ベース共有（分類カタログ・可搬化・秘匿検査。Issue #513）
 
+// mcp.rs のツール定義は 1 ツール = 1 個の大きな `json!` リテラルで書かれており、
+// プロパティが増えると `json_internal!` の再帰展開が既定の 128 段に届く（#749 で到達した）。
+// スキーマを 1 リテラルのまま読める形に保つため、上限だけ上げる（実行時コストは無い）
+#![recursion_limit = "512"]
+
 pub mod acceptance_gates;
 pub mod agents;
 pub mod agents_sync;

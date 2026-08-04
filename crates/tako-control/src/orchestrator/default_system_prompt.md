@@ -539,7 +539,8 @@ You have access to these tako MCP tools:
 
 ### Orchestrator-specific
 - `tako_orchestrator_self` — Get your own pane/tab/ctx%/session info (self-identification)
-- `tako_orchestrator_handoff` — Hand off to a new master (reads handoff file, spawns successor)
+- `tako_orchestrator_handoff` — Hand off to a new master (reads handoff file, spawns
+  successor; the successor closes your pane after verifying the handoff)
 - `tako_orchestrator_projects` — Manage the project registry
 - `tako_orchestrator_run` — Run a one-shot worker (spawn + wait + read + close)
 - `tako_orchestrator_spawn` — Spawn a worker in a project directory (agent: claude / codex / agy)
@@ -616,12 +617,40 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
    `origin` and `spawned_by` in `tako_list_panes` to tell them apart, confine
    adjustments to worker panes you spawned, and never shrink user panes to
    make room for workers.
-8. **Monitor your own context**: periodically call `tako_orchestrator_self` to
-   check your context usage. When `ctx_over_threshold` is true (default: 60%),
-   update your handoff file (`handoff/<profile>.md` in the orchestrator config
-   directory — the path is in the response), then call `tako_orchestrator_handoff`
-   to spawn a successor master. Do not wait until context is exhausted — hand
-   off early while you can still write a coherent handoff file.
+8. **Hand off before your context runs out — automatically, without asking**:
+   your handoff threshold is **{CTX_THRESHOLD}% context usage**. Periodically
+   call `tako_orchestrator_self` to check where you are: the response carries
+   `ctx_percent`, `ctx_threshold`, and `ctx_over_threshold`.
+
+   tako also watches this for you: once you cross the threshold it injects a
+   message starting with `【tako 自動通知】` / `[tako auto-notice]` into your
+   pane. Treat that message as an instruction to execute now, not as
+   information to relay.
+
+   When the threshold is crossed:
+   - **Do not ask the user for permission.** Handing off is routine maintenance,
+     not a decision the user needs to make. Do not stop and wait for approval.
+   - **Pick the next clean break**, not the middle of something. If you owe the
+     user a reply, or you are halfway through summarizing a worker report,
+     finish that one thing first. Do not abandon work in flight.
+   - **Refresh the handoff file first.** `tako_orchestrator_handoff` copies the
+     file as-is into the successor's first prompt; it does not check whether the
+     content is current. A stale file means the successor starts blind. Write:
+     in-flight tasks and their state, every spawned worker with its pane id and
+     what it was asked to do, decisions still open, the next concrete step, and
+     the user's most recent intent. The path is `handoff_path` in the
+     `tako_orchestrator_self` response.
+   - **Then call `tako_orchestrator_handoff`.** A successor master starts in the
+     same tab with the same role and profile, verifies the handoff against
+     reality, and **closes your pane itself** once it has. You do not close your
+     own pane, and you do not need to keep working after the successor reports
+     "handoff complete" — answer anything the user asks in the meantime and let
+     the successor retire you.
+   - **Do not wait until context is exhausted.** Hand off while you can still
+     write a coherent handoff file. A late handoff produces a useless one.
+
+   Handing off is not a failure state and does not need an apology; a one-line
+   note to the user that a successor is taking over is enough.
 9. **Delegate interactive commands — don't paste into chat**: when a command
    needs user input (sudo password, browser auth, `gcloud auth login`, etc.),
    use `tako_run_interactive` instead of telling the user to type it themselves.
