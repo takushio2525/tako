@@ -257,6 +257,16 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
 - **MCP エンジン**（`tako-control::mcp`）: initialize / tools/list / tools/call の JSON-RPC
   処理とツールカタログ。**実行は IPC と同じ `dispatch` を呼ぶだけ**（操作セマンティクスの
   一元化 = 設計原則 5。MCP 固有の操作実装はゼロ）
+  - `mcp/mod.rs`: 公開ファサード、JSON-RPC、UI スレッドで実行できない special handler
+  - `mcp/catalog.rs`: 133 ツールの名前・説明・入力スキーマ（公開契約の正）
+  - `mcp/request.rs`: MCP 引数から `protocol::Request` への変換と入力検証
+  - `mcp/http.rs`: localhost HTTP の認証・受信・応答
+  - `mcp/tests.rs`: エンジン / Request 変換 / HTTP の単体・往復テスト
+  公開 API（`tools` / `handle_message` / `McpSession` / `McpServer`）はファサードから維持する。
+  全カタログ JSON は `testdata/mcp_tools_full_snapshot.json` で順序を含め固定し、さらに全ツール名が
+  `Request` 変換か明示 special handler のどちらかへ到達することを網羅テストで保証する。
+  新ツール追加時の編集先は catalog / request（長時間処理だけ mod.rs の special handler）へ限定し、
+  HTTP・stdio・dispatch・CLI の接続コードへ同じ定義を重複させない。
 - **トランスポート 1: Streamable HTTP**（`McpServer`、tako-app に内蔵）:
   127.0.0.1 の空きポートに tiny_http（同期・スレッドベース。tokio を持ち込まない方針を維持。
   公式 SDK rmcp は tokio 必須のため不採用）で立て、URL を `TAKO_MCP_URL` として全ペインへ注入。
@@ -291,7 +301,7 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   `tako-control` の example `mcp_host` 内で実物の `claude -p` を実行。stdio / HTTP の両経路。
   ユーザーのグローバル claude 設定は変更しない `--mcp-config --strict-mcp-config` 方式）
 
-#### 公開ツール（実装済み 12 個。FR-2.5 と 1:1）
+#### 基盤となる公開ツール（Phase 3 で実装した 12 個。現在の全 133 ツールは完全スナップショットで固定）
 
 `tako_list_panes` / `tako_split_pane` / `tako_send_input` / `tako_read_pane` /
 `tako_focus_pane` / `tako_close_pane` / `tako_resize_pane` / `tako_equalize_layout` /
