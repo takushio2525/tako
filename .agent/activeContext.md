@@ -17,7 +17,10 @@
 - #748 merge 後の完全スナップショット SHA-256:
   `de522af54b1628270b23df8ca787ee8be64a23d74189933ff4ad1bf5cb09d7b3`
 - 構造分割後も同一ハッシュ、MCP 単体 39 本・完全スナップショット 3 本は全緑
-- 次: workspace 全品質ゲート → 隔離セルフテスト → PR（Closes #750）→ CI → merge / install
+- `cargo fmt --all --check` / Clippy（全 target・warning deny）/ workspace test は全緑
+- `TAKO_ISOLATED=1 TAKO_SELF_TEST=1 cargo run -p tako-app` は
+  `TAKO_APP_SELF_TEST_OK`・exit 0 で完走
+- 次: PR（Closes #750）→ macOS / Windows CI → squash merge → main 同期 / worktree 掃除 / install
 
 ## 不変条件
 
