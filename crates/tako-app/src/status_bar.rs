@@ -1206,7 +1206,7 @@ impl TakoApp {
                     } else {
                         "stable"
                     };
-                    crate::ui_text::update::current_line(&current, channel, method_label)
+                    crate::ui_text::update::current_line(current, channel, method_label)
                 }))
                 .into_any_element(),
         );

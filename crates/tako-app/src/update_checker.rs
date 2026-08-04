@@ -861,7 +861,7 @@ pub fn stage_update(info: &UpdateInfo) -> Result<serde_json::Value, String> {
         UpdateTarget::Windows => windows_setup_asset_name(&format!("v{}", info.version)),
         UpdateTarget::MacOs => format!("tako-{}.zip", info.version),
     };
-    let dest = tmp_dir.join(&file_name);
+    let dest = tmp_dir.join(file_name);
 
     let downloaded = download_to_file(url, &dest)?;
 
