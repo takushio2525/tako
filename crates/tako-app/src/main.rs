@@ -37280,13 +37280,24 @@ mod self_test {
                     else {
                         fail("#749 (101c): 後任のペイン ID が取れない")
                     };
-                    // dispatch が積んだ attach を実行する（セルフテストは自前で drain する）
+                    // dispatch が積んだ後処理を**本来の IPC / MCP 経路と同じ順で**実行する。
+                    // セルフテストの `fire` は dispatch を直呼びするのでこの後処理を通らず、
+                    // `pending_writes`（= claude 起動コマンド）を drain し忘れると
+                    // **claude が起動せず PromptFlow が必ず 60 秒でタイムアウトする**
+                    // （実測でこれを踏み、資源不足と誤診した。#749）
                     let _ = window.update(cx, |app, _, cx| {
                         for (p, options) in std::mem::take(&mut app.pending_attach) {
                             if app.spawn_session(p, options, cx).is_err() {
                                 app.remove_pane(p, cx);
                             }
                         }
+                        // セッション起動の**後**に書き込む（順序が逆だと write が捨てられる）
+                        for (p, data) in std::mem::take(&mut app.pending_writes) {
+                            if let Some(session) = app.terminals.get(&p) {
+                                session.write(data);
+                            }
+                        }
+                        app.flush_alt_screen_writes();
                     });
 
                     // 後任の起動 → 引き継ぎ読了 → 前任 close を待つ。
