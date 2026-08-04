@@ -25658,7 +25658,7 @@ mod self_test {
             //     まさに Issue #28 で死んでいた経路を実 claude で通す。
             //     claude CLI + 認証が必要なため既定ではスキップ。verify-claude-mcp.sh と同格の
             //     実機検証ツールという位置付け）
-            if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() {
+            if claude_e2e_enabled("28") {
                 type_text(any, cx, "claude", true);
                 let mut claude_ready = false;
                 for _ in 0..80 {
@@ -34578,7 +34578,7 @@ mod self_test {
                 //      ペイン内の claude が `CLAUDE_CODE_CHILD_SESSION` を継承すると
                 //      transcript 保存が無効化され（画面に `Transcript saving is off`）、
                 //      session_id が解決できずここは必ず落ちる（実測して突き止めた）
-                let claude_e2e = std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed;
+                let claude_e2e = claude_e2e_enabled("716") && tmux_backed;
                 // 実 claude 用に**専用の広いペイン**を用意する。項目 94 / 95 で使ったペインは
                 // ①分割を重ねて背が低い ②項目 95 の送信テストでシェルに文字が残っている
                 // ので、そのまま claude を起動すると入力欄に残骸が混ざる（実測した）
@@ -35697,7 +35697,7 @@ mod self_test {
                 //      （#720 受け入れ条件 1 そのもの）。ここで測った所要時間が
                 //      `SETTLE_AGENT_LIMIT` の根拠になる。95c と同じく claude CLI +
                 //      認証 + tmux が要るので既定ではスキップする
-                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() && tmux_backed {
+                if claude_e2e_enabled("720") && tmux_backed {
                     let e2e_pane = window
                         .update(cx, |app, _, cx| {
                             let pane = tako_control::dispatch(
@@ -37245,7 +37245,7 @@ mod self_test {
                 //      引き継ぎの通し: 閾値超過を模擬した前任 → handoff → 後任が起動して
                 //      引き継ぎファイルを読み実態を突き合わせ → 前任ペインを閉じる。
                 //      claude CLI + 認証 + tmux が要るので既定ではスキップする（#749 受け入れ 1）
-                if std::env::var_os("TAKO_SELF_TEST_CLAUDE").is_some() {
+                if claude_e2e_enabled("749") {
                     // 引き継ぎファイルへ目印を入れる（後任が読んだことを画面で確認するため）
                     if let Some(ref path) = handoff_path {
                         let _ = std::fs::write(
@@ -37426,6 +37426,22 @@ fn shell_escape(path: &std::path::Path) -> String {
         format!("'{}'", s.replace('\'', "'\\''"))
     } else {
         s.into_owned()
+    }
+}
+
+/// 実 claude を要するセルフテスト項目を走らせるか（`TAKO_SELF_TEST_CLAUDE`）。
+///
+/// 値がタグ（項目に付けた Issue 番号）と一致するときは**その項目だけ**を走らせる。
+/// claude e2e は 1 本ごとに数十秒かかるうえタイミング判定を含むので、
+/// 並列ビルドで負荷が高いマシンでは全部通すと関係ない項目のフレークに当たり続ける
+/// （#749 の検証で実測: 4 連続で別々の項目が落ち 101c へ到達しなかった）。
+/// `=1` のような非タグ値は従来どおり全項目を走らせる
+fn claude_e2e_enabled(tag: &str) -> bool {
+    const TAGS: [&str; 4] = ["28", "716", "720", "749"];
+    match std::env::var("TAKO_SELF_TEST_CLAUDE") {
+        Ok(v) if TAGS.contains(&v.as_str()) => v == tag,
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 
