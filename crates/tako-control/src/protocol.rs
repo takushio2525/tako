@@ -516,11 +516,18 @@ pub enum Request {
         pane: Option<u64>,
         item: Option<usize>,
     },
-    /// PDF プレビュー内のリンク一覧取得（Issue #271）。
+    /// プレビュー内のリンク一覧取得（PDF は Issue #271、Markdown は Issue #680）。
+    /// 応答の `kind` が `"markdown"` / `"pdf"` のどちらの一覧かを示す。
     PreviewLinkList { pane: Option<u64> },
-    /// PDF プレビュー内のリンクをフォローする（Issue #271）。
+    /// プレビュー内のリンクをフォローする（PDF は Issue #271、Markdown は Issue #680）。
     /// `index` は link-list で返る 0 始まりインデックス。
     PreviewFollowLink { pane: Option<u64>, index: usize },
+    /// Markdown プレビューのコードブロック全文をクリップボードへ入れる（Issue #680）。
+    /// `index` は出現順の 0 始まり（省略時は先頭）。UI のコピーボタンと同じ経路。
+    PreviewCopyCode {
+        pane: Option<u64>,
+        index: Option<usize>,
+    },
     /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewReload { enabled: Option<bool> },

@@ -34,7 +34,55 @@ impl Rgb {
             b: (self.b as f32 * factor) as u8,
         }
     }
+
+    /// WCAG の相対輝度（0.0–1.0）
+    pub fn relative_luminance(self) -> f32 {
+        let channel = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(self.r) + 0.7152 * channel(self.g) + 0.0722 * channel(self.b)
+    }
+
+    /// 2 色のコントラスト比（WCAG。1.0〜21.0）
+    pub fn contrast_ratio(self, other: Self) -> f32 {
+        let a = self.relative_luminance();
+        let b = other.relative_luminance();
+        let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 明るい面に載せても読める明度まで落とす（色相・彩度の比は保つ）。
+    ///
+    /// Markdown のコードブロックは syntect のダーク配色で色付けされるため、ライトテーマの
+    /// 淡い面にそのまま載せるとコントラストが 2:1 前後まで落ちて読めない（Issue #656）。
+    /// 相対輝度が `max_luminance` を超える色だけを、sRGB のガンマ（≒2.2 乗）から逆算した
+    /// 係数で一律に暗くする。チャンネル比を変えないので構文色の識別は残る。
+    pub fn adapt_for_light_bg(self, max_luminance: f32) -> Self {
+        let luminance = self.relative_luminance();
+        if luminance <= max_luminance || luminance <= 0.0 {
+            return self;
+        }
+        // sRGB 値を k 倍すると輝度は概ね k^2.2 倍になるので、逆に解いて係数を出す
+        let factor = (max_luminance / luminance).powf(1.0 / 2.2).clamp(0.1, 1.0);
+        Self {
+            r: (self.r as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            g: (self.g as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            b: (self.b as f32 * factor).round().clamp(0.0, 255.0) as u8,
+        }
+    }
 }
+
+/// syntect（ダーク配色固定）由来の構文色をライトの面へ載せるときの相対輝度の上限。
+///
+/// ライトテーマの描画面（コードプレビュー本体 = `background` / Markdown のコードブロック =
+/// `mantle`）に対して WCAG AA（本文 4.5:1）を満たす値。境界は
+/// `adapt_syntax_colorがライトの実描画面で読める明度になる` で固定している。
+pub const SYNTAX_LIGHT_MAX_LUMINANCE: f32 = 0.12;
 
 /// テーマモード（ライト / ダーク。Issue #217）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -571,6 +619,21 @@ impl Theme {
         }
     }
 
+    /// syntect 由来の構文色を、このテーマの面で読める色へ整える（Issue #656 / #669）。
+    ///
+    /// syntect のテーマは `base16-eighties.dark` 固定なので、ライトテーマの淡い面へ
+    /// そのまま載せると既定文字色が 1.3:1 まで落ちてほぼ見えない。ライトのときだけ
+    /// 相対輝度を [`SYNTAX_LIGHT_MAX_LUMINANCE`] まで落とす（チャンネル比は保つので
+    /// 構文色の識別は残る）。ダークは原色をそのまま返し従来の見た目を保つ。
+    ///
+    /// 描画時の変換なので、テーマ切替はハイライトの作り直し無しで即座に反映される。
+    pub fn adapt_syntax_color(&self, color: Rgb) -> Rgb {
+        match self.mode {
+            ThemeMode::Dark => color,
+            ThemeMode::Light => color.adapt_for_light_bg(SYNTAX_LIGHT_MAX_LUMINANCE),
+        }
+    }
+
     /// 256 色パレットのインデックスを解決する。
     /// 0–15 はテーマの ANSI 色、16–231 は 6x6x6 カラーキューブ、232–255 はグレースケール
     pub fn indexed_color(&self, index: u8) -> Rgb {
@@ -599,6 +662,98 @@ mod tests {
     fn from_hexで各成分が取れる() {
         let c = Rgb::from_hex(0x1e2e3e);
         assert_eq!((c.r, c.g, c.b), (0x1e, 0x2e, 0x3e));
+    }
+
+    /// Issue #656: syntect のダーク配色をライトの面に載せても読めること。
+    /// 期待値は「ライトのコードパネル面（mantle）に対して 4.5:1 以上」
+    #[test]
+    fn adapt_for_light_bgでライト面のコントラストが確保される() {
+        let panel = Theme::default_light().mantle;
+        // base16-eighties.dark の実値（既定文字色 / 緑 / 黄 / 青）
+        for raw in [0xd3d0c8, 0x99cc99, 0xffcc66, 0x6699cc, 0xffffff] {
+            let raw = Rgb::from_hex(raw);
+            let before = raw.contrast_ratio(panel);
+            let after = raw.adapt_for_light_bg(0.12).contrast_ratio(panel);
+            assert!(
+                after >= 4.5,
+                "{} は変換後もコントラスト不足: {before:.2} → {after:.2}",
+                raw.to_hex()
+            );
+            assert!(after > before, "変換でコントラストが上がっていない");
+        }
+    }
+
+    #[test]
+    fn adapt_for_light_bgは暗い色をそのまま返す() {
+        let dark = Rgb::from_hex(0x1e1e2e);
+        assert_eq!(dark.adapt_for_light_bg(0.12), dark);
+        // 色相（チャンネルの大小関係）は変換後も保たれる
+        let green = Rgb::from_hex(0x99cc99).adapt_for_light_bg(0.12);
+        assert!(green.g > green.r && green.g > green.b);
+    }
+
+    /// base16-eighties.dark（syntect の既定テーマ）の代表色。
+    /// 既定文字色 / 緑（文字列）/ 黄（関数名）/ 青（キーワード）/ 赤 / 紫 / コメント灰 / 白
+    const SYNTECT_SAMPLE_COLORS: [(u32, &str); 8] = [
+        (0xd3d0c8, "既定文字色"),
+        (0x99cc99, "緑（文字列）"),
+        (0xffcc66, "黄（関数名）"),
+        (0x6699cc, "青（キーワード）"),
+        (0xf2777a, "赤"),
+        (0xcc99cc, "紫"),
+        (0x747369, "コメント灰"),
+        (0xffffff, "白"),
+    ];
+
+    /// Issue #669: ライトテーマの**実描画面**すべてで AA（4.5:1）を満たすこと。
+    /// コードプレビュー本体は `background`、Markdown のコードブロックは `mantle` に載る。
+    #[test]
+    fn adapt_syntax_colorがライトの実描画面で読める明度になる() {
+        let light = Theme::default_light();
+        for (surface_name, surface) in [("background", light.background), ("mantle", light.mantle)]
+        {
+            for (hex, label) in SYNTECT_SAMPLE_COLORS {
+                let raw = Rgb::from_hex(hex);
+                let before = raw.contrast_ratio(surface);
+                let after = light.adapt_syntax_color(raw).contrast_ratio(surface);
+                assert!(
+                    after >= 4.5,
+                    "{label}（{}）が {surface_name} で AA 未達: {before:.2} → {after:.2}",
+                    raw.to_hex()
+                );
+            }
+        }
+    }
+
+    /// ダークテーマでは 1 ビットも変えない（Issue #669 の受け入れ条件 2）
+    #[test]
+    fn adapt_syntax_colorはダークで原色を返す() {
+        let dark = Theme::default_dark();
+        for (hex, label) in SYNTECT_SAMPLE_COLORS {
+            let raw = Rgb::from_hex(hex);
+            assert_eq!(dark.adapt_syntax_color(raw), raw, "{label} が変換された");
+        }
+    }
+
+    /// ライト変換後も色相（チャンネルの大小関係）が保たれ、構文色を見分けられること
+    #[test]
+    fn adapt_syntax_colorはライトでも色相を保つ() {
+        let light = Theme::default_light();
+        let green = light.adapt_syntax_color(Rgb::from_hex(0x99cc99));
+        assert!(green.g > green.r && green.g > green.b, "緑が緑でない");
+        let blue = light.adapt_syntax_color(Rgb::from_hex(0x6699cc));
+        assert!(blue.b > blue.g && blue.g > blue.r, "青が青でない");
+        let red = light.adapt_syntax_color(Rgb::from_hex(0xf2777a));
+        assert!(red.r > red.g && red.r > red.b, "赤が赤でない");
+    }
+
+    #[test]
+    fn contrast_ratioは対称で範囲内() {
+        let a = Rgb::from_hex(0xffffff);
+        let b = Rgb::from_hex(0x000000);
+        assert!((a.contrast_ratio(b) - 21.0).abs() < 0.1);
+        assert!((b.contrast_ratio(a) - 21.0).abs() < 0.1);
+        assert!((a.contrast_ratio(a) - 1.0).abs() < 0.001);
     }
 
     #[test]
