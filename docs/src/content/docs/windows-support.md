@@ -23,9 +23,9 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 95 | macOS 版と同じように使えます |
-| 一部対応 | 11 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 22 | まだ実装されていません（追跡 Issue つき） |
+| 対応済み | 99 | macOS 版と同じように使えます |
+| 一部対応 | 9 | 使えますが機能が落ちます（理由は各表に記載） |
+| 未対応 | 20 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **129** | |
 
@@ -68,7 +68,7 @@ tako platform --status pending # 未対応のものだけ
 | `tako_collapse_tab` | 対応済み | — |
 | `tako_confirm_close` | 対応済み | — |
 | `tako_set_title` | 対応済み | — |
-| `tako_auto_rename` | 一部対応 | AI による命名は claude CLI の解決が Windows で効かないため働かず、ヒューリスティック命名にとどまる |
+| `tako_auto_rename` | 対応済み | — |
 | `tako_window` | 対応済み | — |
 | `tako_menu` | 対応済み（macOS でも一部対応） | — |
 | `tako_panel` | 対応済み | — |
@@ -156,7 +156,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | --- | --- | --- |
 | `tako_open_file` | 一部対応 | コード・Markdown・画像・PDF は表示できる。動画は macOS 実装のため表示できない |
 | `tako_preview_view` | 対応済み | — |
-| `tako_preview_outline` | 一部対応 | Markdown の目次と PDF のページ送りは動く。PDF 自身の目次（しおり）を取り出す API が Windows の PDF レンダラに無いため、しおりだけが空になる |
+| `tako_preview_outline` | 対応済み | — |
 | `tako_preview_reload` | 対応済み | — |
 | `tako_preview_cache` | 対応済み | — |
 | `tako_preview_changelog` | 対応済み | — |
@@ -168,8 +168,8 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_preview_undo` | 対応済み | — |
 | `tako_preview_redo` | 対応済み | — |
 | `tako_preview_autosave` | 対応済み | — |
-| `tako_preview_link_list` | 未対応 | PDF の表示・ズーム・ページ送りは動く。リンク注釈を取り出す API が Windows の PDF レンダラに無いため、リンクは常に 0 件になる <br />追跡: [#693](https://github.com/takushio2525/tako/issues/693) |
-| `tako_preview_follow_link` | 未対応 | PDF の表示・ズーム・ページ送りは動く。リンク注釈を取り出す API が Windows の PDF レンダラに無いため、リンクは常に 0 件になる <br />追跡: [#693](https://github.com/takushio2525/tako/issues/693) |
+| `tako_preview_link_list` | 対応済み | — |
+| `tako_preview_follow_link` | 対応済み | — |
 | `tako_pin_preview` | 対応済み | — |
 | `tako_video_playback` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
 | `tako_video_seek` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
