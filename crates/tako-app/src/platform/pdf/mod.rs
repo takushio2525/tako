@@ -9,21 +9,21 @@
 //! | | ラスタライズ | テキストレイヤ | 目次（しおり） | リンク注釈 |
 //! |---|---|---|---|---|
 //! | macOS | Core Graphics | PDFKit | PDFKit | PDFKit |
-//! | Windows | Windows.Data.Pdf | **無し** | lopdf (#693) | lopdf (#693) |
+//! | Windows | Windows.Data.Pdf | pdf-extract (#693) | lopdf (#693) | lopdf (#693) |
 //! | その他 | 無し | 無し | 無し | 無し |
 //!
-//! Windows の目次・リンク注釈は #693 で `lopdf`（pure Rust の PDF 構造パーサ）を導入して
-//! 対応した。テキストレイヤの抽出には content stream のパースとフォントエンコーディングの
-//! 解決が必要で、lopdf 単体では困難なため空を返す。テキストレイヤの無い PDF は macOS でも
-//! 普通にあり、描画側（`preview_render`）はその場合の分岐を既に持っている。
+//! Windows の WinRT レンダラは**ページを画像にすることしかできない**ので、
+//! 残る 3 つは #693 で PDF ファイルを直接読んで補った（`windows.rs` のモジュール doc）。
+//! テキストレイヤの無い PDF（スキャン画像など）は macOS でも普通にあり、
+//! 描画側（`preview_render`）はその場合の分岐を既に持っている。
 //!
-//! ## なぜ OS 標準のレンダラ + lopdf か
+//! ## なぜ OS 標準のレンダラ + PDF パーサか
 //!
 //! macOS が PDFKit / Core Graphics（= OS 標準）を使っているのと同じ形にすると、
-//! B12 が「両 OS とも OS のレンダラを呼ぶ」1 つの構造に収まる。PDFium を同梱すれば
-//! テキストもリンクも一度に手に入るが、対価が `pdfium.dll` 約 6〜11 MB の配布物追加
+//! B12 が「両 OS とも OS のレンダラで描く」1 つの構造に収まる。PDFium を同梱すれば
+//! 描画もテキストもリンクも一度に手に入るが、対価が `pdfium.dll` 約 6〜11 MB の配布物追加
 //! （Inno Setup インストーラー・ポータブル zip・配布物検査すべてに波及）で高い。
-//! lopdf は pure Rust で追加の再頒布物が不要、バイナリ増は推定 200〜400KB で済む。
+//! `lopdf` / `pdf-extract` は pure Rust なので追加の再頒布物が要らない。
 //! 選定の詳細は #521 / #693 のコメントを参照。
 
 use std::path::Path;
@@ -52,7 +52,12 @@ use windows as imp;
 pub struct PdfCapabilities {
     /// ページを画像へ描けるか。false ならプレビューを開くこと自体ができない
     pub rasterize: bool,
-    /// テキストレイヤ（選択・コピー・ヒットテスト）が取れるか
+    /// テキストレイヤ（選択・コピー・ヒットテスト）が取れるか。
+    ///
+    /// true でも**行のまとまり方は実装によって差が出る**。macOS は PDFKit の版面解析、
+    /// Windows は字送りと位置指定からの復元（`windows.rs` の `build_lines`）で、
+    /// 後者は段組を空きの広さで切り分ける近似になる。選択の単位である文字矩形は
+    /// どちらも 1 文字ずつ実測値から作る
     pub text_layer: bool,
     /// PDF 自身の目次（しおり）が取れるか。
     /// 目次パネルの「ページへ移動」は `total_pages` 由来で、これとは独立に動く

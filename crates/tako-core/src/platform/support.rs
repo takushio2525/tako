@@ -160,14 +160,6 @@ pub mod notes {
         "tmux サーバーそのものを操作する機能。Windows に tmux は無い",
         "Operates the tmux server itself, which does not exist on Windows",
     );
-    /// #693: PDF のテキスト選択・コピーは Windows では使えない。content stream のパースと
-    /// フォントエンコーディングの解決が必要で、lopdf 単体では困難なため
-    pub const WIN_PDF_NO_TEXT_LAYER: Note = Note::new(
-        "PDF のテキスト選択・コピーは Windows では使えない。PDF 内部のテキスト抽出には \
-         フォントエンコーディングの解決が必要で、現在の構成では困難なため",
-        "PDF text selection and copy are not available on Windows. Extracting text from PDF \
-         internals requires font encoding resolution, which is not feasible with the current stack",
-    );
     /// #521: 動画再生は AVFoundation 実装なので macOS 限定
     pub const WIN_VIDEO_MACOS_ONLY: Note = Note::new(
         "動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない",

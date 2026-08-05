@@ -7,15 +7,33 @@
 //!
 //! ## リンク注釈・目次・テキスト (#693)
 //!
-//! Windows.Data.Pdf にはリンク注釈・目次（しおり）・テキスト抽出の API が**存在しない**。
-//! そこで PDF オブジェクトツリーの構造パーサ `lopdf`（pure Rust・MIT）を併用し、
-//! ラスタライズは WinRT、メタデータ抽出は lopdf で補う。
+//! Windows.Data.Pdf にはリンク注釈・目次（しおり）・テキスト抽出の API が**存在しない**
+//! （このレンダラができるのは「ページを画像にする」ことだけ）。そこで PDF ファイル側を
+//! 直接読んで補う。ラスタライズは WinRT、それ以外は PDF の構造から組み立てる。
 //!
-//! - **リンク注釈**: ページの `/Annots` → `/Link` サブタイプ → `/A`（URI アクション）/
-//!   `/Dest`（内部ページ）を読む。`/Rect` から PDF 座標の矩形を取得
-//! - **目次**: ドキュメントカタログの `/Outlines` ツリーを走査
-//! - **テキスト抽出**: content stream のパースとフォントエンコーディングの解決が要るため
-//!   lopdf 単体では困難。[`CAPABILITIES`] で `text_layer: false` を立てる
+//! - **リンク注釈**: ページの `/Annots` → `/Link` → `/A`（URI アクション）/ `/Dest`
+//!   （内部ページ）を `lopdf` で読む。`/Rect` から矩形を取る
+//! - **目次**: ドキュメントカタログの `/Outlines` ツリーを `lopdf` で走査
+//! - **テキストレイヤ**: `pdf-extract` に content stream を解釈させ、文字ごとの
+//!   変換行列・送り幅・フォントサイズを受け取って行と文字矩形へ組み直す（[`TextCollector`]）
+//!
+//! `lopdf` 単体では**字面すら取り出せない**（content stream の `Tj` が持つのはフォント固有の
+//! バイト列で、Unicode へ落とすには標準 14 フォントの AFM 幅・`/Differences`・`ToUnicode`
+//! CMap・CID の解決が要る）。そこを持っているのが `pdf-extract` の採用理由で、
+//! バージョンは `lopdf` を共有させるために揃えてある（Cargo.toml のコメント参照）。
+//!
+//! ## 座標系
+//!
+//! 3 つとも **PDF 座標（左下原点）で、ページ矩形の左下を (0, 0) とした値**に揃える
+//! （`preview_render::pdf_box_to_screen` がその前提で画面へ写す）。`/CropBox` があるページは
+//! レンダラもそちらを描くので、原点は [`page_box_origin`] で CropBox 優先に解決して差し引く。
+//!
+//! ## 行の復元（テキストレイヤの限界）
+//!
+//! PDF に「行」は無く、字送りと位置指定の列があるだけなので [`build_lines`] が復元する。
+//! macOS の PDFKit のような版面解析は持たないため、**段組は空きの広さで切り分ける近似**に
+//! なる（[`LINE_JOIN_GAP_RATIO`]）。選択・ヒットテストの単位である文字矩形は
+//! 1 文字ずつ実測値から作るので、この近似の影響を受けるのは行のまとまり方だけ。
 //!
 //! ## 単位の違い（罠）
 //!
@@ -61,13 +79,12 @@ use windows::Data::Pdf::{PdfDocument, PdfPage, PdfPageRenderOptions};
 use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
 
 use super::PdfCapabilities;
-use crate::preview::{PdfRasterKey, PdfRasterizedPages, PdfTextLine};
+use crate::preview::{PdfCharBox, PdfRasterKey, PdfRasterizedPages, PdfTextLine};
 
 pub(super) const CAPABILITIES: PdfCapabilities = PdfCapabilities {
     rasterize: true,
-    // content stream + font encoding が要るので lopdf 単体では困難（#693）
-    text_layer: false,
-    // lopdf で PDF オブジェクトツリーから読む（#693）
+    // 以下 3 つは WinRT レンダラには無く、PDF を直接読んで補っている（#693）
+    text_layer: true,
     outline: true,
     links: true,
 };
@@ -159,14 +176,292 @@ pub fn render_all_pages(
     })
 }
 
-/// テキスト抽出には content stream のパースとフォントエンコーディングの解決が必要で、
-/// lopdf 単体では困難（#693）。テキストレイヤの無い PDF は macOS でも普通にあり、
-/// 描画側はその分岐を持っているのでエラーではなく空で返す
+/// `pdf-extract` に content stream を解釈させ、文字ごとの位置から行を組み立てる（#693）。
+///
+/// テキストレイヤを持たない PDF（スキャン画像など）は macOS でも普通にあり、描画側は
+/// その分岐を持っているので、取れなければエラーではなく空で返す。
 pub fn extract_text_layers(
-    _path: &Path,
-    _total_pages: usize,
+    path: &Path,
+    total_pages: usize,
 ) -> Result<Vec<Vec<PdfTextLine>>, String> {
-    Ok(Vec::new())
+    let Ok(doc) = LopdfDocument::load(path) else {
+        return Ok(Vec::new());
+    };
+    let mut result = vec![Vec::new(); total_pages];
+    for (&page_num, &page_id) in &doc.get_pages() {
+        let page_index = (page_num as usize).saturating_sub(1);
+        if page_index >= total_pages {
+            continue;
+        }
+        if let Some(lines) = collect_page_text(&doc, page_num, page_box_origin(&doc, page_id)) {
+            result[page_index] = lines;
+        }
+    }
+    Ok(result)
+}
+
+/// 1 ページ分のテキストを採取する。取れなければ `None`（そのページだけ空になる）。
+///
+/// `pdf-extract` は不正な content stream に対して panic することがある
+/// （テキスト表示演算子が `Tf` より先に来ると内部の `unwrap` が外れる）。ユーザーの PDF は
+/// 何が入っているか分からないので、**1 ページの panic でアプリを道連れにしない**よう捕まえる。
+/// 捕まえてもプロセス側の panic フックは動くので、原因は panic.log に残る。
+fn collect_page_text(
+    doc: &LopdfDocument,
+    page_num: u32,
+    origin: (f64, f64),
+) -> Option<Vec<PdfTextLine>> {
+    let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut collector = TextCollector::new(origin);
+        pdf_extract::output_doc_page(doc, &mut collector, page_num).ok()?;
+        Some(collector.into_lines())
+    }));
+    match collected {
+        Ok(lines) => lines,
+        Err(_) => {
+            eprintln!("warning: PDF のテキスト抽出が {page_num} ページ目で異常終了した");
+            None
+        }
+    }
+}
+
+// --- pdf-extract によるテキストレイヤ抽出 ---
+
+/// 1 ページあたりの採取上限。壊れた PDF や生成物の暴走で青天井にしない
+const MAX_CHARS_PER_PAGE: usize = 200_000;
+/// 同じ行とみなすベースラインのずれ（実効フォントサイズ比）
+const SAME_BASELINE_RATIO: f64 = 0.3;
+/// 同じ行として繋いでよい水平方向の空き（実効フォントサイズ比）。
+/// 単語ごとに `Tm` を置き直す生成器を繋ぎ直しつつ、段組は分けたままにするための境目
+const LINE_JOIN_GAP_RATIO: f64 = 6.0;
+/// 空白を 1 つ補う水平方向の空き（実効フォントサイズ比）。
+/// PDF は単語の区切りを空白文字ではなく字送りだけで表すことがある
+const SPACE_GAP_RATIO: f64 = 0.25;
+/// ベースラインから下へ伸ばす量（ディセンダ相当。実効フォントサイズ比）
+const DESCENT_RATIO: f64 = 0.2;
+/// 送り幅ゼロのグリフに与える最小幅（実効フォントサイズ比）。
+/// 幅 0 の矩形はヒットテストの的にならず、選択から取り残されてしまう
+const MIN_GLYPH_WIDTH_RATIO: f64 = 0.05;
+
+/// 採取した 1 文字。座標はページ矩形の左下を原点とする PDF 座標
+struct RawChar {
+    /// ベースライン左端の x
+    x: f64,
+    /// ベースラインの y
+    y: f64,
+    /// 送り幅
+    advance: f64,
+    /// 実効フォントサイズ（`Tm` / CTM の伸縮を畳んだ値）
+    size: f64,
+    text: String,
+    /// 直前に `end_line()` が来た = ここから新しい run
+    line_break: bool,
+}
+
+/// `pdf-extract` から文字を受け取って溜める。
+///
+/// この実装が返すのは「文字と、その置かれた位置」だけで、行にまとめるのは [`build_lines`]。
+struct TextCollector {
+    origin: (f64, f64),
+    chars: Vec<RawChar>,
+    pending_break: bool,
+    overflowed: bool,
+}
+
+impl TextCollector {
+    fn new(origin: (f64, f64)) -> Self {
+        Self {
+            origin,
+            chars: Vec::new(),
+            pending_break: false,
+            overflowed: false,
+        }
+    }
+
+    fn into_lines(self) -> Vec<PdfTextLine> {
+        if self.overflowed {
+            eprintln!(
+                "warning: PDF 1 ページの文字数が上限（{MAX_CHARS_PER_PAGE}）を超えたので打ち切った"
+            );
+        }
+        build_lines(self.chars)
+    }
+}
+
+impl pdf_extract::OutputDev for TextCollector {
+    fn begin_page(
+        &mut self,
+        _page_num: u32,
+        _media_box: &pdf_extract::MediaBox,
+        _art_box: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+
+    fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+
+    /// `trm` は `Tsm × Tm × CTM`（**フォントサイズを含まない**。pdf-extract は別引数で渡す）。
+    /// その平行移動成分がグリフ原点 = ベースライン左端で、単位は PDF ユーザー空間。
+    fn output_character(
+        &mut self,
+        trm: &pdf_extract::Transform,
+        width: f64,
+        spacing: f64,
+        font_size: f64,
+        text: &str,
+    ) -> Result<(), pdf_extract::OutputError> {
+        if self.chars.len() >= MAX_CHARS_PER_PAGE {
+            self.overflowed = true;
+            return Ok(());
+        }
+        // 制御文字は行の意味を壊すだけなので落とす（\u{0} を吐く PDF がある）
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        if text.is_empty() {
+            return Ok(());
+        }
+        // 行列の線形部から縦横の伸縮を取り出す。回転していても長さとして正しい値になる
+        let x_scale = trm.m11.hypot(trm.m12);
+        let y_scale = trm.m21.hypot(trm.m22);
+        // 送り幅はテキスト空間で width * font_size + spacing。横方向の伸縮だけ掛ける
+        let advance = (width * font_size + spacing) * x_scale;
+        let size = font_size * y_scale;
+        self.chars.push(RawChar {
+            x: trm.m31 - self.origin.0,
+            y: trm.m32 - self.origin.1,
+            advance,
+            size,
+            text,
+            line_break: std::mem::take(&mut self.pending_break),
+        });
+        Ok(())
+    }
+
+    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+
+    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+
+    /// `Tm` / `Td` / `TD` / `T*` で呼ばれる = 位置指定が入った合図
+    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> {
+        self.pending_break = true;
+        Ok(())
+    }
+}
+
+/// 採取した文字を行へ組み直す。
+///
+/// ①`end_line()` で run に切り、②同じベースラインで横に続く run を繋ぎ直す、の 2 段。
+/// ②が要るのは単語ごとに位置指定を置き直す生成器があるためで、それをやると今度は段組が
+/// 1 行に化けるので、空きが [`LINE_JOIN_GAP_RATIO`] を超えたら繋がない。
+fn build_lines(chars: Vec<RawChar>) -> Vec<PdfTextLine> {
+    // ① 位置指定で run へ分割
+    let mut runs: Vec<Vec<RawChar>> = Vec::new();
+    for ch in chars {
+        if ch.line_break || runs.is_empty() {
+            runs.push(Vec::new());
+        }
+        if let Some(run) = runs.last_mut() {
+            run.push(ch);
+        }
+    }
+    runs.retain(|run| !run.is_empty());
+    // TJ の負オフセットで前後することがあるので run 内も x 昇順に均す
+    for run in &mut runs {
+        run.sort_by(|a, b| a.x.total_cmp(&b.x));
+    }
+    // 上の行から、同じ行なら左から右へ
+    runs.sort_by(|a, b| b[0].y.total_cmp(&a[0].y).then(a[0].x.total_cmp(&b[0].x)));
+
+    // ② 同じベースラインで近い run を繋ぐ
+    let mut lines: Vec<Vec<RawChar>> = Vec::new();
+    for run in runs {
+        match lines.last_mut() {
+            Some(last) if can_join(last, &run) => last.extend(run),
+            _ => lines.push(run),
+        }
+    }
+    lines.into_iter().filter_map(finish_line).collect()
+}
+
+/// 直前の行の続きとして繋いでよいか
+fn can_join(last: &[RawChar], run: &[RawChar]) -> bool {
+    let (Some(tail), Some(head)) = (last.last(), run.first()) else {
+        return false;
+    };
+    let size = tail.size.max(head.size).max(f64::EPSILON);
+    if (tail.y - head.y).abs() > SAME_BASELINE_RATIO * size {
+        return false;
+    }
+    // 少しの重なりは許す（カーニングや装飾で前の字へ食い込むことがある）
+    let gap = head.x - (tail.x + tail.advance);
+    (-0.5 * size..=LINE_JOIN_GAP_RATIO * size).contains(&gap)
+}
+
+/// 1 行分の文字から [`PdfTextLine`] を作る。
+///
+/// 文字矩形は**必ず 1 Unicode スカラーにつき 1 つ**にする（選択とヒットテストが
+/// バイト位置で引くため）。合字が複数文字へ展開されたときは送り幅を等分する。
+fn finish_line(mut chars: Vec<RawChar>) -> Option<PdfTextLine> {
+    chars.sort_by(|a, b| a.x.total_cmp(&b.x));
+
+    let mut text = String::new();
+    let mut char_boxes: Vec<PdfCharBox> = Vec::new();
+    let mut prev_right: Option<f64> = None;
+
+    for ch in &chars {
+        let height = ch.size.max(f64::EPSILON);
+        let bottom = ch.y - DESCENT_RATIO * ch.size;
+        let width = ch.advance.abs().max(ch.size * MIN_GLYPH_WIDTH_RATIO);
+
+        // 字送りだけで表された単語区切りを空白として補う
+        if let Some(right) = prev_right {
+            let gap = ch.x - right;
+            if gap > SPACE_GAP_RATIO * ch.size && !ch.text.starts_with(' ') {
+                let start = text.len();
+                text.push(' ');
+                char_boxes.push(PdfCharBox {
+                    byte_range: start..text.len(),
+                    bbox: [right, bottom, gap, height],
+                });
+            }
+        }
+
+        // 合字などで 1 グリフが複数文字になることがあるので等分する
+        let count = ch.text.chars().count().max(1);
+        let each = width / count as f64;
+        for (i, c) in ch.text.chars().enumerate() {
+            let start = text.len();
+            text.push(c);
+            char_boxes.push(PdfCharBox {
+                byte_range: start..text.len(),
+                bbox: [ch.x + each * i as f64, bottom, each, height],
+            });
+        }
+        prev_right = Some(ch.x + width);
+    }
+
+    if text.trim().is_empty() {
+        return None;
+    }
+    // 行の外接矩形は文字矩形の和
+    let left = char_boxes.iter().fold(f64::MAX, |a, b| a.min(b.bbox[0]));
+    let right = char_boxes
+        .iter()
+        .fold(f64::MIN, |a, b| a.max(b.bbox[0] + b.bbox[2]));
+    let bottom = char_boxes.iter().fold(f64::MAX, |a, b| a.min(b.bbox[1]));
+    let top = char_boxes
+        .iter()
+        .fold(f64::MIN, |a, b| a.max(b.bbox[1] + b.bbox[3]));
+    Some(PdfTextLine {
+        text,
+        bbox: [left, bottom, right - left, top - bottom],
+        char_boxes,
+    })
 }
 
 /// lopdf で PDF の `/Outlines` ツリー（しおり）を走査する（#693）。
@@ -216,6 +511,7 @@ fn lopdf_extract_links(doc: &LopdfDocument, total_pages: usize) -> PdfLinks {
             Some(ids) => ids,
             None => continue,
         };
+        let origin = page_box_origin(doc, page_id);
         for annot_ref in annot_ids {
             let annot_id = match annot_ref.as_reference() {
                 Ok(id) => id,
@@ -230,7 +526,7 @@ fn lopdf_extract_links(doc: &LopdfDocument, total_pages: usize) -> PdfLinks {
             if !is_link_annotation(annot_dict) {
                 continue;
             }
-            let bbox = match extract_rect(annot_dict) {
+            let bbox = match extract_rect(doc, annot_dict, origin) {
                 Some(r) => r,
                 None => continue,
             };
@@ -254,11 +550,14 @@ fn is_link_annotation(dict: &lopdf::Dictionary) -> bool {
         .is_some_and(|name| name == b"Link")
 }
 
-/// `/Rect [x1, y1, x2, y2]` を `[x, y, width, height]`（PDF 座標、左下原点）に変換。
-/// macOS の PDFKit と同じ形式にする
-fn extract_rect(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
-    let rect_obj = dict.get(b"Rect").ok()?;
-    let rect_arr = rect_obj.as_array().ok()?;
+/// `/Rect [x1, y1, x2, y2]` を `[x, y, width, height]`（PDF 座標・左下原点）に変換する。
+/// 角の順序は仕様上どちらでもよいので min / max で正規化し、ページ矩形の左下を原点に揃える
+fn extract_rect(
+    doc: &LopdfDocument,
+    dict: &lopdf::Dictionary,
+    origin: (f64, f64),
+) -> Option<[f64; 4]> {
+    let rect_arr = resolve_array(doc, dict.get(b"Rect").ok()?)?;
     if rect_arr.len() < 4 {
         return None;
     }
@@ -266,9 +565,41 @@ fn extract_rect(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
     let y1 = obj_to_f64(&rect_arr[1])?;
     let x2 = obj_to_f64(&rect_arr[2])?;
     let y2 = obj_to_f64(&rect_arr[3])?;
-    let x = x1.min(x2);
-    let y = y1.min(y2);
-    Some([x, y, (x2 - x1).abs(), (y2 - y1).abs()])
+    Some([
+        x1.min(x2) - origin.0,
+        y1.min(y2) - origin.1,
+        (x2 - x1).abs(),
+        (y2 - y1).abs(),
+    ])
+}
+
+/// ページ矩形の左下。`/CropBox` があればそちらを優先する（レンダラも CropBox を描くので、
+/// 注釈やテキストの座標を画像へ重ねるにはこの原点でそろえる必要がある）。
+/// この 2 つは親の `/Pages` から継承できるので `/Parent` を辿る
+fn page_box_origin(doc: &LopdfDocument, page_id: lopdf::ObjectId) -> (f64, f64) {
+    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+        if let Some(rect) = inherited_rect(doc, page_id, key) {
+            return (rect[0].min(rect[2]), rect[1].min(rect[3]));
+        }
+    }
+    (0.0, 0.0)
+}
+
+/// ページ属性を `/Parent` を辿りながら引く。壊れた PDF の循環参照で止まらないよう深さを切る
+fn inherited_rect(doc: &LopdfDocument, page_id: lopdf::ObjectId, key: &[u8]) -> Option<[f64; 4]> {
+    const MAX_DEPTH: usize = 32;
+    let mut current = page_id;
+    for _ in 0..MAX_DEPTH {
+        let dict = doc.get_object(current).ok()?.as_dict().ok()?;
+        if let Some(arr) = dict.get(key).ok().and_then(|v| resolve_array(doc, v)) {
+            let values: Vec<f64> = arr.iter().take(4).filter_map(obj_to_f64).collect();
+            if let [x1, y1, x2, y2] = values[..] {
+                return Some([x1, y1, x2, y2]);
+            }
+        }
+        current = dict.get(b"Parent").ok()?.as_reference().ok()?;
+    }
+    None
 }
 
 /// リンクの飛び先を取り出す。`/A`（アクション辞書）を優先し、無ければ `/Dest` を試す
@@ -349,7 +680,7 @@ fn resolve_named_dest(
     let names_dict = resolve_dict(doc, names_ref)?;
     let dests_ref = names_dict.get(b"Dests").ok()?;
     let dests_dict = resolve_dict(doc, dests_ref)?;
-    lookup_name_tree(doc, &dests_dict, name, pages)
+    lookup_name_tree(doc, dests_dict, name, pages)
 }
 
 /// PDF の Name Tree をたどる
@@ -381,7 +712,7 @@ fn lookup_name_tree(
         let kids = resolve_array(doc, kids_arr)?;
         for kid in kids {
             let kid_dict = resolve_dict(doc, kid)?;
-            if let Some(result) = lookup_name_tree(doc, &kid_dict, name, pages) {
+            if let Some(result) = lookup_name_tree(doc, kid_dict, name, pages) {
                 return Some(result);
             }
         }
@@ -414,31 +745,36 @@ fn lopdf_extract_outline(doc: &LopdfDocument, total_pages: usize) -> PreviewOutl
         Err(_) => return PreviewOutline::default(),
     };
 
-    let mut items = Vec::new();
-    collect_outline_items(
+    let walk = OutlineWalk {
         doc,
-        first,
-        1,
         total_pages,
-        &pages,
-        &mut items,
-        MAX_DEPTH,
-        MAX_ITEMS,
-    );
+        pages: &pages,
+        max_depth: MAX_DEPTH,
+        max_items: MAX_ITEMS,
+    };
+    let mut items = Vec::new();
+    collect_outline_items(&walk, first, 1, &mut items);
     PreviewOutline::new(items)
 }
 
-fn collect_outline_items(
-    doc: &LopdfDocument,
-    item_ref: &lopdf::Object,
-    level: u8,
+/// `/Outlines` の走査中ずっと変わらないもの。
+/// 再帰の引数として持ち回ると、可変な「今どこか」（項目・深さ・結果）が埋もれる
+struct OutlineWalk<'a> {
+    doc: &'a LopdfDocument,
     total_pages: usize,
-    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
-    items: &mut Vec<PreviewOutlineItem>,
+    pages: &'a std::collections::BTreeMap<u32, lopdf::ObjectId>,
     max_depth: u8,
     max_items: usize,
+}
+
+fn collect_outline_items(
+    walk: &OutlineWalk<'_>,
+    item_ref: &lopdf::Object,
+    level: u8,
+    items: &mut Vec<PreviewOutlineItem>,
 ) {
-    if level > max_depth || items.len() >= max_items {
+    let (doc, pages) = (walk.doc, walk.pages);
+    if level > walk.max_depth || items.len() >= walk.max_items {
         return;
     }
     let dict = match resolve_dict(doc, item_ref) {
@@ -454,9 +790,8 @@ fn collect_outline_items(
         .to_string();
 
     if !title.is_empty() {
-        let page_target = resolve_outline_dest(doc, &dict, pages);
-        if let Some(page) = page_target {
-            if page <= total_pages {
+        if let Some(page) = resolve_outline_dest(doc, dict, pages) {
+            if page <= walk.total_pages {
                 items.push(PreviewOutlineItem {
                     title,
                     level,
@@ -467,29 +802,10 @@ fn collect_outline_items(
     }
 
     if let Ok(first_child) = dict.get(b"First") {
-        collect_outline_items(
-            doc,
-            first_child,
-            level.saturating_add(1),
-            total_pages,
-            pages,
-            items,
-            max_depth,
-            max_items,
-        );
+        collect_outline_items(walk, first_child, level.saturating_add(1), items);
     }
-
     if let Ok(next) = dict.get(b"Next") {
-        collect_outline_items(
-            doc,
-            next,
-            level,
-            total_pages,
-            pages,
-            items,
-            max_depth,
-            max_items,
-        );
+        collect_outline_items(walk, next, level, items);
     }
 }
 
@@ -765,11 +1081,168 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// テキストレイヤは取れないが Err ではなく空を返す
+    /// 不在ファイルはパニックせず空で返る（描画側が正常系として扱えるように）
     #[test]
-    fn テキストレイヤは空で返る() {
+    fn テキストレイヤは不在ファイルで空を返す() {
         let path = Path::new("no-such.pdf");
         assert!(extract_text_layers(path, 3).unwrap().is_empty());
+    }
+
+    /// **文字矩形が実際の版面と合っているか**を、位置の分かっている PDF で数値検証する。
+    /// ここがずれるとテキスト選択が 1 行ずれた場所を掴む
+    #[test]
+    fn テキストの文字矩形が版面の実座標と一致する() {
+        let dir = std::env::temp_dir().join("tako_pdf_win_text_coord_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("text.pdf");
+        // Helvetica 12pt を (72, 700) に置く。Helvetica の 'H' は 722/1000 em なので
+        // 1 文字目の送りは 12 * 0.722 = 8.664pt になる
+        std::fs::write(
+            &path,
+            pdf_with_content("BT /F1 12 Tf 72 700 Td (Hello) Tj ET"),
+        )
+        .unwrap();
+
+        let layers = extract_text_layers(&path, 1).unwrap();
+        assert_eq!(layers.len(), 1);
+        let lines = &layers[0];
+        assert_eq!(lines.len(), 1, "1 行に組まれる: {lines:?}");
+        assert_eq!(lines[0].text, "Hello");
+
+        let boxes = &lines[0].char_boxes;
+        assert_eq!(boxes.len(), 5, "1 文字 1 矩形");
+        // 1 文字目 'H' はベースライン (72, 700) から始まる
+        assert!(
+            (boxes[0].bbox[0] - 72.0).abs() < 0.5,
+            "先頭の x が 72pt: got {}",
+            boxes[0].bbox[0]
+        );
+        // 下端はベースラインからディセンダぶん下（12 * 0.2 = 2.4pt）
+        assert!(
+            (boxes[0].bbox[1] - (700.0 - 2.4)).abs() < 0.5,
+            "下端がベースライン - ディセンダ: got {}",
+            boxes[0].bbox[1]
+        );
+        assert!(
+            (boxes[0].bbox[2] - 8.664).abs() < 0.5,
+            "'H' の送り幅が AFM の 722/1000 em: got {}",
+            boxes[0].bbox[2]
+        );
+        assert!(
+            (boxes[0].bbox[3] - 12.0).abs() < 0.5,
+            "高さがフォントサイズ: got {}",
+            boxes[0].bbox[3]
+        );
+        // 2 文字目は 1 文字目の送りぶん右にある（等間隔ではなく字幅どおり）
+        assert!(
+            (boxes[1].bbox[0] - (72.0 + 8.664)).abs() < 0.5,
+            "2 文字目が 'H' の幅ぶん右: got {}",
+            boxes[1].bbox[0]
+        );
+        // 文字矩形は左から右へ単調に進む
+        assert!(
+            boxes.windows(2).all(|w| w[1].bbox[0] >= w[0].bbox[0]),
+            "x が単調増加: {boxes:?}"
+        );
+        // バイト範囲が行テキストを隙間なく覆う
+        let covered: String = boxes
+            .iter()
+            .map(|b| &lines[0].text[b.byte_range.clone()])
+            .collect();
+        assert_eq!(covered, lines[0].text, "バイト範囲が行全体を覆う");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 字送りだけで表された単語区切りが空白になり、離れた行は別の行になる
+    #[test]
+    fn 空白の補完と行の分離() {
+        let dir = std::env::temp_dir().join("tako_pdf_win_text_lines_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.pdf");
+        // 1 行目: 空白文字を置かず Td で離して 2 語を並べる（PDF でよくある表現）
+        // 2 行目: TL + T* で 20pt 下げる
+        std::fs::write(
+            &path,
+            pdf_with_content(
+                "BT /F1 12 Tf 20 TL 72 700 Td (Alpha) Tj 60 0 Td (Beta) Tj \
+                 -60 0 Td T* (Gamma) Tj ET",
+            ),
+        )
+        .unwrap();
+
+        let layers = extract_text_layers(&path, 1).unwrap();
+        let lines = &layers[0];
+        assert_eq!(lines.len(), 2, "2 行に分かれる: {lines:?}");
+        assert_eq!(
+            lines[0].text, "Alpha Beta",
+            "同じベースラインの 2 語は空白で繋がる"
+        );
+        assert_eq!(lines[1].text, "Gamma");
+        // 上の行が先に来る（PDF の y は上ほど大きい）
+        assert!(lines[0].bbox[1] > lines[1].bbox[1], "行が上から順に並ぶ");
+        // 補完した空白にも矩形があり、選択が途切れない
+        assert_eq!(
+            lines[0].char_boxes.len(),
+            lines[0].text.chars().count(),
+            "1 文字 1 矩形（補完した空白を含む）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// テキストの無い PDF（図形だけ）では行がゼロになる
+    #[test]
+    fn テキストのないpdfは行を返さない() {
+        let dir = std::env::temp_dir().join("tako_pdf_win_text_none_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shape.pdf");
+        std::fs::write(&path, pdf_with_content("0 0 1 rg 10 10 100 100 re f")).unwrap();
+
+        let layers = extract_text_layers(&path, 1).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert!(layers[0].is_empty(), "テキスト行はゼロ: {:?}", layers[0]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 612x792 の 1 ページ PDF を content stream から組む（Helvetica を /F1 に持つ）
+    fn pdf_with_content(content: &str) -> Vec<u8> {
+        let mut pdf = Vec::with_capacity(1024);
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(5);
+
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+        );
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content.as_bytes());
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_at = pdf.len();
+        let size = offsets.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
     }
 
     /// 壊れた PDF や不在ファイルでリンク・アウトラインはパニックせず空を返す
