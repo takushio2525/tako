@@ -411,6 +411,10 @@ pub(crate) enum CsiUMode {
     ModifiedOnly,
     /// Esc 単押しも CSI 27u（アプリ自身が kitty disambiguate を要求済み = 確実に解釈できる）
     Full,
+    /// **経路が CSI u を運べない**ので送らない（#729）。器（psmux）が握り潰すため、
+    /// 修飾付き Enter / Tab をレガシー形式（`ESC CR` / `ESC [ Z`）へ落とす。
+    /// 落とさないと内側アプリへ**何も届かず**キーが無反応になる
+    Legacy,
 }
 
 /// 修飾キーのエンコード（xterm / kitty 共通: 1 + shift | alt<<1 | ctrl<<2 | super<<3）
@@ -427,6 +431,14 @@ pub(crate) fn encode_modifiers(m: &Modifiers) -> u8 {
 /// それ以外のフラグ（REPORT_ALL_KEYS 等）は未対応（必要になったら拡張する）
 pub(crate) fn keystroke_to_bytes(ks: &Keystroke, csi_u: CsiUMode) -> Option<Vec<u8>> {
     let mods = encode_modifiers(&ks.modifiers);
+    // 経路が CSI u を運べないなら届く形へ落とす（#729）。判定と表現は
+    // tako-core と**同じ関数**を使う（GUI 経路と AI 経路を乖離させないため）
+    if csi_u == CsiUMode::Legacy {
+        let m = &ks.modifiers;
+        if let Some(bytes) = tako_core::keys::legacy_modified(&ks.key, m.shift, m.alt, m.control) {
+            return Some(bytes);
+        }
+    }
     let csi_u_code: Option<u32> = match ks.key.as_str() {
         "escape" if csi_u == CsiUMode::Full || mods > 1 => Some(27),
         "enter" if mods > 1 => Some(13),
@@ -641,6 +653,54 @@ mod tests {
                 }
             ),
             "disambiguate 時の Esc が GUI 経路と AI 経路で違う"
+        );
+
+        // #729: CSI u を運べない経路（psmux ペイン）でも両経路が一致する。
+        // ここが割れると「手で押すと改行できるのに tako keys からは無反応」になる
+        let legacy = KeyEncoding {
+            extended_keys: false,
+            ..Default::default()
+        };
+        for name in ["enter", "tab", "backspace", "escape"] {
+            assert_eq!(
+                keystroke_to_bytes(&ks_shift(name), CsiUMode::Legacy),
+                encode_key(&format!("shift-{name}"), legacy),
+                "Legacy 経路の Shift+{name} が GUI 経路と AI 経路で違う"
+            );
+            assert_eq!(
+                keystroke_to_bytes(&ks(name), CsiUMode::Legacy),
+                encode_key(name, legacy),
+                "Legacy 経路の {name} 単独が GUI 経路と AI 経路で違う"
+            );
+        }
+    }
+
+    /// **#729**: 器（psmux）が CSI u を握り潰す経路では、GUI の Shift+Enter を
+    /// meta-Enter（`ESC CR`）で送る。**この 1 本が実機症状の再現テスト**
+    /// （修正前は `ESC [ 13 ; 2 u` を送って内側アプリに何も届かなかった）
+    #[test]
+    fn 運べない経路のshift_enterはesc_crで送る() {
+        assert_eq!(
+            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::Legacy),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks_ctrl("enter"), CsiUMode::Legacy),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::Legacy),
+            Some(b"\x1b[Z".to_vec())
+        );
+        // Enter 単独は送信のまま（ここが変わると「送信できない」に化ける）
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter"), CsiUMode::Legacy),
+            Some(b"\r".to_vec())
+        );
+        // 運べる経路は従来どおり CSI u（macOS の挙動不変）
+        assert_eq!(
+            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::ModifiedOnly),
+            Some(b"\x1b[13;2u".to_vec())
         );
     }
 

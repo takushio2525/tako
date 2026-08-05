@@ -21,9 +21,9 @@
 
 /// 端末側のモードに応じた符号化の出し分け。
 ///
-/// どちらも **TUI が要求したときだけ真**にする（`TerminalSession` から引ける）。
-/// 既定（`Default`）は素の端末想定で、レガシー形式を送る
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `app_cursor` / `disambiguate` は **TUI が要求したときだけ真**にする
+/// （`TerminalSession` から引ける）。既定は素の端末想定で、レガシー形式を送る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEncoding {
     /// DECCKM（application cursor keys）。真なら矢印は `ESC O A`、偽なら `ESC [ A`
     pub app_cursor: bool,
@@ -31,6 +31,24 @@ pub struct KeyEncoding {
     /// （偽のまま CSI 27u を送ると、非対応アプリの入力欄に「27u」が文字として入る。
     /// tako-app 側で実機バグとして確認済みの罠なので既定では送らない）
     pub disambiguate: bool,
+    /// **経路が CSI u を内側アプリまで運べるか**（#729）。
+    ///
+    /// `disambiguate` が「内側アプリが CSI u を読みたがっているか」なのに対し、
+    /// こちらは「そもそも届くのか」。器（psmux）が握り潰す場合は偽になり、
+    /// 修飾付きキーをレガシー形式へ落とす。
+    /// 正は [`crate::backend::BackendCapabilities::extended_keys`]
+    pub extended_keys: bool,
+}
+
+impl Default for KeyEncoding {
+    fn default() -> Self {
+        Self {
+            app_cursor: false,
+            disambiguate: false,
+            // 既定は「運べる」。運べない器だけが明示的に倒す
+            extended_keys: true,
+        }
+    }
 }
 
 /// 修飾キーの組み合わせ
@@ -112,6 +130,14 @@ fn encode_base(base: &str, mods: Mods, enc: KeyEncoding) -> Option<Vec<u8>> {
         (lower, mods)
     };
     let m = mods.encode();
+
+    // 経路が CSI u を運べないなら、届く形へ落とす（#729）。
+    // 落とさないと器（psmux）が握り潰して**何も届かない** = キーが無反応になる
+    if !enc.extended_keys {
+        if let Some(bytes) = legacy_modified_mods(&lower, mods) {
+            return Some(bytes);
+        }
+    }
 
     // 修飾付き Enter / Tab / Backspace / Esc はレガシー形式では区別できないので CSI u。
     // Esc 単押しは TUI が kitty disambiguate を要求しているときだけ CSI u
@@ -206,6 +232,39 @@ fn encode_base(base: &str, mods: Mods, enc: KeyEncoding) -> Option<Vec<u8>> {
         }
     };
     Some(bytes)
+}
+
+/// CSI u を運べない経路（psmux）向けのレガシー表現（#729）。
+///
+/// **GUI 経路（`tako-app::keystroke_to_bytes`）と共有するために公開している。**
+/// 二重に書くと「手で押すと動くのに AI から送ると動かない（or 逆）」という
+/// 再現の難しい差になる（`新旧のキー符号化が一致する` テストが番犬）
+pub fn legacy_modified(key: &str, shift: bool, alt: bool, ctrl: bool) -> Option<Vec<u8>> {
+    legacy_modified_mods(&key.to_ascii_lowercase(), Mods { shift, alt, ctrl })
+}
+
+/// [`legacy_modified`] の本体。
+///
+/// 対象は「本来 CSI u で送るキー」だけ。器が CSI u を握り潰すと**何も届かない**ので、
+/// 修飾を完全には表現できなくても届く形へ落とす方が良い。
+/// どの形が psmux を通るかは実測で確かめてある（Issue #729 の表）。
+fn legacy_modified_mods(lower: &str, mods: Mods) -> Option<Vec<u8>> {
+    let m = mods.encode();
+    match lower {
+        // 修飾付き Enter の意図は「送信せず改行」。meta-Enter（`ESC CR`）は
+        // Claude Code が Option / Alt+Enter として受け付ける標準形で、psmux も通す。
+        // Shift / Ctrl / Alt はここで区別を失うが、いずれも改行が欲しい打鍵なので
+        // 1 つに畳んで良い（畳まないと全滅する）
+        "enter" | "return" if m > 1 => Some(b"\x1b\r".to_vec()),
+        // Shift+Tab = backtab。psmux を通ることを実測済み
+        "tab" if m > 1 => Some(b"\x1b[Z".to_vec()),
+        // 修飾を表現する術が無いキーは修飾を落として素の形で送る。
+        // CSI u のままだと握り潰されて無反応になるので、素の方がまだ使える
+        "backspace" if m > 1 => Some(b"\x7f".to_vec()),
+        // 単押し（disambiguate 由来の `CSI 27u`）も修飾付きも素の Esc へ
+        "escape" | "esc" => Some(b"\x1b".to_vec()),
+        _ => None,
+    }
 }
 
 /// F1〜F4 は修飾なしで SS3（`ESC O P`）、修飾付きで CSI（`ESC [ 1;2P`）
@@ -383,6 +442,84 @@ mod tests {
 
         let err = encode_keys(&["1".into(), "bogus".into()], KeyEncoding::default()).unwrap_err();
         assert_eq!(err, "bogus");
+    }
+
+    /// CSI u を運べない経路（psmux）用の符号化
+    fn legacy() -> KeyEncoding {
+        KeyEncoding {
+            extended_keys: false,
+            ..Default::default()
+        }
+    }
+
+    fn enc_legacy(name: &str) -> Vec<u8> {
+        encode_key(name, legacy()).expect(name)
+    }
+
+    /// **#729 の本命**: 器が CSI u を握り潰す経路では、修飾付き Enter を
+    /// meta-Enter（`ESC CR`）で送る。CSI u のままだと内側アプリへ**何も届かない**
+    /// （psmux 実測）ので、Shift+Enter が無反応になる
+    #[test]
+    fn csi_uを運べない経路では修飾付きenterをesc_crで送る() {
+        assert_eq!(enc_legacy("shift-enter"), b"\x1b\r");
+        // Ctrl / Alt も同じ「送信せず改行」へ畳む（畳まないと全滅する）
+        assert_eq!(enc_legacy("ctrl-enter"), b"\x1b\r");
+        assert_eq!(enc_legacy("alt-enter"), b"\x1b\r");
+        // Shift+Tab は backtab（psmux を通ることを実測済み）
+        assert_eq!(enc_legacy("shift-tab"), b"\x1b[Z");
+        assert_eq!(enc_legacy("backtab"), b"\x1b[Z");
+        // 修飾を表現できないキーは素の形へ落とす（無反応よりまし）
+        assert_eq!(enc_legacy("shift-backspace"), b"\x7f");
+        assert_eq!(enc_legacy("shift-escape"), b"\x1b");
+    }
+
+    /// **回帰防止**: 修飾なしのキーは経路の能力に関係なく従来どおり。
+    /// 特に **Enter 単独が `\r` のまま**でなければ「送信できない」に化ける
+    #[test]
+    fn csi_uを運べなくても修飾なしのキーは変わらない() {
+        for name in [
+            "enter",
+            "return",
+            "tab",
+            "escape",
+            "backspace",
+            "space",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "delete",
+            "f1",
+            "f5",
+        ] {
+            assert_eq!(
+                enc_legacy(name),
+                enc(name),
+                "修飾なし {name} が経路の能力で変わってしまった"
+            );
+        }
+        assert_eq!(
+            enc_legacy("enter"),
+            b"\r",
+            "Enter 単独は送信のままでなければならない"
+        );
+        // Ctrl+英字（C0）も不変
+        assert_eq!(enc_legacy("ctrl-c"), vec![0x03]);
+        // 修飾付き矢印は元から CSI u ではない（xterm 形式）ので不変
+        assert_eq!(enc_legacy("shift-up"), b"\x1b[1;2A");
+        assert_eq!(enc_legacy("shift-delete"), b"\x1b[3;2~");
+    }
+
+    /// 運べる経路（tmux / 直接ペイン）は従来どおり CSI u。macOS の挙動を変えない
+    #[test]
+    fn 運べる経路は従来どおりcsi_uを送る() {
+        assert_eq!(enc("shift-enter"), b"\x1b[13;2u");
+        assert_eq!(enc("shift-tab"), b"\x1b[9;2u");
+        assert!(KeyEncoding::default().extended_keys, "既定は運べる側");
     }
 
     /// 一覧に載っている名前はすべて符号化できる（説明文と実装の乖離を防ぐ）

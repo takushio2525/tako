@@ -808,11 +808,16 @@ impl TerminalSession {
     }
 
     /// このセッションへキーを送るときの符号化（#662）。
-    /// TUI が要求したモードをそのまま反映する
-    pub fn key_encoding(&self) -> crate::keys::KeyEncoding {
+    /// TUI が要求したモードをそのまま反映する。
+    ///
+    /// `extended_keys` は **この PTY から内側アプリまでの経路が CSI u を運べるか**
+    /// （#729）。セッション自身は器に包まれているかを知らないので呼び出し側が渡す
+    /// （正は [`crate::backend::BackendCapabilities::extended_keys`]）
+    pub fn key_encoding(&self, extended_keys: bool) -> crate::keys::KeyEncoding {
         crate::keys::KeyEncoding {
             app_cursor: self.app_cursor(),
             disambiguate: self.disambiguate_keys(),
+            extended_keys,
         }
     }
 

@@ -246,6 +246,136 @@ fn killは前方一致する別の器を巻き込まない() {
     let _ = f.backend.kill(&long);
 }
 
+/// 受信バイトを 16 進で吐く最小 TUI。**claude と同じ条件**にするため Node の raw mode を
+/// 使う（libuv が Win10+ の raw tty で `ENABLE_VIRTUAL_TERMINAL_INPUT` を立てるので、
+/// ConPTY が VT をキーイベントへ翻訳する経路まで claude と同じになる）
+const KEY_DUMPER_JS: &str = r#"
+process.stdin.setRawMode(true);
+process.stdin.resume();
+console.log('KEYDUMP-READY');
+process.stdin.on('data', (buf) => {
+  console.log('RECV<' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join('-') + '>');
+});
+"#;
+
+fn node_available() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// **#729 の本命**: Shift+Enter が**器を越えて内側アプリまで届く**。
+///
+/// psmux は CSI u（`ESC [ 13 ; 2 u`）を握り潰して内側へ渡さない。tako はこれを
+/// 器の能力（`extended_keys`）として持ち、運べない器では meta-Enter（`ESC CR`）へ
+/// 落とす。**このテストは本番の符号化関数に本番の能力値を渡して**、実際に届くことを見る。
+///
+/// 修正前は届かない（＝ Shift+Enter が無反応）。`extended_keys` を `true` に戻すと落ちる
+#[test]
+fn shift_enterが器を越えて内側アプリへ届く() {
+    let f = fixture!("shiftenter");
+    if !node_available() {
+        eprintln!("skip: node が無い環境");
+        return;
+    }
+    // このテスト自身が tako の psmux ペインの中で走ると器の入れ子を拒否されるため、
+    // 子へ引き継がないよう落とす
+    std::env::remove_var("PSMUX_SESSION");
+
+    let js = std::env::temp_dir().join(format!("tako-729-keydump-{}.js", std::process::id()));
+    std::fs::write(&js, KEY_DUMPER_JS).expect("dumper を書ける");
+
+    let name = session("tako-m2shiftent1");
+    let opts = SpawnOptions {
+        command: Some(SpawnCommand {
+            program: "node".into(),
+            args: vec![js.to_string_lossy().into_owned()],
+        }),
+        cwd: Some(std::env::temp_dir()),
+        env: vec![],
+    };
+    let (mut s, mut rx) =
+        tako_core::TerminalSession::spawn(100, 30, f.backend.wrap_spawn(opts, &name))
+            .expect("器の中で dumper を spawn できる");
+
+    // **rx を汲む**のが必須（器のクライアントは端末クエリへの応答を待つ）。
+    // 借用が重ならないよう自由関数にする
+    fn pump(
+        s: &mut tako_core::TerminalSession,
+        rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
+    ) {
+        while let Ok(event) = rx.try_recv() {
+            s.process_event(event);
+        }
+    }
+    fn wait_for(
+        s: &mut tako_core::TerminalSession,
+        rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
+        needle: &str,
+        attempts: usize,
+    ) -> bool {
+        for _ in 0..attempts {
+            pump(s, rx);
+            if s.visible_lines().iter().any(|l| l.contains(needle)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+    assert!(
+        wait_for(&mut s, &mut rx, "KEYDUMP-READY", 200),
+        "器の中で dumper が起動しない。画面: {:?}",
+        s.visible_lines().join("\n")
+    );
+
+    // **本番の能力値**を本番の符号化関数へ渡す（テスト専用の値を作らない）
+    let caps = f.backend.capabilities();
+    assert!(
+        !caps.extended_keys,
+        "psmux は CSI u を運べないと申告しているはず"
+    );
+    let enc = tako_core::keys::KeyEncoding {
+        extended_keys: caps.extended_keys,
+        ..Default::default()
+    };
+    let bytes =
+        tako_core::keys::encode_key("shift-enter", enc).expect("shift-enter を符号化できる");
+    s.write(bytes);
+
+    // psmux は配送が遅れることがあるので長めに待つ
+    assert!(
+        wait_for(&mut s, &mut rx, "RECV<1b-0d>", 200),
+        "Shift+Enter が内側アプリへ届かない（#729 の再発）。画面: {:?}",
+        s.visible_lines().join("\n")
+    );
+
+    // 素の CSI u は**やはり届かない**（この事実がフォールバックの根拠）。
+    // 届くようになったら psmux 側が対応したということなので、能力値を見直す合図
+    s.write(b"\x1b[13;2u".to_vec());
+    std::thread::sleep(Duration::from_secs(3));
+    pump(&mut s, &mut rx);
+    let screen = s.visible_lines().join("\n");
+    assert!(
+        !screen.contains("RECV<1b-5b-31-33-3b-32-75>"),
+        "psmux が CSI u を通すようになった。`extended_keys` の申告を見直すこと。画面: {screen:?}"
+    );
+
+    // Enter 単独は送信のまま（ここが壊れると「送信できない」に化ける）
+    s.write(b"\r".to_vec());
+    assert!(
+        wait_for(&mut s, &mut rx, "RECV<0d>", 100),
+        "Enter 単独が届かない。画面: {:?}",
+        s.visible_lines().join("\n")
+    );
+
+    drop(s);
+    let _ = f.backend.kill(&name);
+    let _ = std::fs::remove_file(&js);
+}
+
 /// **要件 5**: conf が実際に適用され、`warm off` が効いている。
 /// あわせて **psmux が知らないオプションを持ち込んでいない**ことも確かめる
 /// （知らない行が 1 つでもあると `psmux: N config warning(s):` がペインに出る＝

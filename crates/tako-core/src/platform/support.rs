@@ -154,6 +154,19 @@ pub mod notes {
          that app owns the position: scrolling works, but the position cannot be read back and \
          absolute positioning with `to` is unavailable",
     );
+    /// #729: psmux は CSI u（kitty 拡張キー）を内側アプリへ通さない（実測）。
+    /// tako は届く形へ落とすので**改行そのものは効く**が、修飾の区別は失われる。
+    /// 「使えない」と誤解されると回避行動を取られるので、できること / できないことを分けて書く
+    pub const WIN_KEYS_NO_CSI_U: Note = Note::new(
+        "psmux ペインでは器が CSI u（kitty 拡張キー）を通さないため、修飾付き Enter は \
+         meta-Enter（ESC CR）、Shift+Tab は backtab へ落として送る。\
+         claude の「送信せず改行」は効くが、Shift / Ctrl / Alt+Enter の区別は失われる。\
+         器を使わないペイン（persist OFF）では CSI u がそのまま届く",
+        "In psmux panes the session host does not forward CSI u (kitty extended keys), so modified \
+         Enter is sent as meta-Enter (ESC CR) and Shift+Tab as backtab. Claude's \"newline without \
+         submitting\" works, but Shift / Ctrl / Alt+Enter are no longer distinguishable. \
+         Panes without the session host (persist OFF) still receive CSI u unchanged",
+    );
     /// #519: 任意の tmux サーバーを直接操作する機能面。psmux は tmux 互換だが
     /// 「他人が立てた tmux セッションの発見と片付け」という用途自体が Windows には無い
     pub const WIN_TMUX_SERVER: Note = Note::new(
@@ -955,7 +968,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_send_keys",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_KEYS_NO_CSI_U,
+        },
     },
     Feature {
         key: "tako_sessions",

@@ -6910,7 +6910,10 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
 /// （Windows の psmux backend は `DetachedAccess` を持たないので**常に**失敗した）。
 /// 画面採取もキー送出も in-process なら tmux に一切依存せず完結する
 enum DialogReach<'a> {
-    InProcess(&'a tako_core::TerminalSession),
+    /// tako が握っている PTY へ直接書く。`bool` は**その PTY から内側アプリまでの
+    /// 経路が CSI u を運べるか**（#729）。器（psmux）に包まれたペインだと器が
+    /// 握り潰すので、修飾付き Enter / Tab をレガシー形式へ落とす必要がある
+    InProcess(&'a tako_core::TerminalSession, bool),
     Detached(
         tako_core::backend::SessionRef,
         &'static dyn tako_core::backend::DetachedAccess,
@@ -6921,7 +6924,7 @@ impl DialogReach<'_> {
     /// 可視画面の採取
     fn capture(&self) -> Result<Vec<String>, DispatchError> {
         match self {
-            Self::InProcess(session) => Ok(session.visible_lines()),
+            Self::InProcess(session, _) => Ok(session.visible_lines()),
             Self::Detached(s, access) => access
                 .capture_screen(s)
                 .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}"))),
@@ -6931,8 +6934,8 @@ impl DialogReach<'_> {
     /// キー名 1 個の送出
     fn send_key(&self, key: &str) -> Result<(), DispatchError> {
         match self {
-            Self::InProcess(session) => {
-                let bytes = tako_core::keys::encode_key(key, session.key_encoding())
+            Self::InProcess(session, extended_keys) => {
+                let bytes = tako_core::keys::encode_key(key, session.key_encoding(*extended_keys))
                     .ok_or_else(|| DispatchError::InvalidParams(unknown_key_message(key)))?;
                 session.write(bytes);
                 Ok(())
@@ -6947,7 +6950,7 @@ impl DialogReach<'_> {
 
     fn label(&self) -> &'static str {
         match self {
-            Self::InProcess(_) => "in-process",
+            Self::InProcess(..) => "in-process",
             Self::Detached(..) => "detached",
         }
     }
@@ -7001,6 +7004,17 @@ fn detached_key_name(key: &str) -> String {
     }
 }
 
+/// このペインの PTY から内側アプリまでの経路が CSI u を運べるか（#729）。
+///
+/// 器に包まれていないペイン（persist OFF・器なし環境）は tako の PTY が内側アプリへ
+/// 直結するので、器が CSI u を運べなくても影響を受けない。**ペイン単位で見る**必要がある
+fn pane_carries_extended_keys(host: &dyn ControlHost, pane: PaneId) -> bool {
+    if host.backend_session(pane).is_none() {
+        return true;
+    }
+    tako_core::backend::capabilities().extended_keys
+}
+
 /// ダイアログ操作の到達手段を解決する。in-process 優先（#662）
 fn resolve_dialog_reach(
     host: &dyn ControlHost,
@@ -7008,7 +7022,10 @@ fn resolve_dialog_reach(
 ) -> Result<DialogReach<'_>, DispatchError> {
     let target = PaneId::from_raw(pane_id);
     if let Some(session) = host.session(target) {
-        return Ok(DialogReach::InProcess(session));
+        return Ok(DialogReach::InProcess(
+            session,
+            pane_carries_extended_keys(host, target),
+        ));
     }
     // tako-app が保持していない = ペイン消失 or GUI 不在。バックエンドの到達手段に頼る
     let backend_session = host.backend_session(target).ok_or_else(|| {
@@ -7444,7 +7461,7 @@ fn dispatch_send_keys(
             let session = host
                 .session(target)
                 .ok_or(DispatchError::NoSession(target.as_u64()))?;
-            DialogReach::InProcess(session)
+            DialogReach::InProcess(session, pane_carries_extended_keys(host, target))
         }
         crate::reach::PaneReach::Detached(s, access) => DialogReach::Detached(s, access),
         crate::reach::PaneReach::Unreachable(reason) => {

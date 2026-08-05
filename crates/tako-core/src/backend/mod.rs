@@ -142,6 +142,17 @@ pub struct BackendCapabilities {
     pub detached_access: bool,
     /// スクロールバックの権威
     pub scrollback: ScrollbackAuthority,
+    /// 器が **CSI u（kitty 拡張キー）を内側アプリへ通す**か（#729）。
+    ///
+    /// 修飾付き Enter / Tab はレガシー形式だと区別できない（Shift+Enter = 素の `\r`）ので、
+    /// tako は `ESC [ 13 ; 2 u` のような CSI u で送る。**これは器が運んでくれる前提**で、
+    /// tmux は conf の `extended-keys always` + `extended-keys-format csi-u` で運ぶ。
+    ///
+    /// psmux にはこれに相当する設定が無く、CSI u を**握り潰して内側へ渡さない**
+    /// （実測: `ESC[13;2u` / `ESC[13;5u` / `ESC[27;2;13~` はいずれも届かない。
+    /// 一方 `ESC CR` / `ESC[Z` / `ESC[1;2A` は通る）。
+    /// 偽ならレガシー形式へ落として送る（[`crate::keys::KeyEncoding::extended_keys`]）
+    pub extended_keys: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -179,6 +190,7 @@ impl BackendCapabilities {
                 ScrollbackAuthority::Backend => "backend",
                 ScrollbackAuthority::InProcess => "in_process",
             },
+            "extended_keys": self.extended_keys,
             "note": self.degraded_note(),
         })
     }
@@ -897,6 +909,7 @@ mod tests {
             detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
+            extended_keys: true,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -907,6 +920,7 @@ mod tests {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            extended_keys: true,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -923,6 +937,7 @@ mod tests {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            extended_keys: true,
             label: "none",
         };
         let v = caps.describe();
@@ -938,6 +953,7 @@ mod tests {
             detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
+            extended_keys: true,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -954,6 +970,7 @@ mod tests {
             detached_capture: true,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            extended_keys: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -990,6 +1007,7 @@ mod tests {
                 detached_capture: false,
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
+                extended_keys: true,
                 label: "session-host",
             }
         }
@@ -1187,6 +1205,7 @@ mod tests {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            extended_keys: true,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -1247,6 +1266,7 @@ mod tests {
                 detached_capture: true,
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
+                extended_keys: true,
                 label: "capture-only",
             }
         }

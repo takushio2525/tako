@@ -1708,3 +1708,26 @@
   profiles 書き込みと未登録キー・排他違反・破損 YAML のエラー、`inherit` が起動コマンドで
   **unset** になること（代入に化けたら FAILED になるテスト）まで確認
 - 関連: PR（Closes #709）。tako-control +14 / tako-app +3 テスト。fmt / clippy は baseline と同一
+
+## 2026-08-05（#729: Windows の Shift+Enter 改行を根治 — 器が CSI u を運べるかを能力にする）
+
+- 送出側は最初から正しく、**運び手が落としていた**。tako は修飾付き Enter を CSI u
+  （`ESC[13;2u`）で送るが、これは器が運ぶ前提。tmux は `extended-keys always` +
+  `extended-keys-format csi-u` で運ぶのに対し、**psmux にはこれに相当する設定が無く
+  握り潰す**（`BACKEND_CONF` から意図的に落としてあり、テストがそれを固定している）
+- Node の raw mode（claude と同じ条件）で受信バイトを採取して棚卸し: psmux は
+  `ESC[13;2u` / `ESC[13;5u` / `ESC[27;2;13~` を通さず、`ESC CR` / `ESC[Z` /
+  `ESC[1;2A` / `\r` / `\t` は通す。**ConPTY は無罪**（直接ペインでは CSI u が届く）。
+  psmux は配送が遅れるので、短い窓で「食われた」と誤断定しないよう長めに待って確定した
+- 「CSI u を運べるか」を `BackendCapabilities::extended_keys` として持たせ、運べない器に
+  **包まれたペインだけ**レガシー形式へ落とす（修飾付き Enter → `ESC CR`、Shift+Tab →
+  `ESC[Z`）。判定はペイン単位（persist OFF の直接ペインは巻き添えにしない）。落とす表現は
+  `keys::legacy_modified` の 1 箇所に置き、GUI 経路と AI 経路（`tako keys`）が同じ関数を通る
+- 検証: 統合テスト `shift_enterが器を越えて内側アプリへ届く` を新設し、修正前の挙動を
+  再現すると **20 秒待っても受信行が 1 つも出ない**（＝報告どおりの無反応）ことを実測。
+  `ESC CR` が claude に「送信せず改行」と解釈されることも実 claude で確認（別行に残った）
+- 対応マトリクスの `tako_send_keys` を Windows で Degraded へ（修飾の区別は失われる）+ doc 再生成
+- 関連: PR（Closes #729）。macOS は `extended_keys = true` のまま ＝ 挙動不変
+- 次: #730（IME 確定直後の Enter 連打が改行になる）は**別根因**として切り出し済み。
+  tako の連続 write が 1 回の read にまとまり、内側 TUI の貼り付け判定で CR が改行に化ける
+  （`RECV<e3-81-82-e3-81-84-e3-81-86-0d-0d-0d>` を実測。直接ペインでも psmux でも再現）

@@ -511,6 +511,23 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   Esc を CSI 27u で送るのはアプリ自身の kitty 要求を外側 Term が直接見た場合
   （`CsiUMode::Full`）のみ。往復 + 「27u」非漏出は e2e 済み、Shift+Enter の
   GUI 実キー経路はセルフテスト 45b で回帰防止
+- **ただし CSI u は「器が運んでくれる」前提の上に乗っている**（Issue #729）:
+  上の「常時送出が正」は、器が CSI u を内側へ通すことが条件。tmux は
+  `extended-keys always` + `extended-keys-format csi-u` で運ぶが、**psmux
+  （Windows の器）は相当する設定を持たず CSI u を握り潰す**。実測では
+  `ESC[13;2u` / `ESC[13;5u` / `ESC[27;2;13~` が内側アプリへ一切届かず、
+  Shift+Enter が**無反応**になっていた（`ESC CR` / `ESC[Z` / `ESC[1;2A` /
+  `\r` / `\t` は通る。ConPTY 自体は素通しするので直接ペインでは届く）。
+  そこで「運べるか」を器の能力 `BackendCapabilities::extended_keys` として持ち、
+  運べない器に**包まれたペインだけ**レガシー形式へ落とす（`CsiUMode::Legacy` /
+  `KeyEncoding::extended_keys`）。落とし先は修飾付き Enter → `ESC CR`
+  （meta-Enter = Claude Code の Option/Alt+Enter）、Shift+Tab → `ESC[Z`、
+  修飾付き Backspace / Esc → 素の形。Shift / Ctrl / Alt+Enter の区別は失うが、
+  区別を保って全滅するより改行が届く方を採る。**判定はペイン単位**（persist OFF の
+  直接ペインは器に包まれないので CSI u のまま）。落とす表現は
+  `tako_core::keys::legacy_modified` の 1 箇所に置き、GUI 経路（`keystroke_to_bytes`）と
+  AI 経路（`encode_key`）が同じ関数を通る（乖離すると「手で押すと動くのに
+  tako keys からは無反応」になる）
 - **IME 候補・未確定文字列の位置は shaping で出す**: `pane_cursor_origin` を
   col × セル幅の線形換算にすると全角行で打ち進めるほど右へずれる（描画は実フォント幅）。
   `cell_at` の逆写像（`ScreenLine::cell_cols` + `shape_line`）で求める

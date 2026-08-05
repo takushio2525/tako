@@ -205,6 +205,11 @@ impl SessionBackend for PsmuxBackend {
             detached_capture: true,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            // `extended_keys = false`: CSI u（kitty 拡張キー）を内側へ通さない。
+            // tmux の `extended-keys always` に相当する設定が psmux には無く、
+            // 実測でも `ESC[13;2u` / `ESC[13;5u` / `ESC[27;2;13~` は内側アプリへ
+            // 一切届かない（`ESC CR` / `ESC[Z` / `ESC[1;2A` は通る）。#729
+            extended_keys: false,
             label: "psmux",
         }
     }

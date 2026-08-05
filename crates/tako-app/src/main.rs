@@ -7734,11 +7734,7 @@ impl TakoApp {
             .focused_session()
             .map(|s| s.disambiguate_keys())
             .unwrap_or(false);
-        let csi_u = if kitty_requested {
-            CsiUMode::Full
-        } else {
-            CsiUMode::ModifiedOnly
-        };
+        let csi_u = self.csi_u_mode_for_pane(self.focused_pane(), kitty_requested);
         if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u) {
             // tmux スクロール中（copy-mode）は iTerm2 流に最下部へ戻してから流す
             // （copy-mode にキーが飲まれて「入力が反映されない」症状の根治）
@@ -7788,6 +7784,24 @@ impl TakoApp {
                 cx.stop_propagation();
                 cx.notify();
             }
+        }
+    }
+
+    /// このペインへ CSI u をどこまで送ってよいか（#729）。
+    ///
+    /// **ペイン単位で決める**必要がある。器（psmux）は CSI u を握り潰すが、
+    /// persist OFF や器なし環境のペインは tako の PTY が内側アプリへ直結していて
+    /// CSI u がそのまま届く（実測）。バックエンド設定だけを見て一律に落とすと、
+    /// 直接ペインの Shift+Enter まで巻き添えでレガシー形式へ劣化する
+    fn csi_u_mode_for_pane(&self, pane: PaneId, kitty_requested: bool) -> CsiUMode {
+        let wrapped = self.backend_sessions.contains_key(&pane);
+        if wrapped && !tako_core::backend::capabilities().extended_keys {
+            return CsiUMode::Legacy;
+        }
+        if kitty_requested {
+            CsiUMode::Full
+        } else {
+            CsiUMode::ModifiedOnly
         }
     }
 

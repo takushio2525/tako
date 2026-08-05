@@ -4,28 +4,32 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-08-01・Windows 実機 — #709 完了）
+## 現在の対象（2026-08-05・Windows 実機 — #729 完了 / #730 切り出し）
 
-**#709 マージ済み**（PR #712 → `47a524f`）。claude ログインアカウントの切替を
-`tako account`（list / add / remove / show / login / use）へ 1 本化した。
+**#729（Shift+Enter で改行できない）を根治**。原因は送出側ではなく**運び手**で、
+psmux が CSI u（`ESC[13;2u`）を内側アプリへ通していなかった（実測で確定。ConPTY は無罪）。
 
-- MCP は新ツールを増やさず `tako_orchestrator_accounts` に action を足して 1:1（129 ツールのまま）
-- 前提として **main のアカウントモデル #512 / #543 を先に移植**した（`config_dir: Option<String>`
-  + `inherit` + `AccountConfigDir` + `EnvPlan`）。claude は `CLAUDE_CONFIG_DIR` が**設定されて
-  いるだけで**資格情報エントリを分けるので、「既定の資格情報を使う」は既定パスの明示ではなく
-  **未設定**でしか表現できない。`inherit` は起動コマンドで明示 unset を出す
-- ログイン状態は 3 値（`missing` / `logged_out` / `logged_in`）+ 壊れたエントリの `invalid`
-- GUI は ⌘K パレットの「claude アカウントを切り替え」（default プロファイルの master へ割り当て）
+- 「CSI u を運べるか」を `BackendCapabilities::extended_keys` にし、運べない器に
+  **包まれたペインだけ**レガシー形式へ落とす（修飾付き Enter → `ESC CR`、Shift+Tab → `ESC[Z`）。
+  **判定はペイン単位**（persist OFF の直接ペインは CSI u のまま = 巻き添えにしない）
+- 落とす表現は `keys::legacy_modified` の 1 箇所。GUI 経路（`keystroke_to_bytes` の
+  `CsiUMode::Legacy`）と AI 経路（`encode_key`）が同じ関数を通る
+- psmux は**配送が遅れる**（`ESC[Z` が 600ms 窓の外で届いた）。到達の判定は長めに待つこと。
+  短い窓での「届かない」は誤断定になる
+- 対応マトリクス `tako_send_keys` は Windows で Degraded（修飾の区別は失われる）
 
 ## 次の一手
 
-1. **稼働中 GUI は旧バイナリ**なので `tako account` はまだ使えない。次のインストーラー更新で反映
-2. **main とのアカウントモデル統合（マージ時の宿題）**: main には CLI
-   `tako orchestrator accounts`（#548/#556）が別途あるので、両方の CLI パスを同じ dispatch へ
-   向ける（ロジックは二重化しない）。master への account 適用も本ブランチ #653 と main #555 が
-   独立実装で衝突する既知の債務
+1. **#730（IME 確定直後の Enter 連打が改行になる）**: #729 とは**別根因**。tako の連続
+   `write` が 1 回の read にまとまり、内側 TUI の貼り付け判定で CR が改行に化ける
+   （`RECV<e3-81-82-e3-81-84-e3-81-86-0d-0d-0d>` を実測。直接ペイン・psmux の両方で再現）。
+   Enter の送達は #95 / #623 / #640 が積み上げた領域なので、触るなら実測つきで慎重に
+2. **実機確認は次のインストーラー更新後**（稼働中 GUI は旧バイナリなので #729 の修正は未反映）
 3. **#623 の実機確認（未決）**: 日本語入力の打鍵消失は直った確証が無い。症状が出たら
    `TAKO_IME_DIAG=1 TAKO_PERF_LOG=<path>` で採取し #623 のコメント §5 で切り分ける
+4. **main とのアカウントモデル統合（#709 マージ時の宿題）**: main の CLI
+   `tako orchestrator accounts`（#548/#556）と両方の CLI パスを同じ dispatch へ向ける。
+   master への account 適用も本ブランチ #653 と main #555 が独立実装で衝突する既知の債務
 
 ## mac 側 master への引き継ぎ（マージ後に要対応）
 

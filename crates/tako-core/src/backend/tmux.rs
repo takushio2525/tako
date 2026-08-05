@@ -71,6 +71,9 @@ impl SessionBackend for TmuxBackend {
             detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
+            // conf の `extended-keys always` + `extended-keys-format csi-u` が運ぶ
+            // （e2e `ネストtmux越しのcsi_uが最内アプリへ届く` が固定している）
+            extended_keys: true,
             label: "tmux",
         }
     }

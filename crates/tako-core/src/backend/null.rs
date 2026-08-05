@@ -32,6 +32,9 @@ impl SessionBackend for NullBackend {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            // 器が無い = tako の PTY が内側アプリへ直結する。CSI u はそのまま届く
+            // （Windows でも ConPTY は素通しすることを実測。#729）
+            extended_keys: true,
             label: "none",
         }
     }
