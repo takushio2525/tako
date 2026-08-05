@@ -1708,3 +1708,22 @@
   profiles 書き込みと未登録キー・排他違反・破損 YAML のエラー、`inherit` が起動コマンドで
   **unset** になること（代入に化けたら FAILED になるテスト）まで確認
 - 関連: PR（Closes #709）。tako-control +14 / tako-app +3 テスト。fmt / clippy は baseline と同一
+
+## 2026-08-05（#521: 動画プレビューの Windows 実装 — B12 後半）
+
+- PDF（PR #704）に続いて **B12 の動画側**を新設。Windows は **Media Foundation の
+  `IMFMediaEngine`（フレームサーバーモード）+ `IWICBitmap`** で、追加の再頒布物ゼロのまま
+  フレーム表示・再生・一時停止・シーク・音量・速度・ループまで通した。libmpv / ffmpeg は
+  **pdfium を見送ったのと同じ理由**（DLL 数十 MB が #587 の配布物一式へ波及）で不採用
+- `video_player.rs` は**純粋計算だけ**を残し `VideoPlayer` は境界から `pub use`。
+  呼び出し側は**コメント以外 1 行も変わっていない**。macOS 実装は無改変移設で、
+  トークン列 2142 個の完全一致を機械確認
+- 実測で潰した Windows 固有の壊れ方 3 つ: ①**総尺不明のとき `clamp_time` がシークを全部
+  0.0 に潰す**（開いた直後の `tako video seek 4.0` が必ず先頭へ飛ぶ）→ `seek_target()`
+  ②ポスターフレームはメタデータ到着と**同時には来ない** → `needs_tick()` を「最初のフレームを
+  取るまで」へ ③`OnVideoStreamTick` の S_OK / S_FALSE が `windows` crate では**どちらも `Ok`**
+  → vtable 直呼びで HRESULT を見る。PDF で要った終了時 AV の「番人」は動画では不要（exit 0 実測）
+- 検証素材の mp4（H.264 + AAC）は **ffmpeg を使わず OS のエンコーダで生成**する
+  （`platform/video/test_fixture.rs`）。CI の Windows ランナーでも同じ e2e が回る
+- 検証: 隔離インスタンスで **CLI と MCP の両経路**から再生 / 一時停止 / シーク / 音量を実測 +
+  異常系 3 種。マトリクスは 4 キーを対応済みへ、doc 再生成

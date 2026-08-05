@@ -433,6 +433,57 @@ fn pdfレンダラの直呼びが境界の外に残っていない() {
     );
 }
 
+/// **#521 の受け入れ**: 動画プレイヤーの直接呼び出しが、抽象境界 B12 の外に残っていないこと。
+///
+/// 動画も PDF と同じく OS ごとに別の再生器（macOS = AVFoundation の AVPlayer、
+/// Windows = Media Foundation の `IMFMediaEngine`）を使う。`video_player.rs` は
+/// **プラットフォーム非依存な計算だけ**を持ち、OS を叩く部分は
+/// `platform::video` の内側に閉じている、という状態を守る番犬。
+///
+/// 元の `video_player.rs` は cfg 分岐が 36 箇所（この移植で最多）あったファイルなので、
+/// 「ちょっとだけ cfg を戻す」が起きやすい。ここで落とす。
+#[test]
+fn 動画プレイヤーの直呼びが境界の外に残っていない() {
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/tako-app/src/platform/video/macos.rs",
+            "境界 B12 の macOS 実装（AVFoundation）",
+        ),
+        (
+            "crates/tako-app/src/platform/video/windows.rs",
+            "境界 B12 の Windows 実装（Media Foundation の IMFMediaEngine）",
+        ),
+        (
+            "crates/tako-app/src/platform/video/test_fixture.rs",
+            "検証用 mp4 を OS のエンコーダで作るテスト専用モジュール（境界の内側）",
+        ),
+    ];
+    // OS 固有の再生 API を名指しで見る（コメント中の言及ではなく、実際に呼ぶ形）
+    const PATTERNS: &[&str] = &[
+        // macOS
+        "name = \"AVFoundation\"",
+        "AVPlayerItemVideoOutput",
+        "CVPixelBufferGetBaseAddress",
+        // Windows
+        "IMFMediaEngine",
+        "MFCreateAttributes",
+        "MediaFoundation::",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let src = root.join("crates").join(crate_dir).join("src");
+        collect_direct_calls(&src, &root, PATTERNS, ALLOWED, &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "動画プレイヤーの直呼びが境界の外にある:\n  {}\n\
+         → tako-app の platform::video 経由にしてください（#521 / 設計 §2 の B12）",
+        offenders.join("\n  ")
+    );
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///
