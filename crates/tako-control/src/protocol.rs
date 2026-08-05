@@ -1090,11 +1090,17 @@ pub enum Request {
     ///   `channel` = "stable"（既定）/ "test" で対象チャンネルを指定。
     /// `"apply-zip"` → 配布系統を問わず zip 経由で強制更新する（brew 失敗時のフォールバック）。
     /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）
+    ///
+    /// `dry_run` = true（apply のみ有効）で「取得と検証まで済ませ、置き換えは実行しない」。
+    /// 適用は後戻りできないので `tako git merge` 等と同じく**何が起きるかを先に出せる**
+    /// ようにしてある。更新チェック / 取得・検証 / 適用の段階ごとの機械検証もこれで行う（#723）
     Update {
         #[serde(default)]
         action: Option<String>,
         #[serde(default)]
         channel: Option<String>,
+        #[serde(default)]
+        dry_run: Option<bool>,
     },
     /// フルディスクアクセス (FDA) の状態確認と設定画面を開く操作（Issue #118）。
     /// `action` = "status"（既定）/ "open"（システム設定を開く）

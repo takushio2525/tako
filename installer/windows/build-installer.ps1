@@ -105,6 +105,14 @@ if (-not (Test-Path -LiteralPath $iconPath)) {
 }
 
 if (-not $SkipBuild) {
+    # -win.N タグからビルド番号を抽出し、update_checker が自バイナリの版数を正確に
+    # 埋め込めるようにする（#723）。build.rs が TAKO_WIN_NUM を TAKO_FULL_VERSION へ反映
+    if ($Version -match '-win\.(\d+)') {
+        $env:TAKO_WIN_NUM = $Matches[1]
+        Write-Host "-- TAKO_WIN_NUM=$($env:TAKO_WIN_NUM)（$Version から抽出）"
+    } else {
+        $env:TAKO_WIN_NUM = $null
+    }
     Write-Host '-- cargo build --release -p tako-app -p tako-cli'
     Push-Location $repoRoot
     try {
@@ -112,6 +120,7 @@ if (-not $SkipBuild) {
         if ($LASTEXITCODE -ne 0) { throw "cargo build に失敗 (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location
+        $env:TAKO_WIN_NUM = $null
     }
 }
 

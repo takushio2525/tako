@@ -1116,10 +1116,7 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_update",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_video_playback",

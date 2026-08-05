@@ -28,8 +28,49 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// チェック失敗時のリトライ間隔（1 時間）
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// 現在のバージョン（Cargo.toml から埋め込み）
-pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// ビルド時に埋め込んだバージョン。build.rs が `CARGO_PKG_VERSION` に、
+/// リリースビルド時の `TAKO_WIN_NUM`（例: "3"）があれば `-win.3` を付与した文字列。
+///
+/// **これは「このバイナリをビルドしたときの版数」であって、更新判定に使う版数とは限らない**。
+/// 判定には `effective_current_version()` を使うこと（#723）
+pub const CURRENT_VERSION: &str = env!("TAKO_FULL_VERSION");
+
+/// 更新判定に使う「今入っている版数」。
+///
+/// インストーラーが記録した版数（`DisplayVersion`）を最優先する。理由は #723:
+/// すでに配布済みの `v0.5.13-win.1`〜`win.3` は `TAKO_WIN_NUM` 無しでビルドされており、
+/// ビルド埋め込みの版数が一律 `0.5.13` になる。それを基準にすると「最新は win.3」と
+/// 比べて永遠に「更新あり」になり、更新しても同じ版が入るだけの無限ループに陥る。
+/// インストーラーの記録は win.1 の時点から正確なので、遡ってこの穴を塞げる。
+///
+/// ポータブル zip・開発ビルド・macOS では記録が無いので `CURRENT_VERSION` に落ちる。
+///
+/// 結果はプロセス内で 1 度だけ解決してキャッシュする。ステータスバーの描画から呼ばれるので
+/// 毎フレーム レジストリを引かせない（#212 / #168 で潰した「UI スレッドでの同期 syscall」を
+/// 再び持ち込まないため）。実体が入れ替わるときは必ずプロセスも終わるので陳腐化しない。
+pub fn effective_current_version() -> &'static str {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        resolve_current_version(
+            tako_core::platform::install_info::installed_version().as_deref(),
+            CURRENT_VERSION,
+        )
+    })
+}
+
+/// `effective_current_version` の判定本体（純粋関数。テストから直接叩ける）。
+///
+/// インストーラーの記録が**パースできる版数のときだけ**採用する。読めない値
+/// （手で書き換えられた・別形式）に引きずられてビルド埋め込みの版数を捨てないため
+fn resolve_current_version(installed: Option<&str>, built_in: &str) -> String {
+    if let Some(raw) = installed {
+        let normalized = raw.trim().strip_prefix('v').unwrap_or(raw.trim());
+        if ParsedVersion::parse(normalized).is_some() {
+            return normalized.to_string();
+        }
+    }
+    built_in.to_string()
+}
 
 const OWNER_REPO: &str = "takushio2525/tako";
 
@@ -415,7 +456,8 @@ pub fn check_channel(channel: Channel) -> Result<Option<UpdateInfo>, CheckError>
     })
 }
 
-/// パース済みバージョン（`X.Y.Z` または `X.Y.Z-test.N`）
+/// パース済みバージョン（`X.Y.Z`、`X.Y.Z-test.N`、`X.Y.Z-win.N`）。
+/// `-win.N` は Windows 固有のビルド反復番号（#723）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedVersion {
     pub major: u32,
@@ -423,17 +465,20 @@ pub struct ParsedVersion {
     pub patch: u32,
     /// None = 安定版、Some(n) = テスト版 `-test.N`
     pub test_num: Option<u32>,
+    /// None = 非 Windows 固有版、Some(n) = Windows 反復 `-win.N`（#723）
+    pub win_num: Option<u32>,
 }
 
 impl ParsedVersion {
     pub fn parse(s: &str) -> Option<Self> {
-        let (base, test_num) = if let Some((base, suffix)) = s.split_once("-test.") {
-            (base, Some(suffix.parse::<u32>().ok()?))
+        let (base, test_num, win_num) = if let Some((base, suffix)) = s.split_once("-test.") {
+            (base, Some(suffix.parse::<u32>().ok()?), None)
+        } else if let Some((base, suffix)) = s.split_once("-win.") {
+            (base, None, Some(suffix.parse::<u32>().ok()?))
         } else if s.contains('-') {
-            // `-test.N` 以外のプレリリースサフィックス（例: `-rc.1`）はテスト版扱い
             return None;
         } else {
-            (s, None)
+            (s, None, None)
         };
         let parts: Vec<&str> = base.split('.').collect();
         if parts.len() != 3 {
@@ -444,6 +489,7 @@ impl ParsedVersion {
             minor: parts[1].parse().ok()?,
             patch: parts[2].parse().ok()?,
             test_num,
+            win_num,
         })
     }
 
@@ -460,6 +506,16 @@ impl ParsedVersion {
     fn base_tuple(&self) -> (u32, u32, u32) {
         (self.major, self.minor, self.patch)
     }
+
+    /// サフィックスの種別と番号を正規化した比較用タプル。
+    /// ランク: 安定版(2) > test(1) > win(0)。同ランク内は番号順
+    fn suffix_rank(&self) -> (u8, u32) {
+        match (self.test_num, self.win_num) {
+            (None, None) => (2, 0),
+            (Some(n), _) => (1, n),
+            (_, Some(n)) => (0, n),
+        }
+    }
 }
 
 impl PartialOrd for ParsedVersion {
@@ -470,15 +526,35 @@ impl PartialOrd for ParsedVersion {
 
 impl Ord for ParsedVersion {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.base_tuple().cmp(&other.base_tuple()).then_with(|| {
-            match (self.test_num, other.test_num) {
-                // 同じベースなら: stable(None) > test(Some)
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(&b),
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-        })
+        self.base_tuple()
+            .cmp(&other.base_tuple())
+            .then_with(|| self.suffix_rank().cmp(&other.suffix_rank()))
+    }
+}
+
+/// プラットフォームを考慮した「available は current より新しいか」判定（#723）。
+///
+/// semver の Ord（stable > prerelease）とは異なり、Windows では `-win.N` を
+/// 同ベースの stable 以上として扱う。理由: Windows バイナリの `CURRENT_VERSION` が
+/// ビルドタグ未埋め込みだと素の `X.Y.Z`（`win_num: None`）になり、semver 順で
+/// `-win.N` が「古い」と判定されてしまうため。macOS は semver 準拠のまま
+fn is_newer_release(
+    available: &ParsedVersion,
+    current: &ParsedVersion,
+    target: UpdateTarget,
+) -> bool {
+    let base_cmp = available.base_tuple().cmp(&current.base_tuple());
+    match base_cmp {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match target {
+            UpdateTarget::Windows => match (available.win_num, current.win_num) {
+                (Some(a), Some(c)) => a > c,
+                (Some(_), None) => true,
+                _ => available.suffix_rank() > current.suffix_rank(),
+            },
+            UpdateTarget::MacOs => available.suffix_rank() > current.suffix_rank(),
+        },
     }
 }
 
@@ -673,7 +749,17 @@ fn parse_releases_for(
     target: UpdateTarget,
     arch: &str,
 ) -> ChannelUpdates {
-    let current = ParsedVersion::parse(CURRENT_VERSION);
+    parse_releases_for_version(releases, target, arch, effective_current_version())
+}
+
+/// テストから current_version を差し替えられる内部関数
+fn parse_releases_for_version(
+    releases: &[serde_json::Value],
+    target: UpdateTarget,
+    arch: &str,
+    current_version: &str,
+) -> ChannelUpdates {
+    let current = ParsedVersion::parse(current_version);
 
     let mut result = ChannelUpdates::default();
 
@@ -683,15 +769,26 @@ fn parse_releases_for(
         let Some(ver) = ParsedVersion::parse(version_str) else {
             continue;
         };
+
+        // -win.N は Windows 固有のビルド反復。非 Windows では意味が無いのでスキップ
+        if ver.win_num.is_some() && target != UpdateTarget::Windows {
+            continue;
+        }
+
         let is_prerelease = release["prerelease"].as_bool().unwrap_or(false);
         let channel = if is_prerelease {
-            Channel::Test
+            // Windows 上で -win.N は正規リリース（Stable 扱い）
+            if target == UpdateTarget::Windows && ver.win_num.is_some() {
+                Channel::Stable
+            } else {
+                Channel::Test
+            }
         } else {
             Channel::Stable
         };
 
         if let Some(ref cur) = current {
-            if ver <= *cur {
+            if !is_newer_release(&ver, cur, target) {
                 continue;
             }
         }
@@ -744,6 +841,87 @@ pub fn perform_update(info: &UpdateInfo) -> Result<String, String> {
             update_via_zip(info)
         }
     }
+}
+
+/// 配布物の取得と整合検証まで行い、**置き換えはしない**（#723）。
+///
+/// 適用は後戻りできず、実機で試すと本番インストールを壊してしまうので、
+/// 「落とす・確かめる」だけを独立して叩けるようにしてある。返す JSON には
+/// このあと実際に走らせるコマンド行も入れて、次に何が起きるかを見えるようにする。
+pub fn stage_update(info: &UpdateInfo) -> Result<serde_json::Value, String> {
+    let target = UpdateTarget::current();
+    let url = info.download_url.as_deref().ok_or_else(|| {
+        "このプラットフォーム向けの配布物が見つかりません（更新できるリリースがない）".to_string()
+    })?;
+
+    let tmp_dir = std::env::temp_dir().join("tako-update-dry-run");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("一時ディレクトリの作成に失敗: {e}"))?;
+    let file_name = match target {
+        UpdateTarget::Windows => windows_setup_asset_name(&format!("v{}", info.version)),
+        UpdateTarget::MacOs => format!("tako-{}.zip", info.version),
+    };
+    let dest = tmp_dir.join(file_name);
+
+    let downloaded = download_to_file(url, &dest)?;
+
+    // 検証の中身はプラットフォームで違う。Windows は PE ヘッダまで見る
+    let (verified, verify_note) = match target {
+        UpdateTarget::Windows => {
+            let head = read_file_head(&dest, 2);
+            match verify_installer_bytes(&head, downloaded, info.download_size) {
+                Ok(()) => (true, "サイズ一致 + PE ヘッダ確認".to_string()),
+                Err(e) => (false, e),
+            }
+        }
+        UpdateTarget::MacOs => {
+            // macOS はアセット一覧を見ない（申告サイズを持たない）ので空でないことだけ見る
+            if downloaded > 0 {
+                (
+                    true,
+                    "ダウンロード済み（macOS は申告サイズなし）".to_string(),
+                )
+            } else {
+                (false, "ダウンロードしたファイルが空です".to_string())
+            }
+        }
+    };
+
+    let would_run = match target {
+        UpdateTarget::Windows => {
+            let mut argv = vec![dest.display().to_string()];
+            argv.extend(windows_installer_args().iter().map(|s| s.to_string()));
+            argv
+        }
+        UpdateTarget::MacOs => vec![
+            "ditto".into(),
+            "-xk".into(),
+            dest.display().to_string(),
+            "/Applications/tako.app".into(),
+        ],
+    };
+
+    if !verified {
+        // 壊れた配布物を残さない（次の dry-run が古い残骸を掴まないように）
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!(
+            "配布物の検証に失敗: {verify_note}（適用は行いません）"
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "dry_run": true,
+        "applied": false,
+        "version": info.version,
+        "channel": info.channel.label(),
+        "download_url": url,
+        "downloaded_path": dest.display().to_string(),
+        "downloaded_bytes": downloaded,
+        "expected_bytes": info.download_size,
+        "verified": verified,
+        "verify_note": verify_note,
+        "would_run": would_run,
+    }))
 }
 
 /// zip 強制更新（brew 失敗時のフォールバック用。配布系統を問わず zip で更新する）
@@ -1002,13 +1180,15 @@ pub fn restart_app() -> Result<(), String> {
 pub fn update_status_json() -> serde_json::Value {
     let method = detect_install_method_full();
     let duplicates = detect_duplicate_cli();
-    let current_channel = if CURRENT_VERSION.contains("-test.") {
+    let current = effective_current_version();
+    let current_channel = if current.contains("-test.") {
         Channel::Test
     } else {
+        // `-win.N` は Windows の正規配布なので stable 扱い（#723）
         Channel::Stable
     };
     let mut json = serde_json::json!({
-        "current_version": CURRENT_VERSION,
+        "current_version": current,
         "current_channel": current_channel.label(),
         "install_method": method.label(),
         "duplicate_cli": duplicates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
@@ -1064,11 +1244,18 @@ mod tests {
         assert_eq!(v.minor, 6);
         assert_eq!(v.patch, 0);
         assert_eq!(v.test_num, None);
+        assert_eq!(v.win_num, None);
         assert_eq!(v.channel(), Channel::Stable);
 
         let v = ParsedVersion::parse("0.6.0-test.3").unwrap();
         assert_eq!(v.test_num, Some(3));
+        assert_eq!(v.win_num, None);
         assert_eq!(v.channel(), Channel::Test);
+
+        let v = ParsedVersion::parse("0.5.13-win.3").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (0, 5, 13));
+        assert_eq!(v.test_num, None);
+        assert_eq!(v.win_num, Some(3));
 
         assert!(ParsedVersion::parse("invalid").is_none());
         assert!(ParsedVersion::parse("0.6.0-rc.1").is_none());
@@ -1615,5 +1802,396 @@ mod tests {
             // ネットワーク不達なら Network エラーが返る（panic しない）
             let _ = check_channel(Channel::Stable);
         });
+    }
+
+    // --- #723: -win.N バージョン比較 ---
+
+    #[test]
+    fn test_parsed_version_win_suffix() {
+        let v = ParsedVersion::parse("0.5.13-win.3").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (0, 5, 13));
+        assert_eq!(v.win_num, Some(3));
+        assert_eq!(v.test_num, None);
+
+        let v = ParsedVersion::parse("0.5.13-win.0").unwrap();
+        assert_eq!(v.win_num, Some(0));
+
+        // -win.N と -test.N は排他
+        assert_ne!(
+            ParsedVersion::parse("0.5.13-win.1").unwrap(),
+            ParsedVersion::parse("0.5.13-test.1").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_win_semver_ordering() {
+        // semver の Ord: stable > test > win（同ベース）
+        let stable = ParsedVersion::parse("0.5.13").unwrap();
+        let test1 = ParsedVersion::parse("0.5.13-test.1").unwrap();
+        let win3 = ParsedVersion::parse("0.5.13-win.3").unwrap();
+        assert!(stable > test1);
+        assert!(stable > win3);
+        assert!(test1 > win3);
+
+        // win 同士
+        let win1 = ParsedVersion::parse("0.5.13-win.1").unwrap();
+        assert!(win3 > win1);
+        assert_eq!(win3.cmp(&win3.clone()), std::cmp::Ordering::Equal);
+
+        // 異なるベースではベースが優先
+        let newer_base = ParsedVersion::parse("0.5.14-win.1").unwrap();
+        assert!(newer_base > win3);
+        assert!(newer_base > stable);
+    }
+
+    #[test]
+    fn test_is_newer_release_windows() {
+        let cur_base = ParsedVersion::parse("0.5.13").unwrap();
+        let cur_win3 = ParsedVersion::parse("0.5.13-win.3").unwrap();
+        let avail_win3 = ParsedVersion::parse("0.5.13-win.3").unwrap();
+        let avail_win4 = ParsedVersion::parse("0.5.13-win.4").unwrap();
+        let avail_win1 = ParsedVersion::parse("0.5.13-win.1").unwrap();
+        let avail_newer = ParsedVersion::parse("0.5.14-win.1").unwrap();
+
+        // Windows: win.N > base（ビルドタグ未埋め込みバイナリの更新検知）
+        assert!(is_newer_release(
+            &avail_win3,
+            &cur_base,
+            UpdateTarget::Windows
+        ));
+        assert!(is_newer_release(
+            &avail_win4,
+            &cur_base,
+            UpdateTarget::Windows
+        ));
+
+        // Windows: win.4 > win.3
+        assert!(is_newer_release(
+            &avail_win4,
+            &cur_win3,
+            UpdateTarget::Windows
+        ));
+        // Windows: win.3 == win.3 → false
+        assert!(!is_newer_release(
+            &avail_win3,
+            &cur_win3,
+            UpdateTarget::Windows
+        ));
+        // Windows: win.1 < win.3 → false
+        assert!(!is_newer_release(
+            &avail_win1,
+            &cur_win3,
+            UpdateTarget::Windows
+        ));
+
+        // ベースが新しいなら常に true
+        assert!(is_newer_release(
+            &avail_newer,
+            &cur_win3,
+            UpdateTarget::Windows
+        ));
+        assert!(is_newer_release(
+            &avail_newer,
+            &cur_base,
+            UpdateTarget::Windows
+        ));
+    }
+
+    #[test]
+    fn test_is_newer_release_macos_ignores_win() {
+        let cur = ParsedVersion::parse("0.5.13").unwrap();
+        let win3 = ParsedVersion::parse("0.5.13-win.3").unwrap();
+        // macOS: win.N < stable（通常の semver 順序）
+        assert!(!is_newer_release(&win3, &cur, UpdateTarget::MacOs));
+    }
+
+    #[test]
+    fn test_parse_releases_windows_detects_win_releases() {
+        let arr = vec![
+            release_json("v0.5.13-win.3", true, &["tako-setup-v0.5.13-win.3-x64.exe"]),
+            release_json("v0.5.13-win.2", true, &["tako-setup-v0.5.13-win.2-x64.exe"]),
+        ];
+        // current = "0.5.13" → win.3 が最新の stable として検出される
+        let win = parse_releases_for_version(&arr, UpdateTarget::Windows, "x86_64", "0.5.13");
+        assert!(win.stable.is_some(), "Windows では -win.N が stable に入る");
+        assert_eq!(win.stable.as_ref().unwrap().version, "0.5.13-win.3");
+        assert_eq!(win.stable.as_ref().unwrap().channel, Channel::Stable);
+    }
+
+    #[test]
+    fn test_parse_releases_windows_skips_current_or_older_win() {
+        let arr = vec![
+            release_json("v0.5.13-win.3", true, &["tako-setup-v0.5.13-win.3-x64.exe"]),
+            release_json("v0.5.13-win.2", true, &["tako-setup-v0.5.13-win.2-x64.exe"]),
+        ];
+        // current = "0.5.13-win.3" → 同じ版は検出しない
+        let win = parse_releases_for_version(&arr, UpdateTarget::Windows, "x86_64", "0.5.13-win.3");
+        assert!(win.stable.is_none(), "同じ版は更新なしにする");
+    }
+
+    #[test]
+    fn test_parse_releases_macos_skips_win_releases() {
+        let arr = vec![release_json(
+            "v0.5.13-win.3",
+            true,
+            &["tako-setup-v0.5.13-win.3-x64.exe"],
+        )];
+        let mac = parse_releases_for_version(&arr, UpdateTarget::MacOs, "arm64", "0.5.12");
+        assert!(mac.stable.is_none(), "macOS で -win.N は表示しない");
+        assert!(mac.test.is_none(), "macOS で -win.N は表示しない");
+    }
+
+    #[test]
+    fn test_resolve_current_version_prefers_installer_record() {
+        // インストーラーの記録が正（v 接頭辞は落とす）
+        assert_eq!(
+            resolve_current_version(Some("v0.5.13-win.3"), "0.5.13"),
+            "0.5.13-win.3"
+        );
+        assert_eq!(
+            resolve_current_version(Some("0.5.13-win.2"), "0.5.13"),
+            "0.5.13-win.2"
+        );
+        // 前後の空白は落とす（レジストリ値は空白詰めのことがある）
+        assert_eq!(
+            resolve_current_version(Some("  v0.6.0  "), "0.5.13"),
+            "0.6.0"
+        );
+    }
+
+    #[test]
+    fn test_resolve_current_version_falls_back() {
+        // 記録が無い（ポータブル zip / 開発ビルド / macOS）
+        assert_eq!(
+            resolve_current_version(None, "0.5.13-win.4"),
+            "0.5.13-win.4"
+        );
+        // 記録が読めない値ならビルド埋め込みを使う（手で書き換えられた等）
+        assert_eq!(resolve_current_version(Some("garbage"), "0.5.13"), "0.5.13");
+        assert_eq!(resolve_current_version(Some(""), "0.5.13"), "0.5.13");
+        assert_eq!(
+            resolve_current_version(Some("v0.6.0-rc.1"), "0.5.13"),
+            "0.5.13"
+        );
+    }
+
+    #[test]
+    fn test_installed_win3_sees_no_update_for_win3() {
+        // #723 の無限ループ回帰テスト: インストーラーが win.3 を記録していれば
+        // 最新が win.3 でも「更新あり」にしない
+        let arr = vec![release_json(
+            "v0.5.13-win.3",
+            true,
+            &["tako-setup-v0.5.13-win.3-x64.exe"],
+        )];
+        let current = resolve_current_version(Some("v0.5.13-win.3"), "0.5.13");
+        let win = parse_releases_for_version(&arr, UpdateTarget::Windows, "x86_64", &current);
+        assert!(
+            win.stable.is_none(),
+            "win.3 を入れているのに win.3 が更新として出た（無限ループ）"
+        );
+
+        // 記録が無いビルド埋め込みだけの場合は「更新あり」になる（既存 win.1〜3 の救済経路）
+        let fallback = resolve_current_version(None, "0.5.13");
+        let win = parse_releases_for_version(&arr, UpdateTarget::Windows, "x86_64", &fallback);
+        assert_eq!(win.stable.as_ref().unwrap().version, "0.5.13-win.3");
+    }
+
+    // --- #723: 実 GitHub Release に対する e2e（ネットワークが要るので既定では走らせない）---
+    //
+    //   cargo test -p tako-app --  --ignored real_release
+    //
+    // ここだけは本物のリリース JSON / 本物のアセットを相手にする。フィクスチャは
+    // 「アセット名の規約が変わった」「リリースの付け方が変わった」を検出できないため
+
+    /// 実 GitHub API から /releases を取得する（テスト補助）
+    fn fetch_real_releases() -> Vec<serde_json::Value> {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        let mut req = agent
+            .get(RELEASES_API_URL)
+            .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
+            .header("Accept", "application/vnd.github+json");
+        if let Some(t) = gh_auth_token() {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req.call().expect("GitHub API へ到達できない");
+        assert_eq!(resp.status().as_u16(), 200, "GitHub API が 200 を返さない");
+        let body: String = resp.into_body().read_to_string().unwrap();
+        serde_json::from_str(&body).expect("リリース JSON をパースできない")
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。--ignored で明示実行する"]
+    fn real_release_windows_detects_and_stops() {
+        let releases = fetch_real_releases();
+
+        // 古い版数を名乗る → 更新あり（-win.N を拾う）
+        let old = parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", "0.5.13");
+        let info = old
+            .stable
+            .as_ref()
+            .expect("実リリースに Windows 配布物があるのに更新なしと判定された");
+        assert!(
+            info.version.contains("-win."),
+            "Windows が拾うのは -win.N 系列のはず: {}",
+            info.version
+        );
+        let url = info.download_url.as_deref().unwrap();
+        assert!(
+            url.ends_with("-x64.exe"),
+            "インストーラー exe を指していない: {url}"
+        );
+        assert!(
+            info.download_size.unwrap_or(0) > 1_000_000,
+            "申告サイズが小さすぎる"
+        );
+        eprintln!("[検出] {} -> {}", info.version, url);
+
+        // 同じ版数を名乗る → 最新（無限ループしない）
+        let same =
+            parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", &info.version);
+        assert!(
+            same.stable.is_none(),
+            "同じ版を入れているのに更新ありと判定された（無限ループ）: {:?}",
+            same.stable.map(|i| i.version)
+        );
+        eprintln!("[停止] {} は最新と判定", info.version);
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。--ignored で明示実行する"]
+    fn real_release_macos_never_sees_win_series() {
+        let releases = fetch_real_releases();
+        for current in ["0.5.13", "0.1.0"] {
+            let mac = parse_releases_for_version(&releases, UpdateTarget::MacOs, "arm64", current);
+            for info in [mac.stable, mac.test].into_iter().flatten() {
+                assert!(
+                    !info.version.contains("-win."),
+                    "macOS に Windows 専用リリースが出た: {}",
+                    info.version
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。約 15MB 落とす。--ignored で明示実行する"]
+    fn real_release_download_and_verify() {
+        let releases = fetch_real_releases();
+        let info = parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", "0.5.13")
+            .stable
+            .expect("Windows 配布物のあるリリースが無い");
+        let url = info.download_url.as_deref().unwrap();
+
+        let dir = std::env::temp_dir().join("tako-update-verify-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("setup.exe");
+
+        let written = download_to_file(url, &dest).expect("ダウンロードに失敗");
+        let head = read_file_head(&dest, 2);
+        eprintln!("[DL] {written} バイト / 先頭 {head:?}");
+
+        // 正常系: 申告サイズと一致し PE ヘッダを持つ
+        verify_installer_bytes(&head, written, info.download_size)
+            .expect("実アセットが検証を通らない");
+
+        // 異常系はここで一緒に潰す（本物のバイト列を種に使う）
+        assert!(
+            verify_installer_bytes(&head, written - 1, info.download_size).is_err(),
+            "途中で切れたファイルを通してしまう"
+        );
+        assert!(
+            verify_installer_bytes(b"<!", written, info.download_size).is_err(),
+            "HTML のエラーページを通してしまう"
+        );
+        assert!(
+            verify_installer_bytes(&[], 0, None).is_err(),
+            "空ファイルを通してしまう"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。約 15MB 落とす。--ignored で明示実行する"]
+    fn real_release_stage_update_does_not_apply() {
+        // apply の一歩手前（取得 + 検証）だけを実 Release に対して通す。
+        // dispatch の action=apply&dry_run=true / CLI の `tako update apply --dry-run`
+        // / MCP の tako_update{dry_run:true} が最終的に呼ぶのがこの関数
+        let releases = fetch_real_releases();
+        let info = parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", "0.5.13")
+            .stable
+            .expect("Windows 配布物のあるリリースが無い");
+
+        let staged = stage_update(&info).expect("取得と検証に失敗");
+        eprintln!("{}", serde_json::to_string_pretty(&staged).unwrap());
+
+        assert_eq!(staged["dry_run"], true);
+        assert_eq!(staged["applied"], false, "dry-run なのに適用済みを名乗った");
+        assert_eq!(staged["verified"], true);
+        assert_eq!(staged["downloaded_bytes"], staged["expected_bytes"]);
+
+        // 落ちたものが本当に存在して、これから起動するコマンドが指しているファイルと同じ
+        let path = staged["downloaded_path"].as_str().unwrap();
+        assert!(std::path::Path::new(path).is_file(), "配布物が残っていない");
+        let would_run: Vec<String> = serde_json::from_value(staged["would_run"].clone()).unwrap();
+        assert_eq!(would_run[0], path);
+        assert!(would_run.contains(&"/SILENT".to_string()));
+        assert!(would_run.contains(&"/NORESTART".to_string()));
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("tako-update-dry-run"));
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。--ignored で明示実行する"]
+    fn real_release_stage_update_rejects_size_mismatch() {
+        // 申告サイズを 1 バイトずらすと検証で落ち、壊れた配布物を残さない
+        let releases = fetch_real_releases();
+        let mut info =
+            parse_releases_for_version(&releases, UpdateTarget::Windows, "x86_64", "0.5.13")
+                .stable
+                .expect("Windows 配布物のあるリリースが無い");
+        info.download_size = Some(info.download_size.unwrap() + 1);
+
+        let err = stage_update(&info).unwrap_err();
+        assert!(err.contains("検証に失敗"), "{err}");
+        assert!(err.contains("適用は行いません"), "{err}");
+        assert!(
+            !std::env::temp_dir().join("tako-update-dry-run").exists(),
+            "検証に失敗した配布物が残っている"
+        );
+    }
+
+    #[test]
+    #[ignore = "ネットワークが要る。--ignored で明示実行する"]
+    fn real_release_download_fails_safely_on_bad_host() {
+        // 到達できないホスト → Err を返すだけで panic せず、保存先も残さない
+        let dir = std::env::temp_dir().join("tako-update-badhost-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("setup.exe");
+        let err = download_to_file("https://invalid.invalid/nope.exe", &dest).unwrap_err();
+        assert!(err.contains("ダウンロードに失敗"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_releases_windows_win_and_macos_coexist() {
+        // macOS 安定版と Windows -win.N が両方あるリリース群
+        let arr = vec![
+            release_json("v0.6.3", true, &["tako-v0.6.3-macos-arm64.zip"]),
+            release_json("v0.5.13-win.3", true, &["tako-setup-v0.5.13-win.3-x64.exe"]),
+        ];
+        // Windows: macOS-only リリースは assets なしでスキップ、win.3 だけ stable に入る
+        let win = parse_releases_for_version(&arr, UpdateTarget::Windows, "x86_64", "0.5.13");
+        assert_eq!(win.stable.as_ref().unwrap().version, "0.5.13-win.3");
+        // macOS: win.N はスキップ、macOS zip のある v0.6.3 は test（prerelease）に入る
+        let mac = parse_releases_for_version(&arr, UpdateTarget::MacOs, "arm64", "0.5.13");
+        assert!(mac.stable.is_none());
+        assert_eq!(mac.test.as_ref().unwrap().version, "0.6.3");
     }
 }

@@ -188,6 +188,13 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
 - アセット名は `tako-setup-{tag}-x64.exe`（インストーラー）と `tako-{tag}-windows-x64.zip`
   （ポータブル）。インストーラーは per-user（`{localappdata}\Programs\tako`）で管理者権限を
   要求せず、ユーザー PATH へインストール先を追加する
+- **`-win.N` タグの版数埋め込み（#723）**: `build-installer.ps1` はタグから `TAKO_WIN_NUM` を
+  抜いて `cargo build` へ渡し、`tako-app/build.rs` がそれを `TAKO_FULL_VERSION`
+  （例: `0.5.13-win.4`）としてバイナリへ埋める。Cargo.toml の version は `0.5.13` のまま
+  反復するので、これが無いと win.1 も win.4 も同じ版数を名乗り、アプリ内更新が新旧を判断できない。
+  **アプリ内更新が実際に読む版数はインストーラーが記録した `DisplayVersion`**
+  （`platform::install_info`。win.1 から正確に入っている）で、ビルド埋め込みは
+  ポータブル zip・開発ビルド用のフォールバック
 - **Release を作るのは先に走った方**。macOS の `scripts/release.sh` と同じタグで両方回すときは
   release.sh を先に流す（後発は既存 Release へアセットを足すだけになる）
 - Windows は MSVC CRT を静的リンクする（`.cargo/config.toml`）。VC++ 再頒布可能パッケージを

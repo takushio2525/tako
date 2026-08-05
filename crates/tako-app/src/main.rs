@@ -14539,6 +14539,24 @@ impl SystemHost for TakoApp {
             "install_method": update_checker::detect_install_method().label(),
         }))
     }
+    fn update_apply_dry_run(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
+        // apply と同じ経路でチャンネル解決 → 対象の特定まで行う。
+        // 違いは最後の「置き換える」を踏まないことだけ（#723）
+        let ch: update_checker::Channel =
+            channel.unwrap_or("stable").parse().map_err(|e: String| e)?;
+        let info = update_checker::check_channel(ch)
+            .map_err(|e| format!("更新チェックに失敗: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "{}の新しいバージョンが見つからない（既に最新版です）",
+                    ch.display_label()
+                )
+            })?;
+        let mut staged = update_checker::stage_update(&info)?;
+        staged["install_method"] =
+            serde_json::json!(update_checker::detect_install_method().label());
+        Ok(staged)
+    }
     fn update_apply_zip(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
         let ch: update_checker::Channel =
             channel.unwrap_or("stable").parse().map_err(|e: String| e)?;
