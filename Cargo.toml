@@ -78,7 +78,20 @@ winresource = "0.1"
 # Windows の OS 標準 PDF レンダラ `Windows.Data.Pdf` を呼ぶ WinRT バインディング（#521）。
 # Microsoft 公式・MIT OR Apache-2.0。既に gpui / wry 経由で依存グラフの中にいる 0.62 系へ揃える。
 # 参照するのは cfg(windows) のときだけなので macOS のビルドグラフには載らない
-windows = { version = "0.62", features = ["Data_Pdf", "Foundation", "Storage_Streams"] }
+windows = { version = "0.62", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Storage_Streams",
+    # 動画プレビュー（#521。platform/video/windows.rs 参照）
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+# COM オブジェクトを Rust 側で実装する #[implement] マクロが windows_core をクレート名で
+# 参照するため、windows crate 経由ではなく直接の依存として要る（#521）
+windows-core = "0.62"
 # PDF 構造パーサ（#693）。Windows.Data.Pdf にはリンク注釈・目次・テキスト抽出 API が無いため、
 # PDF オブジェクトツリーを自前で読んで補う。pure Rust・MIT。default features の
 # chrono/jiff/rayon/time は PDF 解析に不要なので切ってバイナリを抑える

@@ -23,9 +23,9 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 99 | macOS 版と同じように使えます |
-| 一部対応 | 10 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 19 | まだ実装されていません（追跡 Issue つき） |
+| 対応済み | 103 | macOS 版と同じように使えます |
+| 一部対応 | 9 | 使えますが機能が落ちます（理由は各表に記載） |
+| 未対応 | 16 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **129** | |
 
@@ -150,11 +150,11 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 ## ファイルプレビュー・Web ビュー
 
-コード / Markdown / 画像 / PDF / 動画のプレビューと、ネイティブ Web ビューペイン。（このカテゴリ全体としては **一部対応**）
+コード / Markdown / 画像 / PDF / 動画のプレビューと、ネイティブ Web ビューペイン。（このカテゴリ全体としては **対応済み**）
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
-| `tako_open_file` | 一部対応 | コード・Markdown・画像・PDF は表示できる。動画は macOS 実装のため表示できない |
+| `tako_open_file` | 対応済み | — |
 | `tako_preview_view` | 対応済み | — |
 | `tako_preview_outline` | 対応済み | — |
 | `tako_preview_reload` | 対応済み | — |
@@ -171,9 +171,9 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_preview_link_list` | 対応済み | — |
 | `tako_preview_follow_link` | 対応済み | — |
 | `tako_pin_preview` | 対応済み | — |
-| `tako_video_playback` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
-| `tako_video_seek` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
-| `tako_video_volume` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
+| `tako_video_playback` | 対応済み | — |
+| `tako_video_seek` | 対応済み | — |
+| `tako_video_volume` | 対応済み | — |
 | `tako_web` | 対応済み | — |
 
 ## コード実行（Code Runner）

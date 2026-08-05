@@ -168,11 +168,13 @@ pub mod notes {
         "PDF text selection and copy are not available on Windows. Extracting text from PDF \
          internals requires font encoding resolution, which is not feasible with the current stack",
     );
-    /// #521: 動画再生は AVFoundation 実装なので macOS 限定
-    pub const WIN_VIDEO_MACOS_ONLY: Note = Note::new(
-        "動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない",
-        "Video preview is implemented with macOS AVFoundation, so it cannot play on Windows",
-    );
+    // #521 で動画プレビューの Windows 実装（Media Foundation の IMFMediaEngine を
+    // フレームサーバーモードで使う）が入り、再生・一時停止・シーク・音量・フレーム表示が
+    // 動くようになった。縮退理由 WIN_VIDEO_MACOS_ONLY（「macOS 実装のため再生できない」）は
+    // **実態と食い違う**ので削除した。宣言が残っていると system prompt へ誤情報が注入される
+    // （このファイルのモジュール doc「この表を直したら」を参照）。
+    // 再生できるコーデックが OS 依存になるのは macOS（AVFoundation）でも同じなので、
+    // Windows 固有の縮退としては書かない
     /// #657: メニューは macOS では OS のグローバルメニューバーが所有するので、
     /// tako 側から開閉できない（項目の実行と一覧は OS メニューでも成立する）。
     /// **これは Windows の縮退ではなく macOS 側の縮退**という珍しい向きの例
@@ -182,12 +184,8 @@ pub mod notes {
         "The menu is owned by the OS menu bar, so tako cannot open or close it \
          (open / close unavailable). Listing the structure and invoking items both work",
     );
-    /// #521: PDF は Windows でも開けるようになった（Windows.Data.Pdf）。
-    /// プレビューの中身で残る欠けは動画だけ
-    pub const WIN_PREVIEW_NO_VIDEO: Note = Note::new(
-        "コード・Markdown・画像・PDF は表示できる。動画は macOS 実装のため表示できない",
-        "Code, Markdown, images and PDFs render. Video does not, as it is implemented for macOS only",
-    );
+    // #521 でプレビューの中身が出揃った（コード / Markdown / 画像 / PDF / 動画）。
+    // 縮退理由 WIN_PREVIEW_NO_VIDEO（「動画は表示できない」）は実態と食い違うので削除した
     // #617 で B8 の Windows 実装（explorer.exe /select, / ShellExecuteW /
     // SHFileOperationW + FOF_ALLOWUNDO）が入り、`tako_file_op` は全操作が動くようになった。
     // 縮退理由 WIN_FILE_OP_PARTIAL（「ゴミ箱へ移動は完全削除になる」）は**実態と食い違う**
@@ -590,10 +588,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_file",
         macos: Support::Supported,
-        // #521: PDF は OS 標準の Windows.Data.Pdf で開けるようになった。残るのは動画だけ
-        windows: Support::Degraded {
-            note: notes::WIN_PREVIEW_NO_VIDEO,
-        },
+        // #521: PDF は Windows.Data.Pdf、動画は Media Foundation で開けるようになり、
+        // プレビューの中身（コード / Markdown / 画像 / PDF / 動画）が出揃った
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_open_remote",
@@ -1118,29 +1115,22 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
     },
+    // 動画は macOS = AVFoundation / Windows = Media Foundation の IMFMediaEngine（#521）。
+    // どちらも OS 標準の再生器なので、扱えるコーデックが OS 依存になるのは共通
     Feature {
         key: "tako_video_playback",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_VIDEO_MACOS_ONLY,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_video_seek",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_VIDEO_MACOS_ONLY,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_video_volume",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_VIDEO_MACOS_ONLY,
-            issue: 521,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_web",
