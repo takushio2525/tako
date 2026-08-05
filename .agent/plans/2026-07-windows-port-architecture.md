@@ -70,7 +70,7 @@ P0 完了以降、`cargo check --target x86_64-pc-windows-msvc` は **macOS 上�
 | B9 | スリープ防止 | `platform::power`（`supported` / `set_hold` / `is_held` / `on_ac_power`）**［非 macOS 側は #524 で新設済み。macOS は IOKit 実装が `sleep_guard::iokit` に残る］** | `tako-control/src/sleep_guard.rs:364-501` | IOKit + pmset | `PowerCreateRequest` + `PowerSetRequest`（`SetThreadExecutionState` は**呼んだスレッドが死ぬと解除**され `powercfg /requests` にも出ないので不採用。蓋閉じ・sudoers・thermal は macOS 固有 capability = `sleep_guard::lid_control_supported()`） |
 | B10 | ロケール検出 | `platform::locale::system_languages()` **［#604 で新設済み］** | `tako-core/src/i18n.rs:106,132-147`（移設元） | `defaults read AppleLanguages` | `GetUserPreferredUILanguages`（**表示言語**の順序付きリスト。`GetUserDefaultLocaleName` は「地域形式」= 書式ロケールを返す別物で、表示言語 = 英語 / 地域形式 = 日本語のユーザーを誤判定するため使わない。#604） |
 | B11 | Web ビュー ホスト | `trait WebviewHost`（attach / detach / resize / key monitor） | `tako-app/src/webview.rs:467-470` | WKWebView 子ビュー | WebView2 子 HWND |
-| B12 | ドキュメントレンダラ | `trait PdfRenderer` / `trait VideoPlayer` | `tako-app/src/preview.rs:745,821,1039`、`video_player.rs:11-24`、`tako-core/src/pdf_links.rs`、`preview_outline.rs` | PDFKit / CoreGraphics / AVFoundation | pdfium 等 or `Unsupported` 明示 |
+| B12 | ドキュメントレンダラ | `tako-app/src/platform/pdf/` + `tako-app/src/platform/video/` **［#521 で両方新設済み。trait ではなく「実装モジュールを cfg 1 箇所で選ぶ」形］** | `tako-app/src/preview.rs`（PDF 呼び出し）、`video_player.rs`（共通の純粋計算だけ残す） | PDFKit / CoreGraphics / AVFoundation | **PDF = `Windows.Data.Pdf`**（テキスト / しおり / リンクは API が無いので空。#693）/ **動画 = Media Foundation の `IMFMediaEngine`**（フレームサーバーモード + `IWICBitmap`。追加の再頒布物なし） |
 | B13 | シェル統合 | `shell_integration::script_for(shell)` + 注入先解決 | `tako-core/shell-integration/{zshenv.zsh,tako.bash,tako.fish}` | 既存 3 種 | PowerShell profile |
 | B14 | 配布・自動更新 | `trait UpdateChannel`（detect / download / apply / restart） | `tako-app/src/update_checker.rs:261-286,707-733` | .app / Caskroom | winget / scoop / zip |
 | B15 | プライバシー許可ガイド | `trait PermissionGuide` | `tako-control/src/fda.rs` | TCC / FDA | `Unsupported`（Windows に TCC 相当なし） |
@@ -108,6 +108,10 @@ crates/tako-core/src/platform/
   プラットフォーム分岐ではなく能力分岐として扱う）
 - **B12 は「Windows 未対応」を正式な選択肢として許す**。`Unsupported` はマトリクスに
   現れるので、隠れた劣化にはならない
+  → **結果として PDF も動画も OS 標準の API で実装でき、`Unsupported` は使わずに済んだ**
+  （#521）。判断軸は「追加の再頒布物を増やさない」で、pdfium（DLL 6〜11MB）や
+  libmpv / ffmpeg（DLL 数十 MB）は #587 で整えたインストーラー・zip・配布物検査に
+  波及するため MVP では採らなかった。欠けが残るのは PDF のテキスト / しおり / リンク（#693）だけ
 
 ---
 

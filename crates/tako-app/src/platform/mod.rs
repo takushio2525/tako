@@ -8,3 +8,4 @@
 //! 呼び出し側（`preview` / `preview_render` / UI）は単一のコードパスを持つ。
 
 pub mod pdf;
+pub mod video;

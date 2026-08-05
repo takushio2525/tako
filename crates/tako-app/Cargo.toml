@@ -36,10 +36,13 @@ ureq.workspace = true
 wry.workspace = true
 raw-window-handle.workspace = true
 
-# PDF プレビューの Windows 実装（#521。platform/pdf/windows.rs 参照）。
-# OS 標準の `Windows.Data.Pdf` を呼ぶだけで、追加の再頒布物は要らない
+# PDF / 動画プレビューの Windows 実装（#521。platform/pdf/windows.rs / platform/video/windows.rs 参照）。
+# OS 標準の `Windows.Data.Pdf` と Media Foundation を呼ぶだけで、追加の再頒布物は要らない
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+# COM オブジェクトを Rust 側で実装する #[implement] マクロが windows_core をクレート名で
+# 参照するため、windows crate 経由ではなく直接の依存として要る（#521 の動画側）
+windows-core.workspace = true
 # PDF 構造パーサ（#693）。ラスタライズは WinRT、リンク注釈・目次は lopdf で補う
 lopdf.workspace = true
 
