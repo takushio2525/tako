@@ -87,8 +87,8 @@ const CATEGORIES = [
       'tako_preview_cache', 'tako_preview_changelog', 'tako_preview_search', 'tako_preview_edit',
       'tako_preview_apply', 'tako_preview_replace', 'tako_preview_save', 'tako_preview_undo',
       'tako_preview_redo', 'tako_preview_autosave', 'tako_preview_link_list',
-      'tako_preview_follow_link', 'tako_pin_preview', 'tako_video_playback', 'tako_video_seek',
-      'tako_video_volume', 'tako_web',
+      'tako_preview_follow_link', 'tako_preview_copy_code', 'tako_pin_preview',
+      'tako_video_playback', 'tako_video_seek', 'tako_video_volume', 'tako_web',
     ],
   },
   {
