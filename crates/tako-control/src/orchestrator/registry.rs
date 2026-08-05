@@ -458,6 +458,30 @@ fn record_session_detected_for_worker_at(
     })
 }
 
+/// 検出済み claude session をレジストリへ反映する（ペイン ID キー。#728）。
+///
+/// 器を持たない構成（Windows で psmux 未導入 / tmux 不在の macOS）では
+/// `tmux_session` が無く [`record_session_detected`] が 1 件も引けない。
+/// 生きている worker をペイン ID で引き、worker ID キーの経路（#592）へ委譲する。
+/// ペイン ID 再利用の誤マッチが気になるところだが、ここで渡ってくるのは
+/// **今まさにそのペインで claude が動いている**という実プロセスの観測結果なので、
+/// active な worker が居るなら同一世代とみなしてよい
+pub fn record_session_detected_by_pane(pane: u64, session_id: &str) -> Result<(), String> {
+    let Some(path) = registry_path() else {
+        return Ok(());
+    };
+    if !path.is_file() {
+        return Ok(());
+    }
+    let worker_id = WorkerRegistry::load_from(&path)?
+        .find_active_by_pane(pane)
+        .map(|(id, _)| id.clone());
+    match worker_id {
+        Some(id) => record_session_detected_for_worker_at(&path, &id, session_id),
+        None => Ok(()),
+    }
+}
+
 /// 検出済み claude session をレジストリへ反映する（tmux_session キー）。
 /// session_id の初観測 = transcript 生成 = プロンプト到達の証跡として
 /// `prompt_delivered_at` も同時に記録する。GUI の定期スキャンおよび

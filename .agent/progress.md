@@ -1708,3 +1708,24 @@
   profiles 書き込みと未登録キー・排他違反・破損 YAML のエラー、`inherit` が起動コマンドで
   **unset** になること（代入に化けたら FAILED になるテスト）まで確認
 - 関連: PR（Closes #709）。tako-control +14 / tako-app +3 テスト。fmt / clippy は baseline と同一
+
+## 2026-08-05（#728: tako sessions を Windows で動かす — 器なし構成の検出欠落 + 境界の取りこぼし）
+
+- 棚卸しで「マトリクスの `Pending`（tmux バックエンド依存）は嘘」と確定: カタログ本体は
+  器に依存せず、psmux 導入済みのこの実機では **list / show / resume がすでに動いていた**
+  （本番 read-only 実測）。復元も tako 自身のペイン生成 + `claude --resume` なので
+  器への送出は要らない（PR #705 の読み取り到達すら不要）
+- 実装本体は **器なし構成**（psmux 未導入 = Windows の既定になりうる）でカタログが永久に
+  空だった問題。spawn の pending 記録・定期スキャンのゲート・検出の対応付けの三段すべてが
+  器のセッション名 1 本に依存していたのを、#592 と同じ二段構え（器があればセッション名 /
+  無ければ PTY 直下の子 pid → ペイン ID）へ。キーの解釈は `PendingSpawn::matches` に集約
+- 器のペイン列挙を `SessionBackend::pane_pids_all` へ寄せた（`agents.rs` が `tmux_bin()` を
+  直叩きしていたので、`TAKO_PSMUX_BIN` だけで psmux を入れた構成では器が動いていても
+  検出が全滅していた）。マトリクスは Pending → Supported + doc 再生成（95→96 対応済み）
+- 検証: 同一手順で binary だけ差し替えた A/B（before = 導入済み release v0.5.13）。
+  器なし **FAIL → OK** / `TAKO_PSMUX_BIN` のみ **FAIL → OK** / 器あり OK → OK（回帰なし）。
+  MCP と CLI は全構成で同じ session_id を返し、resume も両経路が同一コマンドで新ペインを立てた
+- 検証環境の落とし穴 3 件を Issue に記録（psmux ペイン内から検証すると `PSMUX_SESSION` 継承で
+  器が作れずアプリ即終了 / `CLAUDE_CODE_CHILD_SESSION` 継承で transcript が切れる /
+  `TAKO_ORCHESTRATOR_DIR` を空で隔離すると accounts.yaml が無く既定 config dir しか走査しない）
+- 器ありの resume 起動コマンドの取りこぼしは **before でも同一再現** = #640（OPEN）の担当範囲

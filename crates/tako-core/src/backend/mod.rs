@@ -317,6 +317,22 @@ pub trait SessionBackend: Send + Sync {
         Vec::new()
     }
 
+    /// 器の中の**全**ペインを `(ターゲット ID, pane_pid)` で列挙する（#728）。
+    ///
+    /// ID は `session:window.pane`。remote API のペイン ID 形式と一致させてあるので、
+    /// 呼び出し側は `:` の手前を切って器のセッション名としても使える。
+    ///
+    /// [`Self::pane_pids`] のセッション単位版に対して、こちらは**器の全体**を 1 回で返す。
+    /// 用途は「実プロセス → どのペインか」の逆引き（`claude agents --json` の pid から
+    /// 祖先を辿ってペインへ対応付ける経路。#44 / #592 / セッションカタログの #112）で、
+    /// セッション数ぶんサブプロセスを起こすと 2 秒ポーリングの経路が破綻する。
+    ///
+    /// 既定実装は空。**器を持つ実装は必ず上書きすること**（`pane_pids` と違い、
+    /// ここが空だと「器の中で動いている claude が 1 つも見えない」に化ける）
+    fn pane_pids_all(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+
     /// 器がそのペインを copy mode（履歴閲覧）に置いているか。
     /// **答えられない器は `None`**（呼び出し側は「分からない」として扱い、
     /// 器へ副作用のある操作をしない）。#686
@@ -736,6 +752,23 @@ pub(crate) fn parse_scroll_probe(output: &str) -> Option<ScrollProbe> {
     })
 }
 
+/// `list-panes -a -F "<id> #{pane_pid}"` の出力をパースする（純関数。#728）。
+///
+/// **`rsplit_once(' ')` で切る**のが要点。左側のセッション名に空白は入らない
+/// （[`SessionRef::new`] が拒否する）が、器が行頭へ警告を混ぜたときに
+/// 前から切ると ID を取り違える。pid にならない行・pid 0 は捨てる
+pub(crate) fn parse_pane_pids_all(output: &str) -> Vec<(String, u32)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, pid) = line.trim_end().rsplit_once(' ')?;
+            let pid: u32 = pid.trim().parse().ok()?;
+            let id = id.trim();
+            (pid != 0 && !id.is_empty()).then(|| (id.to_string(), pid))
+        })
+        .collect()
+}
+
 /// 現在時刻（unix epoch 秒）。器の実装が最終アクティビティの猶予判定に使う
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -763,6 +796,40 @@ mod tests {
         let ok = SessionRef::new("tako-0123456789ab").unwrap();
         assert_eq!(ok.as_str(), "tako-0123456789ab");
         assert_eq!(ok.to_string(), "tako-0123456789ab");
+    }
+
+    #[test]
+    fn 器の全ペイン列挙は末尾のpidで切る() {
+        // #728: tmux / psmux が実際に返す形（実機の psmux 出力から採った）
+        let out = "tako-1f3c0f0d9f5f:0.0 3340\ntako-2159422b104f:0.0 21236\n";
+        assert_eq!(
+            parse_pane_pids_all(out),
+            vec![
+                ("tako-1f3c0f0d9f5f:0.0".to_string(), 3340),
+                ("tako-2159422b104f:0.0".to_string(), 21236),
+            ]
+        );
+        // 器が行頭へ警告を混ぜても、**末尾**の pid で切るので ID を取り違えない
+        assert_eq!(
+            parse_pane_pids_all("warning: something tako-a:0.0 42\n"),
+            vec![("warning: something tako-a:0.0".to_string(), 42)]
+        );
+        // pid にならない行・pid 0・空行・ID 欠落は捨てる
+        assert!(parse_pane_pids_all("no server running\n").is_empty());
+        assert!(parse_pane_pids_all("tako-a:0.0 0\n").is_empty());
+        assert!(parse_pane_pids_all("\n \n").is_empty());
+        assert!(parse_pane_pids_all("").is_empty());
+        // CRLF（Windows の器）でも pid が壊れない
+        assert_eq!(
+            parse_pane_pids_all("tako-a:0.0 7\r\n"),
+            vec![("tako-a:0.0".to_string(), 7)]
+        );
+    }
+
+    #[test]
+    fn 器を持たない実装は全ペイン列挙も空を返す() {
+        // 既定実装の契約: 器が無いなら「器の中のペイン」は 0 件
+        assert!(NullBackend.pane_pids_all().is_empty());
     }
 
     fn tmux_bin() -> Binary {

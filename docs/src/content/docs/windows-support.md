@@ -23,9 +23,9 @@ tako platform --status pending # 未対応のものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | ---: | --- |
-| 対応済み | 99 | macOS 版と同じように使えます |
+| 対応済み | 100 | macOS 版と同じように使えます |
 | 一部対応 | 10 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 19 | まだ実装されていません（追跡 Issue つき） |
+| 未対応 | 18 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
 | **合計** | **129** | |
 
@@ -119,7 +119,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
 | `tako_persist` | 一部対応 | psmux（tmux 互換の永続化バックエンド）を導入すると実行中プロセスと画面ごと復元する。未導入ならタブ・ペイン構成と cwd のみ復元し、実行中プロセスは tako の終了時に停止する |
-| `tako_sessions` | 未対応 | tmux バックエンドに依存。Windows の永続化戦略の決定が前提 <br />追跡: [#519](https://github.com/takushio2525/tako/issues/519) |
+| `tako_sessions` | 対応済み | — |
 | `tako_tmux_list` | 未対応 | tmux サーバーそのものを操作する機能。Windows に tmux は無い <br />追跡: [#519](https://github.com/takushio2525/tako/issues/519) |
 | `tako_tmux_open` | 未対応 | tmux サーバーそのものを操作する機能。Windows に tmux は無い <br />追跡: [#519](https://github.com/takushio2525/tako/issues/519) |
 | `tako_tmux_kill` | 未対応 | tmux サーバーそのものを操作する機能。Windows に tmux は無い <br />追跡: [#519](https://github.com/takushio2525/tako/issues/519) |
