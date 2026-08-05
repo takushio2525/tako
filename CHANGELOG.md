@@ -8,6 +8,13 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.7] - 2026-08-06
+
+Nightly patch release (automated). Changes since v0.6.6:
+夜間パッチリリース（自動）。v0.6.6 以降の変更:
+
+- [修正] handoff の後任 master が worker 設定で起動し default プロファイル扱いになる問題を根治 (#761) (#767)
+
 ## [0.6.6] - 2026-08-05
 
 Nightly patch release (automated). Changes since v0.6.5:
