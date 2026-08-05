@@ -40,13 +40,59 @@ pub fn parse_ctx_threshold(v: u32) -> Result<u32, String> {
     }
 }
 
+/// プロファイル名を省略したときの既定プロファイル
+pub const DEFAULT_PROFILE: &str = "default";
+
 /// role 文字列から master のプロファイル名を取り出す。
 /// `orchestrator-master` → `"default"` / `orchestrator-master:<name>` → `"<name>"`。
 /// worker / solo / それ以外は None（自動ハンドオフの対象は master だけ）
 pub fn master_profile_of_role(role: &str) -> Option<&str> {
     let rest = role.strip_prefix("orchestrator-master")?;
     if rest.is_empty() {
-        Some("default")
+        Some(DEFAULT_PROFILE)
+    } else {
+        rest.strip_prefix(':').filter(|s| !s.is_empty())
+    }
+}
+
+/// master の **表示用 role**（ペインの role ラベル）を組み立てる。
+/// `default` / 空 → `orchestrator-master`、それ以外 → `orchestrator-master:<profile>`。
+///
+/// master の role には**語彙が 2 つある**（表示用とこの下の env 用）。混ぜると
+/// `TAKO_ORCHESTRATOR_ROLE=orchestrator-master:<profile>` のような値が生まれ、
+/// 受け手の `master:` 前置き解決が全部外れて default プロファイル扱いになる（#761）。
+/// 生成をこの 2 関数に閉じることで、その取り違えを構造的に防ぐ
+pub fn master_pane_role(profile: &str) -> String {
+    if profile.is_empty() || profile == DEFAULT_PROFILE {
+        "orchestrator-master".to_string()
+    } else {
+        format!("orchestrator-master:{profile}")
+    }
+}
+
+/// master の **env 用 role**（`TAKO_ORCHESTRATOR_ROLE` に入れる値）を組み立てる。
+/// `default` / 空 → `master`、それ以外 → `master:<profile>`（CLI の `tako master` と同一）
+pub fn master_role_env(profile: &str) -> String {
+    if profile.is_empty() || profile == DEFAULT_PROFILE {
+        "master".to_string()
+    } else {
+        format!("master:{profile}")
+    }
+}
+
+/// 表示用 role（`orchestrator-master[:<name>]`）と env 用 role（`master[:<name>]`）の
+/// **どちらからでも** master のプロファイル名を取り出す。
+/// master 以外（solo / worker / role なし）は None。
+///
+/// caller_role には env 由来（MCP / CLI）とペインの role ラベル由来（`tako_stale_binary
+/// restart` 等の内部呼び出し）の両方が流れ込むため、受け側は両方を解けるようにする
+pub fn master_profile_of_any_role(role: &str) -> Option<&str> {
+    if let Some(profile) = master_profile_of_role(role) {
+        return Some(profile);
+    }
+    let rest = role.strip_prefix("master")?;
+    if rest.is_empty() {
+        Some(DEFAULT_PROFILE)
     } else {
         rest.strip_prefix(':').filter(|s| !s.is_empty())
     }
@@ -460,5 +506,45 @@ mod tests {
         // 似た接頭辞に引っかからない
         assert_eq!(master_profile_of_role("orchestrator-master-old"), None);
         assert_eq!(master_profile_of_role("orchestrator-master:"), None);
+    }
+
+    /// #761: 表示用 role と env 用 role を取り違えないための生成側の契約。
+    /// env に表示用文字列（`orchestrator-master:<profile>`）が入ると、受け手の
+    /// `master:` 前置き解決が外れて default 扱いになる
+    #[test]
+    fn masterのroleは表示用とenv用で別の語彙になる() {
+        assert_eq!(master_pane_role("default"), "orchestrator-master");
+        assert_eq!(master_pane_role(""), "orchestrator-master");
+        assert_eq!(master_pane_role("takodev"), "orchestrator-master:takodev");
+
+        assert_eq!(master_role_env("default"), "master");
+        assert_eq!(master_role_env(""), "master");
+        assert_eq!(master_role_env("takodev"), "master:takodev");
+
+        // env 用の値が表示用の語彙になっていない（#761 の回帰そのもの）
+        assert!(!master_role_env("takodev").starts_with("orchestrator-"));
+    }
+
+    /// 生成した role は**どちらの語彙でも**元のプロファイル名に戻る（往復）
+    #[test]
+    fn どちらの語彙のroleからもプロファイル名に戻る() {
+        for profile in ["default", "takodev", "sol"] {
+            assert_eq!(
+                master_profile_of_any_role(&master_pane_role(profile)),
+                Some(profile),
+                "表示用 role の往復: {profile}"
+            );
+            assert_eq!(
+                master_profile_of_any_role(&master_role_env(profile)),
+                Some(profile),
+                "env 用 role の往復: {profile}"
+            );
+        }
+        // master 以外・空 suffix・似た接頭辞
+        assert_eq!(master_profile_of_any_role("master:"), None);
+        assert_eq!(master_profile_of_any_role("solo:docs"), None);
+        assert_eq!(master_profile_of_any_role("worker:tako"), None);
+        assert_eq!(master_profile_of_any_role("master-old"), None);
+        assert_eq!(master_profile_of_any_role(""), None);
     }
 }
