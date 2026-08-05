@@ -414,7 +414,11 @@ master のコンテキストが埋まると判断が劣化する。tako は `/co
 2. master が引き継ぎファイル（`<data_dir>/orchestrator/handoff/<プロファイル>.md`）を
    今の状況で上書きし、`tako_orchestrator_handoff` を呼ぶ
 3. 後任 master が同じタブ・同じ role・同じプロファイルで立ち上がり、引き継ぎファイルと
-   実態（`tako_orchestrator_workers` / `tako_list_panes`）を突き合わせて「引き継ぎ完了」を報告する
+   実態（`tako_orchestrator_workers` / `tako_list_panes`）を突き合わせて「引き継ぎ完了」を報告する。
+   **起動は `tako master -<プロファイル>` と同一経路**なので、モデル・effort・アカウント・
+   master system prompt はプロファイルの master 設定がそのまま効く（worker 用の
+   `worker_agents` は使わない）。`TAKO_ORCHESTRATOR_ROLE` も CLI と同じ `master:<プロファイル>`
+   形式で入るので、後任の `tako orchestrator self` は自分のプロファイルを正しく返す（#761）
 4. 後任が前任ペインの入力欄を確認（ユーザーの未送達の指示が残っていないか）してから
    前任ペインを閉じる
 

@@ -37398,6 +37398,234 @@ mod self_test {
                 });
             }
 
+            // 102. handoff 後任 master の起動パラメータ（#761）。
+            // 実地の初ハンドオフで後任が **worker 用モデル** で起動し、
+            // TAKO_ORCHESTRATOR_ROLE に**表示用**の role 文字列が入って以後 default
+            // プロファイル扱いになった。実 dispatch が積む起動コマンドそのものを読み、
+            // そこから取り出した role env で self を引いて、プロファイルが後任へ
+            // 引き継がれることまで通しで測る（実 claude は要らない）
+            {
+                use tako_control::protocol::Request as Req;
+                let probe = "_st761_";
+                let master_model = "claude-fable-5-st761master";
+                let worker_model = "claude-opus-4-6-st761worker";
+
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let profiles_req = |action: &str, with_models: bool| Req::OrchestratorProfiles {
+                    action: action.into(),
+                    name: Some(probe.into()),
+                    kind: Some("master".into()),
+                    from: None,
+                    projects: None,
+                    clear_projects: false,
+                    master_agent: None,
+                    clear_master_agent: false,
+                    // master 側: profile.model / profile.effort
+                    model: with_models.then(|| master_model.to_string()),
+                    worker_model: None,
+                    effort: with_models.then(|| "xhigh".to_string()),
+                    worker_effort: None,
+                    clear_model: false,
+                    clear_worker_model: false,
+                    worker_agent: None,
+                    clear_worker_agent: false,
+                    // worker 側: worker_agents.claude（後任がこちらで立ったら回帰）
+                    agent: with_models.then(|| "claude".to_string()),
+                    agent_model: with_models.then(|| worker_model.to_string()),
+                    clear_agent_model: false,
+                    agent_effort: with_models.then(|| "high".to_string()),
+                    clear_agent_effort: false,
+                    agent_skip_permissions: None,
+                    agent_args: None,
+                    worker_model_policy: None,
+                    tab_naming_convention: None,
+                    env_set: None,
+                    env_unset: None,
+                    master_account: None,
+                    clear_master_account: false,
+                    worker_account: None,
+                    clear_worker_account: false,
+                    ctx_threshold: None,
+                    clear_ctx_threshold: false,
+                    auto_handoff: None,
+                    clear_auto_handoff: false,
+                };
+                if fire(profiles_req("set", true), cx).is_none() {
+                    fail("#761: 検証用プロファイルを作れない");
+                }
+                let handoff_path = tako_control::orchestrator::handoff_path(probe);
+                if let Some(ref path) = handoff_path {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(path, "## 状態\nselftest 761\n");
+                }
+
+                // 前任 master ペイン（role だけ立てる。中身は素のシェルでよい）
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#761: 基準ペインの取得")
+                };
+                let prev = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            Req::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw)
+                    })
+                    .ok()
+                    .flatten();
+                let Some(prev) = prev else {
+                    fail("#761: 前任ペインの作成")
+                };
+                let _ = window.update(cx, |app, _, _| {
+                    if let Some(obj) = app.workspace.active_tab_mut().tree_mut().get_mut(prev) {
+                        obj.set_role(Some(format!("orchestrator-master:{probe}")));
+                    }
+                });
+
+                let handoff = fire(
+                    Req::OrchestratorHandoff {
+                        pane: Some(prev.as_u64()),
+                        caller_role: Some(format!("master:{probe}")),
+                        tab: None,
+                        caller_pid: None,
+                    },
+                    cx,
+                );
+                let Some(handoff) = handoff else {
+                    fail("#761: handoff が失敗した")
+                };
+                if handoff["profile"].as_str() != Some(probe) {
+                    fail(&format!("#761: handoff の profile が違う: {handoff}"));
+                }
+                let Some(successor) = handoff["new_master_pane_id"].as_u64().map(PaneId::from_raw)
+                else {
+                    fail("#761: 後任のペイン ID が取れない")
+                };
+
+                // 積まれた起動コマンドを取り出す（**実行はしない**。claude を起動しないよう
+                // pending_attach も破棄する。この項目が見たいのはコマンドの中身だけ）
+                let cmd = window
+                    .update(cx, |app, _, _| {
+                        let _ = std::mem::take(&mut app.pending_attach);
+                        std::mem::take(&mut app.pending_writes)
+                            .into_iter()
+                            .find(|(p, _)| *p == successor)
+                            .map(|(_, data)| String::from_utf8_lossy(&data).to_string())
+                    })
+                    .ok()
+                    .flatten();
+                let Some(cmd) = cmd else {
+                    fail("#761: 後任の起動コマンドが積まれていない")
+                };
+                // 実際に積まれたコマンドを出す（この項目が走った証跡 + 実測ログ）。
+                // 絶対パスはファイル名だけに切り詰める（診断出力にホームパスを出さない）
+                let printable = cmd
+                    .split(' ')
+                    .map(|t| {
+                        let unquoted = t.trim_matches('\'');
+                        match unquoted.starts_with('/') {
+                            true => format!("<path>/{}", unquoted.rsplit('/').next().unwrap_or("")),
+                            false => t.to_string(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("TAKO_SELF_TEST_761_CMD: {printable}");
+                check(
+                    cmd.contains(&format!("--model '{master_model}'"))
+                        && cmd.contains("--effort xhigh")
+                        && !cmd.contains(worker_model),
+                    "102: handoff 後任が master のモデル / effort で起動する (#761)",
+                );
+                check(
+                    cmd.contains("--append-system-prompt-file ")
+                        && cmd.contains(&format!("_system_prompt_{probe}.md")),
+                    "102: handoff 後任に master の system prompt が付く (#761)",
+                );
+
+                // 起動コマンドが注入する TAKO_ORCHESTRATOR_ROLE をコマンド文字列から取り出す
+                let role_env = cmd
+                    .split("TAKO_ORCHESTRATOR_ROLE='")
+                    .nth(1)
+                    .and_then(|rest| rest.split('\'').next())
+                    .unwrap_or("")
+                    .to_string();
+                check(
+                    role_env == format!("master:{probe}"),
+                    "102: handoff 後任の TAKO_ORCHESTRATOR_ROLE が master:<profile> 形式 (#761)",
+                );
+
+                // その env をそのまま caller_role にして self を引く = 後任がたどる経路
+                let self_result = fire(
+                    Req::OrchestratorSelf {
+                        pane: Some(successor.as_u64()),
+                        caller_role: Some(role_env),
+                        caller_pid: None,
+                    },
+                    cx,
+                );
+                let profile_ok = self_result
+                    .as_ref()
+                    .is_some_and(|v| v["profile"].as_str() == Some(probe));
+                let path_ok = self_result.as_ref().is_some_and(|v| {
+                    v["handoff_path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with(&format!("{probe}.md")))
+                });
+                println!(
+                    "TAKO_SELF_TEST_761_SELF: profile={:?} handoff_path={:?}",
+                    self_result.as_ref().and_then(|v| v["profile"].as_str()),
+                    self_result
+                        .as_ref()
+                        .and_then(|v| v["handoff_path"].as_str())
+                        .and_then(|p| p.rsplit('/').next())
+                );
+                check(
+                    profile_ok && path_ok,
+                    "102: 後任の orchestrator self がプロファイルと handoff_path を引き継ぐ (#761)",
+                );
+
+                // 後片付け（プロファイル・handoff ファイル・検証用ペイン）
+                fire(profiles_req("delete", false), cx);
+                if let Some(ref path) = handoff_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                if let Some(dir) = tako_control::orchestrator::config_dir() {
+                    let _ = std::fs::remove_file(dir.join(format!("_system_prompt_{probe}.md")));
+                }
+                for pane in [successor, prev] {
+                    fire(
+                        Req::Close {
+                            pane: Some(pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        cx,
+                    );
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);

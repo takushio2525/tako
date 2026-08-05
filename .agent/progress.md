@@ -1727,3 +1727,15 @@
 - Issue に棚卸し・計画を記録し、PR #752 で完全カタログスナップショットを先行導入。
 - #748 / #749 merge 後、MCP を catalog / request / HTTP / tests / facade へ挙動不変で分割開始。
 - 完全スナップショット diff ゼロ、全品質ゲート緑、隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK`）。
+
+## 2026-08-05（#761: handoff 後任 master が worker 設定で起動し default 扱いになる問題）
+- 後任の起動を CLI `tako master -<profile>` と同一経路（`build_master_cmd`）へ寄せ、
+  `TAKO_ORCHESTRATOR_ROLE` を env 用語彙（`master:<p>`）に是正。role 生成は
+  `tako_core::handoff` の `master_pane_role` / `master_role_env` に一本化し、
+  受け側は `master_profile_of_any_role` で表示用 / env 用どちらの語彙も解けるようにした
+- 副産物: 後任に master system prompt が一切付いていなかった（worker 用コマンド構築の
+  ため）のも同時に解消。組み立てをペイン分割の前へ移し失敗時に空ペインを残さない
+- 検証: 隔離アプリ + 偽 claude の実経路 e2e で before/after 実測（before は
+  worker model / `orchestrator-master:st761` / prompt 無し / self が profile=default、
+  after は master model / `master:st761` / marker-found / profile=st761）+
+  単体 5 本 + セルフテスト項目 102 新設（各バグを戻すと FAILED を実測）

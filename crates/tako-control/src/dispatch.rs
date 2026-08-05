@@ -5884,14 +5884,12 @@ fn dispatch_orchestrator_handoff(
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
-    let role_suffix = caller_role
-        .and_then(|r| r.strip_prefix("master:"))
-        .map(str::to_string);
-
-    let profile_name = role_suffix
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("default");
+    // caller_role は env 由来（`master:<profile>`。MCP / CLI）とペインの role ラベル由来
+    // （`orchestrator-master:<profile>`。stale binary restart などの内部呼び出し）の
+    // 両方が流れ込む。どちらでもプロファイルへ解決する（#761）
+    let profile_name = caller_role
+        .and_then(tako_core::handoff::master_profile_of_any_role)
+        .unwrap_or(tako_core::handoff::DEFAULT_PROFILE);
 
     // handoff ファイルの存在確認
     let handoff_content = orchestrator::read_handoff(profile_name)
@@ -5939,14 +5937,30 @@ fn dispatch_orchestrator_handoff(
     let master_agent = profile
         .resolve_master_agent()
         .map_err(DispatchError::InvalidParams)?;
-    let launch = profile.resolve_agent_launch(master_agent, None, None);
 
-    // 新 master の role
-    let new_role = if profile_name == "default" {
-        "orchestrator-master".to_string()
-    } else {
-        format!("orchestrator-master:{profile_name}")
-    };
+    // #761: role には語彙が 2 つある。ペインに貼る表示用ラベルと、起動コマンドが注入する
+    // `TAKO_ORCHESTRATOR_ROLE`（`master:<profile>`）。以前は表示用を env にも入れていたため、
+    // 後任の caller_role が解決できず self / handoff / profiles がすべて default に落ちていた
+    let new_role = tako_core::handoff::master_pane_role(profile_name);
+    let role_env = tako_core::handoff::master_role_env(profile_name);
+
+    // #761: master の起動コマンドは CLI の `tako master -<profile>` と**同一経路**で作る。
+    // worker 用の `resolve_agent_launch`（worker_agents.<agent> を見る）を使っていたため、
+    // 後任が worker 用モデルで起動し、master system prompt も付いていなかった
+    let prompt_content = profile.build_system_prompt(profile_name);
+    let prompt_path = orchestrator::config_dir()
+        .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?
+        .join(format!("_system_prompt_{profile_name}.md"));
+    if let Some(parent) = prompt_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| op_err(format!("system prompt の保存先を作れない: {e}")))?;
+    }
+    std::fs::write(&prompt_path, &prompt_content)
+        .map_err(|e| op_err(format!("system prompt の書き出しに失敗: {e}")))?;
+    let tako_bin = resolve_tako_binary();
+    // ペインを分割する**前**に組み立てる（失敗したときに空ペインだけ残さない）
+    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
+        .map_err(DispatchError::Operation)?;
 
     // cwd はホームディレクトリ
     let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
@@ -5967,17 +5981,6 @@ fn dispatch_orchestrator_handoff(
         env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
-
-    // master エージェント CLI コマンドを構築して送信
-    let master_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
-        agent: master_agent,
-        role: &new_role,
-        model: launch.model.as_deref(),
-        effort: launch.effort.as_deref(),
-        skip_permissions: master_agent.default_skip_permissions(),
-        extra_args: &launch.extra_args,
-        env: &profile_env,
-    });
 
     // 事前信頼。claude は config dir 配下の .claude.json を読むので、アカウント指定で
     // CLAUDE_CONFIG_DIR を注入する場合はその config dir へ書く（#558）
@@ -8841,6 +8844,8 @@ mod tests {
         clipboard: Vec<String>,
         /// #749: 積まれたプロンプト送達フロー（後任 master への初期プロンプト検証用）
         prompt_flows: Vec<(PaneId, String)>,
+        /// #761: 積まれた遅延書き込み（= 後任 master の起動コマンド）の検証用
+        writes: Vec<(PaneId, String)>,
     }
 
     impl MockHost {
@@ -8879,6 +8884,7 @@ mod tests {
                 command_cards: tako_core::CommandCards::new(),
                 clipboard: Vec::new(),
                 prompt_flows: Vec::new(),
+                writes: Vec::new(),
             }
         }
 
@@ -8918,6 +8924,10 @@ mod tests {
         }
         fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
             self.prompt_flows.push((pane, prompt));
+        }
+        fn queue_write(&mut self, pane: PaneId, data: Vec<u8>) {
+            self.writes
+                .push((pane, String::from_utf8_lossy(&data).to_string()));
         }
         fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
             self.detached.push(pane.as_u64());
@@ -13001,6 +13011,234 @@ mod tests {
                 .map(|(_, text)| text.clone())
                 .unwrap();
             assert!(!prompt.contains("tako_close_pane"), "{prompt}");
+        });
+    }
+
+    // --- #761: 後任 master の起動パラメータ（モデル / effort / role env）---
+
+    /// takodev で実際に起きた構成を最小再現したプロファイル:
+    /// master は fable / xhigh、worker は opus[1m] / high。後任がどちらで立つかを測る
+    fn save_761_profile(name: &str) {
+        use crate::orchestrator::{AgentWorkerConfig, Profile};
+        let mut p = Profile {
+            model: Some("claude-fable-5-761master".into()),
+            effort: "xhigh".into(),
+            ..Default::default()
+        };
+        p.worker_agents.insert(
+            "claude".into(),
+            AgentWorkerConfig {
+                model: Some("claude-opus-4-6-761worker[1m]".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        );
+        p.save(name).expect("プロファイルの保存");
+    }
+
+    /// 後任へ積まれた起動コマンド（queue_write の 1 本目）を取り出す
+    fn successor_launch_cmd(host: &MockHost, new_pane: u64) -> String {
+        host.writes
+            .iter()
+            .find(|(p, _)| p.as_u64() == new_pane)
+            .map(|(_, cmd)| cmd.clone())
+            .expect("後任ペインへ起動コマンドが積まれる")
+    }
+
+    #[test]
+    fn handoffの後任はmaster用のモデルとeffortで起動する() {
+        let profile = "_tako_761_model_";
+        with_handoff_file(profile, "state", || {
+            save_761_profile(profile);
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
+            let cmd = successor_launch_cmd(&host, new_pane);
+
+            // master は profile.model / profile.effort で起動する（CLI の tako master と同じ）
+            assert!(
+                cmd.contains("--model 'claude-fable-5-761master'"),
+                "master のモデルで起動していない: {cmd}"
+            );
+            assert!(cmd.contains("--effort xhigh"), "{cmd}");
+            // worker 用の解決（worker_agents.claude）が混ざらない = #761 バグ 1 の回帰検査
+            assert!(
+                !cmd.contains("761worker"),
+                "worker 用モデルで起動している: {cmd}"
+            );
+            assert!(!cmd.contains("--effort high"), "{cmd}");
+            // master system prompt が付く（worker 用コマンド構築では付いていなかった）
+            assert!(
+                cmd.contains("--append-system-prompt-file '"),
+                "master の system prompt が付いていない: {cmd}"
+            );
+            assert!(
+                cmd.contains(&format!("_system_prompt_{profile}.md")),
+                "{cmd}"
+            );
+
+            let _ = std::fs::remove_file(
+                crate::orchestrator::profiles_dir()
+                    .expect("override 済み")
+                    .join(format!("{profile}.yaml")),
+            );
+        });
+    }
+
+    #[test]
+    fn handoffの後任のrole_envはmaster形式でselfが同じプロファイルを返す() {
+        let profile = "_tako_761_role_";
+        with_handoff_file(profile, "state", || {
+            save_761_profile(profile);
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
+            let cmd = successor_launch_cmd(&host, new_pane);
+
+            // 起動コマンドが注入する TAKO_ORCHESTRATOR_ROLE を**コマンド文字列から取り出す**
+            let role_env = cmd
+                .split("TAKO_ORCHESTRATOR_ROLE='")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("role env が注入されている")
+                .to_string();
+            assert_eq!(
+                role_env,
+                format!("master:{profile}"),
+                "env 用 role は master:<profile> 形式（#761 バグ 2）: {cmd}"
+            );
+            // 表示用ラベルは従来どおり orchestrator-master:<profile>（両者を混ぜない）
+            assert_eq!(
+                result["role"].as_str(),
+                Some(format!("orchestrator-master:{profile}").as_str())
+            );
+
+            // その env をそのまま caller_role にして self を引く = 後任が実際にたどる経路
+            let self_result = dispatch(
+                &mut host,
+                Request::OrchestratorSelf {
+                    pane: Some(new_pane),
+                    caller_role: Some(role_env),
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("後任の self は成功する");
+            assert_eq!(
+                self_result["profile"].as_str(),
+                Some(profile),
+                "後任の self が default に落ちている: {self_result}"
+            );
+            assert!(
+                self_result["handoff_path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with(&format!("{profile}.md"))),
+                "handoff_path が引き継がれていない: {self_result}"
+            );
+            assert_eq!(self_result["pane_id"].as_u64(), Some(new_pane));
+
+            let _ = std::fs::remove_file(
+                crate::orchestrator::profiles_dir()
+                    .expect("override 済み")
+                    .join(format!("{profile}.yaml")),
+            );
+        });
+    }
+
+    /// #547 の規則（master_account が master の CLAUDE_CONFIG_DIR を決める）が
+    /// 起動経路の差し替え後も維持されていること
+    #[test]
+    fn handoffの後任はmaster_accountを反映する() {
+        let profile = "_tako_761_acct_";
+        with_handoff_file(profile, "state", || {
+            use crate::orchestrator::{AccountEntry, AccountsConfig, Profile};
+            let mut accounts = AccountsConfig::load().unwrap_or(AccountsConfig {
+                accounts: Default::default(),
+            });
+            accounts.accounts.insert(
+                "_tako_761_univ_".into(),
+                AccountEntry {
+                    config_dir: Some("/tmp/_tako_761_cfg_".into()),
+                    ..Default::default()
+                },
+            );
+            accounts.save().expect("accounts.yaml の保存");
+            let p = Profile {
+                master_account: Some("_tako_761_univ_".into()),
+                ..Default::default()
+            };
+            p.save(profile).expect("プロファイルの保存");
+
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
+            let cmd = successor_launch_cmd(&host, new_pane);
+            assert!(
+                cmd.contains("export CLAUDE_CONFIG_DIR=/tmp/_tako_761_cfg_"),
+                "master_account の config dir が反映されていない: {cmd}"
+            );
+
+            // 後始末。**一時ディレクトリ配下であることを確認してから**消す
+            let dir = crate::orchestrator::config_dir().expect("override 済み");
+            assert!(
+                dir.starts_with(std::env::temp_dir()),
+                "テストの config_dir が一時ディレクトリ配下でない: {}",
+                dir.display()
+            );
+            let _ = std::fs::remove_file(dir.join("accounts.yaml"));
+            let _ = std::fs::remove_file(dir.join("profiles").join(format!("{profile}.yaml")));
+        });
+    }
+
+    /// caller_role にペインの role ラベル（表示用）が来る内部呼び出し
+    /// （`tako_stale_binary restart` の master 経路）でも default に落ちない
+    #[test]
+    fn handoffは表示用roleのcaller_roleでもプロファイルを解決する() {
+        let profile = "_tako_761_disp_";
+        with_handoff_file(profile, "state", || {
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("orchestrator-master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            assert_eq!(result["profile"].as_str(), Some(profile), "{result}");
         });
     }
 
