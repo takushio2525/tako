@@ -4,28 +4,42 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-08-01・Windows 実機 — #709 完了）
+## 現在の対象（2026-08-05・Windows 実機 — #728 完了）
 
-**#709 マージ済み**（PR #712 → `47a524f`）。claude ログインアカウントの切替を
-`tako account`（list / add / remove / show / login / use）へ 1 本化した。
+**#728**（`tako sessions` の Windows 対応）。マトリクスの `Pending` は棚卸しで嘘と判明
+（psmux 導入済みなら既に動いていた）。実装本体は**器なし構成**（psmux 未導入）で
+セッションカタログが永久に空だった欠落の修正。
 
-- MCP は新ツールを増やさず `tako_orchestrator_accounts` に action を足して 1:1（129 ツールのまま）
-- 前提として **main のアカウントモデル #512 / #543 を先に移植**した（`config_dir: Option<String>`
-  + `inherit` + `AccountConfigDir` + `EnvPlan`）。claude は `CLAUDE_CONFIG_DIR` が**設定されて
-  いるだけで**資格情報エントリを分けるので、「既定の資格情報を使う」は既定パスの明示ではなく
-  **未設定**でしか表現できない。`inherit` は起動コマンドで明示 unset を出す
-- ログイン状態は 3 値（`missing` / `logged_out` / `logged_in`）+ 壊れたエントリの `invalid`
-- GUI は ⌘K パレットの「claude アカウントを切り替え」（default プロファイルの master へ割り当て）
+- 突き合わせキーを「器があればセッション名 / 無ければペイン ID」の二段構えへ（#592 と同型）。
+  器なしの対応付けは `TerminalSession::child_pid` からの pid 祖先辿り。
+  キーの解釈は `PendingSpawn::matches` に集約（`tmux_session` の直接比較は禁止）
+- 器のペイン列挙は `SessionBackend::pane_pids_all()` 経由（`agents.rs` の `tmux_bin()`
+  直叩きだと `TAKO_PSMUX_BIN` のみの構成で検出が全滅する）
+- 復元は tako 自身のペイン生成 + `claude --resume` なので**器への送出は不要**
 
 ## 次の一手
 
-1. **稼働中 GUI は旧バイナリ**なので `tako account` はまだ使えない。次のインストーラー更新で反映
+1. **稼働中 GUI は旧バイナリ**なので #709 の `tako account` / #728 の器なし検出はまだ効かない。
+   次のインストーラー更新で反映
 2. **main とのアカウントモデル統合（マージ時の宿題）**: main には CLI
    `tako orchestrator accounts`（#548/#556）が別途あるので、両方の CLI パスを同じ dispatch へ
    向ける（ロジックは二重化しない）。master への account 適用も本ブランチ #653 と main #555 が
    独立実装で衝突する既知の債務
 3. **#623 の実機確認（未決）**: 日本語入力の打鍵消失は直った確証が無い。症状が出たら
    `TAKO_IME_DIAG=1 TAKO_PERF_LOG=<path>` で採取し #623 のコメント §5 で切り分ける
+4. **#640（OPEN）**: 器あり（psmux）の起動コマンド送達は今も取りこぼす。#728 の実測で
+   `sessions resume` の行が欠落・重複するのを再現（baseline でも同一）
+
+## Windows 実機で隔離検証するときの env 剥がし（#728 実測）
+
+psmux ペインの中から検証を回すと、以下を剥がさない限り**製品の不具合に見える偽陰性**が出る。
+
+- `PSMUX_SESSION` / `PSMUX_TARGET_SESSION` / `TMUX` / `TMUX_PANE` — 器が
+  「nested with care」で作れず、PTY 死亡判定でアプリが即終了する（`cargo test --test
+  psmux_backend` の 5 件もこれで落ちる）
+- `CLAUDE_CODE_CHILD_SESSION` 等 — 子 claude の transcript 保存が切れ `resumable` が常に false
+- `TAKO_ORCHESTRATOR_DIR` を空で隔離するときは **accounts.yaml をコピーする**
+  （`claude agents --json` の走査先が既定 config dir だけになる）
 
 ## mac 側 master への引き継ぎ（マージ後に要対応）
 

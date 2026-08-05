@@ -7,12 +7,22 @@
 //! tako の worker は冒頭が全部同一テンプレのため見分けられない。
 //!
 //! 記録の流れ:
-//! 1. spawn / master / solo 起動時: session_id はまだ無いため、tmux バックエンド
-//!    セッション名をキーに **pending 記録**（project / label / prompt 由来の Issue 番号等）
-//!    を残す（spawn は dispatch 側、master / solo はペイン role からの解析で足りるため省略）
+//! 1. spawn / master / solo 起動時: session_id はまだ無いため **pending 記録**
+//!    （project / label / prompt 由来の Issue 番号等）を残す（spawn は dispatch 側、
+//!    master / solo はペイン role からの解析で足りるため省略）
 //! 2. GUI の定期スキャン（`claude agents --json` × pid 祖先辿り）が session_id を
 //!    検出した時点で pending をエントリへ**昇格**し、ペインのメタ情報と統合する
 //! 3. `tako sessions list / show / resume` と MCP `tako_sessions` が参照する
+//!
+//! ## 突き合わせキー（#728）
+//!
+//! pending と検出結果を結ぶキーは**器（tmux / psmux）のセッション名**。
+//! ただし器の導入は任意なので（Windows の psmux・macOS の tmux はどちらも
+//! 「入れれば深く復元できる」もの）、器が無い構成では**ペイン ID** に倒す。
+//! 器が無いときペインのシェルは tako-app の直接の子なので、claude の対応付けは
+//! `TerminalSession::child_pid` からの pid 祖先辿りになる（`agents` の #592 経路）。
+//! カタログ本体・復元手順は器に一切依存しない（復元は tako 自身のペイン生成 +
+//! `claude --resume` であって、器への送出は要らない）
 //!
 //! ファイルは `<data_dir>/sessions.yaml`（`TAKO_SESSIONS_FILE` で上書き可。隔離検証用）。
 //! 書き込みは config_io（排他 flock + アトミック書き込み + 世代バックアップ。#169）。
@@ -46,7 +56,7 @@ pub struct SessionCatalog {
     /// session_id → エントリ
     #[serde(default)]
     pub entries: BTreeMap<String, SessionEntry>,
-    /// session_id 検出前の spawn 記録（tmux バックエンドセッション名がキー）
+    /// session_id 検出前の spawn 記録（キーは器のセッション名 / 器が無ければペイン ID。#728）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<PendingSpawn>,
 }
@@ -95,10 +105,16 @@ pub struct SessionEntry {
     pub last_seen_at: String,
 }
 
-/// spawn 時点の記録（session_id 検出前）。キーは tmux バックエンドセッション名
+/// spawn 時点の記録（session_id 検出前）。
+///
+/// 突き合わせキーは**器のセッション名、器が無ければペイン ID**（#728）。
+/// psmux / tmux が無い構成（Windows の既定・tmux 不在の macOS）では器の名前が
+/// 付かないので `tmux_session` は `None` になる。キーの解釈は
+/// [`PendingSpawn::matches`] に一本化してあり、直接比較してはいけない
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PendingSpawn {
-    pub tmux_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +139,25 @@ pub struct PendingSpawn {
     pub pane: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub recorded_at: String,
+}
+
+impl PendingSpawn {
+    /// 検出結果との突き合わせ（#728）。
+    ///
+    /// 器があるときは**セッション名だけ**で見る（ペイン ID は tako 再起動をまたいで
+    /// 振り直されるので、器の名前の方が強い同一性を持つ）。器が無いときだけ
+    /// ペイン ID で見る。**両方 None のエントリは何にも一致しない**
+    /// （キーの無い記録が最初の検出を横取りするのを防ぐ）
+    pub fn matches(&self, session: Option<&str>, pane: Option<u64>) -> bool {
+        match (self.tmux_session.as_deref(), session) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => match (self.pane, pane) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => false,
+            },
+        }
+    }
 }
 
 impl SessionCatalog {
@@ -197,9 +232,12 @@ impl SessionCatalog {
 /// （カタログの失敗で spawn を止めない）
 pub fn record_spawn(record: PendingSpawn) -> Result<(), String> {
     SessionCatalog::mutate(|catalog| {
+        // 同じキー（器のセッション名 / 器が無ければペイン ID）の記録だけを置き換える。
+        // 単純な `tmux_session` 比較だと、器なし（どちらも None）の記録が
+        // 互いを消し合って最後の 1 件しか残らない（#728）
         catalog
             .pending
-            .retain(|p| p.tmux_session != record.tmux_session);
+            .retain(|p| !p.matches(record.tmux_session.as_deref(), record.pane));
         catalog.pending.push(record);
     })
 }
@@ -208,8 +246,10 @@ pub fn record_spawn(record: PendingSpawn) -> Result<(), String> {
 #[derive(Debug, Clone)]
 pub struct DetectedSession {
     pub session_id: String,
-    /// tmux バックエンドセッション名（pending / ペインとの対応キー）
-    pub tmux_session: String,
+    /// 器のセッション名（pending / ペインとの対応キー）。器が無ければ `None`（#728）
+    pub tmux_session: Option<String>,
+    /// tako のペイン ID。器が無いペインはこれが唯一の対応キーになる（#728）
+    pub pane: Option<u64>,
     /// claude agents --json の cwd（resume の起動ディレクトリとして最優先）
     pub agent_cwd: Option<String>,
     pub model: Option<String>,
@@ -220,7 +260,9 @@ pub struct DetectedSession {
 pub struct PaneMetaSnapshot {
     pub pane: u64,
     pub tab: u64,
-    pub tmux_session: String,
+    /// 器のセッション名。器を持たないペインは `None`（#728。この場合の対応付けは
+    /// 検出側が PTY 直下の子 pid で解決済みなので、ここには pid を持たない）
+    pub tmux_session: Option<String>,
     pub role: Option<String>,
     pub title: Option<String>,
     pub cwd: Option<String>,
@@ -228,23 +270,36 @@ pub struct PaneMetaSnapshot {
     pub log_file: Option<String>,
 }
 
-/// `agents::list_agents_with_panes` の結果（`{"agents": [...]}`）から検出リストを作る。
-/// pane 対応（`session:window.pane`）と有効な session_id を持つエントリだけを拾う
+/// `agents::list_agents_for_scan` の結果（`{"agents": [...]}`）から検出リストを作る。
+///
+/// 対応キーは 2 系統（#728）:
+/// - `pane` = 器のターゲット ID（`session:window.pane`）→ セッション名を取る
+/// - `tako_pane` = tako のペイン ID → 器を持たないペインの対応キー
+///
+/// どちらも無い（= どのペインにも紐付かない）エージェントと、
+/// 不正な session_id は捨てる
 pub fn detect_from_agents_value(value: &Value) -> Vec<DetectedSession> {
     value["agents"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|agent| {
-            let pane = agent["pane"].as_str()?;
-            let backend = pane.split_once(':')?.0;
+            let tmux_session = agent["pane"]
+                .as_str()
+                .and_then(|pane| pane.split_once(':'))
+                .map(|(backend, _)| backend.to_string());
+            let pane = agent["tako_pane"].as_u64();
+            if tmux_session.is_none() && pane.is_none() {
+                return None;
+            }
             let session_id = agent["session_id"].as_str()?;
             if !crate::transcript::is_valid_session_id(session_id) {
                 return None;
             }
             Some(DetectedSession {
                 session_id: session_id.to_string(),
-                tmux_session: backend.to_string(),
+                tmux_session,
+                pane,
                 agent_cwd: agent["cwd"].as_str().map(str::to_string),
                 model: agent["model"].as_str().map(str::to_string),
             })
@@ -277,11 +332,17 @@ pub fn sync_detected_at(
             if !crate::transcript::is_valid_session_id(&d.session_id) {
                 continue;
             }
-            let pane_meta = panes.iter().find(|p| p.tmux_session == d.tmux_session);
+            // 対応付けは器のセッション名優先、器が無ければペイン ID（#728）
+            let pane_meta = panes
+                .iter()
+                .find(|p| match (&p.tmux_session, &d.tmux_session) {
+                    (Some(mine), Some(theirs)) => mine == theirs,
+                    _ => d.pane.is_some_and(|pane| p.pane == pane),
+                });
             let pending_idx = catalog
                 .pending
                 .iter()
-                .position(|p| p.tmux_session == d.tmux_session);
+                .position(|p| p.matches(d.tmux_session.as_deref(), d.pane));
             let pending = pending_idx.map(|i| catalog.pending.remove(i));
 
             let entry = catalog.entries.entry(d.session_id.clone()).or_default();
@@ -293,7 +354,13 @@ pub fn sync_detected_at(
                     .unwrap_or_else(|| now.clone());
             }
             entry.last_seen_at = now.clone();
-            entry.tmux_session = Some(d.tmux_session.clone());
+            // 器が無い構成では None のまま（「観測できていない」ではなく「器が無い」）
+            if d.tmux_session.is_some() {
+                entry.tmux_session = d.tmux_session.clone();
+            }
+            if let Some(pane) = d.pane {
+                entry.pane = Some(pane);
+            }
             if d.agent_cwd.is_some() {
                 entry.cwd = d.agent_cwd.clone();
             }
@@ -524,6 +591,8 @@ pub fn list_payload(
         .map(|p| {
             json!({
                 "tmux_session": p.tmux_session,
+                // 器が無い構成の突き合わせキー（#728）。表示・診断のために出す
+                "pane": p.pane,
                 "kind": p.kind,
                 "label": p.label,
                 "project": p.project,
@@ -696,12 +765,33 @@ mod tests {
         let detected = detect_from_agents_value(&value);
         assert_eq!(detected.len(), 2);
         assert_eq!(detected[0].session_id, "session-a");
-        assert_eq!(detected[0].tmux_session, "tako-a");
+        assert_eq!(detected[0].tmux_session.as_deref(), Some("tako-a"));
         assert_eq!(detected[0].agent_cwd.as_deref(), Some("/w/a"));
         assert_eq!(detected[0].model.as_deref(), Some("claude-fable-5"));
-        assert_eq!(detected[1].tmux_session, "tako-b");
+        assert_eq!(detected[1].tmux_session.as_deref(), Some("tako-b"));
         // 空 agents は空
         assert!(detect_from_agents_value(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn 器がないペインはtako_paneで検出される() {
+        // #728: 器（psmux / tmux）が無い構成では `pane` が付かない。
+        // `tako_pane`（tako のペイン ID）が唯一の対応キーになる
+        let value = serde_json::json!({"agents": [
+            {"tako_pane": 7, "session_id": "session-a", "cwd": "C:\\w", "model": "claude-opus-5"},
+            {"tako_pane": 9, "session_id": "../../invalid"},
+            {"session_id": "no-pane-at-all"},
+            // 器あり側が優先（両方付くことは無いが、付いたらセッション名を採る）
+            {"pane": "tako-x:0.0", "tako_pane": 3, "session_id": "session-b"},
+        ]});
+        let detected = detect_from_agents_value(&value);
+        assert_eq!(detected.len(), 2);
+        assert_eq!(detected[0].session_id, "session-a");
+        assert_eq!(detected[0].tmux_session, None);
+        assert_eq!(detected[0].pane, Some(7));
+        assert_eq!(detected[0].agent_cwd.as_deref(), Some("C:\\w"));
+        assert_eq!(detected[1].tmux_session.as_deref(), Some("tako-x"));
+        assert_eq!(detected[1].pane, Some(3));
     }
 
     #[test]
@@ -762,7 +852,7 @@ mod tests {
         // spawn 時の pending 記録
         SessionCatalog::mutate_at(&path, |c| {
             c.pending.push(PendingSpawn {
-                tmux_session: "tako-s42".into(),
+                tmux_session: Some("tako-s42".into()),
                 kind: "worker".into(),
                 label: Some("112-session-log".into()),
                 project: Some("tako".into()),
@@ -782,14 +872,15 @@ mod tests {
         // 検出 → 昇格（テストは mutate_at ベースの sync を直接再現する）
         let detected = vec![DetectedSession {
             session_id: "11111111-2222-3333-4444-555555555555".into(),
-            tmux_session: "tako-s42".into(),
+            tmux_session: Some("tako-s42".into()),
+            pane: Some(7),
             agent_cwd: Some("/work/tako".into()),
             model: Some("claude-fable-5".into()),
         }];
         let panes = vec![PaneMetaSnapshot {
             pane: 7,
             tab: 3,
-            tmux_session: "tako-s42".into(),
+            tmux_session: Some("tako-s42".into()),
             role: Some("orchestrator-worker:tako:112-session-log".into()),
             title: Some("tako: 112-session-log".into()),
             cwd: Some("/work/tako".into()),
@@ -815,18 +906,133 @@ mod tests {
     }
 
     #[test]
+    fn 器がない構成でもpending記録がペインidで昇格する() {
+        // #728: Windows で psmux 未導入（backend=none）の主経路。
+        // 器の名前が付かないので、spawn 記録も検出もペイン ID がキーになる
+        let path = temp_path("promote-container-less");
+        SessionCatalog::mutate_at(&path, |c| {
+            c.pending.push(PendingSpawn {
+                tmux_session: None,
+                kind: "worker".into(),
+                label: Some("728-sessions".into()),
+                project: Some("tako".into()),
+                agent: Some("claude".into()),
+                issues: vec![728],
+                prompt_head: Some("Issue #728 を実装する".into()),
+                cwd: Some("C:\\work\\tako".into()),
+                tab: Some(1),
+                pane: Some(12),
+                recorded_at: "2026-08-01T00:00:00Z".into(),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+
+        let detected = vec![DetectedSession {
+            session_id: "22222222-3333-4444-5555-666666666666".into(),
+            tmux_session: None,
+            pane: Some(12),
+            agent_cwd: Some("C:\\work\\tako".into()),
+            model: Some("claude-opus-5".into()),
+        }];
+        let panes = vec![PaneMetaSnapshot {
+            pane: 12,
+            tab: 1,
+            tmux_session: None,
+            role: Some("orchestrator-worker:tako:728-sessions".into()),
+            title: Some("tako: 728-sessions".into()),
+            cwd: Some("C:\\work\\tako".into()),
+            log_file: None,
+        }];
+        sync_detected_at(&path, &detected, &panes).unwrap();
+
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        assert!(catalog.pending.is_empty(), "pending が昇格で消える");
+        let entry = &catalog.entries["22222222-3333-4444-5555-666666666666"];
+        assert_eq!(entry.kind, "worker");
+        assert_eq!(entry.label.as_deref(), Some("728-sessions"));
+        assert_eq!(entry.issues, vec![728]);
+        assert_eq!(entry.pane, Some(12));
+        assert_eq!(entry.tab, Some(1));
+        assert_eq!(entry.cwd.as_deref(), Some("C:\\work\\tako"));
+        // 器が無いので名前は付かない（「観測漏れ」ではなく「器が無い」）
+        assert_eq!(entry.tmux_session, None);
+        assert_eq!(entry.started_at, "2026-08-01T00:00:00Z");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn 器なしのpending記録は互いを消さない() {
+        // #728: 旧実装は `p.tmux_session != record.tmux_session` で重複排除していた。
+        // 器なし（どちらも None）だと全件が「同じキー」に見え、spawn のたびに
+        // 直前の記録が消えて最後の 1 件しか残らなかった
+        let mut catalog = SessionCatalog::default();
+        let make = |pane: u64| PendingSpawn {
+            tmux_session: None,
+            pane: Some(pane),
+            recorded_at: "2026-08-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        for pane in [1u64, 2, 3] {
+            let record = make(pane);
+            catalog
+                .pending
+                .retain(|p| !p.matches(record.tmux_session.as_deref(), record.pane));
+            catalog.pending.push(record);
+        }
+        assert_eq!(catalog.pending.len(), 3, "別ペインの記録は残る");
+        // 同じペインの再 spawn は置き換わる
+        let again = make(2);
+        catalog
+            .pending
+            .retain(|p| !p.matches(again.tmux_session.as_deref(), again.pane));
+        catalog.pending.push(again);
+        assert_eq!(catalog.pending.len(), 3);
+    }
+
+    #[test]
+    fn 突き合わせキーは器の有無で切り替わる() {
+        // #728: 器があるときはセッション名だけで見る（ペイン ID は tako 再起動を
+        // またいで振り直されるので、器の名前の方が強い同一性を持つ）
+        let with_container = PendingSpawn {
+            tmux_session: Some("tako-abc".into()),
+            pane: Some(5),
+            ..Default::default()
+        };
+        assert!(with_container.matches(Some("tako-abc"), None));
+        assert!(!with_container.matches(Some("tako-xyz"), Some(5)));
+        // 器ありの記録は、器なしの検出（ペイン ID だけ）には一致しない
+        assert!(!with_container.matches(None, Some(5)));
+
+        let without = PendingSpawn {
+            tmux_session: None,
+            pane: Some(5),
+            ..Default::default()
+        };
+        assert!(without.matches(None, Some(5)));
+        assert!(!without.matches(None, Some(6)));
+        assert!(!without.matches(Some("tako-abc"), Some(5)));
+
+        // キーを 1 つも持たない記録は何にも一致しない
+        let keyless = PendingSpawn::default();
+        assert!(!keyless.matches(None, None));
+        assert!(!keyless.matches(Some("tako-abc"), Some(5)));
+    }
+
+    #[test]
     fn pending無しでもroleから分類される() {
         let path = temp_path("role-only");
         let detected = vec![DetectedSession {
             session_id: "aaaaaaaa-1111-2222-3333-444444444444".into(),
-            tmux_session: "tako-s9".into(),
+            tmux_session: Some("tako-s9".into()),
+            pane: None,
             agent_cwd: None,
             model: None,
         }];
         let panes = vec![PaneMetaSnapshot {
             pane: 2,
             tab: 1,
-            tmux_session: "tako-s9".into(),
+            tmux_session: Some("tako-s9".into()),
             role: Some("orchestrator-master:sol".into()),
             title: None,
             cwd: Some("/home/u".into()),
@@ -909,12 +1115,12 @@ mod tests {
     fn gcはpending期限とエントリ上限を強制する() {
         let mut catalog = SessionCatalog::default();
         catalog.pending.push(PendingSpawn {
-            tmux_session: "old".into(),
+            tmux_session: Some("old".into()),
             recorded_at: "2026-07-01T00:00:00Z".into(),
             ..Default::default()
         });
         catalog.pending.push(PendingSpawn {
-            tmux_session: "fresh".into(),
+            tmux_session: Some("fresh".into()),
             recorded_at: "2026-07-13T00:00:00Z".into(),
             ..Default::default()
         });
@@ -929,7 +1135,7 @@ mod tests {
         }
         gc(&mut catalog, "2026-07-13T12:00:00Z");
         assert_eq!(catalog.pending.len(), 1);
-        assert_eq!(catalog.pending[0].tmux_session, "fresh");
+        assert_eq!(catalog.pending[0].tmux_session.as_deref(), Some("fresh"));
         assert_eq!(catalog.entries.len(), MAX_ENTRIES);
         // 最も古い 10 件が消えている
         assert!(!catalog.entries.contains_key("session-0000"));
