@@ -25,9 +25,9 @@ tako platform --status pending # 未対応のものだけ
 | --- | ---: | --- |
 | 対応済み | 99 | macOS 版と同じように使えます |
 | 一部対応 | 10 | 使えますが機能が落ちます（理由は各表に記載） |
-| 未対応 | 19 | まだ実装されていません（追跡 Issue つき） |
+| 未対応 | 20 | まだ実装されていません（追跡 Issue つき） |
 | 対象外 | 1 | Windows には概念自体が存在しません |
-| **合計** | **129** | |
+| **合計** | **130** | |
 
 ## ターミナルの基本
 
@@ -170,6 +170,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_preview_autosave` | 対応済み | — |
 | `tako_preview_link_list` | 対応済み | — |
 | `tako_preview_follow_link` | 対応済み | — |
+| `tako_preview_copy_code` | 対応済み | — |
 | `tako_pin_preview` | 対応済み | — |
 | `tako_video_playback` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
 | `tako_video_seek` | 未対応 | 動画プレビューが macOS（AVFoundation）実装のため Windows では再生できない <br />追跡: [#521](https://github.com/takushio2525/tako/issues/521) |
@@ -207,7 +208,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 
 ## リモートアクセス・自動更新
 
-スマホからの接続（tako remote）とアプリ内アップデート。（このカテゴリ全体としては **一部対応**）
+スマホからの接続（tako remote）とアプリ内アップデート。（このカテゴリ全体としては **未対応**）
 
 | 機能 | Windows | 補足 |
 | --- | --- | --- |
@@ -219,7 +220,7 @@ tako を再起動したときにタブ・ペインと実行中プロセスをど
 | `tako_remote_agents` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
 | `tako_remote_messages` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
 | `tako_remote_scrollback` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
-| `tako_update` | 対応済み | — |
+| `tako_update` | 未対応 | remote トランスポートと Windows 配布系統が前提 <br />追跡: [#528](https://github.com/takushio2525/tako/issues/528) |
 
 ## この表の読み方
 
