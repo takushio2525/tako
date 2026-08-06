@@ -1739,3 +1739,13 @@
   worker model / `orchestrator-master:st761` / prompt 無し / self が profile=default、
   after は master model / `master:st761` / marker-found / profile=st761）+
   単体 5 本 + セルフテスト項目 102 新設（各バグを戻すと FAILED を実測）
+
+## 2026-08-06（#772: stale binary 検知がメインスレッドを毎 tick 400ms 専有する問題）
+- 真因は「毎 tick × 対象ペインごと」の `find_claude_pid_for_backend`（1 回で
+  `tmux list-panes -a` + `ps` の 2 プロセス）。採取を `ProcessSnapshot` で 1 回に束ね、
+  走査を background へ出し、`should_rescan`（起動直後 / 指紋変化 / 対象増減 / 60 秒）で
+  頻度を落とした。それ以外の tick は stat だけ（`which claude` も PATH 走査へ置換）
+- 実測（隔離・6 worker ペイン）: `periodic_prep:stale_binary` p50 289〜323ms → 0ms、
+  しきい値超え行 24 行/60s → 0 行、`ps` 起動 175 回/60s → 34 回（stale ぶんは約 144 → 2）
+- 検証: セルフテスト項目 103 新設（偽 claude の版差し替えで検知 + 変化無し tick の省略）+
+  単体 9 本 + 品質ゲート全緑

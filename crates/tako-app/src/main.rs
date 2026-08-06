@@ -1350,6 +1350,9 @@ struct TakoApp {
     pending_webview_restore: Vec<(Option<u64>, String)>,
     /// stale claude バイナリの検知状態（Issue #498）。ペインごとに管理
     stale_binary_banners: HashMap<PaneId, StaleBinaryBanner>,
+    /// stale 検知の走査状態（Issue #772）。前回の指紋・対象・時刻を持ち、
+    /// 変化していない tick では tmux / ps を起動しないための判断材料にする
+    stale_binary_scan: tako_control::stale_binary::ScanState,
     /// 初回起動のウェルカムバナーを表示中か（Issue #549）。
     /// 起動時に settings.json の実在で判定し（`welcome::should_show_on_launch`）、
     /// 閉じたら settings.json へ永続化する
@@ -2685,6 +2688,7 @@ impl TakoApp {
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
             stale_binary_banners: HashMap::new(),
+            stale_binary_scan: tako_control::stale_binary::ScanState::default(),
             // #549: 初回起動（settings.json がまだ無い）だけウェルカムバナーを出す。
             // 起動処理は settings を読むだけで書かないため、ここでの判定は
             // 「このプロセスが最初の 1 回目か」を正しく反映する
@@ -3372,10 +3376,6 @@ impl TakoApp {
                         app.refresh_agent_metrics();
                     }
                     {
-                        let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
-                        app.check_stale_binaries();
-                    }
-                    {
                         // #572: busy 中に人間が打った指示が claude のキューに滞留したまま
                         // 止まっていないかを見張り、見つけたら送り出す
                         let _s = tako_control::diag::perf_span("periodic_prep:queued_recovery");
@@ -3482,6 +3482,33 @@ impl TakoApp {
                     });
                     if ok.is_err() {
                         break;
+                    }
+                }
+                // ② background: stale claude バイナリの検知（#498 / #772）。
+                // UI スレッドでは対象ペインの一覧作りと結果の反映だけを行う。
+                // background 側も既定では stat だけで済ませ、claude が入れ替わった /
+                // 対象ペインが増減した / 60 秒経った tick でのみ tmux + ps を起動する
+                {
+                    let targets = this.update(cx, |app: &mut TakoApp, _| {
+                        let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
+                        app.collect_stale_binary_scan()
+                    });
+                    let Ok(targets) = targets else {
+                        break;
+                    };
+                    if let Some((targets, prev)) = targets {
+                        let outcome = cx
+                            .background_executor()
+                            .spawn(async move { tako_control::stale_binary::poll(targets, &prev) })
+                            .await;
+                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                            if app.apply_stale_binary_scan(outcome) {
+                                cx.notify();
+                            }
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
                     }
                 }
                 // ② background: GUI モードのチャット読み取り（#702）。sleep_guard の
@@ -9294,19 +9321,10 @@ impl TakoApp {
         }
     }
 
-    /// stale claude バイナリの定期チェック（Issue #498）。
-    /// 2 秒ポーリングの periodic_prep に便乗し、role が master/worker のペインだけチェック。
-    /// `resolve_current_claude_binary` は 5 秒 TTL キャッシュ付きなのでほとんどの tick は即返。
-    /// PID 解決（`pidpath`）は FFI 1 回で µs 級なので UI 専有は実質 0ms
-    fn check_stale_binaries(&mut self) {
-        let current = tako_control::stale_binary::resolve_current_claude_binary();
-        let Some(current_path) = current else {
-            return;
-        };
-        let current_version = tako_control::stale_binary::extract_version_from_path(&current_path);
-
-        let pane_ids: Vec<(PaneId, String, bool)> = self
-            .workspace
+    /// stale 検知の対象ペイン（master / worker かつバックエンドセッションを持つもの）。
+    /// メモリ走査だけなので UI スレッドで呼んでよい
+    fn stale_binary_panes(&self) -> Vec<(PaneId, String, bool)> {
+        self.workspace
             .tabs()
             .iter()
             .flat_map(|tab| tab.tree().panes())
@@ -9326,26 +9344,85 @@ impl TakoApp {
                     None
                 }
             })
+            .collect()
+    }
+
+    /// stale claude バイナリ検知の UI 収集部（Issue #498 / #772）。
+    ///
+    /// #772: 旧実装はこの場（2 秒ごとの periodic_prep）でペインごとに
+    /// `find_claude_pid_for_backend`（= tmux + ps の 2 プロセス）を実行しており、
+    /// メインスレッドを毎 tick 392〜466ms 専有していた。
+    /// いまはここでは対象ペインを数えるだけで、バイナリ解決も tmux / ps も background で行う
+    #[allow(clippy::type_complexity)]
+    fn collect_stale_binary_scan(
+        &self,
+    ) -> Option<(
+        Vec<tako_control::stale_binary::StaleScanTarget>,
+        tako_control::stale_binary::ScanState,
+    )> {
+        let panes = self.stale_binary_panes();
+        // 対象ゼロが続いている間は background へ行くまでもない（= エージェントを
+        // 立てていない通常のターミナル利用では検知そのものが動かない）。
+        // 直前まで対象があった tick は状態を畳むために 1 回だけ通す
+        if panes.is_empty()
+            && self.stale_binary_scan.targets.is_empty()
+            && self.stale_binary_scan.scanned_at.is_some()
+        {
+            return None;
+        }
+        let targets = panes
+            .into_iter()
+            .map(
+                |(pane_id, backend_session, _)| tako_control::stale_binary::StaleScanTarget {
+                    key: pane_id.as_u64(),
+                    backend_session,
+                },
+            )
+            .collect();
+        Some((targets, self.stale_binary_scan.clone()))
+    }
+
+    /// background の走査結果をバナーへ反映する（メモリ操作のみ）。表示が変わったら true
+    fn apply_stale_binary_scan(
+        &mut self,
+        outcome: tako_control::stale_binary::ScanOutcome,
+    ) -> bool {
+        let tako_control::stale_binary::ScanOutcome::Scanned {
+            state,
+            current_binary,
+            current_version,
+            results,
+        } = outcome
+        else {
+            return false;
+        };
+        self.stale_binary_scan = state;
+        let Some(current_path) = current_binary else {
+            return false;
+        };
+
+        let is_master: HashMap<u64, bool> = self
+            .stale_binary_panes()
+            .into_iter()
+            .map(|(pane_id, _, is_master)| (pane_id.as_u64(), is_master))
             .collect();
 
-        for (pane_id, _backend, is_master) in &pane_ids {
-            // 既にバナーが出ていてユーザーが操作待ちなら再チェック不要
+        let mut changed = false;
+        for result in results {
+            let pane_id = PaneId::from_raw(result.key);
+            // 既にバナーが出ていてユーザーが操作待ちなら触らない
             if self
                 .stale_binary_banners
-                .get(pane_id)
+                .get(&pane_id)
                 .is_some_and(|b| !b.dismissed)
             {
                 continue;
             }
-
-            // ペインの claude PID を取得して pidpath で実パスを調べる
-            let pid = self.backend_sessions.get(pane_id).and_then(|backend| {
-                tako_control::stale_binary::find_claude_pid_for_backend(backend)
-            });
-            let Some(pid) = pid else {
+            // ペインが消えていたら対象外
+            let Some(&is_master) = is_master.get(&result.key) else {
                 continue;
             };
-            let Some(running_path) = tako_control::stale_binary::pidpath(pid) else {
+            let Some(running_path) = result.running_binary else {
                 continue;
             };
 
@@ -9353,21 +9430,23 @@ impl TakoApp {
                 let spawned_version =
                     tako_control::stale_binary::extract_version_from_path(&running_path);
                 self.stale_binary_banners.insert(
-                    *pane_id,
+                    pane_id,
                     StaleBinaryBanner {
                         spawned_version,
                         current_version: current_version.clone(),
                         dismissed: false,
                         restarting: false,
                         error: None,
-                        is_master: *is_master,
+                        is_master,
                     },
                 );
-            } else {
+                changed = true;
+            } else if self.stale_binary_banners.remove(&pane_id).is_some() {
                 // 最新に追いついたらバナーを消す
-                self.stale_binary_banners.remove(pane_id);
+                changed = true;
             }
         }
+        changed
     }
 
     /// sleep guard の UI 収集部: 全バックエンドセッション名を集める。
@@ -37623,6 +37702,219 @@ mod self_test {
                         },
                         cx,
                     );
+                }
+            }
+
+            // ===== 103: stale binary 検知の背景化と頻度削減（#772） =====
+            // 旧実装は 2 秒ごとに **対象ペインごとに** tmux + ps を起動し、
+            // メインスレッドを 392〜466ms 専有していた（perf.log 実測）。ここでは
+            //   ① 起動時と同じ claude ならバナーが出ないこと
+            //   ② 変化が無い tick は走査ごと省かれること（= 頻度削減が効いている）
+            //   ③ バイナリを差し替えたら検知してバナーが出ること（機能の非回帰）
+            // を、偽 claude + 実 tmux セッションで通しで確かめる。
+            // 走査は本番では background 実行だが、ここでは判定を決定的にするため
+            // 1 回の update の中で同期実行する（2 秒ループと交錯させない）
+            #[cfg(unix)]
+            {
+                use tako_control::protocol::Request as Req;
+                use tako_control::stale_binary::{poll_with_launcher, ScanOutcome};
+
+                let root =
+                    std::env::temp_dir().join(format!("tako-selftest-772-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&root);
+                if std::fs::create_dir_all(&root).is_err() {
+                    fail("#772: 検証用ディレクトリを作れない");
+                }
+                // `proc_pidpath` は実体のパス（macOS では /private/var/…）を返すので、
+                // 突き合わせる側も canonicalize した形に揃える
+                let root = std::fs::canonicalize(&root).unwrap_or(root);
+                let bin_dir = root.join("bin");
+                let v_old = root.join("versions").join("1.0.0");
+                let v_new = root.join("versions").join("1.0.1");
+                for dir in [&bin_dir, &v_old, &v_new] {
+                    if std::fs::create_dir_all(dir).is_err() {
+                        fail("#772: 検証用ディレクトリを作れない");
+                    }
+                }
+                // 偽 claude = tako CLI のコピー。pidpath が `.../versions/<版>/claude` を
+                // 返すので検知経路が本番と同じ形になる。
+                // `/bin/sleep` 等のシステムバイナリはコピーすると macOS に SIGKILL される
+                // （platform binary の署名が元の場所に紐づくため）ので使えない。
+                // シェルスクリプトも駄目（pidpath が返すのは実行中のインタプリタ）
+                let launcher = bin_dir.join("claude");
+                for dir in [&v_old, &v_new] {
+                    if std::fs::copy(&cli_path, dir.join("claude")).is_err() {
+                        fail("#772: 偽 claude を用意できない");
+                    }
+                }
+                if std::os::unix::fs::symlink(v_old.join("claude"), &launcher).is_err() {
+                    fail("#772: 偽 claude の symlink を張れない");
+                }
+
+                // 実 tmux セッションでシェルを立て、その子として偽 claude を走らせる
+                let socket = tako_core::tmux_backend::socket_name();
+                let session = format!("tako-st772-{}", std::process::id());
+                let _ = tako_core::tmux::tmux_command(Some(&socket))
+                    .args(["kill-session", "-t", &format!("={session}:")])
+                    .output();
+                if tako_core::tmux::tmux_command(Some(&socket))
+                    .args([
+                        "new-session",
+                        "-d",
+                        "-s",
+                        &session,
+                        "sh",
+                        "-c",
+                        // `mcp serve` は stdin 待ちで居座るので長生きプロセスになる。
+                        // `& wait` にすると sh がペインのプロセスとして残り、偽 claude が
+                        // その子になる（本番と同じ形）。exec させると pane_pid 自身が
+                        // claude になり、検知側の「子孫を探す」判定に掛からない。
+                        // send-keys だとシェル起動待ちの取りこぼしで不安定になるので使わない
+                        &format!("{} mcp serve & wait", shell_escape(&launcher)),
+                    ])
+                    .output()
+                    .map(|o| !o.status.success())
+                    .unwrap_or(true)
+                {
+                    fail("#772: 検証用 tmux セッションを作れない");
+                }
+                // 偽 claude がシェルの子として見えるまで待つ（最大 12 秒）
+                let mut claude_up = false;
+                for _ in 0..80 {
+                    if tako_control::stale_binary::find_claude_pid_for_backend(&session).is_some() {
+                        claude_up = true;
+                        break;
+                    }
+                    wait(cx, 150).await;
+                }
+                check(claude_up, "103: 検証用の偽 claude がペイン内で見える (#772)");
+
+                // 検証用ペイン（role worker + バックエンドセッション登録）
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#772: 基準ペインの取得")
+                };
+                let probe_pane = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            Req::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw)
+                    })
+                    .ok()
+                    .flatten();
+                let Some(probe_pane) = probe_pane else {
+                    fail("#772: 検証用ペインの作成")
+                };
+
+                // ①② を 1 回の update で連続実行する。バックエンドセッションの登録も
+                // ここでだけ行い、2 秒ループが同じペインを拾って結果を上書きするのを防ぐ
+                let launcher_1 = launcher.clone();
+                let session_1 = session.clone();
+                let phase1 = window
+                    .update(cx, |app, _, _| {
+                        if let Some(obj) =
+                            app.workspace.active_tab_mut().tree_mut().get_mut(probe_pane)
+                        {
+                            obj.set_role(Some("orchestrator-worker:772".into()));
+                        }
+                        app.backend_sessions.insert(probe_pane, session_1);
+                        // ① 起動時と同じ版 → stale ではない
+                        let (targets, prev) = app.collect_stale_binary_scan()?;
+                        let scanned = poll_with_launcher(targets, &prev, Some(launcher_1.clone()));
+                        let did_scan = matches!(scanned, ScanOutcome::Scanned { .. });
+                        app.apply_stale_binary_scan(scanned);
+                        let banner_same = app.stale_binary_banners.contains_key(&probe_pane);
+                        // ② 何も変わっていない次の tick → 走査ごと省く
+                        let (targets, prev) = app.collect_stale_binary_scan()?;
+                        let again = poll_with_launcher(targets, &prev, Some(launcher_1));
+                        let skipped = matches!(again, ScanOutcome::Skipped);
+                        app.backend_sessions.remove(&probe_pane);
+                        Some((did_scan, banner_same, skipped))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((did_scan, banner_same, skipped)) = phase1 else {
+                    fail("#772: 走査の実行に失敗した")
+                };
+                check(did_scan, "103: 初回は走査が走る (#772)");
+                check(
+                    !banner_same,
+                    "103: 起動時と同じ claude ならバナーは出ない (#772)",
+                );
+                check(skipped, "103: 変化が無い tick は tmux / ps を起動しない (#772)");
+
+                // ③ バイナリを差し替える（claude の自己更新に相当）
+                let _ = std::fs::remove_file(&launcher);
+                if std::os::unix::fs::symlink(v_new.join("claude"), &launcher).is_err() {
+                    fail("#772: 偽 claude の差し替えに失敗した");
+                }
+                let launcher_2 = launcher.clone();
+                let session_2 = session.clone();
+                let phase2 = window
+                    .update(cx, |app, _, _| {
+                        app.backend_sessions.insert(probe_pane, session_2);
+                        let (targets, prev) = app.collect_stale_binary_scan()?;
+                        let scanned = poll_with_launcher(targets, &prev, Some(launcher_2));
+                        let did_scan = matches!(scanned, ScanOutcome::Scanned { .. });
+                        app.apply_stale_binary_scan(scanned);
+                        let banner = app.stale_binary_banners.get(&probe_pane).map(|b| {
+                            (b.spawned_version.clone(), b.current_version.clone())
+                        });
+                        app.backend_sessions.remove(&probe_pane);
+                        Some((did_scan, banner))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((rescanned, banner)) = phase2 else {
+                    fail("#772: 差し替え後の走査に失敗した")
+                };
+                println!("TAKO_SELF_TEST_772_BANNER: {banner:?}");
+                check(rescanned, "103: バイナリが変わったら走査し直す (#772)");
+                check(
+                    banner.as_ref().is_some_and(|(spawned, current)| {
+                        spawned == "1.0.0" && current == "1.0.1"
+                    }),
+                    "103: バイナリ差し替えで stale バナーが出る (#772)",
+                );
+
+                // 後片付け（tmux セッション・検証用ペイン・一時ディレクトリ）
+                let _ = tako_core::tmux::tmux_command(Some(&socket))
+                    .args(["kill-session", "-t", &format!("={session}:")])
+                    .output();
+                let _ = window.update(cx, |app, _, _| {
+                    app.stale_binary_banners.remove(&probe_pane);
+                    let _ = tako_control::dispatch(
+                        app,
+                        Req::Close {
+                            pane: Some(probe_pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                });
+                // 一時ディレクトリ配下であることを確かめてから消す
+                let temp_root = std::fs::canonicalize(std::env::temp_dir())
+                    .unwrap_or_else(|_| std::env::temp_dir());
+                if root.starts_with(&temp_root)
+                    && root
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("tako-selftest-772-"))
+                {
+                    let _ = std::fs::remove_dir_all(&root);
                 }
             }
 

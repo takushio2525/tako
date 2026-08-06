@@ -3,40 +3,49 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-05、Issue #761 handoff 後任 master の起動パラメータ）
+## 現在の対象（2026-08-06、Issue #772 stale binary 検知の CPU 張り付き）
 
-- 2026-08-05 の初実地ハンドオフで後任 master が worker 用モデルで起動し、以後
-  default プロファイル扱いになった不具合の修正（worktree `../tako-wt-761`）
-- 直した 3 点（いずれも `dispatch_orchestrator_handoff`）:
-  1. 起動コマンドを `build_worker_cmd` + `resolve_agent_launch`（worker 用）から
-     `build_master_cmd`（CLI `tako master -<profile>` と同一経路）へ
-     → profile の master model / effort が効き、master system prompt も付く
-  2. `TAKO_ORCHESTRATOR_ROLE` に表示用 role（`orchestrator-master:<p>`）を入れていたのを
-     env 用（`master:<p>`）へ。生成は `tako_core::handoff` の 2 関数に閉じた
-  3. caller_role にペインの role ラベルが来る内部呼び出し（stale binary restart）でも
-     プロファイルを解決できるよう `master_profile_of_any_role` を新設
-- 起動コマンドの組み立てをペイン分割の**前**に移し、失敗時に空ペインを残さない
+- 本番 GUI が CPU 40〜65% に張り付き、perf.log に `periodic_prep:stale_binary` が
+  約 2.5 秒間隔で 392〜466ms（メインスレッド専有）と出ていた不具合の修正
+  （worktree `../tako-wt-772`）
+- 真因は「毎 tick × 対象ペインごと」に `find_claude_pid_for_backend` を呼んでいたこと。
+  1 回あたり `tmux list-panes -a` + `ps -axo pid=,ppid=` の **2 プロセス**を起こすため、
+  master / worker が 6 ペインで 12 プロセス / 2 秒。旧コメントの
+  「pidpath は FFI 1 回で µs 級」はこの前段のサブプロセスを勘定していなかった
+- 直した 3 点:
+  1. **採取の束ね直し**: `ProcessSnapshot`（tmux + ps を 1 回ずつ）を新設し、
+     ペイン数によらず 2 プロセスで全ペインを解決する
+  2. **background 化**: UI スレッドは対象ペインの一覧作り（`collect_stale_binary_scan`）と
+     結果反映（`apply_stale_binary_scan`）だけ。走査は background executor
+  3. **頻度削減**: `should_rescan`（純関数）で、起動直後 / claude の指紋が変わった /
+     対象ペインが増減した / 60 秒経った、のいずれかのときだけ重い走査を回す。
+     それ以外の tick は **stat だけ**（`current_binary_fingerprint`）
+- 副産物: `which claude` のサブプロセスを PATH 走査（stat のみ）へ置換。
+  取りこぼし防止に `which` はフォールバックとして残す
 
 ## 検証状況
 
-- 実経路 e2e（隔離アプリ + プロファイル env の PATH で偽 claude を最優先）で before / after:
-  - before = `--model …worker[1m] --effort high` / role env が `orchestrator-master:st761` /
-    system prompt 無し / 後任の `orchestrator self` が `profile=default handoff=default.md`
-  - after = `--model …master --effort xhigh` / role env `master:st761` /
-    prompt マーカー検出 / `profile=st761 handoff=st761.md`
-- 単体 3 本（dispatch）+ 2 本（tako-core）追加。各バグを戻すと FAILED になることを実測
-- セルフテスト項目 102 を新設（起動コマンド + role env + 後任 self の通し検証）
+- 隔離インスタンス（6 worker ペイン・`TAKO_PERF_VERBOSE=1`）で before / after 実測:
+  - `periodic_prep:stale_binary` p50 289〜323ms / max 478ms → **p50 0ms / max 0ms**
+  - しきい値超えの perf.log 行 60 秒あたり 24〜25 行 → **0 行**
+  - `ps` の起動回数（shim で実測）60 秒あたり 175 回 → **34 回**
+    （残りは sleep guard 等の別系統。stale 検知ぶんは約 144 → 約 2）
+- セルフテスト項目 103 を新設: 偽 claude（`versions/1.0.0` → `1.0.1` の symlink 差し替え）と
+  実 tmux セッションで ①同版ならバナー無し ②変化無しの tick は走査を省く
+  ③差し替えでバナーが出る、を通しで検証
+- 単体 9 本（`should_rescan` / 指紋 / PATH 走査）追加
 - `cargo test --workspace` / `fmt --check` / clippy（全 target・deny warnings）全緑
-- 隔離セルフテストは `TAKO_APP_SELF_TEST_OK`・exit 0（SKIPPED は 76d のみ = 環境要因）
 
 ## 不変条件
 
-- 本番 GUI・本番 tmux・本番 data dir に触れない（隔離は TAKO_ISOLATED + 明示 data/discovery、
-  CLI 側は呼び出し元の `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE` を必ず unset する）
-- master の role は「表示用」と「env 用」で語彙が違う。生成は tako-core の関数経由に限る
-- master_account の反映規則（#547）は変更しない
+- 本番 GUI・本番 tmux（ソケット `tako`）・本番 data dir に触れない
+  （隔離は `TAKO_ISOLATED=1` + 明示 socket / discovery。CLI 側は呼び出し元の
+  `TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` を必ず unset する）
+- stale 検知の**判定ロジック**（何を stale と見なすか・バナーの出し方）は変えない。
+  変えたのは実行場所と頻度だけ
+- 定期ループの UI スレッド部にサブプロセス実行を置かない（#168 / #212 / #340 と同じ原則）
 
 ## 未着手・持ち越し
 
 - #691 GUI モードのクローズはユーザーの実使用確認待ち
-- #658、#601 案 2、#632、#633、#638、#651 ほか既存キューは #761 の対象外
+- #658、#601 案 2、#632、#633、#638、#651 ほか既存キューは #772 の対象外
