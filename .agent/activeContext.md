@@ -42,7 +42,7 @@
 - 番犬 3 本（tako-app）: kill が明示 close 経路の外に無い / `on_app_quit` が kill しない /
   `close:gui-tab` を GUI タブ × 以外が名乗らない。いずれも違反注入で FAILED を実測
 - `cargo test --workspace` 1881 件緑 / fmt --check / clippy(-D warnings) 緑
-- 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（exit 0）。項目 103 のマーカー検査は
+- 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（exit 0）。項目 104 のマーカー検査は
   「ウィンドウが前面でないと新ペインが描画されずペインログが作られない」ため
   76d と同じ条件で SKIPPED になることがある
 
