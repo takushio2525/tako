@@ -893,6 +893,12 @@ trait で抽象化し、core/ と control/ は platform/ の trait のみに依�
   fork+exec が秒級に伸び「画面が重い・点滅・スクロールもっさり」の主犯になった。
   IOKit FFI（`IOPSGetTimeRemainingEstimate`）へ置換済み。定期パスに外部コマンドが必要なら
   background executor へ逃がすこと
+- **プロセス走査の共有と変化検出**（#772 / #779）: `agents::ProcessSnapshot` が tmux pane PID と
+  `ps` の親子関係を 1 回ずつ採取し、stale binary と sleep guard が同一 tick で共有する。
+  sleep guard の 2 秒 tick は assertion の評価頻度であって、tmux / ps の採取頻度ではない。
+  backend 集合・role・OSC 133 状態が変わったときと初回、取りこぼし回収の 60 秒ごとだけ再採取し、
+  それ以外は前回の `busy_backend_sessions` を sleep guard / GUI モード / close 確認で共有する。
+  `while-agents-running` へ切り替えた tick は、古いキャッシュで assertion を決めず即再採取する
 
 ## セキュリティ方針
 

@@ -3,51 +3,55 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-06、Issue #781 IME 位置・選択座標のズレ再発）
+## 現在の対象（2026-08-06、Issue #779 sleep guard の `ps` 起動削減）
 
-- worktree `../tako-wt-781` / ブランチ `fix/781-ime-selection-offset`
-- **疑われていた #725 / #737（チャット表示）の回帰ではなかった**。稼働は `ui_mode: terminal` で、
-  ターミナル表示の座標系の問題。#737 マージ以降の diff に IME / 選択の座標変更は無い
-- 根因: **stale claude バナー（#498）の 28px がテキスト領域の会計から漏れていた**。
-  バナーはペインヘッダとターミナル領域のあいだに積まれる「流れの中」の要素なのに、
-  `pane_text_areas`（= PTY 行数 / マウス座標変換 / IME アンカーの共通の正）を作る算術が
-  差し引いていなかった。#684 が正にしたのは「ペインを並べるコンテナ」で、ペイン内部は対象外だった
-- タイミングの実測: `~/.local/bin/claude` の symlink が 13:40 に 2.1.220 → 2.1.223 へ更新
-  → ユーザー報告 13:43:42（3 分後）。claude が自己更新すると全 master / worker ペインで
-  一斉にバナーが出るので、「また発生してる」の周期性は claude の更新周期と一致する
+- worktree `../tako-wt-779` / ブランチ `improve/779-sleep-guard-ps` / PR #783
+- #772 の `ProcessSnapshot` を `agents` 側へ移して stale binary 検知と共有し、同じ tick で
+  両方が必要とするプロセス一覧を 1 回の `tmux list-panes` + `ps` で賄う
+- sleep guard の走査は初回・対象の backend / role / OSC 状態変化・モード有効化・60 秒経過時だけ。
+  2 秒 tick ごとの assertion 適用は維持し、走査を省いた tick は直前の busy 集合を再利用する
+- 走査対象はソートして HashMap 列挙順による偽の変化検知を防ぐ。走査と stale binary poll は
+  どちらも background job 内で実行し、メインスレッドを外部コマンド待ちで止めない
 
-## 実測・検証
+## 実測証拠
 
-- セルフテスト項目 106 を新設（実描画のテキスト領域を prepaint で採取して算術と突き合わせる）
-  - 修正前: `top 77.0 -> 105.0 gap 0.0 -> 28.0` → FAILED（exit 1）
-  - 修正後: `top 77.0 -> 105.0 gap 0.0 -> 0.0` → `TAKO_APP_SELF_TEST_OK`（exit 0）
-  - バナーの押し下げ量が両方で +28px = 検査は空振りしていない
-- 単体 7 本（`pane_text_area_tests`）。会計を外すと番犬が FAILED になることを実測
-- 番犬 `ターミナルペインの直接の子は想定どおり`（直接の子の数を固定 = 流れの中に足したら落ちる）
-- 実行時の自己申告: `render()` 冒頭で算術と実描画を突き合わせ、1px 以上なら perf.log へ 1 回だけ
-- `cargo test --workspace` 1897 件緑 / fmt --check 緑
-- 76d / 104 のマーカー検査はウィンドウ非前面のため既知の SKIPPED（素の main でも同じ）
+- 隔離環境・worker role 6 ペイン・PATH shim の同条件で、アイドル時の `ps` 起動は
+  before 34 回 / 約 75 秒 → after 3 回 / 約 72 秒（約 91% 減）
+- 同じ計測の tako-app CPU は before 約 0.3% → after 約 0.6%。after は load average
+  100 超の強い競合下での値だが、受け入れ目標の 10% を十分下回った
+- 実経路で隔離アプリの worker に `sleep 30` を実行すると、その PID の
+  `PreventUserIdleSystemSleep` assertion が保持され、終了後に解除された
+- `TAKO_PERF_VERBOSE` の periodic 各区間は after の p50 / max が原則 0ms
+- 2 秒周期の残りは main periodic と autorename poll。外部処理は状態変化・表示中・対象ありで
+  条件化済みで、今回の実測から別 Issue が必要な重い常時処理は見つからなかった
 
-## 修正の要点
+## 検証状況
 
-1. `STALE_BANNER_HEIGHT` を描画側の `.h()` と会計側で共有
-2. 矩形は `pane_text_area_rect(content, unit_rect, stacked_top, band, scale_factor)` の 1 か所で作る
-3. `PaneTextAreaProbe`（ペイン単位）で実矩形を採取。**正としては使わない**
-   （PTY resize と結ぶと 1 フレーム遅れが行数の振動を生む）= 観測と自己申告のみ
+- `cargo test --workspace` / `cargo fmt --all --check` /
+  `cargo clippy --workspace --all-targets -- -D warnings` は緑
+- 最新 main（#781 の `8aeb939`）へ rebase 済み。競合は `activeContext` / `progress` の
+  ドキュメント 2 件のみで、`main.rs` は自動マージ（#781 はペイン描画・本件は periodic の別領域）
+- 隔離セルフテストは高負荷下で #771 型の無関係な GUI タイミング項目が 4 回フレークした
+  （入力予測 zsh・#680・#181 が 2 回）。負荷の谷で完走結果を取り直すのが残作業
 
 ## 不変条件
 
-- 本番 GUI・本番 tmux socket `tako`・本番 data dir に触れない（検証は TAKO_ISOLATED=1 のみ）
-- System Events のキーストローク送出は禁止。本番 pid は検証の前後で不変（53327）
-- 採取プローブは描画中に entity を触らない（`Cell` への書き込みだけ。#684 と同じ理由）
+- sleep guard の機能仕様、2 秒ごとの状態評価、assertion の取得・解放条件を変えない
+- `busy_backend_sessions` は sleep guard 以外（GUI モード判定・close 確認）も読むので、
+  モードが `while-agents-running` でなくても変化時 + 60 秒保険の走査は止めない
+- 本番 GUI・本番 tmux socket `tako`・本番 data dir に触れない
+- 検証は `TAKO_ISOLATED=1` + 専用 `TAKO_TMUX_SOCKET` + 専用 data / discovery dir
+- System Events のキーストローク送出は禁止。隔離アプリは PID 指定で終了する
+- 並走ビルドと同時に Cargo / app bundle ビルドを走らせない
 
-## 次
+## 次の手順
 
-- コミット → push → PR（Closes #781）→ macOS CI 緑 → squash merge
-- Issue へ実測証拠をコメント。**実 IME の見た目は未検証**（この機に日本語入力ソースが無い）
-  なのでクローズはユーザー実機確認後
-- マージ後 `scripts/build-app.sh --install`（他 worker のビルドと同時実行しない）
+1. 負荷低下後に隔離セルフテストを再実行し `TAKO_APP_SELF_TEST_OK` を確認
+2. force-with-lease で PR #783 を更新 → macOS CI 緑 → squash merge（`--delete-branch`）
+3. Issue #779 に証拠をコメントしてクローズ → main 同期 → worktree 削除
+4. 並走ビルドがないことを確認して `scripts/build-app.sh --install`。GUI 再起動は master 側
 
-## 持ち越し
+## 現フェーズで Read すべき設計書
 
-- #782（UI ストールそのもの）はこの Issue の対象外。主因でないことは隔離実測で確認済み
+- 性能・診断まわりを触るとき: `.agent/architecture.md`（periodic tick / perf.log 節）
+- sleep guard の仕様確認: `.agent/requirements.md` FR-5.14

@@ -4,7 +4,6 @@
 //! libproc `proc_pidpath` で取得、`~/.local/bin/claude` の現在の解決先と突き合わせる。
 //! 差異があれば stale と判定し、UI バナー + CLI/MCP で通知・張り直しを提供する。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -230,73 +229,19 @@ pub fn check_stale(info: &PaneClaudeInfo) -> StaleStatus {
 /// パスを実行しているプロセスを返す。`claude agents --json` に依存しないため
 /// 隔離環境でも動く
 pub fn find_claude_pid_for_backend(backend_session: &str) -> Option<u32> {
-    ProcessSnapshot::capture().find_claude_pid(backend_session)
+    let snapshot = crate::agents::ProcessSnapshot::capture();
+    find_claude_pid(&snapshot, backend_session)
 }
 
-/// tmux ペイン PID 一覧 + プロセス親子関係の「1 回ぶん」のスナップショット。
-///
-/// #772: 旧実装は `find_claude_pid_for_backend` をペインごとに呼んでおり、
-/// 1 回あたり `tmux list-panes -a` と `ps -axo pid=,ppid=` の**2 プロセス**を起動していた。
-/// master / worker が 5〜6 ペインあると 1 tick で 10〜12 プロセス = 実測 400ms。
-/// 採取を 1 回に束ねることで、ペイン数によらず 2 プロセスで済む
-struct ProcessSnapshot {
-    /// `session:window.pane` → ペインのシェル PID
-    panes: Vec<(String, u32)>,
-    /// pid → 子 pid の集合
-    children: HashMap<u32, Vec<u32>>,
-}
-
-impl ProcessSnapshot {
-    /// tmux と ps を 1 回ずつ実行して採取する（サブプロセスを起こすのでここは background 専用）
-    fn capture() -> Self {
-        let socket = tako_core::tmux_backend::socket_name();
-        let panes = crate::agents::tmux_pane_pids(Some(&socket));
-        let parents = crate::agents::process_parent_map();
-        // 逆引き: pid → 子の集合
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (&child, &parent) in &parents {
-            children.entry(parent).or_default().push(child);
-        }
-        Self { panes, children }
-    }
-
-    /// バックエンドセッション配下で claude を実行しているプロセスの PID を探す
-    fn find_claude_pid(&self, backend_session: &str) -> Option<u32> {
-        let prefix = format!("{backend_session}:");
-        let target_pids: Vec<u32> = self
-            .panes
-            .iter()
-            .filter(|(id, _)| id.starts_with(&prefix))
-            .map(|(_, pid)| *pid)
-            .collect();
-        if target_pids.is_empty() {
-            return None;
-        }
-
-        // ペイン PID から BFS で子孫を辿り、pidpath が claude を含むものを探す
-        for &pane_pid in &target_pids {
-            let mut queue = vec![pane_pid];
-            let mut visited = std::collections::HashSet::new();
-            while let Some(pid) = queue.pop() {
-                if !visited.insert(pid) {
-                    continue;
-                }
-                // pidpath で実パスを確認（claude を含むか）
-                if pid != pane_pid {
-                    if let Some(path) = pidpath(pid) {
-                        let path_str = path.to_string_lossy();
-                        if path_str.contains("claude") {
-                            return Some(pid);
-                        }
-                    }
-                }
-                if let Some(kids) = self.children.get(&pid) {
-                    queue.extend(kids);
-                }
-            }
-        }
-        None
-    }
+/// 共有スナップショットから backend session 配下の claude PID を探す。
+fn find_claude_pid(
+    snapshot: &crate::agents::ProcessSnapshot,
+    backend_session: &str,
+) -> Option<u32> {
+    snapshot
+        .descendant_pids(backend_session)
+        .into_iter()
+        .find(|&pid| pidpath(pid).is_some_and(|path| path.to_string_lossy().contains("claude")))
 }
 
 // ===== 定期走査（#772: メインスレッド専有 400ms/tick の根治） =====
@@ -416,7 +361,17 @@ pub enum ScanOutcome {
 /// stale 検知の定期走査本体。**background executor から呼ぶこと**
 /// （変化時は tmux / ps を起動する）
 pub fn poll(targets: Vec<StaleScanTarget>, prev: &ScanState) -> ScanOutcome {
-    poll_with_launcher(targets, prev, launcher_path())
+    poll_with_snapshot(targets, prev, None)
+}
+
+/// sleep guard と同じ tick の `ProcessSnapshot` を共有して走査する。
+/// snapshot が無く、かつ stale 側の再走査が必要なら内部で 1 回だけ採取する。
+pub fn poll_with_snapshot(
+    targets: Vec<StaleScanTarget>,
+    prev: &ScanState,
+    snapshot: Option<&crate::agents::ProcessSnapshot>,
+) -> ScanOutcome {
+    poll_with_launcher_and_snapshot(targets, prev, launcher_path(), snapshot)
 }
 
 /// ランチャを明示して走査する（セルフテストが偽 claude を差し込むための入口。
@@ -426,6 +381,15 @@ pub fn poll_with_launcher(
     targets: Vec<StaleScanTarget>,
     prev: &ScanState,
     launcher: Option<PathBuf>,
+) -> ScanOutcome {
+    poll_with_launcher_and_snapshot(targets, prev, launcher, None)
+}
+
+fn poll_with_launcher_and_snapshot(
+    targets: Vec<StaleScanTarget>,
+    prev: &ScanState,
+    launcher: Option<PathBuf>,
+    snapshot: Option<&crate::agents::ProcessSnapshot>,
 ) -> ScanOutcome {
     let fingerprint = launcher.as_deref().and_then(fingerprint_of);
     let now = std::time::Instant::now();
@@ -443,14 +407,19 @@ pub fn poll_with_launcher(
     let results = if targets.is_empty() || current_binary.is_none() {
         Vec::new()
     } else {
-        let snapshot = ProcessSnapshot::capture();
+        let captured;
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = crate::agents::ProcessSnapshot::capture();
+                &captured
+            }
+        };
         targets
             .iter()
             .map(|t| StaleScanResult {
                 key: t.key,
-                running_binary: snapshot
-                    .find_claude_pid(&t.backend_session)
-                    .and_then(pidpath),
+                running_binary: find_claude_pid(snapshot, &t.backend_session).and_then(pidpath),
             })
             .collect()
     };

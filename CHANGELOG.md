@@ -97,6 +97,14 @@ Nightly patch release (automated). Changes since v0.6.4:
 
 ### Fixed / 修正
 
+- Sleep guard no longer launches `ps` on every two-second tick (#779). It shares one
+  process snapshot with stale-binary detection and rescans only on backend, agent-role, or
+  command-state changes, plus a 60-second safety interval; unchanged ticks reuse the cached
+  result for sleep assertions, GUI-mode classification, and close confirmation.
+- sleep guard が 2 秒 tick ごとに `ps` を起動し続ける問題を修正（#779）。stale binary
+  検知と 1 個の process snapshot を共有し、backend・エージェント role・コマンド状態の
+  変化時と 60 秒の保険だけ再走査する。変化のない tick は前回結果をスリープアサーション・
+  GUI モード判定・close 確認で共有する。
 - Markdown tables inside the chat view no longer wrap one character per line (#745).
   A cell whose text fitted its column collapsed to zero width and stacked its characters
   vertically, so a single row grew past half the pane; the same table in the preview pane
