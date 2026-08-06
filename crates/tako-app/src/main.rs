@@ -427,10 +427,18 @@ struct PromptFlow {
     paste_reflected: bool,
     /// 未達で打ち切ったときの理由コード（規約により画面内容・送信テキストは含めない）
     unverified_reason: Option<&'static str>,
+    /// worker レジストリへ初回プロンプトの送達結果を記録するフローか。
+    /// 通常の後続 send は同じ送達確認ループを使うが、spawn の状態は変更しない（#778）
+    delivery_flow: tako_control::orchestrator::registry::PromptDeliveryFlow,
 }
 
 impl PromptFlow {
-    fn new(pane: PaneId, prompt: String, wait_tui: bool) -> Self {
+    fn new(
+        pane: PaneId,
+        prompt: String,
+        wait_tui: bool,
+        delivery_flow: tako_control::orchestrator::registry::PromptDeliveryFlow,
+    ) -> Self {
         let now = std::time::Instant::now();
         Self {
             pane,
@@ -453,13 +461,19 @@ impl PromptFlow {
             queue_recalls: 0,
             paste_reflected: false,
             unverified_reason: None,
+            delivery_flow,
         }
     }
 
     /// Enter 単独送達フロー（Issue #95）: dispatch の Enter 単独送信
     /// （text が空 / 改行のみ）用。信頼ダイアログ処理 → Enter → 空検証 + 再送
     fn new_enter_only(pane: PaneId) -> Self {
-        let mut flow = Self::new(pane, String::new(), false);
+        let mut flow = Self::new(
+            pane,
+            String::new(),
+            false,
+            tako_control::orchestrator::registry::PromptDeliveryFlow::FollowUpSend,
+        );
         flow.enter_only = true;
         flow
     }
@@ -468,7 +482,12 @@ impl PromptFlow {
     /// のため検証（VerifySubmitted）から開始する。`baseline` は Enter 書き込み直前の
     /// 入力欄内容（同じ内容が残っていれば未送達 = Enter を単独再送）
     fn new_enter_verify(pane: PaneId, baseline: String) -> Self {
-        let mut flow = Self::new(pane, String::new(), false);
+        let mut flow = Self::new(
+            pane,
+            String::new(),
+            false,
+            tako_control::orchestrator::registry::PromptDeliveryFlow::FollowUpSend,
+        );
         flow.enter_only = true;
         flow.baseline = Some(baseline);
         flow.state = PromptFlowState::VerifySubmitted;
@@ -4953,10 +4972,14 @@ impl TakoApp {
             return;
         }
         let pane = flow.pane.as_u64();
+        let delivery_flow = flow.delivery_flow;
         std::thread::spawn(move || {
-            if let Err(e) =
-                tako_control::orchestrator::registry::record_prompt_delivery(pane, false, reason)
-            {
+            if let Err(e) = tako_control::orchestrator::registry::record_prompt_delivery(
+                pane,
+                delivery_flow,
+                false,
+                reason,
+            ) {
                 eprintln!("warning: worker レジストリへの送達結果記録に失敗: {e}");
             }
         });
@@ -4968,10 +4991,14 @@ impl TakoApp {
             return;
         }
         let pane = flow.pane.as_u64();
+        let delivery_flow = flow.delivery_flow;
         std::thread::spawn(move || {
-            if let Err(e) =
-                tako_control::orchestrator::registry::record_prompt_delivery(pane, true, "verified")
-            {
+            if let Err(e) = tako_control::orchestrator::registry::record_prompt_delivery(
+                pane,
+                delivery_flow,
+                true,
+                "verified",
+            ) {
                 eprintln!("warning: worker レジストリへの送達結果記録に失敗: {e}");
             }
         });
@@ -14490,11 +14517,30 @@ impl SessionHost for TakoApp {
     }
 
     fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
-        self.prompt_flows.push(PromptFlow::new(pane, prompt, true));
+        self.prompt_flows.push(PromptFlow::new(
+            pane,
+            prompt,
+            true,
+            tako_control::orchestrator::registry::PromptDeliveryFlow::FollowUpSend,
+        ));
+    }
+
+    fn queue_spawn_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        self.prompt_flows.push(PromptFlow::new(
+            pane,
+            prompt,
+            true,
+            tako_control::orchestrator::registry::PromptDeliveryFlow::SpawnPrompt,
+        ));
     }
 
     fn queue_send_flow(&mut self, pane: PaneId, text: String) {
-        self.prompt_flows.push(PromptFlow::new(pane, text, false));
+        self.prompt_flows.push(PromptFlow::new(
+            pane,
+            text,
+            false,
+            tako_control::orchestrator::registry::PromptDeliveryFlow::FollowUpSend,
+        ));
     }
 
     fn queue_enter_flow(&mut self, pane: PaneId) {
@@ -38114,6 +38160,170 @@ mod self_test {
                 }
 
                 let _ = std::fs::remove_file(&pdf770);
+            }
+
+            // 105. Delivered 済み worker への後続 send 失敗は spawn プロンプトの
+            // 未達へ転落させない（#778）。実 dispatch の Send → queue_send_flow →
+            // PromptFlow タイムアウト → worker_status までを隔離データで通す。
+            {
+                use tako_control::orchestrator::registry::{
+                    PromptDeliveryFlow, RegisterSpawn, WorkerRegistry,
+                };
+                use tako_control::protocol::Request as Req;
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("105: 基準ペインの取得 (#778)")
+                };
+                let busy_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            Req::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: Some(vec![
+                                    "/bin/sh".into(),
+                                    "-c".into(),
+                                    r"printf '\033[?1049h'; printf 'worker busy'; sleep 3600"
+                                        .into(),
+                                ]),
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(busy_pane) = busy_pane else {
+                    fail("105: busy worker ペインを作れない (#778)")
+                };
+                let mut alt_screen = false;
+                for _ in 0..100 {
+                    alt_screen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&busy_pane)
+                                .is_some_and(|s| s.is_alt_screen())
+                        })
+                        .unwrap_or(false);
+                    if alt_screen {
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                check(alt_screen, "105: worker が busy な全画面状態になる (#778)");
+
+                let worker_id = tako_control::orchestrator::registry::record_spawn(RegisterSpawn {
+                    project: "selftest-778".into(),
+                    agent: "claude".into(),
+                    pane: busy_pane.as_u64(),
+                    issues: vec![778],
+                    ..Default::default()
+                })
+                .unwrap_or_else(|e| fail(&format!("105: worker 登録に失敗: {e}")));
+                WorkerRegistry::mutate(|reg| {
+                    let entry = reg
+                        .workers
+                        .get_mut(&worker_id)
+                        .expect("直前に登録した worker が存在する");
+                    entry.session_id = Some("selftest-778-session".into());
+                    entry.prompt_delivered_at = Some(tako_control::sessions::now_iso());
+                })
+                .unwrap_or_else(|e| fail(&format!("105: Delivered 証跡の記録に失敗: {e}")));
+
+                let queued = fire(
+                    Req::Send {
+                        pane: Some(busy_pane.as_u64()),
+                        text: "follow-up".into(),
+                        newline: true,
+                        tmux_session: None,
+                        await_prompt: false,
+                    },
+                    cx,
+                )
+                .is_some_and(|v| v["queued"].as_bool() == Some(true));
+                check(queued, "105: busy 中の後続 send が PromptFlow に入る (#778)");
+                let follow_up_flow = window
+                    .update(cx, |app, _, _| {
+                        let flow = app
+                            .prompt_flows
+                            .iter_mut()
+                            .find(|flow| flow.pane == busy_pane)
+                            .expect("直前に積んだ PromptFlow が存在する");
+                        let follow_up = flow.delivery_flow == PromptDeliveryFlow::FollowUpSend;
+                        flow.created_at = std::time::Instant::now()
+                            - std::time::Duration::from_secs(121);
+                        app.drive_prompt_flows();
+                        follow_up
+                    })
+                    .unwrap_or(false);
+                check(
+                    follow_up_flow,
+                    "105: 後続 send が spawn 送達フローと識別される (#778)",
+                );
+                wait(cx, 500).await;
+
+                let status = fire(
+                    Req::OrchestratorWorkerStatus {
+                        pane_id: None,
+                        session_id: None,
+                        tmux_session: None,
+                        worker: Some(worker_id.clone()),
+                    },
+                    cx,
+                )
+                .unwrap_or_else(|| fail("105: worker_status の取得に失敗 (#778)"));
+                let no_undelivered = status["events"].as_array().is_none_or(|events| {
+                    events
+                        .iter()
+                        .all(|event| event["kind"].as_str() != Some("prompt_undelivered"))
+                });
+                let reg = WorkerRegistry::load()
+                    .unwrap_or_else(|e| fail(&format!("105: worker 再読込に失敗: {e}")));
+                let (_, entry) = reg
+                    .resolve(&worker_id)
+                    .unwrap_or_else(|e| fail(&format!("105: worker 再解決に失敗: {e}")));
+                println!(
+                    "TAKO_SELF_TEST_778: busy={alt_screen} follow_up={follow_up_flow} \
+                     prompt_delivery={} failed_at={} undelivered_event={}",
+                    status["prompt_delivery"].as_str().unwrap_or("(none)"),
+                    entry.prompt_delivery_failed_at.is_some(),
+                    !no_undelivered,
+                );
+                check(
+                    status["prompt_delivery"].as_str() == Some("delivered")
+                        && entry.prompt_delivery_failed_at.is_none()
+                        && no_undelivered,
+                    "105: busy 中の後続 send 失敗後も Delivered のまま (#778)",
+                );
+                fire(
+                    Req::Close {
+                        pane: Some(busy_pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    cx,
+                );
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

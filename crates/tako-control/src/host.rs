@@ -58,6 +58,12 @@ pub trait SessionHost {
     /// 信頼ダイアログ承諾 → ❯ 待ち → 貼り付け → 分離 Enter → 入力欄の空検証 + 再送
     /// のステートマシンを駆動する（Issue #32 送達確認ループ）
     fn queue_prompt_flow(&mut self, _pane: PaneId, _prompt: String) {}
+    /// worker spawn の初回プロンプト送達フローを登録する（Issue #530 / #778）。
+    /// 通常の後続 send と区別し、初回プロンプトの送達結果だけを worker
+    /// レジストリへ記録する。既定実装はテスト用モックとの互換のため通常フローへ委譲する
+    fn queue_spawn_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        self.queue_prompt_flow(pane, prompt);
+    }
     /// 送達確認つき送信フローを登録する（Issue #32）。`queue_prompt_flow` と同じ
     /// ステートマシンだが claude TUI の起動を待たず、現画面へ即座に貼り付ける
     /// （全画面 TUI への newline つき送信用）。既定実装は何もしない（テスト用モック等）
