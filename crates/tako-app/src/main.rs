@@ -3343,6 +3343,13 @@ impl TakoApp {
             let mut pane_log_tick: u32 = 0;
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
+                // 隔離インスタンスへの SIGTERM を正規の quit として扱う（#770）。
+                // 本番では仕掛けが入らないので何も起きない。Cmd+Q と同じ
+                // `cx.quit()` を通すので、実測しているのは本番と同じ終了経路
+                if tako_core::platform::quit_signal::take_quit_request() {
+                    cx.update(|cx| cx.quit());
+                    break;
+                }
                 // リモート接続の承認待ち・接続端末を更新（#283。状態確認 + admin API は
                 // すべて background で行い、UI スレッドをブロックしない。daemon 停止中は
                 // running=false になるだけ）
@@ -5801,9 +5808,21 @@ impl TakoApp {
 
     /// ペインを閉じたときのバックエンドセッション破棄（Phase 5.5）。
     /// **明示 close のときだけ**呼ぶ（アプリ終了経路では呼ばない = セッションが残り永続化）。
-    /// シェル exit 由来の close では既にセッションが消えており kill は無害な空振りになる
-    fn drop_backend_session(&mut self, pane_id: PaneId) {
+    /// シェル exit 由来の close では既にセッションが消えており kill は無害な空振りになる。
+    ///
+    /// #770: kill は「実行中プロセスの器を捨てる」不可逆操作なので、発生源つきで
+    /// persist.log に必ず記録する。従来の痕跡はペインログのクローズマーカーだけで、
+    /// これは `pane_logs` 設定で OFF にできるため、OFF の環境では「再起動が消したのか
+    /// 明示 close が消したのか」を事後に切り分ける材料が一切残らなかった
+    fn drop_backend_session(&mut self, pane_id: PaneId, origin: CloseOrigin, caller: Option<&str>) {
         if let Some(name) = self.backend_sessions.remove(&pane_id) {
+            if !self.secondary {
+                persist_diag(&format!(
+                    "セッション kill: pane={} session={name}（発生源 {}）",
+                    pane_id.as_u64(),
+                    origin.marker_with_caller(caller)
+                ));
+            }
             let socket = tako_core::tmux_backend::socket_name();
             std::thread::spawn(move || tako_core::tmux_backend::kill_session(&socket, &name));
         }
@@ -5849,7 +5868,7 @@ impl TakoApp {
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
         self.claude_resume_sessions.remove(&pane_id);
         if reason.is_explicit() {
-            self.drop_backend_session(pane_id);
+            self.drop_backend_session(pane_id, reason.origin(), None);
         } else {
             self.backend_sessions.remove(&pane_id);
         }
@@ -5957,6 +5976,23 @@ impl TakoApp {
             return;
         };
         let pane_ids: Vec<PaneId> = tab.tree().panes().iter().map(|p| p.id()).collect();
+        // #770: タブ close は複数ペインと tmux セッションを一度に失う。ペイン単位の
+        // 「セッション kill」行だけでは「タブ 1 枚が消えた」という形が読み取りにくいので、
+        // 明示 close のときは失う規模も 1 行で残す（実機ではこの記録が無く、
+        // 事故が「再起動でタブが消えた」と誤って切り分けられた）
+        if !self.secondary && reason.is_explicit() {
+            let killed = pane_ids
+                .iter()
+                .filter(|id| self.backend_sessions.contains_key(id))
+                .count();
+            persist_diag(&format!(
+                "タブ close: tab={} ペイン {} / セッション kill {}（発生源 {}）",
+                tab_id.as_u64(),
+                pane_ids.len(),
+                killed,
+                reason.origin().marker()
+            ));
+        }
         // ペインログの最終フラッシュ（Issue #112 B）。タブ close / 全ペイン終了の両分岐で
         // 素材を close 前に採取し、どちらの経路でも書き残す
         let log_closes: Vec<(PaneId, PaneLogCloseData)> = pane_ids
@@ -14489,7 +14525,7 @@ impl SessionHost for TakoApp {
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
         self.drop_tmux_view_session(pane);
-        self.drop_backend_session(pane);
+        self.drop_backend_session(pane, origin, caller);
     }
 
     fn reattach_backgrounded(&mut self, pane: PaneId) {
@@ -17824,6 +17860,10 @@ fn main() {
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
     tako_control::diag::spawn_stall_watchdog();
+    // #770: 隔離インスタンスに限り SIGTERM を正規の quit（`on_app_quit` を通る）へ
+    // 読み替える。「quit がセッションを kill しない」ことを pid 指定で実測するため。
+    // 本番は仕掛けを入れないので SIGTERM の挙動は不変
+    tako_core::platform::quit_signal::install_for_isolated_verification();
     // 一括隔離モード（#177）: TAKO_ISOLATED=1 だけで本番リソース（layout.json /
     // tmux バックエンド / discovery）に一切触れない起動になる。実験・検証で個別の
     // 隔離変数を指定し漏らす事故（TAKO_DISCOVERY_DIR だけ隔離した dev 起動が
@@ -37918,6 +37958,164 @@ mod self_test {
                 }
             }
 
+            // 104. タブ × close の発生源マーカー（#770）。
+            // 実地では「プレビュー混在タブが再起動で消えた」と報告されたが、実体は
+            // その 2 時間 44 分前のタブ × close だった。それを確定できた唯一の材料が
+            // ペインログのクローズマーカー `close:gui-tab` で、ここがずれると
+            // 同種の事故を二度と切り分けられない。プレビューペインが混ざったタブでも
+            // タブ × が全ペインへ同じ発生源を残すことを機械検証する。
+            // （セッション kill 側は self test では測れない: TAKO_SELF_TEST は persist を
+            //   OFF にするため tmux バックエンドがそもそも無い。kill と persist.log の
+            //   監査行は隔離 e2e（persist ON）で実測している）
+            {
+                use tako_control::protocol::Request as Req;
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+
+                // ターミナル 2 + プレビュー 1 のタブを作る（#770 の消えたタブと同じ構成）
+                let created = fire(
+                    Req::TabNew {
+                        title: Some("st770".into()),
+                        focus: Some(true),
+                    },
+                    cx,
+                );
+                let tab770 = created.as_ref().and_then(|v| v["tab"].as_u64());
+                let base770 = created.as_ref().and_then(|v| v["pane"].as_u64());
+                let (Some(tab770), Some(base770)) = (tab770, base770) else {
+                    fail("104: 検証用タブを作れない (#770)");
+                };
+                wait(cx, 1500).await;
+                fire(
+                    Req::Split {
+                        pane: Some(base770),
+                        tab: None,
+                        direction: None,
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    cx,
+                );
+                wait(cx, 1500).await;
+                let pdf770 =
+                    std::env::temp_dir().join(format!("tako-st770-{}.pdf", std::process::id()));
+                write_test_pdf(&pdf770);
+                fire(
+                    Req::OpenFile {
+                        pane: Some(base770),
+                        path: pdf770.display().to_string(),
+                        mode: None,
+                        direction: Some(tako_control::protocol::Direction::Down),
+                        focus: Some(false),
+                    },
+                    cx,
+                );
+                wait(cx, 1500).await;
+
+                // close 前に構成を控える（ペイン生成は負荷で遅れるので揃うまで待つ）。
+                // シェルのプロンプトが出るまで待つのも必須: ペインログは「何も出ていない
+                // ペイン」にはファイルを作らないため、待たないとマーカー検査が空振りする
+                let mut panes770: Vec<PaneId> = Vec::new();
+                let mut has_preview = false;
+                let mut drawn = 0usize;
+                for _ in 0..30 {
+                    (panes770, has_preview, drawn) = window
+                        .update(cx, |app, _, _| {
+                            let panes: Vec<PaneId> = app
+                                .workspace
+                                .get_tab(TabId::from_raw(tab770))
+                                .map(|t| t.tree().panes().iter().map(|p| p.id()).collect())
+                                .unwrap_or_default();
+                            let preview = panes.iter().any(|p| app.previews.contains_key(p));
+                            let drawn = panes
+                                .iter()
+                                .filter(|p| {
+                                    app.terminals.get(p).is_some_and(|s| {
+                                        s.visible_lines().iter().any(|l| !l.trim().is_empty())
+                                    })
+                                })
+                                .count();
+                            (panes, preview, drawn)
+                        })
+                        .unwrap_or_default();
+                    if panes770.len() == 3 && has_preview && drawn == 2 {
+                        break;
+                    }
+                    wait(cx, 500).await;
+                }
+                println!(
+                    "TAKO_SELF_TEST_770_TAB: panes={} preview={has_preview} drawn={drawn}",
+                    panes770.len(),
+                );
+                check(
+                    panes770.len() == 3 && has_preview,
+                    "104: 検証用タブがターミナル 2 + プレビュー 1 で組めた (#770)",
+                );
+
+                // タブ × ボタンと同じハンドラで閉じる（cmd 押下 = 確認スキップ）
+                window
+                    .update(cx, |app, _, cx| {
+                        app.close_tab_with_confirm(TabId::from_raw(tab770), true, cx);
+                    })
+                    .ok();
+                wait(cx, 1500).await;
+
+                let tab_gone = window
+                    .update(cx, |app, _, _| {
+                        app.workspace.get_tab(TabId::from_raw(tab770)).is_none()
+                    })
+                    .unwrap_or(false);
+                check(tab_gone, "104: タブ × でタブが閉じる (#770)");
+
+                // 発生源マーカーが close:gui-tab であること（事後の切り分けの根拠）。
+                // 期待は「ターミナル 2 ペインぶん」（プレビューペインはログを持たない）。
+                // ウィンドウが他アプリに完全に隠れていると GPUI が描画を止め、新ペインの
+                // シェルが 1 行も出さない = ペインログのファイル自体が作られない。
+                // product の欠陥ではないので落とさず、飛ばしたことを明示する（76d と同じ扱い）
+                if drawn == 2 {
+                    let markers: Vec<String> = tako_core::pane_log::log_dir()
+                        .map(|dir| {
+                            panes770
+                                .iter()
+                                .filter_map(|p| {
+                                    tako_core::pane_log::latest_for_pane(&dir, p.as_u64())
+                                })
+                                .filter_map(|path| tako_core::pane_log::read_tail(&path, 5).ok())
+                                .flat_map(|tail| {
+                                    tail.lines()
+                                        .filter_map(tako_core::pane_log::close_marker_reason)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    println!("TAKO_SELF_TEST_770_MARKERS: {markers:?}");
+                    check(
+                        markers.len() == 2
+                            && markers.iter().all(|m| {
+                                m == tako_core::pane_log::CloseOrigin::TabButton.marker()
+                            }),
+                        "104: タブ × close の発生源が close:gui-tab で記録される (#770)",
+                    );
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 104 のマーカー検査（新ペインが未描画 = \
+                         ペインログが作られない。ウィンドウを前面にして再実行すると検証できる）"
+                    );
+                }
+
+                let _ = std::fs::remove_file(&pdf770);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -38922,6 +39120,147 @@ mod pane_content_geometry_tests {
             stacked.len(),
             5,
             "積まれる要素が変わっている: {stacked:?}（実測経路の検証対象を見直すこと）"
+        );
+    }
+}
+
+/// セッション kill の境界を守る番犬（#770）。
+///
+/// tmux バックエンドセッションは「実行中プロセスの器」なので、kill してよいのは
+/// **ユーザー / AI の明示 close だけ**（#30）。アプリ終了（`on_app_quit`）・PTY 死亡・
+/// 復元では絶対に kill しない。この不変条件はレビューでしか守られていなかったため、
+/// 新しい kill 経路が生えたらここで落ちるようにする。
+#[cfg(test)]
+mod session_kill_boundary_tests {
+    /// `drop_backend_session`（= 実際に kill を撃つ唯一の入口）を呼んでよい場所。
+    /// 追加するときは必ず理由を書く（黙って穴を開けない）
+    const ALLOWED_CALLERS: &[(&str, &str)] = &[
+        (
+            "drop_backend_session_with",
+            "明示 close だけを kill に通す出し分け（#30）。PTY 死亡はここで弾かれる",
+        ),
+        (
+            "detach_session",
+            "ControlHost = CLI / MCP の明示 close（発生源つき）",
+        ),
+    ];
+
+    /// 走査対象のソース。この番犬モジュール自身（パターン文字列を含む）は除外する
+    fn source(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+        let marker = concat!("mod ", "session_kill_boundary_tests");
+        match text.find(marker) {
+            Some(i) => text[..i].to_string(),
+            None => text,
+        }
+    }
+
+    /// セッション kill の呼び出しが、許可した関数の中だけにあること。
+    /// 判定は「直前に現れた `fn 名前(`」で行う（関数境界の近似で十分な粒度）
+    #[test]
+    fn セッションkillの呼び出しが明示close経路の外に無い() {
+        // drawer.rs（たまり場カードの kill 確認）は GUI の明示操作なので別枠で許可する
+        let files = ["src/main.rs", "src/drawer.rs"];
+        let mut offenders = Vec::new();
+        for rel in files {
+            let text = source(rel);
+            let mut current_fn = String::from("(ファイル先頭)");
+            for (i, line) in text.lines().enumerate() {
+                if let Some(rest) = line.trim_start().strip_prefix("fn ") {
+                    current_fn = rest.split('(').next().unwrap_or("").to_string();
+                }
+                // 呼び出し形（レシーバつき）だけを見る。定義・ドキュメント中の言及は無視
+                if !line.contains(".drop_backend_session(") {
+                    continue;
+                }
+                let allowed = ALLOWED_CALLERS.iter().any(|(f, _)| *f == current_fn)
+                    // たまり場ドロワーの kill 確認（GUI の明示操作）はクロージャの中なので
+                    // 関数名で切れない。ファイル単位で許可する
+                    || rel == "src/drawer.rs";
+                if !allowed {
+                    offenders.push(format!("{rel}:{} （{current_fn} の中）", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "セッション kill が明示 close 経路の外から呼ばれている:\n  {}\n\
+             → 明示 close なら drop_backend_session_with を通し、\
+             アプリ終了・PTY 死亡では kill しないこと（#30 / #770）",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// クローズマーカー `close:gui-tab` が **GUI のタブ × 経路でしか付かない**こと（#770）。
+    ///
+    /// 事故の切り分けはこのマーカーだけを根拠に「再起動ではなくタブ × だった」と
+    /// 断定した。別経路（dispatch・内部後始末・アプリ終了）が同じ発生源を名乗ると
+    /// 事後調査が成立しなくなるので、`CloseOrigin::TabButton` の出現場所を固定する。
+    #[test]
+    fn タブcloseの発生源はgui経路だけが名乗る() {
+        // 許可: タブ × のハンドラと、その確認ダイアログの承認、およびセルフテストの後始末
+        const ALLOWED_FNS: &[&str] = &[
+            "close_tab_with_confirm", // タブバーの × ボタン
+            "close_confirm_accepted", // その確認ダイアログの「閉じる」
+            "remove_tab",             // 既定の発生源を GUI タブ × とするヘルパ
+        ];
+        let text = source("src/main.rs");
+        let mut current_fn = String::from("(ファイル先頭)");
+        let mut offenders = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if let Some(rest) = line.trim_start().strip_prefix("fn ") {
+                current_fn = rest.split('(').next().unwrap_or("").to_string();
+            }
+            // 発生源として**渡している**行だけを見る。`.marker()` は
+            // 期待値を引くだけの読み取り（セルフテストの検査など）なので対象外
+            if !line.contains("CloseOrigin::TabButton") || line.contains(".marker()") {
+                continue;
+            }
+            if !ALLOWED_FNS.contains(&current_fn.as_str()) {
+                offenders.push(format!("src/main.rs:{} （{current_fn} の中）", i + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "close:gui-tab を GUI のタブ × 以外が名乗っている:\n  {}\n\
+             → 発生源が混ざると「再起動で消えた / 明示 close で消えた」の\
+             事後切り分けができなくなる（#566 / #770）",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// `on_app_quit` に登録する終了処理がセッションを kill しないこと（#770 の受け入れ条件 2）。
+    /// quit のクロージャ本体を切り出して、kill 系の呼び出しが含まれないことを見る
+    #[test]
+    fn アプリ終了処理はセッションをkillしない() {
+        let text = source("src/main.rs");
+        let start = text
+            .find("cx.on_app_quit(")
+            .expect("on_app_quit の登録が見つからない（構造が変わったらこの番犬も見直すこと）");
+        let body = &text[start..];
+        let end = body
+            .find("\n        .detach();")
+            .expect("on_app_quit クロージャの終端が見つからない");
+        let body = &body[..end];
+        for forbidden in [
+            "drop_backend_session",
+            "kill_session",
+            "drop_tmux_view_session",
+            "remove_pane",
+            "remove_tab",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "アプリ終了処理に {forbidden} が入っている。\
+                 quit は detach（セッションを残す）だけで、kill してはいけない（#30 / #770）"
+            );
+        }
+        // 逆に、終了処理が本来やるべきこと（構成の保存）は残っていること
+        assert!(
+            body.contains("save_layout()"),
+            "アプリ終了処理から save_layout が消えている（再起動で構成を失う）"
         );
     }
 }
