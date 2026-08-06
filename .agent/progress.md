@@ -1784,3 +1784,5 @@
 - sleep guard の子プロセス走査を backend・role・OSC 状態の変化時 + 60 秒保険に限定し、
   #772 の `ProcessSnapshot` を stale binary 検知と共有。アイドル実測は `ps` 34 回 / 約 75 秒 → 3 回 / 約 72 秒（約 91% 減）。
 - 隔離実経路で worker 実行中の sleep assertion 保持と終了後の解除を確認。CPU は高負荷下でも約 0.6% で目標 10% 未満、残る 2 秒 tick に常時重い処理は観測されなかった。
+- 関連コミット: `14bea3a`（PR #783 squash merge）。#781 へ rebase 後の macOS CI 緑 +
+  隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK` / FAILED 0。#771 型フレークは load 10 前後で消えた）

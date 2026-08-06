@@ -3,9 +3,9 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-06、Issue #779 sleep guard の `ps` 起動削減）
+## 現在の対象（2026-08-06、Issue #779 sleep guard の `ps` 起動削減 = **完了**）
 
-- worktree `../tako-wt-779` / ブランチ `improve/779-sleep-guard-ps` / PR #783
+- PR #783 を `14bea3a` として squash merge 済み。Issue #779 クローズ、worktree / ブランチ削除済み
 - #772 の `ProcessSnapshot` を `agents` 側へ移して stale binary 検知と共有し、同じ tick で
   両方が必要とするプロセス一覧を 1 回の `tmux list-panes` + `ps` で賄う
 - sleep guard の走査は初回・対象の backend / role / OSC 状態変化・モード有効化・60 秒経過時だけ。
@@ -27,12 +27,14 @@
 
 ## 検証状況
 
-- `cargo test --workspace` / `cargo fmt --all --check` /
-  `cargo clippy --workspace --all-targets -- -D warnings` は緑
+- macOS CI 緑（rebase 後の `4b31270`）= fmt --check / clippy -D warnings / build / test の全ステップ
 - 最新 main（#781 の `8aeb939`）へ rebase 済み。競合は `activeContext` / `progress` の
   ドキュメント 2 件のみで、`main.rs` は自動マージ（#781 はペイン描画・本件は periodic の別領域）
-- 隔離セルフテストは高負荷下で #771 型の無関係な GUI タイミング項目が 4 回フレークした
-  （入力予測 zsh・#680・#181 が 2 回）。負荷の谷で完走結果を取り直すのが残作業
+- 隔離セルフテスト完走（release バイナリ + 専用 data dir + 専用 tmux socket）:
+  `TAKO_APP_SELF_TEST_OK` / exit 0 / FAILED 0 件。SKIPPED は項目 104 のマーカー検査のみ
+  （ウィンドウ非前面の既知）。#781 の `TAKO_SELF_TEST_781: gap 0.0 -> 0.0` も rebase 後に通過
+- 前回 4 回フレークした #771 型の GUI タイミング項目は load average 10 前後では全て通過
+- 本番 GUI（pid 53327）と本番 tmux socket `tako`（9 セッション）は検証の前後で不変
 
 ## 不変条件
 
@@ -46,10 +48,8 @@
 
 ## 次の手順
 
-1. 負荷低下後に隔離セルフテストを再実行し `TAKO_APP_SELF_TEST_OK` を確認
-2. force-with-lease で PR #783 を更新 → macOS CI 緑 → squash merge（`--delete-branch`）
-3. Issue #779 に証拠をコメントしてクローズ → main 同期 → worktree 削除
-4. 並走ビルドがないことを確認して `scripts/build-app.sh --install`。GUI 再起動は master 側
+1. `scripts/build-app.sh --install` で `/Applications/tako.app` を更新（他 worker のビルドと同時に走らせない）
+2. GUI 再起動は master 側。再起動後に本番のアイドル CPU を体感確認（#779 の効果は本番未反映）
 
 ## 現フェーズで Read すべき設計書
 
