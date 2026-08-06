@@ -1761,3 +1761,8 @@
 - **事故**: 検証に使った System Events の Cmd+Q がグローバル送出で本番 tako に着弾し終了させた。
   以後キーストローク送出は禁止、quit は pid 指定 SIGTERM、e2e は本番 pid 不変をアサートする
 - 次: 別 Issue 化（GUI close が workers.yaml に closed を残さない / テストが本番 data dir を汚す）
+
+## 2026-08-06（#778: 後続 send 失敗の prompt_undelivered 偽陽性を修正）
+- PromptFlow を spawn 初回 / 後続 send に識別し、後続失敗が worker の初回送達状態を変更しないよう修正。#530 の初回ダイアログ未達検知は維持
+- 関連コミット: `add1053` `[修正] 後続send失敗のprompt未達誤検知を防ぐ (#778)`。PR #780 merge、Issue クローズ、全 CI 緑、0.6.7 app 導入済み
+- 検証: unit 2 本 + 隔離実経路項目 105（busy 後続 send timeout 後も Delivered）+ workspace test / fmt / clippy / self-test 全緑

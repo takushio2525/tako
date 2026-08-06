@@ -41,8 +41,11 @@
 - 本番 GUI・本番 tmux socket `tako`・本番 data dir に触れない
 - System Events のキーストローク送出は禁止
 
-## 次
+## 完了状態
 
-- コミット → push → PR（Closes #778）→ macOS CI 緑確認 → squash merge
-- Issue に実測証拠をコメントしてクローズ
-- main 同期・worktree 削除後、他ビルド不在を確認して `scripts/build-app.sh --install`
+- PR #780 を squash merge（`add1053`）、Issue #778 は実測証拠コメントつきでクローズ
+- macOS / Windows / Cloudflare CI はすべて緑
+- main を fast-forward、専用 worktree とローカル・リモートブランチを削除済み
+- 別 worktree のビルド終了を待ってから `scripts/build-app.sh --install` を実行し、
+  `/Applications/tako.app` へ 0.6.7 を配置済み
+- GUI の再起動は master 側で行う
