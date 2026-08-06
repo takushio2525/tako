@@ -1558,6 +1558,9 @@ struct TakoApp {
     /// sleep guard の定期スキャン（2 秒 tick の background 実行）結果を再利用し、
     /// close 確認の判定で UI スレッドから tmux / ps を起こさないためのキャッシュ
     busy_backend_sessions: std::collections::HashSet<String>,
+    /// 子プロセス走査の対象指紋・前回結果・最終走査時刻（#779）。変化のない tick は
+    /// tmux / ps を起動せず、この状態を sleep guard / GUI モード / close 確認で共有する。
+    running_children_scan: tako_control::agents::RunningChildrenScanState,
     /// スリープ防止の最新状態（ステータスバーチップ + 詳細ポップオーバー表示用。
     /// ポーリングで更新。#173/#218/#440）
     sleep_guard_state: Option<tako_control::sleep_guard::SleepGuardState>,
@@ -2832,6 +2835,7 @@ impl TakoApp {
             confirm_close: tako_control::setup::confirm_close_enabled(),
             pending_close_confirm: None,
             busy_backend_sessions: std::collections::HashSet::new(),
+            running_children_scan: tako_control::agents::RunningChildrenScanState::default(),
             sleep_guard_state: None,
             sleep_guard_popover_open: false,
             sleep_guard_popover_anchor: None,
@@ -3501,9 +3505,16 @@ impl TakoApp {
                     }
                     // #666: 閉じたペインのコマンドカードを掃除する（メモリ操作のみ）
                     app.prune_command_cards();
-                    let sleep_guard_backends = {
+                    let running_children_scan = {
                         let _s = tako_control::diag::perf_span("periodic_prep:sleep_guard");
-                        app.sleep_guard_backends()
+                        (
+                            app.running_children_scan_targets(),
+                            app.running_children_scan.clone(),
+                        )
+                    };
+                    let stale_binary_scan = {
+                        let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
+                        app.collect_stale_binary_scan()
                     };
                     app.detect_new_failures();
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
@@ -3544,7 +3555,8 @@ impl TakoApp {
                         sidebar_git_cwd,
                         log_jobs,
                         app.pane_logs.clone(),
-                        sleep_guard_backends,
+                        running_children_scan,
+                        stale_binary_scan,
                     )
                 });
                 // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
@@ -3563,60 +3575,69 @@ impl TakoApp {
                     sidebar_git_cwd,
                     log_jobs,
                     pane_logs,
-                    sleep_guard_backends,
+                    running_children_scan,
+                    stale_binary_scan,
                 )) = prep
                 else {
                     break;
                 };
-                // ② background: sleep guard の settings 読み + 全バックエンドの子プロセス判定。
-                // #372: 旧実装は Unknown ペインのみ対象で、Idle のまま子プロセスが走る
-                // ペイン（TUI エージェント）を見落としていた。全バックエンドを対象にする
+                // ② background: sleep guard と stale binary のプロセス走査（#779）。
+                // 初回 / 対象・role・OSC 状態変化 / 60 秒保険でだけ tmux + ps を起動し、
+                // 両方が同じ tick で必要なら 1 個の ProcessSnapshot を共有する。
                 {
-                    let (settings, busy_sessions) = cx
+                    let (settings, running_children_scan, stale_outcome) = cx
                         .background_executor()
                         .spawn(async move {
-                            let busy = if sleep_guard_backends.is_empty() {
-                                Vec::new()
+                            let settings = tako_control::settings::load();
+                            let sleep_guard_active = settings.sleep_guard_mode
+                                == tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
+                            let (running_targets, running_prev) = running_children_scan;
+                            let now = std::time::Instant::now();
+                            let rescan_running =
+                                tako_control::agents::should_rescan_running_children(
+                                    &running_prev,
+                                    &running_targets,
+                                    sleep_guard_active,
+                                    now,
+                                );
+                            let snapshot = if rescan_running && !running_targets.is_empty() {
+                                Some(tako_control::agents::ProcessSnapshot::capture())
                             } else {
-                                let refs: Vec<&str> =
-                                    sleep_guard_backends.iter().map(|s| s.as_str()).collect();
-                                tako_control::agents::sessions_with_running_children(&refs)
+                                None
                             };
-                            (tako_control::settings::load(), busy)
+                            let running_state = if rescan_running {
+                                tako_control::agents::scan_running_children(
+                                    running_targets,
+                                    sleep_guard_active,
+                                    now,
+                                    snapshot.as_ref(),
+                                )
+                            } else {
+                                let mut state = running_prev;
+                                state.sleep_guard_active = sleep_guard_active;
+                                state
+                            };
+                            let stale_outcome = stale_binary_scan.map(|(targets, prev)| {
+                                tako_control::stale_binary::poll_with_snapshot(
+                                    targets,
+                                    &prev,
+                                    snapshot.as_ref(),
+                                )
+                            });
+                            (settings, running_state, stale_outcome)
                         })
                         .await;
-                    let ok = this.update(cx, |app: &mut TakoApp, _| {
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        let busy_sessions = running_children_scan.busy_sessions.clone();
+                        app.running_children_scan = running_children_scan;
                         app.apply_sleep_guard(&settings, busy_sessions);
+                        if stale_outcome.is_some_and(|outcome| app.apply_stale_binary_scan(outcome))
+                        {
+                            cx.notify();
+                        }
                     });
                     if ok.is_err() {
                         break;
-                    }
-                }
-                // ② background: stale claude バイナリの検知（#498 / #772）。
-                // UI スレッドでは対象ペインの一覧作りと結果の反映だけを行う。
-                // background 側も既定では stat だけで済ませ、claude が入れ替わった /
-                // 対象ペインが増減した / 60 秒経った tick でのみ tmux + ps を起動する
-                {
-                    let targets = this.update(cx, |app: &mut TakoApp, _| {
-                        let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
-                        app.collect_stale_binary_scan()
-                    });
-                    let Ok(targets) = targets else {
-                        break;
-                    };
-                    if let Some((targets, prev)) = targets {
-                        let outcome = cx
-                            .background_executor()
-                            .spawn(async move { tako_control::stale_binary::poll(targets, &prev) })
-                            .await;
-                        let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                            if app.apply_stale_binary_scan(outcome) {
-                                cx.notify();
-                            }
-                        });
-                        if ok.is_err() {
-                            break;
-                        }
                     }
                 }
                 // ② background: GUI モードのチャット読み取り（#702）。sleep_guard の
@@ -9689,14 +9710,47 @@ impl TakoApp {
         changed
     }
 
-    /// sleep guard の UI 収集部: 全バックエンドセッション名を集める。
-    /// 子プロセス有無の実判定（tmux + ps 実行）は background で行い、UI スレッドに
-    /// サブプロセス実行を置かない（#340）。
+    /// sleep guard の UI 収集部: 全バックエンドのセッション名・role・OSC 133 状態を
+    /// 変化検出用の指紋として集める（メモリ走査のみ）。
+    /// 子プロセス有無の実判定（tmux + ps）は background で、初回 / 指紋変化 /
+    /// 60 秒保険のときだけ行う（#340 / #779）。
     /// #372: 旧実装は Unknown ペインのみ対象だったが、OSC 133 の遷移に依存すると
     /// Idle のまま子プロセスが走るペイン（TUI エージェント）を見落とす。全バックエンドを
     /// 対象にし、子プロセス判定のみで busy を決定する
-    fn sleep_guard_backends(&self) -> Vec<String> {
-        self.backend_sessions.values().cloned().collect()
+    fn running_children_scan_targets(
+        &self,
+    ) -> Vec<tako_control::agents::RunningChildrenScanTarget> {
+        let mut roles: HashMap<PaneId, bool> = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.tree().panes())
+            .map(|pane| (pane.id(), pane.role().is_some()))
+            .collect();
+        roles.extend(
+            self.workspace
+                .shelved_panes()
+                .iter()
+                .map(|pane| (pane.id(), pane.role().is_some())),
+        );
+        let mut targets: Vec<_> = self
+            .backend_sessions
+            .iter()
+            .map(
+                |(pane_id, backend_session)| tako_control::agents::RunningChildrenScanTarget {
+                    backend_session: backend_session.clone(),
+                    command_state: self
+                        .terminals
+                        .get(pane_id)
+                        .map(|session| session.command_state())
+                        .unwrap_or(tako_core::CommandState::Unknown),
+                    has_agent_role: roles.get(pane_id).copied().unwrap_or(false),
+                },
+            )
+            .collect();
+        // HashMap の列挙順で指紋が揺れて毎 tick 再走査にならないよう固定する。
+        targets.sort_by(|a, b| a.backend_session.cmp(&b.backend_session));
+        targets
     }
 
     /// sleep guard の適用部。busy_sessions（バックエンドセッションのうち実行中子プロセスを

@@ -5,6 +5,7 @@
 //! `pane_pid` からプロセス祖先を辿って「どのペインで動いているか」を対応付ける。
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -85,6 +86,146 @@ pub fn process_parent_map() -> HashMap<u32, u32> {
         return HashMap::new();
     };
     parse_parent_map(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// tmux ペイン PID と全プロセスの親子関係を 1 回で採取した共有スナップショット。
+///
+/// `tmux list-panes -a` と `ps -axo pid=,ppid=` はどちらもサブプロセスを起動するため、
+/// 2 秒 tick の各機能が別々に採取してはならない。#772 の stale binary 検知と #779 の
+/// sleep guard は、同じ tick ではこの 1 個を共有する。
+#[derive(Debug, Clone)]
+pub struct ProcessSnapshot {
+    /// `session:window.pane` → ペインのシェル PID
+    panes: Vec<(String, u32)>,
+    /// pid → ppid
+    parents: HashMap<u32, u32>,
+    /// pid → 直接の子 PID 集合
+    children: HashMap<u32, Vec<u32>>,
+}
+
+impl ProcessSnapshot {
+    /// tmux と ps を各 1 回だけ実行して採取する。background executor 専用。
+    pub fn capture() -> Self {
+        let socket = tako_core::tmux_backend::socket_name();
+        let panes = tmux_pane_pids(Some(&socket));
+        let parents = process_parent_map();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&child, &parent) in &parents {
+            children.entry(parent).or_default().push(child);
+        }
+        Self {
+            panes,
+            parents,
+            children,
+        }
+    }
+
+    /// 指定 backend session の pane PID を除いた全子孫 PID を返す。
+    pub fn descendant_pids(&self, backend_session: &str) -> Vec<u32> {
+        let prefix = format!("{backend_session}:");
+        let mut queue: Vec<u32> = self
+            .panes
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .flat_map(|(_, pid)| self.children.get(pid).into_iter().flatten().copied())
+            .collect();
+        let mut descendants = Vec::new();
+        let mut visited = HashSet::new();
+        while let Some(pid) = queue.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            descendants.push(pid);
+            if let Some(kids) = self.children.get(&pid) {
+                queue.extend(kids);
+            }
+        }
+        descendants
+    }
+
+    /// backend session 群のうち、実行中の子プロセスを持つものを返す。
+    pub fn sessions_with_running_children(&self, sessions: &[&str]) -> Vec<String> {
+        sessions_with_children_inner(sessions, &self.panes, &self.parents)
+    }
+
+    #[cfg(test)]
+    fn from_parts(panes: Vec<(String, u32)>, parents: HashMap<u32, u32>) -> Self {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&child, &parent) in &parents {
+            children.entry(parent).or_default().push(child);
+        }
+        Self {
+            panes,
+            parents,
+            children,
+        }
+    }
+}
+
+/// sleep guard の子プロセス走査対象。backend 集合だけでなく、エージェント role と
+/// OSC 133 状態を指紋へ含め、開始・終了を次の tick で再走査できるようにする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningChildrenScanTarget {
+    pub backend_session: String,
+    pub command_state: tako_core::CommandState,
+    pub has_agent_role: bool,
+}
+
+/// sleep guard / GUI モード / close 確認で共有する子プロセス走査状態。
+#[derive(Debug, Clone, Default)]
+pub struct RunningChildrenScanState {
+    pub targets: Vec<RunningChildrenScanTarget>,
+    pub busy_sessions: Vec<String>,
+    pub scanned_at: Option<Instant>,
+    /// 前回の走査時に while-agents-running が有効だったか。
+    pub sleep_guard_active: bool,
+}
+
+/// 変化に現れない終了等を回収する低頻度の保険。
+pub const RUNNING_CHILDREN_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// tmux + ps の再採取が必要かをメモリ情報だけで判定する。
+pub fn should_rescan_running_children(
+    prev: &RunningChildrenScanState,
+    targets: &[RunningChildrenScanTarget],
+    sleep_guard_active: bool,
+    now: Instant,
+) -> bool {
+    let Some(scanned_at) = prev.scanned_at else {
+        return true;
+    };
+    if prev.targets != targets {
+        return true;
+    }
+    // off / on から while-agents-running へ切り替えた瞬間は、古い共有キャッシュを
+    // assertion 判定へ使わず即時に実態を採り直す。
+    if !prev.sleep_guard_active && sleep_guard_active {
+        return true;
+    }
+    now.duration_since(scanned_at) >= RUNNING_CHILDREN_RESCAN_INTERVAL
+}
+
+/// 共有 ProcessSnapshot から走査結果を作る。呼び出し側が `should_rescan_*` を確認し、
+/// stale binary と同じ snapshot を渡す。
+pub fn scan_running_children(
+    targets: Vec<RunningChildrenScanTarget>,
+    sleep_guard_active: bool,
+    now: Instant,
+    snapshot: Option<&ProcessSnapshot>,
+) -> RunningChildrenScanState {
+    let refs: Vec<&str> = targets
+        .iter()
+        .map(|target| target.backend_session.as_str())
+        .collect();
+    let busy_sessions = snapshot
+        .map(|snapshot| snapshot.sessions_with_running_children(&refs))
+        .unwrap_or_default();
+    RunningChildrenScanState {
+        targets,
+        busy_sessions,
+        scanned_at: Some(now),
+        sleep_guard_active,
+    }
 }
 
 /// `ps -axo pid=,ppid=` の出力をパースする
@@ -389,13 +530,7 @@ pub fn sessions_with_running_children(sessions: &[&str]) -> Vec<String> {
     if sessions.is_empty() {
         return Vec::new();
     }
-    let socket = tako_core::tmux_backend::socket_name();
-    let panes = tmux_pane_pids(Some(&socket));
-    if panes.is_empty() {
-        return Vec::new();
-    }
-    let parents = process_parent_map();
-    sessions_with_children_inner(sessions, &panes, &parents)
+    ProcessSnapshot::capture().sessions_with_running_children(sessions)
 }
 
 /// バッチ判定の内部ロジック（テスト可能）
@@ -593,6 +728,126 @@ mod tests {
         let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
         let parents: HashMap<u32, u32> = [(100, 1)].into();
         assert!(sessions_with_children_inner(&["tako-nonexist"], &panes, &parents).is_empty());
+    }
+
+    #[test]
+    fn process_snapshotを子プロセス判定と子孫列挙で共有する() {
+        let snapshot = ProcessSnapshot::from_parts(
+            vec![("tako-s1:0.0".to_string(), 100u32)],
+            [(100, 1), (200, 100), (300, 200)].into(),
+        );
+        assert_eq!(
+            snapshot.sessions_with_running_children(&["tako-s1"]),
+            vec!["tako-s1".to_string()]
+        );
+        let descendants: HashSet<u32> = snapshot.descendant_pids("tako-s1").into_iter().collect();
+        assert_eq!(descendants, HashSet::from([200, 300]));
+        assert!(!descendants.contains(&100), "pane PID 自体は子孫へ含めない");
+    }
+
+    fn running_target(
+        session: &str,
+        command_state: tako_core::CommandState,
+        has_agent_role: bool,
+    ) -> RunningChildrenScanTarget {
+        RunningChildrenScanTarget {
+            backend_session: session.to_string(),
+            command_state,
+            has_agent_role,
+        }
+    }
+
+    #[test]
+    fn running_children走査は変化なしなら省く() {
+        let now = Instant::now();
+        let targets = vec![running_target(
+            "tako-s1",
+            tako_core::CommandState::Idle,
+            true,
+        )];
+        let prev = RunningChildrenScanState {
+            targets: targets.clone(),
+            busy_sessions: vec!["tako-s1".into()],
+            scanned_at: Some(now),
+            sleep_guard_active: true,
+        };
+        assert!(!should_rescan_running_children(&prev, &targets, true, now));
+    }
+
+    #[test]
+    fn running_children走査はbackendとroleとosc状態の変化を拾う() {
+        let now = Instant::now();
+        let idle = running_target("tako-s1", tako_core::CommandState::Idle, false);
+        let prev = RunningChildrenScanState {
+            targets: vec![idle.clone()],
+            busy_sessions: Vec::new(),
+            scanned_at: Some(now),
+            sleep_guard_active: true,
+        };
+        assert!(should_rescan_running_children(
+            &prev,
+            &[running_target(
+                "tako-s1",
+                tako_core::CommandState::Running,
+                false
+            )],
+            true,
+            now
+        ));
+        assert!(should_rescan_running_children(
+            &prev,
+            &[running_target(
+                "tako-s1",
+                tako_core::CommandState::Idle,
+                true
+            )],
+            true,
+            now
+        ));
+        assert!(should_rescan_running_children(
+            &prev,
+            &[
+                idle,
+                running_target("tako-s2", tako_core::CommandState::Unknown, false)
+            ],
+            true,
+            now
+        ));
+    }
+
+    #[test]
+    fn running_children走査はwhileモード移行と60秒保険で再開する() {
+        let scanned_at = Instant::now();
+        let targets = vec![running_target(
+            "tako-s1",
+            tako_core::CommandState::Unknown,
+            true,
+        )];
+        let prev = RunningChildrenScanState {
+            targets: targets.clone(),
+            busy_sessions: Vec::new(),
+            scanned_at: Some(scanned_at),
+            sleep_guard_active: false,
+        };
+        assert!(should_rescan_running_children(
+            &prev, &targets, true, scanned_at
+        ));
+        let active = RunningChildrenScanState {
+            sleep_guard_active: true,
+            ..prev
+        };
+        assert!(!should_rescan_running_children(
+            &active,
+            &targets,
+            true,
+            scanned_at + RUNNING_CHILDREN_RESCAN_INTERVAL / 2
+        ));
+        assert!(should_rescan_running_children(
+            &active,
+            &targets,
+            true,
+            scanned_at + RUNNING_CHILDREN_RESCAN_INTERVAL
+        ));
     }
 
     // --- #439: live claude セッションの一括解決 ---
