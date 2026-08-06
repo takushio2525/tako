@@ -150,7 +150,7 @@ impl TakoApp {
 
     /// このペインがターミナルとして描かれるか（帯を作ってよいか）。
     /// `render_pane` が早期 return する経路（Web ビュー / プレビュー / スターター）を除く
-    fn pane_shows_terminal(&self, pane_id: PaneId) -> bool {
+    pub(crate) fn pane_shows_terminal(&self, pane_id: PaneId) -> bool {
         if self.webviews.iter().any(|e| e.pane == Some(pane_id))
             || self.previews.contains_key(&pane_id)
         {

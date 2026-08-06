@@ -231,6 +231,15 @@ const PANEL_MIN_WIDTH: f32 = 220.0;
 /// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
 const PANE_TITLE_BAR: f32 = 32.0;
 
+/// stale claude バナー（#498）の高さ（px。#781）。
+///
+/// ペイン内の**流れの中**（ヘッダとターミナル領域のあいだ）に積まれるので、
+/// 出ているあいだはターミナル領域が下へずれて縮む。テキスト領域の矩形
+/// （`pane_text_areas` = PTY 行数・マウス座標変換・IME 位置の正）を作るときに
+/// 必ずこの高さを差し引くこと。ここを 1 か所にしてあるのは、
+/// 描画側の `.h()` と会計側がずれると座標がずれるため（#781 の根因）
+const STALE_BANNER_HEIGHT: f32 = 28.0;
+
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 32.0;
 
@@ -800,6 +809,70 @@ struct ImeComposition {
 /// どのペインのものかを持つのは、チャットペインが複数あっても取り違えないため
 type ChatCaretSlot = std::rc::Rc<std::cell::Cell<Option<(PaneId, Bounds<Pixels>)>>>;
 
+/// ターミナルのテキスト領域（実描画）の採取スロット（#781）。
+///
+/// `pane_text_areas` は「ビューポート寸法からの引き算」で作るので、ペイン内の
+/// **流れの中**に積まれる要素（ヘッダ / stale claude バナー / カード帯）を
+/// 会計し忘れると、マウス座標変換・IME 位置・PTY 行数が実描画とずれる。
+/// #684 がコンテナに対して行ったことを、ペイン内のテキスト領域に対して行う。
+///
+/// **採取した値は「正」として使わない**（PTY の resize と結び付けると
+/// 1 フレーム遅れが行数の振動を生む）。会計は算術のまま正とし、これは
+/// 「算術が実描画と一致しているか」を機械検証・診断するための観測値に留める
+type PaneTextAreaProbe = std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>;
+
+/// 実描画のテキスト領域から、`pane_text_areas` に入るべき矩形を求める（#781）。
+///
+/// 行スタックは `left/right/top = PANE_PADDING` の absolute なので、
+/// テキスト領域はコンテナを四辺 `PANE_PADDING` だけ内側へ詰めたもの
+fn text_area_from_container(container: Bounds<Pixels>) -> Bounds<Pixels> {
+    let pad = px(PANE_PADDING);
+    Bounds::new(
+        point(container.origin.x + pad, container.origin.y + pad),
+        size(
+            container.size.width - pad * 2.0,
+            container.size.height - pad * 2.0,
+        ),
+    )
+}
+
+/// ペインの単位矩形からテキスト領域（`pane_text_areas` に入る矩形）を求める（#781）。
+///
+/// **ペイン内で「流れの中」に積まれる要素はここで全部会計する**。
+/// この矩形は PTY の行数・マウス座標変換（ドラッグ選択）・IME 位置の**正**なので、
+/// 会計漏れがあると 3 つが同時にずれる（#781 の実害。stale claude バナーの
+/// 28px を引いていなかったため、claude が自己更新した瞬間から
+/// 全 master / worker ペインで選択と IME が約 1.6 行ぶんずれていた）。
+///
+/// - `stacked_top`: ペイン上端からテキストまでに積まれる高さ（タイトルバー + バナー）
+/// - `band`: テキスト領域の下に積まれる高さ（AI コマンド提案カードの帯。#703）
+/// - `scale_factor`: デバイスピクセルスナップ用（#385。グリッド描画の振動対策）
+fn pane_text_area_rect(
+    content: Bounds<Pixels>,
+    r: Rect,
+    stacked_top: f32,
+    band: f32,
+    scale_factor: f32,
+) -> Bounds<Pixels> {
+    let snap = |v: Pixels| -> Pixels {
+        Pixels::from((f32::from(v) * scale_factor).round() / scale_factor)
+    };
+    let inset = PANE_BORDER + PANE_PADDING;
+    let origin = point(
+        snap(content.origin.x + content.size.width * r.x + px(inset)),
+        snap(content.origin.y + content.size.height * r.y + px(inset + stacked_top)),
+    );
+    // 引くだけで 0 クランプはしない: 極端に低いウィンドウでは元から負の高さになり、
+    // 下端が実コンテナの内側に来ることで整合していた（#684 の検査で捕まえた）
+    Bounds::new(
+        origin,
+        size(
+            snap(content.size.width * r.width - px(inset * 2.0)),
+            snap(content.size.height * r.height - px(inset * 2.0 + stacked_top)) - px(band),
+        ),
+    )
+}
+
 /// 未確定文字列（marked text）のハイライト区間を組む（FR-1.9）。
 ///
 /// ハイライト範囲は重複禁止（`StyledText` の要求）なので、注目文節の前・文節・後の
@@ -1024,6 +1097,13 @@ struct TakoApp {
     pane_content: HashMap<gpui::WindowId, PaneContentGeometry>,
     /// 実描画からの採取スロット（ウィンドウ単位）。詳細は `PaneContentProbe`
     pane_content_probes: HashMap<gpui::WindowId, std::rc::Rc<PaneContentProbe>>,
+    /// ターミナルのテキスト領域（実描画）の採取スロット（ペイン単位）。
+    /// #781: `pane_text_areas` の算術が実描画と一致していることの観測用。詳細は
+    /// [`PaneTextAreaProbe`]
+    pane_text_area_probes: HashMap<PaneId, PaneTextAreaProbe>,
+    /// 会計漏れとして perf.log に記録済みのずれ（px。ペイン単位。#781）。
+    /// 同じずれを毎フレーム書かないためのメモ
+    pane_text_area_drift_logged: HashMap<PaneId, i32>,
     /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
     ipc: Option<IpcServer>,
     /// Layer 2 内蔵 MCP サーバー（FR-2.3 の受け口。起動失敗時は None で MCP なし動作）
@@ -2540,6 +2620,8 @@ impl TakoApp {
             drag_scroll: None,
             pane_text_areas: Vec::new(),
             pane_content: HashMap::new(),
+            pane_text_area_probes: HashMap::new(),
+            pane_text_area_drift_logged: HashMap::new(),
             pane_content_probes: HashMap::new(),
             ipc,
             mcp,
@@ -5975,6 +6057,8 @@ impl TakoApp {
                 self.scroll_ctls.remove(&pane_id);
                 self.pane_font_sizes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
+                self.pane_text_area_probes.remove(&pane_id);
+                self.pane_text_area_drift_logged.remove(&pane_id);
                 self.dock_webview_of(pane_id);
                 self.drop_tmux_view_session(pane_id);
                 self.drop_backend_session_with(pane_id, reason);
@@ -9169,6 +9253,99 @@ impl TakoApp {
             .text_system()
             .shape_line(SharedString::from(prefix.to_string()), px(fs), &[run], None)
             .width
+    }
+
+    /// テキスト領域から差し引く stale claude バナー（#498）の高さ（px。#781）。
+    ///
+    /// バナーはペイン内の**流れの中**（ヘッダとターミナル領域のあいだ）に積まれるので、
+    /// 出ているあいだテキスト領域は下へずれて縮む。`render()` がペイン矩形
+    /// （`pane_text_areas` = PTY 行数・マウス座標変換・IME 位置の正）を作る前に呼ぶ。
+    ///
+    /// 判定条件は描画側（`render_pane` の `when_some`）と**同じ**にすること。
+    /// 描画されないのに引くと逆向きのずれになる
+    fn stale_banner_height(&self, pane_id: PaneId) -> f32 {
+        // バナーはターミナル表示のペインにしか描かれない（プレビュー / Web ビュー /
+        // スターター / チャットは `render_pane` の分岐で先に返る）
+        if !self.pane_shows_terminal(pane_id) {
+            return 0.0;
+        }
+        let shown = self
+            .stale_binary_banners
+            .get(&pane_id)
+            .is_some_and(|b| !b.dismissed);
+        if shown {
+            STALE_BANNER_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    /// `pane_text_areas` の算術と実描画のテキスト領域のずれ（#781。診断・機械検証用）。
+    ///
+    /// 返り値は (算術で作った矩形, 実描画から導いた矩形)。まだ描かれていない
+    /// （プローブが空 / ターミナル表示でない）ペインは `None`
+    fn pane_text_area_drift(&self, pane_id: PaneId) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+        let used = self
+            .pane_text_areas
+            .iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, b)| *b)?;
+        let container = self.pane_text_area_probes.get(&pane_id)?.get()?;
+        Some((used, text_area_from_container(container)))
+    }
+
+    /// 会計漏れの自己申告（#781）。
+    ///
+    /// `render()` の**冒頭**（矩形を作り直す前）に呼ぶ。この時点の `pane_text_areas` と
+    /// プローブの採取値は**同じフレーム**のものなので、差があれば「ペイン内に積まれた
+    /// 要素を会計していない」という実バグを意味する（#781 で 16 日間気づけなかった）。
+    ///
+    /// ペインを並べるコンテナ側が収束していないフレーム（リサイズ中・ルートのバナーが
+    /// 出た直後。#684 の 1 フレーム遅れ）は対象外にする。そちらは既知の過渡状態で、
+    /// 毎フレーム記録すると本物の会計漏れが埋もれる
+    fn report_pane_text_area_drift(&mut self, window_id: gpui::WindowId) {
+        let container_settled = self
+            .pane_content
+            .get(&window_id)
+            .and_then(|g| g.used.zip(g.measured))
+            .is_some_and(|(used, measured)| !pane_content_rect_differs(used, measured));
+        if !container_settled {
+            return;
+        }
+        let panes: Vec<PaneId> = self.pane_text_areas.iter().map(|(id, _)| *id).collect();
+        for pane in panes {
+            let Some((used, real)) = self.pane_text_area_drift(pane) else {
+                continue;
+            };
+            let d = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs();
+            let gap = d(used.origin.x, real.origin.x)
+                .max(d(used.origin.y, real.origin.y))
+                .max(d(used.size.width, real.size.width))
+                .max(d(used.size.height, real.size.height));
+            // 1px 未満はスナップと taffy の丸めの差（実害なし）
+            let rounded = gap.round() as i32;
+            if rounded < 1 {
+                self.pane_text_area_drift_logged.remove(&pane);
+                continue;
+            }
+            // 同じずれを繰り返し記録しない（perf.log を埋めない）
+            if self.pane_text_area_drift_logged.get(&pane) == Some(&rounded) {
+                continue;
+            }
+            self.pane_text_area_drift_logged.insert(pane, rounded);
+            tako_control::diag::perf_log(&format!(
+                "テキスト領域の会計漏れ: pane={} ずれ {rounded}px（算術 {:?} / 実描画 {:?}。#781）",
+                pane.as_u64(),
+                (
+                    f32::from(used.origin.y).round(),
+                    f32::from(used.size.height).round()
+                ),
+                (
+                    f32::from(real.origin.y).round(),
+                    f32::from(real.size.height).round()
+                ),
+            ));
+        }
     }
 
     // --- マウス ---
@@ -14037,7 +14214,8 @@ impl TakoApp {
                             .id(("stale-banner", pane_id.as_u64()))
                             .flex_none()
                             .w_full()
-                            .h(px(28.0))
+                            // 高さは会計側（`stale_banner_height`）と同じ定数から取る（#781）
+                            .h(px(STALE_BANNER_HEIGHT))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -14126,6 +14304,22 @@ impl TakoApp {
                     .relative()
                     .bg(rgba(theme.background))
                     .when(has_link_hover, |d| d.cursor(CursorStyle::PointingHand))
+                    // #781: テキスト領域の実矩形を採取する（何も描かない absolute な
+                    // プローブなので見た目にもレイアウトにも出ない）。`pane_text_areas`
+                    // の算術がペイン内の積み上げ（ヘッダ / stale バナー / カード帯）を
+                    // 会計できているかを、実描画と突き合わせて検証するための観測点
+                    .child({
+                        let slot = self
+                            .pane_text_area_probes
+                            .entry(pane_id)
+                            .or_default()
+                            .clone();
+                        canvas(move |bounds, _, _| slot.set(Some(bounds)), |_, _, _, _| ())
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                    })
                     .child(
                         div()
                             .absolute()
@@ -16886,6 +17080,9 @@ impl Render for TakoApp {
             ),
         );
         let window_id = window.window_handle().window_id();
+        // #781: 矩形を作り直す**前**に、前フレームの算術と実描画を突き合わせる
+        // （同じフレームの値どうしなので、差があれば会計漏れという実バグ）
+        self.report_pane_text_area_drift(window_id);
         // 閉じたウィンドウの採取結果は残さない（複数ウィンドウ #339 は同一 entity を共有）
         if self.pane_content.len() > 1 {
             let live: std::collections::HashSet<gpui::WindowId> = self
@@ -16925,26 +17122,20 @@ impl Render for TakoApp {
             .tree();
         let focused = tree.focused();
         let layout = tree.layout(Rect::UNIT);
-        // デバイスピクセルスナップ（#385）: ターミナルはグリッドベースの描画のため、
-        // サブピクセル座標のままだとリサイズ時にグリフのラスタライズ位置がフレーム間で
-        // 振動し、暗転・ちらつきとして知覚される（zed の terminal_element と同じ対策）
+        // デバイスピクセルスナップ（#385）は `pane_text_area_rect` の中で行う。
+        // ターミナルはグリッドベースの描画のため、サブピクセル座標のままだと
+        // リサイズ時にグリフのラスタライズ位置がフレーム間で振動し、暗転・ちらつきとして
+        // 知覚される（zed の terminal_element と同じ対策）
         let scale_factor = window.scale_factor();
-        let snap = |v: Pixels| -> Pixels {
-            Pixels::from((f32::from(v) * scale_factor).round() / scale_factor)
-        };
         let new_areas: Vec<(PaneId, Bounds<Pixels>)> = layout
             .iter()
             .map(|(id, r)| {
-                let inset = PANE_BORDER + PANE_PADDING;
-                // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる
-                let origin = point(
-                    snap(content_origin.x + content_size.width * r.x + px(inset)),
-                    snap(content_origin.y + content_size.height * r.y + px(inset + PANE_TITLE_BAR)),
-                );
-                let full = size(
-                    snap(content_size.width * r.width - px(inset * 2.0)),
-                    snap(content_size.height * r.height - px(inset * 2.0 + PANE_TITLE_BAR)),
-                );
+                // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる。
+                // #781: stale claude バナー（#498）もヘッダとテキスト領域のあいだに
+                // 積まれる**流れの中の要素**なので、ここで一緒に会計する
+                // （引き忘れるとドラッグ選択・IME 位置・PTY 行数が同時にずれる）
+                let stacked_top = PANE_TITLE_BAR + self.stale_banner_height(*id);
+                let full = pane_text_area_rect(content_rect, *r, stacked_top, 0.0, scale_factor);
                 // AI コマンド提案カードの帯（#703）はテキスト領域の**外**（下）に置く。
                 // ここで先に差し引いておくことで、PTY の行数・マウス座標変換・IME 位置が
                 // すべて「カードに隠されていない領域」だけを指すようになる
@@ -16955,15 +17146,14 @@ impl Render for TakoApp {
                     .unwrap_or(f32::from(cell.height));
                 let band = self.card_band_height(
                     *id,
-                    f32::from(full.height),
-                    f32::from(full.width),
+                    f32::from(full.size.height),
+                    f32::from(full.size.width),
                     cell_h,
                 );
-                // 引くだけで 0 クランプはしない: 極端に低いウィンドウでは元から
-                // 負の高さになり、下端が実コンテナの内側に来ることで整合していた
-                // （0 に丸めると下端がコンテナの外へ飛び出す。#684 の検査で捕まえた）
-                let area_size = size(full.width, full.height - px(band));
-                (*id, Bounds::new(origin, area_size))
+                (
+                    *id,
+                    pane_text_area_rect(content_rect, *r, stacked_top, band, scale_factor),
+                )
             })
             .collect();
         // pane_text_areas は全ウィンドウ共有（Issue #339）: 自ウィンドウの表示タブ分を
@@ -38326,6 +38516,146 @@ mod self_test {
                 );
             }
 
+            // 106. stale claude バナー（#498）が出ているペインでも、テキスト領域の矩形
+            // （`pane_text_areas` = PTY 行数 / マウス座標変換 / IME 位置の正）が
+            // 実描画と一致する（#781）。
+            //
+            // バナーはヘッダとターミナル領域のあいだに積まれる**流れの中の要素**なので、
+            // 会計し忘れるとテキスト領域が丸ごと下へずれ
+            //   ・ドラッグ選択がクリックした行より下に付く
+            //   ・IME の未確定文字列と変換候補ウィンドウがカーソルより上に出る
+            //   ・PTY の行数が可視行数を超えて末尾行が見切れる
+            // が同時に起きる（実機では claude が自己更新した 3 分後に報告された）。
+            // 実描画のテキスト領域を採取して算術と突き合わせるので、
+            // 将来ペイン内に別の要素が積まれたときも同じ検査で捕まる
+            {
+                let any781 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window781 = any781.downcast::<TakoApp>().unwrap_or(window);
+                // 実描画に依存する検査なのでフレームを明示的に回す（項目 92 と同じ理由）
+                macro_rules! drift781 {
+                    ($pane:expr) => {{
+                        for _ in 0..2 {
+                            let _ = any781.update(cx, |_, win, cx| win.draw(cx).clear());
+                        }
+                        window781
+                            .update(cx, |app, win, _| {
+                                let container =
+                                    app.pane_text_area_probes.get(&$pane).and_then(|p| p.get());
+                                let drift = app.pane_text_area_drift($pane);
+                                let cell = app.cell_size_for_pane($pane);
+                                // 実描画のテキスト左上から半セルだけ内側の点が
+                                // セル (0,0) へ解決するか（= 見た目とクリックの一致）
+                                let hit = match (drift, cell) {
+                                    (Some((_, real)), Some(cell)) => app.cell_at(
+                                        $pane,
+                                        point(
+                                            real.origin.x + cell.width * 0.5,
+                                            real.origin.y + cell.height * 0.5,
+                                        ),
+                                        win,
+                                    ),
+                                    _ => None,
+                                };
+                                (container, drift, hit)
+                            })
+                            .ok()
+                    }};
+                }
+                let pane781 = window781.update(cx, |app, _, _| app.focused_pane()).ok();
+                let terminal781 = window781
+                    .update(cx, |app, _, _| {
+                        pane781.is_some_and(|p| app.pane_shows_terminal(p))
+                    })
+                    .unwrap_or(false);
+                match pane781.filter(|_| terminal781) {
+                    None => println!(
+                        "TAKO_SELF_TEST_SKIPPED: 106（フォーカスペインがターミナル表示でない）"
+                    ),
+                    Some(pane) => {
+                        let before = drift781!(pane).unwrap_or((None, None, None));
+                        if before.0.is_none() {
+                            println!(
+                                "TAKO_SELF_TEST_SKIPPED: 106（テキスト領域が未描画。\
+                                 ウィンドウを前面にして再実行すると検証できる）"
+                            );
+                        } else {
+                            let gap = |(used, real): (Bounds<Pixels>, Bounds<Pixels>)| {
+                                let d = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs();
+                                d(used.origin.x, real.origin.x)
+                                    .max(d(used.origin.y, real.origin.y))
+                                    .max(d(used.size.width, real.size.width))
+                                    .max(d(used.size.height, real.size.height))
+                            };
+                            // サブピクセルの丸め（`snap` と taffy の両方が丸める）を許容する
+                            const TOL: f32 = 1.0;
+                            let base_gap = before.1.map(gap);
+                            check(
+                                base_gap.is_some_and(|g| g <= TOL),
+                                "106: バナー無しではテキスト領域の算術が実描画と一致する (#781)",
+                            );
+                            check(
+                                before.2 == Some((0, 0, false)),
+                                "106: バナー無しで実描画左上がセル (0,0) へ解決する (#781)",
+                            );
+                            let top_before = before.0.map(|b| f32::from(b.origin.y));
+
+                            // stale バナーを出す（claude の自己更新に相当。判定経路は
+                            // 項目 103 が担保しているのでここは表示状態だけを作る）
+                            let _ = window781.update(cx, |app, _, cx| {
+                                app.stale_binary_banners.insert(
+                                    pane,
+                                    StaleBinaryBanner {
+                                        spawned_version: "2.1.220".into(),
+                                        current_version: "2.1.223".into(),
+                                        dismissed: false,
+                                        restarting: false,
+                                        error: None,
+                                        is_master: false,
+                                    },
+                                );
+                                cx.notify();
+                            });
+                            let after = drift781!(pane).unwrap_or((None, None, None));
+                            let top_after = after.0.map(|b| f32::from(b.origin.y));
+                            // 検査が空振りしていないこと: バナーが実際に高さを食っている
+                            let pushed = match (top_before, top_after) {
+                                (Some(a), Some(b)) => (b - a - STALE_BANNER_HEIGHT).abs() <= TOL,
+                                _ => false,
+                            };
+                            check(
+                                pushed,
+                                "106: バナーがテキスト領域を実際に押し下げている (#781)",
+                            );
+                            let banner_gap = after.1.map(gap);
+                            println!(
+                                "TAKO_SELF_TEST_781: top {top_before:?} -> {top_after:?} \
+                                 gap {base_gap:?} -> {banner_gap:?}"
+                            );
+                            check(
+                                banner_gap.is_some_and(|g| g <= TOL),
+                                "106: バナー表示中もテキスト領域の算術が実描画と一致する (#781)",
+                            );
+                            check(
+                                after.2 == Some((0, 0, false)),
+                                "106: バナー表示中も実描画左上がセル (0,0) へ解決する (#781)",
+                            );
+
+                            // バナーを閉じたら元へ戻る（= 会計が片方向に効いていない）
+                            let _ = window781.update(cx, |app, _, cx| {
+                                app.stale_binary_banners.remove(&pane);
+                                cx.notify();
+                            });
+                            let restored = drift781!(pane).unwrap_or((None, None, None));
+                            check(
+                                restored.1.map(gap).is_some_and(|g| g <= TOL)
+                                    && restored.0.map(|b| f32::from(b.origin.y)) == top_before,
+                                "106: バナーを閉じるとテキスト領域が元へ戻る (#781)",
+                            );
+                        }
+                    }
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -39179,6 +39509,175 @@ mod app_menu_tests {
             assert!(ks.modifiers.platform, "{action} は cmd 修飾");
             assert_eq!(ks.modifiers.alt, alt, "{action} の alt 修飾");
         }
+    }
+}
+
+/// ペイン内の「流れの中に積まれる要素」の会計（#781）。
+///
+/// テキスト領域の矩形は PTY の行数・マウス座標変換（ドラッグ選択）・IME 位置の
+/// **共通の正**なので、会計漏れは 3 つ同時のずれになる。実際に stale claude
+/// バナー（#498）の 28px が漏れており、claude が自己更新した瞬間から
+/// 全 master / worker ペインで選択と IME が約 1.6 行ぶんずれていた
+#[cfg(test)]
+mod pane_text_area_tests {
+    use super::*;
+
+    /// 1 ペインだけのタブ（単位矩形が全面）でのテキスト領域
+    fn area(stacked_top: f32, band: f32) -> Bounds<Pixels> {
+        let content = Bounds::new(point(px(360.0), px(44.0)), size(px(1000.0), px(800.0)));
+        pane_text_area_rect(content, Rect::UNIT, stacked_top, band, 2.0)
+    }
+
+    #[test]
+    fn バナーぶんだけ下へずれて同じだけ縮む() {
+        let without = area(PANE_TITLE_BAR, 0.0);
+        let with = area(PANE_TITLE_BAR + STALE_BANNER_HEIGHT, 0.0);
+        assert_eq!(
+            f32::from(with.origin.y) - f32::from(without.origin.y),
+            STALE_BANNER_HEIGHT,
+            "バナーはテキストの開始位置を押し下げる"
+        );
+        assert_eq!(
+            f32::from(without.size.height) - f32::from(with.size.height),
+            STALE_BANNER_HEIGHT,
+            "押し下げたぶんだけ高さも減る（下端がペインの外へ出ない）"
+        );
+        // 横は変わらない（バナーは全幅なので x 方向の会計は不要）
+        assert_eq!(with.origin.x, without.origin.x);
+        assert_eq!(with.size.width, without.size.width);
+    }
+
+    #[test]
+    fn 上の積み上げと下のカード帯は独立に効く() {
+        let base = area(PANE_TITLE_BAR, 0.0);
+        let banded = area(PANE_TITLE_BAR, 40.0);
+        let both = area(PANE_TITLE_BAR + STALE_BANNER_HEIGHT, 40.0);
+        assert_eq!(banded.origin.y, base.origin.y, "帯は下なので開始位置は不変");
+        assert_eq!(
+            f32::from(base.size.height) - f32::from(banded.size.height),
+            40.0
+        );
+        assert_eq!(
+            f32::from(base.size.height) - f32::from(both.size.height),
+            40.0 + STALE_BANNER_HEIGHT,
+            "上下の会計は足し合わせで効く"
+        );
+    }
+
+    #[test]
+    fn 枠と余白の内側から始まる() {
+        let a = area(PANE_TITLE_BAR, 0.0);
+        // content.origin=(360,44) + 枠 1 + 余白 10、縦はさらにタイトルバー 32
+        assert_eq!(f32::from(a.origin.x), 360.0 + PANE_BORDER + PANE_PADDING);
+        assert_eq!(
+            f32::from(a.origin.y),
+            44.0 + PANE_BORDER + PANE_PADDING + PANE_TITLE_BAR
+        );
+    }
+
+    #[test]
+    fn 極端に低いペインでは高さを0へ丸めない() {
+        // 0 クランプすると下端が実コンテナの外へ飛び出す（#684 の検査で捕まえた挙動）
+        let content = Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(20.0)));
+        let a = pane_text_area_rect(content, Rect::UNIT, PANE_TITLE_BAR, 0.0, 2.0);
+        assert!(f32::from(a.size.height) < 0.0, "負のままにする");
+    }
+
+    #[test]
+    fn 実描画コンテナからテキスト領域を戻せる() {
+        // プローブが採取するのは行スタックの親（四辺 PANE_PADDING の内側が本文）
+        let container = Bounds::new(point(px(11.0), px(77.0)), size(px(500.0), px(300.0)));
+        let a = text_area_from_container(container);
+        assert_eq!(f32::from(a.origin.x), 11.0 + PANE_PADDING);
+        assert_eq!(f32::from(a.origin.y), 77.0 + PANE_PADDING);
+        assert_eq!(f32::from(a.size.width), 500.0 - PANE_PADDING * 2.0);
+        assert_eq!(f32::from(a.size.height), 300.0 - PANE_PADDING * 2.0);
+    }
+
+    /// ペイン内に「流れの中」の要素を増やしたら、必ず会計を通ることを構造で担保する。
+    ///
+    /// 描画側の高さ指定と会計側の定数がずれると座標がずれるので、
+    /// バナーの高さ指定が定数経由であること・会計が `render()` の矩形計算で
+    /// 呼ばれていることを固定する
+    #[test]
+    fn バナーの高さ指定と会計が同じ定数を共有している() {
+        let source = include_str!("main.rs");
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        // 描画側: バナー要素の高さ指定が定数経由（生の px 値だと会計側とずれる）
+        let banner_element = flat
+            .split(&format!("(\"{}\", pane_id.as_u64())", "stale-banner"))
+            .nth(1)
+            .map(|rest| rest.split(".flex_row()").next().unwrap_or(""))
+            .expect("stale バナーの要素が見つからない");
+        let shared = format!(".h(px({}))", "STALE_BANNER_HEIGHT");
+        assert!(
+            banner_element.contains(&shared),
+            "バナーの高さが定数経由でない（会計側とずれる）: {banner_element}"
+        );
+        assert_eq!(
+            flat.matches(&shared).count(),
+            1,
+            "バナーの高さ指定が複数ある（どれが正か分からなくなる）"
+        );
+        // 会計側: 矩形計算がバナーを足している
+        let accounted = format!("PANE_TITLE_BAR + self.{}", "stale_banner_height");
+        assert!(
+            flat.contains(&accounted),
+            "テキスト領域の矩形計算がバナーを会計していない"
+        );
+        // 矩形を作る式は 1 か所だけ（#684 と同じ方針: 手計算を増やさない）
+        let formula = format!("fn {}(", "pane_text_area_rect");
+        assert_eq!(flat.matches(&formula).count(), 1);
+    }
+
+    /// ターミナルペインの**直接の子**の棚卸し（#781 の再発防止）。
+    ///
+    /// 流れの中に子を 1 つ足すだけでテキスト領域が下へずれ、ドラッグ選択・IME 位置・
+    /// PTY 行数が同時に狂う。`absolute` を付け忘れた子は静かに高さを食うので、
+    /// 直接の子の**数**を固定して「増えたら会計を見直す」を強制する
+    #[test]
+    fn ターミナルペインの直接の子は想定どおり() {
+        let source = include_str!("main.rs");
+        // ターミナル表示のペインは `render_pane` の最後の分岐なので、
+        // ペイン root の直前にある一意な行を起点にする
+        // （`.id(("pane", …))` はプレビュー / スターター側にもあるため使えない）
+        let pane = source
+            .split("let has_link_hover = self")
+            .nth(1)
+            .expect("ターミナルペインの起点が見つからない");
+        // 関数の終わり（4 スペースの閉じ括弧）まで
+        let pane = pane.split("\n    }\n").next().expect("ペイン要素の終端");
+        assert!(
+            pane.contains(&format!(".id((\"{}\", pane_id.as_u64()))", "pane")),
+            "起点の直後にペイン root が無い（走査範囲がずれている）"
+        );
+        // 直接の子 = 12 スペースのインデントで始まるビルダー呼び出し
+        let children: Vec<&str> = pane
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("            .")?;
+                if line.starts_with("             ") {
+                    return None;
+                }
+                ["child(", "children(", "when(", "when_some("]
+                    .into_iter()
+                    .find(|head| rest.starts_with(head))
+                    .map(|_| rest)
+            })
+            .collect();
+        // 期待する 9 個:
+        //   when(is_failed) / when(focused) = 影と枠の見た目だけ（高さを食わない）
+        //   child(ヘッダ) = PANE_TITLE_BAR / when_some(stale バナー) = STALE_BANNER_HEIGHT
+        //   child(ターミナル領域) = flex_1
+        //   children(カード帯) = card_band_height
+        //   children(スクロールバー) / children(提案チップ) / when(workers メニュー) = absolute
+        assert_eq!(
+            children.len(),
+            9,
+            "ペインの直接の子が変わっている: {children:#?}\n\
+             流れの中（absolute でない）に足したなら `stacked_top` / `band` の会計を\
+             見直すこと（#781）"
+        );
     }
 }
 
