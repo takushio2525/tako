@@ -8,6 +8,20 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.8] - 2026-08-07
+
+Nightly patch release (automated). Changes since v0.6.7:
+夜間パッチリリース（自動）。v0.6.7 以降の変更:
+
+- [ドキュメント] Issue 779 の完了状況を記録 (#779)
+- [改善] sleep guard の ps 起動を変化時だけに削減 (#779) (#783)
+- [修正] IME 位置・選択座標のズレを根治: stale claude バナーの高さをテキスト領域の会計に含める (#781) (#784)
+- [ドキュメント] Issue 778 の完了状況を記録 (#778)
+- [修正] 後続send失敗のprompt未達誤検知を防ぐ (#778) (#780)
+- [ドキュメント] #770 のセルフテスト項目番号を 104 に訂正（#772 との rebase で繰り上がったため）
+- [修正] 再起動ではなくタブ × close だった喪失を、記録と復旧の両面で根治 (#770) (#774)
+- [修正] stale binary 検知がメインスレッドを毎 tick 400ms 専有する問題を根治 (#772) (#773)
+
 ## [0.6.7] - 2026-08-06
 
 Nightly patch release (automated). Changes since v0.6.6:
