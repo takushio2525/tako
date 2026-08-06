@@ -6372,7 +6372,7 @@ fn dispatch_orchestrator_spawn(
     // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
     // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
     // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
-    host.queue_prompt_flow(new_id, prompt.to_string());
+    host.queue_spawn_prompt_flow(new_id, prompt.to_string());
 
     // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)

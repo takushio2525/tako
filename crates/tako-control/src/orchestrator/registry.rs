@@ -149,6 +149,15 @@ pub enum PromptDelivery {
     NotApplicable,
 }
 
+/// PromptFlow の用途（Issue #778）。worker レジストリが追跡するのは spawn 時の
+/// 初回プロンプトだけで、稼働中 worker への後続 send は同じ送達確認ループを使っても
+/// spawn プロンプトの送達状態を変更しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDeliveryFlow {
+    SpawnPrompt,
+    FollowUpSend,
+}
+
 impl PromptDelivery {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -371,15 +380,33 @@ pub fn record_session_detected(tmux_session: &str, session_id: &str) -> Result<(
 /// pane 番号で引く（PromptFlow が持つキー）。同番号ペインの再利用による誤更新を防ぐため、
 /// active かつ既に決着（delivered / failed）していないエントリだけを対象にする。
 /// 記録失敗で送達フローを止めないよう、呼び出し側は警告のみで継続する
-pub fn record_prompt_delivery(pane: u64, verified: bool, reason: &str) -> Result<(), String> {
+pub fn record_prompt_delivery(
+    pane: u64,
+    flow: PromptDeliveryFlow,
+    verified: bool,
+    reason: &str,
+) -> Result<(), String> {
     let Some(path) = registry_path() else {
         return Ok(());
     };
+    record_prompt_delivery_at(&path, pane, flow, verified, reason)
+}
+
+fn record_prompt_delivery_at(
+    path: &Path,
+    pane: u64,
+    flow: PromptDeliveryFlow,
+    verified: bool,
+    reason: &str,
+) -> Result<(), String> {
+    if flow != PromptDeliveryFlow::SpawnPrompt {
+        return Ok(());
+    }
     if !path.is_file() {
         return Ok(());
     }
     // 変更が無いなら書き込みをスキップ（冪等。record_session_detected と同型）
-    let current = WorkerRegistry::load_from(&path)?;
+    let current = WorkerRegistry::load_from(path)?;
     let needs_update = current.workers.values().any(|e| {
         e.is_active()
             && e.pane == pane
@@ -390,7 +417,7 @@ pub fn record_prompt_delivery(pane: u64, verified: bool, reason: &str) -> Result
         return Ok(());
     }
     let now = crate::sessions::now_iso();
-    WorkerRegistry::mutate_at(&path, |reg| {
+    WorkerRegistry::mutate_at(path, |reg| {
         for entry in reg.workers.values_mut() {
             if !entry.is_active() || entry.pane != pane || entry.prompt_delivery_failed_at.is_some()
             {
@@ -848,6 +875,81 @@ mod tests {
         assert_eq!(
             resend_command(failed).as_deref(),
             Some("tako send --pane 41 '<同じ依頼文>'")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 後続sendの失敗はdelivered済みworkerをundeliveredへ戻さない() {
+        let path = temp_registry_file("followup-delivery");
+        register_at(&path, sample_record(778));
+        let delivered_at = crate::sessions::now_iso();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            let entry = reg
+                .workers
+                .values_mut()
+                .find(|entry| entry.pane == 778 && entry.is_active())
+                .unwrap();
+            entry.session_id = Some("session-778".into());
+            entry.prompt_delivered_at = Some(delivered_at);
+        })
+        .unwrap();
+
+        record_prompt_delivery_at(
+            &path,
+            778,
+            PromptDeliveryFlow::FollowUpSend,
+            false,
+            "flow_timeout",
+        )
+        .unwrap();
+
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let (_, entry) = reg.find_active_by_pane(778).unwrap();
+        assert!(entry.prompt_delivery_failed_at.is_none());
+        assert!(entry.prompt_delivery_failure.is_none());
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment(entry, now_epoch),
+            PromptDelivery::Delivered
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn spawn初回ダイアログの失敗はsession検出済みでもundeliveredになる() {
+        let path = temp_registry_file("spawn-dialog-failure");
+        register_at(&path, sample_record(530));
+        WorkerRegistry::mutate_at(&path, |reg| {
+            let entry = reg
+                .workers
+                .values_mut()
+                .find(|entry| entry.pane == 530 && entry.is_active())
+                .unwrap();
+            entry.session_id = Some("session-530".into());
+            entry.prompt_delivered_at = Some(crate::sessions::now_iso());
+        })
+        .unwrap();
+
+        record_prompt_delivery_at(
+            &path,
+            530,
+            PromptDeliveryFlow::SpawnPrompt,
+            false,
+            "choice_dialog",
+        )
+        .unwrap();
+
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let (_, entry) = reg.find_active_by_pane(530).unwrap();
+        assert_eq!(
+            entry.prompt_delivery_failure.as_deref(),
+            Some("choice_dialog")
+        );
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment(entry, now_epoch),
+            PromptDelivery::OverdueSuspect
         );
         let _ = std::fs::remove_file(&path);
     }
