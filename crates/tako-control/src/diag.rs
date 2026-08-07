@@ -160,6 +160,30 @@ static PERF_WATCH: Mutex<PerfWatch> = Mutex::new(PerfWatch {
     samples: Vec::new(),
 });
 
+/// メインスレッドの ThreadId（`mark_main_thread` で登録）。
+/// **未登録なら「全部メインスレッド扱い」** = 従来の挙動（CLI・テストは登録しない）
+static MAIN_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// 呼んだスレッドをメインスレッドとして登録する（GUI プロセスの起動時に 1 回）。
+///
+/// Issue #782: `perf_span` は元々スレッドを区別せず、**background executor 上の
+/// 区間まで「メインスレッド専有」として perf.log に書いていた**。実際には
+/// background で走っている PDF ラスタライズ（`pdf_rasterize`。#258 で background 化済み）が
+/// 「メインスレッド専有 73ms」と記録され、UI ストールの容疑者に見えていた。
+/// 登録後は、別スレッドの区間を watchdog の対象（= ハング容疑）にも
+/// 「メインスレッド専有」の記録にも入れない
+pub fn mark_main_thread() {
+    *MAIN_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+}
+
+/// 呼び出し元がメインスレッドか（未登録時は true = 従来挙動）
+fn on_main_thread() -> bool {
+    MAIN_THREAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none_or(|id| id == std::thread::current().id())
+}
+
 /// verbose 実測モード（`TAKO_PERF_VERBOSE=1`）。プロセス内で 1 回だけ判定
 fn perf_verbose() -> bool {
     static VERBOSE: OnceLock<bool> = OnceLock::new();
@@ -191,6 +215,8 @@ pub struct PerfSpan {
     t0: Instant,
     log_over_ms: u64,
     prev: Option<SpanState>,
+    /// メインスレッドで開始した区間か（別スレッドは記録の扱いを変える）
+    on_main: bool,
 }
 
 /// 既定しきい値（32ms、verbose 時 16ms）の計測区間を開始する
@@ -202,7 +228,10 @@ pub fn perf_span(tag: impl Into<Cow<'static, str>>) -> PerfSpan {
 pub fn perf_span_over(tag: impl Into<Cow<'static, str>>, log_over_ms: u64) -> PerfSpan {
     let tag = tag.into();
     let t0 = Instant::now();
-    let prev = {
+    // 別スレッドの区間は watchdog の現在区間に入れない（#782: background の
+    // 区間がメインスレッドのハング容疑者として記録されていた）
+    let on_main = on_main_thread();
+    let prev = if on_main {
         let mut w = watch_lock();
         let prev = w.current.take();
         w.current = Some(SpanState {
@@ -211,28 +240,35 @@ pub fn perf_span_over(tag: impl Into<Cow<'static, str>>, log_over_ms: u64) -> Pe
             hang_reported: false,
         });
         prev
+    } else {
+        None
     };
     PerfSpan {
         tag,
         t0,
         log_over_ms,
         prev,
+        on_main,
     }
 }
 
 impl Drop for PerfSpan {
     fn drop(&mut self) {
         let took = self.t0.elapsed().as_millis() as u64;
+        if !self.on_main {
+            // 別スレッドの所要は verbose 統計にだけ残す（タグに bg: を付けて
+            // メインスレッドの分布と混ざらないようにする）
+            if perf_verbose() {
+                push_sample(Cow::Owned(format!("bg:{}", self.tag)), took);
+            }
+            return;
+        }
         {
             let mut w = watch_lock();
             w.current = self.prev.take();
-            if perf_verbose() {
-                w.samples.push((self.tag.clone(), took));
-                // 暴走ガード: watchdog 不在でも無限には溜めない
-                if w.samples.len() > 100_000 {
-                    w.samples.drain(..50_000);
-                }
-            }
+        }
+        if perf_verbose() {
+            push_sample(self.tag.clone(), took);
         }
         if took >= self.log_over_ms && span_log_rate_ok() {
             perf_log(&format!(
@@ -240,6 +276,16 @@ impl Drop for PerfSpan {
                 self.tag
             ));
         }
+    }
+}
+
+/// verbose 統計へサンプルを 1 件積む（暴走ガード付き）
+fn push_sample(tag: Cow<'static, str>, took: u64) {
+    let mut w = watch_lock();
+    w.samples.push((tag, took));
+    // 暴走ガード: watchdog 不在でも無限には溜めない
+    if w.samples.len() > 100_000 {
+        w.samples.drain(..50_000);
     }
 }
 
