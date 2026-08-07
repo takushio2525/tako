@@ -3,69 +3,63 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-07、Issue #782 エージェント高出力時の CPU / UI ストール）
+## 現在の対象（2026-08-07、Issue #786 クローム・ペインのビュー単位キャッシュ = **実装完了・PR 待ち**）
 
-- worktree `../tako-wt-782`（ブランチ `fix/782-render-cpu`）。コミット `1994b8e`
-- 入れたのは「無駄な再描画の除去 + 診断の是正」まで。
-  **表示中ペインの描画コスト自体は未着手**（Zed 比 11× のまま = 受け入れ基準は未達）
-- フレームコスト実測（要素ツリー末尾の canvas）は**取り下げた**: 全面サイズの canvas を
-  末尾へ足すとセルフテスト #680（md 座標キャッシュ生成）が落ちる。切り分け済み
-  （`TAKO_782_NO_PROBE=1` で緑 / 有効で赤）。機序未解明のまま描画層に足さない判断
+- ブランチ `fix/786-view-cache`（worktree `~/dev/tako-wt-786`）にコミット 2 本。
+  `crates/tako-app/src/view_cache.rs` を新設し、ペイン本体（`PaneBody`）とクローム 4 枚
+  （`Chrome`: TabBar / Sidebar / Panel / StatusBar）を `AnyView::cached` の単位へ切り出した
+- PTY 出力は `flush_term_redraw` で**そのペインのビューだけ**を notify。ペインの外にも出る変化
+  （OSC / タイトル）とペイン本体の外にも映っている場合（たまり場サムネイル・ホバー /
+  ピン留めプレビュー）は従来どおり全体を notify（`PaneVisibility` の 3 値）
+- それ以外の状態変化は全部 `TakoApp` を notify し、子ビューが `cx.observe` で自分も汚す
+  = 取りこぼしが構造的に起きない順序
+- ペインの配置は cached ビューのスタイルへ移し、各 `render_*_pane` は `size_full` で描く
 
-## 実測で確定した根因（Issue #782 のコメントに全文）
+## 実測証拠（隔離・色付き 110 桁 200 行/秒・同一バイナリの A/B）
 
-- tako は単一 GPUI entity なので、**どのペインの出力でも `cx.notify()` が
-  アプリ全体（表示中タブの全ペイン + サイドバー + パネル）を描き直す**
-- 裏タブのペインが出力するだけで 60fps 超の全面再描画 = 22.3% CPU（見た目は不変）
-- UI ストールは 1 回のロング処理ではなく、2〜4ms のフレームを 60fps で回した
-  メインスレッド飽和による。ハング級（2 秒超え）の区間は 1 つも無い
-- perf.log の「メインスレッド専有: pdf_rasterize」は**誤ラベル**。`perf_span` が
-  スレッドを区別せず background の区間を混ぜていた（#258 で background 化済み）
-
-## Zed（同じ GPUI）との同条件比較 = 残りの工事量
-
-同じジェネレータ・同じ端末サイズ（137x13 ≒ 136x14）・200 行/秒:
-
-| | tako | Zed |
+| 表示中 2 ペイン（22x21） | before（`TAKO_786_NO_VIEW_CACHE=1`） | after |
 |---|---|---|
-| CPU | 14.6% | 1.3% |
-| instructions | 9.0G | 0.14G |
-| 1 フレームの命令数 | 5.1M（固定）+ 0.39M × 行数 | 0.16M |
+| 4 タブ + サイドバー + 右パネル | 25.30% CPU / 6.772M instr/frame | 18.04% / 5.016M |
+| 17 タブ + サイドバー（実フォルダ）+ 右パネル | 36.65% / 9.693M | 8.94% / 5.574M |
 
-- **固定 5.1M/frame** = 毎フレーム作り直すアプリ全体のレイアウト + ペイント。
-  Zed はビュー単位キャッシュ（`AnyView::cached`）で汚れていないビューを再利用する
-- **0.39M/行** = 行 div + スタイル区間ごとの子 div を taffy に流す端末グリッド描画。
-  Zed は専用 Element で `shape_line` → グリフ直置き（div も taffy ノードも作らない）
-- 色付き（4 チャンク/行）と色なし（1 チャンク/行）の差は 5% = チャンク数ではなく
-  1 セルあたりの処理量が支配的
+- クロームを 4 → 17 タブへ増やしたときの 1 フレーム増分は **2.92M → 0.56M（−81%）**
+  = 固定費（クローム）がほぼ消えた。before の 4.9M 前後は #782 の「固定 5.1M」とほぼ一致
+- 1 ペイン（47x21）は before 22.77 / 22.79% → after 9.56〜13.43%
+- 残る 5M 台/frame はペイングリッド自体の描画。専用 Element 化（#787）の担当
 
 ## 検証状況
 
-- 品質ゲート: fmt / clippy(-D warnings) / test 1908 件 全緑
-- 隔離実測（本番 pid 不変を毎回確認）: 裏タブ 22.3% → 2.6%、表示中は交互 A/B で回帰なし
-- 隔離セルフテスト **完走（`TAKO_APP_SELF_TEST_OK` / exit 0）**。項目 107 の診断も
-  `hidden req=0 skip=8 session=true visible=false` で意図どおり。SKIPPED は 76d と
-  104 のマーカー検査（ウィンドウ非前面の既知）のみ
-- Zed 比較のためユーザー承認のもと Zed を一時終了 → 復帰させた。**復帰後のウィンドウが
-  1 枚（元は "empty project" 2 枚）**になっている点はユーザーへ報告済み
+- fmt / clippy(-D warnings) / test --workspace 全緑（1903 件）
+- 隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK` / exit 0 / FAILED 0）。項目 108 を新設
+- visual-test 全 23 節完走（FAILED 0）。`chat-select`(#725) / `md`(#680) / `indent-guide`(#589)
+  を含み、`dark_roundtrip_diff` は cpu / python とも 0（キャッシュ無効時と一致）
+- **visual-test は #749 以降ビルドできない状態だった**（feature 付きでしか通らないため
+  `Request::OrchestratorProfiles` のフィールド追加の追従漏れが CI をすり抜けていた）。
+  本 PR で復旧。併せてハーネス側の notify 抜け 1 箇所（編集モードの解除）を修正
+- 本番 GUI（pid 47236）は全計測の前後で生存。本番 tmux socket `tako` には触っていない
+  （隔離は `TAKO_ISOLATED=1` + socket `tako786` + data dir `/private/tmp/tk786`。
+  socket パス長 104B 上限のため data dir だけ短いパスを使った）
 
 ## 不変条件
 
-- 本番 GUI（pid 23951）・本番 tmux socket `tako`・本番 data dir に触れない
-- 計測は `TAKO_ISOLATED=1` + 専用 `TAKO_TMUX_SOCKET` / data / discovery dir
-- ウィンドウがロック・遮蔽されていると GPUI は描画しない = 計測が無効になる。
-  ハーネスは wall 乖離と描画回数 0 を「計測無効」として弾く
-- System Events のキーストローク送出は禁止（メニュークリックは pid 指定でのみ実施）
+- 汚れ方の規約 2 つを崩さない: ①PTY 出力はそのペインだけ ②それ以外は全部 `TakoApp`
+- `view_cache::cached_view` の `view.read(cx)` を外さない（外すとキャッシュしたビューが
+  tracked から落ちて二度と描き直されない。実測で踏んだ）
+- キャッシュビューへ渡すスタイルが大きさを確定させる（GPUI は中身を見ない）
+- 状態を変えたら必ず notify する（毎フレーム全再構築の暗黙依存はもう無い）
+- 検証は `TAKO_ISOLATED=1` + 専用 tmux socket + 専用 data / discovery dir。
+  System Events のキーストローク送出は禁止（計測のためのウィンドウ前面化は
+  PID 指定の `set frontmost` のみ）。隔離アプリは PID 指定で終了する
+- 並走ビルドと同時に Cargo / app bundle ビルドを走らせない
 
 ## 次の手順
 
-1. PR → macOS CI 緑 → squash merge
-2. `scripts/build-app.sh --install`（他ビルドと同時に走らせない）。GUI 再起動は master 側
-3. Zed 同等化の本体（別 Issue 提案）: A. 端末グリッドの専用 Element 化 /
-   B. ペイン・クロームのビュー分割 + `AnyView::cached`
+1. push → PR（`Closes #786` / `Refs #782`）→ macOS CI 全ジョブ緑を確認 → squash merge
+2. `scripts/build-app.sh --install`（他 worker のビルドと同時に走らせない）
+3. GUI 再起動は master 側。再起動後に本番でエージェント高出力時の体感を確認
+4. 残りの Zed 同等化は #787（端末グリッドの専用 Element 化）
 
 ## 現フェーズで Read すべき設計書
 
-- 描画・性能まわり: `.agent/architecture.md`（periodic tick / perf.log 節）
-- 端末描画の既存制約: #39（要素数）/ #64（折り返し消失）/ #159（サブラインスクロール）/
-  #725（チャット選択）は端末グリッドの描画方式を変えるとき必ず読むこと
+- 描画・再描画まわりを触るとき: `.agent/architecture.md`「ビュー単位の描画キャッシュ」節
+- ペイン矩形の会計: 同じファイルの #684 / #781 節
