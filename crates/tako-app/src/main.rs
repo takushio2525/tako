@@ -20268,6 +20268,12 @@ mod self_test {
             clear_master_account: false,
             worker_account: None,
             clear_worker_account: false,
+            // #749 で足りたフィールド。visual-test は feature 付きでしかビルドされないため
+            // 追従漏れが CI をすり抜けていた（本 PR で復旧）
+            ctx_threshold: None,
+            clear_ctx_threshold: false,
+            auto_handoff: None,
+            clear_auto_handoff: false,
         };
 
         // --- 実データ規模を用意する ---
@@ -22431,9 +22437,13 @@ mod self_test {
                     &format!("visual-test {language} 編集 RGBA"),
                 );
                 window
-                    .update(cx, |app, _, _| {
+                    .update(cx, |app, _, cx| {
                         app.set_preview_editing_local(pdf_pane, false)
                             .expect("visual-test 編集終了");
+                        // #786: 状態を変えたら notify する（実装の CLI / MCP / UI 経路は
+                        // すべて notify している）。ビューキャッシュが入る前は毎フレーム
+                        // 全再構築だったので notify 無しでも次の draw で反映されていた
+                        cx.notify();
                     })
                     .ok();
 
