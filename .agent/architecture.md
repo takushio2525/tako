@@ -900,6 +900,69 @@ trait で抽象化し、core/ と control/ は platform/ の trait のみに依�
   それ以外は前回の `busy_backend_sessions` を sleep guard / GUI モード / close 確認で共有する。
   `while-agents-running` へ切り替えた tick は、古いキャッシュで assertion を決めず即再採取する
 
+## ビュー単位の描画キャッシュ（#782 / #786。2026-08-07）
+
+tako は `TakoApp` 1 個をすべてのウィンドウのルートビューにしている（#339）。何もしないと
+`cx.notify()` 1 回でアプリ全体（タブバー・サイドバー・右パネル・ステータスバー・表示中タブの
+全ペイン）の element ツリーを作り直し、GPUI がそれを丸ごと taffy でレイアウトしてペイントする。
+Zed では各エディタ・ターミナルが独立 entity なので、この浪費が構造的に存在しない。
+
+段階的に埋めた（#782 が「見えていないものを描かない」、#786 が「見えているが変わっていない
+ものを描き直さない」）:
+
+- **可視性ゲート（#782）**: 画面のどこにも映っていないペイン（裏タブ・たまり場）の出力では
+  再描画を要求しない。`pane_visibility` が「自分のペイン本体だけに映る（`OwnPane`）」
+  「ドロワーのサムネイル・ホバー / ピン留めプレビューにも映る（`Elsewhere`）」
+  「どこにも映らない（`Hidden`）」の 3 値を返す。判定不能な過渡状態は保守的に `Elsewhere`
+- **ビュー単位キャッシュ（#786。`view_cache`）**: ペイン本体（`PaneBody`）とクローム 4 枚
+  （`Chrome`: TabBar / Sidebar / Panel / StatusBar）を独立した子ビューにして
+  `AnyView::cached(style)` で包む。汚れていないビューは GPUI が prepaint と paint を
+  丸ごと再利用する。見た目のコードは `TakoApp` 側の既存 render メソッドのまま
+  （子ビューは描画を委譲するだけ）
+
+汚れ方の規約は 2 つだけ。**この順序が不変条件**（新しい状態変化を汚し忘れる事故が起きない）:
+
+1. **PTY 出力**は `request_term_redraw` → `flush_term_redraw` 経由で、`OwnPane` のときだけ
+   そのペインの `PaneBody` を notify する
+2. **それ以外のすべての状態変化**は従来どおり `TakoApp` を notify する。子ビューは
+   `cx.observe(TakoApp)` で自分も汚す
+
+### ⚠️ 踏み抜きどころ
+
+- **キャッシュしたビューは毎フレーム「アクセス」しないと二度と描き直されない**:
+  `cx.notify()` がウィンドウの再描画に化けるのは、その entity が
+  `App::tracked_entities`（= 直前の draw で accessed になった集合）に載っている
+  あいだだけ。載っていないと observer を呼ぶだけで dirty を立てない。キャッシュが当たった
+  フレームは GPUI が `element_state.accessed_entities` を積み直してくれるが、**その集合は
+  初回 prepaint の差分**で作られるため、ビューを親の render の中で `cx.new` すると
+  その id が差分から漏れて次フレームで tracked から外れる。`view_cache::cached_view` が
+  毎フレーム `view.read(cx)` を通してこれを構造的に防いでいる
+  （実測: プレビューペインが開いた直後の 1 フレームで固まり、目次ジャンプが効かなくなった）
+- **ペインの配置はキャッシュビューのスタイルが持つ**: `AnyView::cached` の
+  `request_layout` は**スタイルだけ**を見て大きさを決める（中身を見に行かない）ので、
+  呼び出し側が絶対配置と大きさを確定させる。各 `render_*_pane` は矩形いっぱい
+  （`relative` + `size_full`）に描く
+- **状態を変えたら必ず notify する**: キャッシュが入る前は「毎フレーム全再構築」だったので、
+  notify を忘れても次の draw で反映されていた。#786 の検証で visual-test に 1 箇所
+  （編集モードの解除）その手抜きが残っていたのが発覚した
+- **ホバー・アニメーションは自動で追従する**: hover / active / tooltip の状態変化は
+  GPUI が `Window::refresh()` を呼び、`refresh` 中はキャッシュが無効になる。
+  `with_animation` は `request_animation_frame` で**そのビュー自身**を notify するので、
+  再描画のループが自走する
+- 効果の回帰検出はセルフテスト項目 108（`pane_body_renders` / `chrome_renders` の増減）。
+  `TAKO_786_NO_VIEW_CACHE=1` で同じバイナリの A/B が取れる
+
+### 実測（隔離・色付き 110 桁 200 行/秒・A/B は同一バイナリ）
+
+| 構成（表示中 2 ペイン・22x21） | before（キャッシュ無効） | after |
+|---|---|---|
+| 4 タブ + サイドバー + 右パネル | 25.30% CPU / 6.772M instr/frame | **18.04% / 5.016M** |
+| 17 タブ + サイドバー（実フォルダ）+ 右パネル | 36.65% / 9.693M | **8.94% / 5.574M** |
+
+クロームを 4 タブ → 17 タブへ増やしたときの 1 フレームあたり増分は
+**2.92M → 0.56M（−81%）**。残る 5M 台はペイングリッドそのものの描画で、
+専用 Element 化（#787）の担当。
+
 ## セキュリティ方針
 
 - IPC / MCP は localhost のみ + セッション毎のランダムトークン必須（FR-2.3.4）

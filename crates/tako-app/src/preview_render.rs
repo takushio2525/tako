@@ -4,7 +4,7 @@ use gpui::{
     Window,
 };
 use std::path::PathBuf;
-use tako_core::{PaneId, Rect};
+use tako_core::PaneId;
 
 use super::*;
 
@@ -997,7 +997,6 @@ impl TakoApp {
     pub(crate) fn render_preview_pane(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         area: gpui::Bounds<gpui::Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -1980,11 +1979,9 @@ impl TakoApp {
 
         div()
             .id(("pane", pane_id.as_u64()))
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
+            // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+            .relative()
+            .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
             .rounded(px(7.0))
