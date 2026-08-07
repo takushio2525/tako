@@ -1807,4 +1807,5 @@
 - 踏み抜き: 親の render で `cx.new` したキャッシュビューは `tracked_entities` から落ちて
   二度と描き直されない（`cached_view` で毎フレーム `read` して固定）。
   副産物で #749 以降ビルド不能だった visual-test も復旧
+- 関連コミット: `0188d79`（PR #788 squash merge）。macOS / Windows CI 緑、install 済み
 - 次: #787（端末グリッドの専用 Element 化）で残りの 5M/frame を削る

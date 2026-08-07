@@ -3,10 +3,11 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-07、Issue #786 クローム・ペインのビュー単位キャッシュ = **実装完了・PR 待ち**）
+## 現在の対象（2026-08-08、Issue #786 クローム・ペインのビュー単位キャッシュ = **完了**）
 
-- ブランチ `fix/786-view-cache`（worktree `~/dev/tako-wt-786`）にコミット 2 本。
-  `crates/tako-app/src/view_cache.rs` を新設し、ペイン本体（`PaneBody`）とクローム 4 枚
+- PR #788 を `0188d79` として squash merge。Issue #786 クローズ、ブランチ・worktree 削除済み。
+  `/Applications/tako.app` へ install 済み（0.6.8、署名検証つき）
+- `crates/tako-app/src/view_cache.rs` を新設し、ペイン本体（`PaneBody`）とクローム 4 枚
   （`Chrome`: TabBar / Sidebar / Panel / StatusBar）を `AnyView::cached` の単位へ切り出した
 - PTY 出力は `flush_term_redraw` で**そのペインのビューだけ**を notify。ペインの外にも出る変化
   （OSC / タイトル）とペイン本体の外にも映っている場合（たまり場サムネイル・ホバー /
@@ -54,10 +55,10 @@
 
 ## 次の手順
 
-1. push → PR（`Closes #786` / `Refs #782`）→ macOS CI 全ジョブ緑を確認 → squash merge
-2. `scripts/build-app.sh --install`（他 worker のビルドと同時に走らせない）
-3. GUI 再起動は master 側。再起動後に本番でエージェント高出力時の体感を確認
-4. 残りの Zed 同等化は #787（端末グリッドの専用 Element 化）
+1. GUI 再起動は master 側（install 済み。再起動しないと本番へ反映されない）。
+   再起動後に本番でエージェント高出力時の体感を確認する
+2. 残りの Zed 同等化は #787（端末グリッドの専用 Element 化）。
+   本 PR 後も 1 フレーム 5M 台はペイングリッドの描画で、そこが次の削りどころ
 
 ## 現フェーズで Read すべき設計書
 
