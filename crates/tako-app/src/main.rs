@@ -1359,6 +1359,10 @@ struct TakoApp {
     last_term_notify: std::time::Instant,
     /// 端末イベントの再描画デバウンス: 遅延 notify のタイマーが稼働中か
     term_notify_pending: bool,
+    /// 出力起因の再描画を要求した回数（Issue #782 の可視性ゲートの検証用。単調増加）
+    term_redraw_requests: u64,
+    /// 画面に映っていないペインの出力で再描画を省いた回数（同上）
+    term_redraw_skipped: u64,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// 動画の旧フレーム。次の render 冒頭で GPU sprite atlas から解放する（Issue #258）。
@@ -1888,6 +1892,68 @@ struct CharInfo {
     bg: Option<tako_core::theme::Rgb>,
     /// グリフ advance が半角セル幅と一致するか（char_cols == 1 のときのみ意味を持つ）
     snaps: bool,
+}
+
+/// 端末イベントを 4ms 窓でまとめて 1 回にする（Issue #782。zed の
+/// `Terminal::subscribe` と同じ方式）。
+///
+/// `TermEvent::Wakeup` は「画面が変わったので描き直して」以上の意味を持たない
+/// no-op（`process_event` が None を返す）なので、窓内に何件届いても 1 件に畳める。
+/// それ以外（タイトル変更・OSC・PTY 書き込み・終了）は順序どおり全件処理する。
+///
+/// 戻り値 Err = View が破棄された（呼び出し側はループを抜ける）
+async fn batch_term_events(
+    this: &gpui::WeakEntity<TakoApp>,
+    cx: &mut gpui::AsyncApp,
+    pane_id: PaneId,
+    rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
+) -> Result<(), ()> {
+    use futures::FutureExt;
+    loop {
+        let mut events: Vec<tako_core::SessionEvent> = Vec::new();
+        let mut wakeup = false;
+        let mut timer = cx
+            .background_executor()
+            .timer(TakoApp::TERM_EVENT_BATCH)
+            .fuse();
+        loop {
+            futures::select_biased! {
+                _ = timer => break,
+                event = rx.next() => match event {
+                    Some(event) => {
+                        if matches!(event, tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup)) {
+                            wakeup = true;
+                        } else {
+                            events.push(event);
+                        }
+                        // 窓の途中でも溜まりすぎたら流す（zed と同じ上限）
+                        if events.len() > 100 {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+        if events.is_empty() && !wakeup {
+            return Ok(()); // 窓のあいだ静かだった → 外側の待ちへ戻る
+        }
+        let applied = this.update(cx, |app: &mut TakoApp, cx| {
+            if wakeup {
+                app.on_term_event(
+                    pane_id,
+                    tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
+                    cx,
+                );
+            }
+            for event in events {
+                app.on_term_event(pane_id, event, cx);
+            }
+        });
+        if applied.is_err() {
+            return Err(());
+        }
+    }
 }
 
 /// 描画 div 1 つぶんのチャンク（CharInfo 列の半開区間）
@@ -2751,6 +2817,8 @@ impl TakoApp {
             usage_history: std::collections::VecDeque::new(),
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
+            term_redraw_requests: 0,
+            term_redraw_skipped: 0,
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
@@ -5350,11 +5418,25 @@ impl TakoApp {
         self.terminals.insert(pane_id, session);
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.next().await {
-                let result = this.update(cx, |app: &mut TakoApp, cx| {
-                    app.on_term_event(pane_id, event, cx);
-                });
-                if result.is_err() {
+                // 1 件目は即処理（打鍵の反応 = レイテンシ優先）
+                if this
+                    .update(cx, |app: &mut TakoApp, cx| {
+                        app.on_term_event(pane_id, event, cx);
+                    })
+                    .is_err()
+                {
                     break; // View が破棄された
+                }
+                // Issue #782: 続けて届くイベントは 4ms 窓でまとめてから 1 回だけ処理する
+                // （zed の `Terminal::subscribe` と同じ方式）。高出力時は Wakeup が
+                // 秒間数百〜数千届き、1 件ごとに `Entity::update`（= effect flush）を
+                // 回すだけでメインスレッドを食う。Wakeup は「描き直して」以上の意味を
+                // 持たない no-op なので、窓内の分は 1 件に畳める
+                if batch_term_events(&this, cx, pane_id, &mut rx)
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         })
@@ -5394,6 +5476,9 @@ impl TakoApp {
         Ok(())
     }
 
+    /// 端末イベントの合流窓（Issue #782）。zed の `Terminal::subscribe` と同じ 4ms
+    const TERM_EVENT_BATCH: Duration = Duration::from_millis(4);
+
     fn on_term_event(
         &mut self,
         pane_id: PaneId,
@@ -5403,7 +5488,11 @@ impl TakoApp {
         let Some(session) = self.terminals.get_mut(&pane_id) else {
             return;
         };
+        // OSC 7 / 133（cwd・実行状態）はペイン本体の外（タブバーの状態ドット・
+        // サイドバーの root・パネル）にも出るので、ペインが見えていなくても描き直す
+        let state_change = matches!(event, tako_core::SessionEvent::Osc(_));
         let mut need_immediate = false;
+        let mut ui_outside_pane = state_change;
         match session.process_event(event) {
             Some(SessionNotice::Exited) => {
                 // PTY 死亡由来の close: セッション kill・layout 削除はしない（Issue #30）
@@ -5414,31 +5503,83 @@ impl TakoApp {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 need_immediate = true;
             }
-            Some(SessionNotice::TitleChanged) | None => {}
+            // タイトル（OSC 0/2）はタブ名・ペインヘッダに出る = ペイン外の UI
+            Some(SessionNotice::TitleChanged) => ui_outside_pane = true,
+            None => {}
         }
-        // 16ms（~60fps）のフレームレート制限: 重要イベントは即座に再描画し、
-        // 通常の出力データは最大 16ms 遅延させてバッチ化する
+        // 重要イベント（ペイン消滅・クリップボード）は即座に再描画する
         if need_immediate {
             self.last_term_notify = std::time::Instant::now();
-            cx.notify();
+            self.request_term_redraw(cx);
             return;
         }
+        // Issue #782: **画面のどこにも映っていないペインの出力では再描画しない**。
+        // tako は単一 entity 構成なので notify 1 回でアプリ全体（表示中タブの全ペイン +
+        // サイドバー + パネル）を描き直す。裏タブ・たまり場のペインが吐く出力で
+        // 60fps の全面再描画を回し続けるのは、見た目が 1 ピクセルも変わらない純粋な浪費
+        if !ui_outside_pane && !self.pane_content_visible(pane_id) {
+            self.term_redraw_skipped = self.term_redraw_skipped.saturating_add(1);
+            return;
+        }
+        // 16ms（~60fps）のフレームレート制限: 通常の出力データはまとめてから描く
+        let interval = Duration::from_millis(16);
         let elapsed = self.last_term_notify.elapsed();
-        if elapsed >= Duration::from_millis(16) {
+        if elapsed >= interval {
             self.last_term_notify = std::time::Instant::now();
-            cx.notify();
+            self.request_term_redraw(cx);
         } else if !self.term_notify_pending {
             self.term_notify_pending = true;
-            let remaining = Duration::from_millis(16) - elapsed;
+            let remaining = interval - elapsed;
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(remaining).await;
-                let _ = this.update(cx, |app, cx| {
+                let _ = this.update(cx, |app: &mut TakoApp, cx| {
                     app.term_notify_pending = false;
                     app.last_term_notify = std::time::Instant::now();
-                    cx.notify();
+                    app.request_term_redraw(cx);
                 });
             })
             .detach();
+        }
+    }
+
+    /// 出力起因の再描画を要求する（回数はセルフテスト 107 の判定に使う）
+    fn request_term_redraw(&mut self, cx: &mut Context<Self>) {
+        self.term_redraw_requests = self.term_redraw_requests.saturating_add(1);
+        cx.notify();
+    }
+
+    /// このペインの**画面内容**が今どこかに描かれているか（Issue #782）。
+    ///
+    /// 描画されるのは ①いずれかのウィンドウが表示中のタブのペイン ②たまり場ドロワーの
+    /// サムネイル（開いているときだけ）③ホバープレビュー ④ピン留めプレビュー の 4 経路
+    /// （= `terminal_screen_lines` の呼び出し元）。判定できないもの（どのタブにも
+    /// たまり場にも居ない過渡状態）は**見えている扱い**にして描画を止めない
+    fn pane_content_visible(&self, pane_id: PaneId) -> bool {
+        let shows = |target: &PreviewTarget| match *target {
+            PreviewTarget::Pane(p) | PreviewTarget::TmuxWindow(p, _) => p == pane_id,
+            PreviewTarget::ClosedGroup(tab) => self
+                .background_entries_of_tab(tab)
+                .iter()
+                .any(|e| e.pane == pane_id),
+        };
+        if self
+            .hover_preview
+            .as_ref()
+            .is_some_and(|h| shows(&h.target))
+            || self.pinned_previews.iter().any(|p| shows(&p.target))
+        {
+            return true;
+        }
+        match self.workspace.find_tab_of_pane(pane_id) {
+            // タブに属する = 表示中タブ（複数ウィンドウはそれぞれの表示タブ）なら見えている
+            Some(tab) => self
+                .workspace
+                .windows()
+                .iter()
+                .any(|w| w.active_tab() == tab),
+            // タブに居ない = たまり場（退避中）。ドロワーを開いているときだけ見えている。
+            // たまり場にも居なければ過渡状態なので描画を止めない（保守的）
+            None => self.drawer_visible || self.workspace.shelved(pane_id).is_none(),
         }
     }
 
@@ -18149,6 +18290,10 @@ fn open_viewport_window(
 fn main() {
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
+    // #782: ここ（GUI プロセスのメインスレッド）を基準に、以後 perf_span は
+    // メインスレッドの区間だけを「メインスレッド専有」として記録する。
+    // 登録前は従来どおり全スレッドが対象なので、この行より前の計測は変わらない
+    tako_control::diag::mark_main_thread();
     tako_control::diag::spawn_stall_watchdog();
     // #770: 隔離インスタンスに限り SIGTERM を正規の quit（`on_app_quit` を通る）へ
     // 読み替える。「quit がセッションを kill しない」ことを pid 指定で実測するため。
@@ -38706,6 +38851,125 @@ mod self_test {
                                 "106: バナーを閉じるとテキスト領域が元へ戻る (#781)",
                             );
                         }
+                    }
+                }
+            }
+
+            // 107: 画面に映っていないペインの出力では再描画しない（Issue #782）。
+            // tako は単一 entity 構成なので notify 1 回でアプリ全体（表示中タブの全ペイン +
+            // サイドバー + パネル）を描き直す。裏タブのペインが吐く出力で 60fps の
+            // 全面再描画を回すのは、見た目が 1 ピクセルも変わらない純粋な浪費だった
+            // （隔離実測: 裏タブ 2 ペイン 200 行/秒で 22.3% CPU → 修正後 2.6%）
+            {
+                let any782 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window782 = any782.downcast::<TakoApp>().unwrap_or(window);
+                let hidden782 = window782
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("782-hidden".into()),
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        // dispatch を直接呼ぶので、セッション起動依頼（pending_attach）は
+                        // ここで処理する（IPC ループ相当）。これを欠くと PTY 無しのペインになり
+                        // `on_term_event` が入口で戻ってしまう
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        r["pane"].as_u64().map(PaneId::from_raw)
+                    })
+                    .ok()
+                    .flatten();
+                wait(cx, 500).await;
+                match hidden782 {
+                    None => println!("TAKO_SELF_TEST_SKIPPED: 107（裏タブを作れない）"),
+                    Some(hidden) => {
+                        let (vis_ok, hid_ok) = window782
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let visible = app.focused_pane();
+                                (
+                                    app.pane_content_visible(visible),
+                                    !app.pane_content_visible(hidden),
+                                )
+                            })
+                            .unwrap_or((false, false));
+                        check(vis_ok, "107: 表示中タブのペインは可視と判定される (#782)");
+                        check(hid_ok, "107: 裏タブのペインは不可視と判定される (#782)");
+
+                        // 出力イベントを 1 つの update 内で流し、その場で数える
+                        // （他ペインの出力・遅延 notify が混ざらない決定的な判定）
+                        let feed782 = |cx: &mut gpui::AsyncApp, pane: Option<PaneId>, osc: bool| {
+                            window782
+                                .update(cx, |app: &mut TakoApp, _, cx| {
+                                    let target = pane.unwrap_or_else(|| app.focused_pane());
+                                    // デバウンス窓を空けて「要求するなら即座に要求する」状態にする
+                                    app.last_term_notify = std::time::Instant::now()
+                                        - std::time::Duration::from_secs(1);
+                                    let (r0, s0) =
+                                        (app.term_redraw_requests, app.term_redraw_skipped);
+                                    for _ in 0..8 {
+                                        let event = if osc {
+                                            tako_core::SessionEvent::Osc(
+                                                tako_core::osc_tap::OscEvent::Mark(
+                                                    tako_core::osc_tap::PromptMark::PromptStart,
+                                                ),
+                                            )
+                                        } else {
+                                            tako_core::SessionEvent::Term(
+                                                tako_core::TermEvent::Wakeup,
+                                            )
+                                        };
+                                        app.on_term_event(target, event, cx);
+                                    }
+                                    (
+                                        app.term_redraw_requests - r0,
+                                        app.term_redraw_skipped - s0,
+                                    )
+                                })
+                                .unwrap_or((0, 0))
+                        };
+                        let (hidden_req, hidden_skip) = feed782(cx, Some(hidden), false);
+                        let has_session = window782
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                (
+                                    app.terminals.contains_key(&hidden),
+                                    app.pane_content_visible(hidden),
+                                )
+                            })
+                            .unwrap_or((false, true));
+                        println!(
+                            "TAKO_SELF_TEST_782: hidden req={hidden_req} skip={hidden_skip} \
+                             session={} visible={}",
+                            has_session.0, has_session.1
+                        );
+                        check(
+                            hidden_req == 0 && hidden_skip == 8,
+                            "107: 裏タブの出力では再描画を要求しない (#782)",
+                        );
+                        let (visible_req, _) = feed782(cx, None, false);
+                        check(
+                            visible_req >= 1,
+                            "107: 表示中ペインの出力では再描画を要求する (#782)",
+                        );
+                        // OSC（cwd・実行状態）はタブバー等ペインの外にも出るので、
+                        // 裏タブでも描き直す（状態変化を取りこぼさない）
+                        let (osc_req, _) = feed782(cx, Some(hidden), true);
+                        check(
+                            osc_req >= 1,
+                            "107: 裏タブでも OSC 由来の状態変化は再描画する (#782)",
+                        );
+                        // 後片付け: 作った裏タブを閉じる
+                        let _ = window782.update(cx, |app: &mut TakoApp, _, cx| {
+                            app.remove_pane_with(
+                                hidden,
+                                CloseReason::Explicit(CloseOrigin::Internal),
+                                cx,
+                            );
+                        });
                     }
                 }
             }
