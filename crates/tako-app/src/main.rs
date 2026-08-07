@@ -17472,7 +17472,6 @@ impl Render for TakoApp {
             .get_tab(display_tab)
             .unwrap_or_else(|| self.workspace.active_tab())
             .tree();
-        let focused = tree.focused();
         let layout = tree.layout(Rect::UNIT);
         // デバイスピクセルスナップ（#385）は `pane_text_area_rect` の中で行う。
         // ターミナルはグリッドベースの描画のため、サブピクセル座標のままだと
@@ -17545,7 +17544,7 @@ impl Render for TakoApp {
                 )
             })
             .collect();
-        let _ = (cell, focused);
+        let _ = cell;
         // 消えたペインのビューは持ち続けない（タブ・たまり場のどちらにも居ないもの）
         self.prune_pane_body_views();
 
