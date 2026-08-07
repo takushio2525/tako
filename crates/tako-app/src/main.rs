@@ -42,6 +42,7 @@ mod ui_text;
 mod update_checker;
 mod update_window;
 mod video_player;
+mod view_cache;
 mod webview;
 
 use keybindings::*;
@@ -1074,6 +1075,17 @@ impl PaneSettle {
     }
 }
 
+/// ペインの画面内容が今どこに描かれているか（Issue #782 の可視性判定を #786 で細分化）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaneVisibility {
+    /// どこにも描かれていない（裏タブ / 退避中でドロワーも閉じている）
+    Hidden,
+    /// 自分のペイン本体としてだけ描かれている（= そのビューだけ汚せば足りる）
+    OwnPane,
+    /// たまり場サムネイル・ホバー / ピン留めプレビュー等、ペイン本体の外にも描かれている
+    Elsewhere,
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -1363,6 +1375,18 @@ struct TakoApp {
     term_redraw_requests: u64,
     /// 画面に映っていないペインの出力で再描画を省いた回数（同上）
     term_redraw_skipped: u64,
+    /// デバウンス待ちのあいだに出力があったペイン（#786。フラッシュでまとめて notify する）
+    term_pending_panes: Vec<PaneId>,
+    /// デバウンス待ちの変化がペインの外（タブバー・サイドバー等）にも出るか（#786）
+    term_pending_app: bool,
+    /// ペイン本体の子ビュー（#786。`AnyView::cached` のキャッシュ単位）
+    pane_bodies: HashMap<PaneId, gpui::Entity<view_cache::PaneBody>>,
+    /// クロームの子ビュー（#786。同上）
+    chrome_views: HashMap<view_cache::ChromePart, gpui::Entity<view_cache::Chrome>>,
+    /// ペイン本体を実際に描き直した回数（#786 の効果検証用。単調増加）
+    pane_body_renders: u64,
+    /// クロームを実際に描き直した回数（同上）
+    chrome_renders: u64,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// 動画の旧フレーム。次の render 冒頭で GPU sprite atlas から解放する（Issue #258）。
@@ -2819,6 +2843,12 @@ impl TakoApp {
             term_notify_pending: false,
             term_redraw_requests: 0,
             term_redraw_skipped: 0,
+            term_pending_panes: Vec::new(),
+            term_pending_app: false,
+            pane_bodies: HashMap::new(),
+            chrome_views: HashMap::new(),
+            pane_body_renders: 0,
+            chrome_renders: 0,
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
@@ -5510,23 +5540,32 @@ impl TakoApp {
         // 重要イベント（ペイン消滅・クリップボード）は即座に再描画する
         if need_immediate {
             self.last_term_notify = std::time::Instant::now();
-            self.request_term_redraw(cx);
+            self.term_pending_app = true;
+            self.flush_term_redraw(cx);
             return;
         }
         // Issue #782: **画面のどこにも映っていないペインの出力では再描画しない**。
-        // tako は単一 entity 構成なので notify 1 回でアプリ全体（表示中タブの全ペイン +
-        // サイドバー + パネル）を描き直す。裏タブ・たまり場のペインが吐く出力で
-        // 60fps の全面再描画を回し続けるのは、見た目が 1 ピクセルも変わらない純粋な浪費
-        if !ui_outside_pane && !self.pane_content_visible(pane_id) {
+        // 裏タブ・たまり場のペインが吐く出力で 60fps の再描画を回し続けるのは、
+        // 見た目が 1 ピクセルも変わらない純粋な浪費
+        let visibility = self.pane_visibility(pane_id);
+        if !ui_outside_pane && visibility == PaneVisibility::Hidden {
             self.term_redraw_skipped = self.term_redraw_skipped.saturating_add(1);
             return;
+        }
+        // Issue #786: 変化がペイン本体の中だけなら、**そのペインのビューだけ**を汚す。
+        // ペインの外（タブバー・サイドバー等）にも出る変化と、ペインの内容が本体以外
+        // （たまり場サムネイル・ホバー / ピン留めプレビュー）にも描かれている場合は
+        // 従来どおりアプリ全体を汚す
+        if ui_outside_pane || visibility != PaneVisibility::OwnPane {
+            self.term_pending_app = true;
+        } else if !self.term_pending_panes.contains(&pane_id) {
+            self.term_pending_panes.push(pane_id);
         }
         // 16ms（~60fps）のフレームレート制限: 通常の出力データはまとめてから描く
         let interval = Duration::from_millis(16);
         let elapsed = self.last_term_notify.elapsed();
         if elapsed >= interval {
-            self.last_term_notify = std::time::Instant::now();
-            self.request_term_redraw(cx);
+            self.flush_term_redraw(cx);
         } else if !self.term_notify_pending {
             self.term_notify_pending = true;
             let remaining = interval - elapsed;
@@ -5534,27 +5573,58 @@ impl TakoApp {
                 cx.background_executor().timer(remaining).await;
                 let _ = this.update(cx, |app: &mut TakoApp, cx| {
                     app.term_notify_pending = false;
-                    app.last_term_notify = std::time::Instant::now();
-                    app.request_term_redraw(cx);
+                    app.flush_term_redraw(cx);
                 });
             })
             .detach();
         }
     }
 
-    /// 出力起因の再描画を要求する（回数はセルフテスト 107 の判定に使う）
-    fn request_term_redraw(&mut self, cx: &mut Context<Self>) {
+    /// 溜まっていた出力起因の再描画要求を流す（回数はセルフテスト 107 の判定に使う）。
+    ///
+    /// #786: アプリ全体を汚す要求が 1 件でもあれば `cx.notify()`（子ビューは
+    /// `cx.observe` で一緒に汚れる）。無ければ出力のあったペインのビューだけを汚す
+    fn flush_term_redraw(&mut self, cx: &mut Context<Self>) {
+        self.last_term_notify = std::time::Instant::now();
+        let app_scope = std::mem::take(&mut self.term_pending_app);
+        let panes = std::mem::take(&mut self.term_pending_panes);
+        if !app_scope && panes.is_empty() {
+            return;
+        }
         self.term_redraw_requests = self.term_redraw_requests.saturating_add(1);
-        cx.notify();
+        if app_scope {
+            cx.notify();
+            return;
+        }
+        for pane in panes {
+            self.notify_pane_body(pane, cx);
+        }
+    }
+
+    /// ペイン本体のビューだけを汚す（#786）。
+    /// まだビューを作っていない（最初の描画前）ならアプリ全体を汚して作らせる
+    fn notify_pane_body(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        match self.pane_bodies.get(&pane_id).cloned() {
+            Some(view) => view.update(cx, |_, cx| cx.notify()),
+            None => cx.notify(),
+        }
     }
 
     /// このペインの**画面内容**が今どこかに描かれているか（Issue #782）。
     ///
+    /// 判定の実体は [`Self::pane_visibility`]。
+    fn pane_content_visible(&self, pane_id: PaneId) -> bool {
+        self.pane_visibility(pane_id) != PaneVisibility::Hidden
+    }
+
+    /// このペインの**画面内容**が今どこに描かれているか（Issue #782 → #786 で細分化）。
+    ///
     /// 描画されるのは ①いずれかのウィンドウが表示中のタブのペイン ②たまり場ドロワーの
     /// サムネイル（開いているときだけ）③ホバープレビュー ④ピン留めプレビュー の 4 経路
-    /// （= `terminal_screen_lines` の呼び出し元）。判定できないもの（どのタブにも
-    /// たまり場にも居ない過渡状態）は**見えている扱い**にして描画を止めない
-    fn pane_content_visible(&self, pane_id: PaneId) -> bool {
+    /// （= `terminal_screen_lines` の呼び出し元）。①だけがペイン本体の描画なので、
+    /// ②〜④に映っているものは「ペイン本体の外にも出ている」= 全体を描き直す必要がある。
+    /// 判定できないもの（どのタブにもたまり場にも居ない過渡状態）は保守的に `Elsewhere`
+    fn pane_visibility(&self, pane_id: PaneId) -> PaneVisibility {
         let shows = |target: &PreviewTarget| match *target {
             PreviewTarget::Pane(p) | PreviewTarget::TmuxWindow(p, _) => p == pane_id,
             PreviewTarget::ClosedGroup(tab) => self
@@ -5568,18 +5638,31 @@ impl TakoApp {
             .is_some_and(|h| shows(&h.target))
             || self.pinned_previews.iter().any(|p| shows(&p.target))
         {
-            return true;
+            return PaneVisibility::Elsewhere;
         }
         match self.workspace.find_tab_of_pane(pane_id) {
             // タブに属する = 表示中タブ（複数ウィンドウはそれぞれの表示タブ）なら見えている
-            Some(tab) => self
-                .workspace
-                .windows()
-                .iter()
-                .any(|w| w.active_tab() == tab),
+            Some(tab) => {
+                if self
+                    .workspace
+                    .windows()
+                    .iter()
+                    .any(|w| w.active_tab() == tab)
+                {
+                    PaneVisibility::OwnPane
+                } else {
+                    PaneVisibility::Hidden
+                }
+            }
             // タブに居ない = たまり場（退避中）。ドロワーを開いているときだけ見えている。
             // たまり場にも居なければ過渡状態なので描画を止めない（保守的）
-            None => self.drawer_visible || self.workspace.shelved(pane_id).is_none(),
+            None => {
+                if self.drawer_visible || self.workspace.shelved(pane_id).is_none() {
+                    PaneVisibility::Elsewhere
+                } else {
+                    PaneVisibility::Hidden
+                }
+            }
         }
     }
 
@@ -12399,7 +12482,6 @@ impl TakoApp {
     fn render_webview_pane(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         area: Bounds<Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -12491,11 +12573,9 @@ impl TakoApp {
 
         div()
             .id(("pane", pane_id.as_u64()))
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
+            // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+            .relative()
+            .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
             .rounded(px(7.0))
@@ -13593,10 +13673,89 @@ impl TakoApp {
             .into_any_element()
     }
 
+    /// `PaneBody` ビュー（#786）から呼ばれるペイン 1 枚の描画入口。
+    ///
+    /// テキスト領域（`area`）とフォーカス状態は `TakoApp::render` が毎フレーム更新した
+    /// `pane_text_areas` / ペインツリーから引く。ルートの render は必ず走るので、
+    /// このビューが描かれる時点では両方とも最新になっている
+    fn render_pane_body(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.pane_body_renders = self.pane_body_renders.saturating_add(1);
+        let Some(area) = self
+            .pane_text_areas
+            .iter()
+            .find(|(p, _)| *p == pane_id)
+            .map(|(_, b)| *b)
+        else {
+            // レイアウトから外れた直後（close 中など）。枠だけ残して次フレームで消える
+            return div().into_any_element();
+        };
+        let focused = self
+            .workspace
+            .find_tab_of_pane(pane_id)
+            .and_then(|t| self.workspace.get_tab(t))
+            .is_some_and(|tab| tab.tree().focused() == pane_id);
+        self.render_pane(pane_id, area, focused, cx)
+    }
+
+    /// ペイン本体のキャッシュ単位となる子ビュー（無ければ作る。#786）
+    fn pane_body_view(
+        &mut self,
+        pane_id: PaneId,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<view_cache::PaneBody> {
+        if let Some(view) = self.pane_bodies.get(&pane_id) {
+            return view.clone();
+        }
+        let app = cx.entity();
+        let view = cx.new(|cx| view_cache::PaneBody::new(&app, pane_id, cx));
+        self.pane_bodies.insert(pane_id, view.clone());
+        view
+    }
+
+    /// タブにもたまり場にも居なくなったペインのビューを捨てる（#786）
+    fn prune_pane_body_views(&mut self) {
+        if self.pane_bodies.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<PaneId> = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .map(|p| p.id())
+            .chain(self.workspace.shelved_panes().iter().map(|s| s.pane().id()))
+            .collect();
+        self.pane_bodies.retain(|id, _| live.contains(id));
+    }
+
+    /// クローム 1 枚を `AnyView::cached` で包む（#786）。
+    /// `style` はそのままキャッシュビューの layout に使われる（中身は見に行かない）ので、
+    /// 呼び出し側が大きさを確定させる
+    fn cached_chrome(
+        &mut self,
+        part: view_cache::ChromePart,
+        style: gpui::StyleRefinement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = match self.chrome_views.get(&part) {
+            Some(view) => view.clone(),
+            None => {
+                let app = cx.entity();
+                let view = cx.new(|cx| view_cache::Chrome::new(&app, part, cx));
+                self.chrome_views.insert(part, view.clone());
+                view
+            }
+        };
+        view_cache::cached_view(&view, style, cx)
+    }
+
+    /// ペイン 1 枚の中身を描く。
+    ///
+    /// #786: 位置と大きさは呼び出し側（`PaneBody` を包む `AnyView::cached` のスタイル）が
+    /// 持つので、ここから下は**与えられた矩形いっぱい**（`size_full`）に描く。
     fn render_pane(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         area: Bounds<Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -13604,13 +13763,13 @@ impl TakoApp {
         // ネイティブ Web ビューペイン（FR-3.8 / #155）
         if self.webviews.iter().any(|e| e.pane == Some(pane_id)) {
             return self
-                .render_webview_pane(pane_id, rect, area, focused, cx)
+                .render_webview_pane(pane_id, area, focused, cx)
                 .into_any_element();
         }
         // プレビューペイン（FR-3.2 / FR-3.3）はターミナルではなくファイル内容を描く
         if self.previews.contains_key(&pane_id) {
             return self
-                .render_preview_pane(pane_id, rect, area, focused, cx)
+                .render_preview_pane(pane_id, area, focused, cx)
                 .into_any_element();
         }
         let theme = self.theme.clone();
@@ -13644,12 +13803,12 @@ impl TakoApp {
         match self.pane_display_for(pane_id) {
             tako_core::ui_mode::PaneDisplay::Starter => {
                 return self
-                    .render_starter_pane(pane_id, rect, area, focused, cx)
+                    .render_starter_pane(pane_id, area, focused, cx)
                     .into_any_element();
             }
             tako_core::ui_mode::PaneDisplay::Chat => {
                 return self
-                    .render_chat_pane(pane_id, rect, area, focused, cx)
+                    .render_chat_pane(pane_id, area, focused, cx)
                     .into_any_element();
             }
             // #720: 表示種別が確定するまでの過渡期。生ターミナルを見せない
@@ -13660,7 +13819,7 @@ impl TakoApp {
                     .map(|s| s.state(self.pane_has_role(pane_id)).kind)
                     .unwrap_or(tako_core::ui_mode::SettleKind::Shell);
                 return self
-                    .render_preparing_pane(pane_id, kind, rect, area, focused, cx)
+                    .render_preparing_pane(pane_id, kind, area, focused, cx)
                     .into_any_element();
             }
             tako_core::ui_mode::PaneDisplay::Terminal => {}
@@ -13840,11 +13999,9 @@ impl TakoApp {
 
         div()
             .id(("pane", pane_id.as_u64()))
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
+            // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+            .relative()
+            .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
             .rounded(px(9.0))
@@ -17368,19 +17525,29 @@ impl Render for TakoApp {
         self.pane_text_areas.extend(new_areas);
 
         let drop_layout = layout.clone();
+        // #786: ペイン本体は 1 枚ずつ独立した子ビュー（`PaneBody`）にして
+        // `AnyView::cached` で包む。PTY 出力はそのペインだけを notify するので、
+        // 出力していない他ペイン・クロームは prepaint / paint ごと再利用される。
+        // 位置と大きさはここ（cached のスタイル）が持ち、中身は矩形いっぱいに描く
         let panes: Vec<_> = layout
             .into_iter()
             .map(|(id, rect)| {
-                let area = self
-                    .pane_text_areas
-                    .iter()
-                    .find(|(p, _)| *p == id)
-                    .map(|(_, b)| *b)
-                    .expect("直前に同じ layout から構築済み");
-                self.render_pane(id, rect, area, id == focused, cx)
+                let view = self.pane_body_view(id, cx);
+                view_cache::cached_view(
+                    &view,
+                    gpui::StyleRefinement::default()
+                        .absolute()
+                        .left(relative(rect.x))
+                        .top(relative(rect.y))
+                        .w(relative(rect.width))
+                        .h(relative(rect.height)),
+                    cx,
+                )
             })
             .collect();
-        let _ = cell;
+        let _ = (cell, focused);
+        // 消えたペインのビューは持ち続けない（タブ・たまり場のどちらにも居ないもの）
+        self.prune_pane_body_views();
 
         // Web ビューの可視性同期: ネイティブビューは GPUI の GPU 合成レイヤの上に
         // 来るため、GPUI のオーバーレイ UI（コマンドパレット・close 確認等）と重なる
@@ -17729,7 +17896,18 @@ impl Render for TakoApp {
                     this.on_mouse_up(event, cx);
                 }),
             )
-            .child(self.render_tab_bar(window, cx))
+            // #786: クローム 4 枚もそれぞれ独立したキャッシュ単位にする。
+            // 大きさはここで指定する（cached ビューの request_layout はスタイルだけを見る）
+            .child(
+                self.cached_chrome(
+                    view_cache::ChromePart::TabBar,
+                    gpui::StyleRefinement::default()
+                        .w_full()
+                        .h(px(TAB_BAR_HEIGHT))
+                        .flex_none(),
+                    cx,
+                ),
+            )
             // #549: 初回起動のウェルカムバナー（タブバー直下・全幅。2 回目以降は出ない）
             .children(self.render_welcome_banner(cx))
             // #616: アップデート通知カード（× で閉じるまで残る。ペインの上には被せない）
@@ -17745,7 +17923,16 @@ impl Render for TakoApp {
                     .min_h(px(0.0))
                     .flex()
                     .flex_row()
-                    .children(self.render_sidebar(cx))
+                    .children(self.filetree.visible.then(|| {
+                        self.cached_chrome(
+                            view_cache::ChromePart::Sidebar,
+                            gpui::StyleRefinement::default()
+                                .w(px(self.sidebar_width))
+                                .h_full()
+                                .flex_none(),
+                            cx,
+                        )
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -17758,11 +17945,29 @@ impl Render for TakoApp {
                             .children(drop_overlays)
                             .children(ime_overlay),
                     )
-                    .children(self.render_panel(cx)),
+                    .children(self.panel_visible.then(|| {
+                        self.cached_chrome(
+                            view_cache::ChromePart::Panel,
+                            gpui::StyleRefinement::default()
+                                .w(px(self.panel_width))
+                                .h_full()
+                                .flex_none(),
+                            cx,
+                        )
+                    })),
             )
             .children(self.render_drawer(cx))
             .children(self.render_webview_dock(cx))
-            .child(self.render_status_bar(cx))
+            .child(
+                self.cached_chrome(
+                    view_cache::ChromePart::StatusBar,
+                    gpui::StyleRefinement::default()
+                        .w_full()
+                        .h(px(STATUS_BAR_HEIGHT))
+                        .flex_none(),
+                    cx,
+                ),
+            )
             .child(ime_registration)
             .children(context_menu_overlay)
             .children(pane_context_overlay)
@@ -38974,6 +39179,81 @@ mod self_test {
                 }
             }
 
+            // 108: 表示中ペインの出力ではクロームを描き直さない（Issue #786）。
+            // ペイン本体とクローム（タブバー / サイドバー / 右パネル / ステータスバー）を
+            // それぞれ `AnyView::cached` の単位に切り出したので、PTY 出力は
+            // **そのペインのビューだけ**を汚す。逆に、それ以外の状態変化では
+            // 従来どおり全部が汚れる（`cx.observe(TakoApp)`）ことも同時に固定する
+            // = 「速いが取りこぼす」への退行を検出できる
+            if view_cache::enabled() {
+                // 2 ペインにして「出力したペインだけが描き直される」ことを見る
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    if app.workspace.active_tab().tree().panes().len() < 2 {
+                        app.split(SplitDirection::Right, cx);
+                    }
+                });
+                wait(cx, 300).await;
+                let draw = |cx: &mut gpui::AsyncApp| {
+                    let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
+                };
+                // 溜まっている汚れを吐き出してから計測を始める
+                draw(cx);
+                wait(cx, 50).await;
+                draw(cx);
+                let counters = |cx: &mut gpui::AsyncApp| {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            (app.pane_body_renders, app.chrome_renders)
+                        })
+                        .unwrap_or((0, 0))
+                };
+                let (panes0, chrome0) = counters(cx);
+                // ① フォーカスペインの出力だけを流す（デバウンス窓は空けておく）
+                let fed = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let target = app.focused_pane();
+                        app.last_term_notify =
+                            std::time::Instant::now() - std::time::Duration::from_secs(1);
+                        app.on_term_event(
+                            target,
+                            tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
+                            cx,
+                        );
+                        app.terminals.contains_key(&target)
+                    })
+                    .unwrap_or(false);
+                draw(cx);
+                let (panes1, chrome1) = counters(cx);
+                // ② テーマ切替（= ペインの外にも出る普通の状態変化）で全部が汚れる
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
+                draw(cx);
+                let (panes2, chrome2) = counters(cx);
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
+                draw(cx);
+                println!(
+                    "TAKO_SELF_TEST_786: fed={fed} output=(panes +{} chrome +{}) \
+                     theme=(panes +{} chrome +{})",
+                    panes1 - panes0,
+                    chrome1 - chrome0,
+                    panes2 - panes1,
+                    chrome2 - chrome1,
+                );
+                check(
+                    fed && panes1 > panes0,
+                    "108: 出力のあったペインは描き直される (#786)",
+                );
+                check(
+                    chrome1 == chrome0,
+                    "108: ペイン出力ではクロームを描き直さない (#786)",
+                );
+                check(
+                    chrome2 > chrome1 && panes2 > panes1,
+                    "108: ペイン外の状態変化では全部が描き直される (#786)",
+                );
+            } else {
+                println!("TAKO_SELF_TEST_SKIPPED: 108（TAKO_786_NO_VIEW_CACHE でキャッシュ無効）");
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -40125,8 +40405,9 @@ mod pane_content_geometry_tests {
     #[test]
     fn ルートに積まれる高さを食う要素は想定どおり() {
         let source = include_str!("main.rs");
+        // 起点はタブバー。#786 でキャッシュビュー化したので `ChromePart::TabBar` が目印
         let render = source
-            .split(".child(self.render_tab_bar(window, cx))")
+            .split("view_cache::ChromePart::TabBar,")
             .nth(1)
             .expect("ルート render が見つからない");
         let render = render
@@ -40138,7 +40419,8 @@ mod pane_content_geometry_tests {
             "render_update_card",
             "render_drawer",
             "render_webview_dock",
-            "render_status_bar",
+            // ステータスバーも #786 でキャッシュビュー化した
+            "view_cache::ChromePart::StatusBar",
         ]
         .into_iter()
         .filter(|name| render.contains(name))

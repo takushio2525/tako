@@ -159,7 +159,6 @@ impl TakoApp {
     fn render_gui_pane_frame(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         focused: bool,
         show_terminal_button: bool,
         cx: &mut Context<Self>,
@@ -180,11 +179,9 @@ impl TakoApp {
 
         div()
             .id(("pane", pane_id.as_u64()))
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
+            // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+            .relative()
+            .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
             .rounded(px(7.0))
@@ -346,7 +343,6 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         kind: SettleKind,
-        rect: Rect,
         area: gpui::Bounds<gpui::Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -378,7 +374,7 @@ impl TakoApp {
             SettleKind::Agent => txt::preparing_agent(),
         };
 
-        self.render_gui_pane_frame(pane_id, rect, focused, true, cx)
+        self.render_gui_pane_frame(pane_id, focused, true, cx)
             .child(
                 div()
                     .flex_1()
@@ -419,7 +415,6 @@ impl TakoApp {
     pub(crate) fn render_starter_pane(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         area: gpui::Bounds<gpui::Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -657,7 +652,7 @@ impl TakoApp {
                 .into_any_element()
         };
 
-        self.render_gui_pane_frame(pane_id, rect, focused, false, cx)
+        self.render_gui_pane_frame(pane_id, focused, false, cx)
             // 本体: 見出し + カード 3 枚（縦積み・中央寄せ）
             .child(
                 div()

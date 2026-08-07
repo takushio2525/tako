@@ -1318,7 +1318,6 @@ impl TakoApp {
     pub(crate) fn render_chat_pane(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         area: gpui::Bounds<gpui::Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -1329,11 +1328,9 @@ impl TakoApp {
             // 空でもペインの矩形は占めておく（隣のペインの位置を動かさない）
             return div()
                 .id(("pane", pane_id.as_u64()))
-                .absolute()
-                .left(relative(rect.x))
-                .top(relative(rect.y))
-                .w(relative(rect.width))
-                .h(relative(rect.height))
+                // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+                .relative()
+                .size_full()
                 .bg(rgba(theme.background));
         };
         let width = f32::from(area.size.width);
@@ -1389,11 +1386,9 @@ impl TakoApp {
 
         div()
             .id(("pane", pane_id.as_u64()))
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
+            // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+            .relative()
+            .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
             .rounded(px(7.0))
