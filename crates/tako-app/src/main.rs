@@ -39196,32 +39196,45 @@ mod self_test {
             // 従来どおり全部が汚れる（`cx.observe(TakoApp)`）ことも同時に固定する
             // = 「速いが取りこぼす」への退行を検出できる
             if view_cache::enabled() {
+                // 項目 78 でウィンドウを開き直しているので handle を取り直す（#381。
+                // 古い handle のまま draw すると何も描かれず、判定が空回りする）
+                let any786 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window786 = any786.downcast::<TakoApp>().unwrap_or(window);
                 // 2 ペインにして「出力したペインだけが描き直される」ことを見る
-                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                let _ = window786.update(cx, |app: &mut TakoApp, _, cx| {
                     if app.workspace.active_tab().tree().panes().len() < 2 {
                         app.split(SplitDirection::Right, cx);
                     }
                 });
                 wait(cx, 300).await;
                 let draw = |cx: &mut gpui::AsyncApp| {
-                    let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
+                    let _ = any786.update(cx, |_, w, cx| w.draw(cx).clear());
                 };
                 // 溜まっている汚れを吐き出してから計測を始める
                 draw(cx);
                 wait(cx, 50).await;
                 draw(cx);
                 let counters = |cx: &mut gpui::AsyncApp| {
-                    window
+                    window786
                         .update(cx, |app: &mut TakoApp, _, _| {
                             (app.pane_body_renders, app.chrome_renders)
                         })
                         .unwrap_or((0, 0))
                 };
                 let (panes0, chrome0) = counters(cx);
-                // ① フォーカスペインの出力だけを流す（デバウンス窓は空けておく）
-                let fed = window
+                // ① このウィンドウに**実際に描かれた**ペインの出力だけを流す。
+                // 直前の draw で `pane_text_areas` に載ったものが正（複数ウィンドウ
+                // 構成では active_tab がこのウィンドウの表示タブとは限らない）
+                let fed = window786
                     .update(cx, |app: &mut TakoApp, _, cx| {
-                        let target = app.focused_pane();
+                        let Some(target) = app
+                            .pane_text_areas
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .find(|id| app.terminals.contains_key(id))
+                        else {
+                            return false;
+                        };
                         app.last_term_notify =
                             std::time::Instant::now() - std::time::Duration::from_secs(1);
                         app.on_term_event(
@@ -39229,16 +39242,16 @@ mod self_test {
                             tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
                             cx,
                         );
-                        app.terminals.contains_key(&target)
+                        true
                     })
                     .unwrap_or(false);
                 draw(cx);
                 let (panes1, chrome1) = counters(cx);
                 // ② テーマ切替（= ペインの外にも出る普通の状態変化）で全部が汚れる
-                let _ = window.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
+                let _ = window786.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
                 draw(cx);
                 let (panes2, chrome2) = counters(cx);
-                let _ = window.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
+                let _ = window786.update(cx, |app: &mut TakoApp, _, cx| app.toggle_theme(cx));
                 draw(cx);
                 println!(
                     "TAKO_SELF_TEST_786: fed={fed} output=(panes +{} chrome +{}) \
@@ -39248,18 +39261,24 @@ mod self_test {
                     panes2 - panes1,
                     chrome2 - chrome1,
                 );
-                check(
-                    fed && panes1 > panes0,
-                    "108: 出力のあったペインは描き直される (#786)",
-                );
-                check(
-                    chrome1 == chrome0,
-                    "108: ペイン出力ではクロームを描き直さない (#786)",
-                );
-                check(
-                    chrome2 > chrome1 && panes2 > panes1,
-                    "108: ペイン外の状態変化では全部が描き直される (#786)",
-                );
+                if !fed {
+                    // ウィンドウが遮蔽されて 1 度も描かれていないと `pane_text_areas` が
+                    // 空になる。product の欠陥ではないので落とさず飛ばす（76d と同じ扱い）
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 108（ペインが未描画。\
+                         ウィンドウを前面にして再実行すると検証できる）"
+                    );
+                } else {
+                    check(panes1 > panes0, "108: 出力のあったペインは描き直される (#786)");
+                    check(
+                        chrome1 == chrome0,
+                        "108: ペイン出力ではクロームを描き直さない (#786)",
+                    );
+                    check(
+                        chrome2 > chrome1 && panes2 > panes1,
+                        "108: ペイン外の状態変化では全部が描き直される (#786)",
+                    );
+                }
             } else {
                 println!("TAKO_SELF_TEST_SKIPPED: 108（TAKO_786_NO_VIEW_CACHE でキャッシュ無効）");
             }
