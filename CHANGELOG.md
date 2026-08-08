@@ -8,6 +8,15 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.9] - 2026-08-09
+
+Nightly patch release (automated). Changes since v0.6.8:
+夜間パッチリリース（自動）。v0.6.8 以降の変更:
+
+- [ドキュメント] Issue 786 の完了状況を記録 (#786)
+- [改善] クローム・ペインをビュー単位のキャッシュへ (#786) (#788)
+- [改善] 見えないペインの出力で全面再描画しない (#782) (#785)
+
 ## [0.6.8] - 2026-08-07
 
 Nightly patch release (automated). Changes since v0.6.7:
