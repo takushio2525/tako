@@ -1323,6 +1323,10 @@ struct TakoApp {
     git_branch_input: Option<GitBranchInput>,
     /// コンフリクト解消エージェントの選択ドロップダウンを開いているか（#496）
     git_agent_menu_open: bool,
+    /// git パネルの「一括 dismiss に食われうる」クリック要素の実描画矩形（#496。
+    /// キーは agent 名 / `"toggle"` / `"branch-input"`）。
+    /// セルフテストが実マウスで押すためだけに使う観測値で、描画の正には使わない
+    git_click_probe_bounds: std::rc::Rc<std::cell::RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     /// バックグラウンドドロワーの表示状態（FR-2.15。下部ステータスバーのボタンでトグル）
     drawer_visible: bool,
     /// バックグラウンドドロワーの高さ（px）
@@ -2816,6 +2820,7 @@ impl TakoApp {
             git_branch_confirm: None,
             git_branch_input: None,
             git_agent_menu_open: false,
+            git_click_probe_bounds: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             drawer_visible: false,
             drawer_height: DRAWER_DEFAULT_HEIGHT,
             bg_pending_kill: None,
@@ -5678,6 +5683,14 @@ impl TakoApp {
     /// git コミット / Web dock URL / Web アドレスバーの 3 種のフラグを落とし、
     /// キー入力がターミナルペインへ届くようにする。
     /// タブ切替・ペインフォーカス移動・パネル非表示化など、入力対象が変わる全経路で呼ぶ
+    ///
+    /// **ここでクリアするフラグに依存して描かれるクリック要素は、必ず
+    /// `on_mouse_down` で `cx.stop_propagation()` すること（#496）**。
+    /// この関数はルート div の `on_mouse_down` からも呼ばれる（= メニュー外クリックで
+    /// 閉じる dismiss 経路）。GPUI の配送は `mouse_down` → `mouse_up` → `click` の順なので、
+    /// 守っていない要素は「押した瞬間に自分が消えて `on_click` が発火しない」。
+    /// 実際に #496 のコンフリクト解消エージェント 3 択が merge 時から一度も
+    /// GUI で動いていなかった（CLI / MCP の同じ dispatch は動くので気付きにくい）
     fn clear_text_input_focus(&mut self) {
         // #719: チャット入力欄は TUI の入力行を映すだけで打鍵を横取りしないので、
         // ここで落とすフラグを持たない（#503 の再発経路が構造的に無い）
@@ -20665,9 +20678,25 @@ mod self_test {
     /// 実測矩形の中心を、実 OS マウスと同じ `PlatformInput` 経路で押す（#738）。
     /// GPUI のヒットテストとリスナー配線まで通るので「見えている位置を押すと
     /// その値が選ばれる」を確かめられる。`AnyWindowHandle` から呼ぶこと
-    /// （`WindowHandle<V>::update` の中だとルートビューの二重借用で panic する）
+    /// （`WindowHandle<V>::update` の中だとルートビューの二重借用で panic する）。
+    /// #496 でも使う: 配送順（mouse_down → mouse_up → click）まで通さないと
+    /// 「押した瞬間に自分が消えて on_click が発火しない」型のバグを検出できない
     #[cfg(feature = "visual-test")]
     fn click_at(any: AnyWindowHandle, cx: &mut AsyncApp, position: Point<Pixels>) {
+        // まず動かして、**そのあと 1 フレーム描く**。`hitbox.is_hovered` はフレーム構築時の
+        // hit test 結果を見るので、動かしただけでは「その要素の上に居る」と判定されず、
+        // 続く mouse_down がどのリスナーにも届かない（#496 の実測で判明）
+        let _ = any.update(cx, |_, win, cx| {
+            win.dispatch_event(
+                gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            )
+        });
+        let _ = capture_frame(any, cx);
         for input in [
             gpui::PlatformInput::MouseMove(MouseMoveEvent {
                 position,
@@ -21012,29 +21041,26 @@ mod self_test {
                 for (first, columns, rows) in tables.iter().copied() {
                     let mut column_width = vec![0.0f32; columns];
                     for row in 0..rows {
-                        for column in 0..columns {
+                        for (column, width) in column_width.iter_mut().enumerate().take(columns) {
                             if let Some(b) = cell_box(cells, first + row * columns + column) {
-                                column_width[column] = column_width[column].max(b.width);
+                                *width = width.max(b.width);
                             }
                         }
                     }
                     for row in 0..rows {
                         let mut row_height = 0.0f32;
-                        for column in 0..columns {
+                        for (column, colw) in column_width.iter().copied().enumerate().take(columns)
+                        {
                             let Some(b) = cell_box(cells, first + row * columns + column) else {
                                 continue;
                             };
                             row_height = row_height.max(b.height);
-                            if md_view::md_table_cell_collapsed(
-                                b,
-                                column_width[column],
-                                line_height,
-                            ) {
+                            if md_view::md_table_cell_collapsed(b, colw, line_height) {
                                 collapsed += 1;
                                 if collapsed <= 4 {
                                     detail.push_str(&format!(
-                                        " collapsed(t{first} r{row} c{column} w={:.1} h={:.1} colw={:.1})",
-                                        b.width, b.height, column_width[column]
+                                        " collapsed(t{first} r{row} c{column} w={:.1} h={:.1} colw={colw:.1})",
+                                        b.width, b.height
                                     ));
                                 }
                             }
@@ -22066,9 +22092,15 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                "conflict-card" => {
+                    conflict_card_visual(window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
-                        "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは profiles / chat-table）"
+                        "TAKO_VISUAL_ONLY: 未知の節 '{other}'\
+                         （使えるのは profiles / chat-table / conflict-card）"
                     );
                     std::process::exit(1);
                 }
@@ -22085,6 +22117,10 @@ mod self_test {
             // #745: チャットビュー内の md テーブル。同じ md をプレビューと並べて
             // 同じ幅で描き、「入る幅があるのに 1 文字ずつ折り返した」セルを 0 件で固定する
             chat_table_visual(any, window, cx).await;
+
+            // #496: コンフリクトカードの操作が実マウスで発火するか
+            // （一括 dismiss #503 に食われて GUI から一度も起動できていなかった）
+            conflict_card_visual(window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -24273,6 +24309,307 @@ mod self_test {
         .detach();
     }
 
+    /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。
+    ///
+    /// ルート div の `on_mouse_down` が呼ぶ一括 dismiss（#503）が `git_agent_menu_open` を
+    /// 落とすため、3 択は押下の mouse_down で消え、続く `on_click` が一度も発火して
+    /// いなかった（merge 時から GUI で動いておらず、CLI / MCP の同じ dispatch は動くので
+    /// 前回の検証をすり抜けた）。**合成マウスは実際に描き終わったフレームの hitbox に
+    /// 当たる**ので、`capture_frame` でフレームを確定させてから押す
+    /// = 通常セルフテスト（test-support 無し）ではなく visual-test 側に置く。
+    /// 単独実行は `TAKO_VISUAL_ONLY=conflict-card`
+    #[cfg(feature = "visual-test")]
+    async fn conflict_card_visual(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        // 109. コンフリクトカードの操作が**実マウスで**発火する（#496）。
+        // ルート div の `on_mouse_down` が呼ぶ一括 dismiss（#503）が
+        // `git_agent_menu_open` を落とすため、3 択は押下の mouse_down で消え、
+        // 続く on_click が一度も発火していなかった（merge 時から GUI では動いておらず、
+        // CLI / MCP の同じ dispatch は動くので前回の検証をすり抜けた）。
+        // カードは**使い捨てリポジトリの実コンフリクト**から実 render 経路で出し、
+        // 押下は実 OS マウスと同じ `PlatformInput` 経路（GPUI のヒットテストと
+        // リスナー配線を通る）で行う。判定は「解消エージェントのペインが増える」
+        {
+            let iso496 = std::env::temp_dir().join(format!("tako-st496-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&iso496);
+            let git496 = |args: &[&str]| -> bool {
+                std::process::Command::new("git")
+                    .args(["-c", "user.name=tako-self-test"])
+                    .args(["-c", "user.email=self-test@example.invalid"])
+                    .args(args)
+                    .current_dir(&iso496)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
+            let shared = iso496.join("shared.txt");
+            let repo_ready = std::fs::create_dir_all(&iso496).is_ok()
+                && git496(&["init", "-q", "-b", "main"])
+                && std::fs::write(&shared, "line1\nline2\nline3\n").is_ok()
+                && git496(&["add", "-A"])
+                && git496(&["commit", "-qm", "base"])
+                && git496(&["checkout", "-qb", "feat"])
+                && std::fs::write(&shared, "line1\nFEAT\nline3\n").is_ok()
+                && git496(&["commit", "-qam", "feat"])
+                && git496(&["checkout", "-q", "main"])
+                && std::fs::write(&shared, "line1\nMAIN\nline3\n").is_ok()
+                && git496(&["commit", "-qam", "main"])
+                // merge は**失敗する**のが正しい（コンフリクト）。成否は見ない
+                && {
+                    let _ = git496(&["merge", "feat"]);
+                    iso496.join(".git/MERGE_HEAD").exists()
+                };
+            let window496: WindowHandle<TakoApp> = cx
+                .update(|cx| {
+                    cx.windows()
+                        .into_iter()
+                        .find_map(|w| w.downcast::<TakoApp>())
+                })
+                .unwrap_or(window);
+            let any496: AnyWindowHandle = window496.into();
+            if !repo_ready {
+                println!("TAKO_SELF_TEST_SKIPPED: 109（使い捨て git リポを作れない）");
+            } else {
+                // ペインの cwd をそのリポへ移す（dispatch は**セッションの cwd** から
+                // リポジトリを解決するので、pinned フォルダだけでは届かない）
+                type_text(any496, cx, &format!("cd {}", shell_escape(&iso496)), true);
+                let mut cwd_ok = false;
+                for _ in 0..20 {
+                    wait(cx, 300).await;
+                    cwd_ok = window496
+                        .update(cx, |app, _, _| {
+                            app.focused_session()
+                                .and_then(|s| s.cwd())
+                                .map(|c| c == iso496)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if cwd_ok {
+                        break;
+                    }
+                }
+                if !cwd_ok {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 109（ペインの cwd が使い捨てリポへ移らない）"
+                    );
+                } else {
+                    let _ = window496.update(cx, |app, _, cx| {
+                        app.panel_visible = true;
+                        app.panel_view = PanelView::Git;
+                        app.git_feedback = None;
+                        app.git_agent_menu_open = false;
+                        app.git_click_probe_bounds.borrow_mut().clear();
+                        app.refresh_git(cx);
+                    });
+                    // コンフリクトカードが出るまで待つ（実 git 由来。注入はしない）
+                    let mut conflicted = false;
+                    for _ in 0..40 {
+                        wait(cx, 250).await;
+                        conflicted = window496
+                            .update(cx, |app, _, _| {
+                                app.git_data
+                                    .as_ref()
+                                    .map(|d| d.conflict.is_active())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if conflicted {
+                            break;
+                        }
+                    }
+                    check(
+                        conflicted,
+                        "109: 使い捨てリポのコンフリクトを git パネルが認識する (#496)",
+                    );
+                    // フレームを最後まで作る（`draw` だけでは hitbox が確定せず、
+                    // 合成マウスがどの要素にも当たらない。実測して分かった）。
+                    // ついでに矩形も canvas の paint で記録される
+                    // 合成マウスは**実際に表示されたフレームの hitbox** に当たるので、
+                    // 自分を前面へ出してから押す（外から AppleScript で上げると同名
+                    // プロセスが複数ある環境で誤解決して本番を掴む）
+                    cx.update(|cx| cx.activate(true));
+                    let _ = window496.update(cx, |_, win, _| win.activate_window());
+                    wait(cx, 1200).await;
+                    // #786 でクロームは `AnyView::cached` になったので、**汚さないと
+                    // 子ビューを描き直さない = hitbox が登録されず合成マウスが当たらない**。
+                    // notify → フレーム完成 の順で 1 セットにする
+                    let draw496 = |cx: &mut gpui::AsyncApp| {
+                        let _ = window496.update(cx, |_, _, cx| cx.notify());
+                        let frame = capture_frame(any496, cx);
+                        if let (Ok(dump), Some((frame, _))) =
+                            (std::env::var("TAKO_VISUAL_DUMP_DIR"), frame.as_ref())
+                        {
+                            let _ =
+                                frame.save(std::path::Path::new(&dump).join("conflict-card.png"));
+                        }
+                    };
+                    draw496(cx);
+                    wait(cx, 200).await;
+                    let probe = |cx: &mut gpui::AsyncApp, key: &'static str| {
+                        window496
+                            .update(cx, |app, _, _| {
+                                app.git_click_probe_bounds.borrow().get(key).copied()
+                            })
+                            .ok()
+                            .flatten()
+                    };
+                    let base496 = window496
+                        .update(cx, |app, _, _| app.focused_pane())
+                        .unwrap_or_else(|_| PaneId::from_raw(1));
+                    let panes_of = |cx: &mut gpui::AsyncApp| {
+                        window496
+                            .update(cx, |app, _, _| {
+                                app.workspace.active_tab().tree().panes().len()
+                            })
+                            .unwrap_or(0)
+                    };
+                    match probe(cx, "toggle") {
+                        None => check(false, "109: コンフリクトカードのトグルが描かれない (#496)"),
+                        Some(toggle) => {
+                            // ① トグルの実クリックでメニューが開く
+                            click_at(any496, cx, toggle.center());
+                            wait(cx, 300).await;
+                            let opened = window496
+                                .update(cx, |app, _, _| app.git_agent_menu_open)
+                                .unwrap_or(false);
+                            check(
+                                opened,
+                                "109: 「解消エージェントを起動」の実クリックで 3 択が開く (#496)",
+                            );
+                            // ② もう一度押すと閉じる（mouse_down で落ちていると
+                            //    on_click が `!false` = true にするので閉じられなかった）
+                            click_at(any496, cx, toggle.center());
+                            wait(cx, 300).await;
+                            let closed_by_toggle = window496
+                                .update(cx, |app, _, _| !app.git_agent_menu_open)
+                                .unwrap_or(false);
+                            check(
+                                closed_by_toggle,
+                                "109: トグルの再クリックで 3 択が閉じる (#496)",
+                            );
+                            // ③ 3 択それぞれの実クリックで解消エージェントのペインが立つ。
+                            //    Issue の受け入れ条件 6 = claude / codex / agy の各ボタン。
+                            //    立ったペインは毎回すぐ閉じる（実エージェントを残さない）
+                            for agent in ["claude", "codex", "agy"] {
+                                let _ = window496.update(cx, |app, _, cx| {
+                                    app.git_feedback = None;
+                                    app.git_agent_menu_open = true;
+                                    cx.notify();
+                                });
+                                draw496(cx);
+                                wait(cx, 200).await;
+                                let Some(choice) = probe(cx, agent) else {
+                                    check(false, "109: 3 択のボタンが描かれない (#496)");
+                                    continue;
+                                };
+                                let before = panes_of(cx);
+                                click_at(any496, cx, choice.center());
+                                let mut after = before;
+                                for _ in 0..20 {
+                                    wait(cx, 250).await;
+                                    after = panes_of(cx);
+                                    if after > before {
+                                        break;
+                                    }
+                                }
+                                let feedback = window496
+                                    .update(cx, |app, _, _| {
+                                        app.git_feedback
+                                            .as_ref()
+                                            .map(|f| (f.message.clone(), f.is_error))
+                                    })
+                                    .ok()
+                                    .flatten();
+                                println!(
+                                    "TAKO_SELF_TEST_496: agent={agent} panes {before}->{after} \
+                                     feedback={feedback:?}"
+                                );
+                                check(
+                                    after > before,
+                                    &format!(
+                                        "109: 3 択「{agent}」の実クリックで解消エージェントの\
+                                         ペインが立つ (#496)"
+                                    ),
+                                );
+                                check(
+                                    window496
+                                        .update(cx, |app, _, _| !app.git_agent_menu_open)
+                                        .unwrap_or(false),
+                                    "109: 起動したら 3 択は閉じる (#496)",
+                                );
+                                // 立てたペインを閉じ、**リポを見ているペインへフォーカスを
+                                // 戻す**（戻さないと次の周で基準ペインが解決できず
+                                // 「対象ペインが未指定」になる。実測して分かった）
+                                let _ = window496.update(cx, |app, _, cx| {
+                                    let target = app.focused_pane();
+                                    if target != base496 {
+                                        let _ = tako_control::dispatch(
+                                            app,
+                                            tako_control::protocol::Request::Close {
+                                                pane: Some(target.as_u64()),
+                                                force: true,
+                                                caller_role: None,
+                                            },
+                                            PaneOrigin::Cli,
+                                        );
+                                    }
+                                    let _ =
+                                        app.workspace.active_tab_mut().tree_mut().focus(base496);
+                                    cx.notify();
+                                });
+                                wait(cx, 500).await;
+                            }
+                        }
+                    }
+                    // ④ 同じ罠にあった新規ブランチ名の入力欄（`git_branch_input`）が、
+                    //    自分をクリックしても消えないこと
+                    let _ = window496.update(cx, |app, _, cx| {
+                        app.git_feedback = None;
+                        app.git_collapsed.branches = false;
+                        app.git_branch_input = Some(GitBranchInput {
+                            text: "st496".into(),
+                            cursor: 5,
+                            start_point: None,
+                        });
+                        cx.notify();
+                    });
+                    draw496(cx);
+                    wait(cx, 200).await;
+                    match probe(cx, "branch-input") {
+                        None => println!(
+                            "TAKO_SELF_TEST_SKIPPED: 109-b（ブランチ名入力欄が描かれていない）"
+                        ),
+                        Some(input) => {
+                            click_at(any496, cx, input.center());
+                            wait(cx, 300).await;
+                            let kept = window496
+                                .update(cx, |app, _, _| app.git_branch_input.is_some())
+                                .unwrap_or(false);
+                            check(
+                                kept,
+                                "109: ブランチ名入力欄は自分をクリックしても消えない (#496)",
+                            );
+                        }
+                    }
+                }
+            }
+            // 後片付け: 注入した状態と使い捨てリポを消す
+            let _ = window496.update(cx, |app, _, cx| {
+                app.git_branch_input = None;
+                app.git_feedback = None;
+                app.git_agent_menu_open = false;
+                app.panel_visible = false;
+                app.refresh_git(cx);
+            });
+            if iso496.starts_with(std::env::temp_dir()) {
+                let _ = std::fs::remove_dir_all(&iso496);
+            }
+        }
+    }
+
     pub fn run(window: WindowHandle<TakoApp>, cx: &mut App) {
         cx.spawn(async move |cx| {
             let any: AnyWindowHandle = window.into();
@@ -26043,25 +26380,43 @@ mod self_test {
                     ),
                     true,
                 );
-                wait(cx, 2500).await;
-                check(
-                    focused_contains(window, cx, "ST601>"),
-                    "検証用 zsh が起動する（PATH 注入）",
-                );
+                // zsh の起動と各コマンドの出力は固定待ちでは間に合わないことがある
+                // （負荷時に落ちるフレーク源だった）。項目 17 / 42 と同じリトライで待つ
+                let mut zsh_up = false;
+                for _ in 0..12 {
+                    wait(cx, 500).await;
+                    zsh_up = focused_contains(window, cx, "ST601>");
+                    if zsh_up {
+                        break;
+                    }
+                }
+                check(zsh_up, "検証用 zsh が起動する（PATH 注入）");
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "tako --version | sed 's/^/TAKO601-A=/'", true);
-                wait(cx, 1500).await;
+                let mut ver_ok = false;
+                for _ in 0..12 {
+                    wait(cx, 500).await;
+                    ver_ok = focused_contains(window, cx, "TAKO601-A=tako ");
+                    if ver_ok {
+                        break;
+                    }
+                }
                 check(
-                    focused_contains(window, cx, "TAKO601-A=tako "),
+                    ver_ok,
                     "PATH に tako が無くても tako 内シェルから実行できる",
                 );
                 type_text(any, cx, "command -v tako", true);
-                wait(cx, 1000).await;
-                check(
-                    focused_contains(window, cx, &format!("{}/tako", cli_dir.display())),
-                    "解決されるのは実行中バイナリの隣の CLI",
-                );
+                let expect_which = format!("{}/tako", cli_dir.display());
+                let mut which_ok = false;
+                for _ in 0..12 {
+                    wait(cx, 500).await;
+                    which_ok = focused_contains(window, cx, &expect_which);
+                    if which_ok {
+                        break;
+                    }
+                }
+                check(which_ok, "解決されるのは実行中バイナリの隣の CLI");
                 type_text(any, cx, "exit", true);
                 wait(cx, 1000).await;
 
@@ -26076,15 +26431,29 @@ mod self_test {
                     ),
                     true,
                 );
-                wait(cx, 2500).await;
+                // A と同じく起動を待ってから打つ（`clear` を前のシェルへ打ち込むと
+                // 以降の判定が丸ごとズレる = 「解決順を変えない」の偽 FAILED になっていた）
+                let mut zsh_up_b = false;
+                for _ in 0..12 {
+                    wait(cx, 500).await;
+                    zsh_up_b = focused_contains(window, cx, "ST601>");
+                    if zsh_up_b {
+                        break;
+                    }
+                }
+                check(zsh_up_b, "検証用 zsh が起動する（既存 tako あり）");
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "tako", true);
-                wait(cx, 1200).await;
-                check(
-                    focused_contains(window, cx, "TAKO601-user"),
-                    "既存の tako の解決順を変えない",
-                );
+                let mut user_ok = false;
+                for _ in 0..12 {
+                    wait(cx, 500).await;
+                    user_ok = focused_contains(window, cx, "TAKO601-user");
+                    if user_ok {
+                        break;
+                    }
+                }
+                check(user_ok, "既存の tako の解決順を変えない");
                 type_text(
                     any,
                     cx,
@@ -26094,11 +26463,15 @@ mod self_test {
                     ),
                     true,
                 );
-                wait(cx, 1200).await;
-                check(
-                    focused_contains(window, cx, "TAKO601-B=0"),
-                    "既存の tako があるときは PATH へ足さない",
-                );
+                let mut no_append = false;
+                for _ in 0..12 {
+                    wait(cx, 500).await;
+                    no_append = focused_contains(window, cx, "TAKO601-B=0");
+                    if no_append {
+                        break;
+                    }
+                }
+                check(no_append, "既存の tako があるときは PATH へ足さない");
                 type_text(any, cx, "exit", true);
                 wait(cx, 1000).await;
 

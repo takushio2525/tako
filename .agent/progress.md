@@ -1810,6 +1810,17 @@
 - 関連コミット: `0188d79`（PR #788 squash merge）。macOS / Windows CI 緑、install 済み
 - 次: #787（端末グリッドの専用 Element 化）で残りの 5M/frame を削る
 
+## 2026-08-10（#496 残バグ: git パネルのクリックが一括 dismiss に食われる問題を根治）
+- ルート div の `on_mouse_down` が呼ぶ `clear_text_input_focus()`（#503）が押下の瞬間に
+  状態を落とし、コンフリクト解消エージェント 3 択の `on_click` が **merge 時から一度も
+  発火していなかった**。同型 4 件（トグル / ブランチ名入力欄 / 作成 / キャンセル）も一括修正
+- 実測: visual-test 新節 `conflict-card` で claude→pane2 / codex→pane3 / agy→pane4 が
+  実マウスで立つ。guard を外すと `panes 1->1 / feedback=None` で FAILED（検出力）。
+  CI 用に番犬テスト 3 本 + 規約を `.agent/conventions.md` へ明文化
+- 同梱: セルフテスト #601 の固定待ちをリトライ化（main 由来の確定失敗）、visual-test の
+  clippy 違反 2 件（#745 由来）
+- 次: PR → CI 緑 → merge → install。PDF / IME / tmux のセルフテスト項目は main 由来失敗で別起票
+
 ## 2026-08-10（#793: setup に設定共有（tako config）の検出・案内・代行導線）
 - `config_share::env` を新設し、①配線済みか ②共有対象が既に外部 git（dotfiles）で
   管理されていないか ③gh の認証状態、を読み取りだけで検出。案内は純粋関数 `guidance` で決め、

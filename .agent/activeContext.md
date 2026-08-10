@@ -34,7 +34,12 @@
 - 未配線 → 案内 / 配線済み → 状態のみ（3 回連続で同一）/ dotfiles 検出 → 相乗り提案 +
   二重管理の注意 / `--yes`・非 TTY → 副作用も代行案内も無し / pty 経由の対話端末 → 質問ゼロ
   のまま代行導線が出る / `gh repo create`（スタブ）→ `tako config init --remote` の連結
-- fmt / clippy(-D warnings) / test --workspace 全緑（1921 件）+ docs build 成功
+- fmt / clippy(-D warnings) / test --workspace 全緑（1921 件）+ docs build 成功 +
+  Windows クロス check（`scripts/check-windows.sh`）エラー 0 / 警告 13 = baseline 不変
+- **隔離セルフテストは完走せず**。同一手順 4 回で毎回別項目が落ち、**素の main（`b6c9e38`）
+  でも落ちた**（本 PR: #601 / PDF #232 / #601、main: #666）。本番 tako.app が ~99% CPU で
+  load 6〜16 の環境要因。#496 側も同日「#601 の固定待ちをリトライ化（main 由来の確定失敗）」
+  「PDF / IME / tmux は main 由来失敗」と記録している
 - 証拠: `/private/tmp/tako-793-e2e/evidence`、スクリプトは scratchpad の `e2e-793.sh`
 
 ## 不変条件
