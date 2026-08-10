@@ -8,6 +8,14 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.10] - 2026-08-11
+
+Nightly patch release (automated). Changes since v0.6.9:
+夜間パッチリリース（自動）。v0.6.9 以降の変更:
+
+- [機能追加] setup に設定共有の検出・案内・代行導線を追加 (#793) (#794)
+- [修正] git パネルのクリックが一括 dismiss に食われる問題を根治 (#496) (#795)
+
 ## [0.6.9] - 2026-08-09
 
 Nightly patch release (automated). Changes since v0.6.8:
