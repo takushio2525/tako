@@ -2604,6 +2604,13 @@ impl TakoApp {
                     .bg(rgba(theme.crust))
                     .text_size(px(11.0))
                     .text_color(hsla(theme.tab_active_foreground))
+                    // #496: ルート div の一括 dismiss（#503）から自分を守る。GPUI は
+                    // mouse_down → mouse_up → click の順に配る = 守らないと押下の瞬間に
+                    // 自分が消えて on_click が発火しない（規約は .agent/conventions.md）
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                    )
                     .when(input.text.is_empty(), |d| {
                         d.child(
                             div()
@@ -2630,6 +2637,23 @@ impl TakoApp {
                                 .text_ellipsis()
                                 .child(SharedString::from(head_chars(after, visible))),
                         )
+                    })
+                    // セルフテスト（visual-test）が実マウスで押すための実矩形。
+                    // 記録は上書きのみ（render 冒頭でクリアすると空を読む窓ができる。#315）
+                    .child({
+                        let slot = self.git_click_probe_bounds.clone();
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, _, _| {
+                                slot.borrow_mut().insert("branch-input", bounds);
+                            },
+                        )
+                        // `absolute` だけでは CSS 同様「本来置かれる位置」= 直前の子の
+                        // 下へずれる。原点を明示して対象へ正確に重ねる
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
                     }),
             )
             .child(
@@ -2662,6 +2686,13 @@ impl TakoApp {
                             .bg(rgba_alpha(theme.accent, 0.2))
                             .text_color(hsla(theme.accent))
                             .hover(|d| d.bg(rgba_alpha(theme.accent, 0.35)))
+                            // #496: ルート div の一括 dismiss（#503）から自分を守る。GPUI は
+                            // mouse_down → mouse_up → click の順に配る = 守らないと押下の瞬間に
+                            // 自分が消えて on_click が発火しない（規約は .agent/conventions.md）
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.git_do_create_branch(repo_for_create.clone(), cx);
                             }))
@@ -2677,6 +2708,13 @@ impl TakoApp {
                             .text_size(px(10.0))
                             .text_color(hsla_alpha(fg, 0.8))
                             .hover(|d| d.bg(rgba_alpha(theme.selection_background, 0.4)))
+                            // #496: ルート div の一括 dismiss（#503）から自分を守る。GPUI は
+                            // mouse_down → mouse_up → click の順に配る = 守らないと押下の瞬間に
+                            // 自分が消えて on_click が発火しない（規約は .agent/conventions.md）
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.git_branch_input = None;
                                 cx.notify();
@@ -2953,6 +2991,13 @@ impl TakoApp {
                     .bg(rgba_alpha(theme.accent, 0.25))
                     .text_color(hsla(theme.accent))
                     .hover(|d| d.bg(rgba_alpha(theme.accent, 0.4)))
+                    // #496: ルート div の一括 dismiss（#503）から自分を守る。GPUI は
+                    // mouse_down → mouse_up → click の順に配る = 守らないと押下の瞬間に
+                    // 自分が消えて on_click が発火しない（規約は .agent/conventions.md）
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.git_agent_menu_open = !this.git_agent_menu_open;
@@ -2983,7 +3028,22 @@ impl TakoApp {
                                     .flex_none()
                                     .text_color(hsla(theme.accent)),
                             ),
-                    ),
+                    )
+                    .child({
+                        let slot = self.git_click_probe_bounds.clone();
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, _, _| {
+                                slot.borrow_mut().insert("toggle", bounds);
+                            },
+                        )
+                        // `absolute` だけでは CSS 同様「本来置かれる位置」= 直前の子の
+                        // 下へずれる。原点を明示して対象へ正確に重ねる
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                    })
             )
             .child(
                 div()
@@ -3024,6 +3084,7 @@ impl TakoApp {
                 .gap_1();
             // 既存のエージェント基盤と同じ 3 種（新しい系統は作らない）
             for (i, agent) in ["claude", "codex", "agy"].into_iter().enumerate() {
+                let slot = self.git_click_probe_bounds.clone();
                 row = row.child(
                     div()
                         .id(("git-conflict-agent", i))
@@ -3038,11 +3099,32 @@ impl TakoApp {
                         .bg(rgba_alpha(theme.accent, 0.15))
                         .text_color(hsla(theme.accent))
                         .hover(|d| d.bg(rgba_alpha(theme.accent, 0.35)))
+                        // #496: ルート div の一括 dismiss（#503）から自分を守る。GPUI は
+                        // mouse_down → mouse_up → click の順に配る = 守らないと押下の瞬間に
+                        // 自分が消えて on_click が発火しない（規約は .agent/conventions.md）
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.git_do_resolve_agent(agent, cx);
                         }))
-                        .child(agent),
+                        .child(agent)
+                        // セルフテスト（visual-test）が実マウスで押すための実矩形
+                        .child(
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| {
+                                    slot.borrow_mut().insert(agent, bounds);
+                                },
+                            )
+                            // `absolute` だけでは直前の子の下へずれる（原点を明示する）
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        ),
                 );
             }
             push_row!(row);
@@ -5639,5 +5721,86 @@ mod tests {
             "予測不能なのに「コンフリクトなし」と出している: {joined}"
         );
         assert!(joined.contains(crate::ui_text::panel::git_merge_prediction_unavailable()));
+    }
+}
+
+/// 一括 dismiss（#503）に食われるクリック要素を作らせないための番犬（#496）。
+///
+/// ルート div の `on_mouse_down` は `clear_text_input_focus()` を呼び、
+/// テキスト入力フラグとメニュー開閉状態をまとめて落とす。GPUI の配送は
+/// mouse_down → mouse_up → click なので、**落とされる状態に依存して描かれる
+/// クリック要素**が `on_mouse_down` で伝播を止めていないと、押した瞬間に自分が消えて
+/// `on_click` が一度も発火しない（#496 のコンフリクト解消エージェント 3 択は
+/// merge 時から GUI で動いていなかった。CLI / MCP の同じ dispatch は動くので
+/// 実クリックしないと気付けない）。
+///
+/// visual-test の `conflict-card` 節が実マウスで押さえているが、あれは
+/// `--features visual-test` が要るため CI では走らない。ここは CI で毎回走る側。
+#[cfg(test)]
+mod dismiss_guard_watchdog {
+    /// `clear_text_input_focus` が落とす状態に依存して描かれるクリック要素。
+    /// 新しくこの種の要素を足したらここへも足す（足さないと守り忘れに気付けない）
+    const GUARDED: &[(&str, &str)] = &[
+        // コンフリクト解消エージェントの 3 択とトグル（#496）
+        ("git-conflict-agent", "git_agent_menu_open"),
+        ("git-conflict-resolve-btn", "git_agent_menu_open"),
+        // 新規ブランチ名の入力欄と確定 / キャンセル（#496）
+        ("git-branch-create-btn", "git_branch_input"),
+        ("git-branch-cancel-btn", "git_branch_input"),
+    ];
+
+    /// `id(...)` から次の `.on_click(` までの間に `.on_mouse_down(` があるか。
+    /// 要素の定義はメソッドチェーンなので、この 2 つの出現順で判定できる
+    fn guards_mouse_down(src: &str, id: &str) -> bool {
+        let Some(at) = src.find(id) else {
+            return false;
+        };
+        let rest = &src[at..];
+        let Some(click) = rest.find(".on_click(") else {
+            return false;
+        };
+        rest[..click].contains(".on_mouse_down(")
+    }
+
+    #[test]
+    fn 一括dismissに依存するクリック要素はmouse_downで伝播を止めている() {
+        let src = include_str!("right_panel.rs");
+        for (id, flag) in GUARDED {
+            assert!(
+                guards_mouse_down(src, id),
+                "{id} は {flag} に依存して描かれるのに on_mouse_down で \
+                 stop_propagation していない。ルート div の一括 dismiss（#503）が \
+                 押下の mouse_down で状態を落とすため、on_click が発火しない。\
+                 規約は .agent/conventions.md「一括 dismiss に食われないクリック要素の作り方」"
+            );
+        }
+    }
+
+    /// 検出力の担保: 守っていない要素を渡したら落ちること（番犬自身が空振りしない）
+    #[test]
+    fn 番犬はmouse_downのない要素を見逃さない() {
+        let bad = r#"div().id("x-btn").on_click(cx.listener(|_, _, _, _| {}))"#;
+        assert!(!guards_mouse_down(bad, "x-btn"));
+        let good = r#"div().id("x-btn").on_mouse_down(MouseButton::Left, f).on_click(g)"#;
+        assert!(guards_mouse_down(good, "x-btn"));
+    }
+
+    /// ブランチ名入力欄の本体（id を持たない）も守られているか。
+    /// `render_branch_input` の入力ボックスは押すと `git_branch_input` が None になり
+    /// 欄ごと消えていた（#496）ので、専用に固定する
+    #[test]
+    fn ブランチ名入力欄の本体もmouse_downで伝播を止めている() {
+        let src = include_str!("right_panel.rs");
+        let at = src
+            .find("fn render_branch_input")
+            .expect("render_branch_input が見つからない");
+        let body = &src[at..];
+        let end = body
+            .find("fn render_branch_confirm")
+            .unwrap_or(body.len().min(8000));
+        assert!(
+            body[..end].contains(".on_mouse_down("),
+            "render_branch_input の入力欄が on_mouse_down で stop_propagation していない"
+        );
     }
 }
