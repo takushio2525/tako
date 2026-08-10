@@ -159,3 +159,22 @@ scripts/release.sh --update-notes v0.6.0   # 実アセットを読み直して�
   対話を通じて何でもできる状態を既定にする。対話 agent の起動は省略しない（Issue #391）。
   `--` オプションは「詳しい人が、わかったうえで付ける」上級者レイヤであり、既定の
   ユーザー体験はオプションなしで完結すること。CLI 設計時にこれを判断基準にする
+
+## 一括 dismiss に食われないクリック要素の作り方（Issue #496 / #503）
+
+ルート div の `on_mouse_down` は `clear_text_input_focus()` を呼び、テキスト入力フラグと
+メニュー開閉状態をまとめて落とす（#503 の「キー入力が奪われたまま残る」対策 +
+メニュー外クリックで閉じる dismiss 経路）。GPUI の配送は **`mouse_down` → `mouse_up` →
+`click`** の順なので、次の規約を守らないとクリックが構造的に死ぬ。
+
+- **`clear_text_input_focus()` が落とす状態に依存して描かれるクリック要素は、必ず
+  `on_mouse_down` で `cx.stop_propagation()` する**。守らないと押下の mouse_down で
+  自分が消え、`on_click` が一度も発火しない（#496 のコンフリクト解消エージェント 3 択が
+  merge 時から GUI で動いていなかった。CLI / MCP の同じ dispatch は動くので気付けない）
+- トグルボタン（開閉を反転する側）も同じ。守らないと mouse_down で `false` に落ちた直後に
+  `on_click` が `!false` = `true` にするので、**開いた状態から閉じられない**
+- 実装の正は `starter.rs` のプロファイル選択メニュー（項目に `stop_propagation`、
+  背面に全画面 dismiss div）と、git コミット入力欄（`right_panel.rs`）
+- 回帰は**合成マウス**で押さえる。`self_test::click_at` が実 OS マウスと同じ
+  `PlatformInput`（MouseMove → MouseDown → MouseUp）を流すので、GPUI のヒットテストと
+  リスナー配線まで通る。ハンドラを直呼びするテストではこの型のバグを検出できない
