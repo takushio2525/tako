@@ -1820,3 +1820,13 @@
 - 同梱: セルフテスト #601 の固定待ちをリトライ化（main 由来の確定失敗）、visual-test の
   clippy 違反 2 件（#745 由来）
 - 次: PR → CI 緑 → merge → install。PDF / IME / tmux のセルフテスト項目は main 由来失敗で別起票
+
+## 2026-08-10（#793: setup に設定共有（tako config）の検出・案内・代行導線）
+- `config_share::env` を新設し、①配線済みか ②共有対象が既に外部 git（dotfiles）で
+  管理されていないか ③gh の認証状態、を読み取りだけで検出。案内は純粋関数 `guidance` で決め、
+  setup サマリと `--check` が同じ判定から文言を作る（質問は増やさない / 配線済みなら勧誘しない）
+- 代行はアシスタント側: `setup-context.yaml` の `config_share` + system-prompt Step 3.5。
+  **既存 dotfiles があれば相乗りが第一案**（別リポジトリだと pull の rename が symlink を
+  実ファイルへ置き換えて既存の配線を壊す）。既存ユーザーへは changes.yaml rev 14（guided）
+- 検証: 隔離 e2e PASS 55 / FAIL 0（本番 HOME・~/.claude・GitHub 非干渉を含む）+
+  品質ゲート全緑（1921）+ docs build

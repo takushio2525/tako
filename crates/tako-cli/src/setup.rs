@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use tako_control::config_share::env::ShareEnvironment;
 use tako_control::setup::{
     compare_instruction_coverage, load_config, pending_changes, resolve_setup_value, ChangeKind,
     InstructionCoverage, ResolvedSetupValue, SetupAnswers, SetupChange, SetupPlan,
@@ -1293,6 +1294,46 @@ struct SetupContext<'a> {
     /// 同梱推奨ルールとの項目レベル比較の結果（Issue #322）。
     /// setup agent（--review）が Step 1 の裏取りに使う
     instruction_coverage: InstructionCoverageContext,
+    /// 設定共有の現状（Issue #793）。setup agent が案内・代行の判断に使う。
+    /// **検出は CLI 側で済ませてある**（agent に探索させない = 毎回同じ判断になる）
+    config_share: ConfigShareContext<'a>,
+}
+
+/// setup agent へ渡す設定共有の現状（Issue #793）
+#[derive(serde::Serialize)]
+struct ConfigShareContext<'a> {
+    /// 配線済みか。true なら**案内しない**（#793 受け入れ条件 4 = 冪等）
+    linked: bool,
+    /// 配線先（ホームは `~` 表記）
+    repo: Option<&'a str>,
+    /// 配線先が生きた git リポジトリか
+    repo_ok: bool,
+    /// linked / broken / adopt_existing / fresh
+    guidance: &'static str,
+    /// 提示してよい最簡の次の一手（#322）
+    next_command: String,
+    /// gh CLI の状態（missing / unauthenticated / authenticated / unknown）。
+    /// 配線済みのときは判定しないので null
+    gh: Option<&'static str>,
+    /// `gh repo create` の代行を提案してよいか（authenticated のときだけ true）
+    gh_can_create_repo: bool,
+    /// 既に外部 git（dotfiles 等）で管理されている共有対象
+    external: &'a [tako_control::config_share::env::ExternalManaged],
+}
+
+impl<'a> ConfigShareContext<'a> {
+    fn from_env(env: &'a ShareEnvironment) -> Self {
+        Self {
+            linked: env.linked,
+            repo: env.repo.as_deref(),
+            repo_ok: env.repo_ok,
+            guidance: env.guidance().as_str(),
+            next_command: env.next_command(),
+            gh: env.gh.map(|gh| gh.as_str()),
+            gh_can_create_repo: env.gh_can_create_repo(),
+            external: &env.external,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -1329,6 +1370,7 @@ fn write_setup_context(
     plans: &BTreeMap<String, String>,
     profile_note: &str,
     instruction_coverage: Option<&InstructionCoverage>,
+    share_env: &ShareEnvironment,
 ) -> Result<(), String> {
     let instruction_file = instruction_path(selected)
         .map(|path| display_home_relative(&path))
@@ -1345,6 +1387,7 @@ fn write_setup_context(
         provider_plans: plans,
         profile_note,
         instruction_coverage: InstructionCoverageContext::from_coverage(instruction_coverage),
+        config_share: ConfigShareContext::from_env(share_env),
     };
     let yaml = serde_yaml::to_string(&context)
         .map_err(|e| format!("setup-context.yaml の生成に失敗: {e}"))?;
@@ -1480,27 +1523,89 @@ fn decide_config_share_step(
     }
 }
 
-/// 設定共有（Issue #513）の案内・配線。**標準 setup では質問を増やさない**（#262）。
+/// 設定共有の状態表示（Issue #793）。setup サマリと `--check` が**同じ判定**
+/// （`config_share::env::Guidance`）から文言を作るので、片方だけ古くならない。
+/// **質問は含まない**（#262 の質問ゼロ）。`verbose` = setup サマリ向けに説明行を足す
+fn config_share_lines(env: &ShareEnvironment, verbose: bool) -> Vec<String> {
+    use tako_control::config_share::env::Guidance;
+
+    let repo = env.repo.as_deref().unwrap_or("?");
+    let next = env.next_command();
+    let mut lines = Vec::new();
+    match env.guidance() {
+        // 配線済みなら状態を 1 行示すだけ。勧誘はしない（#793 受け入れ条件 4 = 冪等）
+        Guidance::Linked => {
+            lines.push(format!("  [OK] 設定共有: 配線済み（{repo}）"));
+            if verbose {
+                lines.push(
+                    "       差分は `tako config status`、同期は `tako config push` / `pull`".into(),
+                );
+            }
+        }
+        Guidance::Broken => {
+            lines.push(format!(
+                "  [警告] 設定共有: 配線先が git リポジトリではありません（{repo}）"
+            ));
+            lines.push(format!("         `{next}` で繋ぎ直せます"));
+        }
+        // 既に自力で共有している利用者には、まず相乗りを示す（二重管理を作らない）
+        Guidance::AdoptExisting => {
+            lines.push("  [情報] 設定共有: 未配線".into());
+            for found in &env.external {
+                lines.push(format!(
+                    "         {} は既に {} で管理されています{}",
+                    found.path,
+                    found.repo,
+                    if found.same_place {
+                        "（tako の置き場と一致）"
+                    } else {
+                        "（tako の置き場とは別）"
+                    }
+                ));
+            }
+            lines.push(format!("         同じリポジトリへ相乗りするなら `{next}`"));
+            lines.push(
+                "         別のリポジトリを作ると同じ内容が 2 箇所に並びます（二重管理）".into(),
+            );
+        }
+        Guidance::Fresh => {
+            lines.push(format!(
+                "  [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `{next}`）"
+            ));
+            if verbose {
+                lines.push(
+                    "         claude のグローバル指示と tako の宣言的設定を git 1 本で共有します"
+                        .into(),
+                );
+                lines.push(
+                    "         秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます".into(),
+                );
+            }
+        }
+    }
+    lines
+}
+
+/// 設定共有（Issue #513 / #793）の案内・配線。**標準 setup では質問を増やさない**（#262）。
 ///
 /// - `answers.config_share` があれば非対話で配線する（MCP `tako_setup` / `--answers` 経路）
 /// - `--review` の対話では y/N で 1 回だけ聞く
-/// - それ以外は「こういう機能がある」の 1 行案内だけ（質問しない）
+/// - それ以外は検出結果（`env`）にもとづく状態表示だけ（質問しない）。
+///   実際の設定は、このあと起動する対話アシスタントが代行する（#793）
 ///
 /// 失敗しても setup 全体は止めない（共有はオプションであって前提ではない）
 fn apply_config_share(
     review: bool,
     assume_yes: bool,
     answers: Option<&tako_control::setup::SetupConfigShareAnswers>,
+    env: &ShareEnvironment,
+    agent_follows: bool,
 ) -> Result<(), String> {
-    let already_linked = tako_control::config_share::load_state()
-        .ok()
-        .flatten()
-        .is_some();
     let step = decide_config_share_step(
         review,
         assume_yes,
         std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        already_linked,
+        env.linked,
         answers,
     );
     match step {
@@ -1508,16 +1613,24 @@ fn apply_config_share(
         ConfigShareStep::Link { repo, path, remote } => {
             return run_config_share_link(repo.as_deref(), path.as_deref(), remote.as_deref())
         }
-        ConfigShareStep::AlreadyLinked => {
+        // 配線済み・案内のどちらも「表示だけ」。質問は増やさない（#262）
+        ConfigShareStep::AlreadyLinked | ConfigShareStep::Info => {
             eprintln!();
-            eprintln!("  [OK] 設定共有は配線済みです（`tako config status` で差分を確認できます）");
-            return Ok(());
-        }
-        ConfigShareStep::Info => {
-            eprintln!();
-            eprintln!("設定共有（任意）: 複数デバイスで同じ AI 設定を使うなら `tako config init`");
-            eprintln!("  claude のグローバル指示と tako の宣言的設定を git 1 本で共有します");
-            eprintln!("  秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます");
+            for line in config_share_lines(env, true) {
+                eprintln!("{line}");
+            }
+            // 代行できるのは対話アシスタントが続けて起動するときだけ。
+            // `--yes` / 非 TTY では誰も代行しないので、その案内も出さない（#793 受け入れ条件 5）
+            if agent_follows && env.guidance().invites_setup() {
+                eprintln!(
+                    "         このあとの対話アシスタントに「設定を共有したい」と言えば{}",
+                    if env.gh_can_create_repo() {
+                        "、リポジトリ作成から配線まで任せられます"
+                    } else {
+                        "、そのまま設定できます"
+                    }
+                );
+            }
             return Ok(());
         }
         ConfigShareStep::Ask => {}
@@ -1529,6 +1642,18 @@ fn apply_config_share(
     eprintln!("  tako の宣言的設定（profiles / projects / accounts / local-rules）を");
     eprintln!("  git リポジトリ 1 本で別デバイスと共有できます。");
     eprintln!("  秘匿情報（token / credentials）とマシン固有の状態は構造的に除外されます。");
+    for found in &env.external {
+        eprintln!(
+            "  検出: {} は既に {} で管理されています{}",
+            found.path,
+            found.repo,
+            if found.same_place {
+                "（相乗りすれば同じ場所に載るので重複しません）"
+            } else {
+                "（別リポジトリを作ると同じ内容が 2 箇所に並びます）"
+            }
+        );
+    }
     eprint!("  いま設定しますか？ [y/N]: ");
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
@@ -1540,7 +1665,19 @@ fn apply_config_share(
         return Ok(());
     }
 
-    eprintln!("  既存の共有リポジトリがあればパスか URL を、無ければ Enter（新規作成）");
+    let suggested = env
+        .external
+        .first()
+        .filter(|found| found.same_place)
+        .map(|found| found.repo.clone());
+    match &suggested {
+        Some(repo) => {
+            eprintln!("  既存の共有リポジトリがあればパスか URL を。Enter で {repo} へ相乗りします")
+        }
+        None => {
+            eprintln!("  既存の共有リポジトリがあればパスか URL を、無ければ Enter（新規作成）")
+        }
+    }
     eprint!("  リポジトリ: ");
     let mut repo = String::new();
     if std::io::stdin().read_line(&mut repo).is_err() {
@@ -1548,6 +1685,9 @@ fn apply_config_share(
     }
     let repo = repo.trim().to_string();
     if !repo.is_empty() {
+        return run_config_share_link(Some(&repo), None, None);
+    }
+    if let Some(repo) = suggested {
         return run_config_share_link(Some(&repo), None, None);
     }
     eprintln!("  新規作成します。GitHub 等に置くならリモート URL を、ローカルだけなら Enter");
@@ -1860,6 +2000,11 @@ pub fn run_check() -> Result<(), String> {
                 }
             }
         }
+    }
+
+    // 設定共有（Issue #513 / #793）。表示だけで、配線もリポジトリ作成もしない
+    for line in config_share_lines(&tako_control::config_share::env::detect(), false) {
+        eprintln!("{line}");
     }
 
     // プロファイル一覧
@@ -2211,6 +2356,9 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     let profile_note = prepare_profile(selected, &agents, &plans, answers.profile.as_ref())?;
     apply_projects(answers.projects.as_ref())?;
+    // 設定共有の現状（#793）。読み取りだけで副作用は無い。
+    // 表示（サマリ / --check）と対話アシスタントへの引き渡しで同じ検出結果を使う
+    let share_env = tako_control::config_share::env::detect();
     write_setup_context(
         &dir,
         selected,
@@ -2218,6 +2366,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         &plans,
         profile_note,
         instruction_coverage.as_ref(),
+        &share_env,
     )?;
 
     let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
@@ -2227,15 +2376,21 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     eprintln!();
     eprintln!("スマホからリモート接続するには: tako remote setup");
 
-    // 設定共有（#513）。標準経路では案内 1 行だけ = 質問を増やさない（#262）
-    apply_config_share(review_mode, assume_yes, answers.config_share.as_ref())?;
-
     // --- 対話エージェント起動（Issue #295 / #322 / #391）---
     // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
     // スキップ条件: --yes / 非 TTY / --answers launch_agent=none
     let skip_agent = assume_yes
         || !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || answers.launch_agent.as_deref().is_some_and(|v| v == "none");
+
+    // 設定共有（#513 / #793）。標準経路は状態表示だけ = 質問を増やさない（#262）
+    apply_config_share(
+        review_mode,
+        assume_yes,
+        answers.config_share.as_ref(),
+        &share_env,
+        !skip_agent,
+    )?;
 
     if !skip_agent {
         if review_mode && instruction_existed {
@@ -2635,6 +2790,111 @@ mod tests {
                 decide(true, false, true, true, None),
                 ConfigShareStep::AlreadyLinked
             );
+        }
+    }
+
+    /// 表示（setup サマリ / `--check`）の文言（Issue #793）。
+    /// 判定は `config_share::env` の純粋関数、ここで見るのは「何をどう見せるか」
+    mod config_share_notice {
+        use super::super::config_share_lines;
+        use tako_control::config_share::env::{
+            ExternalKind, ExternalManaged, GhStatus, ShareEnvironment,
+        };
+
+        fn env(linked: bool, external: Vec<ExternalManaged>) -> ShareEnvironment {
+            ShareEnvironment {
+                linked,
+                repo: linked.then(|| "~/tako-config-sync".to_string()),
+                repo_ok: linked,
+                external,
+                gh: (!linked).then_some(GhStatus::Authenticated),
+            }
+        }
+
+        fn dotfiles(repo_rel: &str) -> ExternalManaged {
+            ExternalManaged {
+                root: "claude",
+                path: "~/.claude".into(),
+                kind: ExternalKind::Symlink,
+                repo: "~/dotfiles".into(),
+                same_place: ExternalManaged::shares_place("claude", repo_rel),
+                repo_rel: repo_rel.into(),
+            }
+        }
+
+        fn joined(env: &ShareEnvironment, verbose: bool) -> String {
+            config_share_lines(env, verbose).join("\n")
+        }
+
+        #[test]
+        fn 表示に質問は含まれない() {
+            for verbose in [true, false] {
+                for env in [
+                    env(false, vec![]),
+                    env(false, vec![dotfiles("claude")]),
+                    env(true, vec![]),
+                ] {
+                    let text = joined(&env, verbose);
+                    assert!(
+                        !text.contains("[y/N]") && !text.contains("しますか"),
+                        "標準 setup の表示で質問してはいけない（#262）: {text}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn 配線済みなら勧誘文言を出さない() {
+            let text = joined(&env(true, vec![dotfiles("claude")]), true);
+            assert!(text.contains("配線済み"), "{text}");
+            assert!(
+                !text.contains("tako config init") && !text.contains("tako config link"),
+                "配線済みで新規配線を勧めない（#793 受け入れ条件 4）: {text}"
+            );
+        }
+
+        #[test]
+        fn 未配線かつ既存運用なしなら新規作成を案内する() {
+            let text = joined(&env(false, vec![]), true);
+            assert!(text.contains("未配線"), "{text}");
+            assert!(text.contains("tako config init"), "{text}");
+        }
+
+        #[test]
+        fn 既存の外部管理を検出したら相乗りを先に出す() {
+            let text = joined(&env(false, vec![dotfiles("claude")]), true);
+            assert!(
+                text.contains("~/.claude は既に ~/dotfiles で管理"),
+                "{text}"
+            );
+            assert!(
+                text.contains("tako config link ~/dotfiles"),
+                "相乗り先を最簡形で示す（#322）: {text}"
+            );
+            assert!(
+                text.contains("二重管理"),
+                "別リポジトリを作る危険を明示する（#793 受け入れ条件 3）: {text}"
+            );
+            assert!(
+                !text.contains("tako config init"),
+                "既存運用があるのに新規作成を第一案にしない: {text}"
+            );
+        }
+
+        #[test]
+        fn 置き場が違えば重複を明示する() {
+            let same = joined(&env(false, vec![dotfiles("claude")]), false);
+            assert!(same.contains("tako の置き場と一致"), "{same}");
+            let differs = joined(&env(false, vec![dotfiles("home/.claude")]), false);
+            assert!(differs.contains("tako の置き場とは別"), "{differs}");
+        }
+
+        #[test]
+        fn checkは説明行を足さない() {
+            let check = config_share_lines(&env(false, vec![]), false);
+            let summary = config_share_lines(&env(false, vec![]), true);
+            assert_eq!(check.len(), 1, "--check は 1 行: {check:?}");
+            assert!(summary.len() > check.len(), "サマリでは説明を足す");
         }
     }
 }
