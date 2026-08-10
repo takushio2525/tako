@@ -30,6 +30,7 @@
 //! よって明示的な `push` / `pull` にした。差分は `status` で見える。
 
 pub mod catalog;
+pub mod env;
 pub mod guard;
 pub mod portable;
 

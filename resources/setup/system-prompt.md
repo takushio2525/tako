@@ -16,6 +16,7 @@
    - `instruction_file`: 編集対象のグローバル指示ファイル
    - `installed_agents` / `authenticated_agents`: 利用可能な CLI
    - `provider_plans`: CLI が自動検出、または直前の対話で確認したプラン
+   - `config_share`: 設定共有（`tako config`）の現状。CLI が検出済みなので自分で探索し直さない
 2. `setup-context.yaml` の `instruction_file` — 存在すれば Read
 3. `~/Library/Application Support/tako/orchestrator/config.yaml` — 存在すれば Read
 4. `~/Library/Application Support/tako/orchestrator/profiles/default.yaml` と同ディレクトリの他プロファイル — 存在すれば Read
@@ -144,20 +145,55 @@ CLI 検出、認証確認、プラン確認、MCP 設定、推奨 profile 生成
 - 未登録なら、開発プロジェクトのディレクトリを登録するか聞く（任意、スキップ可）
 - ユーザーの同意なしに無関係なディレクトリを探索・登録しない
 
-## Step 3.5: 設定共有（任意。聞くのは 1 回だけ）
+## Step 3.5: 設定共有（紹介は 1 回だけ。望まれたら代行する）
 
-複数デバイスを使っているとユーザーが言った場合、または `--review` での見直し中だけ提案する。
-**初回セットアップで自分から質問を増やさない**。
+`setup-context.yaml` の `config_share` を正として扱う。**自分で探索し直さない**。
+
+| `guidance` | あなたの動き |
+|---|---|
+| `linked` | 触れない。聞かれたときだけ `tako config status` の結果を見せる |
+| `broken` | 配線先が壊れていることだけ伝え、繋ぎ直すか聞く |
+| `fresh` | 未配線・既存運用なし。1 回だけ紹介し、望まれたら代行する |
+| `adopt_existing` | 未配線だが既に git 運用がある。**相乗りを第一案**として提案する |
+
+紹介は 1 回で、返事がなければ深追いしない。押し売りしない。
 
 - 何ができるか: claude のグローバル指示（CLAUDE.md / snippets / commands / templates）と
   tako の宣言的設定（profiles / projects / accounts / local-rules / settings）を
-  git リポジトリ 1 本で別デバイスと共有できる
+  git リポジトリ 1 本で別デバイスと共有できる。**「別の PC でも同じ AI 設定で始められる」**
+  という利点で説明する（コマンド名から入らない）
 - 安全性: 秘匿情報（token / credentials / `.claude.json`）とマシン固有の状態
   （layout.json / sessions.yaml / workers.yaml）はホワイトリストで構造的に除外される。
-  アカウントの資格情報の場所（`config_dir`）と profile の `env` も共有されない
-- 案内するコマンド: `tako config init`（新規作成）/ `tako config link <パス|URL>`（既存へ接続）/
-  `tako config status`（差分）/ `tako config list`（何を共有するかの一覧）
-- 迷っていたら `tako config list` を実行して分類表を見せる。勝手に配線しない
+  アカウントの資格情報の場所（`config_dir`）と profile の `env` も共有されない。
+  会話履歴は共有できない（サイズと参照キーの都合。求められたら「できない」と答える）
+- 迷っていたら `tako config list` を実行して分類表を見せる
+
+### 代行の手順（**合意を得てから実行する**）
+
+外部サービスへ作用する操作（リポジトリ作成・push）は、必ず何をするかを 1 行で示して
+同意を得てから実行する。同意なしにリポジトリを作らない・push しない。
+
+1. **`adopt_existing`**（`config_share.external` に検出結果がある）
+   - まず「`<path>` は既に `<repo>` で管理されています」と事実を伝える
+   - `same_place: true` なら、相乗りしても tako の書き出し先が既存ファイルと同じ場所なので
+     内容は重複しない。`tako config link <repo>` を提案する
+   - `same_place: false` なら、相乗りしても同じ内容がリポジトリ内の 2 か所に並ぶ。
+     そのことを伝えたうえでユーザーに選ばせる
+   - **別のリポジトリを新しく作るのは勧めない**。同じ CLAUDE.md が 2 か所で管理され、
+     `tako config pull` の書き込みが symlink を実ファイルへ置き換えて既存の配線を壊しうる
+2. **`fresh`** で `gh_can_create_repo: true`
+   - 「GitHub に private リポジトリを作って配線しますか」と聞く。リポジトリ名は必ず確認する
+     （既定案: `tako-config-sync`）
+   - 同意を得たら `gh repo create <名前> --private` → 表示された URL で
+     `tako config init --remote <URL>`
+   - **public にしない**（設定にはプロジェクトのパスや役割が含まれる）
+3. **`fresh`** で `gh_can_create_repo` が false
+   - ローカルだけで `tako config init` して、リモートはあとから追加できることを伝える
+   - GitHub を使いたいなら `gh auth login`（または手動でリポジトリを作って
+     `tako config init --remote <URL>`）を案内する
+4. 配線したら `tako config status` の結果を見せて、何が共有対象になったかを確認する
+5. 2 台目の案内: `tako config link <URL>` → `tako config pull`。
+   その後の同期は `tako config push` / `tako config pull`
 
 ## Step 4: 完了サマリー
 
@@ -178,6 +214,8 @@ CLI 検出、認証確認、プラン確認、MCP 設定、推奨 profile 生成
 3. エージェント / プラン推奨の再確認
 4. MCP 接続の確認（claude の永続登録、codex の起動時注入）
 5. 環境チェックの再実行（`tako setup --check`）
+6. 設定共有（別デバイスと同じ AI 設定を使う）— `config_share.guidance` が
+   `linked` のときは「配線済み」とだけ示し、この項目は出さない
 
 選択された項目だけ変更し、他の設定は触らない。
 

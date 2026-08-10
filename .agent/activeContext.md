@@ -3,64 +3,55 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-08、Issue #786 クローム・ペインのビュー単位キャッシュ = **完了**）
+## 現在の対象（2026-08-10、Issue #793 setup への設定共有の導線 = 実装完了・PR 待ち）
 
-- PR #788 を `0188d79` として squash merge。Issue #786 クローズ、ブランチ・worktree 削除済み。
-  `/Applications/tako.app` へ install 済み（0.6.8、署名検証つき）
-- `crates/tako-app/src/view_cache.rs` を新設し、ペイン本体（`PaneBody`）とクローム 4 枚
-  （`Chrome`: TabBar / Sidebar / Panel / StatusBar）を `AnyView::cached` の単位へ切り出した
-- PTY 出力は `flush_term_redraw` で**そのペインのビューだけ**を notify。ペインの外にも出る変化
-  （OSC / タイトル）とペイン本体の外にも映っている場合（たまり場サムネイル・ホバー /
-  ピン留めプレビュー）は従来どおり全体を notify（`PaneVisibility` の 3 値）
-- それ以外の状態変化は全部 `TakoApp` を notify し、子ビューが `cx.observe` で自分も汚す
-  = 取りこぼしが構造的に起きない順序
-- ペインの配置は cached ビューのスタイルへ移し、各 `render_*_pane` は `size_full` で描く
+- worktree `~/dev/tako-wt-793` / ブランチ `feat/793-setup-config-share`
+- #513 の `tako config` は実装済みだったのに setup からの導線が無く、**この開発機でも
+  未配線のまま放置されていた**（= 導線が無いと使われない実例）。それを是正した
+- 新設 `tako-control::config_share::env`: ①配線済みか（`config-share.json`）
+  ②共有対象が既に外部 git（dotfiles 等）で管理されていないか ③gh の認証状態、を
+  **読み取りだけ**で検出する。案内の種類は純粋関数 `guidance`
+  （`linked` / `broken` / `adopt_existing` / `fresh`）で決める
+- 表示は setup サマリと `tako setup --check` が同じ判定から文言を作る（`config_share_lines`）。
+  **質問は増やさない**（#262）。配線済みなら勧誘しない（冪等）
+- 代行は setup 対話アシスタント側。検出結果を `setup-context.yaml` の `config_share`
+  （guidance / next_command / gh_can_create_repo / external[]）で渡し、
+  system-prompt.md の Step 3.5 に代行手順を書いた。既存ユーザーへは changes.yaml rev 14（guided）
 
-## 実測証拠（隔離・色付き 110 桁 200 行/秒・同一バイナリの A/B）
+## 設計判断（なぜ「相乗り」が第一案か）
 
-| 表示中 2 ペイン（22x21） | before（`TAKO_786_NO_VIEW_CACHE=1`） | after |
-|---|---|---|
-| 4 タブ + サイドバー + 右パネル | 25.30% CPU / 6.772M instr/frame | 18.04% / 5.016M |
-| 17 タブ + サイドバー（実フォルダ）+ 右パネル | 36.65% / 9.693M | 8.94% / 5.574M |
+- `~/.claude` を dotfiles の symlink にしている利用者に**別**の共有リポジトリを配線すると、
+  同じ CLAUDE.md が 2 か所で管理され、`tako config pull` の書き込み
+  （`config_io::atomic_write` の rename）が symlink を実ファイルへ置き換えて既存の配線を壊す
+- 逆に既存リポジトリへ相乗りすれば、tako の書き出し先（`claude/…`）が既存の置き場と
+  一致する限り**同じファイル**を指すので重複が生まれない。一致するかは
+  `ExternalManaged::same_place`（`repo_rel == root`）で判定して表示・context に載せる
 
-- クロームを 4 → 17 タブへ増やしたときの 1 フレーム増分は **2.92M → 0.56M（−81%）**
-  = 固定費（クローム）がほぼ消えた。before の 4.9M 前後は #782 の「固定 5.1M」とほぼ一致
-- 1 ペイン（47x21）は before 22.77 / 22.79% → after 9.56〜13.43%
-- 残る 5M 台/frame はペイングリッド自体の描画。専用 Element 化（#787）の担当
+## 検証状況（隔離 e2e = PASS 55 / FAIL 0）
 
-## 検証状況
-
-- fmt / clippy(-D warnings) / test --workspace 全緑（1903 件）
-- 隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK` / exit 0 / FAILED 0）。項目 108 を新設
-- visual-test 全 23 節完走（FAILED 0）。`chat-select`(#725) / `md`(#680) / `indent-guide`(#589)
-  を含み、`dark_roundtrip_diff` は cpu / python とも 0（キャッシュ無効時と一致）
-- **visual-test は #749 以降ビルドできない状態だった**（feature 付きでしか通らないため
-  `Request::OrchestratorProfiles` のフィールド追加の追従漏れが CI をすり抜けていた）。
-  本 PR で復旧。併せてハーネス側の notify 抜け 1 箇所（編集モードの解除）を修正
-- 本番 GUI（pid 47236）は全計測の前後で生存。本番 tmux socket `tako` には触っていない
-  （隔離は `TAKO_ISOLATED=1` + socket `tako786` + data dir `/private/tmp/tk786`。
-  socket パス長 104B 上限のため data dir だけ短いパスを使った）
+- 隔離 HOME + スタブ claude / gh + ローカル bare リポジトリ。**本番の HOME・`~/.claude`・
+  dotfiles・GitHub には一切触れていない**（非干渉チェックも e2e に含む）
+- 未配線 → 案内 / 配線済み → 状態のみ（3 回連続で同一）/ dotfiles 検出 → 相乗り提案 +
+  二重管理の注意 / `--yes`・非 TTY → 副作用も代行案内も無し / pty 経由の対話端末 → 質問ゼロ
+  のまま代行導線が出る / `gh repo create`（スタブ）→ `tako config init --remote` の連結
+- fmt / clippy(-D warnings) / test --workspace 全緑（1921 件）+ docs build 成功
+- 証拠: `/private/tmp/tako-793-e2e/evidence`、スクリプトは scratchpad の `e2e-793.sh`
 
 ## 不変条件
 
-- 汚れ方の規約 2 つを崩さない: ①PTY 出力はそのペインだけ ②それ以外は全部 `TakoApp`
-- `view_cache::cached_view` の `view.read(cx)` を外さない（外すとキャッシュしたビューが
-  tracked から落ちて二度と描き直されない。実測で踏んだ）
-- キャッシュビューへ渡すスタイルが大きさを確定させる（GPUI は中身を見ない）
-- 状態を変えたら必ず notify する（毎フレーム全再構築の暗黙依存はもう無い）
-- 検証は `TAKO_ISOLATED=1` + 専用 tmux socket + 専用 data / discovery dir。
-  System Events のキーストローク送出は禁止（計測のためのウィンドウ前面化は
-  PID 指定の `set frontmost` のみ）。隔離アプリは PID 指定で終了する
-- 並走ビルドと同時に Cargo / app bundle ビルドを走らせない
+- 検出は**読み取りだけ**。`--yes` / 非 TTY で外部への副作用（リポジトリ作成・push）を作らない
+- 標準 setup に質問を足さない（`decide_config_share_step` は Info のまま）
+- 勝手にリポジトリを作らない・push しない（合意は対話アシスタント側で取る）
+- 隔離検証では `CLAUDE_CONFIG_DIR` を必ず外す（外さないと `catalog::claude_home()` が
+  本番のアカウント設定ディレクトリを指し、隔離が崩れる）
 
 ## 次の手順
 
-1. GUI 再起動は master 側（install 済み。再起動しないと本番へ反映されない）。
-   再起動後に本番でエージェント高出力時の体感を確認する
-2. 残りの Zed 同等化は #787（端末グリッドの専用 Element 化）。
-   本 PR 後も 1 フレーム 5M 台はペイングリッドの描画で、そこが次の削りどころ
+1. PR（`Closes #793`）→ macOS CI 全ジョブ緑 → squash merge → `build-app.sh --install`
+2. 実機での確認は本番 setup を走らせる形になるので、ユーザー判断（この機は
+   `~/.claude` = `~/dotfiles/claude` の symlink なので `adopt_existing` が出るはず）
 
 ## 現フェーズで Read すべき設計書
 
-- 描画・再描画まわりを触るとき: `.agent/architecture.md`「ビュー単位の描画キャッシュ」節
-- ペイン矩形の会計: 同じファイルの #684 / #781 節
+- 設定共有まわり: `.agent/requirements.md` FR-5.14（.9〜.11 が #793）
+- setup の流れ: `resources/setup/system-prompt.md`（Step 3.5）と `crates/tako-cli/src/setup.rs`
