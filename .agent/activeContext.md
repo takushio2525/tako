@@ -3,60 +3,59 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-10、Issue #793 setup への設定共有の導線 = 実装完了・PR 待ち）
+## 現在の対象（2026-08-11、Issue #787 の前提整備 = 実装完了・PR 待ち）
 
-- worktree `~/dev/tako-wt-793` / ブランチ `feat/793-setup-config-share`
-- #513 の `tako config` は実装済みだったのに setup からの導線が無く、**この開発機でも
-  未配線のまま放置されていた**（= 導線が無いと使われない実例）。それを是正した
-- 新設 `tako-control::config_share::env`: ①配線済みか（`config-share.json`）
-  ②共有対象が既に外部 git（dotfiles 等）で管理されていないか ③gh の認証状態、を
-  **読み取りだけ**で検出する。案内の種類は純粋関数 `guidance`
-  （`linked` / `broken` / `adopt_existing` / `fresh`）で決める
-- 表示は setup サマリと `tako setup --check` が同じ判定から文言を作る（`config_share_lines`）。
-  **質問は増やさない**（#262）。配線済みなら勧誘しない（冪等）
-- 代行は setup 対話アシスタント側。検出結果を `setup-context.yaml` の `config_share`
-  （guidance / next_command / gh_can_create_repo / external[]）で渡し、
-  system-prompt.md の Step 3.5 に代行手順を書いた。既存ユーザーへは changes.yaml rev 14（guided）
+- worktree `~/dev/tako-wt-787pre` / ブランチ `test/787-visual-net`
+- #787（端末グリッドを div スタックから専用 Element へ置き換え）は #64 / #159 /
+  #497・#781 / #725・#145 / #153 の実装に触るので、**置き換える前に今の見た目を
+  ピクセルで固定する**のが本タスク。Element 化本体は後続 worker が担当（ここではやらない）
+- 追加したのは visual-test の `terminal-grid` 節 1 本（6 検査）+ 共通部品 6 個。
+  `TAKO_VISUAL_ONLY=terminal-grid` で単独実行でき、全節通しの先頭でも走る
+  （ターミナルが素の状態 = 1 ペイン・テーマ既定のうちに撮るため）
 
-## 設計判断（なぜ「相乗り」が第一案か）
+## 6 検査の中身（すべて実ピクセル or 実レイアウト矩形）
 
-- `~/.claude` を dotfiles の symlink にしている利用者に**別**の共有リポジトリを配線すると、
-  同じ CLAUDE.md が 2 か所で管理され、`tako config pull` の書き込み
-  （`config_io::atomic_write` の rename）が symlink を実ファイルへ置き換えて既存の配線を壊す
-- 逆に既存リポジトリへ相乗りすれば、tako の書き出し先（`claude/…`）が既存の置き場と
-  一致する限り**同じファイル**を指すので重複が生まれない。一致するかは
-  `ExternalManaged::same_place`（`repo_rel == root`）で判定して表示・context に載せる
+1. **日本語混在行**（#64）: fixture 12 行を PTY へ流し、**非空セルが全部塗られているか**を
+   セル単位で見る。`⏺ Fable 5 + max` / `ターミナルUI` / 絵文字混在 / 行末まで届く半角行
+2. **ピクセルスクロール**（#159）: インク縦プロファイルの**位相**が半セル
+   （17 device px）ちょうどずれる + 上端が繰り上がる + 下端の extra_bottom が隙間を埋める
+3. **選択ハイライト**（#725/#145）: 合成 `PlatformInput` のドラッグで行をまたいで選択 →
+   選択色の塗り + `pbpaste` 一致（copy-on-select）
+4. **色とスタイル**: `ScreenLine::runs` が解決した色をそのままピクセルと突き合わせる
+   （truecolor fg / truecolor bg / 256 色 / bold / dim / 反転）。期待色をテストへ焼かない
+5. **IME アンカー**（#781/#497）: `pane_text_area_drift` = 0 + カーソルブロックの実塗り位置と
+   算術の一致（0.07px）+ `ime_overlay_anchor` がその位置を指す
+6. **カーソル描画**: ブロック / バー × フォーカス有無の 4 通りでセルが塗られ、
+   DECTCEM で隠すと 0（対照）
 
-## 検証状況（隔離 e2e = PASS 55 / FAIL 0）
+## この整備で見つけた既知の癖（Issue 化済み。Element 化で直る見込み）
 
-- 隔離 HOME + スタブ claude / gh + ローカル bare リポジトリ。**本番の HOME・`~/.claude`・
-  dotfiles・GitHub には一切触れていない**（非干渉チェックも e2e に含む）
-- 未配線 → 案内 / 配線済み → 状態のみ（3 回連続で同一）/ dotfiles 検出 → 相乗り提案 +
-  二重管理の注意 / `--yes`・非 TTY → 副作用も代行案内も無し / pty 経由の対話端末 → 質問ゼロ
-  のまま代行導線が出る / `gh repo create`（スタブ）→ `tako config init --remote` の連結
-- fmt / clippy(-D warnings) / test --workspace 全緑（1921 件）+ docs build 成功 +
-  Windows クロス check（`scripts/check-windows.sh`）エラー 0 / 警告 13 = baseline 不変
-- **隔離セルフテストは完走せず**。同一手順 4 回で毎回別項目が落ち、**素の main（`b6c9e38`）
-  でも落ちた**（本 PR: #601 / PDF #232 / #601、main: #666）。本番 tako.app が ~99% CPU で
-  load 6〜16 の環境要因。#496 側も同日「#601 の固定待ちをリトライ化（main 由来の確定失敗）」
-  「PDF / IME / tmux は main 由来失敗」と記録している
-- 証拠: `/private/tmp/tako-793-e2e/evidence`、スクリプトは scratchpad の `e2e-793.sh`
+- **#797**: SGR 4 の下線が**1 px も描かれない**。GPUI は下線を行ボックス下端
+  （ベースライン + descent×0.618）へ置くので、チャンク div の `overflow_hidden`
+  （#64 対策で外せない）が丸ごと切る。節では「モデルは underline と解決する」
+  「次の行へはみ出さない」だけを主張し、ピクセルの主張は #797 を直す側で入れる
+- **#798**: 全角が長く連なる行で描画位置がグリッドより最大 1 セル左へ詰まる
+  （div 幅のデバイスピクセル丸めが 55 個ぶん累積）。**半角行は drift 0**。
+  節では VC 行で「1 セル以内」と塗られたセル数で固定してある
 
 ## 不変条件
 
-- 検出は**読み取りだけ**。`--yes` / 非 TTY で外部への副作用（リポジトリ作成・push）を作らない
-- 標準 setup に質問を足さない（`decide_config_share_step` は Info のまま）
-- 勝手にリポジトリを作らない・push しない（合意は対話アシスタント側で取る）
-- 隔離検証では `CLAUDE_CONFIG_DIR` を必ず外す（外さないと `catalog::claude_home()` が
-  本番のアカウント設定ディレクトリを指し、隔離が崩れる）
+- **描画本体は 1 行も変えない**。追加は全部 `#[cfg(feature = "visual-test")]`。
+  feature 無しビルドの**グローバルシンボル 135,988 件と `__text` 49,141,068 バイトが
+  main と完全一致**することで担保（SHA は行番号 DWARF が動くぶんだけ違う）
+- 検証は `TAKO_ISOLATED=1` + 注入済み `TAKO_*` を `env -u` で外す
+  （ランナーは scratchpad の `787/run-visual.sh`）。本番 GUI の pid は毎回不変を確認
+- ダンプ（`TAKO_VISUAL_DUMP_DIR`）はホスト名・ユーザー名が写るので**リポジトリへ入れない**
 
 ## 次の手順
 
-1. PR（`Closes #793`）→ macOS CI 全ジョブ緑 → squash merge → `build-app.sh --install`
-2. 実機での確認は本番 setup を走らせる形になるので、ユーザー判断（この機は
-   `~/.claude` = `~/dotfiles/claude` の symlink なので `adopt_existing` が出るはず）
+1. PR（`Refs #787`）→ macOS CI 全ジョブ緑 → squash merge → worktree 片付け（install 不要）
+2. #787 本体（Element 化）の worker は、着手前に `TAKO_VISUAL_ONLY=terminal-grid` で
+   before を採り、置き換え後に同じ数値と突き合わせる。#797 / #798 が直ったら
+   その節の主張を「ピクセルが出る」「drift 0」へ**意図的に**上げる
 
 ## 現フェーズで Read すべき設計書
 
-- 設定共有まわり: `.agent/requirements.md` FR-5.14（.9〜.11 が #793）
-- setup の流れ: `resources/setup/system-prompt.md`（Step 3.5）と `crates/tako-cli/src/setup.rs`
+- 端末グリッドの描画: `crates/tako-app/src/main.rs` の `terminal_screen_lines` /
+  `chunk_line_chars` / `pane_text_area_rect`、`.agent/architecture.md`
+- visual-test の作法: `main.rs` の `self_test::run_visual` と `capture_frame` 周辺の共通部品

@@ -1830,3 +1830,17 @@
   実ファイルへ置き換えて既存の配線を壊す）。既存ユーザーへは changes.yaml rev 14（guided）
 - 検証: 隔離 e2e PASS 55 / FAIL 0（本番 HOME・~/.claude・GitHub 非干渉を含む）+
   品質ゲート全緑（1921）+ docs build
+
+## 2026-08-11（#787 前提整備: 端末グリッドの visual-test 回帰検出網）
+- visual-test に `terminal-grid` 節を新設（6 検査 = 日本語混在行 #64 / ピクセルスクロール #159 /
+  選択ハイライト #725 / 端末 SGR の色・属性 / IME アンカー #781 / カーソル 4 通り）。
+  Element 化本体（#787）は後続 worker
+- 描画本体は無変更: 追加は全部 `#[cfg(feature = "visual-test")]` で、feature 無しビルドの
+  シンボル 135,988 件と `__text` 49,141,068 バイトが main と完全一致
+- 検証: 3 回連続で全緑（数値も完全一致）+ 全節通し 96 checkpoint 緑 + 検出力 3 件実証
+  （nowrap 除去 → max 消失を検出 / subline シフト 0 → 位相 34px で検出 / テキスト領域
+  会計を 8px ずらす → 最初の幾何検査で検出）+ fmt / clippy(feature 込み) / test 1924 緑
+- 副産物: #797（SGR 4 の下線が 1 px も描かれない = 行ボックス下端で overflow_hidden に切られる）/
+  #798（全角の長い連なりで描画位置が最大 1 セル左へ詰まる）を起票。#796 へ
+  「visual-test feature 付きビルドではセルフテスト #600 が確定失敗（main も同じ）」を追記
+- 次: #787 本体の worker が before/after をこの節で突き合わせる

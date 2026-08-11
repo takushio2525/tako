@@ -19687,6 +19687,240 @@ mod self_test {
         }
     }
 
+    // --- 端末グリッドのピクセル検証の土台（#787 の前提整備） ---
+    //
+    // #787 は端末グリッドを div から専用 Element（自前 layout / paint）へ置き換える。
+    // 触る先が #64（半角消失）/ #159（サブラインスクロール）/ #725・#145（選択座標）/
+    // #781（IME アンカー）/ #153（リンク装飾）なので、置き換える前に
+    // 「今の見た目」をピクセルで固定しておく（回帰検出網）。以下はそのための共通部品。
+
+    /// 指定矩形の中で「背景と違う色に塗られた」デバイスピクセル数（#787）。
+    ///
+    /// グリフでもセル背景でも構わず「インクが乗っているか」だけを見るので、
+    /// 「このセルが描かれなかった」（#64 の文字消失）を色に依存せず検出できる。
+    /// しきい値はチャンネル差の総和で `drawn_row_count` と揃えてある
+    #[cfg(feature = "visual-test")]
+    fn ink_pixels_in_bounds(
+        frame: &image::RgbaImage,
+        bounds: &Bounds<Pixels>,
+        scale: f32,
+        background: tako_core::Rgb,
+        flip_y: bool,
+    ) -> usize {
+        let (width, height) = frame.dimensions();
+        let left = (f32::from(bounds.left()) * scale).round().max(0.0) as u32;
+        let right = ((f32::from(bounds.right()) * scale).round().max(0.0) as u32).min(width);
+        let raw_top = (f32::from(bounds.top()) * scale).round().max(0.0) as u32;
+        let raw_bottom = ((f32::from(bounds.bottom()) * scale).round().max(0.0) as u32).min(height);
+        let (top, bottom) = if flip_y {
+            (
+                height.saturating_sub(raw_bottom),
+                height.saturating_sub(raw_top),
+            )
+        } else {
+            (raw_top.min(height), raw_bottom.min(height))
+        };
+        let mut count = 0;
+        for y in top..bottom {
+            for x in left..right {
+                let p = frame.get_pixel(x, y).0;
+                if (i32::from(p[0]) - i32::from(background.r)).abs()
+                    + (i32::from(p[1]) - i32::from(background.g)).abs()
+                    + (i32::from(p[2]) - i32::from(background.b)).abs()
+                    > 24
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// 指定矩形の**デバイス行ごと**のインク量（#787）。index 0 が矩形の論理上端で、
+    /// Metal 読み戻しの上下反転はここで吸収する。
+    ///
+    /// 行境界の「位相」を見るための土台。半行スクロールでこのプロファイルが
+    /// ちょうど半セルぶんずれることを確かめれば、「行単位ではなくピクセル単位で
+    /// 描かれている」（#159）を差分の大小ではなく**ずれ量そのもの**で言える
+    #[cfg(feature = "visual-test")]
+    fn ink_row_profile(
+        frame: &image::RgbaImage,
+        bounds: &Bounds<Pixels>,
+        scale: f32,
+        background: tako_core::Rgb,
+        flip_y: bool,
+    ) -> Vec<u32> {
+        let (width, height) = frame.dimensions();
+        let left = (f32::from(bounds.left()) * scale).round().max(0.0) as u32;
+        let right = ((f32::from(bounds.right()) * scale).round().max(0.0) as u32).min(width);
+        let raw_top = (f32::from(bounds.top()) * scale).round().max(0.0) as u32;
+        let raw_bottom = ((f32::from(bounds.bottom()) * scale).round().max(0.0) as u32).min(height);
+        let mut profile = Vec::with_capacity((raw_bottom.saturating_sub(raw_top)) as usize);
+        for logical_y in raw_top..raw_bottom {
+            let y = if flip_y {
+                match height.checked_sub(logical_y + 1) {
+                    Some(y) => y,
+                    None => {
+                        profile.push(0);
+                        continue;
+                    }
+                }
+            } else {
+                logical_y
+            };
+            if y >= height {
+                profile.push(0);
+                continue;
+            }
+            let mut ink = 0u32;
+            for x in left..right {
+                let p = frame.get_pixel(x, y).0;
+                if (i32::from(p[0]) - i32::from(background.r)).abs()
+                    + (i32::from(p[1]) - i32::from(background.g)).abs()
+                    + (i32::from(p[2]) - i32::from(background.b)).abs()
+                    > 24
+                {
+                    ink += 1;
+                }
+            }
+            profile.push(ink);
+        }
+        profile
+    }
+
+    /// 2 本のインク縦プロファイルが最もよく重なるずれ量（#787）。
+    ///
+    /// `a[i] ≈ b[i + shift]` を満たす shift を返す（= a の模様が b では下へ shift 動いた）。
+    /// 戻り値は (最良 shift, 最良の平均残差, shift=0 の平均残差)
+    #[cfg(feature = "visual-test")]
+    fn best_profile_shift(a: &[u32], b: &[u32], max_shift: i32) -> (i32, f64, f64) {
+        let cost = |shift: i32| -> f64 {
+            let mut sum = 0f64;
+            let mut count = 0usize;
+            for (i, av) in a.iter().enumerate() {
+                let j = i as i32 + shift;
+                if j < 0 || j as usize >= b.len() {
+                    continue;
+                }
+                sum += (f64::from(*av) - f64::from(b[j as usize])).abs();
+                count += 1;
+            }
+            if count == 0 {
+                f64::MAX
+            } else {
+                sum / count as f64
+            }
+        };
+        let mut best = (0, cost(0));
+        for shift in -max_shift..=max_shift {
+            let c = cost(shift);
+            if c < best.1 {
+                best = (shift, c);
+            }
+        }
+        (best.0, best.1, cost(0))
+    }
+
+    /// グリッドのセル矩形（#787）。`col..col + span` × 1 行ぶん。
+    /// 縦位置はサブラインスクロールの描画シフト（#159）を引いた実描画位置
+    #[cfg(feature = "visual-test")]
+    fn grid_cell_bounds(
+        area: &Bounds<Pixels>,
+        cell: Size<Pixels>,
+        subline: f32,
+        col: usize,
+        span: usize,
+        row: usize,
+    ) -> Bounds<Pixels> {
+        Bounds::new(
+            point(
+                area.origin.x + cell.width * col as f32,
+                area.origin.y + cell.height * row as f32 - px(subline),
+            ),
+            size(cell.width * span.max(1) as f32, cell.height),
+        )
+    }
+
+    /// 指定色が実際に塗られた範囲の外接矩形（論理座標。#787）。
+    ///
+    /// カーソルブロックのように「1 セルを塗りつぶす」描画の**実位置**を、
+    /// 算術（`grid_cell_bounds`）とは独立に読み戻すために使う
+    #[cfg(feature = "visual-test")]
+    fn color_bbox_in_bounds(
+        frame: &image::RgbaImage,
+        bounds: &Bounds<Pixels>,
+        scale: f32,
+        color: tako_core::Rgb,
+        tolerance: i32,
+        flip_y: bool,
+    ) -> Option<Bounds<Pixels>> {
+        let (width, height) = frame.dimensions();
+        let left = (f32::from(bounds.left()) * scale).round().max(0.0) as u32;
+        let right = ((f32::from(bounds.right()) * scale).round().max(0.0) as u32).min(width);
+        let raw_top = (f32::from(bounds.top()) * scale).round().max(0.0) as u32;
+        let raw_bottom = ((f32::from(bounds.bottom()) * scale).round().max(0.0) as u32).min(height);
+        let mut min_x = u32::MAX;
+        let mut max_x = 0u32;
+        let mut min_y = u32::MAX;
+        let mut max_y = 0u32;
+        for logical_y in raw_top..raw_bottom {
+            let y = if flip_y {
+                match height.checked_sub(logical_y + 1) {
+                    Some(y) => y,
+                    None => continue,
+                }
+            } else {
+                logical_y
+            };
+            if y >= height {
+                continue;
+            }
+            for x in left..right {
+                let p = frame.get_pixel(x, y).0;
+                let near = (i32::from(p[0]) - i32::from(color.r)).abs() <= tolerance
+                    && (i32::from(p[1]) - i32::from(color.g)).abs() <= tolerance
+                    && (i32::from(p[2]) - i32::from(color.b)).abs() <= tolerance;
+                if near {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(logical_y);
+                    max_y = max_y.max(logical_y);
+                }
+            }
+        }
+        (min_x != u32::MAX).then(|| {
+            Bounds::new(
+                point(px(min_x as f32 / scale), px(min_y as f32 / scale)),
+                size(
+                    px((max_x + 1 - min_x) as f32 / scale),
+                    px((max_y + 1 - min_y) as f32 / scale),
+                ),
+            )
+        })
+    }
+
+    /// スタイルランが占めるグリッド列の範囲（開始, 終端は排他）。#787 の色検証で
+    /// 「モデルが解決した色が、そのランの実ピクセルに出ているか」を突き合わせるのに使う
+    #[cfg(feature = "visual-test")]
+    fn run_cols(
+        line: &tako_core::screen::ScreenLine,
+        run: &tako_core::screen::StyleRun,
+    ) -> Option<(usize, usize)> {
+        let byte_offsets: Vec<usize> = line.text.char_indices().map(|(b, _)| b).collect();
+        let first = byte_offsets.iter().position(|b| *b >= run.range.start)?;
+        let last = byte_offsets.iter().rposition(|b| *b < run.range.end)?;
+        if last < first {
+            return None;
+        }
+        let start = *line.cell_cols.get(first)?;
+        let end = line
+            .cell_cols
+            .get(last + 1)
+            .copied()
+            .unwrap_or_else(|| line.cell_cols.get(last).copied().unwrap_or(start) + 1);
+        (end > start).then_some((start, end))
+    }
+
     /// stdio ブリッジ（`tako mcp serve`）へ MCP メッセージ列を流し、応答行を回収する。
     /// 指定した TAKO_* 以外は環境から除去し、tako 内 / 外の両状態を再現できるようにする
     fn bridge_roundtrip(
@@ -22067,6 +22301,1047 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// スタイルランのテキスト（診断表示用。#787）
+    #[cfg(feature = "visual-test")]
+    fn line_text_of(
+        line: &tako_core::screen::ScreenLine,
+        run: &tako_core::screen::StyleRun,
+    ) -> String {
+        line.text[run.range.clone()].trim_end().to_string()
+    }
+
+    /// 端末グリッド検証で毎回そろえて読む値（#787）
+    #[cfg(feature = "visual-test")]
+    struct GridGeom {
+        pane: PaneId,
+        /// テキスト領域（`pane_text_areas` の算術値 = マウス座標・IME・PTY 行数の正）
+        area: Bounds<Pixels>,
+        cell: Size<Pixels>,
+        /// サブラインスクロールの描画シフト（論理 px。#159）
+        subline: f32,
+        screen: tako_core::screen::Screen,
+        background: tako_core::Rgb,
+        foreground: tako_core::Rgb,
+        cursor: tako_core::Rgb,
+        selection: tako_core::Rgb,
+    }
+
+    #[cfg(feature = "visual-test")]
+    fn grid_geom(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: Option<PaneId>,
+    ) -> Option<GridGeom> {
+        window
+            .update(cx, |app, _, _| {
+                let pane = pane.unwrap_or_else(|| app.focused_pane());
+                let area = app
+                    .pane_text_areas
+                    .iter()
+                    .find(|(id, _)| *id == pane)
+                    .map(|(_, b)| *b)?;
+                let cell = app.cell_size_for_pane(pane)?;
+                let session = app.terminals.get(&pane)?;
+                Some(GridGeom {
+                    pane,
+                    area,
+                    cell,
+                    subline: session.scroll_subline_fract() * f32::from(cell.height),
+                    screen: session.screen(&app.theme),
+                    background: app.theme.background,
+                    foreground: app.theme.foreground,
+                    cursor: app.theme.cursor,
+                    selection: app.theme.selection_background,
+                })
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// #787 の前提整備: 端末グリッド描画の「今の見た目」をピクセルで固定する。
+    ///
+    /// #787 はこのグリッドを div スタック（行 div + スタイル区間ごとの子 div）から
+    /// 専用 Element（自前 layout / paint）へ置き換える。触る先が #64（半角消失）/
+    /// #159（サブラインスクロール）/ #725・#145（選択の実 shaping 座標）/
+    /// #781（IME アンカー）/ #153（リンク装飾）なので、**置き換える前に**
+    /// 現在の描画結果をピクセルで固定しておく（回帰検出網）。
+    ///
+    /// 検査は 6 本:
+    /// 1. 日本語混在行 — 非空セルが全部塗られている（#64 の「max 丸ごと消失」型）
+    /// 2. ピクセルスクロール — 半行スクロールで縦の位相がちょうど半セルずれ、
+    ///    上端 / 下端に部分行が出る（#159）
+    /// 3. 選択ハイライト — 合成マウスのドラッグが行をまたいで塗られ pbpaste と一致
+    /// 4. 色とスタイル — truecolor / 256 色 / bold / dim / underline / 反転
+    /// 5. IME アンカー — 算術のテキスト領域が実描画と一致し、カーソルセルを指す（#781）
+    /// 6. カーソル描画 — ブロック / バー × フォーカス有無の 4 通り
+    #[cfg(feature = "visual-test")]
+    async fn terminal_grid_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let dump_dir = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        let mut dump = String::new();
+        let dir = std::env::temp_dir().join(format!("tako-visual-grid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test グリッド fixture ディレクトリ");
+
+        // 桁数を見てから fixture を作る（#64 の「行末付近の半角語」を実際に最終列付近へ
+        // 置くため）。最終列は 1 つ空けて折り返し保留の曖昧さを消す
+        let cols = window
+            .update(cx, |app, _, _| {
+                app.terminals
+                    .get(&app.focused_pane())
+                    .map(|s| s.size().0)
+                    .unwrap_or(80)
+            })
+            .unwrap_or(80);
+        let body_cols = cols.saturating_sub(1).max(24);
+        let pad_cols = body_cols.saturating_sub("V3 ".len() + " max".len());
+        // 行末付近の半角語（#64 の「max 丸ごと消失」型）。埋めは半角にする:
+        // 全角の長い連なりは div の幅がデバイスピクセルへ丸められて**位置がずれる**
+        // （#798。下の VC で実測して 1 セル以内に固定する）ので、
+        // セル単位の厳密検査には使えない
+        let v3 = format!("V3 {} max", "-".repeat(pad_cols));
+        // 全角だけで右端まで届く行。ここは「1 セル以内のずれ」を測って固定する（#798）
+        let vc_pad = body_cols.saturating_sub("VC ".len() + " max".len());
+        let vc = format!(
+            "VC {}{} max",
+            "全".repeat(vc_pad / 2),
+            " ".repeat(vc_pad % 2)
+        );
+        // 固定パターン。エスケープ列をシェルのクォート越しに打たずに済むよう
+        // スクリプトへ書き出して `sh` に食わせる（打鍵経路の揺れを排除）
+        let script = dir.join("grid.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "printf 'V1 ⏺ Fable 5 + max\\n'\n\
+                 printf 'V2 ターミナルUI\\n'\n\
+                 printf '%s\\n' '{v3}'\n\
+                 printf 'V4 絵文字 🎉 と ✅ mix\\n'\n\
+                 printf 'V5 \\033[38;2;236;80;40mTRUE\\033[0m \
+                 \\033[48;2;24;96;200mBGBG\\033[0m \\033[38;5;208mC256\\033[0m\\n'\n\
+                 printf 'V6 \\033[48;2;255;0;255mMMMMMMMM\\033[0m\\n'\n\
+                 printf 'V7 WWWW\\n\\n'\n\
+                 printf 'V8 \\033[1mWWWW\\033[0m\\n\\n'\n\
+                 printf 'V9 \\033[2mWWWW\\033[0m\\n\\n'\n\
+                 printf 'VA \\033[4mWWWW\\033[0m\\n\\n'\n\
+                 printf 'VB \\033[7mWWWW\\033[0m\\n\\n'\n\
+                 printf '%s\\n' '{vc}'\n"
+            ),
+        )
+        .expect("visual-test グリッド fixture スクリプト");
+
+        // fixture の投入（`clear` 後にスクリプト出力 = 行 0 から並ぶ）
+        press(any, cx, "ctrl-u");
+        type_text(any, cx, &format!("clear; sh {}", script.display()), true);
+        const MARKERS: [&str; 12] = [
+            "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "VA", "VB", "VC",
+        ];
+        let mut rows: HashMap<String, usize> = HashMap::new();
+        for _ in 0..12 {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            rows = window
+                .update(cx, |app, _, _| {
+                    let pane = app.focused_pane();
+                    let Some(session) = app.terminals.get(&pane) else {
+                        return HashMap::new();
+                    };
+                    let screen = session.screen(&app.theme);
+                    MARKERS
+                        .iter()
+                        .filter_map(|marker| {
+                            let head = format!("{marker} ");
+                            screen
+                                .lines
+                                .iter()
+                                .position(|line| line.text.starts_with(&head))
+                                .map(|row| (marker.to_string(), row))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if rows.len() == MARKERS.len() {
+                break;
+            }
+        }
+        check(
+            rows.len() == MARKERS.len(),
+            "visual-test 端末グリッド: fixture 12 行が画面に出る (#787)",
+        );
+
+        // 1 枚目で矩形を確定させ、2 枚目を検査に使う（他の節と同じ作法）
+        let _ = capture_frame(any, cx);
+        let Some((frame, scale)) = capture_frame(any, cx) else {
+            fail("visual-test 端末グリッド: フレーム取得")
+        };
+        let Some(geom) = grid_geom(window, cx, None) else {
+            fail("visual-test 端末グリッド: ジオメトリ取得")
+        };
+        let row_of = |marker: &str| -> usize {
+            *rows
+                .get(marker)
+                .unwrap_or_else(|| fail("visual-test 端末グリッド: fixture 行の解決"))
+        };
+
+        // Metal 読み戻しの上下方向を**マーカー色で確定**させる（他の節が両向き試して
+        // 多い方を採るのと同じ趣旨だが、画面に 1 か所しか無い色で決めるので曖昧さが無い）。
+        // V6 の背景はマゼンタ = UI のどこにも使われていない
+        let marker_bounds =
+            grid_cell_bounds(&geom.area, geom.cell, geom.subline, 3, 8, row_of("V6"));
+        let magenta = tako_core::Rgb::new(255, 0, 255);
+        let marker_normal =
+            color_pixels_in_bounds(&frame, marker_bounds, scale, magenta, 12, false);
+        let marker_flipped =
+            color_pixels_in_bounds(&frame, marker_bounds, scale, magenta, 12, true);
+        let flip = marker_flipped > marker_normal;
+        let marker_hit = marker_flipped.max(marker_normal);
+        let marker_area = (f32::from(marker_bounds.size.width)
+            * scale
+            * f32::from(marker_bounds.size.height)
+            * scale) as usize;
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid flip={flip} marker_hit={marker_hit} \
+             marker_area={marker_area} normal={marker_normal} flipped={marker_flipped}"
+        );
+        check(
+            marker_hit * 2 >= marker_area,
+            "visual-test 端末グリッド: マーカー行の背景色が実ピクセルで塗られている (#787)",
+        );
+
+        let cell_ink = |frame: &image::RgbaImage,
+                        geom: &GridGeom,
+                        row: usize,
+                        col: usize,
+                        span: usize|
+         -> usize {
+            let bounds = grid_cell_bounds(&geom.area, geom.cell, geom.subline, col, span, row);
+            ink_pixels_in_bounds(frame, &bounds, scale, geom.background, flip)
+        };
+
+        // --- 1. 日本語混在行（#64）: 非空セルが全部塗られている ---
+        //
+        // #64 の壊れ方は「グループ div の幅を GPUI が wrap_width として扱い、
+        // 折り返された末尾（"max" 丸ごと / "UI" の I）が overflow_hidden の外へ出て消える」。
+        // セルフテスト 69b は構造（whitespace_nowrap・チャンク分割）を見るが、
+        // ここは**実ピクセル**で「そのセルにインクがあるか」を見る
+        let mut cjk_ok = true;
+        let mut cjk_tail_ok = true;
+        let mut cjk_bleed_ok = true;
+        let mut cjk_drift_ok = true;
+        for marker in ["V1", "V2", "V3", "V4", "VC"] {
+            // VC（全角だけで右端まで届く行）は #798 の累積で最大 1 セルずれる。
+            // セル単位の厳密検査ではなく「ずれ量」と「塗られたセル数」で押さえる
+            let tolerant = marker == "VC";
+            let row = row_of(marker);
+            let line = &geom.screen.lines[row];
+            // (col, span, ch) の一覧。span == 0（結合文字）と空白は対象外
+            let chars: Vec<char> = line.text.chars().collect();
+            let mut cells: Vec<(usize, usize, char)> = Vec::new();
+            for (i, ch) in chars.iter().enumerate() {
+                let col = line.cell_cols[i];
+                let span = line.cell_cols.get(i + 1).copied().unwrap_or(col + 1) - col;
+                if span > 0 && *ch != ' ' {
+                    cells.push((col, span, *ch));
+                }
+            }
+            let missing: Vec<String> = cells
+                .iter()
+                .filter_map(|&(col, span, ch)| {
+                    let ink = cell_ink(&frame, &geom, row, col, span);
+                    (ink < 2).then(|| format!("{ch:?}@{col}(ink={ink})"))
+                })
+                .collect();
+            // 行末付近の半角語（#64 の "max" / "UI"）は個別に主張する。
+            // tolerant な行は語をまとめて ±1 セルの窓で見る（位置のずれを許し、
+            // 「語が消えた」だけを検出する）
+            let tail = match marker {
+                "V2" => "UI",
+                "V4" => "mix",
+                _ => "max",
+            };
+            let tail_first = line
+                .text
+                .rfind(tail)
+                .map(|byte| line.text[..byte].chars().count());
+            let tail_ink: Vec<usize> = tail_first
+                .map(|first| {
+                    (0..tail.chars().count())
+                        .map(|k| {
+                            let col = line.cell_cols[first + k];
+                            cell_ink(&frame, &geom, row, col, 1)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tail_window = tail_first
+                .map(|first| {
+                    let col = line.cell_cols[first];
+                    cell_ink(
+                        &frame,
+                        &geom,
+                        row,
+                        col.saturating_sub(1),
+                        tail.chars().count() + 2,
+                    )
+                })
+                .unwrap_or(0);
+            // 最終セルの右にインクが漏れていない（1 セルぶんの余裕を見る）
+            let last_col = cells.iter().map(|&(c, s, _)| c + s).max().unwrap_or(0);
+            let bleed = if last_col + 2 < cols {
+                let beyond = Bounds::new(
+                    point(
+                        geom.area.origin.x + geom.cell.width * (last_col + 2) as f32,
+                        geom.area.origin.y + geom.cell.height * row as f32 - px(geom.subline),
+                    ),
+                    size(
+                        (geom.area.right() - px(18.0))
+                            - (geom.area.origin.x + geom.cell.width * (last_col + 2) as f32),
+                        geom.cell.height,
+                    ),
+                );
+                ink_pixels_in_bounds(&frame, &beyond, scale, geom.background, flip)
+            } else {
+                0
+            };
+            // 実描画のインク最終列（算術とは独立に読み戻す）
+            let drawn_last = (0..cols)
+                .rev()
+                .find(|&col| cell_ink(&frame, &geom, row, col, 1) >= 2);
+            // 実描画のインク位置とグリッド算術のずれ（セル単位）。全角の長い連なりでは
+            // 行 div のスタックが幅をデバイスピクセルへ丸めるぶん左へ詰まる
+            let drift = drawn_last.map(|drawn| drawn as i64 - (last_col as i64 - 1));
+            let inked_cells = (0..cols)
+                .filter(|&col| cell_ink(&frame, &geom, row, col, 1) >= 2)
+                .count();
+            let expected_inked: usize = cells.iter().map(|&(_, span, _)| span).sum();
+            println!(
+                "TAKO_VISUAL_PIXEL: term-grid cjk {marker} row={row} cells={} missing={} \
+                 tail={tail} tail_ink={tail_ink:?} tail_window={tail_window} \
+                 last_col={last_col} drawn_last={drawn_last:?} drift={drift:?} \
+                 inked={inked_cells}/{expected_inked} bleed={bleed}",
+                cells.len(),
+                missing.len(),
+            );
+            if !missing.is_empty() && !tolerant {
+                // 落ちたときはセルごとのインクをそのまま出す。どこから位置がずれたのか /
+                // どの文字が消えたのかは、この並びを見るのが一番速い
+                println!(
+                    "TAKO_VISUAL_PIXEL:   missing={} ink={:?}",
+                    missing.join(" "),
+                    (0..cols)
+                        .map(|col| cell_ink(&frame, &geom, row, col, 1))
+                        .collect::<Vec<_>>()
+                );
+            }
+            // ピクセル指紋（セルごとのインク量）は毎回ダンプへ残す。#787 の置き換え
+            // 前後を並べて見るときの一次資料になる
+            if dump_dir.is_some() {
+                let histogram: Vec<usize> = (0..cols)
+                    .map(|col| cell_ink(&frame, &geom, row, col, 1))
+                    .collect();
+                dump.push_str(&format!(
+                    "{marker} row={row} cols={cols} cw={:.4} text={:?}\n  ink={histogram:?}\n",
+                    f32::from(geom.cell.width),
+                    line.text.trim_end()
+                ));
+            }
+            if tolerant {
+                // 塗られたセル数が期待とほぼ一致 = 消えた文字が無い
+                cjk_ok &= inked_cells + 2 >= expected_inked && expected_inked > 0;
+                cjk_tail_ok &= tail_window >= 60 * tail.chars().count();
+                cjk_drift_ok &= drift.is_some_and(|d| d.abs() <= 1);
+            } else {
+                cjk_ok &= missing.is_empty() && !cells.is_empty();
+                cjk_tail_ok &=
+                    tail_ink.len() == tail.chars().count() && tail_ink.iter().all(|ink| *ink >= 2);
+                cjk_drift_ok &= drift == Some(0);
+            }
+            cjk_bleed_ok &= bleed <= 2;
+        }
+        check(
+            cjk_ok,
+            "visual-test 端末グリッド: 全角半角混在行の非空セルが全部塗られている (#64/#787)",
+        );
+        check(
+            cjk_tail_ok,
+            "visual-test 端末グリッド: 行末付近の半角語が消えていない (#64/#787)",
+        );
+        check(
+            cjk_bleed_ok,
+            "visual-test 端末グリッド: 最終セルより右へインクが漏れない (#787)",
+        );
+        check(
+            cjk_drift_ok,
+            "visual-test 端末グリッド: 実描画位置とグリッド算術のずれが規定内 \
+             （半角行 = 0 セル / 全角の長い連なり = 1 セル以内）(#787)",
+        );
+
+        // --- 4. 色とスタイル（端末 SGR。syntect ではない） ---
+        //
+        // モデル（`ScreenLine::runs`）が解決した色が、そのランの実ピクセルに出ているかを
+        // 突き合わせる。期待色をテストへ焼かずモデルから取るので、256 色 / truecolor /
+        // dim / 反転を 1 つの規則で押さえられる
+        let v5_row = row_of("V5");
+        let v5 = &geom.screen.lines[v5_row];
+        let v5_band = Bounds::new(
+            point(
+                geom.area.origin.x,
+                geom.area.origin.y + geom.cell.height * v5_row as f32 - px(geom.subline),
+            ),
+            size(geom.area.size.width - px(18.0), geom.cell.height),
+        );
+        let mut color_notes: Vec<String> = Vec::new();
+        let mut fg_ok = true;
+        let mut bg_ok = true;
+        for run in &v5.runs {
+            let Some((start, end)) = run_cols(v5, run) else {
+                continue;
+            };
+            let text = v5.text[run.range.clone()].trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            let bounds = grid_cell_bounds(
+                &geom.area,
+                geom.cell,
+                geom.subline,
+                start,
+                end - start,
+                v5_row,
+            );
+            let fg_hit = color_pixels_in_bounds(&frame, bounds, scale, run.fg, 10, flip);
+            let mean = sample_mean_rgb(&frame, scale, &bounds, flip).unwrap_or([-1.0; 3]);
+            // 背景色つきのランは「そのセルを塗りつぶす」かつ「行の他の場所には出ない」。
+            // 平均 RGB はグリフの占有率に左右されるので指紋として出すだけにし、
+            // 主張は塗り面積と**行内のはみ出し**（stray）で行う
+            let (bg_hit, bg_gap, bg_stray) = match run.bg {
+                Some(bg) => (
+                    color_pixels_in_bounds(&frame, bounds, scale, bg, 10, flip),
+                    rgb_gap(mean, bg),
+                    color_pixels_in_bounds(&frame, v5_band, scale, bg, 10, flip),
+                ),
+                None => (0, 0.0, 0),
+            };
+            color_notes.push(format!(
+                "{text:?}[{start}..{end}] fg={:?} fg_hit={fg_hit} bg={:?} bg_hit={bg_hit} \
+                 bg_gap={bg_gap:.1} bg_row={bg_stray}",
+                (run.fg.r, run.fg.g, run.fg.b),
+                run.bg.map(|c| (c.r, c.g, c.b)),
+            ));
+            fg_ok &= fg_hit >= 3;
+            if run.bg.is_some() {
+                let area_px =
+                    (f32::from(bounds.size.width) * scale * f32::from(bounds.size.height) * scale)
+                        as usize;
+                // 行内に出た同色のうち 8 割以上がこのランの矩形の中（縁の
+                // アンチエイリアスぶんだけはみ出す）。行全体へ塗り広がる回帰は落ちる
+                bg_ok &= bg_hit * 3 >= area_px && bg_hit * 5 >= bg_stray * 4;
+            }
+        }
+        for note in &color_notes {
+            println!("TAKO_VISUAL_PIXEL: term-grid color {note}");
+        }
+        check(
+            fg_ok && !color_notes.is_empty(),
+            "visual-test 端末グリッド: truecolor / 256 色の前景がその色で描かれている (#787)",
+        );
+        check(
+            bg_ok,
+            "visual-test 端末グリッド: truecolor 背景がセルを塗りつぶしている (#787)",
+        );
+
+        // bold / dim / underline / 反転は「同じ 4 文字（WWWW）を同じ列で」比べる。
+        // 属性ごとに 1 行ずつ置いてあるので、素の行との差だけが属性の効果になる
+        let attr_bounds = |marker: &str| -> Bounds<Pixels> {
+            grid_cell_bounds(&geom.area, geom.cell, geom.subline, 3, 4, row_of(marker))
+        };
+        let attr_ink = |marker: &str| -> usize {
+            ink_pixels_in_bounds(&frame, &attr_bounds(marker), scale, geom.background, flip)
+        };
+        // 下線は「セルの下端 25%」にだけ現れる（グリフ本体とは重ならない帯）
+        let underline_band = |marker: &str| -> usize {
+            let b = attr_bounds(marker);
+            let band = Bounds::new(
+                point(b.origin.x, b.origin.y + b.size.height * 0.75),
+                size(b.size.width, b.size.height * 0.25),
+            );
+            ink_pixels_in_bounds(&frame, &band, scale, geom.background, flip)
+        };
+        let plain_ink = attr_ink("V7");
+        let bold_ink = attr_ink("V8");
+        let dim_ink = attr_ink("V9");
+        let plain_band = underline_band("V7");
+        let ul_band = underline_band("VA");
+        // 反転はセル背景が前景色になる = 面で塗られる
+        let rev_bg =
+            color_pixels_in_bounds(&frame, attr_bounds("VB"), scale, geom.foreground, 10, flip);
+        let rev_area = (f32::from(attr_bounds("VB").size.width)
+            * scale
+            * f32::from(attr_bounds("VB").size.height)
+            * scale) as usize;
+        // dim は前景色そのものが**出ていない**ことまで見る（減光後の色で描かれている）
+        let dim_run_fg = geom.screen.lines[row_of("V9")]
+            .runs
+            .iter()
+            .find(|r| r.dim)
+            .map(|r| r.fg);
+        let dim_plain_hit =
+            color_pixels_in_bounds(&frame, attr_bounds("V9"), scale, geom.foreground, 10, flip);
+        let dim_hit = dim_run_fg
+            .map(|fg| color_pixels_in_bounds(&frame, attr_bounds("V9"), scale, fg, 10, flip))
+            .unwrap_or(0);
+        let ul_ink = attr_ink("VA");
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid attrs plain={plain_ink} bold={bold_ink} dim={dim_ink} \
+             ul={ul_ink} plain_band={plain_band} ul_band={ul_band} rev_bg={rev_bg} \
+             rev_area={rev_area} dim_fg={dim_run_fg:?} dim_hit={dim_hit} \
+             dim_plain_hit={dim_plain_hit}"
+        );
+        // 行の下（次の行の上端まで）へはみ出していないか。属性行の下は fixture が
+        // 空行にしてあるので、ここに出たインクは「その行の装飾がはみ出した」ぶん
+        let below_band = |marker: &str| -> usize {
+            let b = attr_bounds(marker);
+            let band = Bounds::new(
+                point(b.origin.x, b.bottom()),
+                size(b.size.width, b.size.height * 0.5),
+            );
+            ink_pixels_in_bounds(&frame, &band, scale, geom.background, flip)
+        };
+        let plain_below = below_band("V7");
+        let ul_below = below_band("VA");
+        // SGR 4 のモデル側の解決（パーサの契約）。ピクセルは #797 のとおり 1 つも出ない
+        let ul_run_flag = geom.screen.lines[row_of("VA")]
+            .runs
+            .iter()
+            .any(|r| r.underline && line_text_of(&geom.screen.lines[row_of("VA")], r) == "WWWW");
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid attrs-underline model={ul_run_flag} ink={ul_ink} \
+             plain_ink={plain_ink} band={ul_band} plain_band={plain_band} below={ul_below} \
+             plain_below={plain_below} profile={:?}",
+            ink_row_profile(&frame, &attr_bounds("VA"), scale, geom.background, flip),
+        );
+        check(
+            bold_ink > plain_ink && plain_ink > 0,
+            "visual-test 端末グリッド: bold が素より太く描かれる (#787)",
+        );
+        // underline（SGR 4）は**モデルには載るがピクセルが 1 つも出ない**（#797）。
+        // GPUI は下線を「ベースライン + descent×0.618」= 行ボックスの下端ちょうどへ置くので、
+        // チャンク div の overflow_hidden（#64 の折り返し対策で必須）が丸ごと切り落とす。
+        // ここでは事実だけを固定する: パーサはちゃんと下線と解決していて、
+        // 装飾が次の行へはみ出してもいない。ピクセルの主張は #797 を直した側で入れる
+        check(
+            ul_run_flag,
+            "visual-test 端末グリッド: SGR 4 がモデルで underline に解決される (#787)",
+        );
+        check(
+            ul_below == 0 && plain_below == 0,
+            "visual-test 端末グリッド: 行の装飾が次の行へはみ出さない (#787)",
+        );
+        check(
+            rev_bg * 3 >= rev_area,
+            "visual-test 端末グリッド: 反転でセル背景が前景色に塗られる (#787)",
+        );
+        check(
+            dim_run_fg.is_some_and(|fg| fg != geom.foreground)
+                && dim_hit >= 3
+                && dim_plain_hit == 0,
+            "visual-test 端末グリッド: dim が減光後の色で描かれる (#787)",
+        );
+
+        // --- 5. IME アンカー（#781）: 算術のテキスト領域が実描画と一致し、
+        //        カーソルセルを指す ---
+        //
+        // `pane_text_areas` は「ビューポート寸法からの引き算」で作るので、ペイン内に
+        // 積まれる要素（ヘッダ / stale claude バナー / カード帯）の会計を落とすと
+        // PTY 行数・マウス座標・IME 位置が同時にずれる。セルフテスト 106 の gap=0 検査を
+        // 実ピクセル側からも固定する: カーソルブロックの実塗り位置とアンカーを突き合わせる
+        let drift = window
+            .update(cx, |app, _, _| app.pane_text_area_drift(geom.pane))
+            .ok()
+            .flatten();
+        let drift_gap = drift
+            .map(|(used, real)| {
+                (f32::from(used.origin.x) - f32::from(real.origin.x))
+                    .abs()
+                    .max((f32::from(used.origin.y) - f32::from(real.origin.y)).abs())
+                    .max((f32::from(used.size.width) - f32::from(real.size.width)).abs())
+                    .max((f32::from(used.size.height) - f32::from(real.size.height)).abs())
+            })
+            .unwrap_or(f32::MAX);
+        let cursor_cell = geom.screen.cursor;
+        let expected_cursor = cursor_cell
+            .map(|(col, row)| grid_cell_bounds(&geom.area, geom.cell, geom.subline, col, 1, row));
+        let drawn_cursor = expected_cursor.and_then(|b| {
+            // 期待セルの周囲 1 セルまで広げて探す（ずれていれば「ずれた位置」が読める）
+            let search = Bounds::new(
+                point(b.origin.x - b.size.width, b.origin.y - b.size.height),
+                size(b.size.width * 3.0, b.size.height * 3.0),
+            );
+            color_bbox_in_bounds(&frame, &search, scale, geom.cursor, 10, flip)
+        });
+        let anchor = window
+            .update(cx, |app, win, _| {
+                app.ime = Some(ImeComposition {
+                    pane: geom.pane,
+                    app_input: None,
+                    text: "あ".into(),
+                    selected_utf16: None,
+                });
+                let anchor = app.ime_overlay_anchor(win);
+                app.ime = None;
+                anchor
+            })
+            .ok()
+            .flatten();
+        let cursor_gap = match (drawn_cursor, expected_cursor) {
+            (Some(drawn), Some(expected)) => (f32::from(drawn.origin.x)
+                - f32::from(expected.origin.x))
+            .abs()
+            .max((f32::from(drawn.origin.y) - f32::from(expected.origin.y)).abs()),
+            _ => f32::MAX,
+        };
+        let anchor_gap = match (anchor, drawn_cursor) {
+            (Some(anchor), Some(drawn)) => (f32::from(anchor.x) - f32::from(drawn.origin.x))
+                .abs()
+                .max((f32::from(anchor.y) - f32::from(drawn.origin.y)).abs()),
+            _ => f32::MAX,
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid ime drift_gap={drift_gap:.2} cursor={cursor_cell:?} \
+             expected={expected_cursor:?} drawn={drawn_cursor:?} cursor_gap={cursor_gap:.2} \
+             anchor={anchor:?} anchor_gap={anchor_gap:.2}"
+        );
+        check(
+            drift_gap <= 0.5,
+            "visual-test 端末グリッド: テキスト領域の算術が実描画と一致 (#781/#787)",
+        );
+        check(
+            cursor_gap <= 1.5,
+            "visual-test 端末グリッド: カーソルブロックが算術どおりの位置に塗られる (#787)",
+        );
+        check(
+            anchor_gap <= 1.5,
+            "visual-test 端末グリッド: IME アンカーがカーソルセルの実描画位置を指す (#497/#781/#787)",
+        );
+
+        // --- 3. 選択ハイライト（#725/#145）: 合成マウスのドラッグが行をまたいで塗られ、
+        //        pbpaste と一致する ---
+        let v1_row = row_of("V1");
+        let v2_row = row_of("V2");
+        // V1 の ⏺（col 3）から V2 の I の右隣（col 15）まで = 全角混在行をまたぐ選択。
+        // セル中央で離すと右半分に入らないので、含めたい最終セルの 1 つ先を終点にする
+        let start = grid_cell_bounds(&geom.area, geom.cell, geom.subline, 3, 1, v1_row).center();
+        let end = grid_cell_bounds(&geom.area, geom.cell, geom.subline, 15, 1, v2_row).center();
+        let (before_sel, _) = capture_frame(any, cx)
+            .unwrap_or_else(|| fail("visual-test 端末グリッド: 選択前フレーム"));
+        // **実 OS マウスと同じ `PlatformInput` 経路**でドラッグする（ヒットテストと
+        // リスナー配線まで通すので「マウスで選べない」回帰をここで検出できる）
+        for input in [
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: end,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+        ] {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        }
+        let selected = window
+            .update(cx, |app, _, cx| {
+                cx.notify();
+                app.terminals
+                    .get(&geom.pane)
+                    .and_then(|s| s.selection_text())
+            })
+            .ok()
+            .flatten();
+        let (after_sel, _) = capture_frame(any, cx)
+            .unwrap_or_else(|| fail("visual-test 端末グリッド: 選択後フレーム"));
+        let sel_band = Bounds::new(
+            point(
+                geom.area.origin.x,
+                geom.area.origin.y + geom.cell.height * v1_row as f32 - px(geom.subline),
+            ),
+            size(
+                geom.area.size.width - px(18.0),
+                geom.cell.height * ((v2_row + 1 - v1_row) as f32),
+            ),
+        );
+        let sel_fill =
+            color_pixels_in_bounds(&after_sel, sel_band, scale, geom.selection, 10, flip);
+        let sel_changed = changed_pixels_in_bounds(&before_sel, &after_sel, &[sel_band], scale);
+        let pasted = cx
+            .background_executor()
+            .spawn(async {
+                std::process::Command::new("pbpaste")
+                    .output()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+            })
+            .await;
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid select rows={v1_row}..{v2_row} fill={sel_fill} \
+             changed={sel_changed} selected={:?} pbpaste_match={}",
+            selected
+                .as_deref()
+                .map(|t| t.chars().take(28).collect::<String>()),
+            pasted.as_deref() == selected.as_deref()
+        );
+        check(
+            selected
+                .as_deref()
+                .is_some_and(|t| t.contains("Fable") && t.contains("ターミナルUI")),
+            "visual-test 端末グリッド: 合成マウスのドラッグが行をまたいで選択する (#725/#787)",
+        );
+        check(
+            sel_fill > 200 && sel_changed > 200,
+            "visual-test 端末グリッド: 選択の帯が選択色で塗られる (#787)",
+        );
+        check(
+            pasted.as_deref() == selected.as_deref(),
+            "visual-test 端末グリッド: copy-on-select が実クリップボードへ渡る (#787)",
+        );
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&geom.pane) {
+                    session.clear_selection();
+                }
+                cx.notify();
+            })
+            .ok();
+
+        // --- 2. ピクセルスクロール（#159）: 半行スクロールで縦の位相がちょうど
+        //        半セルずれ、上端 / 下端に部分行が出る ---
+        //
+        // 既存の subline 節（そのまま比較 / 半行戻して比較の差分）とは独立に、
+        // **インク縦プロファイルの位相**で言う。行単位描画なら位相は 0 か 1 セルにしか
+        // ならないので、半セルの位相はピクセル単位描画の直接証拠になる
+        press(any, cx, "ctrl-u");
+        type_text(any, cx, "seq 400", true);
+        cx.background_executor()
+            .timer(Duration::from_millis(1500))
+            .await;
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&geom.pane) {
+                    session.scroll_to_bottom();
+                }
+                cx.notify();
+            })
+            .ok();
+        let _ = capture_frame(any, cx);
+        let Some(flat) = grid_geom(window, cx, Some(geom.pane)) else {
+            fail("visual-test 端末グリッド: スクロール前ジオメトリ")
+        };
+        let Some((frame_flat, _)) = capture_frame(any, cx) else {
+            fail("visual-test 端末グリッド: スクロール前フレーム")
+        };
+        // 右端 18px（スクロールバー）を除いた内側でプロファイルを採る
+        let profile_bounds = |g: &GridGeom| -> Bounds<Pixels> {
+            Bounds::new(
+                g.area.origin,
+                size(g.area.size.width - px(18.0), g.area.size.height),
+            )
+        };
+        let prof_flat = ink_row_profile(
+            &frame_flat,
+            &profile_bounds(&flat),
+            scale,
+            flat.background,
+            flip,
+        );
+        let cell_h = f32::from(flat.cell.height);
+        window
+            .update(cx, |app, win, cx| {
+                app.on_pane_scroll(
+                    geom.pane,
+                    &ScrollWheelEvent {
+                        position: flat.area.center(),
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(cell_h * 0.5))),
+                        ..ScrollWheelEvent::default()
+                    },
+                    win,
+                    cx,
+                );
+                cx.notify();
+            })
+            .ok();
+        let Some((frame_half, _)) = capture_frame(any, cx) else {
+            fail("visual-test 端末グリッド: 半行スクロール後フレーム")
+        };
+        let Some(half) = grid_geom(window, cx, Some(geom.pane)) else {
+            fail("visual-test 端末グリッド: 半行スクロール後ジオメトリ")
+        };
+        let prof_half = ink_row_profile(
+            &frame_half,
+            &profile_bounds(&half),
+            scale,
+            half.background,
+            flip,
+        );
+        let expected_shift = (cell_h * 0.5 * scale).round() as i32;
+        let (shift, best_cost, zero_cost) = best_profile_shift(
+            &prof_flat,
+            &prof_half,
+            (cell_h * 1.5 * scale).round() as i32,
+        );
+        let ink_extent = |profile: &[u32]| -> (i32, i32, usize) {
+            let first = profile.iter().position(|v| *v > 0).map(|i| i as i32);
+            let last = profile.iter().rposition(|v| *v > 0).map(|i| i as i32);
+            (
+                first.unwrap_or(-1),
+                last.unwrap_or(-1),
+                profile.iter().filter(|v| **v > 0).count(),
+            )
+        };
+        let (first_flat, last_flat, rows_flat) = ink_extent(&prof_flat);
+        let (first_half, last_half, rows_half) = ink_extent(&prof_half);
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid scroll fract={:.3} shift={shift} \
+             expected={expected_shift} best_cost={best_cost:.2} zero_cost={zero_cost:.2} \
+             first={first_flat}->{first_half} last={last_flat}->{last_half} \
+             ink_rows={rows_flat}->{rows_half}",
+            half.screen.fract,
+        );
+        check(
+            (half.screen.fract - 0.5).abs() < 0.2,
+            "visual-test 端末グリッド: 半行スクロールで端数が 0.5 行になる (#159/#787)",
+        );
+        check(
+            (shift - expected_shift).abs() <= 2 && best_cost * 2.0 < zero_cost,
+            "visual-test 端末グリッド: 描画がちょうど半セルずれる（ピクセル単位）(#159/#787)",
+        );
+        check(
+            first_half >= 0 && first_half < first_flat,
+            "visual-test 端末グリッド: 上端に部分行が出る（クリップされて先頭が繰り上がる）(#159/#787)",
+        );
+        check(
+            (last_half - last_flat).abs() as f32 <= cell_h * 0.25 * scale,
+            "visual-test 端末グリッド: 下端の部分行（extra_bottom）が隙間を埋める (#159/#787)",
+        );
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&geom.pane) {
+                    session.scroll_to_bottom();
+                }
+                cx.notify();
+            })
+            .ok();
+
+        // --- 6. カーソル描画: ブロック / バー × フォーカス有無の 4 通り ---
+        //
+        // tako は DECSCUSR の形状に関係なく**セルを塗るブロック**で描く（現状の見た目）。
+        // フォーカスの有無でも消さない。ここではその 4 通りを実ピクセルで固定し、
+        // DECTCEM で隠したときだけ 0 になることを対照に置く（検査が空振りしていない証拠）
+        let mut cursor_notes: Vec<String> = Vec::new();
+        let mut cursor_ok = true;
+        let mut hidden_ok = false;
+        // 比較のためプレビューペインを右に開いてフォーカスを奪う（PTY を増やさない）
+        let side_file = dir.join("side.txt");
+        std::fs::write(&side_file, "side\n").expect("visual-test グリッド: 副ペイン用ファイル");
+        let mut side_pane: Option<PaneId> = None;
+        for focused in [true, false] {
+            if !focused {
+                side_pane = window
+                    .update(cx, |app, _, cx| {
+                        let opened = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(geom.pane.as_u64()),
+                                path: side_file.display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                direction: Some(tako_control::protocol::Direction::Right),
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        cx.notify();
+                        opened
+                    })
+                    .ok()
+                    .flatten();
+                cx.background_executor()
+                    .timer(Duration::from_millis(600))
+                    .await;
+            }
+            for (shape, sequence) in [("block", "\\033[2 q"), ("bar", "\\033[6 q")] {
+                let shape_script = dir.join(format!("cursor-{shape}.sh"));
+                std::fs::write(&shape_script, format!("printf '{sequence}'\n"))
+                    .expect("visual-test グリッド: カーソル形状スクリプト");
+                window
+                    .update(cx, |app, _, cx| {
+                        if let Some(session) = app.terminals.get(&geom.pane) {
+                            session.write(
+                                format!("clear; sh {}\n", shape_script.display()).into_bytes(),
+                            );
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(900))
+                    .await;
+                let _ = capture_frame(any, cx);
+                let Some((cursor_frame, _)) = capture_frame(any, cx) else {
+                    fail("visual-test 端末グリッド: カーソルフレーム")
+                };
+                let Some(now) = grid_geom(window, cx, Some(geom.pane)) else {
+                    fail("visual-test 端末グリッド: カーソル時ジオメトリ")
+                };
+                let hit = now
+                    .screen
+                    .cursor
+                    .map(|(col, row)| {
+                        let bounds =
+                            grid_cell_bounds(&now.area, now.cell, now.subline, col, 1, row);
+                        let area_px = (f32::from(bounds.size.width)
+                            * scale
+                            * f32::from(bounds.size.height)
+                            * scale) as usize;
+                        (
+                            color_pixels_in_bounds(
+                                &cursor_frame,
+                                bounds,
+                                scale,
+                                now.cursor,
+                                10,
+                                flip,
+                            ),
+                            area_px,
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                cursor_notes.push(format!(
+                    "{shape}/focused={focused} cell={:?} fill={} area={}",
+                    now.screen.cursor, hit.0, hit.1
+                ));
+                cursor_ok &= now.screen.cursor.is_some() && hit.0 * 2 >= hit.1 && hit.1 > 0;
+            }
+            if focused {
+                // 対照: DECTCEM で隠すとカーソル色が 1 px も出ない
+                let hide_script = dir.join("cursor-hide.sh");
+                std::fs::write(&hide_script, "printf '\\033[?25l'\n")
+                    .expect("visual-test グリッド: カーソル非表示スクリプト");
+                window
+                    .update(cx, |app, _, cx| {
+                        if let Some(session) = app.terminals.get(&geom.pane) {
+                            session.write(
+                                format!("clear; sh {}\n", hide_script.display()).into_bytes(),
+                            );
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(900))
+                    .await;
+                let _ = capture_frame(any, cx);
+                let Some((hidden_frame, _)) = capture_frame(any, cx) else {
+                    fail("visual-test 端末グリッド: カーソル非表示フレーム")
+                };
+                let Some(now) = grid_geom(window, cx, Some(geom.pane)) else {
+                    fail("visual-test 端末グリッド: カーソル非表示ジオメトリ")
+                };
+                let stray = color_pixels_in_bounds(
+                    &hidden_frame,
+                    profile_bounds(&now),
+                    scale,
+                    now.cursor,
+                    10,
+                    flip,
+                );
+                hidden_ok = now.screen.cursor.is_none() && stray == 0;
+                cursor_notes.push(format!("hidden cell={:?} stray={stray}", now.screen.cursor));
+                // 元に戻す（以降の節はカーソルが見える前提）
+                let show_script = dir.join("cursor-show.sh");
+                std::fs::write(&show_script, "printf '\\033[?25h\\033[0 q'\n")
+                    .expect("visual-test グリッド: カーソル復帰スクリプト");
+                window
+                    .update(cx, |app, _, cx| {
+                        if let Some(session) = app.terminals.get(&geom.pane) {
+                            session.write(
+                                format!("clear; sh {}\n", show_script.display()).into_bytes(),
+                            );
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(700))
+                    .await;
+            }
+        }
+        for note in &cursor_notes {
+            println!("TAKO_VISUAL_PIXEL: term-grid cursor {note}");
+        }
+        check(
+            cursor_ok && cursor_notes.len() == 5,
+            "visual-test 端末グリッド: ブロック / バー × フォーカス有無の 4 通りでカーソルが塗られる (#787)",
+        );
+        check(
+            hidden_ok,
+            "visual-test 端末グリッド: DECTCEM で隠すとカーソル色が出ない（対照）(#787)",
+        );
+
+        // 後片付け（以降の節へ影響を残さない）
+        if let Some(side) = side_pane {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(side.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(geom.pane);
+                    cx.notify();
+                })
+                .ok();
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+        }
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&geom.pane) {
+                    session.write(b"clear\n".to_vec());
+                }
+                cx.notify();
+            })
+            .ok();
+        if let Some(dir_name) = dump_dir.as_deref() {
+            let base = std::path::Path::new(dir_name);
+            let _ = std::fs::create_dir_all(base);
+            let _ = frame.save(base.join("term-grid-fixture.png"));
+            let _ = after_sel.save(base.join("term-grid-select.png"));
+            let _ = frame_half.save(base.join("term-grid-halfscroll.png"));
+            let _ = std::fs::write(base.join("term-grid.txt"), &dump);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #152 / #589 / #656 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の
     /// PTY / fd ストレス項目のタイミングに左右されず scene だけを検査する。
     #[cfg(feature = "visual-test")]
@@ -22097,14 +23372,24 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                "terminal-grid" => {
+                    terminal_grid_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'\
-                         （使えるのは profiles / chat-table / conflict-card）"
+                         （使えるのは profiles / chat-table / conflict-card / terminal-grid）"
                     );
                     std::process::exit(1);
                 }
             }
+
+            // #787 の前提整備: 端末グリッドの描画をピクセルで固定する。ターミナルが
+            // 素の状態（1 ペイン・プロンプトだけ・テーマ既定）のうちに先に撮るので、
+            // 以降の節がプレビュー / チャット / テーマを触っても影響を受けない
+            terminal_grid_visual(any, window, cx).await;
 
             // #656: Markdown プレビューの表示品質。代表 md（全ブロック種別）を
             // ダーク / ライト / 狭幅の 3 状態で実フレーム描画し、
