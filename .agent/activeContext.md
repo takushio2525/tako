@@ -3,59 +3,59 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-11、Issue #787 の前提整備 = 実装完了・PR 待ち）
+## 現在の対象（2026-08-11、Issue #787 端末グリッドの専用 Element 化 = 実装完了・PR 待ち）
 
-- worktree `~/dev/tako-wt-787pre` / ブランチ `test/787-visual-net`
-- #787（端末グリッドを div スタックから専用 Element へ置き換え）は #64 / #159 /
-  #497・#781 / #725・#145 / #153 の実装に触るので、**置き換える前に今の見た目を
-  ピクセルで固定する**のが本タスク。Element 化本体は後続 worker が担当（ここではやらない）
-- 追加したのは visual-test の `terminal-grid` 節 1 本（6 検査）+ 共通部品 6 個。
-  `TAKO_VISUAL_ONLY=terminal-grid` で単独実行でき、全節通しの先頭でも走る
-  （ターミナルが素の状態 = 1 ペイン・テーマ既定のうちに撮るため）
+- worktree `~/dev/tako-wt-787` / ブランチ `improve/787-grid-element`
+- ペイン本体の端末グリッドを「行 div + チャンク div のスタック」から
+  **1 個の `Element`（`crates/tako-app/src/terminal_grid.rs`）**へ置き換えた。
+  セルの原点を `col * cell_width` で直接決め、背景は `paint_quad`、
+  グリフは `shape_line(force_width) + ShapedLine::paint`、下線・取り消し線は自前で置く
+- 同時に #797（SGR 4 と ⌘ホバーの下線が 1 px も出ない）と #798（全角の長い連なりで
+  最大 1 セル左へ詰まる）が構造的に解消。visual-test の主張を「直った側」へ更新した
+- 行 div の `terminal_screen_lines` は**残してある**（チャット入力欄のミラー #719 /
+  たまり場サムネイル / タブツリーのホバープレビュー = 行を他要素へ埋め込む用途）
 
-## 6 検査の中身（すべて実ピクセル or 実レイアウト矩形）
+## 設計判断（force_width と全角スペーサー）
 
-1. **日本語混在行**（#64）: fixture 12 行を PTY へ流し、**非空セルが全部塗られているか**を
-   セル単位で見る。`⏺ Fable 5 + max` / `ターミナルUI` / 絵文字混在 / 行末まで届く半角行
-2. **ピクセルスクロール**（#159）: インク縦プロファイルの**位相**が半セル
-   （17 device px）ちょうどずれる + 上端が繰り上がる + 下端の extra_bottom が隙間を埋める
-3. **選択ハイライト**（#725/#145）: 合成 `PlatformInput` のドラッグで行をまたいで選択 →
-   選択色の塗り + `pbpaste` 一致（copy-on-select）
-4. **色とスタイル**: `ScreenLine::runs` が解決した色をそのままピクセルと突き合わせる
-   （truecolor fg / truecolor bg / 256 色 / bold / dim / 反転）。期待色をテストへ焼かない
-5. **IME アンカー**（#781/#497）: `pane_text_area_drift` = 0 + カーソルブロックの実塗り位置と
-   算術の一致（0.07px）+ `ime_overlay_anchor` がその位置を指す
-6. **カーソル描画**: ブロック / バー × フォーカス有無の 4 通りでセルが塗られ、
-   DECTCEM で隠すと 0（対照）
+- `shape_line` の `force_width = cell_width` はグリフ位置をセル境界へスナップするので、
+  advance がセル幅と合わないグリフ（`⏺`・絵文字）の**後続が自動でグリッドへ戻る**。
+  #64 対策の「個別 div へ隔離して overflow_hidden で切る」は不要になった
+- ただし `force_width` は「グリフ 1 個 = 1 セル」を仮定するため、**全角の 2 セル目に
+  スペースを 1 個差し込む**（`shape_segments`）。これでグリフ数と列数が 1:1 に戻る
+- **行高はセル高を渡す**。旧実装は `StyledText` 経由で環境既定行高（13×1.618≒21px）
+  基準にベースラインを置いていたため字が 2px 下へずれ、ディセンダが切れていた。
+  **この 2px はユーザーに見える変化**（PR に明記済み）
 
-## この整備で見つけた既知の癖（Issue 化済み。Element 化で直る見込み）
+## 検証状況（すべて隔離・本番 pid 1099 は全計測の前後で生存）
 
-- **#797**: SGR 4 の下線が**1 px も描かれない**。GPUI は下線を行ボックス下端
-  （ベースライン + descent×0.618）へ置くので、チャンク div の `overflow_hidden`
-  （#64 対策で外せない）が丸ごと切る。節では「モデルは underline と解決する」
-  「次の行へはみ出さない」だけを主張し、ピクセルの主張は #797 を直す側で入れる
-- **#798**: 全角が長く連なる行で描画位置がグリッドより最大 1 セル左へ詰まる
-  （div 幅のデバイスピクセル丸めが 55 個ぶん累積）。**半角行は drift 0**。
-  節では VC 行で「1 セル以内」と塗られたセル数で固定してある
+- 品質ゲート: fmt / clippy(-D warnings、feature なし + visual-test 付き) / test 1935 件 全緑 /
+  Windows クロスチェック エラー 0・警告 16 = main と同数
+- visual-test `terminal-grid` 節 3 連続 OK（検査 22 行）。全節は 6 回中 4 回完走、
+  落ちた 2 回は **PDF 文字矩形の paint**（`wait_for_preview_maps` の実時間待ち）。
+  **素の main（a071852）でも 3 回中 2 回同じ項目で落ちる**ことを実測 = main 由来（#796）
+- 隔離セルフテスト **完走**（`TAKO_APP_SELF_TEST_OK` / exit 0）。SKIPPED は 76d / 104 の
+  2 件のみ = #786 と同じ既知の環境要因（ウィンドウ非前面）
+- 実 claude（`TAKO_VISUAL_CLAUDE=1`）: 13 行 523 セルで missing 0 / drift 左右とも 0
+- 性能（同一バイナリ A/B・`TAKO_787_NO_GRID_ELEMENT=1` が before）:
+  満杯 15.59M → 8.68M / 実務密度 15.68M → 6.42M instr/frame。**ライブ画面の CPU% は
+  ディスプレイが消えていて測れず**、`Window::draw` を自前で回す `grid-bench` で代替
 
 ## 不変条件
 
-- **描画本体は 1 行も変えない**。追加は全部 `#[cfg(feature = "visual-test")]`。
-  feature 無しビルドの**グローバルシンボル 135,988 件と `__text` 49,141,068 バイトが
-  main と完全一致**することで担保（SHA は行番号 DWARF が動くぶんだけ違う）
-- 検証は `TAKO_ISOLATED=1` + 注入済み `TAKO_*` を `env -u` で外す
-  （ランナーは scratchpad の `787/run-visual.sh`）。本番 GUI の pid は毎回不変を確認
-- ダンプ（`TAKO_VISUAL_DUMP_DIR`）はホスト名・ユーザー名が写るので**リポジトリへ入れない**
+- `pane_text_areas` の算術が正（PTY 行数・マウス座標・IME の共通の正）。element の
+  矩形はその原点と一致させる（visual-test の `drift_gap <= 0.5` が見張り）
+- サブラインスクロールは「行スタック全体を fract 行ぶん上へ + extra_bottom で下端を埋める」
+- 空白セルはグリフを描かないが、**背景・下線・カーソルは別の層が描く**。
+  「空白だから何もしない」をグリフ以外へ広げない
 
 ## 次の手順
 
-1. PR（`Refs #787`）→ macOS CI 全ジョブ緑 → squash merge → worktree 片付け（install 不要）
-2. #787 本体（Element 化）の worker は、着手前に `TAKO_VISUAL_ONLY=terminal-grid` で
-   before を採り、置き換え後に同じ数値と突き合わせる。#797 / #798 が直ったら
-   その節の主張を「ピクセルが出る」「drift 0」へ**意図的に**上げる
+1. PR（`Closes #787` / `Closes #797` / `Closes #798`）→ macOS CI 全ジョブ緑 → squash merge
+2. `scripts/build-app.sh --install`（GUI 再起動は master 側）
+3. 残る 1 フレーム 4.76M の固定費は**グリッドではない**（空画面でも掛かる）= #786 の残り。
+   別 Issue にするかは master 判断
 
 ## 現フェーズで Read すべき設計書
 
-- 端末グリッドの描画: `crates/tako-app/src/main.rs` の `terminal_screen_lines` /
-  `chunk_line_chars` / `pane_text_area_rect`、`.agent/architecture.md`
-- visual-test の作法: `main.rs` の `self_test::run_visual` と `capture_frame` 周辺の共通部品
+- 描画: `.agent/architecture.md`「端末グリッドの専用 Element」「ビュー単位の描画キャッシュ」
+- 実装: `crates/tako-app/src/terminal_grid.rs`（モジュール冒頭に方式と踏み抜きどころ）
