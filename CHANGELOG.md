@@ -8,6 +8,14 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.6.11] - 2026-08-12
+
+Nightly patch release (automated). Changes since v0.6.10:
+夜間パッチリリース（自動）。v0.6.10 以降の変更:
+
+- [改善] 端末グリッドを専用 Element へ置き換え、下線と全角の描画ずれを根治 (#787) (#800)
+- [改善] 端末グリッド描画の visual-test 回帰検出網を整備 (#787) (#799)
+
 ## [0.6.10] - 2026-08-11
 
 Nightly patch release (automated). Changes since v0.6.9:
