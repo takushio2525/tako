@@ -38,6 +38,7 @@ mod sidebar;
 mod starter;
 mod status_bar;
 mod tab_bar;
+mod terminal_grid;
 mod ui_text;
 mod update_checker;
 mod update_window;
@@ -12322,7 +12323,98 @@ impl TakoApp {
         )
     }
 
-    /// ターミナルの現在画面を行 div のリストへ変換する（通常ペイン描画とバックグラウンドプレビューで共用）。
+    /// このペインに映す行列（ミラースクロール中は tmux 履歴 + ライブ画面の合成。#159）。
+    /// サブライン表示中は最下行の 1 行下（`extra_bottom`）まで含める
+    fn display_lines(
+        &self,
+        pane_id: PaneId,
+        screen: tako_core::Screen,
+    ) -> Vec<tako_core::ScreenLine> {
+        self.compose_mirror_lines(pane_id, &screen)
+            .unwrap_or_else(|| {
+                let mut lines = screen.lines;
+                lines.extend(screen.extra_bottom);
+                lines
+            })
+    }
+
+    /// ⌘ホバー中のリンクスパン（行番号 → セル範囲 `[start, end)`）
+    fn hovered_link_spans(&self, pane_id: PaneId) -> HashMap<usize, (usize, usize)> {
+        self.hovered_link
+            .as_ref()
+            .filter(|h| h.pane == pane_id)
+            .map(|h| {
+                h.spans
+                    .iter()
+                    .map(|&(row, sc, ec)| (row, (sc, ec)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// ペイン本体の端末グリッドを描く element を組む（#787）。
+    ///
+    /// 行 div のスタック（[`Self::terminal_screen_lines`]）を置き換える本体側の経路。
+    /// セルの原点を `col * cell_width` で直接決めるので、div の幅をデバイスピクセルへ
+    /// 丸めるぶんの累積（#798）と、行 div の `overflow_hidden` による下線の切り落ち
+    /// （#797）が構造的に起きない。詳細は `crate::terminal_grid`
+    fn terminal_grid_element(
+        &self,
+        pane_id: PaneId,
+        show_cursor: bool,
+        subline_shift: f32,
+    ) -> Option<terminal_grid::TerminalGrid> {
+        if terminal_grid::element_disabled() {
+            return None;
+        }
+        let theme = &self.theme;
+        let cell = self.cell_size_for_pane(pane_id)?;
+        let has_custom_font = self.pane_font_sizes.contains_key(&pane_id);
+        let text_style = if has_custom_font {
+            self.pane_text_style(pane_id)
+        } else {
+            self.text_style()
+        };
+        let screen = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.screen_opts(theme, show_cursor))?;
+        let link_spans = self.hovered_link_spans(pane_id);
+        let link_style = terminal_grid::LinkDecoration {
+            fg: hsla(theme.accent),
+            bg: hsla_alpha(theme.accent, 0.22),
+            underline: hsla(theme.accent),
+        };
+        let fg = hsla(theme.foreground);
+        let rows = self
+            .display_lines(pane_id, screen)
+            .iter()
+            .enumerate()
+            .map(|(row_idx, line)| {
+                terminal_grid::plan_row(line, fg, link_spans.get(&row_idx).copied(), link_style)
+            })
+            .collect();
+        let font_size = px(if has_custom_font {
+            self.pane_font_size(pane_id)
+        } else {
+            theme.font_size
+        });
+        Some(terminal_grid::TerminalGrid::new(
+            rows,
+            cell,
+            font_size,
+            text_style.font(),
+            px(subline_shift),
+        ))
+    }
+
+    /// ターミナルの現在画面を行 div のリストへ変換する。
+    ///
+    /// **ペイン本体は [`Self::terminal_grid_element`]（専用 element。#787）が描く**。
+    /// ここが残っているのは、行を「他の要素の中へ埋め込む」用途 —
+    /// チャット入力欄のミラー（#719）、たまり場のサムネイル、
+    /// タブツリーのホバープレビュー — で、行が div のままだと扱いやすい経路。
+    ///
     /// run ごとの色・太字・下線などの装飾を StyledText のハイライトへ写す。
     /// 全角文字を含む行はランごとにセル幅固定 div で配置し、フォント advance と
     /// グリッドセル幅のずれを吸収する（Markdown テーブル等の罫線崩れ防止）
@@ -12352,31 +12444,8 @@ impl TakoApp {
             return Vec::new();
         };
         // cmd+ホバー中のリンクスパン（行番号→(start_col, end_col) のマップ）
-        let link_spans: HashMap<usize, (usize, usize)> = self
-            .hovered_link
-            .as_ref()
-            .filter(|h| h.pane == pane_id)
-            .map(|h| {
-                h.spans
-                    .iter()
-                    .map(|&(row, sc, ec)| (row, (sc, ec)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let _total_cols = screen.cols;
-        // 表示行列の決定（#159）:
-        // - バックエンドのミラースクロール中: tmux 履歴ミラー + ライブ画面の合成
-        // - それ以外: viewport（+ サブライン中は最下行の 1 行下 = extra_bottom）。
-        //   描画側が行スタック全体を fract 行ぶん上へずらすため、下端の隙間を追加行が埋める
-        let display_lines = self
-            .compose_mirror_lines(pane_id, &screen)
-            .unwrap_or_else(|| {
-                let mut lines = screen.lines;
-                lines.extend(screen.extra_bottom);
-                lines
-            });
-        display_lines
+        let link_spans = self.hovered_link_spans(pane_id);
+        self.display_lines(pane_id, screen)
             .into_iter()
             .enumerate()
             .map(|(row_idx, line)| {
@@ -13985,9 +14054,6 @@ impl TakoApp {
             .unwrap_or(0.0);
         let command_card_band = self.render_command_card_band(pane_id, band_height, cx);
 
-        // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
-        // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
-        let lines = self.terminal_screen_lines(pane_id, true);
         // サブラインスクロールの描画シフト（fract 行ぶん行スタック全体を上へずらす。#159）。
         // バックエンドペインはミラー位置の端数、直接ペインはセッションの端数
         let subline_fract = self
@@ -14005,6 +14071,16 @@ impl TakoApp {
             })
             .unwrap_or(0.0);
         let subline_shift = subline_fract * f32::from(cell.height);
+        // ミラー方式（#159）では copy-mode に入らないためカーソルを隠す必要はない
+        // （ライブ画面部分のカーソルはスクロール中も見えるのが iTerm2 と同じ挙動）
+        let grid = self.terminal_grid_element(pane_id, true, subline_shift);
+        // 旧経路（`TAKO_787_NO_GRID_ELEMENT=1` = 同一バイナリ A/B 用の逃げ道、または
+        // セル幅未計測の起動直後）だけ行 div のスタックを組む
+        let legacy_lines = if grid.is_none() {
+            self.terminal_screen_lines(pane_id, true)
+        } else {
+            Vec::new()
+        };
         let has_link_hover = self
             .hovered_link
             .as_ref()
@@ -14658,9 +14734,10 @@ impl TakoApp {
                 },
             )
             .child(
-                // テキスト領域: サブラインスクロール（#159）のため行スタックを
-                // absolute 配置し、fract 行ぶん上へずらして描画する（overflow_hidden で
-                // 上下端は部分行として見切れる = ピクセル単位のスムーススクロール）。
+                // テキスト領域: 端末グリッドは専用 element（#787）が 1 要素で描く。
+                // サブラインスクロール（#159）の fract 行ぶんのずらしは element の内側で
+                // 行ごとに掛かり、上下端は content mask で部分行として見切れる
+                // （= ピクセル単位のスムーススクロール）。
                 // bg を明示する（#385）: リサイズ・レイアウト変化時に端末行が新サイズを
                 // 埋め切る前のフレームでも、ペイン背景色と同色が塗られて暗転しない
                 div()
@@ -14686,14 +14763,23 @@ impl TakoApp {
                             .size_full()
                     })
                     .child(
+                        // element の矩形は `pane_text_areas` の算術と同じ原点
+                        // （四辺 PANE_PADDING の内側）。下端だけはコンテナまで伸ばして、
+                        // サブラインスクロールで上へずれた最終行の部分行が
+                        // 旧実装と同じ範囲まで見えるようにする
                         div()
                             .absolute()
                             .left(px(PANE_PADDING))
                             .right(px(PANE_PADDING))
-                            .top(px(PANE_PADDING - subline_shift))
-                            .flex()
-                            .flex_col()
-                            .children(lines),
+                            .when_some(grid, |d, grid| {
+                                d.top(px(PANE_PADDING)).bottom(px(0.0)).child(grid)
+                            })
+                            .when(!legacy_lines.is_empty(), |d| {
+                                d.top(px(PANE_PADDING - subline_shift))
+                                    .flex()
+                                    .flex_col()
+                                    .children(legacy_lines)
+                            }),
                     ),
             )
             // AI コマンド提案カードの帯（#703）: ターミナル領域の**兄弟**として下に置く。
@@ -22324,6 +22410,7 @@ mod self_test {
         foreground: tako_core::Rgb,
         cursor: tako_core::Rgb,
         selection: tako_core::Rgb,
+        accent: tako_core::Rgb,
     }
 
     #[cfg(feature = "visual-test")]
@@ -22352,6 +22439,7 @@ mod self_test {
                     foreground: app.theme.foreground,
                     cursor: app.theme.cursor,
                     selection: app.theme.selection_background,
+                    accent: app.theme.accent,
                 })
             })
             .ok()
@@ -22428,7 +22516,8 @@ mod self_test {
                  printf 'V9 \\033[2mWWWW\\033[0m\\n\\n'\n\
                  printf 'VA \\033[4mWWWW\\033[0m\\n\\n'\n\
                  printf 'VB \\033[7mWWWW\\033[0m\\n\\n'\n\
-                 printf '%s\\n' '{vc}'\n"
+                 printf '%s\\n' '{vc}'\n\
+                 printf 'VD gjpqy\\n\\n'\n"
             ),
         )
         .expect("visual-test グリッド fixture スクリプト");
@@ -22436,11 +22525,11 @@ mod self_test {
         // fixture の投入（`clear` 後にスクリプト出力 = 行 0 から並ぶ）
         press(any, cx, "ctrl-u");
         type_text(any, cx, &format!("clear; sh {}", script.display()), true);
-        const MARKERS: [&str; 12] = [
-            "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "VA", "VB", "VC",
+        const MARKERS: [&str; 13] = [
+            "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "VA", "VB", "VC", "VD",
         ];
         let mut rows: HashMap<String, usize> = HashMap::new();
-        for _ in 0..12 {
+        for _ in 0..MARKERS.len() {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
@@ -22533,9 +22622,6 @@ mod self_test {
         let mut cjk_bleed_ok = true;
         let mut cjk_drift_ok = true;
         for marker in ["V1", "V2", "V3", "V4", "VC"] {
-            // VC（全角だけで右端まで届く行）は #798 の累積で最大 1 セルずれる。
-            // セル単位の厳密検査ではなく「ずれ量」と「塗られたセル数」で押さえる
-            let tolerant = marker == "VC";
             let row = row_of(marker);
             let line = &geom.screen.lines[row];
             // (col, span, ch) の一覧。span == 0（結合文字）と空白は対象外
@@ -22555,9 +22641,7 @@ mod self_test {
                     (ink < 2).then(|| format!("{ch:?}@{col}(ink={ink})"))
                 })
                 .collect();
-            // 行末付近の半角語（#64 の "max" / "UI"）は個別に主張する。
-            // tolerant な行は語をまとめて ±1 セルの窓で見る（位置のずれを許し、
-            // 「語が消えた」だけを検出する）
+            // 行末付近の半角語（#64 の "max" / "UI"）はセルごとに主張する
             let tail = match marker {
                 "V2" => "UI",
                 "V4" => "mix",
@@ -22611,8 +22695,10 @@ mod self_test {
             let drawn_last = (0..cols)
                 .rev()
                 .find(|&col| cell_ink(&frame, &geom, row, col, 1) >= 2);
-            // 実描画のインク位置とグリッド算術のずれ（セル単位）。全角の長い連なりでは
-            // 行 div のスタックが幅をデバイスピクセルへ丸めるぶん左へ詰まる
+            // 実描画のインク位置とグリッド算術のずれ（セル単位）。
+            // 旧実装（行 div のスタック）は全角の長い連なりで幅がデバイスピクセルへ
+            // 丸められて左へ詰まっていた（#798。VC 行で drift=-1 を実測）。
+            // 専用 element は列番号から座標を作るので累積が生まれず 0 になる
             let drift = drawn_last.map(|drawn| drawn as i64 - (last_col as i64 - 1));
             let inked_cells = (0..cols)
                 .filter(|&col| cell_ink(&frame, &geom, row, col, 1) >= 2)
@@ -22626,7 +22712,7 @@ mod self_test {
                 cells.len(),
                 missing.len(),
             );
-            if !missing.is_empty() && !tolerant {
+            if !missing.is_empty() {
                 // 落ちたときはセルごとのインクをそのまま出す。どこから位置がずれたのか /
                 // どの文字が消えたのかは、この並びを見るのが一番速い
                 println!(
@@ -22649,17 +22735,13 @@ mod self_test {
                     line.text.trim_end()
                 ));
             }
-            if tolerant {
-                // 塗られたセル数が期待とほぼ一致 = 消えた文字が無い
-                cjk_ok &= inked_cells + 2 >= expected_inked && expected_inked > 0;
-                cjk_tail_ok &= tail_window >= 60 * tail.chars().count();
-                cjk_drift_ok &= drift.is_some_and(|d| d.abs() <= 1);
-            } else {
-                cjk_ok &= missing.is_empty() && !cells.is_empty();
-                cjk_tail_ok &=
-                    tail_ink.len() == tail.chars().count() && tail_ink.iter().all(|ink| *ink >= 2);
-                cjk_drift_ok &= drift == Some(0);
-            }
+            // #798 を直したので全角だけで右端まで届く行（VC）も半角行と同じ厳密検査に
+            // 掛ける。`inked_cells` は絵文字（実 advance が 2 セルを超える）で期待より
+            // 増えることがあるので指紋として出すだけにし、主張は「消えていない」側で行う
+            cjk_ok &= missing.is_empty() && !cells.is_empty() && expected_inked > 0;
+            cjk_tail_ok &=
+                tail_ink.len() == tail.chars().count() && tail_ink.iter().all(|ink| *ink >= 2);
+            cjk_drift_ok &= drift == Some(0);
             cjk_bleed_ok &= bleed <= 2;
         }
         check(
@@ -22676,8 +22758,8 @@ mod self_test {
         );
         check(
             cjk_drift_ok,
-            "visual-test 端末グリッド: 実描画位置とグリッド算術のずれが規定内 \
-             （半角行 = 0 セル / 全角の長い連なり = 1 セル以内）(#787)",
+            "visual-test 端末グリッド: 実描画位置がグリッド算術と一致する \
+             （全角が長く連なる行も 0 セル）(#798/#787)",
         );
 
         // --- 4. 色とスタイル（端末 SGR。syntect ではない） ---
@@ -22771,6 +22853,19 @@ mod self_test {
             );
             ink_pixels_in_bounds(&frame, &band, scale, geom.background, flip)
         };
+        // 下線が引かれる**その 1 px の帯**（実装が決めた位置を正として見る）。
+        // 下端 25% の帯は「字が少し下にある」だけでもインクが出るので、
+        // 「下線が描かれたか」の判定にはこの細い帯を使う（#797 の検出力）
+        let underline_line = |b: Bounds<Pixels>| -> Bounds<Pixels> {
+            let dy = crate::terminal_grid::underline_y(
+                f32::from(geom.cell.height),
+                crate::terminal_grid::DECORATION_THICKNESS,
+            );
+            Bounds::new(
+                point(b.origin.x, b.origin.y + px(dy)),
+                size(b.size.width, px(crate::terminal_grid::DECORATION_THICKNESS)),
+            )
+        };
         let plain_ink = attr_ink("V7");
         let bold_ink = attr_ink("V8");
         let dim_ink = attr_ink("V9");
@@ -22813,29 +22908,50 @@ mod self_test {
         };
         let plain_below = below_band("V7");
         let ul_below = below_band("VA");
-        // SGR 4 のモデル側の解決（パーサの契約）。ピクセルは #797 のとおり 1 つも出ない
+        // SGR 4 のモデル側の解決（パーサの契約）
         let ul_run_flag = geom.screen.lines[row_of("VA")]
             .runs
             .iter()
             .any(|r| r.underline && line_text_of(&geom.screen.lines[row_of("VA")], r) == "WWWW");
+        // 下線 1 px の帯だけを見た値（素の行との差が下線そのもの）
+        let ul_strip = ink_pixels_in_bounds(
+            &frame,
+            &underline_line(attr_bounds("VA")),
+            scale,
+            geom.background,
+            flip,
+        );
+        let plain_strip = ink_pixels_in_bounds(
+            &frame,
+            &underline_line(attr_bounds("V7")),
+            scale,
+            geom.background,
+            flip,
+        );
         println!(
             "TAKO_VISUAL_PIXEL: term-grid attrs-underline model={ul_run_flag} ink={ul_ink} \
              plain_ink={plain_ink} band={ul_band} plain_band={plain_band} below={ul_below} \
-             plain_below={plain_below} profile={:?}",
+             plain_below={plain_below} strip={ul_strip} plain_strip={plain_strip} profile={:?}",
             ink_row_profile(&frame, &attr_bounds("VA"), scale, geom.background, flip),
         );
         check(
             bold_ink > plain_ink && plain_ink > 0,
             "visual-test 端末グリッド: bold が素より太く描かれる (#787)",
         );
-        // underline（SGR 4）は**モデルには載るがピクセルが 1 つも出ない**（#797）。
-        // GPUI は下線を「ベースライン + descent×0.618」= 行ボックスの下端ちょうどへ置くので、
-        // チャンク div の overflow_hidden（#64 の折り返し対策で必須）が丸ごと切り落とす。
-        // ここでは事実だけを固定する: パーサはちゃんと下線と解決していて、
-        // 装飾が次の行へはみ出してもいない。ピクセルの主張は #797 を直した側で入れる
+        // underline（SGR 4）は**モデルに載るだけでなくピクセルにも出る**（#797 で解消）。
+        // 旧実装は GPUI に下線を任せていたため「ベースライン + descent×0.618」=
+        // 行ボックスの下端ちょうどに置かれ、チャンク div の overflow_hidden
+        // （#64 の折り返し対策で必須）が丸ごと切り落としていた
+        // （実測: ink 851 = 素と完全同値 / 下線 1 px の帯 strip 0 / below 0）。
+        // 専用 element は下線を自分で引くので、①素の行より確かにインクが増え
+        // ②下線の帯に出て ③素の行の同じ帯には出ない（= グリフのはみ出しではない）
         check(
             ul_run_flag,
             "visual-test 端末グリッド: SGR 4 がモデルで underline に解決される (#787)",
+        );
+        check(
+            ul_ink > plain_ink && ul_strip >= 40 && plain_strip == 0,
+            "visual-test 端末グリッド: SGR 4 の下線が実ピクセルで描かれる (#797/#787)",
         );
         check(
             ul_below == 0 && plain_below == 0,
@@ -22844,6 +22960,94 @@ mod self_test {
         check(
             rev_bg * 3 >= rev_area,
             "visual-test 端末グリッド: 反転でセル背景が前景色に塗られる (#787)",
+        );
+
+        // ⌘ホバーのリンク下線（#153）も同じ経路なので #797 で一緒に落ちていた疑いが
+        // あった（accent 色 + 背景が付くので気づきにくい）。ここで実ピクセルを固定する。
+        // ホバー状態を直接立てて 1 フレーム描き、素の行との差を見る
+        let link_row = row_of("V7");
+        let link_band = underline_line(attr_bounds("V7"));
+        window
+            .update(cx, |app, _, cx| {
+                app.hovered_link = Some(HoveredLink {
+                    pane: geom.pane,
+                    target: "https://example.com".into(),
+                    kind: tako_core::LinkKind::Url,
+                    spans: vec![(link_row, 3, 7)],
+                });
+                cx.notify();
+            })
+            .ok();
+        let _ = capture_frame(any, cx);
+        let link_hit = capture_frame(any, cx)
+            .map(|(f, _)| {
+                (
+                    ink_pixels_in_bounds(&f, &link_band, scale, geom.background, flip),
+                    color_pixels_in_bounds(&f, link_band, scale, geom.accent, 24, flip),
+                )
+            })
+            .unwrap_or((0, 0));
+        window
+            .update(cx, |app, _, cx| {
+                app.hovered_link = None;
+                cx.notify();
+            })
+            .ok();
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid attrs-link strip={} accent={} plain_strip={plain_strip}",
+            link_hit.0, link_hit.1
+        );
+        check(
+            link_hit.0 >= 40 && link_hit.1 >= 20 && plain_strip == 0,
+            "visual-test 端末グリッド: ⌘ホバーのリンク下線が accent 色で描かれる (#153/#797/#787)",
+        );
+
+        // 行内の縦位置（#787 で変わったところ）: グリフが**セルの内側に収まる**。
+        //
+        // 旧実装は行 div（高さ = セル高 17px）の中で、環境の既定行高（13px × 1.618 ≒
+        // 21px）を基準にベースラインを置いていたため、字が 2px 下にずれ、
+        // ディセンダ（g / j / p / q / y）が行 div の overflow_hidden で切れていた。
+        // 専用 element はセル高そのものを行高としてシェイプするので、
+        // ディセンダまで 1 セルの中に収まる。ここではその不変条件を固定する:
+        // ①ディセンダのインクが素の W より深く伸びる ②それでも行の下端を越えない
+        let desc_bounds = grid_cell_bounds(&geom.area, geom.cell, geom.subline, 3, 5, row_of("VD"));
+        let desc_profile = ink_row_profile(&frame, &desc_bounds, scale, geom.background, flip);
+        let w_profile = ink_row_profile(&frame, &attr_bounds("V7"), scale, geom.background, flip);
+        let deepest = |profile: &[u32]| -> i32 {
+            profile
+                .iter()
+                .rposition(|v| *v > 0)
+                .map(|i| i as i32)
+                .unwrap_or(-1)
+        };
+        let highest = |profile: &[u32]| -> i32 {
+            profile
+                .iter()
+                .position(|v| *v > 0)
+                .map(|i| i as i32)
+                .unwrap_or(-1)
+        };
+        let row_device = (f32::from(geom.cell.height) * scale).round() as i32;
+        let desc_deep = deepest(&desc_profile);
+        let desc_high = highest(&desc_profile);
+        let desc_below = below_band("VD");
+        println!(
+            "TAKO_VISUAL_PIXEL: term-grid rowfit row_device={row_device} \
+             desc=[{desc_high}..{desc_deep}] w=[{}..{}] below={desc_below} \
+             profile={desc_profile:?}",
+            highest(&w_profile),
+            deepest(&w_profile),
+        );
+        check(
+            desc_deep > deepest(&w_profile),
+            "visual-test 端末グリッド: ディセンダが素の字より深く描かれる (#787)",
+        );
+        // 旧実装は desc=[9..33] / row_device=34 = 行の最終デバイス行までインクが詰まって
+        // いた（= overflow_hidden でディセンダが切られていた）。element では
+        // desc=[5..31] で下端に余白が残る。1 px 以上の余白を要求してその差を固定する
+        check(
+            desc_high >= 0 && desc_deep + 2 <= row_device && desc_below == 0,
+            "visual-test 端末グリッド: ディセンダまで 1 セルの内側に収まる（切れていない）(#787)",
         );
         check(
             dim_run_fg.is_some_and(|fg| fg != geom.foreground)
@@ -23339,6 +23543,290 @@ mod self_test {
             let _ = frame_half.save(base.join("term-grid-halfscroll.png"));
             let _ = std::fs::write(base.join("term-grid.txt"), &dump);
         }
+
+        // --- 7.（任意・`TAKO_VISUAL_CLAUDE=1`）実 claude の TUI をこのグリッドで描く ---
+        //
+        // fixture は「こちらが選んだ文字」なので、実務で出る箱罫線・スピナー・
+        // フォールバックフォント混在（`⏺` / `⎿` / `·`）を素通りしてしまう。
+        // ここは**実 claude を起動して**、その画面のすべての非空セルにインクが乗り、
+        // 実描画位置がグリッド算術と一致していることを見る。
+        // claude CLI + 認証が要るので既定ではスキップ（`claude_e2e_enabled` と同格の扱い）
+        if matches!(
+            std::env::var("TAKO_VISUAL_CLAUDE").ok().as_deref(),
+            Some("1" | "true" | "on")
+        ) {
+            press(any, cx, "ctrl-u");
+            type_text(any, cx, "claude", true);
+            let mut ready = false;
+            for _ in 0..80 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let screen = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&geom.pane)
+                            .map(|s| s.visible_lines().join("\n"))
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                if screen.contains("trust this folder") || screen.contains("Yes, I trust") {
+                    press(any, cx, "enter");
+                    continue;
+                }
+                if screen.contains("shift+tab to cycle") {
+                    ready = true;
+                    break;
+                }
+            }
+            check(
+                ready,
+                "visual-test 端末グリッド: 実 claude の TUI が起動する (#787)",
+            );
+            // 日本語 + 記号を含む発話を入力欄に置く（送信はしない = API を消費しない）。
+            // claude の TUI が箱罫線の中へ全角を並べ、フッターにスピナー行を出す
+            type_text(any, cx, "日本語のテスト ⏺ ⎿ │ ─ ✻ mix", false);
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = capture_frame(any, cx);
+            let Some((cframe, cscale)) = capture_frame(any, cx) else {
+                fail("visual-test 端末グリッド: 実 claude フレーム")
+            };
+            let Some(cgeom) = grid_geom(window, cx, Some(geom.pane)) else {
+                fail("visual-test 端末グリッド: 実 claude ジオメトリ")
+            };
+            let mut rows_checked = 0usize;
+            let mut cells_checked = 0usize;
+            let mut missing: Vec<String> = Vec::new();
+            let mut drifts: Vec<i64> = Vec::new();
+            for (row, line) in cgeom.screen.lines.iter().enumerate() {
+                let chars: Vec<char> = line.text.chars().collect();
+                let mut cells: Vec<(usize, usize, char)> = Vec::new();
+                for (i, ch) in chars.iter().enumerate() {
+                    let col = line.cell_cols[i];
+                    let span = line.cell_cols.get(i + 1).copied().unwrap_or(col + 1) - col;
+                    // 空白は「インクが乗らないのが正しい」。実 claude は
+                    // NO-BREAK SPACE（U+00A0）で桁を詰めるので ASCII 空白だけでは足りない
+                    if span > 0 && !ch.is_whitespace() {
+                        cells.push((col, span, *ch));
+                    }
+                }
+                if cells.is_empty() {
+                    continue;
+                }
+                rows_checked += 1;
+                cells_checked += cells.len();
+                for &(col, span, ch) in &cells {
+                    let bounds =
+                        grid_cell_bounds(&cgeom.area, cgeom.cell, cgeom.subline, col, span, row);
+                    let ink =
+                        ink_pixels_in_bounds(&cframe, &bounds, cscale, cgeom.background, flip);
+                    if ink < 2 {
+                        missing.push(format!("{ch:?}@{row}:{col}"));
+                    }
+                }
+                // インクが乗り得る最終列。グリフだけでなく**背景つきのセル**も数える
+                // （claude の入力行はテキストの右にブロックカーソルを置くので、
+                //  グリフの最終列だけで見ると必ず 1 セルはみ出して見える）
+                let last_col = cells
+                    .iter()
+                    .map(|&(c, s, _)| c + s)
+                    .chain(
+                        line.runs
+                            .iter()
+                            .filter(|r| r.bg.is_some())
+                            .filter_map(|r| run_cols(line, r).map(|(_, end)| end)),
+                    )
+                    .max()
+                    .unwrap_or(0);
+                let drawn_last = (0..cgeom.screen.cols).rev().find(|&col| {
+                    let b = grid_cell_bounds(&cgeom.area, cgeom.cell, cgeom.subline, col, 1, row);
+                    ink_pixels_in_bounds(&cframe, &b, cscale, cgeom.background, flip) >= 2
+                });
+                if let Some(drawn) = drawn_last {
+                    let drift = drawn as i64 - (last_col as i64 - 1);
+                    if drift != 0 {
+                        // ずれた行は文字ごと出す（どのグリフが原因か切り分けるため）
+                        println!(
+                            "TAKO_VISUAL_PIXEL:   claude drift row={row} drift={drift} \
+                             last_col={last_col} drawn={drawn} text={:?}",
+                            line.text.trim_end()
+                        );
+                    }
+                    drifts.push(drift);
+                }
+            }
+            // 左へ詰まる（負の）ずれは #798 そのものなので許さない。右へ 1 セルだけ
+            // 許すのは、セル幅より広い実 advance のグリフが**切られずに**描かれる余地
+            // （旧実装は個別 div の overflow_hidden で切っていた）。実測は 0
+            let worst_left = drifts.iter().copied().min().unwrap_or(0);
+            let worst_right = drifts.iter().copied().max().unwrap_or(0);
+            println!(
+                "TAKO_VISUAL_PIXEL: term-grid claude rows={rows_checked} cells={cells_checked} \
+                 missing={} drift_left={worst_left} drift_right={worst_right} sample={:?}",
+                missing.len(),
+                missing.iter().take(6).collect::<Vec<_>>(),
+            );
+            check(
+                rows_checked >= 4 && cells_checked >= 40,
+                "visual-test 端末グリッド: 実 claude の画面に検査対象の行がある (#787)",
+            );
+            check(
+                missing.is_empty(),
+                "visual-test 端末グリッド: 実 claude 画面の非空セルが全部塗られている (#787)",
+            );
+            check(
+                worst_left == 0 && worst_right <= 1,
+                "visual-test 端末グリッド: 実 claude 画面でも描画位置が左へ詰まらない (#798/#787)",
+            );
+            if let Some(dir_name) = dump_dir.as_deref() {
+                let _ = cframe.save(std::path::Path::new(dir_name).join("term-grid-claude.png"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端末グリッド描画の 1 フレームあたりコストを測る（#787 / #782 / #786）。
+    ///
+    /// **ディスプレイが消えていても測れる**のが要点。実ウィンドウの表示に頼ると
+    /// GPUI は遮蔽・スリープ中に描画をやめるので（#782 の「無効な計測」条件）、
+    /// ここでは `Window::draw` を自分で回す。1 フレームの内訳（element ツリー構築 +
+    /// taffy レイアウト + ペイント）は実描画とまったく同じ経路。
+    ///
+    /// `TAKO_787_NO_GRID_ELEMENT=1` を付けた同一バイナリの実行と並べれば
+    /// 専用 element（#787）と旧行 div スタックの A/B になる。
+    /// 外から `proc_pid_rusage` で instructions を採れるよう、計測の前後に
+    /// マーカーを出して数秒待つ。
+    #[cfg(feature = "visual-test")]
+    async fn terminal_grid_bench(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let frames: usize = std::env::var("TAKO_GRID_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let dir = std::env::temp_dir().join(format!("tako-grid-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("bench fixture ディレクトリ");
+
+        // 画面を「色付きの実務的な内容」で埋める（#782 / #786 と同じ 4 チャンク / 行）。
+        // `TAKO_GRID_BENCH_FILL` で密度を変える:
+        // - `full`（既定）: 端末幅いっぱいまでインクが乗る最悪ケース
+        // - `sparse`: 実務的な密度（実測 34 セル / 行 = エージェント出力の平均に近い）
+        // - `empty`（`0`）: 空画面。**グリッド以外の固定費**を切り分ける対照
+        let body = match std::env::var("TAKO_GRID_BENCH_FILL").ok().as_deref() {
+            Some("0" | "empty" | "false" | "off") => None,
+            Some("sparse") => Some("-".repeat(22)),
+            _ => Some("-".repeat(100)),
+        };
+        let script = dir.join("fill.sh");
+        let command = match body {
+            None => "clear\n".to_string(),
+            Some(body) => {
+                std::fs::write(
+                    &script,
+                    format!(
+                        "i=0\n\
+                         while [ $i -lt 200 ]; do\n\
+                         printf '\\033[38;2;236;80;40m%04d\\033[0m \
+                         \\033[48;2;24;96;200mBGBG\\033[0m \
+                         \\033[38;5;208mC256\\033[0m %s\\n' \"$i\" '{body}'\n\
+                         i=$((i+1))\n\
+                         done\n"
+                    ),
+                )
+                .expect("bench fixture スクリプト");
+                format!("clear; sh {}\n", script.display())
+            }
+        };
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&app.focused_pane()) {
+                    session.write(command.into_bytes());
+                }
+                cx.notify();
+            })
+            .ok();
+        cx.background_executor()
+            .timer(Duration::from_millis(2500))
+            .await;
+
+        let (pane, cols, rows, inked) = window
+            .update(cx, |app, _, _| {
+                let pane = app.focused_pane();
+                let (cols, rows) = app.terminals.get(&pane).map(|s| s.size()).unwrap_or((0, 0));
+                let inked = app
+                    .terminals
+                    .get(&pane)
+                    .map(|s| {
+                        let screen = s.screen(&app.theme);
+                        let rows = screen
+                            .lines
+                            .iter()
+                            .filter(|l| !l.text.trim().is_empty())
+                            .count();
+                        // 実際に描かれるセル（空白でない文字）の総数。
+                        // 1 セルあたりのコストを出すときの分母
+                        let cells: usize = screen
+                            .lines
+                            .iter()
+                            .map(|l| l.text.chars().filter(|c| *c != ' ').count())
+                            .sum();
+                        (rows, cells)
+                    })
+                    .unwrap_or((0, 0));
+                (pane, cols, rows, inked)
+            })
+            .unwrap_or((PaneId::from_raw(1), 0, 0, (0, 0)));
+
+        // 暖機（グリフ raster / 行レイアウトのキャッシュを埋める）
+        for _ in 0..20 {
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        }
+        println!(
+            "TAKO_GRID_BENCH_READY element={} pane={} size={cols}x{rows} inked_rows={} \
+             inked_cells={} frames={frames}",
+            !crate::terminal_grid::element_disabled(),
+            pane.as_u64(),
+            inked.0,
+            inked.1,
+        );
+        // 外部サンプラー（proc_pid_rusage）が起点を採る余裕
+        cx.background_executor()
+            .timer(Duration::from_millis(3000))
+            .await;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..frames {
+            // PTY 出力と同じ経路でペインを汚す（4ms 合流をまたぐため直前の
+            // notify 時刻を巻き戻す）。汚さないとビューキャッシュ（#786）が当たって
+            // グリッドの描画コストが測れない
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                app.last_term_notify =
+                    std::time::Instant::now() - std::time::Duration::from_secs(1);
+                app.on_term_event(
+                    pane,
+                    tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
+                    cx,
+                );
+            });
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        }
+        let elapsed = t0.elapsed();
+        println!(
+            "TAKO_GRID_BENCH_DONE element={} frames={frames} wall_ms={:.1} \
+             ms_per_frame={:.3} fps_capable={:.1}",
+            !crate::terminal_grid::element_disabled(),
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / frames as f64,
+            frames as f64 / elapsed.as_secs_f64(),
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(3000))
+            .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23377,10 +23865,16 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // 検査ではなく計測（#787）。ディスプレイが消えていても測れる
+                "grid-bench" => {
+                    terminal_grid_bench(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
-                        "TAKO_VISUAL_ONLY: 未知の節 '{other}'\
-                         （使えるのは profiles / chat-table / conflict-card / terminal-grid）"
+                        "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
+                         profiles / chat-table / conflict-card / terminal-grid / grid-bench）"
                     );
                     std::process::exit(1);
                 }
