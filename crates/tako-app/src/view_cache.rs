@@ -24,6 +24,19 @@
 //!
 //! この順序なので「新しく足した状態変化を汚し忘れる」事故が起きない
 //! （明示的に PTY 経路へ載せない限り、全部が従来どおり全体を汚す）。
+//!
+//! ## `cached` は入れ子にできない（#801 の実測）
+//!
+//! GPUI は `AnyView::cached` が**実際に描き直すあいだ** `window.refreshing = true` を
+//! 立てる（gpui `view.rs` の prepaint）。再利用の条件に `!window.refreshing` が
+//! 入っているので、**キャッシュビューの中のキャッシュビューは一度も当たらない**。
+//! ペインヘッダを [`PaneBody`] の内側でさらにキャッシュしても効かないのはこれが理由
+//! （効かせるにはヘッダをペイン枠ごとルート側の兄弟へ持ち上げる必要がある）。
+//!
+//! また `cached` は「汚れていても」得がある: 中身は `layout_as_root` で確定サイズの
+//! 別パスとして解かれるので、ルートの flexbox がその部分木を測り直さない。
+//! 実測では、汚れたペイン本体をキャッシュ無しで出しただけで **+0.86M instr/frame**
+//! 掛かった（119x21・空画面）。「どうせ描き直すから素で出す」は逆効果になる。
 
 use gpui::{
     div, prelude::*, AnyElement, AnyView, Context, Entity, Render, StyleRefinement, Subscription,

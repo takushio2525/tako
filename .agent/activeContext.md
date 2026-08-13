@@ -3,59 +3,63 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-11、Issue #787 端末グリッドの専用 Element 化 = 実装完了・PR 待ち）
+## 現在の対象（2026-08-13、Issue #801 描画の残る固定費 = 実装完了・PR 待ち）
 
-- worktree `~/dev/tako-wt-787` / ブランチ `improve/787-grid-element`
-- ペイン本体の端末グリッドを「行 div + チャンク div のスタック」から
-  **1 個の `Element`（`crates/tako-app/src/terminal_grid.rs`）**へ置き換えた。
-  セルの原点を `col * cell_width` で直接決め、背景は `paint_quad`、
-  グリフは `shape_line(force_width) + ShapedLine::paint`、下線・取り消し線は自前で置く
-- 同時に #797（SGR 4 と ⌘ホバーの下線が 1 px も出ない）と #798（全角の長い連なりで
-  最大 1 セル左へ詰まる）が構造的に解消。visual-test の主張を「直った側」へ更新した
-- 行 div の `terminal_screen_lines` は**残してある**（チャット入力欄のミラー #719 /
-  たまり場サムネイル / タブツリーのホバープレビュー = 行を他要素へ埋め込む用途）
+- worktree `~/dev/tako-wt-801` / ブランチ `improve/801-fixed-frame-cost`
+- #787 完了時点で残っていた**空画面でも毎フレーム掛かる 4.76M instructions** の内訳を
+  段階的無効化ゲートで確定し、支配項（セル単位の変換）を削った
+- 結果（grid-bench・300 フレーム・同一バイナリ A/B・`TAKO_801_NO_FAST_CELLS=1` が before）:
+  空画面 3.587M → **2.197M（−39%）**（バナー無し 119x27）/ 実務密度 −10% / 満杯 −2%。
+  **目標の 1M 未満は未達**（理由は下記の内訳を参照）
 
-## 設計判断（force_width と全角スペーサー）
+## 内訳の実測（空画面 119x21・バナーあり = #787 の 4.76M と同条件）
 
-- `shape_line` の `force_width = cell_width` はグリフ位置をセル境界へスナップするので、
-  advance がセル幅と合わないグリフ（`⏺`・絵文字）の**後続が自動でグリッドへ戻る**。
-  #64 対策の「個別 div へ隔離して overflow_hidden で切る」は不要になった
-- ただし `force_width` は「グリフ 1 個 = 1 セル」を仮定するため、**全角の 2 セル目に
-  スペースを 1 個差し込む**（`shape_segments`）。これでグリフ数と列数が 1:1 に戻る
-- **行高はセル高を渡す**。旧実装は `StyledText` 経由で環境既定行高（13×1.618≒21px）
-  基準にベースラインを置いていたため字が 2px 下へずれ、ディセンダが切れていた。
-  **この 2px はユーザーに見える変化**（PR に明記済み）
+| 部位 | instr/frame |
+|---|---|
+| ウェルカムバナー #549（**初回起動時のみ表示**） | 1.17M |
+| スナップショット + `plan_row` + グリッド element | 1.76M ← ここを削った |
+| ペインヘッダ | 0.81M ← `cached` が入れ子にできず塞がっている |
+| クローム 4 枚の cached 再利用 | 0.46M |
+| ルートの箱・ペイン枠・プローブ等 | 0.41M |
+| gpui のフレーム下限（ルートが空 div） | 0.16M |
 
-## 検証状況（すべて隔離・本番 pid 1099 は全計測の前後で生存）
+## 今回の実装（`TAKO_801_NO_FAST_CELLS=1` で一括 off）
 
-- 品質ゲート: fmt / clippy(-D warnings、feature なし + visual-test 付き) / test 1935 件 全緑 /
-  Windows クロスチェック エラー 0・警告 16 = main と同数
-- visual-test `terminal-grid` 節 3 連続 OK（検査 22 行）。全節は 6 回中 4 回完走、
-  落ちた 2 回は **PDF 文字矩形の paint**（`wait_for_preview_maps` の実時間待ち）。
-  **素の main（a071852）でも 3 回中 2 回同じ項目で落ちる**ことを実測 = main 由来（#796）
-- 隔離セルフテスト **完走**（`TAKO_APP_SELF_TEST_OK` / exit 0）。SKIPPED は 76d / 104 の
-  2 件のみ = #786 と同じ既知の環境要因（ウィンドウ非前面）
-- 実 claude（`TAKO_VISUAL_CLAUDE=1`）: 13 行 523 セルで missing 0 / drift 左右とも 0
-- 性能（同一バイナリ A/B・`TAKO_787_NO_GRID_ELEMENT=1` が before）:
-  満杯 15.59M → 8.68M / 実務密度 15.68M → 6.42M instr/frame。**ライブ画面の CPU% は
-  ディスプレイが消えていて測れず**、`Window::draw` を自前で回す `grid-bench` で代替
+- `tako_core::screen::snapshot_opts`: 素の空白セル（半角スペース + フラグ無し + 既定色）は
+  `grid` の初期値と同じ結果になるので解決も書き込みもしない。1 セルも書かれなかった行は
+  `compose_line` を 1 本だけ組んで複製する
+- `tako_app::terminal_grid::plan_row`: 描くものが無い行は `RowPlan::default()` を即返す。
+  残る行も `Rgb -> Hsla` を**ラン単位**へ（旧: セルごと = 空画面でも毎フレーム 2,499 回）
+- `render_pane` からタイトルバーを `render_pane_header` へ切り出し（ヘッダを
+  キャッシュ単位へ持ち上げる後続作業の準備。今回は**キャッシュしていない**）
+
+## 見つけた制約（後続作業の前提。architecture.md に記載済み）
+
+- **`AnyView::cached` は入れ子にできない**: GPUI はキャッシュビューを描き直すあいだ
+  `window.refreshing = true` を立て、再利用条件に `!refreshing` が入っている。
+  ペインヘッダを `PaneBody` の内側でキャッシュしても一度も当たらない（実測で確認）
+- **`cached` は汚れていても得**: 中身が `layout_as_root` の別パスになるので、ルートの
+  flexbox が部分木を測り直さない。「どうせ描き直すから素で出す」は **+0.86M** の逆効果
+- → ヘッダ 0.81M を取るには**ペイン枠ごとルート側へ持ち上げる**必要がある（丸め角の
+  クリップを崩さないこと。visual-test の `terminal-grid` が見張る）
 
 ## 不変条件
 
-- `pane_text_areas` の算術が正（PTY 行数・マウス座標・IME の共通の正）。element の
-  矩形はその原点と一致させる（visual-test の `drift_gap <= 0.5` が見張り）
-- サブラインスクロールは「行スタック全体を fract 行ぶん上へ + extra_bottom で下端を埋める」
-- 空白セルはグリフを描かないが、**背景・下線・カーソルは別の層が描く**。
-  「空白だから何もしない」をグリフ以外へ広げない
+- 空白セルの近道を**属性へ広げない**（下線・反転・DIM・明示背景色・全角スペーサーは
+  空白でも見える / 列数がずれる）。判定は「フラグが 1 つも立っていない」が必要条件
+- 既定色が OSC 4 / 11 で差し替えられている場合は近道を使わない（判定はループの外で 1 回）
+- ⌘ホバーのリンク装飾は空白セルにも掛かるので、リンクのある行は早期打ち切りの対象外
 
 ## 次の手順
 
-1. PR（`Closes #787` / `Closes #797` / `Closes #798`）→ macOS CI 全ジョブ緑 → squash merge
+1. PR（`Closes #801`）→ macOS CI 全ジョブ緑 → squash merge
 2. `scripts/build-app.sh --install`（GUI 再起動は master 側）
-3. 残る 1 フレーム 4.76M の固定費は**グリッドではない**（空画面でも掛かる）= #786 の残り。
-   別 Issue にするかは master 判断
+3. 残件を Issue 化するかは master 判断: ペインヘッダの持ち上げ（0.81M）/
+   ウェルカムバナー（1.17M・初回のみ）
 
 ## 現フェーズで Read すべき設計書
 
-- 描画: `.agent/architecture.md`「端末グリッドの専用 Element」「ビュー単位の描画キャッシュ」
-- 実装: `crates/tako-app/src/terminal_grid.rs`（モジュール冒頭に方式と踏み抜きどころ）
+- 描画: `.agent/architecture.md`「ビュー単位の描画キャッシュ」「端末グリッドの専用 Element」
+  「空白セルの近道」
+- 実装: `crates/tako-core/src/screen.rs`（`is_plain_blank`）/
+  `crates/tako-app/src/terminal_grid.rs`（`row_draws_nothing` / `RunStyle`）

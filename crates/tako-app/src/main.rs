@@ -13760,6 +13760,638 @@ impl TakoApp {
     /// テキスト領域（`area`）とフォーカス状態は `TakoApp::render` が毎フレーム更新した
     /// `pane_text_areas` / ペインツリーから引く。ルートの render は必ず走るので、
     /// このビューが描かれる時点では両方とも最新になっている
+    /// master ペインの子ワーカー一覧（`spawned_by` チェーン。全タブ走査）。
+    /// ヘッダの `workers ▾` チップとそのドロップダウンが同じ材料を使う
+    fn collect_worker_rows(&self, pane_id: PaneId) -> Vec<WorkerRow> {
+        self.workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .filter(|p| p.spawned_by() == Some(pane_id))
+            .map(|p| {
+                let name = p
+                    .role()
+                    .or_else(|| p.title())
+                    .unwrap_or("worker")
+                    .to_string();
+                let subtitle = p
+                    .title()
+                    .map(str::to_string)
+                    .filter(|t| *t != name)
+                    .unwrap_or_default();
+                let st = self
+                    .terminals
+                    .get(&p.id())
+                    .map(|s| s.command_state())
+                    .unwrap_or(tako_core::CommandState::Unknown);
+                WorkerRow {
+                    pane: p.id(),
+                    name,
+                    subtitle,
+                    state: st,
+                }
+            })
+            .collect()
+    }
+
+    /// ペインのタイトルバー（#801 で [`Self::render_pane`] から切り出し）。
+    ///
+    /// ここに出るもの（タイトル・role・状態ドット・番号・cwd・workers）は
+    /// **PTY の出力では変わらない**ので、本来は独立したキャッシュ単位にしたい
+    /// （実測 0.62M instr/frame）。ただし GPUI の `AnyView::cached` は入れ子にできない
+    /// （`view_cache` のモジュールコメント参照）ため、ペイン本体をキャッシュ単位に
+    /// したまま**この中で**キャッシュしても一度も当たらない。切り出しは、
+    /// ヘッダをペイン枠ごとルート側へ持ち上げる後続作業のための準備でもある
+    fn render_pane_header(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        let Some(area) = self
+            .pane_text_areas
+            .iter()
+            .find(|(p, _)| *p == pane_id)
+            .map(|(_, b)| *b)
+        else {
+            return div().into_any_element();
+        };
+        let focused = self
+            .workspace
+            .find_tab_of_pane(pane_id)
+            .and_then(|t| self.workspace.get_tab(t))
+            .is_some_and(|tab| tab.tree().focused() == pane_id);
+        // タイトルとロールを分離取得（ロールは独立バッジとして表示）
+        let pane_info = self.workspace.active_tab().tree().get(pane_id);
+        let pane_title = pane_info.and_then(|p| p.title().map(str::to_string));
+        let pane_role = pane_info.and_then(|p| p.role().map(str::to_string));
+        let title_label = pane_title
+            .or_else(|| pane_role.clone())
+            .or_else(|| {
+                self.terminals
+                    .get(&pane_id)
+                    .and_then(|s| s.title())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().to_string());
+        // role ラベル（カンプ: バッジではなく素のテキスト 9.5px 600 tracking 0.06em）
+        let is_master = pane_role.as_deref().is_some_and(|r| {
+            r.contains("orchestrator-master") || r == "master" || r.starts_with("master:")
+        });
+        let is_worker = pane_role
+            .as_deref()
+            .is_some_and(|r| r.contains("orchestrator-worker") || r.starts_with("worker"));
+        let role_label = pane_role.as_deref().map(|r| {
+            if is_master {
+                ("ORCH".to_string(), theme.accent)
+            } else if is_worker {
+                ("WORKER".to_string(), theme.teal)
+            } else {
+                (
+                    r.split(':').next().unwrap_or(r).to_uppercase(),
+                    theme.text_tertiary,
+                )
+            }
+        });
+        let (state_dot, state_label) = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| match s.command_state() {
+                tako_core::CommandState::Failed(_) => (Some(theme.red), Some("failed")),
+                tako_core::CommandState::Running => (Some(theme.accent), Some("running")),
+                tako_core::CommandState::Idle => (Some(theme.green), Some("idle")),
+                tako_core::CommandState::Unknown => (None, None),
+            })
+            .unwrap_or((None, None));
+        let is_failed = matches!(state_label, Some("failed"));
+        // 稼働時間（カンプ: running · 4m12s。OSC 133 の状態遷移からの経過）
+        let state_elapsed = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|s| s.command_state_since())
+            .map(|t| format_state_elapsed(t.elapsed()));
+        // ペイン番号（カンプ: 17×17 バッジ。タブ内の表示順で 1 始まり）
+        let pane_index = self
+            .workspace
+            .active_tab()
+            .tree()
+            .panes()
+            .iter()
+            .position(|p| p.id() == pane_id)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // cwd チップ（カンプ: ~/projects/tako。クリックでコピー)
+        let cwd_display = self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
+            let full = p.to_string_lossy().to_string();
+            let home = std::env::var("HOME").unwrap_or_default();
+            let short = if !home.is_empty() && full.starts_with(&home) {
+                format!("~{}", &full[home.len()..])
+            } else {
+                full.clone()
+            };
+            (short, full)
+        });
+        // master: 子ワーカー一覧（spawned_by チェーン。全タブ走査）
+        let workers: Vec<WorkerRow> = if is_master {
+            self.collect_worker_rows(pane_id)
+        } else {
+            Vec::new()
+        };
+        // worker: 親 master へのリンク（↳ master）
+        let parent_master = pane_info.and_then(|p| p.spawned_by()).and_then(|parent| {
+            self.workspace
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .find(|p| p.id() == parent)
+                .map(|p| {
+                    (
+                        parent,
+                        p.role()
+                            .or_else(|| p.title())
+                            .unwrap_or("master")
+                            .to_string(),
+                    )
+                })
+        });
+        // #185 見切れ解消: 幅に応じた段階的省略。× は最後まで必ず残す
+        let header_w = f32::from(area.size.width);
+        let hv = tako_core::HeaderVisibility::from_width(header_w);
+        div()
+            .id(("pane-titlebar", pane_id.as_u64()))
+            .h(px(PANE_TITLE_BAR))
+            .flex_none()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .bg(rgba(if is_failed {
+                // カンプ: 失敗ペインのヘッダは赤みの面（#241b26）
+                theme.danger_header
+            } else if focused {
+                theme.surface_2
+            } else {
+                theme.surface_0
+            }))
+            .border_b_1()
+            .border_color(if is_failed {
+                hsla_alpha(theme.red, 0.25)
+            } else if focused {
+                hsla(theme.border_default)
+            } else {
+                hsla(theme.border_subtle)
+            })
+            .text_size(px(11.0))
+            .text_color(hsla(theme.tab_inactive_foreground))
+            .cursor(CursorStyle::OpenHand)
+            .on_drag(
+                PaneDrag { pane: pane_id },
+                self.drag_ghost_builder(DragKind::Pane, truncate(&title_label, 24), cx),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.workspace
+                        .active_tab_mut()
+                        .tree_mut()
+                        .focus(pane_id)
+                        .ok();
+                    cx.notify();
+                }),
+            )
+            // #185: ペインヘッダ右クリックメニュー
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.pane_context_menu = Some(PaneContextMenu {
+                        pane: pane_id,
+                        kind: PaneContextKind::Terminal,
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
+            // #185: 左コンテナ（情報要素、flex_1 + overflow_hidden）
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    // ペイン番号バッジ（カンプ: 17x17 / radius 5 / mono 10px 700）
+                    .when(hv.badge && pane_index > 0, |d| {
+                        let (badge_bg, badge_fg) = if is_failed {
+                            (rgba_alpha(theme.red, 0.16), theme.red)
+                        } else if focused {
+                            (rgba_alpha(theme.accent, 0.16), theme.accent)
+                        } else {
+                            (rgba_alpha(theme.accent, 0.10), theme.accent_muted)
+                        };
+                        d.child(
+                            div()
+                                .w(px(17.0))
+                                .h(px(17.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.0))
+                                .bg(badge_bg)
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hsla(badge_fg))
+                                .child(SharedString::from(pane_index.to_string())),
+                        )
+                    })
+                    // ペイン名（カンプ: mono 12px 600）
+                    .when(hv.title, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_family(theme.font_family.clone())
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_color(if focused {
+                                    hsla(theme.foreground)
+                                } else {
+                                    hsla(theme.text_secondary)
+                                })
+                                .child(SharedString::from(truncate(&title_label, 40))),
+                        )
+                    })
+                    // role ラベル（カンプ: 素のテキスト 9.5px 600 tracking 0.06em）
+                    .when(hv.role, |d| {
+                        d.children(role_label.map(|(label, color)| {
+                            div()
+                                .flex_none()
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(color))
+                                .child(SharedString::from(label))
+                        }))
+                    })
+                    // master: 「N workers ▾」ドロップダウンボタン
+                    .when(
+                        hv.workers_dropdown && is_master && !workers.is_empty(),
+                        |d| {
+                            let n = workers.len();
+                            d.child(
+                                div()
+                                    .id(("pane-workers", pane_id.as_u64()))
+                                    .flex()
+                                    .flex_none()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .px(px(8.0))
+                                    .py(px(3.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgba(theme.chip_surface))
+                                    .border_1()
+                                    .border_color(hsla(theme.border_heavy))
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(hsla(theme.text_tertiary))
+                                    .cursor_pointer()
+                                    .hover(|d| {
+                                        d.text_color(hsla(theme.foreground))
+                                            .border_color(hsla(theme.text_overlay))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.workers_menu_open =
+                                            if this.workers_menu_open == Some(pane_id) {
+                                                None
+                                            } else {
+                                                Some(pane_id)
+                                            };
+                                        cx.notify();
+                                    }))
+                                    .child(SharedString::from(format!("{n} workers")))
+                                    .child(
+                                        svg()
+                                            .path(crate::file_icons::ui_icon::CHEVRON_DOWN)
+                                            .w(px(9.0))
+                                            .h(px(9.0))
+                                            .text_color(hsla(theme.text_tertiary)),
+                                    ),
+                            )
+                        },
+                    )
+                    // worker: 「↳ master」親リンク
+                    .when(hv.parent_link, |d| {
+                        d.children(parent_master.clone().map(|(parent_id, parent_name)| {
+                            div()
+                                .id(("pane-parent", pane_id.as_u64()))
+                                .flex_none()
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_muted))
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(hsla(theme.accent)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.jump_to_pane(parent_id, cx);
+                                }))
+                                .child(SharedString::from(format!(
+                                    "\u{21B3} {}",
+                                    truncate(&parent_name, 16)
+                                )))
+                        }))
+                    })
+                    // 状態表示（ドット + running · 4m12s / fail_x + failed）
+                    .when(hv.state && is_failed, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(5.0))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.red))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::FAIL_X)
+                                        .w(px(11.0))
+                                        .h(px(11.0))
+                                        .text_color(hsla(theme.red)),
+                                )
+                                .child("failed"),
+                        )
+                    })
+                    .when(hv.state && !is_failed, |d| {
+                        d.children(state_dot.map(|color| {
+                            let label = match (state_label, &state_elapsed) {
+                                (Some("running"), Some(el)) if hv.state_elapsed => {
+                                    format!("running \u{00B7} {el}")
+                                }
+                                (Some("running"), _) => "running".to_string(),
+                                (Some(l), _) => l.to_string(),
+                                (None, _) => String::new(),
+                            };
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(5.0))
+                                .text_size(px(10.5))
+                                .text_color(if state_label == Some("running") {
+                                    hsla(theme.accent)
+                                } else {
+                                    hsla(theme.text_muted)
+                                })
+                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(hsla(color)))
+                                .child(SharedString::from(label))
+                        }))
+                    })
+                    // cwd チップ（カンプ: mono 10.5 / chip 面 / クリックでコピー）
+                    .when(hv.cwd_chip, |d| {
+                        d.children(cwd_display.map(|(short, full)| {
+                            div()
+                                .id(("pane-cwd", pane_id.as_u64()))
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(rgba(theme.chip_surface))
+                                .border_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(theme.text_muted))
+                                .cursor_pointer()
+                                .hover(|d| {
+                                    d.text_color(hsla(theme.text_tertiary))
+                                        .border_color(hsla(theme.border_heavy))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        full.clone(),
+                                    ));
+                                }))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::FOLDER)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .text_color(hsla(theme.text_muted)),
+                                )
+                                .child(SharedString::from(truncate(&short, 28)))
+                        }))
+                    })
+                    // ターミナル情報（シェル名 · cols x rows）
+                    .when(hv.shell_info, |d| {
+                        // #801: グリッド寸法はセッションから読む（`render_pane` が
+                        // ヘッダを組む前に実寸へ resize 済み）。ウィンドウリサイズは
+                        // gpui が `refresh()` するのでキャッシュ越しでも古びない
+                        let (cols, rows) = self
+                            .terminals
+                            .get(&pane_id)
+                            .map(|s| s.size())
+                            .unwrap_or((0, 0));
+                        let shell_name = self
+                            .terminals
+                            .get(&pane_id)
+                            .and_then(|s| s.title())
+                            .unwrap_or("zsh");
+                        let shell_short = shell_name.rsplit('/').next().unwrap_or(shell_name);
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.5))
+                                .font_family(theme.font_family.clone())
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(format!(
+                                    "{shell_short} \u{00B7} {cols}\u{00D7}{rows}"
+                                ))),
+                        )
+                    }),
+            )
+            // #185: 右コンテナ（操作ボタン、flex_none — 常に表示）
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    // split ボタン（カンプ: 13px SVG）
+                    .when(hv.split_button, |d| {
+                        d.child(
+                            div()
+                                .id(("pane-split", pane_id.as_u64()))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.split_pane_button(pane_id, SplitDirection::Right, cx);
+                                }))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::SPLIT)
+                                        .w(px(13.0))
+                                        .h(px(13.0))
+                                        .text_color(hsla(theme.text_muted)),
+                                ),
+                        )
+                    })
+                    // バックグラウンドボタン
+                    .when(hv.bg_button, |d| {
+                        d.child(
+                            div()
+                                .id(("pane-bg", pane_id.as_u64()))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.background_pane_button(pane_id, cx);
+                                }))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::MINUS)
+                                        .w(px(13.0))
+                                        .h(px(13.0))
+                                        .text_color(hsla(theme.text_muted)),
+                                ),
+                        )
+                    })
+                    // #229: 狭幅時は「...」メニューに bg/close を集約
+                    .when(hv.more_menu, |d| {
+                        d.child(
+                            div()
+                                .id(("pane-more", pane_id.as_u64()))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.pane_context_menu = Some(PaneContextMenu {
+                                            pane: pane_id,
+                                            kind: PaneContextKind::Terminal,
+                                            position: event.position,
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::MORE)
+                                        .w(px(13.0))
+                                        .h(px(13.0))
+                                        .text_color(hsla(theme.text_muted)),
+                                ),
+                        )
+                    })
+                    // 閉じるボタン（more_menu でないとき表示。hover で赤）
+                    .when(hv.close_button, |d| {
+                        d.child(
+                            div()
+                                .id(("pane-close", pane_id.as_u64()))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgba_alpha(theme.red, 0.25)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, event: &gpui::ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_pane_with_confirm(
+                                            pane_id,
+                                            event.modifiers().platform,
+                                            CloseOrigin::PaneButton,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::CLOSE)
+                                        .w(px(13.0))
+                                        .h(px(13.0))
+                                        .text_color(hsla(theme.text_muted)),
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
     fn render_pane_body(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.pane_body_renders = self.pane_body_renders.saturating_add(1);
         let Some(area) = self
@@ -13907,131 +14539,20 @@ impl TakoApp {
             tako_core::ui_mode::PaneDisplay::Terminal => {}
         }
 
-        // タイトルとロールを分離取得（ロールは独立バッジとして表示）
-        let pane_info = self.workspace.active_tab().tree().get(pane_id);
-        let pane_title = pane_info.and_then(|p| p.title().map(str::to_string));
-        let pane_role = pane_info.and_then(|p| p.role().map(str::to_string));
-        let title_label = pane_title
-            .or_else(|| pane_role.clone())
-            .or_else(|| {
-                self.terminals
-                    .get(&pane_id)
-                    .and_then(|s| s.title())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| crate::ui_text::common::terminal_fallback_title().to_string());
-        // role ラベル（カンプ: バッジではなく素のテキスト 9.5px 600 tracking 0.06em）
-        let is_master = pane_role.as_deref().is_some_and(|r| {
-            r.contains("orchestrator-master") || r == "master" || r.starts_with("master:")
-        });
-        let is_worker = pane_role
-            .as_deref()
-            .is_some_and(|r| r.contains("orchestrator-worker") || r.starts_with("worker"));
-        let role_label = pane_role.as_deref().map(|r| {
-            if is_master {
-                ("ORCH".to_string(), theme.accent)
-            } else if is_worker {
-                ("WORKER".to_string(), theme.teal)
-            } else {
-                (
-                    r.split(':').next().unwrap_or(r).to_uppercase(),
-                    theme.text_tertiary,
-                )
-            }
-        });
-        let (state_dot, state_label) = self
-            .terminals
-            .get(&pane_id)
-            .map(|s| match s.command_state() {
-                tako_core::CommandState::Failed(_) => (Some(theme.red), Some("failed")),
-                tako_core::CommandState::Running => (Some(theme.accent), Some("running")),
-                tako_core::CommandState::Idle => (Some(theme.green), Some("idle")),
-                tako_core::CommandState::Unknown => (None, None),
-            })
-            .unwrap_or((None, None));
-        let is_failed = matches!(state_label, Some("failed"));
-        // 稼働時間（カンプ: running · 4m12s。OSC 133 の状態遷移からの経過）
-        let state_elapsed = self
-            .terminals
-            .get(&pane_id)
-            .and_then(|s| s.command_state_since())
-            .map(|t| format_state_elapsed(t.elapsed()));
-        // ペイン番号（カンプ: 17×17 バッジ。タブ内の表示順で 1 始まり）
-        let pane_index = self
-            .workspace
-            .active_tab()
-            .tree()
-            .panes()
-            .iter()
-            .position(|p| p.id() == pane_id)
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        // cwd チップ（カンプ: ~/projects/tako。クリックでコピー)
-        let cwd_display = self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
-            let full = p.to_string_lossy().to_string();
-            let home = std::env::var("HOME").unwrap_or_default();
-            let short = if !home.is_empty() && full.starts_with(&home) {
-                format!("~{}", &full[home.len()..])
-            } else {
-                full.clone()
-            };
-            (short, full)
-        });
-        // master: 子ワーカー一覧（spawned_by チェーン。全タブ走査）
-        let workers: Vec<WorkerRow> = if is_master {
-            self.workspace
-                .tabs()
-                .iter()
-                .flat_map(|t| t.tree().panes())
-                .filter(|p| p.spawned_by() == Some(pane_id))
-                .map(|p| {
-                    let name = p
-                        .role()
-                        .or_else(|| p.title())
-                        .unwrap_or("worker")
-                        .to_string();
-                    let subtitle = p
-                        .title()
-                        .map(str::to_string)
-                        .filter(|t| *t != name)
-                        .unwrap_or_default();
-                    let st = self
-                        .terminals
-                        .get(&p.id())
-                        .map(|s| s.command_state())
-                        .unwrap_or(tako_core::CommandState::Unknown);
-                    WorkerRow {
-                        pane: p.id(),
-                        name,
-                        subtitle,
-                        state: st,
-                    }
-                })
-                .collect()
+        // タイトルバーは `render_pane_header` へ切り出してある（#801）。
+        // ここで先に採るのはヘッダの**外**でも要るものだけ:
+        // 枠の色・影（is_failed）と、ヘッダの下に重ねるドロップダウン（workers）
+        let is_failed = matches!(
+            self.terminals.get(&pane_id).map(|s| s.command_state()),
+            Some(tako_core::CommandState::Failed(_))
+        );
+        let workers_menu_open = self.workers_menu_open == Some(pane_id);
+        let workers: Vec<WorkerRow> = if workers_menu_open {
+            self.collect_worker_rows(pane_id)
         } else {
             Vec::new()
         };
-        // worker: 親 master へのリンク（↳ master）
-        let parent_master = pane_info.and_then(|p| p.spawned_by()).and_then(|parent| {
-            self.workspace
-                .tabs()
-                .iter()
-                .flat_map(|t| t.tree().panes())
-                .find(|p| p.id() == parent)
-                .map(|p| {
-                    (
-                        parent,
-                        p.role()
-                            .or_else(|| p.title())
-                            .unwrap_or("master")
-                            .to_string(),
-                    )
-                })
-        });
-        let workers_menu_open = self.workers_menu_open == Some(pane_id);
-        // #185 見切れ解消: 幅に応じた段階的省略。× は最後まで必ず残す
-        let header_w = f32::from(area.size.width);
-        let hv = tako_core::HeaderVisibility::from_width(header_w);
+        let header = self.render_pane_header(pane_id, cx);
 
         // スクロールバー（FR-2.5.13）: iTerm2 流にスクロール中だけ表示 → フェードアウト。
         // バックエンドペインは tmux 側（ネスト先含む）の位置・履歴を表示する
@@ -14143,491 +14664,7 @@ impl TakoApp {
                     this.on_pane_scroll(pane_id, event, window, cx);
                 }),
             )
-            .child(
-                div()
-                    .id(("pane-titlebar", pane_id.as_u64()))
-                    .h(px(PANE_TITLE_BAR))
-                    .flex_none()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .bg(rgba(if is_failed {
-                        // カンプ: 失敗ペインのヘッダは赤みの面（#241b26）
-                        theme.danger_header
-                    } else if focused {
-                        theme.surface_2
-                    } else {
-                        theme.surface_0
-                    }))
-                    .border_b_1()
-                    .border_color(if is_failed {
-                        hsla_alpha(theme.red, 0.25)
-                    } else if focused {
-                        hsla(theme.border_default)
-                    } else {
-                        hsla(theme.border_subtle)
-                    })
-                    .text_size(px(11.0))
-                    .text_color(hsla(theme.tab_inactive_foreground))
-                    .cursor(CursorStyle::OpenHand)
-                    .on_drag(
-                        PaneDrag { pane: pane_id },
-                        self.drag_ghost_builder(DragKind::Pane, truncate(&title_label, 24), cx),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.workspace
-                                .active_tab_mut()
-                                .tree_mut()
-                                .focus(pane_id)
-                                .ok();
-                            cx.notify();
-                        }),
-                    )
-                    // #185: ペインヘッダ右クリックメニュー
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.pane_context_menu = Some(PaneContextMenu {
-                                pane: pane_id,
-                                kind: PaneContextKind::Terminal,
-                                position: event.position,
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    // #185: 左コンテナ（情報要素、flex_1 + overflow_hidden）
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            // ペイン番号バッジ（カンプ: 17x17 / radius 5 / mono 10px 700）
-                            .when(hv.badge && pane_index > 0, |d| {
-                                let (badge_bg, badge_fg) = if is_failed {
-                                    (rgba_alpha(theme.red, 0.16), theme.red)
-                                } else if focused {
-                                    (rgba_alpha(theme.accent, 0.16), theme.accent)
-                                } else {
-                                    (rgba_alpha(theme.accent, 0.10), theme.accent_muted)
-                                };
-                                d.child(
-                                    div()
-                                        .w(px(17.0))
-                                        .h(px(17.0))
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(5.0))
-                                        .bg(badge_bg)
-                                        .font_family(theme.font_family.clone())
-                                        .text_size(px(10.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(hsla(badge_fg))
-                                        .child(SharedString::from(pane_index.to_string())),
-                                )
-                            })
-                            // ペイン名（カンプ: mono 12px 600）
-                            .when(hv.title, |d| {
-                                d.child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .font_family(theme.font_family.clone())
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .min_w(px(0.0))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_color(if focused {
-                                            hsla(theme.foreground)
-                                        } else {
-                                            hsla(theme.text_secondary)
-                                        })
-                                        .child(SharedString::from(truncate(&title_label, 40))),
-                                )
-                            })
-                            // role ラベル（カンプ: 素のテキスト 9.5px 600 tracking 0.06em）
-                            .when(hv.role, |d| {
-                                d.children(role_label.map(|(label, color)| {
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(9.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(hsla(color))
-                                        .child(SharedString::from(label))
-                                }))
-                            })
-                            // master: 「N workers ▾」ドロップダウンボタン
-                            .when(
-                                hv.workers_dropdown && is_master && !workers.is_empty(),
-                                |d| {
-                                    let n = workers.len();
-                                    d.child(
-                                        div()
-                                            .id(("pane-workers", pane_id.as_u64()))
-                                            .flex()
-                                            .flex_none()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap(px(4.0))
-                                            .px(px(8.0))
-                                            .py(px(3.0))
-                                            .rounded(px(6.0))
-                                            .bg(rgba(theme.chip_surface))
-                                            .border_1()
-                                            .border_color(hsla(theme.border_heavy))
-                                            .text_size(px(10.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(hsla(theme.text_tertiary))
-                                            .cursor_pointer()
-                                            .hover(|d| {
-                                                d.text_color(hsla(theme.foreground))
-                                                    .border_color(hsla(theme.text_overlay))
-                                            })
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                    cx.stop_propagation()
-                                                }),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.workers_menu_open =
-                                                    if this.workers_menu_open == Some(pane_id) {
-                                                        None
-                                                    } else {
-                                                        Some(pane_id)
-                                                    };
-                                                cx.notify();
-                                            }))
-                                            .child(SharedString::from(format!("{n} workers")))
-                                            .child(
-                                                svg()
-                                                    .path(crate::file_icons::ui_icon::CHEVRON_DOWN)
-                                                    .w(px(9.0))
-                                                    .h(px(9.0))
-                                                    .text_color(hsla(theme.text_tertiary)),
-                                            ),
-                                    )
-                                },
-                            )
-                            // worker: 「↳ master」親リンク
-                            .when(hv.parent_link, |d| {
-                                d.children(parent_master.clone().map(|(parent_id, parent_name)| {
-                                    div()
-                                        .id(("pane-parent", pane_id.as_u64()))
-                                        .flex_none()
-                                        .font_family(theme.font_family.clone())
-                                        .text_size(px(10.5))
-                                        .text_color(hsla(theme.text_muted))
-                                        .cursor_pointer()
-                                        .hover(|d| d.text_color(hsla(theme.accent)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.jump_to_pane(parent_id, cx);
-                                        }))
-                                        .child(SharedString::from(format!(
-                                            "\u{21B3} {}",
-                                            truncate(&parent_name, 16)
-                                        )))
-                                }))
-                            })
-                            // 状態表示（ドット + running · 4m12s / fail_x + failed）
-                            .when(hv.state && is_failed, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .flex_none()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(5.0))
-                                        .text_size(px(10.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(hsla(theme.red))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::FAIL_X)
-                                                .w(px(11.0))
-                                                .h(px(11.0))
-                                                .text_color(hsla(theme.red)),
-                                        )
-                                        .child("failed"),
-                                )
-                            })
-                            .when(hv.state && !is_failed, |d| {
-                                d.children(state_dot.map(|color| {
-                                    let label = match (state_label, &state_elapsed) {
-                                        (Some("running"), Some(el)) if hv.state_elapsed => {
-                                            format!("running \u{00B7} {el}")
-                                        }
-                                        (Some("running"), _) => "running".to_string(),
-                                        (Some(l), _) => l.to_string(),
-                                        (None, _) => String::new(),
-                                    };
-                                    div()
-                                        .flex()
-                                        .flex_none()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(5.0))
-                                        .text_size(px(10.5))
-                                        .text_color(if state_label == Some("running") {
-                                            hsla(theme.accent)
-                                        } else {
-                                            hsla(theme.text_muted)
-                                        })
-                                        .child(
-                                            div()
-                                                .w(px(6.0))
-                                                .h(px(6.0))
-                                                .rounded_full()
-                                                .bg(hsla(color)),
-                                        )
-                                        .child(SharedString::from(label))
-                                }))
-                            })
-                            // cwd チップ（カンプ: mono 10.5 / chip 面 / クリックでコピー）
-                            .when(hv.cwd_chip, |d| {
-                                d.children(cwd_display.map(|(short, full)| {
-                                    div()
-                                        .id(("pane-cwd", pane_id.as_u64()))
-                                        .flex()
-                                        .flex_none()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .px(px(8.0))
-                                        .py(px(2.0))
-                                        .rounded(px(5.0))
-                                        .bg(rgba(theme.chip_surface))
-                                        .border_1()
-                                        .border_color(hsla(theme.border_subtle))
-                                        .font_family(theme.font_family.clone())
-                                        .text_size(px(10.5))
-                                        .text_color(hsla(theme.text_muted))
-                                        .cursor_pointer()
-                                        .hover(|d| {
-                                            d.text_color(hsla(theme.text_tertiary))
-                                                .border_color(hsla(theme.border_heavy))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.stop_propagation();
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                full.clone(),
-                                            ));
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::FOLDER)
-                                                .w(px(10.0))
-                                                .h(px(10.0))
-                                                .text_color(hsla(theme.text_muted)),
-                                        )
-                                        .child(SharedString::from(truncate(&short, 28)))
-                                }))
-                            })
-                            // ターミナル情報（シェル名 · cols x rows）
-                            .when(hv.shell_info, |d| {
-                                let shell_name = self
-                                    .terminals
-                                    .get(&pane_id)
-                                    .and_then(|s| s.title())
-                                    .unwrap_or("zsh");
-                                let shell_short =
-                                    shell_name.rsplit('/').next().unwrap_or(shell_name);
-                                d.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(10.5))
-                                        .font_family(theme.font_family.clone())
-                                        .text_color(hsla(theme.tab_inactive_foreground))
-                                        .child(SharedString::from(format!(
-                                            "{shell_short} \u{00B7} {cols}\u{00D7}{rows}"
-                                        ))),
-                                )
-                            }),
-                    )
-                    // #185: 右コンテナ（操作ボタン、flex_none — 常に表示）
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.0))
-                            // split ボタン（カンプ: 13px SVG）
-                            .when(hv.split_button, |d| {
-                                d.child(
-                                    div()
-                                        .id(("pane-split", pane_id.as_u64()))
-                                        .w(px(18.0))
-                                        .h(px(18.0))
-                                        .flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(5.0))
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(rgba(theme.surface_highlight)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.split_pane_button(
-                                                pane_id,
-                                                SplitDirection::Right,
-                                                cx,
-                                            );
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::SPLIT)
-                                                .w(px(13.0))
-                                                .h(px(13.0))
-                                                .text_color(hsla(theme.text_muted)),
-                                        ),
-                                )
-                            })
-                            // バックグラウンドボタン
-                            .when(hv.bg_button, |d| {
-                                d.child(
-                                    div()
-                                        .id(("pane-bg", pane_id.as_u64()))
-                                        .w(px(18.0))
-                                        .h(px(18.0))
-                                        .flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(5.0))
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(rgba(theme.surface_highlight)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.background_pane_button(pane_id, cx);
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::MINUS)
-                                                .w(px(13.0))
-                                                .h(px(13.0))
-                                                .text_color(hsla(theme.text_muted)),
-                                        ),
-                                )
-                            })
-                            // #229: 狭幅時は「...」メニューに bg/close を集約
-                            .when(hv.more_menu, |d| {
-                                d.child(
-                                    div()
-                                        .id(("pane-more", pane_id.as_u64()))
-                                        .w(px(18.0))
-                                        .h(px(18.0))
-                                        .flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(5.0))
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(rgba(theme.surface_highlight)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(
-                                                move |this, event: &MouseDownEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.pane_context_menu =
-                                                        Some(PaneContextMenu {
-                                                            pane: pane_id,
-                                                            kind: PaneContextKind::Terminal,
-                                                            position: event.position,
-                                                        });
-                                                    cx.notify();
-                                                },
-                                            ),
-                                        )
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::MORE)
-                                                .w(px(13.0))
-                                                .h(px(13.0))
-                                                .text_color(hsla(theme.text_muted)),
-                                        ),
-                                )
-                            })
-                            // 閉じるボタン（more_menu でないとき表示。hover で赤）
-                            .when(hv.close_button, |d| {
-                                d.child(
-                                    div()
-                                        .id(("pane-close", pane_id.as_u64()))
-                                        .w(px(18.0))
-                                        .h(px(18.0))
-                                        .flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(5.0))
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.25)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                        )
-                                        .on_click(cx.listener(
-                                            move |this, event: &gpui::ClickEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                this.close_pane_with_confirm(
-                                                    pane_id,
-                                                    event.modifiers().platform,
-                                                    CloseOrigin::PaneButton,
-                                                    cx,
-                                                );
-                                            },
-                                        ))
-                                        .child(
-                                            svg()
-                                                .path(crate::file_icons::ui_icon::CLOSE)
-                                                .w(px(13.0))
-                                                .h(px(13.0))
-                                                .text_color(hsla(theme.text_muted)),
-                                        ),
-                                )
-                            }),
-                    ),
-            )
+            .child(header)
             // stale claude バイナリ通知バナー（Issue #498）
             .when_some(
                 self.stale_binary_banners
