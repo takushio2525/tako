@@ -20,6 +20,13 @@ use crate::theme::{Rgb, Theme};
 /// DIM（SGR 2）の減光係数
 const DIM_FACTOR: f32 = 0.66;
 
+/// 空白セルの近道（#801）を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_801_NO_FAST_CELLS=1`）。UI 側の `terminal_grid` の近道と同じ変数で一緒に切れる
+fn fast_cells_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_801_NO_FAST_CELLS").is_some())
+}
+
 /// 同一スタイルが連続する区間。`range` は行テキスト内のバイト範囲
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyleRun {
@@ -86,8 +93,9 @@ impl Screen {
     }
 }
 
-/// セル単位の解決済みスタイル（ラン合成前の中間表現）
-#[derive(Debug, Clone, PartialEq)]
+/// セル単位の解決済みスタイル（ラン合成前の中間表現）。
+/// `Copy` なのは cols*rows のグリッドを毎フレーム敷き直すため（#801）
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct CellStyle {
     fg: Rgb,
     bg: Option<Rgb>,
@@ -129,7 +137,11 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         dim: false,
     };
     // フラット配列（rows 個の内側 Vec 割り当てを回避）
-    let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style.clone()); cols * rows];
+    let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style); cols * rows];
+    // #801: 1 セルも書かれなかった行は、どの行でも合成結果が同じになる。
+    // 1 本だけ組んで複製すれば、行ごとの `compose_line`（119 セルの走査 +
+    // スタイル比較 + String / Vec の積み上げ）が丸ごと省ける
+    let mut row_touched = vec![false; rows];
 
     let cursor = (show_cursor && content.cursor.shape != CursorShape::Hidden)
         .then(|| point_to_viewport(display_offset, content.cursor.point))
@@ -144,6 +156,20 @@ pub(crate) fn snapshot_opts<T: EventListener>(
 
     let selection = content.selection;
     let colors = content.colors;
+    // #801: 「素の空白セル」は `grid` の初期値とまったく同じ結果になるので、
+    // 色解決も書き込みも要らない。空画面ではほぼ全セルがこれに当たり、
+    // 毎フレーム cols*rows 回走っていた `resolve_cell` が丸ごと消える。
+    // 既定色が OSC 4 でテーマ色から差し替えられているときは近道を使わない
+    // （前景はスペースには見えないが、`compose_line` のラン分割に効くので同じ扱い）
+    let plain_blank_matches_default = !fast_cells_disabled()
+        && colors[NamedColor::Background as usize]
+            .map(from_ansi)
+            .unwrap_or(theme.background)
+            == theme.background
+        && colors[NamedColor::Foreground as usize]
+            .map(from_ansi)
+            .unwrap_or(theme.foreground)
+            == theme.foreground;
     // display_iter が content を部分 move するため、追加行の構築で使う
     // カーソルのグリッド座標はここで取り出しておく
     let cursor_visible_at = (show_cursor && content.cursor.shape != CursorShape::Hidden)
@@ -159,11 +185,24 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         }
         let selected = selection.is_some_and(|range| range.contains(indexed.point));
         let is_cursor = cursor == Some((col, row));
+        if plain_blank_matches_default && !selected && !is_cursor && is_plain_blank(indexed.cell) {
+            continue;
+        }
         grid[row * cols + col] = resolve_cell(indexed.cell, selected, is_cursor, colors, theme);
+        row_touched[row] = true;
     }
 
+    // 素のままの行は 1 本組んで使い回す（#801。中身は行位置に依らず同じ）
+    let mut blank_line: Option<ScreenLine> = None;
     let lines = (0..rows)
-        .map(|row| compose_line(&grid[row * cols..(row + 1) * cols]))
+        .map(|row| {
+            if row_touched[row] {
+                return compose_line(&grid[row * cols..(row + 1) * cols]);
+            }
+            blank_line
+                .get_or_insert_with(|| compose_line(&grid[row * cols..(row + 1) * cols]))
+                .clone()
+        })
         .collect();
 
     // fract > 0 のとき viewport 最下行の 1 行下を追加で切り出す（部分行の描画用）。
@@ -195,6 +234,20 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         fract,
         extra_bottom,
     }
+}
+
+/// 「素の空白セル」か（#801）。
+///
+/// 文字が半角スペースで、属性フラグが 1 つも立っておらず、前景・背景が既定色のセル。
+/// このセルの解決結果は `snapshot_opts` が `grid` に敷く初期値（`' '` + 既定スタイル）と
+/// 一致するので、解決も書き込みも省ける。**判定を緩めてはいけない**:
+/// フラグ（DIM / INVERSE / HIDDEN / 下線 / 全角スペーサー）や明示色が 1 つでもあれば
+/// 見た目が変わる
+fn is_plain_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
+    cell.c == ' '
+        && cell.flags.is_empty()
+        && matches!(cell.fg, Color::Named(NamedColor::Foreground))
+        && matches!(cell.bg, Color::Named(NamedColor::Background))
 }
 
 /// セル 1 つを色解決済みの (文字, スタイル) へ変換する。
@@ -801,6 +854,100 @@ mod tests {
         assert_eq!(s.ime_cursor, None);
         // 10 行ぶん過去が見えている
         assert!(s.lines[0].text.starts_with("line6"));
+    }
+
+    // ---- #801: 空白セルの近道が「見た目が変わるセル」を飛ばさないこと ----
+    //
+    // `is_plain_blank` を緩めると、空白でも装飾が乗るセルが素の空白に化ける。
+    // 以下は近道を壊したときに落ちる（= 検出力を持つ）不変条件
+
+    #[test]
+    fn 装飾つきの空白セルは近道で飛ばさない() {
+        // 下線・取り消し線・反転・DIM は「空白でも見える」属性
+        let t = theme();
+        let s = snapshot(&term_with(b"\x1b[4m   \x1b[0m"), &t);
+        assert!(
+            s.lines[0].runs.iter().any(|r| r.underline),
+            "SGR 4 の空白に下線ランが残る"
+        );
+        let s = snapshot(&term_with(b"\x1b[9m   \x1b[0m"), &t);
+        assert!(s.lines[0].runs.iter().any(|r| r.strikeout));
+        let s = snapshot(&term_with(b"\x1b[7m   \x1b[0m"), &t);
+        assert!(
+            s.lines[0].runs.iter().any(|r| r.bg == Some(t.foreground)),
+            "反転した空白は前景色で塗られる"
+        );
+    }
+
+    #[test]
+    fn 明示背景色の空白セルは近道で飛ばさない() {
+        let t = theme();
+        let s = snapshot(&term_with(b"\x1b[48;2;10;20;30m   \x1b[0m"), &t);
+        assert!(s.lines[0]
+            .runs
+            .iter()
+            .any(|r| r.bg == Some(Rgb::new(10, 20, 30))));
+    }
+
+    #[test]
+    fn 既定背景がosc11で変わったら空白も塗る() {
+        // 近道は「既定背景 = テーマ背景」が前提。OSC 11 で変わったら全セル塗る必要がある
+        let t = theme();
+        let s = snapshot(&term_with(b"\x1b]11;#00ff00\x1b\\"), &t);
+        // 先頭セルはカーソルなので除く。残りの素の空白すべてに新しい既定背景が乗る
+        assert!(
+            s.lines[0]
+                .runs
+                .iter()
+                .filter(|r| r.range.start > 0)
+                .all(|r| r.bg == Some(Rgb::new(0, 255, 0))),
+            "既定背景が差し替わったら空白セルにも背景が乗る: {:?}",
+            s.lines[0].runs
+        );
+        // 2 行目以降（カーソルが居ない行）も同じ
+        assert!(s.lines[1]
+            .runs
+            .iter()
+            .all(|r| r.bg == Some(Rgb::new(0, 255, 0))));
+    }
+
+    #[test]
+    fn 空白セルの選択とカーソルは近道で飛ばさない() {
+        let t = theme();
+        // 何も入力していない行を選択する（全セルが素の空白）
+        let mut term = term_with(b"");
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(2)), Side::Right);
+        term.selection = Some(sel);
+        let s = snapshot(&term, &t);
+        // 先頭セルはカーソルが勝つので、選択背景はその隣に出る
+        assert!(
+            s.lines[0]
+                .runs
+                .iter()
+                .any(|r| r.bg == Some(t.selection_background)),
+            "空白セルの選択も塗られる: {:?}",
+            s.lines[0].runs
+        );
+        // カーソルセル（行頭）はカーソル色で焼かれている
+        let s = snapshot(&term_with(b""), &t);
+        assert_eq!(s.cursor, Some((0, 0)));
+        assert_eq!(s.lines[0].runs.first().map(|r| r.bg), Some(Some(t.cursor)));
+    }
+
+    #[test]
+    fn 全角の右隣スペーサーは近道で飛ばさない() {
+        // スペーサーを素の空白として書き戻すと、列数が 1 ずれて cell_cols が壊れる
+        let s = snapshot(&term_with("あ".as_bytes()), &theme());
+        assert_eq!(s.lines[0].text.chars().next(), Some('あ'));
+        // 「あ」は 2 セル占有 = 次の文字の列が 2
+        assert_eq!(s.lines[0].cell_cols.first().copied(), Some(0));
+        assert_eq!(s.lines[0].cell_cols.get(1).copied(), Some(2));
+        assert!(s.lines[0].has_wide);
     }
 
     #[test]

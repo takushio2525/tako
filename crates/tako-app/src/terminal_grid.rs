@@ -56,6 +56,14 @@ pub(crate) fn element_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("TAKO_787_NO_GRID_ELEMENT").is_some())
 }
 
+/// セル単位の近道（#801: 空行の早期打ち切りとラン単位の色解決）を切って
+/// 同じバイナリで A/B を取る逃げ道（`TAKO_801_NO_FAST_CELLS=1`）。
+/// `tako_core::screen` の空白セル近道と同じ変数で一緒に切れる
+pub(crate) fn fast_cells_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_801_NO_FAST_CELLS").is_some())
+}
+
 /// 行中の空白がこのセル数以上続いたらシェイプ区間を切る。
 ///
 /// 空白 1 セルぶんのグリフ（`paint_glyph` の raster 参照）より、区間を増やす
@@ -158,6 +166,60 @@ fn run_at<'a>(runs: &'a [StyleRun], run_idx: &mut usize, byte_off: usize) -> Opt
         .filter(|r| byte_off >= r.range.start && byte_off < r.range.end)
 }
 
+/// ラン 1 本ぶんの解決済み色（#801）。
+///
+/// `Rgb -> Hsla` は除算を含むので、セルごとに引き直すと**空画面でも**毎フレーム
+/// セル数ぶん（119x21 = 2,499 回）走る。ランは同じスタイルの連続区間なので、
+/// ランが変わったときだけ作って使い回す
+#[derive(Debug, Clone, Copy)]
+struct RunStyle {
+    fg: Hsla,
+    bg: Option<Hsla>,
+    bold: bool,
+    italic: bool,
+    underline: Option<Hsla>,
+    strikeout: Option<Hsla>,
+}
+
+impl RunStyle {
+    fn resolve(run: Option<&StyleRun>, default_fg: Hsla) -> Self {
+        let Some(r) = run else {
+            return Self {
+                fg: default_fg,
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: None,
+                strikeout: None,
+            };
+        };
+        let fg = to_hsla(r.fg);
+        Self {
+            fg,
+            bg: r.bg.map(to_hsla),
+            bold: r.bold,
+            italic: r.italic,
+            // 下線・取り消し線の色は前景色と同じ（旧実装の `to_hsla(r.fg)` と同値）
+            underline: r.underline.then_some(fg),
+            strikeout: r.strikeout.then_some(fg),
+        }
+    }
+}
+
+/// 描くものが何も無い行か（#801）。
+///
+/// 全部が空白で、背景・下線・取り消し線がどのランにも無ければ、
+/// [`plan_row`] の結果は必ず空になる。空画面ではこれが全行に当たるので、
+/// セル単位の組み立て（2,499 個の `PlanCell`）ごと省ける。
+/// ⌘ホバーのリンク装飾は空白セルにも掛かるため、リンクがある行は対象外
+fn row_draws_nothing(line: &ScreenLine) -> bool {
+    line.text.bytes().all(|b| b == b' ')
+        && line
+            .runs
+            .iter()
+            .all(|r| r.bg.is_none() && !r.underline && !r.strikeout)
+}
+
 /// 1 行を描画計画へ変換する。
 ///
 /// `link` は ⌘ホバー中のリンクのセル範囲 `[start, end)`。`fg` は既定前景色
@@ -168,8 +230,15 @@ pub(crate) fn plan_row(
     link: Option<(usize, usize)>,
     link_style: LinkDecoration,
 ) -> RowPlan {
+    let fast = !fast_cells_disabled();
+    // #801: 描くものが無い行はセル単位の組み立てごと省く（空画面の全行がこれ）
+    if fast && link.is_none() && row_draws_nothing(line) {
+        return RowPlan::default();
+    }
     let mut cells: Vec<PlanCell> = Vec::with_capacity(line.cell_cols.len());
     let mut run_idx = 0usize;
+    // 直前に解決したラン（#801。同じランの連続セルで Rgb->Hsla を繰り返さない）
+    let mut cached: Option<(usize, bool, RunStyle)> = None;
     for (ci, (byte_off, ch)) in line.text.char_indices().enumerate() {
         let col = line.cell_cols.get(ci).copied().unwrap_or(ci);
         let cols = line
@@ -178,16 +247,26 @@ pub(crate) fn plan_row(
             .map(|next| next.saturating_sub(col))
             .unwrap_or(1);
         let run = run_at(&line.runs, &mut run_idx, byte_off);
+        // ランの同一性は「何番目のランか」+「そのランに入っているか」で決まる
+        let hit = run.is_some();
+        let style = match cached {
+            Some((idx, cached_hit, style)) if fast && idx == run_idx && cached_hit == hit => style,
+            _ => {
+                let style = RunStyle::resolve(run, fg);
+                cached = Some((run_idx, hit, style));
+                style
+            }
+        };
         let mut cell = PlanCell {
             ch,
             col,
             cols,
-            fg: run.map(|r| to_hsla(r.fg)).unwrap_or(fg),
-            bg: run.and_then(|r| r.bg).map(to_hsla),
-            bold: run.is_some_and(|r| r.bold),
-            italic: run.is_some_and(|r| r.italic),
-            underline: run.filter(|r| r.underline).map(|r| to_hsla(r.fg)),
-            strikeout: run.filter(|r| r.strikeout).map(|r| to_hsla(r.fg)),
+            fg: style.fg,
+            bg: style.bg,
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            strikeout: style.strikeout,
         };
         // リンク装飾はランより後（同じ ANSI ラン内でもリンク部分だけに掛かる）
         if let Some((start, end)) = link {
@@ -663,6 +742,86 @@ mod tests {
     fn 空行は何も描かない() {
         let plan = plan_row(&line("        "), fg(), None, link_style());
         assert!(plan.is_empty());
+    }
+
+    // ---- #801: セル単位の近道が結果を変えないこと ----
+
+    #[test]
+    fn 空行の早期打ち切りは装飾つきの行に効かない() {
+        // 背景・下線・取り消し線のどれかが乗っていれば「描くものがある」
+        for (bg, ul, st) in [
+            (Some(Rgb::new(1, 2, 3)), false, false),
+            (None, true, false),
+            (None, false, true),
+        ] {
+            let mut l = line("     ");
+            l.runs[0].bg = bg;
+            l.runs[0].underline = ul;
+            l.runs[0].strikeout = st;
+            assert!(
+                !row_draws_nothing(&l),
+                "bg={bg:?} ul={ul} st={st} は空扱いにしてはいけない"
+            );
+            assert!(!plan_row(&l, fg(), None, link_style()).is_empty());
+        }
+        // 素の空白だけなら空
+        assert!(row_draws_nothing(&line("     ")));
+    }
+
+    #[test]
+    fn 空行でもリンク装飾があれば早期打ち切りしない() {
+        // ⌘ホバーのリンクは空白セルにも背景と下線を乗せる
+        let plan = plan_row(&line("     "), fg(), Some((1, 3)), link_style());
+        assert!(!plan.is_empty());
+        assert_eq!(plan.underlines.len(), 1);
+    }
+
+    #[test]
+    fn ラン単位の色解決は複数ランをまたいでも取り違えない() {
+        // ラン境界で色が切り替わることを固定する（キャッシュのキーが甘いと崩れる）
+        let mut l = line("aabbcc");
+        let mk = |range: std::ops::Range<usize>, r: u8| StyleRun {
+            range,
+            fg: Rgb::new(r, 0, 0),
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikeout: false,
+            dim: false,
+        };
+        l.runs = vec![mk(0..2, 10), mk(2..4, 20), mk(4..6, 30)];
+        let plan = plan_row(&l, fg(), None, link_style());
+        assert_eq!(plan.segments.len(), 1);
+        let styles = &plan.segments[0].styles;
+        assert_eq!(styles.len(), 3, "ランごとにスタイル区間が分かれる");
+        assert_eq!(
+            styles.iter().map(|s| s.len).collect::<Vec<_>>(),
+            vec![2, 2, 2]
+        );
+        assert_eq!(styles[0].fg, crate::hsla(Rgb::new(10, 0, 0)));
+        assert_eq!(styles[1].fg, crate::hsla(Rgb::new(20, 0, 0)));
+        assert_eq!(styles[2].fg, crate::hsla(Rgb::new(30, 0, 0)));
+    }
+
+    #[test]
+    fn ランの外のセルは既定前景色に戻る() {
+        // ラン列が行の途中で終わる場合、以降のセルは fg（既定色）で描かれる
+        let mut l = line("abcd");
+        l.runs = vec![StyleRun {
+            range: 0..2,
+            fg: Rgb::new(9, 9, 9),
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikeout: false,
+            dim: false,
+        }];
+        let styles = &plan_row(&l, fg(), None, link_style()).segments[0].styles;
+        assert_eq!(styles.len(), 2);
+        assert_eq!(styles[0].fg, crate::hsla(Rgb::new(9, 9, 9)));
+        assert_eq!(styles[1].fg, fg());
     }
 
     #[test]
