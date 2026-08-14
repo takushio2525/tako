@@ -1891,3 +1891,5 @@
   隔離セルフテスト完走（項目 102b 新設 = 実 dispatch で sectioned / legacy を実測）+
   検出力 3 件（カタログ削除で 2 テスト FAILED / prompt 見出しドリフトで FAILED /
   節判定の破壊で 8 テスト FAILED）
+- 関連コミット: `40c4b2a`（PR #804 squash merge）。CI macOS / Windows / Pages 全緑 +
+  `/Applications/tako.app` install 済み（反映は再起動後）。証拠は ~/dev/tako-evidence/792/

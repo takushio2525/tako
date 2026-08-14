@@ -3,9 +3,10 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-14、Issue #792 handoff の知識 / 実行状態の分離）
+## 現在の対象（2026-08-14、Issue #792 handoff の知識 / 実行状態の分離 = merge 済み・install 済み）
 
-- ブランチ `improve/792-handoff-split`（worktree `~/dev/tako-wt-792`）で実装完了 → PR 待ち
+- PR #804 を squash merge（`40c4b2a`）。CI は macOS / Windows / Pages 全緑。Issue #792 クローズ済み。
+  `/Applications/tako.app` へ install 済み（**反映は tako 再起動後**）
 - 引き継ぎファイルを **2 節**へ分離: `## 知識（マシン非依存）` / `## 実行状態（このマシン限定）`
   （英語表示なら `## Knowledge (machine-independent)` / `## Runtime state (this machine only)`）
 - **旧書式は従来どおり動く**（後方互換が本質）: 書式に関わらず全文を後任へ渡し、
@@ -31,8 +32,9 @@
 
 ## 次の一手（master 判断）
 
-- PR（`Closes #792` / `Refs #513 #749`）→ CI 緑 → squash merge → install
+- GUI 再起動で新バイナリを反映（install は済み）
 - #513 側の判断: 知識節だけを共有カタログへ Shared 追加するか（本 PR は分離までで止めている）
+- 本番の handoff 5 本は旧書式のまま（次の引き継ぎ更新で master が 2 節へ書き直す想定）
 
 ## 現フェーズで Read すべき設計書
 
