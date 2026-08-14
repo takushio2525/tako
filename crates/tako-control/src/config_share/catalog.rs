@@ -835,9 +835,9 @@ pub fn classify(root: Root, rel: &str) -> Option<&'static Entry> {
             // 名前が実行時に決まるファイル。**同じディレクトリの中だけ**に効かせる
             // （`_system_prompt_` がディレクトリ名だった場合に配下を巻き込まない）
             let prefix = entry.match_prefix();
-            let matches = rel.strip_prefix(prefix).is_some_and(|rest| {
-                !rest.is_empty() && !rest.contains('/') && !prefix.ends_with('/')
-            });
+            let matches = rel
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'));
             if matches && best.is_none_or(|b| b.path.len() < entry.path.len()) {
                 best = Some(entry);
             }
