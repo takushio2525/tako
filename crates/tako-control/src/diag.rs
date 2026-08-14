@@ -66,6 +66,34 @@ pub fn perf_log(msg: &str) {
     append_log(perf_log_path(), msg);
 }
 
+/// 1 / 5 / 15 分の load average。取得できない環境（Windows 等）では `None`（#796）。
+///
+/// セルフテストの失敗ログに残すためだけの観測値で、製品の判断には使わない。
+/// 「同じコードなのに回によって落ちる項目が変わる」の切り分けに、**そのときの
+/// マシンの混み具合**が必要だった（実測: load 6〜16 の帯で落ちる項目が入れ替わる）
+pub fn load_average() -> Option<[f64; 3]> {
+    #[cfg(unix)]
+    {
+        let mut out = [0f64; 3];
+        // getloadavg(3): 埋められた要素数を返す（負値は失敗）
+        let filled = unsafe { libc::getloadavg(out.as_mut_ptr(), 3) };
+        (filled == 3).then_some(out)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// load average を診断 1 行用の表記へ（`load=6.17/5.79/5.47`）。
+/// 取得できなければ `load=unknown`。純粋関数なので単体テストで固定できる
+pub fn format_load_average(load: Option<[f64; 3]>) -> String {
+    match load {
+        Some([one, five, fifteen]) => format!("load={one:.2}/{five:.2}/{fifteen:.2}"),
+        None => "load=unknown".to_string(),
+    }
+}
+
 fn append_log(path: Option<PathBuf>, msg: &str) {
     let Some(path) = path else {
         return;
@@ -461,6 +489,27 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_averageの表記は取得可否で決まる() {
+        assert_eq!(
+            format_load_average(Some([6.171, 5.79, 5.4])),
+            "load=6.17/5.79/5.40"
+        );
+        assert_eq!(format_load_average(None), "load=unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixではload_averageが取れて非負に収まる() {
+        let load = load_average().expect("unix では getloadavg が 3 要素返す");
+        for value in load {
+            assert!(
+                value.is_finite() && value >= 0.0,
+                "load average が異常: {load:?}"
+            );
+        }
     }
 
     #[test]
