@@ -1941,3 +1941,20 @@
   旧バイナリ = sweep 非搭載で実害ゼロ）。隔離検証は `env -u TAKO_SOCKET -u TAKO_TOKEN` 必須
 - 次: 本番の掃除は install + GUI 再起動後に `tako orchestrator workers` を 2 回
   （5 分あけて）。GC は GUI プロセス側で走るので旧バイナリのままでは倒れない
+
+## 2026-08-14（#796: 隔離セルフテストの main 由来フレークを根治）
+- 根因 3 つを実測で確定: ①**#786 の `AnyView::cached` と「汚さずに draw」**（製品経路は
+  dispatch 後に `cx.notify()` するのにセルフテストはしていなかった → 幾何がキャッシュのまま
+  = PDF アウトライン #232 が「ジャンプが効かない」に見えていた。実測 `children=2` /
+  `max_offset_y=199` なのに `offset_y` が 4 秒 80 フレームで 0 のまま。同機序で #702 の
+  下端追従も）②**偽の待ち条件**（#601 の A / B 両フェーズが同じ `ST601>`。旧形式で
+  実測 `shared_prompt=Some(0)` = 起動前に待ちが成立）③**「出るもの」を固定時間で待っていた**
+  26 組（`--features visual-test` は gpui の leak-detection を有効にして数割遅い）
+- 実装: `wait_for_focused_text` / `_timed` / `absent_after_anchor` / `notify_and_draw` /
+  `PdfScrollProbe` / `TAKO_APP_SELF_TEST_ENV`（profile / feature / load / 経過。load は
+  `tako_control::diag::load_average` 新設）/ #732 の前提待ち / 番犬テスト
+  `selftest_wait_watchdog` / 規約を conventions.md へ明文化
+- 検証: 人工負荷（`yes` 6 本・load 14〜74）で feature 無し 5 回連続 OK + feature 付き 3 回連続 OK
+  （feature 付きは修正前 4/4 で `PDFKit アウトライン…` に確定失敗していた）。品質ゲート全緑
+- 副産物: このマシンの **Metal Toolchain 不在**でセッション前半は gpui のシェーダを
+  ビルドできず（`xcodebuild -downloadComponent MetalToolchain` で復旧。23:00 に解消）

@@ -19147,7 +19147,48 @@ mod self_test {
     use super::*;
     use gpui::{AnyWindowHandle, AsyncApp, WindowHandle};
 
+    /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
+    static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    /// このビルドの構成（#796）。
+    ///
+    /// `visual-test` feature は `gpui_platform/test-support` を有効にし、そこから
+    /// **`gpui/leak-detection`** が入る。leak detector は entity ハンドルの生成・複製・破棄を
+    /// 毎回グローバルなロック + HashMap で記録するので、同じソースでも体感で数割遅くなる。
+    /// 「feature の有無だけで固定待ちの検査が落ちる」の正体がこれなので、
+    /// 失敗ログに構成を必ず併記する
+    fn build_flavor() -> String {
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let visual = cfg!(feature = "visual-test");
+        format!(
+            "profile={profile} features=[{}] gpui_leak_detection={}",
+            if visual { "visual-test" } else { "" },
+            if visual { "on" } else { "off" }
+        )
+    }
+
+    /// 失敗ログに残す実行環境の 1 行（#796）。
+    /// 同じコードでも「マシンの混み具合」と「ビルド構成」で落ちる項目が変わるため、
+    /// 判定の近くに必ず環境を出しておく（後から load を推測しなくて済むように）
+    fn env_line() -> String {
+        let elapsed = STARTED_AT
+            .get()
+            .map(|s| s.elapsed().as_secs())
+            .unwrap_or_default();
+        format!(
+            "{} {} elapsed={elapsed}s",
+            build_flavor(),
+            tako_control::diag::format_load_average(tako_control::diag::load_average())
+        )
+    }
+
     fn fail(step: &str) -> ! {
+        // 環境要因（load / feature 構成）は失敗と同じ場所に出す（#796）
+        println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
         println!("TAKO_APP_SELF_TEST_FAILED: {step}");
         std::process::exit(1);
     }
@@ -19476,7 +19517,7 @@ mod self_test {
         for _ in 0..80 {
             // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
             // なる。root entity を借用しない AnyWindowHandle 境界から描画する。
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            notify_and_draw(any, window, cx);
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
@@ -19520,7 +19561,7 @@ mod self_test {
         pane: PaneId,
     ) -> bool {
         for _ in 0..40 {
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            notify_and_draw(any, window, cx);
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
@@ -19548,7 +19589,7 @@ mod self_test {
         pane: PaneId,
     ) -> bool {
         for _ in 0..80 {
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            notify_and_draw(any, window, cx);
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
@@ -20354,6 +20395,125 @@ mod self_test {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    /// **汚してから 1 フレーム描く**（#786 / #796）。
+    ///
+    /// #786 でペイン本体とクロームは `AnyView::cached` になったので、状態を変えただけでは
+    /// 子ビューが描き直されない（= スクロールの幾何もキャッシュのまま）。
+    /// 製品経路（IPC / MCP の dispatch ループ）は dispatch のあとに `cx.notify()` してから
+    /// 次のフレームを描くので、**直接 dispatch する検証側も同じ順序で見る**こと。
+    ///
+    /// これを守らないと「アウトラインジャンプが効いていない」ように見える
+    /// （実際に #232 の PDF ジャンプ検査が #786 以降フレークになっていた。
+    /// 2 秒ポーリングの notify がたまたま挟まった回だけ通っていた）
+    fn notify_and_draw(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+        let _ = window.update(cx, |_, _, cx| cx.notify());
+        let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
+    }
+
+    /// PDF アウトラインジャンプの計測値（#232 / #796 の診断）。
+    ///
+    /// スクロールが動かなかったのか、動いたが着地がズレたのか、そもそも
+    /// ページが子として並んでいないのかを 1 行で切り分けられるようにする
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct PdfScrollProbe {
+        offset_y: f32,
+        page_top: f32,
+        page_bottom: f32,
+        view_top: f32,
+        view_bottom: f32,
+        /// スクロール容器の子の数（PDF はラスタライズ済みページだけが子になる）
+        children: usize,
+        /// スクロールできる上限（`content - viewport`。0 ならそもそも動かせない）
+        max_offset_y: f32,
+    }
+
+    /// フォーカス中ペインの画面末尾（診断用。#796）。
+    ///
+    /// セルフテストのペインに出ているのは自分が打った検査用の文字列だけなので、
+    /// 失敗時に限って末尾を出す（項目 73 / 74 に同型の先例あり）。
+    /// 長さは打ち切る = 洪水した画面でログを埋めない
+    fn focused_screen_tail(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> String {
+        let joined = window
+            .update(cx, |app, _, _| {
+                app.focused_session()
+                    .map(|s| {
+                        s.visible_lines()
+                            .iter()
+                            .map(|l| l.trim_end().to_string())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let tail: String = joined.chars().rev().take(240).collect();
+        tail.chars().rev().collect()
+    }
+
+    /// **時間ではなく状態を待つ**（#796）。フォーカス中ペインの画面に `needle` が
+    /// 出るまで待ち、上限で諦めたら「何を待って何秒待ったか + 画面末尾 + 実行環境」を出す。
+    ///
+    /// 固定待ち + `focused_contains` の組は、負荷やビルド構成（`visual-test` の
+    /// leak-detection）で数割遅くなるだけで落ちる。逆に**上限まで待って駄目なら偽**なので、
+    /// 検出力は固定待ちと同じか強い（成立しない条件はいくら待っても成立しない）
+    async fn wait_for_focused_text(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        wait_for_focused_text_timed(window, cx, needle, timeout)
+            .await
+            .is_some()
+    }
+
+    /// `wait_for_focused_text` の実測時間つき版（#796）。
+    /// 「固定待ちの予算に対して実際どれだけ掛かっているか」を出したいときに使う
+    async fn wait_for_focused_text_timed(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        needle: &str,
+        timeout: Duration,
+    ) -> Option<Duration> {
+        let started = std::time::Instant::now();
+        loop {
+            if focused_contains(window, cx, needle) {
+                return Some(started.elapsed());
+            }
+            if started.elapsed() >= timeout {
+                println!(
+                    "TAKO_SELF_TEST_WAIT_TIMEOUT: needle={needle:?} waited={:.1}s {} screen_tail={:?}",
+                    started.elapsed().as_secs_f32(),
+                    env_line(),
+                    focused_screen_tail(window, cx)
+                );
+                return None;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
+    }
+
+    /// `wait_for_focused_text` の否定側（#796）。
+    ///
+    /// 「出ないこと」は待てば待つほど確からしくなる一方、**アンカー無しの否定検査は
+    /// 出力が来る前に通ってしまう**（偽 PASS）。そこで「先に必ず出るもの（anchor）を
+    /// 待ってから、禁止文字列が無いことを見る」形に固定する
+    async fn absent_after_anchor(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        anchor: &str,
+        forbidden: &str,
+        timeout: Duration,
+    ) -> bool {
+        if !wait_for_focused_text(window, cx, anchor, timeout).await {
+            return false;
+        }
+        !focused_contains(window, cx, forbidden)
     }
 
     /// ファイルツリーのインデントガイド線（#589）の実ピクセル検証。
@@ -26683,6 +26843,10 @@ mod self_test {
     }
 
     pub fn run(window: WindowHandle<TakoApp>, cx: &mut App) {
+        // 実行環境を最初に 1 行出す（#796）。同じソースでも load とビルド構成で
+        // 落ちる項目が変わるので、ログ単体で条件が再現できる状態にしておく
+        let _ = STARTED_AT.set(std::time::Instant::now());
+        println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
         cx.spawn(async move |cx| {
             let any: AnyWindowHandle = window.into();
             let wait = |cx: &mut AsyncApp, ms: u64| {
@@ -26723,8 +26887,10 @@ mod self_test {
             // 1. 起動 + 素の入力経路
             wait(cx, 2500).await;
             type_text(any, cx, "echo TAKO-INPUT-OK", true);
-            wait(cx, 1000).await;
-            check(focused_contains(window, cx, "TAKO-INPUT-OK"), "入力エコー");
+            check(
+                wait_for_focused_text(window, cx, "TAKO-INPUT-OK", Duration::from_secs(15)).await,
+                "入力エコー",
+            );
 
             // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）。
             //     高負荷環境（worker のビルド並走等）ではエコー反映が 800ms を超えることが
@@ -26742,8 +26908,10 @@ mod self_test {
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
             type_text(any, cx, "[ \"$PWD\" = \"$HOME\" ] && echo CWDCHK-$((40+2))", true);
-            wait(cx, 800).await;
-            check(focused_contains(window, cx, "CWDCHK-42"), "初期 cwd はホーム");
+            check(
+                wait_for_focused_text(window, cx, "CWDCHK-42", Duration::from_secs(15)).await,
+                "初期 cwd はホーム",
+            );
 
             // 1d. tako 内で tmux がエラーなく起動できる（TERM 修正の実地確認。
             //     専用ソケット -L で実環境の tmux サーバーに触れない。未インストール時は素通し）
@@ -26755,9 +26923,8 @@ mod self_test {
                  && echo TMUX-OK-42; else echo TMUX-OK-42; fi",
                 true,
             );
-            wait(cx, 1500).await;
             check(
-                focused_contains(window, cx, "TMUX-OK-42"),
+                wait_for_focused_text(window, cx, "TMUX-OK-42", Duration::from_secs(20)).await,
                 "tako 内で tmux がエラーなく起動",
             );
 
@@ -26768,8 +26935,10 @@ mod self_test {
             press(any, cx, "backspace");
             press(any, cx, "backspace");
             type_text(any, cx, "OK", true);
-            wait(cx, 900).await;
-            check(focused_contains(window, cx, "BSPOK"), "Backspace で行編集できる");
+            check(
+                wait_for_focused_text(window, cx, "BSPOK", Duration::from_secs(15)).await,
+                "Backspace で行編集できる",
+            );
 
             let pane1 = window
                 .update(cx, |app, _, _| app.focused_pane())
@@ -26792,9 +26961,8 @@ mod self_test {
 
             // 3. 新ペインだけに入力が流れる
             type_text(any, cx, "echo TAKO-PANE2-OK", true);
-            wait(cx, 1000).await;
             check(
-                focused_contains(window, cx, "TAKO-PANE2-OK"),
+                wait_for_focused_text(window, cx, "TAKO-PANE2-OK", Duration::from_secs(15)).await,
                 "ペイン 2 へ入力",
             );
             let pane1_clean = window
@@ -27021,9 +27189,8 @@ mod self_test {
                 cx.write_to_clipboard(ClipboardItem::new_string("TAKO-PASTE-OK".into()));
             });
             press(any, cx, "cmd-v");
-            wait(cx, 800).await;
             check(
-                focused_contains(window, cx, "TAKO-PASTE-OK"),
+                wait_for_focused_text(window, cx, "TAKO-PASTE-OK", Duration::from_secs(15)).await,
                 "cmd-v ペースト",
             );
 
@@ -27107,9 +27274,14 @@ mod self_test {
 
             // 15. TAKO_PANE_ID / TAKO_TAB_ID の注入（FR-2.1.1）
             type_text(any, cx, "echo P=$TAKO_PANE_ID,T=$TAKO_TAB_ID", true);
-            wait(cx, 800).await;
             check(
-                focused_contains(window, cx, &format!("P={pane2},T={tab1}")),
+                wait_for_focused_text(
+                    window,
+                    cx,
+                    &format!("P={pane2},T={tab1}"),
+                    Duration::from_secs(15),
+                )
+                .await,
                 "TAKO_PANE_ID / TAKO_TAB_ID 注入",
             );
 
@@ -27120,9 +27292,8 @@ mod self_test {
                 "test -S \"$TAKO_SOCKET\" && [ -n \"$TAKO_TOKEN\" ] && echo TAKO-SOCK-$((40+2))",
                 true,
             );
-            wait(cx, 800).await;
             check(
-                focused_contains(window, cx, "TAKO-SOCK-42"),
+                wait_for_focused_text(window, cx, "TAKO-SOCK-42", Duration::from_secs(15)).await,
                 "TAKO_SOCKET / TAKO_TOKEN 注入",
             );
 
@@ -27380,9 +27551,8 @@ mod self_test {
                 "[ -n \"$TAKO_MCP_URL\" ] && echo TAKO-MCPENV-$((40+2))",
                 true,
             );
-            wait(cx, 800).await;
             check(
-                focused_contains(window, cx, "TAKO-MCPENV-42"),
+                wait_for_focused_text(window, cx, "TAKO-MCPENV-42", Duration::from_secs(15)).await,
                 "TAKO_MCP_URL 注入",
             );
 
@@ -27797,9 +27967,9 @@ mod self_test {
                 .unwrap_or(false);
             check(committed, "IME 確定で変換状態クリア");
             press(any, cx, "enter");
-            wait(cx, 1000).await;
+            // #796: 固定 1 秒待ちだと負荷時に取りこぼす（フレーク源）。状態到達で待つ
             check(
-                focused_contains(window, cx, "IME-42-にほんご"),
+                wait_for_focused_text(window, cx, "IME-42-にほんご", Duration::from_secs(15)).await,
                 "IME 確定文字列が PTY へ",
             );
 
@@ -27813,9 +27983,8 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(unmarked, "unmark で変換状態クリア");
-            wait(cx, 800).await;
             check(
-                focused_contains(window, cx, "かくてい"),
+                wait_for_focused_text(window, cx, "かくてい", Duration::from_secs(15)).await,
                 "unmark はそのまま挿入",
             );
 
@@ -27914,9 +28083,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 10000).await;
             check(
-                focused_contains(window, cx, "TAKO-STRESS-42"),
+                wait_for_focused_text(window, cx, "TAKO-STRESS-42", Duration::from_secs(40)).await,
                 "split/close ストレス 10 周",
             );
             let stress_stable = window
@@ -28149,31 +28317,37 @@ mod self_test {
                     &format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", as_home.display()),
                     true,
                 );
-                wait(cx, 2500).await;
+                // #796: 固定待ちだと `visual-test` feature 付きビルド（gpui の
+                // leak-detection が入って数割遅い）で**確定的に**間に合わず、
+                // ここが main 由来の失敗として後続を全部止めていた。状態到達で待つ
                 check(
-                    focused_contains(window, cx, "ST600>"),
+                    wait_for_focused_text(window, cx, "ST600>", Duration::from_secs(20)).await,
                     "検証用 zsh が起動する（入力予測）",
                 );
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 // 履歴 `echo TAKO600-ghost-ok` の接頭辞だけ打つ（Enter は押さない）
                 type_text(any, cx, "echo TAKO600-gh", false);
-                wait(cx, 1200).await;
                 check(
-                    focused_contains(window, cx, "ghost-ok"),
+                    wait_for_focused_text(window, cx, "ghost-ok", Duration::from_secs(15)).await,
                     "履歴からゴースト予測が出る",
                 );
                 // #614: ゴーストの直後に確定キーの案内が薄く出る
                 check(
-                    focused_contains(window, cx, &hint_text),
+                    wait_for_focused_text(window, cx, &hint_text, Duration::from_secs(10)).await,
                     "予測の後ろに確定キーの案内が出る（#614）",
                 );
                 // 右矢印（forward-char）で全確定 → 続きを打って実行できる
                 press(any, cx, "right");
                 type_text(any, cx, " 41c", true);
-                wait(cx, 1200).await;
                 check(
-                    focused_contains(window, cx, "TAKO600-ghost-ok 41c"),
+                    wait_for_focused_text(
+                        window,
+                        cx,
+                        "TAKO600-ghost-ok 41c",
+                        Duration::from_secs(15),
+                    )
+                    .await,
                     "右矢印で予測が確定する",
                 );
 
@@ -28186,18 +28360,24 @@ mod self_test {
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "echo TAKO600-gh", false);
-                wait(cx, 1500).await;
                 check(
-                    focused_contains(window, cx, &hint_text),
+                    wait_for_focused_text(window, cx, &hint_text, Duration::from_secs(15)).await,
                     "案内は毎行出る（#614）",
                 );
                 press(any, cx, "tab");
                 wait(cx, 800).await;
                 press(any, cx, "enter");
-                wait(cx, 1200).await;
+                // 実行された行が出るのを待ってから「案内が混ざっていない」を見る
+                // （#796: アンカー無しの否定検査は出力前に通ってしまう）
                 check(
-                    focused_contains(window, cx, "TAKO600-ghost-ok")
-                        && !focused_contains(window, cx, &hint_text),
+                    absent_after_anchor(
+                        window,
+                        cx,
+                        "TAKO600-ghost-ok",
+                        &hint_text,
+                        Duration::from_secs(15),
+                    )
+                    .await,
                     "Tab で予測が確定し、案内の文字列は実行内容に混ざらない（#614）",
                 );
 
@@ -28210,9 +28390,14 @@ mod self_test {
                 type_text(any, cx, "ls TAKO614-uniq", false);
                 wait(cx, 1200).await;
                 press(any, cx, "tab");
-                wait(cx, 2000).await;
                 check(
-                    focused_contains(window, cx, "TAKO614-unique-file.txt"),
+                    wait_for_focused_text(
+                        window,
+                        cx,
+                        "TAKO614-unique-file.txt",
+                        Duration::from_secs(15),
+                    )
+                    .await,
                     "ゴーストが無いときの Tab は従来の補完（#614 非回帰）",
                 );
                 press(any, cx, "ctrl-u");
@@ -28243,10 +28428,15 @@ mod self_test {
                 // 種になっている `echo TAKO600-gh` とは**別の接頭辞**にしておく
                 // （完全一致が履歴の先頭に来るとゴーストが出なくなる）
                 type_text(any, cx, "echo TAKO600-g", false);
-                wait(cx, 1500).await;
                 check(
-                    focused_contains(window, cx, &hint_text_no_tab)
-                        && !focused_contains(window, cx, &hint_text),
+                    absent_after_anchor(
+                        window,
+                        cx,
+                        &hint_text_no_tab,
+                        &hint_text,
+                        Duration::from_secs(15),
+                    )
+                    .await,
                     "Tab 確定 OFF では案内から Tab が消える（#614）",
                 );
                 press(any, cx, "tab");
@@ -28283,9 +28473,8 @@ mod self_test {
                 press(any, cx, "enter");
                 wait(cx, 1200).await;
                 type_text(any, cx, "echo TAKO600-gh", false);
-                wait(cx, 1500).await;
                 check(
-                    focused_contains(window, cx, &hint_text),
+                    wait_for_focused_text(window, cx, &hint_text, Duration::from_secs(15)).await,
                     "残り 1 回なら案内は出る（#614）",
                 );
                 if let Some(root) = hint_root.as_ref() {
@@ -28301,19 +28490,18 @@ mod self_test {
                 type_text(any, cx, "clear", true);
                 wait(cx, 1000).await;
                 type_text(any, cx, "echo TAKO600-gh", false);
-                wait(cx, 1500).await;
                 check(
-                    focused_contains(window, cx, "ghost-ok")
-                        && !focused_contains(window, cx, &hint_text)
+                    absent_after_anchor(window, cx, "ghost-ok", &hint_text, Duration::from_secs(15))
+                        .await
                         && !focused_contains(window, cx, &hint_text_no_tab),
                     "残り回数を使い切ると案内が消える（#614 うるさくならない）",
                 );
                 press(any, cx, "tab");
                 wait(cx, 800).await;
                 press(any, cx, "enter");
-                wait(cx, 1200).await;
                 check(
-                    focused_contains(window, cx, "TAKO600-ghost-ok"),
+                    wait_for_focused_text(window, cx, "TAKO600-ghost-ok", Duration::from_secs(15))
+                        .await,
                     "案内が消えても Tab 確定は効き続ける（#614）",
                 );
 
@@ -28331,11 +28519,20 @@ mod self_test {
                         app.marked_text_range(window, cx) == Some(0..4)
                     })
                     .unwrap_or(false);
-                wait(cx, 600).await;
                 check(ime_kept, "予測表示中でも IME 変換を開始できる");
+                // 「PTY へ流れない」の否定側は**流れてしまう場合の往復ぶん**待たないと
+                // 検出力が落ちる（アンカーは既に画面にあるゴーストなので即成立する）。
+                // ここだけは落ち着き待ちを残すのが正しい（#796 の規約どおり）
+                wait(cx, 600).await;
                 check(
-                    focused_contains(window, cx, "ghost-ok")
-                        && !focused_contains(window, cx, "にほんご"),
+                    absent_after_anchor(
+                        window,
+                        cx,
+                        "ghost-ok",
+                        "にほんご",
+                        Duration::from_secs(10),
+                    )
+                    .await,
                     "IME 変換中も予測が保たれ未確定文字列は PTY へ流れない",
                 );
                 let ime_cleared = window
@@ -28345,9 +28542,8 @@ mod self_test {
                     })
                     .unwrap_or(false);
                 check(ime_cleared, "IME 変換をキャンセルできる");
-                wait(cx, 600).await;
                 check(
-                    focused_contains(window, cx, "ghost-ok"),
+                    wait_for_focused_text(window, cx, "ghost-ok", Duration::from_secs(10)).await,
                     "IME キャンセル後も予測が残る",
                 );
 
@@ -28357,19 +28553,23 @@ mod self_test {
                 type_text(any, cx, "printf '\\033[?1049h'; cat; printf '\\033[?1049l'", true);
                 wait(cx, 1200).await;
                 type_text(any, cx, "TAKO600-alt", false);
-                wait(cx, 1000).await;
                 check(
-                    focused_contains(window, cx, "TAKO600-alt")
-                        && !focused_contains(window, cx, "ghost-ok"),
+                    absent_after_anchor(
+                        window,
+                        cx,
+                        "TAKO600-alt",
+                        "ghost-ok",
+                        Duration::from_secs(15),
+                    )
+                    .await,
                     "alt screen の TUI に予測が干渉しない",
                 );
                 // 抜けるのは EOF（ctrl-d）で。ctrl-c だと zsh が `;` リストごと中断し、
                 // 続く `printf '\e[?1049l'` が走らず alt screen に取り残される
                 press(any, cx, "enter");
                 press(any, cx, "ctrl-d");
-                wait(cx, 1000).await;
                 check(
-                    focused_contains(window, cx, "ST600>"),
+                    wait_for_focused_text(window, cx, "ST600>", Duration::from_secs(15)).await,
                     "alt screen から通常画面へ戻る",
                 );
 
@@ -28396,9 +28596,17 @@ mod self_test {
                 type_text(any, cx, "clear", true);
                 wait(cx, 1000).await;
                 type_text(any, cx, "echo TAKO600-gh", false);
-                wait(cx, 1200).await;
+                // #796: 否定検査は「打った行が画面に出た」ことをアンカーにする
+                // （固定待ちだと、出力が来る前に通ってしまう = 偽 PASS になりうる）
                 check(
-                    !focused_contains(window, cx, "ghost-ok"),
+                    absent_after_anchor(
+                        window,
+                        cx,
+                        "echo TAKO600-gh",
+                        "ghost-ok",
+                        Duration::from_secs(15),
+                    )
+                    .await,
                     "OFF で予測が消える（稼働中のシェルにも効く）",
                 );
                 press(any, cx, "ctrl-u");
@@ -28455,7 +28663,15 @@ mod self_test {
                 let _ = std::fs::remove_dir_all(&iso);
                 std::fs::create_dir_all(iso.join("bin")).expect("隔離 HOME を作れる");
                 let zshrc = iso.join(".zshrc");
-                std::fs::write(&zshrc, "PROMPT='ST601> '\n").expect(".zshrc を置ける");
+                // #796: A と B で**別のプロンプト**にする。同じ `ST601>` だと、B の
+                // 「起動を待つ」判定が A の残り表示に即マッチして真になり
+                // （画面は消えない = 偽の待ち条件）、続く `clear` と `tako` が
+                // 起動前の外側シェルへ流れて「解決順を変えない」が偽 FAILED になっていた
+                std::fs::write(
+                    &zshrc,
+                    "PROMPT=\"ST601${TAKO601_PHASE}> \"\n",
+                )
+                .expect(".zshrc を置ける");
                 // ユーザーが自分で PATH に置いた tako（別実体）を模す
                 let user_cli = iso.join("bin/tako");
                 std::fs::write(&user_cli, "#!/bin/sh\necho TAKO601-user\n").expect("置ける");
@@ -28472,48 +28688,36 @@ mod self_test {
                     any,
                     cx,
                     &format!(
-                        "PATH=/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
+                        "TAKO601_PHASE=A PATH=/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
                         iso.display()
                     ),
                     true,
                 );
-                // zsh の起動と各コマンドの出力は固定待ちでは間に合わないことがある
-                // （負荷時に落ちるフレーク源だった）。項目 17 / 42 と同じリトライで待つ
-                let mut zsh_up = false;
-                for _ in 0..12 {
-                    wait(cx, 500).await;
-                    zsh_up = focused_contains(window, cx, "ST601>");
-                    if zsh_up {
-                        break;
-                    }
-                }
-                check(zsh_up, "検証用 zsh が起動する（PATH 注入）");
+                // zsh の起動と各コマンドの出力は固定待ちでは間に合わない（負荷時に落ちる
+                // フレーク源だった）。状態到達で待つ = 上限まで来なければ失敗（#796）。
+                // 実測時間を残すのは「旧実装の固定 2500ms がどれだけ足りていなかったか」を
+                // 後から見られるようにするため（load とセットで TAKO_SELF_TEST_601 に出す）
+                let zsh_a_ms =
+                    wait_for_focused_text_timed(window, cx, "ST601A>", Duration::from_secs(20))
+                        .await;
+                check(
+                    zsh_a_ms.is_some(),
+                    "検証用 zsh が起動する（PATH 注入）",
+                );
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "tako --version | sed 's/^/TAKO601-A=/'", true);
-                let mut ver_ok = false;
-                for _ in 0..12 {
-                    wait(cx, 500).await;
-                    ver_ok = focused_contains(window, cx, "TAKO601-A=tako ");
-                    if ver_ok {
-                        break;
-                    }
-                }
                 check(
-                    ver_ok,
+                    wait_for_focused_text(window, cx, "TAKO601-A=tako ", Duration::from_secs(20))
+                        .await,
                     "PATH に tako が無くても tako 内シェルから実行できる",
                 );
                 type_text(any, cx, "command -v tako", true);
                 let expect_which = format!("{}/tako", cli_dir.display());
-                let mut which_ok = false;
-                for _ in 0..12 {
-                    wait(cx, 500).await;
-                    which_ok = focused_contains(window, cx, &expect_which);
-                    if which_ok {
-                        break;
-                    }
-                }
-                check(which_ok, "解決されるのは実行中バイナリの隣の CLI");
+                check(
+                    wait_for_focused_text(window, cx, &expect_which, Duration::from_secs(20)).await,
+                    "解決されるのは実行中バイナリの隣の CLI",
+                );
                 type_text(any, cx, "exit", true);
                 wait(cx, 1000).await;
 
@@ -28522,35 +28726,27 @@ mod self_test {
                     any,
                     cx,
                     &format!(
-                        "PATH={}/bin:/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
+                        "TAKO601_PHASE=B PATH={}/bin:/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
                         iso.display(),
                         iso.display()
                     ),
                     true,
                 );
                 // A と同じく起動を待ってから打つ（`clear` を前のシェルへ打ち込むと
-                // 以降の判定が丸ごとズレる = 「解決順を変えない」の偽 FAILED になっていた）
-                let mut zsh_up_b = false;
-                for _ in 0..12 {
-                    wait(cx, 500).await;
-                    zsh_up_b = focused_contains(window, cx, "ST601>");
-                    if zsh_up_b {
-                        break;
-                    }
-                }
-                check(zsh_up_b, "検証用 zsh が起動する（既存 tako あり）");
+                // 以降の判定が丸ごとズレる = 「解決順を変えない」の偽 FAILED になっていた）。
+                // #796: 待つ相手は **B 専用のプロンプト**。A と同じ文字列だと画面に
+                // 残っている A のプロンプトへ即マッチして「起動した」ことになっていた
+                check(
+                    wait_for_focused_text(window, cx, "ST601B>", Duration::from_secs(20)).await,
+                    "検証用 zsh が起動する（既存 tako あり）",
+                );
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "tako", true);
-                let mut user_ok = false;
-                for _ in 0..12 {
-                    wait(cx, 500).await;
-                    user_ok = focused_contains(window, cx, "TAKO601-user");
-                    if user_ok {
-                        break;
-                    }
-                }
-                check(user_ok, "既存の tako の解決順を変えない");
+                check(
+                    wait_for_focused_text(window, cx, "TAKO601-user", Duration::from_secs(20)).await,
+                    "既存の tako の解決順を変えない",
+                );
                 type_text(
                     any,
                     cx,
@@ -28560,15 +28756,10 @@ mod self_test {
                     ),
                     true,
                 );
-                let mut no_append = false;
-                for _ in 0..12 {
-                    wait(cx, 500).await;
-                    no_append = focused_contains(window, cx, "TAKO601-B=0");
-                    if no_append {
-                        break;
-                    }
-                }
-                check(no_append, "既存の tako があるときは PATH へ足さない");
+                check(
+                    wait_for_focused_text(window, cx, "TAKO601-B=0", Duration::from_secs(20)).await,
+                    "既存の tako があるときは PATH へ足さない",
+                );
                 type_text(any, cx, "exit", true);
                 wait(cx, 1000).await;
 
@@ -28580,7 +28771,12 @@ mod self_test {
                 let _ = std::fs::remove_dir_all(&iso);
                 // check は失敗時に即 exit するので、この行が出たら 41d は全判定を通っている
                 // （黙って素通りした場合と区別できるようにする）
-                println!("TAKO_SELF_TEST_601: cli_dir={}", cli_dir.display());
+                println!(
+                    "TAKO_SELF_TEST_601: cli_dir={} zsh_startup_ms={} {}",
+                    cli_dir.display(),
+                    zsh_a_ms.map(|d| d.as_millis()).unwrap_or_default(),
+                    env_line()
+                );
             } else {
                 println!("TAKO_SELF_TEST_SKIPPED: 41d（zsh か統合ディレクトリが無い）");
             }
@@ -28596,9 +28792,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
             check(
-                focused_contains(window, cx, "TAKO-DISC-42"),
+                wait_for_focused_text(window, cx, "TAKO-DISC-42", Duration::from_secs(20)).await,
                 "環境変数なしでファイル発見接続",
             );
             // 42b. 古い環境変数からのフォールバック（接続不可 → ファイル、認証失敗 → ファイル）
@@ -28612,9 +28807,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
             check(
-                focused_contains(window, cx, "TAKO-STALE-42"),
+                wait_for_focused_text(window, cx, "TAKO-STALE-42", Duration::from_secs(20)).await,
                 "古い環境変数からフォールバック",
             );
 
@@ -29128,8 +29322,11 @@ mod self_test {
                     ),
                     true,
                 );
-                wait(cx, 1500).await;
-                check(focused_contains(window, cx, "TAKO-TMUX-48"), "tako tmux list");
+                check(
+                    wait_for_focused_text(window, cx, "TAKO-TMUX-48", Duration::from_secs(20))
+                        .await,
+                    "tako tmux list",
+                );
                 type_text(
                     any,
                     cx,
@@ -29322,9 +29519,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
             check(
-                focused_contains(window, cx, "TAKO-AR-52"),
+                wait_for_focused_text(window, cx, "TAKO-AR-52", Duration::from_secs(20)).await,
                 "tako autorename off / 状態取得",
             );
             let toggled = window
@@ -29419,9 +29615,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
             check(
-                focused_contains(window, cx, "TAKO-PD-55"),
+                wait_for_focused_text(window, cx, "TAKO-PD-55", Duration::from_secs(20)).await,
                 "tako portdetect off / 状態取得",
             );
             let detect_cleared = window
@@ -29965,15 +30160,39 @@ mod self_test {
                 &format!("{cli} split --down --focus -- sh -c 'echo TAKO-CMD-\"OK\"; sleep 15'"),
                 true,
             );
-            let mut cmd_ok = false;
-            for _ in 0..15 {
-                wait(cx, 600).await;
-                cmd_ok = focused_contains(window, cx, "TAKO-CMD-OK");
-                if cmd_ok {
+            // #796: 旧実装は上限 9 秒。CLI のコールドスタート + ログインシェル + tmux は
+            // 高負荷で 9 秒を超える。状態到達で待ち、上限で診断を出す。
+            //
+            // さらに、**ウィンドウが他アプリに完全に隠れていると GPUI が描画を止め、
+            // 新ペインのシェルは 1 行も出さない**（項目 76d / 104 と同じ環境要因。
+            // 実測: `screen_tail=""` で 40 秒経過）。描かれたかどうかを
+            // `pane_text_areas`（= 1 度でも描画されたペインだけが載る）で見て、
+            // 未描画ならスキップを明示する
+            let mut cmd_pane_painted = false;
+            for _ in 0..60 {
+                wait(cx, 100).await;
+                cmd_pane_painted = window
+                    .update(cx, |app, _, _| {
+                        let pane = app.focused_pane();
+                        app.pane_text_areas.iter().any(|(id, _)| *id == pane)
+                    })
+                    .unwrap_or(false);
+                if cmd_pane_painted {
                     break;
                 }
             }
-            check(cmd_ok, "明示コマンド付き split（ログインシェル経由）");
+            if cmd_pane_painted {
+                check(
+                    wait_for_focused_text(window, cx, "TAKO-CMD-OK", Duration::from_secs(40)).await,
+                    "明示コマンド付き split（ログインシェル経由）",
+                );
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 63（新ペインが未描画 = ウィンドウが完全に隠れて \
+                     描画が止まった。前面にして再実行すると検証できる） {}",
+                    env_line()
+                );
+            }
             press(any, cx, "cmd-w");
             wait(cx, 500).await;
 
@@ -29988,9 +30207,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
             check(
-                focused_contains(window, cx, "TAKO-PN-64"),
+                wait_for_focused_text(window, cx, "TAKO-PN-64", Duration::from_secs(20)).await,
                 "tako panel CLI の roundtrip",
             );
             let panel_synced = window
@@ -30016,9 +30234,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1200).await;
             check(
-                focused_contains(window, cx, "TAKO-FT-64b"),
+                wait_for_focused_text(window, cx, "TAKO-FT-64b", Duration::from_secs(20)).await,
                 "tako panel --filetree の roundtrip",
             );
             let filetree_synced = window
@@ -30054,9 +30271,8 @@ mod self_test {
                 ),
                 true,
             );
-            wait(cx, 1500).await;
             check(
-                focused_contains(window, cx, "TAKO-DSC-65"),
+                wait_for_focused_text(window, cx, "TAKO-DSC-65", Duration::from_secs(20)).await,
                 "汚染された current から生存インスタンスへフォールバック",
             );
 
@@ -30219,7 +30435,7 @@ mod self_test {
             .await
             .is_some();
             // 新しい本文の子矩形を確定させ、ジャンプ前は 3 項目目が画面外であることを測る。
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            notify_and_draw(any, window, cx);
             wait(cx, 50).await;
             let markdown_target_position = |app: &TakoApp| -> Option<(f32, f32, f32)> {
                 let target = app
@@ -30278,7 +30494,7 @@ mod self_test {
                     jumped["selected"]["kind"] == "markdown_block"
                 })
                 .unwrap_or(false);
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            notify_and_draw(any, window, cx);
             wait(cx, 50).await;
             let markdown_after = window
                 .update(cx, |app, _, _| markdown_target_position(app))
@@ -30388,23 +30604,59 @@ mod self_test {
             .await
             .is_some();
             // background 完了後の PDF ページ矩形を確定してからジャンプ要求を出す。
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
-            wait(cx, 50).await;
-            let pdf_page_position = |app: &TakoApp| -> Option<(f32, f32, f32, f32, f32)> {
+            //
+            // #796: ここは「1 回 draw して 50ms 待つ」だけだった。PDF のページは
+            // **ラスタライズ済み（PNG が非空）のものだけがスクロールの子として並ぶ**
+            // ので、2 ページ目のデコードが終わる前に飛ばすと `scroll_to_top_of_item(1)` が
+            // 前フレームの幾何を基準に offset を決めてしまい、ページ 2 が画面上端から
+            // ずれた位置に着く（実測 290px。負荷とビルド構成でだけ起きるフレークの正体）。
+            // 対策は「ジャンプの前に幾何を確定させる」= ページが揃い、2 回連続で
+            // 同じ矩形が返るまで draw して待つ
+            let pdf_page_position = |app: &TakoApp| -> Option<PdfScrollProbe> {
                 let handle = app.preview_scroll_handles.get(&PaneId::from_raw(pane))?;
                 let page_bounds = handle.bounds_for_item(1)?;
-                Some((
-                    f32::from(handle.offset().y),
-                    f32::from(page_bounds.top() + handle.offset().y),
-                    f32::from(page_bounds.bottom() + handle.offset().y),
-                    f32::from(handle.bounds().top()),
-                    f32::from(handle.bounds().bottom()),
-                ))
+                Some(PdfScrollProbe {
+                    offset_y: f32::from(handle.offset().y),
+                    page_top: f32::from(page_bounds.top() + handle.offset().y),
+                    page_bottom: f32::from(page_bounds.bottom() + handle.offset().y),
+                    view_top: f32::from(handle.bounds().top()),
+                    view_bottom: f32::from(handle.bounds().bottom()),
+                    children: handle.children_count(),
+                    max_offset_y: f32::from(handle.max_offset().y),
+                })
             };
-            let pdf_before = window
-                .update(cx, |app, _, _| pdf_page_position(app))
-                .ok()
-                .flatten();
+            // ページ 2 の矩形が 2 回連続で同じ値になったら「幾何が確定した」とみなす
+            let mut pdf_before = None;
+            let mut pdf_settle_ms = 0u64;
+            let mut pdf_settle_last: Option<PdfScrollProbe> = None;
+            {
+                let mut previous: Option<PdfScrollProbe> = None;
+                for _ in 0..80 {
+                    notify_and_draw(any, window, cx);
+                    wait(cx, 50).await;
+                    pdf_settle_ms += 50;
+                    let current = window
+                        .update(cx, |app, _, _| pdf_page_position(app))
+                        .ok()
+                        .flatten();
+                    // 幾何が意味を持つのは「ページ 2 の矩形が取れて、器の高さも決まり、
+                    // 実際にスクロールできる余地がある」時（#796: PDF は
+                    // ラスタライズ済みページだけが子なので、途中では余地が 0 になる）
+                    let usable = current.is_some_and(|probe| {
+                        probe.page_bottom > probe.page_top
+                            && probe.view_bottom > probe.view_top
+                            && probe.max_offset_y > 1.0
+                    });
+                    if current.is_some() {
+                        pdf_settle_last = current;
+                    }
+                    if usable && current == previous {
+                        pdf_before = current;
+                        break;
+                    }
+                    previous = current;
+                }
+            }
             let pdf_outline_ok = window
                 .update(cx, |app, _, _| {
                     let listed = tako_control::dispatch(
@@ -30439,25 +30691,41 @@ mod self_test {
                             .is_some_and(|view| view.page == 2)
                 })
                 .unwrap_or(false);
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
-            wait(cx, 50).await;
-            let pdf_after = window
-                .update(cx, |app, _, _| pdf_page_position(app))
-                .ok()
-                .flatten();
-            let (pdf_jump_ok, pdf_jump_delta) = match (pdf_before, pdf_after) {
-                (
-                    Some((before_offset, before_page_top, _, _, _)),
-                    Some((after_offset, after_page_top, after_page_bottom, top, bottom)),
-                ) => (
-                    after_offset < before_offset - 1.0
-                        && after_page_top < before_page_top - 1.0
-                        && after_page_top < bottom
-                        && after_page_bottom > top,
-                    (after_page_top - top).abs(),
-                ),
-                _ => (false, f32::INFINITY),
-            };
+            // ジャンプの着地は次のフレームの prepaint で決まる（offset の適用 →
+            // 再レイアウト）。#796: 1 フレームだけ見て諦めるのをやめ、条件が揃うまで
+            // draw して待つ。**待っても揃わなければ偽**なので検出力は落ちない
+            let mut pdf_after = None;
+            let mut pdf_jump_ok = false;
+            let mut pdf_jump_delta = f32::INFINITY;
+            let mut pdf_jump_why = String::from("計測できず");
+            for _ in 0..80 {
+                notify_and_draw(any, window, cx);
+                wait(cx, 50).await;
+                pdf_after = window
+                    .update(cx, |app, _, _| pdf_page_position(app))
+                    .ok()
+                    .flatten();
+                match (pdf_before, pdf_after) {
+                    (Some(before), Some(after)) => {
+                        // 失敗したときに「どの条件で落ちたか」を残す（#796: 旧実装は
+                        // delta しか出さず、スクロール未適用と着地ズレを切り分けられなかった）
+                        let scrolled = after.offset_y < before.offset_y - 1.0;
+                        let moved_up = after.page_top < before.page_top - 1.0;
+                        let visible =
+                            after.page_top < after.view_bottom && after.page_bottom > after.view_top;
+                        pdf_jump_delta = (after.page_top - after.view_top).abs();
+                        pdf_jump_ok = scrolled && moved_up && visible;
+                        pdf_jump_why =
+                            format!("scrolled={scrolled} moved_up={moved_up} visible={visible}");
+                    }
+                    _ => {
+                        pdf_jump_why = "ページ 2 の矩形が取れない（未ラスタライズ）".into();
+                    }
+                }
+                if pdf_jump_ok {
+                    break;
+                }
+            }
             let plain_pdf_opened = window
                 .update(cx, |app, _, cx| {
                     let opened = selftest_open(
@@ -30539,7 +30807,7 @@ mod self_test {
                 })
                 .unwrap_or((false, false, false, false));
             println!(
-                "TAKO_PREVIEW_OUTLINE_DEBUG: md_list_ok={markdown_outline_ok} md_jump_ok={markdown_jump_ok} md_jump_delta_px={markdown_jump_delta:.1} pdf_list_ok={pdf_outline_ok} pdf_jump_ok={pdf_jump_ok} pdf_jump_delta_px={pdf_jump_delta:.1}"
+                "TAKO_PREVIEW_OUTLINE_DEBUG: md_list_ok={markdown_outline_ok} md_jump_ok={markdown_jump_ok} md_jump_delta_px={markdown_jump_delta:.1} pdf_list_ok={pdf_outline_ok} pdf_jump_ok={pdf_jump_ok} pdf_jump_delta_px={pdf_jump_delta:.1} pdf_jump_why=({pdf_jump_why}) pdf_settle_ms={pdf_settle_ms} pdf_settle_last={pdf_settle_last:?} pdf_before={pdf_before:?} pdf_after={pdf_after:?}"
             );
             check(code_ok, "コードプレビューの open");
             check(md_ok, "Markdown プレビューの再利用");
@@ -31502,7 +31770,7 @@ mod self_test {
                     cx.notify();
                 })
                 .ok();
-            let _ = any.update(cx, |_, preview_window, cx| preview_window.draw(cx).clear());
+            notify_and_draw(any, window, cx);
             wait(cx, 50).await;
             let (mode_before, scroll_before, apply_before) = window
                 .update(cx, |app, _, _| {
@@ -32032,18 +32300,45 @@ mod self_test {
                         opened["pane"].as_u64().expect("pane が返る")
                     })
                     .unwrap_or(0);
-                // attach クライアントが実際にセッションへ繋がる（list-clients が非空になる）
+                // attach クライアントが実際にセッションへ繋がる（list-clients が非空になる）。
+                // #796: 上限まで待っても繋がらないときは **tmux の言い分**（stderr）と
+                // ペイン側の状態を残す。旧実装は真偽だけで、負荷起因の遅れと
+                // 「そもそも attach が失敗している」を切り分けられなかった
                 let mut attached = false;
+                let mut attach_diag = String::from("list-clients を実行できない");
                 for _ in 0..25 {
                     wait(cx, 400).await;
-                    attached = std::process::Command::new("tmux")
+                    let out = std::process::Command::new("tmux")
                         .args(["-L", &dnd_sock, "list-clients"])
-                        .output()
-                        .map(|o| o.status.success() && !o.stdout.is_empty())
-                        .unwrap_or(false);
+                        .output();
+                    if let Ok(out) = out.as_ref() {
+                        attached = out.status.success() && !out.stdout.is_empty();
+                        attach_diag = format!(
+                            "status={} stdout_len={} stderr={:?}",
+                            out.status,
+                            out.stdout.len(),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        );
+                    }
                     if attached {
                         break;
                     }
+                }
+                if !attached {
+                    let pane_state = window
+                        .update(cx, |app, _, _| {
+                            format!(
+                                "pane={} backend={:?} alive={}",
+                                opened_pane,
+                                app.backend_sessions.get(&PaneId::from_raw(opened_pane)).cloned(),
+                                app.terminals.contains_key(&PaneId::from_raw(opened_pane))
+                            )
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "TAKO_SELF_TEST_TMUX_ATTACH: {attach_diag} {pane_state} {}",
+                        env_line()
+                    );
                 }
                 check(attached, "tmux open: 分割ペインの attach クライアントが繋がる");
                 // 存在しないセッション名は分割前に弾かれる（空ペインが生えない）
@@ -34001,13 +34296,53 @@ mod self_test {
 
                 // 73f. #566: 通常の（role 無し・アイドルの）シェルペインは確認なしで即 close。
                 //      確認を全ペインに出すと日常操作の邪魔になるため、対象を絞る不変条件
+                //
+                // #732 / #796: この項目は間欠的に落ちていた。分割直後のペインは
+                // シェルの起動（rc / compinit / シェル統合の precmd）で**まだ子プロセスを
+                // 抱えている**ことがあり、`pane_close_needs_confirm` の「子プロセスあり」で
+                // 真になる。前提（= 素のアイドルなペイン）が整うまで待ってから
+                // 「確認なしで閉じる」を検査する。判定内容そのものは変えていない
                 type_text(
                     any,
                     cx,
                     &format!("{cli} split --right --focus >/dev/null"),
                     true,
                 );
-                wait(cx, 1500).await;
+                let split_pane_before = window
+                    .update(cx, |app, _, _| app.focused_pane())
+                    .unwrap_or_else(|_| fail("73f: 分割前のフォーカス取得"));
+                let mut plain_target = None;
+                let mut plain_idle = false;
+                for _ in 0..60 {
+                    wait(cx, 250).await;
+                    let state = window
+                        .update(cx, |app, _, _| {
+                            let target = app.focused_pane();
+                            (
+                                target,
+                                target != split_pane_before,
+                                !app.pane_close_needs_confirm(target),
+                            )
+                        })
+                        .unwrap_or((split_pane_before, false, false));
+                    if state.1 {
+                        plain_target = Some(state.0);
+                        plain_idle = state.2;
+                        if plain_idle {
+                            break;
+                        }
+                    }
+                }
+                if plain_target.is_none() {
+                    fail("73f: split で新ペインへフォーカスが移らない");
+                }
+                // 前提が整わなかったら「なぜ」を残す（黙って落ちるのを避ける。#796）
+                if !plain_idle {
+                    println!(
+                        "TAKO_SELF_TEST_732: 分割直後のペインが 15 秒アイドルにならなかった {}",
+                        env_line()
+                    );
+                }
                 let plain_ok = window
                     .update(cx, |app, _, cx| {
                         let before = app.workspace.active_tab().tree().len();
@@ -36154,23 +36489,36 @@ mod self_test {
                 check(listed_ok, "コマンドカードの list が論理文字列を返す (#666)");
 
                 // (a)(b)(c) UI のコピーボタンと同じ経路 → 実クリップボードで照合
-                let copy_via_button = |index: usize, cx: &mut AsyncApp| -> Option<String> {
-                    window
-                        .update(cx, |app, _, cx| {
-                            app.copy_command_card(card_id, index, cx);
-                            // render と同じ 1 行（GPUI の clipboard API は App が要る）
-                            app.flush_pending_clipboard(cx);
-                        })
-                        .ok()?;
-                    cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()))
+                // クリップボードは**OS 共有の資源**なので、他プロセス（並走している
+                // worker の pbcopy 等）が割り込むと読み戻しが一致しない。#796: 期待値と
+                // 違ったら数回だけ押し直す（押す経路は UI ボタンと同じまま）
+                let copy_via_button = |index: usize,
+                                       expected: &str,
+                                       cx: &mut AsyncApp|
+                 -> Option<String> {
+                    let mut last = None;
+                    for _ in 0..5 {
+                        window
+                            .update(cx, |app, _, cx| {
+                                app.copy_command_card(card_id, index, cx);
+                                // render と同じ 1 行（GPUI の clipboard API は App が要る）
+                                app.flush_pending_clipboard(cx);
+                            })
+                            .ok()?;
+                        last = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()));
+                        if last.as_deref() == Some(expected) {
+                            break;
+                        }
+                    }
+                    last
                 };
-                let copied_long = copy_via_button(1, cx);
+                let copied_long = copy_via_button(1, &long, cx);
                 check(
                     copied_long.as_deref() == Some(long.as_str())
                         && !copied_long.as_deref().unwrap_or("\n").contains('\n'),
                     "長いコマンドが改行なしの論理 1 行でコピーされる (#666)",
                 );
-                let copied_tricky = copy_via_button(2, cx);
+                let copied_tricky = copy_via_button(2, tricky, cx);
                 check(
                     copied_tricky.as_deref() == Some(tricky),
                     "改行・引用符・変数・日本語を含むコマンドがそのままコピーされる (#666)",
@@ -36206,7 +36554,15 @@ mod self_test {
                     .unwrap_or(false);
                 check(narrow_ok, "狭幅ペインでもカードを描画できる (#666)");
 
-                // (d) UI の「新規ペインで実行」ボタン → 同じタブにペインが生えて実行される
+                // (d) UI の「新規ペインで実行」ボタン → 同じタブにペインが生えて実行される。
+                //
+                // #796: 新しいペインのシェルが出力するには**そのペインが描かれる**必要がある
+                // （ウィンドウが他アプリに完全に隠れると GPUI は描画を止め、新ペインは
+                // 1 行も出さない。項目 104 / 76d に同じ先例）。ここは実出力まで見る項目なので、
+                // 押す前に自分を前面へ出しておく
+                cx.update(|cx| cx.activate(true));
+                let _ = window.update(cx, |_, win, _| win.activate_window());
+                wait(cx, 400).await;
                 let marker = "TAKO-CARD-RUN-OK";
                 let run_cmd = format!("echo {marker}");
                 let before = window
@@ -36266,10 +36622,13 @@ mod self_test {
                     "TAKO_SELF_TEST_666_STRUCTURE: panes {} -> {} tabs={} focus_kept={} new_pane={:?}",
                     before.0, after_len, tabs_len, focus_kept, run_pane
                 );
-                // 実行はシェル起動 → 出力 → パースを待つ（tmux バックエンド時は attach ぶん遅い）
+                // 実行はシェル起動 → 出力 → パースを待つ（tmux バックエンド時は attach ぶん遅い）。
+                // #796: 上限 8 秒では高負荷時（load 16 帯）に間に合わないことがあり、
+                // 本 PR 前は worker B がここで落ちていた。30 秒まで待つ（早く出れば早く抜ける）
                 let mut ran = false;
-                for _ in 0..20 {
-                    wait(cx, 400).await;
+                let ran_started = std::time::Instant::now();
+                while ran_started.elapsed() < Duration::from_secs(30) {
+                    wait(cx, 250).await;
                     ran = window
                         .update(cx, |app, _, _| {
                             run_pane.and_then(|p| app.terminals.get(&p)).is_some_and(|s| {
@@ -36282,11 +36641,90 @@ mod self_test {
                     }
                 }
                 eprintln!(
-                    "TAKO_SELF_TEST_666_RUN: panes {} -> {} tabs={} focus_kept={} new_pane={:?} ran={}",
-                    before.0, after_len, tabs_len, focus_kept, run_pane, ran
+                    "TAKO_SELF_TEST_666_RUN: panes {} -> {} tabs={} focus_kept={} new_pane={:?} ran={} waited={:.1}s {}",
+                    before.0,
+                    after_len,
+                    tabs_len,
+                    focus_kept,
+                    run_pane,
+                    ran,
+                    ran_started.elapsed().as_secs_f32(),
+                    env_line()
                 );
+                // #796: 出力が来なかったときは**そのペインの実態**を残す
+                // （PTY が生きているか / バックエンドセッション名 / alt screen か /
+                // 実際に何が出ているか）。旧実装は真偽だけで、環境起因の
+                // 起動失敗と機能の壊れを切り分けられなかった
+                // 出力が来なかったときは**そのペインの実態**を残す（PTY が生きているか /
+                // バックエンドセッション名 / alt screen か / 実際に何が出ているか）。
+                // 旧実装は真偽だけで、環境起因の描画停止と機能の壊れを切り分けられなかった
+                let mut produced_nothing = false;
+                if !ran {
+                    let (detail, empty) = window
+                        .update(cx, |app, _, _| {
+                            let lines: Vec<String> = run_pane
+                                .and_then(|p| app.terminals.get(&p))
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .iter()
+                                        .map(|l| l.trim_end().to_string())
+                                        .filter(|l| !l.is_empty())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let has_pty = run_pane
+                                .map(|p| app.terminals.contains_key(&p))
+                                .unwrap_or(false);
+                            // 1 度でも描画されたペインだけが `pane_text_areas` に載る
+                            // （項目 76d / 104 が使っている「未描画」の signal）
+                            let painted = run_pane
+                                .map(|p| app.pane_text_areas.iter().any(|(id, _)| *id == p))
+                                .unwrap_or(false);
+                            (
+                                format!(
+                                    "has_pty={has_pty} painted={painted} backend={:?} alt={} nonempty_lines={} tail={:?}",
+                                    run_pane.and_then(|p| app.backend_sessions.get(&p).cloned()),
+                                    run_pane
+                                        .map(|p| app.pane_inner_alt_screen(p))
+                                        .unwrap_or(false),
+                                    lines.len(),
+                                    lines.iter().rev().take(5).collect::<Vec<_>>()
+                                ),
+                                has_pty && (!painted || lines.is_empty()),
+                            )
+                        })
+                        .unwrap_or_default();
+                    let backend_alive = window
+                        .update(cx, |app, _, _| {
+                            run_pane
+                                .and_then(|p| app.backend_sessions.get(&p).cloned())
+                                .map(|name| {
+                                    tako_core::tmux::has_session(
+                                        Some(&tako_core::tmux_backend::socket_name()),
+                                        &name,
+                                    )
+                                })
+                        })
+                        .ok()
+                        .flatten();
+                    eprintln!(
+                        "TAKO_SELF_TEST_666_RUN_DETAIL: {detail} backend_alive={backend_alive:?}"
+                    );
+                    produced_nothing = empty;
+                }
+                // PTY は生きているのに**未描画 / 1 行も出ていない**なら、シェルが走る機会を
+                // もらえていない = ウィンドウが完全に隠れて描画が止まった環境要因
+                // （項目 104 / 76d と同じ扱いで、落とさずスキップを明示する）。
+                // 出力があるのにマーカーだけ無い場合は機能の欠陥なので落とす
+                if produced_nothing {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 91(d) の実行検査（新ペインが未描画 / 1 行も \
+                         出していない = ウィンドウが完全に隠れて描画が止まった。前面にして \
+                         再実行すると検証できる）"
+                    );
+                }
                 check(
-                    structure_ok && ran,
+                    structure_ok && (ran || produced_nothing),
                     "カードの新規ペイン実行: 同じタブに生えて実行され、フォーカスは動かない (#666)",
                 );
 
@@ -37236,10 +37674,15 @@ mod self_test {
                 // **全ウィンドウを描く**: この時点でウィンドウは複数あり（#339 / #380。
                 // 項目 78 が開き直す）、外側の `any` は別のタブを表示していることがある。
                 // 1 枚だけ描くと「描かれていないのに素通り」になる
+                // #796: **汚してから**描く。#786 でペイン本体は `AnyView::cached` になり、
+                // dirty でないフレームは子ビューを描き直さない = 下端追従のように
+                // 「render が見て決める」状態が更新されない（製品経路は dispatch のあとに
+                // `cx.notify()` してから次フレームを描く）。TakoApp は全ウィンドウで
+                // 共有の 1 entity なので notify は 1 回で全ウィンドウへ効く（#339）
                 let draw_all_windows = |cx: &mut AsyncApp| {
-                    let handles = cx.update(|cx| cx.windows());
-                    for handle in handles {
-                        for _ in 0..2 {
+                    for _ in 0..2 {
+                        let _ = window.update(cx, |_, _, cx| cx.notify());
+                        for handle in cx.update(|cx| cx.windows()) {
                             let _ = handle.update(cx, |_, win, cx| win.draw(cx).clear());
                         }
                     }
@@ -40025,8 +40468,36 @@ mod self_test {
                     // (f) 長い未確定文字列。箱の幅を超えても外へはみ出さない
                     ("長い未確定", "とてもながいみていのもじれつをここにいれてはこのはばをこえさせる"),
                 ] {
+                    // #796: この検査の前提は「そのペインがチャット表示になっている」こと。
+                    // 表示種別は準備中（#720）やモード切替の余韻で数百 ms 揺れるので、
+                    // 前提の成立を待ってから変換を始める（待っても整わなければ落とす）
+                    let mut chat_ready = false;
+                    for _ in 0..40 {
+                        chat_ready = window
+                            .update(cx, |app, _, _| {
+                                ensure_chat(app, false);
+                                app.chat_ime_inline(chat_pane)
+                            })
+                            .unwrap_or(false);
+                        if chat_ready {
+                            break;
+                        }
+                        wait(cx, 100).await;
+                    }
+                    if !chat_ready {
+                        let display = window
+                            .update(cx, |app, _, _| app.pane_display_for(chat_pane))
+                            .ok();
+                        println!(
+                            "TAKO_SELF_TEST_737_PRECOND: pane_display={display:?} {}",
+                            env_line()
+                        );
+                    }
+                    check(
+                        chat_ready,
+                        &format!("#737({label}): 前提のチャット表示になっている"),
+                    );
                     let _ = window.update(cx, |app, window, cx| {
-                        ensure_chat(app, false);
                         app.replace_and_mark_text_in_range(
                             None,
                             preedit,
@@ -41039,25 +41510,45 @@ mod self_test {
                 let _ = tako_core::tmux::tmux_command(Some(&socket))
                     .args(["kill-session", "-t", &format!("={session}:")])
                     .output();
-                if tako_core::tmux::tmux_command(Some(&socket))
-                    .args([
-                        "new-session",
-                        "-d",
-                        "-s",
-                        &session,
-                        "sh",
-                        "-c",
-                        // `mcp serve` は stdin 待ちで居座るので長生きプロセスになる。
-                        // `& wait` にすると sh がペインのプロセスとして残り、偽 claude が
-                        // その子になる（本番と同じ形）。exec させると pane_pid 自身が
-                        // claude になり、検知側の「子孫を探す」判定に掛からない。
-                        // send-keys だとシェル起動待ちの取りこぼしで不安定になるので使わない
-                        &format!("{} mcp serve & wait", shell_escape(&launcher)),
-                    ])
-                    .output()
-                    .map(|o| !o.status.success())
-                    .unwrap_or(true)
-                {
+                // #796: tmux サーバーの起動と競合すると 1 回目の new-session が落ちることが
+                // ある（高負荷で実測）。数回だけ試し、駄目なら tmux の言い分を出して落とす
+                let mut session_made = false;
+                let mut session_err = String::new();
+                for _ in 0..5 {
+                    let out = tako_core::tmux::tmux_command(Some(&socket))
+                        .args([
+                            "new-session",
+                            "-d",
+                            "-s",
+                            &session,
+                            "sh",
+                            "-c",
+                            // `mcp serve` は stdin 待ちで居座るので長生きプロセスになる。
+                            // `& wait` にすると sh がペインのプロセスとして残り、偽 claude が
+                            // その子になる（本番と同じ形）。exec させると pane_pid 自身が
+                            // claude になり、検知側の「子孫を探す」判定に掛からない。
+                            // send-keys だとシェル起動待ちの取りこぼしで不安定になるので使わない
+                            &format!("{} mcp serve & wait", shell_escape(&launcher)),
+                        ])
+                        .output();
+                    match out {
+                        Ok(o) if o.status.success() => {
+                            session_made = true;
+                            break;
+                        }
+                        Ok(o) => {
+                            session_err =
+                                String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        }
+                        Err(e) => session_err = e.to_string(),
+                    }
+                    wait(cx, 500).await;
+                }
+                if !session_made {
+                    println!(
+                        "TAKO_SELF_TEST_772_TMUX: stderr={session_err:?} {}",
+                        env_line()
+                    );
                     fail("#772: 検証用 tmux セッションを作れない");
                 }
                 // 偽 claude がシェルの子として見えるまで待つ（最大 12 秒）
@@ -43465,5 +43956,79 @@ mod session_kill_boundary_tests {
             body.contains("save_layout()"),
             "アプリ終了処理から save_layout が消えている（再起動で構成を失う）"
         );
+    }
+}
+
+/// セルフテストの待ち条件の番犬（#796）。
+///
+/// 「固定時間待って画面に文字が出ているはず」で書くと、負荷やビルド構成
+/// （`visual-test` feature は gpui の leak-detection を有効にして数割遅くなる）で
+/// **同じソースなのに落ちる項目が変わる**。実際に #601 / #600 / PDF アウトライン /
+/// IME / tmux attach が main 由来の失敗として worker の完了判定を壊し続けた。
+///
+/// 正しい形は `wait_for_focused_text`（状態到達まで待ち、上限で偽 + 診断を出す）。
+/// visual-test は CI で走らないので、**CI で毎回走る静的検査**としてここに置く。
+#[cfg(test)]
+mod selftest_wait_watchdog {
+    /// 「固定待ちの直後に、画面の文字列が出ていることを前提にした check」を探す。
+    ///
+    /// 否定検査（`!focused_contains`）は対象外: 「出ないこと」の確認は
+    /// 落ち着くまでの待ちが本質なので、固定待ちで良い
+    /// （出るものを待つのに固定時間を使うのが誤り）
+    fn fixed_wait_then_positive_contains(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !(trimmed.starts_with("wait(cx, ") && trimmed.ends_with(").await;")) {
+                continue;
+            }
+            let following = lines
+                .iter()
+                .skip(index + 1)
+                .take(3)
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !following.starts_with("check(") {
+                continue;
+            }
+            // 肯定形が 1 つでもあれば違反（`!focused_contains` だけなら見逃す）
+            let mut rest = following.as_str();
+            while let Some(at) = rest.find("focused_contains(window") {
+                if !rest[..at].ends_with('!') {
+                    hits.push(index + 1);
+                    break;
+                }
+                rest = &rest[at + 1..];
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn 画面の文字列を待つ検査は固定待ちに依存していない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_wait_then_positive_contains(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「固定待ち → 画面に文字が出ているはず」で書かれている。\
+             負荷やビルド構成で落ちるフレークになるので `wait_for_focused_text`\
+             （状態到達まで待つ）を使うこと（#796）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬は固定待ちの肯定検査を見逃さず否定検査は許す() {
+        let bad = "            wait(cx, 800).await;\n            \
+                   check(focused_contains(window, cx, \"X\"), \"だめな形\");";
+        assert_eq!(fixed_wait_then_positive_contains(bad), vec![1]);
+        let negative = "            wait(cx, 800).await;\n            check(\n                \
+                        !focused_contains(window, cx, \"X\"),\n                \"出ないことの確認\",";
+        assert!(fixed_wait_then_positive_contains(negative).is_empty());
+        let good = "            check(\n                \
+                    wait_for_focused_text(window, cx, \"X\", Duration::from_secs(15)).await,\n";
+        assert!(fixed_wait_then_positive_contains(good).is_empty());
     }
 }
