@@ -8,6 +8,13 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.1] - 2026-08-15
+
+Nightly patch release (automated). Changes since v0.7.0:
+夜間パッチリリース（自動）。v0.7.0 以降の変更:
+
+- [ドキュメント] v0.7.0 リリースの作業記録を反映
+
 ## [0.7.0] - 2026-08-15
 
 安定版。v0.6.0 以降にテスト版チャンネル（夜間パッチ v0.6.1〜v0.6.11）で検証してきた
