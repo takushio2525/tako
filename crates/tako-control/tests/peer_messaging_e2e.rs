@@ -49,6 +49,29 @@ impl Drop for SessionGuard {
             self.dir.display()
         );
         let _ = std::fs::remove_dir_all(&self.dir);
+        remove_trust_entry(&self.dir);
+    }
+}
+
+/// claude の `.claude.json` からテスト用ディレクトリの projects エントリを除去する
+/// （best-effort）。`launch_claude` が事前信頼を書き込むので、消さないと実行のたびに
+/// ユーザーの設定へ残骸が溜まる（#612 と同じ後始末。書き先の解決規則も同じ）
+fn remove_trust_entry(dir: &Path) {
+    for path in claude_tui::config_json_paths(None) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        if projects.remove(&dir.display().to_string()).is_some() {
+            if let Ok(serialized) = serde_json::to_string_pretty(&root) {
+                let _ = std::fs::write(&path, serialized);
+            }
+        }
     }
 }
 
