@@ -456,8 +456,8 @@ enum PeerStep {
         /// transcript で受信を確認できたか
         received: bool,
     },
-    /// peer は使えない → 従来のキー操作経路へ
-    UseKeys,
+    /// peer は使えない → 従来のキー操作経路へ（理由は診断ログへ残す）
+    UseKeys { reason: &'static str },
     /// `TAKO_PEER_MESSAGING=only` で peer が使えなかった（検証用。キー経路へ落ちない）
     Refused { note: String },
 }
@@ -471,10 +471,20 @@ enum PeerAttemptResult {
         received: bool,
     },
     /// peer は使えなかった。キー操作経路へ落ちてよい
-    Fallback,
+    Fallback {
+        /// 安定した理由コード（診断ログ用）
+        reason: &'static str,
+        /// 待てば解消しうる理由か（claude が起動途中で受信箱をまだ開いていない等）
+        transient: bool,
+    },
     /// `TAKO_PEER_MESSAGING=only` で peer が使えなかった（検証用）
     Refused { note: String },
 }
+
+/// 一時的な不成立（起動途中で受信箱がまだ無い）を待つ猶予。
+/// claude の受信箱 bind は入力欄表示とほぼ同時（実測 1.1 秒）だが、負荷が高いと遅れる。
+/// 猶予を過ぎたら従来経路へ落ちる（待ち続けて送達が遅れる方が悪い）
+const PEER_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
 
 impl PromptFlow {
     fn new(
@@ -5149,7 +5159,10 @@ impl TakoApp {
                                 flow.state = PromptFlowState::Done;
                                 Self::report_prompt_delivery(&flow, "peer_refused");
                             }
-                            PeerStep::UseKeys => {
+                            PeerStep::UseKeys { reason } => {
+                                if let Some((backend, _)) = peer_ctx.as_ref() {
+                                    tako_control::delivery::log_fallback(backend, reason);
+                                }
                                 session.paste(&flow.prompt);
                                 flow.state = PromptFlowState::WaitTextInInput;
                                 flow.state_entered_at = now;
@@ -5273,14 +5286,18 @@ impl TakoApp {
         use tako_control::{delivery, peer_messaging};
         let Some((backend, agent_managed)) = ctx else {
             // バックエンドセッションが無いペイン（tmux 不在の直 spawn）は宛先を特定できない
-            return PeerStep::UseKeys;
+            return PeerStep::UseKeys {
+                reason: "no_backend_session",
+            };
         };
         let slot = match flow.peer_attempt.clone() {
             Some(slot) => slot,
             None => {
                 // I/O を伴わない事前判定で対象外なら background を起こさない
-                if delivery::plan(peer_messaging::mode(), *agent_managed).is_err() {
-                    return PeerStep::UseKeys;
+                if let Err(reason) = delivery::plan(peer_messaging::mode(), *agent_managed) {
+                    return PeerStep::UseKeys {
+                        reason: reason.code(),
+                    };
                 }
                 let slot: std::sync::Arc<std::sync::Mutex<Option<PeerAttemptResult>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -5293,7 +5310,9 @@ impl TakoApp {
                         delivery::PeerAttempt::Sent(outcome) => PeerAttemptResult::Sent {
                             received: outcome.verification.is_none_or(|v| v.is_received()),
                         },
-                        delivery::PeerAttempt::Fallback { .. } => PeerAttemptResult::Fallback,
+                        delivery::PeerAttempt::Fallback { reason, transient } => {
+                            PeerAttemptResult::Fallback { reason, transient }
+                        }
                         delivery::PeerAttempt::Refused { note } => {
                             PeerAttemptResult::Refused { note }
                         }
@@ -5309,7 +5328,16 @@ impl TakoApp {
         match done {
             None => PeerStep::Pending,
             Some(PeerAttemptResult::Sent { received }) => PeerStep::Sent { received },
-            Some(PeerAttemptResult::Fallback) => PeerStep::UseKeys,
+            Some(PeerAttemptResult::Fallback { reason, transient }) => {
+                // 起動途中で受信箱がまだ無いだけなら、猶予のあいだ再試行する
+                // （spawn 直後の 1 回だけを見て従来経路へ落とすと、長文プロンプトで
+                // 一番効く場面を取り逃す）
+                if transient && flow.created_at.elapsed() < PEER_GRACE {
+                    flow.peer_attempt = None;
+                    return PeerStep::Pending;
+                }
+                PeerStep::UseKeys { reason }
+            }
             Some(PeerAttemptResult::Refused { note }) => PeerStep::Refused { note },
         }
     }

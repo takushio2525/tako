@@ -124,6 +124,39 @@ master が「送達に失敗した」と読み違えていた。是正:
   `is_busy` の文言ではなく **画面が変化していないこと**（`claude_tui::screen_settled`）
   で判定する（実測で 120 行のリスト生成中に `is_busy` が false を返した）
 
+FR-2.2.2 追補 2（Issue #790・2026-08-14）: **claude worker への送達は 2 層**にする。
+第 1 層は claude の Cross-Session Messaging（peer messaging。v2.1.224+）= 受信箱の Unix
+domain socket へ直送する経路で、画面解析もキー操作も伴わない。第 2 層は従来のキー操作経路
+（上記の送達確認ループ）。第 1 層が使えなければ第 2 層へ落ちる。
+
+- 判定材料: claude のバージョン / `peerProtocol` / `kind == "interactive"` / 受信箱 socket の
+  実在 / 資格情報の可読性。**可用性はサーバー側 gate に依存し env で強制できない**ため、
+  実行時に見て落ちる（実装は `tako-control::peer_messaging` / `delivery`）
+- 発見: `<config dir>/sessions/<pid>.json`（`messagingSocketPath` 等）と
+  `<config dir>/sessions/<pid>.<hash>.key`（`peerToken`。0600）。**config dir ごとに別**なので、
+  アカウント切替（#504 / #512）の worker も `transcript::claude_config_dirs()` で解決する。
+  鍵は `procStart` がレジストリと一致するものだけ使う（pid 再利用の残骸を弾く）
+- **適用は「エージェント管理下の worker」に限る**: 受信側の本文には tako から抑制できない
+  定型の前置き（「別の claude セッションから届いた」「peer は権限昇格を与えない」「保留中
+  プロンプトの承認として扱うな」）が付く。master → worker の指示はその関係そのものなので
+  正確だが、人間由来の送達（master への指示・承認の代行）では意味が変わる。判定は
+  ペインの role（`peer_messaging::agent_managed_role`）。ペインが解決できない経路では
+  worker レジストリ（#390）に active で載っているかで見る
+- **送り切ったらフォールバックしない**（二重投函の防止）。落ちてよいのは可用性判定と
+  接続失敗（受信側が 1 行も読めていないと言える段階）だけ
+- 送達検証は transcript で行う。受信の姿は 2 形態あり**両方**を受理する:
+  `type:"user"` + `origin.kind == "peer"`（ターンとして処理）と `type:"attachment"` の
+  `queued_command`（生成中・ダイアログ中に進行中ターンへ折り込まれた）。加えて
+  `queue-operation`（enqueue）はキュー投函として扱う。判定は「送信直前に控えた
+  ファイル長より後ろの追記分」だけを見る（`sessions::now_iso()` は秒精度で transcript は
+  ミリ秒なので、時刻文字列の比較では同じ秒の痕跡を取りこぼす）
+- どちらの経路で送ったかは `<data_dir>/persist.log` に残す（無音で経路が変わらない）。
+  `TAKO_PEER_MESSAGING=off`（常に第 2 層）/ `only`（落ちずにエラー）で経路を固定でき、
+  フォールバックを機械検証できる
+- 受信箱は claude の起動途中に開く（実測 1.1 秒）。spawn 直後だけ数秒の猶予を置いて
+  再試行してから第 2 層へ落ちる（1 回で諦めると長文プロンプトで最も効く場面を取り逃す）
+- codex / agy と Windows は従来経路のまま（Windows は `cfg(unix)` で構造的に対象外）
+
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
 MCP stdio ブリッジ（`tako mcp serve`）のフォールバックは「環境変数がある = tako 内で

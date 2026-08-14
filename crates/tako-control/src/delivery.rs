@@ -34,7 +34,13 @@ pub enum PeerAttempt {
     /// peer で送達済み（**従来経路へ落ちてはならない**）
     Sent(DeliveryOutcome),
     /// peer は使えない / 送る前に失敗した。従来経路へ落ちてよい
-    Fallback { reason: &'static str },
+    Fallback {
+        /// 安定した理由コード
+        reason: &'static str,
+        /// 待てば解消しうる理由か（claude の起動途中で受信箱がまだ無い等）。
+        /// 呼び出し側は spawn 直後だけ数 tick 再試行してから従来経路へ落ちてよい
+        transient: bool,
+    },
     /// `TAKO_PEER_MESSAGING=only` で peer が使えなかった（検証用。呼び出し側はエラーにする）
     Refused { note: String },
 }
@@ -80,6 +86,7 @@ pub fn try_peer(backend_session: &str, text: &str, agent_managed: bool) -> PeerA
         }
         return PeerAttempt::Fallback {
             reason: "send_failed",
+            transient: false, // 接続できる宛先で書き込みに失敗した = 待っても変わらない
         };
     }
 
@@ -101,23 +108,24 @@ pub fn try_peer(backend_session: &str, text: &str, agent_managed: bool) -> PeerA
 /// `TAKO_PEER_MESSAGING=only` の説明（エラー文で使う）
 const ENV_ONLY: &str = "TAKO_PEER_MESSAGING=only";
 
-/// 従来経路へ落ちる（理由を診断ログへ残す）
+/// 従来経路へ落ちる。
+///
+/// **ここではログを書かない**: 一時的な理由（起動途中で受信箱がまだ無い等）は
+/// 呼び出し側が数 tick 再試行するので、その途中経過を persist.log へ流すと埋まる。
+/// keys 経路に確定した時点で呼び出し側が [`log_fallback`] を 1 回だけ呼ぶ
 fn fallback(backend_session: &str, reason: Unavailable, mode: Mode) -> PeerAttempt {
+    let _ = backend_session;
     let code = reason.code();
-    // Off / NotAgentManaged は「設計どおりそちらを通る」ので毎回ログへ出さない
-    // （2 秒 tick の送達で persist.log を埋めないため）
-    if !matches!(reason, Unavailable::Disabled | Unavailable::NotAgentManaged) {
-        crate::diag::persist_log(&format!(
-            "送達: keys へフォールバック（session={backend_session} 理由={code}: {}）",
-            reason.note()
-        ));
-    }
+    let transient = reason.is_transient();
     if mode == Mode::Only {
         return PeerAttempt::Refused {
             note: format!("peer 送達が使えない（{ENV_ONLY}）: {}", reason.note()),
         };
     }
-    PeerAttempt::Fallback { reason: code }
+    PeerAttempt::Fallback {
+        reason: code,
+        transient,
+    }
 }
 
 /// keys 経路を使ったことを記録して結果を組む
@@ -127,6 +135,18 @@ pub fn keys_outcome(reason: &'static str) -> DeliveryOutcome {
         verification: None,
         fallback_reason: Some(reason),
     }
+}
+
+/// keys 経路に確定したことを診断ログへ 1 回だけ残す（#790 の可観測性要件）。
+/// 設計どおりそちらを通る 2 つ（off 指定 / 人間由来の送達）は書かない
+/// （常時発生するので persist.log が埋まる）
+pub fn log_fallback(backend_session: &str, reason: &str) {
+    if reason == "disabled" || reason == "not_agent_managed" {
+        return;
+    }
+    crate::diag::persist_log(&format!(
+        "送達: keys 経路（session={backend_session} peer 不成立={reason}）"
+    ));
 }
 
 #[cfg(test)]

@@ -332,7 +332,16 @@ master は結果を確認してユーザーに報告する。
 | `--effort` | | thinking / reasoning effort（claude・codex のみ。省略時はプロファイル設定） |
 | `--account` | | アカウント名（accounts.yaml のキー。この worker だけ別アカウントで起動する。#504 / #511） |
 
-プロンプト送達は送達確認ループで行う（Issue #32）:
+プロンプト送達は 2 層構成（Issue #790）。claude worker には**まず受信箱へ直送**する
+（claude の Cross-Session Messaging。socket 直送なので画面解析もキー操作も伴わず、
+生成中でもキューに入って取りこぼさない。長文もそのまま届く）。使えない環境
+（claude が古い / 受信箱を開いていない / codex・agy・Windows）では従来のキー操作経路へ
+自動で落ちる。どちらを通ったかは `<data_dir>/persist.log` に `送達: peer …` /
+`送達: keys 経路 …` として残る。**受信側には「別の claude セッションから届いた」旨の
+定型文が付く**ので、この経路を使うのは worker 宛だけ（master への指示や承認の代行は
+従来経路のまま = 人が打った指示として扱われる）。
+
+従来のキー操作経路（フォールバック先）は送達確認ループで行う（Issue #32）:
 
 1. **事前信頼**: spawn 時に `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
    立て、初回フォルダの信頼ダイアログ自体を出さない（ダイアログが送信プロンプトを

@@ -5368,7 +5368,9 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
                     eprintln!("warning: {note}（session={session}）");
                     return;
                 }
-                crate::delivery::PeerAttempt::Fallback { .. } => {}
+                crate::delivery::PeerAttempt::Fallback { reason, .. } => {
+                    crate::delivery::log_fallback(&session, reason);
+                }
             }
         }
         let socket = tako_core::tmux_backend::socket_name();

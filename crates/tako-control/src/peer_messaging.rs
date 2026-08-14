@@ -134,6 +134,28 @@ impl Unavailable {
         }
     }
 
+    /// 待てば解消しうる理由か。
+    ///
+    /// claude は起動途中に受信箱を bind してレジストリへ書く（実測 1.1 秒だが
+    /// 負荷次第で遅れる）。入力欄が見えた直後に問い合わせると「まだ無い」ことが
+    /// あるので、spawn 直後だけは少し待ってから従来経路へ落ちる。
+    /// 版・世代・非対話・設定由来の理由は待っても変わらない
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Unavailable::NoClaudePid { .. }
+            | Unavailable::NoRegistryEntry { .. }
+            | Unavailable::NoSocketPath { .. }
+            | Unavailable::SocketMissing { .. }
+            | Unavailable::TokenUnavailable { .. } => true,
+            Unavailable::Disabled
+            | Unavailable::Unsupported
+            | Unavailable::OldVersion { .. }
+            | Unavailable::UnsupportedProtocol { .. }
+            | Unavailable::NotInteractive { .. }
+            | Unavailable::NotAgentManaged => false,
+        }
+    }
+
     /// 人向けの説明（診断ログ用。ペイン内容・送信テキストは含めない）
     pub fn note(&self) -> String {
         match self {
@@ -362,17 +384,43 @@ pub fn resolve_in(dirs: &[PathBuf], pid: u32) -> Result<PeerTarget, Unavailable>
     })
 }
 
-/// バックエンド tmux セッション名から宛先を解決する。
-/// claude の pid は `stale_binary::find_claude_pid_for_backend`（tmux pane_pid →
-/// 子孫辿り）で求めるので `claude agents --json` に依存しない
+/// バックエンドセッション配下で claude セッションの候補になる pid を列挙する。
+///
+/// tako が spawn した worker はペインのシェルの子として claude が居るので子孫が本命。
+/// ただしペイン自身が claude のこともある（`exec claude` 起動）ため、ペイン pid も
+/// 候補に含める。「どれが claude か」はコマンドパスではなく**レジストリにエントリが
+/// あるか**で決める（`claude agents --json` にもパス一致にも依存しない）
+fn candidate_pids(backend_session: &str) -> Vec<u32> {
+    let snapshot = crate::agents::ProcessSnapshot::capture();
+    let mut pids = snapshot.descendant_pids(backend_session);
+    let socket = tako_core::tmux_backend::socket_name();
+    let prefix = format!("{backend_session}:");
+    for (id, pid) in crate::agents::tmux_pane_pids(Some(&socket)) {
+        if id.starts_with(&prefix) && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// バックエンド tmux セッション名から宛先を解決する
 pub fn resolve_for_backend(backend_session: &str) -> Result<PeerTarget, Unavailable> {
-    let pid =
-        crate::stale_binary::find_claude_pid_for_backend(backend_session).ok_or_else(|| {
-            Unavailable::NoClaudePid {
-                session: backend_session.to_string(),
+    let dirs = crate::transcript::claude_config_dirs();
+    let mut blocked: Option<Unavailable> = None;
+    for pid in candidate_pids(backend_session) {
+        match resolve_in(&dirs, pid) {
+            Ok(target) => return Ok(target),
+            // レジストリに無い pid = claude セッションではない（MCP サーバー等）。次の候補へ
+            Err(Unavailable::NoRegistryEntry { .. }) => continue,
+            // claude セッションだが使えない（古い / gate off / 非対話）。理由を保って返す
+            Err(other) => {
+                blocked.get_or_insert(other);
             }
-        })?;
-    resolve_in(&crate::transcript::claude_config_dirs(), pid)
+        }
+    }
+    Err(blocked.unwrap_or(Unavailable::NoClaudePid {
+        session: backend_session.to_string(),
+    }))
 }
 
 /// 受信箱へ 1 通送る。**成功したらフォールバックしてはならない**

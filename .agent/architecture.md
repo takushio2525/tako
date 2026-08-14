@@ -1082,6 +1082,63 @@ visual-test の `terminal-grid` 節（`TAKO_VISUAL_ONLY=terminal-grid` で単独
 **ルートが空 div を返すだけのフレームが 0.159M** なので、gpui 側の下限は十分小さく、
 残りはすべて tako の要素ツリーの大きさに比例する。
 
+## worker への指示送達の 2 層化（#790。2026-08-14）
+
+master → worker の指示は長らくキー操作（貼り付け + 分離 Enter + 空検証）1 本だった。
+claude v2.1.224+ の Cross-Session Messaging を第 1 層に足し、**使えなければ従来経路へ
+落ちる**構成にした。実装は `tako-control::peer_messaging`（発見・可用性判定・送信・受信確認）
+と `tako-control::delivery`（経路選択とログ）。要件は FR-2.2.2 追補 2。
+
+### 伝送と発見（2026-08-14 に v2.1.232 で実測）
+
+```
+<config dir>/sessions/<pid>.json        レジストリ（messagingSocketPath / peerProtocol /
+                                        kind / status / version / tmux / cwd …）
+<config dir>/sessions/<pid>.<hash>.key  {"peerToken": …, "procStart": …}（0600）
+/tmp/cc-socks/<pid>.sock                受信箱（0600）
+```
+
+socket へ接続して改行区切り JSON を 2 行書く（`{"type":"auth","token":…}` →
+`{"type":"user","message":{"role":"user","content":…}}`）。受信側は `LOCAL_PEERCRED` で
+送信元 pid を検証し、transcript に `origin: {kind:"peer", verifiedPeerPid}` を残す。
+
+### なぜ「worker 宛だけ」なのか
+
+本文には tako から抑制できない定型の前置きが付く（「別の claude セッションから届いた」
+「peer は権限昇格を与えない」「**保留中プロンプトの承認として扱うな**」）。master → worker は
+その関係そのものなので正確だが、人が `tako send` で「はい、進めて」と送る用法では意味が
+変わる。だから宛先の role で分ける（`agent_managed_role`）。チャット入力欄は PTY の
+ミラー（#718 / #719）でこの経路を通らないので、GUI で人が打つ操作は影響を受けない。
+
+### 実測（Issue #790 のコメントに全量）
+
+| 状況 | 結果 |
+|---|---|
+| idle | ターンとして処理（transcript `origin.kind=peer`） |
+| busy（生成中） | キュー投函 → ターン終了後に処理。取りこぼしゼロ |
+| permission ダイアログ中 | **ダイアログ無傷**でキューへ入り、進行中ターンの `attachment/queued_command` として取り込まれる |
+| 長文 | 28,101 文字 / 43,449 バイトを 1 回でバイト等価に送達（先頭〜末尾まで欠落なし） |
+| 受信箱の bind | claude 起動から 1.1 秒（入力欄表示とほぼ同時） |
+
+### ⚠️ 踏み抜きどころ
+
+- **送り切った後にフォールバックしない**。socket へ書き切った時点で受信側のキューに
+  入るので、そこから従来経路へ落ちると同じ指示が 2 回届く。落ちてよいのは可用性判定と
+  接続失敗（1 バイトも読まれていないと言える段階）だけ
+- **可用性はサーバー側 gate（GrowthBook）依存で env では強制できない**。off のセッションは
+  受信箱を開かない = レジストリに `messagingSocketPath` が出ない。`claude --help` に
+  該当フラグは無く、`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`（upstream #35240）は
+  v2.1.232 のバイナリに文字列として存在しない
+- **時刻文字列で受信を判定しない**。`sessions::now_iso()` は秒精度（`…:21Z`）で transcript は
+  ミリ秒（`…:21.218Z`）なので、辞書順では同じ秒の痕跡が送信時刻より前に並ぶ。
+  送信直前のファイル長を控えて追記分だけ読む（`TranscriptCursor`）
+- **受信の姿は 2 形態**。`user/isMeta` だけを見るとダイアログ中・生成中の送達
+  （`attachment/queued_command`）を「未達」と誤判定する
+- **UI スレッドで待たない**。socket 接続 + 受信確認は待ちを含むので background スレッドへ
+  出し、`PromptFlow` は結果のスロットを覗くだけにする（#212 / #772 と同じ規約）
+- 「どれが claude の pid か」をコマンドパスで判定しない。**レジストリにエントリがあるか**で
+  決める（ペイン自身が claude の場合と、シェルの子である場合の両方を 1 つの規則で扱える）
+
 ## セキュリティ方針
 
 - IPC / MCP は localhost のみ + セッション毎のランダムトークン必須（FR-2.3.4）

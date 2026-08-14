@@ -3,57 +3,43 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-14、Issue #789 サイドバー幅のクランプ統一 = PR 提出）
+## 現在の対象（2026-08-14、Issue #790 worker 送達の Cross-Session Messaging 化）
 
-> 直前に #792（handoff の知識 / 実行状態の分離）が main へ入り install 済み（`40c4b2a`）。
-> その書式と不変条件は `.agent/orchestrator.md` と FR-2.24.8 が正本。
-> GUI 再起動が要るのは #792 と本件の両方（バイナリを差し替えたら 1 回で足りる）
+- ブランチ `feat/790-sendmessage-delivery`（worktree `~/dev/tako-wt-790`）で実装完了 → PR 待ち
+- claude worker への指示送達を **2 層**にした: 第 1 層 = claude の Cross-Session Messaging
+  （受信箱 socket へ直送）→ 使えなければ第 2 層 = 従来のキー操作経路（#32 の送達確認ループ）
+- スパイクの実測は Issue #790 のコメントに全量（実験フラグ不要 / 伝送プロトコル / 前置きの存在）
 
-- #307（サイドバーのドラッグリサイズ）の上限だけが経路で食い違っていた:
-  ドラッグ = ウィンドウ幅の 50% / dispatch（CLI・MCP）= 固定 600px。下限 120px は一致していた
-- 規則を `tako_core::sidebar`（`MIN_WIDTH` = 120 / `MAX_RATIO` = 0.5 / `clamp_width` /
-  `max_width`）へ一本化。**ドラッグ側へ寄せた**理由は ①固定 px では広い窓で CLI から
-  ドラッグ相当の幅に届かない（設計原則 5 の破れ）②固定 px は狭い窓で過大（600px は
-  800px 窓の 75%）。仕様は `.agent/requirements.md` FR-3.23 に起こした
+## スパイクで確定した事実（実装の前提。触るときはここから）
 
-## 入った実装
-
-- `tako-core/src/sidebar.rs` 新設（GPUI 非依存の純関数 + unit 7 本）。tako-app の
-  `SIDEBAR_MIN_WIDTH` 定数は廃止（規則の二重定義を構造的に防ぐ）
-- 状態は**要求値**（`TakoApp::sidebar_width`）、描画・座標計算は**実効幅**
-  （`effective_sidebar_width()` = 要求値をビューポート幅でクランプ）に分離。
-  render の会計（`estimated` / `pane_text_areas`）・ルートが渡す `.w()`・
-  `sidebar.rs` の内側の `.w()` はすべて同じ実効幅を通る（#684 / #781 と同じ理由）
-- dispatch 経路はウィンドウを持たないので、上限は `last_viewport_width`
-  （render が毎フレーム控える「最後に描いた窓の幅」）から取る。応答に
-  `sidebar_width_max` / `sidebar_width_min` を追加し、永続化は要求値 → **適用値**へ
-- セルフテスト項目 109 = 実ハンドラ（`on_mouse_move`）と実 dispatch（`Request::Panel`）へ
-  同じ数値を入れて一致を見る。窓を 1600 に固定するので旧固定 600px は必ず落ちる
+- 実験フラグは**不要**（v2.1.232 に `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` は無い）。
+  代わりに**サーバー側 gate**（GrowthBook）依存 = env で強制できない → 実行時検出 + 落ちる
+- 発見: `<config dir>/sessions/<pid>.json`（`messagingSocketPath` / `peerProtocol` / `kind` /
+  `status`）+ `<pid>.<hash>.key`（`peerToken`）。**config dir ごと**（アカウント切替と直結）
+- 伝送: socket へ改行区切り JSON 2 行（`auth` → `user`）。受信側は pid を OS で検証
+- 受信の姿は **2 形態**: `user` + `origin.kind=peer` / `attachment` の `queued_command`
+- **本文に抑制不可の前置きが付く**（「別セッションから届いた / 承認として扱うな」）
+  → 適用は worker 宛だけ（人間由来の送達は従来経路）
+- 実測: idle=ターン処理 / busy=キュー投函して取りこぼしなし / ダイアログ中も無傷 /
+  43,449 バイトを 1 回でバイト等価 / 受信箱 bind は起動 1.1 秒
 
 ## 不変条件
 
-- クランプ規則の正は `tako_core::sidebar` だけ。tako-app / tako-control に px の直値を置かない
-- **窓が狭くなっても要求値は書き換えない**（狭い窓では収まる幅で描き、広げ直す・
-  再起動すると元の幅へ戻る）。窓の縮小で settings.json を上書きしないこと
-- ビューポート幅が不明な文脈（起動直後・GUI 非依存）では上限を課さない。
-  上限は必ず幅が分かる場所（描画時）で掛かる
-
-## 環境メモ（他 worker も踏む）
-
-- **Metal Toolchain が消えていた**（macOS の purgeable 資産。`xcrun metal` が
-  `missing Metal Toolchain`）ため、新しい worktree では gpui のシェーダをビルドできない。
-  復旧は `xcodebuild -downloadComponent MetalToolchain`（704MB・管理者権限不要・実施済み）
-- 新しい worktree は `web/tako-remote/dist/` が無く rust_embed で tako-control が
-  コンパイルできない。`cp -a` で既存 worktree から持ってくるか `npm run build`
+- **送り切ったらフォールバックしない**（二重投函）。落ちてよいのは可用性判定と接続失敗だけ
+- 受信確認に**時刻文字列を使わない**（秒精度 vs ミリ秒で同じ秒を取りこぼす）。
+  送信直前のファイル長を控えて追記分だけ読む（`TranscriptCursor`）
+- socket 接続と受信確認は **background スレッド**（UI スレッドで待たない。#212 / #772）
+- トークンを持つフィールドは `PeerTarget` の非公開に留め、ログ・エラー文へ出さない
 
 ## 次の一手（master 判断）
 
-- PR（`Closes #789`）→ CI 緑 → squash merge → install（他 worker と重ねない）
-- 上限を「ウィンドウ幅の 50%」にしたので、サイドバー 50% + 右パネル 70% を同時に
-  指定するとペイン領域が負になり得る（ドラッグでも従来から可能）。気になるなら別 Issue
+- PR（`Closes #790`）→ CI 緑 → squash merge → install
+- 別 Issue 化の候補: ①ダイアログ表示中の `tako send` 拒否（#748）を peer 可用時だけ通す
+  （実測では安全。今回はスコープ外） ②spawn 初回プロンプトが peer を通った割合の可視化
 
 ## 現フェーズで Read すべき設計書
 
-- 幅・クランプ: `.agent/requirements.md` FR-3.23 / `crates/tako-core/src/sidebar.rs`
-- 描画の会計: `.agent/architecture.md`「ビュー単位の描画キャッシュ」/
-  `crates/tako-app/src/main.rs` の `effective_sidebar_width` と `pane_text_area_rect`
+- 送達: `.agent/architecture.md`「worker への指示送達の 2 層化」/ `.agent/requirements.md`
+  FR-2.2.2 追補 2 / `.agent/orchestrator.md`「プロンプト送達」
+- 実装: `crates/tako-control/src/peer_messaging.rs` / `delivery.rs` /
+  `crates/tako-app/src/main.rs`（`drive_peer_attempt`）
