@@ -8,6 +8,343 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.0] - 2026-08-15
+
+安定版。v0.6.0 以降にテスト版チャンネル（夜間パッチ v0.6.1〜v0.6.11）で検証してきた
+変更をまとめて安定版として提供する。柱は 3 つ。**ターミナルを初めて触る人でも使える
+GUI ライク表示モード**（スターターと claude の会話ビュー）、**描画コストの大幅削減**
+（同じ画面を出すのに使う CPU をおよそ 1/4〜1/3 まで落とし、ついでに長年の描画バグを
+根治した）、**AI 連携の底上げ**（コマンド提案カード・master の自動引き継ぎ・worker への
+確実な指示送達・設定のデバイス間共有）。Windows は引き続き移植の基盤のみで、配布物は
+macOS のみ。
+
+Stable release. Consolidates everything validated on the test channel (nightly patches
+v0.6.1 through v0.6.11) since v0.6.0. Three pillars: a **GUI-like display mode** that makes
+tako usable without knowing a terminal (starter cards and a real conversation view for
+Claude panes), a **large cut in rendering cost** (roughly a quarter to a third of the CPU
+for the same screen, plus root fixes for long-standing drawing bugs), and **stronger AI
+integration** (command suggestion cards, automatic master handoff, reliable instruction
+delivery to workers, and configuration sharing across devices). Windows remains groundwork
+only; binaries are still macOS-only.
+
+### Highlights / ハイライト
+
+- **GUI ライク表示モード — ターミナルを知らなくても使える** (#691, #694, #702, #715, #716, #717, #718, #719, #720, #725, #737, #739, #745, #746)
+  `tako ui-mode gui`（タブバーのボタン / ⌘K パレット / MCP からも）で、何も動いていない
+  ペインが「AI チームに任せる / AI と 1 対 1 で話す / コマンド入力へ」の 3 ボタンになり、
+  claude と対話中のペインは**会話ビュー**になる。会話ビューはモデル名・状態・コンテキスト
+  残量バー・Markdown 描画・ツール / 思考の折りたたみ・入力欄・スラッシュコマンドボタン・
+  承認カードを備え、本文はドラッグで選択して ⌘C でコピーできる（発話をまたいで選択可能。
+  発話ごと・コードブロックごとのコピーボタンもある）。入力欄は claude TUI の入力行の
+  **ミラー**なので、Enter / Shift+Enter・IME・画像ペースト・ゴースト提案が TUI と完全に
+  一致し、表示を切り替えても状態がズレない。ペインを作った直後は「準備中…」で覆い、
+  direnv のログや起動途中の画面を見せない。**表示レイヤだけの切り替え**で、PTY・tmux
+  セッション・実行中プロセスには一切影響しない。
+  *A display mode that makes tako usable without terminal knowledge. Idle shell panes turn
+  into three buttons ("let an AI team handle it" / "talk with one AI" / "go to the command
+  line"), and panes running Claude become a **conversation view** with the model name,
+  status, a remaining-context bar, Markdown rendering, collapsible tool/thinking blocks, an
+  input box, slash-command buttons, and approval cards. The body is selectable and
+  copyable with ⌘C across message boundaries, with per-message and per-code-block copy
+  buttons. The input box is a **mirror of Claude's own TUI input line**, so Enter,
+  Shift+Enter, IME composition, image pastes, and ghost suggestions behave identically and
+  never drift when you switch modes. Freshly created panes are covered by a "preparing"
+  screen instead of showing direnv logs and startup noise. This is a **presentation layer
+  only** — PTYs, tmux sessions, and running processes are untouched.*
+- **描画コストの大幅削減 + 長年の描画バグの根治** (#782, #786, #787, #801, #803)
+  端末グリッドを行ごとの div スタックから専用の描画要素へ置き換え、ペイン本体・ペイン
+  ヘッダ・各種クロームをそれぞれ独立したキャッシュ単位に切り出し、見えていないペインの
+  出力では再描画しないようにした。実測で、裏タブが毎秒 200 行を出し続ける状況の CPU は
+  22.3% → 2.6%、17 タブ表示中は 36.65% → 8.94%、1 フレームあたりの命令数は実務的な
+  文字密度で 15.68M → 6.42M（−59%）。この置き換えの過程で、**下線（SGR 4）や ⌘ホバーの
+  下線が 1 ピクセルも描かれない** (#797)、**全角文字が続く行で最大 1 セルぶん左へ詰まる**
+  (#798) という 2 つの実バグも同時に消えた。行の高さをセル高に合わせたので、`g` や `y` の
+  下が切れることもなくなっている。
+  *Replaced the terminal grid (a stack of per-row divs) with a dedicated element, split the
+  pane body, pane header, and chrome into independent cache units, and stopped repainting
+  for output from panes you cannot see. Measured: CPU while a background tab prints 200
+  lines/second went from 22.3% to 2.6%; with 17 tabs open, 36.65% to 8.94%; instructions per
+  frame at realistic text density from 15.68M to 6.42M (−59%). The rewrite also eliminated
+  two real bugs: **underlines (SGR 4) and ⌘-hover underlines never drawing at all** (#797)
+  and **rows of full-width characters drifting up to one cell to the left** (#798). Row
+  height now matches cell height, so descenders are no longer clipped.*
+- **AI が提示するコマンドをワンクリックで実行できる** (#666, #681, #703)
+  AI が会話の中に書いたコマンドは、TUI の物理的な折り返しのせいでコピーすると壊れる。
+  `tako show-command`（MCP `tako_show_command`）で提示されたコマンドは、**ターミナル領域を
+  縮めて作った専用の帯**にカードとして出る（会話・入力欄・フッターと重ならない）。
+  カードにはコピーと「新しいペインで実行」が付き、GUI モードの会話ビューでは Markdown の
+  コードブロック風にインライン表示される。
+  *Commands an AI writes into the conversation break when copied, because the TUI wraps them
+  physically. `tako show-command` (MCP `tako_show_command`) presents them as a card in a
+  **dedicated strip carved out of the terminal area**, so it never overlaps the conversation,
+  input box, or footer. Each card offers copy and "run in a new pane"; in the GUI-mode
+  conversation view it renders inline like a Markdown code block.*
+- **AI 系設定を git 1 本でデバイス間共有** (#513, #793)
+  `tako config init` / `link` / `push` / `pull`（MCP `tako_config_share` と 1:1）で、claude の
+  グローバル指示（`CLAUDE.md` / snippets / commands / templates）と tako の宣言的設定
+  （profiles / projects / accounts / local-rules / settings）を 1 つの git リポジトリで
+  mac ⇔ Windows 共有する。共有対象は**ホワイトリスト**で、載っていないものは共有しない。
+  秘匿情報（token / credentials / `.claude.json`）とマシンローカル状態（layout / sessions /
+  workers / ペインログ）は構造的に除外し、ファイル単位で切れないもの（アカウントの
+  `config_dir`・profile の `env`）はフィールド単位で落とす。絶対パスはホーム部分が `~` に
+  正規化されるので、ホームの位置が違うマシン同士でも同じリポジトリを使える。`tako setup` は
+  配線済みかどうかを検出して案内するだけで、**質問は増えない**。
+  *Share your AI configuration across devices through one git repository: `tako config init`
+  / `link` / `push` / `pull` (1:1 with MCP `tako_config_share`). It covers Claude's global
+  instructions (`CLAUDE.md`, snippets, commands, templates) and tako's declarative settings
+  (profiles, projects, accounts, local rules, settings). What gets shared is an
+  **allow-list** — anything not in the catalog is never shared. Secrets (tokens,
+  credentials, `.claude.json`) and machine-local state (layout, sessions, workers, pane
+  logs) are excluded structurally, and parts that cannot be split by file (an account's
+  `config_dir`, a profile's `env`) are stripped field by field. Absolute paths store the
+  home prefix as `~`, so machines with different home locations can share one repository.
+  `tako setup` only detects and explains it — no new questions.*
+- **master が自分で引き継ぐ** (#749, #792)
+  master のコンテキスト使用率が閾値（既定 60%。プロファイルごとに 50〜60% で設定可）を
+  超えると、tako が master へ引き継ぎ開始を指示する（ユーザーの操作は不要）。master は
+  引き継ぎファイルを最新化して後任を同じタブ・同じ role・同じプロファイルで立ち上げ、
+  後任が引き継ぎファイルと実態を突き合わせ、**前任の入力欄にユーザーの未送達の指示が
+  残っていないかを確認してから**前任ペインを閉じる。呼び出し自体は前任を閉じないので、
+  後任の起動に失敗しても master を失わない。引き継ぎファイルは「知識（マシン非依存）」と
+  「実行状態（このマシン限定）」の 2 節に分かれ、後任は前者を前提にしてよく後者は必ず
+  実態で確認する（旧書式もそのまま読める）。`/compact` の自動実行は「話が通じなくなる」
+  ため意図的に採らない。設定は `tako orchestrator profiles set <名前> --ctx-threshold 55` /
+  `--auto-handoff false`（設定画面 → プロファイルでも同じ）。
+  *When the master's context usage crosses a threshold (default 60%, settable per profile
+  between 50% and 60%), tako tells it to hand over — no user action needed. The master
+  refreshes its handoff file and starts a successor in the same tab with the same role and
+  profile; the successor cross-checks the handoff against reality, verifies that no
+  undelivered user instruction is sitting in the predecessor's input box, and only then
+  closes the old pane. The call itself never closes it, so a failed successor launch cannot
+  leave you without a master. Handoff files are now split into "knowledge (machine
+  independent)" and "runtime state (this machine only)" — the successor may trust the first
+  and must re-verify the second (old single-section files still work). `/compact` is
+  deliberately not automated: it makes the conversation lose its thread.*
+- **worker への指示が生成中でも取りこぼされない** (#790)
+  claude worker への送達を 2 層にした。第 1 層は claude の Cross-Session Messaging
+  （受信箱へ直送）で、画面解析もキー操作も伴わないため生成中でもキューに入って取りこぼさず、
+  長文もバイト等価に 1 回で届く（実測 43,449 バイト）。使えない場合だけ従来のキー操作経路
+  （貼り付け + 分離 Enter + 空検証）へ落ちる。対象は**エージェント管理下の worker 宛だけ**で、
+  master への指示や承認の代行は従来経路のまま。
+  *Instruction delivery to Claude workers is now two-layered. The first layer is Claude's
+  Cross-Session Messaging (straight into the recipient's inbox): no screen scraping, no
+  synthetic keystrokes, so messages queue correctly even mid-generation and long payloads
+  arrive byte-for-byte in one shot (43,449 bytes measured). It falls back to the previous
+  keystroke path only when unavailable. This applies **only to agent-managed workers** —
+  instructions and approvals aimed at a master still use the old path.*
+- **アップデートの見せ方を作り直した** (#616, #690)
+  下部ステータスバーの表示を廃止し、上部の通知カード（× で閉じるとそのバージョンは以後
+  通知しない）と専用画面（現在 / 最新バージョン・チャンネル・配布系統・配布物・
+  リリースノート・「今すぐ更新」）に分けた。リリースノートは Markdown で描画され
+  （見出し / 表 / リスト / コード / 引用）、リンクは ⌘+クリックで既定ブラウザへ。
+  *Reworked how updates surface: removed the status-bar entry in favour of a dismissible
+  top notification card (dismissing hides that version for good) and a dedicated screen
+  showing current and latest version, channel, install origin, assets, release notes, and
+  an update button. Release notes render as Markdown (headings, tables, lists, code,
+  quotes), with ⌘-click opening links in your default browser.*
+
+### Added / 機能追加
+
+- **GUI モードのスターターでプロファイルを選んで起動できる** (#739)
+  プロファイルが 2 つ以上あるとき「AI チームに任せる」「AI と 1 対 1 で話す」のカード右端に
+  **▾** が出て、一覧から選ぶと `tako master -<名前>` がシェルに入る。各項目には担当
+  プロジェクト / 起動フォルダ / モデルの手がかりが付く。カード本体のクリックは従来どおり
+  既定プロファイル（引数なし）の起動。あわせて会話ビューのヘッダに、コンテキスト使用率が
+  80% を超えたときだけ**押せる**「/compact で会話を軽くする」ヒントが出る。
+  *When you have more than one profile, the "let an AI team handle it" and "talk with one
+  AI" cards get a **▾** on their right edge; picking from the dropdown writes
+  `tako master -<name>` into the shell, with each entry hinting at its assigned projects,
+  working folder, or model. Clicking the card itself still launches the default profile with
+  no arguments. The conversation header also grows a clickable "shrink the conversation with
+  /compact" hint once context usage passes 80%.*
+- **Markdown プレビュー: リンクの ⌘+クリックとコードブロックのコピーボタン** (#680)
+  `[text](url)` を ⌘+ホバーで下線表示し、⌘+クリックで既定ブラウザへ（**http / https のみ**
+  開き、`javascript:` や相対パス・アンカーは拒否する）。コードブロックの右上には装飾なしの
+  全文をクリップボードへ送るコピーボタンが常時出る。CLI `tako preview-link-list` /
+  `preview-follow-link` / `preview-copy-code` と MCP も 1:1。
+  *⌘-hover underlines `[text](url)` links and ⌘-click opens them in the default browser
+  (**http/https only**; `javascript:`, relative paths, and anchors are refused). Code blocks
+  get an always-visible copy button that copies the undecorated full text. Exposed 1:1 as
+  `tako preview-link-list` / `preview-follow-link` / `preview-copy-code` and MCP tools.*
+- **設定画面に「プロファイル」タブ** (#721)
+  master / solo の起動プロファイルを GUI のフォームで編集できる（一覧・全項目編集・
+  新規 / 複製 / 削除。`default` は削除不可）。書き込みは CLI・MCP と同じ経路を通るので、
+  検証も排他制御もそのまま効く。
+  *Edit master and solo launch profiles from a form in Settings (list, all fields, create /
+  copy / delete; `default` cannot be deleted). Writes go through the same path as the CLI
+  and MCP, so validation and locking apply unchanged.*
+- **[macOS] 入力予測の確定キーを案内し、Tab でも確定できるようにした** (#614)
+  予測（薄いゴースト）の直後に `[→ か Tab で確定]` を薄く出す（既定 10 回で自動的に消え、
+  `tako autosuggest hint off` で恒久 OFF にもできる）。加えて**予測が出ていてカーソルが
+  行末にあるときだけ** Tab が確定になり、それ以外の Tab は従来どおりの補完のまま
+  （補完メニューの巡回も不変）。Tab 確定は `tako autosuggest tab off` で切れる。
+  *Shows how to accept an input suggestion right where you are looking: a faded
+  `[→ or Tab to accept]` hint after the ghost text (fades away after 10 command lines, and
+  can be turned off permanently). Tab now also accepts — but only while a suggestion is
+  shown and the cursor is at the end of the line, so ordinary Tab completion and
+  completion-menu cycling are untouched.*
+- **[macOS] Finder の「このアプリケーションで開く」に tako が出る** (#708)
+  フォルダやファイルを tako で開けるようになった。
+  *tako now appears in Finder's "Open With" menu for folders and files.*
+- **worker の選択肢ダイアログを種別つきで扱えるようにした** (#748)
+  ダイアログの検知を文言依存から**構造検知**（番号つき / 番号なしの 2 経路）へ一般化し、
+  種別（permission / trust / bypass / usage limit / plan 確認 / 選択）を分類して
+  `WORKER_DIALOG` イベントと `choice_dialog` フィールドで公開する。応答
+  （`tako orchestrator respond`）は `--choice` を省略すると**送信せず選択肢の構造だけ返す**
+  ので下見ができる。番号つきは番号キーだけで確定し、番号なしは矢印移動 + ラベル一致検証 +
+  Enter。**ダイアログ表示中の `tako send` は選択肢つきのエラーで拒否される**（テキストが
+  キー操作として食われ、数字が選択を確定させてしまうため）。
+  *Dialog detection is now **structural** (numbered and unnumbered variants) instead of
+  wording-based, and classified by kind (permission, trust, bypass, usage limit, plan
+  confirmation, selection), surfaced through a `WORKER_DIALOG` event and a `choice_dialog`
+  field. `tako orchestrator respond` without `--choice` returns the structure without
+  answering, so an agent can look before it leaps. Numbered dialogs are confirmed with the
+  number key alone; unnumbered ones move with arrows, verify the highlighted label, then
+  press Enter. **`tako send` is refused while a dialog is up** (text would be eaten as key
+  presses and digits would confirm a choice), with the available options in the error.*
+
+### Changed / 改善
+
+- **Markdown プレビューの全面的な品質改善** (#656)
+  GFM のテーブルを罫線・ヘッダ帯・ゼブラ・列アライメント付きの表として描画し、見出し
+  6 段・コード・インラインコード・引用のネスト・リストマーカー・チェックボックスの配色を
+  作り直した。選択とコピーはセル単位で解決する。
+  *GFM tables now render as real tables (rules, header band, zebra striping, column
+  alignment), and the palette for all six heading levels, code, inline code, nested quotes,
+  list markers, and checkboxes was rebuilt. Selection and copy resolve per cell.*
+- **CPU を使わない待ち方へ** (#772, #779)
+  stale binary 検知（メインスレッドを毎 tick 289〜323ms 専有していた）を 1 回の
+  プロセススナップショットに束ねて背景へ出し、変化があったときだけ走査するようにした。
+  sleep guard も同じスナップショットを共有し、`ps` の起動を 75 秒あたり 34 回から 3 回へ
+  （約 91% 減）落とした。
+  *Stale-binary detection (which occupied the main thread for 289–323ms every tick) now
+  batches into a single process snapshot, runs in the background, and only rescans on
+  change. Sleep guard shares that snapshot, cutting `ps` launches from 34 per 75 seconds to
+  3 (about 91% fewer).*
+- **リモート画面の情報設計と操作** (#615, #621)
+  スマホ側のペイン選択画面を、**そのペインで今何が起きているか**が分かる設計に変えた
+  （タブでのグループ化・状態ピル・チップ・実際の直近出力のプレビュー。従来は最も古い履歴の
+  先頭を表示していた）。Mac 側のリモートカードはステータスバーのインジケータ直上に
+  アンカーされ、起動 / 停止のトグルが付いた。
+  *The phone-side pane picker now shows **what is actually happening in each pane** (tab
+  grouping, status pills, chips, and a preview of the latest output — it used to show the
+  top of the oldest history). On the Mac, the remote card is anchored directly above its
+  status-bar indicator and carries a start/stop toggle.*
+- **サイドバー幅のクランプ規則を全経路で統一** (#789)
+  ドラッグは「ウィンドウ幅の 50%」、CLI / MCP は「固定 600px」と上限が食い違っていた。
+  規則を 1 か所（下限 120px / 上限 = ビューポート幅の 50%）へ統一し、状態は要求値・描画は
+  実効幅に分けたので、ウィンドウを狭めても要求値は書き換わらず、広げ直せば元の幅へ戻る。
+  *The drag handle clamped to 50% of the window while the CLI and MCP clamped to a fixed
+  600px. Both now share one rule (min 120px, max 50% of the viewport), and the requested
+  width is kept separate from the effective width — shrinking the window no longer
+  overwrites your preference, and widening it restores the original size.*
+- **ドキュメントサイトを v0.6.0 に追従** (#620)
+  CLI 68 コマンド / MCP 128 ツールを全数機械照合して記述の食い違いをゼロにし、
+  リリースページを再構成、モバイル表示の実バグも直した。
+  *Documentation site brought in line with v0.6.0: all 68 CLI commands and 128 MCP tools
+  machine-checked against the implementation, the releases page restructured, and real
+  mobile-layout bugs fixed.*
+
+### Fixed / 修正
+
+- **PC 再起動後に master ペインだけ claude の会話が復元されない** (#652)
+  *After a machine restart, the master pane alone failed to resume its Claude conversation.*
+- **コードプレビューの構文色がライトテーマで読めない** (#669)
+  シンタックスハイライトのテーマがダーク固定で、ライトでも暗い配色のままだった（既定の
+  文字色でコントラスト比 1.36:1）。色の変換を 1 か所に集め、Markdown 内のコードブロックと
+  同じ輝度クランプを通すようにした。描画時に変換するのでテーマ切り替えに即応し、ダークは
+  従来の色のまま。
+  *Syntax highlighting was pinned to a dark theme and stayed dark in light mode (1.36:1
+  contrast for default text). Colour conversion is now centralized and passes through the
+  same luminance clamp as Markdown code blocks; it converts at draw time, so theme switches
+  apply instantly and dark mode is unchanged.*
+- **git パネルのボタンが押しても反応しない** (#496)
+  ルート要素の「押したら入力フォーカスを落とす」処理がボタンの押下と同時に状態を消して
+  いたため、コンフリクト解消エージェントの 3 択・ブランチ名の入力欄・作成・キャンセルが
+  **マージ以来 1 度も発火していなかった**。
+  *A global "clear text-input focus on mouse down" handler wiped the state at the moment of
+  the press, so the conflict-resolver's three agent buttons, the branch-name field, create,
+  and cancel had **never fired since they were merged**.*
+- **設定画面のプロファイルタブの描画が崩れる** (#738)
+  幅が auto の親の中で折り返すチップ群の幅が確定せず、チップが 1 個ずつ縦に折り返される
+  一方で行の高さは 1 行ぶんで見積もられ、伸びたチップ群が次の行に重なっていた。
+  *Wrapping chip groups inside an auto-width parent never resolved their width: chips
+  wrapped one per line while the row height was still measured as a single line, so the
+  overflowing chips overlapped the row below.*
+- **チャットビューの入力欄の重なり、IME の位置ズレ、md テーブルの崩れ、画像つき発話の二重表示** (#737, #745, #746)
+  claude が空欄のときも箱の中に自前の案内文を描くのに、tako がプレースホルダを重ねて
+  読めなくしていた（#737）。IME の未確定文字列と候補ウィンドウは、チャット表示が
+  ターミナルグリッドを描かないのにセル座標をアンカーにしていたため画面上のどこも指して
+  いなかった（#737）。テーブルはセルが幅 0 まで潰れて 1 文字ずつ縦積みになっていた
+  （#745）。画像を添付した発話は、楽観表示が生の TUI 入力行を持っていたため transcript と
+  突き合わず二重に見えていた（#746）。
+  *Claude draws its own hint text inside the input box even when empty, and tako layered a
+  placeholder on top of it (#737). IME preedit text and the candidate window anchored to
+  terminal cell coordinates, which point nowhere in a chat view that draws no grid (#737).
+  Table cells collapsed to zero width and stacked one character per line (#745). Messages
+  with image attachments appeared twice because the optimistic echo held the raw TUI input
+  line and never matched the transcript (#746).*
+- **IME の位置と選択座標がずれる** (#781)
+  stale claude バナーの高さ 28px がテキスト領域の会計から漏れていた。この会計は PTY の
+  行数・マウス座標の変換・IME のアンカーの共通の正なので、バナーが出た瞬間に全部ずれていた。
+  *The 28px stale-Claude banner was missing from the text-area accounting — the single
+  source of truth for PTY row count, mouse coordinate mapping, and the IME anchor — so
+  everything shifted the moment the banner appeared.*
+- **縦に積む UI の表示中にペインの PTY 行数が可視行数を超える** (#684)
+  *Panes reported more PTY rows than were visible while a stacked UI element (a banner) was
+  shown.*
+- **消えたタブ・ペインを「いつ何で失ったか」で追えるようにした** (#770)
+  「再起動で消えた」と報告された喪失が、実際にはタブの × による close だったと実測で確定
+  した。セッション kill とタブ close は**発生源つき**で `persist.log` に残るようになり
+  （`close:gui-tab` / `close:gui` / `close:kbd` / `close:dispatch` / `exit`）、バックアップ
+  世代は「tmux セッションを持つペインが消える保存」でも作られるようになった。
+  *A loss reported as "everything vanished on restart" turned out to be a tab closed with
+  its × button. Session kills and tab closes are now recorded in `persist.log` **with their
+  origin** (`close:gui-tab`, `close:gui`, `close:kbd`, `close:dispatch`, `exit`), and a
+  backup generation is taken whenever a save would drop a pane that owns a tmux session.*
+- **引き継ぎ後の master が worker の設定で起動し、default プロファイル扱いになる** (#761)
+  後任の起動が worker 用のコマンド構築を通っていたため、モデルも role も間違ったうえに
+  master の system prompt が一切付いていなかった。
+  *The successor was built with the worker command path, so it launched with the wrong
+  model and role — and with no master system prompt at all.*
+- **後続の送信に失敗すると worker の初回プロンプトが「未達」に化ける** (#778)
+  *A failed follow-up send flipped the worker's initial prompt back to "undelivered".*
+- **Code Runner の `tako run` が指定していないのに新ペインへフォーカスを奪う** (#676)
+  *`tako run` stole focus to the new pane even when focus was not requested.*
+- **[macOS] リモートサーバーの停止で子プロセスが defunct として残り、停止が失敗と報告される** (#619)
+  起動した daemon の終了ステータスを誰も回収していなかった。`kill(pid, 0)` はゾンビにも
+  成功するため、実際には停止できているのに「SIGTERM 後 5 秒経っても終了しない」を返していた。
+  *Nobody reaped the daemon's exit status, and since `kill(pid, 0)` succeeds for zombies the
+  stop path reported "did not exit 5 seconds after SIGTERM" even though the server had
+  actually stopped.*
+- **worker レジストリに死んだエントリが残り続ける** (#658)
+  ペインも器も見えなくなった worker に印を付け、5 分続いたものだけを closed として畳む
+  ようにした（`resume` コマンドは畳んだ後も引ける）。
+  *Workers whose pane and session are both gone are now marked and, only after five minutes,
+  folded into `closed` — their resume command stays available afterwards.*
+
+### Internal / 開発基盤
+
+- **MCP 実装の整理** (#750, #752, #755)
+  公開契約の完全スナップショットを先に入れてから、133 ツールの実装を catalog / request /
+  HTTP / tests / facade へ責務別に分割した（スナップショットの差分ゼロで挙動不変を担保）。
+  *Added a complete snapshot of the public contract first, then split the 133-tool
+  implementation into catalog, request, HTTP, tests, and facade modules — with a zero-diff
+  snapshot proving behaviour did not change.*
+- **テストの信頼性** (#608, #625, #668, #796, #799)
+  表示言語のグローバルを共有していたテストの競合、並列負荷下で落ちる tmux e2e の 3 根因、
+  visual-test のインデントガイド節（ここで止まって以降の全節が実行されていなかった）、
+  隔離セルフテストの「固定時間で待つ」26 組を潰した。端末グリッドの描画には、置き換えの
+  前後を突き合わせるための visual-test 回帰検出網を先に用意した。
+  *Fixed a shared display-language global that made tests race, three root causes of tmux
+  e2e flaking under parallel load, the visual-test indent-guide section (which stopped the
+  run so later sections never executed), and 26 fixed-duration waits in the isolated
+  self-test. A visual-test regression net for the terminal grid was built before the grid
+  rewrite so before/after could be compared.*
+- GUI ライク表示モードの詳細仕様 (#691)、GUI モードのスターター導線と過渡期の扱い (#720)。
+  *Detailed specification for the GUI-like display mode, plus starter guidance and
+  transition handling.*
+
 ## [0.6.11] - 2026-08-12
 
 Nightly patch release (automated). Changes since v0.6.10:
@@ -78,111 +415,6 @@ Nightly patch release (automated). Changes since v0.6.4:
 - [機能追加] チャットビューのテキスト選択・コピー（ドラッグ選択 + ⌘C + 発話単位のコピーボタン）(#725) (#736)
 - [改善] チャット入力欄を TUI ミラー + 打鍵パススルーにする（#718 箱サイズ + #719 完成度 6 点） (#735)
 
-## [Unreleased]
-
-### Added / 追加
-
-- Automatic master handoff (#749): when the master's context usage crosses the threshold
-  (default 60%, settable per profile between 50% and 60%), tako tells the master to hand
-  over — no user action needed. The master refreshes its handoff file and calls
-  `tako_orchestrator_handoff`; the successor starts in the same tab with the same role and
-  profile, cross-checks the handoff file against reality, verifies that no undelivered user
-  instruction is sitting in the predecessor's input box, and only then closes the
-  predecessor's pane. The call itself never closes the old pane, so a failed successor
-  launch cannot leave you without a master. `/compact` is deliberately not automated —
-  it makes the conversation lose its thread. Configure with
-  `tako orchestrator profiles set <name> --ctx-threshold 55` / `--auto-handoff false`
-  (also in Settings → Profiles, and via `tako_orchestrator_profiles`); each nudge is
-  recorded in `<data_dir>/supervisor.log`.
-- master の自動ハンドオフ（#749）: master のコンテキスト使用率が閾値
-  （既定 60%。プロファイルごとに 50〜60% で設定可）を超えると、tako が master へ
-  引き継ぎ開始を指示する（ユーザーの操作は不要）。master は引き継ぎファイルを最新化して
-  `tako_orchestrator_handoff` を呼び、後任 master が同じタブ・同じ role・同じプロファイルで
-  立ち上がって引き継ぎファイルと実態を突き合わせ、**前任の入力欄にユーザーの未送達の指示が
-  残っていないかを確認してから**前任ペインを閉じる。呼び出し自体は前任を閉じないので、
-  後任の起動に失敗しても master を失わない。`/compact` の自動実行は「話が通じなくなる」ため
-  意図的に採らない。設定は `tako orchestrator profiles set <名前> --ctx-threshold 55` /
-  `--auto-handoff false`（設定画面 → プロファイル、MCP `tako_orchestrator_profiles` も同じ）。
-  送った記録は `<data_dir>/supervisor.log` に残る。
-- Chat view text selection and copy (#725): drag to select the conversation body and press
-  ⌘C — the selection spans multiple messages, uses the same real-shaping hit test as the
-  preview pane (so Japanese, bold, heading sizes and table cells all land where you click),
-  and ⌘A selects the whole conversation. Each message gets a copy button on its right
-  (plain text exactly as shown, full text even while collapsed), and code blocks inside a
-  reply get the same copy button as the Markdown preview (#680). Also available as
-  `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` and the
-  MCP tool `tako_chat_copy` (133 tools).
-- チャットビューのテキスト選択・コピー（#725）: 会話本文をドラッグで選択して ⌘C。
-  選択は**発話をまたいで**掃け、プレビューと同じ実 shaping ヒットテストを使うので
-  日本語・太字・見出しサイズ・表のセルでも狙った位置が取れる。⌘A で会話全体を選択。
-  発話の右にはコピーボタン（画面と同じプレーンテキスト。折りたたみ中でも全文）が付き、
-  返答の中のコードブロックには Markdown プレビューと同じコピーボタン（#680）が出る。
-  CLI `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` と
-  MCP `tako_chat_copy`（計 133 ツール）からも同じ操作ができる。
-- GUI mode starter: pick a profile before launching (#739). When you have more than one
-  profile, the "Let an AI team handle it" / "Talk with one AI" cards get a **▾** on their
-  right edge; the dropdown lists every profile with a hint (assigned projects, working
-  folder or model) and writes `tako master -<name>` into the shell. Clicking the card
-  itself still launches the default profile with no arguments. The chat header now also
-  offers a clickable "Shrink the conversation with /compact" hint once the context is
-  more than 80% used, next to the existing warning-coloured remaining-context bar.
-- GUI モードのスターターでプロファイルを選んで起動できる（#739）。プロファイルが
-  2 つ以上あるとき「AI チームに任せる」「AI と 1 対 1 で話す」のカード右端に **▾** が出て、
-  一覧から選ぶと `tako master -<名前>` がシェルに入る。各項目には担当プロジェクト /
-  起動フォルダ / モデルの手がかりが付く。カード本体のクリックは従来どおり
-  既定プロファイル（引数なし）の起動。あわせてチャットのヘッダに、コンテキスト使用率が
-  80% を超えたときだけ**押せる**「/compact で会話を軽くする」ヒントが出るようにした
-  （従来からの警告色の残量バーの隣）。
-
-### Fixed / 修正
-
-- Sleep guard no longer launches `ps` on every two-second tick (#779). It shares one
-  process snapshot with stale-binary detection and rescans only on backend, agent-role, or
-  command-state changes, plus a 60-second safety interval; unchanged ticks reuse the cached
-  result for sleep assertions, GUI-mode classification, and close confirmation.
-- sleep guard が 2 秒 tick ごとに `ps` を起動し続ける問題を修正（#779）。stale binary
-  検知と 1 個の process snapshot を共有し、backend・エージェント role・コマンド状態の
-  変化時と 60 秒の保険だけ再走査する。変化のない tick は前回結果をスリープアサーション・
-  GUI モード判定・close 確認で共有する。
-- Markdown tables inside the chat view no longer wrap one character per line (#745).
-  A cell whose text fitted its column collapsed to zero width and stacked its characters
-  vertically, so a single row grew past half the pane; the same table in the preview pane
-  was fine. The trigger was a `min-width: 0` on the assistant message body — a no-op there
-  (it is a child of a **column** flex container, where the automatic minimum size applies
-  to the height), but it changed how taffy measured the subtree and left the cell text laid
-  out with a wrap width of 0. Measured at an identical pane width of 478px, the cell
-  「入力欄のテキスト重なり」 went from `w=0.0 h=214.5` (11 lines) to `w=143.0 h=19.5` —
-  the exact geometry the preview pane produces. A new `chat-table` visual-test section
-  renders the same Markdown into a chat pane and a preview pane side by side at the same
-  width and fails if any cell wraps while its column still has room.
-- チャットビュー内の Markdown テーブルでセルが 1 文字ずつ縦に折り返される問題を修正
-  （#745）。列に入る幅があるセルが幅 0 まで潰れて文字が縦積みになり、1 行だけで
-  ペインの半分以上に伸びていた（同じ表をプレビューペインで開くと正常）。引き金は
-  assistant 発話の本文コンテナに付いていた `min_w(0)` で、**縦並び**の中の子では
-  自動最小サイズが掛かるのは高さ側なので意味を持たないのに、taffy の採寸経路が変わって
-  セルのテキストが折り返し幅 0 でレイアウトされたまま残っていた。同一ペイン幅 478px の
-  実測で、セル「入力欄のテキスト重なり」は `w=0.0 h=214.5`（11 行）から
-  `w=143.0 h=19.5`（プレビューと同値）になった。再発防止として visual-test に
-  `chat-table` 節を新設し、同じ md をチャットとプレビューへ**同じ幅で並べて**描き、
-  列に余裕があるのに折り返したセルが 1 つでもあれば落ちるようにした。
-- Sending a message with an image attachment no longer shows the same message twice in the
-  chat view (#746). The optimistic echo (the bubble shown before the transcript catches up)
-  stored the **raw** TUI input line, which contains Claude's internal `[Image #13]`
-  placeholder. The transcript stores the same message with the placeholder stripped, so the
-  two never matched: the echo survived for up to 45 seconds beside the real bubble, still
-  labelled 「送信待ち」 and showing the raw placeholder as if it were part of the text. The
-  echo now goes through the very same classifier the transcript uses, so it carries the same
-  text plus an image chip and is dropped the moment the transcript catches up. Sending the
-  same text twice still produces two bubbles.
-- 画像を添付した発話がチャットビューで二重に表示される問題を修正（#746）。楽観 echo
-  （transcript が追いつくまで見せる吹き出し）が**生の TUI 入力行**を持っていたため、
-  claude の内部表記 `[Image #13]` が入ったままだった。transcript 側は同じ発話を
-  マーカー除去済みで持つので突き合わせが必ず外れ、echo が本物の吹き出しの隣に最長
-  45 秒残り、「送信待ち」ラベルのまま内部表記を本文の一部のように見せていた。echo を
-  **transcript とまったく同じ分類器**へ通すようにしたので、本文と画像チップが本物と
-  一致し、transcript が追いついた時点で消える。同じ文面を 2 回送れば従来どおり
-  吹き出しは 2 個出る。
-
 ## [0.6.4] - 2026-08-02
 
 Nightly patch release (automated). Changes since v0.6.3:
@@ -240,60 +472,6 @@ Nightly patch release (automated). Changes since v0.6.0:
 - [機能追加] 入力予測の確定キーを案内し Tab でも確定できるようにする (#614) (#622)
 - [改善] リモートカードをインジケータ直上へアンカー + 起動/停止トグル化 (#615) (#618)
 - [ドキュメント] v0.6.0 リリースの作業記録を反映
-
-## [Unreleased]
-
-### Added
-
-- **[macOS] AI 系設定を git でデバイス間共有できるようにした（#513）**:
-  `tako config init` / `link` / `push` / `pull` / `status` / `list`（MCP `tako_config_share` と 1:1）。
-  claude のグローバル指示（`CLAUDE.md` / snippets / commands / templates）と tako の宣言的設定
-  （profiles / projects / accounts / local-rules / settings）を git リポジトリ 1 本で共有する。
-  共有対象は**ホワイトリスト**で、カタログに載っていないファイルは共有しない。
-  秘匿情報（token / credentials / `.claude.json`）とマシンローカル状態（layout.json /
-  sessions.yaml / workers.yaml / ペインログ）は構造的に除外し、ファイル単位で切れないもの
-  （アカウントの `config_dir`・profile の `env`・UI の操作履歴）はフィールド単位で切る。
-  設定内の絶対パスはホーム部分が `~` に正規化されるので、mac と Windows でホームの位置が
-  違っても同じリポジトリを使える。**任意機能**であり `tako setup` の質問は増えない。
-  *Share your AI configuration across devices through one git repository:
-  `tako config init` / `link` / `push` / `pull` / `status` / `list` (1:1 with MCP
-  `tako_config_share`). It covers Claude's global instructions (`CLAUDE.md`, snippets,
-  commands, templates) and tako's declarative settings (profiles, projects, accounts,
-  local rules, settings). What gets shared is an **allow-list** — anything not in the
-  catalog is never shared. Secrets (tokens, credentials, `.claude.json`) and machine-local
-  state (layout, sessions, workers, pane logs) are excluded structurally, and the parts
-  that cannot be split by file (an account's `config_dir`, a profile's `env`, UI dismissal
-  flags) are stripped field by field. Absolute paths are stored with the home prefix
-  normalized to `~`, so macOS and Windows can share the same repository. Entirely
-  optional: `tako setup` asks no new questions.*
-  Windows での実機配線確認は #467 と合流予定。
-  *Wiring on real Windows hardware is still pending, tracked with #467.*
-- **[macOS] 入力予測の確定キーを案内し、Tab でも確定できるようにした（#614）**:
-  予測（薄いゴースト）の直後に `[→ か Tab で確定]` を薄く出す（既定 10 回で自動的に消え、
-  設定 / `tako autosuggest hint off` / MCP で恒久 OFF にもできる）。加えて
-  **予測が出ていてカーソルが行末にあるときだけ** Tab が確定になり、それ以外の Tab は
-  従来どおりの補完（補完メニューの巡回も不変）。Tab 確定は `tako autosuggest tab off` で切れる。
-  *Shows how to accept an input suggestion, right where you are looking: a faded
-  `[→ or Tab to accept]` hint after the ghost text (a tutorial that fades away after
-  10 command lines, and can be turned off permanently). Tab now also accepts — but only
-  while a suggestion is shown and the cursor is at the end of the line, so ordinary Tab
-  completion and completion-menu cycling are untouched.*
-
-### Fixed
-
-- **[macOS] リモートサーバーの停止で子プロセスが defunct（ゾンビ）として残り、停止が
-  失敗と報告されていた問題を修正（#619）**: 起動した daemon は tako 本体の子プロセスの
-  ままなのに、終了ステータスを誰も回収していなかった。`kill(pid, 0)` はゾンビにも成功する
-  ため停止側は「終了しない」と誤判定し、実際には停止できているのに 5 秒待ってから
-  「SIGTERM 後 5 秒経っても終了しない」を返していた（GUI の停止ボタンもそのエラーを表示）。
-  起動した側で終了ステータスを回収するようにし、停止側もゾンビを終了済みと読むようにした。
-  *Fixes zombie (defunct) processes piling up after stopping the remote server, and the
-  bogus failure it caused. The daemon stayed a child of tako but nobody reaped its exit
-  status; since `kill(pid, 0)` succeeds for zombies, the stop path concluded the process
-  was still running and returned "did not exit 5 seconds after SIGTERM" — even though the
-  server had actually stopped (the GUI stop button surfaced that error too). tako now
-  reaps the daemon in the process that started it, and the stop path reads a zombie as
-  terminated.*
 
 ## [0.6.0] - 2026-07-27
 
