@@ -424,6 +424,39 @@ master のコンテキストが埋まると判断が劣化する。tako は `/co
 
 **閉じるのは後任だけ**なので、後任の起動に失敗しても前任の master は失われない。
 
+### 引き継ぎファイルの書式（Issue #792）
+
+引き継ぎファイルは **2 節**に分ける。pane / tab 番号はこのマシンでしか意味を持たないので、
+知識に混ぜたまま別マシンへ持ち込むと後任が**存在しないペイン**へ指示を出す（#513 の設定共有で
+現実に起きる事故）。
+
+```markdown
+# master 引き継ぎ（profile: takodev）
+
+## 知識（マシン非依存）
+決定事項とその理由 / ユーザーの方針・好み / 残タスクとその意図 / 調べて分かったこと。
+pane / tab 番号は書かない
+
+## 実行状態（このマシン限定）
+spawn 済み worker とその pane と依頼内容 / 開いているペイン / 実行中のもの。
+別マシンでは丸ごと無効になる前提で書く
+```
+
+見出しは表示言語に合わせて英語（`## Knowledge (machine-independent)` /
+`## Runtime state (this machine only)`）でもよい。判定は寛容で、番号付き（`## 1. 知識…`）・
+半角括弧・強調（`**…**`）・語尾の省略（`## 知識`）も同じ節として認識する。
+
+- **旧書式（節なし）もそのまま読める**。`tako_orchestrator_handoff` は書式に関係なく
+  **全文を後任へ渡す**。旧書式のときは「番号への参照はすべて実態で確認しろ + 次の更新で
+  2 節へ書き直せ」が後任プロンプトに付くので、自然な更新で新書式へ移る（一括変換はしない）
+- 新書式のときは節ごとの扱い（知識 = そのまま前提にしてよい / 実行状態 = 必ず実態で確認）が
+  後任プロンプトに付く
+- いま自分のファイルがどちらかは `tako orchestrator self` の `handoff_format`
+  （`sectioned` / `legacy` / 未作成なら null）と `handoff_sections` で分かる。
+  `tako orchestrator handoff` の応答も同じ 2 フィールドを返す
+- 書式の正本は `tako_core::handoff`（`section_of_line` / `split_handoff` /
+  `handoff_template`。見出し定数は master system prompt と同期していることを単体テストが拘束）
+
 ```bash
 # 今の閾値と超過状態を見る（master 自身が使う）
 tako orchestrator self

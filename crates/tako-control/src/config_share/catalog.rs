@@ -105,7 +105,10 @@ impl Class {
 #[derive(Debug, Clone, Copy)]
 pub struct Entry {
     pub root: Root,
-    /// ルートからの相対パス。末尾が `/` ならそのディレクトリ配下すべてが対象
+    /// ルートからの相対パス。
+    /// - 末尾が `/` ならそのディレクトリ配下すべてが対象
+    /// - 末尾が `*` ならファイル名の**前方一致**（`_system_prompt_*` のように
+    ///   名前が実行時に決まるファイル。#792）
     pub path: &'static str,
     pub class: Class,
     /// 分類の理由（日英）。`tako config list` と診断がここから引く
@@ -125,6 +128,16 @@ impl Entry {
     /// ディレクトリ配下すべてを指すエントリか
     pub fn is_dir(&self) -> bool {
         self.path.ends_with('/')
+    }
+
+    /// ファイル名の前方一致で効くエントリか（`_system_prompt_*`。#792）
+    pub fn is_prefix(&self) -> bool {
+        self.path.ends_with('*')
+    }
+
+    /// 前方一致に使う部分（末尾の `*` を落としたもの）
+    fn match_prefix(&self) -> &'static str {
+        self.path.trim_end_matches('*')
     }
 
     /// リポジトリ内のパス（`tako/orchestrator/projects.yaml` 等）
@@ -505,6 +518,17 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // master / solo の起動ごとに書き出す system prompt の実体（`_system_prompt_<profile>.md`）。
+    // プロファイル名で名前が決まるので**前方一致**で分類する（#792）。
+    // 正本はプロファイル + 埋め込みテンプレートなので、共有する意味がない
+    Entry {
+        root: Root::TakoData,
+        path: "orchestrator/_system_prompt_*",
+        class: Class::Local,
+        note: notes::GENERATED,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     // ---------------- claude: 共有する ----------------
     Entry {
         root: Root::Claude,
@@ -807,6 +831,16 @@ pub fn classify(root: Root, rel: &str) -> Option<&'static Entry> {
             {
                 best = Some(entry);
             }
+        } else if entry.is_prefix() {
+            // 名前が実行時に決まるファイル。**同じディレクトリの中だけ**に効かせる
+            // （`_system_prompt_` がディレクトリ名だった場合に配下を巻き込まない）
+            let prefix = entry.match_prefix();
+            let matches = rel
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'));
+            if matches && best.is_none_or(|b| b.path.len() < entry.path.len()) {
+                best = Some(entry);
+            }
         } else if rel == entry.path {
             // 完全一致は常に最優先
             return Some(entry);
@@ -915,6 +949,34 @@ mod tests {
                 .class,
             Class::Local
         );
+    }
+
+    /// #792: 名前が実行時に決まるファイル（`_system_prompt_<profile>.md`）が
+    /// 前方一致エントリで分類される
+    #[test]
+    fn 前方一致エントリが動的名のファイルを分類する() {
+        for name in [
+            "orchestrator/_system_prompt_default.md",
+            "orchestrator/_system_prompt_takodev.md",
+            // 走査が畳んだ形（`{profile}` → `*`）もそのまま引ける
+            "orchestrator/_system_prompt_*.md",
+        ] {
+            let e = classify(Root::TakoData, name)
+                .unwrap_or_else(|| panic!("{name} が分類されていない"));
+            assert_eq!(e.class, Class::Local, "{name}");
+            assert_eq!(e.path, "orchestrator/_system_prompt_*");
+        }
+        // 前方一致は兄弟ファイルを巻き込まない
+        assert_eq!(
+            classify(Root::TakoData, "orchestrator/projects.yaml")
+                .unwrap()
+                .class,
+            Class::Shared
+        );
+        // 接頭辞そのものだけ（残りが空）は一致しない
+        assert!(classify(Root::TakoData, "orchestrator/_system_prompt_").is_none());
+        // 別ディレクトリ配下へは効かない
+        assert!(classify(Root::TakoData, "orchestrator/_system_prompt_x/inner.md").is_none());
     }
 
     #[test]

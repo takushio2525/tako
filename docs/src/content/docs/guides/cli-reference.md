@@ -922,6 +922,8 @@ tako orchestrator profiles set default --ctx-threshold 55
 tako orchestrator profiles set default --auto-handoff false
 ```
 
+引き継ぎファイルは 2 つの節に分かれます。**知識（マシン非依存）** には決定事項・方針・残タスクの意図を、**実行状態（このマシン限定）** には worker とそのペイン番号や実行中のものを書きます。ペイン番号はそのパソコンでしか意味を持たないので、設定を別のパソコンと共有したとき（`tako config`）に知識だけが役に立つ形にしておくためです。節分けの無い古い引き継ぎファイルもそのまま読めます（後任には「番号は実際の画面で確認するように」が伝わり、次に更新されるときに 2 節へ書き直されます）。
+
 ### tako orchestrator workers / respond / self / handoff
 
 ```bash

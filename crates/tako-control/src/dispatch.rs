@@ -5606,6 +5606,10 @@ fn dispatch_orchestrator_self(
 
     let handoff_path = orchestrator::handoff_path(profile_name);
     let handoff_exists = handoff_path.as_ref().is_some_and(|p| p.is_file());
+    // #792: 自分の引き継ぎファイルが新書式（知識 / 実行状態の 2 節）かどうかを master 自身が
+    // 確認できるようにする。不在なら null（「まだ書いていない」と「旧書式」を混ぜない）
+    let handoff_doc =
+        orchestrator::read_handoff(profile_name).map(|c| tako_core::handoff::split_handoff(&c));
 
     let mut result = json!({
         "pane_id": pane_id.as_u64(),
@@ -5621,6 +5625,8 @@ fn dispatch_orchestrator_self(
         "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
         "handoff_path": handoff_path,
         "handoff_exists": handoff_exists,
+        "handoff_format": handoff_doc.as_ref().map(|d| d.format().as_str()),
+        "handoff_sections": handoff_doc.as_ref().map(|d| d.section_labels()),
     });
     // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
     if threshold.clamped() {
@@ -5892,15 +5898,18 @@ fn dispatch_orchestrator_handoff(
         .unwrap_or(tako_core::handoff::DEFAULT_PROFILE);
 
     // handoff ファイルの存在確認
-    let handoff_content = orchestrator::read_handoff(profile_name)
-        .ok_or_else(|| {
-            let path = orchestrator::handoff_path(profile_name)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            DispatchError::Operation(format!(
-                "handoff ファイルが見つからない: {path}\nmaster は引き継ぎ前にこのファイルに状態を書き込む必要がある"
-            ))
-        })?;
+    let handoff_content = orchestrator::read_handoff(profile_name).ok_or_else(|| {
+        let path = orchestrator::handoff_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        // #792: 書けと言うだけでなく**どう書くか**（2 節の雛形）まで返す。
+        // これを最初に読むのは AI なので、ここが書式を知る唯一の機会になりうる
+        let template = tako_core::handoff::handoff_template(profile_name);
+        DispatchError::Operation(format!(
+            "handoff ファイルが見つからない: {path}\n\
+                 master は引き継ぎ前にこのファイルに状態を書き込む必要がある。書式:\n{template}"
+        ))
+    })?;
 
     // #288: 分割元ペインの解決。`tab` 指定時はそのタブのフォーカスペインを分割元にする
     // ので、呼び出し元（= 退役する master）とは別物になりうる
@@ -5999,7 +6008,10 @@ fn dispatch_orchestrator_handoff(
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
-    // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）
+    // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）。
+    // #792: 新書式（2 節）なら節ごとの扱い、旧書式なら「番号は実態で確認 + 次回は書き直せ」が
+    // 文面に付く。**引き継ぎ内容そのものは書式に関係なく全文が渡る**（後方互換）
+    let handoff_doc = tako_core::handoff::split_handoff(&handoff_content);
     let handoff_prompt = tako_core::handoff::successor_prompt(
         profile_name,
         &handoff_content,
@@ -6024,6 +6036,9 @@ fn dispatch_orchestrator_handoff(
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
+        // #792: 読み取った引き継ぎファイルの書式。旧書式なら "legacy"（動作は従来どおり）
+        "handoff_format": handoff_doc.format().as_str(),
+        "handoff_sections": handoff_doc.section_labels(),
         // #749: 退役するペイン。null なら後任に kill を指示していない
         // （旧 master を特定できなかった = 安全側に倒した）
         "previous_master_pane_id": previous_pane.map(PaneId::as_u64),
@@ -12864,6 +12879,14 @@ mod tests {
         assert!(result.is_err(), "handoff ファイル不在はエラー");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("handoff ファイルが見つからない"), "{err}");
+        // #792: 書式（2 節の雛形）まで返す。ここが AI が書式を知る唯一の機会になりうる
+        let lang = tako_core::i18n::lang();
+        for section in [
+            tako_core::handoff::HandoffSection::Knowledge,
+            tako_core::handoff::HandoffSection::Runtime,
+        ] {
+            assert!(err.contains(section.heading(lang)), "{err}");
+        }
     }
 
     // --- #749: 自動ハンドオフ（閾値反映 + 後任への kill 手順） ---
@@ -12978,6 +13001,182 @@ mod tests {
                 );
             },
         );
+    }
+
+    // --- #792: 引き継ぎファイルの書式（新書式 / 旧書式の後方互換）---
+
+    /// 後任へ積まれたプロンプトを取り出す
+    fn successor_prompt_of(host: &MockHost, new_pane: u64) -> String {
+        host.prompt_flows
+            .iter()
+            .find(|(p, _)| p.as_u64() == new_pane)
+            .map(|(_, text)| text.clone())
+            .expect("後任へのプロンプトが積まれる")
+    }
+
+    /// master ペインから handoff を実行して (応答, 後任プロンプト) を返す
+    fn run_handoff(profile: &str) -> (Value, String) {
+        let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorHandoff {
+                pane: Some(pane),
+                caller_role: Some(format!("master:{profile}")),
+                tab: None,
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect("handoff は成功する");
+        let new_pane = result["new_master_pane_id"].as_u64().expect("新 master");
+        let prompt = successor_prompt_of(&host, new_pane);
+        (result, prompt)
+    }
+
+    /// 表示言語に依存しない見出し（判定側の定数をそのまま使う）
+    fn heading_now(section: tako_core::handoff::HandoffSection) -> &'static str {
+        section.heading(tako_core::i18n::lang())
+    }
+
+    #[test]
+    fn handoffは新書式の2節を認識して後任へ扱いを伝える() {
+        let profile = "_tako_792_new_";
+        let content = "# master 引き継ぎ\n\n\
+                       ## 知識（マシン非依存）\n\
+                       - 方針: 検証は隔離 data dir で行う\n\n\
+                       ## 実行状態（このマシン限定）\n\
+                       - worker A: pane 7（#792 の実装）\n";
+        with_handoff_file(profile, content, || {
+            let (result, prompt) = run_handoff(profile);
+            // 機械可読な書式判定（言語非依存）
+            assert_eq!(result["handoff_format"].as_str(), Some("sectioned"));
+            assert_eq!(
+                result["handoff_sections"].as_array().map(Vec::len),
+                Some(2),
+                "知識 / 実行状態の 2 節: {result}"
+            );
+            // 内容は全文そのまま渡る（節に切って渡すと認識漏れが黙って落ちる）
+            assert!(
+                prompt.contains("- 方針: 検証は隔離 data dir で行う"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("- worker A: pane 7（#792 の実装）"),
+                "{prompt}"
+            );
+            // 節ごとの扱いが説明される（実行状態は実態で確認）
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Runtime)),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Knowledge)),
+                "{prompt}"
+            );
+            // #749 の手順（確認 → kill）は書式に関係なく入る
+            let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+            let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+            assert!(read_at < close_at, "{prompt}");
+        });
+    }
+
+    /// **後方互換の核**: 節分離前のファイル（pane / tab 参照が本文に混在）でも
+    /// 従来どおり全文が後任へ渡り、#749 の手順もそのまま入る
+    #[test]
+    fn handoffは旧書式のファイルでも従来どおり動く() {
+        let profile = "_tako_792_legacy_";
+        let content = "# master (default プロファイル) 引き継ぎ\n\n\
+                       ## 【サンプル案件 移行】担当 master（tab 136 / pane 884）\n\
+                       - 進行中: 客の追加 5 点\n\n\
+                       ## 残キュー（優先順）\n\
+                       - #801 の残件を Issue 化\n";
+        with_handoff_file(profile, content, || {
+            let (result, prompt) = run_handoff(profile);
+            assert_eq!(result["handoff_format"].as_str(), Some("legacy"));
+            assert_eq!(
+                result["handoff_sections"].as_array().map(Vec::len),
+                Some(0),
+                "旧書式は節を持たない: {result}"
+            );
+            // 全文が 1 文字も欠けずに渡る
+            assert!(
+                prompt.contains(content.trim()),
+                "旧書式の全文が渡らなかった: {prompt}"
+            );
+            // 従来の手順（#749 の不変条件）は維持
+            let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+            let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+            assert!(read_at < close_at, "{prompt}");
+            // 次の更新で新書式へ書き直す指示が付く（自然な移行の駆動源）
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Knowledge))
+                    && prompt.contains(heading_now(tako_core::handoff::HandoffSection::Runtime)),
+                "書き直し先の見出しが案内されていない: {prompt}"
+            );
+        });
+    }
+
+    /// master 自身が「自分のファイルが新書式か」を確認できる（#792）
+    #[test]
+    fn selfが引き継ぎファイルの書式を返す() {
+        let profile = "_tako_792_self_";
+        with_handoff_file(
+            profile,
+            "## 知識（マシン非依存）\n- 方針\n",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorSelf {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .unwrap();
+                assert_eq!(result["handoff_exists"].as_bool(), Some(true));
+                assert_eq!(result["handoff_format"].as_str(), Some("sectioned"));
+                assert_eq!(
+                    result["handoff_sections"].as_array().map(Vec::len),
+                    Some(1),
+                    "知識節だけ: {result}"
+                );
+            },
+        );
+    }
+
+    /// ファイル不在は「旧書式」と混ぜない（null で「まだ書いていない」を表す）
+    #[test]
+    fn selfは引き継ぎファイル不在で書式をnullにする() {
+        let profile = "_tako_792_none_";
+        // with_handoff_file は作ってしまうので、作らずに config_dir だけ揃える
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+        let path = crate::orchestrator::handoff_path(profile).expect("override 済み");
+        let _ = std::fs::remove_file(&path);
+
+        let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(pane),
+                caller_role: Some(format!("master:{profile}")),
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result["handoff_exists"].as_bool(), Some(false));
+        assert!(result["handoff_format"].is_null(), "{result}");
+        assert!(result["handoff_sections"].is_null(), "{result}");
     }
 
     #[test]

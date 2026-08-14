@@ -40563,6 +40563,119 @@ mod self_test {
                     "102: 後任の orchestrator self がプロファイルと handoff_path を引き継ぐ (#761)",
                 );
 
+                // ===== 102b: 引き継ぎファイルの書式（#792） =====
+                // 知識（マシン非依存）と実行状態（このマシン限定）の 2 節に分けた書式を
+                // 実 dispatch が認識し、後任へ節ごとの扱いを伝えること。そして
+                // **節分離前のファイルでも従来どおり全文が渡ること**（後方互換）を測る。
+                // 実 claude は要らない（応答と後任プロンプトの中身だけを見る）
+                let mut extra_successors: Vec<PaneId> = Vec::new();
+                let handoff_792 = |content: &str, cx: &mut AsyncApp| {
+                    if let Some(ref path) = handoff_path {
+                        let _ = std::fs::write(path, content);
+                    }
+                    window
+                        .update(cx, |app, _, _| {
+                            let res = tako_control::dispatch(
+                                app,
+                                Req::OrchestratorHandoff {
+                                    pane: Some(prev.as_u64()),
+                                    caller_role: Some(format!("master:{probe}")),
+                                    tab: None,
+                                    caller_pid: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()?;
+                            let successor =
+                                res["new_master_pane_id"].as_u64().map(PaneId::from_raw)?;
+                            // claude は起動させない（起動コマンドと attach を捨てる）
+                            let _ = std::mem::take(&mut app.pending_attach);
+                            let _ = std::mem::take(&mut app.pending_writes);
+                            // 後任へ積まれた初期プロンプトを取り出して flow は畳む
+                            let prompt = app
+                                .prompt_flows
+                                .iter()
+                                .find(|f| f.pane == successor)
+                                .map(|f| f.prompt.clone());
+                            app.prompt_flows.retain(|f| f.pane != successor);
+                            Some((res, prompt?, successor))
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let runtime_heading = tako_core::handoff::HandoffSection::Runtime
+                    .heading(tako_core::i18n::lang())
+                    .to_string();
+
+                // (a) 新書式: 2 節として認識され、内容は全文渡り、扱いの説明が付く
+                let sectioned_src = format!(
+                    "# selftest 792\n\n## {}\n- 方針: 検証は隔離 data dir で行う\n\n## {}\n- worker A: pane 7\n",
+                    tako_core::handoff::KNOWLEDGE_HEADING_JA,
+                    tako_core::handoff::RUNTIME_HEADING_JA,
+                );
+                match handoff_792(&sectioned_src, cx) {
+                    Some((res, prompt, successor)) => {
+                        extra_successors.push(successor);
+                        let sections = res["handoff_sections"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_default();
+                        println!(
+                            "TAKO_SELF_TEST_792_SECTIONED: format={:?} sections=[{sections}]",
+                            res["handoff_format"].as_str()
+                        );
+                        check(
+                            res["handoff_format"].as_str() == Some("sectioned")
+                                && sections == "knowledge,runtime",
+                            "102b: 新書式の handoff が 2 節として認識される (#792)",
+                        );
+                        check(
+                            prompt.contains("- 方針: 検証は隔離 data dir で行う")
+                                && prompt.contains("- worker A: pane 7")
+                                && prompt.contains(&runtime_heading),
+                            "102b: 後任プロンプトに全文と節ごとの扱いが入る (#792)",
+                        );
+                    }
+                    None => fail("#792: 新書式での handoff が失敗した"),
+                }
+
+                // (b) 旧書式（節なし・pane / tab 参照が本文に混在）: 従来どおり全文が渡る
+                let legacy_src = "# master (default プロファイル) 引き継ぎ\n\n\
+                                  ## 【サンプル案件 移行】担当 master（tab 136 / pane 884）\n\
+                                  - 進行中: 客の追加 5 点\n\n\
+                                  ## 残キュー（優先順）\n\
+                                  - #801 の残件を Issue 化\n";
+                match handoff_792(legacy_src, cx) {
+                    Some((res, prompt, successor)) => {
+                        extra_successors.push(successor);
+                        println!(
+                            "TAKO_SELF_TEST_792_LEGACY: format={:?} sections={}",
+                            res["handoff_format"].as_str(),
+                            res["handoff_sections"]
+                                .as_array()
+                                .map(|a| a.len())
+                                .unwrap_or(9)
+                        );
+                        check(
+                            res["handoff_format"].as_str() == Some("legacy")
+                                && res["handoff_sections"].as_array().map(|a| a.len()) == Some(0),
+                            "102b: 旧書式は legacy として扱われる (#792)",
+                        );
+                        check(
+                            prompt.contains(legacy_src.trim())
+                                && prompt.contains("tako_read_pane")
+                                && prompt.contains("tako_close_pane"),
+                            "102b: 旧書式でも全文と #749 の手順がそのまま渡る (#792)",
+                        );
+                    }
+                    None => fail("#792: 旧書式での handoff が失敗した"),
+                }
+
                 // 後片付け（プロファイル・handoff ファイル・検証用ペイン）
                 fire(profiles_req("delete", false), cx);
                 if let Some(ref path) = handoff_path {
@@ -40570,6 +40683,16 @@ mod self_test {
                 }
                 if let Some(dir) = tako_control::orchestrator::config_dir() {
                     let _ = std::fs::remove_file(dir.join(format!("_system_prompt_{probe}.md")));
+                }
+                for pane in extra_successors {
+                    fire(
+                        Req::Close {
+                            pane: Some(pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        cx,
+                    );
                 }
                 for pane in [successor, prev] {
                     fire(

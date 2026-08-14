@@ -1874,3 +1874,20 @@
   ルート側へ持ち上げる必要がある。実測と回避案は architecture.md に記録
 - 検証: 品質ゲート全緑（1944）+ visual-test 全節 3 連続 OK + 隔離セルフテスト完走 +
   隔離実操作 12/12（出力・テーマ・分割・フォーカス・スクロール）
+
+## 2026-08-14（#792: handoff を「知識（マシン非依存）」と「実行状態（このマシン限定）」に分離）
+- 書式の正本を `tako_core::handoff` に新設（見出し 4 定数 + 寛容な `section_of_line` +
+  `split_handoff` + `handoff_template`）。後任プロンプトは**全文をそのまま渡した上で**
+  節ごとの扱い（知識 = 前提にしてよい / 実行状態 = 必ず実態で確認）を添える
+- **旧書式はそのまま動く**: 節が無ければ Legacy として全文を渡し「番号は実態で確認 +
+  次の更新で 2 節へ書き直せ」を添えて自然な移行に任せる（一括変換はしない）。
+  本番の実 handoff 5 本を読み取りだけで実測 = 全部 legacy / 全文保持
+- master prompt の規範を新書式へ改訂（見出し定数とのドリフトはテストが落とす）。
+  応答に `handoff_format` / `handoff_sections` を追加（self / handoff の両方）。
+  solo は handoff 機構を持たないので規範なし（プレースホルダ置換だけ）= 変更不要
+- ついで: `_system_prompt_*` を Local(GENERATED) でカタログ登録し、被覆テストの走査を
+  `join(format!(…))` へ拡張（before: `unclassified` に 2 件 → after: 0 件を実バイナリで A/B）
+- 検証: 品質ゲート全緑（1966）+ Windows クロスチェック警告 16 = main 同数 +
+  隔離セルフテスト完走（項目 102b 新設 = 実 dispatch で sectioned / legacy を実測）+
+  検出力 3 件（カタログ削除で 2 テスト FAILED / prompt 見出しドリフトで FAILED /
+  節判定の破壊で 8 テスト FAILED）
