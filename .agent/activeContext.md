@@ -3,65 +3,76 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-14、Issue #796 隔離セルフテストの main 由来フレークの根治）
+## 現在の対象（2026-08-15、Issue #803 ペインヘッダをルート側へ持ち上げる = PR 提出）
 
-- ブランチ `fix/796-selftest-stability`（worktree `~/dev/tako-wt-796`）
-- 目的: worker の Definition of Done「隔離セルフテスト完走」を信頼できる状態へ戻す
-  （同じソースなら同じ結果になる = main 由来の失敗と PR 由来の失敗を切り分けなくて済む）
-
-## 確定した根因 3 つ（すべて実測で切り分け済み）
-
-1. **`AnyView::cached`（#786）と「汚さずに draw」の組み合わせ** ← PDF アウトライン（#232）の正体。
-   製品経路（IPC / MCP の dispatch ループ）は dispatch 直後に `cx.notify()` してから次フレームを
-   描くが、セルフテストは直接 `dispatch` して `draw()` するだけだったので子ビューが描き直されず、
-   スクロールの幾何がキャッシュのまま = ジャンプが効いていないように見えていた。
-   2 秒ポーリングの notify がたまたま挟まった回だけ通っていた。
-   実測: `children=2 max_offset_y=199` なのに `offset_y` が 4 秒 80 フレームで 0 のまま →
-   `notify → draw` の順に直すと同一ビルドで `pdf_jump_ok=true delta=91.0`
-2. **偽の待ち条件**（#601）: A / B 両フェーズのプロンプトが同じ `ST601>` で、B の起動待ちが
-   A の残り表示へ即マッチ → `clear` と `tako` が起動前の外側シェルへ流れていた。
-   リトライでは直らない型（`ST601A>` / `ST601B>` に分離）
-3. **「出るもの」を固定時間で待っていた**（26 組）: `--features visual-test` は
-   `gpui_platform/test-support` → **`gpui/leak-detection`** を有効にし、entity ハンドルの
-   生成・複製・破棄を毎回ロック + HashMap で記録するので数割遅い = feature の有無だけで落ちていた
+- ブランチ `improve/803-header-lift`（worktree `~/dev/tako-wt-803`）。#796 / #658 merge 後の
+  origin/main へ rebase 済み
+- 目的: ペインのタイトルバーは **PTY の出力では変わらない**のに毎フレーム作り直していた。
+  `AnyView::cached` は入れ子にできない（#801 の実測）ので、ペイン本体の内側に置いたままでは
+  キャッシュが一度も当たらなかった → **本体の兄弟（どちらもルートの子）へ出した**
 
 ## 入った実装
 
-- `wait_for_focused_text` / `wait_for_focused_text_timed`（状態到達まで待ち、上限で偽 +
-  `TAKO_SELF_TEST_WAIT_TIMEOUT` に待った時間・画面末尾・実行環境）へ 26 組を移行
-- `absent_after_anchor`（否定検査は「先に必ず出るもの」を待ってから見る = 偽 PASS を防ぐ）
-- `notify_and_draw`（幾何を読む前は必ず汚してから 1 フレーム = 製品経路と同じ順序）
-- `PdfScrollProbe`（children / max_offset まで出す）+ 落ちた条件の内訳
-- `TAKO_APP_SELF_TEST_ENV`（profile / feature / leak-detection / load / 経過）を開始時と失敗時に出力。
-  load は `tako_control::diag::load_average`（新設。書式は純粋関数で単体テスト）
-- #732 は「分割直後のペインが素のアイドルになる」前提の成立を待ってから検査
-- 番犬テスト `selftest_wait_watchdog`（固定待ち + 肯定 `focused_contains` をソース検査で禁止）
-- 規約: `.agent/conventions.md`「セルフテストの待ち条件の書き方」
+- `view_cache::PaneHeader` 新設（本体 `PaneBody` と同列のキャッシュ単位）。ルートは
+  ペインごとに「本体（矩形いっぱい）」+「ヘッダ（矩形の上端）」を並べる
+- ヘッダの外側の div は**ペイン枠と同じ箱**（同じ矩形・同じ枠幅・同じ角丸・
+  `overflow_hidden`）を taffy に組ませるためのもの = 位置を px で手計算しない。
+  背景・影は持たないが、**枠線だけは同じ色で描かせる**（下記の罠）
+- 本体は同じ高さ（`PANE_TITLE_BAR`）のスペーサーでヘッダの場所を空ける
+  （`pane_text_areas` の会計 `stacked_top` は持ち上げの前後で不変）
+- ヘッダを出すかは `lifted_header_panes`（= **本体が実際に場所を空けたか**）で決める
+- `tick_pane_header_clocks`: `running · 4m12s` だけは時間で変わるので 1 秒に 1 回だけ
+  Running のペインのヘッダを汚す
+- grid-bench の DONE 行に `renders=(body +N header +N chrome +N)` を追加
 
-## 開発環境の注意（このマシン固有・報告済み）
+## 実測（隔離 grid-bench・300 フレーム・main と改修版の交互 3 反復の中央値）
 
-- **Metal Toolchain が入っていない**（macOS 26.4 / Xcode 26.2 で別ダウンロード扱い）。
-  `xcrun -sdk macosx metal` が失敗するので **gpui_macos の build script が走る構成では
-  ビルドできない**（debug 全般 / feature を変えた release）。
-  復旧は `xcodebuild -downloadComponent MetalToolchain`。
-  今回は「シェーダは gpui の rev 固定で不変」なので、既存 `shaders.metallib` を再利用する
-  ローカル shim（リポジトリ外）で回避して検証した
+| 密度（119x27・バナー無し） | main | #803 | 差 |
+|---|---|---|---|
+| 空画面 | 2.192M instr/frame | **1.737M** | −0.455M（−21%） |
+| 実務密度（915 セル） | 5.158M | **4.698M** | −0.460M（−9%） |
+| 満杯（2,943 セル） | 8.435M | **7.977M** | −0.458M（−5%） |
 
-## 追加で判明した環境要因（重要）
+ヘッダを丸ごと描かないゲートを当てた main が 1.517M = **ヘッダの総コスト 0.678M**、
+うち **0.455M（67%）を回収**。残り 0.22M は `cached` の再利用そのもの（`reuse_prepaint` /
+`reuse_paint` / `Scene::replay`）と外側 div で、tako 側から削る余地は薄い。
+**Issue 本文の 0.81M は #801 の 119x21 + バナーありの構成の値**（本件の構成では 0.678M）。
 
-- **ウィンドウが他アプリに完全に隠れると GPUI が描画を止め、新規ペインのシェルが
-  1 行も出力しない**（項目 76d / 104 が既にスキップしている条件）。これが #666 と
-  項目 63 の失敗の正体だった。判定 signal は `pane_text_areas`（1 度でも描画された
-  ペインだけが載る）で、未描画なら**明示スキップ**（落とさない・黙って通さない）
+## 踏み抜いた罠（同じ構造を触る人へ）
+
+- GPUI の `Style::paint` は「影 → 背景 → 子 → **枠線**」の順。持ち上げる前は
+  ペイン枠の丸め角がヘッダの上に来ていたので、兄弟にしただけだと上 2 つの角が
+  ヘッダの四角い背景で潰れる（実測 104 画素の accent が消えた）。外側 div にも
+  同じ矩形・同じ色の枠線を描かせて重なり順を戻した
+- **`visual-test` のピクセル計測値だけでは足りない**（角の欠けは計測点の外だった）。
+  `TAKO_VISUAL_DUMP_DIR` の実フレーム同士を全画素比較して初めて分かる
+
+## 不変条件
+
+- ヘッダの実体は `view_cache::PaneHeader` からしか呼ばない（`self.render_pane_header(` を
+  main.rs へ書くと入れ子キャッシュに戻る = 番犬テストが落ちる）
+- ヘッダの位置は taffy に解かせる（px の手計算を足さない）
+- 表示種別ごとのヘッダ（Web ビュー / プレビュー / スターター / チャット / 準備中）は
+  従来どおり各自の本体の中。持ち上げ対象はターミナル表示だけ
+
+## 検証の環境メモ（次に同じ検証をする人向け）
+
+- **visual-test の窓高で結果が変わる検査がある**: `terminal-grid` の
+  「下端の部分行（extra_bottom）が隙間を埋める」は `テキスト領域の高さ mod セル高`
+  依存で、既定 960x600 では **main でも落ちる**。`layout.json` に
+  `window.height = 708` を書いた隔離起動で main / 改修版とも緑になる
+- セルフテストの data dir を長いパス（scratchpad 直下）にすると IPC ソケットが
+  `SUN_LEN` を超えて**起動直後に固まる**。`TAKO_ISOLATED=1` の既定（`$TMPDIR`）に任せる
+- PDF / カーソルブロックの節は負荷で落ちる（main も同率）。3 連続緑は取れる
 
 ## 次の一手（master 判断）
 
-- #732 はクローズ提案のコメント済み。#771 は 101c 本体だけ残す方針をコメント済み
-- セルフテストは feature なしのビルドで回す運用が正（visual-test は
-  `TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=<節>` 側）。ただし本 PR 以降は**両構成で完走する**
+- PR（`Closes #803`）→ CI 緑 → squash merge → install（他 worker と重ねない）
+- 残り 0.22M を追うなら「枠線をルート側の 1 枚のオーバーレイに集約して本体からは外す」案が
+  ある（角の AA の二重合成 32 画素も消える）が、枠線の責務が分かれるので別 Issue 推奨
 
 ## 現フェーズで Read すべき設計書
 
-- セルフテストの待ち条件: `.agent/conventions.md`「セルフテストの待ち条件の書き方」
-- 実装: `crates/tako-app/src/main.rs`（`mod self_test` の `wait_for_focused_text` /
-  `notify_and_draw` / `selftest_wait_watchdog`）
+- キャッシュ構造: `.agent/architecture.md`「ビュー単位の描画キャッシュ」+
+  「ペインヘッダの持ち上げ」/ `crates/tako-app/src/view_cache.rs`
+- 会計: `.agent/architecture.md`「端末グリッドの専用 Element」/ `pane_text_area_rect`

@@ -110,6 +110,10 @@ fn claude_resume_command(
 const TAB_BAR_HEIGHT: f32 = 44.0;
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
+/// ペイン枠の丸め角（px。カンプ準拠）。
+/// #803: ヘッダをルート側へ持ち上げた外枠も同じ角丸で枠線を描き直すので、
+/// **本体とヘッダの 2 か所で同じ値**を使う（直値を散らすと角がずれる）
+const PANE_CORNER_RADIUS: f32 = 9.0;
 /// ペイン内側の余白（px。デザインスペック: 12–14px content padding）
 const PANE_PADDING: f32 = 10.0;
 /// キーボードリサイズ 1 回あたりの比率変化
@@ -1439,10 +1443,24 @@ struct TakoApp {
     term_pending_app: bool,
     /// ペイン本体の子ビュー（#786。`AnyView::cached` のキャッシュ単位）
     pane_bodies: HashMap<PaneId, gpui::Entity<view_cache::PaneBody>>,
+    /// ペインヘッダの子ビュー（#803。本体と同列のキャッシュ単位）
+    pane_headers: HashMap<PaneId, gpui::Entity<view_cache::PaneHeader>>,
+    /// 本体が「ヘッダの場所を空けた」ペイン（#803）。
+    ///
+    /// ルートはこの記録に従ってヘッダ要素を出す。live な判定（`pane_display_for`）で
+    /// 決めないのは、本体がキャッシュ再利用のまま表示種別だけが変わったフレームで
+    /// ヘッダが二重に出る / 消えるのを避けるため（本体が実際に描いたものが正）
+    lifted_header_panes: std::collections::HashSet<PaneId>,
+    /// ヘッダの実描画矩形の採取スロット（#803。持ち上げ後の位置検証用。`PaneTextAreaProbe` と同じ扱い）
+    pane_header_probes: HashMap<PaneId, PaneTextAreaProbe>,
+    /// ヘッダの時計（`running · 4m12s`）を進めた最後の時刻（#803）
+    last_header_clock_tick: std::time::Instant,
     /// クロームの子ビュー（#786。同上）
     chrome_views: HashMap<view_cache::ChromePart, gpui::Entity<view_cache::Chrome>>,
     /// ペイン本体を実際に描き直した回数（#786 の効果検証用。単調増加）
     pane_body_renders: u64,
+    /// ペインヘッダを実際に描き直した回数（#803 の効果検証用。単調増加）
+    pane_header_renders: u64,
     /// クロームを実際に描き直した回数（同上）
     chrome_renders: u64,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
@@ -2909,8 +2927,13 @@ impl TakoApp {
             term_pending_panes: Vec::new(),
             term_pending_app: false,
             pane_bodies: HashMap::new(),
+            pane_headers: HashMap::new(),
+            lifted_header_panes: std::collections::HashSet::new(),
+            pane_header_probes: HashMap::new(),
+            last_header_clock_tick: std::time::Instant::now(),
             chrome_views: HashMap::new(),
             pane_body_renders: 0,
+            pane_header_renders: 0,
             chrome_renders: 0,
             video_players: HashMap::new(),
             video_ticker: false,
@@ -3630,6 +3653,8 @@ impl TakoApp {
                 let prep = this.update(cx, |app: &mut TakoApp, wcx| {
                     // Issue #168: 定期更新の UI スレッド部（収集 + save_layout）を計測
                     let _span = tako_control::diag::perf_span("periodic_prep");
+                    // #803: 出力が止まっている running ペインのヘッダ時計もここで進む
+                    app.tick_pane_header_clocks(wcx);
                     // ステップ別サブスパン（#212: periodic_prep の秒級スパイクをステップ単位で
                     // 攻撃者特定できるようにする。しきい値超えのみ記録 = 正常時コストほぼゼロ）
                     let tmux_ctx = {
@@ -5764,6 +5789,9 @@ impl TakoApp {
     /// `cx.observe` で一緒に汚れる）。無ければ出力のあったペインのビューだけを汚す
     fn flush_term_redraw(&mut self, cx: &mut Context<Self>) {
         self.last_term_notify = std::time::Instant::now();
+        // #803: ヘッダの時計だけは時間で変わる。出力が流れているあいだも 1 秒に 1 回
+        // 進める（ゲートは中で見るので、ここの呼び出しは Instant の比較 1 回）
+        self.tick_pane_header_clocks(cx);
         let app_scope = std::mem::take(&mut self.term_pending_app);
         let panes = std::mem::take(&mut self.term_pending_panes);
         if !app_scope && panes.is_empty() {
@@ -14001,15 +14029,17 @@ impl TakoApp {
             .collect()
     }
 
-    /// ペインのタイトルバー（#801 で [`Self::render_pane`] から切り出し）。
+    /// ペインのタイトルバー（#801 で [`Self::render_pane`] から切り出し、
+    /// #803 で `view_cache::PaneHeader` としてルート側へ持ち上げ）。
     ///
     /// ここに出るもの（タイトル・role・状態ドット・番号・cwd・workers）は
-    /// **PTY の出力では変わらない**ので、本来は独立したキャッシュ単位にしたい
-    /// （実測 0.62M instr/frame）。ただし GPUI の `AnyView::cached` は入れ子にできない
-    /// （`view_cache` のモジュールコメント参照）ため、ペイン本体をキャッシュ単位に
-    /// したまま**この中で**キャッシュしても一度も当たらない。切り出しは、
-    /// ヘッダをペイン枠ごとルート側へ持ち上げる後続作業のための準備でもある
+    /// **PTY の出力では変わらない**。GPUI の `AnyView::cached` は入れ子にできない
+    /// （`view_cache` のモジュールコメント参照）ので、ペイン本体の内側に置いたままでは
+    /// キャッシュが一度も当たらなかった。いまはペイン本体と**同列**のキャッシュ単位
+    /// なので、出力フレームでは丸ごと再利用される（呼び出し元は [`view_cache::PaneHeader`]
+    /// だけ = ここを直接呼ぶと本体の内側に戻ってしまう）
     fn render_pane_header(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.pane_header_renders = self.pane_header_renders.saturating_add(1);
         let theme = self.theme.clone();
         let Some(area) = self
             .pane_text_areas
@@ -14178,6 +14208,18 @@ impl TakoApp {
                     cx.notify();
                 }),
             )
+            // #803: ヘッダの実描画矩形を採取する（何も描かない absolute なプローブ。
+            // 見た目にもレイアウトにも出ない）。ルート側へ持ち上げた結果が
+            // 「ペイン矩形の内側の上端」に着いていることを、テキスト領域の正
+            // （`pane_text_areas`）と突き合わせて検証するための観測点
+            .child({
+                let slot = self.pane_header_probes.entry(pane_id).or_default().clone();
+                canvas(move |bounds, _, _| slot.set(Some(bounds)), |_, _, _, _| ())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+            })
             // #185: 左コンテナ（情報要素、flex_1 + overflow_hidden）
             .child(
                 div()
@@ -14601,6 +14643,10 @@ impl TakoApp {
     }
     fn render_pane_body(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.pane_body_renders = self.pane_body_renders.saturating_add(1);
+        // #803: ヘッダを出すかどうかは「この本体が場所を空けたか」で決まる。
+        // ターミナル表示の分岐に入ったときだけ `render_pane` が立て直す
+        // （Web ビュー / プレビュー / スターター / チャット / 準備中は自前のヘッダを持つ）
+        self.lifted_header_panes.remove(&pane_id);
         let Some(area) = self
             .pane_text_areas
             .iter()
@@ -14633,9 +14679,48 @@ impl TakoApp {
         view
     }
 
-    /// タブにもたまり場にも居なくなったペインのビューを捨てる（#786）
+    /// ペイン枠線の色（#803）。
+    ///
+    /// 本体（`render_pane`）とルート側のヘッダ外枠が**同じ枠線を 2 回**塗るので、
+    /// 規則はここ 1 か所に置く（片方だけ直すと枠の上下で色が食い違う）
+    fn pane_border_color(&self, pane_id: PaneId) -> gpui::Hsla {
+        let is_failed = matches!(
+            self.terminals.get(&pane_id).map(|s| s.command_state()),
+            Some(tako_core::CommandState::Failed(_))
+        );
+        let focused = self
+            .workspace
+            .find_tab_of_pane(pane_id)
+            .and_then(|t| self.workspace.get_tab(t))
+            .is_some_and(|tab| tab.tree().focused() == pane_id);
+        if is_failed {
+            // カンプ: 失敗ペインは赤枠で明確に（rgba(243,139,168,0.55)）
+            hsla_alpha(self.theme.red, 0.55)
+        } else if focused {
+            hsla(self.theme.accent)
+        } else {
+            hsla(self.theme.border_default)
+        }
+    }
+
+    /// ペインヘッダのキャッシュ単位となる子ビュー（無ければ作る。#803）
+    fn pane_header_view(
+        &mut self,
+        pane_id: PaneId,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<view_cache::PaneHeader> {
+        if let Some(view) = self.pane_headers.get(&pane_id) {
+            return view.clone();
+        }
+        let app = cx.entity();
+        let view = cx.new(|cx| view_cache::PaneHeader::new(&app, pane_id, cx));
+        self.pane_headers.insert(pane_id, view.clone());
+        view
+    }
+
+    /// タブにもたまり場にも居なくなったペインのビューを捨てる（#786 / #803）
     fn prune_pane_body_views(&mut self) {
-        if self.pane_bodies.is_empty() {
+        if self.pane_bodies.is_empty() && self.pane_headers.is_empty() {
             return;
         }
         let live: std::collections::HashSet<PaneId> = self
@@ -14647,6 +14732,41 @@ impl TakoApp {
             .chain(self.workspace.shelved_panes().iter().map(|s| s.pane().id()))
             .collect();
         self.pane_bodies.retain(|id, _| live.contains(id));
+        self.pane_headers.retain(|id, _| live.contains(id));
+        self.pane_header_probes.retain(|id, _| live.contains(id));
+        self.lifted_header_panes.retain(|id| live.contains(id));
+    }
+
+    /// ヘッダの時計（`running · 4m12s`）を進める（#803）。
+    ///
+    /// 持ち上げる前のヘッダはペイン本体の一部だったので、出力のたびに描き直されて
+    /// 時計も進んでいた。いまは PTY 出力でヘッダを汚さないのが要点なので、
+    /// **経過時間を出しているペインだけ** 1 秒に 1 回別枠で汚す
+    /// （逆に、出力が止まっている running ペインの時計は持ち上げ前より新鮮になる）
+    fn tick_pane_header_clocks(&mut self, cx: &mut Context<Self>) {
+        if self.pane_headers.is_empty() {
+            return;
+        }
+        if self.last_header_clock_tick.elapsed() < std::time::Duration::from_millis(1000) {
+            return;
+        }
+        self.last_header_clock_tick = std::time::Instant::now();
+        let running: Vec<PaneId> = self
+            .pane_headers
+            .keys()
+            .copied()
+            .filter(|id| {
+                matches!(
+                    self.terminals.get(id).map(|s| s.command_state()),
+                    Some(tako_core::CommandState::Running)
+                )
+            })
+            .collect();
+        for pane in running {
+            if let Some(view) = self.pane_headers.get(&pane).cloned() {
+                view.update(cx, |_, cx| cx.notify());
+            }
+        }
     }
 
     /// クローム 1 枚を `AnyView::cached` で包む（#786）。
@@ -14746,9 +14866,10 @@ impl TakoApp {
             tako_core::ui_mode::PaneDisplay::Terminal => {}
         }
 
-        // タイトルバーは `render_pane_header` へ切り出してある（#801）。
-        // ここで先に採るのはヘッダの**外**でも要るものだけ:
-        // 枠の色・影（is_failed）と、ヘッダの下に重ねるドロップダウン（workers）
+        // タイトルバーは `render_pane_header` へ切り出し（#801）、ルート側の兄弟へ
+        // 持ち上げてある（#803。`view_cache::PaneHeader`）。ここに残すのはヘッダの
+        // **外**でも要るものだけ: 枠の色・影（is_failed）と、ヘッダの下に重ねる
+        // ドロップダウン（workers）。ヘッダの場所は下のスペーサーで空ける
         let is_failed = matches!(
             self.terminals.get(&pane_id).map(|s| s.command_state()),
             Some(tako_core::CommandState::Failed(_))
@@ -14759,7 +14880,9 @@ impl TakoApp {
         } else {
             Vec::new()
         };
-        let header = self.render_pane_header(pane_id, cx);
+        // #803: 「この本体はヘッダの場所を空けた」の記録。ルートはこれに従って
+        // ヘッダ要素を出す（本体が実際に描いたものが正 = 二重表示が起きない）
+        self.lifted_header_panes.insert(pane_id);
 
         // スクロールバー（FR-2.5.13）: iTerm2 流にスクロール中だけ表示 → フェードアウト。
         // バックエンドペインは tmux 側（ネスト先含む）の位置・履歴を表示する
@@ -14821,15 +14944,8 @@ impl TakoApp {
             .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
-            .rounded(px(9.0))
-            .border_color(if is_failed {
-                // カンプ: 失敗ペインは赤枠で明確に（rgba(243,139,168,0.55)）
-                hsla_alpha(theme.red, 0.55)
-            } else if focused {
-                hsla(theme.accent)
-            } else {
-                hsla(theme.border_default)
-            })
+            .rounded(px(PANE_CORNER_RADIUS))
+            .border_color(self.pane_border_color(pane_id))
             .when(is_failed, |d| {
                 d.shadow(vec![BoxShadow {
                     color: hsla_alpha(theme.red, 0.12),
@@ -14871,7 +14987,11 @@ impl TakoApp {
                     this.on_pane_scroll(pane_id, event, window, cx);
                 }),
             )
-            .child(header)
+            // #803: ヘッダの場所（`PANE_TITLE_BAR`）。実体はルート側の
+            // `view_cache::PaneHeader` がこの矩形へ絶対配置で描く。ここは高さを
+            // 空けるだけ = `pane_text_areas` の会計（`stacked_top`）は持ち上げの
+            // 前後で変わらない
+            .child(div().flex_none().w_full().h(px(PANE_TITLE_BAR)))
             // stale claude バイナリ通知バナー（Issue #498）
             .when_some(
                 self.stale_binary_banners
@@ -17887,9 +18007,9 @@ impl Render for TakoApp {
         // 出力していない他ペイン・クロームは prepaint / paint ごと再利用される。
         // 位置と大きさはここ（cached のスタイル）が持ち、中身は矩形いっぱいに描く
         let panes: Vec<_> = layout
-            .into_iter()
+            .iter()
             .map(|(id, rect)| {
-                let view = self.pane_body_view(id, cx);
+                let view = self.pane_body_view(*id, cx);
                 view_cache::cached_view(
                     &view,
                     gpui::StyleRefinement::default()
@@ -17900,6 +18020,63 @@ impl Render for TakoApp {
                         .h(relative(rect.height)),
                     cx,
                 )
+            })
+            .collect();
+        // #803: ペインヘッダは本体の**兄弟**（キャッシュ単位を分ける）。GPUI の
+        // `AnyView::cached` は入れ子にできないので、本体の内側に置いたままでは
+        // 「PTY 出力では変わらないのに毎フレーム作り直す」が避けられなかった。
+        //
+        // 外側の div はペイン枠と同じ箱（同じ矩形・同じ枠幅・同じ角丸・`overflow_hidden`）を
+        // taffy に組ませるためのもので、背景も影も持たない。ヘッダの位置と大きさを
+        // 手計算しないのが要点（枠の内側の上端という関係をレイアウトエンジンに解かせる
+        // = 会計のずれが構造的に起きない）。
+        //
+        // **枠線だけはこの div にも描かせる**（`border_color`）。GPUI の `Style::paint` は
+        // 「影 → 背景 → 子 → 枠線」の順なので、持ち上げる前はペイン枠の丸め角が
+        // ヘッダの**上**に来ていた。ヘッダを兄弟にすると本体の枠線より後に塗られ、
+        // 上 2 つの丸め角がヘッダの四角い背景で潰れる（実測: フォーカス枠の accent が
+        // 角で 104px 消えた）。同じ矩形・同じ色の枠線を子（ヘッダ）の後に塗り直すことで、
+        // 持ち上げ前とまったく同じ重なり順に戻す
+        let lifted: Vec<(PaneId, Rect)> = layout
+            .iter()
+            .filter(|(id, _)| self.lifted_header_panes.contains(id))
+            .map(|(id, rect)| (*id, *rect))
+            .collect();
+        let pane_headers: Vec<_> = lifted
+            .into_iter()
+            .map(|(id, rect)| {
+                let view = self.pane_header_view(id, cx);
+                let header = view_cache::cached_view_when(
+                    // `TAKO_803_NO_HEADER_CACHE=1` は「持ち上げたが毎フレーム作り直す」
+                    // = 持ち上げ前と同じ仕事量。同一バイナリの A/B に使う
+                    view_cache::enabled() && !view_cache::header_cache_disabled(),
+                    &view,
+                    gpui::StyleRefinement::default()
+                        .w_full()
+                        .h(px(PANE_TITLE_BAR))
+                        .flex_none(),
+                    cx,
+                );
+                // 枠線の色は本体（`render_pane`）と同じ 1 か所から取る。状態が変われば
+                // TakoApp が notify され本体も同じフレームで描き直るので食い違わない
+                let border_color = self.pane_border_color(id);
+                div()
+                    .absolute()
+                    .left(relative(rect.x))
+                    .top(relative(rect.y))
+                    .w(relative(rect.width))
+                    // 低いペインではペイン枠と同じところで切る（枠の内側に収める）
+                    .max_h(relative(rect.height))
+                    .border_l(px(PANE_BORDER))
+                    .border_t(px(PANE_BORDER))
+                    .border_r(px(PANE_BORDER))
+                    .rounded_t(px(PANE_CORNER_RADIUS))
+                    .border_color(border_color)
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .into_any_element()
             })
             .collect();
         let _ = cell;
@@ -18300,6 +18477,9 @@ impl Render for TakoApp {
                             // #684: 実矩形の採取はペインより先（最背面）に置く
                             .child(content_probe)
                             .children(panes)
+                            // #803: ヘッダは本体の直後（本体の上・境界ハンドルの下）。
+                            // 本体側は同じ高さを空けてあるので重なりは無い
+                            .children(pane_headers)
                             .children(border_handles)
                             .children(drop_overlays)
                             .children(ime_overlay),
@@ -24252,6 +24432,21 @@ mod self_test {
             .timer(Duration::from_millis(3000))
             .await;
 
+        // #803: 「どのビューが何回描き直されたか」を計測区間の前後で採る。
+        // instr/frame だけ見ていると「キャッシュが当たっていない」と
+        // 「当たっているが再利用そのものが重い」を取り違える
+        let renders = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    (
+                        app.pane_body_renders,
+                        app.pane_header_renders,
+                        app.chrome_renders,
+                    )
+                })
+                .unwrap_or((0, 0, 0))
+        };
+        let r0 = renders(cx);
         let t0 = std::time::Instant::now();
         for _ in 0..frames {
             // PTY 出力と同じ経路でペインを汚す（4ms 合流をまたぐため直前の
@@ -24269,13 +24464,18 @@ mod self_test {
             let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
         }
         let elapsed = t0.elapsed();
+        let r1 = renders(cx);
         println!(
             "TAKO_GRID_BENCH_DONE element={} frames={frames} wall_ms={:.1} \
-             ms_per_frame={:.3} fps_capable={:.1}",
+             ms_per_frame={:.3} fps_capable={:.1} \
+             renders=(body +{} header +{} chrome +{})",
             !crate::terminal_grid::element_disabled(),
             elapsed.as_secs_f64() * 1000.0,
             elapsed.as_secs_f64() * 1000.0 / frames as f64,
             frames as f64 / elapsed.as_secs_f64(),
+            r1.0 - r0.0,
+            r1.1 - r0.1,
+            r1.2 - r0.2,
         );
         cx.background_executor()
             .timer(Duration::from_millis(3000))
@@ -42600,6 +42800,172 @@ mod self_test {
                 }
             }
 
+            // 110: ペインヘッダは本体と別のキャッシュ単位で、PTY 出力では描き直さない
+            // （Issue #803）。
+            //
+            // ヘッダに出るもの（タイトル・role・状態・cwd・workers）は出力では変わらない。
+            // それでも #801 までは毎フレーム作り直していた（`AnyView::cached` は入れ子に
+            // できないので、本体の内側に置いたままではキャッシュが一度も当たらない）。
+            // ここでは ①出力ではヘッダを描き直さない ②ヘッダの中身が変わる状態変化
+            // （実 dispatch のタイトル変更）では描き直す ③持ち上げた結果が
+            // 「枠の内側の上端」に着いている（テキスト領域の正と矛盾しない）の 3 点を見る。
+            // ヘッダを本体の内側へ戻すと ① が、notify 経路を落とすと ② が、
+            // 位置を手計算し直すと ③ が落ちる
+            if view_cache::enabled() && !view_cache::header_cache_disabled() {
+                let any803 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window803 = any803.downcast::<TakoApp>().unwrap_or(window);
+                let draw = |cx: &mut gpui::AsyncApp| {
+                    let _ = any803.update(cx, |_, w, cx| w.draw(cx).clear());
+                };
+                draw(cx);
+                wait(cx, 50).await;
+                draw(cx);
+                let counters = |cx: &mut gpui::AsyncApp| {
+                    window803
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            (app.pane_body_renders, app.pane_header_renders)
+                        })
+                        .unwrap_or((0, 0))
+                };
+                // 対象は「このウィンドウに実際に描かれた」ターミナルのペイン。
+                // 持ち上げているかは**条件にしない**（条件にすると、持ち上げを戻した
+                // ときに検査が落ちずに飛ぶ = 検出力が無くなる）
+                let target = window803
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.pane_text_areas
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .find(|id| {
+                                app.terminals.contains_key(id)
+                                    && !app.previews.contains_key(id)
+                                    && !app.webviews.iter().any(|w| w.pane == Some(*id))
+                            })
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(target) = target {
+                    let lifted = window803
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.lifted_header_panes.contains(&target)
+                        })
+                        .unwrap_or(false);
+                    check(
+                        lifted,
+                        "110: ターミナル表示のペインはヘッダをルート側へ持ち上げている (#803)",
+                    );
+                    let (body0, head0) = counters(cx);
+                    // ① 出力（= このペインの本体だけを汚す経路）
+                    let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.last_term_notify =
+                            std::time::Instant::now() - std::time::Duration::from_secs(1);
+                        app.on_term_event(
+                            target,
+                            tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
+                            cx,
+                        );
+                    });
+                    draw(cx);
+                    let (body1, head1) = counters(cx);
+                    // ② 実 dispatch（CLI / MCP が通る道）でタイトルを変える。
+                    // ControlHost のメソッド自身は notify しない設計なので、IPC の
+                    // 1 ターンと同じく dispatch の直後に `cx.notify()` して締める
+                    // （= ヘッダが「アプリ全体の notify」で汚れることの検証になる）
+                    let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Title {
+                                pane: Some(target.as_u64()),
+                                title: Some("selftest-803".into()),
+                                role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                    });
+                    draw(cx);
+                    let (body2, head2) = counters(cx);
+                    // ③ 実描画のヘッダ矩形とテキスト領域の正（`pane_text_areas`）の関係。
+                    // ヘッダの下端 + パディングがテキスト領域の上端、左右はパディングぶん内側
+                    let geom = window803
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            let probe = app.pane_header_probes.get(&target)?.get()?;
+                            let (_, area) =
+                                app.pane_text_areas.iter().find(|(id, _)| *id == target)?;
+                            let banner = app.stale_banner_height(target);
+                            Some((
+                                f32::from(area.origin.x) - f32::from(probe.origin.x) - PANE_PADDING,
+                                f32::from(area.origin.y)
+                                    - f32::from(probe.origin.y)
+                                    - PANE_TITLE_BAR
+                                    - banner
+                                    - PANE_PADDING,
+                                f32::from(probe.size.width)
+                                    - f32::from(area.size.width)
+                                    - PANE_PADDING * 2.0,
+                                f32::from(probe.size.height),
+                            ))
+                        })
+                        .ok()
+                        .flatten();
+                    println!(
+                        "TAKO_SELF_TEST_803: output=(body +{} header +{}) \
+                         title=(body +{} header +{}) geom={geom:?}",
+                        body1 - body0,
+                        head1 - head0,
+                        body2 - body1,
+                        head2 - head1,
+                    );
+                    check(body1 > body0, "110: 出力のあったペイン本体は描き直される (#803)");
+                    check(
+                        head1 == head0,
+                        "110: PTY 出力ではペインヘッダを描き直さない (#803)",
+                    );
+                    check(
+                        head2 > head1,
+                        "110: タイトル変更ではペインヘッダを描き直す (#803)",
+                    );
+                    match geom {
+                        // 端数はデバイスピクセルへのスナップぶん（`pane_text_area_rect`）
+                        Some((dx, dy, dw, h)) => {
+                            check(
+                                dx.abs() <= 1.0 && dy.abs() <= 1.0 && dw.abs() <= 1.0,
+                                "110: 持ち上げたヘッダが枠の内側の上端に着いている (#803)",
+                            );
+                            check(
+                                (h - PANE_TITLE_BAR).abs() <= 2.0,
+                                "110: ヘッダの高さが PANE_TITLE_BAR のまま (#803)",
+                            );
+                        }
+                        None => println!(
+                            "TAKO_SELF_TEST_SKIPPED: 110 の矩形検査（ヘッダ未描画）"
+                        ),
+                    }
+                    // 後始末: タイトルを戻す
+                    let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Title {
+                                pane: Some(target.as_u64()),
+                                title: Some(String::new()),
+                                role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        cx.notify();
+                    });
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 110（ターミナル表示のペインが未描画。\
+                         ウィンドウを前面にして再実行すると検証できる）"
+                    );
+                }
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 110（TAKO_786_NO_VIEW_CACHE / \
+                     TAKO_803_NO_HEADER_CACHE でキャッシュ無効）"
+                );
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -43650,7 +44016,8 @@ mod pane_text_area_tests {
             .collect();
         // 期待する 9 個:
         //   when(is_failed) / when(focused) = 影と枠の見た目だけ（高さを食わない）
-        //   child(ヘッダ) = PANE_TITLE_BAR / when_some(stale バナー) = STALE_BANNER_HEIGHT
+        //   child(ヘッダの場所を空けるスペーサー #803) = PANE_TITLE_BAR
+        //   when_some(stale バナー) = STALE_BANNER_HEIGHT
         //   child(ターミナル領域) = flex_1
         //   children(カード帯) = card_band_height
         //   children(スクロールバー) / children(提案チップ) / when(workers メニュー) = absolute
@@ -43660,6 +44027,49 @@ mod pane_text_area_tests {
             "ペインの直接の子が変わっている: {children:#?}\n\
              流れの中（absolute でない）に足したなら `stacked_top` / `band` の会計を\
              見直すこと（#781）"
+        );
+        // #803: ヘッダの場所は「空けるだけ」でなければならない（実体はルート側）。
+        // ここに実要素が戻ると `AnyView::cached` の入れ子になってキャッシュが
+        // 一度も当たらなくなる（見た目は変わらないので気づけない）
+        let spacer = format!(
+            ".child(div().flex_none().w_full().h(px({})))",
+            "PANE_TITLE_BAR"
+        );
+        assert!(
+            pane.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(&spacer),
+            "ヘッダの場所がスペーサーになっていない（#803 の持ち上げが戻っている）"
+        );
+    }
+
+    /// ペインヘッダはルート側の兄弟に居る（#803 の持ち上げが戻っていない）。
+    ///
+    /// GPUI の `AnyView::cached` は入れ子にできないので、ヘッダをペイン本体の内側から
+    /// 呼び直すと「PTY 出力では変わらないのに毎フレーム作り直す」へ静かに戻る
+    /// （#801 の実測。効果だけが消えて見た目は変わらないため、目視では気づけない）
+    #[test]
+    fn ペインヘッダはルート側の兄弟として描かれる() {
+        let source = include_str!("main.rs");
+        let direct = format!("self.{}(", "render_pane_header");
+        assert_eq!(
+            source.matches(&direct).count(),
+            0,
+            "ペイン本体からヘッダを直接呼んでいる（キャッシュ単位が入れ子になる。#803）"
+        );
+        let view_cache = include_str!("view_cache.rs");
+        assert_eq!(
+            view_cache
+                .matches(&format!("app.{}(pane, cx)", "render_pane_header"))
+                .count(),
+            1,
+            "ヘッダの呼び出し元は `view_cache::PaneHeader` 1 か所だけ（#803）"
+        );
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&format!(".children({})", "pane_headers")),
+            "ルートがヘッダ要素を出していない（#803）"
         );
     }
 }
