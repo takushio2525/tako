@@ -441,7 +441,50 @@ struct PromptFlow {
     /// worker レジストリへ初回プロンプトの送達結果を記録するフローか。
     /// 通常の後続 send は同じ送達確認ループを使うが、spawn の状態は変更しない（#778）
     delivery_flow: tako_control::orchestrator::registry::PromptDeliveryFlow,
+    /// peer 送達（#790。claude の Cross-Session Messaging）の非同期試行。
+    /// socket 接続と transcript による受信確認は待ちを含むので background で走らせ、
+    /// 結果をこのスロットへ書く。None = まだ試していない
+    peer_attempt: Option<std::sync::Arc<std::sync::Mutex<Option<PeerAttemptResult>>>>,
 }
+
+/// 送達フローから見た peer 送達の 1 tick ぶんの進み（#790）
+enum PeerStep {
+    /// background の試行中（次 tick で結果を見る）
+    Pending,
+    /// peer で送り切った
+    Sent {
+        /// transcript で受信を確認できたか
+        received: bool,
+    },
+    /// peer は使えない → 従来のキー操作経路へ（理由は診断ログへ残す）
+    UseKeys { reason: &'static str },
+    /// `TAKO_PEER_MESSAGING=only` で peer が使えなかった（検証用。キー経路へ落ちない）
+    Refused { note: String },
+}
+
+/// background で走らせた peer 送達の結果（#790）
+#[derive(Debug, Clone)]
+enum PeerAttemptResult {
+    /// peer で送り切った（**キー操作経路へ落ちてはならない** = 二重投函の防止）
+    Sent {
+        /// transcript による受信確認
+        received: bool,
+    },
+    /// peer は使えなかった。キー操作経路へ落ちてよい
+    Fallback {
+        /// 安定した理由コード（診断ログ用）
+        reason: &'static str,
+        /// 待てば解消しうる理由か（claude が起動途中で受信箱をまだ開いていない等）
+        transient: bool,
+    },
+    /// `TAKO_PEER_MESSAGING=only` で peer が使えなかった（検証用）
+    Refused { note: String },
+}
+
+/// 一時的な不成立（起動途中で受信箱がまだ無い）を待つ猶予。
+/// claude の受信箱 bind は入力欄表示とほぼ同時（実測 1.1 秒）だが、負荷が高いと遅れる。
+/// 猶予を過ぎたら従来経路へ落ちる（待ち続けて送達が遅れる方が悪い）
+const PEER_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
 
 impl PromptFlow {
     fn new(
@@ -473,6 +516,7 @@ impl PromptFlow {
             paste_reflected: false,
             unverified_reason: None,
             delivery_flow,
+            peer_attempt: None,
         }
     }
 
@@ -4979,6 +5023,27 @@ impl TakoApp {
                     flow.created_at.elapsed().as_secs_f32()
                 );
             }
+            // #790: peer 送達の宛先材料。バックエンド tmux セッション名と
+            // 「エージェント管理下の worker か」（role で判定。人間が話す master /
+            // 素のペインは従来経路のまま = 前置きの意味を変えない）。
+            // Enter 単独送達（#95）は「キーを送れ」という要求そのものなので対象外
+            let peer_ctx = if flow.enter_only || flow.prompt.trim().is_empty() {
+                None
+            } else {
+                self.backend_sessions.get(&flow.pane).map(|backend| {
+                    let role = self
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .flat_map(|t| t.tree().panes())
+                        .find(|p| p.id() == flow.pane)
+                        .and_then(|p| p.role());
+                    (
+                        backend.clone(),
+                        tako_control::peer_messaging::agent_managed_role(role),
+                    )
+                })
+            };
             match flow.state {
                 PromptFlowState::WaitAltScreen => {
                     // agy 1.1.0 は inline モード（非 alt_screen）で動くため、alt_screen 遷移
@@ -5071,9 +5136,38 @@ impl TakoApp {
                         // bracketed paste はアプリが要求していれば paste() が括りを付ける。
                         // ダイアログ待ちを経てここへ来た場合は保留理由を解除する（#530）
                         flow.unverified_reason = None;
-                        session.paste(&flow.prompt);
-                        flow.state = PromptFlowState::WaitTextInInput;
-                        flow.state_entered_at = now;
+                        // #790: worker 宛は peer 送達（claude の Cross-Session Messaging =
+                        // socket 直送）を先に試す。貼り付けもキー操作も伴わないので、
+                        // 長文の取りこぼし（#530）・生成中のキュー誤認（#572）が起きない。
+                        // 使えなければ従来経路（貼り付け + 分離 Enter + 空検証）へ落ちる
+                        match Self::drive_peer_attempt(&mut flow, peer_ctx.as_ref()) {
+                            PeerStep::Pending => {} // 次 tick で結果を見る
+                            PeerStep::Sent { received } => {
+                                flow.state = PromptFlowState::Done;
+                                if received {
+                                    Self::report_prompt_delivery_ok(&flow);
+                                } else {
+                                    eprintln!(
+                                        "warning: peer 送達の受信を確認できない（pane={}）",
+                                        flow.pane.as_u64()
+                                    );
+                                    Self::report_prompt_delivery(&flow, "peer_unconfirmed");
+                                }
+                            }
+                            PeerStep::Refused { note } => {
+                                eprintln!("warning: {note}（pane={}）", flow.pane.as_u64());
+                                flow.state = PromptFlowState::Done;
+                                Self::report_prompt_delivery(&flow, "peer_refused");
+                            }
+                            PeerStep::UseKeys { reason } => {
+                                if let Some((backend, _)) = peer_ctx.as_ref() {
+                                    tako_control::delivery::log_fallback(backend, reason);
+                                }
+                                session.paste(&flow.prompt);
+                                flow.state = PromptFlowState::WaitTextInInput;
+                                flow.state_entered_at = now;
+                            }
+                        }
                     }
                 }
                 PromptFlowState::WaitTextInInput => {
@@ -5181,6 +5275,71 @@ impl TakoApp {
             tako_control::request_claude_scan();
         }
         self.prompt_flows = remaining;
+    }
+
+    /// peer 送達（#790）の 1 tick ぶんの前進。
+    ///
+    /// socket 接続と transcript による受信確認は待ちを含むので background スレッドで走らせ、
+    /// UI スレッドはスロットを覗くだけにする（#212 / #772 の「UI スレッドで待たない」規約）。
+    /// `ctx` = (バックエンド tmux セッション名, エージェント管理下の worker か)
+    fn drive_peer_attempt(flow: &mut PromptFlow, ctx: Option<&(String, bool)>) -> PeerStep {
+        use tako_control::{delivery, peer_messaging};
+        let Some((backend, agent_managed)) = ctx else {
+            // バックエンドセッションが無いペイン（tmux 不在の直 spawn）は宛先を特定できない
+            return PeerStep::UseKeys {
+                reason: "no_backend_session",
+            };
+        };
+        let slot = match flow.peer_attempt.clone() {
+            Some(slot) => slot,
+            None => {
+                // I/O を伴わない事前判定で対象外なら background を起こさない
+                if let Err(reason) = delivery::plan(peer_messaging::mode(), *agent_managed) {
+                    return PeerStep::UseKeys {
+                        reason: reason.code(),
+                    };
+                }
+                let slot: std::sync::Arc<std::sync::Mutex<Option<PeerAttemptResult>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                flow.peer_attempt = Some(slot.clone());
+                let backend = backend.clone();
+                let text = flow.prompt.clone();
+                let agent_managed = *agent_managed;
+                std::thread::spawn(move || {
+                    let result = match delivery::try_peer(&backend, &text, agent_managed) {
+                        delivery::PeerAttempt::Sent(outcome) => PeerAttemptResult::Sent {
+                            received: outcome.verification.is_none_or(|v| v.is_received()),
+                        },
+                        delivery::PeerAttempt::Fallback { reason, transient } => {
+                            PeerAttemptResult::Fallback { reason, transient }
+                        }
+                        delivery::PeerAttempt::Refused { note } => {
+                            PeerAttemptResult::Refused { note }
+                        }
+                    };
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(result);
+                    }
+                });
+                return PeerStep::Pending;
+            }
+        };
+        let done = slot.lock().ok().and_then(|guard| guard.clone());
+        match done {
+            None => PeerStep::Pending,
+            Some(PeerAttemptResult::Sent { received }) => PeerStep::Sent { received },
+            Some(PeerAttemptResult::Fallback { reason, transient }) => {
+                // 起動途中で受信箱がまだ無いだけなら、猶予のあいだ再試行する
+                // （spawn 直後の 1 回だけを見て従来経路へ落とすと、長文プロンプトで
+                // 一番効く場面を取り逃す）
+                if transient && flow.created_at.elapsed() < PEER_GRACE {
+                    flow.peer_attempt = None;
+                    return PeerStep::Pending;
+                }
+                PeerStep::UseKeys { reason }
+            }
+            Some(PeerAttemptResult::Refused { note }) => PeerStep::Refused { note },
+        }
     }
 
     /// 送達フローの結果を worker レジストリへ記録する（Issue #530）。

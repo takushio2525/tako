@@ -5343,12 +5343,36 @@ fn normalize_newlines_for_keys(text: &str) -> String {
 /// （Issue #32）。`deliver_via_tmux` は内部で sleep するブロッキング関数のため、
 /// UI スレッド上の dispatch から直接呼ばない。結果はログのみ（fire-and-forget）
 ///
+/// #790: ペインが解決できない経路なので、「エージェント管理下の worker か」は
+/// worker レジストリ（#390）へ問う。worker なら peer 送達（Cross-Session Messaging）を
+/// 先に試し、使えなければ従来のキー操作経路へ落ちる
+///
 /// **到達可否の判断は呼び出し側が `crate::reach` へ問う**。ここは tmux 固有の
 /// 送達手順（capture → 貼り付け → 分離 Enter → 空検証）そのものであり、
 /// 案 B-1（器だけの ConPTY セッションホスト）が入ったら同等の手順を
 /// その実装向けに用意して `DetachedAccess` 側へ載せる（設計 §5.1）
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     std::thread::spawn(move || {
+        // Enter 単独送達（#95。入力欄に残留したテキストの送信代行）は
+        // 「キーを送れ」という要求そのものなので peer 送達の対象外
+        if !text.trim().is_empty() {
+            let agent_managed = crate::peer_messaging::backend_is_registered_worker(&session);
+            match crate::delivery::try_peer(&session, &text, agent_managed) {
+                crate::delivery::PeerAttempt::Sent(outcome) => {
+                    if outcome.verification.is_some_and(|v| !v.is_received()) {
+                        eprintln!("warning: peer 送達の受信を確認できない（session={session}）");
+                    }
+                    return; // 送り切っている = 従来経路へ落ちない（二重投函の防止）
+                }
+                crate::delivery::PeerAttempt::Refused { note } => {
+                    eprintln!("warning: {note}（session={session}）");
+                    return;
+                }
+                crate::delivery::PeerAttempt::Fallback { reason, .. } => {
+                    crate::delivery::log_fallback(&session, reason);
+                }
+            }
+        }
         let socket = tako_core::tmux_backend::socket_name();
         match crate::claude_tui::deliver_via_tmux(Some(&socket), &session, &text, wait_ready) {
             Ok(report) if !report.verified => {

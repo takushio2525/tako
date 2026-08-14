@@ -1908,3 +1908,10 @@
   再拡大も含む）。旧挙動 2 通りへ戻すと項目 109 が FAILED になることを実測。品質ゲート全緑（1951）
 - 副産物: Metal Toolchain（purgeable 資産）がマシンから消えており全 worktree で gpui の
   シェーダをビルドできない状態だったので `xcodebuild -downloadComponent MetalToolchain` で復旧
+
+## 2026-08-14（#790: worker への指示送達を Cross-Session Messaging 優先の二層へ）
+- claude v2.1.224+ の受信箱（socket 直送）を第 1 層に、従来のキー操作経路を第 2 層に。
+  適用は worker 宛のみ（受信側に抑制不可の前置きが付くため人間由来の送達は従来経路）
+- 実測: 実験フラグ不要（サーバー側 gate 依存）/ idle・busy・ダイアログ中とも送達成立 /
+  43,449 バイトをバイト等価に 1 回で送達。前置きの存在と挙動への影響は Issue に記録
+- 次: PR（Closes #790）→ CI 緑 → squash merge → install
