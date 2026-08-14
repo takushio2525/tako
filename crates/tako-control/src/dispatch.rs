@@ -1575,9 +1575,14 @@ fn dispatch_inner(
                 host.set_filetree(filetree);
             }
             if let Some(sw) = sidebar_width {
+                // 上限・下限のクランプは host 側（`tako_core::sidebar` の 1 実装 =
+                // GUI のドラッグ経路と同じ規則。#789）
                 host.set_sidebar_width(sw);
+                // #789: 永続化するのは要求値ではなく**実際に適用された幅**
+                // （旧実装は要求値を書いていたので、クランプ後の画面の幅と
+                // settings.json の値が食い違っていた）
                 let mut settings = crate::settings::load();
-                settings.sidebar_width = sw as u32;
+                settings.sidebar_width = host.sidebar_width() as u32;
                 let _ = crate::settings::save(&settings);
             }
             if let Some(sh) = show_hidden {
@@ -1592,7 +1597,11 @@ fn dispatch_inner(
                 "width": width,
                 "view": view.as_str(),
                 "filetree": host.filetree_visible(),
+                // #789: 画面に出ている実効幅と、その時点の上限（ウィンドウ幅の 50%。
+                // GUI のドラッグと同じ規則。ウィンドウ未描画なら null）
                 "sidebar_width": host.sidebar_width(),
+                "sidebar_width_max": host.sidebar_width_max(),
+                "sidebar_width_min": tako_core::sidebar::MIN_WIDTH,
                 "show_hidden": host.filetree_show_hidden(),
             }))
         }

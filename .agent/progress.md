@@ -1893,3 +1893,18 @@
   節判定の破壊で 8 テスト FAILED）
 - 関連コミット: `40c4b2a`（PR #804 squash merge）。CI macOS / Windows / Pages 全緑 +
   `/Applications/tako.app` install 済み（反映は再起動後）。証拠は ~/dev/tako-evidence/792/
+
+## 2026-08-14（#789: サイドバー幅のクランプ規則を全経路で統一）
+- 上限がドラッグ = ウィンドウ幅の 50% / dispatch = 固定 600px で食い違っていた（#307 の
+  クローズ検証で発覚）。規則を `tako_core::sidebar`（下限 120 / 上限 = ビューポート幅の 50%）へ
+  一本化。**ドラッグ側へ寄せた**理由は ①固定 px では広い窓で CLI がドラッグ相当の幅に
+  届かない（設計原則 5 の破れ）②固定 px は狭い窓で過大（600px は 800px 窓の 75%）
+- 状態は要求値・描画は実効幅（`effective_sidebar_width`）に分離。窓が狭くなっても要求値は
+  書き換えないので広げ直し / 再起動で元の幅へ戻る。dispatch はウィンドウを持たないので
+  上限を最後に描いたビューポート幅から取り、応答に `sidebar_width_max` / `_min` を追加。
+  永続化も要求値 → 適用値へ（settings.json と画面の食い違いを解消）
+- 検証: unit 7 本 + セルフテスト項目 109（実ハンドラ `on_mouse_move` と実 dispatch へ同じ値を
+  入れ、窓 1600 = 上限 800 で一致を見るので旧固定 600 は必ず落ちる。窓 700 への縮小 →
+  再拡大も含む）。旧挙動 2 通りへ戻すと項目 109 が FAILED になることを実測。品質ゲート全緑（1951）
+- 副産物: Metal Toolchain（purgeable 資産）がマシンから消えており全 worktree で gpui の
+  シェーダをビルドできない状態だったので `xcodebuild -downloadComponent MetalToolchain` で復旧

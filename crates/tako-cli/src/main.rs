@@ -2075,7 +2075,7 @@ struct PanelArgs {
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
     filetree: Option<String>,
-    /// 左サイドバーの幅（px。Issue #307）
+    /// 左サイドバーの幅（px。下限 120 / 上限はウィンドウ幅の 50% にクランプされる。#307 / #789）
     #[arg(long)]
     sidebar_width: Option<f32>,
     /// ファイルツリーの隠しファイル（ドット始まり）表示（Issue #550。既定 off）
