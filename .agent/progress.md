@@ -1914,4 +1914,8 @@
   適用は worker 宛のみ（受信側に抑制不可の前置きが付くため人間由来の送達は従来経路）
 - 実測: 実験フラグ不要（サーバー側 gate 依存）/ idle・busy・ダイアログ中とも送達成立 /
   43,449 バイトをバイト等価に 1 回で送達。前置きの存在と挙動への影響は Issue に記録
-- 次: PR（Closes #790）→ CI 緑 → squash merge → install
+- 検証: 実 claude e2e 3 本（idle=peer/delivered / busy=送信時点 busy で peer/queued /
+  peer off でキー経路 verified）+ 既存 `claude_tui_e2e` 6/7（残り 1 は main でも同一に失敗）+
+  品質ゲート全緑（1990）+ Windows クロスチェック警告 16 = main 同数 + 隔離セルフテスト完走
+- 関連コミット: `f57e661`（PR #806 squash merge）。install 済み（反映は再起動後）。
+  副産物 #807 起票（`ui_text::update` の言語グローバル競合フレーク = #608 の取りこぼし）

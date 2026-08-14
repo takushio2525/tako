@@ -3,9 +3,10 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-14、Issue #790 worker 送達の Cross-Session Messaging 化）
+## 現在の対象（2026-08-15、Issue #790 worker 送達の Cross-Session Messaging 化 = merge 済み・install 済み）
 
-- ブランチ `feat/790-sendmessage-delivery`（worktree `~/dev/tako-wt-790`）で実装完了 → PR 待ち
+- PR #806 を squash merge（`f57e661`）。CI は macOS / Windows / Pages 全緑。Issue #790 クローズ済み。
+  `/Applications/tako.app` へ install 済み（**反映は tako 再起動後**）
 - claude worker への指示送達を **2 層**にした: 第 1 層 = claude の Cross-Session Messaging
   （受信箱 socket へ直送）→ 使えなければ第 2 層 = 従来のキー操作経路（#32 の送達確認ループ）
 - スパイクの実測は Issue #790 のコメントに全量（実験フラグ不要 / 伝送プロトコル / 前置きの存在）
@@ -33,7 +34,7 @@
 
 ## 次の一手（master 判断）
 
-- PR（`Closes #790`）→ CI 緑 → squash merge → install
+- GUI 再起動で新バイナリを反映（install は済み。再起動は全 worker を落とすので master 判断）
 - 別 Issue 化の候補: ①ダイアログ表示中の `tako send` 拒否（#748）を peer 可用時だけ通す
   （実測では安全。今回はスコープ外） ②spawn 初回プロンプトが peer を通った割合の可視化
 
