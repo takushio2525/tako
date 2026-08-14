@@ -1552,6 +1552,9 @@ pub fn tools() -> Vec<Value> {
                 auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で \
                 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。\
                 handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。\
+                handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、\
+                legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。\
+                legacy なら次に更新するとき 2 節へ書き直す。\
                 pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）\
                 から自動解決する。",
             "inputSchema": {
@@ -1575,6 +1578,13 @@ pub fn tools() -> Vec<Value> {
                 後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が\
                 退役予定のペイン（null なら後任に close を指示していない）。\
                 handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。\
+                #792: 引き継ぎファイルは 2 節に分けて書く。\
+                「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、\
+                「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。\
+                pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで\
+                誤った指示の元になる。節分離前の旧書式もそのまま読める（応答の handoff_format が\
+                sectioned / legacy、handoff_sections が認識した節。legacy のときは後任へ\
+                「番号は実態で確認 + 次の更新で 2 節へ書き直す」が伝わる）。\
                 tab を省略すると呼び出し元と同タブに新 master を spawn する。",
             "inputSchema": {
                 "type": "object",

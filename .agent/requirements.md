@@ -874,6 +874,7 @@ master のコンテキストが埋まると判断が劣化する。`/compact` �
 | FR-2.24.5 | 後任の role / プロファイル / タブは前任と同一を引き継ぐ（#210 の維持）。文面（ナッジ・後任プロンプト）は `tako_core::handoff` の純関数 1 本が正で、日英対応（FR-4 の i18n 規約） | M |
 | FR-2.24.6 | master の default system prompt に**自動発動の規範**を書く: 閾値超過で（a）**ユーザーの許可を求めない** （b）**区切りの良いタイミング**を選ぶ（返しかけの報告は先に片付ける） （c）**引き継ぎファイルの最新化が前提条件**（このツールは中身の鮮度を確認しないので、古いファイルのまま呼ぶと後任が盲目で始まる） （d）自分のペインは自分で閉じない。実効閾値は `{CTX_THRESHOLD}` として prompt へ焼き込む（毎回 self を呼ばなくても自分の閾値が分かる） | M |
 | FR-2.24.7 | 設定は CLI `tako orchestrator profiles set --ctx-threshold N` / `--auto-handoff <bool>`（+ `--clear-*`）と MCP `tako_orchestrator_profiles` の同名パラメータへ 1:1 公開する（**新しい MCP ツールは増やさない** = 既存のプロファイル操作の一部として載せる）。GUI は設定画面「プロファイル」タブの「自動ハンドオフ」節（FR-4.7 と同じ dispatch 経路） | M |
+| FR-2.24.8 | **引き継ぎファイルは「マシン非依存の知識」と「このマシンの実行状態」の 2 節に分ける**（#792）。見出しは `## 知識（マシン非依存）` / `## 実行状態（このマシン限定）`（英語表示なら `## Knowledge (machine-independent)` / `## Runtime state (this machine only)`）で、判定は表記ゆれ（番号付き・半角括弧・強調・語尾省略）を吸収する寛容な前方一致。pane / tab 番号は実行状態節にだけ書く（知識に混ざったまま別デバイスへ運ぶと、後任が存在しないペインへ指示を出す。FR-5.14 の設定共有で現実に起きる）。**旧書式（節なし）は従来どおり読める**: `tako_orchestrator_handoff` は書式に関わらず全文を後任へ渡し、旧書式なら後任プロンプトへ「番号への参照はすべて実態で確認」+「次の更新で 2 節へ書き直す」を添えて自然な移行に任せる（既存ファイルの一括変換はしない）。新書式なら節ごとの扱い（知識 = 前提にしてよい / 実行状態 = 必ず実態で確認）を添える。書式の判定結果は `tako_orchestrator_self` と `tako_orchestrator_handoff` の応答（`handoff_format` = `sectioned` / `legacy`、`handoff_sections`）で機械可読に返す。書式の正本は `tako_core::handoff`（`section_of_line` / `split_handoff` / `handoff_template` + 見出し定数）で、master system prompt の規範がその定数と食い違ったらテストで落とす | M |
 
 実装メモ（2026-08-04 / #749）: 判定と文面は `tako-core::handoff`（GPUI / I/O 非依存の
 純関数 + 定数）、閾値の解決は `tako-control::orchestrator::resolve_ctx_threshold`
@@ -1172,6 +1173,7 @@ FR-2.7.6 は画像ペインを並べて実現する）。
 | FR-5.14.9 | **setup が状況を検出して案内する**（Issue #793。「導線が無いと使われない」の是正）: `config_share::env::detect` が ①配線済みか（`config-share.json`）②共有対象が既に外部 git（dotfiles 等）で管理されていないか ③gh CLI の認証状態、を**読み取りだけ**で調べる。検出は `~/.claude` / データディレクトリの本体を先に見て、管理外なら symlink の子だけを追う（git 起動を増やさない）。案内の種類は純粋関数 `guidance`（`linked` / `broken` / `adopt_existing` / `fresh`）で決め、setup サマリと `--check` が同じ判定から文言を作る | M | ✅ 2026-08-10 |
 | FR-5.14.10 | **質問は増やさない**（#262）: 標準 setup での扱いは表示のみ。**配線済みなら勧誘文言を出さない**（冪等）。`--yes` / 非 TTY では外部への副作用（リポジトリ作成・push）を伴う動作も、代行の案内も出さない | M | ✅ 2026-08-10 |
 | FR-5.14.11 | **代行は対話アシスタント側**（Issue #793）: 検出結果を `setup-context.yaml` の `config_share`（`guidance` / `next_command` / `gh_can_create_repo` / `external[]`）へ渡し、setup agent が案内と配線を代行する。**既存の外部 git 運用があれば相乗り**（`tako config link <既存リポジトリ>`）が第一案。別リポジトリを作ると同じファイルが 2 か所で管理され、pull の書き込み（`atomic_write` の rename）が symlink を実ファイルへ置き換えて既存の配線を壊すため。リポジトリ作成・push は**合意を得てから**行い、共有リポジトリは private を既定とする。既存ユーザーへは `changes.yaml` rev 14（guided）で届く | M | ✅ 2026-08-10 |
+| FR-5.14.12 | **名前が実行時に決まるファイルも分類する**（Issue #792）: カタログの `path` は末尾 `*` で**ファイル名の前方一致**を表せる（同じディレクトリの中だけに効く）。`orchestrator/_system_prompt_*`（master / solo 起動ごとに書き出す system prompt の実体）は `local` + 理由 GENERATED。被覆テストの走査は `join("…")` に加えて `join(format!("…"))` も拾い、可変部分を `*` に畳んでカタログと突き合わせる（`join(format!(…))` を素通りさせていたため、動的名のファイルは「未分類 = fail-closed で安全だが気づけない」状態だった） | M | ✅ 2026-08-14 |
 
 ### close 操作とバックエンドセッションの整合（2026-06-12 仕様化）
 

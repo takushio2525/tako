@@ -2130,7 +2130,7 @@
     "name": "tako_orchestrator_workers"
   },
   {
-    "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、ctx_over_threshold は閾値超えフラグ。ctx_over_threshold が true になったら、ユーザーの許可を待たずに handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）から自動解決する。",
+    "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、ctx_over_threshold は閾値超えフラグ。ctx_over_threshold が true になったら、ユーザーの許可を待たずに handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。legacy なら次に更新するとき 2 節へ書き直す。pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）から自動解決する。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2145,7 +2145,7 @@
     "name": "tako_orchestrator_self"
   },
   {
-    "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。role / プロファイル / タブは旧 master と同一を引き継ぐ。呼ぶ前に handoff ファイルを今の状況で最新化すること（このツールはファイルの内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。#749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**（初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄にユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が退役予定のペイン（null なら後任に close を指示していない）。handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。tab を省略すると呼び出し元と同タブに新 master を spawn する。",
+    "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。role / プロファイル / タブは旧 master と同一を引き継ぐ。呼ぶ前に handoff ファイルを今の状況で最新化すること（このツールはファイルの内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。#749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**（初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄にユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が退役予定のペイン（null なら後任に close を指示していない）。handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。#792: 引き継ぎファイルは 2 節に分けて書く。「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで誤った指示の元になる。節分離前の旧書式もそのまま読める（応答の handoff_format がsectioned / legacy、handoff_sections が認識した節。legacy のときは後任へ「番号は実態で確認 + 次の更新で 2 節へ書き直す」が伝わる）。tab を省略すると呼び出し元と同タブに新 master を spawn する。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
