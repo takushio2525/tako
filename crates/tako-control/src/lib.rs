@@ -13,6 +13,8 @@
 //!   claude agents プロキシ・会話ログ正規化）
 //! - tailscale: Tailscale Serve transport（Issue #282。CLI 検出・setup 判定・serve 管理）
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
+//! - peer_messaging / delivery: claude の Cross-Session Messaging による指示送達と
+//!   経路選択（peer 優先 + 従来のキー操作経路へフォールバック。Issue #790）
 //! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
 //!   プロセス間ロック・世代バックアップ。Issue #169）
 //! - config_share: AI 系設定の git ベース共有（分類カタログ・可搬化・秘匿検査。Issue #513）
@@ -28,6 +30,7 @@ pub mod agents_sync;
 pub mod claude_tui;
 pub mod config_io;
 pub mod config_share;
+pub mod delivery;
 pub mod diag;
 pub mod discovery;
 pub mod dispatch;
@@ -37,6 +40,7 @@ pub mod ipc;
 pub mod layout;
 pub mod mcp;
 pub mod orchestrator;
+pub mod peer_messaging;
 pub mod platform;
 pub mod protocol;
 pub mod reach;
