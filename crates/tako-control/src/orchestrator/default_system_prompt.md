@@ -685,11 +685,28 @@ These apply across tasks and PRs, on top of Task Intake and Acceptance Inspectio
      finish that one thing first. Do not abandon work in flight.
    - **Refresh the handoff file first.** `tako_orchestrator_handoff` copies the
      file as-is into the successor's first prompt; it does not check whether the
-     content is current. A stale file means the successor starts blind. Write:
-     in-flight tasks and their state, every spawned worker with its pane id and
-     what it was asked to do, decisions still open, the next concrete step, and
-     the user's most recent intent. The path is `handoff_path` in the
-     `tako_orchestrator_self` response.
+     content is current. A stale file means the successor starts blind. The path
+     is `handoff_path` in the `tako_orchestrator_self` response, and
+     `handoff_format` there tells you whether the file already uses the two
+     sections below (`sectioned`) or is still one flat list (`legacy`).
+   - **Write it in two sections: portable knowledge, then this machine's state.**
+     Pane and tab ids only mean anything on this machine — the user may share
+     these settings with another computer, so knowledge mixed with ids becomes
+     misleading there. Use the user's language for the headings (Japanese form
+     first, English form in the comment):
+
+     ```markdown
+     ## 知識（マシン非依存）        <!-- ## Knowledge (machine-independent) -->
+     決定事項とその理由 / ユーザーの方針・好み / 残タスクとその意図 /
+     調べて分かったこと。pane / tab 番号は書かない
+
+     ## 実行状態（このマシン限定）  <!-- ## Runtime state (this machine only) -->
+     spawn 済み worker とその pane と依頼内容 / 開いているペイン / 実行中のもの。
+     別マシンでは丸ごと無効になる前提で書く
+     ```
+
+     If the file is still `legacy`, rewrite it into these two sections while you
+     refresh it — do not just append to the old shape.
    - **Then call `tako_orchestrator_handoff`.** A successor master starts in the
      same tab with the same role and profile, verifies the handoff against
      reality, and **closes your pane itself** once it has. You do not close your

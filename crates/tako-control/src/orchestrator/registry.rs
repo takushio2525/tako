@@ -26,6 +26,14 @@ use serde_json::{json, Value};
 /// 複合条件を併用する（dispatch 側 = `prompt_delivery_assessment` の呼び出し元）
 pub const PROMPT_DELIVERY_GRACE_SECS: i64 = 240;
 
+/// 「ペインも器も消えた」状態がこの秒数続いた active エントリを closed へ倒す（Issue #658）。
+/// **1 回の観測では倒さない**（この間隔をあけた 2 回以上の観測で同じ判定が出ることを要求する）。
+/// 器（tmux / psmux）の列挙が一時的に失敗する・アプリ再起動直後でペインがまだ復元されて
+/// いない、といった過渡状態で生きている worker を closed にしないための確認期間。
+/// #390 の「ペイン消失後も追跡する」意図は closed でも壊れない（resume_command /
+/// report / `workers --all` は status を問わず引ける）
+pub const DEAD_CONFIRM_SECS: i64 = 300;
+
 /// closed エントリを含めた保持上限。超過分は古い closed から削除する
 const MAX_WORKERS: usize = 200;
 
@@ -119,6 +127,10 @@ pub struct WorkerEntry {
     /// claude transcript（session_id）を最初に観測した時刻 = プロンプト到達の証跡
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_delivered_at: Option<String>,
+    /// 「ペインも器も消えている」と**最初に**観測した時刻（Issue #658 の GC 用）。
+    /// 生存が再観測されたら消える。`DEAD_CONFIRM_SECS` を超えて残ったら closed へ倒す
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_since: Option<String>,
     /// 送達フロー（PromptFlow）がプロンプトの到達を確認できずに打ち切った時刻（Issue #530）。
     /// session 検出（= claude が起動しただけ）より優先して未達と判定するための証跡
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +320,7 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 closed_at: None,
                 close_reason: None,
                 prompt_delivered_at: None,
+                dead_since: None,
                 prompt_delivery_failed_at: None,
                 prompt_delivery_failure: None,
             },
@@ -319,16 +332,29 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
 
 /// 明示 close されたペインの active worker を closed にする。
 /// レジストリ不在（orchestrator 未使用）は何もしない（通常ペインの close に
-/// ファイル IO のコストを掛けない）
+/// ファイル IO のコストを掛けない）。**worker でないペインでも書き込まない**
+/// （全ペインの close 経路から呼ばれるため。#658 で GUI 経路にも配線した）
 pub fn mark_closed_by_pane(pane: u64, reason: &str) -> Result<(), String> {
     let Some(path) = registry_path() else {
         return Ok(());
     };
+    mark_closed_by_pane_at(&path, pane, reason)
+}
+
+/// `mark_closed_by_pane` のパス指定版（テスト用。実体はこちら）
+pub fn mark_closed_by_pane_at(path: &Path, pane: u64, reason: &str) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
+    let hit = WorkerRegistry::load_from(path)?
+        .workers
+        .values()
+        .any(|e| e.pane == pane && e.is_active());
+    if !hit {
+        return Ok(());
+    }
     let now = crate::sessions::now_iso();
-    WorkerRegistry::mutate_at(&path, |reg| {
+    WorkerRegistry::mutate_at(path, |reg| {
         for entry in reg.workers.values_mut() {
             if entry.pane == pane && entry.is_active() {
                 entry.status = "closed".into();
@@ -484,6 +510,138 @@ fn resume_command_with_env(entry: &WorkerEntry, env_prefix: Option<&str>) -> Opt
     Some(cmd)
 }
 
+/// エントリの生存観測（Issue #658）。一覧表示と GC が**同じ規則**を使うための単一定義。
+/// `live_backends` は現存する器（tmux / psmux）のセッション名、`live_panes` は GUI に
+/// 現存する（ペイン ID, backend セッション名）の組。返り値は (pane_alive, tmux_alive)
+pub fn liveness(
+    entry: &WorkerEntry,
+    live_backends: &[String],
+    live_panes: &[(u64, Option<String>)],
+) -> (bool, bool) {
+    let tmux_alive = entry
+        .tmux_session
+        .as_deref()
+        .is_some_and(|ts| live_backends.iter().any(|b| b == ts));
+    let pane_alive = live_panes.iter().any(|(pid, backend)| {
+        *pid == entry.pane
+            && match entry.tmux_session.as_deref() {
+                // 追跡キーがあれば backend の一致で同一性を確認
+                Some(expect) => backend.as_deref() == Some(expect),
+                // キーが無い（器なし spawn）場合は番号のみで判定
+                None => true,
+            }
+    });
+    (pane_alive, tmux_alive)
+}
+
+/// GC（`sweep_dead`）の計画。ファイルに触らない純粋な判定結果
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepPlan {
+    /// 初めて「死んで見えた」ので `dead_since` を刻むだけのエントリ
+    pub mark: Vec<String>,
+    /// 死んだ状態が `DEAD_CONFIRM_SECS` 続いたので closed へ倒すエントリ
+    pub close: Vec<String>,
+    /// 生存が再観測されたので `dead_since` を消すエントリ
+    pub revive: Vec<String>,
+}
+
+impl SweepPlan {
+    pub fn is_empty(&self) -> bool {
+        self.mark.is_empty() && self.close.is_empty() && self.revive.is_empty()
+    }
+}
+
+/// 死んだ active エントリの掃除計画を立てる（Issue #658。純粋関数 = テスト可能）。
+///
+/// ペインも器も観測できない active エントリを「死んで見えた」とし、その状態が
+/// `DEAD_CONFIRM_SECS` を超えて続いたものだけを closed へ倒す。**1 回の観測では倒さない**
+/// ので、器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、
+/// といった過渡状態で生きている worker を落とすことがない
+pub fn plan_sweep(
+    registry: &WorkerRegistry,
+    live_backends: &[String],
+    live_panes: &[(u64, Option<String>)],
+    now_epoch: i64,
+) -> SweepPlan {
+    let mut plan = SweepPlan::default();
+    for (id, entry) in &registry.workers {
+        if !entry.is_active() {
+            continue;
+        }
+        let (pane_alive, tmux_alive) = liveness(entry, live_backends, live_panes);
+        if pane_alive || tmux_alive {
+            // 生きて見えた。過渡的に死んで見えていた記録は取り消す
+            if entry.dead_since.is_some() {
+                plan.revive.push(id.clone());
+            }
+            continue;
+        }
+        let Some(first_dead) = entry
+            .dead_since
+            .as_deref()
+            .and_then(crate::sessions::parse_iso)
+        else {
+            // 初観測（または時刻が読めない）→ 刻むだけ。倒すのは次以降の観測
+            plan.mark.push(id.clone());
+            continue;
+        };
+        if now_epoch - first_dead >= DEAD_CONFIRM_SECS {
+            plan.close.push(id.clone());
+        }
+    }
+    plan
+}
+
+/// 死んだ active エントリを closed へ倒し、掃除後のレジストリを返す（Issue #658）。
+/// 変更が無ければ**書き込まない**（一覧のたびにファイルを書き換えない）
+pub fn sweep_dead_at(
+    path: &Path,
+    live_backends: &[String],
+    live_panes: &[(u64, Option<String>)],
+) -> Result<WorkerRegistry, String> {
+    let registry = WorkerRegistry::load_from(path)?;
+    let now = crate::sessions::now_iso();
+    let now_epoch = crate::sessions::parse_iso(&now).unwrap_or(0);
+    if plan_sweep(&registry, live_backends, live_panes, now_epoch).is_empty() {
+        return Ok(registry);
+    }
+    // 計画はロックの内側で立て直す（読み取り後に他プロセスが更新していても勝たない）
+    WorkerRegistry::mutate_at(path, |reg| {
+        let plan = plan_sweep(reg, live_backends, live_panes, now_epoch);
+        for id in &plan.mark {
+            if let Some(e) = reg.workers.get_mut(id) {
+                e.dead_since = Some(now.clone());
+            }
+        }
+        for id in &plan.revive {
+            if let Some(e) = reg.workers.get_mut(id) {
+                e.dead_since = None;
+            }
+        }
+        for id in &plan.close {
+            if let Some(e) = reg.workers.get_mut(id) {
+                e.status = "closed".into();
+                e.closed_at = Some(now.clone());
+                e.close_reason = Some("gone".into());
+                e.dead_since = None;
+            }
+        }
+        reg.clone()
+    })
+}
+
+/// `sweep_dead_at` の既定パス版
+pub fn sweep_dead(
+    live_backends: &[String],
+    live_panes: &[(u64, Option<String>)],
+) -> Result<WorkerRegistry, String> {
+    let path = registry_path().ok_or("ホームディレクトリが取得できない")?;
+    if !path.is_file() {
+        return Ok(WorkerRegistry::default());
+    }
+    sweep_dead_at(&path, live_backends, live_panes)
+}
+
 /// prompt 送達状態を判定する（Issue #390 要件 4）。
 /// OverdueSuspect は「疑い」であり、最終的な未達イベントの発火は呼び出し側が
 /// 画面状態（busy でない・実行中子プロセスなし）と組み合わせて決める
@@ -536,19 +694,7 @@ pub fn list_payload(
     // 新しい順（spawned_at 降順）
     entries.sort_by(|a, b| b.1.spawned_at.cmp(&a.1.spawned_at));
     for (id, e) in entries {
-        let tmux_alive = e
-            .tmux_session
-            .as_deref()
-            .is_some_and(|ts| live_backends.iter().any(|b| b == ts));
-        let pane_alive = live_panes.iter().any(|(pid, backend)| {
-            *pid == e.pane
-                && match e.tmux_session.as_deref() {
-                    // 追跡キーがあれば backend の一致で同一性を確認
-                    Some(expect) => backend.as_deref() == Some(expect),
-                    // キーが無い（tmux 無し spawn）場合は番号のみで判定
-                    None => true,
-                }
-        });
+        let (pane_alive, tmux_alive) = liveness(e, live_backends, live_panes);
         let delivery = prompt_delivery_assessment(e, now_epoch);
         items.push(json!({
             "worker_id": id,
@@ -569,6 +715,8 @@ pub fn list_payload(
             "status": e.status,
             "closed_at": e.closed_at,
             "close_reason": e.close_reason,
+            // #658: 「ペインも器も見えない」と最初に観測した時刻（GC の確認期間の起点）
+            "dead_since": e.dead_since,
             "pane_alive": pane_alive,
             "tmux_alive": tmux_alive,
             "prompt_delivery": delivery.as_str(),
@@ -647,6 +795,7 @@ mod tests {
                     closed_at: None,
                     close_reason: None,
                     prompt_delivered_at: None,
+                    dead_since: None,
                     prompt_delivery_failed_at: None,
                     prompt_delivery_failure: None,
                 },
@@ -1139,6 +1288,192 @@ mod tests {
             false,
         );
         assert_eq!(payload["workers"][0]["pane_alive"], true);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- #658: 死んだ active エントリの GC ---
+
+    /// 生存観測を持たないレジストリを組み立てる（GC 判定のテスト材料）
+    fn registry_with(entries: &[(&str, WorkerEntry)]) -> WorkerRegistry {
+        let mut reg = WorkerRegistry::default();
+        for (id, e) in entries {
+            reg.workers.insert((*id).to_string(), e.clone());
+        }
+        reg
+    }
+
+    fn dead_candidate(pane: u64, tmux: Option<&str>, dead_since: Option<&str>) -> WorkerEntry {
+        WorkerEntry {
+            project: "tako".into(),
+            agent: "claude".into(),
+            pane,
+            tmux_session: tmux.map(str::to_string),
+            spawned_at: "2026-07-21T11:35:45Z".into(),
+            status: "active".into(),
+            dead_since: dead_since.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn 死んだエントリは初回観測では倒れず時刻だけ刻まれる() {
+        let reg = registry_with(&[("1", dead_candidate(9, Some("tako-gone"), None))]);
+        let plan = plan_sweep(&reg, &[], &[], 1_000_000);
+        assert_eq!(plan.mark, vec!["1".to_string()]);
+        assert!(
+            plan.close.is_empty(),
+            "1 回の観測では倒さない（過渡状態対策）"
+        );
+    }
+
+    #[test]
+    fn 確認期間を超えた死亡エントリはcloseされる() {
+        let now = 1_000_000;
+        let first = crate::diag::format_utc(now - DEAD_CONFIRM_SECS);
+        let reg = registry_with(&[("1", dead_candidate(9, Some("tako-gone"), Some(&first)))]);
+        let plan = plan_sweep(&reg, &[], &[], now);
+        assert_eq!(plan.close, vec!["1".to_string()]);
+        assert!(plan.mark.is_empty());
+
+        // 確認期間の手前では倒れない
+        let plan = plan_sweep(&reg, &[], &[], now - 1);
+        assert!(plan.close.is_empty());
+    }
+
+    #[test]
+    fn 生きているworkerはgcされない() {
+        let now = 1_000_000;
+        let old = crate::diag::format_utc(now - DEAD_CONFIRM_SECS * 10);
+        // ペインが生きている / 器が生きている / 両方生きている の 3 通り
+        let reg = registry_with(&[
+            ("1", dead_candidate(9, Some("tako-a"), Some(&old))),
+            ("2", dead_candidate(10, Some("tako-b"), Some(&old))),
+            ("3", dead_candidate(11, None, Some(&old))),
+        ]);
+        let live_backends = vec!["tako-b".to_string()];
+        let live_panes = vec![
+            (9u64, Some("tako-a".to_string())),
+            (11u64, None), // 器なし spawn は番号一致で生存
+        ];
+        let plan = plan_sweep(&reg, &live_backends, &live_panes, now);
+        assert!(plan.close.is_empty(), "生きている worker は倒さない");
+        // 生き返ったので死亡マークは取り消される
+        let mut revived = plan.revive.clone();
+        revived.sort();
+        assert_eq!(revived, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn pane番号が再利用されていても器が違えばgc対象になる() {
+        let now = 1_000_000;
+        let old = crate::diag::format_utc(now - DEAD_CONFIRM_SECS - 1);
+        let reg = registry_with(&[("1", dead_candidate(9, Some("tako-old"), Some(&old)))]);
+        // 同じ pane 番号だが別の器 = 別物（#390 の同一性検証と同じ規則）
+        let plan = plan_sweep(&reg, &[], &[(9u64, Some("tako-new".to_string()))], now);
+        assert_eq!(plan.close, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn closedエントリはgcの対象外() {
+        let now = 1_000_000;
+        let old = crate::diag::format_utc(now - DEAD_CONFIRM_SECS * 5);
+        let mut e = dead_candidate(9, Some("tako-gone"), Some(&old));
+        e.status = "closed".into();
+        let reg = registry_with(&[("1", e)]);
+        assert!(plan_sweep(&reg, &[], &[], now).is_empty());
+    }
+
+    #[test]
+    fn gcはファイルへ適用され追跡キーとresumeは残る() {
+        let path = temp_registry_file("sweep");
+        let id = register_at(&path, sample_record(42));
+        WorkerRegistry::mutate_at(&path, |reg| {
+            let e = reg.workers.get_mut(&id).unwrap();
+            e.session_id = Some("sid-42".into());
+            // 確認期間を過ぎた死亡マークを仕込む
+            let now = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+            e.dead_since = Some(crate::diag::format_utc(now - DEAD_CONFIRM_SECS - 1));
+        })
+        .unwrap();
+
+        let reg = sweep_dead_at(&path, &[], &[]).unwrap();
+        let entry = &reg.workers[&id];
+        assert_eq!(entry.status, "closed");
+        assert_eq!(entry.close_reason.as_deref(), Some("gone"));
+        assert!(entry.closed_at.is_some());
+        assert!(entry.dead_since.is_none(), "倒したら死亡マークは畳む");
+        // #390 の追跡・復旧材料は closed でも残っている
+        assert_eq!(entry.session_id.as_deref(), Some("sid-42"));
+        assert!(resume_command(entry).is_some());
+        // ディスクにも反映されている
+        let on_disk = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(on_disk.workers[&id].status, "closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 掃除するものが無ければファイルを書き換えない() {
+        let path = temp_registry_file("sweep-noop");
+        let id = register_at(&path, sample_record(7));
+        let before = std::fs::read_to_string(&path).unwrap();
+        // 生きている（器が見えている）→ 何もしない
+        let live = vec!["tako-pane-7".to_string()];
+        sweep_dead_at(&path, &live, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // 死んで見えた初回は dead_since を刻むので書き換わる
+        sweep_dead_at(&path, &[], &[]).unwrap();
+        let after = WorkerRegistry::load_from(&path).unwrap();
+        assert!(after.workers[&id].dead_since.is_some());
+        assert!(after.workers[&id].is_active(), "刻んだだけでまだ active");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 一覧のpane_aliveとgcの判定は同じ規則を使う() {
+        let now = 1_000_000;
+        let old = crate::diag::format_utc(now - DEAD_CONFIRM_SECS - 1);
+        let reg = registry_with(&[
+            ("1", dead_candidate(9, Some("tako-a"), Some(&old))), // 生存
+            ("2", dead_candidate(10, Some("tako-b"), Some(&old))), // 死亡
+        ]);
+        let live_panes = vec![(9u64, Some("tako-a".to_string()))];
+        let payload = list_payload(&reg, &[], &live_panes, false);
+        let items = payload["workers"].as_array().unwrap();
+        let alive: Vec<bool> = items
+            .iter()
+            .map(|w| w["pane_alive"].as_bool().unwrap() || w["tmux_alive"].as_bool().unwrap())
+            .collect();
+        let closed = plan_sweep(&reg, &[], &live_panes, now).close;
+        // 一覧で死んで見えるものだけが GC 対象（表示と GC の判定が食い違わない）
+        for (item, is_alive) in items.iter().zip(alive) {
+            let id = item["worker_id"].as_str().unwrap().to_string();
+            assert_eq!(
+                closed.contains(&id),
+                !is_alive,
+                "worker {id} の一覧表示と GC 判定が食い違っている"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_closed_by_paneは該当が無ければ書き込まない() {
+        // 専用ファイルで検証する（registry_path() の共有ファイルを使うと
+        // 同じプロセスの他テストの登録と混ざる）
+        let path = temp_registry_file("mark-closed-noop");
+        let id = register_at(&path, sample_record(1234));
+        let before = std::fs::read_to_string(&path).unwrap();
+        // worker でないペインの close（全ペインの close 経路から呼ばれる）
+        mark_closed_by_pane_at(&path, 999_999, "explicit_close").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "該当なしでファイルを書き換えない"
+        );
+        // 該当があれば倒す
+        mark_closed_by_pane_at(&path, 1234, "explicit_close").unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(reg.workers[&id].status, "closed");
         let _ = std::fs::remove_file(&path);
     }
 }

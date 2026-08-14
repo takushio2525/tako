@@ -1459,7 +1459,9 @@ enum OrchestratorCommand {
         messages: Option<usize>,
     },
     /// worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と
-    /// 無関係に列挙する（tako 再起動後も追跡できる）。既定は active のみ
+    /// 無関係に列挙する（tako 再起動後も追跡できる）。既定は active のみ。
+    /// 列挙のついでに、ペインも器も 5 分以上観測できない active エントリを
+    /// closed（gone）へ倒す（#658。closed でも resume / report は引ける）
     Workers {
         /// closed（明示 close 済み）の worker も含める
         #[arg(long)]
@@ -2075,7 +2077,7 @@ struct PanelArgs {
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
     filetree: Option<String>,
-    /// 左サイドバーの幅（px。Issue #307）
+    /// 左サイドバーの幅（px。下限 120 / 上限はウィンドウ幅の 50% にクランプされる。#307 / #789）
     #[arg(long)]
     sidebar_width: Option<f32>,
     /// ファイルツリーの隠しファイル（ドット始まり）表示（Issue #550。既定 off）

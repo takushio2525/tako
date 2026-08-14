@@ -83,11 +83,19 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
 }
 
 /// オーケストレーター設定ディレクトリのパス。
-/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）
+/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）。
+/// `TAKO_ORCHESTRATOR_DIR` で直接差し替えられる（隔離用。#658: セルフテストは
+/// data_dir を本番のまま使うため、これが無いと projects.yaml / ledger.yaml へ
+/// 検証用のエントリが混ざる）
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = test_config_dir_override().get() {
         return Some(dir.clone());
+    }
+    if let Some(dir) = std::env::var_os("TAKO_ORCHESTRATOR_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
     }
     tako_core::paths::data_dir().map(|d| d.join("orchestrator"))
 }
@@ -3850,6 +3858,36 @@ worker_agents:
         // solo にも未置換のプレースホルダを残さない
         let solo = p.build_solo_system_prompt("default");
         assert!(!solo.contains("{CTX_THRESHOLD}"));
+    }
+
+    /// #792: prompt に書いた見出しと、パーサが認識する見出し定数を**ドリフトさせない**。
+    /// prompt 側の文字列を書き換えると、後任プロンプトの節認識と食い違うので落とす
+    #[test]
+    fn プロンプトの引き継ぎ規範が新書式の見出しを指している() {
+        use tako_core::handoff as ho;
+        let master = Profile::default().build_system_prompt("default");
+        for heading in [
+            ho::KNOWLEDGE_HEADING_JA,
+            ho::KNOWLEDGE_HEADING_EN,
+            ho::RUNTIME_HEADING_JA,
+            ho::RUNTIME_HEADING_EN,
+        ] {
+            assert!(
+                master.contains(heading),
+                "master prompt に見出し `{heading}` が無い（tako_core::handoff の定数と食い違う）"
+            );
+        }
+        // 見出しは必ず節として認識できる形（`## <見出し>`）で書く
+        for line in master.lines() {
+            if let Some(section) = tako_core::handoff::section_of_line(line) {
+                assert!(
+                    line.trim_start().starts_with("## "),
+                    "{section:?} の見出しが H2 で書かれていない: {line}"
+                );
+            }
+        }
+        // 旧書式のファイルを書き直させる規範がある（自然な移行の駆動源）
+        assert!(master.contains("legacy"), "旧書式の扱いが書かれていない");
     }
 
     #[test]

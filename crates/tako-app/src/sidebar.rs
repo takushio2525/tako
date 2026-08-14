@@ -224,7 +224,8 @@ impl TakoApp {
             );
         }
         let inline_edit_snapshot = self.inline_edit.clone();
-        let sidebar_w = self.sidebar_width;
+        // #789: 親（root render）が渡す幅と同じ実効幅を使う（要求値ではない）
+        let sidebar_w = self.effective_sidebar_width();
         let drop_highlight = self.sidebar_drop_highlight;
         Some(
             div()

@@ -83,6 +83,9 @@ pub enum OffloadJob {
     Workers {
         live_panes: Vec<(u64, Option<String>)>,
         include_closed: bool,
+        /// 死んだ active エントリの GC を同時に行うか（#658）。セカンダリインスタンスは
+        /// プライマリのペインを持たないため false（他人の worker を殺さない）
+        sweep: bool,
     },
     GitLog {
         cwd: PathBuf,
@@ -136,6 +139,7 @@ pub fn prepare_offload(
         Request::OrchestratorWorkers { all } => Some(Ok(OffloadJob::Workers {
             live_panes: collect_live_panes(host),
             include_closed: all.unwrap_or(false),
+            sweep: !host.is_secondary(),
         })),
         Request::GitLog { pane, max_count } => {
             Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
@@ -172,7 +176,8 @@ impl OffloadJob {
             OffloadJob::Workers {
                 live_panes,
                 include_closed,
-            } => finish_workers_list(&live_panes, include_closed),
+                sweep,
+            } => finish_workers_list(&live_panes, include_closed, sweep),
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
@@ -272,20 +277,33 @@ fn collect_live_panes(host: &dyn ControlHost) -> Vec<(u64, Option<String>)> {
 }
 
 /// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
-/// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）
+/// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）。
+///
+/// `sweep` = true なら列挙のついでに死んだ active エントリを GC する（#658）。
+/// ペインも器も見えない状態が `DEAD_CONFIRM_SECS` 続いたものだけが closed になる
+/// （倒すのに 2 回以上の観測が要るので、この 1 回の列挙で生き物を落とすことはない）
 fn finish_workers_list(
     live_panes: &[(u64, Option<String>)],
     include_closed: bool,
+    sweep: bool,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator::registry;
-    let reg = registry::WorkerRegistry::load()
-        .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
     // 現存するバックエンドセッションを列挙する（器が無い / サーバー未起動は空 = 全て dead 扱い）
     let live_backends: Vec<String> = tako_core::backend::backend()
         .list()
         .into_iter()
         .map(|s| s.session.into_string())
         .collect();
+    let reg = if sweep {
+        // GC の失敗（ロック競合・書き込み不能）で一覧まで落とさない。読むだけへ縮退する
+        registry::sweep_dead(&live_backends, live_panes).or_else(|e| {
+            eprintln!("warning: worker レジストリの GC に失敗: {e}");
+            registry::WorkerRegistry::load()
+        })
+    } else {
+        registry::WorkerRegistry::load()
+    }
+    .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
     Ok(registry::list_payload(
         &reg,
         &live_backends,
@@ -1575,9 +1593,14 @@ fn dispatch_inner(
                 host.set_filetree(filetree);
             }
             if let Some(sw) = sidebar_width {
+                // 上限・下限のクランプは host 側（`tako_core::sidebar` の 1 実装 =
+                // GUI のドラッグ経路と同じ規則。#789）
                 host.set_sidebar_width(sw);
+                // #789: 永続化するのは要求値ではなく**実際に適用された幅**
+                // （旧実装は要求値を書いていたので、クランプ後の画面の幅と
+                // settings.json の値が食い違っていた）
                 let mut settings = crate::settings::load();
-                settings.sidebar_width = sw as u32;
+                settings.sidebar_width = host.sidebar_width() as u32;
                 let _ = crate::settings::save(&settings);
             }
             if let Some(sh) = show_hidden {
@@ -1592,7 +1615,11 @@ fn dispatch_inner(
                 "width": width,
                 "view": view.as_str(),
                 "filetree": host.filetree_visible(),
+                // #789: 画面に出ている実効幅と、その時点の上限（ウィンドウ幅の 50%。
+                // GUI のドラッグと同じ規則。ウィンドウ未描画なら null）
                 "sidebar_width": host.sidebar_width(),
+                "sidebar_width_max": host.sidebar_width_max(),
+                "sidebar_width_min": tako_core::sidebar::MIN_WIDTH,
                 "show_hidden": host.filetree_show_hidden(),
             }))
         }
@@ -2665,7 +2692,8 @@ fn dispatch_inner(
         // #390: worker レジストリの一覧（同期経路。IPC / MCP 経由は prepare_offload 側）
         Request::OrchestratorWorkers { all } => {
             let live_panes = collect_live_panes(host);
-            finish_workers_list(&live_panes, all.unwrap_or(false))
+            let sweep = !host.is_secondary();
+            finish_workers_list(&live_panes, all.unwrap_or(false), sweep)
         }
 
         // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
@@ -5334,12 +5362,36 @@ fn normalize_newlines_for_keys(text: &str) -> String {
 /// （Issue #32）。`deliver_via_tmux` は内部で sleep するブロッキング関数のため、
 /// UI スレッド上の dispatch から直接呼ばない。結果はログのみ（fire-and-forget）
 ///
+/// #790: ペインが解決できない経路なので、「エージェント管理下の worker か」は
+/// worker レジストリ（#390）へ問う。worker なら peer 送達（Cross-Session Messaging）を
+/// 先に試し、使えなければ従来のキー操作経路へ落ちる
+///
 /// **到達可否の判断は呼び出し側が `crate::reach` へ問う**。ここは tmux 固有の
 /// 送達手順（capture → 貼り付け → 分離 Enter → 空検証）そのものであり、
 /// 案 B-1（器だけの ConPTY セッションホスト）が入ったら同等の手順を
 /// その実装向けに用意して `DetachedAccess` 側へ載せる（設計 §5.1）
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     std::thread::spawn(move || {
+        // Enter 単独送達（#95。入力欄に残留したテキストの送信代行）は
+        // 「キーを送れ」という要求そのものなので peer 送達の対象外
+        if !text.trim().is_empty() {
+            let agent_managed = crate::peer_messaging::backend_is_registered_worker(&session);
+            match crate::delivery::try_peer(&session, &text, agent_managed) {
+                crate::delivery::PeerAttempt::Sent(outcome) => {
+                    if outcome.verification.is_some_and(|v| !v.is_received()) {
+                        eprintln!("warning: peer 送達の受信を確認できない（session={session}）");
+                    }
+                    return; // 送り切っている = 従来経路へ落ちない（二重投函の防止）
+                }
+                crate::delivery::PeerAttempt::Refused { note } => {
+                    eprintln!("warning: {note}（session={session}）");
+                    return;
+                }
+                crate::delivery::PeerAttempt::Fallback { reason, .. } => {
+                    crate::delivery::log_fallback(&session, reason);
+                }
+            }
+        }
         let socket = tako_core::tmux_backend::socket_name();
         match crate::claude_tui::deliver_via_tmux(Some(&socket), &session, &text, wait_ready) {
             Ok(report) if !report.verified => {
@@ -5606,6 +5658,10 @@ fn dispatch_orchestrator_self(
 
     let handoff_path = orchestrator::handoff_path(profile_name);
     let handoff_exists = handoff_path.as_ref().is_some_and(|p| p.is_file());
+    // #792: 自分の引き継ぎファイルが新書式（知識 / 実行状態の 2 節）かどうかを master 自身が
+    // 確認できるようにする。不在なら null（「まだ書いていない」と「旧書式」を混ぜない）
+    let handoff_doc =
+        orchestrator::read_handoff(profile_name).map(|c| tako_core::handoff::split_handoff(&c));
 
     let mut result = json!({
         "pane_id": pane_id.as_u64(),
@@ -5621,6 +5677,8 @@ fn dispatch_orchestrator_self(
         "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
         "handoff_path": handoff_path,
         "handoff_exists": handoff_exists,
+        "handoff_format": handoff_doc.as_ref().map(|d| d.format().as_str()),
+        "handoff_sections": handoff_doc.as_ref().map(|d| d.section_labels()),
     });
     // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
     if threshold.clamped() {
@@ -5892,15 +5950,18 @@ fn dispatch_orchestrator_handoff(
         .unwrap_or(tako_core::handoff::DEFAULT_PROFILE);
 
     // handoff ファイルの存在確認
-    let handoff_content = orchestrator::read_handoff(profile_name)
-        .ok_or_else(|| {
-            let path = orchestrator::handoff_path(profile_name)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            DispatchError::Operation(format!(
-                "handoff ファイルが見つからない: {path}\nmaster は引き継ぎ前にこのファイルに状態を書き込む必要がある"
-            ))
-        })?;
+    let handoff_content = orchestrator::read_handoff(profile_name).ok_or_else(|| {
+        let path = orchestrator::handoff_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        // #792: 書けと言うだけでなく**どう書くか**（2 節の雛形）まで返す。
+        // これを最初に読むのは AI なので、ここが書式を知る唯一の機会になりうる
+        let template = tako_core::handoff::handoff_template(profile_name);
+        DispatchError::Operation(format!(
+            "handoff ファイルが見つからない: {path}\n\
+                 master は引き継ぎ前にこのファイルに状態を書き込む必要がある。書式:\n{template}"
+        ))
+    })?;
 
     // #288: 分割元ペインの解決。`tab` 指定時はそのタブのフォーカスペインを分割元にする
     // ので、呼び出し元（= 退役する master）とは別物になりうる
@@ -5999,7 +6060,10 @@ fn dispatch_orchestrator_handoff(
     cmd_bytes.push(b'\r');
     host.queue_write(new_id, cmd_bytes);
 
-    // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）
+    // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）。
+    // #792: 新書式（2 節）なら節ごとの扱い、旧書式なら「番号は実態で確認 + 次回は書き直せ」が
+    // 文面に付く。**引き継ぎ内容そのものは書式に関係なく全文が渡る**（後方互換）
+    let handoff_doc = tako_core::handoff::split_handoff(&handoff_content);
     let handoff_prompt = tako_core::handoff::successor_prompt(
         profile_name,
         &handoff_content,
@@ -6024,6 +6088,9 @@ fn dispatch_orchestrator_handoff(
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
+        // #792: 読み取った引き継ぎファイルの書式。旧書式なら "legacy"（動作は従来どおり）
+        "handoff_format": handoff_doc.format().as_str(),
+        "handoff_sections": handoff_doc.section_labels(),
         // #749: 退役するペイン。null なら後任に kill を指示していない
         // （旧 master を特定できなかった = 安全側に倒した）
         "previous_master_pane_id": previous_pane.map(PaneId::as_u64),
@@ -12864,6 +12931,14 @@ mod tests {
         assert!(result.is_err(), "handoff ファイル不在はエラー");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("handoff ファイルが見つからない"), "{err}");
+        // #792: 書式（2 節の雛形）まで返す。ここが AI が書式を知る唯一の機会になりうる
+        let lang = tako_core::i18n::lang();
+        for section in [
+            tako_core::handoff::HandoffSection::Knowledge,
+            tako_core::handoff::HandoffSection::Runtime,
+        ] {
+            assert!(err.contains(section.heading(lang)), "{err}");
+        }
     }
 
     // --- #749: 自動ハンドオフ（閾値反映 + 後任への kill 手順） ---
@@ -12978,6 +13053,182 @@ mod tests {
                 );
             },
         );
+    }
+
+    // --- #792: 引き継ぎファイルの書式（新書式 / 旧書式の後方互換）---
+
+    /// 後任へ積まれたプロンプトを取り出す
+    fn successor_prompt_of(host: &MockHost, new_pane: u64) -> String {
+        host.prompt_flows
+            .iter()
+            .find(|(p, _)| p.as_u64() == new_pane)
+            .map(|(_, text)| text.clone())
+            .expect("後任へのプロンプトが積まれる")
+    }
+
+    /// master ペインから handoff を実行して (応答, 後任プロンプト) を返す
+    fn run_handoff(profile: &str) -> (Value, String) {
+        let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorHandoff {
+                pane: Some(pane),
+                caller_role: Some(format!("master:{profile}")),
+                tab: None,
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect("handoff は成功する");
+        let new_pane = result["new_master_pane_id"].as_u64().expect("新 master");
+        let prompt = successor_prompt_of(&host, new_pane);
+        (result, prompt)
+    }
+
+    /// 表示言語に依存しない見出し（判定側の定数をそのまま使う）
+    fn heading_now(section: tako_core::handoff::HandoffSection) -> &'static str {
+        section.heading(tako_core::i18n::lang())
+    }
+
+    #[test]
+    fn handoffは新書式の2節を認識して後任へ扱いを伝える() {
+        let profile = "_tako_792_new_";
+        let content = "# master 引き継ぎ\n\n\
+                       ## 知識（マシン非依存）\n\
+                       - 方針: 検証は隔離 data dir で行う\n\n\
+                       ## 実行状態（このマシン限定）\n\
+                       - worker A: pane 7（#792 の実装）\n";
+        with_handoff_file(profile, content, || {
+            let (result, prompt) = run_handoff(profile);
+            // 機械可読な書式判定（言語非依存）
+            assert_eq!(result["handoff_format"].as_str(), Some("sectioned"));
+            assert_eq!(
+                result["handoff_sections"].as_array().map(Vec::len),
+                Some(2),
+                "知識 / 実行状態の 2 節: {result}"
+            );
+            // 内容は全文そのまま渡る（節に切って渡すと認識漏れが黙って落ちる）
+            assert!(
+                prompt.contains("- 方針: 検証は隔離 data dir で行う"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("- worker A: pane 7（#792 の実装）"),
+                "{prompt}"
+            );
+            // 節ごとの扱いが説明される（実行状態は実態で確認）
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Runtime)),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Knowledge)),
+                "{prompt}"
+            );
+            // #749 の手順（確認 → kill）は書式に関係なく入る
+            let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+            let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+            assert!(read_at < close_at, "{prompt}");
+        });
+    }
+
+    /// **後方互換の核**: 節分離前のファイル（pane / tab 参照が本文に混在）でも
+    /// 従来どおり全文が後任へ渡り、#749 の手順もそのまま入る
+    #[test]
+    fn handoffは旧書式のファイルでも従来どおり動く() {
+        let profile = "_tako_792_legacy_";
+        let content = "# master (default プロファイル) 引き継ぎ\n\n\
+                       ## 【サンプル案件 移行】担当 master（tab 136 / pane 884）\n\
+                       - 進行中: 客の追加 5 点\n\n\
+                       ## 残キュー（優先順）\n\
+                       - #801 の残件を Issue 化\n";
+        with_handoff_file(profile, content, || {
+            let (result, prompt) = run_handoff(profile);
+            assert_eq!(result["handoff_format"].as_str(), Some("legacy"));
+            assert_eq!(
+                result["handoff_sections"].as_array().map(Vec::len),
+                Some(0),
+                "旧書式は節を持たない: {result}"
+            );
+            // 全文が 1 文字も欠けずに渡る
+            assert!(
+                prompt.contains(content.trim()),
+                "旧書式の全文が渡らなかった: {prompt}"
+            );
+            // 従来の手順（#749 の不変条件）は維持
+            let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+            let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+            assert!(read_at < close_at, "{prompt}");
+            // 次の更新で新書式へ書き直す指示が付く（自然な移行の駆動源）
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Knowledge))
+                    && prompt.contains(heading_now(tako_core::handoff::HandoffSection::Runtime)),
+                "書き直し先の見出しが案内されていない: {prompt}"
+            );
+        });
+    }
+
+    /// master 自身が「自分のファイルが新書式か」を確認できる（#792）
+    #[test]
+    fn selfが引き継ぎファイルの書式を返す() {
+        let profile = "_tako_792_self_";
+        with_handoff_file(
+            profile,
+            "## 知識（マシン非依存）\n- 方針\n",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorSelf {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .unwrap();
+                assert_eq!(result["handoff_exists"].as_bool(), Some(true));
+                assert_eq!(result["handoff_format"].as_str(), Some("sectioned"));
+                assert_eq!(
+                    result["handoff_sections"].as_array().map(Vec::len),
+                    Some(1),
+                    "知識節だけ: {result}"
+                );
+            },
+        );
+    }
+
+    /// ファイル不在は「旧書式」と混ぜない（null で「まだ書いていない」を表す）
+    #[test]
+    fn selfは引き継ぎファイル不在で書式をnullにする() {
+        let profile = "_tako_792_none_";
+        // with_handoff_file は作ってしまうので、作らずに config_dir だけ揃える
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+        let path = crate::orchestrator::handoff_path(profile).expect("override 済み");
+        let _ = std::fs::remove_file(&path);
+
+        let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(pane),
+                caller_role: Some(format!("master:{profile}")),
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result["handoff_exists"].as_bool(), Some(false));
+        assert!(result["handoff_format"].is_null(), "{result}");
+        assert!(result["handoff_sections"].is_null(), "{result}");
     }
 
     #[test]

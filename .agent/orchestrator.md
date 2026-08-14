@@ -332,7 +332,16 @@ master は結果を確認してユーザーに報告する。
 | `--effort` | | thinking / reasoning effort（claude・codex のみ。省略時はプロファイル設定） |
 | `--account` | | アカウント名（accounts.yaml のキー。この worker だけ別アカウントで起動する。#504 / #511） |
 
-プロンプト送達は送達確認ループで行う（Issue #32）:
+プロンプト送達は 2 層構成（Issue #790）。claude worker には**まず受信箱へ直送**する
+（claude の Cross-Session Messaging。socket 直送なので画面解析もキー操作も伴わず、
+生成中でもキューに入って取りこぼさない。長文もそのまま届く）。使えない環境
+（claude が古い / 受信箱を開いていない / codex・agy・Windows）では従来のキー操作経路へ
+自動で落ちる。どちらを通ったかは `<data_dir>/persist.log` に `送達: peer …` /
+`送達: keys 経路 …` として残る。**受信側には「別の claude セッションから届いた」旨の
+定型文が付く**ので、この経路を使うのは worker 宛だけ（master への指示や承認の代行は
+従来経路のまま = 人が打った指示として扱われる）。
+
+従来のキー操作経路（フォールバック先）は送達確認ループで行う（Issue #32）:
 
 1. **事前信頼**: spawn 時に `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
    立て、初回フォルダの信頼ダイアログ自体を出さない（ダイアログが送信プロンプトを
@@ -355,6 +364,26 @@ error（異常停止。#157）のときは応答に `error.kind` / `error.detail
 |---|---|---|
 | `--pane` | ○ | ペイン ID |
 | `--session-id` | | claude の session ID |
+
+### `tako orchestrator workers`（レジストリ。Issue #390 / #658）
+
+spawn 済み worker を**ペインの生死と無関係に**列挙する（`<data_dir>/workers.yaml`）。
+tako を再起動してペインが消えても、`tmux_session` / `session_id` 経由で
+watch / status / report を続けられる。既定は active のみ、`--all` で closed も出す。
+
+エントリの寿命:
+
+| 遷移 | きっかけ |
+|---|---|
+| active → closed（`explicit_close`） | ペイン / タブを明示的に閉じた（CLI・MCP・GUI のどの経路でも） |
+| active → closed（`superseded`） | 同じペイン番号へ新しい worker を spawn した |
+| active → closed（`gone`） | ペインも器（tmux / psmux）も **5 分以上続けて**観測できない（GC。#658） |
+
+GC は `workers` の列挙のついでに走る（別コマンドは要らない）。**1 回の観測では倒さない**
+——器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、といった
+過渡状態で生きている worker を落とさないため、`dead_since` を刻んでから確認期間を待つ。
+closed にしても `resume_command` / `report --worker` / `workers --all` は引けるので、
+突然死からの復旧材料（#390）は失われない。
 
 ### `tako orchestrator watch`
 
@@ -423,6 +452,39 @@ master のコンテキストが埋まると判断が劣化する。tako は `/co
    前任ペインを閉じる
 
 **閉じるのは後任だけ**なので、後任の起動に失敗しても前任の master は失われない。
+
+### 引き継ぎファイルの書式（Issue #792）
+
+引き継ぎファイルは **2 節**に分ける。pane / tab 番号はこのマシンでしか意味を持たないので、
+知識に混ぜたまま別マシンへ持ち込むと後任が**存在しないペイン**へ指示を出す（#513 の設定共有で
+現実に起きる事故）。
+
+```markdown
+# master 引き継ぎ（profile: takodev）
+
+## 知識（マシン非依存）
+決定事項とその理由 / ユーザーの方針・好み / 残タスクとその意図 / 調べて分かったこと。
+pane / tab 番号は書かない
+
+## 実行状態（このマシン限定）
+spawn 済み worker とその pane と依頼内容 / 開いているペイン / 実行中のもの。
+別マシンでは丸ごと無効になる前提で書く
+```
+
+見出しは表示言語に合わせて英語（`## Knowledge (machine-independent)` /
+`## Runtime state (this machine only)`）でもよい。判定は寛容で、番号付き（`## 1. 知識…`）・
+半角括弧・強調（`**…**`）・語尾の省略（`## 知識`）も同じ節として認識する。
+
+- **旧書式（節なし）もそのまま読める**。`tako_orchestrator_handoff` は書式に関係なく
+  **全文を後任へ渡す**。旧書式のときは「番号への参照はすべて実態で確認しろ + 次の更新で
+  2 節へ書き直せ」が後任プロンプトに付くので、自然な更新で新書式へ移る（一括変換はしない）
+- 新書式のときは節ごとの扱い（知識 = そのまま前提にしてよい / 実行状態 = 必ず実態で確認）が
+  後任プロンプトに付く
+- いま自分のファイルがどちらかは `tako orchestrator self` の `handoff_format`
+  （`sectioned` / `legacy` / 未作成なら null）と `handoff_sections` で分かる。
+  `tako orchestrator handoff` の応答も同じ 2 フィールドを返す
+- 書式の正本は `tako_core::handoff`（`section_of_line` / `split_handoff` /
+  `handoff_template`。見出し定数は master system prompt と同期していることを単体テストが拘束）
 
 ```bash
 # 今の閾値と超過状態を見る（master 自身が使う）

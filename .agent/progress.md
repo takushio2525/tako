@@ -1875,6 +1875,73 @@
 - 検証: 品質ゲート全緑（1944）+ visual-test 全節 3 連続 OK + 隔離セルフテスト完走 +
   隔離実操作 12/12（出力・テーマ・分割・フォーカス・スクロール）
 
+## 2026-08-14（#792: handoff を「知識（マシン非依存）」と「実行状態（このマシン限定）」に分離）
+- 書式の正本を `tako_core::handoff` に新設（見出し 4 定数 + 寛容な `section_of_line` +
+  `split_handoff` + `handoff_template`）。後任プロンプトは**全文をそのまま渡した上で**
+  節ごとの扱い（知識 = 前提にしてよい / 実行状態 = 必ず実態で確認）を添える
+- **旧書式はそのまま動く**: 節が無ければ Legacy として全文を渡し「番号は実態で確認 +
+  次の更新で 2 節へ書き直せ」を添えて自然な移行に任せる（一括変換はしない）。
+  本番の実 handoff 5 本を読み取りだけで実測 = 全部 legacy / 全文保持
+- master prompt の規範を新書式へ改訂（見出し定数とのドリフトはテストが落とす）。
+  応答に `handoff_format` / `handoff_sections` を追加（self / handoff の両方）。
+  solo は handoff 機構を持たないので規範なし（プレースホルダ置換だけ）= 変更不要
+- ついで: `_system_prompt_*` を Local(GENERATED) でカタログ登録し、被覆テストの走査を
+  `join(format!(…))` へ拡張（before: `unclassified` に 2 件 → after: 0 件を実バイナリで A/B）
+- 検証: 品質ゲート全緑（1966）+ Windows クロスチェック警告 16 = main 同数 +
+  隔離セルフテスト完走（項目 102b 新設 = 実 dispatch で sectioned / legacy を実測）+
+  検出力 3 件（カタログ削除で 2 テスト FAILED / prompt 見出しドリフトで FAILED /
+  節判定の破壊で 8 テスト FAILED）
+- 関連コミット: `40c4b2a`（PR #804 squash merge）。CI macOS / Windows / Pages 全緑 +
+  `/Applications/tako.app` install 済み（反映は再起動後）。証拠は ~/dev/tako-evidence/792/
+
+## 2026-08-14（#789: サイドバー幅のクランプ規則を全経路で統一）
+- 上限がドラッグ = ウィンドウ幅の 50% / dispatch = 固定 600px で食い違っていた（#307 の
+  クローズ検証で発覚）。規則を `tako_core::sidebar`（下限 120 / 上限 = ビューポート幅の 50%）へ
+  一本化。**ドラッグ側へ寄せた**理由は ①固定 px では広い窓で CLI がドラッグ相当の幅に
+  届かない（設計原則 5 の破れ）②固定 px は狭い窓で過大（600px は 800px 窓の 75%）
+- 状態は要求値・描画は実効幅（`effective_sidebar_width`）に分離。窓が狭くなっても要求値は
+  書き換えないので広げ直し / 再起動で元の幅へ戻る。dispatch はウィンドウを持たないので
+  上限を最後に描いたビューポート幅から取り、応答に `sidebar_width_max` / `_min` を追加。
+  永続化も要求値 → 適用値へ（settings.json と画面の食い違いを解消）
+- 検証: unit 7 本 + セルフテスト項目 109（実ハンドラ `on_mouse_move` と実 dispatch へ同じ値を
+  入れ、窓 1600 = 上限 800 で一致を見るので旧固定 600 は必ず落ちる。窓 700 への縮小 →
+  再拡大も含む）。旧挙動 2 通りへ戻すと項目 109 が FAILED になることを実測。品質ゲート全緑（1951）
+- 副産物: Metal Toolchain（purgeable 資産）がマシンから消えており全 worktree で gpui の
+  シェーダをビルドできない状態だったので `xcodebuild -downloadComponent MetalToolchain` で復旧
+
+## 2026-08-14（#790: worker への指示送達を Cross-Session Messaging 優先の二層へ）
+- claude v2.1.224+ の受信箱（socket 直送）を第 1 層に、従来のキー操作経路を第 2 層に。
+  適用は worker 宛のみ（受信側に抑制不可の前置きが付くため人間由来の送達は従来経路）
+- 実測: 実験フラグ不要（サーバー側 gate 依存）/ idle・busy・ダイアログ中とも送達成立 /
+  43,449 バイトをバイト等価に 1 回で送達。前置きの存在と挙動への影響は Issue に記録
+- 検証: 実 claude e2e 3 本（idle=peer/delivered / busy=送信時点 busy で peer/queued /
+  peer off でキー経路 verified）+ 既存 `claude_tui_e2e` 6/7（残り 1 は main でも同一に失敗）+
+  品質ゲート全緑（1990）+ Windows クロスチェック警告 16 = main 同数 + 隔離セルフテスト完走
+- 関連コミット: `f57e661`（PR #806 squash merge）。install 済み（反映は再起動後）。
+  副産物 #807 起票（`ui_text::update` の言語グローバル競合フレーク = #608 の取りこぼし）
+
+## 2026-08-15（#658: worker レジストリの残留と GC 不全を main へ移植）
+- #658 は 2026-07-31 に「クローズ済み」だったが、PR #701 の base は
+  `windows/467-ipc-orchestration-local` で **main には 1 行も入っていなかった**
+  （`dead_since` が存在しない）。本番 workers.yaml も 51/53/54/184 が active のまま・
+  `dead_since` 未刻印で症状継続。再実装ではなく `ef89ca3` を main へ移植した
+- 中身は 3 層: ①セルフテストの隔離対象を `self_test_isolation_defaults()` へ集約
+  （`TAKO_WORKERS_FILE` / 新設 `TAKO_ORCHESTRATOR_DIR`）+ 項目 0 で実プロセス検査
+  ②GUI 経路の close をレジストリへ記録（main は `CloseReason::Explicit(CloseOrigin)`
+  なので `is_explicit()` へ適応）③`workers` 列挙のついでの GC（ペインも器も見えない
+  active に `dead_since` を刻み、**300 秒続いたものだけ** closed(gone)）。仕様は
+  requirements.md に **FR-2.26** を新設（#390 は FR が無かった）
+- 検証: 品質ゲート全緑（fmt / clippy -D warnings / test。#658 の unit 8 本）+
+  隔離 GUI + 本番コピーのレジストリで**実時間 310 秒待ちの通し**（1 回目 = 14 件に
+  `dead_since` 刻印・closed 0 / 2 回目 = 14 件 closed(gone)、生きたペインを指す
+  エントリは active のまま・刻印もされない）+ closed 後も `resume_command` が
+  引けること（claude worker 10 件）+ 隔離漏れの陰性対照（項目 0 が exit 1）
+- 副産物: **tako ペインの中から CLI を叩くと `TAKO_SOCKET`/`TAKO_TOKEN` が本番 GUI を
+  指す**ため、data_dir / discovery を隔離しても本番へ届く（1 回踏んだ。本番 GUI が
+  旧バイナリ = sweep 非搭載で実害ゼロ）。隔離検証は `env -u TAKO_SOCKET -u TAKO_TOKEN` 必須
+- 次: 本番の掃除は install + GUI 再起動後に `tako orchestrator workers` を 2 回
+  （5 分あけて）。GC は GUI プロセス側で走るので旧バイナリのままでは倒れない
+
 ## 2026-08-14（#796: 隔離セルフテストの main 由来フレークを根治）
 - 根因 3 つを実測で確定: ①**#786 の `AnyView::cached` と「汚さずに draw」**（製品経路は
   dispatch 後に `cx.notify()` するのにセルフテストはしていなかった → 幾何がキャッシュのまま

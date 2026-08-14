@@ -21,7 +21,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `data_dir()` / `config_dir()` の直後に現れる最初の `join("…")` を集める。
+/// `data_dir()` / `config_dir()` の直後に現れる最初の `join(…)` を集める。
 /// 「tako がデータディレクトリ配下に作るファイル名」の実測値になる
 fn referenced_paths() -> BTreeSet<(Root, String)> {
     const MARKERS: &[(&str, &str)] = &[
@@ -44,12 +44,12 @@ fn referenced_paths() -> BTreeSet<(Root, String)> {
                     from = at;
                     // マーカー直後の限られた範囲だけを見る（無関係な join を拾わない）。
                     // 日本語コメントを含むので、必ず char 境界で切る
-                    let mut end = text.len().min(at + 200);
+                    let mut end = text.len().min(at + 300);
                     while end > at && !text.is_char_boundary(end) {
                         end -= 1;
                     }
                     let window = &text[at..end];
-                    if let Some(name) = first_join_literal(window) {
+                    if let Some(name) = first_join_arg(window) {
                         out.insert((Root::TakoData, format!("{prefix}{name}")));
                     }
                 }
@@ -59,27 +59,81 @@ fn referenced_paths() -> BTreeSet<(Root, String)> {
     out
 }
 
-/// `join("name")` の最初の 1 件を取り出す。`join(format!(…))` 等は対象外。
+/// マーカー直後の**同じ式**に現れる最初の `join(…)` の引数を取り出す。
+/// `join("name")` と `join(format!("name_{x}.md"))` の両方を拾い、
+/// 後者は可変部分を `*` に畳む（カタログの前方一致エントリと突き合わせるため。#792）。
 ///
-/// マーカーから `join(` までが**メソッドチェーンだけで繋がっている**ことを要求する。
-/// 「近くにあるだけの無関係な join」（別の変数のパス組み立て、テストコード、
-/// doc コメント）を拾うと、テストが誤って落ちて信用されなくなるため
-fn first_join_literal(window: &str) -> Option<String> {
-    let at = window.find("join(\"")?;
-    let between = &window[..at];
-    let chained = between.chars().all(|c| {
-        c.is_alphanumeric() || c.is_whitespace() || matches!(c, '_' | '.' | '?' | '(' | ')' | '|')
-    });
-    if !chained {
+/// 「近くにあるだけの無関係な join」を拾うとテストが誤って落ちて信用されなくなるので、
+/// 走査は**ステートメント / ブロック境界で打ち切る**（`;` / 行頭の `}` / 空行）。
+/// 関数定義（`fn data_dir() -> …`）はそもそも呼び出しではないので除外する
+fn first_join_arg(window: &str) -> Option<String> {
+    if window.trim_start().starts_with("->") {
         return None;
     }
-    let rest = &window[at + "join(\"".len()..];
+    let scope = cut_at_statement_end(window);
+    let at = find_join_arg_start(scope)?;
+    let rest = &scope[at..];
     let end = rest.find('"')?;
     let name = &rest[..end];
-    if name.is_empty() || name.contains('{') {
+    if name.is_empty() {
         return None;
     }
-    Some(name.to_string())
+    Some(collapse_placeholders(name))
+}
+
+/// 式の終わりで切る（`;` / 行頭の `}` / 空行のいずれか最初のところ）
+fn cut_at_statement_end(window: &str) -> &str {
+    let mut end = window.len();
+    for pat in [";", "\n}", "\n\n"] {
+        if let Some(i) = window.find(pat) {
+            end = end.min(i);
+        }
+    }
+    &window[..end]
+}
+
+/// `join("` / `join(format!("` の**文字列リテラルが始まる位置**（`"` の次）を返す
+fn find_join_arg_start(scope: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(found) = scope[from..].find("join(") {
+        let mut i = from + found + "join(".len();
+        i += leading_space(&scope[i..]);
+        if scope[i..].starts_with("format!(") {
+            let mut j = i + "format!(".len();
+            j += leading_space(&scope[j..]);
+            if scope[j..].starts_with('"') {
+                return Some(j + 1);
+            }
+        } else if scope[i..].starts_with('"') {
+            return Some(i + 1);
+        }
+        from = i;
+    }
+    None
+}
+
+/// 先頭の空白のバイト数
+fn leading_space(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
+/// `format!` の可変部分（`{profile}`）を `*` に畳む。
+/// カタログ側は `_system_prompt_*` のような前方一致エントリで受ける
+fn collapse_placeholders(name: &str) -> String {
+    let mut out = String::new();
+    let mut in_placeholder = false;
+    for c in name.chars() {
+        match c {
+            '{' => {
+                in_placeholder = true;
+                out.push('*');
+            }
+            '}' => in_placeholder = false,
+            c if !in_placeholder => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
@@ -137,10 +191,58 @@ fn 走査が実際にパスを拾えている() {
          スキャナが壊れていないか確認してください",
         found.len()
     );
-    for expected in ["layout.json", "token", "orchestrator/projects.yaml"] {
+    for expected in [
+        "layout.json",
+        "token",
+        "orchestrator/projects.yaml",
+        // #792: 名前が実行時に決まるファイル（`join(format!(…))`）も網に掛かる
+        "orchestrator/_system_prompt_*.md",
+    ] {
         assert!(
             found.contains(&(Root::TakoData, expected.to_string())),
             "既知のパス {expected} を走査で拾えていない"
+        );
+    }
+}
+
+/// **#792**: 走査が拾えない・拾いにくい「名前が実行時に決まるファイル」を名指しで固定する。
+/// 走査の実装が変わっても、この families が未分類になったら落ちる
+#[test]
+fn 動的に名前が決まるファイルも分類されている() {
+    const DYNAMIC: &[(&str, &str, Class)] = &[
+        // master / solo 起動ごとに書き出す system prompt の実体（生成物）
+        (
+            "tako",
+            "orchestrator/_system_prompt_default.md",
+            Class::Local,
+        ),
+        (
+            "tako",
+            "orchestrator/_system_prompt_takodev.md",
+            Class::Local,
+        ),
+        // プロファイルごとの引き継ぎファイル（このマシンの実行状態を含む）
+        ("tako", "orchestrator/handoff/default.md", Class::Local),
+        // ペインごとの平文ログ
+        ("tako", "pane-logs/pane-42.log", Class::Local),
+        // プロファイル定義（宣言的設定なので共有する）
+        ("tako", "orchestrator/profiles/takodev.yaml", Class::Shared),
+        (
+            "tako",
+            "orchestrator/solo-profiles/docs.yaml",
+            Class::Shared,
+        ),
+    ];
+    for (root_name, rel, want) in DYNAMIC {
+        let root = Root::parse(root_name).expect("ルート名");
+        let entry = catalog::classify(root, rel)
+            .unwrap_or_else(|| panic!("{root_name}/{rel} が未分類（動的名でも分類は必要）"));
+        assert_eq!(
+            entry.class,
+            *want,
+            "{root_name}/{rel} の分類が想定と違う（{} != {}）",
+            entry.class.as_str(),
+            want.as_str()
         );
     }
 }
