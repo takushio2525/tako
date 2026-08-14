@@ -1459,7 +1459,9 @@ enum OrchestratorCommand {
         messages: Option<usize>,
     },
     /// worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と
-    /// 無関係に列挙する（tako 再起動後も追跡できる）。既定は active のみ
+    /// 無関係に列挙する（tako 再起動後も追跡できる）。既定は active のみ。
+    /// 列挙のついでに、ペインも器も 5 分以上観測できない active エントリを
+    /// closed（gone）へ倒す（#658。closed でも resume / report は引ける）
     Workers {
         /// closed（明示 close 済み）の worker も含める
         #[arg(long)]

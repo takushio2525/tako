@@ -1919,3 +1919,25 @@
   品質ゲート全緑（1990）+ Windows クロスチェック警告 16 = main 同数 + 隔離セルフテスト完走
 - 関連コミット: `f57e661`（PR #806 squash merge）。install 済み（反映は再起動後）。
   副産物 #807 起票（`ui_text::update` の言語グローバル競合フレーク = #608 の取りこぼし）
+
+## 2026-08-15（#658: worker レジストリの残留と GC 不全を main へ移植）
+- #658 は 2026-07-31 に「クローズ済み」だったが、PR #701 の base は
+  `windows/467-ipc-orchestration-local` で **main には 1 行も入っていなかった**
+  （`dead_since` が存在しない）。本番 workers.yaml も 51/53/54/184 が active のまま・
+  `dead_since` 未刻印で症状継続。再実装ではなく `ef89ca3` を main へ移植した
+- 中身は 3 層: ①セルフテストの隔離対象を `self_test_isolation_defaults()` へ集約
+  （`TAKO_WORKERS_FILE` / 新設 `TAKO_ORCHESTRATOR_DIR`）+ 項目 0 で実プロセス検査
+  ②GUI 経路の close をレジストリへ記録（main は `CloseReason::Explicit(CloseOrigin)`
+  なので `is_explicit()` へ適応）③`workers` 列挙のついでの GC（ペインも器も見えない
+  active に `dead_since` を刻み、**300 秒続いたものだけ** closed(gone)）。仕様は
+  requirements.md に **FR-2.26** を新設（#390 は FR が無かった）
+- 検証: 品質ゲート全緑（fmt / clippy -D warnings / test。#658 の unit 8 本）+
+  隔離 GUI + 本番コピーのレジストリで**実時間 310 秒待ちの通し**（1 回目 = 14 件に
+  `dead_since` 刻印・closed 0 / 2 回目 = 14 件 closed(gone)、生きたペインを指す
+  エントリは active のまま・刻印もされない）+ closed 後も `resume_command` が
+  引けること（claude worker 10 件）+ 隔離漏れの陰性対照（項目 0 が exit 1）
+- 副産物: **tako ペインの中から CLI を叩くと `TAKO_SOCKET`/`TAKO_TOKEN` が本番 GUI を
+  指す**ため、data_dir / discovery を隔離しても本番へ届く（1 回踏んだ。本番 GUI が
+  旧バイナリ = sweep 非搭載で実害ゼロ）。隔離検証は `env -u TAKO_SOCKET -u TAKO_TOKEN` 必須
+- 次: 本番の掃除は install + GUI 再起動後に `tako orchestrator workers` を 2 回
+  （5 分あけて）。GC は GUI プロセス側で走るので旧バイナリのままでは倒れない

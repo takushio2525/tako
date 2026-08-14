@@ -83,6 +83,9 @@ pub enum OffloadJob {
     Workers {
         live_panes: Vec<(u64, Option<String>)>,
         include_closed: bool,
+        /// 死んだ active エントリの GC を同時に行うか（#658）。セカンダリインスタンスは
+        /// プライマリのペインを持たないため false（他人の worker を殺さない）
+        sweep: bool,
     },
     GitLog {
         cwd: PathBuf,
@@ -136,6 +139,7 @@ pub fn prepare_offload(
         Request::OrchestratorWorkers { all } => Some(Ok(OffloadJob::Workers {
             live_panes: collect_live_panes(host),
             include_closed: all.unwrap_or(false),
+            sweep: !host.is_secondary(),
         })),
         Request::GitLog { pane, max_count } => {
             Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
@@ -172,7 +176,8 @@ impl OffloadJob {
             OffloadJob::Workers {
                 live_panes,
                 include_closed,
-            } => finish_workers_list(&live_panes, include_closed),
+                sweep,
+            } => finish_workers_list(&live_panes, include_closed, sweep),
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
@@ -272,20 +277,33 @@ fn collect_live_panes(host: &dyn ControlHost) -> Vec<(u64, Option<String>)> {
 }
 
 /// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
-/// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）
+/// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）。
+///
+/// `sweep` = true なら列挙のついでに死んだ active エントリを GC する（#658）。
+/// ペインも器も見えない状態が `DEAD_CONFIRM_SECS` 続いたものだけが closed になる
+/// （倒すのに 2 回以上の観測が要るので、この 1 回の列挙で生き物を落とすことはない）
 fn finish_workers_list(
     live_panes: &[(u64, Option<String>)],
     include_closed: bool,
+    sweep: bool,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator::registry;
-    let reg = registry::WorkerRegistry::load()
-        .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
     // 現存するバックエンドセッションを列挙する（器が無い / サーバー未起動は空 = 全て dead 扱い）
     let live_backends: Vec<String> = tako_core::backend::backend()
         .list()
         .into_iter()
         .map(|s| s.session.into_string())
         .collect();
+    let reg = if sweep {
+        // GC の失敗（ロック競合・書き込み不能）で一覧まで落とさない。読むだけへ縮退する
+        registry::sweep_dead(&live_backends, live_panes).or_else(|e| {
+            eprintln!("warning: worker レジストリの GC に失敗: {e}");
+            registry::WorkerRegistry::load()
+        })
+    } else {
+        registry::WorkerRegistry::load()
+    }
+    .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
     Ok(registry::list_payload(
         &reg,
         &live_backends,
@@ -2674,7 +2692,8 @@ fn dispatch_inner(
         // #390: worker レジストリの一覧（同期経路。IPC / MCP 経由は prepare_offload 側）
         Request::OrchestratorWorkers { all } => {
             let live_panes = collect_live_panes(host);
-            finish_workers_list(&live_panes, all.unwrap_or(false))
+            let sweep = !host.is_secondary();
+            finish_workers_list(&live_panes, all.unwrap_or(false), sweep)
         }
 
         // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
