@@ -3,44 +3,60 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-15、Issue #790 worker 送達の Cross-Session Messaging 化 = merge 済み・install 済み）
+## 現在の対象（2026-08-15、Issue #658 worker レジストリの残留と GC 不全 = PR 提出）
 
-- PR #806 を squash merge（`f57e661`）。CI は macOS / Windows / Pages 全緑。Issue #790 クローズ済み。
-  `/Applications/tako.app` へ install 済み（**反映は tako 再起動後**）
-- claude worker への指示送達を **2 層**にした: 第 1 層 = claude の Cross-Session Messaging
-  （受信箱 socket へ直送）→ 使えなければ第 2 層 = 従来のキー操作経路（#32 の送達確認ループ）
-- スパイクの実測は Issue #790 のコメントに全量（実験フラグ不要 / 伝送プロトコル / 前置きの存在）
+> 直前に #790（worker 送達の 2 層化）が main へ入り install 済み（`f57e661`）。
+> GUI 再起動が要るのは #790 と本件の両方（バイナリを差し替えたら 1 回で足りる）。
 
-## スパイクで確定した事実（実装の前提。触るときはここから）
+- **前提のズレ（重要）**: #658 は 2026-07-31 に「クローズ済み」だが、PR #701 の base は
+  **`windows/467-ipc-orchestration-local`** であって main ではない。main には修正が
+  1 行も無い（`dead_since` が存在しない）。本番 workers.yaml も 51/53/54/184 が
+  `active` のまま・`dead_since` 未刻印で、症状は継続していた
+- 対処は**再実装ではなく `ef89ca3` の main への移植**（設計は Windows 実機で検証済み。
+  別実装を作ると windows/467 の将来マージで衝突が悪化する）
 
-- 実験フラグは**不要**（v2.1.232 に `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` は無い）。
-  代わりに**サーバー側 gate**（GrowthBook）依存 = env で強制できない → 実行時検出 + 落ちる
-- 発見: `<config dir>/sessions/<pid>.json`（`messagingSocketPath` / `peerProtocol` / `kind` /
-  `status`）+ `<pid>.<hash>.key`（`peerToken`）。**config dir ごと**（アカウント切替と直結）
-- 伝送: socket へ改行区切り JSON 2 行（`auth` → `user`）。受信側は pid を OS で検証
-- 受信の姿は **2 形態**: `user` + `origin.kind=peer` / `attachment` の `queued_command`
-- **本文に抑制不可の前置きが付く**（「別セッションから届いた / 承認として扱うな」）
-  → 適用は worker 宛だけ（人間由来の送達は従来経路）
-- 実測: idle=ターン処理 / busy=キュー投函して取りこぼしなし / ダイアログ中も無傷 /
-  43,449 バイトを 1 回でバイト等価 / 受信箱 bind は起動 1.1 秒
+## 入った実装（移植 + main 適応）
+
+- `registry.rs`: `DEAD_CONFIRM_SECS`（300 秒）/ `dead_since` フィールド / `liveness()` /
+  `plan_sweep()` → `SweepPlan{mark,close,revive}` / `sweep_dead_at()`。
+  **一覧の pane_alive・tmux_alive と GC が同じ `liveness()` を通る**
+- GUI 経路の close（× / cmd+W / タブ close）をレジストリへ記録。main は
+  `CloseReason::Explicit(CloseOrigin)`（#566）なので `reason.is_explicit()` へ適応
+- セルフテストの隔離対象を `self_test_isolation_defaults()` に集約
+  （`TAKO_WORKERS_FILE` / 新設 `TAKO_ORCHESTRATOR_DIR`）+ **セルフテスト項目 0**
+- 仕様は `.agent/requirements.md` **FR-2.26** に新設（#390 は FR が無かった）
 
 ## 不変条件
 
-- **送り切ったらフォールバックしない**（二重投函）。落ちてよいのは可用性判定と接続失敗だけ
-- 受信確認に**時刻文字列を使わない**（秒精度 vs ミリ秒で同じ秒を取りこぼす）。
-  送信直前のファイル長を控えて追記分だけ読む（`TranscriptCursor`）
-- socket 接続と受信確認は **background スレッド**（UI スレッドで待たない。#212 / #772）
-- トークンを持つフィールドは `PeerTarget` の非公開に留め、ログ・エラー文へ出さない
+- **消してよいのは「ペインも器も見えない状態が 300 秒続いた active」だけ**。
+  1 回の観測では倒さない（`dead_since` を刻んで待つ）。生存の再観測で刻印は消える
+- GC は status を倒すだけで**エントリを削除しない**（削除は別機構 = `MAX_WORKERS` 200 の
+  保持上限で、古い closed から削る）。closed でも resume_command / report は引ける
+- 同一性は「ペイン番号 + 器」。番号は再利用されるので追跡キーがあれば器の一致まで見る
+- セカンダリインスタンスは GC を回さない（他人の worker を殺さない）
+- `CloseReason::Exited`（PTY 死亡）では倒さない（#390 の追跡意図）
+- **GC を回すのは「実ペインを持っているプライマリ GUI」だけ**。ペインを持たない
+  インスタンスから叩くと、生きている worker が「見えない」= 死亡扱いになる
+  （隔離検証で実際に起きた。本番の掃除は本番 GUI から叩くこと）
+
+## 環境メモ（他 worker も踏む）
+
+- **tako ペインの中から CLI を叩くと `TAKO_SOCKET` / `TAKO_TOKEN` が本番 GUI を指す**。
+  `TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR` を隔離しても env が先に効くので本番へ届く。
+  隔離検証は `env -u TAKO_SOCKET -u TAKO_TOKEN` を必ず付ける（今回 1 回踏んだ。
+  本番 GUI が旧バイナリ = sweep 非搭載だったため実害ゼロ）
+- 新しい worktree は `web/tako-remote/dist/` が無いと rust_embed でビルドできない
 
 ## 次の一手（master 判断）
 
-- GUI 再起動で新バイナリを反映（install は済み。再起動は全 worker を落とすので master 判断）
-- 別 Issue 化の候補: ①ダイアログ表示中の `tako send` 拒否（#748）を peer 可用時だけ通す
-  （実測では安全。今回はスコープ外） ②spawn 初回プロンプトが peer を通った割合の可視化
+- PR（`Closes #658`）→ CI 緑 → squash merge → install
+- **本番の掃除は install + GUI 再起動のあと**（GC は GUI プロセス側で走るため、
+  旧バイナリのままでは `workers` を叩いても倒れない）。手順は PR / 報告に記載
+- windows/467 側は同じ変更を持っているので、将来のマージで registry.rs は衝突する
+  （解決は「main 側 = 移植済み」を採る。#665 の `launch` 系は Windows 側にのみある）
 
 ## 現フェーズで Read すべき設計書
 
-- 送達: `.agent/architecture.md`「worker への指示送達の 2 層化」/ `.agent/requirements.md`
-  FR-2.2.2 追補 2 / `.agent/orchestrator.md`「プロンプト送達」
-- 実装: `crates/tako-control/src/peer_messaging.rs` / `delivery.rs` /
-  `crates/tako-app/src/main.rs`（`drive_peer_attempt`）
+- GC の仕様: `.agent/requirements.md` FR-2.26 / `.agent/orchestrator.md`「workers」節
+- 実装: `crates/tako-control/src/orchestrator/registry.rs`（`plan_sweep` / `liveness`）、
+  `crates/tako-control/src/dispatch.rs`（`finish_workers_list` の sweep 分岐）

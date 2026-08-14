@@ -2116,7 +2116,7 @@
     "name": "tako_orchestrator_worker_status"
   },
   {
-    "description": "worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と無関係に列挙する。tako 再起動でペインが消えても、レジストリに残る worker は tmux_session / session_id 経由で watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ prompt_delivery_failure（未達の理由コード。#530: choice_dialog = 初回のテーマ選択・ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / flow_timeout）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。",
+    "description": "worker レジストリの一覧（#390）。spawn 済み worker をペインの生死と無関係に列挙する。tako 再起動でペインが消えても、レジストリに残る worker は tmux_session / session_id 経由で watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ prompt_delivery_failure（未達の理由コード。#530: choice_dialog = 初回のテーマ選択・ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / flow_timeout）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。列挙のついでに、ペインも tmux session も 5 分以上続けて観測できない active エントリを closed（close_reason = gone）へ倒す（#658。resume_command / report は closed でも引けるので 突然死からの復旧材料は失われない）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

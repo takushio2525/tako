@@ -83,11 +83,19 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
 }
 
 /// オーケストレーター設定ディレクトリのパス。
-/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）
+/// `<data_dir>/orchestrator/`（TAKO_DATA_DIR / TAKO_ISOLATED を経由）。
+/// `TAKO_ORCHESTRATOR_DIR` で直接差し替えられる（隔離用。#658: セルフテストは
+/// data_dir を本番のまま使うため、これが無いと projects.yaml / ledger.yaml へ
+/// 検証用のエントリが混ざる）
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = test_config_dir_override().get() {
         return Some(dir.clone());
+    }
+    if let Some(dir) = std::env::var_os("TAKO_ORCHESTRATOR_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
     }
     tako_core::paths::data_dir().map(|d| d.join("orchestrator"))
 }

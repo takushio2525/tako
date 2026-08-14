@@ -1530,7 +1530,10 @@ pub fn tools() -> Vec<Value> {
                 ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / \
                 flow_timeout）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を \
                 tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。\
-                突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。",
+                突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。\
+                列挙のついでに、ペインも tmux session も 5 分以上続けて観測できない active エントリを \
+                closed（close_reason = gone）へ倒す（#658。resume_command / report は closed でも引けるので \
+                突然死からの復旧材料は失われない）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
