@@ -733,7 +733,7 @@
           "type": "boolean"
         },
         "sidebar_width": {
-          "description": "左サイドバーの幅（px。Issue #307）",
+          "description": "左サイドバーの幅（px。GUI のドラッグと同じ規則で下限 120 / 上限はウィンドウ幅の 50% にクランプされる。応答の sidebar_width が実際に適用された幅、sidebar_width_max がその時点の上限。Issue #307 / #789）",
           "exclusiveMinimum": 0,
           "type": "number"
         },

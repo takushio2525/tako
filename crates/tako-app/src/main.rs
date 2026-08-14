@@ -222,9 +222,9 @@ impl ScrollCtl {
     }
 }
 
-/// 左サイドバー（ファイルツリー）の最小幅（px。FR-3.1。ドラッグで可変。
-/// 既定幅は settings::default_sidebar_width() = 244）
-const SIDEBAR_MIN_WIDTH: f32 = 120.0;
+// 左サイドバー（ファイルツリー）の幅の下限・上限は `tako_core::sidebar` が正
+// （FR-3.23。既定幅は settings::default_sidebar_width() = 244）。#789: ドラッグ経路と
+// dispatch 経路で規則を食い違わせないため、tako-app 側に定数を持たない
 
 /// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
@@ -1177,8 +1177,17 @@ struct TakoApp {
     tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
     /// 統合 tmux ビューのペイン行ゴミ箱 → kill 確認待ちのペイン（FR-2.16.7。誤爆防止）
     pending_pane_kill: Option<PaneId>,
-    /// 左サイドバー幅（px。右端ハンドルのドラッグで可変。#307）
+    /// 左サイドバー幅の**要求値**（px。右端ハンドルのドラッグで可変。#307 / FR-3.23）。
+    ///
+    /// #789: 描画・座標計算に使う実効幅は `effective_sidebar_width()`
+    /// （= `tako_core::sidebar::clamp_width(要求値, ビューポート幅)`）。
+    /// ここに窓を狭めた分を書き戻さないので、窓を広げ直すと元の幅に戻る
     sidebar_width: f32,
+    /// 最後に描いたウィンドウのビューポート幅（px。0 = 未描画）。
+    ///
+    /// dispatch（CLI / MCP）経路はウィンドウを持たないため、上限クランプに使う幅を
+    /// ここから取る（#789。ドラッグ経路はそのウィンドウの実測幅を直接使う）
+    last_viewport_width: f32,
     /// 左サイドバー右端の境界をドラッグ中か（#307）
     dragging_sidebar: bool,
     /// 左サイドバーのファイルツリー（FR-3.1 / FR-3.7。cmd+B でトグル）
@@ -2755,9 +2764,13 @@ impl TakoApp {
             pane_context_menu: None,
             inline_edit: None,
             sidebar_width: {
+                // #789: ここではまだウィンドウが無いので上限は課さない（下限だけ）。
+                // 上限は最初の描画で実効幅として掛かるので、広い窓では
+                // 永続化した幅がそのまま復元され、狭い窓では窓に収まる
                 let w = tako_control::settings::load().sidebar_width as f32;
-                w.clamp(SIDEBAR_MIN_WIDTH, 600.0)
+                tako_core::sidebar::clamp_width(w, 0.0)
             },
+            last_viewport_width: 0.0,
             dragging_sidebar: false,
             filetree: {
                 // #550: ドット始まりの表示は settings.json に永続化する（既定 = 非表示）
@@ -7233,6 +7246,16 @@ impl TakoApp {
         }
     }
 
+    /// 描画・座標計算に使う左サイドバーの実効幅（px。#789）。
+    ///
+    /// 要求値（`sidebar_width`）を「最後に描いたウィンドウのビューポート幅」で
+    /// クランプする。ドラッグ経路・dispatch 経路・永続化からの復元のどれで幅が
+    /// 決まっても、画面に出る幅はここを通った 1 つの値になる（= ペイン矩形 /
+    /// PTY 行数 / マウス座標 / IME 位置の会計がずれない。#684 / #781 と同じ理由）
+    fn effective_sidebar_width(&self) -> f32 {
+        tako_core::sidebar::clamp_width(self.sidebar_width, self.last_viewport_width)
+    }
+
     // --- ウェルカムバナー（Issue #549）------------------------------------
 
     /// バナー / パレットからの「その場実行」。素のログインシェルのタブを作り、
@@ -10920,11 +10943,13 @@ impl TakoApp {
             cx.notify();
             return;
         }
-        // 左サイドバーの幅ドラッグ（Issue #307。右パネルと同方式）
+        // 左サイドバーの幅ドラッグ（Issue #307。右パネルと同方式）。
+        // クランプ規則は dispatch 経路と同じ 1 実装（#789）
         if self.dragging_sidebar {
             let total = f32::from(window.viewport_size().width);
-            let max = (total * 0.5).max(SIDEBAR_MIN_WIDTH);
-            self.sidebar_width = f32::from(event.position.x).clamp(SIDEBAR_MIN_WIDTH, max);
+            self.last_viewport_width = total;
+            self.sidebar_width =
+                tako_core::sidebar::clamp_width(f32::from(event.position.x), total);
             cx.notify();
             return;
         }
@@ -15696,12 +15721,21 @@ impl UiStateHost for TakoApp {
         self.filetree.set_show_hidden(show);
     }
 
+    /// 画面に出ている幅を返す（#789。要求値ではなく実効幅 = UI と同じ値）
     fn sidebar_width(&self) -> f32 {
-        self.sidebar_width
+        self.effective_sidebar_width()
     }
 
+    /// #789: ドラッグ経路と同じ規則でクランプする。ウィンドウを持たない経路
+    /// （CLI / MCP）なので上限は最後に描いたビューポート幅から取る
     fn set_sidebar_width(&mut self, width: f32) {
-        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, 600.0);
+        self.sidebar_width = tako_core::sidebar::clamp_width(width, self.last_viewport_width);
+    }
+
+    /// その時点で許される上限（px。#789。未描画で不明なら None）
+    fn sidebar_width_max(&self) -> Option<f32> {
+        let max = tako_core::sidebar::max_width(self.last_viewport_width);
+        max.is_finite().then_some(max)
     }
 
     fn set_filetree(&mut self, visible: bool) {
@@ -17544,8 +17578,14 @@ impl Render for TakoApp {
         // サイドバー表示中はその幅だけコンテンツ領域を右へずらす（ペイン矩形・境界
         // ハンドル・IME 位置はすべて content_origin / content_size 起点で連動する）
         let viewport = window.viewport_size();
+        // #789: サイドバー幅の上限はウィンドウ幅の割合なので、実効幅を出す前に
+        // 「いま描いているウィンドウの幅」を控える（dispatch 経路もこれを使う）。
+        // 窓が狭くなっても要求値（`sidebar_width`）は書き換えないので、
+        // 広げ直せば元の幅に戻る
+        self.last_viewport_width = f32::from(viewport.width);
+        let effective_sidebar_width = self.effective_sidebar_width();
         let sidebar_width = if self.filetree.visible {
-            px(self.sidebar_width)
+            px(effective_sidebar_width)
         } else {
             px(0.0)
         };
@@ -18062,7 +18102,9 @@ impl Render for TakoApp {
                         self.cached_chrome(
                             view_cache::ChromePart::Sidebar,
                             gpui::StyleRefinement::default()
-                                .w(px(self.sidebar_width))
+                                // #789: 会計（上の estimated / pane_text_areas）と
+                                // 同じ実効幅を使う
+                                .w(px(effective_sidebar_width))
                                 .h_full()
                                 .flex_none(),
                             cx,
@@ -41592,6 +41634,240 @@ mod self_test {
                 }
             } else {
                 println!("TAKO_SELF_TEST_SKIPPED: 108（TAKO_786_NO_VIEW_CACHE でキャッシュ無効）");
+            }
+
+            // 109: サイドバー幅のクランプ規則が経路で食い違わない（#789 / FR-3.23）。
+            //
+            // #307 は上限だけが経路で違っていた（ドラッグ = ウィンドウ幅の 50% /
+            // dispatch = 固定 600px）。実害は「広いウィンドウでは CLI / MCP から
+            // ドラッグ相当の幅にできない」= 設計原則 5「UI でできることは AI からも
+            // できる」の破れで、さらに永続化される値が要求値（クランプ前）だったため
+            // settings.json と画面の幅が食い違っていた。
+            //
+            // ここは**実ハンドラ**（`on_mouse_move` = 右端ハンドルのドラッグ）と
+            // **実 dispatch**（`Request::Panel` = CLI / MCP が通る道）へ同じ数値を入れ、
+            // 同じ幅・同じ上限・同じ永続化値に落ちることを見る。ウィンドウ幅を 1600 に
+            // 固定してから測るので、旧実装の固定 600px は上限 800 と一致せず必ず落ちる
+            {
+                let any789 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window789 = any789.downcast::<TakoApp>().unwrap_or(window);
+                let orig789 = window789
+                    .update(cx, |app, win, _| {
+                        (
+                            win.viewport_size(),
+                            app.sidebar_width,
+                            app.filetree.visible,
+                            tako_control::settings::load().sidebar_width,
+                        )
+                    })
+                    .ok();
+                // 幅の変更は OS 経由で非同期に届くので、フレームを回しつつ反映を待つ
+                // （#684 の項目と同じ待ち方。`last_viewport_width` は描画で更新される）
+                macro_rules! resize789 {
+                    ($w:expr) => {{
+                        let _ = window789.update(cx, |app, win, cx| {
+                            app.filetree.visible = true;
+                            let h = win.viewport_size().height;
+                            win.resize(size(px($w), h));
+                            cx.notify();
+                        });
+                        let mut applied = false;
+                        for _ in 0..20 {
+                            wait(cx, 100).await;
+                            let _ = any789.update(cx, |_, win, cx| win.draw(cx).clear());
+                            applied = window789
+                                .update(cx, |app, win, _| {
+                                    (f32::from(win.viewport_size().width) - $w).abs() <= 2.0
+                                        && (app.last_viewport_width - $w).abs() <= 2.0
+                                })
+                                .unwrap_or(false);
+                            if applied {
+                                break;
+                            }
+                        }
+                        applied
+                    }};
+                }
+                let wide789: f32 = 1600.0;
+                let narrow789: f32 = 700.0;
+                if orig789.is_none() || !resize789!(wide789) {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 109（ウィンドウ幅を {wide789} に固定できない）"
+                    );
+                } else {
+                    let max_wide = wide789 * 0.5;
+                    let probe = window789
+                        .update(cx, |app, win, cx| {
+                            let inputs = [40.0f32, 130.0, max_wide - 1.0, max_wide + 1.0, wide789];
+                            // (a) ドラッグ経路: 右端ハンドルを掴んだ状態で x を動かす
+                            let mut by_drag = Vec::new();
+                            for x in inputs {
+                                app.dragging_sidebar = true;
+                                app.on_mouse_move(
+                                    &MouseMoveEvent {
+                                        position: point(px(x), px(TAB_BAR_HEIGHT + 10.0)),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    },
+                                    win,
+                                    cx,
+                                );
+                                by_drag.push(app.sidebar_width);
+                            }
+                            app.dragging_sidebar = false;
+                            // (b) dispatch 経路: 同じ数値を CLI / MCP と同じ Request で入れる
+                            let mut by_dispatch = Vec::new();
+                            let mut maxes = Vec::new();
+                            let mut saved = Vec::new();
+                            for x in inputs {
+                                let v = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::Panel {
+                                        visible: None,
+                                        width: None,
+                                        view: None,
+                                        filetree: None,
+                                        sidebar_width: Some(x),
+                                        show_hidden: None,
+                                    },
+                                    PaneOrigin::Cli,
+                                )
+                                .ok();
+                                let num = |v: &Option<serde_json::Value>, key: &str| {
+                                    v.as_ref().and_then(|v| v[key].as_f64()).unwrap_or(-1.0) as f32
+                                };
+                                by_dispatch.push(num(&v, "sidebar_width"));
+                                maxes.push(num(&v, "sidebar_width_max"));
+                                saved.push(tako_control::settings::load().sidebar_width as f32);
+                            }
+                            // (c) ドラッグでは起こり得ない入力（0 以下）は黙ってクランプせず拒否する
+                            let rejected = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Panel {
+                                    visible: None,
+                                    width: None,
+                                    view: None,
+                                    filetree: None,
+                                    sidebar_width: Some(0.0),
+                                    show_hidden: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .is_err();
+                            (inputs, by_drag, by_dispatch, maxes, saved, rejected)
+                        })
+                        .ok();
+                    match probe {
+                        None => println!("TAKO_SELF_TEST_SKIPPED: 109（幅の測定に失敗）"),
+                        Some((inputs, by_drag, by_dispatch, maxes, saved, rejected)) => {
+                            let expected: Vec<f32> = inputs
+                                .iter()
+                                .map(|x| x.max(tako_core::sidebar::MIN_WIDTH).min(max_wide))
+                                .collect();
+                            let eq = |a: &[f32], b: &[f32]| {
+                                a.len() == b.len()
+                                    && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 0.01)
+                            };
+                            eprintln!(
+                                "TAKO_SELF_TEST_789: viewport={wide789} inputs={inputs:?} \
+                                 drag={by_drag:?} dispatch={by_dispatch:?} max={maxes:?} \
+                                 saved={saved:?}"
+                            );
+                            check(
+                                eq(&by_drag, &by_dispatch),
+                                "109: ドラッグと dispatch が同じ幅になる (#789)",
+                            );
+                            check(
+                                eq(&by_drag, &expected) && eq(&by_dispatch, &expected),
+                                "109: 下限 120 / 上限はウィンドウ幅の 50% (#789)",
+                            );
+                            check(
+                                maxes.iter().all(|m| (m - max_wide).abs() <= 0.01),
+                                "109: 応答が上限（ウィンドウ幅の 50%）を返す (#789)",
+                            );
+                            check(
+                                eq(&saved, &expected),
+                                "109: 永続化されるのは要求値ではなく適用された幅 (#789)",
+                            );
+                            check(rejected, "109: 0 以下の幅要求はエラーで拒否される (#789)");
+                        }
+                    }
+
+                    // (d) 永続化した幅より窓が狭くなっても、要求値は保ったまま窓に収まる
+                    //     （= 広い窓で保存 → 狭い窓で再起動、の適用時挙動）
+                    let intent789 = window789.update(cx, |app, _, _| app.sidebar_width).ok();
+                    if resize789!(narrow789) {
+                        let after = window789
+                            .update(cx, |app, _, _| {
+                                let pane = app.focused_pane();
+                                let text_w = app
+                                    .pane_text_areas
+                                    .iter()
+                                    .find(|(p, _)| *p == pane)
+                                    .map(|(_, b)| f32::from(b.size.width));
+                                (
+                                    app.sidebar_width,
+                                    app.effective_sidebar_width(),
+                                    text_w,
+                                    tako_control::settings::load().sidebar_width,
+                                    app.pane_shows_terminal(pane),
+                                )
+                            })
+                            .ok();
+                        match after {
+                            None => println!("TAKO_SELF_TEST_SKIPPED: 109（狭窓の測定に失敗）"),
+                            Some((intent, effective, text_w, saved, is_term)) => {
+                                eprintln!(
+                                    "TAKO_SELF_TEST_789: narrow={narrow789} intent={intent} \
+                                     effective={effective} text_w={text_w:?} saved={saved}"
+                                );
+                                check(
+                                    intent789.is_some_and(|i| (intent - i).abs() <= 0.01)
+                                        && intent789
+                                            .is_some_and(|i| i > narrow789 * 0.5 + 0.01),
+                                    "109: 窓を狭めても幅の要求値は書き換えない (#789)",
+                                );
+                                check(
+                                    (effective - narrow789 * 0.5).abs() <= 0.01,
+                                    "109: 実効幅は今の窓の 50% に収まる (#789)",
+                                );
+                                check(
+                                    intent789.is_some_and(|i| saved as f32 == i.trunc()),
+                                    "109: 窓の縮小では永続化値を上書きしない (#789)",
+                                );
+                                check(
+                                    !is_term || text_w.is_some_and(|w| w > 0.0),
+                                    "109: 狭窓でもペインのテキスト領域が残る (#789)",
+                                );
+                            }
+                        }
+                        // 窓を広げ直すと要求値どおりの幅へ戻る（意図が失われていない）
+                        if resize789!(wide789) {
+                            let restored = window789
+                                .update(cx, |app, _, _| app.effective_sidebar_width())
+                                .ok();
+                            check(
+                                restored.zip(intent789).is_some_and(|(r, i)| (r - i).abs() <= 0.01),
+                                "109: 窓を広げ直すと元の幅へ戻る (#789)",
+                            );
+                        }
+                    } else {
+                        println!("TAKO_SELF_TEST_SKIPPED: 109（狭い窓へ変更できない）");
+                    }
+                }
+                // 後始末: ウィンドウ寸法・幅・ファイルツリー表示・設定値を戻す
+                if let Some((vp, width, ft, saved)) = orig789 {
+                    let _ = window789.update(cx, |app, win, cx| {
+                        app.sidebar_width = width;
+                        app.filetree.visible = ft;
+                        win.resize(vp);
+                        cx.notify();
+                    });
+                    let mut settings = tako_control::settings::load();
+                    settings.sidebar_width = saved;
+                    let _ = tako_control::settings::save(&settings);
+                    wait(cx, 200).await;
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

@@ -208,12 +208,19 @@ pub trait UiStateHost {
     }
     /// ドット始まり項目の表示切替（Issue #550。永続化は呼び出し側の責務）
     fn set_filetree_show_hidden(&mut self, _show: bool) {}
-    /// 左サイドバーの幅（px。Issue #307）
+    /// 左サイドバーの幅（px。Issue #307。#789: 画面に出ている実効幅を返す）
     fn sidebar_width(&self) -> f32 {
         244.0
     }
-    /// 左サイドバーの幅を設定する（Issue #307。永続化は呼び出し側の責務）
+    /// 左サイドバーの幅を設定する（Issue #307。永続化は呼び出し側の責務）。
+    ///
+    /// #789: 実装側は `tako_core::sidebar::clamp_width` でクランプする
+    /// （ドラッグ経路と同一規則）。要求値がそのまま入るとは限らない
     fn set_sidebar_width(&mut self, _width: f32) {}
+    /// 左サイドバー幅の上限（px。#789。ウィンドウ幅が分からない実装は None）
+    fn sidebar_width_max(&self) -> Option<f32> {
+        None
+    }
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
     /// ピン留め中のプレビュー一覧（FR-2.16.15）
