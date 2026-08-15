@@ -1441,6 +1441,14 @@ struct TakoApp {
     term_redraw_requests: u64,
     /// 画面に映っていないペインの出力で再描画を省いた回数（同上）
     term_redraw_skipped: u64,
+    /// ペインごとのイベント配送状態（#816）。
+    ///
+    /// #782 の可視性ゲートは `on_term_event`（= メインスレッド）に入ってから効くので、
+    /// 見えないペインの出力でも **チャネル送出 → executor 起床 → メインスレッド往復**
+    /// までは毎回払っていた（実測でこれが取り込み経路の 36%）。最後の可視判定を
+    /// ここへ申し送っておき、配送側が往復そのものを省けるようにする。
+    /// `hidden` の書き手は `on_term_event` だけ、読み手は配送タスクだけ
+    pane_delivery: HashMap<PaneId, std::sync::Arc<PaneDelivery>>,
     /// デバウンス待ちのあいだに出力があったペイン（#786。フラッシュでまとめて notify する）
     term_pending_panes: Vec<PaneId>,
     /// デバウンス待ちの変化がペインの外（タブバー・サイドバー等）にも出るか（#786）
@@ -2010,6 +2018,28 @@ struct CharInfo {
     snaps: bool,
 }
 
+/// ペインごとのイベント配送状態（#816）。`hidden` は最後の可視判定の申し送りで、
+/// 2 本のカウンタは「渡した / 省いた」の実測用（#782 の `term_redraw_skipped` と
+/// 同じ役割。あちらはメインスレッドに入ってからの回数、こちらは入る前の回数）
+#[derive(Default)]
+struct PaneDelivery {
+    hidden: std::sync::atomic::AtomicBool,
+    /// メインスレッドへ渡った回数
+    hops: std::sync::atomic::AtomicU64,
+    /// 見えないので渡さなかった回数
+    skipped: std::sync::atomic::AtomicU64,
+}
+
+/// 未処理 `Wakeup` ゲート（#816。`TerminalSession::wakeup_gate`）を倒す。
+///
+/// **グリッドを読む直前**に呼ぶこと。倒したあとに届いた出力は次の `Wakeup` を
+/// 立て直すので取りこぼさない。倒す前に読むと「読んだ後・倒す前」の出力が
+/// 次の合図を得られず画面が止まる
+#[inline]
+fn release_wakeup_gate(gate: &std::sync::atomic::AtomicBool) {
+    gate.store(false, std::sync::atomic::Ordering::Release);
+}
+
 /// 端末イベントを 4ms 窓でまとめて 1 回にする（Issue #782。zed の
 /// `Terminal::subscribe` と同じ方式）。
 ///
@@ -2017,17 +2047,29 @@ struct CharInfo {
 /// no-op（`process_event` が None を返す）なので、窓内に何件届いても 1 件に畳める。
 /// それ以外（タイトル変更・OSC・PTY 書き込み・終了）は順序どおり全件処理する。
 ///
+/// #816: 窓の中身が Wakeup だけで、しかもそのペインが画面のどこにも映っていない
+/// （`delivery.hidden` が立っている）なら、メインスレッドへ渡らずに外側の待ちへ戻る。
+/// 判定の正は従来どおり `on_term_event` の `pane_visibility` で、ここはその申し送りを
+/// 読むだけ。申し送りが古い場合の上限は外側の再確認間隔
+/// （[`TakoApp::HIDDEN_WAKEUP_RECHECK`]）で抑えている。
+///
 /// 戻り値 Err = View が破棄された（呼び出し側はループを抜ける）
 async fn batch_term_events(
     this: &gpui::WeakEntity<TakoApp>,
     cx: &mut gpui::AsyncApp,
     pane_id: PaneId,
     rx: &mut futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>,
+    delivery: &PaneDelivery,
+    last_hop: &mut std::time::Instant,
+    gate: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ()> {
     use futures::FutureExt;
+    // #816: 再描画の間隔（16ms）に満たないうちに来た Wakeup は持ち越す。
+    // 捨てるのではなく次の窓へ繰り越すので、出力が止まっても最後の 1 枚は必ず描かれる
+    let mut carried_wakeup = false;
     loop {
         let mut events: Vec<tako_core::SessionEvent> = Vec::new();
-        let mut wakeup = false;
+        let mut wakeup = carried_wakeup;
         let mut timer = cx
             .background_executor()
             .timer(TakoApp::TERM_EVENT_BATCH)
@@ -2054,6 +2096,33 @@ async fn batch_term_events(
         if events.is_empty() && !wakeup {
             return Ok(()); // 窓のあいだ静かだった → 外側の待ちへ戻る
         }
+        if events.is_empty() && delivery.hidden.load(std::sync::atomic::Ordering::Relaxed) {
+            // #816: 画面に出ないペインの Wakeup だけ → 往復せず外側の待ちへ戻す。
+            // ゲートは倒しておく（倒さないと PTY 側が次の Wakeup を送らず、
+            // 外側の再確認そのものが起きなくなる）
+            release_wakeup_gate(gate);
+            delivery
+                .skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        if events.is_empty() && last_hop.elapsed() < TakoApp::TERM_REDRAW_INTERVAL {
+            // #816: Wakeup だけの窓で、まだ次の再描画時刻に達していない。
+            // いま渡しても `on_term_event` は遅延フラッシュを積むだけなので、
+            // 持ち越して窓をもう 1 周する（描かれる時刻は変わらない）
+            carried_wakeup = true;
+            delivery
+                .skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        carried_wakeup = false;
+        *last_hop = std::time::Instant::now();
+        delivery
+            .hops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // グリッドを読む直前にゲートを倒す（#816）
+        release_wakeup_gate(gate);
         let applied = this.update(cx, |app: &mut TakoApp, cx| {
             if wakeup {
                 app.on_term_event(
@@ -2941,6 +3010,7 @@ impl TakoApp {
             term_notify_pending: false,
             term_redraw_requests: 0,
             term_redraw_skipped: 0,
+            pane_delivery: HashMap::new(),
             term_pending_panes: Vec::new(),
             term_pending_app: false,
             pane_bodies: HashMap::new(),
@@ -5703,8 +5773,59 @@ impl TakoApp {
         }
         let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
         self.terminals.insert(pane_id, session);
+        let delivery = self.pane_delivery.entry(pane_id).or_default().clone();
+        let gate = self
+            .terminals
+            .get(&pane_id)
+            .map(|s| s.wakeup_gate())
+            .unwrap_or_default();
         cx.spawn(async move |this, cx| {
+            // #816: 見えないペインへ渡り続けないための最終確認時刻。
+            // 申し送り（`hidden`）を書けるのはメインスレッドの `on_term_event` だけなので、
+            // 一度も渡らなくなると申し送りが更新されない。この間隔で必ず 1 回渡し、
+            // 申し送りの古さを上限つきにする（= 表に出た直後でも自力で復帰する）
+            let mut last_hop = std::time::Instant::now() - TakoApp::HIDDEN_WAKEUP_RECHECK;
             while let Some(event) = rx.next().await {
+                let wakeup_only = matches!(
+                    event,
+                    tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup)
+                );
+                if wakeup_only
+                    && delivery.hidden.load(std::sync::atomic::Ordering::Relaxed)
+                    && last_hop.elapsed() < TakoApp::HIDDEN_WAKEUP_RECHECK
+                {
+                    // 画面のどこにも出ないペインの「描き直して」= 渡すだけ無駄。
+                    // グリッドは PTY 側のスレッドが更新済みで、表に出たときの描画は
+                    // そのときの実グリッドから起こされるので取りこぼしにならない。
+                    // ゲートは倒す（次の出力で起こしてもらい、再確認の機会を保つ）
+                    release_wakeup_gate(&gate);
+                    delivery
+                        .skipped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                // #816: 見えているペインでも、再描画は 16ms に 1 回しか起きない
+                // （`on_term_event` のデバウンス）のに、Wakeup 1 件ごとに
+                // メインスレッドへ渡っていた。1 行ずつ吐くプログラムでは
+                // 秒間 200 回の往復になり、これが取り込み経路の支配項だった。
+                // 直前に渡ってから 16ms 経つまで待ってから渡す。**描画される時刻は
+                // 変わらない**（従来もデバウンスで同じ境界まで遅延していた）し、
+                // 待っているあいだに届いた分は次の窓でまとめて処理される。
+                // 静かなペインへの打鍵（= 直前の往復が 16ms 以上前）は即時のまま
+                if wakeup_only {
+                    let since = last_hop.elapsed();
+                    if since < TakoApp::TERM_REDRAW_INTERVAL {
+                        cx.background_executor()
+                            .timer(TakoApp::TERM_REDRAW_INTERVAL - since)
+                            .await;
+                    }
+                }
+                last_hop = std::time::Instant::now();
+                delivery
+                    .hops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // グリッドを読む直前にゲートを倒す（#816）
+                release_wakeup_gate(&gate);
                 // 1 件目は即処理（打鍵の反応 = レイテンシ優先）
                 if this
                     .update(cx, |app: &mut TakoApp, cx| {
@@ -5719,7 +5840,7 @@ impl TakoApp {
                 // 秒間数百〜数千届き、1 件ごとに `Entity::update`（= effect flush）を
                 // 回すだけでメインスレッドを食う。Wakeup は「描き直して」以上の意味を
                 // 持たない no-op なので、窓内の分は 1 件に畳める
-                if batch_term_events(&this, cx, pane_id, &mut rx)
+                if batch_term_events(&this, cx, pane_id, &mut rx, &delivery, &mut last_hop, &gate)
                     .await
                     .is_err()
                 {
@@ -5766,6 +5887,16 @@ impl TakoApp {
     /// 端末イベントの合流窓（Issue #782）。zed の `Terminal::subscribe` と同じ 4ms
     const TERM_EVENT_BATCH: Duration = Duration::from_millis(4);
 
+    /// 見えないペインの Wakeup を飛ばし続ける最長時間（#816）。
+    /// これを過ぎたら必ず 1 回メインスレッドへ渡し、`pane_visibility` を取り直す。
+    /// 表へ出た瞬間の描画はタブ切替そのものが起こすので、ここは「その後の更新が
+    /// 止まったままにならない」ための上限にすぎない
+    const HIDDEN_WAKEUP_RECHECK: Duration = Duration::from_millis(200);
+
+    /// 出力起因の再描画の最小間隔（約 60fps）。`on_term_event` のデバウンスと、
+    /// #816 の「Wakeup でメインスレッドへ渡る最小間隔」の両方がこれを見る
+    const TERM_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+
     fn on_term_event(
         &mut self,
         pane_id: PaneId,
@@ -5805,6 +5936,13 @@ impl TakoApp {
         // 裏タブ・たまり場のペインが吐く出力で 60fps の再描画を回し続けるのは、
         // 見た目が 1 ピクセルも変わらない純粋な浪費
         let visibility = self.pane_visibility(pane_id);
+        // #816: 判定結果を配送側へ申し送る（次の Wakeup からメインスレッド往復ごと省ける）
+        if let Some(state) = self.pane_delivery.get(&pane_id) {
+            state.hidden.store(
+                visibility == PaneVisibility::Hidden,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if !ui_outside_pane && visibility == PaneVisibility::Hidden {
             self.term_redraw_skipped = self.term_redraw_skipped.saturating_add(1);
             return;
@@ -5819,7 +5957,7 @@ impl TakoApp {
             self.term_pending_panes.push(pane_id);
         }
         // 16ms（~60fps）のフレームレート制限: 通常の出力データはまとめてから描く
-        let interval = Duration::from_millis(16);
+        let interval = Self::TERM_REDRAW_INTERVAL;
         let elapsed = self.last_term_notify.elapsed();
         if elapsed >= interval {
             self.flush_term_redraw(cx);
@@ -6558,6 +6696,8 @@ impl TakoApp {
                     self.apply_pane_log_close(pane_id, data, reason);
                 }
                 self.terminals.remove(&pane_id);
+                // #816: 可視性の申し送りは配送タスクと同じ寿命
+                self.pane_delivery.remove(&pane_id);
                 self.discard_ime_for_pane(pane_id);
                 self.drop_preview_pane_state(pane_id);
                 self.drop_gui_pane_state(pane_id);
@@ -6628,6 +6768,7 @@ impl TakoApp {
                 }
                 for id in pane_ids {
                     self.terminals.remove(&id);
+                    self.pane_delivery.remove(&id);
                     self.previews.remove(&id);
                     self.preview_edits.remove(&id);
                     self.discard_ime_for_pane(id);
@@ -8058,6 +8199,13 @@ impl TakoApp {
     ) {
         // #503: タブ切替でテキスト入力フラグをクリア
         self.clear_text_input_focus();
+        // #816: 表示タブが変わると可視性の申し送りは古くなる。ここで落としておけば
+        // 表へ出たペインは次の出力で即座にメインスレッドへ渡り、再確認間隔を待たない
+        for state in self.pane_delivery.values() {
+            state
+                .hidden
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         if self.workspace.get_window(viewport).is_none()
             || self.workspace.window_of_tab(tab) == Some(viewport)
         {
@@ -15651,6 +15799,7 @@ impl SessionHost for TakoApp {
             self.apply_pane_log_close_from(pane, data, origin, caller);
         }
         self.terminals.remove(&pane);
+        self.pane_delivery.remove(&pane);
         self.discard_ime_for_pane(pane);
         // #821: GUI の close（`remove_pane_with`）と同じ一式を落とす。
         // ここが独自の列挙だった頃は、CLI / MCP で閉じたプレビューの
@@ -23345,6 +23494,11 @@ mod self_test {
             "visual-test 端末グリッド: fixture 12 行が画面に出る (#787)",
         );
 
+        // #796 の作法: 撮る前に必ず汚す。ペイン本体は `AnyView::cached`（#786）なので、
+        // 「グリッドには出ているがビューは汚れていない」状態で draw すると
+        // キャッシュ由来の古い絵が撮れる（#816 で出力起因の notify が再描画間隔まで
+        // 遅れるようになり、この取りこぼしが表に出た）
+        notify_and_draw(any, window, cx);
         // 1 枚目で矩形を確定させ、2 枚目を検査に使う（他の節と同じ作法）
         let _ = capture_frame(any, cx);
         let Some((frame, scale)) = capture_frame(any, cx) else {
@@ -44296,6 +44450,177 @@ mod self_test {
                             }
                         }
                         let _ = std::fs::remove_dir_all(&dir815);
+                    }
+                }
+            }
+
+            // 項目 113（#816）: 画面のどこにも映っていないペインの出力では、
+            // メインスレッドへ渡ること自体を省く。#782 の可視性ゲートは
+            // `on_term_event`（= 渡った後）で効くので、渡る回数は減っていなかった。
+            //
+            // 観測点はペインごとの配送カウンタ（`PaneDelivery`）。ゲート前は
+            // 出力のバーストごとに `hops` が増えるが、ゲート後は
+            // `HIDDEN_WAKEUP_RECHECK` ごとの再確認ぶんしか増えない。
+            // ペインはシェルへ打ち込むのではなく**コマンド付きで起動**するので、
+            // プロンプトの立ち上がり待ちに依存しない
+            #[cfg(unix)]
+            {
+                let hidden816 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("816-hidden".into()),
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        let pane = r["pane"].as_u64().map(PaneId::from_raw)?;
+                        // 項目 107 と同じく dispatch 直呼びなので PTY 起動をここで回す。
+                        // ただし対象ペインだけはコマンド付きで起動して出力を確定させる
+                        for (id, mut options) in std::mem::take(&mut app.pending_attach) {
+                            if id == pane {
+                                options.command = Some(tako_core::SpawnCommand {
+                                    program: "/bin/sh".into(),
+                                    args: vec![
+                                        "-c".into(),
+                                        "i=0; while [ $i -lt 150 ]; do printf 'l%d\\n' $i; \
+                                         sleep 0.02; i=$((i+1)); done"
+                                            .into(),
+                                    ],
+                                });
+                            }
+                            let _ = app.spawn_session(id, options, cx);
+                        }
+                        Some(pane)
+                    })
+                    .ok()
+                    .flatten();
+                match hidden816 {
+                    None => println!("TAKO_SELF_TEST_SKIPPED: 113（裏タブを作れない）"),
+                    Some(pane) => {
+                        wait(cx, 500).await;
+                        let invisible = window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                !app.pane_content_visible(pane)
+                            })
+                            .unwrap_or(false);
+                        check(invisible, "113: 計測対象のペインが不可視である (#816)");
+                        let snap = |cx: &mut gpui::AsyncApp| {
+                            window
+                                .update(cx, |app: &mut TakoApp, _, _| {
+                                    let d = app.pane_delivery.get(&pane);
+                                    (
+                                        d.map(|d| d.hops.load(std::sync::atomic::Ordering::Relaxed))
+                                            .unwrap_or(0),
+                                        d.map(|d| {
+                                            d.skipped.load(std::sync::atomic::Ordering::Relaxed)
+                                        })
+                                        .unwrap_or(0),
+                                        // 進み具合は「見えている最後の l<N>」で測る。
+                                        // 永続バックエンド構成では tmux が alt screen を
+                                        // 使うため `history_size` は常に 0 になる
+                                        app.terminals
+                                            .get(&pane)
+                                            .and_then(|s| {
+                                                s.visible_lines()
+                                                    .into_iter()
+                                                    .filter_map(|l| {
+                                                        l.trim()
+                                                            .strip_prefix('l')
+                                                            .and_then(|n| n.parse::<u64>().ok())
+                                                    })
+                                                    .next_back()
+                                            })
+                                            .unwrap_or(0),
+                                    )
+                                })
+                                .unwrap_or((0, 0, 0))
+                        };
+                        let (hop0, _, line0) = snap(cx);
+                        wait(cx, 2500).await;
+                        let (hop1, skip1, line1) = snap(cx);
+                        let hops = hop1.saturating_sub(hop0);
+                        let grew = line1.saturating_sub(line0);
+                        let diag = window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let s = app.terminals.get(&pane);
+                                format!(
+                                    "session={} size={:?} alt={:?} last={:?}",
+                                    s.is_some(),
+                                    s.map(|s| s.size()),
+                                    s.map(|s| s.is_alt_screen()),
+                                    s.map(|s| s
+                                        .visible_lines()
+                                        .into_iter()
+                                        .rfind(|l| !l.trim().is_empty())
+                                        .unwrap_or_default())
+                                )
+                            })
+                            .unwrap_or_default();
+                        println!(
+                            "TAKO_SELF_TEST_816: hidden hops={hops} skipped={skip1} \
+                             lines+={grew} ({line0}->{line1}) recheck_ms={} {diag}",
+                            TakoApp::HIDDEN_WAKEUP_RECHECK.as_millis()
+                        );
+                        // 出力が実際に流れていること（流れていなければ hops が少なくて当然）
+                        check(grew >= 40, "113: 裏タブのペインで出力が実際に流れる (#816)");
+                        // ゲート前は「届いた Wakeup の数だけ渡る」ので skipped は 0 のまま。
+                        // ゲート後は渡した回数より省いた回数の方が多くなる
+                        // （hops に載る残りは Wakeup 以外 = タイトル等、常に渡すもの）
+                        check(
+                            skip1 >= hops && skip1 >= 20,
+                            "113: 不可視ペインの Wakeup は渡すより省く方が多い (#816)",
+                        );
+                        // 2.5 秒 / 200ms = 13 回 + Wakeup 以外のぶん。ゲート前は
+                        // 出力 1 件ごとに渡るので 100 回超になる
+                        check(
+                            hops <= 80,
+                            "113: 不可視ペインへの往復が出力の数に比例しない (#816)",
+                        );
+                        // 表へ出したら申し送りが落ち、次の出力は普通に届く
+                        let resumed = window
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let tab = app.workspace.find_tab_of_pane(pane)?;
+                                app.select_tab_for_window(
+                                    tab,
+                                    app.workspace.active_window_id(),
+                                    cx,
+                                );
+                                Some(
+                                    app.pane_content_visible(pane)
+                                        && app.pane_delivery.get(&pane).is_some_and(|d| {
+                                            !d.hidden.load(std::sync::atomic::Ordering::Relaxed)
+                                        }),
+                                )
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false);
+                        check(
+                            resumed,
+                            "113: 表へ出すと可視に戻り申し送りも落ちる (#816)",
+                        );
+                        let (hop2, _, _) = snap(cx);
+                        wait(cx, 600).await;
+                        let (hop3, _, _) = snap(cx);
+                        check(
+                            hop3 > hop2,
+                            "113: 表へ出した後は出力がメインスレッドへ届く (#816)",
+                        );
+                        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                        });
                     }
                 }
             }
