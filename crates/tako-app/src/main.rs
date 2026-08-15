@@ -1529,17 +1529,22 @@ struct TakoApp {
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
     ///
-    /// **コードプレビューは可視行だけが `Some`**（#821 の仮想化）。索引は常に
+    /// **コード（#821）と Markdown（#826）は可視部分だけが `Some`**。索引は常に
     /// 文書の行番号なので、`None` を読み飛ばす利用側（`preview_text_layout_hit_test` /
     /// `md_link_at_position`）はそのまま動く
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
-    /// コードプレビューの仮想リスト状態（#821）。可変行高（折り返し）を
-    /// GPUI 側が実測して持つので、折り返しの見た目を変えずに可視行だけ描ける。
-    /// 値は (状態, 構築時の行数) で、行数が変わったら作り直す
-    preview_code_lists: HashMap<PaneId, (gpui::ListState, usize)>,
-    /// コードプレビューの行頭バイトオフセット（#821）。仮想化で行を飛ばして
+    /// プレビュー本文の仮想リスト状態（コード = #821 / Markdown = #826）。
+    /// 可変高（折り返し・表・コードブロック）を GPUI 側が実測して持つので、
+    /// 見た目を変えずに可視部分だけ描ける。値は (状態, 中身の種別, 構築時の item 数) で、
+    /// **種別か item 数が変われば作り直す**（同じ行数で code ⇄ md が入れ替わる事故を防ぐ）
+    preview_body_lists: HashMap<PaneId, (gpui::ListState, PreviewBodyKind, usize)>,
+    /// プレビュー本文の行頭バイトオフセット（#821 / #826）。仮想化で行を飛ばして
     /// 描くため、`doc_offset` の逐次加算では検索ヒット範囲を決められない
     preview_line_starts: HashMap<PaneId, Vec<usize>>,
+    /// Markdown ブロックの索引（#826）。仮想リストは可視ブロックだけを組むので、
+    /// ブロック番号から「最初の行番号 / 行数 / コードブロック番号」を引けるようにする。
+    /// render で毎フレーム作り直す（行テキストと同じ 1 パスで済む）
+    preview_md_block_index: HashMap<PaneId, Vec<MdBlockIndex>>,
     /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）。
     /// **仮想化しても全行ぶんを持つ**（⌘A / コピー / ヒットテストの正）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
@@ -1850,6 +1855,33 @@ pub(crate) struct MdLinkHit {
     pub(crate) range: std::ops::Range<usize>,
     /// md に書かれた遷移先（開けないものも記録する）
     pub(crate) url: String,
+}
+
+/// プレビュー本文の仮想リストが並べている中身（#826）。
+///
+/// コードは 1 item = 1 行、Markdown は 1 item = 1 ブロック（#232 の目次ジャンプが
+/// ブロック番号で子要素を指す対応をそのまま保つ）。同じ item 数でも意味が違うので、
+/// 種別が変わったら `ListState` は作り直す
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewBodyKind {
+    Code,
+    Markdown,
+}
+
+/// Markdown ブロック 1 個の索引（#826）。
+///
+/// 仮想リストは可視ブロックだけを組むので、`doc_offset` の逐次加算では
+/// 「このブロックの行は何番から始まるか」「検索ヒットのバイト範囲はどこか」
+/// 「何番目のコードブロックか（#680 のコピー）」を決められない。
+/// 並びの正は [`md_block_line_texts`] で、render の 1 パスで作る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MdBlockIndex {
+    /// このブロックの最初の選択行番号
+    pub(crate) first_line: usize,
+    /// このブロックが占める選択行の本数（表だけが 2 以上になる）
+    pub(crate) line_count: usize,
+    /// コードブロックなら出現順の番号（#680 のコピー対象）
+    pub(crate) code_index: Option<usize>,
 }
 
 /// cmd+ホバーで検出されたリンク情報
@@ -3047,7 +3079,8 @@ impl TakoApp {
             preview_pdf_hovered_link: None,
             preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
-            preview_code_lists: HashMap::new(),
+            preview_body_lists: HashMap::new(),
+            preview_md_block_index: HashMap::new(),
             preview_line_starts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             preview_md_link_hits: HashMap::new(),
@@ -6769,29 +6802,12 @@ impl TakoApp {
                 for id in pane_ids {
                     self.terminals.remove(&id);
                     self.pane_delivery.remove(&id);
-                    self.previews.remove(&id);
-                    self.preview_edits.remove(&id);
+                    // #826: タブ close もペイン close と同じ後始末を通す。
+                    // ここが独自列挙のままだと、後から足したプレビュー状態
+                    // （#821 の行レイアウト・#826 のブロック索引）がタブごと
+                    // 閉じたときだけ残る（#821 が CLI / MCP 経路で踏んだのと同型）
+                    self.drop_preview_pane_state(id);
                     self.discard_ime_for_pane(id);
-                    self.video_players.remove(&id);
-                    self.remove_video_frame_cache(id);
-                    self.remove_preview_image_cache(id);
-                    self.preview_run_profiles.remove(&id);
-                    self.preview_run_selected.remove(&id);
-                    self.preview_views.remove(&id);
-                    self.preview_scroll_handles.remove(&id);
-                    self.pending_pdf_rasters.remove(&id);
-                    self.active_pdf_rasters.remove(&id);
-                    self.video_seek_bar_bounds.remove(&id);
-                    self.preview_selections.remove(&id);
-                    self.preview_line_bounds.remove(&id);
-                    self.preview_pdf_char_bounds.remove(&id);
-                    self.preview_pdf_highlight_paint_count.remove(&id);
-                    self.preview_pdf_page_image_bounds.remove(&id);
-                    self.preview_text_layouts.remove(&id);
-                    self.preview_code_lists.remove(&id);
-                    self.preview_line_starts.remove(&id);
-                    self.preview_line_texts.remove(&id);
-                    self.forget_md_links(id);
                     self.pane_links.remove(&id);
                     self.known_failed.remove(&id);
                     self.scroll_accum.remove(&id);
@@ -11579,7 +11595,7 @@ impl TakoApp {
 
         let delta_px = drag_scroll_delta_px(factor.abs());
         // #821: コードは仮想リストが自分でスクロールを持つ（`list` は下方向が正）
-        if let Some((list, _)) = self.preview_code_lists.get(&pane_id) {
+        if let Some((list, _, _)) = self.preview_body_lists.get(&pane_id) {
             list.scroll_by(px(if factor > 0.0 { -delta_px } else { delta_px }));
         } else if let Some(handle) = self.preview_scroll_handles.get(&pane_id) {
             let offset = handle.offset();
@@ -16464,7 +16480,17 @@ impl PreviewHost for TakoApp {
                 if preview.mode != preview::PreviewMode::Markdown {
                     return Err("Markdown アウトラインの対象ではない".into());
                 }
-                handle.scroll_to_top_of_item(block);
+                // #826: 仮想化した md 本文は `list` が器（1 item = 1 ブロック）。
+                // 論理位置で飛ばすので、**まだ一度も描かれていないブロック**へも届く
+                // （スクロールハンドルは描画済みの子矩形しか知らない）
+                if let Some(list) = self.preview_md_list(pane) {
+                    list.scroll_to(gpui::ListOffset {
+                        item_ix: block,
+                        offset_in_item: px(0.0),
+                    });
+                } else {
+                    handle.scroll_to_top_of_item(block);
+                }
             }
             tako_core::PreviewOutlineTarget::PdfPage { page } => {
                 let preview::PreviewContent::Pdf(data) = &preview.content else {
@@ -16793,7 +16819,9 @@ impl PreviewHost for TakoApp {
         self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
-        self.preview_code_lists.remove(&pane);
+        self.preview_body_lists.remove(&pane);
+        // #826: 中身が変わればブロック索引の意味も変わる（次の md 描画で作り直す）
+        self.preview_md_block_index.remove(&pane);
         self.preview_line_starts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.forget_md_links(pane);
@@ -20029,6 +20057,32 @@ mod self_test {
                 return true;
             }
         }
+        // 揃わなかったときは「何が揃っていないか」を残す（#826。器の違いで
+        // 待ち条件が空振りしたのか、そもそも描かれていないのかを切り分けるため）
+        let why = window
+            .update(cx, |app, _, _| {
+                format!(
+                    "kind={} texts={} layouts={}/{} line_bounds={} pdf_chars={} visible={}",
+                    match app.previews.get(&pane).map(|s| &s.content) {
+                        Some(preview::PreviewContent::Code(_)) => "code",
+                        Some(preview::PreviewContent::Markdown(_)) => "markdown",
+                        Some(preview::PreviewContent::Pdf(_)) => "pdf",
+                        Some(preview::PreviewContent::Loading) => "loading",
+                        Some(_) => "other",
+                        None => "none",
+                    },
+                    app.preview_line_texts.get(&pane).map_or(0, Vec::len),
+                    app.preview_text_layouts
+                        .get(&pane)
+                        .map_or(0, |l| l.iter().filter(|x| x.is_some()).count()),
+                    app.preview_text_layouts.get(&pane).map_or(0, Vec::len),
+                    app.preview_line_bounds.get(&pane).map_or(0, Vec::len),
+                    app.preview_pdf_char_bounds.get(&pane).map_or(0, Vec::len),
+                    app.pane_content_visible(pane),
+                )
+            })
+            .unwrap_or_default();
+        println!("TAKO_VISUAL_PIXEL: preview-maps timeout pane={pane:?} pdf={pdf} {why}");
         false
     }
 
@@ -21105,14 +21159,60 @@ mod self_test {
         )
     }
 
-    /// 指定した選択行（Markdown のブロック / 表セル）がペイン上端付近へ来るまでスクロールする
+    /// 指定した選択行（Markdown のブロック / 表セル）がペイン上端付近へ来るまでスクロールする。
+    ///
+    /// #826: 仮想化した md 本文は `list` が器なので、行が属する**ブロック番号**で飛ぶ
+    /// （まだ描かれていない行は `TextLayout` を持たないので、旧経路のような
+    /// 「今の bounds との差分でスクロールする」計算がそもそも成立しない）
     #[cfg(feature = "visual-test")]
     async fn scroll_md_to_line(
+        any: AnyWindowHandle,
         window: WindowHandle<TakoApp>,
         cx: &mut AsyncApp,
         pane: PaneId,
         line: usize,
     ) {
+        let block = window
+            .update(cx, |app, _, cx| {
+                let block = app.preview_md_list(pane).and_then(|list| {
+                    let block = app
+                        .preview_md_block_index
+                        .get(&pane)
+                        .and_then(|index| {
+                            index.iter().position(|meta| {
+                                line >= meta.first_line && line < meta.first_line + meta.line_count
+                            })
+                        })
+                        .unwrap_or(0);
+                    list.scroll_to(gpui::ListOffset {
+                        item_ix: block,
+                        offset_in_item: px(0.0),
+                    });
+                    Some(block)
+                });
+                cx.notify();
+                block
+            })
+            .ok()
+            .flatten();
+        if block.is_some() {
+            // #826: 上端の余白（旧経路の +56px）はここで足す。`scroll_by` は
+            // 測り終えたブロックの高さで位置を決めるので、**一度描いてから**でないと
+            // 未測定ぶんを 0 として数えて先頭まで戻ってしまう（narrow で実測）
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, cx| {
+                    if let Some(list) = app.preview_md_list(pane) {
+                        list.scroll_by(px(-56.0));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            return;
+        }
         window
             .update(cx, |app, _, cx| {
                 if let (Some(handle), Some(target_bounds)) = (
@@ -21135,6 +21235,61 @@ mod self_test {
             .await;
     }
 
+    /// プレビュー本文を掃引位置へ動かす（#826）。
+    ///
+    /// 仮想化した md 本文は `list` が器で、**総高さは測り終えたぶんしか分からない**
+    /// （未測定のブロックは含まれない）ため、ピクセル比で割る旧来の掃引では末尾まで
+    /// 届かない。ブロック番号で割ると文書全体を確実に舐められる。
+    #[cfg(feature = "visual-test")]
+    fn sweep_preview_body(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        step: usize,
+        steps: usize,
+    ) {
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(list) = app.preview_md_list(pane) {
+                    let last = list.item_count().saturating_sub(1);
+                    list.scroll_to(gpui::ListOffset {
+                        item_ix: last * step / steps.max(1),
+                        offset_in_item: px(0.0),
+                    });
+                } else if let Some(handle) = app.preview_scroll_handles.get(&pane) {
+                    let max_y = f32::from(handle.max_offset().y);
+                    let y = max_y * step as f32 / steps.max(1) as f32;
+                    handle.set_offset(point(px(0.0), px(-y)));
+                }
+                cx.notify();
+            })
+            .ok();
+    }
+
+    /// いまの掃引位置の目印（#826。list = 先頭ブロック番号 / div = スクロール量 px）。
+    ///
+    /// **描いたあと**に読むこと。`list` は「内容が 1 画面に収まる」ときレイアウトで
+    /// 先頭を 0 へ戻すので、掃引が本当に効いているかはこの値の変化で分かる
+    #[cfg(feature = "visual-test")]
+    fn preview_body_scroll_mark(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> f32 {
+        window
+            .update(cx, |app, _, _| {
+                if let Some(list) = app.preview_md_list(pane) {
+                    list.logical_scroll_top().item_ix as f32
+                } else {
+                    app.preview_scroll_handles
+                        .get(&pane)
+                        .map(|handle| -f32::from(handle.offset().y))
+                        .unwrap_or(0.0)
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
     /// Markdown プレビューの検証に使う状態（行レイアウト・ペイン矩形・テーマ）を取る
     #[cfg(feature = "visual-test")]
     fn md_visual_state(
@@ -21153,10 +21308,8 @@ mod self_test {
                         .get(&pane)
                         .cloned()
                         .unwrap_or_default(),
-                    app.preview_scroll_handles
-                        .get(&pane)
-                        .map(|handle| handle.bounds())
-                        .unwrap_or_default(),
+                    // #826: 器が div スクロールでも仮想リストでも同じ矩形になる経路
+                    app.preview_body_bounds(pane).unwrap_or_default(),
                     app.theme.clone(),
                 )
             })
@@ -22268,9 +22421,9 @@ mod self_test {
                             prev,
                             chat_body,
                             f32::from(chat_body.size.width),
-                            app.preview_scroll_handles
-                                .get(&md_pane)
-                                .map(|h| f32::from(h.bounds().size.width))
+                            // #826: 器の種類によらず本文コンテナの幅（余白込み）
+                            app.preview_body_bounds(md_pane)
+                                .map(|b| f32::from(b.size.width))
                                 .unwrap_or_default(),
                             app.theme.line_height,
                             app.theme.background,
@@ -22460,6 +22613,11 @@ mod self_test {
                     PaneOrigin::Cli,
                 )
                 .expect("visual-test md を dispatch で開ける");
+                // #826: md / PDF / 動画は background ロードのキューへ積まれ、実際に
+                // 回すのは **UI 経路と IPC 受信ループ**。ここは dispatch 直呼びなので
+                // 自分で回さないと `Loading` のまま待ち続ける（main 由来のフレークで、
+                // 「たまたま他の経路が回してくれた」ときだけ通っていた）
+                app.drain_pending_preview_loads(cx);
                 cx.notify();
                 (
                     base,
@@ -22559,7 +22717,7 @@ mod self_test {
 
             // (1) 表のヘッダ行が見える位置。画面外の要素は prepaint されず bounds が
             // 前フレームのまま残るので、検証も採取も「今フレームで見えている行」で行う
-            scroll_md_to_line(window, cx, md_pane, table_line).await;
+            scroll_md_to_line(any, window, cx, md_pane, table_line).await;
             let (frame, scale) =
                 capture_frame(any, cx).unwrap_or_else(|| fail("visual-test md: フレーム取得"));
             if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
@@ -22638,7 +22796,7 @@ mod self_test {
             }
 
             // (2) コードブロックが見える位置
-            scroll_md_to_line(window, cx, md_pane, code_line).await;
+            scroll_md_to_line(any, window, cx, md_pane, code_line).await;
             let (frame, scale) =
                 capture_frame(any, cx).unwrap_or_else(|| fail("visual-test md: フレーム取得"));
             if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
@@ -22707,33 +22865,16 @@ mod self_test {
             }
 
             // (3) 先頭から末尾までスクロールで舐める。どのスクロール位置でも
-            // 行が重ならず横に溢れないことを、実 shaping の bounds で確認する
-            let max_y = window
-                .update(cx, |app, _, _| {
-                    app.preview_scroll_handles
-                        .get(&md_pane)
-                        .map(|handle| f32::from(handle.max_offset().y))
-                        .unwrap_or(0.0)
-                })
-                .unwrap_or(0.0);
-            check(
-                max_y > 0.0,
-                "visual-test md: 本文がスクロールできる長さある",
-            );
+            // 行が重ならず横に溢れないことを、実 shaping の bounds で確認する。
+            // #826: 位置決めは器（div スクロール / 仮想リスト）を吸収した掃引関数へ
             let steps = 8;
             let mut swept = 0usize;
+            let mut sweep_marks: Vec<f32> = Vec::new();
             for step in 0..=steps {
-                let y = -max_y * step as f32 / steps as f32;
-                window
-                    .update(cx, |app, _, cx| {
-                        if let Some(handle) = app.preview_scroll_handles.get(&md_pane) {
-                            handle.set_offset(point(px(0.0), px(y)));
-                        }
-                        cx.notify();
-                    })
-                    .ok();
+                sweep_preview_body(window, cx, md_pane, step, steps);
                 // capture_frame は同期で描き直すので、直後の bounds は今の状態のもの
                 let swept_frame = capture_frame(any, cx);
+                sweep_marks.push(preview_body_scroll_mark(window, cx, md_pane));
                 if let (Ok(dump), Some((frame, _))) =
                     (std::env::var("TAKO_VISUAL_DUMP_DIR"), swept_frame.as_ref())
                 {
@@ -22760,12 +22901,26 @@ mod self_test {
                 );
                 swept += 1;
             }
-            println!("TAKO_VISUAL_PIXEL: md sweep {state} steps={swept} max_y={max_y:.0} ok");
+            // 掃引が実際に効いている（本文が 1 画面に収まっていない）ことの確認。
+            // #826 で「total 高さ」が器依存になったので、位置の目印が動いたかで見る
+            let moved = sweep_marks
+                .last()
+                .zip(sweep_marks.first())
+                .map(|(last, first)| last - first)
+                .unwrap_or(0.0);
+            check(
+                moved > 0.0,
+                "visual-test md: 本文がスクロールできる長さある",
+            );
+            println!("TAKO_VISUAL_PIXEL: md sweep {state} steps={swept} moved={moved:.0} ok");
         }
 
         // 表セルのヒットテストと選択コピー（#656 の受け入れ条件 4）。
         // 2 列目のセル中央をクリックしたとき、左端セルではなくそのセルが選ばれること
         let cell_index = table_line + table_columns + 1;
+        // #826: 掃引で末尾まで動かしたあとなので、表を画面へ戻してから座標を採る
+        // （仮想化した本文は見えている行しか `TextLayout` を持たない）
+        scroll_md_to_line(any, window, cx, md_pane, cell_index).await;
         let (hit, cell_text, two_cells, clipboard) = window
             .update(cx, |app, _, cx| {
                 let center = app
@@ -22847,6 +23002,8 @@ mod self_test {
         // コードブロックのドラッグ選択（1 行目の先頭 → 2 行目の途中）を実ヒットテストで作り、
         // ⌘C 相当のコピーが pbpaste まで届くこと。md のコードブロックは 1 要素 =
         // 複数行の StyledText なので、行内 byte offset が正しく解決される必要がある
+        // （#826: 表を見ている位置からコードブロックへ戻してから座標を採る）
+        scroll_md_to_line(any, window, cx, md_pane, code_line).await;
         let (code_from, code_to, code_selected) = window
             .update(cx, |app, _, cx| {
                 let bounds = app
@@ -22957,7 +23114,7 @@ mod self_test {
                 .flatten();
             let (link_index, link_line, link_url) =
                 link_target.unwrap_or_else(|| fail("visual-test md: 開けるリンクが無い (#680)"));
-            scroll_md_to_line(window, cx, md_pane, link_line).await;
+            scroll_md_to_line(any, window, cx, md_pane, link_line).await;
             let link_bounds = window
                 .update(cx, |app, _, _| {
                     app.preview_text_layouts
@@ -23017,7 +23174,7 @@ mod self_test {
 
             // (2) コードブロックのコピーボタン。コピー成功状態は常時表示なので
             //     idle との差分でボタンが実際に描かれていることを確かめる
-            scroll_md_to_line(window, cx, md_pane, code_line).await;
+            scroll_md_to_line(any, window, cx, md_pane, code_line).await;
             let boxes = window
                 .update(cx, |app, _, _| {
                     let layout = app
@@ -23219,6 +23376,8 @@ mod self_test {
                     },
                     PaneOrigin::Cli,
                 );
+                // #826: dispatch 直呼びなので background ロードは自分で回す
+                app.drain_pending_preview_loads(cx);
                 cx.notify();
             })
             .ok();
@@ -23245,26 +23404,13 @@ mod self_test {
             "visual-test md ストレス: ロードがフリーズしない",
         );
 
-        let stress_max = window
-            .update(cx, |app, _, _| {
-                app.preview_scroll_handles
-                    .get(&md_pane)
-                    .map(|handle| f32::from(handle.max_offset().y))
-                    .unwrap_or(0.0)
-            })
-            .unwrap_or(0.0);
         let steps = 12;
+        let mut stress_marks: Vec<f32> = Vec::new();
         for step in 0..=steps {
-            let y = -stress_max * step as f32 / steps as f32;
-            window
-                .update(cx, |app, _, cx| {
-                    if let Some(handle) = app.preview_scroll_handles.get(&md_pane) {
-                        handle.set_offset(point(px(0.0), px(y)));
-                    }
-                    cx.notify();
-                })
-                .ok();
+            // #826: 巨大表でも器を問わず末尾まで舐める（ピクセル比では届かない）
+            sweep_preview_body(window, cx, md_pane, step, steps);
             let frame = capture_frame(any, cx);
+            stress_marks.push(preview_body_scroll_mark(window, cx, md_pane));
             if let (Ok(dump), Some((frame, _))) =
                 (std::env::var("TAKO_VISUAL_DUMP_DIR"), frame.as_ref())
             {
@@ -23293,7 +23439,16 @@ mod self_test {
                 ),
             );
         }
-        println!("TAKO_VISUAL_PIXEL: md stress sweep steps={steps} max_y={stress_max:.0} ok");
+        let stress_moved = stress_marks
+            .last()
+            .zip(stress_marks.first())
+            .map(|(last, first)| last - first)
+            .unwrap_or(0.0);
+        check(
+            stress_moved > 0.0,
+            "visual-test md ストレス: 掃引が末尾へ届く",
+        );
+        println!("TAKO_VISUAL_PIXEL: md stress sweep steps={steps} moved={stress_moved:.0} ok");
 
         // 後片付け（以降の検証へ影響を残さない）
         window
@@ -24899,7 +25054,7 @@ mod self_test {
             .update(cx, |app, _, _| {
                 app.preview_line_texts.contains_key(&pane) as u8
                     + app.preview_text_layouts.contains_key(&pane) as u8
-                    + app.preview_code_lists.contains_key(&pane) as u8
+                    + app.preview_body_lists.contains_key(&pane) as u8
                     + app.preview_line_starts.contains_key(&pane) as u8
             })
             .unwrap_or(9);
@@ -24947,6 +25102,20 @@ mod self_test {
         let lines = std::fs::read_to_string(&path)
             .map(|s| s.lines().count())
             .unwrap_or(0);
+        // #826: `.md` はそのまま Markdown プレビューとして測る（既定）。
+        // `TAKO_826_MODE=code` を付ければ同じ .md をコード表示でも測れる
+        let markdown = std::env::var("TAKO_826_MODE")
+            .map(|v| v == "markdown" || v == "md")
+            .unwrap_or_else(|_| {
+                std::path::Path::new(&path)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            });
+        let mode = if markdown {
+            tako_control::protocol::PreviewModeWire::Markdown
+        } else {
+            tako_control::protocol::PreviewModeWire::Code
+        };
 
         // 暖機（フォント / グリフ raster / テーマの初回確保を計測から外す）
         for _ in 0..10 {
@@ -24971,26 +25140,31 @@ mod self_test {
                         tako_control::protocol::Request::OpenFile {
                             pane: Some(base),
                             path: path.clone(),
-                            mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                            mode: Some(mode),
                             direction: Some(tako_control::protocol::Direction::Right),
                             focus: Some(false),
                         },
                         PaneOrigin::Cli,
                     )
                     .expect("#821 bench: OpenFile");
+                    // md（と PDF / 動画）は background ロードのキューへ積まれるので、
+                    // 自前で回さないと Loading のまま進まない（#826）
+                    app.drain_pending_preview_loads(cx);
                     cx.notify();
                     PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
                 })
                 .unwrap_or_else(|_| fail("#821 bench: OpenFile dispatch"));
-            // background ロード（構文ハイライト）の完了を待ってから描く
-            let loaded = wait_for_preview_state(window, cx, Duration::from_secs(20), |app| {
-                matches!(
-                    app.previews.get(&pane).map(|s| &s.content),
-                    Some(preview::PreviewContent::Code(l)) if l.len() > 1
-                )
-            })
-            .await;
-            check(loaded.is_some(), "#821 bench: コード本文がロードされる");
+            // background ロード（構文ハイライト / md パース）の完了を待ってから描く
+            let loaded =
+                wait_for_preview_state(window, cx, Duration::from_secs(20), |app| {
+                    match app.previews.get(&pane).map(|s| &s.content) {
+                        Some(preview::PreviewContent::Code(l)) => !markdown && l.len() > 1,
+                        Some(preview::PreviewContent::Markdown(b)) => markdown && b.len() > 1,
+                        _ => false,
+                    }
+                })
+                .await;
+            check(loaded.is_some(), "#821 bench: 本文がロードされる");
             // 最初の 1 フレーム（= 開いてから中身が見えるまで）と、その後の
             // 定常フレームを分けて測る。前者が「開くのが重い」の体感に対応する
             let first_frame = std::time::Instant::now();
@@ -25003,18 +25177,24 @@ mod self_test {
             let steady_ms = steady.elapsed().as_secs_f64() * 1000.0 / (frames.max(2) - 1) as f64;
             cx.background_executor().timer(pause).await;
             let (open_bytes, open_blocks) = live_heap();
-            let shaped = window
+            let (shaped, doc_blocks) = window
                 .update(cx, |app, _, _| {
-                    app.preview_text_layouts
+                    let shaped = app
+                        .preview_text_layouts
                         .get(&pane)
                         .map(|l| l.iter().filter(|x| x.is_some()).count())
-                        .unwrap_or(0)
+                        .unwrap_or(0);
+                    let doc_blocks = match app.previews.get(&pane).map(|s| &s.content) {
+                        Some(preview::PreviewContent::Markdown(b)) => b.len(),
+                        _ => 0,
+                    };
+                    (shaped, doc_blocks)
                 })
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
             println!(
                 "TAKO_821 phase=open round={round} live_mb={:.2} blocks={open_blocks} \
-                 delta_mb={:.2} shaped_lines={shaped} load_ms={:.0} first_frame_ms={first_frame_ms:.1} \
-                 steady_frame_ms={steady_ms:.2}",
+                 delta_mb={:.2} shaped_lines={shaped} md_blocks={doc_blocks} load_ms={:.0} \
+                 first_frame_ms={first_frame_ms:.1} steady_frame_ms={steady_ms:.2}",
                 open_bytes as f64 / 1_048_576.0,
                 (open_bytes as f64 - base0 as f64) / 1_048_576.0,
                 loaded.map(|d| d.as_secs_f64() * 1000.0).unwrap_or(-1.0),
@@ -25046,12 +25226,14 @@ mod self_test {
             let maps = window
                 .update(cx, |app, _, _| {
                     format!(
-                        "previews={} texts={} layouts={} lists={} starts={} bodies={} edits={}",
+                        "previews={} texts={} layouts={} lists={} starts={} md_index={} \
+                         bodies={} edits={}",
                         app.previews.len(),
                         app.preview_line_texts.len(),
                         app.preview_text_layouts.len(),
-                        app.preview_code_lists.len(),
+                        app.preview_body_lists.len(),
                         app.preview_line_starts.len(),
+                        app.preview_md_block_index.len(),
                         app.pane_bodies.len(),
                         app.preview_edits.len(),
                     )
@@ -25527,6 +25709,9 @@ mod self_test {
                         PaneOrigin::Cli,
                     )
                     .expect("visual-test PDF を dispatch で開ける");
+                    // #826: dispatch 直呼びなので background ロード（PDFKit の
+                    // ラスタライズと文字矩形の採取）は自分で回す
+                    app.drain_pending_preview_loads(cx);
                     cx.notify();
                     (
                         base,
@@ -31412,6 +31597,10 @@ mod self_test {
             // 新しい本文の子矩形を確定させ、ジャンプ前は 3 項目目が画面外であることを測る。
             notify_and_draw(any, window, cx);
             wait(cx, 50).await;
+            // 返すのは (対象ブロックの上端, ビューポート上端, ビューポート下端)。
+            // #826: 仮想化した md 本文は `list` が器で、**画面外のブロックは
+            // そもそも矩形を持たない**（描かれていないので当然）。「下にある」ことを
+            // 表すためにビューポート下端より下の値を返し、判定の意味を旧経路と揃える
             let markdown_target_position = |app: &TakoApp| -> Option<(f32, f32, f32)> {
                 let target = app
                     .previews
@@ -31421,7 +31610,17 @@ mod self_test {
                 let tako_core::PreviewOutlineTarget::MarkdownBlock { block } = target else {
                     return None;
                 };
-                let handle = app.preview_scroll_handles.get(&PaneId::from_raw(pane))?;
+                let pane_id = PaneId::from_raw(pane);
+                if let Some(list) = app.preview_md_list(pane_id) {
+                    let viewport = list.viewport_bounds();
+                    let bottom = f32::from(viewport.bottom());
+                    let top = list
+                        .bounds_for_item(block)
+                        .map(|b| f32::from(b.top()))
+                        .unwrap_or(bottom + 1.0);
+                    return Some((top, f32::from(viewport.top()), bottom));
+                }
+                let handle = app.preview_scroll_handles.get(&pane_id)?;
                 let target_bounds = handle.bounds_for_item(block)?;
                 Some((
                     f32::from(target_bounds.top() + handle.offset().y),
@@ -32048,9 +32247,9 @@ mod self_test {
                     // 「スクロールが起きたこと」はリストの論理位置で、「座標が
                     // 更新されたこと」は描かれている行の往復で見る
                     let top = app
-                        .preview_code_lists
+                        .preview_body_lists
                         .get(&pane)
-                        .map(|(list, _)| list.logical_scroll_top())
+                        .map(|(list, _, _)| list.logical_scroll_top())
                         .expect("コードプレビューの仮想リスト状態がある");
                     let scrolled = top.item_ix > 0 || f32::from(top.offset_in_item) > 0.0;
                     println!(
@@ -44625,6 +44824,314 @@ mod self_test {
                 }
             }
 
+            // 項目 114（#826）: Markdown プレビューも**可視ブロックだけ**を組む。
+            // 全ブロックの element を毎フレーム作ると 1 フレームぶんの測定レイアウト
+            // ノードが taffy の `node_context_data` に居座り、閉じても戻らないヒープが
+            // ブロック数に比例して積み上がる（機序は #821 と同じ）。
+            //
+            // 仮想化で壊れやすいのは「文書全体の座標系」なので、そこも一緒に見る:
+            // 行テキストは全ブロックぶん残る（⌘A / コピーの正）・目次ジャンプ（#232）は
+            // **一度も描かれていないブロック**へ届く・リンク索引（#680）は render と一致・
+            // 画面外のコードブロックもコピーできる。
+            // 旧挙動へ戻す（`TAKO_826_NO_MD_VIRTUAL_LIST=1`）と「整形した行数 = 全行」に
+            // なるので、この項目の 2 つ目の判定が FAILED になる
+            if crate::preview_render::preview_md_virtual_list_disabled() {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 114（TAKO_826_NO_MD_VIRTUAL_LIST で仮想化を無効化）"
+                );
+            } else {
+                let any826 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window826 = any826.downcast::<TakoApp>().unwrap_or(window);
+                let dir826 = std::env::temp_dir().join(format!("tako-826-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir826);
+                let src826 = dir826.join("big.md");
+                // 1 画面にはとても入らない量。見出し（= 目次項目）・段落・リンク・
+                // コードブロックを混ぜて、行数がブロック数と一致しない形にする
+                let mut doc = String::from("# 先頭\n\n");
+                for i in 0..300 {
+                    doc.push_str(&format!("## 節 {i}\n\n"));
+                    doc.push_str(&format!(
+                        "段落 {i} と [リンク](https://example.com/{i}) を含む本文。\n\n"
+                    ));
+                }
+                doc.push_str("```sh\necho 末尾のコードブロック\n```\n\n");
+                // 表は 1 ブロック = 複数の選択行（#656）。行番号とブロック番号が
+                // 一対一でないことを索引が扱えているかをここで見る
+                doc.push_str("| 列A | 列B |\n|---|---|\n| 値1 | 値2 |\n\n");
+                doc.push_str("## 最後の見出し\n\n末尾の段落 END_MARKER_826\n");
+                let _ = std::fs::write(&src826, &doc);
+                let opened826 = window826
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let mut bases = vec![app.focused_pane()];
+                        bases.extend(app.terminals.keys().copied());
+                        for base in bases {
+                            let res = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OpenFile {
+                                    pane: Some(base.as_u64()),
+                                    path: src826.display().to_string(),
+                                    mode: Some(
+                                        tako_control::protocol::PreviewModeWire::Markdown,
+                                    ),
+                                    direction: Some(tako_control::protocol::Direction::Right),
+                                    focus: Some(false),
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            if let Ok(v) = res {
+                                // md は background ロードのキューへ積まれる（UI 経路と
+                                // IPC 受信ループが drain する）。直接 dispatch なので自分で回す
+                                app.drain_pending_preview_loads(cx);
+                                cx.notify();
+                                if let Some(pane) = v["pane"].as_u64() {
+                                    return Some(PaneId::from_raw(pane));
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .ok()
+                    .flatten();
+                match opened826 {
+                    None => fail("114: Markdown プレビューを開けない (#826)"),
+                    Some(pane) => {
+                        let drawn = wait_for_preview_drawn(
+                            any826,
+                            window826,
+                            cx,
+                            Duration::from_secs(20),
+                            |app: &TakoApp| {
+                                matches!(
+                                    app.previews.get(&pane).map(|s| &s.content),
+                                    Some(preview::PreviewContent::Markdown(b)) if b.len() > 100
+                                ) && app
+                                    .preview_text_layouts
+                                    .get(&pane)
+                                    .is_some_and(|l| l.iter().any(Option::is_some))
+                            },
+                        )
+                        .await;
+                        check(drawn.is_some(), "114: Markdown 本文が描かれる (#826)");
+
+                        let probe = window826
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let blocks = match app.previews.get(&pane).map(|s| &s.content) {
+                                    Some(preview::PreviewContent::Markdown(b)) => b.len(),
+                                    _ => 0,
+                                };
+                                let lines = app
+                                    .preview_line_texts
+                                    .get(&pane)
+                                    .map(Vec::len)
+                                    .unwrap_or(0);
+                                let shaped = app
+                                    .preview_text_layouts
+                                    .get(&pane)
+                                    .map(|l| l.iter().filter(|x| x.is_some()).count())
+                                    .unwrap_or(0);
+                                let index = app
+                                    .preview_md_block_index
+                                    .get(&pane)
+                                    .map(Vec::len)
+                                    .unwrap_or(0);
+                                let hits = app
+                                    .preview_md_link_hits
+                                    .get(&pane)
+                                    .map(Vec::len)
+                                    .unwrap_or(0);
+                                let listed = app.preview_md_links(pane).map(|l| l.len()).unwrap_or(0);
+                                (blocks, lines, shaped, index, hits, listed)
+                            })
+                            .unwrap_or((0, 0, 0, 0, 0, 0));
+                        let (blocks, lines, shaped, index, hits, listed) = probe;
+                        println!(
+                            "TAKO_SELF_TEST_826: blocks={blocks} lines={lines} shaped={shaped} \
+                             index={index} link_hits={hits} link_list={listed}"
+                        );
+                        // 行テキストは全ブロックぶん残る（⌘A / コピー / ヒットテストの正）
+                        check(
+                            lines > blocks && index == blocks && blocks > 500,
+                            "114: 行テキストとブロック索引は文書全体ぶん持つ (#826)",
+                        );
+                        // 整形したのは可視ぶんだけ（旧挙動なら shaped == lines になる）
+                        check(
+                            shaped > 0 && shaped * 4 < lines,
+                            "114: 整形するのは可視ブロックだけ (#826)",
+                        );
+                        // リンク索引は render と CLI / MCP 一覧で同じ並び（#680）
+                        check(
+                            hits == listed && hits >= 300,
+                            "114: リンク索引が render と一覧で一致する (#826/#680)",
+                        );
+
+                        // 目次ジャンプ（#232）: **一度も描かれていない**ブロックへ届く
+                        // 文書の**真ん中あたり**の見出しを狙う。末尾の見出しだと
+                        // 「残りが 1 画面に満たないぶんだけ手前へ寄せる」GPUI の
+                        // 仕様が働いて先頭ブロックが一致しない（スクロール位置としては
+                        // 正しいが、この項目で見たいのは「指したブロックへ飛ぶ」こと）
+                        let last_item = window826
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.previews
+                                    .get(&pane)
+                                    .map(|s| s.outline.items.len().div_ceil(2).max(1))
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
+                        let target_block = window826
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                match app.previews.get(&pane)?.outline.target(last_item).ok()? {
+                                    tako_core::PreviewOutlineTarget::MarkdownBlock { block } => {
+                                        Some(block)
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .ok()
+                            .flatten();
+                        match target_block {
+                            None => fail("114: 目次の対象項目が Markdown ブロックでない (#826)"),
+                            Some(block) => {
+                                let first_line = window826
+                                    .update(cx, |app: &mut TakoApp, _, _| {
+                                        app.preview_md_block_index
+                                            .get(&pane)
+                                            .and_then(|i| i.get(block))
+                                            .map(|m| m.first_line)
+                                    })
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(0);
+                                let shaped_before = window826
+                                    .update(cx, |app: &mut TakoApp, _, _| {
+                                        app.preview_text_layouts
+                                            .get(&pane)
+                                            .and_then(|l| l.get(first_line))
+                                            .map(Option::is_some)
+                                    })
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(true);
+                                check(
+                                    !shaped_before,
+                                    "114: ジャンプ先は最初は描かれていない (#826/#232)",
+                                );
+                                let jumped = window826
+                                    .update(cx, |app: &mut TakoApp, _, cx| {
+                                        let r = tako_control::dispatch(
+                                            app,
+                                            tako_control::protocol::Request::PreviewOutline {
+                                                pane: Some(pane.as_u64()),
+                                                item: Some(last_item),
+                                            },
+                                            PaneOrigin::Mcp,
+                                        );
+                                        cx.notify();
+                                        r.is_ok()
+                                    })
+                                    .unwrap_or(false);
+                                notify_and_draw(any826, window826, cx);
+                                wait(cx, 100).await;
+                                notify_and_draw(any826, window826, cx);
+                                let (top_ix, shaped_after) = window826
+                                    .update(cx, |app: &mut TakoApp, _, _| {
+                                        (
+                                            app.preview_md_list(pane)
+                                                .map(|l| l.logical_scroll_top().item_ix),
+                                            app.preview_text_layouts
+                                                .get(&pane)
+                                                .and_then(|l| l.get(first_line))
+                                                .map(Option::is_some)
+                                                .unwrap_or(false),
+                                        )
+                                    })
+                                    .unwrap_or((None, false));
+                                println!(
+                                    "TAKO_SELF_TEST_826: jump item={last_item} block={block} \
+                                     first_line={first_line} top_ix={top_ix:?} \
+                                     shaped_after={shaped_after}"
+                                );
+                                check(
+                                    jumped && top_ix == Some(block) && shaped_after,
+                                    "114: 目次ジャンプが未描画ブロックへ届いて描かれる (#826/#232)",
+                                );
+                            }
+                        }
+
+                        // 画面外のコードブロックもコピーできる（#680。要素ではなく
+                        // ブロック列から採るので、描かれているかに依存しない）
+                        let copied = window826
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let r = tako_control::dispatch(
+                                    app,
+                                    tako_control::protocol::Request::PreviewCopyCode {
+                                        pane: Some(pane.as_u64()),
+                                        index: Some(0),
+                                    },
+                                    PaneOrigin::Cli,
+                                );
+                                cx.notify();
+                                r.ok().and_then(|v| {
+                                    app.pending_clipboard.last().cloned().map(|t| (v, t))
+                                })
+                            })
+                            .ok()
+                            .flatten();
+                        check(
+                            copied
+                                .as_ref()
+                                .is_some_and(|(_, text)| text.contains("末尾のコードブロック")),
+                            "114: 画面外のコードブロックもコピーできる (#826/#680)",
+                        );
+
+                        // ⌘A → ⌘C の正は行テキスト。描かれていない末尾も入る
+                        let all_text = window826
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let texts = app.preview_line_texts.get(&pane)?;
+                                let last = texts.len().checked_sub(1)?;
+                                selection_text(
+                                    texts,
+                                    &PreviewSelection {
+                                        anchor: (0, 0),
+                                        head: (last, texts[last].len()),
+                                    },
+                                )
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        check(
+                            all_text.contains("END_MARKER_826") && all_text.contains("先頭"),
+                            "114: 全選択のコピーに未描画の末尾まで入る (#826)",
+                        );
+
+                        let _ = window826.update(cx, |app: &mut TakoApp, _, cx| {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            cx.notify();
+                        });
+                        // 閉じたらブロック索引も落ちている（後始末の集約経路。#821 の同型）
+                        let leftovers = window826
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.preview_md_block_index.contains_key(&pane) as u8
+                                    + app.preview_body_lists.contains_key(&pane) as u8
+                                    + app.preview_text_layouts.contains_key(&pane) as u8
+                                    + app.preview_line_texts.contains_key(&pane) as u8
+                            })
+                            .unwrap_or(9);
+                        check(leftovers == 0, "114: 閉じたら md の座標系も落ちる (#826)");
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&dir826);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -46124,11 +46631,15 @@ mod preview_cleanup_watchdog {
         &rest[..end]
     }
 
-    /// プレビュー由来のマップを直接 remove している行（後始末の独自列挙）
+    /// プレビュー由来のマップを直接 remove している行（後始末の独自列挙）。
+    ///
+    /// #826: 束縛名は経路ごとに違う（ペイン close は `&pane`、タブ close は
+    /// ループ変数の `&id`）。`&pane` だけを見ていた最初の版は `remove_tab_with` の
+    /// 独自列挙を見逃していたので、引数名に依存しない形にした
     fn direct_preview_removes(body: &str) -> Vec<String> {
         body.lines()
             .map(str::trim)
-            .filter(|line| line.starts_with("self.preview") && line.contains(".remove(&pane"))
+            .filter(|line| line.starts_with("self.preview") && line.contains(".remove(&"))
             .map(str::to_string)
             .collect()
     }
@@ -46136,7 +46647,7 @@ mod preview_cleanup_watchdog {
     #[test]
     fn close_経路はプレビュー状態の後始末を集約関数に任せている() {
         let src = include_str!("main.rs");
-        for name in ["remove_pane_with", "detach_session"] {
+        for name in ["remove_pane_with", "detach_session", "remove_tab_with"] {
             let body = body_of(src, name);
             assert!(
                 body.contains("drop_preview_pane_state("),
@@ -46162,5 +46673,12 @@ mod preview_cleanup_watchdog {
         let good =
             "    fn f(&mut self) {\n        self.drop_preview_pane_state(pane);\n    }\n    fn g(";
         assert!(direct_preview_removes(body_of(good, "f")).is_empty());
+        // #826: ループ変数（タブ close は `&id`）でも見逃さない
+        let bad_loop =
+            "    fn f(&mut self) {\n        self.preview_body_lists.remove(&id);\n    }\n    fn g(";
+        assert_eq!(
+            direct_preview_removes(body_of(bad_loop, "f")),
+            vec!["self.preview_body_lists.remove(&id);".to_string()]
+        );
     }
 }
