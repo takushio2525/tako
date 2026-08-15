@@ -3,49 +3,50 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-15、#826 = Markdown プレビューの仮想化）
+## 現在の対象（2026-08-15、#828 = window close 後の OS ウィンドウ残留）
 
-- ブランチ `fix/826-md-virtual`（worktree `~/dev/tako-wt-826`、base = `9744171`）
-- #821（コードプレビューの仮想化）の続き。#814 の削減シリーズの一部
-- 対象は**プレビューの md 本文だけ**。チャット（#725）とアップデート詳細（#690）は
-  同じ `md_view::render_block` を使うが仮想化しない（根拠は architecture.md）
+- ブランチ `fix/828-window-close`（worktree `~/dev/tako-wt-828`、base = `9484e15`）
+- #819 の調査から分離した子 Issue。#814 の削減シリーズの一部
 
-## やったこと
+## わかったこと（Issue の目星は反証された）
 
-md 本文を `gpui::list` にして**可視ブロックだけ** element を作る（1 item = 1 ブロック =
-#232 の目次ジャンプの対応をそのまま保つ）。器はコードと共用の 1 本
-（`preview_body_lists` + `PreviewBodyKind`）にして、モード切替で「行番号とブロック番号を
-取り違える」事故を構造で防いだ。行テキスト・行頭オフセット・ブロック索引は
-**文書全体ぶん**作るので、⌘A / コピー / ヒットテスト / リンク索引は描画状態に依存しない。
+`sync_viewports` の `let _ = handle.update(...)` は**毎回 `Ok`** を返していて、gpui の
+ウィンドウ登録も毎回減っている（計装実測）。AppKit 側も `MacWindow::drop` が走り
+（`delegate=nil`）ウィンドウは order out されている（`isVisible=false`）。
+残るのは **NSWindow オブジェクトが解放されない**ことだけで、`retainCount` は 24 → 8 の
+まま減衰せず、CAMetalLayer の drawable（既定窓 9.1MB）が返らない。
 
-## 効果（隔離・同一バイナリ A/B・1,819 ブロック）
+**tako の欠陥ではない**: tako のコードを 1 行も含まない素の gpui アプリで同じ状態になり、
+**赤ボタン相当（NSWindow へ直接 close）でも完全に同じ**。閉じ方を変えても結果が同じなので
+tako 側に「正しく解放される閉じ方」は無い。`leaks` も到達不能リークを報告しない
+（= AppKit が意図的に保持している）。
 
-| 段階 | before | after |
-|---|---|---|
-| 開いた | 90.23 MB | **24.29 MB** |
-| **閉じた（1 往復）** | 78.77（残留 **67.10**） | **13.54（残留 1.86）** |
-| 閉じた（3 往復） | 93.05（残留 81.38） | 13.74（残留 2.05） |
-| 整形した行数 | 3,408 | **7** |
-| 定常フレーム | 0.63 ms | **0.11 ms** |
-| peak RSS | 192 MB | **115 MB** |
+## やったこと（挙動は変えていない）
 
-## 同梱で直したもの
+close 失敗を握り潰していた `let _ =` を、発生源つきの persist.log 記録へ。
+`sync_viewports(origin, cx)` の `origin` は `render` / `dispatch` / `selftest`。
+**再試行はしない**ので挙動は従来どおり（#169 以来の fail-loud 規約に合わせただけ）。
+対応表（`drop_viewport`）を先に落とす設計なので、失敗すると記録も無く孤児化する
+（今回それを判定するのに計装ビルドを 1 本起こす必要があった）のを塞ぐのが目的。
 
-- `remove_tab_with`（タブごと閉じる）が独自にプレビュー状態を列挙していた
-  → `drop_preview_pane_state` へ集約。番犬の走査が `&pane` 決め打ちで `&id` の
-  ループを見逃していたのも直した
-- visual-test の md / md ストレス / PDF が `drain_pending_preview_loads` を呼ばず
-  「たまたま通っていた」（main のバイナリでも同じ場所で落ちることを実測）
+## この環境で検証できなかったこと
+
+`AppleClamshellState = Yes` / `Display Asleep: Yes`（外部ディスプレイ無し）のままで
+蓋を開けられず、**「閉じた窓が画面から消える」の実ピクセル確認は不可能**
+（`screencapture` は成功するが画像は全面黒）。CGWindowList が `onscreen=true` を
+返し続けるのと AppKit の `isVisible=false` の食い違いが画面 OFF 由来かは未判定。
 
 ## 次の一手
 
-- PR（`Closes #826` / `Refs #814 #821`）→ macOS CI 緑 → squash merge → install
-- チャットビュー（#725）の md も同じ機序を持ちうる。器が別物なので別 Issue
+- 蓋を開けて `~/dev/tako-evidence/828/repro828.sh` を再実行（5 分）。drawable が解放
+  されるなら #828 は環境由来としてクローズ
+- 残るなら上流（zed）へ報告するかは **master 判断**（`win828probe.rs` が最小再現）
+- tako 側の緩和は「GPUI ウィンドウを close せず再利用」しか効かないが、
+  `cx.windows()` が空になることを Dock 復帰の起点にしている **#381 と衝突**する
 
 ## 現フェーズで Read すべき設計書
 
-- `.agent/architecture.md`「Markdown プレビューの仮想化（#826）」= 器の一本化・
-  座標系の正・踏み抜きどころ（**包む器は flex 列** / **控えは paint 時** /
-  **目次ジャンプは `ListState::scroll_to`** / **`scroll_by` は描いてから**）
-- その手前の「コードプレビューの仮想化（#821）」= 残留の機序（taffy の
-  `node_context_data` が `clear()` で消えない）と計測ハーネスの落とし穴
+- `.agent/architecture.md`「複数ウィンドウ（ビューポート方式）」= #339 / #380 / #381 の
+  不変条件（同一 entity 共有・タブ排他・最後の 1 枚は entity を殺さない）
+- 証拠一式は `~/dev/tako-evidence/828/`（再現ハーネス `repro828.sh` / 素の gpui プローブ
+  `win828probe.rs` / CGWindowList 計測 `winlist.swift` / 計装パッチ / 全ログ）

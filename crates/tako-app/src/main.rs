@@ -731,6 +731,26 @@ fn persist_diag(msg: &str) {
     tako_control::diag::persist_log(&msg);
 }
 
+/// GPUI ウィンドウの close に失敗したときの診断行（#828）。
+///
+/// `sync_viewports` は対応表を先に落としてから close を投げるので、ここで失敗すると
+/// **どこにも記録が残らないまま** OS ウィンドウだけが残る。書式を 1 か所に置いて
+/// 書き手とテストで共有する（#770 のセッション kill 監査行と同じ「発生源つき」の形）
+fn viewport_close_failure_log(
+    origin: &str,
+    logical: tako_core::WindowId,
+    window: gpui::WindowId,
+    err: &str,
+) -> String {
+    format!(
+        "ウィンドウ close 失敗: logical={} gpui={:?} 理由={}（発生源 {}）",
+        logical.as_u64(),
+        window,
+        err,
+        origin
+    )
+}
+
 /// 復元強奪ガード（#177）: これから復元 attach しようとする tmux セッションに
 /// **生きた別 tako-app 配下のクライアント**が attach 中なら、そのセッション群は
 /// 別インスタンスが表示中なのでセカンダリ降格の理由を返す。
@@ -3572,7 +3592,7 @@ impl TakoApp {
                     // ウィンドウ操作（Issue #339）の GPUI ウィンドウ生成・close を即座に
                     // 反映する。render 冒頭の同期はウィンドウが隠れているとフレームが
                     // 来ず走らないため、CLI / MCP 経路はここで消費する
-                    app.sync_viewports(cx);
+                    app.sync_viewports("dispatch", cx);
                     if let Some(tab) = app.pending_settings_open.take() {
                         app.open_settings_window_impl(tab, cx);
                     }
@@ -8390,8 +8410,11 @@ impl TakoApp {
     /// 論理ウィンドウと GPUI ウィンドウの突き合わせ（Issue #339）。render 冒頭から
     /// 毎フレーム呼ばれる冪等な同期で、どの経路（close_tab / タブ移動 / dispatch）で
     /// 論理ウィンドウが消えても GPUI ウィンドウを閉じ漏らさない。
-    /// dispatch 経由で作られた GPUI 未生成の論理ウィンドウはここで開く
-    fn sync_viewports(&mut self, cx: &mut Context<Self>) {
+    /// dispatch 経由で作られた GPUI 未生成の論理ウィンドウはここで開く。
+    ///
+    /// `origin` は close の発生源（`render` / `dispatch` / `selftest`）。失敗したときの
+    /// 診断にだけ使う（#828）
+    fn sync_viewports(&mut self, origin: &'static str, cx: &mut Context<Self>) {
         let live: std::collections::HashSet<tako_core::WindowId> =
             self.workspace.windows().iter().map(|w| w.id()).collect();
         let dead: Vec<(tako_core::WindowId, AnyWindowHandle)> = self
@@ -8403,7 +8426,18 @@ impl TakoApp {
         for (lid, handle) in dead {
             self.drop_viewport(lid, handle);
             cx.defer(move |cx| {
-                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                // #828: ここを握り潰すと、対応表（drop_viewport）は先に消えているので
+                // GPUI ウィンドウが**記録も無いまま**孤児化する。実測では常に Ok だが、
+                // 失敗したら発生源つきで残す（#169 以来の fail-loud 規約）。
+                // 再試行はしない = 挙動は従来どおり
+                if let Err(e) = handle.update(cx, |_, window, _| window.remove_window()) {
+                    persist_diag(&viewport_close_failure_log(
+                        origin,
+                        lid,
+                        handle.window_id(),
+                        &e.to_string(),
+                    ));
+                }
             });
         }
         for lid in std::mem::take(&mut self.pending_viewport_opens) {
@@ -18134,7 +18168,7 @@ impl Render for TakoApp {
         // （render 毎フレームの呼び出しを廃止してパフォーマンス改善）
 
         // 論理ウィンドウ ⇔ GPUI ウィンドウの同期（Issue #339。空ウィンドウの close 等）
-        self.sync_viewports(cx);
+        self.sync_viewports("render", cx);
         if let Some(tab) = self.pending_settings_open.take() {
             self.open_settings_window_impl(tab, cx);
         }
@@ -36195,7 +36229,7 @@ mod self_test {
                     for (pane, options) in std::mem::take(&mut app.pending_attach) {
                         let _ = app.spawn_session(pane, options, cx);
                     }
-                    app.sync_viewports(cx);
+                    app.sync_viewports("selftest", cx);
                     r.is_ok()
                 })
                 .unwrap_or(false);
@@ -36239,7 +36273,7 @@ mod self_test {
                         },
                         tako_core::PaneOrigin::Cli,
                     );
-                    app.sync_viewports(cx);
+                    app.sync_viewports("selftest", cx);
                     r.is_ok()
                 })
                 .unwrap_or(false);
@@ -36354,7 +36388,7 @@ mod self_test {
                                 // W1 が空で除去された場合は base_tab の所属ウィンドウが正
                                 app.workspace.window_of_tab(base_tab).is_some()
                             };
-                            app.sync_viewports(cx);
+                            app.sync_viewports("selftest", cx);
                             stolen && exclusive && restored
                         })
                     })
@@ -46716,5 +46750,76 @@ mod preview_cleanup_watchdog {
             direct_preview_removes(body_of(bad_loop, "f")),
             vec!["self.preview_body_lists.remove(&id);".to_string()]
         );
+    }
+}
+
+/// GPUI ウィンドウ close の失敗を握り潰していないことの番犬（#828）。
+///
+/// `sync_viewports` は `drop_viewport` で対応表を先に落としてから close を投げるので、
+/// ここを `let _ =` にすると失敗が**どこにも残らない**（#828 の調査では、この
+/// 握り潰しが原因かどうかを判定するのに計装ビルドを 1 本起こす必要があった）。
+#[cfg(test)]
+mod viewport_close_diag {
+    use super::viewport_close_failure_log;
+
+    /// `fn <name>` から次のトップレベル `    fn ` までを切り出す
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} が見つからない"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// close の戻り値を捨てている行
+    fn swallowed_close(body: &str) -> Vec<String> {
+        body.lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("let _ =") && line.contains("remove_window"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn sync_viewports_は_close_失敗を記録する() {
+        let src = include_str!("main.rs");
+        let body = body_of(src, "sync_viewports");
+        let strays = swallowed_close(body);
+        assert!(
+            strays.is_empty(),
+            "sync_viewports が close の失敗を握り潰している: {strays:?}（#828）"
+        );
+        assert!(
+            body.contains("viewport_close_failure_log("),
+            "sync_viewports が close 失敗を persist.log へ残していない（#828）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬は握り潰しを見逃さない() {
+        let bad = "    fn f(&mut self) {\n        \
+                   let _ = handle.update(cx, |_, window, _| window.remove_window());\n    }\n    fn g(";
+        assert_eq!(swallowed_close(body_of(bad, "f")).len(), 1);
+        let good = "    fn f(&mut self) {\n        \
+                    if let Err(e) = handle.update(cx, |_, window, _| window.remove_window()) {}\n    }\n    fn g(";
+        assert!(swallowed_close(body_of(good, "f")).is_empty());
+    }
+
+    #[test]
+    fn 診断行は発生源と対象を含む() {
+        let line = viewport_close_failure_log(
+            "dispatch",
+            tako_core::WindowId::from_raw(7),
+            gpui::WindowId::default(),
+            "window not found",
+        );
+        assert!(line.contains("logical=7"), "{line}");
+        assert!(line.contains("window not found"), "{line}");
+        assert!(line.contains("（発生源 dispatch）"), "{line}");
     }
 }

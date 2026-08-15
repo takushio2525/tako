@@ -2102,3 +2102,13 @@
   （直す前は外しても通っていた）。`scroll_mark=8.0000->8.0000`（ブロック数 101 → 107）
 - 検証: fmt / clippy(-D warnings) / test --workspace 全緑 + 隔離セルフテスト
   `TAKO_APP_SELF_TEST_OK`
+
+## 2026-08-15（#828: window close の残留は gpui / AppKit 層。診断だけ足した）
+- Issue の目星（`sync_viewports` の Err 握り潰し）を計装で反証: `handle.update` は毎回 `Ok`、
+  `MacWindow::drop` も走り（`delegate=nil` / `isVisible=false`）、残るのは NSWindow が
+  解放されないこと（`retainCount` 24→8 で不変）だけ。**素の gpui でも赤ボタン相当の
+  AppKit 起点 close でも同じ**で、`leaks` も到達不能リークを報告しない
+- 実装は最小のハードニングのみ: close 失敗を発生源つき（`render` / `dispatch` / `selftest`）で
+  persist.log へ記録。再試行はせず**挙動不変**。番犬テスト 3 本（握り潰しへ戻すと FAILED を実測）
+- 蓋を開けた状態での再計測は未実施（この機は clamshell 閉・画面 OFF で全面黒しか撮れない）。
+  証拠と再現ハーネスは `~/dev/tako-evidence/828/`
