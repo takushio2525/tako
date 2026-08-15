@@ -183,6 +183,8 @@ pub struct TerminalSession {
     wheel_carry: std::sync::Mutex<f32>,
     /// 転送系ホイールのレート制限状態（トークンバケット。#167）
     wheel_rate: std::sync::Mutex<WheelRateState>,
+    /// 未処理の `Wakeup` があるか（#816。詳細は `pty_loop::PtyLoop::wakeup_pending`）
+    wakeup_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// ホイール転送レート制限（#167）の状態。tokens = 残イベント数、last = 最終補充時刻
@@ -272,7 +274,9 @@ impl TerminalSession {
 
         // PTY IO ループは tako 側に持つ（`pty_loop`）。upstream の `EventLoop` は
         // reader スレッドのスタックへ 1 MiB を確保し、ペインごとに常駐していた（#817）
-        let event_loop = PtyLoop::new(term.clone(), proxy, pty).map_err(SessionError::EventLoop)?;
+        let wakeup_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let event_loop = PtyLoop::new(term.clone(), proxy, pty, wakeup_pending.clone())
+            .map_err(SessionError::EventLoop)?;
         let notifier = Notifier(event_loop.channel());
         let _io_thread = event_loop.spawn();
 
@@ -294,6 +298,7 @@ impl TerminalSession {
                     tokens: WHEEL_FORWARD_BURST,
                     last: std::time::Instant::now(),
                 }),
+                wakeup_pending,
             },
             rx,
         ))
@@ -525,8 +530,22 @@ impl TerminalSession {
         for offset in (skip_newest + 1..=skip_newest + take).rev() {
             let line = Line(-(offset as i32));
             let row = &grid[line];
-            let mut text = String::with_capacity(cols);
-            for col in 0..cols {
+            // #816: 行の大半は末尾の未使用セル（空白）で、`trim_end` で必ず落ちる。
+            // 先に後ろから境界を探し、そこまでしか組み立てない（`String` の確保も
+            // 1 本で済ませる）。取り出す文字列は従来と 1 バイトも変わらない
+            let mut end = cols;
+            while end > 0 {
+                let cell = &row[Column(end - 1)];
+                let spacer = cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+                if !spacer && cell.c != ' ' {
+                    break;
+                }
+                end -= 1;
+            }
+            let mut text = String::with_capacity(end);
+            for col in 0..end {
                 let cell = &row[Column(col)];
                 if cell
                     .flags
@@ -536,7 +555,9 @@ impl TerminalSession {
                 }
                 text.push(cell.c);
             }
-            out.push(text.trim_end().to_string());
+            // 空白以外の末尾空白類（タブ等）は従来どおり `trim_end` に任せる
+            text.truncate(text.trim_end().len());
+            out.push(text);
         }
         out
     }
@@ -717,6 +738,13 @@ impl TerminalSession {
     pub fn agent_metrics(&self) -> Option<AgentMetrics> {
         let lines = self.visible_lines();
         parse_agent_metrics(&lines)
+    }
+
+    /// 未処理 `Wakeup` フラグ（#816）。受け手はグリッドを読む直前にこれを倒す
+    /// （`consume_wakeup`）。倒すまで PTY 側は次の `Wakeup` を送らないので、
+    /// 1 read ごとにイベント配送タスクを起こすコストが消える
+    pub fn wakeup_gate(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.wakeup_pending.clone()
     }
 
     /// Claude TUI の入力行（❯）のテキストがゴースト（自動提案）か手動入力かを分析する。
@@ -1272,6 +1300,115 @@ fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #816 の `Wakeup` ゲート: 未処理の `Wakeup` が残っている間は PTY 側が次を送らず、
+    /// 受け手が倒すと再び送られる。これが崩れると「1 read ごとに配送タスクを起こす」
+    /// 旧挙動（取り込み経路の 78%）に戻るか、逆に画面が止まる
+    #[cfg(unix)]
+    #[test]
+    fn wakeupゲートは倒すまで次を送らない() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        // 20ms ごとに 1 行ずつ出す（1 行 = 1 read = 旧挙動なら 1 Wakeup）
+        let script = "i=0; while [ $i -lt 60 ]; do printf 'g%d\\n' $i; sleep 0.02; \
+                      i=$((i+1)); done";
+        let (session, mut rx) = TerminalSession::spawn(
+            40,
+            8,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        let gate = session.wakeup_gate();
+        let is_wakeup = |e: &SessionEvent| matches!(e, SessionEvent::Term(TermEvent::Wakeup));
+
+        // 1 件目の Wakeup を待つ（= ゲートが立つ）
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut first = false;
+        while Instant::now() < deadline && !first {
+            match rx.try_recv() {
+                Ok(ev) => first = is_wakeup(&ev),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(first, "最初の Wakeup が来ない");
+        assert!(gate.load(Ordering::Acquire), "ゲートが立っていない");
+
+        // 倒さずに待つ: 出力は続いているのに Wakeup は 1 件も増えない
+        std::thread::sleep(Duration::from_millis(400));
+        let mut extra = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if is_wakeup(&ev) {
+                extra += 1;
+            }
+        }
+        assert_eq!(extra, 0, "倒す前に Wakeup が {extra} 件届いた");
+
+        // 倒すと再び届く（= 画面が止まらない）
+        gate.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut resumed = false;
+        while Instant::now() < deadline && !resumed {
+            match rx.try_recv() {
+                Ok(ev) => resumed = is_wakeup(&ev),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(resumed, "ゲートを倒しても Wakeup が再開しない");
+    }
+
+    /// #816 で `history_plain_lines` は「後ろから境界を探して 1 本だけ組み立てる」形に
+    /// なった。取り出す文字列は従来と 1 バイトも変わらないこと（末尾空白は落ちる /
+    /// 全角のスペーサで欠けない / 行内の空白は残る）を実 PTY で固定する
+    #[cfg(unix)]
+    #[test]
+    fn 履歴の平文行は末尾空白を落とし全角も欠けない() {
+        use std::time::{Duration, Instant};
+
+        // 20 桁 4 行に 12 行流すと、先頭の検査対象は履歴へ押し出される
+        let script = "printf 'ab   \\nあい\\na b\\n'; \
+                      i=0; while [ $i -lt 9 ]; do printf 'pad%d\\n' $i; i=$((i+1)); done";
+        let (session, _rx) = TerminalSession::spawn(
+            20,
+            4,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while session.history_size() < 8 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let lines = session.history_plain_lines(0, 32);
+        assert!(
+            lines.iter().any(|l| l == "ab"),
+            "末尾空白が落ちていない: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "あい"),
+            "全角行が欠けた: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "a b"),
+            "行内の空白が消えた: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.ends_with(' ')),
+            "末尾空白が残っている: {lines:?}"
+        );
+    }
 
     #[test]
     fn コマンド実行状態の遷移とエラー保持() {

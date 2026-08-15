@@ -38,6 +38,7 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -272,6 +273,16 @@ pub struct PtyLoop<T: EventedPty, U: EventListener> {
     tx: Sender<Msg>,
     terminal: Arc<FairMutex<Term<U>>>,
     event_proxy: U,
+    /// 「まだ処理されていない `Wakeup` が 1 件ある」フラグ（#816）。
+    ///
+    /// `Wakeup` は「画面が変わったので描き直して」以上の意味を持たない**冪等**な合図
+    /// なので、受け手が処理する前に 2 件目を送っても仕事は増えない。それどころか
+    /// 1 件ごとに受け手のタスクを起こすコストが実測で **PTY read 1 回あたり
+    /// 約 25 万命令**（取り込み経路の 78%）になっていた。立っている間は送らず、
+    /// 受け手が処理に取りかかるときに自分で倒す（= 受け手主導のバックプレッシャ）。
+    /// **倒すのは「グリッドを読む直前」**でなければならない。倒した後に届いた出力は
+    /// 次の `Wakeup` を立て直すので、取りこぼしにならない
+    wakeup_pending: Arc<AtomicBool>,
 }
 
 impl<T, U> PtyLoop<T, U>
@@ -283,6 +294,7 @@ where
         terminal: Arc<FairMutex<Term<U>>>,
         event_proxy: U,
         pty: T,
+        wakeup_pending: Arc<AtomicBool>,
     ) -> io::Result<PtyLoop<T, U>> {
         let (tx, rx) = mpsc::channel();
         let poll = Poller::new()?.into();
@@ -293,7 +305,16 @@ where
             rx: PeekableReceiver::new(rx),
             terminal,
             event_proxy,
+            wakeup_pending,
         })
+    }
+
+    /// 未処理の `Wakeup` が無いときだけ送る（#816）
+    #[inline]
+    fn notify_wakeup(&self) {
+        if !self.wakeup_pending.swap(true, Ordering::AcqRel) {
+            self.event_proxy.send_event(Event::Wakeup);
+        }
     }
 
     pub fn channel(&self) -> LoopSender {
@@ -388,7 +409,7 @@ where
 
         // 同期更新中に飲み込まれた分しか無ければ再描画は要らない
         if state.parser.sync_bytes_count() < processed && processed > 0 {
-            self.event_proxy.send_event(Event::Wakeup);
+            self.notify_wakeup();
         }
 
         Ok(())
@@ -469,7 +490,7 @@ where
                     // 同期更新のタイムアウト処理
                     if events.is_empty() && self.rx.peek().is_none() {
                         state.parser.stop_sync(&mut *self.terminal.lock());
-                        self.event_proxy.send_event(Event::Wakeup);
+                        self.notify_wakeup();
                         continue;
                     }
 
