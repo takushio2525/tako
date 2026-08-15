@@ -1646,7 +1646,15 @@ struct TakoApp {
     chat_expanded: std::collections::HashSet<(PaneId, u64, chat_view::ChatSection)>,
     /// チャットが下端に追従しているか（未登録 = 追従。手動スクロールで外れる）
     chat_follow: HashMap<PaneId, bool>,
+    /// 旧経路（`TAKO_830_NO_CHAT_VIRTUAL_LIST=1`）の本文スクロール
     chat_scroll_handles: HashMap<PaneId, gpui::ScrollHandle>,
+    /// #830: チャット本文の仮想リスト（item = 発話 + 末尾の付随要素）と、その item 数
+    chat_body_lists: HashMap<PaneId, (gpui::ListState, usize)>,
+    /// #830: 仮想リストの item が引く「このフレームの並び」
+    chat_render: HashMap<PaneId, std::rc::Rc<chat_view::ChatRenderPlan>>,
+    /// #830: 行の割り当て（plan）と実描画の本数が食い違った回数。
+    /// 正常なら 0 のままで、セルフテストがそれを見張る
+    chat_index_mismatch: usize,
     /// 直近に描いた会話の内容キー（新着があったフレームだけ下端へ寄せるため）
     chat_content_keys: HashMap<PaneId, u64>,
     /// 発話本文の md パース結果（内容キー → ブロック列）。
@@ -3138,6 +3146,9 @@ impl TakoApp {
             chat_expanded: std::collections::HashSet::new(),
             chat_follow: HashMap::new(),
             chat_scroll_handles: HashMap::new(),
+            chat_body_lists: HashMap::new(),
+            chat_render: HashMap::new(),
+            chat_index_mismatch: 0,
             chat_content_keys: HashMap::new(),
             chat_md_cache: HashMap::new(),
             chat_echo: HashMap::new(),
@@ -21208,7 +21219,7 @@ mod self_test {
     ) {
         let block = window
             .update(cx, |app, _, cx| {
-                let block = app.preview_md_list(pane).and_then(|list| {
+                let block = app.preview_md_list(pane).map(|list| {
                     let block = app
                         .preview_md_block_index
                         .get(&pane)
@@ -21222,7 +21233,7 @@ mod self_test {
                         item_ix: block,
                         offset_in_item: px(0.0),
                     });
-                    Some(block)
+                    block
                 });
                 cx.notify();
                 block
@@ -22411,9 +22422,7 @@ mod self_test {
             // ままだと**画面外**になり、実ピクセルの検査にも目視の証拠にも乗らない
             let _ = window.update(cx, |app, _, cx| {
                 app.chat_follow.insert(chat_pane, false);
-                if let Some(handle) = app.chat_scroll_handles.get(&chat_pane) {
-                    handle.set_offset(point(px(0.0), px(0.0)));
-                }
+                app.chat_scroll_to_top(chat_pane);
                 cx.notify();
             });
             // 1 フレーム目は前フレームの bounds が混ざるので、描き直してから採る
@@ -22445,11 +22454,7 @@ mod self_test {
                             .get(&md_pane)
                             .map(|l| bounds_of(l))
                             .unwrap_or_default();
-                        let chat_body = app
-                            .chat_scroll_handles
-                            .get(&chat_pane)
-                            .map(|h| h.bounds())
-                            .unwrap_or_default();
+                        let chat_body = app.chat_body_bounds(chat_pane).unwrap_or_default();
                         (
                             chat,
                             prev,
@@ -25299,6 +25304,279 @@ mod self_test {
         );
     }
 
+    /// チャットビューの開閉で live ヒープが戻るかを測る（#830）。
+    ///
+    /// 作りは [`preview_leak_bench`] と同じで、**描画を自分で回す**のが要点
+    /// （GPUI は遮蔽されると描画を止めるので、裏で起動した隔離インスタンスでは
+    /// 残留が再現しない）。違いは器で、チャットは
+    ///
+    /// - 会話の件数が `CHAT_TAIL`（50）で頭打ち
+    /// - 1 発話が md ブロック列に展開される（長い assistant 発話ほど大きい）
+    ///
+    /// ので、「発話数」ではなく **1 フレームで作られる md ブロック / 行の総数**が
+    /// 効く。実 transcript を `TAKO_830_TRANSCRIPT` で渡せる（既定は合成会話）。
+    ///
+    /// - `TAKO_830_MESSAGES`: 合成する発話数（既定 50 = `CHAT_TAIL`）
+    /// - `TAKO_830_BLOCKS`: 1 発話あたりの md ブロック数（既定 12）
+    /// - `TAKO_830_TAIL`: 実 transcript から読む件数（既定 `CHAT_TAIL`）
+    /// - `TAKO_830_CYCLES` / `TAKO_830_FRAMES` / `TAKO_830_PAUSE_MS`
+    #[cfg(feature = "visual-test")]
+    async fn chat_leak_bench(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let cycles: usize = std::env::var("TAKO_830_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let frames: usize = std::env::var("TAKO_830_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let pause = Duration::from_millis(
+            std::env::var("TAKO_830_PAUSE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1500),
+        );
+        // 会話の材料。実 transcript があればそれを、無ければ合成する
+        let (messages, source) = match std::env::var("TAKO_830_TRANSCRIPT") {
+            Ok(path) if !path.is_empty() => {
+                let tail: usize = std::env::var("TAKO_830_TAIL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(chat_view::CHAT_TAIL);
+                let values =
+                    tako_control::transcript::read_messages_at(std::path::Path::new(&path), tail)
+                        .unwrap_or_else(|e| fail(&format!("#830 bench: transcript 読み取り {e}")));
+                (chat_view::messages_from_json(&values), path)
+            }
+            _ => {
+                let count: usize = std::env::var("TAKO_830_MESSAGES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(chat_view::CHAT_TAIL);
+                let blocks: usize = std::env::var("TAKO_830_BLOCKS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(12);
+                let mut values = Vec::with_capacity(count);
+                for i in 0..count {
+                    if i % 2 == 0 {
+                        values.push(serde_json::json!({
+                            "role": "user",
+                            "text": format!("発話 {i}: この部分を直してほしい。日本語と ASCII の混在 mixed line {i}."),
+                        }));
+                    } else {
+                        let mut text = String::new();
+                        for b in 0..blocks {
+                            match b % 4 {
+                                0 => text.push_str(&format!("## 見出し {i}-{b}\n\n")),
+                                1 => text.push_str(&format!(
+                                    "段落 {i}-{b}: 実装の方針を説明します。ここは折り返しが起きる\
+                                     程度に長い日本語の段落で、`inline code` も混ざります。\n\n"
+                                )),
+                                2 => text.push_str(&format!(
+                                    "```rust\nfn sample_{i}_{b}() -> usize {{\n    let v = {b};\n    \
+                                     v * 2\n}}\n```\n\n"
+                                )),
+                                _ => text.push_str(&format!(
+                                    "- 箇条書き {i}-{b} の 1 つ目\n- 2 つ目\n- 3 つ目\n\n"
+                                )),
+                            }
+                        }
+                        values.push(serde_json::json!({
+                            "role": "assistant",
+                            "text": text,
+                            "thinking": format!("思考 {i}: まず現状を確認する。"),
+                            "tools": [{"name": "Read", "summary": format!("crates/tako-app/src/chat_view.rs ({i})")}],
+                        }));
+                    }
+                }
+                (
+                    chat_view::messages_from_json(&values),
+                    format!("synthetic(messages={count} blocks_per_message={blocks})"),
+                )
+            }
+        };
+        // 会話の規模は「発話数」ではなく展開後の md ブロック / 行で見る
+        let md_blocks: usize = messages
+            .iter()
+            .filter(|m| m.role == chat_view::ChatRole::Assistant)
+            .map(|m| preview::markdown_blocks(&m.text).len())
+            .sum();
+        let text_bytes: usize = messages.iter().map(|m| m.text.len()).sum();
+
+        // GUI モード（チャット表示の前提）
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::UiMode {
+                    action: Some("set".into()),
+                    mode: Some("gui".into()),
+                    pane: None,
+                },
+                PaneOrigin::User,
+            );
+            cx.notify();
+        });
+        // 暖機（フォント / グリフ raster / テーマの初回確保を計測から外す）
+        for _ in 0..10 {
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        }
+        cx.background_executor().timer(pause).await;
+        let (base0, blocks0) = live_heap();
+        println!(
+            "TAKO_830 phase=start live_mb={:.2} blocks={blocks0} source={source} \
+             messages={} md_blocks={md_blocks} text_kb={} cycles={cycles} frames={frames}",
+            base0 as f64 / 1_048_576.0,
+            messages.len(),
+            text_bytes / 1024,
+        );
+
+        // 同じタブに何枚のチャットを並べるか（#830。tako の実運用は
+        // master + worker が 1 タブに同居するので、1 フレームの element は
+        // 「1 会話ぶん」ではなく**枚数ぶん**になる）
+        let panes: usize = std::env::var("TAKO_830_PANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let pane_ids: Vec<PaneId> = window
+            .update(cx, |app, _, _| {
+                let mut ids = vec![app.focused_pane()];
+                for _ in 1..panes {
+                    let from = *ids.last().expect("#830 bench: 分割元");
+                    let opened = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(from.as_u64()),
+                            tab: None,
+                            direction: Some(tako_control::protocol::Direction::Right),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("#830 bench: Split");
+                    ids.push(PaneId::from_raw(
+                        opened["pane"].as_u64().expect("Split 応答の pane"),
+                    ));
+                }
+                ids
+            })
+            .unwrap_or_else(|_| fail("#830 bench: ペイン準備"));
+        let pane = pane_ids[0];
+        for round in 1..=cycles {
+            window
+                .update(cx, |app, _, cx| {
+                    for id in &pane_ids {
+                        app.chat_panes.insert(
+                            *id,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: format!("visual-830-{round}-{}", id.as_u64()),
+                                messages: messages.clone(),
+                                model: Some("claude-opus-5".into()),
+                                ..Default::default()
+                            }),
+                        );
+                    }
+                    cx.notify();
+                })
+                .ok();
+            let first_frame = std::time::Instant::now();
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            let first_frame_ms = first_frame.elapsed().as_secs_f64() * 1000.0;
+            let steady = std::time::Instant::now();
+            for _ in 1..frames {
+                let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            }
+            let steady_ms = steady.elapsed().as_secs_f64() * 1000.0 / (frames.max(2) - 1) as f64;
+            cx.background_executor().timer(pause).await;
+            let (open_bytes, open_blocks) = live_heap();
+            let (display, lines, shaped) = window
+                .update(cx, |app, _, _| {
+                    let display = format!("{:?}", app.pane_display_for(pane));
+                    // 索引は「全ペインぶんの合計」で見る（1 フレームの総量が知りたい）
+                    let (lines, shaped) = pane_ids
+                        .iter()
+                        .filter_map(|id| app.chat_text_index.get(id))
+                        .fold((0usize, 0usize), |(l, s), i| {
+                            (
+                                l + i.texts.len(),
+                                s + i.layouts.iter().filter(|x| x.is_some()).count(),
+                            )
+                        });
+                    (display, lines, shaped)
+                })
+                .unwrap_or_default();
+            check(display == "Chat", "#830 bench: チャット表示になっている");
+            println!(
+                "TAKO_830 phase=open round={round} live_mb={:.2} blocks={open_blocks} \
+                 delta_mb={:.2} display={display} panes={panes} index_lines={lines} \
+                 shaped_lines={shaped} first_frame_ms={first_frame_ms:.1} \
+                 steady_frame_ms={steady_ms:.2}",
+                open_bytes as f64 / 1_048_576.0,
+                (open_bytes as f64 - base0 as f64) / 1_048_576.0,
+            );
+
+            // 「閉じる」= チャット状態を落としてターミナル表示へ戻す
+            // （ペインを閉じずに済むので、端末側の確保が混ざらない）
+            window
+                .update(cx, |app, _, cx| {
+                    for id in &pane_ids {
+                        app.drop_gui_pane_state(*id);
+                    }
+                    app.chat_md_cache.clear();
+                    cx.notify();
+                })
+                .ok();
+            for _ in 0..frames {
+                let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            }
+            cx.background_executor().timer(pause).await;
+            for _ in 0..5 {
+                let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            }
+            let (closed_bytes, closed_blocks) = live_heap();
+            let maps = window
+                .update(cx, |app, _, _| {
+                    format!(
+                        "chat_panes={} index={} md_cache={} scroll={}",
+                        app.chat_panes.len(),
+                        app.chat_text_index.len(),
+                        app.chat_md_cache.len(),
+                        app.chat_scroll_handles.len(),
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "TAKO_830 phase=closed round={round} live_mb={:.2} blocks={closed_blocks} \
+                 residual_mb={:.2} residual_blocks={} {maps}",
+                closed_bytes as f64 / 1_048_576.0,
+                (closed_bytes as f64 - base0 as f64) / 1_048_576.0,
+                closed_blocks as i64 - blocks0 as i64,
+            );
+        }
+        println!("TAKO_830 phase=settle");
+        cx.background_executor()
+            .timer(Duration::from_millis(
+                std::env::var("TAKO_830_SETTLE_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2000),
+            ))
+            .await;
+        let (end_bytes, end_blocks) = live_heap();
+        println!(
+            "TAKO_830 phase=end live_mb={:.2} blocks={end_blocks} residual_mb={:.2}",
+            end_bytes as f64 / 1_048_576.0,
+            (end_bytes as f64 - base0 as f64) / 1_048_576.0,
+        );
+    }
+
     /// 端末グリッド描画の 1 フレームあたりコストを測る（#787 / #782 / #786）。
     ///
     /// **ディスプレイが消えていても測れる**のが要点。実ウィンドウの表示に頼ると
@@ -25509,6 +25787,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // 検査ではなく計測（#830）。チャット開閉の live ヒープを追う
+                "chat-leak" => {
+                    chat_leak_bench(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 "preview-code" => {
                     preview_code_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
@@ -25518,7 +25802,7 @@ mod self_test {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
-                         grid-bench / preview-leak / preview-code）"
+                         grid-bench / preview-leak / chat-leak / preview-code）"
                     );
                     std::process::exit(1);
                 }
@@ -27404,9 +27688,7 @@ mod self_test {
                 // 下端追従のままだと先頭の発話が画面外にいて bounds が使えない
                 let _ = window.update(cx, |app, _, cx| {
                     app.chat_follow.insert(pane, false);
-                    if let Some(handle) = app.chat_scroll_handles.get(&pane) {
-                        handle.set_offset(point(px(0.0), px(0.0)));
-                    }
+                    app.chat_scroll_to_top(pane);
                     cx.notify();
                 });
                 let (scrolled_dark, _) = capture_frame(any, cx)
@@ -39100,9 +39382,7 @@ mod self_test {
                 // 折りたたみを開いた分だけ本文が伸びているので、明示的に戻さないと
                 // 下端には居ない（内容が変わらない限り勝手には引き戻さない仕様）
                 let _ = window.update(cx, |app, _, _| {
-                    if let Some(handle) = app.chat_scroll_handles.get(&chat_pane) {
-                        handle.scroll_to_bottom();
-                    }
+                    app.chat_scroll_to_bottom(chat_pane);
                 });
                 draw_all_windows(cx);
                 let follow_resumed = window
@@ -40875,9 +41155,25 @@ mod self_test {
                 let user_line = texts.iter().position(|t| t == "選択できるようにして");
                 let heading_line = texts.iter().position(|t| t == "できます");
                 let code_line = texts.iter().position(|t| t == "echo hello\necho world");
+                // #830: 「索引はあるのにレイアウトが控えられていない」を切り分けられるよう、
+                // 整形済みの本数と本文の実測高さも出す（仮想リストは可視ぶんしか控えない）
+                let (shaped, body_h, items) = window
+                    .update(cx, |app, _, _| {
+                        (
+                            app.chat_text_index
+                                .get(&chat_pane)
+                                .map(|i| i.layouts.iter().filter(|l| l.is_some()).count())
+                                .unwrap_or(0),
+                            app.chat_body_bounds(chat_pane)
+                                .map(|b| f32::from(b.size.height))
+                                .unwrap_or(-1.0),
+                            app.chat_item_count(chat_pane),
+                        )
+                    })
+                    .unwrap_or((0, -1.0, 0));
                 println!(
                     "TAKO_SELF_TEST_725_INDEX: lines={} user={user_line:?} heading={heading_line:?} \
-                     code={code_line:?}",
+                     code={code_line:?} shaped={shaped} body_h={body_h:.1} items={items}",
                     texts.len()
                 );
                 check(
@@ -40891,7 +41187,19 @@ mod self_test {
                     fail("#725: 行索引の取得")
                 };
 
-                // (b)(c) 実描画の座標からヒットテスト → user 行 → assistant 見出し行の選択
+                // (b)(c) 実描画の座標からヒットテスト → user 行 → assistant 見出し行の選択。
+                //
+                // #830 以降チャット本文は仮想リストなので、**描かれた行にしか座標が無い**
+                // （索引は文書全体ぶん、レイアウトは可視ぶんだけ）。会話は既定で下端に
+                // 付くため、先頭の user 発話を掴むにはまず先頭へ戻す（追従も外す）。
+                // ここは「見えているものを掴めるか」の検査で、見えていない行の座標を
+                // 期待する検査ではない
+                let _ = window.update(cx, |app, _, cx| {
+                    app.chat_follow.insert(chat_pane, false);
+                    app.chat_scroll_to_top(chat_pane);
+                    cx.notify();
+                });
+                draw_all(cx);
                 let (hit, selected, clipboard) = window
                     .update(cx, |app, _, cx| {
                         let center = |app: &TakoApp, line: usize| {
@@ -41123,9 +41431,7 @@ mod self_test {
                             // 追従中・先頭表示・新着ありの状態を作る
                             app.chat_follow.insert(chat_pane, true);
                             app.chat_selecting = selecting.then_some(chat_pane);
-                            if let Some(handle) = app.chat_scroll_handles.get(&chat_pane) {
-                                handle.set_offset(point(px(0.0), px(0.0)));
-                            }
+                            app.chat_scroll_to_top(chat_pane);
                             let messages = chat_view::messages_from_json(&[
                                 serde_json::json!({ "role": "user", "text": "1 通目" }),
                                 serde_json::json!({
@@ -41149,12 +41455,7 @@ mod self_test {
                         });
                         draw_all(cx);
                         window
-                            .update(cx, |app, _, _| {
-                                app.chat_scroll_handles
-                                    .get(&chat_pane)
-                                    .map(|h| f32::from(h.offset().y))
-                                    .unwrap_or(0.0)
-                            })
+                            .update(cx, |app, _, _| app.chat_scroll_mark(chat_pane))
                             .unwrap_or(0.0)
                     };
                     let while_selecting = offsets(cx, true);
@@ -41862,12 +42163,7 @@ mod self_test {
                 // busy を立てると会話の子要素が 1 個増える（末尾 = AI 側の位置）
                 let activity_appended = window
                     .update(cx, |app, _, cx| {
-                        let count = |app: &TakoApp| {
-                            app.chat_scroll_handles
-                                .get(&chat_pane)
-                                .map(|h| h.children_count())
-                                .unwrap_or(0)
-                        };
+                        let count = |app: &TakoApp| app.chat_item_count(chat_pane);
                         let before = count(app);
                         ensure_chat(app, false);
                         cx.notify();
@@ -41877,11 +42173,7 @@ mod self_test {
                 draw_all(cx);
                 let idle_children = window
                     .update(cx, |app, _, cx| {
-                        let n = app
-                            .chat_scroll_handles
-                            .get(&chat_pane)
-                            .map(|h| h.children_count())
-                            .unwrap_or(0);
+                        let n = app.chat_item_count(chat_pane);
                         ensure_chat(app, true);
                         cx.notify();
                         n
@@ -41889,12 +42181,7 @@ mod self_test {
                     .unwrap_or(0);
                 draw_all(cx);
                 let busy_children = window
-                    .update(cx, |app, _, _| {
-                        app.chat_scroll_handles
-                            .get(&chat_pane)
-                            .map(|h| h.children_count())
-                            .unwrap_or(0)
-                    })
+                    .update(cx, |app, _, _| app.chat_item_count(chat_pane))
                     .unwrap_or(0);
                 let _ = activity_appended;
                 check(
@@ -45200,6 +45487,379 @@ mod self_test {
                     }
                 }
                 let _ = std::fs::remove_dir_all(&dir826);
+            }
+
+            // 項目 115（#830）: チャット本文も**可視の発話だけ**を組む。
+            //
+            // 仮想化で壊れやすいのは「文書全体の座標系」と「下端追従」なので、
+            // ① 行テキストは全発話ぶん残る（⌘A / コピーの正）② 整形するのは可視ぶんだけ
+            // ③ 割り当て（plan）と実描画の本数が食い違わない ④ 折りたたみを開くと
+            // 行が増える ⑤ 新着で下端へ付いていく ⑥ 上へスクロールしたら追従が外れ、
+            // 新着が来ても位置が動かない、を通しで見る。
+            // 旧挙動へ戻す（`TAKO_830_NO_CHAT_VIRTUAL_LIST=1`）と「整形した行数 = 全行」に
+            // なるので、②の判定が FAILED になる
+            if chat_view::chat_virtual_list_disabled() {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 115（TAKO_830_NO_CHAT_VIRTUAL_LIST で仮想化を無効化）"
+                );
+            } else {
+                let any830 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window830 = any830.downcast::<TakoApp>().unwrap_or(window);
+                // 1 画面にはとても入らない量の会話。thinking / ツール / 表 / コードを
+                // 混ぜて「発話数と行数が一対一でない」形にする
+                let mut raw: Vec<serde_json::Value> = Vec::new();
+                for i in 0..40 {
+                    raw.push(serde_json::json!({
+                        "role": "user",
+                        "text": format!("依頼 {i}: ここを直して"),
+                    }));
+                    raw.push(serde_json::json!({
+                        "role": "assistant",
+                        "text": format!(
+                            "## 見出し {i}\n\n段落 {i} の本文です。\n\n| 列A | 列B |\n|---|---|\n| 値{i} | 42 |\n\n```sh\necho block {i}\n```\n"
+                        ),
+                        "thinking": format!("思考 {i} の中身 THINK_MARK_{i}"),
+                        "tools": [{ "name": "Bash", "summary": format!("cargo test {i}") }],
+                    }));
+                }
+                raw.push(serde_json::json!({
+                    "role": "assistant",
+                    "text": "末尾の発話 END_MARKER_830",
+                }));
+                let messages830 = chat_view::messages_from_json(&raw);
+                let last_key = messages830.last().map(|m| m.key).unwrap_or(0);
+                // **専用のペインを立てる**（項目 98 と同じ理由）。前の項目が
+                // 「コマンド入力へ」でターミナルに固定した（`starter_released`）ペインや
+                // alt screen の TUI を掴むと、判定表がチャットへ行かない
+                let pane830 = window830
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let anchor = app.focused_pane();
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        let pane = pane.unwrap_or(anchor);
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("set".into()),
+                                mode: Some("gui".into()),
+                                pane: None,
+                            },
+                            PaneOrigin::User,
+                        );
+                        app.chat_index_mismatch = 0;
+                        app.starter_released.remove(&pane);
+                        app.chat_panes.insert(
+                            pane,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-830".into(),
+                                messages: messages830.clone(),
+                                model: Some("claude-opus-5".into()),
+                                ..Default::default()
+                            }),
+                        );
+                        let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                        cx.notify();
+                        pane
+                    })
+                    .unwrap_or_else(|_| fail("115: チャットペインを用意できない (#830)"));
+                // 実描画されるまで回す（`TextLayout` は描き終わらないと bounds を持たない）
+                let drawn830 = wait_for_preview_drawn(
+                    any830,
+                    window830,
+                    cx,
+                    Duration::from_secs(10),
+                    |app: &TakoApp| {
+                        app.pane_display_for(pane830)
+                            == tako_core::ui_mode::PaneDisplay::Chat
+                            && app
+                                .chat_text_index
+                                .get(&pane830)
+                                .is_some_and(|i| i.layouts.iter().any(Option::is_some))
+                    },
+                )
+                .await;
+                if drawn830.is_none() {
+                    let why = window830
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            format!("display={:?}", app.pane_display_for(pane830))
+                        })
+                        .unwrap_or_default();
+                    println!("TAKO_SELF_TEST_830_NOTDRAWN: pane={pane830:?} {why}");
+                }
+                check(drawn830.is_some(), "115: チャット本文が描かれる (#830)");
+
+                let (lines830, shaped830, items830, mismatch830) = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let index = app.chat_text_index.get(&pane830);
+                        (
+                            index.map(|i| i.texts.len()).unwrap_or(0),
+                            index
+                                .map(|i| i.layouts.iter().filter(|l| l.is_some()).count())
+                                .unwrap_or(0),
+                            app.chat_item_count(pane830),
+                            app.chat_index_mismatch,
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 9));
+                println!(
+                    "TAKO_SELF_TEST_830: lines={lines830} shaped={shaped830} \
+                     items={items830} mismatch={mismatch830} messages={}",
+                    messages830.len()
+                );
+                check(
+                    lines830 > 200 && items830 == messages830.len(),
+                    "115: 行テキストと item は会話全体ぶん持つ (#830)",
+                );
+                check(
+                    shaped830 > 0 && shaped830 < lines830 / 2,
+                    &format!("115: 整形するのは可視の発話だけ ({shaped830}/{lines830}) (#830)"),
+                );
+                check(
+                    mismatch830 == 0,
+                    "115: 行の割り当てと実描画の本数が一致する (#830)",
+                );
+
+                // **合成ホイールを実際に配送する**。#830 で本文の器を `list` へ移した際、
+                // 追従を外すリスナー（`on_chat_scroll`）はスクロールしなくなった外側の
+                // div へ残した。`list` は自前の `on_mouse_event` でホイールを処理するので、
+                // 「リストが食って外側まで届かない」と**上へ遡っても追従が外れない**
+                // （= 読んでいる最中に新着で引き戻される）。既存の #702 の検査は
+                // `on_chat_scroll` を直接呼んでいて経路差を見ないので、ここで見る
+                let wheel_released = {
+                    let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.chat_follow.insert(pane830, true);
+                        cx.notify();
+                    });
+                    notify_and_draw(any830, window830, cx);
+                    let position = window830
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.chat_body_bounds(pane830)
+                                .map(|b| b.center())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    // 配送は `AnyWindowHandle` 経由で行う（`window.update` の中でやると
+                    // TakoApp が貸し出し中のまま `cx.listener` が二重に借りて panic する）
+                    let _ = any830.update(cx, |_, win, cx| {
+                        win.dispatch_event(
+                            gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position,
+                                // 上へ遡る向き（`on_chat_scroll` は dy > 0 で外す）
+                                delta: ScrollDelta::Lines(point(0.0, 3.0)),
+                                ..ScrollWheelEvent::default()
+                            }),
+                            cx,
+                        );
+                    });
+                    window830
+                        .update(cx, |app: &mut TakoApp, _, _| !app.chat_following(pane830))
+                        .unwrap_or(false)
+                };
+                check(
+                    wheel_released,
+                    "115: 実ホイールが本文の外側まで届いて追従が外れる (#830)",
+                );
+
+                // ⌘A → コピーは**描かれていない先頭まで**入る（座標系が描画状態に依存しない）
+                let all830 = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.select_all_chat(pane830);
+                        app.chat_selected_text()
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                check(
+                    all830.contains("依頼 0: ここを直して") && all830.contains("END_MARKER_830"),
+                    "115: 全選択のコピーに未描画の先頭と末尾が入る (#830)",
+                );
+                let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.chat_selections.remove(&pane830);
+                    cx.notify();
+                });
+
+                // 折りたたみ（thinking）を開くと**その発話の行が増える**。
+                // 行が増えるということは plan と描画が同じ規則で動いている証拠でもある
+                let before_fold = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.chat_text_index
+                            .get(&pane830)
+                            .map(|i| i.texts.len())
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let folded_key = messages830
+                    .iter()
+                    .find(|m| m.thinking.is_some())
+                    .map(|m| m.key)
+                    .unwrap_or(0);
+                let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.chat_expanded.insert((
+                        pane830,
+                        folded_key,
+                        chat_view::ChatSection::Thinking,
+                    ));
+                    cx.notify();
+                });
+                notify_and_draw(any830, window830, cx);
+                let (after_fold, fold_text) = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let index = app.chat_text_index.get(&pane830);
+                        (
+                            index.map(|i| i.texts.len()).unwrap_or(0),
+                            index
+                                .map(|i| i.texts.iter().any(|t| t.contains("THINK_MARK_0")))
+                                .unwrap_or(false),
+                        )
+                    })
+                    .unwrap_or((0, false));
+                println!(
+                    "TAKO_SELF_TEST_830_FOLD: before={before_fold} after={after_fold} \
+                     body_in_index={fold_text}"
+                );
+                check(
+                    after_fold == before_fold + 1 && fold_text,
+                    "115: 折りたたみを開くと索引の行が 1 本増える (#830)",
+                );
+
+                // 下端追従: 新着が来たら末尾の発話が実際に描かれる（= 下端にいる）
+                let follow830 = {
+                    let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.chat_follow.insert(pane830, true);
+                        let mut next = messages830.clone();
+                        next.push(chat_view::ChatMessage {
+                            role: chat_view::ChatRole::Assistant,
+                            text: "新着 TAIL_MARK_830".into(),
+                            thinking: None,
+                            tools: Vec::new(),
+                            images: 0,
+                            notices: 0,
+                            queued: false,
+                            key: last_key ^ 0x8300,
+                        });
+                        app.chat_panes.insert(
+                            pane830,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-830".into(),
+                                messages: next,
+                                model: Some("claude-opus-5".into()),
+                                ..Default::default()
+                            }),
+                        );
+                        cx.notify();
+                    });
+                    notify_and_draw(any830, window830, cx);
+                    notify_and_draw(any830, window830, cx);
+                    window830
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            let Some(index) = app.chat_text_index.get(&pane830) else {
+                                return false;
+                            };
+                            // 末尾の行が整形されている = 画面に出ている
+                            index
+                                .texts
+                                .iter()
+                                .zip(index.layouts.iter())
+                                .any(|(t, l)| t.contains("TAIL_MARK_830") && l.is_some())
+                        })
+                        .unwrap_or(false)
+                };
+                check(follow830, "115: 新着で下端の発話が描かれる (#830 追従)");
+
+                // 逆に、上へスクロールして追従を外したら**新着が来ても位置が動かない**
+                let stay830 = {
+                    let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.chat_follow.insert(pane830, false);
+                        app.chat_scroll_to_top(pane830);
+                        cx.notify();
+                    });
+                    notify_and_draw(any830, window830, cx);
+                    let mark_before = window830
+                        .update(cx, |app: &mut TakoApp, _, _| app.chat_scroll_mark(pane830))
+                        .unwrap_or(0.0);
+                    let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                        let mut next = messages830.clone();
+                        next.push(chat_view::ChatMessage {
+                            role: chat_view::ChatRole::User,
+                            text: "追いかけないでほしい新着".into(),
+                            thinking: None,
+                            tools: Vec::new(),
+                            images: 0,
+                            notices: 0,
+                            queued: false,
+                            key: last_key ^ 0x8301,
+                        });
+                        app.chat_panes.insert(
+                            pane830,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-830".into(),
+                                messages: next,
+                                model: Some("claude-opus-5".into()),
+                                ..Default::default()
+                            }),
+                        );
+                        cx.notify();
+                    });
+                    notify_and_draw(any830, window830, cx);
+                    notify_and_draw(any830, window830, cx);
+                    let mark_after = window830
+                        .update(cx, |app: &mut TakoApp, _, _| app.chat_scroll_mark(pane830))
+                        .unwrap_or(-1.0);
+                    println!(
+                        "TAKO_SELF_TEST_830_STAY: before={mark_before:.3} after={mark_after:.3}"
+                    );
+                    (mark_after - mark_before).abs() < 0.5
+                };
+                check(
+                    stay830,
+                    "115: 追従を外していれば新着で位置が動かない (#830)",
+                );
+
+                // 後始末: チャット状態を落とすと器と並びも落ちる。検証用ペインも閉じる
+                let _ = window830.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.drop_gui_pane_state(pane830);
+                    app.ui_mode = tako_core::ui_mode::UiMode::Terminal;
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(pane830.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                });
+                let leftovers830 = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.chat_body_lists.contains_key(&pane830) as u8
+                            + app.chat_render.contains_key(&pane830) as u8
+                            + app.chat_text_index.contains_key(&pane830) as u8
+                    })
+                    .unwrap_or(9);
+                check(
+                    leftovers830 == 0,
+                    "115: 閉じたらチャットの器と座標系も落ちる (#830)",
+                );
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

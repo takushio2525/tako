@@ -465,6 +465,12 @@ pub(crate) struct ChatTextIndex {
     pub(crate) texts: Vec<String>,
     /// 行番号 → 実描画レイアウト（**ヒットテストの正**。文字の無い行は None）
     pub(crate) layouts: Vec<Option<gpui::TextLayout>>,
+    /// この受け皿が担当する**文書上の先頭行**（#830）。
+    ///
+    /// 仮想化すると 1 発話ぶんの局所受け皿を作って描くので、選択ハイライトの
+    /// 行番号だけ文書側へ寄せる（`texts` / `layouts` は局所のまま積み、
+    /// 描き終わってから文書全体の枠へ書き戻す）。旧経路は 0 = 文書そのもの
+    base_line: usize,
 }
 
 impl ChatTextIndex {
@@ -481,7 +487,7 @@ impl ChatTextIndex {
         color: tako_core::Rgb,
         weight: Option<FontWeight>,
     ) -> StyledText {
-        let line = self.texts.len();
+        let line = self.base_line + self.texts.len();
         push_selection_highlight(&mut highlights, &text, line, self.selection.as_ref(), theme);
         let styled = crate::md_view::styled_line(
             text.clone(),
@@ -498,6 +504,76 @@ impl ChatTextIndex {
         self.texts.push(String::new());
         self.layouts.push(None);
     }
+}
+
+/// 発話 1 件が占める行範囲（#830）。
+///
+/// 仮想リストの item（= 発話 1 件）は、描き終わったレイアウトを
+/// **文書全体の枠**（[`ChatTextIndex::layouts`]）のここへ書き戻す
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ChatMessageLines {
+    pub(crate) first_line: usize,
+    pub(crate) line_count: usize,
+}
+
+/// 仮想リストの item 1 個が何であるか（#830）。
+///
+/// 旧経路が本文コンテナへ縦に並べていた要素と 1:1 で対応する
+/// （発話 → コマンド提案カード → 作業中インジケータ → 承認カード）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatItemKind {
+    /// [`ChatRenderPlan::messages`] の発話
+    Message(usize),
+    /// コマンド提案カード（#666）をまとめた 1 個
+    Cards,
+    /// 作業中インジケータ（#737）
+    Activity,
+    /// 承認カード（#716）
+    Approval,
+}
+
+/// 1 フレームぶんの「何をどの順で並べるか」（#830）。
+///
+/// 仮想リストの item は render が返ったあと（`list` の prepaint）で組まれるので、
+/// 材料は `TakoApp` に置いて渡す。プレビュー（#821 / #826）が
+/// `previews` / `preview_md_block_index` から引くのと同じ構え
+pub(crate) struct ChatRenderPlan {
+    /// 表示する発話（transcript + 生きている楽観 echo）
+    pub(crate) messages: Vec<ChatMessage>,
+    /// 並べる item
+    pub(crate) items: Vec<ChatItemKind>,
+    /// 発話ごとの行範囲（索引の座標系）
+    pub(crate) lines: Vec<ChatMessageLines>,
+    /// 狭幅レイアウト（ペイン幅で決まるので item 側からは分からない）
+    pub(crate) compact: bool,
+    /// スピナー行（#719）。実画面の採取はフレームに 1 回だけなので控えて渡す
+    pub(crate) activity: Option<String>,
+}
+
+/// 発話と発話のあいだ（px）。旧経路の本文コンテナの `gap` と同じ値。
+///
+/// 仮想リストは item を隙間なく積むので、間隔は item 側（先頭以外の `mt`）で作る
+pub(crate) const CHAT_ITEM_GAP: f32 = 10.0;
+
+/// 本文の上下余白（px）。旧経路のスクロールコンテナの `py` と同じ値
+pub(crate) const CHAT_BODY_PADDING_Y: f32 = 12.0;
+
+/// 本文の左右余白（px）。狭幅では詰める。**スクロールしない**ので器の外側が持つ
+pub(crate) fn chat_body_padding_x(compact: bool) -> f32 {
+    if compact {
+        10.0
+    } else {
+        16.0
+    }
+}
+
+/// チャット本文の仮想リストを止めて旧経路（全発話を毎フレーム組む）で描く（#830 の A/B 用）。
+///
+/// 実測とトラブルシュートのための逃げ道で、既定は仮想化。
+/// 見た目・座標系が変わらないことは visual-test の chat 系節が押さえる
+pub(crate) fn chat_virtual_list_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("TAKO_830_NO_CHAT_VIRTUAL_LIST").is_ok())
 }
 
 /// md ブロック列を「画面と同じプレーンテキスト」へ落とす（#725 のコピー本文）。
@@ -931,6 +1007,173 @@ impl TakoApp {
         }
     }
 
+    /// 発話 1 件が占める「選択行」のテキストを `out` へ積む（#830。**行の座標系の正**）。
+    ///
+    /// 描画（[`Self::render_chat_message`]）が [`ChatTextIndex::push`] /
+    /// [`ChatTextIndex::push_spacer`] を呼ぶ順・本数と **1:1 で一致していなければ
+    /// ならない**。仮想化後は可視ぶんの発話しか描かないので、コピー・⌘A・
+    /// ヒットテストの座標系はここが唯一の出どころになる（#826 が md プレビューで
+    /// `md_block_line_texts` を正にしたのと同じ構え）。
+    ///
+    /// 要素は 1 個も作らない（文字列の連結だけなので taffy ノードは増えない）
+    fn push_chat_message_lines(
+        &mut self,
+        pane_id: PaneId,
+        message: &ChatMessage,
+        out: &mut Vec<String>,
+    ) {
+        match message.role {
+            // 通知は薄い 1 行で、選択の対象にしていない（索引にも載せない）
+            ChatRole::System => {}
+            ChatRole::User => {
+                if message.text.is_empty() {
+                    return;
+                }
+                let total = message.text.chars().count();
+                if total <= LONG_MESSAGE_CHARS {
+                    out.push(message.text.clone());
+                    return;
+                }
+                let expanded = self.chat_long_expanded.contains(&(pane_id, message.key));
+                out.push(if expanded {
+                    message.text.clone()
+                } else {
+                    message
+                        .text
+                        .chars()
+                        .take(LONG_MESSAGE_CHARS)
+                        .collect::<String>()
+                });
+            }
+            ChatRole::Assistant => {
+                // 折りたたみは**開いているときだけ**本文を索引へ積む（見出し行は
+                // 素の SharedString なので選択対象ではない = 旧経路と同じ）
+                if let Some(thinking) = message.thinking.as_ref() {
+                    if self.chat_expanded(pane_id, message.key, ChatSection::Thinking) {
+                        out.push(thinking.clone());
+                    }
+                }
+                if !message.text.trim().is_empty() {
+                    let blocks = self.chat_md_blocks(message.key, &message.text);
+                    for block in blocks.iter() {
+                        // 罫線は `push_spacer` と同じ空文字 1 行になる
+                        out.extend(crate::md_block_line_texts(block));
+                    }
+                }
+                for (slot, tool) in message.tools.iter().enumerate() {
+                    if self.chat_expanded(pane_id, message.key, ChatSection::Tool(slot)) {
+                        out.push(tool.summary.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// チャット本文の仮想リスト状態（#830）。item 数が変わったら作り直す。
+    ///
+    /// 新着・折りたたみで item 数が動いても見ている位置を失わないよう、論理
+    /// スクロール位置（item + item 内オフセット）を作り直しの前後で持ち越す
+    /// （#826 のプレビューと同じ扱い）。下端追従は呼び出し側が
+    /// [`gpui::ListState::scroll_to_end`] で明示する
+    fn chat_body_list_state(&mut self, pane_id: PaneId, count: usize) -> gpui::ListState {
+        if let Some((state, built_for)) = self.chat_body_lists.get(&pane_id) {
+            if *built_for == count {
+                return state.clone();
+            }
+            let state = state.clone();
+            let keep = state.logical_scroll_top();
+            state.reset(count);
+            if keep.item_ix < count {
+                state.scroll_to(keep);
+            }
+            self.chat_body_lists.insert(pane_id, (state.clone(), count));
+            return state;
+        }
+        // **`Bottom` ではなく `Top`**（#830 の実測）。`ListAlignment::Bottom` は
+        // 内容がビューポートより短いときに会話をペインの**下端へ貼り付ける**ので、
+        // 旧経路（上詰めのスクロール div）と絵が変わる。下端追従は呼び出し側の
+        // `scroll_to_end` が担うので、器の既定は上詰めでよい。
+        // overdraw は画面外にも組んでおく高さで、ドラッグ選択がペインの端を
+        // またぐときに「行がまだ無い」状態を避けるため広めに取る（#821 と同じ）
+        let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(600.0));
+        self.chat_body_lists.insert(pane_id, (state.clone(), count));
+        state
+    }
+
+    /// チャット本文の**器そのもの**の矩形（#830）。
+    ///
+    /// 仮想化した本文は中の `list` が器で、`viewport_bounds` が返すのは左右の余白の
+    /// 内側なので、旧経路（div スクロールの border box）と同じ土俵で見るために
+    /// 余白を戻す（#826 の `preview_body_bounds` と同じ扱い）
+    pub(crate) fn chat_body_bounds(&self, pane_id: PaneId) -> Option<gpui::Bounds<gpui::Pixels>> {
+        if let Some((list, _)) = self.chat_body_lists.get(&pane_id) {
+            let inner = list.viewport_bounds();
+            if f32::from(inner.size.height) > 0.0 {
+                let compact = self.chat_render.get(&pane_id).is_some_and(|p| p.compact);
+                let pad = px(chat_body_padding_x(compact));
+                return Some(gpui::Bounds {
+                    origin: gpui::point(inner.origin.x - pad, inner.origin.y),
+                    size: gpui::size(inner.size.width + pad * 2.0, inner.size.height),
+                });
+            }
+        }
+        self.chat_scroll_handles
+            .get(&pane_id)
+            .map(gpui::ScrollHandle::bounds)
+    }
+
+    /// チャット本文を先頭へ戻す（#830。器の種類によらず同じ意味になる 1 本の入口）
+    pub(crate) fn chat_scroll_to_top(&mut self, pane_id: PaneId) {
+        if let Some((list, _)) = self.chat_body_lists.get(&pane_id) {
+            list.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.0),
+            });
+            return;
+        }
+        if let Some(handle) = self.chat_scroll_handles.get(&pane_id) {
+            handle.set_offset(gpui::point(px(0.0), px(0.0)));
+        }
+    }
+
+    /// チャット本文を下端へ寄せる（#830。器の種類によらず同じ意味になる 1 本の入口）
+    pub(crate) fn chat_scroll_to_bottom(&mut self, pane_id: PaneId) {
+        if let Some((list, _)) = self.chat_body_lists.get(&pane_id) {
+            list.scroll_to_end();
+            return;
+        }
+        if let Some(handle) = self.chat_scroll_handles.get(&pane_id) {
+            handle.scroll_to_bottom();
+        }
+    }
+
+    /// 本文に並んでいる要素の数（#830。旧経路の `children_count` と同じ意味）
+    pub(crate) fn chat_item_count(&self, pane_id: PaneId) -> usize {
+        if let Some((list, _)) = self.chat_body_lists.get(&pane_id) {
+            return list.item_count();
+        }
+        self.chat_scroll_handles
+            .get(&pane_id)
+            .map(gpui::ScrollHandle::children_count)
+            .unwrap_or(0)
+    }
+
+    /// 「どれだけ下へ送ったか」の指標（#830。器が違うと単位が違うので符号だけ揃える）。
+    ///
+    /// 旧経路はスクロールオフセット（下へ送ると負）、仮想リストは
+    /// 先頭 item の番号 + item 内オフセット（下へ送ると正）なので、
+    /// **先頭表示なら 0・下へ送ると負**に正規化して比べられるようにする
+    pub(crate) fn chat_scroll_mark(&self, pane_id: PaneId) -> f32 {
+        if let Some((list, _)) = self.chat_body_lists.get(&pane_id) {
+            let top = list.logical_scroll_top();
+            return -(top.item_ix as f32 + f32::from(top.offset_in_item) / 1000.0);
+        }
+        self.chat_scroll_handles
+            .get(&pane_id)
+            .map(|h| f32::from(h.offset().y))
+            .unwrap_or(0.0)
+    }
+
     /// 下端に追従しているか（既定は追従）。手動で上へスクロールすると外れる
     pub(crate) fn chat_following(&self, pane_id: PaneId) -> bool {
         self.chat_follow.get(&pane_id).copied().unwrap_or(true)
@@ -1346,7 +1589,6 @@ impl TakoApp {
             self.chat_follow.insert(pane_id, true);
         }
         let following = self.chat_following(pane_id);
-        let scroll_handle = self.chat_scroll_handles.entry(pane_id).or_default().clone();
         // 表示は transcript + 生きている楽観 echo（#716。§3.1）
         let visible = self.chat_visible_messages(pane_id, &state);
         // **内容が変わったフレームだけ**下端へ寄せる。毎フレーム寄せると、
@@ -1355,34 +1597,127 @@ impl TakoApp {
         // **ドラッグ選択中は寄せない**（#725。選択の最中に新着で飛ぶと選択が壊れる）
         let content_changed =
             self.chat_content_changed(pane_id, &visible, state.permission.is_some(), state.busy);
-        if content_changed && following && self.chat_selecting != Some(pane_id) {
-            scroll_handle.scroll_to_bottom();
-        }
-        // #725: 選択の座標系（行番号）はこのフレームで描く順に決まる。
-        // 索引は毎フレーム作り直し、描き終わってから丸ごと差し替える
-        let mut index = ChatTextIndex {
-            selection: self.chat_selections.get(&pane_id).cloned(),
-            ..Default::default()
+        let snap_to_bottom = content_changed && following && self.chat_selecting != Some(pane_id);
+        let virtualized = !chat_virtual_list_disabled();
+        let empty = visible.is_empty();
+
+        // #830: 本文は**可視の発話だけ**を組む（機序は #821 / #826 と同じで、
+        // 全発話の element を毎フレーム作ると 1 フレームぶんの測定レイアウトノードが
+        // taffy の `node_context_data` に居座り、チャットを閉じても戻らない）。
+        // 発話の高さは md ブロック・折りたたみ・折り返しで不定なので、高さの実測は
+        // `list`（可変高さ + 遅延計測）へ任せる
+        let body: gpui::AnyElement = if virtualized {
+            // ① 行の割り当て（**要素は作らない**）。選択・コピー・⌘A の座標系は
+            //    描画状態に依存しないので、文書全体ぶんをここで作り切る
+            let mut texts: Vec<String> = Vec::new();
+            let mut lines: Vec<ChatMessageLines> = Vec::with_capacity(visible.len());
+            for message in &visible {
+                let first_line = texts.len();
+                self.push_chat_message_lines(pane_id, message, &mut texts);
+                lines.push(ChatMessageLines {
+                    first_line,
+                    line_count: texts.len() - first_line,
+                });
+            }
+            let total_lines = texts.len();
+            // 可視の発話が自分の枠へ書き込む器。索引は常に文書の行番号
+            self.chat_text_index.insert(
+                pane_id,
+                ChatTextIndex {
+                    selection: self.chat_selections.get(&pane_id).cloned(),
+                    texts,
+                    layouts: vec![None; total_lines],
+                    base_line: 0,
+                },
+            );
+
+            // ② 並べる item。旧経路が本文コンテナへ縦に並べていた順と 1:1
+            let mut items: Vec<ChatItemKind> =
+                (0..visible.len()).map(ChatItemKind::Message).collect();
+            if !self.command_card_rows(pane_id).is_empty() {
+                items.push(ChatItemKind::Cards);
+            }
+            if state.busy {
+                items.push(ChatItemKind::Activity);
+            }
+            if state.permission.is_some() {
+                items.push(ChatItemKind::Approval);
+            }
+            let count = items.len();
+            self.chat_render.insert(
+                pane_id,
+                std::rc::Rc::new(ChatRenderPlan {
+                    messages: visible,
+                    items,
+                    lines,
+                    compact,
+                    activity: activity.clone(),
+                }),
+            );
+
+            let list_state = self.chat_body_list_state(pane_id, count);
+            if snap_to_bottom {
+                list_state.scroll_to_end();
+            }
+            let app = cx.entity().downgrade();
+            gpui::list(list_state, move |ix, _window, cx| {
+                let Some(app) = app.upgrade() else {
+                    return div().into_any_element();
+                };
+                app.update(cx, |app, cx| app.render_chat_item(pane_id, ix, cx))
+            })
+            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+            .py(px(CHAT_BODY_PADDING_Y))
+            .flex_1()
+            .into_any_element()
+        } else {
+            // A/B 計測とトラブルシュート用の旧挙動（全発話を毎フレーム組む）。
+            // 1 発話の作り方は仮想化と同じ関数を通すので見た目は完全に一致する
+            self.chat_body_lists.remove(&pane_id);
+            self.chat_render.remove(&pane_id);
+            let scroll_handle = self.chat_scroll_handles.entry(pane_id).or_default().clone();
+            if snap_to_bottom {
+                scroll_handle.scroll_to_bottom();
+            }
+            let mut index = ChatTextIndex {
+                selection: self.chat_selections.get(&pane_id).cloned(),
+                ..Default::default()
+            };
+            let mut messages: Vec<gpui::AnyElement> = visible
+                .iter()
+                .map(|m| self.render_chat_message(pane_id, m, compact, &mut index, cx))
+                .collect();
+            self.chat_text_index.insert(pane_id, index);
+            // #716: コマンド提案カード（#666）は会話の流れの中へインラインで置く。
+            // ターミナル表示のときは従来どおり専用帯（#703。`pane_shows_terminal` が
+            // Chat を除外しているので二重には出ない）
+            messages.extend(self.render_chat_inline_cards(pane_id, cx));
+            // #737 追加要件 3: 作業中インジケータは会話末尾の AI 側。
+            // ヘッダではなくここに出すので、下端追従スクロールにそのまま乗る
+            if state.busy {
+                messages.push(self.render_chat_activity(pane_id, activity.clone(), state.queued));
+            }
+            // 承認カードは会話の末尾（いま答えるべきことが一番下にある）
+            if let Some(dialog) = state.permission.clone() {
+                messages.push(self.render_chat_approval(pane_id, &dialog, cx));
+            }
+            // 旧経路は左右の余白も**器の内側**が持つ（`main` とまったく同じ形。
+            // 仮想化した経路は器の外側 = 左右はスクロールしないので見た目は同じ）
+            div()
+                .id(("chat-body-legacy", pane_id.as_u64()))
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_y_scroll()
+                .track_scroll(&scroll_handle)
+                .flex()
+                .flex_col()
+                .gap(px(CHAT_ITEM_GAP))
+                .px(px(chat_body_padding_x(compact)))
+                .py(px(CHAT_BODY_PADDING_Y))
+                .children(messages)
+                .into_any_element()
         };
-        let mut messages: Vec<gpui::AnyElement> = visible
-            .iter()
-            .map(|m| self.render_chat_message(pane_id, m, compact, &mut index, cx))
-            .collect();
-        self.chat_text_index.insert(pane_id, index);
-        let empty = messages.is_empty();
-        // #716: コマンド提案カード（#666）は会話の流れの中へインラインで置く。
-        // ターミナル表示のときは従来どおり専用帯（#703。`pane_shows_terminal` が
-        // Chat を除外しているので二重には出ない）
-        messages.extend(self.render_chat_inline_cards(pane_id, cx));
-        // #737 追加要件 3: 作業中インジケータは会話末尾の AI 側。
-        // ヘッダではなくここに出すので、下端追従スクロールにそのまま乗る
-        if state.busy {
-            messages.push(self.render_chat_activity(pane_id, activity.clone(), state.queued));
-        }
-        // 承認カードは会話の末尾（いま答えるべきことが一番下にある）
-        if let Some(dialog) = state.permission.clone() {
-            messages.push(self.render_chat_approval(pane_id, &dialog, cx));
-        }
 
         div()
             .id(("pane", pane_id.as_u64()))
@@ -1435,18 +1770,18 @@ impl TakoApp {
                 )
             })
             .child(
+                // #830: 器（縦のスクロールと余白）は本文側が持つ。ここは
+                // 左右の余白とマウス操作（選択・ホイール）の受け皿に徹する
+                // （左右の余白はスクロールしないので、外側に出しても見た目は変わらない）
                 div()
                     .id(("chat-body", pane_id.as_u64()))
                     .flex_1()
                     .min_h(px(0.0))
                     .w_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&scroll_handle)
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
-                    .px(px(if compact { 10.0 } else { 16.0 }))
-                    .py(px(12.0))
+                    .overflow_hidden()
+                    .when(virtualized, |d| d.px(px(chat_body_padding_x(compact))))
                     // 本文はテキストなのでカーソルもテキスト（選択できることが分かる）
                     .cursor(gpui::CursorStyle::IBeam)
                     // 上へスクロールしたら追従を外す（新着で勝手に飛ばない）
@@ -1487,6 +1822,8 @@ impl TakoApp {
                         d.child(
                             div()
                                 .flex_shrink_0()
+                                .mt(px(CHAT_BODY_PADDING_Y))
+                                .when(!virtualized, |d| d.px(px(chat_body_padding_x(compact))))
                                 .text_size(px(12.0))
                                 .text_color(hsla(theme.text_muted))
                                 .child(SharedString::from(
@@ -1494,11 +1831,144 @@ impl TakoApp {
                                 )),
                         )
                     })
-                    .children(messages),
+                    .child(body),
             )
             // 入力欄 + スラッシュボタン。**worker も含めて全チャットペインに出す**
             // （#719 追加要件 5。実運用では worker への直接指示が日常的にある）
             .child(self.render_chat_composer(pane_id, &state, mirror, compact, cx))
+    }
+
+    /// 会話本文の item 1 個を組む（#830 の仮想リストから可視ぶんだけ呼ばれる）。
+    ///
+    /// 選択・折りたたみ・カードの中身は**呼ばれた時点の状態**から引き直す
+    /// （リストは `TakoApp` の描画を伴わないスクロールでも item を組み直すので、
+    /// 呼び出し側でキャプチャした値を使うと 1 フレーム古い状態が焼き付く。#821）。
+    /// 行番号は render が 1 パスで作った [`ChatRenderPlan::lines`] から引くので、
+    /// 全発話を組んでいたときと同じ座標系になる
+    pub(crate) fn render_chat_item(
+        &mut self,
+        pane_id: PaneId,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        let Some(plan) = self.chat_render.get(&pane_id).cloned() else {
+            return empty();
+        };
+        let Some(kind) = plan.items.get(ix).copied() else {
+            return empty();
+        };
+        // 旧経路の本文コンテナは `gap` で間を空けていた。仮想リストは item を
+        // 隙間なく積むので、先頭以外へ同じ幅の上マージンを付けて同じ絵にする
+        let spaced = |element: gpui::AnyElement| -> gpui::AnyElement {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .when(ix > 0, |d| d.mt(px(CHAT_ITEM_GAP)))
+                .child(element)
+                .into_any_element()
+        };
+        match kind {
+            ChatItemKind::Message(mi) => {
+                let (Some(message), Some(meta)) =
+                    (plan.messages.get(mi).cloned(), plan.lines.get(mi).copied())
+                else {
+                    return empty();
+                };
+                // 局所の受け皿。行番号だけ文書側へ寄せる（選択ハイライトの塗りが
+                // 発話をまたいだ選択でも正しい範囲になる）
+                let mut index = ChatTextIndex {
+                    selection: self.chat_selections.get(&pane_id).cloned(),
+                    texts: Vec::with_capacity(meta.line_count),
+                    layouts: Vec::with_capacity(meta.line_count),
+                    base_line: meta.first_line,
+                };
+                let element =
+                    self.render_chat_message(pane_id, &message, plan.compact, &mut index, cx);
+                // plan と描画の本数が食い違ったら索引がずれる（コピーが別の行を返す）。
+                // セルフテストが 0 であることを見張れるよう記録だけ残す
+                if index.texts.len() != meta.line_count {
+                    self.chat_index_mismatch += 1;
+                }
+                let layouts = index.layouts;
+                let first_line = meta.first_line;
+                let app = cx.entity().downgrade();
+                // #821 / #826 と同じ理由でレイアウトの控えは **paint 時**に入れる。
+                // 仮想リストは高さの見積もりで item を `layout_as_root` するだけの
+                // ことがあり、その `TextLayout` は prepaint を通っていないので
+                // `bounds()` / `index_for_position()` が panic する
+                let recorder = gpui::canvas(
+                    |_, _, _| (),
+                    move |_, _, _window, cx| {
+                        let Some(app) = app.upgrade() else {
+                            return;
+                        };
+                        app.update(cx, |app, _| {
+                            let Some(index) = app.chat_text_index.get_mut(&pane_id) else {
+                                return;
+                            };
+                            for (offset, layout) in layouts.iter().enumerate() {
+                                if let Some(slot) = index.layouts.get_mut(first_line + offset) {
+                                    *slot = layout.clone();
+                                }
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full();
+                // #821 と同じ理由で `w_full` が要る（リストの item は伸ばしてくれる
+                // 親を持たない）。発話側は幅を持たず親の stretch に頼っているので、
+                // 包む器は旧経路のコンテナと同じ **flex 列**にする
+                spaced(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .relative()
+                        .child(element)
+                        .child(recorder)
+                        .into_any_element(),
+                )
+            }
+            ChatItemKind::Cards => {
+                let cards = self.render_chat_inline_cards(pane_id, cx);
+                if cards.is_empty() {
+                    return empty();
+                }
+                spaced(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(CHAT_ITEM_GAP))
+                        .children(cards)
+                        .into_any_element(),
+                )
+            }
+            ChatItemKind::Activity => {
+                let Some(state) = self.chat_panes.get(&pane_id).cloned() else {
+                    return empty();
+                };
+                if !state.busy {
+                    return empty();
+                }
+                spaced(self.render_chat_activity(pane_id, plan.activity.clone(), state.queued))
+            }
+            ChatItemKind::Approval => {
+                let Some(dialog) = self
+                    .chat_panes
+                    .get(&pane_id)
+                    .and_then(|s| s.permission.clone())
+                else {
+                    return empty();
+                };
+                spaced(self.render_chat_approval(pane_id, &dialog, cx))
+            }
+        }
     }
 
     /// 入力欄 + スラッシュボタン列（#716 / §2.3。中身は #719 でミラー方式）。
@@ -3136,6 +3606,25 @@ impl TakoApp {
     /// スクロールが下端にあるか（追従の再開判定）。
     /// `child_bounds` はスクロールオフセットを含まない座標なので offset を足して比べる
     fn chat_scroll_at_bottom(&self, pane_id: PaneId) -> bool {
+        // #830: 仮想リストは「最後の item が描かれていて、その下端が
+        // ビューポートの下端に届いているか」で見る。`bounds_for_item` は
+        // スクロール適用後の窓座標を返すのでオフセットは足さない
+        if let Some((list, _)) = self.chat_body_lists.get(&pane_id) {
+            let count = list.item_count();
+            if count == 0 {
+                return true;
+            }
+            let viewport = list.viewport_bounds();
+            if f32::from(viewport.size.height) <= 0.0 {
+                // まだ一度も測っていない（初回フレーム）。追従の既定は ON なので
+                // ここが呼ばれるのは「外れている」ときだけ = 勝手に戻さない
+                return false;
+            }
+            let Some(last) = list.bounds_for_item(count - 1) else {
+                return false;
+            };
+            return f32::from(last.bottom() - viewport.bottom()) <= CHAT_FOLLOW_EPSILON;
+        }
         let Some(handle) = self.chat_scroll_handles.get(&pane_id) else {
             return true;
         };
@@ -3336,6 +3825,10 @@ impl TakoApp {
         self.chat_panes.remove(&pane_id);
         self.chat_follow.remove(&pane_id);
         self.chat_scroll_handles.remove(&pane_id);
+        // #830: 仮想リストの器とこのフレームの並びも一緒に落とす
+        // （ペイン ID は再利用されるので、残すと他人の会話の item 数で始まる）
+        self.chat_body_lists.remove(&pane_id);
+        self.chat_render.remove(&pane_id);
         self.chat_expanded.retain(|(pane, _, _)| *pane != pane_id);
         self.chat_content_keys.remove(&pane_id);
         self.starter_released.remove(&pane_id);
