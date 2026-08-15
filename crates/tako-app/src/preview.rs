@@ -9,7 +9,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use tako_control::protocol::PreviewModeWire;
 use tako_core::{
@@ -448,6 +449,12 @@ pub fn apply_editor_text(preview: &mut PreviewState, edit: &EditState) {
 }
 
 impl PreviewState {
+    /// 再ハイライトの可能性がある種別か（#815 の構文セット寿命判定）。
+    /// Markdown もコードブロックのハイライトで構文セットを使う
+    pub fn needs_syntax(&self) -> bool {
+        matches!(self.mode, PreviewMode::Code | PreviewMode::Markdown)
+    }
+
     /// Markdown レンダリングへ切り替え可能なファイルか（目アイコントグルの表示判定）
     pub fn markdown_capable(&self) -> bool {
         is_markdown_path(&self.path)
@@ -1729,10 +1736,123 @@ pub trait Highlighter: Send + Sync {
     fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line>;
 }
 
-/// 既定ハイライタ（プロセス内で 1 度だけ構文セットを読む）
-pub fn highlighter() -> &'static dyn Highlighter {
-    static INSTANCE: OnceLock<SyntectHighlighter> = OnceLock::new();
-    INSTANCE.get_or_init(SyntectHighlighter::new)
+/// 構文セットを載せたままにしておく猶予（最後に使ってからの長さ。#815）。
+/// 編集の連続打鍵とライブリロードの連投で毎回ロードし直さないための幅で、これを過ぎたら
+/// プレビューを開いたままでも手放す（描画済みの色は [`PreviewContent`] 側が持っている）。
+pub const SYNTAX_IDLE_GRACE: Duration = Duration::from_secs(30);
+
+/// 構文セットの寿命（#815）。
+///
+/// 実費は `SyntaxSet` の器（実測 1.04 MB / ロード 0.6〜1.2 ms）ではなく、**ハイライトした
+/// 言語ごとに遅延コンパイルされる正規表現**にある（実測: Rust +5.1 MB・bash +10.9 MB・
+/// Markdown +10.9 MB・TypeScript +32.0 MB。18 言語を通すと 149 MB まで積み上がる）。
+/// これはセットの内側に溜まり、syntect には言語単位で捨てる API が無い。
+/// つまり**捨てられる単位はセット全体だけ**なので、「借用が 1 枚も無く、最後の使用から
+/// [`SYNTAX_IDLE_GRACE`] 経過したら丸ごと解放する」寿命管理にしている。
+/// 実体は下のグローバル 1 個だが、テストが並列でも決定的になるようローカルに作れる形にしてある
+struct SyntaxCache {
+    /// 生存追跡。借用チケットが 1 枚でも生きていれば upgrade できる
+    weak: Weak<SyntectHighlighter>,
+    /// 猶予中の保持。これを手放しても、実際の解放は最後のチケットが落ちた時
+    keep: Option<Arc<SyntectHighlighter>>,
+    last_use: Option<Instant>,
+}
+
+impl SyntaxCache {
+    const fn new() -> Self {
+        Self {
+            weak: Weak::new(),
+            keep: None,
+            last_use: None,
+        }
+    }
+
+    /// 借りる。載っていなければここでロードする（実測 0.6〜1.2 ms）
+    fn acquire(&mut self, now: Instant) -> SyntaxLease {
+        self.last_use = Some(now);
+        if let Some(arc) = self.weak.upgrade() {
+            self.keep = Some(Arc::clone(&arc));
+            return SyntaxLease(arc);
+        }
+        let arc = Arc::new(SyntectHighlighter::new());
+        self.weak = Arc::downgrade(&arc);
+        self.keep = Some(Arc::clone(&arc));
+        SyntaxLease(arc)
+    }
+
+    /// 猶予を過ぎていれば保持を手放す。戻り値 = このターンで手放したか。
+    /// 借用が残っていれば実解放はそのチケットが落ちた時まで自動的に待つ
+    fn release_idle(&mut self, now: Instant, text_preview_open: bool) -> bool {
+        if self.keep.is_none() {
+            return false;
+        }
+        let idle = self
+            .last_use
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        if !syntax_release_due(idle, text_preview_open) {
+            return false;
+        }
+        self.keep = None;
+        true
+    }
+
+    /// 構文セットが今メモリに載っているか（保持していなくても、借用中なら載っている）
+    fn resident(&self) -> bool {
+        self.weak.strong_count() > 0
+    }
+}
+
+static SYNTAX_CACHE: Mutex<SyntaxCache> = Mutex::new(SyntaxCache::new());
+
+fn syntax_cache() -> MutexGuard<'static, SyntaxCache> {
+    SYNTAX_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// ハイライタの借用チケット（#815）。**これが生きている間は構文セットが解放されない**ので、
+/// background のハイライト実行中に足元が消えることが型として起こり得ない。
+pub struct SyntaxLease(Arc<SyntectHighlighter>);
+
+impl Highlighter for SyntaxLease {
+    fn highlight(&self, path: &Path, text: &str) -> Vec<Line> {
+        self.0.highlight(path, text)
+    }
+
+    fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line> {
+        self.0.highlight_lang(lang, text)
+    }
+}
+
+/// 既定ハイライタを借りる。載っていなければここでロードする（実測 0.6〜1.2 ms）
+pub fn highlighter() -> SyntaxLease {
+    syntax_cache().acquire(Instant::now())
+}
+
+/// 保持を手放してよいか（純関数。テストが実時間を待たないための切り出し）
+pub(crate) fn syntax_release_due(idle: Duration, text_preview_open: bool) -> bool {
+    // テキストのプレビューが 1 枚も無ければ猶予を待たない（閉じた直後に返す）
+    !text_preview_open || idle >= SYNTAX_IDLE_GRACE
+}
+
+/// 解放をやめて旧挙動（プロセス常駐）へ戻す逃げ道（`TAKO_815_NO_SYNTAX_RELEASE=1`）。
+/// #815 の効果を同じバイナリで A/B するためのもの（#786 / #787 / #803 と同じ流儀）
+pub(crate) fn syntax_release_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_815_NO_SYNTAX_RELEASE").is_some())
+}
+
+/// 使っていない構文セットを手放す（2 秒 tick から呼ぶ。#815）。
+/// 実際の解放は最後の [`SyntaxLease`] が落ちた時点で起こるので、ハイライト中に呼んでも安全。
+/// 戻り値 = このターンで保持を手放したか
+pub fn release_idle_syntax(now: Instant, text_preview_open: bool) -> bool {
+    if syntax_release_disabled() {
+        return false;
+    }
+    syntax_cache().release_idle(now, text_preview_open)
+}
+
+/// 構文セットが今メモリに載っているか（診断・セルフテスト用）
+pub fn syntax_resident() -> bool {
+    syntax_cache().resident()
 }
 
 /// syntect 実装（bat / delta と同系の定番。純 Rust 構成 = regex-fancy）
@@ -3352,6 +3472,141 @@ mod syntax_resolution_tests {
         let path = std::path::Path::new("script");
         let syn = hl.syntax_for_path(path, "#!/bin/bash\necho hello");
         assert_ne!(syn.name, "Plain Text", "shebang で構文が特定される");
+    }
+
+    /// #815 で構文セットの寿命に手を入れたので、#320 の対応言語が縮退していないことを
+    /// **登録済み拡張子の全数**で押さえる（軽い既定セットへ落とす案を採ると必ず落ちる）
+    #[test]
+    fn 登録済み拡張子は全数が構文へ解決する() {
+        let hl = SyntectHighlighter::new();
+        let mut checked = 0usize;
+        let mut missing: Vec<String> = Vec::new();
+        for syntax in hl.syntaxes.syntaxes() {
+            for ext in &syntax.file_extensions {
+                checked += 1;
+                if hl.syntaxes.find_syntax_by_extension(ext).is_none() {
+                    missing.push(ext.clone());
+                }
+            }
+        }
+        assert!(missing.is_empty(), "解決できない拡張子: {missing:?}");
+        // two-face（bat 由来）の規模。syntect 同梱の既定セットは 75 構文 / 拡張子も
+        // 半分以下なので、セットを差し替えたらこの下限で気づける
+        assert!(
+            hl.syntaxes.syntaxes().len() >= 200,
+            "構文数が縮退している: {}",
+            hl.syntaxes.syntaxes().len()
+        );
+        assert!(checked >= 550, "拡張子の登録数が縮退している: {checked}");
+    }
+}
+
+/// Issue #815: 構文セットの寿命（使っている間だけ載せ、使い終われば手放す）。
+///
+/// グローバルは並列テストで他のテストと衝突するため、判定はローカルの
+/// [`SyntaxCache`] に対して行う（同じ実装をグローバルが薄く包んでいる）。
+#[cfg(test)]
+mod syntax_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn 解放判定はプレビューの有無と猶予で決まる() {
+        // プレビューが 1 枚も無ければ猶予を待たない
+        assert!(syntax_release_due(Duration::ZERO, false));
+        // 開いている間は猶予まで保持する（編集の連続打鍵で毎回ロードし直さない）
+        assert!(!syntax_release_due(Duration::ZERO, true));
+        assert!(!syntax_release_due(
+            SYNTAX_IDLE_GRACE - Duration::from_millis(1),
+            true
+        ));
+        assert!(syntax_release_due(SYNTAX_IDLE_GRACE, true));
+    }
+
+    #[test]
+    fn 借用中は保持を手放しても解放されない() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        let lease = cache.acquire(now);
+        assert!(cache.resident(), "借りた直後は載っている");
+
+        // プレビュー 0 枚 = 即時解放の条件でも、借用が生きている間は解放されない
+        assert!(cache.release_idle(now, false), "保持は手放す");
+        assert!(
+            cache.resident(),
+            "借用チケットが生きている間は構文セットが残る（background ハイライトの足元）"
+        );
+
+        // ハイライトは借用中ずっと成立する
+        let lines = lease.highlight(Path::new("a.rs"), "fn main() {}\n");
+        assert_eq!(lines.len(), 1);
+
+        drop(lease);
+        assert!(!cache.resident(), "最後の借用が落ちた時点で解放される");
+    }
+
+    #[test]
+    fn 猶予内は載せたまま_猶予を過ぎたら手放す() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        drop(cache.acquire(now));
+        assert!(cache.resident());
+
+        // プレビューを開いたまま・猶予内 = 保持（再ハイライトが速い）
+        assert!(!cache.release_idle(now + Duration::from_secs(1), true));
+        assert!(cache.resident());
+
+        // 猶予を過ぎたら開いたままでも手放す（借用は無いので即解放）
+        assert!(cache.release_idle(now + SYNTAX_IDLE_GRACE, true));
+        assert!(!cache.resident());
+        // 2 回目は「もう手放している」ので false（tick が毎回仕事をしない）
+        assert!(!cache.release_idle(now + SYNTAX_IDLE_GRACE, true));
+    }
+
+    #[test]
+    fn 解放後に借り直しても同じ色が出る() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        let sample = "fn main() {\n    let x = 1; // コメント\n}\n";
+
+        let before = cache.acquire(now).highlight(Path::new("sample.rs"), sample);
+        assert!(cache.release_idle(now, false));
+        assert!(!cache.resident(), "解放されている");
+
+        let after = cache.acquire(now).highlight(Path::new("sample.rs"), sample);
+        assert!(cache.resident(), "借り直しでロードし直される");
+        assert_eq!(before, after, "再ロード後も色・区切りが一致する");
+        // 色が実際に付いていること（両方とも素のテキストでは検査にならない）
+        assert!(
+            before.iter().flatten().any(|s| s.color.is_some()),
+            "ハイライトの色が付いている"
+        );
+    }
+
+    #[test]
+    fn 借用が重なっても構文セットは1つ() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        let a = cache.acquire(now);
+        let b = cache.acquire(now);
+        assert!(
+            Arc::ptr_eq(&a.0, &b.0),
+            "同時に借りたチケットは同じ構文セットを指す（二重ロードしない）"
+        );
+        drop(a);
+        assert!(cache.resident(), "1 枚残っていれば載ったまま");
+        drop(b);
+        assert!(cache.release_idle(now, false));
+        assert!(!cache.resident());
+    }
+
+    #[test]
+    fn グローバル経路も借用と解放が成立する() {
+        // グローバルは他のテストと共有なので、「借りたら載る」だけを見る
+        // （解放の判定はローカル cache 側のテストが担う）
+        let lease = highlighter();
+        assert!(syntax_resident(), "借りている間は載っている");
+        let lines = lease.highlight(Path::new("g.rs"), "fn main() {}\n");
+        assert_eq!(lines.len(), 1);
     }
 }
 

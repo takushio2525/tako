@@ -3719,6 +3719,14 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:pane_log");
                         app.collect_pane_log_work()
                     };
+                    // 使っていない構文セットを手放す（#815）。ハイライト済みの色は
+                    // プレビュー側が持っているので、開いたままでも猶予経過で解放できる。
+                    // 実解放は最後の借用（SyntaxLease）が落ちた時点なので background の
+                    // ハイライト中に呼んでも安全
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:syntax_release");
+                        app.release_idle_syntax();
+                    }
                     app.save_layout();
                     let filetree_targets = if app.filetree.visible {
                         let _s = tako_control::diag::perf_span("periodic_prep:filetree_targets");
@@ -8744,6 +8752,18 @@ impl TakoApp {
             }
         }
         cx.notify();
+    }
+
+    /// 使っていない構文セットを手放す（#815）。テキストのプレビューも編集セッションも
+    /// 無ければ猶予を待たずに返し、あるなら最後のハイライトから
+    /// [`preview::SYNTAX_IDLE_GRACE`] 経過してから返す。戻り値 = 手放したか
+    fn release_idle_syntax(&self) -> bool {
+        let text_preview_open = self
+            .previews
+            .values()
+            .any(preview::PreviewState::needs_syntax)
+            || !self.preview_edits.is_empty();
+        preview::release_idle_syntax(std::time::Instant::now(), text_preview_open)
     }
 
     fn refresh_preview_from_editor(&mut self, pane_id: PaneId) {
@@ -19756,6 +19776,37 @@ mod self_test {
                     .ok()
             })
             .await
+    }
+
+    /// `wait_for_preview_state` の描画つき版（#796 / #786）。
+    ///
+    /// 待つ対象が「描画のときにしか進まないもの」（キャッシュされたビューの幾何など）でも
+    /// 進むよう、ポーリングのたびに `notify_and_draw` で 1 フレーム進める。
+    /// セルフテストのウィンドウは前面とは限らず、自然な描画が来ないことがある
+    async fn wait_for_preview_drawn<F>(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        timeout: Duration,
+        predicate: F,
+    ) -> Option<Duration>
+    where
+        F: Fn(&TakoApp) -> bool,
+    {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            notify_and_draw(any, window, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            if window
+                .update(cx, |app, _, _| predicate(app))
+                .unwrap_or(false)
+            {
+                return Some(started.elapsed());
+            }
+        }
+        None
     }
 
     /// OS イベント→デバウンス→background 読み込み→UI 差し替えの
@@ -43507,6 +43558,265 @@ mod self_test {
                     let _ = window.update(cx, |app, _, cx| {
                         app.remove_pane(p, cx);
                     });
+                }
+            }
+
+            // 112: 構文セットはプレビューを閉じたら手放す（#815）。
+            // 旧実装（OnceLock のプロセス常駐）へ戻すと「閉じた後も載っている」で FAILED になる。
+            if preview::syntax_release_disabled() {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 112（TAKO_815_NO_SYNTAX_RELEASE で解放を無効化）"
+                );
+            } else {
+                let any815 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window815 = any815.downcast::<TakoApp>().unwrap_or(window);
+                // 小さい実ファイルを Code モードで開く（大きいファイルは debug ビルドだと
+                // ハイライトそのものに数十秒かかり、寿命の検査が待ち時間に化ける）
+                let dir815 = std::env::temp_dir().join(format!("tako-815-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir815);
+                let src = dir815.join("sample.rs");
+                let _ = std::fs::write(
+                    &src,
+                    "fn main() {\n    let x: u32 = 1; // コメント\n    println!(\"{x}\");\n}\n",
+                );
+                // 開いたあと `drain_pending_highlights` を呼ぶ。dispatch は syntect
+                // ハイライトを `pending_highlights` へ積むだけで、drain するのは
+                // **UI 経路と IPC 受信ループ**（`control_rx` のループ）なので、
+                // セルフテストの直接 dispatch では誰も drain しない = 色が付かない。
+                // 本番の CLI / MCP は IPC 経由なので必ず drain される
+                let open815 = |app: &mut TakoApp,
+                               cx: &mut Context<TakoApp>,
+                               path: &std::path::Path|
+                 -> Result<PaneId, String> {
+                    // 基準ペインは「フォーカス → 各ターミナル」の順に試す。この時点の
+                    // フォーカスは先行項目次第でプレビューや webview のこともあり、
+                    // そこからの分割は失敗しうる
+                    let mut bases = vec![app.focused_pane()];
+                    bases.extend(app.terminals.keys().copied());
+                    let mut last = "基準ペインが無い".to_string();
+                    for base in bases {
+                        let res = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(base.as_u64()),
+                                path: path.display().to_string(),
+                                mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                direction: Some(tako_control::protocol::Direction::Right),
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        match res {
+                            Ok(v) => {
+                                app.drain_pending_highlights(cx);
+                                cx.notify();
+                                if let Some(pane) = v["pane"].as_u64() {
+                                    return Ok(PaneId::from_raw(pane));
+                                }
+                                last = format!("応答に pane が無い: {v}");
+                            }
+                            Err(e) => last = format!("base={} err={e}", base.as_u64()),
+                        }
+                    }
+                    Err(last)
+                };
+                let opened = window815
+                    .update(cx, |app: &mut TakoApp, _, cx| open815(app, cx, &src))
+                    .unwrap_or_else(|e| Err(format!("update 失敗: {e}")));
+                match opened.map_err(|e| {
+                    println!("TAKO_SELF_TEST_815_OPEN: {e}");
+                }) {
+                    Err(()) => fail("112: 構文セット検証用のプレビューを開けない (#815)"),
+                    Ok(pane) => {
+                        // background ハイライトの完了（色が付く）まで待つ
+                        let highlighted = wait_for_preview_drawn(
+                            any815,
+                            window815,
+                            cx,
+                            Duration::from_secs(20),
+                            |app: &TakoApp| match app.previews.get(&pane).map(|s| &s.content) {
+                                Some(preview::PreviewContent::Code(lines)) => {
+                                    lines.iter().flatten().any(|span| span.color.is_some())
+                                }
+                                _ => false,
+                            },
+                        )
+                        .await;
+                        let probe815 = window815
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let state = app.previews.get(&pane);
+                                let kind = match state.map(|s| &s.content) {
+                                    Some(preview::PreviewContent::Code(lines)) => format!(
+                                        "code(lines={} colored={})",
+                                        lines.len(),
+                                        lines
+                                            .iter()
+                                            .flatten()
+                                            .filter(|s| s.color.is_some())
+                                            .count()
+                                    ),
+                                    Some(other) => format!("{other:?}").chars().take(24).collect(),
+                                    None => "なし".into(),
+                                };
+                                format!(
+                                    "pane={} previews={} content={kind} pending={}",
+                                    pane.as_u64(),
+                                    app.previews.len(),
+                                    app.pending_highlights.len()
+                                )
+                            })
+                            .unwrap_or_else(|_| "取得失敗".into());
+                        println!("TAKO_SELF_TEST_815: {probe815}");
+                        check(
+                            highlighted.is_some(),
+                            "112: コードプレビューがハイライトされる (#815)",
+                        );
+                        check(
+                            preview::syntax_resident(),
+                            "112: ハイライト中は構文セットが載っている (#815)",
+                        );
+                        // 開いている間は猶予まで保持する（編集の連続打鍵で毎回ロードし直さない）
+                        let released_while_open = window815
+                            .update(cx, |app: &mut TakoApp, _, _| app.release_idle_syntax())
+                            .unwrap_or(false);
+                        check(
+                            !released_while_open && preview::syntax_resident(),
+                            "112: 開いている間は猶予内なら手放さない (#815)",
+                        );
+                        // 猶予を過ぎたら「開いたまま」でも手放す（実時間は待たず、tick へ
+                        // 猶予ぶん先の時刻を渡す）。表示中の色は PreviewContent が持っている
+                        let released_idle = preview::release_idle_syntax(
+                            std::time::Instant::now() + preview::SYNTAX_IDLE_GRACE,
+                            true,
+                        );
+                        check(
+                            released_idle && !preview::syntax_resident(),
+                            "112: 開いたままでも猶予を過ぎたら手放す (#815)",
+                        );
+                        let still_colored = window815
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                matches!(
+                                    app.previews.get(&pane).map(|s| &s.content),
+                                    Some(preview::PreviewContent::Code(lines))
+                                        if lines.iter().flatten().any(|s| s.color.is_some())
+                                )
+                            })
+                            .unwrap_or(false);
+                        check(
+                            still_colored,
+                            "112: 手放しても表示中の色はそのまま残る (#815)",
+                        );
+                        // ライブリロード（#233）: 解放後にファイルが変わっても、
+                        // background が構文セットを借り直して色つきで差し替える
+                        let _ = std::fs::write(
+                            &src,
+                            "fn main() {\n    let y: u32 = 2; // 追記\n    println!(\"{y}\");\n}\n\nfn added() {}\n",
+                        );
+                        let reloaded = wait_for_preview_drawn(
+                            any815,
+                            window815,
+                            cx,
+                            Duration::from_secs(20),
+                            |app: &TakoApp| match app.previews.get(&pane).map(|s| &s.content) {
+                                Some(preview::PreviewContent::Code(lines)) => {
+                                    lines.iter().flatten().any(|s| s.text.contains("added"))
+                                        && lines.iter().flatten().any(|s| s.color.is_some())
+                                }
+                                _ => false,
+                            },
+                        )
+                        .await;
+                        check(
+                            reloaded.is_some(),
+                            "112: 解放後のライブリロードでも色が付く (#815 / #233)",
+                        );
+                        // 「テキストのプレビューが 1 枚も無ければ猶予を待たない」規則を
+                        // 観測するため、先行項目が残したプレビューも含めて全部閉じる
+                        // （項目 111 は quit の直前なので他項目への影響は無い）
+                        let closed = window815
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let targets: Vec<PaneId> = app
+                                    .previews
+                                    .iter()
+                                    .filter(|(_, state)| state.needs_syntax())
+                                    .map(|(id, _)| *id)
+                                    .collect();
+                                let had_mine = targets.contains(&pane);
+                                for id in targets {
+                                    let _ = tako_control::dispatch(
+                                        app,
+                                        tako_control::protocol::Request::Close {
+                                            pane: Some(id.as_u64()),
+                                            force: true,
+                                            caller_role: None,
+                                        },
+                                        PaneOrigin::Cli,
+                                    );
+                                }
+                                cx.notify();
+                                had_mine
+                                    && !app
+                                        .previews
+                                        .values()
+                                        .any(preview::PreviewState::needs_syntax)
+                            })
+                            .unwrap_or(false);
+                        check(
+                            closed,
+                            "112: テキストのプレビューを全部閉じられる (#815)",
+                        );
+                        let released = window815
+                            .update(cx, |app: &mut TakoApp, _, _| app.release_idle_syntax())
+                            .unwrap_or(false);
+                        check(released, "112: 閉じたら構文セットの保持を手放す (#815)");
+                        check(
+                            !preview::syntax_resident(),
+                            "112: 閉じた後は構文セットが載っていない (#815)",
+                        );
+                        // 開き直しでロードし直され、色が復活する（解放が片道切符でない）
+                        let reopened = window815
+                            .update(cx, |app: &mut TakoApp, _, cx| open815(app, cx, &src))
+                            .unwrap_or_else(|e| Err(format!("update 失敗: {e}")))
+                            .ok();
+                        match reopened {
+                            None => fail("112: プレビューを開き直せない (#815)"),
+                            Some(again) => {
+                                let recolored = wait_for_preview_drawn(
+                                    any815,
+                                    window815,
+                                    cx,
+                                    Duration::from_secs(20),
+                                    |app: &TakoApp| {
+                                        match app.previews.get(&again).map(|s| &s.content) {
+                                            Some(preview::PreviewContent::Code(lines)) => lines
+                                                .iter()
+                                                .flatten()
+                                                .any(|span| span.color.is_some()),
+                                            _ => false,
+                                        }
+                                    },
+                                )
+                                .await;
+                                check(
+                                    recolored.is_some(),
+                                    "112: 解放後に開き直しても色が付く (#815)",
+                                );
+                                let _ = window815.update(cx, |app: &mut TakoApp, _, cx| {
+                                    let _ = tako_control::dispatch(
+                                        app,
+                                        tako_control::protocol::Request::Close {
+                                            pane: Some(again.as_u64()),
+                                            force: true,
+                                            caller_role: None,
+                                        },
+                                        PaneOrigin::Cli,
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        }
+                        let _ = std::fs::remove_dir_all(&dir815);
+                    }
                 }
             }
 

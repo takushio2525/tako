@@ -3,53 +3,53 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-15、#813 リミット後の自動復帰）
+## 現在の対象（2026-08-15、#815 = 構文セットのメモリ寿命）
 
-- ブランチ `feat/813-limit-autoresume`（worktree `~/dev/tako-wt-813`）。base は `af625b1`（v0.7.1）
-- ペイン単位でオプトインすると、5h / 週次上限で止まったエージェントを
-  リセット時刻後に tako が自動で再開させる（FR-2.27 新設）
+- ブランチ `improve/815-syntax-memory`（worktree `~/dev/tako-wt-815`、base = `af625b1` v0.7.1）
+- #814（Phase 1 実測監査）の子。`preview::highlighter()` の `OnceLock` 常駐を
+  **借用チケット（`SyntaxLease`）+ 無使用の解放**へ変えた
 
-## 層の分け方（この機能の読み方）
+## 実測で覆した前提（Issue の推奨案は棄却した）
 
-- `tako_core::limit_resume` — **純関数だけ**。発動判断（`decide`）・リセット時刻の
-  パース（`parse_reset_at`。now とタイムゾーンは引数で注入）・安全な選択肢の選別
-  （`safe_choice` = 許可リスト **かつ** 拒否リスト）
-- `tako_control::limit_stop` — 既存の検知（#748 のダイアログ種別 / #157 の画面パターン）を
-  束ねて `LimitStop` にするだけ。**新しい検知規則は足していない**
-- `tako-app::limit_autoresume` — 2 秒 tick の駆動。有効ペインが 0 なら即 return
+- **構文セットの器は 1.04 MB / ロード 1.2 ms しかない**。98 MB の正体は
+  **ハイライトした言語ごとの遅延展開**（Rust +5.1 / bash +10.9 / md +10.9 / **TS +32.0 MB**。
+  18 言語で 149 MB）。syntect に言語単位で捨てる API は無い = 捨てる単位はセット全体だけ
+- よって Issue 推奨の「段階ロード（軽い既定セット → 昇格）」は**器の 0.64 MB しか減らない**のに
+  未対応拡張子 363 件の回帰リスクを負う → 採らない。`ThemeSet` 案も 0.11 MB で無意味
 
-## 踏み抜きどころ（次に触る人へ）
+## 効果（隔離・同一バイナリ A/B。`TAKO_815_NO_SYNTAX_RELEASE=1` が旧挙動）
 
-- **リセット時刻はエピソード開始時に確定して途中で更新しない**。画面には古い上限
-  メッセージが残るので、毎 tick 読み直すと復帰予定が後ろへずれ続ける
-- 裏返しの既知の限界: 上限中に tako を再起動すると初観測が「今」になるため、
-  すでに過ぎたリセット時刻は**翌日の同時刻**として解釈される（安全側だが復帰しない）
-- ダイアログへの応答は `respond_to_choice_dialog`（dispatch から切り出したホスト非依存版）を
-  **background** で呼ぶ。UI スレッドで呼ぶとキー送出のスリープでフレームが止まる
-- `safe_limit_choice`（supervisor #401）も core の `safe_choice` へ寄せたので、
-  拒否リストは自動復帰と supervisor の両方に効く
+| 段階（小 .rs + 小 .ts） | before（常駐） | after（#815） |
+|---|---|---|
+| 起動直後 | 12.96 MB | 13.06 MB |
+| 2 枚開いた | 83.95 MB | 82.91 MB |
+| **開いたまま 40 秒** | 83.55 MB（不変） | **13.05 MB（−69.9）** |
+| **2 枚とも閉じた** | 83.57 MB（戻らない） | **13.04 MB = 起動直後へ完全復帰** |
 
-## 検証の状態（すべて実施済み）
+## 別件を発見（#815 の対象外・起票する）
 
-- 品質ゲート: fmt / clippy(-D warnings) / `cargo test --workspace` 全緑（新規 unit 36 本）
-- Windows クロスチェック: エラー 0 / 警告 16（main と同数）
-- 隔離セルフテスト: **完走（`TAKO_APP_SELF_TEST_OK`、FAILED 0）**。項目 111 =
-  正例 2 型（ダイアログ / idle）+ 負例 3 型（OFF / permission / api_error）+
-  試行上限 + list・read の一致 + 保存表現への反映（`Some((4, 4))`）
-- visual-test: 全節 `TAKO_VISUAL_TEST_OK`（98 checkpoint）
-- docs: `npm run build` 24 ページ緑
-- 途中 1 回だけ #739（スターターのプロファイル ▾）が落ちたが、同一バイナリの
-  再実行で通ったので**負荷起因のフレーク**（load 7 前後で発生、4 前後では再現せず）
+**大きいファイルのプレビューは行数に比例したヒープが残り、閉じても解放されない**。
+3629 行の .rs で 12.6 → 183.1 MB、閉じても 162.7 MB（**150 MB 残留**）。
+開閉 3 往復で 162.7 → 196.4 → 205.8 MB と積み増す。10 行の .rs は 13.0 → 20.9 → 13.8 MB で
+ほぼ完全に戻るので**行数依存**。同じ言語なので syntect ではない（A/B の両側で残る）。
+約 41 KB/行。疑いは行ごとの TextLayout / hit-test 索引（#145 / #725）か GPUI の行レイアウト
+
+## 踏み抜いた罠
+
+- **`pgrep -f <絶対パス>` は相対パス起動にマッチしない** → `TAKO_SOCKET` が空パスになり、
+  CLI が discovery へフォールバックして**本番インスタンスに届いた**（実行は read-only の
+  `list` のみで実害ゼロ）。隔離検証では pid を `$!` で取り、socket の実在を確認してから使う
+- `tako open` は tako ペインの外から呼ぶと `--pane` 必須（`TAKO_PANE_ID` が無いため）
+- bash 3.2 は `$P1）` のような**全角括弧直後の変数展開**を識別子の一部として読む → `${P1}` で囲む
+- debug ビルド + `MallocStackLogging=1` は gimli の記号解決で 110 MB 積むので、
+  メモリの attribution には使えない（release で測ること）
 
 ## 次の一手
 
-- PR #820（`Closes #813`）の macOS CI 緑を待って squash merge → `build-app.sh --install`
-- GUI の見た目（右クリック項目・ヘッダのアイコン・英語表示）と、実際に上限を踏んだ
-  ときの手触りは `.agent/manual-checks.md`「リミット後の自動復帰（#813）」で確認する
+- 隔離セルフテスト（項目 112 新設）と visual-test 全節 → PR（`Closes #815` / `Refs #814`）
+- 行数依存の残留を新規 Issue へ起票（`Refs #814`）
 
 ## 現フェーズで Read すべき設計書
 
-- 要件: `.agent/requirements.md` FR-2.27（安全条件と発動条件の正）
-- 使い方: `.agent/orchestrator.md`「リミット後の自動復帰」
-- 既存資産: #748（`tako_core::dialog` / `claude_tui::DialogKind`）・#157（`wait::detect_worker_error`）・
-  #749（`drive_handoff_nudge` = 2 秒 tick の先例）・#401（`orchestrator::supervisor`）
+- `.agent/architecture.md`「構文セットの寿命（#815）」= 計測値と採否の根拠
+- `crates/tako-app/src/preview.rs` の `SyntaxCache` / `SyntaxLease` / `release_idle_syntax`
