@@ -29,18 +29,23 @@
 - `safe_limit_choice`（supervisor #401）も core の `safe_choice` へ寄せたので、
   拒否リストは自動復帰と supervisor の両方に効く
 
-## 検証の状態
+## 検証の状態（すべて実施済み）
 
-- 品質ゲート: fmt / clippy(-D warnings) / `cargo test --workspace` 全緑
-- 隔離セルフテスト: 1 回目は**項目 99（#739 スターターのプロファイル ▾）**で FAILED。
-  項目 111 より前で落ちるため未到達 → main 由来かの切り分け中
-- 隔離 e2e（項目 111）: 正例 2 型（ダイアログ / idle）+ 負例 3 型（OFF / permission /
-  api_error）+ 試行上限 + list・read の一致
+- 品質ゲート: fmt / clippy(-D warnings) / `cargo test --workspace` 全緑（新規 unit 36 本）
+- Windows クロスチェック: エラー 0 / 警告 16（main と同数）
+- 隔離セルフテスト: **完走（`TAKO_APP_SELF_TEST_OK`、FAILED 0）**。項目 111 =
+  正例 2 型（ダイアログ / idle）+ 負例 3 型（OFF / permission / api_error）+
+  試行上限 + list・read の一致 + 保存表現への反映（`Some((4, 4))`）
+- visual-test: 全節 `TAKO_VISUAL_TEST_OK`（98 checkpoint）
+- docs: `npm run build` 24 ページ緑
+- 途中 1 回だけ #739（スターターのプロファイル ▾）が落ちたが、同一バイナリの
+  再実行で通ったので**負荷起因のフレーク**（load 7 前後で発生、4 前後では再現せず）
 
 ## 次の一手
 
-- セルフテスト完走の確認（#739 が main 由来なら Issue へ切り出す）
-- visual-test 全節 → PR（`Closes #813`）→ macOS CI → squash merge → `build-app.sh --install`
+- PR #820（`Closes #813`）の macOS CI 緑を待って squash merge → `build-app.sh --install`
+- GUI の見た目（右クリック項目・ヘッダのアイコン・英語表示）と、実際に上限を踏んだ
+  ときの手触りは `.agent/manual-checks.md`「リミット後の自動復帰（#813）」で確認する
 
 ## 現フェーズで Read すべき設計書
 

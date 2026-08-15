@@ -1996,4 +1996,7 @@
 - 層は 3 つ: `tako_core::limit_resume`（純関数の判断・時刻パース・選択肢選別）/
   `tako_control::limit_stop`（#748 と #157 の既存検知を束ねるだけ）/ `tako-app::limit_autoresume`
   （2 秒 tick。有効ペイン 0 なら即 return）。supervisor（#401）の `safe_limit_choice` も core へ寄せた
-- 次: PR（Closes #813）→ macOS CI → squash merge → `build-app.sh --install`
+- 検証: 品質ゲート全緑 + 隔離セルフテスト完走（項目 111 新設 = 正例 2 型 / 負例 3 型 /
+  試行上限 / list・read の一致）+ visual-test 全節（98 checkpoint）+ Windows クロスチェック
+  （エラー 0 / 警告 16 = main 同数）
+- 次: PR #820（Closes #813）→ macOS CI → squash merge → `build-app.sh --install`
