@@ -225,6 +225,34 @@ worker spawn の配置を「呼び出し元の右に等分割」から差し替�
   失敗時はペインを巻き戻して CLI / MCP へエラー応答する。
   回帰はセルフテスト 40 / 40b（split→close ストレス + fd リーク検査）で機械検証する
 
+### PTY IO ループは tako 側に持つ（`tako-core::pty_loop`。#817）
+
+alacritty_terminal の `EventLoop` は使わず、**同等のループを tako が持つ**。理由は 1 点だけ:
+
+upstream は reader スレッドの**スタック**に `[0u8; READ_BUFFER_SIZE]`（1 MiB）を置く。
+ゼロ初期化なのでスレッド開始時点で全ページが dirty になり、**ペイン 1 枚 = 約 1.03 MB が常駐**
+していた（16 ペインで stack 17 MB。#814 の実測）。`READ_BUFFER_SIZE` は `pub(crate)` で
+外から下げられず、`Builder::stack_size` を絞っても memset された分は reserve ではなく
+resident なので減らない（減るのは仮想サイズだけ）。**バッファをヒープへ動かすには
+ループ自体を持つしかない**。
+
+移植にあたっての約束:
+
+- **挙動は upstream と同一に保つ**。ロック粒度（`MAX_LOCKED_READ` = 64 KiB）、
+  バッファ上限に達したときのブロッキングロック（= PTY のバックプレッシャ特性）、
+  シャットダウン順序（`Msg::Shutdown` → ループ脱出 → `deregister`）を変えない
+- 読み取りバッファは 64 KiB 始まり。ロックが取れている通常経路は `MAX_LOCKED_READ` で
+  打ち切られるので **read / parse の回数は upstream と同じ**。足りないとき（ロック競合中に
+  64 KiB を超えて届いたとき）だけ上限 1 MiB まで倍々で伸ばし、`pty_read` の最後に戻す
+- poller のトークンは Windows では upstream が `pub` で出しているものを使い、Unix だけ
+  `pub(crate)` の値を写す。**写し違いはハングとして現れるので単体テストで潰す**
+  （実 PTY を張って読み取り / 子プロセス終了イベントのキーを確認する。値を壊すと
+  ハングではなく FAILED になるところまで作ってある）
+- 由来と改変内容の告知は `THIRD-PARTY-NOTICES.md`（Apache-2.0 → GPL-3.0-or-later は一方向互換）
+
+alacritty_terminal を上げるときは `event_loop.rs` の差分を見て、上の 3 点（ロック粒度・
+上限到達時の挙動・トークン）に変更が無いかを確認すること。
+
 ## 制御プレーン（コンセプト①の 3 層）
 
 ### 環境変数注入（共通基盤）

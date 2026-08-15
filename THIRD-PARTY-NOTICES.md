@@ -1,17 +1,71 @@
 # サードパーティ告知 / Third-Party Notices
 
 tako 本体は [GPL-3.0-or-later](LICENSE) だが、配布物（`tako.app` / リリース zip）には
-別ライセンスの第三者成果物を**改変せず**同梱している。ここはその一覧と告知。
+別ライセンスの第三者成果物を同梱している（そのまま同梱したものと、改変して取り込んだものがある）。
+ここはその一覧と告知。
 
 tako itself is licensed under [GPL-3.0-or-later](LICENSE), but the distributed
-artifacts bundle third-party works, unmodified, under their own licenses.
-This file is the required notice for those works.
+artifacts bundle third-party works under their own licenses — some verbatim,
+some adapted. This file is the required notice for those works.
 
 Rust クレートの依存関係はここには列挙しない（`Cargo.lock` と `cargo license` が正本）。
-ここに書くのは**ソースツリーへ直接コピーして配布している**もの。
+ここに書くのは**ソースツリーへ直接取り込んで配布している**もの。
 
 Rust crate dependencies are not listed here (`Cargo.lock` plus `cargo license` is the
-source of truth). This file covers works **copied into this source tree** verbatim.
+source of truth). This file covers works **incorporated into this source tree**.
+
+---
+
+## alacritty_terminal（PTY IO ループの移植 / adapted PTY IO loop）
+
+- バージョン / Version: **0.26.0**
+- 用途 / Used for: PTY の読み書きと VT パースを回す IO スレッド。
+  upstream の `EventLoop::spawn()` は reader スレッドのスタックへ 1 MiB の配列を置き、
+  ペイン 1 枚につき約 1 MB が常駐していた（Issue #817）。この定数は `pub(crate)` で
+  外から下げられないため、ループを tako 側へ取り込んで**読み取りバッファだけ
+  ヒープへ移した**
+- 取り込み先 / Incorporated into: `crates/tako-core/src/pty_loop.rs`
+- 上流 / Upstream: https://github.com/alacritty/alacritty
+  （`alacritty_terminal/src/event_loop.rs`）
+- ライセンス / License: Apache-2.0
+  （全文: https://www.apache.org/licenses/LICENSE-2.0 。
+  クレート同梱の `LICENSE-APACHE` と同一）
+
+### 加えた変更 / Changes made
+
+Apache-2.0 セクション 4(b) が要求する「改変の明示」:
+
+- 読み取りバッファをスタックの `[0u8; READ_BUFFER_SIZE]` から、64 KiB 始まりで
+  必要時のみ `READ_BUFFER_SIZE` まで伸びるヒープの `Vec<u8>` へ置き換えた（Issue #817）
+- tako が使っていなかった `ref_test`（PTY 出力の記録ファイル書き出し）と
+  `drain_on_exit` を削除した
+- ログ出力を `log` クレートから tako が使う `tracing` へ差し替え、文言を日本語にした
+- IO スレッドで panic していた 2 箇所（送信側が全部落ちたときのチャネル受信と、
+  write interest の再登録失敗）を、記録してループを畳む静かな終了へ倒した。
+  tako はペイン単位でセッションを捨てるので、IO スレッドの panic は事故になりやすい
+- Unix でのみ `pub(crate)` の `PTY_READ_WRITE_TOKEN` / `PTY_CHILD_EVENT_TOKEN` を
+  同じ値で再定義した（Windows は upstream が `pub` で出しているのでそれを使う）。
+  値のずれは実 PTY を張る単体テストで検出する
+- 型名を tako の文脈に合わせて改名した（`EventLoop` → `PtyLoop`、
+  `EventLoopSender` → `LoopSender`、`EventLoopSendError` → `SendError`）
+
+The read buffer was moved from a 1 MiB stack array to a heap `Vec<u8>` that starts at
+64 KiB and grows on demand; `ref_test` and `drain_on_exit` were dropped; logging was
+switched from `log` to `tracing`; the Unix-only `pub(crate)` poller tokens were
+re-declared with the same values (guarded by a unit test against a real PTY); and the
+types were renamed to fit tako's naming.
+
+### GPL との関係 / Relationship to the GPL
+
+Apache-2.0 は GPL-3.0 と**一方向に互換**（Apache-2.0 のコードを GPL-3.0-or-later の
+著作物へ取り込める）であり、取り込んだ結果は tako 全体と同じ GPL-3.0-or-later で配布する。
+Apache-2.0 が課す義務 — 出所・ライセンスの表示と改変の明示 — は本節と
+`crates/tako-core/src/pty_loop.rs` 冒頭のコメントで満たす。
+
+Apache-2.0 is one-way compatible with GPL-3.0: Apache-2.0 code may be incorporated into a
+GPL-3.0-or-later work, and the result is distributed under tako's GPL-3.0-or-later terms.
+The obligations — attribution, license notice, and stating the changes — are satisfied by
+this section and by the header comment of `crates/tako-core/src/pty_loop.rs`.
 
 ---
 
