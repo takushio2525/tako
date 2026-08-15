@@ -2030,3 +2030,14 @@
 - 挙動: 4 ペイン洪水完走・26 KB 貼り付けの往復がバイト等価（md5 一致）・seq 50000 の末尾連続・
   洪水後も CLI 応答。Unix の poller トークンは実 PTY を張る単体テストで検出（壊すとハングでなく FAILED）
 - 関連コミット: PR（Closes #817 / Refs #814）。由来と改変は `THIRD-PARTY-NOTICES.md` へ追記
+
+## 2026-08-15（#821: コードプレビューの行数比例リークを仮想化で根治）
+- 根因は allocation プロファイルで確定: 全行ぶんの element を毎フレーム作るため、
+  1 フレームぶんの測定レイアウトノードが taffy の `node_context_data` に残り続ける
+  （`TaffyTree::clear()` がこれを消さない）+ アリーナ / フレーム Vec の高水位。
+  `gpui::list` で可視行だけ描く形へ変え、閉じたあとの残留 110.1 MB → 2.2 MB（1 万行は
+  footprint 210 → 46 MB）。見た目は旧経路と実ピクセル差 0（visual-test `preview-code` 節を新設）
+- 同梱: CLI / MCP の close がプレビュー状態を落としていなかった実バグを
+  `drop_preview_pane_state` への集約 + 番犬テストで根治
+- 事故: 後始末の `pkill -x tako-app` が本番 GUI にも当たり終了させた。再起動で
+  9 タブ 21 ペイン完全復元。以後、隔離インスタンスは明示 pid でのみ落とす

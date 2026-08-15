@@ -3,72 +3,60 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-15、#814 の実測監査から出た削減シリーズ）
+## 現在の対象（2026-08-15、#821 = コードプレビューの行数比例リーク）
 
-v0.7.1（`af625b1`）を土台に、#814 Phase 1 の実測で優先度づけした削減タスクを並行で進めている。
-子 Issue は **#815（syntect 常駐）/ #816（取り込み経路の CPU）/ #817（PTY reader の 1 MiB
-スタック）/ #818（直接ペインのスクロールバック）/ #819（IOSurface の drawable 枚数）**。
+- ブランチ `fix/821-preview-leak`（worktree `~/dev/tako-wt-821`、base = `5e48470`）
+- #814（Phase 1 実測監査）の子。#815 の A/B 中に見つかった「閉じても戻らない
+  約 41 KB/行」を、**コード本文の仮想化**（`gpui::list` で可視行だけ描く）で根治した
 
-- **#815（`5e48470`）と #817（このブランチ）が完了**。以下は #817 の結果
-- #815 は構文セットを「使っている間だけ載せる」形にした（開いたまま 40 秒で 83.6 → 13.1 MB）。
-  詳細は `.agent/architecture.md`「構文セットの寿命（#815）」と progress の該当エントリ
-- #816 は別 worker が担当中
-- #813（リミット後の自動復帰）の GUI 目視は
-  `.agent/manual-checks.md`「リミット後の自動復帰（#813）」に残っている
+## 根因（推測ではなく allocation プロファイルで確定）
 
-## #817 でやったこと
+- コードプレビューは**ファイル全行ぶんの element を毎フレーム**作っていた
+  （3,884 行 = 1 フレーム約 2 万個）
+- `heap`（MallocStackLogging + シンボル付き release）の live 先頭が
+  `TaffyLayoutEngine::request_measured_layout` の **7,883 ブロック ≒ 2 × 行数**
+- gpui は測定クロージャへ `TextLayout`（整形済み）をキャプチャさせ、それが taffy の
+  `node_context_data` に入る。**taffy 0.10.1 の `TaffyTree::clear()` はこれを消さない**
+  ため、「今までで一番大きかったフレーム」ぶんが永久に残る
+- 残り 65 MB 級は element アリーナとフレーム用 Vec の**高水位**。どちらも
+  close 時の解放では戻らない（閉じたあと 300 フレーム描いても 1 バイトも減らない）
 
-alacritty_terminal の `EventLoop` をやめ、**同等のループを tako が持つ**
-（`crates/tako-core/src/pty_loop.rs`）。upstream は reader スレッドの**スタック**へ
-1 MiB の配列を置いており、ゼロ初期化なのでペイン 1 枚ごとに約 1.03 MB が常駐していた。
-`READ_BUFFER_SIZE` は `pub(crate)` で外から下げられず、**スレッドのスタックサイズを絞っても
-footprint は減らない**（memset された分は reserve ではなく resident）ため、
-バッファをヒープへ動かすにはループを持つしかなかった。
+## 効果（隔離・同一バイナリ A/B。`TAKO_821_NO_VIRTUAL_LIST=1` が旧挙動）
 
-- 読み取りバッファは 64 KiB 始まり（= `MAX_LOCKED_READ` 以上の最小の 2 冪）。
-  ロック競合で足りなくなったときだけ上限 1 MiB まで倍々で伸ばし、`pty_read` の最後に戻す
-- ロック粒度・上限到達時のブロッキングロック・シャットダウン順序は upstream のまま
-- Unix の poller トークンだけ `pub(crate)` の値を写しているので、実 PTY を張る単体テストで
-  ずれを検出する（値を壊すとハングではなく FAILED になるところまで作ってある）
-- 由来と改変内容は `THIRD-PARTY-NOTICES.md`（Apache-2.0 → GPL-3.0-or-later は一方向互換）
+| 3,884 行 .rs | before | after |
+|---|---|---|
+| 開いた | 124.03 MB | **14.85 MB** |
+| **閉じた（1 往復）** | 121.71（残留 110.1） | **13.80（残留 2.2）** |
+| 閉じた（3 往復） | 158.89（残留 147.3） | 14.18（残留 2.6） |
+| 定常フレーム | 0.94〜1.00 ms | **0.12〜0.13 ms** |
 
-## 実測（隔離・release ビルド・16 ペイン）
+1 万行では footprint **210 MB → 46 MB**。
 
-| | stack（footprint） | 1 MB 級スレッドスタック | phys_footprint |
-|---|---|---|---|
-| before | **17 MB** / 68 領域 | **16 本**（各 1040K dirty） | 226 MB |
-| after | **848 KB** / 68 領域 | **0 本** | **211 MB** |
+## 同梱で直した別バグ
 
-MALLOC_SMALL は 18 → 19 MB（16 ペイン × 64 KiB のヒープぶん）。差し引き **−15 MB**。
+CLI / MCP の close（`detach_session`）が GUI の close と別々にフィールドを列挙していて、
+プレビューの行テキスト・行レイアウトを落としていなかった（1 開閉あたり約 0.8 MB 残留）。
+`drop_preview_pane_state` へ集約 + 番犬テスト `preview_cleanup_watchdog` で拘束。
 
-CPU は悪化なし。描画（#782 の可視性ゲート）が支配的でノイズになるため、洪水は**裏タブ**で
-起こして取り込み経路だけを測った。
+## 踏み抜いた罠（次に触る人へ）
 
-- 固定仕事量（40,000 行 × 4 ペイン、全速）: before 0.41 / 0.41 / 0.39 CPU 秒 →
-  after 0.41 / 0.40 / 0.39 CPU 秒
-- レート制限（200 行/秒 × 4 ペイン。**実出力行数で正規化**）:
-  before 149.1 / 116.3 / 122.9 → after 144.9 / 105.1 / 117.7 cpu_ms/1000 行（3 ペアとも after が低い）
-
-## 計測の落とし穴（次に測る人へ）
-
-- **ウィンドウの可視性で CPU が数倍変わる**（#782）。表ペインで測ると PTY 経路の差は埋もれる。
-  取り込み経路を測るなら裏タブへ流すこと
-- **レート制限ジェネレータは負荷で実際の行数が変わる**。CPU% だけ見ると before が 2.96% に
-  沈むことがある（仕事量が減っただけ）。実行数で正規化するか、固定仕事量あたりの CPU 秒で測る
-- 隔離検証は `TAKO_ISOLATED=1` に加えて **CLI へ `TAKO_SOCKET` / `TAKO_TOKEN` を明示**する。
-  tako のペインから叩くと env 継承で本番 GUI に当たる
+- **`pkill -x tako-app` は本番 GUI にも当たる**。実際に落として復旧した（layout.json と
+  tmux は無事で 9 タブ 21 ペイン復元）。隔離インスタンスは**明示 pid でのみ**落とす
+- GPUI は macOS で**遮蔽されると display link を止める**ので、裏で起動した隔離
+  インスタンスは 1 フレームも描かない。#821 は描画でしか再現しないため、
+  計測は `TAKO_VISUAL_ONLY=preview-leak`（`Window::draw` を自分で回す）で行う
+- list の item は `w_full` が要る / 未 prepaint の `TextLayout` を触ると panic /
+  余白はリスト側に置く（詳細は architecture.md）
 
 ## 次の一手
 
-- #817 は PR #823 を squash merge。`build-app.sh --install` は他 worker と重ならない
-  タイミングで単独実行する
-- 残りの削減候補は #816（CPU）。#818 / #819 は効果が小さいか要切り分け。
-  #815 が副産物で見つけた「大きいファイルのプレビューの行数依存な残留」も別途起票済み
+- PR（`Closes #821` / `Refs #814`）→ macOS CI 緑 → squash merge → install
+  （`build-app.sh` は #817 worker と重ねない）
+- 上流へ報告する価値がある: taffy `TaffyTree::clear()` が `node_context_data` を
+  消さない（1 行の修正。tako は gpui を rev 固定で参照しているだけなので自前では直せない）
 
 ## 現フェーズで Read すべき設計書
 
-- PTY まわりを触るとき: `.agent/architecture.md`「PTY IO ループは tako 側に持つ」
-  「⚠️ PTY セッション破棄のハマりどころ」
-- リミット後の自動復帰（#813）を触るとき: `.agent/requirements.md` FR-2.27 /
-  `.agent/orchestrator.md`「リミット後の自動復帰」
-- 実測の作法: `.agent/conventions.md`（セルフテストの待ち方。#796）
+- `.agent/architecture.md`「コードプレビューの仮想化（#821）」= 機序・実測・踏み抜きどころ
+- `crates/tako-app/src/preview_render.rs` の `render_preview_code_line` /
+  `preview_code_list_state` / `drop_preview_pane_state` / `preview_viewport_bounds`

@@ -21,6 +21,29 @@ pub(crate) struct MdLineSel {
 /// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
 pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(2200);
 
+/// コードプレビューの仮想リスト（#821）を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_821_NO_VIRTUAL_LIST=1`）。旧挙動 = ファイル全行の element を毎フレーム作る。
+///
+/// 効果測定と、表示異常が出たときに「仮想化のせい」と「行の作り方のせい」を
+/// 切り分けるために使う。既定は有効（未設定 = 仮想化する）
+pub(crate) fn preview_virtual_list_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_821_NO_VIRTUAL_LIST").is_some())
+}
+
+/// 旧挙動（全行を組む）。1 行の作り方は仮想化と同じ `render_preview_code_line` を
+/// 通すので、見た目は完全に一致する
+fn return_all_code_lines(
+    app: &mut TakoApp,
+    pane_id: PaneId,
+    count: usize,
+    cx: &mut Context<TakoApp>,
+) -> Vec<gpui::AnyElement> {
+    (0..count)
+        .map(|ix| app.render_preview_code_line(pane_id, ix, cx))
+        .collect()
+}
+
 /// プレビューペインの Markdown 受け皿（#690）。
 ///
 /// 幾何は [`crate::md_view::render_block`] に任せ、ここは「選択・検索・⌘ホバーの
@@ -1025,6 +1048,17 @@ impl TakoApp {
             _ => Vec::new(),
         };
         self.ensure_preview_image_cache(pane_id, &wanted_images);
+        // #821: コード本文以外を出すことになったら仮想リスト状態を捨てる。
+        // 残すと `preview_viewport_bounds` が実際には描いていない器の矩形を返し、
+        // ドラッグ選択のオートスクロールが効かなくなる（モード切替・履歴ビュー）
+        if self.preview_changelogs.contains_key(&pane_id)
+            || !matches!(
+                self.previews.get(&pane_id).map(|p| &p.content),
+                Some(preview::PreviewContent::Code(_))
+            )
+        {
+            self.preview_code_lists.remove(&pane_id);
+        }
         let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
         let file_name = state.file_name();
         let path_label = state.path.display().to_string();
@@ -1037,7 +1071,6 @@ impl TakoApp {
             editing: bool,
             dirty: bool,
             message: Option<String>,
-            cursor_pos: (usize, usize),
             save_status: Option<preview::SaveStatus>,
             autosave: bool,
             search_visible: bool,
@@ -1060,7 +1093,6 @@ impl TakoApp {
             editing: edit.editing,
             dirty: edit.dirty(),
             message: edit.message.clone(),
-            cursor_pos: edit.buffer.line_byte_col(edit.buffer.cursor()),
             save_status: edit.save_status.clone(),
             autosave: edit.autosave,
             search_visible: edit.search_visible,
@@ -1081,10 +1113,9 @@ impl TakoApp {
         let editing = edit_snap.as_ref().is_some_and(|s| s.editing);
         let dirty = edit_snap.as_ref().is_some_and(|s| s.dirty);
         let edit_message = edit_snap.as_ref().and_then(|s| s.message.clone());
-        let edit_cursor = edit_snap
-            .as_ref()
-            .filter(|s| s.editing)
-            .map(|s| s.cursor_pos);
+        // キャレット位置はコード行を組むときに `render_preview_code_line` が
+        // その場で引き直す（#821 の仮想リストは TakoApp の描画を伴わずに
+        // item を組み直すので、ここでキャプチャすると古い位置が焼き付く）
         let save_status = edit_snap.as_ref().and_then(|s| s.save_status.clone());
         let autosave = edit_snap.as_ref().is_some_and(|s| s.autosave);
         let search_visible = edit_snap.as_ref().is_some_and(|s| s.search_visible);
@@ -1190,45 +1221,58 @@ impl TakoApp {
         let changelog_active = self.preview_changelogs.contains_key(&pane_id);
         let changelog_data = self.preview_changelogs.get(&pane_id).cloned();
 
+        // #821: コード本文だけは仮想リスト（可視行だけ element を作る）
+        let code_body =
+            changelog_data.is_none() && matches!(&state.content, preview::PreviewContent::Code(_));
+        let code_virtualized = code_body && !preview_virtual_list_disabled();
+
         // 本文要素を先に組む（state の借用をここで終える）
         let body: Vec<gpui::AnyElement> = if let Some(cl) = &changelog_data {
             self.render_changelog_body(pane_id, cl, &theme, cx)
         } else {
             match &state.content {
+                // #821: コードは**可視行だけ**を組む。全行ぶんの element を毎フレーム
+                // 作ると、1 フレームの測定レイアウトノードが taffy の `node_context_data`
+                // に残り続け（`TaffyTree::clear` はこれを消さない）、閉じても解放されない
+                // ヒープが行数に比例して積み上がる。折り返しがあるので行高は一定でなく、
+                // 高さの実測は GPUI の `list`（可変高さ + 遅延計測）へ任せる
                 preview::PreviewContent::Code(lines) => {
-                    let number_width = lines.len().to_string().len();
-                    let mut doc_offset: usize = 0;
-                    lines
+                    let count = lines.len();
+                    line_texts = lines
                         .iter()
-                        .enumerate()
-                        .map(|(i, line)| {
-                            let text: String = line.iter().map(|s| s.text.as_str()).collect();
-                            let line_start = doc_offset;
-                            let line_end = doc_offset + text.len();
-                            doc_offset = line_end + 1; // +1 for '\n'
-                            let sel_range = selection
-                                .as_ref()
-                                .and_then(|s| s.range_for_line(i, text.len()));
-                            let hit_ranges = search_hits
-                                .map(|(hits, idx)| {
-                                    search_hits_for_line(hits, idx, line_start, line_end)
-                                })
-                                .unwrap_or_default();
-                            line_texts.push(text);
-                            let cursor_col = edit_cursor
-                                .filter(|(line, _)| *line == i)
-                                .map(|(_, col)| col);
-                            let (element, layout) = self.preview_code_line_sel(
-                                line,
-                                Some((i + 1, number_width)),
-                                (sel_range, cursor_col),
-                                &hit_ranges,
-                                cx,
-                            );
-                            line_layouts.push(Some(layout));
-                            element.into_any_element()
+                        .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
+                        .collect();
+                    // 行頭バイトオフセット（検索ヒットの行内範囲を出すのに要る）
+                    let mut starts = Vec::with_capacity(count);
+                    let mut doc_offset: usize = 0;
+                    for text in &line_texts {
+                        starts.push(doc_offset);
+                        doc_offset += text.len() + 1; // +1 for '\n'
+                    }
+                    self.preview_line_starts.insert(pane_id, starts);
+                    // 可視行が自分の枠へ書き込む器。索引は常に文書の行番号。
+                    // ここで先に入れておくのが要点で、`list` の item は
+                    // このあとの prepaint で自分の枠へ書き込む
+                    self.preview_text_layouts.insert(pane_id, vec![None; count]);
+                    if !code_virtualized {
+                        // A/B 計測とトラブルシュート用の旧挙動（全行を組む）。
+                        // 1 行の作り方は仮想化と同じ関数を通すので見た目は完全に一致する
+                        self.preview_code_lists.remove(&pane_id);
+                        return_all_code_lines(self, pane_id, count, cx)
+                    } else {
+                        let list_state = self.preview_code_list_state(pane_id, count);
+                        let app = cx.entity().downgrade();
+                        vec![gpui::list(list_state, move |ix, _window, cx| {
+                            let Some(app) = app.upgrade() else {
+                                return div().into_any_element();
+                            };
+                            app.update(cx, |app, cx| app.render_preview_code_line(pane_id, ix, cx))
                         })
-                        .collect()
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                        .py(px(PANE_PADDING + 4.0))
+                        .flex_1()
+                        .into_any_element()]
+                    }
                 }
                 preview::PreviewContent::Markdown(blocks) => {
                     // #656: 表は 1 ブロックの中に複数の選択行（セル）を持つので、
@@ -3051,7 +3095,13 @@ impl TakoApp {
                 // 効かないバグの根因だった（release ビルドの .app 環境で顕在化）。
                 // 古い bounds は同じフレームの paint で上書きされるため実害なし。
                 // ペイン削除時は remove_pane_with で除去される。
-                self.preview_text_layouts.insert(pane_id, line_layouts);
+                //
+                // #821: コード本文は body を組む前に器を入れてあり、行はそこへ
+                // 自分で書き込む（仮想リストの item は prepaint で走るので、ここで
+                // 入れ直すと可視行の分を捨ててしまう）
+                if !code_body {
+                    self.preview_text_layouts.insert(pane_id, line_layouts);
+                }
                 // #680: md 以外のプレビューへ切り替わったら当たり判定も空にする
                 // （行番号は content ごとに意味が変わるため、残すと誤ヒットになる）
                 self.preview_md_link_hits
@@ -3065,12 +3115,19 @@ impl TakoApp {
                 div()
                     .id(("preview-scroll", pane_id.as_u64()))
                     .flex_1()
-                    .p(px(PANE_PADDING + 4.0))
+                    // #821: コードは余白を `list` 側へ移す。div スクロールは
+                    // 内容を padding の上まで描いて（overflow のクリップは padding box）
+                    // 端に半端な行が覗くが、`list` は content box の内側にしか描けない。
+                    // 余白ごとリストへ渡すとクリップ位置が旧経路と一致する
+                    .when(code_virtualized, |d| d.px(px(PANE_PADDING + 4.0)))
+                    .when(!code_virtualized, |d| d.p(px(PANE_PADDING + 4.0)))
                     .flex()
                     .flex_col()
-                    .track_scroll(&scroll_handle)
+                    // #821: コードは中の `list` が自分でスクロールを持つ。ここに
+                    // overflow スクロールを重ねると二重の器になるので付けない
+                    .when(!code_virtualized, |d| d.track_scroll(&scroll_handle))
                     .when(zoomable, |d| d.overflow_scroll())
-                    .when(!zoomable, |d| d.overflow_y_scroll())
+                    .when(!zoomable && !code_virtualized, |d| d.overflow_y_scroll())
                     .cursor(
                         if self
                             .preview_pdf_hovered_link
@@ -3230,6 +3287,9 @@ impl TakoApp {
                     .children(truncated.then(|| {
                         div()
                             .pt_2()
+                            // #821: コードでは縦の余白がリスト側にあるので、
+                            // このフッタは自分で下の余白を持つ
+                            .when(code_virtualized, |d| d.pb(px(PANE_PADDING + 4.0)))
                             .text_size(px(11.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
                             .child(crate::ui_text::preview::tail_omitted())
@@ -3272,14 +3332,171 @@ impl TakoApp {
         crate::md_view::md_text_style(&self.theme, color, weight)
     }
 
+    /// ペインが消えたときにプレビュー由来の状態を**一式**落とす（#821）。
+    ///
+    /// GUI の close（`remove_pane_with`）と CLI / MCP の close（`detach_session`）が
+    /// それぞれ独自にフィールドを列挙していたため、後から足したものが片方だけに
+    /// 入る事故が起きていた（実測: CLI / MCP で閉じたコードプレビューは
+    /// `preview_line_texts` / `preview_text_layouts` を落とさず、3,884 行の
+    /// ファイルなら 1 回の開閉あたり約 0.8 MB がプロセス終了まで残っていた）。
+    /// 追加するフィールドはここへ足せば両方へ効く（番犬テストで拘束してある）。
+    pub(crate) fn drop_preview_pane_state(&mut self, pane_id: PaneId) {
+        self.previews.remove(&pane_id);
+        self.preview_edits.remove(&pane_id);
+        self.preview_views.remove(&pane_id);
+        self.preview_scroll_handles.remove(&pane_id);
+        self.preview_selections.remove(&pane_id);
+        self.preview_line_bounds.remove(&pane_id);
+        self.preview_line_texts.remove(&pane_id);
+        self.preview_line_starts.remove(&pane_id);
+        self.preview_text_layouts.remove(&pane_id);
+        self.preview_code_lists.remove(&pane_id);
+        self.preview_changelogs.remove(&pane_id);
+        self.preview_run_profiles.remove(&pane_id);
+        self.preview_run_selected.remove(&pane_id);
+        if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
+            self.preview_run_menu = None;
+        }
+        self.preview_pdf_char_bounds.remove(&pane_id);
+        self.preview_pdf_highlight_paint_count.remove(&pane_id);
+        self.preview_pdf_page_image_bounds.remove(&pane_id);
+        self.pending_pdf_rasters.remove(&pane_id);
+        self.active_pdf_rasters.remove(&pane_id);
+        self.remove_preview_image_cache(pane_id);
+        self.video_players.remove(&pane_id);
+        self.remove_video_frame_cache(pane_id);
+        self.video_seek_bar_bounds.remove(&pane_id);
+        self.forget_md_links(pane_id);
+    }
+
+    /// プレビュー本文のビューポート矩形（#821）。
+    ///
+    /// コードは中の `list` が器なので `ListState` の実測値を、それ以外は
+    /// これまでどおりスクロールハンドルの実測値を返す。ドラッグ選択の
+    /// 端到達判定（#309）はどちらの器でも同じ座標系で動く
+    pub(crate) fn preview_viewport_bounds(&self, pane_id: PaneId) -> Option<Bounds<Pixels>> {
+        if let Some((list, _)) = self.preview_code_lists.get(&pane_id) {
+            let bounds = list.viewport_bounds();
+            if f32::from(bounds.size.height) > 0.0 {
+                return Some(bounds);
+            }
+        }
+        self.preview_scroll_handles
+            .get(&pane_id)
+            .map(gpui::ScrollHandle::bounds)
+    }
+
+    /// コードプレビューの仮想リスト状態（#821）。行数が変わったら作り直す。
+    ///
+    /// ライブリロード（#233）で行数が動いても見ている位置を失わないよう、
+    /// 論理スクロール位置（行 + 行内オフセット）を作り直しの前後で持ち越す。
+    fn preview_code_list_state(&mut self, pane_id: PaneId, count: usize) -> gpui::ListState {
+        if let Some((state, built_for)) = self.preview_code_lists.get(&pane_id) {
+            if *built_for == count {
+                return state.clone();
+            }
+            let state = state.clone();
+            let keep = state.logical_scroll_top();
+            state.reset(count);
+            if keep.item_ix < count {
+                state.scroll_to(keep);
+            }
+            self.preview_code_lists
+                .insert(pane_id, (state.clone(), count));
+            return state;
+        }
+        // overdraw = 画面外にも描いておく高さ。ドラッグ選択がペインの端を
+        // またぐときに「行がまだ無い」状態を避けるため広めに取る
+        let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(600.0));
+        self.preview_code_lists
+            .insert(pane_id, (state.clone(), count));
+        state
+    }
+
+    /// コードプレビューの 1 行を組む（#821 の仮想リストから可視行だけ呼ばれる）。
+    ///
+    /// 選択・検索・キャレットは**呼ばれた時点の状態**から引き直す。リストは
+    /// `TakoApp` の描画を伴わないスクロールでも item を組み直すので、
+    /// 呼び出し側でキャプチャした値を使うと 1 フレーム古い状態が焼き付く。
+    pub(crate) fn render_preview_code_line(
+        &mut self,
+        pane_id: PaneId,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        let Some(preview::PreviewContent::Code(lines)) =
+            self.previews.get(&pane_id).map(|s| &s.content)
+        else {
+            return empty();
+        };
+        let Some(line) = lines.get(ix) else {
+            return empty();
+        };
+        let number_width = lines.len().to_string().len();
+        let text_len = self
+            .preview_line_texts
+            .get(&pane_id)
+            .and_then(|texts| texts.get(ix))
+            .map(String::len)
+            .unwrap_or_else(|| line.iter().map(|s| s.text.len()).sum());
+        let sel_range = self
+            .preview_selections
+            .get(&pane_id)
+            .and_then(|s| s.range_for_line(ix, text_len));
+        let edit = self.preview_edits.get(&pane_id);
+        let cursor_col = edit
+            .filter(|e| e.editing)
+            .map(|e| e.buffer.line_byte_col(e.buffer.cursor()))
+            .filter(|(l, _)| *l == ix)
+            .map(|(_, c)| c);
+        let hit_ranges = edit
+            .filter(|e| e.search_visible && !e.search_hits.is_empty())
+            .and_then(|e| {
+                let start = *self.preview_line_starts.get(&pane_id)?.get(ix)?;
+                Some(search_hits_for_line(
+                    &e.search_hits,
+                    e.search_index,
+                    start,
+                    start + text_len,
+                ))
+            })
+            .unwrap_or_default();
+        // #821: レイアウトの控えは **paint 時**に入れる。仮想リストは高さの見積もりで
+        // item を `layout_as_root` するだけのことがあり、その `TextLayout` は
+        // prepaint を通っていないので `bounds()` / `index_for_position()` が
+        // panic する（gpui `elements/text.rs` は None を unwrap する）。
+        // 実測: 描かれていない行を掴んだ瞬間にプロセスごと abort した
+        let (element, _layout) = self.preview_code_line_sel(
+            line,
+            Some((ix + 1, number_width)),
+            (sel_range, cursor_col),
+            &hit_ranges,
+            Some((cx.entity().downgrade(), pane_id, ix)),
+            cx,
+        );
+        // #821: 仮想リストの item は**伸ばしてくれる親を持たない**（`layout_as_root` で
+        // 単独に解かれる）。幅を指定しないと行が content 幅（= 折り返さない最大幅）で
+        // 解かれ、長い行の折り返しが消える。実測で 410px 幅の行が 3272px になった。
+        // 100% にすると `list` が渡す可用幅へ吸い付き、旧経路（flex 列の stretch）と
+        // 同じ幅・同じ折り返しになる
+        element.w_full().into_any_element()
+    }
+
     /// 選択ハイライト + 検索ヒットハイライト付きコード行。返した TextLayout は
     /// StyledText と共有され、ヒットテストとキャレット位置を実描画の shaping に一致させる。
+    ///
+    /// `record` を渡すと、**実際に描かれたときだけ** `preview_text_layouts` の
+    /// その行の枠へレイアウトを控える（#821）。キャレット用の canvas に相乗りするので
+    /// 要素は増えない。prepaint を通っていないレイアウトを外へ出さないための仕組みで、
+    /// 出すと `bounds()` の unwrap でプロセスごと落ちる
     fn preview_code_line_sel(
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
         interaction: (Option<(usize, usize)>, Option<usize>),
         search_hit_ranges: &[(usize, usize, bool)],
+        record: Option<(gpui::WeakEntity<Self>, PaneId, usize)>,
         _cx: &mut Context<Self>,
     ) -> (gpui::Div, TextLayout) {
         let (sel_range, cursor_col) = interaction;
@@ -3343,7 +3560,23 @@ impl TakoApp {
         let caret_color = hsla(theme.accent);
         let caret_canvas = canvas(
             |_, _, _| (),
-            move |_, _, window, _| {
+            move |_, _, window, cx| {
+                // #821: ここまで来た = この行は実際に描かれた（prepaint 済みで
+                // bounds が入っている）。控えるのはこの瞬間だけ
+                if let Some((entity, pane_id, ix)) = &record {
+                    if let Some(entity) = entity.upgrade() {
+                        let layout = caret_layout.clone();
+                        entity.update(cx, |app, _| {
+                            if let Some(slot) = app
+                                .preview_text_layouts
+                                .get_mut(pane_id)
+                                .and_then(|slots| slots.get_mut(*ix))
+                            {
+                                *slot = Some(layout);
+                            }
+                        });
+                    }
+                }
                 if let Some(origin) =
                     caret_byte.and_then(|byte| caret_layout.position_for_index(byte))
                 {
