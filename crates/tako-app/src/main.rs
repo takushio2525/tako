@@ -1520,8 +1520,20 @@ struct TakoApp {
     preview_pdf_page_image_bounds: HashMap<PaneId, HashMap<usize, Bounds<Pixels>>>,
     /// コード / Markdown の行ごとの GPUI 実描画レイアウト。
     /// 描画と同じ shaping 結果で座標を UTF-8 byte index へ逆写像する。
+    ///
+    /// **コードプレビューは可視行だけが `Some`**（#821 の仮想化）。索引は常に
+    /// 文書の行番号なので、`None` を読み飛ばす利用側（`preview_text_layout_hit_test` /
+    /// `md_link_at_position`）はそのまま動く
     preview_text_layouts: HashMap<PaneId, Vec<Option<TextLayout>>>,
-    /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）
+    /// コードプレビューの仮想リスト状態（#821）。可変行高（折り返し）を
+    /// GPUI 側が実測して持つので、折り返しの見た目を変えずに可視行だけ描ける。
+    /// 値は (状態, 構築時の行数) で、行数が変わったら作り直す
+    preview_code_lists: HashMap<PaneId, (gpui::ListState, usize)>,
+    /// コードプレビューの行頭バイトオフセット（#821）。仮想化で行を飛ばして
+    /// 描くため、`doc_offset` の逐次加算では検索ヒット範囲を決められない
+    preview_line_starts: HashMap<PaneId, Vec<usize>>,
+    /// プレビューの行ごとのプレーンテキスト（選択テキスト抽出用）。
+    /// **仮想化しても全行ぶんを持つ**（⌘A / コピー / ヒットテストの正）
     preview_line_texts: HashMap<PaneId, Vec<String>>,
     /// Markdown プレビュー内リンクの当たり判定（#680）。render で「選択と同じ
     /// 行・バイト範囲」の座標系で記録し、⌘+ホバー / ⌘+クリックがこれを引く
@@ -2965,6 +2977,8 @@ impl TakoApp {
             preview_pdf_hovered_link: None,
             preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
+            preview_code_lists: HashMap::new(),
+            preview_line_starts: HashMap::new(),
             preview_line_texts: HashMap::new(),
             preview_md_link_hits: HashMap::new(),
             preview_md_hovered_link: None,
@@ -6544,32 +6558,9 @@ impl TakoApp {
                     self.apply_pane_log_close(pane_id, data, reason);
                 }
                 self.terminals.remove(&pane_id);
-                self.previews.remove(&pane_id);
-                self.preview_edits.remove(&pane_id);
                 self.discard_ime_for_pane(pane_id);
-                self.video_players.remove(&pane_id);
-                self.remove_video_frame_cache(pane_id);
-                self.remove_preview_image_cache(pane_id);
-                self.preview_run_profiles.remove(&pane_id);
-                self.preview_run_selected.remove(&pane_id);
-                if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
-                    self.preview_run_menu = None;
-                }
-                self.preview_changelogs.remove(&pane_id);
-                self.preview_views.remove(&pane_id);
-                self.preview_scroll_handles.remove(&pane_id);
+                self.drop_preview_pane_state(pane_id);
                 self.drop_gui_pane_state(pane_id);
-                self.pending_pdf_rasters.remove(&pane_id);
-                self.active_pdf_rasters.remove(&pane_id);
-                self.video_seek_bar_bounds.remove(&pane_id);
-                self.preview_selections.remove(&pane_id);
-                self.preview_line_bounds.remove(&pane_id);
-                self.preview_pdf_char_bounds.remove(&pane_id);
-                self.preview_pdf_highlight_paint_count.remove(&pane_id);
-                self.preview_pdf_page_image_bounds.remove(&pane_id);
-                self.preview_text_layouts.remove(&pane_id);
-                self.preview_line_texts.remove(&pane_id);
-                self.forget_md_links(pane_id);
                 self.pane_links.remove(&pane_id);
                 self.known_failed.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
@@ -6656,6 +6647,8 @@ impl TakoApp {
                     self.preview_pdf_highlight_paint_count.remove(&id);
                     self.preview_pdf_page_image_bounds.remove(&id);
                     self.preview_text_layouts.remove(&id);
+                    self.preview_code_lists.remove(&id);
+                    self.preview_line_starts.remove(&id);
                     self.preview_line_texts.remove(&id);
                     self.forget_md_links(id);
                     self.pane_links.remove(&id);
@@ -11328,10 +11321,9 @@ impl TakoApp {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let Some(handle) = self.preview_scroll_handles.get(&pane_id) else {
+        let Some(area) = self.preview_viewport_bounds(pane_id) else {
             return;
         };
-        let area = handle.bounds();
         let y = f32::from(position.y);
         let top = f32::from(area.origin.y);
         let bottom = top + f32::from(area.size.height);
@@ -11432,26 +11424,32 @@ impl TakoApp {
             self.drag_scroll = None;
             return false;
         }
-        let Some(handle) = self.preview_scroll_handles.get(&pane_id) else {
+        let Some(area) = self.preview_viewport_bounds(pane_id) else {
             self.drag_scroll = None;
             return false;
         };
 
         let delta_px = drag_scroll_delta_px(factor.abs());
-        let offset = handle.offset();
-        let current_y = f32::from(offset.y);
-
-        let new_y = if factor > 0.0 {
-            // 上方向（正 = 先頭へ）。offset は負方向
-            (current_y + delta_px).min(0.0)
+        // #821: コードは仮想リストが自分でスクロールを持つ（`list` は下方向が正）
+        if let Some((list, _)) = self.preview_code_lists.get(&pane_id) {
+            list.scroll_by(px(if factor > 0.0 { -delta_px } else { delta_px }));
+        } else if let Some(handle) = self.preview_scroll_handles.get(&pane_id) {
+            let offset = handle.offset();
+            let current_y = f32::from(offset.y);
+            let new_y = if factor > 0.0 {
+                // 上方向（正 = 先頭へ）。offset は負方向
+                (current_y + delta_px).min(0.0)
+            } else {
+                current_y - delta_px
+            };
+            handle.set_offset(point(offset.x, px(new_y)));
         } else {
-            current_y - delta_px
-        };
-        handle.set_offset(point(offset.x, px(new_y)));
+            self.drag_scroll = None;
+            return false;
+        }
 
         // スクロール後の端位置で選択を更新。スクロール領域の上端/下端のヒットテストを行い、
         // ビューポートからはみ出た先のテキストを選択範囲に含める
-        let area = handle.bounds();
         let hit_pos = if factor > 0.0 {
             point(area.origin.x, area.origin.y)
         } else {
@@ -15653,15 +15651,12 @@ impl SessionHost for TakoApp {
             self.apply_pane_log_close_from(pane, data, origin, caller);
         }
         self.terminals.remove(&pane);
-        self.previews.remove(&pane);
-        self.preview_edits.remove(&pane);
         self.discard_ime_for_pane(pane);
-        self.remove_preview_image_cache(pane);
-        self.preview_views.remove(&pane);
-        self.preview_scroll_handles.remove(&pane);
+        // #821: GUI の close（`remove_pane_with`）と同じ一式を落とす。
+        // ここが独自の列挙だった頃は、CLI / MCP で閉じたプレビューの
+        // 行テキスト・行レイアウトがプロセスの終わりまで残っていた
+        self.drop_preview_pane_state(pane);
         self.drop_gui_pane_state(pane);
-        self.video_players.remove(&pane);
-        self.remove_video_frame_cache(pane);
         self.pane_links.remove(&pane);
         self.known_failed.remove(&pane);
         self.sync_preview_watches();
@@ -16649,6 +16644,8 @@ impl PreviewHost for TakoApp {
         self.preview_pdf_highlight_paint_count.remove(&pane);
         self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
+        self.preview_code_lists.remove(&pane);
+        self.preview_line_starts.remove(&pane);
         self.preview_line_texts.remove(&pane);
         self.forget_md_links(pane);
         self.remove_preview_image_cache(pane);
@@ -24473,6 +24470,465 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// プロセス全体の live なヒープ（malloc の全ゾーン）を採る（#821 の計測用）。
+    ///
+    /// 外部の `heap <pid>` が出す `All zones: N nodes (M bytes)` と同じ値を
+    /// **プロセス内から同期的に**採る。`heap` は外部サンプリングなので、
+    /// 「開いた直後」「閉じた直後」という測りたい瞬間を外しやすい。
+    #[cfg(feature = "visual-test")]
+    fn live_heap() -> (u64, u64) {
+        #[repr(C)]
+        #[derive(Default)]
+        struct MallocStatistics {
+            blocks_in_use: std::ffi::c_uint,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        extern "C" {
+            /// zone に NULL を渡すと全ゾーンの合計になる（`malloc/malloc.h`）
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+        }
+        let mut stats = MallocStatistics::default();
+        unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
+        (stats.size_in_use as u64, u64::from(stats.blocks_in_use))
+    }
+
+    /// コードプレビューの**見た目と操作**が仮想化（#821）で変わらないことを実ピクセルで見る。
+    ///
+    /// `TAKO_821_NO_VIRTUAL_LIST=1` を付けた同じバイナリの実行と並べて
+    /// `TAKO_VISUAL_PIXEL: preview-code …` の行を diff すると、
+    /// 「可視行だけ描く」に変えても**描かれる絵が 1 ピクセルも変わらない**ことが分かる。
+    /// 合わせて、可視範囲をまたぐドラッグ選択（オートスクロール）とコピーも通す。
+    #[cfg(feature = "visual-test")]
+    async fn preview_code_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let dir = std::env::temp_dir().join(format!("tako-visual-code-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test code 一時ディレクトリ");
+        let path = dir.join("sample.rs");
+        // 折り返す長い行・日本語 + tab・ASCII を混ぜる（幅と行高が一定でない前提を作る）
+        let mut source = String::new();
+        source.push_str("fn main() {\n");
+        source.push_str("    let 日本語 = \"タブ\tと混在\"; // コメント\n");
+        source.push_str(&format!("    let long = \"{}\";\n", "x".repeat(400)));
+        for i in 0..300 {
+            source.push_str(&format!("    let v{i} = {i}; // line {i}\n"));
+        }
+        source.push_str("}\n");
+        std::fs::write(&path, &source).expect("visual-test code fixture");
+        let total_lines = source.lines().count();
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test code を dispatch で開ける");
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test code dispatch"));
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            "visual-test コード: 座標キャッシュが揃う",
+        );
+
+        // (1) 初期表示の実ピクセル。仮想化の有無で 1 ピクセルも変わってはいけない
+        let Some((first, scale)) = capture_frame(any, cx) else {
+            fail("visual-test コード: フレーム採取")
+        };
+        let geom = |app: &TakoApp| -> (usize, usize, String) {
+            let layouts = app
+                .preview_text_layouts
+                .get(&pane)
+                .cloned()
+                .unwrap_or_default();
+            let shaped = layouts.iter().filter(|l| l.is_some()).count();
+            // 先頭 6 行の実描画矩形（折り返し行の高さもここに出る）
+            let rects = layouts
+                .iter()
+                .take(6)
+                .map(|l| {
+                    l.as_ref()
+                        .map(|layout| {
+                            let b = layout.bounds();
+                            format!(
+                                "{:.1}x{:.1}@{:.1}",
+                                f32::from(b.size.width),
+                                f32::from(b.size.height),
+                                f32::from(b.top()),
+                            )
+                        })
+                        .unwrap_or_else(|| "-".into())
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            (layouts.len(), shaped, rects)
+        };
+        let (len0, shaped0, rects0) = window.update(cx, |app, _, _| geom(app)).unwrap_or_default();
+        let ink0 = first.pixels().filter(|p| p.0[3] > 0).count();
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code initial lines={total_lines} layouts={len0} \
+             shaped={shaped0} rects=[{rects0}] ink={ink0} scale={scale}"
+        );
+        check(
+            len0 == total_lines,
+            "visual-test コード: レイアウト索引は常に全行ぶん（画面外は None）",
+        );
+
+        // (2) スクロール後の実ピクセルと、描かれている行の座標
+        window
+            .update(cx, |app, win, cx| {
+                let position = app
+                    .preview_text_layouts
+                    .get(&pane)
+                    .and_then(|l| l.first())
+                    .and_then(Option::as_ref)
+                    .map(|layout| layout.bounds().center())
+                    .unwrap_or_default();
+                win.dispatch_event(
+                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(-600.0))),
+                        ..ScrollWheelEvent::default()
+                    }),
+                    cx,
+                );
+            })
+            .ok();
+        let Some((scrolled, _)) = capture_frame(any, cx) else {
+            fail("visual-test コード: スクロール後のフレーム採取")
+        };
+        let (_, shaped1, rects1) = window.update(cx, |app, _, _| geom(app)).unwrap_or_default();
+        let moved = changed_pixels_in_bounds(
+            &first,
+            &scrolled,
+            &[Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: gpui::size(
+                    px(first.width() as f32 / scale),
+                    px(first.height() as f32 / scale),
+                ),
+            }],
+            scale,
+        );
+        // 旧経路（div スクロール）と仮想リストでスクロール量が一致しているかを
+        // 「描かれている一番上の行とその y」で突き合わせる（単位の違う offset ではなく
+        // 実際に見えているもので比べる）
+        let top_visible = window
+            .update(cx, |app, _, _| {
+                app.preview_text_layouts
+                    .get(&pane)
+                    .and_then(|layouts| {
+                        layouts.iter().enumerate().find_map(|(ix, l)| {
+                            l.as_ref()
+                                .map(|layout| (ix, f32::from(layout.bounds().top())))
+                        })
+                    })
+                    .map(|(ix, y)| format!("{ix}@{y:.1}"))
+                    .unwrap_or_else(|| "-".into())
+            })
+            .unwrap_or_default();
+        let scrolled_ink = scrolled.pixels().filter(|p| p.0[3] > 0).count();
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code scrolled shaped={shaped1} rects=[{rects1}] \
+             top_visible={top_visible} ink={scrolled_ink} changed={moved}"
+        );
+        check(moved > 0, "visual-test コード: ホイールで実画面が動く");
+        // A/B で実画像そのものを突き合わせられるよう、要求されたら書き出す
+        if let Ok(dump) = std::env::var("TAKO_821_DUMP_DIR") {
+            let dir = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dir);
+            let _ = first.save(dir.join("preview-code-initial.png"));
+            let _ = scrolled.save(dir.join("preview-code-scrolled.png"));
+            println!("TAKO_VISUAL_PIXEL: preview-code dumped -> {dump}");
+        }
+
+        // (3) 可視範囲をまたぐドラッグ選択（オートスクロール）→ ⌘C。
+        //     仮想化では画面外の行に TextLayout が無いので、ここが壊れやすい
+        let (top_pos, bottom_pos) = window
+            .update(cx, |app, _, _| {
+                let area = app
+                    .preview_viewport_bounds(pane)
+                    .expect("プレビューのビューポート矩形がある");
+                (
+                    point(area.left() + px(24.0), area.top() + px(6.0)),
+                    point(area.left() + px(24.0), area.bottom() - px(2.0)),
+                )
+            })
+            .unwrap_or_else(|_| fail("visual-test コード: ビューポート矩形"));
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(pos) = app.preview_hit_test(pane, top_pos) {
+                    app.preview_selections.insert(
+                        pane,
+                        PreviewSelection {
+                            anchor: pos,
+                            head: pos,
+                        },
+                    );
+                    app.preview_selecting = Some(pane);
+                }
+                // 下端へドラッグ = オートスクロールしながら選択を伸ばす
+                app.update_preview_drag_scroll(pane, bottom_pos, cx);
+            })
+            .ok();
+        let mut ticks = 0;
+        for _ in 0..40 {
+            let alive = window
+                .update(cx, |app, _, cx| {
+                    app.drag_scroll
+                        .as_ref()
+                        .map(|s| (s.pane, s.speed_factor))
+                        .map(|(p, f)| app.tick_preview_drag_scroll(p, f, cx))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            if !alive {
+                break;
+            }
+            ticks += 1;
+        }
+        let (sel, copied) = window
+            .update(cx, |app, _, _| {
+                app.preview_selecting = None;
+                let sel = app.preview_selections.get(&pane).cloned();
+                (sel, app.preview_selected_text())
+            })
+            .unwrap_or((None, None));
+        let span = sel
+            .as_ref()
+            .map(|s| (s.head.0 as i64 - s.anchor.0 as i64).abs().max(0))
+            .unwrap_or(0);
+        println!(
+            "TAKO_VISUAL_PIXEL: preview-code drag ticks={ticks} anchor={:?} head={:?} \
+             lines_spanned={span} copied_chars={}",
+            sel.as_ref().map(|s| s.anchor),
+            sel.as_ref().map(|s| s.head),
+            copied.as_ref().map(String::len).unwrap_or(0),
+        );
+        check(
+            span > 0 && copied.is_some_and(|t| t.contains('\n')),
+            "visual-test コード: 可視範囲をまたぐドラッグ選択が複数行を掴む (#821)",
+        );
+
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Close {
+                        pane: Some(pane.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            })
+            .ok();
+        let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        let leftovers = window
+            .update(cx, |app, _, _| {
+                app.preview_line_texts.contains_key(&pane) as u8
+                    + app.preview_text_layouts.contains_key(&pane) as u8
+                    + app.preview_code_lists.contains_key(&pane) as u8
+                    + app.preview_line_starts.contains_key(&pane) as u8
+            })
+            .unwrap_or(9);
+        println!("TAKO_VISUAL_PIXEL: preview-code closed leftovers={leftovers}");
+        check(
+            leftovers == 0,
+            "visual-test コード: close で行データが残らない (#821)",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// コードプレビューの開閉で live ヒープが戻るかを測る（#821）。
+    ///
+    /// **描画を自分で回すのが要点**。GPUI は macOS で
+    /// `windowDidChangeOcclusionState` を受けると display link を止めるので
+    /// （`gpui_macos` の `start_display_link`）、隔離インスタンスを裏で起動した
+    /// だけでは 1 フレームも描かれない。#821 の残留は「行ごとの実描画」でしか
+    /// 生まれないため、その状態で `heap` を採ると**リークが再現しない**
+    /// （実測: 開いても +19 MB・閉じて完全復帰 = 描画されていないだけだった）。
+    ///
+    /// `TAKO_821_FILE` で対象ファイル、`TAKO_821_CYCLES` で往復回数を変えられる。
+    /// 外から `heap <pid>` も採れるよう、各相のあとに数秒待つ。
+    #[cfg(feature = "visual-test")]
+    async fn preview_leak_bench(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let path = std::env::var("TAKO_821_FILE")
+            .unwrap_or_else(|_| "crates/tako-app/src/preview.rs".to_string());
+        let cycles: usize = std::env::var("TAKO_821_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let frames: usize = std::env::var("TAKO_821_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let pause = Duration::from_millis(
+            std::env::var("TAKO_821_PAUSE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1500),
+        );
+        let lines = std::fs::read_to_string(&path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+
+        // 暖機（フォント / グリフ raster / テーマの初回確保を計測から外す）
+        for _ in 0..10 {
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+        }
+        cx.background_executor().timer(pause).await;
+        let (base0, blocks0) = live_heap();
+        println!(
+            "TAKO_821 phase=start live_mb={:.2} blocks={blocks0} file={path} lines={lines} \
+             cycles={cycles} frames={frames}",
+            base0 as f64 / 1_048_576.0,
+        );
+
+        let base = window
+            .update(cx, |app, _, _| app.focused_pane().as_u64())
+            .unwrap_or(1);
+        for round in 1..=cycles {
+            let pane = window
+                .update(cx, |app, _, cx| {
+                    let opened = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(base),
+                            path: path.clone(),
+                            mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                            direction: Some(tako_control::protocol::Direction::Right),
+                            focus: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("#821 bench: OpenFile");
+                    cx.notify();
+                    PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+                })
+                .unwrap_or_else(|_| fail("#821 bench: OpenFile dispatch"));
+            // background ロード（構文ハイライト）の完了を待ってから描く
+            let loaded = wait_for_preview_state(window, cx, Duration::from_secs(20), |app| {
+                matches!(
+                    app.previews.get(&pane).map(|s| &s.content),
+                    Some(preview::PreviewContent::Code(l)) if l.len() > 1
+                )
+            })
+            .await;
+            check(loaded.is_some(), "#821 bench: コード本文がロードされる");
+            // 最初の 1 フレーム（= 開いてから中身が見えるまで）と、その後の
+            // 定常フレームを分けて測る。前者が「開くのが重い」の体感に対応する
+            let first_frame = std::time::Instant::now();
+            let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            let first_frame_ms = first_frame.elapsed().as_secs_f64() * 1000.0;
+            let steady = std::time::Instant::now();
+            for _ in 1..frames {
+                let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            }
+            let steady_ms = steady.elapsed().as_secs_f64() * 1000.0 / (frames.max(2) - 1) as f64;
+            cx.background_executor().timer(pause).await;
+            let (open_bytes, open_blocks) = live_heap();
+            let shaped = window
+                .update(cx, |app, _, _| {
+                    app.preview_text_layouts
+                        .get(&pane)
+                        .map(|l| l.iter().filter(|x| x.is_some()).count())
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            println!(
+                "TAKO_821 phase=open round={round} live_mb={:.2} blocks={open_blocks} \
+                 delta_mb={:.2} shaped_lines={shaped} load_ms={:.0} first_frame_ms={first_frame_ms:.1} \
+                 steady_frame_ms={steady_ms:.2}",
+                open_bytes as f64 / 1_048_576.0,
+                (open_bytes as f64 - base0 as f64) / 1_048_576.0,
+                loaded.map(|d| d.as_secs_f64() * 1000.0).unwrap_or(-1.0),
+            );
+
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Close {
+                            pane: Some(pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            for _ in 0..frames {
+                let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            }
+            cx.background_executor().timer(pause).await;
+            for _ in 0..5 {
+                let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
+            }
+            let (closed_bytes, closed_blocks) = live_heap();
+            // ペイン単位の状態が本当に落ちているか（tako 側の取りこぼし検出）
+            let maps = window
+                .update(cx, |app, _, _| {
+                    format!(
+                        "previews={} texts={} layouts={} lists={} starts={} bodies={} edits={}",
+                        app.previews.len(),
+                        app.preview_line_texts.len(),
+                        app.preview_text_layouts.len(),
+                        app.preview_code_lists.len(),
+                        app.preview_line_starts.len(),
+                        app.pane_bodies.len(),
+                        app.preview_edits.len(),
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "TAKO_821 phase=closed round={round} live_mb={:.2} blocks={closed_blocks} \
+                 residual_mb={:.2} residual_blocks={} {maps}",
+                closed_bytes as f64 / 1_048_576.0,
+                (closed_bytes as f64 - base0 as f64) / 1_048_576.0,
+                closed_blocks as i64 - blocks0 as i64,
+            );
+        }
+        // 外から `heap <pid>` / `malloc_history <pid> -callTree` を採る余裕
+        println!("TAKO_821 phase=settle");
+        cx.background_executor()
+            .timer(Duration::from_millis(
+                std::env::var("TAKO_821_SETTLE_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2000),
+            ))
+            .await;
+        let (end_bytes, end_blocks) = live_heap();
+        println!(
+            "TAKO_821 phase=end live_mb={:.2} blocks={end_blocks} residual_mb={:.2}",
+            end_bytes as f64 / 1_048_576.0,
+            (end_bytes as f64 - base0 as f64) / 1_048_576.0,
+        );
+    }
+
     /// 端末グリッド描画の 1 フレームあたりコストを測る（#787 / #782 / #786）。
     ///
     /// **ディスプレイが消えていても測れる**のが要点。実ウィンドウの表示に頼ると
@@ -24677,10 +25133,22 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // 検査ではなく計測（#821）。プレビュー開閉の live ヒープを追う
+                "preview-leak" => {
+                    preview_leak_bench(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                "preview-code" => {
+                    preview_code_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
-                         profiles / chat-table / conflict-card / terminal-grid / grid-bench）"
+                         profiles / chat-table / conflict-card / terminal-grid / \
+                         grid-bench / preview-leak / preview-code）"
                     );
                     std::process::exit(1);
                 }
@@ -31421,15 +31889,27 @@ mod self_test {
                         .position_for_index(byte)
                         .expect("scroll 後の描画位置がある");
                     position.y += layout.line_height() / 2.0;
+                    // #821: コードは仮想リストなので、スクロールで画面外へ出た行の
+                    // レイアウトは None になる（残っていると古い座標で誤ヒットする）。
+                    // 「スクロールが起きたこと」はリストの論理位置で、「座標が
+                    // 更新されたこと」は描かれている行の往復で見る
+                    let top = app
+                        .preview_code_lists
+                        .get(&pane)
+                        .map(|(list, _)| list.logical_scroll_top())
+                        .expect("コードプレビューの仮想リスト状態がある");
+                    let scrolled = top.item_ix > 0 || f32::from(top.offset_in_item) > 0.0;
                     println!(
-                        "TAKO_PREVIEW_COORD: scroll line=40 before_y={:.2} after_line0_y={:.2} target_y={:.2} byte={}",
+                        "TAKO_PREVIEW_COORD: scroll line=40 before_y={:.2} scroll_top={}+{:.2} \
+                         line0_shaped={} target_y={:.2} byte={}",
                         f32::from(line0_before),
-                        f32::from(layouts[0].as_ref().expect("line 0").bounds().top()),
+                        top.item_ix,
+                        f32::from(top.offset_in_item),
+                        layouts[0].is_some(),
                         f32::from(position.y),
                         byte,
                     );
-                    layouts[0].as_ref().expect("line 0").bounds().top() < line0_before
-                        && app.preview_hit_test(pane, position) == Some((line, byte))
+                    scrolled && app.preview_hit_test(pane, position) == Some((line, byte))
                 })
                 .unwrap_or(false);
             check(
@@ -45294,5 +45774,68 @@ mod selftest_wait_watchdog {
         let good = "            check(\n                \
                     wait_for_focused_text(window, cx, \"X\", Duration::from_secs(15)).await,\n";
         assert!(fixed_wait_then_positive_contains(good).is_empty());
+    }
+}
+
+#[cfg(test)]
+/// close 経路が「プレビュー状態の後始末」を勝手に列挙し直していないかの番犬（#821）。
+///
+/// GUI（`remove_pane_with`）と CLI / MCP（`detach_session`）が別々に
+/// フィールドを並べていたため、後から足したものが片方だけに入り、
+/// CLI / MCP で閉じたコードプレビューの行データがプロセス終了まで残っていた。
+/// 一式は `drop_preview_pane_state` に集約してあり、ここはその形を保つ。
+#[cfg(test)]
+mod preview_cleanup_watchdog {
+    /// `fn <name>` から次のトップレベル `    fn ` までを切り出す（同じ impl 内の関数本体）
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} が見つからない"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// プレビュー由来のマップを直接 remove している行（後始末の独自列挙）
+    fn direct_preview_removes(body: &str) -> Vec<String> {
+        body.lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("self.preview") && line.contains(".remove(&pane"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn close_経路はプレビュー状態の後始末を集約関数に任せている() {
+        let src = include_str!("main.rs");
+        for name in ["remove_pane_with", "detach_session"] {
+            let body = body_of(src, name);
+            assert!(
+                body.contains("drop_preview_pane_state("),
+                "{name} が drop_preview_pane_state を呼んでいない（#821）"
+            );
+            let strays = direct_preview_removes(body);
+            assert!(
+                strays.is_empty(),
+                "{name} がプレビュー状態を独自に列挙している: {strays:?}。\
+                 追加は drop_preview_pane_state（preview_render.rs）へ足すこと（#821）"
+            );
+        }
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬は独自列挙を見逃さない() {
+        let bad = "    fn f(&mut self) {\n        self.preview_line_texts.remove(&pane);\n    }\n    fn g(";
+        assert_eq!(
+            direct_preview_removes(body_of(bad, "f")),
+            vec!["self.preview_line_texts.remove(&pane);".to_string()]
+        );
+        let good =
+            "    fn f(&mut self) {\n        self.drop_preview_pane_state(pane);\n    }\n    fn g(";
+        assert!(direct_preview_removes(body_of(good, "f")).is_empty());
     }
 }

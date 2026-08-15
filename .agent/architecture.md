@@ -1291,6 +1291,97 @@ syntect 5 の `SyntaxSet` は**コンテキストと正規表現を初回使用�
   （構文 200 未満 / 拡張子 550 未満で落ちる = セットを軽い方へ差し替えたら気づく）。
   `TAKO_815_NO_SYNTAX_RELEASE=1` で旧挙動（常駐）へ戻して同一バイナリ A/B ができる
 
+## コードプレビューの仮想化（#821。2026-08-15）
+
+コードプレビューは**ファイル全行ぶんの element を毎フレーム**作っていた。3,884 行なら
+1 行あたり div ×3 + `StyledText` ×2（行番号 + 本文）+ canvas ×1 で、1 フレーム約 2 万個。
+これが「閉じても戻らないヒープ」の正体だった。
+
+### 残留の機序（allocation プロファイルで確定）
+
+シンボル付き release + `MallocStackLogging=1` の `heap <pid>` で、閉じたあとの live を
+確保元ごとに見ると先頭がこうなる（3,884 行 .rs を 1 回開閉した直後）:
+
+| 確保元 | live | ブロック |
+|---|---|---|
+| `RawVecInner::finish_grow`（巨大 Vec 3 本） | 42.9 MB | 3 |
+| `WindowTextSystem::shape_text` の `Vec<DecorationRun>`（3072 B 固定） | 24.2 MB | **7,888** |
+| `gpui::arena::Chunk::new`（element アリーナ） | 21.3 MB | 20 |
+| `MacTextSystem::layout_line` | 4.0 MB | 14,592 |
+| `TaffyLayoutEngine::request_measured_layout`（測定クロージャの Box） | 2.5 MB | **7,883** |
+
+**7,883 ≒ 2 × 行数 = 1 フレームぶんの測定レイアウトノード**。
+gpui の `TextLayout::layout` は `request_measured_layout` へ渡すクロージャに
+`TextLayout`（整形済みの `WrappedLine` ごと）をキャプチャさせ、それが taffy の
+`node_context_data` に入る。そして **taffy 0.10.1 の `TaffyTree::clear()` は
+`nodes` / `children` / `parents` しか消さず `node_context_data` を消さない**
+（`SecondaryMap` の残骸は同じ slot index が再利用されるまで生き続ける）。
+gpui は毎フレーム `clear()` を呼ぶので、**「今までで一番大きかったフレーム」の
+測定ノードとそこから辿れる整形済みテキストが永久に居座る**。
+残る 65 MB 級はアリーナのチャンクとフレーム用 Vec の**高水位**で、これも
+「1 フレームで 2 万個」が作った山がそのまま残ったもの。
+
+close 時の解放をいくら足しても直らない（実測: 閉じたあと 300 フレーム描いても
+残留は 1 バイトも減らない）。**ピークを作らないことだけが効く**。
+
+### 採った形
+
+- 本文は `gpui::list`（可変高さ + 遅延計測）で**可視行だけ** element を作る。
+  折り返しがあるので行高は一定でなく、高さの実測は list に任せる（`uniform_list` は使えない）
+- 1 行の作り方は `render_preview_code_line` の 1 実装。旧挙動（全行）も同じ関数を
+  通すので、`TAKO_821_NO_VIRTUAL_LIST=1` の同一バイナリ A/B で**絵が変わらない**
+- 索引は常に文書の行番号で、`preview_text_layouts` は可視行だけ `Some`。
+  読む側（`preview_text_layout_hit_test` / `md_link_at_position`）は元から `None` を
+  読み飛ばす形だったのでそのまま動く。`preview_line_texts` は**全行ぶん**を持つ
+  （⌘A・コピー・ヒットテストの正）
+
+### ⚠️ 踏み抜きどころ
+
+- **list の item は伸ばしてくれる親を持たない**（`layout_as_root` で単独に解かれる）。
+  幅を指定しないと行が content 幅で解かれ、**長い行の折り返しが消える**
+  （実測: 410px の行が 3272px の 1 行になった）。行に `w_full` が要る
+- **未 prepaint の `TextLayout` を外へ出すとプロセスごと落ちる**。gpui の
+  `bounds()` / `index_for_position()` / `position_for_index()` は `bounds` を
+  unwrap する。list は高さの見積もりで item を `layout_as_root` するだけのことが
+  あるので、レイアウトの控えは**キャレット canvas の paint 時**に入れる（要素は増えない）
+- **余白はリスト側に置く**。div スクロールは overflow を padding box でクリップするので
+  内容が余白の上まで描かれるが、list は content box の内側にしか描けない。
+  コンテナに padding を残すと上下の端で数 px ぶん絵が変わる（実測で検出した）
+- ドラッグ選択のオートスクロール（#309）はビューポート矩形とスクロールの当て先が
+  器ごとに違う。`preview_viewport_bounds` で吸収してある
+
+### 実測（隔離・同一バイナリ A/B。`TAKO_821_NO_VIRTUAL_LIST=1` が旧挙動）
+
+3,884 行の `.rs` を開閉 3 往復（live ヒープ = 全 malloc ゾーンの `size_in_use`）:
+
+| 段階 | before | after |
+|---|---|---|
+| 起動直後 | 11.57 MB | 11.58 MB |
+| 開いた（1 回目） | 124.03（+112.5） | **14.85（+3.3）** |
+| **閉じた（1 回目）** | 121.71（**残留 110.1**） | **13.80（残留 2.2）** |
+| 閉じた（2 回目） | 158.71（残留 147.1） | 14.02（残留 2.5） |
+| 閉じた（3 回目） | 158.89（残留 147.3） | 14.18（残留 2.6） |
+| 整形した行数 | 3,884 | **11**（可視ぶん） |
+| 定常フレーム | 0.94〜1.00 ms | **0.12〜0.13 ms** |
+
+1 万行（表示上限で 5,000 行）では footprint が **210 MB → 46 MB**。
+
+### 見た目が変わっていないことの確認
+
+`TAKO_VISUAL_ONLY=preview-code` の節を旧挙動と並べると、**本文領域の実ピクセル差は 0**
+（行の実描画矩形・折り返し行の高さ 189px・スクロール量 600px・ドラッグ選択の
+掴んだ行数 49・コピー 1,449 文字まで一致）。visual-test 全 98 チェックポイントも
+`cpp` / `python` / `subline` / `content-geom` / `indent-guide` / `md` が完全一致する。
+
+### CLI / MCP の close も同じ後始末を通る（#821 で見つけた別バグ）
+
+GUI の close（`remove_pane_with`）と CLI / MCP の close（`detach_session`）が
+**それぞれ独自にフィールドを列挙**していたため、後から足したものが片方だけに入り、
+CLI / MCP で閉じたコードプレビューは行テキストと行レイアウトを落とさなかった
+（3,884 行で 1 回の開閉あたり約 0.8 MB がプロセス終了まで残る）。
+一式は `TakoApp::drop_preview_pane_state` に集約し、番犬テスト
+`preview_cleanup_watchdog` が「独自列挙が復活していないこと」を CI で拘束する。
+
 ## セキュリティ方針
 
 - IPC / MCP は localhost のみ + セッション毎のランダムトークン必須（FR-2.3.4）
