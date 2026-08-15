@@ -7232,6 +7232,51 @@ mod tests {
         );
     }
 
+    /// #813: 素の `tako limit-resume` で状態確認、on / off で切替、`--all` で一覧。
+    /// `--pane` 省略時は呼び出し元（TAKO_PANE_ID）を埋める
+    #[test]
+    fn limit_resumeは状態取得と切替と一覧を操作へ写す() {
+        let status = parse(&["tako", "limit-resume"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: None,
+                all: None
+            }
+        );
+        let enable = parse(&["tako", "limit-resume", "on", "--pane", "12"]);
+        assert_eq!(
+            build_request(&enable).unwrap(),
+            Request::LimitResume {
+                pane: Some(12),
+                enabled: Some(true),
+                all: None
+            }
+        );
+        let disable = parse(&["tako", "limit-resume", "off", "--pane", "12"]);
+        assert_eq!(
+            build_request(&disable).unwrap(),
+            Request::LimitResume {
+                pane: Some(12),
+                enabled: Some(false),
+                all: None
+            }
+        );
+        // 一覧は呼び出し元ペインが分からなくても引ける（dispatch 側が pane を見ない）
+        let all = parse(&["tako", "limit-resume", "--all"]);
+        assert_eq!(
+            build_request(&all).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: None,
+                all: Some(true)
+            }
+        );
+        // on / off 以外は clap が弾く（誤った語で黙って状態取得にならない）
+        assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());
+    }
+
     /// #600: 入力予測は素の `tako autosuggest` で状態確認、on / off で切替
     #[test]
     fn autosuggestは状態取得と切替を操作へ写す() {
