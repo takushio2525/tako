@@ -43,6 +43,12 @@ pub(crate) struct HintTooltip {
     theme: Theme,
 }
 
+impl HintTooltip {
+    pub(crate) fn new(label: String, theme: Theme) -> Self {
+        Self { label, theme }
+    }
+}
+
 impl Render for HintTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()

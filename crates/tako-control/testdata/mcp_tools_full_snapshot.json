@@ -1301,6 +1301,29 @@
     "name": "tako_confirm_close"
   },
   {
+    "description": "利用上限（5h / 週次）後の自動復帰を**ペイン単位**で ON/OFF する（enabled 省略時は現在状態の取得のみ。既定 OFF）。有効にしたペインが上限で止まると、tako がリセット時刻（画面の「reset at …」から解決）+ 数分の安全マージンを過ぎたところで作業を再開させる: 上限対処ダイアログが出ていれば「解除まで待つ」相当の選択肢をラベル一致で確定し（課金・モデル変更を伴う選択肢は構造的に選ばない）、ダイアログが無ければ継続ナッジを送達する。発動するのは上限由来の停止だけで、permission ダイアログ・API エラー・通常の idle・人間の下書きが入力欄にあるときは発動しない。試行は 1 回の上限あたり 3 回までで打ち切る。実行の記録は <data_dir>/supervisor.log のaction=limit_autoresume に残る。設定は layout.json に永続化され再起動・復元をまたいで維持される。all=true で全ペインの状態を一覧できる。応答の state は現在の停止状況・復帰予定時刻・試行回数。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "all": {
+          "description": "true = 全ペインの状態を一覧（enabled とは併用しない）",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "true = 有効化、false = 無効化（省略時は状態取得）",
+          "type": "boolean"
+        },
+        "pane": {
+          "description": "対象ペイン",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_limit_resume"
+  },
+  {
     "description": "git リポジトリのコミット履歴・ブランチ一覧・変更状態を取得する。対象ペインの cwd から git リポジトリを解決する。コミットグラフ描画・ブランチ操作の判断材料として使う。",
     "inputSchema": {
       "additionalProperties": false,

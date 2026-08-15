@@ -593,6 +593,16 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #813: 上限後の自動復帰。ダイアログへの応答が tmux バックエンド（detached access）
+        // 経由なので、Windows は永続バックエンドの移植（#526 のオーケストレーション層）待ち
+        key: "tako_limit_resume",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_ORCHESTRATOR,
+            issue: 526,
+        },
+    },
+    Feature {
         key: "tako_limit_service",
         macos: Support::Supported,
         windows: Support::Pending {

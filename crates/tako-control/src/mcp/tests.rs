@@ -491,7 +491,8 @@ mod tests {
         // #680 の tako_preview_copy_code を追加して 131
         // #694 の tako_ui_mode を追加して 132
         // #725 の tako_chat_copy を追加して 133
-        assert_eq!(tools.len(), 133);
+        // #813 の tako_limit_resume を追加して 134
+        assert_eq!(tools.len(), 134);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

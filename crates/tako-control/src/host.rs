@@ -280,6 +280,12 @@ pub trait UiStateHost {
         _resolved: tako_core::i18n::Lang,
     ) {
     }
+    /// 利用上限後の自動復帰（#813）の**実行状態**（いま上限で止まっているか・
+    /// いつ復帰するか・これまでの試行）。オプトインそのものは Pane 属性なので
+    /// ここには無い。GUI 以外のホストは追跡状態を持たないので既定は None
+    fn limit_resume_state(&self, _pane: PaneId) -> Option<serde_json::Value> {
+        None
+    }
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
     fn limit_service(&self) -> tako_core::LimitService {
         tako_core::LimitService::Claude

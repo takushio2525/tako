@@ -1987,3 +1987,13 @@
   `/Applications` = 0.7.0。CI macOS / Windows 緑、夜間は `SKIP: 変更なし` へ復帰
 - 関連コミット: `20ef2a1`（tako）/ `2651bf2`（homebrew-tako）、tag `v0.7.0`
 - 次: ユーザーの GUI 再起動で反映。docs サイトのライブ反映は未確認（デプロイ先 URL がリポジトリに無い）
+
+## 2026-08-15（#813: 利用上限後のペイン単位の自動復帰）
+- ペイン単位のオプトイン（右クリック / `tako limit-resume` / MCP `tako_limit_resume` の 3 経路が
+  同じ dispatch）で、5h / 週次上限で止まったエージェントをリセット時刻 + 安全マージン後に再開させる。
+  ダイアログ型は「解除まで待つ」をラベル一致で確定（課金・モデル変更は拒否リストで構造的に排除）、
+  idle 型は継続ナッジを送達確認つき経路へ。FR-2.27 新設
+- 層は 3 つ: `tako_core::limit_resume`（純関数の判断・時刻パース・選択肢選別）/
+  `tako_control::limit_stop`（#748 と #157 の既存検知を束ねるだけ）/ `tako-app::limit_autoresume`
+  （2 秒 tick。有効ペイン 0 なら即 return）。supervisor（#401）の `safe_limit_choice` も core へ寄せた
+- 次: PR（Closes #813）→ macOS CI → squash merge → `build-app.sh --install`

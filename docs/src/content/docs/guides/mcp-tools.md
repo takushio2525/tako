@@ -1,9 +1,9 @@
 ---
 title: MCP ツール一覧
-description: tako が AI エージェントに公開する 133 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 134 個の MCP ツールの全リスト
 ---
 
-tako は **133 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **134 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -204,6 +204,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_auto_rename` | タブ・ペイン名の AI 自動リネームの ON/OFF |
 | `tako_port_detect` | listen ポート検知と提案チップの ON/OFF |
 | `tako_confirm_close` | 閉じる確認ダイアログの ON/OFF |
+| `tako_limit_resume` | 利用上限後の自動復帰のペイン単位 ON/OFF・状態確認 |
 | `tako_limit_service` | ステータスバーに出す利用制限表示サービスの切替 |
 | `tako_sleep_guard` | スリープ防止の状態確認・設定変更 |
 

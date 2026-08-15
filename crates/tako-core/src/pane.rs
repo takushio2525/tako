@@ -91,6 +91,9 @@ pub struct Pane {
     spawned_by: Option<PaneId>,
     /// run-interactive のメタデータ (auto_close_policy, command)。セッション内で使い捨て
     interactive_meta: Option<(String, String)>,
+    /// 利用上限（5h / 週次）後の自動復帰を有効にするか（#813）。既定 OFF。
+    /// ペイン単位のオプトインで、layout.json に保存して再起動・復元をまたいで維持する
+    limit_autoresume: bool,
 }
 
 impl Pane {
@@ -103,6 +106,7 @@ impl Pane {
             role: None,
             spawned_by: None,
             interactive_meta: None,
+            limit_autoresume: false,
         }
     }
 
@@ -114,6 +118,7 @@ impl Pane {
         title: Option<String>,
         title_source: TitleSource,
         role: Option<String>,
+        limit_autoresume: bool,
     ) -> Self {
         PaneId::reserve(id);
         Self {
@@ -124,6 +129,7 @@ impl Pane {
             role,
             spawned_by: None,
             interactive_meta: None,
+            limit_autoresume,
         }
     }
 
@@ -187,6 +193,16 @@ impl Pane {
 
     pub fn set_interactive_meta(&mut self, auto_close: String, command: String) {
         self.interactive_meta = Some((auto_close, command));
+    }
+
+    /// 利用上限後の自動復帰が有効か（#813。既定 false）
+    pub fn limit_autoresume(&self) -> bool {
+        self.limit_autoresume
+    }
+
+    /// 自動復帰のオプトインを設定する（右クリック / CLI / MCP の 3 経路が同じここを通る）
+    pub fn set_limit_autoresume(&mut self, enabled: bool) {
+        self.limit_autoresume = enabled;
     }
 }
 
