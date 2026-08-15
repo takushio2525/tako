@@ -32918,16 +32918,19 @@ mod self_test {
                 "tako preview-cache 512 が LRU 予算へ反映",
             );
 
-            let long_markdown = |heading: &str| {
+            // #826: 行数（= ブロック数）を書き換えごとに変える。同じ数のままだと
+            // 仮想リストは作り直されないので、「見ている位置を持ち越す」経路
+            // （`preview_body_list_state` の reset → scroll_to）を通らない
+            let long_markdown = |heading: &str, extra: usize| {
                 let mut text = format!("# {heading}\n\n");
-                for line in 0..100 {
+                for line in 0..(100 + extra) {
                     text.push_str(&format!("- line {line}\n"));
                 }
                 text
             };
             std::fs::write(
                 preview_dir.join("note.md"),
-                long_markdown("Live baseline"),
+                long_markdown("Live baseline", 0),
             )
             .expect("スクロール可能な基準 Markdown を書ける");
             wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
@@ -32946,12 +32949,38 @@ mod self_test {
             })
             .await
             .unwrap_or_else(|| fail("スクロール保持用の基準 Markdown を反映"));
+            // #826: md 本文は仮想リストが器なので、スクロールハンドルへ直接
+            // offset を書いても画面は動かない（= 位置保持の検査が空振りする）。
+            // 器に合わせて位置を指し、読むときも同じ器から読む
+            let scroll_mark = move |app: &TakoApp| -> f32 {
+                if let Some(list) = app.preview_md_list(reload_pane) {
+                    let top = list.logical_scroll_top();
+                    // ブロック番号 + ブロック内オフセットを 1 本の実数にして比べる
+                    top.item_ix as f32 + f32::from(top.offset_in_item) / 10_000.0
+                } else {
+                    app.preview_scroll_handles
+                        .get(&reload_pane)
+                        .map(|handle| f32::from(handle.offset().y))
+                        .unwrap_or_default()
+                }
+            };
+            // 位置を指す前に 1 フレーム描く。仮想リストは**その内容で描かれて初めて**
+            // 作られるので、作られる前に指すと次のフレームの作り直しで捨てられる（#826）
+            notify_and_draw(any, window, cx);
+            wait(cx, 50).await;
             window
                 .update(cx, |app, preview_window, cx| {
-                    app.preview_scroll_handles
-                        .entry(reload_pane)
-                        .or_default()
-                        .set_offset(point(px(0.0), px(-48.0)));
+                    if let Some(list) = app.preview_md_list(reload_pane) {
+                        list.scroll_to(gpui::ListOffset {
+                            item_ix: 8,
+                            offset_in_item: px(0.0),
+                        });
+                    } else {
+                        app.preview_scroll_handles
+                            .entry(reload_pane)
+                            .or_default()
+                            .set_offset(point(px(0.0), px(-48.0)));
+                    }
                     preview_window.refresh();
                     cx.notify();
                 })
@@ -32962,14 +32991,16 @@ mod self_test {
                 .update(cx, |app, _, _| {
                     (
                         app.previews.get(&reload_pane).map(|state| state.mode),
-                        app.preview_scroll_handles
-                            .get(&reload_pane)
-                            .map(|handle| f32::from(handle.offset().y))
-                            .unwrap_or_default(),
+                        scroll_mark(app),
                         app.preview_reload_apply_count,
                     )
                 })
                 .unwrap_or((None, 0.0, 0));
+            // 位置がそもそも動いていなければ「保持できた」に意味が無い
+            check(
+                scroll_before.abs() > 0.0,
+                "ライブリロード前にスクロール位置が動いている (#826)",
+            );
             check(
                 mode_before == Some(preview::PreviewMode::Markdown),
                 "連続 write 前は Markdown モード",
@@ -32981,7 +33012,7 @@ mod self_test {
                 }
                 std::fs::write(
                     preview_dir.join("note.md"),
-                    long_markdown(&format!("Live reload {index}")),
+                    long_markdown(&format!("Live reload {index}"), index + 1),
                 )
                 .expect("連続 write を実行できる");
                 if index < 5 {
@@ -33012,13 +33043,16 @@ mod self_test {
             let final_delay = final_write_at.elapsed();
             // 遅延イベントが二重適用を起こさないことも観測する。
             wait(cx, 450).await;
+            // #826: 新しい本文で 1 フレーム描いてから位置を読む。描くまで器
+            // （仮想リスト）は作り直されないので、描かずに読むと「差し替え前の
+            // 位置」を見て保持できたことにしてしまう
+            notify_and_draw(any, window, cx);
+            wait(cx, 50).await;
             let (mode_after, scroll_after, apply_after) = window
                 .update(cx, |app, _, _| {
                     (
                         app.previews.get(&reload_pane).map(|state| state.mode),
-                        app.preview_scroll_handles
-                            .get(&reload_pane)
-                            .map(|handle| f32::from(handle.offset().y)),
+                        Some(scroll_mark(app)),
                         app.preview_reload_apply_count,
                     )
                 })
@@ -33037,8 +33071,10 @@ mod self_test {
                 "最終 write から 1.5 秒以内に反映",
             );
             println!(
-                "TAKO_PREVIEW_RELOAD: writes=6 applies=1 delay_ms={} mode=markdown scroll_y={scroll_before:.1} outline=updated",
-                final_delay.as_millis()
+                "TAKO_PREVIEW_RELOAD: writes=6 applies=1 delay_ms={} mode=markdown \
+                 scroll_mark={scroll_before:.4}->{:.4} outline=updated",
+                final_delay.as_millis(),
+                scroll_after.unwrap_or(f32::NAN),
             );
 
             // 削除 / rename は旧パスに Error を出し、同パスへ戻せば自動復帰する。
