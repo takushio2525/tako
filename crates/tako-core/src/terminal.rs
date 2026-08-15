@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{EventListener, Notify, OnResize, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -23,6 +22,7 @@ use alacritty_terminal::tty;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 
 use crate::osc_tap::{OscEvent, PromptMark, TapPty};
+use crate::pty_loop::{Msg, Notifier, PtyLoop};
 use crate::screen::{self, Screen};
 use crate::theme::Theme;
 
@@ -270,8 +270,9 @@ impl TerminalSession {
             }),
         );
 
-        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
-            .map_err(SessionError::EventLoop)?;
+        // PTY IO ループは tako 側に持つ（`pty_loop`）。upstream の `EventLoop` は
+        // reader スレッドのスタックへ 1 MiB を確保し、ペインごとに常駐していた（#817）
+        let event_loop = PtyLoop::new(term.clone(), proxy, pty).map_err(SessionError::EventLoop)?;
         let notifier = Notifier(event_loop.channel());
         let _io_thread = event_loop.spawn();
 
