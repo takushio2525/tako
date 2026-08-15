@@ -38,6 +38,7 @@ pub mod fda;
 pub mod host;
 pub mod ipc;
 pub mod layout;
+pub mod limit_stop;
 pub mod mcp;
 pub mod orchestrator;
 pub mod peer_messaging;

@@ -211,6 +211,19 @@ pub(super) fn build_request(
         "tako_confirm_close" => Request::ConfirmClose {
             enabled: bool_arg(args, "enabled")?,
         },
+        // #813: 一覧（all）のときは対象ペインを解決しない（呼び出し元が無くても引ける）
+        "tako_limit_resume" => {
+            let all = bool_arg(args, "all")?;
+            Request::LimitResume {
+                pane: if all == Some(true) {
+                    None
+                } else {
+                    Some(target_pane(args, caller)?)
+                },
+                enabled: bool_arg(args, "enabled")?,
+                all,
+            }
+        }
         "tako_open_file" => Request::OpenFile {
             pane: Some(target_pane(args, caller)?),
             path: str_arg(args, "path")?.ok_or("path を指定する")?,

@@ -924,6 +924,9 @@ fn dispatch_inner(
                 // #748: 選択肢ダイアログ（null = ダイアログなし）。
                 // 非 null のときは入力欄が無いので send ではなく respond で応答する
                 "choice_dialog": dialog.as_ref().map(|d| d.to_json()),
+                // #813: 利用上限後の自動復帰。enabled = ペインのオプトイン、
+                // state = いま上限で止まっているか・いつ復帰するか（GUI 稼働時のみ）
+                "limit_resume": limit_resume_entry(host, PaneId::from_raw(pane_id)),
             }))
         }
 
@@ -1536,6 +1539,32 @@ fn dispatch_inner(
                 let _ = crate::setup::mutate_config(|c| c.confirm_close = val);
             }
             Ok(json!({ "enabled": host.confirm_close_enabled() }))
+        }
+
+        Request::LimitResume { pane, enabled, all } => {
+            // 一覧（#813。有効なペインがどれかを 1 回で把握する）
+            if all.unwrap_or(false) {
+                if enabled.is_some() {
+                    return Err(DispatchError::InvalidParams(
+                        "all と enabled は併用できない（一覧か設定のどちらか）".into(),
+                    ));
+                }
+                return Ok(json!({ "panes": limit_resume_panes(host) }));
+            }
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            if let Some(val) = enabled {
+                tree_mut(host.workspace_mut(), tab)
+                    .get_mut(target)
+                    .expect("resolve_pane で存在確認済み")
+                    .set_limit_autoresume(val);
+                // 有効・無効はペイン属性なので layout.json の保存で永続化される
+                // （保存は UI 層が dispatch 後に回す。CLI / MCP / 右クリックで同じ経路）
+                crate::diag::persist_log(&format!(
+                    "[limit-autoresume] pane={} enabled={val}",
+                    target.as_u64()
+                ));
+            }
+            Ok(limit_resume_entry(host, target))
         }
 
         Request::Persist { enabled } => {
@@ -6579,6 +6608,8 @@ pub struct WorkerStatusCtx {
     full_screen: Option<String>,
     /// tmux セッション配下に実行中の子プロセスがあるか（#224）
     has_running_children: bool,
+    /// 利用上限後の自動復帰の状態（#813。UI スレッドで写し取る）
+    limit_resume: Value,
 }
 
 /// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
@@ -6614,6 +6645,7 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         has_running_children,
         live_tail: lines.map(tail_join),
         full_screen,
+        limit_resume: limit_resume_entry(host, target),
     }
 }
 
@@ -6649,6 +6681,7 @@ fn finish_worker_status(
         live_tail,
         full_screen,
         has_running_children: has_children,
+        limit_resume,
     } = ctx;
 
     // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
@@ -6770,6 +6803,7 @@ fn finish_worker_status(
         registry_session_detected,
         registry_resume_command,
         agent_process_alive,
+        limit_resume,
     })
 }
 
@@ -6796,6 +6830,8 @@ struct ResolvedWorkerStatus {
     /// #390: エージェントプロセスの生存シグナル（突然死判定専用。pane 消失中は
     /// tmux フォールバックで再計算済み。busy / stalled 補正には使わない）
     agent_process_alive: bool,
+    /// #813: 利用上限後の自動復帰の状態（UI スレッドで写し取った値をそのまま載せる）
+    limit_resume: Value,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -6816,6 +6852,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         registry_session_detected,
         registry_resume_command,
         agent_process_alive,
+        limit_resume,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -7073,6 +7110,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "worker_id": registry_worker_id,
         "prompt_delivery": prompt_delivery_final.map(|(d, _)| d.as_str()),
         "resume_command": registry_resume_command,
+        // #813: 利用上限後の自動復帰（enabled = ペインのオプトイン / state = 実行状態）
+        "limit_resume": limit_resume,
     }))
 }
 
@@ -7101,7 +7140,23 @@ fn dispatch_orchestrator_respond(
             "ペイン {pane_id} のバックエンドセッションが見つからない"
         ))
     })?;
+    respond_to_choice_dialog(&backend_session, pane_id, choice, caller_role)
+}
 
+/// 選択肢ダイアログへの応答本体（ホスト非依存）。
+///
+/// `ControlHost` を必要とするのはバックエンドセッション名の解決だけなので、
+/// そこを引数で受け取る形に切り出してある。おかげで GUI の**バックグラウンド
+/// スレッド**からも同じ経路（同じ検証・同じ persist.log 監査）で応答できる
+/// （#813 の自動復帰。この関数はキー送出のたびに数百 ms スリープするので
+/// UI スレッドから呼んではいけない）
+pub fn respond_to_choice_dialog(
+    backend_session: &str,
+    pane_id: u64,
+    choice: Option<&str>,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    let backend_session = backend_session.to_string();
     // 画面からダイアログの存在を検証。
     // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
     let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
@@ -7885,6 +7940,40 @@ fn video_response(host: &(impl ControlHost + ?Sized), target: PaneId) -> serde_j
     resp
 }
 
+/// 1 ペインぶんの自動復帰の状態（#813）。
+///
+/// `enabled` はペイン属性（layout.json 永続化）、`state` は GUI が持つ実行状態。
+/// GUI 以外のホスト（テスト・CLI 単体）では `state` は null になる
+fn limit_resume_entry(host: &dyn ControlHost, target: PaneId) -> Value {
+    let enabled = host
+        .workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes())
+        .find(|p| p.id() == target)
+        .map(|p| p.limit_autoresume())
+        .unwrap_or(false);
+    json!({
+        "pane": target.as_u64(),
+        "enabled": enabled,
+        "state": host.limit_resume_state(target),
+    })
+}
+
+/// 全ペインの自動復帰状態（`all` 指定時）
+fn limit_resume_panes(host: &dyn ControlHost) -> Vec<Value> {
+    let targets: Vec<PaneId> = host
+        .workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
+        .collect();
+    targets
+        .into_iter()
+        .map(|id| limit_resume_entry(host, id))
+        .collect()
+}
+
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
 pub(crate) fn resolve_pane(
     ws: &Workspace,
@@ -8121,6 +8210,8 @@ fn list_json(host: &dyn ControlHost) -> Value {
                                 "dirty": dirty,
                             })
                         }),
+                        // 利用上限後の自動復帰のオプトイン（#813。既定 false）
+                        "limit_autoresume": p.limit_autoresume(),
                         "tmux_session": host.backend_session(p.id()),
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
@@ -8158,6 +8249,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
                 "spawned_by": bp.pane().spawned_by().map(|id| id.as_u64()),
                 "origin_tab": bp.origin_tab().as_u64(),
                 "origin_tab_title": bp.origin_tab_title(),
+                "limit_autoresume": bp.pane().limit_autoresume(),
             })
         })
         .collect();
@@ -9265,6 +9357,110 @@ mod tests {
         .unwrap()["pane"]
             .as_u64()
             .unwrap()
+    }
+
+    /// #813: 自動復帰のオプトインは既定 OFF で、dispatch から読み書きでき、
+    /// list / read にも同じ値が出る（UI・CLI・MCP はすべてこの dispatch を通る）
+    #[test]
+    fn issue813_自動復帰の設定と参照が全経路で同じ値を返す() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let other = split(&mut host, root);
+
+        // 既定は OFF
+        let q = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(root),
+                enabled: None,
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(q["pane"], root);
+        assert_eq!(q["enabled"], false);
+
+        // ON にすると応答・list の両方に出る（他のペインには波及しない）
+        let on = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(root),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(on["enabled"], true);
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let panes = list["tabs"][0]["panes"].as_array().unwrap();
+        let flag = |id: u64| {
+            panes
+                .iter()
+                .find(|p| p["id"] == id)
+                .map(|p| p["limit_autoresume"].clone())
+                .unwrap()
+        };
+        assert_eq!(flag(root), json!(true));
+        assert_eq!(flag(other), json!(false), "他のペインへ波及しない");
+
+        // all で一覧できる
+        let all = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let entries = all["panes"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|e| e["pane"] == root && e["enabled"] == true));
+
+        // OFF に戻せる
+        let off = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(root),
+                enabled: Some(false),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(off["enabled"], false);
+
+        // all と enabled の併用は拒否（設定と一覧の取り違えを構造的に防ぐ）
+        let bad = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: None,
+                enabled: Some(true),
+                all: Some(true),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(
+            matches!(bad, Err(DispatchError::InvalidParams(_))),
+            "{bad:?}"
+        );
+
+        // 存在しないペインはエラー
+        let missing = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(9999),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
     }
 
     #[test]
@@ -11692,6 +11888,7 @@ mod tests {
             live_tail: None,
             full_screen: None,
             has_running_children: false,
+            limit_resume: Value::Null,
         };
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
@@ -11710,6 +11907,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11726,6 +11924,7 @@ mod tests {
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11741,6 +11940,7 @@ mod tests {
                 live_tail: None,
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11762,6 +11962,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11786,6 +11987,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11804,6 +12006,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11823,6 +12026,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11845,6 +12049,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11869,6 +12074,7 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -11891,6 +12097,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -15250,6 +15457,7 @@ mod tests {
                 live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -15277,6 +15485,7 @@ mod tests {
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             None,
             None,
@@ -15310,6 +15519,7 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+                limit_resume: Value::Null,
             },
             Some("sid-7801-detected"),
             None,
@@ -15355,6 +15565,7 @@ mod tests {
             live_tail: Some("zsh: segmentation fault  claude\n% ".into()),
             full_screen: None,
             has_running_children: has_children,
+            limit_resume: Value::Null,
         };
 
         // 子プロセスなし → agent_dead イベント + resume_command

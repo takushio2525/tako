@@ -25,6 +25,7 @@ mod filetree;
 #[cfg(any(test, feature = "visual-test"))]
 mod form_layout;
 mod keybindings;
+mod limit_autoresume;
 mod md_view;
 mod open_files;
 mod overlays;
@@ -1416,6 +1417,9 @@ struct TakoApp {
     /// ctx 閾値・auto_handoff の解決結果のキャッシュ（プロファイル名 → 値）。
     /// 2 秒 tick 毎に profiles/*.yaml + config.yaml を読むのを避ける（Issue #749）
     handoff_policy_cache: HashMap<String, (std::time::Instant, u32, bool)>,
+    /// 利用上限後の自動復帰の追跡状態（Issue #813）。オプトイン自体は Pane 属性
+    /// （layout.json 永続化）で、ここは揮発する実行状態だけを持つ
+    limit_resume: limit_autoresume::LimitResumeTrackers,
     /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
     codex_metrics: AgentMetrics,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
@@ -2909,6 +2913,7 @@ impl TakoApp {
             agent_metrics: AgentMetrics::default(),
             handoff_nudges: HashMap::new(),
             handoff_policy_cache: HashMap::new(),
+            limit_resume: HashMap::new(),
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             lang_setting: {
@@ -3684,6 +3689,12 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:handoff_nudge");
                         app.drive_handoff_nudge();
                     }
+                    // #813: 上限で止まっているオプトイン済みペインを、リセット後に再開させる
+                    // （有効なペインが無ければ即 return するので通常運転のコストはゼロ）
+                    let limit_resume_jobs = {
+                        let _s = tako_control::diag::perf_span("periodic_prep:limit_autoresume");
+                        app.drive_limit_autoresume()
+                    };
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
                         app.poll_webview_state();
@@ -3743,6 +3754,7 @@ impl TakoApp {
                         app.pane_logs.clone(),
                         running_children_scan,
                         stale_binary_scan,
+                        limit_resume_jobs,
                     )
                 });
                 // UI スレッド専有時間の計測（Issue #113 診断。しきい値超えのみ記録）
@@ -3763,10 +3775,30 @@ impl TakoApp {
                     pane_logs,
                     running_children_scan,
                     stale_binary_scan,
+                    limit_resume_jobs,
                 )) = prep
                 else {
                     break;
                 };
+                // #813: 上限ダイアログへの応答はキー送出（数百 ms のスリープ込み）なので
+                // background で実行し、結果だけ UI スレッドへ戻す。この tick は応答が
+                // 終わるまで待つ（発生するのは上限で止まったオプトインペインだけで、
+                // 1 エピソードあたり最大 3 回。tracker の in_flight が二重起動を止める）
+                for job in limit_resume_jobs {
+                    let pane = job.pane;
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move { limit_autoresume::run_limit_resume_job(&job) })
+                        .await;
+                    if this
+                        .update(cx, |app: &mut TakoApp, _| {
+                            app.apply_limit_resume_result(pane, outcome);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 // ② background: sleep guard と stale binary のプロセス走査（#779）。
                 // 初回 / 対象・role・OSC 状態変化 / 60 秒保険でだけ tmux + ps を起動し、
                 // 両方が同じ tick で必要なら 1 個の ProcessSnapshot を共有する。
@@ -14130,6 +14162,8 @@ impl TakoApp {
         } else {
             Vec::new()
         };
+        // #813: 上限後の自動復帰が有効か（ヘッダのインジケータ表示）
+        let limit_resume_on = pane_info.is_some_and(|p| p.limit_autoresume());
         // worker: 親 master へのリンク（↳ master）
         let parent_master = pane_info.and_then(|p| p.spawned_by()).and_then(|parent| {
             self.workspace
@@ -14285,6 +14319,41 @@ impl TakoApp {
                                 .text_color(hsla(color))
                                 .child(SharedString::from(label))
                         }))
+                    })
+                    // #813: 上限後の自動復帰が有効なペインの控えめなインジケータ。
+                    // 上限で止まっているあいだは色を強める（いま待機中だと分かる）
+                    .when(hv.role && limit_resume_on, |d| {
+                        let waiting = self.limit_resume.contains_key(&pane_id);
+                        let tip_theme = theme.clone();
+                        d.child(
+                            div()
+                                .id(("pane-limit-resume", pane_id.as_u64()))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                // アイコンだけでは意味が分からないので言葉を添える
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        crate::tab_bar::HintTooltip::new(
+                                            crate::ui_text::pane_menu::limit_resume_indicator()
+                                                .to_string(),
+                                            tip_theme.clone(),
+                                        )
+                                    })
+                                    .into()
+                                })
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::LOOP_REPEAT)
+                                        .w(px(11.0))
+                                        .h(px(11.0))
+                                        .text_color(if waiting {
+                                            hsla(theme.accent)
+                                        } else {
+                                            hsla_alpha(theme.text_tertiary, 0.8)
+                                        }),
+                                ),
+                        )
                     })
                     // master: 「N workers ▾」ドロップダウンボタン
                     .when(
@@ -15731,6 +15800,11 @@ impl UiStateHost for TakoApp {
     fn request_viewport_open(&mut self, window: tako_core::WindowId) {
         // GPUI ウィンドウの生成は Context が要るため render の sync_viewports で消費する
         self.pending_viewport_opens.push(window);
+    }
+
+    /// 利用上限後の自動復帰の実行状態（#813）
+    fn limit_resume_state(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.limit_resume_state_json(pane)
     }
 
     fn auto_rename_enabled(&self) -> bool {
@@ -17469,22 +17543,35 @@ impl TakoApp {
             .get(&pane_id)
             .and_then(|s| s.cwd())
             .map(|p| p.to_path_buf());
+        // #813: 自動復帰のオプトイン状態（ターミナルペインだけに出す）
+        let limit_resume_on = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .find(|p| p.id() == pane_id)
+            .map(|p| p.limit_autoresume());
         let mut items: Vec<(&str, &str)> = Vec::new();
         if is_preview {
-            items.push(("copy-path", "パスをコピー"));
-            items.push(("reveal", "Finder で表示"));
-            items.push(("open-default", "デフォルトアプリで開く"));
+            items.push(("copy-path", ui_text::pane_menu::copy_path()));
+            items.push(("reveal", ui_text::pane_menu::reveal()));
+            items.push(("open-default", ui_text::pane_menu::open_default()));
             items.push(("sep1", ""));
         } else if cwd.is_some() {
-            items.push(("copy-cwd", "cwd をコピー"));
-            items.push(("reveal-cwd", "Finder で開く"));
+            items.push(("copy-cwd", ui_text::pane_menu::copy_cwd()));
+            items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd()));
             items.push(("sep1", ""));
         }
-        items.push(("split-right", "右に分割"));
-        items.push(("split-down", "下に分割"));
+        items.push(("split-right", ui_text::pane_menu::split_right()));
+        items.push(("split-down", ui_text::pane_menu::split_down()));
+        // 上限後の自動復帰トグル（#813。ターミナルペインのみ = プレビューには上限が無い）
+        if let Some(on) = limit_resume_on.filter(|_| !is_preview) {
+            items.push(("sep-limit", ""));
+            items.push(("limit-resume", ui_text::pane_menu::limit_resume_toggle(on)));
+        }
         items.push(("sep2", ""));
-        items.push(("bg", "バックグラウンドへ"));
-        items.push(("close", "閉じる"));
+        items.push(("bg", ui_text::pane_menu::background()));
+        items.push(("close", ui_text::pane_menu::close()));
 
         let pctx_menu_width: f32 = 200.0;
         let pctx_item_height: f32 = 20.0;
@@ -17567,6 +17654,21 @@ impl TakoApp {
                                 if let Some(c) = &cwd {
                                     let _ = tako_control::platform::os_integration::open_default(c);
                                 }
+                            }
+                            // #813: CLI / MCP と同じ dispatch を通す（3 経路で同じ状態を書く）
+                            "limit-resume" => {
+                                let next = !limit_resume_on.unwrap_or(false);
+                                let _ = tako_control::dispatch(
+                                    this,
+                                    tako_control::protocol::Request::LimitResume {
+                                        pane: Some(pane_id.as_u64()),
+                                        enabled: Some(next),
+                                        all: None,
+                                    },
+                                    PaneOrigin::User,
+                                );
+                                // 属性は layout.json へ載るので、ここで保存して再起動に備える
+                                this.save_layout();
                             }
                             "split-right" => {
                                 this.split_pane_button(pane_id, SplitDirection::Right, cx);
@@ -42964,6 +43066,448 @@ mod self_test {
                     "TAKO_SELF_TEST_SKIPPED: 110（TAKO_786_NO_VIEW_CACHE / \
                      TAKO_803_NO_HEADER_CACHE でキャッシュ無効）"
                 );
+            }
+
+            // 111. 利用上限後のペイン単位の自動復帰（#813）。
+            //
+            // 正例 2 型（ダイアログ型 / idle 型）と負例 3 型（OFF / permission /
+            // API エラー）を**実ペインの実画面**で通す。上限を実際に踏むことはできないので
+            // 画面は #748 の実採取 fixture を printf で描き、時刻だけ
+            // `backdate_for_test` で「リセット済み」へ寄せる（判断そのものは
+            // tako-core の純粋関数のまま = #749 と同じ流儀）
+            {
+                use tako_control::protocol::Request as Req;
+
+                // fixture は**専用タブの単独ペイン**に、**コマンド付きペイン**として描く。
+                // ここは 2 つの実測を踏まえた形:
+                //  ① ここまでの項目でタブ内のペインが増えており、既存タブで分割すると
+                //     高さが数行しか残らない。ダイアログは見出し + 選択肢で 5 行を占めるので
+                //     狭いペインでは上の行がスクロールアウトして検知できない
+                //  ② シェルへ `Send` で打ち込むと**コマンドのエコー**が画面に残り、
+                //     fixture の文字列がそこにも現れて「出た」と誤判定する。
+                //     コマンド付きペイン（分割時に直接起動）ならエコーが無い
+                // 新タブの初期ペインは分割後に閉じて、fixture ペインを全高にする。
+                // fixture は最下部に残す必要があるので sleep で保持する
+                let make_fixture_pane = async |cx: &mut AsyncApp, body: &str| -> Option<PaneId> {
+                    let script = format!("printf '%b' '{body}'; sleep 3600");
+                    let pair = window
+                        .update(cx, |app, _, cx| {
+                            let shell = tako_control::dispatch(
+                                app,
+                                Req::TabNew {
+                                    title: Some("st813".into()),
+                                    focus: Some(true),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["pane"].as_u64())
+                            .map(PaneId::from_raw)?;
+                            let fixture = tako_control::dispatch(
+                                app,
+                                Req::Split {
+                                    pane: Some(shell.as_u64()),
+                                    tab: None,
+                                    direction: Some(tako_control::protocol::Direction::Down),
+                                    ratio: None,
+                                    command: Some(vec![
+                                        "/bin/sh".into(),
+                                        "-c".into(),
+                                        script.clone(),
+                                    ]),
+                                    cwd: None,
+                                    focus: Some(false),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["pane"].as_u64())
+                            .map(PaneId::from_raw)?;
+                            for (p, options) in std::mem::take(&mut app.pending_attach) {
+                                if app.spawn_session(p, options, cx).is_err() {
+                                    app.remove_pane(p, cx);
+                                }
+                            }
+                            Some((shell, fixture))
+                        })
+                        .ok()
+                        .flatten();
+                    let (shell, fixture) = pair?;
+                    // 初期シェルを閉じて fixture ペインを全高にする
+                    wait(cx, 200).await;
+                    let _ = window.update(cx, |app, _, cx| app.remove_pane(shell, cx));
+                    Some(fixture)
+                };
+                // 画面の末尾（診断用。落ちたときに何が出ていたかを残す）
+                let tail813 = |cx: &mut AsyncApp, pane: PaneId| -> String {
+                    window
+                        .update(cx, |app, _, _| {
+                            let lines = app
+                                .terminals
+                                .get(&pane)
+                                .map(|s| s.visible_lines())
+                                .unwrap_or_default();
+                            let start = lines.len().saturating_sub(8);
+                            lines[start..].join(" / ")
+                        })
+                        .unwrap_or_default()
+                };
+                // 画面に文字列が出るまで待つ（固定待ちにしない。#796）
+                let wait_screen = async |cx: &mut AsyncApp, pane: PaneId, needle: &str| -> bool {
+                    for _ in 0..40 {
+                        wait(cx, 250).await;
+                        let hit = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&pane)
+                                    .map(|s| s.visible_lines().join("\n").contains(needle))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if hit {
+                            return true;
+                        }
+                    }
+                    false
+                };
+                let set_enabled = |cx: &mut AsyncApp, pane: PaneId, on: bool| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                Req::LimitResume {
+                                    pane: Some(pane.as_u64()),
+                                    enabled: Some(on),
+                                    all: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["enabled"].as_bool())
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or(!on)
+                };
+                // 1 回駆動して「そのペインへ積まれたナッジ本文」と追跡状態を返す
+                let drive =
+                    |cx: &mut AsyncApp, pane: PaneId| -> (Vec<String>, Option<String>, u32) {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.prompt_flows.clear();
+                                let _jobs = app.drive_limit_autoresume();
+                                let sent: Vec<String> = app
+                                    .prompt_flows
+                                    .iter()
+                                    .filter(|f| f.pane == pane)
+                                    .map(|f| f.prompt.clone())
+                                    .collect();
+                                let t = app.limit_resume.get(&pane);
+                                (
+                                    sent,
+                                    t.map(|t| t.kind.as_str().to_string()),
+                                    t.map(|t| t.attempts).unwrap_or(0),
+                                )
+                            })
+                            .unwrap_or_default()
+                    };
+                // リセット済みの状態へ寄せる（初観測を 1 時間前・リセットを 10 分前へ）
+                let backdate = |cx: &mut AsyncApp, pane: PaneId| {
+                    let _ = window.update(cx, |app, _, _| {
+                        let now = tako_core::limit_resume::now_unix();
+                        if let Some(t) = app.limit_resume.get_mut(&pane) {
+                            t.backdate_for_test(3600, Some(now - 600));
+                        }
+                    });
+                };
+                // 追跡状態の要約（落ちたときに理由が分かるように必ず出す）
+                let state813 = |cx: &mut AsyncApp, pane: PaneId| -> String {
+                    window
+                        .update(cx, |app, _, _| match app.limit_resume.get(&pane) {
+                            Some(t) => format!(
+                                "kind={} reset_at={:?} stable_since={:?} attempts={} outcome={:?}",
+                                t.kind.as_str(),
+                                t.reset_at,
+                                t.stable_since,
+                                t.attempts,
+                                t.last_outcome
+                            ),
+                            None => "none".to_string(),
+                        })
+                        .unwrap_or_default()
+                };
+                // 画面が静止するまで待つ（fixture の出力が届き切ってから判定に入る。
+                // 静止していないと `decide` は screen_unstable で正しく待つので、
+                // ここで待たないとテスト側の都合で偽陰性になる）
+                let settle813 = async |cx: &mut AsyncApp, pane: PaneId| {
+                    let mut last = String::new();
+                    for _ in 0..20 {
+                        let now = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&pane)
+                                    .map(|s| s.visible_lines().join("\n"))
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                        if !now.is_empty() && now == last {
+                            return;
+                        }
+                        last = now;
+                        wait(cx, 200).await;
+                    }
+                };
+
+                // --- 正例 ① idle 型（ダイアログ無し。上限メッセージのまま止まっている） ---
+                let filler813 = "\\n".repeat(50);
+                let idle_body = format!(
+                    "{filler813}実装を進めます\\n  Claude usage limit reached. \
+                     Your limit will reset at 3am.\\n"
+                );
+                let Some(idle_pane) = make_fixture_pane(cx, &idle_body).await else {
+                    fail("#813: idle 型ペインの作成")
+                };
+                if !wait_screen(cx, idle_pane, "usage limit reached").await {
+                    fail("#813: idle 型 fixture が画面に出ない");
+                }
+                settle813(cx, idle_pane).await;
+                // --- 負例 ① OFF のペインでは一切発動しない ---
+                let (sent_off, kind_off, _) = drive(cx, idle_pane);
+                check(
+                    sent_off.is_empty() && kind_off.is_none(),
+                    "111: OFF のペインでは自動復帰が発動しない (#813)",
+                );
+                // ON にする（dispatch 経由 = CLI / MCP / 右クリックと同じ経路）
+                check(
+                    set_enabled(cx, idle_pane, true),
+                    "111: dispatch で自動復帰を有効にできる (#813)",
+                );
+                // 有効化直後はリセット時刻待ちで発動しない
+                let (sent_wait, kind_wait, attempts_wait) = drive(cx, idle_pane);
+                check(
+                    sent_wait.is_empty()
+                        && kind_wait.as_deref() == Some("idle")
+                        && attempts_wait == 0,
+                    "111: 検知直後（静止待ち・リセット時刻待ち）は発動しない (#813)",
+                );
+                // リセット済みへ寄せると継続ナッジが積まれる
+                let before813 = state813(cx, idle_pane);
+                backdate(cx, idle_pane);
+                let (sent_now, _, attempts_now) = drive(cx, idle_pane);
+                println!(
+                    "TAKO_SELF_TEST_813_IDLE: before=({before813}) after=({}) sent={} \
+                     first={:?}",
+                    state813(cx, idle_pane),
+                    sent_now.len(),
+                    sent_now.first().map(|s| s.chars().take(24).collect::<String>()),
+                );
+                check(
+                    sent_now.len() == 1 && sent_now[0].contains("tako") && attempts_now == 1,
+                    "111: リセット後に継続ナッジが送達経路へ積まれる (#813)",
+                );
+                // 試行上限で打ち切る（無限リトライしない）
+                let exhausted = window
+                    .update(cx, |app, _, _| {
+                        if let Some(t) = app.limit_resume.get_mut(&idle_pane) {
+                            t.attempts = tako_core::limit_resume::MAX_ATTEMPTS;
+                            t.last_attempt = None;
+                        }
+                        app.prompt_flows.clear();
+                        let _ = app.drive_limit_autoresume();
+                        app.prompt_flows
+                            .iter()
+                            .filter(|f| f.pane == idle_pane)
+                            .count()
+                    })
+                    .unwrap_or(1);
+                check(exhausted == 0, "111: 試行上限に達したら発動しない (#813)");
+
+                // --- 正例 ② ダイアログ型（上限の対処ダイアログが出ている） ---
+                // 罫線と選択カーソルは**実文字**で書く（`\uXXXX` エスケープはシェルの
+                // printf 実装差で展開されず画面が別物になる。項目 102 と同じ理由）
+                let dialog_body = format!(
+                    "{filler813}▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\\n   \
+                     What do you want to do?\\n\\n   \
+                     ❯ 1. Stop and wait for limit to reset\\n     \
+                     2. Upgrade to Max 20x for higher session limits every month\\n     \
+                     3. Continue with usage credits\\n"
+                );
+                let Some(dialog_pane) = make_fixture_pane(cx, &dialog_body).await else {
+                    fail("#813: ダイアログ型ペインの作成")
+                };
+                if !wait_screen(cx, dialog_pane, "Stop and wait for limit to reset").await {
+                    fail("#813: ダイアログ型 fixture が画面に出ない");
+                }
+                settle813(cx, dialog_pane).await;
+                let _ = set_enabled(cx, dialog_pane, true);
+                let (_, kind_dialog, _) = drive(cx, dialog_pane);
+                println!(
+                    "TAKO_SELF_TEST_813_KIND: kind={kind_dialog:?} tail=[{}]",
+                    tail813(cx, dialog_pane)
+                );
+                check(
+                    kind_dialog.as_deref() == Some("dialog"),
+                    "111: 上限ダイアログをダイアログ型として検知する (#813)",
+                );
+                backdate(cx, dialog_pane);
+                let dialog_act = window
+                    .update(cx, |app, _, _| {
+                        app.prompt_flows.clear();
+                        let jobs = app.drive_limit_autoresume();
+                        let job_for = jobs.iter().filter(|j| j.pane == dialog_pane).count();
+                        let sent = app
+                            .prompt_flows
+                            .iter()
+                            .filter(|f| f.pane == dialog_pane)
+                            .count();
+                        let outcome = app
+                            .limit_resume
+                            .get(&dialog_pane)
+                            .and_then(|t| t.last_outcome.clone())
+                            .unwrap_or_default();
+                        (job_for, sent, outcome)
+                    })
+                    .unwrap_or((0, 0, String::new()));
+                println!(
+                    "TAKO_SELF_TEST_813_DIALOG: jobs={} sent={} outcome={:?} state=({})",
+                    dialog_act.0,
+                    dialog_act.1,
+                    dialog_act.2,
+                    state813(cx, dialog_pane),
+                );
+                // ダイアログにはテキストを送らない（キー操作として食われるため。#748）。
+                // 応答は job（バックエンドあり）か「到達手段なし」の記録のどちらかになる
+                check(
+                    dialog_act.1 == 0,
+                    "111: ダイアログ型では入力欄へテキストを送らない (#813)",
+                );
+                check(
+                    dialog_act.0 == 1 || dialog_act.2.contains("no backend session"),
+                    "111: ダイアログ型ではダイアログ応答を選ぶ (#813)",
+                );
+                // 実画面から拾った選択肢で、選ばれるのが「待つ」であること（課金系を選ばない）
+                let picked = window
+                    .update(cx, |app, _, _| {
+                        let lines = app.terminals.get(&dialog_pane)?.visible_lines();
+                        let d = tako_control::claude_tui::detect_choice_dialog(&lines)?;
+                        let opts: Vec<(Option<u32>, String)> = d
+                            .options
+                            .iter()
+                            .map(|o| (o.number, o.label.clone()))
+                            .collect();
+                        tako_core::limit_resume::safe_choice(&opts).map(|(_, l)| l.to_string())
+                    })
+                    .ok()
+                    .flatten();
+                check(
+                    picked.as_deref() == Some("Stop and wait for limit to reset"),
+                    "111: 実画面のダイアログから「待つ」選択肢をラベルで選ぶ (#813)",
+                );
+
+                // --- 負例 ② permission ダイアログでは発動しない ---
+                let perm_body = format!(
+                    "{filler813}   Bash command\\n   npm test\\n   \
+                     Do you want to proceed?\\n\\n   \
+                     ❯ 1. Yes\\n     2. Yes, and do not ask again\\n     3. No\\n"
+                );
+                let Some(perm_pane) = make_fixture_pane(cx, &perm_body).await else {
+                    fail("#813: permission ペインの作成")
+                };
+                if !wait_screen(cx, perm_pane, "Do you want to proceed?").await {
+                    fail("#813: permission fixture が画面に出ない");
+                }
+                settle813(cx, perm_pane).await;
+                let _ = set_enabled(cx, perm_pane, true);
+                let (sent_perm, kind_perm, _) = drive(cx, perm_pane);
+                check(
+                    sent_perm.is_empty() && kind_perm.is_none(),
+                    "111: permission ダイアログでは自動復帰が発動しない (#813)",
+                );
+
+                // --- 負例 ③ API エラーでは発動しない（supervisor の担当） ---
+                let api_body = format!(
+                    "{filler813}実装を進めます\\n  \
+                     API Error: Connection closed mid-response.\\n"
+                );
+                let Some(api_pane) = make_fixture_pane(cx, &api_body).await else {
+                    fail("#813: API エラーペインの作成")
+                };
+                if !wait_screen(cx, api_pane, "API Error").await {
+                    fail("#813: API エラー fixture が画面に出ない");
+                }
+                settle813(cx, api_pane).await;
+                let _ = set_enabled(cx, api_pane, true);
+                let (sent_api, kind_api, _) = drive(cx, api_pane);
+                check(
+                    sent_api.is_empty() && kind_api.is_none(),
+                    "111: API エラーでは自動復帰が発動しない (#813)",
+                );
+
+                // --- 3 経路の等価性: dispatch で書いた値が list / read に出る ---
+                let seen = window
+                    .update(cx, |app, _, _| {
+                        let list = tako_control::dispatch(app, Req::List, PaneOrigin::Cli).ok()?;
+                        let from_list = list["tabs"]
+                            .as_array()?
+                            .iter()
+                            .flat_map(|t| t["panes"].as_array().cloned().unwrap_or_default())
+                            .find(|p| p["id"] == idle_pane.as_u64())
+                            .and_then(|p| p["limit_autoresume"].as_bool())?;
+                        let read = tako_control::dispatch(
+                            app,
+                            Req::Read {
+                                pane: Some(idle_pane.as_u64()),
+                                lines: Some(1),
+                                tmux_session: None,
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .ok()?;
+                        let from_read = read["limit_resume"]["enabled"].as_bool()?;
+                        let has_state = read["limit_resume"]["state"]["resume_at"].is_i64();
+                        Some((from_list, from_read, has_state))
+                    })
+                    .ok()
+                    .flatten();
+                check(
+                    seen == Some((true, true, true)),
+                    "111: list / read が同じオプトイン状態と復帰予定を返す (#813)",
+                );
+
+                // --- 再起動をまたぐ維持: 保存表現に載っているか ---
+                // `save_layout` はセルフテスト中は**意図的に no-op**（ユーザーの
+                // layout.json を汚さない）なので、同じ capture を直接呼んで
+                // 「実ワークスペースから作った保存表現」を検査する。
+                // 保存 → 復元の往復は layout の単体テスト（issue813_…後方互換）が担保する
+                let persisted = window
+                    .update(cx, |app, _, _| {
+                        let layout = tako_control::layout::capture(
+                            &app.workspace,
+                            &|_| tako_control::layout::PaneMeta::default(),
+                            None,
+                        );
+                        let json = serde_json::to_string(&layout).ok()?;
+                        Some((
+                            json.matches("\"limit_autoresume\":true").count(),
+                            json.matches("limit_autoresume").count(),
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
+                check(
+                    // 有効にしたのは idle / dialog / permission / api の 4 ペインだけ。
+                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
+                    persisted == Some((4, 4)),
+                    "111: 有効にしたペインだけが保存表現へ載る (#813)",
+                );
+
+                // 後始末: 検証用ペインを閉じる
+                for p in [idle_pane, dialog_pane, perm_pane, api_pane] {
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.remove_pane(p, cx);
+                    });
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

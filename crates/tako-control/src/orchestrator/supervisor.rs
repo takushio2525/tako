@@ -156,35 +156,27 @@ impl SupervisorState {
 /// 盲目的な Enter は**黙って課金プラン変更 / モデル変更を確定させる**危険がある。
 ///
 /// 優先順: 解除まで待つ > 現状維持 > 停止。いずれも無ければ `None`
-/// （呼び出し側は自動操作をやめて通知のみに落ちる）
+/// （呼び出し側は自動操作をやめて通知のみに落ちる）。
+///
+/// 選別そのものは `tako_core::limit_resume::safe_choice` の 1 実装に寄せてある（#813）。
+/// おかげで許可リストと**拒否リスト**（課金・モデル変更を伴うラベルを構造的に弾く）が
+/// supervisor（#401）とペイン単位の自動復帰（#813）で完全に同じになる
 pub fn safe_limit_choice(dialog: &Value) -> Option<u32> {
-    let options = dialog.get("options")?.as_array()?;
-    let labeled: Vec<(u32, String)> = options
+    let options: Vec<(Option<u32>, String)> = dialog
+        .get("options")?
+        .as_array()?
         .iter()
-        .enumerate()
-        .map(|(i, o)| {
-            let number = o
-                .get("number")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as u32)
-                .unwrap_or((i + 1) as u32);
-            let label = o
-                .get("label")
-                .and_then(|l| l.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            (number, label)
+        .map(|o| {
+            (
+                o.get("number").and_then(|n| n.as_u64()).map(|n| n as u32),
+                o.get("label")
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
         })
         .collect();
-    for needle in ["wait for limit to reset", "keep current model"] {
-        if let Some((n, _)) = labeled.iter().find(|(_, l)| l.contains(needle)) {
-            return Some(*n);
-        }
-    }
-    labeled
-        .iter()
-        .find(|(_, l)| l == "stop" || l.starts_with("stop "))
-        .map(|(n, _)| *n)
+    tako_core::limit_resume::safe_choice(&options).map(|(number, _)| number)
 }
 
 /// ダイアログの構造を下見する（choice 省略 = 送信しない。#748）。

@@ -376,6 +376,18 @@ pub enum Request {
     /// タブ/ペインの × ボタン close 時の確認ダイアログ ON/OFF（Issue #172）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は config.yaml に永続化される
     ConfirmClose { enabled: Option<bool> },
+    /// 利用上限（5h / 週次）後の自動復帰（FR-2.27 / Issue #813）の**ペイン単位**の
+    /// オプトイン。`enabled` 省略時は現在状態の取得のみ。
+    /// `pane` は呼び出し側が埋める（CLI は `TAKO_PANE_ID`、MCP は呼び出し元ペイン。
+    /// FR-2.2.7 と同じ規約なので、特定できなければエラーになる）。
+    /// 設定は layout.json に永続化され、再起動・復元をまたいで維持される
+    LimitResume {
+        pane: Option<u64>,
+        enabled: Option<bool>,
+        /// true = 全ペインの状態を一覧する（`enabled` とは併用しない）
+        #[serde(default)]
+        all: Option<bool>,
+    },
     /// 右サイドバー情報パネル（統合 tmux ビュー / git）の表示・幅・ビュー切替と、
     /// 左サイドバーのファイルツリー表示切替（FR-2.16.5。下部ステータスバーのトグルと
     /// 同じ経路）。すべて省略 = 現在状態の取得のみ（AI が成果や状況をユーザーへ見せる

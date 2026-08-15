@@ -7,6 +7,7 @@
 //! 新しくプラットフォーム分岐が必要になったら、呼び出し側に `cfg` を足すのではなく
 //! ここに境界を追加する。
 
+pub mod clock;
 pub mod quit_signal;
 pub mod release_assets;
 pub mod shell;

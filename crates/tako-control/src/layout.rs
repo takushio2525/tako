@@ -204,6 +204,15 @@ pub struct PaneLayout {
     /// バックグラウンドペインの由来タブ名（同上。閉じたタブ由来でも親を明記できるよう保持）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_tab_title: Option<String>,
+    /// 利用上限後の自動復帰のオプトイン（#813）。既定 OFF なので false は出力せず、
+    /// 旧ファイルは serde default で false になる（後方互換）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub limit_autoresume: bool,
+}
+
+/// `skip_serializing_if` 用（既定値 false の項目を JSON に出さない）
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// プレビューペインの保存内容（復元時はファイルを開き直す。PTY は起動しない）
@@ -292,6 +301,7 @@ pub fn capture(
                     // 由来タブ（FR-2.15.6）。再起動後もタブ別分離表示を保つ
                     origin_tab: Some(shelved.origin_tab().as_u64()),
                     origin_tab_title: Some(shelved.origin_tab_title().to_string()),
+                    limit_autoresume: pane.limit_autoresume(),
                 }
             })
             .collect(),
@@ -341,6 +351,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 // tree 内のペインは退避ではないので由来タブを持たない
                 origin_tab: None,
                 origin_tab_title: None,
+                limit_autoresume: pane.limit_autoresume(),
             }))
         }
         PaneNode::Split {
@@ -446,6 +457,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             p.title.clone(),
             parse_title_source(&p.title_source),
             p.role.clone(),
+            p.limit_autoresume,
         );
         restored.push(RestoredPane {
             pane: p.id,
@@ -504,6 +516,7 @@ fn restore_node(
                 p.title.clone(),
                 parse_title_source(&p.title_source),
                 p.role.clone(),
+                p.limit_autoresume,
             );
             let id = pane.id();
             restored.push(RestoredPane {
@@ -751,6 +764,81 @@ mod tests {
         let tab2_pane = Pane::new(PaneOrigin::Mcp);
         ws.create_tab("2", tab2_pane);
         ws
+    }
+
+    /// #813: 自動復帰のオプトインが再起動をまたいで残る。
+    /// 既定 OFF は JSON に出さず、旧ファイル（フィールド無し）も OFF として読める
+    #[test]
+    fn issue813_自動復帰フラグが保存復元され旧ファイルと後方互換() {
+        let root = Pane::new(PaneOrigin::User);
+        let root_id = root.id();
+        let mut ws = Workspace::new("1", root);
+        let second = Pane::new(PaneOrigin::Cli);
+        let second_id = second.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Right, second)
+            .unwrap();
+        // 片方だけ有効にする（全ペインに波及しないことも同時に見る）
+        ws.active_tab_mut()
+            .tree_mut()
+            .get_mut(second_id)
+            .unwrap()
+            .set_limit_autoresume(true);
+        // バックグラウンドのペインでも保たれる
+        let bg = Pane::new(PaneOrigin::User);
+        let bg_id = bg.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Down, bg)
+            .unwrap();
+        ws.active_tab_mut()
+            .tree_mut()
+            .get_mut(bg_id)
+            .unwrap()
+            .set_limit_autoresume(true);
+        ws.shelve_pane(bg_id).expect("退避できる");
+
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        let json = serde_json::to_string(&layout).unwrap();
+        // 既定 OFF のペインはフィールドごと出さない（旧 tako でも読める JSON を保つ）
+        assert_eq!(
+            json.matches("limit_autoresume").count(),
+            2,
+            "ON のペインぶんだけ出力される: {json}"
+        );
+
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored_ws, _) = restore(&back).expect("復元できる");
+        let tree = restored_ws.tabs()[0].tree();
+        assert!(
+            !tree
+                .get(PaneId::from_raw(root_id.as_u64()))
+                .unwrap()
+                .limit_autoresume(),
+            "有効にしていないペインは OFF のまま"
+        );
+        assert!(
+            tree.get(PaneId::from_raw(second_id.as_u64()))
+                .unwrap()
+                .limit_autoresume(),
+            "有効にしたペインは ON で戻る"
+        );
+        assert!(
+            restored_ws.shelved_panes()[0].pane().limit_autoresume(),
+            "バックグラウンドのペインでも ON で戻る"
+        );
+
+        // フィールドを持たない旧ファイルは OFF として読める
+        let legacy: LayoutFile =
+            serde_json::from_str(&json.replace("\"limit_autoresume\":true", "\"_x\":true"))
+                .unwrap();
+        let (legacy_ws, _) = restore(&legacy).expect("旧ファイルも復元できる");
+        assert!(!legacy_ws.tabs()[0]
+            .tree()
+            .get(PaneId::from_raw(second_id.as_u64()))
+            .unwrap()
+            .limit_autoresume());
     }
 
     #[test]
@@ -1061,6 +1149,7 @@ mod tests {
                 webview: None,
                 origin_tab: None,
                 origin_tab_title: None,
+                limit_autoresume: false,
             }))
         }
         let mut tree = pane(1);
@@ -1118,6 +1207,7 @@ mod tests {
             webview: None,
             origin_tab: Some(1),
             origin_tab_title: None,
+            limit_autoresume: false,
         });
         assert_eq!(layout.pane_count(), 4);
         assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
@@ -1212,6 +1302,7 @@ mod tests {
                 webview: None,
                 origin_tab: None,
                 origin_tab_title: None,
+                limit_autoresume: false,
             }))
         }
         let mut id = 1u64;
@@ -1305,6 +1396,7 @@ mod tests {
             webview: None,
             origin_tab: Some(1),
             origin_tab_title: None,
+            limit_autoresume: false,
         });
         assert!(
             !loses_backend_session(&base, &shelved),

@@ -110,6 +110,10 @@ enum Command {
     /// ON/OFF・状態確認。既定 ON。tako の外の zsh には影響しない。
     /// `hint` / `tab` で確定キーの案内と Tab 確定を個別に切り替える
     Autosuggest(AutosuggestArgs),
+    /// 利用上限（5h / 週次）後の自動復帰の ON/OFF・状態確認（ペイン単位。既定 OFF）。
+    /// 有効にしたペインは、上限で止まってもリセット時刻を過ぎたら tako が作業を再開させる
+    #[command(name = "limit-resume")]
+    LimitResume(LimitResumeArgs),
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
@@ -2107,6 +2111,23 @@ struct AutosuggestArgs {
     /// hint / tab を指定したときの on / off（省略時はその項目の現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+/// 利用上限後の自動復帰の引数（Issue #813）。
+///
+/// `tako limit-resume` = 呼び出し元ペインの現在値、`on` / `off` で切替、
+/// `--all` で全ペインの一覧。素のコマンドが最短で済む形にしてある（#322）
+#[derive(Args)]
+struct LimitResumeArgs {
+    /// on / off（省略時は現在状態を表示）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+    /// 対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 全ペインの状態を一覧する（state とは併用しない）
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -5029,6 +5050,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::LimitResume(args) => Request::LimitResume {
+            pane: args.pane.or_else(caller_pane),
+            enabled: args.state.as_deref().map(|s| s == "on"),
+            all: args.all.then_some(true),
+        },
         Command::Theme(args) => {
             let m = args.mode.as_deref();
             match m {
@@ -6587,6 +6613,8 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Pin(_) => {
             println!("{result}")
         }
+        // #813: 状態（stop / resume_at / attempts）が入れ子なので整形して出す
+        Command::LimitResume(_) => println!("{}", pretty_json(result)),
         Command::Git(GitCommand::Log { .. })
         | Command::Git(GitCommand::Diff { .. })
         | Command::Git(GitCommand::Show { .. })
@@ -7202,6 +7230,51 @@ mod tests {
                 enabled: Some(false)
             }
         );
+    }
+
+    /// #813: 素の `tako limit-resume` で状態確認、on / off で切替、`--all` で一覧。
+    /// `--pane` 省略時は呼び出し元（TAKO_PANE_ID）を埋める
+    #[test]
+    fn limit_resumeは状態取得と切替と一覧を操作へ写す() {
+        let status = parse(&["tako", "limit-resume"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: None,
+                all: None
+            }
+        );
+        let enable = parse(&["tako", "limit-resume", "on", "--pane", "12"]);
+        assert_eq!(
+            build_request(&enable).unwrap(),
+            Request::LimitResume {
+                pane: Some(12),
+                enabled: Some(true),
+                all: None
+            }
+        );
+        let disable = parse(&["tako", "limit-resume", "off", "--pane", "12"]);
+        assert_eq!(
+            build_request(&disable).unwrap(),
+            Request::LimitResume {
+                pane: Some(12),
+                enabled: Some(false),
+                all: None
+            }
+        );
+        // 一覧は呼び出し元ペインが分からなくても引ける（dispatch 側が pane を見ない）
+        let all = parse(&["tako", "limit-resume", "--all"]);
+        assert_eq!(
+            build_request(&all).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: None,
+                all: Some(true)
+            }
+        );
+        // on / off 以外は clap が弾く（誤った語で黙って状態取得にならない）
+        assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());
     }
 
     /// #600: 入力予測は素の `tako autosuggest` で状態確認、on / off で切替

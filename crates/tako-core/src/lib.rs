@@ -12,6 +12,7 @@ pub mod git;
 pub mod handoff;
 pub mod header_layout;
 pub mod i18n;
+pub mod limit_resume;
 pub mod links;
 pub mod md_links;
 pub mod osc_tap;

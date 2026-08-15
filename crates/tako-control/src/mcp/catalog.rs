@@ -953,6 +953,30 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_limit_resume",
+            "description": "利用上限（5h / 週次）後の自動復帰を**ペイン単位**で ON/OFF する\
+                （enabled 省略時は現在状態の取得のみ。既定 OFF）。有効にしたペインが\
+                上限で止まると、tako がリセット時刻（画面の「reset at …」から解決）+ 数分の\
+                安全マージンを過ぎたところで作業を再開させる: 上限対処ダイアログが出ていれば\
+                「解除まで待つ」相当の選択肢をラベル一致で確定し（課金・モデル変更を伴う\
+                選択肢は構造的に選ばない）、ダイアログが無ければ継続ナッジを送達する。\
+                発動するのは上限由来の停止だけで、permission ダイアログ・API エラー・\
+                通常の idle・人間の下書きが入力欄にあるときは発動しない。試行は 1 回の\
+                上限あたり 3 回までで打ち切る。実行の記録は <data_dir>/supervisor.log の\
+                action=limit_autoresume に残る。設定は layout.json に永続化され\
+                再起動・復元をまたいで維持される。all=true で全ペインの状態を一覧できる。\
+                応答の state は現在の停止状況・復帰予定時刻・試行回数。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                    "all": { "type": "boolean", "description": "true = 全ペインの状態を一覧（enabled とは併用しない）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_git_log",
             "description": "git リポジトリのコミット履歴・ブランチ一覧・変更状態を取得する。\
                 対象ペインの cwd から git リポジトリを解決する。\
