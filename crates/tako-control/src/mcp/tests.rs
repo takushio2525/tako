@@ -106,6 +106,7 @@ mod tests {
                 mode: Some(crate::protocol::PreviewModeWire::Code),
                 direction: None,
                 focus: None,
+                new_tab: false,
             }]
         );
         // mode 省略は拡張子の自動判定に委ねる（None で渡る）。direction も省略可
@@ -122,6 +123,7 @@ mod tests {
                 mode: None,
                 direction: None,
                 focus: None,
+                new_tab: false,
             }]
         );
         // direction 指定（FR-3.11 = D&D のドロップ位置の同等操作）
@@ -141,6 +143,7 @@ mod tests {
                 mode: None,
                 direction: Some(Direction::Down),
                 focus: None,
+                new_tab: false,
             }]
         );
         // 不正な mode と path 欠落は引数エラー

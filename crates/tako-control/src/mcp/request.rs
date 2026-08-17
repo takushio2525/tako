@@ -148,6 +148,7 @@ pub(super) fn build_request(
         "tako_create_tab" => Request::TabNew {
             title: str_arg(args, "title")?,
             focus: bool_arg(args, "focus")?,
+            cwd: str_arg(args, "cwd")?,
         },
         "tako_select_tab" => Request::TabSelect {
             tab: required_u64(args, "tab")?,
@@ -235,6 +236,7 @@ pub(super) fn build_request(
             },
             direction: direction_arg(args)?,
             focus: bool_arg(args, "focus")?,
+            new_tab: bool_arg(args, "new_tab")?.unwrap_or(false),
         },
         "tako_preview_view" => Request::PreviewView {
             pane: Some(target_pane(args, caller)?),

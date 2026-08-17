@@ -1264,11 +1264,60 @@ impl TakoApp {
                 mode: None,
                 direction: None,
                 focus: Some(true),
+                new_tab: false,
             },
             PaneOrigin::User,
         );
         if let Err(e) = result {
             eprintln!("warning: ファイルを開けない: {e}");
+        }
+        self.drain_pending_highlights(cx);
+        cx.notify();
+    }
+
+    /// Finder の「このアプリケーションで開く」から渡されたものを新しいタブで開く
+    /// （FR-3.22 / #835）。ファイルは `tako open --new-tab`、フォルダは
+    /// `tako tab new --cwd` と同じ dispatch を通る（UI 独自経路を作らない）
+    pub(crate) fn open_from_finder(
+        &mut self,
+        target: &crate::open_files::OpenTarget,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::open_files::OpenTarget;
+        let request = match target {
+            OpenTarget::PreviewInNewTab(path) => tako_control::protocol::Request::OpenFile {
+                pane: None,
+                path: path.display().to_string(),
+                mode: None,
+                direction: None,
+                focus: Some(true),
+                new_tab: true,
+            },
+            OpenTarget::ShellInNewTab(dir) => tako_control::protocol::Request::TabNew {
+                // タブ名はフォルダ名（無ければパスそのもの）。明示タイトル =
+                // 手動リネーム扱いになるので自動リネームに奪われない
+                title: Some(
+                    dir.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dir.display().to_string()),
+                ),
+                focus: Some(true),
+                cwd: Some(dir.display().to_string()),
+            },
+        };
+        match tako_control::dispatch(self, request, PaneOrigin::User) {
+            Ok(_) => {
+                // フォルダ経路（TabNew）はシェルを起動する。dispatch を直接呼ぶと
+                // 起動依頼は pending_attach へ積まれるだけなので、ここで処理する
+                // （残すと空のペインが残り、後続 dispatch が巻き添えを食う）
+                for (pane, options) in std::mem::take(&mut self.pending_attach) {
+                    if let Err(e) = self.spawn_session(pane, options, cx) {
+                        eprintln!("warning: フォルダのターミナルを起動できない: {e}");
+                        self.remove_pane(pane, cx);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: Finder から渡されたものを開けない: {e}"),
         }
         self.drain_pending_highlights(cx);
         cx.notify();

@@ -10830,6 +10830,7 @@ impl TakoApp {
                     mode: None,
                     direction,
                     focus: Some(true),
+                    new_tab: false,
                 },
                 PaneOrigin::User,
             );
@@ -10854,6 +10855,7 @@ impl TakoApp {
                     mode: None,
                     direction: None,
                     focus: Some(true),
+                    new_tab: false,
                 },
                 PaneOrigin::User,
             );
@@ -11260,6 +11262,7 @@ impl TakoApp {
                             mode: None,
                             direction: Some(tako_control::protocol::Direction::Right),
                             focus: Some(true),
+                            new_tab: false,
                         },
                         PaneOrigin::User,
                     );
@@ -19720,6 +19723,22 @@ mod self_test {
         }
     }
 
+    /// パスを NSURL の `absoluteString` 相当（`file://` + パーセントエンコード）へ。
+    /// 項目 116（#835）が Finder から来る形そのままで受け口を叩くために使う。
+    /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて
+    pub(crate) fn file_url(path: &std::path::Path) -> String {
+        let mut out = String::from("file://");
+        for b in path.display().to_string().bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
     /// CoreGraphics / PDFKit の両方が受理する xref 付き最小 PDF を生成する。
     fn write_test_pdf(path: &std::path::Path) {
         write_test_pdf_with_text(path, "Hello PDF");
@@ -22339,6 +22358,7 @@ mod self_test {
                         mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(false),
+                        new_tab: false,
                     },
                     PaneOrigin::Cli,
                 )
@@ -22648,6 +22668,7 @@ mod self_test {
                         mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(true),
+                        new_tab: false,
                     },
                     PaneOrigin::Cli,
                 )
@@ -23412,6 +23433,7 @@ mod self_test {
                         mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                         direction: None,
                         focus: Some(true),
+                        new_tab: false,
                     },
                     PaneOrigin::Cli,
                 );
@@ -24503,6 +24525,7 @@ mod self_test {
                                 mode: Some(tako_control::protocol::PreviewModeWire::Code),
                                 direction: Some(tako_control::protocol::Direction::Right),
                                 focus: Some(true),
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -24881,6 +24904,7 @@ mod self_test {
                         mode: Some(tako_control::protocol::PreviewModeWire::Code),
                         direction: Some(tako_control::protocol::Direction::Right),
                         focus: Some(true),
+                        new_tab: false,
                     },
                     PaneOrigin::Cli,
                 )
@@ -25182,6 +25206,7 @@ mod self_test {
                             mode: Some(mode),
                             direction: Some(tako_control::protocol::Direction::Right),
                             focus: Some(false),
+                            new_tab: false,
                         },
                         PaneOrigin::Cli,
                     )
@@ -26023,6 +26048,7 @@ mod self_test {
                             mode: Some(tako_control::protocol::PreviewModeWire::Pdf),
                             direction: None,
                             focus: None,
+                            new_tab: false,
                         },
                         PaneOrigin::Cli,
                     )
@@ -26101,6 +26127,7 @@ mod self_test {
                                 mode: Some(tako_control::protocol::PreviewModeWire::Code),
                                 direction: None,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -31819,6 +31846,7 @@ mod self_test {
                             mode,
                             direction: None,
                             focus: None,
+                            new_tab: false,
                         },
                         PaneOrigin::Cli,
                     )
@@ -32452,6 +32480,7 @@ mod self_test {
                             mode: Some(tako_control::protocol::PreviewModeWire::Code),
                             direction: None,
                             focus: None,
+                            new_tab: false,
                         },
                         PaneOrigin::Cli,
                     )
@@ -32597,6 +32626,7 @@ mod self_test {
                             mode: Some(tako_control::protocol::PreviewModeWire::Pdf),
                             direction: None,
                             focus: None,
+                            new_tab: false,
                         },
                         PaneOrigin::Cli,
                     )
@@ -32841,6 +32871,7 @@ mod self_test {
                                 mode: Some(tako_control::protocol::PreviewModeWire::Code),
                                 direction: None,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -32900,6 +32931,7 @@ mod self_test {
                             mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                             direction: None,
                             focus: None,
+                            new_tab: false,
                         },
                         PaneOrigin::Cli,
                     );
@@ -32936,6 +32968,7 @@ mod self_test {
                                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                                 direction: None,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -33171,6 +33204,7 @@ mod self_test {
                                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                                 direction: None,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         );
@@ -34657,6 +34691,7 @@ mod self_test {
                                 mode: None,
                                 direction,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -34788,6 +34823,7 @@ mod self_test {
                                 mode: None,
                                 direction: None,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -35188,6 +35224,7 @@ mod self_test {
                                 mode: None,
                                 direction: None,
                                 focus: None,
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -35584,6 +35621,7 @@ mod self_test {
                             tako_control::protocol::Request::TabNew {
                                 title: Some("spawn-layout".into()),
                                 focus: None,
+                                cwd: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -36164,6 +36202,7 @@ mod self_test {
                                 mode: None,
                                 direction: None,
                                 focus: Some(true),
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         )
@@ -43259,6 +43298,7 @@ mod self_test {
                     Req::TabNew {
                         title: Some("st770".into()),
                         focus: Some(true),
+                        cwd: None,
                     },
                     cx,
                 );
@@ -43291,6 +43331,7 @@ mod self_test {
                         mode: None,
                         direction: Some(tako_control::protocol::Direction::Down),
                         focus: Some(false),
+                        new_tab: false,
                     },
                     cx,
                 );
@@ -43711,6 +43752,7 @@ mod self_test {
                             tako_control::protocol::Request::TabNew {
                                 title: Some("782-hidden".into()),
                                 focus: Some(false),
+                                cwd: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -44338,6 +44380,7 @@ mod self_test {
                                 Req::TabNew {
                                     title: Some("st813".into()),
                                     focus: Some(true),
+                                    cwd: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -44793,6 +44836,7 @@ mod self_test {
                                 mode: Some(tako_control::protocol::PreviewModeWire::Code),
                                 direction: Some(tako_control::protocol::Direction::Right),
                                 focus: Some(false),
+                                new_tab: false,
                             },
                             PaneOrigin::Cli,
                         );
@@ -45028,6 +45072,7 @@ mod self_test {
                             tako_control::protocol::Request::TabNew {
                                 title: Some("816-hidden".into()),
                                 focus: Some(false),
+                                cwd: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -45232,6 +45277,7 @@ mod self_test {
                                     ),
                                     direction: Some(tako_control::protocol::Direction::Right),
                                     focus: Some(false),
+                                    new_tab: false,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -45860,6 +45906,170 @@ mod self_test {
                     leftovers830 == 0,
                     "115: 閉じたらチャットの器と座標系も落ちる (#830)",
                 );
+            }
+
+            // 116（#835）: Finder の「このアプリケーションで開く」の受け口。
+            // macOS の `application:openURLs:` から先の**全部**（URL → パス変換 →
+            // 開き方の振り分け → dispatch → タブ生成）をプロセス内で通す。
+            // AppKit のイベント配送そのものは隔離 .app の `open -a` e2e で見る
+            {
+                let any835 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window835 = any835.downcast::<TakoApp>().unwrap_or(window);
+                let dir835 = std::env::temp_dir()
+                    .join(format!("tako-selftest-835-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir835);
+                let _ = std::fs::create_dir_all(dir835.join("プロジェクト"));
+                let _ = std::fs::write(dir835.join("読み物.md"), "# 見出し\n\n本文\n");
+                // 宣言外の形式（UTI が無いので Finder の候補には出ないが「その他…」で来る）
+                let _ = std::fs::write(dir835.join("unknown.xyzzy"), "任意のバイト列\n");
+
+                let (tabs_before835, active_before835, panes_before835) = window835
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.workspace.tabs().len(),
+                            app.workspace.active_tab_id(),
+                            app.workspace.active_tab().tree().len(),
+                        )
+                    })
+                    .unwrap_or((0, TabId::from_raw(0), 0));
+
+                // NSURL が渡してくる形（パーセントエンコード込み）から通す
+                let urls835: Vec<String> = vec![
+                    // 存在しないパス（%E3%83%80%E3%83%9F%E3%83%BC = ダミー）は落ちる
+                    "file:///%E3%83%80%E3%83%9F%E3%83%BC".to_string(),
+                    self_test::file_url(&dir835.join("読み物.md")),
+                    self_test::file_url(&dir835.join("プロジェクト")),
+                    self_test::file_url(&dir835.join("unknown.xyzzy")),
+                ];
+                let paths835 = open_files::file_urls_to_paths(&urls835);
+                check(
+                    paths835.len() == 4,
+                    &format!(
+                        "116: file URL が 4 本ともパスへ戻る ({}) (#835)",
+                        paths835.len()
+                    ),
+                );
+                cx.update(|cx| open_files::open_paths(paths835, cx));
+                notify_and_draw(any835, window835, cx);
+
+                #[allow(clippy::type_complexity)]
+                let (tabs_after835, active_after835, prev_tab_panes835, new_tabs835): (
+                    usize,
+                    TabId,
+                    Option<usize>,
+                    Vec<(String, usize, Option<String>, bool)>,
+                ) = window835
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let new_tabs = app
+                            .workspace
+                            .tabs()
+                            .iter()
+                            .skip(tabs_before835)
+                            .map(|t| {
+                                let panes: Vec<PaneId> =
+                                    t.tree().panes().into_iter().map(|p| p.id()).collect();
+                                let preview = panes
+                                    .iter()
+                                    .find_map(|p| app.previews.get(p))
+                                    .map(|s| s.path.display().to_string());
+                                let has_terminal =
+                                    panes.iter().any(|p| app.terminals.contains_key(p));
+                                (t.title().to_string(), panes.len(), preview, has_terminal)
+                            })
+                            .collect();
+                        (
+                            app.workspace.tabs().len(),
+                            app.workspace.active_tab_id(),
+                            app.workspace.get_tab(active_before835).map(|t| t.tree().len()),
+                            new_tabs,
+                        )
+                    })
+                    .unwrap_or((0, TabId::from_raw(0), None, Vec::new()));
+                println!(
+                    "TAKO_SELF_TEST_835: tabs={tabs_before835}->{tabs_after835} \
+                     new={new_tabs835:?} prev_tab_panes={prev_tab_panes835:?}"
+                );
+                // 開けた 3 つがそれぞれ 1 タブ（存在しない 1 本は落ちる）
+                check(
+                    tabs_after835 == tabs_before835 + 3,
+                    &format!(
+                        "116: 開けたものだけが 1 つ 1 タブになる \
+                         ({tabs_before835}->{tabs_after835}) (#835)"
+                    ),
+                );
+                // 元のタブは 1 ペインも増減しない = 既存の作業を動かさない
+                check(
+                    prev_tab_panes835 == Some(panes_before835),
+                    "116: 元のタブのペイン数が変わらない (#835)",
+                );
+                check(
+                    new_tabs835.first().is_some_and(|(title, panes, preview, term)| {
+                        title == "読み物.md"
+                            && *panes == 1
+                            && preview.as_deref().is_some_and(|p| p.ends_with("読み物.md"))
+                            && !*term
+                    }),
+                    "116: ファイルはプレビュー 1 枚だけのタブになる\
+                     （PTY なし・タブ名 = ファイル名） (#835)",
+                );
+                check(
+                    new_tabs835.get(1).is_some_and(|(title, panes, preview, term)| {
+                        title == "プロジェクト" && *panes == 1 && preview.is_none() && *term
+                    }),
+                    "116: フォルダはそのフォルダのターミナルのタブになる (#835)",
+                );
+                check(
+                    new_tabs835.get(2).is_some_and(|(title, _, preview, term)| {
+                        title == "unknown.xyzzy"
+                            && preview
+                                .as_deref()
+                                .is_some_and(|p| p.ends_with("unknown.xyzzy"))
+                            && !*term
+                    }),
+                    "116: 宣言外の形式もプレビューで安全に開く (#835)",
+                );
+                // 最後に開いたものが前に出る
+                let last_tab835 = window835
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.workspace.tabs().last().map(|t| t.id())
+                    })
+                    .ok()
+                    .flatten();
+                check(
+                    new_tabs835.len() == 3 && last_tab835 == Some(active_after835),
+                    "116: 最後に開いたタブが前に出る (#835)",
+                );
+
+                // 後始末: 作ったタブのペインを閉じて元のタブへ戻す
+                let _ = window835.update(cx, |app: &mut TakoApp, _, cx| {
+                    let extra: Vec<u64> = app
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .skip(tabs_before835)
+                        .flat_map(|t| {
+                            t.tree()
+                                .panes()
+                                .into_iter()
+                                .map(|p| p.id().as_u64())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    for pane in extra {
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Close {
+                                pane: Some(pane),
+                                force: true,
+                                caller_role: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                    }
+                    let _ = app.workspace.activate_tab(active_before835);
+                    cx.notify();
+                });
+                let _ = std::fs::remove_dir_all(&dir835);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

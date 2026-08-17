@@ -2136,3 +2136,22 @@
 - 同梱: 計測ハーネス `TAKO_VISUAL_ONLY=chat-leak`（実 transcript / 枚数を指定できる）、
   項目 98 のヒットテストを「見えている行を掴む」形へ是正、`--features visual-test` 時の
   clippy 違反 1 件（main 由来）を修正
+
+## 2026-08-17（#835: Finder の「このアプリケーションで開く」で新しいタブが開く）
+- #708 は受け口まで作ってあったが開く先が**アクティブタブのプレビュー再利用**で、複数選択
+  すると最後の 1 枚しか残らず「選んでも何も起きない」に見えていた（旧挙動へ戻すと
+  セルフテスト 116 が `tabs 3->4` / `new=[("プロジェクト", 2, Some("…/unknown.xyzzy"), true)]`
+  = 3 ファイルが 1 ペインに潰れることを実測）。**新しいタブ**で開く形へ是正
+- 振り分け: ファイル（宣言外の形式も）= プレビュー 1 枚だけのタブ（PTY なし・タブ名 =
+  ファイル名の手動タイトル）/ フォルダ = そのフォルダでシェルを起動したタブ / 不在パスは
+  読み飛ばし。複数選択は **1 ファイル = 1 タブ**（最後が前に出る）。既存タブは不変
+- 新ツールは作らず既存 dispatch を 2 本拡張: `OpenFile { new_tab }`（`tako open --new-tab` /
+  MCP `new_tab`。`direction` とは排他）と `TabNew { cwd }`（`tako tab new --cwd` / MCP `cwd`。
+  存在しない・フォルダでないパスは起動前にエラー）。MCP ツール数は不変
+- 検証: 品質ゲート全緑（fmt / clippy -D warnings / test）+ Windows クロスチェック警告 16
+  （main 同数）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 116 新設）+ **隔離 .app の
+  `open -a` e2e 22/22**（bundle id を差し替えたコピー + LSEnvironment で隔離。cold launch で
+  復元 3 タブ + 新規 1 タブ / 起動中 / 複数 / フォルダ / 宣言外 / 不在パス / CLI・MCP 1:1 /
+  本番の pid・layout.json 不変）。検出力は 3 通りの revert で FAILED を実測
+- 副観点: Finder に tako が 2 つ出るのは `~/dev/tako/dist/tako.app`（build-app.sh の生成物・
+  .gitignore 済み）が LS へ自動登録されるため。掃除手順は Issue / PR に記載（自動掃除はしない）

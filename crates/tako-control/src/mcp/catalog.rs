@@ -444,6 +444,7 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "title": { "type": "string", "description": "タブのタイトル（省略時は連番）" },
                     "focus": { "type": "boolean", "description": "true にすると新タブをアクティブにする（省略時は false = 現在のタブを維持）" },
+                    "cwd": { "type": "string", "description": "初期ペインのシェルを起動するフォルダ（省略時は継承）。存在しない・フォルダでないパスはエラー" },
                 },
                 "additionalProperties": false,
             },
@@ -624,7 +625,9 @@ pub fn tools() -> Vec<Value> {
                 ペインは再利用される: 対象がプレビューペインなら差し替え、同タブに既存の\
                 プレビューペインがあればそこへ、無ければ pane を分割して生やす（ターミナルは\
                 起動しない）。direction を指定すると再利用せず必ずその方向へ分割して開く\
-                （表示位置を制御したいとき）。「このファイルを見て」「成果物を確認して」の\
+                （表示位置を制御したいとき）。new_tab を指定すると新しいタブ 1 枚を\
+                そのファイル専用にする（Finder の「このアプリケーションで開く」と同じ表示）。\
+                「このファイルを見て」「成果物を確認して」の\
                 提示に使うこと。相対パスは pane の cwd 基準で解決する。",
             "inputSchema": {
                 "type": "object",
@@ -642,6 +645,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "指定時は既存プレビューを再利用せず pane をこの方向へ分割して開く",
                     },
                     "focus": { "type": "boolean", "description": "true にするとプレビューペインにフォーカスを移す（省略時は false = 元ペインを維持）" },
+                    "new_tab": { "type": "boolean", "description": "true にすると新しいタブを作り、そのタブ 1 枚をこのファイル専用のプレビューにする（タブ名はファイル名。ターミナルは起動しない）。いまのタブを一切動かさず別物として見せたいときに使う。direction とは排他" },
                 },
                 "required": ["path"],
                 "additionalProperties": false,
