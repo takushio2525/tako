@@ -94,6 +94,7 @@ tako/
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
 | ファイルツリーフォルダ操作 | `tako tree add <path>` / `tako tree remove <path>` / `tako tree list`（AI がプロジェクトフォルダを明示追加。#134） |
+| **Finder の「このアプリケーションで開く」（#708 / #835）** | Finder でファイルを右クリック → tako を選ぶと**新しいタブ**で開く。**ファイル = そのファイルだけが載ったタブ 1 枚**（タブ名 = ファイル名・プレビューのみで PTY なし）、**フォルダ = そのフォルダでシェルを起動したタブ**、存在しないパスは読み飛ばし。**複数選択は 1 ファイル = 1 タブ**で最後に開いたものが前に出る。既存のタブ・ペインには触らない。AI からの同等操作は `tako open <file> --new-tab` / MCP `tako_open_file` の `new_tab`（`--right` 等の分割方向とは排他）と `tako tab new --cwd <dir>` / MCP `tako_create_tab` の `cwd`。**既定アプリは奪わない**（`LSHandlerRank` は全宣言 `Alternate` 固定 = 候補に出るだけ。番犬テストが `build-app.sh` を読んで機械検証）。`.rs` / `.toml` 等は macOS が UTI を持たないため候補には出ない（`open -a tako <file>` なら開ける） |
 | プレビュー目次操作 | `tako preview-outline [--pane N] [--item N]`（Markdown / PDF 目次の一覧・1 始まり項目ジャンプ。MCP `tako_preview_outline` と 1:1。#232） |
 | プレビュー内リンク（#680 / #271） | `tako preview-link-list`（Markdown の `[text](url)` / PDF 注釈リンクを一覧。応答の `kind` が `markdown` / `pdf`）/ `tako preview-follow-link <index>`（URL は OS 既定ブラウザ。**http / https のみ**開き、`javascript:` / 相対パス / アンカーは拒否。PDF の内部リンクはページジャンプ）。GUI は ⌘+ホバーで下線 + ⌘+クリックで同じ経路。MCP `tako_preview_link_list` / `tako_preview_follow_link` と 1:1 |
 | Markdown コードブロックのコピー（#680） | `tako preview-copy-code [index]`（装飾なしの全文をクリップボードへ。index は出現順 0 始まり・省略で先頭。GUI はブロック右上のコピーボタンと同一経路。MCP `tako_preview_copy_code` と 1:1） |

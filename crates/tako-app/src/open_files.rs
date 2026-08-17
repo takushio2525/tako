@@ -1,5 +1,5 @@
-//! Finder の「このアプリケーションで開く」から渡されたファイルをプレビューで開く
-//! （FR-3.22 / Issue #708）。
+//! Finder の「このアプリケーションで開く」から渡されたファイルを開く
+//! （FR-3.22 / Issue #708・#835）。
 //!
 //! ## 経路
 //!
@@ -8,9 +8,22 @@
 //! 呼ばれない）。GPUI はこれを [`gpui::App::on_open_urls`] として公開しているが、
 //! コールバックのシグネチャは `FnMut(Vec<String>)` で `App` を持たない。
 //! そのため受け取った URL は channel でメインループへ渡し、そこで
-//! [`crate::TakoApp::open_file_row`]（= dispatch `OpenFile` = CLI `tako open` /
-//! MCP `tako_open_file` と同一経路）に載せる。**新しい操作系は作らない**ので、
+//! dispatch（= CLI `tako open --new-tab` / MCP `tako_open_file` の `new_tab`、
+//! フォルダは `tako tab new --cwd`）に載せる。**新しい操作系は作らない**ので、
 //! 開発不変条件（UI でできることは AI からもできる）は既存ツールで満たされる。
+//!
+//! ## 何がどこに開くか（#835）
+//!
+//! | 渡されたもの | 動作 |
+//! |---|---|
+//! | プレビューできるファイル | **新しいタブ 1 枚**をそのファイル専用のプレビューにする |
+//! | 宣言外・未知の形式 | 同上（`OpenFile` がコードプレビューへ落とす。巨大ファイルは切り詰め） |
+//! | フォルダ | **新しいタブ**でそのフォルダにシェルを起動する（ターミナルとして自然な既定） |
+//! | 存在しないパス | 警告して読み飛ばす（他のファイルの処理は続ける） |
+//!
+//! 複数ファイルを一度に渡されたら **1 ファイル = 1 タブ**。同じプレビューペインを
+//! 順に差し替えると最後の 1 枚しか残らず、選んだファイルの大半が「開かなかった」
+//! ように見えるため（#708 の挙動を #835 で是正）。
 //!
 //! ## タイミング
 //!
@@ -19,7 +32,7 @@
 //! 届くことがある。`on_open_urls` を `run` の前に登録し、受け取りを
 //! unbounded channel に積むことで、消費側（`run` の中で spawn）が動き出すまで
 //! 取りこぼさない。復元は `TakoApp::new` の中で同期的に終わるため、消費側が
-//! 動く時点でタブ・ペインは揃っている。
+//! 動く時点でタブ・ペインは揃っている（= 復元と新規タブが混ざらない）。
 
 use std::path::PathBuf;
 
@@ -82,15 +95,45 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// メインループ側の受け口。Finder から渡されたファイルをプレビューで開き、
-/// tako を前面に出す。
+/// 渡されたパスをどう開くか（#835）。分類は純粋関数（[`plan_open`]）にしてあるので、
+/// GUI なしで規則そのものを検査できる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenTarget {
+    /// 新しいタブ 1 枚をこのファイル専用のプレビューにする
+    PreviewInNewTab(PathBuf),
+    /// 新しいタブでこのフォルダにシェルを起動する
+    ShellInNewTab(PathBuf),
+}
+
+/// 渡されたパス群を開き方へ振り分ける。存在しないものは落とす（他を巻き添えにしない）。
+/// 順序は入力どおり = Finder で選んだ順にタブが並ぶ
+pub(crate) fn plan_open(paths: &[PathBuf]) -> Vec<OpenTarget> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            if p.is_dir() {
+                // ターミナルアプリにフォルダを渡す = 「そこで作業を始めたい」と読む。
+                // プレビューはファイル専用なので、フォルダはシェルで受ける
+                Some(OpenTarget::ShellInNewTab(p.clone()))
+            } else if p.is_file() {
+                // 宣言外の形式もここへ来る。表示モードの決定と巨大ファイルの
+                // 切り詰めは dispatch / プレビュー側が持っているので判定しない
+                Some(OpenTarget::PreviewInNewTab(p.clone()))
+            } else {
+                eprintln!("warning: 開けるものが見つからない: {}", p.display());
+                None
+            }
+        })
+        .collect()
+}
+
+/// メインループ側の受け口。Finder から渡されたものを新しいタブで開き、tako を前面に出す。
 ///
-/// - ウィンドウが 1 枚も無い（赤ボタン close 後にプロセスだけ生存）場合は
-///   Dock 復帰と同じ [`crate::reopen_or_restore`] でウィンドウを開き直してから開く
-/// - ディレクトリは v1 では対象外（`CFBundleDocumentTypes` にも宣言しない）。
-///   「その他…」で強制指定された場合は警告だけ出して無視する
+/// ウィンドウが 1 枚も無い（赤ボタン close 後にプロセスだけ生存）場合は
+/// Dock 復帰と同じ [`crate::reopen_or_restore`] でウィンドウを開き直してから開く。
 pub(crate) fn open_paths(paths: Vec<PathBuf>, cx: &mut gpui::App) {
-    if paths.is_empty() {
+    let targets = plan_open(&paths);
+    if targets.is_empty() {
         return;
     }
     if cx.windows().is_empty() {
@@ -98,33 +141,9 @@ pub(crate) fn open_paths(paths: Vec<PathBuf>, cx: &mut gpui::App) {
     }
     cx.activate(true);
 
-    let files: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|p| {
-            if p.is_dir() {
-                eprintln!(
-                    "warning: フォルダは開けない（プレビューはファイル専用）: {}",
-                    p.display()
-                );
-                return false;
-            }
-            if !p.exists() {
-                eprintln!("warning: ファイルが見つからない: {}", p.display());
-                return false;
-            }
-            true
-        })
-        .collect();
-    if files.is_empty() {
-        return;
-    }
-
     let open = move |app: &mut crate::TakoApp, cx: &mut gpui::Context<crate::TakoApp>| {
-        for path in &files {
-            // ファイルツリーのクリックと同一経路（dispatch OpenFile）。
-            // 複数選択で開かれた場合は同じプレビューペインを順に差し替える
-            // （タブ内 1 枚再利用は FR-3.2 の既定挙動）
-            app.open_file_row(path, cx);
+        for target in &targets {
+            app.open_from_finder(target, cx);
         }
     };
 
@@ -239,6 +258,40 @@ mod tests {
             file_urls_to_paths(&urls),
             vec![PathBuf::from("/tmp/a.md"), PathBuf::from("/tmp/b c.rs")]
         );
+    }
+
+    /// #835: 何を渡されたら何が開くかの規則。GUI なしで規則そのものを固定する
+    #[test]
+    fn 渡されたものの種類で開き方が決まる() {
+        let dir = std::env::temp_dir().join(format!("tako-openfiles-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.md"), "# x").unwrap();
+        // 宣言外の拡張子（UTI を持たない = Finder の候補には出ないが「その他…」で来る）
+        std::fs::write(dir.join("b.bin"), [0u8, 1, 2]).unwrap();
+
+        let plan = plan_open(&[
+            dir.join("a.md"),
+            dir.join("sub"),
+            dir.join("b.bin"),
+            dir.join("no-such"),
+        ]);
+        assert_eq!(
+            plan,
+            vec![
+                // ファイルは 1 枚 = 1 タブ。宣言外の形式も同じ扱い（表示モードの
+                // 決定と巨大ファイルの切り詰めはプレビュー側が持つ）
+                OpenTarget::PreviewInNewTab(dir.join("a.md")),
+                // フォルダはシェル
+                OpenTarget::ShellInNewTab(dir.join("sub")),
+                OpenTarget::PreviewInNewTab(dir.join("b.bin")),
+                // 存在しないものは落とすが、他は巻き添えにしない
+            ],
+            "選んだ順にタブが並び、開けないものだけが落ちる"
+        );
+        assert!(plan_open(&[]).is_empty());
+        assert!(plan_open(&[dir.join("no-such")]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 番犬テスト（受け入れ条件 4）: `build-app.sh` が生成する Info.plist の

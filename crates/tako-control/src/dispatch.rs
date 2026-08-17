@@ -1313,7 +1313,25 @@ fn dispatch_inner(
             }))
         }
 
-        Request::TabNew { title, focus } => {
+        Request::TabNew { title, focus, cwd } => {
+            // cwd はシェルを起動する前に検査する（存在しない場所で起動すると
+            // シェルの既定へ黙って落ちるので、頼まれた場所と違う場所が開く）
+            let cwd = match cwd {
+                Some(raw) => {
+                    let path = std::path::PathBuf::from(&raw);
+                    let path = path.canonicalize().map_err(|e| {
+                        DispatchError::Operation(format!("フォルダを開けない（{raw}: {e}）"))
+                    })?;
+                    if !path.is_dir() {
+                        return Err(DispatchError::Operation(format!(
+                            "フォルダではない: {}",
+                            path.display()
+                        )));
+                    }
+                    Some(path)
+                }
+                None => None,
+            };
             let prev_active = host.workspace().active_tab_id();
             let pane = Pane::new(origin);
             let pane_id = pane.id();
@@ -1331,8 +1349,19 @@ fn dispatch_inner(
             if !focus.unwrap_or(false) {
                 let _ = host.workspace_mut().activate_tab(prev_active);
             }
-            host.attach_session(pane_id, SpawnOptions::default());
-            Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
+            let cwd_json = cwd.as_ref().map(|p| p.display().to_string());
+            host.attach_session(
+                pane_id,
+                SpawnOptions {
+                    cwd,
+                    ..SpawnOptions::default()
+                },
+            );
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "pane": pane_id.as_u64(),
+                "cwd": cwd_json,
+            }))
         }
 
         Request::TabSelect { tab } => {
@@ -1659,7 +1688,14 @@ fn dispatch_inner(
             mode,
             direction,
             focus,
+            new_tab,
         } => {
+            if new_tab && direction.is_some() {
+                return Err(DispatchError::Operation(
+                    "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）"
+                        .into(),
+                ));
+            }
             let (tab, target) = match pane {
                 Some(_) => resolve_pane(host.workspace(), pane)?,
                 None => {
@@ -1708,27 +1744,49 @@ fn dispatch_inner(
                     }
                     _ => PreviewModeWire::Code,
                 });
-            // 表示先の解決: direction 指定（FR-3.11 = D&D のドロップ位置）なら再利用せず
-            // 必ずその方向へ分割。省略時は 対象自身がプレビュー > 同タブの既存プレビュー
-            // （再利用）> 右分割で新設（ターミナルセッションは起動しない = attach なし）
-            let (view_pane, created) = if let Some(direction) = direction {
+            // 表示先の解決: new_tab 指定（FR-3.22 = Finder の「このアプリケーションで
+            // 開く」）なら新しいタブ 1 枚をそのファイル専用にする。direction 指定
+            // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
+            // どちらも省略時は 対象自身がプレビュー > 同タブの既存プレビュー（再利用）
+            // > 右分割で新設。いずれの経路でもターミナルセッションは起動しない
+            let (tab, view_pane, created) = if new_tab {
+                let prev_active = host.workspace().active_tab_id();
+                let new_pane = Pane::new(origin);
+                let new_id = new_pane.id();
+                let title = resolved
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| resolved.display().to_string());
+                let tab_id = host.workspace_mut().create_tab(title, new_pane);
+                // ファイル名は「このタブが何か」そのものなので、自動リネーム（FR-2.12）に
+                // 奪わせない。プレビュー専用タブには命名材料になる端末出力も無い
+                if let Some(t) = host.workspace_mut().get_tab_mut(tab_id) {
+                    let title = t.title().to_string();
+                    t.set_title_manual(title);
+                }
+                // CLI/MCP 経由のデフォルトはアクティブタブを維持（ユーザーの入力を奪わない）
+                if !focus.unwrap_or(false) {
+                    let _ = host.workspace_mut().activate_tab(prev_active);
+                }
+                (tab_id, new_id, true)
+            } else if let Some(direction) = direction {
                 let new_pane = Pane::new(origin);
                 let new_id = new_pane.id();
                 tree_mut(host.workspace_mut(), tab)
                     .split_with_ratio(target, direction.to_core(), 0.5, new_pane)
                     .map_err(op_err)?;
-                (new_id, true)
+                (tab, new_id, true)
             } else if host.preview_state(target).is_some() {
-                (target, false)
+                (tab, target, false)
             } else if let Some(existing) = host.preview_pane_of_tab(tab) {
-                (existing, false)
+                (tab, existing, false)
             } else {
                 let new_pane = Pane::new(origin);
                 let new_id = new_pane.id();
                 tree_mut(host.workspace_mut(), tab)
                     .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
                     .map_err(op_err)?;
-                (new_id, true)
+                (tab, new_id, true)
             };
             let path_str = resolved.display().to_string();
             host.set_preview(view_pane, &path_str, mode)
@@ -1740,6 +1798,7 @@ fn dispatch_inner(
                     .map_err(op_err)?;
             }
             Ok(json!({
+                "tab": tab.as_u64(),
                 "pane": view_pane.as_u64(),
                 "path": path_str,
                 "mode": mode.as_str(),
@@ -9491,6 +9550,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9621,6 +9681,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9668,6 +9729,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: Some(true),
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9697,6 +9759,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9713,6 +9776,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: Some(true),
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9732,6 +9796,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: Some(true),
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10271,6 +10336,7 @@ mod tests {
             Request::TabNew {
                 title: Some("agents".into()),
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10651,6 +10717,7 @@ mod tests {
             Request::TabNew {
                 title: Some("agents".into()),
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10666,6 +10733,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10696,6 +10764,7 @@ mod tests {
                     mode,
                     direction: None,
                     focus: None,
+                    new_tab: false,
                 },
                 PaneOrigin::Mcp,
             )
@@ -10739,6 +10808,179 @@ mod tests {
         // 存在しないパス・ディレクトリはエラー
         assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
         assert!(open(&mut host, dir.display().to_string(), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-3.22 / #835: `new_tab` は「そのファイルだけが載った 1 枚」を作る。
+    /// Finder の「このアプリケーションで開く」がこの経路を通る
+    #[test]
+    fn open_fileのnew_tabはファイル専用のタブを作る() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-newtab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("b.md"), "# 見出し").unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let first_tab = host.ws.active_tab_id();
+        let open_new_tab = |host: &mut MockHost, path: String, focus: Option<bool>| {
+            dispatch(
+                host,
+                Request::OpenFile {
+                    pane: Some(root),
+                    path,
+                    mode: None,
+                    direction: None,
+                    focus,
+                    new_tab: true,
+                },
+                PaneOrigin::Mcp,
+            )
+        };
+
+        let result = open_new_tab(
+            &mut host,
+            dir.join("a.rs").display().to_string(),
+            Some(true),
+        )
+        .unwrap();
+        let tab_a = TabId::from_raw(result["tab"].as_u64().unwrap());
+        assert_ne!(tab_a, first_tab, "新しいタブが作られる");
+        assert_eq!(result["created"].as_bool(), Some(true));
+        assert_eq!(result["mode"].as_str(), Some("code"));
+        // 元のタブは 1 ペインのまま = 既存の作業を一切動かさない
+        assert_eq!(host.ws.get_tab(first_tab).unwrap().tree().len(), 1);
+        // 新しいタブは「プレビュー 1 枚だけ」。ターミナルは起動しない
+        assert_eq!(host.ws.get_tab(tab_a).unwrap().tree().len(), 1);
+        assert!(
+            host.attached.is_empty(),
+            "プレビュー専用タブは PTY を持たない"
+        );
+        // タブ名はファイル名で、自動リネームに奪われない手動扱い
+        assert_eq!(host.ws.get_tab(tab_a).unwrap().title(), "a.rs");
+        assert_eq!(
+            host.ws.get_tab(tab_a).unwrap().title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // focus=true なので新しいタブが前に出る
+        assert_eq!(host.ws.active_tab_id(), tab_a);
+
+        // 2 ファイル目も再利用せず別のタブになる（複数選択で全部が同時に見える）
+        let result = open_new_tab(
+            &mut host,
+            dir.join("b.md").display().to_string(),
+            Some(true),
+        )
+        .unwrap();
+        let tab_b = TabId::from_raw(result["tab"].as_u64().unwrap());
+        assert_ne!(tab_b, tab_a);
+        assert_eq!(result["mode"].as_str(), Some("markdown"));
+        assert_eq!(host.ws.tabs().len(), 3);
+
+        // focus 省略（CLI / MCP の既定）はアクティブタブを奪わない
+        let before = host.ws.active_tab_id();
+        let result = open_new_tab(&mut host, dir.join("a.rs").display().to_string(), None).unwrap();
+        assert_eq!(
+            host.ws.active_tab_id(),
+            before,
+            "既定はユーザーの表示を奪わない"
+        );
+        assert_ne!(
+            TabId::from_raw(result["tab"].as_u64().unwrap()),
+            before,
+            "タブ自体は裏で作られる"
+        );
+
+        // direction とは排他（新しいタブには分割元が無い）
+        let conflict = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: dir.join("a.rs").display().to_string(),
+                mode: None,
+                direction: Some(Direction::Right),
+                focus: None,
+                new_tab: true,
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(conflict.is_err(), "new_tab + direction はエラー");
+
+        // ディレクトリ・不在パスは new_tab でもエラー（タブを作り散らかさない）
+        let tabs_before = host.ws.tabs().len();
+        assert!(open_new_tab(&mut host, dir.display().to_string(), None).is_err());
+        assert!(open_new_tab(&mut host, dir.join("no-such").display().to_string(), None).is_err());
+        assert_eq!(host.ws.tabs().len(), tabs_before, "失敗時にタブは増えない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #835: フォルダを渡されたときの受け皿。`tako tab new --cwd` = Finder から
+    /// フォルダを開いたときの「そのフォルダでシェルを起動する」経路
+    #[test]
+    fn tab_newのcwdはそのフォルダでシェルを起動する() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-tabcwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: Some("proj".into()),
+                focus: Some(true),
+                cwd: Some(dir.display().to_string()),
+            },
+            PaneOrigin::User,
+        )
+        .unwrap();
+        let pane = result["pane"].as_u64().unwrap();
+        let spawned = host
+            .attached_options
+            .get(&pane)
+            .expect("シェルが起動依頼される");
+        assert_eq!(
+            spawned.cwd.as_deref(),
+            Some(dir.canonicalize().unwrap().as_path()),
+            "頼まれたフォルダでシェルが立つ"
+        );
+        assert!(spawned.command.is_none(), "既定シェルを起動する");
+
+        // 存在しない・フォルダでないパスは起動前にエラー（黙って別の場所で開かない）
+        assert!(dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: Some(dir.join("no-such").display().to_string()),
+            },
+            PaneOrigin::User,
+        )
+        .is_err());
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        assert!(dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: Some(dir.join("f.txt").display().to_string()),
+            },
+            PaneOrigin::User,
+        )
+        .is_err());
+        // cwd 省略は従来どおり継承（回帰防止）
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: None,
+            },
+            PaneOrigin::User,
+        )
+        .unwrap();
+        let pane = result["pane"].as_u64().unwrap();
+        assert!(host.attached_options.get(&pane).unwrap().cwd.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11038,6 +11280,7 @@ mod tests {
                     mode: None,
                     direction,
                     focus: Some(true),
+                    new_tab: false,
                 },
                 PaneOrigin::User,
             )
@@ -11076,6 +11319,7 @@ mod tests {
                 mode: Some(PreviewModeWire::Code),
                 direction: None,
                 focus: None,
+                new_tab: false,
             },
             PaneOrigin::Cli,
         )
@@ -11111,6 +11355,7 @@ mod tests {
                 mode: None,
                 direction: None,
                 focus: None,
+                new_tab: false,
             },
             PaneOrigin::User,
         );
@@ -11311,6 +11556,7 @@ mod tests {
                 Request::TabNew {
                     title: None,
                     focus: None,
+                    cwd: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -11390,6 +11636,7 @@ mod tests {
                 Request::TabNew {
                     title: None,
                     focus: None,
+                    cwd: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -13795,6 +14042,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -13848,6 +14096,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -14524,6 +14773,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -14546,6 +14796,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -14568,6 +14819,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -14662,6 +14914,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -15304,6 +15557,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )

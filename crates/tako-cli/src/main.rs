@@ -1980,6 +1980,10 @@ struct OpenArgs {
     /// プレビューペインにフォーカスを移す（省略時は元ペインを維持）
     #[arg(long)]
     focus: bool,
+    /// 新しいタブ 1 枚をこのファイル専用のプレビューにして開く（タブ名はファイル名。
+    /// Finder の「このアプリケーションで開く」と同じ表示。#835）
+    #[arg(long = "new-tab", conflicts_with_all = ["right", "down", "up", "left"])]
+    new_tab: bool,
 }
 
 #[derive(Args)]
@@ -2436,6 +2440,9 @@ enum TabCommand {
         /// 新タブをアクティブにする（省略時は現在のタブを維持）
         #[arg(long)]
         focus: bool,
+        /// 初期ペインのシェルを起動するフォルダ（省略時は継承。#835）
+        #[arg(long)]
+        cwd: Option<String>,
     },
     /// タブの表示タイトルを変える（明示リネーム = 自動リネームより優先。空文字で解除）
     Rename {
@@ -3681,6 +3688,7 @@ fn remote_start() -> Result<(), String> {
                     mode: Some(tako_control::protocol::PreviewModeWire::Image),
                     direction: None,
                     focus: Some(true),
+                    new_tab: false,
                 });
                 eprintln!("スマホでスキャンしてください。");
             }
@@ -4624,6 +4632,7 @@ fn new_tab_target(
     let tab_result = send_request(Request::TabNew {
         title: Some(tab_title.to_string()),
         focus: Some(true),
+        cwd: None,
     })
     .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
     let pane = tab_result["pane"]
@@ -4695,6 +4704,19 @@ fn tab_contains_pane(tab: &Value, pane: u64) -> bool {
     tab["panes"]
         .as_array()
         .is_some_and(|panes| panes.iter().any(|p| p["id"].as_u64() == Some(pane)))
+}
+
+/// 相対パスを CLI 実行時の cwd で絶対化する。`--pane` で別ペインを指定しても
+/// 「いま居る場所」基準のまま意図どおりに解決させるため（cwd を取れなければ
+/// そのまま渡し、アプリ側のペイン cwd 解決に任せる）
+fn absolutize(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if !p.is_relative() {
+        return path.to_string();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p).display().to_string())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// `--pane` 指定が無ければ呼び出し元へフォールバックする（FR-2.2.7）
@@ -4811,19 +4833,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tab: args.tab,
         },
         Command::Open(args) => {
-            // 相対パスは CLI 実行時の cwd で絶対化する（--pane で別ペインを指定しても
-            // 「いま居る場所」基準のまま意図どおりに解決される）
-            let path = std::path::Path::new(&args.path);
-            let path = if path.is_relative() {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(path).display().to_string())
-                    .unwrap_or_else(|_| args.path.clone())
-            } else {
-                args.path.clone()
-            };
             Request::OpenFile {
                 pane: target_pane(args.pane)?,
-                path,
+                path: absolutize(&args.path),
                 mode: match args.mode.as_deref() {
                     None => None,
                     Some("code") => Some(tako_control::protocol::PreviewModeWire::Code),
@@ -4841,6 +4853,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     _ => None,
                 },
                 focus: if args.focus { Some(true) } else { None },
+                new_tab: args.new_tab,
             }
         }
         Command::Preview(args) => Request::PreviewView {
@@ -4931,9 +4944,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 enabled: *enabled,
             },
         },
-        Command::Tab(TabCommand::New { title, focus }) => Request::TabNew {
+        Command::Tab(TabCommand::New { title, focus, cwd }) => Request::TabNew {
             title: title.clone(),
             focus: if *focus { Some(true) } else { None },
+            // 相対パスは CLI 実行時の cwd で絶対化する（`tako open` と同じ規則）
+            cwd: cwd.as_ref().map(|c| absolutize(c)),
         },
         Command::Tab(TabCommand::Rename { tab, source, title }) => Request::TabRename {
             pane: if tab.is_none() {
@@ -7085,6 +7100,7 @@ mod tests {
                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                 direction: None,
                 focus: None,
+                new_tab: false,
             }
         );
         // 相対パスは CLI の cwd で絶対化される
