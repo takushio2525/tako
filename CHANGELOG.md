@@ -8,6 +8,13 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.3] - 2026-08-18
+
+Nightly patch release (automated). Changes since v0.7.2:
+夜間パッチリリース（自動）。v0.7.2 以降の変更:
+
+- [機能追加] Finder の「このアプリケーションで開く」で新しいタブが開く (#835) (#836)
+
 ## [0.7.2] - 2026-08-16
 
 Nightly patch release (automated). Changes since v0.7.1:
