@@ -46,6 +46,16 @@ impl raw_window_handle::HasWindowHandle for WindowHandleBox {
     }
 }
 
+/// フレーム同期をルート render で行う新経路（#838）を切る逃げ道
+/// （`TAKO_838_NO_ROOT_WEBVIEW_SYNC=1`）。
+///
+/// 1 の間は #838 以前の「ペイン本体の render が印を付け、ルートの掃き出しが
+/// 印の無いものを隠す」経路に戻る。同じバイナリでちらつきを A/B するためのもの
+pub(crate) fn root_sync_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_838_NO_ROOT_WEBVIEW_SYNC").is_some())
+}
+
 /// dock 管理用の永続 ID。ペインとは独立で、ペインを閉じてもページは生きる
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WebViewId(pub u64);
@@ -133,6 +143,10 @@ pub struct WebViewEntry {
     pub(crate) visible_now: bool,
     /// 直近フレームの bounds（論理 px。差分呼び出し用）
     bounds_now: Option<(f64, f64, f64, f64)>,
+    /// 可視 ⇔ 不可視が実際に切り替わった回数（#838 のちらつき定量。診断専用）
+    pub(crate) visible_flips: u64,
+    /// bounds を実際に張り替えた回数（#838 の診断専用）
+    pub(crate) bounds_sets: u64,
     /// eval トークン採番
     next_eval_token: u64,
 }
@@ -222,6 +236,8 @@ impl WebViewEntry {
             pane: None,
             visible_now: false,
             bounds_now: None,
+            visible_flips: 0,
+            bounds_sets: 0,
             next_eval_token: 1,
         })
     }
@@ -237,10 +253,12 @@ impl WebViewEntry {
                         size: wry::dpi::Size::Logical(wry::dpi::LogicalSize::new(w, h)),
                     });
                     self.bounds_now = Some((x, y, w, h));
+                    self.bounds_sets = self.bounds_sets.saturating_add(1);
                 }
                 if !self.visible_now {
                     let _ = self.view.set_visible(true);
                     self.visible_now = true;
+                    self.visible_flips = self.visible_flips.saturating_add(1);
                 }
             }
             None => {
@@ -250,8 +268,20 @@ impl WebViewEntry {
                     let _ = self.view.focus_parent();
                     let _ = self.view.set_visible(false);
                     self.visible_now = false;
+                    self.visible_flips = self.visible_flips.saturating_add(1);
                 }
             }
+        }
+    }
+
+    /// bounds をまだ決められない状態で表示だけ先行させる（#442 の即時可視化）。
+    /// 位置は次の render の `sync_frame` が補正する。
+    /// 可視状態の変化はここも数える（#838 の計器が実態とずれないように）
+    pub fn show_without_bounds(&mut self) {
+        if !self.visible_now {
+            let _ = self.view.set_visible(true);
+            self.visible_now = true;
+            self.visible_flips = self.visible_flips.saturating_add(1);
         }
     }
 

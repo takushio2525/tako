@@ -759,13 +759,40 @@ Windows = WebView2）で実装した。CDP ミラー方式 PoC（ヘッドレス
   閉じても wry インスタンスが生き、SPA 状態・ログイン・スクロール位置が維持される。
   ステータスバー 🌐 ボタン → dock パネル（flex 列内 = webview と重ならない）から
   ワンクリック復帰。永続化は layout.json（PaneLayout.webview + LayoutFile.webview_dock）
-- **可視性同期**: render 末尾で「今フレーム描画されなかった webview」（非アクティブ
-  タブ・dock 退避）と D&D 中の全 webview を `set_visible(false)`。隠す際は
-  `focus_parent()` でキー入力を GPUI へ返す
+- **フレーム同期**: ルートの render 末尾（`sync_webview_frames`）が、**そのフレームの
+  レイアウト**（全ウィンドウ共有の `pane_text_areas` = 今どこかの表示タブに載っている
+  ペインだけが残る。#339）から「どの webview をどこに置くか」を直接決める。
+  隠す際は `focus_parent()` でキー入力を GPUI へ返す。判断材料は dock 退避
+  （pane = None）・非表示タブ・エラーオーバーレイ・アドレスバー編集・`hide_all`
+  （D&D / パレット / close 確認）。**どのウィンドウの render から呼ばれても同じ答え**に
+  なる材料だけを使うので、複数ウィンドウでも可視性の奪い合いが起きない
 - **AI 操作**: dispatch `Request::Web`（action 式 9 操作）+ CLI `tako web` + MCP
   `tako_web`。JS 評価は 2 段階 API（eval → token → eval_result）— dispatch は
   UI スレッドで走り、wry のコールバックも UI スレッド配送のため同期待ちは
   デッドロックする（`webview.rs` の設計コメント参照）
+
+### フレーム同期を「印」でやってはいけない（#838）
+
+2026-08-18 まで、可視性は**印（mark）方式**だった: ペイン本体の render が
+「自分は今フレーム描かれた」と印を付け、ルートの掃き出しが印の無い webview を隠す。
+これは #786（ペイン本体を `AnyView::cached` の子ビュー化）で壊れた。
+
+- 子（`PaneBody`）の render は**キャッシュが当たったフレームでは走らない**ので印が付かない
+  → 掃き出しが webview を隠す → 次に `TakoApp` が notify されると子が描き直されて再表示。
+  この往復が「激しくちらつく」の正体（#816 で PTY 出力が**そのペインだけ**を notify する
+  ようになったため、`TakoApp` を notify しないフレームが日常的に発生するようになった）
+- さらに子の render はルートの掃き出しの**後**に走る（render → layout → 子の render の順）。
+  つまり印方式では最後に書くのが常に子で、`hide_all`（D&D・パレット・close 確認との
+  重なり回避）が子に上書きされて効いていなかった
+
+実測（隔離セルフテスト項目 71 / `TAKO_838_NO_ROOT_WEBVIEW_SYNC=1`）: notify 無しのフレームを
+12 枚重ねると `visible=true → false`（切替回数 3 → 4）。実 GUI では毎秒 10 回以上の
+可視 ⇔ 不可視の往復として観測された。
+
+**規約**: ネイティブ子ビューの位置・可視性は、**ルートが持っている状態から毎フレーム
+決め切る**こと。キャッシュされうる子の render を「起きたことの記録」として使わない。
+回帰検査はセルフテスト項目 71 の `visible_flips`（可視 ⇔ 不可視の累計切替回数。
+`tako web list` にも出る）で、notify 無しフレームを重ねても増えないことを見る。
 
 **既知の制約（z オーダー）**: ネイティブビューは GPUI の GPU 合成レイヤの**上**に乗る。
 GPUI のオーバーレイ（ピン留め窓 FR-2.16.15・ホバープレビュー・コンテキストメニュー・
