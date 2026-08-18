@@ -2155,3 +2155,20 @@
   本番の pid・layout.json 不変）。検出力は 3 通りの revert で FAILED を実測
 - 副観点: Finder に tako が 2 つ出るのは `~/dev/tako/dist/tako.app`（build-app.sh の生成物・
   .gitignore 済み）が LS へ自動登録されるため。掃除手順は Issue / PR に記載（自動掃除はしない）
+
+## 2026-08-18（#838: Web ビューペインのちらつきを根治）
+- 根因は**可視性の「印」方式が #786 で壊れていた**こと: ペイン本体が `AnyView::cached` の
+  子ビューになり、キャッシュが当たったフレームは子の render が走らない = 印が付かない →
+  ルートの掃き出しが webview を隠す → 次の `TakoApp` notify で再表示、の往復。
+  #816 で PTY 出力が**そのペインだけ**を notify するようになり、notify されないフレームが
+  日常的に起きるようになって顕在化した。加えて子の render は掃き出しの**後**に走るので、
+  `hide_all`（D&D / パレット / close 確認との重なり回避）も子に上書きされて効いていなかった
+- 直し方: フレーム同期をルート render（`sync_webview_frames`）へ移し、**どのウィンドウから
+  呼ばれても同じ答えになる材料だけ**（全ウィンドウ共有の `pane_text_areas`。#339）から
+  毎フレーム決め切る。印は撤去。A/B は `TAKO_838_NO_ROOT_WEBVIEW_SYNC=1`
+- 実測（隔離 GUI・同一バイナリ A/B・20 秒 ×2 往復。root render の生存は分割比を 2 秒ごとに
+  動かす能動プローブ `bounds_delta=10` が両側同値で担保）: 可視 ⇔ 不可視の切替が
+  **178 / 174 回（8.9 / 8.7 回/秒）→ 0 回**、終了時の状態は `visible=False`（消えたまま）
+  → `visible=True`。セルフテスト項目 71 に回帰検査を新設（旧経路では
+  `visible=true → false`（切替 3 → 4）で FAILED になることを実測）
+- 関連コミット: PR（Closes #838）

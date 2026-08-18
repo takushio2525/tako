@@ -13081,18 +13081,23 @@ impl TakoApp {
         // 本文領域 = pane_text_areas と同じ絶対座標（タイトルバー・枠・パディングの内側）。
         // GPUI の Pixels は論理座標なので wry の Logical bounds へそのまま渡せる。
         // 実描画はネイティブ webview 自身が行い、GPUI 側は枠とタイトルバーだけを描く
-        self.webview_marks.insert(id);
-        let editing_addr = self.webview_address_bar_active == Some(pane_id);
-        if error_state.is_none() && !editing_addr {
-            let bounds = (
-                f64::from(f32::from(area.origin.x)),
-                f64::from(f32::from(area.origin.y)),
-                f64::from(f32::from(area.size.width)),
-                f64::from(f32::from(area.size.height)),
-            );
-            self.webviews[idx].sync_frame(Some(bounds));
-        } else {
-            self.webviews[idx].sync_frame(None);
+        // #838: フレーム同期はルート render（`sync_webview_frames`）が持つ。
+        // ここ（= `AnyView::cached` の子）は**キャッシュが当たったフレームでは走らない**ので、
+        // 同期の判断材料にすると可視 → 不可視の往復が起きる（ちらつきの原因）
+        if webview::root_sync_disabled() {
+            self.webview_marks.insert(id);
+            let editing_addr = self.webview_address_bar_active == Some(pane_id);
+            if error_state.is_none() && !editing_addr {
+                let bounds = (
+                    f64::from(f32::from(area.origin.x)),
+                    f64::from(f32::from(area.origin.y)),
+                    f64::from(f32::from(area.size.width)),
+                    f64::from(f32::from(area.size.height)),
+                );
+                self.webviews[idx].sync_frame(Some(bounds));
+            } else {
+                self.webviews[idx].sync_frame(None);
+            }
         }
 
         let display_title = if title.trim().is_empty() {
@@ -13562,10 +13567,7 @@ impl TakoApp {
         } else {
             // 新規 split 直後で area 未計算。set_visible(true) だけ呼び、
             // 次の render の sync_frame で正確な bounds へ補正される
-            if !e.visible_now {
-                let _ = e.view.set_visible(true);
-                e.visible_now = true;
-            }
+            e.show_without_bounds();
         }
     }
 
@@ -14083,10 +14085,58 @@ impl TakoApp {
             )
     }
 
+    /// render 末尾の Web ビューのフレーム同期（#838）。
+    ///
+    /// 「今フレームでどのペインが描かれたか」ではなく、**ルートが持っているレイアウト**
+    /// （`pane_text_areas`）から直接決める。
+    ///
+    /// 印（`webview_marks`）ベースだった旧経路は #786 で壊れていた: ペイン本体が
+    /// `AnyView::cached` の子ビューになり、キャッシュが当たったフレームは子の render が
+    /// 走らない = 印が付かないため、掃き出しが webview を隠す。次に `TakoApp` が notify
+    /// されると子が描き直されて再表示される、の往復がちらつきとして見えていた。
+    /// 加えて子の render はルートの掃き出しの**後**に走るので、パレット等との重なり回避
+    /// （`hide_all`）も子に上書きされて効いていなかった。
+    ///
+    /// 判断材料は**どのウィンドウの render から呼ばれても同じ**ものだけを使う。
+    /// `pane_text_areas` は全ウィンドウ共有で「今どこかのウィンドウの表示タブに載って
+    /// いるペイン」だけが残る（#339）ので、これを可視性の正にすればウィンドウ間で
+    /// 答えが割れない（= 2 枚目のウィンドウが描くたびに隠す、が起きない）
+    fn sync_webview_frames(&mut self, hide_all: bool) {
+        for idx in 0..self.webviews.len() {
+            let bounds = self.webview_desired_bounds(idx, hide_all);
+            self.webviews[idx].sync_frame(bounds);
+        }
+    }
+
+    /// 1 枚の Web ビューが今フレームで置かれるべき矩形（論理 px）。None = 隠す。
+    /// 判断材料はすべてルートが持っている状態だけ（#838）
+    fn webview_desired_bounds(&self, idx: usize, hide_all: bool) -> Option<(f64, f64, f64, f64)> {
+        if hide_all {
+            return None;
+        }
+        let e = self.webviews.get(idx)?;
+        // dock 退避中（pane = None）は隠す
+        let pane = e.pane?;
+        // エラーオーバーレイ表示中とアドレスバー編集中は GPUI 側に画面とキー入力を渡す
+        if e.error_state().is_some() || self.webview_address_bar_active == Some(pane) {
+            return None;
+        }
+        // 非表示タブのペインは `pane_text_areas` に載っていない = ここで None になる
+        let (_, area) = self.pane_text_areas.iter().find(|(p, _)| *p == pane)?;
+        Some((
+            f64::from(f32::from(area.origin.x)),
+            f64::from(f32::from(area.origin.y)),
+            f64::from(f32::from(area.size.width)),
+            f64::from(f32::from(area.size.height)),
+        ))
+    }
+
     /// render 末尾の可視性同期。今フレームで描画されなかった Web ビュー
     /// （非アクティブタブ・dock 退避中）と、D&D 中の全 Web ビューを隠す
     /// （ネイティブビューは GPUI のドロップターゲット描画より上に来るため）。
-    /// 描画済み集合（webview_marks）はここで消費する
+    /// 描画済み集合（webview_marks）はここで消費する。
+    ///
+    /// #838 以前の経路。`TAKO_838_NO_ROOT_WEBVIEW_SYNC=1` のときだけ通る（A/B 用）
     fn sync_webview_visibility(&mut self, hide_all: bool) {
         let marks = std::mem::take(&mut self.webview_marks);
         for e in &mut self.webviews {
@@ -17135,6 +17185,11 @@ impl WebViewHost for TakoApp {
                         "loading": e.is_loading(),
                         "error": err.as_ref().map(|(msg, _)| msg.as_str()),
                         "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
+                        // #838: ちらつきの機械検証用。visible_flips = 可視 ⇔ 不可視が
+                        // 実際に切り替わった累計回数（安定していれば増えない）
+                        "visible": e.visible_now,
+                        "visible_flips": e.visible_flips,
+                        "bounds_sets": e.bounds_sets,
                     })
                 })
                 .collect(),
@@ -18433,7 +18488,12 @@ impl Render for TakoApp {
         let hide_webviews = (self.drag_kind.is_some() && cx.has_active_drag())
             || self.command_palette.is_some()
             || self.pending_close_confirm.is_some();
-        self.sync_webview_visibility(hide_webviews);
+        if webview::root_sync_disabled() {
+            self.sync_webview_visibility(hide_webviews);
+        } else {
+            // #838: 印ではなくルートが持っているレイアウトから直接決める
+            self.sync_webview_frames(hide_webviews);
+        }
 
         // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
         // gpui 側のドラッグが外部要因（Esc 等）で消えたフレームでは出さない。
@@ -35539,6 +35599,54 @@ mod self_test {
                     shown_alive,
                     "Web ビュー show（復帰後もページ状態が維持 = インスタンス保持）",
                 );
+                // #838: ちらつきの回帰検査。ペイン本体は `AnyView::cached` の子ビュー
+                //   （#786）なので、TakoApp を notify せずに描いたフレームでは子の render が
+                //   走らない。フレーム同期を「子が付けた印」に頼っていると、そのフレームで
+                //   webview が隠れ、次の notify で再表示される = 可視 ⇔ 不可視の往復が
+                //   ちらつきとして見える。ここでは notify 無しのフレームを重ねても
+                //   可視状態が 1 度も変わらないことを visible_flips（累計切替回数）で見る。
+                //   `TAKO_838_NO_ROOT_WEBVIEW_SYNC=1`（旧経路）だと必ず落ちる
+                {
+                    fn wv_state(
+                        window: WindowHandle<TakoApp>,
+                        cx: &mut AsyncApp,
+                        web_id: u64,
+                    ) -> Option<(u64, bool)> {
+                        window
+                            .update(cx, |app, _, _cx| {
+                                let r = tako_control::dispatch(
+                                    app,
+                                    web_req("list", None, None, None, None, None),
+                                    PaneOrigin::Cli,
+                                )
+                                .ok()?;
+                                let e = r
+                                    .as_array()?
+                                    .iter()
+                                    .find(|e| e["id"].as_u64() == Some(web_id))?;
+                                Some((e["visible_flips"].as_u64()?, e["visible"].as_bool()?))
+                            })
+                            .ok()
+                            .flatten()
+                    }
+                    // 表示を確定させる（製品経路と同じ notify → draw の順序）
+                    notify_and_draw(any, window, cx);
+                    let before = wv_state(window, cx, web_id);
+                    // notify **無し**で描き続ける = キャッシュが当たり子の render は走らない
+                    for _ in 0..12 {
+                        let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
+                    }
+                    let after = wv_state(window, cx, web_id);
+                    let stable =
+                        matches!((before, after), (Some((b, true)), Some((a, true))) if a == b);
+                    if !stable {
+                        println!("TAKO_WV_FLICKER: before={before:?} after={after:?}");
+                    }
+                    check(
+                        stable,
+                        "Web ビュー: notify 無しフレームでも可視状態が変わらない（#838）",
+                    );
+                }
                 // close: 完全破棄 + ペイン数が元に戻る
                 let closed = window
                     .update(cx, |app, _, _cx| {
