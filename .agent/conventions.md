@@ -217,3 +217,13 @@ scripts/release.sh --update-notes v0.6.0   # 実アセットを読み直して�
   **UI 経路と IPC 受信ループ**。呼ばないと `Loading` のまま待ち続け、「他の何かが
   たまたま回した」回だけ通る（#826 で visual-test の md / md ストレス / PDF の
   3 か所がこれだった。`main` のバイナリでも同じ場所で落ちることを実測して確認）
+- **ペインへ打つコマンドの env 代入は必ずクオートを通す**。値を素の `format!` で
+  埋めると、data dir が既定の `~/Library/Application Support/tako` のとき
+  `ZDOTDIR=…/Application` までが代入・`Support/…` がコマンド名として割れ、
+  意図したプログラムが起動しない。`self_test::shell_env_command`（値を
+  `tako_core::shell::quote_for_shell` へ通す）を使う。番犬テスト
+  `selftest_env_assignment_watchdog` が違反行を名指しで落とす（#833）。
+  **隔離起動（`TAKO_ISOLATED=1`）の data dir は `/tmp` 配下で空白が無い**ので、
+  隔離検証だけを回していると踏めない = main 由来の確定失敗として残る。
+  項目 41c / 41d の隔離 HOME はディレクトリ名に空白を入れてあり、
+  `HOME=` / `PATH=` 側は毎回の隔離セルフテストで踏む
