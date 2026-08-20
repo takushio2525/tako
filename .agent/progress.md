@@ -1708,3 +1708,24 @@
   profiles 書き込みと未登録キー・排他違反・破損 YAML のエラー、`inherit` が起動コマンドで
   **unset** になること（代入に化けたら FAILED になるテスト）まで確認
 - 関連: PR（Closes #709）。tako-control +14 / tako-app +3 テスト。fmt / clippy は baseline と同一
+
+## 2026-08-21（#528: remote 系を Windows で動かす MVP）
+
+- 根因は 6 箇所に閉じていた: B4 の Windows 実装が固定 `Err` / B5 `terminate` 未実装 /
+  `is_process_alive` が `libc::kill` 直呼びで常に false（= デーモンは存在しない扱い）/
+  デタッチが `setsid` のみ / `AppIpcClient` が「Windows の IPC は未実装」（**B3 の named pipe が
+  既にあるのに使っていなかった**）/ tailscale の CLI 候補が macOS パスのみ + `serve unix:` 非対応
+- ローカル待ち受けは **loopback TCP**（`127.0.0.1:0` → 実ポートを endpoint ファイルへ）。
+  Windows の AF_UNIX は `SO_PEERCRED` 相当を持たず UDS では同一ユーザー検証が成立しないため
+  移植しない。到達手段ゲートは `detached_access` → `detached_capture` でも通す形に緩めた
+  （#519/#705 の読み取り専用到達で採取は動くため）
+- MCP / CLI の申告を実態へ: `status` に `endpoint_kind` / `endpoint_port`、MCP 説明の
+  「UDS で開始」「TCP ポートは一切開かない」は Windows で嘘なので修正、案内を OS 別化（#525 と同型）
+- 罠: `verify_pid_identity` の Windows 版を「パスに tako を含む」で書くと、テストバイナリ
+  `tako_control-*.exe` まで一致して **cargo test が自分自身を kill** する。実行ファイル名の
+  完全一致 + `GetProcessTimes` の起動時刻照合へ厳密化
+- 検証: tako-control 863 passed / 9 failed（baseline 853/11 の部分集合。baseline で落ちていた
+  2 件を修正）+ パリティ 13 全緑 + 隔離 e2e（start → status → admin API の loopback TCP 往復 →
+  stop で残骸ゼロ）。**Tailscale 未導入機のため tailnet 経由のスマホ実接続は未検証**
+- 関連: PR #840（Closes #528）。残タスクは #841（loopback TCP の XFF 偽装対策・P0）と
+  #842（実機 e2e + 残り 5 ツールの実挙動計測 → note を推定から実測へ）
