@@ -543,6 +543,32 @@ pub const ENV_BACKEND: &str = "TAKO_BACKEND";
 /// psmux 実行ファイルの明示指定（未設定なら PATH 上の `psmux` → `tmux` の順に探す）
 pub const ENV_PSMUX_BIN: &str = "TAKO_PSMUX_BIN";
 
+/// 器そのものの実行ファイル名（拡張子なし・小文字）。
+///
+/// psmux は `psmux.exe` / `pmux.exe` / `tmux.exe` の 3 本を配り、**どの名前で
+/// 起動されても内部で `<bin> server …` を子プロセスとして起動する**。
+/// つまり器のプロセスは「ペインの PTY 直下の子」の子孫として必ず現れる。
+///
+/// これらは **tako の配管であってユーザーが動かしたプログラムではない**ので、
+/// パッシブ検知（`ports`）が拾ったものは結果から落とす（#724）。
+/// 一覧を [`Binary`] の検出結果から作らないのは、tako が `tmux.exe` を起動しても
+/// 器が名乗る名前は `psmux.exe` でありうる（実測）ため。
+pub const PLUMBING_PROCESS_NAMES: &[&str] = &["psmux", "pmux", "tmux"];
+
+/// プロセス名が器そのものか（`ports` の除外判定。`psmux.exe` / `PSMUX` どちらも真）。
+///
+/// 比較は「拡張子を落として小文字化」で行う。Windows のプロセス名は
+/// `PROCESSENTRY32W.szExeFile` = 実行ファイル名なので、これで一意に決まる
+pub fn is_plumbing_process(name: &str) -> bool {
+    let stem = name
+        .rsplit_once('.')
+        .map(|(base, _ext)| base)
+        .unwrap_or(name);
+    PLUMBING_PROCESS_NAMES
+        .iter()
+        .any(|known| stem.eq_ignore_ascii_case(known))
+}
+
 /// 見つかった「tmux を名乗るバイナリ」の正体。
 ///
 /// **psmux は `psmux.exe` / `pmux.exe` / `tmux.exe` の 3 本を配る**ので、

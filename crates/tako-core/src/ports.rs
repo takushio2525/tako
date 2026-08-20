@@ -120,6 +120,16 @@ pub fn scan(_keys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
 /// スキャン結果の組み立て（純粋関数）。プロセス一覧・LISTEN 一覧・キー群から
 /// キー → ポート一覧を作る。**Windows 実機が無くてもテストできる**ように
 /// `cfg` の外に出してある（`platform::locale` の parse 関数と同じ方針）
+///
+/// ## 器（psmux）自身の LISTEN を落とす（#724）
+///
+/// psmux はクライアント↔サーバー間の IPC に **TCP ループバック**を使い、
+/// サーバーを**クライアントの子プロセス**として 1 セッションに 1 個起動する。
+/// クライアント = ペインの PTY 直下の子（`pane_key` の材料）なので、
+/// 器つきのペインは**例外なく** 1 個の偽 listen ポートを持つことになる。
+///
+/// そこで所有プロセスが器そのものなら結果から落とす。**子孫の走査自体は止めない**
+/// （器の下で動いている本物の dev サーバーは引き続き拾いたいため）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn group_by_root(
     procs: &[crate::platform::procinfo::ProcEntry],
@@ -136,6 +146,12 @@ fn group_by_root(
         let mut ports: Vec<ListenPort> = listeners
             .iter()
             .filter(|e| family.contains(&e.pid))
+            // 名前が取れないものは器と断定できないので落とさない（従来どおり報告する）
+            .filter(|e| {
+                !names
+                    .get(&e.pid)
+                    .is_some_and(|name| crate::backend::is_plumbing_process(name))
+            })
             .map(|e| ListenPort {
                 port: e.port,
                 // 実在の Windows pid は i32 に収まる（4 の倍数で 2^31 未満）

@@ -1123,6 +1123,10 @@ struct TakoApp {
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
     /// 要るため初回 render で消費する
     pending_webview_restore: Vec<(Option<u64>, String)>,
+    /// Web ビュー生成の依頼口（#724）。**App を借用していない main thread** で
+    /// 実際の生成を行うタスクへ渡す。Windows でのみ使う
+    /// （[`webview::CREATION_PUMPS_EVENT_LOOP`] の解説を参照）
+    webview_create_tx: futures::channel::mpsc::UnboundedSender<PendingWebviewCreate>,
     /// stale claude バイナリの検知状態（Issue #498）。ペインごとに管理
     stale_binary_banners: HashMap<PaneId, StaleBinaryBanner>,
     /// アプリ内自動更新の状態
@@ -1557,6 +1561,30 @@ struct PortSuggestion {
     pane: PaneId,
     port: u16,
     process: String,
+}
+
+/// 生成した Web ビューをどこへ取り付けるか（#724）。
+///
+/// 同期生成（macOS）と遅延生成（Windows）で配置ロジックを分けないための指定。
+/// 生成を依頼した時点で決まり、`TakoApp::install_webview` が実行する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebviewPlacement {
+    /// 既存ペインへ表示する（`web open`。dispatch が用意したペイン）
+    Pane(PaneId),
+    /// 復元: 保存時のペイン ID へ表示する。見つからなければ dock へ退避する
+    RestorePane(u64),
+    /// dock 退避のまま置く（復元の dock 分）
+    Dock,
+    /// フォーカスペインを右分割して表示する（dock UI / `target=_blank`）
+    SplitFromFocus,
+}
+
+/// 生成待ちの Web ビュー 1 件（#724）。
+/// **App を借用していない main thread** で生成するタスクへチャネルで渡す
+struct PendingWebviewCreate {
+    id: webview::WebViewId,
+    url: String,
+    placement: WebviewPlacement,
 }
 
 /// stale claude バイナリの通知バナー（Issue #498）
@@ -2092,6 +2120,10 @@ impl TakoApp {
                 }
             };
 
+        // Web ビュー生成の依頼口（#724）。実際の生成は App の借用の外で行う
+        let (webview_create_tx, webview_create_rx) =
+            futures::channel::mpsc::unbounded::<PendingWebviewCreate>();
+
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
@@ -2255,6 +2287,7 @@ impl TakoApp {
             webview_address_bar_active: None,
             window_raw_handle: None,
             pending_webview_restore: Vec::new(),
+            webview_create_tx,
             stale_binary_banners: HashMap::new(),
             update_state: update_checker::UpdateState::Idle,
             update_dropdown_open: false,
@@ -2573,6 +2606,45 @@ impl TakoApp {
                 cleaned.len()
             );
         }
+
+        // Web ビューの生成を **App を借用していない main thread** で行うループ（#724）。
+        //
+        // Windows の WebView2 生成は OS の入れ子メッセージループを回す
+        // （`webview::CREATION_PUMPS_EVENT_LOOP`）。借用の内側で呼ぶと、ポンプが
+        // 走らせた runnable が `borrow_mut()` に失敗して panic → abort する。
+        //
+        // このタスクの `await` 直後は「main thread だが借用していない」状態なので、
+        // ハンドルの取り出し（借用の内側）と生成（借用の外側）と取り付け（借用の内側）を
+        // 明確に分ける。**`WebViewEntry::build` を `this.update` の中へ移してはいけない**
+        let mut webview_create_rx = webview_create_rx;
+        cx.spawn(async move |this, cx| {
+            while let Some(job) = webview_create_rx.next().await {
+                // ① 借用の内側: 親ウィンドウのハンドルだけ持ち出す
+                let Ok(handle) = this.update(cx, |app: &mut TakoApp, _| {
+                    app.window_raw_handle.clone()
+                }) else {
+                    break; // View が破棄された
+                };
+                let Some(handle) = handle else {
+                    eprintln!("warning: ウィンドウ初期化前のため Web ビューを作れない");
+                    continue;
+                };
+                // ② 借用の外側: ここでだけ wry を呼ぶ（入れ子ポンプが回っても安全）
+                let built = webview::WebViewEntry::build(&handle, job.id, &job.url);
+                // ③ 借用の内側: 取り付け
+                let installed = this.update(cx, |app: &mut TakoApp, cx| match built {
+                    Ok(entry) => {
+                        app.install_webview(entry, job.placement);
+                        cx.notify();
+                    }
+                    Err(e) => eprintln!("warning: Web ビューを開けない ({}): {e}", job.url),
+                });
+                if installed.is_err() {
+                    break; // View が破棄された
+                }
+            }
+        })
+        .detach();
 
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
@@ -11380,18 +11452,96 @@ impl TakoApp {
         }
     }
 
-    /// wry WebView を生成して webviews に登録する（表示先ペインは呼び出し側が設定）
-    fn create_webview(&mut self, url: &str) -> Result<webview::WebViewId, String> {
+    /// wry WebView を生成してワークスペースへ取り付ける。
+    ///
+    /// **Windows では実際の生成をここで行わない**（#724）。WebView2 の生成は
+    /// OS の入れ子メッセージループを回す（[`webview::CREATION_PUMPS_EVENT_LOOP`]）ので、
+    /// GPUI の App を借用したまま呼ぶと再入した runnable が二重借用 panic → abort する。
+    /// 借用の外で生成する遅延キューへ積み、**id だけ先に確定**して返す
+    /// （生成完了後の配置は `placement` が表す）。
+    ///
+    /// macOS は従来どおりその場で生成して取り付ける（経路差分なし）
+    fn create_webview(
+        &mut self,
+        url: &str,
+        placement: WebviewPlacement,
+    ) -> Result<webview::WebViewId, String> {
         let handle = self
             .window_raw_handle
             .as_ref()
             .ok_or("ウィンドウ初期化前のため Web ビューを作れない（直後に再試行）")?;
         let id = webview::WebViewId(self.webview_next_id);
+        if webview::CREATION_PUMPS_EVENT_LOOP {
+            // id は先に消費する（同じ id を 2 回配らないため）
+            self.webview_next_id += 1;
+            self.webview_create_tx
+                .unbounded_send(PendingWebviewCreate {
+                    id,
+                    url: url.to_string(),
+                    placement,
+                })
+                .map_err(|_| "Web ビュー生成キューが閉じている".to_string())?;
+            return Ok(id);
+        }
         let entry = webview::WebViewEntry::build(handle, id, url)?;
         self.webview_next_id += 1;
+        self.install_webview(entry, placement);
+        Ok(id)
+    }
+
+    /// 生成済みの Web ビューをワークスペースへ取り付ける（#724）。
+    ///
+    /// 同期生成（macOS）と遅延生成（Windows）が**同じ配置ロジック**を通るように、
+    /// 生成後の後始末はすべてここに集約する。`cx` を取らないのは
+    /// `WebViewHost::web_open`（dispatch 経由）が `Context` を持たないため。
+    /// 再描画は呼び出し側が行う
+    fn install_webview(&mut self, entry: webview::WebViewEntry, placement: WebviewPlacement) {
+        let id = entry.id;
         self.webviews.push(entry);
         webview::set_has_webview(true);
-        Ok(id)
+        match placement {
+            WebviewPlacement::Pane(pane) => {
+                // 遅延生成では生成中にペインが閉じられうる。消えていたら dock へ残す
+                if self.pane_exists(pane) {
+                    if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
+                        e.pane = Some(pane);
+                    }
+                    self.eagerly_show_webview(pane);
+                } else {
+                    eprintln!(
+                        "warning: Web ビューの表示先ペイン {} が生成中に閉じられたため dock へ退避",
+                        pane.as_u64()
+                    );
+                }
+            }
+            WebviewPlacement::RestorePane(raw) => {
+                let target = self
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .flat_map(|t| t.tree().panes())
+                    .map(|p| p.id())
+                    .find(|p| p.as_u64() == raw);
+                if target.is_none() {
+                    eprintln!(
+                        "warning: Web ビュー復元: ペイン {raw} が見つからないため dock へ退避"
+                    );
+                }
+                if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
+                    e.pane = target;
+                }
+            }
+            WebviewPlacement::Dock => {}
+            WebviewPlacement::SplitFromFocus => self.webview_attach_to_new_split(id),
+        }
+    }
+
+    /// ペインがどこかのタブに実在するか（遅延生成の取り付け先確認用）
+    fn pane_exists(&self, pane: PaneId) -> bool {
+        self.workspace
+            .tabs()
+            .iter()
+            .any(|t| t.tree().contains(pane))
     }
 
     /// render を待たずに webview を可視化する（#442）。
@@ -11470,23 +11620,29 @@ impl TakoApp {
                 self.scroll_active_tab_into_view();
             }
         } else {
-            let target = self.workspace.active_tab().tree().focused();
-            let new_pane = Pane::new(PaneOrigin::User);
-            let new_id = new_pane.id();
-            if self
-                .workspace
-                .active_tab_mut()
-                .tree_mut()
-                .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
-                .is_ok()
-            {
-                if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
-                    e.pane = Some(new_id);
-                }
-                let _ = self.workspace.active_tab_mut().tree_mut().focus(new_id);
-            }
+            self.webview_attach_to_new_split(id);
         }
         cx.notify();
+    }
+
+    /// dock 退避中の Web ビューをフォーカスペインの右分割へ表示する。
+    /// `webview_show_from_dock` と遅延生成の取り付け（#724）が共有する
+    fn webview_attach_to_new_split(&mut self, id: webview::WebViewId) {
+        let target = self.workspace.active_tab().tree().focused();
+        let new_pane = Pane::new(PaneOrigin::User);
+        let new_id = new_pane.id();
+        if self
+            .workspace
+            .active_tab_mut()
+            .tree_mut()
+            .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
+            .is_ok()
+        {
+            if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
+                e.pane = Some(new_id);
+            }
+            let _ = self.workspace.active_tab_mut().tree_mut().focus(new_id);
+        }
     }
 
     /// アドレスバーのキー処理（#337）。編集中のみ呼ばれる
@@ -11682,9 +11838,8 @@ impl TakoApp {
     /// create_webview + フォーカスペイン右分割で表示し、dock を閉じる
     fn open_webview_from_dock(&mut self, url: &str, cx: &mut Context<Self>) {
         let normalized = webview::normalize_url(url);
-        match self.create_webview(&normalized) {
-            Ok(id) => {
-                self.webview_show_from_dock(id, cx);
+        match self.create_webview(&normalized, WebviewPlacement::SplitFromFocus) {
+            Ok(_id) => {
                 self.webview_dock_url_input.clear();
                 self.webview_dock_url_cursor = 0;
                 self.webview_dock_url_focused = false;
@@ -11953,27 +12108,12 @@ impl TakoApp {
     fn restore_webviews(&mut self) {
         let pending = std::mem::take(&mut self.pending_webview_restore);
         for (pane, url) in pending {
-            match self.create_webview(&url) {
-                Ok(id) => {
-                    if let Some(raw) = pane {
-                        let target = self
-                            .workspace
-                            .tabs()
-                            .iter()
-                            .flat_map(|t| t.tree().panes())
-                            .map(|p| p.id())
-                            .find(|p| p.as_u64() == raw);
-                        if target.is_none() {
-                            eprintln!(
-                                "warning: Web ビュー復元: ペイン {raw} が見つからないため dock へ退避 ({url})"
-                            );
-                        }
-                        if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
-                            e.pane = target;
-                        }
-                    }
-                }
-                Err(err) => eprintln!("warning: Web ビュー復元失敗 ({url}): {err}"),
+            let placement = match pane {
+                Some(raw) => WebviewPlacement::RestorePane(raw),
+                None => WebviewPlacement::Dock,
+            };
+            if let Err(err) = self.create_webview(&url, placement) {
+                eprintln!("warning: Web ビュー復元失敗 ({url}): {err}");
             }
         }
     }
@@ -14270,21 +14410,15 @@ impl RemoteHost for TakoApp {
 
 impl WebViewHost for TakoApp {
     fn web_open(&mut self, pane: PaneId, url: &str) -> Result<serde_json::Value, String> {
-        let id = self.create_webview(&webview::normalize_url(url))?;
-        if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
-            e.pane = Some(pane);
-        }
-        self.eagerly_show_webview(pane);
-        let url = self
-            .webviews
-            .iter()
-            .find(|e| e.id == id)
-            .map(|e| e.current_url())
-            .unwrap_or_default();
+        let normalized = webview::normalize_url(url);
+        let id = self.create_webview(&normalized, WebviewPlacement::Pane(pane))?;
+        // 生成直後の `current_url()` は常に要求 URL（`WebViewEntry::build` が
+        // shared.url に入れる）。遅延生成（#724）では実体がまだ無いので、
+        // 同じ値を要求 URL から返す
         Ok(serde_json::json!({
             "id": id.as_u64(),
             "pane": pane.as_u64(),
-            "url": url,
+            "url": normalized,
         }))
     }
 

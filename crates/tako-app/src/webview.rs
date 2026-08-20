@@ -19,12 +19,34 @@ use std::sync::{Arc, Mutex};
 
 use tako_core::PaneId;
 
+/// Web ビューの生成が **OS の入れ子メッセージループを回すか**（#724）。
+///
+/// Windows の WebView2（wry の `build_as_child`）は environment / controller の生成完了を
+/// `webview2_com::wait_with_pump` で待つ。中身は `GetMessage` + `DispatchMessage` の
+/// 入れ子ループで、**待っている間ウィンドウプロシージャが再入する**。
+///
+/// GPUI の `App` は `Rc<RefCell<App>>` なので、借用したまま（= クリックハンドラ・
+/// `render`・dispatch のいずれも借用の内側）生成すると、ポンプが走らせた
+/// foreground runnable の `AsyncApp::update_entity` が `borrow_mut()` で
+/// 二重借用 panic を起こす。その panic は `extern "system"` のウィンドウプロシージャを
+/// 跨ぐため unwind できず **abort = アプリごと即死**する
+/// （実機の panic.log と隔離環境の再現で同一署名を実測。#724）。
+///
+/// true のプラットフォームでは生成を借用の外へ追い出す
+/// （[`crate::TakoApp::create_webview`] の遅延生成キュー）。
+/// macOS の WKWebView はポンプを回さないので従来どおり同期生成でよい
+pub const CREATION_PUMPS_EVENT_LOOP: bool = cfg!(windows);
+
 /// GPUI ウィンドウの生ハンドルを保持して wry の親にするラッパー。
 /// `gpui::Window` は render 中しか触れないため、初回 render で採取した
 /// `RawWindowHandle` を保持し、dispatch（IPC / MCP）からの webview 生成でも使う。
 ///
+/// `Clone` なのは遅延生成（#724）のため。**App を借用していない状態**で
+/// `build` を呼ぶ必要があるので、借用の内側でクローンして外側へ持ち出す。
+///
 /// SAFETY: tako は単一ウィンドウ構成で、ウィンドウ破棄 = アプリ終了。
 /// ハンドル（macOS では NSView ポインタ）はアプリ生存中ずっと有効
+#[derive(Clone)]
 pub struct WindowHandleBox(raw_window_handle::RawWindowHandle);
 
 impl WindowHandleBox {
