@@ -12,7 +12,7 @@
 // tako バイナリは --bin で指定できる。省略時は target/debug → target/release → PATH の順。
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -142,6 +142,37 @@ function platformJson(bin, platform) {
   return JSON.parse(out);
 }
 
+// マトリクスの正は support.rs だが、この script は **バイナリ経由** で読む。
+// そのため古い tako で生成すると、他の人が入れた分類変更が黙って巻き戻る。
+//
+// 実測でやった事故: rebase で `tako_update` を「対応済み」へ直すコミットを取り込んだあと、
+// 再ビルドせずに生成して、ページだけ「未対応」へ戻しかけた。**キー集合は変わらない**
+// （分類値だけが変わる）ので、ツールスナップショットとの突き合わせでは検出できない。
+// よって「support.rs より古いバイナリを使っていないか」を直接見る。
+//
+// 対象はリポジトリの target/ にある開発ビルドだけ（PATH 上の配布版・CI は対象外）。
+// どうしても回避したいときは TAKO_DOCS_SKIP_FRESHNESS=1。
+function assertBinaryIsFresh(bin) {
+  if (process.env.TAKO_DOCS_SKIP_FRESHNESS) return;
+  const inRepoTarget = bin.startsWith(join(ROOT, 'target')) || bin.includes('tako-wt-target');
+  if (!inRepoTarget || !existsSync(bin)) return;
+  const source = join(ROOT, 'crates/tako-core/src/platform/support.rs');
+  if (!existsSync(source)) return;
+  const binAt = statSync(bin).mtimeMs;
+  const srcAt = statSync(source).mtimeMs;
+  if (srcAt > binAt) {
+    throw new Error(
+      [
+        'tako バイナリが support.rs より古いので生成を中止します',
+        `  binary: ${bin}`,
+        `  support.rs のほうが ${Math.round((srcAt - binAt) / 1000)} 秒新しい`,
+        '→ `cargo build -p tako-cli` で作り直してから再実行してください',
+        '  （古いまま生成すると、他の変更ぶんの分類が黙って巻き戻ります）',
+      ].join('\n'),
+    );
+  }
+}
+
 function render(win, mac) {
   const byKey = new Map(win.features.map((f) => [f.key, f]));
   const macByKey = new Map(mac.features.map((f) => [f.key, f]));
@@ -237,6 +268,7 @@ function render(win, mac) {
 const bin = resolveBin();
 let text;
 try {
+  assertBinaryIsFresh(bin);
   text = render(platformJson(bin, 'windows'), platformJson(bin, 'macos'));
 } catch (e) {
   console.error(`生成に失敗: ${e.message}`);
