@@ -1577,43 +1577,6 @@ fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// #647: フォントサイズを変えると cols/rows は変わるので通知される。
-    /// **cols/rows が偶然一致してもセル寸法が変われば通知する**のが本題
-    #[test]
-    fn リサイズ計画はセル寸法の変化だけでも_pty_へ通知する() {
-        // 何も変わっていない = 何もしない（毎 render で呼ばれる経路なので必須）
-        assert_eq!(
-            resize_plan((80, 24), (8, 16), (80, 24), (8, 16)),
-            ResizePlan {
-                reflow_grid: false,
-                notify_pty: false,
-            }
-        );
-        // グリッドが変わった = reflow + 通知（従来どおり）
-        assert_eq!(
-            resize_plan((80, 24), (8, 16), (48, 11), (12, 26)),
-            ResizePlan {
-                reflow_grid: true,
-                notify_pty: true,
-            }
-        );
-        // グリッドは同じでセル寸法だけ変わった（フォントサイズ変更で cols/rows が
-        // 偶然一致した場面）= reflow はしないが通知はする。旧実装はここで
-        // 早期 return し ws_xpixel が古いまま残っていた
-        assert_eq!(
-            resize_plan((80, 24), (8, 16), (80, 24), (12, 26)),
-            ResizePlan {
-                reflow_grid: false,
-                notify_pty: true,
-            }
-        );
-        // 高さだけ変わる（行高だけ変えた場合）
-        assert_eq!(
-            resize_plan((80, 24), (8, 16), (80, 24), (8, 26)),
-            ResizePlan {
-                reflow_grid: false,
-                notify_pty: true,
-            }
     /// #816 の `Wakeup` ゲート: 未処理の `Wakeup` が残っている間は PTY 側が次を送らず、
     /// 受け手が倒すと再び送られる。これが崩れると「1 read ごとに配送タスクを起こす」
     /// 旧挙動（取り込み経路の 78%）に戻るか、逆に画面が止まる
@@ -1720,6 +1683,46 @@ mod tests {
         assert!(
             lines.iter().all(|l| !l.ends_with(' ')),
             "末尾空白が残っている: {lines:?}"
+        );
+    }
+
+    /// #647: フォントサイズを変えると cols/rows は変わるので通知される。
+    /// **cols/rows が偶然一致してもセル寸法が変われば通知する**のが本題
+    #[test]
+    fn リサイズ計画はセル寸法の変化だけでも_pty_へ通知する() {
+        // 何も変わっていない = 何もしない（毎 render で呼ばれる経路なので必須）
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (80, 24), (8, 16)),
+            ResizePlan {
+                reflow_grid: false,
+                notify_pty: false,
+            }
+        );
+        // グリッドが変わった = reflow + 通知（従来どおり）
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (48, 11), (12, 26)),
+            ResizePlan {
+                reflow_grid: true,
+                notify_pty: true,
+            }
+        );
+        // グリッドは同じでセル寸法だけ変わった（フォントサイズ変更で cols/rows が
+        // 偶然一致した場面）= reflow はしないが通知はする。旧実装はここで
+        // 早期 return し ws_xpixel が古いまま残っていた
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (80, 24), (12, 26)),
+            ResizePlan {
+                reflow_grid: false,
+                notify_pty: true,
+            }
+        );
+        // 高さだけ変わる（行高だけ変えた場合）
+        assert_eq!(
+            resize_plan((80, 24), (8, 16), (80, 24), (8, 26)),
+            ResizePlan {
+                reflow_grid: false,
+                notify_pty: true,
+            }
         );
     }
 

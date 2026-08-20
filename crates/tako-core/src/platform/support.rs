@@ -105,6 +105,23 @@ impl Note {
 pub mod notes {
     use super::Note;
 
+    /// main 側で分岐後に増えた UI 機能（#549 / #552 / #666 / #694）の担当範囲。
+    /// Windows の GUI 起動とペイン / タブ管理そのものは #517 で入っているが、
+    /// これらの新機能は Windows 側の配線がまだ無い
+    pub const WIN_TERMINAL: Note = Note::new(
+        "GUI 起動とペイン / タブ管理の Windows 実装が前提",
+        "Requires the Windows implementation of GUI startup and pane / tab management",
+    );
+    /// main 側で分岐後に増えたプレビュー機能（#680）の担当範囲
+    pub const WIN_PREVIEW: Note = Note::new(
+        "プレビュー / Web ビューの Windows 実装（WebView2・PDF・動画）が前提",
+        "Requires the Windows implementation of preview / web view (WebView2, PDF, video)",
+    );
+    /// main 側で分岐後に増えた orchestrator 機能（#813）の担当範囲
+    pub const WIN_ORCHESTRATOR: Note = Note::new(
+        "orchestrator の Windows 縮退モードが前提",
+        "Requires the degraded orchestrator mode on Windows",
+    );
     /// #519 の担当範囲
     pub const WIN_PERSIST: Note = Note::new(
         "tmux バックエンドに依存。Windows の永続化戦略の決定が前提",
@@ -1433,8 +1450,7 @@ mod tests {
         let (key, issue) = any_pending_on_windows();
         let note = support_for(Platform::Windows, key).unwrap().note().unwrap();
         for lang in [Lang::Ja, Lang::En] {
-            let err =
-                gate_in(Platform::Windows, key, lang).expect_err("Windows では未対応のはず");
+            let err = gate_in(Platform::Windows, key, lang).expect_err("Windows では未対応のはず");
             assert!(
                 err.contains(note.text_in(lang)),
                 "{lang:?} の診断に note が含まれない: {err}"

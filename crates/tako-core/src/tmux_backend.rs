@@ -14,7 +14,6 @@
 //!   `~/.tmux.conf` は読まない（status バー・prefix キー等が見えない裏方に徹する）
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
