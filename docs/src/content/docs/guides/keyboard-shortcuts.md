@@ -1,6 +1,12 @@
 ---
 title: キーボードショートカット
+<<<<<<< HEAD
 description: tako で使えるキーボードショートカット一覧（macOS / Windows・Linux 併記）
+||||||| db83389
+description: tako で使えるキーボードショートカット一覧
+=======
+description: tako で使えるキーボードショートカット一覧（iTerm2 に近い操作体系）
+>>>>>>> origin/main
 ---
 
 tako のキーボードショートカットは macOS では iTerm2 に近い操作体系です。
@@ -18,7 +24,7 @@ Windows / Linux では **<kbd>Cmd</kbd> をそのまま <kbd>Ctrl</kbd> に読�
 ショートカットが一覧で出ます。表示されるキーは実行中のプラットフォームのものです。
 :::
 
-## タブ操作
+## タブ
 
 | 操作 | macOS | Windows / Linux |
 |---|---|---|
@@ -28,8 +34,13 @@ Windows / Linux では **<kbd>Cmd</kbd> をそのまま <kbd>Ctrl</kbd> に読�
 | 前のタブへ | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>[</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> |
 | 次のタブへ | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>]</kbd> | <kbd>Ctrl</kbd>+<kbd>Tab</kbd> |
 
-## ペイン操作
+:::note[閉じる前に確認が入ることがあります]
+エージェントや実行中のプロセスがあるペインを閉じるときは確認ダイアログが出ます。普通のシェルはそのまま閉じます（`tako confirm-close off` で無効化できます）。
+:::
 
+## ペイン
+
+<<<<<<< HEAD
 | 操作 | macOS | Windows / Linux |
 |---|---|---|
 | 右にペイン分割 | <kbd>Cmd</kbd>+<kbd>D</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
@@ -47,6 +58,23 @@ Python・Node の REPL の終了、`cat > file` の入力終端に使うため�
 下方向が <kbd>E</kbd> なのは <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> が右方向で埋まるためで、
 Terminator / Tilix も分割に <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> を使います。
 :::
+||||||| db83389
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>D</kbd> | 右にペイン分割 |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | 下にペイン分割 |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>←</kbd> | 左のペインへフォーカス移動 |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>→</kbd> | 右のペインへフォーカス移動 |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>↑</kbd> | 上のペインへフォーカス移動 |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>↓</kbd> | 下のペインへフォーカス移動 |
+=======
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>D</kbd> | 右にペイン分割 |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | 下にペイン分割 |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 左 / 右のペインへフォーカス移動 |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 上 / 下のペインへフォーカス移動 |
+>>>>>>> origin/main
 
 ## リサイズ
 
@@ -57,23 +85,72 @@ Terminator / Tilix も分割に <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> �
 | ペインの高さを広げる | <kbd>Ctrl</kbd>+<kbd>Cmd</kbd>+<kbd>↓</kbd> | <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> |
 | ペインの高さを狭める | <kbd>Ctrl</kbd>+<kbd>Cmd</kbd>+<kbd>↑</kbd> | <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> |
 
+<<<<<<< HEAD
 ## サイドバー・パネル
+||||||| db83389
+## サイドバー
+=======
+## コマンドパレット・設定
+>>>>>>> origin/main
 
+<<<<<<< HEAD
 | 操作 | macOS | Windows / Linux |
 |---|---|---|
 | ファイルツリー（左サイドバー）の表示/非表示 | <kbd>Cmd</kbd>+<kbd>B</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> |
 | コマンドパレットを開く | <kbd>Cmd</kbd>+<kbd>K</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> |
+||||||| db83389
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>B</kbd> | ファイルツリー（左サイドバー）の表示/非表示 |
+=======
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>K</kbd> | コマンドパレットを開く |
+| <kbd>Cmd</kbd>+<kbd>,</kbd> | 設定画面を開く |
+| <kbd>Cmd</kbd>+<kbd>B</kbd> | ファイルツリー（左サイドバー）の表示 / 非表示 |
+
+:::tip[まず <kbd>Cmd</kbd>+<kbd>K</kbd>]
+やりたいことの名前を覚えていなくても、コマンドパレットから探せます。セットアップの実行や master の起動も、ここから直接行えます。
+:::
+>>>>>>> origin/main
 
 ## テキスト操作
 
+<<<<<<< HEAD
 | 操作 | macOS | Windows / Linux |
 |---|---|---|
 | 選択テキストをコピー（選択なしの場合は Ctrl+C をペインへ送信） | <kbd>Cmd</kbd>+<kbd>C</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
 | ペースト（ブラケットペースト対応） | <kbd>Cmd</kbd>+<kbd>V</kbd> | <kbd>Ctrl</kbd>+<kbd>V</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> / <kbd>Shift</kbd>+<kbd>Insert</kbd> |
 | 全選択 | <kbd>Cmd</kbd>+<kbd>A</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
+||||||| db83389
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>C</kbd> | 選択テキストをコピー（選択なしの場合は Ctrl+C をペインへ送信） |
+| <kbd>Cmd</kbd>+<kbd>V</kbd> | ペースト（ブラケットペースト対応） |
+| <kbd>Cmd</kbd>+<kbd>A</kbd> | 全選択 |
+=======
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>C</kbd> | 選択テキストをコピー（選択なしの場合は Ctrl+C をペインへ送信） |
+| <kbd>Cmd</kbd>+<kbd>V</kbd> | ペースト（ブラケットペースト対応） |
+| <kbd>Cmd</kbd>+<kbd>A</kbd> | 全選択 |
+| <kbd>→</kbd> または <kbd>Tab</kbd> | 入力予測（ゴーストテキスト）を確定 |
+
+## プレビューの操作
+
+プレビューペインにフォーカスがあるときに使えます。
+
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>S</kbd> | 編集内容を保存 |
+| <kbd>Cmd</kbd>+<kbd>F</kbd> | プレビュー内を検索 |
+| <kbd>Cmd</kbd>+<kbd>Z</kbd> | 編集を元に戻す |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | 編集をやり直す |
+>>>>>>> origin/main
 
 ## 表示
 
+<<<<<<< HEAD
 | 操作 | macOS | Windows / Linux |
 |---|---|---|
 | 文字サイズを拡大 | <kbd>Cmd</kbd>+<kbd>=</kbd> / <kbd>Cmd</kbd>+<kbd>+</kbd> | <kbd>Ctrl</kbd>+<kbd>=</kbd> / <kbd>Ctrl</kbd>+<kbd>+</kbd> |
@@ -89,9 +166,24 @@ Terminator / Tilix も分割に <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> �
 | 検索 | <kbd>Cmd</kbd>+<kbd>F</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> |
 | 取り消し | <kbd>Cmd</kbd>+<kbd>Z</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> |
 | やり直し | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
+||||||| db83389
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>=</kbd> / <kbd>Cmd</kbd>+<kbd>+</kbd> | 文字サイズを拡大 |
+| <kbd>Cmd</kbd>+<kbd>-</kbd> | 文字サイズを縮小 |
+| <kbd>Cmd</kbd>+<kbd>0</kbd> | 文字サイズをリセット |
+=======
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>=</kbd> / <kbd>Cmd</kbd>+<kbd>+</kbd> | 文字サイズを拡大 |
+| <kbd>Cmd</kbd>+<kbd>-</kbd> | 文字サイズを縮小 |
+| <kbd>Cmd</kbd>+<kbd>0</kbd> | 文字サイズをリセット |
+| <kbd>Ctrl</kbd>+<kbd>Cmd</kbd>+<kbd>F</kbd> | フルスクリーン切替 |
+>>>>>>> origin/main
 
-## アプリ
+## ウィンドウ・アプリ
 
+<<<<<<< HEAD
 | 操作 | macOS | Windows / Linux |
 |---|---|---|
 | ディレクトリを開く | <kbd>Cmd</kbd>+<kbd>O</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> |
@@ -104,6 +196,24 @@ macOS 固有の「アプリを隠す」（<kbd>Cmd</kbd>+<kbd>H</kbd>）・「�
 （<kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>H</kbd>）・「最小化」（<kbd>Cmd</kbd>+<kbd>M</kbd>）は
 Windows / Linux には対応する概念が無いため割り当てていません。Windows の最小化・最大化は
 タイトルバー右上のウィンドウコントロールと <kbd>Win</kbd>+<kbd>↓</kbd> を使ってください。
+||||||| db83389
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>O</kbd> | ディレクトリを開く |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> | リポジトリを開く |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> | 新規ウィンドウ |
+| <kbd>Cmd</kbd>+<kbd>Q</kbd> | tako を終了（tmux バックエンド有効時はプロセスは保持される） |
+=======
+| ショートカット | 操作 |
+|---|---|
+| <kbd>Cmd</kbd>+<kbd>O</kbd> | ディレクトリを開く |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> | リポジトリを開く |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> | 新規ウィンドウ |
+| <kbd>Cmd</kbd>+<kbd>M</kbd> | ウィンドウを最小化 |
+| <kbd>Cmd</kbd>+<kbd>H</kbd> | tako を隠す |
+| <kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>H</kbd> | ほかのアプリを隠す |
+| <kbd>Cmd</kbd>+<kbd>Q</kbd> | tako を終了（tmux バックエンド有効時はプロセスは保持される） |
+>>>>>>> origin/main
 
 ## マウス操作
 
@@ -111,6 +221,7 @@ Windows / Linux には対応する概念が無いため割り当てていませ�
 |---|---|
 | ペイン境界線をドラッグ | リサイズ |
 | ペインタイトルバーをドラッグ | ペインの位置を移動（D&D） |
-| タブをドラッグ | タブの並び替え |
+| タブをドラッグ | タブの並び替え（挿入位置がバーで表示される） |
 | テキスト選択 | 自動コピー（copy-on-select） |
+| <kbd>Cmd</kbd>+クリック | URL・ファイルパスを開く（ホバーで下線が出ます） |
 | ファイルツリーからペインへドラッグ | パス入力 / プレビュー表示 |

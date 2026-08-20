@@ -56,15 +56,22 @@ tako platform
 
 ### 方法 A: Homebrew（推奨）
 
-ターミナル（macOS 標準の「ターミナル.app」で OK）を開き、次の 2 行を実行します。
+ターミナル（macOS 標準の「ターミナル.app」で OK）を開き、次の 1 行を実行します。
+
+```bash
+brew install --cask takushio2525/tako/tako
+```
+
+アプリ本体が `/Applications/tako.app` に入り、`tako` コマンドも自動で使えるようになります。
+
+:::note[`Cask not found` と言われたら]
+配布元の登録（tap）を先に済ませてから、もう一度インストールしてください。
 
 ```bash
 brew tap takushio2525/tako
 brew install --cask takushio2525/tako/tako
 ```
-
-- 1 行目は「tako の配布元を Homebrew に登録する」コマンド（初回のみ）
-- 2 行目が実際のインストール。アプリ本体が `/Applications/tako.app` に入り、`tako` コマンドも自動で使えるようになります
+:::
 
 インストールできたか確認:
 
@@ -72,7 +79,7 @@ brew install --cask takushio2525/tako/tako
 tako --version
 ```
 
-バージョン番号（例: `tako 0.2.8`）が表示されれば成功です。
+バージョン番号（例: `tako 0.6.0`）が表示されれば成功です。
 
 ### 方法 B: ZIP ダウンロード
 
@@ -92,9 +99,11 @@ unzip tako-*.zip
 mv tako.app /Applications/
 ```
 
-#### PATH を通す（ZIP の場合のみ）
+**tako を起動して、その中のターミナルで使う分には、これで準備完了です。** tako が開くシェルには `tako` コマンドの置き場所が自動で追加されるので、[クイックスタート](/getting-started/quickstart/)の `tako setup` はそのまま打てます。
 
-「PATH を通す」とは、ターミナルのどこからでも `tako` とだけ打てばコマンドが使えるようにする設定です。Homebrew なら自動ですが、ZIP の場合は手動で登録します。
+#### 外部ターミナルでも使いたい場合（ZIP のみ・任意）
+
+Terminal.app や iTerm2 など **tako の外**のターミナルからも `tako` と打ちたいときだけ、PATH に登録します（Homebrew なら自動）。
 
 ```bash
 # zsh（macOS 標準のシェル）の場合
@@ -202,8 +211,11 @@ Windows 版はまだコード署名を行っていないため、初回実行時
 
 </TabItem>
 </Tabs>
+**初回起動時は、タブバーの下に案内バナーが出ます。** `tako setup` と `tako master` をその場のボタンから実行できるので、次の手順はバナーからそのまま進められます。バナーは一度閉じると再表示されません（`tako welcome show` でいつでも呼び戻せます）。同じ項目は <kbd>Cmd</kbd>+<kbd>K</kbd> のコマンドパレットにも常設されています。
 
-まずは普段どおりコマンドを打ってみてください。`ls` や `cd` など、通常のターミナルと同じ操作がそのまま使えます。
+まずは普段どおりコマンドを打ってみてください。`ls` や `cd` など、通常のターミナルと同じ操作がそのまま使えます。コマンドを打ち始めると、履歴から続きが薄い文字で予測表示されます（<kbd>→</kbd> または <kbd>Tab</kbd> で確定）。最初の 10 回だけ確定キーの案内が薄く表示され、慣れた頃に自然と消えます。
+
+この入力予測は **tako が開いたシェルの中だけ**で効き、`~/.zshrc` は書き換えないので tako の外のターミナルは何も変わりません。挙動は `tako autosuggest off`（予測そのもの）/ `tako autosuggest tab off`（Tab 確定だけ無効化）/ `tako autosuggest hint off`（案内を今すぐ止める）で個別に切り替えられます。
 
 ## 3. `tako setup` — 質問ゼロの自動セットアップ
 
@@ -227,7 +239,8 @@ tako setup
 4. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します
 5. **指示とテンプレートの準備** — 指示ファイルが未作成なら安全な開発ルールの既定値を作り、セットアップ用ファイル一式を tako のデータフォルダ（macOS は `~/Library/Application Support/tako/setup/`、Windows は `%APPDATA%\tako\setup\`）に展開します。既存の指示は上書きしません
 6. **同梱推奨ルールとの比較** — 既存の指示ファイルを、tako が同梱する推奨ルール（言語 / 対話スタイル / Git 運用 / コード品質 / 安全ルール / 提案品質 / 完了検証の 7 項目）と項目レベルで突き合わせ、不足の可能性を具体的に表示します。差分がなければ「差分なし」と明示します。表示のみで、ファイルは書き換えません
-7. **最終サマリと次の一歩** — 値の由来を `detected` / `previous` / `default` / `input` で表示し、実際に変えた項目だけを最後にまとめます。続けて `tako master` での始め方（起動して日本語で話しかけるだけ）とプロファイルの現在値を案内し、tako 内での対話実行ならその場で master の開始を提案します。認証済み単一 CLI の標準ケースでは人間への質問はありません
+7. **設定共有の状況確認** — 別の PC と設定を共有する仕組み（[`tako config`](/guides/cli-reference/#tako-config)）について、配線済みか / `~/.claude` が既に dotfiles などの git で管理されていないか / `gh` にログイン済みかを調べ、状態と次の一手を表示します。**調べるだけ**で、リポジトリの作成や配線は起こりません。配線済みなら状態が 1 行出るだけで、設定を勧める案内は出ません
+8. **最終サマリと次の一歩** — 値の由来を `detected` / `previous` / `default` / `input` で表示し、実際に変えた項目だけを最後にまとめます。続けて `tako master` での始め方（起動して日本語で話しかけるだけ）とプロファイルの現在値を案内し、tako 内での対話実行ならその場で master の開始を提案します。認証済み単一 CLI の標準ケースでは人間への質問はありません
 
 :::note[MCP とは？]
 MCP（Model Context Protocol）は、AI エージェントが外部ツールを操作するための共通規格です。tako は MCP サーバーを内蔵しており、claude または codex の master が「ペインを分割する」「コマンドを実行する」「ファイルを表示する」といった操作を直接行えます。
@@ -260,6 +273,20 @@ tako setup --review
 
 agy は setup と worker には使えますが、MCP 接続方式の制約から master には使えません。agy だけが入っている環境では setup を完了できますが、`tako master` を使う前に claude または codex を追加してください。
 
+### 別の PC でも同じ設定を使いたいとき
+
+`tako setup` の最後に起動する対話アシスタントに、そのまま頼めます。
+
+> 「別の PC でも同じ設定を使いたい」
+
+アシスタントは検出済みの状況（未配線か / 既に dotfiles などで管理していないか / `gh` にログイン済みか）を見て進め方を提案し、合意が取れた操作だけを実行します。
+
+- 既に `~/.claude` を dotfiles リポジトリで管理している場合は、**そのリポジトリへの相乗り**（`tako config link <リポジトリ>`）を最初に提案します。別のリポジトリを新しく作ると、同じ `CLAUDE.md` が 2 か所で管理されることになるためです
+- 何も無い場合は、`gh` にログイン済みならプライベートリポジトリの作成から配線まで代行できます。リポジトリ名は必ず確認し、**同意なしにリポジトリを作ったり push したりはしません**
+- 共有したくなければ何もしなくて構いません。標準の `tako setup` は状態を表示するだけで、質問は増えません
+
+仕組みと共有対象の一覧は [`tako config`](/guides/cli-reference/#tako-config) を参照してください。
+
 ### 2 回目以降の `tako setup`
 
 セットアップ済みの状態で再実行すると、前回の agent・プラン・profile・指示・プロジェクトを自動的に引き継ぎます。新しい検出値が前回値と違う場合だけ、両方を表示して検出値を優先します。実変更がなければ `config.yaml` を書き直さず、「変更なし」と表示して終了します。キー入力は必要ありません。
@@ -282,11 +309,11 @@ tako setup --changes
 ```
 tako setup アップデート追従状況
 ─────────────────────────────
-  現在の setup リビジョン: 9（tako v0.5.4）
-  適用済みリビジョン: 8（tako v0.5.2 で setup 実行）
+  現在の setup リビジョン: 12（tako v0.6.0）
+  適用済みリビジョン: 11（tako v0.5.6 で setup 実行）
   未適用の変更: 1 件
 
-  [rev 9 / v0.5.4 / 2026-07-15] setup を質問ゼロ・前回値引き継ぎ・AI 代行へ刷新
+  [rev 12 / v0.6.0 / 2026-07-17] リモート接続を Tailscale Serve へ一本化 + setup ウィザード新設
       区分: auto（setup 再実行で自動適用）
       ...
 
@@ -311,6 +338,7 @@ tako セットアップ 環境チェック
     [検出] codex: /opt/homebrew/bin/codex（認証済み / plus）
   [OK] 既定エージェント: codex
   [OK] 申告・検出プラン: claude=pro, google=free, gpt=plus
+  [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `tako config init`）
 ```
 
 `[不足]` や未認証と表示された項目が、まだ済んでいない設定です。
@@ -340,6 +368,8 @@ tako 内のターミナルで master を起動します。setup が生成した 
 ```bash
 tako master
 ```
+
+master は**今いるペインでそのまま起動**します（新しいタブは作りません）。専用のタブを立てたい場合は `tako master --tab` を使ってください。
 
 起動したら、試しにこう話しかけてみてください。
 
@@ -386,10 +416,9 @@ Windows 版のアプリ内更新は対応準備中です。当面は [GitHub Rel
 
 ### `tako` コマンドが見つからない（command not found）
 
-PATH が通っていません。
+**tako の中のターミナル**で出た場合は、tako を再起動してみてください（`tako` の置き場所は tako の起動時に解決されます）。**tako の外**のターミナルで出た場合は PATH が通っていません。Homebrew でインストールした場合はターミナルを開き直し、ZIP からインストールした場合は上記の「外部ターミナルでも使いたい場合」の手順を実施してください。
 
-- **macOS**: Homebrew でインストールした場合はターミナルを開き直してみてください。ZIP からインストールした場合は上記の「PATH を通す」手順を確認してください
-- **Windows**: PATH の変更は既存のウィンドウには反映されません。PowerShell を閉じて開き直してください。それでも見つからない場合、ポータブル ZIP なら「ポータブル ZIP で入れる」の PATH 追加手順を実行してください
+**Windows** では PATH の変更が既存のウィンドウに反映されません。PowerShell を閉じて開き直してください。それでも見つからない場合、ポータブル ZIP なら「ポータブル ZIP で入れる」の PATH 追加手順を実行してください。
 
 ### `tako setup` が「エージェント CLI が見つかりません」と言う
 
@@ -423,5 +452,6 @@ xattr -dr com.apple.quarantine /Applications/tako.app
 - [クイックスタート](/getting-started/quickstart/) — `tako master` を起動して AI オーケストレーションを最短で体験する
 - [タブ＆ペイン管理](/features/tabs-and-panes/) — 画面分割やショートカットを覚える
 - [オーケストレーションとは](/features/orchestration/) — AI エージェントを並列に働かせる tako の目玉機能
+- [設定とカスタマイズ](/guides/settings/) — テーマ・表示言語・入力予測などの調整
 - [CLI リファレンス](/guides/cli-reference/) — `tako` コマンド全一覧
 - [リリースノート](/releases/) — 各バージョンの変更内容

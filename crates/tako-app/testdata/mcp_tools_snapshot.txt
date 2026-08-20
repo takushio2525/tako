@@ -1,11 +1,14 @@
 tako_agents_sync_rules
 tako_auto_rename
+tako_autosuggest
 tako_background_kill
 tako_background_list
 tako_background_pane
+tako_chat_copy
 tako_check_health
 tako_close_pane
 tako_collapse_tab
+tako_config_share
 tako_confirm_close
 tako_create_tab
 tako_equalize_layout
@@ -28,6 +31,7 @@ tako_git_show
 tako_git_stage
 tako_git_unstage
 tako_lang
+tako_limit_resume
 tako_limit_service
 tako_list_panes
 tako_logs
@@ -57,12 +61,14 @@ tako_orchestrator_workers
 tako_panel
 tako_persist
 tako_pin_preview
+tako_pin_tab_title
 tako_platform
 tako_port_detect
 tako_preview_apply
 tako_preview_autosave
 tako_preview_cache
 tako_preview_changelog
+tako_preview_copy_code
 tako_preview_edit
 tako_preview_follow_link
 tako_preview_link_list
@@ -102,6 +108,7 @@ tako_settings
 tako_setup
 tako_setup_changes
 tako_setup_mcp
+tako_show_command
 tako_sleep_guard
 tako_split_pane
 tako_ssh_hosts
@@ -121,9 +128,11 @@ tako_tmux_open
 tako_tmux_resize
 tako_tmux_select_window
 tako_tree_folder
+tako_ui_mode
 tako_update
 tako_video_playback
 tako_video_seek
 tako_video_volume
 tako_web
+tako_welcome
 tako_window

@@ -59,8 +59,38 @@ const CHAR_WIDTH_PX: f32 = 7.0;
 const LABEL_MAX_CHARS: usize = 24;
 /// タブラベルの最小文字数（縮小限界）
 const LABEL_MIN_CHARS: usize = 6;
-/// 右端コントロール群の概算幅（⌘K(210+px) + bell(30) + theme(30) + gap + margin）
-const RIGHT_CONTROLS_PX: f32 = 300.0;
+/// 右端コントロール群の概算幅
+/// （⌘K(210+px) + bell(30) + ui-mode(30) + theme(30) + gap + margin。#694 で +30）
+const RIGHT_CONTROLS_PX: f32 = 330.0;
+
+/// 1 行のヒント表示（#694 のツールチップ用の最小ビュー）。
+/// GPUI のツールチップは `AnyView` を要求するので、ドラッグゴースト（`DragGhost`）と
+/// 同じ「小さな Render 実装」パターンで用意する
+pub(crate) struct HintTooltip {
+    label: String,
+    theme: Theme,
+}
+
+impl HintTooltip {
+    pub(crate) fn new(label: String, theme: Theme) -> Self {
+        Self { label, theme }
+    }
+}
+
+impl Render for HintTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgba(self.theme.surface_2))
+            .border_1()
+            .border_color(hsla(self.theme.border_default))
+            .text_size(px(11.0))
+            .text_color(hsla(self.theme.foreground))
+            .child(SharedString::from(self.label.clone()))
+    }
+}
 
 impl TakoApp {
     /// タブ数と利用可能幅からラベルの truncate 上限文字数を決定する
@@ -163,10 +193,13 @@ impl TakoApp {
                     .iter()
                     .find(|w| w.id() != viewport && w.active_tab() == id)
                     .map(|w| w.id().as_u64());
-                (id, label, agg, pane_states, fails, shown_in)
+                // 自動命名の直後だけ出す「この名前を固定」の印（#552 案 4）
+                let pin_hint =
+                    tab.title_source() == TitleSource::Auto && self.auto_title_hint_active(id);
+                (id, label, agg, pane_states, fails, shown_in, pin_hint)
             })
             .collect();
-        let attention: usize = tabs.iter().map(|(_, _, _, _, fails, _)| fails).sum();
+        let attention: usize = tabs.iter().map(|(_, _, _, _, fails, _, _)| fails).sum();
         let state_color = |state: &CommandState| match state {
             CommandState::Failed(_) => theme.red,
             CommandState::Running => theme.accent,
@@ -271,7 +304,7 @@ impl TakoApp {
                         this.drop_pane_on_tab(drag.pane, None, cx);
                     }))
                     .children(tabs.into_iter().map(
-                        |(id, label, agg, pane_states, fails, shown_in)| {
+                        |(id, label, agg, pane_states, fails, shown_in, pin_hint)| {
                             let is_active = id == active;
                             let dot_color = state_color(&agg);
                             let pulsing = matches!(agg, CommandState::Running);
@@ -441,6 +474,38 @@ impl TakoApp {
                                                 })
                                                 .child(SharedString::from(truncated)),
                                         )
+                                        // 自動命名の直後だけ出る「この名前を固定」の印
+                                        // （#552 案 4）。クリックでこの名前が手動名として
+                                        // 固定され、以後 自動リネームに書き換えられなくなる。
+                                        // 時間（PIN_HINT_TTL）が経てば静かに消える
+                                        .when(pin_hint, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("tab-pin-title", id.as_u64()))
+                                                    .w(px(17.0))
+                                                    .h(px(17.0))
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(5.0))
+                                                    .cursor_pointer()
+                                                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &gpui::ClickEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.pin_auto_tab_title(id, cx);
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        svg()
+                                                            .path(ui_icon::PIN)
+                                                            .w(px(11.0))
+                                                            .h(px(11.0))
+                                                            .text_color(hsla(theme.accent)),
+                                                    ),
+                                            )
+                                        })
                                         // 他ウィンドウで表示中の区別バッジ（#380。
                                         // クリックすればこのウィンドウへ表示が移る）
                                         .when_some(shown_in, |d, win| {
@@ -726,6 +791,57 @@ impl TakoApp {
                                 .child(SharedString::from(attention.to_string())),
                         )
                     }),
+            )
+            // 表示モード切替（#694。GUI ライク ⇔ ターミナル。テーマボタンの左隣 =
+            // 「アプリ全体の見た目」と同格の概念という位置づけ。現在モードのアイコンを出す）
+            .child(
+                div()
+                    .id("ui-mode-toggle")
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.surface_highlight)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_ui_mode(cx);
+                    }))
+                    // 新設ボタンなので何が起きるかを言葉で出す（アイコンだけでは
+                    // 「表示モードが変わる」と分からない）
+                    .tooltip({
+                        let theme = theme.clone();
+                        let gui = self.ui_mode.is_gui();
+                        move |_, cx| {
+                            let label = if gui {
+                                crate::ui_text::ui_mode::toggle_to_terminal()
+                            } else {
+                                crate::ui_text::ui_mode::toggle_to_gui()
+                            };
+                            cx.new(|_| HintTooltip {
+                                label: label.to_string(),
+                                theme: theme.clone(),
+                            })
+                            .into()
+                        }
+                    })
+                    .child(
+                        svg()
+                            .path(if self.ui_mode.is_gui() {
+                                ui_icon::CHAT_BUBBLE
+                            } else {
+                                ui_icon::PROMPT
+                            })
+                            .w(px(15.0))
+                            .h(px(15.0))
+                            .text_color(hsla(if self.ui_mode.is_gui() {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })),
+                    ),
             )
             // テーマ切替（カンプ: 太陽アイコン。ライト時は月。Issue #217）
             .child(

@@ -296,10 +296,51 @@ tako orchestrator profiles set sol --clear-master-agent       # claude 既定へ
 # アカウント固定（#504 / #653。値は accounts.yaml のキー）
 tako orchestrator profiles set default --master-account personal --worker-account work
 tako orchestrator profiles set default --clear-master-account  # 既定ログインへ戻す
+# 自動ハンドオフ（#749。閾値は 50〜60。範囲外はエラー）
+tako orchestrator profiles set default --ctx-threshold 55
+tako orchestrator profiles set default --auto-handoff false   # 自動通知だけ止める
+tako orchestrator profiles set default --clear-ctx-threshold   # config.yaml → 既定 60 へ
 ```
 
 MCP からは `tako_orchestrator_profiles`（action: list / show / set。master_agent /
 worker_agent / agent_* パラメータ対応）で同じ操作ができる。
+
+### アカウント（accounts.yaml。Issue #504 / #512）
+
+worker を別の claude アカウントで動かすための名前つきレジストリ。
+`<data_dir>/orchestrator/accounts.yaml` に置き、CLI `tako orchestrator accounts`
+（list / show / add / remove）または MCP `tako_orchestrator_accounts`（同じ action）で編集する
+（両者は同じ dispatch 関数を呼ぶので出力・警告・検証は完全に一致する）。
+使うのは spawn の `--account`、プロファイルの `master_account` / `worker_account`。
+
+```bash
+tako orchestrator accounts list
+tako orchestrator accounts add personal --inherit --default-model claude-opus-5
+tako orchestrator accounts add univ --config-dir ~/.claude-univ --default-model 'claude-opus-4-6[1m]'
+tako orchestrator accounts remove univ
+```
+
+```yaml
+accounts:
+  univ:
+    config_dir: ~/.claude-univ      # CLAUDE_CONFIG_DIR にこのパスを設定する
+    default_model: claude-opus-4-6[1m]
+  personal:
+    inherit: true                   # CLAUDE_CONFIG_DIR を設定しない（既定の資格情報）
+    default_model: claude-opus-5
+```
+
+`master_account` は `tako master` / `tako solo` / handoff の新 master に、
+`worker_account` は spawn する worker に効く（spawn の `--account` が最優先。#547）。
+起動時に「アカウント: <名前>（config dir: …）」を表示するので、どちらで立ったかは
+コマンド出力で確認できる。登録していないアカウント名は起動前にエラーになる。
+
+**既定アカウントは `config_dir: ~/.claude` ではなく `inherit: true` で書く**（#512）。
+claude は `CLAUDE_CONFIG_DIR` が**設定されている**だけで Keychain のエントリ名に
+ハッシュを付けるため、値が既定パスと同一でも別エントリ（= 未ログイン扱い）になる。
+`inherit: true` の worker は起動コマンドの先頭で `unset CLAUDE_CONFIG_DIR;` を実行し、
+direnv 等が設定してくる値も確実に消す。既定パスを明示指定して登録しようとすると
+add が警告を返す。
 
 ## 基本的な使い方
 
@@ -337,13 +378,20 @@ master は結果を確認してユーザーに報告する。
 
 ## CLI リファレンス
 
-### `tako master [suffix]`
+### `tako master [-プロファイル]`
 
-新タブでマスターオーケストレーターを起動する。
+現在のペインでマスターオーケストレーターを起動する（インライン起動。#264）。
 
 | オプション | 説明 |
 |---|---|
-| `suffix` | タブ名のサフィックス（省略時は "master"） |
+| `-<プロファイル名>` | プロファイル指定（省略時は default。タブ名は `master-<名前>`。旧形式のサフィックス指定も後方互換で動く） |
+| `--tab` | 常に新規タブで起動する |
+
+起動先ペインは **pid 祖先辿り → `TAKO_PANE_ID` → stale pane map（#210）** の順で解決し、
+どれでも特定できなければ「呼び出し元不明」として新規タブを作りそこで起動する（#567）。
+アプリ再起動やシェルの再利用で `TAKO_PANE_ID` が古くなっていても起動は止まらない
+（読み替え・フォールバックが起きたときは案内と `unset TAKO_PANE_ID` を表示する）。
+`tako solo` も同じ解決順。
 
 ### `tako orchestrator projects list`
 
@@ -405,8 +453,18 @@ queued → shell_ready → launch_sent → agent_started → prompt_sent → pro
 
 これが無かった頃は、ペインは開くのに起動コマンドが届かず、worker が素の
 PowerShell のまま 6 時間空回りしても spawn は成功を返していた（#640）。
+| `--account` | | アカウント名（accounts.yaml のキー。この worker だけ別アカウントで起動する。#504 / #511） |
 
-プロンプト送達は送達確認ループで行う（Issue #32）:
+プロンプト送達は 2 層構成（Issue #790）。claude worker には**まず受信箱へ直送**する
+（claude の Cross-Session Messaging。socket 直送なので画面解析もキー操作も伴わず、
+生成中でもキューに入って取りこぼさない。長文もそのまま届く）。使えない環境
+（claude が古い / 受信箱を開いていない / codex・agy・Windows）では従来のキー操作経路へ
+自動で落ちる。どちらを通ったかは `<data_dir>/persist.log` に `送達: peer …` /
+`送達: keys 経路 …` として残る。**受信側には「別の claude セッションから届いた」旨の
+定型文が付く**ので、この経路を使うのは worker 宛だけ（master への指示や承認の代行は
+従来経路のまま = 人が打った指示として扱われる）。
+
+従来のキー操作経路（フォールバック先）は送達確認ループで行う（Issue #32）:
 
 1. **事前信頼**: spawn 時に `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
    立て、初回フォルダの信頼ダイアログ自体を出さない（ダイアログが送信プロンプトを
@@ -431,6 +489,26 @@ error（異常停止。#157）のときは応答に `error.kind` / `error.detail
 | `--session-id` | | claude の session ID |
 
 ### `tako orchestrator workers`（レジストリ。Issue #390 / #658）
+
+spawn 済み worker を**ペインの生死と無関係に**列挙する（`<data_dir>/workers.yaml`）。
+tako を再起動してペインが消えても、`tmux_session` / `session_id` 経由で
+watch / status / report を続けられる。既定は active のみ、`--all` で closed も出す。
+
+エントリの寿命:
+
+| 遷移 | きっかけ |
+|---|---|
+| active → closed（`explicit_close`） | ペイン / タブを明示的に閉じた（CLI・MCP・GUI のどの経路でも） |
+| active → closed（`superseded`） | 同じペイン番号へ新しい worker を spawn した |
+| active → closed（`gone`） | ペインも器（tmux / psmux）も **5 分以上続けて**観測できない（GC。#658） |
+
+GC は `workers` の列挙のついでに走る（別コマンドは要らない）。**1 回の観測では倒さない**
+——器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、といった
+過渡状態で生きている worker を落とさないため、`dead_since` を刻んでから確認期間を待つ。
+closed にしても `resume_command` / `report --worker` / `workers --all` は引けるので、
+突然死からの復旧材料（#390）は失われない。
+
+### `tako orchestrator watch`
 
 spawn 済み worker を**ペインの生死と無関係に**列挙する（`<data_dir>/workers.yaml`）。
 tako を再起動してペインが消えても、`tmux_session` / `session_id` 経由で
@@ -526,10 +604,10 @@ master（または任意の claude エージェント）から使える MCP ツ�
 | ツール | 説明 |
 |---|---|
 | `tako_orchestrator_projects` | プロジェクト管理（list / add / remove） |
-| `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除） |
-| `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択。既定で起動保証つき = `await_launch`。応答の `assurance` にどこまで確認できたかが入る。#665） |
-| `tako_orchestrator_launch_status` | 起動保証の到達段階の照会（#665） |
-| `tako_orchestrator_supervisor` | 常時監視（`action: "events"` でイベント取得。再アーム不要。#665） |
+| `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除、ctx_threshold / auto_handoff（#749）） |
+| `tako_orchestrator_self` | 自分の pane / tab / ctx% / 引き継ぎ閾値の取得（`ctx_over_threshold` が true なら引き継ぎ時） |
+| `tako_orchestrator_handoff` | 後任 master への引き継ぎ（handoff ファイルを読んで spawn。前任ペインは後任が閉じる） |
+| `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択） |
 | `tako_orchestrator_worker_status` | worker の状態確認（codex / agy は画面推定。異常停止は status=error + error.kind / recommended_action（#157）。停滞は status=stalled + stalled.detail / recommended_action（#224）。has_running_children / collapsed フラグ付き） |
 
 | `tako_orchestrator_dialog` | worker が表示中のダイアログの内容取得（#662。AskUserQuestion の質問文と選択肢を transcript から全文で。ライブ画面から現在位置・ハイライト・回答済みも） |
@@ -570,6 +648,121 @@ tako orchestrator respond --pane 5 --answer 2 --dry-run
 TUI を直接叩きたいときは `tako keys`（`tako_send_keys`）で生キーを送れる
 （`enter` / `escape` / 矢印 / `ctrl-c` / 1 文字リテラル）。10 番目以降の選択肢は
 数字キー 1 発で選べないので、そのときだけ `down` の連打 + `enter` を使う。
+## master の自動ハンドオフ（Issue #749）
+
+master のコンテキストが埋まると判断が劣化する。tako は `/compact` を自動実行せず
+（会話の文脈が飛んで「話が通じなくなる」）、**新しい master へ乗り換える**。
+
+流れは 4 手で、**ユーザーは何もしなくてよい**:
+
+1. tako が master ペインの ctx% を見張り、閾値（既定 60%・50〜60% で設定可）を
+   超えたら `【tako 自動通知】…` をそのペインへ送る
+2. master が引き継ぎファイル（`<data_dir>/orchestrator/handoff/<プロファイル>.md`）を
+   今の状況で上書きし、`tako_orchestrator_handoff` を呼ぶ
+3. 後任 master が同じタブ・同じ role・同じプロファイルで立ち上がり、引き継ぎファイルと
+   実態（`tako_orchestrator_workers` / `tako_list_panes`）を突き合わせて「引き継ぎ完了」を報告する。
+   **起動は `tako master -<プロファイル>` と同一経路**なので、モデル・effort・アカウント・
+   master system prompt はプロファイルの master 設定がそのまま効く（worker 用の
+   `worker_agents` は使わない）。`TAKO_ORCHESTRATOR_ROLE` も CLI と同じ `master:<プロファイル>`
+   形式で入るので、後任の `tako orchestrator self` は自分のプロファイルを正しく返す（#761）
+4. 後任が前任ペインの入力欄を確認（ユーザーの未送達の指示が残っていないか）してから
+   前任ペインを閉じる
+
+**閉じるのは後任だけ**なので、後任の起動に失敗しても前任の master は失われない。
+
+### 引き継ぎファイルの書式（Issue #792）
+
+引き継ぎファイルは **2 節**に分ける。pane / tab 番号はこのマシンでしか意味を持たないので、
+知識に混ぜたまま別マシンへ持ち込むと後任が**存在しないペイン**へ指示を出す（#513 の設定共有で
+現実に起きる事故）。
+
+```markdown
+# master 引き継ぎ（profile: takodev）
+
+## 知識（マシン非依存）
+決定事項とその理由 / ユーザーの方針・好み / 残タスクとその意図 / 調べて分かったこと。
+pane / tab 番号は書かない
+
+## 実行状態（このマシン限定）
+spawn 済み worker とその pane と依頼内容 / 開いているペイン / 実行中のもの。
+別マシンでは丸ごと無効になる前提で書く
+```
+
+見出しは表示言語に合わせて英語（`## Knowledge (machine-independent)` /
+`## Runtime state (this machine only)`）でもよい。判定は寛容で、番号付き（`## 1. 知識…`）・
+半角括弧・強調（`**…**`）・語尾の省略（`## 知識`）も同じ節として認識する。
+
+- **旧書式（節なし）もそのまま読める**。`tako_orchestrator_handoff` は書式に関係なく
+  **全文を後任へ渡す**。旧書式のときは「番号への参照はすべて実態で確認しろ + 次の更新で
+  2 節へ書き直せ」が後任プロンプトに付くので、自然な更新で新書式へ移る（一括変換はしない）
+- 新書式のときは節ごとの扱い（知識 = そのまま前提にしてよい / 実行状態 = 必ず実態で確認）が
+  後任プロンプトに付く
+- いま自分のファイルがどちらかは `tako orchestrator self` の `handoff_format`
+  （`sectioned` / `legacy` / 未作成なら null）と `handoff_sections` で分かる。
+  `tako orchestrator handoff` の応答も同じ 2 フィールドを返す
+- 書式の正本は `tako_core::handoff`（`section_of_line` / `split_handoff` /
+  `handoff_template`。見出し定数は master system prompt と同期していることを単体テストが拘束）
+
+```bash
+# 今の閾値と超過状態を見る（master 自身が使う）
+tako orchestrator self
+
+# 閾値を 55% に下げる（プロファイル単位）
+tako orchestrator profiles set default --ctx-threshold 55
+
+# 自動通知を止める（手動の tako orchestrator handoff は使える）
+tako orchestrator profiles set default --auto-handoff false
+```
+
+自動通知を送った記録は `<data_dir>/supervisor.log` に残る（`action=ctx_handoff_nudge`）。
+GUI からは設定画面（⌘,）→ プロファイル → 「自動ハンドオフ」でも同じ設定を変えられる。
+
+## リミット後の自動復帰（Issue #813）
+
+5 時間制限・週次制限に当たったエージェントは、リセットまで止まったまま人間の再開操作を
+待つ。**ペイン単位でオプトイン**しておくと、リセット時刻を過ぎたところで tako が
+そのペインの作業を再開させる。オーケストレーション配下の worker を面倒見る
+supervisor（#401）とは別物で、**どのペインでも使える**（master 自身でも、ユーザーが
+自分で立てたエージェントでも）。
+
+```bash
+# 今のペインの状態を見る（既定 OFF）
+tako limit-resume
+
+# 有効にする / 戻す
+tako limit-resume on
+tako limit-resume off
+
+# 別のペインを指定する / 全ペインを一覧する
+tako limit-resume on --pane 12
+tako limit-resume --all
+```
+
+GUI では**ペインの右クリック**に「リミット後の自動復帰を有効にする」が出る。
+有効なペインはヘッダに小さなループアイコンが付き、上限で止まって待機しているあいだは
+色が濃くなる。設定は layout.json に載るので再起動しても残る。
+
+発動するのは**上限由来の停止だけ**で、次の条件をすべて満たしたときに限る:
+
+- 上限の対処ダイアログが出ている、または上限メッセージのまま止まっている
+- 画面が一定時間まったく変化していない（生成中に割り込まない）
+- リセット時刻 + 数分の安全マージンを過ぎた（時刻が読めなければ初観測から 15 分待つ）
+- 入力欄に人間の打ちかけた指示が無い
+- このエピソードの試行が 3 回未満（無限リトライしない）
+
+動作は 2 通り。**ダイアログが出ていれば**「解除まで待つ」相当の選択肢を**ラベル一致で**
+確定する（`Upgrade to Max 20x` や `Continue with usage credits` のような課金・モデル変更を
+伴う選択肢は拒否リストで構造的に弾くので、並び順が変わっても掴まない。安全な選択肢が
+無ければ何も送らずに諦める）。**ダイアログが無ければ**継続を促すナッジを送達確認つきで送る。
+
+permission ダイアログ・plan 確認・API エラー・普通の idle では**発動しない**。
+
+実行と結果は `<data_dir>/supervisor.log` に `action=limit_autoresume` で残る
+（自動ハンドオフの `ctx_handoff_nudge` と同じファイル）。いま何を待っているかは
+`tako limit-resume` の `state`（停止の型・復帰予定時刻・試行回数・直近の結果）で分かる。
+
+MCP は `tako_limit_resume` が 1:1 対応。`tako list` / `tako read` /
+`tako orchestrator worker-status` にも状態が載る。
 
 ## 品質パイプライン（全プロファイル共通）
 

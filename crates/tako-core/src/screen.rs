@@ -20,6 +20,13 @@ use crate::theme::{Rgb, Theme};
 /// DIM（SGR 2）の減光係数
 const DIM_FACTOR: f32 = 0.66;
 
+/// 空白セルの近道（#801）を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_801_NO_FAST_CELLS=1`）。UI 側の `terminal_grid` の近道と同じ変数で一緒に切れる
+fn fast_cells_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_801_NO_FAST_CELLS").is_some())
+}
+
 /// 同一スタイルが連続する区間。`range` は行テキスト内のバイト範囲
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyleRun {
@@ -86,8 +93,9 @@ impl Screen {
     }
 }
 
-/// セル単位の解決済みスタイル（ラン合成前の中間表現）
-#[derive(Debug, Clone, PartialEq)]
+/// セル単位の解決済みスタイル（ラン合成前の中間表現）。
+/// `Copy` なのは cols*rows のグリッドを毎フレーム敷き直すため（#801）
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct CellStyle {
     fg: Rgb,
     bg: Option<Rgb>,
@@ -129,7 +137,11 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         dim: false,
     };
     // フラット配列（rows 個の内側 Vec 割り当てを回避）
-    let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style.clone()); cols * rows];
+    let mut grid: Vec<(char, CellStyle)> = vec![(' ', default_style); cols * rows];
+    // #801: 1 セルも書かれなかった行は、どの行でも合成結果が同じになる。
+    // 1 本だけ組んで複製すれば、行ごとの `compose_line`（119 セルの走査 +
+    // スタイル比較 + String / Vec の積み上げ）が丸ごと省ける
+    let mut row_touched = vec![false; rows];
 
     let cursor = (show_cursor && content.cursor.shape != CursorShape::Hidden)
         .then(|| point_to_viewport(display_offset, content.cursor.point))
@@ -144,6 +156,20 @@ pub(crate) fn snapshot_opts<T: EventListener>(
 
     let selection = content.selection;
     let colors = content.colors;
+    // #801: 「素の空白セル」は `grid` の初期値とまったく同じ結果になるので、
+    // 色解決も書き込みも要らない。空画面ではほぼ全セルがこれに当たり、
+    // 毎フレーム cols*rows 回走っていた `resolve_cell` が丸ごと消える。
+    // 既定色が OSC 4 でテーマ色から差し替えられているときは近道を使わない
+    // （前景はスペースには見えないが、`compose_line` のラン分割に効くので同じ扱い）
+    let plain_blank_matches_default = !fast_cells_disabled()
+        && colors[NamedColor::Background as usize]
+            .map(from_ansi)
+            .unwrap_or(theme.background)
+            == theme.background
+        && colors[NamedColor::Foreground as usize]
+            .map(from_ansi)
+            .unwrap_or(theme.foreground)
+            == theme.foreground;
     // display_iter が content を部分 move するため、追加行の構築で使う
     // カーソルのグリッド座標はここで取り出しておく
     let cursor_visible_at = (show_cursor && content.cursor.shape != CursorShape::Hidden)
@@ -159,11 +185,24 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         }
         let selected = selection.is_some_and(|range| range.contains(indexed.point));
         let is_cursor = cursor == Some((col, row));
+        if plain_blank_matches_default && !selected && !is_cursor && is_plain_blank(indexed.cell) {
+            continue;
+        }
         grid[row * cols + col] = resolve_cell(indexed.cell, selected, is_cursor, colors, theme);
+        row_touched[row] = true;
     }
 
+    // 素のままの行は 1 本組んで使い回す（#801。中身は行位置に依らず同じ）
+    let mut blank_line: Option<ScreenLine> = None;
     let lines = (0..rows)
-        .map(|row| compose_line(&grid[row * cols..(row + 1) * cols]))
+        .map(|row| {
+            if row_touched[row] {
+                return compose_line(&grid[row * cols..(row + 1) * cols]);
+            }
+            blank_line
+                .get_or_insert_with(|| compose_line(&grid[row * cols..(row + 1) * cols]))
+                .clone()
+        })
         .collect();
 
     // fract > 0 のとき viewport 最下行の 1 行下を追加で切り出す（部分行の描画用）。
@@ -195,6 +234,20 @@ pub(crate) fn snapshot_opts<T: EventListener>(
         fract,
         extra_bottom,
     }
+}
+
+/// 「素の空白セル」か（#801）。
+///
+/// 文字が半角スペースで、属性フラグが 1 つも立っておらず、前景・背景が既定色のセル。
+/// このセルの解決結果は `snapshot_opts` が `grid` に敷く初期値（`' '` + 既定スタイル）と
+/// 一致するので、解決も書き込みも省ける。**判定を緩めてはいけない**:
+/// フラグ（DIM / INVERSE / HIDDEN / 下線 / 全角スペーサー）や明示色が 1 つでもあれば
+/// 見た目が変わる
+fn is_plain_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
+    cell.c == ' '
+        && cell.flags.is_empty()
+        && matches!(cell.fg, Color::Named(NamedColor::Foreground))
+        && matches!(cell.bg, Color::Named(NamedColor::Background))
 }
 
 /// セル 1 つを色解決済みの (文字, スタイル) へ変換する。
@@ -355,18 +408,36 @@ pub struct InputStatus {
 /// dim 状態を分析する。❯ 行が見つからなければ None
 pub fn analyze_input_line(screen: &Screen) -> Option<InputStatus> {
     // Claude TUI は ❯ の下にフッター（区切り線・モデル情報・ctx%）が 4〜6 行あるため、
-    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）
-    let start = screen.lines.len().saturating_sub(10);
-    let mut found: Option<(usize, usize)> = None; // (行 index, ❯ のバイト位置)
-    for i in start..screen.lines.len() {
-        let trimmed = screen.lines[i].text.trim_start();
-        if trimmed.starts_with('❯') {
-            let leading_spaces = screen.lines[i].text.len() - trimmed.len();
-            found = Some((i, leading_spaces));
+    // 末尾 10 行の範囲で最後の ❯ 行を探す（wait.rs の screen_looks_idle と同じ走査範囲）。
+    // 起点は「行数」ではなく**中身がある最後の行**にする。ビューポートを埋めない画面では
+    // 下端に空行が並び、行数基準だと入力行が範囲外に落ちる（#719 の実スクショで発覚）
+    let bottom = screen
+        .lines
+        .iter()
+        .rposition(|l| !l.text.trim().is_empty())
+        .map(|i| i + 1)?;
+    let start = bottom.saturating_sub(10);
+    let mut found: Option<usize> = None;
+    for i in start..bottom {
+        if screen.lines[i].text.trim_start().starts_with('❯') {
+            found = Some(i);
         }
     }
-    let (line_idx, prompt_byte_pos) = found?;
-    let line = &screen.lines[line_idx];
+    analyze_input_line_at(screen, found?)
+}
+
+/// 行 index を指定して入力行を分析する（#719）。
+///
+/// チャット入力欄は [`input_region`] が決めた**まさにその行**を見る必要がある。
+/// 探し直すと走査範囲の違いで「箱は見つかったのに入力テキストは無いことになる」
+/// という食い違いが起きる（実スクショでプレースホルダが本文に重なって発覚した）
+pub fn analyze_input_line_at(screen: &Screen, line_idx: usize) -> Option<InputStatus> {
+    let line = screen.lines.get(line_idx)?;
+    let trimmed = line.text.trim_start();
+    if !trimmed.starts_with('❯') {
+        return None;
+    }
+    let prompt_byte_pos = line.text.len() - trimmed.len();
     let full_line = line.text.trim_end().to_string();
 
     // ❯ の右側のテキストを抽出
@@ -427,6 +498,152 @@ pub fn analyze_input_line(screen: &Screen) -> Option<InputStatus> {
         text: input_text,
         style,
     })
+}
+
+/// エージェント TUI の入力ボックスが占めている**画面行の範囲**（#719）。
+///
+/// チャットビューの入力欄はこの範囲を実画面からミラーする（下書きを別に持たない）ので、
+/// 「入力欄が何行あるか」= 箱の高さ、がここで決まる（#718 のオートグローもこれに従う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputRegion {
+    /// 入力ボックスの先頭行（画面行 index。上の罫線は含まない）
+    pub start: usize,
+    /// 入力ボックスの終端行の**次**（下の罫線は含まない）
+    pub end: usize,
+    /// プロンプト記号（`❯` 等）がある行
+    pub prompt_row: usize,
+}
+
+impl InputRegion {
+    /// 行数（必ず 1 以上）
+    pub fn rows(&self) -> usize {
+        self.end.saturating_sub(self.start).max(1)
+    }
+}
+
+/// 入力ボックスの中に **TUI 自身が何か描いているか**（Issue #737）。
+///
+/// 「ユーザーが打った文字があるか」とは別物で、claude 自身の dim な案内文も
+/// true になる（空欄時の `Try "how does <filepath> work?"`、キュー滞留時の
+/// `Press up to edit queued messages` を実採取で確認）。
+///
+/// GUI モードのチャット入力欄は TUI の入力行をそのまま映すので、ここが true の
+/// ときに tako 自前のプレースホルダを重ねると**同じ座標に 2 つの文字列が出て
+/// 読めなくなる**（#737 の実測根因。dim テキストは列 2 から始まり、
+/// プレースホルダの絶対配置とほぼ一致していた）
+pub fn input_box_has_content(screen: &Screen, region: &InputRegion) -> bool {
+    // プロンプト行は記号（`❯`）を除いた中身を見る。記号だけの行は「空」
+    if analyze_input_line_at(screen, region.prompt_row).is_some_and(|s| !s.text.trim().is_empty()) {
+        return true;
+    }
+    // 箱が複数行なら 2 行目以降の本文も見る（プロンプト行は上で判定済み）
+    let end = region.end.min(screen.lines.len());
+    (region.start..end).any(|i| i != region.prompt_row && !screen.lines[i].text.trim().is_empty())
+}
+
+/// 入力ボックスの中でのキャレット位置 `(列, 映した行の先頭から数えた行)`（Issue #737）。
+///
+/// `shown_rows` は実際に映している行数（上限で頭打ちになり、超えたぶんは
+/// **頭が落ちる**）。返す行番号は映した行の中での index なので、描画側は
+/// 「行の高さ × これ」でそのままキャレットの y が出る。
+///
+/// GUI モードのチャット表示はターミナルグリッドを描かないため、IME の未確定文字列と
+/// 候補ウィンドウをセル座標（`pane_text_areas` 由来）へ向けると画面上のどこも
+/// 指さない。**入力欄の実座標へ向けるための唯一の写像**がこれ
+pub fn input_caret_cell(
+    screen: &Screen,
+    region: &InputRegion,
+    shown_rows: usize,
+) -> Option<(usize, usize)> {
+    let (col, row) = screen.ime_anchor_cell()?;
+    let shown = region.rows().min(shown_rows.max(1));
+    let first = region.end.saturating_sub(shown);
+    // 箱の外（会話ログ側・フッター側）にカーソルがあるなら入力欄には出さない
+    (first..region.end).position(|r| r == row).map(|w| (col, w))
+}
+
+/// 罫線だけでできた行か（`────` / `╭────╮` / `│` 単独は除く）。
+///
+/// claude は入力欄を上下の水平罫線で挟んで描く（実採取画面 v2.1 系）。
+/// バージョンによっては角丸ボックス（`╭─╮` / `╰─╯`）になるのでどちらも受ける
+fn is_frame_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let mut horizontal = 0usize;
+    for c in t.chars() {
+        match c {
+            '─' | '━' | '═' | '╌' | '┄' | '┈' | '⎯' => horizontal += 1,
+            // 角・接続・縦棒は許すが、水平線の本数には数えない
+            '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '│' | '┃' | ' ' =>
+                {}
+            _ => return false,
+        }
+    }
+    horizontal >= 3
+}
+
+/// エージェント TUI のプロンプト記号で始まる行か。
+///
+/// 枠線つきで描かれるバージョン（`│ ❯ hello │`）でも拾えるよう、行頭の縦罫線は
+/// 1 つだけ剥がしてから見る。記号は claude `❯` / codex `›` / agy `>` の和集合（#120）
+fn starts_with_prompt(line: &str) -> bool {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix('│')
+        .or_else(|| t.strip_prefix('┃'))
+        .unwrap_or(t)
+        .trim_start();
+    // ASCII の `>` はシェルの PS2 と衝突するので「`>` 単独 or `> `＋内容」だけ
+    t.starts_with('❯') || t.starts_with('›') || t.starts_with("> ") || t.trim_end() == ">"
+}
+
+/// 画面から入力ボックスの行範囲を求める（#719 のミラー描画の基準）。
+///
+/// 手順は「プロンプト行を見つける → 上下の一番近い罫線で挟む」。罫線が無い
+/// バージョンでもプロンプト行 1 行として成立するので、TUI の描き方が変わっても
+/// **入力欄が消えることはない**（最悪 1 行に縮退するだけ）。
+/// 番号付き選択ダイアログの選択カーソルはプロンプトではないので除外する（#530 と同じ判断）
+pub fn input_region_in_lines(lines: &[&str]) -> Option<InputRegion> {
+    // 走査の基準は「行数」ではなく**中身がある最後の行**。ビューポートを埋めない
+    // TUI（起動直後・出力が短いとき）では下端に空行が続き、行数基準だと
+    // 入力ボックスが走査範囲から丸ごと外れる（セルフテストで実測して直した）
+    let bottom = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)?;
+    // 下端 24 行の中の**最後の**プロンプト行。会話ログ側の `❯` を拾わないための範囲制限。
+    // フッター（区切り線 + モデル / ctx / モード行で最大 8 行）を挟んでも、入力が
+    // 十数行に伸びたところまで届く幅にしてある（表示上限 8 行より広い）
+    let scan_from = bottom.saturating_sub(24);
+    let prompt_row = (scan_from..bottom)
+        .rev()
+        .find(|&i| starts_with_prompt(lines[i]))?;
+    // 上へ: 一番近い罫線の 1 つ下が入力ボックスの先頭
+    let start = (scan_from..prompt_row)
+        .rev()
+        .find(|&i| is_frame_line(lines[i]))
+        .map(|i| i + 1)
+        .unwrap_or(prompt_row);
+    // 下へ: 一番近い罫線の手前が終端。罫線が無ければプロンプト行だけ
+    let end = (prompt_row + 1..bottom)
+        .find(|&i| is_frame_line(lines[i]))
+        .unwrap_or(prompt_row + 1);
+    Some(InputRegion {
+        start,
+        end: end.max(prompt_row + 1),
+        prompt_row,
+    })
+}
+
+/// [`input_region_in_lines`] の `Screen` 版（描画側はこちらを使う）。
+///
+/// 返す index は `screen.lines` の添字なので、**同じ `Screen` から作った描画行**と
+/// 1:1 で対応する（ミラーの行ズレを構造的に防ぐ）
+pub fn input_region(screen: &Screen) -> Option<InputRegion> {
+    let texts: Vec<&str> = screen.lines.iter().map(|l| l.text.as_str()).collect();
+    input_region_in_lines(&texts)
 }
 
 #[cfg(test)]
@@ -639,6 +856,100 @@ mod tests {
         assert!(s.lines[0].text.starts_with("line6"));
     }
 
+    // ---- #801: 空白セルの近道が「見た目が変わるセル」を飛ばさないこと ----
+    //
+    // `is_plain_blank` を緩めると、空白でも装飾が乗るセルが素の空白に化ける。
+    // 以下は近道を壊したときに落ちる（= 検出力を持つ）不変条件
+
+    #[test]
+    fn 装飾つきの空白セルは近道で飛ばさない() {
+        // 下線・取り消し線・反転・DIM は「空白でも見える」属性
+        let t = theme();
+        let s = snapshot(&term_with(b"\x1b[4m   \x1b[0m"), &t);
+        assert!(
+            s.lines[0].runs.iter().any(|r| r.underline),
+            "SGR 4 の空白に下線ランが残る"
+        );
+        let s = snapshot(&term_with(b"\x1b[9m   \x1b[0m"), &t);
+        assert!(s.lines[0].runs.iter().any(|r| r.strikeout));
+        let s = snapshot(&term_with(b"\x1b[7m   \x1b[0m"), &t);
+        assert!(
+            s.lines[0].runs.iter().any(|r| r.bg == Some(t.foreground)),
+            "反転した空白は前景色で塗られる"
+        );
+    }
+
+    #[test]
+    fn 明示背景色の空白セルは近道で飛ばさない() {
+        let t = theme();
+        let s = snapshot(&term_with(b"\x1b[48;2;10;20;30m   \x1b[0m"), &t);
+        assert!(s.lines[0]
+            .runs
+            .iter()
+            .any(|r| r.bg == Some(Rgb::new(10, 20, 30))));
+    }
+
+    #[test]
+    fn 既定背景がosc11で変わったら空白も塗る() {
+        // 近道は「既定背景 = テーマ背景」が前提。OSC 11 で変わったら全セル塗る必要がある
+        let t = theme();
+        let s = snapshot(&term_with(b"\x1b]11;#00ff00\x1b\\"), &t);
+        // 先頭セルはカーソルなので除く。残りの素の空白すべてに新しい既定背景が乗る
+        assert!(
+            s.lines[0]
+                .runs
+                .iter()
+                .filter(|r| r.range.start > 0)
+                .all(|r| r.bg == Some(Rgb::new(0, 255, 0))),
+            "既定背景が差し替わったら空白セルにも背景が乗る: {:?}",
+            s.lines[0].runs
+        );
+        // 2 行目以降（カーソルが居ない行）も同じ
+        assert!(s.lines[1]
+            .runs
+            .iter()
+            .all(|r| r.bg == Some(Rgb::new(0, 255, 0))));
+    }
+
+    #[test]
+    fn 空白セルの選択とカーソルは近道で飛ばさない() {
+        let t = theme();
+        // 何も入力していない行を選択する（全セルが素の空白）
+        let mut term = term_with(b"");
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(2)), Side::Right);
+        term.selection = Some(sel);
+        let s = snapshot(&term, &t);
+        // 先頭セルはカーソルが勝つので、選択背景はその隣に出る
+        assert!(
+            s.lines[0]
+                .runs
+                .iter()
+                .any(|r| r.bg == Some(t.selection_background)),
+            "空白セルの選択も塗られる: {:?}",
+            s.lines[0].runs
+        );
+        // カーソルセル（行頭）はカーソル色で焼かれている
+        let s = snapshot(&term_with(b""), &t);
+        assert_eq!(s.cursor, Some((0, 0)));
+        assert_eq!(s.lines[0].runs.first().map(|r| r.bg), Some(Some(t.cursor)));
+    }
+
+    #[test]
+    fn 全角の右隣スペーサーは近道で飛ばさない() {
+        // スペーサーを素の空白として書き戻すと、列数が 1 ずれて cell_cols が壊れる
+        let s = snapshot(&term_with("あ".as_bytes()), &theme());
+        assert_eq!(s.lines[0].text.chars().next(), Some('あ'));
+        // 「あ」は 2 セル占有 = 次の文字の列が 2
+        assert_eq!(s.lines[0].cell_cols.first().copied(), Some(0));
+        assert_eq!(s.lines[0].cell_cols.get(1).copied(), Some(2));
+        assert!(s.lines[0].has_wide);
+    }
+
     #[test]
     fn 選択範囲に選択背景がつく() {
         let mut term = term_with(b"hello");
@@ -733,4 +1044,359 @@ mod tests {
         let run = run_for(&extra, "line");
         assert_eq!(run.bg, Some(t.selection_background));
     }
+
+    // --- 入力ボックスの行範囲（#719 のミラー描画。#718 の高さもここが決める） ---
+
+    /// 実採取した claude v2.1 系の下端（罫線で挟まれた `❯` + フッター）
+    fn claude_bottom(input: &[&str]) -> Vec<String> {
+        let mut lines: Vec<String> = vec![
+            "  ⎿  Tip: Use /btw to ask a quick side question".into(),
+            "".into(),
+            "────────────────────────────────".into(),
+        ];
+        lines.extend(input.iter().map(|s| s.to_string()));
+        lines.extend(
+            [
+                "────────────────────────────────",
+                "  [Opus 5 · MAX]  user@example.com",
+                "  ctx  18% █░░░░░░░░░",
+                "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        lines
+    }
+
+    fn region_of(lines: &[String]) -> Option<InputRegion> {
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        input_region_in_lines(&refs)
+    }
+
+    #[test]
+    fn 入力ボックスは罫線に挟まれた範囲になる() {
+        let lines = claude_bottom(&["❯ こんにちは"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1, "1 行入力は 1 行ぶんの高さ");
+        assert_eq!(lines[r.prompt_row], "❯ こんにちは");
+        assert_eq!(r.start, r.prompt_row);
+    }
+
+    #[test]
+    fn 複数行入力では行数が増える() {
+        let lines = claude_bottom(&["❯ 1 行目", "  2 行目", "  3 行目"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 3, "TUI の行数にそのまま追従する");
+        assert_eq!(lines[r.start], "❯ 1 行目");
+        assert_eq!(lines[r.end - 1], "  3 行目");
+    }
+
+    #[test]
+    fn 空の入力欄でも1行として取れる() {
+        let lines = claude_bottom(&["❯"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+    }
+
+    #[test]
+    fn 角丸ボックスの描き方でも挟める() {
+        // 将来 claude が枠線に変えても縮退しないこと
+        let lines: Vec<String> = [
+            "text above",
+            "╭──────────────────────╮",
+            "│ ❯ hello              │",
+            "│   world              │",
+            "╰──────────────────────╯",
+            "  footer",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 2);
+    }
+
+    #[test]
+    fn 罫線が無くてもプロンプト行だけに縮退する() {
+        let lines: Vec<String> = ["output line", "❯ hello"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+        assert_eq!(r.start, 1);
+    }
+
+    #[test]
+    fn プロンプトが無ければ範囲は取れない() {
+        let lines: Vec<String> = ["$ ls", "a.txt  b.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            region_of(&lines).is_none(),
+            "素のシェルは入力ボックス扱いしない"
+        );
+    }
+
+    #[test]
+    fn 会話ログの古いプロンプト行は拾わない() {
+        // 画面上端に残った過去の `❯` ではなく、下端の入力欄を採る
+        let mut lines: Vec<String> = vec!["❯ 昔の入力".into()];
+        lines.extend((0..26).map(|i| format!("出力 {i}")));
+        lines.extend(claude_bottom(&["❯ いまの入力"]));
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(lines[r.prompt_row], "❯ いまの入力");
+    }
+
+    #[test]
+    fn 画面下端に空行が続いても入力ボックスを見つけられる() {
+        // ビューポートを埋めない TUI（起動直後・出力が短いとき）。
+        // 行数基準で下端 24 行を切ると入力ボックスごと走査範囲から外れる
+        let mut lines = claude_bottom(&["❯ こんにちは"]);
+        lines.extend((0..30).map(|_| String::new()));
+        let r = region_of(&lines).expect("空行の上にある入力ボックスを見つける");
+        assert_eq!(r.rows(), 1);
+        assert_eq!(lines[r.prompt_row], "❯ こんにちは");
+    }
+
+    /// 行テキストだけから最小の Screen を組む（走査範囲の検査用。runs は空でよい）
+    fn screen_of(texts: &[&str]) -> Screen {
+        Screen {
+            cols: 80,
+            rows: texts.len(),
+            lines: texts
+                .iter()
+                .map(|t| ScreenLine {
+                    text: (*t).to_string(),
+                    runs: Vec::new(),
+                    cell_cols: Vec::new(),
+                    has_wide: false,
+                })
+                .collect(),
+            cursor: None,
+            ime_cursor: None,
+            display_offset: 0,
+            fract: 0.0,
+            extra_bottom: None,
+        }
+    }
+
+    #[test]
+    fn 入力行の分析も末尾空行に耐える() {
+        // ビューポートを埋めない画面（下端に空行が並ぶ）。行数基準で末尾 10 行を切ると
+        // 入力行を見失い、「箱はあるのにテキストは無い」食い違いが起きる（#719 実スクショ）
+        let mut texts: Vec<&str> = vec!["out", "────────", "❯ hello", "────────", "footer"];
+        texts.extend(std::iter::repeat_n("", 12));
+        let s = screen_of(&texts);
+        let status = analyze_input_line(&s).expect("末尾に空行があっても入力行を見つける");
+        assert_eq!(status.text, "hello");
+        // 箱の判定と同じ行を指定した場合も同じ結果になる（食い違いを構造的に防ぐ）
+        let region = input_region(&s).expect("入力ボックスがある");
+        let at = analyze_input_line_at(&s, region.prompt_row).expect("同じ行から取れる");
+        assert_eq!(at.text, status.text);
+    }
+
+    #[test]
+    fn 実採取した_claude_の複数行入力ボックスに追従する() {
+        // claude v2.1.220 を隔離 tmux で動かし Shift+Enter で 4 行入れたときの実採取。
+        // 箱の中には「次の行」用の空行が 1 つ入るので 5 行になる（TUI の見た目どおり）
+        let lines: Vec<String> = [
+            "                                        ctrl+g to edit in VS Code",
+            "──────────────────────────────────────────────────────────────",
+            "❯ line1",
+            "  line2",
+            "  line3",
+            "  line4",
+            "",
+            "──────────────────────────────────────────────────────────────",
+            "  [Opus 5 (1M context) · xH]  user@example.com",
+            "  ctx   0% ░░░░░░░░░░",
+            "  5h   --",
+            "  7d   --",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(
+            r.rows(),
+            5,
+            "TUI が描いた行数（末尾の空行を含む）に一致する"
+        );
+        assert_eq!(lines[r.start], "❯ line1");
+        assert_eq!(lines[r.end - 1], "");
+    }
+
+    #[test]
+    fn 実採取した_claude_の画像プレースホルダ入り入力行を拾う() {
+        // ⌘V（= Ctrl+V 素通し）で claude 自身が差し込む形（実採取: `❯ abc[Image #1]`）
+        let lines = claude_bottom(&["❯ abc[Image #1]"]);
+        let r = region_of(&lines).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 1);
+        assert!(lines[r.prompt_row].contains("[Image #1]"));
+    }
+
+    #[test]
+    fn 罫線判定は本文を誤検出しない() {
+        assert!(is_frame_line("────────"));
+        assert!(is_frame_line("╭──────╮"));
+        assert!(!is_frame_line("─"), "1〜2 本の水平線は罫線扱いしない");
+        assert!(!is_frame_line("│"), "縦棒だけは罫線ではない");
+        assert!(!is_frame_line("ハイフン--- 区切り"));
+        assert!(!is_frame_line(""));
+    }
+
+    #[test]
+    fn screen_からも同じ範囲が取れる() {
+        // 描画行と同じ添字で返ること（ミラーの行ズレ防止）
+        let term = term_with("out\n────────\n❯ hi\n────────\nfooter".as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(s.lines[r.prompt_row].text.trim_start().starts_with('❯'));
+        assert_eq!(r.rows(), 1);
+    }
+
+    // ─────── #737: 入力欄の重なり描画と IME キャレット ───────
+
+    /// 実 claude と同じ広さの端末を作る（20 列だと案内文が折り返してしまう）
+    fn wide_term(bytes: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TermSize::new(60, 12), VoidListener);
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    /// 実採取した claude の下端（`737probe` の tmux キャプチャそのまま）を組む。
+    /// `input` はプロンプト行の生バイト列（SGR 込み）
+    fn claude_screen(input: &str) -> Screen {
+        let rule = "─".repeat(40);
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n{input}\r\n\x1b[38;5;244m{rule}\r\n\
+             \x1b[39m  \x1b[32m[Opus 5 (1M context) \u{b7} xH]\x1b[0m\r\n  ctx   0%",
+        );
+        let term = wide_term(bytes.as_bytes());
+        snapshot_opts(&term, &theme(), true, 0.0)
+    }
+
+    /// 空欄の claude は **自前の dim な案内文**を箱の中に描く（実採取）。
+    /// これを「中身なし」と扱うと、tako のプレースホルダを同じ座標へ重ねてしまう
+    /// （#737 の実測根因 O1）
+    #[test]
+    fn 空欄のclaudeは自前の案内文を箱に描いている() {
+        // 実採取: '\x1b[39m❯\xa0\x1b[2mTry "how does <filepath> work?"\x1b[0m'
+        let s = claude_screen("\x1b[39m❯\u{a0}\x1b[2mTry \"how does <filepath> work?\"\x1b[0m");
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(
+            input_box_has_content(&s, &r),
+            "dim の案内文も「箱に何か描いてある」として扱う: {:?}",
+            s.lines[r.prompt_row].text
+        );
+    }
+
+    /// キュー滞留中の案内文（実採取）も同じ扱い。
+    /// ここを取りこぼすと busy キューの状態で重なりが起きる（受け入れ条件 1 の 1 状態）
+    #[test]
+    fn キュー滞留の案内文も箱の中身として扱う() {
+        let s = claude_screen(
+            "\x1b[38;5;246m❯\u{a0}\x1b[2m\x1b[39mPress up to edit queued messages\x1b[0m",
+        );
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(input_box_has_content(&s, &r));
+    }
+
+    /// 生成中で本当に空の箱（`❯ ` だけ。実採取）は「中身なし」。
+    /// ここまで true にしてしまうと tako の案内文が一切出なくなる
+    #[test]
+    fn 本当に空の箱は中身なしと判定する() {
+        let s = claude_screen("\x1b[38;5;246m❯\u{a0}\x1b[39m");
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(
+            !input_box_has_content(&s, &r),
+            "記号だけの行は空: {:?}",
+            s.lines[r.prompt_row].text
+        );
+    }
+
+    /// ユーザーが打った文字は当然「中身あり」
+    #[test]
+    fn 打った文字は箱の中身として扱う() {
+        let s = claude_screen("\x1b[38;5;246m❯\u{a0}\x1b[39mbusy中の追加指示です");
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(input_box_has_content(&s, &r));
+    }
+
+    /// 複数行入力の 2 行目以降だけに本文があるときも中身ありとする
+    #[test]
+    fn 複数行入力の2行目の本文も拾う() {
+        let rule = "─".repeat(40);
+        let bytes =
+            format!("out\r\n\x1b[38;5;244m{rule}\r\n❯\u{a0}\r\n  2行目の本文\r\n\x1b[38;5;244m{rule}\r\n  ctx 0%");
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert!(r.rows() >= 2, "2 行の箱として取れている: {r:?}");
+        assert!(input_box_has_content(&s, &r));
+    }
+
+    /// キャレットは「箱の中の (列, 行)」へ写る。
+    /// 実採取の値（空欄 = 列 2 / 14 文字打つと列 16）と同じ関係になることを見る
+    #[test]
+    fn キャレットは箱の中の座標へ写る() {
+        // プロンプト行は上から 2 行目（0 始まりで index 2）。CSI H は 1 始まり
+        let rule = "─".repeat(40);
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n❯\u{a0}G4 mo susumete\r\n\x1b[38;5;244m{rule}\r\n  ctx 0%\x1b[3;17H",
+        );
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        let (col, row) = input_caret_cell(&s, &r, CHAT_INPUT_MAX_ROWS_FOR_TEST)
+            .expect("箱の中にキャレットがある");
+        assert_eq!(col, 16, "実採取と同じ列（`❯ ` の 2 列 + 14 文字）");
+        assert_eq!(row, 0, "1 行の箱なので先頭行");
+    }
+
+    /// カーソルが箱の外（会話ログ側）にあるときは入力欄へ出さない。
+    /// ここで Some を返すと、スクロールバック中に未確定文字列が入力欄へ化けて出る
+    #[test]
+    fn 箱の外のカーソルは入力欄のキャレットにしない() {
+        let rule = "─".repeat(40);
+        // カーソルを 1 行目（会話ログ側）へ置く
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n❯\u{a0}hi\r\n\x1b[38;5;244m{rule}\r\n  ctx 0%\x1b[1;1H",
+        );
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert_eq!(input_caret_cell(&s, &r, CHAT_INPUT_MAX_ROWS_FOR_TEST), None);
+    }
+
+    /// 上限行数を超えて**頭が落ちている**ときは、落ちたぶんだけ行番号が詰まる。
+    /// ここを region.start 基準で数えると、映していない行のぶん下へずれる
+    #[test]
+    fn 頭が落ちた箱でも行番号は映した行を基準にする() {
+        let rule = "─".repeat(40);
+        let mut body = String::new();
+        for i in 0..4 {
+            body.push_str(&format!("❯\u{a0}row{i}\r\n"));
+        }
+        // 4 行の箱。カーソルは最終行（画面 index 5 = CSI H の 6 行目）
+        let bytes = format!(
+            "out\r\n\x1b[38;5;244m{rule}\r\n{body}\x1b[38;5;244m{rule}\r\n  ctx 0%\x1b[6;3H"
+        );
+        let term = wide_term(bytes.as_bytes());
+        let s = snapshot_opts(&term, &theme(), true, 0.0);
+        let r = input_region(&s).expect("入力ボックスがある");
+        assert_eq!(r.rows(), 4, "4 行の箱: {r:?}");
+        // 全部映すなら最終行 = index 3
+        assert_eq!(input_caret_cell(&s, &r, 4).map(|(_, row)| row), Some(3));
+        // 2 行しか映さない（頭 2 行が落ちる）なら最終行 = index 1
+        assert_eq!(input_caret_cell(&s, &r, 2).map(|(_, row)| row), Some(1));
+    }
+
+    /// 描画側の上限（`chat_view::CHAT_INPUT_MAX_ROWS`）と同値。
+    /// core は GPUI に依存しないのでテスト用に持つ
+    const CHAT_INPUT_MAX_ROWS_FOR_TEST: usize = 8;
 }

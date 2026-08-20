@@ -52,4 +52,21 @@ if [[ -n ${TAKO_PANE_ID-} && $- == *i* && -z ${_TAKO_BASH_DONE-} ]]; then
 
   PROMPT_COMMAND=_tako_precmd
   trap _tako_debug DEBUG
+
+  # tako CLI の PATH 注入（Issue #601）。このファイルが source されるのは最初の
+  # プロンプト直前 = ~/.bashrc の後なので、「ユーザーが自分で tako を通しているか」を
+  # 正しく判定できる。足すのは PATH の末尾、しかも見つからないときだけ。
+  # ~/.bashrc は書き換えないので tako の外の bash は不変。逃げ道は TAKO_NO_PATH_INJECTION=1
+  if [[ -z ${TAKO_NO_PATH_INJECTION-} ]]; then
+    _tako_root=${BASH_SOURCE[0]%/*}
+    _tako_cli_dir=
+    # $(<file) は bash では fork しない。tako が起動時に書く（不在・空 = 注入しない）
+    [[ -r $_tako_root/cli-dir ]] && _tako_cli_dir=$(<"$_tako_root/cli-dir")
+    if [[ -n $_tako_cli_dir && -x $_tako_cli_dir/tako ]] \
+      && [[ ":$PATH:" != *":$_tako_cli_dir:"* ]] \
+      && ! command -v tako >/dev/null 2>&1; then
+      export PATH="$PATH:$_tako_cli_dir"
+    fi
+    unset _tako_root _tako_cli_dir
+  fi
 fi

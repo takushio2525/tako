@@ -238,6 +238,23 @@ pub fn capture_session(socket: Option<&str>, session: &str) -> Result<Vec<String
     .map(|output| output.lines().map(str::to_string).collect())
 }
 
+/// `capture_session` の **エスケープ付き**（`-e`）版。SGR 属性が残るので
+/// 「入力欄のテキストが dim か」= claude のプレースホルダ / ゴースト提案かどうかを
+/// 文言に依存せず判定できる（Issue #572。判定は `claude_tui::input_text_is_all_dim`）
+pub fn capture_session_styled(socket: Option<&str>, session: &str) -> Result<Vec<String>, String> {
+    run_tmux(
+        socket,
+        &[
+            "capture-pane",
+            "-t",
+            &session_pane_target(session),
+            "-p",
+            "-e",
+        ],
+    )
+    .map(|output| output.lines().map(str::to_string).collect())
+}
+
 /// セッションのアクティブ window へキー入力を送信する。
 /// `text` はそのまま send-keys へ渡す（リテラルモード `-l`）。
 /// 注意: 改行を含むテキストの一括送信は TUI 側で貼り付けと誤認され崩れる

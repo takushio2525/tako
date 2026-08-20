@@ -16,6 +16,19 @@ pub struct Settings {
     /// listen ポート検知 + 提案チップ（FR-2.4.4。既定 ON）
     #[serde(default = "default_true")]
     pub port_detect: bool,
+    /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600。既定 ON）。
+    /// zsh 以外のシェル・ユーザーが自前で導入済みの環境では設定に関わらず無害に素通しする
+    #[serde(default = "default_true")]
+    pub autosuggest: bool,
+    /// 入力予測の確定キーのヒント表示（Issue #614。既定 ON）。
+    /// 残り回数そのものは `<data_dir>/shell-integration/autosuggest-hint` にあり、
+    /// ここが持つのは「恒久 OFF にしたか」だけ（ON へ戻すと残り回数が既定に戻る）
+    #[serde(default = "default_true")]
+    pub autosuggest_hint: bool,
+    /// ゴースト表示中の Tab を確定にするか（Issue #614。既定 ON）。
+    /// OFF なら Tab は常に従来の補完へ委譲される
+    #[serde(default = "default_true")]
+    pub autosuggest_tab: bool,
     /// 表示中プレビューファイルのライブリロード（Issue #233。既定 ON）
     #[serde(default = "default_true")]
     pub preview_live_reload: bool,
@@ -47,12 +60,29 @@ pub struct Settings {
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// UI 表示モード（Issue #691 / #694。"terminal"（既定）/ "gui"）。
+    /// 既定が terminal なので、この項目を知らない既存ユーザーの体験は変わらない
+    #[serde(default = "default_ui_mode")]
+    pub ui_mode: String,
     /// 左サイドバー（ファイルツリー）の幅（px 整数。Issue #307。既定 244）
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u32,
+    /// ファイルツリーでドット始まりの項目を表示する（Issue #550。既定 false = 非表示）
+    #[serde(default)]
+    pub show_hidden_files: bool,
     /// エラーレポートの自動送信（Issue #333。既定 OFF = opt-in）
     #[serde(default)]
     pub telemetry: bool,
+    /// 初回起動のウェルカムバナーを閉じた（Issue #549。既定 false）。
+    /// 「初回かどうか」の主判定は settings.json の実在（`welcome::should_show`）で、
+    /// これはユーザーが明示的に閉じた記録。CLI / MCP `tako welcome` から操作できる
+    #[serde(default)]
+    pub welcome_dismissed: bool,
+    /// 更新通知カードを閉じたときの対象バージョン（Issue #616。None = 閉じていない）。
+    /// 値は「どのバージョンを案内していたか」を表すキー（例 `"stable:0.6.1 test:0.7.0-test.1"`）。
+    /// 新しいバージョンを検知するとキーが変わり、カードは再び出る（= バージョン単位の抑止）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_card_dismissed: Option<String>,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。既定 "claude"）
     #[serde(default = "default_limit_service")]
     pub limit_service: String,
@@ -91,6 +121,10 @@ fn default_theme() -> String {
     "dark".into()
 }
 
+fn default_ui_mode() -> String {
+    tako_core::ui_mode::UiMode::default().as_str().into()
+}
+
 fn default_sidebar_width() -> u32 {
     244
 }
@@ -124,6 +158,9 @@ impl Default for Settings {
         Self {
             auto_rename: true,
             port_detect: true,
+            autosuggest: true,
+            autosuggest_hint: true,
+            autosuggest_tab: true,
             preview_live_reload: true,
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
@@ -134,8 +171,12 @@ impl Default for Settings {
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             theme: default_theme(),
+            ui_mode: default_ui_mode(),
             sidebar_width: default_sidebar_width(),
+            show_hidden_files: false,
             telemetry: false,
+            welcome_dismissed: false,
+            update_card_dismissed: None,
             limit_service: default_limit_service(),
             language: default_language(),
             runner_defaults: std::collections::BTreeMap::new(),
@@ -191,6 +232,11 @@ impl Settings {
         tako_core::theme::ThemeMode::parse(&self.theme).unwrap_or_default()
     }
 
+    /// UI 表示モードを tako-core の型へ解決する（不明値は既定 terminal。Issue #694）
+    pub fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+        tako_core::ui_mode::UiMode::parse(&self.ui_mode).unwrap_or_default()
+    }
+
     /// 利用制限表示の選択サービスを解決する（不明値は既定 Claude。Issue #321）
     pub fn limit_service(&self) -> tako_core::LimitService {
         tako_core::LimitService::parse(&self.limit_service).unwrap_or_default()
@@ -214,7 +260,8 @@ pub fn load() -> Settings {
         .unwrap_or_default()
 }
 
-fn load_from(path: &std::path::Path) -> Option<Settings> {
+/// 指定パスから設定を読む（不在・破損は None）
+pub fn load_from(path: &std::path::Path) -> Option<Settings> {
     let json = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&json).ok()
 }
@@ -231,7 +278,8 @@ pub fn save(settings: &Settings) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn save_to(path: &std::path::Path, settings: &Settings) -> io::Result<()> {
+/// 指定パスへ設定を書き出す（`save` の本体。隔離した検証で使えるよう公開）
+pub fn save_to(path: &std::path::Path, settings: &Settings) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "親ディレクトリが無い"))?;
@@ -261,6 +309,9 @@ mod tests {
         let settings = Settings {
             auto_rename: false,
             port_detect: false,
+            autosuggest: false,
+            autosuggest_hint: false,
+            autosuggest_tab: false,
             preview_live_reload: false,
             preview_cache_max_mb: 768,
             tmux_persist: false,
@@ -271,8 +322,12 @@ mod tests {
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
             theme: "light".into(),
+            ui_mode: "gui".into(),
             sidebar_width: 300,
+            show_hidden_files: true,
             telemetry: true,
+            welcome_dismissed: true,
+            update_card_dismissed: Some("stable:9.9.9".into()),
             limit_service: "codex".into(),
             language: "en".into(),
             runner_defaults: std::collections::BTreeMap::new(),
@@ -296,6 +351,13 @@ mod tests {
         assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
+        // #600: 入力予測は既定 ON（旧ファイル後方互換）
+        assert!(parsed.autosuggest);
+        // #614: 確定キーのヒントと Tab 確定も既定 ON（#600 時代のファイルでも立つ）
+        assert!(parsed.autosuggest_hint);
+        assert!(parsed.autosuggest_tab);
+        // #550: 隠しファイルは既定で非表示（未知キーの後方互換も兼ねる）
+        assert!(!parsed.show_hidden_files);
         assert!(parsed.preview_live_reload);
         assert_eq!(parsed.preview_cache_max_mb, 512);
         assert!(parsed.tmux_persist);
@@ -322,9 +384,29 @@ mod tests {
         assert_eq!(parsed.sidebar_width, 244);
         // テレメトリの既定は OFF（Issue #333。opt-in）
         assert!(!parsed.telemetry);
+        // ウェルカムバナーの dismiss 記録の既定（Issue #549。旧ファイル後方互換）
+        assert!(!parsed.welcome_dismissed);
         // 利用制限サービスの既定は claude（Issue #321。旧ファイル後方互換）
         assert_eq!(parsed.limit_service, "claude");
         assert_eq!(parsed.limit_service(), tako_core::LimitService::Claude);
+        // UI 表示モードの既定は terminal（Issue #694。旧ファイル後方互換 =
+        // この項目を持たない既存ユーザーの表示は従来どおり）
+        assert_eq!(parsed.ui_mode, "terminal");
+        assert_eq!(parsed.ui_mode(), tako_core::ui_mode::UiMode::Terminal);
+    }
+
+    #[test]
+    fn ui_modeが不明値でterminalへフォールバックする() {
+        let gui = Settings {
+            ui_mode: "gui".into(),
+            ..Settings::default()
+        };
+        assert_eq!(gui.ui_mode(), tako_core::ui_mode::UiMode::Gui);
+        let unknown = Settings {
+            ui_mode: "simple".into(),
+            ..Settings::default()
+        };
+        assert_eq!(unknown.ui_mode(), tako_core::ui_mode::UiMode::Terminal);
     }
 
     #[test]

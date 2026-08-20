@@ -1,5 +1,13 @@
 //! ペイン・タブの close 確認ダイアログの文言（FR-2.2.6 / #346。キー: dialog.*）
 
+/// ダイアログの見出し（#566 で日本語直書きからカタログへ移した）
+pub fn title_close_pane() -> &'static str {
+    tr!("ペインを閉じる", "Close pane")
+}
+pub fn title_close_tab() -> &'static str {
+    tr!("タブを閉じる", "Close tab")
+}
+
 pub fn close_pane_question() -> &'static str {
     tr!("このペインを閉じますか？", "Close this pane?")
 }
@@ -20,6 +28,13 @@ pub fn lost_running_process() -> &'static str {
 }
 pub fn lost_busy_worker() -> &'static str {
     tr!("稼働中の worker", "a busy worker")
+}
+/// エージェントのペイン（#566。確認が出た理由を role つきで示す）
+pub fn lost_agent_pane(role: &str) -> String {
+    tr!(
+        format!("エージェントのペイン（{role}）"),
+        format!("an agent pane ({role})")
+    )
 }
 pub fn lost_tmux_session() -> &'static str {
     tr!("tmux セッション", "a tmux session")
@@ -68,11 +83,14 @@ mod tests {
     fn catalog_has_both_languages_and_no_emoji() {
         tests_support::check_ja_en(|| {
             vec![
+                title_close_pane().to_string(),
+                title_close_tab().to_string(),
                 close_pane_question().to_string(),
                 close_tab_question().to_string(),
                 close_loses(&["a".to_string(), "b".to_string()]),
                 lost_running_process().to_string(),
                 lost_busy_worker().to_string(),
+                lost_agent_pane("orchestrator-master"),
                 lost_tmux_session().to_string(),
                 lost_panes(2),
                 lost_running(1),

@@ -421,6 +421,14 @@ pub(crate) fn encode_modifiers(m: &Modifiers) -> u8 {
         + ((m.platform as u8) << 3)
 }
 
+/// 貼り付け（`cmd-v`）のキーストロークか（#546）。
+/// `key_bindings()` の `cmd-v` → `PasteClipboard` と同じ組み合わせだけを真にする。
+/// アプリ内テキスト入力がキーを消費している間はアクションが発火しないので、
+/// `handle_key` はこの判定で `paste()` へ回す
+pub(crate) fn is_paste_keystroke(ks: &Keystroke) -> bool {
+    ks.key == "v" && ks.modifiers.platform && !ks.modifiers.control && !ks.modifiers.alt
+}
+
 /// キー入力 → PTY バイト列。`csi_u` は kitty keyboard protocol（disambiguate
 /// フラグ。TUI が `CSI > 1 u` で有効化。Claude Code 等が Shift+Enter を
 /// 区別するために使う）の送出範囲。UI 層は常に ModifiedOnly 以上を渡す。
@@ -553,6 +561,34 @@ mod tests {
             key: key.into(),
             key_char: Some(ch.into()),
         }
+    }
+
+    /// #546: `cmd-v` だけを貼り付けと見なす（他のキーを巻き込むと
+    /// パレット等の入力欄で文字が打てなくなる）
+    #[test]
+    fn 貼り付け判定はcmd_vのみ() {
+        let cmd_v = Keystroke::parse("cmd-v").expect("cmd-v");
+        assert!(is_paste_keystroke(&cmd_v));
+        // 修飾なしの v は本文入力
+        assert!(!is_paste_keystroke(&ks_char("v", "v")));
+        // 別のコマンド combo
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("cmd-c").expect("cmd-c")
+        ));
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("cmd-k").expect("cmd-k")
+        ));
+        // 追加修飾つきは別バインドの可能性があるので拾わない
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("cmd-alt-v").expect("cmd-alt-v")
+        ));
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("ctrl-cmd-v").expect("ctrl-cmd-v")
+        ));
+        // ターミナルの literal-next（ctrl-v）は貼り付けではない
+        assert!(!is_paste_keystroke(
+            &Keystroke::parse("ctrl-v").expect("ctrl-v")
+        ));
     }
     fn ks_ctrl(key: &str) -> Keystroke {
         Keystroke {

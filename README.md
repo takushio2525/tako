@@ -245,3 +245,7 @@ v0.2.6 以降は署名の designated requirement が identifier 固定になり�
 ## ライセンス / License
 
 [GPL-3.0-or-later](LICENSE) — 依存クレート（zlog / ztracing、Zed リポ由来）が GPL-3.0 のため。
+
+同梱している第三者成果物（zsh-autosuggestions ほか）の告知は
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にある。
+Notices for bundled third-party works are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

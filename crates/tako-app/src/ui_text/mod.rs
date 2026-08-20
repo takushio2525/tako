@@ -25,11 +25,13 @@ macro_rules! tr {
 // 移動しないこと
 
 pub mod about;
+pub mod command_card;
 pub mod common;
 pub mod dialog;
 pub mod drawer;
 pub mod menu;
 pub mod palette;
+pub mod pane_menu;
 pub mod panel;
 pub mod ports;
 pub mod preview;
@@ -38,8 +40,10 @@ pub mod settings;
 pub mod sidebar;
 pub mod sleep_guard;
 pub mod stale;
+pub mod ui_mode;
 pub mod update;
 pub mod webdock;
+pub mod welcome;
 
 #[cfg(test)]
 pub(crate) mod tests_support {

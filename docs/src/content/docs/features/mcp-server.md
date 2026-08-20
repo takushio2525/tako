@@ -17,9 +17,9 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 
 初回に `tako setup`（または `tako setup-mcp`）で stdio ブリッジを登録すれば、以降はどのプロジェクトでも設定不要です。
 
-## 50+ の MCP ツール
+## 128 個の MCP ツール
 
-tako は 50 以上の MCP ツールを公開しています。全リストは [MCP ツール一覧](/guides/mcp-tools/)にあります。主なカテゴリ:
+tako は **128 個**の MCP ツールを公開しています。全リストは [MCP ツール一覧](/guides/mcp-tools/)にあります。主なカテゴリ:
 
 ### レイアウト操作
 - `tako_split_pane` — ペイン分割（方向・比率・コマンド指定）
@@ -49,11 +49,16 @@ tako は 50 以上の MCP ツールを公開しています。全リストは [M
 - `tako_tmux_list` / `tako_tmux_kill` / `tako_tmux_open` / `tako_tmux_cleanup` など
 
 ### git 連携
-- `tako_git_log` / `tako_git_diff`
+- 読む: `tako_git_log` / `tako_git_diff` / `tako_git_show`
+- 変える: `tako_git_stage` / `tako_git_commit` / `tako_git_push` / `tako_git_checkout` / `tako_git_merge` など計 14 ツール
 
 ### オーケストレーター
-- `tako_orchestrator_spawn` / `tako_orchestrator_run` — worker の起動・ワンショット実行
-- `tako_orchestrator_worker_status` / `tako_orchestrator_projects` / `tako_orchestrator_profiles`
+- `tako_orchestrator_spawn` / `tako_orchestrator_run` — worker の起動・非同期実行
+- `tako_orchestrator_worker_status` / `tako_orchestrator_workers` / `tako_orchestrator_report` — 監視と報告の回収
+- `tako_orchestrator_projects` / `tako_orchestrator_profiles` / `tako_orchestrator_accounts` — 設定
+
+### 表示・設定
+- `tako_theme` / `tako_lang` / `tako_settings` / `tako_autosuggest` — 人が設定画面でできることは AI からも同じようにできます
 
 ## 設計思想: AI フルコントロール
 

@@ -70,11 +70,31 @@ impl OscScanner {
         Self::default()
     }
 
-    /// バイト列を走査し、完結した対象 OSC をイベントとして返す
+    /// バイト列を走査し、完結した対象 OSC をイベントとして返す。
+    ///
+    /// #816: 実際に流れるバイトはほぼ全部 `Ground`（シーケンスの外）にあり、そこでの
+    /// 仕事は「ESC か否か」だけ。1 バイトずつ [`Self::step`] を呼ぶと状態 match と
+    /// 呼び出しのぶんを毎バイト払うので、`Ground` のあいだは次の ESC まで飛ばす。
+    /// `Ground` の非 ESC バイトは状態も出力も一切変えないので結果は同じ
+    /// （同一性は `groundの読み飛ばしが1バイト送りと同じ結果になる` が固定する）。
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut out = Vec::new();
-        for &b in bytes {
-            self.step(b, &mut out);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            if self.state == ScanState::Ground {
+                // memchr クレートは足さない: この読み取り粒度では SIMD 差が
+                // OSC tap 全体に対して誤差で、依存を増やす理由にならない
+                match rest.iter().position(|&b| b == 0x1b) {
+                    Some(i) => {
+                        self.state = ScanState::Esc;
+                        rest = &rest[i + 1..];
+                    }
+                    None => break,
+                }
+            } else {
+                self.step(rest[0], &mut out);
+                rest = &rest[1..];
+            }
         }
         out
     }
@@ -388,6 +408,43 @@ mod tests {
         let mut s = OscScanner::new();
         let events = s.scan(b"\x1b]133;A\x1b]7;file:///tmp\x07");
         assert_eq!(events, vec![OscEvent::CwdChanged(PathBuf::from("/tmp"))]);
+    }
+
+    /// #816 の `Ground` 読み飛ばしは「1 バイトずつ送る」のと完全に同じ結果でなければ
+    /// ならない。ESC / OSC / 終端 / 中断 / 上限超過が混ざった列で突き合わせる
+    #[test]
+    fn groundの読み飛ばしが1バイト送りと同じ結果になる() {
+        let mut long = b"\x1b]133;".to_vec();
+        long.extend(std::iter::repeat_n(b'x', MAX_OSC_LEN + 5));
+        long.push(0x07);
+        let corpus: Vec<Vec<u8>> = vec![
+            b"plain text without any escape".to_vec(),
+            b"\x1b]7;file:///tmp\x07tail".to_vec(),
+            b"\x1b\x1b\x1b]133;A\x07".to_vec(),
+            b"\x1b]133;A\x1b]7;file:///a\x07".to_vec(),
+            b"\x1b[31mred\x1b[0m\x1b]0;title\x07".to_vec(),
+            b"\x1b]133;D;0;aid=3\x1b\\".to_vec(),
+            long,
+            // 全角・非 ASCII バイトが Ground に混ざっても取りこぼさない
+            "日本語 \u{1b}]7;file:///%E4%BD%9C\u{7}".as_bytes().to_vec(),
+        ];
+        for chunk in &corpus {
+            let mut fast = OscScanner::new();
+            let mut slow = OscScanner::new();
+            let got = fast.scan(chunk);
+            let want: Vec<OscEvent> = chunk.iter().flat_map(|b| slow.scan(&[*b])).collect();
+            assert_eq!(got, want, "chunk={chunk:?}");
+        }
+        // 連続投入（スキャナ状態を持ち越す）でも一致する
+        let mut fast = OscScanner::new();
+        let mut slow = OscScanner::new();
+        let mut got = Vec::new();
+        let mut want = Vec::new();
+        for chunk in &corpus {
+            got.extend(fast.scan(chunk));
+            want.extend(chunk.iter().flat_map(|b| slow.scan(&[*b])));
+        }
+        assert_eq!(got, want);
     }
 
     #[test]

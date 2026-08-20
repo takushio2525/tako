@@ -13,7 +13,8 @@
 //! - サーバーは専用 conf（`<data_dir>/tmux-backend.conf`）で起動し、ユーザーの
 //!   `~/.tmux.conf` は読まない（status バー・prefix キー等が見えない裏方に徹する）
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
@@ -107,16 +108,43 @@ set -gq copy-mode-position-format ''
 ";
 
 /// 専用 conf をデータディレクトリへ書き出す（毎起動上書き = バージョン更新追従）。
-/// 書けない環境では `/dev/null` を返し「ユーザー conf を読まない」ことだけは維持する
+/// 書けない環境では `/dev/null` を返し「ユーザー conf を読まない」ことだけは維持する。
+///
+/// **一時ファイル → rename で差し替える**（#625）。`wrap_options` はペインを spawn する
+/// たびにここを通るので、複数ペインを同時に立てると「書き手が truncate している最中の
+/// conf」を、別ペインが起動した tmux サーバーが `-f` で読みうる。読ませてしまうと
+/// サーバーは既定設定（status on / mouse off / extended-keys off / prefix C-b）で
+/// 立ち上がり、ステータスバーが出る・ホイールが素通しされない・Shift+Enter が
+/// 素の Enter に劣化する（#28 / #167 と同じ症状クラス）。rename は同一ディレクトリ内で
+/// 原子的なので、読み手は常に完全な conf を見る
 fn ensure_conf() -> PathBuf {
-    fn write_conf() -> Option<PathBuf> {
-        let dir = data_dir()?;
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("tmux-backend.conf");
-        std::fs::write(&path, BACKEND_CONF).ok()?;
-        Some(path)
+    data_dir()
+        .and_then(|dir| write_conf_in(&dir).ok())
+        .unwrap_or_else(|| PathBuf::from("/dev/null"))
+}
+
+/// conf を `dir` へ原子的に置き、そのパスを返す
+fn write_conf_in(dir: &Path) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("tmux-backend.conf");
+    // tmp 名は **書き込み 1 回ごとに** 固有にする。プロセス固有までしか分けないと、
+    // 同時に走った書き手同士が同じ tmp を奪い合い（A が truncate 中に B が rename）、
+    // 途中状態がそのまま原子的に差し替わってしまう（この修正を作る過程で実測）。
+    // data_dir はプライマリ / セカンダリでも共有されうるので pid も併記する
+    let tmp = dir.join(format!(
+        "tmux-backend.conf.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, BACKEND_CONF)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    write_conf().unwrap_or_else(|| PathBuf::from("/dev/null"))
+    Ok(path)
 }
 
 /// 稼働中のバックエンドサーバーへ最新 conf を再適用する。
@@ -434,22 +462,61 @@ impl TmuxTestGuard {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 return;
             };
-            let pid = std::process::id().to_string();
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                let base = name.trim_end_matches('=');
-                if !base.starts_with("tako-coretest-") {
-                    continue;
+                if is_stale_socket(name, process_alive) {
+                    kill_server(name.trim_end_matches('='));
                 }
-                // 自プロセスのソケットはスキップ（テスト前半で作って後半で使う場合）
-                if base.contains(&pid) {
-                    continue;
-                }
-                kill_server(base);
             }
         });
     }
+}
+
+/// テストソケット名（`tako-coretest-<用途>-<pid>`）の所有プロセス ID
+#[cfg(test)]
+fn socket_owner_pid(name: &str) -> Option<u32> {
+    name.rsplit('-').next()?.parse().ok()
+}
+
+/// 掃除してよい残骸ソケットか。
+///
+/// **「自分の pid を含まない = 残骸」で判定してはいけない**（#625 の隔離破れ）。
+/// 別ブランチの worker が同時に `cargo test` を回すと、後から起動した側の掃除が
+/// 先行プロセスの**生きている**サーバーを kill + ソケット削除してしまい、
+/// 相手側の tmux e2e が `[server exited]` で総崩れになる（1 掃除で 5 本同時に
+/// 落ちるのを実測）。所有プロセスが生きていれば残骸ではない。
+///
+/// 命名規約から外れて所有者を特定できない名前は**触らない**（安全側に倒す）
+#[cfg(test)]
+fn is_stale_socket(name: &str, is_alive: impl Fn(u32) -> bool) -> bool {
+    // tmux は /tmp → /private/tmp の解決でソケット名末尾に `=` を付けることがある
+    let base = name.trim_end_matches('=');
+    if !base.starts_with("tako-coretest-") {
+        return false;
+    }
+    socket_owner_pid(base).is_some_and(|pid| !is_alive(pid))
+}
+
+/// プロセスが生きているか。`kill(pid, 0)` はシグナルを送らず存在と権限だけを見る
+/// （EPERM = 別ユーザーの生存プロセス）
+#[cfg(all(test, unix))]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        // 0 はプロセスグループ指定になるため所有者判定には使わない（= 触らない）
+        return true;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows には tmux ソケットのレイアウトが無く `cleanup_stale_sockets` は
+/// `socket_dir()` が None を返して早期 return するが、コンパイルは通す必要がある
+#[cfg(all(test, windows))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -459,6 +526,51 @@ impl Drop for TmuxTestGuard {
             kill_server(socket);
         }
     }
+}
+
+/// テスト用: ペインが alt screen（`\033[?1049h`）へ切り替わり終えるのを待つ。
+/// 切り替わったら `Some(true)`、10 秒待っても切り替わらなければ最後に観測した値、
+/// ペインごと消えていれば `None`。
+///
+/// **「履歴ゼロ」を切替の証跡に使ってはいけない**（#625 のフレークの根因）。
+/// 内側が非対話シェル（`sh -c '…'`）のペインはプロンプトを出さないので
+/// スクロールバックが spawn 直後から 0 行であり、`history_size == 0` は
+/// 切替を待たずに真になる。切替前にキーを書き込むと、その入力は**通常画面**へ
+/// エコーされ、直後の `?1049h` が alt screen を消去するので画面から消える
+/// （カーソル桁だけが進んだ状態が残る）。並列負荷でシェルの起動が遅れると
+/// この窓が開き、テストが確率的に落ちていた。
+/// tmux 自身の `#{alternate_on}` が切替の唯一の直接的な証跡になる
+#[cfg(all(test, unix))]
+pub(crate) fn wait_alt_screen(socket: &str, session: &str) -> Option<bool> {
+    let mut last = None;
+    for _ in 0..100 {
+        last = alternate_on(socket, session);
+        if last == Some(true) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    last
+}
+
+/// アクティブペインが alt screen 表示中か。ペイン不在・tmux 不在では None
+#[cfg(all(test, unix))]
+fn alternate_on(socket: &str, session: &str) -> Option<bool> {
+    let output = crate::tmux::run_tmux(
+        Some(socket),
+        &[
+            "list-panes",
+            "-t",
+            &format!("={session}:"),
+            "-F",
+            "#{pane_active}\t#{alternate_on}",
+        ],
+    )
+    .ok()?;
+    output.lines().find_map(|line| {
+        let mut f = line.split('\t');
+        (f.next()? == "1").then(|| f.next() == Some("1"))
+    })
 }
 
 #[cfg(test)]
@@ -484,6 +596,98 @@ mod tests {
             }),
             "npm run 'dev server'"
         );
+    }
+
+    /// conf の差し替え中でも、読み手は「完全な conf」しか観測しない（#625）。
+    /// `wrap_options` はペイン spawn のたびに conf を書き直すので、複数ペインを同時に
+    /// 立てると別ペインが起動する tmux サーバーの `-f` 読み取りと重なる。途中状態を
+    /// 読ませると既定設定のサーバーが立ち、ステータスバー表示・ホイール素通し不可・
+    /// Shift+Enter 劣化を起こす
+    #[test]
+    fn conf差し替え中も読み手は完全な内容しか見ない() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("tako-conf-625-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = write_conf_in(&dir).expect("conf を置ける");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let partial = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let (d, s) = (dir.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    let _ = write_conf_in(&d);
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let (p, s, bad, n) = (path.clone(), stop.clone(), partial.clone(), reads.clone());
+            threads.push(std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    if let Ok(body) = std::fs::read_to_string(&p) {
+                        n.fetch_add(1, Ordering::Relaxed);
+                        if body != BACKEND_CONF {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().expect("スレッドが panic しない");
+        }
+        let (n, bad) = (
+            reads.load(Ordering::Relaxed),
+            partial.load(Ordering::Relaxed),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(n > 100, "読み取り回数が少なすぎて検出力が無い: {n}");
+        assert_eq!(bad, 0, "{n} 回中 {bad} 回、不完全な conf を観測した");
+    }
+
+    /// 残骸ソケットの判定（#625）。
+    /// 「自分の pid を含まない = 残骸」だと、別 worker の `cargo test` が同時に走ったとき
+    /// 相手の**生きている** tmux サーバーを kill してしまい、tmux e2e が総崩れになる
+    #[test]
+    fn 生きている別プロセスのテストソケットは残骸ではない() {
+        // pid 4242 だけが生きている世界
+        let alive = |pid: u32| pid == 4242;
+        // 別プロセス（生存）のソケット = 触らない ← #625 の回帰
+        assert!(!is_stale_socket("tako-coretest-scr0-4242", alive));
+        // macOS の /private/tmp 解決で末尾に `=` が付いた形も同じ判定
+        assert!(!is_stale_socket("tako-coretest-scr0-4242=", alive));
+        // 所有プロセスが died → 残骸なので掃除してよい
+        assert!(is_stale_socket("tako-coretest-scr0-999999", alive));
+        assert!(is_stale_socket("tako-coretest-nestw-in-999999", alive));
+        // テスト用でないソケット（本番の tako バックエンド等）は対象外
+        assert!(!is_stale_socket("tako", |_| false));
+        assert!(!is_stale_socket("tako-999999", |_| false));
+        // 命名規約から外れて所有者を特定できないものは安全側に倒して触らない
+        assert!(!is_stale_socket("tako-coretest-nopid", |_| false));
+    }
+
+    #[test]
+    fn テストソケット名から所有pidを取れる() {
+        assert_eq!(socket_owner_pid("tako-coretest-scr0-1234"), Some(1234));
+        assert_eq!(socket_owner_pid("tako-coretest-nestw-in-77"), Some(77));
+        assert_eq!(socket_owner_pid("tako-coretest-nopid"), None);
+    }
+
+    /// 自プロセスは当然「生きている」= 自分のソケットを掃除しない
+    #[test]
+    #[cfg(unix)]
+    fn 自プロセスは生存判定される() {
+        assert!(process_alive(std::process::id()));
+        assert!(!is_stale_socket(
+            &format!("tako-coretest-scr0-{}", std::process::id()),
+            process_alive
+        ));
     }
 
     #[test]
@@ -709,9 +913,12 @@ mod tests {
         let (second, _rx2) =
             crate::TerminalSession::spawn(80, 24, wrap_options(base, &socket, session))
                 .expect("再 attach の tmux クライアントを spawn できる");
+        // 画面を落とす: 失敗が「復元できなかった」のか「サーバーごと消えた
+        // （= 外から kill された）」のかをログだけで切り分けられるようにする
         assert!(
             wait_for(&second, "TAKO-PERSIST-OK"),
-            "再 attach で画面内容が復元される"
+            "再 attach で画面内容が復元される。画面: {:?}",
+            second.visible_lines().join("\n")
         );
     }
 
@@ -1456,6 +1663,14 @@ mod tests {
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-alt"))
                 .expect("tmux クライアントを spawn できる");
+        // 前提（alt screen ペインであること）の成立を待つ。これが無いと通常画面のまま
+        // ホイールを送って「矢印に化けない」を見てしまい、検出力が落ちる（#625）
+        assert_eq!(
+            wait_alt_screen(&socket, "tako-e2e-alt"),
+            Some(true),
+            "alt-screen 切替が完了しない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
         // 外側のマウスモード（バックエンドの mouse on）を待つ
         for _ in 0..100 {
             if session.mouse_reporting() {

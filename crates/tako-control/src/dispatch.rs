@@ -609,7 +609,11 @@ fn dispatch_inner(
             Ok(json!({ "pane": new_id.as_u64() }))
         }
 
-        Request::Close { pane, force } => {
+        Request::Close {
+            pane,
+            force,
+            caller_role,
+        } => {
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
 
             // worker 保護: orchestrator-worker role のペインが busy なら拒否
@@ -656,7 +660,10 @@ fn dispatch_inner(
                 }
                 Err(e) => return Err(op_err(e)),
             }
-            host.detach_session(target);
+            // #566: 発生源（CLI / MCP + 呼び出し元 role）をペインログへ残す。
+            // dispatch 経由の close は確認を挟まない（AI フルコントロール維持）ぶん、
+            // 「誰が閉じたか」を事後に追える形にしておく
+            host.detach_session(target, close_origin_of(origin), caller_role.as_deref());
             // #390: worker レジストリの該当エントリを closed へ（worker でなければ no-op。
             // PTY 死亡（Exited）はここを通らないため「pane が消えても worker は生存」の
             // 追跡は維持される）
@@ -719,6 +726,10 @@ fn dispatch_inner(
 
         Request::List => Ok(list_json(host)),
 
+        Request::ResolvePane { pane, caller_pid } => {
+            Ok(resolve_pane_lenient_json(host, pane, caller_pid))
+        }
+
         Request::Send {
             pane,
             text,
@@ -742,6 +753,18 @@ fn dispatch_inner(
                         None => Err(e),
                     },
                 };
+            }
+
+            // #748: 選択肢ダイアログ表示中の送信を**入口で断る**。
+            // ダイアログは入力欄を奪っているので、テキストを書けば 1 文字ずつが
+            // ダイアログのキー操作として食われ（数字なら選択が確定してしまう）、
+            // Enter は「今ハイライトされている選択肢の確定」になる。
+            // 実際に観測されたのは limit ダイアログの選択肢テキストが入力欄に
+            // 残ったまま混線する状態（#748 の観測 1 / 4）。
+            // 正しい操作は respond（番号 / ラベル指定 + 実在再検証）なので、
+            // 選択肢一覧つきの明示エラーでそちらへ誘導する
+            if let Some(err) = dialog_blocks_send(host, pane, tmux_session.as_deref(), &text) {
+                return Err(err);
             }
 
             // pane ID で解決を試み、失敗時に tmux session フォールバック
@@ -883,6 +906,18 @@ fn dispatch_inner(
                 }
             };
 
+            // #572: claude のメッセージキューに未送信の指示が残っているか
+            // （画面を切り詰める前の全行で判定する）
+            let queued_pending = crate::claude_tui::queued_messages_pending(&all);
+
+            // #748: 選択肢ダイアログが実在するか（画面を切り詰める前の全行で判定）。
+            // ダイアログの選択カーソル（`❯ 1. Stop and wait for limit to reset`）は
+            // 入力欄と同じ字面なので、旧実装は `input_status.style=user` として
+            // 「入力欄にテキストが残っている」と報告していた（#748 の観測 1）。
+            // ダイアログ中は**入力欄が存在しない**ので input_status は null にし、
+            // 代わりに構造化した選択肢を返す
+            let dialog = crate::claude_tui::detect_choice_dialog(&all);
+
             while all.last().is_some_and(|l| l.is_empty()) {
                 all.pop();
             }
@@ -891,7 +926,7 @@ fn dispatch_inner(
                     all.drain(..all.len() - n);
                 }
             }
-            let input_json = input_status.map(|s| {
+            let input_json = input_status.filter(|_| dialog.is_none()).map(|s| {
                 json!({
                     "line": s.line,
                     "text": s.text,
@@ -901,9 +936,23 @@ fn dispatch_inner(
                         tako_core::InputStyle::Mixed => "mixed",
                         tako_core::InputStyle::None => "none",
                     },
+                    // #572: true = busy 中に打たれた指示が claude のキューにあり未送信。
+                    // 入力欄自体は空なので Enter 単独送達では発火しない
+                    "queued_messages_pending": queued_pending,
                 })
             });
-            Ok(json!({ "pane": pane_id, "text": all.join("\n"), "input_status": input_json }))
+            Ok(json!({
+                "pane": pane_id,
+                "text": all.join("\n"),
+                "input_status": input_json,
+                "queued_messages_pending": queued_pending,
+                // #748: 選択肢ダイアログ（null = ダイアログなし）。
+                // 非 null のときは入力欄が無いので send ではなく respond で応答する
+                "choice_dialog": dialog.as_ref().map(|d| d.to_json()),
+                // #813: 利用上限後の自動復帰。enabled = ペインのオプトイン、
+                // state = いま上限で止まっているか・いつ復帰するか（GUI 稼働時のみ）
+                "limit_resume": limit_resume_entry(host, PaneId::from_raw(pane_id)),
+            }))
         }
 
         Request::Scroll { pane, to, delta } => {
@@ -1275,7 +1324,50 @@ fn dispatch_inner(
             )
         }
 
-        Request::TabNew { title, focus } => {
+        // #552 案 4: GUI の「この名前を固定」（自動命名直後に出るピン印）と 1:1
+        Request::TabPinTitle { pane, tab, pinned } => {
+            let tab_id = match tab {
+                Some(raw) => find_tab(host.workspace(), raw)?,
+                None => resolve_pane(host.workspace(), pane)?.0,
+            };
+            let tab = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .expect("find_tab / resolve_pane で存在確認済み");
+            match pinned {
+                Some(true) => {
+                    tab.pin_title();
+                }
+                Some(false) => tab.clear_manual_title(),
+                None => {}
+            }
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "title": tab.title(),
+                "source": tab.title_source().as_str(),
+                "pinned": tab.title_source() == tako_core::TitleSource::Manual,
+            }))
+        }
+
+        Request::TabNew { title, focus, cwd } => {
+            // cwd はシェルを起動する前に検査する（存在しない場所で起動すると
+            // シェルの既定へ黙って落ちるので、頼まれた場所と違う場所が開く）
+            let cwd = match cwd {
+                Some(raw) => {
+                    let path = std::path::PathBuf::from(&raw);
+                    let path = path.canonicalize().map_err(|e| {
+                        DispatchError::Operation(format!("フォルダを開けない（{raw}: {e}）"))
+                    })?;
+                    if !path.is_dir() {
+                        return Err(DispatchError::Operation(format!(
+                            "フォルダではない: {}",
+                            path.display()
+                        )));
+                    }
+                    Some(path)
+                }
+                None => None,
+            };
             let prev_active = host.workspace().active_tab_id();
             let pane = Pane::new(origin);
             let pane_id = pane.id();
@@ -1293,8 +1385,19 @@ fn dispatch_inner(
             if !focus.unwrap_or(false) {
                 let _ = host.workspace_mut().activate_tab(prev_active);
             }
-            host.attach_session(pane_id, SpawnOptions::default());
-            Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
+            let cwd_json = cwd.as_ref().map(|p| p.display().to_string());
+            host.attach_session(
+                pane_id,
+                SpawnOptions {
+                    cwd,
+                    ..SpawnOptions::default()
+                },
+            );
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "pane": pane_id.as_u64(),
+                "cwd": cwd_json,
+            }))
         }
 
         Request::TabSelect { tab } => {
@@ -1499,12 +1602,73 @@ fn dispatch_inner(
             Ok(json!({ "enabled": host.port_detect_enabled() }))
         }
 
+        Request::Autosuggest { enabled, hint, tab } => {
+            if let Some(enabled) = enabled {
+                host.set_autosuggest(enabled);
+            }
+            if let Some(hint) = hint {
+                host.set_autosuggest_hint(hint);
+            }
+            if let Some(tab) = tab {
+                host.set_autosuggest_tab(tab);
+            }
+            let enabled = host.autosuggest_enabled();
+            let hint = host.autosuggest_hint_enabled();
+            let tab = host.autosuggest_tab_enabled();
+            // 残り回数は zsh 側がコマンドラインごとに 1 減らす。恒久 OFF と読めない環境は null
+            let hint_remaining = tako_core::shell_integration::integration_root()
+                .and_then(|r| tako_core::shell_integration::autosuggest_hint_state_in(&r));
+            Ok(json!({
+                "enabled": enabled,
+                // #614: 確定キーの案内と、確定に使えるキー
+                "hint": hint,
+                "hint_remaining": hint_remaining,
+                "tab_accept": tab,
+                "accept_keys": if tab { vec!["Right", "Tab"] } else { vec!["Right"] },
+                // 何が同梱されているか / どのシェルに効くかを AI にも見せる
+                "shell": "zsh",
+                "provider": "zsh-autosuggestions",
+                "version": tako_core::shell_integration::AUTOSUGGEST_VERSION,
+                "applies_to": "既存ペインを含む tako 内の zsh（次のプロンプトから反映）",
+                "note": "ユーザーが自前で zsh-autosuggestions を導入しているペインでは \
+                    tako は注入せず、この設定も効かない（二重注入ガード）。\
+                    Tab 確定が働くのはゴースト表示中かつカーソルが行末のときだけで、\
+                    それ以外の Tab は従来の補完のまま（tab=false にすると常に補完）",
+            }))
+        }
+
         Request::ConfirmClose { enabled } => {
             if let Some(val) = enabled {
                 host.set_confirm_close(val);
                 let _ = crate::setup::mutate_config(|c| c.confirm_close = val);
             }
             Ok(json!({ "enabled": host.confirm_close_enabled() }))
+        }
+
+        Request::LimitResume { pane, enabled, all } => {
+            // 一覧（#813。有効なペインがどれかを 1 回で把握する）
+            if all.unwrap_or(false) {
+                if enabled.is_some() {
+                    return Err(DispatchError::InvalidParams(
+                        "all と enabled は併用できない（一覧か設定のどちらか）".into(),
+                    ));
+                }
+                return Ok(json!({ "panes": limit_resume_panes(host) }));
+            }
+            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            if let Some(val) = enabled {
+                tree_mut(host.workspace_mut(), tab)
+                    .get_mut(target)
+                    .expect("resolve_pane で存在確認済み")
+                    .set_limit_autoresume(val);
+                // 有効・無効はペイン属性なので layout.json の保存で永続化される
+                // （保存は UI 層が dispatch 後に回す。CLI / MCP / 右クリックで同じ経路）
+                crate::diag::persist_log(&format!(
+                    "[limit-autoresume] pane={} enabled={val}",
+                    target.as_u64()
+                ));
+            }
+            Ok(limit_resume_entry(host, target))
         }
 
         Request::Persist { enabled } => {
@@ -1541,6 +1705,7 @@ fn dispatch_inner(
             view,
             filetree,
             sidebar_width,
+            show_hidden,
         } => {
             if let Some(w) = width {
                 if !w.is_finite() || w <= 0.0 {
@@ -1561,9 +1726,20 @@ fn dispatch_inner(
                 host.set_filetree(filetree);
             }
             if let Some(sw) = sidebar_width {
+                // 上限・下限のクランプは host 側（`tako_core::sidebar` の 1 実装 =
+                // GUI のドラッグ経路と同じ規則。#789）
                 host.set_sidebar_width(sw);
+                // #789: 永続化するのは要求値ではなく**実際に適用された幅**
+                // （旧実装は要求値を書いていたので、クランプ後の画面の幅と
+                // settings.json の値が食い違っていた）
                 let mut settings = crate::settings::load();
-                settings.sidebar_width = sw as u32;
+                settings.sidebar_width = host.sidebar_width() as u32;
+                let _ = crate::settings::save(&settings);
+            }
+            if let Some(sh) = show_hidden {
+                host.set_filetree_show_hidden(sh);
+                let mut settings = crate::settings::load();
+                settings.show_hidden_files = sh;
                 let _ = crate::settings::save(&settings);
             }
             let (visible, width, view) = host.panel_state();
@@ -1572,7 +1748,12 @@ fn dispatch_inner(
                 "width": width,
                 "view": view.as_str(),
                 "filetree": host.filetree_visible(),
+                // #789: 画面に出ている実効幅と、その時点の上限（ウィンドウ幅の 50%。
+                // GUI のドラッグと同じ規則。ウィンドウ未描画なら null）
                 "sidebar_width": host.sidebar_width(),
+                "sidebar_width_max": host.sidebar_width_max(),
+                "sidebar_width_min": tako_core::sidebar::MIN_WIDTH,
+                "show_hidden": host.filetree_show_hidden(),
             }))
         }
 
@@ -1582,7 +1763,14 @@ fn dispatch_inner(
             mode,
             direction,
             focus,
+            new_tab,
         } => {
+            if new_tab && direction.is_some() {
+                return Err(DispatchError::Operation(
+                    "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）"
+                        .into(),
+                ));
+            }
             let (tab, target) = match pane {
                 Some(_) => resolve_pane(host.workspace(), pane)?,
                 None => {
@@ -1631,27 +1819,49 @@ fn dispatch_inner(
                     }
                     _ => PreviewModeWire::Code,
                 });
-            // 表示先の解決: direction 指定（FR-3.11 = D&D のドロップ位置）なら再利用せず
-            // 必ずその方向へ分割。省略時は 対象自身がプレビュー > 同タブの既存プレビュー
-            // （再利用）> 右分割で新設（ターミナルセッションは起動しない = attach なし）
-            let (view_pane, created) = if let Some(direction) = direction {
+            // 表示先の解決: new_tab 指定（FR-3.22 = Finder の「このアプリケーションで
+            // 開く」）なら新しいタブ 1 枚をそのファイル専用にする。direction 指定
+            // （FR-3.11 = D&D のドロップ位置）なら再利用せず必ずその方向へ分割。
+            // どちらも省略時は 対象自身がプレビュー > 同タブの既存プレビュー（再利用）
+            // > 右分割で新設。いずれの経路でもターミナルセッションは起動しない
+            let (tab, view_pane, created) = if new_tab {
+                let prev_active = host.workspace().active_tab_id();
+                let new_pane = Pane::new(origin);
+                let new_id = new_pane.id();
+                let title = resolved
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| resolved.display().to_string());
+                let tab_id = host.workspace_mut().create_tab(title, new_pane);
+                // ファイル名は「このタブが何か」そのものなので、自動リネーム（FR-2.12）に
+                // 奪わせない。プレビュー専用タブには命名材料になる端末出力も無い
+                if let Some(t) = host.workspace_mut().get_tab_mut(tab_id) {
+                    let title = t.title().to_string();
+                    t.set_title_manual(title);
+                }
+                // CLI/MCP 経由のデフォルトはアクティブタブを維持（ユーザーの入力を奪わない）
+                if !focus.unwrap_or(false) {
+                    let _ = host.workspace_mut().activate_tab(prev_active);
+                }
+                (tab_id, new_id, true)
+            } else if let Some(direction) = direction {
                 let new_pane = Pane::new(origin);
                 let new_id = new_pane.id();
                 tree_mut(host.workspace_mut(), tab)
                     .split_with_ratio(target, direction.to_core(), 0.5, new_pane)
                     .map_err(op_err)?;
-                (new_id, true)
+                (tab, new_id, true)
             } else if host.preview_state(target).is_some() {
-                (target, false)
+                (tab, target, false)
             } else if let Some(existing) = host.preview_pane_of_tab(tab) {
-                (existing, false)
+                (tab, existing, false)
             } else {
                 let new_pane = Pane::new(origin);
                 let new_id = new_pane.id();
                 tree_mut(host.workspace_mut(), tab)
                     .split_with_ratio(target, SplitDirection::Right, 0.5, new_pane)
                     .map_err(op_err)?;
-                (new_id, true)
+                (tab, new_id, true)
             };
             let path_str = resolved.display().to_string();
             host.set_preview(view_pane, &path_str, mode)
@@ -1663,6 +1873,7 @@ fn dispatch_inner(
                     .map_err(op_err)?;
             }
             Ok(json!({
+                "tab": tab.as_u64(),
                 "pane": view_pane.as_u64(),
                 "path": path_str,
                 "mode": mode.as_str(),
@@ -1754,21 +1965,54 @@ fn dispatch_inner(
         }
         Request::PreviewLinkList { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
+            // Markdown（#680）と PDF（#271）でリンクの持ち方が違うので、表示中の
+            // 内容に合わせて一覧を出し分ける（応答の `kind` でどちらか分かる）
+            if let Some(links) = host.preview_md_links(target) {
+                return Ok(json!({
+                    "pane": target.as_u64(),
+                    "kind": "markdown",
+                    "links": links,
+                }));
+            }
             let links = host.preview_pdf_links(target).ok_or_else(|| {
                 DispatchError::Operation(format!(
-                    "PDF プレビューペインではない: {}",
+                    "Markdown・PDF プレビューペインではない: {}",
                     target.as_u64()
                 ))
             })?;
             Ok(json!({
                 "pane": target.as_u64(),
+                "kind": "pdf",
                 "links": links.links,
             }))
         }
         Request::PreviewFollowLink { pane, index } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = if host.preview_md_links(target).is_some() {
+                host.follow_preview_md_link(target, index)
+            } else {
+                host.follow_preview_pdf_link(target, index)
+            }
+            .map_err(DispatchError::Operation)?;
+            Ok(result)
+        }
+        Request::PreviewCopyCode { pane, index } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
             let result = host
-                .follow_preview_pdf_link(target, index)
+                .copy_preview_code_block(target, index)
+                .map_err(DispatchError::Operation)?;
+            Ok(result)
+        }
+        Request::ChatCopy {
+            pane,
+            list,
+            message,
+            code,
+            markdown,
+        } => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let result = host
+                .chat_copy(target, list, message, code, markdown)
                 .map_err(DispatchError::Operation)?;
             Ok(result)
         }
@@ -2321,7 +2565,7 @@ fn dispatch_inner(
             if host.workspace_mut().remove_shelved(pane_id).is_none() {
                 return Err(DispatchError::PaneNotFound(pane));
             }
-            host.detach_session(pane_id);
+            host.detach_session(pane_id, close_origin_of(origin), None);
             Ok(json!({ "killed": pane }))
         }
 
@@ -2403,6 +2647,10 @@ fn dispatch_inner(
         Request::OrchestratorProfiles {
             action,
             name,
+            kind,
+            from,
+            projects,
+            clear_projects,
             master_agent,
             clear_master_agent,
             model,
@@ -2428,9 +2676,17 @@ fn dispatch_inner(
             clear_master_account,
             worker_account,
             clear_worker_account,
+            ctx_threshold,
+            clear_ctx_threshold,
+            auto_handoff,
+            clear_auto_handoff,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
+            kind,
+            from,
+            projects,
+            clear_projects,
             master_agent,
             clear_master_agent,
             model,
@@ -2456,6 +2712,10 @@ fn dispatch_inner(
             clear_master_account,
             worker_account,
             clear_worker_account,
+            ctx_threshold,
+            clear_ctx_threshold,
+            auto_handoff,
+            clear_auto_handoff,
         }),
 
         // #504: アカウントレジストリの CRUD
@@ -2473,6 +2733,7 @@ fn dispatch_inner(
             pane,
             tab,
         } => dispatch_orchestrator_accounts(
+<<<<<<< HEAD
             Some(host),
             origin,
             AccountParams {
@@ -2489,6 +2750,60 @@ fn dispatch_inner(
                 pane,
                 tab,
             },
+||||||| db83389
+            &action,
+            name.as_deref(),
+            config_dir.as_deref(),
+            description.as_deref(),
+            default_model.as_deref(),
+            default_effort.as_deref(),
+=======
+            &action,
+            name.as_deref(),
+            config_dir.as_deref(),
+            inherit,
+            description.as_deref(),
+            default_model.as_deref(),
+            default_effort.as_deref(),
+>>>>>>> origin/main
+        ),
+
+        // #666: AI コマンド提案カード
+        Request::ShowCommand {
+            action,
+            commands,
+            label,
+            pane,
+            card,
+            index,
+            focus,
+        } => dispatch_show_command(
+            host,
+            origin,
+            action.as_deref().unwrap_or("show"),
+            &commands,
+            label.as_deref(),
+            pane,
+            card,
+            index,
+            focus,
+        ),
+
+        // #513: AI 系設定の git ベース共有
+        Request::ConfigShare {
+            action,
+            target,
+            path,
+            remote,
+            message,
+            no_push,
+        } => dispatch_config_share(
+            action.as_deref().unwrap_or("status"),
+            target.as_deref(),
+            path.as_deref(),
+            remote.as_deref(),
+            message.as_deref(),
+            no_push,
         ),
 
         Request::OrchestratorLayout {
@@ -2596,6 +2911,7 @@ fn dispatch_inner(
             answers,
             dry_run,
             caller_role,
+<<<<<<< HEAD
         } => dispatch_orchestrator_respond(
             host,
             pane_id,
@@ -2609,6 +2925,12 @@ fn dispatch_inner(
         Request::OrchestratorDialog { pane_id, worker } => {
             let q = resolve_worker_query(pane_id, worker.as_deref(), None, None)?;
             dispatch_orchestrator_dialog(host, q)
+||||||| db83389
+        } => dispatch_orchestrator_respond(host, pane_id, &choice, caller_role.as_deref()),
+=======
+        } => {
+            dispatch_orchestrator_respond(host, pane_id, choice.as_deref(), caller_role.as_deref())
+>>>>>>> origin/main
         }
 
         // #364: worker の報告内容を scrollback + transcript から取得
@@ -2783,7 +3105,7 @@ fn dispatch_inner(
                         }
                         Err(e) => return Err(op_err(e)),
                     }
-                    host.detach_session(target);
+                    host.detach_session(target, close_origin_of(origin), None);
                     Ok(())
                 };
             match action.as_str() {
@@ -2873,7 +3195,12 @@ fn dispatch_inner(
                 )));
             }
             match action {
-                "status" => Ok(host.update_status()),
+                "status" => {
+                    let mut json = host.update_status();
+                    // #616: 専用画面が開いているか（設定画面の status と同じ役割）
+                    json["window_open"] = json!(host.update_window_open());
+                    Ok(json)
+                }
                 "check" => Ok(host.update_check(ch)),
                 "apply" if dry => host
                     .update_apply_dry_run(ch)
@@ -2881,8 +3208,38 @@ fn dispatch_inner(
                 "apply" => host.update_apply(ch).map_err(DispatchError::Operation),
                 "apply-zip" => host.update_apply_zip(ch).map_err(DispatchError::Operation),
                 "repair" => host.update_repair().map_err(DispatchError::Operation),
+                // #616: アップデート専用画面 + 上部通知カード
+                "open" => {
+                    host.open_update_window();
+                    Ok(json!({ "ok": true, "requested": true }))
+                }
+                "card" => Ok(host.update_card_status()),
+                "card-dismiss" | "card-show" => {
+                    let dismissed = action == "card-dismiss";
+                    // 閉じる対象のキーは「いま案内している内容」。set より先に読む
+                    let key = dismissed
+                        .then(|| {
+                            host.update_card_status()["key"]
+                                .as_str()
+                                .map(str::to_string)
+                        })
+                        .flatten();
+                    host.set_update_card_dismissed(dismissed);
+                    // ユーザー設定を汚さない（Theme / Welcome と同方針）
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.update_card_dismissed = key;
+                        if let Err(e) = crate::settings::save(&settings) {
+                            return Err(DispatchError::Operation(format!(
+                                "更新通知カードの状態を保存できない: {e}"
+                            )));
+                        }
+                    }
+                    Ok(host.update_card_status())
+                }
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / check / apply / apply-zip / repair のいずれか）"
+                    "不明な action: {other:?}（status / check / apply / apply-zip / repair / \
+                     open / card / card-dismiss / card-show のいずれか）"
                 ))),
             }
         }
@@ -3263,10 +3620,12 @@ fn dispatch_inner(
 
         // 対応マトリクスの参照（#515）。静的な表を引くだけなのでホスト状態に触れない。
         // CLI・MCP とも crate::platform::report を通るので表示が食い違わない
-        Request::Platform { platform, status } => {
-            crate::platform::report(platform.as_deref(), status.as_deref())
-                .map_err(DispatchError::InvalidParams)
-        }
+        Request::Platform {
+            platform,
+            status,
+            known_limitations,
+        } => crate::platform::report(platform.as_deref(), status.as_deref(), known_limitations)
+            .map_err(DispatchError::InvalidParams),
 
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
@@ -3309,6 +3668,85 @@ fn dispatch_inner(
                 }
                 other => Err(DispatchError::InvalidParams(format!(
                     "不明な action: {other:?}（status / set のいずれか）"
+                ))),
+            }
+        }
+
+        // UI 表示モード（#691 / #694）。テーマと同型の「状態確認 / 設定 / 反転」に、
+        // スターターの「コマンド入力へ」に相当するペイン単位の揮発解除を足したもの。
+        // GUI のトグル・カードも同じここを通るので UI と AI の操作が構造的に一致する
+        Request::UiMode { action, mode, pane } => {
+            use tako_core::ui_mode::UiMode;
+            let action = action.as_deref().unwrap_or("status");
+            let status_json = |host: &dyn ControlHost| {
+                let mut released: Vec<u64> = host
+                    .starter_released_panes()
+                    .iter()
+                    .map(|p| p.as_u64())
+                    .collect();
+                released.sort_unstable();
+                // #720: いま各ペインが何として描かれているか（terminal / starter / chat /
+                // preparing）。揮発なので永続化しない。「チャットがまだ出ない」理由
+                // （= 過渡期の preparing なのか、判定がターミナルに倒れたのか）が分かる
+                let mut displays: Vec<(u64, &str)> = host
+                    .pane_displays()
+                    .into_iter()
+                    .map(|(pane, display)| (pane.as_u64(), display.as_str()))
+                    .collect();
+                displays.sort_unstable();
+                let pane_display: serde_json::Map<String, Value> = displays
+                    .into_iter()
+                    .map(|(pane, display)| (pane.to_string(), serde_json::json!(display)))
+                    .collect();
+                serde_json::json!({
+                    "ui_mode": host.ui_mode().as_str(),
+                    "available": UiMode::VALUES,
+                    "released_panes": released,
+                    "pane_display": pane_display,
+                })
+            };
+            let apply = |host: &mut dyn ControlHost,
+                         next: UiMode|
+             -> Result<Value, DispatchError> {
+                // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。Theme と同方針）
+                if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                    let mut settings = crate::settings::load();
+                    settings.ui_mode = next.as_str().into();
+                    crate::settings::save(&settings)
+                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                }
+                host.set_ui_mode(next);
+                Ok(status_json(host))
+            };
+            match action {
+                "status" => Ok(status_json(host)),
+                "set" => {
+                    let raw = mode.as_deref().ok_or_else(|| {
+                        DispatchError::InvalidParams("set には mode が必要（terminal / gui）".into())
+                    })?;
+                    let next = UiMode::parse(raw).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!(
+                            "不明な mode: {raw:?}（terminal / gui のいずれか）"
+                        ))
+                    })?;
+                    apply(host, next)
+                }
+                "toggle" => {
+                    let next = host.ui_mode().toggled();
+                    apply(host, next)
+                }
+                // ペイン単位の揮発解除（スターターの「コマンド入力へ」と同経路）。
+                // 永続化しないので再起動すると GUI 表示に戻る（仕様 §1.3）
+                "release" | "restore" => {
+                    let (_, target) = resolve_pane(host.workspace(), pane)?;
+                    host.set_starter_released(target, action == "release");
+                    let mut json = status_json(host);
+                    json["pane"] = serde_json::json!(target.as_u64());
+                    json["released"] = serde_json::json!(action == "release");
+                    Ok(json)
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / set / toggle / release / restore のいずれか）"
                 ))),
             }
         }
@@ -3830,7 +4268,7 @@ fn dispatch_inner(
 
                     if should_close {
                         let _ = tree_mut(host.workspace_mut(), tab_id).close(target);
-                        host.detach_session(target);
+                        host.detach_session(target, close_origin_of(origin), None);
                     }
 
                     Ok(json!({
@@ -4123,10 +4561,250 @@ fn dispatch_inner(
                 ))),
             }
         }
+
+        Request::Welcome { action } => {
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => {}
+                "show" => host.set_welcome_banner_visible(true),
+                "dismiss" => {
+                    host.set_welcome_banner_visible(false);
+                    // ユーザー設定を汚さない（Theme / LimitService と同方針）
+                    let should_save = !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none();
+                    if should_save {
+                        if let Err(e) = crate::welcome::mark_dismissed() {
+                            return Err(DispatchError::Operation(format!(
+                                "ウェルカムバナーの状態を保存できない: {e}"
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "不明な action: {other:?}（status / show / dismiss のいずれか）"
+                    )))
+                }
+            }
+            Ok(welcome_status(host))
+        }
     }
 }
 
-/// RunInteractive / Run 共通: 分割 → コマンド付きセッション起動 → exit マーカーラップ
+/// ウェルカムバナーの状態 + 案内コマンド（Issue #549）。
+/// コマンドは #322 の最簡形で返す（AI がユーザーへそのまま提示できる）
+fn welcome_status(host: &dyn ControlHost) -> Value {
+    json!({
+        "visible": host.welcome_banner_visible(),
+        "dismissed": crate::settings::load().welcome_dismissed,
+        "first_launch": crate::welcome::is_first_launch(),
+        "setup_command": crate::welcome::SETUP_COMMAND,
+        "master_command": crate::welcome::MASTER_COMMAND,
+    })
+}
+
+// --- AI コマンド提案カード (#666) ---
+
+/// カード 1 枚の JSON 表現。`commands` は**AI が渡した論理文字列そのもの**
+/// （画面の折り返しは一切混ざらない）
+fn command_card_json(card: &tako_core::CommandCard) -> Value {
+    json!({
+        "id": card.id().as_u64(),
+        "pane": card.pane().as_u64(),
+        "label": card.label(),
+        "commands": card.commands(),
+        "count": card.commands().len(),
+    })
+}
+
+/// カード保管庫を持たないホスト（GUI 不在）向けのエラー
+fn cards_unsupported() -> DispatchError {
+    DispatchError::Operation(
+        "コマンド提案カードは GUI（tako-app）が必要（この接続先には保管庫が無い）".into(),
+    )
+}
+
+/// `CommandCardError` → `DispatchError`。入力の不備は InvalidParams、
+/// 対象が見つからないのは Operation（呼び出し方は正しいが状態が合わない）
+fn command_card_err(e: tako_core::CommandCardError) -> DispatchError {
+    match e {
+        tako_core::CommandCardError::CardNotFound { id } => DispatchError::Operation(if id == 0 {
+            "このペインに表示中のコマンドカードが無い".into()
+        } else {
+            e.to_string()
+        }),
+        _ => DispatchError::InvalidParams(e.to_string()),
+    }
+}
+
+/// AI コマンド提案カードの操作（FR-2.22 / #666）。
+///
+/// **UI のボタンもここを通る**（カードのコピー / 実行は UI から dispatch を呼ぶ）。
+/// UI 層に独自のコピー・実行ロジックを置かないことで、CLI / MCP と挙動が一致する
+#[allow(clippy::too_many_arguments)]
+fn dispatch_show_command(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    action: &str,
+    commands: &[String],
+    label: Option<&str>,
+    pane: Option<u64>,
+    card: Option<u64>,
+    index: Option<usize>,
+    focus: Option<bool>,
+) -> Result<Value, DispatchError> {
+    let card_id = card.map(tako_core::CommandCardId::from_raw);
+
+    // 対象カードの所在ペイン。カード ID が明示されていればそこから引ける
+    // （ペイン指定なしの CLI からでも copy / run / dismiss ができる）
+    let card_pane = card_id.and_then(|id| {
+        host.command_cards()
+            .and_then(|c| c.get(id))
+            .map(|c| c.pane().as_u64())
+    });
+
+    match action {
+        "show" => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let store = host.command_cards_mut().ok_or_else(cards_unsupported)?;
+            let id = store
+                .show(target, commands, label)
+                .map_err(command_card_err)?;
+            let store = host.command_cards().ok_or_else(cards_unsupported)?;
+            let shown = store
+                .get(id)
+                .ok_or_else(|| DispatchError::Operation("カードの登録直後に見失った".into()))?;
+            let value = json!({
+                "card": command_card_json(shown),
+                "pane_cards": store.list(Some(shown.pane())).len(),
+                "max_cards_per_pane": tako_core::command_card::MAX_CARDS_PER_PANE,
+            });
+            Ok(value)
+        }
+
+        "list" => {
+            let (_, target) = resolve_pane(host.workspace(), pane.or(card_pane))?;
+            let store = host.command_cards().ok_or_else(cards_unsupported)?;
+            Ok(json!({
+                "pane": target.as_u64(),
+                "cards": store
+                    .list(Some(target))
+                    .into_iter()
+                    .map(command_card_json)
+                    .collect::<Vec<_>>(),
+                "total": store.len(),
+            }))
+        }
+
+        "copy" | "run" => {
+            // カード ID を指定したのに見つからない = 既に閉じたカード（UI のボタンが
+            // 古い ID を握っている等）。「ペイン未指定」より先にこれを言う
+            if let (Some(id), None) = (card_id, card_pane) {
+                return Err(command_card_err(
+                    tako_core::CommandCardError::CardNotFound { id: id.as_u64() },
+                ));
+            }
+            let (tab_id, target) = resolve_pane(host.workspace(), card_pane.or(pane))?;
+            let idx = index.unwrap_or(1);
+            let (resolved_id, command) = {
+                let store = host.command_cards().ok_or_else(cards_unsupported)?;
+                let card = store.resolve(target, card_id).map_err(command_card_err)?;
+                (
+                    card.id().as_u64(),
+                    card.command(idx).map_err(command_card_err)?.to_string(),
+                )
+            };
+            if action == "copy" {
+                if !host.queue_clipboard_copy(command.clone()) {
+                    return Err(DispatchError::Operation(
+                        "クリップボードへ書き込めない（GUI が必要）".into(),
+                    ));
+                }
+                return Ok(json!({
+                    "copied": true,
+                    "card": resolved_id,
+                    "index": idx,
+                    // 論理文字列をそのまま返す（AI 側でも同一性を検証できる）
+                    "command": command,
+                    "bytes": command.len(),
+                }));
+            }
+            // run: 同じタブに新しいペインを分割してそこで実行する。
+            // 手元のペイン（AI と対話中のペイン）には一切書き込まない
+            let cwd = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_path_buf());
+            // focus=false のときのフォーカス保持は spawn_command_pane が担う（#676）。
+            // カードの実行は「手元のペインに触らない」が要件（FR-2.22.4）
+            let focus = focus.unwrap_or(false);
+            let new_id = spawn_command_pane(
+                host,
+                origin,
+                tab_id,
+                target,
+                Direction::Down,
+                0.35,
+                cwd.clone(),
+                &command,
+                "never",
+                focus,
+            )?;
+            // タイトルは Code Runner (#453) と同じ `(>)` 接頭辞 + コマンド先頭
+            let head: String = command
+                .lines()
+                .next()
+                .unwrap_or(&command)
+                .chars()
+                .take(24)
+                .collect();
+            if let Some(p) = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .and_then(|t| t.tree_mut().get_mut(new_id))
+            {
+                p.set_title(Some(format!("(>) {head}")));
+            }
+            Ok(json!({
+                "pane": new_id.as_u64(),
+                "from_pane": target.as_u64(),
+                "card": resolved_id,
+                "index": idx,
+                "command": command,
+                "cwd": cwd.map(|p| p.display().to_string()),
+                "focus": focus,
+            }))
+        }
+
+        "dismiss" => {
+            // カード ID 指定なら所在ペインを問わず消せる。省略時は対象ペインの全件
+            let target = if card_id.is_some() {
+                None
+            } else {
+                Some(resolve_pane(host.workspace(), pane)?.1)
+            };
+            let store = host.command_cards_mut().ok_or_else(cards_unsupported)?;
+            let removed = store.dismiss(target, card_id);
+            Ok(json!({
+                "dismissed": removed,
+                "pane": target.map(|p| p.as_u64()),
+                "card": card,
+                "remaining": store.len(),
+            }))
+        }
+
+        other => Err(DispatchError::InvalidParams(format!(
+            "不明な action: {other:?}（show / list / copy / run / dismiss のいずれか）"
+        ))),
+    }
+}
+
+/// RunInteractive / Run / ShowCommand 共通: 分割 → コマンド付きセッション起動 →
+/// exit マーカーラップ。
+///
+/// **`focus` の規約は `Request::Split` と同じ**: false なら分割前のフォーカスを保つ
+/// （ユーザーの入力を奪わない）。`PaneTree::split_with_ratio` は無条件で新ペインへ
+/// フォーカスを移すので、ここで戻さないと「既定 false」が効かない（#676）
 #[allow(clippy::too_many_arguments)]
 fn spawn_command_pane(
     host: &mut dyn ControlHost,
@@ -4142,6 +4820,9 @@ fn spawn_command_pane(
 ) -> Result<PaneId, DispatchError> {
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
+
+    // 分割前のフォーカス（focus=false のときここへ戻す。#676）
+    let focused_before = host.workspace().get_tab(tab_id).map(|t| t.tree().focused());
 
     tree_mut(host.workspace_mut(), tab_id)
         .split_with_ratio(target, direction.to_core(), ratio, new_pane)
@@ -4163,6 +4844,9 @@ fn spawn_command_pane(
 
     if focus {
         let _ = tree_mut(host.workspace_mut(), tab_id).focus(new_id);
+    } else if let Some(prev) = focused_before.filter(|p| *p != new_id) {
+        // 分割の副作用で移ったフォーカスを元へ戻す（#676）
+        let _ = tree_mut(host.workspace_mut(), tab_id).focus(prev);
     }
 
     // interactive_meta を設定（RunInteractiveStatus で exit code 回収 + auto_close に使う）
@@ -4438,6 +5122,14 @@ fn dispatch_orchestrator_projects(
 pub struct ProfilesParams {
     pub action: String,
     pub name: Option<String>,
+    /// プロファイル種別（"master" = tako master / "solo" = tako solo。省略時 master。#721）
+    pub kind: Option<String>,
+    /// copy の複製元プロファイル名（#721）
+    pub from: Option<String>,
+    /// このプロファイルに割り当てるプロジェクトキー（丸ごと置き換え。#721）
+    pub projects: Option<Vec<String>>,
+    /// projects の指定を解除する（#721）
+    pub clear_projects: bool,
     /// master のエージェント種別（claude / codex。agy は master 非対応。#127）
     pub master_agent: Option<String>,
     pub clear_master_agent: bool,
@@ -4472,14 +5164,26 @@ pub struct ProfilesParams {
     /// worker の既定アカウント名（Issue #504）
     pub worker_account: Option<String>,
     pub clear_worker_account: bool,
+    /// 引き継ぎを始める ctx 閾値（%。50〜60。Issue #749）
+    pub ctx_threshold: Option<u32>,
+    pub clear_ctx_threshold: bool,
+    /// 閾値超過時に tako が master へ引き継ぎを促すか（Issue #749）
+    pub auto_handoff: Option<bool>,
+    pub clear_auto_handoff: bool,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
-/// model が null のときは claude CLI の既定モデルで起動することを表す
-fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value {
+/// model が null のときは claude CLI の既定モデルで起動することを表す。
+/// `kind` は保存先ディレクトリ（master = profiles/ / solo = solo-profiles/。#721）
+fn profile_to_json(
+    kind: crate::orchestrator::ProfileKind,
+    name: &str,
+    profile: &crate::orchestrator::Profile,
+) -> Value {
     use crate::orchestrator;
     let mut v = json!({
         "name": name,
+        "kind": kind.as_str(),
         "model": profile.model,
         "effort": profile.effort,
         "worker_model_policy": profile.worker_model_policy,
@@ -4487,9 +5191,15 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
         "worker_effort": profile.worker_effort,
         "resolved_worker_model": profile.resolve_worker_model(),
         "resolved_worker_effort": profile.resolve_worker_effort(),
-        "path": orchestrator::profiles_dir()
+        "path": kind.dir()
             .map(|d| d.join(format!("{name}.yaml")).display().to_string()),
     });
+    // 参照整合性の警告（未登録 project / アカウント / [1m] モデル）は list / show /
+    // set のすべてに載せる。GUI は保存前の確認に、CLI / MCP は起動前の気づきに使う（#721）
+    let warnings = orchestrator::profile_warnings(profile);
+    if !warnings.is_empty() {
+        v["warnings"] = json!(warnings);
+    }
     // worker エージェント設定（#120）は使用時のみ出力（既存出力形の互換維持）
     if profile.worker_agent.is_some() || !profile.worker_agents.is_empty() {
         v["worker_agent"] = json!(profile.worker_agent.as_deref().unwrap_or("claude"));
@@ -4529,32 +5239,92 @@ fn profile_to_json(name: &str, profile: &crate::orchestrator::Profile) -> Value 
     if profile.worker_account.is_some() {
         v["worker_account"] = json!(profile.worker_account);
     }
+    // 自動ハンドオフ設定（#749）。実効値（config.yaml / 既定へのフォールバック込み）も
+    // 併記する = master が「今どの閾値で動くのか」を 1 回の呼び出しで確定できる
+    if profile.ctx_threshold.is_some() {
+        v["ctx_threshold"] = json!(profile.ctx_threshold);
+    }
+    if profile.auto_handoff.is_some() {
+        v["auto_handoff"] = json!(profile.auto_handoff);
+    }
+    let resolved = profile.resolved_ctx_threshold();
+    v["resolved_ctx_threshold"] = json!(resolved.value);
+    v["ctx_threshold_source"] = json!(resolved.source.as_str());
+    v["resolved_auto_handoff"] = json!(orchestrator::auto_handoff_enabled(profile));
     v
 }
 
-/// プロファイル管理（list / show / set）。ファイル直読みなので tako-core の状態に依存しない
+/// プロファイル管理（list / show / set / create / copy / delete）。
+/// ファイル直読みなので tako-core の状態に依存しない。kind で master / solo を切り替える（#721）
 pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, DispatchError> {
     use crate::orchestrator;
+    // 種別（master / solo）。省略時は従来どおり master（完全後方互換。#721）
+    let kind = match params.kind.as_deref() {
+        Some(k) => orchestrator::ProfileKind::parse(k).map_err(DispatchError::InvalidParams)?,
+        None => orchestrator::ProfileKind::Master,
+    };
     match params.action.as_str() {
         "list" => {
-            let names = orchestrator::list_profiles().map_err(DispatchError::Operation)?;
+            let names = orchestrator::list_profiles_of(kind).map_err(DispatchError::Operation)?;
             let profiles: Vec<Value> = names
                 .iter()
-                .map(|n| {
-                    let p = orchestrator::Profile::load(n).unwrap_or_default();
-                    profile_to_json(n, &p)
+                .map(|n| match orchestrator::load_profile_of(kind, n) {
+                    Ok(p) => profile_to_json(kind, n, &p),
+                    // 壊れた yaml も一覧から隠さない（直し方は error 文言に入っている）。
+                    // default に丸めて表示すると「壊れていない」と誤認させる
+                    Err(e) => json!({ "name": n, "kind": kind.as_str(), "error": e }),
                 })
                 .collect();
-            Ok(json!({ "profiles": profiles }))
+            Ok(json!({ "kind": kind.as_str(), "profiles": profiles }))
         }
         "show" => {
             let name = params.name.as_deref().unwrap_or("default");
-            let profile = match orchestrator::Profile::load(name) {
+            let profile = match orchestrator::load_profile_of(kind, name) {
                 Ok(p) => p,
-                Err(_) if name == "default" => orchestrator::Profile::default(),
+                Err(_) if name == "default" => kind.default_profile(),
                 Err(e) => return Err(DispatchError::Operation(e)),
             };
-            Ok(profile_to_json(name, &profile))
+            Ok(profile_to_json(kind, name, &profile))
+        }
+        "create" => {
+            let name = params
+                .name
+                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let (path, profile) = orchestrator::create_profile_of(kind, &name, None)
+                .map_err(DispatchError::Operation)?;
+            let mut result = profile_to_json(kind, &name, &profile);
+            result["path"] = json!(path.display().to_string());
+            result["created"] = json!(true);
+            Ok(result)
+        }
+        "copy" => {
+            let name = params.name.ok_or(DispatchError::InvalidParams(
+                "name（複製先）を指定する".into(),
+            ))?;
+            let from = params.from.ok_or(DispatchError::InvalidParams(
+                "from（複製元）を指定する".into(),
+            ))?;
+            let base =
+                orchestrator::load_profile_of(kind, &from).map_err(DispatchError::Operation)?;
+            let (path, profile) = orchestrator::create_profile_of(kind, &name, Some(base))
+                .map_err(DispatchError::Operation)?;
+            let mut result = profile_to_json(kind, &name, &profile);
+            result["path"] = json!(path.display().to_string());
+            result["copied_from"] = json!(from);
+            Ok(result)
+        }
+        "delete" => {
+            let name = params
+                .name
+                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let path =
+                orchestrator::delete_profile_of(kind, &name).map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "kind": kind.as_str(),
+                "name": name,
+                "deleted": true,
+                "path": path.display().to_string(),
+            }))
         }
         "set" => {
             let name = params
@@ -4636,15 +5406,36 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     }
                 }
             }
+            if params.projects.is_some() && params.clear_projects {
+                return Err(DispatchError::InvalidParams(
+                    "projects と clear_projects は同時に指定できない".into(),
+                ));
+            }
+            // #749: 閾値は範囲外を黙って丸めず、設定時点でエラーにする
+            if let Some(v) = params.ctx_threshold {
+                tako_core::handoff::parse_ctx_threshold(v).map_err(DispatchError::InvalidParams)?;
+            }
+            if params.ctx_threshold.is_some() && params.clear_ctx_threshold {
+                return Err(DispatchError::InvalidParams(
+                    "ctx_threshold と clear_ctx_threshold は同時に指定できない".into(),
+                ));
+            }
+            if params.auto_handoff.is_some() && params.clear_auto_handoff {
+                return Err(DispatchError::InvalidParams(
+                    "auto_handoff と clear_auto_handoff は同時に指定できない".into(),
+                ));
+            }
             let env_set_clone = params.env_set.clone();
             let env_unset_clone = params.env_unset.clone();
             let master_account_clone = params.master_account.clone();
             let worker_account_clone = params.worker_account.clone();
             let clear_master_account = params.clear_master_account;
             let clear_worker_account = params.clear_worker_account;
+            let projects_clone = params.projects.clone();
+            let clear_projects = params.clear_projects;
             // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
             // default に丸めて上書き保存すると設定が消えるため、Err で中断する
-            let (path, profile) = orchestrator::Profile::mutate_named(&name, |profile| {
+            let (path, profile) = orchestrator::mutate_profile_of(kind, &name, |profile| {
                 if let Some(a) = params.master_agent {
                     profile.master_agent = Some(a);
                 } else if params.clear_master_agent {
@@ -4733,6 +5524,23 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 } else if clear_worker_account {
                     profile.worker_account = None;
                 }
+                // プロジェクト割り当て（丸ごと置き換え。空配列はクリアと同義。#721）
+                if let Some(keys) = projects_clone {
+                    profile.projects = if keys.is_empty() { None } else { Some(keys) };
+                } else if clear_projects {
+                    profile.projects = None;
+                }
+                // 自動ハンドオフ設定（#749）
+                if let Some(v) = params.ctx_threshold {
+                    profile.ctx_threshold = Some(v);
+                } else if params.clear_ctx_threshold {
+                    profile.ctx_threshold = None;
+                }
+                if let Some(v) = params.auto_handoff {
+                    profile.auto_handoff = Some(v);
+                } else if params.clear_auto_handoff {
+                    profile.auto_handoff = None;
+                }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
                     .worker_agents
@@ -4740,32 +5548,14 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 profile.clone()
             })
             .map_err(DispatchError::Operation)?;
-            let mut result = profile_to_json(&name, &profile);
+            // 参照整合性の警告（[1m] モデル・未登録 project / アカウント）は
+            // profile_to_json が profile_warnings から載せる（GUI / CLI / MCP 共通。#721）
+            let mut result = profile_to_json(kind, &name, &profile);
             result["path"] = json!(path.display().to_string());
-            // [1m] は Max / API プラン限定 → 明示 opt-in は許容しつつ警告を返す
-            // （inherit で master と同一モデルの場合は master 分のみ警告。
-            //  claude 以外の master の model は claude 表記でないため対象外。#127）
-            let warnings: Vec<String> = [
-                profile
-                    .model
-                    .as_deref()
-                    .filter(|_| profile.master_agent_is_claude())
-                    .and_then(|m| orchestrator::one_m_model_warning(m, "master")),
-                profile
-                    .resolve_worker_model()
-                    .filter(|m| Some(*m) != profile.model.as_deref())
-                    .and_then(|m| orchestrator::one_m_model_warning(m, "worker")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            if !warnings.is_empty() {
-                result["warnings"] = json!(warnings);
-            }
             Ok(result)
         }
         other => Err(DispatchError::InvalidParams(format!(
-            "action が不正: {other}（list / show / set）"
+            "action が不正: {other}（list / show / set / create / copy / delete）"
         ))),
     }
 }
@@ -4805,12 +5595,36 @@ fn normalize_newlines_for_keys(text: &str) -> String {
 /// （Issue #32）。`deliver_via_tmux` は内部で sleep するブロッキング関数のため、
 /// UI スレッド上の dispatch から直接呼ばない。結果はログのみ（fire-and-forget）
 ///
+/// #790: ペインが解決できない経路なので、「エージェント管理下の worker か」は
+/// worker レジストリ（#390）へ問う。worker なら peer 送達（Cross-Session Messaging）を
+/// 先に試し、使えなければ従来のキー操作経路へ落ちる
+///
 /// **到達可否の判断は呼び出し側が `crate::reach` へ問う**。ここは tmux 固有の
 /// 送達手順（capture → 貼り付け → 分離 Enter → 空検証）そのものであり、
 /// 案 B-1（器だけの ConPTY セッションホスト）が入ったら同等の手順を
 /// その実装向けに用意して `DetachedAccess` 側へ載せる（設計 §5.1）
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     std::thread::spawn(move || {
+        // Enter 単独送達（#95。入力欄に残留したテキストの送信代行）は
+        // 「キーを送れ」という要求そのものなので peer 送達の対象外
+        if !text.trim().is_empty() {
+            let agent_managed = crate::peer_messaging::backend_is_registered_worker(&session);
+            match crate::delivery::try_peer(&session, &text, agent_managed) {
+                crate::delivery::PeerAttempt::Sent(outcome) => {
+                    if outcome.verification.is_some_and(|v| !v.is_received()) {
+                        eprintln!("warning: peer 送達の受信を確認できない（session={session}）");
+                    }
+                    return; // 送り切っている = 従来経路へ落ちない（二重投函の防止）
+                }
+                crate::delivery::PeerAttempt::Refused { note } => {
+                    eprintln!("warning: {note}（session={session}）");
+                    return;
+                }
+                crate::delivery::PeerAttempt::Fallback { reason, .. } => {
+                    crate::delivery::log_fallback(&session, reason);
+                }
+            }
+        }
         let socket = tako_core::tmux_backend::socket_name();
         match crate::claude_tui::deliver_via_tmux(Some(&socket), &session, &text, wait_ready) {
             Ok(report) if !report.verified => {
@@ -4824,6 +5638,7 @@ fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     });
 }
 
+<<<<<<< HEAD
 /// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
 /// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
 /// アカウント操作のパラメータ（Request と 1:1。Issue #504 / #709）
@@ -4876,6 +5691,80 @@ pub fn dispatch_orchestrator_accounts(
     host: Option<&mut dyn ControlHost>,
     origin: PaneOrigin,
     params: AccountParams<'_>,
+||||||| db83389
+/// spawn レイアウト設定の取得・変更（Issue #165）。host 非依存（config.yaml の読み書きのみ）
+/// のため pub にし、CLI `tako orchestrator layout` からもローカル呼び出しで共用する
+/// アカウントレジストリの CRUD（Issue #504）
+fn dispatch_orchestrator_accounts(
+    action: &str,
+    name: Option<&str>,
+    config_dir: Option<&str>,
+    description: Option<&str>,
+    default_model: Option<&str>,
+    default_effort: Option<&str>,
+=======
+/// 解決済みアカウント 1 件の JSON 表現（list / show / add で共通。#504 / #512）
+fn account_json(a: &crate::orchestrator::ResolvedAccount) -> Value {
+    json!({
+        "name": a.name,
+        // inherit のアカウントは CLAUDE_CONFIG_DIR を設定しない = パスを持たない
+        "config_dir": a.config_dir.path(),
+        "inherit": a.config_dir.is_inherit(),
+        "description": a.description,
+        "default_model": a.default_model,
+        "default_effort": a.default_effort,
+    })
+}
+
+/// AI 系設定の git ベース共有（Issue #513）。host 非依存（ファイルと git だけ）のため
+/// pub にし、CLI `tako config` からもローカル呼び出しで共用する
+/// （MCP `tako_config_share` と 1:1。GUI が動いていなくても使える）
+pub fn dispatch_config_share(
+    action: &str,
+    target: Option<&str>,
+    path: Option<&str>,
+    remote: Option<&str>,
+    message: Option<&str>,
+    no_push: bool,
+) -> Result<Value, DispatchError> {
+    use crate::config_share;
+    let result = match action {
+        "status" => config_share::status(),
+        "list" => Ok(config_share::list()),
+        "init" => config_share::init(path, remote),
+        "link" => {
+            let target = target.ok_or_else(|| {
+                DispatchError::Operation(
+                    "link には対象（リポジトリのパスまたは URL）が必要です".into(),
+                )
+            })?;
+            config_share::link(target, path)
+        }
+        "unlink" => config_share::unlink(),
+        "push" => config_share::push(message, no_push),
+        "pull" => config_share::pull(),
+        other => {
+            return Err(DispatchError::Operation(format!(
+                "不明な action: {other}。status | init | link | unlink | push | pull | list"
+            )))
+        }
+    };
+    result.map_err(DispatchError::Operation)
+}
+
+/// アカウントレジストリの CRUD（Issue #504 / #512）。host 非依存
+/// （accounts.yaml の読み書きのみ）のため pub にし、CLI `tako orchestrator accounts`
+/// からもローカル呼び出しで共用する（MCP `tako_orchestrator_accounts` と 1:1。
+/// 表示・警告・検証を二重実装しない。Issue #548）
+pub fn dispatch_orchestrator_accounts(
+    action: &str,
+    name: Option<&str>,
+    config_dir: Option<&str>,
+    inherit: Option<bool>,
+    description: Option<&str>,
+    default_model: Option<&str>,
+    default_effort: Option<&str>,
+>>>>>>> origin/main
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator::{self, accounts as acct};
     let AccountParams {
@@ -4896,14 +5785,43 @@ pub fn dispatch_orchestrator_accounts(
     match action {
         "list" => {
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+<<<<<<< HEAD
             let views = acct::collect_views(&config);
             Ok(json!({
                 "accounts": views.iter().map(account_view_json).collect::<Vec<_>>(),
             }))
+||||||| db83389
+            let accounts: Vec<Value> = config
+                .list_resolved()
+                .into_iter()
+                .map(|a| {
+                    json!({
+                        "name": a.name,
+                        "config_dir": a.config_dir,
+                        "description": a.description,
+                        "default_model": a.default_model,
+                        "default_effort": a.default_effort,
+                    })
+                })
+                .collect();
+            Ok(json!({ "accounts": accounts }))
+=======
+            let accounts: Vec<Value> = config
+                .list_resolved()
+                .into_iter()
+                .map(|(name, resolved)| match resolved {
+                    Ok(a) => account_json(&a),
+                    // 壊れたエントリも隠さず出す（直し方は error 文言に入っている）
+                    Err(e) => json!({ "name": name, "error": e }),
+                })
+                .collect();
+            Ok(json!({ "accounts": accounts }))
+>>>>>>> origin/main
         }
         "show" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+<<<<<<< HEAD
             if !config.accounts.contains_key(name) {
                 return Err(DispatchError::Operation(format!(
                     "アカウント '{name}' が accounts.yaml に見つからない"
@@ -4914,9 +5832,23 @@ pub fn dispatch_orchestrator_accounts(
                 .find(|v| v.name == name)
                 .expect("直前に存在確認済み");
             Ok(account_view_json(&view))
+||||||| db83389
+            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "name": a.name,
+                "config_dir": a.config_dir,
+                "description": a.description,
+                "default_model": a.default_model,
+                "default_effort": a.default_effort,
+            }))
+=======
+            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            Ok(account_json(&a))
+>>>>>>> origin/main
         }
         "add" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+<<<<<<< HEAD
             // #512: config_dir と inherit は排他。どちらも無いと解決できない
             if inherit && config_dir.is_some() {
                 return Err(DispatchError::InvalidParams(
@@ -4939,6 +5871,43 @@ pub fn dispatch_orchestrator_accounts(
                          既定のログインを使いたい場合は inherit を指定してください（#512）"
                     )
                 });
+||||||| db83389
+            let cd =
+                config_dir.ok_or(DispatchError::InvalidParams("config_dir を指定する".into()))?;
+=======
+            let inherit = inherit.unwrap_or(false);
+            // config_dir / inherit の排他は登録時に弾く（壊れたエントリを作らせない。#512）
+            match (inherit, config_dir) {
+                (false, None) => {
+                    return Err(DispatchError::InvalidParams(
+                        "config_dir か inherit のどちらかを指定する\
+                         （別 config dir なら config_dir、既定の資格情報をそのまま使うなら inherit=true）"
+                            .into(),
+                    ))
+                }
+                (true, Some(_)) => {
+                    return Err(DispatchError::InvalidParams(
+                        "config_dir と inherit=true は同時に指定できない".into(),
+                    ))
+                }
+                _ => {}
+            }
+            // #512: 既定パスの明示指定は「未設定」と等価ではない（Keychain エントリが分かれ、
+            // 既存ログインが見えなくなる）。登録は通すが必ず警告する
+            let warning = config_dir
+                .filter(|cd| orchestrator::is_claude_default_config_dir(cd))
+                .map(|cd| {
+                    format!(
+                        "config_dir '{cd}' は claude の既定パスです。既定パスを明示指定すると \
+                         CLAUDE_CONFIG_DIR が設定された状態になり、claude が Keychain の別エントリ\
+                         （ハッシュ付き）を見に行くため既存ログインが未ログイン扱いになります。\
+                         既定の資格情報をそのまま使うなら inherit=true で登録してください（#512）"
+                    )
+                });
+            if let Some(w) = &warning {
+                eprintln!("warning: {w}");
+            }
+>>>>>>> origin/main
             let entry = orchestrator::AccountEntry {
                 config_dir: config_dir.map(str::to_string),
                 inherit,
@@ -4951,6 +5920,7 @@ pub fn dispatch_orchestrator_accounts(
             })
             .map_err(DispatchError::Operation)?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+<<<<<<< HEAD
             let view = acct::collect_views(&config)
                 .into_iter()
                 .find(|v| v.name == name)
@@ -4960,6 +5930,23 @@ pub fn dispatch_orchestrator_accounts(
                 obj.insert("warning".into(), json!(w));
             }
             Ok(out)
+||||||| db83389
+            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            Ok(json!({
+                "name": a.name,
+                "config_dir": a.config_dir,
+                "description": a.description,
+                "default_model": a.default_model,
+                "default_effort": a.default_effort,
+            }))
+=======
+            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            let mut result = account_json(&a);
+            if let Some(w) = warning {
+                result["warning"] = json!(w);
+            }
+            Ok(result)
+>>>>>>> origin/main
         }
         "remove" => {
             let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
@@ -5261,14 +6248,19 @@ fn dispatch_orchestrator_self(
         ("unknown".to_string(), None)
     };
 
-    let ctx_threshold = crate::setup::load_config()
-        .map(|c| c.ctx_threshold)
-        .unwrap_or(60);
+    // #749: 閾値はプロファイル → config.yaml → 既定 60 の順で解決し 50〜60 へ丸める
+    let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    let threshold = profile.resolved_ctx_threshold();
+    let ctx_threshold = threshold.value;
 
     let handoff_path = orchestrator::handoff_path(profile_name);
     let handoff_exists = handoff_path.as_ref().is_some_and(|p| p.is_file());
+    // #792: 自分の引き継ぎファイルが新書式（知識 / 実行状態の 2 節）かどうかを master 自身が
+    // 確認できるようにする。不在なら null（「まだ書いていない」と「旧書式」を混ぜない）
+    let handoff_doc =
+        orchestrator::read_handoff(profile_name).map(|c| tako_core::handoff::split_handoff(&c));
 
-    Ok(json!({
+    let mut result = json!({
         "pane_id": pane_id.as_u64(),
         "tab_id": tab_id.as_u64(),
         "profile": profile_name,
@@ -5277,10 +6269,26 @@ fn dispatch_orchestrator_self(
         "status": status,
         "ctx_percent": ctx_percent,
         "ctx_threshold": ctx_threshold,
+        "ctx_threshold_source": threshold.source.as_str(),
         "ctx_over_threshold": ctx_percent.map(|c| c >= ctx_threshold),
+        "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
         "handoff_path": handoff_path,
         "handoff_exists": handoff_exists,
-    }))
+        "handoff_format": handoff_doc.as_ref().map(|d| d.format().as_str()),
+        "handoff_sections": handoff_doc.as_ref().map(|d| d.section_labels()),
+    });
+    // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
+    if threshold.clamped() {
+        result["ctx_threshold_raw"] = json!(threshold.raw);
+        result["warnings"] = json!([format!(
+            "ctx_threshold={} は値域外のため {} へ丸めた（{}〜{}）",
+            threshold.raw,
+            ctx_threshold,
+            tako_core::handoff::CTX_THRESHOLD_MIN,
+            tako_core::handoff::CTX_THRESHOLD_MAX
+        )]);
+    }
+    Ok(result)
 }
 
 /// #288: caller のペインを解決する共通関数
@@ -5703,9 +6711,13 @@ fn capture_scrollback_joined(session: &str, lines: usize) -> Option<String> {
     capture.capture_history_joined(&session, lines)
 }
 
-/// OrchestratorHandoff — master の引き継ぎ（#193）。
+/// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
-/// handoff 内容を含むプロンプトを注入する。旧 master は閉じない（ユーザー判断）。
+/// handoff 内容を含むプロンプトを注入する。
+///
+/// #749: 旧 master のペインは **新 master が引き継ぎを確認したあとに新 master 自身が
+/// 閉じる**（初期プロンプトにその手順を埋め込む）。ここで旧ペインを閉じないのは、
+/// 新 master の起動が失敗したときに旧 master を失わないため（順序が安全側に倒れる）。
 /// spawn には既存の OrchestratorSpawn（project 経由）を使わず、直接 Split + attach
 /// を行う（handoff は「プロジェクト」ではないため projects.yaml に依存しない）
 fn dispatch_orchestrator_handoff(
@@ -5718,52 +6730,86 @@ fn dispatch_orchestrator_handoff(
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
-    let role_suffix = caller_role
-        .and_then(|r| r.strip_prefix("master:"))
-        .map(str::to_string);
-
-    let profile_name = role_suffix
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("default");
+    // caller_role は env 由来（`master:<profile>`。MCP / CLI）とペインの role ラベル由来
+    // （`orchestrator-master:<profile>`。stale binary restart などの内部呼び出し）の
+    // 両方が流れ込む。どちらでもプロファイルへ解決する（#761）
+    let profile_name = caller_role
+        .and_then(tako_core::handoff::master_profile_of_any_role)
+        .unwrap_or(tako_core::handoff::DEFAULT_PROFILE);
 
     // handoff ファイルの存在確認
-    let handoff_content = orchestrator::read_handoff(profile_name)
-        .ok_or_else(|| {
-            let path = orchestrator::handoff_path(profile_name)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            DispatchError::Operation(format!(
-                "handoff ファイルが見つからない: {path}\nmaster は引き継ぎ前にこのファイルに状態を書き込む必要がある"
-            ))
-        })?;
+    let handoff_content = orchestrator::read_handoff(profile_name).ok_or_else(|| {
+        let path = orchestrator::handoff_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        // #792: 書けと言うだけでなく**どう書くか**（2 節の雛形）まで返す。
+        // これを最初に読むのは AI なので、ここが書式を知る唯一の機会になりうる
+        let template = tako_core::handoff::handoff_template(profile_name);
+        DispatchError::Operation(format!(
+            "handoff ファイルが見つからない: {path}\n\
+                 master は引き継ぎ前にこのファイルに状態を書き込む必要がある。書式:\n{template}"
+        ))
+    })?;
 
-    // #288: 分割元ペインの解決
-    let (tab_id, split_target) = if let Some(raw_tab) = tab {
-        let tid = find_tab(host.workspace(), raw_tab)?;
-        let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
-        (tid, focused)
-    } else {
-        resolve_caller_pane(host, pane, caller_role, caller_pid)?
+    // #288: 分割元ペインの解決。`tab` 指定時はそのタブのフォーカスペインを分割元にする
+    // ので、呼び出し元（= 退役する master）とは別物になりうる
+    let caller = resolve_caller_pane(host, pane, caller_role, caller_pid).ok();
+    let (tab_id, split_target) = match tab {
+        Some(raw_tab) => {
+            let tid = find_tab(host.workspace(), raw_tab)?;
+            let focused = host.workspace().get_tab(tid).unwrap().tree().focused();
+            (tid, focused)
+        }
+        // caller が解決できないときは従来どおり解決エラーをそのまま返す
+        None => resolve_caller_pane(host, pane, caller_role, caller_pid)?,
     };
+
+    // #749: 退役する旧 master のペイン。**role が master のペインだけ**を対象にし、
+    // ユーザーが開いたペインを後任に閉じさせる事故を構造的に防ぐ
+    let previous_pane = caller.map(|(_, p)| p).filter(|p| {
+        host.workspace()
+            .get_tab(tab_id)
+            .and_then(|t| t.tree().get(*p))
+            .and_then(|pane| pane.role())
+            .is_some_and(|r| r.starts_with("orchestrator-master"))
+    });
 
     // プロファイルの読み込みとエージェント解決
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env().map_err(DispatchError::Operation)?;
-    let profile_env = profile.resolved_env();
+    // 引き継ぎ先の master も master_account を反映する（#547。CLI の master 起動と同じ規則）
+    let profile_env = profile
+        .resolved_env_plan_for_master()
+        .map_err(DispatchError::Operation)?;
 
     let master_agent = profile
         .resolve_master_agent()
         .map_err(DispatchError::InvalidParams)?;
-    let launch = profile.resolve_agent_launch(master_agent, None, None);
 
-    // 新 master の role
-    let new_role = if profile_name == "default" {
-        "orchestrator-master".to_string()
-    } else {
-        format!("orchestrator-master:{profile_name}")
-    };
+    // #761: role には語彙が 2 つある。ペインに貼る表示用ラベルと、起動コマンドが注入する
+    // `TAKO_ORCHESTRATOR_ROLE`（`master:<profile>`）。以前は表示用を env にも入れていたため、
+    // 後任の caller_role が解決できず self / handoff / profiles がすべて default に落ちていた
+    let new_role = tako_core::handoff::master_pane_role(profile_name);
+    let role_env = tako_core::handoff::master_role_env(profile_name);
+
+    // #761: master の起動コマンドは CLI の `tako master -<profile>` と**同一経路**で作る。
+    // worker 用の `resolve_agent_launch`（worker_agents.<agent> を見る）を使っていたため、
+    // 後任が worker 用モデルで起動し、master system prompt も付いていなかった
+    let prompt_content = profile.build_system_prompt(profile_name);
+    let prompt_path = orchestrator::config_dir()
+        .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?
+        .join(format!("_system_prompt_{profile_name}.md"));
+    if let Some(parent) = prompt_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| op_err(format!("system prompt の保存先を作れない: {e}")))?;
+    }
+    std::fs::write(&prompt_path, &prompt_content)
+        .map_err(|e| op_err(format!("system prompt の書き出しに失敗: {e}")))?;
+    let tako_bin = resolve_tako_binary();
+    // ペインを分割する**前**に組み立てる（失敗したときに空ペインだけ残さない）
+    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
+        .map_err(DispatchError::Operation)?;
 
     // cwd はホームディレクトリ
     let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
@@ -5781,10 +6827,11 @@ fn dispatch_orchestrator_handoff(
     let options = SpawnOptions {
         command: None,
         cwd: Some(cwd.clone()),
-        env: profile_env.clone(),
+        env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
 
+<<<<<<< HEAD
     // master エージェント CLI コマンドを構築して送信
     let master_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: master_agent,
@@ -5795,8 +6842,31 @@ fn dispatch_orchestrator_handoff(
         extra_args: &launch.extra_args,
         env: &profile_env,
         env_unsets: &[],
+||||||| db83389
+    // master エージェント CLI コマンドを構築して送信
+    let master_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
+        agent: master_agent,
+        role: &new_role,
+        model: launch.model.as_deref(),
+        effort: launch.effort.as_deref(),
+        skip_permissions: master_agent.default_skip_permissions(),
+        extra_args: &launch.extra_args,
+        env: &profile_env,
+=======
+    // 事前信頼。claude は config dir 配下の .claude.json を読むので、アカウント指定で
+    // CLAUDE_CONFIG_DIR を注入する場合はその config dir へ書く（#558）
+    let _ = orchestrator::agent::ensure_trusted_in(
+        master_agent,
+        profile_env.claude_config_dir().as_deref(),
+        &cwd.to_string_lossy(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {e}");
+        false
+>>>>>>> origin/main
     });
 
+<<<<<<< HEAD
     // 事前信頼
     let _ = orchestrator::agent::ensure_trusted(master_agent, &cwd.to_string_lossy())
         .unwrap_or_else(|e| {
@@ -5806,15 +6876,33 @@ fn dispatch_orchestrator_handoff(
 
     // コマンド送信（送達確認つき。#640）
     host.queue_command_flow(new_id, master_cmd);
+||||||| db83389
+    // 事前信頼
+    let _ = orchestrator::agent::ensure_trusted(master_agent, &cwd.to_string_lossy())
+        .unwrap_or_else(|e| {
+            eprintln!("warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {e}");
+            false
+        });
 
-    // handoff プロンプトの構成と送信
-    let handoff_prompt = format!(
-        "あなたは前任 master から引き継ぎを受けた新しい master です。\n\
-         以下の引き継ぎファイルの内容を読み、前任の状態を把握してから業務を開始してください。\n\n\
-         --- handoff/{profile_name}.md ---\n\
-         {handoff_content}\n\
-         --- end ---\n\n\
-         引き継ぎ内容を把握したら「引き継ぎ完了」と報告し、待機してください。"
+    // コマンド送信（queue_write で遅延書き込み）
+    let mut cmd_bytes = master_cmd.into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+=======
+    // コマンド送信（queue_write で遅延書き込み）
+    let mut cmd_bytes = master_cmd.into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+>>>>>>> origin/main
+
+    // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）。
+    // #792: 新書式（2 節）なら節ごとの扱い、旧書式なら「番号は実態で確認 + 次回は書き直せ」が
+    // 文面に付く。**引き継ぎ内容そのものは書式に関係なく全文が渡る**（後方互換）
+    let handoff_doc = tako_core::handoff::split_handoff(&handoff_content);
+    let handoff_prompt = tako_core::handoff::successor_prompt(
+        profile_name,
+        &handoff_content,
+        previous_pane.map(PaneId::as_u64),
     );
     host.queue_prompt_flow(new_id, handoff_prompt.clone());
 
@@ -5835,6 +6923,17 @@ fn dispatch_orchestrator_handoff(
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
+        // #792: 読み取った引き継ぎファイルの書式。旧書式なら "legacy"（動作は従来どおり）
+        "handoff_format": handoff_doc.format().as_str(),
+        "handoff_sections": handoff_doc.section_labels(),
+        // #749: 退役するペイン。null なら後任に kill を指示していない
+        // （旧 master を特定できなかった = 安全側に倒した）
+        "previous_master_pane_id": previous_pane.map(PaneId::as_u64),
+        "previous_master_close": if previous_pane.is_some() {
+            "後任 master が引き継ぎ確認後に閉じる"
+        } else {
+            "旧 master ペインを特定できなかったため閉じない"
+        },
     }))
 }
 
@@ -5865,7 +6964,7 @@ fn dispatch_git_resolve_agent(
     let caller_pane = pane.map(PaneId::from_raw);
     let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &None);
     profile.validate_env().map_err(DispatchError::Operation)?;
-    let profile_env = profile.resolved_env();
+    let profile_env = profile.resolved_env_plan();
     let worker_agent = profile
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
@@ -5899,7 +6998,7 @@ fn dispatch_git_resolve_agent(
     let options = SpawnOptions {
         command: None,
         cwd: Some(repo.clone()),
-        env: profile_env.clone(),
+        env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -5915,15 +7014,21 @@ fn dispatch_git_resolve_agent(
         env_unsets: &[],
     });
 
-    // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）
-    let pre_trusted = orchestrator::agent::ensure_trusted(worker_agent, &cwd).unwrap_or_else(|e| {
-        eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        false
-    });
+    // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）。
+    // 書き先は起動する claude の config dir 配下（#558）
+    let claude_config_dir = profile_env.claude_config_dir();
+    let pre_trusted =
+        orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
+            .unwrap_or_else(|e| {
+                eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+                false
+            });
     if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
-        let _ = crate::claude_tui::ensure_bypass_accepted().map_err(|e| {
-            eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        });
+        let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref()).map_err(
+            |e| {
+                eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
+            },
+        );
     }
 
     // 起動コマンドは送達確認つきで送る（#640）
@@ -6072,8 +7177,14 @@ fn dispatch_orchestrator_spawn(
     } else {
         None
     };
+<<<<<<< HEAD
     let env_plan = profile.resolved_env_with_account(resolved_account.as_ref());
     let profile_env = env_plan.exports.clone();
+||||||| db83389
+    let profile_env = profile.resolved_env_with_account(resolved_account.as_ref());
+=======
+    let profile_env = profile.resolved_env_plan_with_account(resolved_account.as_ref());
+>>>>>>> origin/main
 
     let worker_agent = profile
         .resolve_worker_agent(agent)
@@ -6120,7 +7231,7 @@ fn dispatch_orchestrator_spawn(
     let options = SpawnOptions {
         command: None,
         cwd: Some(std::path::PathBuf::from(&cwd)),
-        env: profile_env.clone(),
+        env: profile_env.exports.clone(),
     };
     host.attach_session(new_id, options);
 
@@ -6142,24 +7253,32 @@ fn dispatch_orchestrator_spawn(
 
     // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
     // 送信したプロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。
-    // 起動前に各 CLI の設定ファイル（claude: ~/.claude.json / codex: ~/.codex/config.toml /
-    // agy: ~/.gemini/antigravity-cli/settings.json）へ信頼済みを書き込んでダイアログ自体を
-    // 出さない。失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
-    let pre_trusted = orchestrator::agent::ensure_trusted(worker_agent, &cwd).unwrap_or_else(|e| {
-        eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        false
-    });
+    // 起動前に各 CLI の設定ファイル（claude: <config dir>/.claude.json /
+    // codex: ~/.codex/config.toml / agy: ~/.gemini/antigravity-cli/settings.json）へ
+    // 信頼済みを書き込んでダイアログ自体を出さない。claude の書き先は起動する
+    // config dir 配下でなければ効かない（#558。アカウント指定で変わる）。
+    // 失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
+    let claude_config_dir = profile_env.claude_config_dir();
+    let pre_trusted =
+        orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
+            .unwrap_or_else(|e| {
+                eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+                false
+            });
 
     // Bypass Permissions 事前承認（#407）: skip_permissions=true の claude worker は
     // --dangerously-skip-permissions で起動する。初回は確認ダイアログが出て既定選択
-    // 「No, exit」で即終了するため、起動前に ~/.claude.json へ承認済みを書き込む。
-    // フォールバック: deliver_via_tmux の bypass ダイアログ検出 → 承諾
+    // 「No, exit」で即終了するため、起動前に config dir 配下の .claude.json へ
+    // 承認済みを書き込む。フォールバック: deliver_via_tmux の bypass ダイアログ検出 → 承諾
     if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
-        let _ = crate::claude_tui::ensure_bypass_accepted().map_err(|e| {
-            eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
-        });
+        let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref()).map_err(
+            |e| {
+                eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
+            },
+        );
     }
 
+<<<<<<< HEAD
     // 起動コマンドとプロンプトの送出は**起動保証の状態機械**へ委ねる（Issue #665）。
     // 従来はここで queue_write（起動コマンド）+ queue_prompt_flow（プロンプト）を
     // 投げっぱなしにしており、どちらも届いたか誰も確認していなかった。
@@ -6167,6 +7286,31 @@ fn dispatch_orchestrator_spawn(
     // そのまま使い、その上に「エージェントが実際に起動したか」「プロンプトが
     // 入力欄から消えたか」の検証と再送を重ねる。実際の登録はレジストリの
     // worker_id が決まってから行う（段階を workers.yaml へ記録するため）
+||||||| db83389
+    // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
+    // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
+    let mut cmd_bytes = worker_cmd.clone().into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+
+    // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
+    // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
+    // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
+    // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
+    host.queue_prompt_flow(new_id, prompt.to_string());
+=======
+    // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
+    // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
+    let mut cmd_bytes = worker_cmd.clone().into_bytes();
+    cmd_bytes.push(b'\r');
+    host.queue_write(new_id, cmd_bytes);
+
+    // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
+    // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
+    // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
+    // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
+    host.queue_spawn_prompt_flow(new_id, prompt.to_string());
+>>>>>>> origin/main
 
     // タイトルと role 設定
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
@@ -6286,12 +7430,10 @@ fn dispatch_orchestrator_spawn(
     crate::request_claude_scan();
 
     // Part 4: env のキー一覧（値はマスク。Issue #500）
-    let env_keys: Vec<&str> = profile_env.iter().map(|(k, _)| k.as_str()).collect();
-    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める
-    let config_dir_value = profile_env
-        .iter()
-        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
-        .map(|(_, v)| v.as_str());
+    let env_keys: Vec<&str> = profile_env.export_keys();
+    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める。
+    // inherit のアカウントでは設定しない = null + env_unset に現れる（#512）
+    let config_dir_value = profile_env.export_value(orchestrator::CLAUDE_CONFIG_DIR_ENV);
 
     Ok(json!({
         "pane_id": new_id.as_u64(),
@@ -6310,6 +7452,8 @@ fn dispatch_orchestrator_spawn(
         "ledger_id": ledger_id,
         "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
         "env_keys": env_keys,
+        // #512: 明示 unset する変数（inherit アカウントの CLAUDE_CONFIG_DIR 等）
+        "env_unset": profile_env.unsets,
         "config_dir": config_dir_value,
         // inherit のアカウントでは config_dir が null になるので、
         // 「未設定に戻した」ことを別フィールドで示す（#512 / #709）
@@ -6427,10 +7571,16 @@ pub struct WorkerStatusCtx {
     full_screen: Option<String>,
     /// tmux セッション配下に実行中の子プロセスがあるか（#224）
     has_running_children: bool,
+<<<<<<< HEAD
     /// ペインの PTY 子プロセス（シェル）の pid（#592）。
     /// 器を持たないバックエンド（Windows の backend=none）で、pane → claude セッションを
     /// 辿る唯一の起点になる。GUI に無いペイン（レジストリ照会のみ）では None
     pane_pid: Option<u32>,
+||||||| db83389
+=======
+    /// 利用上限後の自動復帰の状態（#813。UI スレッドで写し取る）
+    limit_resume: Value,
+>>>>>>> origin/main
 }
 
 /// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
@@ -6470,7 +7620,30 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         has_running_children,
         live_tail: lines.map(tail_join),
         full_screen,
+<<<<<<< HEAD
         pane_pid,
+||||||| db83389
+=======
+        limit_resume: limit_resume_entry(host, target),
+    }
+}
+
+/// `claude agents --json` の生 status を dispatch の語彙へ正規化する（#267）。
+///
+/// 正規化しないと watch ループの unknown フォールバック（画面推定）に落ち、
+/// 一次シグナルを持っているのに捨てることになる。
+///
+/// #571: claude の実出力は `idle` / `busy`（2026-07-27 実測。旧実装が想定していた
+/// `active` は現れない）。**未知の値は "unknown" に落ちて画面推定へ回る**ので、
+/// 語彙がずれても壊れはしないが検知精度が落ちる。実測で確認した値を並べる
+fn normalize_agent_status(raw: &str) -> &'static str {
+    match raw {
+        "idle" => "idle",
+        "busy" | "active" | "running" => "busy",
+        "waiting" | "waiting_for_input" => "waiting",
+        "gone" => "gone",
+        _ => "unknown",
+>>>>>>> origin/main
     }
 }
 
@@ -6526,7 +7699,12 @@ fn finish_worker_status(
         live_tail,
         full_screen,
         has_running_children: has_children,
+<<<<<<< HEAD
         pane_pid,
+||||||| db83389
+=======
+        limit_resume,
+>>>>>>> origin/main
     } = ctx;
 
     // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
@@ -6658,6 +7836,7 @@ fn finish_worker_status(
         registry_session_detected,
         registry_resume_command,
         agent_process_alive,
+        limit_resume,
     })
 }
 
@@ -6684,6 +7863,8 @@ struct ResolvedWorkerStatus {
     /// #390: エージェントプロセスの生存シグナル（突然死判定専用。pane 消失中は
     /// tmux フォールバックで再計算済み。busy / stalled 補正には使わない）
     agent_process_alive: bool,
+    /// #813: 利用上限後の自動復帰の状態（UI スレッドで写し取った値をそのまま載せる）
+    limit_resume: Value,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -6704,6 +7885,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         registry_session_detected,
         registry_resume_command,
         agent_process_alive,
+        limit_resume,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -6763,6 +7945,48 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
                 status = "busy".to_string();
             }
         }
+    }
+
+    // #577: 画面に permission ダイアログ（ツール実行の承認要求）が**実在すれば**
+    // waiting へ格上げする。旧実装は「agents の生 status が waiting」だけを根拠に
+    // していたため、**agents がその worker を見られない状況で丸ごと落ちていた**。
+    //
+    // 実測（2026-07-27 / claude v2.1.x。証拠は #577 の e2e）:
+    // - agents 解決に成功していれば生 status は `waiting` を返す（Issue 本文の
+    //   「claude は idle / busy しか返さない」は permission 待ちには当てはまらない）
+    // - ところが `claude agents --json` に載らない worker（別 config dir の継承・
+    //   `CLAUDE_CODE_CHILD_SESSION` つき起動・一覧の取りこぼし = #571 の環境）は
+    //   status_source=screen へ落ち、画面推定は `❯ 1. Yes` を入力欄と見なして idle。
+    //   結果 permission 待ちが「idle + question」として通知され、
+    //   `permission_dialog` は常に null だった（#577 の観測がこれ）
+    // - codex / agy には agents 相当の API が無く、常にこの画面推定経路を通る
+    //
+    // そこで判定を agents の語彙から切り離し、画面の実在検査
+    // （`detect_permission_dialog`）を一次の根拠にする。ダイアログは入力欄を
+    // 奪っている（= 応答するまで先へ進めない）ので、agents / 画面推定が
+    // どちらの状態を出していても停止側が正
+    let permission_dialog = recent_output
+        .as_deref()
+        .and_then(crate::orchestrator::wait::permission_dialog_json);
+    // #748: permission 以外の選択肢ダイアログ（usage limit の対処選択・モデル選択・
+    // plan 確認・AskUserQuestion・`/mcp` の一覧等）も同じ構造検知から拾う。
+    // どの種別でも**入力欄を奪っている = 応答するまで先へ進めない**ので waiting へ格上げする。
+    // 旧実装は permission だけを見ており、それ以外は idle（= 完了）として通知されていた
+    // （#748 の観測 2。master は WORKER_IDLE を受けて報告を待ち続ける）
+    let choice_dialog = recent_output
+        .as_deref()
+        .and_then(crate::orchestrator::wait::choice_dialog_json);
+    // usage limit の対処ダイアログだけは waiting へ格上げしない（#748）。
+    // 「解除まで待ってから続行」という復旧は error 側（#157 の WorkerErrorKind +
+    // #401 の supervisor）が持っているので、そこを迂回させない。
+    // 選択肢の構造は下の `choice_dialog` フィールドに載るので respond もできる
+    let limit_dialog = choice_dialog
+        .as_ref()
+        .and_then(|d| d["kind"].as_str())
+        .is_some_and(|k| k == "usage_limit");
+    if (permission_dialog.is_some() || choice_dialog.is_some()) && status != "gone" && !limit_dialog
+    {
+        status = "waiting".to_string();
     }
 
     // 停止（idle）した worker の画面に既知のエラーパターン（API エラー・usage limit・
@@ -6873,20 +8097,20 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         );
     }
 
-    // #319: waiting + 画面に permission ダイアログがあれば構造化情報を付与
-    let permission_dialog: Option<Value> = if status == "waiting" {
-        recent_output.as_ref().and_then(|out| {
-            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
-            let dialog = crate::claude_tui::detect_permission_dialog(&lines)?;
-            Some(json!({
-                "command": dialog.command,
-                "options": dialog.options,
-                "highlighted": dialog.highlighted,
-            }))
-        })
-    } else {
-        None
-    };
+    // #572: busy 中に人間が打った指示が claude のキューに未送信のまま残っていないか。
+    // 入力欄は空に見えるので、これが無いと master は「何も残っていない」と読み違える
+    let queued_messages_pending = recent_output.as_ref().is_some_and(|out| {
+        let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+        crate::claude_tui::queued_messages_pending(&lines)
+    });
+    if queued_messages_pending {
+        events.push(
+            crate::orchestrator::wait::WorkerEvent {
+                kind: crate::orchestrator::wait::WorkerEventKind::QueuedMessagesPending,
+            }
+            .to_json(),
+        );
+    }
 
     // #364: 履歴サイズ計測（agent 非依存の busy シグナル布石）。
     // 採取の到達手段で足りる（#519）。`bytes` は器によっては観測できず 0 になる
@@ -6909,15 +8133,23 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "has_running_children": has_children,
         "collapsed": collapsed,
         "events": events,
+        // #572: true = 人間が busy 中に打った指示がキューに未送信で残っている
+        "queued_messages_pending": queued_messages_pending,
         "permission_dialog": permission_dialog,
+        // #748: 種別つきの選択肢ダイアログ（permission も含む全種別）。
+        // `tako orchestrator respond` に渡す番号 / ラベルはここから読む
+        "choice_dialog": choice_dialog,
         "history": history_info,
         // #390: worker レジストリ由来の情報（未登録ペインは null）
         "worker_id": registry_worker_id,
         "prompt_delivery": prompt_delivery_final.map(|(d, _)| d.as_str()),
         "resume_command": registry_resume_command,
+        // #813: 利用上限後の自動復帰（enabled = ペインのオプトイン / state = 実行状態）
+        "limit_resume": limit_resume,
     }))
 }
 
+<<<<<<< HEAD
 /// ダイアログ操作の到達手段（#662）。
 ///
 /// **in-process を必ず先に試す**のが要点。旧実装は `reach::detached_session` だけを見ており、
@@ -7018,9 +8250,36 @@ fn detached_key_name(key: &str) -> String {
 
 /// ダイアログ操作の到達手段を解決する。in-process 優先（#662）
 fn resolve_dialog_reach(
+||||||| db83389
+/// #319: permission ダイアログへの構造化応答
+fn dispatch_orchestrator_respond(
+=======
+/// 選択肢ダイアログへの構造化応答（#319 permission → #748 で全種別に一般化）。
+///
+/// `choice` を省略すると**送信せずに構造だけ返す**（下見。#322 の「最簡形」に沿って
+/// 新しいツールを増やさず、同じコマンドで一覧と応答の両方を賄う）。
+///
+/// キー送出は実測に基づく（#748。claude v2.1.220 の permission / AskUserQuestion で観測）:
+/// - 番号つきダイアログは**番号キーだけで確定する**（Enter 不要）。旧実装は番号 + Enter を
+///   送っていたので、余分な Enter がダイアログ解消後の入力欄へ抜けていた
+/// - 番号なしダイアログ（`/mcp` 等）では番号キーは**無反応**。`↑`/`↓` で移動して Enter。
+///   移動後は**ラベル一致で着地を検証**してから Enter を送る（見出し行が選択肢に混ざる
+///   TUI でも誤選択を confirm しない）
+fn dispatch_orchestrator_respond(
+>>>>>>> origin/main
     host: &dyn ControlHost,
     pane_id: u64,
+<<<<<<< HEAD
 ) -> Result<DialogReach<'_>, DispatchError> {
+||||||| db83389
+    choice: &str,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+=======
+    choice: Option<&str>,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+>>>>>>> origin/main
     let target = PaneId::from_raw(pane_id);
     if let Some(session) = host.session(target) {
         return Ok(DialogReach::InProcess(session));
@@ -7029,14 +8288,45 @@ fn resolve_dialog_reach(
     let backend_session = host.backend_session(target).ok_or_else(|| {
         DispatchError::Operation(crate::reach::UnreachableReason::NoSession(pane_id).note())
     })?;
+<<<<<<< HEAD
     match crate::reach::detached_session(&backend_session) {
         Some((s, access)) => Ok(DialogReach::Detached(s, access)),
         None => Err(DispatchError::Operation(
+||||||| db83389
+
+    // 画面から permission ダイアログの存在を検証。
+    // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
+    let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
+        DispatchError::Operation(
+=======
+    respond_to_choice_dialog(&backend_session, pane_id, choice, caller_role)
+}
+
+/// 選択肢ダイアログへの応答本体（ホスト非依存）。
+///
+/// `ControlHost` を必要とするのはバックエンドセッション名の解決だけなので、
+/// そこを引数で受け取る形に切り出してある。おかげで GUI の**バックグラウンド
+/// スレッド**からも同じ経路（同じ検証・同じ persist.log 監査）で応答できる
+/// （#813 の自動復帰。この関数はキー送出のたびに数百 ms スリープするので
+/// UI スレッドから呼んではいけない）
+pub fn respond_to_choice_dialog(
+    backend_session: &str,
+    pane_id: u64,
+    choice: Option<&str>,
+    caller_role: Option<&str>,
+) -> Result<Value, DispatchError> {
+    let backend_session = backend_session.to_string();
+    // 画面からダイアログの存在を検証。
+    // GUI 不在でも応答できることが本 API の意義なので、到達手段は backend 側に依存する
+    let (session, access) = crate::reach::detached_session(&backend_session).ok_or_else(|| {
+        DispatchError::Operation(
+>>>>>>> origin/main
             crate::reach::UnreachableReason::NoDetachedAccess {
                 session: backend_session.clone(),
                 note: crate::reach::no_detached_access_note(),
             }
             .note(),
+<<<<<<< HEAD
         )),
     }
 }
@@ -7053,38 +8343,116 @@ fn dispatch_orchestrator_respond_permission(
     let reach = resolve_dialog_reach(host, pane_id)?;
     let lines = reach.capture()?;
     let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
+||||||| db83389
+        )
+    })?;
+    let lines = access
+        .capture_screen(&session)
+        .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))?;
+    let dialog = crate::claude_tui::detect_permission_dialog(&lines).ok_or_else(|| {
+=======
+        )
+    })?;
+    let capture = || -> Result<Vec<String>, DispatchError> {
+        access
+            .capture_screen(&session)
+            .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))
+    };
+    let lines = capture()?;
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines).ok_or_else(|| {
+>>>>>>> origin/main
         DispatchError::Operation(
-            "ペイン画面に permission ダイアログが見つからない（既に解消済みか、別の画面状態です）"
+            "ペイン画面に選択肢ダイアログが見つからない（既に解消済みか、別の画面状態です）"
                 .to_string(),
         )
     })?;
 
-    // choice を番号に解決
-    let choice_num: usize = match choice.to_lowercase().as_str() {
-        "yes" | "allow" => 1,
-        "no" | "deny" => {
-            // Deny は最後の選択肢（通常は 3 番目）
-            dialog
-                .options
-                .iter()
-                .position(|o| o.to_lowercase().contains("deny") || o.to_lowercase() == "no")
-                .map(|i| i + 1)
-                .unwrap_or(dialog.options.len())
-        }
-        n => n.parse().map_err(|_| {
-            DispatchError::Operation(format!(
-                "choice は番号（1-{}）または yes/no/allow/deny を指定してください: {choice}",
-                dialog.options.len()
-            ))
-        })?,
-    };
-    if choice_num == 0 || choice_num > dialog.options.len() {
-        return Err(DispatchError::Operation(format!(
-            "choice {choice_num} は範囲外です（1-{}）",
+    // choice 省略 = 下見（構造だけ返す。送信しない）
+    let Some(choice) = choice else {
+        let mut result = dialog.to_json();
+        result["pane_id"] = json!(pane_id);
+        result["responded"] = json!(false);
+        result["hint"] = json!(format!(
+            "応答するには choice に番号（1-{}）かラベルの一部を渡す",
             dialog.options.len()
-        )));
+        ));
+        return Ok(result);
+    };
+
+    let index = resolve_choice_index(&dialog, choice)?;
+    let chosen = dialog.options[index].clone();
+
+    // --- キー送出（種別ではなく「番号つきか」で分岐する） ---
+    let mut keys_sent: Vec<String> = Vec::new();
+    let send = |key: &str| -> Result<(), DispatchError> {
+        access
+            .send_key(&session, key)
+            .map_err(|e| DispatchError::Operation(format!("キー {key} の送信に失敗: {e}")))
+    };
+    if dialog.numbered {
+        let number = chosen.number.unwrap_or((index + 1) as u32).to_string();
+        send(&number)?;
+        keys_sent.push(number);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // 番号キーで確定しない TUI（codex の「Press enter to confirm」等）のための
+        // フォールバック。**ダイアログが残っているときだけ** Enter を送る
+        // （確定済みの画面へ送ると入力欄の残留テキストを送信してしまう）
+        if dialog_still_open(&capture()?, &dialog) {
+            send("Enter")?;
+            keys_sent.push("Enter".to_string());
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+    } else {
+        // 番号なし: ハイライトから目標までカーソルを動かし、着地をラベルで検証する
+        let mut current = dialog.highlighted.ok_or_else(|| {
+            DispatchError::Operation(
+                "番号なしダイアログでハイライト位置を特定できない（手動で応答してください）"
+                    .to_string(),
+            )
+        })?;
+        for _ in 0..NAV_ATTEMPTS {
+            if current == index {
+                break;
+            }
+            let (key, steps) = if index > current {
+                ("Down", index - current)
+            } else {
+                ("Up", current - index)
+            };
+            for _ in 0..steps {
+                send(key)?;
+                keys_sent.push(key.to_string());
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            // 移動後の実画面から現在位置を読み直す（キーを飲まれた場合の再試行）
+            let after = crate::claude_tui::detect_choice_dialog(&capture()?).ok_or_else(|| {
+                DispatchError::Operation(
+                    "カーソル移動中にダイアログが消えた（応答は送っていません）".to_string(),
+                )
+            })?;
+            current = after
+                .highlighted
+                .ok_or_else(|| DispatchError::Operation("ハイライト位置を再取得できない".into()))?;
+            if after.options.get(current).map(|o| o.label.as_str()) == Some(chosen.label.as_str()) {
+                break;
+            }
+        }
+        // ラベル一致を確認できないまま Enter は押さない（誤選択の確定を構造的に防ぐ）
+        let landed = crate::claude_tui::detect_choice_dialog(&capture()?)
+            .and_then(|d| d.highlighted.and_then(|i| d.options.get(i).cloned()))
+            .is_some_and(|o| o.label == chosen.label);
+        if !landed {
+            return Err(DispatchError::Operation(format!(
+                "選択肢「{}」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）",
+                chosen.label
+            )));
+        }
+        send("Enter")?;
+        keys_sent.push("Enter".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(400));
     }
 
+<<<<<<< HEAD
     // 選択キーを送信: 番号キー → 短い待ち → Enter
     reach.send_key(&choice_num.to_string())?;
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -7095,18 +8463,57 @@ fn dispatch_orchestrator_respond_permission(
         .get(choice_num - 1)
         .cloned()
         .unwrap_or_default();
+||||||| db83389
+    // 選択キーを送信: 番号キー → 短い待ち → Enter
+    access
+        .send_key(&session, &choice_num.to_string())
+        .map_err(|e| DispatchError::Operation(format!("番号キーの送信に失敗: {e}")))?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    access
+        .send_key(&session, "Enter")
+        .map_err(|e| DispatchError::Operation(format!("Enter の送信に失敗: {e}")))?;
+
+    let chosen_text = dialog
+        .options
+        .get(choice_num - 1)
+        .cloned()
+        .unwrap_or_default();
+=======
+    // 解消の検証（ダイアログが残っていれば responded=true でも resolved=false を返す）
+    let after = capture()?;
+    let resolved = !dialog_still_open(&after, &dialog);
+    // 検知と送出のあいだにダイアログが自然消滅していた場合、送ったキーは入力欄へ
+    // 素通りする。入力欄にそれが残っていたら**黙って成功と言わずに**報告する
+    // （番号キーだけで Enter を送らない設計なので、送信されることはない）
+    let stray_input = keys_sent
+        .iter()
+        .any(|k| crate::claude_tui::input_line(&after).is_some_and(|c| c.trim() == k));
+>>>>>>> origin/main
 
     // 監査記録（persist.log。ペイン出力自体はキー入力の結果として画面に残る）
     let caller = caller_role.unwrap_or("unknown");
     crate::diag::persist_log(&format!(
+<<<<<<< HEAD
         "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={} reach={}",
         dialog.command,
         reach.label(),
+||||||| db83389
+        "[permission-respond] caller={caller} pane={pane_id} choice={choice_num} ({chosen_text}) command={}",
+        dialog.command
+=======
+        "[dialog-respond] caller={caller} pane={pane_id} kind={} choice={} ({}) keys={} resolved={resolved} stray={stray_input} title={}",
+        dialog.kind.as_str(),
+        index + 1,
+        chosen.label,
+        keys_sent.join("+"),
+        dialog.title
+>>>>>>> origin/main
     ));
 
     Ok(json!({
         "pane_id": pane_id,
         "responded": true,
+<<<<<<< HEAD
         "kind": "permission",
         "choice": choice_num,
         "choice_text": chosen_text,
@@ -7479,7 +8886,186 @@ fn dispatch_send_keys(
         "sent": keys.len(),
         "keys": keys,
         "reach": reach.label(),
+||||||| db83389
+        "choice": choice_num,
+        "choice_text": chosen_text,
+        "command": dialog.command,
+=======
+        "resolved": resolved,
+        "kind": dialog.kind.as_str(),
+        "choice": index + 1,
+        "choice_number": chosen.number,
+        "choice_text": chosen.label,
+        "keys_sent": keys_sent,
+        "numbered": dialog.numbered,
+        // true = ダイアログが応答直前に消えており、送ったキーが入力欄に残っている
+        // （選択は成立していない。入力欄を消してから再試行する）
+        "stray_input": stray_input,
+        // 後方互換（#319 の応答フィールド。permission 以外では本文の説明が入る）
+        "command": dialog.title,
+>>>>>>> origin/main
     }))
+}
+
+/// 番号なしダイアログでカーソル移動を試みる回数（キーを飲まれたときの再試行込み）
+const NAV_ATTEMPTS: u32 = 3;
+
+/// `choice` 文字列を選択肢の添字（0-based）へ解決する（#748）。
+///
+/// 受け付ける形:
+/// - 番号（画面に出ている番号を優先。番号なしダイアログでは 1-based の順番）
+/// - ラベルの部分一致（大小無視。複数一致は曖昧としてエラー）
+/// - `yes` / `allow` / `no` / `deny` のエイリアス（#319 の互換）
+fn resolve_choice_index(
+    dialog: &crate::claude_tui::ChoiceDialog,
+    choice: &str,
+) -> Result<usize, DispatchError> {
+    let labels = || {
+        dialog
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}. {}", o.number.unwrap_or((i + 1) as u32), o.label))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
+    let lower = choice.trim().to_lowercase();
+    if lower.is_empty() {
+        return Err(DispatchError::Operation(format!(
+            "choice が空。選択肢: {}",
+            labels()
+        )));
+    }
+    // 1. 番号
+    if let Ok(n) = lower.parse::<u32>() {
+        if let Some(i) = dialog.options.iter().position(|o| o.number == Some(n)) {
+            return Ok(i);
+        }
+        let i = (n as usize)
+            .checked_sub(1)
+            .filter(|i| *i < dialog.options.len());
+        return i.ok_or_else(|| {
+            DispatchError::Operation(format!(
+                "choice {n} は範囲外（1-{}）。選択肢: {}",
+                dialog.options.len(),
+                labels()
+            ))
+        });
+    }
+    // 2. yes / no エイリアス（#319 の互換。permission ダイアログの実文言に合わせる）
+    let alias: Option<Vec<&str>> = match lower.as_str() {
+        "yes" | "allow" => Some(vec!["yes", "allow once", "allow"]),
+        "no" | "deny" => Some(vec!["no,", "deny", "no"]),
+        _ => None,
+    };
+    if let Some(candidates) = alias {
+        for needle in candidates {
+            if let Some(i) = dialog
+                .options
+                .iter()
+                .position(|o| o.label.to_lowercase().starts_with(needle))
+            {
+                return Ok(i);
+            }
+        }
+        return Err(DispatchError::Operation(format!(
+            "{choice} に対応する選択肢が見つからない。選択肢: {}",
+            labels()
+        )));
+    }
+    // 3. ラベルの部分一致
+    let hits: Vec<usize> = dialog
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.label.to_lowercase().contains(&lower))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(DispatchError::Operation(format!(
+            "「{choice}」に一致する選択肢が無い。選択肢: {}",
+            labels()
+        ))),
+        _ => Err(DispatchError::Operation(format!(
+            "「{choice}」が複数の選択肢に一致する（{}件）。番号で指定する。選択肢: {}",
+            hits.len(),
+            labels()
+        ))),
+    }
+}
+
+/// 応答後もダイアログが残っているか（同じ選択肢構成のダイアログが見えているか）。
+/// 別のダイアログへ遷移した場合（承認 → 次の承認）は「解消済み」と扱う
+fn dialog_still_open(lines: &[String], before: &crate::claude_tui::ChoiceDialog) -> bool {
+    crate::claude_tui::detect_choice_dialog(lines)
+        .is_some_and(|now| now.labels() == before.labels())
+}
+
+/// #748: 選択肢ダイアログ表示中の `Send` を断る。
+///
+/// 返り値が `Some` なら送信せずそのエラーを返す。生のエスケープシーケンス
+/// （矢印キー等の低レベルなキー送信）は意図的な TUI 操作として通す
+fn dialog_blocks_send(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tmux_session: Option<&str>,
+    text: &str,
+) -> Option<DispatchError> {
+    if text.contains('\u{1b}') {
+        return None;
+    }
+    let (pane_id, lines) = send_target_screen(host, pane, tmux_session)?;
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines)?;
+    dialog_send_refusal(&dialog, pane_id).map(DispatchError::Operation)
+}
+
+/// 送信拒否の文面（純関数。`None` = 送信して良い）。
+/// trust / bypass は tako 自身が承諾する（送達フローが承諾 → 貼り付けまで面倒を見る）ので通す
+fn dialog_send_refusal(
+    dialog: &crate::claude_tui::ChoiceDialog,
+    pane_id: Option<u64>,
+) -> Option<String> {
+    if dialog.kind.auto_accepted() {
+        return None;
+    }
+    let options = dialog
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| format!("{}. {}", o.number.unwrap_or((i + 1) as u32), o.label))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let pane_arg = pane_id
+        .map(|p| format!("--pane {p}"))
+        .unwrap_or_else(|| "--pane <N>".to_string());
+    Some(format!(
+        "選択肢ダイアログ（{}）が表示中のため送信を中止した。\
+         入力欄が奪われているので、テキストや Enter はダイアログのキー操作として食われる\
+         （数字なら選択が確定してしまう）。選択肢: {options}。\
+         応答は `tako orchestrator respond {pane_arg} --choice <番号|ラベル>`\
+         （choice を省略すると構造だけ確認できる）",
+        dialog.kind.as_str()
+    ))
+}
+
+/// `Send` の対象ペインの画面を採る（in-process セッション優先、無ければ detached 経由）
+fn send_target_screen(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tmux_session: Option<&str>,
+) -> Option<(Option<u64>, Vec<String>)> {
+    if let Ok((_, target)) = resolve_pane(host.workspace(), pane) {
+        if let Some(session) = host.session(target) {
+            return Some((Some(target.as_u64()), session.visible_lines()));
+        }
+    }
+    let ts = tmux_session?;
+    let (session, access) = crate::reach::detached_session(ts)?;
+    access
+        .capture_screen(&session)
+        .ok()
+        .map(|lines| (pane, lines))
 }
 
 /// worker が busy かどうかを画面出力で判定する。
@@ -7787,15 +9373,37 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let app_version = env!("CARGO_PKG_VERSION").to_string();
     let mut issues: Vec<Value> = Vec::new();
 
-    // tako CLI が PATH に通っているか
+    // tako CLI が PATH に通っているか。
+    // ここで見るのは tako-app のプロセス環境（Dock 起動だと最小構成）なので、
+    // 「tako 内のシェルから打てるか」とは別物である点に注意（#601）
     let cli_path = which("tako");
     let cli_in_path = cli_path.is_some();
+    // #601: tako が開くシェルへ自動注入している CLI ディレクトリ（解決できなければ null）
+    let injected_cli_dir = tako_core::shell_integration::cli_dir();
     if !cli_in_path {
+        // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも
+        // 使いたい人向けの案内に落とす（level を下げても対処法は示し続ける）
+        let (level, message) = match injected_cli_dir.as_deref() {
+            Some(dir) => (
+                "info",
+                format!(
+                    "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
+                     tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は\
+                     このディレクトリを PATH に追加すること",
+                    dir.display()
+                ),
+            ),
+            None => (
+                "error",
+                "tako CLI が PATH に見つからない。.app バンドル内の CLI を PATH に追加するか、\
+                 scripts/build-app.sh --install でインストールすること"
+                    .to_string(),
+            ),
+        };
         issues.push(json!({
-            "level": "error",
+            "level": level,
             "check": "cli_in_path",
-            "message": "tako CLI が PATH に見つからない。.app バンドル内の CLI を PATH に追加するか、\
-                scripts/build-app.sh --install でインストールすること",
+            "message": message,
         }));
     }
 
@@ -7865,6 +9473,8 @@ fn check_health(host: &dyn ControlHost) -> Value {
         "app_version": app_version,
         "cli_version": cli_version,
         "cli_in_path": cli_in_path,
+        // tako 内のシェルへ自動で PATH 追加している CLI ディレクトリ（#601）
+        "injected_cli_dir": injected_cli_dir.map(|d| d.display().to_string()),
         "version_match": version_match,
         "tmux_available": tmux_available,
         "persist_enabled": persist_enabled,
@@ -7922,6 +9532,40 @@ fn video_response(host: &(impl ControlHost + ?Sized), target: PaneId) -> serde_j
     resp
 }
 
+/// 1 ペインぶんの自動復帰の状態（#813）。
+///
+/// `enabled` はペイン属性（layout.json 永続化）、`state` は GUI が持つ実行状態。
+/// GUI 以外のホスト（テスト・CLI 単体）では `state` は null になる
+fn limit_resume_entry(host: &dyn ControlHost, target: PaneId) -> Value {
+    let enabled = host
+        .workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes())
+        .find(|p| p.id() == target)
+        .map(|p| p.limit_autoresume())
+        .unwrap_or(false);
+    json!({
+        "pane": target.as_u64(),
+        "enabled": enabled,
+        "state": host.limit_resume_state(target),
+    })
+}
+
+/// 全ペインの自動復帰状態（`all` 指定時）
+fn limit_resume_panes(host: &dyn ControlHost) -> Vec<Value> {
+    let targets: Vec<PaneId> = host
+        .workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
+        .collect();
+    targets
+        .into_iter()
+        .map(|id| limit_resume_entry(host, id))
+        .collect()
+}
+
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
 pub(crate) fn resolve_pane(
     ws: &Workspace,
@@ -7934,6 +9578,83 @@ pub(crate) fn resolve_pane(
         }
     }
     Err(DispatchError::PaneNotFound(raw))
+}
+
+/// 呼び出し元ペインの解決に使った手段（Issue #567。応答の `method` フィールド）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneResolveMethod {
+    /// caller_pid の祖先辿りで実ペインを特定した（環境変数より確か）
+    Pid,
+    /// 渡された pane ID がそのまま現世代に存在した
+    Pane,
+    /// stale pane map（#210）で旧 ID → 新 ID に読み替えた
+    Stale,
+}
+
+impl PaneResolveMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            PaneResolveMethod::Pid => "pid",
+            PaneResolveMethod::Pane => "pane",
+            PaneResolveMethod::Stale => "stale",
+        }
+    }
+}
+
+/// Issue #567: 呼び出し元ペインの寛容な解決。`resolve_pane` と違い**エラーにしない**。
+///
+/// 解決順は #288 の `resolve_caller_pane` と揃える（pid 祖先辿り → pane そのまま →
+/// stale pane map）。pid を先に見るのは、環境変数はシェルの再利用で古くなるのに対し
+/// プロセスの祖先関係は「今どのペインで動いているか」の実態だから。
+/// role 検索へのフォールバックは**しない**: `tako master` の起動先が無関係な master
+/// ペインになると実行中のエージェントを潰すため、呼び出し元が新規タブへ逃がす方が安全。
+fn resolve_pane_lenient(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_pid: Option<u32>,
+    pid_resolver: impl Fn(u32, &[(u64, String)]) -> Option<u64>,
+) -> Option<(PaneResolveMethod, TabId, PaneId)> {
+    if let Some(pid) = caller_pid {
+        let pane_backends = collect_pane_backends(host);
+        if let Some(raw) = pid_resolver(pid, &pane_backends) {
+            if let Ok((tab, target)) = resolve_pane(host.workspace(), Some(raw)) {
+                return Some((PaneResolveMethod::Pid, tab, target));
+            }
+        }
+    }
+    if let Ok((tab, target)) = resolve_pane(host.workspace(), pane) {
+        return Some((PaneResolveMethod::Pane, tab, target));
+    }
+    if let Some((tab, target)) = pane
+        .map(PaneId::from_raw)
+        .and_then(|stale| host.resolve_stale_pane(stale))
+        .and_then(|new_id| resolve_pane(host.workspace(), Some(new_id.as_u64())).ok())
+    {
+        return Some((PaneResolveMethod::Stale, tab, target));
+    }
+    None
+}
+
+/// `Request::ResolvePane` の応答（Issue #567）
+fn resolve_pane_lenient_json(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_pid: Option<u32>,
+) -> Value {
+    let resolved = resolve_pane_lenient(host, pane, caller_pid, crate::agents::resolve_pane_by_pid);
+    // 渡された ID が現世代のものと食い違っていたか（呼び出し元の案内文用）
+    let stale = match (pane, resolved) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(requested), Some((_, _, p))) => p.as_u64() != requested,
+    };
+    json!({
+        "requested": pane,
+        "pane": resolved.map(|(_, _, p)| p.as_u64()),
+        "tab": resolved.map(|(_, t, _)| t.as_u64()),
+        "method": resolved.map(|(m, _, _)| m.as_str()),
+        "stale": stale,
+    })
 }
 
 fn find_tab(ws: &Workspace, raw: u64) -> Result<TabId, DispatchError> {
@@ -8216,6 +9937,18 @@ fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
         .tree_mut()
 }
 
+/// dispatch の呼び出し経路をペインログのクローズ発生源へ写す（Issue #566）。
+/// `PaneOrigin::User` は GUI が dispatch を直接呼ぶ経路（Web ビュー close 等）で、
+/// キーバインドや × ボタンとは区別できないため一般の dispatch として記録する
+fn close_origin_of(origin: PaneOrigin) -> tako_core::pane_log::CloseOrigin {
+    use tako_core::pane_log::CloseOrigin;
+    match origin {
+        PaneOrigin::Cli => CloseOrigin::Cli,
+        PaneOrigin::Mcp => CloseOrigin::Mcp,
+        PaneOrigin::User | PaneOrigin::Suggestion => CloseOrigin::Dispatch,
+    }
+}
+
 fn op_err(e: impl std::fmt::Display) -> DispatchError {
     DispatchError::Operation(e.to_string())
 }
@@ -8314,6 +10047,8 @@ fn list_json(host: &dyn ControlHost) -> Value {
                                 "dirty": dirty,
                             })
                         }),
+                        // 利用上限後の自動復帰のオプトイン（#813。既定 false）
+                        "limit_autoresume": p.limit_autoresume(),
                         "tmux_session": host.backend_session(p.id()),
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
@@ -8351,6 +10086,7 @@ fn list_json(host: &dyn ControlHost) -> Value {
                 "spawned_by": bp.pane().spawned_by().map(|id| id.as_u64()),
                 "origin_tab": bp.origin_tab().as_u64(),
                 "origin_tab_title": bp.origin_tab_title(),
+                "limit_autoresume": bp.pane().limit_autoresume(),
             })
         })
         .collect();
@@ -9062,6 +10798,7 @@ fn dispatch_stale_binary_dismiss(
 mod tests {
     use super::*;
     use crate::protocol::Axis;
+    use tako_core::pane_log::CloseOrigin;
     use tako_core::TerminalSession;
 
     // --- #687: 器がスクロールを持つペインのスクロール計算 ---
@@ -9142,6 +10879,8 @@ mod tests {
         /// 送達確認つきの起動コマンド（pane, 本文）。#640
         command_flows: Vec<(u64, String)>,
         detached: Vec<u64>,
+        /// #566: close の発生源マーカー（ペインログへ書かれる文字列と同一）
+        detached_markers: Vec<String>,
         previews: std::collections::HashMap<u64, (String, PreviewModeWire)>,
         preview_views: std::collections::HashMap<u64, tako_core::PreviewViewState>,
         preview_outlines: std::collections::HashMap<u64, tako_core::PreviewOutline>,
@@ -9154,12 +10893,16 @@ mod tests {
         stale_pane_map: std::collections::HashMap<PaneId, PaneId>,
         /// #217: UI テーマモード
         theme_mode: tako_core::theme::ThemeMode,
+        /// #694: UI 表示モードとペイン単位の揮発解除
+        ui_mode: tako_core::ui_mode::UiMode,
+        starter_released: std::collections::HashSet<u64>,
         lang_setting: tako_core::i18n::LangSetting,
         lang_resolved: Option<tako_core::i18n::Lang>,
         /// #321: 利用制限表示サービス
         limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
+<<<<<<< HEAD
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
         /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
@@ -9168,6 +10911,26 @@ mod tests {
         menu_bar: crate::protocol::MenuBarSnapshot,
         /// #657: UI 層へ依頼したメニュー操作
         menu_ops: Vec<crate::protocol::MenuOp>,
+||||||| db83389
+=======
+        /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
+        backend_sessions: std::collections::HashMap<u64, String>,
+        /// #549: ウェルカムバナーの表示状態
+        welcome_banner: bool,
+        /// #600: 入力予測（既定 ON）
+        autosuggest: bool,
+        /// #614: 確定キーのヒント表示 / ゴースト表示中の Tab 確定（どちらも既定 ON）
+        autosuggest_hint: bool,
+        autosuggest_tab: bool,
+        /// #666: コマンド提案カードの保管庫
+        command_cards: tako_core::CommandCards,
+        /// #666: クリップボードへ書いた内容（コピー検証用）
+        clipboard: Vec<String>,
+        /// #749: 積まれたプロンプト送達フロー（後任 master への初期プロンプト検証用）
+        prompt_flows: Vec<(PaneId, String)>,
+        /// #761: 積まれた遅延書き込み（= 後任 master の起動コマンド）の検証用
+        writes: Vec<(PaneId, String)>,
+>>>>>>> origin/main
     }
 
     impl MockHost {
@@ -9179,6 +10942,7 @@ mod tests {
                 queued_writes: Vec::new(),
                 command_flows: Vec::new(),
                 detached: Vec::new(),
+                detached_markers: Vec::new(),
                 previews: std::collections::HashMap::new(),
                 preview_views: std::collections::HashMap::new(),
                 preview_outlines: std::collections::HashMap::new(),
@@ -9188,6 +10952,8 @@ mod tests {
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
                 theme_mode: tako_core::theme::ThemeMode::Dark,
+                ui_mode: tako_core::ui_mode::UiMode::Terminal,
+                starter_released: std::collections::HashSet::new(),
                 lang_setting: tako_core::i18n::LangSetting::System,
                 lang_resolved: None,
                 limit_service: tako_core::LimitService::Claude,
@@ -9197,10 +10963,23 @@ mod tests {
                     used_bytes: 32 * 1024 * 1024,
                     entries: 2,
                 },
+<<<<<<< HEAD
                 window_state_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
+||||||| db83389
+=======
+                backend_sessions: std::collections::HashMap::new(),
+                welcome_banner: false,
+                autosuggest: true,
+                autosuggest_hint: true,
+                autosuggest_tab: true,
+                command_cards: tako_core::CommandCards::new(),
+                clipboard: Vec::new(),
+                prompt_flows: Vec::new(),
+                writes: Vec::new(),
+>>>>>>> origin/main
             }
         }
 
@@ -9238,8 +11017,17 @@ mod tests {
             self.attached.push(pane.as_u64());
             self.attached_options.insert(pane.as_u64(), options);
         }
-        fn detach_session(&mut self, pane: PaneId) {
+        fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+            self.prompt_flows.push((pane, prompt));
+        }
+        fn queue_write(&mut self, pane: PaneId, data: Vec<u8>) {
+            self.writes
+                .push((pane, String::from_utf8_lossy(&data).to_string()));
+        }
+        fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
             self.detached.push(pane.as_u64());
+            self.detached_markers
+                .push(origin.marker_with_caller(caller));
             self.previews.remove(&pane.as_u64());
             self.preview_views.remove(&pane.as_u64());
             self.preview_outlines.remove(&pane.as_u64());
@@ -9310,6 +11098,33 @@ mod tests {
         fn set_theme_mode(&mut self, mode: tako_core::theme::ThemeMode) {
             self.theme_mode = mode;
         }
+        // #694: UI 表示モード（GUI ライク表示）
+        fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+            self.ui_mode
+        }
+        fn set_ui_mode(&mut self, mode: tako_core::ui_mode::UiMode) {
+            self.ui_mode = mode;
+        }
+        fn starter_released_panes(&self) -> Vec<PaneId> {
+            self.starter_released
+                .iter()
+                .map(|id| PaneId::from_raw(*id))
+                .collect()
+        }
+        fn set_starter_released(&mut self, pane: PaneId, released: bool) {
+            if released {
+                self.starter_released.insert(pane.as_u64());
+            } else {
+                self.starter_released.remove(&pane.as_u64());
+            }
+        }
+        // #549: ウェルカムバナー
+        fn welcome_banner_visible(&self) -> bool {
+            self.welcome_banner
+        }
+        fn set_welcome_banner_visible(&mut self, visible: bool) {
+            self.welcome_banner = visible;
+        }
         fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
             self.lang_setting
         }
@@ -9326,6 +11141,34 @@ mod tests {
         }
         fn set_limit_service(&mut self, service: tako_core::LimitService) {
             self.limit_service = service;
+        }
+        fn autosuggest_enabled(&self) -> bool {
+            self.autosuggest
+        }
+        fn set_autosuggest(&mut self, enabled: bool) {
+            self.autosuggest = enabled;
+        }
+        fn autosuggest_hint_enabled(&self) -> bool {
+            self.autosuggest_hint
+        }
+        fn set_autosuggest_hint(&mut self, enabled: bool) {
+            self.autosuggest_hint = enabled;
+        }
+        fn autosuggest_tab_enabled(&self) -> bool {
+            self.autosuggest_tab
+        }
+        fn set_autosuggest_tab(&mut self, enabled: bool) {
+            self.autosuggest_tab = enabled;
+        }
+        fn command_cards(&self) -> Option<&tako_core::CommandCards> {
+            Some(&self.command_cards)
+        }
+        fn command_cards_mut(&mut self) -> Option<&mut tako_core::CommandCards> {
+            Some(&mut self.command_cards)
+        }
+        fn queue_clipboard_copy(&mut self, text: String) -> bool {
+            self.clipboard.push(text);
+            true
         }
     }
 
@@ -9474,6 +11317,110 @@ mod tests {
             .unwrap()
     }
 
+    /// #813: 自動復帰のオプトインは既定 OFF で、dispatch から読み書きでき、
+    /// list / read にも同じ値が出る（UI・CLI・MCP はすべてこの dispatch を通る）
+    #[test]
+    fn issue813_自動復帰の設定と参照が全経路で同じ値を返す() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let other = split(&mut host, root);
+
+        // 既定は OFF
+        let q = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(root),
+                enabled: None,
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(q["pane"], root);
+        assert_eq!(q["enabled"], false);
+
+        // ON にすると応答・list の両方に出る（他のペインには波及しない）
+        let on = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(root),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(on["enabled"], true);
+        let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
+        let panes = list["tabs"][0]["panes"].as_array().unwrap();
+        let flag = |id: u64| {
+            panes
+                .iter()
+                .find(|p| p["id"] == id)
+                .map(|p| p["limit_autoresume"].clone())
+                .unwrap()
+        };
+        assert_eq!(flag(root), json!(true));
+        assert_eq!(flag(other), json!(false), "他のペインへ波及しない");
+
+        // all で一覧できる
+        let all = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let entries = all["panes"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|e| e["pane"] == root && e["enabled"] == true));
+
+        // OFF に戻せる
+        let off = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(root),
+                enabled: Some(false),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(off["enabled"], false);
+
+        // all と enabled の併用は拒否（設定と一覧の取り違えを構造的に防ぐ）
+        let bad = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: None,
+                enabled: Some(true),
+                all: Some(true),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(
+            matches!(bad, Err(DispatchError::InvalidParams(_))),
+            "{bad:?}"
+        );
+
+        // 存在しないペインはエラー
+        let missing = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(9999),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
+    }
+
     #[test]
     fn splitで同じタブに新ペインが生えattachされる() {
         let mut host = MockHost::new();
@@ -9502,6 +11449,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9550,6 +11498,7 @@ mod tests {
             Request::Close {
                 pane: Some(new_id),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -9557,6 +11506,69 @@ mod tests {
         assert_eq!(result["closed"].as_u64(), Some(new_id));
         assert_eq!(host.detached, vec![new_id]);
         assert_eq!(host.ws.active_tab().tree().len(), 1);
+    }
+
+    /// #566: dispatch 経由の close は確認を挟まない（AI フルコントロール維持）が、
+    /// 発生源は必ず記録する。CLI / MCP / 呼び出し元 role が事後に区別できること
+    #[test]
+    fn dispatch_closeは経路と呼び出し元をペインログへ記録する() {
+        // CLI 経由（role なし）
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let cli_pane = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(cli_pane),
+                force: false,
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.detached_markers,
+            vec!["close:dispatch(cli)".to_string()]
+        );
+
+        // MCP 経由（呼び出し元 role つき = どのエージェントが閉じたか）
+        let mcp_pane = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(mcp_pane),
+                force: false,
+                caller_role: Some("orchestrator-master:takodev".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            host.detached_markers[1],
+            "close:dispatch(mcp, caller=orchestrator-master:takodev)"
+        );
+    }
+
+    /// #566: BackgroundKill（たまり場からの kill）も発生源が残る
+    #[test]
+    fn background_killも発生源を記録する() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::Background {
+                pane: Some(pane),
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        dispatch(&mut host, Request::BackgroundKill { pane }, PaneOrigin::Mcp).unwrap();
+        assert_eq!(
+            host.detached_markers,
+            vec!["close:dispatch(mcp)".to_string()]
+        );
     }
 
     #[test]
@@ -9568,6 +11580,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9578,6 +11591,7 @@ mod tests {
             Request::Close {
                 pane: Some(root),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -9595,6 +11609,7 @@ mod tests {
             Request::Close {
                 pane: Some(root),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -9613,6 +11628,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: Some(true),
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9642,6 +11658,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9658,6 +11675,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: Some(true),
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -9677,6 +11695,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: Some(true),
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10216,6 +12235,7 @@ mod tests {
             Request::TabNew {
                 title: Some("agents".into()),
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10407,6 +12427,98 @@ mod tests {
         assert_eq!(tab.title_source(), tako_core::TitleSource::Default);
     }
 
+    /// #552 案 4「この名前を固定」: 自動命名された名前を打ち直さずに固定でき、
+    /// 固定後は自動リネームの対象外になる（GUI のピン印と同じ経路）
+    #[test]
+    fn タブ名の固定と解除() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let tab_id = host.ws.tabs()[0].id().as_u64();
+        // 自動命名された状態を作る
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "tako 検証".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        // 変更せずに状態だけ取得できる
+        let status = dispatch(
+            &mut host,
+            Request::TabPinTitle {
+                pane: Some(root),
+                tab: None,
+                pinned: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(status["pinned"].as_bool(), Some(false));
+        assert_eq!(status["source"].as_str(), Some("auto"));
+
+        // 固定: 名前は変えずに手動指定へ
+        let pinned = dispatch(
+            &mut host,
+            Request::TabPinTitle {
+                pane: Some(root),
+                tab: None,
+                pinned: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(pinned["title"].as_str(), Some("tako 検証"));
+        assert_eq!(pinned["pinned"].as_bool(), Some(true));
+        assert_eq!(
+            host.ws.tabs()[0].title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // 固定後は自動リネームが通らない
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "別の自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(host.ws.tabs()[0].title(), "tako 検証");
+
+        // 解除すると自動リネームが再開する（タイトルは保持）
+        let released = dispatch(
+            &mut host,
+            Request::TabPinTitle {
+                pane: None,
+                tab: Some(tab_id),
+                pinned: Some(false),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(released["pinned"].as_bool(), Some(false));
+        assert_eq!(released["title"].as_str(), Some("tako 検証"));
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: None,
+                tab: Some(tab_id),
+                title: "別の自動名".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(host.ws.tabs()[0].title(), "別の自動名");
+    }
+
     #[test]
     fn タブの自動リネームは手動リネーム済みを上書きしない() {
         let mut host = MockHost::new();
@@ -10504,6 +12616,7 @@ mod tests {
             Request::TabNew {
                 title: Some("agents".into()),
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10519,6 +12632,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -10549,6 +12663,7 @@ mod tests {
                     mode,
                     direction: None,
                     focus: None,
+                    new_tab: false,
                 },
                 PaneOrigin::Mcp,
             )
@@ -10592,6 +12707,179 @@ mod tests {
         // 存在しないパス・ディレクトリはエラー
         assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
         assert!(open(&mut host, dir.display().to_string(), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-3.22 / #835: `new_tab` は「そのファイルだけが載った 1 枚」を作る。
+    /// Finder の「このアプリケーションで開く」がこの経路を通る
+    #[test]
+    fn open_fileのnew_tabはファイル専用のタブを作る() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-newtab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("b.md"), "# 見出し").unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let first_tab = host.ws.active_tab_id();
+        let open_new_tab = |host: &mut MockHost, path: String, focus: Option<bool>| {
+            dispatch(
+                host,
+                Request::OpenFile {
+                    pane: Some(root),
+                    path,
+                    mode: None,
+                    direction: None,
+                    focus,
+                    new_tab: true,
+                },
+                PaneOrigin::Mcp,
+            )
+        };
+
+        let result = open_new_tab(
+            &mut host,
+            dir.join("a.rs").display().to_string(),
+            Some(true),
+        )
+        .unwrap();
+        let tab_a = TabId::from_raw(result["tab"].as_u64().unwrap());
+        assert_ne!(tab_a, first_tab, "新しいタブが作られる");
+        assert_eq!(result["created"].as_bool(), Some(true));
+        assert_eq!(result["mode"].as_str(), Some("code"));
+        // 元のタブは 1 ペインのまま = 既存の作業を一切動かさない
+        assert_eq!(host.ws.get_tab(first_tab).unwrap().tree().len(), 1);
+        // 新しいタブは「プレビュー 1 枚だけ」。ターミナルは起動しない
+        assert_eq!(host.ws.get_tab(tab_a).unwrap().tree().len(), 1);
+        assert!(
+            host.attached.is_empty(),
+            "プレビュー専用タブは PTY を持たない"
+        );
+        // タブ名はファイル名で、自動リネームに奪われない手動扱い
+        assert_eq!(host.ws.get_tab(tab_a).unwrap().title(), "a.rs");
+        assert_eq!(
+            host.ws.get_tab(tab_a).unwrap().title_source(),
+            tako_core::TitleSource::Manual
+        );
+        // focus=true なので新しいタブが前に出る
+        assert_eq!(host.ws.active_tab_id(), tab_a);
+
+        // 2 ファイル目も再利用せず別のタブになる（複数選択で全部が同時に見える）
+        let result = open_new_tab(
+            &mut host,
+            dir.join("b.md").display().to_string(),
+            Some(true),
+        )
+        .unwrap();
+        let tab_b = TabId::from_raw(result["tab"].as_u64().unwrap());
+        assert_ne!(tab_b, tab_a);
+        assert_eq!(result["mode"].as_str(), Some("markdown"));
+        assert_eq!(host.ws.tabs().len(), 3);
+
+        // focus 省略（CLI / MCP の既定）はアクティブタブを奪わない
+        let before = host.ws.active_tab_id();
+        let result = open_new_tab(&mut host, dir.join("a.rs").display().to_string(), None).unwrap();
+        assert_eq!(
+            host.ws.active_tab_id(),
+            before,
+            "既定はユーザーの表示を奪わない"
+        );
+        assert_ne!(
+            TabId::from_raw(result["tab"].as_u64().unwrap()),
+            before,
+            "タブ自体は裏で作られる"
+        );
+
+        // direction とは排他（新しいタブには分割元が無い）
+        let conflict = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: dir.join("a.rs").display().to_string(),
+                mode: None,
+                direction: Some(Direction::Right),
+                focus: None,
+                new_tab: true,
+            },
+            PaneOrigin::Mcp,
+        );
+        assert!(conflict.is_err(), "new_tab + direction はエラー");
+
+        // ディレクトリ・不在パスは new_tab でもエラー（タブを作り散らかさない）
+        let tabs_before = host.ws.tabs().len();
+        assert!(open_new_tab(&mut host, dir.display().to_string(), None).is_err());
+        assert!(open_new_tab(&mut host, dir.join("no-such").display().to_string(), None).is_err());
+        assert_eq!(host.ws.tabs().len(), tabs_before, "失敗時にタブは増えない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #835: フォルダを渡されたときの受け皿。`tako tab new --cwd` = Finder から
+    /// フォルダを開いたときの「そのフォルダでシェルを起動する」経路
+    #[test]
+    fn tab_newのcwdはそのフォルダでシェルを起動する() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-tabcwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: Some("proj".into()),
+                focus: Some(true),
+                cwd: Some(dir.display().to_string()),
+            },
+            PaneOrigin::User,
+        )
+        .unwrap();
+        let pane = result["pane"].as_u64().unwrap();
+        let spawned = host
+            .attached_options
+            .get(&pane)
+            .expect("シェルが起動依頼される");
+        assert_eq!(
+            spawned.cwd.as_deref(),
+            Some(dir.canonicalize().unwrap().as_path()),
+            "頼まれたフォルダでシェルが立つ"
+        );
+        assert!(spawned.command.is_none(), "既定シェルを起動する");
+
+        // 存在しない・フォルダでないパスは起動前にエラー（黙って別の場所で開かない）
+        assert!(dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: Some(dir.join("no-such").display().to_string()),
+            },
+            PaneOrigin::User,
+        )
+        .is_err());
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        assert!(dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: Some(dir.join("f.txt").display().to_string()),
+            },
+            PaneOrigin::User,
+        )
+        .is_err());
+        // cwd 省略は従来どおり継承（回帰防止）
+        let result = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: None,
+            },
+            PaneOrigin::User,
+        )
+        .unwrap();
+        let pane = result["pane"].as_u64().unwrap();
+        assert!(host.attached_options.get(&pane).unwrap().cwd.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10732,6 +13020,115 @@ mod tests {
         assert!(!host.preview_reload.enabled());
     }
 
+    /// #600: 入力予測は既定 ON で、取得と切替が往復する
+    #[test]
+    fn autosuggestは状態を取得変更できる() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["enabled"], true, "既定 ON");
+        // 何が効くのかを AI が判断できる情報を必ず返す
+        assert_eq!(initial["shell"], "zsh");
+        assert_eq!(initial["provider"], "zsh-autosuggestions");
+        assert_eq!(
+            initial["version"],
+            tako_core::shell_integration::AUTOSUGGEST_VERSION
+        );
+
+        let off = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: Some(false),
+                hint: None,
+                tab: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(off["enabled"], false);
+        assert!(!host.autosuggest);
+        // #614: 本体だけ触ったときにヒント / Tab 確定を巻き込まない
+        assert_eq!(off["hint"], true);
+        assert_eq!(off["tab_accept"], true);
+
+        let on = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: Some(true),
+                hint: None,
+                tab: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(on["enabled"], true);
+        assert!(host.autosuggest);
+    }
+
+    /// #614: 確定キーのヒントと Tab 確定は本体と独立に切り替えられる。
+    /// 「Tab 確定を切ったのに『Tab で確定』と案内する」矛盾も起こさない
+    #[test]
+    fn autosuggestのヒントとtab確定は独立に切り替えられる() {
+        let mut host = MockHost::new();
+        let initial = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(initial["hint"], true, "ヒントは既定 ON");
+        assert_eq!(initial["tab_accept"], true, "Tab 確定は既定 ON");
+        assert_eq!(initial["accept_keys"], json!(["Right", "Tab"]));
+
+        // Tab 確定だけ切る（本体とヒントは維持）
+        let no_tab = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: Some(false),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(no_tab["enabled"], true);
+        assert_eq!(no_tab["hint"], true);
+        assert_eq!(no_tab["tab_accept"], false);
+        assert_eq!(
+            no_tab["accept_keys"],
+            json!(["Right"]),
+            "Tab 確定 OFF なのに Tab を確定キーとして案内している"
+        );
+        assert!(!host.autosuggest_tab);
+
+        // ヒントだけ恒久 OFF（Tab 確定は触らない）
+        let no_hint = dispatch(
+            &mut host,
+            Request::Autosuggest {
+                enabled: None,
+                hint: Some(false),
+                tab: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(no_hint["hint"], false);
+        assert_eq!(no_hint["tab_accept"], false, "Tab 確定を巻き戻していない");
+        assert!(!host.autosuggest_hint);
+    }
+
     #[test]
     fn preview_cacheは予算と利用状況を取得変更できる() {
         let mut host = MockHost::new();
@@ -10782,6 +13179,7 @@ mod tests {
                     mode: None,
                     direction,
                     focus: Some(true),
+                    new_tab: false,
                 },
                 PaneOrigin::User,
             )
@@ -10820,6 +13218,7 @@ mod tests {
                 mode: Some(PreviewModeWire::Code),
                 direction: None,
                 focus: None,
+                new_tab: false,
             },
             PaneOrigin::Cli,
         )
@@ -10855,6 +13254,7 @@ mod tests {
                 mode: None,
                 direction: None,
                 focus: None,
+                new_tab: false,
             },
             PaneOrigin::User,
         );
@@ -10950,6 +13350,7 @@ mod tests {
             Request::Close {
                 pane: None,
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -10960,6 +13361,7 @@ mod tests {
             Request::Close {
                 pane: Some(99999),
                 force: false,
+                caller_role: None,
             },
             PaneOrigin::Cli,
         )
@@ -11131,6 +13533,7 @@ mod tests {
                 Request::TabNew {
                     title: None,
                     focus: None,
+                    cwd: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -11210,6 +13613,7 @@ mod tests {
                 Request::TabNew {
                     title: None,
                     focus: None,
+                    cwd: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -11856,7 +14260,12 @@ mod tests {
             live_tail: None,
             full_screen: None,
             has_running_children: false,
+<<<<<<< HEAD
             pane_pid: None,
+||||||| db83389
+=======
+            limit_resume: Value::Null,
+>>>>>>> origin/main
         };
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
@@ -11875,7 +14284,12 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -11892,7 +14306,12 @@ mod tests {
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -11908,7 +14327,12 @@ mod tests {
                 live_tail: None,
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -11930,7 +14354,12 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -11955,7 +14384,12 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -11974,7 +14408,12 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -11994,7 +14433,12 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -12017,7 +14461,12 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -12042,7 +14491,12 @@ mod tests {
                 ),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -12065,7 +14519,12 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -12272,6 +14731,7 @@ mod tests {
         // この状態で `claude agents --json` を素で実行すると worker が一覧に出ない
         std::env::set_var(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV, &alt_config);
 
+<<<<<<< HEAD
         // worker は既定 config dir で走らせるので、事前信頼もそちらへ書く
         crate::claude_tui::ensure_trusted(&work.display().to_string()).expect("事前信頼を書ける");
 
@@ -12370,6 +14830,725 @@ mod tests {
             busy["status_source"], "agents-auto",
             "busy 中も config dir を跨いで claude セッションを解決できている（#571 の根因）: {busy}"
         );
+||||||| db83389
+        assert_eq!(v["status"], "busy");
+=======
+        // worker は既定 config dir で走らせるので、事前信頼もそちらへ書く（#558）
+        let default_cfg = crate::orchestrator::claude_default_config_dir()
+            .expect("既定 config dir")
+            .display()
+            .to_string();
+        crate::claude_tui::ensure_trusted_in(Some(&default_cfg), &work.display().to_string())
+            .expect("事前信頼を書ける");
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", E2E_SOCKET_571, "kill-server"])
+            .output();
+        let session = "w571";
+        let status = std::process::Command::new("tmux")
+            // tmux サーバーへ汚染を伝播させない（worker は既定 config dir で動く必要がある）
+            .env_remove(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+            .args([
+                "-L",
+                E2E_SOCKET_571,
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "100",
+                "-y",
+                "35",
+                "-c",
+                work.to_str().expect("テストパスは UTF-8"),
+                "unset CLAUDE_CONFIG_DIR; exec claude --model haiku",
+            ])
+            .status()
+            .expect("tmux を実行できる");
+        assert!(status.success(), "tmux new-session が失敗した");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.backend_sessions.insert(pane, session.to_string());
+
+        // プロンプト送達。ここから worker は busy になる
+        let report = crate::claude_tui::deliver_via_tmux(
+            Some(E2E_SOCKET_571),
+            session,
+            "What is 40 + 2? Reply with only the answer spelled out in English words, lowercase.",
+            true,
+        )
+        .expect("送達が完了する");
+        assert!(
+            report.verified,
+            "プロンプトが入力欄へ反映される: {report:?}"
+        );
+
+        let opts = crate::orchestrator::wait::WatchOptions {
+            pane_id: pane,
+            session_id: None,
+            tmux_session: Some(session.to_string()),
+            timeout: Some(Duration::from_secs(60)),
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(2),
+        };
+
+        // ① busy を実際に観測する（「最初から idle」で素通りしていないことの担保）。
+        //    判定はワッチ結果の後で行う（本命は ② なので、失敗時にそちらを先に見せる）
+        let started = Instant::now();
+        let mut saw_busy = None;
+        while started.elapsed() < Duration::from_secs(30) {
+            let v = dispatch(
+                &mut host,
+                Request::OrchestratorWorkerStatus {
+                    pane_id: Some(pane),
+                    session_id: None,
+                    tmux_session: Some(session.to_string()),
+                    worker: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .expect("worker_status が引ける");
+            if v["status"] == "busy" {
+                saw_busy = Some(v);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        // ② busy → idle の遷移を watch が検知して完了すること（本命）
+        let outcome = {
+            let mut exec =
+                |req: Request| dispatch(&mut host, req, PaneOrigin::Cli).map_err(|e| e.to_string());
+            crate::orchestrator::wait::wait_for_worker(&mut exec, &opts, None)
+        };
+        drop(guard);
+        assert!(
+            matches!(
+                outcome,
+                crate::orchestrator::wait::WatchOutcome::Idle { .. }
+            ),
+            "busy → idle 遷移で Idle を返す（修正前は永久 busy のまま Timeout になる）: {outcome:?}"
+        );
+
+        let busy = saw_busy.expect("送達後に busy を観測できる");
+        assert_eq!(
+            busy["status_source"], "agents-auto",
+            "busy 中も config dir を跨いで claude セッションを解決できている（#571 の根因）: {busy}"
+        );
+    }
+
+    // --- #577 E2E: 実 tmux + 実 claude で permission ダイアログの検知を通しで確認する ---
+    //
+    // Issue #577 の再現手順（brace expansion を含む Bash 実行 = 自動承認されない）を
+    // そのまま流し、watch が WORKER_QUESTION ではなく WORKER_PERMISSION を出すこと、
+    // `worker_status.permission_dialog` が構造化情報を返すことを確かめる。手動実行:
+    //
+    // ```sh
+    // cargo test -p tako-control --lib issue577_e2e -- --ignored --nocapture --test-threads=1
+    // ```
+    //
+    // 前提: `claude` CLI がログイン済み / `tmux` がある / ネットワーク接続。
+    // tmux ソケットと data ディレクトリは隔離するので本番の tako / tmux には触れない
+
+    const E2E_SOCKET_577: &str = "tako-e2e-577";
+
+    fn e2e_577_base() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/private/tmp/tako-e2e-577-{}", std::process::id()))
+    }
+
+    /// テスト用の一時ディレクトリだけを消す（#512 の事故を構造で防ぐ）
+    fn remove_e2e_577_dir(dir: &std::path::Path) {
+        let allowed = dir.parent() == Some(std::path::Path::new("/private/tmp"))
+            && dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("tako-e2e-577-"));
+        assert!(
+            allowed,
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct E2e577Guard {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for E2e577Guard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", E2E_SOCKET_577, "kill-server"])
+                .output();
+            remove_e2e_577_dir(&self.dir);
+            remove_e2e_trust_entry(&self.dir.join("work"));
+        }
+    }
+
+    /// e2e が書いた事前信頼エントリを claude の `.claude.json` から除去する（best-effort）。
+    /// 消さないと実行のたびに `/private/tmp/tako-e2e-577-<pid>/work` が溜まり続ける
+    /// （claude_tui_e2e の `remove_trust_entry` と同じ後始末）
+    fn remove_e2e_trust_entry(dir: &std::path::Path) {
+        let key = dir.display().to_string();
+        for path in crate::claude_tui::config_json_paths(None) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(mut root) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else {
+                continue;
+            };
+            if projects.remove(&key).is_some() {
+                if let Ok(serialized) = serde_json::to_string_pretty(&root) {
+                    let _ = std::fs::write(&path, serialized);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
+    fn issue577_e2e_実claudeのpermissionダイアログをwatchが検知する() {
+        use std::time::{Duration, Instant};
+
+        let base = e2e_577_base();
+        remove_e2e_577_dir(&base);
+        let work = base.join("work");
+        let data = base.join("data");
+        for d in [&work, &data] {
+            std::fs::create_dir_all(d).expect("一時ディレクトリを作れる");
+        }
+        let guard = E2e577Guard { dir: base.clone() };
+
+        std::env::set_var("TAKO_TMUX_SOCKET", E2E_SOCKET_577);
+        std::env::set_var("TAKO_DATA_DIR", &data);
+
+        // 信頼ダイアログを出さない（出ると permission ダイアログまで到達しない）
+        let default_cfg = crate::orchestrator::claude_default_config_dir()
+            .expect("既定 config dir")
+            .display()
+            .to_string();
+        crate::claude_tui::ensure_trusted_in(Some(&default_cfg), &work.display().to_string())
+            .expect("事前信頼を書ける");
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", E2E_SOCKET_577, "kill-server"])
+            .output();
+        let session = "w577";
+        let status = std::process::Command::new("tmux")
+            // 親（tako の worker ペイン）の env を持ち込むと agents 一覧に載らない
+            .env_remove(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+            .env_remove("CLAUDE_CODE_CHILD_SESSION")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .args([
+                "-L",
+                E2E_SOCKET_577,
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "100",
+                "-y",
+                "35",
+                "-c",
+                work.to_str().expect("テストパスは UTF-8"),
+                // permission ダイアログを出させるので --dangerously-skip-permissions は付けない
+                "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; \
+                 exec claude --model haiku",
+            ])
+            .status()
+            .expect("tmux を実行できる");
+        assert!(status.success(), "tmux new-session が失敗した");
+
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.backend_sessions.insert(pane, session.to_string());
+
+        // Issue #577 の再現プロンプト: brace expansion を含む Bash は
+        // 「Contains brace_expression」で必ず承認を求められる
+        let report = crate::claude_tui::deliver_via_tmux(
+            Some(E2E_SOCKET_577),
+            session,
+            "Use the Bash tool to run exactly this command, without asking me first: \
+             for i in {1..3}; do echo $i; done",
+            true,
+        )
+        .expect("送達が完了する");
+        assert!(
+            report.verified,
+            "プロンプトが入力欄へ反映される: {report:?}"
+        );
+
+        // ダイアログの実在は **検知関数に頼らず** 画面の文言で確認する
+        let dialog_deadline = Instant::now() + Duration::from_secs(180);
+        let mut screen = String::new();
+        while Instant::now() < dialog_deadline {
+            screen = tako_core::tmux::capture_session(Some(E2E_SOCKET_577), session)
+                .map(|l| l.join("\n"))
+                .unwrap_or_default();
+            if screen.contains("Do you want to proceed?") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(
+            screen.contains("Do you want to proceed?"),
+            "承認ダイアログが出るはず。画面:\n{screen}"
+        );
+
+        let worker_status = |host: &mut MockHost, session_id: Option<String>| -> Value {
+            dispatch(
+                host,
+                Request::OrchestratorWorkerStatus {
+                    pane_id: Some(pane),
+                    session_id,
+                    tmux_session: Some(session.to_string()),
+                    worker: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .expect("worker_status が引ける")
+        };
+
+        // ① agents 解決に成功する経路。この claude 版は permission 待ちで生 status
+        //    `waiting` を返すので、修正前からここは waiting になる（非回帰の確認）
+        let auto = worker_status(&mut host, None);
+        println!(
+            "[#577 e2e] agents 経路: status={} source={}",
+            auto["status"], auto["status_source"]
+        );
+        assert_eq!(auto["status"], "waiting", "{auto}");
+        assert!(auto["permission_dialog"].is_object(), "{auto}");
+
+        // ② **#577 の本体**: agents 一覧に載らない worker（別 config dir 継承・
+        //    CLAUDE_CODE_CHILD_SESSION つき起動・codex / agy）を模して、解決できない
+        //    session ID を渡し status_source=screen へ落とす。修正前はこの経路が
+        //    「idle + question」で、permission_dialog は常に null だった
+        const MISSING_SID: &str = "00000000-0000-4000-8000-000000000577";
+        let screened = worker_status(&mut host, Some(MISSING_SID.to_string()));
+        println!(
+            "[#577 e2e] 画面推定経路: status={} source={} events={}",
+            screened["status"], screened["status_source"], screened["events"]
+        );
+        assert_eq!(
+            screened["status_source"], "screen",
+            "agents が解決できない状況を作れている: {screened}"
+        );
+        assert_eq!(
+            screened["status"], "waiting",
+            "修正前は idle（`❯ 1. Yes` を入力欄と見なす）: {screened}"
+        );
+        assert!(
+            screened["permission_dialog"].is_object(),
+            "修正前は常に null: {screened}"
+        );
+        let options = screened["permission_dialog"]["options"]
+            .as_array()
+            .expect("選択肢が取れる");
+        assert!(options.len() >= 2, "選択肢が構造化される: {screened}");
+        let kinds: Vec<&str> = screened["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"permission_dialog"), "{kinds:?}");
+        assert!(
+            !kinds.contains(&"question"),
+            "question は出さない: {kinds:?}"
+        );
+
+        // ③ watch（画面推定経路）: WORKER_PERMISSION（修正前は WORKER_QUESTION）
+        let opts = crate::orchestrator::wait::WatchOptions {
+            pane_id: pane,
+            session_id: Some(MISSING_SID.to_string()),
+            tmux_session: Some(session.to_string()),
+            timeout: Some(Duration::from_secs(90)),
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(2),
+        };
+        let outcome = {
+            let mut exec =
+                |req: Request| dispatch(&mut host, req, PaneOrigin::Cli).map_err(|e| e.to_string());
+            crate::orchestrator::wait::wait_for_worker(&mut exec, &opts, None)
+        };
+        let crate::orchestrator::wait::WatchOutcome::PermissionWaiting {
+            ref permission_dialog,
+        } = outcome
+        else {
+            panic!("WORKER_PERMISSION を返す（修正前は Question）: {outcome:?}\n画面:\n{screen}");
+        };
+        println!("[#577 e2e] permission_dialog = {permission_dialog}");
+
+        // ④ 応答（choice 1 = Yes 一回だけ）で解除でき、以後は通常の完了検知に戻る
+        //    （#571 の非回帰。ダイアログを永続 waiting に固定していない）
+        dispatch(
+            &mut host,
+            Request::OrchestratorRespond {
+                pane_id: pane,
+                choice: Some("1".into()),
+                caller_role: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("permission ダイアログへ応答できる");
+
+        let after = {
+            let mut exec =
+                |req: Request| dispatch(&mut host, req, PaneOrigin::Cli).map_err(|e| e.to_string());
+            crate::orchestrator::wait::wait_for_worker(&mut exec, &opts, None)
+        };
+        drop(guard);
+        assert!(
+            matches!(after, crate::orchestrator::wait::WatchOutcome::Idle { .. }),
+            "承認後は通常どおり Idle で完了する: {after:?}"
+        );
+    }
+
+    // --- #577: permission ダイアログ待ちを waiting へ格上げする ---
+
+    /// permission ダイアログ待ちの実画面（Issue #577 の再現時に採取した形。
+    /// brace expansion を含む Bash 実行の承認要求）
+    const PERMISSION_SCREEN_577: &str = "\
+⏺ Running 1 shell command…\n\
+────────────────────────────────────────────────\n\
+ Bash command\n\
+   for i in {1..12}; do echo $i; sleep 1; done; echo done\n\
+ Contains brace_expression\n\
+ Do you want to proceed?\n\
+ ❯ 1. Yes\n\
+   2. Yes, and don't ask again for echo commands\n\
+   3. No, and tell Claude what to do differently (esc)\n\
+ Esc to cancel · Tab to amend · ctrl+e to explain";
+
+    /// worker が **本文で** 質問して入力待ちになった画面（入力欄は最下部に健在）
+    const QUESTION_SCREEN_577: &str = "\
+⏺ 2 通りの直し方があります。どちらにしますか?\n\
+  1. 既存 API を変えずに互換レイヤを足す\n\
+  2. 破壊的変更として一気に置き換える\n\
+────────────────────────────────────────────────\n\
+❯ \n\
+────────────────────────────────────────────────\n\
+  claude-opus-5 · ctx 23%";
+
+    fn resolved_with_screen(status: &str, source: &str, screen: &str) -> ResolvedWorkerStatus {
+        let mut r = resolved(status, source, true);
+        r.recent_output = Some(screen.into());
+        r
+    }
+
+    #[test]
+    fn issue577_agentsがidleでも画面のダイアログでwaitingへ格上げする() {
+        // agents が idle を返す（一覧の取りこぼし・claude 以外・古い版）状況でも、
+        // 画面にダイアログが実在すれば停止側が正。旧実装は agents の waiting だけを
+        // 根拠にしていたので permission_dialog が null のままだった
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            PERMISSION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        let dialog = &v["permission_dialog"];
+        assert!(dialog.is_object(), "構造化情報が付く: {dialog}");
+        assert!(
+            dialog["command"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("for i in {1..12}"),
+            "承認対象のコマンドを抽出する: {dialog}"
+        );
+        let options = dialog["options"].as_array().expect("選択肢が配列");
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0], "Yes");
+        assert_eq!(dialog["highlighted"], 0);
+
+        // events は permission_dialog のみ（question は出さない = master が
+        // respond ではなく通常の質問応答へ流れるのを防ぐ）
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"permission_dialog"), "{kinds:?}");
+        assert!(!kinds.contains(&"question"), "{kinds:?}");
+    }
+
+    #[test]
+    fn issue577_画面推定経路でもwaitingへ格上げする() {
+        // codex / agy や agents 解決失敗時（status_source=screen）。
+        // `❯ 1. Yes` を入力欄と見なして idle になっていた経路
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "unknown",
+            "screen",
+            PERMISSION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(v["permission_dialog"].is_object());
+    }
+
+    #[test]
+    fn issue577_本物の質問はidleのままでpermission_dialogはnull() {
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            QUESTION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "idle", "格上げしない");
+        assert!(v["permission_dialog"].is_null());
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"question"),
+            "question は従来どおり: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn issue577_通常のidleはidleのまま() {
+        // #571 の非回帰: ダイアログの無い停止画面を waiting に化けさせない
+        let v = apply_worker_status_corrections(resolved("idle", "agents-auto", true)).unwrap();
+        assert_eq!(v["status"], "idle");
+        assert!(v["permission_dialog"].is_null());
+    }
+
+    #[test]
+    fn issue577_生成中はダイアログと判定しない() {
+        // busy 中の claude は入力欄が最下部に見えている（= 入力を奪われていない）。
+        // 会話ログ上流にダイアログの残骸があっても格上げしない
+        let mut screen = PERMISSION_SCREEN_577.to_string();
+        screen.push_str("\n✽ Misting… (1m 4s · ↓ 2.1k tokens)\n────────\n❯ \n────────\n  ctx 23%");
+        let v =
+            apply_worker_status_corrections(resolved_with_screen("busy", "agents-auto", &screen))
+                .unwrap();
+        assert_eq!(v["status"], "busy");
+        assert!(v["permission_dialog"].is_null());
+    }
+
+    // --- #748: permission 以外の選択肢ダイアログ ---
+
+    /// `/model` のモデル選択（実採取。#748 の screens/02）。
+    /// **raw string で書く**こと: `"\<改行>"` の継続は次行の行頭空白を落とすので、
+    /// 桁揃えが意味を持つダイアログ画面は再現できない
+    const MODEL_SELECT_748: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models.
+
+     1. Default (recommended)  Opus 5
+   ❯ 2. Opus (1M context)      Opus 5 with 1M context
+     3. Sonnet                 Sonnet 5
+
+   Enter to set as default · Esc to cancel"#;
+
+    /// claude の usage limit 対処ダイアログ（実文言 = バイナリ内文字列。#748）
+    const LIMIT_DIALOG_748: &str = r#"⏺ 実装を続けます
+  ⎿  Claude usage limit reached. Your limit will reset at 3am.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Upgrade to Max 20x for higher session limits every month
+
+   Enter to confirm · Esc to cancel"#;
+
+    /// `/mcp` の一覧（実採取。**番号なし** + セクション見出し混在）
+    const MCP_LIST_748: &str = r#"▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Manage MCP servers
+
+     User MCPs
+   ❯ context7 · ✔ connected · 2 tools
+     filesystem · ✔ connected · 14 tools
+     tako · ✔ connected · 133 tools
+
+   ↑/↓ to navigate · Enter to confirm · Esc to cancel"#;
+
+    #[test]
+    fn issue748_モデル選択ダイアログでwaitingとchoice_dialogを返す() {
+        // 旧実装は permission ダイアログしか見ておらず、この画面は
+        // 「idle + question」= 完了扱いで通知されていた（#748 の観測 2）
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            MODEL_SELECT_748,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(v["permission_dialog"].is_null(), "permission ではない");
+        let dialog = &v["choice_dialog"];
+        assert_eq!(dialog["kind"], "select");
+        assert_eq!(dialog["numbered"], true);
+        assert_eq!(dialog["highlighted"], 1);
+        assert_eq!(dialog["options"].as_array().unwrap().len(), 3);
+        assert_eq!(dialog["recommended_action"], "respond");
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"choice_dialog"), "{kinds:?}");
+        assert!(
+            !kinds.contains(&"question"),
+            "ダイアログ待ちを質問として出さない: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn issue748_limitダイアログはerrorのままchoice_dialogが付く() {
+        // 「解除まで待つ」復旧は error 側（#157 / #401 の supervisor）が持っている。
+        // waiting へ格上げしてその経路を迂回させない。ただし選択肢の構造は返す
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            LIMIT_DIALOG_748,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["kind"], "usage_limit");
+        assert_eq!(v["error"]["recommended_action"], "wait_reset");
+        let dialog = &v["choice_dialog"];
+        assert_eq!(dialog["kind"], "usage_limit");
+        assert_eq!(
+            dialog["options"][0]["label"],
+            "Stop and wait for limit to reset"
+        );
+        assert_eq!(dialog["recommended_action"], "respond_wait");
+    }
+
+    #[test]
+    fn issue748_permissionダイアログはchoice_dialogにも載る() {
+        // 既存の permission_dialog は互換のまま、種別つきの構造も並べて返す
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            PERMISSION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(v["permission_dialog"].is_object());
+        assert_eq!(v["choice_dialog"]["kind"], "permission");
+        // events は permission_dialog のみ（choice_dialog と二重に出さない）
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"permission_dialog"), "{kinds:?}");
+        assert!(!kinds.contains(&"choice_dialog"), "{kinds:?}");
+    }
+
+    #[test]
+    fn issue748_ダイアログの無い画面ではchoice_dialogはnull() {
+        let v = apply_worker_status_corrections(resolved_with_screen(
+            "idle",
+            "agents-auto",
+            QUESTION_SCREEN_577,
+        ))
+        .unwrap();
+        assert_eq!(v["status"], "idle");
+        assert!(v["choice_dialog"].is_null());
+    }
+
+    fn dialog_of(screen: &str) -> crate::claude_tui::ChoiceDialog {
+        let lines: Vec<String> = screen.lines().map(|l| l.to_string()).collect();
+        crate::claude_tui::detect_choice_dialog(&lines).expect("ダイアログが検知される")
+    }
+
+    #[test]
+    fn issue748_choiceは番号とラベルとエイリアスで解決する() {
+        let dialog = dialog_of(PERMISSION_SCREEN_577);
+        // 番号
+        assert_eq!(resolve_choice_index(&dialog, "1").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "3").unwrap(), 2);
+        // エイリアス（#319 互換）
+        assert_eq!(resolve_choice_index(&dialog, "yes").unwrap(), 0);
+        assert_eq!(resolve_choice_index(&dialog, "no").unwrap(), 2);
+        // ラベルの部分一致（大小無視）
+        assert_eq!(resolve_choice_index(&dialog, "don't ask again").unwrap(), 1);
+        // 範囲外・不一致はエラー（選択肢一覧を添える）
+        let err = resolve_choice_index(&dialog, "9").unwrap_err().to_string();
+        assert!(err.contains("範囲外") && err.contains("1. Yes"), "{err}");
+        let err = resolve_choice_index(&dialog, "存在しない")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("一致する選択肢が無い"), "{err}");
+    }
+
+    #[test]
+    fn issue748_曖昧なラベルは確定させずエラーにする() {
+        // モデル選択の「opus」は 2 つの選択肢に一致する（Default … Opus 5 /
+        // Opus (1M context)）。勝手にどちらかを選ぶと worker のモデルが変わるので
+        // 番号を要求する（黙って推測しない）
+        let dialog = dialog_of(MODEL_SELECT_748);
+        let err = resolve_choice_index(&dialog, "opus")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("複数の選択肢に一致"), "{err}");
+    }
+
+    #[test]
+    fn issue748_番号なしダイアログはラベルで選べる() {
+        let dialog = dialog_of(MCP_LIST_748);
+        assert!(!dialog.numbered);
+        let i = resolve_choice_index(&dialog, "tako").unwrap();
+        assert_eq!(dialog.options[i].label, "tako · ✔ connected · 133 tools");
+        // 1 始まりの順番でも指定できる
+        let by_number = resolve_choice_index(&dialog, "1").unwrap();
+        assert_eq!(by_number, 0);
+    }
+
+    #[test]
+    fn issue748_ダイアログ中のsendは選択肢つきで断る() {
+        // #748 の観測 1 / 4: テキストや Enter はダイアログのキー操作として食われる
+        let refusal = dialog_send_refusal(&dialog_of(LIMIT_DIALOG_748), Some(5)).expect("断る");
+        assert!(refusal.contains("usage_limit"), "{refusal}");
+        assert!(
+            refusal.contains("1. Stop and wait for limit to reset"),
+            "選択肢を提示する: {refusal}"
+        );
+        assert!(
+            refusal.contains("tako orchestrator respond --pane 5"),
+            "respond へ誘導する: {refusal}"
+        );
+        // trust / bypass は tako 自身が承諾するので送信を止めない（送達フローが面倒を見る）
+        let trust = r#" Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel"#;
+        assert!(dialog_send_refusal(&dialog_of(trust), Some(5)).is_none());
+    }
+
+    #[test]
+    fn issue748_応答後の解消判定は選択肢構成で見る() {
+        let before = dialog_of(PERMISSION_SCREEN_577);
+        let same: Vec<String> = PERMISSION_SCREEN_577
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(dialog_still_open(&same, &before), "同じダイアログは残存");
+        let cleared: Vec<String> = "⏺ 実行しました\n────\n❯ \n────\n  ctx 5%"
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!dialog_still_open(&cleared, &before), "消えたら解消");
+        // 別のダイアログへ遷移した場合も「このダイアログは解消」と扱う
+        let next: Vec<String> = MODEL_SELECT_748.lines().map(|l| l.to_string()).collect();
+        assert!(!dialog_still_open(&next, &before));
+>>>>>>> origin/main
     }
 
     #[test]
@@ -12459,6 +15638,10 @@ mod tests {
 
     #[test]
     fn orchestrator_handoffがファイル不在でエラー() {
+        // config_dir はプロセス共有なので、handoff ファイルを作るテスト（#749）と直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut host = MockHost::new();
         let pane = host.root_pane();
         dispatch(
@@ -12485,6 +15668,642 @@ mod tests {
         assert!(result.is_err(), "handoff ファイル不在はエラー");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("handoff ファイルが見つからない"), "{err}");
+        // #792: 書式（2 節の雛形）まで返す。ここが AI が書式を知る唯一の機会になりうる
+        let lang = tako_core::i18n::lang();
+        for section in [
+            tako_core::handoff::HandoffSection::Knowledge,
+            tako_core::handoff::HandoffSection::Runtime,
+        ] {
+            assert!(err.contains(section.heading(lang)), "{err}");
+        }
+    }
+
+    // --- #749: 自動ハンドオフ（閾値反映 + 後任への kill 手順） ---
+
+    /// 隔離した config_dir に handoff ファイルを置いて f を呼ぶ（実運用の設定に触らない）
+    fn with_handoff_file<F: FnOnce()>(profile: &str, content: &str, f: F) {
+        use crate::orchestrator;
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+        let path = orchestrator::handoff_path(profile).expect("override 済み");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("handoff ディレクトリ");
+        }
+        std::fs::write(&path, content).expect("handoff ファイル");
+        f();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// role 付きの master ペインを 1 つ持つ MockHost
+    fn master_host(role: &str) -> (MockHost, u64) {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some(role.into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        (host, pane)
+    }
+
+    #[test]
+    fn handoffは後任へ旧ペインの確認とkillを指示する() {
+        let profile = "_tako_749_ho_";
+        with_handoff_file(
+            profile,
+            "## 状態\n進行中: worker A（pane 7）",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                let tab_id = host.workspace().tabs()[0].id();
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorHandoff {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        tab: None,
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .expect("handoff は成功する");
+
+                // 退役予定のペインが応答に出る（後任の close 対象）
+                assert_eq!(result["previous_master_pane_id"].as_u64(), Some(pane));
+                // role / プロファイル / タブは旧 master と同一を引き継ぐ（#210 の維持）
+                assert_eq!(
+                    result["role"].as_str(),
+                    Some(format!("orchestrator-master:{profile}").as_str())
+                );
+                assert_eq!(result["profile"].as_str(), Some(profile));
+                let new_pane = result["new_master_pane_id"].as_u64().expect("新 master");
+                assert_ne!(new_pane, pane, "新旧は別ペイン");
+                assert_eq!(
+                    result["new_master_tab_id"].as_u64(),
+                    Some(tab_id.as_u64()),
+                    "同じタブに立つ"
+                );
+                assert_eq!(
+                    host.workspace()
+                        .get_tab(tab_id)
+                        .and_then(|t| t.tree().get(PaneId::from_raw(new_pane)))
+                        .and_then(|p| p.role())
+                        .map(str::to_string),
+                    Some(format!("orchestrator-master:{profile}")),
+                    "後任ペインの role も引き継がれる"
+                );
+
+                // 旧 master ペインはこの呼び出しでは閉じない（後任の起動失敗で master を失わない）
+                assert!(
+                    host.workspace()
+                        .get_tab(tab_id)
+                        .and_then(|t| t.tree().get(PaneId::from_raw(pane)))
+                        .is_some(),
+                    "旧 master は生きたまま"
+                );
+
+                // 後任へ送るプロンプトに handoff 内容 + 確認 → kill の手順が入る
+                let prompt = host
+                    .prompt_flows
+                    .iter()
+                    .find(|(p, _)| p.as_u64() == new_pane)
+                    .map(|(_, text)| text.clone())
+                    .expect("後任へのプロンプトが積まれる");
+                assert!(prompt.contains("worker A（pane 7）"), "{prompt}");
+                let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+                let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+                assert!(read_at < close_at, "確認より先に kill を書かない: {prompt}");
+                assert!(
+                    prompt.contains(&pane.to_string()),
+                    "閉じる対象の pane ID が入る: {prompt}"
+                );
+            },
+        );
+    }
+
+    // --- #792: 引き継ぎファイルの書式（新書式 / 旧書式の後方互換）---
+
+    /// 後任へ積まれたプロンプトを取り出す
+    fn successor_prompt_of(host: &MockHost, new_pane: u64) -> String {
+        host.prompt_flows
+            .iter()
+            .find(|(p, _)| p.as_u64() == new_pane)
+            .map(|(_, text)| text.clone())
+            .expect("後任へのプロンプトが積まれる")
+    }
+
+    /// master ペインから handoff を実行して (応答, 後任プロンプト) を返す
+    fn run_handoff(profile: &str) -> (Value, String) {
+        let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorHandoff {
+                pane: Some(pane),
+                caller_role: Some(format!("master:{profile}")),
+                tab: None,
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect("handoff は成功する");
+        let new_pane = result["new_master_pane_id"].as_u64().expect("新 master");
+        let prompt = successor_prompt_of(&host, new_pane);
+        (result, prompt)
+    }
+
+    /// 表示言語に依存しない見出し（判定側の定数をそのまま使う）
+    fn heading_now(section: tako_core::handoff::HandoffSection) -> &'static str {
+        section.heading(tako_core::i18n::lang())
+    }
+
+    #[test]
+    fn handoffは新書式の2節を認識して後任へ扱いを伝える() {
+        let profile = "_tako_792_new_";
+        let content = "# master 引き継ぎ\n\n\
+                       ## 知識（マシン非依存）\n\
+                       - 方針: 検証は隔離 data dir で行う\n\n\
+                       ## 実行状態（このマシン限定）\n\
+                       - worker A: pane 7（#792 の実装）\n";
+        with_handoff_file(profile, content, || {
+            let (result, prompt) = run_handoff(profile);
+            // 機械可読な書式判定（言語非依存）
+            assert_eq!(result["handoff_format"].as_str(), Some("sectioned"));
+            assert_eq!(
+                result["handoff_sections"].as_array().map(Vec::len),
+                Some(2),
+                "知識 / 実行状態の 2 節: {result}"
+            );
+            // 内容は全文そのまま渡る（節に切って渡すと認識漏れが黙って落ちる）
+            assert!(
+                prompt.contains("- 方針: 検証は隔離 data dir で行う"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("- worker A: pane 7（#792 の実装）"),
+                "{prompt}"
+            );
+            // 節ごとの扱いが説明される（実行状態は実態で確認）
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Runtime)),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Knowledge)),
+                "{prompt}"
+            );
+            // #749 の手順（確認 → kill）は書式に関係なく入る
+            let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+            let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+            assert!(read_at < close_at, "{prompt}");
+        });
+    }
+
+    /// **後方互換の核**: 節分離前のファイル（pane / tab 参照が本文に混在）でも
+    /// 従来どおり全文が後任へ渡り、#749 の手順もそのまま入る
+    #[test]
+    fn handoffは旧書式のファイルでも従来どおり動く() {
+        let profile = "_tako_792_legacy_";
+        let content = "# master (default プロファイル) 引き継ぎ\n\n\
+                       ## 【サンプル案件 移行】担当 master（tab 136 / pane 884）\n\
+                       - 進行中: 客の追加 5 点\n\n\
+                       ## 残キュー（優先順）\n\
+                       - #801 の残件を Issue 化\n";
+        with_handoff_file(profile, content, || {
+            let (result, prompt) = run_handoff(profile);
+            assert_eq!(result["handoff_format"].as_str(), Some("legacy"));
+            assert_eq!(
+                result["handoff_sections"].as_array().map(Vec::len),
+                Some(0),
+                "旧書式は節を持たない: {result}"
+            );
+            // 全文が 1 文字も欠けずに渡る
+            assert!(
+                prompt.contains(content.trim()),
+                "旧書式の全文が渡らなかった: {prompt}"
+            );
+            // 従来の手順（#749 の不変条件）は維持
+            let read_at = prompt.find("tako_read_pane").expect("入力欄の確認手順");
+            let close_at = prompt.find("tako_close_pane").expect("kill 手順");
+            assert!(read_at < close_at, "{prompt}");
+            // 次の更新で新書式へ書き直す指示が付く（自然な移行の駆動源）
+            assert!(
+                prompt.contains(heading_now(tako_core::handoff::HandoffSection::Knowledge))
+                    && prompt.contains(heading_now(tako_core::handoff::HandoffSection::Runtime)),
+                "書き直し先の見出しが案内されていない: {prompt}"
+            );
+        });
+    }
+
+    /// master 自身が「自分のファイルが新書式か」を確認できる（#792）
+    #[test]
+    fn selfが引き継ぎファイルの書式を返す() {
+        let profile = "_tako_792_self_";
+        with_handoff_file(
+            profile,
+            "## 知識（マシン非依存）\n- 方針\n",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorSelf {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .unwrap();
+                assert_eq!(result["handoff_exists"].as_bool(), Some(true));
+                assert_eq!(result["handoff_format"].as_str(), Some("sectioned"));
+                assert_eq!(
+                    result["handoff_sections"].as_array().map(Vec::len),
+                    Some(1),
+                    "知識節だけ: {result}"
+                );
+            },
+        );
+    }
+
+    /// ファイル不在は「旧書式」と混ぜない（null で「まだ書いていない」を表す）
+    #[test]
+    fn selfは引き継ぎファイル不在で書式をnullにする() {
+        let profile = "_tako_792_none_";
+        // with_handoff_file は作ってしまうので、作らずに config_dir だけ揃える
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::orchestrator::test_config_dir_override().get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
+        let path = crate::orchestrator::handoff_path(profile).expect("override 済み");
+        let _ = std::fs::remove_file(&path);
+
+        let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+        let result = dispatch(
+            &mut host,
+            Request::OrchestratorSelf {
+                pane: Some(pane),
+                caller_role: Some(format!("master:{profile}")),
+                caller_pid: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(result["handoff_exists"].as_bool(), Some(false));
+        assert!(result["handoff_format"].is_null(), "{result}");
+        assert!(result["handoff_sections"].is_null(), "{result}");
+    }
+
+    #[test]
+    fn handoffはmaster以外のペインをkill対象にしない() {
+        let profile = "_tako_749_nk_";
+        with_handoff_file(profile, "state", || {
+            // role 無しのユーザーペインを分割元にして呼ぶ（旧 master が特定できない状況）
+            let mut host = MockHost::new();
+            let user_pane = host.root_pane();
+            let tab_id = host.workspace().tabs()[0].id().as_u64();
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(user_pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: Some(tab_id),
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff 自体は成功する");
+            assert!(
+                result["previous_master_pane_id"].is_null(),
+                "master でないペインは kill 対象にしない: {result}"
+            );
+            let new_pane = result["new_master_pane_id"].as_u64().unwrap();
+            let prompt = host
+                .prompt_flows
+                .iter()
+                .find(|(p, _)| p.as_u64() == new_pane)
+                .map(|(_, text)| text.clone())
+                .unwrap();
+            assert!(!prompt.contains("tako_close_pane"), "{prompt}");
+        });
+    }
+
+    // --- #761: 後任 master の起動パラメータ（モデル / effort / role env）---
+
+    /// takodev で実際に起きた構成を最小再現したプロファイル:
+    /// master は fable / xhigh、worker は opus[1m] / high。後任がどちらで立つかを測る
+    fn save_761_profile(name: &str) {
+        use crate::orchestrator::{AgentWorkerConfig, Profile};
+        let mut p = Profile {
+            model: Some("claude-fable-5-761master".into()),
+            effort: "xhigh".into(),
+            ..Default::default()
+        };
+        p.worker_agents.insert(
+            "claude".into(),
+            AgentWorkerConfig {
+                model: Some("claude-opus-4-6-761worker[1m]".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        );
+        p.save(name).expect("プロファイルの保存");
+    }
+
+    /// 後任へ積まれた起動コマンド（queue_write の 1 本目）を取り出す
+    fn successor_launch_cmd(host: &MockHost, new_pane: u64) -> String {
+        host.writes
+            .iter()
+            .find(|(p, _)| p.as_u64() == new_pane)
+            .map(|(_, cmd)| cmd.clone())
+            .expect("後任ペインへ起動コマンドが積まれる")
+    }
+
+    #[test]
+    fn handoffの後任はmaster用のモデルとeffortで起動する() {
+        let profile = "_tako_761_model_";
+        with_handoff_file(profile, "state", || {
+            save_761_profile(profile);
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
+            let cmd = successor_launch_cmd(&host, new_pane);
+
+            // master は profile.model / profile.effort で起動する（CLI の tako master と同じ）
+            assert!(
+                cmd.contains("--model 'claude-fable-5-761master'"),
+                "master のモデルで起動していない: {cmd}"
+            );
+            assert!(cmd.contains("--effort xhigh"), "{cmd}");
+            // worker 用の解決（worker_agents.claude）が混ざらない = #761 バグ 1 の回帰検査
+            assert!(
+                !cmd.contains("761worker"),
+                "worker 用モデルで起動している: {cmd}"
+            );
+            assert!(!cmd.contains("--effort high"), "{cmd}");
+            // master system prompt が付く（worker 用コマンド構築では付いていなかった）
+            assert!(
+                cmd.contains("--append-system-prompt-file '"),
+                "master の system prompt が付いていない: {cmd}"
+            );
+            assert!(
+                cmd.contains(&format!("_system_prompt_{profile}.md")),
+                "{cmd}"
+            );
+
+            let _ = std::fs::remove_file(
+                crate::orchestrator::profiles_dir()
+                    .expect("override 済み")
+                    .join(format!("{profile}.yaml")),
+            );
+        });
+    }
+
+    #[test]
+    fn handoffの後任のrole_envはmaster形式でselfが同じプロファイルを返す() {
+        let profile = "_tako_761_role_";
+        with_handoff_file(profile, "state", || {
+            save_761_profile(profile);
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
+            let cmd = successor_launch_cmd(&host, new_pane);
+
+            // 起動コマンドが注入する TAKO_ORCHESTRATOR_ROLE を**コマンド文字列から取り出す**
+            let role_env = cmd
+                .split("TAKO_ORCHESTRATOR_ROLE='")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("role env が注入されている")
+                .to_string();
+            assert_eq!(
+                role_env,
+                format!("master:{profile}"),
+                "env 用 role は master:<profile> 形式（#761 バグ 2）: {cmd}"
+            );
+            // 表示用ラベルは従来どおり orchestrator-master:<profile>（両者を混ぜない）
+            assert_eq!(
+                result["role"].as_str(),
+                Some(format!("orchestrator-master:{profile}").as_str())
+            );
+
+            // その env をそのまま caller_role にして self を引く = 後任が実際にたどる経路
+            let self_result = dispatch(
+                &mut host,
+                Request::OrchestratorSelf {
+                    pane: Some(new_pane),
+                    caller_role: Some(role_env),
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("後任の self は成功する");
+            assert_eq!(
+                self_result["profile"].as_str(),
+                Some(profile),
+                "後任の self が default に落ちている: {self_result}"
+            );
+            assert!(
+                self_result["handoff_path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with(&format!("{profile}.md"))),
+                "handoff_path が引き継がれていない: {self_result}"
+            );
+            assert_eq!(self_result["pane_id"].as_u64(), Some(new_pane));
+
+            let _ = std::fs::remove_file(
+                crate::orchestrator::profiles_dir()
+                    .expect("override 済み")
+                    .join(format!("{profile}.yaml")),
+            );
+        });
+    }
+
+    /// #547 の規則（master_account が master の CLAUDE_CONFIG_DIR を決める）が
+    /// 起動経路の差し替え後も維持されていること
+    #[test]
+    fn handoffの後任はmaster_accountを反映する() {
+        let profile = "_tako_761_acct_";
+        with_handoff_file(profile, "state", || {
+            use crate::orchestrator::{AccountEntry, AccountsConfig, Profile};
+            let mut accounts = AccountsConfig::load().unwrap_or(AccountsConfig {
+                accounts: Default::default(),
+            });
+            accounts.accounts.insert(
+                "_tako_761_univ_".into(),
+                AccountEntry {
+                    config_dir: Some("/tmp/_tako_761_cfg_".into()),
+                    ..Default::default()
+                },
+            );
+            accounts.save().expect("accounts.yaml の保存");
+            let p = Profile {
+                master_account: Some("_tako_761_univ_".into()),
+                ..Default::default()
+            };
+            p.save(profile).expect("プロファイルの保存");
+
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
+            let cmd = successor_launch_cmd(&host, new_pane);
+            assert!(
+                cmd.contains("export CLAUDE_CONFIG_DIR=/tmp/_tako_761_cfg_"),
+                "master_account の config dir が反映されていない: {cmd}"
+            );
+
+            // 後始末。**一時ディレクトリ配下であることを確認してから**消す
+            let dir = crate::orchestrator::config_dir().expect("override 済み");
+            assert!(
+                dir.starts_with(std::env::temp_dir()),
+                "テストの config_dir が一時ディレクトリ配下でない: {}",
+                dir.display()
+            );
+            let _ = std::fs::remove_file(dir.join("accounts.yaml"));
+            let _ = std::fs::remove_file(dir.join("profiles").join(format!("{profile}.yaml")));
+        });
+    }
+
+    /// caller_role にペインの role ラベル（表示用）が来る内部呼び出し
+    /// （`tako_stale_binary restart` の master 経路）でも default に落ちない
+    #[test]
+    fn handoffは表示用roleのcaller_roleでもプロファイルを解決する() {
+        let profile = "_tako_761_disp_";
+        with_handoff_file(profile, "state", || {
+            let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(pane),
+                    caller_role: Some(format!("orchestrator-master:{profile}")),
+                    tab: None,
+                    caller_pid: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("handoff は成功する");
+            assert_eq!(result["profile"].as_str(), Some(profile), "{result}");
+        });
+    }
+
+    #[test]
+    fn selfの閾値はプロファイル設定を反映する() {
+        use crate::orchestrator;
+        with_handoff_file("_tako_749_", "state", || {
+            let (mut host, pane) = master_host("orchestrator-master:_tako_749_");
+            let call = |host: &mut MockHost| {
+                dispatch(
+                    host,
+                    Request::OrchestratorSelf {
+                        pane: Some(pane),
+                        caller_role: Some("master:_tako_749_".into()),
+                        caller_pid: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .unwrap()
+            };
+
+            // 未設定は既定 60
+            let before = call(&mut host);
+            assert_eq!(before["ctx_threshold"].as_u64(), Some(60));
+            assert_eq!(before["auto_handoff"].as_bool(), Some(true));
+            assert!(before["handoff_exists"].as_bool().unwrap_or(false));
+
+            // プロファイルで 50 に下げると self にも発動判定にも反映される
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some("_tako_749_".into()),
+                ctx_threshold: Some(50),
+                auto_handoff: Some(false),
+                ..Default::default()
+            })
+            .expect("set は成功する");
+            let after = call(&mut host);
+            assert_eq!(after["ctx_threshold"].as_u64(), Some(50));
+            assert_eq!(after["ctx_threshold_source"].as_str(), Some("profile"));
+            assert_eq!(after["auto_handoff"].as_bool(), Some(false));
+
+            // 同じ設定が tako-core の発動判定へそのまま渡る（55% は 50 で発動 / 60 では未発動）
+            let input = |threshold: u32| tako_core::handoff::NudgeInput {
+                auto_handoff: true,
+                ctx_percent: Some(55),
+                threshold,
+                pane_age: tako_core::handoff::NUDGE_GRACE * 2,
+                since_last_nudge: None,
+                sent_count: 0,
+                handoff_started: false,
+            };
+            let effective = after["ctx_threshold"].as_u64().unwrap() as u32;
+            assert!(tako_core::handoff::nudge_decision(&input(effective)).should_send());
+            assert!(!tako_core::handoff::nudge_decision(&input(60)).should_send());
+
+            // 後始末（プロファイルファイルを残さない）
+            let _ = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "delete".into(),
+                name: Some("_tako_749_".into()),
+                ..Default::default()
+            });
+            let _ = orchestrator::handoff_path("_tako_749_");
+        });
+    }
+
+    #[test]
+    fn プロファイルのctx閾値は範囲外を拒否する() {
+        for bad in [0u32, 49, 61, 100] {
+            let err = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some("_tako_749_range_".into()),
+                ctx_threshold: Some(bad),
+                ..Default::default()
+            })
+            .expect_err("範囲外は拒否する");
+            assert!(err.to_string().contains("50〜60"), "{err}");
+        }
     }
 
     #[test]
@@ -12506,6 +16325,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -12559,6 +16379,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -12638,6 +16459,116 @@ mod tests {
             Some(actual_pane),
             "stale pane ID が新 pane ID に解決される"
         );
+    }
+
+    // ---- Issue #567: ResolvePane（stale な TAKO_PANE_ID の救済） ----
+
+    #[test]
+    fn resolve_pane_現存ペインはそのまま返る() {
+        let mut host = MockHost::new();
+        let actual = host.root_pane();
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: Some(actual),
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(result["pane"].as_u64(), Some(actual));
+        assert_eq!(result["method"], "pane");
+        assert_eq!(result["stale"], false);
+    }
+
+    #[test]
+    fn resolve_pane_stale_mapで新idへ読み替える() {
+        let mut host = MockHost::new();
+        let actual = host.root_pane();
+        let stale_id = 99999_u64;
+        host.stale_pane_map
+            .insert(PaneId::from_raw(stale_id), PaneId::from_raw(actual));
+
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: Some(stale_id),
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            result["pane"].as_u64(),
+            Some(actual),
+            "stale ID が現世代のペインへ読み替わる"
+        );
+        assert_eq!(result["method"], "stale");
+        assert_eq!(result["stale"], true);
+        assert_eq!(result["requested"].as_u64(), Some(stale_id));
+    }
+
+    #[test]
+    fn resolve_pane_解決不能でもエラーにせずnullを返す() {
+        let mut host = MockHost::new();
+        // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: Some(305),
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("解決できなくてもエラーにしない（呼び出し元がフォールバックを選ぶ）");
+        assert!(result["pane"].is_null());
+        assert!(result["tab"].is_null());
+        assert!(result["method"].is_null());
+        assert_eq!(result["stale"], true);
+    }
+
+    #[test]
+    fn resolve_pane_pane未指定は解決不能かつstaleではない() {
+        let mut host = MockHost::new();
+        let result = dispatch(
+            &mut host,
+            Request::ResolvePane {
+                pane: None,
+                caller_pid: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(result["pane"].is_null());
+        assert_eq!(
+            result["stale"], false,
+            "自称 ID が無いのだから「古い」わけではない"
+        );
+    }
+
+    #[test]
+    fn resolve_pane_lenient_pid解決が環境変数より優先される() {
+        let host = MockHost::new();
+        let actual = host.root_pane();
+        // pane env は現存する別 ID を騙る（ID 再利用で他人のペインを掴む事故の再現）。
+        // pid 祖先辿りが実ペインを返せばそちらが勝つ
+        let resolved = resolve_pane_lenient(&host, Some(4242), Some(1234), |pid, _backends| {
+            assert_eq!(pid, 1234);
+            Some(actual)
+        })
+        .expect("pid で解決できる");
+        assert_eq!(resolved.0, PaneResolveMethod::Pid);
+        assert_eq!(resolved.2.as_u64(), actual);
+    }
+
+    #[test]
+    fn resolve_pane_lenient_pid不明ならpane指定へ落ちる() {
+        let host = MockHost::new();
+        let actual = host.root_pane();
+        let resolved = resolve_pane_lenient(&host, Some(actual), Some(1234), |_, _| None)
+            .expect("pane 指定で解決できる");
+        assert_eq!(resolved.0, PaneResolveMethod::Pane);
+        assert_eq!(resolved.2.as_u64(), actual);
     }
 
     #[test]
@@ -12838,6 +16769,73 @@ mod tests {
             PaneOrigin::Cli,
         )
         .is_err());
+    }
+
+    /// #694: UI 表示モードの status / set / toggle と、ペイン単位の揮発解除
+    #[test]
+    fn ui_modeのstatus_set_toggleが機能する() {
+        use tako_core::ui_mode::UiMode;
+        let mut host = MockHost::new();
+        let ui_mode = |host: &mut MockHost, action: Option<&str>, mode: Option<&str>| {
+            dispatch(
+                host,
+                Request::UiMode {
+                    action: action.map(str::to_string),
+                    mode: mode.map(str::to_string),
+                    pane: None,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+        // status: 既定は terminal（既存ユーザーの表示は変わらない）
+        let v = ui_mode(&mut host, None, None).unwrap();
+        assert_eq!(v["ui_mode"], "terminal");
+        assert_eq!(v["available"].as_array().unwrap().len(), 2);
+        assert_eq!(v["released_panes"].as_array().unwrap().len(), 0);
+        // set gui → host へ反映
+        let v = ui_mode(&mut host, Some("set"), Some("gui")).unwrap();
+        assert_eq!(v["ui_mode"], "gui");
+        assert_eq!(host.ui_mode, UiMode::Gui);
+        // toggle → terminal へ戻る
+        let v = ui_mode(&mut host, Some("toggle"), None).unwrap();
+        assert_eq!(v["ui_mode"], "terminal");
+        assert_eq!(host.ui_mode, UiMode::Terminal);
+        // set の不明 mode / mode 無し / 不明 action はエラー
+        assert!(ui_mode(&mut host, Some("set"), Some("simple")).is_err());
+        assert!(ui_mode(&mut host, Some("set"), None).is_err());
+        assert!(ui_mode(&mut host, Some("kiosk"), None).is_err());
+    }
+
+    /// #694: スターターの「コマンド入力へ」= ペイン単位の揮発解除も
+    /// dispatch から操作できる（開発不変条件: UI でできることは AI からもできる）
+    #[test]
+    fn ui_modeのペイン単位解除が機能する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let release = |host: &mut MockHost, action: &str, pane: Option<u64>| {
+            dispatch(
+                host,
+                Request::UiMode {
+                    action: Some(action.into()),
+                    mode: None,
+                    pane,
+                },
+                PaneOrigin::Cli,
+            )
+        };
+        let v = release(&mut host, "release", Some(pane)).unwrap();
+        assert_eq!(v["pane"], pane);
+        assert_eq!(v["released"], true);
+        assert_eq!(v["released_panes"], serde_json::json!([pane]));
+        assert!(host.starter_released.contains(&pane));
+        // restore で戻る
+        let v = release(&mut host, "restore", Some(pane)).unwrap();
+        assert_eq!(v["released"], false);
+        assert_eq!(v["released_panes"].as_array().unwrap().len(), 0);
+        assert!(host.starter_released.is_empty());
+        // 対象ペインを解決できないときはエラー（黙って別ペインへ効かせない）
+        assert!(release(&mut host, "release", Some(9999)).is_err());
+        assert!(release(&mut host, "release", None).is_err());
     }
 
     #[test]
@@ -13058,6 +17056,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -13080,6 +17079,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -13102,6 +17102,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -13196,6 +17197,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -13605,6 +17607,178 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #676 の実行対象ファイル（`tako run` のテスト用。呼び出しごとに別ディレクトリ）
+    fn issue676_run_target(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-676-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.command");
+        std::fs::write(&file, "#!/usr/bin/env bash\necho hello\n").unwrap();
+        (dir, file)
+    }
+
+    /// #676 受け入れ条件 1 / 3: `tako run` は focus 未指定（既定 false）で
+    /// **手元のペインのフォーカスを奪わない**。CLI と MCP は同じ dispatch を通るので
+    /// 1 本で両経路を担保する（origin だけ差し替えて 2 回検証する）
+    #[test]
+    fn issue676_runはfocus未指定でフォーカスを奪わない() {
+        let (dir, file) = issue676_run_target("default");
+        for origin in [PaneOrigin::Cli, PaneOrigin::Mcp] {
+            let mut host = MockHost::new();
+            let root = host.ws.active_tab().tree().focused();
+            let result = dispatch(
+                &mut host,
+                Request::Run {
+                    path: file.display().to_string(),
+                    pane: Some(root.as_u64()),
+                    tab: None,
+                    profile: None,
+                    command: None,
+                    direction: None,
+                    ratio: None,
+                    auto_close: None,
+                    focus: None, // 既定 = false
+                },
+                origin,
+            )
+            .unwrap();
+            let new_pane = result["pane"].as_u64().unwrap();
+            assert_ne!(new_pane, root.as_u64());
+            assert_eq!(
+                host.ws.active_tab().tree().focused(),
+                root,
+                "{origin:?}: focus 未指定ではフォーカスが動かない（#676）"
+            );
+            // 明示 false でも同じ
+            let result = dispatch(
+                &mut host,
+                Request::Run {
+                    path: file.display().to_string(),
+                    pane: Some(root.as_u64()),
+                    tab: None,
+                    profile: None,
+                    command: None,
+                    direction: None,
+                    ratio: None,
+                    auto_close: None,
+                    focus: Some(false),
+                },
+                origin,
+            )
+            .unwrap();
+            assert_ne!(result["pane"].as_u64().unwrap(), root.as_u64());
+            assert_eq!(
+                host.ws.active_tab().tree().focused(),
+                root,
+                "{origin:?}: focus=false でもフォーカスが動かない（#676）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #676 受け入れ条件 2: `--focus` / `focus: true` を明示したときは新ペインへ移る
+    #[test]
+    fn issue676_runはfocus指定で新ペインへ移る() {
+        let (dir, file) = issue676_run_target("explicit");
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(root.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            result["pane"].as_u64().unwrap(),
+            "focus=true では新ペインへ移る"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #676 受け入れ条件 4: `run_interactive` は従来どおり新ペインへフォーカスを移す
+    /// （ユーザーの入力を待つペインなので、こちらは移すのが正しい）
+    #[test]
+    fn issue676_run_interactiveは新ペインへフォーカスを移す() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunInteractive {
+                pane: Some(root.as_u64()),
+                tab: None,
+                command: "sudo true".into(),
+                input_hint: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            result["pane"].as_u64().unwrap(),
+            "run_interactive は入力待ちのため新ペインへ移る（回帰させない）"
+        );
+    }
+
+    /// #676 受け入れ条件 5: `split` の既定（フォーカスを移さない）に回帰がないこと。
+    /// `spawn_command_pane` と同じ規約であることを 1 本で並べて固定する
+    #[test]
+    fn issue676_splitの既定はフォーカスを移さない() {
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let r = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root.as_u64()),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_ne!(r["pane"].as_u64().unwrap(), root.as_u64());
+        assert_eq!(host.ws.active_tab().tree().focused(), root);
+        // 明示 true では移る（既存仕様）
+        let r = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root.as_u64()),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            r["pane"].as_u64().unwrap()
+        );
+    }
+
     // === 複数ウィンドウ（Issue #339） ===
 
     /// #584: 最小化 / 最大化 / 復元は UI 層への依頼として積まれる。
@@ -13936,6 +18110,7 @@ mod tests {
             Request::TabNew {
                 title: None,
                 focus: None,
+                cwd: None,
             },
             PaneOrigin::Cli,
         )
@@ -14005,6 +18180,7 @@ mod tests {
                 Request::Close {
                     pane: Some(worker_pane),
                     force: true,
+                    caller_role: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -14088,7 +18264,12 @@ mod tests {
                 live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -14116,7 +18297,12 @@ mod tests {
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             None,
             None,
@@ -14150,7 +18336,12 @@ mod tests {
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 has_running_children: false,
+<<<<<<< HEAD
                 pane_pid: None,
+||||||| db83389
+=======
+                limit_resume: Value::Null,
+>>>>>>> origin/main
             },
             Some("sid-7801-detected"),
             None,
@@ -14196,7 +18387,12 @@ mod tests {
             live_tail: Some("zsh: segmentation fault  claude\n% ".into()),
             full_screen: None,
             has_running_children: has_children,
+<<<<<<< HEAD
             pane_pid: None,
+||||||| db83389
+=======
+            limit_resume: Value::Null,
+>>>>>>> origin/main
         };
 
         // 子プロセスなし → agent_dead イベント + resume_command
@@ -14379,6 +18575,68 @@ mod tests {
         );
     }
 
+    // --- #549 ウェルカムバナー ---
+
+    #[test]
+    fn welcomeのstatusは表示状態と案内コマンドを返す() {
+        let mut host = MockHost::new();
+        let v = dispatch(
+            &mut host,
+            Request::Welcome { action: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], false);
+        // #322: 案内は最簡形（絶対パスや既定オプションを見せない）
+        assert_eq!(v["setup_command"], "tako setup");
+        assert_eq!(v["master_command"], "tako master");
+        assert!(v["first_launch"].is_boolean());
+        assert!(v["dismissed"].is_boolean());
+    }
+
+    #[test]
+    fn welcomeのshowとdismissが表示状態を切り替える() {
+        let mut host = MockHost::new();
+        let v = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("show".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], true);
+        assert!(host.welcome_banner_visible());
+
+        let v = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("dismiss".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], false);
+        assert!(!host.welcome_banner_visible());
+    }
+
+    #[test]
+    fn welcomeの不明actionはエラー() {
+        let mut host = MockHost::new();
+        let err = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("explode".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("status / show / dismiss"),
+            "選べる値を案内すること: {err:?}"
+        );
+    }
+
     #[test]
     fn stale_binary_dismissは正常応答() {
         let mut host = MockHost::new();
@@ -14396,6 +18654,7 @@ mod tests {
         assert_eq!(v["pane"], pane);
     }
 
+<<<<<<< HEAD
     // --- #723: update の dry_run 分岐 ---
     //
     // 「試すだけのつもりが本当に置き換わった」が最悪の事故なので、
@@ -14512,5 +18771,375 @@ mod tests {
             );
             assert!(host.applied.is_empty() && host.staged.is_empty());
         }
+||||||| db83389
+=======
+    // --- #666: AI コマンド提案カード ---
+
+    /// テスト用のリクエスト組み立て（既定値ばかりなので毎回書くと読めない）
+    fn show_command_req(action: &str, commands: &[&str], pane: Option<u64>) -> Request {
+        Request::ShowCommand {
+            action: Some(action.into()),
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+            label: None,
+            pane,
+            card: None,
+            index: None,
+            focus: None,
+        }
+    }
+
+    #[test]
+    fn issue666_showしたコマンドは論理文字列のまま返る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // ペイン幅より確実に長い 1 行（画面から拾うと物理改行が入る種類の文字列）
+        let long = format!("cargo test --workspace -- --nocapture {}", "x".repeat(240));
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: None, // 既定は show
+                commands: vec![long.clone()],
+                label: Some("テストを回す".into()),
+                pane: Some(pane),
+                card: None,
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(v["card"]["pane"], pane);
+        assert_eq!(v["card"]["count"], 1);
+        assert_eq!(v["card"]["label"], "テストを回す");
+        assert_eq!(v["card"]["commands"][0], long);
+        assert_eq!(v["pane_cards"], 1);
+
+        // list でも同じ論理文字列が返る（AI 側で同一性を検証できる）
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(listed["cards"][0]["commands"][0], long);
+        assert_eq!(listed["total"], 1);
+    }
+
+    #[test]
+    fn issue666_copyは論理文字列をクリップボードへ渡す() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let multi = "cd /tmp \\\n  && ls -la";
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo one", multi], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        // index 省略で 1 件目
+        let v = dispatch(
+            &mut host,
+            show_command_req("copy", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["copied"], true);
+        assert_eq!(v["index"], 1);
+        assert_eq!(host.clipboard, vec!["echo one".to_string()]);
+        // index=2 は改行込みでそのまま渡る
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("copy".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: Some(pane),
+                card: None,
+                index: Some(2),
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["command"], multi);
+        assert_eq!(host.clipboard.last().unwrap(), multi);
+    }
+
+    #[test]
+    fn issue666_runは同じタブに新ペインを分割して実行する() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let before_panes = host.ws.active_tab().tree().panes().len();
+        let before_tabs = host.ws.tabs().len();
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo 'カード実行' && pwd"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let v = dispatch(
+            &mut host,
+            show_command_req("run", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let new_pane = v["pane"].as_u64().unwrap();
+        assert_ne!(new_pane, pane, "手元のペインで実行してはならない");
+        assert_eq!(v["from_pane"], pane);
+        assert_eq!(v["focus"], false, "既定でフォーカスを奪わない");
+        assert_eq!(host.ws.tabs().len(), before_tabs, "タブを増やさない");
+        assert_eq!(
+            host.ws.active_tab().tree().panes().len(),
+            before_panes + 1,
+            "同じタブにペインが 1 枚増える"
+        );
+        // 新ペインには /bin/sh -c で構造化して渡る（#453 の 127 即死を避ける形）
+        let opts = host
+            .attached_options
+            .get(&new_pane)
+            .expect("セッション起動");
+        let cmd = opts.command.as_ref().expect("コマンド付き起動");
+        assert_eq!(cmd.program, "/bin/sh");
+        assert_eq!(cmd.args[0], "-c");
+        assert!(
+            cmd.args[1].starts_with("echo 'カード実行' && pwd"),
+            "論理文字列がそのまま渡る: {:?}",
+            cmd.args[1]
+        );
+        // 手元のペインのフォーカスを奪わない（split は新ペインへフォーカスを移す仕様なので
+        // 明示的に戻している。この assert を消すと退行が見えなくなる）
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            pane,
+            "既定ではフォーカスが手元のペインに残る"
+        );
+        // カードは実行後も残る（他のコマンドを続けて実行できる）
+        let listed = dispatch(
+            &mut host,
+            show_command_req("list", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(listed["cards"].as_array().unwrap().len(), 1);
+
+        // focus=true を明示したときだけ新ペインへ移る
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("run".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: Some(pane),
+                card: None,
+                index: None,
+                focus: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["focus"], true);
+        assert_eq!(
+            host.ws.active_tab().tree().focused().as_u64(),
+            v["pane"].as_u64().unwrap(),
+            "focus=true では新ペインへ移る"
+        );
+    }
+
+    #[test]
+    fn issue666_カードid指定はペイン指定なしでも解決できる() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let shown = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let card = shown["card"]["id"].as_u64().unwrap();
+        // pane 省略 + card 指定（TAKO_PANE_ID が無い外部シェルからの操作）
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("copy".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: None,
+                card: Some(card),
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["card"], card);
+        assert_eq!(host.clipboard, vec!["echo hi".to_string()]);
+    }
+
+    #[test]
+    fn issue666_dismissはカード単位とペイン単位で効く() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let first = dispatch(
+            &mut host,
+            show_command_req("show", &["echo 1"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo 2"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let v = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("dismiss".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: None,
+                card: Some(first),
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["dismissed"], 1);
+        assert_eq!(v["remaining"], 1);
+        // card 省略 = そのペインの全件
+        let v = dispatch(
+            &mut host,
+            show_command_req("dismiss", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["dismissed"], 1);
+        assert_eq!(v["remaining"], 0);
+    }
+
+    #[test]
+    fn issue666_不正な入力は理由つきで拒否される() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // コマンド無し
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &[], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("コマンドが 1 件も"), "{err}");
+        // 空文字列
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &["   "], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("空のコマンド"), "{err}");
+        // エスケープシーケンス混入
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &["echo \x1b[2J"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("制御文字"), "{err}");
+        // 不明 action は選べる値を案内する
+        let err = dispatch(
+            &mut host,
+            show_command_req("explode", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("show / list / copy / run / dismiss"),
+            "{err}"
+        );
+        // カードが無いペインでの copy / run
+        let err = dispatch(
+            &mut host,
+            show_command_req("copy", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("表示中のコマンドカードが無い"),
+            "{err}"
+        );
+        // 範囲外のコマンド番号
+        dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let err = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("run".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: Some(pane),
+                card: None,
+                index: Some(5),
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("コマンド番号が範囲外"), "{err}");
+        assert!(
+            host.clipboard.is_empty(),
+            "失敗した操作で副作用を起こさない"
+        );
+    }
+
+    #[test]
+    fn issue666_消えたカードやペインへの操作はエラーで返る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let card = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(pane)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap()["card"]["id"]
+            .as_u64()
+            .unwrap();
+        dispatch(
+            &mut host,
+            show_command_req("dismiss", &[], Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // 閉じたカードのボタンを押した相当（panic せずエラー）
+        let err = dispatch(
+            &mut host,
+            Request::ShowCommand {
+                action: Some("run".into()),
+                commands: Vec::new(),
+                label: None,
+                pane: None,
+                card: Some(card),
+                index: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("見つからない"), "{err}");
+        // 存在しないペインへの show
+        let err = dispatch(
+            &mut host,
+            show_command_req("show", &["echo hi"], Some(999_999)),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::PaneNotFound(999_999)));
+>>>>>>> origin/main
     }
 }

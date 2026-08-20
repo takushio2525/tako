@@ -563,8 +563,22 @@ pub fn show_payload(id_prefix: &str) -> Result<Value, String> {
 }
 
 /// resume 用の起動コマンドを組み立てる（claude のみ。Issue #112 の制限:
-/// codex / agy は session 参照手段が tako から安定して取れないため対象外）
+/// codex / agy は session 参照手段が tako から安定して取れないため対象外）。
+/// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（Issue #652）
 pub fn resume_command(id: &str, entry: &SessionEntry) -> Result<String, String> {
+    resume_command_with_env(
+        id,
+        entry,
+        crate::transcript::resume_env_prefix(id).as_deref(),
+    )
+}
+
+/// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
+fn resume_command_with_env(
+    id: &str,
+    entry: &SessionEntry,
+    env_prefix: Option<&str>,
+) -> Result<String, String> {
     let agent = entry.agent.as_deref().unwrap_or("claude");
     if agent != "claude" {
         return Err(format!(
@@ -599,8 +613,8 @@ pub fn resume_command(id: &str, entry: &SessionEntry) -> Result<String, String> 
     };
     // 会話の所在（config ディレクトリ）を先頭で明示する。無いと別アカウントの会話は
     // `No conversation found with session ID` になる（#652）
-    if let Some(prefix) = crate::transcript::resume_env_prefix(id) {
-        cmd.insert_str(0, &prefix);
+    if let Some(prefix) = env_prefix {
+        cmd.insert_str(0, prefix);
     }
     if let Some(model) = entry.model.as_deref() {
         cmd.push_str(&format!(
@@ -869,7 +883,8 @@ mod tests {
             effort: Some("max".into()),
             ..Default::default()
         };
-        let cmd = resume_command("11111111-2222-3333-4444-555555555555", &entry).unwrap();
+        let cmd =
+            resume_command_with_env("11111111-2222-3333-4444-555555555555", &entry, None).unwrap();
         assert_eq!(
             cmd,
             format!(
@@ -883,7 +898,7 @@ mod tests {
             profile: Some("default".into()),
             ..Default::default()
         };
-        let cmd = resume_command("abc", &solo).unwrap();
+        let cmd = resume_command_with_env("abc", &solo, None).unwrap();
         assert!(
             cmd.starts_with(&crate::orchestrator::agent::launch_with_role(
                 "solo", "claude"
@@ -895,14 +910,43 @@ mod tests {
             agent: Some("codex".into()),
             ..Default::default()
         };
-        let err = resume_command("abc", &codex).unwrap_err();
+        let err = resume_command_with_env("abc", &codex, None).unwrap_err();
         assert!(err.contains("resume 非対応"), "{err}");
 
         let invalid = SessionEntry {
             agent: Some("claude".into()),
             ..Default::default()
         };
-        assert!(resume_command("../etc", &invalid).is_err());
+        assert!(resume_command_with_env("../etc", &invalid, None).is_err());
+    }
+
+    /// Issue #652: アカウントの会話は `CLAUDE_CONFIG_DIR` を前置しないと
+    /// `No conversation found with session ID` で resume に失敗する。
+    /// 前置はコマンド先頭（rc / direnv より後に効く位置。#500 / #512 と同型）
+    #[test]
+    fn resume_commandはconfigdirを先頭に前置する() {
+        let entry = SessionEntry {
+            kind: "master".into(),
+            profile: Some("takodev".into()),
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        let cmd = resume_command_with_env(
+            "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4",
+            &entry,
+            Some("export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; "),
+        )
+        .unwrap();
+        // 前置は先頭に来る。role 以降の組み立てはシェル方言（POSIX / PowerShell）に
+        // 従うので、直書きせず同じ部品と突き合わせる（#652 / Windows）
+        assert_eq!(
+            cmd,
+            format!(
+                "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; {} \
+                 --resume e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4",
+                crate::orchestrator::agent::launch_with_role("master:takodev", "claude")
+            )
+        );
     }
 
     #[test]

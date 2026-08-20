@@ -204,6 +204,15 @@ pub struct PaneLayout {
     /// バックグラウンドペインの由来タブ名（同上。閉じたタブ由来でも親を明記できるよう保持）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_tab_title: Option<String>,
+    /// 利用上限後の自動復帰のオプトイン（#813）。既定 OFF なので false は出力せず、
+    /// 旧ファイルは serde default で false になる（後方互換）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub limit_autoresume: bool,
+}
+
+/// `skip_serializing_if` 用（既定値 false の項目を JSON に出さない）
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// プレビューペインの保存内容（復元時はファイルを開き直す。PTY は起動しない）
@@ -292,6 +301,7 @@ pub fn capture(
                     // 由来タブ（FR-2.15.6）。再起動後もタブ別分離表示を保つ
                     origin_tab: Some(shelved.origin_tab().as_u64()),
                     origin_tab_title: Some(shelved.origin_tab_title().to_string()),
+                    limit_autoresume: pane.limit_autoresume(),
                 }
             })
             .collect(),
@@ -341,6 +351,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 // tree 内のペインは退避ではないので由来タブを持たない
                 origin_tab: None,
                 origin_tab_title: None,
+                limit_autoresume: pane.limit_autoresume(),
             }))
         }
         PaneNode::Split {
@@ -446,6 +457,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             p.title.clone(),
             parse_title_source(&p.title_source),
             p.role.clone(),
+            p.limit_autoresume,
         );
         restored.push(RestoredPane {
             pane: p.id,
@@ -504,6 +516,7 @@ fn restore_node(
                 p.title.clone(),
                 parse_title_source(&p.title_source),
                 p.role.clone(),
+                p.limit_autoresume,
             );
             let id = pane.id();
             restored.push(RestoredPane {
@@ -616,9 +629,10 @@ pub fn load_file(path: &Path) -> Result<LayoutFile, LayoutError> {
 }
 
 /// 書き出し（tmp + rename。settings と同方式）。
-/// ペイン数が大幅に減る保存は、上書き前に直前の layout.json を世代バックアップ
+/// **何かを失う保存**は、上書き前に直前の layout.json を世代バックアップ
 /// （`.bak.1`〜`.bak.3`）へ退避する（#177: tmux クライアント強奪で PTY が一斉死亡した
-/// 直後の自動保存が「正常だった構成」を上書き破壊し、復元不能になった）。
+/// 直後の自動保存が「正常だった構成」を上書き破壊し、復元不能になった。
+/// #770: タブ close で失った構成も戻せるようにする）。
 /// 空のレイアウト（タブ 0 個 / ペイン 0 個）は復元不能な上書きにしかならないため
 /// 保存自体を拒否する（#381: どのような異常経路でも既存の良品を空で潰さない防御線。
 /// restore 側の `LayoutError::Empty` 拒否と対の二重防御）
@@ -635,7 +649,7 @@ pub fn save(layout: &LayoutFile) -> io::Result<PathBuf> {
             "データディレクトリを解決できない",
         )
     })?;
-    backup_if_degraded(&path, layout, BACKUP_MIN_INTERVAL);
+    backup_if_lossy(&path, layout, BACKUP_MIN_INTERVAL);
     save_to(&path, layout)?;
     Ok(path)
 }
@@ -663,6 +677,20 @@ fn is_degraded_shrink(prev: usize, next: usize) -> bool {
     prev >= 4 && next < prev.div_ceil(2)
 }
 
+/// バックエンドセッション（実行中プロセスの器）を持つペインが消える保存か（#770）。
+///
+/// ペイン数の減り方だけを見る [`is_degraded_shrink`] では、タブ 1 枚（3 ペイン）の
+/// close が素通りしていた。close は 1 ペインずつ届くため、12→11→10 のどの段階も
+/// 「半減」にならず、実機では **16 日間 1 度も世代が残らなかった**（#770 の実測）。
+/// 失うのがセッション = 再現できない実行中プロセスなので、ここを回転の基準にする。
+///
+/// バックグラウンドへの退避（たまり場）は `sessions()` が退避分も数えるため喪失にならない。
+/// プレビューペインだけを閉じる操作も（セッションを持たないので）対象外。
+fn loses_backend_session(prev: &LayoutFile, next: &LayoutFile) -> bool {
+    let kept: HashSet<&str> = next.sessions().into_iter().collect();
+    prev.sessions().iter().any(|s| !kept.contains(s))
+}
+
 /// 保存を拒否すべき空レイアウトか（#381: 空での上書きは復元不能に直結する）
 fn is_empty_layout(layout: &LayoutFile) -> bool {
     layout.tabs.is_empty() || layout.pane_count() == 0
@@ -672,14 +700,17 @@ fn is_empty_layout(layout: &LayoutFile) -> bool {
 /// 健全世代が bak から押し出されないよう、bak.1 がこの秒数より新しい間は回転させない
 const BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(600);
 
-/// ペイン数が大幅減する保存の前に、直前の layout.json を `.bak.1`〜`.bak.3` へ退避する。
+/// 何かを失う保存の前に、直前の layout.json を `.bak.1`〜`.bak.3` へ退避する。
 /// バックアップ失敗で保存自体は止めない（保存できない方が復元不能に直結する）
-fn backup_if_degraded(path: &Path, next: &LayoutFile, min_interval: Duration) {
+fn backup_if_lossy(path: &Path, next: &LayoutFile, min_interval: Duration) {
     let Ok(prev) = load_file(path) else {
         // 不在 = 初回保存、破損 = 退避しても復旧に使えない。どちらも対象外
         return;
     };
-    if !is_degraded_shrink(prev.pane_count(), next.pane_count()) {
+    // 一気に半減する縮退（#177）と、セッションを 1 つでも失う保存（#770）の両方を拾う
+    if !is_degraded_shrink(prev.pane_count(), next.pane_count())
+        && !loses_backend_session(&prev, next)
+    {
         return;
     }
     let bak1 = crate::config_io::backup_path(path, 1);
@@ -692,7 +723,7 @@ fn backup_if_degraded(path: &Path, next: &LayoutFile, min_interval: Duration) {
         return;
     }
     if let Err(e) = crate::config_io::rotate_backups(path) {
-        eprintln!("warning: layout.json の縮退前バックアップに失敗: {e}");
+        eprintln!("warning: layout.json の喪失前バックアップに失敗: {e}");
     }
 }
 
@@ -733,6 +764,81 @@ mod tests {
         let tab2_pane = Pane::new(PaneOrigin::Mcp);
         ws.create_tab("2", tab2_pane);
         ws
+    }
+
+    /// #813: 自動復帰のオプトインが再起動をまたいで残る。
+    /// 既定 OFF は JSON に出さず、旧ファイル（フィールド無し）も OFF として読める
+    #[test]
+    fn issue813_自動復帰フラグが保存復元され旧ファイルと後方互換() {
+        let root = Pane::new(PaneOrigin::User);
+        let root_id = root.id();
+        let mut ws = Workspace::new("1", root);
+        let second = Pane::new(PaneOrigin::Cli);
+        let second_id = second.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Right, second)
+            .unwrap();
+        // 片方だけ有効にする（全ペインに波及しないことも同時に見る）
+        ws.active_tab_mut()
+            .tree_mut()
+            .get_mut(second_id)
+            .unwrap()
+            .set_limit_autoresume(true);
+        // バックグラウンドのペインでも保たれる
+        let bg = Pane::new(PaneOrigin::User);
+        let bg_id = bg.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Down, bg)
+            .unwrap();
+        ws.active_tab_mut()
+            .tree_mut()
+            .get_mut(bg_id)
+            .unwrap()
+            .set_limit_autoresume(true);
+        ws.shelve_pane(bg_id).expect("退避できる");
+
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        let json = serde_json::to_string(&layout).unwrap();
+        // 既定 OFF のペインはフィールドごと出さない（旧 tako でも読める JSON を保つ）
+        assert_eq!(
+            json.matches("limit_autoresume").count(),
+            2,
+            "ON のペインぶんだけ出力される: {json}"
+        );
+
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored_ws, _) = restore(&back).expect("復元できる");
+        let tree = restored_ws.tabs()[0].tree();
+        assert!(
+            !tree
+                .get(PaneId::from_raw(root_id.as_u64()))
+                .unwrap()
+                .limit_autoresume(),
+            "有効にしていないペインは OFF のまま"
+        );
+        assert!(
+            tree.get(PaneId::from_raw(second_id.as_u64()))
+                .unwrap()
+                .limit_autoresume(),
+            "有効にしたペインは ON で戻る"
+        );
+        assert!(
+            restored_ws.shelved_panes()[0].pane().limit_autoresume(),
+            "バックグラウンドのペインでも ON で戻る"
+        );
+
+        // フィールドを持たない旧ファイルは OFF として読める
+        let legacy: LayoutFile =
+            serde_json::from_str(&json.replace("\"limit_autoresume\":true", "\"_x\":true"))
+                .unwrap();
+        let (legacy_ws, _) = restore(&legacy).expect("旧ファイルも復元できる");
+        assert!(!legacy_ws.tabs()[0]
+            .tree()
+            .get(PaneId::from_raw(second_id.as_u64()))
+            .unwrap()
+            .limit_autoresume());
     }
 
     #[test]
@@ -1043,6 +1149,7 @@ mod tests {
                 webview: None,
                 origin_tab: None,
                 origin_tab_title: None,
+                limit_autoresume: false,
             }))
         }
         let mut tree = pane(1);
@@ -1100,6 +1207,7 @@ mod tests {
             webview: None,
             origin_tab: Some(1),
             origin_tab_title: None,
+            limit_autoresume: false,
         });
         assert_eq!(layout.pane_count(), 4);
         assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
@@ -1148,27 +1256,228 @@ mod tests {
         let bak1 = crate::config_io::backup_path(&path, 1);
 
         // 不在（初回保存）では何もしない
-        backup_if_degraded(&path, &layout_with_panes(3), Duration::ZERO);
+        backup_if_lossy(&path, &layout_with_panes(3), Duration::ZERO);
         assert!(!bak1.exists());
 
         // 16 ペイン → 3 ペインの縮退保存: 直前の 16 ペイン版が .bak.1 へ退避される
         save_to(&path, &layout_with_panes(16)).unwrap();
-        backup_if_degraded(&path, &layout_with_panes(3), Duration::ZERO);
+        backup_if_lossy(&path, &layout_with_panes(3), Duration::ZERO);
         save_to(&path, &layout_with_panes(3)).unwrap();
         assert_eq!(load_file(&bak1).unwrap().pane_count(), 16);
         assert_eq!(load_file(&path).unwrap().pane_count(), 3);
 
-        // 増加・微減では回転しない（bak.1 は 16 ペイン版のまま）
+        // 増加では回転しない（bak.1 は 16 ペイン版のまま）
         save_to(&path, &layout_with_panes(8)).unwrap();
-        backup_if_degraded(&path, &layout_with_panes(7), Duration::ZERO);
-        save_to(&path, &layout_with_panes(7)).unwrap();
+        backup_if_lossy(&path, &layout_with_panes(9), Duration::ZERO);
+        save_to(&path, &layout_with_panes(9)).unwrap();
         assert_eq!(load_file(&bak1).unwrap().pane_count(), 16);
 
         // 破損した直前ファイルは退避対象にしない（パニックもしない）
         let broken = dir.join("broken.json");
         std::fs::write(&broken, "{not json").unwrap();
-        backup_if_degraded(&broken, &layout_with_panes(1), Duration::ZERO);
+        backup_if_lossy(&broken, &layout_with_panes(1), Duration::ZERO);
         assert!(!crate::config_io::backup_path(&broken, 1).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 指定したセッション名だけを持つ 1 タブのレイアウト（#770 の回転条件テスト用）。
+    /// `preview_panes` はセッションを持たないプレビューペインの枚数
+    fn layout_with_sessions(sessions: &[&str], preview_panes: usize) -> LayoutFile {
+        fn leaf(id: u64, session: Option<&str>) -> NodeLayout {
+            NodeLayout::Pane(Box::new(PaneLayout {
+                id,
+                session: session.map(str::to_string),
+                title: None,
+                title_source: "auto".into(),
+                role: None,
+                origin: "user".into(),
+                cwd: None,
+                claude_session_id: None,
+                logged_history: None,
+                preview: session.is_none().then(|| PreviewLayout {
+                    path: format!("/tmp/p{id}.pdf"),
+                    mode: "pdf".into(),
+                }),
+                webview: None,
+                origin_tab: None,
+                origin_tab_title: None,
+                limit_autoresume: false,
+            }))
+        }
+        let mut id = 1u64;
+        let mut leaves: Vec<NodeLayout> = Vec::new();
+        for s in sessions {
+            leaves.push(leaf(id, Some(s)));
+            id += 1;
+        }
+        for _ in 0..preview_panes {
+            leaves.push(leaf(id, None));
+            id += 1;
+        }
+        let mut tree = leaves.remove(0);
+        for next in leaves {
+            tree = NodeLayout::Split {
+                axis: "x".into(),
+                ratio: 0.5,
+                first: Box::new(tree),
+                second: Box::new(next),
+            };
+        }
+        LayoutFile {
+            version: LAYOUT_VERSION,
+            active_tab: 1,
+            tabs: vec![TabLayout {
+                id: 1,
+                title: "t".into(),
+                title_source: "default".into(),
+                focused: 1,
+                tree,
+                pinned_folders: vec![],
+            }],
+            window: None,
+            backgrounded: vec![],
+            collapsed: vec![],
+            webview_dock: vec![],
+            windows: vec![],
+        }
+    }
+
+    #[test]
+    fn セッションを失う保存は半減でなくても世代バックアップされる() {
+        // #770: 実機は 7 タブ 12 ペイン → 6 タブ 10 ペインで 1 度も回転せず、
+        // .bak が 16 日前のまま = tako recover に使える世代が無かった
+        let prev = layout_with_sessions(&["a", "b", "c", "d", "e", "f"], 6); // 12 ペイン
+        let next = layout_with_sessions(&["a", "b", "c", "d"], 6); // 10 ペイン
+        assert!(
+            !is_degraded_shrink(prev.pane_count(), next.pane_count()),
+            "12 → 10 は旧条件（半減）では検出できない"
+        );
+        assert!(
+            loses_backend_session(&prev, &next),
+            "セッション e / f を失う保存は世代を残す対象"
+        );
+
+        // タブ close は 1 ペインずつ届く。どの段階も半減にならないが、
+        // セッションを失う段階は必ず回転対象になる（#770 の実測どおり）
+        let p4 = layout_with_sessions(&["a", "b", "c"], 1); // 4 ペイン
+        let p3 = layout_with_sessions(&["a", "b", "c"], 0); // プレビューだけ閉じた
+        let p2 = layout_with_sessions(&["a", "b"], 0);
+        assert!(
+            !loses_backend_session(&p4, &p3),
+            "プレビューペインだけを閉じる操作は喪失ではない（再現できる）"
+        );
+        assert!(loses_backend_session(&p3, &p2));
+    }
+
+    #[test]
+    fn 増加とバックグラウンド退避は喪失とみなさない() {
+        let base = layout_with_sessions(&["a", "b"], 0);
+        // 増加
+        assert!(!loses_backend_session(
+            &base,
+            &layout_with_sessions(&["a", "b", "c"], 0)
+        ));
+        // 不変
+        assert!(!loses_backend_session(&base, &base));
+        // たまり場へ退避（tree から消えても backgrounded に残る = 生きている）
+        let mut shelved = layout_with_sessions(&["a"], 0);
+        shelved.backgrounded.push(PaneLayout {
+            id: 99,
+            session: Some("b".into()),
+            title: None,
+            title_source: "auto".into(),
+            role: None,
+            origin: "user".into(),
+            cwd: None,
+            claude_session_id: None,
+            logged_history: None,
+            preview: None,
+            webview: None,
+            origin_tab: Some(1),
+            origin_tab_title: None,
+            limit_autoresume: false,
+        });
+        assert!(
+            !loses_backend_session(&base, &shelved),
+            "バックグラウンド退避はセッションを殺さないので世代を消費しない"
+        );
+    }
+
+    #[test]
+    fn タブcloseの1ペインずつの保存でも直前構成が世代に残る() {
+        // #770 の実測を回帰として固定する。close は 1 ペインずつ届くので保存も
+        // 段階的になり、どの段階も「半減」に届かない。旧条件では 4 ペイン →
+        // 1 ペインまで閉じても .bak が 1 度も作られなかった
+        let dir = std::env::temp_dir().join(format!("tako-layout-770-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layout.json");
+        let bak1 = crate::config_io::backup_path(&path, 1);
+        let interval = Duration::from_secs(600);
+
+        // ターミナル 3 + プレビュー 1 のタブ + 別タブのターミナル 1 相当（計 5 ペイン）
+        let steps = [
+            layout_with_sessions(&["a", "b", "c", "keep"], 1), // 5 ペイン（初期状態）
+            layout_with_sessions(&["a", "b", "keep"], 1),      // c を close
+            layout_with_sessions(&["a", "keep"], 1),           // b を close
+            layout_with_sessions(&["keep"], 1),                // a を close
+            layout_with_sessions(&["keep"], 0),                // プレビューも close = タブ消滅
+        ];
+        save_to(&path, &steps[0]).unwrap();
+        for next in &steps[1..] {
+            // どの段階も「4 ペイン以上から半減」にはならない
+            let prev = load_file(&path).unwrap();
+            assert!(
+                !is_degraded_shrink(prev.pane_count(), next.pane_count()),
+                "{} → {} が半減判定に掛かってしまうとこのテストの意味が無くなる",
+                prev.pane_count(),
+                next.pane_count()
+            );
+            backup_if_lossy(&path, next, interval);
+            save_to(&path, next).unwrap();
+        }
+
+        let restored = load_file(&bak1).expect("喪失前の構成が .bak.1 に残っている");
+        assert_eq!(
+            restored.pane_count(),
+            5,
+            "最初にセッションを失った時点の構成（5 ペイン）が世代に残るべき"
+        );
+        assert_eq!(restored.sessions(), vec!["a", "b", "c", "keep"]);
+        // 回転ガード（600 秒）が効いて、後続の段階で健全世代が押し出されていないこと
+        assert!(
+            !crate::config_io::backup_path(&path, 2).exists(),
+            "連鎖する喪失で世代を食い潰してはいけない（#177 のガードを維持）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 実機770の形12ペインから10ペインでも世代が残る() {
+        // 実機は 7 タブ 12 ペイン → 6 タブ 10 ペイン。旧条件では素通りし、
+        // .bak が 16 日前のままで tako recover が使えなかった
+        let dir = std::env::temp_dir().join(format!("tako-layout-770b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layout.json");
+        let bak1 = crate::config_io::backup_path(&path, 1);
+
+        let prev = layout_with_sessions(&["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"], 3);
+        let next = layout_with_sessions(&["s1", "s2", "s3", "s4", "s5", "s6", "s7"], 3);
+        assert_eq!(prev.pane_count(), 12);
+        assert_eq!(next.pane_count(), 10);
+        save_to(&path, &prev).unwrap();
+        backup_if_lossy(&path, &next, Duration::from_secs(600));
+        save_to(&path, &next).unwrap();
+
+        assert_eq!(
+            load_file(&bak1)
+                .expect("12 ペイン版が .bak.1 に残っている")
+                .pane_count(),
+            12
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1185,10 +1494,10 @@ mod tests {
         // PTY 大量死は 16→7→3 のような段階保存になる。最初の縮退で bak.1 = 16 が
         // でき、直後（interval 内）の縮退では回転せず健全世代が保持される
         save_to(&path, &layout_with_panes(16)).unwrap();
-        backup_if_degraded(&path, &layout_with_panes(7), interval);
+        backup_if_lossy(&path, &layout_with_panes(7), interval);
         save_to(&path, &layout_with_panes(7)).unwrap();
         assert_eq!(load_file(&bak1).unwrap().pane_count(), 16);
-        backup_if_degraded(&path, &layout_with_panes(3), interval);
+        backup_if_lossy(&path, &layout_with_panes(3), interval);
         save_to(&path, &layout_with_panes(3)).unwrap();
         assert_eq!(
             load_file(&bak1).unwrap().pane_count(),

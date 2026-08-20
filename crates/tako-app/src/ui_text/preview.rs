@@ -156,6 +156,13 @@ pub fn binary_file() -> &'static str {
     )
 }
 
+// --- Markdown コードブロックのコピーボタン（#680。キー: preview.code_copy_*） ---
+
+/// コピー直後の成功フィードバック（待機中はアイコンのみで文言を出さない）
+pub fn code_copied() -> &'static str {
+    tr!("コピーしました", "Copied")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -199,6 +206,7 @@ mod tests {
                 cannot_read("io error"),
                 pdf_unsupported_platform().to_string(),
                 binary_file().to_string(),
+                code_copied().to_string(),
             ]
         });
     }

@@ -40,7 +40,13 @@ impl SessionHost for HeadlessHost {
         None
     }
     fn attach_session(&mut self, _pane: PaneId, _options: SpawnOptions) {}
-    fn detach_session(&mut self, _pane: PaneId) {}
+    fn detach_session(
+        &mut self,
+        _pane: PaneId,
+        _origin: tako_core::pane_log::CloseOrigin,
+        _caller: Option<&str>,
+    ) {
+    }
 }
 
 impl TmuxHost for HeadlessHost {}

@@ -1,6 +1,6 @@
 ---
 title: tako とは
-description: AI エージェントのための次世代ターミナル
+description: AI エージェントのための次世代ターミナル。設定ゼロで AI が画面を組み立てる macOS 向け GUI ターミナル
 tableOfContents: false
 head:
   - tag: style
@@ -21,11 +21,11 @@ head:
 
 <h1 class="tako-hero-title">画面を自由に操る、<br /><span class="tako-highlight">tako</span> にようこそ。</h1>
 
-<p class="tako-hero-tagline">Claude Code の子エージェント・dev サーバー・ファイルプレビューを「1タブ＝1作業グループ」で集約。設定ゼロで、AI が自分のワークスペースを組み立てます。</p>
+<p class="tako-hero-tagline">AI エージェント・子エージェント・dev サーバーを「1 タブ = 1 作業グループ」で集約する macOS 向けターミナル。設定ゼロで、AI が自分のワークスペースを組み立てます。</p>
 
 <div class="tako-hero-actions">
 <a href="/getting-started/#1-インストール" class="tako-btn tako-btn-primary">ダウンロード ↓</a>
-<a href="/getting-started/" class="tako-btn tako-btn-secondary">セットアップガイド</a>
+<a href="/getting-started/quickstart/" class="tako-btn tako-btn-secondary">3 分で試す</a>
 </div>
 </div>
 
@@ -33,52 +33,63 @@ head:
 <img src="/tako-mascot.svg" alt="tako マスコット" class="tako-mascot" />
 </div>
 </div>
+
+<div class="tako-stats">
+<div class="tako-stat"><span class="tako-stat-num">128</span><span class="tako-stat-label">MCP ツール</span></div>
+<div class="tako-stat"><span class="tako-stat-num">68</span><span class="tako-stat-label">CLI コマンド</span></div>
+<div class="tako-stat"><span class="tako-stat-num">210+</span><span class="tako-stat-label">ハイライト対応形式</span></div>
+<div class="tako-stat"><span class="tako-stat-num">0</span><span class="tako-stat-label">必要な MCP 設定</span></div>
+</div>
 </section>
 
 <section class="tako-section">
 <h2 class="tako-section-title"><span class="tako-section-dash">—</span> tako でできること</h2>
+<p class="tako-section-lead">ターミナルそのものが AI の作業台になります。人がキーボードでできることは、AI も同じ経路でできます。</p>
 
 <div class="tako-card-grid">
+
 <div class="tako-card">
-<div class="tako-card-icon tako-card-icon-pink">⚡</div>
+<div class="tako-card-icon tako-card-icon-pink"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/></svg></div>
 <h3>内蔵 MCP サーバー</h3>
-<p>tako の中で Claude Code を起動すれば、AI が設定ゼロでペインの分割・コマンド実行・ファイル表示を行える。「隣のペインで dev サーバー起動して」と言うだけ。50 以上の MCP ツールを内蔵。</p>
+<p>tako の中で AI エージェントを起動すれば、設定ゼロでペインの分割・コマンド実行・ファイル表示ができます。「隣のペインで dev サーバー起動して」と言うだけ。<strong>128 個</strong>の MCP ツールを内蔵しています。</p>
 </div>
 
 <div class="tako-card">
-<div class="tako-card-icon tako-card-icon-pink">⊞</div>
-<h3>タブ＆ペイン管理</h3>
-<p>iTerm2 ライクな分割レイアウトにドラッグ＆ドロップ対応。エージェント・dev サーバー・ログを「1 タブ = 1 作業グループ」にまとめて、どのプロジェクトで何が動いているかが一目でわかる。</p>
-</div>
-
-<div class="tako-card">
-<div class="tako-card-icon tako-card-icon-green">↻</div>
-<h3>再起動しても消えない</h3>
-<p>tmux バックエンドにより、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元される。エージェントの長時間タスクも、dev サーバーもそのまま。</p>
-</div>
-
-<div class="tako-card">
-<div class="tako-card-icon tako-card-icon-green">◇</div>
-<h3>ファイルプレビュー</h3>
-<p>AI が「このファイル見て」と言ったら、シンタックスハイライト付きのコードプレビューや Markdown レンダリングがペイン内に直接表示される。ターミナルから出ずにレビューできる。</p>
-</div>
-
-<div class="tako-card">
-<div class="tako-card-icon tako-card-icon-pink">♪</div>
+<div class="tako-card-icon tako-card-icon-pink"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M12 7.4v3.6M12 11h-7v5.6M12 11h7v5.6"/></svg></div>
 <h3>オーケストレーション</h3>
-<p><code>tako master</code> で司令塔の AI を起動すれば、複数の子エージェントが同じタブのペインに並んで働く。依頼は自然言語で 1 回だけ。監視も回収も自動。<a href="/features/orchestration/">詳しく →</a></p>
+<p><code>tako master</code> で司令塔の AI を起動すれば、複数の子エージェントが同じタブのペインに並んで働きます。依頼は自然言語で 1 回だけ。監視も検収も片付けも自動。<a href="/features/orchestration/">詳しく →</a></p>
 </div>
 
 <div class="tako-card">
-<div class="tako-card-icon tako-card-icon-green">📱</div>
-<h3>スマホからリモート監視</h3>
-<p><code>tako remote start</code> で QR コードを表示、スマホで読み取ればどこからでもターミナルの様子を確認できる。エージェントに長時間タスクを任せて外出しても安心。</p>
+<div class="tako-card-icon tako-card-icon-green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><path d="M3 9h18M11 9v12"/></svg></div>
+<h3>タブ＆ペイン管理</h3>
+<p>iTerm2 ライクな分割レイアウトにドラッグ＆ドロップ対応。エージェント・dev サーバー・ログを 1 タブにまとめられるので、どのプロジェクトで何が動いているか一目でわかります。複数ウィンドウにも対応。</p>
 </div>
+
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg></div>
+<h3>再起動しても消えない</h3>
+<p>tmux バックエンドにより、tako を閉じて再起動しても実行中のプロセスと画面内容がそのまま復元されます。エージェントの長時間タスクも dev サーバーもそのまま。「任せて寝る」が現実的にできます。</p>
+</div>
+
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-pink"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6.5Z"/><path d="M14 2v5h5"/><path d="M9 13h6M9 17h4"/></svg></div>
+<h3>プレビューと git</h3>
+<p>コード・Markdown・画像・PDF・動画をペイン内で表示。210 以上の形式にシンタックスハイライトが効きます。git パネルからはステージング・コミット・ブランチ切替・マージまで行えます。</p>
+</div>
+
+<div class="tako-card">
+<div class="tako-card-icon tako-card-icon-green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M11 18.5h2"/></svg></div>
+<h3>スマホからリモート監視</h3>
+<p><code>tako remote start</code> と Tailscale で、tailnet 内限定の固定 URL からスマホでも様子を見られます。通信は WireGuard で暗号化され、接続には Mac 側での承認が必要。<a href="/features/remote/">詳しく →</a></p>
+</div>
+
 </div>
 </section>
 
 <section class="tako-section">
 <h2 class="tako-section-title"><span class="tako-section-dash">—</span> はじめよう</h2>
+<p class="tako-section-lead">インストールしたら、あとは 2 コマンド。設定ファイルを開く必要はありません。</p>
 
 <div class="tako-terminal-block">
 <div class="tako-terminal-header">
@@ -89,7 +100,7 @@ head:
 </div>
 <div class="tako-terminal-body">
 <div class="tako-terminal-line"><span class="tako-terminal-comment"># 1. Homebrew でインストール（推奨）</span></div>
-<div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">brew tap takushio2525/tako && brew install --cask takushio2525/tako/tako</span></div>
+<div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">brew install --cask takushio2525/tako/tako</span></div>
 <div class="tako-terminal-line">&nbsp;</div>
 <div class="tako-terminal-line"><span class="tako-terminal-comment"># 2. 質問ゼロの自動セットアップ（初回のみ。MCP 登録も自動）</span></div>
 <div class="tako-terminal-line"><span class="tako-terminal-prompt">$</span> <span class="tako-terminal-cmd">tako setup</span></div>
@@ -100,6 +111,17 @@ head:
 </div>
 
 <p class="tako-guide-link">詳しい手順は <a href="/getting-started/">セットアップガイド →</a>、最短で体験するなら <a href="/getting-started/quickstart/">クイックスタート →</a> をご覧ください。</p>
+</section>
+
+<section class="tako-section">
+<h2 class="tako-section-title"><span class="tako-section-dash">—</span> 次に読む</h2>
+
+<div class="tako-next-grid">
+<a class="tako-next-card" href="/getting-started/quickstart/"><strong>クイックスタート</strong><span>3 ステップで AI オーケストレーションを体験する</span></a>
+<a class="tako-next-card" href="/features/orchestration/"><strong>オーケストレーションとは</strong><span>複数の AI を並列に働かせる目玉機能の考え方</span></a>
+<a class="tako-next-card" href="/guides/cli-reference/"><strong>CLI リファレンス</strong><span>68 個の <code>tako</code> コマンドの逆引き一覧</span></a>
+<a class="tako-next-card" href="/guides/mcp-tools/"><strong>MCP ツール一覧</strong><span>AI に公開している 128 ツールの全リスト</span></a>
+</div>
 </section>
 
 </div>

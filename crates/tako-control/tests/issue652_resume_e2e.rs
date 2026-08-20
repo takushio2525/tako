@@ -27,9 +27,21 @@ use tako_control::transcript;
 /// 会話が見つからなかったときに claude が出す文言（判定の要）
 const NOT_FOUND: &str = "No conversation found with session ID";
 
-/// テスト用の一時ディレクトリ接頭辞。削除ガードもこの値で判定する
+/// テスト用の一時ディレクトリ接頭辞。削除ガードもこの値で判定する。
+///
+/// unix では `$TMPDIR`（macOS の `/var/folders/...`）ではなく `/private/tmp` 直下に
+/// 作る（claude_tui_e2e と同じ理由: 祖先の信頼済みエントリの影響を避ける）。
+/// Windows には該当の作法が無いので OS の一時ディレクトリを使う
 fn temp_prefix() -> PathBuf {
-    std::env::temp_dir().join(format!("tako-e2e-652-{}", std::process::id()))
+    let name = format!("tako-e2e-652-{}", std::process::id());
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join(name)
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/private/tmp").join(name)
+    }
 }
 
 /// **一時ディレクトリ配下であることを検証してから**消す

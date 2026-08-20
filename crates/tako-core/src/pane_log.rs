@@ -51,6 +51,115 @@ impl Default for PaneLogConfig {
     }
 }
 
+/// ペインが閉じた発生源（Issue #566）。クローズマーカーに書き残し、
+/// 「誰がこのペインを閉じたか」を事後に追跡できるようにする。
+///
+/// 2026-07-27 の master ペイン消失調査では `close` / `exit` の 2 値しか無く、
+/// GUI 操作・キーバインド・CLI / MCP・プロセス終了を区別できずに消去法でしか
+/// 結論を出せなかった。ここで区別を型に落として同じ調査を再発させない
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOrigin {
+    /// キーバインド（Cmd+W）
+    Keyboard,
+    /// GUI のペイン × ボタン
+    PaneButton,
+    /// GUI のタブ × ボタン（タブごと閉じる）
+    TabButton,
+    /// CLI（`tako close` 等）からの dispatch
+    Cli,
+    /// MCP ツール（`tako_close_pane` 等）からの dispatch
+    Mcp,
+    /// 経路不明の dispatch（GUI が dispatch を直接呼ぶ経路・提案チップ等）
+    Dispatch,
+    /// アプリ内部の後始末（PTY 起動失敗のロールバック・死亡ビューの掃除等）
+    Internal,
+    /// アプリ終了に伴う最終フラッシュ
+    AppQuit,
+    /// プロセス終了・PTY 死亡（ユーザー操作ではない）
+    ProcessExit,
+}
+
+impl CloseOrigin {
+    /// クローズマーカーに書く発生源文字列
+    pub fn marker(self) -> &'static str {
+        match self {
+            CloseOrigin::Keyboard => "close:kbd",
+            CloseOrigin::PaneButton => "close:gui",
+            CloseOrigin::TabButton => "close:gui-tab",
+            CloseOrigin::Cli => "close:dispatch(cli)",
+            CloseOrigin::Mcp => "close:dispatch(mcp)",
+            CloseOrigin::Dispatch => "close:dispatch",
+            CloseOrigin::Internal => "close:internal",
+            CloseOrigin::AppQuit => "close:app-quit",
+            CloseOrigin::ProcessExit => "exit",
+        }
+    }
+
+    /// dispatch 経路（CLI / MCP）なら呼び出し元 role を添えた発生源文字列を作る。
+    /// role はマーカー書式を壊さないよう正規化する（診断ログにペイン内容・
+    /// トークンを出さない絶対ルールがあるため、素通しはしない）
+    pub fn marker_with_caller(self, caller: Option<&str>) -> String {
+        let base = self.marker();
+        if !self.is_dispatch() {
+            return base.to_string();
+        }
+        match caller.map(sanitize_caller).filter(|c| !c.is_empty()) {
+            Some(caller) => match base.strip_suffix(')') {
+                // "close:dispatch(cli)" → "close:dispatch(cli, caller=...)"
+                Some(head) => format!("{head}, caller={caller})"),
+                // "close:dispatch" → "close:dispatch(caller=...)"
+                None => format!("{base}(caller={caller})"),
+            },
+            None => base.to_string(),
+        }
+    }
+
+    /// CLI / MCP など制御プレーン由来か
+    pub fn is_dispatch(self) -> bool {
+        matches!(
+            self,
+            CloseOrigin::Cli | CloseOrigin::Mcp | CloseOrigin::Dispatch
+        )
+    }
+}
+
+/// クローズマーカー行の前後。書き出しと読み取りで同じ定数を使う
+const CLOSE_MARKER_PREFIX: &str = "--- [クローズ: ";
+const CLOSE_MARKER_SUFFIX: &str = "] ---";
+
+/// クローズマーカー行から発生源（`CloseOrigin::marker_with_caller` が作った文字列）を
+/// 取り出す。マーカー行でなければ None。
+///
+/// caller つき（`close:dispatch(cli, caller=…)`）でもそのまま返すので、呼び出し側は
+/// `marker()` / `marker_with_caller()` と突き合わせて発生源を厳密に判定できる。
+/// 発生源の前方一致で判定すると `close:gui` が `close:gui-tab` を拾ってしまうため、
+/// 判定材料は「発生源そのもの」として切り出す（Issue #599）
+pub fn close_marker_reason(line: &str) -> Option<&str> {
+    let body = line
+        .strip_prefix(CLOSE_MARKER_PREFIX)?
+        .strip_suffix(CLOSE_MARKER_SUFFIX)?;
+    // 末尾は必ず UTC タイムスタンプ（空白を含まない）。caller も正規化済みで空白を含まない
+    body.rsplit_once(' ').map(|(reason, _utc)| reason)
+}
+
+/// caller（role 等）をマーカーへ埋め込める文字だけに落とす。
+/// 許可: 英数字 / `-` `_` `:` `.` / それ以外は `_`。長さは 64 文字で打ち切る
+fn sanitize_caller(caller: &str) -> String {
+    caller
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
 /// ファイル命名・ヘッダに使うペインのメタ情報（作成時点のスナップショット）
 #[derive(Debug, Clone, Default)]
 pub struct PaneLogMeta {
@@ -214,8 +323,18 @@ impl PaneLogManager {
     }
 
     /// ペイン close / exit 時の最終フラッシュ: 可視画面の残り（履歴に落ちていない行）を
-    /// 追記し、クローズマーカーを書いて状態を破棄する
-    pub fn flush_close(&mut self, pane: u64, meta: &PaneLogMeta, visible: &[String], reason: &str) {
+    /// 追記し、クローズマーカーを書いて状態を破棄する。
+    /// `origin` / `caller` は発生源の記録（Issue #566）。文字列ではなく型で受け取り、
+    /// 呼び出し側が発生源を書き忘れられないようにする
+    pub fn flush_close(
+        &mut self,
+        pane: u64,
+        meta: &PaneLogMeta,
+        visible: &[String],
+        origin: CloseOrigin,
+        caller: Option<&str>,
+    ) {
+        let reason = origin.marker_with_caller(caller);
         let enabled = self.config.enabled;
         let max_bytes = self.config.max_bytes_per_pane;
         let state = self.ensure_state(pane, meta);
@@ -228,7 +347,10 @@ impl PaneLogManager {
             if !owned.is_empty() {
                 append_lines_to(state, &owned, max_bytes);
             }
-            let marker = format!("--- [クローズ: {reason} {}] ---", now_utc());
+            let marker = format!(
+                "{CLOSE_MARKER_PREFIX}{reason} {}{CLOSE_MARKER_SUFFIX}",
+                now_utc()
+            );
             append_lines_to(state, std::slice::from_ref(&marker), max_bytes);
         }
         self.states.remove(&pane);
@@ -792,13 +914,140 @@ mod tests {
                 },
             },
         );
-        mgr.flush_close(11, &m, &lines(&["visible-1", "visible-2", "", ""]), "kill");
+        mgr.flush_close(
+            11,
+            &m,
+            &lines(&["visible-1", "visible-2", "", ""]),
+            CloseOrigin::Keyboard,
+            None,
+        );
         assert!(mgr.path_of(11).is_none(), "状態が破棄される");
         let files = list_files(&dir);
         let content = std::fs::read_to_string(&files[0].path).unwrap();
         assert!(content.contains("scrolled\nvisible-1\nvisible-2\n"));
-        assert!(content.contains("--- [クローズ: kill"));
+        assert!(content.contains("--- [クローズ: close:kbd"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #566: クローズマーカーの発生源表記。GUI × / キーバインド /
+    /// CLI・MCP / プロセス終了を事後に区別できることを固定する
+    #[test]
+    fn クローズマーカーに発生源が入る() {
+        assert_eq!(CloseOrigin::Keyboard.marker(), "close:kbd");
+        assert_eq!(CloseOrigin::PaneButton.marker(), "close:gui");
+        assert_eq!(CloseOrigin::TabButton.marker(), "close:gui-tab");
+        assert_eq!(CloseOrigin::Cli.marker(), "close:dispatch(cli)");
+        assert_eq!(CloseOrigin::Mcp.marker(), "close:dispatch(mcp)");
+        assert_eq!(CloseOrigin::Dispatch.marker(), "close:dispatch");
+        assert_eq!(CloseOrigin::Internal.marker(), "close:internal");
+        assert_eq!(CloseOrigin::AppQuit.marker(), "close:app-quit");
+        assert_eq!(CloseOrigin::ProcessExit.marker(), "exit");
+        // 全て相異なる = 事後の区別がつく
+        let all = [
+            CloseOrigin::Keyboard,
+            CloseOrigin::PaneButton,
+            CloseOrigin::TabButton,
+            CloseOrigin::Cli,
+            CloseOrigin::Mcp,
+            CloseOrigin::Dispatch,
+            CloseOrigin::Internal,
+            CloseOrigin::AppQuit,
+            CloseOrigin::ProcessExit,
+        ];
+        let uniq: std::collections::HashSet<&str> = all.iter().map(|o| o.marker()).collect();
+        assert_eq!(uniq.len(), all.len(), "発生源ごとに別のマーカーになる");
+    }
+
+    #[test]
+    fn dispatch_のマーカーにだけ_caller_が付く() {
+        assert_eq!(
+            CloseOrigin::Mcp.marker_with_caller(Some("orchestrator-master:takodev")),
+            "close:dispatch(mcp, caller=orchestrator-master:takodev)"
+        );
+        assert_eq!(
+            CloseOrigin::Dispatch.marker_with_caller(Some("solo")),
+            "close:dispatch(caller=solo)"
+        );
+        // GUI / キーバインド / プロセス終了は caller を持たない
+        assert_eq!(
+            CloseOrigin::Keyboard.marker_with_caller(Some("orchestrator-master")),
+            "close:kbd"
+        );
+        assert_eq!(
+            CloseOrigin::ProcessExit.marker_with_caller(Some("x")),
+            "exit"
+        );
+        // 空・空白のみは付かない
+        assert_eq!(
+            CloseOrigin::Cli.marker_with_caller(None),
+            "close:dispatch(cli)"
+        );
+        assert_eq!(
+            CloseOrigin::Cli.marker_with_caller(Some("   ")),
+            "close:dispatch(cli)"
+        );
+    }
+
+    #[test]
+    fn caller_はマーカー書式を壊さないよう正規化される() {
+        // 改行・括弧・空白は潰す（1 行 1 マーカーの前提と括弧の対応を守る）
+        assert_eq!(
+            CloseOrigin::Cli.marker_with_caller(Some("bad)\nrole (x")),
+            "close:dispatch(cli, caller=bad__role__x)"
+        );
+        // 長い caller は打ち切る
+        let long = "a".repeat(200);
+        let marker = CloseOrigin::Cli.marker_with_caller(Some(&long));
+        assert!(marker.contains(&"a".repeat(64)));
+        assert!(!marker.contains(&"a".repeat(65)));
+        assert!(!marker.contains('\n'));
+    }
+
+    /// Issue #566: 発生源が実際にログファイルへ書かれる（マーカーの結線確認）
+    #[test]
+    fn クローズマーカーの発生源がファイルへ書かれる() {
+        let dir = temp_dir("close-origin");
+        let mut mgr = PaneLogManager::new(dir.clone(), PaneLogConfig::default());
+        let m = meta(9, "master");
+        mgr.flush_close(
+            21,
+            &m,
+            &lines(&["last-line"]),
+            CloseOrigin::Mcp,
+            Some("orchestrator-master:tako"),
+        );
+        let files = list_files(&dir);
+        let content = std::fs::read_to_string(&files[0].path).unwrap();
+        assert!(
+            content.contains("--- [クローズ: close:dispatch(mcp, caller=orchestrator-master:tako)"),
+            "発生源つきマーカーが書かれる: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #599: 書いたマーカーから発生源を読み戻せる。判定側が
+    /// caller の有無に振り回されないための土台（前方一致で判定していたため
+    /// `TAKO_ORCHESTRATOR_ROLE` のある worker ペインから回すと必ず落ちていた）
+    #[test]
+    fn クローズマーカーから発生源を読み戻せる() {
+        // caller 無し / 有りのどちらも「発生源そのもの」が返る
+        for caller in [None, Some("worker:tako:599")] {
+            let reason = CloseOrigin::Cli.marker_with_caller(caller);
+            let line =
+                format!("{CLOSE_MARKER_PREFIX}{reason} 2026-07-27T10:23:42Z{CLOSE_MARKER_SUFFIX}");
+            assert_eq!(close_marker_reason(&line), Some(reason.as_str()), "{line}");
+        }
+        // 発生源の完全一致で見れば close:gui が close:gui-tab を拾わない
+        let tab = CloseOrigin::TabButton.marker_with_caller(None);
+        let line = format!("{CLOSE_MARKER_PREFIX}{tab} 2026-07-27T10:23:42Z{CLOSE_MARKER_SUFFIX}");
+        assert_eq!(close_marker_reason(&line), Some("close:gui-tab"));
+        assert_ne!(
+            close_marker_reason(&line),
+            Some(CloseOrigin::PaneButton.marker())
+        );
+        // マーカー以外の行は None
+        assert_eq!(close_marker_reason("普通のログ行"), None);
+        assert_eq!(close_marker_reason("--- [クローズ: close:kbd] ---"), None);
     }
 
     #[test]

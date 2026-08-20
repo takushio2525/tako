@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{EventListener, Notify, OnResize, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -23,6 +22,7 @@ use alacritty_terminal::tty;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 
 use crate::osc_tap::{OscEvent, PromptMark, TapPty};
+use crate::pty_loop::{Msg, Notifier, PtyLoop};
 use crate::screen::{self, Screen};
 use crate::theme::Theme;
 
@@ -222,6 +222,8 @@ pub struct TerminalSession {
     wheel_carry: std::sync::Mutex<f32>,
     /// 転送系ホイールのレート制限状態（トークンバケット。#167）
     wheel_rate: std::sync::Mutex<WheelRateState>,
+    /// 未処理の `Wakeup` があるか（#816。詳細は `pty_loop::PtyLoop::wakeup_pending`）
+    wakeup_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 器（psmux）の copy mode 滞在の追跡と in-band 解除の仕込み（#686）
     copy_mode: std::sync::Mutex<CopyModeGate>,
 }
@@ -385,7 +387,10 @@ impl TerminalSession {
             }),
         );
 
-        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
+        // PTY IO ループは tako 側に持つ（`pty_loop`）。upstream の `EventLoop` は
+        // reader スレッドのスタックへ 1 MiB を確保し、ペインごとに常駐していた（#817）
+        let wakeup_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let event_loop = PtyLoop::new(term.clone(), proxy, pty, wakeup_pending.clone())
             .map_err(SessionError::EventLoop)?;
         let notifier = Notifier(event_loop.channel());
         let _io_thread = event_loop.spawn();
@@ -412,6 +417,7 @@ impl TerminalSession {
                     last: std::time::Instant::now(),
                 }),
                 copy_mode: std::sync::Mutex::new(CopyModeGate::default()),
+                wakeup_pending,
             },
             rx,
         ))
@@ -749,8 +755,22 @@ impl TerminalSession {
         for offset in (skip_newest + 1..=skip_newest + take).rev() {
             let line = Line(-(offset as i32));
             let row = &grid[line];
-            let mut text = String::with_capacity(cols);
-            for col in 0..cols {
+            // #816: 行の大半は末尾の未使用セル（空白）で、`trim_end` で必ず落ちる。
+            // 先に後ろから境界を探し、そこまでしか組み立てない（`String` の確保も
+            // 1 本で済ませる）。取り出す文字列は従来と 1 バイトも変わらない
+            let mut end = cols;
+            while end > 0 {
+                let cell = &row[Column(end - 1)];
+                let spacer = cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+                if !spacer && cell.c != ' ' {
+                    break;
+                }
+                end -= 1;
+            }
+            let mut text = String::with_capacity(end);
+            for col in 0..end {
                 let cell = &row[Column(col)];
                 if cell
                     .flags
@@ -760,7 +780,9 @@ impl TerminalSession {
                 }
                 text.push(cell.c);
             }
-            out.push(text.trim_end().to_string());
+            // 空白以外の末尾空白類（タブ等）は従来どおり `trim_end` に任せる
+            text.truncate(text.trim_end().len());
+            out.push(text);
         }
         out
     }
@@ -967,6 +989,13 @@ impl TerminalSession {
         parse_agent_metrics(&lines)
     }
 
+    /// 未処理 `Wakeup` フラグ（#816）。受け手はグリッドを読む直前にこれを倒す
+    /// （`consume_wakeup`）。倒すまで PTY 側は次の `Wakeup` を送らないので、
+    /// 1 read ごとにイベント配送タスクを起こすコストが消える
+    pub fn wakeup_gate(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.wakeup_pending.clone()
+    }
+
     /// Claude TUI の入力行（❯）のテキストがゴースト（自動提案）か手動入力かを分析する。
     /// screen snapshot のスタイルラン（dim フラグ）を検査して判定する
     pub fn analyze_input(&self) -> Option<screen::InputStatus> {
@@ -1020,6 +1049,9 @@ pub struct AgentMetrics {
     pub limit_week: Option<u32>,
     /// メトリクスの取得元（#357: サービス別にルーティングするため）
     pub source: MetricsSource,
+    /// モデル表示名（例: "Opus 5"。フッターの `[Opus 5 (1M context) · xH]` から。#702）。
+    /// `claude agents --json` は版によって `model` を返さないので、画面が実データの拠り所
+    pub model: Option<String>,
 }
 
 /// メトリクスの取得元 CLI 種別（#357）
@@ -1044,6 +1076,7 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
     let mut codex_primary = None;
     let mut codex_secondary = None;
     let mut source = MetricsSource::Unknown;
+    let mut model = None;
 
     for line in &scan_lines {
         // --- Claude パターン ---
@@ -1096,6 +1129,11 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
             }
         }
 
+        // モデル名（#702。`[Opus 5 (1M context) · xH]` の角括弧セグメント）
+        if model.is_none() {
+            model = extract_model_name(line);
+        }
+
         // usage パターン: `Nh NN%` / `Nm NN%` (時間残量) や `$N.NN` (コスト) やトークン数
         if usage_text.is_none() {
             if let Some(usage) = extract_usage_text(line) {
@@ -1125,7 +1163,28 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         limit_5h,
         limit_week,
         source,
+        model,
     })
+}
+
+/// フッターの角括弧からモデル表示名を取り出す（#702）。
+///
+/// 実測の形: `  [Opus 5 (1M context) · xH]  user@example.com`。
+/// **既知のモデルファミリで始まるときだけ**採る — TUI の表示は版で変わるので、
+/// 知らない文字列をモデル名としてヘッダに出すより、何も出さないほうが良い
+fn extract_model_name(line: &str) -> Option<String> {
+    let start = line.find('[')?;
+    let rest = &line[start + 1..];
+    let end = rest.find(']')?;
+    // `·` 区切りの先頭要素がモデル、後続は effort 等
+    let first = rest[..end].split('·').next()?.trim();
+    // 括弧の補足（`(1M context)`）は落とす
+    let name = first.split('(').next()?.trim();
+    let known = ["Opus", "Sonnet", "Haiku", "Fable"];
+    if name.is_empty() || !known.iter().any(|k| name.starts_with(k)) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// 「<label> NN%」形式のパーセント値を抽出する（#217。ラベルの直前が英数字なら
@@ -1555,6 +1614,112 @@ mod tests {
                 reflow_grid: false,
                 notify_pty: true,
             }
+    /// #816 の `Wakeup` ゲート: 未処理の `Wakeup` が残っている間は PTY 側が次を送らず、
+    /// 受け手が倒すと再び送られる。これが崩れると「1 read ごとに配送タスクを起こす」
+    /// 旧挙動（取り込み経路の 78%）に戻るか、逆に画面が止まる
+    #[cfg(unix)]
+    #[test]
+    fn wakeupゲートは倒すまで次を送らない() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        // 20ms ごとに 1 行ずつ出す（1 行 = 1 read = 旧挙動なら 1 Wakeup）
+        let script = "i=0; while [ $i -lt 60 ]; do printf 'g%d\\n' $i; sleep 0.02; \
+                      i=$((i+1)); done";
+        let (session, mut rx) = TerminalSession::spawn(
+            40,
+            8,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        let gate = session.wakeup_gate();
+        let is_wakeup = |e: &SessionEvent| matches!(e, SessionEvent::Term(TermEvent::Wakeup));
+
+        // 1 件目の Wakeup を待つ（= ゲートが立つ）
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut first = false;
+        while Instant::now() < deadline && !first {
+            match rx.try_recv() {
+                Ok(ev) => first = is_wakeup(&ev),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(first, "最初の Wakeup が来ない");
+        assert!(gate.load(Ordering::Acquire), "ゲートが立っていない");
+
+        // 倒さずに待つ: 出力は続いているのに Wakeup は 1 件も増えない
+        std::thread::sleep(Duration::from_millis(400));
+        let mut extra = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if is_wakeup(&ev) {
+                extra += 1;
+            }
+        }
+        assert_eq!(extra, 0, "倒す前に Wakeup が {extra} 件届いた");
+
+        // 倒すと再び届く（= 画面が止まらない）
+        gate.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut resumed = false;
+        while Instant::now() < deadline && !resumed {
+            match rx.try_recv() {
+                Ok(ev) => resumed = is_wakeup(&ev),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(resumed, "ゲートを倒しても Wakeup が再開しない");
+    }
+
+    /// #816 で `history_plain_lines` は「後ろから境界を探して 1 本だけ組み立てる」形に
+    /// なった。取り出す文字列は従来と 1 バイトも変わらないこと（末尾空白は落ちる /
+    /// 全角のスペーサで欠けない / 行内の空白は残る）を実 PTY で固定する
+    #[cfg(unix)]
+    #[test]
+    fn 履歴の平文行は末尾空白を落とし全角も欠けない() {
+        use std::time::{Duration, Instant};
+
+        // 20 桁 4 行に 12 行流すと、先頭の検査対象は履歴へ押し出される
+        let script = "printf 'ab   \\nあい\\na b\\n'; \
+                      i=0; while [ $i -lt 9 ]; do printf 'pad%d\\n' $i; i=$((i+1)); done";
+        let (session, _rx) = TerminalSession::spawn(
+            20,
+            4,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while session.history_size() < 8 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let lines = session.history_plain_lines(0, 32);
+        assert!(
+            lines.iter().any(|l| l == "ab"),
+            "末尾空白が落ちていない: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "あい"),
+            "全角行が欠けた: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "a b"),
+            "行内の空白が消えた: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.ends_with(' ')),
+            "末尾空白が残っている: {lines:?}"
         );
     }
 
@@ -1844,6 +2009,35 @@ mod tests {
         let m = parse_agent_metrics(&lines).unwrap();
         assert_eq!(m.ctx_percent, Some(50));
         assert_eq!(m.usage_text.as_deref(), Some("$1.23"));
+    }
+
+    #[test]
+    fn agent_metricsのモデル名抽出() {
+        // 実測フッター（claude 2.1.220）。GUI モードのチャットヘッダが使う（#702）
+        let lines = vec![
+            "  [Opus 5 (1M context) · xH]  user@example.com".into(),
+            "  ctx   5% ░░░░░░░░░░".into(),
+        ];
+        let m = parse_agent_metrics(&lines).unwrap();
+        assert_eq!(m.model.as_deref(), Some("Opus 5"));
+        assert_eq!(m.ctx_percent, Some(5));
+
+        // 括弧無し・effort 無しでも拾える
+        let lines = vec!["  [Sonnet 5]".into(), "ctx 10%".into()];
+        assert_eq!(
+            parse_agent_metrics(&lines).unwrap().model.as_deref(),
+            Some("Sonnet 5")
+        );
+    }
+
+    #[test]
+    fn agent_metricsは知らない角括弧をモデル名にしない() {
+        // 版差でフッターの中身が変わっても、知らない文字列をモデル名として出さない
+        for line in ["  [tako-14]", "  [2026-08-01]", "  []", "  no brackets"] {
+            let lines = vec![line.to_string(), "ctx 12%".into()];
+            let m = parse_agent_metrics(&lines).unwrap();
+            assert!(m.model.is_none(), "{line} をモデル名にしてはいけない");
+        }
     }
 
     #[test]

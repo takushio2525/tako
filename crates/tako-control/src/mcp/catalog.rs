@@ -1,143 +1,6 @@
-//! mcp — Layer 2 内蔵 MCP サーバー（FR-2.3 / FR-2.5。最大の差別化点）
-//!
-//! Model Context Protocol の JSON-RPC 処理（initialize / tools/list / tools/call）と
-//! ツールカタログをトランスポート非依存のエンジン（[`handle_message`]）として実装する。
-//! 操作の実行は [`crate::dispatch`] へ委ねるため、ツールのセマンティクスは
-//! CLI（Layer 1）と完全に一致する（設計原則 5「AI フルコントロール」）。
-//!
-//! トランスポートは 2 系統（採用理由と検証結果は `.agent/architecture.md`「Layer 2」節）:
-//!
-//! - **Streamable HTTP**（[`McpServer`]）: localhost バインド + Bearer トークン認証。
-//!   接続先 URL を `TAKO_MCP_URL` として各ペインへ注入する。呼び出し元ペインは
-//!   `X-Tako-Pane` ヘッダで申告する（FR-2.3.3）
-//! - **stdio ブリッジ**（`tako mcp serve`、tako-cli 側）: Claude Code 等の stdio
-//!   クライアント向け。このエンジンを共有し、実行だけ IPC へ中継する
-//!
-//! ツール説明文と initialize の `instructions` には FR-2.7.5 の行動規範
-//! （レビューを求めるときは見せろ / 読んでほしければ開け / 方針相談は例を作って並べろ /
-//! 終わったら片付けろ）を埋め込む。エージェントの振る舞いをプロンプトで誘導するのも
-//! プロダクトの一部である。
+//! MCP で公開するツール名・説明・入力スキーマのカタログ。
 
-use std::io;
-use std::sync::Arc;
-
-use futures::channel::mpsc::UnboundedSender;
 use serde_json::{json, Value};
-use tako_core::PaneOrigin;
-
-use crate::ipc::IncomingRequest;
-use crate::orchestrator::wait;
-use crate::protocol::{Axis, Direction, Request};
-
-/// サーバーが既定で名乗る MCP プロトコルバージョン
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
-/// 応答できるバージョン（クライアント申告がここにあればそのまま受ける）
-const KNOWN_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
-
-/// 1 接続分の文脈。トランスポート層（HTTP / stdio ブリッジ）が組み立てる
-pub struct McpSession<'a> {
-    /// 呼び出し元ペイン（stdio: `TAKO_PANE_ID`、HTTP: `X-Tako-Pane` ヘッダ。FR-2.3.3）。
-    /// pane 引数が省略されたツール呼び出しのデフォルト対象になる
-    pub caller_pane: Option<u64>,
-    /// 呼び出し元のオーケストレーター role（stdio: `TAKO_ORCHESTRATOR_ROLE`）。
-    /// 複数 master 並行時に caller_pane が stale でも正しい master を特定する（#109）
-    pub caller_role: Option<String>,
-    /// false のとき tools/list は空を返す（tako の外で起動された stdio ブリッジ用。
-    /// 登録済みでも tako 外の Claude Code セッションを邪魔しない）
-    pub connected: bool,
-    /// 操作の実行係（HTTP: dispatch チャネル往復、stdio: IPC 往復）。
-    /// Err は「ツール実行エラー」として isError 付き結果になる
-    pub exec: &'a mut dyn FnMut(Request) -> Result<Value, String>,
-    /// 非同期 run のポーリングスレッド用 IPC チャネル（#121）。
-    /// HTTP 経路では tx.clone() でスレッドに渡す。stdio ブリッジでは None（sync のみ）
-    pub ipc_tx: Option<UnboundedSender<IncomingRequest>>,
-}
-
-/// MCP メッセージを 1 件処理する。応答すべき JSON-RPC レスポンスを返す
-/// （notification と response メッセージには `None`）
-pub fn handle_message(message: &Value, session: &mut McpSession) -> Option<Value> {
-    // method が無いものはクライアントからの response（ping への返事等）→ 無視
-    let method = message.get("method")?.as_str()?.to_string();
-    let id = match message.get("id") {
-        // id 無し = notification（notifications/initialized 等）。応答しない
-        None | Some(Value::Null) => return None,
-        Some(id) => id.clone(),
-    };
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-    let result = match method.as_str() {
-        "initialize" => Ok(initialize_result(&params, session.connected)),
-        "ping" => Ok(json!({})),
-        "tools/list" => {
-            let tools = if session.connected {
-                tools()
-            } else {
-                Vec::new()
-            };
-            Ok(json!({ "tools": tools }))
-        }
-        "tools/call" => call_tool(&params, session),
-        _ => Err((-32601, format!("メソッド {method} は未対応"))),
-    };
-    Some(match result {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err((code, message)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": code, "message": message },
-        }),
-    })
-}
-
-fn initialize_result(params: &Value, connected: bool) -> Value {
-    // バージョン交渉: クライアント申告が既知ならそれを受け、未知なら最新を名乗る
-    let requested = params.get("protocolVersion").and_then(Value::as_str);
-    let version = match requested {
-        Some(v) if KNOWN_VERSIONS.contains(&v) => v,
-        _ => PROTOCOL_VERSION,
-    };
-    let instructions = if connected {
-        INSTRUCTIONS
-    } else {
-        "tako アプリの外で起動されたため、ペイン操作ツールは提供されない。\
-         tako 内のターミナルからエージェントを起動すると使えるようになる。"
-    };
-    json!({
-        "protocolVersion": version,
-        "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": {
-            "name": "tako",
-            "title": "tako terminal",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-        "instructions": instructions,
-    })
-}
-
-/// initialize で配るサーバー指示
-const INSTRUCTIONS: &str = "\
-あなたは今 tako ターミナル内で動いている。tako は AI エージェントが GUI ターミナルの画面\
-（タブ / ペイン）をプログラマブルに操作できる環境であり、以下のツール群を通じて\
-ペインの分割・コマンド実行・画面の読み取り・ファイルプレビュー・レイアウト管理ができる。\
-通常のターミナルでは手作業が必要な画面操作を、AI が自律的に行えるのが最大の特徴。\n\
-\n\
-重要な概念:\n\
-- タブ = 作業グループ（1 つのタスクや文脈ごとに 1 タブ）\n\
-- ペイン = タブ内の個別のターミナル画面（分割して並べられる）\n\
-- 各ペインには固有の ID があり、全操作はこの ID で対象を指定する\n\
-- ペインを分割して作業ペインを増やし、不要になったら閉じるのが基本フロー\n\
-\n\
-行動規範（ユーザー体験の一部。意識的に従うこと）:\n\
-- レビューを求めるときは見せろ: 作業結果を確認してもらうときは、口頭説明だけでなく\
-成果物（diff・ファイル・実行結果）を tako_split_pane で新しいペインに開いて提示する\
-（例: command=[\"git\",\"diff\",\"HEAD\"] や tako_open_file で差分やコードを見せる）\n\
-- 読んでほしければ開け: ユーザーに読んでほしいドキュメントは、実際にペインで開いて見せる\n\
-- 方針相談は例を作って並べろ: 複数案があるときは案ごとにペインを並べて同時に見せ、\
-ユーザーが見比べて選べるようにする（tako_equalize_layout で整える）\n\
-- 終わったら片付けろ: 役目を終えた作業ペインは tako_close_pane で閉じ、\
-レイアウトが乱れたら tako_equalize_layout で整える\n\
-- 操作の前に tako_list_panes で現状のレイアウトとペイン ID を把握する\n\
-- 実行可能ファイルを新規作成したら先頭コメントに tako:run 宣言を書く: \
-ユーザーが再生ボタン一発で実行できるようになる（書式は tako_run の説明を参照）";
 
 /// ペイン ID 引数のスキーマ（省略時は呼び出し元）
 fn pane_schema(description: &str) -> Value {
@@ -219,7 +82,10 @@ pub fn tools() -> Vec<Value> {
                 入力欄が空になったことの検証 + Enter 単独再送（マルチラインもそのまま送れる。\
                 応答は queued: true が即座に返り、実際の送達確認はバックグラウンドで行われる）。\
                 text を空にして newline: true にすると Enter 単独送信になる: 入力欄に残った\
-                テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。",
+                テキストの送信代行に使え、入力欄が空へ戻るまで Enter を自動再送する。\
+                #748: **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（入力欄が奪われており、\
+                テキストはダイアログのキー操作として食われ、数字なら選択が確定してしまう）。\
+                エラー本文に選択肢一覧が入るので、tako_orchestrator_respond で応答すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -245,39 +111,6 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tako_send_keys",
-            "description": "指定ペインへ特殊キーを送る（#662）。TUI の選択 UI・ダイアログ・\
-                ページャ等、テキスト送信では操作できない画面を動かすのに使う。\
-                tako_send_input と違い送達確認ループを通らないので、Enter が\
-                勝手に再送されることがない（結果の確認は tako_read_pane で行う）。\
-                使えるキー名: enter / escape / tab / backtab / backspace / delete / space / \
-                up / down / left / right / home / end / pageup / pagedown / insert / f1〜f12、\
-                ctrl-<英字>（ctrl-c 等）、shift- / alt- の前置、1 文字リテラル（\"1\" / \"y\" 等）。\
-                Claude Code の対話ダイアログ（AskUserQuestion）に答えるだけなら、\
-                内容の取得と検証つき送信までやってくれる tako_orchestrator_respond を使うこと。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pane": { "type": "integer", "minimum": 0, "description": "送信先ペイン ID（必須）" },
-                    "keys": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "送るキー名の並び（前から順に送る）。例: [\"down\",\"down\",\"enter\"]",
-                    },
-                    "delay_ms": {
-                        "type": "integer",
-                        "description": "キーの間に挟む待ち（ミリ秒。省略時 30、上限 2000）。TUI の再描画を待たせたいときに増やす",
-                    },
-                    "tmux_session": {
-                        "type": "string",
-                        "description": "tmux session 名（pane ID 解決不能時のフォールバック）",
-                    },
-                },
-                "required": ["pane", "keys"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
             "name": "tako_read_pane",
             "description": "指定ペインの画面内容（表示中のテキスト）を返す。\
                 別ペインで実行したコマンドの結果確認や、エージェント・dev サーバーの出力監視に使う。\
@@ -285,7 +118,15 @@ pub fn tools() -> Vec<Value> {
                 応答の input_status は Claude Code TUI の入力行（❯）のテキスト属性を示す: \
                 style が ghost なら自動提案（ゴーストテキスト）、user なら手動入力、\
                 mixed なら混在、none なら入力テキストなし。❯ 行が見つからなければ null。\
-                重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。",
+                重要: ghost の場合はユーザーの意図した入力ではないため、送信してはならない。\
+                queued_messages_pending が true なら、busy 中に人間が打った指示が claude の\
+                メッセージキューに未送信で残っている（入力欄自体は空なので Enter を代行しても\
+                発火しない）。tako が idle 継続時に自動で送り出すので待つこと。\
+                このペインを閉じるとキューごと指示が失われる。\
+                choice_dialog が非 null なら**選択肢ダイアログが表示中**で入力欄は存在しない（#748）。\
+                このとき input_status は null になる（ダイアログの選択カーソルは入力欄と同じ字面なので、\
+                かつては選択肢テキストが style=user の残留入力として報告されていた）。\
+                応答は tako_send_input ではなく tako_orchestrator_respond を使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -578,6 +419,22 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_pin_tab_title",
+            "description": "いまのタブ名をそのまま固定する（以後 自動リネームに上書きされない）。\
+                GUI で自動命名の直後にタブへ出る「この名前を固定」の印と同じ操作で、\
+                名前を打ち直さずに気に入った名前を残せる。\
+                pinned=false で固定を解除すると自動リネームが再開する。\
+                pinned 省略時は現在の固定状態の取得のみ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "integer", "minimum": 0, "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）" },
+                    "pinned": { "type": "boolean", "description": "true = いまの名前を固定、false = 固定解除（自動リネーム再開）。省略時は状態取得のみ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_create_tab",
             "description": "新しいタブ（= エージェントグループ）を作り、タブ ID と初期ペイン ID を返す。\
                 いまのタブと無関係な作業系列を始めるときに使う（1 グループ = 1 タブ）。\
@@ -587,6 +444,7 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "title": { "type": "string", "description": "タブのタイトル（省略時は連番）" },
                     "focus": { "type": "boolean", "description": "true にすると新タブをアクティブにする（省略時は false = 現在のタブを維持）" },
+                    "cwd": { "type": "string", "description": "初期ペインのシェルを起動するフォルダ（省略時は継承）。存在しない・フォルダでないパスはエラー" },
                 },
                 "additionalProperties": false,
             },
@@ -623,32 +481,13 @@ pub fn tools() -> Vec<Value> {
                 共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、\
                 new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、\
                 close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、\
-                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、\
-                minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す。",
+                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus", "minimize", "maximize", "restore"], "description": "省略時は list" },
+                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus"], "description": "省略時は list" },
                     "tab": { "type": "integer", "minimum": 0, "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID" },
-                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore は省略でアクティブウィンドウ" },
-                },
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "tako_menu",
-            "description": "アプリメニュー（ファイル / 編集 / 表示 / ウインドウ / ヘルプ）の操作。\
-                action: list = メニュー構成と開閉状態を取得（項目のアクション名とショートカットつき）、\
-                open = メニューを開く、close = 閉じる、invoke = 項目を実行。\
-                open / close は Windows の in-window メニューバーだけで使える（macOS はメニューが\
-                OS のメニューバーに載るため tako から開閉できない）。invoke は両 OS で使える。\
-                メニューに実在する項目だけが対象。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["list", "open", "close", "invoke"], "description": "省略時は list" },
-                    "menu": { "type": "string", "description": "open: メニュー名（完全一致 → 前方一致 → 部分一致で解決。添字も可）" },
-                    "path": { "type": "string", "description": "invoke: 「メニュー名/項目名」または項目名のみ（例: ファイル/新規タブ、新規タブ、表示/パネル/git ビュー）" },
+                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID" },
                 },
                 "additionalProperties": false,
             },
@@ -690,6 +529,27 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_autosuggest",
+            "description": "tako 内の zsh に出す入力予測（履歴ベースのゴーストテキスト）の ON/OFF と、\
+                確定キーの案内（ヒント）・Tab 確定を切り替える（3 つとも省略時は現在状態の取得のみ）。\
+                いずれも既定 ON。設定は永続化され、稼働中のペインにも次のプロンプトから反映される。\
+                予測は右矢印キー、または Tab（ゴースト表示中かつカーソルが行末のときだけ）で確定する。\
+                ヒントはゴーストの直後に薄く出るチュートリアルで、既定 10 回で自動的に消える\
+                （応答の hint_remaining が残り回数。hint=true で既定回数に戻せる）。\
+                同梱している zsh-autosuggestions を tako が起動したシェルにだけ読み込ませる方式なので、\
+                tako の外の zsh とユーザーの ~/.zshrc には一切影響しない。\
+                ユーザーが自前で zsh-autosuggestions を導入しているペインでは二重注入を避けて何もしない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "true = 予測を出す（既定）、false = 出さない（省略時は状態取得）" },
+                    "hint": { "type": "boolean", "description": "確定キーのヒント表示。true = 残り回数を既定へ戻して出す、false = 恒久 OFF" },
+                    "tab": { "type": "boolean", "description": "ゴースト表示中の Tab を確定にするか。false にすると Tab は常に従来の補完" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_auto_rename",
             "description": "タブ・ペイン名の AI 自動リネームの ON/OFF を切り替える\
                 （enabled 省略時は現在状態の取得のみ）。設定は永続化される。\
@@ -706,17 +566,19 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_panel",
             "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、\
                 左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。\
-                view=tmux はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、\
-                view=git は git graph（実装まではプレースホルダ）。ユーザーに tmux や\
-                エージェントの状況を見せたいとき表示し、邪魔なら隠す。",
+                view の値は GUI のタブ表示名と同じ。view=fleet はタブごとの全ペイン一覧 + \
+                管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰、\
+                view=git は git。ユーザーにセッションやエージェントの状況を見せたいとき表示し、\
+                邪魔なら隠す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "visible": { "type": "boolean", "description": "true = 表示、false = 非表示" },
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "パネル幅（px）" },
-                    "view": { "type": "string", "enum": ["tmux", "orch", "git"], "description": "表示するビュー（orch = オーケストレーター俯瞰。#217）" },
+                    "view": { "type": "string", "enum": ["fleet", "orch", "git", "tmux"], "description": "表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称で後方互換のみ）" },
                     "filetree": { "type": "boolean", "description": "左サイドバーのファイルツリーの表示・非表示" },
-                    "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。Issue #307）" },
+                    "sidebar_width": { "type": "number", "exclusiveMinimum": 0, "description": "左サイドバーの幅（px。GUI のドラッグと同じ規則で下限 120 / 上限はウィンドウ幅の 50% にクランプされる。応答の sidebar_width が実際に適用された幅、sidebar_width_max がその時点の上限。Issue #307 / #789）" },
+                    "show_hidden": { "type": "boolean", "description": "ファイルツリーでドット始まり（.git / .env 等）の項目を表示するか。既定 false = 非表示（Issue #550）" },
                 },
                 "additionalProperties": false,
             },
@@ -763,7 +625,9 @@ pub fn tools() -> Vec<Value> {
                 ペインは再利用される: 対象がプレビューペインなら差し替え、同タブに既存の\
                 プレビューペインがあればそこへ、無ければ pane を分割して生やす（ターミナルは\
                 起動しない）。direction を指定すると再利用せず必ずその方向へ分割して開く\
-                （表示位置を制御したいとき）。「このファイルを見て」「成果物を確認して」の\
+                （表示位置を制御したいとき）。new_tab を指定すると新しいタブ 1 枚を\
+                そのファイル専用にする（Finder の「このアプリケーションで開く」と同じ表示）。\
+                「このファイルを見て」「成果物を確認して」の\
                 提示に使うこと。相対パスは pane の cwd 基準で解決する。",
             "inputSchema": {
                 "type": "object",
@@ -781,6 +645,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "指定時は既存プレビューを再利用せず pane をこの方向へ分割して開く",
                     },
                     "focus": { "type": "boolean", "description": "true にするとプレビューペインにフォーカスを移す（省略時は false = 元ペインを維持）" },
+                    "new_tab": { "type": "boolean", "description": "true にすると新しいタブを作り、そのタブ 1 枚をこのファイル専用のプレビューにする（タブ名はファイル名。ターミナルは起動しない）。いまのタブを一切動かさず別物として見せたいときに使う。direction とは排他" },
                 },
                 "required": ["path"],
                 "additionalProperties": false,
@@ -823,27 +688,62 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_link_list",
-            "description": "PDF プレビュー内のリンク（外部 URL・内部ページ参照）を一覧する。\
-                ページインデックスは 0 始まり、リンクの index は follow-link で使う。",
+            "description": "プレビュー内のリンクを一覧する。Markdown なら [text](url) のリンク\
+                （kind=markdown。text / url / openable / line）、PDF なら注釈リンク（kind=pdf。\
+                外部 URL・内部ページ参照）。リンクの index は follow-link で使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": pane_schema("対象 PDF プレビューペイン ID（省略時は呼び出し元）"),
+                    "pane": pane_schema("対象 Markdown・PDF プレビューペイン ID（省略時は呼び出し元）"),
                 },
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "tako_preview_follow_link",
-            "description": "PDF プレビュー内のリンクをフォローする。外部 URL はブラウザで開き、\
-                内部リンクは該当ページへジャンプする。index は link-list の結果で得られる 0 始まりインデックス。",
+            "description": "プレビュー内のリンクをフォローする。URL は OS 既定ブラウザで開き\
+                （http / https のみ。それ以外はエラー）、PDF の内部リンクは該当ページへジャンプする。\
+                index は link-list の結果で得られる 0 始まりインデックス。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": pane_schema("対象 PDF プレビューペイン ID（省略時は呼び出し元）"),
+                    "pane": pane_schema("対象 Markdown・PDF プレビューペイン ID（省略時は呼び出し元）"),
                     "index": { "type": "integer", "minimum": 0, "description": "フォローするリンクのインデックス（0 始まり）" },
                 },
                 "required": ["index"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_preview_copy_code",
+            "description": "Markdown プレビューのコードブロック全文（装飾なし・インデントと空行を保持）を\
+                クリップボードへ入れる。UI のコピーボタンと同じ経路。index は出現順の 0 始まり（省略時は先頭）。\
+                応答にコピーした text も含む。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象 Markdown プレビューペイン ID（省略時は呼び出し元）"),
+                    "index": { "type": "integer", "minimum": 0, "description": "コードブロックの出現順（0 始まり。省略時は先頭）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_chat_copy",
+            "description": "GUI モードのチャットビュー（claude 対話ペイン）の発話をクリップボードへ入れる。\
+                UI のコピーボタンと同じ経路。list=true なら発話一覧（添字・role・文字数・コードブロック数）を\
+                返すだけでコピーしない。message は表示順の 0 始まりで、省略時は最後の assistant 発話。\
+                code を指定するとその発話の中のコードブロック（出現順 0 始まり）だけをコピーする。\
+                既定は画面と同じプレーンテキストで、markdown=true のときだけ md ソースをそのまま渡す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象チャット表示ペイン ID（省略時は呼び出し元）"),
+                    "list": { "type": "boolean", "description": "true = 発話一覧を返すだけ（コピーしない）" },
+                    "message": { "type": "integer", "minimum": 0, "description": "発話の表示順（0 始まり。省略時は最後の assistant 発話）" },
+                    "code": { "type": "integer", "minimum": 0, "description": "その発話の中のコードブロック出現順（0 始まり。省略時は本文全体）" },
+                    "markdown": { "type": "boolean", "description": "true = md ソースをそのままコピー（既定は画面と同じプレーンテキスト）" },
+                },
                 "additionalProperties": false,
             },
         }),
@@ -999,13 +899,12 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_file_op",
             "description": "ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
-                reveal = ファイルマネージャ（Finder / エクスプローラー）でファイルの場所を表示 /\n\
+                reveal = Finder でファイルの場所を表示（macOS）/\n\
                 open_terminal = 指定パスのディレクトリへペイン内で cd /\n\
                 rename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\n\
-                create_dir = path 配下に name でフォルダ作成 /\n\
-                trash = ゴミ箱（Windows はごみ箱）へ移動。完全削除ではないので復元できる /\n\
-                open_default = デフォルトアプリで開く /\n\
-                open_with = name で指定したアプリで開く（name 必須）。\n\
+                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動 /\n\
+                open_default = デフォルトアプリで開く（macOS）/\n\
+                open_with = name で指定したアプリで開く（macOS。name 必須）。\n\
                 rename / create_file / create_dir / open_with は name パラメータが必須。\
                 open_terminal / copy_relative_path は pane パラメータでペインを指定する。",
             "inputSchema": {
@@ -1043,14 +942,40 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_confirm_close",
-            "description": "タブ / ペインの × ボタンで閉じる際の確認ダイアログの ON/OFF を\
-                切り替える（enabled 省略時は現在状態の取得のみ）。有効時、× クリックで\
+            "description": "タブ / ペインを閉じる際の確認ダイアログの ON/OFF を\
+                切り替える（enabled 省略時は現在状態の取得のみ）。有効時、× クリックと cmd+W で\
                 「失われるもの」を要約した確認ダイアログを表示し、⌘クリックでスキップできる。\
-                設定は config.yaml に永続化される。",
+                確認が入るのは role 付き（エージェント）ペインと実行中プロセスを持つペインだけで、\
+                空のシェルペインは従来どおり即クローズする。CLI / MCP からの close は\
+                確認なし（AI フルコントロール）。設定は config.yaml に永続化される。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_limit_resume",
+            "description": "利用上限（5h / 週次）後の自動復帰を**ペイン単位**で ON/OFF する\
+                （enabled 省略時は現在状態の取得のみ。既定 OFF）。有効にしたペインが\
+                上限で止まると、tako がリセット時刻（画面の「reset at …」から解決）+ 数分の\
+                安全マージンを過ぎたところで作業を再開させる: 上限対処ダイアログが出ていれば\
+                「解除まで待つ」相当の選択肢をラベル一致で確定し（課金・モデル変更を伴う\
+                選択肢は構造的に選ばない）、ダイアログが無ければ継続ナッジを送達する。\
+                発動するのは上限由来の停止だけで、permission ダイアログ・API エラー・\
+                通常の idle・人間の下書きが入力欄にあるときは発動しない。試行は 1 回の\
+                上限あたり 3 回までで打ち切る。実行の記録は <data_dir>/supervisor.log の\
+                action=limit_autoresume に残る。設定は layout.json に永続化され\
+                再起動・復元をまたいで維持される。all=true で全ペインの状態を一覧できる。\
+                応答の state は現在の停止状況・復帰予定時刻・試行回数。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン"),
+                    "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
+                    "all": { "type": "boolean", "description": "true = 全ペインの状態を一覧（enabled とは併用しない）" },
                 },
                 "additionalProperties": false,
             },
@@ -1368,8 +1293,13 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_profiles",
-            "description": "オーケストレーターのプロファイル（tako master の起動設定）を管理する。\
-                action=list で一覧、show で単一表示、set で作成・更新。\
+            "description": "オーケストレーターのプロファイル（tako master / tako solo の起動設定）を管理する。\
+                action=list で一覧、show で単一表示、set で作成・更新、create で新規作成、\
+                copy で複製（from に複製元）、delete で削除（default は削除不可）。\
+                kind=master（既定。tako master が読む profiles/）と kind=solo（tako solo が読む \
+                solo-profiles/）を切り替える。スキーマは両者共通。\
+                list / show / set は参照整合性の警告（未登録 project / 未登録アカウント / \
+                [1m] モデル）を warnings フィールドで返す。\
                 プロファイルは profiles/<name>.yaml に保存され、master のエージェント種別・\
                 モデル・effort と子 worker のモデル決定に使われる。model が null / 未指定の\
                 プロファイルはその CLI の既定モデルで起動する（プラン非依存・推奨）。\
@@ -1381,16 +1311,30 @@ pub fn tools() -> Vec<Value> {
                 master の model / effort は claude worker へ継承されない。\
                 worker のエージェント種別（claude / codex / agy）は worker_agent（既定種別）と\
                 agent_* 系（worker_agents.<agent> のエージェント別 worker 設定: モデル・effort・\
-                許可スキップ・追加引数）で指定する。",
+                許可スキップ・追加引数）で指定する。\
+                自動ハンドオフ（#749）は ctx_threshold（50〜60%）と auto_handoff で調整する。\
+                応答の resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff が\
+                実効値（プロファイル → config.yaml → 既定 60 の解決結果）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "show", "set"],
+                        "enum": ["list", "show", "set", "create", "copy", "delete"],
                         "description": "操作種別（省略時は list）",
                     },
-                    "name": { "type": "string", "description": "プロファイル名（set 時に必須。show 省略時は default）" },
+                    "name": { "type": "string", "description": "プロファイル名（set / create / copy / delete 時に必須。show 省略時は default）" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["master", "solo"],
+                        "description": "プロファイル種別（master = tako master の profiles/ 既定 / solo = tako solo の solo-profiles/）",
+                    },
+                    "from": { "type": "string", "description": "複製元プロファイル名（copy 時に必須）" },
+                    "projects": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "このプロファイルに割り当てるプロジェクトキー（projects.yaml のキー。丸ごと置き換え。空配列でクリア。set 時）",
+                    },
+                    "clear_projects": { "type": "boolean", "description": "projects の割り当てを解除する（set 時）" },
                     "master_agent": {
                         "type": "string",
                         "enum": ["claude", "codex"],
@@ -1437,41 +1381,35 @@ pub fn tools() -> Vec<Value> {
                     "clear_master_account": { "type": "boolean", "description": "master_account を解除する（set 時。#504）" },
                     "worker_account": { "type": "string", "description": "worker の既定アカウント名（空文字でクリア。set 時。#504）" },
                     "clear_worker_account": { "type": "boolean", "description": "worker_account を解除する（set 時。#504）" },
+                    "ctx_threshold": { "type": "integer", "minimum": 50, "maximum": 60, "description": "master が引き継ぎを始める ctx 使用率の閾値（%。50〜60。範囲外はエラー。未設定なら config.yaml → 既定 60。set 時。#749）" },
+                    "clear_ctx_threshold": { "type": "boolean", "description": "ctx_threshold の指定を解除する（config.yaml → 既定 60 へ戻る。set 時。#749）" },
+                    "auto_handoff": { "type": "boolean", "description": "閾値超過時に tako が master へ引き継ぎを促す自動通知（既定 true）。false にすると通知は止まるが tako_orchestrator_self / tako_orchestrator_handoff は従来どおり使える（set 時。#749）" },
+                    "clear_auto_handoff": { "type": "boolean", "description": "auto_handoff の指定を解除して既定（有効）へ戻す（set 時。#749）" },
                 },
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "tako_orchestrator_accounts",
-            "description": "claude ログインアカウントの管理と切替（Issue #504 / #709）。\
-                名前つきアカウント（accounts.yaml）は config_dir（CLAUDE_CONFIG_DIR の値）と\
-                既定モデル/effort を持ち、spawn の account やプロファイルの\
-                master_account/worker_account で使う。\
-                action: list（一覧。ログイン状態 status = logged_in / logged_out / missing / invalid と\
-                ログインメール・割り当て先プロファイルつき）/ show（name 必須。1 件の詳細）/ \
-                add（name 必須 + config_dir か inherit のどちらか。追加または更新）/ \
-                remove（name 必須。削除。割り当てが残っていれば warning を返す）/ \
-                use（name + master / worker のどちらか必須。プロファイルの割り当てを切り替え、\
-                反映タイミングを applies_when で返す）/ \
-                login（name 必須。config dir が無ければ作り、そのアカウントで claude を\
-                起動するペインを生やす。ログイン済みなら /login を送って切替を促す）",
+            "description": "アカウントレジストリの管理（Issue #504）。名前つきアカウント（accounts.yaml）の CRUD。\
+                アカウントは config_dir（CLAUDE_CONFIG_DIR の値）または inherit（未設定のまま = 既定の資格情報）と\
+                既定モデル/effort を持ち、\
+                spawn の account パラメータやプロファイルの master_account/worker_account で使う。\
+                action: list（全アカウント一覧）/ show（name 必須。1 件の詳細）/ \
+                add（name + config_dir か inherit のどちらか必須。追加または更新）/ remove（name 必須。削除）。\
+                既定の claude アカウント（~/.claude）を登録するときは config_dir ではなく inherit=true を使う: \
+                CLAUDE_CONFIG_DIR は設定されているだけで Keychain のエントリ名が変わり、\
+                既定パスを明示しても既存ログインが未ログイン扱いになる（Issue #512）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "show", "add", "remove", "use", "login"], "description": "操作（list / show / add / remove / use / login）" },
-                    "name": { "type": "string", "description": "アカウント名（list 以外で必須）" },
+                    "action": { "type": "string", "enum": ["list", "show", "add", "remove"], "description": "操作（list / show / add / remove）" },
+                    "name": { "type": "string", "description": "アカウント名（show / add / remove 時に必須）" },
                     "config_dir": { "type": "string", "description": "CLAUDE_CONFIG_DIR の値（add 時。~ は $HOME に展開される。inherit と排他）" },
-                    "inherit": { "type": "boolean", "description": "CLAUDE_CONFIG_DIR を設定しない = 既定の資格情報を使う（add 時。config_dir と排他）。\
-                        claude は CLAUDE_CONFIG_DIR が設定されているだけで資格情報のエントリを分けるため、\
-                        既定ログインを使うアカウントは既定パスの明示ではなくこれで表す（#512）" },
+                    "inherit": { "type": "boolean", "description": "true = CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。spawn 時は明示 unset で direnv 等の値も消す。#512）" },
                     "description": { "type": "string", "description": "アカウントの説明（add 時。任意）" },
                     "default_model": { "type": "string", "description": "このアカウントの既定モデル（add 時。任意。spawn で model 未指定時のフォールバック）" },
                     "default_effort": { "type": "string", "description": "このアカウントの既定 effort（add 時。任意）" },
-                    "master": { "type": "boolean", "description": "use 時: master_account に割り当てる（次回の tako master / solo 起動から反映）" },
-                    "worker": { "type": "boolean", "description": "use 時: worker_account に割り当てる（次回 spawn から反映。起動済み worker は変わらない）" },
-                    "profile": { "type": "string", "description": "use 時: 対象プロファイル名（省略時 default）" },
-                    "pane": { "type": "integer", "minimum": 0, "description": "login 時: 分割元ペイン ID（省略時は呼び出し元）" },
-                    "tab": { "type": "integer", "minimum": 0, "description": "login 時: ペインを生やすタブ ID（pane より優先度は低い）" },
                 },
                 "required": ["action"],
                 "additionalProperties": false,
@@ -1549,38 +1487,8 @@ pub fn tools() -> Vec<Value> {
                             spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
                     },
                     "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
-                    "await_launch": {
-                        "type": "boolean",
-                        "description": "既定 true。エージェント CLI が実際に起動しプロンプトが届いたことを\
-                            確認してから返す（#665）。false にすると従来どおり即座に返るが、\
-                            起動コマンドが届かず worker が空回りしても気づけない",
-                    },
-                    "launch_timeout_secs": {
-                        "type": "integer", "minimum": 5, "maximum": 600,
-                        "description": "await_launch の上限秒数（既定 90）",
-                    },
                 },
                 "required": ["project", "prompt"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "tako_orchestrator_launch_status",
-            "description": "spawn の起動保証（#665）の到達段階を照会する。\
-                level は queued（ペイン起動待ち）/ shell_ready（シェルは動いた）/ \
-                launch_sent（起動コマンドを送った）/ agent_started（エージェント CLI の起動を画面で確認）/ \
-                prompt_sent（プロンプトを送った）/ prompt_delivered（入力欄から消えた = 送達確認）/ \
-                failed（起動できなかった）。\
-                settled=true は確定（prompt_delivered か failed）、agent_running=true は worker が実際に動き出したこと。\
-                attempts は起動コマンドの送信回数（再送を含む）。\
-                await_launch=true で spawn した場合は spawn の応答に同じ内容が assurance として入るので、\
-                このツールは「後から確認したい」「spawn を非同期で投げた」ときに使う。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pane": pane_schema("照会対象のペイン ID"),
-                    "worker": { "type": "string", "description": "worker レジストリの ID（ペインが消えても照会できる）" },
-                },
                 "additionalProperties": false,
             },
         }),
@@ -1595,7 +1503,9 @@ pub fn tools() -> Vec<Value> {
                 events 配列に直近の検知イベントが入る（#243）: \
                 question = worker が質問中（idle 時のみ。画面末尾に ? 終端行・選択肢・Should I 等のパターン）/ \
                 model_switched = 自動モデル切替が発生（from/to つき。limit reached, now using ... の検知）/ \
-                context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）。\
+                context_high = ctx 使用率が 60% 超（percent つき。handoff やセーフティコミットの判断材料）/ \
+                queued_messages_pending = 人間が busy 中に打った指示が claude のキューに未送信で残っている（#572。\
+                入力欄は空なので Enter 代行では発火しない。tako が自動で送り出すまで待ち、このペインを閉じない）。\
                 session_id を省略しても pane→session の自動解決（pid 祖先辿り）で claude agents --json の \
                 正確な status を取得する（status_source が agents-auto になる）。自動解決失敗時のみ \
                 画面パターン推定にフォールバック（status_source が screen）。\
@@ -1611,9 +1521,18 @@ pub fn tools() -> Vec<Value> {
                 応答の prompt_delivery（delivered / pending / undelivered）と \
                 events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる \
                 （undelivered なら tako_send_input でプロンプトを再送する）。\
+                #530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して \
+                session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。\
                 events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
                 応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
-                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。",
+                ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。\
+                #748: 選択肢ダイアログ（permission だけでなく usage limit の対処選択・モデル選択・\
+                plan 確認・AskUserQuestion・一覧選択も）が画面にあるときは status が waiting になり、\
+                応答の choice_dialog に構造（kind / title / options[number,label,highlighted] / numbered / \
+                recommended_action）が入る。events には choice_dialog（dialog_kind つき）が積まれ、\
+                このとき question は出さない（ダイアログ待ちは本文への返信では解けない）。\
+                kind が trust / bypass のものは tako 自身が承諾するので触らないこと（auto_accepted: true）。\
+                応答は tako_orchestrator_respond（choice 省略で下見できる）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1635,8 +1554,11 @@ pub fn tools() -> Vec<Value> {
                 watch / status / report を継続できる。各エントリに worker_id / pane / tmux_session / \
                 session_id / pane_alive（GUI にペインが現存するか）/ tmux_alive（tmux session が生存中か）/ \
                 prompt_delivery（delivered = プロンプト到達済み / pending = 確認中 / undelivered = 未達の疑い）/ \
-                resume_command（session ID 検出済み claude worker の復旧コマンド。突然死時に使う）が入る。\
-                既定は active のみ。all = true で closed（明示 close 済み）も含める。\
+                prompt_delivery_failure（未達の理由コード。#530: choice_dialog = 初回のテーマ選択・\
+                ログイン方法選択ダイアログが出て送れなかった / paste_not_reflected / residual_after_retries / \
+                flow_timeout）/ resend_command（未達 worker にだけ入る再送コマンド。同じ依頼文を \
+                tako_send_input で送り直す）/ resume_command（session ID 検出済み claude worker の復旧コマンド。\
+                突然死時に使う）が入る。既定は active のみ。all = true で closed（明示 close 済み）も含める。\
                 列挙のついでに、ペインも tmux session も 5 分以上続けて観測できない active エントリを \
                 closed（close_reason = gone）へ倒す（#658。resume_command / report は closed でも引けるので \
                 突然死からの復旧材料は失われない）。",
@@ -1653,9 +1575,17 @@ pub fn tools() -> Vec<Value> {
             "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。\
                 master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、\
                 このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、\
-                ctx_threshold は引き継ぎ閾値（config.yaml の ctx_threshold、既定 60）、\
+                ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → \
+                既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、\
                 ctx_over_threshold は閾値超えフラグ。\
+                ctx_over_threshold が true になったら、ユーザーの許可を待たずに \
+                handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。\
+                auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で \
+                「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。\
                 handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。\
+                handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、\
+                legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。\
+                legacy なら次に更新するとき 2 節へ書き直す。\
                 pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）\
                 から自動解決する。",
             "inputSchema": {
@@ -1670,8 +1600,22 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_handoff",
             "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、\
                 同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。\
-                旧 master のペインは閉じない（ユーザー判断）。\
+                role / プロファイル / タブは旧 master と同一を引き継ぐ。\
+                呼ぶ前に handoff ファイルを今の状況で最新化すること（このツールはファイルの\
+                内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。\
+                #749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**\
+                （初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄に\
+                ユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、\
+                後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が\
+                退役予定のペイン（null なら後任に close を指示していない）。\
                 handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。\
+                #792: 引き継ぎファイルは 2 節に分けて書く。\
+                「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、\
+                「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。\
+                pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで\
+                誤った指示の元になる。節分離前の旧書式もそのまま読める（応答の handoff_format が\
+                sectioned / legacy、handoff_sections が認識した節。legacy のときは後任へ\
+                「番号は実態で確認 + 次の更新で 2 節へ書き直す」が伝わる）。\
                 tab を省略すると呼び出し元と同タブに新 master を spawn する。",
             "inputSchema": {
                 "type": "object",
@@ -1728,6 +1672,7 @@ pub fn tools() -> Vec<Value> {
                         "enum": ["bugfix-rooted", "bugfix-unrooted", "investigation", "feature-verifiable", "feature-ui", "docs", "review"],
                         "description": "委任台帳の task_type（省略時は investigation）",
                     },
+                    "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,
@@ -1802,85 +1747,24 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tako_orchestrator_dialog",
-            "description": "worker が表示中の対話ダイアログの内容を構造化して取得する（#662）。\
-                worker が AskUserQuestion で選択を求めて止まっているとき、\
-                生画面を読まずに質問・選択肢・現在位置を JSON で取れる。\
-                応答の kind は ask_user_question / permission / none。\
-                screen が本体で、stage（question = 質問表示中 / review = 送信前の確認画面）、\
-                tabs（質問ごとの見出しと回答済みフラグ）、question（表示中の質問文）、\
-                options（番号・ラベル・ハイライト・multiSelect のチェック状態）を返す。\
-                **画面は 1 問ずつしか映さない**ので、次の質問の選択肢は前の質問に答えると見える。\
-                questions は claude の transcript 由来の全文だが、claude は\
-                **ダイアログ表示中は transcript に書かない**（回答確定後に書く）ため、\
-                保留中は基本 null になる（実測。回答後の照会では埋まる）。\
-                狭いペインではラベルが折り返しで欠けることがあるので、\
-                回答は**番号指定が最も確実**。全文を読みたいときは tako_resize_pane で広げる。\
-                回答は tako_orchestrator_respond の answers で行う。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
-                    "worker": {
-                        "type": "string",
-                        "description": "worker レジストリの ID（pane_id と排他。ペイン消失後も追跡できる）",
-                    },
-                },
-                "additionalProperties": false,
-            },
-        }),
-        json!({
             "name": "tako_orchestrator_respond",
-            "description": "worker のダイアログに応答する（#319 / #662）。2 種類のダイアログを扱う。\
-                \n(1) 対話ダイアログ = AskUserQuestion（worker が選択肢を出して止まっている）: \
-                answers に質問ごとの選択を渡す。選択肢は番号（\"2\"）でもラベルの前方一致（\"青い海\"）でもよいが、\
-                狭いペインではラベルが折り返しで欠けるため**番号が最も確実**。\
-                複数質問はそれぞれに 1 要素を渡す（全問に答えないと送信できない）。\
-                multiSelect の質問は options に複数指定する。\
-                内容は先に tako_orchestrator_dialog で確認すること。\
-                2 問目以降の選択肢は画面に出るまで見えないので、\
-                ラベル指定が不安なときは 1 問ずつ答えて dialog で確認するとよい。\
-                \n(2) permission ダイアログ（ツール実行の承認要求）: choice に番号または yes/no を渡す。\
-                \n誤爆防止: ダイアログが画面に無ければエラー。さらに AskUserQuestion では\
-                送信前に確認画面へ写った選択結果を照合し、指定と一致しなければ**送信せずエラー**を返す。\
-                dry_run: true にすると確認画面まで進めて内容を返し、送信はしない。\
+            "description": "worker の**選択肢ダイアログ**に応答する（#319 permission → #748 で全種別）。\
+                対象は permission（ツール承認）のほか usage limit の対処選択・モデル選択（/model）・\
+                plan モードの実行確認・AskUserQuestion の質問・一覧選択（/mcp）など。\
+                watch の WORKER_PERMISSION / WORKER_DIALOG、または worker_status / read_pane の \
+                choice_dialog で検知されたダイアログに対して使う。\
+                **choice を省略すると送信せず構造だけ返す**（下見。選択肢一覧・現在のハイライト・番号キーの可否）。\
+                ダイアログが画面に存在しない場合はエラー（誤爆防止）。\
+                番号つきダイアログは番号キーだけで確定し、番号なしダイアログは矢印移動 + ラベル一致検証 + Enter で応答する。\
                 応答内容は persist.log に監査記録される。\
-                危険なコマンド（rm -rf / 本番 DB 操作等）への承認、および\
-                ユーザーの好み・方針を問う質問への代理回答はユーザーに確認すること。",
+                危険なコマンド（rm -rf / 本番 DB 操作等）への承認、および課金・モデル変更を伴う選択肢はユーザーに確認すること。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "description": "対象の worker ペイン ID" },
                     "choice": {
                         "type": "string",
-                        "description": "permission ダイアログの選択肢: 番号（1, 2, 3...）または 'yes'/'allow'（最初の選択肢）/ 'no'/'deny'（Deny 選択肢）",
-                    },
-                    "answers": {
-                        "type": "array",
-                        "description": "AskUserQuestion への回答。質問ごとに 1 要素（表示順。question を書けば順不同でもよい）",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "対象の質問: 番号（\"1\"）または header の前方一致。省略時は表示順に割り当て",
-                                },
-                                "option": {
-                                    "type": "string",
-                                    "description": "選ぶ選択肢: 番号（\"2\"）または label の前方一致（\"青い海\"）",
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "multiSelect の質問で複数選ぶとき",
-                                },
-                            },
-                            "additionalProperties": false,
-                        },
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "description": "true にすると確認画面まで進めて選択結果を返し、送信はしない（省略時 false）",
+                        "description": "選択肢: 番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致（大小無視・複数一致はエラー）／'yes'/'allow'／'no'/'deny'。省略すると送信せず構造だけ返す",
                     },
                 },
                 "required": ["pane_id"],
@@ -1889,34 +1773,20 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_supervisor",
-            "description": "worker の常時監視 supervisor の操作（#401 / #665）。\
-                supervisor は spawn した worker を**自動で監視対象に入れて**、停止・異常・質問を検知し、\
-                入力欄の残留（末尾 Enter 欠落）や api_error の続行ナッジといった一次対応を自動で打つ。\
-                **master は watch を張り直す必要がない**（再アーム不要）。\
-                action=events: cursor 以降の監視イベントを取得する（**これが主な使い方**。\
-                返る next_cursor を次回そのまま渡せば取りこぼしがない）。\
-                action=status: 現在の設定（mode / auto_resume_dead / max_retries）と常駐状況・監査ログ末尾。\
-                action=set_mode: モードを変更する（auto = 自動一次対応あり / notify_only = 通知のみ / off = 無効）。\
-                action=history: 監査ログの末尾（自動アクションの全記録）。\
-                action=stop: 常駐を停止する。\
-                イベントの kind は watching（監視開始）/ idle / question / permission / error / stalled / \
-                dead / gone / auto_action（自動対応を実行）/ escalated（自動復旧を諦め master へ委ねる）。\
-                WORKER_DEAD の自動 resume は既定 notify-only（auto_resume_dead=false）。",
+            "description": "worker 自動復旧 supervisor の操作（#401）。\
+                usage_limit / api_error / agent_dead / prompt_undelivered に対する自動リカバリの設定・状態照会・履歴参照。\
+                action=status: 現在の設定（mode / auto_resume_dead / max_retries）と監査ログ末尾。\
+                action=set_mode: supervisor モードを変更する（auto = 自動復旧 / notify_only = 通知のみ / off = 無効）。\
+                action=history: 監査ログの末尾を取得する（復旧アクションの全記録）。\
+                WORKER_DEAD の自動 resume は既定 notify-only（auto_resume_dead=false）。\
+                opt-in するには set_mode で auto_resume_dead=true を設定する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["events", "status", "set_mode", "history", "stop"],
-                        "description": "events: cursor 以降のイベント / status: 設定と常駐状況 / set_mode: モード変更 / history: 監査ログ / stop: 常駐停止"
-                    },
-                    "cursor": {
-                        "type": "integer", "minimum": 0,
-                        "description": "events: このカーソルより後のイベントを返す（既定 0 = 最初から）。前回の next_cursor を渡す"
-                    },
-                    "limit": {
-                        "type": "integer", "minimum": 1, "maximum": 500,
-                        "description": "events: 返す最大件数（既定 50）"
+                        "enum": ["status", "set_mode", "history"],
+                        "description": "status: 現在の設定と監査ログ / set_mode: モード変更 / history: 監査ログ"
                     },
                     "mode": {
                         "type": "string",
@@ -2159,27 +2029,30 @@ pub fn tools() -> Vec<Value> {
                 channel で stable / test を指定可。省略で全チャンネル同時チェック。\
                 action=apply で配布系統に応じた更新を実行する。\
                 channel で stable（既定）/ test を指定。\
-                dry_run=true（apply のみ）なら配布物の取得と整合検証まで行い置き換えはしない。\
-                更新チェック / 取得・検証 / 適用を段階ごとに確かめるときに使う（#723）。\
                 action=apply-zip で zip 経由で強制更新する。\
                 action=repair で broken-brew 状態を修復する。\
-                apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。",
+                apply 成功後の再起動は UI 側で行う（CLI / MCP からは apply 結果の確認まで）。\
+                action=open で GUI のアップデート専用画面を開く（#616。\
+                現在 / 最新バージョン・チャンネル・配布物・リリースノート・更新ボタンが載る。\
+                開いているかは action=status の window_open で分かる）。\
+                action=card で画面上部の更新通知カードの状態を返す。\
+                action=card-dismiss でカードを閉じる（そのバージョンは以後通知しない）。\
+                action=card-show で抑止を解除して出し直す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "check", "apply", "apply-zip", "repair"],
+                        "enum": [
+                            "status", "check", "apply", "apply-zip", "repair",
+                            "open", "card", "card-dismiss", "card-show",
+                        ],
                         "description": "操作種別（省略時は status）",
                     },
                     "channel": {
                         "type": "string",
                         "enum": ["stable", "test"],
                         "description": "対象チャンネル。check 時は省略で全チャンネル、apply 時は省略で stable",
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "description": "true なら取得と検証だけ行い置き換えない（action=apply でのみ有効）",
                     },
                 },
                 "additionalProperties": false,
@@ -2291,8 +2164,8 @@ pub fn tools() -> Vec<Value> {
                     },
                     "tab": {
                         "type": "string",
-                        "enum": ["general", "appearance", "runner", "setup", "sleep", "remote", "advanced"],
-                        "description": "開くタブ指定（省略時は現在タブ維持）",
+                        "enum": ["general", "appearance", "runner", "profiles", "setup", "sleep", "remote", "advanced"],
+                        "description": "開くタブ指定（省略時は現在タブ維持）。profiles = master / solo の起動プロファイル編集（#721）",
                     },
                 },
                 "additionalProperties": false,
@@ -2322,6 +2195,132 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_welcome",
+            "description": "初回起動のウェルカムバナー（Issue #549）。tako を初めて起動したユーザーへ\
+                「tako setup で初期設定 → tako master で AI 司令塔」の導線を画面上部に出す。\
+                action=status（既定）で表示状態（visible / dismissed / first_launch）と\
+                案内すべきコマンド（setup_command / master_command）を返す。\
+                action=show でバナーを再表示（初期設定がまだのユーザーへ導線を出し直したいとき）。\
+                action=dismiss で閉じて以後出さない（settings.json に永続化）。\
+                ユーザーが「何から始めればいいか」で迷っていたら status で状態を確認し、\
+                setup_command をそのまま案内するか tako_setup を実行すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "show", "dismiss"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_show_command",
+            "description": "ユーザーに実行してほしいコマンドを、コピー可能なカードとして画面に出す\
+                （FR-2.22 / Issue #666）。**ユーザーへコマンドを実行してもらうときは必ずこれを使う**。\
+                会話本文にコマンドを書くだけだと、TUI がペイン幅で物理改行を入れるため\
+                ユーザーが画面からコピーすると壊れる。このツールに渡した文字列はそのまま保管され、\
+                カードは「コピー」（論理文字列を丸ごとクリップボードへ）と「新規ペインで実行」\
+                （同じタブに別ペインを開いて実行。対話中のペインは触らない）のボタンを持つ。\
+                action=show（既定）でカードを出す。commands は 1 件でも複数でもよく、\
+                改行を含む複数行コマンドは 1 要素として渡す（改行はそのまま保たれる）。\
+                label には「何のためのコマンドか」を短く書く。\
+                action=list で表示中カードと保管されている論理文字列を確認できる。\
+                action=copy / action=run はカードのボタンと同じ操作を AI から行う\
+                （run は確認なしで実行されるので、ユーザーが明示的に頼んだときだけ使う）。\
+                action=dismiss でカードを閉じる（card 省略時はそのペインの全カード）。\
+                会話に書いたコマンドの代わりに出すこと。カードを出したら\
+                「ペイン下部のカードからコピーか実行ができます」と一言添える。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["show", "list", "copy", "run", "dismiss"],
+                        "description": "操作種別（省略時は show）",
+                    },
+                    "commands": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "提示するコマンド（action=show で必須）。\
+                            改行を含む複数行コマンドは 1 要素として渡す",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "何のためのコマンドかの短い説明（任意。カード見出しに出る）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "カードを出すペイン ID（省略時は呼び出し元ペイン = 自分の会話ペイン）",
+                    },
+                    "card": {
+                        "type": "integer",
+                        "description": "対象カード ID（copy / run / dismiss。省略時は最新カード。\
+                            dismiss は省略でそのペインの全カード）",
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "対象コマンド番号（copy / run。1 始まり。省略時は 1）",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "run で新しいペインへフォーカスを移すか（既定 false）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_config_share",
+            "description": "AI 系設定の git ベース共有（Issue #513）。tako の宣言的設定\
+                （profiles / projects / accounts / local-rules / settings）と claude の\
+                グローバル指示（CLAUDE.md / snippets / commands / templates）を 1 つの git\
+                リポジトリでデバイス間（mac ⇔ Windows）共有する。\
+                action=status（既定）で配線状態と push / pull 待ちの差分。\
+                action=init で共有リポジトリを新規作成して配線（--remote で origin 登録）。\
+                action=link で既存リポジトリ（ローカルパスまたは git URL）へ配線。\
+                action=push で実体 → リポジトリへ書き出し + commit（+ push）。\
+                action=pull でリポジトリ → 実体へ取り込み（世代バックアップつき）。\
+                action=list で共有 / 非共有の分類表。\
+                秘匿情報（token / credentials / .claude.json）とマシンローカル状態\
+                （layout.json / sessions.yaml / workers.yaml）はホワイトリストで構造的に除外され、\
+                未分類のファイルは共有されない。設定内の絶対パスはホーム部分が ~ に置き換わる。\
+                ユーザーが「別の PC でも同じ設定を使いたい」と言ったらこれを使うこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "init", "link", "unlink", "push", "pull", "list"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "link の対象（ローカルパスまたは git URL）",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "リポジトリの配置先（init / URL clone 時。省略時は ~/tako-config-sync）",
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "init 時に origin として登録するリモート URL",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "push のコミットメッセージ",
+                    },
+                    "no_push": {
+                        "type": "boolean",
+                        "description": "true でリモートへ送らずコミットまでで止める",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_platform",
             "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
                 どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\
@@ -2342,6 +2341,43 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["supported", "degraded", "pending", "unsupported"],
                         "description": "この状態のものだけに絞る（省略時は全件）",
+                    },
+                    "known_limitations": {
+                        "type": "boolean",
+                        "description": "リリースノート用の Known limitations 節（日英併記の markdown）を \
+                            known_limitations_markdown に併せて返す（Issue #594）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_ui_mode",
+            "description": "UI 表示モード（GUI ライク表示 ⇔ ターミナル表示）の状態確認・切替（Issue #691）。\
+                action=status（既定）: 現在のモードと、ターミナル表示へ戻してあるペインを返す。\
+                action=set: mode（terminal / gui）へ切り替える。action=toggle: 反転する。\
+                gui モードでは、アイドルなシェルのペインが「AI チームに任せる / AI と 1 対 1 で話す / \
+                コマンド入力へ」の 3 ボタン（スターター）になる。set / toggle は settings.json へ \
+                永続化され、全ウィンドウへ即時反映される。\
+                action=release: pane で指定したペインだけをターミナル表示に戻す（揮発。\
+                再起動すると gui 表示へ戻る）。action=restore: その解除を取り消す。\
+                表示レイヤだけの切替なので PTY・tmux セッション・実行中プロセスには影響しない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "set", "toggle", "release", "restore"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["terminal", "gui"],
+                        "description": "表示モード（set 時に必須）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "release / restore の対象ペイン ID（省略時は呼び出し元ペイン）",
                     },
                 },
                 "additionalProperties": false,
@@ -3014,2779 +3050,4 @@ pub fn tools() -> Vec<Value> {
             },
         }),
     ]
-}
-
-fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, String)> {
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or((-32602, "ツール名（name）が無い".to_string()))?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    // 未知パラメータの検出（#227: タイポが黙って無視される事故を防ぐ）
-    validate_known_params(name, &args)?;
-
-    // gate check はコマンド実行を伴うため MCP ハンドラスレッドで直接実行する
-    // （dispatch は UI スレッドで実行されるため長時間ブロック不可。#244）
-    if name == "tako_task_gate_check" {
-        let task_id = args
-            .get("task_id")
-            .and_then(Value::as_str)
-            .ok_or((-32602, "task_id を指定する".to_string()))?;
-        let sync = args
-            .get("sync_checkpoint")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        return match crate::acceptance_gates::execute_gate_check(task_id, sync) {
-            Ok(value) => {
-                let text = serde_json::to_string_pretty(&value).unwrap_or_default();
-                Ok(json!({ "content": [{ "type": "text", "text": text }] }))
-            }
-            Err(e) => Ok(json!({
-                "content": [{ "type": "text", "text": e }],
-                "isError": true,
-            })),
-        };
-    }
-
-    // orchestrator_run はポーリングループを伴うため MCP ハンドラスレッドで合成する
-    // （dispatch は同期・UI スレッド実行のため長時間ブロック不可）
-    if name == "tako_orchestrator_run" {
-        let ipc_tx = session.ipc_tx.as_ref().cloned();
-        return orchestrator_run(&args, session, ipc_tx.as_ref());
-    }
-
-    // spawn の起動保証（#665）も同じ理由でハンドラスレッドで待つ。
-    // dispatch は「発射指示を登録して即返す」だけで、到達段階のポーリングはここ
-    if name == "tako_orchestrator_spawn"
-        && bool_arg(&args, "await_launch")
-            .map_err(|e| (-32602, e))?
-            .unwrap_or(true)
-    {
-        return orchestrator_spawn_awaited(&args, session);
-    }
-
-    // supervisor の events / stop は journal・フラグファイルの読み書きだけで
-    // 完結する（GUI 不要）。dispatch を経由せずハンドラスレッドで処理する
-    if name == "tako_orchestrator_supervisor" {
-        match str_arg(&args, "action")
-            .map_err(|e| (-32602, e))?
-            .as_deref()
-        {
-            Some("events") => return supervisor_events_tool(&args),
-            Some("stop") => return supervisor_stop_tool(),
-            _ => {}
-        }
-    }
-
-    let request = build_request(
-        name,
-        &args,
-        session.caller_pane,
-        session.caller_role.as_deref(),
-    )
-    .map_err(|e| (-32602, e))?;
-
-    // list_panes の応答に caller_pane_id / caller_tab_id を付加する（#123）。
-    // master が「自分がどこにいるか」を list で確認できる導線
-    if name == "tako_list_panes" {
-        return list_panes_with_caller(request, session);
-    }
-
-    // #283: remote の応答にトークンは存在しない（長寿命 bearer token を全廃。
-    // 接続時の認証は機器ペアリング二層認証が行う）ため、除去処理は不要になった
-
-    exec_and_wrap(request, session)
-}
-
-/// `tako_orchestrator_spawn` を「起動とプロンプト送達を確認してから返す」形で実行する（#665）。
-///
-/// dispatch（UI スレッド）は待てないので、待つのは MCP ハンドラスレッドの仕事。
-/// 応答の `assurance` に到達段階を載せ、失敗なら isError で返して master に気づかせる
-fn orchestrator_spawn_awaited(
-    args: &Value,
-    session: &mut McpSession,
-) -> Result<Value, (i64, String)> {
-    let request = build_request(
-        "tako_orchestrator_spawn",
-        args,
-        session.caller_pane,
-        session.caller_role.as_deref(),
-    )
-    .map_err(|e| (-32602, e))?;
-    let mut spawned = match (session.exec)(request) {
-        Ok(v) => v,
-        Err(message) => {
-            return Ok(json!({
-                "content": [{ "type": "text", "text": message }],
-                "isError": true,
-            }))
-        }
-    };
-
-    let timeout = u64_arg(args, "launch_timeout_secs")
-        .map_err(|e| (-32602, e))?
-        .unwrap_or(90);
-    let pane = spawned["pane_id"].as_u64();
-    let worker = spawned["worker_id"].as_str().map(str::to_string);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-    let mut assurance = json!({ "level": Value::Null });
-    loop {
-        let probe = (session.exec)(Request::OrchestratorLaunchStatus {
-            pane,
-            worker: worker.clone(),
-        });
-        if let Ok(v) = probe {
-            let settled = v["settled"].as_bool() == Some(true);
-            assurance = v;
-            if settled {
-                break;
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            if let Some(obj) = assurance.as_object_mut() {
-                obj.insert("timed_out".to_string(), json!(true));
-            }
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-
-    let failed = assurance["level"].as_str() == Some("failed")
-        || assurance["timed_out"].as_bool() == Some(true);
-    if let Some(obj) = spawned.as_object_mut() {
-        obj.insert("assurance".to_string(), assurance.clone());
-    }
-    let mut text = spawned.to_string();
-    if failed {
-        // 何が起きたかと次の一手を本文に足す（master が読んで自己修正できるように）
-        text = format!(
-            "{text}\n\nworker の起動を保証できなかった: {}\n到達段階: {}\n\
-             ペインの画面を tako_read_pane で確認し、必要なら close して spawn し直すこと。",
-            assurance["detail"].as_str().unwrap_or("(詳細なし)"),
-            assurance["describe"].as_str().unwrap_or("(不明)"),
-        );
-    }
-    Ok(json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": failed,
-    }))
-}
-
-/// `tako_orchestrator_supervisor { action: "events" }`（#665）
-fn supervisor_events_tool(args: &Value) -> Result<Value, (i64, String)> {
-    use crate::orchestrator::supervisor;
-    let cursor = u64_arg(args, "cursor")
-        .map_err(|e| (-32602, e))?
-        .unwrap_or(0);
-    let limit = u64_arg(args, "limit")
-        .map_err(|e| (-32602, e))?
-        .unwrap_or(50) as usize;
-    // 監視役が居なければ起こす（master に張り忘れの余地を残さない）
-    let profile = crate::orchestrator::Profile::load("default").unwrap_or_default();
-    let started = supervisor::ensure_running(profile.supervisor_mode.unwrap_or_default());
-    match supervisor::read_events(cursor, limit) {
-        Ok((events, next, truncated)) => {
-            let value = json!({
-                "events": events,
-                "next_cursor": next,
-                "truncated": truncated,
-                "running": supervisor::is_running(),
-                "started_now": started,
-            });
-            Ok(json!({
-                "content": [{ "type": "text", "text": value.to_string() }],
-                "isError": false,
-            }))
-        }
-        Err(message) => Ok(json!({
-            "content": [{ "type": "text", "text": message }],
-            "isError": true,
-        })),
-    }
-}
-
-/// `tako_orchestrator_supervisor { action: "stop" }`（#665）
-fn supervisor_stop_tool() -> Result<Value, (i64, String)> {
-    use crate::orchestrator::supervisor;
-    if !supervisor::is_running() {
-        return Ok(json!({
-            "content": [{ "type": "text", "text": json!({"running": false, "stopped": false}).to_string() }],
-            "isError": false,
-        }));
-    }
-    match supervisor::request_stop() {
-        Ok(()) => Ok(json!({
-            "content": [{ "type": "text", "text": json!({"running": true, "stopped": true}).to_string() }],
-            "isError": false,
-        })),
-        Err(message) => Ok(json!({
-            "content": [{ "type": "text", "text": message }],
-            "isError": true,
-        })),
-    }
-}
-
-fn exec_and_wrap(request: Request, session: &mut McpSession) -> Result<Value, (i64, String)> {
-    // 実行失敗は「ツール実行エラー」としてエージェントへ返す（MCP の isError。
-    // エージェントが読んで自己修正できるよう、JSON-RPC エラーにはしない）
-    Ok(match (session.exec)(request) {
-        Ok(value) => {
-            let text = match value {
-                Value::Null => "ok".to_string(),
-                value => value.to_string(),
-            };
-            json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-        }
-        Err(message) => {
-            json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-        }
-    })
-}
-
-/// list_panes の応答に caller_pane_id / caller_tab_id を後付けする（#123）
-fn list_panes_with_caller(
-    request: Request,
-    session: &mut McpSession,
-) -> Result<Value, (i64, String)> {
-    match (session.exec)(request) {
-        Ok(mut value) => {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("caller_pane_id".to_string(), json!(session.caller_pane));
-                // caller_tab_id: caller_pane が属するタブを探す
-                let caller_tab = session.caller_pane.and_then(|cpane| {
-                    obj.get("tabs")?.as_array()?.iter().find_map(|tab| {
-                        let panes = tab.get("panes")?.as_array()?;
-                        if panes.iter().any(|p| p["id"].as_u64() == Some(cpane)) {
-                            tab.get("id")?.as_u64()
-                        } else {
-                            None
-                        }
-                    })
-                });
-                obj.insert("caller_tab_id".to_string(), json!(caller_tab));
-                if let Some(role) = &session.caller_role {
-                    obj.insert("caller_role".to_string(), json!(role));
-                }
-            }
-            let text = value.to_string();
-            Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))
-        }
-        Err(message) => {
-            Ok(json!({ "content": [{ "type": "text", "text": message }], "isError": true }))
-        }
-    }
-}
-
-/// `tako_orchestrator_run` — spawn + 完了待ち + 出力取得 + close の合成操作（#121 で非同期化）。
-/// 既定（sync=false）は spawn 後に即座に `{run_id, pane_id, ...}` を返す非同期モード。
-/// sync=true は旧挙動（完了までブロッキング）を維持する後方互換モード。
-/// `ipc_tx` は非同期モードのポーリングスレッド用 IPC チャネル。None のとき
-/// 非同期モードは「IPC チャネルが渡されていない」エラーを返す（stdio ブリッジ等）
-fn orchestrator_run(
-    args: &Value,
-    session: &mut McpSession,
-    ipc_tx: Option<&UnboundedSender<IncomingRequest>>,
-) -> Result<Value, (i64, String)> {
-    let map_err = |e: String| (-32602i64, e);
-
-    // --- パラメータ解析 ---
-    let project = str_arg(args, "project")
-        .map_err(map_err)?
-        .ok_or((-32602, "project を指定する".to_string()))?;
-    let prompt = str_arg(args, "prompt")
-        .map_err(map_err)?
-        .ok_or((-32602, "prompt を指定する".to_string()))?;
-    let label = str_arg(args, "label").map_err(map_err)?;
-    let pane_raw = u64_arg(args, "pane").map_err(map_err)?;
-    let tab = u64_arg(args, "tab").map_err(map_err)?;
-    let pane = if pane_raw.is_some() {
-        pane_raw
-    } else if tab.is_some() {
-        None
-    } else {
-        session.caller_pane
-    };
-    let tab = if pane_raw.is_some() { None } else { tab };
-    if pane.is_none() && tab.is_none() {
-        return Err((-32602, "pane または tab を指定してください".into()));
-    }
-    let timeout_secs = u64_arg(args, "timeout_seconds")
-        .map_err(map_err)?
-        .unwrap_or(1800);
-    let auto_close = bool_arg(args, "auto_close")
-        .map_err(map_err)?
-        .unwrap_or(true);
-    let output_lines = u64_arg(args, "output_lines")
-        .map_err(map_err)?
-        .unwrap_or(200) as usize;
-    let model = str_arg(args, "model").map_err(map_err)?;
-    let effort = str_arg(args, "effort").map_err(map_err)?;
-    let agent = str_arg(args, "agent").map_err(map_err)?;
-    let sync_mode = bool_arg(args, "sync").map_err(map_err)?.unwrap_or(false);
-
-    let task_type = str_arg(args, "task_type").map_err(map_err)?;
-    let account = str_arg(args, "account").map_err(map_err)?;
-    let opts = wait::RunOptions {
-        project,
-        prompt,
-        label,
-        model,
-        effort,
-        agent,
-        pane,
-        tab,
-        caller_role: session.caller_role.clone(),
-        timeout: std::time::Duration::from_secs(timeout_secs),
-        auto_close,
-        output_lines,
-        initial_delay: std::time::Duration::from_secs(20),
-        interval: std::time::Duration::from_secs(5),
-        task_type,
-        account,
-    };
-
-    if sync_mode {
-        // 後方互換: 完了までブロッキング
-        let result =
-            wait::run_worker(&mut *session.exec, &opts, &mut |_, _| {}).map_err(|e| (-32602, e))?;
-        return Ok(json!({
-            "content": [{ "type": "text", "text": result.to_string() }],
-            "isError": false,
-        }));
-    }
-
-    // 非同期モード（#121）
-    let tx = ipc_tx
-        .ok_or((
-            -32602,
-            "非同期 run は HTTP MCP 経由でのみ利用可能（stdio は sync=true を指定してください）"
-                .to_string(),
-        ))?
-        .clone();
-    let result = wait::run_start(&mut *session.exec, &opts, move || {
-        let tx = tx;
-        Box::new(move |req: Request| -> Result<Value, String> {
-            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-            tx.unbounded_send(IncomingRequest {
-                request: req,
-                origin: PaneOrigin::Mcp,
-                reply: reply_tx,
-            })
-            .map_err(|_| "アプリ側の受け口が閉じている".to_string())?;
-            match reply_rx.recv() {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("アプリ側から応答が返らなかった".into()),
-            }
-        })
-    })
-    .map_err(|e| (-32602, e))?;
-    Ok(json!({
-        "content": [{ "type": "text", "text": result.to_string() }],
-        "isError": false,
-    }))
-}
-
-/// ツール呼び出しを操作プロトコル（[`Request`]）へ写す。エラーは引数バリデーション失敗
-fn build_request(
-    name: &str,
-    args: &Value,
-    caller: Option<u64>,
-    caller_role: Option<&str>,
-) -> Result<Request, String> {
-    Ok(match name {
-        "tako_list_panes" => Request::List,
-        "tako_split_pane" => {
-            let tab = u64_arg(args, "tab")?;
-            Request::Split {
-                // tab 指定時は pane を使わない（タブのフォーカスペインを dispatch が解決）
-                pane: if tab.is_some() {
-                    None
-                } else {
-                    Some(target_pane(args, caller)?)
-                },
-                tab,
-                direction: direction_arg(args)?,
-                ratio: f32_arg(args, "ratio")?,
-                command: str_vec_arg(args, "command")?.filter(|c| !c.is_empty()),
-                cwd: str_arg(args, "cwd")?,
-                focus: bool_arg(args, "focus")?,
-            }
-        }
-        "tako_send_input" => Request::Send {
-            pane: Some(required_u64(args, "pane")?),
-            text: str_arg(args, "text")?.ok_or("text を指定する")?,
-            newline: bool_arg(args, "newline")?.unwrap_or(true),
-            tmux_session: str_arg(args, "tmux_session")?,
-            await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
-        },
-        "tako_send_keys" => Request::SendKeys {
-            pane: Some(required_u64(args, "pane")?),
-            keys: str_vec_arg(args, "keys")?.ok_or("keys を指定する")?,
-            delay_ms: u64_arg(args, "delay_ms")?,
-            tmux_session: str_arg(args, "tmux_session")?,
-        },
-        "tako_read_pane" => Request::Read {
-            pane: Some(required_u64(args, "pane")?),
-            lines: u64_arg(args, "lines")?.map(|n| n as usize),
-            tmux_session: str_arg(args, "tmux_session")?,
-        },
-        "tako_tmux_list" => Request::TmuxList {
-            socket: str_arg(args, "socket")?,
-        },
-        "tako_tmux_cleanup" => Request::TmuxCleanup {
-            socket: str_arg(args, "socket")?,
-        },
-        "tako_tmux_kill" => Request::TmuxKill {
-            socket: str_arg(args, "socket")?,
-            session: str_arg(args, "session")?.ok_or("session を指定する")?,
-            window: u64_arg(args, "window")?.map(|n| n as u32),
-        },
-        "tako_tmux_resize" => Request::TmuxResize {
-            socket: str_arg(args, "socket")?,
-            session: str_arg(args, "session")?.ok_or("session を指定する")?,
-            window: u64_arg(args, "window")?.map(|n| n as u32).unwrap_or(0),
-            cols: u64_arg(args, "cols")?.map(|n| n as u32),
-            rows: u64_arg(args, "rows")?.map(|n| n as u32),
-            reset: bool_arg(args, "reset")?.unwrap_or(false),
-        },
-        "tako_tmux_select_window" => Request::TmuxSelectWindow {
-            pane: Some(target_pane(args, caller)?),
-            window: u64_arg(args, "window")?.ok_or("window を指定する")? as u32,
-        },
-        "tako_tmux_open" => Request::TmuxOpen {
-            socket: str_arg(args, "socket")?,
-            session: str_arg(args, "session")?.ok_or("session を指定する")?,
-            window: u64_arg(args, "window")?.map(|n| n as u32),
-            pane: Some(target_pane(args, caller)?),
-            direction: direction_arg(args)?,
-        },
-        "tako_scroll_pane" => Request::Scroll {
-            pane: Some(target_pane(args, caller)?),
-            to: u64_arg(args, "to")?,
-            delta: i64_arg(args, "delta")?.map(|n| n as i32),
-        },
-        "tako_focus_pane" => {
-            let pane = u64_arg(args, "pane")?;
-            let direction = direction_arg(args)?;
-            if pane.is_none() && direction.is_none() {
-                return Err("pane か direction のどちらか一方を指定する".into());
-            }
-            Request::Focus { pane, direction }
-        }
-        "tako_close_pane" => Request::Close {
-            pane: Some(target_pane(args, caller)?),
-            force: bool_arg(args, "force")?.unwrap_or(false),
-        },
-        "tako_resize_pane" => Request::Resize {
-            pane: Some(target_pane(args, caller)?),
-            axis: match str_arg(args, "axis")?.as_deref() {
-                Some("x") => Axis::X,
-                Some("y") => Axis::Y,
-                _ => return Err("axis は \"x\" か \"y\" を指定する".into()),
-            },
-            delta: f32_arg(args, "delta")?,
-            share: f32_arg(args, "share")?,
-        },
-        "tako_equalize_layout" => {
-            let tab = u64_arg(args, "tab")?;
-            Request::Equalize {
-                // tab 省略時は呼び出し元ペインからタブを解決する
-                pane: if tab.is_none() {
-                    Some(target_pane(args, caller)?)
-                } else {
-                    None
-                },
-                tab,
-            }
-        }
-        "tako_set_title" => Request::Title {
-            pane: Some(target_pane(args, caller)?),
-            title: str_arg(args, "title")?,
-            role: str_arg(args, "role")?,
-        },
-        "tako_rename_tab" => {
-            let tab = u64_arg(args, "tab")?;
-            Request::TabRename {
-                pane: if tab.is_none() {
-                    Some(target_pane(args, caller)?)
-                } else {
-                    None
-                },
-                tab,
-                title: str_arg(args, "title")?.ok_or("title を指定する")?,
-                source: str_arg(args, "source")?,
-            }
-        }
-        "tako_create_tab" => Request::TabNew {
-            title: str_arg(args, "title")?,
-            focus: bool_arg(args, "focus")?,
-        },
-        "tako_select_tab" => Request::TabSelect {
-            tab: required_u64(args, "tab")?,
-        },
-        "tako_reorder_tab" => Request::TabReorder {
-            tab: required_u64(args, "tab")?,
-            index: required_u64(args, "index")? as usize,
-        },
-        "tako_window" => {
-            let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
-            match action.as_str() {
-                "list" => Request::WindowList,
-                "new" => Request::WindowNew {
-                    tab: u64_arg(args, "tab")?,
-                },
-                "close" => Request::WindowClose {
-                    window: required_u64(args, "window")?,
-                },
-                "move-tab" => Request::WindowMoveTab {
-                    tab: required_u64(args, "tab")?,
-                    window: required_u64(args, "window")?,
-                },
-                "focus" => Request::WindowFocus {
-                    window: required_u64(args, "window")?,
-                },
-                "minimize" => Request::WindowMinimize {
-                    window: u64_arg(args, "window")?,
-                },
-                "maximize" => Request::WindowMaximize {
-                    window: u64_arg(args, "window")?,
-                },
-                "restore" => Request::WindowRestore {
-                    window: u64_arg(args, "window")?,
-                },
-                other => {
-                    return Err(format!(
-                        "action が不正: {other}（list | new | close | move-tab | focus | \
-                         minimize | maximize | restore）"
-                    ))
-                }
-            }
-        }
-        "tako_menu" => {
-            let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
-            match action.as_str() {
-                "list" => Request::MenuList,
-                "open" => Request::MenuOpen {
-                    menu: str_arg(args, "menu")?
-                        .ok_or_else(|| "open には menu が必要".to_string())?,
-                },
-                "close" => Request::MenuClose,
-                "invoke" => Request::MenuInvoke {
-                    path: str_arg(args, "path")?
-                        .ok_or_else(|| "invoke には path が必要".to_string())?,
-                },
-                other => {
-                    return Err(format!(
-                        "action が不正: {other}（list | open | close | invoke）"
-                    ))
-                }
-            }
-        }
-        "tako_move_pane_to_tab" => {
-            let new_tab = bool_arg(args, "new_tab")?.unwrap_or(false);
-            Request::MovePane {
-                pane: Some(target_pane(args, caller)?),
-                tab: if new_tab { None } else { u64_arg(args, "tab")? },
-                target: if new_tab {
-                    None
-                } else {
-                    u64_arg(args, "target")?
-                },
-                direction: if new_tab { None } else { direction_arg(args)? },
-                focus: bool_arg(args, "focus")?,
-            }
-        }
-        "tako_auto_rename" => Request::AutoRename {
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_port_detect" => Request::PortDetect {
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_persist" => Request::Persist {
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_confirm_close" => Request::ConfirmClose {
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_open_file" => Request::OpenFile {
-            pane: Some(target_pane(args, caller)?),
-            path: str_arg(args, "path")?.ok_or("path を指定する")?,
-            mode: match str_arg(args, "mode")?.as_deref() {
-                None => None,
-                Some("code") => Some(crate::protocol::PreviewModeWire::Code),
-                Some("markdown") => Some(crate::protocol::PreviewModeWire::Markdown),
-                Some(other) => return Err(format!("mode が不正: {other}（code | markdown）")),
-            },
-            direction: direction_arg(args)?,
-            focus: bool_arg(args, "focus")?,
-        },
-        "tako_preview_view" => Request::PreviewView {
-            pane: Some(target_pane(args, caller)?),
-            zoom: f32_arg(args, "zoom")?,
-            zoom_in: bool_arg(args, "zoom_in")?.unwrap_or(false),
-            zoom_out: bool_arg(args, "zoom_out")?.unwrap_or(false),
-            reset: bool_arg(args, "reset")?.unwrap_or(false),
-            page: u64_arg(args, "page")?.map(|page| page as usize),
-            pan_x: f32_arg(args, "pan_x")?,
-            pan_y: f32_arg(args, "pan_y")?,
-        },
-        "tako_preview_outline" => Request::PreviewOutline {
-            pane: Some(target_pane(args, caller)?),
-            item: u64_arg(args, "item")?.map(|item| item as usize),
-        },
-        "tako_preview_link_list" => Request::PreviewLinkList {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_preview_follow_link" => Request::PreviewFollowLink {
-            pane: Some(target_pane(args, caller)?),
-            index: u64_arg(args, "index")?.ok_or("index を指定する")? as usize,
-        },
-        "tako_preview_reload" => Request::PreviewReload {
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_preview_cache" => Request::PreviewCache {
-            max_mb: u64_arg(args, "max_mb")?,
-        },
-        "tako_preview_edit" => Request::PreviewEdit {
-            pane: Some(target_pane(args, caller)?),
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_preview_apply" => Request::PreviewApply {
-            pane: Some(target_pane(args, caller)?),
-            text: str_arg(args, "text")?.ok_or("text を指定する")?,
-        },
-        "tako_preview_save" => Request::PreviewSave {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_preview_undo" => Request::PreviewUndo {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_preview_redo" => Request::PreviewRedo {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_preview_search" => Request::PreviewSearch {
-            pane: Some(target_pane(args, caller)?),
-            query: str_arg(args, "query")?,
-            direction: str_arg(args, "direction")?,
-        },
-        "tako_preview_replace" => Request::PreviewReplace {
-            pane: Some(target_pane(args, caller)?),
-            query: str_arg(args, "query")?.ok_or("query を指定する")?,
-            replacement: str_arg(args, "replacement")?.ok_or("replacement を指定する")?,
-            all: bool_arg(args, "all")?,
-        },
-        "tako_preview_autosave" => Request::PreviewAutosave {
-            pane: Some(target_pane(args, caller)?),
-            enabled: bool_arg(args, "enabled")?,
-        },
-        "tako_preview_changelog" => Request::PreviewChangelog {
-            pane: Some(target_pane(args, caller)?),
-            enabled: bool_arg(args, "enabled")?,
-            max_count: u64_arg(args, "max_count")?.map(|v| v as usize),
-            expand: str_arg(args, "expand")?,
-        },
-        "tako_file_op" => {
-            let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;
-            let op = match op_str.as_str() {
-                "copy_absolute_path" => crate::protocol::FileOpKind::CopyAbsolutePath,
-                "copy_relative_path" => crate::protocol::FileOpKind::CopyRelativePath,
-                "reveal" => crate::protocol::FileOpKind::Reveal,
-                "open_terminal" => crate::protocol::FileOpKind::OpenTerminal,
-                "rename" => crate::protocol::FileOpKind::Rename,
-                "create_file" => crate::protocol::FileOpKind::CreateFile,
-                "create_dir" => crate::protocol::FileOpKind::CreateDir,
-                "trash" => crate::protocol::FileOpKind::Trash,
-                "open_default" => crate::protocol::FileOpKind::OpenDefault,
-                "open_with" => crate::protocol::FileOpKind::OpenWith,
-                other => return Err(format!("op が不正: {other}")),
-            };
-            Request::FileOp {
-                op,
-                path: str_arg(args, "path")?.ok_or("path を指定する")?,
-                name: str_arg(args, "name")?,
-                pane: match op {
-                    crate::protocol::FileOpKind::OpenTerminal
-                    | crate::protocol::FileOpKind::CopyRelativePath => {
-                        Some(target_pane(args, caller)?)
-                    }
-                    _ => None,
-                },
-            }
-        }
-        "tako_git_log" => Request::GitLog {
-            pane: Some(target_pane(args, caller)?),
-            max_count: u64_arg(args, "max_count")?.map(|n| n as usize),
-        },
-        "tako_git_diff" => Request::GitDiff {
-            pane: Some(target_pane(args, caller)?),
-            target: str_arg(args, "target")?,
-        },
-        "tako_git_show" => Request::GitShow {
-            pane: Some(target_pane(args, caller)?),
-            hash: str_arg(args, "hash")?.ok_or("hash を指定する")?,
-            file: str_arg(args, "file")?,
-        },
-        "tako_git_commit" => Request::GitCommit {
-            pane: Some(target_pane(args, caller)?),
-            message: str_arg(args, "message")?.ok_or("message を指定する")?,
-            all: bool_arg(args, "all")?.unwrap_or(false),
-        },
-        "tako_git_pull" => Request::GitPull {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_git_push" => Request::GitPush {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_git_stage" => Request::GitStage {
-            pane: Some(target_pane(args, caller)?),
-            paths: str_array_arg(args, "paths"),
-        },
-        "tako_git_unstage" => Request::GitUnstage {
-            pane: Some(target_pane(args, caller)?),
-            paths: str_array_arg(args, "paths"),
-        },
-        "tako_git_checkout" => Request::GitCheckout {
-            pane: Some(target_pane(args, caller)?),
-            branch: str_arg(args, "branch")?.ok_or("branch を指定する")?,
-            confirm: bool_arg(args, "confirm")?.unwrap_or(false),
-        },
-        "tako_git_branch_create" => Request::GitBranchCreate {
-            pane: Some(target_pane(args, caller)?),
-            name: str_arg(args, "name")?.ok_or("name を指定する")?,
-            start_point: str_arg(args, "start_point")?,
-            checkout: bool_arg(args, "checkout")?,
-        },
-        "tako_git_merge" => Request::GitMerge {
-            pane: Some(target_pane(args, caller)?),
-            branch: str_arg(args, "branch")?.ok_or("branch を指定する")?,
-            confirm: bool_arg(args, "confirm")?.unwrap_or(false),
-            no_ff: bool_arg(args, "no_ff")?.unwrap_or(false),
-        },
-        "tako_git_merge_abort" => Request::GitMergeAbort {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_git_conflicts" => Request::GitConflicts {
-            pane: Some(target_pane(args, caller)?),
-        },
-        "tako_git_resolve_agent" => Request::GitResolveAgent {
-            pane: Some(target_pane(args, caller)?),
-            agent: str_arg(args, "agent")?,
-            tab: u64_arg(args, "tab")?,
-        },
-        "tako_background_pane" => {
-            let tab = u64_arg(args, "tab")?;
-            Request::Background {
-                pane: if tab.is_some() {
-                    None
-                } else {
-                    Some(target_pane(args, caller)?)
-                },
-                tab,
-            }
-        }
-        "tako_foreground_pane" => Request::Foreground {
-            pane: required_u64(args, "pane")?,
-            target: u64_arg(args, "target")?,
-            direction: direction_arg(args)?,
-        },
-        "tako_background_list" => Request::BackgroundList,
-        "tako_background_kill" => Request::BackgroundKill {
-            pane: required_u64(args, "pane")?,
-        },
-        "tako_panel" => Request::Panel {
-            visible: bool_arg(args, "visible")?,
-            width: f32_arg(args, "width")?,
-            view: match str_arg(args, "view")?.as_deref() {
-                None => None,
-                Some("tmux") => Some(crate::protocol::PanelViewWire::Tmux),
-                Some("orch") => Some(crate::protocol::PanelViewWire::Orch),
-                Some("git") => Some(crate::protocol::PanelViewWire::Git),
-                Some(other) => return Err(format!("view が不正: {other}（tmux | orch | git）")),
-            },
-            filetree: bool_arg(args, "filetree")?,
-            sidebar_width: f32_arg(args, "sidebar_width")?,
-        },
-        "tako_collapse_tab" => Request::CollapseTab {
-            pane: u64_arg(args, "pane")?.or(caller),
-            tab: u64_arg(args, "tab")?,
-            collapsed: bool_arg(args, "collapsed")?,
-        },
-        "tako_pin_preview" => {
-            let group_tab = u64_arg(args, "group_tab")?;
-            Request::Pin {
-                // group_tab 指定時は pane を補完しない（排他）
-                pane: if group_tab.is_some() {
-                    None
-                } else {
-                    u64_arg(args, "pane")?.or(caller)
-                },
-                group_tab,
-                pinned: bool_arg(args, "pinned")?,
-            }
-        }
-        "tako_check_health" => Request::CheckHealth,
-        "tako_setup_mcp" => Request::SetupMcp {
-            scope: str_arg(args, "scope")?,
-            pane: u64_arg(args, "pane")?.or(caller),
-        },
-        "tako_video_playback" => Request::VideoPlayback {
-            pane: Some(target_pane(args, caller)?),
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
-        },
-        "tako_video_seek" => Request::VideoSeek {
-            pane: Some(target_pane(args, caller)?),
-            seconds: f64_arg(args, "seconds")?.ok_or("seconds を指定する")?,
-        },
-        "tako_video_volume" => Request::VideoVolume {
-            pane: Some(target_pane(args, caller)?),
-            volume: f64_arg(args, "volume")?.ok_or("volume を指定する")?,
-        },
-        "tako_orchestrator_projects" => Request::OrchestratorProjects {
-            action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
-            key: str_arg(args, "key")?,
-            cwd: str_arg(args, "cwd")?,
-            description: str_arg(args, "description")?,
-        },
-        "tako_orchestrator_profiles" => Request::OrchestratorProfiles {
-            action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
-            name: str_arg(args, "name")?,
-            model: str_arg(args, "model")?,
-            master_agent: str_arg(args, "master_agent")?,
-            clear_master_agent: bool_arg(args, "clear_master_agent")?.unwrap_or(false),
-            worker_model: str_arg(args, "worker_model")?,
-            effort: str_arg(args, "effort")?,
-            worker_effort: str_arg(args, "worker_effort")?,
-            clear_model: bool_arg(args, "clear_model")?.unwrap_or(false),
-            clear_worker_model: bool_arg(args, "clear_worker_model")?.unwrap_or(false),
-            worker_agent: str_arg(args, "worker_agent")?,
-            clear_worker_agent: bool_arg(args, "clear_worker_agent")?.unwrap_or(false),
-            agent: str_arg(args, "agent")?,
-            agent_model: str_arg(args, "agent_model")?,
-            clear_agent_model: bool_arg(args, "clear_agent_model")?.unwrap_or(false),
-            agent_effort: str_arg(args, "agent_effort")?,
-            clear_agent_effort: bool_arg(args, "clear_agent_effort")?.unwrap_or(false),
-            agent_skip_permissions: bool_arg(args, "agent_skip_permissions")?,
-            agent_args: str_vec_arg(args, "agent_args")?,
-            worker_model_policy: str_arg(args, "worker_model_policy")?,
-            tab_naming_convention: str_arg(args, "tab_naming_convention")?,
-            env_set: str_vec_arg(args, "env_set")?,
-            env_unset: str_vec_arg(args, "env_unset")?,
-            master_account: str_arg(args, "master_account")?,
-            clear_master_account: bool_arg(args, "clear_master_account")?.unwrap_or(false),
-            worker_account: str_arg(args, "worker_account")?,
-            clear_worker_account: bool_arg(args, "clear_worker_account")?.unwrap_or(false),
-        },
-        "tako_orchestrator_accounts" => Request::OrchestratorAccounts {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
-            name: str_arg(args, "name")?,
-            config_dir: str_arg(args, "config_dir")?,
-            inherit: bool_arg(args, "inherit")?.unwrap_or(false),
-            description: str_arg(args, "description")?,
-            default_model: str_arg(args, "default_model")?,
-            default_effort: str_arg(args, "default_effort")?,
-            master: bool_arg(args, "master")?.unwrap_or(false),
-            worker: bool_arg(args, "worker")?.unwrap_or(false),
-            profile: str_arg(args, "profile")?,
-            pane: u64_arg(args, "pane")?,
-            tab: u64_arg(args, "tab")?,
-        },
-        "tako_orchestrator_layout" => Request::OrchestratorLayout {
-            policy: str_arg(args, "policy")?,
-            master_ratio: f64_arg(args, "master_ratio")?.map(|v| v as f32),
-            algorithm: str_arg(args, "algorithm")?,
-        },
-        "tako_orchestrator_self" => Request::OrchestratorSelf {
-            pane: u64_arg(args, "pane")?.or(caller),
-            caller_role: caller_role.map(str::to_string),
-            caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
-        },
-        "tako_orchestrator_handoff" => Request::OrchestratorHandoff {
-            pane: u64_arg(args, "pane")?.or(caller),
-            caller_role: caller_role.map(str::to_string),
-            tab: u64_arg(args, "tab")?,
-            caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
-        },
-        "tako_orchestrator_spawn" => {
-            let pane = u64_arg(args, "pane")?;
-            let tab = u64_arg(args, "tab")?;
-            let resolved_pane = if pane.is_some() {
-                pane
-            } else if tab.is_some() {
-                None
-            } else {
-                caller
-            };
-            let resolved_tab = if pane.is_some() { None } else { tab };
-            if resolved_pane.is_none() && resolved_tab.is_none() {
-                return Err("pane または tab を指定してください".into());
-            }
-            Request::OrchestratorSpawn {
-                project: str_arg(args, "project")?.ok_or("project を指定する")?,
-                prompt: str_arg(args, "prompt")?.ok_or("prompt を指定する")?,
-                label: str_arg(args, "label")?,
-                model: str_arg(args, "model")?,
-                effort: str_arg(args, "effort")?,
-                pane: resolved_pane,
-                tab: resolved_tab,
-                caller_role: caller_role.map(str::to_string),
-                agent: str_arg(args, "agent")?,
-                caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
-                task_type: str_arg(args, "task_type")?,
-                account: str_arg(args, "account")?,
-            }
-        }
-        "tako_orchestrator_report" => Request::OrchestratorReport {
-            pane_id: u64_arg(args, "pane_id")?,
-            lines: u64_arg(args, "lines")?.map(|v| v as usize),
-            messages: u64_arg(args, "messages")?.map(|v| v as usize),
-            worker: str_arg(args, "worker")?,
-        },
-        "tako_orchestrator_worker_status" => Request::OrchestratorWorkerStatus {
-            pane_id: u64_arg(args, "pane_id")?,
-            session_id: str_arg(args, "session_id")?,
-            tmux_session: str_arg(args, "tmux_session")?,
-            worker: str_arg(args, "worker")?,
-        },
-        "tako_orchestrator_workers" => Request::OrchestratorWorkers {
-            all: bool_arg(args, "all")?,
-        },
-        // caller へフォールバックしない: 省略時に master 自身のペインを照会しても意味がない
-        "tako_orchestrator_launch_status" => Request::OrchestratorLaunchStatus {
-            pane: u64_arg(args, "pane")?,
-            worker: str_arg(args, "worker")?,
-        },
-        "tako_orchestrator_run_status" => Request::OrchestratorRunStatus {
-            run_id: str_arg(args, "run_id")?,
-        },
-        "tako_orchestrator_run_result" => Request::OrchestratorRunResult {
-            run_id: str_arg(args, "run_id")?.ok_or("run_id を指定する")?,
-        },
-        "tako_orchestrator_respond" => Request::OrchestratorRespond {
-            pane_id: required_u64(args, "pane_id")?,
-            choice: str_arg(args, "choice")?,
-            answers: dialog_answers_arg(args)?,
-            dry_run: bool_arg(args, "dry_run")?.unwrap_or(false),
-            caller_role: caller_role.map(str::to_string),
-        },
-        "tako_orchestrator_dialog" => Request::OrchestratorDialog {
-            pane_id: u64_arg(args, "pane_id")?,
-            worker: str_arg(args, "worker")?,
-        },
-        "tako_orchestrator_supervisor" => Request::OrchestratorSupervisor {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
-            mode: str_arg(args, "mode")?,
-            auto_resume_dead: bool_arg(args, "auto_resume_dead")?,
-            max_retries: u64_arg(args, "max_retries")?.map(|v| v as u32),
-            lines: u64_arg(args, "lines")?.map(|v| v as usize),
-        },
-        "tako_orchestrator_ledger" => Request::OrchestratorLedger {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
-            id: str_arg(args, "id")?,
-            outcome: str_arg(args, "outcome")?,
-            rounds: u64_arg(args, "rounds")?.map(|v| v as u32),
-            note: str_arg(args, "note")?,
-            project: str_arg(args, "project")?,
-            task_type: str_arg(args, "task_type")?,
-            limit: u64_arg(args, "limit")?.map(|v| v as usize),
-        },
-        "tako_remote_start" => Request::RemoteStart {},
-        "tako_remote_stop" => Request::RemoteStop {
-            force: bool_arg(args, "force")?.unwrap_or(false),
-        },
-        "tako_remote_status" => Request::RemoteStatus,
-        "tako_remote_agents" => Request::RemoteAgents,
-        "tako_remote_messages" => Request::RemoteMessages {
-            session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,
-            tail: u64_arg(args, "tail")?.map(|n| n as usize),
-        },
-        "tako_remote_devices" => Request::RemoteDevices {
-            action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke）")?,
-            device_id: str_arg(args, "device_id")?,
-        },
-        "tako_remote_setup" => Request::RemoteSetup {
-            action: str_arg(args, "action")?.ok_or("action を指定する（check / run）")?,
-            answers: args.get("answers").cloned(),
-        },
-        "tako_remote_scrollback" => Request::RemoteScrollback {
-            pane_id: str_arg(args, "pane_id")?
-                .ok_or("pane_id を指定する")?
-                .to_string(),
-            lines: u64_arg(args, "lines")?.map(|n| n as u32),
-        },
-        "tako_web" => {
-            let action = str_arg(args, "action")?.ok_or("action は必須")?.to_string();
-            // 分割系（open / show）だけ、基準ペイン省略時に呼び出し元を分割元とする。
-            // 対象指定系で caller を埋めると「AI 自身のペイン」を対象と誤解するため埋めない
-            let pane = match action.as_str() {
-                "open" | "show" => u64_arg(args, "pane")?.or(caller),
-                _ => u64_arg(args, "pane")?,
-            };
-            Request::Web {
-                action,
-                url: str_arg(args, "url")?.map(|s| s.to_string()),
-                id: u64_arg(args, "id")?,
-                pane,
-                direction: direction_arg(args)?,
-                to: str_arg(args, "to")?.map(|s| s.to_string()),
-                js: str_arg(args, "js")?.map(|s| s.to_string()),
-                token: u64_arg(args, "token")?,
-                focus: bool_arg(args, "focus")?,
-            }
-        }
-        "tako_update" => Request::Update {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            channel: str_arg(args, "channel")?.map(|s| s.to_string()),
-            dry_run: bool_arg(args, "dry_run")?,
-        },
-        "tako_fda" => Request::Fda {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-        },
-        "tako_sleep_guard" => Request::SleepGuard {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            mode: str_arg(args, "mode")?.map(|s| s.to_string()),
-            power_condition: str_arg(args, "power_condition")?.map(|s| s.to_string()),
-            lid_sleep_mode: str_arg(args, "lid_sleep_mode")?.map(|s| s.to_string()),
-        },
-        "tako_theme" => Request::Theme {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            mode: str_arg(args, "mode")?.map(|s| s.to_string()),
-            target: str_arg(args, "target")?.map(|s| s.to_string()),
-            key: str_arg(args, "key")?.map(|s| s.to_string()),
-            value: str_arg(args, "value")?.map(|s| s.to_string()),
-            name: str_arg(args, "name")?.map(|s| s.to_string()),
-            font_family: str_arg(args, "font_family")?.map(|s| s.to_string()),
-            font_size: str_arg(args, "font_size")?.and_then(|s| s.parse::<f32>().ok()),
-        },
-        "tako_stale_binary" => Request::StaleBinary {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            pane: u64_arg(args, "pane")?,
-        },
-        "tako_platform" => Request::Platform {
-            platform: str_arg(args, "platform")?.map(|s| s.to_string()),
-            status: str_arg(args, "status")?.map(|s| s.to_string()),
-        },
-        "tako_lang" => Request::Lang {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            value: str_arg(args, "value")?.map(|s| s.to_string()),
-        },
-        "tako_limit_service" => Request::LimitService {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            service: str_arg(args, "service")?.map(|s| s.to_string()),
-        },
-        "tako_telemetry" => Request::Telemetry {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-        },
-        "tako_settings" => Request::Settings {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            tab: str_arg(args, "tab")?.map(|s| s.to_string()),
-        },
-        "tako_setup_changes" => Request::SetupChanges,
-        "tako_setup" => Request::SetupRun {
-            answers: Some(args.clone()),
-        },
-        "tako_agents_sync_rules" => Request::AgentsSyncRules {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            source: str_arg(args, "source")?.map(|s| s.to_string()),
-            targets: {
-                let arr = args.get("targets").and_then(Value::as_array);
-                arr.map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-            },
-        },
-        "tako_tree_folder" => Request::TreeFolder {
-            action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
-                .to_string(),
-            path: str_arg(args, "path")?.map(|s| s.to_string()),
-            tab: u64_arg(args, "tab")?,
-            pane: caller,
-        },
-        "tako_sessions" => {
-            let action = str_arg(args, "action")?.ok_or("action を指定する")?;
-            Request::Sessions {
-                // resume はペイン省略時に呼び出し元（master 自身の隣）へ分割する
-                pane: if action == "resume" && u64_arg(args, "tab")?.is_none() {
-                    u64_arg(args, "pane")?.or(caller)
-                } else {
-                    u64_arg(args, "pane")?
-                },
-                action,
-                id: str_arg(args, "id")?,
-                role: str_arg(args, "role")?,
-                project: str_arg(args, "project")?,
-                limit: u64_arg(args, "limit")?.map(|v| v as usize),
-                tab: u64_arg(args, "tab")?,
-                direction: direction_arg(args)?,
-            }
-        }
-        "tako_logs" => Request::Logs {
-            action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
-                .to_string(),
-            // read はペイン・セッション未指定なら呼び出し元ペインのログを引く
-            pane: match (u64_arg(args, "pane")?, str_arg(args, "session_id")?) {
-                (Some(p), _) => Some(p),
-                (None, None) => caller,
-                (None, Some(_)) => None,
-            },
-            session_id: str_arg(args, "session_id")?,
-            lines: u64_arg(args, "lines")?.map(|v| v as usize),
-            enabled: bool_arg(args, "enabled")?,
-            max_mb: u64_arg(args, "max_mb")?,
-            total_max_mb: u64_arg(args, "total_max_mb")?,
-        },
-        "tako_open_dir" => Request::OpenDir {
-            path: str_arg(args, "path")?.ok_or("path を指定する")?.to_string(),
-            focus: bool_arg(args, "focus")?,
-        },
-        "tako_open_remote" => Request::OpenRemote {
-            host: str_arg(args, "host")?.ok_or("host を指定する")?.to_string(),
-            focus: bool_arg(args, "focus")?,
-        },
-        "tako_ssh_hosts" => Request::SshHosts,
-        "tako_recent" => Request::RecentItems {
-            action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
-                .to_string(),
-        },
-        "tako_task_checkpoint" => Request::TaskCheckpoint {
-            action: "checkpoint".into(),
-            task_id: str_arg(args, "task_id")?,
-            pane: u64_arg(args, "pane")?.or(caller),
-            issue: u64_arg(args, "issue")?.map(|v| v as u32),
-            branch: str_arg(args, "branch")?,
-            phase: str_arg(args, "phase")?,
-            last_commit: str_arg(args, "last_commit")?,
-            agent: str_arg(args, "agent")?,
-            model: str_arg(args, "model")?,
-            prompt_head: str_arg(args, "prompt_head")?,
-            suspended_reason: str_arg(args, "suspended_reason")?,
-            project: str_arg(args, "project")?,
-            cwd: str_arg(args, "cwd")?,
-            resume_pane: None,
-            tab: None,
-            resume_model: None,
-            caller_role: caller_role.map(String::from),
-        },
-        "tako_task_list" => Request::TaskCheckpoint {
-            action: "list".into(),
-            task_id: None,
-            pane: None,
-            issue: None,
-            branch: None,
-            phase: str_arg(args, "phase")?,
-            last_commit: None,
-            agent: None,
-            model: None,
-            prompt_head: None,
-            suspended_reason: None,
-            project: None,
-            cwd: None,
-            resume_pane: None,
-            tab: None,
-            resume_model: None,
-            caller_role: None,
-        },
-        "tako_task_resume" => Request::TaskCheckpoint {
-            action: "resume".into(),
-            task_id: str_arg(args, "task_id")?,
-            pane: None,
-            issue: None,
-            branch: None,
-            phase: None,
-            last_commit: None,
-            agent: None,
-            model: None,
-            prompt_head: None,
-            suspended_reason: None,
-            project: None,
-            cwd: None,
-            resume_pane: if u64_arg(args, "tab")?.is_some() {
-                None
-            } else {
-                u64_arg(args, "pane")?.or(caller)
-            },
-            tab: u64_arg(args, "tab")?,
-            resume_model: str_arg(args, "model")?,
-            caller_role: caller_role.map(String::from),
-        },
-        "tako_task_gate" => {
-            let criteria_val = args.get("criteria").ok_or("criteria を指定する")?;
-            let criteria_json = serde_json::to_string(criteria_val)
-                .map_err(|e| format!("criteria の JSON 変換に失敗: {e}"))?;
-            Request::TaskGate {
-                action: "set".into(),
-                task_id: str_arg(args, "task_id")?,
-                criteria_json: Some(criteria_json),
-                results_json: None,
-                cwd: str_arg(args, "cwd")?,
-                sync_checkpoint: None,
-            }
-        }
-        // tako_task_gate_check は call_tool で特殊処理（dispatch を経由しない）
-        "tako_task_gate_show" => Request::TaskGate {
-            action: "show".into(),
-            task_id: str_arg(args, "task_id")?,
-            criteria_json: None,
-            results_json: None,
-            cwd: None,
-            sync_checkpoint: None,
-        },
-        "tako_run_interactive" => {
-            let tab = u64_arg(args, "tab")?;
-            Request::RunInteractive {
-                pane: if tab.is_some() {
-                    None
-                } else {
-                    Some(target_pane(args, caller)?)
-                },
-                tab,
-                command: str_arg(args, "command")?.ok_or("command を指定する")?,
-                input_hint: str_arg(args, "input_hint")?,
-                direction: direction_arg(args)?,
-                ratio: f32_arg(args, "ratio")?,
-                auto_close: str_arg(args, "auto_close")?,
-            }
-        }
-        "tako_run_interactive_status" => Request::RunInteractiveStatus {
-            pane: required_u64(args, "pane")?,
-            no_wait: false,
-        },
-        "tako_run" => {
-            let tab = u64_arg(args, "tab")?;
-            Request::Run {
-                path: str_arg(args, "path")?.ok_or("path を指定する")?,
-                pane: if tab.is_some() {
-                    None
-                } else {
-                    Some(target_pane(args, caller)?)
-                },
-                tab,
-                profile: str_arg(args, "profile")?,
-                command: str_arg(args, "command")?,
-                direction: direction_arg(args)?,
-                ratio: f32_arg(args, "ratio")?,
-                auto_close: str_arg(args, "auto_close")?,
-                focus: bool_arg(args, "focus")?,
-            }
-        }
-        "tako_run_resolve" => Request::RunResolve {
-            path: str_arg(args, "path")?.ok_or("path を指定する")?,
-            pane: u64_arg(args, "pane")?.or(caller),
-        },
-        "tako_run_defaults" => Request::RunnerDefaults {
-            ext: str_arg(args, "ext")?,
-            command: str_arg(args, "command")?,
-            remove: bool_arg(args, "remove")?.unwrap_or(false),
-        },
-        _ => return Err(format!("不明なツール: {name}")),
-    })
-}
-
-/// `pane` 引数（省略時は呼び出し元へフォールバック。FR-2.3.3 のデフォルトスコープ）
-fn target_pane(args: &Value, caller: Option<u64>) -> Result<u64, String> {
-    u64_arg(args, "pane")?.or(caller).ok_or_else(|| {
-        "対象ペインを特定できない（pane を指定する。\
-         呼び出し元ペインの自動特定には TAKO_PANE_ID / X-Tako-Pane が必要）"
-            .into()
-    })
-}
-
-/// ツール名 → 許可パラメータ名セットのキャッシュ（#227）。
-/// `tools()` のスキーマから `inputSchema.properties` のキーを抽出して構築する。
-/// 全ツールの `additionalProperties: false` を実行時に強制する
-fn allowed_params_map(
-) -> &'static std::collections::HashMap<String, std::collections::HashSet<String>> {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::OnceLock;
-    static MAP: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut map = HashMap::new();
-        for tool in tools() {
-            if let (Some(name), Some(schema)) = (
-                tool.get("name").and_then(Value::as_str),
-                tool.get("inputSchema"),
-            ) {
-                let keys: HashSet<String> = schema
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .map(|props| props.keys().cloned().collect())
-                    .unwrap_or_default();
-                map.insert(name.to_string(), keys);
-            }
-        }
-        map
-    })
-}
-
-/// 引数の全キーがツールスキーマの `properties` に含まれるか検証する。
-/// 未知キーがあれば JSON-RPC InvalidParams エラーを返す
-fn validate_known_params(tool_name: &str, args: &Value) -> Result<(), (i64, String)> {
-    let map = allowed_params_map();
-    let Some(allowed) = map.get(tool_name) else {
-        return Ok(());
-    };
-    if let Some(obj) = args.as_object() {
-        let unknown: Vec<&String> = obj.keys().filter(|k| !allowed.contains(*k)).collect();
-        if !unknown.is_empty() {
-            return Err((
-                -32602,
-                format!(
-                    "未知のパラメータ: {}（{tool_name} が受け付けるのは {} のみ）",
-                    unknown
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if allowed.is_empty() {
-                        "引数なし".to_string()
-                    } else {
-                        let mut sorted: Vec<&str> = allowed.iter().map(String::as_str).collect();
-                        sorted.sort_unstable();
-                        sorted.join(", ")
-                    },
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
-    u64_arg(args, key)?.ok_or_else(|| format!("{key} を指定する"))
-}
-
-fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| format!("{key} は非負整数で指定する")),
-    }
-}
-
-fn i64_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_i64()
-            .map(Some)
-            .ok_or_else(|| format!("{key} は整数で指定する")),
-    }
-}
-
-fn f32_arg(args: &Value, key: &str) -> Result<Option<f32>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_f64()
-            .map(|f| Some(f as f32))
-            .ok_or_else(|| format!("{key} は数値で指定する")),
-    }
-}
-
-fn f64_arg(args: &Value, key: &str) -> Result<Option<f64>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_f64()
-            .map(Some)
-            .ok_or_else(|| format!("{key} は数値で指定する")),
-    }
-}
-
-fn str_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_str()
-            .map(|s| Some(s.to_string()))
-            .ok_or_else(|| format!("{key} は文字列で指定する")),
-    }
-}
-
-fn bool_arg(args: &Value, key: &str) -> Result<Option<bool>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_bool()
-            .map(Some)
-            .ok_or_else(|| format!("{key} は真偽値で指定する")),
-    }
-}
-
-fn str_array_arg(args: &Value, key: &str) -> Vec<String> {
-    match args.get(key) {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn direction_arg(args: &Value) -> Result<Option<Direction>, String> {
-    match str_arg(args, "direction")?.as_deref() {
-        None => Ok(None),
-        Some("right") => Ok(Some(Direction::Right)),
-        Some("down") => Ok(Some(Direction::Down)),
-        Some("left") => Ok(Some(Direction::Left)),
-        Some("up") => Ok(Some(Direction::Up)),
-        Some(other) => Err(format!(
-            "direction が不正: {other}（right / down / left / up のいずれか）"
-        )),
-    }
-}
-
-/// `tako_orchestrator_respond` の `answers`（#662）。
-/// 質問ごとに `{question?, option?, options?}`。option / options のどちらも無い要素は拒否する
-/// （空回答のまま送信して worker を進めてしまうのを防ぐ）
-fn dialog_answers_arg(args: &Value) -> Result<Option<Vec<crate::protocol::DialogAnswer>>, String> {
-    let items = match args.get("answers") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Array(items)) => items,
-        Some(_) => return Err("answers は配列で指定する".to_string()),
-    };
-    let mut out = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        if !item.is_object() {
-            return Err(format!(
-                "answers[{i}] はオブジェクトで指定する（{{option: \"2\"}} 等）"
-            ));
-        }
-        let answer = crate::protocol::DialogAnswer {
-            question: str_arg(item, "question")?,
-            option: str_arg(item, "option")?,
-            options: str_vec_arg(item, "options")?,
-        };
-        if answer.option_list().is_empty() {
-            return Err(format!(
-                "answers[{i}] に option / options のどちらも無い（選ぶ選択肢を指定する）"
-            ));
-        }
-        out.push(answer);
-    }
-    Ok(Some(out))
-}
-
-fn str_vec_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(String::from)
-                    .ok_or_else(|| format!("{key} は文字列の配列で指定する"))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        Some(_) => Err(format!("{key} は文字列の配列で指定する")),
-    }
-}
-
-// --- Streamable HTTP トランスポート ---
-
-/// リクエストボディの上限（暴走・誤接続対策）
-const MAX_BODY_BYTES: u64 = 1 << 20;
-
-/// 内蔵 MCP サーバーのハンドル。`url` をペインのシェルへ `TAKO_MCP_URL` として注入する。
-/// ポートはプロセス終了時に OS が解放するため明示シャットダウンは持たない
-pub struct McpServer {
-    url: String,
-}
-
-impl McpServer {
-    /// 127.0.0.1 の空きポートで Streamable HTTP サーバーを起動する。
-    /// 受け取った各操作は IPC と同じ `tx` 経由で UI スレッドへ届く（dispatch 共有）
-    pub fn start(tx: UnboundedSender<IncomingRequest>, token: String) -> io::Result<Self> {
-        let server = tiny_http::Server::http("127.0.0.1:0")
-            .map_err(|e| io::Error::other(format!("MCP HTTP サーバーを起動できない: {e}")))?;
-        let port = server
-            .server_addr()
-            .to_ip()
-            .ok_or_else(|| io::Error::other("MCP サーバーのポートを特定できない"))?
-            .port();
-        let url = format!("http://127.0.0.1:{port}/mcp");
-        let token = Arc::new(token);
-        std::thread::Builder::new()
-            .name("tako-mcp-http".into())
-            .spawn(move || {
-                for request in server.incoming_requests() {
-                    let tx = tx.clone();
-                    let token = Arc::clone(&token);
-                    std::thread::Builder::new()
-                        .name("tako-mcp-req".into())
-                        .spawn(move || {
-                            handle_http(request, &token, &tx);
-                        })
-                        .ok();
-                }
-            })?;
-        Ok(Self { url })
-    }
-
-    /// 接続先 URL（`TAKO_MCP_URL` として注入する）
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-}
-
-fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv(name))
-        .map(|h| h.value.as_str().to_string())
-}
-
-fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
-    let result = match body {
-        Some(body) => {
-            let header =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .expect("固定値のヘッダ構築は失敗しない");
-            // 応答サイズは既知なので常に Content-Length で送る。tiny_http の既定は
-            // 32KB 超で chunked に切り替わり、チャンク境界がマルチバイト文字の途中に
-            // 落ちると素朴なクライアントの read_to_string が壊れる（ツールカタログが
-            // 32KB を超えた際にセルフテストで顕在化）
-            request.respond(
-                tiny_http::Response::from_string(body)
-                    .with_chunked_threshold(usize::MAX)
-                    .with_header(header)
-                    .with_status_code(status),
-            )
-        }
-        None => request.respond(tiny_http::Response::empty(status)),
-    };
-    if let Err(e) = result {
-        tracing::debug!("MCP 応答の送信に失敗: {e}");
-    }
-}
-
-fn handle_http(
-    mut request: tiny_http::Request,
-    token: &str,
-    tx: &UnboundedSender<IncomingRequest>,
-) {
-    // Origin 検証: ブラウザからの DNS リバインディング対策（MCP 仕様の要請）。
-    // 非ブラウザクライアントは通常 Origin を送らない
-    if let Some(origin) = header_value(&request, "origin") {
-        let local = [
-            "http://127.0.0.1",
-            "http://localhost",
-            "https://127.0.0.1",
-            "https://localhost",
-        ]
-        .iter()
-        .any(|prefix| origin.starts_with(prefix));
-        if !local {
-            return respond(request, 403, None);
-        }
-    }
-    // Bearer トークン認証（FR-2.3.4。アプリ外プロセスの拒否）
-    let authorized =
-        header_value(&request, "authorization").is_some_and(|v| v == format!("Bearer {token}"));
-    if !authorized {
-        return respond(request, 401, None);
-    }
-    // Streamable HTTP の必須経路は POST のみ実装（GET の SSE ストリームは任意機能のため
-    // 405 を返す。サーバー発のリクエスト・通知を持たないため不要）
-    if *request.method() != tiny_http::Method::Post {
-        return respond(request, 405, None);
-    }
-    let caller_pane = header_value(&request, "x-tako-pane").and_then(|v| v.parse().ok());
-    let mut body = String::new();
-    {
-        use std::io::Read as _;
-        if request
-            .as_reader()
-            .take(MAX_BODY_BYTES)
-            .read_to_string(&mut body)
-            .is_err()
-        {
-            return respond(request, 400, None);
-        }
-    }
-    let Ok(message) = serde_json::from_str::<Value>(&body) else {
-        let error = json!({
-            "jsonrpc": "2.0",
-            "id": null,
-            "error": { "code": -32700, "message": "リクエストを JSON として解釈できない" },
-        });
-        return respond(request, 400, Some(error.to_string()));
-    };
-    let mut exec = |req: Request| -> Result<Value, String> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        tx.unbounded_send(IncomingRequest {
-            request: req,
-            origin: PaneOrigin::Mcp,
-            reply: reply_tx,
-        })
-        .map_err(|_| "アプリ側の受け口が閉じている".to_string())?;
-        match reply_rx.recv() {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err("アプリ側から応答が返らなかった".into()),
-        }
-    };
-    let caller_role = header_value(&request, "x-tako-role").map(|v| v.to_string());
-    let mut session = McpSession {
-        caller_pane,
-        caller_role,
-        connected: true,
-        exec: &mut exec,
-        ipc_tx: Some(tx.clone()),
-    };
-    match handle_message(&message, &mut session) {
-        Some(response) => respond(request, 200, Some(response.to_string())),
-        // notification（initialized 等）には 202 Accepted を返す（Streamable HTTP 仕様）
-        None => respond(request, 202, None),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 受けた Request を記録して固定値を返す exec
-    fn run(message: Value, caller: Option<u64>, connected: bool) -> (Option<Value>, Vec<Request>) {
-        let mut seen = Vec::new();
-        let mut exec = |request: Request| -> Result<Value, String> {
-            seen.push(request);
-            Ok(json!({ "pane": 7 }))
-        };
-        let mut session = McpSession {
-            caller_pane: caller,
-            caller_role: None,
-            connected,
-            exec: &mut exec,
-            ipc_tx: None,
-        };
-        let response = handle_message(&message, &mut session);
-        (response, seen)
-    }
-
-    fn call(name: &str, args: Value) -> Value {
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": args },
-        })
-    }
-
-    #[test]
-    fn initializeはバージョン交渉とinstructionsを返す() {
-        let message = json!({
-            "jsonrpc": "2.0", "id": 0, "method": "initialize",
-            "params": { "protocolVersion": "2025-03-26" },
-        });
-        let (response, _) = run(message, None, true);
-        let result = &response.unwrap()["result"];
-        assert_eq!(result["protocolVersion"], "2025-03-26");
-        assert_eq!(result["serverInfo"]["name"], "tako");
-        // 行動規範（FR-2.7.5）が埋め込まれている
-        let instructions = result["instructions"].as_str().unwrap();
-        assert!(instructions.contains("レビューを求めるときは見せろ"));
-        assert!(instructions.contains("片付け"));
-
-        // 未知バージョンは最新を名乗る
-        let message = json!({
-            "jsonrpc": "2.0", "id": 0, "method": "initialize",
-            "params": { "protocolVersion": "9999-01-01" },
-        });
-        let (response, _) = run(message, None, true);
-        assert_eq!(
-            response.unwrap()["result"]["protocolVersion"],
-            PROTOCOL_VERSION
-        );
-    }
-
-    #[test]
-    fn notificationとresponseには応答しない() {
-        let (response, _) = run(
-            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-            None,
-            true,
-        );
-        assert!(response.is_none());
-        let (response, _) = run(
-            json!({ "jsonrpc": "2.0", "id": 5, "result": {} }),
-            None,
-            true,
-        );
-        assert!(response.is_none());
-    }
-
-    #[test]
-    fn open_fileはモードを解釈し呼び出し元へフォールバックする() {
-        let (response, requests) = run(
-            call(
-                "tako_open_file",
-                json!({ "path": "/tmp/x.md", "mode": "code" }),
-            ),
-            Some(7),
-            true,
-        );
-        assert!(response.is_some());
-        assert_eq!(
-            requests,
-            vec![Request::OpenFile {
-                pane: Some(7),
-                path: "/tmp/x.md".into(),
-                mode: Some(crate::protocol::PreviewModeWire::Code),
-                direction: None,
-                focus: None,
-            }]
-        );
-        // mode 省略は拡張子の自動判定に委ねる（None で渡る）。direction も省略可
-        let (_, requests) = run(
-            call("tako_open_file", json!({ "path": "a.rs" })),
-            Some(7),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::OpenFile {
-                pane: Some(7),
-                path: "a.rs".into(),
-                mode: None,
-                direction: None,
-                focus: None,
-            }]
-        );
-        // direction 指定（FR-3.11 = D&D のドロップ位置の同等操作）
-        let (_, requests) = run(
-            call(
-                "tako_open_file",
-                json!({ "path": "a.rs", "direction": "down" }),
-            ),
-            Some(7),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::OpenFile {
-                pane: Some(7),
-                path: "a.rs".into(),
-                mode: None,
-                direction: Some(Direction::Down),
-                focus: None,
-            }]
-        );
-        // 不正な mode と path 欠落は引数エラー
-        let (response, requests) = run(
-            call("tako_open_file", json!({ "path": "a.rs", "mode": "html" })),
-            Some(7),
-            true,
-        );
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("mode"));
-        let (response, _) = run(call("tako_open_file", json!({})), Some(7), true);
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("path"));
-    }
-
-    #[test]
-    fn preview編集3操作をrequestへ写す() {
-        let (_, requests) = run(
-            call("tako_preview_edit", json!({ "enabled": true })),
-            Some(7),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::PreviewEdit {
-                pane: Some(7),
-                enabled: Some(true),
-            }]
-        );
-        let (_, requests) = run(
-            call(
-                "tako_preview_apply",
-                json!({ "pane": 9, "text": "日本語\n" }),
-            ),
-            Some(7),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::PreviewApply {
-                pane: Some(9),
-                text: "日本語\n".into(),
-            }]
-        );
-        let (_, requests) = run(call("tako_preview_save", json!({})), Some(7), true);
-        assert_eq!(requests, vec![Request::PreviewSave { pane: Some(7) }]);
-    }
-
-    #[test]
-    fn preview_viewは倍率ページパンをrequestへ写す() {
-        let (_, requests) = run(
-            call(
-                "tako_preview_view",
-                json!({
-                    "pane": 7,
-                    "zoom": 150.0,
-                    "page": 3,
-                    "pan_x": 24.0,
-                    "pan_y": 48.0
-                }),
-            ),
-            None,
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::PreviewView {
-                pane: Some(7),
-                zoom: Some(150.0),
-                zoom_in: false,
-                zoom_out: false,
-                reset: false,
-                page: Some(3),
-                pan_x: Some(24.0),
-                pan_y: Some(48.0),
-            }]
-        );
-    }
-
-    #[test]
-    fn preview_outlineは一覧取得と項目ジャンプをrequestへ写す() {
-        let (_, requests) = run(
-            call("tako_preview_outline", json!({ "pane": 7 })),
-            None,
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::PreviewOutline {
-                pane: Some(7),
-                item: None,
-            }]
-        );
-        let (_, requests) = run(
-            call("tako_preview_outline", json!({ "item": 2 })),
-            Some(5),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::PreviewOutline {
-                pane: Some(5),
-                item: Some(2),
-            }]
-        );
-    }
-
-    #[test]
-    fn tmux_openはセッション必須でドロップ位置相当を写す() {
-        let (_, requests) = run(
-            call(
-                "tako_tmux_open",
-                json!({ "session": "master-tako", "socket": "work", "direction": "down" }),
-            ),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::TmuxOpen {
-                socket: Some("work".into()),
-                session: "master-tako".into(),
-                window: None,
-                pane: Some(3),
-                direction: Some(Direction::Down),
-            }]
-        );
-        // session 欠落は引数エラー
-        let (response, requests) = run(call("tako_tmux_open", json!({})), Some(3), true);
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("session"));
-    }
-
-    #[test]
-    fn tako_setup_changesはsetup_changesリクエストに変換される() {
-        let (response, requests) = run(call("tako_setup_changes", json!({})), None, true);
-        assert_eq!(requests, vec![Request::SetupChanges]);
-        assert_eq!(response.unwrap()["result"]["isError"], false);
-    }
-
-    #[test]
-    fn tako_setupは全回答をsetup_runリクエストに変換する() {
-        let answers = json!({
-            "selected_agent": "codex",
-            "provider_plans": {"gpt": "plus"},
-            "instruction_content": "# Rules",
-            "profile": {"master_agent": "codex", "effort": "high"},
-            "projects": {"app": {"cwd": "~/src/app"}},
-            "orchestrator": {"auto_close": false, "auto_push": false},
-            "sleep_guard": {"mode": "while-agents-running", "power": "ac-only"}
-        });
-        let (_, requests) = run(call("tako_setup", answers.clone()), None, true);
-        assert_eq!(
-            requests,
-            vec![Request::SetupRun {
-                answers: Some(answers)
-            }]
-        );
-    }
-
-    #[test]
-    fn tako_orchestrator_layoutはリクエストに変換される() {
-        // 全省略 = 取得
-        let (response, requests) = run(call("tako_orchestrator_layout", json!({})), None, true);
-        assert_eq!(
-            requests,
-            vec![Request::OrchestratorLayout {
-                policy: None,
-                master_ratio: None,
-                algorithm: None,
-            }]
-        );
-        assert_eq!(response.unwrap()["result"]["isError"], false);
-
-        // 指定あり = 設定
-        let (_, requests) = run(
-            call(
-                "tako_orchestrator_layout",
-                json!({ "policy": "legacy", "master_ratio": 0.6, "algorithm": "spiral" }),
-            ),
-            None,
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::OrchestratorLayout {
-                policy: Some("legacy".into()),
-                master_ratio: Some(0.6),
-                algorithm: Some("spiral".into()),
-            }]
-        );
-    }
-
-    #[test]
-    fn preview_reloadは状態取得と切替をrequestへ写す() {
-        let (_, requests) = run(call("tako_preview_reload", json!({})), None, true);
-        assert_eq!(requests, vec![Request::PreviewReload { enabled: None }]);
-
-        let (_, requests) = run(
-            call("tako_preview_reload", json!({ "enabled": false })),
-            None,
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::PreviewReload {
-                enabled: Some(false)
-            }]
-        );
-    }
-
-    #[test]
-    fn preview_cacheは状態取得と上限変更をrequestへ写す() {
-        let (_, requests) = run(call("tako_preview_cache", json!({})), None, true);
-        assert_eq!(requests, vec![Request::PreviewCache { max_mb: None }]);
-
-        let (_, requests) = run(
-            call("tako_preview_cache", json!({ "max_mb": 768 })),
-            None,
-            true,
-        );
-        assert_eq!(requests, vec![Request::PreviewCache { max_mb: Some(768) }]);
-    }
-
-    #[test]
-    fn ツールカタログは操作セットを網羅する() {
-        let tools = tools();
-        // 件数の固定値。ツール追加時はここと対応マトリクス（#515）の両方を更新する
-        // （分類漏れ自体は tests/platform_parity.rs の T1 が検出する）
-        assert_eq!(tools.len(), 129);
-        for tool in &tools {
-            let name = tool["name"].as_str().unwrap();
-            assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
-            assert!(!tool["description"].as_str().unwrap().is_empty());
-            assert_eq!(tool["inputSchema"]["type"], "object");
-        }
-        // 行動規範が説明文側にも埋め込まれている（FR-2.7.5）
-        let split = tools
-            .iter()
-            .find(|t| t["name"] == "tako_split_pane")
-            .unwrap();
-        assert!(split["description"].as_str().unwrap().contains("レビュー"));
-    }
-
-    #[test]
-    fn 未接続ではツールを公開しない() {
-        let (response, _) = run(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-            None,
-            false,
-        );
-        assert_eq!(response.unwrap()["result"]["tools"], json!([]));
-    }
-
-    #[test]
-    fn splitは呼び出し元ペインへフォールバックする() {
-        let (response, seen) = run(
-            call("tako_split_pane", json!({ "direction": "down" })),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            seen,
-            vec![Request::Split {
-                pane: Some(3),
-                tab: None,
-                direction: Some(Direction::Down),
-                ratio: None,
-                command: None,
-                cwd: None,
-                focus: None,
-            }]
-        );
-        let result = &response.unwrap()["result"];
-        assert_eq!(result["isError"], false);
-        assert!(result["content"][0]["text"].as_str().unwrap().contains("7"));
-    }
-
-    #[test]
-    fn 呼び出し元不明でpane省略はエラー() {
-        let (response, seen) = run(call("tako_close_pane", json!({})), None, true);
-        assert!(seen.is_empty());
-        let error = &response.unwrap()["error"];
-        assert_eq!(error["code"], -32602);
-        assert!(error["message"].as_str().unwrap().contains("pane"));
-    }
-
-    #[test]
-    fn sendとreadはpane必須() {
-        let (response, seen) = run(
-            call("tako_send_input", json!({ "text": "ls" })),
-            Some(3), // 呼び出し元があってもフォールバックしない（誤送信防止）
-            true,
-        );
-        assert!(seen.is_empty());
-        assert_eq!(response.unwrap()["error"]["code"], -32602);
-
-        let (_, seen) = run(
-            call("tako_read_pane", json!({ "pane": 4, "lines": 10 })),
-            None,
-            true,
-        );
-        assert_eq!(
-            seen,
-            vec![Request::Read {
-                pane: Some(4),
-                lines: Some(10),
-                tmux_session: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn 実行エラーはエラーフラグ付き結果になる() {
-        let mut exec = |_: Request| -> Result<Value, String> {
-            Err("ペイン 9 が見つからない".into())
-        };
-        let mut session = McpSession {
-            caller_pane: None,
-            caller_role: None,
-            connected: true,
-            exec: &mut exec,
-            ipc_tx: None,
-        };
-        let response = handle_message(&call("tako_list_panes", json!({})), &mut session).unwrap();
-        let result = &response["result"];
-        assert_eq!(result["isError"], true);
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("見つからない"));
-    }
-
-    #[test]
-    fn 不明なツールと未対応メソッドはエラー() {
-        let (response, _) = run(call("tako_explode", json!({})), None, true);
-        assert_eq!(response.unwrap()["error"]["code"], -32602);
-        let (response, _) = run(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }),
-            None,
-            true,
-        );
-        assert_eq!(response.unwrap()["error"]["code"], -32601);
-    }
-
-    #[test]
-    fn pin_previewはペインまたはグループタブをトグルする() {
-        // pane 指定（呼び出し元フォールバック）
-        let (_, requests) = run(
-            call("tako_pin_preview", json!({ "pinned": true })),
-            Some(5),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::Pin {
-                pane: Some(5),
-                group_tab: None,
-                pinned: Some(true),
-            }]
-        );
-        // group_tab 指定時は pane を補完しない（排他）
-        let (_, requests) = run(
-            call("tako_pin_preview", json!({ "group_tab": 2 })),
-            Some(5),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::Pin {
-                pane: None,
-                group_tab: Some(2),
-                pinned: None,
-            }]
-        );
-        // 両方省略 = 呼び出し元ペインでトグル
-        let (_, requests) = run(call("tako_pin_preview", json!({})), Some(5), true);
-        assert_eq!(
-            requests,
-            vec![Request::Pin {
-                pane: Some(5),
-                group_tab: None,
-                pinned: None,
-            }]
-        );
-        // pinned に不正な型を渡すとエラー
-        let (response, requests) = run(
-            call("tako_pin_preview", json!({ "pinned": "yes" })),
-            Some(5),
-            true,
-        );
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("pinned"));
-    }
-
-    #[test]
-    fn video_playbackはaction必須でペインへフォールバックする() {
-        let (_, requests) = run(
-            call("tako_video_playback", json!({ "action": "toggle" })),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::VideoPlayback {
-                pane: Some(3),
-                action: "toggle".into(),
-            }]
-        );
-        // pane 明示指定
-        let (_, requests) = run(
-            call(
-                "tako_video_playback",
-                json!({ "pane": 10, "action": "play" }),
-            ),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::VideoPlayback {
-                pane: Some(10),
-                action: "play".into(),
-            }]
-        );
-        // action 欠落はエラー
-        let (response, requests) = run(call("tako_video_playback", json!({})), Some(3), true);
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("action"));
-        // 呼び出し元なし + pane 省略もエラー
-        let (response, requests) = run(
-            call("tako_video_playback", json!({ "action": "pause" })),
-            None,
-            true,
-        );
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("pane"));
-    }
-
-    #[test]
-    fn video_seekはseconds必須でペインへフォールバックする() {
-        let (_, requests) = run(
-            call("tako_video_seek", json!({ "seconds": 42.5 })),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::VideoSeek {
-                pane: Some(3),
-                seconds: 42.5,
-            }]
-        );
-        // seconds 欠落はエラー
-        let (response, requests) = run(call("tako_video_seek", json!({})), Some(3), true);
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("seconds"));
-        // seconds に負値（スキーマでは minimum: 0 だが、f64_arg は型のみ検証。
-        // ここではパース層が通ることを確認。意味検証は dispatch 側の責務）
-        let (_, requests) = run(
-            call("tako_video_seek", json!({ "seconds": 0.0 })),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::VideoSeek {
-                pane: Some(3),
-                seconds: 0.0,
-            }]
-        );
-        // seconds に文字列を渡すとエラー
-        let (response, requests) = run(
-            call("tako_video_seek", json!({ "seconds": "ten" })),
-            Some(3),
-            true,
-        );
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("seconds"));
-    }
-
-    #[test]
-    fn video_volumeはvolume必須でペインへフォールバックする() {
-        let (_, requests) = run(
-            call("tako_video_volume", json!({ "volume": 0.5 })),
-            Some(3),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::VideoVolume {
-                pane: Some(3),
-                volume: 0.5,
-            }]
-        );
-        let (response, requests) = run(call("tako_video_volume", json!({})), Some(3), true);
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("volume"));
-    }
-
-    #[test]
-    fn video_playbackのmute_loop操作がパースできる() {
-        for action in &[
-            "mute",
-            "unmute",
-            "toggle_mute",
-            "loop_on",
-            "loop_off",
-            "toggle_loop",
-        ] {
-            let (_, requests) = run(
-                call("tako_video_playback", json!({ "action": action })),
-                Some(3),
-                true,
-            );
-            assert_eq!(
-                requests,
-                vec![Request::VideoPlayback {
-                    pane: Some(3),
-                    action: action.to_string(),
-                }]
-            );
-        }
-    }
-
-    #[test]
-    fn webはactionごとにcaller既定を使い分ける() {
-        // open: pane 省略 → caller が分割元になる
-        let (_, requests) = run(
-            call(
-                "tako_web",
-                json!({ "action": "open", "url": "http://localhost:3000" }),
-            ),
-            Some(5),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::Web {
-                action: "open".into(),
-                url: Some("http://localhost:3000".into()),
-                id: None,
-                pane: Some(5),
-                direction: None,
-                to: None,
-                js: None,
-                token: None,
-                focus: None,
-            }]
-        );
-        // navigate: pane 省略でも caller を埋めない（対象は表示中 Web ビューの自動解決）
-        let (_, requests) = run(
-            call("tako_web", json!({ "action": "navigate", "to": "reload" })),
-            Some(5),
-            true,
-        );
-        assert_eq!(
-            requests,
-            vec![Request::Web {
-                action: "navigate".into(),
-                url: None,
-                id: None,
-                pane: None,
-                direction: None,
-                to: Some("reload".into()),
-                js: None,
-                token: None,
-                focus: None,
-            }]
-        );
-        // action 欠落はエラー
-        let (response, requests) = run(call("tako_web", json!({})), Some(5), true);
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("action"));
-        // 不正な direction はエラー
-        let (response, requests) = run(
-            call(
-                "tako_web",
-                json!({ "action": "open", "url": "http://localhost:3000", "direction": "diagonal" }),
-            ),
-            Some(5),
-            true,
-        );
-        assert!(requests.is_empty());
-        assert!(response.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("direction"));
-    }
-
-    #[test]
-    fn orchestrator_spawnのpaneとtab優先順位() {
-        // pane のみ → pane が使われ tab は None
-        let (_, requests) = run(
-            call(
-                "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi", "pane": 5 , "await_launch": false }),
-            ),
-            Some(99),
-            true,
-        );
-        assert_eq!(requests.len(), 1);
-        match &requests[0] {
-            Request::OrchestratorSpawn { pane, tab, .. } => {
-                assert_eq!(*pane, Some(5));
-                assert_eq!(*tab, None);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        // tab のみ → tab が使われ pane は None（caller もフォールバックしない）
-        let (_, requests) = run(
-            call(
-                "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi", "tab": 2 , "await_launch": false }),
-            ),
-            Some(99),
-            true,
-        );
-        match &requests[0] {
-            Request::OrchestratorSpawn { pane, tab, .. } => {
-                assert_eq!(*pane, None);
-                assert_eq!(*tab, Some(2));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        // pane と tab 両方 → pane 優先、tab は None
-        let (_, requests) = run(
-            call(
-                "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi", "pane": 5, "tab": 2 , "await_launch": false }),
-            ),
-            Some(99),
-            true,
-        );
-        match &requests[0] {
-            Request::OrchestratorSpawn { pane, tab, .. } => {
-                assert_eq!(*pane, Some(5), "pane が tab より優先される");
-                assert_eq!(*tab, None, "pane 指定時は tab を無視する");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        // 両方省略、caller あり → caller がフォールバック
-        let (_, requests) = run(
-            call(
-                "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi" , "await_launch": false }),
-            ),
-            Some(42),
-            true,
-        );
-        match &requests[0] {
-            Request::OrchestratorSpawn { pane, tab, .. } => {
-                assert_eq!(*pane, Some(42), "caller へフォールバック");
-                assert_eq!(*tab, None);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        // 両方省略、caller なし → エラー
-        let (response, requests) = run(
-            call(
-                "tako_orchestrator_spawn",
-                json!({ "project": "p", "prompt": "hi" , "await_launch": false }),
-            ),
-            None,
-            true,
-        );
-        assert!(requests.is_empty());
-        let error = &response.unwrap()["error"];
-        assert!(
-            error["message"]
-                .as_str()
-                .unwrap()
-                .contains("pane または tab"),
-            "pane も tab も無い場合はエラー"
-        );
-    }
-
-    // --- HTTP トランスポート（実ポートで往復） ---
-
-    mod http {
-        use super::*;
-        use futures::channel::mpsc::unbounded;
-        use futures::StreamExt;
-        use std::io::{Read, Write};
-
-        const TOKEN: &str = "http-test-token";
-
-        /// サーバー + ダミーディスパッチャ（list に固定値を返す）を立てる
-        fn start_server() -> McpServer {
-            let (tx, mut rx) = unbounded::<IncomingRequest>();
-            let server = McpServer::start(tx, TOKEN.into()).expect("MCP サーバーを起動できる");
-            std::thread::spawn(move || {
-                while let Some(incoming) = futures::executor::block_on(rx.next()) {
-                    assert_eq!(incoming.origin, PaneOrigin::Mcp);
-                    let _ = incoming.reply.send(Ok(json!({ "tabs": [] })));
-                }
-            });
-            server
-        }
-
-        fn post(
-            url: &str,
-            auth: Option<&str>,
-            extra_headers: &[(&str, &str)],
-            body: &str,
-        ) -> (u16, String) {
-            let rest = url.strip_prefix("http://").expect("テスト URL は http");
-            let (hostport, path) = rest.split_once('/').expect("URL にパスがある");
-            let mut stream = std::net::TcpStream::connect(hostport).expect("接続できる");
-            let mut request = format!(
-                "POST /{path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
-                 Accept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
-                body.len()
-            );
-            if let Some(token) = auth {
-                request.push_str(&format!("Authorization: Bearer {token}\r\n"));
-            }
-            for (name, value) in extra_headers {
-                request.push_str(&format!("{name}: {value}\r\n"));
-            }
-            request.push_str("\r\n");
-            request.push_str(body);
-            stream.write_all(request.as_bytes()).expect("送信できる");
-            let mut response = String::new();
-            stream.read_to_string(&mut response).expect("受信できる");
-            let status = response
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .expect("ステータス行がある");
-            let body = response
-                .split_once("\r\n\r\n")
-                .map(|(_, b)| b.to_string())
-                .unwrap_or_default();
-            (status, body)
-        }
-
-        #[test]
-        fn 認証付きでツール呼び出しが往復する() {
-            let server = start_server();
-            let body = call("tako_list_panes", json!({})).to_string();
-            let (status, response) = post(server.url(), Some(TOKEN), &[], &body);
-            assert_eq!(status, 200);
-            let response: Value = serde_json::from_str(&response).unwrap();
-            assert_eq!(response["result"]["isError"], false);
-            assert!(response["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("tabs"));
-        }
-
-        #[test]
-        fn 不正トークンと不正オリジンは拒否される() {
-            let server = start_server();
-            let body = call("tako_list_panes", json!({})).to_string();
-            let (status, _) = post(server.url(), Some("bogus"), &[], &body);
-            assert_eq!(status, 401);
-            let (status, _) = post(server.url(), None, &[], &body);
-            assert_eq!(status, 401);
-            let (status, _) = post(
-                server.url(),
-                Some(TOKEN),
-                &[("Origin", "http://evil.example")],
-                &body,
-            );
-            assert_eq!(status, 403);
-        }
-
-        #[test]
-        fn tools_listはhttp経由で全カタログを返す() {
-            // 50 ツール（日本語説明文込みで数十 KB）の大きな応答が HTTP 層で
-            // 欠けずに返ることを検証する（セルフテスト項目 32 のユニット版）
-            let server = start_server();
-            let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-            let (status, response) = post(server.url(), Some(TOKEN), &[], body);
-            assert_eq!(status, 200);
-            let response: Value = serde_json::from_str(&response).unwrap();
-            assert_eq!(
-                response["result"]["tools"].as_array().unwrap().len(),
-                tools().len()
-            );
-        }
-
-        #[test]
-        fn notificationは202になる() {
-            let server = start_server();
-            let body = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-            let (status, _) = post(server.url(), Some(TOKEN), &[], &body.to_string());
-            assert_eq!(status, 202);
-        }
-
-        #[test]
-        fn 呼び出し元ペインはヘッダで申告できる() {
-            let (tx, mut rx) = unbounded::<IncomingRequest>();
-            let server = McpServer::start(tx, TOKEN.into()).unwrap();
-            std::thread::spawn(move || {
-                while let Some(incoming) = futures::executor::block_on(rx.next()) {
-                    // X-Tako-Pane がデフォルト対象として解決されている（FR-2.3.3）
-                    assert_eq!(
-                        incoming.request,
-                        Request::Close {
-                            pane: Some(42),
-                            force: false
-                        },
-                        "X-Tako-Pane が呼び出し元として使われる"
-                    );
-                    let _ = incoming.reply.send(Ok(json!({ "closed": 42 })));
-                }
-            });
-            let body = call("tako_close_pane", json!({})).to_string();
-            let (status, response) =
-                post(server.url(), Some(TOKEN), &[("X-Tako-Pane", "42")], &body);
-            assert_eq!(status, 200);
-            let response: Value = serde_json::from_str(&response).unwrap();
-            assert_eq!(response["result"]["isError"], false);
-        }
-
-        #[test]
-        fn 遅いdispatch中も並行リクエストがブロックされない() {
-            let (tx, mut rx) = unbounded::<IncomingRequest>();
-            let server = McpServer::start(tx, TOKEN.into()).unwrap();
-            // dispatch ハンドラ: 重い dispatch は別スレッドへ offload（実 app の
-            // OffloadJob と同じパターン。UI スレッドは即座に次のリクエストへ進む）
-            std::thread::spawn(move || {
-                while let Some(incoming) = futures::executor::block_on(rx.next()) {
-                    match &incoming.request {
-                        Request::Read { .. } => {
-                            std::thread::spawn(move || {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                let _ = incoming.reply.send(Ok(json!({ "slow": true })));
-                            });
-                        }
-                        _ => {
-                            let _ = incoming.reply.send(Ok(json!({ "tabs": [] })));
-                        }
-                    }
-                }
-            });
-            let url = server.url().to_string();
-            // 遅い read_pane を先に投げる
-            let url_slow = url.clone();
-            let slow = std::thread::spawn(move || {
-                let body = call("tako_read_pane", json!({"pane": 1})).to_string();
-                let start = std::time::Instant::now();
-                let (status, _) = post(&url_slow, Some(TOKEN), &[], &body);
-                (status, start.elapsed())
-            });
-            // 少し待ってから高速な list_panes を投げる
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let url_fast = url.clone();
-            let fast = std::thread::spawn(move || {
-                let body = call("tako_list_panes", json!({})).to_string();
-                let start = std::time::Instant::now();
-                let (status, _) = post(&url_fast, Some(TOKEN), &[], &body);
-                (status, start.elapsed())
-            });
-            let (slow_status, slow_elapsed) = slow.join().unwrap();
-            let (fast_status, fast_elapsed) = fast.join().unwrap();
-            assert_eq!(slow_status, 200);
-            assert_eq!(fast_status, 200);
-            // 並行化されていれば fast は slow を待たず 200ms 以内に返る
-            // （直列なら slow の 500ms 完了後にしか処理されない）
-            assert!(
-                fast_elapsed < std::time::Duration::from_millis(200),
-                "list_panes が read_pane の完了を待ってしまった（{:?}、並行化されていない）",
-                fast_elapsed,
-            );
-            assert!(slow_elapsed >= std::time::Duration::from_millis(400));
-        }
-    }
-
-    #[test]
-    fn 未知パラメータはエラーになる_spawn() {
-        let msg = call(
-            "tako_orchestrator_spawn",
-            json!({ "project": "p", "prompt": "hi", "agentt": "codex" }),
-        );
-        let (resp, _) = run(msg, Some(0), true);
-        let err = &resp.unwrap()["error"];
-        assert_eq!(err["code"], -32602);
-        let msg = err["message"].as_str().unwrap();
-        assert!(msg.contains("agentt"), "エラーに未知キー名を含む: {msg}");
-        assert!(
-            msg.contains("tako_orchestrator_spawn"),
-            "エラーにツール名を含む: {msg}"
-        );
-    }
-
-    #[test]
-    fn 未知パラメータはエラーになる_list_panes() {
-        let msg = call("tako_list_panes", json!({ "foo": "bar" }));
-        let (resp, _) = run(msg, Some(0), true);
-        let err = &resp.unwrap()["error"];
-        assert_eq!(err["code"], -32602);
-        let msg = err["message"].as_str().unwrap();
-        assert!(msg.contains("foo"), "エラーに未知キー名を含む: {msg}");
-    }
-
-    #[test]
-    fn 正規パラメータはエラーにならない_spawn() {
-        let msg = call(
-            "tako_orchestrator_spawn",
-            json!({ "project": "p", "prompt": "hi", "agent": "codex", "pane": 0 }),
-        );
-        let (resp, _) = run(msg, Some(0), true);
-        assert!(
-            resp.as_ref().unwrap().get("error").is_none(),
-            "正規パラメータでエラー: {:?}",
-            resp
-        );
-    }
-
-    // --- #723: tako_update の dry_run が MCP からも CLI と同じに叩ける ---
-
-    #[test]
-    fn tako_updateのスキーマにdry_runがある() {
-        let tool = tools()
-            .into_iter()
-            .find(|t| t["name"] == "tako_update")
-            .expect("tako_update が公開されていない");
-        let props = &tool["inputSchema"]["properties"];
-        assert_eq!(
-            props["dry_run"]["type"], "boolean",
-            "dry_run が boolean で公開されていない: {props}"
-        );
-        // additionalProperties:false なので、載せ忘れると引数ごと弾かれる
-        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
-    }
-
-    #[test]
-    fn tako_updateのdry_runがrequestまで届く() {
-        let msg = call("tako_update", json!({ "action": "apply", "dry_run": true }));
-        let (resp, seen) = run(msg, Some(0), true);
-        assert!(
-            resp.as_ref().unwrap().get("error").is_none(),
-            "dry_run つきでエラー: {resp:?}"
-        );
-        assert_eq!(
-            seen,
-            vec![Request::Update {
-                action: Some("apply".into()),
-                channel: None,
-                dry_run: Some(true),
-            }],
-            "MCP から dry_run が Request へ届いていない"
-        );
-    }
-
-    #[test]
-    fn tako_updateのdry_run省略は未指定のまま() {
-        let msg = call("tako_update", json!({ "action": "apply" }));
-        let (_, seen) = run(msg, Some(0), true);
-        assert_eq!(
-            seen,
-            vec![Request::Update {
-                action: Some("apply".into()),
-                channel: None,
-                dry_run: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn tako_updateのdry_runは真偽値以外を拒否する() {
-        let msg = call(
-            "tako_update",
-            json!({ "action": "apply", "dry_run": "yes" }),
-        );
-        let (resp, seen) = run(msg, Some(0), true);
-        // 文字列 "yes" を truthy 扱いして本物の apply が走る、が最悪の事故
-        assert!(
-            resp.as_ref().unwrap().get("error").is_some(),
-            "dry_run に文字列を渡したのに通った: {resp:?}"
-        );
-        assert!(seen.is_empty(), "不正な引数なのに Request が組み立てられた");
-    }
 }

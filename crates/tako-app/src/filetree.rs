@@ -54,6 +54,12 @@ pub struct FileTree {
     git_cache: HashMap<PathBuf, GitChange>,
     /// rows() の結果キャッシュ（状態変化時に無効化し、render での再構築を回避する）
     rows_cache: Option<Vec<Row>>,
+    /// ドット始まりの項目を表示するか（#550。既定 false）。
+    /// キャッシュには全項目を保持し、表示時にだけ絞るので切替は即時に効く。
+    /// なお VSCode / Zed の既定は `.git` 等の個別除外リストで、ドット全体は隠さない
+    /// （実機で確認済み）。tako はホームを開いた初回印象が壊れるのを優先して
+    /// ドット全体を既定で隠し、ワンクリックで戻せる形にしている
+    show_hidden: bool,
 }
 
 impl FileTree {
@@ -61,8 +67,28 @@ impl FileTree {
         &self.roots
     }
 
+    /// ドット始まり項目の表示状態（#550）
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    /// ドット始まり項目の表示切替（#550）。変化があれば true（再描画判断用）
+    pub fn set_show_hidden(&mut self, show: bool) -> bool {
+        if self.show_hidden == show {
+            return false;
+        }
+        self.show_hidden = show;
+        self.rows_cache = None;
+        true
+    }
+
     /// ワークスペースフォルダ列の同期（FR-3.1。呼び出し側がタブ内ペインの cwd を集める）。
-    /// 重複は除き、既存ルートの展開状態は維持する。変化があれば true（再描画判断用）
+    /// 重複は除き、既存ルートの展開状態は維持する。変化があれば true（再描画判断用）。
+    ///
+    /// #550: **新しく増えたルートは自動展開したうえで先頭へ出す**。ホーム 1 本で始まった
+    /// ツリーにペインの `cd` 由来ルートが足されたとき、末尾に積むと 100 行以上下へ埋もれて
+    /// 見出しだけが切り替わったように見えるため。既存ルートの並びは維持するので、
+    /// 同じ集合で再同期しても順序は暴れない（呼び出し側はポーリングで毎秒叩く）
     pub fn set_roots(&mut self, roots: Vec<PathBuf>) -> bool {
         let mut deduped: Vec<PathBuf> = Vec::new();
         for root in roots {
@@ -70,17 +96,24 @@ impl FileTree {
                 deduped.push(root);
             }
         }
-        if self.roots == deduped {
+        // 新規ルートを先頭、既存ルートは現在の表示順のまま後ろへ
+        let mut ordered: Vec<PathBuf> = deduped
+            .iter()
+            .filter(|r| !self.roots.contains(r))
+            .cloned()
+            .collect();
+        ordered.extend(self.roots.iter().filter(|r| deduped.contains(r)).cloned());
+        if self.roots == ordered {
             return false;
         }
         // 消えたルートの状態は畳む（配下の展開・キャッシュは refresh が掃除する）
         for old in &self.roots {
-            if !deduped.contains(old) {
+            if !ordered.contains(old) {
                 self.expanded.remove(old);
                 self.cache.remove(old);
             }
         }
-        for root in &deduped {
+        for root in &ordered {
             if !self.roots.contains(root) {
                 self.expanded.insert(root.clone());
                 self.cache
@@ -88,7 +121,7 @@ impl FileTree {
                     .or_insert_with(|| read_dir_sorted(root));
             }
         }
-        self.roots = deduped;
+        self.roots = ordered;
         self.rows_cache = None;
         true
     }
@@ -171,6 +204,11 @@ impl FileTree {
             return;
         };
         for entry in entries {
+            // #550: ドット始まりは既定で隠す（ルート見出しは対象外 = ユーザーが
+            // 明示的に開いた `~/.claude` 等は隠さない）
+            if !self.show_hidden && is_hidden_name(&entry.name) {
+                continue;
+            }
             let expanded = entry.is_dir && self.expanded.contains(&entry.path);
             let git_status = self.git_cache.get(&entry.path).copied();
             rows.push(Row {
@@ -183,6 +221,20 @@ impl FileTree {
             if expanded {
                 self.collect_rows(&entry.path, depth + 1, rows);
             }
+        }
+    }
+
+    /// 1 ディレクトリだけ即座に読み直す（#559。新規作成・リネームの直後に呼び、
+    /// 2 秒ポーリングを待たずに結果を見せる）。ディレクトリ 1 個の read_dir なので
+    /// UI スレッドで同期に呼んでよい（`expand_dir` と同じ扱い）
+    pub fn refresh_dir(&mut self, dir: &Path) {
+        if !self.cache.contains_key(dir) && !self.roots.iter().any(|r| r == dir) {
+            return;
+        }
+        let fresh = read_dir_sorted(dir);
+        if self.cache.get(dir) != Some(&fresh) {
+            self.cache.insert(dir.to_path_buf(), fresh);
+            self.rows_cache = None;
         }
     }
 
@@ -287,6 +339,12 @@ pub fn scan_git_status(roots: &[PathBuf]) -> HashMap<PathBuf, GitChange> {
     result
 }
 
+/// 隠し項目の判定（#550）。Unix 慣習のドット始まりのみ（Windows の隠し属性は
+/// 境界 B1 側の関心事なのでここでは扱わない）
+pub fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.')
+}
+
 /// ディレクトリを読んで「ディレクトリ先・名前（大文字小文字無視）順」に並べる。
 /// 読めない場合は空（権限・消滅は正常系として無害に劣化）
 fn read_dir_sorted(path: &Path) -> Vec<Entry> {
@@ -318,10 +376,21 @@ fn read_dir_sorted(path: &Path) -> Vec<Entry> {
 mod tests {
     use super::*;
 
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実ディレクトリを消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn fixture(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("tako-filetree-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_temp_dir(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("docs")).unwrap();
         std::fs::write(dir.join("README.md"), "x").unwrap();
@@ -354,7 +423,7 @@ mod tests {
                 ("README.md".to_string(), 1, false),
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_temp_dir(&dir);
     }
 
     #[test]
@@ -377,7 +446,7 @@ mod tests {
         // ルートが減っても残りの展開状態は維持される
         assert!(tree.set_roots(vec![dir.join("docs")]));
         assert_eq!(names(&mut tree).len(), 1, "docs は空ディレクトリ");
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_temp_dir(&dir);
     }
 
     #[test]
@@ -392,7 +461,7 @@ mod tests {
         assert!(rows.iter().any(|r| r.entry.name == "src" && r.expanded));
         tree.toggle_dir(&dir.join("src"));
         assert!(!tree.rows().iter().any(|r| r.entry.name == "main.rs"));
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_temp_dir(&dir);
     }
 
     #[test]
@@ -412,7 +481,7 @@ mod tests {
             .rows()
             .iter()
             .any(|r| r.entry.name == "docs" && r.expanded));
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_temp_dir(&dir);
     }
 
     /// 性能計測（通常テストでは走らせない）: `cargo test -p tako-app --release -- --ignored --nocapture perf_`
@@ -422,7 +491,7 @@ mod tests {
         use std::time::Instant;
         // 合成: 5000 ファイルの大ディレクトリ（node_modules / target 相当）
         let big = std::env::temp_dir().join(format!("tako-filetree-perf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&big);
+        remove_temp_dir(&big);
         std::fs::create_dir_all(&big).unwrap();
         for i in 0..5000 {
             std::fs::write(big.join(format!("file-{i:05}.txt")), "x").unwrap();
@@ -456,7 +525,72 @@ mod tests {
         let t2 = Instant::now();
         let rows = tree.rows();
         eprintln!("[perf] rows(): {:?}（{} 行）", t2.elapsed(), rows.len());
-        let _ = std::fs::remove_dir_all(&big);
+        remove_temp_dir(&big);
+    }
+
+    /// #550: ドット始まりは既定で隠れ、トグルで出る。ルート見出し自身は隠さない
+    #[test]
+    fn ドット始まりは既定で隠れトグルで出る() {
+        let dir = fixture("t5");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".env"), "x").unwrap();
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        assert!(!tree.show_hidden(), "既定は非表示");
+        let visible: Vec<String> = tree.rows().iter().map(|r| r.entry.name.clone()).collect();
+        assert!(!visible.iter().any(|n| n == ".git"));
+        assert!(!visible.iter().any(|n| n == ".env"));
+        assert!(visible.iter().any(|n| n == "README.md"));
+
+        assert!(tree.set_show_hidden(true));
+        assert!(!tree.set_show_hidden(true), "同値なら変化なし");
+        let visible: Vec<String> = tree.rows().iter().map(|r| r.entry.name.clone()).collect();
+        assert!(visible.iter().any(|n| n == ".git"));
+        assert!(visible.iter().any(|n| n == ".env"));
+
+        // ルート見出しがドットディレクトリでも隠さない（明示的に開いたフォルダ）
+        tree.set_show_hidden(false);
+        tree.set_roots(vec![dir.join(".git")]);
+        let rows = tree.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].root && rows[0].entry.name == ".git");
+        remove_temp_dir(&dir);
+    }
+
+    /// #550: 増えたルートは自動展開のうえ先頭へ。同じ集合の再同期で順序は暴れない
+    #[test]
+    fn 新しいルートは先頭に出て順序は安定する() {
+        let dir = fixture("t6");
+        let home = dir.join("docs");
+        let project = dir.join("src");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![home.clone()]);
+        assert_eq!(tree.roots(), std::slice::from_ref(&home));
+
+        // ペインが cd して project が増える → 先頭へ
+        assert!(tree.set_roots(vec![home.clone(), project.clone()]));
+        assert_eq!(tree.roots(), &[project.clone(), home.clone()]);
+        // 自動展開されているので中身が見える
+        assert!(tree.rows().iter().any(|r| r.entry.name == "main.rs"));
+        // 同じ集合をポーリングで再同期しても並びは変わらない
+        assert!(!tree.set_roots(vec![home.clone(), project.clone()]));
+        assert_eq!(tree.roots(), &[project, home]);
+        remove_temp_dir(&dir);
+    }
+
+    /// #559: 新規作成の直後に該当ディレクトリだけ読み直せる
+    #[test]
+    fn refresh_dirは対象ディレクトリだけ読み直す() {
+        let dir = fixture("t7");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        std::fs::write(dir.join("created.txt"), "x").unwrap();
+        assert!(!tree.rows().iter().any(|r| r.entry.name == "created.txt"));
+        tree.refresh_dir(&dir);
+        assert!(tree.rows().iter().any(|r| r.entry.name == "created.txt"));
+        // 未知のディレクトリは無視（キャッシュを作らない）
+        tree.refresh_dir(Path::new("/no/such/dir"));
+        remove_temp_dir(&dir);
     }
 
     #[test]

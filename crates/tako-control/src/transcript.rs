@@ -6,13 +6,17 @@
 //! 既定の `~/.claude` だけでなく登録済みアカウントの分も走査する（Issue #652）。
 //!
 //! 正規化の方針:
-//! - `type: "user"`（本文が文字列のもの）と `type: "assistant"` だけを拾う。
+//! - `type: "user"` と `type: "assistant"` だけを拾う。
 //!   tool_result だけの user 行・system / attachment / ai-title 等の補助行・
 //!   サブエージェントの会話（isSidechain）はスキップする
 //! - assistant の 1 応答は複数 JSONL 行に分かれる（thinking 行 / tool_use 行 /
 //!   text 行）ため、同一 `requestId` の行を 1 エントリへ統合する
 //! - thinking は折りたたみ表示用に `thinking` フィールドへ分離、ツール使用は
 //!   `tools: [{name, summary}]` のサマリにする
+//! - **user 行の中身は「本物の発話」と「システムが差し込んだ内容」に分類する**
+//!   （Issue #715。[`classify_user_content`]）。claude は画像添付のメタテキスト・
+//!   `<task-notification>` 等の XML を user 発話と同じ形で transcript に書くため、
+//!   素通しするとチャット UI に生 XML が並ぶ
 
 use std::collections::VecDeque;
 use std::io::BufRead;
@@ -22,6 +26,9 @@ use serde_json::{json, Value};
 
 /// ツールサマリ・テキスト切り詰めの最大文字数
 const SUMMARY_MAX_CHARS: usize = 120;
+
+/// システム通知の要約に使う最大文字数（薄い 1 行に収まる範囲）
+const NOTICE_SUMMARY_MAX_CHARS: usize = 100;
 
 /// session_id の形式検証（UUID 想定: 英数とハイフンのみ）。
 /// パストラバーサル防止のため、これ以外の文字を含む ID は拒否する
@@ -33,10 +40,8 @@ pub fn is_valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// transcript の所在（Issue #652）。**どの claude config ディレクトリに属するか**まで返す。
-///
+/// transcript の所在（Issue #652）。どの claude config ディレクトリに属するかまで返す。
 /// resume はその config ディレクトリで実行しないと会話を見つけられない
-/// （実測: 別 config dir から叩くと `No conversation found with session ID`）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLocation {
     /// `<config dir>/projects/<プロジェクトスラグ>/<session-id>.jsonl`
@@ -47,7 +52,7 @@ pub struct TranscriptLocation {
     pub is_default: bool,
 }
 
-/// パス比較用の正規化（`a/./b` や末尾区切りの表記ゆれを吸収する。
+/// パス比較用の正規化（`a/./b` や末尾スラッシュの表記ゆれを吸収する。
 /// 存在しないパスも比較できるよう canonicalize には頼らない）
 fn normalize(path: &Path) -> PathBuf {
     path.components().collect()
@@ -62,66 +67,35 @@ fn push_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
 
 /// transcript を探す claude config ディレクトリの一覧（先頭が既定 `~/.claude`）。
 ///
-/// `~/.claude` **だけ**を見ていると、config ディレクトリを分けているセッションの
-/// transcript が 1 件も見つからない（#662 の隔離 E2E で実測）。claude は config
-/// ディレクトリ配下へ transcript を書くので、候補は 3 系統ある:
+/// claude は会話を `<config dir>/projects/` 配下へ保存するため、`CLAUDE_CONFIG_DIR` を
+/// 使うアカウント（#504 / #512）の会話は既定ディレクトリには存在しない。既定だけを見ると
+/// 別アカウントのペインは「会話が無い」と判定され resume されない（Issue #652 の根因）。
 ///
-/// 1. 既定の `~/.claude`（`home_dir` は Windows の `USERPROFILE` も見る）
-/// 2. `CLAUDE_CONFIG_DIR` 環境変数（アカウント env つきのペインから GUI を起動すると
-///    tako 自身のプロセスに紛れ込む。#571）
-/// 3. **アカウント登録された config ディレクトリ**（#504）。`agent_scan_targets` は
-///    これらも `claude agents --json` の走査先にしているので、session_id は解決できるのに
-///    transcript だけ引けない、という食い違いが起きていた
-///
-/// 既定を先頭に置くのは、同じ ID がたまたま複数 config dir にあるときへ
-/// 「素の環境」側を優先させるため（`agent_scan_targets` と同じ考え方）。
-///
-/// transcript を第一ソースにする機能（対話ダイアログの内容取得 #662 /
-/// report --messages #364 / sessions #112 / remote の会話表示 / 復元時の resume #652）が
-/// 全部ここを通る
+/// 走査順: 既定 → tako 自身のプロセス env の `CLAUDE_CONFIG_DIR`（アカウント env つきの
+/// ペインから GUI を起動すると紛れ込む。#571）→ accounts.yaml の `config_dir`。
+/// 同じ場所を指すものは重複排除する
 pub fn claude_config_dirs() -> Vec<PathBuf> {
-    let env_dir = std::env::var(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
-        .ok()
-        .filter(|d| !d.trim().is_empty())
-        .map(|d| crate::orchestrator::expand_tilde(&d));
-    let accounts = crate::orchestrator::AccountsConfig::load()
-        .map(|a| {
-            a.list_resolved()
-                .into_iter()
-                // 壊れたエントリと inherit（既定 config dir を使う）は走査先を増やさない。
-                // 既定 config dir は config_dirs_from が先頭に置く
-                .filter_map(|(_, resolved)| resolved.ok()?.config_dir.path().map(str::to_string))
-                .filter(|d| !d.trim().is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    config_dirs_from(
-        crate::orchestrator::claude_default_config_dir(),
-        env_dir,
-        accounts,
-    )
-}
-
-/// 走査順の組み立てだけを行う純関数（環境を読まないのでテストが決定的になる）。
-///
-/// **環境を読むのは呼び出し側 1 箇所に閉じる**。同一プロセスの別テストが `HOME` を
-/// 書き換えるため（`read_messagesは実ファイルを読める` 等）、この関数の中で環境を
-/// 2 回読むと「候補の先頭」と「既定」が別の HOME 由来になり得て、
-/// 並行実行でだけ落ちるテストになる（#652 の CI で実際に発生）
-fn config_dirs_from(
-    default: Option<PathBuf>,
-    env_dir: Option<String>,
-    account_dirs: Vec<String>,
-) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(default) = default {
+    let mut dirs = Vec::new();
+    if let Some(default) = crate::orchestrator::claude_default_config_dir() {
         push_dir(&mut dirs, default);
     }
-    if let Some(dir) = env_dir {
-        push_dir(&mut dirs, PathBuf::from(dir));
+    if let Some(env) = std::env::var_os(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV) {
+        let value = env.to_string_lossy().to_string();
+        if !value.trim().is_empty() {
+            push_dir(
+                &mut dirs,
+                PathBuf::from(crate::orchestrator::expand_tilde(&value)),
+            );
+        }
     }
-    for dir in account_dirs {
-        push_dir(&mut dirs, PathBuf::from(dir));
+    if let Ok(accounts) = crate::orchestrator::AccountsConfig::load() {
+        for (_, resolved) in accounts.list_resolved() {
+            let Ok(account) = resolved else { continue };
+            let Some(path) = account.config_dir.path() else {
+                continue; // inherit = 既定。先頭で走査済み
+            };
+            push_dir(&mut dirs, PathBuf::from(path));
+        }
     }
     dirs
 }
@@ -170,13 +144,9 @@ pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
 ///
 /// claude は `CLAUDE_CONFIG_DIR` で会話の保存先が変わるため、resume は**その会話が
 /// 保存されている config ディレクトリ**で実行しないと
-/// `No conversation found with session ID` で失敗する（Windows 実機で before/after 実測）。
-/// tako 自身のプロセス env・ペインの rc・direnv が別の値を持っていても勝てるよう、
-/// 代入 / 未設定化を明示する（#500 / #512 と同型）。
-///
-/// シェル方言（unix: POSIX sh / windows: PowerShell）の差は `agent` の
-/// ペインシェル部品が吸収する。**ここで `export` / `unset` を直書きしてはいけない**
-/// （PowerShell のペインへ POSIX 構文を流すと構文エラーで resume ごと落ちる）
+/// `No conversation found with session ID` で失敗する。tako 自身のプロセス env や
+/// ログインシェルの rc / direnv が別の値を持っていても勝てるよう、
+/// `export` / `unset` を明示する（#500 / #512 と同型）
 pub fn resume_env_prefix_for(location: &TranscriptLocation) -> String {
     let key = crate::orchestrator::CLAUDE_CONFIG_DIR_ENV;
     if location.is_default {
@@ -211,6 +181,30 @@ pub fn read_messages(session_id: &str, tail: usize) -> Result<Value, String> {
     }))
 }
 
+/// **所在が分かっている** transcript の末尾 `tail` 件を正規化して返す（#702）。
+///
+/// [`read_messages`] は毎回 config ディレクトリを走査して所在を探すが、GUI モードの
+/// チャットビューは 2 秒ごとに同じファイルを見るので、解決済みのパスを使い回して
+/// `read_dir` を省く（同時に「更新の有無」を mtime で判断する呼び出し側の前提とも合う）
+pub fn read_messages_at(path: &Path, tail: usize) -> Result<Vec<Value>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("transcript を開けない: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+    Ok(normalize_lines(reader.lines().map_while(Result::ok), tail))
+}
+
+/// システム通知エントリ（`role: "system"`。#715）を落とした複製を返す。
+///
+/// リモート PWA のチャットは role が `user` 以外を全てエージェント発話として描くので、
+/// 通知を渡すと「AI が言った」ように見える。PWA 側の描画には手を入れない方針
+/// （#716 のスコープ外）なので、配る手前で落とす。生 XML が消える #715 の効果は
+/// 正規化層の分類だけで得られており、通知の可視化は GUI モード側の役割
+pub fn without_system_notices(mut value: Value) -> Value {
+    if let Some(messages) = value["messages"].as_array_mut() {
+        messages.retain(|m| m["role"] != "system");
+    }
+    value
+}
+
 /// 会話の最初のユーザー発話を返す（`max_chars` で切り詰め）。
 /// セッションカタログ（Issue #112）の `show` 用。ファイルは先頭から
 /// ストリーム読みして最初の該当行で打ち切るため、巨大 transcript でも軽い
@@ -228,7 +222,9 @@ pub fn first_user_text(session_id: &str, max_chars: usize) -> Option<String> {
         if obj["type"].as_str() != Some("user") {
             continue;
         }
-        let Some(text) = obj["message"]["content"].as_str() else {
+        // #715: 画像メタ・システム XML を会話の見出しにしない（分類は正規化と共通）
+        let UserContent::Speech { text, .. } = classify_user_content(&obj["message"]["content"])
+        else {
             continue;
         };
         let trimmed = text.trim();
@@ -238,6 +234,283 @@ pub fn first_user_text(session_id: &str, max_chars: usize) -> Option<String> {
         return Some(truncate_chars(trimmed, max_chars));
     }
     None
+}
+
+// ─────────────── user 行の内容分類（Issue #715） ───────────────
+
+/// claude が user 行として書くが**会話ではない**内容を囲む XML タグ。
+///
+/// 実 transcript 3409 本の user 本文を全数走査して確定した一覧
+/// （`<task-notification>` = Monitor 等の自動通知 2068 件、`<local-command-caveat>` =
+/// スラッシュコマンドの前置定型文 84 件、`<local-command-*>` / `<bash-std*>` =
+/// コマンドの実行結果、`<system-reminder>` = ツール結果に添えられる注意書き）
+const SYSTEM_BLOCK_TAGS: &[&str] = &[
+    "task-notification",
+    "system-reminder",
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-stdout",
+    "bash-stderr",
+];
+
+/// スラッシュコマンド実行時に前置される定型文（タグに包まれていない古い形式のため、
+/// 本文一致でも落とす）
+const LOCAL_COMMAND_CAVEAT_HEAD: &str =
+    "Caveat: The messages below were generated by the user while running local commands.";
+
+/// user 行の中身の分類結果（[`classify_user_content`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserContent {
+    /// 本物のユーザー発話。`images` は添付画像の枚数（本文が空でも枚数があれば表示する）
+    Speech { text: String, images: usize },
+    /// システムが差し込んだ通知。`summary` は**生 XML を含まない** 1 行の要約で、
+    /// 必ず非空（伝える中身が無い通知は [`UserContent::Skip`] になる）。
+    /// 「システム通知」等のラベルは表示側が i18n で付ける
+    Notice { summary: String },
+    /// 表示するものが無い（tool_result だけの行・空行）
+    Skip,
+}
+
+/// user 行の `message.content` を分類する（Issue #715 の中核。純関数）。
+///
+/// content は claude の版によって**文字列と配列の両方**があり、配列には
+/// `text` / `image` / `tool_result` ブロックが混ざる。旧実装は文字列だけを拾っていたため
+/// ①配列形式の発話（画像を添えた質問など）が丸ごと消える ②文字列形式の
+/// 画像メタ・システム XML が生のまま user 発話として表示される、の 2 つが同時に起きていた。
+pub fn classify_user_content(content: &Value) -> UserContent {
+    match content {
+        Value::String(text) => classify_user_text(text, 0),
+        Value::Array(blocks) => {
+            // tool_result はツールの出力（会話ではない）。従来どおり行ごと落とす
+            if blocks
+                .iter()
+                .any(|b| b["type"].as_str() == Some("tool_result"))
+            {
+                return UserContent::Skip;
+            }
+            let mut text = String::new();
+            let mut images = 0usize;
+            for block in blocks {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(t) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                    Some("image") => images += 1,
+                    _ => {}
+                }
+            }
+            classify_user_text(&text, images)
+        }
+        _ => UserContent::Skip,
+    }
+}
+
+/// テキスト本文の分類。`block_images` は content 配列から数えた実画像ブロック数
+fn classify_user_text(text: &str, block_images: usize) -> UserContent {
+    // ① システム XML ブロックを**どこにあっても**取り除く。
+    //    `<system-reminder>` は本物の発話の後ろに付くことがあるので、
+    //    「先頭がタグなら通知」ではなく「取り除いた残りが空なら通知」で判定する
+    let mut notices: Vec<(&str, String)> = Vec::new();
+    let mut rest = text.to_string();
+    for tag in SYSTEM_BLOCK_TAGS {
+        rest = strip_tagged_blocks(&rest, tag, &mut notices);
+    }
+    // ② スラッシュコマンドの前置定型文
+    let had_caveat = rest.contains(LOCAL_COMMAND_CAVEAT_HEAD);
+    if had_caveat {
+        rest = strip_caveat(&rest);
+    }
+    // ③ 画像添付のメタテキスト（`[Image: original WxH, ...]` / `[Image #1]`）
+    let (rest, meta_images) = strip_image_markers(&rest);
+    let images = block_images.max(meta_images);
+    // ④ スラッシュコマンド / bash モードの行は「ユーザーが打ったコマンド」として見せる
+    if let Some(command) = user_command_label(&rest) {
+        return UserContent::Speech {
+            text: command,
+            images,
+        };
+    }
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        return UserContent::Speech {
+            text: rest.to_string(),
+            images,
+        };
+    }
+    if images > 0 {
+        // 画像だけの発話（貼り付けただけ）。プレースホルダを出すため Speech で返す
+        return UserContent::Speech {
+            text: String::new(),
+            images,
+        };
+    }
+    // 伝える中身のある通知だけを残す（定型文だけの行は薄い 1 行すら出さない）
+    for (_, inner) in notices {
+        let summary = notice_summary(&inner);
+        if !summary.is_empty() {
+            return UserContent::Notice { summary };
+        }
+    }
+    UserContent::Skip
+}
+
+/// `<tag>…</tag>` を全て取り除き、中身を `found` へ push する。
+///
+/// 閉じタグが無い（切り詰められた行など）ときは**開きタグ以降を全部捨てる**。
+/// 「残せるところまで残す」より、生 XML の断片を絶対に表示させないことを優先する
+fn strip_tagged_blocks<'a>(text: &str, tag: &'a str, found: &mut Vec<(&'a str, String)>) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(&open) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + open.len()..];
+        match after_open.find(&close) {
+            Some(end) => {
+                found.push((tag, after_open[..end].to_string()));
+                rest = &after_open[end + close.len()..];
+            }
+            None => {
+                found.push((tag, after_open.to_string()));
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// スラッシュコマンドの前置定型文（`Caveat: …`）をその段落ごと取り除く
+fn strip_caveat(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("Caveat:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 画像添付のメタテキストを取り除き、(残り, 見つけた枚数) を返す。
+///
+/// claude は画像を貼ると `[Image: original 3024x1964, displayed at ...]` という
+/// **座標変換の説明文**を user 発話として書く（実 transcript で 111 件観測）。
+/// 本文中の参照 `[Image #1]` も表示上は不要なので落とす
+fn strip_image_markers(text: &str) -> (String, usize) {
+    let mut images = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut remaining = line;
+        let mut kept = String::new();
+        // 1 行に複数のマーカーが並ぶことがある（`[Image #1] [Image #2] 比べて`）
+        while let Some(start) = remaining.find("[Image") {
+            let after = &remaining[start..];
+            match after.find(']') {
+                Some(end) => {
+                    kept.push_str(&remaining[..start]);
+                    images += 1;
+                    remaining = &after[end + 1..];
+                }
+                // 閉じ括弧が無い = マーカーではない普通の本文
+                None => break,
+            }
+        }
+        kept.push_str(remaining);
+        let trimmed = kept.trim();
+        // マーカーだけの行は行ごと落とす（空行が残ると吹き出しが間延びする）
+        if !trimmed.is_empty() {
+            out.push(kept);
+        }
+    }
+    (out.join("\n"), images)
+}
+
+/// ユーザーが打ったコマンドの行を 1 行の発話へ直す。該当しなければ None。
+///
+/// - `<command-name>/model</command-name>` + `<command-args>…</command-args>`
+///   = スラッシュコマンド → `/model …`
+/// - `<bash-input>cmd</bash-input>` = claude の bash モード（`!` 始まり）→ `! cmd`
+///
+/// どちらも**ユーザーの操作そのもの**なので、通知として隠すのではなく発話として見せる
+fn user_command_label(text: &str) -> Option<String> {
+    if let Some(name) = inner_text(text, "command-name") {
+        let name = name.trim();
+        if !name.is_empty() {
+            let args = inner_text(text, "command-args")
+                .map(|a| a.trim().to_string())
+                .unwrap_or_default();
+            return Some(if args.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} {args}")
+            });
+        }
+    }
+    let bash = inner_text(text, "bash-input")?;
+    let bash = bash.trim();
+    (!bash.is_empty()).then(|| format!("! {bash}"))
+}
+
+/// `<tag>…</tag>` の中身（最初の 1 個。閉じタグが無ければ None）
+fn inner_text(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].to_string())
+}
+
+/// `<tag>` 以降の中身（閉じタグが無ければ末尾まで）。
+/// 切り詰められた通知からも要約を拾うための緩い版。**要約用にだけ使う**
+/// （スラッシュコマンド名のような「意味が変わる」抽出には使わない）
+fn inner_text_lossy(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..]
+        .find(&close)
+        .map(|e| e + start)
+        .unwrap_or(text.len());
+    Some(text[start..end].to_string())
+}
+
+/// システム通知の 1 行要約。`<summary>` があればそれを使い、無ければ
+/// 中身の最初の意味のある行を取る。**残った山括弧は落とす**（生 XML を出さない）
+fn notice_summary(inner: &str) -> String {
+    // 定型文（`Caveat: …`）は「中身」に数えない。これだけの通知は何も伝えないので
+    // 呼び出し側で Skip になる
+    let inner = strip_caveat(inner);
+    let candidate = inner_text_lossy(&inner, "summary")
+        .map(|s| strip_all_tags(&s).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            strip_all_tags(&inner)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    truncate_chars(&candidate, NOTICE_SUMMARY_MAX_CHARS)
+}
+
+/// 残存する `<…>` を落とす（要約に生 XML を混ぜないための最後の関所）
+fn strip_all_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// JSONL の行イテレータを正規化メッセージ列（末尾 tail 件）へ変換する。
@@ -257,18 +530,100 @@ pub fn normalize_lines(lines: impl Iterator<Item = String>, tail: usize) -> Vec<
             continue;
         }
         match obj["type"].as_str() {
-            Some("user") => {
-                // 本文が文字列の行だけがユーザー発話。配列は tool_result（スキップ）
-                let Some(text) = obj["message"]["content"].as_str() else {
-                    continue;
-                };
-                if text.trim().is_empty() {
-                    continue;
+            // #737: 生成中に打たれた指示は claude のキューへ入り、その時点で
+            // `queue-operation` 行として記録される。**本物の user 行になるのは
+            // 配送された後**（長いターンでは数分後）で、ターン内へ差し込まれた場合は
+            // 一生 user 行にならない。ここを読まないと「busy 中に送った発話が
+            // 吹き出しとして出ない」（実測で確定した #737 追加要件 5 の根因）
+            Some("queue-operation") => {
+                match obj["operation"].as_str() {
+                    // content を持つのは enqueue だけ（実 transcript 3416 本で
+                    // enqueue 6555 件が全件 content つき）
+                    Some("enqueue") => {
+                        // 中身は user 行と同じ分類にかける。`<task-notification>` 等の
+                        // システム注入がキューに入ることもあるため（実測 1760 件）、
+                        // 通し方を user 行と揃えないと生 XML が吹き出しになる。
+                        // 通知は本物の user 行として後から必ず来るのでここでは出さない
+                        let UserContent::Speech { text, images } =
+                            classify_user_content(&obj["content"])
+                        else {
+                            continue;
+                        };
+                        // `queued` = 表示用の「送信待ち」印（キューから出たら消える）。
+                        // `from_queue` = 本物の user 行と突き合わせるための印
+                        // （配送のされ方が 2 通りあるので、表示状態とは別に持つ）
+                        let mut entry = json!({
+                            "role": "user", "text": text,
+                            "queued": true, "from_queue": true,
+                        });
+                        if images > 0 {
+                            entry["attachments"] = json!(vec![json!({ "kind": "image" }); images]);
+                        }
+                        if let Some(ts) = obj["timestamp"].as_str() {
+                            entry["timestamp"] = json!(ts);
+                        }
+                        out.push_back(entry);
+                        last_request_id = None;
+                        if out.len() > tail {
+                            out.pop_front();
+                        }
+                    }
+                    // キューから出た = 送信された。どのメッセージかは content が
+                    // 無い（dequeue）ので特定できないため、FIFO で最も古い
+                    // 「送信待ち」の印を落とす
+                    Some("dequeue") | Some("remove") | Some("popAll") => {
+                        if let Some(entry) = out.iter_mut().find(|e| e["queued"] == json!(true)) {
+                            entry["queued"] = json!(false);
+                        }
+                    }
+                    _ => {}
                 }
-                let mut entry = json!({
-                    "role": "user",
-                    "text": text,
-                });
+            }
+            Some("user") => {
+                // #715: 本物の発話 / システム注入 / 表示なし を分類する
+                let mut entry = match classify_user_content(&obj["message"]["content"]) {
+                    UserContent::Skip => continue,
+                    UserContent::Speech { text, images } => {
+                        // #737: キュー経由で既に出してある発話が配送されてきた。
+                        // 同じ本文を 2 回並べない（1 対 1 で消費するので、同じ文面を
+                        // 2 回送った場合はきちんと 2 個出る）。**まだ手元に残っている
+                        // ものだけ**を対象にするので、tail から押し出された後に
+                        // 本物が来ても取り違えて消すことはない
+                        if let Some(queued) = out
+                            .iter_mut()
+                            .find(|e| e["from_queue"] == json!(true) && e["text"] == json!(&text))
+                        {
+                            queued["from_queue"] = json!(false);
+                            queued["queued"] = json!(false);
+                            if let Some(ts) = obj["timestamp"].as_str() {
+                                queued["timestamp"] = json!(ts);
+                            }
+                            last_request_id = None;
+                            continue;
+                        }
+                        let mut entry = json!({ "role": "user", "text": text });
+                        if images > 0 {
+                            entry["attachments"] = json!(vec![json!({ "kind": "image" }); images]);
+                        }
+                        entry
+                    }
+                    UserContent::Notice { summary } => {
+                        // 連続するシステム通知は 1 エントリへまとめる（Monitor の通知が
+                        // 何十件も続くと、tail の枠を食い潰して会話が見えなくなる）
+                        if let Some(prev) = out.back_mut() {
+                            if prev["kind"] == "notice" {
+                                let count = prev["count"].as_u64().unwrap_or(1) + 1;
+                                prev["count"] = json!(count);
+                                if !summary.is_empty() {
+                                    prev["text"] = json!(summary);
+                                }
+                                last_request_id = None;
+                                continue;
+                            }
+                        }
+                        json!({ "role": "system", "kind": "notice", "text": summary, "count": 1 })
+                    }
+                };
                 if let Some(ts) = obj["timestamp"].as_str() {
                     entry["timestamp"] = json!(ts);
                 }
@@ -530,56 +885,6 @@ mod tests {
             .into_iter()
     }
 
-    /// #662: config ディレクトリを分けているセッションの transcript を取りこぼさない。
-    ///
-    /// 環境変数やアカウント設定を書き換えるテストは並行実行で干渉するため、
-    /// 実環境から組み立てた候補の**不変条件**だけを検証する
-    /// 実環境から組み立てた候補の**環境に依存しない不変条件**だけを見る。
-    /// 順序の検証は `config_dirs_from` の決定的なテストが受け持つ
-    /// （同一プロセスの別テストが `HOME` を書き換えるため、ここで順序を見ると
-    /// 並行実行でだけ落ちる）
-    #[test]
-    fn transcriptの探索先は候補を重複なく並べる() {
-        let dirs = claude_config_dirs();
-        assert!(!dirs.is_empty(), "探索先が空");
-        // 重複が無い（同じディレクトリを 2 度 read_dir しない）
-        let mut sorted = dirs.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), dirs.len(), "探索先に重複がある: {dirs:?}");
-    }
-
-    /// 走査順そのものの検証（純関数なので環境に左右されない）。
-    /// 既定を先頭に置くのは、同じ ID がたまたま複数 config dir にあるとき
-    /// 「素の環境」側を優先するため（`agent_scan_targets` と同じ考え方）
-    #[test]
-    fn 探索先は既定を先頭に置き重複を畳む() {
-        let default = PathBuf::from("/home/u/.claude");
-        let dirs = config_dirs_from(
-            Some(default.clone()),
-            Some("/home/u/.claude-env".into()),
-            vec![
-                "/home/u/.claude-account".into(),
-                "/home/u/.claude-env".into(), // env と重複
-                "/home/u/.claude".into(),     // 既定と重複
-            ],
-        );
-        assert_eq!(
-            dirs,
-            vec![
-                normalize(&default),
-                PathBuf::from("/home/u/.claude-env"),
-                PathBuf::from("/home/u/.claude-account"),
-            ],
-            "既定 → env → アカウント の順で重複なく並ぶ"
-        );
-
-        // ホームが取れない環境でも落ちない（既定を飛ばして残りを並べる）
-        let dirs = config_dirs_from(None, None, vec!["/x/.claude-account".into()]);
-        assert_eq!(dirs, vec![PathBuf::from("/x/.claude-account")]);
-        assert!(config_dirs_from(None, None, Vec::new()).is_empty());
-    }
-
     /// `<config dir>/projects/<スラグ>/<id>.jsonl` を作る（Issue #652 のテスト用）
     fn seed_transcript(config_dir: &Path, slug: &str, session_id: &str) -> PathBuf {
         let dir = config_dir.join("projects").join(slug);
@@ -589,64 +894,77 @@ mod tests {
         path
     }
 
-    /// 一時ディレクトリ（テスト間で衝突しない名前）
-    fn temp_root(tag: &str) -> PathBuf {
-        let unique = format!(
-            "tako-652-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
+    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
+    /// 消す（変数名の取り違えで実アカウントの config dir を消す事故を構造的に防ぐ）
+    fn remove_temp_dir(dir: &Path) {
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ以外を削除しようとしている: {}",
+            dir.display()
         );
-        let dir = std::env::temp_dir().join(unique);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp");
-        dir
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// #652 の根因そのもの: 既定でない config ディレクトリに保存された会話を見つけ、
-    /// **どこで見つけたか**まで返す。既定しか見ないと resume を試みる手前で諦めていた
+    /// Issue #652: アカウント（`CLAUDE_CONFIG_DIR`）の会話は既定 `~/.claude` に無い。
+    /// 走査は全 config ディレクトリを見て、所在（既定か否か）まで返す
     #[test]
-    fn 既定でないconfigディレクトリの会話も所在つきで見つかる() {
-        let root = temp_root("locate");
+    fn transcriptを全configディレクトリから探し所在を返す() {
+        let root = std::env::temp_dir().join(format!("tako-652-locate-{}", std::process::id()));
+        remove_temp_dir(&root);
         let default_dir = root.join(".claude");
-        let account_dir = root.join(".claude-univ");
-        let id = "a45899a8-96a6-4fa6-9bf6-71df53307878";
-        let expected = seed_transcript(&account_dir, "-home-u-proj", id);
+        let univ_dir = root.join(".claude-univ");
+        let default_id = "11111111-2222-3333-4444-555555555555";
+        let univ_id = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
+        let default_path = seed_transcript(&default_dir, "-tmp-proj", default_id);
+        let univ_path = seed_transcript(&univ_dir, "-tmp-proj", univ_id);
+        let dirs = vec![default_dir.clone(), univ_dir.clone()];
 
-        let dirs = vec![default_dir.clone(), account_dir.clone()];
-        let found = locate_transcript_in(&dirs, Some(&default_dir), id).expect("見つかるはず");
-        assert_eq!(found.path, expected);
-        assert_eq!(found.config_dir, account_dir);
-        assert!(!found.is_default, "既定ではない所在として返す");
+        let found = locate_transcript_in(&dirs, Some(&default_dir), default_id).expect("既定側");
+        assert_eq!(found.path, default_path);
+        assert_eq!(found.config_dir, default_dir);
+        assert!(found.is_default);
 
-        // 既定側にある会話は is_default = true
-        let id2 = "b45899a8-96a6-4fa6-9bf6-71df53307878";
-        seed_transcript(&default_dir, "-home-u-proj", id2);
-        let found2 = locate_transcript_in(&dirs, Some(&default_dir), id2).expect("見つかるはず");
-        assert!(found2.is_default);
+        // 既定だけを見ていた旧実装が resume を諦めていたケース
+        let found = locate_transcript_in(&dirs, Some(&default_dir), univ_id).expect("univ 側");
+        assert_eq!(found.path, univ_path);
+        assert_eq!(found.config_dir, univ_dir);
+        assert!(!found.is_default);
+        // 既定だけを走査対象にすると見つからない（= 修正前の挙動）
+        assert!(locate_transcript_in(
+            std::slice::from_ref(&default_dir),
+            Some(&default_dir),
+            univ_id
+        )
+        .is_none());
 
-        // どこにも無い ID / 不正な ID は None（推測で resume しない）
-        assert!(locate_transcript_in(&dirs, Some(&default_dir), "c45899a8-0000").is_none());
-        assert!(locate_transcript_in(&dirs, Some(&default_dir), "../../bad").is_none());
-        let _ = std::fs::remove_dir_all(&root);
+        // 実在しない ID / 不正な ID は None（パストラバーサル防止）
+        assert!(locate_transcript_in(
+            &dirs,
+            Some(&default_dir),
+            "99999999-0000-0000-0000-000000000000"
+        )
+        .is_none());
+        assert!(locate_transcript_in(&dirs, Some(&default_dir), "../../etc/passwd").is_none());
+
+        remove_temp_dir(&root);
     }
 
-    /// resume の env 前置は**そのプラットフォームのシェル方言**でなければならない。
-    /// PowerShell のペインへ POSIX の `export` / `unset` を流すと構文エラーになり、
-    /// resume ごと落ちる（#652 の Windows 側の要点）
+    /// resume 時の env プレフィクス。既定は明示 unset（tako 側 env / direnv の
+    /// 漏れに勝つ）、アカウントは export（#500 / #512 と同型）
     #[test]
     fn resumeのenv前置はプラットフォームの方言に従う() {
-        let account = TranscriptLocation {
-            path: PathBuf::from("/x/projects/p/id.jsonl"),
-            config_dir: PathBuf::from("/home/u/.claude-univ"),
+        let univ_loc = TranscriptLocation {
+            path: PathBuf::from("/home/me/.claude-univ/projects/p/a.jsonl"),
+            config_dir: PathBuf::from("/home/me/.claude-univ"),
             is_default: false,
         };
-        let default = TranscriptLocation {
-            path: PathBuf::from("/y/projects/p/id.jsonl"),
-            config_dir: PathBuf::from("/home/u/.claude"),
+        let default_loc = TranscriptLocation {
+            path: PathBuf::from("/home/me/.claude/projects/p/a.jsonl"),
+            config_dir: PathBuf::from("/home/me/.claude"),
             is_default: true,
         };
-        let assign = resume_env_prefix_for(&account);
-        let unset = resume_env_prefix_for(&default);
+        let assign = resume_env_prefix_for(&univ_loc);
+        let unset = resume_env_prefix_for(&default_loc);
 
         // 共通の不変条件: 変数名を必ず含み、末尾は次のコマンドと繋がる区切り
         for p in [&assign, &unset] {
@@ -658,6 +976,18 @@ mod tests {
         assert!(
             !unset.contains("''") && !unset.contains("\"\""),
             "既定は空文字代入にしない: {unset}"
+        );
+
+        // 空白入りパスはクォートされる（どちらの方言でもシェルへ渡すため）
+        let spaced = TranscriptLocation {
+            path: PathBuf::from("/home/me/My Configs/.claude/projects/p/a.jsonl"),
+            config_dir: PathBuf::from("/home/me/My Configs/.claude"),
+            is_default: false,
+        };
+        let spaced_prefix = resume_env_prefix_for(&spaced);
+        assert!(
+            spaced_prefix.contains("'/home/me/My Configs/.claude'"),
+            "{spaced_prefix}"
         );
 
         #[cfg(windows)]
@@ -703,6 +1033,396 @@ mod tests {
         assert_eq!(msgs[0]["timestamp"], "2026-01-01T00:00:00Z");
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[1]["text"], "やあ");
+    }
+
+    // --- #715: user 行の内容分類（実 master セッションから採取したパターン） ---
+
+    /// 画像添付のメタテキストは発話ではない（実測 111 件）。
+    /// 「画像」プレースホルダの材料（枚数）だけ残し、座標変換の説明文は捨てる
+    #[test]
+    fn 画像メタテキストは発話にせず枚数だけ残す() {
+        let meta = json!(
+            "[Image: original 3024x1964, displayed at 2000x1299. Multiply coordinates by 1.51 to map to original image.]"
+        );
+        assert_eq!(
+            classify_user_content(&meta),
+            UserContent::Speech {
+                text: String::new(),
+                images: 1
+            }
+        );
+        // 本文つき（`[Image #1] この子はなに？`）はマーカーだけ落として本文を残す
+        let with_text = json!([
+            { "type": "text", "text": "[Image #1] この子はなに？" },
+            { "type": "image", "source": { "type": "base64", "data": "iVBO" } },
+        ]);
+        assert_eq!(
+            classify_user_content(&with_text),
+            UserContent::Speech {
+                text: "この子はなに？".into(),
+                images: 1
+            }
+        );
+        // 画像だけ貼った発話（text ブロックなし）は枚数を数える
+        let only_images = json!([
+            { "type": "image", "source": {} },
+            { "type": "image", "source": {} },
+        ]);
+        assert_eq!(
+            classify_user_content(&only_images),
+            UserContent::Speech {
+                text: String::new(),
+                images: 2
+            }
+        );
+    }
+
+    /// `<task-notification>` は生 XML を一切出さず、`<summary>` を 1 行要約にする
+    #[test]
+    fn task_notificationはシステム通知へ分類する() {
+        let raw = json!(concat!(
+            "<task-notification>\n<task-id>btexwkxuv</task-id>\n",
+            "<summary>Monitor event: \"worker の完了監視\"</summary>\n",
+            "<event>[Monitor timed out — re-arm if needed.]</event>\n</task-notification>"
+        ));
+        let UserContent::Notice { summary } = classify_user_content(&raw) else {
+            panic!(
+                "システム通知として分類されるべき: {:?}",
+                classify_user_content(&raw)
+            );
+        };
+        assert_eq!(summary, "Monitor event: \"worker の完了監視\"");
+        assert!(!summary.contains('<'), "生 XML を要約に混ぜない: {summary}");
+    }
+
+    /// `<system-reminder>` は**本物の発話の後ろに付く**ことがある。
+    /// そのときは通知にせず、注意書きだけ削って発話を残す
+    #[test]
+    fn system_reminderは削って発話を残す() {
+        let raw = json!("これを直して\n<system-reminder>Prefer batch tools.</system-reminder>");
+        assert_eq!(
+            classify_user_content(&raw),
+            UserContent::Speech {
+                text: "これを直して".into(),
+                images: 0
+            }
+        );
+        // 単独で来たら通知
+        let alone = json!("<system-reminder>Prefer batch tools.</system-reminder>");
+        assert_eq!(
+            classify_user_content(&alone),
+            UserContent::Notice {
+                summary: "Prefer batch tools.".into()
+            }
+        );
+    }
+
+    /// 閉じタグが無い（切り詰め等）ときも生 XML の断片を漏らさない
+    #[test]
+    fn 閉じタグが無いシステムブロックも漏らさない() {
+        let raw = json!("<task-notification>\n<task-id>abc</task-id>\n<summary>途中で切れた");
+        let result = classify_user_content(&raw);
+        let UserContent::Notice { summary } = &result else {
+            panic!("通知として分類されるべき: {result:?}");
+        };
+        assert!(!summary.contains('<'), "断片が残っている: {summary}");
+        assert_eq!(summary, "途中で切れた");
+    }
+
+    /// スラッシュコマンド実行行は「ユーザーが打ったコマンド」として見せる
+    #[test]
+    fn スラッシュコマンド行はコマンド名の発話にする() {
+        let raw = json!(concat!(
+            "<command-name>/model</command-name>\n",
+            "            <command-message>model</command-message>\n",
+            "            <command-args></command-args>"
+        ));
+        assert_eq!(
+            classify_user_content(&raw),
+            UserContent::Speech {
+                text: "/model".into(),
+                images: 0
+            }
+        );
+        // 引数つき
+        let with_args = json!(
+            "<command-name>/compact</command-name><command-args>focus on tests</command-args>"
+        );
+        assert_eq!(
+            classify_user_content(&with_args),
+            UserContent::Speech {
+                text: "/compact focus on tests".into(),
+                images: 0
+            }
+        );
+    }
+
+    /// claude の bash モード（`!` 始まり）はユーザーの操作なので発話として見せ、
+    /// その出力は通知にする（実 transcript の `<bash-input>` / `<bash-stdout>`）
+    #[test]
+    fn bashモードの入力は発話出力は通知にする() {
+        let input = json!("<bash-input>git status</bash-input>");
+        assert_eq!(
+            classify_user_content(&input),
+            UserContent::Speech {
+                text: "! git status".into(),
+                images: 0
+            }
+        );
+        let output = json!("<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>");
+        assert_eq!(
+            classify_user_content(&output),
+            UserContent::Notice {
+                summary: "clean".into()
+            }
+        );
+    }
+
+    /// スラッシュコマンドの前置定型文と実行結果は会話に出さない
+    #[test]
+    fn ローカルコマンドの定型文と結果は通知にする() {
+        // 定型文だけの行は伝える中身が無いので薄い 1 行すら出さない
+        // （タグに包まれた形 = 実 transcript で 84 件観測 / 素の形 = 古い形式）
+        let wrapped = json!(concat!(
+            "<local-command-caveat>Caveat: The messages below were generated by the user while ",
+            "running local commands. DO NOT respond to these messages.</local-command-caveat>"
+        ));
+        assert_eq!(classify_user_content(&wrapped), UserContent::Skip);
+        let caveat = json!(concat!(
+            "Caveat: The messages below were generated by the user while running local commands. ",
+            "DO NOT respond to these messages."
+        ));
+        assert_eq!(classify_user_content(&caveat), UserContent::Skip);
+        let stdout = json!("<local-command-stdout>Set model to opus</local-command-stdout>");
+        assert_eq!(
+            classify_user_content(&stdout),
+            UserContent::Notice {
+                summary: "Set model to opus".into()
+            }
+        );
+    }
+
+    /// tool_result だけの行は従来どおり落とす（配列対応で拾い始めない）
+    #[test]
+    fn tool_result行は配列対応後もスキップする() {
+        let raw = json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]);
+        assert_eq!(classify_user_content(&raw), UserContent::Skip);
+        // system-reminder 入りの tool_result も同じ（旧実装で 44 件観測）
+        let with_reminder = json!([
+            { "type": "tool_result", "tool_use_id": "t1", "content": "ok" },
+            { "type": "text", "text": "<system-reminder>note</system-reminder>" },
+        ]);
+        assert_eq!(classify_user_content(&with_reminder), UserContent::Skip);
+    }
+
+    /// 正規化の出力に生 XML・画像メタが一切出ないこと（#715 受け入れ条件 1 の機械版）
+    #[test]
+    fn 正規化出力にシステムテキストが混ざらない() {
+        let raw = [
+            r#"{"type":"user","message":{"content":"実装して"}}"#,
+            r#"{"type":"user","message":{"content":"[Image: original 3024x1964, displayed at 2000x1299. Multiply coordinates by 1.51 to map to original image.]"}}"#,
+            r#"{"type":"user","message":{"content":"<task-notification>\n<task-id>a</task-id>\n<summary>Monitor event</summary>\n</task-notification>"}}"#,
+            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"text","text":"やります"}]}}"#,
+        ];
+        let msgs = normalize_lines(lines(&raw), 10);
+        let dump = serde_json::to_string(&msgs).expect("シリアライズ");
+        assert!(
+            !dump.contains("task-notification"),
+            "生 XML が残っている: {dump}"
+        );
+        assert!(
+            !dump.contains("Multiply coordinates"),
+            "画像メタが残っている: {dump}"
+        );
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["text"], "実装して");
+        // 画像だけの発話は本文が空 + attachments で表現する
+        assert_eq!(msgs[1]["text"], "");
+        assert_eq!(msgs[1]["attachments"][0]["kind"], "image");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(msgs[2]["kind"], "notice");
+        assert_eq!(msgs[2]["text"], "Monitor event");
+        assert_eq!(msgs[3]["text"], "やります");
+    }
+
+    /// 連続するシステム通知は 1 エントリへまとめる（tail を食い潰さない）
+    #[test]
+    fn 連続するシステム通知をまとめる() {
+        let notice = |n: u32| {
+            format!(
+                r#"{{"type":"user","message":{{"content":"<task-notification><summary>通知{n}</summary></task-notification>"}}}}"#
+            )
+        };
+        let raw: Vec<String> = vec![
+            r#"{"type":"user","message":{"content":"やって"}}"#.to_string(),
+            notice(1),
+            notice(2),
+            notice(3),
+            r#"{"type":"assistant","requestId":"r1","message":{"content":[{"type":"text","text":"了解"}]}}"#.to_string(),
+        ];
+        let msgs = normalize_lines(raw.into_iter(), 10);
+        assert_eq!(msgs.len(), 3, "通知 3 件が 1 エントリへ: {msgs:?}");
+        assert_eq!(msgs[1]["count"], 3);
+        // まとめても最新の要約を出す
+        assert_eq!(msgs[1]["text"], "通知3");
+    }
+
+    // ─────────── #737: busy 中に打たれた指示（queue-operation） ───────────
+
+    /// 実 transcript の形（実測 3416 本より）で 1 行を組む
+    fn queue_line(operation: &str, content: Option<&str>) -> String {
+        let mut v = json!({
+            "type": "queue-operation",
+            "operation": operation,
+            "timestamp": "2026-08-02T10:40:21.015Z",
+            "sessionId": "s",
+        });
+        if let Some(c) = content {
+            v["content"] = json!(c);
+        }
+        v.to_string()
+    }
+
+    fn user_line(text: &str) -> String {
+        json!({
+            "type": "user",
+            "timestamp": "2026-08-02T10:45:00.000Z",
+            "message": { "role": "user", "content": text },
+        })
+        .to_string()
+    }
+
+    /// busy 中に打たれた指示は enqueue の時点で吹き出しになる（配送を待たない）。
+    /// これが無いと長いターンの最中は自分の発話がどこにも出ない（#737 追加要件 5）
+    #[test]
+    fn キューに入った指示はその時点で発話として出る() {
+        let msgs = normalize_lines(
+            vec![
+                user_line("最初のお願い"),
+                queue_line("enqueue", Some("busy中の追加指示です")),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(msgs.len(), 2, "{msgs:#?}");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["text"], "busy中の追加指示です");
+        assert_eq!(msgs[1]["queued"], json!(true), "送信待ちの印が付く");
+    }
+
+    /// 配送されたら「送信待ち」は消え、**本物の user 行が来ても二重に並べない**。
+    /// 実測した 2 通りの配送（dequeue → user 行 / ターン内差し込みで remove のみ）を両方見る
+    #[test]
+    fn キュー発話は配送後に二重化しない() {
+        // 経路 A: enqueue → dequeue → 本物の user 行（実測 = 次のターンとして配送）
+        let a = normalize_lines(
+            vec![
+                queue_line("enqueue", Some("あとで届く指示")),
+                queue_line("dequeue", None),
+                user_line("あとで届く指示"),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(a.len(), 1, "同じ発話を 2 個並べない: {a:#?}");
+        assert_eq!(a[0]["text"], "あとで届く指示");
+        assert_eq!(
+            a[0]["queued"],
+            json!(false),
+            "配送済みなので送信待ちは消える"
+        );
+
+        // 経路 B: enqueue → remove のみ（ターン内へ差し込まれ user 行にならない）
+        let b = normalize_lines(
+            vec![
+                queue_line("enqueue", Some("ターン内へ差し込まれる指示")),
+                queue_line("remove", Some("ターン内へ差し込まれる指示")),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(b.len(), 1, "{b:#?}");
+        assert_eq!(b[0]["text"], "ターン内へ差し込まれる指示");
+        assert_eq!(b[0]["queued"], json!(false));
+    }
+
+    /// 同じ文面を 2 回送ったら 2 個出る（重複排除は 1 対 1 で消費する）
+    #[test]
+    fn 同じ文面を2回送れば2個出る() {
+        let msgs = normalize_lines(
+            vec![
+                queue_line("enqueue", Some("もう一度")),
+                queue_line("dequeue", None),
+                user_line("もう一度"),
+                user_line("もう一度"),
+            ]
+            .into_iter(),
+            50,
+        );
+        assert_eq!(msgs.len(), 2, "2 回の発話は 2 個出る: {msgs:#?}");
+    }
+
+    /// キューへ入るのはユーザー発話だけではない（実測 = `<task-notification>` 1760 件）。
+    /// システム注入がキュー経由で生 XML の吹き出しになってはいけない（#715 の保証）
+    #[test]
+    fn キュー経由のシステム注入は吹き出しにしない() {
+        let msgs = normalize_lines(
+            vec![queue_line(
+                "enqueue",
+                Some("<task-notification>\n<summary>Monitor event</summary>\n</task-notification>"),
+            )]
+            .into_iter(),
+            50,
+        );
+        assert!(
+            msgs.is_empty(),
+            "システム注入はキュー経由でも発話にしない: {msgs:#?}"
+        );
+    }
+
+    /// tail から押し出された後に本物の user 行が来ても、取り違えて消さない
+    #[test]
+    fn tail外へ出たキュー発話は本物を消さない() {
+        let mut lines = vec![queue_line("enqueue", Some("古い指示"))];
+        // tail=2 なので後続の 2 発話で押し出される
+        lines.push(user_line("別の話1"));
+        lines.push(user_line("別の話2"));
+        lines.push(user_line("古い指示"));
+        let msgs = normalize_lines(lines.into_iter(), 2);
+        assert_eq!(msgs.len(), 2, "{msgs:#?}");
+        assert_eq!(
+            msgs[1]["text"], "古い指示",
+            "本物の配送が消えてはいけない: {msgs:#?}"
+        );
+    }
+
+    /// PWA へ配る手前でシステム通知を落とす（role 判定できないフロント向け）
+    #[test]
+    fn without_system_noticesは通知だけ落とす() {
+        let value = json!({
+            "session_id": "s",
+            "messages": [
+                { "role": "user", "text": "やって" },
+                { "role": "system", "kind": "notice", "text": "通知" },
+                { "role": "assistant", "text": "はい" },
+            ],
+        });
+        let filtered = without_system_notices(value);
+        let messages = filtered["messages"].as_array().expect("配列");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    /// 会話の見出し（セッションカタログ）にもシステムテキストを出さない
+    #[test]
+    fn first_user_textはシステムテキストを飛ばす() {
+        // classify を通しているので、画像メタ → 通知 → 本物の発話の順でも本物を拾う
+        let raw = json!("[Image: original 100x100, displayed at 50x50.]");
+        assert!(matches!(
+            classify_user_content(&raw),
+            UserContent::Speech { text, .. } if text.is_empty()
+        ));
     }
 
     #[test]

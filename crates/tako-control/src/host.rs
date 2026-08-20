@@ -5,6 +5,7 @@
 //! シグネチャ（`&mut dyn ControlHost`）は不変。
 
 use serde_json::Value;
+use tako_core::pane_log::CloseOrigin;
 use tako_core::{
     PaneId, PreviewOutline, PreviewOutlineTarget, PreviewViewState, PreviewViewUpdate,
     SpawnOptions, TabId, TerminalSession, Workspace,
@@ -39,8 +40,10 @@ pub trait SessionHost {
     /// ツリーへ挿入済みの新ペインに対しセッションを起動しイベント中継を張る。
     /// `TAKO_PANE_ID` 等の環境変数合成は実装側の責務（FR-2.1.1）
     fn attach_session(&mut self, pane: PaneId, options: SpawnOptions);
-    /// 閉じられたペインのセッションを破棄する
-    fn detach_session(&mut self, pane: PaneId);
+    /// 閉じられたペインのセッションを破棄する。
+    /// `origin` / `caller` は close の発生源（Issue #566）。この経路は CLI / MCP の
+    /// dispatch だけが通るため、ペインログのクローズマーカーへ「誰が閉じたか」を残す
+    fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>);
     /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
     /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
     fn reattach_backgrounded(&mut self, _pane: PaneId) {}
@@ -55,6 +58,12 @@ pub trait SessionHost {
     /// 信頼ダイアログ承諾 → ❯ 待ち → 貼り付け → 分離 Enter → 入力欄の空検証 + 再送
     /// のステートマシンを駆動する（Issue #32 送達確認ループ）
     fn queue_prompt_flow(&mut self, _pane: PaneId, _prompt: String) {}
+    /// worker spawn の初回プロンプト送達フローを登録する（Issue #530 / #778）。
+    /// 通常の後続 send と区別し、初回プロンプトの送達結果だけを worker
+    /// レジストリへ記録する。既定実装はテスト用モックとの互換のため通常フローへ委譲する
+    fn queue_spawn_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        self.queue_prompt_flow(pane, prompt);
+    }
     /// 送達確認つき送信フローを登録する（Issue #32）。`queue_prompt_flow` と同じ
     /// ステートマシンだが claude TUI の起動を待たず、現画面へ即座に貼り付ける
     /// （全画面 TUI への newline つき送信用）。既定実装は何もしない（テスト用モック等）
@@ -229,6 +238,24 @@ pub trait UiStateHost {
     }
     /// listen ポート検知の ON/OFF 切替（永続化・検知済み情報の掃除は実装側の責務）
     fn set_port_detect(&mut self, _enabled: bool) {}
+    /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600）の現在状態
+    fn autosuggest_enabled(&self) -> bool {
+        true
+    }
+    /// 入力予測の ON/OFF 切替（永続化とシェル側の状態ファイル反映は実装側の責務）
+    fn set_autosuggest(&mut self, _enabled: bool) {}
+    /// 確定キーのヒント表示（Issue #614）の現在状態。`false` = 恒久 OFF
+    fn autosuggest_hint_enabled(&self) -> bool {
+        true
+    }
+    /// ヒント表示の ON/OFF 切替（ON は残り回数を既定へ戻す = もう一度案内する）
+    fn set_autosuggest_hint(&mut self, _enabled: bool) {}
+    /// ゴースト表示中の Tab 確定（Issue #614）の現在状態
+    fn autosuggest_tab_enabled(&self) -> bool {
+        true
+    }
+    /// Tab 確定の ON/OFF 切替
+    fn set_autosuggest_tab(&mut self, _enabled: bool) {}
     /// × ボタン close の確認ダイアログの現在状態（Issue #172）
     fn confirm_close_enabled(&self) -> bool {
         true
@@ -237,7 +264,7 @@ pub trait UiStateHost {
     fn set_confirm_close(&mut self, _enabled: bool) {}
     /// 右サイドバー情報パネルの状態 (visible, width, view)
     fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
-        (false, 0.0, crate::protocol::PanelViewWire::Tmux)
+        (false, 0.0, crate::protocol::PanelViewWire::Fleet)
     }
     /// 右サイドバー情報パネルの操作（None の項目は変更しない）
     fn set_panel(
@@ -253,12 +280,25 @@ pub trait UiStateHost {
     }
     /// ファイルツリーの表示・非表示（root の cwd 同期は実装側の責務）
     fn set_filetree(&mut self, _visible: bool) {}
-    /// 左サイドバーの幅（px。Issue #307）
+    /// ファイルツリーでドット始まりの項目を表示しているか（Issue #550）
+    fn filetree_show_hidden(&self) -> bool {
+        false
+    }
+    /// ドット始まり項目の表示切替（Issue #550。永続化は呼び出し側の責務）
+    fn set_filetree_show_hidden(&mut self, _show: bool) {}
+    /// 左サイドバーの幅（px。Issue #307。#789: 画面に出ている実効幅を返す）
     fn sidebar_width(&self) -> f32 {
         244.0
     }
-    /// 左サイドバーの幅を設定する（Issue #307。永続化は呼び出し側の責務）
+    /// 左サイドバーの幅を設定する（Issue #307。永続化は呼び出し側の責務）。
+    ///
+    /// #789: 実装側は `tako_core::sidebar::clamp_width` でクランプする
+    /// （ドラッグ経路と同一規則）。要求値がそのまま入るとは限らない
     fn set_sidebar_width(&mut self, _width: f32) {}
+    /// 左サイドバー幅の上限（px。#789。ウィンドウ幅が分からない実装は None）
+    fn sidebar_width_max(&self) -> Option<f32> {
+        None
+    }
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
     /// ピン留め中のプレビュー一覧（FR-2.16.15）
@@ -275,6 +315,37 @@ pub trait UiStateHost {
     }
     /// UI テーマモードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
     fn set_theme_mode(&mut self, _mode: tako_core::theme::ThemeMode) {}
+    /// UI 表示モードの現在値（Issue #694。GUI ライク表示 ⇔ ターミナル表示）
+    fn ui_mode(&self) -> tako_core::ui_mode::UiMode {
+        tako_core::ui_mode::UiMode::Terminal
+    }
+    /// UI 表示モードの切替（再描画は実装側の責務。永続化は dispatch 側で行う）
+    fn set_ui_mode(&mut self, _mode: tako_core::ui_mode::UiMode) {}
+    /// スターターの「コマンド入力へ」でターミナル表示に戻したペイン（Issue #694）。
+    /// 揮発フラグなので永続化しない = 再起動すると GUI 表示に戻る
+    fn starter_released_panes(&self) -> Vec<PaneId> {
+        Vec::new()
+    }
+    /// 同上の設定（`released=false` で GUI 表示へ戻す。再描画は実装側の責務）
+    fn set_starter_released(&mut self, _pane: PaneId, _released: bool) {}
+    /// いま各ペインが何として描かれているか（Issue #720）。
+    /// terminal モードでは全部 `Terminal`。**AI が「画面に何が出ているか」を知る手段**で、
+    /// 準備中（過渡期）かどうかもここで分かる。揮発なので永続化しない
+    fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
+        Vec::new()
+    }
+    /// チャットビュー本文のコピー（Issue #725）。UI のコピーボタンと同じ経路。
+    /// 引数の意味は [`crate::protocol::Request::ChatCopy`] を参照。
+    fn chat_copy(
+        &mut self,
+        _pane: PaneId,
+        _list: bool,
+        _message: Option<usize>,
+        _code: Option<usize>,
+        _markdown: bool,
+    ) -> Result<serde_json::Value, String> {
+        Err("チャットビューのコピーは未対応".into())
+    }
     /// UI 表示言語の設定値（Issue #435。system / ja / en）
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
         tako_core::i18n::LangSetting::System
@@ -286,6 +357,12 @@ pub trait UiStateHost {
         _setting: tako_core::i18n::LangSetting,
         _resolved: tako_core::i18n::Lang,
     ) {
+    }
+    /// 利用上限後の自動復帰（#813）の**実行状態**（いま上限で止まっているか・
+    /// いつ復帰するか・これまでの試行）。オプトインそのものは Pane 属性なので
+    /// ここには無い。GUI 以外のホストは追跡状態を持たないので既定は None
+    fn limit_resume_state(&self, _pane: PaneId) -> Option<serde_json::Value> {
+        None
     }
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
     fn limit_service(&self) -> tako_core::LimitService {
@@ -301,6 +378,13 @@ pub trait UiStateHost {
     fn settings_window_open(&self) -> bool {
         false
     }
+    /// 初回起動のウェルカムバナーが表示中か（Issue #549）
+    fn welcome_banner_visible(&self) -> bool {
+        false
+    }
+    /// ウェルカムバナーの表示 / 非表示（再描画は実装側の責務。
+    /// 「以後出さない」の永続化は dispatch 側で行う。Issue #549）
+    fn set_welcome_banner_visible(&mut self, _visible: bool) {}
     /// 利用制限メトリクスの即時再取得（#357 リロードボタン）。
     /// 全ペインの TUI フッターを再走査し、現在のメトリクスを JSON で返す
     fn refresh_limits(&mut self) -> serde_json::Value {
@@ -309,6 +393,21 @@ pub trait UiStateHost {
             "codex": { "primary": null, "secondary": null },
             "agy": { "status": "unsupported" },
         })
+    }
+    /// AI コマンド提案カードの保管庫（FR-2.22 / #666）。
+    /// **判定と操作は dispatch に置き、ホストは保管だけ担う**（GUI 不在のホストは None）
+    fn command_cards(&self) -> Option<&tako_core::CommandCards> {
+        None
+    }
+    /// 同上（可変）。カードを持たないホストでは show / run が「未対応」で失敗する
+    fn command_cards_mut(&mut self) -> Option<&mut tako_core::CommandCards> {
+        None
+    }
+    /// クリップボードへの書き込みを要求する（#666 のコピー）。
+    /// GPUI のクリップボード API は `App` を要するため、実装側は保留キューへ積み
+    /// 次の render で流す（`pending_settings_open` と同じ方式）
+    fn queue_clipboard_copy(&mut self, _text: String) -> bool {
+        false
     }
 }
 
@@ -365,6 +464,27 @@ pub trait PreviewHost {
         _index: usize,
     ) -> Result<serde_json::Value, String> {
         Err("PDF リンクフォローは未対応".into())
+    }
+    /// Markdown プレビュー内のリンク一覧（Issue #680）。md プレビューでなければ None。
+    fn preview_md_links(&self, _pane: PaneId) -> Option<Vec<tako_core::MdLink>> {
+        None
+    }
+    /// Markdown プレビュー内のリンクをフォローする（Issue #680。http / https のみ開く）。
+    fn follow_preview_md_link(
+        &mut self,
+        _pane: PaneId,
+        _index: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("Markdown リンクフォローは未対応".into())
+    }
+    /// Markdown プレビューのコードブロック全文をクリップボードへ入れる（Issue #680）。
+    /// `index` は出現順の 0 始まり（省略時は先頭）。UI のコピーボタンと同じ経路。
+    fn copy_preview_code_block(
+        &mut self,
+        _pane: PaneId,
+        _index: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        Err("コードブロックのコピーは未対応".into())
     }
     /// 表示中ファイルのライブリロード設定（Issue #233）。
     fn preview_reload_enabled(&self) -> bool {
@@ -636,6 +756,23 @@ pub trait SystemHost {
     fn update_repair(&mut self) -> Result<Value, String> {
         Err("この環境では修復を実行できない".into())
     }
+    /// アップデート専用画面を開く（Issue #616）
+    fn open_update_window(&mut self) {}
+    /// アップデート専用画面が開いているか（Issue #616）
+    fn update_window_open(&self) -> bool {
+        false
+    }
+    /// 上部通知カードの状態（Issue #616）。`key` は案内中バージョンの一意キーで、
+    /// 「同じバージョンでは再表示しない」の永続化に使う
+    fn update_card_status(&self) -> Value {
+        serde_json::json!({
+            "visible": false,
+            "key": Value::Null,
+            "dismissed_key": Value::Null,
+        })
+    }
+    /// 通知カードを閉じた / 出し直した（永続化は dispatch 側の責務。Issue #616）
+    fn set_update_card_dismissed(&mut self, _dismissed: bool) {}
     /// ペインログの現在設定（Issue #112 B）。GUI はライブの PaneLogManager から返す
     fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
         crate::settings::load().pane_log_config()

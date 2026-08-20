@@ -142,23 +142,57 @@ pub enum MenuItemSnapshot {
 }
 
 /// 右サイドバー情報パネルの内部ビュー（固定タブ 0 個方針。FR-2.16.6 で agents は
-/// tmux ビューへ統合済み。git は git graph（FR-3.6）実装までプレースホルダ表示）
+/// fleet ビューへ統合済み）。
+///
+/// 値の語彙は **GUI のタブ表示名（fleet / orch / git）と一致させる**（#553）。
+/// AI が画面に見えている名前をそのまま指定できることが設計原則 5 の前提。
+/// 旧称 `tmux` は既存スクリプト互換のため受理し続ける（`serde(alias)` + [`parse`]）が、
+/// 応答・案内には出さない。
+///
+/// [`parse`]: PanelViewWire::parse
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelViewWire {
-    Tmux,
+    /// GUI の「fleet」タブ（旧称 tmux。#553 で改称）
+    #[serde(alias = "tmux")]
+    Fleet,
     /// オーケストレーター中心ビュー（#217。master + ワーカーツリーの俯瞰）
     Orch,
     Git,
 }
 
 impl PanelViewWire {
+    /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
+    pub const VALUES: [&'static str; 3] = ["fleet", "orch", "git"];
+    /// 後方互換のみで受理する旧称と現行値の対応（#553）
+    pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
+
     pub fn as_str(self) -> &'static str {
         match self {
-            PanelViewWire::Tmux => "tmux",
+            PanelViewWire::Fleet => "fleet",
             PanelViewWire::Orch => "orch",
             PanelViewWire::Git => "git",
         }
+    }
+
+    /// 文字列から解決する。旧称（`tmux`）も後方互換で受理する（#553）
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "fleet" | "tmux" => Some(PanelViewWire::Fleet),
+            "orch" => Some(PanelViewWire::Orch),
+            "git" => Some(PanelViewWire::Git),
+            _ => None,
+        }
+    }
+
+    /// 不正値を弾くときに添える案内（GUI 表示名を先に出し、旧称は括弧で補足。#553 案 2）
+    pub fn values_hint() -> String {
+        let legacy = Self::LEGACY_VALUES
+            .iter()
+            .map(|(old, new)| format!("{old} は {new} の旧称"))
+            .collect::<Vec<_>>()
+            .join("、");
+        format!("{}。{legacy}", Self::VALUES.join(" | "))
     }
 }
 
@@ -246,6 +280,11 @@ pub enum Request {
         /// true にすると busy な worker でも強制 close（省略時 false）
         #[serde(default)]
         force: bool,
+        /// 呼び出し元の role（Issue #566。MCP は接続時の `TAKO_ORCHESTRATOR_ROLE`、
+        /// CLI は同名の環境変数から埋める）。ペインログのクローズマーカーへ
+        /// 「どのエージェントが閉じたか」を残す監査情報で、close の可否には影響しない
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
     },
     /// フォーカス移動（FR-2.5.5）。`direction` 指定時はアクティブタブ内の方向移動
     Focus {
@@ -263,6 +302,19 @@ pub enum Request {
     Equalize { pane: Option<u64>, tab: Option<u64> },
     /// タブ / ペインのツリー構造・ジオメトリ・状態の取得（FR-2.2.4 / FR-2.5.1〜2）
     List,
+    /// 呼び出し元ペインの解決（Issue #567）。stale な `TAKO_PANE_ID`（アプリ再起動・
+    /// セッション再利用をまたいだ旧世代 ID）を現世代のペインへ読み替えるための問い合わせ。
+    /// 解決順は pid 祖先辿り → pane そのまま → stale pane map（#210）。
+    /// **role 検索へはフォールバックしない**（無関係な master ペインを掴まないため）。
+    /// 解決できなくてもエラーにせず `pane: null` を返す（呼び出し側がフォールバックを選ぶ）
+    ResolvePane {
+        /// 呼び出し元が自称するペイン ID（`TAKO_PANE_ID`。stale の可能性がある）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 呼び出しプロセスの pid（pid 祖先辿りで実ペインを特定する。#288 と同じ経路）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_pid: Option<u32>,
+    },
     /// ペインへのテキスト送信（FR-2.2.2）。`newline` で末尾に改行（CR）を付与。
     /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で送信する。
     /// `await_prompt` が true の場合、claude TUI の ❯ プロンプト表示を待ってから送信する。
@@ -368,12 +420,26 @@ pub enum Request {
         title: String,
         source: Option<String>,
     },
+    /// いまのタブ名を固定する / 固定を解除する（#552 案 4「この名前を固定」）。
+    /// GUI の自動命名直後に出るピン印と 1:1。`pinned` = true で現在のタイトルを
+    /// そのまま手動指定へ（以後 自動リネームが上書きしない）、false で固定解除
+    /// （自動リネーム再開）、省略時は現在状態の取得のみ。
+    /// `tab` 省略時は `pane`（呼び出し元）の属するタブ
+    TabPinTitle {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        pinned: Option<bool>,
+    },
     /// タブ作成（FR-2.5.10）
     TabNew {
         title: Option<String>,
         /// 新タブをアクティブにするか（省略時は false = 現在のタブを維持）
         #[serde(default)]
         focus: Option<bool>,
+        /// 初期ペインのシェルを起動する作業ディレクトリ（省略時はプロセスから継承）。
+        /// Finder からフォルダを渡されたときの受け皿でもある（FR-3.22 / #835）
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// タブ切替（FR-2.5.10）
     TabSelect { tab: u64 },
@@ -439,6 +505,20 @@ pub enum Request {
     /// listen ポート検知 + 提案チップ（FR-2.4.4）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される
     PortDetect { enabled: Option<bool> },
+    /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600）の ON/OFF。
+    /// 3 つとも省略時は現在状態の取得のみ。設定は永続化され、
+    /// **稼働中のペインにも次のプロンプトから反映される**（状態ファイルを毎プロンプト読むため）
+    Autosuggest {
+        /// 入力予測そのもの
+        enabled: Option<bool>,
+        /// 確定キーのヒント表示（Issue #614）。ON にすると残り回数が既定へ戻る
+        #[serde(default)]
+        hint: Option<bool>,
+        /// ゴースト表示中の Tab を確定にするか（Issue #614）。
+        /// OFF なら Tab は常に従来の補完
+        #[serde(default)]
+        tab: Option<bool>,
+    },
     /// tmux バックエンドによるセッション永続化（Phase 5.5 / FR-5）の ON/OFF。
     /// `enabled` 省略時は現在状態の取得のみ。切替は**以後生成されるペイン**に効く
     /// （既存ペインのバックエンドは変わらない）。設定は永続化される
@@ -446,6 +526,18 @@ pub enum Request {
     /// タブ/ペインの × ボタン close 時の確認ダイアログ ON/OFF（Issue #172）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は config.yaml に永続化される
     ConfirmClose { enabled: Option<bool> },
+    /// 利用上限（5h / 週次）後の自動復帰（FR-2.27 / Issue #813）の**ペイン単位**の
+    /// オプトイン。`enabled` 省略時は現在状態の取得のみ。
+    /// `pane` は呼び出し側が埋める（CLI は `TAKO_PANE_ID`、MCP は呼び出し元ペイン。
+    /// FR-2.2.7 と同じ規約なので、特定できなければエラーになる）。
+    /// 設定は layout.json に永続化され、再起動・復元をまたいで維持される
+    LimitResume {
+        pane: Option<u64>,
+        enabled: Option<bool>,
+        /// true = 全ペインの状態を一覧する（`enabled` とは併用しない）
+        #[serde(default)]
+        all: Option<bool>,
+    },
     /// 右サイドバー情報パネル（統合 tmux ビュー / git）の表示・幅・ビュー切替と、
     /// 左サイドバーのファイルツリー表示切替（FR-2.16.5。下部ステータスバーのトグルと
     /// 同じ経路）。すべて省略 = 現在状態の取得のみ（AI が成果や状況をユーザーへ見せる
@@ -459,6 +551,8 @@ pub enum Request {
         filetree: Option<bool>,
         /// 左サイドバーの幅（px。Issue #307）
         sidebar_width: Option<f32>,
+        /// ファイルツリーでドット始まりの項目を表示するか（Issue #550。既定 false）
+        show_hidden: Option<bool>,
     },
     /// サイドバー tmux ビューのタブ枠の折りたたみ（FR-2.16.14）。折りたたむと、その
     /// タブ配下の**バックグラウンド項目（裏で実行中のペイン行 + バックグラウンド）を隠し、前面表示中の
@@ -493,6 +587,13 @@ pub enum Request {
         /// プレビューペインにフォーカスを移すか（省略時は false = 元ペインを維持）
         #[serde(default)]
         focus: Option<bool>,
+        /// 新しいタブを作り、そのタブ 1 枚をプレビューにして開く（FR-3.22 / #835。
+        /// Finder の「このアプリケーションで開く」経路と 1:1）。ターミナルは起動しない
+        /// ので、そのタブは「そのファイルだけが載った 1 枚」になる。
+        /// `pane` は表示先の解決には使われなくなるが、相対パスの解決基準としては
+        /// 引き続き有効。`direction`（分割方向）とは分割元が無いため排他
+        #[serde(default)]
+        new_tab: bool,
     },
     /// PDF・画像プレビューの表示倍率・ページ・パン操作（#234）。
     /// 全操作省略時は状態取得。zoom は百分率（150 = 150%）、page は 1 始まり、
@@ -516,11 +617,36 @@ pub enum Request {
         pane: Option<u64>,
         item: Option<usize>,
     },
-    /// PDF プレビュー内のリンク一覧取得（Issue #271）。
+    /// プレビュー内のリンク一覧取得（PDF は Issue #271、Markdown は Issue #680）。
+    /// 応答の `kind` が `"markdown"` / `"pdf"` のどちらの一覧かを示す。
     PreviewLinkList { pane: Option<u64> },
-    /// PDF プレビュー内のリンクをフォローする（Issue #271）。
+    /// プレビュー内のリンクをフォローする（PDF は Issue #271、Markdown は Issue #680）。
     /// `index` は link-list で返る 0 始まりインデックス。
     PreviewFollowLink { pane: Option<u64>, index: usize },
+    /// Markdown プレビューのコードブロック全文をクリップボードへ入れる（Issue #680）。
+    /// `index` は出現順の 0 始まり（省略時は先頭）。UI のコピーボタンと同じ経路。
+    PreviewCopyCode {
+        pane: Option<u64>,
+        index: Option<usize>,
+    },
+    /// GUI モードのチャットビュー本文をクリップボードへ入れる（Issue #725）。
+    ///
+    /// `list` = true なら発話の一覧を返すだけでコピーしない（添字の下見用）。
+    /// `message` は表示順の 0 始まりで、省略時は**最後の assistant 発話**。
+    /// `code` はその発話の中のコードブロック出現順 0 始まり（省略時は本文全体）。
+    /// `markdown` = true のときだけ md ソースをそのまま渡す（既定は画面と同じ
+    /// プレーンテキスト）。UI のコピーボタンと同じ経路。
+    ChatCopy {
+        pane: Option<u64>,
+        #[serde(default)]
+        list: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<usize>,
+        #[serde(default)]
+        markdown: bool,
+    },
     /// 表示中プレビューファイルのライブリロード設定（Issue #233）。
     /// `enabled` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewReload { enabled: Option<bool> },
@@ -703,15 +829,29 @@ pub enum Request {
         cwd: Option<String>,
         description: Option<String>,
     },
-    /// オーケストレーター: プロファイル管理（list / show / set）。
+    /// オーケストレーター: プロファイル管理（list / show / set / create / copy / delete）。
     /// model 未指定のプロファイルは claude CLI の既定モデルで起動する（Issue #27）。
     /// set は model / worker_model / effort / worker_effort の更新と、
     /// clear_model / clear_worker_model による解除（claude 既定へ戻す）に対応。
     /// worker_agent（既定エージェント種別）と agent_* 系（`worker_agents.<agent>` の
-    /// エージェント別 worker 設定）は Issue #120、master_agent は Issue #127 で追加
+    /// エージェント別 worker 設定）は Issue #120、master_agent は Issue #127 で追加。
+    /// kind（master / solo）と create / copy / delete、projects は Issue #721 で追加
     OrchestratorProfiles {
         action: String,
         name: Option<String>,
+        /// プロファイル種別（"master" = tako master の profiles/ / "solo" = tako solo の
+        /// solo-profiles/。省略時 master = 完全後方互換。Issue #721）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// copy の複製元プロファイル名（Issue #721）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// このプロファイルに割り当てるプロジェクトキー（丸ごと置き換え。Issue #721）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projects: Option<Vec<String>>,
+        /// projects の指定を解除する（Issue #721）
+        #[serde(default)]
+        clear_projects: bool,
         /// master のエージェント種別（claude / codex。agy は master 非対応）を設定する
         #[serde(default, skip_serializing_if = "Option::is_none")]
         master_agent: Option<String>,
@@ -777,6 +917,16 @@ pub enum Request {
         worker_account: Option<String>,
         #[serde(default)]
         clear_worker_account: bool,
+        /// master が引き継ぎを始める ctx 閾値（%。50〜60。範囲外はエラー。#749）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ctx_threshold: Option<u32>,
+        #[serde(default)]
+        clear_ctx_threshold: bool,
+        /// 閾値超過時に tako が master へ引き継ぎを促すか（既定 true。#749）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_handoff: Option<bool>,
+        #[serde(default)]
+        clear_auto_handoff: bool,
     },
     /// オーケストレーター: アカウントレジストリの操作（Issue #504 / #709）。
     /// action: list / show / add / remove / use / login
@@ -786,9 +936,9 @@ pub enum Request {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config_dir: Option<String>,
-        /// CLAUDE_CONFIG_DIR を設定しない（既定の資格情報を使う。#512）
-        #[serde(default)]
-        inherit: bool,
+        /// true = CLAUDE_CONFIG_DIR を設定しない（既定の資格情報を使う。Issue #512）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherit: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -895,14 +1045,15 @@ pub enum Request {
     /// 未完了なら `phase: "running"` を返す。完了済みなら出力取得 + auto_close +
     /// レジストリから除去
     OrchestratorRunResult { run_id: String },
-    /// オーケストレーター: worker の permission ダイアログへの応答（#319）。
+    /// オーケストレーター: worker の選択肢ダイアログへの応答（#319 → #748 で一般化）。
     /// ダイアログが画面上に存在することを検証してから選択キーを送る。
     /// 不在時はエラー（誤爆防止）
     /// #662: `answers` 指定で AskUserQuestion（対話ダイアログ）にも応答する
     OrchestratorRespond {
         pane_id: u64,
-        /// permission ダイアログの選択肢番号（1-based）または "yes"/"no" エイリアス。
-        /// AskUserQuestion に答えるときは `answers` を使う（`choice` は省略可）
+        /// 選択肢の番号（画面の番号 or 1-based の順番）／ラベルの部分一致／
+        /// "yes"/"no" エイリアス。**省略すると送信せず構造だけ返す**（下見。#748）。
+        /// AskUserQuestion に質問ごとに答えるときは `answers` を使う（#662）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         choice: Option<String>,
         /// AskUserQuestion への回答（#662）。質問ごとに 1 要素。
@@ -1089,7 +1240,11 @@ pub enum Request {
     /// `"apply"` → 配布系統に応じた更新を実行する（再起動は UI 側の責務）。
     ///   `channel` = "stable"（既定）/ "test" で対象チャンネルを指定。
     /// `"apply-zip"` → 配布系統を問わず zip 経由で強制更新する（brew 失敗時のフォールバック）。
-    /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）
+    /// `"repair"` → broken-brew 状態を修復する（brew install --cask --force で台帳を再締結）。
+    /// `"open"` → アップデート専用画面を開く（Issue #616）。
+    /// `"card"` → 上部通知カードの状態（表示中か / 案内中バージョンのキー）。
+    /// `"card-dismiss"` → カードを閉じ、そのバージョンは以後通知しない（settings.json へ永続化）。
+    /// `"card-show"` → 抑止を解除してカードを出し直す
     ///
     /// `dry_run` = true（apply のみ有効）で「取得と検証まで済ませ、置き換えは実行しない」。
     /// 適用は後戻りできないので `tako git merge` 等と同じく**何が起きるかを先に出せる**
@@ -1184,6 +1339,9 @@ pub enum Request {
         /// "supported" / "degraded" / "pending" / "unsupported"（省略時は全件）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        /// リリースノート用の Known limitations 節を併せて返す（Issue #594）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        known_limitations: bool,
     },
     /// UI 表示言語の状態確認・切替（Issue #435。日英 i18n）。
     /// `action` = "status"（既定）/ "set"（`value` へ変更）。
@@ -1194,6 +1352,21 @@ pub enum Request {
         /// 言語設定: "system"（OS ロケール追従）/ "ja" / "en"（set 時に必須）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<String>,
+    },
+    /// UI 表示モードの状態確認・切替（Issue #691 / #694。GUI ライク表示）。
+    /// `action` = "status"（既定）/ "set"（`mode` へ変更）/ "toggle"（反転）/
+    ///            "release"（`pane` をターミナル表示に。揮発）/ "restore"（解除を戻す）。
+    /// set / toggle は settings.json に永続化され、全ウィンドウへ即時反映される。
+    /// release / restore は永続化しない（再起動で GUI 表示に戻る）
+    UiMode {
+        #[serde(default)]
+        action: Option<String>,
+        /// 表示モード: "terminal" / "gui"（set 時に必須）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// release / restore の対象ペイン（省略時は呼び出し元ペイン）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
     },
     /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）。
     /// `action` = "status"（既定）/ "on" / "off"。設定は settings.json に永続化される
@@ -1426,7 +1599,7 @@ pub enum Request {
     Settings {
         #[serde(default)]
         action: Option<String>,
-        /// タブ指定: general / appearance / runner / setup / sleep / remote / advanced
+        /// タブ指定: general / appearance / runner / profiles / setup / sleep / remote / advanced
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab: Option<String>,
     },
@@ -1439,6 +1612,61 @@ pub enum Request {
         /// 対象ペイン（省略時はデフォルト解決）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
+    },
+    /// 初回起動のウェルカムバナー（Issue #549）。
+    /// `action` = "status"（既定。表示状態と案内コマンド）/ "show"（再表示）/
+    /// "dismiss"（閉じて以後出さない）
+    Welcome {
+        #[serde(default)]
+        action: Option<String>,
+    },
+    /// AI 系設定（tako の宣言的設定 + claude のグローバル指示）の git ベース共有（Issue #513）。
+    /// `action` = "status"（既定）/ "init" / "link" / "unlink" / "push" / "pull" / "list"
+    ConfigShare {
+        #[serde(default)]
+        action: Option<String>,
+        /// link の対象（ローカルパスまたは git URL）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        /// リポジトリの配置先（init / URL からの clone 時。省略時は `~/tako-config-sync`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// init 時に origin として登録するリモート URL
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+        /// push のコミットメッセージ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// push でリモートへ送らない（コミットまでで止める）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_push: bool,
+    },
+    /// AI コマンド提案カード（FR-2.22 / Issue #666）。AI が「ユーザーに実行してほしい
+    /// コマンド」を渡すと、対象ペイン下部にコピー / 新規ペイン実行つきのカードを出す。
+    /// `action` = "show"（既定。カードを出す）/ "list"（表示中カードと論理文字列）/
+    /// "copy"（クリップボードへコピー）/ "run"（新しいペインで実行）/ "dismiss"（閉じる）
+    ShowCommand {
+        #[serde(default)]
+        action: Option<String>,
+        /// 提示するコマンド（action=show で必須。改行を含む複数行コマンドも 1 要素として渡す）
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<String>,
+        /// 何のためのコマンドかの説明（任意。カードの見出しに出る）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// 対象ペイン（省略時は呼び出し元ペイン）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 対象カード ID（copy / run / dismiss。省略時は対象ペインの最新カード。
+        /// dismiss は省略でそのペインの全カード）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<u64>,
+        /// 対象コマンド番号（copy / run。1 始まり。省略時は 1）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// run で新ペインへフォーカスを移すか（既定 false = 手元のペインを触らない）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
     },
 }
 
@@ -1615,5 +1843,49 @@ mod tests {
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
         assert_eq!(Request::SetupRun { answers: None }.kind_name(), "SetupRun");
         assert_eq!(Request::TmuxList { socket: None }.kind_name(), "TmuxList");
+    }
+
+    /// Issue #553: パネルビューの語彙は GUI のタブ表示名と一致する。
+    /// 旧称 `tmux` は受理し続けるが、応答・案内には出さない
+    #[test]
+    fn panel_viewの正式値はgui表示名と一致する() {
+        assert_eq!(PanelViewWire::Fleet.as_str(), "fleet");
+        assert_eq!(PanelViewWire::Orch.as_str(), "orch");
+        assert_eq!(PanelViewWire::Git.as_str(), "git");
+        // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
+        assert_eq!(PanelViewWire::VALUES, ["fleet", "orch", "git"]);
+        assert!(!PanelViewWire::VALUES.contains(&"tmux"));
+    }
+
+    #[test]
+    fn panel_viewは旧称tmuxを後方互換で受理する() {
+        assert_eq!(PanelViewWire::parse("fleet"), Some(PanelViewWire::Fleet));
+        assert_eq!(PanelViewWire::parse("tmux"), Some(PanelViewWire::Fleet));
+        assert_eq!(PanelViewWire::parse("orch"), Some(PanelViewWire::Orch));
+        assert_eq!(PanelViewWire::parse("git"), Some(PanelViewWire::Git));
+        assert_eq!(PanelViewWire::parse("fleets"), None);
+        assert_eq!(PanelViewWire::parse(""), None);
+        // 旧称で入れても応答の表記は正式値に正規化される
+        assert_eq!(PanelViewWire::parse("tmux").unwrap().as_str(), "fleet");
+    }
+
+    /// IPC 上の JSON も同じ後方互換を持つ（旧 CLI からの Request を新 GUI が読める）
+    #[test]
+    fn panel_viewのjsonは旧称を受理し正式値で書き出す() {
+        let from_new: PanelViewWire = serde_json::from_str("\"fleet\"").unwrap();
+        let from_old: PanelViewWire = serde_json::from_str("\"tmux\"").unwrap();
+        assert_eq!(from_new, PanelViewWire::Fleet);
+        assert_eq!(from_old, PanelViewWire::Fleet);
+        assert_eq!(
+            serde_json::to_string(&PanelViewWire::Fleet).unwrap(),
+            "\"fleet\""
+        );
+    }
+
+    /// 不正値の案内は GUI 表示名を先に出し、旧称との対応も添える（#553 案 2）
+    #[test]
+    fn panel_viewの案内文は表示名と旧称の対応を含む() {
+        let hint = PanelViewWire::values_hint();
+        assert_eq!(hint, "fleet | orch | git。tmux は fleet の旧称");
     }
 }

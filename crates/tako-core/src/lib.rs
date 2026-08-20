@@ -6,11 +6,16 @@
 pub mod acceptance_gate;
 pub mod backend;
 pub mod byte_lru;
+pub mod command_card;
+pub mod dialog;
 pub mod git;
+pub mod handoff;
 pub mod header_layout;
 pub mod i18n;
 pub mod keys;
+pub mod limit_resume;
 pub mod links;
+pub mod md_links;
 pub mod osc_tap;
 pub mod pane;
 pub mod pane_log;
@@ -23,6 +28,7 @@ pub mod preview_cache;
 pub mod preview_outline;
 pub mod preview_reload;
 pub mod preview_view;
+pub mod pty_loop;
 pub mod recent;
 pub mod runner;
 pub mod screen;
@@ -31,6 +37,7 @@ pub mod scroll_mirror;
 pub mod shell;
 pub mod shell_integration;
 pub mod shell_send;
+pub mod sidebar;
 pub mod spawn_layout;
 pub mod ssh_config;
 pub mod tab;
@@ -40,17 +47,21 @@ pub mod text_edit;
 pub mod theme;
 pub mod tmux;
 pub mod tmux_backend;
+pub mod ui_mode;
 pub mod workspace;
 
 pub use byte_lru::ByteLru;
+pub use command_card::{CommandCard, CommandCardError, CommandCardId, CommandCards};
 pub use git::{
     CheckoutPreview, CommitBlock, CommitDetail, CommitFileChange, ConflictState, DiffFile,
     DiffHunk, DiffLine, DiffLineKind, DiffTarget, GitBranch, GitCommit, GitStatus, GitStatusEntry,
     GraphLayout, GraphLine, GraphRow, MergeKind, MergeOutcome, MergePreview, RepoOperation,
     COMMIT_MESSAGE_MAX, CONFLICT_BADGE, GRAPH_PALETTE,
 };
+pub use handoff::{NudgeDecision, NudgeInput, NudgeSkip};
 pub use header_layout::{truncate_path_middle, HeaderVisibility, PreviewHeaderVisibility};
 pub use links::{detect_links, detect_links_with_cwd, link_at, DetectedLink, LinkKind};
+pub use md_links::MdLink;
 pub use osc_tap::{OscEvent, PromptMark};
 pub use pane::{Pane, PaneId, PaneOrigin, TitleSource};
 pub use pane_tree::{
@@ -86,6 +97,7 @@ pub use terminal::{
 pub use text_edit::{CursorMovement, SearchHit, TextBuffer, TextEditError};
 pub use theme::{Rgb, Theme};
 pub use tmux::{TmuxSession, TmuxWindow};
+pub use ui_mode::{pane_display, PaneDisplay, PaneDisplayInput, StarterAction, UiMode};
 pub use workspace::{BackgroundPane, WindowId, Workspace, WorkspaceError, WorkspaceWindow};
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。

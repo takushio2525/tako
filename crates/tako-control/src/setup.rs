@@ -159,6 +159,23 @@ pub struct SetupAnswers {
     /// "claude" / "codex" / "agy" = その場で対話起動、"none" = 起動しない。
     /// 省略時は TTY があれば対話で選択、なければ "none"
     pub launch_agent: Option<String>,
+    /// AI 系設定の git 共有（Issue #513）。**オプション**なので省略時は何もしない
+    /// （標準 setup の質問ゼロ原則 #262 を守る）。明示指定か `--review` でだけ配線する
+    pub config_share: Option<SetupConfigShareAnswers>,
+}
+
+/// 設定共有の回答（Issue #513）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupConfigShareAnswers {
+    /// true で配線する。false / 省略なら何もしない
+    pub enable: Option<bool>,
+    /// 既存の共有リポジトリ（ローカルパスまたは git URL）。省略時は新規作成
+    pub repo: Option<String>,
+    /// リポジトリの配置先（省略時は `~/tako-config-sync`）
+    pub path: Option<String>,
+    /// 新規作成時に origin として登録するリモート URL
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -250,7 +267,7 @@ impl SetupAnswers {
 
 // --- config.yaml のスキーマ ---
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupConfig {
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
@@ -268,9 +285,28 @@ pub struct SetupConfig {
     /// タブ/ペインの × ボタン close 時の確認ダイアログ（Issue #172。既定 true）
     #[serde(default = "default_true")]
     pub confirm_close: bool,
-    /// master の ctx% 閾値（#193。この値を超えると MASTER_CTX_HIGH 通知。既定 60）
-    #[serde(default = "default_ctx_threshold")]
-    pub ctx_threshold: u32,
+    /// master が引き継ぎを始める ctx% 閾値（#193 / #749。既定 60、値域 50〜60）。
+    /// `None` = 未設定（既定値を使う）。プロファイル側の `ctx_threshold` が優先される。
+    /// 解決は `orchestrator::resolve_ctx_threshold` が唯一の正
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_threshold: Option<u32>,
+}
+
+/// #566: `#[derive(Default)]` だと `confirm_close` が `bool::default()` = false、
+/// `ctx_threshold` が 0 になり、**config.yaml が無い環境（新規ユーザー・隔離起動）で
+/// serde の既定値と食い違う**。`load_config` は不在時に `Ok(default())` を返すので、
+/// 「既定 true」と書かれた close 確認が実際には無効になっていた。手書きで揃える
+impl Default for SetupConfig {
+    fn default() -> Self {
+        Self {
+            orchestrator: OrchestratorConfig::default(),
+            setup: SetupState::default(),
+            agents_sync: crate::agents_sync::AgentsSyncConfig::default(),
+            spawn_layout: SpawnLayoutSection::default(),
+            confirm_close: default_true(),
+            ctx_threshold: None,
+        }
+    }
 }
 
 /// config.yaml の spawn_layout セクション（Issue #165）。
@@ -365,10 +401,6 @@ pub struct SetupState {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_ctx_threshold() -> u32 {
-    60
 }
 
 impl Default for OrchestratorConfig {
@@ -755,6 +787,26 @@ pub fn render_pending_markdown(pending: &[SetupChange], applied_revision: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #566: config.yaml が無い環境（新規ユーザー・隔離起動）でも
+    /// serde の既定値（confirm_close=true / ctx_threshold=未設定）と一致すること。
+    /// derive(Default) のままだと close 確認が黙って無効になっていた
+    #[test]
+    fn config不在時の既定はserdeの既定と一致する() {
+        let dir = std::env::temp_dir().join(format!("tako-setup-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let missing = dir.join("config.yaml");
+        let loaded = load_config_from(&missing).expect("不在は default で成功する");
+        assert!(loaded.confirm_close, "close 確認は既定 ON");
+        // #749: 未設定は None（「明示 60」と区別できる形）。実効値は resolve が決める
+        assert_eq!(loaded.ctx_threshold, None);
+
+        // 空 YAML（キー未設定）を読んだときの serde 既定とも一致する
+        let from_serde: SetupConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(from_serde.confirm_close, loaded.confirm_close);
+        assert_eq!(from_serde.ctx_threshold, loaded.ctx_threshold);
+        assert!(SetupConfig::default().confirm_close);
+    }
 
     #[test]
     fn setup値はdetected_previous_defaultの順で解決する() {

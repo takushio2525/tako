@@ -1,12 +1,179 @@
 use gpui::{
     canvas, div, fill, point, prelude::*, px, relative, Bounds, BoxShadow, Context, CursorStyle,
     FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, Pixels, SharedString, StyledText,
-    UnderlineStyle, Window,
+    Window,
 };
 use std::path::PathBuf;
-use tako_core::{PaneId, Rect};
+use tako_core::PaneId;
 
 use super::*;
+
+/// Markdown ブロック内の 1 選択行ぶんの選択・検索ハイライト（Issue #656）。
+/// 表だけが 1 ブロックに複数行（セル）を持つため、ブロック単位ではなく行単位で渡す
+#[derive(Default)]
+pub(crate) struct MdLineSel {
+    sel_range: Option<(usize, usize)>,
+    hit_ranges: Vec<(usize, usize, bool)>,
+    /// ⌘ 押下中にホバーしているリンクのバイト範囲（#680。この行に無ければ None）
+    hovered_link: Option<std::ops::Range<usize>>,
+}
+
+/// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
+pub(crate) const MD_COPY_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(2200);
+
+/// プレビュー本文の器がとる余白（#826 で定数化）。
+///
+/// 仮想化した本文（#821 / #826）はこの余白を**リスト側**が持ち、コンテナは
+/// 左右だけを持つ。「本文の器の矩形」を器の違いによらず作るときにも要るので、
+/// 同じリテラルを散らさず 1 か所に置く
+pub(crate) const PREVIEW_BODY_PADDING: f32 = PANE_PADDING + 4.0;
+
+/// コードプレビューの仮想リスト（#821）を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_821_NO_VIRTUAL_LIST=1`）。旧挙動 = ファイル全行の element を毎フレーム作る。
+///
+/// 効果測定と、表示異常が出たときに「仮想化のせい」と「行の作り方のせい」を
+/// 切り分けるために使う。既定は有効（未設定 = 仮想化する）
+pub(crate) fn preview_virtual_list_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_821_NO_VIRTUAL_LIST").is_some())
+}
+
+/// Markdown プレビューの仮想リスト（#826）を切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_826_NO_MD_VIRTUAL_LIST=1`）。旧挙動 = 全ブロックの element を毎フレーム作る。
+///
+/// コード側（#821）と別の変数にしてあるのは、表示異常が出たときに
+/// 「どちらの仮想化のせいか」を切り分けられるようにするため
+pub(crate) fn preview_md_virtual_list_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_826_NO_MD_VIRTUAL_LIST").is_some())
+}
+
+/// 旧挙動（全行を組む）。1 行の作り方は仮想化と同じ `render_preview_code_line` を
+/// 通すので、見た目は完全に一致する
+fn return_all_code_lines(
+    app: &mut TakoApp,
+    pane_id: PaneId,
+    count: usize,
+    cx: &mut Context<TakoApp>,
+) -> Vec<gpui::AnyElement> {
+    (0..count)
+        .map(|ix| app.render_preview_code_line(pane_id, ix, cx))
+        .collect()
+}
+
+/// 旧挙動（全ブロックを組む）。1 ブロックの作り方は仮想化と同じ
+/// `render_preview_md_block` を通すので、見た目は完全に一致する（#826）
+fn return_all_md_blocks(
+    app: &mut TakoApp,
+    pane_id: PaneId,
+    count: usize,
+    cx: &mut Context<TakoApp>,
+) -> Vec<gpui::AnyElement> {
+    (0..count)
+        .map(|ix| app.render_preview_md_block(pane_id, ix, cx))
+        .collect()
+}
+
+/// プレビューペインの Markdown 受け皿（#690）。
+///
+/// 幾何は [`crate::md_view::render_block`] に任せ、ここは「選択・検索・⌘ホバーの
+/// ハイライトを重ねる」「実描画の `TextLayout` を行順に控える」「コードブロックの
+/// コピーボタンを差す」の 3 つだけを担う。呼ばれる順序が `md_block_line_texts` の
+/// 並びと一致するので、自前のカウンタで選択行情報と突き合わせられる。
+struct MdSelectionSink<'a, 'w> {
+    app: &'a TakoApp,
+    cx: &'a mut Context<'w, TakoApp>,
+    pane_id: PaneId,
+    lines: &'a [MdLineSel],
+    /// 次に描く行（`lines` の添字）
+    line: usize,
+    layouts: Vec<Option<TextLayout>>,
+}
+
+impl MdSelectionSink<'_, '_> {
+    /// 検索ヒット → 選択の順に重ねる（選択が上に来る）
+    fn add_search_and_sel(
+        &self,
+        highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
+        text: &str,
+        sel: &MdLineSel,
+    ) {
+        let theme = &self.app.theme;
+        for &(start, end, is_current) in &sel.hit_ranges {
+            let s = snap_to_char_boundary(text, start.min(text.len()));
+            let e = snap_to_char_boundary(text, end.min(text.len()));
+            if s < e {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        background_color: Some(if is_current {
+                            hsla_alpha(theme.yellow, 0.5)
+                        } else {
+                            hsla_alpha(theme.yellow, 0.2)
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
+        }
+        if let Some((start, end)) = sel.sel_range {
+            let s = snap_to_char_boundary(text, start.min(text.len()));
+            let e = snap_to_char_boundary(text, end.min(text.len()));
+            if s < e {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        background_color: Some(hsla_alpha(theme.accent, 0.35)),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
+        }
+    }
+}
+
+impl crate::md_view::MdTextSink for MdSelectionSink<'_, '_> {
+    fn text(
+        &mut self,
+        text: String,
+        mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+        color: tako_core::Rgb,
+        weight: Option<FontWeight>,
+    ) -> gpui::AnyElement {
+        let empty = MdLineSel::default();
+        let sel = self.lines.get(self.line).unwrap_or(&empty);
+        // md 由来 → ⌘ホバー → 検索 → 選択の順（merge_highlights は後の指定が勝つ）
+        if let Some(range) = sel.hovered_link.as_ref() {
+            crate::md_view::push_hovered_link_highlight(
+                &mut highlights,
+                &text,
+                range,
+                &self.app.theme,
+            );
+        }
+        self.add_search_and_sel(&mut highlights, &text, sel);
+        let styled =
+            crate::md_view::styled_line(text, highlights, &self.app.md_text_style(color, weight));
+        let layout = styled.layout().clone();
+        self.line += 1;
+        self.layouts.push(Some(layout));
+        styled.into_any_element()
+    }
+
+    fn spacer(&mut self) {
+        self.line += 1;
+        self.layouts.push(None);
+    }
+
+    fn code_overlay(&mut self, index: usize) -> Option<crate::md_view::MdCodeOverlay> {
+        let app = self.app;
+        let pane_id = self.pane_id;
+        let base = app.theme.font_size;
+        let group = SharedString::from(format!("md-code-{}-{index}", pane_id.as_u64()));
+        let element = app.md_code_copy_button(pane_id, index, group.clone(), base, self.cx);
+        Some(crate::md_view::MdCodeOverlay { group, element })
+    }
+}
 
 /// PDF / 画像 / 動画サムネの描画用 gpui::Image キャッシュ（Issue #168）。
 /// `gpui::Image::from_bytes` は id 生成のために全バイトのハッシュを計算するので、
@@ -273,7 +440,7 @@ impl TakoApp {
         area: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let logical_width = (f32::from(area.size.width) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
+        let logical_width = (f32::from(area.size.width) - PREVIEW_BODY_PADDING * 2.0).max(1.0);
         let desired = preview::PdfRasterKey::for_view(
             self.preview_device_scale,
             self.preview_views
@@ -883,7 +1050,6 @@ impl TakoApp {
     pub(crate) fn render_preview_pane(
         &mut self,
         pane_id: PaneId,
-        rect: Rect,
         area: gpui::Bounds<gpui::Pixels>,
         focused: bool,
         cx: &mut Context<Self>,
@@ -912,6 +1078,18 @@ impl TakoApp {
             _ => Vec::new(),
         };
         self.ensure_preview_image_cache(pane_id, &wanted_images);
+        // #821 / #826: 仮想化する本文（コード / md）以外を出すことになったら
+        // 仮想リスト状態を捨てる。残すと `preview_viewport_bounds` が実際には
+        // 描いていない器の矩形を返し、ドラッグ選択のオートスクロールが効かなくなる
+        // （モード切替・履歴ビュー）
+        if self.preview_changelogs.contains_key(&pane_id)
+            || !matches!(
+                self.previews.get(&pane_id).map(|p| &p.content),
+                Some(preview::PreviewContent::Code(_)) | Some(preview::PreviewContent::Markdown(_))
+            )
+        {
+            self.preview_body_lists.remove(&pane_id);
+        }
         let state = self.previews.get(&pane_id).expect("呼び出し前に確認済み");
         let file_name = state.file_name();
         let path_label = state.path.display().to_string();
@@ -924,7 +1102,6 @@ impl TakoApp {
             editing: bool,
             dirty: bool,
             message: Option<String>,
-            cursor_pos: (usize, usize),
             save_status: Option<preview::SaveStatus>,
             autosave: bool,
             search_visible: bool,
@@ -933,7 +1110,6 @@ impl TakoApp {
             search_cursor: usize,
             search_total: usize,
             search_index: usize,
-            search_hits: Vec<tako_core::SearchHit>,
             replace_text: String,
             replace_cursor: usize,
             ime_text: Option<String>,
@@ -947,16 +1123,16 @@ impl TakoApp {
             editing: edit.editing,
             dirty: edit.dirty(),
             message: edit.message.clone(),
-            cursor_pos: edit.buffer.line_byte_col(edit.buffer.cursor()),
             save_status: edit.save_status.clone(),
             autosave: edit.autosave,
             search_visible: edit.search_visible,
             search_focus: edit.search_focus,
             search_query: edit.search_query.clone(),
             search_cursor: edit.search_cursor,
+            // #826: ヒットの実体（`search_hits`）はここで clone しない。
+            // 行のハイライト範囲は可視部分を組むときに `preview_edits` から直に引く
             search_total: edit.search_hits.len(),
             search_index: edit.search_index,
-            search_hits: edit.search_hits.clone(),
             replace_text: edit.replace_text.clone(),
             replace_cursor: edit.replace_cursor,
             ime_text: if edit.search_visible {
@@ -968,10 +1144,9 @@ impl TakoApp {
         let editing = edit_snap.as_ref().is_some_and(|s| s.editing);
         let dirty = edit_snap.as_ref().is_some_and(|s| s.dirty);
         let edit_message = edit_snap.as_ref().and_then(|s| s.message.clone());
-        let edit_cursor = edit_snap
-            .as_ref()
-            .filter(|s| s.editing)
-            .map(|s| s.cursor_pos);
+        // キャレット位置はコード行を組むときに `render_preview_code_line` が
+        // その場で引き直す（#821 の仮想リストは TakoApp の描画を伴わずに
+        // item を組み直すので、ここでキャプチャすると古い位置が焼き付く）
         let save_status = edit_snap.as_ref().and_then(|s| s.save_status.clone());
         let autosave = edit_snap.as_ref().is_some_and(|s| s.autosave);
         let search_visible = edit_snap.as_ref().is_some_and(|s| s.search_visible);
@@ -1005,8 +1180,8 @@ impl TakoApp {
             .copied()
             .unwrap_or_default();
         let preview_zoom = preview_view.zoom;
-        let viewport_width = (f32::from(area.size.width) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
-        let viewport_height = (f32::from(area.size.height) - (PANE_PADDING + 4.0) * 2.0).max(1.0);
+        let viewport_width = (f32::from(area.size.width) - PREVIEW_BODY_PADDING * 2.0).max(1.0);
+        let viewport_height = (f32::from(area.size.height) - PREVIEW_BODY_PADDING * 2.0).max(1.0);
 
         let pdf_info: Option<(usize, usize)> =
             if let preview::PreviewContent::Pdf(data) = &state.content {
@@ -1042,15 +1217,8 @@ impl TakoApp {
 
         // テキスト行を収集（選択テキスト抽出 + bounds 追跡用）
         let mut line_texts: Vec<String> = Vec::new();
-        // Code / Markdown は StyledText 自身の TextLayout を保持し、ヒットテストと
-        // キャレット描画を実際の shaping 結果に一致させる。
-        let mut line_layouts: Vec<Option<TextLayout>> = Vec::new();
-
-        // 検索ヒット情報（ハイライト描画用）
-        let search_hits = edit_snap
-            .as_ref()
-            .filter(|s| s.search_visible && !s.search_hits.is_empty())
-            .map(|s| (s.search_hits.as_slice(), s.search_index));
+        // Markdown のリンク当たり判定（#680。md 以外は None = 前フレームの残骸を消す）
+        let mut md_link_hits: Option<Vec<MdLinkHit>> = None;
 
         // Code Runner 状態（#453 M4）
         let run_profiles = self
@@ -1075,71 +1243,134 @@ impl TakoApp {
         let changelog_active = self.preview_changelogs.contains_key(&pane_id);
         let changelog_data = self.preview_changelogs.get(&pane_id).cloned();
 
+        // #821 / #826: コード本文と Markdown 本文は仮想リスト（可視部分だけ element を作る）
+        let code_body =
+            changelog_data.is_none() && matches!(&state.content, preview::PreviewContent::Code(_));
+        let md_body = changelog_data.is_none()
+            && matches!(&state.content, preview::PreviewContent::Markdown(_));
+        let code_virtualized = code_body && !preview_virtual_list_disabled();
+        let md_virtualized = md_body && !preview_md_virtual_list_disabled();
+        // 器（スクロール・余白・レイアウトの控え）の扱いはコードと md で同じ
+        let body_virtualized = code_virtualized || md_virtualized;
+
         // 本文要素を先に組む（state の借用をここで終える）
         let body: Vec<gpui::AnyElement> = if let Some(cl) = &changelog_data {
             self.render_changelog_body(pane_id, cl, &theme, cx)
         } else {
             match &state.content {
+                // #821: コードは**可視行だけ**を組む。全行ぶんの element を毎フレーム
+                // 作ると、1 フレームの測定レイアウトノードが taffy の `node_context_data`
+                // に残り続け（`TaffyTree::clear` はこれを消さない）、閉じても解放されない
+                // ヒープが行数に比例して積み上がる。折り返しがあるので行高は一定でなく、
+                // 高さの実測は GPUI の `list`（可変高さ + 遅延計測）へ任せる
                 preview::PreviewContent::Code(lines) => {
-                    let number_width = lines.len().to_string().len();
-                    let mut doc_offset: usize = 0;
-                    lines
+                    let count = lines.len();
+                    line_texts = lines
                         .iter()
-                        .enumerate()
-                        .map(|(i, line)| {
-                            let text: String = line.iter().map(|s| s.text.as_str()).collect();
-                            let line_start = doc_offset;
-                            let line_end = doc_offset + text.len();
-                            doc_offset = line_end + 1; // +1 for '\n'
-                            let sel_range = selection
-                                .as_ref()
-                                .and_then(|s| s.range_for_line(i, text.len()));
-                            let hit_ranges = search_hits
-                                .map(|(hits, idx)| {
-                                    search_hits_for_line(hits, idx, line_start, line_end)
-                                })
-                                .unwrap_or_default();
-                            line_texts.push(text);
-                            let cursor_col = edit_cursor
-                                .filter(|(line, _)| *line == i)
-                                .map(|(_, col)| col);
-                            let (element, layout) = self.preview_code_line_sel(
-                                line,
-                                Some((i + 1, number_width)),
-                                (sel_range, cursor_col),
-                                &hit_ranges,
-                                cx,
-                            );
-                            line_layouts.push(Some(layout));
-                            element.into_any_element()
+                        .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
+                        .collect();
+                    // 行頭バイトオフセット（検索ヒットの行内範囲を出すのに要る）
+                    let mut starts = Vec::with_capacity(count);
+                    let mut doc_offset: usize = 0;
+                    for text in &line_texts {
+                        starts.push(doc_offset);
+                        doc_offset += text.len() + 1; // +1 for '\n'
+                    }
+                    self.preview_line_starts.insert(pane_id, starts);
+                    // 可視行が自分の枠へ書き込む器。索引は常に文書の行番号。
+                    // ここで先に入れておくのが要点で、`list` の item は
+                    // このあとの prepaint で自分の枠へ書き込む
+                    self.preview_text_layouts.insert(pane_id, vec![None; count]);
+                    if !code_virtualized {
+                        // A/B 計測とトラブルシュート用の旧挙動（全行を組む）。
+                        // 1 行の作り方は仮想化と同じ関数を通すので見た目は完全に一致する
+                        self.preview_body_lists.remove(&pane_id);
+                        return_all_code_lines(self, pane_id, count, cx)
+                    } else {
+                        let list_state =
+                            self.preview_body_list_state(pane_id, PreviewBodyKind::Code, count);
+                        let app = cx.entity().downgrade();
+                        vec![gpui::list(list_state, move |ix, _window, cx| {
+                            let Some(app) = app.upgrade() else {
+                                return div().into_any_element();
+                            };
+                            app.update(cx, |app, cx| app.render_preview_code_line(pane_id, ix, cx))
                         })
-                        .collect()
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                        .py(px(PREVIEW_BODY_PADDING))
+                        .flex_1()
+                        .into_any_element()]
+                    }
                 }
+                // #826: Markdown も**可視ブロックだけ**を組む（機序はコードと同じ。
+                // 全ブロックの element を毎フレーム作ると 1 フレームぶんの測定
+                // レイアウトノードが taffy に居座り、閉じても戻らない）。
+                // ブロック高さは表・コードブロック・折り返しで不定なので、
+                // 高さの実測は `list`（可変高さ + 遅延計測）へ任せる
                 preview::PreviewContent::Markdown(blocks) => {
+                    // #656: 表は 1 ブロックの中に複数の選択行（セル）を持つので、
+                    // 行番号はブロック番号とは別に数える。要素は 1 ブロック = 1 個を
+                    // 保つ（目次ジャンプ #232 がブロック番号で子要素を指すため）
+                    //
+                    // ここでは**要素を作らず**、行テキスト・行頭オフセット・ブロック索引
+                    // だけを 1 パスで作る（文字列の連結だけなので taffy ノードは増えない）。
+                    // これが選択・コピー・リンク・検索の座標系の正で、可視ブロックの
+                    // 組み立て（`render_preview_md_block`）はここから引く
+                    let count = blocks.len();
                     let mut doc_offset: usize = 0;
-                    blocks
-                        .iter()
-                        .enumerate()
-                        .map(|(i, block)| {
-                            let text = md_block_plain_text(block);
-                            let line_start = doc_offset;
-                            let line_end = doc_offset + text.len();
-                            doc_offset = line_end + 1;
-                            let sel_range = selection
-                                .as_ref()
-                                .and_then(|s| s.range_for_line(i, text.len()));
-                            let hit_ranges = search_hits
-                                .map(|(hits, idx)| {
-                                    search_hits_for_line(hits, idx, line_start, line_end)
-                                })
-                                .unwrap_or_default();
+                    let mut line_index: usize = 0;
+                    let mut code_blocks: usize = 0;
+                    let mut starts: Vec<usize> = Vec::new();
+                    let mut index: Vec<MdBlockIndex> = Vec::with_capacity(count);
+                    for block in blocks.iter() {
+                        let texts = md_block_line_texts(block);
+                        let code_index =
+                            matches!(block.kind, preview::MdBlockKind::CodeBlock { .. }).then(
+                                || {
+                                    code_blocks += 1;
+                                    code_blocks - 1
+                                },
+                            );
+                        index.push(MdBlockIndex {
+                            first_line: line_index,
+                            line_count: texts.len(),
+                            code_index,
+                        });
+                        for text in texts {
+                            starts.push(doc_offset);
+                            doc_offset += text.len() + 1; // +1 for '\n'
+                            line_index += 1;
                             line_texts.push(text);
-                            let (element, layout) =
-                                self.preview_md_block_sel(block, sel_range, &hit_ranges);
-                            line_layouts.push(layout);
-                            element
+                        }
+                    }
+                    self.preview_line_starts.insert(pane_id, starts);
+                    self.preview_md_block_index.insert(pane_id, index);
+                    // 可視ブロックが自分の枠へ書き込む器。索引は常に文書の行番号
+                    self.preview_text_layouts
+                        .insert(pane_id, vec![None; line_index]);
+                    // 当たり判定は「render とまったく同じ並び」でなければ索引が
+                    // 食い違うので、CLI / MCP 一覧と同じ純関数から作る（#680）
+                    md_link_hits = Some(md_document_links(blocks));
+                    if !md_virtualized {
+                        // A/B 計測とトラブルシュート用の旧挙動（全ブロックを組む）。
+                        // 1 ブロックの作り方は仮想化と同じ関数を通すので見た目は一致する
+                        self.preview_body_lists.remove(&pane_id);
+                        return_all_md_blocks(self, pane_id, count, cx)
+                    } else {
+                        let list_state =
+                            self.preview_body_list_state(pane_id, PreviewBodyKind::Markdown, count);
+                        let app = cx.entity().downgrade();
+                        vec![gpui::list(list_state, move |ix, _window, cx| {
+                            let Some(app) = app.upgrade() else {
+                                return div().into_any_element();
+                            };
+                            app.update(cx, |app, cx| app.render_preview_md_block(pane_id, ix, cx))
                         })
-                        .collect()
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                        .py(px(PREVIEW_BODY_PADDING))
+                        .flex_1()
+                        .into_any_element()]
+                    }
                 }
                 preview::PreviewContent::Image(_) => {
                     // Issue #168: Image はキャッシュ済み（ensure_preview_image_cache）
@@ -1827,11 +2058,9 @@ impl TakoApp {
 
         div()
             .id(("pane", pane_id.as_u64()))
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
+            // #786: 配置は `PaneBody` を包む cached ビューのスタイルが持つ
+            .relative()
+            .size_full()
             .bg(rgba(theme.background))
             .border(px(PANE_BORDER))
             .rounded(px(7.0))
@@ -2552,7 +2781,11 @@ impl TakoApp {
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.close_pane_button(pane_id, cx);
+                                        this.close_pane_button(
+                                            pane_id,
+                                            tako_core::pane_log::CloseOrigin::PaneButton,
+                                            cx,
+                                        );
                                     }))
                                     .child(
                                         svg()
@@ -2897,7 +3130,18 @@ impl TakoApp {
                 // 効かないバグの根因だった（release ビルドの .app 環境で顕在化）。
                 // 古い bounds は同じフレームの paint で上書きされるため実害なし。
                 // ペイン削除時は remove_pane_with で除去される。
-                self.preview_text_layouts.insert(pane_id, line_layouts);
+                //
+                // #821 / #826: コード本文と md 本文は body を組む前に器を入れてあり、
+                // 可視部分がそこへ自分で書き込む（リストの item は prepaint で走るので、
+                // ここで入れ直すと可視ぶんを捨ててしまう）。それ以外の中身
+                // （PDF / 画像 / 履歴ビュー）は行レイアウトを持たないので空にする
+                if !code_body && !md_body {
+                    self.preview_text_layouts.insert(pane_id, Vec::new());
+                }
+                // #680: md 以外のプレビューへ切り替わったら当たり判定も空にする
+                // （行番号は content ごとに意味が変わるため、残すと誤ヒットになる）
+                self.preview_md_link_hits
+                    .insert(pane_id, md_link_hits.take().unwrap_or_default());
                 let scroll_handle = self
                     .preview_scroll_handles
                     .entry(pane_id)
@@ -2908,12 +3152,19 @@ impl TakoApp {
                 div()
                     .id(("preview-scroll", pane_id.as_u64()))
                     .flex_1()
-                    .p(px(PANE_PADDING + 4.0))
+                    // #821 / #826: 仮想化した本文は余白を `list` 側へ移す。div スクロールは
+                    // 内容を padding の上まで描いて（overflow のクリップは padding box）
+                    // 端に半端な行が覗くが、`list` は content box の内側にしか描けない。
+                    // 余白ごとリストへ渡すとクリップ位置が旧経路と一致する
+                    .when(body_virtualized, |d| d.px(px(PREVIEW_BODY_PADDING)))
+                    .when(!body_virtualized, |d| d.p(px(PREVIEW_BODY_PADDING)))
                     .flex()
                     .flex_col()
-                    .track_scroll(&scroll_handle)
+                    // #821 / #826: 仮想化した本文は中の `list` が自分でスクロールを持つ。
+                    // ここに overflow スクロールを重ねると二重の器になるので付けない
+                    .when(!body_virtualized, |d| d.track_scroll(&scroll_handle))
                     .when(zoomable, |d| d.overflow_scroll())
-                    .when(!zoomable, |d| d.overflow_y_scroll())
+                    .when(!zoomable && !body_virtualized, |d| d.overflow_y_scroll())
                     // #654: ホイールがこのコンテナまで届いているかを残す（診断時のみ）。
                     // gpui の組み込みスクロール処理とは独立で、伝播も止めない
                     .when(crate::scroll_diag_enabled(), |d| {
@@ -2925,6 +3176,9 @@ impl TakoApp {
                         if self
                             .preview_pdf_hovered_link
                             .is_some_and(|(pid, _)| pid == pane_id)
+                            || self
+                                .preview_md_hovered_link
+                                .is_some_and(|(pid, _)| pid == pane_id)
                         {
                             CursorStyle::PointingHand
                         } else if mode == preview::PreviewMode::Image {
@@ -3000,6 +3254,22 @@ impl TakoApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            // ⌘クリック: Markdown リンクを既定ブラウザで開く（#680）。
+                            // ホバー状態を優先し、⌘ 単独押下の直後（ホバー未更新）でも
+                            // 位置から引き直して開く
+                            if ev.modifiers.platform && ev.click_count == 1 {
+                                let md_index = this
+                                    .preview_md_hovered_link
+                                    .filter(|(pid, _)| *pid == pane_id)
+                                    .map(|(_, idx)| idx)
+                                    .or_else(|| this.md_link_at_position(pane_id, ev.position));
+                                if let Some(index) = md_index {
+                                    this.open_md_link(pane_id, index);
+                                    this.preview_md_hovered_link = None;
+                                    cx.notify();
+                                    return;
+                                }
+                            }
                             // ⌘クリック: PDF リンクを開く（#271）
                             if ev.modifiers.platform && ev.click_count == 1 {
                                 if let Some(link_idx) = this.preview_pdf_hovered_link
@@ -3061,6 +3331,9 @@ impl TakoApp {
                     .children(truncated.then(|| {
                         div()
                             .pt_2()
+                            // #821 / #826: 仮想化した本文では縦の余白がリスト側に
+                            // あるので、このフッタは自分で下の余白を持つ
+                            .when(body_virtualized, |d| d.pb(px(PREVIEW_BODY_PADDING)))
                             .text_size(px(11.0))
                             .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.8))
                             .child(crate::ui_text::preview::tail_omitted())
@@ -3096,58 +3369,338 @@ impl TakoApp {
             }))
     }
 
-    /// Markdown インラインスパン列 → (テキスト, ハイライト範囲)
-    fn preview_md_text(
-        &self,
-        spans: &[preview::MdSpan],
-    ) -> (String, Vec<(std::ops::Range<usize>, HighlightStyle)>) {
-        let theme = &self.theme;
-        let mut text = String::new();
-        let mut highlights = Vec::new();
-        for span in spans {
-            let start = text.len();
-            text.push_str(&span.text);
-            let styled = span.bold || span.italic || span.code || span.strike || span.link;
-            if !styled {
-                continue;
-            }
-            highlights.push((
-                start..text.len(),
-                HighlightStyle {
-                    color: if span.code {
-                        Some(hsla(theme.yellow))
-                    } else if span.link {
-                        Some(hsla(theme.accent))
-                    } else {
-                        None
-                    },
-                    background_color: span.code.then(|| hsla(theme.tab_bar_background)),
-                    font_weight: span.bold.then_some(FontWeight::BOLD),
-                    font_style: span.italic.then_some(FontStyle::Italic),
-                    underline: span.link.then(|| UnderlineStyle {
-                        thickness: px(1.0),
-                        color: None,
-                        wavy: false,
-                    }),
-                    strikethrough: span.strike.then_some(StrikethroughStyle {
-                        thickness: px(1.0),
-                        color: None,
-                    }),
-                    ..HighlightStyle::default()
-                },
-            ));
+    /// Markdown 用のテキスト既定スタイル。`StyledText` の run は色とフォントを焼き込むため
+    /// （サイズと行高だけが親要素から継承される）、文字色・太さはここで渡す必要がある。
+    /// 実体は `md_view`（アップデート詳細画面と共有。#690）
+    fn md_text_style(&self, color: tako_core::Rgb, weight: Option<FontWeight>) -> TextStyle {
+        crate::md_view::md_text_style(&self.theme, color, weight)
+    }
+
+    /// ペインが消えたときにプレビュー由来の状態を**一式**落とす（#821）。
+    ///
+    /// GUI の close（`remove_pane_with`）と CLI / MCP の close（`detach_session`）が
+    /// それぞれ独自にフィールドを列挙していたため、後から足したものが片方だけに
+    /// 入る事故が起きていた（実測: CLI / MCP で閉じたコードプレビューは
+    /// `preview_line_texts` / `preview_text_layouts` を落とさず、3,884 行の
+    /// ファイルなら 1 回の開閉あたり約 0.8 MB がプロセス終了まで残っていた）。
+    /// 追加するフィールドはここへ足せば両方へ効く（番犬テストで拘束してある）。
+    pub(crate) fn drop_preview_pane_state(&mut self, pane_id: PaneId) {
+        self.previews.remove(&pane_id);
+        self.preview_edits.remove(&pane_id);
+        self.preview_views.remove(&pane_id);
+        self.preview_scroll_handles.remove(&pane_id);
+        self.preview_selections.remove(&pane_id);
+        self.preview_line_bounds.remove(&pane_id);
+        self.preview_line_texts.remove(&pane_id);
+        self.preview_line_starts.remove(&pane_id);
+        self.preview_text_layouts.remove(&pane_id);
+        self.preview_body_lists.remove(&pane_id);
+        self.preview_md_block_index.remove(&pane_id);
+        self.preview_changelogs.remove(&pane_id);
+        self.preview_run_profiles.remove(&pane_id);
+        self.preview_run_selected.remove(&pane_id);
+        if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
+            self.preview_run_menu = None;
         }
-        (text, highlights)
+        self.preview_pdf_char_bounds.remove(&pane_id);
+        self.preview_pdf_highlight_paint_count.remove(&pane_id);
+        self.preview_pdf_page_image_bounds.remove(&pane_id);
+        self.pending_pdf_rasters.remove(&pane_id);
+        self.active_pdf_rasters.remove(&pane_id);
+        self.remove_preview_image_cache(pane_id);
+        self.video_players.remove(&pane_id);
+        self.remove_video_frame_cache(pane_id);
+        self.video_seek_bar_bounds.remove(&pane_id);
+        self.forget_md_links(pane_id);
+    }
+
+    /// プレビュー本文のビューポート矩形（#821 / #826）。
+    ///
+    /// 仮想化した本文（コード / md）は中の `list` が器なので `ListState` の実測値を、
+    /// それ以外はこれまでどおりスクロールハンドルの実測値を返す。ドラッグ選択の
+    /// 端到達判定（#309）はどちらの器でも同じ座標系で動く
+    pub(crate) fn preview_viewport_bounds(&self, pane_id: PaneId) -> Option<Bounds<Pixels>> {
+        if let Some((list, _, _)) = self.preview_body_lists.get(&pane_id) {
+            let bounds = list.viewport_bounds();
+            if f32::from(bounds.size.height) > 0.0 {
+                return Some(bounds);
+            }
+        }
+        self.preview_scroll_handles
+            .get(&pane_id)
+            .map(gpui::ScrollHandle::bounds)
+    }
+
+    /// プレビュー本文の仮想リスト状態（コード = #821 / md = #826）。
+    /// item 数が変わったら作り直す。
+    ///
+    /// ライブリロード（#233）で行数・ブロック数が動いても見ている位置を失わないよう、
+    /// 論理スクロール位置（item + item 内オフセット）を作り直しの前後で持ち越す。
+    /// **種別が変わったとき（コード ⇄ md のモード切替）は持ち越さない**:
+    /// item の意味が「行」から「ブロック」へ変わるので、同じ番号は別の場所を指す
+    fn preview_body_list_state(
+        &mut self,
+        pane_id: PaneId,
+        kind: PreviewBodyKind,
+        count: usize,
+    ) -> gpui::ListState {
+        if let Some((state, built_kind, built_for)) = self.preview_body_lists.get(&pane_id) {
+            if *built_kind == kind && *built_for == count {
+                return state.clone();
+            }
+            let same_kind = *built_kind == kind;
+            let state = state.clone();
+            let keep = state.logical_scroll_top();
+            state.reset(count);
+            if same_kind && keep.item_ix < count {
+                state.scroll_to(keep);
+            }
+            self.preview_body_lists
+                .insert(pane_id, (state.clone(), kind, count));
+            return state;
+        }
+        // overdraw = 画面外にも描いておく高さ。ドラッグ選択がペインの端を
+        // またぐときに「行がまだ無い」状態を避けるため広めに取る
+        let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(600.0));
+        self.preview_body_lists
+            .insert(pane_id, (state.clone(), kind, count));
+        state
+    }
+
+    /// プレビュー本文の**器そのもの**の矩形（#826）。
+    ///
+    /// [`Self::preview_viewport_bounds`] が返すのは仮想リストの内側（余白の内）なので、
+    /// 「本文がこの矩形からはみ出していないか」を旧経路（div スクロールの border box）と
+    /// 同じ土俵で見るには、リスト側が持っている左右の余白を戻す必要がある
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn preview_body_bounds(&self, pane_id: PaneId) -> Option<Bounds<Pixels>> {
+        if let Some((list, _, _)) = self.preview_body_lists.get(&pane_id) {
+            let inner = list.viewport_bounds();
+            if f32::from(inner.size.height) > 0.0 {
+                let pad = px(PREVIEW_BODY_PADDING);
+                return Some(Bounds {
+                    origin: gpui::point(inner.origin.x - pad, inner.origin.y),
+                    size: gpui::size(inner.size.width + pad * 2.0, inner.size.height),
+                });
+            }
+        }
+        self.preview_scroll_handles
+            .get(&pane_id)
+            .map(gpui::ScrollHandle::bounds)
+    }
+
+    /// 仮想リストが並べているのが Markdown ブロックなら、その `ListState`（#826）。
+    ///
+    /// 目次ジャンプ（#232）のように「ブロック番号で位置を指す」操作は、
+    /// スクロールハンドルではなくこちらを通す（未描画のブロックへも飛べる）
+    pub(crate) fn preview_md_list(&self, pane_id: PaneId) -> Option<&gpui::ListState> {
+        self.preview_body_lists
+            .get(&pane_id)
+            .filter(|(_, kind, _)| *kind == PreviewBodyKind::Markdown)
+            .map(|(list, _, _)| list)
+    }
+
+    /// コードプレビューの 1 行を組む（#821 の仮想リストから可視行だけ呼ばれる）。
+    ///
+    /// 選択・検索・キャレットは**呼ばれた時点の状態**から引き直す。リストは
+    /// `TakoApp` の描画を伴わないスクロールでも item を組み直すので、
+    /// 呼び出し側でキャプチャした値を使うと 1 フレーム古い状態が焼き付く。
+    pub(crate) fn render_preview_code_line(
+        &mut self,
+        pane_id: PaneId,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        let Some(preview::PreviewContent::Code(lines)) =
+            self.previews.get(&pane_id).map(|s| &s.content)
+        else {
+            return empty();
+        };
+        let Some(line) = lines.get(ix) else {
+            return empty();
+        };
+        let number_width = lines.len().to_string().len();
+        let text_len = self
+            .preview_line_texts
+            .get(&pane_id)
+            .and_then(|texts| texts.get(ix))
+            .map(String::len)
+            .unwrap_or_else(|| line.iter().map(|s| s.text.len()).sum());
+        let sel_range = self
+            .preview_selections
+            .get(&pane_id)
+            .and_then(|s| s.range_for_line(ix, text_len));
+        let edit = self.preview_edits.get(&pane_id);
+        let cursor_col = edit
+            .filter(|e| e.editing)
+            .map(|e| e.buffer.line_byte_col(e.buffer.cursor()))
+            .filter(|(l, _)| *l == ix)
+            .map(|(_, c)| c);
+        let hit_ranges = edit
+            .filter(|e| e.search_visible && !e.search_hits.is_empty())
+            .and_then(|e| {
+                let start = *self.preview_line_starts.get(&pane_id)?.get(ix)?;
+                Some(search_hits_for_line(
+                    &e.search_hits,
+                    e.search_index,
+                    start,
+                    start + text_len,
+                ))
+            })
+            .unwrap_or_default();
+        // #821: レイアウトの控えは **paint 時**に入れる。仮想リストは高さの見積もりで
+        // item を `layout_as_root` するだけのことがあり、その `TextLayout` は
+        // prepaint を通っていないので `bounds()` / `index_for_position()` が
+        // panic する（gpui `elements/text.rs` は None を unwrap する）。
+        // 実測: 描かれていない行を掴んだ瞬間にプロセスごと abort した
+        let (element, _layout) = self.preview_code_line_sel(
+            line,
+            Some((ix + 1, number_width)),
+            (sel_range, cursor_col),
+            &hit_ranges,
+            Some((cx.entity().downgrade(), pane_id, ix)),
+            cx,
+        );
+        // #821: 仮想リストの item は**伸ばしてくれる親を持たない**（`layout_as_root` で
+        // 単独に解かれる）。幅を指定しないと行が content 幅（= 折り返さない最大幅）で
+        // 解かれ、長い行の折り返しが消える。実測で 410px 幅の行が 3272px になった。
+        // 100% にすると `list` が渡す可用幅へ吸い付き、旧経路（flex 列の stretch）と
+        // 同じ幅・同じ折り返しになる
+        element.w_full().into_any_element()
+    }
+
+    /// Markdown プレビューの 1 ブロックを組む（#826 の仮想リストから可視ブロックだけ呼ばれる）。
+    ///
+    /// 選択・検索・⌘ホバーは**呼ばれた時点の状態**から引き直す（理由は #821 と同じで、
+    /// リストは `TakoApp` の描画を伴わないスクロールでも item を組み直すため）。
+    /// 行番号・行頭バイトオフセット・コードブロック番号は render が 1 パスで作った
+    /// `preview_md_block_index` / `preview_line_starts` から引くので、全ブロックを
+    /// 組んでいたときと同じ座標系になる（`md_block_line_texts` の並びが正）
+    pub(crate) fn render_preview_md_block(
+        &mut self,
+        pane_id: PaneId,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        let Some(meta) = self
+            .preview_md_block_index
+            .get(&pane_id)
+            .and_then(|index| index.get(ix))
+            .copied()
+        else {
+            return empty();
+        };
+        let Some(preview::PreviewContent::Markdown(blocks)) =
+            self.previews.get(&pane_id).map(|s| &s.content)
+        else {
+            return empty();
+        };
+        let Some(block) = blocks.get(ix) else {
+            return empty();
+        };
+        // ⌘ホバー中のリンク（当たり判定は文書全体の行番号で持っている）
+        let hovered = self
+            .preview_md_hovered_link
+            .filter(|(pid, _)| *pid == pane_id)
+            .and_then(|(_, idx)| {
+                self.preview_md_link_hits
+                    .get(&pane_id)
+                    .and_then(|links| links.get(idx))
+                    .map(|hit| (hit.line, hit.range.clone()))
+            });
+        let search = self
+            .preview_edits
+            .get(&pane_id)
+            .filter(|e| e.search_visible && !e.search_hits.is_empty());
+        let texts = self.preview_line_texts.get(&pane_id);
+        let starts = self.preview_line_starts.get(&pane_id);
+        let mut sels: Vec<MdLineSel> = Vec::with_capacity(meta.line_count);
+        for offset in 0..meta.line_count {
+            let line = meta.first_line + offset;
+            let text_len = texts
+                .and_then(|t| t.get(line))
+                .map(String::len)
+                .unwrap_or(0);
+            let sel_range = self
+                .preview_selections
+                .get(&pane_id)
+                .and_then(|s| s.range_for_line(line, text_len));
+            let hit_ranges = search
+                .zip(starts.and_then(|s| s.get(line)))
+                .map(|(e, start)| {
+                    search_hits_for_line(&e.search_hits, e.search_index, *start, start + text_len)
+                })
+                .unwrap_or_default();
+            let hovered_link = hovered
+                .as_ref()
+                .filter(|(hit_line, _)| *hit_line == line)
+                .map(|(_, range)| range.clone());
+            sels.push(MdLineSel {
+                sel_range,
+                hit_ranges,
+                hovered_link,
+            });
+        }
+        let (element, layouts) =
+            self.preview_md_block_sel(pane_id, block, &sels, meta.code_index, cx);
+
+        // #826: レイアウトの控えは **paint 時**に入れる。仮想リストは高さの見積もりで
+        // item を `layout_as_root` するだけのことがあり、その `TextLayout` は prepaint を
+        // 通っていないので `bounds()` / `index_for_position()` が panic する（#821 で実測）
+        let app = cx.entity().downgrade();
+        let first_line = meta.first_line;
+        let recorder = canvas(
+            |_, _, _| (),
+            move |_, _, _window, cx| {
+                let Some(app) = app.upgrade() else {
+                    return;
+                };
+                app.update(cx, |app, _| {
+                    let Some(slots) = app.preview_text_layouts.get_mut(&pane_id) else {
+                        return;
+                    };
+                    for (offset, layout) in layouts.iter().enumerate() {
+                        if let Some(slot) = slots.get_mut(first_line + offset) {
+                            *slot = layout.clone();
+                        }
+                    }
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        // #821 と同じ理由で `w_full` が要る（リストの item は伸ばしてくれる親を持たない）。
+        // ブロック側は幅を持たず親の stretch に頼っているので、包む器は
+        // 旧経路のコンテナと同じ **flex 列**にする（幅・折り返しが変わらない）
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .child(element)
+            .child(recorder)
+            .into_any_element()
     }
 
     /// 選択ハイライト + 検索ヒットハイライト付きコード行。返した TextLayout は
     /// StyledText と共有され、ヒットテストとキャレット位置を実描画の shaping に一致させる。
+    ///
+    /// `record` を渡すと、**実際に描かれたときだけ** `preview_text_layouts` の
+    /// その行の枠へレイアウトを控える（#821）。キャレット用の canvas に相乗りするので
+    /// 要素は増えない。prepaint を通っていないレイアウトを外へ出さないための仕組みで、
+    /// 出すと `bounds()` の unwrap でプロセスごと落ちる
     fn preview_code_line_sel(
         &self,
         line: &preview::Line,
         number: Option<(usize, usize)>,
         interaction: (Option<(usize, usize)>, Option<usize>),
         search_hit_ranges: &[(usize, usize, bool)],
+        record: Option<(gpui::WeakEntity<Self>, PaneId, usize)>,
         _cx: &mut Context<Self>,
     ) -> (gpui::Div, TextLayout) {
         let (sel_range, cursor_col) = interaction;
@@ -3158,7 +3711,8 @@ impl TakoApp {
             let start = text.len();
             text.push_str(&span.text);
             let style = HighlightStyle {
-                color: span.color.map(hsla),
+                // syntect はダーク配色固定。ライトの面で読める明度へ落とす（#669）
+                color: span.color.map(|c| hsla(theme.adapt_syntax_color(c))),
                 font_weight: span.bold.then_some(FontWeight::BOLD),
                 font_style: span.italic.then_some(FontStyle::Italic),
                 ..HighlightStyle::default()
@@ -3210,7 +3764,23 @@ impl TakoApp {
         let caret_color = hsla(theme.accent);
         let caret_canvas = canvas(
             |_, _, _| (),
-            move |_, _, window, _| {
+            move |_, _, window, cx| {
+                // #821: ここまで来た = この行は実際に描かれた（prepaint 済みで
+                // bounds が入っている）。控えるのはこの瞬間だけ
+                if let Some((entity, pane_id, ix)) = &record {
+                    if let Some(entity) = entity.upgrade() {
+                        let layout = caret_layout.clone();
+                        entity.update(cx, |app, _| {
+                            if let Some(slot) = app
+                                .preview_text_layouts
+                                .get_mut(pane_id)
+                                .and_then(|slots| slots.get_mut(*ix))
+                            {
+                                *slot = Some(layout);
+                            }
+                        });
+                    }
+                }
                 if let Some(origin) =
                     caret_byte.and_then(|byte| caret_layout.position_for_index(byte))
                 {
@@ -3260,182 +3830,140 @@ impl TakoApp {
     }
 
     /// 選択ハイライト + 検索ヒットハイライト付き Markdown ブロック + 実描画 TextLayout。
+    ///
+    /// 幾何とテーマ色は [`crate::md_view::render_block`] に一本化してあり（アップデート
+    /// 詳細画面と共有。#690）、ここは**インタラクション層**だけを受け皿として足す:
+    /// 選択・検索・⌘ホバーのハイライト、TextLayout の控え、コピーボタン。
+    ///
+    /// `lines` は `md_block_line_texts` と同じ順序・同じ個数の選択行情報。返す TextLayout も
+    /// 同じ順序・同じ個数で、ヒットテストと選択の座標系を実描画の shaping に一致させる。
+    /// 表だけが 1 ブロック = 複数行（セル）になる（Issue #656）。
     fn preview_md_block_sel(
         &self,
+        pane_id: PaneId,
         block: &preview::MdBlock,
-        sel_range: Option<(usize, usize)>,
-        search_hit_ranges: &[(usize, usize, bool)],
-    ) -> (gpui::AnyElement, Option<TextLayout>) {
+        lines: &[MdLineSel],
+        code_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> (gpui::AnyElement, Vec<Option<TextLayout>>) {
         let theme = self.theme.clone();
+        let mut sink = MdSelectionSink {
+            app: self,
+            cx,
+            pane_id,
+            lines,
+            line: 0,
+            layouts: Vec::with_capacity(lines.len()),
+        };
+        let element = crate::md_view::render_block(&theme, block, code_index, &mut sink);
+        let layouts = sink.layouts;
+        debug_assert_eq!(
+            layouts.len(),
+            lines.len(),
+            "描画した行数と選択行数が一致していない（md_block_line_texts と順序を揃える）"
+        );
+        (element, layouts)
+    }
 
-        let add_search_and_sel =
-            |highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>, text: &str| {
-                for &(start, end, is_current) in search_hit_ranges {
-                    let s = snap_to_char_boundary(text, start.min(text.len()));
-                    let e = snap_to_char_boundary(text, end.min(text.len()));
-                    if s < e {
-                        highlights.push((
-                            s..e,
-                            HighlightStyle {
-                                background_color: Some(if is_current {
-                                    hsla_alpha(theme.yellow, 0.5)
-                                } else {
-                                    hsla_alpha(theme.yellow, 0.2)
-                                }),
-                                ..HighlightStyle::default()
-                            },
-                        ));
-                    }
+    /// コードブロック右上のコピーボタン（#680）。
+    ///
+    /// 常時表示だが待機中はアイコンのみ・淡色で控えめにし、ホバーとコピー直後だけ
+    /// 濃くする。**「ホバーで初めて現れる」方式（`opacity(0)` + `group_hover`）は
+    /// 採らない**: 実機（隔離 GUI + 実マウス）でホバーしても復帰せず、ボタンが
+    /// 一度も見えないことを実測したため。見えないボタンは押せないので常時表示が正。
+    /// コピー本体は CLI / MCP と同じ `copy_preview_code_block` を通す（開発不変条件）
+    fn md_code_copy_button(
+        &self,
+        pane_id: PaneId,
+        index: usize,
+        group: SharedString,
+        base: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = &self.theme;
+        let copied = self.preview_md_copied.is_some_and(|(pid, i, at)| {
+            pid == pane_id && i == index && at.elapsed() < MD_COPY_FEEDBACK
+        });
+        let (icon, color) = if copied {
+            (crate::file_icons::ui_icon::CHECK, theme.green)
+        } else {
+            (crate::file_icons::ui_icon::COPY, theme.text_secondary)
+        };
+        let icon_size = base * 0.85;
+        div()
+            .id(("md-code-copy", (pane_id.as_u64() << 20) | index as u64))
+            .absolute()
+            .top(px(base * 0.25))
+            .right(px(base * 0.25))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(base * 0.3))
+            .px(px(base * 0.4))
+            .py(px(base * 0.2))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(hsla_alpha(
+                if copied {
+                    theme.green
+                } else {
+                    theme.border_default
+                },
+                if copied { 1.0 } else { 0.7 },
+            ))
+            .bg(hsla_alpha(
+                theme.surface_highlight,
+                if copied { 1.0 } else { 0.8 },
+            ))
+            .text_size(px(base * 0.78))
+            .line_height(px(base))
+            .text_color(hsla(color))
+            // 常時表示だが控えめ（アイコンのみ・淡色）。ホバー・コピー直後だけ濃くする。
+            // 「ホバーで初めて現れる」方式（opacity 0 + group_hover）は GPUI で
+            // 実機のホバー復帰が発火しないことを実測したので採らない（#680）
+            .opacity(if copied { 1.0 } else { 0.55 })
+            .group_hover(group, |d| d.opacity(1.0))
+            .hover(|d| d.opacity(1.0).bg(hsla(theme.surface_hover)))
+            .cursor(CursorStyle::PointingHand)
+            .child(
+                svg()
+                    .path(icon)
+                    .w(px(icon_size))
+                    .h(px(icon_size))
+                    .flex_none()
+                    .text_color(hsla(color)),
+            )
+            // 待機中はアイコンだけ（狭いペインで本文へ被る面積を最小にする）。
+            // コピー直後は文字で成功をはっきり伝える
+            .children(copied.then(|| SharedString::from(crate::ui_text::preview::code_copied())))
+            // 下のプレビューでテキスト選択が始まらないようにする（他のボタンと同じ）
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match this.copy_preview_code_block(pane_id, Some(index)) {
+                    Ok(_) => this.flush_pending_clipboard(cx),
+                    Err(e) => eprintln!("warning: コードブロックのコピーに失敗: {e}"),
                 }
-                if let Some((start, end)) = sel_range {
-                    let s = snap_to_char_boundary(text, start.min(text.len()));
-                    let e = snap_to_char_boundary(text, end.min(text.len()));
-                    if s < e {
-                        highlights.push((
-                            s..e,
-                            HighlightStyle {
-                                background_color: Some(hsla_alpha(theme.accent, 0.35)),
-                                ..HighlightStyle::default()
-                            },
-                        ));
-                    }
-                }
-            };
-
-        match block {
-            preview::MdBlock::Heading { level, spans } => {
-                let (text, mut highlights) = self.preview_md_text(spans);
-                add_search_and_sel(&mut highlights, &text);
-                let highlights = merge_highlights(highlights);
-                let size = match level {
-                    1 => 19.0,
-                    2 => 16.0,
-                    3 => 14.0,
-                    _ => 13.0,
-                };
-                let styled =
-                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
-                let layout = styled.layout().clone();
-                let element = div()
-                    .relative()
-                    .pt_2()
-                    .pb_1()
-                    .text_size(px(size))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(hsla(theme.foreground))
-                    .when(*level <= 2, |d| {
-                        d.border_b_1()
-                            .border_color(hsla_alpha(theme.pane_border, 0.8))
-                    })
-                    .child(styled)
-                    .into_any_element();
-                (element, Some(layout))
-            }
-            preview::MdBlock::Paragraph { spans } => {
-                let (text, mut highlights) = self.preview_md_text(spans);
-                add_search_and_sel(&mut highlights, &text);
-                let highlights = merge_highlights(highlights);
-                let styled =
-                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
-                let layout = styled.layout().clone();
-                let element = div().relative().py_1().child(styled).into_any_element();
-                (element, Some(layout))
-            }
-            preview::MdBlock::ListItem {
-                depth,
-                marker,
-                spans,
-            } => {
-                let (text, mut highlights) = self.preview_md_text(spans);
-                add_search_and_sel(&mut highlights, &text);
-                let highlights = merge_highlights(highlights);
-                let styled =
-                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
-                let layout = styled.layout().clone();
-                let element = div()
-                    .relative()
-                    .flex()
-                    .flex_row()
-                    .pl(px(8.0 + 16.0 * *depth as f32))
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(hsla_alpha(theme.foreground, 0.7))
-                            .child(SharedString::from(marker.clone())),
-                    )
-                    .child(div().flex_1().min_w(px(0.0)).child(styled))
-                    .into_any_element();
-                (element, Some(layout))
-            }
-            preview::MdBlock::CodeBlock { lines } => {
-                let mut text = String::new();
-                let mut highlights = Vec::new();
-                for (line_i, line) in lines.iter().enumerate() {
-                    if line_i > 0 {
-                        text.push('\n');
-                    }
-                    for span in line {
-                        let start = text.len();
-                        text.push_str(&span.text);
-                        if span.color.is_some() || span.bold || span.italic {
-                            highlights.push((
-                                start..text.len(),
-                                HighlightStyle {
-                                    color: span.color.map(hsla),
-                                    font_weight: span.bold.then_some(FontWeight::BOLD),
-                                    font_style: span.italic.then_some(FontStyle::Italic),
-                                    ..HighlightStyle::default()
-                                },
-                            ));
+                // フィードバックの終わりで元の見た目へ戻す（2 秒ポーリング待ちにしない）
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(MD_COPY_FEEDBACK).await;
+                    let _ = this.update(cx, |app, cx| {
+                        if app
+                            .preview_md_copied
+                            .is_some_and(|(_, _, at)| at.elapsed() >= MD_COPY_FEEDBACK)
+                        {
+                            app.preview_md_copied = None;
                         }
-                    }
-                }
-                add_search_and_sel(&mut highlights, &text);
-                if text.is_empty() {
-                    text.push(' ');
-                }
-                let styled = StyledText::new(text)
-                    .with_default_highlights(&self.text_style(), merge_highlights(highlights));
-                let layout = styled.layout().clone();
-                let element = div()
-                    .relative()
-                    .my_1()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgba_alpha(theme.tab_bar_background, 0.9))
-                    .child(styled)
-                    .into_any_element();
-                (element, Some(layout))
-            }
-            preview::MdBlock::Quote { spans } => {
-                let (text, mut highlights) = self.preview_md_text(spans);
-                add_search_and_sel(&mut highlights, &text);
-                let highlights = merge_highlights(highlights);
-                let styled =
-                    StyledText::new(text).with_default_highlights(&self.text_style(), highlights);
-                let layout = styled.layout().clone();
-                let element = div()
-                    .relative()
-                    .my_1()
-                    .pl_2()
-                    .border_l_2()
-                    .border_color(hsla_alpha(theme.accent, 0.6))
-                    .text_color(hsla_alpha(theme.foreground, 0.75))
-                    .child(styled)
-                    .into_any_element();
-                (element, Some(layout))
-            }
-            preview::MdBlock::Rule => (
-                div()
-                    .relative()
-                    .my_2()
-                    .h(px(1.0))
-                    .bg(hsla_alpha(theme.pane_border, 0.9))
-                    .into_any_element(),
-                None,
-            ),
-        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// チェンジログビューのトグル（Issue #338）
@@ -3926,6 +4454,44 @@ mod tests {
             "a[変換]b"
         );
         assert_eq!(render_field_with_cursor("ab", 1, true, Some("")), "a|b");
+    }
+
+    /// Issue #656: 表のセルは同じ y 帯に横並びになるので、ヒットテストは x で
+    /// セルを選び分けなければならない（旧実装は最初に当たった左端セルへ寄っていた）
+    #[test]
+    fn 同じy帯の行はxで選び分けられる() {
+        let cell = |left: f32, width: f32| {
+            Bounds::new(point(px(left), px(100.0)), gpui::size(px(width), px(18.0)))
+        };
+        let candidates = vec![
+            (3, cell(10.0, 60.0)),
+            (4, cell(80.0, 60.0)),
+            (5, cell(150.0, 60.0)),
+        ];
+        // 各セルの内側
+        assert_eq!(pick_line_by_x(&candidates, px(30.0)), Some(3));
+        assert_eq!(pick_line_by_x(&candidates, px(100.0)), Some(4));
+        assert_eq!(pick_line_by_x(&candidates, px(180.0)), Some(5));
+        // セルの隙間（パディング）は近い方へ寄る
+        assert_eq!(pick_line_by_x(&candidates, px(72.0)), Some(3));
+        assert_eq!(pick_line_by_x(&candidates, px(78.0)), Some(4));
+        // 右端よりさらに右は最後のセル、左端より左は最初のセル
+        assert_eq!(pick_line_by_x(&candidates, px(900.0)), Some(5));
+        assert_eq!(pick_line_by_x(&candidates, px(0.0)), Some(3));
+        // 候補なし
+        assert_eq!(pick_line_by_x(&[], px(10.0)), None);
+        // 単一候補（通常の本文行）はつねにその行
+        assert_eq!(pick_line_by_x(&[(7, cell(10.0, 60.0))], px(999.0)), Some(7));
+    }
+
+    #[test]
+    fn horizontal_gapは行の内側で0になる() {
+        let bounds = Bounds::new(point(px(10.0), px(0.0)), gpui::size(px(20.0), px(10.0)));
+        assert_eq!(horizontal_gap(&bounds, px(15.0)), 0.0);
+        assert_eq!(horizontal_gap(&bounds, px(10.0)), 0.0);
+        assert_eq!(horizontal_gap(&bounds, px(30.0)), 0.0);
+        assert_eq!(horizontal_gap(&bounds, px(5.0)), 5.0);
+        assert_eq!(horizontal_gap(&bounds, px(40.0)), 10.0);
     }
 
     #[test]

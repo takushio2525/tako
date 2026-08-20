@@ -13,14 +13,24 @@
 //!   claude agents プロキシ・会話ログ正規化）
 //! - tailscale: Tailscale Serve transport（Issue #282。CLI 検出・setup 判定・serve 管理）
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
+//! - peer_messaging / delivery: claude の Cross-Session Messaging による指示送達と
+//!   経路選択（peer 優先 + 従来のキー操作経路へフォールバック。Issue #790）
 //! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
 //!   プロセス間ロック・世代バックアップ。Issue #169）
+//! - config_share: AI 系設定の git ベース共有（分類カタログ・可搬化・秘匿検査。Issue #513）
+
+// mcp.rs のツール定義は 1 ツール = 1 個の大きな `json!` リテラルで書かれており、
+// プロパティが増えると `json_internal!` の再帰展開が既定の 128 段に届く（#749 で到達した）。
+// スキーマを 1 リテラルのまま読める形に保つため、上限だけ上げる（実行時コストは無い）
+#![recursion_limit = "512"]
 
 pub mod acceptance_gates;
 pub mod agents;
 pub mod agents_sync;
 pub mod claude_tui;
 pub mod config_io;
+pub mod config_share;
+pub mod delivery;
 pub mod diag;
 pub mod dialog;
 pub mod discovery;
@@ -29,13 +39,16 @@ pub mod fda;
 pub mod host;
 pub mod ipc;
 pub mod layout;
+pub mod limit_stop;
 pub mod mcp;
 pub mod orchestrator;
+pub mod peer_messaging;
 pub mod platform;
 pub mod protocol;
 pub mod reach;
 pub mod remote;
 pub mod remote_auth;
+pub mod remote_preview;
 pub mod remote_setup;
 pub mod sessions;
 pub mod settings;
@@ -46,6 +59,7 @@ pub mod tailscale;
 pub mod task_checkpoints;
 pub mod telemetry;
 pub mod transcript;
+pub mod welcome;
 
 pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,

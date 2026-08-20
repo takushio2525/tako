@@ -12,8 +12,9 @@ pub fn cancel() -> &'static str {
 pub fn restore() -> &'static str {
     tr!("復帰", "Restore")
 }
-pub fn update() -> &'static str {
-    tr!("更新", "Update")
+/// 結果表示を畳むボタン（アップデート画面の完了 / 失敗表示など。#616）
+pub fn close() -> &'static str {
+    tr!("閉じる", "Close")
 }
 
 /// クリップボード操作（ペインの右クリックメニュー等。キー: common.copy / common.paste）
@@ -61,7 +62,7 @@ mod tests {
                 no().to_string(),
                 cancel().to_string(),
                 restore().to_string(),
-                update().to_string(),
+                close().to_string(),
                 copy().to_string(),
                 paste().to_string(),
                 terminal_fallback_title().to_string(),

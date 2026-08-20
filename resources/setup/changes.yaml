@@ -216,3 +216,50 @@ changes:
       セットアップは `tako remote setup` で対話的に行える（Tailscale の導入から serve 設定、
       QR コード生成までを案内）。`tako setup` の依存チェックにも tailscale が追加された（任意）。
       旧方式を使っていた場合は `tako remote setup` で新方式へ移行できる。
+
+  - revision: 13
+    version: "0.6.1"
+    date: "2026-07-28"
+    kind: auto
+    title: AI 系設定の git 共有（tako config）を追加
+    description: |
+      claude のグローバル指示（CLAUDE.md / snippets / commands / templates）と
+      tako の宣言的設定（profiles / projects / accounts / local-rules / settings）を
+      git リポジトリ 1 本でデバイス間共有できるようになった（Issue #513）。
+      `tako config init` で新規リポジトリを作って配線、`tako config link <パス|URL>` で
+      既存リポジトリへ接続、`tako config push` / `pull` で同期、`tako config status` で差分、
+      `tako config list` で「何を共有し何を共有しないか」の分類表を確認できる。
+      秘匿情報（token / credentials / .claude.json）とマシン固有の状態
+      （layout.json / sessions.yaml / workers.yaml / ペインログ）はホワイトリストで
+      構造的に除外され、カタログに載っていないファイルは共有されない。
+      アカウントの資格情報の場所（config_dir）と profile の env も共有対象から外れる。
+      設定内の絶対パスはホーム部分が ~ に置き換わって保存されるので、mac と Windows で
+      ホームの位置が違っても同じリポジトリを使える。
+      **任意機能**なので、使わないなら何もしなくてよい（setup の質問は増えない）。
+
+  - revision: 14
+    version: "0.6.10"
+    date: "2026-08-10"
+    kind: guided
+    title: setup が設定共有の状況を見て案内・代行できるようになった
+    description: |
+      設定共有（`tako config`。revision 13 で追加）は、導線が無いと存在に気づかれないまま
+      使われないことが分かったので、`tako setup` が状況を検出して案内するようにした（Issue #793）。
+      検出するのは ①配線済みか ②`~/.claude` や tako のデータディレクトリが既に別の git
+      （dotfiles 等）で管理されていないか ③gh CLI でログイン済みか の 3 点で、
+      いずれも読み取りだけ（リポジトリ作成や配線は起こらない）。
+      標準の `tako setup` は**質問を増やさない**（完了サマリと `tako setup --check` に
+      状態と次の一手が 1〜数行出るだけ）。設定したいときは、setup の対話アシスタントに
+      「設定を共有したい」と言えば、リポジトリの用意から配線まで代行してもらえる。
+
+      確認事項（このユーザーがどれに当たるかで案内が変わる）:
+      - 既に配線済み（`config-share.json` がある）なら、この変更で何も起きない。
+        「配線済みです」と伝えるだけで、新しい配線を勧めない
+      - `~/.claude` を dotfiles リポジトリの symlink にしている等、**既に自力で共有している**
+        場合は、そのリポジトリへ相乗りする（`tako config link <リポジトリ>`）案を第一に示す。
+        別のリポジトリを新しく作ると同じ CLAUDE.md が 2 か所で管理され、
+        `tako config pull` の書き込みが symlink を実ファイルへ置き換えて既存の配線を壊しうる
+      - 未配線で既存運用も無い場合だけ、`tako config init`（ローカル作成）や
+        gh でのプライベートリポジトリ作成を提案してよい。**リポジトリ作成と push は
+        ユーザーの同意を得てから**行う。共有リポジトリは必ず private にする
+      - 共有したくないなら何もしなくてよい。以後も勝手に配線されることはない

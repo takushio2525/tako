@@ -255,6 +255,31 @@ pub mod notes {
         "Requires the remote transport and the Windows distribution channel",
     );
 
+    /// GUI ライク表示モードのチャットビュー（#691 の G2 以降）。
+    /// 表示レイヤだけの機能なので #517 で足りそうに見えるが、**会話の解決が
+    /// 永続バックエンドのセッション名を鍵にしている**（`.agent/plans/2026-07-gui-mode.md`
+    /// §4 G2 の帰結: チャット化されるのはバックエンドを持つペインだけ）ため、
+    /// GUI 起動と永続化戦略の両方が要る。スターター側（#694 / #739）は GUI 起動だけで
+    /// 動くので `tako_ui_mode` は `WIN_TERMINAL` のまま
+    pub const WIN_GUI_CHAT: Note = Note::new(
+        "GUI 起動に加えて、チャットビューが会話をひも付けるための永続バックエンド（tmux 相当）の決定が前提",
+        "Requires GUI startup plus deciding the persistent backend (the tmux equivalent) that the chat view resolves conversations through",
+    );
+
+    /// #513 の担当範囲。実装はプラットフォーム共通（ファイル操作 + git のみ）で、
+    /// パス可搬化の Windows 表記も macOS 上の単体テストで検証済み。
+    /// 残っているのは**実機での配線確認**だけなので、その一点だけを理由として書く
+    pub const WIN_CONFIG_SHARE: Note = Note::new(
+        "実装はプラットフォーム共通だが、Windows 実機での配線確認が未了",
+        "The implementation is platform-neutral, but wiring has not yet been verified on real Windows hardware",
+    );
+
+    /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
+    pub const WIN_NO_PSREADLINE_NEEDED: Note = Note::new(
+        "Windows の PowerShell は PSReadLine の予測入力を標準搭載しているため、tako 側の注入は要らない",
+        "Windows PowerShell ships PSReadLine predictive input, so tako does not need to inject anything",
+    );
+
     /// 概念自体が存在しないもの
     pub const WIN_NO_TCC: Note = Note::new(
         "Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い",
@@ -367,14 +392,24 @@ pub fn degraded_note_items(platform: Platform) -> Vec<Note> {
 /// 実行してよいかの判定。`Err` の中身はそのまま利用者への診断メッセージになる。
 /// **メッセージをマトリクス以外の場所に書かない**ための唯一の入口
 pub fn gate(platform: Platform, key: &str) -> Result<(), String> {
+    gate_in(platform, key, crate::i18n::lang())
+}
+
+/// `gate` の言語を明示する版。**言語グローバルに触らず解決できる**ようにするため、
+/// 実体はこちらの純粋関数に置く（`Note::text_in` と同じ方針）。
+///
+/// 表示言語の解決を 1 箇所に集約する意味もある。定型文と理由文で別々に
+/// `i18n::lang()` を読むと、その間に言語が切り替わったとき
+/// 「日本語の定型文 + 英語の理由文」のような混在が出る（#608）
+pub fn gate_in(platform: Platform, key: &str, lang: crate::i18n::Lang) -> Result<(), String> {
     match support_for(platform, key) {
         // 未登録は素通しする。登録漏れで機能が止まるより、T1 の失敗で気付く方がよい
         None => Ok(()),
         Some(s) if s.is_usable() => Ok(()),
         Some(s) => {
-            let note = s.note().map(Note::text).unwrap_or_default();
+            let note = s.note().map(|n| n.text_in(lang)).unwrap_or_default();
             let target = platform.as_str();
-            Err(match (crate::i18n::lang(), s.issue()) {
+            Err(match (lang, s.issue()) {
                 (crate::i18n::Lang::Ja, Some(issue)) => format!(
                     "{key} は {target} では未対応です（{note}）。追跡: #{issue}。\
                      実装したら crates/tako-core/src/platform/support.rs の対応状況を更新してください"
@@ -409,6 +444,14 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #600: tako 内 zsh の入力予測（zsh-autosuggestions をシェル統合経路で注入）
+        key: "tako_autosuggest",
+        macos: Support::Supported,
+        windows: Support::Unsupported {
+            note: notes::WIN_NO_PSREADLINE_NEEDED,
+        },
+    },
+    Feature {
         key: "tako_background_kill",
         macos: Support::Supported,
         windows: Support::Supported,
@@ -424,6 +467,16 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        // #725: GUI モードのチャットビュー本文コピー。表示レイヤの機能だが、
+        // 会話の解決に永続バックエンドが要る（#739 で理由を精緻化）
+        key: "tako_chat_copy",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_GUI_CHAT,
+            issue: 519,
+        },
+    },
+    Feature {
         key: "tako_check_health",
         macos: Support::Supported,
         windows: Support::Supported,
@@ -437,6 +490,15 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_collapse_tab",
         macos: Support::Supported,
         windows: Support::Supported,
+    },
+    Feature {
+        // #513: AI 系設定の git ベース共有。GUI にも tmux にも依存しない
+        key: "tako_config_share",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_CONFIG_SHARE,
+            issue: 513,
+        },
     },
     Feature {
         key: "tako_confirm_close",
@@ -551,6 +613,16 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_lang",
         macos: Support::Supported,
         windows: Support::Supported,
+    },
+    Feature {
+        // #813: 上限後の自動復帰。ダイアログへの応答が tmux バックエンド（detached access）
+        // 経由なので、Windows は永続バックエンドの移植（#526 のオーケストレーション層）待ち
+        key: "tako_limit_resume",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_ORCHESTRATOR,
+            issue: 526,
+        },
     },
     Feature {
         key: "tako_limit_service",
@@ -719,6 +791,15 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        // #552: 自動命名された名前の固定（GUI のピン印と 1:1）
+        key: "tako_pin_tab_title",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_platform",
         macos: Support::Supported,
         windows: Support::Supported,
@@ -749,6 +830,14 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_preview_changelog",
         macos: Support::Supported,
         windows: Support::Supported,
+    },
+    Feature {
+        key: "tako_preview_copy_code",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_PREVIEW,
+            issue: 521,
+        },
     },
     Feature {
         key: "tako_preview_edit",
@@ -996,6 +1085,14 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        key: "tako_show_command",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_sleep_guard",
         macos: Support::Supported,
         // #524: PowerCreateRequest / PowerSetRequest でアイドルスリープを抑止。
@@ -1114,6 +1211,18 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        // #694 / #739: 表示レイヤだけの切替で、モードトグルとスターター
+        // （プロファイル選択 ▾ を含む）は GUI 本体（#517）が動けばそのまま動く。
+        // チャットビューだけは永続バックエンドにも依存するが、それは
+        // `tako_chat_copy`（WIN_GUI_CHAT）側で追跡する
+        key: "tako_ui_mode",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
+    },
+    Feature {
         key: "tako_update",
         macos: Support::Supported,
         windows: Support::Supported,
@@ -1146,6 +1255,14 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_web",
         macos: Support::Supported,
         windows: Support::Supported,
+    },
+    Feature {
+        key: "tako_welcome",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_TERMINAL,
+            issue: 517,
+        },
     },
     Feature {
         key: "tako_window",
@@ -1230,10 +1347,12 @@ mod tests {
             .expect("Windows に Pending が 1 件も無い（テストの前提が崩れている）")
     }
 
-    /// 表示言語を切り替えると理由文も切り替わること（`&'static str` 直書きへの退行防止）
+    /// 表示言語を切り替えると理由文も切り替わること（`&'static str` 直書きへの退行防止）。
+    /// **言語グローバルへの追従そのものが検査対象**なので、ここは
+    /// `lang_guard` で直列化する（#608。他のテストは `text_in` / `gate_in` を使うこと）
     #[test]
     fn 理由文は表示言語に追従する() {
-        let original = i18n::lang();
+        let _guard = i18n::testing::lang_guard();
         let (key, _) = any_pending_on_windows();
         let note = support_for(Platform::Windows, key)
             .unwrap()
@@ -1243,22 +1362,20 @@ mod tests {
         let ja = note.text();
         i18n::set_lang(Lang::En);
         let en = note.text();
-        i18n::set_lang(original);
         assert_eq!(ja, note.ja());
         assert_eq!(en, note.en());
         assert_ne!(ja, en);
     }
 
-    /// 診断メッセージも表示言語に追従すること
+    /// 診断メッセージも表示言語に追従すること（同上。グローバル追従の検査なので直列化する）
     #[test]
     fn gateの診断も表示言語に追従する() {
-        let original = i18n::lang();
+        let _guard = i18n::testing::lang_guard();
         let (key, issue) = any_pending_on_windows();
         i18n::set_lang(Lang::En);
         let en = gate(Platform::Windows, key).unwrap_err();
         i18n::set_lang(Lang::Ja);
         let ja = gate(Platform::Windows, key).unwrap_err();
-        i18n::set_lang(original);
         assert!(
             !en.chars()
                 .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
@@ -1306,18 +1423,28 @@ mod tests {
         assert_eq!(mac.status(), "supported");
     }
 
-    /// 縮退時の診断メッセージはマトリクス由来（二重管理を作らない）
+    /// 縮退時の診断メッセージはマトリクス由来（二重管理を作らない）。
+    ///
+    /// 言語は `gate_in` / `text_in` に明示して渡す。**言語グローバルを読むと
+    /// 診断と理由文を別々のタイミングで解決することになり、その間に
+    /// 言語切替テストが走ると不一致で落ちる**（#608 の再現経路）
     #[test]
     fn gateの診断はマトリクスの理由と追跡先を含む() {
         let (key, issue) = any_pending_on_windows();
-        let err = gate(Platform::Windows, key).expect_err("Windows では未対応のはず");
         let note = support_for(Platform::Windows, key).unwrap().note().unwrap();
-        assert!(err.contains(note.text()), "診断に note が含まれない: {err}");
-        assert!(
-            err.contains(&format!("#{issue}")),
-            "診断に追跡 Issue が含まれない: {err}"
-        );
-        assert!(gate(Platform::MacOs, key).is_ok());
+        for lang in [Lang::Ja, Lang::En] {
+            let err =
+                gate_in(Platform::Windows, key, lang).expect_err("Windows では未対応のはず");
+            assert!(
+                err.contains(note.text_in(lang)),
+                "{lang:?} の診断に note が含まれない: {err}"
+            );
+            assert!(
+                err.contains(&format!("#{issue}")),
+                "{lang:?} の診断に追跡 Issue が含まれない: {err}"
+            );
+            assert!(gate_in(Platform::MacOs, key, lang).is_ok());
+        }
     }
 
     /// マトリクス自身はどのプラットフォームでも引けないと意味がない

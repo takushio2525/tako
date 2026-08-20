@@ -86,6 +86,34 @@ pub fn perf_log(msg: &str) {
     append_log(perf_log_path(), msg);
 }
 
+/// 1 / 5 / 15 分の load average。取得できない環境（Windows 等）では `None`（#796）。
+///
+/// セルフテストの失敗ログに残すためだけの観測値で、製品の判断には使わない。
+/// 「同じコードなのに回によって落ちる項目が変わる」の切り分けに、**そのときの
+/// マシンの混み具合**が必要だった（実測: load 6〜16 の帯で落ちる項目が入れ替わる）
+pub fn load_average() -> Option<[f64; 3]> {
+    #[cfg(unix)]
+    {
+        let mut out = [0f64; 3];
+        // getloadavg(3): 埋められた要素数を返す（負値は失敗）
+        let filled = unsafe { libc::getloadavg(out.as_mut_ptr(), 3) };
+        (filled == 3).then_some(out)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// load average を診断 1 行用の表記へ（`load=6.17/5.79/5.47`）。
+/// 取得できなければ `load=unknown`。純粋関数なので単体テストで固定できる
+pub fn format_load_average(load: Option<[f64; 3]>) -> String {
+    match load {
+        Some([one, five, fifteen]) => format!("load={one:.2}/{five:.2}/{fifteen:.2}"),
+        None => "load=unknown".to_string(),
+    }
+}
+
 fn append_log(path: Option<PathBuf>, msg: &str) {
     let Some(path) = path else {
         return;
@@ -180,6 +208,30 @@ static PERF_WATCH: Mutex<PerfWatch> = Mutex::new(PerfWatch {
     samples: Vec::new(),
 });
 
+/// メインスレッドの ThreadId（`mark_main_thread` で登録）。
+/// **未登録なら「全部メインスレッド扱い」** = 従来の挙動（CLI・テストは登録しない）
+static MAIN_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// 呼んだスレッドをメインスレッドとして登録する（GUI プロセスの起動時に 1 回）。
+///
+/// Issue #782: `perf_span` は元々スレッドを区別せず、**background executor 上の
+/// 区間まで「メインスレッド専有」として perf.log に書いていた**。実際には
+/// background で走っている PDF ラスタライズ（`pdf_rasterize`。#258 で background 化済み）が
+/// 「メインスレッド専有 73ms」と記録され、UI ストールの容疑者に見えていた。
+/// 登録後は、別スレッドの区間を watchdog の対象（= ハング容疑）にも
+/// 「メインスレッド専有」の記録にも入れない
+pub fn mark_main_thread() {
+    *MAIN_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+}
+
+/// 呼び出し元がメインスレッドか（未登録時は true = 従来挙動）
+fn on_main_thread() -> bool {
+    MAIN_THREAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none_or(|id| id == std::thread::current().id())
+}
+
 /// verbose 実測モード（`TAKO_PERF_VERBOSE=1`）。プロセス内で 1 回だけ判定
 fn perf_verbose() -> bool {
     static VERBOSE: OnceLock<bool> = OnceLock::new();
@@ -211,6 +263,8 @@ pub struct PerfSpan {
     t0: Instant,
     log_over_ms: u64,
     prev: Option<SpanState>,
+    /// メインスレッドで開始した区間か（別スレッドは記録の扱いを変える）
+    on_main: bool,
 }
 
 /// 既定しきい値（32ms、verbose 時 16ms）の計測区間を開始する
@@ -222,7 +276,10 @@ pub fn perf_span(tag: impl Into<Cow<'static, str>>) -> PerfSpan {
 pub fn perf_span_over(tag: impl Into<Cow<'static, str>>, log_over_ms: u64) -> PerfSpan {
     let tag = tag.into();
     let t0 = Instant::now();
-    let prev = {
+    // 別スレッドの区間は watchdog の現在区間に入れない（#782: background の
+    // 区間がメインスレッドのハング容疑者として記録されていた）
+    let on_main = on_main_thread();
+    let prev = if on_main {
         let mut w = watch_lock();
         let prev = w.current.take();
         w.current = Some(SpanState {
@@ -231,28 +288,35 @@ pub fn perf_span_over(tag: impl Into<Cow<'static, str>>, log_over_ms: u64) -> Pe
             hang_reported: false,
         });
         prev
+    } else {
+        None
     };
     PerfSpan {
         tag,
         t0,
         log_over_ms,
         prev,
+        on_main,
     }
 }
 
 impl Drop for PerfSpan {
     fn drop(&mut self) {
         let took = self.t0.elapsed().as_millis() as u64;
+        if !self.on_main {
+            // 別スレッドの所要は verbose 統計にだけ残す（タグに bg: を付けて
+            // メインスレッドの分布と混ざらないようにする）
+            if perf_verbose() {
+                push_sample(Cow::Owned(format!("bg:{}", self.tag)), took);
+            }
+            return;
+        }
         {
             let mut w = watch_lock();
             w.current = self.prev.take();
-            if perf_verbose() {
-                w.samples.push((self.tag.clone(), took));
-                // 暴走ガード: watchdog 不在でも無限には溜めない
-                if w.samples.len() > 100_000 {
-                    w.samples.drain(..50_000);
-                }
-            }
+        }
+        if perf_verbose() {
+            push_sample(self.tag.clone(), took);
         }
         if took >= self.log_over_ms && span_log_rate_ok() {
             perf_log(&format!(
@@ -260,6 +324,16 @@ impl Drop for PerfSpan {
                 self.tag
             ));
         }
+    }
+}
+
+/// verbose 統計へサンプルを 1 件積む（暴走ガード付き）
+fn push_sample(tag: Cow<'static, str>, took: u64) {
+    let mut w = watch_lock();
+    w.samples.push((tag, took));
+    // 暴走ガード: watchdog 不在でも無限には溜めない
+    if w.samples.len() > 100_000 {
+        w.samples.drain(..50_000);
     }
 }
 
@@ -570,6 +644,27 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_averageの表記は取得可否で決まる() {
+        assert_eq!(
+            format_load_average(Some([6.171, 5.79, 5.4])),
+            "load=6.17/5.79/5.40"
+        );
+        assert_eq!(format_load_average(None), "load=unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixではload_averageが取れて非負に収まる() {
+        let load = load_average().expect("unix では getloadavg が 3 要素返す");
+        for value in load {
+            assert!(
+                value.is_finite() && value >= 0.0,
+                "load average が異常: {load:?}"
+            );
+        }
     }
 
     #[test]

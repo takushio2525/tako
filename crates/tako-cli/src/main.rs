@@ -40,6 +40,10 @@ struct Cli {
     command: Command,
 }
 
+// `orchestrator profiles set` のオプション数で variant サイズ差 lint が出る
+// （ProfilesCommand 側と同じ理由）。CLI 引数のパースはプロセスで 1 回きりなので
+// 実害がなく、clap は Subcommand / Args を Box 化できないため許容する
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// 対象ペインの隣に新ペインを生やす（既定は右）。新ペイン ID を出力する
@@ -74,12 +78,15 @@ enum Command {
     /// Markdown・PDF プレビューのアウトラインを表示し、項目へジャンプする
     #[command(name = "preview-outline")]
     PreviewOutline(PreviewOutlineArgs),
-    /// PDF プレビュー内のリンク一覧を表示する
+    /// Markdown・PDF プレビュー内のリンク一覧を表示する
     #[command(name = "preview-link-list")]
     PreviewLinkList(PaneArg),
-    /// PDF プレビュー内のリンクをフォローする（外部 URL はブラウザ、内部はページジャンプ）
+    /// プレビュー内のリンクをフォローする（URL はブラウザ、PDF 内部リンクはページジャンプ）
     #[command(name = "preview-follow-link")]
     PreviewFollowLink(PreviewFollowLinkArgs),
+    /// Markdown プレビューのコードブロック全文をクリップボードへコピーする
+    #[command(name = "preview-copy-code")]
+    PreviewCopyCode(PreviewCopyCodeArgs),
     /// 表示中プレビューファイルのライブリロード ON/OFF・状態確認
     #[command(name = "preview-reload")]
     PreviewReload(ToggleArgs),
@@ -106,22 +113,49 @@ enum Command {
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップの ON/OFF・状態確認
     Portdetect(ToggleArgs),
+    /// tako 内 zsh の入力予測（履歴ベースのゴーストテキスト。右矢印か Tab で確定）の
+    /// ON/OFF・状態確認。既定 ON。tako の外の zsh には影響しない。
+    /// `hint` / `tab` で確定キーの案内と Tab 確定を個別に切り替える
+    Autosuggest(AutosuggestArgs),
+    /// 利用上限（5h / 週次）後の自動復帰の ON/OFF・状態確認（ペイン単位。既定 OFF）。
+    /// 有効にしたペインは、上限で止まってもリセット時刻を過ぎたら tako が作業を再開させる
+    #[command(name = "limit-resume")]
+    LimitResume(LimitResumeArgs),
     /// セッション永続化（tmux バックエンド）の ON/OFF・状態確認。
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される
     Persist(ToggleArgs),
-    /// × ボタン close の確認ダイアログ ON/OFF・状態確認
+    /// close 確認ダイアログの ON/OFF・状態確認（× ボタン / cmd+W。
+    /// 確認が入るのはエージェント・実行中プロセスがあるペインのみ）
     #[command(name = "confirm-close")]
     ConfirmClose(ToggleArgs),
     /// UI テーマの確認・切替・色設定・プリセット・フォント（Issue #217/#459）
     Theme(ThemeArgs),
     /// 設定画面を開く（Issue #459）
     Settings(SettingsArgs),
+    /// 初回起動のウェルカムバナーの状態確認・再表示・非表示（Issue #549）。
+    /// 引数なしで現在の表示状態と案内すべきコマンドを表示する
+    Welcome(WelcomeArgs),
+    /// ユーザーに実行してほしいコマンドをコピー可能なカードとして提示する（Issue #666）。
+    /// `tako show-command "コマンド"` で対象ペイン下部にカードが出る
+    // 変異名が enum 名（Command）で終わるが、CLI 名 `show-command` は FR-2.7 の
+    // show_file / show_diff / show_url と揃えた提示系の語彙。名前を崩さず allow する
+    #[allow(clippy::enum_variant_names)]
+    ShowCommand(ShowCommandArgs),
     /// プラットフォーム対応マトリクスの参照（Issue #515）。
     /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     Platform(PlatformArgs),
+    /// AI 系設定（tako の宣言的設定 + claude のグローバル指示）を
+    /// git リポジトリでデバイス間共有する（Issue #513）。
+    /// 引数なしで現在の配線状態と差分を表示する
+    Config(ConfigArgs),
     /// UI 表示言語（日本語/英語）の確認・切替（Issue #435）。
     /// 引数なしで現在言語を表示、ja / en で指定、system で OS ロケール追従
     Lang(LangArgs),
+    /// UI 表示モード（GUI ライク表示 / ターミナル表示）の確認・切替（Issue #691）。
+    /// 引数なしで現在モードを表示、gui / terminal で指定、toggle で反転。
+    /// release / restore は指定ペインだけを一時的にターミナル表示へ（揮発）
+    #[command(name = "ui-mode")]
+    UiMode(UiModeArgs),
     /// ステータスバーの利用制限表示サービスの確認・切替（Issue #321）。
     /// 引数なしで現在サービスを表示、claude / codex / agy で指定
     #[command(name = "limit-service")]
@@ -225,6 +259,9 @@ enum Command {
     /// エラーレポートの自動送信（テレメトリ）の状態確認・切替（Issue #333）
     #[command(subcommand)]
     Telemetry(TelemetryCommand),
+    /// GUI モードのチャットビュー本文のコピー（Issue #725。UI のコピーボタンと同じ経路）
+    #[command(subcommand)]
+    Chat(ChatCommand),
     /// ファイルツリーへのフォルダの追加・削除・一覧（#134）。
     /// AI が作業対象プロジェクトのフォルダを明示追加する
     #[command(subcommand)]
@@ -542,6 +579,14 @@ enum UpdateCommand {
     },
     /// broken-brew 状態の修復（brew install --cask --force で台帳を再締結）
     Repair,
+    /// アップデート専用画面（GUI）を開く
+    Open,
+    /// 上部通知カードの操作（引数なしで現在の状態）
+    Card {
+        /// dismiss = 閉じてこのバージョンは以後通知しない / show = 抑止を解除して出し直す
+        #[arg(value_parser = ["dismiss", "show"])]
+        action: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -604,6 +649,29 @@ enum SleepGuardCommand {
     InstallLidSleep,
     /// 蓋閉じ防止の sudoers 登録を削除
     RemoveLidSleep,
+}
+
+#[derive(Subcommand)]
+enum ChatCommand {
+    /// 発話（またはその中のコードブロック）をクリップボードへコピーする。
+    /// 既定は最後の assistant 発話を「画面と同じプレーンテキスト」で
+    Copy {
+        /// 対象ペイン ID（省略時は呼び出し元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 発話の表示順（0 始まり。省略時は最後の assistant 発話）
+        #[arg(long)]
+        message: Option<usize>,
+        /// その発話の中のコードブロック出現順（0 始まり。省略時は本文全体）
+        #[arg(long)]
+        code: Option<usize>,
+        /// md ソースをそのままコピーする（既定は画面と同じプレーンテキスト）
+        #[arg(long)]
+        markdown: bool,
+        /// コピーせずに発話の一覧（添字・role・文字数・コードブロック数）だけ出す
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1366,6 +1434,9 @@ enum OrchestratorCommand {
     /// プロファイル管理（一覧 / 表示 / 設定）
     #[command(subcommand)]
     Profiles(ProfilesCommand),
+    /// アカウント管理（accounts.yaml の一覧 / 表示 / 追加 / 削除。#504 / #548）
+    #[command(subcommand)]
+    Accounts(AccountsCommand),
     /// worker spawn のレイアウト設定（全オプション省略で現在値を表示）
     Layout {
         /// 配置ポリシー: master-reserved（master の取り分を維持。既定）/ legacy（従来の右等分割）
@@ -1407,6 +1478,7 @@ enum OrchestratorCommand {
         /// 委任台帳の task_type（省略時は investigation）
         #[arg(long)]
         task_type: Option<String>,
+<<<<<<< HEAD
         /// 起動保証（#665）を待たずに即座に返す。既定は
         /// 「エージェント CLI が起動しプロンプトが届いた」ことを確認してから返す
         #[arg(long)]
@@ -1431,6 +1503,12 @@ enum OrchestratorCommand {
         /// --wait の上限秒数（既定 90）
         #[arg(long)]
         timeout: Option<u64>,
+||||||| db83389
+=======
+        /// アカウント名（accounts.yaml のキー。この worker だけ該当アカウントで起動する。#504）
+        #[arg(long)]
+        account: Option<String>,
+>>>>>>> origin/main
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
@@ -1464,15 +1542,32 @@ enum OrchestratorCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
+<<<<<<< HEAD
     /// worker のダイアログに応答する（#319 / #662）。
     /// ダイアログ不在時はエラー（誤爆防止）
+||||||| db83389
+    /// worker の permission ダイアログに応答する（#319）。
+    /// ダイアログ不在時はエラー（誤爆防止）
+=======
+    /// worker の選択肢ダイアログに応答する（#319 → #748 で permission 以外も対象）。
+    /// ダイアログ不在時はエラー（誤爆防止）。
+    /// `--choice` を省略すると**送信せず**選択肢の構造だけを表示する（下見）
+>>>>>>> origin/main
     Respond {
         /// 対象ペイン ID
         #[arg(long)]
         pane: u64,
+<<<<<<< HEAD
         /// permission ダイアログの選択肢番号（1-based）または "yes"/"no" エイリアス
+||||||| db83389
+        /// 選択肢の番号（1-based）または "yes"/"no" エイリアス
+=======
+        /// 選択肢の番号（画面の番号 or 1 始まりの順番）／ラベルの部分一致／
+        /// "yes"/"no" エイリアス。省略すると構造だけ表示する
+>>>>>>> origin/main
         #[arg(long)]
         choice: Option<String>,
+<<<<<<< HEAD
         /// AskUserQuestion への回答（#662）。質問ごとに 1 回指定する（表示順）。
         /// 番号（`2`）でもラベルの前方一致（`青い海`）でもよい。multiSelect は
         /// カンマ区切りで複数指定（`りんご,ぶどう`）。
@@ -1492,6 +1587,10 @@ enum OrchestratorCommand {
         /// worker レジストリの ID（ペインが消えても取得できる）
         #[arg(long)]
         worker: Option<String>,
+||||||| db83389
+        choice: String,
+=======
+>>>>>>> origin/main
     },
     /// worker の報告内容を取得する（scrollback 主 + transcript 補強。#364）
     Report {
@@ -1579,6 +1678,9 @@ enum OrchestratorCommand {
         /// 委任台帳の task_type（省略時は investigation）
         #[arg(long)]
         task_type: Option<String>,
+        /// アカウント名（accounts.yaml のキー。この worker だけ該当アカウントで起動する。#504）
+        #[arg(long)]
+        account: Option<String>,
     },
     /// 非同期 run の進捗照会（#121）。run_id 省略時は全 run の一覧
     #[command(name = "run-status")]
@@ -1595,6 +1697,44 @@ enum OrchestratorCommand {
     /// 委任台帳の操作（Issue #292）
     #[command(subcommand)]
     Ledger(LedgerCommand),
+}
+
+/// `tako orchestrator accounts` — アカウントレジストリ（accounts.yaml）の CRUD。
+/// MCP `tako_orchestrator_accounts` と同じ dispatch 関数を呼ぶ（表示・警告・検証を二重実装しない）
+#[derive(Subcommand)]
+enum AccountsCommand {
+    /// 登録済みアカウントの一覧
+    List,
+    /// 1 件の詳細
+    Show {
+        /// アカウント名
+        name: String,
+    },
+    /// アカウントの追加 / 更新
+    Add {
+        /// アカウント名
+        name: String,
+        /// CLAUDE_CONFIG_DIR に設定するパス（~ は $HOME に展開。--inherit と排他）
+        #[arg(long)]
+        config_dir: Option<String>,
+        /// CLAUDE_CONFIG_DIR を設定しない（既定の資格情報をそのまま使う。#512）
+        #[arg(long, conflicts_with = "config_dir")]
+        inherit: bool,
+        /// 説明
+        #[arg(long)]
+        description: Option<String>,
+        /// このアカウントの既定モデル（spawn で model 未指定時のフォールバック）
+        #[arg(long)]
+        default_model: Option<String>,
+        /// このアカウントの既定 effort
+        #[arg(long)]
+        default_effort: Option<String>,
+    },
+    /// アカウントの削除
+    Remove {
+        /// アカウント名
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1667,22 +1807,68 @@ enum ProjectsCommand {
     },
 }
 
+/// プロファイル種別の指定（#721）。既定は master なので、master を使うときは
+/// 何も付けない（「最も簡単なコマンドを提案する」原則。#322）
+#[derive(Args, Clone, Copy)]
+struct ProfileKindArgs {
+    /// solo プロファイル（tako solo が読む solo-profiles/）を対象にする（省略時 master）
+    #[arg(long)]
+    solo: bool,
+}
+
+impl ProfileKindArgs {
+    /// dispatch の kind パラメータ。master は None（既定）で送る
+    fn kind(&self) -> Option<String> {
+        self.solo.then(|| "solo".to_string())
+    }
+}
+
 // Set のオプション数で variant サイズ差 lint が出るが、CLI 引数のパースは
 // プロセスで 1 回きりのため実害がなく許容する（clap は Box variant を扱えない）
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum ProfilesCommand {
     /// プロファイルの一覧（model が null のものは claude CLI の既定モデルで起動する）
-    List,
+    List {
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
     /// プロファイルの内容と解決結果を表示する
     Show {
         /// プロファイル名（省略時 default）
         name: Option<String>,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
+    /// プロファイルを新規作成する（既存があればエラー。中身は set で埋める）
+    Create {
+        /// プロファイル名（英数字と - _ . のみ）
+        name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
+    /// 既存プロファイルを複製する
+    Copy {
+        /// 複製元のプロファイル名
+        from: String,
+        /// 複製先のプロファイル名
+        name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
+    },
+    /// プロファイルを削除する（default は削除できない）
+    Delete {
+        /// プロファイル名
+        name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
     },
     /// プロファイルを作成・更新する。[1m] 付きモデルは Max / API プラン限定なので注意
     Set {
         /// プロファイル名
         name: String,
+        #[command(flatten)]
+        kind: ProfileKindArgs,
         /// master のエージェント種別（claude / codex。agy は master 非対応。--clear-master-agent と排他）
         #[arg(long, conflicts_with = "clear_master_agent")]
         master_agent: Option<String>,
@@ -1758,6 +1944,24 @@ enum ProfilesCommand {
         /// worker_account を解除する
         #[arg(long)]
         clear_worker_account: bool,
+        /// 割り当てるプロジェクトキー（カンマ区切り。丸ごと置き換え。#721）
+        #[arg(long, value_delimiter = ',', conflicts_with = "clear_projects")]
+        projects: Option<Vec<String>>,
+        /// projects の割り当てを解除する（#721）
+        #[arg(long)]
+        clear_projects: bool,
+        /// 引き継ぎを始める ctx 使用率の閾値（%。50〜60。#749）
+        #[arg(long, conflicts_with = "clear_ctx_threshold")]
+        ctx_threshold: Option<u32>,
+        /// ctx_threshold を解除する（config.yaml → 既定 60 へ戻る。#749）
+        #[arg(long)]
+        clear_ctx_threshold: bool,
+        /// 閾値超過時に tako が引き継ぎを促す自動通知（既定 true。#749）
+        #[arg(long, conflicts_with = "clear_auto_handoff")]
+        auto_handoff: Option<bool>,
+        /// auto_handoff を解除して既定（有効）へ戻す（#749）
+        #[arg(long)]
+        clear_auto_handoff: bool,
     },
 }
 
@@ -1953,6 +2157,10 @@ struct OpenArgs {
     /// プレビューペインにフォーカスを移す（省略時は元ペインを維持）
     #[arg(long)]
     focus: bool,
+    /// 新しいタブ 1 枚をこのファイル専用のプレビューにして開く（タブ名はファイル名。
+    /// Finder の「このアプリケーションで開く」と同じ表示。#835）
+    #[arg(long = "new-tab", conflicts_with_all = ["right", "down", "up", "left"])]
+    new_tab: bool,
 }
 
 #[derive(Args)]
@@ -2010,6 +2218,34 @@ struct PreviewFollowLinkArgs {
 }
 
 #[derive(Args)]
+struct PreviewCopyCodeArgs {
+    /// 対象ペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// コードブロックの出現順（0 始まり。省略時は先頭）
+    index: Option<usize>,
+}
+
+/// `--view` の受理値（#553）。正式値は GUI のタブ表示名と 1:1 で、
+/// 旧称は後方互換のため受理を続ける（`--help` と invalid value エラーの
+/// possible values に旧称も出し、どちらの語彙からでも辿れるようにする）
+fn panel_view_parser() -> clap::builder::PossibleValuesParser {
+    use clap::builder::PossibleValue;
+    use tako_control::protocol::PanelViewWire;
+
+    let mut values: Vec<PossibleValue> = PanelViewWire::VALUES
+        .iter()
+        .map(|v| PossibleValue::new(*v))
+        .collect();
+    values.extend(
+        PanelViewWire::LEGACY_VALUES
+            .iter()
+            .map(|(old, new)| PossibleValue::new(*old).help(format!("{new} の旧称（後方互換）"))),
+    );
+    clap::builder::PossibleValuesParser::new(values)
+}
+
+#[derive(Args)]
 struct PanelArgs {
     /// パネルを表示する
     #[arg(long, conflicts_with = "hide")]
@@ -2020,15 +2256,18 @@ struct PanelArgs {
     /// パネル幅（px）
     #[arg(long)]
     width: Option<f32>,
-    /// 表示するビュー（orch = オーケストレーター俯瞰。#217）
-    #[arg(long, value_parser = ["tmux", "orch", "git"])]
+    /// 表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称）
+    #[arg(long, value_parser = panel_view_parser())]
     view: Option<String>,
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
     #[arg(long, value_parser = ["on", "off"])]
     filetree: Option<String>,
-    /// 左サイドバーの幅（px。Issue #307）
+    /// 左サイドバーの幅（px。下限 120 / 上限はウィンドウ幅の 50% にクランプされる。#307 / #789）
     #[arg(long)]
     sidebar_width: Option<f32>,
+    /// ファイルツリーの隠しファイル（ドット始まり）表示（Issue #550。既定 off）
+    #[arg(long, value_parser = ["on", "off"])]
+    show_hidden: Option<String>,
 }
 
 /// ON/OFF トグル系コマンド共通の引数（autorename / portdetect）
@@ -2037,6 +2276,39 @@ struct ToggleArgs {
     /// on = 有効化、off = 無効化（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+/// 入力予測の引数（Issue #600 / #614）。
+///
+/// `tako autosuggest [on|off]` = 予測そのもの、
+/// `tako autosuggest hint|tab [on|off]` = 確定キーの案内 / Tab 確定。
+/// サブコマンドではなく位置引数にしているのは、素の `tako autosuggest` を
+/// 状態表示のままにするため（`tako theme` と同じ形）
+#[derive(Args)]
+struct AutosuggestArgs {
+    /// on / off（予測そのもの）、または hint / tab（切替対象）。省略時は現在状態を表示
+    #[arg(value_parser = ["on", "off", "hint", "tab"])]
+    target_or_state: Option<String>,
+    /// hint / tab を指定したときの on / off（省略時はその項目の現在状態を表示）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+}
+
+/// 利用上限後の自動復帰の引数（Issue #813）。
+///
+/// `tako limit-resume` = 呼び出し元ペインの現在値、`on` / `off` で切替、
+/// `--all` で全ペインの一覧。素のコマンドが最短で済む形にしてある（#322）
+#[derive(Args)]
+struct LimitResumeArgs {
+    /// on / off（省略時は現在状態を表示）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+    /// 対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 全ペインの状態を一覧する（state とは併用しない）
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -2085,9 +2357,68 @@ struct ThemeArgs {
 /// 設定画面コマンドの引数（Issue #459）
 #[derive(Args)]
 struct SettingsArgs {
-    /// 開くタブ指定
+    /// 開くタブ指定（general / appearance / runner / profiles / setup / sleep / remote / advanced）
     #[arg(long)]
     tab: Option<String>,
+}
+
+/// ウェルカムバナーコマンドの引数（Issue #549）
+#[derive(Args)]
+struct WelcomeArgs {
+    /// show（再表示）/ dismiss（閉じて以後出さない）。省略時は状態表示
+    action: Option<String>,
+}
+
+/// コマンド提案カードの引数（Issue #666）。
+/// 標準の使い方は `tako show-command "コマンド"` の 1 形（#322 の最簡形）
+#[derive(Args)]
+struct ShowCommandArgs {
+    /// 提示するコマンド（複数指定でそのぶんカードに並ぶ）
+    commands: Vec<String>,
+    /// 何のためのコマンドかの短い説明（カード見出しに出る）
+    #[arg(long)]
+    label: Option<String>,
+    /// 対象ペイン（省略時は呼び出し元ペイン）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 表示中のカードと保管されている論理文字列を一覧する
+    #[arg(long, conflicts_with_all = ["label", "copy", "run", "dismiss"])]
+    list: bool,
+    /// カードのコマンドをクリップボードへコピーする（カードの「コピー」と同じ）
+    #[arg(long, conflicts_with_all = ["label", "run", "dismiss"])]
+    copy: bool,
+    /// カードのコマンドを新しいペインで実行する（カードの「新規ペインで実行」と同じ）
+    #[arg(long, conflicts_with_all = ["label", "dismiss"])]
+    run: bool,
+    /// カードを閉じる（--card 省略時はそのペインの全カード）
+    #[arg(long)]
+    dismiss: bool,
+    /// 対象カード ID（copy / run / dismiss。省略時は最新カード）
+    #[arg(long)]
+    card: Option<u64>,
+    /// 対象コマンド番号（copy / run。1 始まり。省略時は 1）
+    #[arg(long)]
+    index: Option<usize>,
+    /// run で新しいペインへフォーカスを移す（既定は移さない）
+    #[arg(long)]
+    focus: bool,
+}
+
+impl ShowCommandArgs {
+    /// フラグから dispatch の action を決める（既定は show）
+    fn action(&self) -> &'static str {
+        if self.list {
+            "list"
+        } else if self.copy {
+            "copy"
+        } else if self.run {
+            "run"
+        } else if self.dismiss {
+            "dismiss"
+        } else {
+            "show"
+        }
+    }
 }
 
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
@@ -2099,6 +2430,10 @@ struct PlatformArgs {
     /// この状態のものだけに絞る（省略時は全件）
     #[arg(long, value_parser = ["supported", "degraded", "pending", "unsupported"])]
     status: Option<String>,
+    /// リリースノート用の Known limitations 節（日英併記の markdown）だけを出力する（Issue #594。
+    /// scripts/release.sh が使う。縮退が無ければ何も出力しない）
+    #[arg(long)]
+    known_limitations: bool,
     /// 生の JSON で出力する
     #[arg(long)]
     json: bool,
@@ -2110,6 +2445,19 @@ struct LangArgs {
     /// ja / en = 指定言語へ、system = OS ロケール追従（省略時は現在言語を表示）
     #[arg(value_parser = ["ja", "en", "system"])]
     value: Option<String>,
+}
+
+/// UI 表示モードの引数（Issue #691 / #694）
+#[derive(Args)]
+struct UiModeArgs {
+    /// gui / terminal = そのモードへ、toggle = 反転、
+    /// release / restore = 対象ペインだけターミナル表示へ / その解除を戻す
+    /// （省略時は現在モードを表示）
+    #[arg(value_parser = ["gui", "terminal", "toggle", "release", "restore"])]
+    action: Option<String>,
+    /// release / restore の対象ペイン ID（省略時は呼び出し元ペイン）
+    #[arg(long)]
+    pane: Option<u64>,
 }
 
 /// 利用制限表示サービスの引数（Issue #321）
@@ -2193,6 +2541,55 @@ struct SetupArgs {
     review: bool,
 }
 
+/// `tako config`（Issue #513）。サブコマンド省略 = status
+#[derive(Args)]
+struct ConfigArgs {
+    /// 出力を JSON にする（MCP tako_config_share と同一ペイロード）。
+    /// サブコマンドの前後どちらに置いてもよい
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Option<ConfigCommand>,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// 配線状態と push / pull 待ちの差分を表示する（既定）
+    Status,
+    /// 共有リポジトリを新規に作って配線し、いまの設定を書き出す
+    Init {
+        /// リポジトリの配置先（省略時は ~/tako-config-sync）
+        #[arg(long)]
+        path: Option<String>,
+        /// origin として登録するリモート URL（指定時は初回 push まで行う）
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// 既存の共有リポジトリに配線する（ローカルパスまたは git URL）
+    Link {
+        /// リポジトリのパス、または clone 元の git URL
+        target: String,
+        /// URL を clone するときの配置先（省略時は ~/tako-config-sync）
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// 配線を外す（リポジトリ自体は消さない）
+    Unlink,
+    /// このデバイスの設定を書き出してコミットする（リモートがあれば push）
+    Push {
+        /// コミットメッセージ
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// リモートへ送らずコミットまでで止める
+        #[arg(long)]
+        no_push: bool,
+    },
+    /// 共有リポジトリの設定をこのデバイスへ取り込む（リモートがあれば pull）
+    Pull,
+    /// 何を共有し何を共有しないかの分類表を表示する
+    List,
+}
+
 #[derive(Args)]
 struct SetupMcpArgs {
     /// ユーザーグローバルに書き込む（既定）
@@ -2220,6 +2617,9 @@ enum TabCommand {
         /// 新タブをアクティブにする（省略時は現在のタブを維持）
         #[arg(long)]
         focus: bool,
+        /// 初期ペインのシェルを起動するフォルダ（省略時は継承。#835）
+        #[arg(long)]
+        cwd: Option<String>,
     },
     /// タブの表示タイトルを変える（明示リネーム = 自動リネームより優先。空文字で解除）
     Rename {
@@ -2231,6 +2631,18 @@ enum TabCommand {
         source: Option<String>,
         /// 新しいタイトル（複数引数はスペース連結。空文字で手動指定を解除）
         title: Vec<String>,
+    },
+    /// いまのタブ名を固定する（自動リネームに上書きされなくなる。#552）
+    Pin {
+        /// 対象タブ ID（省略時は呼び出し元ペインの属するタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 固定を解除して自動リネームを再開する
+        #[arg(long)]
+        off: bool,
+        /// 変更せず現在の固定状態だけを表示する
+        #[arg(long, conflicts_with = "off")]
+        status: bool,
     },
     /// タブを切り替える
     Select { tab: u64 },
@@ -2444,12 +2856,60 @@ fn cli_main() -> ExitCode {
             .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))
         }
+<<<<<<< HEAD
         Command::Orchestrator(OrchestratorCommand::Respond {
             pane,
             ref choice,
             ref answers,
             dry_run,
         }) => {
+||||||| db83389
+        Command::Orchestrator(OrchestratorCommand::Respond { pane, ref choice }) => {
+=======
+        Command::Orchestrator(OrchestratorCommand::Accounts(ref sub)) => {
+            // accounts.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
+            // （MCP `tako_orchestrator_accounts` と 1:1。二重実装を作らない。#548）
+            let (action, name, config_dir, inherit, description, default_model, default_effort) =
+                match sub {
+                    AccountsCommand::List => ("list", None, None, None, None, None, None),
+                    AccountsCommand::Show { name } => {
+                        ("show", Some(name.as_str()), None, None, None, None, None)
+                    }
+                    AccountsCommand::Add {
+                        name,
+                        config_dir,
+                        inherit,
+                        description,
+                        default_model,
+                        default_effort,
+                    } => (
+                        "add",
+                        Some(name.as_str()),
+                        config_dir.as_deref(),
+                        // 指定が無いときは None を渡す（dispatch 側の既定 = false）
+                        inherit.then_some(true),
+                        description.as_deref(),
+                        default_model.as_deref(),
+                        default_effort.as_deref(),
+                    ),
+                    AccountsCommand::Remove { name } => {
+                        ("remove", Some(name.as_str()), None, None, None, None, None)
+                    }
+                };
+            tako_control::dispatch_orchestrator_accounts(
+                action,
+                name,
+                config_dir,
+                inherit,
+                description,
+                default_model,
+                default_effort,
+            )
+            .map_err(|e| e.to_string())
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
+        Command::Orchestrator(OrchestratorCommand::Respond { pane, ref choice }) => {
+>>>>>>> origin/main
             let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
             parse_dialog_answers(answers)
                 .and_then(|parsed| {
@@ -2554,6 +3014,7 @@ fn cli_main() -> ExitCode {
             auto_close,
             output_lines,
             ref task_type,
+            ref account,
         }) => orchestrator_run(
             project,
             prompt,
@@ -2565,6 +3026,7 @@ fn cli_main() -> ExitCode {
             auto_close,
             output_lines,
             task_type.as_deref(),
+            account.as_deref(),
         ),
         Command::Orchestrator(OrchestratorCommand::RunStatus { ref run_id }) => {
             let request = Request::OrchestratorRunStatus {
@@ -2610,6 +3072,7 @@ fn cli_main() -> ExitCode {
         // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
+        Command::Config(ref args) => config_share_local(args),
         // run-interactive --wait は起動 + ポーリングの合成
         Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
         // run --wait / --list は合成処理
@@ -2754,6 +3217,7 @@ fn check_mcp_health_warning() {
     }
 }
 
+<<<<<<< HEAD
 /// master / solo が実際に使うアカウントを起動時に表示する（Issue #653）。
 ///
 /// 「プロファイルを見ても master がどのアカウントで動くか分からない」のが #653 の実害
@@ -2793,6 +3257,34 @@ fn print_account_banner(
             eprintln!("  ⚠ ログイン未確認: {path} に{cause}");
             eprintln!("    このアカウントは未ログインの可能性があります（起動後に claude のログインを求められたらその場で実行してください）");
         }
+||||||| db83389
+=======
+/// master / solo 起動時の env とアカウントの可視化（Issue #500 / #547）。
+/// 値はマスクし、キー名と解決後の config dir だけを出す。
+/// アカウント解決の失敗は build_master_cmd が起動前に Err にするので、ここは表示だけ
+fn print_master_env(profile: &tako_control::orchestrator::Profile) {
+    use tako_control::orchestrator;
+    if !profile.env.is_empty() {
+        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
+        eprintln!("env: {}", keys.join(", "));
+    }
+    match profile.resolve_master_account() {
+        // #547: master_account があればそちらが CLAUDE_CONFIG_DIR の正
+        Ok(Some(account)) => match account.config_dir.path() {
+            Some(dir) => eprintln!("アカウント: {}（config dir: {dir}）", account.name),
+            None => eprintln!(
+                "アカウント: {}（既定の資格情報 / CLAUDE_CONFIG_DIR 未設定）",
+                account.name
+            ),
+        },
+        // アカウント未指定: プロファイル env の config dir を従来どおり出す
+        Ok(None) => {
+            if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+                eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
+            }
+        }
+        Err(e) => eprintln!("warning: {e}"),
+>>>>>>> origin/main
     }
 }
 
@@ -2895,28 +3387,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     )?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
-    // --tab 指定時: 従来の新タブ起動
-    let pane_id = if use_tab {
-        let tab_result = send_request(Request::TabNew {
-            title: Some(tab_title.clone()),
-            focus: Some(true),
-        })?;
-        tab_result["pane"]
-            .as_u64()
-            .ok_or("タブ作成の応答に pane が含まれない")?
-    } else {
-        let cp = caller_pane().ok_or(
-            "呼び出し元ペインが不明（tako 内から実行するか、--tab で新タブ起動してください）",
-        )?;
-        send_request(Request::TabRename {
-            tab: None,
-            pane: Some(cp),
-            title: tab_title.clone(),
-            source: None,
-        })
-        .ok();
-        cp
-    };
+    // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）: 新タブ起動
+    let target = resolve_launch_target(&tab_title, use_tab, &master_cmd_hint(profile_name))?;
+    let pane_id = target.pane;
 
     send_request(Request::Title {
         pane: Some(pane_id),
@@ -2932,12 +3405,10 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         await_prompt: false,
     })?;
 
-    let location = if use_tab {
-        format!("タブ '{tab_title}'（ペイン {pane_id}）")
-    } else {
-        format!("ペイン {pane_id}（インライン）")
-    };
-    eprintln!("master を起動しました: {location}");
+    eprintln!(
+        "master を起動しました: {}",
+        launch_location(&tab_title, &target)
+    );
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         master_agent.as_str(),
@@ -2964,6 +3435,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
     };
     eprintln!("worker モデルポリシー: {policy_desc}");
+<<<<<<< HEAD
     // #653: master がどのアカウントで動くかを常に表示する（設定と実態のドリフト検知）
     print_account_banner(&profile, master_account.as_ref());
     // Part 4: env の可視化（キー名のみ。Issue #500）
@@ -2971,6 +3443,20 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
         eprintln!("env: {}", keys.join(", "));
     }
+||||||| db83389
+    // Part 4: env の可視化（キー名のみ。Issue #500）
+    if !profile.env.is_empty() {
+        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
+        eprintln!("env: {}", keys.join(", "));
+        // CLAUDE_CONFIG_DIR が設定されている場合、config dir を明示表示
+        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
+        }
+    }
+=======
+    // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
+    print_master_env(&profile);
+>>>>>>> origin/main
     if let Some(ref projects) = profile.projects {
         eprintln!("projects 制限: {}", projects.join(", "));
     }
@@ -3106,27 +3592,9 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         solo_account.as_ref(),
     )?;
 
-    let pane_id = if use_tab {
-        let tab_result = send_request(Request::TabNew {
-            title: Some(tab_title.clone()),
-            focus: Some(true),
-        })?;
-        tab_result["pane"]
-            .as_u64()
-            .ok_or("タブ作成の応答に pane が含まれない")?
-    } else {
-        let cp = caller_pane().ok_or(
-            "呼び出し元ペインが不明（tako 内から実行するか、--tab で新タブ起動してください）",
-        )?;
-        send_request(Request::TabRename {
-            tab: None,
-            pane: Some(cp),
-            title: tab_title.clone(),
-            source: None,
-        })
-        .ok();
-        cp
-    };
+    // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）は新タブ起動
+    let target = resolve_launch_target(&tab_title, use_tab, &solo_cmd_hint(profile_name))?;
+    let pane_id = target.pane;
 
     send_request(Request::Title {
         pane: Some(pane_id),
@@ -3142,12 +3610,10 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         await_prompt: false,
     })?;
 
-    let location = if use_tab {
-        format!("タブ '{tab_title}'（ペイン {pane_id}）")
-    } else {
-        format!("ペイン {pane_id}（インライン）")
-    };
-    eprintln!("solo を起動しました: {location}");
+    eprintln!(
+        "solo を起動しました: {}",
+        launch_location(&tab_title, &target)
+    );
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         solo_agent.as_str(),
@@ -3155,6 +3621,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.effort
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
+<<<<<<< HEAD
     // #653: どのアカウントで動くかを常に表示する（master と対称）
     print_account_banner(&profile, solo_account.as_ref());
     // Part 4: env の可視化（キー名のみ。Issue #500）
@@ -3162,6 +3629,19 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
         eprintln!("env: {}", keys.join(", "));
     }
+||||||| db83389
+    // Part 4: env の可視化（キー名のみ。Issue #500）
+    if !profile.env.is_empty() {
+        let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
+        eprintln!("env: {}", keys.join(", "));
+        if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
+            eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
+        }
+    }
+=======
+    // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
+    print_master_env(&profile);
+>>>>>>> origin/main
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
@@ -3479,6 +3959,11 @@ fn orchestrator_watch(
                         if let Some(pct) = ev["percent"].as_u64() {
                             parts.push(format!("percent={pct}"));
                         }
+                        // #572: 対処を併記しないと master が画面から推測するしかなく、
+                        // 「Enter を代行すれば直る」のような誤読の温床になる
+                        if let Some(action) = ev["recommended_action"].as_str() {
+                            parts.push(format!("action={action}"));
+                        }
                         println!("{}", parts.join(" "));
                     }
                 }
@@ -3537,6 +4022,48 @@ fn orchestrator_watch(
             println!("  action: respond");
             print_events(&mut exec);
         }
+        // #748: permission 以外の選択肢ダイアログ待ち。旧実装ではこの状態が
+        // WORKER_IDLE / WORKER_QUESTION として出ていたため、master は
+        // 「完了した」「本文で質問された」と読み違えていた
+        wait::WatchOutcome::ChoiceWaiting { choice_dialog } => {
+            let kind = choice_dialog
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("select");
+            println!("WORKER_DIALOG: tako:{pane} ({kind})");
+            if let Some(title) = choice_dialog.get("title").and_then(|v| v.as_str()) {
+                if !title.is_empty() {
+                    println!("  title: {title}");
+                }
+            }
+            if let Some(opts) = choice_dialog.get("options").and_then(|v| v.as_array()) {
+                for (i, opt) in opts.iter().enumerate() {
+                    let number = opt
+                        .get("number")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or((i + 1) as u64);
+                    let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                    let mark = if opt.get("highlighted").and_then(|v| v.as_bool()) == Some(true) {
+                        " ← 現在の選択"
+                    } else {
+                        ""
+                    };
+                    println!("  {number}. {label}{mark}");
+                }
+            }
+            if choice_dialog.get("numbered").and_then(|v| v.as_bool()) == Some(false) {
+                println!("  note: 番号キーは無反応なダイアログ（tako が矢印移動で応答する）");
+            }
+            println!(
+                "  action: {}",
+                choice_dialog
+                    .get("recommended_action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("respond")
+            );
+            println!("  respond: tako orchestrator respond --pane {pane} --choice <番号|ラベル>");
+            print_events(&mut exec);
+        }
         wait::WatchOutcome::AgentDead { resume_command } => {
             println!("WORKER_DEAD: tako:{pane}");
             println!(
@@ -3574,6 +4101,7 @@ fn orchestrator_run(
     auto_close: bool,
     output_lines: usize,
     task_type: Option<&str>,
+    account: Option<&str>,
 ) -> Result<(), String> {
     let pane_resolved = if pane.is_some() {
         pane
@@ -3603,7 +4131,7 @@ fn orchestrator_run(
         initial_delay: std::time::Duration::from_secs(20),
         interval: std::time::Duration::from_secs(5),
         task_type: task_type.map(str::to_string),
-        account: None,
+        account: account.map(str::to_string),
     };
     let mut exec = |req: Request| send_request(req);
     let result = wait::run_worker(&mut exec, &opts, &mut |pane_id, tmux| {
@@ -3869,17 +4397,39 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
     use tako_control::dispatch::{dispatch_orchestrator_profiles, ProfilesParams};
 
     let params = match sub {
-        ProfilesCommand::List => ProfilesParams {
+        ProfilesCommand::List { kind } => ProfilesParams {
             action: "list".into(),
+            kind: kind.kind(),
             ..Default::default()
         },
-        ProfilesCommand::Show { name } => ProfilesParams {
+        ProfilesCommand::Show { name, kind } => ProfilesParams {
             action: "show".into(),
             name: name.clone(),
+            kind: kind.kind(),
+            ..Default::default()
+        },
+        ProfilesCommand::Create { name, kind } => ProfilesParams {
+            action: "create".into(),
+            name: Some(name.clone()),
+            kind: kind.kind(),
+            ..Default::default()
+        },
+        ProfilesCommand::Copy { from, name, kind } => ProfilesParams {
+            action: "copy".into(),
+            name: Some(name.clone()),
+            from: Some(from.clone()),
+            kind: kind.kind(),
+            ..Default::default()
+        },
+        ProfilesCommand::Delete { name, kind } => ProfilesParams {
+            action: "delete".into(),
+            name: Some(name.clone()),
+            kind: kind.kind(),
             ..Default::default()
         },
         ProfilesCommand::Set {
             name,
+            kind,
             master_agent,
             clear_master_agent,
             model,
@@ -3905,9 +4455,19 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_master_account,
             worker_account,
             clear_worker_account,
+            projects,
+            clear_projects,
+            ctx_threshold,
+            clear_ctx_threshold,
+            auto_handoff,
+            clear_auto_handoff,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
+            kind: kind.kind(),
+            from: None,
+            projects: projects.clone(),
+            clear_projects: *clear_projects,
             master_agent: master_agent.clone(),
             clear_master_agent: *clear_master_agent,
             model: model.clone(),
@@ -3933,6 +4493,10 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_master_account: *clear_master_account,
             worker_account: worker_account.clone(),
             clear_worker_account: *clear_worker_account,
+            ctx_threshold: *ctx_threshold,
+            clear_ctx_threshold: *clear_ctx_threshold,
+            auto_handoff: *auto_handoff,
+            clear_auto_handoff: *clear_auto_handoff,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -3966,6 +4530,7 @@ fn remote_start() -> Result<(), String> {
                     mode: Some(tako_control::protocol::PreviewModeWire::Image),
                     direction: None,
                     focus: Some(true),
+                    new_tab: false,
                 });
                 eprintln!("スマホでスキャンしてください。");
             }
@@ -4136,15 +4701,285 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
     }
 }
 
+/// `tako config`（Issue #513）。GUI が動いていなくても使えるローカル処理。
+/// 実体は dispatch と共通なので、MCP `tako_config_share` と結果が食い違わない
+fn config_share_local(args: &ConfigArgs) -> Result<(), String> {
+    // CLI 単独で走るのでここでも表示言語を解決する（platform_local と同じ理由。#435）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let (action, target, path, remote, message, no_push) = match &args.command {
+        None | Some(ConfigCommand::Status) => ("status", None, None, None, None, false),
+        Some(ConfigCommand::List) => ("list", None, None, None, None, false),
+        Some(ConfigCommand::Init { path, remote }) => (
+            "init",
+            None,
+            path.as_deref(),
+            remote.as_deref(),
+            None,
+            false,
+        ),
+        Some(ConfigCommand::Link { target, path }) => (
+            "link",
+            Some(target.as_str()),
+            path.as_deref(),
+            None,
+            None,
+            false,
+        ),
+        Some(ConfigCommand::Unlink) => ("unlink", None, None, None, None, false),
+        Some(ConfigCommand::Push { message, no_push }) => {
+            ("push", None, None, None, message.as_deref(), *no_push)
+        }
+        Some(ConfigCommand::Pull) => ("pull", None, None, None, None, false),
+    };
+    let result = tako_control::dispatch::dispatch_config_share(
+        action, target, path, remote, message, no_push,
+    )
+    .map_err(|e| e.to_string())?;
+    if args.json {
+        println!("{}", pretty_json(&result));
+        return Ok(());
+    }
+    print_config_share(action, &result);
+    Ok(())
+}
+
+/// `tako config` の人向け表示。JSON の全量は `--json` で出せるので、ここは要点だけ
+fn print_config_share(action: &str, result: &serde_json::Value) {
+    use tako_core::i18n::Lang;
+    let ja = matches!(tako_core::i18n::lang(), Lang::Ja);
+    let t = |j: &'static str, e: &'static str| if ja { j } else { e };
+
+    if action == "list" {
+        for entry in result["entries"].as_array().into_iter().flatten() {
+            let class = entry["class"].as_str().unwrap_or("?");
+            println!(
+                "{class:<7} {}/{}",
+                entry["root"].as_str().unwrap_or("?"),
+                entry["path"].as_str().unwrap_or("?")
+            );
+            if let Some(note) = entry["note"].as_str() {
+                println!("        {note}");
+            }
+            let fields = entry["local_fields"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !fields.is_empty() {
+                let names: Vec<&str> = fields.iter().filter_map(|f| f.as_str()).collect();
+                println!(
+                    "        {}: {}",
+                    t("共有しないフィールド", "fields kept local"),
+                    names.join(", ")
+                );
+            }
+        }
+        let counts = &result["counts"];
+        println!();
+        println!(
+            "shared {} / local {} / secret {}   ({})",
+            counts["shared"],
+            counts["local"],
+            counts["secret"],
+            t(
+                "未分類は共有されません",
+                "unclassified files are never shared"
+            )
+        );
+        return;
+    }
+
+    if result["linked"] == serde_json::Value::Bool(false) {
+        println!("{}", t("設定共有: 未配線", "config share: not linked"));
+        if let Some(hint) = result["hint"].as_str() {
+            println!("{hint}");
+        }
+        return;
+    }
+
+    if let Some(repo) = result["repo"].as_str() {
+        println!("repo:   {repo}");
+    }
+    if let Some(remote) = result["remote"].as_str() {
+        println!("remote: {remote}");
+    }
+    if let Some(branch) = result["branch"].as_str() {
+        println!("branch: {branch}");
+    }
+
+    match action {
+        "status" => {
+            let summary = &result["summary"];
+            println!(
+                "{}: same {} / differs {} / local_only {} / repo_only {}",
+                t("差分", "diff"),
+                summary["same"].as_u64().unwrap_or(0),
+                summary["differs"].as_u64().unwrap_or(0),
+                summary["local_only"].as_u64().unwrap_or(0),
+                summary["repo_only"].as_u64().unwrap_or(0),
+            );
+            for file in result["files"].as_array().into_iter().flatten() {
+                let state = file["state"].as_str().unwrap_or("?");
+                if state == "same" {
+                    continue;
+                }
+                println!("  {state:<11} {}", file["path"].as_str().unwrap_or("?"));
+            }
+            print_list_section(
+                t("共有しない（未分類）", "not shared (unclassified)"),
+                &result["unclassified"],
+            );
+            print_list_section(
+                t(
+                    "リポジトリ内の管理外ファイル",
+                    "untracked files in repository",
+                ),
+                &result["untracked_in_repo"],
+            );
+            print_list_section(
+                t(
+                    "可搬でない絶対パス（別デバイスで解決できません）",
+                    "non-portable absolute paths (unresolvable on other devices)",
+                ),
+                &result["non_portable_paths"],
+            );
+        }
+        "push" | "init" => {
+            let push = if action == "init" {
+                &result["push"]
+            } else {
+                result
+            };
+            println!(
+                "{}: {} files",
+                t("書き出し", "exported"),
+                push["written"].as_u64().unwrap_or(0)
+            );
+            if push["committed"] == serde_json::Value::Bool(true) {
+                println!(
+                    "{}: {}",
+                    t("コミット", "committed"),
+                    push["commit"].as_str().unwrap_or("-")
+                );
+            } else {
+                println!("{}", t("変更なし（コミットなし）", "no changes to commit"));
+            }
+            if push["pushed"] == serde_json::Value::Bool(true) {
+                println!("{}", t("リモートへ push しました", "pushed to remote"));
+            } else if let Some(err) = push["push_error"].as_str() {
+                println!("{}: {err}", t("push に失敗", "push failed"));
+            }
+            print_list_section(
+                t(
+                    "リポジトリ内の管理外ファイル",
+                    "untracked files in repository",
+                ),
+                &push["untracked_in_repo"],
+            );
+        }
+        "pull" => {
+            let applied = result["applied"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let changed: Vec<&serde_json::Value> = applied
+                .iter()
+                .filter(|a| a["action"] != "unchanged")
+                .collect();
+            println!(
+                "{}: {} / {}",
+                t("取り込み", "applied"),
+                changed.len(),
+                applied.len()
+            );
+            for a in changed {
+                println!(
+                    "  {:<9} {}",
+                    a["action"].as_str().unwrap_or("?"),
+                    a["path"].as_str().unwrap_or("?")
+                );
+            }
+            let needs = result["needs_local"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !needs.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    t(
+                        "このデバイスで設定が必要な値（共有されない項目）:",
+                        "values that must be set on this device (never shared):"
+                    )
+                );
+                for n in needs {
+                    println!(
+                        "  {} → {}",
+                        n["path"].as_str().unwrap_or("?"),
+                        n["field"].as_str().unwrap_or("?")
+                    );
+                }
+            }
+        }
+        _ => {
+            if let Some(hint) = result["hint"].as_str() {
+                println!("{hint}");
+            }
+        }
+    }
+}
+
+fn print_list_section(title: &str, value: &serde_json::Value) {
+    let items = value.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if items.is_empty() {
+        return;
+    }
+    println!();
+    println!("{title}: {}", items.len());
+    for item in items.iter().take(20) {
+        match item.as_str() {
+            Some(s) => println!("  {s}"),
+            None => println!("  {item}"),
+        }
+    }
+    if items.len() > 20 {
+        println!("  …");
+    }
+}
+
 /// プラットフォーム対応マトリクスの表示（#515。ローカル処理・IPC 不要）。
 ///
 /// 応答の組み立ては `tako_control::platform::report` を通す。MCP `tako_platform` と
 /// **同じ 1 本**なので、CLI と AI で見える内容が食い違わない
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
+<<<<<<< HEAD
     // 表示言語の解決は `cli_main` の冒頭で全サブコマンド共通に済ませている（#435 / #525）
     let report = tako_control::platform::report(args.platform.as_deref(), args.status.as_deref())?;
+||||||| db83389
+    // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
+    // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let report = tako_control::platform::report(args.platform.as_deref(), args.status.as_deref())?;
+=======
+    // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
+    // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let report = tako_control::platform::report(
+        args.platform.as_deref(),
+        args.status.as_deref(),
+        args.known_limitations,
+    )?;
+>>>>>>> origin/main
     if args.json {
         println!("{}", pretty_json(&report));
+        return Ok(());
+    }
+    // リリースノートへ差し込むための素の markdown 出力（#594）。
+    // 他の表示を混ぜない = そのままリダイレクトできる
+    if args.known_limitations {
+        let md = report["known_limitations_markdown"].as_str().unwrap_or("");
+        if !md.is_empty() {
+            print!("{md}");
+        }
         return Ok(());
     }
 
@@ -4560,6 +5395,204 @@ fn caller_pane() -> Option<u64> {
     std::env::var("TAKO_PANE_ID").ok()?.parse().ok()
 }
 
+/// master / solo の起動先ペイン（Issue #567）
+struct LaunchTarget {
+    pane: u64,
+    /// 新規タブを作ったか（表示文言と復旧案内の出し分けに使う）
+    new_tab: bool,
+}
+
+/// 起動場所の表示文言（Issue #567。フォールバックで新タブになった場合もタブ表記になる）
+fn launch_location(tab_title: &str, target: &LaunchTarget) -> String {
+    if target.new_tab {
+        format!("タブ '{tab_title}'（ペイン {}）", target.pane)
+    } else {
+        format!("ペイン {}（インライン）", target.pane)
+    }
+}
+
+/// 案内文に出す最簡形のコマンド（#322。既定プロファイルなら引数を付けない）
+fn master_cmd_hint(profile_name: &str) -> String {
+    profile_cmd_hint("tako master", profile_name)
+}
+
+fn solo_cmd_hint(profile_name: &str) -> String {
+    profile_cmd_hint("tako solo", profile_name)
+}
+
+fn profile_cmd_hint(base: &str, profile_name: &str) -> String {
+    if profile_name == "default" {
+        base.to_string()
+    } else {
+        format!("{base} -{profile_name}")
+    }
+}
+
+/// master / solo の起動先ペインを決める（Issue #567）。
+///
+/// `TAKO_PANE_ID` はシェルの再利用やアプリ再起動をまたぐと古くなる。古い ID のまま
+/// 起動しようとして「ペイン N が見つからない」で止まると、master 消失からの復旧という
+/// 最も急いでいる場面で手が止まるため、次の順で**必ず起動先を確保する**:
+///
+/// 1. アプリに現世代のペインを問い合わせる（pid 祖先辿り → pane → stale map。#210 / #288）
+/// 2. 解決できなければ「呼び出し元不明」として新規タブを作る
+///
+/// アプリへ届かないときだけエラーで止め、復旧手順を添える。
+/// `cmd_hint` は案内文に出す最簡形のコマンド（例: `tako master -fable`。#322）
+fn resolve_launch_target(
+    tab_title: &str,
+    use_tab: bool,
+    cmd_hint: &str,
+) -> Result<LaunchTarget, String> {
+    let requested = caller_pane();
+    if use_tab {
+        return new_tab_target(tab_title, cmd_hint, requested);
+    }
+    let resolved = resolve_caller_pane_via_app(requested)
+        .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
+    match resolved {
+        Some(caller) => {
+            let pane = caller.pane;
+            if let Some(old) = requested.filter(|old| *old != pane) {
+                if caller.method.as_deref() == Some("stale") {
+                    eprintln!(
+                        "ℹ TAKO_PANE_ID={old} は旧世代のペイン ID です（アプリ再起動をまたいだ値）"
+                    );
+                    eprintln!("  現世代のペイン {pane} へ読み替えて起動します");
+                } else {
+                    eprintln!(
+                        "ℹ TAKO_PANE_ID={old} は呼び出し元ペインと一致しません（シェルが古い値を持っています）"
+                    );
+                    eprintln!("  実際の呼び出し元ペイン {pane} で起動します");
+                }
+                eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
+            }
+            send_request(Request::TabRename {
+                tab: None,
+                pane: Some(pane),
+                title: tab_title.to_string(),
+                source: None,
+            })
+            .ok();
+            Ok(LaunchTarget {
+                pane,
+                new_tab: false,
+            })
+        }
+        None => {
+            match requested {
+                Some(old) => eprintln!(
+                    "ℹ 呼び出し元ペインを特定できません（TAKO_PANE_ID={old} は現在の tako に無い古い値）"
+                ),
+                None => {
+                    eprintln!("ℹ 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）")
+                }
+            }
+            eprintln!("  新しいタブ '{tab_title}' を作ってそこで起動します");
+            if requested.is_some() {
+                eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
+            }
+            new_tab_target(tab_title, cmd_hint, requested)
+        }
+    }
+}
+
+/// 新規タブを作って起動先にする（Issue #567 のフォールバック / `--tab` 指定時）
+fn new_tab_target(
+    tab_title: &str,
+    cmd_hint: &str,
+    requested: Option<u64>,
+) -> Result<LaunchTarget, String> {
+    let tab_result = send_request(Request::TabNew {
+        title: Some(tab_title.to_string()),
+        focus: Some(true),
+        cwd: None,
+    })
+    .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
+    let pane = tab_result["pane"]
+        .as_u64()
+        .ok_or("タブ作成の応答に pane が含まれない")?;
+    Ok(LaunchTarget {
+        pane,
+        new_tab: true,
+    })
+}
+
+/// 起動先を確保できないときのエラー文（Issue #567）。
+/// フォールバック（新規タブ）まで届かない = アプリへ接続できていない状態なので、
+/// 復旧手順を必ず添える。コマンドは最簡形で示す（#322）
+fn launch_failure_message(cause: &str, cmd_hint: &str, requested: Option<u64>) -> String {
+    let mut message = format!(
+        "起動先ペインを確保できない: {cause}\n\
+         復旧: tako アプリを起動し、その中のターミナルで `{cmd_hint}` を実行してください"
+    );
+    if let Some(old) = requested {
+        message.push_str(&format!(
+            "\n      このシェルの TAKO_PANE_ID={old} は古い可能性があります: \
+             `unset TAKO_PANE_ID` してから再実行してください"
+        ));
+    }
+    message
+}
+
+/// 呼び出し元ペインの解決結果（Issue #567）
+struct ResolvedCaller {
+    pane: u64,
+    /// 解決手段（`pid` / `pane` / `stale`。縮退経路では `None`）。案内文の出し分けに使う
+    method: Option<String>,
+}
+
+/// アプリへ現世代の呼び出し元ペインを問い合わせる（Issue #567）。
+/// 解決できなければ `Ok(None)`（エラーではない）。アプリへ届かないときだけ `Err`。
+///
+/// 新旧バイナリ混在（`resolve_pane` を知らない古い GUI が動いている）でも止まらないよう、
+/// 問い合わせに失敗したら `list` でのペイン実在確認へ縮退する（stale map / pid 解決は
+/// 効かないが、少なくとも「古い ID のまま起動して失敗する」ことは無くなる）
+fn resolve_caller_pane_via_app(requested: Option<u64>) -> Result<Option<ResolvedCaller>, String> {
+    let request = Request::ResolvePane {
+        pane: requested,
+        caller_pid: Some(std::process::id()),
+    };
+    match send_request(request) {
+        Ok(value) => Ok(value["pane"].as_u64().map(|pane| ResolvedCaller {
+            pane,
+            method: value["method"].as_str().map(str::to_string),
+        })),
+        Err(e) => match send_request(Request::List) {
+            Ok(list) => Ok(requested
+                .filter(|p| list_contains_pane(&list, *p))
+                .map(|pane| ResolvedCaller { pane, method: None })),
+            Err(_) => Err(e),
+        },
+    }
+}
+
+/// `list` 応答に該当ペインが居るか（Issue #567 の縮退経路）
+fn list_contains_pane(list: &Value, pane: u64) -> bool {
+    list["tabs"]
+        .as_array()
+        .is_some_and(|tabs| tabs.iter().any(|t| tab_contains_pane(t, pane)))
+}
+
+fn tab_contains_pane(tab: &Value, pane: u64) -> bool {
+    tab["panes"]
+        .as_array()
+        .is_some_and(|panes| panes.iter().any(|p| p["id"].as_u64() == Some(pane)))
+}
+
+/// 相対パスを CLI 実行時の cwd で絶対化する。`--pane` で別ペインを指定しても
+/// 「いま居る場所」基準のまま意図どおりに解決させるため（cwd を取れなければ
+/// そのまま渡し、アプリ側のペイン cwd 解決に任せる）
+fn absolutize(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if !p.is_relative() {
+        return path.to_string();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p).display().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 /// `--pane` 指定が無ければ呼び出し元へフォールバックする（FR-2.2.7）
 fn target_pane(explicit: Option<u64>) -> Result<Option<u64>, String> {
     explicit.or_else(caller_pane).map(Some).ok_or_else(|| {
@@ -4640,6 +5673,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Close(args) => Request::Close {
             pane: target_pane(args.pane)?,
             force: args.force,
+            // #566: エージェントのペインから `tako close` を叩いたとき
+            // 「どの role が閉じたか」をペインログへ残す（監査情報。close の可否には影響しない）
+            caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE")
+                .ok()
+                .filter(|r| !r.trim().is_empty()),
         },
         Command::Title(args) => Request::Title {
             pane: target_pane(args.pane)?,
@@ -4675,19 +5713,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tab: args.tab,
         },
         Command::Open(args) => {
-            // 相対パスは CLI 実行時の cwd で絶対化する（--pane で別ペインを指定しても
-            // 「いま居る場所」基準のまま意図どおりに解決される）
-            let path = std::path::Path::new(&args.path);
-            let path = if path.is_relative() {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(path).display().to_string())
-                    .unwrap_or_else(|_| args.path.clone())
-            } else {
-                args.path.clone()
-            };
             Request::OpenFile {
                 pane: target_pane(args.pane)?,
-                path,
+                path: absolutize(&args.path),
                 mode: match args.mode.as_deref() {
                     None => None,
                     Some("code") => Some(tako_control::protocol::PreviewModeWire::Code),
@@ -4705,6 +5733,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     _ => None,
                 },
                 focus: if args.focus { Some(true) } else { None },
+                new_tab: args.new_tab,
             }
         }
         Command::Preview(args) => Request::PreviewView {
@@ -4725,6 +5754,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(args.pane)?,
         },
         Command::PreviewFollowLink(args) => Request::PreviewFollowLink {
+            pane: target_pane(args.pane)?,
+            index: args.index,
+        },
+        Command::PreviewCopyCode(args) => Request::PreviewCopyCode {
             pane: target_pane(args.pane)?,
             index: args.index,
         },
@@ -4791,9 +5824,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 enabled: *enabled,
             },
         },
-        Command::Tab(TabCommand::New { title, focus }) => Request::TabNew {
+        Command::Tab(TabCommand::New { title, focus, cwd }) => Request::TabNew {
             title: title.clone(),
             focus: if *focus { Some(true) } else { None },
+            // 相対パスは CLI 実行時の cwd で絶対化する（`tako open` と同じ規則）
+            cwd: cwd.as_ref().map(|c| absolutize(c)),
         },
         Command::Tab(TabCommand::Rename { tab, source, title }) => Request::TabRename {
             pane: if tab.is_none() {
@@ -4804,6 +5839,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tab: *tab,
             title: title.join(" "),
             source: source.clone(),
+        },
+        Command::Tab(TabCommand::Pin { tab, off, status }) => Request::TabPinTitle {
+            pane: if tab.is_none() {
+                target_pane(None)?
+            } else {
+                None
+            },
+            tab: *tab,
+            pinned: if *status { None } else { Some(!*off) },
         },
         Command::Tab(TabCommand::Select { tab }) => Request::TabSelect { tab: *tab },
         Command::Window(WindowCommand::List) => Request::WindowList,
@@ -4879,19 +5923,45 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => None,
             },
             width: args.width,
-            view: args.view.as_deref().map(|v| match v {
-                "git" => tako_control::protocol::PanelViewWire::Git,
-                "orch" => tako_control::protocol::PanelViewWire::Orch,
-                _ => tako_control::protocol::PanelViewWire::Tmux,
-            }),
+            // value_parser で正式値・旧称ともに検証済み（#553）
+            view: args
+                .view
+                .as_deref()
+                .and_then(tako_control::protocol::PanelViewWire::parse),
             filetree: args.filetree.as_deref().map(|s| s == "on"),
             sidebar_width: args.sidebar_width,
+            show_hidden: args.show_hidden.as_deref().map(|s| s == "on"),
         },
         Command::Portdetect(args) => Request::PortDetect {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::Autosuggest(args) => {
+            let on = |v: &Option<String>| v.as_deref().map(|s| s == "on");
+            match args.target_or_state.as_deref() {
+                Some("hint") => Request::Autosuggest {
+                    enabled: None,
+                    hint: on(&args.state),
+                    tab: None,
+                },
+                Some("tab") => Request::Autosuggest {
+                    enabled: None,
+                    hint: None,
+                    tab: on(&args.state),
+                },
+                other => Request::Autosuggest {
+                    enabled: other.map(|s| s == "on"),
+                    hint: None,
+                    tab: None,
+                },
+            }
+        }
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
+        },
+        Command::LimitResume(args) => Request::LimitResume {
+            pane: args.pane.or_else(caller_pane),
+            enabled: args.state.as_deref().map(|s| s == "on"),
+            all: args.all.then_some(true),
         },
         Command::Theme(args) => {
             let m = args.mode.as_deref();
@@ -5023,9 +6093,45 @@ fn build_request(command: &Command) -> Result<Request, String> {
             action: Some("open".into()),
             tab: args.tab.clone(),
         },
+        Command::Welcome(args) => Request::Welcome {
+            action: args.action.clone(),
+        },
+        Command::ShowCommand(args) => Request::ShowCommand {
+            action: Some(args.action().to_string()),
+            commands: args.commands.clone(),
+            label: args.label.clone(),
+            pane: args.pane,
+            card: args.card,
+            index: args.index,
+            focus: Some(args.focus).filter(|f| *f),
+        },
         Command::Lang(args) => Request::Lang {
             action: args.value.as_deref().map(|_| "set".to_string()),
             value: args.value.clone(),
+        },
+        // #694: `tako ui-mode` は `tako theme` と同型（引数なし = 現在値、値 = set、
+        // toggle = 反転）。release / restore だけペイン単位の揮発操作
+        Command::UiMode(args) => match args.action.as_deref() {
+            Some(action @ ("release" | "restore")) => Request::UiMode {
+                action: Some(action.to_string()),
+                mode: None,
+                pane: target_pane(args.pane)?,
+            },
+            Some("toggle") => Request::UiMode {
+                action: Some("toggle".into()),
+                mode: None,
+                pane: None,
+            },
+            Some(mode) => Request::UiMode {
+                action: Some("set".into()),
+                mode: Some(mode.to_string()),
+                pane: None,
+            },
+            None => Request::UiMode {
+                action: None,
+                mode: None,
+                pane: None,
+            },
         },
         Command::LimitService(args) => Request::LimitService {
             action: if args.refresh {
@@ -5299,11 +6405,88 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(*pane)?,
             volume: *volume,
         },
+<<<<<<< HEAD
         Command::Orchestrator(OrchestratorCommand::Spawn { .. }) => {
             unreachable!("orchestrator spawn は run() を通らない（main() で起動保証つき処理済み）")
         }
         Command::Orchestrator(OrchestratorCommand::LaunchStatus { .. }) => {
             unreachable!("orchestrator launch-status は run() を通らない（main() で処理済み）")
+||||||| db83389
+        Command::Orchestrator(OrchestratorCommand::Spawn {
+            project,
+            prompt,
+            label,
+            agent,
+            model,
+            effort,
+            pane,
+            tab,
+            task_type,
+        }) => {
+            let pane_resolved = if pane.is_some() {
+                *pane
+            } else if tab.is_some() {
+                None
+            } else {
+                caller_pane()
+            };
+            let tab_resolved = if pane.is_some() { None } else { *tab };
+            if pane_resolved.is_none() && tab_resolved.is_none() {
+                return Err("--pane または --tab を指定してください".into());
+            }
+            Request::OrchestratorSpawn {
+                project: project.clone(),
+                prompt: prompt.clone(),
+                label: label.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+                pane: pane_resolved,
+                tab: tab_resolved,
+                caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
+                agent: agent.clone(),
+                caller_pid: Some(std::process::id()),
+                task_type: task_type.clone(),
+                account: None,
+            }
+=======
+        Command::Orchestrator(OrchestratorCommand::Spawn {
+            project,
+            prompt,
+            label,
+            agent,
+            model,
+            effort,
+            pane,
+            tab,
+            task_type,
+            account,
+        }) => {
+            let pane_resolved = if pane.is_some() {
+                *pane
+            } else if tab.is_some() {
+                None
+            } else {
+                caller_pane()
+            };
+            let tab_resolved = if pane.is_some() { None } else { *tab };
+            if pane_resolved.is_none() && tab_resolved.is_none() {
+                return Err("--pane または --tab を指定してください".into());
+            }
+            Request::OrchestratorSpawn {
+                project: project.clone(),
+                prompt: prompt.clone(),
+                label: label.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+                pane: pane_resolved,
+                tab: tab_resolved,
+                caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE").ok(),
+                agent: agent.clone(),
+                caller_pid: Some(std::process::id()),
+                task_type: task_type.clone(),
+                account: account.clone(),
+            }
+>>>>>>> origin/main
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
             unreachable!("orchestrator self は run() を通らない（main() でローカル処理済み）")
@@ -5361,8 +6544,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Orchestrator(OrchestratorCommand::Layout { .. }) => {
             unreachable!("orchestrator layout は run() を通らない（ローカルで config.yaml を操作）")
         }
+<<<<<<< HEAD
         Command::Account { .. } => {
             unreachable!("account は run() を通らない（account_cli が自前で dispatch / IPC する）")
+||||||| db83389
+=======
+        Command::Orchestrator(OrchestratorCommand::Accounts(_)) => {
+            unreachable!(
+                "orchestrator accounts は run() を通らない（ローカルで accounts.yaml を操作）"
+            )
+>>>>>>> origin/main
         }
         Command::Orchestrator(OrchestratorCommand::Report { .. }) => {
             unreachable!("orchestrator report は run() を通らない")
@@ -5508,12 +6699,38 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }
         }
         Command::Update(sub) => {
+<<<<<<< HEAD
             let (action, channel, dry_run) = match sub {
                 UpdateCommand::Status => ("status", None, false),
                 UpdateCommand::Check { channel } => ("check", channel.clone(), false),
                 UpdateCommand::Apply { channel, dry_run } => ("apply", channel.clone(), *dry_run),
                 UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone(), false),
                 UpdateCommand::Repair => ("repair", None, false),
+||||||| db83389
+            let (action, channel) = match sub {
+                UpdateCommand::Status => ("status", None),
+                UpdateCommand::Check { channel } => ("check", channel.clone()),
+                UpdateCommand::Apply { channel } => ("apply", channel.clone()),
+                UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone()),
+                UpdateCommand::Repair => ("repair", None),
+=======
+            let (action, channel) = match sub {
+                UpdateCommand::Status => ("status", None),
+                UpdateCommand::Check { channel } => ("check", channel.clone()),
+                UpdateCommand::Apply { channel } => ("apply", channel.clone()),
+                UpdateCommand::ApplyZip { channel } => ("apply-zip", channel.clone()),
+                UpdateCommand::Repair => ("repair", None),
+                // #616: 専用画面 + 通知カード
+                UpdateCommand::Open => ("open", None),
+                UpdateCommand::Card { action } => (
+                    match action.as_deref() {
+                        Some("dismiss") => "card-dismiss",
+                        Some("show") => "card-show",
+                        _ => "card",
+                    },
+                    None,
+                ),
+>>>>>>> origin/main
             };
             Request::Update {
                 action: Some(action.to_string()),
@@ -5564,6 +6781,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 mode: None,
                 power_condition: None,
                 lid_sleep_mode: None,
+            },
+        },
+        Command::Chat(sub) => match sub {
+            ChatCommand::Copy {
+                pane,
+                message,
+                code,
+                markdown,
+                list,
+            } => Request::ChatCopy {
+                pane: pane.or_else(caller_pane),
+                list: *list,
+                message: *message,
+                code: *code,
+                markdown: *markdown,
             },
         },
         Command::Tree(sub) => match sub {
@@ -5689,6 +6921,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::Config(_) => unreachable!("config は run() を通らない（ローカル処理）"),
         Command::OpenIn(sub) => match sub {
             OpenInCommand::Dir { path, no_focus } => Request::OpenDir {
                 path: resolve_cli_path(path),
@@ -6359,7 +7592,9 @@ fn print_result(command: &Command, result: &Value) {
         Command::List => {
             println!("{}", pretty_json(result));
         }
-        Command::Tab(TabCommand::New { .. }) => println!("{result}"),
+        Command::Tab(TabCommand::New { .. }) | Command::Tab(TabCommand::Pin { .. }) => {
+            println!("{result}")
+        }
         Command::Window(WindowCommand::List) => println!("{}", pretty_json(result)),
         // #657: list は構成そのままの JSON、open / invoke は解決結果（1 行）
         Command::Menu(MenuCommand::List) => println!("{}", pretty_json(result)),
@@ -6379,16 +7614,23 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
         Command::PreviewFollowLink(_) => println!("{result}"),
+        // #680: コピーしたコード全文は改行込みで読みたいので整形して出す
+        Command::PreviewCopyCode(_) => println!("{}", pretty_json(result)),
         Command::PreviewReload(_) | Command::PreviewCache(_) | Command::PreviewChangelog(_) => {
             println!("{result}")
         }
+        // #666: カードの内容（論理文字列）は改行込みで読みたいので整形して出す
+        Command::ShowCommand(_) => println!("{}", pretty_json(result)),
         Command::Autorename(_)
         | Command::Portdetect(_)
+        | Command::Autosuggest(_)
         | Command::Persist(_)
         | Command::ConfirmClose(_)
         | Command::Theme(_)
         | Command::Settings(_)
+        | Command::Welcome(_)
         | Command::Lang(_)
+        | Command::UiMode(_)
         | Command::LimitService(_)
         | Command::Telemetry(_)
         | Command::Panel(_)
@@ -6396,6 +7638,8 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Pin(_) => {
             println!("{result}")
         }
+        // #813: 状態（stop / resume_at / attempts）が入れ子なので整形して出す
+        Command::LimitResume(_) => println!("{}", pretty_json(result)),
         Command::Git(GitCommand::Log { .. })
         | Command::Git(GitCommand::Diff { .. })
         | Command::Git(GitCommand::Show { .. })
@@ -6443,6 +7687,7 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Web(_) => println!("{}", pretty_json(result)),
         Command::StaleBinary(_) => println!("{}", pretty_json(result)),
+<<<<<<< HEAD
         Command::Update(sub) => {
             println!("{}", pretty_json(result));
             // --dry-run を頼んだのに応答が dry-run を名乗らないなら、受け取った tako-app が
@@ -6459,6 +7704,12 @@ fn print_result(command: &Command, result: &Value) {
                 std::process::exit(1);
             }
         }
+||||||| db83389
+        Command::Update(_) => println!("{}", pretty_json(result)),
+=======
+        Command::Update(_) => println!("{}", pretty_json(result)),
+        Command::Chat(_) => println!("{}", pretty_json(result)),
+>>>>>>> origin/main
         Command::Tree(_) => println!("{}", pretty_json(result)),
         Command::Sessions(SessionsCommand::List { json, .. }) => {
             if *json {
@@ -6803,6 +8054,71 @@ mod tests {
         );
     }
 
+    /// #511: dispatch にある account が CLI からも指定できる（1:1 不変条件）
+    #[test]
+    fn spawnのaccountがrequestへ渡る() {
+        let command = parse(&[
+            "tako",
+            "orchestrator",
+            "spawn",
+            "--project",
+            "tako",
+            "--prompt",
+            "テスト",
+            "--pane",
+            "3",
+            "--account",
+            "personal",
+        ]);
+        let request = build_request(&command).unwrap();
+        match request {
+            Request::OrchestratorSpawn { account, .. } => {
+                assert_eq!(account.as_deref(), Some("personal"))
+            }
+            other => panic!("想定外の Request: {other:?}"),
+        }
+        // 省略時は None（従来挙動 = プロファイルの worker_account 解決に委ねる）
+        let command = parse(&[
+            "tako",
+            "orchestrator",
+            "spawn",
+            "--project",
+            "tako",
+            "--prompt",
+            "テスト",
+            "--pane",
+            "3",
+        ]);
+        match build_request(&command).unwrap() {
+            Request::OrchestratorSpawn { account, .. } => assert_eq!(account, None),
+            other => panic!("想定外の Request: {other:?}"),
+        }
+    }
+
+    /// #511: run 側も同じく account を受け取る（spawn と対称）
+    #[test]
+    fn runのaccountフラグがパースできる() {
+        let command = parse(&[
+            "tako",
+            "orchestrator",
+            "run",
+            "--project",
+            "tako",
+            "--prompt",
+            "テスト",
+            "--pane",
+            "3",
+            "--account",
+            "univ",
+        ]);
+        match command {
+            Command::Orchestrator(OrchestratorCommand::Run { account, .. }) => {
+                assert_eq!(account.as_deref(), Some("univ"))
+            }
+            _ => panic!("想定外の Command（run 以外にパースされた）"),
+        }
+    }
+
     #[test]
     fn sendはテキストを連結し改行は既定で付く() {
         let command = parse(&["tako", "send", "--pane", "2", "echo", "hello"]);
@@ -6952,15 +8268,24 @@ mod tests {
 
     #[test]
     fn openは絶対パスとモード別名を解釈する() {
-        let command = parse(&["tako", "open", "/tmp/a.md", "--pane", "5", "--mode", "md"]);
+        // 絶対パスの表記はプラットフォーム依存（Windows はドライブレターが要る。
+        // `/tmp/a.md` は Windows では相対パス扱いになり cwd のドライブで絶対化される）。
+        // ここで見たいのは「絶対パスはそのまま渡る」ことなので実行環境の表記に合わせる
+        let abs_md = if cfg!(windows) {
+            r"C:\tmp\a.md"
+        } else {
+            "/tmp/a.md"
+        };
+        let command = parse(&["tako", "open", abs_md, "--pane", "5", "--mode", "md"]);
         assert_eq!(
             build_request(&command).unwrap(),
             Request::OpenFile {
                 pane: Some(5),
-                path: "/tmp/a.md".into(),
+                path: abs_md.into(),
                 mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
                 direction: None,
                 focus: None,
+                new_tab: false,
             }
         );
         // 相対パスは CLI の cwd で絶対化される
@@ -6979,7 +8304,7 @@ mod tests {
         assert_eq!(mode, None);
         assert_eq!(direction, None);
         // 方向指定（FR-3.11 = D&D のドロップ位置相当）
-        let command = parse(&["tako", "open", "/tmp/a.md", "--pane", "5", "--down"]);
+        let command = parse(&["tako", "open", abs_md, "--pane", "5", "--down"]);
         let Request::OpenFile { direction, .. } = build_request(&command).unwrap() else {
             panic!("OpenFile になる");
         };
@@ -7106,6 +8431,126 @@ mod tests {
                 enabled: Some(false)
             }
         );
+    }
+
+    /// #813: 素の `tako limit-resume` で状態確認、on / off で切替、`--all` で一覧。
+    /// `--pane` 省略時は呼び出し元（TAKO_PANE_ID）を埋める
+    #[test]
+    fn limit_resumeは状態取得と切替と一覧を操作へ写す() {
+        let status = parse(&["tako", "limit-resume"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: None,
+                all: None
+            }
+        );
+        let enable = parse(&["tako", "limit-resume", "on", "--pane", "12"]);
+        assert_eq!(
+            build_request(&enable).unwrap(),
+            Request::LimitResume {
+                pane: Some(12),
+                enabled: Some(true),
+                all: None
+            }
+        );
+        let disable = parse(&["tako", "limit-resume", "off", "--pane", "12"]);
+        assert_eq!(
+            build_request(&disable).unwrap(),
+            Request::LimitResume {
+                pane: Some(12),
+                enabled: Some(false),
+                all: None
+            }
+        );
+        // 一覧は呼び出し元ペインが分からなくても引ける（dispatch 側が pane を見ない）
+        let all = parse(&["tako", "limit-resume", "--all"]);
+        assert_eq!(
+            build_request(&all).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: None,
+                all: Some(true)
+            }
+        );
+        // on / off 以外は clap が弾く（誤った語で黙って状態取得にならない）
+        assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());
+    }
+
+    /// #600: 入力予測は素の `tako autosuggest` で状態確認、on / off で切替
+    #[test]
+    fn autosuggestは状態取得と切替を操作へ写す() {
+        let status = parse(&["tako", "autosuggest"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::Autosuggest {
+                enabled: None,
+                hint: None,
+                tab: None
+            }
+        );
+        let disable = parse(&["tako", "autosuggest", "off"]);
+        assert_eq!(
+            build_request(&disable).unwrap(),
+            Request::Autosuggest {
+                enabled: Some(false),
+                hint: None,
+                tab: None
+            }
+        );
+        let enable = parse(&["tako", "autosuggest", "on"]);
+        assert_eq!(
+            build_request(&enable).unwrap(),
+            Request::Autosuggest {
+                enabled: Some(true),
+                hint: None,
+                tab: None
+            }
+        );
+    }
+
+    /// #614: `hint` / `tab` は本体を巻き込まずにその項目だけを触る。
+    /// 引数なしなら現在状態の取得（`tako autosuggest hint` = 表示のみ）
+    #[test]
+    fn autosuggestのヒントとtab確定を個別に切り替えられる() {
+        for (argv, expect) in [
+            (
+                vec!["tako", "autosuggest", "hint"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: None,
+                    tab: None,
+                },
+            ),
+            (
+                vec!["tako", "autosuggest", "hint", "off"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: Some(false),
+                    tab: None,
+                },
+            ),
+            (
+                vec!["tako", "autosuggest", "hint", "on"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: Some(true),
+                    tab: None,
+                },
+            ),
+            (
+                vec!["tako", "autosuggest", "tab", "off"],
+                Request::Autosuggest {
+                    enabled: None,
+                    hint: None,
+                    tab: Some(false),
+                },
+            ),
+        ] {
+            let parsed = parse(&argv);
+            assert_eq!(build_request(&parsed).unwrap(), expect, "{argv:?}");
+        }
     }
 
     #[test]
@@ -7235,6 +8680,111 @@ mod tests {
             }
         );
     }
+
+    /// Issue #553: GUI に見えている fleet をそのまま指定できる。
+    /// 旧称 tmux も同じビューへ解決され、既存スクリプトが動き続ける
+    #[test]
+    fn panel_viewはfleetと旧称tmuxの両方を受理する() {
+        use tako_control::protocol::PanelViewWire;
+
+        let view_of = |value: &str| match build_request(&parse(&[
+            "tako", "panel", "--show", "--view", value,
+        ]))
+        .unwrap()
+        {
+            Request::Panel { view, .. } => view,
+            other => panic!("Panel 以外になった: {other:?}"),
+        };
+        assert_eq!(view_of("fleet"), Some(PanelViewWire::Fleet));
+        assert_eq!(view_of("tmux"), Some(PanelViewWire::Fleet));
+        assert_eq!(view_of("orch"), Some(PanelViewWire::Orch));
+        assert_eq!(view_of("git"), Some(PanelViewWire::Git));
+    }
+
+    /// invalid value のエラーに GUI 表示名 fleet と旧称の両方が載る（#553 案 2）
+    #[test]
+    fn panel_viewの不正値エラーにfleetが載る() {
+        let err = match Cli::try_parse_from(["tako", "panel", "--view", "fleets"]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("不正値がエラーにならなかった"),
+        };
+        assert!(err.contains("fleet"), "エラーに fleet が無い: {err}");
+        assert!(err.contains("tmux"), "エラーに旧称 tmux が無い: {err}");
+    }
+
+    // ---- Issue #567: stale な TAKO_PANE_ID からの master / solo 起動 ----
+
+    fn list_with_panes(ids: &[u64]) -> Value {
+        serde_json::json!({
+            "tabs": [{
+                "id": 1,
+                "panes": ids.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
+            }],
+        })
+    }
+
+    #[test]
+    fn list_contains_paneは現存判定に使える() {
+        let list = list_with_panes(&[780, 781]);
+        assert!(list_contains_pane(&list, 780));
+        assert!(
+            !list_contains_pane(&list, 305),
+            "旧世代の ID は現存しないと判定される（#567 の実事象）"
+        );
+        // 応答が壊れていても panic せず「居ない」に倒す
+        assert!(!list_contains_pane(&serde_json::json!({}), 780));
+    }
+
+    #[test]
+    fn launch_locationはフォールバック時にタブ表記になる() {
+        let inline = LaunchTarget {
+            pane: 780,
+            new_tab: false,
+        };
+        assert_eq!(
+            launch_location("master", &inline),
+            "ペイン 780（インライン）"
+        );
+        let fallback = LaunchTarget {
+            pane: 900,
+            new_tab: true,
+        };
+        assert_eq!(
+            launch_location("master-fable", &fallback),
+            "タブ 'master-fable'（ペイン 900）"
+        );
+    }
+
+    /// 復旧案内は最簡形で出す（既定プロファイルに余計な引数を付けない。#322）
+    #[test]
+    fn 復旧案内のコマンドは最簡形() {
+        assert_eq!(master_cmd_hint("default"), "tako master");
+        assert_eq!(master_cmd_hint("fable"), "tako master -fable");
+        assert_eq!(solo_cmd_hint("default"), "tako solo");
+        assert_eq!(solo_cmd_hint("fast"), "tako solo -fast");
+    }
+
+    /// フォールバック不能（GUI 不在）のエラーには復旧手順が載る（#567 受け入れ条件 2）
+    #[test]
+    fn 起動失敗のエラーに復旧手順が載る() {
+        let with_stale = launch_failure_message(OUTSIDE_TAKO, "tako master -fable", Some(305));
+        assert!(with_stale.contains("tako アプリを起動"), "{with_stale}");
+        assert!(
+            with_stale.contains("unset TAKO_PANE_ID"),
+            "古い ID を持つシェルには unset を案内する: {with_stale}"
+        );
+        assert!(with_stale.contains("tako master -fable"), "{with_stale}");
+        assert!(
+            with_stale.contains(OUTSIDE_TAKO),
+            "原因も残す: {with_stale}"
+        );
+
+        let without = launch_failure_message(OUTSIDE_TAKO, "tako master", None);
+        assert!(
+            !without.contains("unset TAKO_PANE_ID"),
+            "そもそも設定されていないなら unset は案内しない: {without}"
+        );
+    }
 }
 
 /// T3 CLI 表: 全 CLI サブコマンドがマトリクスのキー（= MCP ツール）へ写像できること。
@@ -7260,6 +8810,8 @@ mod platform_matrix_parity {
         ("background", "tako_background_pane"),
         ("close", "tako_close_pane"),
         ("collapse", "tako_collapse_tab"),
+        // #513: CLI は `tako config <操作>`、MCP は action 引数を持つ 1 ツール
+        ("config", "tako_config_share"),
         ("edit apply", "tako_preview_apply"),
         ("edit autosave", "tako_preview_autosave"),
         ("edit redo", "tako_preview_redo"),
@@ -7298,6 +8850,7 @@ mod platform_matrix_parity {
         ("split", "tako_split_pane"),
         ("tab move-pane", "tako_move_pane_to_tab"),
         ("tab new", "tako_create_tab"),
+        ("tab pin", "tako_pin_tab_title"),
         ("tab rename", "tako_rename_tab"),
         ("tab reorder", "tako_reorder_tab"),
         ("tab select", "tako_select_tab"),
@@ -7376,6 +8929,25 @@ mod platform_matrix_parity {
              → MCP ツールを追加する（開発不変条件）か、対応表 CLI_KEY_OVERRIDES に写像を書くか、\n\
              または意図的に CLI 専用なら CLI_ONLY に理由つきで登録してください"
         );
+    }
+
+    /// #548: accounts の 4 コマンドが MCP の 1 ツールへ写ること。
+    /// 規則（後ろの語を落として探す）で解けるので CLI_KEY_OVERRIDES への登録は要らないが、
+    /// MATRIX 側のキー名が変わったら気づけるように明示しておく
+    #[test]
+    fn t3_accountsコマンドはmcpツールへ写る() {
+        for cmd in [
+            "orchestrator accounts list",
+            "orchestrator accounts show",
+            "orchestrator accounts add",
+            "orchestrator accounts remove",
+        ] {
+            assert_eq!(
+                resolve(cmd),
+                Ok(Some("tako_orchestrator_accounts")),
+                "{cmd} の写像先"
+            );
+        }
     }
 
     /// 表そのものが腐らないようにする（消えたコマンド・キーを残さない）

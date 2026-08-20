@@ -5,7 +5,7 @@ import { test, expect } from '@playwright/test';
 
 const EVIDENCE_DIR = process.env.HOME + '/Desktop/tako-284-evidence';
 const IPHONE_VIEWPORT = { width: 390, height: 844 };
-const BASE = 'http://localhost:5174';
+const BASE = `http://localhost:${process.env.TAKO_PWA_PORT || 5174}`;
 
 // モックデータ
 const FAKE_ME = {
@@ -39,26 +39,26 @@ const FAKE_PANES = {
       id: 1, title: 'fix-auth', role: 'orchestrator-worker-claude',
       agent_type: 'claude', cwd: '/dev/project', state: 'busy',
       surface: 'foreground', position: '2/4', tab_id: 1, tab_title: 'work',
-      cols: 120, rows: 40, focused: false, session_id: 'abc-def-123',
+      cols: 120, rows: 40, focused: false, session_id: 'abc-def-123', tmux_target: 'tako-a:0.0',
       model: 'opus 4.5',
     },
     {
       id: 2, title: 'refactor-api', role: 'orchestrator-worker-codex',
       agent_type: 'codex', cwd: '/dev/project', state: 'running',
       surface: 'foreground', position: '3/4', tab_id: 1, tab_title: 'work',
-      cols: 120, rows: 40, focused: false, model: 'gpt-5.6',
+      cols: 120, rows: 40, focused: false, model: 'gpt-5.6', tmux_target: 'tako-b:0.0',
     },
     {
       id: 3, title: 'docs-site', role: 'orchestrator-worker-agy',
       agent_type: 'agy', cwd: '/dev/docs', state: 'running',
       surface: 'foreground', position: '4/4', tab_id: 1, tab_title: 'work',
-      cols: 120, rows: 40, focused: false, model: 'gemini 3.5',
+      cols: 120, rows: 40, focused: false, model: 'gemini 3.5', tmux_target: 'tako-c:0.0',
     },
     {
       id: 4, title: 'master', role: 'master', agent_type: 'claude',
       cwd: '/dev/project', state: 'idle', surface: 'foreground',
       position: '1/4', tab_id: 1, tab_title: 'work', cols: 120, rows: 40,
-      focused: true, session_id: 'master-session',
+      focused: true, session_id: 'master-session', tmux_target: 'tako-m:0.0',
     },
   ],
   api_version: 2,

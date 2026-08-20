@@ -22,8 +22,19 @@ pub fn account_invalid() -> &'static str {
 /// 固定コマンドの表示ラベル（キー: palette.cmd_<id>）
 pub fn cmd_label(id: &str) -> &'static str {
     match id {
+        // #549: 初期設定・オーケストレーションの導線（初回起動バナーと同じ入口）
+        "run-setup" => tr!("セットアップを実行", "Run setup"),
+        "run-master" => tr!("master を起動", "Start master"),
+        "open-settings" => tr!("設定を開く", "Open settings"),
+        // #616: アップデート画面（下部バーから撤去したぶんの入口）
+        "open-update" => tr!("アップデートを開く", "Open update screen"),
         "new-tab" => tr!("新しいタブ", "New tab"),
         "toggle-theme" => tr!("テーマをライト/ダーク切替", "Toggle light/dark theme"),
+        // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
+        "toggle-ui-mode" => tr!(
+            "表示モードを切り替え（かんたん / ターミナル）",
+            "Switch view mode (simple / terminal)"
+        ),
         "toggle-files" => tr!("ファイルツリーを開閉", "Toggle file tree"),
         "toggle-drawer" => tr!("バックグラウンドドロワーを開閉", "Toggle background drawer"),
         "panel-fleet" => tr!("fleet パネルを開く", "Open fleet panel"),
@@ -32,6 +43,8 @@ pub fn cmd_label(id: &str) -> &'static str {
         "split-right" => tr!("ペインを右に分割", "Split pane right"),
         "split-down" => tr!("ペインを下に分割", "Split pane down"),
         "switch-account" => tr!("claude アカウントを切り替え", "Switch claude account"),
+        // #552: いまのタブ名を固定して自動リネームの上書きを止める
+        "pin-tab-title" => tr!("このタブ名を固定", "Pin this tab name"),
         // 言語切替は両言語でネイティブ表記を併記（切替先を字面で探せるように）。
         // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外
         "toggle-language" => tr!(
@@ -53,8 +66,13 @@ mod tests {
             vec![
                 search_placeholder().to_string(),
                 no_match().to_string(),
+                cmd_label("run-setup").to_string(),
+                cmd_label("run-master").to_string(),
+                cmd_label("open-settings").to_string(),
+                cmd_label("open-update").to_string(),
                 cmd_label("new-tab").to_string(),
                 cmd_label("toggle-theme").to_string(),
+                cmd_label("toggle-ui-mode").to_string(),
                 cmd_label("toggle-files").to_string(),
                 cmd_label("toggle-drawer").to_string(),
                 cmd_label("panel-fleet").to_string(),
@@ -66,6 +84,7 @@ mod tests {
                 account_logged_out().to_string(),
                 account_missing().to_string(),
                 account_invalid().to_string(),
+                cmd_label("pin-tab-title").to_string(),
                 // toggle-language は意図的にネイティブ表記併記のため対象外（上記コメント）
             ]
         });

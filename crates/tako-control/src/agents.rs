@@ -5,6 +5,7 @@
 //! `pane_pid` からプロセス祖先を辿って「どのペインで動いているか」を対応付ける。
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -164,6 +165,143 @@ mod win_process {
             CloseHandle(snapshot);
         }
         map
+/// tmux ペイン PID と全プロセスの親子関係を 1 回で採取した共有スナップショット。
+///
+/// `tmux list-panes -a` と `ps -axo pid=,ppid=` はどちらもサブプロセスを起動するため、
+/// 2 秒 tick の各機能が別々に採取してはならない。#772 の stale binary 検知と #779 の
+/// sleep guard は、同じ tick ではこの 1 個を共有する。
+#[derive(Debug, Clone)]
+pub struct ProcessSnapshot {
+    /// `session:window.pane` → ペインのシェル PID
+    panes: Vec<(String, u32)>,
+    /// pid → ppid
+    parents: HashMap<u32, u32>,
+    /// pid → 直接の子 PID 集合
+    children: HashMap<u32, Vec<u32>>,
+}
+
+impl ProcessSnapshot {
+    /// tmux と ps を各 1 回だけ実行して採取する。background executor 専用。
+    pub fn capture() -> Self {
+        let socket = tako_core::tmux_backend::socket_name();
+        let panes = tmux_pane_pids(Some(&socket));
+        let parents = process_parent_map();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&child, &parent) in &parents {
+            children.entry(parent).or_default().push(child);
+        }
+        Self {
+            panes,
+            parents,
+            children,
+        }
+    }
+
+    /// 指定 backend session の pane PID を除いた全子孫 PID を返す。
+    pub fn descendant_pids(&self, backend_session: &str) -> Vec<u32> {
+        let prefix = format!("{backend_session}:");
+        let mut queue: Vec<u32> = self
+            .panes
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .flat_map(|(_, pid)| self.children.get(pid).into_iter().flatten().copied())
+            .collect();
+        let mut descendants = Vec::new();
+        let mut visited = HashSet::new();
+        while let Some(pid) = queue.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            descendants.push(pid);
+            if let Some(kids) = self.children.get(&pid) {
+                queue.extend(kids);
+            }
+        }
+        descendants
+    }
+
+    /// backend session 群のうち、実行中の子プロセスを持つものを返す。
+    pub fn sessions_with_running_children(&self, sessions: &[&str]) -> Vec<String> {
+        sessions_with_children_inner(sessions, &self.panes, &self.parents)
+    }
+
+    #[cfg(test)]
+    fn from_parts(panes: Vec<(String, u32)>, parents: HashMap<u32, u32>) -> Self {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&child, &parent) in &parents {
+            children.entry(parent).or_default().push(child);
+        }
+        Self {
+            panes,
+            parents,
+            children,
+        }
+    }
+}
+
+/// sleep guard の子プロセス走査対象。backend 集合だけでなく、エージェント role と
+/// OSC 133 状態を指紋へ含め、開始・終了を次の tick で再走査できるようにする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningChildrenScanTarget {
+    pub backend_session: String,
+    pub command_state: tako_core::CommandState,
+    pub has_agent_role: bool,
+}
+
+/// sleep guard / GUI モード / close 確認で共有する子プロセス走査状態。
+#[derive(Debug, Clone, Default)]
+pub struct RunningChildrenScanState {
+    pub targets: Vec<RunningChildrenScanTarget>,
+    pub busy_sessions: Vec<String>,
+    pub scanned_at: Option<Instant>,
+    /// 前回の走査時に while-agents-running が有効だったか。
+    pub sleep_guard_active: bool,
+}
+
+/// 変化に現れない終了等を回収する低頻度の保険。
+pub const RUNNING_CHILDREN_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// tmux + ps の再採取が必要かをメモリ情報だけで判定する。
+pub fn should_rescan_running_children(
+    prev: &RunningChildrenScanState,
+    targets: &[RunningChildrenScanTarget],
+    sleep_guard_active: bool,
+    now: Instant,
+) -> bool {
+    let Some(scanned_at) = prev.scanned_at else {
+        return true;
+    };
+    if prev.targets != targets {
+        return true;
+    }
+    // off / on から while-agents-running へ切り替えた瞬間は、古い共有キャッシュを
+    // assertion 判定へ使わず即時に実態を採り直す。
+    if !prev.sleep_guard_active && sleep_guard_active {
+        return true;
+    }
+    now.duration_since(scanned_at) >= RUNNING_CHILDREN_RESCAN_INTERVAL
+}
+
+/// 共有 ProcessSnapshot から走査結果を作る。呼び出し側が `should_rescan_*` を確認し、
+/// stale binary と同じ snapshot を渡す。
+pub fn scan_running_children(
+    targets: Vec<RunningChildrenScanTarget>,
+    sleep_guard_active: bool,
+    now: Instant,
+    snapshot: Option<&ProcessSnapshot>,
+) -> RunningChildrenScanState {
+    let refs: Vec<&str> = targets
+        .iter()
+        .map(|target| target.backend_session.as_str())
+        .collect();
+    let busy_sessions = snapshot
+        .map(|snapshot| snapshot.sessions_with_running_children(&refs))
+        .unwrap_or_default();
+    RunningChildrenScanState {
+        targets,
+        busy_sessions,
+        scanned_at: Some(now),
+        sleep_guard_active,
     }
 }
 
@@ -361,13 +499,34 @@ fn has_children_of_pid_inner(pane_pid: u32, parents: &HashMap<u32, u32>) -> bool
 }
 
 /// バックエンドセッションで**今まさに動いている** claude エージェント（live 解決）
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LiveClaudeSession {
     /// claude の session_id（transcript 参照キー）
     pub session_id: String,
     /// 対話型 TUI か（`claude agents --json` の kind == "interactive"。
     /// `claude -p` 等の一時セッションと区別し、ペインの agent 種別判定に使う）
     pub interactive: bool,
+    /// モデル名（`model`。GUI モードのチャットヘッダ表示用。#702）
+    pub model: Option<String>,
+    /// コンテキスト使用率 %（`contextPercentUsed`。残量バー用。#702）
+    pub ctx_percent: Option<f64>,
+    /// claude 自身が申告する状態（`status`。実測の語彙は idle / busy。#571）
+    pub status: Option<String>,
+}
+
+impl LiveClaudeSession {
+    /// 正規化済み agent JSON（`normalize_agent`）から作る。
+    /// session_id が空のエントリは live 解決の対象外なので None
+    fn from_agent(agent: &Value) -> Option<Self> {
+        let session_id = agent["session_id"].as_str().filter(|s| !s.is_empty())?;
+        Some(Self {
+            session_id: session_id.to_string(),
+            interactive: agent["kind"].as_str() == Some("interactive"),
+            model: agent["model"].as_str().map(|s| s.to_string()),
+            ctx_percent: agent["ctx_percent"].as_f64(),
+            status: agent["status"].as_str().map(|s| s.to_string()),
+        })
+    }
 }
 
 /// 全バックエンドセッションの live claude セッションを一括解決する
@@ -442,7 +601,7 @@ fn live_sessions_inner(
         let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
             continue;
         };
-        let Some(session_id) = agent["session_id"].as_str().filter(|s| !s.is_empty()) else {
+        let Some(live) = LiveClaudeSession::from_agent(agent) else {
             continue;
         };
         let Some(pane_id) = find_ancestor_pane(pid, parents, &pane_by_pid) else {
@@ -451,21 +610,17 @@ fn live_sessions_inner(
         let Some(backend) = pane_id.split(':').next().filter(|s| !s.is_empty()) else {
             continue;
         };
-        let interactive = agent["kind"].as_str() == Some("interactive");
         // 同一セッションに複数 agent が居る場合は interactive を優先して残す
         map.entry(backend.to_string())
             .and_modify(|existing: &mut LiveClaudeSession| {
-                if interactive && !existing.interactive {
-                    *existing = LiveClaudeSession {
-                        session_id: session_id.to_string(),
-                        interactive,
-                    };
+                if live.interactive && !existing.interactive {
+                    *existing = live.clone();
+                } else if live.interactive == existing.interactive {
+                    // 同格なら新しい方の計測値（ctx% / status）で更新する
+                    *existing = live.clone();
                 }
             })
-            .or_insert(LiveClaudeSession {
-                session_id: session_id.to_string(),
-                interactive,
-            });
+            .or_insert(live);
     }
     map
 }
@@ -508,27 +663,28 @@ pub fn has_running_children(backend_session: &str) -> bool {
 }
 
 /// バックエンドセッション群のうち実行中の子プロセスを持つものの数を返す。
-/// tmux list-panes + ps を各 1 回だけ実行し、全セッションをバッチ判定する。
 /// sleep_guard の busy_agents カウントで persist 復元後の worker を拾うために使う（#324）
 pub fn count_sessions_with_running_children(sessions: &[&str]) -> usize {
+    sessions_with_running_children(sessions).len()
+}
+
+/// バックエンドセッション群のうち実行中の子プロセスを持つものを列挙する。
+/// tmux list-panes + ps を各 1 回だけ実行し、全セッションをバッチ判定する。
+/// #566: close 確認の判定でも同じ結果を使う（UI スレッドから再実行しないよう
+/// 呼び出し側は結果をキャッシュする）
+pub fn sessions_with_running_children(sessions: &[&str]) -> Vec<String> {
     if sessions.is_empty() {
-        return 0;
+        return Vec::new();
     }
-    let socket = tako_core::tmux_backend::socket_name();
-    let panes = tmux_pane_pids(Some(&socket));
-    if panes.is_empty() {
-        return 0;
-    }
-    let parents = process_parent_map();
-    count_sessions_with_children_inner(sessions, &panes, &parents)
+    ProcessSnapshot::capture().sessions_with_running_children(sessions)
 }
 
 /// バッチ判定の内部ロジック（テスト可能）
-fn count_sessions_with_children_inner(
+fn sessions_with_children_inner(
     sessions: &[&str],
     panes: &[(String, u32)],
     parents: &HashMap<u32, u32>,
-) -> usize {
+) -> Vec<String> {
     sessions
         .iter()
         .filter(|session| {
@@ -545,7 +701,8 @@ fn count_sessions_with_children_inner(
                 !pane_set.contains(&pid) && is_descendant_of(ppid, &pane_set, parents)
             })
         })
-        .count()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// pid が target_pids のいずれかの子孫（自身を含む）かどうか
@@ -688,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn count_sessions_with_children_innerで子プロセスありをカウント() {
+    fn sessions_with_children_innerで子プロセスありを列挙() {
         // セッション tako-s1 に pane_pid=100、子プロセス 200→100
         let panes = vec![
             ("tako-s1:0.0".to_string(), 100u32),
@@ -702,20 +859,20 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            count_sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
-            1 // tako-s1 だけ
+            sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
+            vec!["tako-s1".to_string()] // tako-s1 だけ
         );
     }
 
     #[test]
-    fn count_sessions_with_children_innerで空入力は0() {
+    fn sessions_with_children_innerで空入力は空() {
         let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
         let parents: HashMap<u32, u32> = [(100, 1), (200, 100)].into();
-        assert_eq!(count_sessions_with_children_inner(&[], &panes, &parents), 0);
+        assert!(sessions_with_children_inner(&[], &panes, &parents).is_empty());
     }
 
     #[test]
-    fn count_sessions_with_children_innerで複数セッションの子プロセスをカウント() {
+    fn sessions_with_children_innerで複数セッションの子プロセスを列挙() {
         let panes = vec![
             ("tako-s1:0.0".to_string(), 100u32),
             ("tako-s2:0.0".to_string(), 300u32),
@@ -728,19 +885,136 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            count_sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
-            2
+            sessions_with_children_inner(&["tako-s1", "tako-s2"], &panes, &parents),
+            vec!["tako-s1".to_string(), "tako-s2".to_string()]
         );
     }
 
     #[test]
-    fn count_sessions_with_children_innerで存在しないセッションは無視() {
+    fn sessions_with_children_innerで存在しないセッションは無視() {
         let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
         let parents: HashMap<u32, u32> = [(100, 1)].into();
-        assert_eq!(
-            count_sessions_with_children_inner(&["tako-nonexist"], &panes, &parents),
-            0
+        assert!(sessions_with_children_inner(&["tako-nonexist"], &panes, &parents).is_empty());
+    }
+
+    #[test]
+    fn process_snapshotを子プロセス判定と子孫列挙で共有する() {
+        let snapshot = ProcessSnapshot::from_parts(
+            vec![("tako-s1:0.0".to_string(), 100u32)],
+            [(100, 1), (200, 100), (300, 200)].into(),
         );
+        assert_eq!(
+            snapshot.sessions_with_running_children(&["tako-s1"]),
+            vec!["tako-s1".to_string()]
+        );
+        let descendants: HashSet<u32> = snapshot.descendant_pids("tako-s1").into_iter().collect();
+        assert_eq!(descendants, HashSet::from([200, 300]));
+        assert!(!descendants.contains(&100), "pane PID 自体は子孫へ含めない");
+    }
+
+    fn running_target(
+        session: &str,
+        command_state: tako_core::CommandState,
+        has_agent_role: bool,
+    ) -> RunningChildrenScanTarget {
+        RunningChildrenScanTarget {
+            backend_session: session.to_string(),
+            command_state,
+            has_agent_role,
+        }
+    }
+
+    #[test]
+    fn running_children走査は変化なしなら省く() {
+        let now = Instant::now();
+        let targets = vec![running_target(
+            "tako-s1",
+            tako_core::CommandState::Idle,
+            true,
+        )];
+        let prev = RunningChildrenScanState {
+            targets: targets.clone(),
+            busy_sessions: vec!["tako-s1".into()],
+            scanned_at: Some(now),
+            sleep_guard_active: true,
+        };
+        assert!(!should_rescan_running_children(&prev, &targets, true, now));
+    }
+
+    #[test]
+    fn running_children走査はbackendとroleとosc状態の変化を拾う() {
+        let now = Instant::now();
+        let idle = running_target("tako-s1", tako_core::CommandState::Idle, false);
+        let prev = RunningChildrenScanState {
+            targets: vec![idle.clone()],
+            busy_sessions: Vec::new(),
+            scanned_at: Some(now),
+            sleep_guard_active: true,
+        };
+        assert!(should_rescan_running_children(
+            &prev,
+            &[running_target(
+                "tako-s1",
+                tako_core::CommandState::Running,
+                false
+            )],
+            true,
+            now
+        ));
+        assert!(should_rescan_running_children(
+            &prev,
+            &[running_target(
+                "tako-s1",
+                tako_core::CommandState::Idle,
+                true
+            )],
+            true,
+            now
+        ));
+        assert!(should_rescan_running_children(
+            &prev,
+            &[
+                idle,
+                running_target("tako-s2", tako_core::CommandState::Unknown, false)
+            ],
+            true,
+            now
+        ));
+    }
+
+    #[test]
+    fn running_children走査はwhileモード移行と60秒保険で再開する() {
+        let scanned_at = Instant::now();
+        let targets = vec![running_target(
+            "tako-s1",
+            tako_core::CommandState::Unknown,
+            true,
+        )];
+        let prev = RunningChildrenScanState {
+            targets: targets.clone(),
+            busy_sessions: Vec::new(),
+            scanned_at: Some(scanned_at),
+            sleep_guard_active: false,
+        };
+        assert!(should_rescan_running_children(
+            &prev, &targets, true, scanned_at
+        ));
+        let active = RunningChildrenScanState {
+            sleep_guard_active: true,
+            ..prev
+        };
+        assert!(!should_rescan_running_children(
+            &active,
+            &targets,
+            true,
+            scanned_at + RUNNING_CHILDREN_RESCAN_INTERVAL / 2
+        ));
+        assert!(should_rescan_running_children(
+            &active,
+            &targets,
+            true,
+            scanned_at + RUNNING_CHILDREN_RESCAN_INTERVAL
+        ));
     }
 
     // --- #592: 器を持たないペインの pid ベース解決 ---
@@ -886,20 +1160,35 @@ mod tests {
         ];
         let map = live_sessions_inner(&panes, &agents, &parents);
         assert_eq!(map.len(), 2);
-        assert_eq!(
-            map["tako-s1"],
-            LiveClaudeSession {
-                session_id: "sid-interactive".into(),
-                interactive: true
-            }
-        );
+        assert_eq!(map["tako-s1"], live("sid-interactive"));
         assert_eq!(
             map["tako-s2"],
             LiveClaudeSession {
                 session_id: "sid-headless".into(),
-                interactive: false
+                interactive: false,
+                ..live("sid-headless")
             }
         );
+    }
+
+    #[test]
+    fn live_sessionsはモデルとコンテキスト使用率を運ぶ() {
+        // #702: GUI モードのチャットヘッダ（モデル名 / ctx 残量 / 状態）は
+        // この 1 回の解決で一緒に取れる（追加のサブプロセスを増やさない）
+        let panes = vec![("tako-s1:0.0".to_string(), 100u32)];
+        let parents: HashMap<u32, u32> = [(300, 100), (100, 1)].into();
+        let agents = vec![normalize_agent(&json!({
+            "sessionId": "sid-1",
+            "pid": 300,
+            "kind": "interactive",
+            "model": "claude-opus-5",
+            "contextPercentUsed": 42.5,
+            "status": "busy",
+        }))];
+        let map = live_sessions_inner(&panes, &agents, &parents);
+        assert_eq!(map["tako-s1"].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(map["tako-s1"].ctx_percent, Some(42.5));
+        assert_eq!(map["tako-s1"].status.as_deref(), Some("busy"));
     }
 
     #[test]
@@ -928,6 +1217,9 @@ mod tests {
         LiveClaudeSession {
             session_id: sid.into(),
             interactive: true,
+            model: None,
+            ctx_percent: None,
+            status: None,
         }
     }
 

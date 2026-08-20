@@ -1708,3 +1708,849 @@
   profiles 書き込みと未登録キー・排他違反・破損 YAML のエラー、`inherit` が起動コマンドで
   **unset** になること（代入に化けたら FAILED になるテスト）まで確認
 - 関連: PR（Closes #709）。tako-control +14 / tako-app +3 テスト。fmt / clippy は baseline と同一
+## 2026-07-26（#511 / #512: アカウント切替の残欠陥 2 件）
+- #511: CLI `orchestrator spawn / run --account` を追加（dispatch には #504 で入っていたが
+  CLI が account: None 固定だった）。MCP `tako_orchestrator_run` の schema にも account を追加
+- #512: accounts.yaml に `inherit: true`（CLAUDE_CONFIG_DIR を設定しない）を新設。
+  `AccountConfigDir { Path | Inherit }` + `EnvPlan { exports, unsets }` で「未設定」を型で表し、
+  spawn は `unset CLAUDE_CONFIG_DIR;` を前置する（direnv 対策）。既定パス明示の登録は警告
+- 検証: 隔離 GUI + 実 claude で受け入れ 5 件を実測（inherit worker がログイン画面を出さない /
+  direnv 注入に unset が勝つ / MCP・CLI 双方の spawn・run で account 適用）。品質ゲート全緑
+- **事故**: 検証テストの変数シャドウイングで `~/.claude-univ` を削除（復旧不能・要再ログイン）。
+  一時ディレクトリ配下を assert してから消す `remove_temp_dir` を入れて再発を構造で防止
+
+## 2026-07-26（#547: master_account が master 起動に適用されない問題）
+- `build_master_cmd`（tako master / solo）と handoff の新 master を
+  `resolved_env_plan_for_master()` 経由へ。#512 の inherit（unset）もそのまま効く。
+  未登録アカウント名は起動前に Err。CLI 起動時に「アカウント: <名前>（config dir: …）」を表示
+- 検証: 隔離実測で univ = プロセス env に `CLAUDE_CONFIG_DIR=~/.claude-univ`、
+  personal(inherit) / solo / master_account 無し = 未設定を `ps eww` で確認。
+  ユニット 5 本は修正を戻すと 4 本落ちる（検出力実証）。品質ゲート + クロス check ベースライン不変
+
+## 2026-07-26（#548: accounts の CLI 追加でアカウント系の 1:1 欠落を解消）
+- `tako orchestrator accounts list/show/add/remove` を追加。実体は
+  `dispatch_orchestrator_accounts` を pub 化して共用（layout と同じローカル呼び出し）
+- 検証: 同一 data_dir に対する CLI と MCP の出力を diff して list / show / add（警告つき）/
+  remove が完全一致。`--inherit` / 既定パス警告 / 排他エラー / 壊れたエントリ表示も実測。
+  CLI 登録アカウントが spawn で解決されるところまで通し確認。品質ゲート全緑
+
+## 2026-07-26（#530: spawn 初期プロンプトの消失を根治）
+- 根因は疑いにあった「シェル段階の誤判定」ではなく、**claude の番号付き選択ダイアログ**
+  （新 config dir の初回テーマ選択 `❯ 2. Dark mode ✔` / ログイン方法選択）の選択カーソルを
+  `input_line` が入力欄と誤認していたこと。`CLAUDE_CONFIG_DIR` 切替時に必ず出るため
+  account env 注入つき spawn 特有に見えていた。before 実測でテーマ選択が自動確定されて
+  次画面へ進み（t=12.99 → 13.33）プロンプトが消える様子を撮影
+- 修正: 文言非依存の `is_choice_dialog`（最下部プロンプト行が `N. …` + 選択肢 2 件以上）を新設し
+  `input_line` から除外 / 送達の証拠を「入力欄が空」から「貼り付けが入力欄へ反映された」へ /
+  未達は `prompt_delivery=undelivered` + `prompt_delivery_failure` + `resend_command` で報告
+- 検証: 10 連続 spawn で消失ゼロ・registry 全件 delivered、fresh config dir では
+  ダイアログを確定させず undelivered(choice_dialog) + 再送コマンド提示。品質ゲート全緑（1360）+
+  隔離セルフテスト FAILED 0。`claude_tui_e2e` の 2 件失敗は main 時点で同一 = 回帰ではない
+
+## 2026-07-27（#553: パネルビューの語彙を GUI 表示名へ統一）
+- GUI は fleet / orch / git、CLI / MCP は tmux / orch / git で食い違い、画面に見えている語で
+  操作できなかった。`PanelViewWire::Fleet` を正式値化し、語彙の正本（`VALUES` /
+  `LEGACY_VALUES` / `parse` / `values_hint`）を protocol.rs に集約して CLI・MCP が同じ表から引く形へ。
+  応答 JSON は旧称入力でも `fleet` に正規化。tako-app の `PanelView::Tmux` も `Fleet` へ改称
+- 後方互換: `--view tmux` と MCP `view:"tmux"` は受理継続（`serde(alias)` で IPC の JSON も同様）。
+  不正値は CLI が possible values + 「a similar value exists: 'fleet'」、MCP が
+  「fleet | orch | git。tmux は fleet の旧称」を返す（#553 案 2）
+- 検証: 品質ゲート全緑（1377）+ 隔離セルフテスト FAILED 0 + 隔離インスタンスへの実測
+  （fleet / tmux / git 切替・MCP 3 経路・tools/list の enum）。GUI スクショは蓋閉じで取得不可、
+  代わりにセルフテスト 49 が `app.panel_view == PanelView::Fleet` と応答 `view=="fleet"` を同時判定
+
+## 2026-07-27（#550 + #559: ファイルツリーの初回印象と新規作成インライン入力）
+- #550: ドット始まりを既定で非表示（表示時フィルタ = トグル即反映。ルート見出しは対象外）+
+  トグル 3 経路（見出しの目アイコン / 右クリック / 設定画面の外観）+ 増えたルートを自動展開して
+  先頭へ（既存の並びは維持しポーリングで暴れない）。settings.json `show_hidden_files` 永続化 +
+  CLI `tako panel --show-hidden` / MCP `tako_panel` の `show_hidden` と 1:1
+- #559: インライン入力欄を「展開済み子孫を飛ばした末尾」→「確定後にその項目が並ぶ位置」へ。
+  位置計算は純関数 `sidebar::inline_insert_position` に切り出し、インデント規則を通常行と一致。
+  作成先の行を強調 + プレースホルダ + 確定後は `FileTree::refresh_dir` で即反映
+- 実測で判明した訂正: **VSCode / Zed の既定は `.git` 等の個別除外であり、ドット全体は隠さない**
+  （実機確認）。Issue 本文の「VSCode と同じ既定」は不正確なのでコメント / requirements を訂正。
+  VSCode の New File 入力位置も「親の真下」ではなく「ファイル群の先頭」だったので実装を合わせた
+- 関連コミット: `fe5e341`（PR #565 squash merge）。品質ゲート全緑（1384）+ セルフテスト項目
+  83 / 84 新設（修正を戻すと FAILED になることを実測）+ CLI・MCP・永続化・GUI 実クリックを隔離実測。
+  証拠は `~/dev/tako-evidence/550/`
+- 既知: 合成キー入力は IME に吸われるため入力欄への打鍵は GUI 未検証（セルフテスト 84 で代替）。
+  `cargo fmt --all --check` が `keybindings.rs:248` で落ちるのは **main 由来**（#546 merge 時点から）
+
+## 2026-07-27（#558: 事前信頼の書き先を claude の config dir 配下へ）
+- 根因: claude は `<config dir>/.claude.json`（既定 `~/.claude/.claude.json`）を読むのに、
+  tako はホーム直下の `~/.claude.json` へ書いていた。承諾直後の diff で「config dir 側だけが
+  変化しホーム直下は無変化」を実測。事前信頼(#32)と bypass 事前承認(#407)が両方無効だった
+- 修正: `config_json_paths`（config dir 配下 → 既定。旧ファイルは存在時のみ併記）+
+  `ensure_trusted_in` / `ensure_bypass_accepted_in` + `EnvPlan::claude_config_dir` で
+  spawn / handoff / git resolve から起動先の config dir を渡す。e2e の後始末も同じ規則へ
+- 検証: `claude_tui_e2e --ignored` が 2 failed → 4 passed（109 秒 → 27 秒）。
+  アカウント指定 spawn の書き先を before/after 実測。品質ゲート全緑（1389）
+
+## 2026-07-27（#551 / #560 / #561 / #562: git タブの UX 4 件を一括改善）
+- #551 本文順を 変更 → コミット → ブランチ → リモート → diff へ + 既定折りたたみ見直し（案 1/2/3）、
+  #560 変更ファイル行クリックでプレビュー（`open_file_row` = dispatch OpenFile 経由）、
+  #562 マージボタンの常時表示 + 案内行 + ブランチチップからの導線
+- #561 根因は実測で確定 = **変換がターミナルペインに束縛され、下線・候補ウィンドウ・unmark の
+  確定先がすべてターミナル側へ向いていた**（`bound_pane=PaneId(1)` / `candidate_bounds=(11px,87px)` /
+  `commit_msg_after_unmark=""`）。`AppTextInput` + `ImeComposition.app_input` で宛先を型にして根治
+- 副産物: UI アイコン定数の `EMBEDDED_ASSETS` 登録漏れ検査テストを新設し、既存 remote.svg が
+  無言で描かれていなかったのを検出・修正。セルフテスト 85 / 86 / 86b を新設
+- 関連コミット: `b62c325`（PR #570 squash merge）。品質ゲート全緑（1393 tests）+ パリティ 0 エラー +
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK` + 隔離 GUI 実クリック（証拠 ~/dev/tako-evidence/560/）
+- 次: tako 再起動 → #561 の実 IME 目視（この機は日本語入力ソース未有効）と #562 の導線目視。#562 は open 維持
+
+## 2026-07-27（#574 + #567: CI 復旧 + stale TAKO_PANE_ID の master 起動 fallback）
+- #574: 45 日ぶりの CI 実走で腐敗が発覚。ci.yml の mac / Win 両ジョブに PWA ビルド工程を追加
+  （rust_embed が埋め込む `web/tako-remote/dist/` が CI では未生成だった）。Windows は**テスト
+  ステップのみ** continue-on-error（#583 完了までの暫定）。**以後の合格条件 = macOS 全ジョブ緑**
+- #567: stale な `TAKO_PANE_ID` を持つシェルからでも `tako master` / `solo` が起動できる fallback
+- 関連コミット: `cb2d06e`（PR #580）/ `1a5b91d`（PR #573）。CI は macOS / Windows / Pages 全 pass。
+  副産物起票: #583（Windows で tako-control テスト 19 件が POSIX 前提で fail、#467 の子）
+
+## 2026-07-27（#566: ペイン close の確認ガード + 発生源の監査記録）
+- cmd+W を × と同じ確認経由にし、確認対象は「失うものがあるペイン」（role 付き / Running /
+  子プロセスあり）に限定。`CloseOrigin` 型で close の発生源（kbd / ui / dispatch + caller_role）を
+  pane_log マーカーへ記録。副産物: config.yaml が無い環境では **#172 以来 close 確認が既定 OFF**
+  だった `SetupConfig` の serde default 無視バグを発見・修正
+- 関連コミット: `e59ea16`（PR #581 squash merge）。品質ゲート全緑（1400）+ セルフテスト 73a2/73f/87 +
+  実クリック証拠 ~/dev/tako-evidence/566/
+
+## 2026-07-27（#572: busy 中に人間が打った指示の消失を根治）
+- 根因を隔離実 claude で確定: **claude は生成中の打鍵を入力欄ではなく内部キューへ入れる**
+  （ターン終了時に送信）。その間の入力欄は空で dim のヒント `Press up to edit queued messages`
+  が出る。tako はこれを「残留テキスト」と誤認し、Enter 単独送達が no-op の Enter を 5 回
+  空撃ちして `verified=false`、`read` も `style=ghost` + テキストありに見えていた
+- 是正: ①「入力欄が空か」を **dim 属性**で判定（tmux 経路は `capture-pane -e`。文言リストでは
+  AI のゴースト提案を網羅できない）②キュー滞留を `queued_messages_pending` で検知し
+  `read` / `worker_status` / watch イベントへ公開 ③生成が止まっているのにキューが残っていたら
+  `Up` → `Enter` で送り出す。生成中かは `is_busy` の文言ではなく **画面が変化していないこと**
+  （実測で 120 行のリスト生成中に `is_busy` が false を返し救出が暴発した）
+- 検証: fmt / clippy(-D warnings) / test 全緑（1398）+ 実 claude e2e 新設（修正を戻すと
+  FAILED になることを実測）+ 隔離セルフテスト。既存 e2e 4/5 通過（残り 1 は `/tmp` が
+  信頼済みという環境要因で main でも同じく失敗）
+
+## 2026-07-27（#571: orchestrator watch が WORKER_IDLE を発火しない問題の根治）
+- 3 層の欠陥を実測で確定して全部潰した: ①`claude agents --json` をプロセス環境の
+  `CLAUDE_CONFIG_DIR` ごと実行しており、アカウント env つきペインから起動した GUI では
+  他アカウントの worker が「存在しない」ことになる（本番汚染下の実測で 1 件 → 8 件）
+  ②画面フォールバックが `screen_looks_busy || has_children` で busy に上書きしていたが、
+  エージェント TUI 自身がペインシェルの子なので has_children は常に true = 構造的に idle を
+  出せない ③claude のフッターが 8 行あり `screen_looks_busy` の末尾 5 行がスピナーに届かない
+  （②を外すと今度は偽 IDLE になる関係）。併せて claude の実 status 語彙（idle / busy）への
+  正規化と、agents が状態を返せないときの `status_source` 降格も修正
+- 関連: PR #578 squash merge（Closes #571）。fmt / clippy / 1408 tests 緑 +
+  実 claude e2e（`issue571_e2e`）が修正前 Timeout(60s) → 修正後 Idle(13.9s) +
+  隔離 GUI + 実 CLI watch で WORKER_IDLE を idle から 16 秒で発火（復元またぎ・screen 経路も確認）
+- 副産物: permission ダイアログ待ちが WORKER_QUESTION になる（`waiting` へ到達する経路が
+  claude では存在しない）を #577 に起票。Stop hook error は無害と確認（Issue の疑いは外れ）
+
+## 2026-07-27（#549: 初回起動のウェルカムバナー + ⌘K パレット導線）
+- 初回起動のみのバナー（setup / master のその場実行）+ パレットに「セットアップを実行 / 設定を
+  開く / master を起動」。`welcome_dismissed` を settings.json 永続化、破損 settings でも安全。
+  MCP `tako_welcome` + CLI 1:1
+- 関連コミット: `6dfd34b`（PR #597 squash merge）。バナー見た目の GUI 目視は画面ロックで未取得
+  （再起動後にユーザー目視）。PATH 問題の残りは #601 へ分離
+
+## 2026-07-27（#589: ファイルツリーのインデントガイド線の途切れを根治）
+- 根因 = 行の border-left では自分の深さの線しか描かれず、子孫行の区間で祖先の線が丸ごと欠けていた。
+  祖先ぶんの縦線もまとめて描く方式へ。visual-test に dark / light / スクロールのピクセル連続性検査を常設
+- 関連コミット: `c601417`（PR #593 squash merge）
+
+## 2026-07-27（#552: AI 自動リネームの品質改善 4 点）
+- 同一タブ 5 分下限 / 一時的失敗（command not found 等）を材料から除外 / 出力言語を UI 言語に固定
+  （簡体字 115 対置換 + CP932 字種検査）/ 自動命名直後のピン印ワンクリック固定（`tako tab pin` + MCP）
+- 関連コミット: `8667da7`（PR #598 squash merge）。副産物 #599 起票
+
+## 2026-07-27（#590: リモートインジケータの常時表示 + GUI からの起動）
+- daemon 非稼働時もステータスバーに表示、クリックで起動導線 + 未セットアップ案内、稼働中は従来の
+  端末一覧。MCP ツール件数ずれ（126→127、main 由来）と SIGTERM 経路の根治も同梱
+- 関連コミット: `818b07c`（PR #596 squash merge）
+
+## 2026-07-27（#599: セルフテスト項目 87 が worker ペインで落ちる問題）
+- 判定を部分一致から `CloseOrigin::marker()` 系 API で生成した期待値との完全一致へ。
+  `close_marker_reason()` を pane_log に新設し、書き出しと判定が同じ定数を共有
+- 関連コミット: `5eec43e`（PR #605 squash merge）。テストのみの変更で install 不要
+
+## 2026-07-27（#594 + #595: リリース配布物のプラットフォーム対応）
+- アセット命名規則の正を `tako-core::platform::release_assets` に新設（シェル写しは実行結果一致の
+  同期テストで拘束）。#595 = 更新候補を「自 OS アセットを含む最新リリース」へ（旧実装は assets を
+  見ず URL を合成していた）。実リリース 28 件の総当たりで macOS 判定の完全一致を固定。
+  #594 = release.sh のノート生成（ダウンロード表 / Known limitations）+ `--notes-only` / `--update-notes`
+- 関連コミット: `a425a63`（PR #606 squash merge）。副産物: `--promote` が set -e で落ちるバグ修正
+
+## 2026-07-27（#600: 入力予測 — zsh-autosuggestions の同梱注入・既定 ON）
+- v0.7.1（MIT）をバージョン固定同梱し、シェル統合（ZDOTDIR）経由で tako 内の zsh 限定・最初の
+  precmd で読込。ON/OFF は状態ファイル方式で稼働中ペインへも次プロンプトから反映。3 経路 1:1
+  （設定画面 / `tako autosuggest` / MCP tako_autosuggest）+ 二重注入ガード + THIRD-PARTY-NOTICES
+- 関連コミット: `e737117`（PR #607 squash merge）。副産物 #608 起票（表示言語グローバル競合フレーク）
+
+## 2026-07-27（#577: permission ダイアログの WORKER_PERMISSION 検知）
+- Issue の機序を実測で訂正: agents 解決成功時は waiting が返る。真の欠陥は**画面推定経路**
+  （agents に載らない環境）。ダイアログが画面に実在すれば waiting へ格上げ +
+  `detect_permission_dialog` に実在検査（入力欄を奪う構造）を必要条件化。question とは排他
+- 関連コミット: `27ae97c`（PR #609）+ `38ab099`（PR #612 = e2e の信頼エントリ残骸の後始末）
+
+## 2026-07-27（#601: tako 内シェルへの CLI PATH 自動注入）
+- FR-2.4.6 新設。判定はシェル側「rc の後」の一点（zsh precmd / bash PROMPT_COMMAND / fish
+  fish_prompt）で、tako が他に見つからないときだけ PATH 末尾へ追加。rc 非侵襲・
+  `TAKO_NO_PATH_INJECTION=1` で無効化。`tako_check_health` に `injected_cli_dir`
+- 関連コミット: `c2c9350`（PR #613 squash merge）。案 2（外部ターミナル向け設置）は FR-2.14.5 に残
+
+## 2026-07-27（v0.6.0 安定版リリース）
+- CHANGELOG に `[0.6.0]` を新設（v0.5.9 以降 = nightly 0.5.10〜0.5.13 + 未リリース 2 ブロック +
+  本日の 12 件を日英併記で統合・タグ規約準拠）。`[Unreleased]` を空に、未公開だった
+  `[0.6.0-test.1]` 節に「未公開」注記。Cargo.toml / lock を 0.6.0 へ bump
+- tag `v0.6.0` + GitHub Release を **Latest** で公開（#594 の新ノート機構を初適用 =
+  実アセットからダウンロード表 + macOS 手順を生成。Known limitations は Windows アセットが
+  無いため設計どおり非表示）。cask 0.5.9→0.6.0（`brew fetch` で sha256 実検証）、
+  /Applications = 0.6.0、0.6.0 隔離インスタンスで `update check` = `{"available": false}` を実測
+- 関連コミット: `29837da`（tako）/ `acf412e`（homebrew-tako）、tag `v0.6.0`
+- 次: GUI 再起動で本番反映 → 目視確認 → #434 の宣伝タスク
+
+## 2026-07-28（夜間バッチ: #614 / #615 / #616 / #620 / #621 / #608 / #619 / #513 / #625）
+- #614: 予測の確定案内 `[→ か Tab で確定]`（既定 10 回で消灯）+ ゴースト表示中のみの Tab 確定
+  （POSTDISPLAY の 2 関門ラップ方式）。PR #622 = `6f5e75f`
+- #615: リモートカードをインジケータ直上へアンカー（paint フックで矩形記録 + クランプ）+
+  起動/停止トグル（台数付き確認）。PR #618 = `b19ab8c`。副産物 #619 起票
+- #616: アップデート UI 刷新 — 下部バーから撤去 → 専用画面（設定ウィンドウ流用）+ 上部通知カード
+  （× で同一バージョン再表示抑止）。PR #630 = `41ff25e`。**見た目のスクショは蓋閉じで未取得**
+- #620: docs 全面刷新 — CLI 68 / MCP 128 の全数機械照合で乖離ゼロ化、リリースページ再構成、
+  モダン化（絵文字→SVG 等）、モバイル実バグ修正。PR #626 = `45b7bba`、ライブ反映確認済み
+- #621: リモート選択画面の大改善 — 根因 = プレビューが最古の履歴の先頭を描画。daemon に
+  `preview`/`activity`/`error` を同梱しタブグループ + 状態ピル + チップへ。チャット画面不変。
+  PR #629 = `9a88a4c`。**検証テストが本番 remote state を消すバグも発見・同 PR で根治**。
+  副産物 #632/#633 起票
+- #608: 言語グローバル競合フレーク根治 — gate を純関数化 + 残り 3 本を panic 安全な lang_guard で
+  直列化。before 26/60 → after 0/300。PR #624 = `9f625c7`。副産物 #625 起票
+- #619: daemon 停止後の defunct — 根は起動側の `mem::forget`（+ ゾンビにも kill(pid,0) が成功し
+  停止が誤失敗と報告されていた）。reap スレッド + `has_terminated` へ。PR #631 = `e0d4ce1`
+- #513（mac 側）: `tako config` / MCP `tako_config_share` — ホワイトリスト fail-closed +
+  番犬テスト、秘匿はフィールド単位分離、可搬性は `~` トークン化。setup は `--review` でのみ
+  オプトイン。PR #636 = `3da4c41`（Refs #513、Windows 実機配線は #467 と合流で open 維持）
+- #625: scroll テストフレークから独立 3 機序を根治（偽の待ち条件 / 生存サーバー誤 kill /
+  ensure_conf 非アトミック = 本番経路の実バグ）。before 2/30 → after 0/80。PR #637 = `8fb2a7c`。
+  副産物 #638 起票
+- 運用: API エラー 2 件は resume で復旧 / 選択ダイアログ 1 件は master 裁定（PR に含める）/
+  GUI は 01:38 と 03:0x に再起動（env -u 必須の知見は auto-restart-permission メモリ参照）
+
+## 2026-07-30（#656: Markdown プレビューの表示品質を全面改善）
+- GFM テーブルを表形式で描画（罫線 / ヘッダ帯 / ゼブラ / 列アライメント / 表示幅比の列配分）+
+  見出し 6 段・コード（ライトは輝度クランプ）・インラインコード・引用ネスト・リストマーカー・
+  図形チェックボックスの配色刷新。選択・コピーはセル単位（x でヒットテスト解決）
+- レイアウトの根治 2 件: 全 md ブロックへ `flex_shrink_0`（overflow_hidden は flex 自動最小
+  サイズを無効化 → 表が潰れて重なる）/ 表セルの StyledText を `min_w(0)` で包む（GPUI の
+  min-content 幅は折り返しなし 1 行分のため縮まず隣セルへ溢れる）
+- 関連コミット: PR #662（`1f64bc7` + `dcdaad8`）。dark / light / 狭幅 × 全文スクロールの
+  visual-test + 単体 11 本 + 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
+
+## 2026-07-30（#668: visual-test のインデントガイド節が main で失敗していた問題）
+- 根因は検査側: 走査範囲が固定の論理 px（115..420）で、初回起動バナー（#549）が上に
+  載った分サイドバーのヘッダがその範囲へずり込み、**パスボックスの枠（border_subtle =
+  ガイドと同色）をガイドの一部と誤認**して連続している線を「途切れ」と判定していた
+- 修正: 走査範囲を**実際に描かれた行矩形**（新設した `filetree_scroll_handle` の
+  `bounds_for_item` + スクロールオフセット補正）から深さごとに導出。バナーは検査前に閉じる。
+  `dark-scrolled` の合成ホイールがリストへ届いていなかったのもハンドル経由へ直した
+- これで visual-test が**全節完走**（#152 PDF / 構文色 / #159 サブラインスクロールは
+  この失敗以降そもそも実行されていなかった）。実装を #589 前へ戻すと FAILED になることも実測
+- 関連コミット: PR #670
+
+## 2026-07-30（#669: コードプレビュー（非 md）の構文色がライトテーマで読めない問題）
+- syntect のテーマは `base16-eighties.dark` 固定で、非 md のコードプレビューはライトでも
+  ダーク配色のまま（既定文字色 1.36:1）。#656 の輝度クランプは md のコードブロック限定だった
+- 修正: 変換を `Theme::adapt_syntax_color`（+ `SYNTAX_LIGHT_MAX_LUMINANCE` = 0.12）へ切り出し、
+  非 md と md の両経路を同一関数に通した（見た目の一貫性を構造で担保）。描画時変換なので
+  再ハイライト無しでテーマ切替に即応し、ダークは原色のまま
+- 検証: 実ハイライタ出力の全色走査テスト（Rust / Python / C++、`background` と `mantle` 両面で
+  4.5:1）+ visual-test 新節（light_readable 3360/3290・theme_changed 71568/107352・
+  dark_roundtrip_diff 0・span_colors_stable）。実装を戻すと単体 2 本と visual-test が FAILED
+- 既知の限界: 硬いクランプなので**ライトではコメント灰と既定文字色がほぼ同じ濃さ**になる
+  （`#63625a` vs `#63625e`）。色相で分かれない灰系は見分けが付かない → 別途 Issue 化を提案
+- 関連コミット: PR（Closes #669）
+
+## 2026-07-30（#680: md プレビューのリンク ⌘+クリック + コードブロックのコピーボタン）
+- `MdSpan.link: bool` → `link_url: Option<String>` で遷移先をモデル保持し、⌘+ホバー装飾
+  （下線実線化 + accent 背景）+ ⌘+クリックで `os_integration::open_url`。**開くのは
+  http / https のみ**（`tako_core::md_links::browser_url` が正）。当たり判定は
+  `TextLayout::index_for_position` の `Ok` だけ = ⌘ 無しの選択は不変。索引の正は
+  `md_document_links` 1 本で render とCLI 一覧が同じ並びを共有
+- コードブロック右上にコピーボタン（装飾なし全文 + 2.2 秒「コピーしました」）。
+  **`opacity(0)` + `group_hover` の「ホバーで初めて現れる」方式は実機で復帰せず
+  ボタンが一度も見えないと実測**したので常時表示（待機中はアイコンのみ淡色）へ
+- CLI / MCP: `preview-link-list` / `preview-follow-link` を md へ拡張（応答に `kind`）+
+  `tako preview-copy-code` / `tako_preview_copy_code` 新設（131 ツール）
+- 関連コミット: `9758a6b`（PR #685 squash merge）。品質ゲート全緑 + セルフテスト項目 90 +
+  visual-test 全節完走（3 連続）+ 実マウスの ⌘+クリックでローカル HTTP サーバへの
+  実アクセスをログで確認。副産物: `wait_for_preview_maps` の PDF 待ちを 2s → 4s
+
+## 2026-07-31（#691: GUI ライク表示モード（初心者向け UI）の詳細仕様策定 — docs のみ）
+- 仕様書 `.agent/plans/2026-07-gui-mode.md` 新設（243 行）: グローバル `ui_mode` トグル
+  （テーマボタン隣 + settings.json + dispatch/CLI/MCP 1:1）/ スターター 3 ボタン
+  （welcome バナーと同じ「シェルへ `tako master`/`solo` 書き込み」方式）/ claude ペインの
+  チャットビュー（transcript 正規化 + agents ctx% + Send/Respond = PWA と同一データ源の再利用）/
+  表示レイヤのみの切替で PTY・tmux・persist 不変を裏付けつきで明記。フェーズ G1〜G4
+- 関連: エピック Issue #691、PR #692 squash merge（`200d889`）。CI は macOS 全ジョブ緑で合格
+- 次: G1（モード基盤 + スターター）の worker 割当は master 判断
+
+## 2026-07-31（#694: GUI モード G1 — モード基盤 + スターター 3 ボタン）
+- `ui_mode`（既定 terminal）を settings.json / dispatch `UiMode` / CLI `tako ui-mode` /
+  MCP `tako_ui_mode`（132 ツール）へ。判定表は `tako-core::ui_mode` の純関数
+  （材料は OSC 133 の Idle + role なし + sleep_guard の子プロセスキャッシュ = 新規ポーリング無し）、
+  分岐は render_pane の 1 箇所（**PTY リサイズの後**）。スターターは `starter.rs`
+- 仕様との差分 1 件: 「コマンド入力へ」の AI 等価操作が無いと開発不変条件を満たせないため
+  `UiMode` に `release` / `restore`（揮発・非永続）を追加。仕様書 §1.4 / §2.2 に反映
+- 検証: 品質ゲート全緑（app 290 / cli 46 / control 852 / core 497 / parity 10）+
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 93 新設）+ visual-test 新節
+  （terminal 帯 0 → GUI dark 21097 / light 18416 の可読ピクセル）+ 隔離実機の
+  CLI / MCP / 再起動往復。既存ファイルの削除行は 2 行（タブバー幅・ツール数）のみ
+- 次: G2（チャットビュー読み取り）。`PaneDisplay::Chat` と `claude_chat` は配線待ちで用意済み
+## 2026-07-31（#690: アップデート詳細のリリースノートを Markdown レンダリングへ）
+- md の**幾何とテーマ色を `md_view.rs` の 1 実装へ集約**し、プレビューペインと
+  アップデート詳細画面が同じ `render_block` を通る形に。差は `MdTextSink`
+  （選択・検索・TextLayout の控え・コピーボタン）だけ。パースと リンク索引も共有
+- アップデート詳細のノートを md 描画 + ⌘+クリックでブラウザ（http/https のみ）へ。
+  **GPUI の `TextLayout::bounds()` は prepaint 前に呼ぶとアプリごと panic する**ので、
+  ヒットテストは canvas の paint で立てた「描き終わった世代」だけを対象にした
+- 検証: 品質ゲート全緑（1701 tests）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 90(f)
+  新設）+ visual-test 全節完走（新節 update-notes = **実リリース v0.6.2 のノート本文**を
+  実ピクセル検査）。生テキストへ戻すと単体 / セルフテスト / visual-test の 3 つとも
+  FAILED になることを実測（検出力の実証）
+
+## 2026-08-01（#721: プロファイル（master / solo）の GUI 編集）
+- 設定画面に「プロファイル」タブを新設（8 タブ目）。種別切替・一覧・全項目フォーム編集・
+  新規/複製/削除（確認つき・default は不可）。書き込みは既存 `OrchestratorProfiles` dispatch 経由で
+  UI 直書きなし（#169 の config_io と CLI/MCP 検証がそのまま効く）。FR-4.7 として要件化
+- dispatch を kind（master/solo）+ create/copy/delete + projects へ拡張し CLI（`profiles
+  create/copy/delete`・`--solo`・`--projects`）と MCP へ 1:1 公開（ツール数は 132 で不変）。
+  参照整合性の警告は `orchestrator::profile_warnings` の 1 実装で list/show/set 共通
+- 検証: 品質ゲート全緑（1752 tests）+ 隔離セルフテスト完走（項目 96 新設。refresh を外すと
+  FAILED になることを実測）+ 隔離 GUI で `tako master -<新規>` の実起動・使用中プロファイルの
+  編集/削除・壊れた yaml・全項目 roundtrip を実測。GUI スクショは蓋閉じで未取得
+
+## 2026-08-02（#725: チャットビューのテキスト選択・コピー）
+- 会話本文をドラッグ選択 + ⌘C / ⌘A。座標系は `ChatTextIndex`（行 → プレーンテキスト +
+  実描画 `TextLayout`）を 1 ペインぶん通しで採番するので**発話をまたぐ選択**が成立。
+  ヒットテスト（`preview_text_layout_hit_test`）と切り出し（`selection_text`）は
+  プレビューと同一実装に 1 本化した = 見えているものとコピーされるものが一致する構造保証
+- 発話の右に固定列 + コピーボタン（画面と同じプレーンテキスト・折りたたみ中でも全文）、
+  チャット内 md コードブロックにも #680 と同じコピーボタン。CLI `tako chat copy` +
+  MCP `tako_chat_copy`（133 ツール）へ 1:1。ドラッグ選択自体はポインタ操作なので CLI 非公開
+- 検証: 品質ゲート全緑（1780 tests）+ 隔離セルフテスト項目 98（索引 / ヒットテスト /
+  ⌘C / コピーボタン / MCP / 折りたたみ / 空発話 / ドラッグ中スクロール抑止 / terminal 復帰）+
+  visual-test（**合成マウス `PlatformInput` のドラッグ**で選択 → dark 5413・light 4239 px の
+  塗り + pbpaste 一致 + コピーボタン 727 px）+ 隔離 GUI の実 claude で 3 経路 pbpaste 一致。
+  検出力は「索引経由をやめる」「マウス配線を外す」の 2 通りで FAILED を実測
+
+## 2026-08-02（#738: 設定画面プロファイルタブの描画崩壊を根治）
+- 根因は taffy が**幅 auto の親の中の `flex_wrap` コンテナ**の max-content 幅を「一番広い項目
+  1 個ぶん」として返すこと。チップが 1 個ずつ縦に折り返される一方、行の高さは 1 行ぶんで
+  見積もられ、伸びたチップ群が次の行へ重なっていた（実測: effort 群 5 段 149.5px / 行 39.5px）。
+  チップ行を `row_wrapping()`（行の残り幅を持つ右寄せセル）+ `w_full` へ移して幅を確定
+- 再発防止: visual-test に `profiles-form` 節（実測矩形の総当たり = 重なり / 枠外 / 幅溢れ +
+  合成マウスのクリック一致 + 低いウィンドウのスクロール到達 + 他タブの巻き添え検査）と
+  GPUI 非依存の `form_layout`（unit 6 本）。before 14 重なり → after 0（dark / light / 最小サイズ）
+
+## 2026-08-02（#737: チャット入力欄の重なり描画 + IME 位置ズレ + 追加要件 3〜5）
+- 重なりの実測根因は「claude が空欄でも dim の案内文（`Try "…"` / キュー滞留時の
+  `Press up to edit queued messages`）を箱の中へ描く」のに、tako が `has_text` だけを見て
+  自前プレースホルダを同座標へ重ねていたこと。判定を `input_box_has_content` へ替えて根治
+  （「上に N 行」の absolute 重ねも行として箱の上へ出す）
+- IME 位置ズレはチャット表示がターミナルグリッドを描かないのにセル座標を
+  アンカーにしていたため。ミラー行の実 bounds + TUI カーソルセル（`input_caret_cell`）から
+  キャレット矩形を作り、未確定はその位置へインライン描画・候補ウィンドウも同じ矩形へ。
+  未確定の見た目は `ime_preedit_text` の 1 実装をターミナル経路と共有
+- 追加要件 3 = 作業中インジケータを会話末尾の AI 側へ / 4 = assistant にも枠 /
+  5 = busy 中の指示は transcript の `queue-operation`（enqueue）を読んで即吹き出し化。
+  **Issue の推定（system-reminder 過剰フィルタ）は実 transcript 3416 本の全数走査で棄却**
+- 検証: 品質ゲート全緑（1801）+ 隔離セルフテスト項目 100 新設で完走 + visual-test 新節
+  （dark/light の枠 + インジケータ差分）+ **実 claude e2e**（95c 拡張: 実スピナー行
+  `Brewing… (running stop hook · 2s · ↓ 38 tokens)` 採取 / 配送前の吹き出し / 配送後 1 個）。
+  検出力は 5 通りの revert で FAILED を実測
+- 実 IME は**この開発機に日本語入力ソースが無く未検証**（manual-checks へ項目化）
+
+## 2026-08-04（#745 / #746: チャットビューの md テーブル崩れと画像つき発話の二重表示）
+- #745 の根因は**推定と別**だった: 「幅の伝播」ではなく assistant 発話の本文コンテナに
+  付いていた `min_w(0)`。縦並びの子では自動最小サイズが高さ側に掛かるので意味を持たないのに、
+  taffy の採寸経路が変わって表セルが折り返し幅 0 でレイアウトされたまま残る（同一幅 478px で
+  セル「入力欄のテキスト重なり」が w=0.0/h=214.5 → w=143.0/h=19.5 = プレビューと同値）
+- #746 の根因も**推定と別**: enqueue↔user 行の文面は実 transcript 17 件で一致しており正常。
+  真犯人は楽観 echo が**生の TUI 入力行**（`[Image #13] …`）を持っていたこと。transcript と
+  同じ分類器（`classify_user_content`）へ通して正規化し、重複排除も 1 実装（`echo_superseded`）へ
+- 検証: 品質ゲート全緑（1806）+ 隔離セルフテスト完走（#746 項目新設）+ visual-test 全節完走
+  （`chat-table` 節新設 = 同じ md をチャット / プレビューへ同じ幅で並べて実測）+
+  実 claude e2e（95c 拡張: ⌘V で実画像 → `raw_line="[Image #1] …"` → 吹き出し 1 個 / queued=false）。
+  検出力は #745 = visual-test が collapsed=2 で FAILED、#746 = ユニット 3 本 + セルフテスト項目で実証
+
+## 2026-08-04（#749: master の自動ハンドオフ）
+- ctx 閾値を 50〜60 で設定可能化（プロファイル → config.yaml → 既定 60。範囲外は明示指定は
+  エラー / 手書きは丸めて warnings）+ tako が 2 秒 tick で閾値超過を検知して master へ
+  引き継ぎを促す（画面由来の ctx% なので追加ポーリングゼロ）+ handoff の後任プロンプトへ
+  「実態突き合わせ → 旧ペインの入力欄確認 → close」の順序つき手順を埋め込み（前任を
+  閉じるのは後任だけ = 後任の起動失敗で master を失わない）+ master prompt に自動発動規範
+- 判定と文面は `tako-core::handoff` の純関数。MCP ツールは増やさず
+  `tako_orchestrator_profiles` に `ctx_threshold` / `auto_handoff` を載せた（CLI / GUI も同経路）
+- 次: 実 claude の通し e2e（項目 101c）の実測を Issue にコメント
+
+## 2026-08-04（#748: worker の選択肢ダイアログ対応の総点検）
+- ダイアログの**存在判定を構造検知へ一般化**（`tako-core::dialog`。番号つき + 番号なしの 2 経路、
+  罫線で挟まれた入力ボックスは棄却）+ 種別分類は文言（`claude_tui::DialogKind`: permission /
+  trust / bypass / usage_limit / plan_confirm / select）。実採取は permission / `/model` /
+  plan 確認 / `/mcp`（番号なし）/ AskUserQuestion（全角・5 択）
+- 公開: `worker_status` / `read` の `choice_dialog`（ダイアログ中は `input_status` を null）、
+  watch の `WORKER_DIALOG`（種別つき。question は同時に出さない）、respond の一般化
+  （番号 / ラベル / `--choice` 省略で下見。**番号キーだけで確定** = 実測、番号なしは矢印 +
+  ラベル一致検証 + Enter）、**ダイアログ中の send は選択肢つきエラーで拒否**、
+  supervisor の limit 復旧を盲目 Enter → 安全な選択肢のラベル選択へ
+- 検証: 品質ゲート全緑（1838）+ 実 claude e2e 2 本（permission の構造取得と番号キー確定 /
+  `/model` を select として検知）+ セルフテスト項目 101 新設。limit ダイアログは実文言
+  （バイナリ由来）+ 実レイアウト（`/model`）の合成 fixture
+- 次: 隔離セルフテストの完走は環境負荷（load 25〜50）で未達 = main でも別項目で落ちる
+
+## 2026-08-04（#750: MCP 133 ツール全体リファクタ）
+- Issue に棚卸し・計画を記録し、PR #752 で完全カタログスナップショットを先行導入。
+- #748 / #749 merge 後、MCP を catalog / request / HTTP / tests / facade へ挙動不変で分割開始。
+- 完全スナップショット diff ゼロ、全品質ゲート緑、隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK`）。
+
+## 2026-08-05（#761: handoff 後任 master が worker 設定で起動し default 扱いになる問題）
+- 後任の起動を CLI `tako master -<profile>` と同一経路（`build_master_cmd`）へ寄せ、
+  `TAKO_ORCHESTRATOR_ROLE` を env 用語彙（`master:<p>`）に是正。role 生成は
+  `tako_core::handoff` の `master_pane_role` / `master_role_env` に一本化し、
+  受け側は `master_profile_of_any_role` で表示用 / env 用どちらの語彙も解けるようにした
+- 副産物: 後任に master system prompt が一切付いていなかった（worker 用コマンド構築の
+  ため）のも同時に解消。組み立てをペイン分割の前へ移し失敗時に空ペインを残さない
+- 検証: 隔離アプリ + 偽 claude の実経路 e2e で before/after 実測（before は
+  worker model / `orchestrator-master:st761` / prompt 無し / self が profile=default、
+  after は master model / `master:st761` / marker-found / profile=st761）+
+  単体 5 本 + セルフテスト項目 102 新設（各バグを戻すと FAILED を実測）
+
+## 2026-08-06（#772: stale binary 検知がメインスレッドを毎 tick 400ms 専有する問題）
+- 真因は「毎 tick × 対象ペインごと」の `find_claude_pid_for_backend`（1 回で
+  `tmux list-panes -a` + `ps` の 2 プロセス）。採取を `ProcessSnapshot` で 1 回に束ね、
+  走査を background へ出し、`should_rescan`（起動直後 / 指紋変化 / 対象増減 / 60 秒）で
+  頻度を落とした。それ以外の tick は stat だけ（`which claude` も PATH 走査へ置換）
+- 実測（隔離・6 worker ペイン）: `periodic_prep:stale_binary` p50 289〜323ms → 0ms、
+  しきい値超え行 24 行/60s → 0 行、`ps` 起動 175 回/60s → 34 回（stale ぶんは約 144 → 2）
+- 検証: セルフテスト項目 103 新設（偽 claude の版差し替えで検知 + 変化無し tick の省略）+
+  単体 9 本 + 品質ゲート全緑
+
+## 2026-08-06（#770: 「再起動でタブが消えた」の根因確定と、喪失の記録・復旧の是正）
+- 根因は再起動ではなく **10:13:27 JST のタブ × close**（ペインログの `close:gui-tab` +
+  sessions.yaml の last_seen + 12:24 の再起動時点で既に 6 タブ 10 ペインだった復元数で確定）
+- 直したのは気づけない / 戻せない側: セッション kill・タブ close の発生源つき監査行を
+  persist.log へ（FR-5.15）/ バックアップ回転を「セッションを持つペインが消える保存」へ拡張
+  （FR-5.11。実機は 12→10 で素通りし bak が 16 日前だった）/ 隔離限定の SIGTERM→quit 検証口
+- 検証: 隔離 e2e でプレビュー混在タブの quit → 再起動が喪失ゼロ、close の before/after で
+  監査行と `.bak.1` の有無を実測。番犬 3 本 + 単体は違反注入で FAILED を確認
+- **事故**: 検証に使った System Events の Cmd+Q がグローバル送出で本番 tako に着弾し終了させた。
+  以後キーストローク送出は禁止、quit は pid 指定 SIGTERM、e2e は本番 pid 不変をアサートする
+- 次: 別 Issue 化（GUI close が workers.yaml に closed を残さない / テストが本番 data dir を汚す）
+
+## 2026-08-06（#778: 後続 send 失敗の prompt_undelivered 偽陽性を修正）
+- PromptFlow を spawn 初回 / 後続 send に識別し、後続失敗が worker の初回送達状態を変更しないよう修正。#530 の初回ダイアログ未達検知は維持
+- 関連コミット: `add1053` `[修正] 後続send失敗のprompt未達誤検知を防ぐ (#778)`。PR #780 merge、Issue クローズ、全 CI 緑、0.6.7 app 導入済み
+- 検証: unit 2 本 + 隔離実経路項目 105（busy 後続 send timeout 後も Delivered）+ workspace test / fmt / clippy / self-test 全緑
+
+## 2026-08-06（#781: IME 位置・選択座標のズレは stale claude バナーの会計漏れだった）
+- 疑われていた #725 / #737（チャット）の回帰ではない（稼働は `ui_mode: terminal`、
+  #737 以降の diff に座標変更なし）。根因は **stale claude バナー（#498）の 28px** が
+  `pane_text_areas`（PTY 行数 / マウス座標変換 / IME アンカーの共通の正）の算術から
+  漏れていたこと。#684 が正にしたのはコンテナで、ペイン内部の積み上げは対象外だった
+- タイミングの実測: claude の symlink 更新 13:40（2.1.220→2.1.223）→ ユーザー報告 13:43:42。
+  自己更新で全 master / worker ペインに一斉にバナーが出るため周期的に再発していた
+- 修正: 高さ定数を描画と会計で共有 / 矩形を `pane_text_area_rect` の 1 か所へ集約 /
+  実描画のテキスト領域を採取するプローブを追加（正には使わず観測と perf.log 自己申告のみ）
+- 検証: セルフテスト項目 106 が修正前 `gap 28.0` で FAILED → 修正後 `gap 0.0` で OK。
+  単体 7 本 + 番犬（直接の子の数）。会計を外すと FAILED になることを実測
+- 次: 実 IME の見た目は未検証（日本語入力ソースが無い）= ユーザー実機確認後にクローズ
+
+## 2026-08-06（#779: sleep guard の定期 `ps` 起動削減）
+- sleep guard の子プロセス走査を backend・role・OSC 状態の変化時 + 60 秒保険に限定し、
+  #772 の `ProcessSnapshot` を stale binary 検知と共有。アイドル実測は `ps` 34 回 / 約 75 秒 → 3 回 / 約 72 秒（約 91% 減）。
+- 隔離実経路で worker 実行中の sleep assertion 保持と終了後の解除を確認。CPU は高負荷下でも約 0.6% で目標 10% 未満、残る 2 秒 tick に常時重い処理は観測されなかった。
+- 関連コミット: `14bea3a`（PR #783 squash merge）。#781 へ rebase 後の macOS CI 緑 +
+  隔離セルフテスト完走（`TAKO_APP_SELF_TEST_OK` / FAILED 0。#771 型フレークは load 10 前後で消えた）
+
+## 2026-08-07（#782: 見えないペインの出力で全面再描画しない + 描画コストの実測）
+- 根因は「単一 GPUI entity なのでどのペインの出力でもアプリ全体を再描画」。裏タブ 2 ペイン
+  200 行/秒で 22.3% CPU（見た目は不変）→ 可視性ゲートで **2.6% / 再描画 1596→11 回**
+- 端末イベントを zed と同じ 4ms 合流に。`perf_span` をメインスレッド限定にし、background の
+  `pdf_rasterize` が「メインスレッド専有」と誤記録されていたのを是正。フレームコスト実測
+  （末尾 canvas）と実測連動のレート上限は #680 が落ちるため取り下げ（切り分け済み）
+- Zed 同条件比較（137x13・200 行/秒）: tako 14.6% / 9.0G instr vs Zed 1.3% / 0.14G instr。
+  1 フレーム = 5.1M（固定 = 毎フレーム全再構築）+ 0.39M×行数、Zed は 0.16M。**受け入れ基準
+  「Zed 同等」は未達** = 別 Issue（専用 Element 化 + ビュー単位キャッシュ）へ
+- 関連コミット: `1994b8e`
+
+## 2026-08-07（#786: クローム・ペインのビュー単位キャッシュ）
+- ペイン本体（`PaneBody`）とクローム 4 枚（`Chrome`）を `AnyView::cached` の単位へ切り出し、
+  PTY 出力はそのペインのビューだけを notify（それ以外は従来どおり全体 notify + `cx.observe`）
+- 実測（隔離・200 行/秒・同一バイナリ A/B、表示中 2 ペイン）: 4 タブ 25.30% → 18.04% CPU /
+  6.772M → 5.016M instr/frame、17 タブ 36.65% → 8.94% / 9.693M → 5.574M。
+  クローム増分は 2.92M → 0.56M（−81%）= 固定費がほぼ消えた
+- 踏み抜き: 親の render で `cx.new` したキャッシュビューは `tracked_entities` から落ちて
+  二度と描き直されない（`cached_view` で毎フレーム `read` して固定）。
+  副産物で #749 以降ビルド不能だった visual-test も復旧
+- 関連コミット: `0188d79`（PR #788 squash merge）。macOS / Windows CI 緑、install 済み
+- 次: #787（端末グリッドの専用 Element 化）で残りの 5M/frame を削る
+
+## 2026-08-10（#496 残バグ: git パネルのクリックが一括 dismiss に食われる問題を根治）
+- ルート div の `on_mouse_down` が呼ぶ `clear_text_input_focus()`（#503）が押下の瞬間に
+  状態を落とし、コンフリクト解消エージェント 3 択の `on_click` が **merge 時から一度も
+  発火していなかった**。同型 4 件（トグル / ブランチ名入力欄 / 作成 / キャンセル）も一括修正
+- 実測: visual-test 新節 `conflict-card` で claude→pane2 / codex→pane3 / agy→pane4 が
+  実マウスで立つ。guard を外すと `panes 1->1 / feedback=None` で FAILED（検出力）。
+  CI 用に番犬テスト 3 本 + 規約を `.agent/conventions.md` へ明文化
+- 同梱: セルフテスト #601 の固定待ちをリトライ化（main 由来の確定失敗）、visual-test の
+  clippy 違反 2 件（#745 由来）
+- 次: PR → CI 緑 → merge → install。PDF / IME / tmux のセルフテスト項目は main 由来失敗で別起票
+
+## 2026-08-10（#793: setup に設定共有（tako config）の検出・案内・代行導線）
+- `config_share::env` を新設し、①配線済みか ②共有対象が既に外部 git（dotfiles）で
+  管理されていないか ③gh の認証状態、を読み取りだけで検出。案内は純粋関数 `guidance` で決め、
+  setup サマリと `--check` が同じ判定から文言を作る（質問は増やさない / 配線済みなら勧誘しない）
+- 代行はアシスタント側: `setup-context.yaml` の `config_share` + system-prompt Step 3.5。
+  **既存 dotfiles があれば相乗りが第一案**（別リポジトリだと pull の rename が symlink を
+  実ファイルへ置き換えて既存の配線を壊す）。既存ユーザーへは changes.yaml rev 14（guided）
+- 検証: 隔離 e2e PASS 55 / FAIL 0（本番 HOME・~/.claude・GitHub 非干渉を含む）+
+  品質ゲート全緑（1921）+ docs build
+
+## 2026-08-11（#787 前提整備: 端末グリッドの visual-test 回帰検出網）
+- visual-test に `terminal-grid` 節を新設（6 検査 = 日本語混在行 #64 / ピクセルスクロール #159 /
+  選択ハイライト #725 / 端末 SGR の色・属性 / IME アンカー #781 / カーソル 4 通り）。
+  Element 化本体（#787）は後続 worker
+- 描画本体は無変更: 追加は全部 `#[cfg(feature = "visual-test")]` で、feature 無しビルドの
+  シンボル 135,988 件と `__text` 49,141,068 バイトが main と完全一致
+- 検証: 3 回連続で全緑（数値も完全一致）+ 全節通し 96 checkpoint 緑 + 検出力 3 件実証
+  （nowrap 除去 → max 消失を検出 / subline シフト 0 → 位相 34px で検出 / テキスト領域
+  会計を 8px ずらす → 最初の幾何検査で検出）+ fmt / clippy(feature 込み) / test 1924 緑
+- 副産物: #797（SGR 4 の下線が 1 px も描かれない = 行ボックス下端で overflow_hidden に切られる）/
+  #798（全角の長い連なりで描画位置が最大 1 セル左へ詰まる）を起票。#796 へ
+  「visual-test feature 付きビルドではセルフテスト #600 が確定失敗（main も同じ）」を追記
+- 次: #787 本体の worker が before/after をこの節で突き合わせる
+
+## 2026-08-11（#787: 端末グリッドの専用 Element 化 + #797 / #798 の根治）
+- ペイン本体のグリッドを行 div スタックから 1 個の `Element`（`terminal_grid.rs`）へ。
+  セル原点を `col * cell_width` で直接決め、背景 = `paint_quad` / グリフ =
+  `shape_line(force_width)` / 下線・取り消し線 = 自前。**全角の 2 セル目にスペースを
+  差し込んで** force_width のセル境界スナップを全角行でも効かせる
+- 副産物ではなく設計上の帰結として #797（SGR 4 と ⌘ホバーの下線が 1 px も出ない =
+  行 div の overflow_hidden に切られていた）と #798（全角の長い連なりで最大 1 セル
+  左へ詰まる = div 幅のデバイスピクセル丸めの累積）が解消。行高をセル高にしたので
+  ディセンダの切れも直った（**字が 2px 上へ動く = 目に見える変化**）
+- 性能（同一バイナリ A/B。`TAKO_787_NO_GRID_ELEMENT=1` が before・300 フレーム）:
+  実務密度 15.68M → **6.42M** instr/frame（−59%）/ 満杯 15.59M → **8.68M**（−44%）。
+  グリッド分だけなら 0.520M/行 → **0.079M/行**（実務密度）
+- 検証: 品質ゲート全緑（1935）+ Windows クロスチェック警告 16 = main 同数 +
+  visual-test `terminal-grid` 3 連続 OK（新設 4 検査は旧経路で落ちることを実測）+
+  隔離セルフテスト完走 + 実 claude 13 行 523 セルで missing 0 / drift 0。
+  全節の PDF 失敗は素の main でも再現 = main 由来（#796）
+
+## 2026-08-13（#801: 描画の残る固定費の内訳確定 + セル単位の変換の削減）
+- #787 後に残った「空画面でも毎フレーム 4.76M instr」の内訳を段階的無効化ゲートで確定:
+  ウェルカムバナー 1.17M（初回起動のみ）/ スナップショット + `plan_row` 1.76M /
+  ペインヘッダ 0.81M / クローム再利用 0.46M / ルートの箱 0.41M / gpui 下限 0.16M
+- 支配項（セル単位の変換）を削減: 素の空白セルは解決も書き込みもしない・空行は
+  `compose_line` を 1 本だけ組んで複製・`plan_row` は空行を即返し `Rgb->Hsla` をラン単位へ。
+  空画面 3.587M → **2.197M（−39%）**、実務密度 −10%、満杯 −2%（同一バイナリ A/B）
+- **目標の 1M 未満は未達**。ヘッダ 0.81M は「`AnyView::cached` は入れ子にできない」
+  （GPUI が再描画中 `refreshing` を立てる）で塞がっており、取るにはペイン枠ごと
+  ルート側へ持ち上げる必要がある。実測と回避案は architecture.md に記録
+- 検証: 品質ゲート全緑（1944）+ visual-test 全節 3 連続 OK + 隔離セルフテスト完走 +
+  隔離実操作 12/12（出力・テーマ・分割・フォーカス・スクロール）
+
+## 2026-08-14（#792: handoff を「知識（マシン非依存）」と「実行状態（このマシン限定）」に分離）
+- 書式の正本を `tako_core::handoff` に新設（見出し 4 定数 + 寛容な `section_of_line` +
+  `split_handoff` + `handoff_template`）。後任プロンプトは**全文をそのまま渡した上で**
+  節ごとの扱い（知識 = 前提にしてよい / 実行状態 = 必ず実態で確認）を添える
+- **旧書式はそのまま動く**: 節が無ければ Legacy として全文を渡し「番号は実態で確認 +
+  次の更新で 2 節へ書き直せ」を添えて自然な移行に任せる（一括変換はしない）。
+  本番の実 handoff 5 本を読み取りだけで実測 = 全部 legacy / 全文保持
+- master prompt の規範を新書式へ改訂（見出し定数とのドリフトはテストが落とす）。
+  応答に `handoff_format` / `handoff_sections` を追加（self / handoff の両方）。
+  solo は handoff 機構を持たないので規範なし（プレースホルダ置換だけ）= 変更不要
+- ついで: `_system_prompt_*` を Local(GENERATED) でカタログ登録し、被覆テストの走査を
+  `join(format!(…))` へ拡張（before: `unclassified` に 2 件 → after: 0 件を実バイナリで A/B）
+- 検証: 品質ゲート全緑（1966）+ Windows クロスチェック警告 16 = main 同数 +
+  隔離セルフテスト完走（項目 102b 新設 = 実 dispatch で sectioned / legacy を実測）+
+  検出力 3 件（カタログ削除で 2 テスト FAILED / prompt 見出しドリフトで FAILED /
+  節判定の破壊で 8 テスト FAILED）
+- 関連コミット: `40c4b2a`（PR #804 squash merge）。CI macOS / Windows / Pages 全緑 +
+  `/Applications/tako.app` install 済み（反映は再起動後）。証拠は ~/dev/tako-evidence/792/
+
+## 2026-08-14（#789: サイドバー幅のクランプ規則を全経路で統一）
+- 上限がドラッグ = ウィンドウ幅の 50% / dispatch = 固定 600px で食い違っていた（#307 の
+  クローズ検証で発覚）。規則を `tako_core::sidebar`（下限 120 / 上限 = ビューポート幅の 50%）へ
+  一本化。**ドラッグ側へ寄せた**理由は ①固定 px では広い窓で CLI がドラッグ相当の幅に
+  届かない（設計原則 5 の破れ）②固定 px は狭い窓で過大（600px は 800px 窓の 75%）
+- 状態は要求値・描画は実効幅（`effective_sidebar_width`）に分離。窓が狭くなっても要求値は
+  書き換えないので広げ直し / 再起動で元の幅へ戻る。dispatch はウィンドウを持たないので
+  上限を最後に描いたビューポート幅から取り、応答に `sidebar_width_max` / `_min` を追加。
+  永続化も要求値 → 適用値へ（settings.json と画面の食い違いを解消）
+- 検証: unit 7 本 + セルフテスト項目 109（実ハンドラ `on_mouse_move` と実 dispatch へ同じ値を
+  入れ、窓 1600 = 上限 800 で一致を見るので旧固定 600 は必ず落ちる。窓 700 への縮小 →
+  再拡大も含む）。旧挙動 2 通りへ戻すと項目 109 が FAILED になることを実測。品質ゲート全緑（1951）
+- 副産物: Metal Toolchain（purgeable 資産）がマシンから消えており全 worktree で gpui の
+  シェーダをビルドできない状態だったので `xcodebuild -downloadComponent MetalToolchain` で復旧
+
+## 2026-08-14（#790: worker への指示送達を Cross-Session Messaging 優先の二層へ）
+- claude v2.1.224+ の受信箱（socket 直送）を第 1 層に、従来のキー操作経路を第 2 層に。
+  適用は worker 宛のみ（受信側に抑制不可の前置きが付くため人間由来の送達は従来経路）
+- 実測: 実験フラグ不要（サーバー側 gate 依存）/ idle・busy・ダイアログ中とも送達成立 /
+  43,449 バイトをバイト等価に 1 回で送達。前置きの存在と挙動への影響は Issue に記録
+- 検証: 実 claude e2e 3 本（idle=peer/delivered / busy=送信時点 busy で peer/queued /
+  peer off でキー経路 verified）+ 既存 `claude_tui_e2e` 6/7（残り 1 は main でも同一に失敗）+
+  品質ゲート全緑（1990）+ Windows クロスチェック警告 16 = main 同数 + 隔離セルフテスト完走
+- 関連コミット: `f57e661`（PR #806 squash merge）。install 済み（反映は再起動後）。
+  副産物 #807 起票（`ui_text::update` の言語グローバル競合フレーク = #608 の取りこぼし）
+
+## 2026-08-15（#658: worker レジストリの残留と GC 不全を main へ移植）
+- #658 は 2026-07-31 に「クローズ済み」だったが、PR #701 の base は
+  `windows/467-ipc-orchestration-local` で **main には 1 行も入っていなかった**
+  （`dead_since` が存在しない）。本番 workers.yaml も 51/53/54/184 が active のまま・
+  `dead_since` 未刻印で症状継続。再実装ではなく `ef89ca3` を main へ移植した
+- 中身は 3 層: ①セルフテストの隔離対象を `self_test_isolation_defaults()` へ集約
+  （`TAKO_WORKERS_FILE` / 新設 `TAKO_ORCHESTRATOR_DIR`）+ 項目 0 で実プロセス検査
+  ②GUI 経路の close をレジストリへ記録（main は `CloseReason::Explicit(CloseOrigin)`
+  なので `is_explicit()` へ適応）③`workers` 列挙のついでの GC（ペインも器も見えない
+  active に `dead_since` を刻み、**300 秒続いたものだけ** closed(gone)）。仕様は
+  requirements.md に **FR-2.26** を新設（#390 は FR が無かった）
+- 検証: 品質ゲート全緑（fmt / clippy -D warnings / test。#658 の unit 8 本）+
+  隔離 GUI + 本番コピーのレジストリで**実時間 310 秒待ちの通し**（1 回目 = 14 件に
+  `dead_since` 刻印・closed 0 / 2 回目 = 14 件 closed(gone)、生きたペインを指す
+  エントリは active のまま・刻印もされない）+ closed 後も `resume_command` が
+  引けること（claude worker 10 件）+ 隔離漏れの陰性対照（項目 0 が exit 1）
+- 副産物: **tako ペインの中から CLI を叩くと `TAKO_SOCKET`/`TAKO_TOKEN` が本番 GUI を
+  指す**ため、data_dir / discovery を隔離しても本番へ届く（1 回踏んだ。本番 GUI が
+  旧バイナリ = sweep 非搭載で実害ゼロ）。隔離検証は `env -u TAKO_SOCKET -u TAKO_TOKEN` 必須
+- 次: 本番の掃除は install + GUI 再起動後に `tako orchestrator workers` を 2 回
+  （5 分あけて）。GC は GUI プロセス側で走るので旧バイナリのままでは倒れない
+
+## 2026-08-14（#796: 隔離セルフテストの main 由来フレークを根治）
+- 根因 3 つを実測で確定: ①**#786 の `AnyView::cached` と「汚さずに draw」**（製品経路は
+  dispatch 後に `cx.notify()` するのにセルフテストはしていなかった → 幾何がキャッシュのまま
+  = PDF アウトライン #232 が「ジャンプが効かない」に見えていた。実測 `children=2` /
+  `max_offset_y=199` なのに `offset_y` が 4 秒 80 フレームで 0 のまま。同機序で #702 の
+  下端追従も）②**偽の待ち条件**（#601 の A / B 両フェーズが同じ `ST601>`。旧形式で
+  実測 `shared_prompt=Some(0)` = 起動前に待ちが成立）③**「出るもの」を固定時間で待っていた**
+  26 組（`--features visual-test` は gpui の leak-detection を有効にして数割遅い）
+- 実装: `wait_for_focused_text` / `_timed` / `absent_after_anchor` / `notify_and_draw` /
+  `PdfScrollProbe` / `TAKO_APP_SELF_TEST_ENV`（profile / feature / load / 経過。load は
+  `tako_control::diag::load_average` 新設）/ #732 の前提待ち / 番犬テスト
+  `selftest_wait_watchdog` / 規約を conventions.md へ明文化
+- 検証: 人工負荷（`yes` 6 本・load 14〜74）で feature 無し 5 回連続 OK + feature 付き 3 回連続 OK
+  （feature 付きは修正前 4/4 で `PDFKit アウトライン…` に確定失敗していた）。品質ゲート全緑
+- 副産物: このマシンの **Metal Toolchain 不在**でセッション前半は gpui のシェーダを
+  ビルドできず（`xcodebuild -downloadComponent MetalToolchain` で復旧。23:00 に解消）
+
+## 2026-08-15（#803: ペインヘッダをルート側の兄弟へ持ち上げてキャッシュ単位にした）
+- ペインのタイトルバーは PTY 出力では変わらないのに毎フレーム作り直していた（`AnyView::cached`
+  は入れ子にできないので本体の内側では一度も当たらない。#801 の実測）。`view_cache::PaneHeader`
+  として本体の**兄弟**へ出し、本体は同じ高さのスペーサーで場所を空ける（`pane_text_areas` の
+  会計は不変）。ヘッダを出すかは「本体が実際に場所を空けたか」で決める = 表示種別が変わった
+  フレームで二重に出ない。`running · 4m12s` の時計だけ 1 秒に 1 回別枠で汚す
+- 実測（隔離 grid-bench 300 フレーム・main と交互 3 反復の中央値）: 空画面 2.192M →
+  **1.737M（−21%）**/ 実務密度 5.158M → 4.698M / 満杯 8.435M → 7.977M。ヘッダを丸ごと
+  描かないゲート（1.517M）との差から**ヘッダ総コスト 0.678M のうち 0.455M（67%）を回収**。
+  残り 0.22M は `cached` の再利用そのもの（Issue の 0.81M は #801 の別構成での値）
+- 踏み抜いた罠: GPUI は「影 → 背景 → 子 → **枠線**」の順に塗るので、兄弟にしただけだと
+  ペイン枠の上 2 つの丸め角がヘッダの四角い背景で潰れた（実フレーム比較で accent が
+  104 画素消えているのを検出）。外側 div にも同じ矩形・同じ色の枠線を描かせて重なり順を戻した
+- 検証: 品質ゲート全緑（1974 tests / fmt / clippy(feature 有無) / Windows クロスチェック
+  エラー 0・警告 16）+ 隔離セルフテスト完走（項目 110 新設。`output=(body +1 header +0)` /
+  `title=(body +2 header +2)` / 実描画矩形の差 0.0px）+ visual-test 全節 3 連続緑 +
+  **全 98 ピクセル計測値が main と一致**（差は md の load ms のみ）+ 実フレーム
+  2200x1416 の全画素比較で差は 32 画素（0.001%。角の枠線 AA の二重合成のみ）
+- 検出力: ヘッダを本体の内側へ戻すと項目 110 と番犬テスト 2 本が落ちることを実測
+
+## 2026-08-15（v0.7.0 安定版リリース）
+- v0.6.0 以来の安定版。CHANGELOG に `[0.7.0]` を新設し、夜間 v0.6.1〜v0.6.11 + 化石化した
+  `[Unreleased]` 2 ブロック + v0.6.11 以降 11 コミットを日英併記で統合（柱 = GUI ライク表示
+  モード / 描画コスト削減 / AI 連携）。実質コミット 56 件の Issue 番号が節に現れることを機械確認（未カバー 0）
+- tag `v0.7.0` + GitHub Release を **Latest（安定版）**で公開、cask 0.7.0（sha256 は brew fetch で検証）、
+  `/Applications` = 0.7.0。CI macOS / Windows 緑、夜間は `SKIP: 変更なし` へ復帰
+- 関連コミット: `20ef2a1`（tako）/ `2651bf2`（homebrew-tako）、tag `v0.7.0`
+- 次: ユーザーの GUI 再起動で反映。docs サイトのライブ反映は未確認（デプロイ先 URL がリポジトリに無い）
+
+## 2026-08-15（#813: 利用上限後のペイン単位の自動復帰）
+- ペイン単位のオプトイン（右クリック / `tako limit-resume` / MCP `tako_limit_resume` の 3 経路が
+  同じ dispatch）で、5h / 週次上限で止まったエージェントをリセット時刻 + 安全マージン後に再開させる。
+  ダイアログ型は「解除まで待つ」をラベル一致で確定（課金・モデル変更は拒否リストで構造的に排除）、
+  idle 型は継続ナッジを送達確認つき経路へ。FR-2.27 新設
+- 層は 3 つ: `tako_core::limit_resume`（純関数の判断・時刻パース・選択肢選別）/
+  `tako_control::limit_stop`（#748 と #157 の既存検知を束ねるだけ）/ `tako-app::limit_autoresume`
+  （2 秒 tick。有効ペイン 0 なら即 return）。supervisor（#401）の `safe_limit_choice` も core へ寄せた
+- 検証: 品質ゲート全緑 + 隔離セルフテスト完走（項目 111 新設 = 正例 2 型 / 負例 3 型 /
+  試行上限 / list・read の一致）+ visual-test 全節（98 checkpoint）+ Windows クロスチェック
+  （エラー 0 / 警告 16 = main 同数）
+- 次: PR #820（Closes #813）→ macOS CI → squash merge → `build-app.sh --install`
+## 2026-08-15（#815: 構文セットを「使っている間だけ」載せる）
+- Issue の前提を計測が覆した: `SyntaxSet` の器は **1.04 MB / 1.2 ms** しかなく、98 MB の正体は
+  **ハイライトした言語ごとの遅延展開**（Rust +5.1 / bash +10.9 / md +10.9 / TS +32.0 MB。18 言語で 149 MB）。
+  syntect に言語単位で捨てる API が無いので、推奨案の段階ロードは器の 0.64 MB しか減らず
+  未対応 363 拡張子の回帰リスクだけが残る → 棄却し、借用チケット（`SyntaxLease`）+
+  無使用の解放（猶予 30 秒 / プレビュー 0 枚なら即）にした
+- 効果（隔離・同一バイナリ A/B。`TAKO_815_NO_SYNTAX_RELEASE=1` が旧挙動）: 小 .rs + 小 .ts を
+  2 枚開いて **83.57 MB → 13.04 MB（起動直後 13.06 MB へ完全復帰。−70.5 MB）**。
+  開いたままでも 40 秒で 83.55 → 13.05 MB（before は不変）
+- 検証: 品質ゲート全緑（fmt / clippy -D warnings / test 1997）+ 単体 6 本（ローカル
+  `SyntaxCache` で並列テストでも決定的）+ 拡張子全数解決テスト + セルフテスト項目 112 新設
+- 副産物（別 Issue へ）: **大きいファイルのプレビューは行数に比例したヒープが残る**。
+  3629 行で 12.6 → 183.1 MB、閉じても 162.7 MB（150 MB 残留）。開閉 3 往復で積み増し。
+  10 行なら完全に戻るので行数依存 = syntect ではない（A/B の両側で残る）
+
+## 2026-08-15（#817: PTY reader の 1 MiB スタックバッファを根治）
+- alacritty_terminal の `EventLoop` をやめ、同等のループを tako が持つ形へ
+  （`tako-core::pty_loop`。upstream は reader スレッドのスタックへ 1 MiB を置き、ゼロ初期化で
+  ペイン 1 枚 = 約 1.03 MB が常駐していた）。定数は `pub(crate)` で下げられず、**スレッドの
+  スタックサイズを絞っても footprint は減らない**（resident なのは memset された分）ため、
+  バッファをヒープへ動かすにはループを持つしかなかった
+- 読み取りバッファは 64 KiB 始まりで、ロック競合で足りないときだけ 1 MiB まで伸ばして戻す。
+  ロック粒度（`MAX_LOCKED_READ`）・上限到達時のブロッキングロック・シャットダウン順序は upstream のまま
+- 実測（隔離 release・16 ペイン）: stack **17 MB → 848 KB**（1 MB 級スレッドスタック 16 本 → 0 本）、
+  phys_footprint **226 MB → 211 MB（−15 MB）**。MALLOC_SMALL は +1 MB（16 × 64 KiB）
+- CPU 悪化なし。裏タブへ流して取り込み経路だけを測り、固定仕事量 0.41/0.41/0.39 → 0.41/0.40/0.39 CPU 秒、
+  実行数で正規化した 200 行/秒は 3 ペアとも after が低い（149.1/116.3/122.9 → 144.9/105.1/117.7 cpu_ms/1000 行）
+- 挙動: 4 ペイン洪水完走・26 KB 貼り付けの往復がバイト等価（md5 一致）・seq 50000 の末尾連続・
+  洪水後も CLI 応答。Unix の poller トークンは実 PTY を張る単体テストで検出（壊すとハングでなく FAILED）
+- 関連コミット: PR（Closes #817 / Refs #814）。由来と改変は `THIRD-PARTY-NOTICES.md` へ追記
+
+## 2026-08-15（#821: コードプレビューの行数比例リークを仮想化で根治）
+- 根因は allocation プロファイルで確定: 全行ぶんの element を毎フレーム作るため、
+  1 フレームぶんの測定レイアウトノードが taffy の `node_context_data` に残り続ける
+  （`TaffyTree::clear()` がこれを消さない）+ アリーナ / フレーム Vec の高水位。
+  `gpui::list` で可視行だけ描く形へ変え、閉じたあとの残留 110.1 MB → 2.2 MB（1 万行は
+  footprint 210 → 46 MB）。見た目は旧経路と実ピクセル差 0（visual-test `preview-code` 節を新設）
+- 同梱: CLI / MCP の close がプレビュー状態を落としていなかった実バグを
+  `drop_preview_pane_state` への集約 + 番犬テストで根治
+- 事故: 後始末の `pkill -x tako-app` が本番 GUI にも当たり終了させた。再起動で
+  9 タブ 21 ペイン完全復元。以後、隔離インスタンスは明示 pid でのみ落とす
+
+## 2026-08-15（#816: 取り込み経路の CPU — 層別内訳の確定と支配項の削減）
+- 計装ビルド（シンボル付き release + env ゲート）で層別に割ると、支配項は**パースではなく
+  イベント配送**（35.8%）だった。しかも配送コストは行数ではなく **PTY read の回数**に比例し、
+  同じ 6000 行でも「20 行バースト」353M に対し「1 行ずつ」は **1565M（4.4 倍）**
+- 直したのは 5 つ: ①見えないペインの Wakeup はメインスレッドへ渡さない（`PaneDelivery`。
+  #782 の可視性ゲートは渡った後で効くので往復ぶんは払っていた）②見えていても再描画間隔
+  （16ms）より細かく往復しない ③未処理 Wakeup がある間は PTY 側が次を送らない
+  （`wakeup_gate`。受け手主導のバックプレッシャ）④ペインログの行取り込みの二重確保と
+  末尾空白走査を除去 ⑤OSC tap は `Ground` を次の ESC まで飛ばす
+- 効果（隔離・交互 3 反復の中央値・instructions）: 裏タブ + 1 行ずつ = **1569.4M → 686.7M
+  （−56.2%）**、表 + 1 行ずつ −16.6%、20 行バースト −5.5%（表）/ −11.4%（裏）。
+  **エージェント worker が最大の受益者**
+- **#814 の前提の訂正**: 「裏タブでも残る 9.28% が取り込み経路」は再現せず実測 0.2〜0.3%。
+  この機は GPUI がウィンドウを 1 フレームも描いていない（セルフテストが自己申告）ため、
+  9.28% は描画込みの値だった
+- 挙動不変を before/after で突き合わせ: 4 ペイン洪水 4/4・seq 末尾連続 4/4・26KB 往復 md5 一致・
+  OSC 7/133 検知一致・**ペインログ md5 完全一致**・洪水直後の list 応答 18/19ms
+- 検証: fmt / clippy(-D warnings) / test --workspace 全緑 + Windows クロスチェック警告 16
+  （main 同数）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 113 新設）+
+  visual-test 全 98 checkpoint を 3 回連続で緑
+- 事故: `pgrep` 空振りで `TAKO_SOCKET` が空になったワンライナーが CLI 既定の接続解決を通って
+  **本番 GUI にタブを 1 枚作った**（即 close で復旧、他の状態は無傷）
+
+## 2026-08-15（#826: Markdown プレビューの行数比例リークを仮想化で根治）
+- #821 と同じ機序（全ブロックの element を毎フレーム作る → 1 フレームぶんの測定
+  レイアウトノードが taffy の `node_context_data` に居座る）が md にも残っていた。
+  `gpui::list` で**可視ブロックだけ**を組む形へ（**1 item = 1 ブロック** = #232 の
+  目次ジャンプの対応をそのまま保つ）。器はコードと共用の 1 本にして、モード切替で
+  「行番号とブロック番号を取り違える」事故を種別つきの `ListState` で構造排除
+- 行テキスト・行頭オフセット・ブロック索引は**文書全体ぶん**作る（element は増えない）
+  ので、⌘A / コピー / ヒットテスト / リンク索引（#680）は描画状態に依存しない。
+  目次ジャンプは `ListState::scroll_to` にしたので**一度も描かれていないブロック**へも届く
+- 実測（隔離・同一バイナリ A/B。1,819 ブロック）: 開いた 90.23 → **24.29 MB**、
+  閉じた残留 67.10 → **1.86 MB**（3 往復でも 2.05 MB で収束）、整形した行 3,408 → **7**、
+  定常フレーム 0.63 → **0.11 ms**、peak RSS 192 → **115 MB**。実文書
+  （progress.md = 1,014 ブロック）でも残留 31.1 → 1.60 MB
+- 見た目: **同じスクロール位置のフレームは実ピクセル差 0**（dark/light/narrow の文書先頭）。
+  visual-test 98 checkpoint のうち main と違うのは md 節の 11 行だけで、
+  中身は「記録した行レイアウト数」「掃引の指標」「ロード ms」= 計測の意味が変わったぶん
+- 同梱: `remove_tab_with` の独自列挙を `drop_preview_pane_state` へ集約（番犬の走査が
+  `&pane` 決め打ちで `&id` のループを見逃していた）/ visual-test の md・PDF が
+  `drain_pending_preview_loads` を呼ばず「たまたま通っていた」main 由来のフレークを固定
+- 検証: fmt / clippy(-D warnings) / test --workspace 全緑 + Windows クロスチェック
+  エラー 0・警告 13（main 同数）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 114 新設。
+  旧経路では `shaped=608`（= 全行）で FAILED になることを実測）+ visual-test 全 98
+  checkpoint を 3 回連続で緑
+
+## 2026-08-15（#826 追随: ライブリロードの位置保持検査が空振りしていたのを直す）
+- #826 で md 本文の器を `list` にしたことで、セルフテスト 66c（#233）の
+  「スクロールハンドルへ offset を書く → 同じ値を読む」が**画面に触れない空振り**に
+  なっていた（`TAKO_APP_SELF_TEST_OK` でも中身を検証していない状態）
+- 器に合わせて位置を指し・読むように是正（`preview_md_list` があれば
+  `logical_scroll_top` を 1 本の実数にして比べる）+ 「読む前に 1 フレーム描く」
+  + 書き換えごとにブロック数を変える（同数だと仮想リストが作り直されず、
+  位置を持ち越す経路そのものを通らない）
+- 検出力: `preview_body_list_state` の持ち越しを外すと
+  「ライブリロード後もモードとスクロール位置を保持」が FAILED になることを実測
+  （直す前は外しても通っていた）。`scroll_mark=8.0000->8.0000`（ブロック数 101 → 107）
+- 検証: fmt / clippy(-D warnings) / test --workspace 全緑 + 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`
+
+## 2026-08-15（#828: window close の残留は gpui / AppKit 層。診断だけ足した）
+- Issue の目星（`sync_viewports` の Err 握り潰し）を計装で反証: `handle.update` は毎回 `Ok`、
+  `MacWindow::drop` も走り（`delegate=nil` / `isVisible=false`）、残るのは NSWindow が
+  解放されないこと（`retainCount` 24→8 で不変）だけ。**素の gpui でも赤ボタン相当の
+  AppKit 起点 close でも同じ**で、`leaks` も到達不能リークを報告しない
+- 実装は最小のハードニングのみ: close 失敗を発生源つき（`render` / `dispatch` / `selftest`）で
+  persist.log へ記録。再試行はせず**挙動不変**。番犬テスト 3 本（握り潰しへ戻すと FAILED を実測）
+- 蓋を開けた状態での再計測は未実施（この機は clamshell 閉・画面 OFF で全面黒しか撮れない）。
+  証拠と再現ハーネスは `~/dev/tako-evidence/828/`
+
+## 2026-08-15（#830: チャットビューの行数比例リークを仮想化で根治）
+- #821 / #826 と同じ機序（1 フレームで作った element の数だけ taffy の
+  `node_context_data` に測定ノードが残り `clear()` で消えない）がチャットにも残っていた。
+  会話本文を `gpui::list` にして**可視の発話だけ**組む形へ（1 item = 1 発話 + 末尾の
+  付随要素 = カード / 作業中 / 承認）。行テキストは**文書全体ぶん**作るので ⌘A・コピー・
+  ヒットテストは描画状態に依存しない
+- **効くのは会話の長さではなく 1 タブに何枚あるか**（`CHAT_TAIL` = 50 で会話は頭打ちだが、
+  表示中のペインは全部 element を作る = master + worker が同居する tako の実運用が直撃）。
+  実 transcript（tail 50 = 534 md ブロック）の残留: 1 枚 11.32 → **2.53 MB** /
+  4 枚 43.78 → **4.10 MB** / 8 枚 86.24 → **8.18 MB**。整形した行 580/2,320/4,640 →
+  26/104/208（索引の行数は不変）。定常フレームは 8 枚で 0.68 → 0.41 ms
+- 唯一の挙動差: チャットを開いた**最初のフレームで末尾**が出る（旧経路は
+  `ScrollHandle::scroll_to_bottom()` が前フレームの実測に依存し初回は動かず、tail 50 の
+  いちばん古い発話から表示されていた = 承認カードが出ても画面外だった）。
+  「既定は追従」の設計意図どおりなので直した側を採用し、architecture.md に明記
+- 検証: fmt / clippy(-D warnings、visual-test feature 有無とも) / test --workspace 全緑 +
+  Windows クロスチェック エラー 0・警告 16（main 同数）+ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 115 新設。旧経路では `shaped=321`（= 全行）で FAILED に
+  なることを実測）+ visual-test 全 98 checkpoint を 3 回連続で緑（`chat-table` は
+  3 状態とも 1 文字も変わらない）
+- 同梱: 計測ハーネス `TAKO_VISUAL_ONLY=chat-leak`（実 transcript / 枚数を指定できる）、
+  項目 98 のヒットテストを「見えている行を掴む」形へ是正、`--features visual-test` 時の
+  clippy 違反 1 件（main 由来）を修正
+
+## 2026-08-17（#835: Finder の「このアプリケーションで開く」で新しいタブが開く）
+- #708 は受け口まで作ってあったが開く先が**アクティブタブのプレビュー再利用**で、複数選択
+  すると最後の 1 枚しか残らず「選んでも何も起きない」に見えていた（旧挙動へ戻すと
+  セルフテスト 116 が `tabs 3->4` / `new=[("プロジェクト", 2, Some("…/unknown.xyzzy"), true)]`
+  = 3 ファイルが 1 ペインに潰れることを実測）。**新しいタブ**で開く形へ是正
+- 振り分け: ファイル（宣言外の形式も）= プレビュー 1 枚だけのタブ（PTY なし・タブ名 =
+  ファイル名の手動タイトル）/ フォルダ = そのフォルダでシェルを起動したタブ / 不在パスは
+  読み飛ばし。複数選択は **1 ファイル = 1 タブ**（最後が前に出る）。既存タブは不変
+- 新ツールは作らず既存 dispatch を 2 本拡張: `OpenFile { new_tab }`（`tako open --new-tab` /
+  MCP `new_tab`。`direction` とは排他）と `TabNew { cwd }`（`tako tab new --cwd` / MCP `cwd`。
+  存在しない・フォルダでないパスは起動前にエラー）。MCP ツール数は不変
+- 検証: 品質ゲート全緑（fmt / clippy -D warnings / test）+ Windows クロスチェック警告 16
+  （main 同数）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 116 新設）+ **隔離 .app の
+  `open -a` e2e 22/22**（bundle id を差し替えたコピー + LSEnvironment で隔離。cold launch で
+  復元 3 タブ + 新規 1 タブ / 起動中 / 複数 / フォルダ / 宣言外 / 不在パス / CLI・MCP 1:1 /
+  本番の pid・layout.json 不変）。検出力は 3 通りの revert で FAILED を実測
+- 副観点: Finder に tako が 2 つ出るのは `~/dev/tako/dist/tako.app`（build-app.sh の生成物・
+  .gitignore 済み）が LS へ自動登録されるため。掃除手順は Issue / PR に記載（自動掃除はしない）
+
+## 2026-08-18（#838: Web ビューペインのちらつきを根治）
+- 根因は**可視性の「印」方式が #786 で壊れていた**こと: ペイン本体が `AnyView::cached` の
+  子ビューになり、キャッシュが当たったフレームは子の render が走らない = 印が付かない →
+  ルートの掃き出しが webview を隠す → 次の `TakoApp` notify で再表示、の往復。
+  #816 で PTY 出力が**そのペインだけ**を notify するようになり、notify されないフレームが
+  日常的に起きるようになって顕在化した。加えて子の render は掃き出しの**後**に走るので、
+  `hide_all`（D&D / パレット / close 確認との重なり回避）も子に上書きされて効いていなかった
+- 直し方: フレーム同期をルート render（`sync_webview_frames`）へ移し、**どのウィンドウから
+  呼ばれても同じ答えになる材料だけ**（全ウィンドウ共有の `pane_text_areas`。#339）から
+  毎フレーム決め切る。印は撤去。A/B は `TAKO_838_NO_ROOT_WEBVIEW_SYNC=1`
+- 実測（隔離 GUI・同一バイナリ A/B・20 秒 ×2 往復。root render の生存は分割比を 2 秒ごとに
+  動かす能動プローブ `bounds_delta=10` が両側同値で担保）: 可視 ⇔ 不可視の切替が
+  **178 / 174 回（8.9 / 8.7 回/秒）→ 0 回**、終了時の状態は `visible=False`（消えたまま）
+  → `visible=True`。セルフテスト項目 71 に回帰検査を新設（旧経路では
+  `visible=true → false`（切替 3 → 4）で FAILED になることを実測）
+- 関連コミット: PR（Closes #838）

@@ -59,6 +59,12 @@ pub enum WatchOutcome {
     /// worker が permission ダイアログ（ツール実行の承認要求）で停止した（#319）。
     /// master は `tako orchestrator respond` で応答する
     PermissionWaiting { permission_dialog: Value },
+    /// worker が permission 以外の選択肢ダイアログで停止した（#748）。
+    /// `/model` のモデル選択・`/mcp` の一覧・plan モードの実行確認・
+    /// AskUserQuestion の質問など。`choice_dialog` は
+    /// `claude_tui::ChoiceDialog::to_json()` と同じ形（種別・選択肢・ハイライト）で、
+    /// master は `tako orchestrator respond` に番号かラベルを渡して解除する
+    ChoiceWaiting { choice_dialog: Value },
     /// worker が異常（API エラー・usage limit 等）で停止した（#157）。
     /// `detail` は検知パターンにマッチした画面上の行
     Error {
@@ -300,6 +306,12 @@ impl WatchStreaks {
                         permission_dialog: val["permission_dialog"].clone(),
                     });
                 }
+                // #748: permission 以外の選択肢ダイアログも同様に即発火する
+                // （旧実装は IDLE / question として通知され master が respond へ
+                // 進めなかった。ダイアログ待ちは「完了」ではない）
+                if let Some(choice_dialog) = dialog_from_status(val, recent) {
+                    return Some(WatchOutcome::ChoiceWaiting { choice_dialog });
+                }
             }
             "busy" => {
                 self.gone = 0;
@@ -338,6 +350,23 @@ impl WatchStreaks {
                 .or_else(|| detect_worker_error(recent));
             if let Some((kind, detail)) = error {
                 return Some(WatchOutcome::Error { kind, detail });
+            }
+            // #577: permission ダイアログは question より具体的な停止種別
+            // （master の対応が `respond` になる）なので question より先に見る。
+            // dispatch の応答を優先し、無ければ画面から自力検知する
+            // （waiting へ格上げしない旧 tako-app に対しても watch 単体で
+            // WORKER_PERMISSION を出せるフォールバック。判定関数は同一）
+            let dialog = match val.get("permission_dialog") {
+                Some(v) if !v.is_null() => Some(v.clone()),
+                _ => permission_dialog_json(recent),
+            };
+            if let Some(permission_dialog) = dialog {
+                return Some(WatchOutcome::PermissionWaiting { permission_dialog });
+            }
+            // #748: permission 以外の選択肢ダイアログ（モデル選択・plan 確認・
+            // AskUserQuestion 等）。question より具体的なので先に見る
+            if let Some(choice_dialog) = dialog_from_status(val, recent) {
+                return Some(WatchOutcome::ChoiceWaiting { choice_dialog });
             }
             // #267: idle 確定後に events から question を判定。
             // question がある場合は Question で通知（master の対応が異なるため）
@@ -475,6 +504,7 @@ pub fn run_worker(
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+        WatchOutcome::ChoiceWaiting { .. } => "dialog_waiting",
         WatchOutcome::AgentDead { .. } => "worker_dead",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
@@ -501,11 +531,13 @@ pub fn run_worker(
                 | WatchOutcome::Stalled { .. }
                 | WatchOutcome::Question { .. }
                 | WatchOutcome::PermissionWaiting { .. }
+                | WatchOutcome::ChoiceWaiting { .. }
                 | WatchOutcome::AgentDead { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
+            caller_role: None,
         })
         .is_ok()
     } else {
@@ -541,6 +573,14 @@ pub fn run_worker(
     } = outcome
     {
         result["permission_dialog"] = permission_dialog.clone();
+    }
+    // #748: permission 以外の選択肢ダイアログ待ち。加えて **どの outcome でも**
+    // 画面にダイアログが残っていれば構造を添える（usage limit は #157 の
+    // WORKER_ERROR が先に出るので、respond に必要な選択肢一覧がここに必要）
+    if let WatchOutcome::ChoiceWaiting { ref choice_dialog } = outcome {
+        result["choice_dialog"] = choice_dialog.clone();
+    } else if let Some(dialog) = choice_dialog_json(&output) {
+        result["choice_dialog"] = dialog;
     }
     if let WatchOutcome::AgentDead { ref resume_command } = outcome {
         result["agent_dead"] = json!({
@@ -780,6 +820,7 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
             WatchOutcome::Error { .. } => "worker_error",
             WatchOutcome::Stalled { .. } => "worker_stalled",
             WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+            WatchOutcome::ChoiceWaiting { .. } => "dialog_waiting",
             WatchOutcome::AgentDead { .. } => "worker_dead",
             WatchOutcome::Gone => "error",
             WatchOutcome::Timeout => "timeout",
@@ -853,6 +894,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
         WatchOutcome::Error { .. } => "worker_error",
         WatchOutcome::Stalled { .. } => "worker_stalled",
         WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+        WatchOutcome::ChoiceWaiting { .. } => "dialog_waiting",
         WatchOutcome::AgentDead { .. } => "worker_dead",
         WatchOutcome::Gone => "error",
         WatchOutcome::Timeout => "timeout",
@@ -876,11 +918,13 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
                 | WatchOutcome::Stalled { .. }
                 | WatchOutcome::Question { .. }
                 | WatchOutcome::PermissionWaiting { .. }
+                | WatchOutcome::ChoiceWaiting { .. }
                 | WatchOutcome::AgentDead { .. }
         ) {
         exec(Request::Close {
             pane: Some(pane_id),
             force: true,
+            caller_role: None,
         })
         .is_ok()
     } else {
@@ -925,6 +969,12 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     {
         result["permission_dialog"] = permission_dialog.clone();
     }
+    // #748: 選択肢ダイアログ（run の完了後照会でも respond できるように構造を返す）
+    if let WatchOutcome::ChoiceWaiting { ref choice_dialog } = c.outcome {
+        result["choice_dialog"] = choice_dialog.clone();
+    } else if let Some(dialog) = choice_dialog_json(&output) {
+        result["choice_dialog"] = dialog;
+    }
     if let WatchOutcome::AgentDead { ref resume_command } = c.outcome {
         result["agent_dead"] = json!({
             "resume_command": resume_command,
@@ -948,6 +998,7 @@ pub fn run_list() -> Value {
                     WatchOutcome::Error { .. } => "worker_error",
                     WatchOutcome::Stalled { .. } => "worker_stalled",
                     WatchOutcome::PermissionWaiting { .. } => "permission_waiting",
+                    WatchOutcome::ChoiceWaiting { .. } => "dialog_waiting",
                     WatchOutcome::AgentDead { .. } => "worker_dead",
                     WatchOutcome::Gone => "error",
                     WatchOutcome::Timeout => "timeout",
@@ -1093,6 +1144,48 @@ pub fn screen_looks_idle(output: &str) -> bool {
     })
 }
 
+/// 画面テキストに permission ダイアログが実在すれば、その構造化 JSON を返す（#319 / #577）。
+///
+/// `worker_status` の `permission_dialog` フィールドと watch のフォールバック判定で
+/// **同じ関数・同じ形**を使うための入口（形が食い違うと master 側の分岐が壊れる）。
+/// 実在検査の厳密さは `claude_tui::detect_permission_dialog` が担保する
+pub fn permission_dialog_json(output: &str) -> Option<Value> {
+    let lines: Vec<String> = output.lines().map(|l| l.to_string()).collect();
+    let dialog = crate::claude_tui::detect_permission_dialog(&lines)?;
+    Some(json!({
+        "command": dialog.command,
+        "options": dialog.options,
+        "highlighted": dialog.highlighted,
+    }))
+}
+
+/// 画面テキストに選択肢ダイアログが実在すれば、その構造化 JSON を返す（#748）。
+///
+/// `permission_dialog_json` と同じく **worker_status / read / watch が同じ関数・
+/// 同じ形**を通るための入口。permission も含めた全種別を返す（種別は `kind`）
+pub fn choice_dialog_json(output: &str) -> Option<Value> {
+    let lines: Vec<String> = output.lines().map(|l| l.to_string()).collect();
+    crate::claude_tui::detect_choice_dialog(&lines).map(|d| d.to_json())
+}
+
+/// `worker_status` 応答（新 tako-app）→ 画面テキスト（旧 tako-app へのフォールバック）の
+/// 順で選択肢ダイアログを取り出す（#748）。
+///
+/// permission 種別は `PermissionWaiting` が先に扱うので除外する
+/// （両方の outcome を出すと master が respond を二重に打つ）。
+/// tako が自動承諾する trust / bypass も除外する（待てば消えるので停止通知しない）
+fn dialog_from_status(val: &Value, recent: &str) -> Option<Value> {
+    let dialog = match val.get("choice_dialog") {
+        Some(v) if !v.is_null() => v.clone(),
+        _ => choice_dialog_json(recent)?,
+    };
+    let kind = dialog.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind == "permission" || dialog.get("auto_accepted").and_then(|b| b.as_bool()) == Some(true) {
+        return None;
+    }
+    Some(dialog)
+}
+
 /// TUI が折りたたみ状態（「N new messages (click) ↓」等で途中省略されている）かを検出する。
 /// claude TUI は長いツール実行後に出力を折りたたみ、最終的に「95 new messages (click) ↓」
 /// のような表示になる。この状態では read_pane / capture-pane のどちらでも最新の会話が取れない
@@ -1110,10 +1203,26 @@ pub fn screen_is_collapsed(output: &str) -> bool {
 ///
 /// 検知の優先順位は復帰コストの高い順: usage_limit > limit_dialog > api_error
 /// （codex は limit 到達時に limit メッセージとモデル切替ダイアログが同時に出るため、
-/// 本質である limit 到達を優先する）
+/// 本質である limit 到達を優先する）。
+///
+/// **種別は変えない**（#748 で一度 limit ダイアログを `limit_dialog` へ寄せる案を試したが、
+/// codex の limit 画面が supervisor の「解除まで待つ」復旧から外れて即再発するため戻した）。
+/// 代わりに、対処ダイアログの**選択肢構造**は `worker_status` / watch の
+/// `choice_dialog` に載るので、master は WORKER_ERROR を受けた後 respond で確定できる
 pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
     // tail_lines は新しい行が先頭 = 最初のマッチが画面最下部に最も近い
     let lines = tail_lines(output, 30);
+
+    // 0. claude の limit 対処ダイアログ（#748。実文言はバイナリ内文字列より）。
+    //    メッセージ行がスクロールアウトしてダイアログだけ見えている場合でも
+    //    「limit 到達で止まっている」と分かるようにする（無いと idle = 完了に見える）
+    if lines.iter().any(|l| l.contains("What do you want to do?")) {
+        if let Some(l) = lines.iter().find(|l| {
+            l.contains("Stop and wait for limit to reset") || l.contains("Wait for limit to reset")
+        }) {
+            return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
+        }
+    }
 
     // 1. usage limit 到達（claude / codex）
     //    - codex: 「■ You've hit your usage limit. ... try again at 4:24 AM.」
@@ -1169,6 +1278,12 @@ pub enum WorkerEventKind {
     Question,
     /// worker が permission ダイアログで停止している（#319）
     PermissionDialog,
+    /// worker が permission 以外の選択肢ダイアログで停止している（#748）。
+    /// `dialog_kind` は種別 slug（usage_limit / plan_confirm / select / trust / bypass）
+    ChoiceDialog {
+        dialog_kind: String,
+        recommended_action: String,
+    },
     /// claude の自動モデル切替が発生した
     ModelSwitched { from: String, to: String },
     /// ctx 使用率が閾値（60%）を超えた
@@ -1182,6 +1297,11 @@ pub enum WorkerEventKind {
     /// tmux セッション配下の実行中子プロセスが消えた場合に発火。
     /// `resume_command` があれば claude --resume で文脈ごと復旧できる
     AgentDead { resume_command: Option<String> },
+    /// 人間が busy 中に打った指示が claude のメッセージキューに未送信のまま残っている（#572）。
+    /// 入力欄自体は空なので Enter 単独送達では発火しない（`Up` で取り出してから送る）。
+    /// tako は idle が続けば自動で送り出すが、キューはペインが消えると失われるため
+    /// master にも知らせる（ペインを閉じる前に消化させる判断材料）
+    QueuedMessagesPending,
 }
 
 /// worker_status の events 配列に載せる 1 イベント
@@ -1195,6 +1315,14 @@ impl WorkerEvent {
         match &self.kind {
             WorkerEventKind::Question => json!({ "kind": "question" }),
             WorkerEventKind::PermissionDialog => json!({ "kind": "permission_dialog" }),
+            WorkerEventKind::ChoiceDialog {
+                dialog_kind,
+                recommended_action,
+            } => json!({
+                "kind": "choice_dialog",
+                "dialog_kind": dialog_kind,
+                "recommended_action": recommended_action,
+            }),
             WorkerEventKind::ModelSwitched { from, to } => {
                 json!({ "kind": "model_switched", "from": from, "to": to })
             }
@@ -1215,6 +1343,12 @@ impl WorkerEvent {
                     "kind": "agent_dead",
                     "resume_command": resume_command,
                     "recommended_action": "resume_session",
+                })
+            }
+            WorkerEventKind::QueuedMessagesPending => {
+                json!({
+                    "kind": "queued_messages_pending",
+                    "recommended_action": "wait_for_delivery",
                 })
             }
         }
@@ -1316,9 +1450,30 @@ pub fn collect_worker_events(
     ctx_percent: Option<u32>,
 ) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
+    let stopped = status == "idle" || status == "error" || status == "waiting";
 
-    // question: idle / error / waiting 時のみ（busy 中の質問文言はまだ作業途中）
-    if status == "idle" || status == "error" || status == "waiting" {
+    // permission ダイアログの実在（#319 / #577）。question より具体的な状態なので
+    // 先に判定し、両方を出さない（master が respond ではなく通常の質問応答へ
+    // 流れるのを防ぐ。permission ダイアログの文面は "Do you want to proceed?" 等で
+    // question パターンにも必ず掛かる）
+    // #748: 種別つきで 1 回だけ検知する（permission / それ以外を同じ構造検知から出す）
+    let dialog = if stopped {
+        recent_output.and_then(|out| {
+            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+            crate::claude_tui::detect_choice_dialog(&lines)
+        })
+    } else {
+        None
+    };
+    let permission = dialog
+        .as_ref()
+        .is_some_and(|d| d.kind == crate::claude_tui::DialogKind::Permission);
+
+    // question: idle / error / waiting 時のみ（busy 中の質問文言はまだ作業途中）。
+    // #748: ダイアログが実在するときは question を出さない（permission 限定だった）。
+    // ダイアログ待ちを「質問」として通知すると master は本文へ返信しようとして
+    // 送達が入力欄と混線する（#748 の観測 2 / 4）
+    if stopped && dialog.is_none() {
         if let Some(out) = recent_output {
             if detect_worker_question(out) {
                 events.push(WorkerEvent {
@@ -1328,16 +1483,22 @@ pub fn collect_worker_events(
         }
     }
 
-    // permission_dialog: waiting 時に画面に permission ダイアログがあれば記録（#319）
-    if status == "waiting" {
-        if let Some(out) = recent_output {
-            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
-            if crate::claude_tui::detect_permission_dialog(&lines).is_some() {
-                events.push(WorkerEvent {
-                    kind: WorkerEventKind::PermissionDialog,
-                });
-            }
-        }
+    // permission_dialog: 停止側の状態で画面に permission ダイアログがあれば記録
+    // （#319。#577 で `waiting` 限定をやめた: claude agents は waiting を返さないので
+    // status が idle のまま permission 待ちになる経路がある）
+    if permission {
+        events.push(WorkerEvent {
+            kind: WorkerEventKind::PermissionDialog,
+        });
+    } else if let Some(d) = dialog.as_ref() {
+        // #748: permission 以外の選択肢ダイアログ（usage limit の対処選択・モデル選択・
+        // plan 確認・AskUserQuestion 等）も種別つきで通知する
+        events.push(WorkerEvent {
+            kind: WorkerEventKind::ChoiceDialog {
+                dialog_kind: d.kind.as_str().to_string(),
+                recommended_action: d.kind.recommended_action().to_string(),
+            },
+        });
     }
 
     // model_switched: status に関係なく画面に告知があれば記録
@@ -1608,7 +1769,8 @@ mod tests {
             r,
             Request::Close {
                 pane: Some(9),
-                force: true
+                force: true,
+                caller_role: None,
             }
         )));
     }
@@ -2745,7 +2907,185 @@ Running 1 shell command...\n\
 
     #[test]
     fn collect_worker_eventsはwaiting時も質問を検出する() {
-        let events = collect_worker_events("waiting", Some(QUESTION_CONFIRM_SCREEN), Some(42u32));
+        // #748: 判定対象を「本文で質問している画面」に差し替えた。
+        // 旧 fixture（QUESTION_CONFIRM_SCREEN）は字面が**信頼ダイアログそのもの**で、
+        // ダイアログ待ちを question として通知していた（master が本文へ返信しようとする
+        // = #748 の観測 2）。ダイアログは種別つきの choice_dialog で通知する
+        let events = collect_worker_events("waiting", Some(QUESTION_FREE_SCREEN), Some(42u32));
         assert!(events.iter().any(|e| e.kind == WorkerEventKind::Question));
+    }
+
+    #[test]
+    fn issue748_ダイアログ待ちはquestionではなくchoice_dialogで通知する() {
+        // 信頼ダイアログ（tako が自動承諾する種別）は question を出さない
+        let events = collect_worker_events("waiting", Some(QUESTION_CONFIRM_SCREEN), None);
+        assert!(
+            !events.iter().any(|e| e.kind == WorkerEventKind::Question),
+            "ダイアログ実在時に question は出さない: {events:?}"
+        );
+        let dialog = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                WorkerEventKind::ChoiceDialog {
+                    dialog_kind,
+                    recommended_action,
+                } => Some((dialog_kind.clone(), recommended_action.clone())),
+                _ => None,
+            })
+            .expect("choice_dialog イベントが出る");
+        assert_eq!(dialog, ("trust".to_string(), "auto_accept".to_string()));
+    }
+
+    #[test]
+    fn issue748_選択肢ダイアログでwatchがdialog_waitingを返す() {
+        // モデル選択ダイアログ（permission でも limit でもない）で停止した worker。
+        // 旧実装は WORKER_IDLE / question として通知していた（#748 の観測 2）
+        let model_select = "\
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n\
+   Select model\n\
+   Switch between Claude models.\n\n\
+     1. Default (recommended)  Opus 5\n\
+   ❯ 2. Opus (1M context)      Opus 5 with 1M context\n\
+     3. Sonnet                 Sonnet 5\n\n\
+   Enter to set as default · Esc to cancel";
+        let mut script = ExecScript::new(vec![
+            status("idle", model_select, "agents"),
+            status("idle", model_select, "agents"),
+            status("idle", model_select, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        let WatchOutcome::ChoiceWaiting { choice_dialog } = outcome else {
+            panic!("ChoiceWaiting を返す（修正前は Idle）: {outcome:?}");
+        };
+        assert_eq!(choice_dialog["kind"], "select");
+        assert_eq!(choice_dialog["numbered"], true);
+        assert_eq!(choice_dialog["highlighted"], 1);
+        assert_eq!(choice_dialog["options"].as_array().unwrap().len(), 3);
+        assert_eq!(choice_dialog["recommended_action"], "respond");
+    }
+
+    #[test]
+    fn issue748_自動承諾するダイアログはdialog_waitingにしない() {
+        // trust / bypass は tako が承諾するので停止通知しない（待てば消える）。
+        // 誤って ChoiceWaiting にすると spawn 直後の信頼ダイアログで watch が
+        // 即座に「停止」と報告してしまう
+        let trust = "\
+ Quick safety check: Is this a project you created or one you trust?\n\
+ ❯ 1. Yes, I trust this folder\n\
+   2. No, exit\n\n\
+ Enter to confirm · Esc to cancel";
+        let mut script = ExecScript::new(vec![
+            status("waiting", trust, "agents"),
+            status("waiting", trust, "agents"),
+            status("waiting", trust, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Idle { .. }),
+            "信頼ダイアログ中は待ち続け、消えてから idle: {outcome:?}"
+        );
+    }
+
+    // --- #577: permission ダイアログ待ちを WORKER_PERMISSION として通知する ---
+
+    /// Issue #577 の再現画面（brace expansion を含む Bash 実行の承認要求）
+    const PERMISSION_SCREEN_577: &str = "\
+⏺ Running 1 shell command…\n\
+──────────────────────────────────────────\n\
+ Bash command\n\
+   for i in {1..12}; do echo $i; sleep 1; done; echo done\n\
+ Contains brace_expression\n\
+ Do you want to proceed?\n\
+ ❯ 1. Yes\n\
+   2. Yes, and don't ask again for echo commands\n\
+   3. No, and tell Claude what to do differently (esc)\n\
+ Esc to cancel · Tab to amend · ctrl+e to explain";
+
+    #[test]
+    fn issue577_dispatchがidleでも画面から検知してpermissionを返す() {
+        // 旧 tako-app（waiting へ格上げしない dispatch）に対するフォールバック。
+        // permission_dialog フィールドが無くても watch 単体で判定できる
+        let mut script = ExecScript::new(vec![
+            status("idle", PERMISSION_SCREEN_577, "agents"),
+            status("idle", PERMISSION_SCREEN_577, "agents"),
+            status("idle", PERMISSION_SCREEN_577, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        let WatchOutcome::PermissionWaiting { permission_dialog } = outcome else {
+            panic!("WORKER_PERMISSION を返す（修正前は Question）: {outcome:?}");
+        };
+        assert_eq!(permission_dialog["options"].as_array().unwrap().len(), 3);
+        assert!(permission_dialog["command"]
+            .as_str()
+            .unwrap()
+            .contains("for i in {1..12}"));
+    }
+
+    #[test]
+    fn issue577_waitingとpermission_dialogなら即座に発火する() {
+        // dispatch が格上げ済みなら streak を待たない（ダイアログは安定状態）
+        let mut script = ExecScript::new(vec![Ok(json!({
+            "status": "waiting",
+            "recent_output": PERMISSION_SCREEN_577,
+            "status_source": "agents",
+            "permission_dialog": { "command": "cmd", "options": ["Yes", "No"], "highlighted": 0 },
+        }))]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(matches!(outcome, WatchOutcome::PermissionWaiting { .. }));
+        assert_eq!(script.seen.len(), 1, "1 回の照会で発火する");
+    }
+
+    #[test]
+    fn issue577_本物の質問はquestionのまま() {
+        let question_resp = || -> Result<Value, String> {
+            Ok(json!({
+                "status": "idle",
+                "recent_output": QUESTION_CONFIRM_SCREEN,
+                "status_source": "agents",
+                "ctx_percent": 42,
+                "events": [{"kind": "question"}],
+            }))
+        };
+        let mut script = ExecScript::new(vec![question_resp(), question_resp(), question_resp()]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(
+            matches!(outcome, WatchOutcome::Question { .. }),
+            "ダイアログが無ければ Question のまま: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn issue577_通常のidleはidleのまま() {
+        // #571 の非回帰
+        let mut script = ExecScript::new(vec![
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(7, None));
+        assert!(matches!(outcome, WatchOutcome::Idle { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn issue577_collect_worker_eventsはダイアログ時にquestionを出さない() {
+        // permission ダイアログの文面は question パターンにも掛かる。両方出すと
+        // master が respond ではなく通常の質問応答へ流れる
+        for status in ["idle", "waiting"] {
+            let events = collect_worker_events(status, Some(PERMISSION_SCREEN_577), None);
+            let kinds: Vec<_> = events.iter().map(|e| e.kind.clone()).collect();
+            assert!(
+                kinds.contains(&WorkerEventKind::PermissionDialog),
+                "{status}: {kinds:?}"
+            );
+            assert!(
+                !kinds.contains(&WorkerEventKind::Question),
+                "{status}: {kinds:?}"
+            );
+        }
+        // busy 中は停止側の判定をしない
+        assert!(collect_worker_events("busy", Some(PERMISSION_SCREEN_577), None).is_empty());
     }
 }

@@ -9,7 +9,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use tako_control::protocol::PreviewModeWire;
 use tako_core::{
@@ -74,13 +75,69 @@ pub struct MdSpan {
     pub italic: bool,
     pub code: bool,
     pub strike: bool,
-    /// リンクテキスト（アクセント色で描く。URL 自体は開かない = Web ペインは FR-3.8）
-    pub link: bool,
+    /// リンクなら md に書かれた遷移先（`None` = リンクではない）。
+    /// 装飾（accent + 下線）は `is_some()` で判定し、⌘+クリックで開くかは
+    /// `tako_core::md_links::browser_url` の判定に従う（#680）
+    pub link_url: Option<String>,
 }
 
-/// Markdown のブロック（描画単位。FR-3.3）
+impl MdSpan {
+    /// リンクの一部か（装飾判定用）
+    pub fn is_link(&self) -> bool {
+        self.link_url.is_some()
+    }
+}
+
+/// 表セルの配置（GFM の `:---` / `:---:` / `---:`。FR-3.3）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MdAlign {
+    /// 指定なし（`---`）。左寄せで描く
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// 表の 1 セル（インライン装飾を保持する）
+pub type MdCell = Vec<MdSpan>;
+
+/// Markdown のブロック（描画単位。FR-3.3）。
+///
+/// 引用・リストの入れ子は「ブロックを再帰させる」のではなく、各ブロックが自分の
+/// 引用深さ・リスト段を持つフラット構造で表す。1 ブロック = 1 描画要素を保てるので
+/// 目次ジャンプ（Issue #232）のブロック番号がそのまま子要素の添字になる。
 #[derive(Debug, Clone, PartialEq)]
-pub enum MdBlock {
+pub struct MdBlock {
+    pub kind: MdBlockKind,
+    /// 引用のネスト深さ（0 = 引用外）。引用内のリスト・コードブロックも同じ帯に入る
+    pub quote_depth: usize,
+    /// リストのネスト段（1 = 最上位のリスト項目、0 = リスト外）。
+    /// リスト項目に属する段落・コードブロックの字下げにも使う
+    pub list_depth: usize,
+}
+
+impl MdBlock {
+    fn new(kind: MdBlockKind) -> Self {
+        Self {
+            kind,
+            quote_depth: 0,
+            list_depth: 0,
+        }
+    }
+
+    fn nested(kind: MdBlockKind, quote_depth: usize, list_depth: usize) -> Self {
+        Self {
+            kind,
+            quote_depth,
+            list_depth,
+        }
+    }
+}
+
+/// ブロックの種別
+#[derive(Debug, Clone, PartialEq)]
+pub enum MdBlockKind {
     Heading {
         level: u8,
         spans: Vec<MdSpan>,
@@ -88,18 +145,28 @@ pub enum MdBlock {
     Paragraph {
         spans: Vec<MdSpan>,
     },
-    /// リスト項目。`marker` は "•" / "1." 等、`depth` はネスト段
+    /// リスト項目
     ListItem {
-        depth: usize,
-        marker: String,
+        /// 番号付きなら表示番号、箇条書きなら None
+        ordered: Option<u64>,
+        /// タスクリスト（`- [ ]` / `- [x]`）なら完了フラグ
+        task: Option<bool>,
+        /// 同じ項目の 2 つ目以降のブロック（マーカーを描かず字下げだけ揃える）
+        continuation: bool,
         spans: Vec<MdSpan>,
     },
     /// コードブロック（```lang はハイライトして保持する）
     CodeBlock {
+        /// フェンスの info 文字列（言語指定なし / インデントコードは None）
+        lang: Option<String>,
         lines: Vec<Line>,
     },
-    Quote {
-        spans: Vec<MdSpan>,
+    /// GFM テーブル（Issue #656）
+    Table {
+        /// 列ごとの配置。列数の正はこの長さ
+        align: Vec<MdAlign>,
+        header: Vec<MdCell>,
+        rows: Vec<Vec<MdCell>>,
     },
     Rule,
 }
@@ -384,6 +451,12 @@ pub fn apply_editor_text(preview: &mut PreviewState, edit: &EditState) {
 }
 
 impl PreviewState {
+    /// 再ハイライトの可能性がある種別か（#815 の構文セット寿命判定）。
+    /// Markdown もコードブロックのハイライトで構文セットを使う
+    pub fn needs_syntax(&self) -> bool {
+        matches!(self.mode, PreviewMode::Code | PreviewMode::Markdown)
+    }
+
     /// Markdown レンダリングへ切り替え可能なファイルか（目アイコントグルの表示判定）
     pub fn markdown_capable(&self) -> bool {
         is_markdown_path(&self.path)
@@ -914,10 +987,123 @@ pub trait Highlighter: Send + Sync {
     fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line>;
 }
 
-/// 既定ハイライタ（プロセス内で 1 度だけ構文セットを読む）
-pub fn highlighter() -> &'static dyn Highlighter {
-    static INSTANCE: OnceLock<SyntectHighlighter> = OnceLock::new();
-    INSTANCE.get_or_init(SyntectHighlighter::new)
+/// 構文セットを載せたままにしておく猶予（最後に使ってからの長さ。#815）。
+/// 編集の連続打鍵とライブリロードの連投で毎回ロードし直さないための幅で、これを過ぎたら
+/// プレビューを開いたままでも手放す（描画済みの色は [`PreviewContent`] 側が持っている）。
+pub const SYNTAX_IDLE_GRACE: Duration = Duration::from_secs(30);
+
+/// 構文セットの寿命（#815）。
+///
+/// 実費は `SyntaxSet` の器（実測 1.04 MB / ロード 0.6〜1.2 ms）ではなく、**ハイライトした
+/// 言語ごとに遅延コンパイルされる正規表現**にある（実測: Rust +5.1 MB・bash +10.9 MB・
+/// Markdown +10.9 MB・TypeScript +32.0 MB。18 言語を通すと 149 MB まで積み上がる）。
+/// これはセットの内側に溜まり、syntect には言語単位で捨てる API が無い。
+/// つまり**捨てられる単位はセット全体だけ**なので、「借用が 1 枚も無く、最後の使用から
+/// [`SYNTAX_IDLE_GRACE`] 経過したら丸ごと解放する」寿命管理にしている。
+/// 実体は下のグローバル 1 個だが、テストが並列でも決定的になるようローカルに作れる形にしてある
+struct SyntaxCache {
+    /// 生存追跡。借用チケットが 1 枚でも生きていれば upgrade できる
+    weak: Weak<SyntectHighlighter>,
+    /// 猶予中の保持。これを手放しても、実際の解放は最後のチケットが落ちた時
+    keep: Option<Arc<SyntectHighlighter>>,
+    last_use: Option<Instant>,
+}
+
+impl SyntaxCache {
+    const fn new() -> Self {
+        Self {
+            weak: Weak::new(),
+            keep: None,
+            last_use: None,
+        }
+    }
+
+    /// 借りる。載っていなければここでロードする（実測 0.6〜1.2 ms）
+    fn acquire(&mut self, now: Instant) -> SyntaxLease {
+        self.last_use = Some(now);
+        if let Some(arc) = self.weak.upgrade() {
+            self.keep = Some(Arc::clone(&arc));
+            return SyntaxLease(arc);
+        }
+        let arc = Arc::new(SyntectHighlighter::new());
+        self.weak = Arc::downgrade(&arc);
+        self.keep = Some(Arc::clone(&arc));
+        SyntaxLease(arc)
+    }
+
+    /// 猶予を過ぎていれば保持を手放す。戻り値 = このターンで手放したか。
+    /// 借用が残っていれば実解放はそのチケットが落ちた時まで自動的に待つ
+    fn release_idle(&mut self, now: Instant, text_preview_open: bool) -> bool {
+        if self.keep.is_none() {
+            return false;
+        }
+        let idle = self
+            .last_use
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        if !syntax_release_due(idle, text_preview_open) {
+            return false;
+        }
+        self.keep = None;
+        true
+    }
+
+    /// 構文セットが今メモリに載っているか（保持していなくても、借用中なら載っている）
+    fn resident(&self) -> bool {
+        self.weak.strong_count() > 0
+    }
+}
+
+static SYNTAX_CACHE: Mutex<SyntaxCache> = Mutex::new(SyntaxCache::new());
+
+fn syntax_cache() -> MutexGuard<'static, SyntaxCache> {
+    SYNTAX_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// ハイライタの借用チケット（#815）。**これが生きている間は構文セットが解放されない**ので、
+/// background のハイライト実行中に足元が消えることが型として起こり得ない。
+pub struct SyntaxLease(Arc<SyntectHighlighter>);
+
+impl Highlighter for SyntaxLease {
+    fn highlight(&self, path: &Path, text: &str) -> Vec<Line> {
+        self.0.highlight(path, text)
+    }
+
+    fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line> {
+        self.0.highlight_lang(lang, text)
+    }
+}
+
+/// 既定ハイライタを借りる。載っていなければここでロードする（実測 0.6〜1.2 ms）
+pub fn highlighter() -> SyntaxLease {
+    syntax_cache().acquire(Instant::now())
+}
+
+/// 保持を手放してよいか（純関数。テストが実時間を待たないための切り出し）
+pub(crate) fn syntax_release_due(idle: Duration, text_preview_open: bool) -> bool {
+    // テキストのプレビューが 1 枚も無ければ猶予を待たない（閉じた直後に返す）
+    !text_preview_open || idle >= SYNTAX_IDLE_GRACE
+}
+
+/// 解放をやめて旧挙動（プロセス常駐）へ戻す逃げ道（`TAKO_815_NO_SYNTAX_RELEASE=1`）。
+/// #815 の効果を同じバイナリで A/B するためのもの（#786 / #787 / #803 と同じ流儀）
+pub(crate) fn syntax_release_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_815_NO_SYNTAX_RELEASE").is_some())
+}
+
+/// 使っていない構文セットを手放す（2 秒 tick から呼ぶ。#815）。
+/// 実際の解放は最後の [`SyntaxLease`] が落ちた時点で起こるので、ハイライト中に呼んでも安全。
+/// 戻り値 = このターンで保持を手放したか
+pub fn release_idle_syntax(now: Instant, text_preview_open: bool) -> bool {
+    if syntax_release_disabled() {
+        return false;
+    }
+    syntax_cache().release_idle(now, text_preview_open)
+}
+
+/// 構文セットが今メモリに載っているか（診断・セルフテスト用）
+pub fn syntax_resident() -> bool {
+    syntax_cache().resident()
 }
 
 /// syntect 実装（bat / delta と同系の定番。純 Rust 構成 = regex-fancy）
@@ -1079,25 +1265,42 @@ impl Highlighter for SyntectHighlighter {
     }
 }
 
-/// Markdown をブロック列へパースする（FR-3.3）。表など未対応の構造は
-/// テキストとして段落へ劣化させ、内容を落とさない。
+/// パース中に持ち回る構造の状態。`flush` がここを見てブロック種別を決める
+#[derive(Default)]
+struct MdParseState {
+    /// リストのネスト（None = 箇条書き、Some(n) = 番号付きの次番号）
+    lists: Vec<Option<u64>>,
+    quote_depth: usize,
+    heading: Option<u8>,
+    /// 直近の `- [ ]` / `- [x]` マーカー（項目の先頭ブロックにだけ効く）
+    task: Option<bool>,
+    /// 今のリスト項目でまだブロックを出していない（= マーカーを描く番）
+    item_pending_marker: bool,
+}
+
+/// Markdown をブロック列へパースする（FR-3.3）。GFM テーブルは表構造として保持し、
+/// HTML など未対応の構造はテキストとして段落へ劣化させ、内容を落とさない。
 fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
+    // Issue #656: 表を表構造として受け取る（従来は素のテキストへ潰れていた）
+    options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(text, options);
 
-    let mut blocks = Vec::new();
+    let mut blocks: Vec<MdBlock> = Vec::new();
     let mut spans: Vec<MdSpan> = Vec::new();
-    let (mut bold, mut italic, mut strike, mut link) = (0u32, 0u32, 0u32, 0u32);
-    // リストのネスト（None = 箇条書き、Some(n) = 番号付きの次番号）
-    let mut lists: Vec<Option<u64>> = Vec::new();
-    let mut quote_depth = 0u32;
-    let mut heading: Option<u8> = None;
+    let (mut bold, mut italic, mut strike) = (0u32, 0u32, 0u32);
+    // リンクは深さカウンタではなく遷移先のスタックで持つ（⌘+クリックで開くため。#680）。
+    // md にリンクの入れ子は無いが、閉じ忘れの入力でも `last()` が現在のリンクを指す
+    let mut link_urls: Vec<String> = Vec::new();
+    let mut state = MdParseState::default();
     // コードブロック蓄積（lang, 本文）
-    let mut code: Option<(String, String)> = None;
+    let mut code: Option<(Option<String>, String)> = None;
+    // 表の蓄積（Some の間はセル単位でスパンを回収する）
+    let mut table: Option<MdTableBuilder> = None;
 
     let push_span = |spans: &mut Vec<MdSpan>,
                      text: &str,
@@ -1105,7 +1308,7 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
                      bold: u32,
                      italic: u32,
                      strike: u32,
-                     link: u32| {
+                     link: Option<&str>| {
         if text.is_empty() {
             return;
         }
@@ -1115,97 +1318,138 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
             italic: italic > 0,
             code: code_span,
             strike: strike > 0,
-            link: link > 0,
+            link_url: link.map(str::to_string),
         });
     };
     // 段落・見出し等の区切りで溜まったスパンをブロック化する
-    fn flush(
-        blocks: &mut Vec<MdBlock>,
-        spans: &mut Vec<MdSpan>,
-        heading: Option<u8>,
-        lists: &[Option<u64>],
-        quote_depth: u32,
-    ) {
+    fn flush(blocks: &mut Vec<MdBlock>, spans: &mut Vec<MdSpan>, state: &mut MdParseState) {
         if spans.is_empty() {
             return;
         }
         let spans = std::mem::take(spans);
-        if let Some(level) = heading {
-            blocks.push(MdBlock::Heading { level, spans });
-        } else if let Some(counter) = lists.last() {
-            blocks.push(MdBlock::ListItem {
-                depth: lists.len().saturating_sub(1),
-                marker: match counter {
-                    Some(n) => format!("{}.", n.saturating_sub(1)),
-                    None => "•".to_string(),
-                },
+        let kind = if let Some(level) = state.heading {
+            MdBlockKind::Heading { level, spans }
+        } else if let Some(counter) = state.lists.last() {
+            let first = state.item_pending_marker;
+            state.item_pending_marker = false;
+            MdBlockKind::ListItem {
+                ordered: counter.map(|n| n.saturating_sub(1)),
+                task: if first { state.task.take() } else { None },
+                continuation: !first,
                 spans,
-            });
-        } else if quote_depth > 0 {
-            blocks.push(MdBlock::Quote { spans });
+            }
         } else {
-            blocks.push(MdBlock::Paragraph { spans });
-        }
+            MdBlockKind::Paragraph { spans }
+        };
+        blocks.push(MdBlock::nested(kind, state.quote_depth, state.lists.len()));
     }
 
     for event in parser {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                heading = Some(level as u8);
+                flush(&mut blocks, &mut spans, &mut state);
+                state.heading = Some(level as u8);
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                heading = None;
+                flush(&mut blocks, &mut spans, &mut state);
+                state.heading = None;
             }
             Event::Start(Tag::List(start)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                lists.push(start);
+                flush(&mut blocks, &mut spans, &mut state);
+                state.lists.push(start);
             }
             Event::End(TagEnd::List(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                lists.pop();
+                flush(&mut blocks, &mut spans, &mut state);
+                state.lists.pop();
             }
             Event::Start(Tag::Item) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                if let Some(Some(counter)) = lists.last_mut() {
+                flush(&mut blocks, &mut spans, &mut state);
+                if let Some(Some(counter)) = state.lists.last_mut() {
                     *counter += 1;
                 }
+                state.item_pending_marker = true;
+                state.task = None;
             }
             Event::End(TagEnd::Item) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
+                // 中身が空の項目（`-` だけの行）でもマーカーは残す
+                if state.item_pending_marker {
+                    flush_empty_item(&mut blocks, &mut state);
+                }
             }
             Event::Start(Tag::BlockQuote(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                quote_depth += 1;
+                flush(&mut blocks, &mut spans, &mut state);
+                state.quote_depth += 1;
             }
             Event::End(TagEnd::BlockQuote(_)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                quote_depth = quote_depth.saturating_sub(1);
+                flush(&mut blocks, &mut spans, &mut state);
+                state.quote_depth = state.quote_depth.saturating_sub(1);
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
                 let lang = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().unwrap_or("").to_string()
-                    }
-                    CodeBlockKind::Indented => String::new(),
+                    CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .filter(|token| !token.is_empty())
+                        .map(str::to_string),
+                    CodeBlockKind::Indented => None,
                 };
                 code = Some((lang, String::new()));
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some((lang, body)) = code.take() {
                     let body = body.strip_suffix('\n').unwrap_or(&body);
-                    blocks.push(MdBlock::CodeBlock {
-                        lines: highlighter().highlight_lang(&lang, body),
-                    });
+                    let lines = highlighter().highlight_lang(lang.as_deref().unwrap_or(""), body);
+                    let kind = MdBlockKind::CodeBlock { lang, lines };
+                    // リスト項目の中のコードブロックも項目の続きとして字下げする
+                    state.item_pending_marker = false;
+                    blocks.push(MdBlock::nested(kind, state.quote_depth, state.lists.len()));
+                }
+            }
+            Event::Start(Tag::Table(alignments)) => {
+                flush(&mut blocks, &mut spans, &mut state);
+                spans.clear();
+                table = Some(MdTableBuilder::new(&alignments));
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(builder) = table.take() {
+                    state.item_pending_marker = false;
+                    blocks.push(MdBlock::nested(
+                        builder.finish(),
+                        state.quote_depth,
+                        state.lists.len(),
+                    ));
+                }
+            }
+            Event::Start(Tag::TableHead) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.in_head = true;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.end_row();
+                    builder.in_head = false;
+                }
+            }
+            Event::Start(Tag::TableRow) => {}
+            Event::End(TagEnd::TableRow) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.end_row();
+                }
+            }
+            Event::Start(Tag::TableCell) => spans.clear(),
+            Event::End(TagEnd::TableCell) => {
+                if let Some(builder) = table.as_mut() {
+                    builder.push_cell(std::mem::take(&mut spans));
                 }
             }
             Event::Start(Tag::Paragraph) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
             }
             Event::End(TagEnd::Paragraph) => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+                flush(&mut blocks, &mut spans, &mut state);
             }
             Event::Start(Tag::Strong) => bold += 1,
             Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
@@ -1213,42 +1457,271 @@ fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
             Event::Start(Tag::Strikethrough) => strike += 1,
             Event::End(TagEnd::Strikethrough) => strike = strike.saturating_sub(1),
-            Event::Start(Tag::Link { .. }) => link += 1,
-            Event::End(TagEnd::Link) => link = link.saturating_sub(1),
+            Event::Start(Tag::Link { dest_url, .. }) => link_urls.push(dest_url.to_string()),
+            Event::End(TagEnd::Link) => {
+                link_urls.pop();
+            }
             Event::Rule => {
-                flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
-                blocks.push(MdBlock::Rule);
+                flush(&mut blocks, &mut spans, &mut state);
+                blocks.push(MdBlock::new(MdBlockKind::Rule));
             }
             Event::Text(t) => {
                 if let Some((_, body)) = code.as_mut() {
                     body.push_str(&t);
                 } else {
-                    push_span(&mut spans, &t, false, bold, italic, strike, link);
+                    push_span(
+                        &mut spans,
+                        &t,
+                        false,
+                        bold,
+                        italic,
+                        strike,
+                        link_urls.last().map(String::as_str),
+                    );
                 }
             }
-            Event::Code(t) => push_span(&mut spans, &t, true, bold, italic, strike, link),
-            Event::SoftBreak | Event::HardBreak => {
-                push_span(&mut spans, " ", false, bold, italic, strike, link)
-            }
-            Event::TaskListMarker(done) => push_span(
+            Event::Code(t) => push_span(
                 &mut spans,
-                // MD ソース表記のまま描画（絵文字全廃 #217。[x] / [ ] は mono で揃う）
-                if done { "[x] " } else { "[ ] " },
+                &t,
+                true,
+                bold,
+                italic,
+                strike,
+                link_urls.last().map(String::as_str),
+            ),
+            Event::SoftBreak | Event::HardBreak => push_span(
+                &mut spans,
+                " ",
                 false,
                 bold,
                 italic,
                 strike,
-                link,
+                link_urls.last().map(String::as_str),
             ),
-            // 表・HTML 等はインラインテキストとして劣化（内容を落とさない）
-            Event::Html(t) | Event::InlineHtml(t) => {
-                push_span(&mut spans, &t, false, bold, italic, strike, link)
-            }
+            // チェックボックスは描画側が図形で描く（絵文字全廃 #217）。ここでは状態だけ持つ
+            Event::TaskListMarker(done) => state.task = Some(done),
+            // HTML 等はインラインテキストとして劣化（内容を落とさない）
+            Event::Html(t) | Event::InlineHtml(t) => push_span(
+                &mut spans,
+                &t,
+                false,
+                bold,
+                italic,
+                strike,
+                link_urls.last().map(String::as_str),
+            ),
             _ => {}
         }
     }
-    flush(&mut blocks, &mut spans, heading, &lists, quote_depth);
+    flush(&mut blocks, &mut spans, &mut state);
     blocks
+}
+
+/// 中身が空のリスト項目（`- [ ]` だけ / `-` だけ）でもマーカー行を残す
+fn flush_empty_item(blocks: &mut Vec<MdBlock>, state: &mut MdParseState) {
+    let Some(counter) = state.lists.last() else {
+        return;
+    };
+    state.item_pending_marker = false;
+    blocks.push(MdBlock::nested(
+        MdBlockKind::ListItem {
+            ordered: counter.map(|n| n.saturating_sub(1)),
+            task: state.task.take(),
+            continuation: false,
+            spans: Vec::new(),
+        },
+        state.quote_depth,
+        state.lists.len(),
+    ));
+}
+
+/// 等幅フォントでの表示幅の近似（全角 = 2、半角 = 1）。表の列幅の初期配分に使うだけなので
+/// East Asian Width の厳密判定までは要らない（Issue #656）
+pub fn md_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| {
+            let cp = c as u32;
+            let wide = matches!(cp,
+                0x1100..=0x115F      // ハングル字母
+                | 0x2E80..=0x303E    // CJK 部首・記号
+                | 0x3041..=0x33FF    // かな・注音・囲み CJK
+                | 0x3400..=0x4DBF    // CJK 拡張 A
+                | 0x4E00..=0x9FFF    // CJK 統合漢字
+                | 0xA000..=0xA4CF    // イ文字
+                | 0xAC00..=0xD7A3    // ハングル音節
+                | 0xF900..=0xFAFF    // CJK 互換漢字
+                | 0xFE30..=0xFE6F    // CJK 互換形
+                | 0xFF00..=0xFF60    // 全角形
+                | 0xFFE0..=0xFFE6
+                | 0x1F300..=0x1FAFF  // 絵文字（幅 2 で数える）
+                | 0x20000..=0x3FFFD  // CJK 拡張 B 以降
+            );
+            if wide {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// 表の列幅の比（合計 1.0）。内容の表示幅から決めるが、極端な比率にならないよう
+/// 1 列あたり 4〜30 文字相当へ丸め、さらにセルの左右パディング相当を全列へ一律に足す。
+/// パディング分を足さないと「短いが折り返せない語」（`dark` 等）の列が痩せすぎて
+/// 1 語が 2 行に割れる。狭いペインでも全列が見えるよう flex で伸縮させる前提の
+/// 初期配分なので、厳密な実測幅ではなく表示幅の近似で足りる（Issue #656）
+pub fn md_table_column_shares(header: &[MdCell], rows: &[Vec<MdCell>], columns: usize) -> Vec<f32> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let cell_width = |cell: &MdCell| -> usize {
+        cell.iter()
+            .map(|span| md_display_width(&span.text))
+            .sum::<usize>()
+    };
+    let mut widths = vec![0usize; columns];
+    for row in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
+        for (index, cell) in row.iter().enumerate().take(columns) {
+            widths[index] = widths[index].max(cell_width(cell));
+        }
+    }
+    // セル左右パディング（描画側の `base * 0.6` × 2）を文字幅へ換算した分
+    const PADDING_COLUMNS: f32 = 2.0;
+    let weighted: Vec<f32> = widths
+        .iter()
+        .map(|w| (*w).clamp(4, 30) as f32 + PADDING_COLUMNS)
+        .collect();
+    let total: f32 = weighted.iter().sum();
+    if total <= 0.0 {
+        return vec![1.0 / columns as f32; columns];
+    }
+    weighted.iter().map(|w| w / total).collect()
+}
+
+/// 箇条書きマーカーの字形（絵文字を使わず図形で描く。#217 の絵文字全廃に従う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdBullet {
+    /// 塗りの丸（第 1 階層）
+    Dot,
+    /// 中抜きの丸（第 2 階層）
+    Ring,
+    /// 塗りの四角（第 3 階層以降）
+    Square,
+}
+
+/// リストのネスト段（1 始まり）からマーカー字形を決める
+pub fn md_bullet_for_depth(list_depth: usize) -> MdBullet {
+    match list_depth {
+        0 | 1 => MdBullet::Dot,
+        2 => MdBullet::Ring,
+        _ => MdBullet::Square,
+    }
+}
+
+/// インライン列の中のリンクを「連結テキスト上のバイト範囲 + 遷移先」で返す（#680）。
+///
+/// 範囲の原点は `md_block_line_texts` が作る 1 行分のテキスト（= スパンの text を
+/// 連結したもの）で、テキスト選択・ヒットテストと同じ座標系。`**強調**` 混在で
+/// 1 リンクが複数スパンに割れるので、同じ遷移先が隣接していれば 1 本へ束ねる。
+pub fn md_link_ranges(spans: &[MdSpan]) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut offset = 0usize;
+    for span in spans {
+        let start = offset;
+        offset += span.text.len();
+        let Some(url) = span.link_url.as_deref() else {
+            continue;
+        };
+        match out.last_mut() {
+            Some((range, prev)) if prev == url && range.end == start => range.end = offset,
+            _ => out.push((start..offset, url.to_string())),
+        }
+    }
+    out
+}
+
+/// コードブロックの装飾なし論理テキスト（コピー用。行は `\n` 区切り）。
+///
+/// ハイライトのスパン分割・色を落として元のコードへ戻す。インデントと空行は
+/// そのまま残る（`md_block_line_texts` のコードブロック行と同一の文字列）
+pub fn md_code_block_text(lines: &[Line]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 表の組み立て。列数は必ずヘッダ（= 配置指定）の長さに正規化するので、
+/// 行ごとにセル数が違う壊れた表でもグリッドがずれない（Issue #656）
+struct MdTableBuilder {
+    align: Vec<MdAlign>,
+    header: Vec<MdCell>,
+    rows: Vec<Vec<MdCell>>,
+    row: Vec<MdCell>,
+    in_head: bool,
+}
+
+impl MdTableBuilder {
+    fn new(alignments: &[pulldown_cmark::Alignment]) -> Self {
+        use pulldown_cmark::Alignment;
+        Self {
+            align: alignments
+                .iter()
+                .map(|a| match a {
+                    Alignment::None => MdAlign::None,
+                    Alignment::Left => MdAlign::Left,
+                    Alignment::Center => MdAlign::Center,
+                    Alignment::Right => MdAlign::Right,
+                })
+                .collect(),
+            header: Vec::new(),
+            rows: Vec::new(),
+            row: Vec::new(),
+            in_head: false,
+        }
+    }
+
+    fn push_cell(&mut self, cell: MdCell) {
+        self.row.push(cell);
+    }
+
+    fn end_row(&mut self) {
+        let row = std::mem::take(&mut self.row);
+        if row.is_empty() {
+            return;
+        }
+        if self.in_head {
+            self.header = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+
+    fn finish(mut self) -> MdBlockKind {
+        // 未確定の行（End(TableRow) が来ない壊れた入力）も取りこぼさない
+        self.end_row();
+        let columns = self
+            .align
+            .len()
+            .max(self.header.len())
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1);
+        self.align.resize(columns, MdAlign::None);
+        let fit = |mut row: Vec<MdCell>| {
+            row.resize(columns, Vec::new());
+            row
+        };
+        MdBlockKind::Table {
+            align: self.align,
+            header: fit(self.header),
+            rows: self.rows.into_iter().map(fit).collect(),
+        }
+    }
 }
 
 /// Markdown 本文とアウトラインを 1 回のロードで完成させる（Issue #232）。
@@ -1259,7 +1732,7 @@ fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
         .iter()
         .enumerate()
         .filter_map(|(block, entry)| {
-            let MdBlock::Heading { level, spans } = entry else {
+            let MdBlockKind::Heading { level, spans } = &entry.kind else {
                 return None;
             };
             let title = spans
@@ -1278,11 +1751,19 @@ fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
     (blocks, PreviewOutline::new(items))
 }
 
-/// Markdown ブロックだけを必要とする既存のテスト・補助経路。
-#[cfg(test)]
+/// Markdown ブロックだけを必要とする経路（アウトライン不要のとき）。
+///
+/// アップデート詳細画面のリリースノート（#690）と単体テストが使う。
+/// **md のパースはこの 1 本（`pulldown-cmark`）が正**で、表示側が独自に解くことはしない。
 pub fn markdown_blocks(text: &str) -> Vec<MdBlock> {
     parse_markdown_blocks(text)
 }
+
+/// 表示品質確認用の代表 Markdown（Issue #656）。全ブロック種別・全見出しレベル・
+/// 配置指定つき表・ネスト引用・深いリスト・タスクリストを 1 本に収めてある。
+/// 単体テストと visual-test（実ピクセル検査）が同じ内容を見るため定数で共有する。
+#[cfg(any(test, feature = "visual-test"))]
+pub const MARKDOWN_SHOWCASE: &str = include_str!("../resources/fixtures/markdown-showcase.md");
 
 #[cfg(test)]
 mod tests {
@@ -1334,34 +1815,297 @@ mod tests {
         let text = "# 見出し\n\n本文 **強調** と `code`。\n\n- 項目1\n- 項目2\n\n```rust\nfn f() {}\n```\n\n---\n";
         let blocks = markdown_blocks(text);
         assert!(matches!(
-            &blocks[0],
-            MdBlock::Heading { level: 1, spans } if spans[0].text == "見出し"
+            &blocks[0].kind,
+            MdBlockKind::Heading { level: 1, spans } if spans[0].text == "見出し"
         ));
-        let MdBlock::Paragraph { spans } = &blocks[1] else {
+        let MdBlockKind::Paragraph { spans } = &blocks[1].kind else {
             panic!("段落になる: {:?}", blocks[1]);
         };
         assert!(spans.iter().any(|s| s.bold && s.text == "強調"));
         assert!(spans.iter().any(|s| s.code && s.text == "code"));
         let items: Vec<_> = blocks
             .iter()
-            .filter_map(|b| match b {
-                MdBlock::ListItem { marker, spans, .. } => {
-                    Some((marker.clone(), spans[0].text.clone()))
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { ordered, spans, .. } => {
+                    Some((*ordered, spans[0].text.clone()))
                 }
                 _ => None,
             })
             .collect();
         assert_eq!(
             items,
-            vec![
-                ("•".to_string(), "項目1".to_string()),
-                ("•".to_string(), "項目2".to_string())
-            ]
+            vec![(None, "項目1".to_string()), (None, "項目2".to_string())]
         );
         assert!(blocks
             .iter()
-            .any(|b| matches!(b, MdBlock::CodeBlock { lines } if !lines.is_empty())));
-        assert!(blocks.iter().any(|b| matches!(b, MdBlock::Rule)));
+            .any(|b| matches!(&b.kind, MdBlockKind::CodeBlock { lang, lines }
+                if lang.as_deref() == Some("rust") && !lines.is_empty())));
+        assert!(blocks.iter().any(|b| matches!(b.kind, MdBlockKind::Rule)));
+    }
+
+    /// Issue #656: GFM テーブルが表構造として保持され、配置指定も残る
+    #[test]
+    fn gfmテーブルが表構造へパースされる() {
+        let text = "| 左 | 中央 | 右 |\n|:---|:---:|---:|\n| a | `b` | **c** |\n| d |  | f |\n";
+        let blocks = markdown_blocks(text);
+        let table = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                MdBlockKind::Table {
+                    align,
+                    header,
+                    rows,
+                } => Some((align, header, rows)),
+                _ => None,
+            })
+            .expect("表ブロックになる");
+        let (align, header, rows) = table;
+        assert_eq!(align, &vec![MdAlign::Left, MdAlign::Center, MdAlign::Right]);
+        assert_eq!(header.len(), 3);
+        assert_eq!(header[1][0].text, "中央");
+        assert_eq!(rows.len(), 2);
+        // セル内のインライン装飾は保持される
+        assert!(rows[0][1].iter().any(|s| s.code && s.text == "b"));
+        assert!(rows[0][2].iter().any(|s| s.bold && s.text == "c"));
+        // 空セルは空スパン列（列数はヘッダに合わせて正規化）
+        assert_eq!(rows[1].len(), 3);
+        assert!(rows[1][1].is_empty());
+    }
+
+    /// 行ごとにセル数が違う壊れた表でも列数を正規化してグリッドを崩さない
+    #[test]
+    fn 列数が揃わない表は正規化される() {
+        let text = "| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |\n";
+        let blocks = markdown_blocks(text);
+        let MdBlockKind::Table {
+            align,
+            header,
+            rows,
+        } = &blocks
+            .iter()
+            .find(|b| matches!(b.kind, MdBlockKind::Table { .. }))
+            .expect("表ブロックになる")
+            .kind
+        else {
+            unreachable!()
+        };
+        let columns = align.len();
+        assert_eq!(header.len(), columns);
+        for row in rows {
+            assert_eq!(row.len(), columns, "全行が同じ列数へ揃う");
+        }
+    }
+
+    /// タスクリストはテキストではなく状態として持つ（描画側が図形で描く）
+    #[test]
+    fn タスクリストは完了状態を持つ() {
+        let blocks = markdown_blocks("- [x] done\n- [ ] todo\n- plain\n");
+        let tasks: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { task, spans, .. } => {
+                    Some((*task, spans[0].text.trim().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tasks,
+            vec![
+                (Some(true), "done".to_string()),
+                (Some(false), "todo".to_string()),
+                (None, "plain".to_string()),
+            ]
+        );
+        // 旧実装は "[x] " をテキストへ混ぜていた。混ざっていないことを固定する
+        assert!(blocks.iter().all(|b| match &b.kind {
+            MdBlockKind::ListItem { spans, .. } => !spans.iter().any(|s| s.text.contains("[x]")),
+            _ => true,
+        }));
+    }
+
+    /// 引用のネストと、引用の中のリスト・コードブロックが引用深さを持つ
+    #[test]
+    fn 引用の深さが各ブロックに載る() {
+        let blocks = markdown_blocks("> 外側\n>\n> > 内側\n>\n> - 引用内リスト\n\n平文\n");
+        let depths: Vec<_> = blocks
+            .iter()
+            .map(|b| {
+                (
+                    b.quote_depth,
+                    match &b.kind {
+                        MdBlockKind::Paragraph { spans } => spans[0].text.clone(),
+                        MdBlockKind::ListItem { spans, .. } => spans[0].text.clone(),
+                        other => format!("{other:?}"),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(depths[0], (1, "外側".to_string()));
+        assert_eq!(depths[1], (2, "内側".to_string()));
+        assert_eq!(depths[2], (1, "引用内リスト".to_string()));
+        assert_eq!(depths[3], (0, "平文".to_string()));
+    }
+
+    /// リスト項目の 2 つ目以降のブロックはマーカーを重複させない
+    #[test]
+    fn リスト項目内の継続ブロックはマーカーを出さない() {
+        let blocks = markdown_blocks("- 一段落目\n\n  二段落目\n\n  ```sh\n  ls\n  ```\n");
+        let items: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem {
+                    continuation,
+                    spans,
+                    ..
+                } => Some((*continuation, spans[0].text.clone(), b.list_depth)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items[0], (false, "一段落目".to_string(), 1));
+        assert_eq!(items[1], (true, "二段落目".to_string(), 1));
+        // 項目内のコードブロックもリスト段を持ち、字下げが揃う
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(&b.kind, MdBlockKind::CodeBlock { .. }) && b.list_depth == 1));
+    }
+
+    #[test]
+    fn md_display_widthは全角を2で数える() {
+        assert_eq!(md_display_width("dark"), 4);
+        assert_eq!(md_display_width("既定値"), 6);
+        assert_eq!(md_display_width("UI テーマ"), 3 + 6);
+        // 記号・アクセント付きラテンは半角扱い
+        assert_eq!(md_display_width("café"), 4);
+        assert_eq!(md_display_width(""), 0);
+    }
+
+    /// Issue #656: 短くて折り返せない列（`dark`）が痩せて 1 語 2 行に割れないこと。
+    /// パディング相当を足さない旧実装ではこの列の取り分が足りなかった
+    #[test]
+    fn md_table_column_sharesは短い列にも取り分を残す() {
+        let cell = |text: &str| -> MdCell {
+            vec![MdSpan {
+                text: text.to_string(),
+                ..MdSpan::default()
+            }]
+        };
+        let header = vec![cell("コマンド"), cell("既定値"), cell("説明")];
+        let rows = vec![
+            vec![
+                cell("tako autosuggest"),
+                cell("dark"),
+                cell("UI テーマの切替。引数なしで現在値"),
+            ],
+            vec![cell("tako lang"), cell("auto"), cell("表示言語")],
+        ];
+        let shares = md_table_column_shares(&header, &rows, 3);
+        assert_eq!(shares.len(), 3);
+        assert!((shares.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        // 450px 相当の表幅で「dark」(4 文字 ≒ 34px) + パディング 16px が入ること
+        let table_width = 450.0;
+        let value_column = shares[1] * table_width;
+        assert!(
+            value_column >= 50.0,
+            "既定値の列が痩せすぎ: {value_column:.1}px"
+        );
+        // 一番広い列が全体を占有しない（他列が読める幅を保つ）
+        assert!(shares[2] < 0.7, "説明の列が占有しすぎ: {}", shares[2]);
+        // 列数だけ渡して中身が空でも均等割りで返る
+        let empty = md_table_column_shares(&[], &[], 3);
+        assert_eq!(empty.len(), 3);
+        assert!((empty[0] - 1.0 / 3.0).abs() < 1e-5);
+        assert!(md_table_column_shares(&[], &[], 0).is_empty());
+    }
+
+    #[test]
+    fn md_bullet_for_depthは階層で字形を変える() {
+        assert_eq!(md_bullet_for_depth(1), MdBullet::Dot);
+        assert_eq!(md_bullet_for_depth(2), MdBullet::Ring);
+        assert_eq!(md_bullet_for_depth(3), MdBullet::Square);
+        assert_eq!(md_bullet_for_depth(9), MdBullet::Square);
+    }
+
+    /// 言語指定なしフェンスは lang=None（描画側が等幅の素表示にする）
+    #[test]
+    fn 言語指定なしコードフェンス() {
+        let blocks = markdown_blocks("```\nplain text\n```\n");
+        assert!(blocks.iter().any(|b| matches!(
+            &b.kind,
+            MdBlockKind::CodeBlock { lang: None, lines } if !lines.is_empty()
+        )));
+    }
+
+    /// 代表 md（フィクスチャ）に全要素が含まれ、全部パースできること
+    #[test]
+    fn 代表フィクスチャに全ブロック種別が含まれる() {
+        let blocks = markdown_blocks(MARKDOWN_SHOWCASE);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut heading_levels = std::collections::BTreeSet::new();
+        for block in &blocks {
+            seen.insert(match &block.kind {
+                MdBlockKind::Heading { level, .. } => {
+                    heading_levels.insert(*level);
+                    "heading"
+                }
+                MdBlockKind::Paragraph { .. } => "paragraph",
+                MdBlockKind::ListItem { .. } => "list",
+                MdBlockKind::CodeBlock { .. } => "code",
+                MdBlockKind::Table { .. } => "table",
+                MdBlockKind::Rule => "rule",
+            });
+        }
+        for kind in ["heading", "paragraph", "list", "code", "table", "rule"] {
+            assert!(seen.contains(kind), "{kind} がフィクスチャに無い");
+        }
+        assert_eq!(
+            heading_levels,
+            (1u8..=6).collect(),
+            "H1〜H6 すべてがフィクスチャに要る"
+        );
+        // 引用・タスク・言語なしフェンス・配置指定つき表も揃っていること
+        assert!(blocks.iter().any(|b| b.quote_depth >= 2), "ネスト引用");
+        assert!(blocks.iter().any(|b| b.list_depth >= 3), "深いネストリスト");
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(&b.kind, MdBlockKind::ListItem { task: Some(_), .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(&b.kind, MdBlockKind::CodeBlock { lang: None, .. })));
+        assert!(blocks.iter().any(|b| matches!(
+            &b.kind,
+            MdBlockKind::Table { align, .. }
+                if align.contains(&MdAlign::Center) && align.contains(&MdAlign::Right)
+        )));
+        // #680: ⌘+クリックの検証に必要な「開けるリンク」と「開けないリンク」が両方要る
+        let urls: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| match &b.kind {
+                MdBlockKind::Heading { spans, .. }
+                | MdBlockKind::Paragraph { spans }
+                | MdBlockKind::ListItem { spans, .. } => md_link_ranges(spans),
+                MdBlockKind::Table { header, rows, .. } => std::iter::once(header)
+                    .chain(rows.iter())
+                    .flat_map(|row| row.iter())
+                    .flat_map(|cell| md_link_ranges(cell))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .map(|(_, url)| url)
+            .collect();
+        assert!(
+            urls.iter()
+                .filter(|u| tako_core::md_links::browser_url(u).is_some())
+                .count()
+                >= 2,
+            "開ける http(s) リンクが 2 本以上要る: {urls:?}"
+        );
+        for expected in ["#", "./", "javascript:"] {
+            assert!(
+                urls.iter().any(|u| u.starts_with(expected)),
+                "開けないリンク（{expected}）がフィクスチャに無い: {urls:?}"
+            );
+        }
     }
 
     #[test]
@@ -1392,23 +2136,35 @@ mod tests {
         let blocks = markdown_blocks("1. one\n2. two\n   - sub\n");
         let items: Vec<_> = blocks
             .iter()
-            .filter_map(|b| match b {
-                MdBlock::ListItem {
-                    depth,
-                    marker,
-                    spans,
-                } => Some((*depth, marker.clone(), spans[0].text.clone())),
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { ordered, spans, .. } => {
+                    Some((b.list_depth, *ordered, spans[0].text.clone()))
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(
             items,
             vec![
-                (0, "1.".to_string(), "one".to_string()),
-                (0, "2.".to_string(), "two".to_string()),
-                (1, "•".to_string(), "sub".to_string()),
+                (1, Some(1), "one".to_string()),
+                (1, Some(2), "two".to_string()),
+                (2, None, "sub".to_string()),
             ]
         );
+    }
+
+    /// 開始番号を指定した番号付きリスト（`5.` から始まる）でも表示番号が続く
+    #[test]
+    fn 番号付きリストの開始番号を尊重する() {
+        let blocks = markdown_blocks("5. five\n6. six\n");
+        let numbers: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                MdBlockKind::ListItem { ordered, .. } => *ordered,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![5, 6]);
     }
 
     #[test]
@@ -1439,7 +2195,7 @@ mod tests {
         assert!(matches!(
             &loaded.state.content,
             PreviewContent::Markdown(blocks)
-                if matches!(&blocks[0], MdBlock::Heading { spans, .. }
+                if matches!(&blocks[0].kind, MdBlockKind::Heading { spans, .. }
                     if spans[0].text == "変更後")
         ));
         assert_eq!(
@@ -2103,5 +2859,413 @@ mod syntax_resolution_tests {
         let path = std::path::Path::new("script");
         let syn = hl.syntax_for_path(path, "#!/bin/bash\necho hello");
         assert_ne!(syn.name, "Plain Text", "shebang で構文が特定される");
+    }
+
+    /// #815 で構文セットの寿命に手を入れたので、#320 の対応言語が縮退していないことを
+    /// **登録済み拡張子の全数**で押さえる（軽い既定セットへ落とす案を採ると必ず落ちる）
+    #[test]
+    fn 登録済み拡張子は全数が構文へ解決する() {
+        let hl = SyntectHighlighter::new();
+        let mut checked = 0usize;
+        let mut missing: Vec<String> = Vec::new();
+        for syntax in hl.syntaxes.syntaxes() {
+            for ext in &syntax.file_extensions {
+                checked += 1;
+                if hl.syntaxes.find_syntax_by_extension(ext).is_none() {
+                    missing.push(ext.clone());
+                }
+            }
+        }
+        assert!(missing.is_empty(), "解決できない拡張子: {missing:?}");
+        // two-face（bat 由来）の規模。syntect 同梱の既定セットは 75 構文 / 拡張子も
+        // 半分以下なので、セットを差し替えたらこの下限で気づける
+        assert!(
+            hl.syntaxes.syntaxes().len() >= 200,
+            "構文数が縮退している: {}",
+            hl.syntaxes.syntaxes().len()
+        );
+        assert!(checked >= 550, "拡張子の登録数が縮退している: {checked}");
+    }
+}
+
+/// Issue #815: 構文セットの寿命（使っている間だけ載せ、使い終われば手放す）。
+///
+/// グローバルは並列テストで他のテストと衝突するため、判定はローカルの
+/// [`SyntaxCache`] に対して行う（同じ実装をグローバルが薄く包んでいる）。
+#[cfg(test)]
+mod syntax_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn 解放判定はプレビューの有無と猶予で決まる() {
+        // プレビューが 1 枚も無ければ猶予を待たない
+        assert!(syntax_release_due(Duration::ZERO, false));
+        // 開いている間は猶予まで保持する（編集の連続打鍵で毎回ロードし直さない）
+        assert!(!syntax_release_due(Duration::ZERO, true));
+        assert!(!syntax_release_due(
+            SYNTAX_IDLE_GRACE - Duration::from_millis(1),
+            true
+        ));
+        assert!(syntax_release_due(SYNTAX_IDLE_GRACE, true));
+    }
+
+    #[test]
+    fn 借用中は保持を手放しても解放されない() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        let lease = cache.acquire(now);
+        assert!(cache.resident(), "借りた直後は載っている");
+
+        // プレビュー 0 枚 = 即時解放の条件でも、借用が生きている間は解放されない
+        assert!(cache.release_idle(now, false), "保持は手放す");
+        assert!(
+            cache.resident(),
+            "借用チケットが生きている間は構文セットが残る（background ハイライトの足元）"
+        );
+
+        // ハイライトは借用中ずっと成立する
+        let lines = lease.highlight(Path::new("a.rs"), "fn main() {}\n");
+        assert_eq!(lines.len(), 1);
+
+        drop(lease);
+        assert!(!cache.resident(), "最後の借用が落ちた時点で解放される");
+    }
+
+    #[test]
+    fn 猶予内は載せたまま_猶予を過ぎたら手放す() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        drop(cache.acquire(now));
+        assert!(cache.resident());
+
+        // プレビューを開いたまま・猶予内 = 保持（再ハイライトが速い）
+        assert!(!cache.release_idle(now + Duration::from_secs(1), true));
+        assert!(cache.resident());
+
+        // 猶予を過ぎたら開いたままでも手放す（借用は無いので即解放）
+        assert!(cache.release_idle(now + SYNTAX_IDLE_GRACE, true));
+        assert!(!cache.resident());
+        // 2 回目は「もう手放している」ので false（tick が毎回仕事をしない）
+        assert!(!cache.release_idle(now + SYNTAX_IDLE_GRACE, true));
+    }
+
+    #[test]
+    fn 解放後に借り直しても同じ色が出る() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        let sample = "fn main() {\n    let x = 1; // コメント\n}\n";
+
+        let before = cache.acquire(now).highlight(Path::new("sample.rs"), sample);
+        assert!(cache.release_idle(now, false));
+        assert!(!cache.resident(), "解放されている");
+
+        let after = cache.acquire(now).highlight(Path::new("sample.rs"), sample);
+        assert!(cache.resident(), "借り直しでロードし直される");
+        assert_eq!(before, after, "再ロード後も色・区切りが一致する");
+        // 色が実際に付いていること（両方とも素のテキストでは検査にならない）
+        assert!(
+            before.iter().flatten().any(|s| s.color.is_some()),
+            "ハイライトの色が付いている"
+        );
+    }
+
+    #[test]
+    fn 借用が重なっても構文セットは1つ() {
+        let mut cache = SyntaxCache::new();
+        let now = Instant::now();
+        let a = cache.acquire(now);
+        let b = cache.acquire(now);
+        assert!(
+            Arc::ptr_eq(&a.0, &b.0),
+            "同時に借りたチケットは同じ構文セットを指す（二重ロードしない）"
+        );
+        drop(a);
+        assert!(cache.resident(), "1 枚残っていれば載ったまま");
+        drop(b);
+        assert!(cache.release_idle(now, false));
+        assert!(!cache.resident());
+    }
+
+    #[test]
+    fn グローバル経路も借用と解放が成立する() {
+        // グローバルは他のテストと共有なので、「借りたら載る」だけを見る
+        // （解放の判定はローカル cache 側のテストが担う）
+        let lease = highlighter();
+        assert!(syntax_resident(), "借りている間は載っている");
+        let lines = lease.highlight(Path::new("g.rs"), "fn main() {}\n");
+        assert_eq!(lines.len(), 1);
+    }
+}
+
+/// Issue #669: コードプレビューの構文色がライトテーマの面で読めること。
+///
+/// サンプル値ではなく**実ハイライタの出力を全走査**して検証する（構文セットや
+/// syntect の既定テーマが変わっても穴が空かないように）。
+#[cfg(test)]
+mod light_theme_contrast_tests {
+    use super::*;
+    use tako_core::theme::{Theme, ThemeMode};
+
+    const RUST_SAMPLE: &str = r#"use std::collections::HashMap;
+
+/// ドキュメントコメント
+pub fn main() -> Result<(), String> {
+    let mut map: HashMap<&str, u32> = HashMap::new();
+    map.insert("answer", 42);
+    if let Some(v) = map.get("answer") {
+        println!("{v} {:?}", 3.14_f32);
+    }
+    Ok(())
+}
+"#;
+
+    const PYTHON_SAMPLE: &str = r#"import os
+from typing import Optional
+
+# コメント
+class Greeter:
+    """docstring"""
+
+    def __init__(self, name: str = "world") -> None:
+        self.name = name
+
+    def greet(self) -> Optional[str]:
+        return f"hello {self.name}" if os.environ.get("OK") else None
+"#;
+
+    const CPP_SAMPLE: &str = r#"#include <string>
+#include <vector>
+
+// コメント
+namespace demo {
+template <typename T>
+class Box {
+ public:
+  explicit Box(T value) : value_(std::move(value)) {}
+  const T& get() const noexcept { return value_; }
+
+ private:
+  T value_;
+};
+}  // namespace demo
+"#;
+
+    /// ハイライト結果に現れる構文色をすべて集める
+    fn syntax_colors(filename: &str, text: &str) -> Vec<tako_core::Rgb> {
+        let hl = SyntectHighlighter::new();
+        let mut colors: Vec<tako_core::Rgb> = hl
+            .highlight(Path::new(filename), text)
+            .iter()
+            .flat_map(|line| line.iter())
+            .filter_map(|span| span.color)
+            .collect();
+        colors.sort_by_key(|c| (c.r, c.g, c.b));
+        colors.dedup();
+        colors
+    }
+
+    const SAMPLES: [(&str, &str); 3] = [
+        ("sample.rs", RUST_SAMPLE),
+        ("sample.py", PYTHON_SAMPLE),
+        ("sample.cpp", CPP_SAMPLE),
+    ];
+
+    /// 受け入れ条件 1: ライトの実描画面（コードプレビュー本体 = `background`、
+    /// Markdown のコードブロック = `mantle`）に対して全構文色が 4.5:1 以上
+    #[test]
+    fn 代表言語の構文色がライトの実描画面で読める明度になる() {
+        let light = Theme::for_mode(ThemeMode::Light);
+        for (name, text) in SAMPLES {
+            let colors = syntax_colors(name, text);
+            assert!(colors.len() > 1, "{name} に複数の構文色が付く");
+            for (surface_name, surface) in
+                [("background", light.background), ("mantle", light.mantle)]
+            {
+                for raw in &colors {
+                    let after = light.adapt_syntax_color(*raw).contrast_ratio(surface);
+                    assert!(
+                        after >= 4.5,
+                        "{name} の {} が {surface_name} で AA 未達: 変換前 {:.2}:1 → 変換後 {after:.2}:1",
+                        raw.to_hex(),
+                        raw.contrast_ratio(surface)
+                    );
+                }
+            }
+        }
+    }
+
+    /// 受け入れ条件 2: ダークテーマの色は 1 ビットも変わらない
+    #[test]
+    fn ダークテーマの構文色は変換されない() {
+        let dark = Theme::for_mode(ThemeMode::Dark);
+        for (name, text) in SAMPLES {
+            for raw in syntax_colors(name, text) {
+                assert_eq!(
+                    dark.adapt_syntax_color(raw),
+                    raw,
+                    "{name} の {} がダークで変換された",
+                    raw.to_hex()
+                );
+            }
+        }
+    }
+
+    /// エッジ: 構文情報が無い入力（プレーンテキスト / 不明拡張子 / 空ファイル）でも
+    /// 変換が破綻せず、色が付くならライトで読めること
+    #[test]
+    fn 構文情報のない入力でも破綻しない() {
+        let light = Theme::for_mode(ThemeMode::Light);
+        for (name, text) in [
+            ("notes.txt", "ただの平文\nsecond line\n"),
+            ("data.unknownext", "no syntax for this\n"),
+            ("empty.rs", ""),
+            ("empty.txt", ""),
+        ] {
+            let lines = SyntectHighlighter::new().highlight(Path::new(name), text);
+            // 空ファイルは 0 行、平文は行数どおり（表示が欠けない）
+            assert_eq!(lines.len(), text.lines().count(), "{name} の行数");
+            for raw in syntax_colors(name, text) {
+                let after = light
+                    .adapt_syntax_color(raw)
+                    .contrast_ratio(light.background);
+                assert!(
+                    after >= 4.5,
+                    "{name} の {} が AA 未達: {after:.2}:1",
+                    raw.to_hex()
+                );
+            }
+        }
+    }
+    // --- #680: リンクの遷移先保持とコードブロックのコピー本文 ---
+
+    /// パースしたブロック列から (行内テキスト, リンク範囲) を取り出す小道具
+    fn spans_of(md: &str) -> Vec<MdSpan> {
+        let blocks = markdown_blocks(md);
+        blocks
+            .into_iter()
+            .flat_map(|b| match b.kind {
+                MdBlockKind::Heading { spans, .. }
+                | MdBlockKind::Paragraph { spans }
+                | MdBlockKind::ListItem { spans, .. } => spans,
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn リンクは遷移先を保持する() {
+        let spans = spans_of("見て [tako](https://github.com/takushio2525/tako) ね\n");
+        let link: Vec<_> = spans.iter().filter(|s| s.is_link()).collect();
+        assert_eq!(link.len(), 1, "リンクスパンは 1 つ");
+        assert_eq!(link[0].text, "tako");
+        assert_eq!(
+            link[0].link_url.as_deref(),
+            Some("https://github.com/takushio2525/tako")
+        );
+        // リンク外のスパンには遷移先が漏れない
+        assert!(spans
+            .iter()
+            .filter(|s| !s.is_link())
+            .all(|s| s.link_url.is_none()));
+    }
+
+    #[test]
+    fn リンク範囲は連結テキスト上のバイト範囲になる() {
+        let spans = spans_of("あ [tako](https://example.com) い\n");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let ranges = md_link_ranges(&spans);
+        assert_eq!(ranges.len(), 1);
+        let (range, url) = &ranges[0];
+        assert_eq!(url, "https://example.com");
+        // 日本語混在でもバイト範囲がリンク文字列そのものを指す
+        assert_eq!(&text[range.clone()], "tako");
+    }
+
+    #[test]
+    fn リンク内の装飾は一本の範囲へ束ねる() {
+        let spans = spans_of("[**太字**と普通](https://example.com)\n");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        // 装飾で 2 スパンに割れている前提を明示（束ねの意味がある入力か）
+        assert!(spans.iter().filter(|s| s.is_link()).count() >= 2);
+        let ranges = md_link_ranges(&spans);
+        assert_eq!(ranges.len(), 1, "同じ遷移先の隣接スパンは 1 本になる");
+        assert_eq!(&text[ranges[0].0.clone()], "太字と普通");
+    }
+
+    #[test]
+    fn 隣接する別リンクは別範囲になる() {
+        let spans = spans_of("[a](https://a.example)[b](https://b.example)\n");
+        let ranges = md_link_ranges(&spans);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].1, "https://a.example");
+        assert_eq!(ranges[1].1, "https://b.example");
+        assert_eq!(
+            ranges[0].0.end, ranges[1].0.start,
+            "範囲は隣接して重ならない"
+        );
+    }
+
+    #[test]
+    fn 相対パスやアンカーも遷移先として保持する() {
+        // 保持はする（一覧に出す）。開くかどうかは md_links::browser_url が決める
+        let spans = spans_of("[章へ](#section) [ファイル](./doc/readme.md)\n");
+        let urls: Vec<_> = spans.iter().filter_map(|s| s.link_url.as_deref()).collect();
+        assert_eq!(urls, vec!["#section", "./doc/readme.md"]);
+        assert!(urls
+            .iter()
+            .all(|u| tako_core::md_links::browser_url(u).is_none()));
+    }
+
+    #[test]
+    fn リンクの無い文書では範囲が空() {
+        let spans = spans_of("ただの段落 `code` **強調**\n");
+        assert!(md_link_ranges(&spans).is_empty());
+    }
+
+    #[test]
+    fn コードブロックのコピー本文は空行とインデントを保つ() {
+        let md = "```python\ndef f():\n    return 1\n\n\nprint(f())\n```\n";
+        let blocks = markdown_blocks(md);
+        let MdBlockKind::CodeBlock { lines, .. } = &blocks[0].kind else {
+            panic!("コードブロックがある: {blocks:?}");
+        };
+        assert_eq!(
+            md_code_block_text(lines),
+            "def f():\n    return 1\n\n\nprint(f())"
+        );
+    }
+
+    #[test]
+    fn 空のコードブロックのコピー本文は空文字列() {
+        let blocks = markdown_blocks("```\n```\n");
+        let MdBlockKind::CodeBlock { lines, .. } = &blocks[0].kind else {
+            panic!("コードブロックがある: {blocks:?}");
+        };
+        assert_eq!(md_code_block_text(lines), "");
+    }
+
+    #[test]
+    fn コードブロック内のリンク風文字列はリンクにならない() {
+        // ``` の中は素のテキスト = ⌘+クリックの対象にしない（コピー対象のみ）
+        let blocks = markdown_blocks("```\nsee [x](https://example.com)\n```\n");
+        let MdBlockKind::CodeBlock { lines, .. } = &blocks[0].kind else {
+            panic!("コードブロックがある");
+        };
+        assert_eq!(md_code_block_text(lines), "see [x](https://example.com)");
+    }
+
+    #[test]
+    fn 表セル内のリンクも範囲が取れる() {
+        let md = "| 名前 | 先 |\n| --- | --- |\n| tako | [repo](https://example.com/r) |\n";
+        let blocks = markdown_blocks(md);
+        let MdBlockKind::Table { rows, .. } = &blocks[0].kind else {
+            panic!("表がある: {blocks:?}");
+        };
+        let cell = &rows[0][1];
+        let ranges = md_link_ranges(cell);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].1, "https://example.com/r");
+        let text: String = cell.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(&text[ranges[0].0.clone()], "repo");
     }
 }

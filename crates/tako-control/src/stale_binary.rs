@@ -4,7 +4,6 @@
 //! libproc `proc_pidpath` で取得、`~/.local/bin/claude` の現在の解決先と突き合わせる。
 //! 差異があれば stale と判定し、UI バナー + CLI/MCP で通知・張り直しを提供する。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -70,22 +69,71 @@ pub fn resolve_current_claude_binary() -> Option<PathBuf> {
 
 /// `claude` コマンドの symlink 先を実パスまで解決する
 fn resolve_claude_symlink() -> Option<PathBuf> {
-    // which claude → symlink 解決
+    // canonicalize で symlink チェーンを完全解決
+    std::fs::canonicalize(launcher_path()?).ok()
+}
+
+/// PATH 上の `claude` ランチャ（symlink は解決しない）を探す。
+///
+/// #772: 旧実装は `which claude` のサブプロセスだった。指紋取り（後述の
+/// `current_binary_fingerprint`）は 2 秒ごとに走るので、ここでプロセスを起こすと
+/// それだけで恒常的なコストになる。PATH の走査は stat だけで済むので自前で行い、
+/// 取りこぼし（PATH の解釈差）に備えて `which` を保険に残す
+pub fn launcher_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join(CLAUDE_BIN);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    which_claude()
+}
+
+#[cfg(windows)]
+const CLAUDE_BIN: &str = "claude.exe";
+#[cfg(not(windows))]
+const CLAUDE_BIN: &str = "claude";
+
+/// 実行可能な通常ファイルか（symlink は追う = `which` と同じ判定）
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// PATH 走査で見つからなかったときの保険（サブプロセス）
+fn which_claude() -> Option<PathBuf> {
     // #628: GUI プロセスから到達するのでコンソールウィンドウを出させない
     let which_out = tako_core::platform::process::no_console_window(
         std::process::Command::new("which").arg("claude"),
     )
     .output()
-    .ok()
-    .filter(|o| o.status.success())?;
+        .ok()
+        .filter(|o| o.status.success())?;
     let raw = String::from_utf8_lossy(&which_out.stdout)
         .trim()
         .to_string();
     if raw.is_empty() {
         return None;
     }
-    // canonicalize で symlink チェーンを完全解決
-    std::fs::canonicalize(&raw).ok()
+    Some(PathBuf::from(raw))
 }
 
 /// バイナリパスからバージョンを推定する。
@@ -183,48 +231,211 @@ pub fn check_stale(info: &PaneClaudeInfo) -> StaleStatus {
 /// パスを実行しているプロセスを返す。`claude agents --json` に依存しないため
 /// 隔離環境でも動く
 pub fn find_claude_pid_for_backend(backend_session: &str) -> Option<u32> {
-    let socket = tako_core::tmux_backend::socket_name();
-    let panes = crate::agents::tmux_pane_pids(Some(&socket));
-    let target_pids: Vec<u32> = panes
+    let snapshot = crate::agents::ProcessSnapshot::capture();
+    find_claude_pid(&snapshot, backend_session)
+}
+
+/// 共有スナップショットから backend session 配下の claude PID を探す。
+fn find_claude_pid(
+    snapshot: &crate::agents::ProcessSnapshot,
+    backend_session: &str,
+) -> Option<u32> {
+    snapshot
+        .descendant_pids(backend_session)
         .into_iter()
-        .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
-        .map(|(_, pid)| pid)
-        .collect();
-    if target_pids.is_empty() {
-        return None;
+        .find(|&pid| pidpath(pid).is_some_and(|path| path.to_string_lossy().contains("claude")))
+}
+
+// ===== 定期走査（#772: メインスレッド専有 400ms/tick の根治） =====
+//
+// 旧実装は 2 秒ごとの `periodic_prep` の中で、master / worker ペインごとに
+// tmux と ps を起動していた（UI スレッド専有 392〜466ms を実測）。
+// 新実装は
+//   1. 呼び出し側（UI スレッド）は対象ペインの一覧を作るだけ（メモリ操作のみ）
+//   2. background で **stat だけの指紋**を取り、前回と変わっていなければ何もしない
+//   3. 変化したとき（claude の入れ替え・対象ペインの増減・起動直後）と、
+//      取りこぼし回収のための低頻度（60 秒）だけ tmux + ps を 1 回ずつ実行する
+// という 3 段構えにしてある。
+
+/// 走査対象のペイン 1 つぶん
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleScanTarget {
+    /// 呼び出し側のペイン識別子（そのまま結果へ返す）
+    pub key: u64,
+    /// ペインのバックエンド tmux セッション名
+    pub backend_session: String,
+}
+
+/// 走査結果のペイン 1 つぶん
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleScanResult {
+    /// 対応する `StaleScanTarget::key`
+    pub key: u64,
+    /// ペイン内で動いている claude の実パス（見つからなければ None）
+    pub running_binary: Option<PathBuf>,
+}
+
+/// claude バイナリの変化を検出するための指紋。サブプロセスを起こさず
+/// PATH 走査 + `canonicalize` + `metadata` の stat だけで作る
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryFingerprint {
+    /// symlink を解決した実バイナリのパス（版が変われば通常はここが変わる）
+    pub binary: PathBuf,
+    /// 実バイナリの更新時刻（同じパスのまま中身が差し替わる場合の保険）
+    pub mtime: Option<std::time::SystemTime>,
+    /// 実バイナリのサイズ（同上）
+    pub len: u64,
+}
+
+/// 現在の claude バイナリの指紋を取る。サブプロセスを起こさない（stat のみ）
+pub fn current_binary_fingerprint() -> Option<BinaryFingerprint> {
+    fingerprint_of(&launcher_path()?)
+}
+
+/// 指定したランチャの指紋を取る（テストで偽 claude を差し込むための入口）
+pub fn fingerprint_of(launcher: &Path) -> Option<BinaryFingerprint> {
+    let binary = std::fs::canonicalize(launcher).ok()?;
+    let meta = std::fs::metadata(&binary).ok();
+    Some(BinaryFingerprint {
+        mtime: meta.as_ref().and_then(|m| m.modified().ok()),
+        len: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+        binary,
+    })
+}
+
+/// 前回の走査結果（呼び出し側が保持し、`poll` のたびに受け渡す）
+#[derive(Debug, Clone, Default)]
+pub struct ScanState {
+    /// 最後に重い走査を回したときのバイナリ指紋
+    pub fingerprint: Option<BinaryFingerprint>,
+    /// 最後に重い走査を回したときの対象ペイン集合
+    pub targets: Vec<StaleScanTarget>,
+    /// 最後に重い走査を回した時刻（None = まだ 1 度も走らせていない）
+    pub scanned_at: Option<std::time::Instant>,
+}
+
+/// 取りこぼし回収のための低頻度な再走査間隔。
+/// 「バナーを閉じた」「ペイン内で claude を手動で入れ直した」等、指紋にも
+/// 対象集合にも表れない変化をこの間隔で拾う（旧実装の 2 秒 → 60 秒 = 1/30）
+pub const RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 重い走査（tmux + ps）を回すべきかの判定。純関数なので単体テストで固定できる
+pub fn should_rescan(
+    prev: &ScanState,
+    fingerprint: Option<&BinaryFingerprint>,
+    targets: &[StaleScanTarget],
+    now: std::time::Instant,
+) -> bool {
+    // 起動直後の初回（tako 再起動でつないだ既存セッションが stale なことがある）
+    let Some(scanned_at) = prev.scanned_at else {
+        return true;
+    };
+    // claude が入れ替わった
+    if prev.fingerprint.as_ref() != fingerprint {
+        return true;
+    }
+    // 対象ペインが増減した
+    if prev.targets != targets {
+        return true;
+    }
+    // 低頻度の取りこぼし回収
+    now.duration_since(scanned_at) >= RESCAN_INTERVAL
+}
+
+/// `poll` の結果
+#[derive(Debug, Clone)]
+pub enum ScanOutcome {
+    /// 指紋・対象とも変化なしで再走査の時期でもない = tmux も ps も起動していない
+    Skipped,
+    /// 重い走査を回した
+    Scanned {
+        /// 呼び出し側が次回に渡し直す状態
+        state: ScanState,
+        /// 現在の claude 実バイナリ（解決できなければ None）
+        current_binary: Option<PathBuf>,
+        /// 現在の claude のバージョン表記
+        current_version: String,
+        /// ペインごとの実行中バイナリ
+        results: Vec<StaleScanResult>,
+    },
+}
+
+/// stale 検知の定期走査本体。**background executor から呼ぶこと**
+/// （変化時は tmux / ps を起動する）
+pub fn poll(targets: Vec<StaleScanTarget>, prev: &ScanState) -> ScanOutcome {
+    poll_with_snapshot(targets, prev, None)
+}
+
+/// sleep guard と同じ tick の `ProcessSnapshot` を共有して走査する。
+/// snapshot が無く、かつ stale 側の再走査が必要なら内部で 1 回だけ採取する。
+pub fn poll_with_snapshot(
+    targets: Vec<StaleScanTarget>,
+    prev: &ScanState,
+    snapshot: Option<&crate::agents::ProcessSnapshot>,
+) -> ScanOutcome {
+    poll_with_launcher_and_snapshot(targets, prev, launcher_path(), snapshot)
+}
+
+/// ランチャを明示して走査する（セルフテストが偽 claude を差し込むための入口。
+/// 環境変数を書き換えずに済ませたい = background で PATH を読んでいる最中に
+/// `set_var` する競合を作らない）
+pub fn poll_with_launcher(
+    targets: Vec<StaleScanTarget>,
+    prev: &ScanState,
+    launcher: Option<PathBuf>,
+) -> ScanOutcome {
+    poll_with_launcher_and_snapshot(targets, prev, launcher, None)
+}
+
+fn poll_with_launcher_and_snapshot(
+    targets: Vec<StaleScanTarget>,
+    prev: &ScanState,
+    launcher: Option<PathBuf>,
+    snapshot: Option<&crate::agents::ProcessSnapshot>,
+) -> ScanOutcome {
+    let fingerprint = launcher.as_deref().and_then(fingerprint_of);
+    let now = std::time::Instant::now();
+    if !should_rescan(prev, fingerprint.as_ref(), &targets, now) {
+        return ScanOutcome::Skipped;
     }
 
-    // 全プロセスの親子マップから、ペイン PID の子孫で claude を実行しているものを探す
-    let parents = crate::agents::process_parent_map();
-    // 逆引き: pid → 子の集合
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (&child, &parent) in &parents {
-        children.entry(parent).or_default().push(child);
-    }
+    let current_binary = fingerprint.as_ref().map(|f| f.binary.clone());
+    let current_version = current_binary
+        .as_deref()
+        .map(extract_version_from_path)
+        .unwrap_or_default();
 
-    // ペイン PID から BFS で子孫を辿り、pidpath が claude を含むものを探す
-    for &pane_pid in &target_pids {
-        let mut queue = vec![pane_pid];
-        let mut visited = std::collections::HashSet::new();
-        while let Some(pid) = queue.pop() {
-            if !visited.insert(pid) {
-                continue;
+    // 対象が空でも状態は進める（次の tick で無駄に走らせない）
+    let results = if targets.is_empty() || current_binary.is_none() {
+        Vec::new()
+    } else {
+        let captured;
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = crate::agents::ProcessSnapshot::capture();
+                &captured
             }
-            // pidpath で実パスを確認（claude を含むか）
-            if pid != pane_pid {
-                if let Some(path) = pidpath(pid) {
-                    let path_str = path.to_string_lossy();
-                    if path_str.contains("claude") {
-                        return Some(pid);
-                    }
-                }
-            }
-            if let Some(kids) = children.get(&pid) {
-                queue.extend(kids);
-            }
-        }
+        };
+        targets
+            .iter()
+            .map(|t| StaleScanResult {
+                key: t.key,
+                running_binary: find_claude_pid(snapshot, &t.backend_session).and_then(pidpath),
+            })
+            .collect()
+    };
+
+    ScanOutcome::Scanned {
+        state: ScanState {
+            fingerprint,
+            targets,
+            scanned_at: Some(now),
+        },
+        current_binary,
+        current_version,
+        results,
     }
-    None
 }
 
 /// StaleStatus を JSON に変換
@@ -302,5 +513,183 @@ mod tests {
     fn test_pidpath_nonexistent() {
         let path = pidpath(99999999);
         assert!(path.is_none());
+    }
+
+    // ===== #772: 走査頻度の削減 =====
+
+    fn fp(path: &str, len: u64) -> BinaryFingerprint {
+        BinaryFingerprint {
+            binary: PathBuf::from(path),
+            mtime: None,
+            len,
+        }
+    }
+
+    fn target(key: u64, session: &str) -> StaleScanTarget {
+        StaleScanTarget {
+            key,
+            backend_session: session.to_string(),
+        }
+    }
+
+    #[test]
+    fn 初回は必ず走査する() {
+        let prev = ScanState::default();
+        assert!(should_rescan(
+            &prev,
+            Some(&fp("/a/claude", 1)),
+            &[target(1, "tako-s1")],
+            std::time::Instant::now()
+        ));
+    }
+
+    #[test]
+    fn 指紋も対象も変わらなければ走査しない() {
+        let now = std::time::Instant::now();
+        let targets = vec![target(1, "tako-s1")];
+        let prev = ScanState {
+            fingerprint: Some(fp("/a/claude", 1)),
+            targets: targets.clone(),
+            scanned_at: Some(now),
+        };
+        assert!(!should_rescan(
+            &prev,
+            Some(&fp("/a/claude", 1)),
+            &targets,
+            now
+        ));
+    }
+
+    #[test]
+    fn バイナリのパスが変わったら走査する() {
+        let now = std::time::Instant::now();
+        let targets = vec![target(1, "tako-s1")];
+        let prev = ScanState {
+            fingerprint: Some(fp("/versions/2.1.220", 1)),
+            targets: targets.clone(),
+            scanned_at: Some(now),
+        };
+        assert!(should_rescan(
+            &prev,
+            Some(&fp("/versions/2.1.221", 1)),
+            &targets,
+            now
+        ));
+    }
+
+    #[test]
+    fn 同じパスでも中身が差し替わったら走査する() {
+        let now = std::time::Instant::now();
+        let targets = vec![target(1, "tako-s1")];
+        let prev = ScanState {
+            fingerprint: Some(fp("/a/claude", 100)),
+            targets: targets.clone(),
+            scanned_at: Some(now),
+        };
+        assert!(should_rescan(
+            &prev,
+            Some(&fp("/a/claude", 200)),
+            &targets,
+            now
+        ));
+    }
+
+    #[test]
+    fn 対象ペインが増減したら走査する() {
+        let now = std::time::Instant::now();
+        let prev = ScanState {
+            fingerprint: Some(fp("/a/claude", 1)),
+            targets: vec![target(1, "tako-s1")],
+            scanned_at: Some(now),
+        };
+        let grown = vec![target(1, "tako-s1"), target(2, "tako-s2")];
+        assert!(should_rescan(&prev, Some(&fp("/a/claude", 1)), &grown, now));
+    }
+
+    #[test]
+    fn 変化がなくても既定間隔を過ぎたら走査する() {
+        // Instant の減算は起動直後に overflow しうるので、基準時刻から先へ進める
+        let scanned_at = std::time::Instant::now();
+        let targets = vec![target(1, "tako-s1")];
+        let prev = ScanState {
+            fingerprint: Some(fp("/a/claude", 1)),
+            targets: targets.clone(),
+            scanned_at: Some(scanned_at),
+        };
+        assert!(should_rescan(
+            &prev,
+            Some(&fp("/a/claude", 1)),
+            &targets,
+            scanned_at + RESCAN_INTERVAL
+        ));
+        // 間隔の手前では走らせない
+        assert!(!should_rescan(
+            &prev,
+            Some(&fp("/a/claude", 1)),
+            &targets,
+            scanned_at + RESCAN_INTERVAL / 2
+        ));
+    }
+
+    #[test]
+    fn claudeが消えたら走査する() {
+        let now = std::time::Instant::now();
+        let targets = vec![target(1, "tako-s1")];
+        let prev = ScanState {
+            fingerprint: Some(fp("/a/claude", 1)),
+            targets: targets.clone(),
+            scanned_at: Some(now),
+        };
+        assert!(should_rescan(&prev, None, &targets, now));
+    }
+
+    #[test]
+    fn ランチャ探索は実行可能な通常ファイルだけを拾う() {
+        let root = std::env::temp_dir().join(format!("tako-stale-772-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("テスト用ディレクトリ");
+        // 実行ビット無し（拾わない）
+        let plain = root.join("bin-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join(CLAUDE_BIN), b"#!/bin/sh\n").unwrap();
+        assert!(!is_executable_file(&plain.join(CLAUDE_BIN)));
+        // 実行ビットあり（拾う）
+        let exec = root.join("bin-exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let bin = exec.join(CLAUDE_BIN);
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(is_executable_file(&bin));
+        // ディレクトリは拾わない
+        assert!(!is_executable_file(&exec));
+        // 存在しないものは拾わない
+        assert!(!is_executable_file(&root.join("nope")));
+
+        // 後片付け（一時ディレクトリ配下であることを確かめてから消す）
+        assert!(
+            root.starts_with(std::env::temp_dir())
+                && root
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("tako-stale-772-")),
+            "テスト用ディレクトリ以外を消そうとした: {}",
+            root.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 指紋はサブプロセス無しで取れる() {
+        // claude が居ない環境では None、居れば実バイナリと一致する
+        match current_binary_fingerprint() {
+            Some(f) => {
+                assert!(f.binary.is_absolute(), "指紋のパスが絶対パスでない");
+                assert_eq!(Some(f.binary.clone()), resolve_claude_symlink());
+            }
+            None => assert!(launcher_path().is_none() || resolve_claude_symlink().is_none()),
+        }
     }
 }

@@ -103,7 +103,12 @@ impl TakoApp {
                                 this.scroll_accum.remove(&pane_id);
                                 this.scroll_ctls.remove(&pane_id);
                                 this.drop_tmux_view_session(pane_id);
-                                this.drop_backend_session(pane_id);
+                                // たまり場カードの kill も GUI のボタン操作（#770 の監査記録）
+                                this.drop_backend_session(
+                                    pane_id,
+                                    tako_core::pane_log::CloseOrigin::PaneButton,
+                                    None,
+                                );
                             }
                             if this.workspace.shelved_panes().is_empty() {
                                 this.drawer_visible = false;

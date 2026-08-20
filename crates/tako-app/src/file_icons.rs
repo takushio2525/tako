@@ -111,6 +111,7 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("bg_drawer"),
     ui_asset!("coffee"),
     ui_asset!("eye"),
+    ui_asset!("eye_off"),
     ui_asset!("globe"),
     ui_asset!("loop_repeat"),
     ui_asset!("pencil"),
@@ -126,8 +127,14 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("fail_x"),
     ui_asset!("file_generic"),
     ui_asset!("fleet"),
+    ui_asset!("image"),
+    ui_asset!("info"),
     ui_asset!("folder_ui"),
     ui_asset!("git_branch"),
+    ui_asset!("git_merge"),
+    // remote.svg は定数だけあって登録が漏れており、リモートパネルのアイコンが
+    // 無言で描かれていなかった（下の埋め込み検査テストで検出。#562）
+    ui_asset!("remote"),
     ui_asset!("arrow_down"),
     ui_asset!("arrow_up"),
     ui_asset!("check"),
@@ -145,12 +152,16 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("refresh"),
     ui_asset!("search"),
     ui_asset!("split"),
+    ui_asset!("stop"),
     ui_asset!("sun"),
     ui_asset!("trend"),
     ui_asset!("unshelve"),
     ui_asset!("warning"),
     ui_asset!("window_maximize"),
     ui_asset!("window_restore"),
+    // GUI ライク表示モードのトグル（#694。現在モードのアイコンを出す）
+    ui_asset!("chat_bubble"),
+    ui_asset!("prompt"),
 ];
 
 /// UI アイコンのアセットパス定数（#217。`gpui::svg().path(...)` に渡す）
@@ -160,6 +171,8 @@ pub mod ui_icon {
     pub const BG_DRAWER: &str = "icons/ui/bg_drawer.svg";
     pub const COFFEE: &str = "icons/ui/coffee.svg";
     pub const EYE: &str = "icons/ui/eye.svg";
+    /// 隠しファイルを表示していない状態のトグル（#550）
+    pub const EYE_OFF: &str = "icons/ui/eye_off.svg";
     pub const GLOBE: &str = "icons/ui/globe.svg";
     pub const LOOP_REPEAT: &str = "icons/ui/loop_repeat.svg";
     pub const PENCIL: &str = "icons/ui/pencil.svg";
@@ -177,6 +190,8 @@ pub mod ui_icon {
     pub const FLEET: &str = "icons/ui/fleet.svg";
     pub const FOLDER: &str = "icons/ui/folder_ui.svg";
     pub const GIT_BRANCH: &str = "icons/ui/git_branch.svg";
+    /// ブランチ行のマージボタン（#562: 常時表示にして導線を見つけられるようにした）
+    pub const GIT_MERGE: &str = "icons/ui/git_merge.svg";
     pub const ARROW_DOWN: &str = "icons/ui/arrow_down.svg";
     pub const ARROW_UP: &str = "icons/ui/arrow_up.svg";
     pub const CHECK: &str = "icons/ui/check.svg";
@@ -195,6 +210,8 @@ pub mod ui_icon {
     pub const REMOTE: &str = "icons/ui/remote.svg";
     pub const SEARCH: &str = "icons/ui/search.svg";
     pub const SPLIT: &str = "icons/ui/split.svg";
+    /// 起動 ⇔ 停止トグルの停止側（#615。PLAY と対になる ■）
+    pub const STOP: &str = "icons/ui/stop.svg";
     pub const SUN: &str = "icons/ui/sun.svg";
     pub const TREND: &str = "icons/ui/trend.svg";
     pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
@@ -203,6 +220,14 @@ pub mod ui_icon {
     pub const WINDOW_MAXIMIZE: &str = "icons/ui/window_maximize.svg";
     /// Windows のキャプションボタン（最大化状態からの復元）。Issue #584
     pub const WINDOW_RESTORE: &str = "icons/ui/window_restore.svg";
+    /// GUI ライク表示モード中の印（#694。吹き出し = チャット）
+    pub const CHAT_BUBBLE: &str = "icons/ui/chat_bubble.svg";
+    /// ターミナル表示モード中の印（#694。プロンプト記号 `>_`）
+    pub const PROMPT: &str = "icons/ui/prompt.svg";
+    /// 画像添付のプレースホルダ（#715。transcript には画像の実体が無いので印だけ出す）
+    pub const IMAGE: &str = "icons/ui/image.svg";
+    /// システム通知の印（#715。警告ではないので WARNING とは分ける）
+    pub const INFO: &str = "icons/ui/info.svg";
 }
 
 impl AssetSource for TakoAssets {
@@ -598,6 +623,36 @@ pub fn chevron_icon(expanded: bool) -> FileIconKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// UI アイコン定数はすべて `EMBEDDED_ASSETS` に登録されていること。
+    /// 登録漏れがあると `svg().path(...)` が**無言で何も描かない**（#487 で
+    /// 実機報告された「アイコンが見えない」の正体）。#562 でマージアイコンを
+    /// 足したときも定数だけ足して登録を忘れており、ここで検出できる
+    #[test]
+    fn uiアイコン定数はすべて埋め込み済み() {
+        let src = include_str!("file_icons.rs");
+        let mut checked = 0;
+        for line in src.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((_, tail)) = rest.split_once("= \"") else {
+                continue;
+            };
+            let Some(path) = tail.split('"').next() else {
+                continue;
+            };
+            if !path.starts_with("icons/ui/") {
+                continue;
+            }
+            assert!(
+                EMBEDDED_ASSETS.iter().any(|(k, _)| *k == path),
+                "{path} が EMBEDDED_ASSETS に無い（描画時に無言で消える）"
+            );
+            checked += 1;
+        }
+        assert!(checked > 30, "定数の走査に失敗している: {checked} 件");
+    }
 
     #[test]
     fn special_filenames() {
