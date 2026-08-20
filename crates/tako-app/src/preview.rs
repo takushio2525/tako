@@ -2408,7 +2408,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// テスト用 PDF を組み立てる。`contents` の 1 要素が 1 ページのコンテンツストリームで、
     /// 各ページから Helvetica を `/F1` で参照できる。
     ///
