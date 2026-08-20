@@ -77,10 +77,8 @@ All sent reports are logged locally at `<data_dir>/telemetry.log`. You can revie
 
 ## Deletion request
 
-To request deletion of your reports or to ask questions about the telemetry data, please contact the project maintainer via GitHub Issues or email.
-
-- GitHub: https://github.com/takushio2525/tako/issues
-- Email: shiozawataku2525@gmail.com
+To request deletion of your reports or to ask questions about the telemetry data,
+please open an issue: https://github.com/takushio2525/tako/issues
 
 ## Source code
 
