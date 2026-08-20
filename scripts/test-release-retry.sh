@@ -9,6 +9,11 @@ cd "$(dirname "$0")/.."
 PASS=0
 FAIL=0
 
+# release.sh は #837 の後始末で Launch Services を触る。モックテストは本番の LS
+# データベースに一切触らないよう、lsregister を存在しないパスへ差し替える
+# （lib/launch-services.sh 側は実行可能でなければ全操作を no-op にする）
+export TAKO_LSREGISTER=/nonexistent/lsregister
+
 assert_eq() {
   local desc="$1" expected="$2" actual="$3"
   if [[ "$expected" = "$actual" ]]; then
@@ -42,6 +47,17 @@ assert_not_exists() {
   fi
 }
 
+assert_not_dir() {
+  local desc="$1" path="$2"
+  if [[ ! -d "$path" ]]; then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc (directory exists: $path)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 # release.sh のための最小モック環境を一時ディレクトリに構築
 make_test_env() {
   local dir
@@ -49,6 +65,9 @@ make_test_env() {
   mkdir -p "$dir/scripts" "$dir/dist/tako.app/Contents" \
            "$dir/web/tako-remote/dist/assets" "$dir/mock-bin"
   cp scripts/release.sh "$dir/scripts/"
+  # release.sh は scripts/lib/*.sh を source する（release-assets #594 / launch-services #837）。
+  # ここをコピーし忘れると source に失敗して即 exit し、全アサーションが空振りする
+  cp -R scripts/lib "$dir/scripts/"
   echo 'version = "99.0.0"' > "$dir/Cargo.toml"
   printf '## [99.0.0] - 2026-01-01\nTest release\n' > "$dir/CHANGELOG.md"
   echo 'ペイン' > "$dir/web/tako-remote/dist/assets/test.js"
@@ -88,6 +107,7 @@ GHEOF
   assert_contains "stderr がログに記録" "$out" "tag not found on GitHub"
   assert_contains "リトライメッセージ" "$out" "リトライ"
   assert_contains "リリース完了" "$out" "リリース完了"
+  assert_not_dir "ビルド出力の後始末（#837）" "$dir/dist/tako.app"
   rm -rf "$dir"
 }
 

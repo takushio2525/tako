@@ -5,7 +5,9 @@
 #   scripts/build-app.sh            # dist/tako.app を生成
 #   scripts/build-app.sh --verify   # 生成後、バンドル版バイナリでセルフテスト
 #                                   # （TAKO_* 注入 / IPC / MCP を含む全項目）を実行
-#   scripts/build-app.sh --install  # 生成後、/Applications へコピー
+#   scripts/build-app.sh --install  # 生成後、/Applications へコピーし、ビルド出力は片付ける
+#                                   # （同じ .app が 2 つ残ると Finder の「このアプリケーションで
+#                                   #   開く」に tako が 2 つ並ぶ。Issue #837）
 #
 # 方式メモ: cargo-bundle は不採用（メンテ停滞・icns 生成は結局別途必要・
 # macOS 専用なら OS 同梱の iconutil / sips + 素のスクリプトで依存ゼロにできる）。
@@ -20,13 +22,18 @@ DIST="$REPO_ROOT/dist"
 APP="$DIST/tako.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
+# Launch Services の登録は共有ライブラリに集約する（Issue #837。実測値と不変条件は
+# scripts/lib/launch-services.sh の冒頭コメントが正）。release.sh も同じものを使う
+# shellcheck source=lib/launch-services.sh
+source "$REPO_ROOT/scripts/lib/launch-services.sh"
+
 VERIFY=0
 INSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --verify) VERIFY=1 ;;
     --install) INSTALL=1 ;;
-    *) echo "不明な引数: $arg（--verify / --install のみ対応）" >&2; exit 2 ;;
+    *) echo "不明な引数: ${arg}（--verify / --install のみ対応）" >&2; exit 2 ;;
   esac
 done
 
@@ -241,16 +248,24 @@ if [[ $VERIFY -eq 1 ]]; then
 fi
 
 if [[ $INSTALL -eq 1 ]]; then
-  echo "==> /Applications へ配置"
-  rm -rf /Applications/tako.app
-  cp -R "$APP" /Applications/tako.app
-  # Launch Services へ登録し直す（#708）。/Applications への配置でも通常は自動で
-  # 登録されるが、rm -rf → cp -R の差し替えでは古い登録が残り「このアプリケーションで
-  # 開く」の候補・アイコンが更新されないことがある。明示登録して決定論的にする
-  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Support/lsregister
-  if [[ -x "$LSREGISTER" ]]; then
-    "$LSREGISTER" -f /Applications/tako.app || true
-    echo "==> Launch Services へ登録（CFBundleDocumentTypes の反映）"
-  fi
-  echo "==> /Applications/tako.app 配置完了"
+  echo "==> $LS_CANONICAL_APP へ配置"
+  rm -rf "$LS_CANONICAL_APP"
+  cp -R "$APP" "$LS_CANONICAL_APP"
+  ls_register "$LS_CANONICAL_APP"
+  echo "==> Launch Services へ登録（CFBundleDocumentTypes の反映。#708）"
+
+  # install 済みが正本になった時点でビルド出力は用済み。置いたままにすると LS が拾って
+  # Finder の候補に tako が 2 つ並ぶので、実体を消して登録も外す（#837）
+  ls_drop_build_output "$APP" "$DIST"
+
+  echo "==> $LS_CANONICAL_APP 配置完了"
+fi
+
+if [[ $INSTALL -eq 0 && -d "$APP" ]]; then
+  # 素のビルド / --verify では配布物としてビルド出力を残す（release.sh が使う）。
+  # 残っている間は LS に登録されるので、黙って二重化させない（#837）
+  echo "メモ: $APP を残しました。ディスク上にある間は Launch Services に登録され、"
+  echo "      Finder の「このアプリケーションで開く」に $LS_CANONICAL_APP の tako と 2 つ並びます（#837）。"
+  echo "      --install なら自動で片付けます。手動で消すなら:"
+  echo "        rm -rf \"$APP\" && \"$LSREGISTER\" -u \"$APP\""
 fi

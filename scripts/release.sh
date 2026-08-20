@@ -50,6 +50,10 @@ TAG="v${VERSION}"
 # shellcheck source=lib/release-assets.sh
 source "$REPO_ROOT/scripts/lib/release-assets.sh"
 
+# Launch Services の登録ヘルパ（#837）。リリースが成立したらビルド出力を片付ける
+# shellcheck source=lib/launch-services.sh
+source "$REPO_ROOT/scripts/lib/launch-services.sh"
+
 ARCH=$(uname -m)  # arm64 / x86_64
 ZIP_NAME=$(tako_asset_name "$TAG" macos "$ARCH")
 ZIP_PATH="$DIST/$ZIP_NAME"
@@ -515,6 +519,13 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
   fi
 
   echo "==> リリース完了"
+
+  # リリースが成立した時点で、展開済みの tako.app（zip の材料）は用済み。
+  # 置いたままにすると LS が拾って Finder の候補に tako が 2 つ並ぶ（#837）。
+  # 夜間リリース（#166）は「release.sh（build + zip）→ release.sh --skip-build（公開）」の
+  # 2 段なので、片付けるのは公開まで済んだこの分岐だけにする（失敗時は残るので
+  # --skip-build での再試行がそのまま効く）
+  ls_drop_build_output "$APP" "$DIST"
 else
   echo ""
   echo "================================================"

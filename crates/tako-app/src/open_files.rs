@@ -328,4 +328,107 @@ mod tests {
             );
         }
     }
+
+    /// 番犬テスト（Issue #837）: ビルド出力の tako.app を**消してから Launch Services の
+    /// 登録も外す**後始末が、install（build-app.sh）とリリース（release.sh）の両方に
+    /// 入っていること。
+    ///
+    /// 同じ identity の .app がディスク上に 2 つあると LS は両方を登録し、Finder の
+    /// 「このアプリケーションで開く」に tako が 2 つ並ぶ。macOS 26 実測では
+    /// `lsregister -u` だけだと**ファイルを触らなくても約 40 秒後に自動で再登録**され、
+    /// 逆に実体を消しただけでは登録が残骸として残る。**両方**やって初めて恒久的に消える。
+    /// 置き場所を変える回避（`*.noindex` / `.metadata_never_index` / 隠しディレクトリ）は
+    /// どれも効かなかったので、これが唯一の恒久対策。片方だけに退行しないよう固定する。
+    #[test]
+    fn ビルド出力の_app_は_install_とリリースの後に片付けられる() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts")
+            .canonicalize()
+            .expect("scripts/ が見つからない");
+        let read = |name: &str| {
+            std::fs::read_to_string(scripts.join(name))
+                .unwrap_or_else(|e| panic!("{name} を読めない: {e}"))
+        };
+        let lib = read("lib/launch-services.sh");
+        let build_app = read("build-app.sh");
+        let release = read("release.sh");
+
+        // 後始末の実装は共有ライブラリ 1 本（呼び出し側で lsregister を直叩きしない）
+        for name in [
+            "ls_registered_tako_paths()",
+            "ls_unregister()",
+            "ls_sweep_stale_registrations()",
+            "ls_drop_build_output()",
+        ] {
+            assert!(
+                lib.contains(name),
+                "lib/launch-services.sh に {name} が無い（#837）"
+            );
+        }
+        const LSREGISTER_PATH: &str = "LaunchServices.framework/Support/lsregister";
+        for (name, text) in [("build-app.sh", &build_app), ("release.sh", &release)] {
+            assert!(
+                !text.contains(LSREGISTER_PATH),
+                "{name} が lsregister を直叩きしている。LS 操作は \
+                 lib/launch-services.sh に集約すること（#837）"
+            );
+            assert!(
+                text.contains("ls_drop_build_output"),
+                "{name} がビルド出力の後始末（ls_drop_build_output）を呼んでいない。\
+                 残すと LS が拾って Finder の候補が二重化する（#837）"
+            );
+        }
+
+        // 実体を消す → 登録を外す、の順序。逆だと消す前の -u が約 40 秒後に取り消される
+        let drop_fn = lib
+            .split_once("ls_drop_build_output() {")
+            .expect("ls_drop_build_output の定義が見つからない")
+            .1;
+        let rm_at = drop_fn
+            .find("rm -rf \"$app\"")
+            .expect("ls_drop_build_output がビルド出力を消していない（#837）");
+        let sweep_at = drop_fn
+            .find("ls_sweep_stale_registrations")
+            .expect("ls_drop_build_output が登録の掃除をしていない（#837）");
+        assert!(
+            rm_at < sweep_at,
+            "実体の削除は登録解除より前に行うこと（順序が逆だと再登録される。#837）"
+        );
+
+        // 掃除は「実体が無いものだけ」を対象にする（-u が恒久的に効くのはそれだけ）
+        let sweep_fn = lib
+            .split_once("ls_sweep_stale_registrations() {")
+            .expect("ls_sweep_stale_registrations の定義が見つからない")
+            .1;
+        assert!(
+            sweep_fn.contains("ls_unregister"),
+            "掃除が ls_unregister を呼んでいない（#837）"
+        );
+    }
+
+    /// `scripts/test-launch-services.sh`（偽 lsregister を使う密閉モックテスト）を
+    /// CI で回す（Issue #837）。本番の Launch Services データベースには触らない。
+    ///
+    /// シェル側でしか検証できないことを見ている: ビルド出力を消すこと / 登録解除は
+    /// 実体の無いパスだけに限ること / 警告が実際に出力されること（`$var（` のように
+    /// 全角が続く箇所は bash が UTF-8 のバイトを変数名へ取り込むので `${}` で括らないと
+    /// `set -u` で落ちる。実際に踏んだ）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_services_ヘルパのモックテストが通る() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-launch-services.sh")
+            .canonicalize()
+            .expect("test-launch-services.sh が見つからない");
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("bash を起動できない");
+        assert!(
+            out.status.success(),
+            "test-launch-services.sh が失敗した:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
