@@ -56,7 +56,6 @@ impl RemoteSetupAnswers {
 /// ウィザードの非対話実行（dispatch / MCP から呼ばれる。CLI の対話版は tako-cli 側）。
 /// 各ステップを順に実行し、結果を返す。失敗したステップで停止する。
 pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String> {
-    let sock = crate::remote::socket_path();
     let mut result = RemoteSetupResult {
         success: false,
         ts_net_url: None,
@@ -108,36 +107,25 @@ pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String
         .ok_or_else(|| "MagicDNS 名を取得できません".to_string())?;
     let ts_url = format!("https://{dns_name}");
 
-    // Step 3: serve 設定
+    // Step 3: serve 設定（状態確認のみ。実際の serve 設定は `tako remote start` が行う）
     let serve = tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))?;
-    let target = tailscale::proxy_target_for_socket(&sock);
     match serve {
-        ServeState::Proxy(ref existing) if *existing == target => {
-            result.steps.push(SetupStepResult {
-                step: "serve_config",
-                status: "ok",
-                message: format!("serve は設定済み（{target} へプロキシ）"),
-            });
-        }
-        ServeState::NotConfigured => {
-            tailscale::serve_start_unix(cli, &sock)
-                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
-            result.steps.push(SetupStepResult {
-                step: "serve_config",
-                status: "configured",
-                message: format!("serve を設定しました（{target} へプロキシ）"),
-            });
-        }
+        // プロキシ先が tako 自身のものか他人のものかの判定は `tako remote start`
+        // （`establish_tailscale_serve`）が持つ。ここでは現状をそのまま見せるだけにして
+        // 判定ロジックを二重化しない。プロキシ先は表示して食い違いに気づけるようにする
         ServeState::Proxy(existing) => {
             result.steps.push(SetupStepResult {
                 step: "serve_config",
-                status: "conflict",
-                message: format!(
-                    "HTTPS:443 は別のプロキシ先に設定済み（{existing}）。\n\
-                     tako の設定に変更するには、先に tailscale serve --https=443 off で解除してください。"
-                ),
+                status: "ok",
+                message: format!("serve は設定済み（HTTPS:443 → {existing}）"),
             });
-            return Ok(serde_json::to_value(&result).unwrap());
+        }
+        ServeState::NotConfigured => {
+            result.steps.push(SetupStepResult {
+                step: "serve_config",
+                status: "ok",
+                message: "serve は未設定（`tako remote start` で自動設定されます）".into(),
+            });
         }
         ServeState::Other => {
             result.steps.push(SetupStepResult {
@@ -185,7 +173,8 @@ pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String
     Ok(serde_json::to_value(&result).unwrap())
 }
 
-/// スマホ側のセットアップ手順（導線 B。ウィザード末尾と docs で同じ文面を使う）
+/// スマホ側のセットアップ手順（導線 B。ウィザード末尾と docs で同じ文面を使う）。
+/// #528: 文面は macOS / Windows 共通にする（「Mac の画面に」は Windows で嘘になる）
 pub fn phone_setup_instructions(ts_url: &str) -> String {
     format!(
         "\
@@ -195,13 +184,13 @@ pub fn phone_setup_instructions(ts_url: &str) -> String {
    - iPhone: App Store で「Tailscale」を検索
    - Android: Google Play で「Tailscale」を検索
 
-2. Mac と同じアカウントでログイン
+2. この PC と同じアカウントでログイン
    （同じ tailnet に参加する必要があります）
 
 3. スマホのブラウザで以下の URL を開く:
    {ts_url}
 
-4. Mac 画面にペアリング承認ダイアログが表示されるので「許可」を選択
+4. この PC の画面にペアリング承認ダイアログが表示されるので「許可」を選択
 
 5. ブラウザの「ホーム画面に追加」でアプリ化
    （以後はホーム画面のアイコンから開くだけ）
@@ -230,19 +219,48 @@ pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Val
             "Tailscale が必要です。以下のいずれかの方法でインストールしてください:"
         )
         .map_err(|e| e.to_string())?;
-        writeln!(
-            writer,
-            "  - App Store で「Tailscale」を検索してインストール"
-        )
-        .map_err(|e| e.to_string())?;
-        writeln!(writer, "  - brew install tailscale").map_err(|e| e.to_string())?;
+        #[cfg(not(windows))]
+        {
+            writeln!(
+                writer,
+                "  - App Store で「Tailscale」を検索してインストール"
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(writer, "  - brew install tailscale").map_err(|e| e.to_string())?;
+        }
+        #[cfg(windows)]
+        {
+            writeln!(
+                writer,
+                "  - https://tailscale.com/download/windows からインストール"
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(writer, "  - winget install Tailscale.Tailscale")
+                .map_err(|e| e.to_string())?;
+        }
         writeln!(writer).map_err(|e| e.to_string())?;
 
-        if auto_yes || ask_yes_no(writer, "brew install tailscale を実行しますか?")? {
-            writeln!(writer, "  brew install tailscale を実行中...").map_err(|e| e.to_string())?;
-            let install_result = std::process::Command::new("brew")
-                .args(["install", "tailscale"])
-                .status();
+        let install_prompt = if cfg!(windows) {
+            "winget install Tailscale.Tailscale を実行しますか?"
+        } else {
+            "brew install tailscale を実行しますか?"
+        };
+        if auto_yes || ask_yes_no(writer, install_prompt)? {
+            let (cmd_name, cmd_args): (&str, &[&str]) = if cfg!(windows) {
+                (
+                    "winget",
+                    &[
+                        "install",
+                        "Tailscale.Tailscale",
+                        "--accept-package-agreements",
+                    ],
+                )
+            } else {
+                ("brew", &["install", "tailscale"])
+            };
+            writeln!(writer, "  {cmd_name} {} を実行中...", cmd_args.join(" "))
+                .map_err(|e| e.to_string())?;
+            let install_result = std::process::Command::new(cmd_name).args(cmd_args).status();
             match install_result {
                 Ok(s) if s.success() => {
                     writeln!(writer, "  インストール完了").map_err(|e| e.to_string())?;
@@ -359,36 +377,21 @@ pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Val
     let ts_url = format!("https://{dns_name}");
     writeln!(writer, "OK ({dns_name})").map_err(|e| e.to_string())?;
 
-    // Step 4: serve 設定
-    write!(writer, "[4/5] serve を設定中... ").map_err(|e| e.to_string())?;
+    // Step 4: serve の状態確認（設定そのものは `tako remote start` が行う。
+    // プロキシ先はローカルエンドポイントの実体（UDS / loopback ポート）に依存し、
+    // それが確定するのは daemon が待ち受けを開いた後なので、ここでは張らない）
+    write!(writer, "[4/5] serve の状態を確認中... ").map_err(|e| e.to_string())?;
     let _ = writer.flush();
 
-    let sock = crate::remote::socket_path();
     let serve = tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))?;
-    let target = tailscale::proxy_target_for_socket(&sock);
 
     match serve {
-        ServeState::Proxy(ref existing) if *existing == target => {
-            writeln!(writer, "設定済み").map_err(|e| e.to_string())?;
+        ServeState::Proxy(existing) => {
+            writeln!(writer, "設定済み（HTTPS:443 → {existing}）").map_err(|e| e.to_string())?;
         }
         ServeState::NotConfigured => {
-            tailscale::serve_start_unix(cli, &sock)
-                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
-            writeln!(writer, "設定完了 ({target})").map_err(|e| e.to_string())?;
-        }
-        ServeState::Proxy(existing) => {
-            writeln!(writer, "競合").map_err(|e| e.to_string())?;
-            writeln!(
-                writer,
-                "  HTTPS:443 は別のプロキシ先に設定済みです: {existing}"
-            )
-            .map_err(|e| e.to_string())?;
-            writeln!(
-                writer,
-                "  先に `tailscale serve --https=443 off` で解除してください。"
-            )
-            .map_err(|e| e.to_string())?;
-            return Err("serve 設定が競合しています".into());
+            writeln!(writer, "未設定（`tako remote start` で自動設定されます）")
+                .map_err(|e| e.to_string())?;
         }
         ServeState::Other => {
             writeln!(writer, "競合").map_err(|e| e.to_string())?;

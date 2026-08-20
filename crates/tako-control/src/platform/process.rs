@@ -30,9 +30,39 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    /// Windows 実装は `OpenProcess` + `TerminateProcess`（穏当な終了は
-    /// コンソール制御イベントの送出）で置き換える（B5 の Windows 実装タスク）
-    pub fn terminate(_pid: u32, _force: bool) -> Result<(), String> {
-        Err("プロセスの停止は Windows では未対応です".to_string())
+    /// `OpenProcess` + `TerminateProcess`（#528）。
+    ///
+    /// **`force` は意図的に無視する**。Windows で「穏当な終了」に当たるのは
+    /// `GenerateConsoleCtrlEvent` だが、これはプロセスグループ単位でしか送れず、
+    /// remote デーモンは `DETACHED_PROCESS`（= コンソールを持たない）で起動するため届かない。
+    /// 呼び出し側は force の有無に関わらず終了をポーリングで確認するので、
+    /// 常に `TerminateProcess` に一貫させる方が挙動が読める
+    /// （unix の SIGTERM → SIGKILL の段階付けに相当するものは Windows には無い）
+    pub fn terminate(pid: u32, force: bool) -> Result<(), String> {
+        use std::ffi::c_void;
+        // 最小権限: 停止だけができるハンドルを開く
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        let _ = force;
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if handle.is_null() {
+            return Err(format!(
+                "PID {pid} を停止権限つきで開けない（{}）",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let ok = unsafe { TerminateProcess(handle, 1) };
+        // CloseHandle が errno を上書きする前に読む
+        let err = std::io::Error::last_os_error();
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return Err(format!("PID {pid} の停止に失敗（{err}）"));
+        }
+        Ok(())
     }
 }

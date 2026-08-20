@@ -249,10 +249,15 @@ pub mod notes {
         "AI による命名は claude CLI の解決が Windows で効かないため働かず、ヒューリスティック命名にとどまる",
         "AI naming does not run because the claude CLI cannot be resolved on Windows; naming falls back to heuristics",
     );
-    /// #528 の担当範囲
+    /// #528: remote の WS/scrollback/agents 系はペイン到達手段の制約で縮退
     pub const WIN_REMOTE: Note = Note::new(
-        "remote トランスポートと Windows 配布系統が前提",
-        "Requires the remote transport and the Windows distribution channel",
+        "psmux の到達手段が読み取り専用のため WS リアルタイム配信等が縮退",
+        "Degraded because psmux provides read-only detached access (no send-keys/WS)",
+    );
+    /// #528: remote の MVP（setup/start/stop/status）は動作
+    pub const WIN_REMOTE_MVP: Note = Note::new(
+        "loopback TCP + Tailscale Serve で動作（UDS の代替）",
+        "Works via loopback TCP + Tailscale Serve (UDS replacement)",
     );
 
     /// 概念自体が存在しないもの
@@ -598,9 +603,8 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_remote",
         macos: Support::Supported,
-        windows: Support::Pending {
+        windows: Support::Degraded {
             note: notes::WIN_REMOTE,
-            issue: 528,
         },
     },
     Feature {
@@ -822,65 +826,57 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_remote_agents",
         macos: Support::Supported,
-        windows: Support::Pending {
+        windows: Support::Degraded {
             note: notes::WIN_REMOTE,
-            issue: 528,
         },
     },
     Feature {
         key: "tako_remote_devices",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
+        windows: Support::Degraded {
+            note: notes::WIN_REMOTE_MVP,
         },
     },
     Feature {
         key: "tako_remote_messages",
         macos: Support::Supported,
-        windows: Support::Pending {
+        windows: Support::Degraded {
             note: notes::WIN_REMOTE,
-            issue: 528,
         },
     },
     Feature {
         key: "tako_remote_scrollback",
         macos: Support::Supported,
-        windows: Support::Pending {
+        windows: Support::Degraded {
             note: notes::WIN_REMOTE,
-            issue: 528,
         },
     },
     Feature {
         key: "tako_remote_setup",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
+        windows: Support::Degraded {
+            note: notes::WIN_REMOTE_MVP,
         },
     },
     Feature {
         key: "tako_remote_start",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
+        windows: Support::Degraded {
+            note: notes::WIN_REMOTE_MVP,
         },
     },
     Feature {
         key: "tako_remote_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
+        windows: Support::Degraded {
+            note: notes::WIN_REMOTE_MVP,
         },
     },
     Feature {
         key: "tako_remote_stop",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
+        windows: Support::Degraded {
+            note: notes::WIN_REMOTE_MVP,
         },
     },
     Feature {

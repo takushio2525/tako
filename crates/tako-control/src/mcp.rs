@@ -1973,15 +1973,17 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_start",
             "description": "リモートアクセス API サーバーを起動する。スマホからブラウザ経由で\
-                ペインを操作するための HTTP API サーバーが Unix domain socket で開始される。\
-                transport は Tailscale Serve のみ: daemon は UDS（0600）のみで listen し、\
-                tailnet 内限定の恒久固定 URL（https://<ホスト名>.<tailnet>.ts.net）で公開される\
-                （WireGuard E2E 暗号化・TCP ポートは一切開かない）。\
+                ペインを操作するための HTTP API サーバーが、外部へ露出しないローカル専用の\
+                エンドポイントで開始される（macOS: Unix domain socket 0600 / \
+                Windows: loopback TCP のランダムポート。実体は応答の endpoint_kind を見る）。\
+                transport は Tailscale Serve のみ: tailnet 内限定の恒久固定 URL\
+                （https://<ホスト名>.<tailnet>.ts.net）で公開される（WireGuard E2E 暗号化。\
+                LAN や public internet に待ち受けポートは開かない）。\
                 Tailscale が未セットアップ（未導入・未ログイン・HTTPS 未有効等）の場合は\
                 不足項目を列挙して起動を拒否するので、ユーザーに `tako remote setup` を案内する。\
-                接続には機器ペアリングが必要: 初回アクセス時に Mac 画面へ承認ダイアログが表示され、\
-                ユーザーが許可した端末だけが role（observe / interact / manage / admin）に応じて\
-                操作できる。承認・role 変更は Mac の GUI 限定で AI からは行えない。\
+                接続には機器ペアリングが必要: 初回アクセス時にこの PC の画面へ承認ダイアログが\
+                表示され、ユーザーが許可した端末だけが role（observe / interact / manage / admin）\
+                に応じて操作できる。承認・role 変更は GUI 限定で AI からは行えない。\
                 注意: interact 以上を許可した端末はターミナルへ任意コマンドを送信できる（実質シェルアクセス）。",
             "inputSchema": {
                 "type": "object",
@@ -1992,13 +1994,15 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_stop",
             "description": "リモートアクセス API サーバーを停止する。\
-                既定は SIGTERM で停止を試みる。force=true で SIGKILL を使う。",
+                既定は穏当な終了要求（macOS: SIGTERM）で停止を試み、force=true で強制終了する\
+                （macOS: SIGKILL / Windows: TerminateProcess）。\
+                停止時に tailscale serve の設定も解除する（tako が張ったものだけ）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "force": {
                         "type": "boolean",
-                        "description": "true で SIGKILL を使う（既定 false = SIGTERM）",
+                        "description": "true で強制終了する（既定 false = 穏当な終了要求）",
                     },
                 },
                 "additionalProperties": false,
@@ -2007,7 +2011,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_remote_status",
             "description": "リモートアクセス API サーバーの状態を取得する。\
-                起動中なら running=true・socket パス・恒久固定 URL・登録済み端末数を返す。\
+                起動中なら running=true・endpoint_kind（unix-domain-socket / loopback-tcp）・\
+                endpoint_port（loopback-tcp のときだけ）・恒久固定 URL・登録済み端末数を返す。\
                 URL に secret は含まれない（接続時の認証は機器ペアリングが行う）。",
             "inputSchema": {
                 "type": "object",
@@ -2089,8 +2094,9 @@ pub fn tools() -> Vec<Value> {
             "description": "リモートアクセスの Tailscale セットアップ状態を確認・実行する（#286）。\
                 action=check で Tailscale の導入・ログイン・HTTPS・serve の各項目を確認、\
                 action=run で serve 設定 + QR PNG 生成まで実行する。\
-                Tailscale が未導入・未ログインの場合は手順を案内して停止する。\
-                対話的なウィザード（brew install の実行等）は CLI `tako remote setup` で行い、\
+                Tailscale が未導入・未ログインの場合は、その OS で実際に通る手順\
+                （macOS: brew / App Store、Windows: winget / 公式インストーラ）を案内して停止する。\
+                対話的なウィザード（インストールの実行等）は CLI `tako remote setup` で行い、\
                 このツールでは非対話実行のみ。",
             "inputSchema": {
                 "type": "object",
