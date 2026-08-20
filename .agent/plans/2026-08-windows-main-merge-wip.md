@@ -403,12 +403,52 @@ macOS: fmt / clippy（feature 有無とも）**0 findings** / `test --workspace`
 `TerminalSession::child_pid()` が main に無い）、そこだけ直せば済んだ。
 macOS のゲートを先に全部回してから実機へ行くと、この 1 件のために全部やり直しになる。
 
-### 3. IPC named pipe（#467）
+### 3. IPC named pipe（#467）— ✅ **完了**（PR #850）
 
 - 持ち込む新規: `crates/tako-control/src/platform/named_pipe.rs`
 - 編集: IPC のトランスポート選択（`ipc.rs`）
 - 依存: **1**
 - 独立性が高いので 2 と並行してよい
+
+#### 完了記録（2026-08-21。PR #850 / `windows/467-slice3-namedpipe`）
+
+4 ファイル / +371 / −92。**plan の記載より 1 ファイル多い**: `tako-cli` の
+クライアント側も直さないと「pipe のサーバーはあるがクライアントが居ない」状態になる
+（plan は `ipc.rs` + `named_pipe.rs` だけを挙げていた）。
+
+##### 入れたもの
+
+- `platform/named_pipe.rs`（224 行・境界 B3）: `\\.\pipe\tako-*` のサーバー
+  インスタンス生成・クライアント接続・生存プローブ。**バイトストリームの確立だけ**を担い、
+  ワイヤ形式（1 行 1 JSON）は持たない。依存クレートを増やさないため最小の FFI 宣言
+- `ipc.rs`: ワイヤ処理を **`mod conn`（`<R: Read, W: Write>` のトランスポート非依存）**へ
+  抽出し、`unix_imp` / `windows_imp` はストリームの作り方だけを持つ形へ。
+  main の `process_line` は**バイト等価で移動**（正規化差分ゼロ）。ソケットパス選択
+  （`temp_socket_path` / `preferred_socket_path` の `TAKO_SELF_TEST` 分岐と固定パス）も不変
+- `tako-cli`: `mod transport` を「OS 別 `connect()` + 共通 `roundtrip_on()`」へ。
+  main は `#[cfg(unix)]` / `#[cfg(windows)]` で**モジュールを 2 つ**持っていたが、
+  分岐するのは接続の張り方だけなので 1 つに畳んだ
+
+アクセス制御は named pipe の既定 DACL（作成ユーザーのフルアクセス。Everyone は read のみで
+リクエストを書き込めない）+ 全リクエストのトークン検証の二段（unix の 0600 + トークンに相当）。
+`GetNamedPipeClientProcessId` による PeerIdentity 検証は B3 の後続タスク。
+
+##### 実測
+
+macOS: fmt / clippy（feature 有無とも）**0 findings** / `test --workspace`
+**2194 passed / 0 failed**（スライス 2b と同数 = 新規テストは Windows 限定）/
+隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / visual-test **98 checkpoint** /
+クロスチェック エラー 0・**警告 10**（2b の 11 から 1 件減 = `tako-cli` の
+windows スタブが持っていた未使用警告が transport 統合で消えた）。
+
+**Windows 実機**: `ipc::windows_tests` **3 passed / 0 failed**
+（`正しいトークンでリクエストが往復する` / `不正なトークンは認証エラーで拒否される` /
+`連続接続が全件処理される`）。全体は `tako-app` 409/**0** / `tako-cli` 53/**0** /
+`tako-control` 950/25 / `tako-core` 665/5 / `platform_parity` **10/0** /
+`encoding_conpty` **5/0** / `psmux_backend` **16/0**。
+**失敗は 30 件のままで新規ゼロ**（tako-control は 944→950 passed と増えただけ）。
+
+Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機を先に回した）。
 
 ### 4. 入力系: キーボード / IME / フォント / コンソール抑止（#517 / #575 / #582 / #585 / #586）
 
@@ -477,6 +517,54 @@ macOS のゲートを先に全部回してから実機へ行くと、この 1 �
 - 依存: **1**
 - **WIP が保全ブランチにある**: `windows/724-port-crash`（`7633d8b`。ポート検知のクラッシュ修正）/
   `windows/727-sleep-settings`（`91cc13f`。設定 UI）
+
+### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 完了）
+
+main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ PR #850（3）。
+**残りはスライス 4 / 5 / 6 / 7 / 8 / 9**。依存グラフ上、いま着手できるのは
+**4（入力系）**・**6（インストーラー）**・**7（シェル統合 PowerShell。1 と 2 が揃ったので解放）**・
+**9（スリープ防止 / ポート検知）**。5 は 4 の後、8 は最後。
+
+#### 毎スライスで守る作法（実測で効いたもの）
+
+1. **Windows 実機ビルドを先に通す**。`#[cfg(windows)]` のコードは
+   **macOS のゲートが全部緑でも実機で E0599 になる**（2a で 1 回踏み、2b / 3 では
+   先に回して一発で通した）。順序: 実機 build → 実機 test → macOS 全ゲート
+2. **`-j 2` と `CARGO_BUILD_JOBS=2`**。兄弟セッションと並行ビルドすると swap が枯れて
+   `cc` が SIGKILL される（実測: swap 27.5/28.7 GB で `linking with cc failed: signal: 9`）。
+   セルフテストは内側で `cargo build -p tako-cli` を起こすので `CARGO_BUILD_JOBS` も要る
+3. **`#513` の共有カタログは fail-closed**。`<data_dir>` へ書くものを増やしたら
+   `config_share/catalog.rs` へ分類（shared / local / secret）を宣言しないとテストが落ちる。
+   win467 は #513 より前に分岐しているのでこの宣言を持っていない
+4. **対応マトリクスは触らない**。機能が Windows で通しで動くまで Supported へ倒すと
+   `PlatformFacts` 経由で system prompt へ誤情報が流れる（#516）。棚卸しはスライス 8
+5. **plan の見立ては疑う**。2a では「#817 の `pty_loop` の上への再実装が要る」と書いたが、
+   実測では #817 が置き換えたのは**読み取りループだけ**で書き込み経路は不変、
+   win467 の実装がそのまま載った（2b で訂正）。スライス 3 も plan は 2 ファイルと
+   書いていたが実際は 4 ファイル（`tako-cli` のクライアント側が要る）
+6. **`git show "$W:path"` は波括弧で囲む**（`"${W}:path"`）。zsh の履歴修飾子 `:c` / `:r` が
+   効いて壊れる（このセッションで踏んだ）
+7. 隔離セルフテスト / visual-test は**ウィンドウが完全に隠れると描画が止まる**ので、
+   項目 63 / 76d / 104 が SKIP になるのは既知（`TAKO_APP_SELF_TEST_OK` なら合格）。
+   `#680` の項目は load 依存で落ちるので負荷が高いときは回し直す
+
+#### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
+
+| スイート | 結果 |
+|---|---|
+| `tako-app` / `tako-cli` | 409/**0** / 53/**0** |
+| `tako-control` (lib) | 950 / **25 failed** |
+| `tako-core` (lib) | 665 / **5 failed** |
+| `platform_parity` | 10 / 0 |
+| `encoding_conpty` | 5 / 0 |
+| `psmux_backend` | 16 / 0 |
+
+**失敗 30 件はすべて main 由来**（#583 の既知 18 + 以降 main へ増えた同系 7 + tako-core 5）。
+内訳と根拠は #583 の 2026-08-21 のコメント。スライスごとにこの表と突き合わせ、
+増減があれば `TAKO_BACKEND=none` 等で「自分の変更が原因か」を切り分けてから報告する。
+
+macOS 側のベースライン: `test --workspace` **2194 passed / 0 failed** /
+visual-test **98 checkpoint** / クロスチェック **エラー 0・警告 10**。
 
 ### 持ち込まないもの（今回の裁定で確定）
 
