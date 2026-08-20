@@ -38,6 +38,7 @@ mod preview_render;
 mod preview_watch;
 mod remote_panel;
 mod right_panel;
+mod settings_sleep;
 mod settings_window;
 mod sidebar;
 mod status_bar;

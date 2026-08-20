@@ -88,10 +88,20 @@ pub fn reason_agents_finishing() -> &'static str {
     )
 }
 pub fn reason_system_disabled() -> &'static str {
-    tr!(
-        "スリープ無効化（pmset disablesleep）が有効のため、Mac はスリープしません",
-        "System sleep is disabled (pmset disablesleep), so the Mac will not sleep"
-    )
+    // 蓋閉じ継続の手段は OS で違う（macOS = pmset disablesleep / Windows = 電源プランの
+    // lid action。#697）。Windows でも `lid_sleep_disabled` は真になりうるので、
+    // macOS 固有のコマンド名をそのまま出さない（#727）
+    if tako_control::sleep_guard::lid_requires_privileged_setup() {
+        tr!(
+            "スリープ無効化（pmset disablesleep）が有効のため、Mac はスリープしません",
+            "System sleep is disabled (pmset disablesleep), so the Mac will not sleep"
+        )
+    } else {
+        tr!(
+            "蓋閉じ継続が有効のため、この PC はスリープしません",
+            "Lid-close prevention is on, so this PC will not sleep"
+        )
+    }
 }
 pub fn reason_idle() -> &'static str {
     tr!(
