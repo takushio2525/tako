@@ -2554,3 +2554,13 @@
   → `visible=True`。セルフテスト項目 71 に回帰検査を新設（旧経路では
   `visible=true → false`（切替 3 → 4）で FAILED になることを実測）
 - 関連コミット: PR（Closes #838）
+
+## 2026-08-21（#467: main 追いつきマージの規模確定と保全 / Windows 実機ビルド成功）
+- Windows 検証機の未 push 作業 4 件を origin へ保全（Windows からは push 不能 = gh トークン無効 +
+  GCM が SSH で wincredman に触れない → bundle を Mac へ運んで Mac の認証で push）
+- `origin/main` → `windows/467` マージは **45 ファイル / 213 hunk / 27,353 行**の真の衝突。
+  41 ファイルを解決して `windows/467-main-merge-wip`（ddf880e）へ保全し、機能スコープの
+  判断 3 件（#665 / #662 / #709 が main の #748 / #749 / #504 と衝突）で中断。
+  判断ログと推奨（スライス移植）は `.agent/plans/2026-08-windows-main-merge-wip.md`
+- Windows 実機: `cargo build --workspace` 成功（5m24s / error 0 / warning 17）
+- 次: 方針決定（マージ続行 vs main へのスライス移植）
