@@ -2189,3 +2189,28 @@
   fmt / clippy(-D warnings) / test --workspace（2070 passed）/ Windows クロスチェック
   （エラー 0・警告 16 = 記録済みベースライン同数）全緑
 - production 側は無関係と確認（`export K=V;` は `sh_quote` 経由。ワークスペース全走査で漏れ 0）
+
+## 2026-08-21（#837: ビルド出力 .app の Launch Services 重複登録を根治）
+- Issue の対策案 3 つを使い捨て .app で実測して全部棄却: **`lsregister -u` はファイルを
+  触らなくても 48〜70 秒で取り消される** / `*.noindex`・`.metadata_never_index`・
+  `chflags hidden`・ドット始まりの隠しディレクトリ（97 秒後は 0 件 → 133 秒後に登録）は
+  どれも登録を止められない（`.noindex` 配下は Spotlight の importer 属性が付かないまま
+  LS には登録された = **LS は Spotlight とは独立に .app を拾う**）/ bundle id 変更は
+  `CFBundleName` が tako のままなので候補は 2 つ並び、DR 固定（#54）と配布物も壊す。
+  効くのは**「実体を消す + `lsregister -u`」の両方**だけ（存在しないパスは再登録されない。
+  実体を消しただけでは wt-813 / wt-838 のように残骸が候補に残り続ける）
+- **再発の主因は手動 install ではなく夜間リリース**（`~/dev/tako/dist/tako.app` = 0.7.4 は
+  `nightly-release.sh` の生成物）。#166 は「`release.sh`（build + zip）→ `--skip-build` で公開」の
+  2 段なので、`build-app.sh` だけ直しても毎晩再発する → 公開が成立した `release.sh` にも
+  同じ後始末を入れた（失敗時は残すので `--skip-build` の再試行は不変）
+- LS 操作は `scripts/lib/launch-services.sh` に集約。番犬テストとモックテスト
+  （偽 lsregister の `scripts/test-launch-services.sh`）が削除・登録解除・その順序・
+  警告出力を機械検証する
+- 実測: `--verify` の出力は**約 10 秒後**に LS へ登録され（症状再現）、`--install` で
+  削除 + 登録解除 → **150 秒後も再登録なし**。掃除後の候補は `/Applications` の 1 つだけ
+- 同梱: 変数の直後が全角だと bash が UTF-8 バイトを変数名に取り込み `set -u` で落ちる罠を
+  2 件修正（新規の警告出力 + **main 由来**で壊れていた `build-app.sh` の「不明な引数」案内）。
+  規約を conventions.md へ明文化
+- 同梱: `test-release-retry.sh` が #594 以降ずっと temp repo に `scripts/lib` をコピーせず
+  source 失敗で即 exit していた（**main でも 2 pass / 10 fail**）のを修復 → 13 pass / 0 fail
+- 関連: PR（Closes #837）

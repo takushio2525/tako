@@ -227,3 +227,24 @@ scripts/release.sh --update-notes v0.6.0   # 実アセットを読み直して�
   隔離検証だけを回していると踏めない = main 由来の確定失敗として残る。
   項目 41c / 41d の隔離 HOME はディレクトリ名に空白を入れてあり、
   `HOME=` / `PATH=` 側は毎回の隔離セルフテストで踏む
+
+## シェルスクリプトで日本語を出すときの変数展開（Issue #837）
+
+**変数の直後に全角文字が続くときは必ず `${}` で括る。** UTF-8 ロケールの bash は全角
+`（` などのバイトを**変数名の一部として取り込む**ため、`$var（` は `var\xef…` という
+名前の参照になり、`set -u` の下で `unbound variable` で即死する（bash 3.2 / 5.3 の
+両方で再現。`--verify` の通し実行で実際に踏んだ）。
+
+```bash
+echo "        $registered（$note）"      # ✗ set -u で落ちる
+echo "        ${registered}（${note}）"  # ○
+```
+
+`bash -n` では検出できず、その行が実行されるまで潜伏する（`build-app.sh` の
+「不明な引数」案内は #837 まで気付かれずに壊れていた）。**日本語を出す行は必ず一度
+実行して確かめる**か、`scripts/test-launch-services.sh` のようなモックテストで
+その分岐を通す。機械的な洗い出しは:
+
+```sh
+grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]' scripts/*.sh scripts/lib/*.sh
+```

@@ -50,9 +50,13 @@ macOS で `tako.app` を生成して `/Applications` へ配置するには:
 # dist/tako.app を生成（--verify でバンドル版のセルフテストも実行）
 scripts/build-app.sh --verify
 
-# /Applications へ配置（手動なら dist/tako.app をコピーでも同じ）
+# /Applications へ配置（配置後、ビルド出力の dist/tako.app は片付けられる）
 scripts/build-app.sh --install
 ```
+
+同じ `.app` が 2 つディスク上にあると macOS の Launch Services が両方を登録し、Finder の
+「このアプリケーションで開く」に tako が 2 つ並びます。`--install` は配置後にビルド出力を
+消して登録も外すので、候補は `/Applications` の 1 つだけになります。
 
 アイコンの再描画には `rsvg-convert`（`brew install librsvg`）を使います。
 無い場合は同梱の PNG から自動でフォールバックします。
@@ -61,6 +65,8 @@ scripts/build-app.sh --install
 
 To build `tako.app` on macOS, run `scripts/build-app.sh --verify` (creates `dist/tako.app` and
 runs the bundled self-test), then `scripts/build-app.sh --install` to copy it into `/Applications`.
+`--install` also removes the build copy afterwards and unregisters it from Launch Services, so
+Finder's "Open With" lists tako only once.
 Icon rendering uses `rsvg-convert` (`brew install librsvg`) with a PNG fallback.
 For development, plain `cargo run -p tako-app` works without bundling.
 

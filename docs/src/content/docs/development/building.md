@@ -55,9 +55,16 @@ scripts/build-app.sh
 # ビルド後にセルフテストで検証
 scripts/build-app.sh --verify
 
-# /Applications にインストール
+# /Applications にインストール（配置後、ビルド出力の dist/tako.app は片付けられる）
 scripts/build-app.sh --install
 ```
+
+:::note
+同じ `.app` がディスク上に 2 つあると macOS の Launch Services が両方を登録し、Finder の
+「このアプリケーションで開く」に tako が 2 つ並びます（Issue #837）。`--install` は配置後に
+ビルド出力を消して LS の登録も外すため、候補は `/Applications` の 1 つだけになります。
+`--install` を付けないビルドでは `dist/tako.app` が残るので、スクリプトが片付け方を表示します。
+:::
 
 アイコンは `assets/icon/icon-a.svg` から自動生成されます（`rsvg-convert` がある場合は SVG から直接、なければプリレンダリング済み PNG から生成）。
 
