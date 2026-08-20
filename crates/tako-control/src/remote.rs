@@ -869,6 +869,25 @@ fn broadcaster_loop(
     }
 }
 
+/// ローカルエンドポイントのファイルを drop 時に回収するガード（#528）。
+///
+/// `run_daemon` は `bind()` の**後**に起動前チェック（到達手段 / Tailscale /
+/// デバイスレジストリ）を行うため、そこで弾かれると endpoint ファイルだけが残る。
+/// unix では socket ファイル、Windows ではポート番号を書いたテキストで、
+/// 後者は残骸のポートを別プロセスが取ると生存誤判定の元になる。
+///
+/// 正常終了時も `cleanup_state_files()` が同じファイルを消すが、削除は冪等なので
+/// 二重に消えても害はない（ガードを外す条件を持たせない方が漏れが出ない）
+struct EndpointFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for EndpointFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Tailscale setup の不足項目を列挙した起動拒否エラーを組み立てる。
 /// `tako remote start` の誘導文言（Issue #282: 黙って失敗させない）
 fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
@@ -1017,6 +1036,11 @@ pub fn run_daemon() -> io::Result<()> {
         let _ = std::fs::remove_file(&sock);
     }
     let server = local_endpoint::bind(&sock)?;
+    // bind の後の起動前チェック（到達手段・Tailscale・レジストリ）で失敗すると
+    // endpoint ファイルが取り残される。Windows では中身がポート番号なので、
+    // 残骸のポートを**別の無関係なプロセス**が取っていると probe_alive が
+    // 「デーモンが生きている」と誤判定する（#528）。どの早期 return でも回収する
+    let _endpoint_guard = EndpointFileGuard { path: sock.clone() };
 
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
