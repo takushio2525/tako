@@ -1007,11 +1007,15 @@ limit ダイアログは実機を limit まで使い切らずに再現できな�
 | FR-2.27.8 | **黙って動かさない**。実行と結果を `<data_dir>/supervisor.log` へ `action=limit_autoresume` で記録する（#749 の `ctx_handoff_nudge` と同じ場所・同じ形式）。ダイアログ応答は respond 経路の persist.log 監査（`[dialog-respond]`）もそのまま残る | M |
 | FR-2.27.9 | **AI フルコントロール**: `tako limit-resume [on\|off] [--pane N] [--all]`（引数なしで現在値 = #322 の最簡形）と MCP `tako_limit_resume` へ 1:1 公開し、`list` / `read` / `worker_status` に状態フィールド（オプトインと実行状態 = 停止の型・復帰予定時刻・試行回数）を載せる。右クリック・CLI・MCP の 3 経路は**同じ dispatch** を通る | M |
 | FR-2.27.10 | **表示**: 有効なペインはヘッダに控えめな SVG インジケータを出し（絵文字禁止 = #217）、上限で止まって待機しているあいだは色を強める。文言は日英（#435） | S |
+| FR-2.27.11 | **プロファイル既定と spawn 適用**（✅ 2026-08-21、#822）。master / solo プロファイルに `limit_resume`（既定 false）を持たせ、**そのプロファイルから spawn した worker ペインへ自動適用**する（長時間の自律運転で「spawn するたび手で ON」が最後の人間依存点になるため）。解決順は **spawn 引数 → プロファイル → false** で、spawn 引数の `false` は「未指定」ではなく**明示 OFF**（プロファイルが ON でもその worker だけ切れる）。既定 OFF は FR-2.27.1 のペイン単位オプトインをそのまま保つ。適用されたことは `orchestrator spawn` の応答（`limit_resume`）・`orchestrator workers` の各行（ペインが居なければ `null`。番号再利用の別ペインを誤って有効と報告しない）・`worker_status` / `read` / `list` とヘッダインジケータ（FR-2.27.10 と同じペイン属性）で読める。設定は `tako orchestrator profiles set <名前> --limit-resume <bool>` / `--clear-limit-resume` と MCP `tako_orchestrator_profiles`、GUI は設定画面 → プロファイル → 「worker のリミット後自動復帰」の 3 経路が**同じ dispatch** を通る（`profiles show` の `resolved_limit_resume` が実効値で、GUI のトグルもこれを読む）。**solo プロファイルは worker を spawn しない**ので ON にしても効かず、`profiles list` / `show` / `set` が警告を返す（黙って死んだ設定にしない）。`orchestrator run` / task checkpoint resume（#242）も spawn と同じ経路なのでプロファイル既定がそのまま効く（個別の `--オプション` は増やさない = #322） | M |
 
 実装メモ（2026-08-15）: 判断は `tako_core::limit_resume`（`decide` / `due_at` /
 `safe_choice` / `parse_reset_at`。すべて純関数で `now` とタイムゾーンは注入）、
 検知の束ねは `tako_control::limit_stop::detect_limit_stop`、駆動は
 `tako-app::limit_autoresume`（2 秒 tick から `drive_limit_autoresume`）。
+プロファイル既定の解決は `tako_control::orchestrator::resolve_worker_limit_resume`
+（純関数）1 本で、spawn は解決結果をペイン属性へ入れるだけ（#822。機械検証は
+unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる）。
 リセット時刻は**エピソード開始時に確定して途中で更新しない**（画面に残った古い
 上限メッセージで復帰予定が後ろへずれないようにするため。裏返すと、tako を
 上限中に再起動して画面のメッセージだけが古いままだと、復帰予定が最大で翌日まで

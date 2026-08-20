@@ -21835,6 +21835,8 @@ mod self_test {
             clear_ctx_threshold: false,
             auto_handoff: None,
             clear_auto_handoff: false,
+            limit_resume: None,
+            clear_limit_resume: false,
         };
 
         // --- 実データ規模を用意する ---
@@ -35744,6 +35746,7 @@ mod self_test {
                         caller_pid: None,
                         task_type: None,
                         account: None,
+                        limit_resume: None,
                     }
                 }
 
@@ -40620,6 +40623,8 @@ mod self_test {
                     clear_ctx_threshold: false,
                     auto_handoff: None,
                     clear_auto_handoff: false,
+                    limit_resume: None,
+                    clear_limit_resume: false,
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
                     window
@@ -41748,6 +41753,8 @@ mod self_test {
                         clear_ctx_threshold: false,
                         auto_handoff: None,
                         clear_auto_handoff: false,
+                        limit_resume: None,
+                        clear_limit_resume: false,
                     }
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
@@ -42447,6 +42454,8 @@ mod self_test {
                         clear_ctx_threshold: false,
                         auto_handoff: auto,
                         clear_auto_handoff: false,
+                        limit_resume: None,
+                        clear_limit_resume: false,
                     }
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
@@ -42895,6 +42904,8 @@ mod self_test {
                     clear_ctx_threshold: false,
                     auto_handoff: None,
                     clear_auto_handoff: false,
+                    limit_resume: None,
+                    clear_limit_resume: false,
                 };
                 if fire(profiles_req("set", true), cx).is_none() {
                     fail("#761: 検証用プロファイルを作れない");
@@ -46218,6 +46229,223 @@ mod self_test {
                     cx.notify();
                 });
                 let _ = std::fs::remove_dir_all(&dir835);
+            }
+
+            // 117: プロファイルの limit_resume が spawn した worker へ自動適用される
+            // （#822 / FR-2.27.11）。上限を実際に踏む必要はない検査で、見るのは
+            // 「spawn の時点でペイン属性が入ったか」と「それが 3 経路で同じに読めるか」。
+            // 適用（`set_limit_autoresume`）を外すと A の判定が FAILED になる
+            {
+                use tako_control::protocol::Request as Req;
+
+                let profile = "_selftest_822_";
+                let project = "tako-selftest-822";
+                let scratch =
+                    std::env::temp_dir().join(format!("tako-selftest-822-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&scratch);
+                let registered = (|| -> Result<(), String> {
+                    let mut config = tako_control::orchestrator::ProjectsConfig::load()?;
+                    config.add(
+                        project.to_string(),
+                        scratch.display().to_string(),
+                        Some("selftest #822（自動削除される）".into()),
+                    );
+                    config.save()
+                })();
+                check(registered.is_ok(), "117: 一時プロジェクト登録 (#822)");
+
+                let set_profile = |on: Option<bool>| {
+                    tako_control::dispatch::dispatch_orchestrator_profiles(
+                        tako_control::dispatch::ProfilesParams {
+                            action: "set".into(),
+                            name: Some(profile.into()),
+                            limit_resume: on,
+                            clear_limit_resume: on.is_none(),
+                            ..Default::default()
+                        },
+                    )
+                    .ok()
+                    .and_then(|v| v["resolved_limit_resume"].as_bool())
+                };
+
+                // 専用タブを作り、その初期ペインを分割元（master 役）にする。
+                // プロファイルの解決は caller_role（`master:<名前>`）で行う = CLI / MCP と同じ経路
+                let master822 = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            Req::TabNew {
+                                title: Some("st822".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                    })
+                    .ok()
+                    .flatten();
+
+                // spawn して「新ペインの属性 / spawn 応答 / LimitResume の読み出し /
+                // workers 一覧」の 4 つを同時に採る。どれかがズレたら経路の食い違い
+                let spawn822 = |cx: &mut AsyncApp,
+                                master: u64,
+                                override_value: Option<bool>|
+                 -> Option<(u64, bool, bool, bool, Option<bool>)> {
+                    window
+                        .update(cx, |app, _, _| {
+                            let spawned = tako_control::dispatch(
+                                app,
+                                Req::OrchestratorSpawn {
+                                    project: project.into(),
+                                    prompt: String::new(),
+                                    label: None,
+                                    model: None,
+                                    effort: None,
+                                    pane: Some(master),
+                                    tab: None,
+                                    caller_role: Some(format!("master:{profile}")),
+                                    agent: None,
+                                    caller_pid: None,
+                                    task_type: None,
+                                    account: None,
+                                    limit_resume: override_value,
+                                },
+                                PaneOrigin::Mcp,
+                            )
+                            .ok()?;
+                            let pane = spawned["pane_id"].as_u64()?;
+                            let from_spawn = spawned["limit_resume"].as_bool()?;
+                            // ペイン属性そのもの（ヘッダのインジケータもこれを読む）
+                            let on_pane = app
+                                .workspace
+                                .tabs()
+                                .iter()
+                                .flat_map(|t| t.tree().panes())
+                                .find(|p| p.id().as_u64() == pane)?
+                                .limit_autoresume();
+                            // #813 の読み出し経路（右クリック / CLI / MCP と同じ dispatch）
+                            let from_read = tako_control::dispatch(
+                                app,
+                                Req::LimitResume {
+                                    pane: Some(pane),
+                                    enabled: None,
+                                    all: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["enabled"].as_bool())?;
+                            // #822: worker レジストリ一覧にも載る（master が spawn 後に確認できる）
+                            let from_workers = tako_control::dispatch(
+                                app,
+                                Req::OrchestratorWorkers { all: None },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| {
+                                v["workers"].as_array().and_then(|ws| {
+                                    ws.iter()
+                                        .find(|w| w["pane"].as_u64() == Some(pane))
+                                        .map(|w| w["limit_resume"].as_bool())
+                                })
+                            })
+                            .flatten();
+                            Some((pane, on_pane, from_spawn, from_read, from_workers))
+                        })
+                        .ok()
+                        .flatten()
+                };
+
+                if let Some(master) = master822 {
+                    let mut spawned_panes: Vec<u64> = Vec::new();
+
+                    // A: プロファイル ON → spawn した worker に自動適用される
+                    check(set_profile(Some(true)) == Some(true), "117: プロファイルを ON にできる (#822)");
+                    let a = spawn822(cx, master, None);
+                    println!("TAKO_SELF_TEST_822_PROFILE_ON: {a:?}");
+                    check(
+                        a.map(|(_, on_pane, from_spawn, from_read, from_workers)| {
+                            on_pane && from_spawn && from_read && from_workers == Some(true)
+                        }) == Some(true),
+                        "117: プロファイル ON が spawn した worker に適用され 4 経路で一致 (#822)",
+                    );
+                    if let Some((p, ..)) = a {
+                        spawned_panes.push(p);
+                    }
+
+                    // B: spawn 引数の Some(false) はプロファイル ON を打ち消す（明示 OFF）
+                    let b = spawn822(cx, master, Some(false));
+                    println!("TAKO_SELF_TEST_822_OVERRIDE_OFF: {b:?}");
+                    check(
+                        b.map(|(_, on_pane, from_spawn, from_read, from_workers)| {
+                            !on_pane && !from_spawn && !from_read && from_workers == Some(false)
+                        }) == Some(true),
+                        "117: spawn 引数 false がプロファイル ON を打ち消す (#822)",
+                    );
+                    if let Some((p, ..)) = b {
+                        spawned_panes.push(p);
+                    }
+
+                    // C: プロファイル未設定（既定 OFF）でも spawn 引数で個別に有効化できる
+                    check(set_profile(None) == Some(false), "117: プロファイルを解除できる (#822)");
+                    let c = spawn822(cx, master, Some(true));
+                    println!("TAKO_SELF_TEST_822_OVERRIDE_ON: {c:?}");
+                    check(
+                        c.map(|(_, on_pane, from_spawn, from_read, from_workers)| {
+                            on_pane && from_spawn && from_read && from_workers == Some(true)
+                        }) == Some(true),
+                        "117: 既定 OFF でも spawn 引数 true で有効化できる (#822)",
+                    );
+                    if let Some((p, ..)) = c {
+                        spawned_panes.push(p);
+                    }
+
+                    // D: 既定は OFF のまま（#813 のペイン単位オプトインを崩していない）
+                    let d = spawn822(cx, master, None);
+                    println!("TAKO_SELF_TEST_822_DEFAULT_OFF: {d:?}");
+                    check(
+                        d.map(|(_, on_pane, from_spawn, ..)| !on_pane && !from_spawn) == Some(true),
+                        "117: プロファイル未設定の spawn は既定 OFF (#822)",
+                    );
+                    if let Some((p, ..)) = d {
+                        spawned_panes.push(p);
+                    }
+
+                    // 後始末: spawn したペインと専用タブを閉じる
+                    let _ = window.update(cx, |app, _, cx| {
+                        for p in spawned_panes.iter().chain(std::iter::once(&master)) {
+                            let _ = tako_control::dispatch(
+                                app,
+                                Req::Close {
+                                    pane: Some(*p),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                        }
+                        cx.notify();
+                    });
+                } else {
+                    fail("117: 検証用タブを作れない (#822)");
+                }
+
+                // 後始末: プロファイルと一時プロジェクトを残さない
+                let _ = tako_control::dispatch::dispatch_orchestrator_profiles(
+                    tako_control::dispatch::ProfilesParams {
+                        action: "delete".into(),
+                        name: Some(profile.into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = (|| -> Result<(), String> {
+                    let mut config = tako_control::orchestrator::ProjectsConfig::load()?;
+                    config.projects.remove(project);
+                    config.save()
+                })();
+                let _ = std::fs::remove_dir_all(&scratch);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

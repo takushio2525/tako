@@ -1842,6 +1842,10 @@
           "description": "ctx_threshold の指定を解除する（config.yaml → 既定 60 へ戻る。set 時。#749）",
           "type": "boolean"
         },
+        "clear_limit_resume": {
+          "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）",
+          "type": "boolean"
+        },
         "clear_master_account": {
           "description": "master_account を解除する（set 時。#504）",
           "type": "boolean"
@@ -1905,6 +1909,10 @@
             "solo"
           ],
           "type": "string"
+        },
+        "limit_resume": {
+          "description": "このプロファイルから spawn した worker ペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時。#822）。spawn 側の limit_resume が指定されていればそちらが勝つ",
+          "type": "boolean"
         },
         "master_account": {
           "description": "master の既定アカウント名（accounts.yaml のキー。空文字でクリア。set 時。#504）",
@@ -2074,6 +2082,10 @@
         "label": {
           "description": "ペインタイトルに付けるラベル（省略時は '<project>-worker'）",
           "type": "string"
+        },
+        "limit_resume": {
+          "description": "この worker だけ利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を明示指定する（#822）。省略時はプロファイルの limit_resume → 無効。長時間の自律タスクを任せるときに true にする。適用結果は応答の limit_resume に返る（ペイン単位の切替は tako_limit_resume）",
+          "type": "boolean"
         },
         "model": {
           "description": "worker のモデル（agent のネイティブ表記。省略時はプロファイル設定に従う）",

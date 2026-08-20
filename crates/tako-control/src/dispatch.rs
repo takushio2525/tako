@@ -82,6 +82,8 @@ pub enum OffloadJob {
     },
     Workers {
         live_panes: Vec<(u64, Option<String>)>,
+        /// 利用上限後の自動復帰が有効なペイン（#822。一覧に載せるだけで判定には使わない）
+        limit_resume_panes: Vec<u64>,
         include_closed: bool,
         /// 死んだ active エントリの GC を同時に行うか（#658）。セカンダリインスタンスは
         /// プライマリのペインを持たないため false（他人の worker を殺さない）
@@ -138,6 +140,7 @@ pub fn prepare_offload(
         }
         Request::OrchestratorWorkers { all } => Some(Ok(OffloadJob::Workers {
             live_panes: collect_live_panes(host),
+            limit_resume_panes: collect_limit_resume_panes(host),
             include_closed: all.unwrap_or(false),
             sweep: !host.is_secondary(),
         })),
@@ -175,9 +178,10 @@ impl OffloadJob {
             } => finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref()),
             OffloadJob::Workers {
                 live_panes,
+                limit_resume_panes,
                 include_closed,
                 sweep,
-            } => finish_workers_list(&live_panes, include_closed, sweep),
+            } => finish_workers_list(&live_panes, &limit_resume_panes, include_closed, sweep),
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
@@ -276,6 +280,25 @@ fn collect_live_panes(host: &dyn ControlHost) -> Vec<(u64, Option<String>)> {
     panes
 }
 
+/// 利用上限後の自動復帰（FR-2.27 / #813）が有効なペイン ID（#822）。
+/// `workers` 一覧に「その worker が自動復帰の対象か」を載せるための材料
+fn collect_limit_resume_panes(host: &dyn ControlHost) -> Vec<u64> {
+    host.workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes())
+        .filter(|p| p.limit_autoresume())
+        .map(|p| p.id().as_u64())
+        .chain(
+            host.workspace()
+                .shelved_panes()
+                .iter()
+                .filter(|s| s.pane().limit_autoresume())
+                .map(|s| s.id().as_u64()),
+        )
+        .collect()
+}
+
 /// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
 /// UI スレッドで呼ばないこと（OffloadJob::run / dispatch 同期経路用）。
 ///
@@ -284,6 +307,7 @@ fn collect_live_panes(host: &dyn ControlHost) -> Vec<(u64, Option<String>)> {
 /// （倒すのに 2 回以上の観測が要るので、この 1 回の列挙で生き物を落とすことはない）
 fn finish_workers_list(
     live_panes: &[(u64, Option<String>)],
+    limit_resume_panes: &[u64],
     include_closed: bool,
     sweep: bool,
 ) -> Result<Value, DispatchError> {
@@ -308,6 +332,7 @@ fn finish_workers_list(
         &reg,
         &live_backends,
         live_panes,
+        limit_resume_panes,
         include_closed,
     ))
 }
@@ -2605,6 +2630,8 @@ fn dispatch_inner(
             clear_ctx_threshold,
             auto_handoff,
             clear_auto_handoff,
+            limit_resume,
+            clear_limit_resume,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2641,6 +2668,8 @@ fn dispatch_inner(
             clear_ctx_threshold,
             auto_handoff,
             clear_auto_handoff,
+            limit_resume,
+            clear_limit_resume,
         }),
 
         // #504: アカウントレジストリの CRUD
@@ -2739,6 +2768,7 @@ fn dispatch_inner(
             caller_pid,
             task_type,
             account,
+            limit_resume,
         } => dispatch_orchestrator_spawn(
             host,
             origin,
@@ -2755,6 +2785,7 @@ fn dispatch_inner(
                 caller_pid,
                 task_type: task_type.as_deref(),
                 account: account.as_deref(),
+                limit_resume,
             },
         ),
 
@@ -2780,8 +2811,14 @@ fn dispatch_inner(
         // #390: worker レジストリの一覧（同期経路。IPC / MCP 経由は prepare_offload 側）
         Request::OrchestratorWorkers { all } => {
             let live_panes = collect_live_panes(host);
+            let limit_resume_panes = collect_limit_resume_panes(host);
             let sweep = !host.is_secondary();
-            finish_workers_list(&live_panes, all.unwrap_or(false), sweep)
+            finish_workers_list(
+                &live_panes,
+                &limit_resume_panes,
+                all.unwrap_or(false),
+                sweep,
+            )
         }
 
         // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
@@ -5030,6 +5067,9 @@ pub struct ProfilesParams {
     /// 閾値超過時に tako が master へ引き継ぎを促すか（Issue #749）
     pub auto_handoff: Option<bool>,
     pub clear_auto_handoff: bool,
+    /// spawn した worker で利用上限後の自動復帰を既定 ON にするか（Issue #822）
+    pub limit_resume: Option<bool>,
+    pub clear_limit_resume: bool,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -5111,6 +5151,22 @@ fn profile_to_json(
     v["resolved_ctx_threshold"] = json!(resolved.value);
     v["ctx_threshold_source"] = json!(resolved.source.as_str());
     v["resolved_auto_handoff"] = json!(orchestrator::auto_handoff_enabled(profile));
+    // worker の自動復帰の既定（#822）。実効値も併記して「今 spawn したらどうなるか」を
+    // 1 回の呼び出しで確定できるようにする（ctx_threshold と同じ流儀）
+    if profile.limit_resume.is_some() {
+        v["limit_resume"] = json!(profile.limit_resume);
+    }
+    let limit_resume_resolved = orchestrator::resolve_worker_limit_resume(profile, None);
+    v["resolved_limit_resume"] = json!(limit_resume_resolved);
+    // solo は worker を spawn しない（solo prompt が禁止している）ので、ON にしても
+    // 効く先が無い。黙って死んだ設定にしないため警告として見せる
+    if limit_resume_resolved && kind == orchestrator::ProfileKind::Solo {
+        let mut warnings: Vec<Value> = v["warnings"].as_array().cloned().unwrap_or_default();
+        warnings.push(json!(
+            "limit_resume は spawn した worker ペインへ適用される設定ですが、solo プロファイルは worker を spawn しません（この設定は効きません）。\n  ペイン単位で有効にするには `tako limit-resume on --pane <id>` を使ってください"
+        ));
+        v["warnings"] = Value::Array(warnings);
+    }
     v
 }
 
@@ -5285,6 +5341,11 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "auto_handoff と clear_auto_handoff は同時に指定できない".into(),
                 ));
             }
+            if params.limit_resume.is_some() && params.clear_limit_resume {
+                return Err(DispatchError::InvalidParams(
+                    "limit_resume と clear_limit_resume は同時に指定できない".into(),
+                ));
+            }
             let env_set_clone = params.env_set.clone();
             let env_unset_clone = params.env_unset.clone();
             let master_account_clone = params.master_account.clone();
@@ -5400,6 +5461,12 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     profile.auto_handoff = Some(v);
                 } else if params.clear_auto_handoff {
                     profile.auto_handoff = None;
+                }
+                // worker の自動復帰の既定（#822）
+                if let Some(v) = params.limit_resume {
+                    profile.limit_resume = Some(v);
+                } else if params.clear_limit_resume {
+                    profile.limit_resume = None;
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
@@ -6353,6 +6420,9 @@ struct SpawnParams<'a> {
     task_type: Option<&'a str>,
     /// アカウント名（accounts.yaml のキー。この worker だけ該当 config dir で起動。#504）
     account: Option<&'a str>,
+    /// この worker だけ利用上限後の自動復帰を明示指定する（#822。
+    /// 省略時はプロファイルの `limit_resume` → false）
+    limit_resume: Option<bool>,
 }
 
 fn dispatch_orchestrator_spawn(
@@ -6373,6 +6443,7 @@ fn dispatch_orchestrator_spawn(
         caller_pid,
         task_type: _task_type,
         account,
+        limit_resume,
     } = params;
     if pane.is_none() && tab.is_none() {
         return Err(DispatchError::Operation(
@@ -6540,6 +6611,22 @@ fn dispatch_orchestrator_spawn(
         None => format!("orchestrator-worker:{project}"),
     };
     pane_obj.set_role(Some(pane_role));
+    // 利用上限後の自動復帰（FR-2.27 / #813）の既定を worker ペインへ適用する（#822）。
+    // 解決順は spawn 引数 → プロファイル → false。ON のときだけ監査行を残す
+    // （既定 OFF の spawn で persist.log を埋めない）
+    let limit_resume_applied = orchestrator::resolve_worker_limit_resume(&profile, limit_resume);
+    pane_obj.set_limit_autoresume(limit_resume_applied);
+    if limit_resume_applied {
+        let source = if limit_resume.is_some() {
+            "spawn"
+        } else {
+            "profile"
+        };
+        crate::diag::persist_log(&format!(
+            "[limit-autoresume] pane={} enabled=true 発生源 spawn:{source}",
+            new_id.as_u64()
+        ));
+    }
 
     // attach は非同期のため backend セッション名をここで事前予約する（Issue #112。
     // 従来の `backend_session(new_id)` は spawn 時点で常に None = 応答の tmux_session が
@@ -6648,6 +6735,9 @@ fn dispatch_orchestrator_spawn(
         "env_unset": profile_env.unsets,
         "config_dir": config_dir_value,
         "account": account_name,
+        // #822: この worker に適用された利用上限後の自動復帰（FR-2.27）。
+        // true なら `tako limit-resume --pane <id>` で切らない限り自動復帰の対象
+        "limit_resume": limit_resume_applied,
     }))
 }
 
@@ -8689,6 +8779,8 @@ fn dispatch_task_resume(
             caller_pid: None,
             task_type: None,
             account: None,
+            // #822: resume はプロファイルの limit_resume をそのまま引き継ぐ
+            limit_resume: None,
         },
     )?;
 
@@ -11531,6 +11623,7 @@ mod tests {
             caller_pid: None,
             task_type: None,
             account: None,
+            limit_resume: None,
         }
     }
 
@@ -14023,6 +14116,159 @@ mod tests {
         }
     }
 
+    /// #822: プロファイルの limit_resume が spawn 先の worker ペインへ適用される。
+    /// spawn 引数は両方向でプロファイルに勝つ（Some(false) は明示 OFF）
+    #[test]
+    fn issue822_プロファイルのlimit_resumeがspawn先ペインへ適用される() {
+        let profile = "_tako_822_";
+        let set = |limit_resume: Option<bool>, clear: bool| {
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                limit_resume,
+                clear_limit_resume: clear,
+                ..Default::default()
+            })
+            .expect("set は成功する")
+        };
+        // spawn して「新ペインに適用された値」と「応答の値」を返す
+        let spawn = |override_value: Option<bool>| -> (bool, bool) {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            let params = SpawnParams {
+                project: TEST_PROJECT,
+                prompt: "limit resume test",
+                label: None,
+                model: None,
+                effort: Some("high"),
+                pane: Some(master),
+                tab: None,
+                caller_role: Some(&format!("master:{profile}")),
+                agent: None,
+                caller_pid: None,
+                task_type: None,
+                account: None,
+                limit_resume: override_value,
+            };
+            let val = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params)
+                .expect("spawn は成功する");
+            let new_pane = PaneId::from_raw(val["pane_id"].as_u64().unwrap());
+            let applied = host
+                .workspace()
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .find(|p| p.id() == new_pane)
+                .expect("新ペインが存在する")
+                .limit_autoresume();
+            (applied, val["limit_resume"].as_bool().unwrap())
+        };
+
+        with_test_project(|| {
+            // 既定（プロファイル未設定）は OFF = #813 のペイン単位オプトインのまま
+            set(None, true);
+            assert_eq!(spawn(None), (false, false));
+            // プロファイル ON → spawn した worker に自動適用される
+            set(Some(true), false);
+            assert_eq!(spawn(None), (true, true));
+            // spawn 引数で個別に打ち消せる（明示 OFF）
+            assert_eq!(spawn(Some(false)), (false, false));
+            // プロファイル OFF でも spawn 引数で個別に有効化できる
+            set(Some(false), false);
+            assert_eq!(spawn(None), (false, false));
+            assert_eq!(spawn(Some(true)), (true, true));
+
+            // 後始末（プロファイルファイルを残さない）
+            let _ = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "delete".into(),
+                name: Some(profile.into()),
+                ..Default::default()
+            });
+        });
+    }
+
+    /// #822: set / clear / 排他エラーと、実効値の併記（GUI のトグルはこれを読む）
+    #[test]
+    fn issue822_limit_resumeのsetとclearと排他() {
+        let name = "_tako_822_set_";
+        let set = |limit_resume: Option<bool>, clear: bool| {
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some(name.into()),
+                limit_resume,
+                clear_limit_resume: clear,
+                ..Default::default()
+            })
+        };
+
+        // 未設定 = 生値は出さず実効値だけ false
+        let v = set(None, false).expect("set は成功する");
+        assert!(v.get("limit_resume").is_none(), "{v}");
+        assert_eq!(v["resolved_limit_resume"].as_bool(), Some(false), "{v}");
+
+        // ON → 生値と実効値の両方が true
+        let v = set(Some(true), false).expect("set は成功する");
+        assert_eq!(v["limit_resume"].as_bool(), Some(true), "{v}");
+        assert_eq!(v["resolved_limit_resume"].as_bool(), Some(true), "{v}");
+
+        // clear → 生値が消え実効値は false へ戻る
+        let v = set(None, true).expect("clear は成功する");
+        assert!(v.get("limit_resume").is_none(), "{v}");
+        assert_eq!(v["resolved_limit_resume"].as_bool(), Some(false), "{v}");
+
+        // 同時指定は拒否（auto_handoff と同じ規約）
+        let err = set(Some(true), true).expect_err("同時指定は拒否する");
+        assert!(err.to_string().contains("同時に指定できない"), "{err}");
+
+        let _ = dispatch_orchestrator_profiles(ProfilesParams {
+            action: "delete".into(),
+            name: Some(name.into()),
+            ..Default::default()
+        });
+    }
+
+    /// #822: solo は worker を spawn しないので、ON にしても効く先が無い。
+    /// 黙って死んだ設定にせず警告として見せる（GUI / CLI / MCP 共通）
+    #[test]
+    fn issue822_soloプロファイルのlimit_resumeは効かない旨を警告する() {
+        let name = "_tako_822_solo_";
+        let set = |kind: &str, on: bool| {
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some(name.into()),
+                kind: Some(kind.into()),
+                limit_resume: Some(on),
+                ..Default::default()
+            })
+            .expect("set は成功する")
+        };
+        let warned = |v: &Value| {
+            v["warnings"]
+                .as_array()
+                .map(|w| {
+                    w.iter()
+                        .any(|x| x.as_str().is_some_and(|s| s.contains("limit_resume")))
+                })
+                .unwrap_or(false)
+        };
+
+        // solo + ON は警告する
+        assert!(warned(&set("solo", true)), "solo ON で警告が出ない");
+        // solo + OFF は警告しない（効かない設定を持っていない）
+        assert!(!warned(&set("solo", false)), "solo OFF で警告が出る");
+        // master + ON は警告しない（worker へ効く）
+        assert!(!warned(&set("master", true)), "master ON で警告が出る");
+
+        for kind in ["solo", "master"] {
+            let _ = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "delete".into(),
+                name: Some(name.into()),
+                kind: Some(kind.into()),
+                ..Default::default()
+            });
+        }
+    }
+
     #[test]
     fn find_master_paneがsuffix一致を優先する() {
         let mut host = MockHost::new();
@@ -14321,6 +14567,7 @@ mod tests {
                 caller_pid: None,
                 task_type: None,
                 account: None,
+                limit_resume: None,
             };
             let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params);
             assert!(
@@ -15603,6 +15850,7 @@ mod tests {
                 caller_pid: None,
                 task_type: None,
                 account: None,
+                limit_resume: None,
             };
             let val = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params).unwrap();
             let worker_id = val["worker_id"]

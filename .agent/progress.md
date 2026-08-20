@@ -2214,3 +2214,18 @@
 - 同梱: `test-release-retry.sh` が #594 以降ずっと temp repo に `scripts/lib` をコピーせず
   source 失敗で即 exit していた（**main でも 2 pass / 10 fail**）のを修復 → 13 pass / 0 fail
 - 関連: PR（Closes #837）
+||||||| parent of b4a4967 ([機能追加] リミット後の自動復帰をプロファイル既定で spawn worker へ適用 (#822))
+## 2026-08-21（#822: リミット自動復帰をプロファイル既定で spawn worker へ）
+- #813 のペイン単位オプトインを master / solo プロファイルの `limit_resume`（既定 false）に
+  持たせ、spawn した worker ペインへ自動適用（FR-2.27.11 新設）。解決順は
+  **spawn 引数 → プロファイル → false** で、正は `resolve_worker_limit_resume`（純関数）1 本。
+  spawn 引数の `false` は明示 OFF（`or` ではなく `Option` の有無で判定）
+- 見えるところ: spawn 応答の `limit_resume` / `orchestrator workers` の各行（ペインが
+  居なければ `null` = 番号再利用を誤報しない）/ `worker_status` / `read` / `list` /
+  ヘッダインジケータ。3 経路 1:1（CLI `profiles set --limit-resume` / MCP / GUI プロファイルタブ）
+  で MCP ツール数は不変。**solo は worker を spawn しない**ので ON にすると警告を返す
+- 検証: fmt / clippy(-D warnings、visual-test feature 有無とも) / test --workspace 全緑 +
+  Windows クロスチェック エラー 0・警告 16（main 同数）+ 隔離セルフテスト項目 117 新設。
+  検出力は `set_limit_autoresume` を外すと unit（`left: (false, true)`）と項目 117 が FAILED
+- 判断: `orchestrator run` / checkpoint resume は spawn と同じ経路なのでプロファイル既定が
+  そのまま効く。個別の `--オプション` は増やさない（#322 = 既定動作を賢くする方向）

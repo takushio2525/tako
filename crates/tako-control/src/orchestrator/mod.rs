@@ -205,6 +205,15 @@ pub fn auto_handoff_enabled(profile: &Profile) -> bool {
     profile.auto_handoff.unwrap_or(true)
 }
 
+/// worker ペインに適用する利用上限後の自動復帰（FR-2.27 / #813）の既定値（Issue #822）。
+///
+/// 解決順は **spawn 引数 → プロファイル → false**（既定 OFF。#813 の
+/// 「ペイン単位のオプトイン」を崩さない）。spawn 引数は `Some(false)` で
+/// プロファイル ON を明示的に打ち消せる（`or` ではなく `Option` の有無で判定する）。
+pub fn resolve_worker_limit_resume(profile: &Profile, spawn_override: Option<bool>) -> bool {
+    spawn_override.or(profile.limit_resume).unwrap_or(false)
+}
+
 /// `~` を `$HOME` に展開する
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -738,6 +747,14 @@ pub struct Profile {
     /// 気づきと手動の `tako_orchestrator_handoff` は従来どおり使える
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_handoff: Option<bool>,
+
+    /// このプロファイルから spawn した worker ペインで利用上限後の自動復帰
+    /// （FR-2.27 / #813）を既定 ON にするか（Issue #822。省略時 false = 従来どおり
+    /// ペイン単位のオプトイン）。spawn 引数（`limit_resume`）が指定されていれば
+    /// そちらが勝つ。solo プロファイルは worker を spawn しないため効果がない
+    /// （`profile_to_json` が警告を返す）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_resume: Option<bool>,
 }
 
 /// master / claude worker の既定 effort
@@ -772,6 +789,7 @@ impl Default for Profile {
             worker_account: None,
             ctx_threshold: None,
             auto_handoff: None,
+            limit_resume: None,
         }
     }
 }
@@ -3831,6 +3849,53 @@ worker_agents:
             auto_handoff: Some(false),
             ..Default::default()
         }));
+    }
+
+    /// #822: 解決順は spawn 引数 → プロファイル → false。
+    /// `Some(false)` の spawn 引数は「未指定」ではなく**明示 OFF** としてプロファイルに勝つ
+    #[test]
+    fn workerの自動復帰は既定offでspawn引数が最優先() {
+        let off = Profile::default();
+        let on = Profile {
+            limit_resume: Some(true),
+            ..Default::default()
+        };
+        // 既定は OFF（#813 のペイン単位オプトインを崩さない）
+        assert!(!resolve_worker_limit_resume(&off, None));
+        // プロファイル ON はそのまま効く
+        assert!(resolve_worker_limit_resume(&on, None));
+        // spawn 引数は両方向でプロファイルに勝つ
+        assert!(resolve_worker_limit_resume(&off, Some(true)));
+        assert!(!resolve_worker_limit_resume(&on, Some(false)));
+        // 明示 OFF のプロファイル
+        let explicit_off = Profile {
+            limit_resume: Some(false),
+            ..Default::default()
+        };
+        assert!(!resolve_worker_limit_resume(&explicit_off, None));
+        assert!(resolve_worker_limit_resume(&explicit_off, Some(true)));
+    }
+
+    /// 既定値は YAML へ書き出さない（設定ファイルを汚さない）。
+    /// 逆に、フィールドを持たない旧ファイルは serde default で OFF として読める
+    #[test]
+    fn workerの自動復帰は既定でyamlに出ず旧ファイルも読める() {
+        let yaml = serde_yaml::to_string(&Profile::default()).unwrap();
+        assert!(
+            !yaml.contains("limit_resume"),
+            "既定値が YAML に出ている: {yaml}"
+        );
+        let yaml_on = serde_yaml::to_string(&Profile {
+            limit_resume: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(yaml_on.contains("limit_resume: true"), "{yaml_on}");
+
+        // 旧ファイル（フィールドなし）
+        let old: Profile = serde_yaml::from_str("effort: max\n").unwrap();
+        assert_eq!(old.limit_resume, None);
+        assert!(!resolve_worker_limit_resume(&old, None));
     }
 
     #[test]
