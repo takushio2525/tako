@@ -185,12 +185,70 @@ pub struct TerminalSession {
     wheel_rate: std::sync::Mutex<WheelRateState>,
     /// 未処理の `Wakeup` があるか（#816。詳細は `pty_loop::PtyLoop::wakeup_pending`）
     wakeup_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 器（psmux）の copy mode 滞在の追跡と in-band 解除の仕込み（#686）
+    copy_mode: std::sync::Mutex<CopyModeGate>,
+    /// PTY 直下の子プロセスの pid（#592。取得できない環境では None）
+    child_pid: Option<u32>,
 }
 
 /// ホイール転送レート制限（#167）の状態。tokens = 残イベント数、last = 最終補充時刻
 struct WheelRateState {
     tokens: f32,
     last: std::time::Instant,
+}
+
+/// 器（psmux）が copy mode（履歴閲覧）に居るあいだ打鍵を飲んでしまう問題への門番（#686）。
+///
+/// psmux はマウス要求のない内側アプリ（通常シェル）のペインでホイール報告を受けると
+/// copy mode に入り、滞在中の打鍵を copy-mode コマンドとして解釈して**シェルへ渡さない**。
+///
+/// 解除を器へ別経路（`send-keys -X cancel`）で撃つと「解除が届く前に打鍵が
+/// copy mode に食われる」競合が残るため、**同じ書き込みの先頭へ混ぜる**（in-band）。
+/// 転送したホイールの上下差を tako 側で数えるので、**器へ問い合わせずに
+/// 「いま遡っているか」を答えられる**（問い合わせるかどうかの門番になる）
+#[derive(Default)]
+struct CopyModeGate {
+    depth: i32,
+    exit: Option<Vec<u8>>,
+}
+
+impl CopyModeGate {
+    /// 器へ転送したホイール報告を記録する。正 = 過去方向（上）
+    fn note_wheel(&mut self, lines: i32) {
+        self.depth = self.depth.saturating_add(lines).max(0);
+        if self.depth == 0 {
+            // 最下部へ戻った = 器は copy mode を抜けている（実測）。
+            // ここで降ろさないと「下まで戻してから打鍵」でゴミ文字が入る
+            self.exit = None;
+        }
+    }
+
+    /// 器の履歴を遡っている最中か（器へ問い合わせずに答えられる）
+    fn scrolled_back(&self) -> bool {
+        self.depth > 0
+    }
+
+    /// 解除を仕込む。**既に最下部へ戻っていれば何もしない**
+    /// （器へ問い合わせた返事が届くまでの間にユーザーが下まで戻していた場合）
+    fn arm(&mut self, bytes: &[u8]) {
+        if self.scrolled_back() {
+            self.exit = Some(bytes.to_vec());
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.exit = None;
+    }
+
+    /// 仕込んである解除バイト列を取り出す（1 回だけ効く）。
+    /// 解除が入れば器は最下部へ戻るので、遡り量の勘定も 0 に戻す
+    fn take(&mut self) -> Option<Vec<u8>> {
+        let taken = self.exit.take();
+        if taken.is_some() {
+            self.depth = 0;
+        }
+        taken
+    }
 }
 
 impl TerminalSession {
@@ -264,6 +322,16 @@ impl TerminalSession {
         let mut pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
         // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
         let tty_name = slave_tty_name(&mut pty);
+        // 疑似コンソールの文字コードを UTF-8 に固定する（#655。Windows のみ実体を持つ）。
+        // ConPTY は OEM コードページ（日本語版 Windows なら CP932）で始まるため、
+        // 放っておくと子が吐いた UTF-8 バイトを conhost が CP932 として解釈し、
+        // **tako が受け取る前に**文字が壊れる（描画経路は入口から出口まで UTF-8 専用）。
+        // 子が疑似コンソールへ接続し終えるまで数十 ms かかるので、待ちは別スレッドへ
+        // 逃がす（UI スレッドは止めない）。失敗してもペインは起動する
+        let child_pid = pty_child_pid(&pty);
+        if let Some(pid) = child_pid {
+            crate::platform::console::pin_pane_to_utf8_when_ready(pid);
+        }
         // PTY 読み取りを OSC 7 / 133 タップで観測する（バイト列は変更しない。`osc_tap`）
         let pty = TapPty::new(
             pty,
@@ -294,6 +362,8 @@ impl TerminalSession {
                 listen_ports: Vec::new(),
                 scroll_fract: std::sync::Mutex::new(0.0),
                 wheel_carry: std::sync::Mutex::new(0.0),
+                copy_mode: std::sync::Mutex::new(CopyModeGate::default()),
+                child_pid,
                 wheel_rate: std::sync::Mutex::new(WheelRateState {
                     tokens: WHEEL_FORWARD_BURST,
                     last: std::time::Instant::now(),
@@ -346,10 +416,62 @@ impl TerminalSession {
     }
 
     /// PTY（シェルの stdin）へバイト列を書き込む。
-    /// キー入力時はスクロールバック表示を最下部へ戻す（一般的なターミナルの挙動）
+    /// キー入力時はスクロールバック表示を最下部へ戻す（一般的なターミナルの挙動）。
+    ///
+    /// 器（psmux）が copy mode に居ると分かっている場合は、**同じ書き込みの先頭に**
+    /// 解除バイト列を混ぜる（#686）。実端末の作法「スクロール中に打鍵したら最下部へ
+    /// 戻ってキーが通る」を、器へ別経路で命令せずに満たすためで、同じバイト列に
+    /// 載せるので器が解除より先に打鍵を見ることが構造的に起こらない
     pub fn write(&self, bytes: Vec<u8>) {
         self.scroll_to_bottom();
+        let bytes = match self.copy_mode_lock().take() {
+            Some(mut prefix) => {
+                prefix.extend_from_slice(&bytes);
+                prefix
+            }
+            None => bytes,
+        };
         self.notifier.notify(bytes);
+    }
+
+    /// PTY 直下の子プロセス（シェル / 明示コマンド）の pid（取得できない環境では None）。
+    /// 起動時に確定した値で、シェルが exec で入れ替わっても pid 自体は変わらない。
+    /// **プロセスの生存は保証しない**（終了後も残る）ので、生存前提の判定に使う側で確かめること
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
+    }
+
+    /// 器の履歴を遡っている最中か（転送したホイールの上下差 > 0。#686）。
+    /// **器へ問い合わせずに答えられる**ので、問い合わせるかどうかの門番に使う
+    pub fn wheel_scrolled_back(&self) -> bool {
+        self.copy_mode_lock().scrolled_back()
+    }
+
+    /// 次の書き込みの先頭へ混ぜる copy mode 解除バイト列を仕込む（#686）。
+    /// 器へ問い合わせて copy mode と分かってから呼ぶ
+    pub fn arm_copy_mode_exit(&self, bytes: &[u8]) {
+        self.copy_mode_lock().arm(bytes);
+    }
+
+    /// 仕込んだ解除を降ろす（#686）
+    pub fn disarm_copy_mode_exit(&self) {
+        self.copy_mode_lock().disarm();
+    }
+
+    /// `copy_mode` のロック（毒化耐性は他のロックと同じ理由）
+    fn copy_mode_lock(&self) -> std::sync::MutexGuard<'_, CopyModeGate> {
+        self.copy_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// マウス報告としてホイールを転送したときだけ遡り量を勘定する（#686）。
+    /// alternate scroll（矢印キー代替）は内側アプリのスクロールで、
+    /// 器の copy mode とは無関係なので数えない
+    fn note_mouse_report(&self, mode: TermMode, delta_lines: i32) {
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            self.copy_mode_lock().note_wheel(delta_lines);
+        }
     }
 
     /// クリップボード文字列の貼り付け。アプリが要求していればブラケットペーストで包む
@@ -428,7 +550,10 @@ impl TerminalSession {
         };
         match wheel_action(mode, delta_lines, col, row) {
             // 転送はスクロールバック表示を動かさない（write() の bottom 戻しも不要）
-            WheelAction::Write(bytes) => self.notifier.notify(bytes),
+            WheelAction::Write(bytes) => {
+                self.note_mouse_report(mode, delta_lines);
+                self.notifier.notify(bytes);
+            }
             WheelAction::ScrollDisplay(lines) => self.scroll_display(lines),
             WheelAction::None => {}
         }
@@ -453,7 +578,10 @@ impl TerminalSession {
             };
             if lines != 0 {
                 match wheel_action(mode, lines, col, row) {
-                    WheelAction::Write(bytes) => self.notifier.notify(bytes),
+                    WheelAction::Write(bytes) => {
+                        self.note_mouse_report(mode, lines);
+                        self.notifier.notify(bytes);
+                    }
                     // ALT_SCREEN + alternate scroll OFF は何もしない（履歴が無い）
                     WheelAction::ScrollDisplay(_) | WheelAction::None => {}
                 }
@@ -1255,6 +1383,31 @@ fn slave_tty_name(pty: &mut tty::Pty) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn slave_tty_name(_pty: &mut tty::Pty) -> Option<String> {
     // Linux は ptsname_r、Windows は ConPTY で別概念。必要になったフェーズで対応する
+    None
+}
+
+/// PTY 直下の子プロセスの pid（#592）。
+///
+/// alacritty_terminal の API がプラットフォームで分かれる: unix は `Pty::child()`
+/// （`std::process::Child`）、Windows は `Pty::child_watcher().pid()`
+/// （ConPTY 生成時の `GetProcessId`）。取得できなければ None
+/// （対応付けが劣化するだけで、既存経路には影響しない）。
+///
+/// **`platform/` 配下ではなくここに置く**: 分岐しているのは OS ではなく
+/// **外部クレートの型（`tty::Pty`）の API 形**なので、境界へ持ち上げると
+/// `platform/` が alacritty へ依存してしまう（境界は自己完結を保つ）
+#[cfg(unix)]
+fn pty_child_pid(pty: &tty::Pty) -> Option<u32> {
+    Some(pty.child().id())
+}
+
+#[cfg(windows)]
+fn pty_child_pid(pty: &tty::Pty) -> Option<u32> {
+    pty.child_watcher().pid().map(|p| p.get())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pty_child_pid(_pty: &tty::Pty) -> Option<u32> {
     None
 }
 

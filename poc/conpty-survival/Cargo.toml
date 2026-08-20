@@ -1,0 +1,24 @@
+[package]
+name = "conpty-survival"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# ルートの Cargo workspace には参加しない（ルート側も exclude = ["poc"]）。
+# 空の [workspace] を置くことで、このディレクトリ自体が独立ワークスペースのルートになる。
+[workspace]
+
+[[bin]]
+name = "poc-conpty"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
