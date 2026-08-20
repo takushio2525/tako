@@ -2564,3 +2564,12 @@
   判断ログと推奨（スライス移植）は `.agent/plans/2026-08-windows-main-merge-wip.md`
 - Windows 実機: `cargo build --workspace` 成功（5m24s / error 0 / warning 17）
 - 次: 方針決定（マージ続行 vs main へのスライス移植）
+
+## 2026-08-21（#467: master 裁定でスライス移植へ移行 / PII 除去 / stale プロセス掃除）
+- 裁定: #665 は reopen して main の復旧サブシステム上に作り直す / #662・#709 は main の #748・
+  `orchestrator accounts` で代替済みとして移植しない / 進め方はスライス移植を正式採用
+- `.agent/plans/2026-08-windows-main-merge-wip.md` にスライス 9 本の推奨順序・依存関係・
+  持ち込まないものの表・共通手順・落とし穴を追記（302 行）
+- 保全 4 ブランチから telemetry.md の実メールアドレスを除去して push（main / WIP は既にクリーン）。
+  Windows 機の stale `tako.exe` 2 プロセスを kill し既定 target が使えることを実測
+- 次: スライス移植 第 1 弾 = `platform/` 境界（別 worker）
