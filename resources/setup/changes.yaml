@@ -216,3 +216,21 @@ changes:
       セットアップは `tako remote setup` で対話的に行える（Tailscale の導入から serve 設定、
       QR コード生成までを案内）。`tako setup` の依存チェックにも tailscale が追加された（任意）。
       旧方式を使っていた場合は `tako remote setup` で新方式へ移行できる。
+
+  - revision: 13
+    version: "0.6.0"
+    date: "2026-08-02"
+    kind: auto
+    platforms: ["windows"]
+    title: PowerShell のシェル統合（cwd 追従・コマンド状態）を追加
+    description: |
+      Windows のシェル統合（OSC 7 / 133）が使えるようになった（Issue #525）。
+      これが入ると、ファイルツリーがペインの cwd を追いかけ、ペインのドットが
+      idle / running / failed（終了コード付き）で光るようになる。
+      macOS は環境変数の注入だけで済むが、PowerShell には相当する仕組みが無いため、
+      `tako setup` が PowerShell の $PROFILE へ管理ブロック（マーカーで囲んだ数行）を
+      書き込む。PowerShell 7 と Windows PowerShell 5.1 の両方が対象で、
+      $PROFILE の他の内容には触れない。何度実行してもブロックは 1 個のまま。
+      setup の再実行だけで適用される。反映は新しく開いたペインから。
+      配置したくない場合は `tako setup --shell-integration uninstall` で完全に取り除ける
+      （ブロックだけを削り、元のファイルはバイト単位で元に戻る）。

@@ -235,23 +235,18 @@ pub mod notes {
          (no PowerShell 7), commands chained with `&&` or `||` — including the built-in extension \
          defaults for C / C++ / Rust — fail to parse. Installing PowerShell 7 resolves this",
     );
-    /// #525: 環境チェック・設定生成・MCP 登録・winget 案内まで通る。
-    /// setup から設定**できない**項目だけが残る（何が残るかを具体的に書く）
-    pub const WIN_SETUP_PARTIAL: Note = Note::new(
-        "環境チェック・設定の生成・MCP 登録・winget での導入案内は動く。\
-         シェル統合（PowerShell）は Windows 未対応のため、状態の表示だけで設定はできない",
-        "Environment checks, config generation, MCP registration and winget install guidance all work. \
-         Shell integration (PowerShell) is unavailable on Windows, so setup only reports its status \
-         instead of configuring it",
-    );
-    /// #525: シェル統合（OSC 7 / 133）は zsh / bash / fish 用スクリプトしか同梱していない。
-    /// PowerShell 版が無いと **cwd 追従とコマンド状態の検知が効かない**ので、
-    /// 「何が起きないか」を具体的に書く（設定漏れと区別できるように）
-    pub const WIN_NO_SHELL_INTEGRATION: Note = Note::new(
-        "シェル統合（OSC 7 / 133）が zsh / bash / fish 用のみで PowerShell 版が無い。\
-         ペインの cwd 追従とコマンド実行状態の検知が働かない",
-        "Shell integration (OSC 7 / 133) ships only for zsh / bash / fish; there is no PowerShell \
-         version. Pane cwd tracking and command state detection do not work",
+    /// #525 で PowerShell のシェル統合（OSC 7 / 133）は入ったが、psmux を器にしている間は
+    /// 器が OSC を落とす（実測: 素の OSC・DCS の 2 形とも外へ出ず、平文だけが届く。#766）。
+    /// **何が動いて何が動かないか**を条件つきで書く（設定漏れと区別できるように）
+    pub const WIN_PANE_STATE_NEEDS_NO_CONTAINER: Note = Note::new(
+        "ペインの一覧・分割・入出力はそのまま動く。ペインの状態（待機中 / 実行中 / 失敗）と \
+         cwd 追従だけはシェル統合（OSC 7 / 133）に依存し、\
+         永続化の器（psmux）が OSC を外へ通さないため、器を使っている間は付かない。\
+         永続化を切ったペインでは働く",
+        "Listing, splitting and I/O all work. Only the pane state (idle / running / failed) and \
+         cwd tracking depend on shell integration (OSC 7 / 133), and the persistence container \
+         (psmux) does not forward OSC, so they stay empty while it is in use. \
+         They work in panes started with persistence turned off",
     );
     /// #525 と同根（claude バイナリの解決が POSIX シェル経由）。
     /// 機能そのものは残り、命名の質だけが落ちるので Pending ではなく Degraded
@@ -568,9 +563,13 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        // #525: 一覧そのものは完全に動く。`state` と `cwd` だけがシェル統合（OSC 7 / 133）
+        // に依存し、psmux を器にしている間は器が OSC を落とすので付かない
         key: "tako_list_panes",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_PANE_STATE_NEEDS_NO_CONTAINER,
+        },
     },
     Feature {
         key: "tako_logs",
@@ -994,11 +993,12 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        // #525 でシェル統合（PowerShell）まで設定できるようになったので縮退は解消。
+        // macOS との唯一の違いは届け方（env 注入 → `$PROFILE` への管理ブロック）で、
+        // setup から設定できる範囲は同じ。触ったファイルは setup 自身が出力する
         key: "tako_setup",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_SETUP_PARTIAL,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_setup_changes",

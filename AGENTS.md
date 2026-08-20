@@ -72,6 +72,7 @@ tako/
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh`（要 claude CLI + 認証） |
 | 自動セットアップ | `tako setup [--yes] [--answers <json|@file|->]`（質問ゼロ。`--review` だけ個別対話。MCP `tako_setup` と 1:1。#262） |
 | MCP セットアップ | `tako setup-mcp`（`~/.claude/settings.json` に自動追加。`--project` でプロジェクト単位） |
+| **シェル統合（cwd 追従・コマンド状態）の個別操作（#525）** | `tako setup --shell-integration <status\|install\|uninstall>`（標準の `tako setup` が既定で配置するので通常は不要）。**Windows は PowerShell の `$PROFILE`（7 / 5.1 の両方）へマーカーブロックを書く**。macOS は環境変数の注入で完結するので配置対象なし。MCP は `tako_setup` の `shell_integration` 引数と 1:1 |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱） |
 | **Windows 配布物生成** | `pwsh -File installer/windows/build-installer.ps1 [-Version v0.6.0]`（`dist/windows/` に `tako-setup-{tag}-x64.exe` + `tako-{tag}-windows-x64.zip`。Inno Setup 6 の ISCC が要る。#587） |

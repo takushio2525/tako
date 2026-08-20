@@ -159,6 +159,11 @@ pub struct SetupAnswers {
     /// "claude" / "codex" / "agy" = その場で対話起動、"none" = 起動しない。
     /// 省略時は TTY があれば対話で選択、なければ "none"
     pub launch_agent: Option<String>,
+    /// シェル統合（OSC 7 / 133）の扱い（Issue #525）。
+    /// "install"（省略時の既定）= 配置する、"skip" = 状態表示のみ、"uninstall" = 解除。
+    /// Windows では PowerShell の `$PROFILE` へマーカーブロックを書く操作にあたる
+    /// （macOS / Linux は環境変数の注入だけで完結するので "install" は実質何もしない）
+    pub shell_integration: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -225,6 +230,13 @@ impl SetupAnswers {
             if !matches!(agent, "claude" | "codex" | "agy" | "none") {
                 return Err(format!(
                     "launch_agent は claude / codex / agy / none のいずれかです: {agent}"
+                ));
+            }
+        }
+        if let Some(action) = self.shell_integration.as_deref() {
+            if !matches!(action, "install" | "skip" | "uninstall") {
+                return Err(format!(
+                    "shell_integration は install / skip / uninstall のいずれかです: {action}"
                 ));
             }
         }

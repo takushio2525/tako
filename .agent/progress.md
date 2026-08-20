@@ -1689,6 +1689,24 @@
 - 次: macOS のコンパイルは未検証（`ring` が絡み Windows からクロスチェック不可）→ CI 待ち。
   実際に蓋を閉じての確認は manual-checks.md に手順を追加
 
+## 2026-08-05（#525: PowerShell のシェル統合（OSC 7 / 133）を実装）
+
+- Windows でもペインの cwd 追従とコマンド状態（待機中 / 実行中 / 失敗 + 終了コード）が出るように
+  なった。macOS は env 注入で済むが PowerShell に `ZDOTDIR` 相当が無いため、`tako setup` が
+  `$PROFILE`（pwsh 7 / 5.1 の両方）へ**マーカーで囲んだ ASCII のブロック**を書く方式にした。
+  配置は冪等、解除は**バイト一致で復元**、既存ファイルの符号（CP932 等）は変えない
+- 実測で決まった設計 3 点: ①`133;C` は `PSConsoleHostReadLine` のラップで出す
+  （`PreCommandLookupAction` は PSReadLine が prompt 直後に引く 2 コマンドで誤爆する）
+  ②終了コードは `$?` → 履歴 ID 照合 → `$LASTEXITCODE` の順（cmdlet 失敗が直前の
+  ネイティブ終了コードを引き継ぐのを防ぐ） ③`$PROFILE` は OneDrive リダイレクトで
+  日本語パスになるので PowerShell 自身に 16 進で尋ねる
+- **psmux の器では効かない**（#766 起票）: `allow-passthrough on` を受理するのに OSC を
+  素通ししない実測を取り、`BackendCapabilities::osc_passthrough` を新設して器に尋ねる形に。
+  `tako_list_panes` は Windows で Degraded（一覧・入出力は動く / state と cwd だけ器の間は付かない）
+- 検証: 統合テスト 6 本（実 ConPTY で pwsh 7 / 5.1 の状態遷移と cwd 追従、器の中の限界、
+  統合なしの対照）+ 単体 12 本 + 実 `$PROFILE` e2e（CP932 の既存ファイルを壊さず配置 → 冪等 →
+  解除でバイト一致復元）。関連: PR（Closes #525）
+
 ## 2026-08-01（#709: claude ログインアカウントの高速切替）
 
 - 部品（accounts.yaml #504 / ログイン状態読み取り #653 / master_account・worker_account）は

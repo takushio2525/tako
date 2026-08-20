@@ -154,7 +154,29 @@ fn parse_cwd(uri: &[u8]) -> Option<OscEvent> {
     if path.is_empty() {
         return None;
     }
-    Some(OscEvent::CwdChanged(PathBuf::from(path)))
+    Some(OscEvent::CwdChanged(PathBuf::from(strip_drive_slash(
+        &path,
+    ))))
+}
+
+/// `file:///C:/Users/x` の先頭 `/` を落とす（RFC 8089 の Windows 形式 file URI）。
+///
+/// これを付けたまま渡すと Windows では**存在しないパス**になり cwd 追従が全滅する。
+/// 落とす条件は「`/` + ASCII 英字 + `:` の直後が `/` か終端」に限るので、
+/// `C:` という名前のディレクトリを持つ POSIX の絶対パスとは取り違えない
+/// （それでも当たるのは `/C:` ちょうどか `/C:/…` だけ。実在すれば異常な構成）
+fn strip_drive_slash(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    let looks_like_drive = bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes.len() == 3 || bytes[3] == b'/');
+    if looks_like_drive {
+        &path[1..]
+    } else {
+        path
+    }
 }
 
 /// `A` / `B` / `C` / `D[;exit[;...]]`。各マークの後ろに `;key=value` が続く方言も先頭だけ見る
@@ -388,6 +410,42 @@ mod tests {
         let mut s = OscScanner::new();
         let events = s.scan(b"\x1b]133;A\x1b]7;file:///tmp\x07");
         assert_eq!(events, vec![OscEvent::CwdChanged(PathBuf::from("/tmp"))]);
+    }
+
+    #[test]
+    fn windows形式のfile_uriはドライブレターから始まるパスになる() {
+        // PowerShell 統合が出す形（#525）。先頭 `/` が残ると Windows で解決できない
+        assert_eq!(
+            parse_cwd(b"file:///C:/Users/foo/dev"),
+            Some(OscEvent::CwdChanged(PathBuf::from("C:/Users/foo/dev")))
+        );
+        // ドライブ直下・percent エンコードされた日本語・ホスト名付きも同じ扱い
+        assert_eq!(
+            parse_cwd(b"file:///D:/"),
+            Some(OscEvent::CwdChanged(PathBuf::from("D:/")))
+        );
+        assert_eq!(
+            parse_cwd(b"file:///C:/%E4%BD%9C%E6%A5%AD"),
+            Some(OscEvent::CwdChanged(PathBuf::from("C:/作業")))
+        );
+        assert_eq!(
+            parse_cwd(b"file://host/C:/tmp"),
+            Some(OscEvent::CwdChanged(PathBuf::from("C:/tmp")))
+        );
+    }
+
+    #[test]
+    fn posixの絶対パスはドライブ判定に巻き込まれない() {
+        // macOS / Linux 側の解釈は 1 バイトも変えない
+        assert_eq!(
+            parse_cwd(b"file:///Users/foo"),
+            Some(OscEvent::CwdChanged(PathBuf::from("/Users/foo")))
+        );
+        // 2 文字目が英字でも `:` が続かなければドライブではない
+        assert_eq!(strip_drive_slash("/Cx/tmp"), "/Cx/tmp");
+        // `:` の後ろが区切りでなければドライブではない
+        assert_eq!(strip_drive_slash("/C:x/tmp"), "/C:x/tmp");
+        assert_eq!(strip_drive_slash("/tmp"), "/tmp");
     }
 
     #[test]

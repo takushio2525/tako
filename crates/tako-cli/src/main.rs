@@ -2188,6 +2188,14 @@ struct SetupArgs {
     /// 前回設定を setup agent と個別に見直す
     #[arg(long, conflicts_with_all = ["check", "changes", "yes", "answers"])]
     review: bool,
+    /// シェル統合（OSC 7 / 133）だけを操作して終了する（status / install / uninstall）。
+    /// 標準の `tako setup` は質問ゼロで配置まで済ませるので、通常は不要
+    #[arg(
+        long,
+        value_name = "ACTION",
+        conflicts_with_all = ["check", "changes", "reset", "yes", "answers", "review"]
+    )]
+    shell_integration: Option<String>,
 }
 
 #[derive(Args)]
@@ -2365,7 +2373,9 @@ fn cli_main() -> ExitCode {
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
         Command::Setup(ref args) => {
-            if args.check {
+            if let Some(action) = args.shell_integration.as_deref() {
+                setup::run_shell_integration(action)
+            } else if args.check {
                 setup::run_check()
             } else if args.changes {
                 setup::run_changes(args.json)

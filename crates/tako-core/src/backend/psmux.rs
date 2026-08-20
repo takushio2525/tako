@@ -205,6 +205,11 @@ impl SessionBackend for PsmuxBackend {
             detached_capture: true,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            // **実測（#525。追跡は #766）**: `allow-passthrough on` を設定しても OSC は外へ出ない。
+            // 素の OSC・DCS（ESC 二重化あり / なし）の 3 形とも届かず、同時に流した
+            // 平文だけが外側の画面に出た = psmux はオプションを受理するが素通しはしない。
+            // このため psmux ペインでは cwd 追従とコマンド状態が働かない
+            osc_passthrough: false,
             label: "psmux",
         }
     }

@@ -2462,6 +2462,14 @@ pub fn tools() -> Vec<Value> {
                         },
                         "additionalProperties": false,
                     },
+                    "shell_integration": {
+                        "type": "string",
+                        "enum": ["install", "skip", "uninstall"],
+                        "description": "シェル統合（OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態）の扱い。\
+                            省略時は install。Windows では PowerShell の $PROFILE へ管理ブロックを書く操作にあたる\
+                            （macOS / Linux は環境変数の注入だけで完結するので install は実質何もしない）。\
+                            ユーザーが「プロファイルを触らないで」と言った場合だけ skip、外したいときは uninstall",
+                    },
                 },
                 "additionalProperties": false,
             },

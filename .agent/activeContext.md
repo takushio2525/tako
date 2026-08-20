@@ -4,27 +4,30 @@
 > 過去ログは `progress.md` を見ること。ここには履歴を残さない。
 > セッション開始時に AGENTS.md の直後に必ず読む。
 
-## 現在の対象（2026-08-01・Windows 実機 — #709 完了）
+## 現在の対象（2026-08-05・Windows 実機 — #525 シェル統合）
 
-**#709 マージ済み**（PR #712 → `47a524f`）。claude ログインアカウントの切替を
-`tako account`（list / add / remove / show / login / use）へ 1 本化した。
+**#525 の本体（PowerShell の OSC 7 / 133 シェル統合）を実装**。ペインの cwd 追従と
+コマンド状態（待機中 / 実行中 / 失敗 + 終了コード）が Windows でも出るようになった。
 
-- MCP は新ツールを増やさず `tako_orchestrator_accounts` に action を足して 1:1（129 ツールのまま）
-- 前提として **main のアカウントモデル #512 / #543 を先に移植**した（`config_dir: Option<String>`
-  + `inherit` + `AccountConfigDir` + `EnvPlan`）。claude は `CLAUDE_CONFIG_DIR` が**設定されて
-  いるだけで**資格情報エントリを分けるので、「既定の資格情報を使う」は既定パスの明示ではなく
-  **未設定**でしか表現できない。`inherit` は起動コマンドで明示 unset を出す
-- ログイン状態は 3 値（`missing` / `logged_out` / `logged_in`）+ 壊れたエントリの `invalid`
-- GUI は ⌘K パレットの「claude アカウントを切り替え」（default プロファイルの master へ割り当て）
+- 届け方が macOS と違う。PowerShell に `ZDOTDIR` 相当が無いので、`tako setup` が
+  `$PROFILE`（pwsh 7 と 5.1 の両方）へ**マーカーで囲んだ ASCII のブロック**を書く。
+  冪等・解除でバイト一致復元・既存の符号（CP932 等）を壊さない
+- `133;C`（実行開始）のフックは **`PSConsoleHostReadLine` のラップ**。
+  `PreCommandLookupAction` は PSReadLine が prompt 直後に
+  `PSConsoleHostReadLine` / `Set-StrictMode` を引くので誤爆する（実測）
+- **psmux（器）の中では効かない** — psmux は `allow-passthrough on` を受理するのに
+  OSC を素通ししない（実測。平文だけ届く）。`BackendCapabilities::osc_passthrough` を
+  新設して器に尋ねる形にし、setup が理由つきで表示する。追跡は **#766**
 
 ## 次の一手
 
-1. **稼働中 GUI は旧バイナリ**なので `tako account` はまだ使えない。次のインストーラー更新で反映
-2. **main とのアカウントモデル統合（マージ時の宿題）**: main には CLI
-   `tako orchestrator accounts`（#548/#556）が別途あるので、両方の CLI パスを同じ dispatch へ
-   向ける（ロジックは二重化しない）。master への account 適用も本ブランチ #653 と main #555 が
-   独立実装で衝突する既知の債務
-3. **#623 の実機確認（未決）**: 日本語入力の打鍵消失は直った確証が無い。症状が出たら
+1. **#766**（psmux の器で OSC が届かない）。候補は ①psmux に passthrough を実装
+   ②器へ `#{pane_current_path}` をポーリング ③器を替える。②はコスト実測が要る
+2. **稼働中 GUI は旧バイナリ**なので反映は次のインストーラー更新から
+3. **main とのアカウントモデル統合（#709 の宿題）**: main の CLI
+   `tako orchestrator accounts`（#548/#556）と本ブランチの `tako account` を
+   同じ dispatch へ向ける（ロジックは二重化しない）
+4. **#623 の実機確認（未決）**: 日本語入力の打鍵消失は直った確証が無い。症状が出たら
    `TAKO_IME_DIAG=1 TAKO_PERF_LOG=<path>` で採取し #623 のコメント §5 で切り分ける
 
 ## mac 側 master への引き継ぎ（マージ後に要対応）

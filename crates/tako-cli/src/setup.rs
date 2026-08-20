@@ -434,7 +434,12 @@ const WINDOWS_DEPS: &[ExternalDep] = &[
 /// interactive = true なら未導入の依存をその場でインストールできる
 /// （macOS = Homebrew、Windows = winget）。
 /// 戻り値は検出したエージェントと、チェック後も欠けている必須依存の一覧。
-fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) {
+/// `shell_integration` はシェル統合ステップの扱い（`--check` は表示のみ、
+/// `tako setup` は配置まで）。
+fn run_dependency_check(
+    interactive: bool,
+    shell_integration: ShellIntegrationAction,
+) -> (Vec<DetectedAgent>, Vec<String>) {
     let agents = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
@@ -515,8 +520,8 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
             missing_required.push(dep.bin.to_string());
         }
     }
-    // シェル統合（cwd 追従・コマンド状態）の状態
-    run_shell_integration_check();
+    // シェル統合（cwd 追従・コマンド状態）の状態と、必要なら配置
+    run_shell_integration_check(shell_integration);
     // FDA チェック（macOS のみ。任意だが強く推奨）
     #[cfg(target_os = "macos")]
     {
@@ -527,32 +532,147 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
     (agents, missing_required)
 }
 
-/// シェル統合（OSC 7 / 133）の状態を出す。
+/// シェル統合ステップで何をするか（Issue #525）。
 ///
-/// 未対応の環境で黙って飛ばすと、ユーザーには「ファイルツリーが cwd を追わない」
-/// 「コマンド状態のドットが灰色のまま」が**設定ミスにしか見えない**。
-/// 対応状況の知識は `tako_core::shell_integration` が持つ（ここに cfg は書かない）
-fn run_shell_integration_check() {
-    use tako_core::shell_integration::Availability;
+/// `--check` は状態を見るだけ、`tako setup` は配置まで行う、という違いを
+/// 呼び出し側の bool 連打ではなく型で表す
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegrationAction {
+    /// 状態を表示するだけ
+    Report,
+    /// 未配置・古い配置なら配置する（冪等）
+    Install,
+    /// 配置を取り除く
+    Uninstall,
+}
 
-    eprintln!();
-    match tako_core::shell_integration::availability() {
-        Availability::Supported(shells) => {
-            eprintln!("  [OK] シェル統合: 有効（{shells}）");
-            eprintln!("      ペインの cwd 追従とコマンド実行状態の検知に使います");
-        }
-        Availability::Unsupported { note, issue } => {
-            eprintln!("  [未対応] シェル統合: この環境では有効にできません");
-            eprintln!("      理由: {}", note.text());
-            eprintln!(
-                "      影響: ファイルツリーの cwd 追従と、ペインのコマンド状態ドットが働きません"
-            );
-            eprintln!(
-                "      エージェントの稼働監視・オーケストレーションは別経路なので影響しません"
-            );
-            eprintln!("      追跡: #{issue}（設定は不要です。実装され次第、自動で有効になります）");
+impl ShellIntegrationAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "status" | "skip" | "report" => Some(Self::Report),
+            "install" => Some(Self::Install),
+            "uninstall" | "remove" => Some(Self::Uninstall),
+            _ => None,
         }
     }
+}
+
+/// シェル統合（OSC 7 / 133）の状態を出し、必要なら配置・解除する。
+///
+/// 黙って飛ばすと、ユーザーには「ファイルツリーが cwd を追わない」
+/// 「コマンド状態のドットが灰色のまま」が**設定ミスにしか見えない**。
+/// 届け方（env 注入 / `$PROFILE` 注入）の知識は `tako_core::shell_integration` が
+/// 持つ（ここに cfg は書かない）
+fn run_shell_integration_check(action: ShellIntegrationAction) {
+    use tako_core::shell_integration::{self, ChangeKind, Delivery};
+
+    eprintln!();
+    if action == ShellIntegrationAction::Uninstall {
+        match shell_integration::uninstall() {
+            Ok(changes) => {
+                for change in &changes {
+                    let what = match change.kind {
+                        ChangeKind::Removed => "解除しました",
+                        ChangeKind::Deleted => "解除し、空になったファイルを削除しました",
+                        _ => "もともと配置されていません",
+                    };
+                    eprintln!(
+                        "  [設定] シェル統合を{what}（{}: {}）",
+                        change.label,
+                        display_home_relative(&change.path)
+                    );
+                }
+                eprintln!("      次に開いたペインから cwd 追従とコマンド状態が無効になります");
+            }
+            Err(e) => eprintln!("  [警告] シェル統合を解除できません: {e}"),
+        }
+        return;
+    }
+
+    let status = shell_integration::status();
+    if action == ShellIntegrationAction::Install && !status.installed() {
+        match shell_integration::install() {
+            Ok(changes) => {
+                for change in &changes {
+                    let what = match change.kind {
+                        ChangeKind::Installed => "配置しました",
+                        ChangeKind::Updated => "最新へ更新しました",
+                        _ => "配置済みです",
+                    };
+                    eprintln!(
+                        "  [設定] シェル統合を{what}（{}: {}）",
+                        change.label,
+                        display_home_relative(&change.path)
+                    );
+                }
+                eprintln!("      新しく開いたペインから cwd 追従とコマンド状態が有効になります");
+                // 配置できても器が OSC を落とすなら効かない。黙っていると
+                //「設定したのに何も起きない」になるので必ず言う（#525）
+                if let Some(reason) = &status.blocked_by_backend {
+                    eprintln!("  [注意] ただし現在は働きません: {reason}");
+                    eprintln!("      追跡: #766（永続化を切ると有効になります）");
+                }
+                return;
+            }
+            Err(e) => {
+                // MCP 登録と同じ扱い: ここで setup 全体を止めない（他の設定は成立する）
+                eprintln!("  [警告] シェル統合を配置できません: {e}");
+                eprintln!("      ペインの cwd 追従とコマンド状態ドットが働きません");
+                return;
+            }
+        }
+    }
+
+    if status.effective() {
+        eprintln!("  [OK] シェル統合: 有効（{}）", shell_integration::shells());
+        eprintln!("      ペインの cwd 追従とコマンド実行状態の検知に使います");
+        for target in &status.targets {
+            eprintln!(
+                "      配置先: {}（{}）",
+                display_home_relative(&target.path),
+                target.label
+            );
+        }
+        return;
+    }
+
+    if status.installed() {
+        // 配置は済んでいるが器が OSC を落としている
+        eprintln!("  [注意] シェル統合: 配置済みだが現在は働きません");
+        if let Some(reason) = &status.blocked_by_backend {
+            eprintln!("      {reason}");
+        }
+        for target in &status.targets {
+            eprintln!(
+                "      配置先: {}（{}）",
+                display_home_relative(&target.path),
+                target.label
+            );
+        }
+        eprintln!("      追跡: #766（永続化を切ると有効になります）");
+        return;
+    }
+
+    eprintln!("  [不足] シェル統合: 未配置");
+    eprintln!("      ペインの cwd 追従とコマンド実行状態の検知が働きません");
+    if status.delivery == Delivery::Profile {
+        for target in &status.targets {
+            let state = if target.installed {
+                "古い設定が入っています"
+            } else {
+                "未配置"
+            };
+            eprintln!(
+                "      {}: {}（{state}）",
+                target.label,
+                display_home_relative(&target.path)
+            );
+        }
+        if status.targets.is_empty() {
+            eprintln!("      PowerShell が見つからないため配置先がありません");
+        }
+    }
+    eprintln!("      配置: tako setup");
 }
 
 /// この環境のパッケージマネージャ。macOS = Homebrew、Windows = winget。
@@ -1749,13 +1869,25 @@ fn mark_setup_complete(
 
 // --- メインエントリ ---
 
+/// `tako setup --shell-integration <status|install|uninstall>` — その 1 ステップだけ実行する。
+///
+/// 標準フロー（`tako setup`）は質問ゼロで配置まで済ませるので、これは
+/// 「入れ直したい / 外したい / どこに入っているか見たい」上級者向けの逃げ道
+pub fn run_shell_integration(action: &str) -> Result<(), String> {
+    let action = ShellIntegrationAction::parse(action).ok_or_else(|| {
+        format!("--shell-integration は status / install / uninstall のいずれかです: {action}")
+    })?;
+    run_shell_integration_check(action);
+    Ok(())
+}
+
 /// `tako setup --check` — 環境チェックだけ実行して終了
 pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
 
     // エージェント CLI + 任意依存。--check では表示のみ。
-    let (agents, _) = run_dependency_check(false);
+    let (agents, _) = run_dependency_check(false, ShellIntegrationAction::Report);
 
     // MCP 登録（claude のみ永続登録。codex は master 起動時注入、agy は worker 専用）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
@@ -1905,13 +2037,16 @@ pub fn run_check() -> Result<(), String> {
     }
 
     // シェル統合（cwd 追従・コマンド状態）
-    match tako_core::shell_integration::availability() {
-        tako_core::shell_integration::Availability::Supported(shells) => {
-            eprintln!("  [OK] シェル統合: 有効（{shells}）");
-        }
-        tako_core::shell_integration::Availability::Unsupported { note, issue } => {
-            eprintln!("  [未対応] シェル統合: {}（追跡: #{issue}）", note.text());
-        }
+    let shell_status = tako_core::shell_integration::status();
+    if shell_status.effective() {
+        eprintln!(
+            "  [OK] シェル統合: 有効（{}）",
+            tako_core::shell_integration::shells()
+        );
+    } else if let Some(reason) = &shell_status.blocked_by_backend {
+        eprintln!("  [注意] シェル統合: 配置済みだが現在は働きません — {reason}");
+    } else {
+        eprintln!("  [不足] シェル統合: 未配置（tako setup で配置できます）");
     }
 
     // プロファイル一覧
@@ -2017,7 +2152,13 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     // setup 中は項目別 y/n を出さない。未導入依存・FDA・スリープ設定は状態と
     // 専用コマンドだけを表示し、ユーザーが必要なときに個別操作できるようにする。
-    let (agents, missing) = run_dependency_check(false);
+    // シェル統合だけは MCP 登録と同じ「設定の生成」なので既定で配置まで行う（#525）。
+    let shell_integration = answers
+        .shell_integration
+        .as_deref()
+        .and_then(ShellIntegrationAction::parse)
+        .unwrap_or(ShellIntegrationAction::Install);
+    let (agents, missing) = run_dependency_check(false, shell_integration);
     if !missing.is_empty() {
         return Err(format!(
             "必須の依存ツールが不足しています: {}。\n\

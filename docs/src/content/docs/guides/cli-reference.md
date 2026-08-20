@@ -49,11 +49,24 @@ tako setup --changes --json
 
 # セットアップ状態をリセットして最初からやり直す
 tako setup --reset
+
+# シェル統合（ペインの cwd 追従・コマンド状態）だけを操作する
+tako setup --shell-integration status
+tako setup --shell-integration uninstall
 ```
 
 tako のアップデートでセットアップ項目・設定フォーマット・master 用システムプロンプトが変わることがあります。`--changes` で未適用の変更を確認でき、`tako setup` を再実行すると既存カスタマイズを維持しながら最新状態へ追従できます（詳細は[セットアップガイド](/getting-started/#アップデート後の追従-tako-setup-の再実行)）。
 
-`--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は dispatch `SetupRun` と MCP `tako_setup` でも利用できるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
+`--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard`、`shell_integration` を受け取ります。同じ JSON は dispatch `SetupRun` と MCP `tako_setup` でも利用できるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
+
+#### シェル統合（cwd 追従・コマンド状態）
+
+ファイルツリーがペインの作業ディレクトリを追いかけ、ペインのドットが待機中 / 実行中 / 失敗（終了コード付き）で光るのは、シェルが出す OSC 7 / 133 を tako が読んでいるからです。`tako setup` はこの仕組みを既定で有効にします。
+
+- **macOS / Linux**: 環境変数を注入するだけなので、ユーザーのファイルは一切変更しません
+- **Windows**: PowerShell には相当する環境変数が無いため、`$PROFILE`（PowerShell 7 と Windows PowerShell 5.1 の両方）へマーカーで囲んだ管理ブロックを書き込みます。ブロック以外の内容には触れず、何度実行してもブロックは 1 個のままです
+
+反映されるのは**新しく開いたペイン**からです。配置先の確認や取り外しは `--shell-integration` で行えます（`uninstall` はブロックだけを削り、元のファイルをバイト単位で元に戻します）。
 
 ### tako setup-mcp
 
