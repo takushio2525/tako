@@ -2239,3 +2239,16 @@
   checkpoint + クロスチェック エラー 0・警告 11（ベースライン 16 から減）+ Windows 実機ビルド成功・
   失敗 29 件はすべて main 由来（#583 既知 18 + 以降追加の同系 6 + 未実行だった tako-core 5）
 - 関連: PR #845（`Refs #467`）。詳細と申し送りは `.agent/plans/2026-08-windows-main-merge-wip.md` のスライス 1 節
+
+## 2026-08-21（#467 スライス 2a: 永続化の器 psmux を main へ移植）
+- Windows の永続化バックエンド（tako を閉じても実行中プロセスと画面が残る器）を psmux で実装。
+  `backend/{psmux,owner}.rs` + 実バイナリ適合検証。スライス 1 の `platform::process` /
+  `platform::console` をここで配線（コンソール窓抑止・器の中のコードページ utf8 固定）
+- 到達手段を採取（`DetachedCapture`）と送出（`DetachedAccess`）に分離。psmux は
+  capture-pane が動くが送出は不可なので、採取しかしない 5 経路を capture 側へ寄せた
+  （送出する 3 経路は据え置き）。tmux 側の呼び出しは 1 行も変えていない
+- 検証: macOS 全ゲート緑（test 2192 passed / セルフテスト OK / visual-test 98 checkpoint /
+  クロスチェック 警告 11）+ **Windows 実機で psmux 適合 14/0（17.36s・全件が実際に走った）**。
+  plan が見込んでいた「psmux e2e 8 件」は解消。全体の失敗は 29→30 で、増えた 1 件は #822 由来
+  （`TAKO_BACKEND=none` でも同じ行で落ちることを実測）
+- 関連: PR #848（`Refs #467`）。ConPTY の外側 PTY（#655/#659）と #686 は 2b へ送った
