@@ -781,6 +781,12 @@ pub enum Request {
         auto_handoff: Option<bool>,
         #[serde(default)]
         clear_auto_handoff: bool,
+        /// このプロファイルから spawn した worker で利用上限後の自動復帰を
+        /// 既定 ON にするか（既定 false。#822 / FR-2.27）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_resume: Option<bool>,
+        #[serde(default)]
+        clear_limit_resume: bool,
     },
     /// オーケストレーター: アカウントレジストリの CRUD（Issue #504）。
     /// action: list / show / add / remove
@@ -838,6 +844,10 @@ pub enum Request {
         /// アカウント名（accounts.yaml のキー。この worker だけ該当 config dir で起動。#504）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
+        /// この worker だけ利用上限後の自動復帰（FR-2.27 / #813）を明示指定する（#822）。
+        /// 省略時はプロファイルの `limit_resume` → false
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_resume: Option<bool>,
     },
     /// オーケストレーター: master が自身の pane/tab/ctx% を取得する（#123 / #193 / #288）。
     /// 解決順序: caller_pid pid 祖先辿り → pane env → stale map → role 検索（複数時エラー）

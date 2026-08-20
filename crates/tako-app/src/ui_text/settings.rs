@@ -1057,6 +1057,20 @@ pub fn desc_prof_auto_handoff() -> &'static str {
     )
 }
 
+pub fn prof_label_limit_resume() -> &'static str {
+    tr!(
+        "worker のリミット後自動復帰",
+        "Auto-resume workers after limits"
+    )
+}
+
+pub fn desc_prof_limit_resume() -> &'static str {
+    tr!(
+        "このプロファイルから spawn した worker を、利用上限のリセット後に tako が自動で再開させる（ペインごとの切替は右クリック）",
+        "tako restarts workers spawned from this profile once the usage limit resets (per-pane toggle is in the right-click menu)"
+    )
+}
+
 pub fn prof_ctx_threshold_range() -> &'static str {
     tr!(
         "引き継ぎ閾値は 50〜60 の数字で指定してください",
@@ -1332,6 +1346,8 @@ mod tests {
                 desc_prof_ctx_threshold().into(),
                 prof_label_auto_handoff().into(),
                 desc_prof_auto_handoff().into(),
+                prof_label_limit_resume().into(),
+                desc_prof_limit_resume().into(),
                 prof_ctx_threshold_range().into(),
                 prof_env_add().into(),
                 prof_env_masked().into(),

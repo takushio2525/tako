@@ -415,6 +415,8 @@ pub fn run_worker(
         caller_pid: None,
         task_type: opts.task_type.clone(),
         account: opts.account.clone(),
+        // #822: run は個別上書きを持たない（プロファイルの limit_resume がそのまま効く）
+        limit_resume: None,
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
@@ -657,6 +659,8 @@ pub fn run_start(
         caller_pid: None,
         task_type: opts.task_type.clone(),
         account: opts.account.clone(),
+        // #822: run は個別上書きを持たない（プロファイルの limit_resume がそのまま効く）
+        limit_resume: None,
     })?;
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);

@@ -547,6 +547,42 @@ permission ダイアログ・plan 確認・API エラー・普通の idle では
 MCP は `tako_limit_resume` が 1:1 対応。`tako list` / `tako read` /
 `tako orchestrator worker-status` にも状態が載る。
 
+### spawn した worker へ既定で効かせる（Issue #822）
+
+長時間の自律運転では「spawn するたびに手で ON」が最後の人間依存点になる。
+プロファイルに `limit_resume` を持たせると、**そのプロファイルから spawn した
+worker ペインが最初から有効**になる。
+
+```bash
+# プロファイル既定を ON にする（以後 spawn した worker は自動復帰の対象）
+tako orchestrator profiles set myprofile --limit-resume true
+
+# 既定へ戻す（= 無効。ペイン単位のオプトインだけになる）
+tako orchestrator profiles set myprofile --clear-limit-resume
+
+# この worker だけ個別に指定する（プロファイル既定より優先）
+tako orchestrator spawn --project tako --prompt "..." --limit-resume true
+tako orchestrator spawn --project tako --prompt "..." --limit-resume false
+```
+
+解決順は **spawn 引数 → プロファイル → 無効**。`--limit-resume false` は「未指定」ではなく
+**明示 OFF** なので、プロファイルが ON でもその worker だけ切れる。
+
+適用されたかは 3 か所で読める:
+
+- `tako orchestrator spawn` の応答の `limit_resume`
+- `tako orchestrator workers` の各行の `limit_resume`（ペインが居ないときは `null`）
+- `tako orchestrator worker-status` / `tako read` / `tako list` の `limit_resume`
+  （ヘッダのループアイコンも同じペイン属性を読む）
+
+GUI は設定画面（⌘,）→ プロファイル → 「worker のリミット後自動復帰」。
+`tako orchestrator profiles show` の `resolved_limit_resume` が実効値
+（未設定なら false）で、GUI のトグルもこれを表示している。
+
+**solo プロファイルでは効かない**（solo は worker を spawn しないため）。ON にすると
+`profiles list` / `show` / `set` が警告を返すので、solo で使いたいときはペイン単位の
+`tako limit-resume on` を使う。
+
 ## 品質パイプライン（全プロファイル共通）
 
 6 PR 横断レビュー（2026-07-03）で得た運用知見を、Issue #100（2026-07-07）で

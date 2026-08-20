@@ -1385,6 +1385,8 @@ pub fn tools() -> Vec<Value> {
                     "clear_ctx_threshold": { "type": "boolean", "description": "ctx_threshold の指定を解除する（config.yaml → 既定 60 へ戻る。set 時。#749）" },
                     "auto_handoff": { "type": "boolean", "description": "閾値超過時に tako が master へ引き継ぎを促す自動通知（既定 true）。false にすると通知は止まるが tako_orchestrator_self / tako_orchestrator_handoff は従来どおり使える（set 時。#749）" },
                     "clear_auto_handoff": { "type": "boolean", "description": "auto_handoff の指定を解除して既定（有効）へ戻す（set 時。#749）" },
+                    "limit_resume": { "type": "boolean", "description": "このプロファイルから spawn した worker ペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時。#822）。spawn 側の limit_resume が指定されていればそちらが勝つ" },
+                    "clear_limit_resume": { "type": "boolean", "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）" },
                 },
                 "additionalProperties": false,
             },
@@ -1487,6 +1489,12 @@ pub fn tools() -> Vec<Value> {
                             spawn 時に自動記録され、ledger stats で task_type x model の成功率・差し戻し率を集計できる",
                     },
                     "account": { "type": "string", "description": "アカウント名（accounts.yaml のキー。この worker だけ該当 config dir / モデルで起動する。#504）" },
+                    "limit_resume": {
+                        "type": "boolean",
+                        "description": "この worker だけ利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を明示指定する（#822）。\
+                            省略時はプロファイルの limit_resume → 無効。長時間の自律タスクを任せるときに true にする。\
+                            適用結果は応答の limit_resume に返る（ペイン単位の切替は tako_limit_resume）",
+                    },
                 },
                 "required": ["project", "prompt"],
                 "additionalProperties": false,

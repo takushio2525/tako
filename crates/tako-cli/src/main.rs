@@ -1402,6 +1402,10 @@ enum OrchestratorCommand {
         /// アカウント名（accounts.yaml のキー。この worker だけ該当アカウントで起動する。#504）
         #[arg(long)]
         account: Option<String>,
+        /// この worker だけ利用上限後の自動復帰を明示指定する
+        /// （省略時はプロファイルの limit_resume → 無効。#822）
+        #[arg(long)]
+        limit_resume: Option<bool>,
     },
     /// worker の状態確認（busy / idle / error / gone / unknown。error 時は
     /// error.kind（api_error / usage_limit / limit_dialog）と recommended_action を含む。#157）
@@ -1804,6 +1808,12 @@ enum ProfilesCommand {
         /// auto_handoff を解除して既定（有効）へ戻す（#749）
         #[arg(long)]
         clear_auto_handoff: bool,
+        /// spawn した worker で利用上限後の自動復帰を既定 ON にする（既定 false。#822）
+        #[arg(long, conflicts_with = "clear_limit_resume")]
+        limit_resume: Option<bool>,
+        /// limit_resume を解除して既定（無効）へ戻す（#822）
+        #[arg(long)]
+        clear_limit_resume: bool,
     },
 }
 
@@ -3619,6 +3629,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_ctx_threshold,
             auto_handoff,
             clear_auto_handoff,
+            limit_resume,
+            clear_limit_resume,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -3655,6 +3667,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_ctx_threshold: *clear_ctx_threshold,
             auto_handoff: *auto_handoff,
             clear_auto_handoff: *clear_auto_handoff,
+            limit_resume: *limit_resume,
+            clear_limit_resume: *clear_limit_resume,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -5523,6 +5537,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tab,
             task_type,
             account,
+            limit_resume,
         }) => {
             let pane_resolved = if pane.is_some() {
                 *pane
@@ -5548,6 +5563,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 caller_pid: Some(std::process::id()),
                 task_type: task_type.clone(),
                 account: account.clone(),
+                limit_resume: *limit_resume,
             }
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {

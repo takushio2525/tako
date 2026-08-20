@@ -496,6 +496,8 @@ impl SettingsWindow {
             clear_ctx_threshold: false,
             auto_handoff: None,
             clear_auto_handoff: false,
+            limit_resume: None,
+            clear_limit_resume: false,
         };
         match self.dispatch(request, cx) {
             Ok(_) => {
@@ -972,6 +974,7 @@ impl SettingsWindow {
             .as_u64()
             .unwrap_or(u64::from(tako_core::handoff::CTX_THRESHOLD_DEFAULT));
         let auto = detail["resolved_auto_handoff"].as_bool().unwrap_or(true);
+        let limit_resume = detail["resolved_limit_resume"].as_bool().unwrap_or(false);
         div()
             .flex()
             .flex_col()
@@ -994,6 +997,19 @@ impl SettingsWindow {
                     auto,
                     cx.listener(move |this, _, _, cx| {
                         this.set_profile(|p| p.auto_handoff = Some(!auto), cx);
+                    }),
+                ),
+            ))
+            // worker の自動復帰の既定（#822）。実効値は dispatch が返すので
+            // 未設定でも「今 spawn したらどうなるか」がそのままトグルに出る
+            .child(self.row(
+                txt::prof_label_limit_resume(),
+                txt::desc_prof_limit_resume(),
+                self.toggle(
+                    "prof-limit-resume",
+                    limit_resume,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_profile(|p| p.limit_resume = Some(!limit_resume), cx);
                     }),
                 ),
             ))
@@ -1457,6 +1473,8 @@ fn profiles_request(action: &str, kind: ProfileKind, name: Option<&str>) -> Requ
         clear_ctx_threshold: false,
         auto_handoff: None,
         clear_auto_handoff: false,
+        limit_resume: None,
+        clear_limit_resume: false,
     }
 }
 
@@ -1495,6 +1513,8 @@ struct ProfilesSet {
     clear_ctx_threshold: bool,
     auto_handoff: Option<bool>,
     clear_auto_handoff: bool,
+    limit_resume: Option<bool>,
+    clear_limit_resume: bool,
 }
 
 impl ProfilesSet {
@@ -1535,6 +1555,8 @@ impl ProfilesSet {
             clear_ctx_threshold: self.clear_ctx_threshold,
             auto_handoff: self.auto_handoff,
             clear_auto_handoff: self.clear_auto_handoff,
+            limit_resume: self.limit_resume,
+            clear_limit_resume: self.clear_limit_resume,
         }
     }
 }

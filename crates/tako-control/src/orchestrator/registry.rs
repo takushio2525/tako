@@ -682,6 +682,7 @@ pub fn list_payload(
     registry: &WorkerRegistry,
     live_backends: &[String],
     live_panes: &[(u64, Option<String>)],
+    limit_resume_panes: &[u64],
     include_closed: bool,
 ) -> Value {
     let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
@@ -722,6 +723,9 @@ pub fn list_payload(
             "prompt_delivery": delivery.as_str(),
             "prompt_delivery_failure": e.prompt_delivery_failure,
             "resume_command": resume_command(e),
+            // #822: 利用上限後の自動復帰（FR-2.27）が有効か。ペインが生きていないときは
+            // ペイン属性を読めない（番号が別ペインへ再利用されている可能性もある）ので null
+            "limit_resume": pane_alive.then(|| limit_resume_panes.contains(&e.pane)),
             // 未達 worker にだけ再送コマンドを出す（#530 の受け入れ条件 3）
             "resend_command": match delivery {
                 PromptDelivery::OverdueSuspect => resend_command(e),
@@ -1130,7 +1134,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let payload = list_payload(&reg, &[], &[], false);
+        let payload = list_payload(&reg, &[], &[], &[], false);
         let items = payload["workers"].as_array().unwrap();
         let undelivered = items.iter().find(|w| w["pane"] == 7).unwrap();
         let delivered = items.iter().find(|w| w["pane"] == 8).unwrap();
@@ -1255,6 +1259,7 @@ mod tests {
             &reg,
             &["tako-pane-30".to_string()],
             &[(999, None)], // pane 30 は GUI に不在
+            &[],
             false,
         );
         assert_eq!(payload["count"], 1);
@@ -1267,6 +1272,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #822: worker が自動復帰の対象かを一覧に載せる。
+    /// ペインが生きていないときは null（番号が別ペインへ再利用されている可能性がある）
+    #[test]
+    fn issue822_list_payloadにlimit_resumeが載る() {
+        let path = temp_registry_file("limit-resume");
+        register_at(&path, sample_record(30));
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let live = [(30u64, Some("tako-pane-30".to_string()))];
+
+        // 有効なペイン
+        let payload = list_payload(&reg, &["tako-pane-30".to_string()], &live, &[30], false);
+        assert_eq!(payload["workers"][0]["pane_alive"], true);
+        assert_eq!(payload["workers"][0]["limit_resume"], true);
+
+        // 同じペインが生きているが自動復帰は無効
+        let payload = list_payload(&reg, &["tako-pane-30".to_string()], &live, &[], false);
+        assert_eq!(payload["workers"][0]["limit_resume"], false);
+
+        // ペインが居ない = ペイン属性を読めないので null
+        let payload = list_payload(
+            &reg,
+            &["tako-pane-30".to_string()],
+            &[(999, None)],
+            &[30],
+            false,
+        );
+        assert_eq!(payload["workers"][0]["pane_alive"], false);
+        assert!(payload["workers"][0]["limit_resume"].is_null());
+    }
+
     #[test]
     fn list_payloadはpane番号再利用の別ペインをaliveにしない() {
         let path = temp_registry_file("payload-reuse");
@@ -1277,6 +1312,7 @@ mod tests {
             &reg,
             &["tako-pane-30".to_string()],
             &[(30, Some("tako-other".to_string()))],
+            &[],
             false,
         );
         assert_eq!(payload["workers"][0]["pane_alive"], false);
@@ -1285,6 +1321,7 @@ mod tests {
             &reg,
             &["tako-pane-30".to_string()],
             &[(30, Some("tako-pane-30".to_string()))],
+            &[],
             false,
         );
         assert_eq!(payload["workers"][0]["pane_alive"], true);
@@ -1438,7 +1475,7 @@ mod tests {
             ("2", dead_candidate(10, Some("tako-b"), Some(&old))), // 死亡
         ]);
         let live_panes = vec![(9u64, Some("tako-a".to_string()))];
-        let payload = list_payload(&reg, &[], &live_panes, false);
+        let payload = list_payload(&reg, &[], &live_panes, &[], false);
         let items = payload["workers"].as_array().unwrap();
         let alive: Vec<bool> = items
             .iter()

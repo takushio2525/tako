@@ -519,6 +519,8 @@ pub(super) fn build_request(
             clear_ctx_threshold: bool_arg(args, "clear_ctx_threshold")?.unwrap_or(false),
             auto_handoff: bool_arg(args, "auto_handoff")?,
             clear_auto_handoff: bool_arg(args, "clear_auto_handoff")?.unwrap_or(false),
+            limit_resume: bool_arg(args, "limit_resume")?,
+            clear_limit_resume: bool_arg(args, "clear_limit_resume")?.unwrap_or(false),
         },
         "tako_orchestrator_accounts" => Request::OrchestratorAccounts {
             action: str_arg(args, "action")?.ok_or("action を指定する")?,
@@ -572,6 +574,7 @@ pub(super) fn build_request(
                 caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
                 task_type: str_arg(args, "task_type")?,
                 account: str_arg(args, "account")?,
+                limit_resume: bool_arg(args, "limit_resume")?,
             }
         }
         "tako_orchestrator_report" => Request::OrchestratorReport {
