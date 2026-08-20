@@ -2214,7 +2214,6 @@
 - 同梱: `test-release-retry.sh` が #594 以降ずっと temp repo に `scripts/lib` をコピーせず
   source 失敗で即 exit していた（**main でも 2 pass / 10 fail**）のを修復 → 13 pass / 0 fail
 - 関連: PR（Closes #837）
-||||||| parent of b4a4967 ([機能追加] リミット後の自動復帰をプロファイル既定で spawn worker へ適用 (#822))
 ## 2026-08-21（#822: リミット自動復帰をプロファイル既定で spawn worker へ）
 - #813 のペイン単位オプトインを master / solo プロファイルの `limit_resume`（既定 false）に
   持たせ、spawn した worker ペインへ自動適用（FR-2.27.11 新設）。解決順は
@@ -2229,3 +2228,14 @@
   検出力は `set_limit_autoresume` を外すと unit（`left: (false, true)`）と項目 117 が FAILED
 - 判断: `orchestrator run` / checkpoint resume は spawn と同じ経路なのでプロファイル既定が
   そのまま効く。個別の `--オプション` は増やさない（#322 = 既定動作を賢くする方向）
+
+## 2026-08-21（#467 スライス 1: platform 境界の基盤を main へ移植）
+- main への合流マージ（45 ファイル / 213 hunk / 27,353 行）を諦めてスライス移植へ。第 1 弾として
+  境界 8 本（console / exe / font / ime / install_info / locale / process / procinfo）+ PDF（B12）を
+  持ち込み、`theme` / `i18n` / `setup` の cfg 直書きを境界へ寄せた（macOS は挙動不変 = 実測）
+- 副産物: 番犬「OS 連携の直呼びが境界の外に残っていない」が許可リストのパス区切り（`/` vs `\`）で
+  **Windows では必ず落ちていた**のを根治（実機 9/1 → 10/0）。マトリクスは 1 件も動かしていない（棚卸しはスライス 8）
+- 検証: 品質ゲート全緑（test 2134 passed）+ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` + visual-test 98
+  checkpoint + クロスチェック エラー 0・警告 11（ベースライン 16 から減）+ Windows 実機ビルド成功・
+  失敗 29 件はすべて main 由来（#583 既知 18 + 以降追加の同系 6 + 未実行だった tako-core 5）
+- 関連: PR #845（`Refs #467`）。詳細と申し送りは `.agent/plans/2026-08-windows-main-merge-wip.md` のスライス 1 節

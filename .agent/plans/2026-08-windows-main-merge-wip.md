@@ -166,7 +166,7 @@ main の現行設計（#748 / #749 / #790 / #813 / #504 / #548）との重複を
         すべて ───┴──> 8. doc / 対応マトリクスの最終棚卸し
 ```
 
-### 1. `platform/` 境界（基盤）— **最初にやる。他の全スライスがここを呼ぶ**
+### 1. `platform/` 境界（基盤）— ✅ **完了**（2026-08-21。PR #845 / `windows/467-slice1-platform`）
 
 - 持ち込む新規: `crates/tako-core/src/platform/{console,exe,font,ime,install_info,locale,process,procinfo}.rs`
   / `crates/tako-app/src/platform/{mod.rs,pdf/{mod,macos,windows}.rs}`
@@ -177,6 +177,91 @@ main の現行設計（#748 / #749 / #790 / #813 / #504 / #548）との重複を
 - 依存: なし
 - 検証の効く場所: `support.rs` のパリティテスト T1〜T6 が macOS 上で走る。
   番犬テスト「OS 連携の直呼びが境界の外に残っていない」も同様
+
+#### 完了記録（2026-08-21）
+
+24 ファイル / +5,197 / −961。移植元は `windows/467-main-merge-wip`（`mod.rs` と
+`support.rs` は合成済みの側を材料にした）。
+
+**持ち込んだもの**: 境界 8 本（`console` / `exe` / `font` / `ime` / `install_info` /
+`locale` / `process` / `procinfo`）+ tako-app 側の `platform/pdf/{mod,macos,windows}.rs`。
+8 本とも **`crate::` を一切参照しない自己完結**で、Windows 実装は raw FFI
+（kernel32 / imm32 / advapi32 / iphlpapi）なので **tako-core への新規依存はゼロ**。
+
+**呼び出し側を寄せた分**（macOS は挙動不変）: `theme.rs` の `font_family`（境界の macOS
+実装が `"Menlo"` を返す = 同値）/ `i18n.rs` の `macos_preferred_language`（優先順と
+「環境変数で決まったら OS へ問い合わせない」遅延を純関数 `detect_with` でテスト固定）/
+`tako-cli/setup.rs` の `find_command`（境界の unix 実装が同じログインシェル経路）。
+
+**PDF（B12）**: `preview.rs` のインライン `mod pdf_render`（743 行）を境界へ移設。
+macOS 実装は**移設のみで論理不変**（正規化差分は `use` の移動と dedent 後の rustfmt 改行だけ）。
+`cfg` 2 分岐は `capabilities()` 照会 1 本になった。`ui_text` の `pdf_macos_only` は
+`pdf_unsupported_platform` へ改称（対応 OS が増えても文言が腐らない）。
+Windows 実装のためだけに `windows`（`Windows.Data.Pdf`）と `lopdf` を
+`[target.'cfg(windows)'.dependencies]` で追加 = macOS のビルドグラフには載らない。
+
+**マトリクスは 1 件も動かしていない**。境界を敷いただけで通しで動くのはスライス 2 以降。
+ここで Supported へ倒すと `PlatformFacts` 経由で system prompt に誤情報が流れる（#516）。
+
+##### 実測
+
+| ゲート | 結果 |
+|---|---|
+| `cargo fmt --all --check` | 緑 |
+| `cargo clippy --workspace --all-targets -- -D warnings`（feature 有無とも） | 緑・警告 0 |
+| `cargo build --workspace --all-targets` | 緑（3m46s） |
+| `cargo test --workspace` | **2134 passed / 0 failed**（main 基準 2070 → +64） |
+| 隔離セルフテスト | `TAKO_APP_SELF_TEST_OK`（FAILED 0。SKIP 3 = 63 / 76d / 104 はウィンドウ非表示の既知条件） |
+| visual-test 全節 | `TAKO_VISUAL_TEST_OK`・**98 checkpoint**（記録済みベースラインと同数） |
+| `scripts/check-windows.sh` | **エラー 0 / 警告 11**（ベースライン 16 から減少） |
+| CI | macOS / Windows / Pages **全 pass** |
+
+クロスチェックの警告が 16 → 11 に減ったのは、main では `pdf_render` が macOS 限定で
+`PdfCharBox` / `PdfTextLine` 等が Windows ビルドで構築されず dead_code 警告になっていたのが、
+Windows 実装の追加で使われるようになったため。
+
+**Windows 実機**: ビルド成功（7m16s）。`cargo test --no-fail-fast` は
+`tako-app` 408 / **0 failed**、`tako-cli` 53 / **0 failed**、`tako-control` 939 / 24 failed、
+`tako-core` 626 / 5 failed、`platform_parity` **10 / 0**。
+失敗 29 件は**すべて main 由来**で、内訳は #583 の既知 18 件 + #583 計測（2026-07-27）以降に
+main へ増えた同系 6 件（`acceptance_gates` 4 = #244 / `config_share::env` 1 = #513 /
+`stale_binary` 1 = #772）+ `tako-core` 5 件（#583 は fail-fast で tako-core が
+**一度も実行されていなかった**ため未記録。`--no-fail-fast` で初めて可視化）。
+
+##### 副産物: 境界の番犬が Windows で必ず落ちていたのを根治
+
+`os連携の直呼びが境界の外に残っていない`（#522）は許可リストを `/` 区切りで持つのに
+`strip_prefix` は Windows で `\` を返すため、許可が 1 件も一致せず**境界の実装本体
+（`platform/os_integration.rs`）自身が違反として報告されて**いた。
+Windows 実機で **9 passed / 1 failed → 10 passed / 0 failed** を実測。
+#515 の「macOS 上から Windows 側を検証できる」前提が Windows 側で崩れていたので基盤で直した。
+
+##### 次スライスへの申し送り
+
+1. **`exe::find` へ寄せていない直呼びが 3 件残る**: `tako-core/lib.rs` の `resolve_bin` /
+   `tako-control/config_share/env.rs` の `find_gh` / `tako-app/preview.rs` のメディアバイナリ解決。
+   win467 も未着手（`setup.rs` だけ寄せてある）。寄せると **Windows の解決挙動が変わる**ので、
+   tmux / gh / ffmpeg を持つ各スライスで検証つきに寄せる
+2. **境界は置いたが配線は各スライスの仕事**: `console` → スライス 2 / `ime` `font` `process`
+   → スライス 4 / `install_info` → スライス 6 / `procinfo` → スライス 9。
+   tako-core は lib なので `pub` API は dead_code にならず、置いただけでも緑のまま
+3. **`support.rs` の `縮退理由の一覧は重複しない` は WIP 版を持ち込まないこと**。
+   WIP 版は macOS 側にも縮退がある前提（#657 の in-window メニューバー）になっているので、
+   #657 を入れるスライス 5 と同時でないと落ちる
+4. **パリティテストのキー直書きは撤去済み**（`any_pending_on_windows()`）。
+   git 対応スライスが `tako_git_log` を Supported にしても落ちない
+5. **PDF テストは自前生成 PDF になった**（`build_test_pdf`）。Windows 実装の検証は
+   `能力表は矛盾しない` / `どのプラットフォームでも同じ api が生えている` /
+   `取れない付加情報は空で返る` の 3 本が両 OS で同じことを見る
+
+##### 環境メモ（実測）
+
+- 兄弟セッションが同じワークスペースを並行ビルドしていると **swap が枯れて `cc` が
+  SIGKILL される**（実測: swap 27.5/28.7 GB・空きメモリ 14% で `linking with cc failed:
+  signal: 9`）。`-j 2`（および内側の `cargo build` にも効く `CARGO_BUILD_JOBS=2`）で回避できた
+- セルフテストの `#680: リンク md の座標キャッシュ生成` は **load 依存で落ちる**
+  （load 11.1 で失敗 → 7.1 で成功）。`wait_for_preview_maps` は paint 由来の
+  座標マップを待つので、負荷が高いと 80×50ms の上限に収まらない
 
 ### 2. 永続化バックエンド（psmux / ConPTY。#518 / #519）
 
