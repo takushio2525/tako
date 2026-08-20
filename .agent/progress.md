@@ -2252,3 +2252,14 @@
   plan が見込んでいた「psmux e2e 8 件」は解消。全体の失敗は 29→30 で、増えた 1 件は #822 由来
   （`TAKO_BACKEND=none` でも同じ行で落ちることを実測）
 - 関連: PR #848（`Refs #467`）。ConPTY の外側 PTY（#655/#659）と #686 は 2b へ送った
+
+## 2026-08-21（#467 スライス 2b: ConPTY の文字コードと copy mode ゲート）
+- 外側 PTY のコードページ固定（#655/#659。境界はスライス 1 で入っていたので呼ぶだけ）+
+  `TerminalSession::child_pid()`（#592）+ #686 の copy mode ゲート消費側
+  （`CopyModeGate` / write の in-band 前置 / ホイール勘定）+ 2a で外したテスト 2 本の復帰
+- **恐れていた「#817 の pty_loop 上への再実装」は不要だった**: #817 が置き換えたのは
+  読み取りループだけで、書き込み（notifier）とホイール経路の形は不変。win467 の実装がそのまま載った
+- 検証: macOS 全ゲート緑（test 2194 passed / セルフテスト OK / visual-test 98 / クロスチェック 警告 11）+
+  **Windows 実機で encoding_conpty 5/0・psmux_backend 16/0**（新規失敗ゼロ）。
+  2a の教訓どおり実機ビルドを先に通し、macOS では見えない #[cfg(windows)] エラー 1 件を先に潰した
+- 関連: PR #849（`Refs #467`）。これでスライス 2 完了

@@ -263,7 +263,7 @@ Windows 実機で **9 passed / 1 failed → 10 passed / 0 failed** を実測。
   （load 11.1 で失敗 → 7.1 で成功）。`wait_for_preview_maps` は paint 由来の
   座標マップを待つので、負荷が高いと 80×50ms の上限に収まらない
 
-### 2. 永続化バックエンド（psmux / ConPTY。#518 / #519）— **2a 完了 / 2b 未着手**
+### 2. 永続化バックエンド（psmux / ConPTY。#518 / #519）— ✅ **完了**（2a: PR #848 / 2b: PR #849）
 
 - 持ち込む新規: `crates/tako-core/src/backend/{psmux,owner}.rs` /
   `crates/tako-core/tests/{psmux_backend,encoding_conpty}.rs` / `poc/conpty-survival/`
@@ -346,6 +346,62 @@ psmux 化が原因ではなく、既存の「spawn のコマンド組み立て�
 fail-closed 番犬が「未分類のパスがある」で落ちた。**`Local` として分類**した（共有すると
 別マシンの pid を持ち主と読み、#177 のガードが誤作動する）。win467 は #513 より前に
 分岐しているのでこの宣言を持っていない。**data dir へ書くものを増やすスライスは必ずここに宣言が要る**。
+
+#### 2b 完了記録（2026-08-21。PR #849 / `windows/467-slice2b-conpty`）
+
+**恐れていた「#817 の pty_loop の上への再実装」は実際には不要だった。**
+#817 が置き換えたのは **PTY の読み取りループ**で、**書き込み経路（`notifier`）と
+ホイール経路の形は変わっていない**。win467 の実装はそのまま載った
+（読み取りループには 1 行も触っていない）。
+
+##### 入れたもの
+
+- **外側 PTY のコードページ固定（#655 / #659）**: `TerminalSession::spawn` で
+  `platform::console::pin_pane_to_utf8_when_ready(child_pid)` を呼ぶ。
+  ConPTY は OEM コードページ（日本語版 Windows は CP932）で始まるため、
+  放っておくと子が吐いた UTF-8 を conhost が CP932 と解釈し **tako が受け取る前に**壊れる。
+  境界の実体はスライス 1 で既に main に入っていたので、**呼ぶだけ**だった
+- **`TerminalSession::child_pid()`（#592）**: pid を起動時に確定して保持・公開。
+  `pty_child_pid` は `cfg(unix)` / `cfg(windows)` で alacritty の API 形の差を吸収する。
+  **`platform/` へ持ち上げなかった**のは、分岐しているのが OS ではなく
+  **外部クレートの型（`tty::Pty`）の API 形**で、境界へ置くと `platform/` が
+  alacritty へ依存してしまうため（境界の自己完結を保つ）
+- **#686 の copy mode ゲート（消費側）**: `CopyModeGate`（depth + 解除バイト列の純状態）+
+  `write()` での in-band 前置 + ホイール転送 2 箇所での勘定 +
+  `wheel_scrolled_back` / `arm_copy_mode_exit` / `disarm_copy_mode_exit`。
+  解除を器へ別経路（`send-keys -X cancel`）で撃つと「解除が届く前に打鍵が copy mode に
+  食われる」競合が残るので、**同じ書き込みの先頭へ混ぜる**
+- `tests/encoding_conpty.rs` / `poc/conpty-survival/`（`poc` は workspace から exclude 済み）
+- **2a で外した #686 依存の 2 本を復帰**（`psmux_backend.rs` は 1,105 行の元の姿へ）
+
+##### 実測
+
+macOS: fmt / clippy（feature 有無とも）**0 findings** / `test --workspace`
+**2194 passed / 0 failed**（2a 後 2192 → +2 = `CopyModeGate` の単体テスト）/
+隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / visual-test **98 checkpoint** /
+クロスチェック エラー 0・警告 11（2a と同数）。
+
+**Windows 実機**:
+
+| スイート | 結果 |
+|---|---|
+| `encoding_conpty` | **5 passed / 0 failed**（0.52s。skip なし） |
+| `psmux_backend` | **16 passed / 0 failed**（19.48s。2a の 14 → #686 の 2 本が復帰） |
+| `tako-app` / `tako-cli` | 409/**0** / 53/**0** |
+| `tako-control` / `tako-core` | 944/25 / 663/5（**2a と同数 = 新規失敗ゼロ**） |
+| `platform_parity` | **10 / 0** |
+
+`encoding_conpty` の 5 本は「起動時に utf8 へ固定される」「utf8 を吐く子の出力が化けない」
+「日本語ファイル名 / 絵文字 / 長文も化けない」「途中で cp932 へ切り替えても固定し直せば戻る」
+「PowerShell 5.1 のペインでも utf8 になる」。#686 の 2 本は
+「copy mode 滞在中の打鍵が in-band 解除で届く」「ホイールは上下対称で最下部で copy mode を抜ける」。
+
+##### 効いた作法
+
+**2a の教訓どおり Windows 実機ビルドを先に通した**。macOS では気づけない
+`#[cfg(windows)]` 由来のエラーが 1 件だけ出て（`encoding_conpty` が要求する
+`TerminalSession::child_pid()` が main に無い）、そこだけ直せば済んだ。
+macOS のゲートを先に全部回してから実機へ行くと、この 1 件のために全部やり直しになる。
 
 ### 3. IPC named pipe（#467）
 
