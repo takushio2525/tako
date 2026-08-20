@@ -162,6 +162,14 @@ pub mod notes {
         "実行時の状態。デバイスごとに違って当然なので共有しない",
         "Runtime state that legitimately differs per device, so it is not shared",
     );
+    /// 器のオーナー記録（#519 M2）。**共有すると #177 の復元強奪ガードが誤作動する**:
+    /// 別マシンの pid を「この器の持ち主」と読んでしまい、生きている器を
+    /// 奪う / 逆に自分の器を諦める、のどちらにも倒れうる
+    pub const BACKEND_OWNER: Note = Note::new(
+        "器の所有インスタンス（pid）の記録。マシンをまたぐと持ち主の判定が壊れるので共有しない",
+        "Records which local instance (pid) owns each session container; sharing it across \
+         machines would break ownership detection, so it is not shared",
+    );
     pub const DIAGNOSTIC: Note = Note::new(
         "診断ログ。デバイス固有かつ肥大化するので共有しない",
         "Diagnostic logs: device-specific and ever-growing, so they are not shared",
@@ -371,6 +379,14 @@ pub const CATALOG: &[Entry] = &[
         path: "sessions.yaml",
         class: Class::Local,
         note: notes::SESSION,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    Entry {
+        root: Root::TakoData,
+        path: "backend-owners",
+        class: Class::Local,
+        note: notes::BACKEND_OWNER,
         local_fields: &[],
         needs_local_unless: &[],
     },

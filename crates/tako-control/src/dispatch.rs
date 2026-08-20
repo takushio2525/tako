@@ -885,17 +885,17 @@ fn dispatch_inner(
                 Some(r) => r,
                 None => {
                     if let Some(ref ts) = tmux_session {
-                        let (session, access) =
-                            crate::reach::detached_session(ts).ok_or_else(|| {
+                        let (session, capture) =
+                            crate::reach::detached_capture(ts).ok_or_else(|| {
                                 DispatchError::Operation(
                                     crate::reach::UnreachableReason::NoDetachedAccess {
                                         session: ts.clone(),
-                                        note: crate::reach::no_detached_access_note(),
+                                        note: crate::reach::no_detached_capture_note(),
                                     }
                                     .note(),
                                 )
                             })?;
-                        let captured = access
+                        let captured = capture
                             .capture_screen(&session)
                             .map_err(|e| DispatchError::Operation(e.to_string()))?;
                         (pane.unwrap_or(0), captured, None)
@@ -6074,8 +6074,8 @@ fn dispatch_orchestrator_report(
 /// 折返し結合済みのスクロールバックを取得する（報告の第 1 層）。
 /// 実際の採取は永続バックエンドの到達手段（`DetachedAccess`）が担う
 fn capture_scrollback_joined(session: &str, lines: usize) -> Option<String> {
-    let (session, access) = crate::reach::detached_session(session)?;
-    access.capture_history_joined(&session, lines)
+    let (session, capture) = crate::reach::detached_capture(session)?;
+    capture.capture_history_joined(&session, lines)
 }
 
 /// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
@@ -6888,8 +6888,8 @@ fn finish_worker_status(
         if !crate::reach::session_alive(ts) {
             return None;
         }
-        let (session, access) = crate::reach::detached_session(ts)?;
-        Some(tail_join(access.capture_screen(&session).ok()?))
+        let (session, capture) = crate::reach::detached_capture(ts)?;
+        Some(tail_join(capture.capture_screen(&session).ok()?))
     });
 
     // #390: エージェントプロセスの生存シグナル（突然死判定専用）。
@@ -7232,8 +7232,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     let history_info = tmux_session
         .as_ref()
         .and_then(|ts| {
-            let (session, access) = crate::reach::detached_session(ts)?;
-            access.history_probe(&session)
+            let (session, capture) = crate::reach::detached_capture(ts)?;
+            capture.history_probe(&session)
         })
         .map(|p| json!({ "lines": p.history, "bytes": p.bytes }));
 
@@ -7608,8 +7608,8 @@ fn send_target_screen(
         }
     }
     let ts = tmux_session?;
-    let (session, access) = crate::reach::detached_session(ts)?;
-    access
+    let (session, capture) = crate::reach::detached_capture(ts)?;
+    capture
         .capture_screen(&session)
         .ok()
         .map(|lines| (pane, lines))

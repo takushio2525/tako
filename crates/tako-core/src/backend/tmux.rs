@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::{
-    BackendCapabilities, BackendError, DetachedAccess, HistoryProbe, Holder, ScrollbackAuthority,
-    SessionBackend, SessionInfo, SessionRef,
+    BackendCapabilities, BackendError, DetachedAccess, DetachedCapture, HistoryProbe, Holder,
+    HolderKind, ScrollProbe, ScrollbackAuthority, SessionBackend, SessionInfo, SessionRef,
 };
 use crate::terminal::SpawnOptions;
 
@@ -68,6 +68,7 @@ impl SessionBackend for TmuxBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             survives_app_exit: true,
+            detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
             label: "tmux",
@@ -117,6 +118,9 @@ impl SessionBackend for TmuxBackend {
                 Some(Holder {
                     pid,
                     session: SessionRef::new(name).ok()?,
+                    // tmux が返すのはクライアントの PID。所有インスタンスは
+                    // 呼び出し側が祖先を辿って特定する（従来どおり）
+                    kind: HolderKind::Client,
                 })
             })
             .collect()
@@ -145,6 +149,43 @@ impl SessionBackend for TmuxBackend {
         crate::tmux_backend::pane_tty(&self.socket, session.as_str())
     }
 
+    /// 器の中のペインの pid（#659）。tmux は `#{pane_pid}` に正しく答える。
+    ///
+    /// 用途である疑似コンソールのコードページ固定（B19）は Windows だけの話で、
+    /// Windows では tmux を器に選ばない（`decide` の実測理由）。それでも
+    /// **API が嘘をつかない**よう実装しておく（「器の中の pid が取れない器」ではない）
+    fn pane_pids(&self, session: &SessionRef) -> Vec<u32> {
+        let Ok(output) = crate::tmux::tmux_command(self.sock())
+            .args([
+                "list-panes",
+                "-t",
+                &format!("={}:", session.as_str()),
+                "-F",
+                "#{pane_pid}",
+            ])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+            .collect()
+    }
+
+    // `pane_in_mode` / `copy_mode_exit_bytes` は**あえて既定（None）のまま**にしてある。
+    // tmux ペインは `ScrollbackAuthority::Backend` なのでホイールはミラー経路
+    // （#159）を通り、tako が tmux を copy mode に置くことがそもそも無い（#686 は
+    // ミラーが使えない psmux 固有の縮退）。実装しても一度も呼ばれない死にコードになる
+
+    fn session_cwd(&self, session: &SessionRef) -> Option<String> {
+        crate::tmux_backend::session_cwd(&self.socket, session.as_str())
+    }
+
     fn session_env(&self, session: &SessionRef, name: &str) -> Option<String> {
         crate::tmux_backend::session_env(&self.socket, session.as_str(), name)
     }
@@ -162,7 +203,7 @@ impl SessionBackend for TmuxBackend {
     }
 }
 
-impl DetachedAccess for TmuxBackend {
+impl DetachedCapture for TmuxBackend {
     fn capture_screen(&self, session: &SessionRef) -> Result<Vec<String>, BackendError> {
         crate::tmux::capture_session(self.sock(), session.as_str()).map_err(BackendError::Operation)
     }
@@ -229,6 +270,27 @@ impl DetachedAccess for TmuxBackend {
             .collect()
     }
 
+    /// tmux の `#{scroll_position}` は copy mode の外では**空文字**に展開される
+    /// （psmux は 0 を返す）。どちらも「最下部」なので 0 へ寄せる
+    fn scroll_probe(&self, session: &SessionRef) -> Option<ScrollProbe> {
+        let output = crate::tmux::tmux_command(self.sock())
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={}:", session.as_str()),
+                "#{scroll_position}\t#{history_size}\t#{pane_in_mode}\t#{alternate_on}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        super::parse_scroll_probe(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+impl DetachedAccess for TmuxBackend {
     fn send_text(&self, session: &SessionRef, text: &str) -> Result<(), BackendError> {
         crate::tmux::send_keys(self.sock(), session.as_str(), text).map_err(BackendError::Operation)
     }
