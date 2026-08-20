@@ -2263,3 +2263,14 @@
   **Windows 実機で encoding_conpty 5/0・psmux_backend 16/0**（新規失敗ゼロ）。
   2a の教訓どおり実機ビルドを先に通し、macOS では見えない #[cfg(windows)] エラー 1 件を先に潰した
 - 関連: PR #849（`Refs #467`）。これでスライス 2 完了
+
+## 2026-08-21（#467 スライス 3: IPC を named pipe 対応に）
+- Windows では IPC が Unsupported = CLI / MCP が一切通らなかったのを解消。
+  `platform/named_pipe.rs`（境界 B3）+ `ipc.rs` のワイヤ処理を `mod conn`
+  （トランスポート非依存の `<R: Read, W: Write>`）へ抽出。**plan の 2 ファイルでは足りず**、
+  `tako-cli` のクライアント側（`mod transport`）も OS 別 connect + 共通 roundtrip へ直した
+- 検証: macOS 全ゲート緑（test 2194 / セルフテスト OK / visual-test 98 /
+  クロスチェック **警告 10** = 1 件減）+ **Windows 実機で `ipc::windows_tests` 3/0**
+  （トークン往復・不正トークン拒否・連続接続）。失敗 30 件のままで新規ゼロ
+- 関連: PR #850（`Refs #467`）。**このセッションはここで締め**、スライス 4 以降は新 worker へ。
+  引き継ぎは plan の「後続 worker への引き継ぎ」節（作法 7 項目 + 実機ベースライン表）
