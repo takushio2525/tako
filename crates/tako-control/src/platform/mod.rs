@@ -9,6 +9,9 @@
 
 pub mod facts;
 pub mod local_endpoint;
+/// Layer 1 IPC の Windows トランスポート（named pipe。境界 B3）
+#[cfg(windows)]
+pub mod named_pipe;
 pub mod os_integration;
 pub mod process;
 
