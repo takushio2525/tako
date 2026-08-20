@@ -1920,4 +1920,43 @@ mod tests {
         assert_eq!(m.limit_5h, Some(23));
         assert_eq!(m.limit_week, Some(45));
     }
+    /// **#686**: 器（psmux）が copy mode に居るあいだ打鍵が飲まれる問題の門番。
+    /// 「確かめてから撃つ」「最下部へ戻ったら降ろす」「1 回だけ効く」を固定する
+    #[test]
+    fn copy_mode解除は確かめたときだけ仕込まれる() {
+        let mut gate = CopyModeGate::default();
+        // 最下部なら器へ聞くまでもなく copy mode ではない
+        assert!(!gate.scrolled_back());
+        // 確かめる前（= 遡ってもいない）に仕込もうとしても入らない
+        gate.arm(b"q");
+        assert_eq!(gate.take(), None, "確かめずに解除キーを撃ってはいけない");
+
+        // 上へ遡る → 器へ問い合わせて copy mode と判明 → 打鍵に前置される
+        gate.note_wheel(3);
+        assert!(gate.scrolled_back());
+        gate.arm(b"q");
+        assert_eq!(gate.take(), Some(b"q".to_vec()));
+        // 1 回だけ効く（解除後は器も最下部へ戻っている）
+        assert_eq!(gate.take(), None);
+        assert!(!gate.scrolled_back(), "解除後は遡り量も 0 に戻る");
+    }
+
+    /// **#686 の誤射防止**: 下まで戻せば器は copy mode を抜ける（実測）ので、
+    /// 仕込みは器へ聞き直さずに降ろす。降ろさないとシェルへ `q` が入力される
+    #[test]
+    fn 最下部へ戻したら解除の仕込みを降ろす() {
+        let mut gate = CopyModeGate::default();
+        gate.note_wheel(5);
+        gate.arm(b"q");
+        gate.note_wheel(-2); // まだ遡り中
+        assert!(gate.scrolled_back());
+        gate.note_wheel(-3); // 最下部へ到達
+        assert!(!gate.scrolled_back());
+        assert_eq!(gate.take(), None, "最下部で解除キーを撃ってはいけない");
+        // 行き過ぎても負にならない（器も最下部で止まる）
+        gate.note_wheel(-10);
+        assert!(!gate.scrolled_back());
+        gate.note_wheel(1);
+        assert!(gate.scrolled_back(), "1 報告で再び遡り中になる");
+    }
 }
