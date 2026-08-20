@@ -1472,16 +1472,27 @@ mod tests {
         }
     }
 
+    /// 検証に使う「Windows で Pending の機能」を表から拾う。
+    /// キーを直書きすると、その機能が実装されて Supported になった瞬間にテストが
+    /// 「理由が無い」で落ちる（実際 #591 の棚卸しで `tako_git_log` がそうなった）
+    fn any_pending_on_windows() -> (&'static str, u32) {
+        MATRIX
+            .iter()
+            .find_map(|f| f.windows.issue().map(|issue| (f.key, issue)))
+            .expect("Windows に Pending が 1 件も無い（テストの前提が崩れている）")
+    }
+
     /// 表示言語を切り替えると理由文も切り替わること（`&'static str` 直書きへの退行防止）。
     /// **言語グローバルへの追従そのものが検査対象**なので、ここは
     /// `lang_guard` で直列化する（#608。他のテストは `text_in` / `gate_in` を使うこと）
     #[test]
     fn 理由文は表示言語に追従する() {
         let _guard = i18n::testing::lang_guard();
-        let note = support_for(Platform::Windows, "tako_git_log")
+        let (key, _) = any_pending_on_windows();
+        let note = support_for(Platform::Windows, key)
             .unwrap()
             .note()
-            .expect("Windows の tako_git_log には理由があるはず");
+            .expect("Pending には理由があるはず");
         i18n::set_lang(Lang::Ja);
         let ja = note.text();
         i18n::set_lang(Lang::En);
@@ -1495,16 +1506,18 @@ mod tests {
     #[test]
     fn gateの診断も表示言語に追従する() {
         let _guard = i18n::testing::lang_guard();
+        let (key, issue) = any_pending_on_windows();
         i18n::set_lang(Lang::En);
-        let en = gate(Platform::Windows, "tako_git_log").unwrap_err();
+        let en = gate(Platform::Windows, key).unwrap_err();
         i18n::set_lang(Lang::Ja);
-        let ja = gate(Platform::Windows, "tako_git_log").unwrap_err();
+        let ja = gate(Platform::Windows, key).unwrap_err();
         assert!(
             !en.chars()
                 .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
             "英語の診断に日本語が残っている: {en}"
         );
-        assert!(en.contains("#520") && ja.contains("#520"));
+        let tag = format!("#{issue}");
+        assert!(en.contains(&tag) && ja.contains(&tag));
     }
 
     /// キーの重複と並び順。順序を固定しておくと差分レビューが読める
@@ -1552,22 +1565,19 @@ mod tests {
     /// 言語切替テストが走ると不一致で落ちる**（#608 の再現経路）
     #[test]
     fn gateの診断はマトリクスの理由と追跡先を含む() {
-        let note = support_for(Platform::Windows, "tako_git_log")
-            .unwrap()
-            .note()
-            .unwrap();
+        let (key, issue) = any_pending_on_windows();
+        let note = support_for(Platform::Windows, key).unwrap().note().unwrap();
         for lang in [Lang::Ja, Lang::En] {
-            let err = gate_in(Platform::Windows, "tako_git_log", lang)
-                .expect_err("Windows では未対応のはず");
+            let err = gate_in(Platform::Windows, key, lang).expect_err("Windows では未対応のはず");
             assert!(
                 err.contains(note.text_in(lang)),
                 "{lang:?} の診断に note が含まれない: {err}"
             );
             assert!(
-                err.contains("#520"),
+                err.contains(&format!("#{issue}")),
                 "{lang:?} の診断に追跡 Issue が含まれない: {err}"
             );
-            assert!(gate_in(Platform::MacOs, "tako_git_log", lang).is_ok());
+            assert!(gate_in(Platform::MacOs, key, lang).is_ok());
         }
     }
 

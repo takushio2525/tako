@@ -526,7 +526,10 @@ impl Theme {
             tab_active_foreground: Rgb::from_hex(0xcdd6f4),
             tab_inactive_foreground: Rgb::from_hex(0x6c7086),
 
-            font_family: "Menlo".into(),
+            // OS ごとに「必ず存在する等幅フォント」を引く（境界 B16）。
+            // 存在しない family を指定すると GPUI が黙ってプロポーショナルな UI フォントへ
+            // 落とし、セル幅と実グリフ幅がずれて描画が全面的に壊れる（#517）
+            font_family: crate::platform::font::default_monospace_family(),
             font_size: 13.0,
             line_height: 17.0,
         }
@@ -609,7 +612,8 @@ impl Theme {
             tab_active_foreground: Rgb::from_hex(0x4c4f69),
             tab_inactive_foreground: Rgb::from_hex(0x8c8fa1),
 
-            font_family: "Menlo".into(),
+            // ダークと同じくプラットフォーム既定（境界 B16）
+            font_family: crate::platform::font::default_monospace_family(),
             font_size: 13.0,
             line_height: 17.0,
         }
@@ -781,6 +785,17 @@ mod tests {
             Theme::for_mode(ThemeMode::Light).background,
             Rgb::from_hex(0xeff1f5)
         );
+    }
+
+    /// 既定フォントは境界 B16（`platform::font`）から引くこと。
+    /// ここで OS 固有名をハードコードに戻すと、その OS 以外で GPUI が
+    /// プロポーショナルフォントへ落ちてターミナル描画が壊れる（#517）
+    #[test]
+    fn 既定テーマのフォントはプラットフォーム既定と一致する() {
+        let expected = crate::platform::font::default_monospace_family();
+        assert!(!expected.is_empty());
+        assert_eq!(Theme::default_dark().font_family, expected);
+        assert_eq!(Theme::default_light().font_family, expected);
     }
 
     #[test]
