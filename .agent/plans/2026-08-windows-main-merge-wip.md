@@ -300,3 +300,41 @@ main の現行設計（#748 / #749 / #790 / #813 / #504 / #548）との重複を
   ファイルを `git commit -F` で渡す
 - `#583` の既知失敗は 2026-08-21 時点で「12 件解消 / 6 件継続 / 新規 11 件 / psmux e2e 8 件」。
   スライスごとに Windows のテスト結果を #583 と突き合わせて増減を書き残す
+
+#### Mac 側の git remote 操作が信用できないことがある（2026-08-21 実測）
+
+このセッションでは以下が繰り返し起きた。**「push が失敗した」と読み取って同じ push を
+何度もやり直す・force push に手を伸ばす、という誤動作を避けるため必ず頭に入れておく。**
+
+1. **`git ls-remote` が古い値を返す**。push が成功しているのに、直後の
+   `git ls-remote --heads origin refs/heads/<branch>` が**更新前の SHA を返し続けた**
+   （4 ブランチ中 1 本だけ反映されたように見えて、実際は 1 本だけ本当に反映されていた回と、
+   全部反映済みなのに全部未反映に見えた回の両方があった）。`git fetch` を挟んでも
+   remote-tracking ref が追随しないことがある
+2. **`git push` が無応答のまま返る / 出力が空になる**。`git-credential-osxkeychain` や
+   `git-remote-https` が **signal 9 で死ぬ**ことがあり、そのとき stderr は
+   `died of signal 9` か、**何も出ないまま exit 0** になる。バックグラウンド実行だと
+   ログファイルが 0 バイトで終わる
+3. 結果として「push は成功しているのに失敗に見える」状態になる。この状態で押し直すと
+   `cannot lock ref ...: is at <新 SHA> but expected <旧 SHA>` が返る。
+   **これは衝突ではなく「もう入っている」という意味**なので、force push してはいけない
+
+**確認は GitHub API で行う**（ここだけは常に正しい値を返した）:
+
+```sh
+gh api repos/takushio2525/tako/git/ref/heads/<branch> -q .object.sha
+# ファイル内容まで見るなら（ref の / は %2F でエスケープする）
+gh api 'repos/takushio2525/tako/contents/<path>?ref=windows%2F467-...' -q .content | base64 -d
+```
+
+- push は**前景で長めのタイムアウト**を取る方が結果が読める（バックグラウンドだと
+  無応答のまま完了扱いになりログが空になる）
+- 巨大なマージコミットの push は 1 回目で落ちても 2 回目で通ることがある。
+  ただし**押す前に上記 API で「もう入っていないか」を必ず見る**
+
+#### zsh の履歴修飾子で refspec が壊れる
+
+`git push origin "$C:refs/heads/$B"` は zsh では `$C:r`（root 修飾子）と解釈され、
+`...2aefs/heads/...` のような壊れた refspec になって
+`src refspec ... does not match any` で落ちる。このセッションで 2 回踏んだ。
+**`"${C}:refs/heads/${B}"` と必ず波括弧で囲む。**
