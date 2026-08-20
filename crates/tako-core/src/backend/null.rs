@@ -9,7 +9,8 @@
 //! - **保存はする**（layout.json は書かれる）。保存を止めるのは #30 の根因 1 そのもの
 //! - 復元はタブ / ペイン構成・cwd・プレビュー・Web ビュー・claude 会話まで。
 //!   実行中プロセスと画面内容は tako 終了時に失われる
-//! - `detached()` が `None` = tako-app 不在では画面を読めず、キーも送れない
+//! - `detached_capture()` / `detached()` がどちらも `None` = tako-app 不在では
+//!   画面を読めず、キーも送れない
 //! - スクロールは縮退しない。履歴は in-process の alacritty が持ち、
 //!   直接ペイン経路（#159 の本命実装）がそのまま効く（`scrollback: InProcess`）
 
@@ -28,6 +29,7 @@ impl SessionBackend for NullBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             survives_app_exit: false,
+            detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             label: "none",
@@ -83,6 +85,11 @@ impl SessionBackend for NullBackend {
         None
     }
 
+    /// 器が無ければ「器の cwd」も無い（復元 cwd は layout.json 側が持つ）
+    fn session_cwd(&self, _session: &SessionRef) -> Option<String> {
+        None
+    }
+
     fn session_env(&self, _session: &SessionRef, _name: &str) -> Option<String> {
         None
     }
@@ -111,11 +118,13 @@ mod tests {
         let b = NullBackend;
         let caps = b.capabilities();
         assert!(!caps.survives_app_exit);
+        assert!(!caps.detached_capture);
         assert!(!caps.detached_access);
         assert_eq!(caps.scrollback, ScrollbackAuthority::InProcess);
         assert!(!caps.full_restore());
         assert!(b.reserve("tako-0123456789ab").is_none());
         assert!(b.detached().is_none());
+        assert!(b.detached_capture().is_none(), "採取の入口も持たない");
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! 全呼び出し側がコンパイルエラーになるため、フォールバック未記述の経路が
 //! テストより早い段階で露出する。
 
-use tako_core::backend::{backend, DetachedAccess, SessionRef};
+use tako_core::backend::{backend, DetachedAccess, DetachedCapture, SessionRef};
 use tako_core::PaneId;
 
 use crate::host::ControlHost;
@@ -65,10 +65,26 @@ impl UnreachableReason {
 /// このバックエンドに到達手段が無いことの説明。UI・エラー・診断で同じ文字列を使う
 pub fn no_detached_access_note() -> String {
     let caps = backend().capabilities();
+    if caps.detached_capture {
+        return format!(
+            "永続バックエンド（{}）はアウトオブプロセスの画面採取だけができ、入力送出はできないため、\
+             tako-app が保持していないペインへはキーを送れない",
+            caps.label
+        );
+    }
     format!(
         "永続バックエンド（{}）にアウトオブプロセス到達手段が無いため、\
          tako-app が保持していないペインの画面採取・入力送出はできない",
         caps.label
+    )
+}
+
+/// このバックエンドに**採取**の到達手段が無いことの説明
+pub fn no_detached_capture_note() -> String {
+    format!(
+        "永続バックエンド（{}）にアウトオブプロセスの画面採取手段が無いため、\
+         tako-app が保持していないペインの画面・履歴は読めない",
+        backend().capabilities().label
     )
 }
 
@@ -142,6 +158,19 @@ pub fn detached_session(hint: &str) -> Option<(SessionRef, &'static dyn Detached
     let session = SessionRef::new(hint).ok()?;
     let access = backend().detached()?;
     Some((session, access))
+}
+
+/// セッションヒントから**採取**の到達手段を引く（#519）。
+///
+/// 送出できる器（tmux）はこちらも通る（`detached_capture` の既定実装が
+/// `detached` から引き上げる）。psmux は**こちらだけ**通る。
+///
+/// 採取しかしない経路で [`detached_session`] を使ってはいけない
+/// （読めるのに送れない器で、読めるはずの経路まで塞がる）
+pub fn detached_capture(hint: &str) -> Option<(SessionRef, &'static dyn DetachedCapture)> {
+    let session = SessionRef::new(hint).ok()?;
+    let capture = backend().detached_capture()?;
+    Some((session, capture))
 }
 
 #[cfg(test)]

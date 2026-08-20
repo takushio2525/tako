@@ -263,7 +263,7 @@ Windows 実機で **9 passed / 1 failed → 10 passed / 0 failed** を実測。
   （load 11.1 で失敗 → 7.1 で成功）。`wait_for_preview_maps` は paint 由来の
   座標マップを待つので、負荷が高いと 80×50ms の上限に収まらない
 
-### 2. 永続化バックエンド（psmux / ConPTY。#518 / #519）
+### 2. 永続化バックエンド（psmux / ConPTY。#518 / #519）— **2a 完了 / 2b 未着手**
 
 - 持ち込む新規: `crates/tako-core/src/backend/{psmux,owner}.rs` /
   `crates/tako-core/tests/{psmux_backend,encoding_conpty}.rs` / `poc/conpty-survival/`
@@ -275,6 +275,77 @@ Windows 実機で **9 passed / 1 failed → 10 passed / 0 failed** を実測。
   未導入環境では `#[ignore]` にするかも同時に決める
 - 注意: main は #817 で `pty_loop.rs` を新設し PTY reader を自前ループにしている。
   ConPTY 側はこの新しいループの上に載せる（upstream の `EventLoop` 前提で書かない）
+
+#### 2a 完了記録（2026-08-21。PR #848 / `windows/467-slice2-psmux`）
+
+9 ファイル / +3,714 / −60。**器（psmux）とその抽象**までを入れ、
+**ConPTY の外側 PTY の文字コード（#655 / #659）は 2b へ送った**。
+
+##### 入れたもの
+
+- `backend/psmux.rs`（1,214 行）: 器の起動・列挙・kill・orphan 判定・`capture-pane` 採取。
+  **スライス 1 の `platform::process::no_console_window` を配線**（GUI プロセスから
+  psmux を起こすとコンソール窓が明滅するため）
+- `backend/owner.rs`（359 行）: 器のオーナー記録。psmux は tmux の `#{client_pid}` に
+  相当するものを観測できないので、「どの tako-app が握っているか」を tako 側で持つ
+- `tests/psmux_backend.rs`: 実バイナリでの適合検証。**器の内側のコードページ固定
+  （`pin_container_encoding` → `platform::console`）はここに含む**（器と不可分）
+
+##### 到達手段を「採取」と「送出」に分けた
+
+psmux は `capture-pane` が動く一方で送出が信頼できない。`DetachedAccess` 1 本のままだと
+「送れないから読めもしない」に倒れ、**psmux で読める画面まで塞がる**。
+
+- `DetachedCapture`（読み）を分離。`detached_capture()` の既定実装が `detached()` から
+  引き上げるので、**送出できる器（tmux）の呼び出し側は 1 行も変わらない**
+- 採取しかしない **5 経路**を capture 側へ（`Request::Read` の detached / `capture_scrollback_joined` /
+  `finish_worker_status` / `apply_worker_status_corrections` / `send_target_screen`）。
+  送出する **3 経路**（`Send` の 2 箇所 + `respond_to_choice_dialog`）は `detached_session` のまま
+- `Holder` に `HolderKind`（`Client` / `Owner`）。tmux はクライアント PID を返し呼び出し側が
+  祖先を辿るが、psmux は器の実装側で生存確認済みの所有 pid を返す（#177 のガードが両方で効くように）
+
+##### 実測
+
+| ゲート | 結果 |
+|---|---|
+| fmt / clippy（feature 有無とも、`-D warnings`） | 緑・**0 findings** |
+| `cargo test --workspace`（macOS） | **2192 passed / 0 failed**（スライス 1 後 2136 → +56） |
+| 隔離セルフテスト | `TAKO_APP_SELF_TEST_OK`（FAILED 0） |
+| `scripts/check-windows.sh` | エラー 0 / 警告 11（スライス 1 と同数） |
+
+**Windows 実機**: `tests/psmux_backend.rs` が **14 passed / 0 failed（17.36s）**。
+`skip:` 行が 1 本も出ず**全件が実際に走った**（macOS は 13 件が 0.00s = 全件スキップ）。
+実 psmux 3.3.7 で器の attach 復帰・前方一致 kill の巻き込み防止・採取・cwd 往復・
+器内 pid・**器の中のシェルのコードページ utf8 固定**（macOS には無い `#[cfg(windows)]` 項目）を確認。
+
+全体は `tako-app` 409/**0** / `tako-cli` 53/**0** / `tako-control` 944/25 / `tako-core` 663/5 /
+`platform_parity` 10/**0**。**スライス 1 の 29 件 → 30 件**で、増えた 1 件は
+`dispatch::tests::issue822_…`（#822 が main へ入って増えたテスト）。
+**`TAKO_BACKEND=none`（スライス 1 相当）でも同じ行で同じように落ちる**ことを実測したので
+psmux 化が原因ではなく、既存の「spawn のコマンド組み立てが POSIX 前提」の系に属する。
+
+→ **plan が見込んでいた「psmux e2e 8 件」は解消**（psmux 導入 + 本スライスで 14/0）。
+
+##### 2b（残り）でやること
+
+`tests/encoding_conpty.rs` / `poc/conpty-survival/` と、**外側 PTY** のコードページ固定。
+
+- win467 の `terminal.rs` は `alacritty_terminal::event_loop::EventLoop` の上に書かれているが、
+  **main は #817 で `pty_loop.rs` を新設して自前ループへ置き換えている**（1 MiB スタック
+  バッファの排除）。win467 に `pty_loop.rs` は存在しないので**移植ではなく再実装**
+- 併せて #686（器の copy mode ゲート）の `TerminalSession::wheel_scrolled_back` /
+  `arm_copy_mode_exit` を実装する。器側の契約（`pane_in_mode` / `copy_mode_exit_bytes`）は
+  2a に入っているので、消費側だけ。**2a では `psmux_backend.rs` の該当 2 本を外して送った**
+  （ファイル末尾のコメントに明記）
+- **教訓**: その 2 本は `#[cfg(windows)]` なので **macOS のゲートが全部緑でも Windows で
+  E0599 になる**。実機ビルドで初めて分かったので、2b は**実機ビルドを先に通す**こと
+
+##### 統合で判明した点（後続スライスも踏む）
+
+`owner.rs` が `<data_dir>/backend-owners` へ書くため、#513 の共有カタログの
+fail-closed 番犬が「未分類のパスがある」で落ちた。**`Local` として分類**した（共有すると
+別マシンの pid を持ち主と読み、#177 のガードが誤作動する）。win467 は #513 より前に
+分岐しているのでこの宣言を持っていない。**data dir へ書くものを増やすスライスは必ずここに宣言が要る**。
 
 ### 3. IPC named pipe（#467）
 
