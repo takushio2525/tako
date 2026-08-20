@@ -2172,3 +2172,20 @@
   → `visible=True`。セルフテスト項目 71 に回帰検査を新設（旧経路では
   `visible=true → false`（切替 3 → 4）で FAILED になることを実測）
 - 関連コミット: PR（Closes #838）
+
+## 2026-08-21（#833: セルフテストのクォート漏れで #600 系が本番 data dir だと確定失敗）
+- 根因は 41c / 41d の `format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", …)`。既定 data dir
+  `~/Library/Application Support/tako` の空白で `ZDOTDIR=…/Application` + コマンド
+  `Support/…` に割れ zsh が起動しない。**`TAKO_ISOLATED=1` は data dir が `/tmp` 配下
+  （空白なし）なので隔離検証では一度も踏まず**、main 由来の確定失敗として残っていた
+- 修正: `self_test::shell_env_command`（値を `tako_core::shell::quote_for_shell` へ通す）
+  へ 3 か所を寄せ、41c / 41d の隔離 HOME 名に**意図的な空白**を入れて `HOME=` / `PATH=`
+  側は毎回の隔離セルフテストで踏むようにした。番犬 `selftest_env_assignment_watchdog` が
+  `NAME={` をソース走査で名指し（見本の逃げ道は `watchdog-allow`）。規約は conventions.md へ
+- 検証: 空白入り data dir の隔離セルフテストが before = `TAKO_APP_SELF_TEST_FAILED:
+  検証用 zsh が起動する（入力予測）`（画面に `zsh: command not found: 833`）→ after =
+  `TAKO_APP_SELF_TEST_OK` で**全項目完走**（skip 3 件は蓋閉じで未描画の既知項目）。
+  検出力は修正を戻して単体 2 本 + 番犬 1 本が FAILED になることを実測。
+  fmt / clippy(-D warnings) / test --workspace（2070 passed）/ Windows クロスチェック
+  （エラー 0・警告 16 = 記録済みベースライン同数）全緑
+- production 側は無関係と確認（`export K=V;` は `sh_quote` 経由。ワークスペース全走査で漏れ 0）

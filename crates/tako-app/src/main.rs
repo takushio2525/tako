@@ -19799,6 +19799,26 @@ mod self_test {
         out
     }
 
+    /// 隔離 HOME の zsh をペイン内から起こすコマンドを組む（項目 41c / 41d。#833）。
+    ///
+    /// **値は必ずクオートして通す**。`format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", …)`
+    /// のように素で埋めると、data dir が既定の `~/Library/Application Support/tako`
+    /// のとき `ZDOTDIR=…/Application` までが代入・`Support/…` がコマンド名として
+    /// 割れてしまい、zsh が起動しないまま #600 / #601 の項目が確定失敗する。
+    /// `TAKO_ISOLATED=1` の隔離起動は data dir が `/tmp` 配下（空白なし）なので、
+    /// 隔離検証だけを回していると気づけない = main 由来の確定失敗になっていた
+    pub(crate) fn shell_env_command(vars: &[(&str, String)], program: &str) -> String {
+        let mut out = String::new();
+        for (name, value) in vars {
+            out.push_str(name);
+            out.push('=');
+            out.push_str(&tako_core::shell::quote_for_shell(value));
+            out.push(' ');
+        }
+        out.push_str(program);
+        out
+    }
+
     /// CoreGraphics / PDFKit の両方が受理する xref 付き最小 PDF を生成する。
     fn write_test_pdf(path: &std::path::Path) {
         write_test_pdf_with_text(path, "Hello PDF");
@@ -29800,7 +29820,10 @@ mod self_test {
                 .find(|(k, _)| k == "ZDOTDIR")
                 .map(|(_, v)| v.clone());
             if let (Some(zdotdir), true) = (zdotdir, std::path::Path::new("/bin/zsh").is_file()) {
-                let as_home = std::env::temp_dir().join(format!("tako-st600-{}", std::process::id()));
+                // ディレクトリ名の空白は**意図的**（#833）。`HOME=` を素の `format!` で
+                // 組むとここで割れるので、この項目自身がクオート漏れの回帰を踏む
+                let as_home =
+                    std::env::temp_dir().join(format!("tako-st600 space-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&as_home);
                 std::fs::create_dir_all(&as_home).expect("隔離 HOME を作れる");
                 // 予測のネタになる履歴を 1 行だけ置く
@@ -29877,7 +29900,13 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", as_home.display()),
+                    &shell_env_command(
+                        &[
+                            ("HOME", as_home.display().to_string()),
+                            ("ZDOTDIR", zdotdir.clone()),
+                        ],
+                        "/bin/zsh",
+                    ),
                     true,
                 );
                 // #796: 固定待ちだと `visual-test` feature 付きビルド（gpui の
@@ -30222,7 +30251,9 @@ mod self_test {
                 );
                 let cli_dir = cli_dir.expect("CLI の親ディレクトリ");
 
-                let iso = std::env::temp_dir().join(format!("tako-st601-{}", std::process::id()));
+                // 41c と同じく空白は意図的（#833）。`HOME=` / `PATH=` の両方を踏む
+                let iso =
+                    std::env::temp_dir().join(format!("tako-st601 space-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&iso);
                 std::fs::create_dir_all(iso.join("bin")).expect("隔離 HOME を作れる");
                 let zshrc = iso.join(".zshrc");
@@ -30250,9 +30281,14 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!(
-                        "TAKO601_PHASE=A PATH=/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
-                        iso.display()
+                    &shell_env_command(
+                        &[
+                            ("TAKO601_PHASE", "A".to_string()),
+                            ("PATH", "/usr/bin:/bin".to_string()),
+                            ("HOME", iso.display().to_string()),
+                            ("ZDOTDIR", zdotdir.clone()),
+                        ],
+                        "/bin/zsh",
                     ),
                     true,
                 );
@@ -30288,10 +30324,14 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!(
-                        "TAKO601_PHASE=B PATH={}/bin:/usr/bin:/bin HOME={} ZDOTDIR={zdotdir} /bin/zsh",
-                        iso.display(),
-                        iso.display()
+                    &shell_env_command(
+                        &[
+                            ("TAKO601_PHASE", "B".to_string()),
+                            ("PATH", format!("{}/bin:/usr/bin:/bin", iso.display())),
+                            ("HOME", iso.display().to_string()),
+                            ("ZDOTDIR", zdotdir.clone()),
+                        ],
+                        "/bin/zsh",
                     ),
                     true,
                 );
@@ -30314,8 +30354,8 @@ mod self_test {
                     any,
                     cx,
                     &format!(
-                        "echo TAKO601-B=$(print -l $path | grep -cxF '{}')",
-                        cli_dir.display()
+                        "echo TAKO601-B=$(print -l $path | grep -cxF {})",
+                        tako_core::shell::quote_for_shell(&cli_dir.display().to_string())
                     ),
                     true,
                 );
@@ -46596,6 +46636,153 @@ mod scroll_tests {
         let (lines, carry) = accumulate_scroll(0.9, -0.4);
         assert_eq!(lines, 0);
         assert!((carry + 0.4).abs() < 1e-5);
+    }
+}
+
+/// 隔離 HOME の zsh を起こすコマンド組み立ての回帰（#833）。
+///
+/// data dir が既定の `~/Library/Application Support/tako` のとき、`ZDOTDIR=` を
+/// 素の `format!` で埋めると `Application` までが代入・`Support/…` がコマンド名として
+/// 割れ、zsh が起動しないまま #600 / #601 の項目が確定失敗していた。
+/// `TAKO_ISOLATED=1` の隔離起動は data dir が `/tmp` 配下（空白なし）なので
+/// 隔離検証では踏まず、main 由来の失敗として残り続けた
+#[cfg(test)]
+mod selftest_shell_env_command_tests {
+    use super::self_test::shell_env_command;
+
+    /// 本番 macOS の既定 data dir（`Application Support` に空白がある）でも、
+    /// 値が 1 語に閉じ込められる
+    #[test]
+    fn 空白入りのdatadirでも代入が1語に閉じる() {
+        let zdotdir = "/Users/me/Library/Application Support/tako/shell-integration/zsh";
+        let cmd = shell_env_command(
+            &[
+                ("HOME", "/tmp/st600 space".to_string()),
+                ("ZDOTDIR", zdotdir.to_string()),
+            ],
+            "/bin/zsh",
+        );
+        assert_eq!(
+            cmd,
+            format!("HOME='/tmp/st600 space' ZDOTDIR='{zdotdir}' /bin/zsh")
+        );
+    }
+
+    /// 空白を含まない値は素のまま通す（画面に出るコマンドを無駄に読みにくくしない）
+    #[test]
+    fn 安全な値はクオートしない() {
+        assert_eq!(
+            shell_env_command(
+                &[
+                    ("TAKO601_PHASE", "A".to_string()),
+                    ("PATH", "/usr/bin:/bin".to_string()),
+                ],
+                "/bin/zsh",
+            ),
+            "TAKO601_PHASE=A PATH=/usr/bin:/bin /bin/zsh"
+        );
+    }
+
+    /// 実シェルに解釈させて「値がそのままプログラムへ届く」ところまで見る。
+    /// 後半は検出力の対照: 旧実装（素の `format!`）は同じ値で必ず割れる
+    #[cfg(unix)]
+    #[test]
+    fn 実シェルが空白入りの値を1語として渡す() {
+        let dir = "/tmp/tako 833 space/shell-integration/zsh";
+        let program = r#"/bin/sh -c 'printf %s "$ZDOTDIR"'"#;
+
+        let quoted = shell_env_command(&[("ZDOTDIR", dir.to_string())], program);
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&quoted)
+            .output()
+            .expect("/bin/sh を起動できる");
+        assert!(
+            out.status.success(),
+            "クオート済みのコマンドが実シェルで落ちた: {quoted}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), dir);
+
+        // watchdog-allow: 旧実装（クオート無し）を再現する対照。実際に打つ形ではない
+        let raw = format!("ZDOTDIR={dir} {program}"); // watchdog-allow
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&raw)
+            .output()
+            .expect("/bin/sh を起動できる");
+        assert!(
+            !out.status.success() || String::from_utf8_lossy(&out.stdout) != dir,
+            "旧実装（クオート無し）が通ってしまう = この回帰テストは検出力を失っている"
+        );
+    }
+}
+
+/// 「シェルへ打つコマンドの env 代入を素の `format!` で組む」形の番犬（#833）。
+///
+/// 単体テストは `shell_env_command` の中身しか守れない。呼び出し側が
+/// また `format!("HOME={} …")` を書いたら同じ失敗が戻るので、
+/// **CI で毎回走る静的検査**としてソースの形そのものを固定する
+#[cfg(test)]
+mod selftest_env_assignment_watchdog {
+    /// 値にパスが入る env 名。ここに `NAME={`（素のプレースホルダ）が現れたら違反。
+    /// パスを運ぶ env をシェルコマンドへ足すときはこの一覧にも足す
+    const PATH_BEARING: &[&str] = &[
+        "HOME",
+        "PATH",
+        "ZDOTDIR",
+        "XDG_DATA_DIRS",
+        "PROMPT_COMMAND",
+        "CLAUDE_CONFIG_DIR",
+        "TAKO_DATA_DIR",
+    ];
+
+    /// 「シェルへ打つコマンドではない見本」の逃げ道。テストの見本行にだけ書く
+    const ALLOW_MARKER: &str = "watchdog-allow";
+
+    fn unquoted_env_assignments(src: &str) -> Vec<(usize, &'static str)> {
+        let mut hits = Vec::new();
+        for (index, line) in src.lines().enumerate() {
+            // 規約そのものを説明するコメントと、番犬の検出力を確認する見本は対象外。
+            // 見本は必ず `watchdog-allow` を書いた行に置く（レビューで目に入る）
+            if line.trim_start().starts_with("//") || line.contains(ALLOW_MARKER) {
+                continue;
+            }
+            for name in PATH_BEARING {
+                if line.contains(&format!("{name}={{")) {
+                    hits.push((index + 1, *name));
+                }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn シェルコマンドのenv代入はクオートを通している() {
+        let hits = unquoted_env_assignments(include_str!("main.rs"));
+        assert!(
+            hits.is_empty(),
+            "main.rs{hits:?} が env 代入の値を素の format! で埋めている。\
+             空白入りパス（既定の data dir = `Application Support`）でコマンドが割れるので、\
+             `self_test::shell_env_command`（値を quote_for_shell へ通す）を使うこと（#833）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬は素の代入を見つけクオート済みは許す() {
+        // 以下は番犬へ渡す見本（実際に打つコマンドではない）。番犬自身の走査から
+        // 外すため、素の代入を含む行には `watchdog-allow` を付けてある
+        let bad = "    &format!(\"HOME={} ZDOTDIR={zdotdir} /bin/zsh\", h),"; // watchdog-allow
+        let good = "    &shell_env_command(&[(\"HOME\", h)], \"/bin/zsh\"),";
+        let commented = "    /// `format!(\"HOME={} ZDOTDIR={zdotdir}\")` は禁止"; // watchdog-allow
+        assert_eq!(
+            unquoted_env_assignments(bad),
+            vec![(1, "HOME"), (1, "ZDOTDIR")]
+        );
+        assert!(unquoted_env_assignments(good).is_empty());
+        assert!(unquoted_env_assignments(commented).is_empty());
+        // 逃げ道そのものの検査: マーカーがある行は見逃す
+        assert!(unquoted_env_assignments(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
     }
 }
 
