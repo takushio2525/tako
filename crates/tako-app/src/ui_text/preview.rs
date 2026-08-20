@@ -140,12 +140,13 @@ pub fn image_too_large(mb: f64) -> String {
 pub fn cannot_read(e: &str) -> String {
     tr!(format!("読み込めない: {e}"), format!("Cannot read: {e}"))
 }
-/// 使用箇所は #[cfg(not(target_os = "macos"))] のみ（macOS ビルドでは未使用が正常）
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-pub fn pdf_macos_only() -> &'static str {
+/// PDF レンダラを持たないプラットフォーム向け（#521）。macOS は Core Graphics、
+/// Windows は Windows.Data.Pdf を使うので、実際に出るのはそれ以外の OS だけ。
+/// 「対応 OS の列挙」ではなく「この環境では描けない」と言う（対応 OS が増えても文言が腐らない）
+pub fn pdf_unsupported_platform() -> &'static str {
     tr!(
-        "PDF プレビューは macOS のみ対応",
-        "PDF preview is only supported on macOS"
+        "この環境には PDF レンダラが無いため表示できない",
+        "This platform has no PDF renderer, so the file cannot be displayed"
     )
 }
 pub fn binary_file() -> &'static str {
@@ -203,7 +204,7 @@ mod tests {
                 unsupported_image().to_string(),
                 image_too_large(60.0),
                 cannot_read("io error"),
-                pdf_macos_only().to_string(),
+                pdf_unsupported_platform().to_string(),
                 binary_file().to_string(),
                 code_copied().to_string(),
             ]

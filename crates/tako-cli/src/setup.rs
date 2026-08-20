@@ -82,26 +82,13 @@ fn display_home_relative(path: &Path) -> String {
 
 // --- 環境チェック ---
 
-fn login_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into())
-}
-
-/// ログインシェル経由でコマンドを探す（GUI 起動や Homebrew の PATH 差異に対応）
+/// 実行ファイルの探索は抽象境界 B16（[`tako_core::platform::exe`]）に委ねる。
+///
+/// ここで `$SHELL -l -c "command -v"` を直書きすると Windows では**必ず失敗**する（#525）。
+/// macOS 側の解決手順（ログインシェル経由 = `.app` の痩せた PATH でも Homebrew を引ける）は
+/// 境界の内側にそのまま移してあるので、macOS の挙動は変わらない
 fn find_command(name: &str) -> Option<String> {
-    let output = std::process::Command::new(login_shell())
-        .args(["-l", "-c", &format!("command -v {name}")])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(path);
-        }
-    }
-    None
+    tako_core::platform::exe::find(name)
 }
 
 /// setup を進行できるエージェント CLI。agy はオーケストレーターでは worker 専用だが、

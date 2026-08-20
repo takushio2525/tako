@@ -29,6 +29,7 @@ mod limit_autoresume;
 mod md_view;
 mod open_files;
 mod overlays;
+mod platform;
 mod preview;
 mod preview_render;
 mod preview_watch;

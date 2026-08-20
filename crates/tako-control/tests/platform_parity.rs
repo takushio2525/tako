@@ -341,11 +341,15 @@ fn collect_os_shell_calls(
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
+        // ALLOWED と報告文はどちらも `/` 区切りで書く。Windows の `strip_prefix` は
+        // `\` 区切りを返すので、ここで正規化しないと許可が 1 件も一致せず
+        // 境界の実装本体まで違反として報告される（Windows 実機で実測）
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .display()
-            .to_string();
+            .to_string()
+            .replace('\\', "/");
         if allowed.iter().any(|(p, _)| rel == *p) {
             continue;
         }
