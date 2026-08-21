@@ -522,76 +522,27 @@ fn profile_block(script: &Path) -> String {
     )
 }
 
-/// バイト列中の部分列を探す（マーカーはすべて ASCII なので符号を問わない）
-#[cfg_attr(not(windows), allow(dead_code))]
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
+/// 管理ブロックのマーカー。読み書きの規則（区切り改行 1 個・元バイト列への完全復帰）は
+/// [`crate::text_block`] が唯一の実装で、ここはその規則を使う側
+const MARKERS: crate::text_block::BlockMarkers =
+    crate::text_block::BlockMarkers::new(BLOCK_BEGIN, BLOCK_END);
 
-/// ブロックの位置（開始バイト, 終了バイト = 末尾改行を含む）。
-///
-/// **文字列ではなくバイト列で扱う**。ユーザーの `$PROFILE` は UTF-8 とは限らず
-/// （BOM 無しの `.ps1` は Windows PowerShell 5.1 では ANSI = 日本語環境なら CP932）、
-/// 一度でも `String` へ lossy 変換して書き戻すと**中身を壊す**。マーカーもブロック本文も
-/// ASCII なので、バイトのまま切った貼ったすれば元の符号のまま扱える
+/// ブロックの位置（開始バイト, 終了バイト = 末尾改行を含む）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn find_block(text: &[u8]) -> Option<(usize, usize)> {
-    let begin = find_bytes(text, BLOCK_BEGIN.as_bytes())?;
-    let end_marker = find_bytes(&text[begin..], BLOCK_END.as_bytes())? + begin;
-    let after = end_marker + BLOCK_END.len();
-    // 終端マーカー行の改行まで飲む（無ければ EOF）
-    let end = match find_bytes(&text[after..], b"\n") {
-        Some(nl) => after + nl + 1,
-        None => text.len(),
-    };
-    Some((begin, end))
+    MARKERS.find(text)
 }
 
-/// ブロックを配置した結果のファイル内容（あれば置換、無ければ追記）。
-///
-/// **追記時に足す区切りは常に改行 1 個**（空ファイルなら 0 個）。これを守ると
-/// [`remove_block`] が「ブロック + 直前の改行 1 個」を消すだけで
-/// **元のバイト列へ完全に戻せる**（元ファイルが改行で終わっていてもいなくても）
+/// ブロックを配置した結果のファイル内容（あれば置換、無ければ追記）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn apply_block(original: &[u8], block: &str) -> Vec<u8> {
-    let block = block.as_bytes();
-    if let Some((begin, end)) = find_block(original) {
-        let mut out = Vec::with_capacity(original.len() + block.len());
-        out.extend_from_slice(&original[..begin]);
-        out.extend_from_slice(block);
-        out.extend_from_slice(&original[end..]);
-        return out;
-    }
-    if original.is_empty() {
-        return block.to_vec();
-    }
-    let mut out = Vec::with_capacity(original.len() + block.len() + 1);
-    out.extend_from_slice(original);
-    out.push(b'\n');
-    out.extend_from_slice(block);
-    out
+    MARKERS.apply(original, block)
 }
 
 /// ブロックを取り除いた結果のファイル内容。[`apply_block`] が足した改行も戻す
 #[cfg_attr(not(windows), allow(dead_code))]
 fn remove_block(current: &[u8]) -> Vec<u8> {
-    let Some((begin, end)) = find_block(current) else {
-        return current.to_vec();
-    };
-    let mut head = &current[..begin];
-    // apply_block が追記したときの区切り改行 1 個ぶんを戻す
-    if let Some((b'\n', rest)) = head.split_last() {
-        head = rest;
-    }
-    let mut out = Vec::with_capacity(head.len() + current.len() - end);
-    out.extend_from_slice(head);
-    out.extend_from_slice(&current[end..]);
-    out
+    MARKERS.remove(current)
 }
 
 /// 文字列を **ASCII だけで書かれた** PowerShell の文字列式にする。
