@@ -36299,8 +36299,20 @@ mod self_test {
             // 71. Web ビューペイン e2e（FR-3.8 / #155）: wry ネイティブ webview の
             //     open → list → read（タイトル追跡）→ navigate → eval → hide → show → close。
             //     ページは data: URL（外部ネットワーク不要）。dispatch 直呼び = CLI / MCP と
-            //     同一経路（開発不変条件。引数変換は mcp.rs / tako-cli の単体テストが担保）
-            {
+            //     同一経路（開発不変条件。引数変換は mcp.rs / tako-cli の単体テストが担保）。
+            //
+            //     Windows ではこの項目が **tako を落とす**: wry 0.55 の WebView2 側
+            //     （`wry/src/webview2/mod.rs:910`）が現在 URI を `http::Uri` として
+            //     unwrap しており、`data:` URL では `InvalidUri(Empty)` で panic する。
+            //     しかもコールバック内なので**巻き戻せず abort** する（#724 症状②。
+            //     実測スタックは Issue へ記録）。
+            //     クラッシュはセルフテスト全体を道連れにするので、直るまで対象外にする
+            if cfg!(target_os = "windows") {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 71（Web ビューが WebView2 側の非巻き戻し panic で \
+                     アプリごと落ちる。#724 症状②）"
+                );
+            } else {
                 #[allow(clippy::too_many_arguments)]
                 fn web_req(
                     action: &str,
