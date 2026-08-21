@@ -184,11 +184,23 @@ fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
         .ok()
 }
 
+/// エージェント CLI の実行ファイルを解決する。
+///
+/// **入れた直後は PATH 経由で引けないことがある**（profile へ書いても、判定できない
+/// シェルや書き込み失敗では届かない）。その場合でもインストーラが置く場所を見て拾う。
+/// ここで拾えないと「入れたのに見つかりません」で setup が止まる（#868）
+fn find_agent_command(kind: SetupAgent) -> Option<String> {
+    find_command(kind.as_str()).or_else(|| match kind {
+        SetupAgent::Claude => setup_bootstrap::resolve_binary(),
+        _ => None,
+    })
+}
+
 fn detect_agents() -> Vec<DetectedAgent> {
     SetupAgent::ALL
         .into_iter()
         .filter_map(|kind| {
-            let path = find_command(kind.as_str())?;
+            let path = find_agent_command(kind)?;
             let (authenticated, plan) = match kind {
                 SetupAgent::Claude => detect_claude_auth(&path),
                 SetupAgent::Codex => detect_codex_auth(&path),
@@ -330,6 +342,237 @@ fn decode_base64url(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+// --- ゼロスタート導入（Issue #868）---
+
+use tako_control::setup_bootstrap::{self, InstallOptions, Step};
+
+/// `tako setup bootstrap`。MCP `tako_setup_bootstrap` と同じ dispatch 相当を
+/// ローカルで実行する（GUI 不要の処理なので IPC を経由しない）
+pub fn run_bootstrap(action: Option<&str>, dry_run: bool, json: bool) -> Result<(), String> {
+    let action = action.unwrap_or("status");
+    let value = match action {
+        "status" => setup_bootstrap::status()?.to_json(),
+        "install" => setup_bootstrap::install(InstallOptions {
+            dry_run,
+            // CLI は端末を持つので進捗をそのまま流す
+            interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        })?,
+        "path" => setup_bootstrap::ensure_path()?,
+        "undo-path" => setup_bootstrap::undo_path()?,
+        other => {
+            return Err(format!(
+                "不明な action: {other:?}（status / install / path / undo-path のいずれか）"
+            ))
+        }
+    };
+    if json {
+        println!("{}", crate::pretty_json(&value));
+        return Ok(());
+    }
+    print_bootstrap_human(action, &value);
+    Ok(())
+}
+
+fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
+    match action {
+        "status" => {
+            let step = value["next_step"].as_str().unwrap_or("?");
+            eprintln!("エージェント CLI の導入状況");
+            eprintln!("─────────────────────────");
+            eprintln!(
+                "  claude: {}",
+                value["binary"]
+                    .as_str()
+                    .map_or("未導入".to_string(), |p| display_home_relative(
+                        Path::new(p)
+                    ))
+            );
+            eprintln!(
+                "  PATH:   {}",
+                if value["launcher_dir_on_path"].as_bool() == Some(true) {
+                    "通っています"
+                } else {
+                    "通っていません"
+                }
+            );
+            eprintln!(
+                "  認証:   {}",
+                if value["authenticated"].as_bool() == Some(true) {
+                    "済み"
+                } else {
+                    "未ログイン"
+                }
+            );
+            eprintln!(
+                "  次の一歩: {} ({step})",
+                value["next_step_description"].as_str().unwrap_or("")
+            );
+            if step != "ready" {
+                eprintln!("  → `tako setup` を実行すると、ここから最後まで案内します");
+            }
+        }
+        "install" => {
+            if value["performed"].as_bool() == Some(true) {
+                eprintln!("インストールが完了しました");
+            } else {
+                eprintln!("実行はしていません（--dry-run）。実行される内容:");
+                print_install_plan(&value["install_plan"]);
+            }
+        }
+        _ => {
+            for key in ["profile_display", "dir_display", "change", "note"] {
+                if let Some(text) = value[key].as_str() {
+                    eprintln!("  {key}: {text}");
+                }
+            }
+        }
+    }
+}
+
+/// **何をどこに入れるか**（受け入れ条件 4）。実行前に必ず出す
+fn print_install_plan(plan: &serde_json::Value) {
+    for line in plan["lines"].as_array().into_iter().flatten() {
+        if let Some(text) = line.as_str() {
+            eprintln!("    - {text}");
+        }
+    }
+}
+
+/// [y/N] / [Y/n] の確認。非対話（`--yes` / 非 TTY）では質問せず既定を返す
+fn confirm(prompt: &str, default_yes: bool, assume_yes: bool) -> bool {
+    if assume_yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return true;
+    }
+    eprint!("  {prompt} [{}]: ", if default_yes { "Y/n" } else { "y/N" });
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return default_yes;
+    }
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => default_yes,
+        "y" | "yes" => true,
+        _ => false,
+    }
+}
+
+/// ゼロスタート導入の段（#868）。**導入済みなら何も出さずに素通りする**
+/// （検出型 setup の従来体験を変えないため）。
+///
+/// 未導入なら インストール → PATH 通し → 認証誘導 の順に進め、
+/// どの段で失敗したかが分かる形でエラーを返す
+fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
+    let state = setup_bootstrap::status()?;
+    if state.step == Step::Ready {
+        return Ok(());
+    }
+    // ここへ来るのは「claude が無い / PATH に無い / 未ログイン」のいずれか。
+    // 何が起きるのかを先に伝えてから進む
+    eprintln!("はじめてのセットアップ");
+    eprintln!("─────────────────────");
+    eprintln!("  Claude Code を使えるところまで、このまま案内します");
+    eprintln!();
+
+    if state.step == Step::Install {
+        eprintln!("  [1/3] {}", Step::Install.describe());
+        print_install_plan(&state.plan.to_json());
+        if !state.plan.can_run {
+            return Err(format!(
+                "この環境では自動インストールに対応していません。\n\
+                 上のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}",
+                state.plan.official_command
+            ));
+        }
+        if !confirm("この内容でインストールしますか？", true, assume_yes) {
+            return Err(format!(
+                "インストールを中止しました。\n\
+                 自分で入れる場合は次のコマンドを実行してから `tako setup` をやり直してください:\n  {}",
+                state.plan.official_command
+            ));
+        }
+        eprintln!();
+        setup_bootstrap::install(InstallOptions {
+            dry_run: false,
+            interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        })
+        .map_err(|e| format!("[1/3] インストールに失敗しました。\n{e}"))?;
+        eprintln!("  [OK] Claude Code を導入しました");
+    }
+
+    // PATH（インストール直後は必ずここを通る）
+    let state = setup_bootstrap::status()?;
+    if state.step == Step::Path {
+        eprintln!();
+        eprintln!("  [2/3] {}", Step::Path.describe());
+        let result = setup_bootstrap::ensure_path()
+            .map_err(|e| format!("[2/3] PATH の設定に失敗しました。\n{e}"))?;
+        let profile = result["profile_display"].as_str().unwrap_or("(不明)");
+        match result["change"].as_str() {
+            Some("already_on_path") => eprintln!("  [OK] すでに使える状態です"),
+            Some("unchanged") => eprintln!("  [OK] {profile} は設定済みです"),
+            _ => eprintln!("  [OK] {profile} に設定を追加しました"),
+        }
+        if result["verified"].as_bool() != Some(true) {
+            eprintln!(
+                "  [警告] {}",
+                result["note"]
+                    .as_str()
+                    .unwrap_or("反映はターミナルの開き直し後です")
+            );
+        }
+    }
+
+    // 認証（ブラウザが開く。非対話では代行しない）
+    let state = setup_bootstrap::status()?;
+    if state.step == Step::Auth {
+        let binary = state
+            .binary
+            .clone()
+            .ok_or("claude コマンドを解決できません")?;
+        eprintln!();
+        eprintln!("  [3/3] {}", Step::Auth.describe());
+        let interactive = !assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if !interactive {
+            return Err(
+                "Claude アカウントへのログインが必要です。\n\
+                 ブラウザでの操作が要るため自動化できません。\n\
+                 `claude auth login` を実行してログインしてから `tako setup` をやり直してください"
+                    .to_string(),
+            );
+        }
+        eprintln!("  ブラウザが開きます。画面の指示にしたがってログインしてください");
+        eprintln!();
+        let status = tako_core::platform::process::no_console_window(
+            &mut std::process::Command::new(&binary),
+        )
+        .args(["auth", "login"])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("[3/3] claude auth login を起動できません: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "[3/3] ログインが完了しませんでした（exit {}）。\n\
+                 `claude auth login` を自分で実行してから `tako setup` をやり直してください",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        // 「起動した」ではなく「ログインできた」ことを確かめてから次へ進む
+        if !setup_bootstrap::is_authenticated(&binary) {
+            return Err("[3/3] ログインを確認できませんでした。\n\
+                 `claude auth status` で状態を確認し、必要なら `claude auth login` を\
+                 やり直してから `tako setup` を再実行してください"
+                .to_string());
+        }
+        eprintln!("  [OK] ログインしました");
+    }
+
+    eprintln!();
+    eprintln!("  導入が完了しました。続けて設定を行います");
+    eprintln!();
+    Ok(())
 }
 
 // --- 依存ツールチェック ---
@@ -2108,6 +2351,10 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         eprintln!("  [previous] 前回の設定を引き継ぎます");
         eprintln!();
     }
+
+    // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
+    // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
+    run_bootstrap_stage(assume_yes)?;
 
     // setup 中は項目別 y/n を出さない。未導入依存・FDA・スリープ設定は状態と
     // 専用コマンドだけを表示し、ユーザーが必要なときに個別操作できるようにする。

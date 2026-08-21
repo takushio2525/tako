@@ -2501,6 +2501,36 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_setup_bootstrap",
+            "description": "エージェント CLI（Claude Code）のゼロスタート導入を確認・実行する（Issue #868）。\
+                **claude が入っていない環境で `tako setup` を通すための前段**。\
+                action=status（既定・読み取り専用）は「次に何をすべきか」を next_step で返す\
+                （install = 未導入 / path = PATH に無い / auth = 未ログイン / ready = 導入済み）。\
+                install_plan には「何をどこに入れるか」（公式コマンド・取得元・置き場所・\
+                自動更新の有無）が入るので、実行前に必ずユーザーへ提示すること。\
+                action=install で公式インストーラ（macOS は curl -fsSL https://claude.ai/install.sh | bash）を\
+                実行する。dry_run=true なら実行せず計画だけ返す。\
+                action=path でランチャーの置き場所をログインシェルの PATH へ通す（冪等）。\
+                action=undo-path で置いた設定を取り除く。\
+                認証（auth）はブラウザ操作を伴うため自動化せず、ユーザーに \
+                `claude auth login` の実行を案内すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "install", "path", "undo-path"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "action=install で実行せず計画だけ返す",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_setup",
             "description": "tako setup を非対話で実行する（Issue #262）。ユーザーが日本語で伝えた好みを answers に変換して代行する。省略項目は detected → previous → default の順で自動解決され、標準ケースは質問ゼロで完走する。instructions / profile / projects / orchestrator / sleep_guard は明示指定時だけ既存値を更新する。",
             "inputSchema": {

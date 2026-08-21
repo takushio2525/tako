@@ -773,6 +773,10 @@ pub(super) fn build_request(
             tab: str_arg(args, "tab")?.map(|s| s.to_string()),
         },
         "tako_setup_changes" => Request::SetupChanges,
+        "tako_setup_bootstrap" => Request::SetupBootstrap {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            dry_run: bool_arg(args, "dry_run")?,
+        },
         "tako_setup" => Request::SetupRun {
             answers: Some(args.clone()),
         },

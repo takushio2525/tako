@@ -2392,6 +2392,25 @@ struct SetupArgs {
     /// 前回設定を setup agent と個別に見直す
     #[arg(long, conflicts_with_all = ["check", "changes", "yes", "answers"])]
     review: bool,
+    #[command(subcommand)]
+    command: Option<SetupCommand>,
+}
+
+/// `tako setup` のサブコマンド。**素の `tako setup` の意味は変えない**（#322）。
+/// ゼロスタート導入（#868）を AI から段ごとに操作するための入口
+#[derive(Subcommand)]
+enum SetupCommand {
+    /// エージェント CLI の導入状況を確認・実行する（#868）
+    Bootstrap {
+        /// status（既定・読み取り専用）/ install / path / undo-path
+        action: Option<String>,
+        /// install で実行せず「何をどこに入れるか」だけ出す
+        #[arg(long)]
+        dry_run: bool,
+        /// 出力を JSON にする（MCP tako_setup_bootstrap と同一ペイロード）
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `tako config`（Issue #513）。サブコマンド省略 = status
@@ -2626,7 +2645,14 @@ fn cli_main() -> ExitCode {
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
         Command::Setup(ref args) => {
-            if args.check {
+            if let Some(SetupCommand::Bootstrap {
+                ref action,
+                dry_run,
+                json,
+            }) = args.command
+            {
+                setup::run_bootstrap(action.as_deref(), dry_run, json)
+            } else if args.check {
                 setup::run_check()
             } else if args.changes {
                 setup::run_changes(args.json)
