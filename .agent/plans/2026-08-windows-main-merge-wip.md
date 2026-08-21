@@ -543,13 +543,86 @@ visual-test **98 checkpoint**（数値もベースラインと一致）/
   （load 4.60 でも 10.50 でも同一）。**→ #853 に起票**。この項目が後半にあるため
   以降の項目が走らない状態なので、次スライスの検証でも同じところで止まる
 
-### 5. ウィンドウコントロール + in-window メニューバー（#584 / #657）
+### 5. ウィンドウコントロール + in-window メニューバー（#584 / #657）— ✅ **完了**（PR #860）
 
 - 持ち込む新規: `crates/tako-app/src/menu_bar.rs` /
   `assets/icons/ui/window_{maximize,restore}.svg`
 - 編集: `main.rs` / `tab_bar.rs` / dispatch の `WindowState`
 - 依存: **1**, **4**（メニューのアクセラレータがキーバインドの分類に乗る）
 - 注意: アイコンは `EMBEDDED_ASSETS` への登録漏れ検査テストがあるので必ず登録する（#561 の副産物）
+
+#### 完了記録（2026-08-21。PR #860 / `windows/467-slice5-window-menu`）
+
+18 ファイル / +2,610 / −92。**実機で tako GUI が初めて立った回**。
+
+##### 入れたもの
+
+- `menu_bar.rs` 新設（メニュートリガー + その場展開サブメニュー + ドロップダウン +
+  自前ウィンドウコントロール）。行を出すかは `MENU_BAR_HEIGHT`（cfg で 0 / 30）で決めるが
+  **関数本体は両 OS でコンパイルする**（`#[cfg]` で消すと macOS 側が一切通らず実機でしか壊れに気づけない）
+- `top_chrome_height()` 新設。ペイン矩形・IME アンカー・境界ドラッグの起点を 1 か所へ。
+  #684 の番犬テストの式（`viewport.height - px(...)` の出現回数 1）もこれに追随させた
+- タブバー上の対話要素すべてに `.occlude()`（#576）。`tab-scroll-area` には**付けない**
+- `app_menus()` をヘルパー分割し、非 macOS は Explorer 慣習（アプリ名メニュー無し）へ。
+  `HideOthers` / `ShowAllApps` / `HideApp` は番犬テストで**構造的に排除**
+- 3 経路 1:1（`tako window minimize|maximize|restore` / `tako menu` 4 種 /
+  MCP `tako_window` +3 action と `tako_menu` 新設 = **135 ツール**）
+
+##### plan の見立てとの差 2 件
+
+1. **`tako_menu` の macOS は `Supported` にした**（win467 は `Degraded`）。main には `Degraded` の
+   エントリが 1 件も無く、倒すと `PlatformFacts` 経由で **macOS の system prompt** に縮退注記が入り、
+   `known_limitations_markdown`（#594）経由で **macOS のリリースノートに「既知の制限」節が生える**
+   （実際に `縮退一覧はマトリクスから生成される` と
+   `known_limitations_is_empty_when_nothing_degraded` の 2 テストが落ちた）。
+   macOS はメニューバーがネイティブで完全に動くので `Degraded` は実態より重い。
+   使えない `open` / `close` は `require_in_window_menu` が理由と代替を名指しで返す。
+   **後続スライスも「マトリクスを倒す前に #594 のリリースノートへの波及を見る」こと**
+2. **main の menu テスト 3 本が macOS 決め打ち**で、Windows では
+   `menus[0].name == "tako"` を要求して落ちる。win467 のプラットフォーム別版
+   （`#[cfg(target_os = "macos")]` + `windowsのメニュー構成はexplorer慣習の並び`）へ差し替えた。
+   引き継ぎ 1 か条（実機ファースト）を守っていなければ見逃していた類
+
+##### 同梱: main 由来バグ（`tako` CLI が Windows で起動できない）
+
+`Cli::parse()` の構築だけで Windows の既定 1MB スタックを溢れ、debug ビルドの `tako.exe` が
+**どのサブコマンドでも** `thread 'main' has overflowed its stack` で落ちていた。
+実機 A/B（`crates/tako-cli/src/main.rs` だけ `origin/main` へ差し替えて再ビルド）で
+**main 由来と確定**。スライス 3 の IPC 検証はユニットテストだったため実バイナリのこの経路を
+踏んでおらず、**Windows では CLI が丸ごと使えない状態**だった。16MB スタックのワーカースレッドへ移して解消。
+→ **以後のスライスは「実バイナリの CLI を 1 回叩く」を検証に入れる**
+
+##### 実測
+
+macOS: fmt / clippy（`-D warnings`、visual-test feature 有無とも）**0 findings** /
+`test --workspace` **2228 passed / 0 failed**（ベースライン 2217 + 新規 11）/
+クロスチェック **エラー 0・警告 10**（`origin/main` を同条件で実測し**同一の 10 件**）。
+
+**Windows 実機**: `cargo build --workspace` は**一発で通った**（8m03s）。
+`cargo test --workspace --no-fail-fast` は **失敗 30 件 = ベースライン完全一致・新規ゼロ**
+（tako-app 440/0・tako-cli 53/0・tako-control 955/**25**・tako-core 668/**5**・
+platform_parity 11/0・encoding_conpty 5/0・psmux_backend 16/0）。
+
+**実機 GUI**（`schtasks /it` で session 1 へ起動 → 実マウス / 実キーで操作）:
+`Zed::Window` / `title=[tako]` / メニュー行 `ファイル 編集 表示 ウインドウ ヘルプ` + `─ □ ✕` を描画。
+実マウスでメニュートリガー・タブバーの `+`・最小化・最大化・復元・閉じるがすべて成立（#576 の
+`HTCAPTION` に食われない）。F10 / ← → / Esc のキーボード操作、ホバー切替、`menu invoke`、
+最小化中の `tako window restore`（render 停止中でも IPC ハンドラの sync が復帰経路）、
+アイコンの出し分け（`⧉` ⇄ `□` を 5 倍拡大で目視）まで確認。
+**CLI（named pipe）と MCP（stdio ブリッジ）が実 GUI に対して初めて通った**。
+証拠は `~/dev/tako-evidence/467-s5/`。
+
+##### 実機セルフテストは項目 2 で止まる（スライス 7 待ち）
+
+`TAKO_SELF_TEST=1` を実機で回すと **`TERM / COLORTERM 注入` で FAILED** し、以降が走らない
+（シェル統合 = #525 = スライス 7 の領域）。項目 118（メニューバー）は手動の実 GUI 操作で
+代替検証した。**スライス 7 完了後に実機セルフテストを通しで回すこと**。
+
+##### 別 Issue へ切り出し
+
+**#861**: 336 logical px 以下の極端に狭い幅でメニュー行がウィンドウコントロールと重なる
+（`menu_bar_triggers` が `WINDOW_CONTROLS_PX` を差し引かない。タブバー側は引いている非対称）。
+実用外の幅・macOS 影響なしのため低優先。
 
 ### 6. インストーラー + リリース（#587 / #723）— ✅ **完了**（PR #851）
 
@@ -721,13 +794,18 @@ crt-static と build.rs 2 本を含む）:
 - **WIP が保全ブランチにある**: `windows/724-port-crash`（`7633d8b`。ポート検知のクラッシュ修正）/
   `windows/727-sleep-settings`（`91cc13f`。設定 UI）
 
-### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 4 / 6 完了）
+### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 4 / 5 / 6 完了）
 
 main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ `e947524`（3）→
-`83bbdc0`（6）→ PR #852（4）。
-**残りはスライス 5 / 7 / 8 / 9**。依存グラフ上、いま着手できるのは
-**5（ウィンドウコントロール + メニューバー。4 が入ったので解放）**・
+`83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）。
+**残りはスライス 7 / 8 / 9**。依存グラフ上、いま着手できるのは
 **7（シェル統合 PowerShell）**・**9（スリープ防止 / ポート検知）**。8 は最後。
+
+**スライス 5 が残した宿題**: ①実機セルフテストが項目 2（`TERM / COLORTERM 注入`）で止まるので
+**スライス 7 完了後に通しで回す**こと ②#861（極端に狭い幅でメニュー行がコントロールと重なる）。
+また、スライス 5 で **`tako` CLI が Windows で一切起動できなかった main 由来バグ**（1MB スタック超過）
+を直したので、**以後のスライスは検証に「実バイナリの CLI を 1 回叩く」を必ず入れる**
+（ユニットテストだけでは実バイナリの起動経路を踏まない）。
 
 **スライス 4 が残した宿題**: #623（IME の未確定文字列が勝手に確定される）。
 `platform::ime` の `is_associated` / `reassociate` / `guard_action` はスライス 1 で
@@ -768,15 +846,30 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
    入れ子の引用符が壊れるうえ、`[Console]::OutputEncoding` が shift_jis なので
    日本語出力が化ける。冒頭に `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;` と
    `$ProgressPreference="SilentlyContinue"`（CLIXML のノイズ抑止）を足しておく
+10. **マトリクスを Supported / Degraded へ倒す前に #594 のリリースノートへの波及を見る**。
+    `Support::Degraded` の note は `PlatformFacts` 経由で system prompt へ入るだけでなく、
+    `known_limitations_markdown` 経由で**そのプラットフォームのリリースノート**にも出る。
+    macOS 側に `Degraded` を 1 件でも作ると macOS のリリースノートに「既知の制限」節が生える
+    （スライス 5 で `tako_menu` の macOS を Supported に倒し直した経緯）
+11. **main のテストがプラットフォーム決め打ちでないかを疑う**。スライス 5 では main の
+    menu テスト 3 本が `menus[0].name == "tako"` を無条件に要求しており、Windows で必ず落ちた。
+    macOS のゲートは全部緑なので、**実機ビルド → 実機テストを先に回す**以外に検出手段が無い
+12. **GUI を実機で見るには `schtasks /it`**。SSH セッションは session 0（サービス）で、
+    そこから起動したウィンドウは session 1 の対話デスクトップに出ず、`EnumWindows` からも見えない。
+    `schtasks /create ... /it /rl highest` + `/run` で session 1 へ投げる。スクリーンショットと
+    座標操作をするスクリプトは冒頭で `SetProcessDPIAware()` を呼ぶ（呼ばないと座標が仮想化されて
+    クリックが外れる）。`Add-Type` の C# に `static Main` という名前のメソッドを書くと
+    「エントリポイントの署名が違う」で**コンパイルが落ちる**ので別名にする。
+    スライス 5 の道具は `s5-launch.ps1` / `s5-capture.ps1` / `s5-drive.ps1`（`C:\Users\shioz\dev\`）
 
 #### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
 
 | スイート | 結果 |
 |---|---|
-| `tako-app` / `tako-cli` | **427**/**0** / 53/**0**（スライス 4 で +18） |
-| `tako-control` (lib) | 950 / **25 failed** |
-| `tako-core` (lib) | 665 / **5 failed** |
-| `platform_parity` | **11** / 0（スライス 4 で番犬 1 本追加） |
+| `tako-app` / `tako-cli` | **440**/**0** / 53/**0**（スライス 5 で +13） |
+| `tako-control` (lib) | 955 / **25 failed** |
+| `tako-core` (lib) | 668 / **5 failed** |
+| `platform_parity` | **11** / 0 |
 | `encoding_conpty` | 5 / 0 |
 | `psmux_backend` | 16 / 0 |
 
@@ -785,7 +878,7 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 内訳と根拠は #583 の 2026-08-21 のコメント。スライスごとにこの表と突き合わせ、
 増減があれば `TAKO_BACKEND=none` 等で「自分の変更が原因か」を切り分けてから報告する。
 
-macOS 側のベースライン: `test --workspace` **2217 passed / 0 failed**（スライス 4 + 6 の統合後。3 完了時点は 2194）/
+macOS 側のベースライン: `test --workspace` **2228 passed / 0 failed**（スライス 5 後。4 + 6 統合時点は 2217）/
 visual-test **98 checkpoint** / クロスチェック **エラー 0・警告 10**。
 
 ### 持ち込まないもの（今回の裁定で確定）
