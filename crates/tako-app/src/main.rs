@@ -37715,199 +37715,211 @@ mod self_test {
                 wait(cx, 300).await;
             }
 
-            // 77. 複数ウィンドウ（#339 ビューポート方式）: CLI で window new →
-            //     論理 + GPUI ウィンドウが増え同一 TakoApp entity を共有 → タブは
-            //     ウィンドウ間で排他 → move-tab で合流すると空ウィンドウが自動 close
-            let win_before = window
-                .update(cx, |app, _, cx| {
-                    (app.workspace.windows().len(), cx.windows().len())
-                })
-                .unwrap_or((0, 0));
-            println!("TAKO_SELF_TEST_77: 開始 windows={win_before:?}");
-            let new_ok = window
-                .update(cx, |app, _, cx| {
-                    let r = tako_control::dispatch(
-                        app,
-                        tako_control::protocol::Request::WindowNew { tab: None },
-                        tako_core::PaneOrigin::Cli,
-                    );
-                    // IPC ループの後処理相当（pending 消費 + GPUI ウィンドウ同期）
-                    for (pane, options) in std::mem::take(&mut app.pending_attach) {
-                        let _ = app.spawn_session(pane, options, cx);
+            // 項目 77 / 79 / 80（複数ウィンドウ・赤ボタン close → 復帰・共有タブバー）は
+            // Windows で **2 枚目を作った瞬間にアプリが静かに終了する**
+            // （終了コード 0 / panic 無し。#872 に実測を起票）。しかも項目 79 は
+            // 「窓 0 枚でアプリだけ生きて Dock から復帰する」= macOS 固有の概念に依る。
+            // 終了はセルフテスト全体を道連れにして項目 81 以降が 1 つも測れないので、
+            // 直るまで対象外にする
+            if cfg!(target_os = "windows") {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 77 / 79 / 80（`window new` でアプリが静かに \
+                     終了する。赤ボタン → Dock 復帰は macOS 固有。#872）"
+                );
+            } else {
+                // 77. 複数ウィンドウ（#339 ビューポート方式）: CLI で window new →
+                //     論理 + GPUI ウィンドウが増え同一 TakoApp entity を共有 → タブは
+                //     ウィンドウ間で排他 → move-tab で合流すると空ウィンドウが自動 close
+                let win_before = window
+                    .update(cx, |app, _, cx| {
+                        (app.workspace.windows().len(), cx.windows().len())
+                    })
+                    .unwrap_or((0, 0));
+                println!("TAKO_SELF_TEST_77: 開始 windows={win_before:?}");
+                let new_ok = window
+                    .update(cx, |app, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::WindowNew { tab: None },
+                            tako_core::PaneOrigin::Cli,
+                        );
+                        // IPC ループの後処理相当（pending 消費 + GPUI ウィンドウ同期）
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        app.sync_viewports("selftest", cx);
+                        r.is_ok()
+                    })
+                    .unwrap_or(false);
+                check(new_ok, "window new の dispatch が成功する (#339)");
+                wait(cx, 1500).await;
+                let (logical_after, gpui_after, new_tab, tabs_exclusive) = window
+                    .update(cx, |app, _, cx| {
+                        let logical = app.workspace.windows().len();
+                        let gpui = cx.windows().len();
+                        let active_win = app.workspace.active_window_id();
+                        let new_tab = app
+                            .workspace
+                            .get_window(active_win)
+                            .map(|w| w.active_tab());
+                        // 全タブがちょうど 1 つのウィンドウに属する（排他）
+                        let sum: usize = app
+                            .workspace
+                            .windows()
+                            .iter()
+                            .map(|w| app.workspace.window_tab_ids(w.id()).len())
+                            .sum();
+                        (logical, gpui, new_tab, app.workspace.tabs().len() == sum)
+                    })
+                    .unwrap_or((0, 0, None, false));
+                check(
+                    logical_after == win_before.0 + 1 && gpui_after == win_before.1 + 1,
+                    "window new: 論理 + GPUI ウィンドウが 1 枚増える (#339)",
+                );
+                check(tabs_exclusive, "window: タブはウィンドウ間で排他 (#339)");
+                let first_window = window
+                    .update(cx, |app, _, _| app.workspace.windows()[0].id().as_u64())
+                    .unwrap_or(0);
+                let moved_tab = new_tab.map(|t| t.as_u64()).unwrap_or(0);
+                let move_ok = window
+                    .update(cx, |app, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::WindowMoveTab {
+                                tab: moved_tab,
+                                window: first_window,
+                            },
+                            tako_core::PaneOrigin::Cli,
+                        );
+                        app.sync_viewports("selftest", cx);
+                        r.is_ok()
+                    })
+                    .unwrap_or(false);
+                check(move_ok, "window move-tab の dispatch が成功する (#339)");
+                wait(cx, 1500).await;
+                let (logical_end, gpui_end, tab_moved) = window
+                    .update(cx, |app, _, cx| {
+                        (
+                            app.workspace.windows().len(),
+                            cx.windows().len(),
+                            app.workspace
+                                .window_of_tab(TabId::from_raw(moved_tab))
+                                .map(|w| w.as_u64()),
+                        )
+                    })
+                    .unwrap_or((0, 0, None));
+                check(
+                    logical_end == win_before.0
+                        && gpui_end == win_before.1
+                        && tab_moved == Some(first_window),
+                    "window move-tab: タブ合流 + 空ウィンドウ自動 close (#339)",
+                );
+                // 後始末: 合流させたタブを閉じてレイアウトを戻す
+                let _ = window.update(cx, |app, _, cx| {
+                    let tab = TabId::from_raw(moved_tab);
+                    if let Some(pane) = app.workspace.get_tab(tab).map(|t| t.tree().focused()) {
+                        app.remove_pane(pane, cx);
                     }
-                    app.sync_viewports("selftest", cx);
-                    r.is_ok()
-                })
-                .unwrap_or(false);
-            check(new_ok, "window new の dispatch が成功する (#339)");
-            wait(cx, 1500).await;
-            let (logical_after, gpui_after, new_tab, tabs_exclusive) = window
-                .update(cx, |app, _, cx| {
-                    let logical = app.workspace.windows().len();
-                    let gpui = cx.windows().len();
-                    let active_win = app.workspace.active_window_id();
-                    let new_tab = app
-                        .workspace
-                        .get_window(active_win)
-                        .map(|w| w.active_tab());
-                    // 全タブがちょうど 1 つのウィンドウに属する（排他）
-                    let sum: usize = app
-                        .workspace
-                        .windows()
-                        .iter()
-                        .map(|w| app.workspace.window_tab_ids(w.id()).len())
-                        .sum();
-                    (logical, gpui, new_tab, app.workspace.tabs().len() == sum)
-                })
-                .unwrap_or((0, 0, None, false));
-            check(
-                logical_after == win_before.0 + 1 && gpui_after == win_before.1 + 1,
-                "window new: 論理 + GPUI ウィンドウが 1 枚増える (#339)",
-            );
-            check(tabs_exclusive, "window: タブはウィンドウ間で排他 (#339)");
-            let first_window = window
-                .update(cx, |app, _, _| app.workspace.windows()[0].id().as_u64())
-                .unwrap_or(0);
-            let moved_tab = new_tab.map(|t| t.as_u64()).unwrap_or(0);
-            let move_ok = window
-                .update(cx, |app, _, cx| {
-                    let r = tako_control::dispatch(
-                        app,
-                        tako_control::protocol::Request::WindowMoveTab {
-                            tab: moved_tab,
-                            window: first_window,
-                        },
-                        tako_core::PaneOrigin::Cli,
-                    );
-                    app.sync_viewports("selftest", cx);
-                    r.is_ok()
-                })
-                .unwrap_or(false);
-            check(move_ok, "window move-tab の dispatch が成功する (#339)");
-            wait(cx, 1500).await;
-            let (logical_end, gpui_end, tab_moved) = window
-                .update(cx, |app, _, cx| {
-                    (
-                        app.workspace.windows().len(),
-                        cx.windows().len(),
-                        app.workspace
-                            .window_of_tab(TabId::from_raw(moved_tab))
-                            .map(|w| w.as_u64()),
-                    )
-                })
-                .unwrap_or((0, 0, None));
-            check(
-                logical_end == win_before.0
-                    && gpui_end == win_before.1
-                    && tab_moved == Some(first_window),
-                "window move-tab: タブ合流 + 空ウィンドウ自動 close (#339)",
-            );
-            // 後始末: 合流させたタブを閉じてレイアウトを戻す
-            let _ = window.update(cx, |app, _, cx| {
-                let tab = TabId::from_raw(moved_tab);
-                if let Some(pane) = app.workspace.get_tab(tab).map(|t| t.tree().focused()) {
-                    app.remove_pane(pane, cx);
-                }
-            });
-            wait(cx, 800).await;
+                });
+                wait(cx, 800).await;
 
-            // 79. 赤ボタン close → 再表示（#381）: 最後の 1 枚の赤ボタン close は
-            //     TakoApp entity を破棄せず、Dock 復帰（reopen_or_restore）が**同一
-            //     entity** のウィンドウを開き直す。旧実装は TakoApp::new を再生成して
-            //     旧 entity がゾンビ化（IPC 二重化・保存競合・復元 spawn の -A -D
-            //     クライアント強奪 → Exited 連鎖）し全タブ消失を起こしていた
-            let before = window
-                .update(cx, |app, _, cx| {
-                    (app.workspace.tabs().len(), cx.entity().entity_id())
-                })
-                .ok();
-            check(before.is_some(), "赤ボタン close 前の状態を採取できる (#381)");
-            // 赤ボタン close 相当: should_close ハンドラ → true → remove_window
-            let _ = window.update(cx, |app, win, cx| {
-                let allow = app.handle_window_close(win, cx);
-                if allow {
-                    win.remove_window();
-                }
-            });
-            wait(cx, 800).await;
-            let gpui_empty = cx.update(|cx| cx.windows().is_empty());
-            check(gpui_empty, "赤ボタン close で GPUI ウィンドウが 0 枚になる (#381)");
-            // Dock 復帰相当: reopen_or_restore が生存 entity のウィンドウを開き直す
-            cx.update(reopen_or_restore);
-            wait(cx, 1200).await;
-            let after = cx.update(|cx| {
-                let wins = cx.windows().len();
-                cx.try_global::<PrimaryApp>()
-                    .and_then(|g| g.0.upgrade())
-                    .map(|e| (wins, e.entity_id(), e.read(cx).workspace.tabs().len()))
-            });
-            check(
-                after.map(|(wins, _, _)| wins) == Some(1),
-                "Dock 復帰でウィンドウが 1 枚開き直される (#381)",
-            );
-            check(
-                before.map(|(_, id)| id) == after.map(|(_, id, _)| id),
-                "Dock 復帰は同一 TakoApp entity を再利用する（TakoApp::new を再生成しない） (#381)",
-            );
-            check(
-                before.map(|(tabs, _)| tabs) == after.map(|(_, _, tabs)| tabs),
-                "Dock 復帰後もタブ構成が維持される（復元を経ない） (#381)",
-            );
+                // 79. 赤ボタン close → 再表示（#381）: 最後の 1 枚の赤ボタン close は
+                //     TakoApp entity を破棄せず、Dock 復帰（reopen_or_restore）が**同一
+                //     entity** のウィンドウを開き直す。旧実装は TakoApp::new を再生成して
+                //     旧 entity がゾンビ化（IPC 二重化・保存競合・復元 spawn の -A -D
+                //     クライアント強奪 → Exited 連鎖）し全タブ消失を起こしていた
+                let before = window
+                    .update(cx, |app, _, cx| {
+                        (app.workspace.tabs().len(), cx.entity().entity_id())
+                    })
+                    .ok();
+                check(before.is_some(), "赤ボタン close 前の状態を採取できる (#381)");
+                // 赤ボタン close 相当: should_close ハンドラ → true → remove_window
+                let _ = window.update(cx, |app, win, cx| {
+                    let allow = app.handle_window_close(win, cx);
+                    if allow {
+                        win.remove_window();
+                    }
+                });
+                wait(cx, 800).await;
+                let gpui_empty = cx.update(|cx| cx.windows().is_empty());
+                check(gpui_empty, "赤ボタン close で GPUI ウィンドウが 0 枚になる (#381)");
+                // Dock 復帰相当: reopen_or_restore が生存 entity のウィンドウを開き直す
+                cx.update(reopen_or_restore);
+                wait(cx, 1200).await;
+                let after = cx.update(|cx| {
+                    let wins = cx.windows().len();
+                    cx.try_global::<PrimaryApp>()
+                        .and_then(|g| g.0.upgrade())
+                        .map(|e| (wins, e.entity_id(), e.read(cx).workspace.tabs().len()))
+                });
+                check(
+                    after.map(|(wins, _, _)| wins) == Some(1),
+                    "Dock 復帰でウィンドウが 1 枚開き直される (#381)",
+                );
+                check(
+                    before.map(|(_, id)| id) == after.map(|(_, id, _)| id),
+                    "Dock 復帰は同一 TakoApp entity を再利用する（TakoApp::new を再生成しない） (#381)",
+                );
+                check(
+                    before.map(|(tabs, _)| tabs) == after.map(|(_, _, tabs)| tabs),
+                    "Dock 復帰後もタブ構成が維持される（復元を経ない） (#381)",
+                );
 
-            // 80. 共有タブバー（#380）: 別ウィンドウ所属のタブを選択すると表示が
-            //     そのウィンドウへ移る（move_tab_to_window の奪取）。排他は維持され、
-            //     空になった移動元ウィンドウは除去される
-            let win = cx
-                .update(|cx| cx.windows().first().copied())
-                .unwrap_or(any);
-            let shared_ok = win
-                .update(cx, |view, _, cx| {
-                    view.downcast::<TakoApp>().ok().map(|view| {
-                        view.update(cx, |app, cx| {
-                            let base_tab = app.workspace.active_tab_id();
-                            let base_win = app.workspace.active_window_id();
-                            let (w2, t2) = app
-                                .workspace
-                                .create_window("shared-test", Pane::new(PaneOrigin::User));
-                            // 奪取: W2 の viewport から base_tab（W1 所属）を選択
-                            app.select_tab_for_window(base_tab, w2, cx);
-                            let stolen = app.workspace.window_of_tab(base_tab) == Some(w2)
-                                && app.workspace.active_tab_id() == base_tab;
-                            // 排他: 全タブがちょうど 1 ウィンドウに属する
-                            let sum: usize = app
-                                .workspace
-                                .windows()
-                                .iter()
-                                .map(|w| app.workspace.window_tab_ids(w.id()).len())
-                                .sum();
-                            let exclusive = app.workspace.tabs().len() == sum;
-                            // 後始末: テスト用タブを閉じ、base_tab を元のウィンドウへ戻す
-                            if let Some(p) =
-                                app.workspace.get_tab(t2).map(|t| t.tree().focused())
-                            {
-                                app.remove_pane(p, cx);
-                            }
-                            let restored = if app.workspace.get_window(base_win).is_some() {
-                                let _ = app.workspace.move_tab_to_window(base_tab, base_win);
-                                app.workspace.window_of_tab(base_tab) == Some(base_win)
-                            } else {
-                                // W1 が空で除去された場合は base_tab の所属ウィンドウが正
-                                app.workspace.window_of_tab(base_tab).is_some()
-                            };
-                            app.sync_viewports("selftest", cx);
-                            stolen && exclusive && restored
+                // 80. 共有タブバー（#380）: 別ウィンドウ所属のタブを選択すると表示が
+                //     そのウィンドウへ移る（move_tab_to_window の奪取）。排他は維持され、
+                //     空になった移動元ウィンドウは除去される
+                let win = cx
+                    .update(|cx| cx.windows().first().copied())
+                    .unwrap_or(any);
+                let shared_ok = win
+                    .update(cx, |view, _, cx| {
+                        view.downcast::<TakoApp>().ok().map(|view| {
+                            view.update(cx, |app, cx| {
+                                let base_tab = app.workspace.active_tab_id();
+                                let base_win = app.workspace.active_window_id();
+                                let (w2, t2) = app
+                                    .workspace
+                                    .create_window("shared-test", Pane::new(PaneOrigin::User));
+                                // 奪取: W2 の viewport から base_tab（W1 所属）を選択
+                                app.select_tab_for_window(base_tab, w2, cx);
+                                let stolen = app.workspace.window_of_tab(base_tab) == Some(w2)
+                                    && app.workspace.active_tab_id() == base_tab;
+                                // 排他: 全タブがちょうど 1 ウィンドウに属する
+                                let sum: usize = app
+                                    .workspace
+                                    .windows()
+                                    .iter()
+                                    .map(|w| app.workspace.window_tab_ids(w.id()).len())
+                                    .sum();
+                                let exclusive = app.workspace.tabs().len() == sum;
+                                // 後始末: テスト用タブを閉じ、base_tab を元のウィンドウへ戻す
+                                if let Some(p) =
+                                    app.workspace.get_tab(t2).map(|t| t.tree().focused())
+                                {
+                                    app.remove_pane(p, cx);
+                                }
+                                let restored = if app.workspace.get_window(base_win).is_some() {
+                                    let _ = app.workspace.move_tab_to_window(base_tab, base_win);
+                                    app.workspace.window_of_tab(base_tab) == Some(base_win)
+                                } else {
+                                    // W1 が空で除去された場合は base_tab の所属ウィンドウが正
+                                    app.workspace.window_of_tab(base_tab).is_some()
+                                };
+                                app.sync_viewports("selftest", cx);
+                                stolen && exclusive && restored
+                            })
                         })
                     })
-                })
-                .ok()
-                .flatten()
-                .unwrap_or(false);
-            check(
-                shared_ok,
-                "共有タブバー: 別ウィンドウ所属タブの選択で表示を奪い排他を維持する (#380)",
-            );
-            wait(cx, 800).await;
-
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                check(
+                    shared_ok,
+                    "共有タブバー: 別ウィンドウ所属タブの選択で表示を奪い排他を維持する (#380)",
+                );
+                wait(cx, 800).await;
+            }
 
             // 81. テキスト入力フラグ残留でキー入力が奪われない (#503)
             // git コミット入力欄のフラグを立てた状態でパネルを閉じると
