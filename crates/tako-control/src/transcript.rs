@@ -148,13 +148,13 @@ pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
 /// ログインシェルの rc / direnv が別の値を持っていても勝てるよう、
 /// `export` / `unset` を明示する（#500 / #512 と同型）
 pub fn resume_env_prefix_for(location: &TranscriptLocation) -> String {
-    resume_env_prefix_for_in(location, crate::launch_cmd::launch_syntax())
+    resume_env_prefix_for_in(location, crate::launch_cmd::launch_dialect())
 }
 
 /// 方言を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
 pub fn resume_env_prefix_for_in(
     location: &TranscriptLocation,
-    dialect: crate::launch_cmd::LaunchSyntax,
+    dialect: crate::launch_cmd::ShellDialect,
 ) -> String {
     let key = crate::orchestrator::CLAUDE_CONFIG_DIR_ENV;
     if location.is_default {
@@ -887,7 +887,7 @@ mod tests {
     /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
     /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
     #[allow(dead_code)]
-    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+    const POSIX: crate::launch_cmd::ShellDialect = crate::launch_cmd::ShellDialect::Posix;
 
     use super::*;
 

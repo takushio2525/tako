@@ -122,13 +122,13 @@ impl Default for WorkerLaunch<'_> {
 /// claude の従来出力（`build_worker_claude_cmd`）と互換（skip_permissions /
 /// extra_args 未使用時は既存文字列と一致する）
 pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
-    build_worker_cmd_in(launch, crate::launch_cmd::launch_syntax())
+    build_worker_cmd_in(launch, crate::launch_cmd::launch_dialect())
 }
 
 /// 方言を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
 pub fn build_worker_cmd_in(
     launch: &WorkerLaunch,
-    dialect: crate::launch_cmd::LaunchSyntax,
+    dialect: crate::launch_cmd::ShellDialect,
 ) -> String {
     use crate::launch_cmd as lc;
     // env 計画をコマンド先頭で注入する。ログインシェルが direnv で同変数を
@@ -297,7 +297,7 @@ fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
 mod tests {
     /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
     /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
-    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+    const POSIX: crate::launch_cmd::ShellDialect = crate::launch_cmd::ShellDialect::Posix;
 
     use super::*;
 

@@ -1705,7 +1705,7 @@ pub fn build_master_cmd(
         profile,
         prompt_path,
         tako_bin,
-        crate::launch_cmd::launch_syntax(),
+        crate::launch_cmd::launch_dialect(),
     )
 }
 
@@ -1715,7 +1715,7 @@ pub fn build_master_cmd_in(
     profile: &Profile,
     prompt_path: &Path,
     tako_bin: &str,
-    dialect: crate::launch_cmd::LaunchSyntax,
+    dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, String> {
     use crate::launch_cmd as lc;
     // env 検証（内部変数の上書きを拒否。Issue #500）
@@ -1799,7 +1799,7 @@ pub fn build_master_cmd_in(
 /// `agent::build_worker_cmd`。ここは claude 用の互換ラッパー）。
 /// model が None の場合は `--model` を付けず claude CLI の既定に委ねる
 pub fn build_worker_claude_cmd(role: &str, model: Option<&str>, effort: &str) -> String {
-    build_worker_claude_cmd_in(role, model, effort, crate::launch_cmd::launch_syntax())
+    build_worker_claude_cmd_in(role, model, effort, crate::launch_cmd::launch_dialect())
 }
 
 /// 構文を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
@@ -1807,7 +1807,7 @@ pub fn build_worker_claude_cmd_in(
     role: &str,
     model: Option<&str>,
     effort: &str,
-    syntax: crate::launch_cmd::LaunchSyntax,
+    syntax: crate::launch_cmd::ShellDialect,
 ) -> String {
     agent::build_worker_cmd_in(
         &agent::WorkerLaunch {
@@ -2478,7 +2478,7 @@ mod tests {
     /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
     /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
     #[allow(dead_code)]
-    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+    const POSIX: crate::launch_cmd::ShellDialect = crate::launch_cmd::ShellDialect::Posix;
 
     use super::*;
 
@@ -3217,7 +3217,7 @@ prompt_blocks:
     /// `unset` / `$(cat` が消えている」を全関数で機械的に見る
     #[test]
     fn issue867_powershellの起動コマンドにposix構文が残らない() {
-        let ps = crate::launch_cmd::LaunchSyntax::PowerShell;
+        let ps = crate::launch_cmd::ShellDialect::PowerShell;
         let env = EnvPlan {
             exports: vec![("CLAUDE_CONFIG_DIR".into(), "C:\\Users\\x\\.claude-u".into())],
             unsets: vec!["OTHER_VAR".into()],
@@ -3312,7 +3312,7 @@ prompt_blocks:
     /// codex は実機に入っていないので文字列で担保する
     #[test]
     fn issue867_codex_masterのfile読み込みがpowershell構文になる() {
-        let ps = crate::launch_cmd::LaunchSyntax::PowerShell;
+        let ps = crate::launch_cmd::ShellDialect::PowerShell;
         let p = Profile {
             master_agent: Some("codex".into()),
             ..Default::default()
