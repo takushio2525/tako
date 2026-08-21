@@ -1700,6 +1700,24 @@ pub fn build_master_cmd(
     prompt_path: &Path,
     tako_bin: &str,
 ) -> Result<String, String> {
+    build_master_cmd_in(
+        role_env,
+        profile,
+        prompt_path,
+        tako_bin,
+        crate::launch_cmd::launch_syntax(),
+    )
+}
+
+/// 方言を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
+pub fn build_master_cmd_in(
+    role_env: &str,
+    profile: &Profile,
+    prompt_path: &Path,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::LaunchSyntax,
+) -> Result<String, String> {
+    use crate::launch_cmd as lc;
     // env 検証（内部変数の上書きを拒否。Issue #500）
     profile.validate_env()?;
 
@@ -1710,39 +1728,39 @@ pub fn build_master_cmd(
     let plan = profile.resolved_env_plan_for_master()?;
     let mut cmd = String::new();
     for k in &plan.unsets {
-        cmd.push_str(&format!("unset {}; ", agent::sh_quote(k)));
+        cmd.push_str(&lc::unset_prefix(dialect, k));
     }
     for (k, v) in &plan.exports {
-        cmd.push_str(&format!(
-            "export {}={}; ",
-            agent::sh_quote(k),
-            agent::sh_quote(v)
-        ));
+        cmd.push_str(&lc::export_prefix(dialect, k, v));
     }
-    cmd.push_str(&format!(
-        "TAKO_ORCHESTRATOR_ROLE='{role_env}' {}",
-        agent.as_str()
+    // role は「続くエージェントへ引き継ぐ」前置き。PowerShell にインライン前置きの
+    // 構文は無いので代入 + `;` になる（#867 の主症状）
+    cmd.push_str(&lc::inline_env_prefix(
+        dialect,
+        "TAKO_ORCHESTRATOR_ROLE",
+        &lc::quote_always(dialect, role_env),
     ));
+    cmd.push_str(agent.as_str());
     match agent {
         WorkerAgent::Claude => {
             if let Some(model) = profile.model.as_deref() {
-                cmd.push_str(&format!(" --model '{model}'"));
+                cmd.push_str(&format!(" --model {}", lc::quote_always(dialect, model)));
             }
             cmd.push_str(&format!(" --effort {}", profile.effort));
             cmd.push_str(&format!(
-                " --append-system-prompt-file '{}'",
-                prompt_path.display()
+                " --append-system-prompt-file {}",
+                lc::quote_always(dialect, &prompt_path.display().to_string())
             ));
         }
         WorkerAgent::Codex => {
             if let Some(model) = profile.model.as_deref() {
-                cmd.push_str(&format!(" --model {}", agent::sh_quote(model)));
+                cmd.push_str(&format!(" --model {}", lc::quote(dialect, model)));
             }
             // codex 0.144 の effort は none/minimal/low/medium/high/xhigh/max/ultra
             // （バイナリの enum で確認）。ネイティブ表記をそのまま渡す（worker と同じ思想）
             cmd.push_str(&format!(
                 " -c model_reasoning_effort={}",
-                agent::sh_quote(&profile.effort)
+                lc::quote(dialect, &profile.effort)
             ));
             // MCP ツール呼び出し・コマンド実行の承認をスキップ（#132）。
             // `-a never` はコマンド承認のみでMCPツール承認はバイパスしない（実測）。
@@ -1752,10 +1770,10 @@ pub fn build_master_cmd(
             // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
             cmd.push_str(&format!(
                 " -c {}",
-                agent::sh_quote(&format!(
-                    "mcp_servers.tako.command={}",
-                    agent::toml_quote(tako_bin)
-                ))
+                lc::quote(
+                    dialect,
+                    &format!("mcp_servers.tako.command={}", agent::toml_quote(tako_bin))
+                )
             ));
             cmd.push_str(r#" -c 'mcp_servers.tako.args=["mcp","serve"]'"#);
             cmd.push_str(&format!(
@@ -1763,11 +1781,12 @@ pub fn build_master_cmd(
             ));
             // system prompt は developer_instructions（developer ロールメッセージとして
             // モデル可視プロンプトへ注入されることを codex debug prompt-input で実証済み）。
-            // "$(cat …)" はダブルクォート内コマンド置換のため、ファイル内容の $ / " / '
-            // はシェルに再解釈されない
+            // `"$( … )"` はダブルクォート内の部分式展開なので、ファイル内容の $ / " / '
+            // はシェルに再解釈されない。読み方はシェルの方言で変わる（#867: PowerShell に
+            // cat は無く Get-Content -Raw）
             cmd.push_str(&format!(
-                " -c developer_instructions=\"$(cat {})\"",
-                agent::sh_quote(&prompt_path.display().to_string())
+                " -c developer_instructions={}",
+                lc::file_contents_expr(dialect, &prompt_path.display().to_string())
             ));
         }
         // resolve_master_agent が拒否する（master 非対応）
@@ -1780,13 +1799,26 @@ pub fn build_master_cmd(
 /// `agent::build_worker_cmd`。ここは claude 用の互換ラッパー）。
 /// model が None の場合は `--model` を付けず claude CLI の既定に委ねる
 pub fn build_worker_claude_cmd(role: &str, model: Option<&str>, effort: &str) -> String {
-    agent::build_worker_cmd(&agent::WorkerLaunch {
-        agent: WorkerAgent::Claude,
-        role,
-        model,
-        effort: Some(effort),
-        ..Default::default()
-    })
+    build_worker_claude_cmd_in(role, model, effort, crate::launch_cmd::launch_syntax())
+}
+
+/// 構文を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
+pub fn build_worker_claude_cmd_in(
+    role: &str,
+    model: Option<&str>,
+    effort: &str,
+    syntax: crate::launch_cmd::LaunchSyntax,
+) -> String {
+    agent::build_worker_cmd_in(
+        &agent::WorkerLaunch {
+            agent: WorkerAgent::Claude,
+            role,
+            model,
+            effort: Some(effort),
+            ..Default::default()
+        },
+        syntax,
+    )
 }
 
 /// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
@@ -2443,6 +2475,11 @@ pub struct AgentStatus {
 
 #[cfg(test)]
 mod tests {
+    /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
+    /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
+    #[allow(dead_code)]
+    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+
     use super::*;
 
     #[test]
@@ -3172,11 +3209,132 @@ prompt_blocks:
         assert!(prompt.contains("Session Identity"));
     }
 
+    /// #867: 5 フロー（spawn / git resolve / master / solo / handoff / sessions resume）が
+    /// 通る 3 関数すべてで、PowerShell 側に **POSIX 専用の構文が 1 つも残らない**こと。
+    ///
+    /// 実機の症状は「`TAKO_ORCHESTRATOR_ROLE='worker:x' claude` の先頭語がコマンド名として
+    /// 解決できない」だった。ここでは「インライン前置きが代入になっている」「`export` /
+    /// `unset` / `$(cat` が消えている」を全関数で機械的に見る
+    #[test]
+    fn issue867_powershellの起動コマンドにposix構文が残らない() {
+        let ps = crate::launch_cmd::LaunchSyntax::PowerShell;
+        let env = EnvPlan {
+            exports: vec![("CLAUDE_CONFIG_DIR".into(), "C:\\Users\\x\\.claude-u".into())],
+            unsets: vec!["OTHER_VAR".into()],
+        };
+
+        // (1) build_worker_cmd = orchestrator spawn / git resolve
+        let worker = agent::build_worker_cmd_in(
+            &agent::WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:proj:検証",
+                model: Some("claude-opus-5"),
+                effort: Some("max"),
+                env: &env,
+                ..Default::default()
+            },
+            ps,
+        );
+        // (2) build_master_cmd = tako master / tako solo / handoff の後任
+        let mut p = Profile::default();
+        p.env.insert("OTHER_VAR".into(), "v".into());
+        let master =
+            build_master_cmd_in("master:st867", &p, Path::new("C:\\t\\p.md"), "tako.exe", ps)
+                .unwrap();
+        // (3) resume_env_prefix_for = sessions resume / registry の resume_command
+        let resume_default = crate::transcript::resume_env_prefix_for_in(
+            &crate::transcript::TranscriptLocation {
+                config_dir: std::path::PathBuf::from("C:\\Users\\x\\.claude"),
+                is_default: true,
+                path: std::path::PathBuf::from("C:\\Users\\x\\.claude\\t.jsonl"),
+            },
+            ps,
+        );
+        let resume_account = crate::transcript::resume_env_prefix_for_in(
+            &crate::transcript::TranscriptLocation {
+                config_dir: std::path::PathBuf::from("C:\\Users\\x\\.claude-u"),
+                is_default: false,
+                path: std::path::PathBuf::from("C:\\Users\\x\\.claude-u\\t.jsonl"),
+            },
+            ps,
+        );
+
+        for (name, cmd) in [
+            ("build_worker_cmd", &worker),
+            ("build_master_cmd", &master),
+            ("resume(default)", &resume_default),
+            ("resume(account)", &resume_account),
+        ] {
+            // POSIX 専用の構文が残っていない
+            assert!(
+                !cmd.contains("export ") && !cmd.contains("unset "),
+                "{name}: export / unset が残っている: {cmd}"
+            );
+            assert!(!cmd.contains("$(cat "), "{name}: cat が残っている: {cmd}");
+            // インライン前置き（`VAR=v cmd`）が残っていない = #867 の主症状
+            assert!(
+                !cmd.contains("TAKO_ORCHESTRATOR_ROLE='") || cmd.contains("$env:"),
+                "{name}: インライン前置きのまま: {cmd}"
+            );
+        }
+
+        // role は代入で引き継がれ、エージェント名がコマンドの先頭語になる
+        assert!(
+            worker.contains("$env:TAKO_ORCHESTRATOR_ROLE='worker:proj:検証'; claude"),
+            "{worker}"
+        );
+        assert!(
+            master.contains("$env:TAKO_ORCHESTRATOR_ROLE='master:st867'; claude"),
+            "{master}"
+        );
+        // env 計画も PowerShell 構文
+        assert!(
+            worker.contains("$env:CLAUDE_CONFIG_DIR='C:\\Users\\x\\.claude-u'; "),
+            "{worker}"
+        );
+        assert!(
+            worker.contains(
+                "Remove-Item -LiteralPath 'Env:OTHER_VAR' -ErrorAction SilentlyContinue; "
+            ),
+            "{worker}"
+        );
+        assert_eq!(
+            resume_default,
+            "Remove-Item -LiteralPath 'Env:CLAUDE_CONFIG_DIR' -ErrorAction SilentlyContinue; "
+        );
+        assert_eq!(
+            resume_account,
+            "$env:CLAUDE_CONFIG_DIR='C:\\Users\\x\\.claude-u'; "
+        );
+    }
+
+    /// codex master も PowerShell で解釈できる形になること（`$(cat …)` → Get-Content）。
+    /// codex は実機に入っていないので文字列で担保する
+    #[test]
+    fn issue867_codex_masterのfile読み込みがpowershell構文になる() {
+        let ps = crate::launch_cmd::LaunchSyntax::PowerShell;
+        let p = Profile {
+            master_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let cmd =
+            build_master_cmd_in("master", &p, Path::new("C:\\t\\p.md"), "tako.exe", ps).unwrap();
+        assert!(
+            cmd.contains("Get-Content -Raw -LiteralPath 'C:\\t\\p.md'"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("cat "), "{cmd}");
+        assert!(
+            cmd.contains("$env:TAKO_ORCHESTRATOR_ROLE='master'; codex"),
+            "{cmd}"
+        );
+    }
+
     #[test]
     fn master_cmd_without_model() {
         // 既定（master_agent 未指定 = claude）の出力は #127 以前と完全一致（後方互換）
         let p = Profile::default();
-        let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+        let cmd = build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='master' claude --effort max --append-system-prompt-file '/tmp/p.md'"
@@ -3190,7 +3348,8 @@ prompt_blocks:
             model: Some("claude-opus-4-6[1m]".into()),
             ..Default::default()
         };
-        let cmd = build_master_cmd("master:x", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+        let cmd =
+            build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
         assert!(cmd.contains("--model 'claude-opus-4-6[1m]'"));
         assert!(cmd.contains("--effort max"));
     }
@@ -3204,11 +3363,12 @@ prompt_blocks:
             effort: "xhigh".into(),
             ..Default::default()
         };
-        let cmd = build_master_cmd(
+        let cmd = build_master_cmd_in(
             "master:sol",
             &p,
             Path::new("/tmp/_system_prompt_sol.md"),
             "/usr/local/bin/tako",
+            POSIX,
         )
         .unwrap();
         assert_eq!(
@@ -3232,11 +3392,12 @@ prompt_blocks:
             master_agent: Some("codex".into()),
             ..Default::default()
         };
-        let cmd = build_master_cmd(
+        let cmd = build_master_cmd_in(
             "master",
             &p,
             Path::new("/tmp/pro file.md"),
             "/Applications/tako.app/Contents/Resources/tako bin/tako",
+            POSIX,
         )
         .unwrap();
         assert!(!cmd.contains("--model"));
@@ -3269,7 +3430,7 @@ prompt_blocks:
         assert!(err.contains("master 非対応"), "{err}");
         assert!(err.contains("worker"), "{err}");
         assert!(
-            build_master_cmd("master", &agy, Path::new("/tmp/p.md"), "tako").is_err(),
+            build_master_cmd_in("master", &agy, Path::new("/tmp/p.md"), "tako", POSIX).is_err(),
             "agy はコマンド組み立ても拒否"
         );
         // 不正値 → 対応一覧つきエラー
@@ -3340,7 +3501,8 @@ prompt_blocks:
     #[test]
     fn solo_cmd_uses_solo_role_and_high_effort() {
         let p = solo_default_profile();
-        let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+        let cmd =
+            build_master_cmd_in("solo", &p, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='solo' claude --effort high --append-system-prompt-file '/tmp/solo.md'"
@@ -3351,7 +3513,7 @@ prompt_blocks:
         );
 
         let cmd_suffix =
-            build_master_cmd("solo:docs", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+            build_master_cmd_in("solo:docs", &p, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
         assert!(cmd_suffix.contains("TAKO_ORCHESTRATOR_ROLE='solo:docs'"));
         assert!(cmd_suffix.contains("--effort high"));
     }
@@ -3364,7 +3526,8 @@ prompt_blocks:
             effort: "high".into(),
             ..Default::default()
         };
-        let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+        let cmd =
+            build_master_cmd_in("solo", &p, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
         assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='solo' codex "));
         assert!(cmd.contains("-c model_reasoning_effort=high"));
         assert!(
@@ -3378,12 +3541,13 @@ prompt_blocks:
     fn worker_cmd_model_optional() {
         // #120 のエージェント抽象化でモデル名のクオートは安全文字のみなら省く形へ
         // 変わった（シェル解釈後は従来と等価）
-        let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
+        let with =
+            build_worker_claude_cmd_in("worker:demo", Some("claude-sonnet-5"), "high", POSIX);
         assert_eq!(
             with,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model claude-sonnet-5 --effort high"
         );
-        let without = build_worker_claude_cmd("worker:demo", None, "max");
+        let without = build_worker_claude_cmd_in("worker:demo", None, "max", POSIX);
         assert_eq!(
             without,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --effort max"
@@ -4301,7 +4465,8 @@ worker_agents:
                 master_account: Some("univ".into()),
                 ..Default::default()
             };
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.starts_with("export CLAUDE_CONFIG_DIR=/tmp/tako-test-claude-univ; "),
                 "アカウントの config dir が export される: {cmd}"
@@ -4318,7 +4483,8 @@ worker_agents:
                 master_account: Some("personal".into()),
                 ..Default::default()
             };
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.starts_with("unset CLAUDE_CONFIG_DIR; "),
                 "既定の資格情報を使う master は unset を前置する: {cmd}"
@@ -4338,7 +4504,8 @@ worker_agents:
             p.env
                 .insert("CLAUDE_CONFIG_DIR".into(), "/tmp/old-dir".into());
             p.env.insert("OTHER_VAR".into(), "keep".into());
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.contains("export CLAUDE_CONFIG_DIR=/tmp/tako-test-claude-univ;"),
                 "{cmd}"
@@ -4359,7 +4526,8 @@ worker_agents:
                 master_account: Some("nosuch".into()),
                 ..Default::default()
             };
-            let err = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap_err();
+            let err = build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX)
+                .unwrap_err();
             assert!(err.contains("nosuch"), "{err}");
         });
     }
@@ -4369,7 +4537,8 @@ worker_agents:
     fn master_without_account_is_backward_compatible() {
         with_test_accounts(TEST_ACCOUNTS_YAML, || {
             let p = Profile::default();
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='master' claude"),
                 "従来と同じ形式: {cmd}"

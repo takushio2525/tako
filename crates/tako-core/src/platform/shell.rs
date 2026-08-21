@@ -6,8 +6,12 @@
 
 use crate::terminal::SpawnCommand;
 
-/// 既定シェル。`None` を返すとペインを spawn できない
-pub(crate) fn default_shell() -> Option<SpawnCommand> {
+/// 既定シェル。`None` を返すとペインを spawn できない。
+///
+/// **ペインへ打ち込むコマンドの構文はこのシェルで決まる**（#867）。同じ OS でも
+/// PowerShell か POSIX かで `export` / インライン env 前置きの書き方が変わるので、
+/// 起動コマンドを組み立てる側（`tako-control::launch_cmd`）がここを見る
+pub fn default_shell() -> Option<SpawnCommand> {
     imp::default_shell()
 }
 

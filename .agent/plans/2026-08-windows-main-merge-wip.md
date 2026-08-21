@@ -958,6 +958,101 @@ TakoApp 側配線が抜けていれば必ず落ちるので、**実アプリの�
 - `tako_send_input` で**既存ペイン**へ送る経路は書きっぱなしのまま（移植元の意図的な範囲外。
   Ctrl+C による復旧が任意のペインに対しては危険なため別設計が要る）
 
+
+### 7c. 起動コマンドの env 前置きをシェル方言へ（#867）— ✅ **完了**（PR #874）
+
+7b（#640）で「起動コマンドがペインへ全文届く」ようになったが、**届いた命令が PowerShell で
+解釈できず**エージェントが起動しなかった。その残り半分。7b の実機検証で見つけて起票した分。
+
+- 持ち込む新規: `crates/tako-control/src/launch_cmd.rs`（win467 には無い。**新規設計**）
+- 編集: `orchestrator/agent.rs` / `orchestrator/mod.rs` / `transcript.rs` /
+  `platform/shell.rs`（`default_shell` を `pub` へ）
+- 依存: **2**（器の中のシェルが PowerShell であること）、**7b**（送達が成立していること）
+
+#### 完了記録（2026-08-21。PR #874 / `windows/867-shell-dialect-env`）
+
+##### 対象は 5 フロー / 3 関数
+
+呼び出し元を全数確認した結果、**#640 の 4 経路 + master / solo が 3 関数に集約されていた**。
+
+| 関数 | 通る経路 |
+|---|---|
+| `agent::build_worker_cmd` | orchestrator spawn / git resolve のエージェント |
+| `orchestrator::build_master_cmd` | `tako master` / `tako solo` / handoff の後任 master |
+| `transcript::resume_env_prefix_for` | `sessions resume` / worker レジストリの `resume_command` |
+
+`tako master` も `Request::Send` でペインへ**打ち込む**経路なので同じ関数を通る。
+各関数に構文を明示する `*_in` 版を分け、既定版はペインの既定シェルから引く。
+
+##### 変換規則（実機で 6 項目とも検証済み）
+
+| POSIX | PowerShell |
+|---|---|
+| `VAR='v' cmd` | `$env:VAR='v'; cmd` |
+| `export K=v; ` | `$env:K='v'; ` |
+| `unset K; ` | `Remove-Item -LiteralPath 'Env:K' -ErrorAction SilentlyContinue; ` |
+| `"$(cat p)"` | `"$(Get-Content -Raw -LiteralPath 'p')"` |
+| `'…'`（`'\''`） | `'…'`（`''`） |
+
+`-ErrorAction SilentlyContinue` は未設定でも行が止まらないため（POSIX の `unset` と挙動を揃える）。
+`Get-Content -Raw` は `cat` と違い**末尾改行を保つ**（codex の system prompt では無害）。
+
+##### #865 との調整（判断の記録）
+
+#865 が同じ判定を持つ `platform::shell_dialect` を**セルフテスト用**に作っていた。
+当初は「あちらの merge を待って後乗り」で合意したが、見込み 30〜60 分が 1.5 時間超になり、
+その間も `shell_dialect.rs` が育ち続けた（`print_lines` / `quote_arg` 等）。
+
+- 待つ = #867（**Windows でエージェントが起動できるか** = ミッションのコア）の完了時刻が読めない
+- スナップショットを取り込む = #865 側に rebase コンフリクトを押し付ける
+
+ので**依存を切って先に出した**（あちらのファイルへの差分ゼロ = コンフリクト構造的にゼロ）。
+判定が 2 本になることは自覚しており **#873 で一本化を起票**。#865 担当者へ通知・合意済み。
+
+**教訓**: 兄弟セッションの未マージ成果に依存するときは、①相手の残り見込みを聞く
+②その見込みが外れたときの代替を先に決めておく。ファイルを共有するのではなく
+**型を引数で受け取る形にしておくと、後から寄せるのが安い**。
+
+##### macOS を 1 バイトも変えないためにクォートを 2 系統にした
+
+`quote`（必要なときだけ引用 = 従来の `sh_quote`）と `quote_always`（元コードが `'{x}'` と
+直書きしていた箇所）。片方に寄せると `--append-system-prompt-file '/tmp/p.md'` が
+引用なしに変わり既存スナップショットが落ちる。
+
+##### 既定版が「動いているシェル」を見るようになった副作用（実機で 22 件）
+
+POSIX 文字列を固定するスナップショット群が Windows で必ず落ちた。テストが固定したいのは
+POSIX 形式そのものなので、**構文を明示する `*_in` 版を呼ぶ形へ寄せた**（28 箇所）。
+dispatch 経由の 2 件は builder を直接呼べないので期待値を構文非依存にした。
+
+→ 作法 11（プラットフォーム決め打ちのテストを疑う）に、**「自分の変更で決め打ちを
+作り込むこともある」**を追記する価値がある。
+
+#### 実機実測（`ssh win`。隔離 GUI を `schtasks /it` で session 1 へ）
+
+| 観測 | 結果 |
+|---|---|
+| 生成された起動コマンド | `$env:TAKO_ORCHESTRATOR_ROLE='worker:p867'; claude --effort max` |
+| `is not recognized` エラー | **消滅**（4 回の観測すべてで False） |
+| **claude が起動** | TUI 描画を確認（`[Opus 5 (1M context) · MAX]` / ctx バー / auto mode） |
+| **プロンプトが届いた** | `❯ 1 と 2 を足した数だけを答えてください。説明は不要です。` |
+| **claude が応答** | `● Login expired · Please run /login`（**この機の claude ログイン期限切れ**。
+起動と送達と応答は成立） |
+| **env が実プロセスへ届いた** | claude.exe の PEB を読み `TAKO_ORCHESTRATOR_ROLE=worker:p867` を確認 |
+| `flow_log` | `シェル準備待ち → エコー待ち → 実行確認`（書き直し 0 回・長さ 62） |
+
+実機テストは **22 件失敗 = 7b ベースライン 19 + #868 由来 3**（新規ゼロ。
+`resolve_cwd_existing_dir` は逆に通るようになった）。
+
+#### 7c が残した宿題
+
+- **#873**: 方言判定の一本化（`LaunchSyntax` → `ShellDialect`）。#865 merge 後
+- **claude のログインが切れている**ので「3」という中身の回答までは未確認。
+  対話 `/login` が要るので実アカウントに触れない範囲で止めた
+- 兄弟セッションからの申し送り: **#875**（`spawn_command_pane` が `/bin/sh -c` 決め打ちで
+  Windows では PTY が立たない = #666 のカード実行と #453 の Code Runner が死んでいる）。
+  `platform/shell.rs` に `run_pane_command` を足す設計が保全ブランチにあるとのこと
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
@@ -1049,7 +1144,7 @@ CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 
 
 main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ `e947524`（3）→
 `83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）→ PR #863（9）→ PR #855（7）。
-**残りはスライス 8（棚卸し）だけ**（7b = PR #869 で完了）。
+**残りはスライス 8（棚卸し）だけ**（7b = PR #869 / 7c = PR #874 で完了）。
 8 は 1〜7b のすべてに依存するので最後。
 
 **スライス 5 が残した宿題**: ①実機セルフテストが項目 2（`TERM / COLORTERM 注入`）で止まるので
@@ -1116,7 +1211,11 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
     （スライス 5 で `tako_menu` の macOS を Supported に倒し直した経緯）
 11. **main のテストがプラットフォーム決め打ちでないかを疑う**。スライス 5 では main の
     menu テスト 3 本が `menus[0].name == "tako"` を無条件に要求しており、Windows で必ず落ちた。
-    macOS のゲートは全部緑なので、**実機ビルド → 実機テストを先に回す**以外に検出手段が無い
+    macOS のゲートは全部緑なので、**実機ビルド → 実機テストを先に回す**以外に検出手段が無い。
+    **自分の変更で決め打ちを作り込むこともある**（7c で踏んだ）: 既定の関数が
+    「動いている環境」を見るようにすると、それを呼ぶスナップショットテストが
+    その場で決め打ちに化ける（実機で 22 件）。**環境を引数で受け取る `*_in` 版を分け、
+    テストはそちらを呼ぶ**のが型。macOS のゲートは最後まで緑なので実機でしか出ない
 12. **GUI を実機で見るには `schtasks /it`**。SSH セッションは session 0（サービス）で、
     そこから起動したウィンドウは session 1 の対話デスクトップに出ず、`EnumWindows` からも見えない。
     `schtasks /create ... /it /rl highest` + `/run` で session 1 へ投げる。スクリーンショットと
