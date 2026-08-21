@@ -836,6 +836,12 @@ crt-static と build.rs 2 本を含む）:
 CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 GUI へ届く。
 `tako split` は tako の外から叩くので `--pane` が必須。
 
+スライス 9 の道具は `C:\Users\shioz\dev\` に残してある（次スライスで使い回せる）:
+`s9-launch.ps1`（schtasks から session 1 へ GUI を投げる。persist ON）/
+`s9-drive.ps1`（SSH 側から CLI で駆動して観測）/ `s9-final.ps1`（受け入れ観点の通し）/
+`s9-lidcycle.ps1`（蓋の倒す → 自動解除 → `kill -9` 残留 → 起動時復元の 4 段）。
+採取物は `C:\Users\shioz\dev\tako-evidence-s9\`。
+
 #### スライス 9 が残した宿題
 
 - **#724 の症状②（「ブラウザで開く」で abort）は未着手**。wry の `build_as_child` が
