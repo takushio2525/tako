@@ -3,19 +3,31 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-21）
+## 現在の対象（2026-08-22）
 
 - **#467 Windows 移植はスライス 1〜7c / 9 が main へ入り、残りはスライス 8（棚卸し）だけ**
 - **#884（空白を含む cwd でペインが即死）を解消**（PR #887）。原因は psmux ではなく
-  **tako の argv → Windows コマンドライン変換**。`TerminalSession::spawn` が
-  `tty::Options` を既定で組んでいたため alacritty の **`escape_args` が `false`** のままで、
-  Windows の `cmdline()` は `program` と `args` を**素の空白で連結するだけ**だった
-  = tako の argv 形の `SpawnCommand.args` が Windows でだけ
-  「生のコマンドライン断片」に意味が変わっていた。境界
-  **`platform::shell::apply_arg_escaping`（B1）** を新設して `tty::new` の前に通す
-  （unix は恒等）。`-c <cwd>` だけでなく **`-e KEY=<空白入りの値>`** も同時に直る
+  **tako の argv → Windows コマンドライン変換**（alacritty の `escape_args` が `false` のままで
+  `program` と `args` が素の空白連結）。境界 **`platform::shell::apply_arg_escaping`（B1）** が
+  `tty::new` の前に必ず通る（unix は恒等）。`-c <cwd>` と `-e KEY=<空白入り>` の両方が直る。
+  詳細は plan の「#884 の記録」
 - **#877 / #875 / #873 / #881 も main へ入っている**（agents 走査・実行ペイン・方言判定の
   一本化・器へ渡す第 1 語）
+- **#870（`~/` のターミナルリンクが Windows で効かない）を解消**（PR #892）。
+  ホーム解決が 2 か所にあり `links.rs` 側が `HOME` 決め打ちだった（Windows は `HOME` を
+  持たないので必ず `None`）。**`paths::home_dir()` が唯一の入口**（番犬つき。`cfg` は
+  持たない = `HOME` → `USERPROFILE` の順ならどちらの OS でも正しい）。
+  **ホーム解決は他に 15 箇所ある**（分類つきで **#893** に起票。番犬の走査範囲を
+  広げるのはそちらの作業）
+
+## 実機で env 依存を測るときの作法（#877 / #870 で 2 回踏んだ）
+
+- **GUI 起動時の env を再現してから測る。** `SHELL`（#877）も `HOME`（#870）も
+  **SSH セッションの Process スコープにしか無い**（`User` / `Machine` は空）。
+  GUI 起動の tako には渡らないので、`Remove-Item Env:SHELL` / `Remove-Item Env:HOME` を
+  先に打たないと**壊れている経路が動いて見える**
+- **A/B は「修正だけを戻す」形にする。** テストごと戻すと、失敗が
+  「テスト自身の env 読み」なのか「製品の解決経路」なのか切り分けられない
 
 ## #884 で分かった実機の作法（次の worker が踏みやすい）
 
