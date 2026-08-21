@@ -29648,7 +29648,7 @@ mod self_test {
 
             // 27. tako tab select（アクティブタブを 1 へ戻す）。
             // 入力先のペイン 3 にはステップ 10 のペースト残留があるため ctrl-u で行を消す
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(any, cx, &format!("{cli} tab select {tab1}"), true);
             wait(cx, 800).await;
             let selected = window
@@ -29701,7 +29701,7 @@ mod self_test {
             // --- Phase 3: 内蔵 MCP サーバー（Streamable HTTP + stdio ブリッジ）---
 
             // 30. TAKO_MCP_URL の注入（FR-2.3.2）
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
@@ -30083,7 +30083,7 @@ mod self_test {
             // 変換中テキストの見た目は手動チェック（.agent/manual-checks.md）
 
             // 37. 未確定文字列（marked text）は状態として保持され、PTY へは流れない
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             let marked_ok = window
                 .update(cx, |app, window, cx| {
                     app.replace_and_mark_text_in_range(None, "にほんご", Some(0..4), window, cx);
@@ -30131,7 +30131,7 @@ mod self_test {
             );
 
             // 39. unmarkText は「未確定文字列をそのまま挿入」（NSTextInputClient の規約）
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             let unmarked = window
                 .update(cx, |app, window, cx| {
                     app.replace_and_mark_text_in_range(None, "かくてい", None, window, cx);
@@ -30304,7 +30304,7 @@ mod self_test {
             if shell_integration.effective() {
                 // 41. シェル統合（zsh 自動注入）→ OSC 7 / 133 タップ → cwd / state が反映され
                 //     list で公開される（FR-2.4.1 + FR-2.1.4 の e2e。実コマンドで検証する）
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(any, cx, &sh.cd(&osc_dir), true);
                 wait(cx, 1000).await;
                 let osc_cwd_ok = window
@@ -30559,7 +30559,7 @@ mod self_test {
                 //        「確定した中身に案内の文字が混ざらない」ことが最重要の検査になる
                 //
                 // ① Tab で確定できる（案内の文字列はバッファへ入らない）
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "echo TAKO600-gh", false);
@@ -30603,7 +30603,7 @@ mod self_test {
                     .await,
                     "ゴーストが無いときの Tab は従来の補完（#614 非回帰）",
                 );
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
 
                 // ③ Tab 確定 OFF なら、ゴーストが出ていても Tab は補完のまま（逃げ道）
                 let no_tab = window
@@ -30687,7 +30687,7 @@ mod self_test {
                     );
                 }
                 // 使い切った状態で次の行へ（空 Enter で precmd に 0 を読ませる）
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 press(any, cx, "enter");
                 wait(cx, 1200).await;
                 type_text(any, cx, "clear", true);
@@ -30711,7 +30711,7 @@ mod self_test {
                 // エッジ 1: IME 変換中（未確定文字列）でも予測表示が壊れないこと。
                 // tako の未確定文字列はオーバーレイ描画で PTY へ流れないので、
                 // シェル側のバッファ = 予測はそのまま残るのが正しい挙動
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(any, cx, "clear", true);
                 wait(cx, 800).await;
                 type_text(any, cx, "echo TAKO600-gh", false);
@@ -30752,7 +30752,7 @@ mod self_test {
 
                 // エッジ 2: alt screen の TUI では zsh の line editor 自体が動かないので
                 // 干渉しない（打鍵はそのまま TUI へ届き、前のプロンプトの予測も残らない）
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(any, cx, "printf '\\033[?1049h'; cat; printf '\\033[?1049l'", true);
                 wait(cx, 1200).await;
                 type_text(any, cx, "TAKO600-alt", false);
@@ -30812,7 +30812,7 @@ mod self_test {
                     .await,
                     "OFF で予測が消える（稼働中のシェルにも効く）",
                 );
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(any, cx, "exit", true);
                 wait(cx, 800).await;
                 let _ = std::fs::remove_dir_all(&as_home);
@@ -31104,8 +31104,13 @@ mod self_test {
             //     43 で alt screen へ転送した矢印キーが復帰後の zle に届き履歴を遡っているため、
             //     ctrl-u で行をクリアしてから打つ。タイプ（write）は最下部へ戻し、スクロール中は
             //     新しい出力が画面外になるため、成否は echo ではなく offset で検証する
-            press(any, cx, "ctrl-u");
-            type_text(any, cx, &format!("{cli} scroll --to 5 >/dev/null"), true);
+            press(any, cx, sh.clear_line_key());
+            type_text(
+                any,
+                cx,
+                &sh.discard_output(&format!("{cli} scroll --to 5")),
+                true,
+            );
             wait(cx, 1000).await;
             let cli_scrolled = window
                 .update(cx, |app, _, _| {
@@ -31273,7 +31278,16 @@ mod self_test {
             // 45. kitty keyboard protocol（disambiguate）の有効化を検知する
             //     （回帰: Claude Code TUI で Shift+Enter 改行が効かない。
             //     CSI u へのバイト変換はユニットテスト側で網羅）
-            type_text(any, cx, r"printf '\e[>1u'; sleep 1; printf '\e[<u'", true);
+            type_text(
+                any,
+                cx,
+                &sh.sequence(&[
+                    sh.emit_ansi("\u{1b}[>1u"),
+                    sh.sleep(1),
+                    sh.emit_ansi("\u{1b}[<u"),
+                ]),
+                true,
+            );
             wait(cx, 500).await;
             let disambiguate_on = window
                 .update(cx, |app, _, _| {
@@ -31416,7 +31430,7 @@ mod self_test {
             // 46. 全角行のマウス座標→セル変換。描画は 1 文字 = 1 div（w = cell_width × char_cols）
             //     でグリッドスナップするため、全角文字「う」の描画位置（cell_width × 4）を
             //     クリックしたとき、グリッド col = 4（全角 2 セル × 2 文字ぶん）に解決されること
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(any, cx, "echo あいうえおかきくけこ", true);
             // 高負荷環境では echo の実行・画面反映が 1 秒を超えることがあるため
             // リトライで待つ（座標解決の実バグならリトライ後も false のまま fail する）
@@ -31466,7 +31480,7 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!("{cli} split --right --focus >/dev/null"),
+                &sh.discard_output(&format!("{cli} split --right --focus")),
                 true,
             );
             wait(cx, 1500).await;
@@ -31491,7 +31505,7 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!("{cli} split --right --focus >/dev/null"),
+                &sh.discard_output(&format!("{cli} split --right --focus")),
                 true,
             );
             wait(cx, 1500).await;
@@ -31546,13 +31560,14 @@ mod self_test {
                     .unwrap_or(false);
                 check(created, "テスト用 tmux セッション作成");
                 wait(cx, 500).await;
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(
                     any,
                     cx,
-                    &format!(
-                        "{cli} tmux list --socket {sock} | grep -q tako-test \
-                         && echo TAKO-TMUX-$((40+8))"
+                    &sh.on_output_contains_echo(
+                        &format!("{cli} tmux list --socket {sock}"),
+                        "tako-test",
+                        &sh.marker("TAKO-TMUX-", 40, 8),
                     ),
                     true,
                 );
@@ -31638,7 +31653,7 @@ mod self_test {
                     (app.workspace.active_tab_id(), app.focused_pane())
                 })
                 .unwrap_or_else(|_| fail("FR-2.12 開始時の状態取得"));
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(any, cx, &format!("{cli} tab rename 実験タブ"), true);
             let mut renamed = false;
             for _ in 0..15 {
@@ -31720,7 +31735,7 @@ mod self_test {
             check(pin_ok, "印のクリックで名前が固定され自動更新が止まる");
 
             // CLI（= MCP と同じ dispatch）から固定解除 → 自動リネームが再開する
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(any, cx, &format!("{cli} tab pin --off"), true);
             let mut released = false;
             for _ in 0..15 {
@@ -31747,9 +31762,13 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} autorename off >/dev/null && {cli} autorename \
-                     | grep -q '\"enabled\":false' && echo TAKO-AR-$((50+2))"
+                &sh.on_success(
+                    &sh.discard_output(&format!("{cli} autorename off")),
+                    &sh.on_output_contains_echo(
+                        &format!("{cli} autorename"),
+                        "\"enabled\":false",
+                        &sh.marker("TAKO-AR-", 50, 2),
+                    ),
                 ),
                 true,
             );
@@ -31762,90 +31781,106 @@ mod self_test {
                 .unwrap_or(false);
             check(toggled, "自動リネームの無効化が検知ループへ反映");
 
-            // 53. listen ポート検知（FR-2.4.2）。ペイン内で nc を listen させ、
-            //     tty 突き合わせのポーリング（3 秒毎）が拾うまで待つ。
-            //     ポートは bind(0) で空きを取ってから渡す（既知ポートとの衝突回避）
-            let free_port = std::net::TcpListener::bind("127.0.0.1:0")
-                .ok()
-                .and_then(|l| l.local_addr().ok())
-                .map(|a| a.port())
-                .unwrap_or(12947);
-            press(any, cx, "ctrl-u");
-            type_text(any, cx, &format!("nc -l {free_port} &"), true);
-            let mut detected = false;
-            for _ in 0..8 {
-                wait(cx, 1500).await;
-                detected = window
+            // 53 / 54 は「ペインの配下で listen しているプロセス」を作る必要があり、
+            // 素材が `nc` とシェルのジョブ制御（`&` / `kill %1`）= POSIX シェル環境専用。
+            // 検知そのものの Windows 実測は #467 スライス 9 で済んでいる（`tako list` が
+            // 実プロセスのポートを報告する）ので、ここでは対象外にする
+            if sh.is_posix() {
+                // 53. listen ポート検知（FR-2.4.2）。ペイン内で nc を listen させ、
+                //     tty 突き合わせのポーリング（3 秒毎）が拾うまで待つ。
+                //     ポートは bind(0) で空きを取ってから渡す（既知ポートとの衝突回避）
+                let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .ok()
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.port())
+                    .unwrap_or(12947);
+                press(any, cx, sh.clear_line_key());
+                type_text(any, cx, &format!("nc -l {free_port} &"), true);
+                let mut detected = false;
+                for _ in 0..8 {
+                    wait(cx, 1500).await;
+                    detected = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .map(|s| s.listen_ports().iter().any(|p| p.port == free_port))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if detected {
+                        break;
+                    }
+                }
+                check(detected, "listen ポート検知（nc -l）");
+                // list（CLI / MCP と同じ dispatch）にも listen_ports として公開される
+                let listed = window
                     .update(cx, |app, _, _| {
-                        app.terminals
-                            .get(&app.focused_pane())
-                            .map(|s| s.listen_ports().iter().any(|p| p.port == free_port))
-                            .unwrap_or(false)
+                        let pane = app.focused_pane().as_u64();
+                        let value = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::List,
+                            PaneOrigin::Cli,
+                        )
+                        .expect("list は常に成功する");
+                        value["tabs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|t| t["panes"].as_array().cloned().unwrap_or_default())
+                            .filter(|p| p["id"].as_u64() == Some(pane))
+                            .any(|p| {
+                                p["listen_ports"]
+                                    .as_array()
+                                    .is_some_and(|ports| ports.iter().any(|e| {
+                                        e["port"].as_u64() == Some(free_port as u64)
+                                    }))
+                            })
                     })
                     .unwrap_or(false);
-                if detected {
-                    break;
-                }
-            }
-            check(detected, "listen ポート検知（nc -l）");
-            // list（CLI / MCP と同じ dispatch）にも listen_ports として公開される
-            let listed = window
-                .update(cx, |app, _, _| {
-                    let pane = app.focused_pane().as_u64();
-                    let value = tako_control::dispatch(
-                        app,
-                        tako_control::protocol::Request::List,
-                        PaneOrigin::Cli,
-                    )
-                    .expect("list は常に成功する");
-                    value["tabs"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|t| t["panes"].as_array().cloned().unwrap_or_default())
-                        .filter(|p| p["id"].as_u64() == Some(pane))
-                        .any(|p| {
-                            p["listen_ports"]
-                                .as_array()
-                                .is_some_and(|ports| ports.iter().any(|e| {
-                                    e["port"].as_u64() == Some(free_port as u64)
-                                }))
-                        })
-                })
-                .unwrap_or(false);
-            check(listed, "list に listen_ports が公開される");
+                check(listed, "list に listen_ports が公開される");
 
-            // 54. 提案チップ（FR-2.4.3）: 新規 listen ポートでチップが立ち、却下で消え、
-            //     却下中は同じポートを再提案しない
-            let chip_up = window
-                .update(cx, |app, _, _| {
-                    let pane = app.focused_pane();
-                    app.port_suggestions
-                        .iter()
-                        .any(|s| s.pane == pane && s.port == free_port)
-                })
-                .unwrap_or(false);
-            check(chip_up, "listen 検知で提案チップが立つ");
-            let chip_dismissed = window
-                .update(cx, |app, _, cx| {
-                    let pane = app.focused_pane();
-                    app.dismiss_port_suggestion(pane, free_port, cx);
-                    !app.port_suggestions
-                        .iter()
-                        .any(|s| s.pane == pane && s.port == free_port)
-                        && app.dismissed_ports.contains(&(pane, free_port))
-                })
-                .unwrap_or(false);
-            check(chip_dismissed, "チップの却下と再提案抑止");
+                // 54. 提案チップ（FR-2.4.3）: 新規 listen ポートでチップが立ち、却下で消え、
+                //     却下中は同じポートを再提案しない
+                let chip_up = window
+                    .update(cx, |app, _, _| {
+                        let pane = app.focused_pane();
+                        app.port_suggestions
+                            .iter()
+                            .any(|s| s.pane == pane && s.port == free_port)
+                    })
+                    .unwrap_or(false);
+                check(chip_up, "listen 検知で提案チップが立つ");
+                let chip_dismissed = window
+                    .update(cx, |app, _, cx| {
+                        let pane = app.focused_pane();
+                        app.dismiss_port_suggestion(pane, free_port, cx);
+                        !app.port_suggestions
+                            .iter()
+                            .any(|s| s.pane == pane && s.port == free_port)
+                            && app.dismissed_ports.contains(&(pane, free_port))
+                    })
+                    .unwrap_or(false);
+                check(chip_dismissed, "チップの却下と再提案抑止");
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 53 / 54（listen 役の nc とジョブ制御が \
+                     POSIX シェル環境専用）"
+                );
+            }
+
 
             // 55. tako portdetect の ON/OFF（FR-2.4.4。CLI / MCP と同じ dispatch 経路）。
             //     無効化で listen_ports・チップが掃除される
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} portdetect off >/dev/null && {cli} portdetect \
-                     | grep -q '\"enabled\":false' && echo TAKO-PD-$((50+5))"
+                &sh.on_success(
+                    &sh.discard_output(&format!("{cli} portdetect off")),
+                    &sh.on_output_contains_echo(
+                        &format!("{cli} portdetect"),
+                        "\"enabled\":false",
+                        &sh.marker("TAKO-PD-", 50, 5),
+                    ),
                 ),
                 true,
             );
@@ -31864,10 +31899,18 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(detect_cleared, "ポート検知の無効化で検知済み情報がクリアされる");
-            type_text(any, cx, &format!("{cli} portdetect on >/dev/null"), true);
+            type_text(
+                any,
+                cx,
+                &sh.discard_output(&format!("{cli} portdetect on")),
+                true,
+            );
             wait(cx, 800).await;
-            type_text(any, cx, "kill %1 2>/dev/null", true);
-            wait(cx, 500).await;
+            if sh.is_posix() {
+                // 53 で立てた nc のジョブを片付ける（立てていない環境では何もしない）
+                type_text(any, cx, "kill %1 2>/dev/null", true);
+                wait(cx, 500).await;
+            }
 
             // 56. 統合 tmux ビューのタブ枠データ（FR-2.16.6〜2.16.7。旧集約センター FR-2.10 を
             //     統合）。全タブの全ペインがタブ枠に載り、枠内は注目度順。ジャンプで該当ペインへ
@@ -31994,10 +32037,14 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} persist on >/dev/null && {cli} persist \
-                     | grep -q '\"enabled\":true' && {cli} persist \
-                     | grep -q '\"last_restore\"' && echo TAKO-PS-$((50+8))"
+                &sh.on_success(
+                    &sh.discard_output(&format!("{cli} persist on")),
+                    &sh.on_output_contains_echo(
+                        &format!("{cli} persist"),
+                        "\"enabled\":true",
+                        // 診断フィールドの露出（#30）は続けて同じ経路で見る
+                        &sh.marker("TAKO-PS-", 50, 8),
+                    ),
                 ),
                 true,
             );
@@ -32047,7 +32094,7 @@ mod self_test {
                     }
                 }
                 check(session_up, "分割でバックエンドセッションが生える");
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(any, cx, "echo TAKO-BK-'OK'", true);
                 let mut echoed = false;
                 for _ in 0..20 {
@@ -32060,26 +32107,38 @@ mod self_test {
                 check(echoed, "バックエンドペインでシェルが動く");
 
                 // 60. OSC 7 パススルー（allow-passthrough + シェル統合の包み直し）で
-                //     tmux 越しでも cwd 検知（FR-2.4.1）が生きている
-                press(any, cx, "ctrl-u");
-                type_text(any, cx, "mkdir -p /tmp/tako-osc-e2e && cd /tmp/tako-osc-e2e", true);
-                let mut cwd_ok = false;
-                for _ in 0..20 {
-                    wait(cx, 500).await;
-                    cwd_ok = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&backend_pane)
-                                .and_then(|s| s.cwd())
-                                .map(|p| p.display().to_string().contains("tako-osc-e2e"))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if cwd_ok {
-                        break;
+                //     器越しでも cwd 検知（FR-2.4.1）が生きている。
+                //     素通ししない器（psmux。#525 の実測）では届かないので対象外
+                if tako_core::backend::capabilities().osc_passthrough {
+                    let osc_e2e_dir = std::env::temp_dir()
+                        .join("tako-osc-e2e")
+                        .display()
+                        .to_string();
+                    press(any, cx, sh.clear_line_key());
+                    type_text(any, cx, &sh.mkdir_and_cd(&osc_e2e_dir), true);
+                    let mut cwd_ok = false;
+                    for _ in 0..20 {
+                        wait(cx, 500).await;
+                        cwd_ok = window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&backend_pane)
+                                    .and_then(|s| s.cwd())
+                                    .map(|p| p.display().to_string().contains("tako-osc-e2e"))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if cwd_ok {
+                            break;
+                        }
                     }
+                    check(cwd_ok, "OSC 7 が器のパススルーで届く（cwd 検知維持）");
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 60（器 {} が OSC を素通ししない）",
+                        tako_core::backend::capabilities().label
+                    );
                 }
-                check(cwd_ok, "OSC 7 が tmux パススルーで届く（cwd 検知維持）");
 
                 // 61. tty がバックエンド側ペイン tty へ差し替わり（ポート検知・tmuxview の
                 //     突き合わせ先）、tmux list が backend: true + 対応ペインで区別される
@@ -32126,8 +32185,8 @@ mod self_test {
                 // 61b. バックエンドのホイール = tmux 履歴のローカルミラー表示（#159）。
                 //      copy-mode には入らず、capture した履歴 + ライブ画面の合成行列で
                 //      過去が見える（ピクセル単位スクロールの土台）
-                press(any, cx, "ctrl-u");
-                type_text(any, cx, "seq 200", true);
+                press(any, cx, sh.clear_line_key());
+                type_text(any, cx, &sh.seq(1, 200), true);
                 wait(cx, 1000).await;
                 window
                     .update(cx, |app, win, cx| {
@@ -32258,8 +32317,13 @@ mod self_test {
 
                 // 61e. CLI（dispatch 共有）でもバックエンドのミラー表示位置に効く
                 //      （開発不変条件: UI と同じ層を CLI / MCP からも操作できる）
-                press(any, cx, "ctrl-u");
-                type_text(any, cx, &format!("{cli} scroll --to 5 >/dev/null"), true);
+                press(any, cx, sh.clear_line_key());
+                type_text(
+                any,
+                cx,
+                &sh.discard_output(&format!("{cli} scroll --to 5")),
+                true,
+            );
                 let mut cli_scrolled = false;
                 for _ in 0..20 {
                     wait(cx, 300).await;
@@ -32289,7 +32353,7 @@ mod self_test {
                 //      tako ペインで attach して見ている構成が管理外扱いされた
                 //      2026-06-13 実機バグの回帰検知）
                 let tmux_bin = tako_core::tmux::tmux_bin();
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(
                     any,
                     cx,
@@ -32387,11 +32451,17 @@ mod self_test {
             // 63. 明示コマンド付き split の回帰（2026-06-12 リグレッション (7)）。
             //     コマンドはログインシェル経由で実行される（最小 PATH の .app でも
             //     `tmux attach` 等が解決できる）。出力マーカーで実行を機械検証する
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
-                &format!("{cli} split --down --focus -- sh -c 'echo TAKO-CMD-\"OK\"; sleep 15'"),
+                &format!(
+                    "{cli} split --down --focus -- {}",
+                    sh.shell_snippet_argv(&sh.sequence(&[
+                        sh.echo(&sh.marker("TAKO-CMD-", 60, 3)),
+                        sh.sleep(15),
+                    ]))
+                ),
                 true,
             );
             // #796: 旧実装は上限 9 秒。CLI のコールドスタート + ログインシェル + tmux は
@@ -32417,7 +32487,8 @@ mod self_test {
             }
             if cmd_pane_painted {
                 check(
-                    wait_for_focused_text(window, cx, "TAKO-CMD-OK", Duration::from_secs(40)).await,
+                    // マーカーは打った行に答えが出ない形（`$((60+3))`）で組んである
+                    wait_for_focused_text(window, cx, "TAKO-CMD-63", Duration::from_secs(40)).await,
                     "明示コマンド付き split（ログインシェル経由）",
                 );
             } else {
@@ -32431,13 +32502,14 @@ mod self_test {
             wait(cx, 500).await;
 
             // 64. tako panel CLI（開発不変条件）: 表示・ビュー・幅の roundtrip
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} panel --show --view git --width 300 \
-                     | grep -q '\"view\":\"git\"' && echo TAKO-PN-$((60+4))"
+                &sh.on_output_contains_echo(
+                    &format!("{cli} panel --show --view git --width 300"),
+                    "\"view\":\"git\"",
+                    &sh.marker("TAKO-PN-", 60, 4),
                 ),
                 true,
             );
@@ -32458,13 +32530,14 @@ mod self_test {
 
             // 64b. ファイルツリーの CLI / MCP 経路（FR-2.16.5。従来は cmd+B のみだった）:
             //      `tako panel --filetree on/off` で開閉でき、状態が応答 JSON に載る
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} panel --filetree on | grep -q '\"filetree\":true' \
-                     && echo TAKO-FT-$((60+4))b"
+                &sh.on_output_contains_echo(
+                    &format!("{cli} panel --filetree on"),
+                    "\"filetree\":true",
+                    &format!("{}b", sh.marker("TAKO-FT-", 60, 4)),
                 ),
                 true,
             );
@@ -32495,13 +32568,16 @@ mod self_test {
             })
             .is_ok();
             check(poisoned, "current の汚染書き込み（バグ (8) 再現準備）");
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
-                &format!(
-                    "env -u TAKO_SOCKET -u TAKO_TOKEN {cli} list >/dev/null \
-                     && echo TAKO-DSC-$((60+5))"
+                &sh.on_success_echo(
+                    &sh.without_env(
+                        &["TAKO_SOCKET", "TAKO_TOKEN"],
+                        &sh.discard_output(&format!("{cli} list")),
+                    ),
+                    &sh.marker("TAKO-DSC-", 60, 5),
                 ),
                 true,
             );
@@ -33079,7 +33155,7 @@ mod self_test {
 
             // 66b. `tako open` CLI e2e（開発不変条件）: ペイン内シェルから実 CLI で開く。
             //      開いた後のフォーカスはプレビューペインに在るため、検証は app 状態で行う
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
@@ -35123,7 +35199,7 @@ mod self_test {
                 let ws_out = std::env::temp_dir()
                     .join(format!("tako-selftest-ws-{}.json", std::process::id()));
                 let _ = std::fs::remove_file(&ws_out);
-                press(any, cx, "ctrl-u");
+                press(any, cx, sh.clear_line_key());
                 type_text(
                     any,
                     cx,
@@ -35606,7 +35682,7 @@ mod self_test {
             //      テキストを折り返し、折り返された文字（「ターミナルUI」の I、
             //      「Fable 5 + max」の max）が行 div の overflow_hidden の外へ出て消える。
             //      既知失敗の PDF（70）で exit する前に検証するためここに置く
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(
                 any,
                 cx,
@@ -35731,7 +35807,7 @@ mod self_test {
                 shell_escape(&absolute_file),
                 shell_escape(&link_dir),
             );
-            press(any, cx, "ctrl-u");
+            press(any, cx, sh.clear_line_key());
             type_text(any, cx, &link_command, true);
             let mut link_screen_ready = false;
             for _ in 0..12 {
@@ -36551,7 +36627,7 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!("{cli} split --right --focus >/dev/null"),
+                    &sh.discard_output(&format!("{cli} split --right --focus")),
                     true,
                 );
                 wait(cx, 1500).await;
@@ -36631,7 +36707,7 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!("{cli} split --right --focus >/dev/null"),
+                    &sh.discard_output(&format!("{cli} split --right --focus")),
                     true,
                 );
                 wait(cx, 1500).await;
@@ -36661,7 +36737,7 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!("{cli} split --right --focus >/dev/null"),
+                    &sh.discard_output(&format!("{cli} split --right --focus")),
                     true,
                 );
                 let split_pane_before = window
@@ -36780,7 +36856,7 @@ mod self_test {
                 type_text(
                     any,
                     cx,
-                    &format!("{cli} split --right --focus >/dev/null"),
+                    &sh.discard_output(&format!("{cli} split --right --focus")),
                     true,
                 );
                 wait(cx, 1500).await;

@@ -78,6 +78,19 @@ impl ShellDialect {
         }
     }
 
+    /// 入力行をまるごと消すキー（行編集はシェルの行エディタが持つ機能なので方言差がある）。
+    ///
+    /// **PSReadLine（Windows モード）に Ctrl+U は無い**（実測: pwsh 7 / 5.1 とも
+    /// `Get-PSReadLineKeyHandler -Bound` に現れない）。Escape が `RevertLine` で
+    /// 行を消すので、PowerShell ではそれを使う。POSIX 側で Escape を使うと
+    /// メタプレフィックスになって次の文字が編集コマンドに化けるため、Ctrl+U のまま
+    pub fn clear_line_key(self) -> &'static str {
+        match self {
+            Self::Posix => "ctrl-u",
+            Self::PowerShell => "escape",
+        }
+    }
+
     /// 環境変数の参照式（二重引用符の中に埋めて使う）
     pub fn env_ref(self, name: &str) -> String {
         match self {
@@ -207,6 +220,22 @@ impl ShellDialect {
         }
     }
 
+    /// ディレクトリを作ってそこへ移動する（無ければ作る）
+    pub fn mkdir_and_cd(self, path: &str) -> String {
+        match self {
+            Self::Posix => {
+                let q = crate::shell::quote_for_shell(path);
+                format!("mkdir -p {q} && cd {q}")
+            }
+            Self::PowerShell => {
+                let q = ps_quote(path);
+                format!(
+                    "New-Item -ItemType Directory -Force -Path {q} | Out-Null; Set-Location {q}"
+                )
+            }
+        }
+    }
+
     /// 一時ディレクトリ（`cd` の行き先に使う。macOS の `/private/tmp` 直書きを避ける）
     pub fn temp_dir_ref(self) -> String {
         match self {
@@ -233,6 +262,17 @@ impl ShellDialect {
         match self {
             Self::Posix => crate::shell::quote_for_shell(word),
             Self::PowerShell => ps_quote(word),
+        }
+    }
+
+    /// 明示コマンド（`tako split -- <argv>`）として渡す「シェル片を走らせる argv」。
+    ///
+    /// 引数リストで来る経路なので、シェル片は 1 個の引数として包む
+    pub fn shell_snippet_argv(self, snippet: &str) -> String {
+        match self {
+            Self::Posix => format!("sh -c {}", crate::shell::quote_for_shell(snippet)),
+            // 5.1 でも通る名前で呼ぶ（pwsh が無い環境でも動く）
+            Self::PowerShell => format!("powershell -NoProfile -Command {}", ps_quote(snippet)),
         }
     }
 
@@ -454,6 +494,13 @@ mod tests {
         assert_eq!(ShellDialect::from_program("/opt/homebrew/bin/fish"), None);
     }
 
+    /// #865 で実機が教えた差: PSReadLine の Windows モードに Ctrl+U は無い
+    #[test]
+    fn 入力行を消すキーは方言で変わる() {
+        assert_eq!(POSIX.clear_line_key(), "ctrl-u");
+        assert_eq!(PS.clear_line_key(), "escape");
+    }
+
     #[test]
     fn 環境変数参照は方言ごとに変わる() {
         assert_eq!(POSIX.env_ref("TERM"), "${TERM}");
@@ -510,6 +557,32 @@ mod tests {
         assert_eq!(
             PS.emit_ansi_line("\u{1b}[31mRED\u{1b}[0m"),
             "Write-Host \"$([char]27)[31mRED$([char]27)[0m\""
+        );
+    }
+
+    #[test]
+    fn ディレクトリを作って移動する() {
+        assert_eq!(
+            POSIX.mkdir_and_cd("/tmp/tako-osc-e2e"),
+            "mkdir -p /tmp/tako-osc-e2e && cd /tmp/tako-osc-e2e"
+        );
+        assert_eq!(
+            PS.mkdir_and_cd("C:\\Temp\\tako-osc-e2e"),
+            "New-Item -ItemType Directory -Force -Path 'C:\\Temp\\tako-osc-e2e' | Out-Null; \
+             Set-Location 'C:\\Temp\\tako-osc-e2e'"
+        );
+    }
+
+    /// `tako split -- <argv>` へ渡す「シェル片を走らせる argv」
+    #[test]
+    fn シェル片を走らせるargv() {
+        assert_eq!(
+            POSIX.shell_snippet_argv("echo X; sleep 15"),
+            "sh -c 'echo X; sleep 15'"
+        );
+        assert_eq!(
+            PS.shell_snippet_argv("echo X; Start-Sleep 15"),
+            "powershell -NoProfile -Command 'echo X; Start-Sleep 15'"
         );
     }
 
