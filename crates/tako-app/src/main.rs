@@ -1642,6 +1642,15 @@ struct TakoApp {
     /// **このマップに載っていること = 判定表の「claude 対話 TUI 稼働」が成立**という
     /// 対応にしてあるので、`pane_display_for`（毎 render）は材料を調べ直さない
     chat_panes: HashMap<PaneId, std::rc::Rc<chat_view::ChatPaneState>>,
+    /// セルフテストが注入した会話を 2 秒 tick の読み取りから守るペイン（#853）。
+    ///
+    /// 検証用の fixture は「実 claude が動いていないペイン」へ入れるので、定期更新の
+    /// `apply_chat_refresh` が**正しく**「チャットではない」と判断して消す。判定そのものは
+    /// 正しいので変えず、**このペインを読み取り対象から外す**ことで race を無くす
+    /// （項目 98 は MCP を 3 回往復するあいだに必ず tick を挟むため、注入した会話が
+    /// 消えた状態で MCP を叩いて決定的に失敗していた）。
+    /// セルフテスト以外では常に空。`TAKO_853_NO_CHAT_PIN=1` で無効化 = 旧挙動の A/B
+    chat_fixture_panes: std::collections::HashSet<PaneId>,
     /// チャットの折りたたみ（thinking / tool_use）を開いている箇所。
     /// キーは (ペイン, 発話の内容キー, 区画) で、再読込で並びが変わっても付いて回る
     chat_expanded: std::collections::HashSet<(PaneId, u64, chat_view::ChatSection)>,
@@ -3144,6 +3153,7 @@ impl TakoApp {
             starter_chevron_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             pane_settle: HashMap::new(),
             chat_panes: HashMap::new(),
+            chat_fixture_panes: std::collections::HashSet::new(),
             chat_expanded: std::collections::HashSet::new(),
             chat_follow: HashMap::new(),
             chat_scroll_handles: HashMap::new(),
@@ -41402,6 +41412,12 @@ mod self_test {
                             ..Default::default()
                         }),
                     );
+                    // #853: このペインで動いているのは素のシェルなので、2 秒 tick の
+                    // `apply_chat_refresh` が「チャットではない」と**正しく**判断して
+                    // 注入した会話を消す。(e) は MCP を 3 回往復する = 必ず tick を挟むため、
+                    // 会話が消えた状態で MCP を叩き決定的に失敗していた。読み取り対象から
+                    // 外して race を無くす（判定そのものは変えない）
+                    app.pin_chat_fixture(chat_pane);
                     let _ = app.workspace.active_tab_mut().tree_mut().focus(chat_pane);
                     cx.notify();
                 });
@@ -41536,8 +41552,71 @@ mod self_test {
                     "コピーボタンで発話全文が画面どおりのプレーンテキストで入る (#725)",
                 );
 
-                // (e) MCP からの同一操作（list / code / markdown）
+                // (e) MCP からの同一操作（list / code / markdown）。
+                //
+                // #853: 判定は list / code / markdown の 3 本に割る。1 個の `&&` 連鎖だと
+                // **どの経路が落ちたのか出力から確定できず**、原因の切り分けに実機の
+                // 再現待ちが要る（#796 と同じ思想）。応答本文と「MCP を叩いた時点で
+                // fixture がまだ載っているか」も一緒に出す = 定期更新に消されたのか、
+                // コピーの中身が違うのかがログだけで分かる
                 let pane_header = chat_pane.as_u64().to_string();
+                let fixture_state = |cx: &mut AsyncApp| -> String {
+                    window
+                        .update(cx, |app, _, _| {
+                            match app.chat_panes.get(&chat_pane) {
+                                Some(state) => format!(
+                                    "messages={} session={}",
+                                    state.messages.len(),
+                                    state.session_id
+                                ),
+                                None => "gone".into(),
+                            }
+                        })
+                        .unwrap_or_else(|_| "unavailable".into())
+                };
+                let head = |res: &str| -> String { res.chars().take(320).collect() };
+
+                // #853 の回帰検査。2 秒 tick と**同じ経路**を 1 周だけ回して、注入した
+                // 会話が残っていることを見る。tick が (e) の MCP 往復に挟まるかは負荷と
+                // ビルド構成次第（挟まった回だけ「MCP が UI と違う」に見える）なので、
+                // 偶然を当てにすると再現しないまま詰まり続ける = ここで**必ず 1 周**回す。
+                // `TAKO_853_NO_CHAT_PIN=1` を置くと修正前の挙動（会話が消える）を
+                // 同じバイナリで再現できる
+                let (has_backend, alt_inner) = window
+                    .update(cx, |app, _, _| {
+                        (
+                            app.backend_sessions.contains_key(&chat_pane),
+                            app.pane_inner_alt_screen(chat_pane),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                let targets = window
+                    .update(cx, |app, _, _| app.collect_chat_targets())
+                    .unwrap_or_default();
+                let (target_count, targets_fixture) = (
+                    targets.len(),
+                    targets.iter().any(|t| t.pane() == chat_pane),
+                );
+                let refreshed = if targets.is_empty() {
+                    Vec::new()
+                } else {
+                    cx.background_executor()
+                        .spawn(async move { chat_view::load_chat_refresh(targets) })
+                        .await
+                };
+                let _ = window.update(cx, |app, _, _| app.apply_chat_refresh(refreshed));
+                let after_refresh = fixture_state(cx);
+                println!(
+                    "TAKO_SELF_TEST_725_REFRESH: backend={has_backend} alt_inner={alt_inner} \
+                     targets={target_count} targets_include_fixture={targets_fixture} \
+                     fixture=[{after_refresh}]"
+                );
+                check(
+                    after_refresh.starts_with("messages=2"),
+                    "定期更新が注入した会話を消さない（MCP 往復のあいだに詰まらない）(#853)",
+                );
+
+                let before_mcp = fixture_state(cx);
                 let (status, list_res) = mcp_post_bg(
                     cx,
                     &mcp_url,
@@ -41577,20 +41656,35 @@ mod self_test {
                         cx.read_from_clipboard().and_then(|item| item.text())
                     })
                     .unwrap_or_default();
+                let after_mcp = fixture_state(cx);
                 println!(
                     "TAKO_SELF_TEST_725_COPY: button={button_clip:?} code={code_clip:?} \
-                     md_has_fence={}",
+                     md_has_fence={} status={status} fixture_before=[{before_mcp}] \
+                     fixture_after=[{after_mcp}]",
                     md_clip.as_deref().is_some_and(|t| t.contains("```sh"))
                 );
+                println!(
+                    "TAKO_SELF_TEST_725_MCP: list={} | code={} | md={}",
+                    head(&list_res),
+                    head(&code_res),
+                    head(&md_res)
+                );
+                // list / code / markdown を別々に見る（どれが落ちたか名前で分かる）
                 check(
                     status == 200
                         && list_res.contains(r#"\"total\":2"#)
-                        && list_res.contains(r#"\"code_blocks\":1"#)
-                        && code_res.contains(r#"\"code\":0"#)
-                        && code_clip.as_deref() == Some("echo hello\necho world")
-                        && md_res.contains(r#"\"markdown\":true"#)
+                        && list_res.contains(r#"\"code_blocks\":1"#),
+                    "MCP tako_chat_copy の list が UI と同じ会話を返す (#725)",
+                );
+                check(
+                    code_res.contains(r#"\"code\":0"#)
+                        && code_clip.as_deref() == Some("echo hello\necho world"),
+                    "MCP tako_chat_copy の code がコードブロックだけをコピーする (#725)",
+                );
+                check(
+                    md_res.contains(r#"\"markdown\":true"#)
                         && md_clip.as_deref().is_some_and(|t| t.contains("```sh")),
-                    "MCP tako_chat_copy の list / code / markdown が UI と同じ結果 (#725)",
+                    "MCP tako_chat_copy の markdown が md ソースをコピーする (#725)",
                 );
 
                 // (g) エッジ: 長文の折りたたみ境界。索引には**見えているぶんだけ**が載り、
@@ -48309,5 +48403,145 @@ mod viewport_close_diag {
         assert!(line.contains("logical=7"), "{line}");
         assert!(line.contains("window not found"), "{line}");
         assert!(line.contains("（発生源 dispatch）"), "{line}");
+    }
+}
+
+/// セルフテストが注入した会話が定期更新に消されないことの番犬（#853）。
+///
+/// 項目 98（#725）は「MCP `tako_chat_copy` が UI と同じ結果を返す」を見るために、
+/// 実 claude が動いていないペインへ fixture の会話を注入する。2 秒 tick の
+/// `apply_chat_refresh` はそのペインを読んで**正しく**「チャットではない」と判断し
+/// `chat_panes` から消すので、MCP を 3 回往復するあいだに必ず会話が消え、項目 98 が
+/// 決定的に失敗して**以降の項目が一切走らなくなっていた**。
+///
+/// 直し方は「読み取り対象から fixture のペインを外す」（判定は変えない）。
+/// visual-test と違って CI で毎回走る静的検査としてここに置く。
+#[cfg(test)]
+mod chat_fixture_pin_watchdog {
+    /// 走査対象のソース。この番犬モジュール自身（検査したい文字列を含む）は除外する
+    fn scanned(src: &'static str) -> &'static str {
+        match src.find("mod chat_fixture_pin_watchdog") {
+            Some(at) => &src[..at],
+            None => src,
+        }
+    }
+
+    /// `fn <name>` の**本体だけ**を切り出す（波括弧の対応で閉じる）。
+    ///
+    /// 「次の `    fn ` まで」で切ると、後続が `pub(crate) fn` ばかりの並びでは行が
+    /// 一致せず関数を跨いで巨大な範囲を掴む（`pin_chat_fixture` まで含んでしまい、
+    /// `collect_chat_targets` から除外を消しても番犬が素通りした = 実際に踏んだ）
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} が見つからない（構造が変わったら番犬も見直す）"));
+        let rest = &src[start..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("{name} の本体が見つからない"));
+        let mut depth = 0usize;
+        for (at, ch) in rest[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..open + at + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} の本体が閉じていない")
+    }
+
+    #[test]
+    fn 定期更新はfixtureのペインを読みに行かない() {
+        let body = body_of(include_str!("chat_view.rs"), "collect_chat_targets");
+        assert!(
+            body.contains("chat_fixture_panes"),
+            "collect_chat_targets が fixture ペインを除外していない。\
+             セルフテストが注入した会話が 2 秒 tick に消され、項目 98（#725）が\
+             決定的に失敗して以降の項目が走らなくなる（#853）"
+        );
+    }
+
+    #[test]
+    fn 項目98はmcpを叩く前にfixtureをpinしている() {
+        let src = scanned(include_str!("main.rs"));
+        let insert = src
+            .find(r#""selftest-725".into()"#)
+            .expect("項目 98 の fixture 注入が見つからない");
+        let rest = &src[insert..];
+        let pin = rest
+            .find("pin_chat_fixture(chat_pane)")
+            .expect("項目 98 が fixture を pin していない（#853）");
+        let mcp = rest
+            .find(r#""name":"tako_chat_copy""#)
+            .expect("項目 98 の MCP 往復が見つからない");
+        assert!(
+            pin < mcp,
+            "pin が MCP 往復より後にある（往復のあいだに 2 秒 tick が会話を消す。#853）"
+        );
+    }
+
+    #[test]
+    fn 項目98は定期更新を1周回して会話が残ることを見ている() {
+        let src = scanned(include_str!("main.rs"));
+        let insert = src
+            .find(r#""selftest-725".into()"#)
+            .expect("項目 98 の fixture 注入が見つからない");
+        let rest = &src[insert..];
+        let refresh = rest
+            .find("collect_chat_targets()")
+            .expect("項目 98 が定期更新の 1 周を回していない（#853）");
+        let mcp = rest
+            .find(r#""name":"tako_chat_copy""#)
+            .expect("項目 98 の MCP 往復が見つからない");
+        assert!(
+            refresh < mcp,
+            "定期更新の 1 周が MCP 往復より後にある。\
+             tick が挟まるかを運に任せると修正前の詰まりが再現せず、\
+             原因が特定できないまま残る（#853）"
+        );
+        assert!(
+            rest[..mcp].contains("apply_chat_refresh"),
+            "collect_chat_targets を呼ぶだけで反映していない = 消える経路を通っていない（#853）"
+        );
+    }
+
+    #[test]
+    fn mcpの判定はlistとcodeとmarkdownで別々に落ちる() {
+        let src = scanned(include_str!("main.rs"));
+        for needle in [
+            "MCP tako_chat_copy の list が",
+            "MCP tako_chat_copy の code が",
+            "MCP tako_chat_copy の markdown が",
+        ] {
+            assert!(
+                src.contains(needle),
+                "{needle}… の判定が無い。1 個の `&&` 連鎖に戻すと\
+                 どの経路で落ちたのか出力から確定できない（#853 / #796）"
+            );
+        }
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬はpinの欠落と順序違いを見つける() {
+        // 後続は実ファイルと同じ `pub(crate) fn`。行一致で切る実装だと本体を跨いで
+        // 掴んでしまい、除外を消しても素通りする（実際に踏んだので形で拘束する）
+        let tail =
+            "\n    }\n}\n\nimpl T {\n    pub(crate) fn pin_chat_fixture(&mut self) {\n        \
+                    self.chat_fixture_panes.insert(p);\n    }\n}";
+        let no_pin = format!("    fn collect_chat_targets(&self) -> Vec<T> {{\n        x(){tail}");
+        assert!(!body_of(&no_pin, "collect_chat_targets").contains("chat_fixture_panes"));
+        let pinned = format!(
+            "    fn collect_chat_targets(&self) -> Vec<T> {{\n        \
+             x().filter(|(p, _)| !self.chat_fixture_panes.contains(*p)){tail}"
+        );
+        assert!(body_of(&pinned, "collect_chat_targets").contains("chat_fixture_panes"));
+        // 番犬モジュール自身は走査から外れている（自分の文字列で素通りしない）
+        assert!(!scanned(include_str!("main.rs")).contains("mod chat_fixture_pin_watchdog"));
     }
 }
