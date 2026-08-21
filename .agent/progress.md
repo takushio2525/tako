@@ -2589,3 +2589,19 @@
   実際に壊して FAILED を確認 / CI 全ジョブ緑
 - 関連: PR #891（`Refs #766, #467`）。main `c28e470`
 - 次: **#889** が片付けば項目 93 以降（GUI モード / チャット / 設定画面 / limit-resume）が開く
+
+## 2026-08-22（#889: セルフテスト項目 93 の 2 原因を根治 — 到達範囲が 93 へ）
+- 原因はどちらもテスト側: ①`cat` の argv 直書き（Windows は実体が無くペイン即死。判定は
+  「消えたペインでも既定 Terminal」で**通ってしまう**形だった）②素のシェルペインが実機の
+  `$PROFILE` 配置に依存（隔離 data_dir の script と `$PROFILE` の指す本番パスが別物）。
+  境界 `ShellDialect::echo_stdin_command()` / `integration_shell_command()` の 2 本へ寄せ、
+  項目 93 (d) の期待値は製品の `welcome::launch_command_line` から作る形にした
+- 実機 A/B 4 本（`$PROFILE` 配置の有無も変数にした）: main は配置ありで 93 (d)・隠すと 93 (c) で
+  FAILED、ブランチは**両方で 93 全通過** → 次の停止は項目 94。実機スイートは before=23 /
+  after=23 で**失敗名まで IDENTICAL**（新規ゼロ。ベースラインは 22 → 23 へ更新 = #897 の同原因）
+- 番犬 `selftest_pane_command_watchdog`（argv リテラル禁止）+ 方言テスト 2 本を追加。
+  macOS は 2421 passed / セルフテスト完走 / クロスチェック警告 10 = ベースライン同数
+- 関連: PR #900（`Refs #889, #467`）。起票: **#897**（項目 94 と psmux e2e の Enter が LF）/
+  **#898**（`dispatch::which` が POSIX 専用 = stale claude 検知が常に無効）/
+  **#899**（スターター・welcome のコマンド投入が LF + POSIX クォート）
+- 次: #897 を直すと 94 以降が開き実機失敗も 22 件へ戻る → スライス 8（棚卸し）

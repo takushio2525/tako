@@ -1095,7 +1095,9 @@ dispatch 経由の 2 件は builder を直接呼べないので期待値を構�
 **修正前**: `TAKO_APP_SELF_TEST_FAILED: TERM / COLORTERM 注入` / `EXITCODE=1`（9 秒で終了）。
 
 **修正後**: **項目 0〜92 が通る**。止まるのは項目 93（#694 GUI モード判定表）で、
-材料が OSC 133 の idle 検知 + `cat` なので **psmux 越しにシェル統合が届かない**（#766）と同根。
+材料が OSC 133 の idle 検知 + `cat` なので **psmux 越しにシェル統合が届かない**（#766）と同根
+—— **と当時は見立てたが、実際の原因は `$PROFILE` 依存と `cat` 決め打ちの 2 つ**だった
+（器は無関係。#889 で根治し、いまの到達範囲は**項目 0〜93**。次の壁は項目 94 = #897）。
 
 スキップした項目と理由（すべてログに出る。**直れば自動で検証が復活する形**にしてある）:
 
@@ -1721,6 +1723,96 @@ TAKO_SELF_TEST_694: pane=48 state=Some(Unknown) alt=Some(false) role=None backen
 #887 依存はそのまま残る（空白入り `data_dir` のケースで固定済み）。
 ホーム解決の残り 15 箇所の分類は **#893**
 
+#### #889 の記録（セルフテスト項目 93 の 2 原因。PR #900・2026-08-22）
+
+**症状**: 隔離セルフテストが項目 93（#694 GUI ライク表示モードの判定）で必ず止まり、
+**93 以降（GUI モード / チャット / 設定画面 / limit-resume）が 1 つも走らない**。
+2 原因ともテスト側で、#889 の切り分けどおりだった。
+
+##### 原因 1: `cat` を argv リテラルで直書きしていた
+
+`Some(vec!["cat".into()])`。**Windows の `cat` は `Get-Content` のエイリアスで実体が無い**うえ、
+Windows の `login_shell_command` は argv を包まずそのまま `CreateProcess` へ渡すのでペインが即死する。
+判定側は消えたペインでも既定の `Terminal` が成り立つため「実行中のペインは据え置き」は
+**通ってしまい**、送達検証だけが配送先を失って落ちていた。
+→ `ShellDialect::echo_stdin_command()`（POSIX は `["cat"]` のまま / PowerShell は
+標準入力を 1 行ずつ読んで書き戻すループ）。同じ直書きが項目 97（#720）にもあったので一緒に寄せた。
+
+##### 原因 2: 素のシェルペインが実機の `$PROFILE` に依存していた
+
+スターターの前提「アイドルシェル」は OSC 133 の Idle で決まる。unix は spawn 時の env 注入で
+完結するが、PowerShell は `$PROFILE` 経由で、セルフテストは `TAKO_ISOLATED=1` で data_dir を
+隔離するため **`status()` が見る `<隔離 data_dir>/shell-integration/tako.ps1` と `$PROFILE` が
+指す本番のパスが別物**になる = **実機の配置状態でテストの結果が変わる**。
+→ `ShellDialect::integration_shell_command()`（統合を自分でドットソースした対話シェル。
+`-NoLogo -NoProfile -NoExit -Command . <script>` = `tests/shell_integration_powershell.rs` と同形）。
+POSIX は `None` = 既定シェルをそのまま起こすので従来と同じ経路。
+
+##### 実機 A/B（4 本。`$PROFILE` の状態も変数にした）
+
+この機は #766 の検証で `tako shell-integration install` 済みなので、**原因 2 は
+「配置済み」の状態では隠れる**。本番スクリプト（`%APPDATA%\tako\shell-integration\tako.ps1`）を
+リネームして隠すと「未配置の実機」を再現できる（`$PROFILE` のブロックは `Test-Path` で
+守られている）。
+
+| アーム | 本番スクリプト | 結果 |
+|---|---|---|
+| main `551fa0b` | 配置あり | **FAILED**（93 (d) `…tako master が届く`）= 原因 1 |
+| main `551fa0b` | 隠す | **FAILED**（93 (c) `判定表: アイドルシェル → スターター`。診断 `state=Some(Unknown) backend=None`）= 原因 2 |
+| branch `f41e26e` | 隠す | **項目 93 全通過** → 次の停止は項目 94 |
+| branch `f41e26e` | 配置あり | **項目 93 全通過** → 同じく項目 94 |
+
+診断行（そのまま証拠になる）:
+
+```
+selftest 93: shell=Some("…\PowerShell\7\pwsh.exe")
+  script=Some("…\Temp\tako-iso-data-14016\shell-integration\tako.ps1")
+  integration_shell=Some([pwsh, -NoLogo, -NoProfile, -NoExit, -Command, ., <script>])
+  echo_stdin=["powershell", "-NoProfile", "-Command", "while ($true) { … ReadLine() … WriteLine …}"]
+selftest 93d: launch_line="tako master" expected="tako master"
+```
+
+##### 次の壁は項目 94（#702 alt screen）= **Enter を LF で送っている**（#897 へ起票）
+
+```
+TAKO_SELF_TEST_702_ALT2: inner_alt=false backend=None
+  tail="… C:\Users\shioz>>|> Write-Host -NoNewline "$([char]27)[?1049h"; Start-Sleep 3600"
+```
+
+`>>` は PSReadLine の継続行プロンプトで、書き込んだコマンドは**確定していない**。
+端末の Enter は CR で、PowerShell は素の LF を継続行の開始と解釈する（#766 の注記と同じ実測）。
+セルフテストの他の PTY 直書きは既に `\r` を使っており、ここだけ `\n` が残っていた。
+**実機テストの失敗 1 件（`psmux_backend::copy_mode滞在中の打鍵がin_band解除で届く`）も同じ原因**なので、
+直せばセルフテストが 94 以降へ進み、実機テストの失敗も 23 → 22 件へ戻る。
+
+##### 実機ベースラインの更新: **22 → 23 件**（main 側の変化）
+
+main `551fa0b` と branch `f41e26e` の両方で `cargo test --workspace --no-fail-fast` を回し、
+**失敗テスト名が `Compare-Object` で IDENTICAL**（before=23 / after=23）= 新規失敗ゼロ。
+増えた 1 件は上記 psmux の e2e（#583 へコメント済み）。
+`tako-app` 446 → 448 / `tako-core` 795 → 797 の差は #889 が足したテスト 4 本。
+
+##### 見つけた製品バグ（この PR では直さない）
+
+- **#898**: `dispatch::which` が POSIX 専用の `which` コマンド決め打ちで、Windows では常に `None`
+  （実測: `which tako` は「認識されません」/ `where tako` は解決する）。`resolve_tako_binary()` が
+  裸の `tako` へ落ち、**stale claude バイナリ検知（#498）は常に無効**。境界 **B16
+  （`platform::exe::find`）** へ寄せる話
+- **#899**: スターター（#694）/ welcome バナー（#549）のコマンド投入が LF + POSIX クォート。
+  LF が行を確定しないことは項目 94 の診断で実測済み。`starter_action` は GUI クリック専用で
+  CLI / MCP から叩けないため（設計原則 5 の穴）カードそのものの実測はできていない
+
+##### 作法として残すもの
+
+- **番犬テスト `selftest_pane_command_watchdog`**: セルフテストがペインの起動コマンドを
+  argv リテラル（`command: Some(vec![…])` / `split_pane(app, cx, Some(vec![…]))`）で組んでいたら
+  ソース走査で落とす。パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+- **テストが製品の組み立てを決め打ちしない**: 項目 93 (d) の期待値は
+  `welcome::launch_command_line` から作る（macOS の実測値は従来と同一文字列）。
+  決め打ちのままだと #898 を直した瞬間にテストが壊れる
+- **項目 21（`tako title / role 設定`）は固定待ち 800ms で高負荷時に落ちる**（1 回踏んだ。
+  再実行で通る）。#796 の作法から漏れている 1 件
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
@@ -1902,21 +1994,22 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 
 #### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
 
-**最新の実測は main `c210aad`（#766 の A/B で取った。#877 時点の `c8c9fbb` と同数・同名）**:
+**最新の実測は main `551fa0b`（#889 の A/B で取った。合計 23 件）**:
 
 | スイート | 結果 |
 |---|---|
-| `tako-app` (lib) | 445 / **0** |
+| `tako-app` (bin) | 446 / **0** |
 | `tako-cli` (lib) | 53 / **0** |
-| `tako-control` (lib) | 1025 / **15 failed** |
-| `tako-core` (lib) | 766 / **7 failed** |
+| `tako-control` (lib) | 1027 / **15 failed** |
+| `tako-core` (lib) | 795 / **7 failed** |
 | `platform_parity` | **12** / 0 |
 | `encoding_conpty` | 5 / 0 |
-| `psmux_backend` | 16 / 0 |
-| `shell_integration_powershell` | 6 / 0 |
+| `psmux_backend` | 15 / **1 failed** ← #766 以降に増えた分（#897） |
+| `shell_integration_powershell` | **7** / 0（#766 の側路テストを含む） |
 
-**失敗 22 件はすべて main 由来**（#583 の既知分 + 以降 main へ増えた同系。#867 / #873 / #877 /
-#766 の実測とも同数・同名。#881 / #884 / #887 が入っても増減していない）。
+**失敗 23 件はすべて main 由来**（#583 の既知分 + 以降 main へ増えた同系。#867 / #873 / #877 /
+#766 では 22 件で、増えた 1 件 = `psmux_backend::copy_mode滞在中の打鍵がin_band解除で届く` は
+**テスト側が Enter を LF で送っている**のが原因（#897。直せば 22 件へ戻る）。
 #877 では branch / main の両方でスイートを回し、**失敗テスト名まで `Compare-Object` で
 完全一致（IDENTICAL）** を確認した = 新規ゼロ。スライスごとにこの表と突き合わせ、
 増減があれば `TAKO_BACKEND=none` 等で「自分の変更が原因か」を切り分けてから報告する。
