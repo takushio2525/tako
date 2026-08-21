@@ -7028,6 +7028,16 @@ impl TakoApp {
                     return;
                 }
                 self.quitting = true;
+                // セルフテスト中はここが**静かな終了**になる（persist_diag も抑止される）。
+                // 「以降の項目が走らなかった」の原因がログから分からなくなるので、
+                // 発生源だけは必ず出す（#865 の切り分けで 3 反復ぶん溶かした）
+                if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                    println!(
+                        "TAKO_SELF_TEST_QUIT: 最後のタブが閉じたのでアプリを終了する\
+                         （発生源 {} / panes={pane_ids:?}）",
+                        reason.origin().marker()
+                    );
+                }
                 for id in pane_ids {
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
@@ -7037,6 +7047,9 @@ impl TakoApp {
                 for (id, data) in log_closes {
                     self.apply_pane_log_close(id, data, reason);
                 }
+                // セルフテスト中はここが**静かな終了**になる（persist_diag も抑止される）。
+                // 「以降の項目が走らなかった」の原因がログから分からなくなるので、
+                // 発生源だけは必ず出す（#865 の切り分けで 3 反復ぶん溶かした）
                 // セカンダリモードは layout.json の所有者ではないため削除もログも行わない
                 // （プライマリの復元情報を道連れにしない。Issue #113）
                 if std::env::var_os("TAKO_SELF_TEST").is_none() && !self.secondary {
