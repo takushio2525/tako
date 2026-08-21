@@ -37494,9 +37494,32 @@ mod self_test {
             let before_76b = window
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().len())
                 .unwrap_or(0);
-            println!("TAKO_SELF_TEST_76B: panes={before_76b}");
+            let inventory = |app: &TakoApp| -> String {
+                format!(
+                    "tabs={} terminals={} per_tab={:?}",
+                    app.workspace.tabs().len(),
+                    app.terminals.len(),
+                    app.workspace
+                        .tabs()
+                        .iter()
+                        .map(|t| t.tree().len())
+                        .collect::<Vec<_>>()
+                )
+            };
+            println!(
+                "TAKO_SELF_TEST_76B: panes={before_76b} {}",
+                window.update(cx, |app, _, _| inventory(app)).unwrap_or_default()
+            );
             let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
+            println!(
+                "TAKO_SELF_TEST_76B: split 直後 {}",
+                window.update(cx, |app, _, _| inventory(app)).unwrap_or_default()
+            );
             wait(cx, 1200).await;
+            println!(
+                "TAKO_SELF_TEST_76B: 待ち後 {}",
+                window.update(cx, |app, _, _| inventory(app)).unwrap_or_default()
+            );
             // **分割できたことを確かめてから閉じる**。分割に失敗した状態で閉じると
             // タブの最後のペインを落としてアプリが終了し、以降の項目が「静かに
             // 走らなかった」ことになる（Windows 実機で踏んだ: スキップした項目のぶん
