@@ -41,8 +41,16 @@
   倒せる材料が揃った（作法 4 に従いマトリクスは #884 では触っていない）
 - **同型の一族**（`$SHELL -l -c` の直書き）が残っている: `tako-core/src/lib.rs` /
   `tako-app/src/autorename.rs` / `tako-app/src/preview.rs` /
-  `tako-control/src/config_share/env.rs` / `tako-control/src/setup_bootstrap.rs`。
-  **どれも B21（`child_cmd::user_env_cli`）へ寄せられる形**
+  `tako-control/src/config_share/env.rs` は
+  **B21（`child_cmd::user_env_cli`）へそのまま寄せられる形**（「ユーザーの環境で CLI を
+  1 回走らせる」）。
+  **ただし `tako-control/src/setup_bootstrap.rs` の `login_shell_sees()` は例外**（#868 の
+  担当者からの申し送り）: 意図は「ログインシェルの PATH にランチャーのディレクトリが
+  載っているか」の確認で、`user_env_cli` の program / args に対応するものが無い
+  （Windows の PATH はレジストリ由来でシェル profile 由来ではない）。現状
+  `if cfg!(windows) { return false; }` で先に落とす**意図的な unix 専用**なので、
+  機械的に寄せると意味が変わる。番犬の都合で境界の外に置けないなら、
+  B21 側に「ログインシェルの PATH を読む」専用の口を足す（Windows は None）方が素直
 - 項目 93 以降を Windows で通すには **#766**（psmux 越しに OSC が届かない）が要る
 - **#885**（tako-app の spawn が backend の `wrap_spawn` を通らない）は恒久課題として未着手
 - 隣接の穴（別件・未起票）: alacritty の `cmdline()` は **`program` を一切

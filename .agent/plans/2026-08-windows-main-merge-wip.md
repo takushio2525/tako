@@ -1489,7 +1489,7 @@ t=+1200ms => (no panes)
 |---|---|---|
 | `空白を含む引数が1語のまま子へ届く` | **FAILED**（`ARGC=1` にならない） | ok |
 | `器ありでも空白入りcwdのペインが生き残る` | **FAILED**（現れたあと消える） | ok |
-| `cargo test --workspace`（実機） | 22 件失敗 | **22 件失敗・集合が完全一致** |
+| `cargo test --workspace`（実機） | 22 件失敗 | **22 件失敗・失敗テスト名の集合が `diff` で完全一致** |
 
 macOS 側: `test --workspace` **2406 passed / 0 failed** / `fmt` / `clippy`（両 feature）/
 クロスチェック **エラー 0・警告リストが main と完全一致**。
