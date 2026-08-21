@@ -6,6 +6,9 @@
 // --- メニュー名 -------------------------------------------------------------
 
 /// アプリメニュー（先頭）はアプリ名そのものなので言語非依存
+/// macOS のアプリ名メニュー専用（#657）。Windows のメニューはアプリ名メニューを
+/// 持たないので参照されないが、i18n カタログの検査対象には残す
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const APP: &str = "tako";
 
 pub fn file() -> &'static str {
@@ -35,15 +38,27 @@ pub fn check_updates() -> &'static str {
 pub fn settings() -> &'static str {
     tr!("設定…", "Settings…")
 }
+/// macOS のアプリ名メニュー専用（#657）。Windows のメニューはアプリ名メニューを
+/// 持たないので参照されないが、i18n カタログの検査対象には残す
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn services() -> &'static str {
     tr!("サービス", "Services")
 }
+/// macOS のアプリ名メニュー専用（#657）。Windows のメニューはアプリ名メニューを
+/// 持たないので参照されないが、i18n カタログの検査対象には残す
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn hide_app() -> &'static str {
     tr!("tako を隠す", "Hide tako")
 }
+/// macOS のアプリ名メニュー専用（#657）。Windows のメニューはアプリ名メニューを
+/// 持たないので参照されないが、i18n カタログの検査対象には残す
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn hide_others() -> &'static str {
     tr!("ほかを隠す", "Hide Others")
 }
+/// macOS のアプリ名メニュー専用（#657）。Windows のメニューはアプリ名メニューを
+/// 持たないので参照されないが、i18n カタログの検査対象には残す
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn show_all() -> &'static str {
     tr!("すべてを表示", "Show All")
 }
@@ -160,6 +175,12 @@ pub fn minimize() -> &'static str {
 pub fn zoom_window() -> &'static str {
     tr!("拡大 / 縮小", "Zoom")
 }
+/// Windows 版の「拡大 / 縮小」（#657）。GPUI Windows の `zoom()` は `SW_MAXIMIZE`
+/// 固定でトグルにならないため、tako 側で最大化 ↔ 復元を出し分ける。macOS の
+/// 「拡大 / 縮小」と違って**状態が明確な 2 択**なので、Windows 慣習の語で書く
+pub fn maximize_restore() -> &'static str {
+    tr!("最大化 / 元のサイズに戻す", "Maximize / Restore")
+}
 pub fn next_tab() -> &'static str {
     tr!("次のタブ", "Next Tab")
 }
@@ -243,6 +264,7 @@ mod tests {
                 toggle_fullscreen().to_string(),
                 minimize().to_string(),
                 zoom_window().to_string(),
+                maximize_restore().to_string(),
                 next_tab().to_string(),
                 prev_tab().to_string(),
                 select_pane().to_string(),

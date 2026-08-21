@@ -174,9 +174,39 @@ pub(super) fn build_request(
                 "focus" => Request::WindowFocus {
                     window: required_u64(args, "window")?,
                 },
+                "minimize" => Request::WindowMinimize {
+                    window: u64_arg(args, "window")?,
+                },
+                "maximize" => Request::WindowMaximize {
+                    window: u64_arg(args, "window")?,
+                },
+                "restore" => Request::WindowRestore {
+                    window: u64_arg(args, "window")?,
+                },
                 other => {
                     return Err(format!(
-                        "action が不正: {other}（list | new | close | move-tab | focus）"
+                        "action が不正: {other}（list | new | close | move-tab | focus | \
+                         minimize | maximize | restore）"
+                    ))
+                }
+            }
+        }
+        "tako_menu" => {
+            let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
+            match action.as_str() {
+                "list" => Request::MenuList,
+                "open" => Request::MenuOpen {
+                    menu: str_arg(args, "menu")?
+                        .ok_or_else(|| "open には menu が必要".to_string())?,
+                },
+                "close" => Request::MenuClose,
+                "invoke" => Request::MenuInvoke {
+                    path: str_arg(args, "path")?
+                        .ok_or_else(|| "invoke には path が必要".to_string())?,
+                },
+                other => {
+                    return Err(format!(
+                        "action が不正: {other}（list | open | close | invoke）"
                     ))
                 }
             }

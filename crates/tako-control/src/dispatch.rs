@@ -1458,6 +1458,45 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
+        Request::WindowMinimize { window } => {
+            window_state_op(host, window, crate::protocol::WindowStateOp::Minimize)
+        }
+        Request::WindowMaximize { window } => {
+            window_state_op(host, window, crate::protocol::WindowStateOp::Maximize)
+        }
+        Request::WindowRestore { window } => {
+            window_state_op(host, window, crate::protocol::WindowStateOp::Restore)
+        }
+
+        Request::MenuList => Ok(menu_bar_json(&host.menu_bar_snapshot())),
+
+        Request::MenuOpen { menu } => {
+            let snapshot = host.menu_bar_snapshot();
+            require_in_window_menu(&snapshot)?;
+            let index = resolve_menu_index(&snapshot, &menu)?;
+            let name = snapshot.menus[index].name.clone();
+            host.request_menu_op(crate::protocol::MenuOp::Open(index));
+            Ok(json!({ "menu": name, "index": index }))
+        }
+
+        Request::MenuClose => {
+            let snapshot = host.menu_bar_snapshot();
+            require_in_window_menu(&snapshot)?;
+            host.request_menu_op(crate::protocol::MenuOp::Close);
+            Ok(Value::Null)
+        }
+
+        Request::MenuInvoke { path } => {
+            let snapshot = host.menu_bar_snapshot();
+            let hit = resolve_menu_item(&snapshot, &path)?;
+            host.request_menu_op(crate::protocol::MenuOp::Invoke(hit.action.clone()));
+            Ok(json!({
+                "path": hit.path,
+                "action": hit.action,
+                "shortcut": hit.shortcut,
+            }))
+        }
+
         Request::TabReorder { tab, index } => {
             let tab_id = find_tab(host.workspace(), tab)?;
             let actual = host
@@ -8238,6 +8277,21 @@ fn find_window(ws: &Workspace, raw: u64) -> Result<tako_core::WindowId, Dispatch
         .ok_or_else(|| DispatchError::Operation(format!("ウィンドウ {raw} が見つからない")))
 }
 
+/// ウィンドウの最小化 / 最大化 / 復元（Issue #584）。`window` 省略でアクティブウィンドウ。
+/// 実適用は GPUI の Context を持つ UI 層（`request_window_state`）に委ねる
+fn window_state_op(
+    host: &mut dyn ControlHost,
+    window: Option<u64>,
+    op: crate::protocol::WindowStateOp,
+) -> Result<Value, DispatchError> {
+    let wid = match window {
+        Some(raw) => find_window(host.workspace(), raw)?,
+        None => host.workspace().active_window_id(),
+    };
+    host.request_window_state(wid, op);
+    Ok(json!({ "window": wid.as_u64(), "state": op.as_str() }))
+}
+
 /// ウィンドウ一覧（Issue #339）。`WindowList` 応答と `list` の windows フィールドで共用
 fn windows_json(ws: &Workspace) -> Value {
     json!({
@@ -8249,6 +8303,236 @@ fn windows_json(ws: &Workspace) -> Value {
             "tabs": ws.window_tab_ids(w.id()).iter().map(|t| t.as_u64()).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     })
+}
+
+// --- メニューバー（Issue #657）------------------------------------------------
+
+/// メニューバーのスナップショットを JSON へ（Issue #657）
+fn menu_bar_json(snapshot: &crate::protocol::MenuBarSnapshot) -> Value {
+    json!({
+        "in_window": snapshot.in_window,
+        "open": snapshot.open,
+        "menus": snapshot.menus.iter().map(|menu| json!({
+            "name": menu.name,
+            "items": menu.items.iter().map(menu_item_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn menu_item_json(item: &crate::protocol::MenuItemSnapshot) -> Value {
+    use crate::protocol::MenuItemSnapshot as I;
+    match item {
+        I::Separator => json!({ "kind": "separator" }),
+        I::Action {
+            label,
+            action,
+            shortcut,
+        } => json!({
+            "kind": "action",
+            "label": label,
+            "action": action,
+            "shortcut": shortcut,
+        }),
+        I::Submenu { label, items } => json!({
+            "kind": "submenu",
+            "label": label,
+            "items": items.iter().map(menu_item_json).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// in-window メニューバーを持たない環境（macOS）で open / close を拒否する。
+///
+/// **「そんな機能は無い」ではなく理由を返す**（対応マトリクスの方針と同じ）。
+/// macOS でもメニュー自体は存在するので `list` と `invoke` は動く
+fn require_in_window_menu(
+    snapshot: &crate::protocol::MenuBarSnapshot,
+) -> Result<(), DispatchError> {
+    if snapshot.in_window {
+        return Ok(());
+    }
+    Err(DispatchError::Operation(
+        "この環境の menu open / close は使えません（メニューは OS のメニューバーに載るため \
+         tako が開閉できない）。項目の実行は menu invoke が使えます"
+            .into(),
+    ))
+}
+
+/// メニュー名を添字へ解決する（完全一致 → 前方一致 → 部分一致。大小文字は無視）。
+///
+/// 曖昧なときは候補を並べて拒否する（黙って先頭を採らない）
+fn resolve_menu_index(
+    snapshot: &crate::protocol::MenuBarSnapshot,
+    query: &str,
+) -> Result<usize, DispatchError> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Err(DispatchError::InvalidParams("メニュー名が空".into()));
+    }
+    // 添字での直接指定も許す（`menu open 0`）
+    if let Ok(index) = q.parse::<usize>() {
+        if index < snapshot.menus.len() {
+            return Ok(index);
+        }
+    }
+    let names: Vec<String> = snapshot
+        .menus
+        .iter()
+        .map(|m| m.name.to_lowercase())
+        .collect();
+    for matcher in [
+        |name: &str, q: &str| name == q,
+        |name: &str, q: &str| name.starts_with(q),
+        |name: &str, q: &str| name.contains(q),
+    ] {
+        let hits: Vec<usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| matcher(name, &q))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.len() {
+            0 => continue,
+            1 => return Ok(hits[0]),
+            _ => {
+                let candidates: Vec<&str> = hits
+                    .iter()
+                    .map(|i| snapshot.menus[*i].name.as_str())
+                    .collect();
+                return Err(DispatchError::InvalidParams(format!(
+                    "メニュー名 '{query}' が曖昧です: {}",
+                    candidates.join(" / ")
+                )));
+            }
+        }
+    }
+    let all: Vec<&str> = snapshot.menus.iter().map(|m| m.name.as_str()).collect();
+    Err(DispatchError::InvalidParams(format!(
+        "メニュー '{query}' が見つかりません（候補: {}）",
+        all.join(" / ")
+    )))
+}
+
+/// `resolve_menu_item` の戻り
+pub(crate) struct MenuHit {
+    /// 解決したフルパス（`ファイル/新規タブ`）
+    pub path: String,
+    /// アクション名（`tako::NewTab`）
+    pub action: String,
+    pub shortcut: Option<String>,
+}
+
+/// メニュー項目のパスを解決する（Issue #657）。
+///
+/// `path` は `/` 区切りで「メニュー/項目」「メニュー/サブメニュー/項目」または
+/// 項目名のみ（全メニュー横断）。各段の照合は `resolve_menu_index` と同じ
+/// 完全 → 前方 → 部分の順で、曖昧なら候補を並べて拒否する
+fn resolve_menu_item(
+    snapshot: &crate::protocol::MenuBarSnapshot,
+    path: &str,
+) -> Result<MenuHit, DispatchError> {
+    use crate::protocol::MenuItemSnapshot as I;
+
+    if snapshot.menus.is_empty() {
+        return Err(DispatchError::Operation(
+            "メニュー定義がありません（GUI が起動していない可能性があります）".into(),
+        ));
+    }
+    let segments: Vec<&str> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return Err(DispatchError::InvalidParams("項目のパスが空".into()));
+    }
+
+    // 「メニュー名を省略した項目名だけ」の指定を全メニュー横断で拾う。
+    // 平坦化した候補（フルパス付き）を作って 1 段目と同じ照合をかける
+    let mut flat: Vec<(String, &str, &String, &Option<String>)> = Vec::new();
+    for menu in &snapshot.menus {
+        for item in &menu.items {
+            match item {
+                I::Action {
+                    label,
+                    action,
+                    shortcut,
+                } => flat.push((
+                    format!("{}/{}", menu.name, label),
+                    label.as_str(),
+                    action,
+                    shortcut,
+                )),
+                I::Submenu { label, items } => {
+                    for child in items {
+                        if let I::Action {
+                            label: child_label,
+                            action,
+                            shortcut,
+                        } = child
+                        {
+                            flat.push((
+                                format!("{}/{}/{}", menu.name, label, child_label),
+                                child_label.as_str(),
+                                action,
+                                shortcut,
+                            ));
+                        }
+                    }
+                }
+                I::Separator => {}
+            }
+        }
+    }
+
+    // 指定が 2 段以上ならフルパスの末尾一致で絞る（`ファイル/新規タブ`）。
+    // 1 段なら項目ラベルだけで探す
+    let needle = segments.join("/").to_lowercase();
+    let last = segments[segments.len() - 1].to_lowercase();
+    let multi = segments.len() > 1;
+
+    for stage in 0..3 {
+        let hits: Vec<usize> = flat
+            .iter()
+            .enumerate()
+            .filter(|(_, (full, label, _, _))| {
+                let haystack = if multi {
+                    full.to_lowercase()
+                } else {
+                    label.to_lowercase()
+                };
+                let target = if multi { &needle } else { &last };
+                match stage {
+                    0 => haystack == *target,
+                    1 => haystack.ends_with(target) || haystack.starts_with(target),
+                    _ => haystack.contains(target),
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match hits.len() {
+            0 => continue,
+            1 => {
+                let (full, _, action, shortcut) = &flat[hits[0]];
+                return Ok(MenuHit {
+                    path: full.clone(),
+                    action: (*action).clone(),
+                    shortcut: (*shortcut).clone(),
+                });
+            }
+            _ => {
+                let candidates: Vec<&str> =
+                    hits.iter().map(|i| flat[*i].0.as_str()).take(8).collect();
+                return Err(DispatchError::InvalidParams(format!(
+                    "項目 '{path}' が曖昧です: {}",
+                    candidates.join(" / ")
+                )));
+            }
+        }
+    }
+    Err(DispatchError::InvalidParams(format!(
+        "メニュー項目 '{path}' が見つかりません（`tako menu list` で一覧できます）"
+    )))
 }
 
 fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
@@ -9147,6 +9431,12 @@ mod tests {
         limit_service: tako_core::LimitService,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
+        /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
+        window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
+        /// #657: メニューバーの構成（UI 層が持つものの代役）
+        menu_bar: crate::protocol::MenuBarSnapshot,
+        /// #657: UI 層へ依頼したメニュー操作
+        menu_ops: Vec<crate::protocol::MenuOp>,
         /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
         backend_sessions: std::collections::HashMap<u64, String>,
         /// #549: ウェルカムバナーの表示状態
@@ -9194,6 +9484,9 @@ mod tests {
                     used_bytes: 32 * 1024 * 1024,
                     entries: 2,
                 },
+                window_state_ops: Vec::new(),
+                menu_bar: sample_menu_bar(),
+                menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
                 welcome_banner: false,
                 autosuggest: true,
@@ -9276,6 +9569,22 @@ mod tests {
     }
 
     impl UiStateHost for MockHost {
+        fn request_window_state(
+            &mut self,
+            window: tako_core::WindowId,
+            op: crate::protocol::WindowStateOp,
+        ) {
+            self.window_state_ops.push((window.as_u64(), op));
+        }
+
+        fn menu_bar_snapshot(&self) -> crate::protocol::MenuBarSnapshot {
+            self.menu_bar.clone()
+        }
+
+        fn request_menu_op(&mut self, op: crate::protocol::MenuOp) {
+            self.menu_ops.push(op);
+        }
+
         fn pinned_previews(&self) -> Vec<PinnedView> {
             self.pins
                 .iter()
@@ -15726,6 +16035,219 @@ mod tests {
     }
 
     // === 複数ウィンドウ（Issue #339） ===
+
+    /// #584: 最小化 / 最大化 / 復元は UI 層への依頼として積まれる。
+    /// window 省略でアクティブウィンドウ、明示指定でそのウィンドウ、
+    /// 存在しない ID はエラー（無言で別ウィンドウを操作しない）
+    #[test]
+    fn windowの表示状態操作はui層へ依頼される() {
+        use crate::protocol::WindowStateOp;
+        let mut host = MockHost::new();
+        let w1 = host.workspace().active_window_id().as_u64();
+
+        // window 省略 = アクティブウィンドウ
+        let r = dispatch(
+            &mut host,
+            Request::WindowMinimize { window: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["window"].as_u64(), Some(w1));
+        assert_eq!(r["state"].as_str(), Some("minimize"));
+
+        // 別ウィンドウを作り、明示指定でそちらを操作する
+        let r = dispatch(&mut host, Request::WindowNew { tab: None }, PaneOrigin::Cli).unwrap();
+        let w2 = r["window"].as_u64().unwrap();
+        dispatch(
+            &mut host,
+            Request::WindowMaximize { window: Some(w1) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        dispatch(
+            &mut host,
+            Request::WindowRestore { window: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.window_state_ops,
+            vec![
+                (w1, WindowStateOp::Minimize),
+                (w1, WindowStateOp::Maximize),
+                // 直前の WindowNew で w2 がアクティブなので、省略は w2 に解決される
+                (w2, WindowStateOp::Restore),
+            ]
+        );
+
+        // 存在しないウィンドウ ID はエラーで、依頼は積まれない
+        let before = host.window_state_ops.len();
+        assert!(dispatch(
+            &mut host,
+            Request::WindowMinimize {
+                window: Some(9_999)
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        assert_eq!(host.window_state_ops.len(), before);
+    }
+
+    /// #657 のテスト用メニュー構成（Windows 版の並びを模したもの）
+    fn sample_menu_bar() -> crate::protocol::MenuBarSnapshot {
+        use crate::protocol::{MenuBarSnapshot, MenuItemSnapshot as I, MenuSnapshot};
+        MenuBarSnapshot {
+            in_window: true,
+            open: None,
+            menus: vec![
+                MenuSnapshot {
+                    name: "ファイル".into(),
+                    items: vec![
+                        I::Action {
+                            label: "新規タブ".into(),
+                            action: "tako::NewTab".into(),
+                            shortcut: Some("Ctrl+Shift+T".into()),
+                        },
+                        I::Separator,
+                        I::Action {
+                            label: "設定…".into(),
+                            action: "tako::OpenSettings".into(),
+                            shortcut: None,
+                        },
+                    ],
+                },
+                MenuSnapshot {
+                    name: "表示".into(),
+                    items: vec![
+                        I::Action {
+                            label: "コマンドパレット…".into(),
+                            action: "tako::OpenCommandPalette".into(),
+                            shortcut: None,
+                        },
+                        I::Submenu {
+                            label: "パネル".into(),
+                            items: vec![I::Action {
+                                label: "git ビュー".into(),
+                                action: "tako::ShowGitPanel".into(),
+                                shortcut: None,
+                            }],
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// #657: list はメニュー構成をそのまま返し、サブメニューも入れ子で出す
+    #[test]
+    fn menu_listがメニュー構成を返す() {
+        let mut host = MockHost::new();
+        let r = dispatch(&mut host, Request::MenuList, PaneOrigin::Cli).unwrap();
+        assert_eq!(r["in_window"], true);
+        assert_eq!(r["menus"][0]["name"], "ファイル");
+        assert_eq!(r["menus"][0]["items"][0]["action"], "tako::NewTab");
+        assert_eq!(r["menus"][0]["items"][0]["shortcut"], "Ctrl+Shift+T");
+        assert_eq!(r["menus"][0]["items"][1]["kind"], "separator");
+        assert_eq!(r["menus"][1]["items"][1]["kind"], "submenu");
+        assert_eq!(
+            r["menus"][1]["items"][1]["items"][0]["action"],
+            "tako::ShowGitPanel"
+        );
+    }
+
+    /// #657: open は名前の部分一致で解決し、UI 層へ添字で依頼する
+    #[test]
+    fn menu_openは名前を添字へ解決する() {
+        let mut host = MockHost::new();
+        let r = dispatch(
+            &mut host,
+            Request::MenuOpen {
+                menu: "表示".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(r["index"], 1);
+        assert_eq!(host.menu_ops, vec![crate::protocol::MenuOp::Open(1)]);
+
+        // 存在しない名前は候補つきで拒否し、依頼は積まれない
+        let before = host.menu_ops.len();
+        let e = dispatch(
+            &mut host,
+            Request::MenuOpen {
+                menu: "存在しない".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("ファイル"), "候補を出す: {e}");
+        assert_eq!(host.menu_ops.len(), before);
+    }
+
+    /// #657: in-window メニューバーが無い環境（macOS）では open / close を理由つきで拒否。
+    /// **「機能が無い」ではなく「なぜ使えないか + 代わりに何が使えるか」を返す**
+    #[test]
+    fn in_windowメニューが無い環境ではopenを理由つきで拒否する() {
+        let mut host = MockHost::new();
+        host.menu_bar.in_window = false;
+        let e = dispatch(
+            &mut host,
+            Request::MenuOpen {
+                menu: "ファイル".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("menu invoke"), "代替を案内する: {e}");
+        assert!(host.menu_ops.is_empty());
+
+        // invoke は macOS でも動く（アクションの発火は OS メニューと同じ経路）
+        dispatch(
+            &mut host,
+            Request::MenuInvoke {
+                path: "新規タブ".into(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            host.menu_ops,
+            vec![crate::protocol::MenuOp::Invoke("tako::NewTab".into())]
+        );
+    }
+
+    /// #657: invoke のパス解決（メニュー省略 / 2 段 / サブメニュー 3 段）
+    #[test]
+    fn menu_invokeのパス解決() {
+        let mut host = MockHost::new();
+        for (path, action) in [
+            ("新規タブ", "tako::NewTab"),
+            ("ファイル/新規タブ", "tako::NewTab"),
+            ("表示/パネル/git ビュー", "tako::ShowGitPanel"),
+            // 部分一致でも 1 つに絞れれば通る
+            ("パレット", "tako::OpenCommandPalette"),
+        ] {
+            let r = dispatch(
+                &mut host,
+                Request::MenuInvoke { path: path.into() },
+                PaneOrigin::Cli,
+            )
+            .unwrap_or_else(|e| panic!("{path} を解決できない: {e}"));
+            assert_eq!(r["action"], action, "path={path}");
+        }
+        // 見つからないパスはエラー（発火させない）
+        let before = host.menu_ops.len();
+        assert!(dispatch(
+            &mut host,
+            Request::MenuInvoke {
+                path: "存在しない項目".into()
+            },
+            PaneOrigin::Cli,
+        )
+        .is_err());
+        assert_eq!(host.menu_ops.len(), before);
+    }
 
     #[test]
     fn window系の一連操作とlist反映() {

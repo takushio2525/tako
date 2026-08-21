@@ -148,6 +148,24 @@ pub trait UiStateHost {
     /// 論理ウィンドウの GPUI ウィンドウ生成を依頼する（Issue #339）。
     /// dispatch は GPUI の Context を持たないため、UI 層が render で消費する
     fn request_viewport_open(&mut self, _window: tako_core::WindowId) {}
+    /// OS ウィンドウの最小化 / 最大化 / 復元を依頼する（Issue #584）。
+    /// `request_viewport_open` と同じく GPUI の Context が要るため UI 層が消費する。
+    /// 最小化中のウィンドウは render が回らないので、UI 層は render 以外の経路
+    /// （IPC ハンドラの sync）でも消費しなければならない
+    fn request_window_state(
+        &mut self,
+        _window: tako_core::WindowId,
+        _op: crate::protocol::WindowStateOp,
+    ) {
+    }
+    /// in-window メニューバー（Issue #657）の構成と開閉状態。
+    /// メニュー定義は UI 層が持つのでここから貰う。既定は「メニューを持たない環境」
+    fn menu_bar_snapshot(&self) -> crate::protocol::MenuBarSnapshot {
+        crate::protocol::MenuBarSnapshot::default()
+    }
+    /// メニューの開閉・項目発火を依頼する（Issue #657）。
+    /// `request_window_state` と同じく GPUI の Context が要るため UI 層が消費する
+    fn request_menu_op(&mut self, _op: crate::protocol::MenuOp) {}
     /// AI 自動リネーム（FR-2.12.4）の現在状態。UI 層が検知ループの状態を返す
     fn auto_rename_enabled(&self) -> bool {
         true

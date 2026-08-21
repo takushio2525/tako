@@ -627,6 +627,27 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #657: メニューの操作。両プラットフォームで「メニューは存在し、一覧 list と
+        // 項目の実行 invoke が使える」ので Supported。
+        //
+        // macOS だけ `open` / `close` が使えない（メニューを OS のメニューバーが
+        // 所有しており、tako にポップアップさせる手段が無い）が、これを `Degraded`
+        // にはしない。理由は 2 つ:
+        //
+        // - macOS ではメニューバー自体が**ネイティブで完全に動く**。ユーザーから見て
+        //   欠けている機能は無く、`Degraded` は実態より重い表現になる
+        // - `Degraded` の note は `PlatformFacts` 経由で system prompt へ入り、
+        //   `known_limitations_markdown` 経由で**リリースノートの「既知の制限」節**にも
+        //   出る（#594）。macOS 側に縮退はこれまで 1 件も無く、Windows 移植で macOS の
+        //   リリースノートが増えるのは筋が通らない
+        //
+        // 使えない組み合わせは呼んだ瞬間に dispatch が理由と代替（invoke）を名指しで
+        // 返す（`require_in_window_menu`）ので、必要な情報は使用時点で届く
+        key: "tako_menu",
+        macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
         key: "tako_move_pane_to_tab",
         macos: Support::Supported,
         windows: Support::Pending {

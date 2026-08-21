@@ -160,6 +160,9 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     // GUI ライク表示モードのトグル（#694。現在モードのアイコンを出す）
     ui_asset!("chat_bubble"),
     ui_asset!("prompt"),
+    // Windows のキャプションボタン（#584。macOS は native traffic lights を使う）
+    ui_asset!("window_maximize"),
+    ui_asset!("window_restore"),
 ];
 
 /// UI アイコンのアセットパス定数（#217。`gpui::svg().path(...)` に渡す）
@@ -222,6 +225,10 @@ pub mod ui_icon {
     pub const IMAGE: &str = "icons/ui/image.svg";
     /// システム通知の印（#715。警告ではないので WARNING とは分ける）
     pub const INFO: &str = "icons/ui/info.svg";
+    /// Windows のキャプションボタン（最大化）。Issue #584
+    pub const WINDOW_MAXIMIZE: &str = "icons/ui/window_maximize.svg";
+    /// Windows のキャプションボタン（最大化状態からの復元）。Issue #584
+    pub const WINDOW_RESTORE: &str = "icons/ui/window_restore.svg";
 }
 
 impl AssetSource for TakoAssets {
