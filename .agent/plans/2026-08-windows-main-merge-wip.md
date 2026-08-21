@@ -1489,6 +1489,7 @@ t=+1200ms => (no panes)
 |---|---|---|
 | `空白を含む引数が1語のまま子へ届く` | **FAILED**（`ARGC=1` にならない） | ok |
 | `器ありでも空白入りcwdのペインが生き残る` | **FAILED**（現れたあと消える） | ok |
+| `空白を含むenvの値も1語のまま器へ届く` | —（`-e` は製品経路から踏めないので予防） | ok |
 | `cargo test --workspace`（実機） | 22 件失敗 | **22 件失敗・失敗テスト名の集合が `diff` で完全一致** |
 
 macOS 側: `test --workspace` **2406 passed / 0 failed** / `fmt` / `clippy`（両 feature）/
@@ -1749,6 +1750,11 @@ macOS 側のベースライン: `test --workspace` **2386 passed / 0 failed**（
   UTF-8 出力を読むと文字化けする（**表示だけの問題**。コミット本体は正しい UTF-8）。
   日本語のコミットメッセージを Windows 側で作るときは UTF-8 バイトを直接書いた
   ファイルを `git commit -F` で渡す
+- **Windows/MSVC のバイナリを ASCII 走査して Rust の関数名を探しても見つからない**
+  （シンボル名は分離した `.pdb` 側で、この repo の debug profile は `.pdb` を出さない）。
+  「このバイナリはどちらのアームか」を確かめる手段としては**使えない**（#884 で 1 回誤用した）。
+  ビルド時の `git rev-parse HEAD` を記録し、アーム間で `Get-FileHash` が違うことと、
+  **観測された挙動そのもの**を根拠にする
 - **fresh worktree は `web/tako-remote/dist/` を持たない**（`.gitignore` 済み = 未追跡）。
   `rust_embed` の `#[folder = "../../web/tako-remote/dist/"]` が解決できず
   **tako-control のコンパイルが即失敗する**（`PwaAssets::get` の E0599 が連鎖）。
