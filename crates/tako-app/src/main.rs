@@ -796,6 +796,16 @@ fn viewport_close_failure_log(
 /// tako は内部都合で一時的に窓を 0 枚にする経路（`sync_viewports` の閉じ直し・
 /// セルフテストの `remove_window`）を持つので、0 枚になった瞬間は必ず 1 行残す
 /// （#865 の切り分けはこの行が無いために 3 反復溶けた）
+/// セルフテストが最終項目（フォーカス喪失状態の cmd-q。#103）まで到達したか（#872）。
+///
+/// `on_app_quit` の `TAKO_APP_SELF_TEST_OK` は「全 check 通過後にだけ quit が来る」
+/// 前提だった。ところが **ウィンドウ 0 枚の自動終了も同じフックを通る**ので、
+/// 途中で死んだ run が `TAKO_APP_SELF_TEST_OK` + 終了コード 0 を出す
+/// = **偽の緑**になっていた（Windows で実測。#872 の無音終了はこれで隠れ得た）。
+/// 前提を明示のラッチにして、到達していない quit は FAILED で落とす
+static SELF_TEST_AT_FINAL_STEP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 論理ウィンドウ数の最後の観測値（#872 の診断専用）。
 ///
 /// close 観測子（`on_window_closed`）は GPUI の `update_window` の内側から呼ばれるので、
@@ -3434,8 +3444,18 @@ impl TakoApp {
             }
             // セルフテスト最終項目（フォーカス喪失状態の cmd-q。#103）の成功マーカー。
             // ここに到達した = Quit がフォーカス非依存で発火し quit 経路に入った証拠。
-            // 全 check 通過後にだけ cmd-q が送られるため、これが総合 OK マーカーを兼ねる
+            // **ただし quit 経路は最終項目以外からも来る**（ウィンドウ 0 枚の自動終了・
+            // 最後のタブの close）。無条件に OK を出すと途中で死んだ run が
+            // 「OK + 終了コード 0」になる = 偽の緑（#872 で実測）。最終項目まで
+            // 到達したことをラッチで確かめる
             if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                if !SELF_TEST_AT_FINAL_STEP.load(std::sync::atomic::Ordering::SeqCst) {
+                    println!(
+                        "TAKO_APP_SELF_TEST_FAILED: 最終項目より前に quit した\
+                         （途中で終了した run を OK と誤読しないための番犬。#872）"
+                    );
+                    std::process::exit(1);
+                }
                 println!("TAKO_APP_SELF_TEST_OK");
             }
             async {}
@@ -48288,6 +48308,8 @@ mod self_test {
                 .update(|cx| cx.windows().first().copied())
                 .unwrap_or(any);
             let _ = final_any.update(cx, |_, window, _| window.blur());
+            // ここから先の quit だけが「全 check 通過」を意味する（#872）
+            crate::SELF_TEST_AT_FINAL_STEP.store(true, std::sync::atomic::Ordering::SeqCst);
             press(final_any, cx, "cmd-q");
             wait(cx, 5000).await;
             fail("フォーカス喪失状態の cmd-q で終了しない (#103)");
@@ -49957,6 +49979,42 @@ mod session_kill_boundary_tests {
         assert!(
             text.contains("window_lifecycle::last_window_close_here()"),
             "最後のウィンドウの扱いが window_lifecycle 経由でなくなっている。             方針を UI ツールキットの既定に戻すと #872 が再発する"
+        );
+    }
+
+    /// 途中で死んだ run が「OK + 終了コード 0」にならないこと（#872 の番犬）。
+    ///
+    /// `on_app_quit` は最終項目の cmd-q 以外（ウィンドウ 0 枚の自動終了・最後のタブの
+    /// close）からも通るので、OK マーカーを無条件に出すと**偽の緑**になる。
+    /// 実際 Windows で `TAKO_APP_SELF_TEST_OK` + exit 0 が出るのを実測した
+    #[test]
+    fn 途中終了はokマーカーを出さない() {
+        let text = source("src/main.rs");
+        let ok_at = text
+            .find("println!(\"TAKO_APP_SELF_TEST_OK\")")
+            .expect("OK マーカーの印字が見つからない");
+        // OK の直前に「最終項目まで到達したか」の判定があること
+        let before = &text[..ok_at];
+        let guard = before
+            .rfind("SELF_TEST_AT_FINAL_STEP.load(")
+            .expect("OK マーカーがラッチで守られていない（途中終了で偽の緑になる。#872）");
+        assert!(
+            before[guard..].contains("TAKO_APP_SELF_TEST_FAILED"),
+            "ラッチが立っていないときに FAILED を出していない（#872）"
+        );
+        // ラッチを立てるのは最終項目（cmd-q を撃つ直前）だけ
+        let sets: Vec<_> = text
+            .match_indices("SELF_TEST_AT_FINAL_STEP.store(")
+            .collect();
+        assert_eq!(
+            sets.len(),
+            1,
+            "ラッチを立てる箇所が 1 つではない（最終項目だけであること。#872）"
+        );
+        let after_set = &text[sets[0].0..];
+        assert!(
+            after_set[..400].contains("press(final_any, cx, \"cmd-q\")"),
+            "ラッチが最終項目の cmd-q の直前に無い（#872）"
         );
     }
 
