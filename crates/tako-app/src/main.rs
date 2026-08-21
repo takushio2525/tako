@@ -34700,7 +34700,9 @@ mod self_test {
                             direction: None,
                             ratio: None,
                             command: None,
-                            cwd: Some("/private/tmp".into()),
+                            // ホームとは別のディレクトリならマルチルートが成立する。
+                            // OS の一時ディレクトリを使う（`/private/tmp` は macOS 専用）
+                            cwd: Some(std::env::temp_dir().display().to_string()),
                             focus: None,
                         },
                         PaneOrigin::Cli,
@@ -35916,8 +35918,8 @@ mod self_test {
             // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
             //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
             //      ファイルは OpenFile プレビュー、ディレクトリは Split + PTY 起動まで実測する。
-            let link_dir = std::path::PathBuf::from("/private/tmp")
-                .join(format!("tako-selftest-link-{}", std::process::id()));
+            let link_dir =
+                std::env::temp_dir().join(format!("tako-selftest-link-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&link_dir);
             std::fs::create_dir_all(link_dir.join("sub"))
                 .expect("リンク用一時ディレクトリを作れる");
@@ -35925,12 +35927,16 @@ mod self_test {
             let absolute_file = link_dir.join("absolute.txt");
             std::fs::write(&link_file, "link selftest\n").unwrap();
             std::fs::write(&absolute_file, "absolute link selftest\n").unwrap();
-            let link_command = format!(
-                "cd {} && printf '%s\\n' LINK_SELFTEST {} '~/' sub/relative.txt {}",
-                shell_escape(&link_dir),
-                shell_escape(&absolute_file),
-                shell_escape(&link_dir),
-            );
+            let link_command = sh.sequence(&[
+                sh.cd(&link_dir.display().to_string()),
+                sh.print_lines(&[
+                    "LINK_SELFTEST".to_string(),
+                    absolute_file.display().to_string(),
+                    "~/".to_string(),
+                    "sub/relative.txt".to_string(),
+                    link_dir.display().to_string(),
+                ]),
+            ]);
             press(any, cx, sh.clear_line_key());
             type_text(any, cx, &link_command, true);
             let mut link_screen_ready = false;

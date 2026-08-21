@@ -185,6 +185,18 @@ impl ShellDialect {
         }
     }
 
+    /// 渡した語を 1 行ずつそのまま出力する（展開しない）。
+    ///
+    /// PowerShell の `echo`（`Write-Output`）は複数引数を 1 行ずつ出すのでそのまま使える。
+    /// POSIX は `printf '%s\n'` に並べる（`echo` は引数を空白で 1 行に並べてしまう）
+    pub fn print_lines(self, words: &[String]) -> String {
+        let quoted: Vec<String> = words.iter().map(|w| self.quote_arg(w)).collect();
+        match self {
+            Self::Posix => format!("printf '%s\\n' {}", quoted.join(" ")),
+            Self::PowerShell => format!("echo {}", quoted.join(" ")),
+        }
+    }
+
     /// 連番を 1 行 1 個で出す
     pub fn seq(self, from: i64, to: i64) -> String {
         match self {
@@ -584,6 +596,13 @@ mod tests {
             PS.shell_snippet_argv("echo X; Start-Sleep 15"),
             "powershell -NoProfile -Command 'echo X; Start-Sleep 15'"
         );
+    }
+
+    #[test]
+    fn 語を1行ずつ出す() {
+        let words = vec!["A".to_string(), "~/".to_string(), "x y".to_string()];
+        assert_eq!(POSIX.print_lines(&words), "printf '%s\\n' A '~/' 'x y'");
+        assert_eq!(PS.print_lines(&words), "echo 'A' '~/' 'x y'");
     }
 
     #[test]
