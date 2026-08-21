@@ -33852,6 +33852,7 @@ mod self_test {
                         },
                         PaneOrigin::Cli,
                     );
+                    app.drain_pending_preview_loads(cx);
                     cx.notify();
                 })
                 .ok();
@@ -33890,6 +33891,12 @@ mod self_test {
                             PaneOrigin::Cli,
                         )
                         .is_ok();
+                        // Markdown は background 読み込み（`pending_preview_loads`）。
+                        // 直接 dispatch では IPC ループの drain を通らないので手動で流す。
+                        // これが無いと `wait_for_preview_maps` が**前のファイルの
+                        // 座標キャッシュ**を見て通ってしまう（macOS はそれで緑になっていた。
+                        // Windows は直前の PDF が text_layer を持たずキャッシュが空 = 顕在化）
+                        app.drain_pending_preview_loads(cx);
                         cx.notify();
                         ok
                     })
