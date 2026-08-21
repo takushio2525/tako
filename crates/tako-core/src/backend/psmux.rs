@@ -248,7 +248,7 @@ impl SessionBackend for PsmuxBackend {
         // ペイン固有の環境変数はセッション作成時に確定させる（tmux 版と同じ理由。
         // サーバーのグローバル環境から stale な値を拾わせない）
         for (key, val) in &options.env {
-            if key == "TAKO_PANE_ID" || key == "TAKO_TAB_ID" {
+            if crate::backend::PANE_SCOPED_ENV.contains(&key.as_str()) {
                 args.push("-e".to_string());
                 args.push(format!("{key}={val}"));
             }

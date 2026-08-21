@@ -801,6 +801,22 @@ impl TerminalSession {
         }
     }
 
+    /// 側路（[`crate::osc_sink`]）で運ばれてきた OSC バイト列を反映する（#766）。
+    ///
+    /// 器が OSC を素通ししない環境（psmux）では、統合スクリプトが**コンソールではなく
+    /// ファイルへ**同じバイト列を書く。それをここへ流すと PTY 経路と**同じ**
+    /// [`crate::osc_tap`] のスキャナと状態機械を通るので、cwd と実行状態の意味論が
+    /// プラットフォーム間で分岐しない。
+    ///
+    /// スキャナは呼び出しごとに使い捨てる。側路のファイルは常に**完全な 1 束**を
+    /// 持つ（書き手が rename で差し替える）ので、前回の途中状態を持ち越す必要が無い。
+    /// 持ち越すと、上書きで消えた束の断片と次の束が繋がって化ける
+    pub fn feed_osc_bytes(&mut self, bytes: &[u8]) {
+        for event in crate::osc_tap::OscScanner::new().scan(bytes) {
+            self.process_osc_event(event);
+        }
+    }
+
     /// 起動時 working directory または OSC 7 で通知された cwd
     pub fn cwd(&self) -> Option<&std::path::Path> {
         self.cwd.as_deref()

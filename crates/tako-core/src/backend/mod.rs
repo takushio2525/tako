@@ -123,6 +123,21 @@ pub enum ScrollbackAuthority {
     InProcess,
 }
 
+/// 器のセッション作成時（`new-session -e K=V`）に値を確定させる**ペイン固有**の環境変数。
+///
+/// 器のサーバーのグローバル環境は最初のクライアントから継承され、後続セッションも
+/// その stale な値を使う。ペインごとに違う値はここに載せて `-e` で渡さないと、
+/// **別のペインの値が見える**（#210 で実害を踏んだ）。
+///
+/// 器の実装（tmux / psmux）が同じ表を引くので、キーを増やすときの編集は 1 箇所で済む
+/// （片方だけ足すと「tmux では効くが psmux では効かない」という追いにくい差になる）
+pub const PANE_SCOPED_ENV: &[&str] = &[
+    "TAKO_PANE_ID",
+    "TAKO_TAB_ID",
+    // #766: 器が OSC を素通ししないときのシェル統合の書き先（`osc_sink::SINK_ENV`）
+    crate::osc_sink::SINK_ENV,
+];
+
 /// バックエンドの能力。
 ///
 /// **bool の集合であって `enum Backend { Tmux, None }` ではない**のが重要。
@@ -805,6 +820,39 @@ pub(crate) fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod pane_scoped_env_tests {
+    use super::*;
+
+    /// #766: 側路の書き先はペインごとに違うので、`-e` で渡す表に載っていないと
+    /// **器のグローバル環境の stale な値**（別ペインの書き先）が見えてしまう
+    #[test]
+    fn 側路の書き先はペイン固有の環境変数として渡る() {
+        assert!(PANE_SCOPED_ENV.contains(&crate::osc_sink::SINK_ENV));
+        assert!(PANE_SCOPED_ENV.contains(&"TAKO_PANE_ID"));
+        assert!(PANE_SCOPED_ENV.contains(&"TAKO_TAB_ID"));
+    }
+
+    /// 表を引く側が tmux / psmux の両方であること（片方だけ足すと
+    /// 「tmux では効くが psmux では効かない」という追いにくい差になる）
+    #[test]
+    fn 器の実装はどちらもこの表を引いている() {
+        for (name, src) in [
+            ("tmux_backend.rs", include_str!("../tmux_backend.rs")),
+            ("backend/psmux.rs", include_str!("psmux.rs")),
+        ] {
+            assert!(
+                src.contains("PANE_SCOPED_ENV.contains("),
+                "{name} が PANE_SCOPED_ENV を引いていない（キーの直書きへ戻っている）"
+            );
+            assert!(
+                !src.contains(r#"key == "TAKO_PANE_ID""#),
+                "{name} にキーの直書きが残っている（表と食い違う）"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

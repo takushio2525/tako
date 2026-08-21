@@ -384,6 +384,15 @@ pub const CATALOG: &[Entry] = &[
     },
     Entry {
         root: Root::TakoData,
+        // #766: 器が OSC を素通ししない環境でのシェル統合の側路（ペインごとの実行時ファイル）
+        path: "osc/",
+        class: Class::Local,
+        note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    Entry {
+        root: Root::TakoData,
         path: "lid-guard.json",
         class: Class::Local,
         note: notes::LID_GUARD,

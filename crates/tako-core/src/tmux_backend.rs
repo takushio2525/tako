@@ -181,7 +181,7 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // その stale な値を使う。-e はセッション作成時に値を確定させるため、
     // シェル起動後の set-environment（タイミング問題）やクライアント環境の継承に依存しない
     for (key, val) in &options.env {
-        if key == "TAKO_PANE_ID" || key == "TAKO_TAB_ID" {
+        if crate::backend::PANE_SCOPED_ENV.contains(&key.as_str()) {
             args.push("-e".to_string());
             args.push(format!("{key}={val}"));
         }

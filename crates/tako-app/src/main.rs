@@ -1776,6 +1776,9 @@ struct TakoApp {
     /// 子プロセス走査の対象指紋・前回結果・最終走査時刻（#779）。変化のない tick は
     /// tmux / ps を起動せず、この状態を sleep guard / GUI モード / close 確認で共有する。
     running_children_scan: tako_control::agents::RunningChildrenScanState,
+    /// シェル統合の側路（#766）: 器が OSC を素通ししないペインの書き先と読み取り位置。
+    /// **通す器（tmux）と器なしでは空のまま**なので、定期更新のコストはゼロ
+    osc_sinks: HashMap<PaneId, (std::path::PathBuf, tako_core::osc_sink::SinkCursor)>,
     /// スリープ防止の最新状態（ステータスバーチップ + 詳細ポップオーバー表示用。
     /// ポーリングで更新。#173/#218/#440）
     sleep_guard_state: Option<tako_control::sleep_guard::SleepGuardState>,
@@ -3245,6 +3248,7 @@ impl TakoApp {
             pending_close_confirm: None,
             busy_backend_sessions: std::collections::HashSet::new(),
             running_children_scan: tako_control::agents::RunningChildrenScanState::default(),
+            osc_sinks: HashMap::new(),
             sleep_guard_state: None,
             sleep_guard_popover_open: false,
             sleep_guard_popover_anchor: None,
@@ -3954,6 +3958,19 @@ impl TakoApp {
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:syntax_release");
                         app.release_idle_syntax();
+                    }
+                    // #766: 器が OSC を素通ししないペインは、統合スクリプトが書いた
+                    // 側路のファイルからここで取り込む（側路が無ければ即 return）
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:osc_sink");
+                        for pane_id in app.drain_osc_sinks() {
+                            // 状態ドットはヘッダ（#803 で別のキャッシュビューへ出した）、
+                            // cwd チップも同じくヘッダなので**両方**汚す
+                            app.notify_pane_body(pane_id, wcx);
+                            if let Some(view) = app.pane_headers.get(&pane_id).cloned() {
+                                view.update(wcx, |_, cx| cx.notify());
+                            }
+                        }
                     }
                     app.save_layout();
                     let filetree_targets = if app.filetree.visible {
@@ -5930,6 +5947,65 @@ impl TakoApp {
         }
     }
 
+    /// シェル統合の側路（#766）を張る。器が OSC を素通しするなら何もしない。
+    ///
+    /// psmux は「パースして画面モデルへ落とし、クライアントへ描き直す」多重化器なので、
+    /// 画面モデルに置き場の無いバイト列は**どの形でも**クライアントへ出ない
+    /// （`allow-passthrough` は upstream で値を読む側が無く、DCS の tmux 形式は未実装。
+    /// 詳細は `tako_core::osc_sink` の説明）。器の側で直る話ではないので、
+    /// **同じ OSC バイト列をファイルで運ぶ**
+    fn arm_osc_sink(&mut self, pane_id: PaneId, options: &mut SpawnOptions) {
+        if tako_core::backend::capabilities().osc_passthrough {
+            return;
+        }
+        // 側路に対応していない統合スクリプトの環境で書き先を渡しても、空のファイルが
+        // 増えるだけ（統合が見ない）
+        if !tako_core::shell_integration::side_channel_supported() {
+            return;
+        }
+        let Some(data_dir) = tako_core::paths::data_dir() else {
+            return;
+        };
+        let Some(path) = tako_core::osc_sink::prepare(&data_dir, pane_id.as_u64()) else {
+            return;
+        };
+        options.env.push((
+            tako_core::osc_sink::SINK_ENV.into(),
+            path.display().to_string(),
+        ));
+        self.osc_sinks
+            .insert(pane_id, (path, tako_core::osc_sink::SinkCursor::default()));
+    }
+
+    /// 側路に新しい OSC が来ていたらセッションへ流す（定期更新から呼ぶ）。
+    ///
+    /// 反映があったペイン ID を返す（呼び出し側がそのペインだけ再描画できる）。
+    /// 側路を持つペインが無ければ即 return なので、macOS / tmux ではコストゼロ
+    fn drain_osc_sinks(&mut self) -> Vec<PaneId> {
+        if self.osc_sinks.is_empty() {
+            return Vec::new();
+        }
+        let mut fed = Vec::new();
+        for (pane_id, (path, cursor)) in self.osc_sinks.iter_mut() {
+            let Some(bytes) = cursor.take_new(path) else {
+                continue;
+            };
+            if let Some(session) = self.terminals.get_mut(pane_id) {
+                session.feed_osc_bytes(&bytes);
+                fed.push(*pane_id);
+            }
+        }
+        fed
+    }
+
+    /// ペインを閉じたときに側路の残骸を消す（**3 つの close 経路すべてから呼ぶ**。
+    /// 番犬テスト `close_経路は側路の後始末を集約関数に任せている` が拘束している）
+    fn drop_pane_osc_sink(&mut self, pane_id: PaneId) {
+        if let Some((path, _)) = self.osc_sinks.remove(&pane_id) {
+            tako_core::osc_sink::discard(&path);
+        }
+    }
+
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
     /// 制御プレーンの接続情報を環境変数で注入する（FR-2.1.1）。
     /// 失敗（fd 枯渇等での PTY 生成エラー）は Err で返す。ここで panic すると GPUI の
@@ -5954,6 +6030,9 @@ impl TakoApp {
         if options.command.is_none() {
             self.begin_pane_settle(pane_id, tako_core::ui_mode::SettleKind::Shell);
         }
+        // #766: 器が OSC を素通ししないなら、統合スクリプトの書き先（側路）を教える。
+        // 通す器（tmux）と器なしでは何もしない = 従来どおり PTY 経路で届く
+        self.arm_osc_sink(pane_id, &mut options);
         if let Some(ipc) = &self.ipc {
             options
                 .env
@@ -6926,6 +7005,7 @@ impl TakoApp {
                 self.pane_delivery.remove(&pane_id);
                 self.discard_ime_for_pane(pane_id);
                 self.drop_preview_pane_state(pane_id);
+                self.drop_pane_osc_sink(pane_id);
                 self.drop_gui_pane_state(pane_id);
                 self.pane_links.remove(&pane_id);
                 self.known_failed.remove(&pane_id);
@@ -7000,6 +7080,7 @@ impl TakoApp {
                     // （#821 の行レイアウト・#826 のブロック索引）がタブごと
                     // 閉じたときだけ残る（#821 が CLI / MCP 経路で踏んだのと同型）
                     self.drop_preview_pane_state(id);
+                    self.drop_pane_osc_sink(id);
                     self.discard_ime_for_pane(id);
                     self.pane_links.remove(&id);
                     self.known_failed.remove(&id);
@@ -16215,6 +16296,7 @@ impl SessionHost for TakoApp {
         // ここが独自の列挙だった頃は、CLI / MCP で閉じたプレビューの
         // 行テキスト・行レイアウトがプロセスの終わりまで残っていた
         self.drop_preview_pane_state(pane);
+        self.drop_pane_osc_sink(pane);
         self.drop_gui_pane_state(pane);
         self.pane_links.remove(&pane);
         self.known_failed.remove(&pane);
@@ -49676,6 +49758,23 @@ mod preview_cleanup_watchdog {
             .filter(|line| line.starts_with("self.preview") && line.contains(".remove(&"))
             .map(str::to_string)
             .collect()
+    }
+
+    /// #766 の番犬: 側路（`osc_sink`）の後始末も 3 つの close 経路すべてから呼ばれること。
+    ///
+    /// 残すとペイン ID が再利用されたとき（#210 の復元経路）**前のペインの最後の状態**を
+    /// 新しいペインへ食わせてしまう。`prepare` 側でも残骸を消しているので二重の防御だが、
+    /// close で消えないと「閉じたペインのファイルが data_dir に溜まる」ほうが残る
+    #[test]
+    fn close_経路は側路の後始末を集約関数に任せている() {
+        let src = include_str!("main.rs");
+        for name in ["remove_pane_with", "detach_session", "remove_tab_with"] {
+            let body = body_of(src, name);
+            assert!(
+                body.contains("drop_pane_osc_sink("),
+                "{name} が drop_pane_osc_sink を呼んでいない（#766）"
+            );
+        }
     }
 
     #[test]
