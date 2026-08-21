@@ -1517,6 +1517,12 @@ struct TakoApp {
     pane_header_renders: u64,
     /// クロームを実際に描き直した回数（同上）
     chrome_renders: u64,
+    /// 出力起因の再描画で**アプリ全体**を汚した回数（#858 の切り分け用。単調増加）
+    term_app_notifies: u64,
+    /// ペイン本体のビューが無くアプリ全体へ落ちた回数（#858。同上）
+    pane_body_notify_fallbacks: u64,
+    /// ヘッダの時計（1 秒に 1 回）でヘッダを汚した回数（#858。同上）
+    header_clock_ticks: u64,
     /// 動画フレームの描画キャッシュ（frame_gen で世代管理: 新フレーム準備完了まで前フレームを表示）
     video_frame_cache: HashMap<PaneId, (u64, std::sync::Arc<gpui::RenderImage>)>,
     /// 動画の旧フレーム。次の render 冒頭で GPU sprite atlas から解放する（Issue #258）。
@@ -3126,6 +3132,9 @@ impl TakoApp {
             pane_body_renders: 0,
             pane_header_renders: 0,
             chrome_renders: 0,
+            term_app_notifies: 0,
+            pane_body_notify_fallbacks: 0,
+            header_clock_ticks: 0,
             video_players: HashMap::new(),
             video_ticker: false,
             video_frame_cache: HashMap::new(),
@@ -6105,6 +6114,8 @@ impl TakoApp {
         }
         self.term_redraw_requests = self.term_redraw_requests.saturating_add(1);
         if app_scope {
+            // #858: 「出力なのにアプリ全体が汚れた」を後から名指しできるようにする
+            self.term_app_notifies = self.term_app_notifies.saturating_add(1);
             cx.notify();
             return;
         }
@@ -6118,7 +6129,11 @@ impl TakoApp {
     fn notify_pane_body(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         match self.pane_bodies.get(&pane_id).cloned() {
             Some(view) => view.update(cx, |_, cx| cx.notify()),
-            None => cx.notify(),
+            None => {
+                // #858: ここへ落ちるとアプリ全体が描き直る（ビュー未作成の最初だけ）
+                self.pane_body_notify_fallbacks = self.pane_body_notify_fallbacks.saturating_add(1);
+                cx.notify()
+            }
         }
     }
 
@@ -15262,6 +15277,7 @@ impl TakoApp {
             return;
         }
         self.last_header_clock_tick = std::time::Instant::now();
+        self.header_clock_ticks = self.header_clock_ticks.saturating_add(1);
         let running: Vec<PaneId> = self
             .pane_headers
             .keys()
@@ -44850,6 +44866,25 @@ mod self_test {
                         })
                         .unwrap_or((0, 0))
                 };
+                // #858: 測る窓が「出力だけ」だったかを判定する材料。
+                //
+                // アプリ全体を汚す `cx.notify()` が窓に挟まると、キャッシュしてある
+                // クローム 4 枚（#786）も一緒に描き直る = **可視ペインの枚数に依らない
+                // 汚れの証拠**になる。ヘッダの時計（#803。1 秒に 1 回）と
+                // `term_pending_app` の持ち越し・ビュー未作成のフォールバックも
+                // それぞれ数えるので、汚れの発生源が名前で分かる
+                let dirt = |cx: &mut gpui::AsyncApp| {
+                    window803
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            (
+                                app.chrome_renders,
+                                app.term_app_notifies,
+                                app.pane_body_notify_fallbacks,
+                                app.header_clock_ticks,
+                            )
+                        })
+                        .unwrap_or((0, 0, 0, 0))
+                };
                 // 対象は「このウィンドウに実際に描かれた」ターミナルのペイン。
                 // 持ち上げているかは**条件にしない**（条件にすると、持ち上げを戻した
                 // ときに検査が落ちずに飛ぶ = 検出力が無くなる）
@@ -44876,18 +44911,96 @@ mod self_test {
                         lifted,
                         "110: ターミナル表示のペインはヘッダをルート側へ持ち上げている (#803)",
                     );
-                    let (body0, head0) = counters(cx);
-                    // ① 出力（= このペインの本体だけを汚す経路）
-                    let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
-                        app.last_term_notify =
-                            std::time::Instant::now() - std::time::Duration::from_secs(1);
-                        app.on_term_event(
-                            target,
-                            tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
-                            cx,
-                        );
-                    });
-                    draw(cx);
+                    // ① 出力（= このペインの本体だけを汚す経路）。
+                    //
+                    // #858: 素で 1 回測ると**窓の外の理由**で落ちる。実測した汚れは
+                    // ①アプリ全体を汚す `cx.notify()` が窓に挟まる（2 秒 tick 等。
+                    // 可視ペイン全部の本体とヘッダが描き直るので `body +2 header +2`
+                    // = ②の意図的な全体 notify と同じ数字になる）②`term_pending_app`
+                    // の持ち越しで、出力なのに flush が全体経路へ入る ③ヘッダの時計
+                    // （1 秒に 1 回）が同じ flush の先頭で走る（`flush_term_redraw` は
+                    // `tick_pane_header_clocks` を最初に呼ぶ）の 3 通り。
+                    //
+                    // ③は「出力による再描画」ではないので窓の外へ出し（直前に時計を
+                    // 進めておく）、②は持ち越しを落としてから測る。①は外から来るので
+                    // **汚れを検出してやり直す**（上限つき・記録つき。素通りはさせない）
+                    //
+                    // 原因の再現と検出力の実証は env で切り替える（実機で偶然を待たない。
+                    // #853 の `TAKO_853_NO_CHAT_PIN` と同じ流儀）:
+                    // - `TAKO_858_NO_WINDOW_GUARD=1` … 窓を整えず 1 回だけ測る = 修正前
+                    // - `TAKO_858_INJECT=app` … 窓の中でアプリ全体を汚す（**1 回目だけ**
+                    //   = 2 秒 tick が一過性に挟まった状況）。修正前は FAILED、
+                    //   修正後は汚れを見つけて測り直す
+                    // - `TAKO_858_INJECT=header` … 窓の中でヘッダのビューだけを汚す
+                    //   （**毎回** = #803 が壊れた状況）。窓は汚れていないので判定へ進み、
+                    //   やり直しに隠されず FAILED になる
+                    let guard_off = std::env::var_os("TAKO_858_NO_WINDOW_GUARD").is_some();
+                    let inject = std::env::var("TAKO_858_INJECT").unwrap_or_default();
+                    let mut judged: Option<(u64, u64)> = None;
+                    let mut notes: Vec<String> = Vec::new();
+                    for attempt in 1..=5u32 {
+                        let prepared = window803
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                if guard_off {
+                                    return app.pane_bodies.contains_key(&target);
+                                }
+                                // ②: 出力起因の持ち越しを落とす（全体経路へ入らせない）
+                                app.term_pending_app = false;
+                                app.term_pending_panes.clear();
+                                // ③: 時計は「出力」ではない。いま進めた扱いにして窓の外へ
+                                app.last_header_clock_tick = std::time::Instant::now();
+                                // 本体ビューが無いと `notify_pane_body` が全体へ落ちる
+                                app.notify_pane_body(target, cx);
+                                app.pane_bodies.contains_key(&target)
+                            })
+                            .unwrap_or(false);
+                        draw(cx);
+                        let (body0, head0) = counters(cx);
+                        let dirt0 = dirt(cx);
+                        let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
+                            app.last_term_notify =
+                                std::time::Instant::now() - std::time::Duration::from_secs(1);
+                            app.on_term_event(
+                                target,
+                                tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup),
+                                cx,
+                            );
+                        });
+                        // 汚れの注入は「2 秒 tick が挟まる位置」= 出力の直後・描画の直前
+                        if inject == "app" && attempt == 1 {
+                            let _ = window803.update(cx, |_: &mut TakoApp, _, cx| cx.notify());
+                        } else if inject == "header" {
+                            let _ = window803.update(cx, |app: &mut TakoApp, _, cx| {
+                                if let Some(view) = app.pane_headers.get(&target).cloned() {
+                                    view.update(cx, |_, cx| cx.notify());
+                                }
+                            });
+                        }
+                        draw(cx);
+                        let (body1, head1) = counters(cx);
+                        let dirt1 = dirt(cx);
+                        notes.push(format!(
+                            "attempt={attempt} body=+{} header=+{} chrome=+{} app_notify=+{} \
+                             fallback=+{} clock=+{} prepared={prepared}",
+                            body1 - body0,
+                            head1 - head0,
+                            dirt1.0 - dirt0.0,
+                            dirt1.1 - dirt0.1,
+                            dirt1.2 - dirt0.2,
+                            dirt1.3 - dirt0.3,
+                        ));
+                        // 窓が汚れていない = クロームも時計も全体 notify も動いていない。
+                        // このときだけヘッダの増分を製品の挙動として判定する
+                        if guard_off || (dirt1 == dirt0 && prepared) {
+                            judged = Some((body1 - body0, head1 - head0));
+                            break;
+                        }
+                        wait(cx, 150).await;
+                    }
+                    println!("TAKO_SELF_TEST_803_WINDOW: {}", notes.join(" | "));
+                    let Some((body_delta, head_delta)) = judged else {
+                        fail("110: 測る窓が最後まで汚れていて判定できない (#858)")
+                    };
                     let (body1, head1) = counters(cx);
                     // ② 実 dispatch（CLI / MCP が通る道）でタイトルを変える。
                     // ControlHost のメソッド自身は notify しない設計なので、IPC の
@@ -44931,16 +45044,17 @@ mod self_test {
                         .ok()
                         .flatten();
                     println!(
-                        "TAKO_SELF_TEST_803: output=(body +{} header +{}) \
+                        "TAKO_SELF_TEST_803: output=(body +{body_delta} header +{head_delta}) \
                          title=(body +{} header +{}) geom={geom:?}",
-                        body1 - body0,
-                        head1 - head0,
                         body2 - body1,
                         head2 - head1,
                     );
-                    check(body1 > body0, "110: 出力のあったペイン本体は描き直される (#803)");
                     check(
-                        head1 == head0,
+                        body_delta >= 1,
+                        "110: 出力のあったペイン本体は描き直される (#803)",
+                    );
+                    check(
+                        head_delta == 0,
                         "110: PTY 出力ではペインヘッダを描き直さない (#803)",
                     );
                     check(
