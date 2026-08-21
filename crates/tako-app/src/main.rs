@@ -35836,7 +35836,8 @@ mod self_test {
                 "echo '⏺ Fable 5 + max'; echo 'ターミナルUI'",
                 true,
             );
-            let mut issue64 = (false, false, false);
+            // (repro, nowrap, ASCII グループ化, フォント寸法に依る隔離)
+            let mut issue64 = (false, false, false, false);
             // #64 の根因（グリッド幅ちょうどでの折り返し）は macOS の shaper で実測したもの。
             // 他の環境でも同じ前提が成り立つとは限らないので、そこでは診断だけ出す
             let repro_required = cfg!(target_os = "macos");
@@ -35922,18 +35923,19 @@ mod self_test {
                         Some((
                             repro,
                             nowrap,
-                            mark_solo && ascii_grouped && ta_solo && ui_grouped && snap_judge,
+                            // 構造の検証（#39 の要素数削減）: ASCII の連続は 1 チャンクに
+                            // まとまる。フォント寸法に依らない
+                            ascii_grouped && ui_grouped,
+                            // フォント寸法に依る検証: セル幅と合わないグリフ（⏺）と
+                            // 全角は個別チャンクへ隔離される。どのグリフがセル幅と
+                            // 合うかは**入っているフォント次第**
+                            mark_solo && ta_solo && snap_judge,
                         ))
                     })
                     .ok()
                     .flatten()
-                    .unwrap_or((false, false, false));
-                if issue64.0 && issue64.1 && issue64.2 {
-                    break;
-                }
-                // 根因の再現（a）は shaper とフォント寸法に依存する。それ以外
-                // （b / c = 実装の構造検証）が揃ったら待たずに進む
-                if issue64.1 && issue64.2 && !repro_required {
+                    .unwrap_or((false, false, false, false));
+                if issue64.1 && issue64.2 && (!repro_required || (issue64.0 && issue64.3)) {
                     break;
                 }
             }
@@ -35954,7 +35956,16 @@ mod self_test {
                 );
             }
             check(issue64.1, "行 div の whitespace_nowrap（折り返しの構造的禁止）");
-            check(issue64.2, "セル幅不一致グリフの隔離 + ASCII グループ化維持");
+            check(issue64.2, "ASCII 連続のグループ化維持（#39 の要素数削減）");
+            if repro_required {
+                check(issue64.3, "セル幅不一致グリフと全角の個別チャンク隔離");
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 69b のグリフ隔離（どのグリフがセル幅と合うかは \
+                     入っているフォント次第: isolated={}）",
+                    issue64.3
+                );
+            }
 
             // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
             //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
