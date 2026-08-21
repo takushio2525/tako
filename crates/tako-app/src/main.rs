@@ -33233,10 +33233,10 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} open {} > /dev/null",
-                    preview_dir.join("note.md").display()
-                ),
+                &sh.discard_output(&format!(
+                    "{cli} open {}",
+                    sh.quote_arg(&preview_dir.join("note.md").display().to_string())
+                )),
                 true,
             );
             let mut cli_open_ok = false;
