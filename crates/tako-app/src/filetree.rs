@@ -304,11 +304,14 @@ pub fn scan_git_status(roots: &[PathBuf]) -> HashMap<PathBuf, GitChange> {
         if !visited_repos.insert(repo_root.clone()) {
             continue;
         }
-        let Ok(output) = std::process::Command::new(tako_core::git::git_bin())
-            .args(["status", "--porcelain", "-uall"])
-            .current_dir(&repo_root)
-            .output()
-        else {
+        // #586: ファイルツリーの git マークも定期的に走るため、Windows で
+        // コンソールウィンドウを出させない
+        let Ok(output) = tako_core::platform::process::no_console_window(
+            &mut std::process::Command::new(tako_core::git::git_bin()),
+        )
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(&repo_root)
+        .output() else {
             continue;
         };
         if !output.status.success() {

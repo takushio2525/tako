@@ -120,11 +120,13 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// PATH 走査で見つからなかったときの保険（サブプロセス）
 fn which_claude() -> Option<PathBuf> {
-    let which_out = std::process::Command::new("which")
-        .arg("claude")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    let which_out = tako_core::platform::process::no_console_window(
+        std::process::Command::new("which").arg("claude"),
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())?;
     let raw = String::from_utf8_lossy(&which_out.stdout)
         .trim()
         .to_string();
@@ -163,21 +165,21 @@ pub fn extract_version_from_path(path: &Path) -> String {
 }
 
 fn extract_version_via_cli(binary: &Path) -> String {
-    std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
-            // "claude v2.1.220" 形式
-            text.split_whitespace()
-                .find(|w| {
-                    w.starts_with('v') || w.chars().next().is_some_and(|c| c.is_ascii_digit())
-                })
-                .map(|w| w.trim_start_matches('v').to_string())
-        })
-        .unwrap_or_default()
+    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(
+        std::process::Command::new(binary).arg("--version"),
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .and_then(|o| {
+        let text = String::from_utf8_lossy(&o.stdout).to_string();
+        // "claude v2.1.220" 形式
+        text.split_whitespace()
+            .find(|w| w.starts_with('v') || w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .map(|w| w.trim_start_matches('v').to_string())
+    })
+    .unwrap_or_default()
 }
 
 /// 稼働中プロセスのバイナリパスを `proc_pidpath` で取得する（macOS のみ）

@@ -681,7 +681,8 @@ fn resolve_media_bin(name: &str, env_var: &str, known_paths: &[&str]) -> String 
             return bin.to_string_lossy().into_owned();
         }
     }
-    if std::process::Command::new(name)
+    // #586: GUI プロセスから走るのでコンソールウィンドウを出させない（以下 3 箇所）
+    if tako_core::platform::process::no_console_window(&mut std::process::Command::new(name))
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -721,17 +722,19 @@ fn resolve_media_bin(name: &str, env_var: &str, known_paths: &[&str]) -> String 
 
 /// ffprobe で動画のメタ情報を取得する。ffprobe が無ければすべて None
 fn video_probe(path: &Path) -> (Option<f64>, Option<(u32, u32)>, Option<String>) {
-    let output = std::process::Command::new(ffprobe_bin())
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .output();
+    let output = tako_core::platform::process::no_console_window(&mut std::process::Command::new(
+        ffprobe_bin(),
+    ))
+    .args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ])
+    .arg(path)
+    .output();
     let output = match output {
         Ok(o) if o.status.success() => o.stdout,
         _ => return (None, None, None),
@@ -771,21 +774,23 @@ fn video_thumbnail(path: &Path, duration: Option<f64>) -> Vec<u8> {
         Some(d) if d > 1.0 => format!("{:.1}", d * 0.1),
         _ => "0".to_string(),
     };
-    let output = std::process::Command::new(ffmpeg_bin())
-        .args(["-ss", &seek, "-i"])
-        .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "-vf",
-            "scale='min(800,iw)':'min(600,ih)':force_original_aspect_ratio=decrease",
-            "-",
-        ])
-        .output();
+    let output = tako_core::platform::process::no_console_window(&mut std::process::Command::new(
+        ffmpeg_bin(),
+    ))
+    .args(["-ss", &seek, "-i"])
+    .arg(path)
+    .args([
+        "-frames:v",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "-vf",
+        "scale='min(800,iw)':'min(600,ih)':force_original_aspect_ratio=decrease",
+        "-",
+    ])
+    .output();
     match output {
         Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
         _ => Vec::new(),

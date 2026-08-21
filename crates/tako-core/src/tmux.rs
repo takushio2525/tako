@@ -463,6 +463,9 @@ pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
 /// 親から C が継承されても効くよう除去する
 pub fn tmux_command(socket: Option<&str>) -> Command {
     let mut command = Command::new(tmux_bin());
+    // #586: ポーリングされるため、GUI プロセス（tako-app）から素で起動すると Windows が
+    // 毎回コンソールウィンドウを作り、明滅し続けてフォーカスまで奪う
+    crate::platform::process::no_console_window(&mut command);
     command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
     if let Some(name) = socket {
         command.args(["-L", name]);

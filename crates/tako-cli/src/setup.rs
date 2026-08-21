@@ -176,7 +176,12 @@ struct DetectedAgent {
 }
 
 fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new(path).args(args).output().ok()
+    // #586: `tako setup` は dispatch（GUI 内）からも呼ばれる。そちらは既に
+    // コンソールを持たないので、ここを素で起動すると子ごとにウィンドウが出る
+    tako_core::platform::process::no_console_window(&mut std::process::Command::new(path))
+        .args(args)
+        .output()
+        .ok()
 }
 
 fn detect_agents() -> Vec<DetectedAgent> {
@@ -623,9 +628,14 @@ fn run_fda_check(interactive: bool) {
 /// MCP 登録の健全性を確認。
 /// 返り値: (登録あり, 登録パスが生きている)
 fn check_claude_mcp_health(claude_path: &str) -> (bool, bool) {
-    let output = std::process::Command::new(claude_path)
-        .args(["mcp", "list"])
-        .output();
+    // #586: dispatch（GUI 内）から `tako setup` 経由でも走る。親がコンソールを
+    // 持たないと Windows は**子のために新しいコンソールを作る**ので、対話でない
+    // 子はすべて塞ぐ
+    let output = tako_core::platform::process::no_console_window(&mut std::process::Command::new(
+        claude_path,
+    ))
+    .args(["mcp", "list"])
+    .output();
     match output {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
@@ -2432,9 +2442,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
 fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
     let today = {
-        let output = std::process::Command::new("date")
-            .args(["+%Y-%m-%d"])
-            .output();
+        // #586: 対話でない子なのでコンソールウィンドウを出させない
+        let output = tako_core::platform::process::no_console_window(
+            &mut std::process::Command::new("date"),
+        )
+        .args(["+%Y-%m-%d"])
+        .output();
         match output {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => "unknown".into(),
@@ -2455,9 +2468,11 @@ fn find_backup_path(dir: &Path, filename: &str) -> PathBuf {
 }
 
 fn now_iso8601() -> String {
-    let output = std::process::Command::new("date")
-        .args(["+%Y-%m-%dT%H:%M:%S%z"])
-        .output();
+    // #586: 対話でない子なのでコンソールウィンドウを出させない
+    let output =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new("date"))
+            .args(["+%Y-%m-%dT%H:%M:%S%z"])
+            .output();
     match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();

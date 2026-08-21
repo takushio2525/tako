@@ -115,11 +115,14 @@ fn linked_repo() -> Result<PathBuf, String> {
 // --- git 実行 ---------------------------------------------------------------
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new(tako_core::git::git_bin())
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git の実行に失敗 ({}): {e}", args.join(" ")))?;
+    // #586: GUI プロセス（dispatch / MCP）から到達するのでコンソールウィンドウを出させない
+    let output = tako_core::platform::process::no_console_window(&mut std::process::Command::new(
+        tako_core::git::git_bin(),
+    ))
+    .current_dir(repo)
+    .args(args)
+    .output()
+    .map_err(|e| format!("git の実行に失敗 ({}): {e}", args.join(" ")))?;
     if !output.status.success() {
         return Err(format!(
             "git {} が失敗しました:\n{}",

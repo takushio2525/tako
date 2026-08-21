@@ -2332,6 +2332,8 @@ fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
     let mut command = std::process::Command::new(&shell);
+    // #586: GUI から数秒おきに呼ばれるのでコンソール窓を出さない
+    tako_core::platform::process::no_console_window(&mut command);
     // プロセス環境と、ログインシェルの rc（direnv 等）の両方に勝つ必要がある。
     // rc はコマンド文字列より先に走るので、決め手は先頭の unset / export の方（#512 と同型）
     let prefix = match target {

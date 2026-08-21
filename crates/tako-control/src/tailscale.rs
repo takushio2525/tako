@@ -41,7 +41,8 @@ pub fn find_tailscale() -> Option<String> {
 
 /// コマンドが実行可能か（`--version` が起動できるか）を確認する
 fn runnable(bin: &str) -> bool {
-    Command::new(bin)
+    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut Command::new(bin))
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -422,7 +423,8 @@ pub fn serve_stop_if_ours_unix(cli: &str, socket_path: &std::path::Path) -> Resu
 fn run_tailscale(cli: &str, args: &[&str]) -> Result<std::process::Output, String> {
     use std::io::Read;
 
-    let mut child = Command::new(cli)
+    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    let mut child = tako_core::platform::process::no_console_window(&mut Command::new(cli))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
