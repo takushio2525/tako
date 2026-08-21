@@ -311,6 +311,52 @@ impl ShellDialect {
         }
     }
 
+    /// 打ち込まれた行をそのまま画面へ返す前面プロセスの argv（POSIX の `cat` 相当）。
+    ///
+    /// セルフテストが「ペインへ文字列が届いたか」を見る道具。前面がシェルではないので
+    /// 届いた行は**実行されず**、それでも画面に出る（本物のエージェントを起動せずに
+    /// 送達だけを検証できる）。
+    ///
+    /// **Windows の `cat` は `Get-Content` のエイリアスで実体が無い**。tako の split は
+    /// argv をそのまま `CreateProcess` へ渡すので（`platform::shell::login_shell_command`
+    /// は Windows では包まない）ペインが即死し、送達の検証先が消えていた（#889）。
+    /// PowerShell では標準入力を 1 行ずつ読んで書き戻すループへ振り替える
+    pub fn echo_stdin_command(self) -> Vec<String> {
+        match self {
+            // 従来どおり 1 語（`login_shell_command` が `$SHELL -l -c cat` へ包む）
+            Self::Posix => vec!["cat".to_string()],
+            Self::PowerShell => self.shell_snippet_command(ECHO_STDIN_LOOP),
+        }
+    }
+
+    /// シェル統合（OSC 7 / 133）を**ユーザーのファイルに依存せず**読み込ませた
+    /// 対話シェルの argv。`None` = この方言は spawn 時の env 注入だけで統合が効くので
+    /// 既定シェルをそのまま起こせばよい（POSIX）。
+    ///
+    /// なぜ要るか（#889）: PowerShell の統合は `$PROFILE` へ書いたブロック経由なので、
+    /// `TAKO_ISOLATED=1` で data_dir を隔離するセルフテストからは配置が見えない
+    /// （`status()` が見る `<隔離 data_dir>/shell-integration/tako.ps1` と `$PROFILE` が
+    /// 指す本番のパスが別物になる）。**実機の `$PROFILE` の状態でテストの結果が変わる**
+    /// ので、統合を自分で読ませた対話シェルを起こして前提を閉じる。
+    ///
+    /// **`.` とスクリプトパスは別々の語で渡す**: `". 'path'"` の 1 語にすると
+    /// Windows PowerShell 5.1 が引用符を取りこぼしてドットソースごと落ちる
+    /// （実測。`tako-core/tests/shell_integration_powershell.rs` の注記と同じ形）
+    pub fn integration_shell_command(self, program: &str, script: &Path) -> Option<Vec<String>> {
+        match self {
+            Self::Posix => None,
+            Self::PowerShell => Some(vec![
+                program.to_string(),
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                ".".to_string(),
+                script.display().to_string(),
+            ]),
+        }
+    }
+
     /// 画面を 1 枚描いて保持する（検証用の疑似 TUI）。
     ///
     /// `body` は **Rust のエスケープ**（`\n` / `\u{1b}`）でそのまま書く。
@@ -512,6 +558,17 @@ impl ShellDialect {
         }
     }
 }
+
+/// 標準入力を 1 行ずつ読んで書き戻す PowerShell 片（`cat` 相当。#889）。
+///
+/// **引用符を 1 個も含めない**: この文字列は `-Command` の 1 語として届くまでに
+/// 複数の層（Rust の argv 組み立て → PowerShell の引数解釈）を通るので、引用符を
+/// 入れると層ごとに解釈が変わる（同じ理由で実行ペインは `-EncodedCommand` を使う。#875）。
+/// `[Console]::In.ReadLine()` を直に呼ぶのは PSReadLine の行編集を挟まないため
+/// （届いたバイトの見え方が素直になる）。`$null` で抜けるのは stdin が閉じたときに
+/// 例外ループへ落ちないようにする保険
+const ECHO_STDIN_LOOP: &str = "while ($true) { $line = [Console]::In.ReadLine(); \
+     if ($null -eq $line) { break }; [Console]::Out.WriteLine($line) }";
 
 /// PowerShell の単引用符クオート（中の `'` は `''`）
 fn ps_quote(word: &str) -> String {
@@ -862,6 +919,51 @@ mod tests {
              tako list; if ($null -ne $__tako0) { $env:TAKO_TOKEN=$__tako0 } \
              else { Remove-Item Env:TAKO_TOKEN -ErrorAction SilentlyContinue }"
         );
+    }
+
+    /// #889: `cat` は Windows に実体が無い（`Get-Content` のエイリアス）。
+    /// POSIX 側は**従来と 1 バイトも変えない**（macOS の項目 93 / 97 が同じものを測る）
+    #[test]
+    fn 打鍵をそのまま返すペインのargvは方言で変わる() {
+        assert_eq!(POSIX.echo_stdin_command(), vec!["cat".to_string()]);
+        let ps = PS.echo_stdin_command();
+        assert_eq!(ps[..3], ["powershell", "-NoProfile", "-Command"]);
+        let snippet = &ps[3];
+        // 標準入力を読んで書き戻す = `cat` と同じ役（届いた行が実行されない）
+        assert!(
+            snippet.contains("ReadLine"),
+            "stdin を読んでいない: {snippet}"
+        );
+        assert!(snippet.contains("WriteLine"), "書き戻していない: {snippet}");
+        // 引用符を混ぜない（`-Command` の 1 語として届くまでに複数の層を通る）
+        assert!(
+            !snippet.contains('"') && !snippet.contains('\''),
+            "引用符が混ざっている: {snippet}"
+        );
+        // Rust の行継続でつないでいるので、空白が潰れていないことも固定する
+        assert!(
+            !snippet.contains("  ") && !snippet.contains(");if"),
+            "行継続で空白が壊れている: {snippet}"
+        );
+    }
+
+    /// #889: PowerShell の統合は `$PROFILE` 経由なので、隔離した data_dir で走る
+    /// セルフテストからは配置が見えない。自分でドットソースして前提を閉じる
+    #[test]
+    fn 統合を読み込ませた対話シェルのargv() {
+        let script = Path::new("C:\\iso\\shell-integration\\tako.ps1");
+        // POSIX は env 注入（ZDOTDIR 等）で完結するので明示コマンドは要らない
+        assert_eq!(POSIX.integration_shell_command("/bin/zsh", script), None);
+        let ps = PS
+            .integration_shell_command("C:\\Program Files\\PowerShell\\7\\pwsh.exe", script)
+            .expect("PowerShell では明示コマンドが要る");
+        assert_eq!(ps[0], "C:\\Program Files\\PowerShell\\7\\pwsh.exe");
+        // ユーザーのファイルを読ませない + コマンド実行後も対話を続ける
+        assert!(ps.contains(&"-NoProfile".to_string()));
+        assert!(ps.contains(&"-NoExit".to_string()));
+        // `.` とパスは**別の語**（1 語にすると 5.1 が引用符を落として落ちる。実測）
+        assert_eq!(ps[ps.len() - 2], ".");
+        assert_eq!(ps[ps.len() - 1], script.display().to_string());
     }
 
     /// 実環境の既定シェルから方言が引けること（両プラットフォームの経路が動く証明）
