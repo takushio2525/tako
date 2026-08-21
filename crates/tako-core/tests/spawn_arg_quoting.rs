@@ -164,14 +164,18 @@ fn 器ありでも空白入りcwdのペインが生き残る() {
     );
     let mut pane = Pane::spawn(wrapped);
 
-    // 器が「そのセッションのペインがこの cwd で生きている」と答えるまで待つ
+    // 器が「そのセッションのペインがこの cwd で生きている」と答えるまで待ち、
+    // **そのあと生き続ける**ことまで見る。
+    //
+    // 最初に見えた 1 回で合格にしてはいけない（この網を作る過程で実測）:
+    // `-c` が割れて存在しないディレクトリになると psmux は**クライアントの cwd**へ
+    // 落ちるが、`TerminalSession::spawn` は `working_directory`（`CreateProcessW` の
+    // `lpCurrentDirectory`）にも同じ cwd を渡していて、そちらは引用の影響を受けない。
+    // 結果、壊れていても +600ms までは「正しい cwd のペインが居る」ように見え、
+    // 余った語が shell-command として失敗した +1200ms 頃に消える
     let want = space_dir.display().to_string();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut seen = String::new();
-    let mut alive = false;
-    while Instant::now() < deadline {
-        pane.pump(Duration::from_millis(300));
-        if let Ok(out) = container(bin, &socket)
+    let alive_now = |seen: &mut String| {
+        let Ok(out) = container(bin, &socket)
             .args([
                 "list-panes",
                 "-a",
@@ -179,17 +183,39 @@ fn 器ありでも空白入りcwdのペインが生き残る() {
                 "#{session_name} #{pane_dead} #{pane_current_path}",
             ])
             .output()
-        {
-            seen = String::from_utf8_lossy(&out.stdout).to_string();
-            // cwd に空白が入るので、書式は「セッション名 / 生死 / 残り全部が cwd」で切る
-            if seen.lines().any(|line| {
-                let mut it = line.trim_end().splitn(3, ' ');
-                matches!(
-                    (it.next(), it.next(), it.next()),
-                    (Some(name), Some("0"), Some(path)) if name == session && path == want
-                )
-            }) {
-                alive = true;
+        else {
+            return false;
+        };
+        *seen = String::from_utf8_lossy(&out.stdout).to_string();
+        // cwd に空白が入るので、書式は「セッション名 / 生死 / 残り全部が cwd」で切る
+        seen.lines().any(|line| {
+            let mut it = line.trim_end().splitn(3, ' ');
+            matches!(
+                (it.next(), it.next(), it.next()),
+                (Some(name), Some("0"), Some(path)) if name == session && path == want
+            )
+        })
+    };
+
+    let mut seen = String::new();
+    let appeared_by = Instant::now() + Duration::from_secs(30);
+    let mut appeared = false;
+    while Instant::now() < appeared_by {
+        pane.pump(Duration::from_millis(300));
+        if alive_now(&mut seen) {
+            appeared = true;
+            break;
+        }
+    }
+
+    // 生き残り確認。壊れているときは 1 秒強で消えるので、その 4 倍を見張る
+    let mut alive = appeared;
+    if appeared {
+        let watch_until = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < watch_until {
+            pane.pump(Duration::from_millis(400));
+            if !alive_now(&mut seen) {
+                alive = false;
                 break;
             }
         }
@@ -201,9 +227,10 @@ fn 器ありでも空白入りcwdのペインが生き残る() {
     let _ = container(bin, &socket).arg("kill-server").output();
     let _ = std::fs::remove_dir_all(&space_dir);
 
+    assert!(appeared, "空白入り cwd のペインが器の中に現れない\n期待 cwd: {want}\n器の応答: {seen}\n画面:\n{screen}");
     assert!(
         alive,
-        "空白入り cwd のペインが器の中で生きていない\n\
+        "空白入り cwd のペインが現れたあと消えた（#884 の症状そのもの）\n\
          期待 cwd: {want}\n器の応答: {seen}\n画面:\n{screen}"
     );
 }
