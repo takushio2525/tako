@@ -4969,10 +4969,8 @@ fn dispatch_sessions_resume(
         env: Vec::new(),
     };
     host.attach_session(new_id, options);
-    // シェル起動後に resume コマンドを注入する（attach は非同期のため遅延書き込み）
-    let mut cmd_bytes = resume_cmd.clone().into_bytes();
-    cmd_bytes.push(b'\r');
-    host.queue_write(new_id, cmd_bytes);
+    // シェル起動後に resume コマンドを注入する（送達確認つき。#640）
+    host.queue_command_flow(new_id, resume_cmd.clone());
 
     // タイトル・role をカタログのメタから復元する
     let title = match (&entry.project, &entry.label) {
@@ -6260,10 +6258,8 @@ fn dispatch_orchestrator_handoff(
         false
     });
 
-    // コマンド送信（queue_write で遅延書き込み）
-    let mut cmd_bytes = master_cmd.into_bytes();
-    cmd_bytes.push(b'\r');
-    host.queue_write(new_id, cmd_bytes);
+    // コマンド送信（送達確認つき。#640）
+    host.queue_command_flow(new_id, master_cmd);
 
     // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）。
     // #792: 新書式（2 節）なら節ごとの扱い、旧書式なら「番号は実態で確認 + 次回は書き直せ」が
@@ -6400,9 +6396,8 @@ fn dispatch_git_resolve_agent(
         );
     }
 
-    let mut cmd_bytes = agent_cmd.clone().into_bytes();
-    cmd_bytes.push(b'\r');
-    host.queue_write(new_id, cmd_bytes);
+    // 起動コマンドは送達確認つきで送る（#640）
+    host.queue_command_flow(new_id, agent_cmd.clone());
 
     // プロンプトは雛形から生成する（文面は conflict-resolver.md で差し替え可能）
     let template = orchestrator::conflict_resolver_template();
@@ -6639,10 +6634,10 @@ fn dispatch_orchestrator_spawn(
     }
 
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
-    // queue_write で遅延書き込みを登録し、セッション起動後に自動送信する
-    let mut cmd_bytes = worker_cmd.clone().into_bytes();
-    cmd_bytes.push(b'\r');
-    host.queue_write(new_id, cmd_bytes);
+    // かつ、起動した直後の PTY へ書いたバイトは器（psmux）に落とされる（#640 実測:
+    // PTY 起動から 0〜500ms の書き込みは全損、1500〜3000ms は途中欠落）。
+    // 「シェルの準備待ち → エコー確認 → 分離 Enter → 実行確認」を回す送達確認フローで送る
+    host.queue_command_flow(new_id, worker_cmd.clone());
 
     // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
     // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
@@ -9463,8 +9458,10 @@ mod tests {
         clipboard: Vec<String>,
         /// #749: 積まれたプロンプト送達フロー（後任 master への初期プロンプト検証用）
         prompt_flows: Vec<(PaneId, String)>,
-        /// #761: 積まれた遅延書き込み（= 後任 master の起動コマンド）の検証用
+        /// #761: 積まれた遅延書き込みの検証用（#640 以降、起動コマンドはここへ来ない）
         writes: Vec<(PaneId, String)>,
+        /// #640: 送達確認つきで積まれた起動コマンド（pane, 本文）
+        command_flows: Vec<(PaneId, String)>,
     }
 
     impl MockHost {
@@ -9507,6 +9504,7 @@ mod tests {
                 clipboard: Vec::new(),
                 prompt_flows: Vec::new(),
                 writes: Vec::new(),
+                command_flows: Vec::new(),
             }
         }
 
@@ -9550,6 +9548,9 @@ mod tests {
         fn queue_write(&mut self, pane: PaneId, data: Vec<u8>) {
             self.writes
                 .push((pane, String::from_utf8_lossy(&data).to_string()));
+        }
+        fn queue_command_flow(&mut self, pane: PaneId, command: String) {
+            self.command_flows.push((pane, command));
         }
         fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
             self.detached.push(pane.as_u64());
@@ -11955,6 +11956,85 @@ mod tests {
         }
     }
 
+    /// spawn の起動コマンドが「書きっぱなし」ではなく送達確認フローで送られること（#640）。
+    ///
+    /// 旧実装は `queue_write(pane, 本文 + \r)` を PTY 起動直後に積むだけで、器（psmux）が
+    /// 入力を読み始める前に書いたバイトが落ちても誰も気づけなかった（実機で 5/5 未達）。
+    /// **起動コマンドが queue_write に積まれていないこと**まで見て、経路の逆戻りを止める
+    #[test]
+    fn spawnの起動コマンドは送達確認フローで送られる() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let params = test_spawn_params("テスト", None);
+            let result = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params)
+                .expect("spawn は成功する");
+            let pane = result["pane_id"].as_u64().expect("pane_id が返る");
+            let cmd = result["command"]
+                .as_str()
+                .expect("command が返る")
+                .to_string();
+
+            assert_eq!(
+                host.command_flows
+                    .iter()
+                    .map(|(p, c)| (p.as_u64(), c.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(pane, cmd)],
+                "起動コマンドは送達確認つきフローへ登録される"
+            );
+            assert!(
+                host.writes.is_empty(),
+                "起動コマンドを書きっぱなしのキューへ積んではいけない（#640 の再発）: {:?}",
+                host.writes
+                    .iter()
+                    .map(|(p, d)| (p.as_u64(), d.len()))
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// 送達確認フローには**改行を含めない**（Enter は分離して送る）。
+    /// 本文と Enter を 1 回の書き込みにまとめると、届いた分だけが実行される
+    #[test]
+    fn spawnの送達確認フローには改行を含めない() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                test_spawn_params("テスト", None),
+            )
+            .expect("spawn は成功する");
+            let (_, cmd) = host.command_flows.first().expect("フローが 1 件登録される");
+            assert!(
+                !cmd.contains('\r') && !cmd.contains('\n'),
+                "本文に改行を混ぜない: {cmd:?}"
+            );
+        });
+    }
+
     /// 複数 master が存在するとき、caller_role の suffix で正しい master のタブに
     /// worker が配置されることを検証する（#109 の根本修正）
     #[test]
@@ -14162,9 +14242,13 @@ mod tests {
         p.save(name).expect("プロファイルの保存");
     }
 
-    /// 後任へ積まれた起動コマンド（queue_write の 1 本目）を取り出す
+    /// 後任へ積まれた起動コマンドを取り出す。
+    ///
+    /// #640 以降、起動コマンドは書きっぱなしの `queue_write` ではなく送達確認つきの
+    /// `queue_command_flow` を通る（器が起動直後の入力を落とすため）。本文に Enter は
+    /// 含まれない（分離して送る）ので、照合はコマンド本体だけを見る
     fn successor_launch_cmd(host: &MockHost, new_pane: u64) -> String {
-        host.writes
+        host.command_flows
             .iter()
             .find(|(p, _)| p.as_u64() == new_pane)
             .map(|(_, cmd)| cmd.clone())

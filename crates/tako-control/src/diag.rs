@@ -56,6 +56,26 @@ pub fn persist_log(msg: &str) {
     append_log(persist_log_path(), msg);
 }
 
+/// 送達経路の分岐を記録する（`TAKO_FLOW_DIAG=1` のときだけ。#640）。
+///
+/// 起動コマンドの送達は「シェル準備待ち → エコー確認 → 分離 Enter → 実行確認」を
+/// 段階的に進む。どの段階で足踏みしたかを残さないと「worker が起動しない」の切り分けが
+/// できない（器が入力を落としているのか、そもそも書けていないのか）。
+///
+/// **送信テキスト・画面内容は出さない**（AGENTS.md の絶対ルール）。出すのは段階と回数だけ
+pub fn flow_log(msg: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_FLOW_DIAG").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    });
+    if on {
+        perf_log(msg);
+    }
+}
+
 /// UI ストール・dispatch 遅延など性能異常の記録（Issue #113: 多ペイン時の無応答の
 /// 犯人特定用）。**しきい値超えのときだけ**呼ぶこと（正常時は何も書かない = 高頻度
 /// 呼び出し禁止は persist_log と同じ方針）。セルフテスト中はユーザーのログを汚さない

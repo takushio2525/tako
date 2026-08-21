@@ -35,6 +35,7 @@ pub mod scroll;
 pub mod scroll_mirror;
 pub mod shell;
 pub mod shell_integration;
+pub mod shell_send;
 pub mod sidebar;
 pub mod spawn_layout;
 pub mod ssh_config;
