@@ -47243,6 +47243,15 @@ mod self_test {
                         && m.contains("path")),
                     &format!("119: 不明な action を選択肢つきで拒否する (#868) err={bad:?}"),
                 );
+
+                // 「走ったこと」を観測可能にする（#796: 出るはずのものが出ないと
+                // 素通りしたのか通ったのか区別が付かない）
+                eprintln!(
+                    "TAKO_SELF_TEST_868: step={step:?} plan_lines={} dry_run_performed={:?} rejected={}",
+                    plan_lines.len(),
+                    dry.as_ref().and_then(|v| v["performed"].as_bool()),
+                    bad.is_some(),
+                );
             }
 
             // 118: in-window メニューバー (#657)。

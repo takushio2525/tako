@@ -346,6 +346,15 @@ pub fn install(opts: InstallOptions) -> Result<Value, String> {
             "install_plan": plan.to_json(),
         }));
     }
+    // セルフテストは開発者の実ホームで走る（`TAKO_ISOLATED=1` が隔離するのは tako の
+    // データディレクトリだけで HOME ではない）。dry_run の扱いが将来壊れたときに
+    // **実インストールが実ホームへ走る**ことがないよう、ここで構造的に止める。
+    // 過去にテストが実環境を壊した事故があるので、経路自体を塞いでおく
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return Err(
+            "セルフテスト中は実インストールを行いません（dry_run でのみ呼べます）".to_string(),
+        );
+    }
     if !plan.can_run {
         return Err(format!(
             "この環境では tako が自動インストールを代行できません。\n\
