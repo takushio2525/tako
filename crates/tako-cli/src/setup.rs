@@ -16,6 +16,7 @@ use tako_control::setup::{
     InstructionCoverage, ResolvedSetupValue, SetupAnswers, SetupChange, SetupPlan,
     SetupValueSource, CHANGES_YAML, INSTRUCTIONS_DEFAULT, RECOMMENDED_SECTIONS,
 };
+use tako_control::setup_bootstrap::{self, InstallOptions, Step};
 
 // --- バイナリ埋め込みリソース ---
 // 推奨ルールのセクションと既定指示ファイルは tako_control::setup が正
@@ -345,8 +346,6 @@ fn decode_base64url(input: &str) -> Option<Vec<u8>> {
 }
 
 // --- ゼロスタート導入（Issue #868）---
-
-use tako_control::setup_bootstrap::{self, InstallOptions, Step};
 
 /// `tako setup bootstrap`。MCP `tako_setup_bootstrap` と同じ dispatch 相当を
 /// ローカルで実行する（GUI 不要の処理なので IPC を経由しない）
