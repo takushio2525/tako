@@ -38114,14 +38114,25 @@ mod self_test {
                 //      検出力: `TAKO_872_NO_QUIT_GUARD=1` で回すとこの項目で
                 //      **プロセスが終了し、以降の項目が 1 つも走らない**
                 {
-                    let before = cx.update(|cx| {
-                        cx.try_global::<PrimaryApp>()
-                            .and_then(|g| g.0.upgrade())
-                            .map(|e| (e.entity_id(), e.read(cx).workspace.tabs().len()))
+                    // 生存 entity を **テスト側で掴んでおく**。掴まないと 0 枚のあいだに
+                    // 最後の強参照（ウィンドウの root view）が落ち、プラットフォームに
+                    // よっては entity ごと解放される（Windows で実測。macOS は残る）。
+                    // 解放されると `reopen_or_restore` は「保存レイアウトから新しい
+                    // TakoApp を作る」側へ落ち、以降の項目が**別のアプリ**を相手にする。
+                    // ここで見たいのは「0 枚でプロセスが死なないか」なので、
+                    // アプリの寿命はテストが固定して測る対象を 1 つに絞る
+                    let keep = cx.update(|cx| {
+                        cx.try_global::<PrimaryApp>().and_then(|g| g.0.upgrade())
                     });
-                    check(before.is_some(), "0 枚化の前に生存 entity を採取できる (#872)");
-                    // 開いている TakoApp ウィンドウを **should_close を通さず**
-                    // プログラム的に全部閉じる（= 内部都合の 0 枚。ユーザー操作ではない）
+                    check(keep.is_some(), "0 枚化の前に生存 entity を掴める (#872)");
+                    let before = keep
+                        .as_ref()
+                        .map(|e| cx.update(|cx| (e.entity_id(), e.read(cx).workspace.tabs().len())));
+                    // 開いている tako のウィンドウを **should_close を通さず**閉じる
+                    // （= 内部都合の 0 枚。ユーザー操作ではない）。後始末の順番は
+                    // production の `sync_viewports` と同じ「対応表を落としてから
+                    // remove_window」にする: 対応表に古い組が残っていると
+                    // `reopen_or_restore` が「もう開いている」と誤認して開き直さない
                     let takos: Vec<WindowHandle<TakoApp>> = cx.update(|cx| {
                         cx.windows()
                             .into_iter()
@@ -38129,7 +38140,13 @@ mod self_test {
                             .collect()
                     });
                     for h in takos {
-                        let _ = h.update(cx, |_, window, _| window.remove_window());
+                        let _ = h.update(cx, |app, window, _| {
+                            let handle = window.window_handle();
+                            if let Some(lid) = app.viewport_of(window) {
+                                app.drop_viewport(lid, handle);
+                            }
+                            window.remove_window();
+                        });
                     }
                     wait(cx, 800).await;
                     let (total, takos_left) = cx.update(|cx| {
@@ -38151,19 +38168,17 @@ mod self_test {
                     // 0 枚から開き直す（macOS の Dock 復帰と同じ 1 行。Windows でも同じ経路）
                     cx.update(reopen_or_restore);
                     wait(cx, 1200).await;
-                    let after = cx.update(|cx| {
-                        cx.try_global::<PrimaryApp>()
-                            .and_then(|g| g.0.upgrade())
-                            .map(|e| {
-                                (
-                                    cx.windows()
-                                        .iter()
-                                        .filter(|w| w.downcast::<TakoApp>().is_some())
-                                        .count(),
-                                    e.entity_id(),
-                                    e.read(cx).workspace.tabs().len(),
-                                )
-                            })
+                    let after = keep.as_ref().map(|e| {
+                        cx.update(|cx| {
+                            (
+                                cx.windows()
+                                    .iter()
+                                    .filter(|w| w.downcast::<TakoApp>().is_some())
+                                    .count(),
+                                e.entity_id(),
+                                e.read(cx).workspace.tabs().len(),
+                            )
+                        })
                     });
                     println!("TAKO_SELF_TEST_79B: 開き直し後 {after:?}");
                     check(
