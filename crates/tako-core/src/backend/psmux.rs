@@ -693,7 +693,12 @@ fn select_env_value(out: &str, name: &str) -> Option<String> {
 ///   `C:\Windows\System32\cmd.exe` は成功する
 /// - 従って **空白を含むプログラムパスは第 1 語として表現できない**。
 ///   その場合だけ `cmd.exe /c '<Windows 形式のコマンドライン>'` に包む
-///   （`cmd.exe /c '"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo …'` の形で実測成功）
+///
+/// **注意（2026-08-21 に測り直した結果。#881）**: この `cmd.exe /c` の包みは
+/// psmux 3.3.7 では**効かない**（器の中で即死する）。二重引用符版・`call` 版も同じ。
+/// 生きるのは「1 語で書ける形」だけ（`pwsh.exe …` / 8.3 短縮名 `C:\PROGRA~1\…`）。
+/// 実行ペイン（#875）は最初から 1 語で書ける形を渡して回避しているが、
+/// 空白入りのプログラムパスを明示指定する他の経路は #881 が直るまで動かない
 fn inner_command(command: &SpawnCommand) -> String {
     if bare_program_ok(&command.program) {
         let mut out = command.program.clone();

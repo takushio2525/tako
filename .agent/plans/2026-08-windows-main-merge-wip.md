@@ -1113,7 +1113,7 @@ dispatch 経由の 2 件は builder を直接呼べないので期待値を構�
 | 69c | `links.rs` のパス検出が POSIX 形前提（`std::path::MAIN_SEPARATOR == '/'` で判定） | #522 / #870 |
 | 71 | wry の WebView2 が `data:` URL で **abort**（`InvalidUri(Empty)` を COM コールバック内で unwrap） | #724 |
 | 77 / 79 / 80 | **2 枚目のウィンドウを作るとアプリが静かに終了する**（exit 0 / panic 無し） | #872 |
-| 91 の実行検査 | コマンド実行ペインが `/bin/sh` 決め打ちで **PTY が立たない** | #875 |
+| ~~91 の実行検査~~ | ~~コマンド実行ペインが `/bin/sh` 決め打ちで **PTY が立たない**~~ → **#875 で解消**（PR #879）。この行の SKIP は出なくなり、実行検査が緑で通る | #875 |
 
 #### 起票した製品バグ（すべて実機実測つき）
 
@@ -1122,8 +1122,8 @@ dispatch 経由の 2 件は builder を直接呼べないので期待値を構�
 - **#870**: `links.rs` のホーム解決が `HOME` 決め打ち（Windows は `USERPROFILE`）。
   ホーム解決が `terminal.rs` と 2 か所にあることが原因
 - **#872**: 2 枚目のウィンドウ生成でアプリが静かに終了する
-- **#875**: コマンド実行ペイン（#666 カード / #453 Code Runner）が `/bin/sh` 決め打ちで立たない。
-  **保全ブランチに `platform::shell::run_pane_command` として実装済みの設計がある**
+- **#875**: コマンド実行ペイン（#666 カード / #453 Code Runner）が `/bin/sh` 決め打ちで立たない
+  → **解消済み**（PR #879。下の「#875 の記録」節）
 - **#724 へ追記**: 症状②の正確な panic 位置（`wry/src/webview2/mod.rs:910`）とスタック
 
 #### テスト側で直した「macOS では見えなかった穴」
@@ -1216,6 +1216,56 @@ macOS: `test --workspace` 2377 passed / 0 failed / fmt / clippy（両 feature）
 3. **番犬テストは「相手が踏むかもしれない」ことを先に伝える**。#873 の番犬（方言 enum は
    1 つだけ）は #875 が新しい enum を作ると落ちるので、merge 前に共有した（結果、
    相手は `ShellDialect` をそのまま使っていたので無害だった）
+#### #875 の記録（実行ペインの起動コマンド。PR #879・2026-08-21）
+
+**症状**: #666 カードの「新規ペインで実行」/ #453 Code Runner の `tako run` /
+`tako run-interactive` / `tako show-command --run` が Windows で何も起きない。
+`dispatch::spawn_command_pane` が `/bin/sh -c` と POSIX の後置きを直書きしていた。
+
+**直し方**: 組み立てを境界 B1（`platform::shell::run_pane_command`）へ。POSIX 側は
+従来の直書きとバイト一致（テストでリテラル固定）、Windows 側は PowerShell へ
+`-EncodedCommand`（base64 / UTF-16LE）。方言判定は `ShellDialect::from_program` の
+使い回しで、**新しい enum は作っていない**（#873 の番犬に引っかからない）。
+`tako:shell` 宣言の包み方も同じ判定 1 本（`declared_shell_command`）。
+マーカーの正は `EXIT_MARKER_PREFIX` の 1 個にして組み立て側と `find_exit_marker` が共有する。
+
+**plan の見立てとの差 3 件**:
+
+1. **保全ブランチの `run_pane_command` をそのまま持ち込むと `WindowsShell` enum +
+   `resolve_windows_shell_kind` という「3 本目の方言判定」が生える**。#865 の
+   `ShellDialect` と #867 の `LaunchSyntax` を #873 が 1 本へ寄せている最中なので、
+   判定は `from_program` の使い回しにし、`cmd.exe` 分岐は作らなかった
+   （マーカー契約を cmd で満たすのは別物になるうえ、`powershell.exe` は System32 に必ず在る）
+2. **persist ON（器 = psmux）では 1 回目の修正でも PTY が即死した**。psmux は内側コマンドの
+   第 1 語の引用符を剥がさないので空白入りのプログラムパスを運べず、`inner_command` の
+   `cmd.exe /c '…'` 包みは**実測で効かない**（doc の「実測成功」は古い。**#881 に起票**）。
+   実行ペインは最初から 1 語で書ける形（`pwsh.exe`）を渡して回避した
+3. **自分の変更で決め打ちを作り込んだ（作法 11 の実例が 3 本目）**。`/bin/sh` を無条件に
+   期待するテストが dispatch に 3 本あり、macOS のゲートは全部緑のまま
+   **実機だけ 23 件失敗（ベースライン 22 + 1）**になった。境界の出力との突き合わせへ変え、
+   POSIX 固有の形は `#[cfg(unix)]` の中へ残す形にした
+
+**セルフテスト項目 91(d) の厳格化**: #865 が入れた「PTY が立たないときだけ実行検査を外す」
+緩和（`no_run_pty`）を撤去した。起動経路が壊れたら SKIP ではなく FAILED にする。
+
+##### 実機実測（`ssh win`。隔離 GUI を `schtasks /it` で session 1 へ）
+
+| 観点 | before（main b2634a1） | after（`aaed733`） |
+|---|---|---|
+| `tako run-interactive` | `error: PTY を起動できなかった` | pane 生成 → `TAKO875-RI-OK` + `__TAKO_EXIT=0` → status が exit_code 0 で auto_close |
+| `tako run`（`tako:run` 宣言） | 同上 | 出力 + マーカー（狭いペインだと出力行は画面外へ流れる。ペインを広げれば出る） |
+| `tako show-command --run` | 同上（カード作成だけ成功） | pane 生成 → 出力 + マーカー・15 秒後も生存 |
+| ペイン数 | 1 のまま | 1 → 2 |
+| persist ON（psmux） | 同じく PTY が立たない | 器つきで生存（`tmux_session` が付く） |
+| 終了コードの解決 | — | `cmd /c exit 7`→7 / cmdlet 失敗→1 / `exe 失敗; 成功`→0 / `成功; cmdlet 失敗`→1（direct / psmux とも一致） |
+| 引用符・日本語 | — | `echo "hello world 875"` / `echo 'single 875'` / `echo 日本語のテスト875` すべて素通り |
+| セルフテスト項目 91 | `ran=false new_pane=None has_pty=false` + `SKIPPED: 91(d)` | `ran=true waited=0.8s new_pane=Some(PaneId(47))`・**SKIP 行が消える** |
+| セルフテストの停止位置 | 項目 93（#694） | **同じ項目 93**（到達範囲は不変） |
+| SKIP 一覧 | 18 行 | 17 行。**差分は 91(d) の 1 行だけ**（Compare-Object で確認） |
+| `cargo test --workspace` | 22 件失敗 | **22 件失敗・集合が完全一致**（新規ゼロ・解消ゼロ） |
+
+macOS: fmt / clippy（`--features visual-test` 有無とも）/ `test --workspace` **2386 passed / 0 failed** /
+`check-windows.sh --all-targets` **エラー 0・警告リストが main と完全一致**。
 
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
