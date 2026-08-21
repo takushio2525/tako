@@ -468,8 +468,15 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     );
     let name = SessionRef::new(format!("tako-sk{}", std::process::id() % 100_000)).unwrap();
 
-    // 側路の書き先は製品と同じ組み立て（`osc_sink::prepare`）で作る
-    let data_dir = std::env::temp_dir().join(format!("tako-si-sink-data-{}", std::process::id()));
+    // 側路の書き先は製品と同じ組み立て（`osc_sink::prepare`）で作る。
+    //
+    // **ディレクトリ名にあえて空白を入れている**: 書き先は器へ
+    // `new-session -e TAKO_OSC_SINK=<path>` の**引数**として渡るので、
+    // 引数のエスケープが崩れていると 3 語へ割れて器へ届かない（#884 で
+    // `-c <空白入り cwd>` が同じ機序で即死した）。既定の data_dir は
+    // `%APPDATA%\tako` で空白を含まないが、**ユーザー名に空白がある Windows
+    // （`C:\Users\John Smith\...`）では本番構成そのものが該当する**
+    let data_dir = std::env::temp_dir().join(format!("tako si sink {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("データディレクトリを作れること");
     let sink = tako_core::osc_sink::prepare(&data_dir, 1).expect("側路を張れること");
