@@ -17,3 +17,8 @@ clap.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 serde = { workspace = true }
+
+# アイコン / バージョン情報リソースの埋め込み（#587。build.rs 参照）。
+# cfg(windows) を付けて macOS のビルドグラフに載せない
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

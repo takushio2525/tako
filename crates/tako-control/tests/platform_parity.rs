@@ -477,8 +477,9 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-core/src/platform/release_assets.rs",
-            1,
-            "シェル関数との一致を見るテスト内の `sh`（#594）",
+            3,
+            "テストモジュール内。シェル関数との一致を見る `sh`（#594）と、\
+             PowerShell 側の写しとの一致を見る `pwsh` / インストーラー検査（#587）",
         ),
         (
             "crates/tako-core/src/tmux.rs",

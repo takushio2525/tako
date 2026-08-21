@@ -8661,7 +8661,7 @@ impl TakoApp {
                         update_checker::UpdateState::Available(updates)
                     }
                     Ok(_) => update_checker::UpdateState::Done(crate::ui_text::update::up_to_date(
-                        update_checker::CURRENT_VERSION,
+                        update_checker::effective_current_version(),
                     )),
                     Err(e) => update_checker::UpdateState::CheckFailed(e.to_string()),
                 };

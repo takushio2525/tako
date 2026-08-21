@@ -32,8 +32,51 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// チェック失敗時のリトライ間隔（1 時間）
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// 現在のバージョン（Cargo.toml から埋め込み）
-pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// ビルド時に埋め込んだバージョン。build.rs が `CARGO_PKG_VERSION` に、
+/// リリースビルド時の `TAKO_WIN_NUM`（例: "3"）があれば `-win.3` を付与した文字列。
+///
+/// **これは「このバイナリをビルドしたときの版数」であって、更新判定や画面表示に使う
+/// 版数とは限らない**。それらには `effective_current_version()` を使うこと（#723）。
+/// ここを直接使ってよいのは HTTP の User-Agent だけ（「どのビルドが叩いたか」を知りたいため）
+pub const CURRENT_VERSION: &str = env!("TAKO_FULL_VERSION");
+
+/// 更新判定と画面表示に使う「いま入っている版数」。
+///
+/// インストーラーが記録した版数（`DisplayVersion`）を最優先する。理由は #723:
+/// すでに配布済みの `v0.5.13-win.1`〜`win.3` は `TAKO_WIN_NUM` 無しでビルドされており、
+/// ビルド埋め込みの版数が一律 `0.5.13` になる。それを基準にすると「最新は win.3」と
+/// 比べて永遠に「更新あり」になり、更新しても同じ版が入るだけの無限ループに陥る。
+/// インストーラーの記録は win.1 の時点から正確なので、遡ってこの穴を塞げる。
+///
+/// ポータブル zip・開発ビルド・macOS では記録が無いので `CURRENT_VERSION` に落ちる。
+///
+/// 結果はプロセス内で 1 度だけ解決してキャッシュする。ステータスバーや設定ウィンドウの
+/// 描画から呼ばれるので毎フレーム レジストリを引かせない（#212 / #168 で潰した
+/// 「UI スレッドでの同期 syscall」を再び持ち込まないため）。実体が入れ替わるときは
+/// 必ずプロセスも終わるので陳腐化しない。
+pub fn effective_current_version() -> &'static str {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        resolve_current_version(
+            tako_core::platform::install_info::installed_version().as_deref(),
+            CURRENT_VERSION,
+        )
+    })
+}
+
+/// `effective_current_version` の判定本体（純粋関数。テストから直接叩ける）。
+///
+/// インストーラーの記録が**パースできる版数のときだけ**採用する。読めない値
+/// （手で書き換えられた・別形式）に引きずられてビルド埋め込みの版数を捨てないため
+fn resolve_current_version(installed: Option<&str>, built_in: &str) -> String {
+    if let Some(raw) = installed {
+        let normalized = raw.trim().strip_prefix('v').unwrap_or(raw.trim());
+        if ParsedVersion::parse(normalized).is_some() {
+            return normalized.to_string();
+        }
+    }
+    built_in.to_string()
+}
 
 const OWNER_REPO: &str = "takushio2525/tako";
 
@@ -464,17 +507,25 @@ pub struct ParsedVersion {
     pub patch: u32,
     /// None = 安定版、Some(n) = テスト版 `-test.N`
     pub test_num: Option<u32>,
+    /// None = Windows 固有の反復ではない、Some(n) = `-win.N`（#723）。
+    ///
+    /// 同じ Cargo バージョンのまま Windows 向けプレビューを反復するための連番。
+    /// これを解析できないと `-win.N` タグのリリースが更新候補から丸ごと落ちるうえ、
+    /// インストーラーの記録（`DisplayVersion`）も「読めない値」として捨てられる
+    pub win_num: Option<u32>,
 }
 
 impl ParsedVersion {
     pub fn parse(s: &str) -> Option<Self> {
-        let (base, test_num) = if let Some((base, suffix)) = s.split_once("-test.") {
-            (base, Some(suffix.parse::<u32>().ok()?))
+        let (base, test_num, win_num) = if let Some((base, suffix)) = s.split_once("-test.") {
+            (base, Some(suffix.parse::<u32>().ok()?), None)
+        } else if let Some((base, suffix)) = s.split_once("-win.") {
+            (base, None, Some(suffix.parse::<u32>().ok()?))
         } else if s.contains('-') {
-            // `-test.N` 以外のプレリリースサフィックス（例: `-rc.1`）はテスト版扱い
+            // `-test.N` / `-win.N` 以外のプレリリースサフィックス（例: `-rc.1`）は解析しない
             return None;
         } else {
-            (s, None)
+            (s, None, None)
         };
         let parts: Vec<&str> = base.split('.').collect();
         if parts.len() != 3 {
@@ -485,6 +536,7 @@ impl ParsedVersion {
             minor: parts[1].parse().ok()?,
             patch: parts[2].parse().ok()?,
             test_num,
+            win_num,
         })
     }
 
@@ -501,6 +553,19 @@ impl ParsedVersion {
     fn base_tuple(&self) -> (u32, u32, u32) {
         (self.major, self.minor, self.patch)
     }
+
+    /// サフィックスの種別と番号を正規化した比較用タプル。
+    /// ランク: 安定版(2) > `-test.N`(1) > `-win.N`(0)。同ランク内は番号順。
+    ///
+    /// `-win.N` を最下位に置くのは semver の「プレリリースは正式版より古い」に沿わせるため。
+    /// Windows 上での新旧判定はこの順序では足りないので `is_newer_release` が補正する
+    fn suffix_rank(&self) -> (u8, u32) {
+        match (self.test_num, self.win_num) {
+            (None, None) => (2, 0),
+            (Some(n), _) => (1, n),
+            (_, Some(n)) => (0, n),
+        }
+    }
 }
 
 impl PartialOrd for ParsedVersion {
@@ -511,15 +576,42 @@ impl PartialOrd for ParsedVersion {
 
 impl Ord for ParsedVersion {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.base_tuple().cmp(&other.base_tuple()).then_with(|| {
-            match (self.test_num, other.test_num) {
-                // 同じベースなら: stable(None) > test(Some)
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(&b),
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-        })
+        // 同じベースなら stable > test > win。`-win.N` を持たない版同士の結果は
+        // suffix_rank 導入前（stable > test、test 同士は番号順）と完全に一致する
+        self.base_tuple()
+            .cmp(&other.base_tuple())
+            .then_with(|| self.suffix_rank().cmp(&other.suffix_rank()))
+    }
+}
+
+/// プラットフォームを考慮した「available は current より新しいか」判定（#723）。
+///
+/// semver の `Ord`（stable > prerelease）とは異なり、**Windows では `-win.N` を
+/// 同ベースの stable 以上として扱う**。理由: Windows バイナリの版数が
+/// `TAKO_WIN_NUM` 未指定でビルドされていると素の `X.Y.Z`（`win_num: None`）になり、
+/// semver 順では `-win.N` が「古い」と判定されて配布済みプレビューへ更新できない。
+///
+/// 逆に macOS は semver 準拠のままにする。`-win.N` は Windows 向けの配布物しか
+/// 持たないので macOS の更新候補には出てはいけない（アセット選択でも落ちるが、
+/// 版数比較の段でも落として二重に守る）
+fn is_newer_release(
+    available: &ParsedVersion,
+    current: &ParsedVersion,
+    platform: Platform,
+) -> bool {
+    match available.base_tuple().cmp(&current.base_tuple()) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match platform {
+            Platform::Windows => match (available.win_num, current.win_num) {
+                // win.N 同士は番号順
+                (Some(a), Some(c)) => a > c,
+                // 現在が素の X.Y.Z（TAKO_WIN_NUM 未指定ビルド）なら win.N は「新しい」
+                (Some(_), None) => true,
+                _ => available.suffix_rank() > current.suffix_rank(),
+            },
+            Platform::MacOs => available.suffix_rank() > current.suffix_rank(),
+        },
     }
 }
 
@@ -653,7 +745,7 @@ fn select_asset(
 
 /// /releases JSON 配列から ChannelUpdates をパースする（実行環境で判定）
 fn parse_releases(releases: &[serde_json::Value]) -> ChannelUpdates {
-    parse_releases_for(releases, TargetEnv::current(), CURRENT_VERSION)
+    parse_releases_for(releases, TargetEnv::current(), effective_current_version())
 }
 
 /// 実行環境と現在バージョンを明示して判定する純関数（#595 のテスト用の入口）。
@@ -702,7 +794,7 @@ fn parse_releases_for(
         }
 
         if let Some(ref cur) = current {
-            if ver <= *cur {
+            if !is_newer_release(&ver, cur, env.platform) {
                 continue;
             }
         }
@@ -907,14 +999,16 @@ pub fn restart_app() -> Result<(), String> {
 pub fn update_status_json() -> serde_json::Value {
     let method = detect_install_method_full();
     let duplicates = detect_duplicate_cli();
-    let current_channel = if CURRENT_VERSION.contains("-test.") {
+    let current = effective_current_version();
+    // `-win.N` は Windows の正規配布なので stable 扱い（#723）
+    let current_channel = if current.contains("-test.") {
         Channel::Test
     } else {
         Channel::Stable
     };
     let env = TargetEnv::current();
     let mut json = serde_json::json!({
-        "current_version": CURRENT_VERSION,
+        "current_version": current,
         "current_channel": current_channel.label(),
         "install_method": method.label(),
         "duplicate_cli": duplicates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
@@ -1035,6 +1129,13 @@ mod tests {
         assert!(json.get("current_channel").is_some());
         assert!(json.get("install_method").is_some());
         assert!(json.get("duplicate_cli").is_some());
+        // CLI / MCP が読む版数は「いま入っている版数」でなければならない（#723 / 開発不変条件 5）。
+        // ビルド埋め込みを出すと、インストーラー経由の `-win.N` で AI と画面が食い違う
+        assert_eq!(
+            json["current_version"].as_str(),
+            Some(effective_current_version()),
+            "status JSON の current_version が effective_current_version と一致しない"
+        );
     }
 
     // --- CheckError ---
@@ -1256,6 +1357,144 @@ mod tests {
         let arr = vec![release("nightly", false, &["tako-nightly-macos-arm64.zip"])];
         let result = parse_releases_for(&arr, MAC, "0.5.13");
         assert!(result.stable.is_none());
+    }
+
+    // --- #723: `-win.N`（Windows のプレビュー反復）の版数解決 ---
+    //
+    // Windows は Cargo バージョンを据え置いたまま `-win.1` `-win.2` … と配布を回す。
+    // 版数の出所が「ビルド埋め込み」だけだと配布済みの win.1〜3 が一律 X.Y.Z を名乗り、
+    // 「最新は win.3」と比べて永遠に更新ありになる（= 更新しても同じ版が入る無限ループ）。
+
+    #[test]
+    fn build_script_emits_full_version() {
+        // build.rs が TAKO_FULL_VERSION を emit していること。TAKO_WIN_NUM 無しのビルドでは
+        // CARGO_PKG_VERSION と一致し、付きのビルドでは `-win.N` が後ろに付く
+        assert!(
+            CURRENT_VERSION == env!("CARGO_PKG_VERSION")
+                || CURRENT_VERSION.starts_with(concat!(env!("CARGO_PKG_VERSION"), "-win.")),
+            "TAKO_FULL_VERSION が CARGO_PKG_VERSION から乖離している: {CURRENT_VERSION}"
+        );
+        // 更新判定に使う版数は必ず解析できること（できないと比較が全部スキップされる）
+        assert!(
+            ParsedVersion::parse(effective_current_version()).is_some(),
+            "effective_current_version が解析できない: {}",
+            effective_current_version()
+        );
+    }
+
+    #[test]
+    fn parsed_version_reads_win_suffix() {
+        let v = ParsedVersion::parse("0.5.13-win.3").expect("-win.N を解析できること");
+        assert_eq!((v.major, v.minor, v.patch), (0, 5, 13));
+        assert_eq!(v.win_num, Some(3));
+        assert_eq!(v.test_num, None);
+        // 数字でない / 空の連番は不正
+        assert!(ParsedVersion::parse("0.5.13-win.").is_none());
+        assert!(ParsedVersion::parse("0.5.13-win.x").is_none());
+        // `-win.N` 以外のプレリリースは従来どおり解析しない
+        assert!(ParsedVersion::parse("0.5.13-rc.1").is_none());
+    }
+
+    #[test]
+    fn win_suffix_does_not_change_ordering_of_existing_versions() {
+        // suffix_rank 導入で `-win.N` を持たない版同士の順序が変わっていないこと
+        assert!(is_newer("0.6.0", "0.5.13"));
+        assert!(is_newer("0.6.0", "0.6.0-test.1"));
+        assert!(is_newer("0.6.0-test.2", "0.6.0-test.1"));
+        assert!(!is_newer("0.6.0-test.1", "0.6.0"));
+        assert!(!is_newer("0.5.13", "0.6.0"));
+        // semver 準拠では `-win.N` は同ベースの stable より古い
+        assert!(is_newer("0.5.13", "0.5.13-win.3"));
+        assert!(!is_newer("0.5.13-win.3", "0.5.13"));
+    }
+
+    #[test]
+    fn resolve_current_version_prefers_installer_record() {
+        // インストーラーの記録が正（v 接頭辞は落とす）
+        assert_eq!(
+            resolve_current_version(Some("v0.5.13-win.3"), "0.5.13"),
+            "0.5.13-win.3"
+        );
+        assert_eq!(
+            resolve_current_version(Some("0.5.13-win.2"), "0.5.13"),
+            "0.5.13-win.2"
+        );
+        // 前後の空白は落とす（レジストリ値は空白詰めのことがある）
+        assert_eq!(
+            resolve_current_version(Some("  v0.6.0  "), "0.5.13"),
+            "0.6.0"
+        );
+    }
+
+    #[test]
+    fn resolve_current_version_falls_back() {
+        // 記録が無い（ポータブル zip / 開発ビルド / macOS）
+        assert_eq!(
+            resolve_current_version(None, "0.5.13-win.4"),
+            "0.5.13-win.4"
+        );
+        // 記録が読めない値ならビルド埋め込みを使う（手で書き換えられた等）
+        assert_eq!(resolve_current_version(Some("garbage"), "0.5.13"), "0.5.13");
+        assert_eq!(resolve_current_version(Some(""), "0.5.13"), "0.5.13");
+        assert_eq!(
+            resolve_current_version(Some("v0.6.0-rc.1"), "0.5.13"),
+            "0.5.13"
+        );
+    }
+
+    #[test]
+    fn installed_win3_sees_no_update_for_win3() {
+        // #723 の無限ループ回帰テスト: インストーラーが win.3 を記録していれば
+        // 最新が win.3 でも「更新あり」にしない
+        let arr = vec![release(
+            "v0.5.13-win.3",
+            false,
+            &["tako-v0.5.13-win.3-windows-x86_64.exe"],
+        )];
+        let current = resolve_current_version(Some("v0.5.13-win.3"), "0.5.13");
+        assert!(
+            parse_releases_for(&arr, WIN, &current).stable.is_none(),
+            "win.3 を入れているのに win.3 が更新として出た（無限ループ）"
+        );
+
+        // 記録が無いビルド埋め込みだけの場合は「更新あり」になる（既存 win.1〜3 の救済経路）。
+        // semver 順では win.3 < 0.5.13 だが、Windows ではここを新しい扱いにする
+        let fallback = resolve_current_version(None, "0.5.13");
+        assert_eq!(
+            parse_releases_for(&arr, WIN, &fallback)
+                .stable
+                .map(|i| i.version),
+            Some("0.5.13-win.3".into())
+        );
+
+        // win.2 を入れていれば win.3 は更新（連番順）
+        assert_eq!(
+            parse_releases_for(&arr, WIN, "0.5.13-win.2")
+                .stable
+                .map(|i| i.version),
+            Some("0.5.13-win.3".into())
+        );
+        // win.4 を入れていれば win.3 は更新ではない
+        assert!(parse_releases_for(&arr, WIN, "0.5.13-win.4")
+            .stable
+            .is_none());
+    }
+
+    #[test]
+    fn win_release_is_never_offered_on_macos() {
+        // `-win.N` は Windows 向けのアセットしか持たない。仮に macOS の zip が
+        // 付いていたとしても、版数比較の段で macOS には出さない（二重の防御）
+        let arr = vec![release(
+            "v0.5.13-win.3",
+            false,
+            &[
+                "tako-v0.5.13-win.3-windows-x86_64.exe",
+                "tako-v0.5.13-win.3-macos-arm64.zip",
+            ],
+        )];
+        let updates = parse_releases_for(&arr, MAC, "0.5.13");
+        assert!(updates.stable.is_none(), "macOS で -win.N は表示しない");
+        assert!(updates.test.is_none(), "macOS で -win.N は表示しない");
     }
 
     // --- #595: プラットフォームフィルタ ---
