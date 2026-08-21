@@ -57,9 +57,32 @@ pub fn declared_shell_command(shell: &str, command: &str) -> String {
     }
 }
 
+/// PTY の子へ argv を「1 語 = 1 引数」で届ける（#884）。
+///
+/// unix は `execvp` へ argv がそのまま渡るので**何もしない**。Windows には argv という
+/// 概念が無く、`CreateProcessW` へ渡すのは 1 本のコマンドライン文字列なので、
+/// alacritty が `program` と `args` を空白で連結する。その既定（`escape_args = false`）は
+/// **各語を素のまま**つなぐため、空白を含む語が子側の CRT パーサで複数語へ割れる。
+///
+/// 実害（psmux 3.3.7 / Windows 11 で実測）: [`crate::tmux_backend::wrap_options`] が積む
+/// `-c <cwd>` の cwd が `C:\Users\...\dir with space` のとき、器へは
+/// `-c C:\Users\...\dir` `with` `space` として届く。`new-session` は余った語を
+/// **shell-command** と解釈して実行するので `with: The term 'with' is not recognized`
+/// でペインが即死する。tako の器設定は `remain-on-exit` が off なので
+/// **画面には何も出ないまま**ペインごと消える。`-e KEY=<空白入りの値>` も同じ機序で壊れる。
+///
+/// 語ごとの引用を自前で組まずここで alacritty へ委ねるのは、CRT 規則
+/// （引用符の前の連続バックスラッシュを倍にする等）を二重実装しないため
+pub fn apply_arg_escaping(options: &mut alacritty_terminal::tty::Options) {
+    imp::apply_arg_escaping(options);
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
+
+    /// unix の `execvp` は argv をそのまま受け取るので、組み直す余地が無い
+    pub(crate) fn apply_arg_escaping(_options: &mut alacritty_terminal::tty::Options) {}
 
     /// unix では alacritty に `None` を渡さず**ここで明示解決する**。
     ///
@@ -108,6 +131,12 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+
+    /// 各語を CRT 規則でエスケープさせる（#884）。既定の `false` は素の連結なので、
+    /// 空白を含む語が子側で複数語へ割れる
+    pub(crate) fn apply_arg_escaping(options: &mut alacritty_terminal::tty::Options) {
+        options.escape_args = true;
+    }
 
     pub(crate) fn default_shell() -> Option<SpawnCommand> {
         Some(SpawnCommand {
@@ -534,6 +563,27 @@ mod tests {
         assert_eq!(
             declared_shell_command("PowerShell.EXE", "echo hi"),
             "PowerShell.EXE -Command 'echo hi'"
+        );
+    }
+
+    /// `TerminalSession::spawn` が argv の組み直しを境界へ委ねていること（番犬。#884）。
+    ///
+    /// `escape_args` は `#[cfg(target_os = "windows")]` なので **macOS からは
+    /// フィールドごと見えない** = 分岐の中身をユニットテストで踏めない。
+    /// せめて「境界を通っていること」だけは macOS の `cargo test` で固定しておく
+    /// （実挙動の網は Windows 専用の `tests/spawn_arg_quoting.rs`）
+    #[test]
+    fn spawnはargvの組み直しを境界へ委ねる() {
+        let src = include_str!("../terminal.rs");
+        let body = src
+            .split("let mut tty_options = tty::Options {")
+            .nth(1)
+            .expect("spawn の tty::Options 組み立て");
+        let body = &body[..body.find("tty::new(").expect("tty::new の呼び出し")];
+        assert!(
+            body.contains("apply_arg_escaping(&mut tty_options)"),
+            "tty::new へ渡す前に apply_arg_escaping を通していない\
+             （Windows で空白入りの語が割れてペインが即死する。#884）"
         );
     }
 }
