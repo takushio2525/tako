@@ -197,6 +197,24 @@ impl ShellDialect {
         }
     }
 
+    /// `<prefix><0..count-1>` を 1 行ずつ、行間に待ちを入れて出す。
+    /// 取り込み経路（PTY → 画面）を「少しずつ流れてくる出力」で試すのに使う
+    pub fn emit_numbered_lines(self, prefix: &str, count: u32, delay_ms: u32) -> String {
+        match self {
+            Self::Posix => format!(
+                "i=0; while [ $i -lt {count} ]; do printf '{prefix}%d\\n' $i; \
+                 sleep {}.{:03}; i=$((i+1)); done",
+                delay_ms / 1000,
+                delay_ms % 1000
+            ),
+            Self::PowerShell => format!(
+                "0..{} | ForEach-Object {{ Write-Output \"{prefix}$_\"; \
+                 Start-Sleep -Milliseconds {delay_ms} }}",
+                count.saturating_sub(1)
+            ),
+        }
+    }
+
     /// 連番を 1 行 1 個で出す
     pub fn seq(self, from: i64, to: i64) -> String {
         match self {
@@ -683,6 +701,18 @@ mod tests {
         assert_eq!(
             PS.shell_snippet_command("echo x"),
             vec!["powershell", "-NoProfile", "-Command", "echo x"]
+        );
+    }
+
+    #[test]
+    fn 連番行をゆっくり出す() {
+        assert_eq!(
+            POSIX.emit_numbered_lines("l", 150, 20),
+            "i=0; while [ $i -lt 150 ]; do printf 'l%d\\n' $i; sleep 0.020; i=$((i+1)); done"
+        );
+        assert_eq!(
+            PS.emit_numbered_lines("l", 150, 20),
+            "0..149 | ForEach-Object { Write-Output \"l$_\"; Start-Sleep -Milliseconds 20 }"
         );
     }
 

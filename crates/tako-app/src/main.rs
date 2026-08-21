@@ -37169,7 +37169,7 @@ mod self_test {
                         || reason == origin.marker_with_caller(caller_role.as_deref())
                 };
                 // 対象ペインを作り、ログ素材になる出力を残してから閉じる
-                let split_cmd = format!("{cli} split --right --focus >/dev/null");
+                let split_cmd = sh.discard_output(&format!("{cli} split --right --focus"));
                 type_text(any, cx, &split_cmd, true);
                 wait(cx, 1500).await;
                 type_text(any, cx, "echo TAKO-566-KBD", true);
@@ -37546,7 +37546,16 @@ mod self_test {
                                 // Ctrl-C で行を捨ててから送る。sleep で保持しないと、
                                 // コマンド終了後の zsh のプロンプト再描画でカーソルが戻る
                                 s.write(b"\x03".to_vec());
-                                s.write(b"printf '\\033[?25l'; sleep 20\r".to_vec());
+                                s.write(
+                                    format!(
+                                        "{}\r",
+                                        sh.sequence(&[
+                                            sh.emit_ansi("\u{1b}[?25l"),
+                                            sh.sleep(20),
+                                        ])
+                                    )
+                                    .into_bytes(),
+                                );
                                 true
                             }
                             None => false,
@@ -37619,7 +37628,7 @@ mod self_test {
                     } else if let Some(s) = app.terminals.get(&target) {
                         // sleep を止めてカーソルを戻す（後続項目へ状態を残さない）
                         s.write(b"\x03".to_vec());
-                        s.write(b"printf '\\033[?25h'\r".to_vec());
+                        s.write(format!("{}\r", sh.emit_ansi("\u{1b}[?25h")).into_bytes());
                     }
                 });
                 wait(cx, 300).await;
@@ -40598,7 +40607,18 @@ mod self_test {
                 // スターターの master 起動と同じ経路）。cat で alt screen に留まる
                 let _ = window.update(cx, |app, _, _| {
                     if let Some(session) = app.terminals.get(&direct_pane) {
-                        session.write(b"printf '\\033[?1049h'; cat\n".to_vec());
+                        // alt screen へ入って**留まる**のが目的（`cat` は POSIX 専用なので
+                        // 待ちで保持する）
+                        session.write(
+                            format!(
+                                "{}\n",
+                                sh.sequence(&[
+                                    sh.emit_ansi("\u{1b}[?1049h"),
+                                    sh.sleep(3600),
+                                ])
+                            )
+                            .into_bytes(),
+                        );
                     }
                 });
                 let mut e2 = false;
@@ -46374,14 +46394,12 @@ mod self_test {
                         // ただし対象ペインだけはコマンド付きで起動して出力を確定させる
                         for (id, mut options) in std::mem::take(&mut app.pending_attach) {
                             if id == pane {
+                                let argv = sh.shell_snippet_command(
+                                    &sh.emit_numbered_lines("l", 150, 20),
+                                );
                                 options.command = Some(tako_core::SpawnCommand {
-                                    program: "/bin/sh".into(),
-                                    args: vec![
-                                        "-c".into(),
-                                        "i=0; while [ $i -lt 150 ]; do printf 'l%d\\n' $i; \
-                                         sleep 0.02; i=$((i+1)); done"
-                                            .into(),
-                                    ],
+                                    program: argv[0].clone(),
+                                    args: argv[1..].to_vec(),
                                 });
                             }
                             let _ = app.spawn_session(id, options, cx);
