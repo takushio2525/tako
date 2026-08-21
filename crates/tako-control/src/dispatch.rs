@@ -12265,9 +12265,11 @@ mod tests {
             assert_eq!(result["agent"], "codex");
             let cmd = result["command"].as_str().unwrap();
             assert!(cmd.contains(" codex"), "codex を起動する: {cmd}");
-            assert!(cmd.contains("--model gpt-5.6-terra"), "{cmd}");
+            // クォートの有無はシェルの方言で変わる（#867）ので値だけを見る
+            assert!(cmd.contains("gpt-5.6-terra"), "{cmd}");
             assert!(
-                cmd.contains("model_reasoning_effort=medium"),
+                cmd.contains("model_reasoning_effort=medium")
+                    || cmd.contains("model_reasoning_effort='medium'"),
                 "effort は codex の config へ写像: {cmd}"
             );
             assert_eq!(

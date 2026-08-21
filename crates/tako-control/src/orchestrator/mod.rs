@@ -1799,13 +1799,26 @@ pub fn build_master_cmd_in(
 /// `agent::build_worker_cmd`。ここは claude 用の互換ラッパー）。
 /// model が None の場合は `--model` を付けず claude CLI の既定に委ねる
 pub fn build_worker_claude_cmd(role: &str, model: Option<&str>, effort: &str) -> String {
-    agent::build_worker_cmd(&agent::WorkerLaunch {
-        agent: WorkerAgent::Claude,
-        role,
-        model,
-        effort: Some(effort),
-        ..Default::default()
-    })
+    build_worker_claude_cmd_in(role, model, effort, crate::launch_cmd::launch_syntax())
+}
+
+/// 構文を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
+pub fn build_worker_claude_cmd_in(
+    role: &str,
+    model: Option<&str>,
+    effort: &str,
+    syntax: crate::launch_cmd::LaunchSyntax,
+) -> String {
+    agent::build_worker_cmd_in(
+        &agent::WorkerLaunch {
+            agent: WorkerAgent::Claude,
+            role,
+            model,
+            effort: Some(effort),
+            ..Default::default()
+        },
+        syntax,
+    )
 }
 
 /// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
@@ -3528,12 +3541,13 @@ prompt_blocks:
     fn worker_cmd_model_optional() {
         // #120 のエージェント抽象化でモデル名のクオートは安全文字のみなら省く形へ
         // 変わった（シェル解釈後は従来と等価）
-        let with = build_worker_claude_cmd("worker:demo", Some("claude-sonnet-5"), "high");
+        let with =
+            build_worker_claude_cmd_in("worker:demo", Some("claude-sonnet-5"), "high", POSIX);
         assert_eq!(
             with,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model claude-sonnet-5 --effort high"
         );
-        let without = build_worker_claude_cmd("worker:demo", None, "max");
+        let without = build_worker_claude_cmd_in("worker:demo", None, "max", POSIX);
         assert_eq!(
             without,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --effort max"
