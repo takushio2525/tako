@@ -796,6 +796,29 @@ fn viewport_close_failure_log(
 /// tako は内部都合で一時的に窓を 0 枚にする経路（`sync_viewports` の閉じ直し・
 /// セルフテストの `remove_window`）を持つので、0 枚になった瞬間は必ず 1 行残す
 /// （#865 の切り分けはこの行が無いために 3 反復溶けた）
+/// 論理ウィンドウ数の最後の観測値（#872 の診断専用）。
+///
+/// close 観測子（`on_window_closed`）は GPUI の `update_window` の内側から呼ばれるので、
+/// そこで `Entity<TakoApp>` を `read` すると **entity が lease 中だった場合に
+/// gpui の double-lease で panic する**（`remove_window` を TakoApp の update の
+/// 内側から呼ぶ経路が生まれた瞬間に落ちる）。**診断がアプリを落としてはいけない**ので、
+/// 値は entity に触らずに引ける場所へ置く。`usize::MAX` は「まだ観測していない」
+static LOGICAL_WINDOWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// 論理ウィンドウ数の観測値を更新する（`sync_viewports` から毎回呼ばれる）
+fn note_logical_windows(n: usize) {
+    LOGICAL_WINDOWS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 観測済みなら論理ウィンドウ数を返す
+fn observed_logical_windows() -> Option<usize> {
+    match LOGICAL_WINDOWS.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => None,
+        n => Some(n),
+    }
+}
+
 fn viewport_closed_log(
     window: gpui::WindowId,
     remaining: usize,
@@ -8664,6 +8687,7 @@ impl TakoApp {
             return true;
         }
         let policy = tako_core::platform::window_lifecycle::last_window_close_here();
+        note_logical_windows(self.workspace.windows().len());
         persist_diag(&format!(
             "最後のウィンドウの close: layout 保存 → {}",
             policy.reason()
@@ -8740,6 +8764,8 @@ impl TakoApp {
     fn sync_viewports(&mut self, origin: &'static str, cx: &mut Context<Self>) {
         let live: std::collections::HashSet<tako_core::WindowId> =
             self.workspace.windows().iter().map(|w| w.id()).collect();
+        // close 観測子（#872）が entity を read せずに枚数を書けるようにする
+        note_logical_windows(live.len());
         let dead: Vec<(tako_core::WindowId, AnyWindowHandle)> = self
             .viewports
             .iter()
@@ -20319,12 +20345,10 @@ fn main() {
         // 0 枚になった瞬間は必ず記録する（ガードの有無に関係なく常に出す =
         // 次に同じ経路を踏んだ人が黙って溶かさないための保険。#872 受け入れ条件 1）
         cx.on_window_closed(|cx, id| {
-            let primary = cx.try_global::<PrimaryApp>().and_then(|g| g.0.upgrade());
-            let logical = primary.map(|app| app.read(cx).workspace.windows().len());
             let line = viewport_closed_log(
                 id,
                 cx.windows().len(),
-                logical,
+                observed_logical_windows(),
                 tako_core::platform::window_lifecycle::last_window_close_here(),
             );
             // persist_diag はセルフテスト中は黙るので、そのときは stdout へ出す
@@ -49913,6 +49937,23 @@ mod session_kill_boundary_tests {
             text.contains("cx.on_window_closed("),
             "on_window_closed の診断が消えている。0 枚になった瞬間の記録が無いと             「静かに死んだ」の切り分けができない（#872）"
         );
+        // 診断がアプリを落としてはいけない: close 観測子は `update_window` の内側から
+        // 呼ばれるので、そこで entity を read すると lease 中に当たって panic する
+        let obs = text
+            .find("cx.on_window_closed(")
+            .expect("on_window_closed の登録が見つからない");
+        let body = &text[obs..];
+        let body = &body[..body
+            .find("\n        .detach();")
+            .expect("観測子の終端が無い")];
+        for forbidden in ["PrimaryApp", ".read(cx)", ".upgrade()", ".update("] {
+            assert!(
+                !body.contains(forbidden),
+                "close 観測子が {forbidden} を使っている。update_window の内側から呼ばれるので \
+                 entity に触ると gpui の double-lease で「診断がアプリを落とす」（#872）。\
+                 枚数は observed_logical_windows() から引くこと"
+            );
+        }
         assert!(
             text.contains("window_lifecycle::last_window_close_here()"),
             "最後のウィンドウの扱いが window_lifecycle 経由でなくなっている。             方針を UI ツールキットの既定に戻すと #872 が再発する"
