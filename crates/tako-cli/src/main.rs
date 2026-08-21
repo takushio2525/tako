@@ -2592,6 +2592,21 @@ enum MenuCommand {
 }
 
 fn main() -> ExitCode {
+    // Windows のメインスレッドは既定 1MB スタックで、コマンド定義（clap の巨大ツリー）の
+    // 構築だけで debug ビルドが溢れる（macOS / Linux は 8MB）。**main 由来の既存バグ**で、
+    // `origin/main` の `tako.exe list` も実機で `has overflowed its stack` で落ちる
+    // （スライス 3 の IPC 検証はユニットテストだったため踏まなかった）。
+    // 本体を十分なスタックのワーカースレッドで実行する（プラットフォーム共通・挙動不変）
+    std::thread::Builder::new()
+        .name("tako-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(cli_main)
+        .expect("メインスレッドを起動できない")
+        .join()
+        .expect("メインスレッドが異常終了した")
+}
+
+fn cli_main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
