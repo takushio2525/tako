@@ -1483,6 +1483,32 @@ t=+1200ms => (no panes)
 とくに tako は同じ情報（cwd）を器へ 2 経路で渡しているので、
 片方が壊れても一時的に正常に見える。
 
+##### 製品経路の実機 before/after（隔離 GUI + 実 CLI。persist ON = `backend: psmux`）
+
+同じ隔離インスタンス構成で main（`9136942`）ビルドとブランチビルドを差し替えて測った
+（別物であることは `Get-FileHash` で確認: `tako.exe` が `F532F95E…` / `9CFA65C4…`）。
+**判定は「応答が返ったか」ではなく「+6 秒後もペインが居るか」**。
+
+| 操作 | before | after |
+|---|---|---|
+| `tako tab new --cwd "…\prod dir with space"` | 応答は `{"tab":2,"pane":2,…}`・+1s に pane 2 → **+6s に消滅（DIED）** | **SURVIVED**・cwd が空白入りパスのまま |
+| `tako tab new --cwd "…\prodplain"`（対照） | SURVIVED | SURVIVED |
+| `tako run <空白入り dir のファイル>` | pane 4 生成 → **DIED** | **SURVIVED**・`__TAKO_EXIT=0`・cwd が空白入り |
+
+before が Issue の記述（「応答は返るがペインごと消える」「死ぬまでに画面へは何も出ない」）と
+一致している。`tako run` のペインに**プログラムの標準出力（`run-ok-884`）は出ない**が、
+これは**空白と無関係**（空白なしディレクトリで同じ `tako:run:` を走らせても `__TAKO_EXIT=0`
+だけが見える）= 実行ペインの描画の作りで、#884 の判定材料ではない。
+
+**GUI を session 1 へ投げるときの注意**: `TAKO_ISOLATED=1` は discovery dir を
+**pid 由来**（`%TEMP%\tako-iso-discovery-<pid>`）にするので、CLI 側でも
+`TAKO_ISOLATED=1` を立てると**別のディレクトリを見て接続できない**。CLI には
+GUI の pid から `TAKO_DISCOVERY_DIR` を明示的に渡す。
+また**隔離インスタンスは名前付きパイプの primary 名 `\\.\pipe\tako-<user>` を取る**ので、
+他の worker が GUI を立てていると相手を secondary（= 復元スキップ）へ落とす。
+session 1 は先着と直列に使うこと（今回 1 回踏んで #766 の worker に測り直してもらった）。
+
+
 ##### 実機実測（psmux 3.3.7 / Windows 11）
 
 | 観点 | before（`escape_args` 既定） | after |
