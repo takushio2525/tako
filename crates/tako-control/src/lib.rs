@@ -37,6 +37,7 @@ pub mod dispatch;
 pub mod fda;
 pub mod host;
 pub mod ipc;
+pub mod launch_cmd;
 pub mod layout;
 pub mod limit_stop;
 pub mod mcp;

@@ -122,29 +122,43 @@ impl Default for WorkerLaunch<'_> {
 /// claude の従来出力（`build_worker_claude_cmd`）と互換（skip_permissions /
 /// extra_args 未使用時は既存文字列と一致する）
 pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
+    build_worker_cmd_in(launch, crate::launch_cmd::launch_syntax())
+}
+
+/// 方言を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
+pub fn build_worker_cmd_in(
+    launch: &WorkerLaunch,
+    dialect: crate::launch_cmd::LaunchSyntax,
+) -> String {
+    use crate::launch_cmd as lc;
     // env 計画をコマンド先頭で注入する。ログインシェルが direnv で同変数を
-    // 設定していても、後から実行される export / unset が勝つ（Issue #500 / #512）
+    // 設定していても、後から実行される設定 / 解除が勝つ（Issue #500 / #512）。
+    // 構文はシェルの方言で変わる（#867: PowerShell に export / unset は無い）
     let mut cmd = String::new();
     for k in &launch.env.unsets {
-        cmd.push_str(&format!("unset {}; ", sh_quote(k)));
+        cmd.push_str(&lc::unset_prefix(dialect, k));
     }
     for (k, v) in &launch.env.exports {
-        cmd.push_str(&format!("export {}={}; ", sh_quote(k), sh_quote(v)));
+        cmd.push_str(&lc::export_prefix(dialect, k, v));
     }
-    cmd.push_str(&format!(
-        "TAKO_ORCHESTRATOR_ROLE={} {}",
-        sh_quote(launch.role),
-        launch.agent.as_str()
+    // role は「続くエージェントへ引き継ぐ」ための前置き。POSIX はインライン前置き、
+    // PowerShell は代入 + `;`（インライン前置きの構文が無い。#867 の主症状）
+    cmd.push_str(&lc::inline_env_prefix(
+        dialect,
+        "TAKO_ORCHESTRATOR_ROLE",
+        &lc::quote(dialect, launch.role),
     ));
+    cmd.push_str(launch.agent.as_str());
     if let Some(model) = launch.model {
-        cmd.push_str(&format!(" --model {}", sh_quote(model)));
+        cmd.push_str(&format!(" --model {}", lc::quote(dialect, model)));
     }
     if let Some(effort) = launch.effort {
         match launch.agent {
             WorkerAgent::Claude => cmd.push_str(&format!(" --effort {effort}")),
-            WorkerAgent::Codex => {
-                cmd.push_str(&format!(" -c model_reasoning_effort={}", sh_quote(effort)))
-            }
+            WorkerAgent::Codex => cmd.push_str(&format!(
+                " -c model_reasoning_effort={}",
+                lc::quote(dialect, effort)
+            )),
             // agy に effort 指定は無い（モデル名の "(High)" 等に組込み）
             WorkerAgent::Agy => {}
         }
@@ -159,7 +173,7 @@ pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
     }
     for arg in launch.extra_args {
         cmd.push(' ');
-        cmd.push_str(&sh_quote(arg));
+        cmd.push_str(&crate::launch_cmd::quote(dialect, arg));
     }
     cmd
 }
