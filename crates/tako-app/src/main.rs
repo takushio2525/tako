@@ -28960,6 +28960,18 @@ mod self_test {
             // （73 / 87 は必要な瞬間だけ自分で ON / OFF する）
             let _ = window.update(cx, |app, _, _| app.confirm_close = false);
 
+            // ペインへ打ち込むコマンドの方言（#865）。POSIX 構文を直書きすると
+            // PowerShell のペインでは**機能が正常でも必ず落ちる**（`$TERM` が
+            // 未定義の PowerShell 変数になる等）。打つ文字列は必ずここから組む。
+            // 判定できないシェル（cmd.exe / fish）では黙って POSIX を打たずに止める
+            let sh = match tako_core::platform::shell_dialect::for_default_shell() {
+                Some(dialect) => dialect,
+                None => fail(
+                    "ペインのシェル方言を判定できない（セルフテストが対応しないシェル）",
+                ),
+            };
+            println!("selftest shell dialect: {}", sh.label());
+
             // 0. 隔離の前提条件（#658）: セルフテストが本番の orchestrator 状態
             //    （workers.yaml / orchestrator/ の ledger・projects）へ書かないこと。
             //    項目 72 の spawn 4 件が本番レジストリに積まれ、9 日間 active のまま
@@ -28996,7 +29008,7 @@ mod self_test {
             // 1b. TERM / COLORTERM 注入（tmux 等の「missing or unsuitable terminal」回避）。
             //     高負荷環境（worker のビルド並走等）ではエコー反映が 800ms を超えることが
             //     あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
-            type_text(any, cx, "echo TERMCHK=$TERM,$COLORTERM", true);
+            type_text(any, cx, &sh.echo("TERMCHK=${TERM},${COLORTERM}"), true);
             let mut term_ok = false;
             for _ in 0..8 {
                 wait(cx, 800).await;
@@ -29008,30 +29020,45 @@ mod self_test {
             check(term_ok, "TERM / COLORTERM 注入");
 
             // 1c. 初期 cwd はホーム（.app 起動時に `/` へ落ちない）
-            type_text(any, cx, "[ \"$PWD\" = \"$HOME\" ] && echo CWDCHK-$((40+2))", true);
+            type_text(
+                any,
+                cx,
+                &sh.on_cwd_is_home_echo(&sh.marker("CWDCHK-", 40, 2)),
+                true,
+            );
             check(
                 wait_for_focused_text(window, cx, "CWDCHK-42", Duration::from_secs(15)).await,
                 "初期 cwd はホーム",
             );
 
             // 1d. tako 内で tmux がエラーなく起動できる（TERM 修正の実地確認。
-            //     専用ソケット -L で実環境の tmux サーバーに触れない。未インストール時は素通し）
-            type_text(
-                any,
-                cx,
-                "if command -v tmux >/dev/null; then tmux -L takoST kill-server 2>/dev/null; \
-                 tmux -L takoST new-session -d 'sleep 5' && tmux -L takoST kill-server 2>/dev/null \
-                 && echo TMUX-OK-42; else echo TMUX-OK-42; fi",
-                true,
-            );
-            check(
-                wait_for_focused_text(window, cx, "TMUX-OK-42", Duration::from_secs(20)).await,
-                "tako 内で tmux がエラーなく起動",
-            );
+            //     専用ソケット -L で実環境の tmux サーバーに触れない。未インストール時は素通し）。
+            //     tmux は POSIX シェル環境の道具で、Windows の器は psmux（#519）なので
+            //     方言が POSIX でないときは対象外（psmux 側の起動検査は
+            //     `tests/psmux_backend.rs` が実バイナリで見ている）
+            if sh.is_posix() {
+                type_text(
+                    any,
+                    cx,
+                    "if command -v tmux >/dev/null; then tmux -L takoST kill-server 2>/dev/null; \
+                     tmux -L takoST new-session -d 'sleep 5' && tmux -L takoST kill-server 2>/dev/null \
+                     && echo TMUX-OK-42; else echo TMUX-OK-42; fi",
+                    true,
+                );
+                check(
+                    wait_for_focused_text(window, cx, "TMUX-OK-42", Duration::from_secs(20)).await,
+                    "tako 内で tmux がエラーなく起動",
+                );
+            } else {
+                println!("TAKO_SELF_TEST_SKIPPED: 1d（tmux は POSIX シェル環境のみ。器は psmux）");
+            }
 
             // 1e. Backspace が \x7f を送り行編集で文字が消える（特殊キー→PTY バイト変換の往復確認）。
             //     "echo BSPxx" から 2 文字消して "OK" を足し "echo BSPOK" になる。
             //     もし空白等が送られると行が一致せず出力が変わる
+            // ここは**リテラルのまま**にする（`echo "BSPxx"` にすると Backspace 2 回で
+            // 消える文字が引用符側になり、行が `echo "BSPxOK` へ壊れる）。
+            // 裸の 1 語なので PowerShell でもそのまま通る（実測）
             type_text(any, cx, "echo BSPxx", false);
             press(any, cx, "backspace");
             press(any, cx, "backspace");
@@ -29238,7 +29265,12 @@ mod self_test {
             // 8. 色つき出力（ANSI 赤）が Theme の赤へ解決される。
             //    新タブ直後の初回コマンドは高負荷環境でシェル初期化が 1 秒を超えることが
             //    あるため、リトライループで待つ（フレーキー対策。項目 17 と同型）
-            type_text(any, cx, r"printf '\e[31mTAKO-RED\e[0m\n'", true);
+            type_text(
+                any,
+                cx,
+                &sh.emit_ansi_line("\u{1b}[31mTAKO-RED\u{1b}[0m"),
+                true,
+            );
             let mut red_ok = false;
             for _ in 0..8 {
                 wait(cx, 1000).await;
@@ -29267,7 +29299,7 @@ mod self_test {
             check(red_ok, "ANSI 赤の解決");
 
             // 9. スクロールバック表示
-            type_text(any, cx, "seq 1 200", true);
+            type_text(any, cx, &sh.seq(1, 200), true);
             wait(cx, 1200).await;
             let scroll_ok = window
                 .update(cx, |app, _, _| {
@@ -29354,15 +29386,20 @@ mod self_test {
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
+                // Windows では `tako.exe`。`EXE_SUFFIX` は std の定数なので cfg を書かない
                 let path = std::env::current_exe()
                     .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("tako")))
+                    .and_then(|p| {
+                        p.parent()
+                            .map(|d| d.join(format!("tako{}", std::env::consts::EXE_SUFFIX)))
+                    })
                     .filter(|p| p.exists());
                 let Some(path) = path else {
                     fail("tako CLI のビルド / パス特定");
                 };
                 check(built, "tako CLI のビルド");
-                let quoted = format!("\"{}\"", path.display());
+                // PowerShell は引用符付きパスを**式**として評価するので呼び出し演算子が要る
+                let quoted = sh.program(&path);
                 (path, quoted)
             };
 
@@ -29374,7 +29411,12 @@ mod self_test {
                 .unwrap_or_else(|_| fail("Phase 2 開始時の状態取得"));
 
             // 15. TAKO_PANE_ID / TAKO_TAB_ID の注入（FR-2.1.1）
-            type_text(any, cx, "echo P=$TAKO_PANE_ID,T=$TAKO_TAB_ID", true);
+            type_text(
+                any,
+                cx,
+                &sh.echo("P=${TAKO_PANE_ID},T=${TAKO_TAB_ID}"),
+                true,
+            );
             check(
                 wait_for_focused_text(
                     window,
@@ -29386,11 +29428,16 @@ mod self_test {
                 "TAKO_PANE_ID / TAKO_TAB_ID 注入",
             );
 
-            // 16. TAKO_SOCKET（ソケットファイル実在）と TAKO_TOKEN の注入
+            // 16. TAKO_SOCKET（受け口の実在）と TAKO_TOKEN の注入。
+            //     unix は domain socket、Windows は named pipe（`\\.\pipe\tako-…`）
             type_text(
                 any,
                 cx,
-                "test -S \"$TAKO_SOCKET\" && [ -n \"$TAKO_TOKEN\" ] && echo TAKO-SOCK-$((40+2))",
+                &sh.on_ipc_endpoint_ready_echo(
+                    "TAKO_SOCKET",
+                    "TAKO_TOKEN",
+                    &sh.marker("TAKO-SOCK-", 40, 2),
+                ),
                 true,
             );
             check(
@@ -29404,7 +29451,10 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!("{cli} list >/dev/null && echo TAKO-LIST-$((40+2))"),
+                &sh.on_success_echo(
+                    &sh.discard_output(&format!("{cli} list")),
+                    &sh.marker("TAKO-LIST-", 40, 2),
+                ),
                 true,
             );
             let mut list_ok = false;
@@ -29453,7 +29503,11 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!("{cli} send --pane {pane2} 'echo TAKO-SEND-$((40+2))'"),
+                &format!(
+                    "{cli} send --pane {pane2} {}",
+                    // 送り先ペインのシェルで評価される文字列。方言は同じ（同じ既定シェル）
+                    sh.quote_arg(&sh.echo(&sh.marker("TAKO-SEND-", 40, 2)))
+                ),
                 true,
             );
             let mut sent = false;
@@ -29477,8 +29531,10 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!(
-                    "{cli} read --pane {pane2} | grep -q TAKO-SEND-42 && echo TAKO-READ-$((40+2))"
+                &sh.on_output_contains_echo(
+                    &format!("{cli} read --pane {pane2}"),
+                    "TAKO-SEND-42",
+                    &sh.marker("TAKO-READ-", 40, 2),
                 ),
                 true,
             );
@@ -29649,7 +29705,7 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                "[ -n \"$TAKO_MCP_URL\" ] && echo TAKO-MCPENV-$((40+2))",
+                &sh.on_env_set_echo("TAKO_MCP_URL", &sh.marker("TAKO-MCPENV-", 40, 2)),
                 true,
             );
             check(
@@ -30175,13 +30231,21 @@ mod self_test {
 
             // 40b. split→close を 10 周しても落ちず fd が漏れない（PTY 起動は fd を食うため、
             //      リークすると日常使用で fd 枯渇 → spawn 失敗に至る）
+            // fd の数え方は /dev/fd 依存（unix のみ）。読めない環境では
+            // 「漏れていない」と誤って緑にしないよう、後段で SKIP を明示する
+            let fd_countable = std::fs::read_dir("/dev/fd").is_ok();
             let fd_before = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+            let stress_body = sh.on_success(
+                &sh.assign_output("p", &format!("{cli} split --right")),
+                &format!("{cli} close --pane {}", sh.var("p")),
+            );
             type_text(
                 any,
                 cx,
-                &format!(
-                    "for i in $(seq 1 10); do p=$({cli} split --right) && {cli} close --pane $p; done; echo TAKO-STRESS-$((40+2))"
-                ),
+                &sh.sequence(&[
+                    sh.repeat(10, &stress_body),
+                    sh.echo(&sh.marker("TAKO-STRESS-", 40, 2)),
+                ]),
                 true,
             );
             check(
@@ -30198,135 +30262,164 @@ mod self_test {
             // close 後の PTY / プロセス破棄は非同期のため、高負荷環境では回収が
             // 遅延する。fd 数が落ち着くまでリトライして待つ（真のリークなら待っても
             // 減らないので検査の意味は変わらない）
-            let mut fd_ok = false;
-            let mut fd_after = 0;
-            for _ in 0..10 {
-                fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
-                if fd_after <= fd_before + 8 {
-                    fd_ok = true;
-                    break;
+            if fd_countable {
+                let mut fd_ok = false;
+                let mut fd_after = 0;
+                for _ in 0..10 {
+                    fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+                    if fd_after <= fd_before + 8 {
+                        fd_ok = true;
+                        break;
+                    }
+                    wait(cx, 800).await;
                 }
-                wait(cx, 800).await;
+                check(
+                    fd_ok,
+                    &format!("split/close で fd が漏れない（before={fd_before}, after={fd_after}）"),
+                );
+            } else {
+                println!("TAKO_SELF_TEST_SKIPPED: 40b の fd 検査（/dev/fd が無い環境）");
             }
-            check(
-                fd_ok,
-                &format!("split/close で fd が漏れない（before={fd_before}, after={fd_after}）"),
-            );
 
             // 片付け（最後の 1 ペイン close = タブごと閉じる経路も通す）
             type_text(any, cx, &format!("{cli} close"), true);
             wait(cx, 1000).await;
 
-            // 41. シェル統合（zsh 自動注入）→ OSC 7 / 133 タップ → cwd / state が反映され
-            //     list で公開される（FR-2.4.1 + FR-2.1.4 の e2e。実コマンドで検証する）
-            press(any, cx, "ctrl-u");
-            type_text(any, cx, "cd /private/tmp", true);
-            wait(cx, 1000).await;
-            let osc_cwd_ok = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .and_then(|s| s.cwd())
-                        .map(|p| p == std::path::Path::new("/private/tmp"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
-            // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
-            // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
-            type_text(any, cx, "sleep 5", true);
-            let mut osc_running = false;
-            for _ in 0..12 {
-                wait(cx, 300).await;
-                osc_running = window
+            // 41 / 41b の cwd 検証先。POSIX は従来どおり /private/tmp（macOS の /tmp の実体）、
+            // それ以外は OS の一時ディレクトリ（末尾の区切りは OSC 7 の値と揃えるため落とす）
+            let osc_dir = if sh.is_posix() {
+                "/private/tmp".to_string()
+            } else {
+                std::env::temp_dir()
+                    .display()
+                    .to_string()
+                    .trim_end_matches(['\\', '/'])
+                    .to_string()
+            };
+            let osc_expected = std::path::PathBuf::from(&osc_dir);
+            // 41 / 41b は「シェルが出した OSC が**外側の tako まで届く**」ことが前提。
+            // 器が素通ししない（psmux。#525 の実測）/ 配置が済んでいない環境では
+            // 機能が正しくても届かないので、能力を見て対象外にする
+            let shell_integration = tako_core::shell_integration::status();
+            if shell_integration.effective() {
+                // 41. シェル統合（zsh 自動注入）→ OSC 7 / 133 タップ → cwd / state が反映され
+                //     list で公開される（FR-2.4.1 + FR-2.1.4 の e2e。実コマンドで検証する）
+                press(any, cx, "ctrl-u");
+                type_text(any, cx, &sh.cd(&osc_dir), true);
+                wait(cx, 1000).await;
+                let osc_cwd_ok = window
                     .update(cx, |app, _, _| {
                         app.terminals
                             .get(&app.focused_pane())
-                            .map(|s| s.command_state() == CommandState::Running)
-                            == Some(true)
+                            .and_then(|s| s.cwd())
+                            .map(|p| p == osc_expected.as_path())
+                            .unwrap_or(false)
                     })
                     .unwrap_or(false);
-                if osc_running {
-                    break;
-                }
-            }
-            check(osc_running, "実行中コマンドが running");
-            // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ
-            for _ in 0..10 {
-                wait(cx, 800).await;
-                let done = window
-                    .update(cx, |app, _, _| {
-                        app.terminals
-                            .get(&app.focused_pane())
-                            .map(|s| s.command_state() != CommandState::Running)
-                            == Some(true)
-                    })
-                    .unwrap_or(false);
-                if done {
-                    break;
-                }
-            }
-            type_text(any, cx, "false", true);
-            let mut osc_failed = false;
-            for _ in 0..8 {
-                wait(cx, 800).await;
-                osc_failed = window
-                    .update(cx, |app, _, _| {
-                        app.terminals
-                            .get(&app.focused_pane())
-                            .map(|s| s.command_state() == CommandState::Failed(1))
-                            == Some(true)
-                    })
-                    .unwrap_or(false);
-                if osc_failed {
-                    break;
-                }
-            }
-            check(osc_failed, "失敗コマンドで failed（プロンプト後も保持）");
-            // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
-            let list_exposes = window
-                .update(cx, |app, _, _| {
-                    let focused = app.focused_pane().as_u64();
-                    let value = tako_control::dispatch(
-                        app,
-                        tako_control::protocol::Request::List,
-                        PaneOrigin::Cli,
-                    )
-                    .expect("list は常に成功する");
-                    value["tabs"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|t| t["panes"].as_array().into_iter().flatten())
-                        .any(|p| {
-                            p["id"].as_u64() == Some(focused)
-                                && p["state"].as_str() == Some("failed")
-                                && p["exit_code"].as_i64() == Some(1)
-                                && p["cwd"].as_str() == Some("/private/tmp")
+                check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
+                // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
+                // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
+                type_text(any, cx, &sh.sleep(5), true);
+                let mut osc_running = false;
+                for _ in 0..12 {
+                    wait(cx, 300).await;
+                    osc_running = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .map(|s| s.command_state() == CommandState::Running)
+                                == Some(true)
                         })
-                })
-                .unwrap_or(false);
-            check(list_exposes, "list が state / exit_code / cwd を公開");
+                        .unwrap_or(false);
+                    if osc_running {
+                        break;
+                    }
+                }
+                check(osc_running, "実行中コマンドが running");
+                // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ
+                for _ in 0..10 {
+                    wait(cx, 800).await;
+                    let done = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .map(|s| s.command_state() != CommandState::Running)
+                                == Some(true)
+                        })
+                        .unwrap_or(false);
+                    if done {
+                        break;
+                    }
+                }
+                type_text(any, cx, &sh.exit_status(1), true);
+                let mut osc_failed = false;
+                for _ in 0..8 {
+                    wait(cx, 800).await;
+                    osc_failed = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .map(|s| s.command_state() == CommandState::Failed(1))
+                                == Some(true)
+                        })
+                        .unwrap_or(false);
+                    if osc_failed {
+                        break;
+                    }
+                }
+                check(osc_failed, "失敗コマンドで failed（プロンプト後も保持）");
+                // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
+                let list_exposes = window
+                    .update(cx, |app, _, _| {
+                        let focused = app.focused_pane().as_u64();
+                        let value = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::List,
+                            PaneOrigin::Cli,
+                        )
+                        .expect("list は常に成功する");
+                        value["tabs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|t| t["panes"].as_array().into_iter().flatten())
+                            .any(|p| {
+                                p["id"].as_u64() == Some(focused)
+                                    && p["state"].as_str() == Some("failed")
+                                    && p["exit_code"].as_i64() == Some(1)
+                                    && p["cwd"].as_str() == Some(osc_dir.as_str())
+                            })
+                    })
+                    .unwrap_or(false);
+                check(list_exposes, "list が state / exit_code / cwd を公開");
 
-            // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）。
-            //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）
-            type_text(any, cx, &format!("{cli} split --right --focus"), true);
-            wait(cx, 2000).await;
-            let inherited = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&app.focused_pane())
-                        .and_then(|s| s.cwd())
-                        .map(|p| p == std::path::Path::new("/private/tmp"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            check(inherited, "split が分割元の cwd を継承");
-            // 片付け: 新ペインを閉じ、状態を idle へ戻す
-            type_text(any, cx, &format!("{cli} close"), true);
-            wait(cx, 800).await;
-            type_text(any, cx, "true", true);
-            wait(cx, 500).await;
+                // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）。
+                //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）
+                type_text(any, cx, &format!("{cli} split --right --focus"), true);
+                wait(cx, 2000).await;
+                let inherited = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .and_then(|s| s.cwd())
+                            .map(|p| p == osc_expected.as_path())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                check(inherited, "split が分割元の cwd を継承");
+                // 片付け: 新ペインを閉じ、状態を idle へ戻す
+                type_text(any, cx, &format!("{cli} close"), true);
+                wait(cx, 800).await;
+                type_text(any, cx, &sh.exit_status(0), true);
+                wait(cx, 500).await;
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 41 / 41b（シェル統合がこの環境では効かない: \
+                     installed={} blocked_by_backend={:?}）",
+                    shell_integration.installed(),
+                    shell_integration.blocked_by_backend
+                );
+            }
 
             // 41c. 入力予測（FR-2.4.5 / Issue #600）: シェル統合が同梱の
             //      zsh-autosuggestions を tako 内の zsh にだけ読み込ませ、履歴からの
@@ -30907,9 +31000,12 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!(
-                    "env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID {cli} list >/dev/null \
-                     && echo TAKO-DISC-$((40+2))"
+                &sh.on_success_echo(
+                    &sh.without_env(
+                        &["TAKO_SOCKET", "TAKO_TOKEN", "TAKO_PANE_ID"],
+                        &sh.discard_output(&format!("{cli} list")),
+                    ),
+                    &sh.marker("TAKO-DISC-", 40, 2),
                 ),
                 true,
             );
@@ -30921,10 +31017,18 @@ mod self_test {
             type_text(
                 any,
                 cx,
-                &format!(
-                    "TAKO_SOCKET=/nonexistent.sock {cli} list >/dev/null \
-                     && TAKO_TOKEN=bogus-stale-token {cli} list >/dev/null \
-                     && echo TAKO-STALE-$((40+2))"
+                &sh.on_success(
+                    &sh.with_env(
+                        &[("TAKO_SOCKET", "/nonexistent.sock")],
+                        &sh.discard_output(&format!("{cli} list")),
+                    ),
+                    &sh.on_success_echo(
+                        &sh.with_env(
+                            &[("TAKO_TOKEN", "bogus-stale-token")],
+                            &sh.discard_output(&format!("{cli} list")),
+                        ),
+                        &sh.marker("TAKO-STALE-", 40, 2),
+                    ),
                 ),
                 true,
             );
@@ -30955,7 +31059,7 @@ mod self_test {
                     cx,
                 );
             };
-            type_text(any, cx, "seq 200", true);
+            type_text(any, cx, &sh.seq(1, 200), true);
             wait(cx, 1000).await;
             let scrolled_normal = window
                 .update(cx, |app, win, cx| {
@@ -30973,7 +31077,16 @@ mod self_test {
                 .unwrap_or(false);
             check(scrolled_normal, "通常画面のホイールでスクロールバック");
             // alternate screen 中は自前スクロールせず PTY へ転送される
-            type_text(any, cx, r"printf '\e[?1049h'; sleep 2; printf '\e[?1049l'", true);
+            type_text(
+                any,
+                cx,
+                &sh.sequence(&[
+                    sh.emit_ansi("\u{1b}[?1049h"),
+                    sh.sleep(2),
+                    sh.emit_ansi("\u{1b}[?1049l"),
+                ]),
+                true,
+            );
             wait(cx, 800).await;
             let forwarded_in_alt = window
                 .update(cx, |app, win, cx| {
