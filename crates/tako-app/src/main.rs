@@ -37465,12 +37465,28 @@ mod self_test {
                 }
                 // どちら側で落ちたかを残す（blur も refocus も draw 待ちなので、
                 // CPU 競合下では待ち時間切れと本物の壊れを取り違えやすい）
-                println!("TAKO_SELF_TEST_76_FOCUS: blurred={blurred} refocused={refocused}");
+                // 実機で「この直後に静かに終わる」（exit 0 / OK 無し）ことがあったので、
+                // ウィンドウとペインの数を必ず残す（#865 の切り分け用）
+                let after_76 = window
+                    .update(cx, |app, _, cx| {
+                        (
+                            cx.windows().len(),
+                            app.workspace.windows().len(),
+                            app.workspace.active_tab().tree().len(),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
+                println!(
+                    "TAKO_SELF_TEST_76_FOCUS: blurred={blurred} refocused={refocused} \
+                     gpui_windows={} logical_windows={} panes={}",
+                    after_76.0, after_76.1, after_76.2
+                );
                 check(
                     blurred && refocused,
                     "IME 経路: blur 後の focus 自己修復 (#332)",
                 );
             }
+            println!("TAKO_SELF_TEST_76_DONE");
 
             // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
             // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
@@ -37478,6 +37494,7 @@ mod self_test {
             let before_76b = window
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().len())
                 .unwrap_or(0);
+            println!("TAKO_SELF_TEST_76B: panes={before_76b}");
             let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
             wait(cx, 1200).await;
             // **分割できたことを確かめてから閉じる**。分割に失敗した状態で閉じると
