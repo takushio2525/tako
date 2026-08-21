@@ -2590,6 +2590,28 @@
 - 関連: PR #891（`Refs #766, #467`）。main `c28e470`
 - 次: **#889** が片付けば項目 93 以降（GUI モード / チャット / 設定画面 / limit-resume）が開く
 
+## 2026-08-22（#872: ウィンドウ 0 枚の無音終了を根治 — 寿命の方針を tako が持つ）
+- **Issue の前提が外れていた**: 2 枚目のウィンドウは元から作れていた（実機で
+  `gpui 枚数=2` / `registered=true pty=true drawn=true` / 可視 2 枚 / send + read も通る）。
+  死んでいたのは**項目 79（macOS 固有の Dock 復帰）が窓を 0 枚にした瞬間**で、旧コードが
+  77 / 79 / 80 を 1 つの `if cfg!(windows)` でまとめてスキップしていたため 77 の失敗に見えていた
+- 真因は GPUI の `QuitMode::Default` が **非 macOS で「最後の窓が閉じたらアプリ終了」**、
+  しかも `PostQuitMessage(0)` → `ExitProcess(0)` なので**診断が 1 行も残らない**。
+  境界 `platform::window_lifecycle` に方針を置き、`QuitMode::Explicit` +
+  `handle_window_close` の明示 quit へ。`on_window_closed` で 0 枚の瞬間を必ず記録
+  （観測子は `update_window` の内側から呼ばれるので **entity に触らない** = double-lease で
+  診断がアプリを落とすため。番犬つき）。「最後の 1 枚」判定は `cx.windows()` →
+  `self.viewports.len()`（設定画面を数えない）
+- **偽の緑も潰した**: `TAKO_APP_SELF_TEST_OK` は `on_app_quit` が無条件に出していたので、
+  途中で死んだ run が「OK + 終了コード 0」になっていた（実測）。ラッチで最終項目到達だけに絞った
+- 実機 before/after（同一バイナリ・`TAKO_872_NO_QUIT_GUARD=1`）: 停止位置が
+  **項目 79b の無音終了 → 項目 93（#694）= main と同じ**。macOS は
+  `TAKO_APP_SELF_TEST_OK` 完走・`test --workspace` 2423 passed / 0 failed・
+  クロスチェックの警告リストが main と完全一致。実機の失敗集合は main と一致（差分 1 件は
+  #766 の負荷依存フレーク → **#896** に起票）
+- 副産物: 項目 81 は #381 以降ずっと `setup_ok=false` で**素通り**していた（取り直しを前へ移した）
+- 関連コミット: PR #895（`Refs #872, #467`）
+
 ## 2026-08-22（#889: セルフテスト項目 93 の 2 原因を根治 — 到達範囲が 93 へ）
 - 原因はどちらもテスト側: ①`cat` の argv 直書き（Windows は実体が無くペイン即死。判定は
   「消えたペインでも既定 Terminal」で**通ってしまう**形だった）②素のシェルペインが実機の
