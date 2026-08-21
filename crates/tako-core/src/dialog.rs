@@ -572,6 +572,60 @@ Antigravity CLI requires permission to read, edit, and execute files here.
     }
 
     #[test]
+    fn takoが自分で描く合成入力欄をダイアログと誤判定しない() {
+        // セルフテスト / visual-test は `printf` で入力ボックスを合成して描く（#719 / #737）。
+        // これをダイアログと誤判定すると **tako の検査自体が送信ガードで止まる**ので、
+        // 実際に使っている 4 形をそのまま固定する
+        let rule = "─".repeat(20);
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            (
+                "visual-test の 2 行入力",
+                vec![
+                    String::new(),
+                    rule.clone(),
+                    "❯ テストの依頼を書きました".into(),
+                    "  2 行目もあります".into(),
+                    rule.clone(),
+                ],
+            ),
+            (
+                "#737 の案内文つき 1 行",
+                vec![
+                    rule.clone(),
+                    "❯\u{a0}Try \"how does <filepath> work?\"".into(),
+                    rule.clone(),
+                ],
+            ),
+            (
+                "#737 のキュー滞留ヒント",
+                vec![
+                    rule.clone(),
+                    "❯\u{a0}Press up to edit queued messages".into(),
+                    rule.clone(),
+                ],
+            ),
+            (
+                "4 行入力（兄弟 3 つ = 閾値超え。罫線で棄却されること）",
+                vec![
+                    rule.clone(),
+                    "❯ row0".into(),
+                    "  row1".into(),
+                    "  row2".into(),
+                    "  row3".into(),
+                    rule.clone(),
+                ],
+            ),
+        ];
+        for (name, lines) in &cases {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            assert!(
+                detect_choice_list(&refs).is_none(),
+                "{name} は入力欄（ダイアログではない）"
+            );
+        }
+    }
+
+    #[test]
     fn 番号は多桁も解釈する() {
         assert_eq!(numbered_choice("1. Yes"), Some((1, "Yes")));
         assert_eq!(numbered_choice("12. 十二番目"), Some((12, "十二番目")));
