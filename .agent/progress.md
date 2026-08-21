@@ -2530,3 +2530,20 @@
   macOS は fmt・clippy・test 2396 passed・クロスチェック警告が main と一致
 - 副産物 **#884**（空白入り cwd でペインが即死。psmux 単体では同 argv で生存 = 層が違う）
 
+
+## 2026-08-21（#884: PTY へ渡す argv を「1 語 = 1 引数」で届ける）
+- 原因は psmux ではなく **tako の argv → コマンドライン変換**。`TerminalSession::spawn` が
+  `tty::Options` を既定で組み alacritty の `escape_args` が false のままだったため、Windows の
+  `cmdline()` が `program` と `args` を素の空白で連結し、`-c <空白入り cwd>` が 3 語へ割れて
+  `new-session` が余った語を shell-command として実行 → `with: The term 'with' is not
+  recognized` でペイン即死（`remain-on-exit` off なので無音）。`-e KEY=<空白入り>` も同型
+- 対照実測で層を確定（psmux 単体へ 3 通りの引用で同じ引数を渡す）: 引用あり = 生存 /
+  素のまま = セッション消滅 / 素のままだが空白なし = 生存。境界
+  `platform::shell::apply_arg_escaping`（B1）で `escape_args = true`（unix は恒等）
+- **テストの検出力で 1 回踏んだ**: 「一度でも正しい cwd で見えたら合格」だと修正を戻しても
+  通る（cwd は `lpCurrentDirectory` にも渡っており +600ms までは正常に見え +1200ms で消える）。
+  出現後 4 秒の生存を見張る形へ直し、before で両テストが FAILED になることを実機で実測
+- 検証: macOS `test --workspace` 2406 passed / 0 failed・fmt・clippy（両 feature）・
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（SKIP 3 = 作法 7 の既知）・クロスチェック
+  エラー 0 で**警告リストが main と完全一致**
+- 関連コミット: PR #887（`Refs #884, #467`）

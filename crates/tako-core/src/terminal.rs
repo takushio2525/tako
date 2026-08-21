@@ -307,7 +307,7 @@ impl TerminalSession {
         // PTY へ渡す起動 cwd をセッションにも保持し、相対パス解決やファイルツリーが
         // TUI 起動直後から同じ基準ディレクトリを使えるようにする。
         let working_directory = options.cwd.or_else(default_home_dir);
-        let tty_options = tty::Options {
+        let mut tty_options = tty::Options {
             // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）
             shell: options
                 .command
@@ -319,6 +319,10 @@ impl TerminalSession {
             env,
             ..tty::Options::default()
         };
+        // argv を「1 語 = 1 引数」で子へ届ける（#884）。Windows は argv を 1 本の
+        // コマンドラインへ組み直す必要があり、既定は素の空白連結なので空白を含む語
+        // （`-c <空白入り cwd>` 等）が割れてペインが即死する。OS 差は境界の中だけが知る
+        crate::platform::shell::apply_arg_escaping(&mut tty_options);
         let mut pty = tty::new(&tty_options, window_size, 0).map_err(SessionError::Pty)?;
         // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
         let tty_name = slave_tty_name(&mut pty);
