@@ -440,9 +440,14 @@ fn print_install_plan(plan: &serde_json::Value) {
     }
 }
 
-/// [y/N] / [Y/n] の確認。非対話（`--yes` / 非 TTY）では質問せず既定を返す
+/// [y/N] / [Y/n] の確認。
+///
+/// 非対話（`--yes` / 非 TTY）では質問せず続行する。**ただし黙って進めない**:
+/// 何を省略したかを 1 行出す（計画自体は呼び出し側が直前に必ず表示している。
+/// 受け入れ条件 4「--yes 時は表示のみ」）
 fn confirm(prompt: &str, default_yes: bool, assume_yes: bool) -> bool {
     if assume_yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("  {prompt} → 非対話モードのため確認を省略して続行します");
         return true;
     }
     eprint!("  {prompt} [{}]: ", if default_yes { "Y/n" } else { "y/N" });
@@ -2100,6 +2105,23 @@ fn mark_setup_complete(
 pub fn run_check() -> Result<(), String> {
     eprintln!("tako セットアップ 環境チェック");
     eprintln!("─────────────────────────────");
+
+    // ゼロスタート導入の状況（#868）。未導入・PATH 未通し・未ログインのどれで
+    // 止まっているかを、実行はせずに先に出す
+    match setup_bootstrap::status() {
+        Ok(state) if state.step == Step::Ready => {
+            eprintln!("  [OK] エージェント CLI の導入: 完了（claude / PATH / ログイン）");
+        }
+        Ok(state) => {
+            eprintln!(
+                "  [不足] エージェント CLI の導入: {} ({})",
+                state.step.describe(),
+                state.step.as_str()
+            );
+            eprintln!("         tako setup を実行すると、ここから最後まで案内します");
+        }
+        Err(e) => eprintln!("  [警告] 導入状況を確認できません: {e}"),
+    }
 
     // エージェント CLI + 任意依存。--check では表示のみ。
     let (agents, _) = run_dependency_check(false);

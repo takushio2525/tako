@@ -1183,6 +1183,14 @@ pub const MATRIX: &[Feature] = &[
             issue: 517,
         },
     },
+    Feature {
+        key: "tako_setup",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_SETUP,
+            issue: 525,
+        },
+    },
     // #868。macOS は公式 native インストーラ（install.sh）で実行まで代行する。
     // Windows は install.sh 自身が非対応（MINGW*/MSYS*/CYGWIN* で exit 1）で、
     // 公式手順は PowerShell の install.ps1。状態照会と手順の提示までは動くが
@@ -1192,14 +1200,6 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Degraded {
             note: notes::WIN_SETUP_BOOTSTRAP,
-        },
-    },
-    Feature {
-        key: "tako_setup",
-        macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
         },
     },
     Feature {

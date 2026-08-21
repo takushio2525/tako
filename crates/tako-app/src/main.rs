@@ -47155,6 +47155,96 @@ mod self_test {
                 let _ = std::fs::remove_dir_all(&scratch);
             }
 
+            // 119: ゼロスタート導入 (#868)。**実 dispatch 経路**で状態照会と
+            // 計画提示を固定する。この項目は決して実インストールを行わない
+            // （`install` は必ず dry_run で呼ぶ）。CLI / MCP はこの dispatch を
+            // そのまま通るので、ここが緑なら 3 経路とも同じ答えを返す
+            {
+                let mut dispatch_bootstrap = |action: &str, dry_run: Option<bool>| {
+                    window
+                        .update(cx, |app, _, _cx| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::SetupBootstrap {
+                                    action: Some(action.into()),
+                                    dry_run,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+
+                // status: 読み取り専用。next_step は 4 値のいずれかで、
+                // install_plan は「何をどこに入れるか」を必ず持つ（受け入れ条件 4）
+                let status = dispatch_bootstrap("status", None);
+                let step = status
+                    .as_ref()
+                    .and_then(|v| v["next_step"].as_str())
+                    .map(String::from);
+                check(
+                    step.as_deref().is_some_and(|s| {
+                        matches!(s, "install" | "path" | "auth" | "ready")
+                    }),
+                    &format!("119: status が next_step を返す (#868) step={step:?}"),
+                );
+                let plan_lines: Vec<String> = status
+                    .as_ref()
+                    .and_then(|v| v["install_plan"]["lines"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|l| l.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let joined = plan_lines.join("\n");
+                check(
+                    joined.contains("claude.ai/install.sh")
+                        && joined.contains(".local/bin/claude")
+                        && joined.contains("sudo"),
+                    &format!(
+                        "119: install_plan が公式コマンド・置き場所・権限を含む (#868) lines={}",
+                        plan_lines.len()
+                    ),
+                );
+
+                // install の dry_run は**実行せず**計画だけ返す
+                let dry = dispatch_bootstrap("install", Some(true));
+                check(
+                    dry.as_ref().and_then(|v| v["performed"].as_bool()) == Some(false)
+                        && dry.as_ref().and_then(|v| v["reason"].as_str()) == Some("dry_run"),
+                    &format!(
+                        "119: install --dry-run は実行しない (#868) performed={:?}",
+                        dry.as_ref().and_then(|v| v["performed"].as_bool())
+                    ),
+                );
+
+                // 不明な action は選択肢つきで拒否される（黙って何かしない）
+                let bad = window
+                    .update(cx, |app, _, _cx| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::SetupBootstrap {
+                                action: Some("nope".into()),
+                                dry_run: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .err()
+                        .map(|e| e.to_string())
+                    })
+                    .ok()
+                    .flatten();
+                check(
+                    bad.as_deref().is_some_and(|m| m.contains("status")
+                        && m.contains("install")
+                        && m.contains("path")),
+                    &format!("119: 不明な action を選択肢つきで拒否する (#868) err={bad:?}"),
+                );
+            }
+
             // 118: in-window メニューバー (#657)。
             // 構成（危険項目の不在）・開閉・キー操作・項目の発火を GUI 経路で固定する。
             // メニューバー行を持たない macOS では open / close を検証できないので、
