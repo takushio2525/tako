@@ -31309,28 +31309,42 @@ mod self_test {
                 .unwrap_or(false);
             check(disambiguate_off, "kitty protocol pop で解除");
 
-            // 45b. Shift+Enter が GUI キー経路で CSI u（\e[13;2u）としてペインへ届く
-            //     （Issue #28 回帰防止: kitty 未要求でも ModifiedOnly が全ペイン既定。
-            //     tmux バックエンドは extended-keys always が csi-u のまま内側へ届け、
-            //     直接 spawn はそのまま届く。cat 実行中の cooked TTY は ECHOCTL で
-            //     ESC を ^[ とエコーするため、届いたバイト列が ^[[13;2u として見える）
-            type_text(any, cx, "cat", true);
-            wait(cx, 800).await;
-            press(any, cx, "shift-enter");
-            let mut shift_enter_csi_u = false;
-            for _ in 0..20 {
-                wait(cx, 200).await;
-                if focused_contains(window, cx, "[13;2u") {
-                    shift_enter_csi_u = true;
-                    break;
+            // 45b の検証方法は POSIX 専用: 届いたバイト列を画面で読むために
+            // 「cooked TTY が ESC を `^[` としてエコーする（ECHOCTL）」を使っている。
+            // PowerShell に `cat` の相当物（stdin をそのまま流す）は無く、
+            // ConPTY にも ECHOCTL に当たる仕掛けが無いので、この形では検証できない。
+            // Windows での CSI u 到達自体は **#729**（器が CSI u を内側へ通さない）で追跡中で、
+            // 送出側の符号化は keybindings.rs の単体テストが両 OS で固定している
+            if sh.is_posix() {
+                // 45b. Shift+Enter が GUI キー経路で CSI u（\e[13;2u）としてペインへ届く
+                //     （Issue #28 回帰防止: kitty 未要求でも ModifiedOnly が全ペイン既定。
+                //     tmux バックエンドは extended-keys always が csi-u のまま内側へ届け、
+                //     直接 spawn はそのまま届く。cat 実行中の cooked TTY は ECHOCTL で
+                //     ESC を ^[ とエコーするため、届いたバイト列が ^[[13;2u として見える）
+                type_text(any, cx, "cat", true);
+                wait(cx, 800).await;
+                press(any, cx, "shift-enter");
+                let mut shift_enter_csi_u = false;
+                for _ in 0..20 {
+                    wait(cx, 200).await;
+                    if focused_contains(window, cx, "[13;2u") {
+                        shift_enter_csi_u = true;
+                        break;
+                    }
                 }
+                check(
+                    shift_enter_csi_u,
+                    "Shift+Enter が CSI u で届く（Issue #28）",
+                );
+                press(any, cx, "ctrl-c");
+                wait(cx, 500).await;
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 45b（受信バイトを画面へ出す仕掛け = cooked TTY の \
+                     ECHOCTL が POSIX 専用。Windows の CSI u 到達は #729 で追跡）"
+                );
             }
-            check(
-                shift_enter_csi_u,
-                "Shift+Enter が CSI u で届く（Issue #28）",
-            );
-            press(any, cx, "ctrl-c");
-            wait(cx, 500).await;
+
 
             // 45c.（任意・TAKO_SELF_TEST_CLAUDE=1 のときだけ）実 claude で Shift+Enter が
             //     改行として入力欄に入る e2e（Issue #28 の受け入れ検証そのもの。
@@ -32068,7 +32082,16 @@ mod self_test {
             //     隔離ソケット（main() で TAKO_TMUX_SOCKET=tako-st-<pid> を設定済み）上で
             //     セッション生成 → シェル動作 → OSC パススルー → tty 差し替え →
             //     tmuxview 区別 → 明示 close での kill を検証する
-            if tako_core::backend::capabilities().survives_app_exit {
+            // この e2e は**中身が tmux 決め打ち**（`tmux_backend::pane_tty` / `tmux::list_sessions` /
+            // 外部 tmux の attach）なので、器があるだけでは足りず tmux 本体が要る。
+            // psmux（Windows）の永続化 e2e はここには無い（#467 スライス 8 の棚卸し対象）
+            let has_tmux_backend_e2e = tako_core::platform::process::no_console_window(
+                std::process::Command::new("tmux").arg("-V"),
+            )
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+            if tako_core::backend::capabilities().survives_app_exit && has_tmux_backend_e2e {
                 let backend_sock = tako_core::tmux_backend::socket_name();
 
                 // 59. persist 有効中の分割はバックエンドセッションとして生え、シェルが動く
@@ -32319,11 +32342,11 @@ mod self_test {
                 //      （開発不変条件: UI と同じ層を CLI / MCP からも操作できる）
                 press(any, cx, sh.clear_line_key());
                 type_text(
-                any,
-                cx,
-                &sh.discard_output(&format!("{cli} scroll --to 5")),
-                true,
-            );
+                    any,
+                    cx,
+                    &sh.discard_output(&format!("{cli} scroll --to 5")),
+                    true,
+                );
                 let mut cli_scrolled = false;
                 for _ in 0..20 {
                     wait(cx, 300).await;
@@ -32431,7 +32454,11 @@ mod self_test {
                 // 後片付け: 隔離バックエンドサーバーごと落とす
                 tako_core::tmux_backend::kill_server(&backend_sock);
             } else {
-                eprintln!("（tmux 不在のため項目 59〜62 をスキップ）");
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 59〜62（器 {} / tmux={}。この e2e は tmux 決め打ち）",
+                    tako_core::backend::capabilities().label,
+                    has_tmux_backend_e2e
+                );
             }
             // persist を OFF に戻す（以後の項目・終了処理への影響を断つ）
             let persist_off = window
