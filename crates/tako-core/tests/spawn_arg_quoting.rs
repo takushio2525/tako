@@ -236,3 +236,67 @@ fn 器ありでも空白入りcwdのペインが生き残る() {
          期待 cwd: {want}\n器の応答: {seen}\n画面:\n{screen}"
     );
 }
+
+/// `-e KEY=<空白入りの値>` も 1 語のまま器へ届くこと（#884 の影響範囲）。
+///
+/// [`tako_core::tmux_backend::wrap_options`] が `-e` へ載せるのは現状
+/// `TAKO_PANE_ID` / `TAKO_TAB_ID` の**数値だけ**なので製品経路からはまだ踏めないが、
+/// 割れ方は `-c <cwd>` と同一（同じ argv がそのままコマンドラインへ連結される）。
+/// **`-e` に空白入りの値を載せる最初の機能が入った瞬間に黙って壊れる**形なので、
+/// ここで境界の側から固定しておく。
+///
+/// 値は器の環境として読み出して突き合わせる（`show-environment`）。
+/// 修正前は `-e TAKO_PANE_ID=1 2` が割れ、余った `2` が **shell-command** として
+/// 実行されるためセッションごと落ちる
+#[test]
+fn 空白を含むenvの値も1語のまま器へ届く() {
+    let Some(bin) = container_bin() else {
+        eprintln!("skip: 器（tmux / psmux）が無い");
+        return;
+    };
+    let socket = format!("tako-884env-{}", std::process::id());
+    let session = format!("tako-884e-{}", std::process::id());
+    // 値そのものに空白を入れる（`-e` の右辺が割れるかを見る）
+    let want = "1 2";
+    let wrapped = tako_core::tmux_backend::wrap_options(
+        SpawnOptions {
+            command: None,
+            cwd: Some(std::env::temp_dir()),
+            env: vec![("TAKO_PANE_ID".into(), want.into())],
+        },
+        &socket,
+        &session,
+    );
+    let mut pane = Pane::spawn(wrapped);
+
+    let read_env = |seen: &mut String| {
+        let Ok(out) = container(bin, &socket)
+            .args(["show-environment", "-t", &session])
+            .output()
+        else {
+            return false;
+        };
+        *seen = String::from_utf8_lossy(&out.stdout).to_string();
+        seen.lines()
+            .any(|l| l.trim_end() == format!("TAKO_PANE_ID={want}"))
+    };
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ok = false;
+    while Instant::now() < deadline {
+        pane.pump(Duration::from_millis(300));
+        if read_env(&mut seen) {
+            ok = true;
+            break;
+        }
+    }
+    let screen = pane.screen_text();
+    drop(pane);
+    let _ = container(bin, &socket).arg("kill-server").output();
+    assert!(
+        ok,
+        "空白入りの env 値が器へ 1 語で届いていない（期待 TAKO_PANE_ID={want}）\n\
+         器の応答: {seen}\n画面:\n{screen}"
+    );
+}
