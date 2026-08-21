@@ -692,47 +692,32 @@ fn select_env_value(out: &str, name: &str) -> Option<String> {
 ///   `'C:\Windows\System32\cmd.exe'` は起動に失敗し、引用符なしの
 ///   `C:\Windows\System32\cmd.exe` は成功する
 /// - 従って **空白を含むプログラムパスは第 1 語として表現できない**。
-///   その場合だけ `cmd.exe /c '<Windows 形式のコマンドライン>'` に包む
+///   引用符で括っても `cmd.exe /c '<Windows 行>'` に包んでも駄目で、
+///   psmux は単語分割の過程で引用符を落とすので中身の引用符まで消える
+///   （実測 2026-08-21・psmux 3.3.7。`'C:\Program' は…認識されていません` で即死。#881）
 ///
-/// **注意（2026-08-21 に測り直した結果。#881）**: この `cmd.exe /c` の包みは
-/// psmux 3.3.7 では**効かない**（器の中で即死する）。二重引用符版・`call` 版も同じ。
-/// 生きるのは「1 語で書ける形」だけ（`pwsh.exe …` / 8.3 短縮名 `C:\PROGRA~1\…`）。
-/// 実行ペイン（#875）は最初から 1 語で書ける形を渡して回避しているが、
-/// 空白入りのプログラムパスを明示指定する他の経路は #881 が直るまで動かない
+/// そこで**空白を含まない表記へ落としてから**書く（`platform::program_path`。8.3 短縮名 →
+/// 実行ファイル名）。落とせなかった場合は警告を出す — 黙って壊れた行を渡さない
 fn inner_command(command: &SpawnCommand) -> String {
-    if bare_program_ok(&command.program) {
-        let mut out = command.program.clone();
-        for arg in &command.args {
-            out.push(' ');
-            out.push_str(&crate::shell::quote_for_shell(arg));
-        }
-        return out;
+    let program = crate::platform::program_path::single_token(&command.program);
+    if !crate::platform::program_path::is_single_token(&program) {
+        eprintln!(
+            "warning: 器（psmux）へ渡すプログラムを 1 語にできない（{program}）。\
+             psmux は内側コマンドの第 1 語を引用符で括れないため起動に失敗する（#881）"
+        );
     }
-    let line = windows_command_line(command);
-    format!("cmd.exe /c {}", crate::shell::quote_for_shell(&line))
+    inner_command_with(&program, &command.args)
 }
 
-/// プログラムを引用符なしの第 1 語として書けるか（空白・引用符を含まない）
-fn bare_program_ok(program: &str) -> bool {
-    !program.is_empty()
-        && !program
-            .chars()
-            .any(|c| c.is_whitespace() || c == '\'' || c == '"')
-}
-
-/// Windows 形式のコマンドライン（空白を含む語だけ `"` で囲む）
-fn windows_command_line(command: &SpawnCommand) -> String {
-    std::iter::once(&command.program)
-        .chain(command.args.iter())
-        .map(|word| {
-            if word.is_empty() || word.chars().any(char::is_whitespace) {
-                format!("\"{word}\"")
-            } else {
-                word.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// 第 1 語が決まったあとの組み立て（純粋関数。**macOS からも全分岐テストできる**）。
+/// 引数側は psmux の単語分割に合わせて POSIX 風にクオートする
+fn inner_command_with(program: &str, args: &[String]) -> String {
+    let mut out = program.to_string();
+    for arg in args {
+        out.push(' ');
+        out.push_str(&crate::shell::quote_for_shell(arg));
+    }
+    out
 }
 
 /// バージョンの扱い（要件 6）
@@ -1090,26 +1075,42 @@ mod tests {
             "C:\\Windows\\System32\\cmd.exe /c 'echo hi'"
         );
 
-        // 空白を含むプログラムは第 1 語として書けないので cmd.exe /c '<Windows 行>' に包む
-        let cmd = SpawnCommand {
-            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
-            args: vec![
-                "-NoLogo".into(),
-                "-Command".into(),
-                "Write-Output ok".into(),
-            ],
-        };
-        assert_eq!(
-            inner_command(&cmd),
-            "cmd.exe /c '\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo -Command \"Write-Output ok\"'"
-        );
-
         // 引数のバックスラッシュは単一引用符の中で素通しになる（実測）
         let cmd = SpawnCommand {
             program: "cmd.exe".into(),
             args: vec!["/c".into(), "echo C:\\Foo\\Bar".into()],
         };
         assert_eq!(inner_command(&cmd), "cmd.exe /c 'echo C:\\Foo\\Bar'");
+    }
+
+    #[test]
+    fn 空白入りのプログラムは単一語へ落としてから書く() {
+        // #881: `cmd.exe /c '<Windows 行>'` の包みは psmux が引用符を落とすので即死する。
+        // 8.3 短縮名（OS が返す）を第 1 語にすれば引用符が要らない
+        assert_eq!(
+            inner_command_with(
+                "C:\\PROGRA~1\\POWERS~1\\7\\pwsh.exe",
+                &[
+                    "-NoLogo".into(),
+                    "-Command".into(),
+                    "Write-Output ok".into()
+                ],
+            ),
+            "C:\\PROGRA~1\\POWERS~1\\7\\pwsh.exe -NoLogo -Command 'Write-Output ok'"
+        );
+        // 実際の変換は境界（`platform::program_path`）が持つ。ここでは
+        // 「第 1 語に空白も引用符も残らない」ことだけを OS に依らず固定する
+        let cmd = SpawnCommand {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            args: vec!["-NoLogo".into()],
+        };
+        let line = inner_command(&cmd);
+        let first = line.split(' ').next().unwrap_or_default();
+        assert!(
+            crate::platform::program_path::is_single_token(first),
+            "第 1 語が 1 語になっていない: {line}"
+        );
+        assert!(!line.starts_with("cmd.exe /c"), "包みへ戻っている: {line}");
     }
 
     #[test]
