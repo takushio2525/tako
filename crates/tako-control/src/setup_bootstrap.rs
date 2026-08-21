@@ -307,6 +307,31 @@ pub fn status() -> Result<BootstrapState, String> {
 }
 
 /// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）
+///
+/// # これは意図的に unix 専用（B21 へ機械的に寄せないこと）
+///
+/// `$SHELL -l -c` を直に起こしているので、#877 が片付けている
+/// 「`$SHELL -l -c` の直書きの一族」に見える。**だが意図が違う**ので
+/// [`tako_core::platform::child_cmd::user_env_cli`]（境界 B21）へは寄せられない。
+///
+/// | | 一族（agents 走査など） | ここ |
+/// |---|---|---|
+/// | 意図 | ユーザーの環境で **CLI を 1 回走らせる** | **ログインシェルの PATH を読む** |
+/// | Windows の対応物 | PATH で解決した実体を直接起動 | **無い** |
+///
+/// Windows の PATH は**レジストリ由来でシェル profile 由来ではない**ため、
+/// 「ログインシェルの PATH」という概念そのものが存在しない。`user_env_cli` は
+/// Windows 側に `program` / `args` を要求するが、ここには渡せるものが無い。
+///
+/// なので Windows は false を返して先に落とし、判定は
+/// [`tako_core::platform::exe::find`]（境界 B16。PATH + ユーザーが入れがちな場所を走査）と
+/// [`resolve_binary`]（インストーラの置き場所を直接見る）に任せる。
+/// **壊れている経路ではなく、Windows には要らない経路**。
+///
+/// 番犬（`agents走査がposixシェルの直起動へ戻っていない`）の走査範囲が
+/// `tako-control/src/orchestrator/` から広がってここが引っかかるようになったら、
+/// 寄せるのではなく**理由つきの許可**にするか、B21 側へ
+/// 「ログインシェルの PATH を読む」専用の口（Windows は `None`）を足すこと（#868 / #877）
 fn login_shell_sees(dir: &Path) -> bool {
     if cfg!(windows) {
         return false;
