@@ -33760,16 +33760,20 @@ mod self_test {
             println!(
                 "TAKO_PREVIEW_COORD: pdf pinch in={pinch_in_zoom:.3} out={pinch_out_zoom:.3}"
             );
-            check(
-                wait_for_pdf_highlight_paint(
-                    any,
-                    window,
-                    cx,
-                    PaneId::from_raw(code_pane),
-                )
-                .await,
-                "PDF 選択が最前面 canvas の paint_quad へ到達",
-            );
+            // 選択の塗りは文字矩形（text_layer）から作るので、取れない環境（#693）では
+            // 塗る対象そのものが無い
+            if pdf_text_layer {
+                check(
+                    wait_for_pdf_highlight_paint(any, window, cx, PaneId::from_raw(code_pane))
+                        .await,
+                    "PDF 選択が最前面 canvas の paint_quad へ到達",
+                );
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: PDF 選択の最前面 paint_quad（この環境の PDF \
+                     レンダラは text_layer を持たない。#693）"
+                );
+            }
             // C++ / Python は background syntect 完了後の読み取り状態と編集状態で
             // 複数色を確認する。実ピクセル比較は独立した TAKO_VISUAL_TEST で行う。
             for (language, file_name) in [("cpp", "sample.cpp"), ("python", "sample.py")] {
