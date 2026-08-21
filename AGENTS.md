@@ -75,6 +75,9 @@ tako/
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱。**`--install` は配置後にビルド出力を消して Launch Services の登録も外す** = Finder の「このアプリケーションで開く」に tako が 2 つ並ばない。#837） |
 | リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト。ノートは実アセットから生成 = ダウンロード表 + OS 別手順 + Known limitations。`--notes-only` で生成物のドライラン、`--update-notes [tag]` でアセット後付け後のノート作り直し。#594） |
 | 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
+| **Windows 配布物生成（実機で実行。#587）** | `pwsh -File installer/windows/build-installer.ps1 [-Version v0.7.0]`（`dist/windows/` に `tako-<tag>-windows-x86_64.exe`（インストーラー = 主形式）+ `tako-<tag>-windows-x86_64.zip`（ポータブル）。Inno Setup 6 の ISCC が要る。**アセット名の正は `tako-core::platform::release_assets`** で、PowerShell 側の写し `installer/windows/lib/release-assets.ps1` を経由して組む = リリース側と `tako update` の判定が食い違わない（#594/#595）） |
+| **Windows リリース（実機で実行。#587）** | `pwsh -File installer/windows/release-windows.ps1`（前検査 → ビルド → 配布物検査まで。**既定は dry-run**、`-Upload` で GitHub Release へ添付、`-CreateRelease` で prerelease 新規作成。タグ省略時は Cargo.toml から `v<version>`。macOS の `scripts/release.sh` とは独立で、同じタグに両 OS のアセットが並ぶ） |
+| Windows アプリアイコン再生成 | `pwsh -File installer/windows/make-icon.ps1`（A 案 PNG → `assets/icon/tako.ico`。System.Drawing だけで動く = Windows 専用。`.ico` はコミット済みなので通常は不要） |
 | マスターオーケストレーター起動 | `tako master [-profile]`（master system prompt 付きでエージェント CLI を起動。プロファイルの `master_agent` で claude（既定）/ codex を選択。#127） |
 | ソロエージェント起動（オーケストレーション無しの 1 対 1 対話） | `tako solo [-profile]`（solo system prompt 付きで起動。worker spawn 禁止・エコ運用 effort=high。master と同じプロファイル引数・`master_agent` 対応） |
 | オーケストレーター master 自己情報 | `tako orchestrator self [--pane N]`（自 pane/tab/ctx%/handoff 状態 + 引き継ぎ閾値（`ctx_threshold` / `ctx_threshold_source` / `ctx_over_threshold` / `auto_handoff`）。#123/#193/#749） |

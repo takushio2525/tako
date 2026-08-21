@@ -6,8 +6,9 @@
 //! 「更新あり」と通知する、といった事故になる（#595 の背景）。
 //!
 //! そこで**命名規則の判定ロジックはこのモジュール 1 箇所を正とする**。
-//! シェル側（`scripts/lib/release-assets.sh`）は同じ規則の写しで、
-//! 両者が一致していることは本モジュールの同期テストが機械検証する
+//! シェル側（`scripts/lib/release-assets.sh`。macOS のリリース）と
+//! PowerShell 側（`installer/windows/lib/release-assets.ps1`。Windows のリリース。#587）は
+//! 同じ規則の写しで、3 者が一致していることは本モジュールの同期テストが機械検証する
 //! （テストがあるので「片方だけ直して気付かない」が起きない）。
 //!
 //! ## 命名規則
@@ -216,6 +217,12 @@ mod tests {
             asset_name_with_ext(Platform::Windows, Arch::X86_64, "v0.6.0", "zip"),
             "tako-v0.6.0-windows-x86_64.zip"
         );
+        // Windows のプレビュー反復（#723）。`installer/windows/build-installer.ps1` が
+        // ISCC へ渡す OutputBaseFilename はこの名前から拡張子を落としたもの
+        assert_eq!(
+            asset_name(Platform::Windows, Arch::X86_64, "v0.5.13-win.3"),
+            "tako-v0.5.13-win.3-windows-x86_64.exe"
+        );
     }
 
     #[test]
@@ -223,7 +230,14 @@ mod tests {
         for platform in [Platform::MacOs, Platform::Windows] {
             for arch in [Arch::Arm64, Arch::X86_64] {
                 for ext in extensions(platform) {
-                    for tag in ["v0.6.0", "v0.6.0-test.1", "v10.20.30-test.99"] {
+                    // `-win.N` は Windows のプレビュー反復が実際に使うタグ（#723）。
+                    // タグ自身が `-` と `.` を含むので「右から解析」の回帰の錨になる
+                    for tag in [
+                        "v0.6.0",
+                        "v0.6.0-test.1",
+                        "v10.20.30-test.99",
+                        "v0.5.13-win.3",
+                    ] {
                         let name = asset_name_with_ext(platform, arch, tag, ext);
                         let parsed = ReleaseAsset::parse(&name)
                             .unwrap_or_else(|| panic!("解析できない: {name}"));
@@ -302,13 +316,60 @@ mod tests {
         );
     }
 
-    // --- シェル側（scripts/lib/release-assets.sh）との同期検証 ---
+    // --- 写し（sh / PowerShell）との同期検証 ---
     //
-    // 命名規則を 2 言語に写すことになるので、**ズレたら落ちるテスト**で縛る。
+    // 命名規則を 3 言語に写すことになるので、**ズレたら落ちるテスト**で縛る。
     // これが無いと片方だけ直して気付かず、#595 の事故が再発する。
 
+    fn repo_path(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
     fn shell_lib_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/release-assets.sh")
+        repo_path("scripts/lib/release-assets.sh")
+    }
+
+    fn powershell_lib_path() -> std::path::PathBuf {
+        repo_path("installer/windows/lib/release-assets.ps1")
+    }
+
+    /// Inno Setup のスクリプトがアセット名を**自分で組み立てていない**ことの番犬（#587）。
+    ///
+    /// `.iss` の ISPP は Rust からも pwsh からも実行できないので、ここで名前を組み直されると
+    /// 命名規則の 3 つ目の実装ができてしまい、同期テストの網にかからない。
+    /// `OutputBaseFilename` は `build-installer.ps1` が `/DAssetBaseName=` で渡す値だけを使い、
+    /// 未定義なら `#error` で落ちる、という形を維持させる
+    #[test]
+    fn inno_setup_does_not_build_asset_names_itself() {
+        let src = std::fs::read_to_string(repo_path("installer/windows/tako.iss"))
+            .expect("installer/windows/tako.iss");
+        assert!(
+            src.contains("OutputBaseFilename={#AssetBaseName}"),
+            "OutputBaseFilename が /DAssetBaseName= の値をそのまま使っていない"
+        );
+        assert!(
+            src.contains("#ifndef AssetBaseName") && src.contains("#error"),
+            "AssetBaseName 未定義時に #error で落ちる形になっていない             （黙ってフォールバックすると #595 の食い違いが再発する）"
+        );
+        // 命名規則の断片を .iss へ書き戻していないか。`#error` / コメントの例示は
+        // 完成形の 1 語（tako-vX-windows-x86_64）なので、それらを除いた上で
+        // 「接頭辞と platform / arch トークンを + で連結している」行を禁じる
+        for (i, line) in src.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with(';') || code.starts_with("#error") {
+                continue;
+            }
+            let builds_name = code.contains('+')
+                && code.contains(PREFIX)
+                && code.contains(Platform::Windows.as_str());
+            assert!(
+                !builds_name,
+                "tako.iss:{} がアセット名を組み立てている: {line}                 （命名規則は release_assets.rs が正。/DAssetBaseName= で受け取ること）",
+                i + 1
+            );
+        }
     }
 
     #[test]
@@ -369,5 +430,134 @@ mod tests {
                 }
             }
         }
+    }
+    // --- PowerShell 側（installer/windows/lib/release-assets.ps1）との同期検証 ---
+    //
+    // Windows のリリースは GitHub Actions ではなく実機の PowerShell で回す（#587）ので、
+    // 配布物の名前を決めるのは PowerShell 側になる。ここがズレると
+    // 「インストーラーは作られたのに更新チェックが自 OS 向けと認識しない」= #595 の再来。
+
+    #[test]
+    fn powershell_mirror_declares_same_constants() {
+        let src = std::fs::read_to_string(powershell_lib_path())
+            .expect("installer/windows/lib/release-assets.ps1");
+        // 接頭辞
+        assert!(
+            src.contains(&format!("$TakoAssetPrefix = '{PREFIX}'")),
+            "PowerShell 側の $TakoAssetPrefix が Rust の PREFIX と一致しない"
+        );
+        // Windows の配布 arch トークン（`x64` 等の別名を書くと Rust 側の parse が弾く）
+        assert!(
+            src.contains(&format!(
+                "$TakoAssetArchWindows = '{}'",
+                Arch::X86_64.as_str()
+            )),
+            "PowerShell 側の $TakoAssetArchWindows が Rust の Arch::X86_64 と一致しない"
+        );
+        // プラットフォームごとの拡張子（並び順 = 優先順位も一致させる）と表示名
+        for platform in [Platform::MacOs, Platform::Windows] {
+            // macos -> Macos / windows -> Windows（PowerShell の変数名は PascalCase）
+            let suffix = {
+                let name = platform.as_str();
+                let mut c = name.chars();
+                match c.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            };
+            let want_exts = format!(
+                "$TakoAssetExts{suffix} = '{}'",
+                extensions(platform).join(" ")
+            );
+            assert!(
+                src.contains(&want_exts),
+                "PowerShell 側の $TakoAssetExts{suffix} が Rust の extensions() と一致しない（期待: {want_exts}）"
+            );
+            let want_label = format!("$TakoAssetLabel{suffix} = '{}'", display_label(platform));
+            assert!(
+                src.contains(&want_label),
+                "PowerShell 側の $TakoAssetLabel{suffix} が Rust の display_label() と一致しない（期待: {want_label}）"
+            );
+        }
+    }
+
+    /// PowerShell 関数を実際に実行して Rust の生成結果と突き合わせる（最も強い同期検証）。
+    ///
+    /// pwsh が無い環境（素の Linux コンテナ等）では**検証をスキップする**。
+    /// macOS の CI ランナーと Windows には pwsh があるので、CI では必ず走る
+    /// （上の定数テストは pwsh 不要なので、どの環境でもドリフトは検出できる）
+    #[test]
+    fn powershell_mirror_generates_identical_names() {
+        let Some(pwsh) = ["pwsh", "powershell"].into_iter().find(|bin| {
+            std::process::Command::new(bin)
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }) else {
+            eprintln!("pwsh が無いので PowerShell 写しの実行検証をスキップ（定数検証は実施済み）");
+            return;
+        };
+
+        let lib = powershell_lib_path();
+        // 1 プロセスで全組み合わせを出させる（pwsh の起動は 1 回 1 秒近くかかる）
+        let mut script = format!(". '{}'\n", lib.display());
+        let mut want: Vec<String> = Vec::new();
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for arch in [Arch::Arm64, Arch::X86_64] {
+                for tag in ["v0.6.0", "v0.6.0-test.1", "v0.5.13-win.3"] {
+                    for ext in extensions(platform) {
+                        script.push_str(&format!(
+                            "Get-TakoAssetName -Tag '{tag}' -Platform '{}' -Arch '{}' -Ext '{ext}'\n",
+                            platform.as_str(),
+                            arch.as_str()
+                        ));
+                        want.push(asset_name_with_ext(platform, arch, tag, ext));
+                    }
+                    // Ext 省略時は主形式になること
+                    script.push_str(&format!(
+                        "Get-TakoAssetName -Tag '{tag}' -Platform '{}' -Arch '{}'\n",
+                        platform.as_str(),
+                        arch.as_str()
+                    ));
+                    want.push(asset_name(platform, arch, tag));
+                    // Inno Setup の OutputBaseFilename（= 拡張子を除いたベース名）
+                    script.push_str(&format!(
+                        "Get-TakoAssetBaseName -Tag '{tag}' -Platform '{}' -Arch '{}'\n",
+                        platform.as_str(),
+                        arch.as_str()
+                    ));
+                    let primary = asset_name(platform, arch, tag);
+                    let base = primary
+                        .rsplit_once('.')
+                        .expect("主形式に拡張子がある")
+                        .0
+                        .to_string();
+                    want.push(base);
+                }
+            }
+        }
+
+        let out = std::process::Command::new(pwsh)
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .expect("pwsh の実行に失敗");
+        assert!(
+            out.status.success(),
+            "PowerShell 写しの実行が失敗: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            got,
+            want,
+            "PowerShell と Rust でアセット名が食い違う（stderr: {}）",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
