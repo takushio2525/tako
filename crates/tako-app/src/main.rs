@@ -47552,6 +47552,13 @@ mod app_menu_tests {
         );
     }
 
+    /// macOS 慣習のショートカット（#485）は **macOS でだけ**張る（#517 / #585）。
+    ///
+    /// 非 macOS では `cmd-` が platform 修飾 = Win キーへ解決される。Win+Alt+H が
+    /// アプリまで届くと `HideOthers` → `gpui_windows::hide_other_apps` が
+    /// `unimplemented!()` で **panic ＝ アプリごと abort**（器の無いペインは全滅）
+    /// するため、バインドを張らないことで経路ごと塞いでいる。
+    /// **「無いこと」も同じ強さで固定する**（張り直すとここで落ちる）
     #[test]
     fn macos慣習のショートカットがバインドされている() {
         let bindings = key_bindings();
@@ -47560,10 +47567,16 @@ mod app_menu_tests {
             ("tako::HideOthers", "h", true),
             ("tako::MinimizeWindow", "m", false),
         ] {
-            let b = bindings
-                .iter()
-                .find(|b| b.action().name() == action)
-                .unwrap_or_else(|| panic!("{action} のバインドが無い"));
+            let found = bindings.iter().find(|b| b.action().name() == action);
+            if !cfg!(target_os = "macos") {
+                assert!(
+                    found.is_none(),
+                    "{action} のバインドが非 macOS に残っている（Win+Alt+H は \
+                     unimplemented! で app ごと落ちる）"
+                );
+                continue;
+            }
+            let b = found.unwrap_or_else(|| panic!("{action} のバインドが無い"));
             let ks = b.keystrokes()[0].inner();
             assert_eq!(ks.key, key, "{action}");
             assert!(ks.modifiers.platform, "{action} は cmd 修飾");
