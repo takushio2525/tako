@@ -40354,7 +40354,25 @@ mod self_test {
                     let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
                 }
 
-                // (d) 「AI チームに任せる」押下 → そのペインのシェルへコマンド行が届く
+                // (d) 「AI チームに任せる」押下 → そのペインのシェルへコマンド行が届く。
+                //
+                // 期待値は**製品が組んだ行そのもの**（`welcome::launch_command_line`）から
+                // 作る。`tako master` 決め打ちだと実体パスの引用形の差で外れる:
+                // POSIX は `/…/tako master` だが、Windows のパスは `:` と `\` を含むので
+                // 引用されて `'C:\…\tako.exe' master` になる（#889 で実測）。
+                // ディレクトリ部分を落として「実行ファイル名以降」で突き合わせるので、
+                // macOS では従来と同じ `tako master` を探すまま Windows でも成立する。
+                // なお (d) が見るのは**届いたか**で、届いた行が実行されるかは見ていない
+                // （echo ペインは行を実行しないので構造的に見られない）
+                let launch_line = tako_control::welcome::launch_command_line("master");
+                let expected_delivery = launch_line
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(launch_line.as_str())
+                    .to_string();
+                println!(
+                    "selftest 93d: launch_line={launch_line:?} expected={expected_delivery:?}"
+                );
                 let clicked = window
                     .update(cx, |app, _, cx| {
                         app.starter_action(echo_pane, StarterAction::Master, cx)
@@ -40369,12 +40387,26 @@ mod self_test {
                                 .get(&echo_pane)
                                 .map(|s| s.visible_lines().join(""))
                                 .unwrap_or_default()
-                                .contains("tako master")
+                                .contains(&expected_delivery)
                         })
                         .unwrap_or(false);
                     if delivered {
                         break;
                     }
+                }
+                if !delivered {
+                    let screen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&echo_pane)
+                                .map(|s| s.visible_lines().join("|"))
+                                .unwrap_or_else(|| "<ペインなし>".to_string())
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "TAKO_SELF_TEST_694d: clicked={clicked} expected={expected_delivery:?} \
+                         line={launch_line:?} screen={screen:?}"
+                    );
                 }
                 check(
                     clicked && delivered,

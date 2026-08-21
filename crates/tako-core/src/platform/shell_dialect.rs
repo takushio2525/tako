@@ -339,9 +339,16 @@ impl ShellDialect {
     /// 指す本番のパスが別物になる）。**実機の `$PROFILE` の状態でテストの結果が変わる**
     /// ので、統合を自分で読ませた対話シェルを起こして前提を閉じる。
     ///
-    /// **`.` とスクリプトパスは別々の語で渡す**: `". 'path'"` の 1 語にすると
-    /// Windows PowerShell 5.1 が引用符を取りこぼしてドットソースごと落ちる
-    /// （実測。`tako-core/tests/shell_integration_powershell.rs` の注記と同じ形）
+    /// **`.` とスクリプトパスは別々の語で渡す**: 実機の Rust argv → ConPTY 経路で
+    /// 緑になっていることが分かっているのはこの形だけ
+    /// （`tako-core/tests/shell_integration_powershell.rs` と同じ。5.1 は 1 語にすると
+    /// 引用符を取りこぼしてドットソースごと落ちるという実測がそちらに残っている）。
+    ///
+    /// 既知の制限: **パスに空白があると効かない**（PowerShell は `-Command` の後ろの
+    /// 語を引用符を落として空白で連結する。`Start-Process` 経由の実測で
+    /// separate-words=False / single-word=True。#889）。統合スクリプトは data_dir 配下
+    /// （隔離時は `%TEMP%`）なので現状は踏まないが、空白入りのユーザー名で踏んだら
+    /// `-EncodedCommand`（#875 の実行ペインと同じ手）へ替えるのが筋
     pub fn integration_shell_command(self, program: &str, script: &Path) -> Option<Vec<String>> {
         match self {
             Self::Posix => None,
