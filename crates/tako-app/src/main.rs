@@ -37475,21 +37475,38 @@ mod self_test {
             // 76b. 変換中ペインの close で IME 状態が畳まれる（#332）。
             // 畳まれないと ime_target / 確定書き込みが死んだペインへ向き続け、
             // 候補ウィンドウの位置出しと確定文字列の宛先が壊れる
+            let before_76b = window
+                .update(cx, |app, _, _| app.workspace.active_tab().tree().len())
+                .unwrap_or(0);
             let _ = window.update(cx, |app, _, cx| app.split(SplitDirection::Right, cx));
             wait(cx, 1200).await;
-            let ime_close_ok = window
-                .update(cx, |app, window, cx| {
-                    let target = app.focused_pane();
-                    app.replace_and_mark_text_in_range(None, "へんかん", None, window, cx);
-                    let composing = app.ime.is_some();
-                    app.remove_pane(target, cx);
-                    let cleared = app.ime.is_none();
-                    // 畳んだ後の ime_target がフォーカスペインへ解決されることも固定
-                    let target_ok = app.ime_target() == app.focused_pane();
-                    composing && cleared && target_ok
-                })
-                .unwrap_or(false);
-            check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
+            // **分割できたことを確かめてから閉じる**。分割に失敗した状態で閉じると
+            // タブの最後のペインを落としてアプリが終了し、以降の項目が「静かに
+            // 走らなかった」ことになる（Windows 実機で踏んだ: スキップした項目のぶん
+            // ペインが少なく、判定なしで exit 0 になっていた）
+            let split_76b = window
+                .update(cx, |app, _, _| app.workspace.active_tab().tree().len())
+                .unwrap_or(0);
+            if split_76b > before_76b {
+                let ime_close_ok = window
+                    .update(cx, |app, window, cx| {
+                        let target = app.focused_pane();
+                        app.replace_and_mark_text_in_range(None, "へんかん", None, window, cx);
+                        let composing = app.ime.is_some();
+                        app.remove_pane(target, cx);
+                        let cleared = app.ime.is_none();
+                        // 畳んだ後の ime_target がフォーカスペインへ解決されることも固定
+                        let target_ok = app.ime_target() == app.focused_pane();
+                        composing && cleared && target_ok
+                    })
+                    .unwrap_or(false);
+                check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 76b（分割できず panes {before_76b}→{split_76b}。\
+                     最後のペインを閉じるとアプリが終了するため）"
+                );
+            }
 
             // 76c / 76d. カーソル非表示（DECTCEM off）のペインで未確定文字列の
             // 下線オーバーレイが出る（#497）。claude 等の TUI はカーソルを消したまま
@@ -37619,11 +37636,13 @@ mod self_test {
                         "{label}. IME 下線: カーソル非表示ペインでもアンカーが解決する (#497)"
                     ),
                 );
-                // 後始末（変換状態を畳み、76d で作ったペインは閉じる）
+                // 後始末（変換状態を畳み、76d で作ったペインは閉じる）。
+                // 76d の close は**分割できたときだけ**（最後のペインを閉じると
+                // アプリが終了して以降の項目が走らない）
                 let _ = window.update(cx, |app, window, cx| {
                     app.unmark_text(window, cx);
                     let target = app.focused_pane();
-                    if split_first {
+                    if split_first && app.workspace.active_tab().tree().len() > 1 {
                         app.remove_pane(target, cx);
                     } else if let Some(s) = app.terminals.get(&target) {
                         // sleep を止めてカーソルを戻す（後続項目へ状態を残さない）
