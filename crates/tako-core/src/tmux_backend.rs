@@ -196,9 +196,10 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // 統合が届かなくなる。2026-06-12 のスパイクで判明）。未指定なら tmux が
     // default-shell（$SHELL → passwd の順で解決）をログインシェルとして直接 spawn
     // するので、直接 spawn 時と同じく統合が効く。
-    // 明示コマンドは残余引数が空白連結 + sh -c されるため、各語をクォートして 1 引数で渡す
+    // 明示コマンドは残余引数が空白連結 + sh -c されるため、各語をクォートして 1 引数で渡す。
+    // **第 1 語の書き方だけは器によって違う**ので組み立ては backend 側の 1 か所へ（#881）
     if let Some(inner) = &options.command {
-        args.push(shell_quoted(inner));
+        args.push(crate::backend::inner_command_line(inner));
     }
     SpawnOptions {
         command: Some(SpawnCommand {

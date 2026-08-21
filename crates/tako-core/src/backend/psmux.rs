@@ -210,6 +210,7 @@ impl SessionBackend for PsmuxBackend {
             // 同時に流した平文だけが届いた）。このため psmux ペインでは
             // cwd 追従とコマンド状態が働かない（#525）
             osc_passthrough: false,
+            quotes_program: false,
             label: "psmux",
         }
     }
@@ -698,7 +699,7 @@ fn select_env_value(out: &str, name: &str) -> Option<String> {
 ///
 /// そこで**空白を含まない表記へ落としてから**書く（`platform::program_path`。8.3 短縮名 →
 /// 実行ファイル名）。落とせなかった場合は警告を出す — 黙って壊れた行を渡さない
-fn inner_command(command: &SpawnCommand) -> String {
+pub(super) fn inner_command(command: &SpawnCommand) -> String {
     let program = crate::platform::program_path::single_token(&command.program);
     if !crate::platform::program_path::is_single_token(&program) {
         eprintln!(
@@ -1130,16 +1131,21 @@ mod tests {
             format!("pwsh.exe -NoLogo -EncodedCommand {encoded}"),
         );
 
-        // 空白入りのプログラムパス（pwsh 7 の既定インストール先）で cmd.exe 経由に
-        // 包まれても、base64 はやはり素のまま通る
+        // 空白入りのプログラムパス（pwsh 7 の既定インストール先）でも、第 1 語が
+        // 1 語へ落ちるだけで base64 は素のまま通る（#881 で cmd.exe 包みは廃止）
         let cmd = SpawnCommand {
             program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
             args: vec!["-NoLogo".into(), "-EncodedCommand".into(), encoded.into()],
         };
         let line = inner_command(&cmd);
         assert!(
-            line.contains(&format!("-EncodedCommand {encoded}'")),
+            line.ends_with(&format!("-EncodedCommand {encoded}")),
             "base64 が引用・改変された: {line}"
+        );
+        let first = line.split(' ').next().unwrap_or_default();
+        assert!(
+            crate::platform::program_path::is_single_token(first),
+            "第 1 語が 1 語になっていない: {line}"
         );
     }
 
