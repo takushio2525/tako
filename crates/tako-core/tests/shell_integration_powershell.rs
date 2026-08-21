@@ -474,8 +474,14 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     std::fs::create_dir_all(&data_dir).expect("データディレクトリを作れること");
     let sink = tako_core::osc_sink::prepare(&data_dir, 1).expect("側路を張れること");
 
-    // cd の行き先。**器の中で作る**のではなく先に作っておく（cd が失敗すると OSC 7 が出ない）
-    let target = std::env::temp_dir().join(format!("tako-sink-cd-{}", std::process::id()));
+    // cd の行き先。**器の中で作る**のではなく先に作っておく（cd が失敗すると OSC 7 が出ない）。
+    //
+    // 名前を極端に短くしてあるのは器の都合。psmux は流し込んだ入力を落とすことがあり
+    // （#640。だから製品の送達はエコー確認つきの `shell_send` を通る）、絶対パスを
+    // そのまま打つと **行が消えて `\r` だけ届く**（実測: 60 文字の `cd '<絶対パス>'` が
+    // 空行になり、プロンプトだけが 1 つ増えた）。cwd は Temp 直下から相対で移る
+    let leaf = format!("t766{}", std::process::id() % 1000);
+    let target = std::env::temp_dir().join(&leaf);
     std::fs::create_dir_all(&target).expect("cd 先を作れること");
 
     let options = SpawnOptions {
@@ -528,29 +534,36 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
         CommandState::Failed(3),
         Duration::from_secs(20),
     );
-    // ③ cd で cwd が追従する（= OSC 7 が側路で届いた）
-    pane.send_line(&format!("cd '{}'", target.display()));
-    let leaf = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let followed = {
-        let deadline = Instant::now() + Duration::from_secs(20);
+    // ③ cd で cwd が追従する（= OSC 7 が側路で届いた）。
+    // 器が入力を落とすことがあるので**エコーを見て打ち直す**（落ちたときに
+    // 「OSC 7 が来ない」ではなく「入力が届いていない」と分かる形にしておく）
+    let line = format!("cd {leaf}");
+    let mut echoed = false;
+    let mut followed = false;
+    for _ in 0..3 {
+        pane.send_line(&line);
+        echoed |= pane.wait(Duration::from_secs(6), |s| {
+            s.visible_lines().iter().any(|l| l.contains(&line))
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             pane.pump();
             if let Some(bytes) = cursor.take_new(&sink) {
                 pane.session.feed_osc_bytes(&bytes);
             }
-            let hit = pane
+            followed = pane
                 .session
                 .cwd()
                 .is_some_and(|c| c.to_string_lossy().contains(&leaf));
-            if hit || Instant::now() >= deadline {
-                break hit;
+            if followed || Instant::now() >= deadline {
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-    };
+        if followed {
+            break;
+        }
+    }
 
     let screen = pane.screen();
     let state = pane.session.command_state();
@@ -562,6 +575,10 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     assert!(
         failed,
         "側路で 133;D の終了コードが届かない（state={state:?}）\n{screen}"
+    );
+    assert!(
+        echoed,
+        "器が cd の入力を落として画面に出ない（#640。OSC 7 の検証まで到達していない）\n{screen}"
     );
     assert!(
         followed,
