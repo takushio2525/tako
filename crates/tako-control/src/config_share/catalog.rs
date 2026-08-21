@@ -190,6 +190,14 @@ pub mod notes {
         "資格情報の保管場所。中身も場所もデバイス固有なので共有しない",
         "Credential storage: both contents and location are device-specific, so they are not shared",
     );
+    /// 蓋閉じ継続の元値の記録（#697）。**共有すると別マシンの電源プランの GUID と
+    /// 元値を持ち込む**ことになり、起動時の残留復元がこのマシンには存在しない
+    /// プランへ書き戻そうとする（あるいは他人の元値でこのマシンの設定を上書きする）。
+    /// 記録は倒したマシンのものだけが意味を持つ
+    pub const LID_GUARD: Note = Note::new(
+        "蓋閉じ継続の元値の記録。倒したマシンでしか意味を持たないので共有しない",
+        "Saved lid-close action for this machine only; meaningless elsewhere, so it is not shared",
+    );
     pub const SESSION: Note = Note::new(
         "会話・セッションの記録。分量が大きく秘匿情報を含みうるので共有しない",
         "Conversation and session records: large and potentially sensitive, so they are not shared",
@@ -371,6 +379,14 @@ pub const CATALOG: &[Entry] = &[
         path: "layout.json.good",
         class: Class::Local,
         note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    Entry {
+        root: Root::TakoData,
+        path: "lid-guard.json",
+        class: Class::Local,
+        note: notes::LID_GUARD,
         local_fields: &[],
         needs_local_unless: &[],
     },

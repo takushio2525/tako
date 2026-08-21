@@ -4334,32 +4334,35 @@ impl TakoApp {
         })
         .detach();
 
-        // listen ポート検知（FR-2.4.2）。ペインの tty とプロセスの制御端末を突き合わせ、
-        // 配下の LISTEN 中 TCP ポートを 3 秒毎に拾って list / MCP へ公開し、
-        // 新規ポートには提案チップを立てる（FR-2.4.3）。スキャンはバックグラウンドで行う
+        // listen ポート検知（FR-2.4.2）。ペイン配下の LISTEN 中 TCP ポートを 3 秒毎に
+        // 拾って list / MCP へ公開し、新規ポートには提案チップを立てる（FR-2.4.3）。
+        // 「ペイン配下」の判定材料は OS で違う（macOS = 制御端末の rdev、
+        // Windows = PTY 直下の子 pid の子孫）ので、材料の解釈は `ports::pane_key` に
+        // 任せてここでは不透明キーとして扱う（#524）。スキャンはバックグラウンドで行う
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(3)).await;
-            let Ok(ttys) = this.update(cx, |app: &mut TakoApp, _| {
+            let Ok(pane_keys) = this.update(cx, |app: &mut TakoApp, _| {
                 if !app.port_detect {
                     return Vec::new(); // 無効中（FR-2.4.4）は何もしない
                 }
                 app.terminals
                     .iter()
                     .filter_map(|(pane, session)| {
-                        let rdev = tako_core::ports::tty_rdev(session.tty_name()?)?;
-                        Some((*pane, rdev))
+                        let key =
+                            tako_core::ports::pane_key(session.tty_name(), session.child_pid())?;
+                        Some((*pane, key))
                     })
                     .collect::<Vec<_>>()
             }) else {
                 break; // View が破棄された
             };
-            if ttys.is_empty() {
+            if pane_keys.is_empty() {
                 continue;
             }
-            let rdevs: Vec<u64> = ttys.iter().map(|(_, rdev)| *rdev).collect();
+            let keys: Vec<u64> = pane_keys.iter().map(|(_, key)| *key).collect();
             let mut scanned = cx
                 .background_executor()
-                .spawn(async move { tako_core::ports::scan(&rdevs) })
+                .spawn(async move { tako_core::ports::scan(&keys) })
                 .await;
             let result = this.update(cx, |app: &mut TakoApp, cx| {
                 // スキャン中に無効化（portdetect off）が割り込んだら結果を破棄する
@@ -4368,11 +4371,11 @@ impl TakoApp {
                     return;
                 }
                 let mut changed = false;
-                for (pane, rdev) in &ttys {
+                for (pane, key) in &pane_keys {
                     let Some(session) = app.terminals.get_mut(pane) else {
                         continue;
                     };
-                    let ports = scanned.remove(rdev).unwrap_or_default();
+                    let ports = scanned.remove(key).unwrap_or_default();
                     let old: std::collections::HashSet<u16> =
                         session.listen_ports().iter().map(|p| p.port).collect();
                     if !session.set_listen_ports(ports) {

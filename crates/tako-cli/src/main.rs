@@ -4385,25 +4385,43 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                     "未接続"
                 }
             );
-            eprintln!("  蓋: {}", if state.lid_closed { "閉" } else { "開" });
+            // 蓋の開閉は macOS でしか観測できない。取れない OS で「開」と言い切ると
+            // 嘘になるので不明と出す（#697）
+            if tako_control::sleep_guard::lid_state_detectable() {
+                eprintln!("  蓋: {}", if state.lid_closed { "閉" } else { "開" });
+            } else {
+                eprintln!("  蓋: 不明（この OS では開閉を検知できません）");
+            }
+            // sudoers は macOS 固有の手段。要らない OS では出さない（#697）
+            if tako_control::sleep_guard::lid_requires_privileged_setup() {
+                eprintln!(
+                    "  蓋閉じ防止: {} (sudoers: {})",
+                    state.lid_sleep_mode.as_str(),
+                    if state.sudoers_installed {
+                        "登録済み"
+                    } else {
+                        "未登録"
+                    }
+                );
+            } else if tako_control::sleep_guard::lid_control_supported() {
+                eprintln!("  蓋閉じ防止: {}", state.lid_sleep_mode.as_str());
+            } else {
+                eprintln!("  蓋閉じ防止: この OS では対応していません");
+            }
             eprintln!(
-                "  蓋閉じ防止: {} (sudoers: {})",
-                state.lid_sleep_mode.as_str(),
-                if state.sudoers_installed {
-                    "登録済み"
-                } else {
-                    "未登録"
-                }
-            );
-            eprintln!(
-                "  disablesleep: {}",
+                "  蓋閉じ継続の適用: {}",
                 if state.lid_sleep_disabled {
                     "有効"
                 } else {
                     "無効"
                 }
             );
-            eprintln!("  thermal: {}", state.thermal_state.as_str());
+            // thermal は macOS でしか取れない。取れない OS で常に nominal と出しても情報がない
+            if tako_control::sleep_guard::lid_requires_privileged_setup()
+                || state.thermal_state != tako_control::sleep_guard::ThermalState::Nominal
+            {
+                eprintln!("  thermal: {}", state.thermal_state.as_str());
+            }
             if state.display_sleep_forced {
                 eprintln!("  ディスプレイ: 消灯済み（蓋閉じ中）");
             }
@@ -4465,10 +4483,16 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
             Ok(())
         }
         SleepGuardCommand::InstallLidSleep => {
-            eprintln!("蓋閉じ防止の sudoers 登録を行います...");
-            eprintln!("  登録内容: pmset -a disablesleep 0/1 のみ NOPASSWD");
-            eprintln!("  管理者パスワードの入力ダイアログが表示されます。");
-            let result = tako_control::sleep_guard::install_sudoers()?;
+            // 案内は「この OS で何が起きるか」で出し分ける。
+            // 分岐は sleep_guard 側に閉じているのでここは単一経路（#697）
+            if tako_control::sleep_guard::lid_setup_pending() {
+                eprintln!("蓋閉じ防止の sudoers 登録を行います...");
+                eprintln!("  登録内容: pmset -a disablesleep 0/1 のみ NOPASSWD");
+                eprintln!("  管理者パスワードの入力ダイアログが表示されます。");
+            } else {
+                eprintln!("蓋閉じ防止を有効にします...");
+            }
+            let result = tako_control::sleep_guard::prepare_lid_control()?;
             eprintln!("  {result}");
             let mut settings = tako_control::settings::load();
             settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning;
@@ -4479,7 +4503,7 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
             Ok(())
         }
         SleepGuardCommand::RemoveLidSleep => {
-            let result = tako_control::sleep_guard::remove_sudoers()?;
+            let result = tako_control::sleep_guard::teardown_lid_control()?;
             eprintln!("  {result}");
             let mut settings = tako_control::settings::load();
             settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::Off;

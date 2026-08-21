@@ -785,21 +785,87 @@ crt-static と build.rs 2 本を含む）:
   **3 列へ寄せて main の行を移植する**作業が要る。
   `windows/467-main-merge-wip` にこの 7 hunk が未解決のまま残してあるので材料になる
 
-### 9. スリープ防止 + 蓋閉じ継続 + ポート検知（#524 / #697 / #724）
+### 9. スリープ防止 + 蓋閉じ継続 + ポート検知（#524 / #697 / #724）— ✅ **完了**（PR #863）
 
-- 持ち込む新規: `crates/tako-control/src/platform/{lid,power}.rs` /
+- 持ち込んだ新規: `crates/tako-control/src/platform/{lid,power}.rs` /
   `crates/tako-control/tests/lid_residual_windows.rs`
-- 編集: `sleep_guard.rs` / `crates/tako-core/src/ports.rs`（`pane_key()` 経由の判定）
+- 編集: `sleep_guard.rs` / `crates/tako-core/src/ports.rs`（`pane_key()` 経由の判定）/
+  `crates/tako-core/src/backend/mod.rs`（`is_plumbing_process`）/ `agents.rs`（親子マップ）/
+  `dispatch.rs` + `tako-cli`（3 経路 1:1）/ `config_share/catalog.rs`
 - 依存: **1**
-- **WIP が保全ブランチにある**: `windows/724-port-crash`（`7633d8b`。ポート検知のクラッシュ修正）/
-  `windows/727-sleep-settings`（`91cc13f`。設定 UI）
 
-### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 4 / 5 / 6 完了）
+#### plan の見立てとの差（実測で分かったこと）
+
+1. **`agents::process_parent_map` の配線が必須だった**（持ち込み表に無かった）。`ps` 直叩きなので
+   Windows では常に空 → `ProcessSnapshot` も空 → **sleep guard の既定モード
+   `while-agents-running` が busy_agents=0 のまま一度も発動しない**（stale binary 検知 #772 も同様）。
+   スライス 1 が置いた `platform::procinfo` を配線して成立させた。`agents.rs` に `cfg(windows)` は
+   書かず「境界が答えを持っているか」で分岐する（FFI の転記を二重に持たないため）
+2. **#724 の症状①（器の偽ポート）は持ち込むべき**だった。psmux は IPC に TCP ループバックを使い
+   サーバーを**クライアントの子**として起こすので、器つきのペインが例外なく 1 個の偽 listen を持つ。
+   実機で **21 個の psmux プロセスが LISTEN 中**なのを確認済み。除外なしでは
+   「ポート検知が動く」の実測が壊れた機能の実演になる。**症状②（WebView2 の借用 panic）は未着手**
+3. **`<data_dir>/lid-guard.json` は #513 の共有カタログへ宣言が要る**（作法 3 のとおり踏んだ）。
+   Local + 専用 note（共有すると別マシンの電源プラン GUID と元値を持ち込む）
+4. **win467 版のテストはそのまま入れると危ない**: 単体テストが `TAKO_DATA_DIR` を差し替えるので
+   同一バイナリの並列テストを巻き込む（#608 と同型）。記録 I/O をパス引数版へ切り出し、
+   機械全体で 1 つしかない状態（電源要求・電源プラン・記録キャッシュ）を触るテストは
+   `platform::testing::machine_state_lock()` で直列化した
+5. **非 Windows の `imp::Guid = ()`** は clippy の `let_unit_value` で落ちる（macOS の `-D warnings`）。
+   専用のサイズゼロ型にして境界の都合を呼び出し側の `allow` へ漏らさない
+6. `power.rs` の doc にあった「Windows に蓋閉じ継続の仕組みは無い」は **#697 が実測で覆した前提**
+   なので削除した
+
+#### 実機実測（`ssh win`。session 1 へ `schtasks /it` で GUI を投げる）
+
+| 観点 | 実測 |
+|---|---|
+| アイドル防止 | `mode=on` で `powercfg /requests` の SYSTEM に `[PROCESS] …\tako-app.exe`、`mode=off` で消える |
+| busy 判定 | アイドルなシェルだけのときは**倒さない**（電源要求 absent・lid 0x00000001 のまま）。長時間の子プロセスを走らせると PRESENT へ |
+| 蓋閉じ継続 | 稼働中に AC が `0x00000001 → 0x00000000`、記録は `{"scheme":"381b4222-…","ac":1,"dc":null}`。`powercfg /qh` の目でも一致 |
+| 自動解除 | エージェントが終わると**自分で** `0x00000001` へ戻り記録も消える（#779 の 60 秒保険ぶんの遅れがある） |
+| 残留復元 | `kill -9` で倒したまま落としても、次回起動で `0x00000001` へ戻る（persist.log に `lid-sleep: 蓋閉じ継続を解除` が残る） |
+| ポート検知 | `tako list` が `pane 3 ports=[8123/node.exe]`。同時刻に psmux が **21 個** LISTEN しているが 1 個も報告されない |
+| `tako sleep-guard install-lid-sleep` | Windows で成功（`この OS では追加の権限も登録も不要です`）。以前は osascript を起こして必ず失敗していた（#727 の症状 2） |
+
+**注意（実機の作法）**: SSH セッションは session 0 で **DirectX デバイスが無く**、
+そこから `tako-app.exe` を起動すると `Creating DirectX renderer` /
+`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE (0x887A0022)` で即 panic する。GUI が要る検証は
+必ず `schtasks /it` 経由（作法 12）。また `TAKO_ISOLATED=1` は **persist を OFF にする**ので、
+器（psmux）が要る検証では `TAKO_PERSIST=1` を明示する（ソケットは `tako-iso-<pid>` のまま隔離される）。
+CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 GUI へ届く。
+`tako split` は tako の外から叩くので `--pane` が必須。
+
+スライス 9 の道具は `C:\Users\shioz\dev\` に残してある（次スライスで使い回せる）:
+`s9-launch.ps1`（schtasks から session 1 へ GUI を投げる。persist ON）/
+`s9-drive.ps1`（SSH 側から CLI で駆動して観測）/ `s9-final.ps1`（受け入れ観点の通し）/
+`s9-lidcycle.ps1`（蓋の倒す → 自動解除 → `kill -9` 残留 → 起動時復元の 4 段）。
+採取物は `C:\Users\shioz\dev\tako-evidence-s9\`。
+
+#### スライス 9 が残した宿題
+
+- **#724 の症状②（「ブラウザで開く」で abort）は未着手**。wry の `build_as_child` が
+  `wait_with_pump` で入れ子メッセージループを回し、GPUI の `App` 借用中に
+  foreground runnable が再入して二重借用 panic → `extern "system"` を跨ぐので abort。
+  WIP は `windows/724-port-crash` の `82d3dcb`（`webview.rs` の `CREATION_PUMPS_EVENT_LOOP` +
+  `main.rs` の遅延生成キュー、計 260 行）
+- **#727（設定画面のスリープ系が macOS 前提）は未着手**。ボタンが**必ず失敗する**症状は
+  dispatch を `prepare_lid_control` 経由にしたぶん解消したが、文言（「Mac が眠って…」/
+  「sudoers を登録」）と状態表示の欠落は残る。WIP は `windows/727-sleep-settings` の
+  `5791a03`（`settings_sleep.rs` 新設 + 設定タブ、計 820 行）
+- **`tako sleep-guard status` は CLI プロセス自身の状態を返す**（`sleep_guard_local` 経由で
+  IPC を通らないため `assertion_held` / `busy_agents` が常に 0）。**macOS でも同じ**の
+  main 由来の設計。実際の保持は `powercfg /requests`（Windows）/ `pmset -g assertions`（macOS）で見る
+- **`setup` の対話フロー（L3 の蓋閉じ案内）は未移植**。`--check` の表示だけ能力ベースへ直した。
+  win467 の該当箇所は `setup.rs` の 663〜731 行付近
+- マトリクス（`tako_sleep_guard` / ポート検知）は**動かしていない**。スライス 8 の棚卸しで
+  Supported / Degraded を決める材料として上の実測表を使う
+
+### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 4 / 5 / 6 / 9 完了）
 
 main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ `e947524`（3）→
-`83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）。
-**残りはスライス 7 / 8 / 9**。依存グラフ上、いま着手できるのは
-**7（シェル統合 PowerShell）**・**9（スリープ防止 / ポート検知）**。8 は最後。
+`83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）→ PR #863（9）。
+**残りはスライス 7 / 8**。8（棚卸し）は 1〜7 のすべてに依存するので最後。
 
 **スライス 5 が残した宿題**: ①実機セルフテストが項目 2（`TERM / COLORTERM 注入`）で止まるので
 **スライス 7 完了後に通しで回す**こと ②#861（極端に狭い幅でメニュー行がコントロールと重なる）。

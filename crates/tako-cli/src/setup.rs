@@ -1981,19 +1981,23 @@ pub fn run_check() -> Result<(), String> {
                 );
             }
         }
-        let lid_mode = settings.lid_sleep_mode;
-        let sudoers = tako_control::sleep_guard::is_sudoers_installed();
-        match lid_mode {
-            tako_control::sleep_guard::LidSleepMode::Off => {
-                eprintln!(
-                    "  [情報] 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）"
-                );
-            }
-            tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning => {
-                if sudoers {
-                    eprintln!("  [OK] 蓋閉じ防止: while-agents-running（sudoers 登録済み）");
-                } else {
-                    eprintln!("  [不足] 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
+        // 蓋閉じ継続を持たない OS では案内しない（#524）
+        if tako_control::sleep_guard::lid_control_supported() {
+            let lid_mode = settings.lid_sleep_mode;
+            // 未完了かどうかだけを見る。手段（macOS の sudoers）は sleep_guard の内側（#697）
+            let setup_pending = tako_control::sleep_guard::lid_setup_pending();
+            match lid_mode {
+                tako_control::sleep_guard::LidSleepMode::Off => {
+                    eprintln!(
+                        "  [情報] 蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）"
+                    );
+                }
+                tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning => {
+                    if setup_pending {
+                        eprintln!("  [不足] 蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）");
+                    } else {
+                        eprintln!("  [OK] 蓋閉じ防止: while-agents-running");
+                    }
                 }
             }
         }
