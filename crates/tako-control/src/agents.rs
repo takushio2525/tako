@@ -79,6 +79,18 @@ fn find_ancestor_pane(
 
 /// `ps -axo pid=,ppid=` で全プロセスの親子マップを作る
 pub fn process_parent_map() -> HashMap<u32, u32> {
+    // 境界 B5（`platform::procinfo`）が親子関係を返せる環境（Windows の
+    // Toolhelp32 スナップショット）はそれを使う。返せない環境は空 Vec が来るので
+    // 従来の `ps` 経路へ落ちる（#524。スライス 1 が置いた境界の配線）。
+    //
+    // **ここに `cfg(windows)` を書かない**のが肝。書くと FFI の転記が
+    // `procinfo` と二重になり、両方を直さないと壊れる形になる（規約は
+    // `platform/mod.rs` の冒頭）。判定材料は「OS 名」ではなく
+    // 「境界が答えを持っているか」
+    let snapshot = tako_core::platform::procinfo::snapshot();
+    if !snapshot.is_empty() {
+        return snapshot.into_iter().map(|p| (p.pid, p.ppid)).collect();
+    }
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
         .output();
@@ -674,7 +686,19 @@ mod tests {
     #[test]
     fn process_parent_mapは自プロセスを含む() {
         let map = process_parent_map();
-        assert!(map.contains_key(&std::process::id()));
+        let me = std::process::id();
+        assert!(
+            map.contains_key(&me),
+            "自プロセス（pid={me}）が親子マップに無い。\
+             `ps` も境界 B5 のスナップショットも答えを返していない"
+        );
+        // 親も同じマップに居ることまで見る（pid だけ入って ppid が 0 埋めなら
+        // 「子プロセスあり」の判定が全部空振りする）
+        let parent = map[&me];
+        assert!(
+            parent != 0 && parent != me,
+            "自プロセスの親が壊れている: ppid={parent}"
+        );
     }
 
     #[test]
