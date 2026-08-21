@@ -1402,6 +1402,104 @@ spawn 経路では**まだ使われていない**。**#885 に起票**。
 本件は**内側コマンドの引用**。今回 `-t <window 名>` がセッション名 `<sock>__<name>` として
 解決される様子も観測したが、これも target 解決の話で引用とは機序が違う。
 
+#### #884 の記録（PTY へ渡す argv の引用。PR で追記・2026-08-21）
+
+**症状**: persist ON（器 = psmux）で `cwd` に空白を含むディレクトリを指定すると、
+`tab new --cwd` / `tako run` のペインが**応答は返るのに消える**。
+`C:\Users\First Last\…` のようにユーザー名へ空白が入るマシンでは日常的に踏む。
+
+**原因層の確定（対照実測）**: psmux 単体へ**同じ引数を 3 通りの引用で**渡して切り分けた。
+`Process.StartInfo.Arguments` を 1 本の文字列で渡す = ConPTY へ渡るコマンドラインと同じ形。
+
+| 渡し方（`new-session -d -s … -c <dir>`） | 結果 |
+|---|---|
+| A: cwd を引用（正しい argv 相当） | **生存**・cwd も正しい |
+| B: cwd を素のまま（`escape_args=false` の出力そのもの） | **セッションが存在しない** |
+| C: 対照 = 素のままだが空白を含まない cwd | **生存** |
+
+**psmux は無罪**（A と C が生きる）。**tako の argv → コマンドライン変換**が犯人。
+
+**機序**（`remain-on-exit on` の conf を当てて死因を採取して確定）:
+
+```
+capture-pane => with: The term 'with' is not recognized as a name of a cmdlet, ...
+pane_current_path => C:\Users\shioz   （-c が `…\dir` になり存在しないので落ちた先）
+```
+
+`-c C:\…\dir with space` が `-c` `C:\…\dir` `with` `space` へ割れ、
+`new-session` は**余った語を shell-command と解釈して実行する**。
+tako の器設定は `remain-on-exit` が off なのでペインは即破棄され、**画面には何も出ない**。
+
+**コード上の原因**: `TerminalSession::spawn` が `tty::Options` を
+`..tty::Options::default()` で組んでいたため、alacritty の
+**`escape_args` が `false`** のままだった。Windows の `cmdline()` は
+`program` と `args` を**素の空白で連結するだけ**なので、tako の argv 形の
+`SpawnCommand.args` が Windows でだけ「生のコマンドライン断片」に意味が変わっていた。
+
+**直し方**: `platform::shell::apply_arg_escaping`（境界 B1）を新設し、
+`tty::new` へ渡す前に必ず通す。Windows は `escape_args = true`（CRT 規則）、
+unix は恒等（`execvp` へ argv がそのまま渡る）。**語ごとの引用を自前で組まない**のは、
+CRT 規則（引用符の前の連続バックスラッシュを倍にする等）を二重実装しないため。
+
+`-c <cwd>` だけでなく **`-e KEY=<空白入りの値>` も同じ機序で壊れていた**のが
+同時に直る（実測: `-e "TAKO_SPACE=a b c"` が `show-environment` でそのまま読める）。
+
+##### #881 を巻き戻していないことの確認
+
+`escape_args = true` にすると、器へ渡す**内側コマンド 1 本**（`inner_command_line` の
+出力）も CRT 規則で 1 語へ括られる。psmux が単語分割の主体なので壊れないかを実測した:
+
+| 形 | 結果 |
+|---|---|
+| `-c "<空白入り>" "pwsh.exe -NoLogo"`（after の形） | 生存・`cmd=pwsh`・cwd 正しい |
+| `-c <空白入り> pwsh.exe -NoLogo`（before の形） | セッションが存在しない |
+| `… "pwsh.exe -NoLogo -NoExit -Command 'Write-Output ok'"`（#881 の単引用符入り） | 生存・`ok` が出力される |
+
+単引用符は CRT 規則の対象外なので**そのまま psmux の単語分割へ渡る** = #881 の
+`program_path::single_token` の前提は不変。
+
+##### テストの検出力で踏んだ罠（最重要）
+
+最初に書いた e2e は「器がそのセッションのペインを**一度でも**正しい cwd で返したら合格」に
+していたため、**修正を戻しても通った**（検出力ゼロ）。実測で機序を確定:
+
+```
+t=+200ms  => tako-884-27448 0 C:\…\Temp\tako-884 cwd 27448
+t=+600ms  => tako-884-27448 0 C:\…\Temp\tako-884 cwd 27448
+t=+1200ms => (no panes)
+```
+
+`-c` が割れて存在しないディレクトリになると psmux は**クライアントの cwd** へ落ちるが、
+`TerminalSession::spawn` は `working_directory`（`CreateProcessW` の
+`lpCurrentDirectory`）にも同じ cwd を渡しており、**そちらは引用の影響を受けない**。
+そのため壊れていても 1 秒弱は「正しい cwd のペインが居る」ように見える。
+出現を待ったうえで **4 秒の生存を見張る**形に直した（Issue の症状
+「応答は返るがペインごと消える」そのものの判定）。
+
+教訓: **「壊れている側で落ちること」を実際に確かめるまでテストは完成していない**。
+とくに tako は同じ情報（cwd）を器へ 2 経路で渡しているので、
+片方が壊れても一時的に正常に見える。
+
+##### 実機実測（psmux 3.3.7 / Windows 11）
+
+| 観点 | before（`escape_args` 既定） | after |
+|---|---|---|
+| `空白を含む引数が1語のまま子へ届く` | **FAILED**（`ARGC=1` にならない） | ok |
+| `器ありでも空白入りcwdのペインが生き残る` | **FAILED**（現れたあと消える） | ok |
+| `cargo test --workspace`（実機） | 22 件失敗 | **22 件失敗・集合が完全一致** |
+
+macOS 側: `test --workspace` **2406 passed / 0 failed** / `fmt` / `clippy`（両 feature）/
+クロスチェック **エラー 0・警告リストが main と完全一致**。
+番犬（`spawnはargvの組み直しを境界へ委ねる`）は境界呼び出しを外すと FAILED になる。
+
+##### 残っている隣接の穴（別件）
+
+alacritty の `cmdline()` は **`program` を一切エスケープしない**
+（`cmd.push_str(&shell.program)`。`escape_args` の対象外）。空白入りの
+プログラムパスは `CreateProcessW` の「空白区切りを順に試す」探索に救われて
+いるだけなので、`C:\Program.exe` のような細工があると取り違えうる。
+本 Issue の症状（cwd）とは層が別なので触っていない。
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
@@ -1648,6 +1746,11 @@ macOS 側のベースライン: `test --workspace` **2386 passed / 0 failed**（
   UTF-8 出力を読むと文字化けする（**表示だけの問題**。コミット本体は正しい UTF-8）。
   日本語のコミットメッセージを Windows 側で作るときは UTF-8 バイトを直接書いた
   ファイルを `git commit -F` で渡す
+- **fresh worktree は `web/tako-remote/dist/` を持たない**（`.gitignore` 済み = 未追跡）。
+  `rust_embed` の `#[folder = "../../web/tako-remote/dist/"]` が解決できず
+  **tako-control のコンパイルが即失敗する**（`PwaAssets::get` の E0599 が連鎖）。
+  `cargo test --workspace` を実機で回す前に `npm run build` するか、既存 worktree から
+  `dist` をコピーする（#884 で踏んだ。**macOS のクロスチェックが緑でも落ちる**種類の失敗）
 - `#583` の既知失敗は 2026-08-21 時点で「12 件解消 / 6 件継続 / 新規 11 件 / psmux e2e 8 件」。
   スライスごとに Windows のテスト結果を #583 と突き合わせて増減を書き残す
 
