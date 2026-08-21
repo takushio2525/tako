@@ -106,6 +106,8 @@ fn 空白を含む引数が1語のまま子へ届く() {
     });
     let done = pane.wait_for("PROBE-DONE", Duration::from_secs(30));
     let screen = pane.screen_text();
+    // 子が握っているとディレクトリを消せないので、先に PTY を落とす
+    drop(pane);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(done, "プローブが完走しない（画面）:\n{screen}");
     assert!(
