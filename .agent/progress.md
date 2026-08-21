@@ -2330,3 +2330,30 @@
   本物の回帰を隠さない。plain 2 回（load 15〜17）も PASS + `TAKO_APP_SELF_TEST_OK`
 - 関連: PR（`Refs #858`）。診断カウンタ 3 本（`term_app_notifies` /
   `pane_body_notify_fallbacks` / `header_clock_ticks`）を追加
+
+## 2026-08-21（#467 スライス 9: スリープ防止 / 蓋閉じ継続 / ポート検知）
+- 境界 B9（`platform::power` = `PowerSetRequest` / `platform::lid` = 電源プランの
+  `GUID_LIDCLOSE_ACTION`）と B5 の検査側（`ports::pane_key` 経由の配下判定）を移植。
+  `sleep_guard` の保持判定・蓋閉じ判定を純関数 2 本へ集約し両 OS が同じ 1 本を通る形へ。
+  蓋制御の能力を 4 関数で表に出し「sudoers」という macOS 固有の手段を呼び出し側から隠した
+- **plan の持ち込み表に無かった 2 件が必須だった**: ①`agents::process_parent_map` の
+  `ps` 直叩き（Windows で常に空 → sleep guard の既定モード `while-agents-running` が
+  busy_agents=0 のまま**一度も発動しない**。stale binary 検知 #772 も同様）を境界 B5 へ配線
+  ②#724 症状①（psmux は IPC に TCP ループバックを使いサーバーをクライアントの子として
+  起こすので器つきの全ペインが偽 listen を 1 個持つ。実機で psmux が **21 個** LISTEN 中）
+- win467 版の是正 4 件: 単体テストの `TAKO_DATA_DIR` 差し替え（#608 と同型の並列競合）を
+  パス引数版へ / 機械全体で 1 つの状態を触るテストを `machine_state_lock()` で直列化 /
+  非 Windows の `imp::Guid = ()` が clippy `let_unit_value` で落ちる → 専用のサイズゼロ型 /
+  `power.rs` の「Windows に蓋閉じ継続の仕組みは無い」（#697 が覆した前提）を削除。
+  `<data_dir>/lid-guard.json` は #513 の共有カタログへ Local として宣言（fail-closed）
+- 実機実測: アイドル防止が `powercfg /requests` の SYSTEM に出て mode=off で消える /
+  アイドルなシェルだけなら倒さない / 稼働中に AC が `0x00000001 → 0x00000000` /
+  エージェント終了で自分で戻る / `kill -9` の残留も次回起動で戻る /
+  `tako list` が `8123/node.exe` を拾い psmux の 21 ポートを 1 個も報告しない
+- 検証: macOS `test --workspace` **2277 passed / 0 failed**（ベースライン 2228 → +49）/
+  fmt / clippy（feature 有無とも）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` /
+  クロスチェック エラー 0・**警告リストが main と完全一致** / Windows 実機の失敗は
+  **30 → 29 件**（`process_parent_map` が通るようになった。新規ゼロ）/ CI 全 pass
+- 関連: PR #863（`Refs #467, #524, #697, #724, #592`）
+- 次: スライス 7（別 worker 並行中）→ スライス 8（棚卸し）。#724 症状②（WebView2 の
+  借用 panic）と #727（設定画面のスリープ系）は未着手で plan に申し送り済み
