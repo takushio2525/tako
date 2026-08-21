@@ -56,10 +56,11 @@ pub enum CommandState {
 /// スクロールバックの保持行数
 const SCROLLBACK_LINES: usize = 10_000;
 
-/// シェルの既定 cwd（ホームディレクトリ）。macOS / Linux は `$HOME`、Windows は `%USERPROFILE%`。
-/// 取得できなければ None（その場合は親プロセスの cwd を継承する alacritty の既定挙動になる）
+/// シェルの既定 cwd（ホームディレクトリ）。解決は [`crate::paths::home_dir`] 1 本に寄せている
+/// （#870。ホーム解決を 2 か所に持つと片方だけ直る）。取得できなければ None
+/// （その場合は親プロセスの cwd を継承する alacritty の既定挙動になる）
 fn default_home_dir() -> Option<PathBuf> {
-    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+    crate::paths::home_dir()
 }
 
 // 既定シェルの解決は抽象境界 B1（`platform::shell`）に閉じている。
@@ -77,17 +78,6 @@ fn default_locale_env(
     let unset = |v: &Option<std::ffi::OsString>| v.as_deref().is_none_or(|s| s.is_empty());
     (unset(&lang) && unset(&lc_all) && unset(&lc_ctype))
         .then(|| ("LC_CTYPE".to_string(), "UTF-8".to_string()))
-}
-
-/// `default_home_dir` の純粋ロジック（テスト用に env 参照と分離）。
-/// `$HOME` を優先し、無ければ `%USERPROFILE%`。どちらも空なら None
-fn home_from(
-    home: Option<std::ffi::OsString>,
-    userprofile: Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    home.or(userprofile)
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1749,28 +1739,6 @@ mod tests {
             default_locale_env(None, None, Some(OsString::from("UTF-8"))),
             None
         );
-    }
-
-    #[test]
-    #[allow(non_snake_case)]
-    fn ホームディレクトリは_HOME_を優先し_空は無視する() {
-        use std::ffi::OsString;
-        // HOME があればそれを使う
-        assert_eq!(
-            home_from(
-                Some(OsString::from("/Users/foo")),
-                Some(OsString::from("C:\\u"))
-            ),
-            Some(PathBuf::from("/Users/foo"))
-        );
-        // HOME 無し → USERPROFILE（Windows）
-        assert_eq!(
-            home_from(None, Some(OsString::from("C:\\Users\\foo"))),
-            Some(PathBuf::from("C:\\Users\\foo"))
-        );
-        // 空文字は無視（親 cwd 継承へフォールバック）
-        assert_eq!(home_from(Some(OsString::new()), None), None);
-        assert_eq!(home_from(None, None), None);
     }
 
     #[test]

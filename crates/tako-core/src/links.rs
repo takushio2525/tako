@@ -417,9 +417,13 @@ fn overlaps_existing(links: &[DetectedLink], spans: &[(usize, usize, usize)]) ->
     })
 }
 
-/// ホームディレクトリのヒント。`HOME` 環境変数から取得
+/// ホームディレクトリのヒント（`~/` 展開に使う）。
+///
+/// 解決は [`crate::paths::home_dir`] 1 本に寄せている（#870）。以前はここが
+/// **`HOME` 決め打ち**で、`HOME` を持たない Windows では必ず `None` になり
+/// `~/…` のリンクが無反応だった（絶対パスだけ効く、という症状）
 fn dirs_hint() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::paths::home_dir()
 }
 
 /// 指定セル座標にリンクがあるかを返す
@@ -637,8 +641,11 @@ mod tests {
 
     #[test]
     fn detect_tilde_path() {
-        let home = std::env::var("HOME").unwrap();
-        let test_file = std::path::PathBuf::from(&home).join(".tako_test_link_detect");
+        let Some(home) = crate::paths::home_dir() else {
+            eprintln!("skip: この環境はホームを解決できない（HOME / USERPROFILE とも空）");
+            return;
+        };
+        let test_file = home.join(".tako_test_link_detect");
         std::fs::write(&test_file, "").unwrap();
         let screen = make_screen(&["cat ~/.tako_test_link_detect"], 80);
         let links = detect_links_with_cwd(&screen, Some(Path::new("/tmp")));
@@ -652,7 +659,11 @@ mod tests {
     fn cwd不明でも絶対パスとホーム起点は検出する() {
         let dir = setup_test_dir("without_cwd");
         let abs = dir.join("README.md");
-        let home = std::env::var("HOME").unwrap();
+        let Some(home) = crate::paths::home_dir() else {
+            eprintln!("skip: この環境はホームを解決できない（HOME / USERPROFILE とも空）");
+            cleanup_test_dir(&dir);
+            return;
+        };
         let line = format!("{} ~/", abs.display());
         let screen = make_screen(&[&line], 240);
         let links = detect_links_with_cwd(&screen, None);

@@ -36043,7 +36043,9 @@ mod self_test {
                         let base = app.focused_pane();
                         app.refresh_pane_links(base);
                         let links = app.pane_links.get(&base).cloned().unwrap_or_default();
-                        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                        // 期待値も共通のホーム解決を通す（#870。`HOME` 決め打ちだと
+                        // `USERPROFILE` しか無い環境で期待値が None になり検査が空振りする）
+                        let home = tako_core::paths::home_dir();
                         let has_absolute = links.iter().any(|link| {
                             link.kind == tako_core::LinkKind::Path
                                 && std::path::Path::new(&link.target) == absolute_file
@@ -36067,14 +36069,15 @@ mod self_test {
                     })
                     .unwrap_or((false, false, false, false));
                 check(absolute_ok, "絶対パスを実画面から検出・解決");
-                // `~` の解決は `links::dirs_hint`（`HOME` 決め打ち）が前提。Windows は
-                // `HOME` を持たないので解決できない（#870 で追跡）
-                if std::env::var_os("HOME").is_some() {
+                // `~` の解決は共通のホーム解決（`paths::home_dir`。#870 で一本化）を見る。
+                // **`HOME` の有無ではなく実際に解決できるか**で判定するので、
+                // `USERPROFILE` しか無い Windows でもここは必須項目として走る
+                if tako_core::paths::home_dir().is_some() {
                     check(home_ok, "~/ 起点パスを実画面から検出・解決");
                 } else {
                     println!(
-                        "TAKO_SELF_TEST_SKIPPED: 69c の ~/ 解決（この環境は HOME を持たない。\
-                         ホーム解決の一本化は #870）"
+                        "TAKO_SELF_TEST_SKIPPED: 69c の ~/ 解決（この環境は HOME も \
+                         USERPROFILE も無くホームを解決できない）"
                     );
                 }
                 // 相対パスの解決とその前提（cwd 追従）は OSC 7 が届く環境だけ
