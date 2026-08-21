@@ -139,6 +139,11 @@ pub mod notes {
         "PowerShell シェル統合と setup の Windows 対応が前提",
         "Requires PowerShell shell integration and Windows support in setup",
     );
+    /// #525。配置はできるが器が OSC を落とす
+    pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
+        "配置はできるが psmux が OSC を外へ通さないため、cwd 追従とコマンド状態は TAKO_BACKEND=none のときだけ働く",
+        "Installs, but psmux does not pass OSC through, so cwd tracking and command state only work with TAKO_BACKEND=none",
+    );
     /// #526 の担当範囲
     pub const WIN_ORCHESTRATOR: Note = Note::new(
         "orchestrator の Windows 縮退モードが前提",
@@ -1195,6 +1200,16 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Pending {
             note: notes::WIN_SETUP,
             issue: 525,
+        },
+    },
+    // #525。Windows 実機で実測して倒した（作法どおり、動くことを確認してから）:
+    // 配置・冪等・解除の完全復帰と OSC 7 / 133 の到達（pwsh 7 と 5.1 の両方）を確認。
+    // ただし**器が psmux だと OSC が外へ出ない**ので Supported ではなく Degraded
+    Feature {
+        key: "tako_shell_integration",
+        macos: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_SHELL_INTEGRATION_PSMUX,
         },
     },
     Feature {

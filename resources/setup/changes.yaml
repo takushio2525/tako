@@ -263,3 +263,36 @@ changes:
         gh でのプライベートリポジトリ作成を提案してよい。**リポジトリ作成と push は
         ユーザーの同意を得てから**行う。共有リポジトリは必ず private にする
       - 共有したくないなら何もしなくてよい。以後も勝手に配線されることはない
+
+  - revision: 15
+    version: "0.7.5"
+    date: "2026-08-21"
+    kind: guided
+    platforms: ["windows"]
+    title: PowerShell のシェル統合（cwd 追従・コマンド実行状態）を追加
+    description: |
+      Windows でも PowerShell ペインの cwd 追従（OSC 7）とコマンド実行状態
+      （OSC 133 = idle / running / failed）が取れるようになった（Issue #525）。
+      これが無いと `tako list` の cwd が空のままで、エージェントの「終わったか」も
+      判定できないので、AI からペインを見る操作がほぼ機能しない。
+
+      unix（macOS / Linux）は環境変数の注入だけで完結するので**何もしなくてよい**。
+      Windows は PowerShell に `ZDOTDIR` 相当が無いため、`$PROFILE` へ
+      マーカーで囲んだ 1 ブロックを置く必要がある:
+
+        tako shell-integration install
+
+      PowerShell 7 と Windows PowerShell 5.1 の**両方**へ置く（片方だけだと、
+      ペインで `powershell` と打った瞬間に統合が消える）。冪等なので何度実行してもよく、
+      `tako shell-integration uninstall` で足したブロックごと元のバイト列へ戻せる。
+      ブロックはペインの外（`TAKO_PANE_ID` が無い環境）では何もしないので、
+      置いたまま普通の PowerShell を使っても影響はない。
+
+      確認事項:
+      - **配置できても効かない環境がある**。永続バックエンドが psmux のときは
+        psmux 3.3.7 が OSC を外側へ通さない（実測）ため、cwd 追従とコマンド状態は
+        働かない。`tako shell-integration` の応答の `effective` が false で、
+        `blocked_by_backend` に理由が入る。倒すには `TAKO_BACKEND=none`
+        （= 器なし。tako 終了でペインのプロセスも終わる）を選ぶ必要がある
+      - 既に `$PROFILE` を自分で書いている場合も安全。追記は末尾へ 1 ブロックだけで、
+        既存の記述とファイルの文字コード（BOM 無しの CP932 等）は変えない

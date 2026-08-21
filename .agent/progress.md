@@ -2357,3 +2357,22 @@
 - 関連: PR #863（`Refs #467, #524, #697, #724, #592`）
 - 次: スライス 7（別 worker 並行中）→ スライス 8（棚卸し）。#724 症状②（WebView2 の
   借用 panic）と #727（設定画面のスリープ系）は未着手で plan に申し送り済み
+
+## 2026-08-21（#467 スライス 7: PowerShell シェル統合）
+- Windows の PowerShell ペインで cwd 追従（OSC 7）とコマンド状態（OSC 133）を成立させた。
+  **plan の見立てとの差 3 件**: ①`tako.ps1` は win467 に無く保全ブランチ
+  `windows/525-shell-integration` だけに在り、そこは #600/#614/#816/#513 より前の分岐なので
+  ファイルをそのまま取ると入力予測・Ground 読み飛ばし・設定共有を巻き戻す → PowerShell 分だけ接ぎ木
+  ②足りなかったのは `support.rs` ではなく `BackendCapabilities::osc_passthrough`
+  （psmux は OSC を素通ししない = 配置できても効かない）③`changes.yaml` の `platforms:` の
+  最初の実使用なので既存テストの前提（全エントリ未指定）が崩れた
+- 検証: macOS 全ゲート緑（test **2223**（+19）/ セルフテスト OK / クロスチェック警告 10 =
+  ベースライン同数。`--all-targets` でも エラー 0 = Windows 専用 e2e も型検査済み）+
+  **Windows 実機で `shell_integration_powershell` 6/0**（pwsh 7 と 5.1 の cwd・状態、
+  器の中では OSC が出ないことまで）+ CLI の install/冪等/uninstall をバイト列復帰まで実測。
+  失敗 30 件のままで新規ゼロ。マトリクスは実測に基づき Pending → **Degraded**
+- 起票して閉じた #856: debug の `tako.exe` が起動時にスタックオーバーフローするのを見つけたが、
+  **スライス 5 が既に修正済み**（このブランチの base がそれより前だった）ため重複 close。
+  「ユニットテストは実バイナリの起動経路を踏まない」という教訓だけ plan へ残した
+- 関連: PR #855（`Refs #467, #525`）。`shell_send.rs`（#640）は master 承認のうえ **7b へ分離**
+  （7b はこの PR に含めない）。**残りは 7b と 8（棚卸し）のみ**（4 / 5 / 9 は並行 worker が完了）

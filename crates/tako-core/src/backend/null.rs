@@ -32,6 +32,8 @@ impl SessionBackend for NullBackend {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            // 器が無い = シェルの出力が素のまま tako の PTY に届く
+            osc_passthrough: true,
             label: "none",
         }
     }

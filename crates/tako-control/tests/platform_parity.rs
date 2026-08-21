@@ -149,19 +149,40 @@ mod setup_changes_platforms {
     use tako_control::setup;
     use tako_core::platform::support::Platform;
 
-    /// 省略時は全プラットフォームが対象（既存エントリの後方互換）
+    /// 省略時は全プラットフォームが対象（既存エントリの後方互換）。
+    ///
+    /// **`platforms:` を実際に使うエントリが入ってからは「全部が未指定」では縛れない**
+    /// （#525 の revision 15 が Windows 限定になった）。縛るべき不変条件は
+    /// 「未指定のものは両方に出る」ことなので、そこだけを見る
     #[test]
     fn platforms省略は全プラットフォーム対象() {
         let mac = setup::changes_for(Platform::MacOs).expect("パースできること");
         let win = setup::changes_for(Platform::Windows).expect("パースできること");
         assert!(!mac.is_empty(), "changelog が空");
-        // 現行の changes.yaml は platforms 未指定のみ = 両プラットフォームで同数
-        assert_eq!(
-            mac.len(),
-            win.len(),
-            "platforms 未指定のエントリは両プラットフォームに配信されること"
+
+        let shared: Vec<u32> = mac
+            .iter()
+            .filter(|c| c.platforms.is_none())
+            .map(|c| c.revision)
+            .collect();
+        assert!(
+            !shared.is_empty(),
+            "platforms 未指定のエントリが 1 件も無い"
         );
-        assert!(mac.iter().all(|c| c.platforms.is_none()));
+        for rev in &shared {
+            assert!(
+                win.iter().any(|c| c.revision == *rev),
+                "platforms 未指定の revision {rev} が Windows 側で消えている"
+            );
+        }
+        // 逆向き: Windows 側の未指定エントリも macOS に出る
+        for c in win.iter().filter(|c| c.platforms.is_none()) {
+            assert!(
+                mac.iter().any(|m| m.revision == c.revision),
+                "platforms 未指定の revision {} が macOS 側で消えている",
+                c.revision
+            );
+        }
     }
 
     /// 指定されたプラットフォームだけに配信されること

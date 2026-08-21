@@ -1051,6 +1051,41 @@ mod tests {
         assert_eq!(pending.len(), (current - 2) as usize);
     }
 
+    /// `platforms:`（slice 1 で入れた機構）の**最初の実使用**が効いていること（#525）。
+    ///
+    /// これが壊れると Windows 限定の案内が macOS ユーザーへ流れる（逆も同じ）。
+    /// 実物の changes.yaml に対して見るので、リビジョンを足すときに気付ける
+    #[test]
+    fn windows限定のリビジョンはmacosへ配信されない() {
+        let mac = changes_for(Platform::MacOs).expect("changes.yaml をパースできる");
+        let win = changes_for(Platform::Windows).expect("changes.yaml をパースできる");
+
+        // #525 のシェル統合案内は Windows だけ
+        let rev = 15;
+        assert!(
+            win.iter().any(|c| c.revision == rev),
+            "revision {rev} が Windows 向けに出ない"
+        );
+        assert!(
+            !mac.iter().any(|c| c.revision == rev),
+            "revision {rev} が macOS へも配信されている（platforms の絞り込みが効いていない）"
+        );
+
+        // platforms 省略のエントリは両方に出る（絞り込みが全体に波及していないこと）
+        let shared: Vec<u32> = mac
+            .iter()
+            .filter(|c| c.platforms.is_none())
+            .map(|c| c.revision)
+            .collect();
+        assert!(!shared.is_empty(), "共通エントリが 1 件も無い");
+        for r in shared {
+            assert!(
+                win.iter().any(|c| c.revision == r),
+                "platforms 省略の revision {r} が Windows 側で消えている"
+            );
+        }
+    }
+
     #[test]
     fn change_kind_deserializes_lowercase() {
         let yaml = "revision: 1\nversion: \"0.2.4\"\ndate: \"2026-07-02\"\nkind: guided\ntitle: t\ndescription: d\n";
