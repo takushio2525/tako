@@ -40501,8 +40501,8 @@ mod self_test {
                 // (c)(d)(e) 実ペインでの判定と操作。ここまでの項目で使い回された
                 // ペインは role 付き / 実行中 / alt screen などの履歴を持つので、
                 // **この項目用に素のシェルペインを 1 枚作って**判定を見る。
-                // 送達先の検証には `cat` のペインを使う: tty がそのまま入力行を
-                // エコーするので「シェル入力行に現れる」ことを見つつ、
+                // 送達先の検証には打鍵をそのまま返すペイン（POSIX の `cat` 相当）を使う:
+                // 届いた行が画面に出るので「シェル入力行に現れる」ことを見つつ、
                 // セルフテストが本物のエージェントを起動してしまうのを避けられる
                 let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
                 let Some(anchor) = anchor else {
@@ -40536,15 +40536,44 @@ mod self_test {
                     }
                     pane
                 };
+                // スターターの前提「アイドルシェル」は OSC 133 の Idle で決まるので、
+                // **シェル統合が効いているシェル**でなければ成立しない。unix は spawn 時の
+                // env 注入で完結する（= 既定シェルをそのまま起こす）が、PowerShell は
+                // `$PROFILE` 経由なので `TAKO_ISOLATED=1` で data_dir を隔離した
+                // セルフテストからは配置が見えない（実機の `$PROFILE` の状態で結果が
+                // 変わる）。統合を自分で読ませた対話シェルを起こして前提を閉じる（#889）
+                let shell_program = tako_core::platform::shell::default_shell().map(|s| s.program);
+                let integration_script = tako_core::shell_integration::status()
+                    .script
+                    .filter(|s| s.exists());
+                let integration_shell = match (&shell_program, &integration_script) {
+                    (Some(program), Some(script)) => sh.integration_shell_command(program, script),
+                    _ => None,
+                };
+                println!(
+                    "selftest 93: shell={shell_program:?} script={integration_script:?} \
+                     integration_shell={integration_shell:?} echo_stdin={:?}",
+                    sh.echo_stdin_command()
+                );
+                // POSIX の `None` は「env 注入で足りる」= 正しい。それ以外の方言で
+                // 組めないのは前提（統合スクリプトの書き出し）が崩れているので進めない
+                if !sh.is_posix() && integration_shell.is_none() {
+                    fail(
+                        "#694: シェル統合を読み込ませた対話シェルを組めない\
+                         （上の selftest 93 行に材料が出ている）",
+                    )
+                }
                 let base = window
-                    .update(cx, |app, _, cx| split_pane(app, cx, None))
+                    .update(cx, |app, _, cx| split_pane(app, cx, integration_shell.clone()))
                     .ok()
                     .flatten();
-                let cat_pane = window
-                    .update(cx, |app, _, cx| split_pane(app, cx, Some(vec!["cat".into()])))
+                let echo_pane = window
+                    .update(cx, |app, _, cx| {
+                        split_pane(app, cx, Some(sh.echo_stdin_command()))
+                    })
                     .ok()
                     .flatten();
-                let (Some(base), Some(cat_pane)) = (base, cat_pane) else {
+                let (Some(base), Some(echo_pane)) = (base, echo_pane) else {
                     fail("#694: 検証用ペインの作成")
                 };
                 wait(cx, 700).await;
@@ -40587,23 +40616,23 @@ mod self_test {
                         .unwrap_or_default();
                     eprintln!("TAKO_SELF_TEST_694: pane={} {note}", base.as_u64());
                 }
-                let (terminal_mode_same, cat_stays_terminal) = window
+                let (terminal_mode_same, echo_stays_terminal) = window
                     .update(cx, |app, _, _| {
                         let gui = app.ui_mode;
                         app.ui_mode = UiMode::Terminal;
                         let in_terminal_mode =
                             app.pane_display_for(base) == PaneDisplay::Terminal;
                         app.ui_mode = gui;
-                        // `cat` が動いているペインは「アイドルシェル」ではないので
+                        // コマンドが動いているペインは「アイドルシェル」ではないので
                         // GUI モードでもターミナル表示のまま（保守的判定）
                         (
                             in_terminal_mode,
-                            app.pane_display_for(cat_pane) == PaneDisplay::Terminal,
+                            app.pane_display_for(echo_pane) == PaneDisplay::Terminal,
                         )
                     })
                     .unwrap_or((false, false));
                 check(
-                    idle_starter && terminal_mode_same && cat_stays_terminal,
+                    idle_starter && terminal_mode_same && echo_stays_terminal,
                     "判定表: アイドルシェル → スターター / terminal モードと実行中は据え置き (#694)",
                 );
 
@@ -40613,10 +40642,28 @@ mod self_test {
                     let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
                 }
 
-                // (d) 「AI チームに任せる」押下 → そのペインのシェルへコマンド行が届く
+                // (d) 「AI チームに任せる」押下 → そのペインのシェルへコマンド行が届く。
+                //
+                // 期待値は**製品が組んだ行そのもの**（`welcome::launch_command_line`）から
+                // 作る。`tako master` 決め打ちだと実体パスの引用形の差で外れる:
+                // POSIX は `/…/tako master` だが、Windows のパスは `:` と `\` を含むので
+                // 引用されて `'C:\…\tako.exe' master` になる（#889 で実測）。
+                // ディレクトリ部分を落として「実行ファイル名以降」で突き合わせるので、
+                // macOS では従来と同じ `tako master` を探すまま Windows でも成立する。
+                // なお (d) が見るのは**届いたか**で、届いた行が実行されるかは見ていない
+                // （echo ペインは行を実行しないので構造的に見られない）
+                let launch_line = tako_control::welcome::launch_command_line("master");
+                let expected_delivery = launch_line
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(launch_line.as_str())
+                    .to_string();
+                println!(
+                    "selftest 93d: launch_line={launch_line:?} expected={expected_delivery:?}"
+                );
                 let clicked = window
                     .update(cx, |app, _, cx| {
-                        app.starter_action(cat_pane, StarterAction::Master, cx)
+                        app.starter_action(echo_pane, StarterAction::Master, cx)
                     })
                     .unwrap_or(false);
                 let mut delivered = false;
@@ -40625,15 +40672,29 @@ mod self_test {
                     delivered = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&cat_pane)
+                                .get(&echo_pane)
                                 .map(|s| s.visible_lines().join(""))
                                 .unwrap_or_default()
-                                .contains("tako master")
+                                .contains(&expected_delivery)
                         })
                         .unwrap_or(false);
                     if delivered {
                         break;
                     }
+                }
+                if !delivered {
+                    let screen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&echo_pane)
+                                .map(|s| s.visible_lines().join("|"))
+                                .unwrap_or_else(|| "<ペインなし>".to_string())
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "TAKO_SELF_TEST_694d: clicked={clicked} expected={expected_delivery:?} \
+                         line={launch_line:?} screen={screen:?}"
+                    );
                 }
                 check(
                     clicked && delivered,
@@ -40673,7 +40734,7 @@ mod self_test {
                 // 後片付け: 検証用ペインを閉じて terminal モードへ戻す
                 // （以降の項目と最終終了処理を既定の表示で通す）
                 let _ = window.update(cx, |app, _, cx| {
-                    for pane in [cat_pane, base] {
+                    for pane in [echo_pane, base] {
                         let _ = tako_control::dispatch(
                             app,
                             tako_control::protocol::Request::Close {
@@ -42296,7 +42357,7 @@ mod self_test {
                                 tab: None,
                                 direction: Some(tako_control::protocol::Direction::Right),
                                 ratio: None,
-                                command: Some(vec!["cat".into()]),
+                                command: Some(sh.echo_stdin_command()),
                                 cwd: None,
                                 focus: Some(false),
                             },
@@ -48860,6 +48921,81 @@ mod selftest_env_assignment_watchdog {
         assert!(unquoted_env_assignments(commented).is_empty());
         // 逃げ道そのものの検査: マーカーがある行は見逃す
         assert!(unquoted_env_assignments(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
+    }
+}
+
+/// 「セルフテストが起こすペインのコマンドを argv リテラルで直書きする」形の番犬（#889）。
+///
+/// 項目 93 / 97 は `cat` を直書きしていた。**Windows の `cat` は `Get-Content` の
+/// エイリアスで実体が無い**ので、argv をそのまま `CreateProcess` へ渡す split では
+/// ペインが即死し、検証先を失ったまま「判定は通る」状態になっていた（実害 = 項目 93 で
+/// 止まり、以降の GUI モード / チャット / 設定画面 / limit-resume が一切走らない）。
+///
+/// ペインへ起こすものは必ず `platform::shell_dialect::ShellDialect` 経由で組む
+/// （`echo_stdin_command` / `shell_snippet_command` / `integration_shell_command`）。
+/// **単体テストは境界の中身しか守れない**ので、呼び出し側の形そのものをここで固定する
+#[cfg(test)]
+mod selftest_pane_command_watchdog {
+    /// ペインの起動コマンドを argv リテラルで組んでいる形。ここに現れたら違反。
+    ///
+    /// **`concat!` で組む**のは、この番犬自身のソース行が検査対象
+    /// （`include_str!("main.rs")`）に含まれるため。パターンを 1 語で書くと
+    /// 定義行と期待値の行が自分の検査に引っかかる
+    const LITERAL_PANE_COMMANDS: &[&str] = &[
+        concat!("command: Some(", "vec!["),
+        concat!("split_pane(app, cx, Some(", "vec!["),
+    ];
+
+    /// 「シェルへ起こすコマンドではない見本」の逃げ道。テストの見本行にだけ書く
+    const ALLOW_MARKER: &str = "watchdog-allow";
+
+    fn literal_pane_commands(src: &str) -> Vec<(usize, &'static str)> {
+        let mut hits = Vec::new();
+        for (index, line) in src.lines().enumerate() {
+            if line.trim_start().starts_with("//") || line.contains(ALLOW_MARKER) {
+                continue;
+            }
+            for pattern in LITERAL_PANE_COMMANDS {
+                if line.contains(pattern) {
+                    hits.push((index + 1, *pattern));
+                }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn セルフテストのペイン起動コマンドは方言境界から作る() {
+        let hits = literal_pane_commands(include_str!("main.rs"));
+        assert!(
+            hits.is_empty(),
+            "main.rs{hits:?} がペインの起動コマンドを argv リテラルで直書きしている。\
+             `cat` / `/bin/sh` は Windows に無いのでペインが即死する。\
+             `ShellDialect`（`echo_stdin_command` / `shell_snippet_command` /\
+             `integration_shell_command`）から組むこと（#889）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬はargvリテラルを見つけ境界経由は許す() {
+        // 番犬へ渡す見本（実際にペインを起こす行ではない）
+        let bad = "    command: Some(vec![\"cat\".into()]),"; // watchdog-allow
+        let bad2 = "    split_pane(app, cx, Some(vec![\"cat\".into()]))"; // watchdog-allow
+        let good = "    command: Some(sh.echo_stdin_command()),";
+        let good2 = "    split_pane(app, cx, integration_shell.clone())";
+        assert_eq!(
+            literal_pane_commands(bad),
+            vec![(1, LITERAL_PANE_COMMANDS[0])]
+        );
+        assert_eq!(
+            literal_pane_commands(bad2),
+            vec![(1, LITERAL_PANE_COMMANDS[1])]
+        );
+        assert!(literal_pane_commands(good).is_empty());
+        assert!(literal_pane_commands(good2).is_empty());
+        // 逃げ道そのものの検査: マーカーがある行は見逃す
+        assert!(literal_pane_commands(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
     }
 }
 
