@@ -3722,6 +3722,11 @@ impl TakoApp {
             .collect();
         self.backend_sessions
             .iter()
+            // #853: セルフテストが注入した fixture のペインは読みに行かない。
+            // 実 claude が動いていないので読めば必ず「チャットではない」になり、
+            // `apply_chat_refresh` が注入した会話を消してしまう（判定は正しいので
+            // 判定は変えず、対象から外して race そのものを無くす）
+            .filter(|(pane, _)| !self.chat_fixture_panes.contains(*pane))
             .filter_map(|(pane, backend)| {
                 let role = roles.get(pane)?;
                 let session = self.terminals.get(pane);
@@ -3754,6 +3759,17 @@ impl TakoApp {
                 })
             })
             .collect()
+    }
+
+    /// セルフテストが注入した会話を定期更新から守る（#853。**セルフテスト専用**）。
+    ///
+    /// `TAKO_853_NO_CHAT_PIN=1` を置くと何もしない = 旧挙動。修正前の詰まりを
+    /// 同じバイナリで再現できるようにしてある（検出力の A/B）
+    pub(crate) fn pin_chat_fixture(&mut self, pane_id: PaneId) {
+        if std::env::var_os("TAKO_853_NO_CHAT_PIN").is_some() {
+            return;
+        }
+        self.chat_fixture_panes.insert(pane_id);
     }
 
     /// 読み取り結果の反映（UI スレッド）。変化が無ければ `cx.notify()` もしない
@@ -3823,6 +3839,9 @@ impl TakoApp {
     /// ターミナル表示のまま始まってしまう
     pub(crate) fn drop_gui_pane_state(&mut self, pane_id: PaneId) {
         self.chat_panes.remove(&pane_id);
+        // #853: セルフテストの fixture 保護もペインと一緒に落とす
+        // （ペイン ID は再利用されるので、残すと別のペインが読まれなくなる）
+        self.chat_fixture_panes.remove(&pane_id);
         self.chat_follow.remove(&pane_id);
         self.chat_scroll_handles.remove(&pane_id);
         // #830: 仮想リストの器とこのフレームの並びも一緒に落とす
