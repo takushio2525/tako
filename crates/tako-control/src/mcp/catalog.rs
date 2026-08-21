@@ -2348,6 +2348,29 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_shell_integration",
+            "description": "シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除（Issue #525 / #467）。\
+                これが効いていないとペインの cwd 追従（`list` の cwd）とコマンド実行状態\
+                （idle / running / failed）が取れない。\
+                action: status（既定。状態だけ返す）/ install / uninstall。\
+                unix は環境変数の注入だけで完結するので配置操作は要らない（uninstall はエラー）。\
+                Windows は PowerShell の $PROFILE へマーカー付きブロックを 1 個置く（冪等）。\
+                **応答の installed は「配置できたか」で effective は「実際に効くか」**で、\
+                器（永続バックエンド）が OSC を通さないと配置済みでも効かない。\
+                効かない理由は blocked_by_backend に入る。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "install", "uninstall"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_platform",
             "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
                 どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\

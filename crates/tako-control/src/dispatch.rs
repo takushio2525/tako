@@ -3565,6 +3565,10 @@ fn dispatch_inner(
         } => crate::platform::report(platform.as_deref(), status.as_deref(), known_limitations)
             .map_err(DispatchError::InvalidParams),
 
+        Request::ShellIntegration { action } => {
+            crate::shell_integration::run(action.as_deref()).map_err(DispatchError::InvalidParams)
+        }
+
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
             let action = action.as_deref().unwrap_or("status");

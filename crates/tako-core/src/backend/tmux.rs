@@ -71,6 +71,9 @@ impl SessionBackend for TmuxBackend {
             detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
+            // `allow-passthrough on` + DCS 包みで OSC が外側の tako へ届く
+            // （macOS のシェル統合はこの経路で成立している。FR-2.4.1）
+            osc_passthrough: true,
             label: "tmux",
         }
     }

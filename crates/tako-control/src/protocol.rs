@@ -1251,6 +1251,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         known_limitations: bool,
     },
+    /// シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除（Issue #525 / #467）。
+    /// `action` = "status"（既定）/ "install" / "uninstall"。
+    ///
+    /// unix は環境変数の注入だけで完結するので配置対象を持たない（`uninstall` はエラー）。
+    /// Windows は PowerShell の `$PROFILE` へマーカー付きブロックを 1 個置く。
+    /// **器（永続バックエンド）が OSC を通さないと配置済みでも効かない**ので、
+    /// 応答の `effective` と `blocked_by_backend` でそこまで判る
+    ShellIntegration {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+    },
     /// UI 表示言語の状態確認・切替（Issue #435。日英 i18n）。
     /// `action` = "status"（既定）/ "set"（`value` へ変更）。
     /// 変更は settings.json に永続化され、GUI に即時反映される

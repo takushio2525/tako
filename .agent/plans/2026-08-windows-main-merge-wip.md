@@ -762,7 +762,7 @@ crt-static と build.rs 2 本を含む）:
   無効なまま（落とし穴節のとおり）なので、実際のアップロードは
   **Mac 側で `gh release upload` する**か Windows の `gh auth login` を通す必要がある
 
-### 7. シェル統合 PowerShell（#525）
+### 7. シェル統合 PowerShell（#525）— ✅ **完了**（PR #855）
 
 - 持ち込む新規: `crates/tako-core/shell-integration/tako.ps1` /
   `crates/tako-core/tests/shell_integration_powershell.rs`
@@ -773,6 +773,121 @@ crt-static と build.rs 2 本を含む）:
   完成させるところから
 - `crates/tako-core/src/shell_send.rs`（#640）はこのスライスに含める
   （resume 注入・起動コマンド投入が送達確認経路を通るため）
+  → **7 では入れなかった**。OSC を出す話と、ペインへコマンドを送り込む話は
+  どちらも他方の前提になっていない（分けても片方が壊れない）ので、
+  1 PR = 1 まとまりを保つために外した。**#640 はスライス 7b として残っている**
+
+#### 完了記録（2026-08-21。PR #855 / `windows/467-slice7-shellint`）
+
+23 ファイル / +2,190 / −60。plan の見立てとの差が 3 件あった。
+
+##### 1. 移植元が plan の指定と違う（**共通手順が通らない**）
+
+plan の共通手順は「対象ファイルを `origin/windows/467-ipc-orchestration-local` から
+持ち込む」だが、**`tako.ps1` と `shell_integration_powershell.rs` は win467 に存在しない**。
+在ったのは保全ブランチ `windows/525-shell-integration` だけ。
+
+しかもその WIP は **#600 / #614 / #816 / #513 より前**の main から分岐しているので、
+ファイルをそのまま `git checkout` すると次を巻き戻す:
+
+| 巻き戻るもの | WIP が実際にやっていること |
+|---|---|
+| #600 / #614（入力予測） | `shell_integration.rs` から zsh-autosuggestions 一式（約 250 行）を削除 |
+| #816（Ground 読み飛ばし） | `osc_tap.rs` の `scan()` を 1 バイト送りへ戻し、同一性テストも削除 |
+| #513（設定共有） | `changes.yaml` の revision 13 / 14 を別内容へ振り直し |
+
+**後続スライスも保全ブランチを使うときは同じ確認が要る**（`git diff origin/main..<WIP>` を
+機能単位で読み、持ち込む差分だけを選ぶ）。
+
+##### 2. 器の能力に `osc_passthrough` を足す必要があった
+
+plan は編集対象に `platform/support.rs` を挙げていたが、**実際に足りなかったのは
+`BackendCapabilities`** のほう。前任が実測していた「psmux 3.3.7 は
+allow-passthrough 相当を受理するが素通ししない」を型で表す場所が main に無く、
+`Status::effective()` が書けなかった。判定は器に尋ねる 1 箇所（`backend_block()`）だけ。
+
+##### 3. `platforms:` 機構の最初の実使用
+
+`changes.yaml` の `platforms:`（スライス 1 で入った）はこれまで**使われていなかった**。
+revision 15 で初めて使ったので、既存テスト
+`platforms省略は全プラットフォーム対象`（「全エントリが未指定」を前提にしていた）が落ちた。
+**縛るべき不変条件は「未指定のものは両方に出る」**なので、そこを見る形へ書き換えた。
+
+##### 入れたもの
+
+- `shell-integration/tako.ps1`（189 行）: PSReadLine の `PSConsoleHostReadLine` を包んで
+  **実際の送信**を捉える（コマンド探索フックを主経路にできない理由は WIP のコメントに
+  実測が残っていた = PSReadLine 自身の探索で誤爆する）。不在時は
+  `PreCommandLookupAction` へ落ちる。`$?` / `$LASTEXITCODE` はユーザーの prompt へそのまま渡す
+- `shell_integration.rs`（591 → 899 行）: 境界 B13 を `mod imp` へ分離。配置は
+  **バイト列のまま**切った貼ったするので CP932 のプロファイルを壊さない。
+  `$PROFILE` は PowerShell 自身に**16 進で**尋ねる（OneDrive のリダイレクトで
+  決め打ちが外れる + 5.1 のリダイレクト出力は OEM コードページ）
+- `osc_tap.rs`: `strip_drive_slash`（`file:///C:/…` の先頭 `/` 落とし）だけを追加
+- CLI `tako shell-integration` + MCP `tako_shell_integration`（**135 ツール**）+
+  dispatch を `tako_control::shell_integration::run` の 1 実装で共有
+- `changes.yaml` revision 15（`platforms: ["windows"]`）
+
+##### 実測（macOS）
+
+`fmt` / `clippy --all-targets -- -D warnings` **0 findings**（`--features visual-test` も）/
+`test --workspace` **2223 passed / 0 failed**（スライス 6 の 2204 + **新規 19 本**）/
+隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / クロスチェック **エラー 0・警告 10**
+（ベースライン同数・内訳同一）。
+
+**`scripts/check-windows.sh --all-targets` も エラー 0**。素の
+`check-windows.sh` は `--all-targets` を付けないので **Windows 専用の
+integration test（`#![cfg(windows)]`）が型検査されない**。作法 1 を前倒しするなら
+これを渡すとよい（今回は実機ビルドが一発で通った）。
+
+##### 実測（Windows 実機）
+
+`cargo build --workspace` **一発 exit 0 / 7m59s**。
+
+**`shell_integration_powershell` 6 passed / 0 failed**（36 秒）:
+pwsh 7 の cwd 追従 / pwsh 7 の状態（idle・running・failed）/ 5.1 の cwd /
+5.1 の状態 / **器の中では OSC が外へ出ない**（psmux の制約をテストで固定）/
+統合なしでは何も報告されない。**#525 の受け入れ条件 3 はここで満たした**。
+
+CLI の通し（release バイナリ。理由は下記 #856）:
+
+| 検査 | 結果 |
+|---|---|
+| `install` の配置先 | pwsh 7 と 5.1 の**両方**。実パスは `…\OneDrive\ドキュメント\PowerShell\profile.ps1`（= 決め打ちが外れる構成そのもの） |
+| `status` | `installed: true` かつ **`effective: false`** + `blocked_by_backend`（psmux） |
+| 冪等性 | 2 回目は両方 `unchanged` |
+| 置いたブロックの符号 | **非 ASCII バイトは BOM の 3 バイトのみ**（パスに日本語があっても `[char]0xNNNN` へ逃げている） |
+| `uninstall` | 両方 `deleted` + **バイト列が完全復帰** |
+
+全体は `tako-app` 416/**0** / `tako-cli` 53/**0** / `tako-control` 954/25 /
+`tako-core` 682/5 / `platform_parity` 10/0 / `encoding_conpty` 5/0 / `psmux_backend` 16/0。
+**失敗 30 件のままで新規ゼロ**（新規テストは Windows でも全部通り、
+control 950→954・core 668→682 と増えただけ）。
+
+##### マトリクスは Pending → Degraded へ倒した
+
+実機で通しで確認できたので作法 4 の条件を満たす。ただし**器が psmux だと OSC が
+外へ出ない**ので `Supported` ではなく `Degraded`（note は
+`WIN_SHELL_INTEGRATION_PSMUX`）。この note はリリースノートの
+Known limitations にもそのまま出る。
+
+##### 起票して閉じた #856（**スライス 5 が既に直していた**）
+
+検証中に debug の `tako.exe` が `--version` すらスタックオーバーフローするのを見つけて
+#856 を起こしたが、**スライス 5（`0880c26`）が同じバグを既に直していた**。
+このブランチの base が `83bbdc0`（スライス 6）= スライス 5 より前だったため、
+測ったのが修正前のツリーだった。**rebase 後は debug でも起動する**。#856 は重複として close。
+
+測って足せた情報だけ残す:
+
+- PE の `SizeOfStackReserve` は **1,048,576 バイト = Windows の既定**
+  （macOS / Linux のメインスレッドは 8 MB なので同じコードでも落ちない）
+- **`cargo test` では検出できない**。libtest は各テストを別スレッドで回すので
+  メインスレッドの制限に当たらない（`tako-cli` は 53 passed のまま）= #583 に現れない
+- 実際の対処は `tako-cli/src/main.rs` で本処理を `.stack_size(16 MiB)` のスレッドへ載せる形
+
+**教訓（スライス 5 の申し送りと同じ）**: ユニットテストは実バイナリの起動経路を踏まない。
+検証には**実バイナリの CLI を 1 回叩く**を必ず入れる。
 
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
@@ -861,14 +976,16 @@ CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 
 - マトリクス（`tako_sleep_guard` / ポート検知）は**動かしていない**。スライス 8 の棚卸しで
   Supported / Degraded を決める材料として上の実測表を使う
 
-### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 4 / 5 / 6 / 9 完了）
+### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 4 / 5 / 6 / 7 / 9 完了）
 
 main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ `e947524`（3）→
-`83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）→ PR #863（9）。
-**残りはスライス 7 / 8**。8（棚卸し）は 1〜7 のすべてに依存するので最後。
+`83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）→ PR #863（9）→ PR #855（7）。
+**残りはスライス 7b（`shell_send.rs` / #640。7 から外した分）と 8（棚卸し）**。
+8 は 1〜7b のすべてに依存するので最後。
 
 **スライス 5 が残した宿題**: ①実機セルフテストが項目 2（`TERM / COLORTERM 注入`）で止まるので
-**スライス 7 完了後に通しで回す**こと ②#861（極端に狭い幅でメニュー行がコントロールと重なる）。
+**スライス 7 完了後に通しで回す**こと → **スライス 7 完了時に実施済み（結果は 7 の完了記録）**
+②#861（極端に狭い幅でメニュー行がコントロールと重なる）。
 また、スライス 5 で **`tako` CLI が Windows で一切起動できなかった main 由来バグ**（1MB スタック超過）
 を直したので、**以後のスライスは検証に「実バイナリの CLI を 1 回叩く」を必ず入れる**
 （ユニットテストだけでは実バイナリの起動経路を踏まない）。
@@ -879,6 +996,10 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 **macOS でも発火する**ので、main が後から足した設定ウィンドウ・アップデートウィンドウ
 （別 GPUI ウィンドウ）との相互作用を実機で確かめてから入れること。
 `#[cfg(windows)]` で呼び出しを囲えば macOS は不変にできる。
+
+**Windows 実機の注意（#856）**: debug ビルドの `tako.exe` は起動時に
+スタックオーバーフローする（main 由来。`cargo test` では出ない）。CLI を実機で
+叩く検証は `cargo build --release -p tako-cli`（約 8 分）が要る。
 
 #### 毎スライスで守る作法（実測で効いたもの）
 
@@ -908,7 +1029,14 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 8. **`cargo fmt` は commit より前に回す**。`fmt --check` → `fmt` → そのまま commit だと
    整形結果が commit に入らず、CI のフォーマット検査だけが落ちる（スライス 6 で 1 回踏んだ）。
    `git status` が clean になってから push する
-9. **PowerShell を SSH 越しに叩くときは `-EncodedCommand`**（base64 の UTF-16LE）にする。
+9. **保全ブランチから持ち込むときは「どの main から分岐したか」を先に見る**。
+   `windows/525-shell-integration` は #600 / #614 / #816 / #513 より前から分岐していて、
+   ファイルをそのまま `git checkout` すると**それらを巻き戻す**（スライス 7 で踏みかけた）。
+   `git diff origin/main..<WIP> -- <path>` を機能単位で読み、持ち込む差分だけを選ぶ
+10. **`scripts/check-windows.sh --all-targets` を渡すと Windows 専用の integration test も
+   macOS で型検査できる**（素のクロスチェックは `--all-targets` を付けないので
+   `#![cfg(windows)]` のテストファイルは見ていない）。作法 1 の前倒しに効く
+11. **PowerShell を SSH 越しに叩くときは `-EncodedCommand`**（base64 の UTF-16LE）にする。
    入れ子の引用符が壊れるうえ、`[Console]::OutputEncoding` が shift_jis なので
    日本語出力が化ける。冒頭に `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;` と
    `$ProgressPreference="SilentlyContinue"`（CLIXML のノイズ抑止）を足しておく

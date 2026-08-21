@@ -142,6 +142,10 @@ enum Command {
     /// プラットフォーム対応マトリクスの参照（Issue #515）。
     /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
     Platform(PlatformArgs),
+    /// シェル統合（OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態）の
+    /// 配置状態の確認と配置・解除（Issue #525）。引数なしで現在の状態を表示。
+    /// unix は環境変数の注入だけで完結するので配置操作は不要
+    ShellIntegration(ShellIntegrationArgs),
     /// AI 系設定（tako の宣言的設定 + claude のグローバル指示）を
     /// git リポジトリでデバイス間共有する（Issue #513）。
     /// 引数なしで現在の配線状態と差分を表示する
@@ -2277,6 +2281,17 @@ struct PlatformArgs {
     json: bool,
 }
 
+/// シェル統合の配置操作の引数（Issue #525）
+#[derive(Args)]
+struct ShellIntegrationArgs {
+    /// 操作（省略時は status）
+    #[arg(value_parser = ["status", "install", "uninstall"])]
+    action: Option<String>,
+    /// 生の JSON で出力する
+    #[arg(long)]
+    json: bool,
+}
+
 /// UI 表示言語コマンドの引数（Issue #435）
 #[derive(Args)]
 struct LangArgs {
@@ -2838,6 +2853,9 @@ fn cli_main() -> ExitCode {
         // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
+        // GUI を必要としないローカル処理（platform と同じ扱い）。
+        // 実体は dispatch と共通の tako_control::shell_integration::run
+        Command::ShellIntegration(ref args) => shell_integration_local(args),
         Command::Config(ref args) => config_share_local(args),
         // run-interactive --wait は起動 + ポーリングの合成
         Command::RunInteractive(ref args) if args.wait => run_interactive_wait(&cli.command),
@@ -4177,6 +4195,60 @@ fn print_list_section(title: &str, value: &serde_json::Value) {
 ///
 /// 応答の組み立ては `tako_control::platform::report` を通す。MCP `tako_platform` と
 /// **同じ 1 本**なので、CLI と AI で見える内容が食い違わない
+fn shell_integration_local(args: &ShellIntegrationArgs) -> Result<(), String> {
+    let out = tako_control::shell_integration::run(args.action.as_deref())?;
+    if args.json {
+        println!("{}", pretty_json(&out));
+        return Ok(());
+    }
+
+    let delivery = out["delivery"].as_str().unwrap_or("?");
+    println!("シェル統合: {}", out["shells"].as_str().unwrap_or("?"));
+    println!(
+        "  届け方   : {}",
+        match delivery {
+            "automatic" => "環境変数の注入（ユーザーのファイルは触らない）",
+            "profile" => "PowerShell の $PROFILE へブロックを配置",
+            other => other,
+        }
+    );
+    if let Some(script) = out["script"].as_str() {
+        println!("  スクリプト: {script}");
+    }
+    for t in out["targets"].as_array().into_iter().flatten() {
+        let state = match (t["installed"].as_bool(), t["up_to_date"].as_bool()) {
+            (Some(true), Some(true)) => "配置済み",
+            (Some(true), _) => "配置済み（内容が古い。install で更新できます）",
+            _ => "未配置",
+        };
+        println!(
+            "  - {:<24} {state}\n    {}",
+            t["label"].as_str().unwrap_or("?"),
+            t["path"].as_str().unwrap_or("?")
+        );
+    }
+    for c in out["changes"].as_array().into_iter().flatten() {
+        println!(
+            "  → {} {}",
+            c["kind"].as_str().unwrap_or("?"),
+            c["path"].as_str().unwrap_or("?")
+        );
+    }
+    // 「配置できているのに効かない」を必ず言う（#525。psmux は OSC を通さない）
+    if let Some(note) = out["blocked_by_backend"].as_str() {
+        println!("  [警告] {note}");
+    }
+    println!(
+        "  実効     : {}",
+        if out["effective"].as_bool() == Some(true) {
+            "有効"
+        } else {
+            "無効"
+        }
+    );
+    Ok(())
+}
+
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
     // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
     // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
@@ -6063,6 +6135,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::ShellIntegration(_) => {
+            unreachable!("shell-integration は run() を通らない（ローカル処理）")
+        }
         Command::Config(_) => unreachable!("config は run() を通らない（ローカル処理）"),
         Command::OpenIn(sub) => match sub {
             OpenInCommand::Dir { path, no_focus } => Request::OpenDir {

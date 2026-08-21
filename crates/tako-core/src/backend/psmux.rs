@@ -205,6 +205,11 @@ impl SessionBackend for PsmuxBackend {
             detached_capture: true,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            // psmux 3.3.7 は allow-passthrough 相当のオプションを受理するが**素通ししない**
+            // （実測: 素の OSC / DCS の ESC 二重化あり / 二重化なし のいずれも外へ出ず、
+            // 同時に流した平文だけが届いた）。このため psmux ペインでは
+            // cwd 追従とコマンド状態が働かない（#525）
+            osc_passthrough: false,
             label: "psmux",
         }
     }

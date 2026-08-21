@@ -52,6 +52,7 @@ pub mod remote_setup;
 pub mod sessions;
 pub mod settings;
 pub mod setup;
+pub mod shell_integration;
 pub mod sleep_guard;
 pub mod stale_binary;
 pub mod tailscale;

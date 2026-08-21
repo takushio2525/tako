@@ -742,6 +742,9 @@ pub(super) fn build_request(
             message: str_arg(args, "message")?.map(|s| s.to_string()),
             no_push: bool_arg(args, "no_push")?.unwrap_or(false),
         },
+        "tako_shell_integration" => Request::ShellIntegration {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+        },
         "tako_platform" => Request::Platform {
             platform: str_arg(args, "platform")?.map(|s| s.to_string()),
             status: str_arg(args, "status")?.map(|s| s.to_string()),

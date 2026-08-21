@@ -142,6 +142,14 @@ pub struct BackendCapabilities {
     pub detached_access: bool,
     /// スクロールバックの権威
     pub scrollback: ScrollbackAuthority,
+    /// シェルが出す OSC（7 = cwd / 133 = コマンド状態）が**外側の tako まで届くか**
+    /// （シェル統合 = FR-2.4.1 が成立する条件。#525）。
+    ///
+    /// tmux は `allow-passthrough on` + DCS で包めば通る。psmux 3.3.7 は
+    /// **オプションはあるが素通しされない**（実測: 素の OSC / DCS の ESC 二重化あり /
+    /// 二重化なし のいずれも外へ出ず、同時に流した平文だけが届いた）。
+    /// 器なしはそもそも間に何も挟まらないので true
+    pub osc_passthrough: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -179,6 +187,7 @@ impl BackendCapabilities {
                 ScrollbackAuthority::Backend => "backend",
                 ScrollbackAuthority::InProcess => "in_process",
             },
+            "osc_passthrough": self.osc_passthrough,
             "note": self.degraded_note(),
         })
     }
@@ -923,6 +932,7 @@ mod tests {
             detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
+            osc_passthrough: true,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -933,6 +943,7 @@ mod tests {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            osc_passthrough: true,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -949,6 +960,7 @@ mod tests {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            osc_passthrough: true,
             label: "none",
         };
         let v = caps.describe();
@@ -964,6 +976,7 @@ mod tests {
             detached_capture: true,
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
+            osc_passthrough: true,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -980,6 +993,7 @@ mod tests {
             detached_capture: true,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            osc_passthrough: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -1016,6 +1030,7 @@ mod tests {
                 detached_capture: false,
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
+                osc_passthrough: true,
                 label: "session-host",
             }
         }
@@ -1213,6 +1228,7 @@ mod tests {
             detached_capture: false,
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
+            osc_passthrough: true,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -1273,6 +1289,7 @@ mod tests {
                 detached_capture: true,
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
+                osc_passthrough: true,
                 label: "capture-only",
             }
         }
