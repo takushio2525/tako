@@ -35438,14 +35438,15 @@ mod self_test {
                 // 最下部のカーソル行がシェルのプロンプトになり画面状態が変わる）
                 // 罫線と選択カーソルは**実文字**で書く（`\uXXXX` エスケープはシェルの
                 // printf 実装差で展開されないことがあり、画面が別物になる）
-                let dialog_cmd = concat!(
-                    "clear; printf '%b' '",
-                    "▔▔▔▔▔▔▔▔▔▔\\n",
-                    "   What do you want to do?\\n\\n",
-                    "   ❯ 1. Stop and wait for limit to reset\\n",
-                    "     2. Upgrade to Max 20x for higher session limits every month\\n\\n",
-                    "   Enter to confirm\\n",
-                    "'; sleep 30"
+                let dialog_cmd = sh.paint_and_hold(
+                    concat!(
+                        "▔▔▔▔▔▔▔▔▔▔\n",
+                        "   What do you want to do?\n\n",
+                        "   ❯ 1. Stop and wait for limit to reset\n",
+                        "     2. Upgrade to Max 20x for higher session limits every month\n\n",
+                        "   Enter to confirm\n",
+                    ),
+                    30,
                 );
                 let send = |app: &mut TakoApp, text: &str| {
                     tako_control::dispatch(
@@ -35471,7 +35472,7 @@ mod self_test {
                         PaneOrigin::Cli,
                     )
                 };
-                let _ = window.update(cx, |app, _, _| send(app, dialog_cmd));
+                let _ = window.update(cx, |app, _, _| send(app, &dialog_cmd));
                 let mut shown = false;
                 for _ in 0..20 {
                     wait(cx, 300).await;
@@ -43011,7 +43012,7 @@ mod self_test {
                 };
 
                 // claude の入力ボックスを画面へ描く（空欄で dim の案内文つき = 実採取の形）
-                let rule = "\\u2500".repeat(20);
+                let rule = "\u{2500}".repeat(20);
                 // **末尾に sleep を付けるのが肝**: printf だけだと直後にシェル自身の
                 // プロンプト行が出る。`input_region` は下端 24 行の**最後の**プロンプト行を
                 // 採るので、シェルのプロンプトを拾ってしまい判定が時間依存で揺れる
@@ -43025,8 +43026,13 @@ mod self_test {
                         .map(|c| if c.is_ascii() { 1 } else { 2 })
                         .sum();
                     let col = 2 + width;
-                    format!(
-                        "clear; printf '%b' '{rule}\\n\\u276F\\u00a0{body}\\n{rule}\\n\\033[2A\\033[{col}C'; sleep 30"
+                    // 本文は**実文字**で組み、方言側で書式へ翻訳させる（`\uXXXX` の
+                    // エスケープはシェルの printf 実装差で展開されないことがある）
+                    sh.paint_and_hold(
+                        &format!(
+                            "{rule}\n\u{276F}\u{a0}{body}\n{rule}\n\u{1b}[2A\u{1b}[{col}C"
+                        ),
+                        30,
                     )
                 };
                 let send = |app: &mut TakoApp, text: String| {
@@ -43461,15 +43467,16 @@ mod self_test {
                 // **観測窓（101c の 300 秒）より十分長くする**のが要点: 短いと sh が
                 // 自然終了してペインが自動で閉じ、「後任が閉じた」と誤判定する
                 // （実測でこの偽陽性を踏んだ。#749）
-                let filler = "\\n".repeat(60);
-                let fixture = format!(
-                    "printf '%b' '{filler} Auto  5h 12%   ctx 55% ....  110K/200K\\n'; sleep 3600"
+                let filler = "\n".repeat(60);
+                let fixture = sh.paint_and_hold(
+                    &format!("{filler} Auto  5h 12%   ctx 55% ....  110K/200K\n"),
+                    3600,
                 );
                 let Some(master_pane) = make_pane(
                     cx,
                     anchor,
                     tako_control::protocol::Direction::Down,
-                    Some(vec!["/bin/sh".into(), "-c".into(), fixture]),
+                    Some(sh.shell_snippet_command(&fixture)),
                 ) else {
                     fail("#749: 検証用ペインの作成")
                 };
@@ -44569,12 +44576,9 @@ mod self_test {
                                 tab: None,
                                 direction: Some(tako_control::protocol::Direction::Down),
                                 ratio: None,
-                                command: Some(vec![
-                                    "/bin/sh".into(),
-                                    "-c".into(),
-                                    r"printf '\033[?1049h'; printf 'worker busy'; sleep 3600"
-                                        .into(),
-                                ]),
+                                command: Some(sh.shell_snippet_command(
+                                    &sh.paint_and_hold("\u{1b}[?1049h worker busy", 3600),
+                                )),
                                 cwd: None,
                                 focus: Some(false),
                             },
@@ -45577,7 +45581,7 @@ mod self_test {
                 // 新タブの初期ペインは分割後に閉じて、fixture ペインを全高にする。
                 // fixture は最下部に残す必要があるので sleep で保持する
                 let make_fixture_pane = async |cx: &mut AsyncApp, body: &str| -> Option<PaneId> {
-                    let script = format!("printf '%b' '{body}'; sleep 3600");
+                    let script = sh.paint_and_hold(body, 3600);
                     let pair = window
                         .update(cx, |app, _, cx| {
                             let shell = tako_control::dispatch(
@@ -45599,11 +45603,7 @@ mod self_test {
                                     tab: None,
                                     direction: Some(tako_control::protocol::Direction::Down),
                                     ratio: None,
-                                    command: Some(vec![
-                                        "/bin/sh".into(),
-                                        "-c".into(),
-                                        script.clone(),
-                                    ]),
+                                    command: Some(sh.shell_snippet_command(&script)),
                                     cwd: None,
                                     focus: Some(false),
                                 },
@@ -45748,10 +45748,10 @@ mod self_test {
                 };
 
                 // --- 正例 ① idle 型（ダイアログ無し。上限メッセージのまま止まっている） ---
-                let filler813 = "\\n".repeat(50);
+                let filler813 = "\n".repeat(50);
                 let idle_body = format!(
-                    "{filler813}実装を進めます\\n  Claude usage limit reached. \
-                     Your limit will reset at 3am.\\n"
+                    "{filler813}実装を進めます\n  Claude usage limit reached. \
+                     Your limit will reset at 3am.\n"
                 );
                 let Some(idle_pane) = make_fixture_pane(cx, &idle_body).await else {
                     fail("#813: idle 型ペインの作成")
@@ -45815,11 +45815,11 @@ mod self_test {
                 // 罫線と選択カーソルは**実文字**で書く（`\uXXXX` エスケープはシェルの
                 // printf 実装差で展開されず画面が別物になる。項目 102 と同じ理由）
                 let dialog_body = format!(
-                    "{filler813}▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\\n   \
-                     What do you want to do?\\n\\n   \
-                     ❯ 1. Stop and wait for limit to reset\\n     \
-                     2. Upgrade to Max 20x for higher session limits every month\\n     \
-                     3. Continue with usage credits\\n"
+                    "{filler813}▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n   \
+                     What do you want to do?\n\n   \
+                     ❯ 1. Stop and wait for limit to reset\n     \
+                     2. Upgrade to Max 20x for higher session limits every month\n     \
+                     3. Continue with usage credits\n"
                 );
                 let Some(dialog_pane) = make_fixture_pane(cx, &dialog_body).await else {
                     fail("#813: ダイアログ型ペインの作成")
@@ -45895,9 +45895,9 @@ mod self_test {
 
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
-                    "{filler813}   Bash command\\n   npm test\\n   \
-                     Do you want to proceed?\\n\\n   \
-                     ❯ 1. Yes\\n     2. Yes, and do not ask again\\n     3. No\\n"
+                    "{filler813}   Bash command\n   npm test\n   \
+                     Do you want to proceed?\n\n   \
+                     ❯ 1. Yes\n     2. Yes, and do not ask again\n     3. No\n"
                 );
                 let Some(perm_pane) = make_fixture_pane(cx, &perm_body).await else {
                     fail("#813: permission ペインの作成")
@@ -45915,8 +45915,8 @@ mod self_test {
 
                 // --- 負例 ③ API エラーでは発動しない（supervisor の担当） ---
                 let api_body = format!(
-                    "{filler813}実装を進めます\\n  \
-                     API Error: Connection closed mid-response.\\n"
+                    "{filler813}実装を進めます\n  \
+                     API Error: Connection closed mid-response.\n"
                 );
                 let Some(api_pane) = make_fixture_pane(cx, &api_body).await else {
                     fail("#813: API エラーペインの作成")

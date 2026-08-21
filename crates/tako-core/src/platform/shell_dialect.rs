@@ -277,6 +277,52 @@ impl ShellDialect {
         }
     }
 
+    /// シェル片を走らせる **argv**（`Split { command }` / `spawn_session` へ渡す形）。
+    ///
+    /// 検証用の疑似 TUI をペインで走らせるのに使う。`/bin/sh` は Windows に無いので
+    /// ここで振り替える（`powershell` は 5.1 でも 7 でも同じ名前で起動できる）
+    pub fn shell_snippet_command(self, snippet: &str) -> Vec<String> {
+        match self {
+            Self::Posix => vec!["/bin/sh".into(), "-c".into(), snippet.to_string()],
+            Self::PowerShell => vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                snippet.to_string(),
+            ],
+        }
+    }
+
+    /// 画面を 1 枚描いて保持する（検証用の疑似 TUI）。
+    ///
+    /// `body` は **Rust のエスケープ**（`\n` / `\u{1b}`）でそのまま書く。
+    /// POSIX 側は `printf '%b'` の書式へ、PowerShell 側は二重引用符の中の
+    /// `` `n `` / `$([char]27)` へ翻訳する。**生の改行を出さない**のが肝で、
+    /// そのまま打ち込む文字列としても使えるようにしてある。
+    ///
+    /// 保持するのは、描いた直後にシェルのプロンプトが戻ると最下部の行が
+    /// プロンプトになって画面状態が変わってしまうため
+    pub fn paint_and_hold(self, body: &str, seconds: u32) -> String {
+        match self {
+            Self::Posix => {
+                let escaped = body
+                    .replace('\\', "\\\\")
+                    .replace('\u{1b}', "\\033")
+                    .replace('\n', "\\n");
+                format!("clear; printf '%b' '{escaped}'; sleep {seconds}")
+            }
+            Self::PowerShell => {
+                let escaped = body
+                    .replace('`', "``")
+                    .replace('"', "`\"")
+                    .replace('$', "`$")
+                    .replace('\u{1b}', "$([char]27)")
+                    .replace('\n', "`n");
+                format!("Clear-Host; Write-Host -NoNewline \"{escaped}\"; Start-Sleep {seconds}")
+            }
+        }
+    }
+
     /// 明示コマンド（`tako split -- <argv>`）として渡す「シェル片を走らせる argv」。
     ///
     /// 引数リストで来る経路なので、シェル片は 1 個の引数として包む
@@ -595,6 +641,48 @@ mod tests {
         assert_eq!(
             PS.shell_snippet_argv("echo X; Start-Sleep 15"),
             "powershell -NoProfile -Command 'echo X; Start-Sleep 15'"
+        );
+    }
+
+    /// 疑似 TUI の 1 枚絵。**生の改行を出さない**（打ち込む文字列としても使える）
+    #[test]
+    fn 画面を描いて保持する() {
+        let body = "\u{1b}[2J行1\n\u{1b}[31m行2\n";
+        let posix = POSIX.paint_and_hold(body, 30);
+        assert_eq!(
+            posix,
+            "clear; printf '%b' '\\033[2J行1\\n\\033[31m行2\\n'; sleep 30"
+        );
+        let ps = PS.paint_and_hold(body, 30);
+        assert_eq!(
+            ps,
+            "Clear-Host; Write-Host -NoNewline \
+             \"$([char]27)[2J行1`n$([char]27)[31m行2`n\"; Start-Sleep 30"
+        );
+        for rendered in [posix, ps] {
+            assert!(
+                !rendered.contains('\n'),
+                "生の改行が混ざっている: {rendered}"
+            );
+        }
+    }
+
+    /// PowerShell の二重引用符の中で意味を持つ文字を素で通さない
+    #[test]
+    fn 画面本文の特殊文字を潰す() {
+        let ps = PS.paint_and_hold("a\"b`c$d", 1);
+        assert!(ps.contains("a`\"b``c`$d"), "{ps}");
+    }
+
+    #[test]
+    fn シェル片のargvは方言で変わる() {
+        assert_eq!(
+            POSIX.shell_snippet_command("echo x"),
+            vec!["/bin/sh", "-c", "echo x"]
+        );
+        assert_eq!(
+            PS.shell_snippet_command("echo x"),
+            vec!["powershell", "-NoProfile", "-Command", "echo x"]
         );
     }
 
