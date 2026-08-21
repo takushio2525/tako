@@ -11924,7 +11924,10 @@ mod tests {
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
         let had = config.projects.contains_key(key);
         if !had {
-            config.add(key.to_string(), "/tmp".to_string(), None);
+            // 存在するディレクトリならどこでもよい。`/tmp` を決め打ちすると Windows で
+            // 「cwd が存在しない」で spawn 系テストが一族まるごと落ちる（#467 / #583）
+            let cwd = std::env::temp_dir().to_string_lossy().to_string();
+            config.add(key.to_string(), cwd, None);
             config.save().unwrap();
         }
         f();
