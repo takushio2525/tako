@@ -434,6 +434,53 @@ fn 一覧と存在確認とcwdが往復する() {
     assert!(!f.backend.exists(&name), "cleanup で器が消える");
 }
 
+/// **#728 の土台**: 器の全ペインを 1 回で `(session:window.pane, pane_pid)` に列挙できる。
+///
+/// セッションカタログ（#112）と worker の状態解決（#592）は「実プロセス → どのペインか」を
+/// この列挙で逆引きする。psmux は `-J` を無視する・複合コマンドの後半を捨てる、といった
+/// 非互換を持つので、**`list-panes -a` と `#{session_name}:#{window_index}.#{pane_index}` に
+/// 本当に答えるのか**を実バイナリで固定しておく（答えなくなったら「器の中の claude が
+/// 1 つも見えない」に化けて、症状はカタログが空という遠い場所に出る）
+#[test]
+fn 器の全ペインをidとpidで列挙できる() {
+    let f = fixture!("panepids");
+    let a = session("tako-m2pids00001");
+    let b = session("tako-m2pids00002");
+    for name in [&a, &b] {
+        let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+        assert!(ok, "器を作れる: {out}");
+    }
+
+    let all = f.backend.pane_pids_all();
+    for name in [&a, &b] {
+        let found: Vec<_> = all
+            .iter()
+            .filter(|(id, _)| id.starts_with(&format!("{name}:")))
+            .collect();
+        assert_eq!(found.len(), 1, "{name} のペインが 1 件出る: {all:?}");
+        assert!(found[0].1 > 0, "pane_pid が 0 でない: {found:?}");
+        // セッション単位版と同じ pid を指す（2 つの API が食い違わない）
+        assert_eq!(
+            vec![found[0].1],
+            f.backend.pane_pids(name),
+            "pane_pids と pane_pids_all が同じ pid を返す"
+        );
+    }
+
+    // 器を畳めば列挙からも消える（stale な pid を返し続けない）
+    f.backend.kill(&a).expect("kill できる");
+    let after = f.backend.pane_pids_all();
+    assert!(
+        !after.iter().any(|(id, _)| id.starts_with(&format!("{a}:"))),
+        "kill した器は消える: {after:?}"
+    );
+    assert!(
+        after.iter().any(|(id, _)| id.starts_with(&format!("{b}:"))),
+        "残った器は出続ける: {after:?}"
+    );
+    let _ = f.backend.kill(&b);
+}
+
 /// 明示コマンドつきの spawn が psmux の引数パーサを通る（`inner_command` の実地確認）。
 /// バックスラッシュを含む Windows パスを引用してしまうと **起動に失敗する**ので、
 /// 組み立て規則が壊れたらここで落ちる

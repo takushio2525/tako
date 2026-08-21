@@ -105,11 +105,6 @@ impl Note {
 pub mod notes {
     use super::Note;
 
-    /// #519 の担当範囲
-    pub const WIN_PERSIST: Note = Note::new(
-        "tmux バックエンドに依存。Windows の永続化戦略の決定が前提",
-        "Depends on the tmux backend; requires deciding the Windows persistence strategy",
-    );
     /// #519 M2: Windows の永続化は psmux（外部の tmux 互換 CLI）を器にする。
     /// **導入は任意**なので、有無で復元の深さが変わることをそのまま書く
     pub const WIN_PERSIST_PSMUX: Note = Note::new(
@@ -957,13 +952,13 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
     },
+    // #728: カタログは器（tmux / psmux）に依存しない。器があればそのセッション名、
+    // 無ければペインの PTY 子 pid から claude を対応付ける（#592 と同じ二段構え）。
+    // 復元は tako 自身のペイン生成 + `claude --resume` なので器への送出も要らない
     Feature {
         key: "tako_sessions",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
     },
     Feature {
         key: "tako_set_title",

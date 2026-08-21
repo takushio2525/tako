@@ -177,6 +177,25 @@ impl SessionBackend for TmuxBackend {
             .collect()
     }
 
+    /// 器の中の全ペイン（#728）。`list-panes -a` で器の全セッションを 1 回で取る
+    fn pane_pids_all(&self) -> Vec<(String, u32)> {
+        let Ok(output) = crate::tmux::tmux_command(self.sock())
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index}.#{pane_index} #{pane_pid}",
+            ])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        super::parse_pane_pids_all(&String::from_utf8_lossy(&output.stdout))
+    }
+
     // `pane_in_mode` / `copy_mode_exit_bytes` は**あえて既定（None）のまま**にしてある。
     // tmux ペインは `ScrollbackAuthority::Backend` なのでホイールはミラー経路
     // （#159）を通り、tako が tmux を copy mode に置くことがそもそも無い（#686 は

@@ -2720,31 +2720,43 @@ impl TakoApp {
                 if !event_triggered && !timer_triggered {
                     continue;
                 }
-                let (should_scan, backends) = this
+                // #728: 走査対象は「器のセッション」と「器を持たないペインの PTY 子 pid」の
+                // 両方。以前は前者が空なら丸ごとスキップしていたので、psmux 未導入の
+                // Windows ではカタログも resume マップも永久に空だった
+                let (should_scan, backends, pane_pids) = this
                     .update(cx, |app: &mut TakoApp, _| {
+                        let mut backends: Vec<String> = Vec::new();
+                        // 器を持たないペインの (tako ペイン ID, PTY 直下の子 pid)
+                        let mut pane_pids: Vec<(u64, u32)> = Vec::new();
+                        for (pane, session) in &app.terminals {
+                            match app.backend_sessions.get(pane) {
+                                Some(backend) => backends.push(backend.clone()),
+                                None => pane_pids
+                                    .extend(session.child_pid().map(|pid| (pane.as_u64(), pid))),
+                            }
+                        }
                         let should = app.tmux_persist
                             && !app.secondary
-                            && !app.backend_sessions.is_empty()
+                            && !(backends.is_empty() && pane_pids.is_empty())
                             && std::env::var_os("TAKO_SELF_TEST").is_none();
-                        let bs: Vec<String> = if should {
-                            app.backend_sessions.values().cloned().collect()
-                        } else {
-                            Vec::new()
-                        };
-                        (should, bs)
+                        match should {
+                            true => (true, backends, pane_pids),
+                            false => (false, Vec::new(), Vec::new()),
+                        }
                     })
-                    .unwrap_or((false, Vec::new()));
+                    .unwrap_or((false, Vec::new(), Vec::new()));
                 if !should_scan {
                     last_scan = std::time::Instant::now();
                     continue;
                 }
-                // 前段ガード: バックエンドセッションに実行中の子プロセスがなければ
-                // claude も居ないので Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                // 前段ガード: 走査対象に実行中の子プロセスがなければ claude も居ないので
+                // Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                let guard_pids: Vec<u32> = pane_pids.iter().map(|(_, pid)| *pid).collect();
                 let has_children = cx
                     .background_executor()
                     .spawn(async move {
                         let refs: Vec<&str> = backends.iter().map(|s| s.as_str()).collect();
-                        tako_control::agents::count_sessions_with_running_children(&refs) > 0
+                        tako_control::agents::any_target_has_running_children(&refs, &guard_pids)
                     })
                     .await;
                 if !has_children {
@@ -2761,19 +2773,15 @@ impl TakoApp {
                 // セッションカタログの検出（Issue #112 A）の両方を導出する
                 let agents_value = cx
                     .background_executor()
-                    .spawn(async { tako_control::agents::list_agents_with_panes(None) })
+                    .spawn(async move { tako_control::agents::list_agents_for_scan(&pane_pids) })
                     .await;
                 last_scan = std::time::Instant::now();
                 let Ok(agents_value) = agents_value else {
                     continue;
                 };
                 let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
-                let resume_map: HashMap<String, String> = detected
-                    .iter()
-                    .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
-                    .collect();
                 let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
-                    app.apply_claude_resume_sessions(&resume_map);
+                    app.apply_claude_resume_sessions(&detected);
                     app.save_layout();
                     app.collect_pane_meta_snapshots()
                 });
@@ -2790,14 +2798,23 @@ impl TakoApp {
                                 eprintln!("warning: セッションカタログの同期に失敗: {e}");
                             }
                             // #390: worker レジストリへも session_id を反映
-                            // （prompt 到達の証跡。未変更ならファイル書き込みしない）
+                            // （prompt 到達の証跡。未変更ならファイル書き込みしない）。
+                            // #728: 器が無ければペイン ID キーで引く
                             for d in &detected {
-                                if let Err(e) =
-                                    tako_control::orchestrator::registry::record_session_detected(
-                                        &d.tmux_session,
-                                        &d.session_id,
-                                    )
-                                {
+                                use tako_control::orchestrator::registry;
+                                let result = match (&d.tmux_session, d.pane) {
+                                    (Some(ts), _) => {
+                                        registry::record_session_detected(ts, &d.session_id)
+                                    }
+                                    (None, Some(pane)) => {
+                                        registry::record_session_detected_by_pane(
+                                            pane,
+                                            &d.session_id,
+                                        )
+                                    }
+                                    (None, None) => Ok(()),
+                                };
+                                if let Err(e) = result {
                                     eprintln!(
                                         "warning: worker レジストリの session 反映に失敗: {e}"
                                     );
@@ -5569,18 +5586,36 @@ impl TakoApp {
         }
     }
 
-    /// 1 回の `claude agents --json` 成功結果を現在の backend ペインへ反映する。
+    /// 1 回の `claude agents --json` 成功結果を「ペイン → claude セッション」へ落とす
+    /// （layout.json に保存し、復元時の `claude --resume` に使う。#652）。
     /// 成功結果に存在しないペインは Claude が終了済みなので関連を外し、次回 PC 起動で
     /// 古い会話を勝手に resume しない。スキャン自体が失敗した場合は呼ばれない。
-    fn apply_claude_resume_sessions(&mut self, by_backend: &HashMap<String, String>) {
-        self.claude_resume_sessions = self
-            .backend_sessions
+    ///
+    /// #728: 器のセッション名だけでなく**ペイン ID 直付け**の検出も受ける。
+    /// 器が無い構成ではセッション名が付かず、以前はここで全部こぼれていた
+    fn apply_claude_resume_sessions(
+        &mut self,
+        detected: &[tako_control::sessions::DetectedSession],
+    ) {
+        let by_backend: HashMap<&str, &str> = detected
             .iter()
-            .filter_map(|(pane, backend)| {
-                by_backend
-                    .get(backend)
-                    .filter(|id| tako_control::transcript::is_valid_session_id(id))
-                    .map(|id| (*pane, id.clone()))
+            .filter_map(|d| Some((d.tmux_session.as_deref()?, d.session_id.as_str())))
+            .collect();
+        let by_pane: HashMap<u64, &str> = detected
+            .iter()
+            .filter_map(|d| Some((d.pane?, d.session_id.as_str())))
+            .collect();
+        self.claude_resume_sessions = self
+            .terminals
+            .keys()
+            .filter_map(|pane| {
+                let id = self
+                    .backend_sessions
+                    .get(pane)
+                    .and_then(|backend| by_backend.get(backend.as_str()))
+                    .or_else(|| by_pane.get(&pane.as_u64()))?;
+                tako_control::transcript::is_valid_session_id(id)
+                    .then(|| (*pane, (*id).to_string()))
             })
             .collect();
     }
@@ -5749,14 +5784,20 @@ impl TakoApp {
         mgr.flush_close(pane.as_u64(), &data.meta, &data.visible, reason_str);
     }
 
-    /// カタログ同期用のペインメタ（Issue #112 A。backend セッション対応のあるペインのみ）
+    /// カタログ同期用のペインメタ（Issue #112 A）。
+    ///
+    /// #728: 対象は**ターミナルを持つ全ペイン**。以前は `backend_sessions`（器のある
+    /// ペイン）だけを見ていたので、器が無い構成（Windows で psmux 未導入 /
+    /// tmux 不在の macOS）では 1 件も返らず、セッションカタログが永久に空になった。
+    /// 器が無いペインは `tmux_session = None` で表す（対応付けは検出側が
+    /// PTY 直下の子 pid で済ませている）
     fn collect_pane_meta_snapshots(&self) -> Vec<tako_control::sessions::PaneMetaSnapshot> {
         let logs = self.pane_logs_lock();
         let mut out = Vec::new();
-        for (pane, backend) in &self.backend_sessions {
+        for (pane, session) in &self.terminals {
             let mut snap = tako_control::sessions::PaneMetaSnapshot {
                 pane: pane.as_u64(),
-                tmux_session: backend.clone(),
+                tmux_session: self.backend_sessions.get(pane).cloned(),
                 ..Default::default()
             };
             for tab in self.workspace.tabs() {
@@ -5779,11 +5820,7 @@ impl TakoApp {
                     snap.title = bp.pane().title().map(str::to_string);
                 }
             }
-            snap.cwd = self
-                .terminals
-                .get(pane)
-                .and_then(|s| s.cwd())
-                .map(|p| p.display().to_string());
+            snap.cwd = session.cwd().map(|p| p.display().to_string());
             snap.log_file = logs.path_of(pane.as_u64()).map(|p| p.display().to_string());
             out.push(snap);
         }
