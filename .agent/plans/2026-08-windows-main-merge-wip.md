@@ -1155,7 +1155,10 @@ schtasks /run /tn tako865
 #### 次の一手（スライス 8 へ）
 
 - 項目 93 以降（GUI モード / チャット / 設定画面 / limit-resume）は
-  `shell_integration::status().effective()` を材料にする項目が続く。**#766 が直れば一気に進む**
+  `shell_integration::status().effective()` を材料にする項目が続く。~~**#766 が直れば一気に進む**~~
+  → **この見立ては外れた**（#766 の完了記録を参照）。セルフテストは `TAKO_ISOLATED=1` が
+  `TAKO_PERSIST=0` を立てるので**器なしのペイン**を測っており、器の素通しは関係なかった。
+  実際の前提は「`$PROFILE` への配置」と「`cat` 決め打ち」で、どちらも **#889**
 - マトリクスは**触っていない**（作法 4）。ただし棚卸しの材料は揃った:
   上の表がそのまま「Windows で何が動いて何が動かないか」の実測一覧になる。
   いま `tako_theme` / `tako_open_file` / `tako_preview_view` 等が `Pending` のままだが、
@@ -1595,6 +1598,110 @@ macOS が `USERPROFILE` も受け入れる挙動変更になり利得がない�
   USERPROFILE を見ずに `None` へ落ちていた（= 本 Issue と同じ症状）
 - `links.rs` のユニットテスト 2 本が `std::env::var("HOME").unwrap()` で **Windows では
   panic**（#583 の POSIX 前提失敗の一部）。共通解決 + 理由つきスキップへ
+||||||| parent of 1886865 ([ドキュメント] #766 の完了記録と外れた見立ての訂正 (#766) (#467))
+#### スライス 8 の前提: 器の中のシェル統合（#766）— ✅ **完了**（PR は本文末尾の記録）
+
+Windows の既定構成（persist ON = 器が psmux）でシェル統合（OSC 7 / 133）が**まったく働かない**。
+ペインのドットが待機中 / 実行中 / 失敗にならず cwd 追従も死ぬ = **セッション完全復元を
+使っている人ほど効かない**。器なしのペインでは完全に動く。
+
+##### 器の側では直らない（upstream のソースで確定した）
+
+起票時の実測（素の OSC・DCS の ESC 二重化あり / なしの 3 形すべてが外へ出ず、同時に流した
+平文だけが届く）に、**upstream の確認**（`psmux/psmux`。MIT / Rust / crates.io。
+2026-08-21 時点の master と v3.3.8）を足して原因を確定した:
+
+| 調べたこと | 結果 |
+|---|---|
+| `allow-passthrough` を読む側があるか | **無い**。`option_catalog.rs` / `options.rs` の get / set と config パースにしか現れない = tmux 設定互換のスタブ |
+| DCS の tmux 形式（`Ptmux`）の実装 | **リポジトリ全体で 0 ヒット** |
+| v3.3.8（2026-08-18）の changelog | 該当項目なし = **版数を上げても直らない** |
+| 私用 OSC で抜けられるか | **抜けられない**。psmux は「パースして画面モデルへ落とし、クライアントへ描き直す」多重化器で、OSC 8 すら**再直列化**して届けている（upstream #567）。画面モデルに置き場の無いバイト列は原理的に出ない |
+| 器が持っている材料 | OSC 7 → `#{pane_current_path}`（#495 / #539）、OSC 133 A/C/D → コマンド名（#469）。**終了コードは持っていない** |
+
+つまり素通しは upstream の新機能が要る話で、しかも **psmux は tako が配っているものではない**
+（winget / cargo で各自が入れる）。tako 側で閉じる必要がある。
+
+##### 入れたもの: 側路（`tako_core::osc_sink`）
+
+運ぶのは**解釈済みの状態ではなく OSC バイト列そのまま**で、解釈は PTY 経路と同じ `osc_tap` に
+通す。状態機械が 1 本のままなので「macOS では Failed(3) だが Windows では Idle」のような
+分岐が構造的に起きない。器の材料（`#{pane_current_path}` 等）を使う案は**終了コードが取れない**
+ので採らなかった。
+
+- 器が素通ししないときだけ `TAKO_OSC_SINK=<data_dir>/osc/<pane>.osc` をペインへ注入。
+  **`backend::PANE_SCOPED_ENV`**（tmux / psmux が共有する表）へ載せた — 片方だけ足すと
+  「tmux では効くが psmux では効かない」という追いにくい差になる
+- `tako.ps1` は書き先があれば OSC を**束ごと 1 ファイルへ差し替える**（`133;D` + `133;A` +
+  OSC 7 を 1 回で。個別に書くと最後だけ残って**終了コードが消える**）。`.new` へ書いて rename
+- tako は定期更新で「中身が前回と変わっていたら」`TerminalSession::feed_osc_bytes` へ通す。
+  **側路を持つペインが無ければ即 return** なので macOS / tmux のコストはゼロ
+- **器の能力申告（`osc_passthrough`）は変えていない**。psmux が素通ししないのは事実のままで、
+  変わったのは tako が素通しに依存しなくなったこと。経路は
+  `shell_integration::osc_transport()`（`pty` / `side-channel`）で読める
+
+##### 実機実測（`ssh win`。session 1 へ `schtasks /it`）
+
+**criterion 1 = 製品経路**（CLI → IPC → GUI → ペイン → psmux の器）で before / after:
+
+| 観測 | main `dc975df` | 本ブランチ |
+|---|---|---|
+| 起動後の `state` | `unknown` | **`idle`** |
+| `cmd.exe /c exit 3` の後 | `unknown` / `exit_code` なし | **`failed` / `exit_code = 3`** |
+| `cd` の cwd 追従 | `C:\Users\shioz`（動かない。区切り `\` = spawn 値） | `C:/Users/shioz` → **`C:/Users/shioz/dev`**（区切り `/` = OSC 7 由来） |
+| `tako shell-integration` の警告 | `[警告] 永続バックエンド（psmux）が…働かない` | **出ない** |
+| 側路ファイル | 無し | `iso/osc/2.osc` 57 バイト |
+
+側路の中身をバイト単位で確認したもの（束が 1 個 = 上書き方式が効いている）:
+
+```
+<ESC>]133;D;0<BEL><ESC>]133;A<BEL><ESC>]7;file:///C:/Users/shioz/dev<BEL><ESC>]133;B<BEL>
+```
+
+**副産物の実測**: セルフテストの項目 41 / 41b のスキップ理由が
+`blocked_by_backend=Some("永続バックエンド（psmux）が…働かない")` から **`None`** へ変わった
+（= 器の素通しへの依存が消えたことがテスト側の診断にも現れた）。残る `installed=false` は
+`TAKO_ISOLATED` の data_dir 隔離と `$PROFILE` が指す本番パスの食い違いで、#889 へ追記した。
+
+統合テスト（実 psmux + 実 pwsh）は **7/7 緑**（うち 1 本は `data_dir` にあえて空白を入れた
+ケース = `-e` に空白入り値が流れる最初の経路。#887 の根治がそのまま効いている実測）。既存の
+`器の中では統合が読み込まれてもoscが外へ出ない` は**そのまま緑** = 素通しは直っていないことと
+側路が届けていることを同時に固定する。実機の `cargo test --workspace` は **branch 22 / main（`c210aad`）22 で失敗テスト名まで
+`Compare-Object` が IDENTICAL**（新規ゼロ）。
+
+##### criterion 2（項目 93 の到達範囲）: 止まっていた原因は **2 つとも #766 の射程外**だった
+
+plan の見立て（「項目 93 以降は `effective()` を材料にするので #766 が直れば一気に進む」）は
+**外れていた**。診断行が決め手:
+
+```
+TAKO_SELF_TEST_694: pane=48 state=Some(Unknown) alt=Some(false) role=None backend=None busy=None
+```
+
+**`backend=None`** = 器が絡んでいない。セルフテストは `TAKO_ISOLATED=1` が `TAKO_PERSIST=0` を
+立てるので**器なしのペイン**を測っている。器なしなら OSC は元から PTY で通る。
+
+1. **`$PROFILE` にシェル統合が未配置**（実機の環境前提）。`tako shell-integration install` を
+   実行しただけで項目 93 の (c)（判定表）は通過した
+2. その次の (d) は `split_pane(…, vec!["cat"])` の **`cat` 決め打ち**で止まる。Windows の `cat` は
+   PowerShell のエイリアスのみ（実体なし。`CreateProcess` が失敗）→ 対象ペインが即死 →
+   スターターの配送先が消える
+
+**main（`9136942`）とブランチで同じ (d) に止まる**ことを A/B で確認（170 行 / 176 行）=
+**到達範囲は同一で、新たに止めた項目はゼロ**。1 / 2 はテスト側の前提なので **#889 に起票**した。
+
+##### 兄弟セッションとの並行（#881 / #884）
+
+- **psmux 本体もリリース物も触っていない**ので #881 とは衝突しない（`backend/psmux.rs` への
+  変更は env 許可リストの 1 行だけ）
+- **#884（PR #887）が前提**だった。`-e TAKO_OSC_SINK=<path>` は `-c <cwd>` と同じ露出で、
+  `escape_args` が false のままだと**空白入りパスが 3 語に割れる**。しかも `-e` はそれまで
+  `TAKO_PANE_ID` / `TAKO_TAB_ID` の**数値だけ**だったので、#766 が
+  **`-e` に空白入り値を流す最初の経路**になる = 「#887 が無いと新規に壊れる」関係。
+  #887 のマージ後に rebase し、統合テストの `data_dir` を**あえて空白入り**にして固定した
+- 実機の名前付きパイプ（`\\.\pipe\tako-shioz`）は先着が primary を取るので、**兄弟が
+  隔離 GUI を立てている窓で測ると secondary 扱いになる**（復元スキップ）。#884 の worker が
+  時刻つきで知らせてくれたので、その窓に当たった 1 本を測り直した。**session 1 は 1 本ずつ**
 
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
@@ -1777,7 +1884,7 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 
 #### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
 
-**最新の実測は main `c8c9fbb`（#877 の A/B で取った。所要 561 秒 / `-j 2`）**:
+**最新の実測は main `c210aad`（#766 の A/B で取った。#877 時点の `c8c9fbb` と同数・同名）**:
 
 | スイート | 結果 |
 |---|---|
@@ -1790,7 +1897,8 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 | `psmux_backend` | 16 / 0 |
 | `shell_integration_powershell` | 6 / 0 |
 
-**失敗 22 件はすべて main 由来**（#583 の既知分 + 以降 main へ増えた同系。#867 / #873 の実測と同数）。
+**失敗 22 件はすべて main 由来**（#583 の既知分 + 以降 main へ増えた同系。#867 / #873 / #877 /
+#766 の実測とも同数・同名。#881 / #884 / #887 が入っても増減していない）。
 #877 では branch / main の両方でスイートを回し、**失敗テスト名まで `Compare-Object` で
 完全一致（IDENTICAL）** を確認した = 新規ゼロ。スライスごとにこの表と突き合わせ、
 増減があれば `TAKO_BACKEND=none` 等で「自分の変更が原因か」を切り分けてから報告する。
