@@ -2474,3 +2474,22 @@
 - 関連コミット: PR #878（`Refs #873`）
 - 次: 残りはスライス 8（棚卸し）。並行 worker が #875（実行ペインの `/bin/sh` 決め打ち）を
   PR #879 で対応中。私が起票した **#877**（`claude agents --json` の `$SHELL -l -c` 決め打ち）は未着手
+## 2026-08-21（#875: 実行ペインの起動コマンドをシェル方言境界へ）
+- #666 カードの「新規ペインで実行」/ #453 Code Runner / `tako show-command --run` が Windows で
+  **PTY ごと立たなかった**（`dispatch::spawn_command_pane` の `/bin/sh -c` 直書き）のを、境界 B1 の
+  `platform::shell::run_pane_command` へ寄せて根治。POSIX は従来とバイト一致、Windows は
+  PowerShell へ `-EncodedCommand`（base64 / UTF-16LE）。**方言判定は `ShellDialect::from_program` の
+  使い回しで新 enum を作らない**（#873 の一本化と衝突しない）。`tako:shell` 宣言の包み方も同じ 1 本へ
+- **1 回目の修正では persist ON（器 = psmux）でまだ即死した**。psmux は内側コマンドの第 1 語の
+  引用符を剥がさず空白入りパスを運べないうえ、`inner_command` の `cmd.exe /c '…'` 包みが
+  **実測で効かない**（doc の「実測成功」は古い）。実行ペインは 1 語で書ける形（`pwsh.exe`）を
+  渡して回避し、包みが効かないこと自体は **#881 に起票**（8.3 短縮名が通ることまで実測）
+- 作法 11 をまた踏んだ: `/bin/sh` 決め打ちのテストが dispatch に 3 本あり、macOS 全緑のまま
+  **実機だけ 23 件失敗**（ベースライン 22 + 1）。境界の出力との突き合わせへ変え POSIX 固有の形は
+  `#[cfg(unix)]` の中へ。セルフテスト項目 91(d) の「PTY が立たないときだけ実行検査を外す」緩和も撤去
+- 検証: 実機 before/after 3 経路（`PTY を起動できなかった` → 出力 + `__TAKO_EXIT=0`）/ 終了コード
+  4 型（7 / 1 / 0 / 1）/ 引用符・日本語 / psmux 経由 / セルフテスト項目 91 が `ran=true`・**SKIP 行が
+  消え**停止位置は main と同じ項目 93 / 実機テストの失敗集合が main と**完全一致**（新規ゼロ）。
+  macOS は fmt / clippy（visual-test 有無）/ test 2386 passed / クロスチェック警告が main と一致
+- 関連: PR #879（`Refs #875, #467`）
+
