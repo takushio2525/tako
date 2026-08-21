@@ -408,9 +408,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
     const BASELINE: &[(&str, usize, &str)] = &[
         (
             "crates/tako-app/src/main.rs",
-            22,
+            21,
             "セルフテスト（`self_test::run`）と visual-test feature 限定の検証コード、\
-             および `#[cfg(unix)]` の単体テスト。製品の描画・入力経路に子プロセスは無い",
+             および `#[cfg(unix)]` の単体テスト。製品の描画・入力経路に子プロセスは無い。\
+             #865 で tmux の版数検出を `no_console_window` 経由へ寄せたので 22 → 21",
         ),
         (
             "crates/tako-app/src/open_files.rs",

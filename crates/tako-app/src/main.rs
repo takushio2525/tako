@@ -20484,6 +20484,26 @@ mod self_test {
         }
     }
 
+    /// 実環境の `tmux` が**本物の tmux か**（psmux の名前貸しではないか）。
+    ///
+    /// Windows では `tmux` の実体が psmux であることがある（winget の `marlocarlo.psmux` が
+    /// `tmux.exe` を配置する。実測: `tmux -V` が `tmux 3.3.7` + `psmux 3.3.7`）。
+    /// psmux は tmux の `=name`（完全一致ターゲット）を解釈できず `kill-session` が
+    /// 効かない（#866）ため、tmux 決め打ちの項目（48 / 59〜62）はここで切り分ける
+    fn real_tmux_available() -> bool {
+        let Ok(output) = tako_core::platform::process::no_console_window(
+            std::process::Command::new("tmux").arg("-V"),
+        )
+        .output() else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let version = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        version.contains("tmux") && !version.contains("psmux")
+    }
+
     fn press(any: AnyWindowHandle, cx: &mut AsyncApp, combo: &str) {
         let combo = combo.to_string();
         let _ = any.update(cx, |_, window, cx| {
@@ -31560,11 +31580,15 @@ mod self_test {
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
-            let has_tmux = std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            // psmux が `tmux` の名前で入っている環境（Windows）では kill が効かない（#866）。
+            // 「本物の tmux があるときだけ」回して、無い環境では理由を出して飛ばす
+            let has_tmux = real_tmux_available();
+            if !has_tmux {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 48（本物の tmux が無い。psmux の名前貸しでは \
+                     `kill-session -t =name` が効かない = #866）"
+                );
+            }
             if has_tmux {
                 let sock = format!("tako-selftest-{}", std::process::id());
                 let created = std::process::Command::new("tmux")
@@ -32093,12 +32117,7 @@ mod self_test {
             // この e2e は**中身が tmux 決め打ち**（`tmux_backend::pane_tty` / `tmux::list_sessions` /
             // 外部 tmux の attach）なので、器があるだけでは足りず tmux 本体が要る。
             // psmux（Windows）の永続化 e2e はここには無い（#467 スライス 8 の棚卸し対象）
-            let has_tmux_backend_e2e = tako_core::platform::process::no_console_window(
-                std::process::Command::new("tmux").arg("-V"),
-            )
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            let has_tmux_backend_e2e = real_tmux_available();
             if tako_core::backend::capabilities().survives_app_exit && has_tmux_backend_e2e {
                 let backend_sock = tako_core::tmux_backend::socket_name();
 
@@ -32463,7 +32482,8 @@ mod self_test {
                 tako_core::tmux_backend::kill_server(&backend_sock);
             } else {
                 println!(
-                    "TAKO_SELF_TEST_SKIPPED: 59〜62（器 {} / tmux={}。この e2e は tmux 決め打ち）",
+                    "TAKO_SELF_TEST_SKIPPED: 59〜62（器 {} / 本物の tmux={}。\
+                     この e2e は tmux 決め打ち。psmux は #866）",
                     tako_core::backend::capabilities().label,
                     has_tmux_backend_e2e
                 );
