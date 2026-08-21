@@ -137,6 +137,34 @@ impl Pane {
         self.wait(timeout, |s| s.command_state() == want)
     }
 
+    /// 側路（#766）を汲みながら待つ。
+    ///
+    /// 製品では tako の定期更新が `drain_osc_sinks` でこれをやる（2 秒 tick）。
+    /// テストは待ちを速くするため自分で回すが、**通す経路は製品と同じ**
+    /// （`SinkCursor::take_new` → `TerminalSession::feed_osc_bytes`）
+    fn wait_state_via_sink(
+        &mut self,
+        sink: &Path,
+        cursor: &mut tako_core::osc_sink::SinkCursor,
+        want: CommandState,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.pump();
+            if let Some(bytes) = cursor.take_new(sink) {
+                self.session.feed_osc_bytes(&bytes);
+            }
+            if self.session.command_state() == want {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// プロンプトが出る = 統合スクリプトが読み終わって OSC 133;A/B が流れた状態
     fn wait_ready(&mut self) {
         assert!(
@@ -396,6 +424,159 @@ fn 器の中では統合が読み込まれてもoscが外へ出ない() {
     assert!(
         !backend.capabilities().osc_passthrough,
         "psmux の osc_passthrough 申告が実測と食い違っている"
+    );
+}
+
+/// **#766 の本体**: 器（psmux）の中でも側路を張れば cwd 追従とコマンド実行状態が届く。
+///
+/// 直前のテストが「器は OSC を外へ出さない」ことを固定している。**その事実は変わらない**
+/// （psmux はパースして画面モデルへ落とし描き直す多重化器で、`allow-passthrough` は
+/// upstream で値を読む側が無く DCS の tmux 形式も未実装 = 器の側では直らない）。
+/// 変わったのは tako が素通しに依存しなくなったことで、統合スクリプトが同じ OSC
+/// バイト列を `TAKO_OSC_SINK` のファイルへ書き、tako がそれを PTY と同じ
+/// `osc_tap` へ通す。
+///
+/// ここが緑なら「ペインの状態ドットが idle / running / failed になり、cwd が cd に
+/// 追従する」ことの実測になる（`tako list` の `state` / `cwd` はこの 2 つがそのまま出る）
+#[test]
+fn 器の中でも側路を張れば状態とcwdが届く() {
+    detach_own_console();
+    if pwsh7().is_none() {
+        eprintln!("skip: PowerShell 7 が無い");
+        return;
+    }
+    let Some(bin) = psmux_bin() else {
+        eprintln!("skip: psmux が無い（TAKO_PSMUX_BIN / PATH）");
+        return;
+    };
+    if std::env::var_os("PSMUX_SESSION").is_some() || std::env::var_os("TMUX").is_some() {
+        eprintln!(
+            "skip: 既に psmux / tmux の中で走っている（PSMUX_SESSION= を外して実行すること）"
+        );
+        return;
+    }
+    let script = write_script();
+    let socket = format!("tako-si-sink-{}", std::process::id());
+    let owner_dir =
+        std::env::temp_dir().join(format!("tako-si-sink-owners-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&owner_dir);
+    let backend = PsmuxBackend::with_parts(
+        bin.clone(),
+        "3.3.7".into(),
+        socket.clone(),
+        owner_dir.clone(),
+    );
+    let name = SessionRef::new(format!("tako-sk{}", std::process::id() % 100_000)).unwrap();
+
+    // 側路の書き先は製品と同じ組み立て（`osc_sink::prepare`）で作る
+    let data_dir = std::env::temp_dir().join(format!("tako-si-sink-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("データディレクトリを作れること");
+    let sink = tako_core::osc_sink::prepare(&data_dir, 1).expect("側路を張れること");
+
+    // cd の行き先。**器の中で作る**のではなく先に作っておく（cd が失敗すると OSC 7 が出ない）
+    let target = std::env::temp_dir().join(format!("tako-sink-cd-{}", std::process::id()));
+    std::fs::create_dir_all(&target).expect("cd 先を作れること");
+
+    let options = SpawnOptions {
+        command: Some(SpawnCommand {
+            program: "pwsh.exe".to_string(),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NoExit".into(),
+                "-Command".into(),
+                ".".into(),
+                script.display().to_string(),
+            ],
+        }),
+        cwd: Some(std::env::temp_dir()),
+        env: vec![
+            ("TAKO_PANE_ID".into(), "1".into()),
+            (
+                tako_core::osc_sink::SINK_ENV.into(),
+                sink.display().to_string(),
+            ),
+        ],
+    };
+    let (session, rx) = TerminalSession::spawn(120, 40, backend.wrap_spawn(options, &name))
+        .expect("psmux クライアントを起動できること");
+    let mut pane = Pane { session, rx };
+    let mut cursor = tako_core::osc_sink::SinkCursor::default();
+
+    let cleanup = || {
+        let _ = std::process::Command::new(&bin)
+            .args(["-L", &socket, "kill-server"])
+            .output();
+        let _ = std::fs::remove_dir_all(&owner_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&target);
+    };
+
+    // ① 起動して最初のプロンプトが出たら Idle（= 133;A が側路で届いた）
+    let idle = pane.wait_state_via_sink(
+        &sink,
+        &mut cursor,
+        CommandState::Idle,
+        Duration::from_secs(45),
+    );
+    // ② 非ゼロ終了のコマンドで Failed(3)（= 133;D;3 が側路で届いた。終了コードつき）
+    pane.send_line("cmd.exe /c exit 3");
+    let failed = pane.wait_state_via_sink(
+        &sink,
+        &mut cursor,
+        CommandState::Failed(3),
+        Duration::from_secs(20),
+    );
+    // ③ cd で cwd が追従する（= OSC 7 が側路で届いた）
+    pane.send_line(&format!("cd '{}'", target.display()));
+    let leaf = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let followed = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pane.pump();
+            if let Some(bytes) = cursor.take_new(&sink) {
+                pane.session.feed_osc_bytes(&bytes);
+            }
+            let hit = pane
+                .session
+                .cwd()
+                .is_some_and(|c| c.to_string_lossy().contains(&leaf));
+            if hit || Instant::now() >= deadline {
+                break hit;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let screen = pane.screen();
+    let state = pane.session.command_state();
+    let cwd = pane.session.cwd().map(Path::to_path_buf);
+    drop(pane);
+    cleanup();
+
+    assert!(idle, "側路で 133;A が届かない（state={state:?}）\n{screen}");
+    assert!(
+        failed,
+        "側路で 133;D の終了コードが届かない（state={state:?}）\n{screen}"
+    );
+    assert!(
+        followed,
+        "側路で OSC 7 が届かない（cwd={cwd:?} 期待={leaf}）\n{screen}"
+    );
+
+    // 器の能力申告は変えていない: psmux は今も素通ししない（側路がそれを補っている）
+    assert!(
+        !backend.capabilities().osc_passthrough,
+        "psmux の osc_passthrough 申告を変えてはいけない（#766 は素通しを直していない）"
+    );
+    assert_eq!(
+        tako_core::shell_integration::osc_transport(),
+        tako_core::shell_integration::OscTransport::SideChannel,
+        "この構成の申告が side-channel になっていない"
     );
 }
 

@@ -409,6 +409,7 @@ impl Status {
             "installed": self.installed(),
             "effective": self.effective(),
             "blocked_by_backend": self.blocked_by_backend,
+            "osc_transport": osc_transport().as_str(),
             "targets": self.targets.iter().map(|t| serde_json::json!({
                 "label": t.label,
                 "exe": t.exe,
@@ -420,13 +421,54 @@ impl Status {
     }
 }
 
-/// 器が OSC を通さないときの説明（通るなら `None`）。
+/// OSC がどの経路で tako へ届いているか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscTransport {
+    /// ペインの PTY をそのまま読む（器なし / 器が素通しする = macOS の tmux）
+    Pty,
+    /// 器が素通ししないので、統合スクリプトがファイルへ書いたものを読む（#766）
+    SideChannel,
+}
+
+impl OscTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pty => "pty",
+            Self::SideChannel => "side-channel",
+        }
+    }
+}
+
+/// この構成で OSC が届く経路。
 ///
 /// **器に尋ねる**（実装名で分岐しない）。将来 psmux が素通しに対応したり、
 /// 別の器を足したりしても、この 1 箇所の判定がそのまま追従する
+pub fn osc_transport() -> OscTransport {
+    if crate::backend::capabilities().osc_passthrough {
+        OscTransport::Pty
+    } else {
+        OscTransport::SideChannel
+    }
+}
+
+/// このプラットフォームの統合スクリプトが側路（[`crate::osc_sink`]）に対応しているか。
+///
+/// 対応していない環境で書き先を渡しても、スクリプトが見ないので**空のファイルが
+/// 増えるだけ**。呼び出し側（`spawn_session`）はここを見てから張る
+pub fn side_channel_supported() -> bool {
+    imp::SIDE_CHANNEL
+}
+
+/// 器が OSC を通さず、かつ側路も無いときの説明（届くなら `None`）。
+///
+/// #525 の時点では psmux の器では**必ず**ここが `Some` だった。#766 で
+/// 側路（`osc_sink`）を入れたので、側路に対応した統合スクリプトを持つ
+/// プラットフォームでは `None` になる。**器の能力申告（`osc_passthrough`）は
+/// 変えていない** — psmux が素通ししないのは事実のままで、変わったのは
+/// tako が素通しに依存しなくなったこと
 fn backend_block() -> Option<String> {
     let caps = crate::backend::capabilities();
-    if caps.osc_passthrough {
+    if caps.osc_passthrough || imp::SIDE_CHANNEL {
         return None;
     }
     Some(format!(
@@ -584,6 +626,11 @@ mod imp {
     use super::{Change, Delivery, Status};
 
     pub(super) const SHELLS: &str = "zsh / bash / fish";
+    /// 側路（#766）に対応した統合スクリプトを持っているか。
+    /// unix の器（tmux）は DCS パススルーで OSC を通すので側路が要らず、
+    /// zsh / bash / fish の正本にも書き先の扱いを入れていない。
+    /// **通さない器を unix で採ることになったら、正本へ足してからここを true にする**
+    pub(super) const SIDE_CHANNEL: bool = false;
 
     /// unix はシェルが拾う環境変数を撒くだけで届く（ユーザーのファイルを触らない）
     pub(super) fn injected_env(root: &Path, bash_path: &Path) -> Vec<(String, String)> {
@@ -645,6 +692,8 @@ mod imp {
     use super::{Change, ChangeKind, Delivery, ProfileTarget, Status};
 
     pub(super) const SHELLS: &str = "PowerShell 7 / Windows PowerShell 5.1";
+    /// `tako.ps1` は `TAKO_OSC_SINK` があれば OSC を側路へ書く（#766）
+    pub(super) const SIDE_CHANNEL: bool = true;
 
     /// Windows は `$PROFILE` 経由なので、spawn 時に注入する環境変数は無い。
     /// POSIX 用の 3 点セットを撒いても PowerShell は 1 つも見ないため、ペインの
@@ -1194,6 +1243,41 @@ mod powershell_tests {
         assert!(b.contains("'C:\\tako\\tako.ps1'"), "{b}");
         // ペインの外では何もしない（プロファイルに置き続けても無害であることの担保）
         assert!(b.contains("$env:TAKO_PANE_ID"), "{b}");
+    }
+
+    /// #766: 器が OSC を素通ししないときの側路。**正本のスクリプトが**
+    /// `TAKO_OSC_SINK` を見て、束をまとめて 1 ファイルへ差し替えること。
+    ///
+    /// ここが崩れると Windows で状態ドットと cwd 追従が黙って死ぬ（器が既定なので
+    /// **セッション完全復元を使っている人ほど効かない**）。スクリプトは実機テスト
+    /// （`tests/shell_integration_powershell.rs`）が動作まで見るので、ここは
+    /// 「経路が消えていないこと」の番犬
+    #[test]
+    fn ps1が側路の書き先を見て束ごと差し替える() {
+        let s = POWERSHELL_SCRIPT;
+        assert!(
+            s.contains(crate::osc_sink::SINK_ENV),
+            "統合スクリプトが側路の環境変数を見ていない"
+        );
+        // 束（133;D + 133;A + OSC 7）を 1 回で書く: バッファへ積んで flush する形
+        assert!(s.contains("__takoSinkBuf"), "側路のバッファが無い");
+        assert!(
+            s.matches("__takoSinkFlush").count() >= 3,
+            "flush の呼び出しが足りない（定義 + コマンド開始 + プロンプト）"
+        );
+        // 差し替えは .new へ書いて rename（読み手が半端な束を見ないため）
+        assert!(
+            s.contains("'.new'"),
+            "一時ファイル経由の差し替えになっていない"
+        );
+        assert!(s.contains("Move-Item"), "rename による差し替えが無い");
+        // BOM を付けない（先頭の ESC の前にバイトが入るとスキャンが崩れる）
+        assert!(s.contains("UTF8Encoding($false)"), "BOM なし指定が無い");
+        // 側路のときは DCS で包まない（器を通らないので二重化は無意味）
+        assert!(
+            s.contains("$global:__takoSinkBuf += $seq"),
+            "側路へは素のバイト列を積むこと"
+        );
     }
 
     #[test]

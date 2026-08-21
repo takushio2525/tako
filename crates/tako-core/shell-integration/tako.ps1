@@ -30,6 +30,19 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
     # tako pane is not treated as nesting (tako's container is meant to be invisible plumbing).
     # PSMUX_SESSION is psmux's nesting guard -- leaving it set makes `psmux` refuse to start
     # with "sessions should be nested with care" (measured).
+    # Where the OSC goes when the container swallows it (#766). psmux parses OSC 7 / 133
+    # into its own screen model and re-renders for the client, so nothing that is not part of
+    # that model can reach the outer terminal -- there is no byte-level passthrough for ANY
+    # sequence, and `allow-passthrough` is an accepted-but-unread option upstream. tako sets
+    # TAKO_OSC_SINK for such containers and reads the file instead of the PTY. The bytes are
+    # the SAME ones that would have gone to the console, so tako's parser and state machine
+    # are unchanged.
+    $global:__takoSink = $env:TAKO_OSC_SINK
+    $global:__takoSinkBuf = ''
+    # No BOM: tako reads raw bytes and the payload is ASCII by construction (paths are
+    # percent-encoded). A BOM would land in front of the first ESC and break the scan.
+    $global:__takoSinkEnc = New-Object System.Text.UTF8Encoding($false)
+
     $global:__takoPassthrough = $false
     if ($env:TMUX) {
         $__takoSock = ($env:TMUX -split ',')[0]
@@ -45,6 +58,12 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
     # Wrap a raw escape sequence for the transport in use. Inside a passthrough every ESC of
     # the payload must be doubled (multiplexer rule).
     function global:__takoWrap([string] $seq) {
+        # The side channel carries the sequence unwrapped: it never passes through the
+        # container, so the DCS wrapping (and its ESC doubling) would only be noise.
+        if ($global:__takoSink) {
+            $global:__takoSinkBuf += $seq
+            return ''
+        }
         if ($global:__takoPassthrough) {
             $esc = [string] $global:__takoEsc
             return $esc + 'Ptmux;' + $seq.Replace($esc, $esc + $esc) + $esc + '\'
@@ -70,6 +89,25 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
         return $out.ToString()
     }
 
+    # Write the sequences collected since the last flush as ONE file, replacing whatever was
+    # there. A prompt owes up to three of them (133;D, 133;A, OSC 7) and they have to land
+    # together -- writing each one separately would leave only the last, losing the exit code.
+    #
+    # `.new` + rename so the reader never sees a half-written burst (rename over an existing
+    # file is atomic on NTFS). Failures are swallowed: a pane whose sink went away must keep
+    # working as a terminal.
+    function global:__takoSinkFlush {
+        if (-not $global:__takoSink) { return }
+        $buf = $global:__takoSinkBuf
+        $global:__takoSinkBuf = ''
+        if (-not $buf) { return }
+        try {
+            $tmp = $global:__takoSink + '.new'
+            [System.IO.File]::WriteAllText($tmp, $buf, $global:__takoSinkEnc)
+            Move-Item -LiteralPath $tmp -Destination $global:__takoSink -Force -ErrorAction Stop
+        } catch { }
+    }
+
     function global:__takoMark([string] $body) {
         return (__takoWrap ([string] $global:__takoEsc + ']133;' + $body + [string] $global:__takoBel))
     }
@@ -87,6 +125,7 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
     # the prompt and the command output, not while a prompt string is being built.
     function global:__takoEmitExecuted {
         try { [Console]::Write((__takoMark 'C')) } catch { }
+        __takoSinkFlush
     }
 
     # Exit code of the command that just finished, from the state captured at prompt entry.
@@ -181,6 +220,11 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
             $out += 'PS ' + $ExecutionContext.SessionState.Path.CurrentLocation + '> '
         }
         $out += (__takoMark 'B')
+
+        # Hand the whole burst (133;D with the exit code, 133;A, OSC 7) to the side channel in
+        # one write. With a sink the marks contributed '' to $out, so the visible prompt is
+        # exactly what the user's own prompt function produced.
+        __takoSinkFlush
 
         # Arm the fallback hook last: everything above runs commands of its own.
         $global:__takoAtPrompt = $true
