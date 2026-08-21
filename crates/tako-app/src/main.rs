@@ -37210,27 +37210,37 @@ mod self_test {
                     app.focus_direction(SplitDirection::Left, cx);
                 });
                 type_text(any, cx, &format!("{cli} close --pane {cli_pane}"), true);
-                wait(cx, 1200).await;
 
-                let markers_ok = log_dir
-                    .as_ref()
-                    .map(|dir| {
-                        let kbd = close_reason(dir, kbd_pane);
-                        let gui = close_reason(dir, gui_pane);
-                        let cli_m = close_reason(dir, cli_pane);
-                        let ok = reason_is(&kbd, CloseOrigin::Keyboard)
-                            && reason_is(&gui, CloseOrigin::PaneButton)
-                            && reason_is(&cli_m, CloseOrigin::Cli);
-                        if !ok {
-                            println!(
-                                "  クローズマーカー: kbd={kbd:?} gui={gui:?} cli={cli_m:?} / \
-                                 期待 cli={:?}（caller={caller_role:?}）",
-                                CloseOrigin::Cli.marker_with_caller(caller_role.as_deref())
-                            );
-                        }
-                        ok
-                    })
-                    .unwrap_or(false);
+                // マーカーが**出る**のを待つ（#796 の作法）。debug CLI の起動 + IPC 往復 +
+                // ログの書き出しは環境で数秒かかる（Windows 実機で 1200ms 固定では
+                // `cli=""` になった）
+                let mut markers_ok = false;
+                for _ in 0..24 {
+                    wait(cx, 500).await;
+                    markers_ok = log_dir
+                        .as_ref()
+                        .map(|dir| {
+                            reason_is(&close_reason(dir, kbd_pane), CloseOrigin::Keyboard)
+                                && reason_is(&close_reason(dir, gui_pane), CloseOrigin::PaneButton)
+                                && reason_is(&close_reason(dir, cli_pane), CloseOrigin::Cli)
+                        })
+                        .unwrap_or(false);
+                    if markers_ok {
+                        break;
+                    }
+                }
+                if !markers_ok {
+                    if let Some(dir) = log_dir.as_ref() {
+                        println!(
+                            "  クローズマーカー: kbd={:?} gui={:?} cli={:?} / \
+                             期待 cli={:?}（caller={caller_role:?}）",
+                            close_reason(dir, kbd_pane),
+                            close_reason(dir, gui_pane),
+                            close_reason(dir, cli_pane),
+                            CloseOrigin::Cli.marker_with_caller(caller_role.as_deref())
+                        );
+                    }
+                }
                 check(
                     markers_ok,
                     "ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）",
