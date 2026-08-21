@@ -35837,6 +35837,9 @@ mod self_test {
                 true,
             );
             let mut issue64 = (false, false, false);
+            // #64 の根因（グリッド幅ちょうどでの折り返し）は macOS の shaper で実測したもの。
+            // 他の環境でも同じ前提が成り立つとは限らないので、そこでは診断だけ出す
+            let repro_required = cfg!(target_os = "macos");
             for _ in 0..8 {
                 wait(cx, 800).await;
                 issue64 = window
@@ -35928,11 +35931,28 @@ mod self_test {
                 if issue64.0 && issue64.1 && issue64.2 {
                     break;
                 }
+                // 根因の再現（a）は shaper とフォント寸法に依存する。それ以外
+                // （b / c = 実装の構造検証）が揃ったら待たずに進む
+                if issue64.1 && issue64.2 && !repro_required {
+                    break;
+                }
             }
-            check(
-                issue64.0,
-                "半角消失の根因が実在（グリッド幅シェイプで折り返し発生）",
-            );
+            // (a) は「この環境でも #64 の折り返しが起こりうる」ことの確認で、
+            // shaper とフォント寸法に依存する（macOS の実測で見つかった前提）。
+            // 前提が成り立たない環境では**前提が無いこと**を出して先へ進む
+            // （実装の構造検証 = b / c は環境に依らず必須のまま）
+            if repro_required {
+                check(
+                    issue64.0,
+                    "半角消失の根因が実在（グリッド幅シェイプで折り返し発生）",
+                );
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 69b の根因再現（この環境の shaper では \
+                     グリッド幅シェイプが折り返さない: repro={}）",
+                    issue64.0
+                );
+            }
             check(issue64.1, "行 div の whitespace_nowrap（折り返しの構造的禁止）");
             check(issue64.2, "セル幅不一致グリフの隔離 + ASCII グループ化維持");
 
