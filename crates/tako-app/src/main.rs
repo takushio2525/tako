@@ -27,6 +27,7 @@ mod form_layout;
 mod keybindings;
 mod limit_autoresume;
 mod md_view;
+mod menu_bar;
 mod open_files;
 mod overlays;
 mod platform;
@@ -110,6 +111,26 @@ fn claude_resume_command(
 
 /// タブバーの高さ（px）
 const TAB_BAR_HEIGHT: f32 = 44.0;
+
+/// in-window メニューバー行の高さ（px。Issue #657）。
+///
+/// macOS はメニューが OS のグローバルメニューバーへ載るのでこの行を持たない（= 0）。
+/// Windows は `gpui_windows` がウィンドウメニューを一切作らないため、tako が
+/// 自前の 1 行として描く（`menu_bar.rs`）
+#[cfg(target_os = "macos")]
+const MENU_BAR_HEIGHT: f32 = 0.0;
+#[cfg(not(target_os = "macos"))]
+const MENU_BAR_HEIGHT: f32 = 30.0;
+
+/// 上部クローム（メニューバー行 + タブバー行）の合計高さ（px。Issue #657）。
+///
+/// **ペイン矩形・IME アンカー・境界ドラッグの当たり判定はすべてこれを起点にする**。
+/// `TAB_BAR_HEIGHT` を直接使うと、メニューバー行を持つ環境で座標が 1 行分ずれて
+/// 「クリック位置と選択位置が合わない」「候補ウィンドウが 30px 上に出る」といった
+/// 形で壊れる。上段に行を足すときはこの関数だけを直せば全経路が追従する
+const fn top_chrome_height() -> f32 {
+    MENU_BAR_HEIGHT + TAB_BAR_HEIGHT
+}
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
 /// ペイン枠の丸め角（px。カンプ準拠）。
@@ -1758,6 +1779,19 @@ struct TakoApp {
     /// 論理ウィンドウ作成済みで GPUI ウィンドウが未生成のもの（dispatch 経由の
     /// window new 等。GPUI の Context が要るため render / defer で消費する）
     pending_viewport_opens: Vec<tako_core::WindowId>,
+    /// CLI / MCP から依頼された OS ウィンドウの表示状態操作（Issue #584）。
+    /// GPUI の Context が要るため `sync_viewports` で消費する
+    pending_window_states: Vec<(tako_core::WindowId, tako_control::protocol::WindowStateOp)>,
+    /// in-window メニューバーの開閉状態（Issue #657。Windows のみ描画される）
+    menu_bar: menu_bar::MenuBarState,
+    /// メニュー定義のキャッシュ（Issue #657）。`app_menus()` は毎回 `Box<dyn Action>` を
+    /// 40 個以上作るので、言語が変わったときだけ貼り直す（`refresh_menu_defs`）
+    menu_defs: Vec<gpui::OwnedMenu>,
+    /// メニュートリガーの実測レイアウト（Issue #657）。メニューバー行の描画で算出し、
+    /// ドロップダウンの位置決めが同じ数値を使う
+    menu_trigger_layout: Vec<menu_bar::MenuTrigger>,
+    /// CLI / MCP から依頼されたメニュー操作の pending キュー（Issue #657）
+    pending_menu_ops: Vec<tako_control::protocol::MenuOp>,
     /// 設定画面ウィンドウのハンドル（単一インスタンス。Issue #459）
     settings_window_handle: Option<gpui::WindowHandle<settings_window::SettingsWindow>>,
     /// dispatch から設定画面を開くための pending キュー（Issue #459）
@@ -3199,6 +3233,11 @@ impl TakoApp {
                 .map(|(id, f)| (tako_core::WindowId::from_raw(*id), f.clone()))
                 .collect(),
             pending_viewport_opens: Vec::new(),
+            pending_window_states: Vec::new(),
+            menu_bar: menu_bar::MenuBarState::default(),
+            menu_defs: Vec::new(),
+            menu_trigger_layout: Vec::new(),
+            pending_menu_ops: Vec::new(),
             settings_window_handle: None,
             pending_settings_open: None,
             about_window_handle: None,
@@ -8455,6 +8494,42 @@ impl TakoApp {
         for lid in std::mem::take(&mut self.pending_viewport_opens) {
             if live.contains(&lid) && !self.viewports.iter().any(|(l, _)| *l == lid) {
                 self.open_viewport(lid, cx);
+            }
+        }
+        // CLI / MCP からの最小化 / 最大化 / 復元（#584）。最小化中のウィンドウには
+        // render が回らないため、IPC ハンドラ側の sync_viewports 呼び出しが復帰経路になる
+        for (lid, op) in std::mem::take(&mut self.pending_window_states) {
+            let Some((_, handle)) = self.viewports.iter().find(|(l, _)| *l == lid).copied() else {
+                continue;
+            };
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| apply_window_state(window, op));
+            });
+        }
+        self.drain_menu_ops(cx);
+    }
+
+    /// CLI / MCP から依頼されたメニュー操作を適用する（Issue #657）。
+    ///
+    /// 開閉は状態だけなので即座に処理する。項目の発火は `App::dispatch_action`
+    /// （= macOS のネイティブメニューが通るのと同じ経路）へ回すが、**イベント処理中は
+    /// すでにウィンドウ update の内側にいる**ため、`cx.defer` で外へ出してから呼ぶ
+    /// （`App::dispatch_action` は内部でアクティブウィンドウを `update` するので、
+    /// そのまま呼ぶと二重借用になる）
+    fn drain_menu_ops(&mut self, cx: &mut Context<Self>) {
+        use tako_control::protocol::MenuOp;
+        for op in std::mem::take(&mut self.pending_menu_ops) {
+            match op {
+                MenuOp::Open(index) => self.open_menu(index, cx),
+                MenuOp::Close => self.close_menu(cx),
+                MenuOp::Invoke(name) => {
+                    let Some(action) = self.find_menu_action(&name) else {
+                        eprintln!("warning: メニューのアクション '{name}' が見つからない");
+                        continue;
+                    };
+                    self.close_menu(cx);
+                    cx.defer(move |cx| cx.dispatch_action(&*action));
+                }
             }
         }
     }
@@ -16132,6 +16207,25 @@ impl UiStateHost for TakoApp {
         self.pending_viewport_opens.push(window);
     }
 
+    fn request_window_state(
+        &mut self,
+        window: tako_core::WindowId,
+        op: tako_control::protocol::WindowStateOp,
+    ) {
+        // 最小化 / 最大化 / 復元も Context が要るため sync_viewports で消費する（#584）
+        self.pending_window_states.push((window, op));
+    }
+
+    fn menu_bar_snapshot(&self) -> tako_control::protocol::MenuBarSnapshot {
+        self.build_menu_bar_snapshot()
+    }
+
+    fn request_menu_op(&mut self, op: tako_control::protocol::MenuOp) {
+        // 開閉は状態だけだが、invoke は GPUI の Context が要る。#584 と同じく
+        // sync_viewports で消費する（最小化中でも IPC ハンドラ側の呼び出しで届く）
+        self.pending_menu_ops.push(op);
+    }
+
     /// 利用上限後の自動復帰の実行状態（#813）
     fn limit_resume_state(&self, pane: PaneId) -> Option<serde_json::Value> {
         self.limit_resume_state_json(pane)
@@ -18278,6 +18372,11 @@ impl Render for TakoApp {
         if self.menus_lang != Some(lang_now) {
             self.menus_lang = Some(lang_now);
             cx.set_menus(app_menus());
+            // in-window メニューバー（#657）も同じ契機で貼り直す。OS 側と同じ定義を
+            // 使うので、mac のネイティブメニューと Windows の自前描画がずれない
+            self.refresh_menu_defs();
+            // 開いたまま言語が変わると添字の意味が変わるので閉じる
+            self.menu_bar = menu_bar::MenuBarState::default();
         }
         self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
@@ -18367,10 +18466,10 @@ impl Render for TakoApp {
         // アップデート通知カード #616 / たまり場ドロワー / Web ビュー dock）の高さが
         // 抜け落ち、ペインが実コンテナより縦に大きくなって画面外の行が生まれていた
         let estimated = Bounds::new(
-            point(sidebar_width, px(TAB_BAR_HEIGHT)),
+            point(sidebar_width, px(top_chrome_height())),
             size(
                 viewport.width - sidebar_width - panel_width,
-                viewport.height - px(TAB_BAR_HEIGHT) - px(STATUS_BAR_HEIGHT),
+                viewport.height - px(top_chrome_height()) - px(STATUS_BAR_HEIGHT),
             ),
         );
         let window_id = window.window_handle().window_id();
@@ -18579,7 +18678,7 @@ impl Render for TakoApp {
 
         // ペイン境界のドラッグハンドル（仕切り線の上に数 px 幅の透明な当たり領域を重ねる）。
         // ヒットテストとカーソル形状は gpui に任せ、押下で start_border_drag を呼ぶ。
-        // 境界座標はウィンドウ空間で算出し、配置はコンテナ（y=TAB_BAR_HEIGHT 起点）ローカルへ直す
+        // 境界座標はウィンドウ空間で算出し、配置はコンテナ（y=top_chrome_height() 起点）ローカルへ直す
         let border_rect = Rect::new(
             f32::from(content_origin.x),
             f32::from(content_origin.y),
@@ -18883,6 +18982,12 @@ impl Render for TakoApp {
                     window.focus(&this.focus_handle.clone(), cx);
                     window.invalidate_character_coordinates();
                 }
+                // in-window メニューバー（#657）: F10 で開き、開いている間は
+                // ← → ↑ ↓ / Enter / Esc を奪う。ここで消費した打鍵は PTY へ送らない
+                if this.menu_bar_key(&event.keystroke, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 this.handle_key(&event.keystroke, cx);
             }))
             .on_modifiers_changed(cx.listener(
@@ -18899,6 +19004,11 @@ impl Render for TakoApp {
                     this.on_mouse_up(event, cx);
                 }),
             )
+            // in-window メニューバー行（Windows のみ。#657）。タブバーの一段上に置く。
+            // ドロップダウン本体はルート直下のオーバーレイ（下の render_menu_dropdown）。
+            // #786 のクロームキャッシュには載せない: 開閉状態とホバーで毎フレーム
+            // 変わるので、キャッシュしても当たらないうえ無効化の管理だけが増える
+            .children(self.render_menu_bar(window, cx))
             // #786: クローム 4 枚もそれぞれ独立したキャッシュ単位にする。
             // 大きさはここで指定する（cached ビューの request_layout はスタイルだけを見る）
             .child(
@@ -18991,6 +19101,9 @@ impl Render for TakoApp {
             // #615: カードをインジケータ直上へ収めるためビューポート実寸を渡す
             .children(self.render_remote_overlay(window, cx))
             .children(self.render_command_palette(cx))
+            // メニューバーのドロップダウン（#657）。パレットの手前 = 最上位に置く必要は
+            // 無いが、タブバー・ペインより後（= 手前）でなければ隠れる
+            .children(self.render_menu_dropdown(window, cx))
     }
 }
 
@@ -19286,11 +19399,109 @@ fn parse_initial_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-/// アプリメニューバーを構成する（tako / File / Edit / View / Window / Help。#485）。
+/// 「ファイル」メニューの共通項目（#657 で macOS / Windows 共用に切り出した）。
+///
+/// Windows 版はこの後ろに「設定…」「終了」が付く（Explorer / VSCode の作法）。
+/// macOS はその 2 つがアプリ名メニュー（tako）側に居るので、ここで終わる
+fn file_menu_common_items() -> Vec<gpui::MenuItem> {
+    use crate::ui_text::menu as m;
+    use gpui::MenuItem;
+    vec![
+        MenuItem::action(m::new_tab(), NewTab),
+        MenuItem::action(m::new_window(), NewWindow),
+        MenuItem::separator(),
+        MenuItem::action(m::split_right(), SplitRight),
+        MenuItem::action(m::split_down(), SplitDown),
+        MenuItem::separator(),
+        MenuItem::action(m::open_directory(), OpenDirectory),
+        MenuItem::action(m::open_repository(), OpenRepository),
+        MenuItem::action(m::open_remote(), OpenRemote),
+        MenuItem::action(m::open_recent(), OpenRecent),
+        MenuItem::separator(),
+        MenuItem::action(m::save_preview(), SavePreview),
+        MenuItem::separator(),
+        MenuItem::action(m::close_pane(), ClosePane),
+    ]
+}
+
+/// 「編集」メニュー（macOS / Windows 共通。#657）
+fn edit_menu() -> gpui::Menu {
+    use crate::ui_text::menu as m;
+    use gpui::{Menu, MenuItem};
+    Menu::new(m::edit()).items(vec![
+        MenuItem::action(m::undo(), UndoPreview),
+        MenuItem::action(m::redo(), RedoPreview),
+        MenuItem::separator(),
+        MenuItem::action(m::copy(), CopySelection),
+        MenuItem::action(m::paste(), PasteClipboard),
+        MenuItem::action(m::select_all(), SelectAll),
+        MenuItem::separator(),
+        MenuItem::action(m::find(), FindPreview),
+    ])
+}
+
+/// 「表示」メニュー（macOS / Windows 共通。#657）
+fn view_menu() -> gpui::Menu {
+    use crate::ui_text::menu as m;
+    use gpui::{Menu, MenuItem};
+    Menu::new(m::view()).items(vec![
+        MenuItem::action(m::command_palette(), OpenCommandPalette),
+        MenuItem::separator(),
+        MenuItem::action(m::toggle_sidebar(), ToggleSidebar),
+        MenuItem::action(m::toggle_drawer(), ToggleDrawer),
+        MenuItem::submenu(Menu::new(m::panel()).items(vec![
+            MenuItem::action(m::panel_fleet(), ShowFleetPanel),
+            MenuItem::action(m::panel_orch(), ShowOrchPanel),
+            MenuItem::action(m::panel_git(), ShowGitPanel),
+        ])),
+        MenuItem::separator(),
+        MenuItem::action(m::zoom_in(), ZoomIn),
+        MenuItem::action(m::zoom_out(), ZoomOut),
+        MenuItem::action(m::reset_zoom(), ResetZoom),
+        MenuItem::separator(),
+        MenuItem::action(m::toggle_theme(), ToggleTheme),
+        MenuItem::action(m::switch_language(), SwitchLanguage),
+        MenuItem::separator(),
+        MenuItem::action(m::toggle_fullscreen(), ToggleFullScreen),
+    ])
+}
+
+/// 「ウインドウ」メニュー（#657）。ズーム項目のラベルだけプラットフォームで違う
+/// （macOS = 「拡大 / 縮小」のトグル、Windows = 「最大化 / 元のサイズに戻す」）。
+///
+/// ラベルの選択は呼び出し側の `#[cfg]` ではなく**この中の `cfg!`** で行う。
+/// `#[cfg]` で片方の呼び出しを消すと、使われなくなった `ui_text::menu` の関数が
+/// **dead_code になり `clippy -D warnings` の CI が落ちる**（macOS で実際に落ちた）
+fn window_menu() -> gpui::Menu {
+    use crate::ui_text::menu as m;
+    use gpui::{Menu, MenuItem};
+    let zoom_label = if cfg!(target_os = "macos") {
+        m::zoom_window()
+    } else {
+        m::maximize_restore()
+    };
+    Menu::new(m::window()).items(vec![
+        MenuItem::action(m::minimize(), MinimizeWindow),
+        MenuItem::action(zoom_label, ZoomWindow),
+        MenuItem::separator(),
+        MenuItem::action(m::next_tab(), NextTab),
+        MenuItem::action(m::prev_tab(), PrevTab),
+        MenuItem::separator(),
+        MenuItem::submenu(Menu::new(m::select_pane()).items(vec![
+            MenuItem::action(m::focus_left(), FocusLeft),
+            MenuItem::action(m::focus_right(), FocusRight),
+            MenuItem::action(m::focus_up(), FocusUp),
+            MenuItem::action(m::focus_down(), FocusDown),
+        ])),
+    ])
+}
+
+/// アプリメニューバーを構成する（macOS: tako / File / Edit / View / Window / Help。#485）。
 ///
 /// **すべての項目は実在の動作に配線する**（無反応のダミーを置かない）。項目名は
 /// `ui_text::menu` が言語別に解決し、言語切替時は `TakoApp::render` が貼り直す。
 /// ショートカット表示は GPUI が `keybindings::key_bindings()` から自動で引く
+#[cfg(target_os = "macos")]
 fn app_menus() -> Vec<gpui::Menu> {
     use crate::ui_text::menu as m;
     use gpui::{Menu, MenuItem, SystemMenuType};
@@ -19309,67 +19520,51 @@ fn app_menus() -> Vec<gpui::Menu> {
             MenuItem::separator(),
             MenuItem::action(m::quit(), Quit),
         ]),
-        Menu::new(m::file()).items(vec![
-            MenuItem::action(m::new_tab(), NewTab),
-            MenuItem::action(m::new_window(), NewWindow),
-            MenuItem::separator(),
-            MenuItem::action(m::split_right(), SplitRight),
-            MenuItem::action(m::split_down(), SplitDown),
-            MenuItem::separator(),
-            MenuItem::action(m::open_directory(), OpenDirectory),
-            MenuItem::action(m::open_repository(), OpenRepository),
-            MenuItem::action(m::open_remote(), OpenRemote),
-            MenuItem::action(m::open_recent(), OpenRecent),
-            MenuItem::separator(),
-            MenuItem::action(m::save_preview(), SavePreview),
-            MenuItem::separator(),
-            MenuItem::action(m::close_pane(), ClosePane),
-        ]),
-        Menu::new(m::edit()).items(vec![
-            MenuItem::action(m::undo(), UndoPreview),
-            MenuItem::action(m::redo(), RedoPreview),
-            MenuItem::separator(),
-            MenuItem::action(m::copy(), CopySelection),
-            MenuItem::action(m::paste(), PasteClipboard),
-            MenuItem::action(m::select_all(), SelectAll),
-            MenuItem::separator(),
-            MenuItem::action(m::find(), FindPreview),
-        ]),
-        Menu::new(m::view()).items(vec![
-            MenuItem::action(m::command_palette(), OpenCommandPalette),
-            MenuItem::separator(),
-            MenuItem::action(m::toggle_sidebar(), ToggleSidebar),
-            MenuItem::action(m::toggle_drawer(), ToggleDrawer),
-            MenuItem::submenu(Menu::new(m::panel()).items(vec![
-                MenuItem::action(m::panel_fleet(), ShowFleetPanel),
-                MenuItem::action(m::panel_orch(), ShowOrchPanel),
-                MenuItem::action(m::panel_git(), ShowGitPanel),
-            ])),
-            MenuItem::separator(),
-            MenuItem::action(m::zoom_in(), ZoomIn),
-            MenuItem::action(m::zoom_out(), ZoomOut),
-            MenuItem::action(m::reset_zoom(), ResetZoom),
-            MenuItem::separator(),
-            MenuItem::action(m::toggle_theme(), ToggleTheme),
-            MenuItem::action(m::switch_language(), SwitchLanguage),
-            MenuItem::separator(),
-            MenuItem::action(m::toggle_fullscreen(), ToggleFullScreen),
-        ]),
-        Menu::new(m::window()).items(vec![
-            MenuItem::action(m::minimize(), MinimizeWindow),
-            MenuItem::action(m::zoom_window(), ZoomWindow),
-            MenuItem::separator(),
-            MenuItem::action(m::next_tab(), NextTab),
-            MenuItem::action(m::prev_tab(), PrevTab),
-            MenuItem::separator(),
-            MenuItem::submenu(Menu::new(m::select_pane()).items(vec![
-                MenuItem::action(m::focus_left(), FocusLeft),
-                MenuItem::action(m::focus_right(), FocusRight),
-                MenuItem::action(m::focus_up(), FocusUp),
-                MenuItem::action(m::focus_down(), FocusDown),
-            ])),
-        ]),
+        Menu::new(m::file()).items(file_menu_common_items()),
+        edit_menu(),
+        view_menu(),
+        window_menu(),
         Menu::new(m::help()).items(vec![
+            MenuItem::action(m::documentation(), OpenDocumentation),
+            MenuItem::action(m::report_issue(), ReportIssue),
+        ]),
+    ]
+}
+
+/// アプリメニューバーを構成する（Windows: ファイル / 編集 / 表示 / ウインドウ / ヘルプ。#657）。
+///
+/// `gpui_windows` の `Platform::set_menus` は渡された `Menu` を内部に保存するだけで
+/// ウィンドウメニューを作らないため、この構成は tako が自前で 1 行として描く
+/// （`menu_bar.rs`）。並びは Explorer / VSCode の作法に合わせ、**アプリ名メニューを
+/// 持たない**。About・アップデート確認は「ヘルプ」、設定・終了は「ファイル」末尾。
+///
+/// # macOS 固有項目を構造的に持たない（**これは安全装置**）
+///
+/// - `HideOthers` / `ShowAllApps` は `gpui_windows` の `hide_other_apps` /
+///   `unhide_other_apps` が `unimplemented!()` なので、**到達させると panic =
+///   アプリごと abort**（器の無いペインは全滅）する。`keybindings::macos_only_bindings`
+///   がバインドを張らないことで塞いでいるのと同じ地雷を、メニュー側でも塞ぐ
+/// - `HideApp` は Windows の `hide()` が no-op なので置いても無反応（ダミー禁止）
+/// - `Services` は macOS の OS サブメニュー
+///
+/// この不変条件は `windowsのメニューにmacos固有の項目が無い` が固定している
+#[cfg(not(target_os = "macos"))]
+fn app_menus() -> Vec<gpui::Menu> {
+    use crate::ui_text::menu as m;
+    use gpui::{Menu, MenuItem};
+    let mut file_items = file_menu_common_items();
+    file_items.push(MenuItem::separator());
+    file_items.push(MenuItem::action(m::settings(), OpenSettings));
+    file_items.push(MenuItem::action(m::quit(), Quit));
+    vec![
+        Menu::new(m::file()).items(file_items),
+        edit_menu(),
+        view_menu(),
+        window_menu(),
+        Menu::new(m::help()).items(vec![
+            MenuItem::action(m::about(), AboutTako),
+            MenuItem::action(m::check_updates(), CheckForUpdates),
+            MenuItem::separator(),
             MenuItem::action(m::documentation(), OpenDocumentation),
             MenuItem::action(m::report_issue(), ReportIssue),
         ]),
@@ -19384,6 +19579,89 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
         appears_transparent: true,
         // 12px のライトをタブバー縦中央へ（(44-12)/2 = 16。カンプ padding-left 16）
         traffic_light_position: Some(point(px(16.), px(16.))),
+    }
+}
+
+/// CLI / MCP からのウィンドウ表示状態の適用（Issue #584）。
+///
+/// GUI のキャプションボタンは押した時点で OS のネイティブ経路が直接実行するので
+/// ここを通らない（`menu_bar` の `render_window_controls` のドキュメント参照）。
+/// この関数は同じ操作を AI / CLI からも行えるようにするための経路
+/// （開発不変条件「AI フルコントロール」= UI でできることは AI からもできる）。
+fn apply_window_state(window: &mut Window, op: tako_control::protocol::WindowStateOp) {
+    use tako_control::protocol::WindowStateOp;
+    match op {
+        WindowStateOp::Minimize => window.minimize_window(),
+        // macOS の zoom_window はトグルなので、既に最大化なら触らない
+        WindowStateOp::Maximize => {
+            if !window.is_maximized() {
+                window.zoom_window();
+            }
+        }
+        WindowStateOp::Restore => restore_window(window),
+    }
+}
+
+/// メニューの「拡大 / 縮小」（`ZoomWindow`）の実体（macOS。Issue #657）。
+///
+/// NSWindow の zoom はトグルなので**現状のまま**素直に呼ぶ（挙動不変）
+#[cfg(not(target_os = "windows"))]
+fn toggle_window_zoom(window: &mut Window) {
+    window.zoom_window();
+}
+
+/// メニューの「最大化 / 元のサイズに戻す」（`ZoomWindow`）の実体（Windows。Issue #657）。
+///
+/// GPUI Windows の `zoom()` は `SW_MAXIMIZE` 固定でトグルにならない（#584 で判明）。
+/// メニュー項目が「最大化しかできない」のは動作の欠けなので、復元は #584 で用意した
+/// `restore_window`（user32 の `SW_RESTORE`）へ回して状態で出し分ける
+#[cfg(target_os = "windows")]
+fn toggle_window_zoom(window: &mut Window) {
+    if window.is_maximized() {
+        restore_window(window);
+    } else {
+        window.zoom_window();
+    }
+}
+
+/// 最大化を解除して元のサイズへ戻す（Issue #584）。
+///
+/// macOS は NSWindow の zoom がトグルなので `zoom_window()` がそのまま復元になる。
+#[cfg(not(target_os = "windows"))]
+fn restore_window(window: &mut Window) {
+    if window.is_maximized() {
+        window.zoom_window();
+    }
+}
+
+/// Windows の復元（Issue #584）。
+///
+/// GPUI Windows の `zoom()` は `SW_MAXIMIZE` 固定で、復元手段を公開していない
+/// （rev `cafbf4b5`）。GUI のキャプションボタンは `WM_NCLBUTTONUP` の中で GPUI が
+/// `IsZoomed` を見て `SW_NORMAL` を送っているが、その経路は NC ヒットテスト由来で
+/// しか通らない。CLI / MCP からも復元できるよう、ここだけ user32 の
+/// `ShowWindowAsync` を直接呼ぶ（`windows` クレートを足さない最小 FFI。
+/// 既存の CoreGraphics / PDFKit 呼び出しと同じ作法）。
+#[cfg(target_os = "windows")]
+fn restore_window(window: &mut Window) {
+    /// `SW_RESTORE`（winuser.h）。最小化・最大化を解除して元のサイズ・位置へ戻す
+    const SW_RESTORE: i32 = 9;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ShowWindowAsync(hwnd: isize, n_cmd_show: i32) -> i32;
+    }
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: HWND は GPUI が生きている間有効。ShowWindowAsync は
+    // 対象ウィンドウのスレッドへポストするだけで、この場でブロックしない
+    unsafe {
+        ShowWindowAsync(win32.hwnd.get(), SW_RESTORE);
     }
 }
 
@@ -19738,7 +20016,7 @@ fn main() {
             with_active_window(cx, |window| window.minimize_window());
         });
         cx.on_action(|_: &ZoomWindow, cx: &mut App| {
-            with_active_window(cx, |window| window.zoom_window());
+            with_active_window(cx, toggle_window_zoom);
         });
         cx.on_action(|_: &ToggleFullScreen, cx: &mut App| {
             with_active_window(cx, |window| window.toggle_fullscreen());
@@ -28676,8 +28954,8 @@ mod self_test {
                 .update(cx, |app, win, cx| {
                     let vp = win.viewport_size();
                     let area_w = f32::from(vp.width);
-                    let area_h = f32::from(vp.height) - TAB_BAR_HEIGHT;
-                    let border_rect = Rect::new(0.0, TAB_BAR_HEIGHT, area_w, area_h);
+                    let area_h = f32::from(vp.height) - top_chrome_height();
+                    let border_rect = Rect::new(0.0, top_chrome_height(), area_w, area_h);
                     let border = app
                         .workspace
                         .active_tab()
@@ -28735,8 +29013,8 @@ mod self_test {
                 .update(cx, |app, win, cx| {
                     let vp = win.viewport_size();
                     let area_w = f32::from(vp.width);
-                    let area_h = f32::from(vp.height) - TAB_BAR_HEIGHT;
-                    let border_rect = Rect::new(0.0, TAB_BAR_HEIGHT, area_w, area_h);
+                    let area_h = f32::from(vp.height) - top_chrome_height();
+                    let border_rect = Rect::new(0.0, top_chrome_height(), area_w, area_h);
                     let border = app
                         .workspace
                         .active_tab()
@@ -28753,7 +29031,7 @@ mod self_test {
                     });
                     app.on_mouse_move(
                         &MouseMoveEvent {
-                            position: point(px(10.0), px(TAB_BAR_HEIGHT + 10.0)),
+                            position: point(px(10.0), px(top_chrome_height() + 10.0)),
                             pressed_button: None,
                             modifiers: Modifiers::default(),
                         },
@@ -44261,7 +44539,7 @@ mod self_test {
                                 app.dragging_sidebar = true;
                                 app.on_mouse_move(
                                     &MouseMoveEvent {
-                                        position: point(px(x), px(TAB_BAR_HEIGHT + 10.0)),
+                                        position: point(px(x), px(top_chrome_height() + 10.0)),
                                         pressed_button: Some(MouseButton::Left),
                                         modifiers: Modifiers::default(),
                                     },
@@ -46530,6 +46808,123 @@ mod self_test {
                 let _ = std::fs::remove_dir_all(&scratch);
             }
 
+            // 118: in-window メニューバー (#657)。
+            // 構成（危険項目の不在）・開閉・キー操作・項目の発火を GUI 経路で固定する。
+            // メニューバー行を持たない macOS では open / close を検証できないので、
+            // 構成と invoke だけを見る（`MenuBarSnapshot::in_window` で出し分け）
+            {
+                let snap = window
+                    .update(cx, |app, _, _| app.build_menu_bar_snapshot())
+                    .ok();
+                let structure_ok = snap.as_ref().is_some_and(|s| {
+                    let names: Vec<&str> = s.menus.iter().map(|m| m.name.as_str()).collect();
+                    // 危険項目（Windows で unimplemented!() = abort）が UI から到達不能
+                    let actions: Vec<&str> = s
+                        .menus
+                        .iter()
+                        .flat_map(|m| m.items.iter())
+                        .filter_map(|i| match i {
+                            tako_control::protocol::MenuItemSnapshot::Action { action, .. } => {
+                                Some(action.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let no_landmine = cfg!(target_os = "macos")
+                        || !actions.iter().any(|a| {
+                            *a == "tako::HideOthers"
+                                || *a == "tako::ShowAllApps"
+                                || *a == "tako::HideApp"
+                        });
+                    !names.is_empty() && no_landmine
+                });
+                check(structure_ok, "メニュー構成に地雷項目が無い (#657)");
+
+                if snap.as_ref().is_some_and(|s| s.in_window) {
+                    // F10 → 先頭メニューが開き、ハイライトが最初の選択可能行に乗る
+                    let f10 = Keystroke::parse("f10").expect("f10 を解釈できる");
+                    let opened = window
+                        .update(cx, |app, win, cx| {
+                            app.menu_bar_key(&f10, win, cx);
+                            app.menu_bar.open == Some(0) && app.menu_bar.highlighted.is_some()
+                        })
+                        .unwrap_or(false);
+                    check(opened, "メニューバー: F10 で開く (#657)");
+
+                    // → で隣のメニューへ、Esc で閉じる
+                    let nav_ok = window
+                        .update(cx, |app, win, cx| {
+                            let right = Keystroke::parse("right").expect("right");
+                            app.menu_bar_key(&right, win, cx);
+                            let moved = app.menu_bar.open == Some(1);
+                            let esc = Keystroke::parse("escape").expect("escape");
+                            app.menu_bar_key(&esc, win, cx);
+                            moved && app.menu_bar.open.is_none()
+                        })
+                        .unwrap_or(false);
+                    check(nav_ok, "メニューバー: → で隣へ / Esc で閉じる (#657)");
+
+                    // CLI / MCP 経路（dispatch）で開いて閉じる
+                    let dispatch_ok = window
+                        .update(cx, |app, _, cx| {
+                            let opened = tako_control::dispatch::dispatch(
+                                app,
+                                tako_control::protocol::Request::MenuOpen {
+                                    menu: "ファイル".into(),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .is_ok();
+                            app.sync_viewports("selftest", cx);
+                            let is_open = app.menu_bar.open == Some(0);
+                            let closed = tako_control::dispatch::dispatch(
+                                app,
+                                tako_control::protocol::Request::MenuClose,
+                                PaneOrigin::Cli,
+                            )
+                            .is_ok();
+                            app.sync_viewports("selftest", cx);
+                            opened && is_open && closed && app.menu_bar.open.is_none()
+                        })
+                        .unwrap_or(false);
+                    check(dispatch_ok, "メニューバー: CLI 経路で開閉できる (#657)");
+                }
+
+                // invoke は両 OS 共通（アクションの発火経路）。タブが 1 枚増えることで
+                // 「押したら実際に動く」を確認する
+                let tabs_before = window
+                    .update(cx, |app, _, _| app.workspace.tabs().len())
+                    .unwrap_or(0);
+                let invoked = window
+                    .update(cx, |app, _, cx| {
+                        let ok = tako_control::dispatch::dispatch(
+                            app,
+                            tako_control::protocol::Request::MenuInvoke {
+                                path: "ファイル/新規タブ".into(),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok();
+                        app.sync_viewports("selftest", cx);
+                        ok
+                    })
+                    .unwrap_or(false);
+                let mut grew = false;
+                for _ in 0..8 {
+                    wait(cx, 300).await;
+                    grew = window
+                        .update(cx, |app, _, _| app.workspace.tabs().len() > tabs_before)
+                        .unwrap_or(false);
+                    if grew {
+                        break;
+                    }
+                }
+                check(
+                    invoked && grew,
+                    "メニューバー: invoke が実際にアクションを発火する (#657)",
+                );
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -47494,6 +47889,8 @@ mod app_menu_tests {
         }
     }
 
+    /// macOS のアプリ名メニュー（#485）。Windows はアプリ名メニューを持たない（#657）
+    #[cfg(target_os = "macos")]
     #[test]
     fn takoメニューは標準項目を慣習順に並べる() {
         let menus = app_menus();
@@ -47526,6 +47923,8 @@ mod app_menu_tests {
         );
     }
 
+    /// macOS: OS のグローバルメニューバーに載るので Apple の作法（アプリ名メニュー先頭）
+    #[cfg(target_os = "macos")]
     #[test]
     fn メニュー構成は慣習どおりの並び() {
         let menus = app_menus();
@@ -47534,21 +47933,98 @@ mod app_menu_tests {
         assert_eq!(names[0], "tako");
     }
 
+    /// Windows: 自前描画のメニューバー行（#657）なので Explorer / VSCode の作法。
+    /// **アプリ名メニューを持たず**、About はヘルプ、設定・終了はファイル末尾
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn 設定はcmdカンマと同じアクションに配線されている() {
-        // Cmd+, のキーバインドとメニューの「設定…」が同一アクション = 同じ動作
+    fn windowsのメニュー構成はexplorer慣習の並び() {
+        let menus = app_menus();
+        let names: Vec<&str> = menus.iter().map(|m| m.name.as_ref()).collect();
+        assert_eq!(
+            names.len(),
+            5,
+            "ファイル / 編集 / 表示 / ウインドウ / ヘルプ"
+        );
+        assert_ne!(names[0], "tako", "アプリ名メニューは Windows 慣習に無い");
+
+        let mut file_items = Vec::new();
+        collect_actions(&menus[0].items, &mut file_items);
+        let file_actions: Vec<&str> = file_items.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(
+            file_actions.last(),
+            Some(&"tako::Quit"),
+            "終了はファイルメニューの末尾"
+        );
+        assert!(
+            file_actions.contains(&"tako::OpenSettings"),
+            "設定はファイルメニューへ移す"
+        );
+
+        let mut help_items = Vec::new();
+        collect_actions(&menus[4].items, &mut help_items);
+        let help_actions: Vec<&str> = help_items.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(
+            help_actions,
+            vec![
+                "tako::AboutTako",
+                "tako::CheckForUpdates",
+                "tako::OpenDocumentation",
+                "tako::ReportIssue",
+            ],
+            "About と更新確認はヘルプへ移す"
+        );
+    }
+
+    /// **Windows のメニューに macOS 固有の項目を混ぜてはいけない**（#657 の安全装置）。
+    ///
+    /// `HideOthers` / `ShowAllApps` は `gpui_windows` の `hide_other_apps` /
+    /// `unhide_other_apps` が `unimplemented!()` なので、押せる場所に置くと
+    /// **panic = アプリごと abort**（器の無いペインは全滅）する。`keybindings.rs` は
+    /// 「バインドが無く、Windows にはメニューバーも無いので到達経路が無い」ことを
+    /// 安全根拠にしていた。#657 でメニューバーを作った以上、ここで塞ぐ
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windowsのメニューにmacos固有の項目が無い() {
+        let menus = app_menus();
+        let actions: Vec<String> = all_actions(&menus).into_iter().map(|(_, a)| a).collect();
+        for forbidden in [
+            "tako::HideOthers",  // unimplemented!() = abort
+            "tako::ShowAllApps", // unimplemented!() = abort
+            "tako::HideApp",     // Windows の hide() は no-op（無反応のダミー禁止）
+        ] {
+            assert!(
+                !actions.iter().any(|a| a == forbidden),
+                "{forbidden} が Windows のメニューに混ざっている"
+            );
+        }
+        // Services（OS 管理サブメニュー）も macOS 専用
+        for menu in &menus {
+            assert!(
+                !menu
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, MenuItem::SystemMenu(_))),
+                "OS サブメニュー（Services）が Windows のメニューに混ざっている"
+            );
+        }
+    }
+
+    #[test]
+    fn 設定はショートカットと同じアクションに配線されている() {
+        // 設定のキーバインドとメニューの「設定…」が同一アクション = 同じ動作
         let binding = key_bindings()
             .into_iter()
             .find(|b| b.action().name() == "tako::OpenSettings")
-            .expect("cmd-, のバインドが無い");
+            .expect("設定のバインドが無い");
         assert_eq!(binding.keystrokes()[0].inner().key, ",");
         assert!(binding.keystrokes()[0].inner().modifiers.platform);
+        // 置き場所は OS で違う（macOS = tako メニュー / Windows = ファイル末尾。#657）が、
+        // 「メニューから設定を開ける」ことは共通
         let menus = app_menus();
-        let mut items = Vec::new();
-        collect_actions(&menus[0].items, &mut items);
+        let actions: Vec<String> = all_actions(&menus).into_iter().map(|(_, a)| a).collect();
         assert!(
-            items.iter().any(|(_, a)| a == "tako::OpenSettings"),
-            "tako メニューに設定項目が無い"
+            actions.iter().any(|a| a == "tako::OpenSettings"),
+            "メニューに設定項目が無い"
         );
     }
 
@@ -47873,7 +48349,7 @@ mod pane_content_geometry_tests {
             "実測プローブがペインと同じコンテナに無い"
         );
         // ジオメトリの式は 1 か所だけ（推定は measured が無いときのフォールバック）
-        let formula = format!("viewport.height - px({})", "TAB_BAR_HEIGHT");
+        let formula = format!("viewport.height - px({}())", "top_chrome_height");
         assert_eq!(
             flat.matches(&formula).count(),
             1,

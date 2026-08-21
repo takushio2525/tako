@@ -481,13 +481,32 @@ pub fn tools() -> Vec<Value> {
                 共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、\
                 new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、\
                 close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、\
-                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化。",
+                move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、\
+                minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus"], "description": "省略時は list" },
+                    "action": { "type": "string", "enum": ["list", "new", "close", "move-tab", "focus", "minimize", "maximize", "restore"], "description": "省略時は list" },
                     "tab": { "type": "integer", "minimum": 0, "description": "new: 分離するタブ ID（省略で新規タブ）/ move-tab: 移動するタブ ID" },
-                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID" },
+                    "window": { "type": "integer", "minimum": 0, "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore は省略でアクティブウィンドウ" },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_menu",
+            "description": "アプリメニュー（ファイル / 編集 / 表示 / ウインドウ / ヘルプ）の操作。\
+                action: list = メニュー構成と開閉状態を取得（項目のアクション名とショートカットつき）、\
+                open = メニューを開く、close = 閉じる、invoke = 項目を実行。\
+                open / close は Windows の in-window メニューバーだけで使える（macOS はメニューが\
+                OS のメニューバーに載るため tako から開閉できない）。invoke は両 OS で使える。\
+                メニューに実在する項目だけが対象。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "open", "close", "invoke"], "description": "省略時は list" },
+                    "menu": { "type": "string", "description": "open: メニュー名（完全一致 → 前方一致 → 部分一致で解決。添字も可）" },
+                    "path": { "type": "string", "description": "invoke: 「メニュー名/項目名」または項目名のみ（例: ファイル/新規タブ、新規タブ、表示/パネル/git ビュー）" },
                 },
                 "additionalProperties": false,
             },

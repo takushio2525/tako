@@ -99,9 +99,14 @@ enum Command {
     /// タブ操作（new / rename / select / move-pane）
     #[command(subcommand)]
     Tab(TabCommand),
-    /// 複数ウィンドウの操作（Issue #339。list / new / close / move-tab / focus）
+    /// 複数ウィンドウの操作（Issue #339。list / new / close / move-tab / focus /
+    /// minimize / maximize / restore）
     #[command(subcommand)]
     Window(WindowCommand),
+    /// メニューバーの操作（Issue #657。list / open / close / invoke）。
+    /// Windows は自前描画のメニューバー行、macOS は OS のメニューバー
+    #[command(subcommand)]
+    Menu(MenuCommand),
     /// タブ・ペイン名の AI 自動リネームの ON/OFF・状態確認
     Autorename(ToggleArgs),
     /// listen ポート検知 + 提案チップの ON/OFF・状態確認
@@ -2548,6 +2553,41 @@ enum WindowCommand {
     Focus {
         /// 対象ウィンドウ ID
         window: u64,
+    },
+    /// ウィンドウを最小化する（省略時はアクティブウィンドウ）
+    Minimize {
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        window: Option<u64>,
+    },
+    /// ウィンドウを最大化する（省略時はアクティブウィンドウ）
+    Maximize {
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        window: Option<u64>,
+    },
+    /// 最大化を解除して元のサイズへ戻す（省略時はアクティブウィンドウ）
+    Restore {
+        /// 対象ウィンドウ ID（省略時はアクティブウィンドウ）
+        window: Option<u64>,
+    },
+}
+
+/// メニューバーの操作（Issue #657）
+#[derive(Subcommand, Debug)]
+enum MenuCommand {
+    /// メニュー構成と開閉状態を表示する
+    List,
+    /// メニューを開く（Windows のみ。macOS は OS がメニューを描くので開けない）
+    Open {
+        /// メニュー名（完全一致 → 前方一致 → 部分一致で解決。添字も可）
+        menu: String,
+    },
+    /// 開いているメニューを閉じる（Windows のみ）
+    Close,
+    /// メニュー項目を実行する（macOS / Windows 共通）
+    Invoke {
+        /// 「メニュー名/項目名」または項目名のみ（例: `ファイル/新規タブ`、`新規タブ`、
+        /// `表示/パネル/git ビュー`）
+        path: String,
     },
 }
 
@@ -4996,6 +5036,19 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Window(WindowCommand::Focus { window }) => {
             Request::WindowFocus { window: *window }
         }
+        Command::Window(WindowCommand::Minimize { window }) => {
+            Request::WindowMinimize { window: *window }
+        }
+        Command::Window(WindowCommand::Maximize { window }) => {
+            Request::WindowMaximize { window: *window }
+        }
+        Command::Window(WindowCommand::Restore { window }) => {
+            Request::WindowRestore { window: *window }
+        }
+        Command::Menu(MenuCommand::List) => Request::MenuList,
+        Command::Menu(MenuCommand::Open { menu }) => Request::MenuOpen { menu: menu.clone() },
+        Command::Menu(MenuCommand::Close) => Request::MenuClose,
+        Command::Menu(MenuCommand::Invoke { path }) => Request::MenuInvoke { path: path.clone() },
         Command::Tab(TabCommand::Reorder { tab, index }) => Request::TabReorder {
             tab: *tab,
             index: *index,
@@ -6612,8 +6665,18 @@ fn print_result(command: &Command, result: &Value) {
             println!("{result}")
         }
         Command::Window(WindowCommand::List) => println!("{}", pretty_json(result)),
+        // #657: list は構成そのままの JSON、open / invoke は解決結果（1 行）
+        Command::Menu(MenuCommand::List) => println!("{}", pretty_json(result)),
+        Command::Menu(
+            MenuCommand::Open { .. } | MenuCommand::Close | MenuCommand::Invoke { .. },
+        ) => println!("{result}"),
         Command::Window(
-            WindowCommand::New { .. } | WindowCommand::Close { .. } | WindowCommand::MoveTab { .. },
+            WindowCommand::New { .. }
+            | WindowCommand::Close { .. }
+            | WindowCommand::MoveTab { .. }
+            | WindowCommand::Minimize { .. }
+            | WindowCommand::Maximize { .. }
+            | WindowCommand::Restore { .. },
         ) => println!("{result}"),
         Command::Open(_) | Command::Preview(_) | Command::PreviewOutline(_) | Command::Edit(_) => {
             println!("{result}")

@@ -600,7 +600,7 @@
     "name": "tako_reorder_tab"
   },
   {
-    "description": "複数ウィンドウの操作（ビューポート方式: タブ・ペインの実体は全ウィンドウで共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化。",
+    "description": "複数ウィンドウの操作（ビューポート方式: タブ・ペインの実体は全ウィンドウで共有され、各ウィンドウは表示タブだけを持つ）。action: list = ウィンドウ一覧、new = 新しいウィンドウを開く（tab 指定でそのタブを分離、省略で新規タブ付き）、close = ウィンドウを閉じる（タブは残存ウィンドウへ合流しプロセスは殺さない）、move-tab = タブを別ウィンドウへ移動、focus = ウィンドウをアクティブにして前面化、minimize = 最小化、maximize = 最大化、restore = 最大化を解除して元のサイズへ戻す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -611,7 +611,10 @@
             "new",
             "close",
             "move-tab",
-            "focus"
+            "focus",
+            "minimize",
+            "maximize",
+            "restore"
           ],
           "type": "string"
         },
@@ -621,7 +624,7 @@
           "type": "integer"
         },
         "window": {
-          "description": "close / move-tab / focus の対象ウィンドウ ID",
+          "description": "close / move-tab / focus の対象ウィンドウ ID。minimize / maximize / restore は省略でアクティブウィンドウ",
           "minimum": 0,
           "type": "integer"
         }
@@ -629,6 +632,34 @@
       "type": "object"
     },
     "name": "tako_window"
+  },
+  {
+    "description": "アプリメニュー（ファイル / 編集 / 表示 / ウインドウ / ヘルプ）の操作。action: list = メニュー構成と開閉状態を取得（項目のアクション名とショートカットつき）、open = メニューを開く、close = 閉じる、invoke = 項目を実行。open / close は Windows の in-window メニューバーだけで使える（macOS はメニューがOS のメニューバーに載るため tako から開閉できない）。invoke は両 OS で使える。メニューに実在する項目だけが対象。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "省略時は list",
+          "enum": [
+            "list",
+            "open",
+            "close",
+            "invoke"
+          ],
+          "type": "string"
+        },
+        "menu": {
+          "description": "open: メニュー名（完全一致 → 前方一致 → 部分一致で解決。添字も可）",
+          "type": "string"
+        },
+        "path": {
+          "description": "invoke: 「メニュー名/項目名」または項目名のみ（例: ファイル/新規タブ、新規タブ、表示/パネル/git ビュー）",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_menu"
   },
   {
     "description": "ペインを移動する。tab 指定 = 別タブの末尾へ移送（グループ分け）、target 指定 = そのペインの隣（direction 側）へ挿し直す（同タブ内の並べ替え = ペインタイトルバーの D&D と同じ操作。タブまたぎも可）、new_tab = true で新タブとして分離。tab / target / new_tab は排他。既定ではアクティブタブは変わらない（ユーザーの入力を奪わない）。",
