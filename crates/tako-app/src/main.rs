@@ -32936,6 +32936,17 @@ mod self_test {
                         && opened["mode"].as_str() == Some("pdf")
                 })
                 .unwrap_or(false);
+            // 文字矩形（選択・コピー・ヒットテスト）が取れるかは PDF レンダラの能力
+            // （`platform::pdf::capabilities().text_layer`）。取れない環境（Windows は
+            // content stream + font encoding が要るため未実装。#693）では
+            // 「ページが描けているか」までを見る
+            let pdf_text_layer = crate::platform::pdf::capabilities().text_layer;
+            if !pdf_text_layer {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 66 の PDF 文字矩形（この環境の PDF レンダラは \
+                     text_layer を持たない。#693）"
+                );
+            }
             let mut pdf_ok = false;
             for _ in 0..30 {
                 wait(cx, 200).await;
@@ -32946,10 +32957,11 @@ mod self_test {
                                 app.previews.values().next().map(|p| &p.content),
                                 Some(preview::PreviewContent::Pdf(data))
                                     if !data.pages.is_empty()
-                                        && !data.text_layers.is_empty()
-                                        && data.text_layers[0].len() >= 2
-                                        && data.text_layers[0][0].char_boxes.len()
-                                            == data.text_layers[0][0].text.chars().count()
+                                        && (!pdf_text_layer
+                                            || (!data.text_layers.is_empty()
+                                                && data.text_layers[0].len() >= 2
+                                                && data.text_layers[0][0].char_boxes.len()
+                                                    == data.text_layers[0][0].text.chars().count()))
                             )
                         })
                         .unwrap_or(false);
@@ -33194,7 +33206,14 @@ mod self_test {
             check(markdown_outline_ok, "Markdown 重複見出しの一覧と個別ターゲット");
             check(markdown_jump_ok, "Markdown 目次ジャンプ後の見出し先頭位置");
             check(no_heading_ok, "見出しなし Markdown は空アウトラインへ劣化");
-            check(pdf_ok, "PDF プレビューの文字矩形抽出（background 読み込み完了後）");
+            check(
+                pdf_ok,
+                if pdf_text_layer {
+                    "PDF プレビューの文字矩形抽出（background 読み込み完了後）"
+                } else {
+                    "PDF プレビューのページ描画（background 読み込み完了後。文字矩形は #693）"
+                },
+            );
             check(
                 pdf_outline_ok && pdf_jump_ok,
                 "PDFKit アウトライン一覧と 2 ページ目ジャンプ",
