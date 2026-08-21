@@ -33677,9 +33677,11 @@ mod self_test {
                         (zoom, raster_zoom, hit)
                     })
                     .unwrap_or((None, None, None));
-                zoom_coordinates_ok = observation.0 == Some(1.5)
-                    && observation.1 == Some(150)
-                    && observation.2 == Some(Some((0, 0)));
+                // 文字座標の追従は text_layer がある環境だけ（#693）。無い環境では
+                // 「150% へ再ラスタライズされたか」までを見る
+                let hit_ok = !pdf_text_layer || observation.2 == Some(Some((0, 0)));
+                zoom_coordinates_ok =
+                    observation.0 == Some(1.5) && observation.1 == Some(150) && hit_ok;
                 zoom_coordinate_record = format!(
                     "zoom={:?} raster_zoom={:?} hit={:?}",
                     observation.0, observation.1, observation.2
@@ -33691,7 +33693,11 @@ mod self_test {
             println!("TAKO_PREVIEW_COORD: pdf zoom {zoom_coordinate_record}");
             check(
                 zoom_coordinates_ok,
-                "PDF 150% の再ラスタライズ後も文字座標が画像へ追従する",
+                if pdf_text_layer {
+                    "PDF 150% の再ラスタライズ後も文字座標が画像へ追従する"
+                } else {
+                    "PDF 150% の再ラスタライズ（文字座標の追従は #693）"
+                },
             );
             let pinch_position = window
                 .update(cx, |app, _, _| {
