@@ -33461,7 +33461,20 @@ mod self_test {
                         .preview_text_layouts
                         .get(&pane)
                         .expect("code layouts がある");
-                    let line = 40;
+                    // #821 の仮想リスト以後、レイアウトを持つのは**画面に出ている行だけ**。
+                    // 行番号を固定すると、ウィンドウの高さやフォント寸法が違う環境
+                    // （Windows 実機で踏んだ）でその行が画面外になり panic する。
+                    // 描かれている行の中央を選べば、寸法に依らず「スクロール後の座標が
+                    // 更新されて往復する」ことを見られる
+                    let shaped: Vec<usize> = layouts
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, layout)| layout.as_ref().map(|_| index))
+                        .collect();
+                    let line = shaped
+                        .get(shaped.len() / 2)
+                        .copied()
+                        .expect("スクロール後も描かれている行がある");
                     let layout = layouts[line].as_ref().expect("scroll line layout がある");
                     let byte = texts[line].len();
                     let mut position = layout
@@ -33479,8 +33492,10 @@ mod self_test {
                         .expect("コードプレビューの仮想リスト状態がある");
                     let scrolled = top.item_ix > 0 || f32::from(top.offset_in_item) > 0.0;
                     println!(
-                        "TAKO_PREVIEW_COORD: scroll line=40 before_y={:.2} scroll_top={}+{:.2} \
+                        "TAKO_PREVIEW_COORD: scroll line={line} shaped={} before_y={:.2} \
+                         scroll_top={}+{:.2} \
                          line0_shaped={} target_y={:.2} byte={}",
+                        shaped.len(),
                         f32::from(line0_before),
                         top.item_ix,
                         f32::from(top.offset_in_item),
