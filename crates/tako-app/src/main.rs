@@ -31596,20 +31596,28 @@ mod self_test {
                     &format!("{cli} tmux kill --session tako-test --socket {sock}"),
                     true,
                 );
-                wait(cx, 1200).await;
-                let gone = window
-                    .update(cx, |app, _, _| {
-                        let value = tako_control::dispatch(
-                            app,
-                            tako_control::protocol::Request::TmuxList {
-                                socket: Some(sock.clone()),
-                            },
-                            PaneOrigin::Cli,
-                        )
-                        .expect("tmux list は常に成功する");
-                        value["sessions"].as_array().map(Vec::is_empty) == Some(true)
-                    })
-                    .unwrap_or(false);
+                // 「消える」は出来事なので固定待ちにしない（#796 の作法）。
+                // debug CLI の起動 + IPC 往復 + tmux の後始末は環境で数秒かかる
+                let mut gone = false;
+                for _ in 0..24 {
+                    wait(cx, 500).await;
+                    gone = window
+                        .update(cx, |app, _, _| {
+                            let value = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::TmuxList {
+                                    socket: Some(sock.clone()),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .expect("tmux list は常に成功する");
+                            value["sessions"].as_array().map(Vec::is_empty) == Some(true)
+                        })
+                        .unwrap_or(false);
+                    if gone {
+                        break;
+                    }
+                }
                 check(gone, "tako tmux kill でセッションが消える");
                 let _ = std::process::Command::new("tmux")
                     .args(["-L", &sock, "kill-server"])
