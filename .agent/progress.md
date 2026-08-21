@@ -2290,3 +2290,23 @@
   `0.7.4-win.1` が焼けている）+ build 一発 exit 0 / test は失敗 30 件のままで新規ゼロ。
   検出力は 7 通りの revert と ISCC の `#error` 実行で実測
 - 関連: PR #851（`Refs #467, #587, #723`）。残りはスライス 4 / 5 / 7 / 8 / 9
+
+## 2026-08-21（#853: セルフテストが注入した会話を定期更新が消して #725 項目が詰まる問題）
+- 根因は「fixture のフェンスが解釈されない」ではなく**注入した会話が消えていた**こと:
+  実 claude が動いていないペインなので 2 秒 tick の `apply_chat_refresh` が**正しく**
+  「チャットではない」と判断して `chat_panes` から落とす。(e) は MCP を 3 回往復するので
+  そのあいだに tick が挟まると `tako_chat_copy` が失敗し、クリップボードが直前
+  （コピーボタン経路）の値のまま残る = Issue の `code=<本文全体>` / `md_has_fence=false`。
+  md のパースとコードブロック抽出は無傷（`code_clip` が `button_clip` と完全一致が手がかり）
+- **Issue の「決定的に失敗」は誤りで負荷依存**（修正前の挙動でも項目 98 を通り抜けて
+  項目 110 まで進む回があった）。偶然待ちが原因特定の前提になっていた状態自体を直し、
+  (e) の頭で**定期更新を必ず 1 周**回して会話が残ることを見るようにした
+- 直し方は判定を変えず `collect_chat_targets` から fixture のペインを外す
+  （`pin_chat_fixture` / `TAKO_853_NO_CHAT_PIN=1` で旧挙動の A/B）。close で pin も落とす。
+  判定は list / code / markdown の 3 本へ分割 + 応答本文と fixture の有無を診断行へ（#796 の思想）
+- 検証: 隔離セルフテスト **`TAKO_APP_SELF_TEST_OK` = 完走**（skip 3 件は蓋閉じの既知項目）/
+  `TAKO_853_NO_CHAT_PIN=1` で `fixture=[gone]` の FAILED を実測 / test 2222 / fmt / clippy /
+  クロスチェック 警告 10（ベースライン同数）/ CI macOS・Windows・Pages 全 pass。
+  検出力は番犬 4 通りの revert で実測
+- 関連コミット: `c41144a`（PR #857）。副産物 **#858 起票**（項目 110 = #803 が高負荷でフレーク。
+  load 10.16 で `(body +2 header +2)`、低負荷で期待値 `+1/+0`）
