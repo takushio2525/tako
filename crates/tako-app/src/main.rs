@@ -34689,6 +34689,17 @@ mod self_test {
             // 67. ファイルツリーの「タブ = ワークスペース」（FR-3.1。2026-06-13 変更）:
             //     タブ内全ペインの cwd がワークスペースフォルダとして並ぶ（マルチルート）。
             //     cwd 違いのペインを生やし、ルート見出しが 2 つ以上になることを確認する
+            // ホームとは別のフォルダならマルチルートが成立する。`/private/tmp` は
+            // macOS 専用なので OS の一時ディレクトリを使い、**同じ値**を cwd と
+            // 期待値の両方に使う（末尾の区切りは落とす。Windows の `%TEMP%` は付く）
+            let multiroot_dir = std::path::PathBuf::from(
+                std::env::temp_dir()
+                    .display()
+                    .to_string()
+                    .trim_end_matches(['/', '\\'])
+                    .to_string(),
+            );
+            let multiroot_leaf = multiroot_dir.file_name().map(std::ffi::OsStr::to_os_string);
             let temp_pane = window
                 .update(cx, |app, _, cx| {
                     let base = app.focused_pane().as_u64();
@@ -34700,9 +34711,7 @@ mod self_test {
                             direction: None,
                             ratio: None,
                             command: None,
-                            // ホームとは別のディレクトリならマルチルートが成立する。
-                            // OS の一時ディレクトリを使う（`/private/tmp` は macOS 専用）
-                            cwd: Some(std::env::temp_dir().display().to_string()),
+                            cwd: Some(multiroot_dir.display().to_string()),
                             focus: None,
                         },
                         PaneOrigin::Cli,
@@ -34729,7 +34738,14 @@ mod self_test {
                     .update(cx, |app, _, _| {
                         app.sync_filetree_roots();
                         let root_count = app.filetree.roots().len();
-                        let has_tmp = app.filetree.roots().iter().any(|r| r.ends_with("tmp"));
+                        // 名前決め打ち（`ends_with("tmp")`）だと Windows の `…\Local\Temp`
+                        // で外れる（`Path::ends_with` は成分の完全一致で大小も区別する）。
+                        // 実際に渡したフォルダ名で見る
+                        let has_tmp = app
+                            .filetree
+                            .roots()
+                            .iter()
+                            .any(|r| r.file_name().map(std::ffi::OsStr::to_os_string) == multiroot_leaf);
                         let header_rows =
                             app.filetree.rows().iter().filter(|r| r.root).count();
                         root_count >= 2
@@ -34758,7 +34774,11 @@ mod self_test {
                         PaneOrigin::Cli,
                     );
                     app.sync_filetree_roots();
-                    let shrunk = !app.filetree.roots().iter().any(|r| r.ends_with("tmp"));
+                    let shrunk = !app
+                        .filetree
+                        .roots()
+                        .iter()
+                        .any(|r| r.file_name().map(std::ffi::OsStr::to_os_string) == multiroot_leaf);
                     app.set_filetree(false);
                     shrunk && !app.filetree.visible
                 })
