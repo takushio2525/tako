@@ -1801,6 +1801,33 @@ macOS 側: `test --workspace` **2411 passed / 0 failed**（main 2406 + 新規 5�
 6. **`Start-Process` で投げたビルドは SSH セッションが切れると死ぬ**。長い処理は
    `Invoke-CimMethod Win32_Process Create`（ジョブの外に出る）か `schtasks` で投げる
 
+##### 副産物（重い方）: 途中で死んだ run が「OK + 終了コード 0」を出していた
+
+`on_app_quit` の `TAKO_APP_SELF_TEST_OK` は「全 check 通過後にだけ quit が来る」前提だった。
+ところが **quit 経路は最終項目の cmd-q 以外からも通る**（ウィンドウ 0 枚の自動終了・
+最後のタブの close）ので、#872 の無音終了は条件次第で**偽の緑**になる。Windows 実測:
+
+```
+TAKO_SELF_TEST_WINDOW_CLOSED: … 残り gpui=0 … → …アプリを終了する（#872）
+TAKO_APP_SELF_TEST_OK      ← 項目 79b で死んでいるのに OK
+EXITCODE=0
+```
+
+つまり「`TAKO_APP_SELF_TEST_OK` なら合格」という運用の前提が、**この経路では成り立って
+いなかった**。前提を明示のラッチ（`SELF_TEST_AT_FINAL_STEP`）にして、立っていない quit は
+`TAKO_APP_SELF_TEST_FAILED` + exit 1 で落とすようにした（番犬つき）。修正後の同じ before は
+`最終項目より前に quit した` + `EXITCODE=1`。
+
+##### 実機テストの差分は 1 件だけで、それは #766 の負荷依存フレーク
+
+`cargo test --workspace --no-fail-fast`（実機）は main = 22 件失敗、本ブランチ = 23 件。
+増えた 1 件は `psmux_backend.rs` の `器のホイールは上下対称で最下部でcopy_modeを抜ける`
+（#766 で新設）。全体走行では 67 秒かかって
+`遡るための履歴が作れない`（貼り付けた `1..80 | ForEach-Object { "LINE $_" }` が途中で切れて
+PowerShell が継続行 `>>` に入る）で落ちるが、**単独で 3 回連続 pass（各 6 秒）**。
+負荷で送達が崩れる #640 と同型なので **#896 に起票**した。私の変更は tako-app の
+ウィンドウ寿命と tako-core の新モジュールだけで、psmux 経路には触っていない。
+
 ##### 副産物: 項目 81 は #381 以降ずっと空振りしていた
 
 項目 79 でウィンドウを開き直すとハンドルが差し替わるのに、取り直しが**項目 81 の後ろ**に
