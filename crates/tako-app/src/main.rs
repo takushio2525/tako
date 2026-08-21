@@ -33535,73 +33535,84 @@ mod self_test {
                 })
                 .unwrap_or(false);
             check(pdf_opened, "座標検証用 PDF を開く");
-            check(
-                wait_for_preview_maps(any, window, cx, PaneId::from_raw(code_pane), true).await,
-                "PDF の座標キャッシュ生成",
-            );
-            let pdf_coordinates_ok = window
-                .update(cx, |app, _, cx| {
-                    let pane = PaneId::from_raw(code_pane);
-                    let texts = app
-                        .preview_line_texts
-                        .get(&pane)
-                        .expect("pdf texts がある");
-                    let line_bounds = app
-                        .preview_line_bounds
-                        .get(&pane)
-                        .expect("pdf line bounds がある");
-                    let char_bounds = app
-                        .preview_pdf_char_bounds
-                        .get(&pane)
-                        .expect("pdf char bounds がある");
-                    let line0 = texts.first().expect("pdf line 0 がある");
-                    let line0_chars = char_bounds.first().expect("pdf char line 0 がある");
-                    let first = line0_chars.first().expect("pdf char 0 がある");
-                    let last = line0_chars.last().expect("pdf 末尾 char がある");
-                    let caret_point = |bounds: &Bounds<Pixels>, fraction: f32| {
-                        point(
-                            bounds.left() + (bounds.right() - bounds.left()) * fraction,
-                            bounds.center().y,
-                        )
-                    };
-                    let first_start = caret_point(first, 0.25);
-                    let last_start = caret_point(last, 0.25);
-                    let last_end = caret_point(last, 0.75);
-                    let first_byte = 0usize;
-                    let last_byte = line0
-                        .char_indices()
-                        .last()
-                        .map(|(byte, _)| byte)
-                        .unwrap_or(0);
-                    let hit_start = app.preview_hit_test(pane, first_start);
-                    let hit_last_start = app.preview_hit_test(pane, last_start);
-                    let hit_end = app.preview_hit_test(pane, last_end);
-                    app.preview_selections.insert(
-                        pane,
-                        PreviewSelection {
-                            anchor: (0, 0),
-                            head: (0, "Hello".len()),
-                        },
-                    );
-                    cx.notify();
-                    let copied = app.preview_selected_text().as_deref() == Some("Hello");
-                    println!(
-                        "TAKO_PREVIEW_COORD: pdf first_x={:.2} last_x={:.2} hits={hit_start:?}/{hit_last_start:?}/{hit_end:?}",
-                        f32::from(first_start.x),
-                        f32::from(last_end.x),
-                    );
-                    !line_bounds.is_empty()
-                        && !char_bounds.is_empty()
-                        && hit_start == Some((0, first_byte))
-                        && hit_last_start == Some((0, last_byte))
-                        && hit_end == Some((0, line0.len()))
-                        && copied
-                })
-                .unwrap_or(false);
-            check(
-                pdf_coordinates_ok,
-                "PDF の文字矩形ヒットテストと選択コピーが往復する",
-            );
+            // ここから先は PDF の**文字矩形**（text_layer）が前提。取れない環境
+            // （Windows。#693）ではキャッシュが空のままなので、能力で切り分ける。
+            // ページ描画・ズーム・ページ指定はこの下で引き続き検証する
+            if pdf_text_layer {
+                check(
+                    wait_for_preview_maps(any, window, cx, PaneId::from_raw(code_pane), true).await,
+                    "PDF の座標キャッシュ生成",
+                );
+                let pdf_coordinates_ok = window
+                    .update(cx, |app, _, cx| {
+                        let pane = PaneId::from_raw(code_pane);
+                        let texts = app
+                            .preview_line_texts
+                            .get(&pane)
+                            .expect("pdf texts がある");
+                        let line_bounds = app
+                            .preview_line_bounds
+                            .get(&pane)
+                            .expect("pdf line bounds がある");
+                        let char_bounds = app
+                            .preview_pdf_char_bounds
+                            .get(&pane)
+                            .expect("pdf char bounds がある");
+                        let line0 = texts.first().expect("pdf line 0 がある");
+                        let line0_chars = char_bounds.first().expect("pdf char line 0 がある");
+                        let first = line0_chars.first().expect("pdf char 0 がある");
+                        let last = line0_chars.last().expect("pdf 末尾 char がある");
+                        let caret_point = |bounds: &Bounds<Pixels>, fraction: f32| {
+                            point(
+                                bounds.left() + (bounds.right() - bounds.left()) * fraction,
+                                bounds.center().y,
+                            )
+                        };
+                        let first_start = caret_point(first, 0.25);
+                        let last_start = caret_point(last, 0.25);
+                        let last_end = caret_point(last, 0.75);
+                        let first_byte = 0usize;
+                        let last_byte = line0
+                            .char_indices()
+                            .last()
+                            .map(|(byte, _)| byte)
+                            .unwrap_or(0);
+                        let hit_start = app.preview_hit_test(pane, first_start);
+                        let hit_last_start = app.preview_hit_test(pane, last_start);
+                        let hit_end = app.preview_hit_test(pane, last_end);
+                        app.preview_selections.insert(
+                            pane,
+                            PreviewSelection {
+                                anchor: (0, 0),
+                                head: (0, "Hello".len()),
+                            },
+                        );
+                        cx.notify();
+                        let copied = app.preview_selected_text().as_deref() == Some("Hello");
+                        println!(
+                            "TAKO_PREVIEW_COORD: pdf first_x={:.2} last_x={:.2} hits={hit_start:?}/{hit_last_start:?}/{hit_end:?}",
+                            f32::from(first_start.x),
+                            f32::from(last_end.x),
+                        );
+                        !line_bounds.is_empty()
+                            && !char_bounds.is_empty()
+                            && hit_start == Some((0, first_byte))
+                            && hit_last_start == Some((0, last_byte))
+                            && hit_end == Some((0, line0.len()))
+                            && copied
+                    })
+                    .unwrap_or(false);
+                check(
+                    pdf_coordinates_ok,
+                    "PDF の文字矩形ヒットテストと選択コピーが往復する",
+                );
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 66b-2 の PDF 座標・選択（この環境の PDF レンダラは \
+                     text_layer を持たない。#693）"
+                );
+            }
+
             let preview_zoom_command_ok = window
                 .update(cx, |app, preview_window, cx| {
                     let pane = PaneId::from_raw(code_pane);
