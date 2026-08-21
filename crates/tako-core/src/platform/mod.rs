@@ -20,4 +20,5 @@ pub mod procinfo;
 pub mod quit_signal;
 pub mod release_assets;
 pub mod shell;
+pub mod shell_dialect;
 pub mod support;

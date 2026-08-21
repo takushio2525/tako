@@ -1053,6 +1053,115 @@ dispatch 経由の 2 件は builder を直接呼べないので期待値を構�
   Windows では PTY が立たない = #666 のカード実行と #453 の Code Runner が死んでいる）。
   `platform/shell.rs` に `run_pane_command` を足す設計が保全ブランチにあるとのこと
 
+### 8 の前提: セルフテストの方言対応（#865）— ✅ **完了**（PR は本文末尾の記録）
+
+スライス 5 / 7 の申し送りは「実機セルフテストが項目 2（TERM / COLORTERM 注入）で止まるので
+スライス 7 完了後に通しで回す」だったが、**この見立ては誤り**だった。止まっていたのは
+シェル統合ではなく**テストの書き方**で、`echo TERMCHK=$TERM,$COLORTERM` の
+`$TERM` は PowerShell では未定義の PowerShell 変数（環境変数は `$env:TERM`）。
+機能は正常なのに必ず落ち、**以降の項目が 1 つも走らない = Windows のカバレッジ 0** だった。
+
+#### 入れたもの
+
+- `crates/tako-core/src/platform/shell_dialect.rs`（**新設**）: 打ち込む文字列の方言差を
+  閉じ込める境界。方言は OS ではなく `default_shell()` が選んだプログラムから引く
+  **純粋関数**（`from_program`）なので、macOS から PowerShell 側の生成結果を全部テストできる。
+  `cmd.exe` / fish は変換先が無いので `None`（呼び出し側が「対象外」と明示する）
+- 語彙: `echo`（`${NAME}` を環境変数参照へ展開）/ `arith` / `marker` / `emit_ansi(_line)` /
+  `seq` / `sleep` / `exit_status` / `cd` / `mkdir_and_cd` / `program`（PowerShell は
+  呼び出し演算子 `&`）/ `discard_output` / `on_success(_echo)` / `on_output_contains_echo` /
+  `on_env_set_echo` / `on_ipc_endpoint_ready_echo` / `on_cwd_is_home_echo` / `with_env` /
+  `without_env` / `quote_arg` / `print_lines` / `assign_output` / `repeat` / `sequence` /
+  `paint_and_hold` / `shell_snippet_argv` / `shell_snippet_command` / `emit_numbered_lines` /
+  **`clear_line_key`**（後述）
+- セルフテスト側は打ち込む文字列を全部この境界経由へ。**機能そのものが Windows に無い項目は
+  「何が無いか」を理由に明示スキップ**（ログに追跡 Issue 付きで出る）
+
+#### PowerShell 側の形は実機で 1 つずつ測って決めた（pwsh 7 と Windows PowerShell 5.1 の両方）
+
+| 罠 | 実測 | 採った形 |
+|---|---|---|
+| 裸の引数のカンマ | `echo A=$env:X,$env:Y` が **2 行に割れる**（配列区切り） | 必ず二重引用符で包む |
+| `&&` | 5.1 に無い | `cmd; if ($LASTEXITCODE -eq 0) { … }` |
+| `` `e `` | 7 専用 | `$([char]27)` |
+| 引用符付きパス | **式として評価され実行されない** | 呼び出し演算子 `& "…"` |
+| `Ctrl+U` | **PSReadLine（Windows モード）に存在しない**（`Get-PSReadLineKeyHandler -Bound` に出ない） | `Escape`（`RevertLine`）。セルフテストは行を捨てる道具として 30 か所で使っていた |
+| `test -S` | 受け口は named pipe | `Test-Path $env:TAKO_SOCKET`（`\\.\pipe\…` に対して実在で true / 不在で false を実測） |
+| `printf '%b'` | 無い | `Write-Host -NoNewline "…"`（`` `n `` / `$([char]27)` へ翻訳） |
+| `/bin/sh -c` | 無い | `powershell -NoProfile -Command` |
+
+#### 実機の到達範囲（`ssh win` / `schtasks /it` で session 1 へ GUI を投げる）
+
+**修正前**: `TAKO_APP_SELF_TEST_FAILED: TERM / COLORTERM 注入` / `EXITCODE=1`（9 秒で終了）。
+
+**修正後**: **項目 0〜92 が通る**。止まるのは項目 93（#694 GUI モード判定表）で、
+材料が OSC 133 の idle 検知 + `cat` なので **psmux 越しにシェル統合が届かない**（#766）と同根。
+
+スキップした項目と理由（すべてログに出る。**直れば自動で検証が復活する形**にしてある）:
+
+| 項目 | 理由 | 追跡 |
+|---|---|---|
+| 1d | tmux は POSIX シェル環境の道具（器は psmux） | #519 |
+| 40b の fd 検査 | `/dev/fd` が無い | — |
+| 41 / 41b | `shell_integration::status().effective()` が false（psmux が OSC を素通ししない） | #766 |
+| 41c / 41d | zsh 不在（元から自動スキップ） | — |
+| 45b | 受信バイトを画面へ出す仕掛け（cooked TTY の ECHOCTL）が POSIX 専用 | #729 |
+| 48 / 59〜62 | **本物の tmux が無い**（実機の `tmux` は psmux が同名で入れているもの） | #866 |
+| 53 / 54 | listen 役の `nc` とジョブ制御が POSIX 専用 | — |
+| 66 / 66b-2 / PDF 選択 / 150% の文字座標 | `platform::pdf::capabilities().text_layer` が false | #693 |
+| 69b の根因再現 / グリフ隔離 | shaper とフォント寸法に依る前提 | — |
+| 69c | `links.rs` のパス検出が POSIX 形前提（`std::path::MAIN_SEPARATOR == '/'` で判定） | #522 / #870 |
+| 71 | wry の WebView2 が `data:` URL で **abort**（`InvalidUri(Empty)` を COM コールバック内で unwrap） | #724 |
+| 77 / 79 / 80 | **2 枚目のウィンドウを作るとアプリが静かに終了する**（exit 0 / panic 無し） | #872 |
+| 91 の実行検査 | コマンド実行ペインが `/bin/sh` 決め打ちで **PTY が立たない** | #875 |
+
+#### 起票した製品バグ（すべて実機実測つき）
+
+- **#866**: psmux が tmux の `=name`（完全一致ターゲット）を解釈できず `tako tmux kill` が効かない
+  （`=` の有無だけを変えた A/B つき）
+- **#870**: `links.rs` のホーム解決が `HOME` 決め打ち（Windows は `USERPROFILE`）。
+  ホーム解決が `terminal.rs` と 2 か所にあることが原因
+- **#872**: 2 枚目のウィンドウ生成でアプリが静かに終了する
+- **#875**: コマンド実行ペイン（#666 カード / #453 Code Runner）が `/bin/sh` 決め打ちで立たない。
+  **保全ブランチに `platform::shell::run_pane_command` として実装済みの設計がある**
+- **#724 へ追記**: 症状②の正確な panic 位置（`wry/src/webview2/mod.rs:910`）とスタック
+
+#### テスト側で直した「macOS では見えなかった穴」
+
+- 項目 90 / 66c の Markdown が **`drain_pending_preview_loads` を呼んでいなかった**。
+  macOS は前のファイルの座標キャッシュが残っていて**空振りで緑**になっていた
+  （Windows は直前の PDF が text_layer を持たずキャッシュが空なので顕在化）
+- 項目 66b-2 の座標検査が `line = 40` 決め打ち。#821 の仮想リスト以後は
+  **画面に出ている行しかレイアウトを持たない**ので、寸法が違う環境で panic した
+- 項目 48 / 87 の「出来事」を固定待ちで見ていた（#796 の作法へ揃えた）
+- 項目 67 のマルチルート判定が `roots().any(|r| r.ends_with("tmux"))` の**名前決め打ち**
+  （`Path::ends_with` は成分の完全一致で大小も区別する = `…\Local\Temp` で外れる）
+- 項目 76b / 76d が**分割に失敗した状態で最後のペインを閉じ**、アプリを終了させていた
+  （「静かに走らなかった」を作る形）。セルフテスト中の終了に発生源を出す診断も入れた
+
+#### 実機で GUI セルフテストを回すレシピ（そのまま使える）
+
+```powershell
+# 1 度だけ: session 1 へ投げるタスクを作る（SSH は session 0 で GUI が出ない）
+schtasks /create /tn tako865 /tr "C:\Users\<user>\dev\tako-evidence-865\run-selftest.cmd" /sc once /st 23:59 /it /f
+# run-selftest.cmd の中身（TAKO_ISOLATED=1 / TAKO_SELF_TEST=1 / CARGO_BUILD_JOBS=2 を立ててログへ）
+schtasks /run /tn tako865
+# ログは UTF-8 で読む（cp932 で読むと日本語が化ける）
+[System.IO.File]::ReadAllText("…\selftest.log", [System.Text.Encoding]::UTF8)
+```
+
+1 反復は**実機の増分ビルド 1.2〜2.4 分 + セルフテスト 1.5 分**。32 反復回した。
+
+#### 次の一手（スライス 8 へ）
+
+- 項目 93 以降（GUI モード / チャット / 設定画面 / limit-resume）は
+  `shell_integration::status().effective()` を材料にする項目が続く。**#766 が直れば一気に進む**
+- マトリクスは**触っていない**（作法 4）。ただし棚卸しの材料は揃った:
+  上の表がそのまま「Windows で何が動いて何が動かないか」の実測一覧になる。
+  いま `tako_theme` / `tako_open_file` / `tako_preview_view` 等が `Pending` のままだが、
+  **セルフテストは実機でそれらを通している**（= Supported / Degraded へ倒せる）
+
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
