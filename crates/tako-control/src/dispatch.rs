@@ -12284,7 +12284,13 @@ mod tests {
             assert_eq!(result["agent"], "agy");
             let cmd = result["command"].as_str().unwrap();
             assert!(cmd.contains(" agy"), "{cmd}");
-            assert!(cmd.contains("--model 'Gemini 3.5 Flash (High)'"), "{cmd}");
+            // クォートの形はシェルの方言で変わる（#867）。ここが見たいのは
+            // 「空白入りのモデル名が 1 引数として渡る」こと
+            assert!(
+                cmd.contains("--model 'Gemini 3.5 Flash (High)'")
+                    || cmd.contains("--model \"Gemini 3.5 Flash (High)\""),
+                "{cmd}"
+            );
             assert!(!cmd.contains("effort"), "agy に effort は渡さない: {cmd}");
         });
     }
@@ -14442,7 +14448,9 @@ mod tests {
             let new_pane = result["new_master_pane_id"].as_u64().expect("後任ペイン");
             let cmd = successor_launch_cmd(&host, new_pane);
             assert!(
-                cmd.contains("export CLAUDE_CONFIG_DIR=/tmp/_tako_761_cfg_"),
+                // 前置きの構文はシェルの方言で変わる（#867）。config dir が
+                // コマンド行で注入されていることを見る
+                cmd.contains("CLAUDE_CONFIG_DIR") && cmd.contains("/tmp/_tako_761_cfg_"),
                 "master_account の config dir が反映されていない: {cmd}"
             );
 

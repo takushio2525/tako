@@ -295,6 +295,10 @@ fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
+    /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
+    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+
     use super::*;
 
     #[test]
@@ -320,13 +324,16 @@ mod tests {
     fn claude_cmd_matches_legacy_format() {
         // 既存 build_worker_claude_cmd とシェル解釈後に等価なコマンドになる
         // （モデル名のクオートは安全文字のみの場合省く。role は常にクオート）
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Claude,
-            role: "worker:demo",
-            model: Some("claude-sonnet-5"),
-            effort: Some("high"),
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:demo",
+                model: Some("claude-sonnet-5"),
+                effort: Some("high"),
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' claude --model claude-sonnet-5 --effort high"
@@ -335,13 +342,16 @@ mod tests {
 
     #[test]
     fn codex_cmd_maps_effort_to_config_override() {
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Codex,
-            role: "worker:demo",
-            model: Some("gpt-5.6-terra"),
-            effort: Some("medium"),
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:demo",
+                model: Some("gpt-5.6-terra"),
+                effort: Some("medium"),
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' codex --model gpt-5.6-terra -c model_reasoning_effort=medium"
@@ -351,13 +361,16 @@ mod tests {
     #[test]
     fn agy_cmd_ignores_effort_and_quotes_model() {
         // agy のモデル名は空白・括弧入りの表示名（"Gemini 3.5 Flash (High)" 等）
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Agy,
-            role: "worker:demo",
-            model: Some("Gemini 3.5 Flash (High)"),
-            effort: Some("high"),
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Agy,
+                role: "worker:demo",
+                model: Some("Gemini 3.5 Flash (High)"),
+                effort: Some("high"),
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='worker:demo' agy --model 'Gemini 3.5 Flash (High)'"
@@ -373,34 +386,40 @@ mod tests {
             skip_permissions: true,
             ..Default::default()
         };
-        assert!(build_worker_cmd(&base(WorkerAgent::Claude))
+        assert!(build_worker_cmd_in(&base(WorkerAgent::Claude), POSIX)
             .ends_with("claude --dangerously-skip-permissions"));
-        assert!(build_worker_cmd(&base(WorkerAgent::Agy))
+        assert!(build_worker_cmd_in(&base(WorkerAgent::Agy), POSIX)
             .ends_with("agy --dangerously-skip-permissions"));
-        assert!(build_worker_cmd(&base(WorkerAgent::Codex))
+        assert!(build_worker_cmd_in(&base(WorkerAgent::Codex), POSIX)
             .ends_with("codex --dangerously-bypass-approvals-and-sandbox"));
     }
 
     #[test]
     fn extra_args_are_quoted_and_appended() {
         let args = vec!["--search".to_string(), "has space".to_string()];
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Codex,
-            role: "worker:x",
-            extra_args: &args,
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:x",
+                extra_args: &args,
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert!(cmd.ends_with("codex --search 'has space'"));
     }
 
     #[test]
     fn model_and_effort_omitted_when_none() {
         for agent in WorkerAgent::ALL {
-            let cmd = build_worker_cmd(&WorkerLaunch {
-                agent,
-                role: "worker:x",
-                ..Default::default()
-            });
+            let cmd = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent,
+                    role: "worker:x",
+                    ..Default::default()
+                },
+                POSIX,
+            );
             assert!(!cmd.contains("--model"));
             assert!(!cmd.contains("effort"));
             assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='worker:x' "));
@@ -505,12 +524,15 @@ mod tests {
             ],
             unsets: Vec::new(),
         };
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Claude,
-            role: "worker:test",
-            env: &env,
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:test",
+                env: &env,
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert!(cmd.starts_with("export "), "env export が先頭にある: {cmd}");
         assert!(
             cmd.contains("CLAUDE_CONFIG_DIR="),
@@ -529,12 +551,15 @@ mod tests {
             exports: vec![("MY_VAR".to_string(), "keep".to_string())],
             unsets: vec!["CLAUDE_CONFIG_DIR".to_string()],
         };
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Claude,
-            role: "worker:test",
-            env: &env,
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:test",
+                env: &env,
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert!(
             cmd.starts_with("unset CLAUDE_CONFIG_DIR; "),
             "unset がコマンド先頭にある: {cmd}"
@@ -548,12 +573,15 @@ mod tests {
 
     #[test]
     fn build_worker_cmd_empty_env_is_backward_compatible() {
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Claude,
-            role: "worker:test",
-            effort: Some("max"),
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:test",
+                effort: Some("max"),
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert!(
             cmd.starts_with("TAKO_ORCHESTRATOR_ROLE="),
             "env なしなら従来と同じ形式: {cmd}"
@@ -567,12 +595,15 @@ mod tests {
             exports: vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())],
             unsets: Vec::new(),
         };
-        let cmd = build_worker_cmd(&WorkerLaunch {
-            agent: WorkerAgent::Codex,
-            role: "worker:test",
-            env: &env,
-            ..Default::default()
-        });
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:test",
+                env: &env,
+                ..Default::default()
+            },
+            POSIX,
+        );
         assert!(
             cmd.contains("export ANTHROPIC_API_KEY="),
             "codex にも env export: {cmd}"

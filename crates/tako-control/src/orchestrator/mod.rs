@@ -2462,6 +2462,11 @@ pub struct AgentStatus {
 
 #[cfg(test)]
 mod tests {
+    /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
+    /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
+    #[allow(dead_code)]
+    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+
     use super::*;
 
     #[test]
@@ -3316,7 +3321,7 @@ prompt_blocks:
     fn master_cmd_without_model() {
         // 既定（master_agent 未指定 = claude）の出力は #127 以前と完全一致（後方互換）
         let p = Profile::default();
-        let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+        let cmd = build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='master' claude --effort max --append-system-prompt-file '/tmp/p.md'"
@@ -3330,7 +3335,8 @@ prompt_blocks:
             model: Some("claude-opus-4-6[1m]".into()),
             ..Default::default()
         };
-        let cmd = build_master_cmd("master:x", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+        let cmd =
+            build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
         assert!(cmd.contains("--model 'claude-opus-4-6[1m]'"));
         assert!(cmd.contains("--effort max"));
     }
@@ -3344,11 +3350,12 @@ prompt_blocks:
             effort: "xhigh".into(),
             ..Default::default()
         };
-        let cmd = build_master_cmd(
+        let cmd = build_master_cmd_in(
             "master:sol",
             &p,
             Path::new("/tmp/_system_prompt_sol.md"),
             "/usr/local/bin/tako",
+            POSIX,
         )
         .unwrap();
         assert_eq!(
@@ -3372,11 +3379,12 @@ prompt_blocks:
             master_agent: Some("codex".into()),
             ..Default::default()
         };
-        let cmd = build_master_cmd(
+        let cmd = build_master_cmd_in(
             "master",
             &p,
             Path::new("/tmp/pro file.md"),
             "/Applications/tako.app/Contents/Resources/tako bin/tako",
+            POSIX,
         )
         .unwrap();
         assert!(!cmd.contains("--model"));
@@ -3409,7 +3417,7 @@ prompt_blocks:
         assert!(err.contains("master 非対応"), "{err}");
         assert!(err.contains("worker"), "{err}");
         assert!(
-            build_master_cmd("master", &agy, Path::new("/tmp/p.md"), "tako").is_err(),
+            build_master_cmd_in("master", &agy, Path::new("/tmp/p.md"), "tako", POSIX).is_err(),
             "agy はコマンド組み立ても拒否"
         );
         // 不正値 → 対応一覧つきエラー
@@ -3480,7 +3488,8 @@ prompt_blocks:
     #[test]
     fn solo_cmd_uses_solo_role_and_high_effort() {
         let p = solo_default_profile();
-        let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+        let cmd =
+            build_master_cmd_in("solo", &p, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='solo' claude --effort high --append-system-prompt-file '/tmp/solo.md'"
@@ -3491,7 +3500,7 @@ prompt_blocks:
         );
 
         let cmd_suffix =
-            build_master_cmd("solo:docs", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+            build_master_cmd_in("solo:docs", &p, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
         assert!(cmd_suffix.contains("TAKO_ORCHESTRATOR_ROLE='solo:docs'"));
         assert!(cmd_suffix.contains("--effort high"));
     }
@@ -3504,7 +3513,8 @@ prompt_blocks:
             effort: "high".into(),
             ..Default::default()
         };
-        let cmd = build_master_cmd("solo", &p, Path::new("/tmp/solo.md"), "tako").unwrap();
+        let cmd =
+            build_master_cmd_in("solo", &p, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
         assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='solo' codex "));
         assert!(cmd.contains("-c model_reasoning_effort=high"));
         assert!(
@@ -4441,7 +4451,8 @@ worker_agents:
                 master_account: Some("univ".into()),
                 ..Default::default()
             };
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.starts_with("export CLAUDE_CONFIG_DIR=/tmp/tako-test-claude-univ; "),
                 "アカウントの config dir が export される: {cmd}"
@@ -4458,7 +4469,8 @@ worker_agents:
                 master_account: Some("personal".into()),
                 ..Default::default()
             };
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.starts_with("unset CLAUDE_CONFIG_DIR; "),
                 "既定の資格情報を使う master は unset を前置する: {cmd}"
@@ -4478,7 +4490,8 @@ worker_agents:
             p.env
                 .insert("CLAUDE_CONFIG_DIR".into(), "/tmp/old-dir".into());
             p.env.insert("OTHER_VAR".into(), "keep".into());
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.contains("export CLAUDE_CONFIG_DIR=/tmp/tako-test-claude-univ;"),
                 "{cmd}"
@@ -4499,7 +4512,8 @@ worker_agents:
                 master_account: Some("nosuch".into()),
                 ..Default::default()
             };
-            let err = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap_err();
+            let err = build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX)
+                .unwrap_err();
             assert!(err.contains("nosuch"), "{err}");
         });
     }
@@ -4509,7 +4523,8 @@ worker_agents:
     fn master_without_account_is_backward_compatible() {
         with_test_accounts(TEST_ACCOUNTS_YAML, || {
             let p = Profile::default();
-            let cmd = build_master_cmd("master", &p, Path::new("/tmp/p.md"), "tako").unwrap();
+            let cmd =
+                build_master_cmd_in("master", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
             assert!(
                 cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='master' claude"),
                 "従来と同じ形式: {cmd}"

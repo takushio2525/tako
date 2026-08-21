@@ -884,6 +884,11 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
+    /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
+    #[allow(dead_code)]
+    const POSIX: crate::launch_cmd::LaunchSyntax = crate::launch_cmd::LaunchSyntax::Posix;
+
     use super::*;
 
     fn lines(raw: &[&str]) -> std::vec::IntoIter<String> {
@@ -967,7 +972,7 @@ mod tests {
             is_default: true,
         };
         assert_eq!(
-            resume_env_prefix_for(&default_loc),
+            resume_env_prefix_for_in(&default_loc, POSIX),
             "unset CLAUDE_CONFIG_DIR; "
         );
 
@@ -977,7 +982,7 @@ mod tests {
             is_default: false,
         };
         assert_eq!(
-            resume_env_prefix_for(&univ_loc),
+            resume_env_prefix_for_in(&univ_loc, POSIX),
             "export CLAUDE_CONFIG_DIR=/home/me/.claude-univ; "
         );
 
@@ -988,7 +993,7 @@ mod tests {
             is_default: false,
         };
         assert_eq!(
-            resume_env_prefix_for(&spaced),
+            resume_env_prefix_for_in(&spaced, POSIX),
             "export CLAUDE_CONFIG_DIR='/home/me/My Configs/.claude'; "
         );
     }
