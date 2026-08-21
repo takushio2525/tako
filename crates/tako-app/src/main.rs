@@ -8511,11 +8511,19 @@ impl TakoApp {
 
     /// CLI / MCP から依頼されたメニュー操作を適用する（Issue #657）。
     ///
-    /// 開閉は状態だけなので即座に処理する。項目の発火は `App::dispatch_action`
-    /// （= macOS のネイティブメニューが通るのと同じ経路）へ回すが、**イベント処理中は
-    /// すでにウィンドウ update の内側にいる**ため、`cx.defer` で外へ出してから呼ぶ
-    /// （`App::dispatch_action` は内部でアクティブウィンドウを `update` するので、
-    /// そのまま呼ぶと二重借用になる）
+    /// 開閉は状態だけなので即座に処理する。項目の発火は GUI のキー / マウス経路と同じ
+    /// `Window::dispatch_action` へ回すが、**イベント処理中はすでにウィンドウ update の
+    /// 内側にいる**ため `cx.defer` で外へ出してから呼ぶ（そのまま呼ぶと二重借用になる）。
+    ///
+    /// # `App::dispatch_action` を使わない理由（実測）
+    ///
+    /// `App::dispatch_action` は**アクティブウィンドウが無いとグローバル登録
+    /// （`cx.on_action`）だけへ配送する**。tako のメニュー項目の大半（`NewTab` 等）は
+    /// root div の `on_action` = ウィンドウスコープなので、tako が前面に無いときに
+    /// `tako menu invoke` が **成功を返したのに何も起きない**（macOS の隔離セルフテストで
+    /// 実測）。AI からの操作は「ユーザーが tako を見ているか」に左右されてはいけない
+    /// （設計原則 5）ので、自分のウィンドウを名指しして配送する。
+    /// アクティブが自分のウィンドウならそれを優先し、ユーザーが見ている画面へ効かせる
     fn drain_menu_ops(&mut self, cx: &mut Context<Self>) {
         use tako_control::protocol::MenuOp;
         for op in std::mem::take(&mut self.pending_menu_ops) {
@@ -8528,7 +8536,24 @@ impl TakoApp {
                         continue;
                     };
                     self.close_menu(cx);
-                    cx.defer(move |cx| cx.dispatch_action(&*action));
+                    let ours: Vec<AnyWindowHandle> =
+                        self.viewports.iter().map(|(_, h)| *h).collect();
+                    cx.defer(move |cx| {
+                        let target = cx
+                            .active_window()
+                            .filter(|active| ours.contains(active))
+                            .or_else(|| ours.first().copied());
+                        match target {
+                            Some(handle) => {
+                                let _ = handle.update(cx, |_, window, cx| {
+                                    window.dispatch_action(action.boxed_clone(), cx)
+                                });
+                            }
+                            // ウィンドウが 1 枚も無い（#381 の Dock 復帰待ち等）ときだけ
+                            // 従来のグローバル配送へ落とす。Quit のようなグローバル登録は届く
+                            None => cx.dispatch_action(&*action),
+                        }
+                    });
                 }
             }
         }
