@@ -34537,11 +34537,16 @@ mod self_test {
             .await
             .unwrap_or_else(|| fail("PDF 初回ラスタライズ"));
             write_test_pdf_with_text(&pdf_path, "Reloaded PDF");
+            // 差し替わったことの見分け方は 2 つある。文字レイヤの中身（text_layer が
+            // 取れる環境だけ。#693）と、アウトラインが 2 項目 → 空へ変わること
+            // （どの環境でも取れる）。後者は Windows でも成立するので必須条件に据え、
+            // 文字レイヤは取れる環境でだけ追加で見る
             wait_for_preview_state(window, cx, Duration::from_secs(8), |app| {
                 matches!(
                     app.previews.get(&reload_pane).map(|state| &state.content),
                     Some(preview::PreviewContent::Pdf(data))
-                        if data.text_layers.iter().flatten().any(|line| line.text.contains("Reloaded PDF"))
+                        if (!pdf_text_layer
+                            || data.text_layers.iter().flatten().any(|line| line.text.contains("Reloaded PDF")))
                             && app.previews.get(&reload_pane).is_some_and(|state|
                                 state.outline.is_empty())
                 )
@@ -34559,6 +34564,8 @@ mod self_test {
                         Some(tako_control::protocol::PreviewModeWire::Markdown),
                     )
                     .expect("note.md へ戻せる");
+                    // Markdown は background 読み込み（直接 dispatch は IPC ループを通らない）
+                    app.drain_pending_preview_loads(cx);
                     cx.notify();
                 })
                 .ok();
