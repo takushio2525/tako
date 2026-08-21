@@ -1530,6 +1530,72 @@ alacritty の `cmdline()` は **`program` を一切エスケープしない**
 いるだけなので、`C:\Program.exe` のような細工があると取り違えうる。
 本 Issue の症状（cwd）とは層が別なので触っていない。
 
+#### #870 の記録（ホーム解決の一本化。PR で追記・2026-08-22）
+
+**症状**: ターミナルに出た `~/…` 起点のパスが Windows でリンクにならない
+（⌘（Ctrl）+ホバーの下線も ⌘+クリックも無反応。絶対パスは効く）。
+
+**原因**: ホーム解決が 2 か所にあり、`links.rs` の `dirs_hint()` が **`HOME` 決め打ち**。
+Windows は `HOME` を持たない（`USERPROFILE` が正）ので必ず `None` になり、
+`resolve_path` の `~/` 分岐へ到達しても解決できなかった。
+同じ意味論は `terminal.rs` に**正しい形で**あった = **書いた場所が 2 つあると片方だけ直る**。
+
+**直し方**: `paths::home_dir()`（判断部は純粋関数 `home_from`）へ一本化し、
+`links.rs` / `terminal.rs` は両方そこへ委譲。**`cfg` は持たない**（`HOME` → `USERPROFILE` の
+順で見ればどちらの OS でも正しいので `platform/` の境界を増やす必要がない）。
+番犬 `ホーム解決の入口がpathsだけである` が、この 2 ファイルから env を直読みする形へ
+戻るのを止める（**走査するのは env を読む形だけ**。散文の `USERPROFILE` は拾わない
+= 最初はスキップ用のメッセージ文言を誤検知して自分の番犬に落とされた）。
+
+##### 測り方（ここが本題）
+
+**`HOME` を外してから測る。** このマシンの `HOME` は **SSH セッションの Process
+スコープにだけ存在**する（実測: `HOME(User)` / `HOME(Machine)` はどちらも空、
+`HOME(Process)=C:\Users\shioz`）。GUI 起動の tako には渡らないので、
+**SSH でそのまま `cargo test` すると `dirs_hint()` が動いて見えて壊れていることが分からない**
+（#877 の作法 12 とまったく同型。あちらは `SHELL`、こちらは `HOME`）。
+
+A/B は**修正だけを戻す**形にした（`dirs_hint` の中身だけ `HOME` 決め打ちへ差し替え、
+テストは修正版のまま）。こうすると失敗の原因が**テスト自身の env 読み**ではなく
+**製品側の解決経路**に限定される:
+
+| `links::tests::detect_tilde_path`（`HOME` 削除・`USERPROFILE` のみ） | 結果 |
+|---|---|
+| before（`dirs_hint` = `HOME` 決め打ち） | **FAILED**: `left: 0` / `right: 1` = `~/…` が 1 本も解決されない |
+| after（`dirs_hint` = `paths::home_dir()`） | **ok** |
+
+同じ実行の他の links テストのうち `cwd不明でも絶対パスとホーム起点は検出する` /
+`detect_absolute_path` / `tuiの装飾付きsoft_wrapをまたぐパスを検出する` は
+**after でも FAILED のまま**。これは `/`-絶対パス前提（**#522** の担当範囲）で
+ホーム解決とは別の理由 = 既存 22 件ベースラインに含まれる 3 本と同一。
+
+##### セルフテスト 69c の位置づけ（誤解しやすい）
+
+`~/` の判定と期待値は共通解決へ寄せたので、**`HOME` の有無ではなく「実際に解決できるか」**で
+必須／スキップが決まる。ただし **69c ブロック自体は `MAIN_SEPARATOR == '/'` でゲートされていて
+Windows では走らない**（`links.rs` のパス検出が POSIX 形前提。`C:\…` / UNC / 区切り文字は
+**#522 の受け入れ条件 1**）。したがって #870 で Windows の 69c が緑になるわけではなく、
+**#522 が入った時点でゲート無しに通る状態**にしてある。
+
+##### 棚卸しで分かったこと（#893 へ起票）
+
+ワークスペース全体を見るとホーム解決は**他に 15 箇所**ある:
+正しい形（`HOME` → `USERPROFILE`）で既に書かれている **10 箇所**（同じ 2 行の重複）/
+`~` 表示短縮の `HOME` 決め打ち **7 箇所**（Windows では短縮されないだけ）/
+実解決の `HOME` 決め打ち **2 箇所**（`ssh_config.rs` は `~/.ssh/config` が読めない）/
+**触ってはいけない 2 箇所**（`paths.rs` の `default_data_dir` は各 OS の
+データディレクトリ規約としてその OS の変数を読んでいる。`home_dir()` へ寄せると
+macOS が `USERPROFILE` も受け入れる挙動変更になり利得がない）。
+番犬の走査範囲を広げるのは #893 の作業。
+
+##### 併せて直した
+
+- **空の `HOME` が `USERPROFILE` を隠さない**ようにした。統合前の `terminal.rs` 版は
+  `home.or(userprofile).filter(空でない)` の順で、`HOME=`（空）が立っていると
+  USERPROFILE を見ずに `None` へ落ちていた（= 本 Issue と同じ症状）
+- `links.rs` のユニットテスト 2 本が `std::env::var("HOME").unwrap()` で **Windows では
+  panic**（#583 の POSIX 前提失敗の一部）。共通解決 + 理由つきスキップへ
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
