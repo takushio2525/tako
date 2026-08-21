@@ -25,7 +25,8 @@ use crate::file_icons::ui_icon;
 use crate::preview;
 use crate::ui_text::update as txt;
 use crate::update_checker::{
-    self, Channel, ChannelUpdates, InstallMethod, UpdateInfo, UpdateState, CURRENT_VERSION,
+    self, effective_current_version, Channel, ChannelUpdates, InstallMethod, UpdateInfo,
+    UpdateState,
 };
 use crate::TakoApp;
 
@@ -202,7 +203,10 @@ impl UpdateWindow {
     // --- 現在のバージョン ---
 
     fn render_current(&self, theme: &Theme) -> Div {
-        let channel = if CURRENT_VERSION.contains("-test.") {
+        // インストーラーの記録を最優先した「いま入っている版数」（#723）。
+        // ビルド埋め込みの版数を出すと、配布済みの `-win.N` が素の X.Y.Z に見えてしまう
+        let current = effective_current_version();
+        let channel = if current.contains("-test.") {
             Channel::Test
         } else {
             Channel::Stable
@@ -217,11 +221,7 @@ impl UpdateWindow {
             _ => None,
         };
         section(theme, txt::section_current())
-            .child(kv(
-                theme,
-                txt::label_version(),
-                format!("v{CURRENT_VERSION}"),
-            ))
+            .child(kv(theme, txt::label_version(), format!("v{current}")))
             .child(kv(
                 theme,
                 txt::label_channel(),

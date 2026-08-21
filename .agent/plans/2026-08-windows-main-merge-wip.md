@@ -471,7 +471,7 @@ Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機�
 - 依存: **1**, **4**（メニューのアクセラレータがキーバインドの分類に乗る）
 - 注意: アイコンは `EMBEDDED_ASSETS` への登録漏れ検査テストがあるので必ず登録する（#561 の副産物）
 
-### 6. インストーラー + リリース（#587 / #723）
+### 6. インストーラー + リリース（#587 / #723）— ✅ **完了**（PR #851）
 
 - 持ち込む新規: `installer/windows/{build-installer.ps1,make-icon.ps1,release-windows.ps1,tako.iss}`
   / `assets/icon/tako.ico` / `.cargo/config.toml`（MSVC CRT 静的リンク）/
@@ -485,6 +485,129 @@ Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機�
   win467 の #528 `UpdateTarget` は**持ち込まない**（#595 が上位互換）
 - 本 WIP で済んでいる分: `CURRENT_VERSION` を `env!("TAKO_FULL_VERSION")` にする最小差分は
   `windows/467-main-merge-wip` に入っている。参考にできる
+
+#### 完了記録（2026-08-21。PR #851 / `windows/467-slice6-installer`）
+
+19 ファイル / +1,697 / −34。plan の見立てとの差は 2 点:
+
+1. **アセット名は win467 のままでは持ち込めなかった**。win467 は
+   `tako-setup-<tag>-x64.exe` / `tako-<tag>-windows-x64.zip` を出すが、main の正
+   （`platform::release_assets`）は `tako-<tag>-windows-x86_64.{exe,zip}`。
+   そのまま入れると `tako update` が自 OS 向けアセットを掴めない = **#595 の事故そのもの**。
+   plan は「main が既に Windows アセットを扱える」とだけ書いていて、
+   **リリース側（PowerShell）を寄せる作業が要ることに触れていなかった**
+2. **`-win.N` の版数意味論もこのスライスに含める必要があった**。plan は
+   `effective_current_version()` の追加だけを挙げていたが、main の
+   `ParsedVersion::parse("0.5.13-win.3")` は `None` を返す（`-test.` 以外の
+   プレリリースを弾く）ため、**インストーラーの記録が「読めない値」として捨てられ
+   `effective_current_version()` が死んだコードになる**。`win_num` と
+   プラットフォーム考慮の比較まで入れて初めて #723 が成立する
+
+##### 入れたもの
+
+- `installer/windows/lib/release-assets.ps1`（95 行・**新設**）: 命名規則の
+  **PowerShell 側の写し**。Inno Setup の `OutputBaseFilename`（`/DAssetBaseName=` で注入）も
+  zip 名もここから組む。`tako.iss` には名前を書き下さない（ISCC を手で叩いたときだけ
+  使うフォールバックだけ `#ifndef` で持つ）
+- `release_assets.rs` に同期テスト 2 本。`powershell_mirror_declares_same_constants` は
+  **pwsh 不要**（ファイルを読んで定数を突き合わせる）なのでどの環境でもドリフトを検出し、
+  `powershell_mirror_generates_identical_names` は pwsh があれば実行して生成結果を比べる
+  （macOS ランナー / Windows には pwsh がある。無い環境ではスキップ）
+- `build.rs` ×2: アイコン / バージョン情報リソースの埋め込み + `TAKO_FULL_VERSION` の emit。
+  **ターゲット（`CARGO_CFG_TARGET_OS`）とホスト（`cfg!(windows)`）の二重ガード**で
+  macOS のクロス検査を落とさない。アイコングループの ID は 1 固定（gpui が
+  `LoadImageW` で自モジュールの ID 1 を引くため。変えるとタスクバーだけ既定アイコンへ戻る）
+- `.cargo/config.toml`: MSVC の `+crt-static`。`[target.x86_64-pc-windows-msvc]` だけなので
+  **macOS のビルドには構造的に影響しない**（`grep -E "^\["` で節が 1 つだけであることを確認済み）
+- `update_checker.rs`: `effective_current_version()`（`OnceLock` で 1 度だけ解決 =
+  描画から毎フレーム レジストリを引かない）/ `resolve_current_version()`（純関数）/
+  `ParsedVersion::win_num` / `suffix_rank()` / `is_newer_release(platform)`。
+  表示 5 箇所（`update_window` / `about_window` ×2 / 「更新なし」メッセージ / status JSON）を
+  effective 経由へ。`CURRENT_VERSION` の直接参照は **HTTP の User-Agent だけ**に絞った
+
+##### macOS の判定を変えていないことの担保
+
+`suffix_rank()` は `-win.N` を持たない版に対して旧 `Ord`（stable > test、test 同士は番号順）と
+**完全に同じ順序**を返す。`is_newer_release` も `(None, None)` では `suffix_rank` 比較に落ちるので
+既存データでは挙動がビット等価。実リリース 28 件のスナップショットテスト
+（`test_real_releases_macos_judgement_identical_to_before_595`）が緑のまま。
+
+##### 実測
+
+macOS: `fmt --all --check` 緑 / `clippy --workspace --all-targets -- -D warnings`
+**0 findings**（`--features visual-test` も）/ `test --workspace`
+**2204 passed / 0 failed**（スライス 3 の 2194 + **新規 10 本**）/
+クロスチェック **エラー 0・警告 10**（ベースライン同数。内訳も同一 =
+`video_player` 7 + `tako-control` 3 で、いずれも既存）/
+`scripts/release.sh --notes-only` の生成物が不変（macOS のダウンロード表・手順とも）。
+
+**Windows 実機で配布物を実際に作った**（ISCC は
+`%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe` に導入済み）:
+
+```
+pwsh -File installer/windows/build-installer.ps1 -Version v0.7.4-win.1
+  → dist/windows/tako-v0.7.4-win.1-windows-x86_64.exe   16,805,628 bytes
+  → dist/windows/tako-v0.7.4-win.1-windows-x86_64.zip   22,277,860 bytes
+```
+
+- **名前が main の命名規則そのもの**（win467 なら `tako-setup-v0.7.4-win.1-x64.exe`）。
+  実成果物 2 件を `release_assets` に食わせて `tag=v0.7.4-win.1 / Windows / X86_64` に解け、
+  `select(Windows, X86_64)` が `.exe` を、`select(MacOs, Arm64)` が `None` を返すことまで確認
+- **`#723` の連鎖が実バイナリで成立**: `tako-app.exe` に `0.7.4-win.1` が焼けている
+  （タグ → `TAKO_WIN_NUM` → build.rs → `TAKO_FULL_VERSION`）。FileVersion は `0.7.4`、
+  `OriginalFilename` は `tako-app.exe` / **`tako.exe`**（winresource の既定を意図的に上書き）
+- **crt-static が効いている**: `dumpbin /DEPENDENTS` に `VCRUNTIME` / `api-ms-win-crt` の
+  import なし = 素の Windows で VC++ 再頒布可能パッケージ不要
+- zip の中身は `tako/{tako-app.exe, tako.exe, tako.ico, LICENSE.txt}`（GUI と CLI が同階層。
+  `resolve_tako_binary()` が兄弟として `tako.exe` を引くので必須）
+- **ガードが実際に落ちる**: `/DAssetBaseName` 無しの ISCC は
+  `Error on line 43 ... AssetBaseName undefined` で **exit 2 / Compile aborted**。
+  `release-windows.ps1` は `gh` 未認証 + HEAD≠タグ を検出してビルド前に exit 1
+
+**Windows 実機のゲート**（`cargo build --workspace` は**一発で通った** = exit 0 / 9m07s。
+crt-static と build.rs 2 本を含む）:
+
+| スイート | 結果 | ベースライン |
+|---|---|---|
+| `tako-app` | 416 / **0** | 409 / 0（**+7** = #723 の新規テスト） |
+| `tako-cli` | 53 / **0** | 53 / 0 |
+| `tako-control` (lib) | 950 / 25 failed | 950 / 25 failed |
+| `tako-core` (lib) | 667 / 5 failed | 665 / 5（**+2** = PowerShell 同期テスト） |
+| `platform_parity` | 10 / 0 | 10 / 0 |
+| `encoding_conpty` | 5 / 0 | 5 / 0 |
+| `psmux_backend` | 16 / 0 | 16 / 0 |
+
+**失敗は 30 件のままで新規ゼロ**。失敗名も突き合わせ済みで全部 POSIX 前提
+（`execute_command_*` / `symlink` / `tilde` / `pidpath` / `links::` / spawn のコマンド組み立て）=
+#583 の既知パターン。`release_assets` は Windows でも **11/11 緑**
+（`shell_mirror_generates_identical_names` だけ `#[cfg(unix)]` で除外されるので macOS の 12 と 1 本差）。
+
+##### 検出力（壊して落ちることを実測）
+
+| 壊し方 | 落ちたテスト |
+|---|---|
+| PS 写しの arch を `x64` へ | `powershell_mirror_declares_same_constants` |
+| PS 写しの名前フォーマットを壊す | 上記 + `powershell_mirror_generates_identical_names` |
+| `is_newer_release` の Windows 補正を外す | `installed_win3_sees_no_update_for_win3` |
+| インストーラー記録を無視する | 上記 + `resolve_current_version_prefers_installer_record` |
+| `-win.N` の解析をやめる（main の元実装） | 上記 + `parsed_version_reads_win_suffix` ほか計 4 本 |
+| `.iss` がアセット名を組み立て直す | `inno_setup_does_not_build_asset_names_itself`（行番号つきで名指し） |
+| `OutputBaseFilename` を win467 の直書きへ戻す | 同上 |
+
+`build.rs` が消えた場合は `env!("TAKO_FULL_VERSION")` が**コンパイルエラー**になるので、
+テストより強く縛られている。
+
+##### 次スライスへの申し送り
+
+- **対応マトリクスは触っていない**（作法 4）。#587 / #723 を Supported へ倒すのはスライス 8
+- `installer/windows/lib/` に PowerShell の共有部品を置く場所ができた。Windows 側の
+  リリース補助を足すときはここへ（`scripts/lib/` の対応物）
+- `make-icon.ps1` は `.ico` がコミット済みなので通常は走らない。`System.Drawing` 依存で
+  **Windows 専用**なので、macOS からは呼べない（`build-installer.ps1` は `.ico` が
+  在ることを前提に飛ばす）
+- `release-windows.ps1` は **gh の認証を前検査で要求する**。Windows 機の `gh` トークンは
+  無効なまま（落とし穴節のとおり）なので、実際のアップロードは
+  **Mac 側で `gh release upload` する**か Windows の `gh auth login` を通す必要がある
 
 ### 7. シェル統合 PowerShell（#525）
 
@@ -518,11 +641,11 @@ Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機�
 - **WIP が保全ブランチにある**: `windows/724-port-crash`（`7633d8b`。ポート検知のクラッシュ修正）/
   `windows/727-sleep-settings`（`91cc13f`。設定 UI）
 
-### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 完了）
+### 後続 worker への引き継ぎ（2026-08-21 時点。スライス 1 / 2a / 2b / 3 / 6 完了）
 
-main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ PR #850（3）。
-**残りはスライス 4 / 5 / 6 / 7 / 8 / 9**。依存グラフ上、いま着手できるのは
-**4（入力系）**・**6（インストーラー）**・**7（シェル統合 PowerShell。1 と 2 が揃ったので解放）**・
+main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ `e947524`（3）→ PR #851（6）。
+**残りはスライス 4 / 5 / 7 / 8 / 9**。依存グラフ上、いま着手できるのは
+**4（入力系）**・**7（シェル統合 PowerShell。1 と 2 が揃ったので解放）**・
 **9（スリープ防止 / ポート検知）**。5 は 4 の後、8 は最後。
 
 #### 毎スライスで守る作法（実測で効いたもの）
@@ -546,7 +669,17 @@ main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→
    効いて壊れる（このセッションで踏んだ）
 7. 隔離セルフテスト / visual-test は**ウィンドウが完全に隠れると描画が止まる**ので、
    項目 63 / 76d / 104 が SKIP になるのは既知（`TAKO_APP_SELF_TEST_OK` なら合格）。
-   `#680` の項目は load 依存で落ちるので負荷が高いときは回し直す
+   `#680` の項目は load 依存で落ちるので負荷が高いときは回し直す。
+   **兄弟セッションが同時に GUI を立てていると前面を奪い合って SKIP / FAILED が増える**
+   （スライス 6 で踏んだ = 相手の visual-test と重なって #737 の項目が落ちた）。
+   `pgrep -fl tako-app` で相手の稼働を確かめ、単独で回し直してから原因を判断する
+8. **`cargo fmt` は commit より前に回す**。`fmt --check` → `fmt` → そのまま commit だと
+   整形結果が commit に入らず、CI のフォーマット検査だけが落ちる（スライス 6 で 1 回踏んだ）。
+   `git status` が clean になってから push する
+9. **PowerShell を SSH 越しに叩くときは `-EncodedCommand`**（base64 の UTF-16LE）にする。
+   入れ子の引用符が壊れるうえ、`[Console]::OutputEncoding` が shift_jis なので
+   日本語出力が化ける。冒頭に `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;` と
+   `$ProgressPreference="SilentlyContinue"`（CLIXML のノイズ抑止）を足しておく
 
 #### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
 

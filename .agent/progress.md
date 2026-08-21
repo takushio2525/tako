@@ -2274,3 +2274,19 @@
   （トークン往復・不正トークン拒否・連続接続）。失敗 30 件のままで新規ゼロ
 - 関連: PR #850（`Refs #467`）。**このセッションはここで締め**、スライス 4 以降は新 worker へ。
   引き継ぎは plan の「後続 worker への引き継ぎ」節（作法 7 項目 + 実機ベースライン表）
+
+## 2026-08-21（#467 スライス 6: インストーラー / 配布系）
+- Inno Setup インストーラー + ポータブル zip + exe へのアイコン / バージョン情報埋め込み
+  （#587）と `-win.N` の版数解決（#723）を移植。**plan の見立てとの差 2 件**: ①win467 の
+  アセット名（`tako-setup-<tag>-x64.exe`）は main の正（`release_assets`）と食い違うので
+  そのまま入れると `tako update` が自 OS 向けを掴めない = #595 の再来 → PowerShell 側の写し
+  `installer/windows/lib/release-assets.ps1` を新設し同期テスト 2 本で縛った ②main の
+  `ParsedVersion` は `-win.N` を弾くため、版数意味論（`win_num` / `is_newer_release(platform)`）
+  まで入れないと `effective_current_version()` が死んだコードになる
+- 検証: macOS 全ゲート緑（test **2204**（+10）/ セルフテスト OK / クロスチェック **警告 10** =
+  ベースライン同数 / `release.sh --notes-only` 不変）+ **Windows 実機で配布物を実生成**
+  （`tako-v0.7.4-win.1-windows-x86_64.exe` 16.8MB / `.zip` 22.3MB。実成果物名を main の
+  `release_assets` で解析し直して一致・crt-static で VCRUNTIME import ゼロ・exe に
+  `0.7.4-win.1` が焼けている）+ build 一発 exit 0 / test は失敗 30 件のままで新規ゼロ。
+  検出力は 7 通りの revert と ISCC の `#error` 実行で実測
+- 関連: PR #851（`Refs #467, #587, #723`）。残りはスライス 4 / 5 / 7 / 8 / 9

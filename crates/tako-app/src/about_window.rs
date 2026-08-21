@@ -44,7 +44,7 @@ impl AboutWindow {
     fn info_line(&self) -> String {
         format!(
             "tako {} ({}, {})",
-            crate::update_checker::CURRENT_VERSION,
+            crate::update_checker::effective_current_version(),
             crate::update_checker::detect_install_method().label(),
             std::env::consts::ARCH,
         )
@@ -54,7 +54,7 @@ impl AboutWindow {
 impl Render for AboutWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
-        let version = crate::update_checker::CURRENT_VERSION;
+        let version = crate::update_checker::effective_current_version();
         let method = crate::update_checker::detect_install_method().label();
         div()
             .flex()

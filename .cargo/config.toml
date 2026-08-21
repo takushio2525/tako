@@ -1,0 +1,16 @@
+# Windows（MSVC）では C ランタイムを静的リンクする。
+#
+# 既定の動的 CRT だと配布物が VCRUNTIME140.dll / VCRUNTIME140_1.dll を import する。
+# これらは Windows の構成要素ではなく VC++ 再頒布可能パッケージ由来なので、素の Windows では
+# 「DLL が見つからないため起動できません」で落ちうる。テスターへ配る以上、再頒布パッケージの
+# 同梱や導入案内を要求しない形にしておく（#587）。
+#
+# 実測（0.5.12 時点、dumpbin /DEPENDENTS）:
+#   - VCRUNTIME140.dll / VCRUNTIME140_1.dll / api-ms-win-crt-*.dll の import が全て消える
+#   - サイズ増は tako-app.exe +259,584 bytes（+0.69%）/ tako.exe +139,264 bytes（+0.87%）
+#   - 残る依存は Windows 同梱の OS DLL のみ
+#
+# macOS のビルドには影響しない（このセクションは Windows MSVC ターゲット限定）。
+# 追加・変更するとこのターゲットのビルドキャッシュが一度だけ丸ごと無効になる。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
