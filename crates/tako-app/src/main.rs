@@ -37541,11 +37541,17 @@ mod self_test {
                 .update(cx, |app, _, _| app.workspace.active_tab().tree().len())
                 .unwrap_or(0);
             if split_76b > before_76b {
-                let ime_close_ok = window
+                // 段階ごとに痕跡を残す（実機で「この辺りで静かに終わる」を追うため。#865）
+                let composing = window
                     .update(cx, |app, window, cx| {
-                        let target = app.focused_pane();
                         app.replace_and_mark_text_in_range(None, "へんかん", None, window, cx);
-                        let composing = app.ime.is_some();
+                        app.ime.is_some()
+                    })
+                    .unwrap_or(false);
+                println!("TAKO_SELF_TEST_76B: 変換開始 composing={composing}");
+                let ime_close_ok = window
+                    .update(cx, |app, _, cx| {
+                        let target = app.focused_pane();
                         app.remove_pane(target, cx);
                         let cleared = app.ime.is_none();
                         // 畳んだ後の ime_target がフォーカスペインへ解決されることも固定
@@ -37553,6 +37559,7 @@ mod self_test {
                         composing && cleared && target_ok
                     })
                     .unwrap_or(false);
+                println!("TAKO_SELF_TEST_76B: close 後 ok={ime_close_ok}");
                 check(ime_close_ok, "IME 状態: 変換中ペインの close で畳まれる (#332)");
             } else {
                 println!(
