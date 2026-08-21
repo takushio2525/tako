@@ -35967,250 +35967,262 @@ mod self_test {
                 );
             }
 
-            // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
-            //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
-            //      ファイルは OpenFile プレビュー、ディレクトリは Split + PTY 起動まで実測する。
-            let link_dir =
-                std::env::temp_dir().join(format!("tako-selftest-link-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&link_dir);
-            std::fs::create_dir_all(link_dir.join("sub"))
-                .expect("リンク用一時ディレクトリを作れる");
-            let link_file = link_dir.join("sub/relative.txt");
-            let absolute_file = link_dir.join("absolute.txt");
-            std::fs::write(&link_file, "link selftest\n").unwrap();
-            std::fs::write(&absolute_file, "absolute link selftest\n").unwrap();
-            let link_command = sh.sequence(&[
-                sh.cd(&link_dir.display().to_string()),
-                sh.print_lines(&[
-                    "LINK_SELFTEST".to_string(),
-                    absolute_file.display().to_string(),
-                    "~/".to_string(),
-                    "sub/relative.txt".to_string(),
-                    link_dir.display().to_string(),
-                ]),
-            ]);
-            press(any, cx, sh.clear_line_key());
-            type_text(any, cx, &link_command, true);
-            // cwd 追従（OSC 7）が効かない環境（器が素通ししない / 統合が未配置。#525）では
-            // ペインの cwd は起動時の値のまま。画面に出たことだけを待つ
-            let link_cwd_tracked = shell_integration.effective();
-            let mut link_screen_ready = false;
-            for _ in 0..12 {
-                wait(cx, 300).await;
-                link_screen_ready = window
-                    .update(cx, |app, _, _| {
-                        app.terminals
-                            .get(&app.focused_pane())
-                            .is_some_and(|session| {
-                                (!link_cwd_tracked || session.cwd() == Some(link_dir.as_path()))
-                                    && session
-                                        .visible_lines()
-                                        .iter()
-                                        .any(|line| line.trim() == "LINK_SELFTEST")
-                            })
-                    })
-                    .unwrap_or(false);
-                if link_screen_ready {
-                    break;
-                }
-            }
-            check(link_screen_ready, "リンク検証テキストを実 PTY 画面へ表示");
-
-            let (absolute_ok, home_ok, relative_ok, cwd_ok) = window
-                .update(cx, |app, _, _| {
-                    let base = app.focused_pane();
-                    app.refresh_pane_links(base);
-                    let links = app.pane_links.get(&base).cloned().unwrap_or_default();
-                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                    let has_absolute = links.iter().any(|link| {
-                        link.kind == tako_core::LinkKind::Path
-                            && std::path::Path::new(&link.target) == absolute_file
-                    });
-                    let has_relative = links.iter().any(|link| {
-                        link.kind == tako_core::LinkKind::Path
-                            && std::path::Path::new(&link.target) == link_file
-                    });
-                    let has_home = home.is_some_and(|home| {
-                        links.iter().any(|link| {
-                            link.kind == tako_core::LinkKind::Path
-                                && std::path::Path::new(&link.target) == home
+            // links.rs のパス検出は **POSIX 形のパス**（`/` 区切り・`/` 始まり）を
+            // 前提にしている。Windows の `C:\…` / UNC / 区切り文字への対応は #522 の
+            // 受け入れ条件 1（`links.rs` の Windows パス単体テスト）で入る予定なので、
+            // それまでこの環境では検証できない
+            if std::path::MAIN_SEPARATOR == '/' {
+                // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
+                //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
+                //      ファイルは OpenFile プレビュー、ディレクトリは Split + PTY 起動まで実測する。
+                let link_dir =
+                    std::env::temp_dir().join(format!("tako-selftest-link-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&link_dir);
+                std::fs::create_dir_all(link_dir.join("sub"))
+                    .expect("リンク用一時ディレクトリを作れる");
+                let link_file = link_dir.join("sub/relative.txt");
+                let absolute_file = link_dir.join("absolute.txt");
+                std::fs::write(&link_file, "link selftest\n").unwrap();
+                std::fs::write(&absolute_file, "absolute link selftest\n").unwrap();
+                let link_command = sh.sequence(&[
+                    sh.cd(&link_dir.display().to_string()),
+                    sh.print_lines(&[
+                        "LINK_SELFTEST".to_string(),
+                        absolute_file.display().to_string(),
+                        "~/".to_string(),
+                        "sub/relative.txt".to_string(),
+                        link_dir.display().to_string(),
+                    ]),
+                ]);
+                press(any, cx, sh.clear_line_key());
+                type_text(any, cx, &link_command, true);
+                // cwd 追従（OSC 7）が効かない環境（器が素通ししない / 統合が未配置。#525）では
+                // ペインの cwd は起動時の値のまま。画面に出たことだけを待つ
+                let link_cwd_tracked = shell_integration.effective();
+                let mut link_screen_ready = false;
+                for _ in 0..12 {
+                    wait(cx, 300).await;
+                    link_screen_ready = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .is_some_and(|session| {
+                                    (!link_cwd_tracked || session.cwd() == Some(link_dir.as_path()))
+                                        && session
+                                            .visible_lines()
+                                            .iter()
+                                            .any(|line| line.trim() == "LINK_SELFTEST")
+                                })
                         })
-                    });
-                    let cwd_matches = app
-                        .terminals
-                        .get(&base)
-                        .and_then(|session| session.cwd())
-                        == Some(link_dir.as_path());
-                    (has_absolute, has_home, has_relative, cwd_matches)
-                })
-                .unwrap_or((false, false, false, false));
-            check(absolute_ok, "絶対パスを実画面から検出・解決");
-            // `~` の解決は `links::dirs_hint`（`HOME` 決め打ち）が前提。Windows は
-            // `HOME` を持たないので解決できない（#870 で追跡）
-            if std::env::var_os("HOME").is_some() {
-                check(home_ok, "~/ 起点パスを実画面から検出・解決");
-            } else {
-                println!(
-                    "TAKO_SELF_TEST_SKIPPED: 69c の ~/ 解決（この環境は HOME を持たない。\
-                     ホーム解決の一本化は #870）"
-                );
-            }
-            // 相対パスの解決とその前提（cwd 追従）は OSC 7 が届く環境だけ
-            if link_cwd_tracked {
-                check(relative_ok, "cwd 相対パスを実画面から検出・解決");
-                check(cwd_ok, "リンク解決 cwd が実 PTY の OSC 7 と一致");
-            } else {
-                println!(
-                    "TAKO_SELF_TEST_SKIPPED: 69c の cwd 相対パス（シェル統合が効かない環境: \
-                     installed={} blocked={:?}）",
-                    shell_integration.installed(),
-                    shell_integration.blocked_by_backend
-                );
-            }
+                        .unwrap_or(false);
+                    if link_screen_ready {
+                        break;
+                    }
+                }
+                check(link_screen_ready, "リンク検証テキストを実 PTY 画面へ表示");
 
-            // 任意のピクセル検証停止点。通常の self-test では待機しない。
-            // 実画面の検出結果とセル座標から cmd ホバーと同じ更新関数を通し、外部の
-            // screencapture が装飾前後を同一ウィンドウで取得できるようにする。
-            if std::env::var_os("TAKO_SELF_TEST_LINK_VISUAL").is_some() {
-                println!("TAKO_LINK_VISUAL_BASELINE_READY");
-                wait(cx, 15_000).await;
-                let visual_hovered = window
+                let (absolute_ok, home_ok, relative_ok, cwd_ok) = window
+                    .update(cx, |app, _, _| {
+                        let base = app.focused_pane();
+                        app.refresh_pane_links(base);
+                        let links = app.pane_links.get(&base).cloned().unwrap_or_default();
+                        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                        let has_absolute = links.iter().any(|link| {
+                            link.kind == tako_core::LinkKind::Path
+                                && std::path::Path::new(&link.target) == absolute_file
+                        });
+                        let has_relative = links.iter().any(|link| {
+                            link.kind == tako_core::LinkKind::Path
+                                && std::path::Path::new(&link.target) == link_file
+                        });
+                        let has_home = home.is_some_and(|home| {
+                            links.iter().any(|link| {
+                                link.kind == tako_core::LinkKind::Path
+                                    && std::path::Path::new(&link.target) == home
+                            })
+                        });
+                        let cwd_matches = app
+                            .terminals
+                            .get(&base)
+                            .and_then(|session| session.cwd())
+                            == Some(link_dir.as_path());
+                        (has_absolute, has_home, has_relative, cwd_matches)
+                    })
+                    .unwrap_or((false, false, false, false));
+                check(absolute_ok, "絶対パスを実画面から検出・解決");
+                // `~` の解決は `links::dirs_hint`（`HOME` 決め打ち）が前提。Windows は
+                // `HOME` を持たないので解決できない（#870 で追跡）
+                if std::env::var_os("HOME").is_some() {
+                    check(home_ok, "~/ 起点パスを実画面から検出・解決");
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 69c の ~/ 解決（この環境は HOME を持たない。\
+                         ホーム解決の一本化は #870）"
+                    );
+                }
+                // 相対パスの解決とその前提（cwd 追従）は OSC 7 が届く環境だけ
+                if link_cwd_tracked {
+                    check(relative_ok, "cwd 相対パスを実画面から検出・解決");
+                    check(cwd_ok, "リンク解決 cwd が実 PTY の OSC 7 と一致");
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 69c の cwd 相対パス（シェル統合が効かない環境: \
+                         installed={} blocked={:?}）",
+                        shell_integration.installed(),
+                        shell_integration.blocked_by_backend
+                    );
+                }
+
+                // 任意のピクセル検証停止点。通常の self-test では待機しない。
+                // 実画面の検出結果とセル座標から cmd ホバーと同じ更新関数を通し、外部の
+                // screencapture が装飾前後を同一ウィンドウで取得できるようにする。
+                if std::env::var_os("TAKO_SELF_TEST_LINK_VISUAL").is_some() {
+                    println!("TAKO_LINK_VISUAL_BASELINE_READY");
+                    wait(cx, 15_000).await;
+                    let visual_hovered = window
+                        .update(cx, |app, win, cx| {
+                            let base = app.focused_pane();
+                            app.refresh_pane_links(base);
+                            let link = app
+                                .pane_links
+                                .get(&base)?
+                                .iter()
+                                .find(|link| std::path::Path::new(&link.target) == link_file)?
+                                .clone();
+                            let &(row, start, _) = link.spans.first()?;
+                            let area = app
+                                .pane_text_areas
+                                .iter()
+                                .find(|(pane, _)| *pane == base)
+                                .map(|(_, area)| *area)?;
+                            let cell = app.cell_size_for_pane(base)?;
+                            let position = point(
+                                area.origin.x + cell.width * (start as f32 + 0.5),
+                                area.origin.y + cell.height * (row as f32 + 0.5),
+                            );
+                            app.update_hovered_link_at(position, true, win, cx);
+                            app.hovered_link
+                                .as_ref()
+                                .is_some_and(|hovered| hovered.contains(base, row, start))
+                                .then_some(())
+                        })
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    check(visual_hovered, "ピクセル検証用 cmd ホバー状態を構築");
+                    println!("TAKO_LINK_VISUAL_HOVER_READY");
+                    wait(cx, 60_000).await;
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.hovered_link = None;
+                        cx.notify();
+                    });
+                }
+
+                let (file_click_ok, directory_click_ok) = window
                     .update(cx, |app, win, cx| {
                         let base = app.focused_pane();
                         app.refresh_pane_links(base);
-                        let link = app
+                        let links = app.pane_links.get(&base)?.clone();
+
+                        let click = |app: &mut TakoApp,
+                                     link: &tako_core::DetectedLink,
+                                     win: &mut Window,
+                                     cx: &mut Context<TakoApp>| {
+                            let &(row, start, _) = link.spans.first()?;
+                            let area = app
+                                .pane_text_areas
+                                .iter()
+                                .find(|(pane, _)| *pane == base)
+                                .map(|(_, area)| *area)?;
+                            let cell = app.cell_size_for_pane(base)?;
+                            let position = point(
+                                area.origin.x + cell.width * (start as f32 + 0.5),
+                                area.origin.y + cell.height * (row as f32 + 0.5),
+                            );
+                            app.hovered_link = None;
+                            app.on_pane_mouse_down(
+                                base,
+                                &MouseDownEvent {
+                                    button: MouseButton::Left,
+                                    position,
+                                    modifiers: Modifiers {
+                                        platform: true,
+                                        ..Modifiers::default()
+                                    },
+                                    click_count: 1,
+                                    first_mouse: false,
+                                },
+                                win,
+                                cx,
+                            );
+                            Some(())
+                        };
+
+                        let file_link = links
+                            .iter()
+                            .find(|link| std::path::Path::new(&link.target) == link_file)?;
+                        click(app, file_link, win, cx)?;
+                        let preview = app.previews.iter().find_map(|(pane, state)| {
+                            (state.path == link_file).then_some(*pane)
+                        });
+                        let file_click_ok = preview.is_some();
+                        if let Some(preview) = preview {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(preview.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                        }
+
+                        app.refresh_pane_links(base);
+                        let dir_link = app
                             .pane_links
                             .get(&base)?
                             .iter()
-                            .find(|link| std::path::Path::new(&link.target) == link_file)?
+                            .find(|link| std::path::Path::new(&link.target) == link_dir)?
                             .clone();
-                        let &(row, start, _) = link.spans.first()?;
-                        let area = app
-                            .pane_text_areas
-                            .iter()
-                            .find(|(pane, _)| *pane == base)
-                            .map(|(_, area)| *area)?;
-                        let cell = app.cell_size_for_pane(base)?;
-                        let position = point(
-                            area.origin.x + cell.width * (start as f32 + 0.5),
-                            area.origin.y + cell.height * (row as f32 + 0.5),
-                        );
-                        app.update_hovered_link_at(position, true, win, cx);
-                        app.hovered_link
-                            .as_ref()
-                            .is_some_and(|hovered| hovered.contains(base, row, start))
-                            .then_some(())
+                        let terminals_before: std::collections::HashSet<_> =
+                            app.terminals.keys().copied().collect();
+                        click(app, &dir_link, win, cx)?;
+                        let directory_pane = app.terminals.iter().find_map(|(pane, session)| {
+                            (!terminals_before.contains(pane)
+                                && session.cwd() == Some(link_dir.as_path()))
+                            .then_some(*pane)
+                        });
+                        let directory_click_ok = directory_pane.is_some();
+                        if let Some(pane) = directory_pane {
+                            let _ = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Close {
+                                    pane: Some(pane.as_u64()),
+                                    force: true,
+                                    caller_role: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                        }
+                        Some((file_click_ok, directory_click_ok))
                     })
                     .ok()
                     .flatten()
-                    .is_some();
-                check(visual_hovered, "ピクセル検証用 cmd ホバー状態を構築");
-                println!("TAKO_LINK_VISUAL_HOVER_READY");
-                wait(cx, 60_000).await;
-                let _ = window.update(cx, |app, _, cx| {
-                    app.hovered_link = None;
-                    cx.notify();
-                });
+                    .unwrap_or((false, false));
+                check(file_click_ok, "cmd+クリックでファイルを分割プレビュー表示");
+                check(
+                    directory_click_ok,
+                    "cmd+クリックでディレクトリを分割し PTY を cwd 付きで起動",
+                );
+                let _ = std::fs::remove_dir_all(&link_dir);
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 69c（links.rs のパス検出が POSIX 形前提。\
+                     Windows パス対応は #522）"
+                );
             }
 
-            let (file_click_ok, directory_click_ok) = window
-                .update(cx, |app, win, cx| {
-                    let base = app.focused_pane();
-                    app.refresh_pane_links(base);
-                    let links = app.pane_links.get(&base)?.clone();
-
-                    let click = |app: &mut TakoApp,
-                                 link: &tako_core::DetectedLink,
-                                 win: &mut Window,
-                                 cx: &mut Context<TakoApp>| {
-                        let &(row, start, _) = link.spans.first()?;
-                        let area = app
-                            .pane_text_areas
-                            .iter()
-                            .find(|(pane, _)| *pane == base)
-                            .map(|(_, area)| *area)?;
-                        let cell = app.cell_size_for_pane(base)?;
-                        let position = point(
-                            area.origin.x + cell.width * (start as f32 + 0.5),
-                            area.origin.y + cell.height * (row as f32 + 0.5),
-                        );
-                        app.hovered_link = None;
-                        app.on_pane_mouse_down(
-                            base,
-                            &MouseDownEvent {
-                                button: MouseButton::Left,
-                                position,
-                                modifiers: Modifiers {
-                                    platform: true,
-                                    ..Modifiers::default()
-                                },
-                                click_count: 1,
-                                first_mouse: false,
-                            },
-                            win,
-                            cx,
-                        );
-                        Some(())
-                    };
-
-                    let file_link = links
-                        .iter()
-                        .find(|link| std::path::Path::new(&link.target) == link_file)?;
-                    click(app, file_link, win, cx)?;
-                    let preview = app.previews.iter().find_map(|(pane, state)| {
-                        (state.path == link_file).then_some(*pane)
-                    });
-                    let file_click_ok = preview.is_some();
-                    if let Some(preview) = preview {
-                        let _ = tako_control::dispatch(
-                            app,
-                            tako_control::protocol::Request::Close {
-                                pane: Some(preview.as_u64()),
-                                force: true,
-                                caller_role: None,
-                            },
-                            PaneOrigin::Cli,
-                        );
-                    }
-
-                    app.refresh_pane_links(base);
-                    let dir_link = app
-                        .pane_links
-                        .get(&base)?
-                        .iter()
-                        .find(|link| std::path::Path::new(&link.target) == link_dir)?
-                        .clone();
-                    let terminals_before: std::collections::HashSet<_> =
-                        app.terminals.keys().copied().collect();
-                    click(app, &dir_link, win, cx)?;
-                    let directory_pane = app.terminals.iter().find_map(|(pane, session)| {
-                        (!terminals_before.contains(pane)
-                            && session.cwd() == Some(link_dir.as_path()))
-                        .then_some(*pane)
-                    });
-                    let directory_click_ok = directory_pane.is_some();
-                    if let Some(pane) = directory_pane {
-                        let _ = tako_control::dispatch(
-                            app,
-                            tako_control::protocol::Request::Close {
-                                pane: Some(pane.as_u64()),
-                                force: true,
-                                caller_role: None,
-                            },
-                            PaneOrigin::Cli,
-                        );
-                    }
-                    Some((file_click_ok, directory_click_ok))
-                })
-                .ok()
-                .flatten()
-                .unwrap_or((false, false));
-            check(file_click_ok, "cmd+クリックでファイルを分割プレビュー表示");
-            check(
-                directory_click_ok,
-                "cmd+クリックでディレクトリを分割し PTY を cwd 付きで起動",
-            );
-            let _ = std::fs::remove_dir_all(&link_dir);
 
             // 70. PDF プレビュー（FR-3.4 macOS）: dispatch OpenFile で PDF を開き、
             //     Pdf モードで Core Graphics レンダリングされたページが表示される
