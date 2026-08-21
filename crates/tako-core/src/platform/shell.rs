@@ -171,6 +171,7 @@ mod imp {
 /// PATH 探索でも psmux でも同じ実体に解決する。**空白が無ければ触らない**
 /// （既定シェルが `C:\Windows\...\powershell.exe` のようにフルパスで在るときは
 /// そのまま = 取り違えの余地を残さない）
+#[cfg_attr(not(windows), allow(dead_code))]
 fn single_token_program(program: &str) -> String {
     if !program.chars().any(char::is_whitespace) {
         return program.to_string();

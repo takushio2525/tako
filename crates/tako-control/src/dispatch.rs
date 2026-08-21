@@ -17209,19 +17209,25 @@ mod tests {
             before_panes + 1,
             "同じタブにペインが 1 枚増える"
         );
-        // 新ペインには /bin/sh -c で構造化して渡る（#453 の 127 即死を避ける形）
+        // 起動コマンドの形は方言境界が決める（#875）。カードの論理文字列がそのまま
+        // 境界へ渡ることを、境界の出力と突き合わせて見る
         let opts = host
             .attached_options
             .get(&new_pane)
             .expect("セッション起動");
         let cmd = opts.command.as_ref().expect("コマンド付き起動");
-        assert_eq!(cmd.program, "/bin/sh");
-        assert_eq!(cmd.args[0], "-c");
-        assert!(
-            cmd.args[1].starts_with("echo 'カード実行' && pwd"),
-            "論理文字列がそのまま渡る: {:?}",
-            cmd.args[1]
-        );
+        assert_run_pane_command(cmd, "echo 'カード実行' && pwd");
+        // POSIX 側は /bin/sh -c で構造化して渡る（#453 の 127 即死を避ける形）
+        #[cfg(unix)]
+        {
+            assert_eq!(cmd.program, "/bin/sh");
+            assert_eq!(cmd.args[0], "-c");
+            assert!(
+                cmd.args[1].starts_with("echo 'カード実行' && pwd"),
+                "論理文字列がそのまま渡る: {:?}",
+                cmd.args[1]
+            );
+        }
         // 手元のペインのフォーカスを奪わない（split は新ペインへフォーカスを移す仕様なので
         // 明示的に戻している。この assert を消すと退行が見えなくなる）
         assert_eq!(
