@@ -150,6 +150,15 @@ pub struct BackendCapabilities {
     /// 二重化なし のいずれも外へ出ず、同時に流した平文だけが届いた）。
     /// 器なしはそもそも間に何も挟まらないので true
     pub osc_passthrough: bool,
+    /// 器へ渡す**内側コマンドの第 1 語（プログラム）を引用符で括れるか**（#881）。
+    ///
+    /// tmux は内側コマンドを `sh -c` の意味論で解釈するので、空白入りのパスを
+    /// `'…'` で括れば正しく起動する。**psmux は括れない**: 単語分割の過程で
+    /// 引用符ごと落として `CreateProcess` へ渡すため、`'C:\Program Files\…'` が
+    /// そのまま「そんなプログラムは無い」になり、器が既定シェルへ丸投げして死ぬ
+    /// （実測 2026-08-21・psmux 3.3.7）。false の器へは
+    /// `platform::program_path::single_token` で空白の無い表記へ落として渡す
+    pub quotes_program: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -465,6 +474,25 @@ pub fn reserve_for_pane(
 /// 返り値の `Option<SessionRef>` が `None` = 器なし = 呼び出し側は
 /// そのペインを直接ペインとして扱う（`SpawnOptions` は素通し）。
 /// **PTY を所有するのは呼び出し側の `TerminalSession::spawn` のまま**である点に注意
+/// 器へ渡す「内側コマンド 1 本」を組み立てる（#881）。
+///
+/// tmux と psmux で**第 1 語の書き方だけ**が違う。ここを 1 か所にしておかないと、
+/// 器を差し替えたときに「引用符が消えて起動できない」形の行が静かに作られる
+pub fn inner_command_line(command: &crate::terminal::SpawnCommand) -> String {
+    compose_inner_command(command, capabilities().quotes_program)
+}
+
+/// [`inner_command_line`] の判断部（純粋関数。**macOS からも両分岐をテストできる**）
+pub(crate) fn compose_inner_command(
+    command: &crate::terminal::SpawnCommand,
+    quotes_program: bool,
+) -> String {
+    if quotes_program {
+        return crate::tmux_backend::shell_quoted(command);
+    }
+    psmux::inner_command(command)
+}
+
 pub fn wrap_spawn_for_pane(
     backend: &'static dyn SessionBackend,
     persist: bool,
@@ -804,6 +832,64 @@ mod tests {
         Binary::Tmux { bin: "tmux".into() }
     }
 
+    /// 内側コマンドの第 1 語の書き方が器で変わる（#881）
+    #[test]
+    fn 内側コマンドの組み立ては器の引用能力で変わる() {
+        let spaced = crate::terminal::SpawnCommand {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            args: vec![
+                "-NoLogo".into(),
+                "-Command".into(),
+                "Write-Output ok".into(),
+            ],
+        };
+        // tmux は `sh -c` の意味論なので引用符で括ってよい（macOS の従来出力そのもの）
+        assert_eq!(
+            compose_inner_command(&spaced, true),
+            "'C:\\Program Files\\PowerShell\\7\\pwsh.exe' -NoLogo -Command 'Write-Output ok'"
+        );
+        // psmux は括れない。第 1 語は 1 語へ落ち、引数だけがクオートされる
+        let psmux_line = compose_inner_command(&spaced, false);
+        let first = psmux_line.split(' ').next().unwrap_or_default();
+        assert!(
+            crate::platform::program_path::is_single_token(first),
+            "第 1 語が引用符付き・空白入りのまま: {psmux_line}"
+        );
+        assert!(
+            psmux_line.ends_with(" -NoLogo -Command 'Write-Output ok'"),
+            "{psmux_line}"
+        );
+
+        // 空白の無いプログラムはどちらの器でも同じ（macOS の既存出力を変えない）
+        let plain = crate::terminal::SpawnCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi".into()],
+        };
+        assert_eq!(compose_inner_command(&plain, true), "/bin/sh -c 'echo hi'");
+        assert_eq!(compose_inner_command(&plain, false), "/bin/sh -c 'echo hi'");
+    }
+
+    /// 器へ渡す行の組み立てが 1 か所に集まっていること（番犬）。
+    /// `tmux_backend::wrap_options` が `shell_quoted` を直接呼ぶ形へ戻ると、
+    /// psmux では第 1 語が引用符付きのまま渡って**静かに起動できなくなる**（#881）
+    #[test]
+    fn wrap_optionsは内側コマンドの組み立てを境界へ委ねる() {
+        let src = include_str!("../tmux_backend.rs");
+        let body = src
+            .split("pub fn wrap_options(")
+            .nth(1)
+            .expect("wrap_options の定義");
+        let body = &body[..body.find("\npub ").unwrap_or(body.len())];
+        assert!(
+            body.contains("inner_command_line("),
+            "wrap_options が内側コマンドの組み立てを境界へ委ねていない"
+        );
+        assert!(
+            !body.contains("shell_quoted(inner)"),
+            "wrap_options が shell_quoted を直接呼んでいる（psmux で第 1 語が壊れる。#881）"
+        );
+    }
+
     fn psmux_bin() -> Binary {
         Binary::Psmux {
             bin: "tmux".into(),
@@ -933,6 +1019,7 @@ mod tests {
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
             osc_passthrough: true,
+            quotes_program: true,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -944,6 +1031,7 @@ mod tests {
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: true,
+            quotes_program: true,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -961,6 +1049,7 @@ mod tests {
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: true,
+            quotes_program: true,
             label: "none",
         };
         let v = caps.describe();
@@ -977,6 +1066,7 @@ mod tests {
             detached_access: true,
             scrollback: ScrollbackAuthority::Backend,
             osc_passthrough: true,
+            quotes_program: true,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -994,6 +1084,7 @@ mod tests {
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: false,
+            quotes_program: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -1031,6 +1122,7 @@ mod tests {
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
                 osc_passthrough: true,
+                quotes_program: true,
                 label: "session-host",
             }
         }
@@ -1229,6 +1321,7 @@ mod tests {
             detached_access: false,
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: true,
+            quotes_program: true,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -1290,6 +1383,7 @@ mod tests {
                 detached_access: false,
                 scrollback: ScrollbackAuthority::InProcess,
                 osc_passthrough: true,
+                quotes_program: true,
                 label: "capture-only",
             }
         }

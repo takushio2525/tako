@@ -18,6 +18,7 @@ pub mod install_info;
 pub mod locale;
 pub mod process;
 pub mod procinfo;
+pub mod program_path;
 pub mod quit_signal;
 pub mod release_assets;
 pub mod shell;

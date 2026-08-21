@@ -143,45 +143,23 @@ mod imp {
     /// 出す」ことで、cmd は `%ERRORLEVEL%` の展開時期も引用符の扱いも別物になる。
     /// `powershell.exe`（5.1）は Windows 同梱で System32 に必ず居るので、
     /// 既定シェルが PowerShell でないときはそれを名前で起こす（PATH 探索が効く）。
-    /// 方言の判定は [`ShellDialect::from_program`] に任せる（判定を増やさない。#873）
+    /// 方言の判定は [`ShellDialect::from_program`] に任せる（判定を増やさない。#873）。
+    ///
+    /// **解決したフルパスをそのまま返す**。器（psmux）が空白入りのパスを運べない件は
+    /// #875 でここが実行ファイル名へ落として回避していたが、#881 で器側
+    /// （`platform::program_path` 経由の `backend::psmux::inner_command`）が
+    /// 面倒を見るようになったので、取り違えの余地が無い正確な方を渡す
     fn run_pane_shell() -> String {
-        let resolved = default_shell()
+        default_shell()
             .map(|s| s.program)
             .filter(|p| ShellDialect::from_program(p) == Some(ShellDialect::PowerShell))
-            .unwrap_or_else(|| "powershell.exe".to_string());
-        super::single_token_program(&resolved)
+            .unwrap_or_else(|| "powershell.exe".to_string())
     }
 
     /// 非 UTF-8 の環境変数値は解決に使えないため落とす（後段のフォールバックへ回す）
     fn env_string(key: &str) -> Option<String> {
         std::env::var_os(key).and_then(|v| v.into_string().ok())
     }
-}
-
-/// 空白を含まない**1 語**で書けるプログラム表記へ落とす（純粋関数）。
-///
-/// 永続バックエンド psmux は `new-session` の内側コマンドを POSIX 風に単語分割するが、
-/// **第 1 語（プログラム）だけは引用符が剥がれない**ため、空白を含むパスを運べない。
-/// `backend::psmux::inner_command` はその場合 `cmd.exe /c '<Windows 行>'` に包むが、
-/// **実測（2026-08-21・psmux 3.3.7）ではこの包みは器の中で即死する**
-/// （包まない `pwsh.exe …` は同じコマンドで生存する。包みが効かないこと自体は #881）。
-///
-/// そこで実行ペインは最初から 1 語で書ける形を渡す。`pwsh.exe` / `powershell.exe` は
-/// どちらも PATH で引ける（後者は System32 = 必ず在る）ので、`CreateProcess` の
-/// PATH 探索でも psmux でも同じ実体に解決する。**空白が無ければ触らない**
-/// （既定シェルが `C:\Windows\...\powershell.exe` のようにフルパスで在るときは
-/// そのまま = 取り違えの余地を残さない）
-#[cfg_attr(not(windows), allow(dead_code))]
-fn single_token_program(program: &str) -> String {
-    if !program.chars().any(char::is_whitespace) {
-        return program.to_string();
-    }
-    program
-        .rsplit(['\\', '/'])
-        .next()
-        .filter(|f| !f.is_empty())
-        .unwrap_or(program)
-        .to_string()
 }
 
 /// POSIX の実行ペイン用コマンド（純粋関数）。
@@ -540,21 +518,6 @@ mod tests {
             script.contains("Write-Host ('IT''S=' + $__tako_code)"),
             "{script}"
         );
-    }
-
-    #[test]
-    fn 空白を含むプログラムパスは実行ファイル名へ落ちる() {
-        // psmux は第 1 語に引用符を使えず、空白入りのパスを器へ運べない（実測）。
-        // 空白があるときだけ 1 語へ落とし、無ければ**触らない**
-        assert_eq!(single_token_program(PWSH), "pwsh.exe");
-        assert_eq!(
-            single_token_program("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
-            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-        );
-        assert_eq!(single_token_program("powershell.exe"), "powershell.exe");
-        // 区切りが無い / 末尾が区切り のような壊れた入力でも panic しない
-        assert_eq!(single_token_program("a b"), "a b");
-        assert_eq!(single_token_program("C:\\a b\\"), "C:\\a b\\");
     }
 
     #[test]

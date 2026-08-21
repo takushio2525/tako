@@ -2513,3 +2513,20 @@
 - 検証: fmt / clippy（両 feature）/ test 2397 passed / 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` /
   クロスチェックの警告リストが main と完全一致。#875 merge 後に rebase して全ゲート再走
 - 関連: PR #882（`Refs #877, #467`）。**残りはスライス 8（棚卸し）だけ**
+
+## 2026-08-21（#881: 器へ渡す内側コマンドの第 1 語を 1 語にする）
+- persist ON（器 = psmux）で空白入りのプログラムパスを明示指定すると PTY が即死していた。
+  psmux は内側コマンドを**単語分割の過程で引用符ごと落とす**ので、`shell_quoted` が付けた
+  単引用符ごと消えて `'C:\Program Files\…'` を探しに行き、器が既定シェルへ丸投げして構文エラー
+- `BackendCapabilities::quotes_program` を新設し組み立てを `backend::inner_command_line` へ 1 本化。
+  psmux 側は `platform::program_path`（境界 B18・`GetShortPathNameW`）で 8.3 短縮名 →
+  実行ファイル名の順に 1 語へ落とす。**tmux 側はバイト等価**（番犬テストつき）
+- **#875 の「第 1 語 1 語」回避は撤去**（器側が面倒を見るので実行ペインはフルパスを渡す）
+- **最大の学び**: 最初 `psmux::inner_command` を直したが**実機で何も変わらなかった**。
+  `PsmuxBackend::wrap_spawn` に呼び出し元が無く（tako-app は `tmux_backend::wrap_options` を
+  直接叩く）、スライス 2a の backend trait が spawn 経路で使われていなかったため。**#885 に起票**
+- 検証: 実機 before/after（空白入りパスの split が消滅 → 生存）/ #875 の 3 経路と終了コードの回帰なし /
+  実機テスト 22 件失敗で main と集合完全一致 / GUI セルフテストの SKIP・FAILED 一覧が #875 完了時と完全一致 /
+  macOS は fmt・clippy・test 2396 passed・クロスチェック警告が main と一致
+- 副産物 **#884**（空白入り cwd でペインが即死。psmux 単体では同 argv で生存 = 層が違う）
+
