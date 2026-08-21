@@ -37614,15 +37614,21 @@ mod self_test {
                 // DECTCEM でカーソルを消す（claude の TUI と同条件を人工的に作る）。
                 // PTY へ直接エスケープを書いても**入力**として渡るだけで端末は解釈しない。
                 // シェルに printf を実行させ、出力としてエスケープを流す必要がある
+                println!("TAKO_SELF_TEST_76C: {label} 開始");
                 let hid = window
                     .update(cx, |app, _, _| {
                         let pane = app.focused_pane();
                         match app.terminals.get(&pane) {
                             Some(s) => {
                                 // 直前の項目が打ちかけた入力が残っていることがあるので
-                                // Ctrl-C で行を捨ててから送る。sleep で保持しないと、
-                                // コマンド終了後の zsh のプロンプト再描画でカーソルが戻る
-                                s.write(b"\x03".to_vec());
+                                // 行を捨ててから送る。sleep で保持しないと、
+                                // コマンド終了後のプロンプト再描画でカーソルが戻る。
+                                // **Ctrl+C（0x03）は POSIX だけ**: ConPTY へ書くと
+                                // CTRL_C_EVENT がコンソールに配られるため、ホスト側
+                                // （tako 自身）まで飛ぶ疑いがある（#865 で切り分け中）
+                                if sh.is_posix() {
+                                    s.write(b"\x03".to_vec());
+                                }
                                 s.write(
                                     format!(
                                         "{}\r",
@@ -37639,6 +37645,7 @@ mod self_test {
                         }
                     })
                     .unwrap_or(false);
+                println!("TAKO_SELF_TEST_76C: {label} 書き込み後 hid={hid}");
                 let mut cursor_hidden = false;
                 for _ in 0..40 {
                     wait(cx, 100).await;
