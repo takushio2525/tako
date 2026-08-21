@@ -788,6 +788,42 @@ fn viewport_close_failure_log(
     )
 }
 
+/// GPUI ウィンドウが閉じられたときの診断行（#872）。
+///
+/// **ウィンドウが 0 枚になると GPUI の既定はプロセスを終わらせる**（非 macOS。
+/// `QuitMode::Default`）。終了は `PostQuitMessage(0)` → `ExitProcess(0)` なので
+/// panic でも FAILED でもなく、tako 側のどのログにも痕跡が残らない = 「静かに死ぬ」。
+/// tako は内部都合で一時的に窓を 0 枚にする経路（`sync_viewports` の閉じ直し・
+/// セルフテストの `remove_window`）を持つので、0 枚になった瞬間は必ず 1 行残す
+/// （#865 の切り分けはこの行が無いために 3 反復溶けた）
+fn viewport_closed_log(
+    window: gpui::WindowId,
+    remaining: usize,
+    logical: Option<usize>,
+    policy: tako_core::platform::window_lifecycle::LastWindowClose,
+) -> String {
+    let logical = logical.map_or_else(|| "?".to_string(), |n| n.to_string());
+    if remaining == 0 {
+        format!(
+            "ウィンドウ close: gpui={window:?} 残り gpui=0 論理={logical} → {}（#872）",
+            policy.reason()
+        )
+    } else {
+        format!("ウィンドウ close: gpui={window:?} 残り gpui={remaining} 論理={logical}")
+    }
+}
+
+/// 「ウィンドウ 0 枚でプロセスをどうするか」を tako が持つか（#872）。
+///
+/// 既定は持つ（`QuitMode::Explicit` + `handle_window_close` の明示 quit）。
+/// `TAKO_872_NO_QUIT_GUARD=1` で GPUI の既定へ戻せる = 同一バイナリで A/B が取れる
+fn window_quit_guard_enabled() -> bool {
+    !matches!(
+        std::env::var("TAKO_872_NO_QUIT_GUARD").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 復元強奪ガード（#177）: これから復元 attach しようとする tmux セッションに
 /// **生きた別 tako-app 配下のクライアント**が attach 中なら、そのセッション群は
 /// 別インスタンスが表示中なのでセカンダリ降格の理由を返す。
@@ -8592,16 +8628,25 @@ impl TakoApp {
 
     /// 赤ボタン close（on_window_should_close）。複数ウィンドウならビューポートだけ
     /// 閉じてタブを残存ウィンドウへ合流させる（タブ・プロセスは殺さない）。
-    /// 最後の 1 枚は layout 保存のみ（entity・workspace・tmux クライアントは生存し、
+    /// 最後の 1 枚の扱いは `platform::window_lifecycle` の方針に従う（#872）:
+    /// macOS は layout 保存のみ（entity・workspace・tmux クライアントは生存し、
     /// Dock 復帰（on_reopen）が同じ entity のウインドウを開き直す。#312 → #381 で
     /// primary 解放 + TakoApp::new 再生成を廃止: 旧 entity のゾンビ化と保存競合が
-    /// 全タブ消失を起こしていた）。
-    /// 「最後の 1 枚」判定は GPUI ウインドウ数で行う（論理ウインドウ数だと viewport
-    /// 生成失敗などで枚数がズレたとき、保存されないままウインドウ 0 枚になり得る）
+    /// 全タブ消失を起こしていた）。Windows は窓 0 枚から戻る手段が無いので
+    /// **ここで明示的に終了する**（GPUI の自動終了に任せない = 内部都合の
+    /// 「窓 0 枚」と区別できる）。
+    /// 「最後の 1 枚」判定は **tako が持っているビューポートの数**で行う。
+    /// 論理ウインドウ数だと viewport 生成失敗で枚数がズレたとき保存されないまま
+    /// ウインドウ 0 枚になり得るし、GPUI の総ウインドウ数だと設定画面・アップデート
+    /// 画面（別 root view の GPUI ウインドウ）まで数えてしまい、「設定画面を開いた
+    /// まま最後のタブウインドウを閉じる」と最後の 1 枚として扱われない
+    /// （#872: Windows ではその後に設定画面を閉じると、終了も再表示もできない
+    /// プロセスが残る）。`viewports` は open（register_viewport）と close の
+    /// 両方で更新される = tako が実際に見せている窓の数そのもの
     fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let handle = window.window_handle();
         let logical = self.viewport_of(window);
-        if cx.windows().len() > 1 {
+        if self.viewports.len() > 1 {
             if let Some(lid) = logical {
                 if self.workspace.windows().len() > 1 {
                     match self.workspace.close_window(lid) {
@@ -8618,13 +8663,24 @@ impl TakoApp {
             }
             return true;
         }
-        persist_diag("赤ボタン close: layout 保存（ワークスペースは生存、Dock 復帰で再表示）");
+        let policy = tako_core::platform::window_lifecycle::last_window_close_here();
+        persist_diag(&format!(
+            "最後のウィンドウの close: layout 保存 → {}",
+            policy.reason()
+        ));
         self.save_layout();
         if let Some(lid) = logical {
             // Dock 復帰（reopen_or_restore → open_viewport）が window_frames を参照
             // するため、フレームだけは保持して viewport 対応表のみ掃除する（#412）
             self.viewports.retain(|(l, h)| *l != lid && *h != handle);
             self.viewport_subs.remove(&handle.window_id());
+        }
+        // #872: 窓 0 枚から戻る手段が無いプラットフォーム（Windows）では、ここで
+        // **tako が明示的に**終了する。GPUI の自動終了に任せていたときは
+        // 「ユーザーが最後の窓を閉じた」も「tako が内部都合で窓を 0 枚にした」も
+        // 区別なくプロセスが消えていた（後者が #872 の無音終了）
+        if window_quit_guard_enabled() && policy.quits() {
+            cx.quit();
         }
         true
     }
@@ -20033,12 +20089,36 @@ fn open_viewport_window(
             entity.clone()
         },
     );
-    if opened.is_err() {
-        eprintln!("warning: 新しいウィンドウを開けなかった");
-        // GPUI ウィンドウの無い論理ウィンドウは操作不能になるため合流で畳む
-        entity.update(cx, |app, _| {
-            let _ = app.workspace.close_window(logical);
-        });
+    match &opened {
+        Ok(_) => {
+            // #872: 2 枚目の生成は Windows で無音終了の疑いを持たれていた経路なので、
+            // 成否と枚数を必ず残す（失敗しても成功しても手がかりが 1 行出る）
+            let line = format!(
+                "ウィンドウ open: logical={} gpui 枚数={}",
+                logical.as_u64(),
+                cx.windows().len()
+            );
+            if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                println!("TAKO_SELF_TEST_WINDOW_OPEN: {line}");
+            }
+            persist_diag(&line);
+        }
+        Err(e) => {
+            let line = format!(
+                "ウィンドウ open 失敗: logical={} 理由={e} gpui 枚数={}",
+                logical.as_u64(),
+                cx.windows().len()
+            );
+            if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                println!("TAKO_SELF_TEST_WINDOW_OPEN: {line}");
+            }
+            persist_diag(&line);
+            eprintln!("warning: 新しいウィンドウを開けなかった: {e}");
+            // GPUI ウィンドウの無い論理ウィンドウは操作不能になるため合流で畳む
+            entity.update(cx, |app, _| {
+                let _ = app.workspace.close_window(logical);
+            });
+        }
     }
 }
 
@@ -20224,6 +20304,36 @@ fn main() {
     app.run(move |cx: &mut App| {
         cx.bind_keys(key_bindings());
         cx.set_menus(app_menus());
+        // #872: 「ウィンドウが 0 枚になったらプロセスを終わらせるか」は tako が決める。
+        // GPUI の既定（`QuitMode::Default`）は **非 macOS で「最後のウィンドウが閉じたら
+        // 終了」** で、しかも `PostQuitMessage(0)` → `ExitProcess(0)` なので
+        // **診断を 1 行も残さず終了コード 0 でプロセスが消える**。tako は内部都合で
+        // 一時的に窓を 0 枚にする経路（`sync_viewports` の閉じ直し・セルフテストの
+        // `remove_window`）を持つため、そこを踏むと「panic でも FAILED でもない無音終了」
+        // になっていた（#872 の症状 = セルフテストが項目 77 以降を 1 つも測れない）。
+        // 方針の正は `platform::window_lifecycle`、実行は `handle_window_close`。
+        // macOS は `QuitMode::Default` が既に Explicit 相当なので挙動不変
+        if window_quit_guard_enabled() {
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        }
+        // 0 枚になった瞬間は必ず記録する（ガードの有無に関係なく常に出す =
+        // 次に同じ経路を踏んだ人が黙って溶かさないための保険。#872 受け入れ条件 1）
+        cx.on_window_closed(|cx, id| {
+            let primary = cx.try_global::<PrimaryApp>().and_then(|g| g.0.upgrade());
+            let logical = primary.map(|app| app.read(cx).workspace.windows().len());
+            let line = viewport_closed_log(
+                id,
+                cx.windows().len(),
+                logical,
+                tako_core::platform::window_lifecycle::last_window_close_here(),
+            );
+            // persist_diag はセルフテスト中は黙るので、そのときは stdout へ出す
+            if std::env::var_os("TAKO_SELF_TEST").is_some() {
+                println!("TAKO_SELF_TEST_WINDOW_CLOSED: {line}");
+            }
+            persist_diag(&line);
+        })
+        .detach();
         webview::install_key_monitor();
         // New Window はルート div（TakoApp::new_viewport_window = 同一 entity の
         // ビューポート追加。Issue #339）が処理する。ここはウィンドウが 1 枚も無い
@@ -37804,18 +37914,13 @@ mod self_test {
                 wait(cx, 300).await;
             }
 
-            // 項目 77 / 79 / 80（複数ウィンドウ・赤ボタン close → 復帰・共有タブバー）は
-            // Windows で **2 枚目を作った瞬間にアプリが静かに終了する**
-            // （終了コード 0 / panic 無し。#872 に実測を起票）。しかも項目 79 は
-            // 「窓 0 枚でアプリだけ生きて Dock から復帰する」= macOS 固有の概念に依る。
-            // 終了はセルフテスト全体を道連れにして項目 81 以降が 1 つも測れないので、
-            // 直るまで対象外にする
-            if cfg!(target_os = "windows") {
-                println!(
-                    "TAKO_SELF_TEST_SKIPPED: 77 / 79 / 80（`window new` でアプリが静かに \
-                     終了する。赤ボタン → Dock 復帰は macOS 固有。#872）"
-                );
-            } else {
+            // 項目 77 / 80（複数ウィンドウ・共有タブバー）は全プラットフォームで走る。
+            // #872 まで Windows では丸ごとスキップしていたが、その原因は
+            // 「2 枚目の生成」ではなく**項目 79（macOS 固有の Dock 復帰）が窓を 0 枚に
+            // すること**で、GPUI の既定が非 macOS では窓 0 枚 = プロセス終了だった
+            // （`ExitProcess(0)` なので panic も FAILED も出ない）。方針を tako が持つ
+            // ようにしたので 77 / 80 は測れる。79 だけは macOS 固有のまま
+            {
                 // 77. 複数ウィンドウ（#339 ビューポート方式）: CLI で window new →
                 //     論理 + GPUI ウィンドウが増え同一 TakoApp entity を共有 → タブは
                 //     ウィンドウ間で排他 → move-tab で合流すると空ウィンドウが自動 close
@@ -37866,6 +37971,37 @@ mod self_test {
                     "window new: 論理 + GPUI ウィンドウが 1 枚増える (#339)",
                 );
                 check(tabs_exclusive, "window: タブはウィンドウ間で排他 (#339)");
+                // #872: 「増えた」だけでなく **中身が使える** ところまで見る。
+                // ビューポート対応表への登録は新しい GPUI ウィンドウの build クロージャ
+                // （register_viewport）が実際に走った証拠、terminal の存在は
+                // そのタブのペインに PTY が立った証拠
+                let (viewport_registered, pane_has_pty, drawn) = window
+                    .update(cx, |app, _, _| {
+                        let wid = app.workspace.active_window_id();
+                        let registered = app.viewports.iter().any(|(l, _)| *l == wid);
+                        let pane = app
+                            .workspace
+                            .get_window(wid)
+                            .and_then(|w| app.workspace.get_tab(w.active_tab()))
+                            .map(|t| t.tree().focused());
+                        let has_pty = pane.is_some_and(|p| app.terminals.contains_key(&p));
+                        let drawn = pane
+                            .is_some_and(|p| app.pane_text_areas.iter().any(|(id, _)| *id == p));
+                        (registered, has_pty, drawn)
+                    })
+                    .unwrap_or((false, false, false));
+                println!(
+                    "TAKO_SELF_TEST_77: 2 枚目 registered={viewport_registered} \
+                     pty={pane_has_pty} drawn={drawn}"
+                );
+                check(
+                    viewport_registered,
+                    "window new: 2 枚目の GPUI ウィンドウが論理ウィンドウへ対応付く (#339/#872)",
+                );
+                check(
+                    pane_has_pty,
+                    "window new: 2 枚目のタブのペインに PTY が立つ (#339/#872)",
+                );
                 let first_window = window
                     .update(cx, |app, _, _| app.workspace.windows()[0].id().as_u64())
                     .unwrap_or(0);
@@ -37912,48 +38048,137 @@ mod self_test {
                 });
                 wait(cx, 800).await;
 
-                // 79. 赤ボタン close → 再表示（#381）: 最後の 1 枚の赤ボタン close は
-                //     TakoApp entity を破棄せず、Dock 復帰（reopen_or_restore）が**同一
-                //     entity** のウィンドウを開き直す。旧実装は TakoApp::new を再生成して
-                //     旧 entity がゾンビ化（IPC 二重化・保存競合・復元 spawn の -A -D
-                //     クライアント強奪 → Exited 連鎖）し全タブ消失を起こしていた
-                let before = window
-                    .update(cx, |app, _, cx| {
-                        (app.workspace.tabs().len(), cx.entity().entity_id())
-                    })
-                    .ok();
-                check(before.is_some(), "赤ボタン close 前の状態を採取できる (#381)");
-                // 赤ボタン close 相当: should_close ハンドラ → true → remove_window
-                let _ = window.update(cx, |app, win, cx| {
-                    let allow = app.handle_window_close(win, cx);
-                    if allow {
-                        win.remove_window();
+                // 79. 赤ボタン close → Dock 復帰（#381）は **macOS 固有の概念**
+                //     （窓 0 枚でアプリだけ生きて Dock から戻る）。Windows には戻す
+                //     手段が無く、最後の窓を閉じたらアプリを終了するのが正しい
+                //     （方針は platform::window_lifecycle。#872）ので、ここは
+                //     macOS だけで走らせる。実行するとプロセスが終わり、以降の
+                //     項目が 1 つも測れなくなるため
+                if cfg!(target_os = "macos") {
+                    // 79. 赤ボタン close → 再表示（#381）: 最後の 1 枚の赤ボタン close は
+                    //     TakoApp entity を破棄せず、Dock 復帰（reopen_or_restore）が**同一
+                    //     entity** のウィンドウを開き直す。旧実装は TakoApp::new を再生成して
+                    //     旧 entity がゾンビ化（IPC 二重化・保存競合・復元 spawn の -A -D
+                    //     クライアント強奪 → Exited 連鎖）し全タブ消失を起こしていた
+                    let before = window
+                        .update(cx, |app, _, cx| {
+                            (app.workspace.tabs().len(), cx.entity().entity_id())
+                        })
+                        .ok();
+                    check(before.is_some(), "赤ボタン close 前の状態を採取できる (#381)");
+                    // 赤ボタン close 相当: should_close ハンドラ → true → remove_window
+                    let _ = window.update(cx, |app, win, cx| {
+                        let allow = app.handle_window_close(win, cx);
+                        if allow {
+                            win.remove_window();
+                        }
+                    });
+                    wait(cx, 800).await;
+                    let gpui_empty = cx.update(|cx| cx.windows().is_empty());
+                    check(gpui_empty, "赤ボタン close で GPUI ウィンドウが 0 枚になる (#381)");
+                    // Dock 復帰相当: reopen_or_restore が生存 entity のウィンドウを開き直す
+                    cx.update(reopen_or_restore);
+                    wait(cx, 1200).await;
+                    let after = cx.update(|cx| {
+                        let wins = cx.windows().len();
+                        cx.try_global::<PrimaryApp>()
+                            .and_then(|g| g.0.upgrade())
+                            .map(|e| (wins, e.entity_id(), e.read(cx).workspace.tabs().len()))
+                    });
+                    check(
+                        after.map(|(wins, _, _)| wins) == Some(1),
+                        "Dock 復帰でウィンドウが 1 枚開き直される (#381)",
+                    );
+                    check(
+                        before.map(|(_, id)| id) == after.map(|(_, id, _)| id),
+                        "Dock 復帰は同一 TakoApp entity を再利用する（TakoApp::new を再生成しない） (#381)",
+                    );
+                    check(
+                        before.map(|(tabs, _)| tabs) == after.map(|(_, _, tabs)| tabs),
+                        "Dock 復帰後もタブ構成が維持される（復元を経ない） (#381)",
+                    );
+                } else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 79（赤ボタン close → Dock 復帰は macOS 固有。\
+                         この OS では最後のウィンドウを閉じるとアプリが終了するのが正しい。#872）"
+                    );
+                }
+
+                // 79b. #872 の不変条件: **tako が内部都合で GPUI ウィンドウを 0 枚に
+                //      しても、プロセスは死なない**。GPUI の既定は非 macOS で
+                //      「窓 0 枚 = アプリ終了」（`PostQuitMessage(0)` → `ExitProcess(0)`
+                //      なので panic も FAILED も出ない無音終了）だったため、Windows では
+                //      この経路を踏んだ瞬間にセルフテスト全体が道連れになっていた。
+                //      方針を tako が持つ（`platform::window_lifecycle` + `QuitMode::Explicit`）
+                //      ことで、内部都合の 0 枚と「ユーザーが最後の窓を閉じた」が分かれる。
+                //      検出力: `TAKO_872_NO_QUIT_GUARD=1` で回すとこの項目で
+                //      **プロセスが終了し、以降の項目が 1 つも走らない**
+                {
+                    let before = cx.update(|cx| {
+                        cx.try_global::<PrimaryApp>()
+                            .and_then(|g| g.0.upgrade())
+                            .map(|e| (e.entity_id(), e.read(cx).workspace.tabs().len()))
+                    });
+                    check(before.is_some(), "0 枚化の前に生存 entity を採取できる (#872)");
+                    // 開いている TakoApp ウィンドウを **should_close を通さず**
+                    // プログラム的に全部閉じる（= 内部都合の 0 枚。ユーザー操作ではない）
+                    let takos: Vec<WindowHandle<TakoApp>> = cx.update(|cx| {
+                        cx.windows()
+                            .into_iter()
+                            .filter_map(|w| w.downcast::<TakoApp>())
+                            .collect()
+                    });
+                    for h in takos {
+                        let _ = h.update(cx, |_, window, _| window.remove_window());
                     }
-                });
-                wait(cx, 800).await;
-                let gpui_empty = cx.update(|cx| cx.windows().is_empty());
-                check(gpui_empty, "赤ボタン close で GPUI ウィンドウが 0 枚になる (#381)");
-                // Dock 復帰相当: reopen_or_restore が生存 entity のウィンドウを開き直す
-                cx.update(reopen_or_restore);
-                wait(cx, 1200).await;
-                let after = cx.update(|cx| {
-                    let wins = cx.windows().len();
-                    cx.try_global::<PrimaryApp>()
-                        .and_then(|g| g.0.upgrade())
-                        .map(|e| (wins, e.entity_id(), e.read(cx).workspace.tabs().len()))
-                });
-                check(
-                    after.map(|(wins, _, _)| wins) == Some(1),
-                    "Dock 復帰でウィンドウが 1 枚開き直される (#381)",
-                );
-                check(
-                    before.map(|(_, id)| id) == after.map(|(_, id, _)| id),
-                    "Dock 復帰は同一 TakoApp entity を再利用する（TakoApp::new を再生成しない） (#381)",
-                );
-                check(
-                    before.map(|(tabs, _)| tabs) == after.map(|(_, _, tabs)| tabs),
-                    "Dock 復帰後もタブ構成が維持される（復元を経ない） (#381)",
-                );
+                    wait(cx, 800).await;
+                    let (total, takos_left) = cx.update(|cx| {
+                        let all = cx.windows();
+                        let takos = all
+                            .iter()
+                            .filter(|w| w.downcast::<TakoApp>().is_some())
+                            .count();
+                        (all.len(), takos)
+                    });
+                    println!(
+                        "TAKO_SELF_TEST_79B: 内部 close 後 gpui 枚数={total} tako 窓={takos_left} \
+                         （ここが印字されている = 0 枚でプロセスが死んでいない）"
+                    );
+                    check(
+                        takos_left == 0,
+                        "内部都合の close で tako のウィンドウが 0 枚になる (#872)",
+                    );
+                    // 0 枚から開き直す（macOS の Dock 復帰と同じ 1 行。Windows でも同じ経路）
+                    cx.update(reopen_or_restore);
+                    wait(cx, 1200).await;
+                    let after = cx.update(|cx| {
+                        cx.try_global::<PrimaryApp>()
+                            .and_then(|g| g.0.upgrade())
+                            .map(|e| {
+                                (
+                                    cx.windows()
+                                        .iter()
+                                        .filter(|w| w.downcast::<TakoApp>().is_some())
+                                        .count(),
+                                    e.entity_id(),
+                                    e.read(cx).workspace.tabs().len(),
+                                )
+                            })
+                    });
+                    println!("TAKO_SELF_TEST_79B: 開き直し後 {after:?}");
+                    check(
+                        after.map(|(w, _, _)| w) == Some(1),
+                        "0 枚からウィンドウを開き直せる (#872)",
+                    );
+                    check(
+                        before.map(|(id, _)| id) == after.map(|(_, id, _)| id),
+                        "0 枚 → 開き直しは同一 TakoApp entity を再利用する (#872)",
+                    );
+                    check(
+                        before.map(|(_, t)| t) == after.map(|(_, _, t)| t),
+                        "0 枚 → 開き直しでタブ構成が維持される (#872)",
+                    );
+                }
 
                 // 80. 共有タブバー（#380）: 別ウィンドウ所属のタブを選択すると表示が
                 //     そのウィンドウへ移る（move_tab_to_window の奪取）。排他は維持され、
@@ -38010,6 +38235,20 @@ mod self_test {
                 wait(cx, 800).await;
             }
 
+            // 項目 79 / 79b でウィンドウを開き直しているため、ここでハンドルを取り直す
+            // （#381）。取り直さないと `window.update` / `any` への打鍵が Err になり、
+            // **検証本体が一度も走らないまま素通りする**（項目 81 は `setup_ok` が false に
+            // なるだけで何も言わずに飛ばされていた = #872 の調査で気づいた沈黙。
+            // 取り直しは以前は項目 81 の**後ろ**にあり、81 だけが取り残されていた）
+            let window = cx
+                .update(|cx| {
+                    cx.windows()
+                        .into_iter()
+                        .find_map(|w| w.downcast::<TakoApp>())
+                })
+                .unwrap_or(window);
+            let any: AnyWindowHandle = window.into();
+
             // 81. テキスト入力フラグ残留でキー入力が奪われない (#503)
             // git コミット入力欄のフラグを立てた状態でパネルを閉じると
             // handle_key の防御的クリアが働き、打鍵がターミナルに届くことを検証する。
@@ -38024,33 +38263,23 @@ mod self_test {
                         app.panel_visible = false;
                     })
                     .is_ok();
-                if setup_ok {
-                    type_text(any, cx, "echo ST503OK", true);
-                    let mut st503_ok = false;
-                    for _ in 0..8 {
-                        wait(cx, 500).await;
-                        st503_ok = focused_contains(window, cx, "ST503OK");
-                        if st503_ok {
-                            break;
-                        }
+                // 素通り禁止（#796 / #872）: ハンドルが死んでいると以前はここで
+                // 黙って飛ばされ、項目 81 が「何も検証していないのに緑」になっていた
+                check(setup_ok, "項目 81 の前提（ウィンドウハンドルが生きている） (#503)");
+                type_text(any, cx, "echo ST503OK", true);
+                let mut st503_ok = false;
+                for _ in 0..8 {
+                    wait(cx, 500).await;
+                    st503_ok = focused_contains(window, cx, "ST503OK");
+                    if st503_ok {
+                        break;
                     }
-                    check(
-                        st503_ok,
-                        "フラグ残留でもパネル非表示なら打鍵がターミナルに届く (#503)",
-                    );
                 }
+                check(
+                    st503_ok,
+                    "フラグ残留でもパネル非表示なら打鍵がターミナルに届く (#503)",
+                );
             }
-
-            // 項目 78 でウィンドウを開き直しているため、以降はハンドルを取り直す（#381）。
-            // 取り直さないと window.update が Err を返し、検証本体が一度も走らないまま
-            // 「失敗」になる（実際にこれで項目 82 が空振りした）
-            let window = cx
-                .update(|cx| {
-                    cx.windows()
-                        .into_iter()
-                        .find_map(|w| w.downcast::<TakoApp>())
-                })
-                .unwrap_or(window);
 
             // 82. git 新規ブランチ名の入力欄 (#496)。
             // 実機の合成キーボード入力は IME（かな入力）に吸われて検証できないため、
@@ -49648,6 +49877,62 @@ mod session_kill_boundary_tests {
             body.contains("save_layout()"),
             "アプリ終了処理から save_layout が消えている（再起動で構成を失う）"
         );
+    }
+
+    /// ウィンドウ 0 枚で無音終了しないこと（#872 の番犬）。
+    ///
+    /// 症状は「panic でも FAILED でもなく終了コード 0 で消える」= 調査の手がかりが
+    /// ゼロ。手がかりを作っている 2 つの仕掛けがソースから消えたら落ちる:
+    ///
+    /// 1. GPUI の自動終了を止め、方針を tako が持つ（`QuitMode::Explicit` +
+    ///    `platform::window_lifecycle`）
+    /// 2. ウィンドウが閉じた瞬間を必ず記録する（`on_window_closed` → `viewport_closed_log`）
+    #[test]
+    fn ウィンドウ0枚の終了は方針と診断を持つ() {
+        let text = source("src/main.rs");
+        assert!(
+            text.contains("cx.set_quit_mode(gpui::QuitMode::Explicit)"),
+            "QuitMode::Explicit の指定が消えている。GPUI の既定は非 macOS で             「窓 0 枚 = ExitProcess(0)」なので、内部都合の 0 枚でも             **診断を 1 行も残さずプロセスが消える**（#872）"
+        );
+        assert!(
+            text.contains("cx.on_window_closed("),
+            "on_window_closed の診断が消えている。0 枚になった瞬間の記録が無いと             「静かに死んだ」の切り分けができない（#872）"
+        );
+        assert!(
+            text.contains("window_lifecycle::last_window_close_here()"),
+            "最後のウィンドウの扱いが window_lifecycle 経由でなくなっている。             方針を UI ツールキットの既定に戻すと #872 が再発する"
+        );
+    }
+
+    #[test]
+    fn ウィンドウclose診断は0枚を名指しする() {
+        use crate::viewport_closed_log;
+        use tako_core::platform::support::Platform;
+        use tako_core::platform::window_lifecycle::{last_window_close, LastWindowClose};
+        // 論理ウィンドウ数が取れないときも「?」で必ず 1 行出す
+        let zero = viewport_closed_log(
+            gpui::WindowId::default(),
+            0,
+            None,
+            last_window_close(Platform::Windows),
+        );
+        assert!(zero.contains("残り gpui=0"), "0 枚が読み取れない: {zero}");
+        assert!(zero.contains("#872"), "追跡番号が無い: {zero}");
+        assert!(
+            zero.contains(LastWindowClose::Quit.reason()),
+            "方針の理由が入っていない: {zero}"
+        );
+        assert!(zero.contains("論理=?"), "論理不明が表せていない: {zero}");
+        // 残っているときは方針を書かない（毎 close でノイズにしない）
+        let some = viewport_closed_log(
+            gpui::WindowId::default(),
+            2,
+            Some(3),
+            last_window_close(Platform::MacOs),
+        );
+        assert!(some.contains("残り gpui=2"), "枚数が読めない: {some}");
+        assert!(some.contains("論理=3"), "論理枚数が読めない: {some}");
+        assert!(!some.contains("#872"), "0 枚でないのに警告している: {some}");
     }
 }
 

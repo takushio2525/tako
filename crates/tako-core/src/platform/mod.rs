@@ -24,3 +24,4 @@ pub mod release_assets;
 pub mod shell;
 pub mod shell_dialect;
 pub mod support;
+pub mod window_lifecycle;
