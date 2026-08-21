@@ -2310,3 +2310,23 @@
   検出力は番犬 4 通りの revert で実測
 - 関連コミット: `c41144a`（PR #857）。副産物 **#858 起票**（項目 110 = #803 が高負荷でフレーク。
   load 10.16 で `(body +2 header +2)`、低負荷で期待値 `+1/+0`）
+
+## 2026-08-21（#858: セルフテスト項目 110（#803）の高負荷フレークを根治）
+- 原因は #803 の実装ではなく**測り方**。`pane_*_renders` はアプリ全体のカウンタなので、
+  測る窓にアプリ全体を汚す `cx.notify()`（2 秒 tick 等）が挟まると可視ペイン全部が
+  描き直り `body +2 header +2` = 「意図的な全体 notify」と同じ数字になる
+  （製品の回帰と区別が付かない）。窓に入り得る汚れは 3 通り: 外から来る全体 notify /
+  `term_pending_app` の持ち越し / ヘッダの時計（`flush_term_redraw` は
+  `tick_pane_header_clocks` を最初に呼ぶ。1 秒に 1 回）
+- 直し方: 時計と持ち越しは測る前に窓の外へ出し、外から来る汚れは
+  **`chrome_renders`（#786 のクローム 4 枚）が動いたか**で検出してやり直す
+  （上限 5 回・各試行を記録・全滅なら FAILED）。可視ペインの枚数に依らない判定
+- 実測: 負荷だけでは再現しなかった（load 11〜29 で 3 回とも PASS。`clock_age_ms` は
+  221 / 382 で時計は不発）ため、汚れを注入する env で決定的にした。
+  `TAKO_858_NO_WINDOW_GUARD=1 TAKO_858_INJECT=app` = **報告と同一の
+  `output=(body +2 header +2)` で FAILED**（`chrome=+2` が発生源を名指し）→
+  `TAKO_858_INJECT=app` のみ = attempt 1 汚れ → attempt 2 清浄で PASS + 完走
+- 検出力: `TAKO_858_INJECT=header`（窓は清浄・ヘッダだけ +1）で FAILED = やり直しが
+  本物の回帰を隠さない。plain 2 回（load 15〜17）も PASS + `TAKO_APP_SELF_TEST_OK`
+- 関連: PR（`Refs #858`）。診断カウンタ 3 本（`term_app_notifies` /
+  `pane_body_notify_fallbacks` / `header_clock_ticks`）を追加
