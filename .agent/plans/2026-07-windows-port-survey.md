@@ -240,6 +240,9 @@ CI は現在 disabled_manually のため、P0 の前提として「CI の再有�
 - P1〜P2 は並行可能な部分が多い（IPC と シェル統合は独立）
 - 動画プレビュー（AVFoundation 36 箇所）と PDF（PDFKit）は「Windows では当面未対応」を
   明示する選択肢があり、その場合 P4 は楽観側に寄る（-5〜10 worker-日）
+  → **#521 で両方とも OS 標準 API で実装したので、この選択肢は使っていない**
+  （PDF = `Windows.Data.Pdf` / 動画 = Media Foundation の `IMFMediaEngine`）。
+  現在の正は `2026-07-windows-port-architecture.md` の B12 行
 - CI 停止が続く場合の代替検証手段: ローカル Windows VM での `cargo build/test` +
   `TAKO_SELF_TEST=1` 起動（セルフテストは GUI 実画面で機械検証する設計のため VM で有効）
 

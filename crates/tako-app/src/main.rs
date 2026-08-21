@@ -1024,7 +1024,8 @@ struct TakoApp {
     pinned_previews: Vec<PinnedPreview>,
     /// ドラッグ移動中のピン（対象 + 掴んだ位置からピン左上までのオフセット px）
     dragging_pin: Option<(PreviewTarget, Point<Pixels>)>,
-    /// AVFoundation 動画プレイヤー（ペインごと。Video プレビューで「再生」した時に生成）
+    /// 動画プレイヤー（ペインごと。Video プレビューで「再生」した時に生成）。
+    /// 実体は OS ごとに違う（macOS = AVFoundation / Windows = Media Foundation。境界 B12。#521）
     video_players: HashMap<PaneId, video_player::VideoPlayer>,
     /// 動画フレーム更新ティッカーの稼働中フラグ（再生中ペインがある間だけ回す）
     video_ticker: bool,

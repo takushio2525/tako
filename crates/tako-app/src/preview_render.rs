@@ -1387,7 +1387,9 @@ impl TakoApp {
                     let mut elements: Vec<gpui::AnyElement> = Vec::new();
 
                     if let Some(player) = self.video_players.get(&pane_id) {
-                        // AVFoundation プレイヤー起動中: キャッシュ済みフレームを表示
+                        // プレイヤー起動中: キャッシュ済みフレームを表示。フレームがまだ
+                        // 来ていなければ操作 UI だけ出る（Windows は読み込みが非同期なので
+                        // 開いた直後がこの状態になる。#521）
                         let gen = player.frame_gen;
                         let need_update = match self.video_frame_cache.get(&pane_id) {
                             Some((cached_gen, _)) => *cached_gen != gen,
