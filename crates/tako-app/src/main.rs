@@ -35988,8 +35988,12 @@ mod self_test {
                 // 69c. ターミナルリンク（#153）: 実 PTY に絶対 / ~/ / cwd 相対パスを表示し、
                 //      画面スナップショットからの検出と cmd+クリック相当の MouseDown を通す。
                 //      ファイルは OpenFile プレビュー、ディレクトリは Split + PTY 起動まで実測する。
-                let link_dir =
-                    std::env::temp_dir().join(format!("tako-selftest-link-{}", std::process::id()));
+                // ここは POSIX 形のパスを持つ環境限定（上の `MAIN_SEPARATOR` ゲート）なので
+                // **短い実パス**を使う。`std::env::temp_dir()`（macOS は
+                // `/var/folders/…/T`）にすると印字するパスが 90 文字級になり、
+                // 狭いペインで折り返してリンク検出とクリック座標が壊れる（実測）
+                let link_dir = std::path::PathBuf::from("/private/tmp")
+                    .join(format!("tako-selftest-link-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&link_dir);
                 std::fs::create_dir_all(link_dir.join("sub"))
                     .expect("リンク用一時ディレクトリを作れる");
@@ -47966,6 +47970,10 @@ fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     tako_core::git::repo_root(dir)
 }
 
+/// POSIX シェルへ渡すパスのクオート。残った呼び出しは `#[cfg(unix)]` の項目と
+/// visual-test 限定の検証コードだけなので、Windows 向けビルドでは未使用になる
+/// （#865 で項目 69c を `platform::shell_dialect` 経由へ寄せたため）
+#[cfg_attr(not(unix), allow(dead_code))]
 fn shell_escape(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     if s.contains(|c: char| c.is_whitespace() || "\"'\\$`!#&|;(){}[]<>?*~".contains(c)) {

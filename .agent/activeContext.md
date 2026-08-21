@@ -5,46 +5,35 @@
 
 ## 現在の対象（2026-08-21）
 
-- **#868（tako setup のゼロスタート対応）を PR #871 で提出**。claude 未導入の環境から
-  `tako setup` 一発で インストール → PATH 通し → 認証誘導 → 対話起動まで通る
-- 並行して **#467 Windows 移植**がスライス 7c まで進んでいる（残りはスライス 8 = 棚卸し）。
-  **#867（起動コマンドの env 前置きをシェル方言へ）は PR #874**: これで Windows 実機で
-  `orchestrator spawn` から **claude が実際に起動してプロンプトに応答する**ところまで通った
-  （`$env:TAKO_ORCHESTRATOR_ROLE='...'; claude --effort max` を生成。実プロセスの環境に
-  role が届いていることを PEB 読み出しで確認）
+- **#467 Windows 移植はスライス 1〜7c / 9 が main へ入り、残りはスライス 8（棚卸し）だけ**
+- **#865（セルフテストの方言対応）を merge**。Windows 実機のセルフテストが
+  **項目 0〜92 まで到達**（修正前は項目 1b で FAILED = カバレッジ 0）。
+  到達範囲表がそのまま棚卸しの材料になる
+- #867（起動コマンドの env 前置き）も merge 済み。**判定が 2 本（`ShellDialect` /
+  `LaunchSyntax`）並んでいるので #873 で一本化する**（#867 の worker が担当）
 
-## #868 で入れたもの
+## #865 で入れたもの
 
-- 境界 **B17**（`platform::agent_install`）= 公式インストール手順を `Platform` 引数の
-  純粋関数で持つ。macOS 上から Windows 向けの内容も検証できる
-- `shell_profile` = PATH ブロックの冪等な読み書き。**書き先はログインシェルの profile**
-  （zsh = `.zprofile`）。`$SHELL -l -c` が `.zshrc` を読まないため、公式 docs の案内
-  （`.zshrc`）に従うと tako が自分で入れた CLI を見つけられない（実測で確定）
-- `text_block` = マーカーブロックの規則（区切り改行 1 個・元バイト列への完全復帰）を集約。
-  `shell_integration` の PowerShell 実装もここへ委譲
-- `setup_bootstrap`（tako-control）= いまどの段か（install / path / auth / ready）を判定して実行
-- 1:1 公開: `tako setup bootstrap` / MCP `tako_setup_bootstrap`（137 ツール）
-
-## #867 で入れたもの（スライス 7c）
-
-- `tako-control::launch_cmd` = 起動コマンドの env 前置きとクォートを構文別に組み立てる。
-  `LaunchSyntax::for_program` は純粋関数なので macOS から PowerShell 側を全分岐テストできる
-- **5 フローが 3 関数に集約**されていた（`build_worker_cmd` / `build_master_cmd` /
-  `resume_env_prefix_for`）。各関数に構文を明示する `*_in` 版がある
-- macOS は 1 バイトも不変。そのためクォートは `quote`（必要なときだけ）と
-  `quote_always`（常に）の 2 系統
+- `platform::shell_dialect`（境界）= ペインへ**打ち込む文字列**の方言差。方言は OS ではなく
+  `default_shell()` が選んだプログラムから引く純粋関数なので、macOS から PowerShell 側の
+  生成結果を全部テストできる。`cmd.exe` / fish は `None`（呼び出し側が対象外を明示）
+- セルフテストは「機能が無い項目」を能力で明示スキップ（`pdf::capabilities().text_layer` /
+  `shell_integration::status().effective()` / 本物の tmux か / `MAIN_SEPARATOR`）。
+  **直れば自動で検証が復活する**形
+- 起票: #866（psmux の `=name`）/ #870（links の HOME 決め打ち）/ #872（2 枚目の
+  ウィンドウで静かに終了）/ #875（実行ペインの `/bin/sh` 決め打ち）。#724 へ panic 位置を追記
 
 ## 次の一手
 
-- PR #871 の CI 緑を確認 → squash merge → #868 クローズ → #525 へ境界の申し送り
-- **#873**（`LaunchSyntax` と `platform::shell_dialect` の方言判定の一本化。#865 merge 後）
-- **#875**（`spawn_command_pane` の `/bin/sh -c` 決め打ちで Windows では PTY が立たない =
-  #666 のカード実行と #453 の Code Runner が死んでいる）
-- `build-app.sh --install` は**未実施**（本番 GUI 稼働中のため master へ申し送り）
-- #868 の残り: 実ブラウザでのログイン完走は未実測（実アカウントに触れるため手前まで）。
-  Windows の実行代行は #525
+- **スライス 8（棚卸し）**: #865 の到達範囲表を使って `tako_theme` / `tako_open_file` /
+  `tako_preview_view` 等を `Pending` から実測に合わせて倒す（セルフテストが実機で通している）。
+  `tako_orchestrator_watch` を倒す前に `claude agents --json` の `$SHELL -l -c` 経路
+  （Windows で必ず失敗）を見る必要がある
+- 項目 93 以降を Windows で通すには **#766**（psmux 越しに OSC が届かない）が要る
+- #873（方言判定の一本化）は #867 の worker が担当
 
 ## 現フェーズで Read すべき設計書
 
-- `.agent/plans/2026-07-windows-port-architecture.md`（境界の定義。B17 を足した）
-- `.agent/plans/2026-08-windows-main-merge-wip.md`（スライス 8 の申し送り）
+- `.agent/plans/2026-08-windows-main-merge-wip.md`（「8 の前提: セルフテストの方言対応（#865）」節に
+  到達範囲・スキップ理由・実機レシピ。7c 節に #867 の記録）
+- `.agent/plans/2026-07-windows-port-architecture.md`（境界の定義）
