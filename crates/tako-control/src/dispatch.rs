@@ -3281,8 +3281,12 @@ fn dispatch_inner(
                     )
                     .to_json())
                 }
+                // 手段（macOS = sudoers 登録 / Windows = 権限不要）は `sleep_guard` 側に
+                // 閉じているので、ここは OS を意識しない単一経路にする（#697）。
+                // CLI（`tako sleep-guard install-lid-sleep`）と同じ関数を通るので
+                // 3 経路で挙動が食い違わない
                 "install-lid-sleep" => {
-                    let result = crate::sleep_guard::install_sudoers()
+                    let result = crate::sleep_guard::prepare_lid_control()
                         .map_err(DispatchError::Operation)?;
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode =
@@ -3292,11 +3296,14 @@ fn dispatch_inner(
                     Ok(serde_json::json!({
                         "result": result,
                         "lid_sleep_mode": "while-agents-running",
-                        "sudoers_installed": true,
+                        // 手段が sudoers ではない OS もあるので、実態を読んで返す
+                        // （固定の true を返すと Windows で嘘になる）
+                        "sudoers_installed": crate::sleep_guard::is_sudoers_installed(),
+                        "lid_setup_required": crate::sleep_guard::lid_setup_pending(),
                     }))
                 }
                 "remove-lid-sleep" => {
-                    let result = crate::sleep_guard::remove_sudoers()
+                    let result = crate::sleep_guard::teardown_lid_control()
                         .map_err(DispatchError::Operation)?;
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
@@ -3305,7 +3312,7 @@ fn dispatch_inner(
                     Ok(serde_json::json!({
                         "result": result,
                         "lid_sleep_mode": "off",
-                        "sudoers_installed": false,
+                        "sudoers_installed": crate::sleep_guard::is_sudoers_installed(),
                     }))
                 }
                 "open-battery-settings" => {

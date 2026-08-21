@@ -8,12 +8,38 @@
 //! ここに境界を追加する。
 
 pub mod facts;
+/// 蓋を閉じたまま実行を継続する制御（境界 B9 の蓋ぶん。#697）
+pub mod lid;
 pub mod local_endpoint;
 /// Layer 1 IPC の Windows トランスポート（named pipe。境界 B3）
 #[cfg(windows)]
 pub mod named_pipe;
 pub mod os_integration;
+/// アイドルスリープ防止（境界 B9。macOS 以外。#524）
+pub mod power;
 pub mod process;
+
+/// テスト専用: **機械全体で 1 つしかない状態**を触るテストを直列化する錠。
+///
+/// 電源要求の保持（`power`）・電源プランの蓋設定と記録キャッシュ（`lid`）・
+/// それらを束ねる `sleep_guard::update` は、どれもプロセスまたは機械の
+/// グローバル状態を書く。`cargo test` は同一バイナリのテストを並列に走らせるので、
+/// 素で並べると「相手が保持しているのに保持していないと期待する」形で確率的に落ちる
+/// （言語グローバルで実害を出した #608 と同型。規約は `.agent/conventions.md`）。
+///
+/// 使う側は**関数の先頭で**取り、後始末より長く生かす（変数は宣言と逆順に落ちる）。
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::{Mutex, MutexGuard};
+
+    static MACHINE_STATE: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn machine_state_lock() -> MutexGuard<'static, ()> {
+        MACHINE_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 use serde_json::{json, Value};
 use tako_core::platform::support::{self, Note, Platform};
