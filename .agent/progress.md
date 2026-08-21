@@ -2493,3 +2493,23 @@
   macOS は fmt / clippy（visual-test 有無）/ test 2386 passed / クロスチェック警告が main と一致
 - 関連: PR #879（`Refs #875, #467`）
 
+## 2026-08-21（#877: agents 走査の Windows 対応 — tako 自身がシェルを起こす経路）
+- `claude agents --json` の走査が `$SHELL -l -c` 直書きで Windows では必ず失敗し、worker の状態が
+  agents 経由で取れていなかったのを、抽象境界 **B21（`platform::child_cmd`）** 新設で根治。
+  unix は従来どおりログインシェル経由（**1 バイトも変えない**）、Windows は `platform::exe::find`
+  （B16）で解決した実体を**直接起動**（rc が無いので env 前置きが要らず `Command::env` で確定）。
+  走査コマンドは `AGENTS_SCAN_ARGV` 1 か所から「シェル片」と「argv」の両形を作るのでずれない
+- **実機で 2 通りとも壊れていた**: `SHELL` 未設定（= GUI 起動）は `/bin/sh` へ落ちて CreateProcess
+  失敗、`SHELL=powershell.exe`（SSH の副作用）は `-l` が不明な引数で `;` の後ろだけ走る = 前置きが
+  黙って実行されない。**`SHELL` は Process スコープにしか無い**（`User`/`Machine` は空）ので
+  SSH 越しに測ると半分動いて見える → 作法へ「`Remove-Item Env:SHELL` を先に打つ」を追記
+- 実測（Windows 11 / claude 2.1.238 / psmux 3.3.7）: `tako remote agents` が `exit 1` → `exit 0` +
+  実エージェント 1 件 / `query_agent_status -> status="idle"`（= `status_source` agents）/
+  `resolve_session_id_for_backend -> Some(...)`（= agents-auto）/ 同一 e2e を main に当てると FAILED /
+  実機テスト **22 failed で失敗テスト名まで main と IDENTICAL**（新規ゼロ）
+- 収穫 2 件: **claude は認証切れ（`Not logged in`）でも `agents --json` に載る** = 認証が無い実機でも
+  エージェント監視系を検証できる / **器（psmux）越しのペイン対応付けは元から効いていた**
+  （`psmux -u -L tako` で作れば `tmux -L tako list-panes -a` が接頭辞なしの素の名前で返る）
+- 検証: fmt / clippy（両 feature）/ test 2397 passed / 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` /
+  クロスチェックの警告リストが main と完全一致。#875 merge 後に rebase して全ゲート再走
+- 関連: PR #882（`Refs #877, #467`）。**残りはスライス 8（棚卸し）だけ**
