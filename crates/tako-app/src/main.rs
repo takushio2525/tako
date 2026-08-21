@@ -37621,14 +37621,9 @@ mod self_test {
                         match app.terminals.get(&pane) {
                             Some(s) => {
                                 // 直前の項目が打ちかけた入力が残っていることがあるので
-                                // 行を捨ててから送る。sleep で保持しないと、
-                                // コマンド終了後のプロンプト再描画でカーソルが戻る。
-                                // **Ctrl+C（0x03）は POSIX だけ**: ConPTY へ書くと
-                                // CTRL_C_EVENT がコンソールに配られるため、ホスト側
-                                // （tako 自身）まで飛ぶ疑いがある（#865 で切り分け中）
-                                if sh.is_posix() {
-                                    s.write(b"\x03".to_vec());
-                                }
+                                // Ctrl-C で行を捨ててから送る。sleep で保持しないと、
+                                // コマンド終了後のプロンプト再描画でカーソルが戻る
+                                s.write(b"\x03".to_vec());
                                 s.write(
                                     format!(
                                         "{}\r",
@@ -37728,6 +37723,7 @@ mod self_test {
                     (app.workspace.windows().len(), cx.windows().len())
                 })
                 .unwrap_or((0, 0));
+            println!("TAKO_SELF_TEST_77: 開始 windows={win_before:?}");
             let new_ok = window
                 .update(cx, |app, _, cx| {
                     let r = tako_control::dispatch(
