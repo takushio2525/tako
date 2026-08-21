@@ -1267,6 +1267,86 @@ macOS: `test --workspace` 2377 passed / 0 failed / fmt / clippy（両 feature）
 macOS: fmt / clippy（`--features visual-test` 有無とも）/ `test --workspace` **2386 passed / 0 failed** /
 `check-windows.sh --all-targets` **エラー 0・警告リストが main と完全一致**。
 
+#### 7c / #873 の続き: agents 走査の Windows 対応（#877）— ✅ **完了**（PR #882）
+
+#867 が直したのは「ペインへ**打ち込む**コマンド」で、こちらは **tako 自身がシェルを起こす経路**。
+`claude agents --json` の走査が `$SHELL -l -c <シェル片>` の直書きで、Windows では必ず失敗していた。
+
+##### 実機で 2 通りとも壊れていた（修正前）
+
+| プロセス env | 結果 |
+|---|---|
+| `SHELL` 未設定（**GUI 起動と同じ状態**） | `/bin/sh` へ落ちて `CreateProcess: The system cannot find the file specified` → `tako remote agents` が `exit 1` |
+| `SHELL=powershell.exe`（SSH セッションの副作用） | `-l : The term '-l' is not recognized…`。`;` の後ろの `claude agents --json` だけがたまたま走るので**前置き（`unset` / `export`）が黙って実行されない** |
+
+`SHELL` は **Process スコープにしか無い**（`[Environment]::GetEnvironmentVariable("SHELL","User")` /
+`"Machine"` はどちらも空）。SSH セッションが持っているだけで GUI 起動の `tako.exe` には渡らないので、
+実運用は上の行 = 全滅側。**「SSH で測ると動いているように見える」罠**なので、以後この一族を
+測るときは `Remove-Item Env:SHELL` を先に打つこと。
+
+##### 入れたもの
+
+抽象境界 **B21（`tako_core::platform::child_cmd`）**。「tako 自身がユーザーの環境で CLI を
+1 回走らせる」形だけを持つ。ペインの PTY（B1 = `platform::shell`）とは別物なので独立させた
+（#875 が `shell.rs` を大改修中だったのでコンフリクトもゼロ）。
+
+| | 形 | 理由 |
+|---|---|---|
+| unix | `<$SHELL> -l -c <シェル片>`（**従来と 1 バイトも同じ**） | `.app` を Dock から起動すると PATH が最小構成になり Homebrew / npm 導入の CLI が見つからない |
+| Windows | `platform::exe::find`（B16）で解決した実体を直接起動 | `SHELL` も `-l -c` も無い。**rc に相当するものが無いので env 前置きが要らず**、`Command::env` / `env_remove` だけで確定する |
+
+- 走査コマンドは `AGENTS_SCAN_ARGV` の 1 か所から「POSIX シェル片」と「argv」の両形を作る
+  （片方だけ直すずれが構造的に起きない）
+- `diag::flow_log`（`TAKO_FLOW_DIAG=1`）へ失敗理由の**分類だけ**を出す。呼び出し側は
+  CLI 未検出 / spawn 失敗 / claude の異常終了（認証切れ等）のどれも同じ `None` になるので、
+  ログが無いと切り分けられなかった。claude の出力そのものは載せない（AGENTS.md の絶対ルール）
+
+##### 実機実測（`ssh win`。GUI 不要 = `tako remote agents` は daemon も GUI も要らない）
+
+| 観測 | main `c8c9fbb` | 本 PR |
+|---|---|---|
+| `tako remote agents`（`SHELL` 無し） | `exit 1` / `error: claude agents --json の実行に失敗（…）` | `exit 0` / 稼働中の claude を 1 件返す |
+| e2e `issue877_agents_scan_e2e`（同一ファイルを両 HEAD へ当てた A/B） | **FAILED** | **ok**（`query_agent_status(…) -> status="idle"`） |
+| `agents-auto`（`resolve_session_id_for_backend`） | — | **成立** — `器のペイン一覧（socket=tako）: [("tako-s877probe:0.0", 24536)]` → `resolve_session_id_for_backend(tako-s877probe) -> Some("cd75581b-…")` |
+| `flow_log`（claude を PATH から外した状態） | — | `agents 走査: claude の実体を解決できない（PATH に無い）`。正常時は 1 行も書かない |
+| `cargo test --workspace --no-fail-fast` | 22 failed | **22 failed（失敗テスト名まで完全一致 = 新規ゼロ）** |
+
+**認証は要らない**: 実測で claude は `Not logged in · Run /login` の TUI でも
+`agents --json` に `status: idle` で載る（この機の claude はログイン期限切れのまま）。
+`kind: interactive` / `sessionId` / `pid` も全部入る。
+
+**器（psmux）越しでもペイン対応付けが効く**のが分かったのも収穫。`psmux -u -L tako new-session`
+で作ったセッションは `tmux -L tako list-panes -a -F "#{session_name}…"` で
+**接頭辞なしの素の名前**（`tako-s877probe:0.0`）で返るので、`agents::tmux_pane_pids` /
+`resolve_session_id_for_backend` の `starts_with("<session>:")` がそのまま通る。
+（`-L` を落として作ったセッションは `-L tako` から見えない = 名前空間が分かれる。
+測るときは tako と同じ `-u -L tako` で作ること）
+
+##### 検出力
+
+| 戻し方 | 落ちるもの |
+|---|---|
+| オーケストレーション層へ `var("SHELL")` を再導入 | 番犬テスト `agents走査がposixシェルの直起動へ戻っていない`（`mod.rs:2387` を名指し。実測済み） |
+| 走査を main の実装へ戻す | Windows 実機の `issue877_agents_scan_e2e`（実測済み） |
+| Windows 側を POSIX シェル経由へ倒す | `windowsの実機ではposixシェルを経由しない`（`#[cfg(windows)]`） |
+| unix 側を直接起動へ倒す | `unixの実機ではログインシェル経由になる`（`#[cfg(unix)]`） |
+| POSIX 前置きの文字列を変える | `agents走査のposix前置きは従来と同一で環境変数も同時に指定する` |
+
+##### #877 が残した宿題
+
+- **同型の一族は手つかず**（スライス 8 / #875 の対象）。`$SHELL -l -c` を直書きしている残りは
+  `platform::exe`（B16 の unix 実装。境界の内側なので正）/ `tako-core/src/lib.rs` /
+  `tako-app/src/autorename.rs` / `tako-app/src/preview.rs` /
+  `tako-control/src/config_share/env.rs` / `tako-control/src/setup_bootstrap.rs`。
+  **どれも B21 へ寄せられる形**（`user_env_cli` に `command -v <name>` 相当を渡すだけ）
+- **マトリクスは 1 件も動かしていない**（作法 4）。`tako_orchestrator_watch` /
+  `tako_orchestrator_worker_status` を Supported / Degraded へ倒すのはスライス 8。
+  ただし材料は揃った: 走査・`query_agent_status`・`agents-auto` の 3 段が実機で通る
+- `worker_status` / `watch` の**応答 JSON まで**（IPC + dispatch 込み）は GUI が要るので未実測。
+  実測したのは走査 →`query_agent_status`（`status_source = agents`）→
+  `resolve_session_id_for_backend`（`status_source = agents-auto`）の 3 段で、
+  そこから応答 JSON までの間は macOS のユニットが固めている純ロジックだけ
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
@@ -1358,8 +1438,8 @@ CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 
 
 main の到達点: `be55553`（1）→ `7cf97cb`（2a）→ `2947a19`（2b）→ `e947524`（3）→
 `83bbdc0`（6）→ `015ef6d`（4）→ PR #860（5）→ PR #863（9）→ PR #855（7）。
-**残りはスライス 8（棚卸し）だけ**（7b = PR #869 / 7c = PR #874 で完了）。
-8 は 1〜7b のすべてに依存するので最後。
+**残りはスライス 8（棚卸し）だけ**（7b = PR #869 / 7c = PR #874 / 7c の後始末 = PR #878 /
+agents 走査 = PR #882 で完了）。8 は 1〜7b のすべてに依存するので最後。
 
 **スライス 5 が残した宿題**: ①実機セルフテストが項目 2（`TERM / COLORTERM 注入`）で止まるので
 **スライス 7 完了後に通しで回す**こと → **スライス 7 完了時に実施済み（結果は 7 の完了記録）**
@@ -1430,7 +1510,15 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
     「動いている環境」を見るようにすると、それを呼ぶスナップショットテストが
     その場で決め打ちに化ける（実機で 22 件）。**環境を引数で受け取る `*_in` 版を分け、
     テストはそちらを呼ぶ**のが型。macOS のゲートは最後まで緑なので実機でしか出ない
-12. **GUI を実機で見るには `schtasks /it`**。SSH セッションは session 0（サービス）で、
+12. **`$SHELL` を材料にするコードを SSH 越しに測ると「動いている」ように見える**（#877 で踏んだ）。
+   このマシンの `SHELL` は **Process スコープにしか無い**（`User` / `Machine` はどちらも空）ので
+   SSH セッションだけが持っている。GUI 起動の `tako.exe` には渡らないため、
+   `Remove-Item Env:SHELL` を先に打たないと**壊れている経路が通ってしまう**
+   （`SHELL=powershell.exe` のとき `-l -c "<前置き>; claude agents --json"` は前半が失敗して
+   `;` の後ろだけ走る = 半分だけ動く）。実機で env 依存を測るときは
+   **GUI 起動時の env を再現してから**測る
+
+13. **GUI を実機で見るには `schtasks /it`**。SSH セッションは session 0（サービス）で、
     そこから起動したウィンドウは session 1 の対話デスクトップに出ず、`EnumWindows` からも見えない。
     `schtasks /create ... /it /rl highest` + `/run` で session 1 へ投げる。スクリーンショットと
     座標操作をするスクリプトは冒頭で `SetProcessDPIAware()` を呼ぶ（呼ばないと座標が仮想化されて
@@ -1440,22 +1528,38 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
 
 #### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
 
+**最新の実測は main `c8c9fbb`（#877 の A/B で取った。所要 561 秒 / `-j 2`）**:
+
 | スイート | 結果 |
 |---|---|
-| `tako-app` / `tako-cli` | **440**/**0** / 53/**0**（スライス 5 で +13） |
-| `tako-control` (lib) | 955 / **25 failed** |
-| `tako-core` (lib) | 668 / **5 failed** |
-| `platform_parity` | **11** / 0 |
+| `tako-app` (lib) | 445 / **0** |
+| `tako-cli` (lib) | 53 / **0** |
+| `tako-control` (lib) | 1025 / **15 failed** |
+| `tako-core` (lib) | 766 / **7 failed** |
+| `platform_parity` | **12** / 0 |
 | `encoding_conpty` | 5 / 0 |
 | `psmux_backend` | 16 / 0 |
+| `shell_integration_powershell` | 6 / 0 |
 
-**失敗 30 件はすべて main 由来**（#583 の既知 18 + 以降 main へ増えた同系 7 + tako-core 5）。
-スライス 4 の実測でも **30 件のまま**（tako-control 25 / tako-core 5）で新規ゼロ。
-内訳と根拠は #583 の 2026-08-21 のコメント。スライスごとにこの表と突き合わせ、
+**失敗 22 件はすべて main 由来**（#583 の既知分 + 以降 main へ増えた同系。#867 / #873 の実測と同数）。
+#877 では branch / main の両方でスイートを回し、**失敗テスト名まで `Compare-Object` で
+完全一致（IDENTICAL）** を確認した = 新規ゼロ。スライスごとにこの表と突き合わせ、
 増減があれば `TAKO_BACKEND=none` 等で「自分の変更が原因か」を切り分けてから報告する。
+**件数だけでなく名前で突き合わせる**のが確実（同数のまま入れ替わることがある）:
 
-macOS 側のベースライン: `test --workspace` **2228 passed / 0 failed**（スライス 5 後。4 + 6 統合時点は 2217）/
-visual-test **98 checkpoint** / クロスチェック **エラー 0・警告 10**。
+```powershell
+# ログから失敗名を抜いて比較する（両 HEAD で同じことをする）
+$fails = @(); $in = $false
+foreach ($l in (Get-Content <log> -Encoding UTF8)) {
+  if ($l -match "^failures:$") { $in = $true; continue }
+  if ($in) { if ($l -match "^\s{4}(\S.*)$") { $fails += $Matches[1] } elseif ($l.Trim() -ne "") { $in = $false } }
+}
+Compare-Object $branchFails ($fails | Sort-Object -Unique)
+```
+
+macOS 側のベースライン: `test --workspace` **2386 passed / 0 failed**（#877 時点。
+スライス 5 後は 2228、#873 時点は 2377）/ visual-test **98 checkpoint** /
+クロスチェック **エラー 0・警告 10**。
 
 ### 持ち込まないもの（今回の裁定で確定）
 

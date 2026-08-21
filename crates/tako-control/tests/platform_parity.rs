@@ -385,6 +385,36 @@ fn collect_os_shell_calls(
     }
 }
 
+/// **#877 の番犬**: エージェント走査（`claude agents --json`）が、tako 自身で
+/// POSIX シェルを起こす形へ戻っていないこと。
+///
+/// `$SHELL -l -c <シェル片>` は Windows で必ず失敗する（実測: `SHELL` 未設定なら
+/// `/bin/sh` へ落ちて `CreateProcess` が「指定されたファイルが見つかりません」、
+/// `SHELL=powershell.exe` でも `-l : The term '-l' is not recognized`）。
+/// 走査は抽象境界 B21（`tako_core::platform::child_cmd`）を通すのが正で、
+/// Windows は PATH で解決した実体を直接起動する。
+///
+/// **macOS のゲートは倒しても全部緑になる**ので、ソース走査で塞いでおく
+/// （同型の一族は #875 / スライス 8 の棚卸しが対象。ここはオーケストレーション層だけを見る）
+#[test]
+fn agents走査がposixシェルの直起動へ戻っていない() {
+    const PATTERNS: &[&str] = &["\"-l\", \"-c\"", "var(\"SHELL\")"];
+
+    let dir = repo_root()
+        .join("crates")
+        .join("tako-control")
+        .join("src")
+        .join("orchestrator");
+    let mut offenders = Vec::new();
+    collect_os_shell_calls(&dir, &repo_root(), PATTERNS, &[], &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "オーケストレーション層に POSIX シェルの直起動が残っている:\n  {}\n\
+         → tako_core::platform::child_cmd::user_env_cli へ寄せてください（#877 / 境界 B21）",
+        offenders.join("\n  ")
+    );
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///
