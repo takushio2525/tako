@@ -2417,3 +2417,28 @@
   導入済みの無回帰）。品質ゲート全緑（test 2339）+ 隔離セルフテスト項目 119 新設
 - 関連: PR #871（`Refs #868`）
 - 次: CI 緑 → merge → #525 へ境界の申し送り。`build-app.sh --install` は master 判断
+
+## 2026-08-21（#867 スライス 7c: 起動コマンドの env 前置きをシェル方言へ）
+- 7b で送達は直ったが**届いた命令が PowerShell 構文でなく**エージェントが起動しなかった問題を
+  根治。`tako-control::launch_cmd` を新設し env 前置き（`$env:K='v';` /
+  `Remove-Item -LiteralPath 'Env:K' -EA SilentlyContinue;`）とクォート（`''` 二重化）と
+  `$(cat)` → `$(Get-Content -Raw)` を構文別に集約。**5 フローが 3 関数に集約されていた**
+  （`build_worker_cmd` = spawn / git resolve、`build_master_cmd` = master / solo / handoff、
+  `resume_env_prefix_for` = sessions resume / resume_command）
+- **#865 との調整**: 当初「相手の merge を待って後乗り」で合意したが見込みが 1.5 時間超過し、
+  その間も相手のファイルが育っていたため**依存を切って先行**（相手のファイルへの差分ゼロ =
+  コンフリクト構造的にゼロ）。判定が 2 本になる件は **#873 で一本化を起票**、相手も合意
+- 実機実測: 生成コマンドが `$env:TAKO_ORCHESTRATOR_ROLE='worker:p867'; claude --effort max`
+  → **claude の TUI 起動を確認・プロンプト到達・応答**（`Login expired` = この機の
+  ログイン期限切れなので中身の回答までは未確認）→ **claude.exe の PEB を読んで
+  `TAKO_ORCHESTRATOR_ROLE=worker:p867` が実プロセスへ届いたことまで確認**
+- macOS は 1 バイトも不変（既存スナップショットが担保。そのためクォートを `quote` /
+  `quote_always` の 2 系統に分けた）。既定版が「動いているシェル」を見るようになった副作用で
+  POSIX 決め打ちのテストが実機で 22 件落ちたので、構文明示版 `*_in` を呼ぶ形へ 28 箇所寄せた
+- 検証: macOS `test --workspace` **2349 passed / 0 failed** / fmt / clippy（両 feature）/
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / クロスチェック**警告リストが現 main と完全一致**
+  （エラー 0）/ 実機 **22 件失敗 = 7b ベースライン 19 + #868 由来 3（新規ゼロ）**。
+  検出力はインライン前置きを旧挙動へ戻して 4 本 FAILED を実測
+- 関連コミット: PR #874（`Refs #867, #467`）
+- 次: 残りはスライス 8（棚卸し）。**#873**（判定の一本化）と、兄弟からの申し送り **#875**
+  （`spawn_command_pane` の `/bin/sh -c` 決め打ちで Code Runner / コマンドカードが Windows で死ぬ）
