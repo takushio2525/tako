@@ -35991,6 +35991,9 @@ mod self_test {
             ]);
             press(any, cx, sh.clear_line_key());
             type_text(any, cx, &link_command, true);
+            // cwd 追従（OSC 7）が効かない環境（器が素通ししない / 統合が未配置。#525）では
+            // ペインの cwd は起動時の値のまま。画面に出たことだけを待つ
+            let link_cwd_tracked = shell_integration.effective();
             let mut link_screen_ready = false;
             for _ in 0..12 {
                 wait(cx, 300).await;
@@ -35999,7 +36002,7 @@ mod self_test {
                         app.terminals
                             .get(&app.focused_pane())
                             .is_some_and(|session| {
-                                session.cwd() == Some(link_dir.as_path())
+                                (!link_cwd_tracked || session.cwd() == Some(link_dir.as_path()))
                                     && session
                                         .visible_lines()
                                         .iter()
@@ -36042,9 +36045,28 @@ mod self_test {
                 })
                 .unwrap_or((false, false, false, false));
             check(absolute_ok, "絶対パスを実画面から検出・解決");
-            check(home_ok, "~/ 起点パスを実画面から検出・解決");
-            check(relative_ok, "cwd 相対パスを実画面から検出・解決");
-            check(cwd_ok, "リンク解決 cwd が実 PTY の OSC 7 と一致");
+            // `~` の解決は `links::dirs_hint`（`HOME` 決め打ち）が前提。Windows は
+            // `HOME` を持たないので解決できない（#870 で追跡）
+            if std::env::var_os("HOME").is_some() {
+                check(home_ok, "~/ 起点パスを実画面から検出・解決");
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 69c の ~/ 解決（この環境は HOME を持たない。\
+                     ホーム解決の一本化は #870）"
+                );
+            }
+            // 相対パスの解決とその前提（cwd 追従）は OSC 7 が届く環境だけ
+            if link_cwd_tracked {
+                check(relative_ok, "cwd 相対パスを実画面から検出・解決");
+                check(cwd_ok, "リンク解決 cwd が実 PTY の OSC 7 と一致");
+            } else {
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 69c の cwd 相対パス（シェル統合が効かない環境: \
+                     installed={} blocked={:?}）",
+                    shell_integration.installed(),
+                    shell_integration.blocked_by_backend
+                );
+            }
 
             // 任意のピクセル検証停止点。通常の self-test では待機しない。
             // 実画面の検出結果とセル座標から cmd ホバーと同じ更新関数を通し、外部の
