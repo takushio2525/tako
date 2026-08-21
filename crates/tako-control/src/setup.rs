@@ -1017,12 +1017,17 @@ mod tests {
         assert_eq!(back.setup.provider_plans["gpt"], "plus");
     }
 
+    /// 記入ルール（1 始まり・欠番なし）は**正本ファイルそのもの**に対して検証する。
+    ///
+    /// `all_changes()` は現在のプラットフォーム向けに絞り込むので、
+    /// `platforms:` 付きのエントリ（#525 の rev 15 は Windows 限定）は
+    /// **他方のプラットフォームでは欠番になるのが正しい**。絞り込み後の並びに
+    /// 連番を求めると、platforms 付きエントリの後ろに 1 件足しただけで落ちる
     #[test]
     fn embedded_changes_parse_and_monotonic() {
-        let changes = all_changes().expect("埋め込み changes.yaml はパースできること");
-        assert!(!changes.is_empty());
-        // revision は 1 始まり・単調増加・欠番なし（記入ルールの機械検証）
-        for (i, change) in changes.iter().enumerate() {
+        let all = parse_changes(CHANGES_YAML).expect("埋め込み changes.yaml はパースできること");
+        assert!(!all.is_empty());
+        for (i, change) in all.iter().enumerate() {
             assert_eq!(
                 change.revision,
                 (i + 1) as u32,
@@ -1035,20 +1040,36 @@ mod tests {
             assert!(!change.version.is_empty());
             assert!(!change.date.is_empty());
         }
+        // 絞り込み後は欠番が出てよいが、順序（単調増加）は保たれること。
+        // pending の並びと「どこまで適用したか」の比較がこれに依存している
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let list = changes_for(platform).expect("パースできること");
+            assert!(!list.is_empty(), "{platform:?} 向けが空");
+            assert!(
+                list.windows(2).all(|w| w[0].revision < w[1].revision),
+                "{platform:?} 向けの revision が単調増加でない"
+            );
+        }
     }
 
     #[test]
     fn pending_changes_filters_by_revision() {
         let current = current_revision().unwrap();
         assert!(current >= 4, "初期エントリ 4 件が存在する");
+        // 件数は「このプラットフォーム向けの件数」で数える。revision の最大値とは
+        // 一致しない（`platforms:` 付きエントリのぶん欠番が出るため）
+        let applicable = all_changes().unwrap();
         // 全適用済み → 空
         assert!(pending_changes(current).unwrap().is_empty());
         // 追従機構導入前（0）→ 全件
-        assert_eq!(pending_changes(0).unwrap().len(), current as usize);
+        assert_eq!(pending_changes(0).unwrap().len(), applicable.len());
         // 途中まで適用 → それ以降のみ
         let pending = pending_changes(2).unwrap();
         assert!(pending.iter().all(|c| c.revision > 2));
-        assert_eq!(pending.len(), (current - 2) as usize);
+        assert_eq!(
+            pending.len(),
+            applicable.iter().filter(|c| c.revision > 2).count()
+        );
     }
 
     /// `platforms:`（slice 1 で入れた機構）の**最初の実使用**が効いていること（#525）。

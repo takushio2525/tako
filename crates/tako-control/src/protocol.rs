@@ -1175,6 +1175,16 @@ pub enum Request {
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
     /// 適用自体は `tako setup`（自動適用、個別見直しは --review）が行い、これは読み取り専用
     SetupChanges,
+    /// ゼロスタート導入の状態照会と実行（Issue #868）。
+    /// `action` = "status"（既定・読み取り専用）/ "install"（エージェント CLI の導入）/
+    /// "path"（ランチャーを PATH へ通す）/ "undo-path"（置いた PATH ブロックを取り除く）
+    SetupBootstrap {
+        #[serde(default)]
+        action: Option<String>,
+        /// install で実行せず計画だけ返す
+        #[serde(default)]
+        dry_run: Option<bool>,
+    },
     /// setup を非対話実行する（Issue #262）。answers は CLI `tako setup --answers` と同じ JSON。
     SetupRun {
         #[serde(default)]
@@ -1761,6 +1771,14 @@ mod tests {
         assert_eq!(Request::List.kind_name(), "List");
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
         assert_eq!(Request::SetupRun { answers: None }.kind_name(), "SetupRun");
+        assert_eq!(
+            Request::SetupBootstrap {
+                action: None,
+                dry_run: None,
+            }
+            .kind_name(),
+            "SetupBootstrap"
+        );
         assert_eq!(Request::TmuxList { socket: None }.kind_name(), "TmuxList");
     }
 

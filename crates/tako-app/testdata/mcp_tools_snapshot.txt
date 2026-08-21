@@ -103,6 +103,7 @@ tako_sessions
 tako_set_title
 tako_settings
 tako_setup
+tako_setup_bootstrap
 tako_setup_changes
 tako_setup_mcp
 tako_shell_integration

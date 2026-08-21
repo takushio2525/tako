@@ -139,6 +139,11 @@ pub mod notes {
         "PowerShell シェル統合と setup の Windows 対応が前提",
         "Requires PowerShell shell integration and Windows support in setup",
     );
+    /// #868 / #525。状態照会と手順の提示はできるが、実行の代行は macOS だけ
+    pub const WIN_SETUP_BOOTSTRAP: Note = Note::new(
+        "状態の確認と公式手順の案内はできるが、インストールの実行代行は macOS だけ（Windows は PowerShell 版インストーラを案内する）",
+        "Status and official instructions work, but tako only runs the installer for you on macOS (on Windows it points to the PowerShell installer)",
+    );
     /// #525。配置はできるが器が OSC を落とす
     pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
         "配置はできるが psmux が OSC を外へ通さないため、cwd 追従とコマンド状態は TAKO_BACKEND=none のときだけ働く",
@@ -1184,6 +1189,17 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Pending {
             note: notes::WIN_SETUP,
             issue: 525,
+        },
+    },
+    // #868。macOS は公式 native インストーラ（install.sh）で実行まで代行する。
+    // Windows は install.sh 自身が非対応（MINGW*/MSYS*/CYGWIN* で exit 1）で、
+    // 公式手順は PowerShell の install.ps1。状態照会と手順の提示までは動くが
+    // 実行の代行は実機で確かめてから倒す（#525）
+    Feature {
+        key: "tako_setup_bootstrap",
+        macos: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_SETUP_BOOTSTRAP,
         },
     },
     Feature {

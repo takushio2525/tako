@@ -2397,3 +2397,23 @@
 - 関連コミット: PR #869（`Refs #640, #467`）
 - 次: **#867 起票**（送達は直ったが届いたコマンドが PowerShell 構文でない = `VAR=value cmd`
   の env 前置き。#640 の 4 経路と master / solo が該当）。残りはスライス 8（棚卸し）
+
+## 2026-08-21（#868: tako setup のゼロスタート対応）
+- claude 未導入の環境から `tako setup` 一発で インストール → PATH 通し → 認証誘導 →
+  対話起動まで通るようにした。導入済みなら**無言で素通り**（従来の検出型と同じ体験）。
+  境界 B17（`platform::agent_install`）+ `shell_profile` + `text_block` + `setup_bootstrap`、
+  1:1 公開は `tako setup bootstrap` / MCP `tako_setup_bootstrap`（137 ツール）
+- 経路は実物調査で確定: 公式 docs の「Native Install (Recommended)」/ Homebrew は
+  自動更新しないので採らない / install.sh は 302 先の bootstrap.sh で SHA256 自己検証 /
+  Windows は install.sh 自身が非対応 → PowerShell 経路は**データとしてだけ**持ち実行代行は #525
+- **実測で設計を変えた 2 点**: ①PATH の書き先は `.zshrc` ではなく `.zprofile`
+  （`$SHELL -l -c` = 非対話ログインシェルは `.zshrc` を読まない。公式案内どおりだと
+  tako が自分で入れた CLI を見つけられない）②Homebrew は自動導入しない
+  （インストーラが sudo でパスワードを求める。実物に sudo 参照 49 箇所）
+- 同梱で main 由来の潜在バグを修正: changelog の連番検査が**絞り込み後**の一覧を見ており、
+  `platforms:` 付きエントリ（#525 の rev 15）の後ろに 1 件足すと落ちる状態だった
+- 検証: 隔離 HOME（mktemp）+ PATH 剥ぎで実インストールまで通し実測（dry-run / 実導入 /
+  PATH 冪等 / `zsh -l -c` から開き直し無しで引ける / 再開 / 中止 / ネットワーク断 /
+  導入済みの無回帰）。品質ゲート全緑（test 2339）+ 隔離セルフテスト項目 119 新設
+- 関連: PR #871（`Refs #868`）
+- 次: CI 緑 → merge → #525 へ境界の申し送り。`build-app.sh --install` は master 判断

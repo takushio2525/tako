@@ -1,0 +1,695 @@
+//! ゼロスタート導入（#868）
+//!
+//! 「エージェント CLI を入れたことがない人」が `tako setup` 一発で始められるようにする。
+//! 検出型の setup（導入済み CLI を見つけて最適化する）の**手前**に、
+//! 導入そのものを引き受ける段を足す。
+//!
+//! ## 段（順に進む。すべて冪等で、途中から再開できる）
+//!
+//! 1. [`Step::Install`] — エージェント CLI を公式インストーラで導入する
+//! 2. [`Step::Path`] — ランチャーの置き場所をログインシェルの PATH へ通す
+//! 3. [`Step::Auth`] — `claude auth login` で認証してもらう
+//! 4. [`Step::Ready`] — 既存の検出型 setup へ引き継ぐ
+//!
+//! ## 設計の要点
+//!
+//! - **手順の正本はプラットフォーム境界**（[`tako_core::platform::agent_install`]）。
+//!   ここは「いまどの段か」を判定して実行するだけで、URL やパスを持たない
+//! - **失敗は黙って飲まない**。どの段で何が起きたかを [`BootstrapError`] の
+//!   具体的な文面にして返す（受け入れ条件 3）
+//! - **入れる前に何をどこに入れるか出す**（[`InstallPlan`]。受け入れ条件 4）
+//! - Homebrew 自体が無い場合は**案内だけ**にする。Homebrew のインストーラは
+//!   sudo でパスワードを求める（実物で確認: 2026-08-21 時点の install.sh に
+//!   sudo 参照 49 箇所・`have_sudo_access`）。setup が黙って権限昇格を走らせない
+
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use tako_core::platform::agent_install::{self, AgentKind, InstallRecipe};
+use tako_core::shell_profile::{self, PathChange, ShellKind};
+
+/// 導入の進み具合。`status()` が「次に何をすべきか」として返す
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// CLI が無い（か、あるが自動導入できないプラットフォーム）
+    Install,
+    /// CLI はあるが PATH から引けない
+    Path,
+    /// CLI はあるが未認証
+    Auth,
+    /// 検出型 setup へ進める
+    Ready,
+}
+
+impl Step {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Path => "path",
+            Self::Auth => "auth",
+            Self::Ready => "ready",
+        }
+    }
+
+    /// 利用者向けの 1 行説明
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Install => "Claude Code をインストールします",
+            Self::Path => "claude コマンドをどのターミナルからも使えるようにします",
+            Self::Auth => "Claude アカウントにログインします",
+            Self::Ready => "導入は済んでいます",
+        }
+    }
+}
+
+/// 「何をどこに入れるか」。**実行前に必ずこれを見せる**（受け入れ条件 4）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub agent: &'static str,
+    /// 公式ドキュメントに載っているコマンド（利用者が手で打っても同じ結果になる形）
+    pub official_command: String,
+    /// 取得元 URL
+    pub source_url: String,
+    /// コマンド本体の置き場所
+    pub launcher: PathBuf,
+    /// 実体（バージョンごと）の置き場所
+    pub payload: PathBuf,
+    /// バックグラウンド自動更新が効くか
+    pub auto_updates: bool,
+    /// tako が実行を代行できるか。false = 手順を案内するだけ
+    pub can_run: bool,
+}
+
+impl InstallPlan {
+    /// 表示用の行（CLI・GUI・MCP のどこから出しても同じ文面になるよう 1 か所で作る）
+    pub fn lines(&self) -> Vec<String> {
+        vec![
+            format!("実行するコマンド: {}", self.official_command),
+            format!("取得元: {}", self.source_url),
+            format!("コマンドの置き場所: {}", display_path(&self.launcher)),
+            format!("本体の置き場所: {}", display_path(&self.payload)),
+            if self.auto_updates {
+                "以後の更新: Claude Code が自分でバックグラウンド更新します".to_string()
+            } else {
+                "以後の更新: 手動で更新が必要です".to_string()
+            },
+            "sudo（管理者権限）は使いません。ホームディレクトリの中だけで完結します".to_string(),
+        ]
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "agent": self.agent,
+            "official_command": self.official_command,
+            "source_url": self.source_url,
+            "launcher": self.launcher.display().to_string(),
+            "payload": self.payload.display().to_string(),
+            "auto_updates": self.auto_updates,
+            "can_run": self.can_run,
+            "lines": self.lines(),
+        })
+    }
+}
+
+/// 依存ツール 1 件の状態（tmux 等）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepState {
+    pub bin: String,
+    pub found: Option<String>,
+    pub required: bool,
+}
+
+/// いまの導入状況
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapState {
+    pub agent: &'static str,
+    /// 解決できた実行ファイル（PATH 外のランチャーも含む）
+    pub binary: Option<String>,
+    pub authenticated: bool,
+    /// ランチャーの置き場所が PATH に入っているか
+    pub launcher_dir: PathBuf,
+    pub launcher_dir_on_path: bool,
+    /// PATH 追記の書き先（判定できないシェルなら None）
+    pub profile: Option<PathBuf>,
+    pub profile_has_block: bool,
+    pub shell: Option<ShellKind>,
+    pub step: Step,
+    pub plan: InstallPlan,
+}
+
+impl BootstrapState {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "agent": self.agent,
+            "installed": self.binary.is_some(),
+            "binary": self.binary,
+            "authenticated": self.authenticated,
+            "launcher_dir": self.launcher_dir.display().to_string(),
+            "launcher_dir_on_path": self.launcher_dir_on_path,
+            "profile": self.profile.as_ref().map(|p| p.display().to_string()),
+            "profile_has_block": self.profile_has_block,
+            "shell": self.shell.map(ShellKind::as_str),
+            "next_step": self.step.as_str(),
+            "next_step_description": self.step.describe(),
+            "install_plan": self.plan.to_json(),
+            "deps": deps_json(),
+            "homebrew": homebrew_json(),
+        })
+    }
+}
+
+/// ホームディレクトリ。**取得できない環境では何も書かない**
+fn home_dir() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "ホームディレクトリを特定できません（HOME が未設定）".to_string())
+}
+
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    match home_dir() {
+        Ok(home) => {
+            let home = home.display().to_string();
+            match text.strip_prefix(&home) {
+                Some(rest) => format!("~{rest}"),
+                None => text,
+            }
+        }
+        Err(_) => text,
+    }
+}
+
+/// この環境の手順
+pub fn recipe() -> InstallRecipe {
+    agent_install::current_recipe(AgentKind::Claude)
+}
+
+/// 「何をどこに入れるか」
+pub fn install_plan() -> Result<InstallPlan, String> {
+    let home = home_dir()?;
+    let r = recipe();
+    Ok(InstallPlan {
+        agent: r.agent.as_str(),
+        official_command: r.source.official_command.to_string(),
+        source_url: r.source.url.to_string(),
+        launcher: r.launcher_path_in(&home),
+        payload: r.payload_dir_in(&home),
+        auto_updates: r.auto_updates,
+        can_run: r.tako_can_run,
+    })
+}
+
+/// エージェント CLI を解決する。PATH に無くても**インストーラが置く場所**を見る。
+///
+/// インストール直後は profile へ書いた PATH が現プロセスにも
+/// `$SHELL -l -c` にも反映されない（シェルを開き直すまで）。ここで拾わないと
+/// 「入れたのに見つかりません」で setup が止まる
+pub fn resolve_binary() -> Option<String> {
+    let r = recipe();
+    if let Some(found) = tako_core::platform::exe::find(r.agent.as_str()) {
+        return Some(found);
+    }
+    let home = home_dir().ok()?;
+    let launcher = r.launcher_path_in(&home);
+    is_executable(&launcher).then(|| launcher.display().to_string())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// 認証済みか。`claude auth status --json` の `loggedIn` を見る。
+/// **メールアドレスや組織名は読み捨てる**（診断ログへ個人情報を出さないため）
+pub fn is_authenticated(binary: &str) -> bool {
+    let Some(output) =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(binary))
+            .args(["auth", "status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|v| v["loggedIn"].as_bool())
+        .unwrap_or(false)
+}
+
+/// ログインシェルの種別と profile
+fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
+    let home = match home_dir() {
+        Ok(home) => home,
+        Err(_) => return (None, None),
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let kind = ShellKind::from_shell_path(&shell).or_else(|| {
+        // `$SHELL` が無い（GUI から起動した .app 等）ときは OS の既定を仮定する。
+        // macOS は 10.15 以降 zsh が既定
+        (!cfg!(windows)).then_some(ShellKind::Zsh)
+    });
+    let profile = kind.map(|k| home.join(k.login_profile_rel()));
+    (kind, profile)
+}
+
+/// いまの導入状況を調べる（読み取りだけ。副作用なし）
+pub fn status() -> Result<BootstrapState, String> {
+    let home = home_dir()?;
+    let r = recipe();
+    let plan = install_plan()?;
+    let binary = resolve_binary();
+    let authenticated = binary.as_deref().is_some_and(is_authenticated);
+    let launcher_dir = r.launcher_dir_in(&home);
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    // 現プロセスの PATH だけでは `.app` の痩せた PATH を誤判定するので、
+    // ログインシェルからも引けるかを併せて見る
+    let on_path = shell_profile::path_contains(&path_var, &launcher_dir)
+        || login_shell_sees(&launcher_dir)
+        || tako_core::platform::exe::find(r.agent.as_str()).is_some();
+    let (shell, profile) = shell_target();
+    let profile_has_block = profile
+        .as_deref()
+        .is_some_and(shell_profile::profile_has_block);
+
+    let step = if binary.is_none() {
+        Step::Install
+    } else if !on_path {
+        Step::Path
+    } else if !authenticated {
+        Step::Auth
+    } else {
+        Step::Ready
+    };
+
+    Ok(BootstrapState {
+        agent: r.agent.as_str(),
+        binary,
+        authenticated,
+        launcher_dir,
+        launcher_dir_on_path: on_path,
+        profile,
+        profile_has_block,
+        shell,
+        step,
+        plan,
+    })
+}
+
+/// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）
+fn login_shell_sees(dir: &Path) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
+    let Ok(output) =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(shell))
+            .args(["-l", "-c", "printf %s \"$PATH\""])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+    else {
+        return false;
+    };
+    shell_profile::path_contains(&String::from_utf8_lossy(&output.stdout), dir)
+}
+
+// --- インストール実行 ---
+
+/// インストーラを取得して実行する。
+///
+/// 公式の 1 行（`curl … | bash`）と結果は同じだが、**取得と実行を分ける**。
+/// こうすると「取れなかった」「取れたが中身がスクリプトでない（プロキシの HTML
+/// エラーページ）」「実行が失敗した」を切り分けて具体的に報告できる。
+/// 公式のトラブルシュートにも `syntax error near unexpected token '<'` として
+/// 載っている実在の失敗モードで、パイプのままだと利用者には理由が見えない
+pub fn install(opts: InstallOptions) -> Result<Value, String> {
+    let plan = install_plan()?;
+    if opts.dry_run {
+        return Ok(json!({
+            "performed": false,
+            "reason": "dry_run",
+            "install_plan": plan.to_json(),
+        }));
+    }
+    // セルフテストは開発者の実ホームで走る（`TAKO_ISOLATED=1` が隔離するのは tako の
+    // データディレクトリだけで HOME ではない）。dry_run の扱いが将来壊れたときに
+    // **実インストールが実ホームへ走る**ことがないよう、ここで構造的に止める。
+    // 過去にテストが実環境を壊した事故があるので、経路自体を塞いでおく
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return Err(
+            "セルフテスト中は実インストールを行いません（dry_run でのみ呼べます）".to_string(),
+        );
+    }
+    if !plan.can_run {
+        return Err(format!(
+            "この環境では tako が自動インストールを代行できません。\n\
+             次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}\n\
+             （{} の自動化は Issue #525 で対応予定です）",
+            plan.official_command,
+            std::env::consts::OS
+        ));
+    }
+    let script = fetch_installer(&plan)?;
+    let result = run_installer(&script, opts.interactive);
+    // 一時ファイルは成否にかかわらず片付ける
+    let _ = std::fs::remove_file(&script);
+    let log = result?;
+
+    let binary = resolve_binary().ok_or_else(|| {
+        format!(
+            "インストーラは正常終了しましたが {} が見つかりません。\n\
+             `{}` を手で実行して、出力に出るエラーを確認してください",
+            display_path(&plan.launcher),
+            plan.official_command
+        )
+    })?;
+    Ok(json!({
+        "performed": true,
+        "binary": binary,
+        "install_plan": plan.to_json(),
+        // 対話実行では利用者が画面で見ているので空。捕捉実行では AI が診断に使える
+        "output": log,
+    }))
+}
+
+/// インストーラを一時ファイルへ取得する。取得できた中身がシェルスクリプトかまで見る
+fn fetch_installer(plan: &InstallPlan) -> Result<PathBuf, String> {
+    let downloader = tako_core::platform::exe::find("curl")
+        .map(|p| (p, true))
+        .or_else(|| tako_core::platform::exe::find("wget").map(|p| (p, false)))
+        .ok_or_else(|| {
+            "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
+             （macOS なら通常 curl が標準で入っています）"
+                .to_string()
+        })?;
+    let dest = std::env::temp_dir().join(format!("tako-claude-install-{}.sh", std::process::id()));
+    let (bin, is_curl) = downloader;
+    let mut command = std::process::Command::new(&bin);
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut command);
+    if is_curl {
+        command.args(["-fsSL", &plan.source_url, "-o"]).arg(&dest);
+    } else {
+        command.args(["-q", &plan.source_url, "-O"]).arg(&dest);
+    }
+    let output = command
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("{bin} を起動できません: {e}"))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&dest);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(format!(
+            "インストーラを取得できませんでした: {}\n\
+             {}\n\
+             ネットワーク接続とプロキシ設定を確認してから再実行してください。\n\
+             社内プロキシ環境では {} へのアクセス許可が要ることがあります",
+            plan.source_url,
+            if detail.is_empty() {
+                format!("（{bin} が exit {}）", output.status.code().unwrap_or(-1))
+            } else {
+                format!("（{detail}）")
+            },
+            plan.source_url,
+        ));
+    }
+
+    let head = std::fs::read(&dest)
+        .map_err(|e| format!("取得したインストーラを読めません: {e}"))?
+        .into_iter()
+        .take(256)
+        .collect::<Vec<u8>>();
+    if !looks_like_shell_script(&head) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "取得した内容がインストーラではありません（{} が HTML かエラーページを返しています）。\n\
+             社内プロキシやネットワーク制限が疑われます。ブラウザで {} を開いて中身を確認するか、\n\
+             ネットワークを変えて再実行してください",
+            plan.source_url, plan.source_url
+        ));
+    }
+    Ok(dest)
+}
+
+/// 先頭が shebang か（HTML エラーページを弾く）
+fn looks_like_shell_script(head: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(head);
+    let trimmed = text.trim_start();
+    trimmed.starts_with("#!")
+}
+
+/// インストール実行の指定
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InstallOptions {
+    /// 実行せず計画だけ返す
+    pub dry_run: bool,
+    /// 端末があるか。true = 出力を利用者へ流す（進捗が見える・インストーラの TUI が動く）、
+    /// false = 捕捉して応答へ載せる（GUI 内 dispatch / MCP から呼ばれる経路）
+    pub interactive: bool,
+}
+
+/// 取得したインストーラを実行する。
+///
+/// 端末があるときは出力をそのまま流す（インストーラは進捗と TUI を出す）。
+/// GUI 内 dispatch から呼ばれたときは端末が無いので捕捉し、失敗時の診断へ回す
+fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
+    let shell = tako_core::platform::exe::find("bash").unwrap_or_else(|| "/bin/bash".to_string());
+    let mut command = std::process::Command::new(&shell);
+    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut command);
+    command.arg(script);
+    let (status, log) = if interactive {
+        let status = command
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .map_err(|e| format!("{shell} を起動できません: {e}"))?;
+        (status, String::new())
+    } else {
+        let output = command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("{shell} を起動できません: {e}"))?;
+        let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(stderr.trim());
+        }
+        (output.status, log)
+    };
+    if status.success() {
+        return Ok(log);
+    }
+    let code = status.code().unwrap_or(-1);
+    let detail = if log.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", log.trim())
+    };
+    Err(match code {
+        // インストーラ自身が説明を出す終了コード
+        137 => format!(
+            "インストールがメモリ不足で中断されました（exit 137）。\
+             空きメモリを増やしてから再実行してください{detail}"
+        ),
+        c if c >= 128 => format!(
+            "インストールが途中で強制終了しました（exit {c}）。\
+             もう一度実行するか、上に出ているメッセージを確認してください{detail}"
+        ),
+        c => format!(
+            "インストーラが失敗しました（exit {c}）。上に出ているエラーを確認してください。\
+             解決しない場合は https://code.claude.com/docs/en/troubleshoot-install を参照してください{detail}"
+        ),
+    })
+}
+
+// --- PATH 通し ---
+
+/// ランチャーの置き場所をログインシェルの PATH へ通す（冪等）
+pub fn ensure_path() -> Result<Value, String> {
+    let home = home_dir()?;
+    let r = recipe();
+    let dir = r.launcher_dir_in(&home);
+    let (shell, _) = shell_target();
+    let Some(shell) = shell else {
+        let current = std::env::var("SHELL").unwrap_or_default();
+        return Err(format!(
+            "使っているシェル（{}）の設定ファイルが分かりません。\n\
+             次の 1 行をご自身のシェルの設定ファイルへ追加してください:\n  \
+             export PATH=\"{}:$PATH\"",
+            if current.is_empty() {
+                "不明"
+            } else {
+                &current
+            },
+            display_path(&dir),
+        ));
+    };
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let outcome = shell_profile::ensure_dir_on_path_in(&home, shell, &dir, Some(&path_var))?;
+    // 実際にログインシェルから引けるようになったかを**確かめてから**返す。
+    // 「書いたはず」で終わらせない（.zshrc へ書いて届かなかった類の失敗を検出する）
+    let verified = outcome.change == PathChange::AlreadyOnPath || login_shell_sees(&dir);
+    Ok(json!({
+        "shell": shell.as_str(),
+        "profile": outcome.profile.display().to_string(),
+        "profile_display": display_path(&outcome.profile),
+        "dir": dir.display().to_string(),
+        "dir_display": display_path(&dir),
+        "change": outcome.change.as_str(),
+        "wrote": outcome.change.wrote(),
+        "verified": verified,
+        "note": if verified {
+            "新しく開くターミナルから claude コマンドが使えます"
+        } else {
+            "設定は書きましたが、いまのシェルにはまだ反映されていません。\
+             ターミナルを開き直すと有効になります"
+        },
+    }))
+}
+
+/// 置いた PATH ブロックを取り除く（元のバイト列へ戻す）
+pub fn undo_path() -> Result<Value, String> {
+    let home = home_dir()?;
+    let (shell, _) = shell_target();
+    let shell = shell.ok_or("使っているシェルの設定ファイルが分かりません")?;
+    let outcome = shell_profile::remove_from_profile_in(&home, shell)?;
+    Ok(json!({
+        "shell": shell.as_str(),
+        "profile": outcome.profile.display().to_string(),
+        "change": outcome.change.as_str(),
+    }))
+}
+
+// --- 依存ツールと Homebrew ---
+
+/// tako が実行時に使う外部コマンド。**すべて任意**（無くても tako 自体は動く）
+pub const OPTIONAL_DEPS: &[&str] = &["tmux", "git", "tailscale"];
+
+fn deps_json() -> Value {
+    Value::Array(
+        OPTIONAL_DEPS
+            .iter()
+            .map(|bin| {
+                json!({
+                    "bin": bin,
+                    "found": tako_core::platform::exe::find(bin),
+                    "required": false,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Homebrew の状態と、無い場合の案内。
+///
+/// **自動導入はしない**。Homebrew のインストーラは sudo でパスワードを求める
+/// （実物で確認: install.sh に sudo 参照 49 箇所・`have_sudo_access`）。
+/// setup が黙って権限昇格を走らせるべきではないうえ、brew で入れる依存は
+/// すべて任意なので、無くてもゼロスタートは完走できる
+fn homebrew_json() -> Value {
+    let brew = tako_core::platform::exe::find("brew");
+    json!({
+        "found": brew,
+        "auto_install": false,
+        "reason": "Homebrew のインストーラは管理者パスワードを求めるため、tako は代行しません",
+        "guidance": "https://brew.sh の手順を実行すると、tmux などの任意依存を導入できるようになります",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shebangでインストーラとhtmlを見分ける() {
+        assert!(looks_like_shell_script(b"#!/bin/bash\nset -e\n"));
+        assert!(looks_like_shell_script(b"\n#!/usr/bin/env bash\n"));
+        assert!(!looks_like_shell_script(b"<!DOCTYPE html>"));
+        assert!(!looks_like_shell_script(b"<html><body>403"));
+        assert!(!looks_like_shell_script(b""));
+    }
+
+    #[test]
+    fn 段は導入状況から一意に決まる() {
+        // Step の順序（Install → Path → Auth → Ready）を固定する
+        assert_eq!(Step::Install.as_str(), "install");
+        assert_eq!(Step::Path.as_str(), "path");
+        assert_eq!(Step::Auth.as_str(), "auth");
+        assert_eq!(Step::Ready.as_str(), "ready");
+        for step in [Step::Install, Step::Path, Step::Auth, Step::Ready] {
+            assert!(!step.describe().is_empty());
+        }
+    }
+
+    /// 受け入れ条件 4: 実行前に「何をどこに入れるか」が必ず出ること
+    #[test]
+    fn 導入計画は何をどこに入れるかを必ず含む() {
+        let r = agent_install::recipe(
+            tako_core::platform::support::Platform::MacOs,
+            AgentKind::Claude,
+        );
+        let home = Path::new("/tmp/h");
+        let plan = InstallPlan {
+            agent: r.agent.as_str(),
+            official_command: r.source.official_command.to_string(),
+            source_url: r.source.url.to_string(),
+            launcher: r.launcher_path_in(home),
+            payload: r.payload_dir_in(home),
+            auto_updates: r.auto_updates,
+            can_run: r.tako_can_run,
+        };
+        let lines = plan.lines().join("\n");
+        assert!(lines.contains("curl -fsSL https://claude.ai/install.sh | bash"));
+        assert!(lines.contains(".local/bin/claude"), "置き場所が出ていない");
+        assert!(lines.contains(".local/share/claude/versions"));
+        assert!(lines.contains("sudo"), "権限の説明が無い");
+        let json = plan.to_json();
+        assert_eq!(json["can_run"], true);
+        assert!(json["lines"].as_array().is_some_and(|a| a.len() >= 5));
+    }
+
+    /// Windows では「代行しない」ことが計画に出て、実行は具体的な案内つきで断られる
+    #[test]
+    fn windowsの計画は代行しないと明示する() {
+        let r = agent_install::recipe(
+            tako_core::platform::support::Platform::Windows,
+            AgentKind::Claude,
+        );
+        assert!(!r.tako_can_run);
+        assert!(r.source.official_command.contains("install.ps1"));
+    }
+
+    #[test]
+    fn 依存はすべて任意でhomebrewは自動導入しない() {
+        let brew = homebrew_json();
+        assert_eq!(brew["auto_install"], false);
+        assert!(brew["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("パスワード")));
+        for dep in deps_json().as_array().unwrap() {
+            assert_eq!(dep["required"], false, "必須の依存を増やさない");
+        }
+    }
+}

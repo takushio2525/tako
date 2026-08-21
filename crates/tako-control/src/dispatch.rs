@@ -3195,6 +3195,31 @@ fn dispatch_inner(
             crate::setup::changes_status().map_err(DispatchError::Operation)
         }
 
+        Request::SetupBootstrap { action, dry_run } => {
+            // 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => crate::setup_bootstrap::status()
+                    .map(|s| s.to_json())
+                    .map_err(DispatchError::Operation),
+                "install" => {
+                    crate::setup_bootstrap::install(crate::setup_bootstrap::InstallOptions {
+                        dry_run: dry_run.unwrap_or(false),
+                        // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
+                        interactive: false,
+                    })
+                    .map_err(DispatchError::Operation)
+                }
+                "path" => crate::setup_bootstrap::ensure_path().map_err(DispatchError::Operation),
+                "undo-path" => {
+                    crate::setup_bootstrap::undo_path().map_err(DispatchError::Operation)
+                }
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / install / path / undo-path のいずれか）"
+                ))),
+            }
+        }
+
         Request::SetupRun { answers } => {
             let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
             let parsed: crate::setup::SetupAnswers = serde_json::from_value(answers_value)
