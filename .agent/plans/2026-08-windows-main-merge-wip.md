@@ -450,7 +450,7 @@ windows スタブが持っていた未使用警告が transport 統合で消え�
 
 Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機を先に回した）。
 
-### 4. 入力系: キーボード / IME / フォント / コンソール抑止（#517 / #575 / #582 / #585 / #586）
+### 4. 入力系: キーボード / IME / フォント / コンソール抑止（#517 / #575 / #582 / #585 / #586）— ✅ **完了**（PR #852）
 
 - 編集: `crates/tako-app/src/keybindings.rs`（45 本の個別分類）/ `main.rs`（IME アンカー）/
   `settings_window.rs`（既定フォント）/ `autorename.rs` / `stale_binary.rs` /
@@ -462,6 +462,80 @@ Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機�
   **main の `pane_text_area_rect` の上に載せ直す**。旧実装を戻さない
 - `crates/tako-core/src/keys.rs` は #662 由来（`tako keys`）。**#662 を落とす決定**なので
   持ち込まない。Windows のキー送出で必要になったらそのとき最小限で足す
+
+#### 完了記録（2026-08-21。PR #852 / `windows/467-slice4-input`）
+
+21 ファイル / +1,717 / −162（+ 追い修正 1 ファイル）。**plan の見立てより 15 ファイル多い**:
+plan は 6 ファイル（`keybindings.rs` / `main.rs` / `settings_window.rs` / `autorename.rs` /
+`stale_binary.rs` / `orchestrator/mod.rs`）を挙げていたが、コンソール窓抑止（#586 / #628）は
+**GUI から到達する子プロセス起動が 27 箇所**あり、`dispatch.rs` / `remote.rs` /
+`config_share/` / `update_checker.rs` / `tako-cli/setup.rs` / `tako-core` の
+`git.rs` / `tmux.rs` / `lib.rs` にも及んだ。
+
+##### 入れたもの
+
+- **キーバインド（#517 / #585 / #575 / #648）**: `key_bindings()` を「共通」+
+  `macos_only_bindings()` + `platform_bindings()` の 3 段へ。非 macOS へ OS 慣習の
+  **45 本**を追加（macOS の 45 本は 1 本も変えない）。割当の原則 4 つは番犬テストで固定:
+  `ctrl-<英字>` 単独は奪わない（例外は `ctrl-v`）/ 衝突は `ctrl-shift-` へ逃がす
+  （同じ C0 バイトへ潰れるので入力手段が減らない）/ `alt-` は矢印だけ（#575 の meta を殺さない）/
+  shift と記号・数字は組み合わせない（GPUI Windows の正規化と一致しない）
+- **`cmd-h` / `cmd-alt-h` / `cmd-m` を macOS 限定に**。Win+Alt+H が届くと `HideOthers` →
+  `gpui_windows::hide_other_apps` の `unimplemented!()` で **app ごと abort** するため
+  バインドを張らないことで経路ごと塞ぐ。「非 macOS に無いこと」も逆向きに固定した
+- **Alt+印字文字の meta 送出（#575）** と `printable_char_from_key`。AltGr（Windows では
+  Ctrl+Alt）は ESC を前置しない
+- **`is_paste_keystroke`（#546）を非 macOS の実バインドへ追随**。ずれると「入力欄に
+  フォーカスがあるときだけ貼り付けが死ぬ」ので、バインド表との一致をテストで固定
+- **パレットへのショートカット併記（#648）**。表示は必ず `key_bindings()` から導出する
+  （手書きの一覧を別に持つと確実に食い違う）。main が持つ `open-settings` も対象に足した
+- **IME（#582）**: `anchor_rect_y` / 変換ごとの `invalidate_character_coordinates()` /
+  `CFS_EXCLUDE` の除外領域通知。**win467 の旧実装は戻さず**、main の
+  `pane_cursor_origin_for_ime` / `cell_size_for_pane`（#781 / #803 / #787 で作り直した会計）の
+  上に載せ直した
+- **既定フォント（#585）**: 設定画面のプレースホルダを `platform::font` 経由へ
+- **コンソール窓抑止（#586 / #628）**: 27 箇所を `platform::process::no_console_window` へ。
+  番犬テスト `コンソール窓を抑止していない子プロセス起動が増えていない` は**件数を固定**する
+  方式（ファイル単位の許可リストは「そのファイルなら何個でも増やせる」穴になる）。
+  残り 21 ファイルは理由つきで表に残した
+
+##### 落としたもの（次スライスへ）
+
+**#623（IME の未確定文字列が勝手に確定される）は入れていない**。`platform::ime` の
+`is_associated` / `reassociate` / `guard_action` はスライス 1 で main に入っており
+呼び出しを足すだけだが、`guard_action` の `refocus: !focus_held` は **macOS でも発火する**
+経路で、main が win467 の分岐後に足した設定ウィンドウ・アップデートウィンドウ
+（別 GPUI ウィンドウ）との相互作用が未実測。「macOS 挙動不変」を崩さないため分離した。
+
+##### 実測
+
+macOS: fmt / clippy（`-D warnings`）**0 findings** / `test --workspace`
+**2207 passed / 0 failed**（ベースライン 2194 + 新規 13 = 完全一致）/
+visual-test **98 checkpoint**（数値もベースラインと一致）/
+クロスチェック **エラー 0・警告 10**（`origin/main` を同条件で実測し**同一の 10 件**）。
+
+**Windows 実機**: `cargo build --workspace` は**一発で通った**（11m37s / エラー 0）。
+`cargo test --workspace --no-fail-fast` の結果:
+
+| スイート | ベースライン | 実測 |
+|---|---|---|
+| `tako-app` | 409 / 0 | 426 / 1 → **修正後 427 / 0**（実機で再確認） |
+| `tako-cli` | 53 / 0 | 53 / 0 |
+| `tako-control` (lib) | 950 / 25 | **950 / 25**（完全一致） |
+| `tako-core` (lib) | 665 / 5 | **665 / 5**（完全一致） |
+| `platform_parity` | 10 / 0 | **11 / 0**（番犬 1 本新設） |
+| `encoding_conpty` | 5 / 0 | 5 / 0 |
+| `psmux_backend` | 16 / 0 | 16 / 0 |
+
+失敗 31 件のうち **30 件は #583 の既知（POSIX 前提）**で完全一致。残り 1 件は
+`app_menu_tests::macos慣習のショートカットがバインドされている` = **自分が作った回帰**で、
+`cmd-h` / `cmd-alt-h` / `cmd-m` を macOS 限定にしたのにテストが無条件で存在を要求していた。
+テストを両方向へ拡張して解消（`d99f70a`）。**macOS のゲートは全部緑だったのに実機で
+落ちた** = 引き継ぎ 1 か条（実機ファースト）がそのまま効いた事例。
+
+隔離セルフテストは高負荷下（load 8〜10）で項目が入れ替わりながら落ちる
+（1 回目「ANSI 赤の解決」→ 2 回目は通過、2 回目「MCP tako_chat_copy (#725)」）。
+どちらも #796 の負荷依存フレークの系列で、`origin/main` の同条件でも完走しない。
 
 ### 5. ウィンドウコントロール + in-window メニューバー（#584 / #657）
 
