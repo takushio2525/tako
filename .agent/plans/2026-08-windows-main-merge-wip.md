@@ -1598,7 +1598,7 @@ macOS が `USERPROFILE` も受け入れる挙動変更になり利得がない�
   USERPROFILE を見ずに `None` へ落ちていた（= 本 Issue と同じ症状）
 - `links.rs` のユニットテスト 2 本が `std::env::var("HOME").unwrap()` で **Windows では
   panic**（#583 の POSIX 前提失敗の一部）。共通解決 + 理由つきスキップへ
-||||||| parent of 1886865 ([ドキュメント] #766 の完了記録と外れた見立ての訂正 (#766) (#467))
+
 #### スライス 8 の前提: 器の中のシェル統合（#766）— ✅ **完了**（PR は本文末尾の記録）
 
 Windows の既定構成（persist ON = 器が psmux）でシェル統合（OSC 7 / 133）が**まったく働かない**。
@@ -1720,6 +1720,120 @@ TAKO_SELF_TEST_694: pane=48 state=Some(Unknown) alt=Some(false) role=None backen
 ただし `USERPROFILE` フォールバックがあるので**ユーザー名の空白**は通るため、
 #887 依存はそのまま残る（空白入り `data_dir` のケースで固定済み）。
 ホーム解決の残り 15 箇所の分類は **#893**
+#### #872 の記録（ウィンドウ 0 枚の無音終了。PR で追記・2026-08-22）
+
+**症状（Issue の書き方）**: 「2 枚目のウィンドウを作るとアプリが終了コード 0 で静かに終わる」。
+セルフテストは `TAKO_SELF_TEST_77: 開始` の次の行が無く、項目 78 以降が 1 つも測れない。
+
+**Issue の前提は外れていた**。`check` は**成功時に何も印字しない**ので、
+「開始の直後に走るのは `window new` だけ」という推論が成り立たない。実測すると
+2 枚目の生成は**元から通っていた**:
+
+```
+TAKO_SELF_TEST_77: 開始 windows=(1, 1)
+TAKO_SELF_TEST_WINDOW_OPEN: ウィンドウ open: logical=2 gpui 枚数=2
+TAKO_SELF_TEST_77: 2 枚目 registered=true pty=true drawn=true   ← 作れて描けている
+...
+TAKO_SELF_TEST_WINDOW_CLOSED: … 残り gpui=0 論理=1 → …アプリを終了する（#872）
+EXITCODE=0                                                       ← ここで死ぬ
+```
+
+**真因**: GPUI の `QuitMode::Default` は **`cfg!(not(target_os = "macos"))` = 非 macOS で
+「最後のウィンドウが閉じたらアプリ終了」**（`crates/gpui/src/app.rs` の `update_window` →
+`trail` → `quit_on_empty`）。終了は `PostQuitMessage(0)` → **`ExitProcess(0)`** なので
+panic でも FAILED でもなく、tako 側のログにも痕跡が残らない。
+死んでいたのは項目 77 ではなく**項目 79（macOS 固有の Dock 復帰）が窓を 0 枚にした瞬間**で、
+旧コードは 77 / 79 / 80 を 1 つの `if cfg!(windows)` でまとめてスキップしていたため
+「77 で死ぬ」に見えていた。
+
+**直し方**: 寿命の方針を UI ツールキットから取り上げて tako が持つ。
+
+- 境界 `platform::window_lifecycle`（`LastWindowClose::{KeepAliveForReopen, Quit}`）に
+  「最後のウィンドウが閉じたらどうするか」を 1 か所だけ置く。判定は純粋関数なので
+  **macOS 上から Windows 側の方針を検証できる**（`support` と同じ作法）
+- `cx.set_quit_mode(QuitMode::Explicit)` で自動終了を止め、実行は
+  `handle_window_close`（= ユーザーの ✕ / Alt+F4 の経路）だけが行う。
+  これで「ユーザーが最後の窓を閉じた」と「tako が内部都合で 0 枚にした」が分かれる
+- `on_window_closed` で **0 枚になった瞬間を必ず 1 行残す**（`viewport_closed_log`）。
+  `open_viewport_window` も成否と枚数を残す。**次に同じ経路を踏んだ人が黙って溶かさないため**
+- 「最後の 1 枚」判定を `cx.windows().len()`（= 設定画面・アップデート画面まで数える）から
+  **`self.viewports.len()`（tako が見せている窓の数）**へ。前者だと「設定画面を開いたまま
+  最後のタブ窓を閉じる」が最後の 1 枚扱いにならず、そのあと設定画面を閉じると
+  Windows で終了も再表示もできないプロセスが残る
+
+**A/B は同一バイナリで取れる**: `TAKO_872_NO_QUIT_GUARD=1` が旧挙動（GPUI の既定）。
+
+##### 実機実測（Windows 11 / debug / `TAKO_ISOLATED=1`）
+
+| 観点 | before（`TAKO_872_NO_QUIT_GUARD=1`） | after |
+|---|---|---|
+| セルフテストの停止位置 | 項目 79b の 0 枚化で **EXITCODE=0**（無音） | **項目 93（#694）** = main と同じ |
+| 項目 77（2 枚目） | 実は通っていた（`registered=true pty=true drawn=true`） | 同じ |
+| 項目 79b（内部都合の 0 枚） | プロセスが消える | `内部 close 後 gpui 枚数=0` → `開き直し後 Some((1, EntityId(1v1), 2))` |
+| `tako window new`（GUI + CLI） | **落ちない**（2 窓・`gpui 枚数=2`・送達と read も通る） | 同じ |
+| session 1 の可視ウィンドウ | `974x607 title=[tako]` が **2 枚** | 同じ |
+| 最後の窓を ✕（`WM_CLOSE`） | 終了する（GPUI の自動終了） | 終了する（**tako が明示。persist.log に方針つきで残る**） |
+| `cargo test --workspace`（実機） | 22 件失敗 | 22 件失敗・**失敗テスト名の集合が完全一致** |
+
+macOS 側: `test --workspace` **2411 passed / 0 failed**（main 2406 + 新規 5）/ `fmt` /
+`clippy`（両 feature）/ クロスチェック **エラー 0・警告リストが main と完全一致** /
+隔離セルフテスト **`TAKO_APP_SELF_TEST_OK`（完走）**。
+
+##### 実測で分かった作法（次に踏む人向け）
+
+1. **`check` は成功時に黙る**。だから「最後に出たログの直後の処理が犯人」は成り立たない。
+   同じ罠を封じるため、0 枚化の瞬間そのものに診断を足した
+2. **`cfg!` のスキップは 1 項目ずつにする**。77 / 79 / 80 を 1 つの `if` でまとめたせいで、
+   「79 が原因」が「77 が原因」に見えた。スキップ理由も項目ごとに書く
+3. **entity の寿命はプラットフォームで違う**。窓が 0 枚になると最後の強参照
+   （ウィンドウの root view）が落ちるので、**Windows では `TakoApp` entity ごと解放される**
+   （実測。macOS は残る = #381 の「同一 entity で開き直す」設計は macOS の retain に
+   依存している）。解放されると `reopen_or_restore` は保存レイアウトから**別の TakoApp** を
+   作る側へ落ちるので、0 枚を跨ぐ検証はテスト側で entity を掴んで測る対象を固定する
+4. **0 枚化は production と同じ後始末順で作る**（`drop_viewport` → `remove_window`）。
+   `remove_window` だけだと `viewports` に古い組が残り、`reopen_or_restore` が
+   「もう開いている」と誤認して開き直さない（macOS で 1 回踏んだ）
+5. **session 0（SSH）から session 1 のウィンドウは列挙できない**。`EnumWindows` /
+   `MainWindowTitle` は空を返すので、「本当に画面に出ているか」は `schtasks /it` で
+   session 1 に**プローブを投げて**測る。道具は `C:\Users\shioz\dev\tako-evidence-872\` に
+   残してある（`winprobe.ps1` = 可視ウィンドウの列挙 / `wmclose.ps1` = ✕ 相当の `WM_CLOSE` /
+   `st-after.cmd` `st-before2.cmd` = セルフテストの A/B / `gui.ps1` = 隔離 GUI の起動）
+6. **`Start-Process` で投げたビルドは SSH セッションが切れると死ぬ**。長い処理は
+   `Invoke-CimMethod Win32_Process Create`（ジョブの外に出る）か `schtasks` で投げる
+
+##### 副産物（重い方）: 途中で死んだ run が「OK + 終了コード 0」を出していた
+
+`on_app_quit` の `TAKO_APP_SELF_TEST_OK` は「全 check 通過後にだけ quit が来る」前提だった。
+ところが **quit 経路は最終項目の cmd-q 以外からも通る**（ウィンドウ 0 枚の自動終了・
+最後のタブの close）ので、#872 の無音終了は条件次第で**偽の緑**になる。Windows 実測:
+
+```
+TAKO_SELF_TEST_WINDOW_CLOSED: … 残り gpui=0 … → …アプリを終了する（#872）
+TAKO_APP_SELF_TEST_OK      ← 項目 79b で死んでいるのに OK
+EXITCODE=0
+```
+
+つまり「`TAKO_APP_SELF_TEST_OK` なら合格」という運用の前提が、**この経路では成り立って
+いなかった**。前提を明示のラッチ（`SELF_TEST_AT_FINAL_STEP`）にして、立っていない quit は
+`TAKO_APP_SELF_TEST_FAILED` + exit 1 で落とすようにした（番犬つき）。修正後の同じ before は
+`最終項目より前に quit した` + `EXITCODE=1`。
+
+##### 実機テストの差分は 1 件だけで、それは #766 の負荷依存フレーク
+
+`cargo test --workspace --no-fail-fast`（実機）は main = 22 件失敗、本ブランチ = 23 件。
+増えた 1 件は `psmux_backend.rs` の `器のホイールは上下対称で最下部でcopy_modeを抜ける`
+（#766 で新設）。全体走行では 67 秒かかって
+`遡るための履歴が作れない`（貼り付けた `1..80 | ForEach-Object { "LINE $_" }` が途中で切れて
+PowerShell が継続行 `>>` に入る）で落ちるが、**単独で 3 回連続 pass（各 6 秒）**。
+負荷で送達が崩れる #640 と同型なので **#896 に起票**した。私の変更は tako-app の
+ウィンドウ寿命と tako-core の新モジュールだけで、psmux 経路には触っていない。
+
+##### 副産物: 項目 81 は #381 以降ずっと空振りしていた
+
+項目 79 でウィンドウを開き直すとハンドルが差し替わるのに、取り直しが**項目 81 の後ろ**に
+あった。項目 81 は `setup_ok` が false になるだけで**何も検証せずに素通り**していた
+（`if setup_ok { … }` なので FAILED にもならない）。取り直しを 81 の前へ移し、
+前提が崩れたら FAILED にした。
 
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
