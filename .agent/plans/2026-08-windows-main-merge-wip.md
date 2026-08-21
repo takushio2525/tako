@@ -1347,6 +1347,61 @@ macOS: fmt / clippy（`--features visual-test` 有無とも）/ `test --workspac
   `resolve_session_id_for_backend`（`status_source = agents-auto`）の 3 段で、
   そこから応答 JSON までの間は macOS のユニットが固めている純ロジックだけ
 
+#### #881 の記録（器へ渡す内側コマンドの第 1 語。PR で追記・2026-08-21）
+
+**症状**: persist ON（器 = psmux）で `SpawnCommand.program` に空白入りのパスを指定すると、
+ペインは生えるが PTY が即死する（`tako split -- "C:\Program Files\x\y.exe"`）。
+
+**原因**（`remain-on-exit on` を生きているサーバーへ直接立てて死因を採取して確定）:
+psmux は内側コマンドを**単語分割の過程で引用符ごと落として** `CreateProcess` へ渡す。
+`tmux_backend::wrap_options` の `shell_quoted(inner)` はプログラムまで単引用符で括るので、
+`'C:\Program Files\…'` という名前のプログラムを探しに行って見つからず、器が既定シェルへ
+丸投げして `Unexpected token '-NoLogo'` で死んでいた。
+
+**直し方**: `BackendCapabilities::quotes_program`（tmux / 器なし = true、psmux = false）を新設し、
+組み立てを `backend::inner_command_line`（判断部は純粋関数 `compose_inner_command`）へ 1 本化。
+psmux 側は `platform::program_path`（**抽象境界 B18**）で 8.3 短縮名 → 実行ファイル名の順に
+「空白を含まない 1 語」へ落とす。`GetShortPathNameW` の FFI は境界の中だけ。
+
+**#875 の回避は撤去した**（受け入れ条件 2）。実行ペインが第 1 語を実行ファイル名へ落として
+いたのは器がこれを運べなかったための回避で、器側が面倒を見るようになったので
+**解決したフルパスをそのまま渡す**（取り違えの余地が無い方）。
+
+##### plan の見立てとの差（最重要）
+
+**「psmux 側の修正になるはず」は当たっていたが、直す関数を間違えた。**
+`psmux::inner_command` を直して実機で試したら**症状が 1 ミリも変わらなかった**。
+理由は `PsmuxBackend::wrap_spawn` に**呼び出し元が無い**こと（tako-app は
+`tmux_backend::wrap_options` を直接叩いている）。スライス 2a が入れた backend trait は
+spawn 経路では**まだ使われていない**。**#885 に起票**。
+
+教訓: 実機で「直したのに変わらない」ときは、**その関数が本当に呼ばれているかを
+`grep '\.関数名('` で確かめる**。今回は死にゆくペインの画面を 300ms 間隔で採取して
+初めて実際の行（`'C:\Program Files\…' -NoLogo`）が見え、単引用符の出どころが分かった。
+
+##### 実機実測（psmux 3.3.7 / Windows 11）
+
+| 観点 | before（main `dc975df`） | after |
+|---|---|---|
+| `tako split -- "<空白入りフルパス>" -NoLogo` | 応答は pane 2 だが 8 秒後に消滅 | **生存**（`panes=[1,2]`・プロンプト表示） |
+| `tako split -- pwsh.exe -NoLogo`（対照） | 生存 | 生存 |
+| `tako split -- cmd.exe /c pause`（対照） | 生存 | 生存 |
+| #875 の 3 経路（persist ON） | 生存 | 生存（`__TAKO_EXIT=0`。回避撤去後も不変） |
+| 終了コード | — | `cmd /c exit 7`→7 / cmdlet 失敗→1 |
+| `cargo test --workspace` | 22 件失敗 | **22 件失敗・集合が完全一致** |
+| GUI セルフテスト | 項目 91 `ran=true` | 項目 91 `ran=true`・**SKIP/FAILED 一覧が #875 完了時と完全一致** |
+
+##### 併せて起票したもの
+
+- **#884**: 空白を含む **cwd** でペインが即死する（`-c <cwd>` が argv のまま届いていない疑い。
+  psmux 単体では同じ argv で生存するので**層が違う**）。`C:\Users\First Last\…` を持つ
+  マシンでは日常的に踏む
+- **#885**: tako-app の spawn が backend の `wrap_spawn` を通らない（上記の教訓の恒久対処）
+
+**#866 とは別物**（統合しない）: #866 は psmux の**ターゲット解決**（`=name` を解さない）で、
+本件は**内側コマンドの引用**。今回 `-t <window 名>` がセッション名 `<sock>__<name>` として
+解決される様子も観測したが、これも target 解決の話で引用とは機序が違う。
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
