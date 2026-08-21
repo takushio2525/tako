@@ -468,7 +468,7 @@ Windows 実機ビルドは**一発で通った**（2b の教訓どおり実機�
 21 ファイル / +1,717 / −162（+ 追い修正 1 ファイル）。**plan の見立てより 15 ファイル多い**:
 plan は 6 ファイル（`keybindings.rs` / `main.rs` / `settings_window.rs` / `autorename.rs` /
 `stale_binary.rs` / `orchestrator/mod.rs`）を挙げていたが、コンソール窓抑止（#586 / #628）は
-**GUI から到達する子プロセス起動が 27 箇所**あり、`dispatch.rs` / `remote.rs` /
+**GUI から到達する子プロセス起動が 38 箇所**あり、`dispatch.rs` / `remote.rs` /
 `config_share/` / `update_checker.rs` / `tako-cli/setup.rs` / `tako-core` の
 `git.rs` / `tmux.rs` / `lib.rs` にも及んだ。
 
@@ -494,7 +494,8 @@ plan は 6 ファイル（`keybindings.rs` / `main.rs` / `settings_window.rs` / 
   `pane_cursor_origin_for_ime` / `cell_size_for_pane`（#781 / #803 / #787 で作り直した会計）の
   上に載せ直した
 - **既定フォント（#585）**: 設定画面のプレースホルダを `platform::font` 経由へ
-- **コンソール窓抑止（#586 / #628）**: 27 箇所を `platform::process::no_console_window` へ。
+- **コンソール窓抑止（#586 / #628）**: 38 箇所を `platform::process::no_console_window` へ
+  （未抑止の件数は実測で 118 → 80 へ減った）。
   番犬テスト `コンソール窓を抑止していない子プロセス起動が増えていない` は**件数を固定**する
   方式（ファイル単位の許可リストは「そのファイルなら何個でも増やせる」穴になる）。
   残り 21 ファイルは理由つきで表に残した
