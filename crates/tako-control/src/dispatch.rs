@@ -4334,12 +4334,12 @@ fn dispatch_inner(
                 )));
             }
 
-            // シェル指定時はコマンドを包む
-            let final_command = if let Some(shell) = &plan.shell {
-                let escaped = plan.command.replace('\'', "'\\''");
-                format!("{shell} -c '{escaped}'")
-            } else {
-                plan.command.clone()
+            // シェル指定時はコマンドを包む（包み方は宣言されたシェルの方言で決まる。#875）
+            let final_command = match &plan.shell {
+                Some(shell) => {
+                    tako_core::platform::shell::declared_shell_command(shell, &plan.command)
+                }
+                None => plan.command.clone(),
             };
 
             let new_id = spawn_command_pane(
@@ -4795,18 +4795,15 @@ fn spawn_command_pane(
         .split_with_ratio(target, direction.to_core(), ratio, new_pane)
         .map_err(op_err)?;
 
-    let wrapped =
-        format!("{command}; echo \"__TAKO_EXIT=$?\"; read -r __TAKO_DUMMY__ 2>/dev/null || true");
-    // 複合シェルコード（`;` / `||` 入り）は program 1 語に詰めず /bin/sh -c の引数で渡す。
-    // program に詰めると login_shell_command の shell_quoted が全文を 1 語にクォートし、
-    // シェルが「セミコロン込みの 1 コマンド名」として探して 127 で即死する（#453）
+    // 実行ペインの起動コマンドはシェルの方言差があるので境界（B1）へ委ねる。
+    // ここで `/bin/sh -c` を直書きしていたため Windows では PTY が立たなかった（#875）
     host.attach_session(
         new_id,
         SpawnOptions {
-            command: Some(SpawnCommand {
-                program: "/bin/sh".to_string(),
-                args: vec!["-c".to_string(), wrapped],
-            }),
+            command: Some(tako_core::platform::shell::run_pane_command(
+                command,
+                EXIT_MARKER_PREFIX,
+            )),
             cwd,
             env: Vec::new(),
         },
@@ -5568,12 +5565,18 @@ fn send_is_enter_only(text: &str, newline: bool) -> bool {
     text.chars().all(|c| c == '\n' || c == '\r') && (newline || !text.is_empty())
 }
 
+/// 実行ペインが終了コードを報告する行の接頭辞。**実行ペインの唯一の契約**で、
+/// 組み立てる側（`platform::shell::run_pane_command`）と読む側（`find_exit_marker`）が
+/// この 1 個を共有する。POSIX は `echo "<prefix>$?"`、PowerShell は
+/// `Write-Host ('<prefix>' + $__tako_code)` と書き方が違うが、**出る行は同じ形**（#875）
+const EXIT_MARKER_PREFIX: &str = "__TAKO_EXIT=";
+
 /// `__TAKO_EXIT=<code>` マーカーを画面行から検索する。
 /// 行頭以外の位置（read プロンプトと同一行等）にも対応する（#325）
 fn find_exit_marker(lines: &[String]) -> Option<i32> {
     lines.iter().rev().find_map(|line| {
-        line.find("__TAKO_EXIT=").and_then(|pos| {
-            let after = &line[pos + "__TAKO_EXIT=".len()..];
+        line.find(EXIT_MARKER_PREFIX).and_then(|pos| {
+            let after = &line[pos + EXIT_MARKER_PREFIX.len()..];
             after.trim().parse::<i32>().ok()
         })
     })
@@ -15924,6 +15927,26 @@ mod tests {
     }
 
     #[test]
+    fn exit_markerは両方言の実出力から拾える() {
+        // 実行ペインの唯一の契約は「マーカー行の形」。組み立て方は方言で違うのに
+        // **画面に出る行は同じ**であることを、両方言の実出力の形で固定する（#875）。
+        //
+        // POSIX: `echo "__TAKO_EXIT=$?"` → 行末に余分な空白は無い
+        assert_eq!(find_exit_marker(&["__TAKO_EXIT=7".into()]), Some(7));
+        // PowerShell: `Write-Host ('__TAKO_EXIT=' + $__tako_code)`。
+        // ConPTY は行を端末幅まで空白で埋めて返すことがあるので、右の空白を許す
+        assert_eq!(
+            find_exit_marker(&["__TAKO_EXIT=7                    ".into()]),
+            Some(7)
+        );
+        // PowerShell の `$LASTEXITCODE` は cmdlet 失敗時に 1 を返す設計（負値は来ない）が、
+        // ネイティブ exe は負値を返しうる（`exit -1` → 4294967295 ではなく -1 で表示される）
+        assert_eq!(find_exit_marker(&["__TAKO_EXIT=-1".into()]), Some(-1));
+        // どちらの方言でも「マーカーの後ろに数字以外」は採らない
+        assert_eq!(find_exit_marker(&["__TAKO_EXIT=$__tako_code".into()]), None);
+    }
+
+    #[test]
     fn run_interactiveはコマンドをspawn_commandで渡す() {
         let mut host = MockHost::new();
         let root = host.ws.active_tab().tree().focused();
@@ -15944,15 +15967,37 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
-        // 複合シェルコードは /bin/sh -c の引数（program 1 語詰めは 127 即死。#453）
-        assert_eq!(cmd.program, "/bin/sh");
-        assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
-        let sh_code = cmd.args.get(1).expect("-c の引数");
-        assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
-        assert!(sh_code.contains(r#"read "ans?input: ""#), "{sh_code}");
-        assert!(
-            sh_code.ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
-            "{sh_code}"
+        // 起動コマンドの形は方言境界が決める（#875）。dispatch の責任は
+        // 「ユーザーのコマンドをそのまま境界へ渡す」ことなので、境界の出力と突き合わせる
+        assert_run_pane_command(cmd, r#"read "ans?input: ""#);
+        // POSIX 側は #453 の回帰（program 1 語詰めは 127 即死）をここでも見えるようにする
+        #[cfg(unix)]
+        {
+            assert_eq!(cmd.program, "/bin/sh");
+            assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
+            let sh_code = cmd.args.get(1).expect("-c の引数");
+            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+            assert!(sh_code.contains(r#"read "ans?input: ""#), "{sh_code}");
+            assert!(
+                sh_code.ends_with("read -r __TAKO_DUMMY__ 2>/dev/null || true"),
+                "{sh_code}"
+            );
+        }
+    }
+
+    /// 実行ペインの `SpawnCommand` が「そのコマンドを境界へ通した結果」と一致することを見る。
+    ///
+    /// **OS ごとに期待値を書き分けない**。書き分けると Windows で決め打ちの
+    /// テストが増える（作法 11）。境界そのものの出力は
+    /// `platform::shell` 側の単体テストがバイト単位で固定している
+    fn assert_run_pane_command(got: &SpawnCommand, command: &str) {
+        // 接頭辞は `find_exit_marker` が読むのと同じ定数から採る
+        // （組み立て側と読む側がずれたら実機ではなくここで落ちる）
+        let want = tako_core::platform::shell::run_pane_command(command, EXIT_MARKER_PREFIX);
+        assert_eq!(
+            (&got.program, &got.args),
+            (&want.program, &want.args),
+            "実行ペインの起動コマンドが境界の出力と食い違う"
         );
     }
 
@@ -15987,11 +16032,63 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
-        assert_eq!(cmd.program, "/bin/sh");
-        assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
-        let sh_code = cmd.args.get(1).expect("-c の引数");
-        assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
-        assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        // 解決したコマンドがそのまま境界へ渡る（`bash hello.command` = 拡張子既定）
+        assert_eq!(result["command"], "bash hello.command");
+        assert_run_pane_command(cmd, "bash hello.command");
+        #[cfg(unix)]
+        {
+            assert_eq!(cmd.program, "/bin/sh");
+            assert_eq!(cmd.args.first().map(String::as_str), Some("-c"));
+            let sh_code = cmd.args.get(1).expect("-c の引数");
+            assert!(sh_code.starts_with("bash hello.command"), "{sh_code}");
+            assert!(sh_code.contains("__TAKO_EXIT="), "{sh_code}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runのtako_shell宣言は方言境界で包まれる() {
+        // `# tako:shell: pwsh` は Windows で `pwsh -Command '…'` へ、
+        // それ以外（bash / fish 等）は従来どおり `<shell> -c '…'` へ包まれる。
+        // 直書きの `{shell} -c '{escaped}'` だと Windows で pwsh が `-c` を解さない（#875）
+        let dir = std::env::temp_dir().join(format!(
+            "tako-875-declshell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("decl.txt");
+        std::fs::write(
+            &file,
+            "# tako:shell: pwsh
+# tako:run: echo it's
+",
+        )
+        .unwrap();
+
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(root.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let pane_id = result["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&pane_id).expect("options 記録");
+        let cmd = opts.command.as_ref().expect("command が設定されている");
+        // 宣言シェルの包み方は OS に依らない（判定は宣言された名前だけで決まる）
+        assert_run_pane_command(cmd, "pwsh -Command 'echo it''s'");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
