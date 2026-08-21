@@ -207,12 +207,14 @@ fn detect_claude() -> Option<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
-    let output = std::process::Command::new(shell)
-        .args(["-l", "-c", "command -v claude"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    // #586: GUI プロセスからの起動なのでコンソールウィンドウを出させない
+    let output =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(shell))
+            .args(["-l", "-c", "command -v claude"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -228,7 +230,8 @@ fn run_claude(bin: &Path, materials: &TabMaterials, lang: Lang) -> Option<Rename
     use std::process::{Command, Stdio};
 
     let prompt = build_prompt(materials, lang);
-    let mut child = Command::new(bin)
+    // #586: GUI プロセスからの起動なので Windows でコンソールウィンドウを出させない
+    let mut child = tako_core::platform::process::no_console_window(&mut Command::new(bin))
         .args(["-p", "--model", MODEL])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

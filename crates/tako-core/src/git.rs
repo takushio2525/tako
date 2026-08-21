@@ -164,6 +164,8 @@ pub enum DiffLineKind {
 
 fn git_command(repo: &Path) -> Command {
     let mut cmd = Command::new(git_bin());
+    // #586: GUI から 2 秒ポーリングで叩くため、Windows でコンソールウィンドウを出させない
+    crate::platform::process::no_console_window(&mut cmd);
     cmd.current_dir(repo);
     cmd.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
     cmd.env("GIT_TERMINAL_PROMPT", "0");

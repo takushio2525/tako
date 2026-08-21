@@ -1592,6 +1592,10 @@ pub fn spawn_daemon() -> Result<Value, String> {
     let args = vec!["remote".to_string(), "serve".to_string()];
 
     let mut cmd = Command::new(&tako_bin);
+    // #586: GUI（リモートパネルの起動ボタン）から立てるので、console サブシステムの
+    // tako CLI がコンソールウィンドウを出さないようにする。`configure_daemon_child` は
+    // Windows では何もしない（unix の setsid 相当が無い）ので、ここで塞ぐ必要がある
+    tako_core::platform::process::no_console_window(&mut cmd);
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1893,7 +1897,8 @@ fn device_json(d: &crate::remote_auth::Device) -> Value {
 
 /// ホスト名を取得する（表示用）
 pub fn hostname() -> String {
-    Command::new("hostname")
+    // #586: Windows の `hostname.exe` は素で起動するとコンソールウィンドウを出す
+    tako_core::platform::process::no_console_window(&mut Command::new("hostname"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()

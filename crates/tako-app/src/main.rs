@@ -10002,6 +10002,57 @@ impl TakoApp {
             .width
     }
 
+    /// 変換中の未確定文字列が占める矩形（論理px・ウィンドウ client 座標）。
+    /// 候補ウィンドウに覆わせない除外領域として IME へ渡す（#582）。
+    ///
+    /// ターミナル表示のペインだけを対象にする。チャット / アプリ内入力欄の変換は
+    /// `bounds_for_range` がキャレット矩形を返す別経路で、そちらは入力欄が画面の
+    /// 下端に貼り付いていないので反転による被りが起きない
+    fn ime_composition_rect(
+        &mut self,
+        window: &mut Window,
+    ) -> Option<tako_core::platform::ime::CompositionRect> {
+        let text = self.ime.as_ref()?.text.clone();
+        let pane = self.ime_target();
+        let origin = self.pane_cursor_origin_for_ime(pane, window)?;
+        let cell = self.cell_size_for_pane(pane)?;
+        // 変換中の文字列は 1 セルより広いのが普通。狭い側に倒すと候補ウィンドウが
+        // 未確定文字列の右半分に被るので、実描画幅（最低 1 セル）を使う
+        let width = self.ime_prefix_width(&text, pane, window).max(cell.width);
+        Some(tako_core::platform::ime::CompositionRect {
+            left: f32::from(origin.x),
+            top: f32::from(origin.y),
+            right: f32::from(origin.x + width),
+            bottom: f32::from(origin.y + cell.height),
+        })
+    }
+
+    /// 候補ウィンドウの除外領域を「次フレーム」で IME へ通知する（#582）。
+    ///
+    /// **`invalidate_character_coordinates()` の直後に呼ぶこと**。GPUI は同じ
+    /// `on_next_frame` キューへ `CFS_CANDIDATEPOS`（点だけ）のプッシュを積むので、
+    /// あとから積んだこちらが後勝ちで `CFS_EXCLUDE` へ差し替わる
+    /// （`gpui/src/window.rs` の `next_frame_callbacks` は登録順に実行される）。
+    /// 同フレーム内で先に呼ぶと GPUI に上書きされて元の被りへ戻る。
+    ///
+    /// macOS では `set_candidate_exclusion` が境界の内側で何もしない（Cocoa が
+    /// 矩形から自動で避けるため）ので、この経路は空回りするだけで無害
+    fn push_ime_exclusion_next_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime.is_none() {
+            return;
+        }
+        let entity = cx.entity();
+        window.on_next_frame(move |window, cx| {
+            let scale = window.scale_factor();
+            let handle = native_window_handle(window);
+            entity.update(cx, |app, _| {
+                if let Some(rect) = app.ime_composition_rect(window) {
+                    tako_core::platform::ime::set_candidate_exclusion(handle, &rect, scale);
+                }
+            });
+        });
+    }
+
     /// テキスト領域から差し引く stale claude バナー（#498）の高さ（px。#781）。
     ///
     /// バナーはペイン内の**流れの中**（ヘッダとターミナル領域のあいだ）に積まれるので、
@@ -17704,7 +17755,7 @@ impl EntityInputHandler for TakoApp {
         _range_utf16: Option<Range<usize>>,
         new_text: &str,
         new_selected_range: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // IME は毎回未確定文字列の全文を渡してくるので丸ごと差し替える。
@@ -17734,6 +17785,13 @@ impl EntityInputHandler for TakoApp {
                 selected_utf16: new_selected_range,
             });
         }
+        // 未確定文字列が伸び縮みするたびに IM へ文字座標を再通知する。
+        // Windows は `ImmSetCandidateWindow` によるプッシュが必要で、これが無いと
+        // 候補ウィンドウが**変換開始時の位置に貼り付いたまま追従しない**（#582）。
+        // macOS では Cocoa が `firstRectForCharacterRange` を自分で引き直すので
+        // 追加の効果は無い（確定・unmark 側には既に同じ呼び出しがある。#332）
+        window.invalidate_character_coordinates();
+        self.push_ime_exclusion_next_frame(window, cx);
         cx.notify();
     }
 
@@ -17802,9 +17860,15 @@ impl EntityInputHandler for TakoApp {
             }
             None => px(0.0),
         };
+        // 縦方向は最後に `platform::ime::anchor_rect_y` を通す。OS ごとに矩形の解釈が
+        // 違う（macOS は矩形のまま / Windows は垂直中心の 1 点へ潰される）ため、
+        // その差の吸収は境界へ任せてここでは素直にセル矩形を組む（#582）。
+        // macOS では恒等なので値は 1px も変わらない
+        let (anchor_y, anchor_height) =
+            tako_core::platform::ime::anchor_rect_y(f32::from(origin.y), f32::from(cell.height));
         Some(Bounds::new(
-            point(origin.x + x_offset, origin.y),
-            size(cell.width, cell.height),
+            point(origin.x + x_offset, px(anchor_y)),
+            size(cell.width, px(anchor_height)),
         ))
     }
 
@@ -19323,6 +19387,19 @@ fn tako_titlebar_options() -> gpui::TitlebarOptions {
     }
 }
 
+/// ウィンドウのネイティブハンドル（Windows の `HWND`）。他 OS では `None`。
+///
+/// `RawWindowHandle` の列挙子は全 OS で定義されているので `cfg` は要らない
+/// （macOS では `AppKit` に一致して `None` に落ちる）。プラットフォーム分岐は
+/// 受け取り側の境界（`tako_core::platform::ime`）の内側に閉じる
+fn native_window_handle(window: &Window) -> Option<isize> {
+    let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        raw_window_handle::RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
+}
+
 /// 保存済みレイアウトから復元してウインドウを開く（#312: Dock クリックでの復帰用）
 fn open_restored_window(cx: &mut App) {
     let saved_frame = tako_control::layout::load().and_then(|l| l.window);
@@ -20085,14 +20162,18 @@ mod self_test {
         let tab = tab.to_string();
         cx.background_executor()
             .spawn(async move {
-                std::process::Command::new(cli)
-                    .args(args)
-                    .env("TAKO_SOCKET", endpoint)
-                    .env("TAKO_TOKEN", token)
-                    .env("TAKO_PANE_ID", pane)
-                    .env("TAKO_TAB_ID", tab)
-                    .output()
-                    .ok()
+                // #586: tako CLI は console サブシステムなので、GUI プロセスから
+                // 起動するとコンソールウィンドウが出る（Windows）
+                tako_core::platform::process::no_console_window(&mut std::process::Command::new(
+                    cli,
+                ))
+                .args(args)
+                .env("TAKO_SOCKET", endpoint)
+                .env("TAKO_TOKEN", token)
+                .env("TAKO_PANE_ID", pane)
+                .env("TAKO_TAB_ID", tab)
+                .output()
+                .ok()
             })
             .await
     }
@@ -47471,6 +47552,13 @@ mod app_menu_tests {
         );
     }
 
+    /// macOS 慣習のショートカット（#485）は **macOS でだけ**張る（#517 / #585）。
+    ///
+    /// 非 macOS では `cmd-` が platform 修飾 = Win キーへ解決される。Win+Alt+H が
+    /// アプリまで届くと `HideOthers` → `gpui_windows::hide_other_apps` が
+    /// `unimplemented!()` で **panic ＝ アプリごと abort**（器の無いペインは全滅）
+    /// するため、バインドを張らないことで経路ごと塞いでいる。
+    /// **「無いこと」も同じ強さで固定する**（張り直すとここで落ちる）
     #[test]
     fn macos慣習のショートカットがバインドされている() {
         let bindings = key_bindings();
@@ -47479,10 +47567,16 @@ mod app_menu_tests {
             ("tako::HideOthers", "h", true),
             ("tako::MinimizeWindow", "m", false),
         ] {
-            let b = bindings
-                .iter()
-                .find(|b| b.action().name() == action)
-                .unwrap_or_else(|| panic!("{action} のバインドが無い"));
+            let found = bindings.iter().find(|b| b.action().name() == action);
+            if !cfg!(target_os = "macos") {
+                assert!(
+                    found.is_none(),
+                    "{action} のバインドが非 macOS に残っている（Win+Alt+H は \
+                     unimplemented! で app ごと落ちる）"
+                );
+                continue;
+            }
+            let b = found.unwrap_or_else(|| panic!("{action} のバインドが無い"));
             let ks = b.keystrokes()[0].inner();
             assert_eq!(ks.key, key, "{action}");
             assert!(ks.modifiers.platform, "{action} は cmd 修飾");

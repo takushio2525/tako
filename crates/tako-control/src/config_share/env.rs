@@ -344,7 +344,8 @@ fn find_gh() -> Option<String> {
 }
 
 fn command_succeeds(bin: &str, args: &[&str]) -> bool {
-    std::process::Command::new(bin)
+    // #586: GUI プロセス（dispatch / MCP）から到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut std::process::Command::new(bin))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -358,13 +359,15 @@ fn command_succeeds(bin: &str, args: &[&str]) -> bool {
 /// **出力は捨てる**: `gh auth status` はトークンの断片を出しうるため保持しない。
 /// 上限を超えたら kill して `None`（= 判定不能）を返す
 fn run_status(bin: &str, args: &[&str], limit: Duration) -> Option<bool> {
-    let mut child = std::process::Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    // #586: GUI プロセス（dispatch / MCP）から到達するのでコンソールウィンドウを出させない
+    let mut child =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(bin))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
     let start = Instant::now();
     loop {
         match child.try_wait() {

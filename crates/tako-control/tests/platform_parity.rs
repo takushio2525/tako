@@ -363,3 +363,244 @@ fn collect_os_shell_calls(
         }
     }
 }
+
+/// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
+/// 通していない子プロセス起動が、いま把握している数より増えていないこと。
+///
+/// ## なぜ「数」で見るのか
+///
+/// GUI サブシステムの tako-app から console サブシステムの子を素で起動すると、
+/// Windows が**子のためにコンソールウィンドウを新規作成する**（`Stdio::piped()` でも
+/// 防げない）。ポーリング経路がこれをやると窓が明滅し続け、フォーカスまで奪われる。
+///
+/// 残っている未適用箇所はすべて **macOS / unix 限定・テスト専用・意図的に見せる起動**の
+/// いずれかで、Windows の GUI からは到達しない（下表の理由を参照）。ファイル単位の
+/// 許可リストにすると「そのファイルなら何個でも増やせる」穴になるので、**件数を固定**して
+/// 新しい素の起動が 1 つでも増えたら落ちるようにしている。
+///
+/// 落ちたときの直し方:
+/// - Windows の GUI から到達しうるなら `no_console_window` を通す（= 件数は増えない）
+/// - 到達しないなら、この表の件数を理由つきで更新する（黙って数字だけ増やさない）
+#[test]
+fn コンソール窓を抑止していない子プロセス起動が増えていない() {
+    // (パス, 未適用の件数, 理由)
+    const BASELINE: &[(&str, usize, &str)] = &[
+        (
+            "crates/tako-app/src/main.rs",
+            22,
+            "セルフテスト（`self_test::run`）と visual-test feature 限定の検証コード、\
+             および `#[cfg(unix)]` の単体テスト。製品の描画・入力経路に子プロセスは無い",
+        ),
+        (
+            "crates/tako-app/src/open_files.rs",
+            1,
+            "Launch Services ヘルパのモックテスト（macOS 限定。#837）",
+        ),
+        (
+            "crates/tako-app/src/preview.rs",
+            1,
+            "ffmpeg / ffprobe をログインシェル経由で探す経路（`#[cfg(unix)]`）",
+        ),
+        (
+            "crates/tako-app/src/update_checker.rs",
+            2,
+            "macOS 限定の `ditto`（zip 展開）2 箇所。Windows インストーラーの起動は \
+             GUI アプリなので窓を見せるのが正",
+        ),
+        (
+            "crates/tako-cli/src/setup.rs",
+            2,
+            "対話起動 2 箇所（`brew install` の確認プロンプトと setup アシスタント本体）。\
+             対話子は端末を継承させる必要があるので塞がない",
+        ),
+        (
+            "crates/tako-control/src/agents.rs",
+            1,
+            "`ps`（`#[cfg(unix)]`）",
+        ),
+        (
+            "crates/tako-control/src/config_share/env.rs",
+            2,
+            "ログインシェル経由の探索（`#[cfg(unix)]`）とテストモジュールの `git init`",
+        ),
+        (
+            "crates/tako-control/src/dispatch.rs",
+            6,
+            "tmux e2e テスト内（`#[cfg(unix)]`）",
+        ),
+        (
+            "crates/tako-control/src/platform/os_integration.rs",
+            8,
+            "境界 B8 の macOS / Linux 実装（open / osascript / xdg-open）。Windows 側は適用済み",
+        ),
+        (
+            "crates/tako-control/src/remote.rs",
+            7,
+            "`/bin/ps` / `/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト）",
+        ),
+        (
+            "crates/tako-control/src/remote_setup.rs",
+            1,
+            "`brew install` の対話実行。進捗をユーザーの端末に出す必要があるため素で起動する",
+        ),
+        (
+            "crates/tako-control/src/sleep_guard.rs",
+            6,
+            "macOS 限定（pmset / osascript / defaults）",
+        ),
+        (
+            "crates/tako-control/src/telemetry.rs",
+            3,
+            "`hostname`（`#[cfg(unix)]`）と macOS 限定の OS 情報取得（sw_vers / uname）",
+        ),
+        ("crates/tako-core/src/git.rs", 6, "テストモジュール内"),
+        (
+            "crates/tako-core/src/lib.rs",
+            1,
+            "ログインシェル経由のフォールバック（`#[cfg(unix)]`）",
+        ),
+        (
+            "crates/tako-core/src/platform/exe.rs",
+            1,
+            "境界 B16 の unix 実装（ログインシェル経由）。Windows 実装は子プロセスを起こさない",
+        ),
+        (
+            "crates/tako-core/src/platform/locale.rs",
+            1,
+            "`defaults`（macOS 限定）",
+        ),
+        (
+            "crates/tako-core/src/platform/process.rs",
+            1,
+            "境界 B14 の実装本体。単体テストが windows / unix 用に Command を 2 個組み立て、\
+             抑止は 1 回だけ通す（テストの構造上の 1 件で、製品コードの起動ではない）",
+        ),
+        (
+            "crates/tako-core/src/platform/release_assets.rs",
+            3,
+            "テストモジュール内。シェル関数との一致を見る `sh`（#594）と、\
+             PowerShell 側の写しとの一致を見る `pwsh` / インストーラー検査（#587）",
+        ),
+        (
+            "crates/tako-core/src/tmux.rs",
+            1,
+            "tmux e2e テスト内（`#[cfg(unix)]`）",
+        ),
+        (
+            "crates/tako-core/src/tmux_backend.rs",
+            4,
+            "tmux e2e テスト内（`#[cfg(unix)]`）",
+        ),
+    ];
+
+    let root = repo_root();
+    let mut actual: std::collections::BTreeMap<String, usize> = Default::default();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        collect_unguarded_spawns(
+            &root.join("crates").join(crate_dir).join("src"),
+            &root,
+            &mut actual,
+        );
+    }
+
+    let expected: std::collections::BTreeMap<String, usize> = BASELINE
+        .iter()
+        .map(|(p, n, _)| ((*p).to_string(), *n))
+        .collect();
+
+    let mut diffs = Vec::new();
+    for (path, count) in &actual {
+        let want = expected.get(path).copied().unwrap_or(0);
+        if *count > want {
+            diffs.push(format!(
+                "{path}: {want} 件のはずが {count} 件（増えている）"
+            ));
+        }
+    }
+    // 減った / 消えた分も知らせる（表を実態に合わせて縮められる）
+    for (path, want) in &expected {
+        let got = actual.get(path).copied().unwrap_or(0);
+        if got < *want {
+            diffs.push(format!(
+                "{path}: {want} 件の想定だが {got} 件（減ったので表を更新してよい）"
+            ));
+        }
+    }
+
+    // 落ちたときに表をそのまま貼り替えられるよう、実測値を全部出す
+    let actual_table = actual
+        .iter()
+        .map(|(p, n)| format!("        (\"{p}\", {n}, \"理由を書く\"),"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        diffs.is_empty(),
+        "コンソール窓を抑止していない子プロセス起動の件数が想定と違う:\n  {}\n\
+         → Windows の GUI から到達するなら \
+         tako_core::platform::process::no_console_window を通してください（#628 / #586）\n\
+         \n現在の実測値:\n{}",
+        diffs.join("\n  "),
+        actual_table
+    );
+}
+
+/// `Command::new(` の出現のうち、対応する `no_console_window` が無いものをファイル単位で数える。
+///
+/// **1 個の抑止呼び出しは 1 個の起動しか守れない**ので、近傍にあるかを見るだけでは足りない
+/// （素の起動を守られている起動の隣へ足すと、同じ抑止を二重に数えて見逃す）。
+/// 抑止呼び出しを「消費」しながら順に対応づけ、相手の見つからなかった起動だけを数える。
+fn collect_unguarded_spawns(
+    dir: &Path,
+    root: &Path,
+    out: &mut std::collections::BTreeMap<String, usize>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_unguarded_spawns(&path, root, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let is_comment = |l: &str| l.trim_start().starts_with("//");
+
+        // 抑止呼び出しの行番号（コメント中の言及は数えない）
+        let mut guards: Vec<(usize, bool)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("no_console_window") && !is_comment(l))
+            .map(|(i, _)| (i, false))
+            .collect();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if !line.contains("Command::new(") || is_comment(line) {
+                continue;
+            }
+            let from = idx.saturating_sub(3);
+            let to = idx + 11;
+            // まだ誰にも使われていない抑止呼び出しを 1 個だけ確保する
+            let matched = guards
+                .iter_mut()
+                .find(|(g, used)| !*used && *g >= from && *g <= to);
+            match matched {
+                Some((_, used)) => *used = true,
+                None => *out.entry(rel.clone()).or_insert(0) += 1,
+            }
+        }
+    }
+}

@@ -7722,19 +7722,21 @@ fn read_mcp_registration(scope: &McpScope) -> Option<String> {
 
 /// claude CLI のパスを検出
 fn which_claude() -> Option<String> {
-    std::process::Command::new("which")
-        .arg("claude")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if p.is_empty() {
-                None
-            } else {
-                Some(p)
-            }
-        })
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(
+        std::process::Command::new("which").arg("claude"),
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .and_then(|o| {
+        let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if p.is_empty() {
+            None
+        } else {
+            Some(p)
+        }
+    })
 }
 
 fn setup_mcp_via_cli(
@@ -7749,6 +7751,8 @@ fn setup_mcp_via_cli(
 
     // 既存の登録を先に除去（claude mcp add は上書きを許さないため）
     let mut rm = std::process::Command::new(claude_bin);
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut rm);
     rm.args(["mcp", "remove", "--scope", scope_arg, "tako"]);
     if let McpScope::Project(cwd) = scope {
         rm.current_dir(cwd);
@@ -7756,6 +7760,7 @@ fn setup_mcp_via_cli(
     let _ = rm.output(); // 未登録なら失敗するが無視
 
     let mut cmd = std::process::Command::new(claude_bin);
+    tako_core::platform::process::no_console_window(&mut cmd);
     cmd.args([
         "mcp",
         "add",
@@ -7891,13 +7896,15 @@ pub fn resolve_tako_binary() -> String {
 fn run_setup_cli(tako_bin: &str, answers_json: &str) -> Result<Value, DispatchError> {
     use std::io::Write as _;
 
-    let mut child = std::process::Command::new(tako_bin)
-        .args(["setup", "--yes", "--answers", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| DispatchError::Operation(format!("tako setup の起動に失敗: {e}")))?;
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
+    let mut child =
+        tako_core::platform::process::no_console_window(&mut std::process::Command::new(tako_bin))
+            .args(["setup", "--yes", "--answers", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| DispatchError::Operation(format!("tako setup の起動に失敗: {e}")))?;
     child
         .stdin
         .take()
@@ -7964,7 +7971,8 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let cli_version = cli_path
         .as_ref()
         .and_then(|path| {
-            std::process::Command::new(path)
+            // #586: GUI プロセス経由の診断でもコンソールウィンドウを出させない
+            tako_core::platform::process::no_console_window(&mut std::process::Command::new(path))
                 .arg("--version")
                 .output()
                 .ok()
@@ -8048,8 +8056,8 @@ fn home_dir() -> Option<std::path::PathBuf> {
 }
 
 fn which(name: &str) -> Option<String> {
-    std::process::Command::new("which")
-        .arg(name)
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(std::process::Command::new("which").arg(name))
         .output()
         .ok()
         .filter(|out| out.status.success())
