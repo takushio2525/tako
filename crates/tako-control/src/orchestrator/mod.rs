@@ -2357,34 +2357,72 @@ fn run_claude_agents_json_uncached(targets: &[AgentScanTarget]) -> Option<Vec<u8
     merge_agents_json(&outputs)
 }
 
+/// エージェント走査に使う argv。
+///
+/// POSIX のシェル片は**同じ語を空白で並べたもの**（引用の要る文字を含まないので
+/// そのまま連結できる）。1 か所から両方を作ることで、
+/// 「シェル片だけ直して argv を忘れた」というずれを構造的に防ぐ（#877）
+const AGENTS_SCAN_ARGV: [&str; 3] = ["claude", "agents", "--json"];
+
+/// 走査 1 回ぶんの `CLAUDE_CONFIG_DIR` の扱い（純関数。テスト可能）。
+///
+/// 返すのは `(POSIX シェル片への前置き, 子プロセスへ設定する値。None = 消す)` で、
+/// **同じ意図を 2 通りで表している**:
+///
+/// - 前置きはログインシェルの rc（direnv 等）に勝つため。rc はコマンド行より先に走るので
+///   `Command::env` だけでは負ける（#512 と同型）
+/// - env は Windows では**これだけが効く**。シェルを経由しない = 前置きが存在しない（#877）
+fn agent_scan_config_dir_env(target: &AgentScanTarget) -> (String, Option<&str>) {
+    match target {
+        AgentScanTarget::Default => (format!("unset {CLAUDE_CONFIG_DIR_ENV}; "), None),
+        AgentScanTarget::ConfigDir(path) => (
+            format!("export {CLAUDE_CONFIG_DIR_ENV}={}; ", agent::sh_quote(path)),
+            Some(path.as_str()),
+        ),
+    }
+}
+
 /// 単一走査先に対する `claude agents --json` の実行
 fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    let mut command = std::process::Command::new(&shell);
-    // #586: GUI から数秒おきに呼ばれるのでコンソール窓を出さない
-    tako_core::platform::process::no_console_window(&mut command);
-    // プロセス環境と、ログインシェルの rc（direnv 等）の両方に勝つ必要がある。
-    // rc はコマンド文字列より先に走るので、決め手は先頭の unset / export の方（#512 と同型）
-    let prefix = match target {
-        AgentScanTarget::Default => {
-            command.env_remove(CLAUDE_CONFIG_DIR_ENV);
-            format!("unset {CLAUDE_CONFIG_DIR_ENV}; ")
-        }
-        AgentScanTarget::ConfigDir(path) => {
-            command.env(CLAUDE_CONFIG_DIR_ENV, path);
-            format!("export {CLAUDE_CONFIG_DIR_ENV}={}; ", agent::sh_quote(path))
+    let (posix_prefix, config_dir) = agent_scan_config_dir_env(target);
+    // 「ユーザーの環境で CLI を 1 回走らせる」形は OS で違う（#877。抽象境界 B21）。
+    // unix はログインシェル経由（`.app` の痩せた PATH 対策）、Windows は PATH で解決した
+    // 実体を直接起動する（`SHELL` も `-l -c` も無いので従来は必ず失敗していた）
+    let plan = tako_core::platform::child_cmd::user_env_cli(
+        &format!("{posix_prefix}{}", AGENTS_SCAN_ARGV.join(" ")),
+        AGENTS_SCAN_ARGV[0],
+        &AGENTS_SCAN_ARGV[1..],
+    );
+    let Some(plan) = plan else {
+        crate::diag::flow_log("agents 走査: claude の実体を解決できない（PATH に無い）");
+        return None;
+    };
+    let mut command = plan.command();
+    match config_dir {
+        None => command.env_remove(CLAUDE_CONFIG_DIR_ENV),
+        Some(path) => command.env(CLAUDE_CONFIG_DIR_ENV, path),
+    };
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(e) => {
+            crate::diag::flow_log(&format!(
+                "agents 走査: 子プロセスを起こせない（{:?}）",
+                e.kind()
+            ));
+            return None;
         }
     };
-    let output = command
-        .args(["-l", "-c", &format!("{prefix}claude agents --json")])
-        .output()
-        .ok()?;
     if output.status.success() {
         Some(output.stdout)
     } else {
+        // 認証切れなど claude 側の異常はここに来る。**出力そのものは診断ログへ出さない**
+        // （AGENTS.md の絶対ルール）。残すのは終了コードと長さだけ
+        crate::diag::flow_log(&format!(
+            "agents 走査: claude が異常終了（code={:?} stdout={}B stderr={}B）",
+            output.status.code(),
+            output.stdout.len(),
+            output.stderr.len()
+        ));
         None
     }
 }
@@ -4766,6 +4804,47 @@ worker_agents:
         // 「成功したが 0 件」は失敗ではない（該当アカウントに稼働中エージェントが無いだけ）
         let empty = merge_agents_json(&[Some(b"[]".to_vec())]).expect("空配列は成功");
         assert_eq!(empty, b"[]");
+    }
+
+    /// #877: 走査コマンドの 2 形（POSIX シェル片 / argv）は 1 か所から作るので必ず一致する
+    #[test]
+    fn agents走査のシェル片とargvが同じコマンドを指す() {
+        assert_eq!(AGENTS_SCAN_ARGV.join(" "), "claude agents --json");
+        assert_eq!(AGENTS_SCAN_ARGV[0], "claude");
+        assert_eq!(&AGENTS_SCAN_ARGV[1..], &["agents", "--json"]);
+    }
+
+    /// macOS の従来出力を 1 バイトも変えないことの固定（#877 のリファクタ前と同一）
+    #[test]
+    fn agents走査のposix前置きは従来と同一で環境変数も同時に指定する() {
+        let (prefix, env) = agent_scan_config_dir_env(&AgentScanTarget::Default);
+        assert_eq!(prefix, "unset CLAUDE_CONFIG_DIR; ");
+        assert_eq!(
+            env, None,
+            "既定は消す（プロセス env の紛れ込みを断つ。#571）"
+        );
+        assert_eq!(
+            format!("{prefix}{}", AGENTS_SCAN_ARGV.join(" ")),
+            "unset CLAUDE_CONFIG_DIR; claude agents --json"
+        );
+
+        let target = AgentScanTarget::ConfigDir("/Users/u/.claude-univ".into());
+        let (prefix, env) = agent_scan_config_dir_env(&target);
+        assert_eq!(prefix, "export CLAUDE_CONFIG_DIR=/Users/u/.claude-univ; ");
+        assert_eq!(env, Some("/Users/u/.claude-univ"));
+    }
+
+    /// 空白や記号を含む config dir でもシェル片が壊れない（Windows パスもここを通る）
+    #[test]
+    fn agents走査の前置きはconfig_dirを引用する() {
+        let target = AgentScanTarget::ConfigDir("C:\\Users\\My Name\\.claude".into());
+        let (prefix, env) = agent_scan_config_dir_env(&target);
+        assert_eq!(
+            prefix,
+            "export CLAUDE_CONFIG_DIR='C:\\Users\\My Name\\.claude'; "
+        );
+        // env は引用しない（`Command::env` は生の値を渡す）
+        assert_eq!(env, Some("C:\\Users\\My Name\\.claude"));
     }
 
     // --- プロファイル種別と CRUD（Issue #721）---
