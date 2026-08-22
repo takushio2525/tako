@@ -3976,7 +3976,7 @@ fn remote_start() -> Result<(), String> {
             "この URL は恒久固定で secret を含みません（Tailscale MagicDNS 名。tailnet 内限定）。"
         );
         eprintln!("スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。");
-        eprintln!("初回アクセス時は Mac の画面にペアリング承認ダイアログが表示されます。");
+        eprintln!("初回アクセス時はこの PC の画面にペアリング承認ダイアログが表示されます。");
     }
     Ok(())
 }
@@ -4002,7 +4002,7 @@ fn remote_status() -> Result<(), String> {
 }
 
 /// `tako remote devices` — ペアリング済み端末の一覧・失効。
-/// ペアリングの承認・role 変更は Mac 画面の GUI ダイアログでのみ行う
+/// ペアリングの承認・role 変更は tako-app の GUI ダイアログでのみ行う
 /// （AI フルコントロール不変条件の例外。`.agent/requirements.md`）
 fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
     let result = match command {

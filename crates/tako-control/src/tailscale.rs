@@ -11,11 +11,20 @@ use serde_json::Value;
 
 /// tailscale CLI の探索候補。PATH → brew 標準 → App Store 版 / brew cask 版
 /// （App Store 版は .app 同梱バイナリが CLI を兼ねる。弾 0 項目 5）
+#[cfg(not(windows))]
 const TAILSCALE_CANDIDATES: &[&str] = &[
     "tailscale",
     "/opt/homebrew/bin/tailscale",
     "/usr/local/bin/tailscale",
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+];
+
+/// Windows: PATH に入る "tailscale.exe" + 既定のインストール先
+#[cfg(windows)]
+const TAILSCALE_CANDIDATES: &[&str] = &[
+    "tailscale.exe",
+    r"C:\Program Files\Tailscale\tailscale.exe",
+    r"C:\Program Files (x86)\Tailscale\tailscale.exe",
 ];
 
 /// tailscale コマンドの実行タイムアウト。LocalAPI の Unix socket 呼び出しは
@@ -67,15 +76,29 @@ pub enum MissingItem {
 }
 
 impl MissingItem {
-    /// 不足項目の 1 行説明（ユーザー向け表示用）
+    /// 不足項目の 1 行説明（ユーザー向け表示用）。
+    /// #528: 導入・起動の案内は OS で実際に通る手順を出す
+    /// （Windows のテスターへ `brew install` を出す事故を防ぐ。#525 と同じ趣旨）
     pub fn describe(&self) -> String {
         match self {
             Self::CliNotFound => {
-                "Tailscale が未導入（App Store 版アプリ または brew install tailscale）".into()
+                if cfg!(windows) {
+                    "Tailscale が未導入（https://tailscale.com/download/windows \
+                     または winget install Tailscale.Tailscale）"
+                        .into()
+                } else {
+                    "Tailscale が未導入（App Store 版アプリ または brew install tailscale）".into()
+                }
             }
             Self::DaemonNotRunning => {
-                "Tailscale デーモンが起動していない（アプリを起動するか tailscaled を起動）"
-                    .into()
+                if cfg!(windows) {
+                    "Tailscale が起動していない（スタートメニューから Tailscale を起動。\
+                     トレイに常駐アイコンが出ていれば起動済み）"
+                        .into()
+                } else {
+                    "Tailscale デーモンが起動していない（アプリを起動するか tailscaled を起動）"
+                        .into()
+                }
             }
             Self::NotLoggedIn => {
                 "Tailscale にログインしていない（tailscale up でブラウザ認証）".into()
@@ -722,11 +745,42 @@ mod tests {
 
     #[test]
     fn missing_itemのdescribeは対処を含む() {
-        assert!(MissingItem::CliNotFound.describe().contains("brew"));
         assert!(MissingItem::NotLoggedIn.describe().contains("tailscale up"));
         assert!(MissingItem::HttpsNotEnabled.describe().contains("MagicDNS"));
         assert!(MissingItem::BackendNotRunning("Stopped".into())
             .describe()
             .contains("Stopped"));
+    }
+
+    /// #528: 導入案内は OS で実際に通る手順であること。
+    /// Windows のテスターに `brew install` を出す事故（#525 と同型）の回帰止め
+    #[test]
+    fn 導入案内はプラットフォームごとの手順を出す() {
+        let cli = MissingItem::CliNotFound.describe();
+        let daemon = MissingItem::DaemonNotRunning.describe();
+        if cfg!(windows) {
+            assert!(
+                cli.contains("winget") || cli.contains("tailscale.com/download/windows"),
+                "Windows の案内が winget / 公式ダウンロードでない: {cli}"
+            );
+            assert!(
+                !cli.contains("brew"),
+                "Windows に brew を案内している: {cli}"
+            );
+            assert!(
+                !cli.contains("App Store"),
+                "Windows に App Store を案内している: {cli}"
+            );
+            assert!(
+                !daemon.contains("tailscaled"),
+                "Windows に tailscaled 起動を案内している: {daemon}"
+            );
+        } else {
+            assert!(cli.contains("brew"), "macOS の案内に brew が無い: {cli}");
+            assert!(
+                !cli.contains("winget"),
+                "macOS に winget を案内している: {cli}"
+            );
+        }
     }
 }

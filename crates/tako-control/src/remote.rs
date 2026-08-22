@@ -194,16 +194,19 @@ fn cleanup_state_files() {
     cleanup_legacy_state_files();
 }
 
-/// 旧バージョンが /tmp に残した state ファイルを掃除する（移行互換）
+/// 旧バージョンが /tmp に残した state ファイルを掃除する（移行互換。unix のみ）
 fn cleanup_legacy_state_files() {
-    let legacy = std::path::PathBuf::from("/tmp");
-    for name in [
-        "tako-remote.pid",
-        "tako-remote.token",
-        "tako-remote.port",
-        "tako-remote.tunnel",
-    ] {
-        let _ = std::fs::remove_file(legacy.join(name));
+    #[cfg(unix)]
+    {
+        let legacy = std::path::PathBuf::from("/tmp");
+        for name in [
+            "tako-remote.pid",
+            "tako-remote.token",
+            "tako-remote.port",
+            "tako-remote.tunnel",
+        ] {
+            let _ = std::fs::remove_file(legacy.join(name));
+        }
     }
 }
 
@@ -301,10 +304,13 @@ impl DaemonCtx {
     }
 }
 
-/// macOS 通知を表示する（接続開始終了・操作セッション開始。#283）。
-/// osascript 経由（依存追加なし）。`TAKO_REMOTE_NO_NOTIFY=1` で抑止（テスト・検証用）。
+/// OS 通知を表示する（接続開始終了・操作セッション開始。#283）。
+/// 実体は B8（`os_integration::notify`）。macOS は osascript、
+/// **Windows は未実装なので no-op**（#528。ペアリング承認ダイアログ自体は
+/// tako-app の GUI が出すので、通知が無くても承認フローは成立する）。
+/// `TAKO_REMOTE_NO_NOTIFY=1` で抑止（テスト・検証用）。
 /// 通知文にはデバイス名・イベントのみを載せ、ペイン内容は含めない
-fn notify_macos(message: &str) {
+fn notify_remote_event(message: &str) {
     if std::env::var("TAKO_REMOTE_NO_NOTIFY").is_ok_and(|v| v == "1") {
         return;
     }
@@ -480,13 +486,37 @@ impl AppIpcClient {
         Ok(response.result.unwrap_or(Value::Null))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn roundtrip_raw(
-        _socket: &str,
-        _token: &str,
-        _request: crate::protocol::Request,
+        socket: &str,
+        token: &str,
+        request: crate::protocol::Request,
     ) -> Result<Value, String> {
-        Err("Windows の IPC は未実装".into())
+        use std::io::{BufRead, BufReader, Write};
+
+        let stream = crate::platform::named_pipe::connect_client(socket, 3_000)
+            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        let mut writer = stream
+            .try_clone()
+            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+        let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
+        let json =
+            serde_json::to_string(&envelope).map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
+        writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+        if line.is_empty() {
+            return Err("tako app から応答が返らなかった".into());
+        }
+        let response: crate::protocol::ResponseEnvelope =
+            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        if let Some(error) = response.error {
+            return Err(error.message);
+        }
+        Ok(response.result.unwrap_or(Value::Null))
     }
 }
 
@@ -839,6 +869,25 @@ fn broadcaster_loop(
     }
 }
 
+/// ローカルエンドポイントのファイルを drop 時に回収するガード（#528）。
+///
+/// `run_daemon` は `bind()` の**後**に起動前チェック（到達手段 / Tailscale /
+/// デバイスレジストリ）を行うため、そこで弾かれると endpoint ファイルだけが残る。
+/// unix では socket ファイル、Windows ではポート番号を書いたテキストで、
+/// 後者は残骸のポートを別プロセスが取ると生存誤判定の元になる。
+///
+/// 正常終了時も `cleanup_state_files()` が同じファイルを消すが、削除は冪等なので
+/// 二重に消えても害はない（ガードを外す条件を持たせない方が漏れが出ない）
+struct EndpointFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for EndpointFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Tailscale setup の不足項目を列挙した起動拒否エラーを組み立てる。
 /// `tako remote start` の誘導文言（Issue #282: 黙って失敗させない）
 fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
@@ -857,10 +906,14 @@ fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
 
 /// Tailscale の setup 状態を検証し、serve を設定して固定 ts.net URL を返す。
 /// 返り値: (tailscale CLI パス, 固定 URL)。
-/// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自 socket を
-/// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する。
-/// 旧 TCP 形式（`http://127.0.0.1:*`）は tako の残骸と判定して自動移行する
-fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, String)> {
+///
+/// unix: UDS をバックエンドに `tailscale serve unix:<socket>` を張る。
+/// Windows: loopback TCP をバックエンドに `tailscale serve http://127.0.0.1:<port>` を張る
+/// （Windows の tailscale は `unix:` バックエンドをサポートしない）。
+///
+/// 既存の serve 設定が tako 管理形式で自エンドポイントを向いている場合は再利用し、
+/// それ以外の設定は上書きせず拒否する
+fn establish_tailscale_serve(endpoint: &std::path::Path) -> io::Result<(String, String)> {
     let status = crate::tailscale::setup_status();
     if !status.ready() {
         return Err(setup_incomplete_error(&status));
@@ -873,21 +926,30 @@ fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, Stri
         .ts_net_url()
         .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
 
-    let our_target = crate::tailscale::proxy_target_for_socket(sock);
+    // 自分のバックエンド表現を組み立てる
+    let our_target = our_serve_target(endpoint);
+    let is_our_tcp =
+        |t: &str| t.starts_with("http://127.0.0.1:") && our_target.starts_with("http://127.0.0.1:");
+
     match crate::tailscale::serve_state(&cli).map_err(io::Error::other)? {
         crate::tailscale::ServeState::NotConfigured => {
-            crate::tailscale::serve_start_unix(&cli, sock).map_err(io::Error::other)?;
+            start_serve_for_endpoint(&cli, endpoint)?;
         }
-        crate::tailscale::ServeState::Proxy(target) if target == our_target => {
-            // 前回の設定が残っている（強制終了等）。同一 socket なのでそのまま再利用する
+        crate::tailscale::ServeState::Proxy(ref target) if *target == our_target => {
+            // 前回の設定が残っている。同一エンドポイントなのでそのまま再利用する
         }
         crate::tailscale::ServeState::Proxy(ref target)
-            if target.starts_with("http://127.0.0.1:") =>
+            if cfg!(unix) && target.starts_with("http://127.0.0.1:") =>
         {
-            // 旧 TCP 形式の残骸 → UDS 形式へ自動移行
+            // unix 環境で旧 TCP 形式の残骸 → UDS 形式へ自動移行
             eprintln!("旧 TCP 形式の serve 設定を検出しました（{target}）。UDS 形式へ移行します…");
             crate::tailscale::serve_stop(&cli).map_err(io::Error::other)?;
-            crate::tailscale::serve_start_unix(&cli, sock).map_err(io::Error::other)?;
+            start_serve_for_endpoint(&cli, endpoint)?;
+        }
+        crate::tailscale::ServeState::Proxy(ref target) if is_our_tcp(target) => {
+            // Windows で旧ポートの残骸 → 新ポートで張り直し
+            crate::tailscale::serve_stop(&cli).map_err(io::Error::other)?;
+            start_serve_for_endpoint(&cli, endpoint)?;
         }
         crate::tailscale::ServeState::Proxy(target) => {
             return Err(io::Error::other(format!(
@@ -904,6 +966,41 @@ fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, Stri
         }
     }
     Ok((cli, base_url))
+}
+
+/// エンドポイントから serve のプロキシ先表現を組み立てる。
+/// unix: `unix:<socket_path>`。Windows: endpoint ファイルからポート番号を読んで
+/// `http://127.0.0.1:<port>`
+fn our_serve_target(endpoint: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        crate::tailscale::proxy_target_for_socket(endpoint)
+    }
+    #[cfg(windows)]
+    {
+        // endpoint ファイルにポート番号が書かれている（local_endpoint::bind が書き出す）
+        let port: u16 = std::fs::read_to_string(endpoint)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        crate::tailscale::proxy_target_for_port(port)
+    }
+}
+
+/// エンドポイントに対応する tailscale serve を張る
+fn start_serve_for_endpoint(cli: &str, endpoint: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        crate::tailscale::serve_start_unix(cli, endpoint).map_err(io::Error::other)
+    }
+    #[cfg(windows)]
+    {
+        let port: u16 = std::fs::read_to_string(endpoint)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| io::Error::other("daemon のポートファイルを読めない"))?;
+        crate::tailscale::serve_start(cli, port).map_err(io::Error::other)
+    }
 }
 
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
@@ -939,18 +1036,26 @@ pub fn run_daemon() -> io::Result<()> {
         let _ = std::fs::remove_file(&sock);
     }
     let server = local_endpoint::bind(&sock)?;
+    // bind の後の起動前チェック（到達手段・Tailscale・レジストリ）で失敗すると
+    // endpoint ファイルが取り残される。Windows では中身がポート番号なので、
+    // 残骸のポートを**別の無関係なプロセス**が取っていると probe_alive が
+    // 「デーモンが生きている」と誤判定する（#528）。どの早期 return でも回収する
+    let _endpoint_guard = EndpointFileGuard { path: sock.clone() };
 
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
 
     // アウトオブプロセス到達手段の有無を確認する。remote デーモンは tako-app とは
-    // 別プロセスなので、ペインを読む・操作するには backend 側の到達手段が要る
-    if !tako_core::backend::capabilities().detached_access {
+    // 別プロセスなので、ペインを読む・操作するには backend 側の到達手段が要る。
+    // detached_capture（読み取り専用の到達）があれば screen/scrollback は動く。
+    // 操作系（input/close）は IPC 経由で dispatch に委ねるので detached_access は必須ではない
+    let caps = tako_core::backend::capabilities();
+    if !caps.detached_access && !caps.detached_capture {
         return Err(io::Error::other(format!(
             "永続バックエンド（{}）にアウトオブプロセス到達手段が無い。\
              remote サーバーは tako-app の外からペインを操作するため到達手段が必須です\
-             （macOS / Linux では tmux をインストールすると有効になります）",
-            tako_core::backend::capabilities().label
+             （macOS / Linux では tmux、Windows では psmux を導入すると有効になります）",
+            caps.label
         )));
     }
 
@@ -993,7 +1098,7 @@ pub fn run_daemon() -> io::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
 
-    // SIGTERM / SIGINT ハンドラ
+    // 終了シグナルハンドラ
     #[cfg(unix)]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1014,7 +1119,6 @@ pub fn run_daemon() -> io::Result<()> {
             SHUTDOWN_FLAG.store(true, Relaxed);
         }
 
-        // シグナル待ちスレッド
         let shutdown_clone = shutdown_for_signal;
         std::thread::Builder::new()
             .name("signal-watcher".into())
@@ -1026,13 +1130,39 @@ pub fn run_daemon() -> io::Result<()> {
                 }
             })?;
     }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: unsafe extern "system" fn(u32) -> i32,
+                add: i32,
+            ) -> i32;
+        }
+        static SHUTDOWN_WIN: AtomicBool = AtomicBool::new(false);
+        unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+            SHUTDOWN_WIN.store(true, Ordering::Relaxed);
+            1 // handled
+        }
+        unsafe { SetConsoleCtrlHandler(ctrl_handler, 1) };
+        let shutdown_clone = shutdown_for_signal;
+        std::thread::Builder::new()
+            .name("signal-watcher".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if SHUTDOWN_WIN.load(Ordering::Relaxed) {
+                    shutdown_clone.store(true, Ordering::Relaxed);
+                    break;
+                }
+            })?;
+    }
 
     // 公開 URL を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
     if let Err(e) = write_secret_file(&url_path(), &base_url) {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
         // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
         if !test_mode {
-            let _ = crate::tailscale::serve_stop_if_ours_unix(&ts_cli, &sock);
+            cleanup_serve_leftover();
         }
         cleanup_state_files();
         return Err(io::Error::other(format!(
@@ -1043,12 +1173,17 @@ pub fn run_daemon() -> io::Result<()> {
     // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
     // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）。
     // #283: URL に token は載せない（接続時の認証は機器ペアリングが行う）
-    let info = json!({
+    let mut info = json!({
         "running": true,
         "socket": sock.display().to_string(),
         "url": base_url,
         "transport": "tailscale-serve",
+        // #528: ローカル待ち受けの実体（unix = UDS / Windows = loopback TCP）
+        "endpoint_kind": local_endpoint::kind(),
     });
+    if let Some(port) = local_endpoint::loopback_port(&sock) {
+        info["endpoint_port"] = json!(port);
+    }
     println!("{info}");
 
     // CORS 許可 origin を設定（#287 P1: `*` 廃止 → base_url のみエコー）
@@ -1122,9 +1257,12 @@ pub fn run_daemon() -> io::Result<()> {
     // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
     // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
     if !test_mode {
+        #[cfg(unix)]
         if let Err(e) = crate::tailscale::serve_stop_if_ours_unix(&ts_cli, &sock) {
             eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
         }
+        #[cfg(windows)]
+        cleanup_serve_leftover();
     }
     cleanup_state_files();
 
@@ -1192,7 +1330,14 @@ pub fn daemon_status() -> Value {
         "socket": socket_path().display().to_string(),
         "url": base_url,
         "transport": "tailscale-serve",
+        // #528: ローカル待ち受けの実体を申告する。macOS は UDS だが Windows は
+        // loopback TCP なので、CLI / MCP が「socket」だけを見ると実態と食い違う
+        "endpoint_kind": local_endpoint::kind(),
     });
+    // Windows（loopback TCP）は実ポートも返す。UDS では None なのでキーが増えない
+    if let Some(port) = local_endpoint::loopback_port(&socket_path()) {
+        status["endpoint_port"] = json!(port);
+    }
     // 稼働中 serve の実行バイナリを可視化する（#432: どの世代の serve が
     // 動いているかを ps なしで確認できるようにする）
     if let Some(exe) = pid_info.exe.as_deref().filter(|e| !e.is_empty()) {
@@ -1311,7 +1456,87 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Windows には ps の args 相当を非依存で読む手段が無い（コマンドラインの取得は
+        // PEB 読み出しが要る）。代わりに **実行ファイル名の完全一致** + **起動時刻の照合**
+        // の 2 段で同定する。
+        //
+        // 「パスに tako を含む」で緩めてはいけない: テストバイナリ（tako_control-*.exe）や
+        // tako-app.exe まで一致してしまい、fail-safe のはずが**自分自身を kill** する
+        // （実測: cargo test のハーネスが落ちた）
+        use std::ffi::c_void;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn QueryFullProcessImageNameW(
+                handle: *mut c_void,
+                flags: u32,
+                buf: *mut u16,
+                size: *mut u32,
+            ) -> i32;
+            fn GetProcessTimes(
+                handle: *mut c_void,
+                creation: *mut u64,
+                exit: *mut u64,
+                kernel: *mut u64,
+                user: *mut u64,
+            ) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, info.pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let name_ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
+        let mut created: u64 = 0;
+        let (mut exit_t, mut kernel_t, mut user_t) = (0u64, 0u64, 0u64);
+        let times_ok = unsafe {
+            GetProcessTimes(
+                handle,
+                &mut created,
+                &mut exit_t,
+                &mut kernel_t,
+                &mut user_t,
+            )
+        };
+        unsafe { CloseHandle(handle) };
+        if name_ok == 0 {
+            // 検証不能 = 安全側に倒す（kill しない）
+            return false;
+        }
+        let exe_path = String::from_utf16_lossy(&buf[..len as usize]);
+        let file_name = std::path::Path::new(&exe_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if file_name != format!("tako{}", std::env::consts::EXE_SUFFIX).to_ascii_lowercase() {
+            return false;
+        }
+        // 起動時刻の照合（記録がある場合のみ。±5 秒の余裕。unix の etime チェックと同じ）。
+        // PID 再利用で別の tako.exe を掴んでしまう事故を防ぐ最後の砦
+        if let Some(recorded) = info.start_time {
+            if times_ok == 0 {
+                return false;
+            }
+            // FILETIME（1601-01-01 からの 100ns 単位）→ Unix epoch 秒
+            const FILETIME_UNIX_EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+            let created_unix = created
+                .checked_div(10_000_000)
+                .and_then(|s| s.checked_sub(FILETIME_UNIX_EPOCH_DIFF_SECS));
+            let Some(created_unix) = created_unix else {
+                return false;
+            };
+            if created_unix.abs_diff(recorded) > 5 {
+                return false;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = info;
     }
@@ -1363,7 +1588,22 @@ fn cleanup_serve_leftover() {
     let Some(cli) = crate::tailscale::find_tailscale() else {
         return;
     };
-    let _ = crate::tailscale::serve_stop_if_ours_unix(&cli, &socket_path());
+    #[cfg(unix)]
+    {
+        let _ = crate::tailscale::serve_stop_if_ours_unix(&cli, &socket_path());
+    }
+    #[cfg(windows)]
+    {
+        // Windows では TCP ポートをバックエンドにしているので、
+        // 残っている loopback TCP 形式の serve 設定を回収する
+        if let Ok(crate::tailscale::ServeState::Proxy(ref target)) =
+            crate::tailscale::serve_state(&cli)
+        {
+            if target.starts_with("http://127.0.0.1:") {
+                let _ = crate::tailscale::serve_stop(&cli);
+            }
+        }
+    }
 }
 
 fn daemon_stop_impl(force: bool) -> Result<Value, String> {
@@ -1472,14 +1712,14 @@ fn serve_binary_impl(
     current_exe: Option<std::path::PathBuf>,
     stable_exists: bool,
 ) -> Option<String> {
+    let cli_name = format!("tako{}", std::env::consts::EXE_SUFFIX);
     if isolated {
         if let Some(ref exe) = current_exe {
-            if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+            if exe.file_name().and_then(|n| n.to_str()) == Some(&cli_name) {
                 return Some(exe.display().to_string());
             }
-            // GUI（tako-app）等からの起動: 同ディレクトリの CLI（同世代）を使う
             if let Some(dir) = exe.parent() {
-                let sibling = dir.join("tako");
+                let sibling = dir.join(&cli_name);
                 if sibling.is_file() {
                     return Some(sibling.display().to_string());
                 }
@@ -1490,7 +1730,7 @@ fn serve_binary_impl(
         return Some(crate::dispatch::STABLE_APP_BINARY.to_string());
     }
     if let Some(ref exe) = current_exe {
-        if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+        if exe.file_name().and_then(|n| n.to_str()) == Some(&cli_name) {
             return Some(exe.display().to_string());
         }
     }
@@ -1543,7 +1783,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // setsid でプロセスグループから切り離し、親（tmux セッション）終了時に巻き添えで死なないようにする
+    // プロセスグループから切り離し、親（tmux セッション / ペイン）終了時に巻き添えで死なないようにする
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1553,6 +1793,13 @@ pub fn spawn_daemon() -> Result<Value, String> {
                 Ok(())
             });
         }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
     let mut child = cmd
@@ -1649,38 +1896,42 @@ fn is_process_alive(pid: u32) -> bool {
     {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        use std::ffi::c_void;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn GetExitCodeProcess(handle: *mut c_void, code: *mut u32) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+        unsafe { CloseHandle(handle) };
+        ok != 0 && code == STILL_ACTIVE
     }
 }
 
 /// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
 /// SIGTERM → 最大 5 秒ポーリング → 終了しなければ SIGKILL
 fn kill_stale_daemon(pid: u32) {
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    let _ = crate::platform::process::terminate(pid, false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !is_process_alive(pid) {
+            cleanup_state_files();
+            return;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if !is_process_alive(pid) {
-                cleanup_state_files();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
+    let _ = crate::platform::process::terminate(pid, true);
+    std::thread::sleep(std::time::Duration::from_millis(200));
     cleanup_state_files();
 }
 
@@ -3134,7 +3385,7 @@ fn handle_admin_api(
             let result = ctx.registry.lock().unwrap().approve(device_id, role);
             match result {
                 Ok(device) => {
-                    notify_macos(&format!(
+                    notify_remote_event(&format!(
                         "{} を {} として登録しました",
                         device.name,
                         device.role.as_str()
@@ -3337,7 +3588,7 @@ fn handle_api_v2_routes(
                 );
                 drop(reg);
                 if session_started {
-                    notify_macos(&format!("{} が操作を開始しました", device.name));
+                    notify_remote_event(&format!("{} が操作を開始しました", device.name));
                 }
             }
             // dispatch Send へは PaneId（数値）を渡して GUI 側の resolve_pane に解決させる
@@ -3940,7 +4191,7 @@ fn handle_ws_v2(
             &device.name,
             json!({ "route": "/ws" }),
         );
-        notify_macos(&format!("{} が接続しました", device.name));
+        notify_remote_event(&format!("{} が接続しました", device.name));
     }
 
     let ctx_fwd = ctx.clone();
@@ -3993,7 +4244,7 @@ fn handle_ws_v2(
                                     json!({ "route": "/ws" }),
                                 );
                             }
-                            notify_macos(&format!("{device_name} が切断しました"));
+                            notify_remote_event(&format!("{device_name} が切断しました"));
                         }
                     })
                     .ok();
@@ -4767,35 +5018,44 @@ mod tests {
         );
     }
 
+    /// CLI バイナリのファイル名（Windows は `tako.exe`）。#528 で serve_binary_impl を
+    /// EXE_SUFFIX 対応にしたので、テストも実バイナリ名で組み立てる
+    fn cli_file_name() -> String {
+        format!("tako{}", std::env::consts::EXE_SUFFIX)
+    }
+
     #[test]
     fn serve_binary_implは通常モードで安定バイナリを優先する() {
         // #432: PATH 上の dev CLI から start しても .app 世代の serve を立てる
-        let dev_cli = std::path::PathBuf::from("/tmp/dev/target/release/tako");
+        let dev_dir = std::env::temp_dir().join("dev/target/release");
+        let dev_cli = dev_dir.join(cli_file_name());
         assert_eq!(
             serve_binary_impl(false, Some(dev_cli.clone()), true).as_deref(),
             Some(crate::dispatch::STABLE_APP_BINARY)
         );
         // .app が無い環境では CLI 自身
         assert_eq!(
-            serve_binary_impl(false, Some(dev_cli), false).as_deref(),
-            Some("/tmp/dev/target/release/tako")
+            serve_binary_impl(false, Some(dev_cli.clone()), false).as_deref(),
+            Some(dev_cli.display().to_string().as_str())
         );
     }
 
     #[test]
     fn serve_binary_implは検証モードで自世代バイナリを返す() {
         // #432: 隔離・検証時は /Applications に飛ばず検証対象の世代で serve を立てる
-        let dev_cli = std::path::PathBuf::from("/tmp/dev/target/release/tako");
+        let dev_cli = std::env::temp_dir()
+            .join("dev/target/release")
+            .join(cli_file_name());
         assert_eq!(
-            serve_binary_impl(true, Some(dev_cli), true).as_deref(),
-            Some("/tmp/dev/target/release/tako")
+            serve_binary_impl(true, Some(dev_cli.clone()), true).as_deref(),
+            Some(dev_cli.display().to_string().as_str())
         );
         // GUI（tako-app）から: 同ディレクトリに実在する CLI（同世代）へ
         let dir = std::env::temp_dir().join(format!("tako-432-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let sibling = dir.join("tako");
+        let sibling = dir.join(cli_file_name());
         std::fs::write(&sibling, b"stub").unwrap();
-        let gui = dir.join("tako-app");
+        let gui = dir.join(format!("tako-app{}", std::env::consts::EXE_SUFFIX));
         assert_eq!(
             serve_binary_impl(true, Some(gui.clone()), true).as_deref(),
             Some(sibling.display().to_string().as_str())

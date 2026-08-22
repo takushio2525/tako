@@ -428,6 +428,13 @@ const WINDOWS_DEPS: &[ExternalDep] = &[
         package: Some("Git.Git"),
         install_hint: "https://git-scm.com/download/win",
     },
+    ExternalDep {
+        bin: "tailscale",
+        required: false,
+        purpose: "tako remote（スマホからブラウザ経由でペインを操作）",
+        package: Some("Tailscale.Tailscale"),
+        install_hint: "https://tailscale.com/download/windows",
+    },
 ];
 
 /// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
