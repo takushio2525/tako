@@ -210,6 +210,11 @@ impl SessionBackend for PsmuxBackend {
             // 同時に流した平文だけが届いた）。このため psmux ペインでは
             // cwd 追従とコマンド状態が働かない（#525）
             osc_passthrough: false,
+            // **打鍵経路で cp932 に無い文字が落ちる**（#907 の実機実測: `テスト─❯` を
+            // `tako send` すると `テスト` だけが届き `─` と `❯` が消える。器なしの
+            // 同じ経路はバイト等価）。器の注入口（`send-keys -l`）は UTF-8 を
+            // そのまま運ぶので、非 ASCII は `inject_text` で入れる
+            keystrokes_ascii_only: true,
             quotes_program: false,
             label: "psmux",
         }
@@ -289,6 +294,22 @@ impl SessionBackend for PsmuxBackend {
         let result = self.run(&["kill-session", "-t", self.target(session)]);
         self.owners.release(session);
         result.map(|_| ()).map_err(BackendError::Operation)
+    }
+
+    /// `send-keys -l`（リテラル）でテキストを入れる（#907）。
+    ///
+    /// 打鍵経路（外側 PTY への書き込み）は cp932 に無い文字を落とすが、
+    /// **CLI の引数は Windows のコマンドラインとして UTF-16 で渡る**ので落ちない
+    /// （実機実測: `テスト─❯日本` がバイト等価で届いた）。
+    /// ターゲットは #866 の `target()` を使う（`=name` を解釈できない器なので素の名前）
+    fn inject_text(&self, session: &SessionRef, text: &str) -> Result<(), BackendError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let argv = inject_argv(self.target(session), text);
+        self.run(&argv.iter().map(String::as_str).collect::<Vec<_>>())
+            .map(|_| ())
+            .map_err(BackendError::Operation)
     }
 
     fn list(&self) -> Vec<SessionInfo> {
@@ -721,6 +742,20 @@ fn inner_command_with(program: &str, args: &[String]) -> String {
     out
 }
 
+/// `inject_text` の argv（純粋関数。**macOS からも形を固定できる**）。
+///
+/// `-l` はリテラル送信（キー名として解釈させない）。本文を**引数として**渡すのが肝で、
+/// Windows のコマンドラインは UTF-16 なので cp932 に無い文字も落ちない（#907）
+fn inject_argv(target: &str, text: &str) -> Vec<String> {
+    vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        target.to_string(),
+        "-l".to_string(),
+        text.to_string(),
+    ]
+}
+
 /// バージョンの扱い（要件 6）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VersionSupport {
@@ -773,6 +808,18 @@ pub fn behavior_probe(bin: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// #907: 注入は `send-keys -l` で、本文は**引数**として渡す
+    #[test]
+    fn 注入のargvはsend_keysのリテラル形() {
+        let argv = inject_argv("tako-abc", "テスト─❯");
+        assert_eq!(argv[0], "send-keys");
+        assert_eq!(argv[1], "-t");
+        assert_eq!(argv[2], "tako-abc");
+        assert_eq!(argv[3], "-l");
+        // 本文は加工しない（引数で渡るので引用符もエスケープも要らない）
+        assert_eq!(argv[4], "テスト─❯");
+    }
+
     use super::*;
 
     fn backend() -> PsmuxBackend {

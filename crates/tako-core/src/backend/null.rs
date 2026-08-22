@@ -34,6 +34,8 @@ impl SessionBackend for NullBackend {
             scrollback: ScrollbackAuthority::InProcess,
             // 器が無い = シェルの出力が素のまま tako の PTY に届く
             osc_passthrough: true,
+            // 器が無いので打鍵は tako の PTY へ直接届く（#907）
+            keystrokes_ascii_only: false,
             quotes_program: true,
             label: "none",
         }

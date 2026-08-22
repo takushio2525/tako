@@ -2294,6 +2294,76 @@ main の現行 API へ合わせたうえで次の 3 点を足した:
   直した。ステータスバーのポップオーバーに残るので **#905 として起票**
 - `setup` の対話フロー（L3 の蓋閉じ案内）は未移植（スライス 9 の申し送りのまま）
 
+#### #907 の記録（器つきペインへの送達で非 ASCII が落ちる。2026-08-22）
+
+**症状**: #903 の副産物。Windows の既定構成（persist ON = 器 psmux）で `tako send` すると
+**cp932 に無い文字が黙って消える**。
+
+##### 層の確定（同じ tako バイナリ・同じ `tako send` 経路で器の有無だけ替えた）
+
+| アーム | 送った hex（`テスト─❯`） | 届いた hex |
+|---|---|---|
+| 器なし（`TAKO_BACKEND=none`） | `e38386 e382b9 e38388 e29480 e29daf` | **完全一致** |
+| 器あり（psmux） | 同上 | `e38386 e382b9 e38388` = **`─`(U+2500) と `❯`(U+276F) が落ちる** |
+
+**カタカナ・漢字は通る**（`テスト` / `日本` は cp932 にある）。落ちるのは cp932 に無い文字だけ
+なので、Issue に書いた「日本語プロンプトが壊れる」は**半分外れ**（かな・カナ・漢字の指示は届く。
+壊れるのは罫線・記号・絵文字を含む文）。犯人は **psmux の client の打鍵経路**
+（`PromptFlow` の貼り付けではない: 器なしの同じ経路がバイト等価だった）。
+
+##### 器の注入口は UTF-8 をそのまま運ぶ（修正の実現性）
+
+psmux 3.3.7 の `--help` に `send-keys -l` / `load-buffer` / `paste-buffer` がある。
+実機で `テスト─❯日本` を投げたら **両方ともバイト等価**で届いた:
+
+```
+PAYLOAD_HEX=e38386e382b9e38388e29480e29dafe697a5e69cac
+A_hex(send-keys -l)      = 412d e38386e382b9e38388e29480e29daf e697a5e69cac 2d41   ← 一致
+B_hex(load+paste-buffer) = 422d e38386e382b9e38388e29480e29daf e697a5e69cac 2d42   ← 一致
+```
+
+`DetachedAccess::send_text` が psmux で未対応なのは「送出の信頼性」の話（#519）で、
+**注入口そのものは使える**というのがこの Issue の収穫。
+
+##### 直し方
+
+- `BackendCapabilities::keystrokes_ascii_only`（新設）= 「器の client の打鍵が ASCII しか
+  運べない」を能力として表に出す（psmux = true / tmux・器なし = false）
+- `SessionBackend::inject_text`（新設・既定は未対応）を psmux が `send-keys -l` で実装。
+  本文は**引数**として渡すので Windows のコマンドライン（UTF-16）経由で落ちない
+- 迂回の判断は純粋関数 `backend::needs_text_injection`（**非 ASCII かつ落とす器のときだけ**）。
+  ASCII は従来どおり打鍵 = 経路を増やして挙動差を作らない。Enter も ASCII なので打鍵のまま
+  （「貼り付けと分離した単独キー」= #95 / #32 の規約を維持）
+- 送出側 2 か所を `delivery::inject_non_ascii` へ寄せた（`dispatch::Send` の直接書き込みと
+  PromptFlow の貼り付け）。注入の成否は `persist.log`（`送達: 器へ注入 …`）。
+  失敗したら警告して**打鍵へ縮退**する（無音で失うより、従来の壊れ方に留める）
+
+##### 実機 A/B（after / 検出力）
+
+| アーム | 器あり arm の受信 hex |
+|---|---|
+| 修正前（`TAKO_907_NO_INJECT=1`。同一バイナリ） | `…MARKJ-e38386e382b9e38388-MARKJ`（落ちる） |
+| 修正後 | `…MARKJ-e38386e382b9e38388e29480e29daf-MARKJ`（**バイト等価**） |
+
+ASCII のみの対照（`MARKA-ASCII-MARKA`）は before / after / 器なし のすべてで一致 = 経路を
+増やしていないことの裏付け。実機セルフテストは **#903 と同じ項目 101（#906）で止まる**
+= 送達経路に触ったが新規回帰ゼロ。実機テストは **22 件失敗 = ベースライン一致**。
+
+##### 測り方の落とし穴（3 回踏んだ。ここを外すと結論が逆になる）
+
+- **PowerShell は子プロセスの stdout を既定で ANSI（cp932）として読む**。
+  `capture-pane -p` / `tako read` を素で捕まえると測定側で化け、
+  「送達が壊れた」に見える（最初のプローブがこれで `繝・せ繝遺楳` を出した）。
+  `[Console]::OutputEncoding` と `$OutputEncoding` を UTF-8 にしてから測る
+- **`tako persist off` は器つきの既存ペインを失う**。器あり / 器なしを 1 インスタンスで
+  比べようとすると測定対象が消えるので、**インスタンスを 2 本**（`TAKO_BACKEND=none` で 1 本）立てる
+- CLI から製品経路を駆動する形: 隔離 GUI の control.json は
+  `%TEMP%\tako-iso-discovery-<pid>`、`tako list` は `tabs[].panes[].id`、
+  **`tako split` の出力は素の数値**（JSON ではない）、`tako read` は素のテキスト、
+  `tako persist off` は位置引数、`tako split` にコマンドを渡すには `--` が要る
+- **fixture は「シェル自身の echo」が一番強い**。`[Console]::In.ReadLine()` の echo ループを
+  ペインのコマンドにする形は、alt screen（器の client が smcup を出す）と PromptFlow の
+  入力欄検証に足を取られて配送されず、4 通りすべて空振りした
 #### #905 の記録（スリープ防止ポップオーバーの文言。PR #909・2026-08-22）
 
 **症状**: #727 で設定画面と `reason_system_disabled` は能力ベースへ直したが、**ステータスバーの

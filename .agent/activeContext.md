@@ -6,6 +6,11 @@
 ## 現在の対象（2026-08-22）
 
 - **#467 Windows 移植はスライス 1〜7c / 9 が main へ入り、残りはスライス 8（棚卸し）だけ**
+- **#907（器つきペインへの非 ASCII 送達）を解消**（PR は本文末尾）。層は **psmux の client の
+  打鍵経路**で確定（器なしはバイト等価 / 器ありだけ cp932 に無い文字が落ちる。カタカナ・漢字は
+  通るので「日本語が壊れる」は半分外れ）。器の注入口（`send-keys -l`）は UTF-8 をそのまま運ぶので、
+  **非 ASCII のときだけ打鍵ではなく注入口へ迂回**する（`keystrokes_ascii_only` 能力 +
+  `SessionBackend::inject_text` + 純粋関数 `needs_text_injection`）。A/B は `TAKO_907_NO_INJECT=1`
 - **#903（セルフテスト項目 100 = #737 チャット入力欄）を解消**（PR #908）。**Issue の仮説
   （準備待ちの不足）は外れ**、実測で機序が 4 つ出た: ①状態切替の Ctrl+C で**器（psmux）の
   client が終了**しペインごと死ぬ ②(g) の楽観 echo は**外側 PTY の alt screen** 条件なので
@@ -66,6 +71,11 @@
 - **`git stash` を A/B に使わない**（#903 で踏んだ）。変更が無いと no-op なのに `git stash pop` が
   他 worker の古い stash を pop してコンフリクトを作る。ファイルは
   `git checkout <sha> -- <path>` で差し替える
+- **子プロセスの stdout を測るときは `[Console]::OutputEncoding` を UTF-8 にする**（#907）。
+  既定は ANSI（cp932）なので `capture-pane -p` / `tako read` が測定側で化け、
+  「送達が壊れた」と読み間違える
+- **`tako persist off` は器つきの既存ペインを失う**（#907）。器あり / 器なしを比べるなら
+  インスタンスを 2 本立てる（`TAKO_BACKEND=none` で 1 本）
 - **`cp` が `-i` の別名かもしれない**: スクリプトでは `command cp -f` を使う（上書き確認で 10 分ハングした）
 - **tmux ターゲットの `=` を直書きしない**（#866）。`tako_core::tmux::exact_target` /
   `session_pane_target` が `-V` の申告から決める（番犬が直書きを落とす。A/B は
@@ -75,9 +85,6 @@
 
 - **#906（項目 101 = #749）**: 直せば 101 以降（#761 / #772 / #781 / #789 / #803 / #813 /
   #815 / #816 / #826 / #830 / #835 / #822 / #868）が開く
-- **#907（器つきペインへの非 ASCII 送達が落ちる）**: #903 の副産物。`tako send` /
-  worker へのプロンプト送達（#32 の第 2 層）が Windows + persist ON で日本語を落とす疑い。
-  層は「PromptFlow の貼り付け」か「psmux の打鍵処理」のどちらか未確定（切り分け手順は Issue に）
 - **スライス 8（棚卸し）**: #865 の到達範囲表 + #872 / #875 / #877 / #884 / #889 / #897 / #903 の
   実測で `tako_run` / `tako_run_interactive` / `tako_show_command` / `tako_orchestrator_watch` /
   `tako_orchestrator_worker_status` / `tako_window` / `tako_ui_mode` を `Pending` から倒せる材料が

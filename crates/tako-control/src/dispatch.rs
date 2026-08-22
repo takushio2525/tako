@@ -815,12 +815,24 @@ fn dispatch_inner(
                     // （Issue #95: 端末の Enter は CR。LF のままだと claude 等の TUI で
                     // 送信にならない）
                     let normalized = normalize_newlines_for_keys(&text);
-                    let payload = if newline {
-                        format!("{normalized}\r")
-                    } else {
-                        normalized
+                    // #907: 器の client が ASCII しか運べない（psmux）なら、本文は
+                    // 打鍵ではなく**器の注入口**へ入れる。実機実測で打鍵経路は
+                    // cp932 に無い文字（`─` / `❯` 等）を黙って落とす。Enter は ASCII なので
+                    // 従来どおり「貼り付けと分離した単独キー」として打鍵で送る（#95 / #32）
+                    let injected = crate::delivery::inject_non_ascii(
+                        host.backend_session(target).as_deref(),
+                        &normalized,
+                    );
+                    let payload = match (&injected, newline) {
+                        // 注入に成功したら本文は打鍵しない（Enter だけ送る）
+                        (Ok(true), true) => "\r".to_string(),
+                        (Ok(true), false) => String::new(),
+                        (_, true) => format!("{normalized}\r"),
+                        (_, false) => normalized.clone(),
                     };
-                    session.write(payload.into_bytes());
+                    if !payload.is_empty() {
+                        session.write(payload.into_bytes());
+                    }
                     Ok(Value::Null)
                 }
                 Err(e) => {
