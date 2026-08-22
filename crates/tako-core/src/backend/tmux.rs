@@ -163,7 +163,7 @@ impl SessionBackend for TmuxBackend {
             .args([
                 "list-panes",
                 "-t",
-                &format!("={}:", session.as_str()),
+                &crate::tmux::session_pane_target(session.as_str()),
                 "-F",
                 "#{pane_pid}",
             ])
@@ -225,7 +225,7 @@ impl DetachedCapture for TmuxBackend {
                 "-p",
                 "-J",
                 "-t",
-                &format!("={}:", session.as_str()),
+                &crate::tmux::session_pane_target(session.as_str()),
                 "-S",
                 &start,
             ])
@@ -282,7 +282,7 @@ impl DetachedCapture for TmuxBackend {
                 "display-message",
                 "-p",
                 "-t",
-                &format!("={}:", session.as_str()),
+                &crate::tmux::session_pane_target(session.as_str()),
                 "#{scroll_position}\t#{history_size}\t#{pane_in_mode}\t#{alternate_on}",
             ])
             .output()

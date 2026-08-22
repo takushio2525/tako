@@ -35,6 +35,121 @@ fn resolve_tmux_bin() -> String {
     )
 }
 
+/// `-V` の申告が **tmux だけ**を名乗っているか（純関数）。
+///
+/// 本物の tmux は `tmux 3.5a` の 1 行だけを出す。tmux 互換を名乗る別実装は、
+/// 互換のため `tmux 3.3.7` を出した**うえで** `psmux 3.3.7 (05cc5d4 2026-07-20)` と
+/// 自分を名乗る（Windows 実機の実測）。そこで「tmux 以外を名乗る行が 1 行でもあれば
+/// 別実装」とする。ターゲット構文（[`TmuxTargetSyntax`]）と、セルフテストの
+/// 「本物の tmux 決め打ちの項目を回すか」の判断が、この 1 本の規則を共有する
+pub fn announces_only_tmux(version: &str) -> bool {
+    version.lines().all(|line| {
+        line.split_whitespace()
+            .next()
+            .is_none_or(|first| first.eq_ignore_ascii_case("tmux"))
+    })
+}
+
+/// 駆動している tmux 互換 CLI が**完全一致ターゲット（`=name`）を解釈するか**。
+///
+/// tako は全経路で `=name`（前方一致を止めるために #181 / #32 で入れた）を使うが、
+/// tmux 互換を名乗る別実装はこれを解釈しないことがある。
+/// 実測（Windows 11 / psmux 3.3.7・2026-08-22。セッション 2 本を立てた同一ソケット上）:
+///
+/// | ターゲット | psmux の挙動 |
+/// |---|---|
+/// | `kill-session -t =keepa` | **exit 1 / 5158ms** `session 'z866probe__keepa' still present after 5s`（1 つも消えない） |
+/// | `kill-session -t keepa` | exit 0 / 181ms（`keepa` だけが消え `keepb` は残る） |
+/// | `kill-session -t kee`（前方一致だけ） | exit 0 / 25ms（**何も消さない** = 素の名前でも完全一致） |
+///
+/// つまり `=` を落としても取り違えは起きず、落とさないと `tako tmux kill` が
+/// 効かない（#866）。**シェル方言（`platform::shell_dialect`）とは別の軸**で、
+/// ここが決めるのは「tmux へ渡すターゲット文字列の形」だけ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxTargetSyntax {
+    /// `=name` = 完全一致が使える（本物の tmux）
+    Exact,
+    /// 素の名前しか渡せない（`=` を解さない互換実装。そちらは素の名前が完全一致）
+    Plain,
+}
+
+impl TmuxTargetSyntax {
+    /// `-V` の出力から決める（純関数）。取れなかった（バイナリ不在）ときは
+    /// [`Self::Exact`] = 挙動不変にする
+    pub fn from_version(version: &str) -> Self {
+        if announces_only_tmux(version) {
+            Self::Exact
+        } else {
+            Self::Plain
+        }
+    }
+
+    /// 完全一致ターゲットの接頭辞（`=` か空）
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Exact => "=",
+            Self::Plain => "",
+        }
+    }
+
+    /// ターゲットへ完全一致を指示する。**`=` を組み立てる唯一の場所**
+    pub fn exact_target(self, target: &str) -> String {
+        format!("{}{target}", self.prefix())
+    }
+}
+
+/// `tmux -V` の申告そのまま（プロセス内で 1 回だけ尋ねてキャッシュする）。
+/// **`None` = そもそも駆動できる CLI が無い**（tmux も互換実装も入っていない）。
+/// ターゲット構文の判定（[`target_syntax`]）と「tmux 系の機能を試せるか」の
+/// 両方がここから派生する
+pub fn version_announcement() -> Option<&'static str> {
+    static VERSION: OnceLock<Option<String>> = OnceLock::new();
+    VERSION.get_or_init(probe_version).as_deref()
+}
+
+fn probe_version() -> Option<String> {
+    // #586: バージョン照会も GUI プロセスから走る（コンソールウィンドウを出させない）。
+    // psmux は 2 行目で自分を名乗るが、実装によっては stderr へ出しうるので両方読む
+    let output = crate::platform::process::no_console_window(&mut Command::new(tmux_bin()))
+        .arg("-V")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut version = String::from_utf8_lossy(&output.stdout).into_owned();
+    version.push('\n');
+    version.push_str(&String::from_utf8_lossy(&output.stderr));
+    Some(version)
+}
+
+/// いま駆動している CLI のターゲット構文（[`version_announcement`] から決める）。
+/// `TAKO_866_KEEP_EXACT_TARGET=1` で常に `=` を付ける旧挙動へ戻せる（A/B 計測用）
+pub fn target_syntax() -> TmuxTargetSyntax {
+    static SYNTAX: OnceLock<TmuxTargetSyntax> = OnceLock::new();
+    *SYNTAX.get_or_init(|| {
+        if std::env::var("TAKO_866_KEEP_EXACT_TARGET").as_deref() == Ok("1") {
+            return TmuxTargetSyntax::Exact;
+        }
+        // CLI 不在は tmux 扱い = 挙動不変（どのコマンドも実行時に失敗する）
+        TmuxTargetSyntax::from_version(version_announcement().unwrap_or("tmux"))
+    })
+}
+
+/// tmux ターゲットへ完全一致を指示する（`=name` / `=session:0.0`）。
+/// **`=` を付けるかはここだけが決める**（[`target_syntax`] 経由。番犬テストが直書きを禁じる）
+pub fn exact_target(target: &str) -> String {
+    target_syntax().exact_target(target)
+}
+
+/// target-pane 系コマンド（capture-pane / send-keys / paste-buffer）向けの
+/// セッション完全一致ターゲット。tmux 3.6 は裸の `=session` を target-pane として
+/// 解決できず "can't find pane" になるため、末尾コロンでセッション部を明示する
+/// （`=session:` = そのセッションのアクティブ window / pane。Issue #32 の E2E で発覚）
+pub fn session_pane_target(session: &str) -> String {
+    exact_target(&format!("{session}:"))
+}
+
 /// tmux の 1 window
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxWindow {
@@ -98,7 +213,7 @@ pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
 /// セッションの存在確認（`has-session`、1 コマンド）。
 /// `list_sessions`（3 コマンド）よりはるかに軽量
 pub fn has_session(socket: Option<&str>, name: &str) -> bool {
-    run_tmux(socket, &["has-session", "-t", &format!("={name}")]).is_ok()
+    run_tmux(socket, &["has-session", "-t", &exact_target(name)]).is_ok()
 }
 
 /// 全クライアントの (client_pid, セッション名) 一覧（`list-clients`、1 コマンド）。
@@ -133,7 +248,7 @@ pub fn session_group(socket: Option<&str>, name: &str) -> Option<String> {
             "display-message",
             "-p",
             "-t",
-            &format!("={name}"),
+            &exact_target(name),
             "#{session_group}",
         ],
     )
@@ -148,14 +263,18 @@ pub fn session_group(socket: Option<&str>, name: &str) -> Option<String> {
 
 /// セッションを kill する。誤爆防止の確認は呼び出し側（UI / AI）の責務
 pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), String> {
-    run_tmux(socket, &["kill-session", "-t", &format!("={name}")]).map(|_| ())
+    run_tmux(socket, &["kill-session", "-t", &exact_target(name)]).map(|_| ())
 }
 
 /// window を kill する（`session:index` 指定）
 pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(), String> {
     run_tmux(
         socket,
-        &["kill-window", "-t", &format!("={session}:{window}")],
+        &[
+            "kill-window",
+            "-t",
+            &exact_target(&format!("{session}:{window}")),
+        ],
     )
     .map(|_| ())
 }
@@ -175,7 +294,7 @@ pub fn resize_window(
         &[
             "resize-window",
             "-t",
-            &format!("={session}:{window}"),
+            &exact_target(&format!("{session}:{window}")),
             "-x",
             &cols.to_string(),
             "-y",
@@ -192,7 +311,7 @@ pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Re
         &[
             "set-window-option",
             "-t",
-            &format!("={session}:{window}"),
+            &exact_target(&format!("{session}:{window}")),
             "-u",
             "window-size",
         ],
@@ -204,7 +323,11 @@ pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Re
 pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<(), String> {
     run_tmux(
         socket,
-        &["select-window", "-t", &format!("={session}:{index}")],
+        &[
+            "select-window",
+            "-t",
+            &exact_target(&format!("{session}:{index}")),
+        ],
     )
     .map(|_| ())
 }
@@ -214,18 +337,15 @@ pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<
 pub fn capture_pane_text(socket: Option<&str>, session: &str, window: u32) -> Vec<String> {
     run_tmux(
         socket,
-        &["capture-pane", "-t", &format!("={session}:{window}"), "-p"],
+        &[
+            "capture-pane",
+            "-t",
+            &exact_target(&format!("{session}:{window}")),
+            "-p",
+        ],
     )
     .map(|output| output.lines().map(str::to_string).collect())
     .unwrap_or_default()
-}
-
-/// target-pane 系コマンド（capture-pane / send-keys / paste-buffer）向けの
-/// セッション exact-match ターゲット。tmux 3.6 は裸の `=session` を target-pane として
-/// 解決できず "can't find pane" になるため、末尾コロンでセッション部を明示する
-/// （`=session:` = そのセッションのアクティブ window / pane。Issue #32 の E2E で発覚）
-fn session_pane_target(session: &str) -> String {
-    format!("={session}:")
 }
 
 /// セッションのアクティブ window からペイン内容を取得する。
@@ -444,7 +564,7 @@ pub fn capture_history_plain(
 /// セッションが生きているか確認する（`has-session`）
 pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
     tmux_command(socket)
-        .args(["has-session", "-t", &format!("={session}")])
+        .args(["has-session", "-t", &exact_target(session)])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -547,6 +667,76 @@ fn parse_sessions(sessions: &str, windows: &str, clients: &str) -> Vec<TmuxSessi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本物の tmux は `-V` で tmux しか名乗らない（macOS / Linux の実出力）
+    #[test]
+    fn 本物のtmuxは完全一致ターゲットを使う() {
+        for version in ["tmux 3.5a\n", "tmux 3.4", "tmux next-3.6\n\n", "TMUX 3.3\n"] {
+            assert!(announces_only_tmux(version), "version={version:?}");
+            assert_eq!(
+                TmuxTargetSyntax::from_version(version),
+                TmuxTargetSyntax::Exact,
+                "version={version:?}"
+            );
+        }
+    }
+
+    /// psmux は互換のため `tmux 3.3.7` を出したうえで自分を名乗る（Windows 実機の実出力）。
+    /// **これを Exact と誤判定すると `=name` を送ってしまい `tako tmux kill` が効かない**（#866）
+    #[test]
+    fn 自分を名乗る互換実装には素のターゲットを渡す() {
+        let psmux = "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n";
+        assert!(!announces_only_tmux(psmux));
+        assert_eq!(
+            TmuxTargetSyntax::from_version(psmux),
+            TmuxTargetSyntax::Plain
+        );
+        // 名乗る行が先でも順序に依らない
+        let reversed = "psmux 3.3.7 (05cc5d4 2026-07-20)\ntmux 3.3.7\n";
+        assert_eq!(
+            TmuxTargetSyntax::from_version(reversed),
+            TmuxTargetSyntax::Plain
+        );
+    }
+
+    /// `-V` が空（取れなかった）ときは tmux 扱い = 挙動不変にする
+    #[test]
+    fn バージョンが空なら挙動不変のtmux扱い() {
+        assert_eq!(TmuxTargetSyntax::from_version(""), TmuxTargetSyntax::Exact);
+        assert_eq!(
+            TmuxTargetSyntax::from_version("\n\n  \n"),
+            TmuxTargetSyntax::Exact
+        );
+    }
+
+    /// ターゲットの組み立ては構文ごとに 1 通り。
+    /// tmux は `=` で完全一致、互換実装は素の表記（そちらが完全一致。#866 の実測）
+    #[test]
+    fn 構文ごとのターゲット組み立て() {
+        assert_eq!(TmuxTargetSyntax::Exact.exact_target("work"), "=work");
+        assert_eq!(
+            TmuxTargetSyntax::Exact.exact_target("work:0.1"),
+            "=work:0.1"
+        );
+        assert_eq!(TmuxTargetSyntax::Plain.exact_target("work"), "work");
+        assert_eq!(TmuxTargetSyntax::Plain.exact_target("work:0.1"), "work:0.1");
+        // target-pane 系は末尾コロン必須（#32）。接頭辞だけが構文で変わる
+        assert_eq!(TmuxTargetSyntax::Exact.exact_target("work:"), "=work:");
+        assert_eq!(TmuxTargetSyntax::Plain.exact_target("work:"), "work:");
+    }
+
+    /// 実環境の CLI に関わらず、モジュール関数は構文の答えと一致する
+    /// （`target_syntax()` は `-V` を見るので値そのものは環境依存。**形**だけを固定する）
+    #[test]
+    fn モジュール関数は構文の答えと一致する() {
+        let s = target_syntax();
+        assert_eq!(exact_target("work"), s.exact_target("work"));
+        assert_eq!(session_pane_target("work"), s.exact_target("work:"));
+        assert!(matches!(
+            s,
+            TmuxTargetSyntax::Exact | TmuxTargetSyntax::Plain
+        ));
+    }
 
     #[test]
     fn フォーマット出力を統合してパースする() {

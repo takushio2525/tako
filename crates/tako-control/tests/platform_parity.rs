@@ -415,6 +415,40 @@ fn agents走査がposixシェルの直起動へ戻っていない() {
     );
 }
 
+/// **#866 の番犬**: tmux の完全一致ターゲット（`=name`）の直書きが、方言境界
+/// （`tako_core::tmux::exact_target` / `session_pane_target`）の外に残っていないこと。
+///
+/// `=` は tmux の「前方一致ではなく完全一致」指定で、#181 / #32 で意図的に入れたもの。
+/// ところが tmux 互換を名乗る別実装はこれを解釈しないことがある。実測（psmux 3.3.7）:
+/// `kill-session -t =keepa` は **5.1 秒ブロックしたうえで exit 1**（1 つも消えない）、
+/// 素の `-t keepa` なら 181ms で対象だけが消える。**macOS では気づけない**種類の差なので
+/// ソース走査で塞ぐ（新しい直書きが増えたらここで落ちる）
+#[test]
+fn tmuxの完全一致ターゲットの直書きが境界の外に残っていない() {
+    // 境界そのものだけを許す（許可には必ず理由を書く）
+    const ALLOWED: &[(&str, &str)] = &[(
+        "crates/tako-core/src/tmux.rs",
+        "方言境界（TmuxDialect / exact_target / session_pane_target）の実装本体",
+    )];
+    // ターゲット文字列を組み立てる形だけを対象にする（純関数へ渡す固定入力は対象外）
+    const PATTERNS: &[&str] = &["format!(\"="];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let base = root.join("crates").join(crate_dir);
+        for sub in ["src", "tests"] {
+            collect_os_shell_calls(&base.join(sub), &root, PATTERNS, ALLOWED, &mut offenders);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`=` 付き tmux ターゲットの直書きが境界の外にある:\n  {}\n\
+         → tako_core::tmux::exact_target / session_pane_target を通してください（#866）",
+        offenders.join("\n  ")
+    );
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///
@@ -438,10 +472,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
     const BASELINE: &[(&str, usize, &str)] = &[
         (
             "crates/tako-app/src/main.rs",
-            21,
+            17,
             "セルフテスト（`self_test::run`）と visual-test feature 限定の検証コード、\
              および `#[cfg(unix)]` の単体テスト。製品の描画・入力経路に子プロセスは無い。\
-             #865 で tmux の版数検出を `no_console_window` 経由へ寄せたので 22 → 21",
+             #865 で tmux の版数検出を `no_console_window` 経由へ寄せたので 22 → 21、\
+             #866 でセルフテストの tmux 直起動 4 箇所（項目 48 / 68 / 73）を \
+             `tako_core::tmux::tmux_command` 経由へ寄せたので 21 → 17",
         ),
         (
             "crates/tako-app/src/open_files.rs",

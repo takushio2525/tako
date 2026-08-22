@@ -76,10 +76,13 @@ impl ScrollTarget {
     /// ネスト先が分割されている場合はアクティブペインへの近似（制約は FR-2.17 メモ）
     pub(crate) fn locate(&self) -> (Option<&str>, String) {
         match self {
-            ScrollTarget::Backend { socket, session } => {
-                (Some(socket.as_str()), format!("={session}:"))
+            ScrollTarget::Backend { socket, session } => (
+                Some(socket.as_str()),
+                crate::tmux::session_pane_target(session),
+            ),
+            ScrollTarget::Nested { socket, session } => {
+                (socket.as_deref(), crate::tmux::session_pane_target(session))
             }
-            ScrollTarget::Nested { socket, session } => (socket.as_deref(), format!("={session}:")),
         }
     }
 }

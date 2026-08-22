@@ -20751,24 +20751,22 @@ mod self_test {
         }
     }
 
+    /// `tmux` の名前で駆動できる CLI があるか（**本物の tmux でも psmux 等の
+    /// 互換実装でも可**）。FR-2.13 の一覧・kill はターゲット構文を方言境界
+    /// （`tako_core::tmux::exact_target`。#866）へ寄せたので、実装を問わず回せる
+    fn tmux_cli_available() -> bool {
+        tako_core::tmux::version_announcement().is_some()
+    }
+
     /// 実環境の `tmux` が**本物の tmux か**（psmux の名前貸しではないか）。
     ///
     /// Windows では `tmux` の実体が psmux であることがある（winget の `marlocarlo.psmux` が
     /// `tmux.exe` を配置する。実測: `tmux -V` が `tmux 3.3.7` + `psmux 3.3.7`）。
-    /// psmux は tmux の `=name`（完全一致ターゲット）を解釈できず `kill-session` が
-    /// 効かない（#866）ため、tmux 決め打ちの項目（48 / 59〜62）はここで切り分ける
+    /// 判定はターゲット構文の境界（`tako_core::tmux::announces_only_tmux`）と同じ 1 本を通す。
+    /// **attach / send-keys まで tmux 決め打ちの項目**（59〜62 / 68 / 73）はここで切り分ける
+    /// （psmux は送出系が信頼できない = `detached_access` false。#519）
     fn real_tmux_available() -> bool {
-        let Ok(output) = tako_core::platform::process::no_console_window(
-            std::process::Command::new("tmux").arg("-V"),
-        )
-        .output() else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
-        }
-        let version = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-        version.contains("tmux") && !version.contains("psmux")
+        tako_core::tmux::version_announcement().is_some_and(tako_core::tmux::announces_only_tmux)
     }
 
     fn press(any: AnyWindowHandle, cx: &mut AsyncApp, combo: &str) {
@@ -31844,19 +31842,20 @@ mod self_test {
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
-            // psmux が `tmux` の名前で入っている環境（Windows）では kill が効かない（#866）。
-            // 「本物の tmux があるときだけ」回して、無い環境では理由を出して飛ばす
+            // psmux が `tmux` の名前で入っている環境（Windows）でも回す: ターゲット構文は
+            // 方言境界（`tako_core::tmux::exact_target`）が決めるので、`=name` を解さない
+            // 互換実装でも kill が効く（#866。旧挙動は TAKO_866_KEEP_EXACT_TARGET=1）
+            let has_tmux_cli = tmux_cli_available();
             let has_tmux = real_tmux_available();
-            if !has_tmux {
+            if !has_tmux_cli {
                 println!(
-                    "TAKO_SELF_TEST_SKIPPED: 48（本物の tmux が無い。psmux の名前貸しでは \
-                     `kill-session -t =name` が効かない = #866）"
+                    "TAKO_SELF_TEST_SKIPPED: 48（`tmux` の名前で駆動できる CLI が無い）"
                 );
             }
-            if has_tmux {
+            if has_tmux_cli {
                 let sock = format!("tako-selftest-{}", std::process::id());
-                let created = std::process::Command::new("tmux")
-                    .args(["-L", &sock, "new-session", "-d", "-s", "tako-test"])
+                let created = tako_core::tmux::tmux_command(Some(&sock))
+                    .args(["new-session", "-d", "-s", "tako-test"])
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
@@ -31907,11 +31906,11 @@ mod self_test {
                     }
                 }
                 check(gone, "tako tmux kill でセッションが消える");
-                let _ = std::process::Command::new("tmux")
-                    .args(["-L", &sock, "kill-server"])
+                let _ = tako_core::tmux::tmux_command(Some(&sock))
+                    .arg("kill-server")
                     .status();
             } else {
-                eprintln!("（tmux 不在のため項目 48 をスキップ）");
+                eprintln!("（tmux 系 CLI 不在のため項目 48 をスキップ）");
             }
 
             // 49. 情報パネルの fleet ビュー（FR-2.13 / FR-2.16.6。dispatch の Panel 操作で
@@ -35165,8 +35164,8 @@ mod self_test {
                     cx.notify();
                 });
                 wait(cx, 800).await;
-                let survives = std::process::Command::new("tmux")
-                    .args(["-L", &dnd_sock, "has-session", "-t", "=dnd-src"])
+                let survives = tako_core::tmux::tmux_command(Some(&dnd_sock))
+                    .args(["has-session", "-t", &tako_core::tmux::exact_target("dnd-src")])
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
@@ -35175,7 +35174,10 @@ mod self_test {
                     .args(["-L", &dnd_sock, "kill-server"])
                     .status();
             } else {
-                eprintln!("（tmux 不在のため項目 68 をスキップ）");
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 68 の tmux 系（本物の tmux が無い。\
+                     TmuxOpen は attach / send-keys 前提 = psmux は非対応。#519）"
+                );
             }
 
             // 73. TmuxOpen ビューペインのミラースクロール（#181）: `tako tmux open` で
@@ -35192,13 +35194,11 @@ mod self_test {
                     .unwrap_or(false);
                 check(created, "TmuxOpen ミラー用 tmux セッション作成");
                 // 履歴 200 行を積む（ミラー capture の対象）
-                let _ = std::process::Command::new("tmux")
+                let _ = tako_core::tmux::tmux_command(Some(&view_sock))
                     .args([
-                        "-L",
-                        &view_sock,
                         "send-keys",
                         "-t",
-                        "=view-src:",
+                        &tako_core::tmux::session_pane_target("view-src"),
                         "seq 200",
                         "Enter",
                     ])
@@ -35564,7 +35564,10 @@ mod self_test {
                     .args(["-L", &view_sock, "kill-server"])
                     .status();
             } else {
-                eprintln!("（tmux 不在のため項目 73 をスキップ）");
+                println!(
+                    "TAKO_SELF_TEST_SKIPPED: 73（本物の tmux が無い。ビューペインの \
+                     取り込みは attach / send-keys 前提 = psmux は非対応。#519）"
+                );
             }
 
             // 74. worker_status の IPC 応答（#181 → #168 で OffloadJob へ一本化）:
@@ -44886,7 +44889,11 @@ mod self_test {
                 let socket = tako_core::tmux_backend::socket_name();
                 let session = format!("tako-st772-{}", std::process::id());
                 let _ = tako_core::tmux::tmux_command(Some(&socket))
-                    .args(["kill-session", "-t", &format!("={session}:")])
+                    .args([
+                        "kill-session",
+                        "-t",
+                        &tako_core::tmux::session_pane_target(&session),
+                    ])
                     .output();
                 // #796: tmux サーバーの起動と競合すると 1 回目の new-session が落ちることが
                 // ある（高負荷で実測）。数回だけ試し、駄目なら tmux の言い分を出して落とす
@@ -45043,7 +45050,11 @@ mod self_test {
 
                 // 後片付け（tmux セッション・検証用ペイン・一時ディレクトリ）
                 let _ = tako_core::tmux::tmux_command(Some(&socket))
-                    .args(["kill-session", "-t", &format!("={session}:")])
+                    .args([
+                        "kill-session",
+                        "-t",
+                        &tako_core::tmux::session_pane_target(&session),
+                    ])
                     .output();
                 let _ = window.update(cx, |app, _, _| {
                     app.stale_binary_banners.remove(&probe_pane);
