@@ -21977,6 +21977,50 @@ mod self_test {
         }
     }
 
+    /// **新しいペインへ最初の打鍵を送る前に、シェルが受け取れる状態になるまで待つ**（#903）。
+    ///
+    /// 判定材料は「画面に空でない行が出たか」= プロンプトが出たか。OSC 133 の Idle は
+    /// シェル統合の配置に依存する（Windows は `$PROFILE`。#889）ので**前提にしない**が、
+    /// 先に Idle が立つ環境ではそれも成立の材料として使う。
+    ///
+    /// 固定待ちにしてはいけない理由（#903 の実測根因）: 器（tmux / psmux）を挟むと
+    /// 「器の client」と「内側のシェル」の二段の起動が入り、macOS の zsh とは
+    /// 桁違いに遅い。起動途中の PTY へ書いた打鍵は落ちるので、待たずに送ると
+    /// **1 回目が落ちたまま**上限まで待って FAILED になる（#640 と同型）
+    async fn wait_for_pane_ready(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        timeout: Duration,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            let ready = window
+                .update(cx, |app, _, _| {
+                    app.terminals.get(&pane).is_some_and(|session| {
+                        session.command_state() == tako_core::CommandState::Idle
+                            || session.visible_lines().iter().any(|l| !l.trim().is_empty())
+                    })
+                })
+                .unwrap_or(false);
+            if ready {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                println!(
+                    "TAKO_SELF_TEST_PANE_READY_TIMEOUT: pane={} waited={:.1}s {}",
+                    pane.as_u64(),
+                    started.elapsed().as_secs_f32(),
+                    env_line()
+                );
+                return false;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
+    }
+
     /// `wait_for_focused_text` の否定側（#796）。
     ///
     /// 「出ないこと」は待てば待つほど確からしくなる一方、**アンカー無しの否定検査は
@@ -35721,22 +35765,14 @@ mod self_test {
                     })
                     .unwrap_or(0);
                 // 分割直後はシェルの起動途中で打鍵が落ちることがあるので、
-                // プロンプトが出る（= 画面に中身がある）まで待つ
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    let ready = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&tako_core::PaneId::from_raw(dlg_pane))
-                                .is_some_and(|t| {
-                                    t.visible_lines().iter().any(|l| !l.trim().is_empty())
-                                })
-                        })
-                        .unwrap_or(false);
-                    if ready {
-                        break;
-                    }
-                }
+                // プロンプトが出る（= 画面に中身がある）まで待つ（判定は #903 の共通ヘルパー）
+                let _ = wait_for_pane_ready(
+                    window,
+                    cx,
+                    tako_core::PaneId::from_raw(dlg_pane),
+                    Duration::from_secs(30),
+                )
+                .await;
                 // ダイアログ画面を描いて `sleep` で保持する（プロンプトが下に戻ると
                 // 最下部のカーソル行がシェルのプロンプトになり画面状態が変わる）
                 // 罫線と選択カーソルは**実文字**で書く（`\uXXXX` エスケープはシェルの
@@ -43662,7 +43698,32 @@ mod self_test {
                 let Some(chat_pane) = chat_pane else {
                     fail("#737: 検証用ペインの作成")
                 };
-                wait(cx, 500).await;
+                // 作ったペインへ**固定待ちで打鍵しない**（#903）。この項目は疑似 TUI を
+                // 画面へ描いてから見るので、シェルが受け取れる状態になるまで待つ。
+                // `TAKO_903_NO_SHELL_WAIT=1` で修正前（固定 500ms + 送り直しなし）へ
+                // 戻せる = 同一バイナリで A/B が取れる
+                let shell_wait = std::env::var_os("TAKO_903_NO_SHELL_WAIT").is_none();
+                if shell_wait {
+                    let started = std::time::Instant::now();
+                    let ready =
+                        wait_for_pane_ready(window, cx, chat_pane, Duration::from_secs(30)).await;
+                    let (size, state, backend) = window
+                        .update(cx, |app, _, _| {
+                            (
+                                app.terminals.get(&chat_pane).map(|s| s.size()),
+                                app.terminals.get(&chat_pane).map(|s| s.command_state()),
+                                app.backend_sessions.get(&chat_pane).cloned(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "TAKO_SELF_TEST_737_READY: ready={ready} waited={:.1}s size={size:?} \
+                         state={state:?} backend={backend:?}",
+                        started.elapsed().as_secs_f32()
+                    );
+                } else {
+                    wait(cx, 500).await;
+                }
                 // 実描画を 1 フレーム進める（bounds / 索引は描いた後にしか採れない）
                 let draw_all = |cx: &mut AsyncApp| {
                     let handles = cx.update(|cx| cx.windows());
@@ -43746,9 +43807,6 @@ mod self_test {
                         session.write(vec![0x03]);
                     }
                 };
-                // 合成した入力ボックスが実際に下端へ出るまで待つ（固定待ちにしない）。
-                // 判定材料は本番と同じ `chat_input_mirror`。`wait` / `draw_all` は
-                // ローカルクロージャなので、関数ではなくマクロで包む
                 // いま入力ボックスのプロンプト行に何が入っているか（本番と同じ経路で採る）
                 let sample_input = |app: &TakoApp| -> Option<String> {
                     let screen = app
@@ -43759,39 +43817,64 @@ mod self_test {
                     tako_core::screen::analyze_input_line_at(&screen, region.prompt_row)
                         .map(|st| st.text.trim().to_string())
                 };
-                macro_rules! await_box {
-                    ($expected:expr) => {{
-                        let expected: &str = $expected;
+                // 合成した入力ボックスを描いて、**実際に下端へ出るまで**待つ
+                // （固定待ちにしない）。判定材料は本番と同じ `chat_input_mirror`。
+                // `wait` / `draw_all` はローカルクロージャなので、関数ではなくマクロで包む
+                macro_rules! paint_box {
+                    ($body:expr) => {{
+                        // 期待値は本文そのまま（`sample_input` は trim して返す）
+                        let body: &str = $body;
+                        let expected: &str = body.trim();
+                        let command = draw_box(body);
+                        let started = std::time::Instant::now();
+                        // **落ちた 1 回で終わらせない**（#903）。器や pwsh の起動途中は
+                        // 打鍵が落ちるので、出るまで待つだけでなく**送り直す**。
+                        // 送達確認つきの経路（`await_prompt`）は claude TUI 前提なので
+                        // 疑似 TUI には使えず、ここは再送で埋める
+                        let attempts = if shell_wait { 4 } else { 1 };
                         let mut ready = false;
-                        for _ in 0..40 {
-                            let _ = window.update(cx, |app, _, cx| {
-                                ensure_chat(app, false);
-                                cx.notify();
+                        let mut sent = 0usize;
+                        'paint: for _ in 0..attempts {
+                            // 前の状態を保持している sleep を止めてから描き直す
+                            let _ = window.update(cx, |app, _, _| {
+                                interrupt(app);
+                                send(app, command.clone())
                             });
-                            draw_all(cx);
-                            // **狙った中身が出るまで**待つ。ボックスの有無だけで待つと
-                            // 前の状態をそのまま採ってしまう（実測でここがフレークした）
-                            ready = window
-                                .update(cx, |app, _, _| {
-                                    app.chat_input_bounds.get().is_some()
-                                        && sample_input(app).as_deref() == Some(expected)
-                                })
-                                .unwrap_or(false);
-                            if ready {
-                                break;
+                            sent += 1;
+                            for _ in 0..20 {
+                                let _ = window.update(cx, |app, _, cx| {
+                                    ensure_chat(app, false);
+                                    cx.notify();
+                                });
+                                draw_all(cx);
+                                // **狙った中身が出るまで**待つ。ボックスの有無だけで待つと
+                                // 前の状態をそのまま採ってしまう（実測でここがフレークした）
+                                ready = window
+                                    .update(cx, |app, _, _| {
+                                        app.chat_input_bounds.get().is_some()
+                                            && sample_input(app).as_deref() == Some(expected)
+                                    })
+                                    .unwrap_or(false);
+                                if ready {
+                                    break 'paint;
+                                }
+                                wait(cx, 150).await;
                             }
-                            wait(cx, 150).await;
                         }
+                        println!(
+                            "TAKO_SELF_TEST_737_PAINT: expected={expected:?} ready={ready} \
+                             sent={sent} waited={:.1}s",
+                            started.elapsed().as_secs_f32()
+                        );
                         if !ready {
                             // **判定に使った材料そのものを出す**（#796）。`got=None` は
                             // 「入力ボックスが見つからない」でしかなく、箱が塗れていないのか
                             // `input_region` が `\u{276f}` 行を拾えないのかを区別できない。
                             // 画面の末尾と表示種別まで出しておけば 1 回の run で切り分く
-                            let (got, display, tail) = window
+                            let (got, display, tail, pty) = window
                                 .update(cx, |app, _, _| {
-                                    let tail = app
-                                        .terminals
-                                        .get(&chat_pane)
+                                    let session = app.terminals.get(&chat_pane);
+                                    let tail = session
                                         .map(|s| {
                                             s.visible_lines()
                                                 .iter()
@@ -43803,16 +43886,37 @@ mod self_test {
                                                 .join(" | ")
                                         })
                                         .unwrap_or_default();
+                                    // **打鍵の宛先が生きているか**まで出す（#903）。
+                                    // 画面が空なだけでは「起動が遅い」と「PTY が死んだ」を
+                                    // 区別できず、待ちを伸ばすべきかの判断が付かない
+                                    let pty = format!(
+                                        "session={} size={:?} state={:?} child={:?} \
+                                         backend={:?} nonempty={}",
+                                        session.is_some(),
+                                        session.map(|s| s.size()),
+                                        session.map(|s| s.command_state()),
+                                        session.and_then(|s| s.child_pid()),
+                                        app.backend_sessions.get(&chat_pane).cloned(),
+                                        session
+                                            .map(|s| s
+                                                .visible_lines()
+                                                .iter()
+                                                .filter(|l| !l.trim().is_empty())
+                                                .count())
+                                            .unwrap_or(0),
+                                    );
                                     (
                                         sample_input(app),
                                         format!("{:?}", app.pane_display_for(chat_pane)),
                                         tail,
+                                        pty,
                                     )
                                 })
                                 .unwrap_or_default();
                             println!(
                                 "TAKO_SELF_TEST_737: expected={expected:?} got={got:?} \
-                                 display={display} tail={tail:?}"
+                                 display={display} sent={sent} {pty} {} tail={tail:?}",
+                                env_line()
                             );
                             fail("#737: 合成した入力ボックスが画面に出ない");
                         }
@@ -43820,11 +43924,7 @@ mod self_test {
                 }
 
                 // (a) claude 自前の案内文が箱の中にある状態
-                let _ = window.update(cx, |app, _, _| {
-                    interrupt(app);
-                    send(app, draw_box("Try \"how does <filepath> work?\""))
-                });
-                await_box!("Try \"how does <filepath> work?\"");
+                paint_box!("Try \"how does <filepath> work?\"");
                 let (tui_shows, placeholder) = window
                     .update(cx, |app, _, _| {
                         let m = app.chat_input_mirror(chat_pane, true);
@@ -43856,11 +43956,7 @@ mod self_test {
                 );
 
                 // (b) 本当に空の箱（`❯ ` だけ）なら自前の案内を出す
-                let _ = window.update(cx, |app, _, _| {
-                    interrupt(app);
-                    send(app, draw_box(""))
-                });
-                await_box!("");
+                paint_box!("");
                 let empty_shows_placeholder = window
                     .update(cx, |app, _, _| {
                         let m = app.chat_input_mirror(chat_pane, true);
@@ -43875,11 +43971,7 @@ mod self_test {
                 );
 
                 // (c)〜(f) IME 変換中の位置。ユーザーの打った文字を入れてから変換を始める
-                let _ = window.update(cx, |app, _, _| {
-                    interrupt(app);
-                    send(app, draw_box("G4 mo"))
-                });
-                await_box!("G4 mo");
+                paint_box!("G4 mo");
                 for (label, preedit) in [
                     ("短い未確定", "にほんご"),
                     // (f) 長い未確定文字列。箱の幅を超えても外へはみ出さない
@@ -43982,11 +44074,7 @@ mod self_test {
 
                 // (g) Enter パススルーで自分の吹き出しが即座に出る（追加要件 5）。
                 // 送信ボタンを押さず、**打鍵と同じ経路**（handle_key の `\r`）で見る
-                let _ = window.update(cx, |app, _, _| {
-                    interrupt(app);
-                    send(app, draw_box("busy中の追加指示"))
-                });
-                await_box!("busy中の追加指示");
+                paint_box!("busy中の追加指示");
                 let echoed = window
                     .update(cx, |app, _, cx| {
                         let before = app
@@ -50566,6 +50654,71 @@ mod selftest_wait_watchdog {
             }
         }
         hits
+    }
+
+    /// **打ち込んで描く疑似 TUI の fixture は、シェルの準備を待つ**（#903）。
+    ///
+    /// 使い方は 2 通りある。ペインの起動コマンドとして渡す（`shell_snippet_command`）か、
+    /// 既にあるペインへ打ち込むか。後者は**シェルの起動途中だと打鍵が落ちる**ので、
+    /// `wait_for_pane_ready` で準備を待ってから送らなければならない
+    /// （Windows は pwsh + 器の二段の起動で 500ms では足りず、項目 100 が必ず落ちていた）。
+    ///
+    /// 検査は行番号の近傍（前後 100 行 = 1 項目ぶんの目安）にどちらかの形があるかで見る。
+    /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+    fn painted_fixture_without_ready_wait(src: &str) -> Vec<usize> {
+        const WINDOW: usize = 100;
+        let needle = concat!("paint_and", "_hold(");
+        let as_command = concat!("shell_snippet", "_command");
+        let ready = concat!("wait_for_pane", "_ready");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(needle) {
+                continue;
+            }
+            let from = index.saturating_sub(WINDOW);
+            let to = (index + WINDOW + 1).min(lines.len());
+            let around = lines[from..to].join(" ");
+            if around.contains(as_command) || around.contains(ready) {
+                continue;
+            }
+            hits.push(index + 1);
+        }
+        hits
+    }
+
+    #[test]
+    fn 打ち込む疑似画面のfixtureはシェルの準備を待っている() {
+        let src = include_str!("main.rs");
+        let hits = painted_fixture_without_ready_wait(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「疑似 TUI を描くコマンドを、シェルの準備を待たずに\
+             ペインへ打ち込む」形で書かれている。起動途中の PTY は打鍵を落とすので\
+             `wait_for_pane_ready` で待つ（またはペインの起動コマンドとして渡す）こと（#903）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬は準備待ちなしの打ち込みを見逃さず起動コマンド形は許す() {
+        let bad = format!(
+            "                let cmd = sh.{};\n                send(app, cmd);",
+            concat!("paint_and", "_hold(body, 30)")
+        );
+        assert_eq!(painted_fixture_without_ready_wait(&bad), vec![1]);
+        let waited = format!(
+            "                let _ = {}.await;\n                let cmd = sh.{};",
+            concat!("wait_for_pane", "_ready(window, cx, pane, timeout)"),
+            concat!("paint_and", "_hold(body, 30)")
+        );
+        assert!(painted_fixture_without_ready_wait(&waited).is_empty());
+        let as_command = format!(
+            "                command: Some(sh.{}(\n                    &sh.{},\n                )),",
+            concat!("shell_snippet", "_command"),
+            concat!("paint_and", "_hold(body, 30)")
+        );
+        assert!(painted_fixture_without_ready_wait(&as_command).is_empty());
     }
 
     #[test]
