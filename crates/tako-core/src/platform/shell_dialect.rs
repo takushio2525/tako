@@ -298,15 +298,24 @@ impl ShellDialect {
     /// シェル片を走らせる **argv**（`Split { command }` / `spawn_session` へ渡す形）。
     ///
     /// 検証用の疑似 TUI をペインで走らせるのに使う。`/bin/sh` は Windows に無いので
-    /// ここで振り替える（`powershell` は 5.1 でも 7 でも同じ名前で起動できる）
+    /// ここで振り替える（`powershell` は 5.1 でも 7 でも同じ名前で起動できる）。
+    ///
+    /// **PowerShell 側は `-EncodedCommand`（base64 / UTF-16LE）で渡す**（#903）。
+    /// 素の `-Command "…"` にしないのは、器（psmux）が内側コマンドを
+    /// **自分で単語分割する**ため（#875 が実行ペインで踏んだのと同じ 3 層問題）。
+    /// 実機の A/B: 引用符入りのシェル片を `-Command` で渡すと**セッションが即死**し
+    /// （`no server running on session …`）、同じ片を `-EncodedCommand` で渡すと
+    /// 生き続けて画面を描いた。base64 の出力文字は `A-Za-z0-9+/=` だけなので、
+    /// 単語分割・引用符の解釈・コマンドライン組み立てのどの層も通過する。
+    /// 非 ASCII（罫線・`❯`）も UTF-16 のまま運べる = 器越しでも落ちない
     pub fn shell_snippet_command(self, snippet: &str) -> Vec<String> {
         match self {
             Self::Posix => vec!["/bin/sh".into(), "-c".into(), snippet.to_string()],
             Self::PowerShell => vec![
                 "powershell".into(),
                 "-NoProfile".into(),
-                "-Command".into(),
-                snippet.to_string(),
+                "-EncodedCommand".into(),
+                crate::platform::shell::encode_powershell_command(snippet),
             ],
         }
     }
@@ -840,9 +849,22 @@ mod tests {
             POSIX.shell_snippet_command("echo x"),
             vec!["/bin/sh", "-c", "echo x"]
         );
+        // PowerShell 側は `-EncodedCommand`（#903）。器（psmux）が内側コマンドを
+        // 単語分割するので、引用符・空白・非 ASCII を含む片は符号化しないと死ぬ
+        let snippet = "$last = ''; Write-Host -NoNewline '❯ 箱'; Start-Sleep 30";
+        let got = PS.shell_snippet_command(snippet);
+        assert_eq!(got[..3], ["powershell", "-NoProfile", "-EncodedCommand"]);
+        assert!(
+            got[3]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "base64 以外の文字が混ざっている: {}",
+            got[3]
+        );
         assert_eq!(
-            PS.shell_snippet_command("echo x"),
-            vec!["powershell", "-NoProfile", "-Command", "echo x"]
+            crate::platform::shell::decode_powershell_command(&got[3]),
+            snippet,
+            "符号化した片が元に戻らない"
         );
     }
 
@@ -1012,19 +1034,16 @@ mod tests {
     fn 打鍵をそのまま返すペインのargvは方言で変わる() {
         assert_eq!(POSIX.echo_stdin_command(), vec!["cat".to_string()]);
         let ps = PS.echo_stdin_command();
-        assert_eq!(ps[..3], ["powershell", "-NoProfile", "-Command"]);
-        let snippet = &ps[3];
+        // 渡し方は `shell_snippet_command` と同じ = `-EncodedCommand`（#903）
+        assert_eq!(ps[..3], ["powershell", "-NoProfile", "-EncodedCommand"]);
+        let snippet = crate::platform::shell::decode_powershell_command(&ps[3]);
+        let snippet = snippet.as_str();
         // 標準入力を読んで書き戻す = `cat` と同じ役（届いた行が実行されない）
         assert!(
             snippet.contains("ReadLine"),
             "stdin を読んでいない: {snippet}"
         );
         assert!(snippet.contains("WriteLine"), "書き戻していない: {snippet}");
-        // 引用符を混ぜない（`-Command` の 1 語として届くまでに複数の層を通る）
-        assert!(
-            !snippet.contains('"') && !snippet.contains('\''),
-            "引用符が混ざっている: {snippet}"
-        );
         // Rust の行継続でつないでいるので、空白が潰れていないことも固定する
         assert!(
             !snippet.contains("  ") && !snippet.contains(");if"),
