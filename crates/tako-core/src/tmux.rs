@@ -671,7 +671,14 @@ mod tests {
     /// 本物の tmux は `-V` で tmux しか名乗らない（macOS / Linux の実出力）
     #[test]
     fn 本物のtmuxは完全一致ターゲットを使う() {
-        for version in ["tmux 3.5a\n", "tmux 3.4", "tmux next-3.6\n\n", "TMUX 3.3\n"] {
+        // `tmux 3.6b` は開発機（macOS / Homebrew）の実出力そのまま
+        for version in [
+            "tmux 3.6b\n",
+            "tmux 3.5a\n",
+            "tmux 3.4",
+            "tmux next-3.6\n\n",
+            "TMUX 3.3\n",
+        ] {
             assert!(announces_only_tmux(version), "version={version:?}");
             assert_eq!(
                 TmuxTargetSyntax::from_version(version),
