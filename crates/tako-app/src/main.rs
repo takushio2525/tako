@@ -44414,7 +44414,7 @@ mod self_test {
                     // **判定に使った材料そのものを出す**（#796）。`seen=None` だけでは
                     // 「fixture ペインが立っていない」と「立っているが footer を
                     // 読めない」を区別できない
-                    let (pty, tail) = window
+                    let (alive, pty, tail) = window
                         .update(cx, |app, _, _| {
                             let session = app.terminals.get(&master_pane);
                             let tail = session
@@ -44430,6 +44430,7 @@ mod self_test {
                                 })
                                 .unwrap_or_default();
                             (
+                                session.is_some(),
                                 format!(
                                     "session={} size={:?} state={:?} backend={:?}",
                                     session.is_some(),
@@ -44445,6 +44446,15 @@ mod self_test {
                         "TAKO_SELF_TEST_749_CTX: seen={seen:?} {pty} {} tail={tail:?}",
                         env_line()
                     );
+                    // **「読めない」と「そもそも居ない」を言い分ける**（#906）。
+                    // 器（psmux）が内側コマンドの起動を拒否すると client が終了して
+                    // 外側 PTY ごと死ぬので、ペインは無音で消える。これを
+                    // 「画面から読めない」と報告すると疑似 TUI 側を疑って何時間も溶ける
+                    if !alive {
+                        fail(
+                            "#749: 検証用ペインが消えた（器が内側コマンドの起動を拒否した疑い。#906）",
+                        );
+                    }
                     fail(&format!("#749: 画面から ctx% を読めない: {seen:?}"));
                 }
 

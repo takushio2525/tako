@@ -285,12 +285,57 @@ fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
 ///
 /// **符号化はここ 1 箇所**。実行ペイン（#875）とセルフテストのシェル片
 /// （`ShellDialect::shell_snippet_command`。#903）が同じ実装を通る
+///
+/// 出力は必ず [`container_safe_script`] を通してから符号化する（#906）。
+/// `TAKO_906_NO_PAD=1` で修正前（素の符号化）へ戻せる = 同一バイナリで A/B が取れる
 pub(crate) fn encode_powershell_command(script: &str) -> String {
+    let script = if std::env::var_os("TAKO_906_NO_PAD").is_some() {
+        std::borrow::Cow::Borrowed(script)
+    } else {
+        container_safe_script(script)
+    };
+    base64_encode(&utf16le_bytes(&script))
+}
+
+/// UTF-16LE のバイト列（`-EncodedCommand` が要求する形）
+fn utf16le_bytes(script: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(script.len() * 2);
     for unit in script.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    base64_encode(&bytes)
+    bytes
+}
+
+/// 器（psmux）が拒否する形の符号化ペイロードを避ける（純粋関数。#906）。
+///
+/// **なぜ要るか**: psmux は `-EncodedCommand` のペイロードが **base64 の `==`
+/// パディングで終わる**とき、内側コマンドを起こす段で `new-session` ごと
+/// 失敗する（実機実測: `psmux: アクセスが拒否されました。(os error 5)` / exit 5）。
+/// tako 側には失敗が返らず、器の client が終了して外側 PTY が死ぬだけなので
+/// **ペインが無音で消える**（セルフテスト項目 101 が `session=false size=None
+/// backend=None` で止まっていた症状そのもの）。
+///
+/// 実測の要点（`.agent/plans/2026-08-windows-main-merge-wip.md` の #906 の記録）:
+///
+/// - **同一長で padding だけを変えると判別できる**: base64 長 448 / 544 / 576 の
+///   それぞれで `==` は落ち、`=` 1 個・パディング無しは通る
+/// - コマンドライン側は無関係（`==` の後ろに別の引数を足しても落ちる）ので、
+///   トークンの位置ではなく**ペイロードの内容**が条件
+/// - 落ちるのは長さの帯（実測 448〜576）の中だけだが、帯の上端は測り切れていない。
+///   `==` を出さない側は 164〜752 の全実測で通ったので**そちらへ寄せる**
+///
+/// **直し方**: UTF-16 の要素数が 3 の倍数になるよう末尾へ空白を 1 個足す
+/// （バイト数 = 要素数 × 2 なので、要素数 ≡ 2 (mod 3) のときだけ足せば
+/// バイト数が 3 の倍数 = パディング無しになる）。PowerShell から見て末尾の
+/// 空白は何もしないので、スクリプトの意味は変わらない
+pub(crate) fn container_safe_script(script: &str) -> std::borrow::Cow<'_, str> {
+    // base64 のパディングはバイト数 % 3 で決まる。UTF-16LE はバイト数が要素数の
+    // 2 倍なので、要素数 ≡ 2 (mod 3) ⟺ バイト数 ≡ 1 (mod 3) ⟺ `==` の 2 個
+    if script.encode_utf16().count() % 3 == 2 {
+        std::borrow::Cow::Owned(format!("{script} "))
+    } else {
+        std::borrow::Cow::Borrowed(script)
+    }
 }
 
 /// [`encode_powershell_command`] の逆（**テストの検算用**）。
@@ -542,6 +587,79 @@ mod tests {
             // 復号したら元のコマンドがそのまま入っている（エスケープで壊れていない）
             assert!(decode(encoded).contains(command), "{command}");
         }
+    }
+
+    /// #906: 器（psmux）は `==` で終わる符号化ペイロードを拒否する（実機実測）。
+    /// **符号化の出口でそれを作らない**ことを、長さを 1 文字ずつ動かして総当たりで固定する
+    #[test]
+    fn encodedcommandは末尾が二重パディングにならない() {
+        // 素の符号化なら 3 文字ごとに `==` が現れる長さの帯を必ず含む範囲
+        for n in 0..120 {
+            let script = format!("Write-Host {}", "x".repeat(n));
+            let encoded = encode_powershell_command(&script);
+            assert!(
+                !encoded.ends_with("=="),
+                "n={n} で `==` パディングが出た: {encoded}"
+            );
+            // 意味は変わらない（末尾に空白が 1 個増えるだけ）
+            let back = decode(&encoded);
+            assert!(
+                back == script || back == format!("{script} "),
+                "n={n} で元へ戻らない: {back:?}"
+            );
+        }
+    }
+
+    /// 修正前は 3 文字ごとに `==` が出ていた = 直したことの検出力（同じ入力で before/after が違う）
+    #[test]
+    fn 素の符号化では二重パディングが出る長さがある() {
+        let mut padded = 0;
+        for n in 0..120 {
+            let script = format!("Write-Host {}", "x".repeat(n));
+            if base64_encode(&utf16le_bytes(&script)).ends_with("==") {
+                padded += 1;
+            }
+        }
+        assert_eq!(padded, 40, "3 文字ごとに `==` になる前提が崩れた");
+    }
+
+    /// 足すのは「要素数 ≡ 2 (mod 3)」のときだけ（余計な空白を付けない）
+    #[test]
+    fn container_safe_scriptは必要なときだけ空白を足す() {
+        assert_eq!(container_safe_script("ab"), "ab ", "2 要素 = 足す");
+        assert_eq!(container_safe_script("abc"), "abc", "3 要素 = 足さない");
+        assert_eq!(container_safe_script("abcd"), "abcd", "4 要素 = 足さない");
+        assert_eq!(container_safe_script("abcde"), "abcde ", "5 要素 = 足す");
+        // 非 ASCII は UTF-16 の**要素数**で数える（バイト数ではない）
+        assert_eq!(container_safe_script("箱箱"), "箱箱 ");
+        assert_eq!(container_safe_script("箱箱箱"), "箱箱箱");
+    }
+
+    /// #906 の実機で落ちていたペイロードそのもの（セルフテスト項目 101 の疑似 TUI）。
+    /// **この文字列は実機で `new-session` が exit 5 で拒否した形**なので、
+    /// 二重パディングにならないことをここで固定しておく
+    #[test]
+    fn セルフテスト項目101の疑似tuiは拒否される形にならない() {
+        let body = format!(
+            "{} Auto  5h 12%   ctx 55% ....  110K/200K\n",
+            "\n".repeat(60)
+        );
+        let script = ShellDialect::PowerShell.paint_and_hold(&body, 3600);
+        // 修正前は `==` だった（帯 448〜576 の内側 = 実機で拒否された）
+        let bare = base64_encode(&utf16le_bytes(&script));
+        assert!(
+            bare.ends_with("=="),
+            "前提が変わった: {}",
+            &bare[bare.len() - 8..]
+        );
+        assert!(
+            (448..=576).contains(&bare.len()),
+            "帯の外へ出た: {}",
+            bare.len()
+        );
+        // 修正後は `==` で終わらない
+        let fixed = encode_powershell_command(&script);
+        assert!(!fixed.ends_with("=="), "{}", &fixed[fixed.len() - 8..]);
     }
 
     #[test]
