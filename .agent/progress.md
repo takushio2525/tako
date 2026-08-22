@@ -2716,3 +2716,16 @@
 - 関連: PR #909（`Refs #905, #467`）
 - 次: なし（#905 クローズ）。実機の作法（ポップオーバーは実クリックが要る / 表示言語は
   起動前に settings.json を **BOM なしで** 書く）は plan の「#905 の記録」節へ
+
+## 2026-08-22（#907: 器つきペインへの非 ASCII 送達を根治 — 打鍵ではなく器の注入口へ）
+- 層を実測で確定: 器なしはバイト等価、器あり（psmux）だけ **cp932 に無い文字が落ちる**
+  （`テスト─❯` → `テスト`。カタカナ・漢字は通るので Issue の「日本語が壊れる」は半分外れ）。
+  psmux の `send-keys -l` / `paste-buffer` は UTF-8 をそのまま運ぶことも実測
+- 直し方: `keystrokes_ascii_only` 能力 + `SessionBackend::inject_text`（psmux = `send-keys -l`）+
+  純粋関数 `needs_text_injection`（非 ASCII かつ落とす器のときだけ迂回）。送出側 2 か所
+  （`dispatch::Send` / PromptFlow の貼り付け）を `delivery::inject_non_ascii` へ寄せた
+- 検証: after はバイト等価 / `TAKO_907_NO_INJECT=1` で before の壊れ方に戻る（検出力）/
+  macOS セルフテスト完走・test 2468 passed / 実機テスト 22 件 = ベースライン一致 /
+  実機セルフテストの停止位置は #906（新規回帰ゼロ）
+- 関連: PR（`Refs #907, #467`）
+
