@@ -43668,6 +43668,35 @@ mod self_test {
                 let Some(anchor) = anchor else {
                     fail("#737: 基準ペインの取得")
                 };
+                // **器（tmux / psmux）を挟まないペインで測る**（#903）。この項目は状態を
+                // 切り替えるたびに Ctrl+C で保持中の sleep を止めるが、Windows の器は
+                // client 自身が PowerShell スクリプトなので **Ctrl+C で終了し、
+                // 外側 PTY ごと死んでペインが閉じる**（実測: 作った直後は
+                // `session=Some(...)` なのに 14 秒後に `session=false backend=None`）。
+                // 項目 94 が直接ペインを使うのと同じ理由。検査対象は表示レイヤなので
+                // 器の有無に依らない。`TAKO_903_KEEP_CONTAINER=1` で従来どおり器つきに
+                // できる = 同一バイナリで「器が原因」を確かめられる
+                let keep_container = std::env::var_os("TAKO_903_KEEP_CONTAINER").is_some();
+                let persist_before = window
+                    .update(cx, |app, _, _| app.tmux_persist)
+                    .unwrap_or(false);
+                let set_persist = |cx: &mut AsyncApp, enabled: bool| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Persist {
+                                    enabled: Some(enabled),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .is_ok()
+                        })
+                        .unwrap_or(false)
+                };
+                if !keep_container {
+                    let _ = set_persist(cx, false);
+                }
                 let chat_pane = window
                     .update(cx, |app, _, cx| {
                         let pane = tako_control::dispatch(
@@ -43718,7 +43747,7 @@ mod self_test {
                         .unwrap_or_default();
                     println!(
                         "TAKO_SELF_TEST_737_READY: ready={ready} waited={:.1}s size={size:?} \
-                         state={state:?} backend={backend:?}",
+                         state={state:?} backend={backend:?} keep_container={keep_container}",
                         started.elapsed().as_secs_f32()
                     );
                 } else {
@@ -43835,11 +43864,24 @@ mod self_test {
                         let mut ready = false;
                         let mut sent = 0usize;
                         'paint: for _ in 0..attempts {
-                            // 前の状態を保持している sleep を止めてから描き直す
-                            let _ = window.update(cx, |app, _, _| {
+                            // 前の状態を保持している sleep を止めてから描き直す。
+                            // **送る前後で PTY の生死を記録する**（#903）。器つきだと
+                            // Ctrl+C でペインごと死ぬので、どの操作で失ったかが分かる
+                            let alive = window.update(cx, |app, _, _| {
+                                let before = app.terminals.contains_key(&chat_pane);
                                 interrupt(app);
-                                send(app, command.clone())
+                                send(app, command.clone());
+                                (before, app.terminals.contains_key(&chat_pane))
                             });
+                            if let Ok((before, after)) = alive {
+                                if !(before && after) {
+                                    println!(
+                                        "TAKO_SELF_TEST_737_ALIVE: attempt={} before={before} \
+                                         after={after}",
+                                        sent + 1
+                                    );
+                                }
+                            }
                             sent += 1;
                             for _ in 0..20 {
                                 let _ = window.update(cx, |app, _, cx| {
@@ -44140,7 +44182,8 @@ mod self_test {
                     ),
                 );
 
-                // 後片付け
+                // 後片付け（persist は**この項目に入る前の値へ戻す**。以降の項目は
+                // 器つきを前提にしているものがある = 項目 97 が ON にしている）
                 let _ = window.update(cx, |app, _, cx| {
                     let _ = tako_control::dispatch(
                         app,
@@ -44155,6 +44198,9 @@ mod self_test {
                     app.chat_echo.clear();
                     cx.notify();
                 });
+                if !keep_container {
+                    let _ = set_persist(cx, persist_before);
+                }
             }
 
             // 101. master の自動ハンドオフ通知（#749）。
