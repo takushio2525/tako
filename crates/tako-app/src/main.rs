@@ -20560,6 +20560,24 @@ mod self_test {
         out
     }
 
+    /// ペインの PTY へ「Enter を押した」として書くバイト（#897）。
+    ///
+    /// **端末が Enter として送るのは CR**（`\r`）。素の LF を書くと PSReadLine は
+    /// **継続行（`>>`）の開始**と解釈するのでコマンドが確定しない（実測。項目 94 は
+    /// `Write-Host …[?1049h; Start-Sleep 3600` が `>>` で待たされ、alt screen へ
+    /// 入れないまま確定失敗していた）。POSIX 側は tty の ICANON + ICRNL が CR も LF も
+    /// 改行に倒すので、**CR に寄せれば両方の方言で通る**（方言差ではないので
+    /// `ShellDialect` ではなくここに置く）
+    pub(crate) const PTY_ENTER: &[u8] = b"\r";
+
+    /// PTY へ 1 行打ち込む形（本文 + Enter）。
+    /// `session.write(pty_line(&cmd))` で使う（`format!("{cmd}\n")` は禁止。#897）
+    pub(crate) fn pty_line(command: &str) -> Vec<u8> {
+        let mut bytes = command.as_bytes().to_vec();
+        bytes.extend_from_slice(PTY_ENTER);
+        bytes
+    }
+
     /// 隔離 HOME の zsh をペイン内から起こすコマンドを組む（項目 41c / 41d。#833）。
     ///
     /// **値は必ずクオートして通す**。`format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", …)`
@@ -25415,9 +25433,8 @@ mod self_test {
                 window
                     .update(cx, |app, _, cx| {
                         if let Some(session) = app.terminals.get(&geom.pane) {
-                            session.write(
-                                format!("clear; sh {}\n", shape_script.display()).into_bytes(),
-                            );
+                            session
+                                .write(pty_line(&format!("clear; sh {}", shape_script.display())));
                         }
                         cx.notify();
                     })
@@ -25469,9 +25486,8 @@ mod self_test {
                 window
                     .update(cx, |app, _, cx| {
                         if let Some(session) = app.terminals.get(&geom.pane) {
-                            session.write(
-                                format!("clear; sh {}\n", hide_script.display()).into_bytes(),
-                            );
+                            session
+                                .write(pty_line(&format!("clear; sh {}", hide_script.display())));
                         }
                         cx.notify();
                     })
@@ -25503,9 +25519,8 @@ mod self_test {
                 window
                     .update(cx, |app, _, cx| {
                         if let Some(session) = app.terminals.get(&geom.pane) {
-                            session.write(
-                                format!("clear; sh {}\n", show_script.display()).into_bytes(),
-                            );
+                            session
+                                .write(pty_line(&format!("clear; sh {}", show_script.display())));
                         }
                         cx.notify();
                     })
@@ -25551,7 +25566,7 @@ mod self_test {
         window
             .update(cx, |app, _, cx| {
                 if let Some(session) = app.terminals.get(&geom.pane) {
-                    session.write(b"clear\n".to_vec());
+                    session.write(pty_line("clear"));
                 }
                 cx.notify();
             })
@@ -41146,16 +41161,10 @@ mod self_test {
                     if let Some(session) = app.terminals.get(&direct_pane) {
                         // alt screen へ入って**留まる**のが目的（`cat` は POSIX 専用なので
                         // 待ちで保持する）
-                        session.write(
-                            format!(
-                                "{}\n",
-                                sh.sequence(&[
-                                    sh.emit_ansi("\u{1b}[?1049h"),
-                                    sh.sleep(3600),
-                                ])
-                            )
-                            .into_bytes(),
-                        );
+                        session.write(pty_line(&sh.sequence(&[
+                            sh.emit_ansi("\u{1b}[?1049h"),
+                            sh.sleep(3600),
+                        ])));
                     }
                 });
                 let mut e2 = false;
@@ -41537,7 +41546,7 @@ mod self_test {
                     let _ = window.update(cx, |app, _, cx| {
                         app.jump_to_pane(chat_pane, cx);
                         if let Some(session) = app.terminals.get(&chat_pane) {
-                            session.write(b"claude\n".to_vec());
+                            session.write(pty_line("claude"));
                         }
                     });
                     // claude が起動して判定表がこのペインをチャットにするまで待つ。
@@ -48996,6 +49005,116 @@ mod selftest_pane_command_watchdog {
         assert!(literal_pane_commands(good2).is_empty());
         // 逃げ道そのものの検査: マーカーがある行は見逃す
         assert!(literal_pane_commands(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
+    }
+}
+
+/// 「セルフテストが PTY へ書く Enter を LF にする」形の番犬（#897）。
+///
+/// 端末が Enter として送るのは CR。素の LF は PSReadLine が**継続行（`>>`）の開始**と
+/// 解釈するので、書いたコマンドが確定しないまま画面が止まる。項目 94（#702 alt screen）は
+/// これで Windows において確定失敗し、**94 以降（チャット操作 / 準備中 / 設定画面 /
+/// limit-resume）が 1 つも走らない**状態だった。POSIX 側は tty が CR も LF も改行へ倒すので
+/// **CR に寄せれば両方通る** = 例外は要らない。
+///
+/// 単体テストは `pty_line` の中身しか守れないので、呼び出し側の形をここで固定する
+#[cfg(test)]
+mod selftest_pty_enter_watchdog {
+    /// 「PTY へ打つ行ではない見本」の逃げ道。テストの見本行にだけ書く
+    const ALLOW_MARKER: &str = "watchdog-allow";
+
+    /// `.write(…)` へ渡す式の中に LF エスケープが混じっている行を拾う。
+    ///
+    /// **括弧の釣り合いで式を切り出す**のが肝。項目 94 は `format!(` と `"{}\n",` が
+    /// 別の行にあり、行単位の走査では見つからなかった（#897 が長く残った理由）。
+    /// 文字列リテラルを読み飛ばしながら数えるので、リテラル中の括弧で釣り合いが壊れない
+    fn lf_pty_writes(src: &str) -> Vec<usize> {
+        // `concat!` で組む: 番犬自身のソースが検査対象（`include_str!`）に入るため、
+        // 1 語で書くと定義行が自分の走査に引っかかる
+        const NEEDLE: &str = concat!(".", "write", "(");
+        let bytes = src.as_bytes();
+        let mut hits = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(NEEDLE) {
+            let at = from + rel;
+            let open = at + NEEDLE.len() - 1;
+            from = open + 1;
+            // 始まりの行がコメント / 見本なら対象外（規約の説明文と番犬自身の見本）
+            let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_end = src[at..].find('\n').map(|i| at + i).unwrap_or(src.len());
+            let line = &src[line_start..line_end];
+            if line.trim_start().starts_with("//") || line.contains(ALLOW_MARKER) {
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut lf = false;
+            let mut i = open;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => {
+                        // 文字列リテラルは読み飛ばす。中の `\n` だけ拾う
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'"' {
+                            if bytes[i] == b'\\' {
+                                lf |= bytes.get(i + 1) == Some(&b'n');
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                        }
+                    }
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            // 文字リテラル（`'\n'` / `b'\n'`）も同じ違反
+            let end = i.min(bytes.len().saturating_sub(1));
+            lf |= src[open..=end].contains("'\\n'");
+            if lf {
+                hits.push(src[..at].matches('\n').count() + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn セルフテストがptyへ書くenterはcrである() {
+        let hits = lf_pty_writes(include_str!("main.rs"));
+        assert!(
+            hits.is_empty(),
+            "main.rs の {hits:?} 行目が PTY へ LF を書いている。\
+             PowerShell は素の LF を継続行（`>>`）の開始と解釈するのでコマンドが確定しない。\
+             `self_test::pty_line`（本文 + CR）を使うこと（#897）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬はlf書き込みを見つけcrは許す() {
+        // 以下は番犬へ渡す見本（実際に PTY へ打つ行ではない）。番犬自身の走査から
+        // 外すため `watchdog-allow` を付けてある。`good_paren` はリテラル中の括弧で
+        // 釣り合いが壊れないことの検査
+        let bad = "        session.write(b\"clear\\n\".to_vec());"; // watchdog-allow
+        let bad_multiline =
+            "session.write(\n  format!(\n    \"{}\\n\",\n    cmd\n  )\n  .into_bytes(),\n);"; // watchdog-allow
+        let bad_char = "        session.write(vec![b'\\n']);"; // watchdog-allow
+        let good = "        session.write(pty_line(\"clear\"));"; // watchdog-allow
+        let good_cr = "        session.write(b\"clear\\r\".to_vec());"; // watchdog-allow
+        let good_paren = "        session.write(b\"echo (a\\r\".to_vec());"; // watchdog-allow
+        assert_eq!(lf_pty_writes(bad), vec![1]);
+        assert_eq!(lf_pty_writes(bad_multiline), vec![1]);
+        assert_eq!(lf_pty_writes(bad_char), vec![1]);
+        assert!(lf_pty_writes(good).is_empty());
+        assert!(lf_pty_writes(good_cr).is_empty());
+        assert!(lf_pty_writes(good_paren).is_empty());
+        // 逃げ道そのものの検査: マーカーがある行は見逃す
+        assert!(lf_pty_writes(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
     }
 }
 
