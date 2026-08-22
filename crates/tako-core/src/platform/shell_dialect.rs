@@ -394,6 +394,45 @@ impl ShellDialect {
         }
     }
 
+    /// ファイルの中身を画面へ描き直し続ける（検証用の疑似 TUI。#903）。
+    ///
+    /// `paint_and_hold` は「描いて sleep で保持」なので、状態を切り替えるには
+    /// **Ctrl+C で sleep を止めて次のコマンドを打ち込む**必要がある。ところが
+    /// Windows では両方が壊れる:
+    ///
+    /// - 器（psmux）の client 自身が PowerShell スクリプトなので **Ctrl+C で終了**し、
+    ///   外側 PTY ごと死んでペインが閉じる（実測: 送った直後に `session=false`）
+    /// - **器越しの打鍵から非 ASCII が落ちる**（実測: `─` と `❯` が消えて ASCII の
+    ///   本文だけが画面に残る。器の中のシェル自身が印字する経路は無傷なので
+    ///   出力側ではなく打鍵側）
+    ///
+    /// ファイル経由なら打鍵も割り込みも要らず、**書き換えた瞬間に描き替わる**。
+    /// 中身は**生バイトのまま**出す（`printf '%b'` のような書式を通さない）ので
+    /// ESC 列も日本語もそのまま置ける。変化が無ければ描き直さない = ちらつかない
+    pub fn repaint_file_loop(self, path: &Path) -> String {
+        let shown = path.display().to_string();
+        match self {
+            Self::Posix => {
+                let quoted = crate::shell::quote_for_shell(&shown);
+                format!(
+                    "last=''; while :; do b=\"$(cat {quoted} 2>/dev/null)\"; \
+                     if [ \"$b\" != \"$last\" ]; then clear; printf '%s' \"$b\"; last=\"$b\"; fi; \
+                     sleep 0.3; done"
+                )
+            }
+            Self::PowerShell => {
+                let quoted = ps_quote(&shown);
+                format!(
+                    "$last = ''; while ($true) {{ \
+                     $b = Get-Content -Raw -Encoding UTF8 -ErrorAction SilentlyContinue {quoted}; \
+                     if ($null -ne $b -and $b -ne $last) {{ Clear-Host; \
+                     Write-Host -NoNewline $b; $last = $b }}; \
+                     Start-Sleep -Milliseconds 300 }}"
+                )
+            }
+        }
+    }
+
     /// 明示コマンド（`tako split -- <argv>`）として渡す「シェル片を走らせる argv」。
     ///
     /// 引数リストで来る経路なので、シェル片は 1 個の引数として包む
@@ -724,6 +763,45 @@ mod tests {
             PS.shell_snippet_argv("echo X; Start-Sleep 15"),
             "powershell -NoProfile -Command 'echo X; Start-Sleep 15'"
         );
+    }
+
+    /// ファイルの中身を描き直し続けるループ（#903）。
+    ///
+    /// 疑似 TUI の状態を**打鍵ではなくファイルの書き換え**で切り替えるための形。
+    /// 不変条件は 4 つ: 生の改行を出さない（1 行のシェル片として渡せる）/
+    /// 中身を書式解釈せずそのまま出す / 変化が無ければ描き直さない（ちらつき防止）/
+    /// パスを引用する（空白入りのパスで割れない）
+    #[test]
+    fn ファイルの中身を描き直し続ける() {
+        let posix = POSIX.repaint_file_loop(Path::new("/tmp/tako 903/body.txt"));
+        assert!(
+            posix.contains("cat '/tmp/tako 903/body.txt'"),
+            "パスが引用されていない: {posix}"
+        );
+        assert!(posix.contains("printf '%s'"), "書式解釈している: {posix}");
+        assert!(
+            posix.contains(r#""$b" != "$last""#),
+            "変化検出が無い: {posix}"
+        );
+        let ps = PS.repaint_file_loop(Path::new("C:\\Temp\\tako 903\\body.txt"));
+        assert!(
+            ps.contains(
+                "Get-Content -Raw -Encoding UTF8 -ErrorAction SilentlyContinue \
+                         'C:\\Temp\\tako 903\\body.txt'"
+            ),
+            "読み方 / 引用が想定と違う: {ps}"
+        );
+        assert!(
+            ps.contains("Write-Host -NoNewline $b"),
+            "生バイトのまま出していない: {ps}"
+        );
+        assert!(ps.contains("$b -ne $last"), "変化検出が無い: {ps}");
+        for rendered in [posix, ps] {
+            assert!(
+                !rendered.contains('\n'),
+                "生の改行が混ざっている: {rendered}"
+            );
+        }
     }
 
     /// 疑似 TUI の 1 枚絵。**生の改行を出さない**（打ち込む文字列としても使える）
