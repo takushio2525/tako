@@ -43708,7 +43708,7 @@ mod self_test {
                 if std::fs::write(&body_path, box_body(hint_body)).is_err() {
                     fail("#737: 疑似 TUI の本文ファイルを書けない")
                 }
-                let chat_pane = window
+                let created = window
                     .update(cx, |app, _, cx| {
                         let pane = tako_control::dispatch(
                             app,
@@ -43728,16 +43728,27 @@ mod self_test {
                         .ok()
                         .and_then(|v| v["pane"].as_u64())
                         .map(PaneId::from_raw);
+                        // **PTY 起動の失敗理由を捨てない**（#903）。捨てると
+                        // 「起動できなかった」が「画面に出ない」として現れ、
+                        // 原因が疑似 TUI 側にあるように見える
+                        let mut spawn_error = None;
                         for (p, options) in std::mem::take(&mut app.pending_attach) {
-                            if app.spawn_session(p, options, cx).is_err() {
+                            if let Err(e) = app.spawn_session(p, options, cx) {
+                                spawn_error = Some(format!("{e}"));
                                 app.remove_pane(p, cx);
                             }
                         }
-                        pane
+                        (
+                            pane,
+                            spawn_error,
+                            app.workspace.active_tab().tree().panes().len(),
+                        )
                     })
-                    .ok()
-                    .flatten();
-                let Some(chat_pane) = chat_pane else {
+                    .ok();
+                if let Some((_, Some(ref err), panes)) = created {
+                    println!("TAKO_SELF_TEST_737_SPAWN: panes={panes} spawn_error={err:?}");
+                }
+                let Some(chat_pane) = created.and_then(|(pane, _, _)| pane) else {
                     fail("#737: 検証用ペインの作成")
                 };
                 // 作ったペインへ**固定待ちで打鍵しない**（#903）。この項目は疑似 TUI を
