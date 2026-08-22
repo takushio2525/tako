@@ -2056,6 +2056,89 @@ detached セッションは約 1 秒で自然死する**（`new-session -d` の 
   `psmux_backend.rs` の打鍵は導入時（`2947a19`）から `\r` で、真因は #896 の見立て
   （器が起動直後の入力を落とす = #640 と同型）のほう。Issue にも訂正を入れた
 
+#### #866 の記録（tmux の完全一致ターゲット。PR #902・2026-08-22）
+
+**症状**: `tako tmux kill` が Windows で効かない。#865 で実機セルフテストが深く回るようになって
+項目 48（`tako tmux list` / `kill`）の **kill だけ**が落ちることから起票された。
+
+##### 原因: psmux は `-t =name` を解決せず「消えるまで待つ」だけ
+
+`tako_core::tmux` は取り違え防止に **`-t =name`**（tmux の完全一致ターゲット。#181 / #32）を
+渡すが、実機の `tmux` は psmux（winget の `marlocarlo.psmux` が `tmux.exe` を置く）で、
+これを解釈しない。**session 1（GUI と同じデスクトップ）で 2 セッションを立てた同一ソケット**の実測:
+
+| ターゲット | 結果 |
+|---|---|
+| `kill-session -t =keepa` | **exit 1 / 5158ms** `psmux: kill-session: session 'z866probe__keepa' still present after 5s`（`keepa` / `keepb` とも残る） |
+| `kill-session -t kee`（前方一致だけ） | exit 0 / 25ms（**何も消さない** = psmux は素の名前でも完全一致） |
+| `kill-session -t keepa` | exit 0 / 181ms（`keepa` だけが消え `keepb` は残る） |
+
+つまり `=` を落としても取り違えは起きず（2 行目 / 3 行目の対照）、落とさないと無反応になる。
+
+##### 測り方の罠: SSH（session 0）から測ると `=` でも成功して見える
+
+SSH セッションから `new-session -d` で作った psmux セッションは **約 1 秒で自然死する**
+（実測: `t=+500ms` で `ls` に出て `t=+1000ms` で消える）。psmux の `=` 経路は
+「消えるまで 5 秒待つ」だけなので、**その自然死を成功として返す**（`=` は 962〜1745ms、
+素の名前は 200ms 前後 = この差が待ちの分）。Issue 起票時の「3/3 決定的に失敗」と
+本セッション序盤の「成功して見える」は同じ挙動の裏表で、**session 1 で測ると決定的に落ちる**。
+
+##### 直し方: `=` を組み立てる場所を 1 本にした
+
+- `tako_core::tmux` に `announces_only_tmux`（純関数。本物の tmux は `-V` で tmux しか名乗らない /
+  psmux は `tmux 3.3.7` に加えて `psmux 3.3.7 (…)` と自分を名乗る）+ `TmuxTargetSyntax`
+  （Exact / Plain）+ `version_announcement`（`-V` を 1 度だけ）+ `exact_target` / `session_pane_target`
+- 散在していた `format!("={…}")` の直書き **33 箇所**を全部この境界経由へ
+  （tako-core / tako-control / tako-app / e2e テスト）。**macOS は文字列がバイト等価**
+- 番犬テスト `tmuxの完全一致ターゲットの直書きが境界の外に残っていない`（parity テスト）+
+  規約を `.agent/conventions.md` の新節へ
+- **`BackendCapabilities` には足さなかった**。`tako tmux *` は「任意の tmux サーバー」を触る層で、
+  器（backend）とは別物 —— しかもセルフテストは `TAKO_ISOLATED=1` = `TAKO_PERSIST=0` で
+  **器なし**なので、器の能力で分岐すると項目 48 は直らない
+- 名前は `TmuxDialect` ではなく `TmuxTargetSyntax`。#873 の番犬（方言 enum は 1 つだけ）が
+  正しく落ちたので、**シェル方言とは別の軸**であることを名前で分けた
+
+##### 製品経路の実機 A/B（session 1・同一バイナリ・env だけを変えた）
+
+項目 48 は `tako-test` と `tako-test2` を立て、**CLI から前者だけを kill して後者が残る**ことを
+見る（`tako-test` は `tako-test2` の前方一致でもあるので、完全一致になっていない実装だと
+「消えない」か「隣も消える」のどちらかで落ちる）。経路は CLI → IPC → GUI → psmux。
+
+| アーム | 診断行 | 結果 |
+|---|---|---|
+| `TAKO_866_KEEP_EXACT_TARGET=1`（旧挙動） | `（項目 48: kill 後の一覧 = ["tako-test", "tako-test2"]）` | **`TAKO_APP_SELF_TEST_FAILED: tako tmux kill でセッションが消える`** / exit 1 |
+| 既定（このブランチ） | `（項目 48: kill 後の一覧 = ["tako-test2"]）` | **項目 48 通過** |
+
+macOS（実 tmux 3.6b）でも同じ診断行で通り（`["tako-test2"]`）、隔離セルフテストは
+`TAKO_APP_SELF_TEST_OK` で完走した（skip は蓋閉じの既知 2 件 = 項目 63 / 76d）。
+
+##### セルフテスト項目 48 の gate を「本物の tmux」→「駆動できる CLI があるか」へ
+
+項目 59〜62 / 68 / 73 は attach / send-keys 前提（psmux は `detached_access` false）なので
+従来どおり本物の tmux だけで回す。スキップ理由も #866 から #519 へ書き換えた。
+
+##### 実機で確かめた「関連 tmux 系コマンド」（session 1・素の名前）
+
+| コマンド | psmux |
+|---|---|
+| `list-sessions -F` / `list-windows -a -F` | 動く（タブ区切りをそのまま返す） |
+| `list-clients -F` | **書式を無視**して自前の 1 行を返す（`parse_sessions` は突き合わせ不能 = 無害） |
+| `has-session` / `capture-pane -p` / `display-message -p` | 動く |
+| `select-window` / `kill-window` | 動く（`=` 付きでも動くが素の名前で統一） |
+| `resize-window -x -y` | exit 0 だが **幅が変わらない**（`#{window_width}` は 120 のまま）= psmux 側の未対応。`tako tmux resize` は Pending のまま |
+
+##### スライス 8（棚卸し）への申し送り
+
+マトリクスは**触っていない**（作法 4）。この実測で倒せる / 倒せないの材料はこう:
+
+| キー | 実測 |
+|---|---|
+| `tako_tmux_list` / `tako_tmux_kill` | **製品経路（CLI → IPC → GUI）で通した**（セルフテスト項目 48）。Supported へ倒せる |
+| `tako_tmux_select_window` | psmux 単体で動く（`select-window` / `list-windows` とも）。製品経路は未測 |
+| `tako_tmux_cleanup` | kill が効くようになったので理屈では動く（**未測**。orphan 掃除は本番セッションに触るので隔離での確認が要る） |
+| `tako_tmux_resize` | **Pending 継続**（psmux が `-x` を反映しない） |
+| `tako_tmux_open` | **Pending 継続**（`env TMUX= tmux attach-session` = POSIX の `env` と attach 前提） |
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）

@@ -704,7 +704,7 @@ fn broadcaster_loop(
     shutdown: Arc<AtomicBool>,
     map_weak: std::sync::Weak<Mutex<HashMap<String, Arc<Mutex<PaneBroadcaster>>>>>,
 ) {
-    let target = format!("={pane}");
+    let target = tako_core::tmux::exact_target(pane);
     let mut prev: Option<WsPrevState> = None;
     let mut last_sent = std::time::Instant::now();
 
@@ -1143,7 +1143,7 @@ pub fn run_daemon() -> io::Result<()> {
 /// CLI (`tako remote scrollback`) から使う
 pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
     let tmux_socket = tako_core::tmux_backend::socket_name();
-    let target = format!("={pane_id}");
+    let target = tako_core::tmux::exact_target(pane_id);
     let output = tako_core::tmux::tmux_command(Some(&tmux_socket))
         .args([
             "capture-pane",
@@ -2080,7 +2080,7 @@ fn tmux_list_panes_v2(
 
 /// tmux の特定 window 内のペイン一覧を取得する
 fn tmux_list_window_panes(tmux_socket: &str, session: &str, window: u32) -> Vec<String> {
-    let target = format!("={session}:{window}");
+    let target = tako_core::tmux::exact_target(&format!("{session}:{window}"));
     match tmux_output_with_timeout(
         tmux_socket,
         &["list-panes", "-t", &target, "-F", "#{pane_tty}"],
@@ -2766,11 +2766,18 @@ fn attach_card_summaries(result: &mut Value, capture: impl Fn(&str) -> Option<Ve
 }
 
 /// カード用の画面キャプチャ（履歴なし・色なしの現在画面 1 枚）。
-/// v2 ペイン一覧の `tmux_target` をそのまま使い、`=` を付けて
-/// **セッション名の完全一致**にする（前方一致のままだと別セッションを掴む）。
+/// v2 ペイン一覧の `tmux_target` をそのまま使い、**セッション名の完全一致**にする
+/// （前方一致のままだと別セッションを掴む）。形はターゲット構文の境界
+/// （`tako_core::tmux::exact_target`。#866）が決める。
 /// tmux-only モードの `session:win.pane` 形式もそのまま解決できる
 fn capture_pane_for_card(tmux_socket: &str, target: &str) -> Option<Vec<String>> {
-    tmux_capture_pane(tmux_socket, &format!("={target}"), false, None).ok()
+    tmux_capture_pane(
+        tmux_socket,
+        &tako_core::tmux::exact_target(target),
+        false,
+        None,
+    )
+    .ok()
 }
 
 /// tmux ターゲット（`session:0.0` / `session`）からセッション名部分を取り出す。
@@ -3410,7 +3417,7 @@ fn handle_api_v2_routes(
             };
             let target =
                 resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
-            let tmux_target = format!("={target}");
+            let tmux_target = tako_core::tmux::exact_target(&target);
             let ansi = query_param(url_full, "ansi").is_some_and(|v| v == "1" || v == "true");
             let history = query_param(url_full, "lines").and_then(|v| v.parse::<u32>().ok());
             match tmux_capture_pane(tmux_socket, &tmux_target, ansi, history) {
@@ -3437,7 +3444,7 @@ fn handle_api_v2_routes(
             };
             let target =
                 resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
-            let tmux_target = format!("={target}");
+            let tmux_target = tako_core::tmux::exact_target(&target);
             let history = query_param(url_full, "lines")
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(1000);
@@ -3646,7 +3653,7 @@ fn handle_api_v2_routes(
                 None => {
                     drop(conn_guard);
                     // app 不在時は tmux 直接操作にフォールバック（resize は読み取りに近い操作）
-                    let window_target = format!("={}", window_target_of(&target));
+                    let window_target = tako_core::tmux::exact_target(&window_target_of(&target));
                     let result = if reset {
                         tmux_reset_window_size(tmux_socket, &window_target)
                     } else {

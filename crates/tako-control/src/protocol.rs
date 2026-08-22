@@ -342,7 +342,9 @@ pub enum Request {
     },
     /// tmux セッションをタブ内へ取り込む（FR-2.16.10。統合 tmux ビューの D&D と同等操作）。
     /// `pane` を `direction`（省略時は右）へ分割した新ペインで attach クライアント
-    /// （`TMUX= tmux [-L socket] attach-session -t =session`）を起動する。
+    /// （`TMUX= tmux [-L socket] attach-session -t <完全一致ターゲット>`）を起動する。
+    /// ターゲットの形はターゲット構文の境界（`tako_core::tmux::exact_target`）が決める
+    /// （本物の tmux は `=session`、`=` を解さない互換実装は素の `session`。#866）。
     /// 新ペインを閉じてもセッションは残る（kill しない）
     TmuxOpen {
         socket: Option<String>,

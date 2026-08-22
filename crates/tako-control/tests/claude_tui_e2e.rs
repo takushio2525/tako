@@ -161,7 +161,7 @@ fn type_like_human(session: &str, text: &str) {
                 SOCKET,
                 "send-keys",
                 "-t",
-                &format!("={session}:"),
+                &tako_core::tmux::session_pane_target(session),
                 "-H",
                 &format!("{byte:02x}"),
             ])
@@ -284,7 +284,7 @@ fn 残留テキストをenter単独送達で送信できる() {
             SOCKET,
             "send-keys",
             "-t",
-            &format!("={}:", guard.session),
+            &tako_core::tmux::session_pane_target(&guard.session),
             "-l",
             &format!("What is 3 * 7? {SPELL_SUFFIX}"),
         ])

@@ -160,6 +160,27 @@ scripts/release.sh --update-notes v0.6.0   # 実アセットを読み直して�
   `--` オプションは「詳しい人が、わかったうえで付ける」上級者レイヤであり、既定の
   ユーザー体験はオプションなしで完結すること。CLI 設計時にこれを判断基準にする
 
+## tmux ターゲットの完全一致指定（Issue #866）
+
+tmux の `-t` は**前方一致**で解決するので、tako は取り違えを防ぐために
+`=name`（完全一致）を渡している（#181 / #32）。ただし `tmux` の名前で入っている
+CLI が**本物の tmux とは限らない**（Windows は winget の `marlocarlo.psmux` が
+`tmux.exe` を配置する）。
+
+- **`=` を自分で書かない**。`tako_core::tmux::exact_target`（`=name` / `=session:0.0`）と
+  `session_pane_target`（`=session:`。target-pane 系は末尾コロン必須 = #32）を通す。
+  付けるかどうかは `tmux -V` の申告から 1 度だけ決まる（`TmuxTargetSyntax`）
+- 番犬テスト `tmuxの完全一致ターゲットの直書きが境界の外に残っていない`
+  （`crates/tako-control/tests/platform_parity.rs`）が `format!("=…")` の直書きを
+  名指しで落とす
+- **なぜ macOS では気づけないか**: psmux は `kill-session -t =name` を解釈せず、
+  **5.1 秒ブロックしたうえで exit 1**（1 つも消えない）。素の `-t name` なら 181ms で
+  対象だけが消え、前方一致だけの `-t kee` は**何も消さない**（実測。psmux は素の
+  名前でも完全一致）。macOS の tmux は `=` で正しく動くので、テストも含めて全部緑になる
+- 「本物の tmux か」を条件にしたいときも `tako_core::tmux::announces_only_tmux` を通す
+  （版数文字列の判定を 2 か所に持たない）。attach / send-keys まで tmux 決め打ちの
+  検証（セルフテスト 59〜62 / 68 / 73）だけがこの条件を使ってよい
+
 ## 一括 dismiss に食われないクリック要素の作り方（Issue #496 / #503）
 
 ルート div の `on_mouse_down` は `clear_text_input_focus()` を呼び、テキスト入力フラグと

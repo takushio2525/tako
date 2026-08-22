@@ -1196,7 +1196,7 @@ fn dispatch_inner(
                 command.extend([
                     "attach-session".to_string(),
                     "-t".to_string(),
-                    format!("={original}"),
+                    tako_core::tmux::exact_target(&original),
                 ]);
                 if let Some(w) = window {
                     command.extend([
@@ -1217,7 +1217,7 @@ fn dispatch_inner(
                 command.extend([
                     "new-session".to_string(),
                     "-t".to_string(),
-                    format!("={original}"),
+                    tako_core::tmux::exact_target(&original),
                     "-s".to_string(),
                     name.clone(),
                 ]);

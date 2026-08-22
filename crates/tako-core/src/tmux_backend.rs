@@ -220,7 +220,7 @@ pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
         .args([
             "list-panes",
             "-t",
-            &format!("={session}"),
+            &crate::tmux::exact_target(session),
             "-F",
             "#{pane_tty}",
         ])
@@ -244,7 +244,7 @@ pub fn session_cwd(socket: &str, session: &str) -> Option<String> {
         .args([
             "list-panes",
             "-t",
-            &format!("={session}"),
+            &crate::tmux::exact_target(session),
             "-F",
             "#{pane_current_path}",
         ])
@@ -266,7 +266,12 @@ pub fn session_cwd(socket: &str, session: &str) -> Option<String> {
 /// orphan 復元時に `TAKO_ORCHESTRATOR_ROLE` / `TAKO_PANE_ID` を取り出す用途（#210）
 pub fn session_env(socket: &str, session: &str, name: &str) -> Option<String> {
     let output = crate::tmux::tmux_command(Some(socket))
-        .args(["show-environment", "-t", &format!("={session}"), name])
+        .args([
+            "show-environment",
+            "-t",
+            &crate::tmux::exact_target(session),
+            name,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -281,7 +286,13 @@ pub fn session_env(socket: &str, session: &str, name: &str) -> Option<String> {
 /// orphan 復元後に TAKO_PANE_ID を新 pane ID に更新する用途（#210）
 pub fn set_session_env(socket: &str, session: &str, name: &str, value: &str) {
     let _ = crate::tmux::tmux_command(Some(socket))
-        .args(["set-environment", "-t", &format!("={session}"), name, value])
+        .args([
+            "set-environment",
+            "-t",
+            &crate::tmux::exact_target(session),
+            name,
+            value,
+        ])
         .status();
 }
 
@@ -559,7 +570,7 @@ fn alternate_on(socket: &str, session: &str) -> Option<bool> {
         &[
             "list-panes",
             "-t",
-            &format!("={session}:"),
+            &crate::tmux::session_pane_target(session),
             "-F",
             "#{pane_active}\t#{alternate_on}",
         ],
