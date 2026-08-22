@@ -592,8 +592,9 @@ fn remove_block(current: &[u8]) -> Vec<u8> {
 /// 5.1 は BOM 無しの `.ps1` を ANSI コードページとして読むため、既存プロファイルへ
 /// 非 ASCII を追記すると化ける（実測: 検証機の `$PROFILE` は
 /// `…\OneDrive\ドキュメント\PowerShell\` にある）。非 ASCII は `[char]0xNNNN` へ逃がす
-#[cfg_attr(not(windows), allow(dead_code))]
-fn powershell_ascii_literal(value: &str) -> String {
+/// **`shell_profile`（#868 の PATH 通し）と共有する**。同じ escape を 2 つ持つと
+/// 必ず片方が腐るので、実装はここ 1 本に保つ
+pub(crate) fn powershell_ascii_literal(value: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut literal = String::new();
     for unit in value.encode_utf16() {
