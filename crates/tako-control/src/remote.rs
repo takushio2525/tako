@@ -2767,7 +2767,7 @@ fn attach_card_summaries(result: &mut Value, capture: impl Fn(&str) -> Option<Ve
 
 /// カード用の画面キャプチャ（履歴なし・色なしの現在画面 1 枚）。
 /// v2 ペイン一覧の `tmux_target` をそのまま使い、**セッション名の完全一致**にする
-/// （前方一致のままだと別セッションを掴む）。形は方言境界
+/// （前方一致のままだと別セッションを掴む）。形はターゲット構文の境界
 /// （`tako_core::tmux::exact_target`。#866）が決める。
 /// tmux-only モードの `session:win.pane` 形式もそのまま解決できる
 fn capture_pane_for_card(tmux_socket: &str, target: &str) -> Option<Vec<String>> {

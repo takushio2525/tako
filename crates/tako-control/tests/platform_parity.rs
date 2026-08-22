@@ -415,7 +415,7 @@ fn agents走査がposixシェルの直起動へ戻っていない() {
     );
 }
 
-/// **#866 の番犬**: tmux の完全一致ターゲット（`=name`）の直書きが、方言境界
+/// **#866 の番犬**: tmux の完全一致ターゲット（`=name`）の直書きが、ターゲット構文の境界
 /// （`tako_core::tmux::exact_target` / `session_pane_target`）の外に残っていないこと。
 ///
 /// `=` は tmux の「前方一致ではなく完全一致」指定で、#181 / #32 で意図的に入れたもの。
@@ -428,7 +428,7 @@ fn tmuxの完全一致ターゲットの直書きが境界の外に残ってい�
     // 境界そのものだけを許す（許可には必ず理由を書く）
     const ALLOWED: &[(&str, &str)] = &[(
         "crates/tako-core/src/tmux.rs",
-        "方言境界（TmuxDialect / exact_target / session_pane_target）の実装本体",
+        "ターゲット構文の境界（TmuxTargetSyntax / exact_target / session_pane_target）の実装本体",
     )];
     // ターゲット文字列を組み立てる形だけを対象にする（純関数へ渡す固定入力は対象外）
     const PATTERNS: &[&str] = &["format!(\"="];

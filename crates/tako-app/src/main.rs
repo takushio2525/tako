@@ -20752,7 +20752,7 @@ mod self_test {
     }
 
     /// `tmux` の名前で駆動できる CLI があるか（**本物の tmux でも psmux 等の
-    /// 互換実装でも可**）。FR-2.13 の一覧・kill はターゲット構文を方言境界
+    /// 互換実装でも可**）。FR-2.13 の一覧・kill はターゲット構文の境界
     /// （`tako_core::tmux::exact_target`。#866）へ寄せたので、実装を問わず回せる
     fn tmux_cli_available() -> bool {
         tako_core::tmux::version_announcement().is_some()
@@ -31843,7 +31843,7 @@ mod self_test {
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
             // psmux が `tmux` の名前で入っている環境（Windows）でも回す: ターゲット構文は
-            // 方言境界（`tako_core::tmux::exact_target`）が決めるので、`=name` を解さない
+            // ターゲット構文の境界（`tako_core::tmux::exact_target`）が決めるので、`=name` を解さない
             // 互換実装でも kill が効く（#866。旧挙動は TAKO_866_KEEP_EXACT_TARGET=1）
             let has_tmux_cli = tmux_cli_available();
             let has_tmux = real_tmux_available();
