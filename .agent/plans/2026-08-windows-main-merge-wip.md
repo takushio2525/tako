@@ -1994,21 +1994,24 @@ TAKO_SELF_TEST_737: expected="Try \"how does <filepath> work?\"" got=None displa
 
 ##### 実機テストのベースライン（この Issue で分かったこと）
 
-`cargo test --workspace --no-fail-fast -j 2` の失敗は **run ごとに揺れる**。
-branch の通し走行は 31 件失敗だったが、増えた 8 件は**すべて psmux / spawn の e2e**
+**結論から書く: ベースラインは 23 件ではなく 22 件で、psmux の e2e は
+`schtasks /it`（session 1）で回さないと構造的に落ちる。**（この Issue の最大の収穫）
+
+そこへ辿り着くまでの実測。`Invoke-CimMethod Win32_Process Create`（= session 0）で
+`cargo test --workspace --no-fail-fast -j 2` を投げると失敗が **run ごとに揺れた**。
+branch の通し走行は 31 件失敗で、増えた 8 件は**すべて psmux / spawn の e2e**
 （`器のホイールは…` / `器はクライアント切断後も…` / `保持していないセッションの…` /
 `明示コマンドつきの器が起動する` / `器の中のシェルのコードページを…` /
 `一覧と存在確認とcwdが往復する` / `copy_mode_の位置を読み戻せる` /
-`器ありでも空白入りcwdのペインが生き残る`）で、**#896 が言っている負荷依存**そのもの。
-単独で回すと落ちる顔ぶれが入れ替わる（実測）。
+`器ありでも空白入りcwdのペインが生き残る`）。単独 `--test-threads=1` に落としても
+落ちる顔ぶれが入れ替わるだけだった。
 
 **構造上、この PR がこれらを壊すことはあり得ない**: 差分は
 `crates/tako-app/src/main.rs`（`mod self_test` の中）と `.agent/conventions.md` だけで、
 `psmux_backend` / `spawn_arg_quoting` は **tako-core の integration test**。
 main と branch でこれらのテストバイナリは同一の入力から作られる。
 
-**psmux の e2e は `schtasks /it`（session 1）で回さないと構造的に落ちる**（この Issue の最大の収穫）。
-#866 worker の実測（このセッション中に共有された）: **SSH（session 0）で作った psmux の
+**真因**（#866 worker の実測。このセッション中に共有された）: **SSH（session 0）で作った psmux の
 detached セッションは約 1 秒で自然死する**（`new-session -d` の +500ms は `ls` に出て
 +1000ms で消える。session 1 で作ったものは残る）。`Invoke-CimMethod Win32_Process Create`
 で `cargo test` を投げると session 0 なので、psmux e2e が**測り方のせいで**落ちる。
