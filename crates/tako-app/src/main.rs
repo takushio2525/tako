@@ -48467,35 +48467,52 @@ mod self_test {
                 let Some(settings) = settings else {
                     fail("#727: 設定ウィンドウが開かない")
                 };
-                // タブ表示で status を引くが、開いた直後は間に合わないことがあるので
-                // 「更新」ボタンと同じ経路で取り直してから読む
-                let mut plan = None;
-                for _ in 0..20 {
-                    plan = settings
+                // 「更新」ボタンと同じ経路で状態を取り直す。**取れたこと**を待つ
+                // （行数は状態に関わらず 3 本あるので、それを待ち条件にすると
+                // 何も取れていない既定値のまま先へ進む。#796 の作法）。タブ切替は
+                // deferred なので、Sleep タブになるまでは取り直しても入らない
+                let mut json = None;
+                for _ in 0..40 {
+                    json = settings
                         .update(cx, |view, _, cx| {
                             view.st_sleep_refresh(cx);
-                            view.st_sleep_plan()
+                            view.st_sleep_status_json()
                         })
-                        .ok();
-                    if plan.as_ref().is_some_and(|p: &crate::settings_sleep::SleepTabPlan| {
-                        !p.status_rows.is_empty()
-                    }) {
+                        .ok()
+                        .flatten();
+                    if json.is_some() {
                         break;
                     }
                     wait(cx, 100).await;
                 }
-                let Some(plan) = plan else {
+                let Some(json) = json else {
+                    fail("#727: スリープ防止の状態（sleep-guard status）を取れない")
+                };
+                let Some(plan) = settings.update(cx, |view, _, _| view.st_sleep_plan()).ok() else {
                     fail("#727: スリープ防止タブの表示構成が取れない")
                 };
 
                 // (a) 構成が OS の能力に合っている
                 let mac = cfg!(target_os = "macos");
+                println!(
+                    "TAKO_SELF_TEST_727: device={:?} lid_row={} setup_buttons={} needs_setup={} \
+                     rows={:?} texts={}",
+                    plan.device,
+                    plan.show_lid_row,
+                    plan.show_setup_buttons,
+                    plan.needs_privileged_setup,
+                    plan.status_rows
+                        .iter()
+                        .map(|r| (r.label, r.value, r.tone))
+                        .collect::<Vec<_>>(),
+                    plan.visible_texts().len()
+                );
                 check(
                     plan.device == if mac { Device::Mac } else { Device::Pc }
                         && plan.needs_privileged_setup == mac
                         && plan.show_setup_buttons == mac,
                     &format!(
-                        "スリープ防止タブ: 初回セットアップのボタンはそれが要る OS だけに出る                          (#727。device={:?} setup_buttons={} needs_setup={})",
+                        "スリープ防止タブ: 初回セットアップのボタンはそれが要る OS だけに出る (#727。device={:?} setup_buttons={} needs_setup={})",
                         plan.device, plan.show_setup_buttons, plan.needs_privileged_setup
                     ),
                 );
@@ -48512,17 +48529,14 @@ mod self_test {
                 check(
                     offenders.is_empty() && mac_guide_kept && texts.len() >= 14,
                     &format!(
-                        "スリープ防止タブ: この OS で通じない文言が出ない                          (#727。texts={} offenders={:?} mac_guide={mac_guide_kept})",
+                        "スリープ防止タブ: この OS で通じない文言が出ない (#727。texts={} offenders={:?} mac_guide={mac_guide_kept})",
                         texts.len(),
                         offenders
                     ),
                 );
 
                 // (c) 「いまの状態」が dispatch の実値と一致する
-                let json = settings
-                    .update(cx, |view, _, _| view.st_sleep_status_json())
-                    .ok()
-                    .flatten();
+                let json = Some(json);
                 let idle_row = plan.status_rows.first().map(|r| r.value);
                 let lid_row = plan.status_rows.get(1).map(|r| r.value);
                 let power_row = plan.status_rows.get(2).map(|r| r.value);
@@ -48551,7 +48565,7 @@ mod self_test {
                 check(
                     agrees,
                     &format!(
-                        "スリープ防止タブ: いまの状態が sleep-guard status の実値と一致する                          (#727。idle={idle_row:?} lid={lid_row:?} power={power_row:?} json={})",
+                        "スリープ防止タブ: いまの状態が sleep-guard status の実値と一致する (#727。idle={idle_row:?} lid={lid_row:?} power={power_row:?} json={})",
                         json.as_ref()
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "none".into())
