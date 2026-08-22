@@ -1927,6 +1927,100 @@ main `551fa0b` と branch `f41e26e` の両方で `cargo test --workspace --no-fa
 - **項目 21（`tako title / role 設定`）は固定待ち 800ms で高負荷時に落ちる**（1 回踏んだ。
   再実行で通る）。#796 の作法から漏れている 1 件
 
+#### #897 の記録（PTY へ書く Enter を CR へ。PR #901・2026-08-22）
+
+**症状**: #889 で項目 93 が開いた直後の壁。隔離セルフテストが項目 94（#702 alt screen）で
+必ず止まり、**94 以降が 1 つも走らない**。Issue の切り分けどおり原因はテスト側 1 か所。
+
+##### 原因: Enter を LF で書いていた
+
+端末が Enter として送るのは **CR**。素の LF は PSReadLine が**継続行（`>>`）の開始**と
+解釈するのでコマンドが確定しない。POSIX 側は tty の ICANON + ICRNL が CR も LF も改行へ
+倒すので、**CR に寄せれば両方の方言で通る**（方言差ではないので `ShellDialect` ではなく
+`self_test::pty_line`（本文 + CR）に置いた）。残っていた LF は 6 か所
+（項目 94 / 項目 95c の `claude` 起動 / visual-test のカーソル形状・非表示・復帰・`clear`）。
+
+##### 実機 A/B（同じ worktree・同じ手順で HEAD だけ替えた）
+
+| アーム | HEAD | 結果 |
+|---|---|---|
+| main | `eac860a` | **FAILED**（項目 94）。到達 = 94 |
+| branch | `b003965` | **項目 94 通過** → 次の停止は**項目 100（#737）**。到達 = 100 |
+
+main 側の診断（`tail` は逆順の末尾 80 文字）:
+
+```
+TAKO_SELF_TEST_702_ALT2: inner_alt=false backend=None
+  tail="0063 peelS-tratS ;\"h9401?[)72]rahc[($\" enilweNoN- tsoH-etirW >>|>zoihs\\sresU\\:C "
+TAKO_APP_SELF_TEST_FAILED: alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)
+```
+
+読み下すと `C:\Users\shioz>` の次の行が `>> Write-Host -NoNewline "$([char]27)[?1049h"; Start-Sleep 3600`
+= **PSReadLine の継続行プロンプトで、書いたコマンドが確定していない**。
+branch 側ではこの診断行が**そもそも出ない**（= 判定が通った）。
+
+##### 94 の先で初めて Windows を通った項目（branch 側のログ。すべて緑）
+
+```
+97-SETTLE: sequence=[Preparing, Starter] reached_starter=true                  ← #720 準備中
+TAKO_SELF_TEST_725_INDEX / _SELECT / _COPY / _MCP / _LONG / _SCROLL            ← #725 チャット選択・コピー
+TAKO_SELF_TEST_739_PROFILES / _LAUNCH / _CTX                                   ← #739 起動カードのプロファイル
+```
+
+項目 94（#702）・95（#716）・96（#721）・97（#720）・98（#725）・99（#739）が
+**Windows で初めて走って通った**。
+
+##### 次の壁は項目 100（#737 チャット入力欄）= **#903 へ起票**
+
+```
+TAKO_SELF_TEST_737: expected="Try \"how does <filepath> work?\"" got=Some(None)
+TAKO_APP_SELF_TEST_FAILED: #737: 合成した入力ボックスが画面に出ない
+```
+
+**#897 の LF ではない**（製品の `Send` は `normalize_newlines_for_keys` で CR へ倒している）。
+`paint_and_hold` が組む PowerShell コマンド自体も実機の pwsh 7 で
+**そのまま構文を通って箱を描く**ことを確認済み（`Invoke-Expression` で PARSE_OK・
+罫線と `❯` と ESC 列が出た）。`got=None` = `screen::input_region` が `❯` 行を見つけられない
+という以上のことは分からなかったので、**この PR で診断行に画面末尾 6 行と
+`pane_display_for` を足した**（#796 の作法）。次の run で切り分く。
+
+##### 実機テストのベースライン（この Issue で分かったこと）
+
+`cargo test --workspace --no-fail-fast -j 2` の失敗は **run ごとに揺れる**。
+branch の通し走行は 31 件失敗だったが、増えた 8 件は**すべて psmux / spawn の e2e**
+（`器のホイールは…` / `器はクライアント切断後も…` / `保持していないセッションの…` /
+`明示コマンドつきの器が起動する` / `器の中のシェルのコードページを…` /
+`一覧と存在確認とcwdが往復する` / `copy_mode_の位置を読み戻せる` /
+`器ありでも空白入りcwdのペインが生き残る`）で、**#896 が言っている負荷依存**そのもの。
+単独で回すと落ちる顔ぶれが入れ替わる（実測）。
+
+**構造上、この PR がこれらを壊すことはあり得ない**: 差分は
+`crates/tako-app/src/main.rs`（`mod self_test` の中）と `.agent/conventions.md` だけで、
+`psmux_backend` / `spawn_arg_quoting` は **tako-core の integration test**。
+main と branch でこれらのテストバイナリは同一の入力から作られる。
+
+**兄弟セッションのビルドと重なると桁で悪化する**（実測）。単独走行
+（`--test-threads=1`）でも #866 worker の `cargo build` と重なった窓では
+**main = 10 件失敗 / branch = 7 件失敗**（psmux 16 本中）になり、**main のほうが悪い**。
+非 e2e のスイート（tako-app / tako-cli / tako-control lib / tako-core lib /
+platform_parity / encoding_conpty / shell_integration_powershell）は
+**失敗名がベースライン 22 件と完全一致**していたので、判定はそちらで行う。
+
+**残骸の後始末を忘れない**（この run で踏んだ）: 隔離セルフテストと psmux e2e は
+**psmux サーバー（プロセス名は `tmux.exe`）と pwsh の孤児を残す**。`-L tako-iso-<pid>` /
+`-L tako-884test-<pid>` が自分の残骸で、`-L tako` は本番。溜まると psmux e2e の
+失敗が増えるので、run のたびに**明示 pid** で落とす。
+
+##### 作法として残すもの
+
+- **番犬テスト `selftest_pty_enter_watchdog`**: `.write(…)` に渡す式を**括弧の釣り合いで
+  切り出して** LF エスケープを探す。項目 94 は `format!(` と `"{}\n",` が別の行にあり、
+  **行単位の走査では見つからなかった**（#897 が長く残った理由）。文字列リテラルを
+  読み飛ばしながら数えるのでリテラル中の括弧で釣り合いが壊れない
+- **#897 のコメントにあった「psmux e2e の失敗も同じ LF が原因」は誤り**。
+  `psmux_backend.rs` の打鍵は導入時（`2947a19`）から `\r` で、真因は #896 の見立て
+  （器が起動直後の入力を落とす = #640 と同型）のほう。Issue にも訂正を入れた
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
