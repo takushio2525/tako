@@ -32781,7 +32781,7 @@ mod self_test {
             } else {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 59〜62（器 {} / 本物の tmux={}。\
-                     この e2e は tmux 決め打ち。psmux は #866）",
+                     この e2e は attach / send-keys まで tmux 決め打ち = psmux は非対応。#519）",
                     tako_core::backend::capabilities().label,
                     has_tmux_backend_e2e
                 );

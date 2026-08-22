@@ -2098,6 +2098,20 @@ SSH セッションから `new-session -d` で作った psmux セッションは
 - 名前は `TmuxDialect` ではなく `TmuxTargetSyntax`。#873 の番犬（方言 enum は 1 つだけ）が
   正しく落ちたので、**シェル方言とは別の軸**であることを名前で分けた
 
+##### 製品経路の実機 A/B（session 1・同一バイナリ・env だけを変えた）
+
+項目 48 は `tako-test` と `tako-test2` を立て、**CLI から前者だけを kill して後者が残る**ことを
+見る（`tako-test` は `tako-test2` の前方一致でもあるので、完全一致になっていない実装だと
+「消えない」か「隣も消える」のどちらかで落ちる）。経路は CLI → IPC → GUI → psmux。
+
+| アーム | 診断行 | 結果 |
+|---|---|---|
+| `TAKO_866_KEEP_EXACT_TARGET=1`（旧挙動） | `（項目 48: kill 後の一覧 = ["tako-test", "tako-test2"]）` | **`TAKO_APP_SELF_TEST_FAILED: tako tmux kill でセッションが消える`** / exit 1 |
+| 既定（このブランチ） | `（項目 48: kill 後の一覧 = ["tako-test2"]）` | **項目 48 通過** |
+
+macOS（実 tmux 3.6b）でも同じ診断行で通り（`["tako-test2"]`）、隔離セルフテストは
+`TAKO_APP_SELF_TEST_OK` で完走した（skip は蓋閉じの既知 2 件 = 項目 63 / 76d）。
+
 ##### セルフテスト項目 48 の gate を「本物の tmux」→「駆動できる CLI があるか」へ
 
 項目 59〜62 / 68 / 73 は attach / send-keys 前提（psmux は `detached_access` false）なので
@@ -2113,6 +2127,17 @@ SSH セッションから `new-session -d` で作った psmux セッションは
 | `select-window` / `kill-window` | 動く（`=` 付きでも動くが素の名前で統一） |
 | `resize-window -x -y` | exit 0 だが **幅が変わらない**（`#{window_width}` は 120 のまま）= psmux 側の未対応。`tako tmux resize` は Pending のまま |
 
+##### スライス 8（棚卸し）への申し送り
+
+マトリクスは**触っていない**（作法 4）。この実測で倒せる / 倒せないの材料はこう:
+
+| キー | 実測 |
+|---|---|
+| `tako_tmux_list` / `tako_tmux_kill` | **製品経路（CLI → IPC → GUI）で通した**（セルフテスト項目 48）。Supported へ倒せる |
+| `tako_tmux_select_window` | psmux 単体で動く（`select-window` / `list-windows` とも）。製品経路は未測 |
+| `tako_tmux_cleanup` | kill が効くようになったので理屈では動く（**未測**。orphan 掃除は本番セッションに触るので隔離での確認が要る） |
+| `tako_tmux_resize` | **Pending 継続**（psmux が `-x` を反映しない） |
+| `tako_tmux_open` | **Pending 継続**（`env TMUX= tmux attach-session` = POSIX の `env` と attach 前提） |
 
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
