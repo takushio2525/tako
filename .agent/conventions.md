@@ -281,6 +281,27 @@ CLI が**本物の tmux とは限らない**（Windows は winget の `marlocarl
   **検出してやり直す**（上限つき・各試行を記録・全滅なら FAILED）。
   やり直しが本物の回帰を隠さないことは「窓が汚れていない状態で増分が出る」
   注入（`TAKO_858_INJECT=header`）で毎回確かめられる
+- **疑似 TUI の fixture は「ペインの起動コマンド」で描く。打ち込むなら準備を待つ**。
+  既にあるペインへ打ち込む形は Windows で 3 通り壊れた（#903 の実測）:
+  ①状態切替の Ctrl+C で**器（psmux）の client が終了**し外側 PTY ごと死ぬ
+  （client 自身が PowerShell スクリプトなので pipeline ごと終わる）②**器越しの打鍵から
+  非 ASCII が落ちる**（`─` / `❯` が消えて ASCII の本文だけ残る。器の中のシェルが自分で
+  印字する経路は無傷だと対照実験で確認 → 製品側の疑いは #907）③起動途中の PTY は
+  打鍵を落とす（#640）。状態を切り替えたいなら**ファイルの書き換えで描き替える**
+  （`ShellDialect::repaint_file_loop`。変化が無ければ描き直さないのでちらつかない）。
+  番犬テスト `打ち込む疑似画面のfixtureはシェルの準備を待っている` が
+  `paint_and_hold` の使い方を「起動コマンドとして渡す」か
+  「`wait_for_pane_ready` で待ってから打ち込む」の 2 通りに縛る
+- **ペインで走らせるシェル片は PowerShell では `-EncodedCommand` で渡す**
+  （`ShellDialect::shell_snippet_command`）。器（psmux）は内側コマンドを**自分で
+  単語分割する**ので、引用符入りの `-Command '<片>'` は届く前に壊れて**セッションが即死**する
+  （#875 が実行ペインで踏んだ 3 層問題と同じ。実機 A/B: `-Command` は
+  `no server running on session …`、`-EncodedCommand` は生存して画面を描いた）。
+  base64 は `A-Za-z0-9+/=` だけなのでどの層も通り、非 ASCII も UTF-16 のまま運べる。
+  符号化は `platform::shell::encode_powershell_command` の**1 実装**を共有する
+- **PTY 起動の失敗理由を捨てない**。セルフテストの `spawn_session` の `Err` を捨てると
+  「起動できなかった」が「画面に出ない」として現れ、原因が fixture 側にあるように見える
+  （#903 が長引いた理由の 1 つ）。`spawn_error` を診断行に出す
 
 ## シェルスクリプトで日本語を出すときの変数展開（Issue #837）
 
