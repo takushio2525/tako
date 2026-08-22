@@ -2647,3 +2647,25 @@
   プロンプトすら出ていないところまで確定）。#897 コメントの「psmux e2e も同じ LF が原因」は
   **誤り**と実測で訂正（`psmux_backend.rs` は導入時から `\r`）
 - 次: #903 を直せば 100 以降（#748 / #813 / #826 / #830 / #835 / #868 …）が開く
+
+## 2026-08-22（#866: tmux の完全一致ターゲットを構文の境界へ）
+
+- psmux は `kill-session -t =name` を**解決せず「消えるまで 5 秒待つ」だけ**（session 1 実測:
+  exit 1 / 5158ms / `still present after 5s` で 2 セッションとも残る）。素の `-t keepa` は
+  181ms で対象だけが消え、前方一致だけの `-t kee` は**何も消さない** = `=` を落としても
+  取り違えは起きない。`=` の組み立てを `tako_core::tmux`（`announces_only_tmux` /
+  `TmuxTargetSyntax` / `exact_target` / `session_pane_target`）の 1 本へ寄せ、直書き 33 箇所を通した
+- **session 0（SSH / `Invoke-CimMethod`）では測れない**: そこで作った detached セッションは
+  約 1 秒で自然死し、psmux の待ちループが**それを成功と読む**（`=` でも exit 0 に見える）
+- 製品経路の A/B（同一バイナリ・env だけ替え）: `TAKO_866_KEEP_EXACT_TARGET=1` は
+  項目 48 で `["tako-test", "tako-test2"]` = **FAILED**、既定は `["tako-test2"]` で通過し
+  **項目 94（#897 の壁）まで到達**。項目 48 には「前方一致で隣にいる `tako-test2` が残る」
+  対照を新設したので、「消えない」も「隣も消える」も落ちる
+- macOS: 実 tmux 3.6b の e2e 全緑（`tmux_backend` 21/0・`scroll` 4/0・`tmux` 18/0）+
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK` + test 2433 passed / fmt / clippy（両 feature）/
+  クロスチェック エラー 0・警告 10（**集合は main と完全一致**）。送る文字列はバイト等価
+- 実機スイート（session 1）は **22 件失敗 = ベースラインと一致**（tako-control 15 / tako-core 7 /
+  `psmux_backend` 16-0 / `platform_parity` 13-0）。番犬 `tmuxの完全一致ターゲットの直書きが
+  境界の外に残っていない` を新設し、1 箇所を戻すと名指しで落ちることを実測
+- 関連: PR #902。**スライス 8 への申し送り**: `tako_tmux_list` / `tako_tmux_kill` は
+  Supported へ倒せる材料が揃った（`tako_tmux_resize` / `tako_tmux_open` は Pending 継続）

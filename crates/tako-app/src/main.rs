@@ -31842,9 +31842,9 @@ mod self_test {
 
             // 48. tmux 一覧と kill（FR-2.13）。専用 -L ソケットで隔離し、ユーザーの
             //     実 tmux サーバーには一切触れない。tmux 不在環境ではスキップする
-            // psmux が `tmux` の名前で入っている環境（Windows）でも回す: ターゲット構文は
-            // ターゲット構文の境界（`tako_core::tmux::exact_target`）が決めるので、`=name` を解さない
-            // 互換実装でも kill が効く（#866。旧挙動は TAKO_866_KEEP_EXACT_TARGET=1）
+            // psmux が `tmux` の名前で入っている環境（Windows）でも回す: ターゲットの形は
+            // `tako_core::tmux::exact_target` が決めるので、`=name` を解さない互換実装でも
+            // kill が効く（#866。旧挙動は TAKO_866_KEEP_EXACT_TARGET=1）
             let has_tmux_cli = tmux_cli_available();
             let has_tmux = real_tmux_available();
             if !has_tmux_cli {
