@@ -3,10 +3,15 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
+	// 公開 URL。canonical / og:url / sitemap / OG 画像の絶対 URL の基点になる
+	// （crates/tako-app/src/about_window.rs の DOCUMENTATION_URL と同じ URL）
+	site: 'https://tako-docs.pages.dev',
 	integrations: [
 		starlight({
 			title: 'tako',
 			description: 'AI エージェントのための次世代ターミナル',
+			// ページごとの OG 画像を head に足す（画像は docs/scripts/generate-og.mjs が生成）
+			routeMiddleware: './src/starlightRouteData.ts',
 			defaultLocale: 'root',
 			locales: {
 				root: { label: '日本語', lang: 'ja' },
