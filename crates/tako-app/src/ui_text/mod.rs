@@ -103,6 +103,19 @@ pub(crate) mod tests_support {
         i18n::set_lang(original);
     }
 
+    /// 指定した言語で `body` を 1 回走らせる（#905）。
+    ///
+    /// 「macOS 側の文言が 1 文字も動いていない」のように**実文字列で押さえたい**検査は
+    /// 言語を固定しないと書けない。ロックは呼び出しごとに取り直すので、
+    /// 続けて 2 回呼んでも他テストと競合しない
+    pub(crate) fn with_lang(lang: Lang, body: impl FnOnce()) {
+        let _guard = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let original = i18n::lang();
+        i18n::set_lang(lang);
+        body();
+        i18n::set_lang(original);
+    }
+
     fn assert_no_emoji(s: &str) {
         for c in s.chars() {
             let cp = c as u32;

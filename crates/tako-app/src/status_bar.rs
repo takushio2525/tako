@@ -6,6 +6,7 @@ use tako_core::{CommandState, LimitService};
 
 use super::*;
 use crate::file_icons::ui_icon;
+use crate::settings_sleep::Device;
 
 impl TakoApp {
     pub(crate) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::Div {
@@ -339,7 +340,7 @@ impl TakoApp {
             }))
             // sleep-guard 状態チップ（#440: 平易な日本語表示 + クリックで詳細ポップオーバー）
             .children(self.sleep_guard_state.as_ref().and_then(|state| {
-                let label = crate::ui_text::sleep_guard::chip_label(state)?;
+                let label = crate::ui_text::sleep_guard::chip_label(state, Device::detect())?;
                 let thermal = state.lid_sleep_disabled && state.thermal_state.is_warning();
                 let color = if thermal { theme.red } else { theme.teal };
                 let popover_open = self.sleep_guard_popover_open;
@@ -981,6 +982,9 @@ impl TakoApp {
         if !self.sleep_guard_popover_open {
             return None;
         }
+        // 呼び名は OS 固定なのでここで 1 回だけ決める（#905。文言側は値で受け取るので
+        // macOS 上から Windows 側の分岐をテストできる）
+        let device = Device::detect();
         let anchor = self.sleep_guard_popover_anchor?;
         let state = self.sleep_guard_state.clone()?;
         let theme = self.theme.clone();
@@ -1097,11 +1101,11 @@ impl TakoApp {
                                 ))
                                 .child(row(
                                     text::label_status(),
-                                    SharedString::from(text::reason(&state)),
+                                    SharedString::from(text::reason(&state, device)),
                                 ))
                                 .child(row(
                                     text::label_lid(),
-                                    SharedString::from(text::lid_behavior(&state)),
+                                    SharedString::from(text::lid_behavior(&state, device)),
                                 ))
                                 // 高温警告（蓋閉じ継続が効いている文脈でのみ表示）
                                 .when(thermal, |d| {
@@ -1133,7 +1137,7 @@ impl TakoApp {
                                                     .text_size(px(10.5))
                                                     .line_height(px(15.0))
                                                     .text_color(hsla(theme.red))
-                                                    .child(text::thermal_note()),
+                                                    .child(text::thermal_note(device)),
                                             ),
                                     )
                                 }),

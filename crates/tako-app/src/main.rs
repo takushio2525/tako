@@ -48577,6 +48577,77 @@ mod self_test {
                 let _ = window.update(cx, |app, _, _| app.settings_window_handle = None);
             }
 
+            // 121: ステータスバーのスリープ防止ポップオーバーの文言（#905）。
+            // 設定画面（項目 120）と違い、ここは「効いているときだけ出る」表示面なので
+            // 実状態に依らせると検証が環境任せになる。状態を差し替えて**実際に開き**、
+            // 描かれる文言の集合（`popover_texts` = renderer と同じ関数から作る。
+            // 番犬テストが両者の一致を担保）に、この OS で通じない語が無いかを見る
+            {
+                use crate::settings_sleep::Device;
+                use tako_control::sleep_guard::{
+                    LidSleepMode, PowerCondition, SleepGuardMode, SleepGuardState, ThermalState,
+                };
+
+                let probe_state = SleepGuardState {
+                    assertion_held: true,
+                    mode: SleepGuardMode::WhileAgentsRunning,
+                    power_condition: PowerCondition::AcOnly,
+                    on_ac_power: true,
+                    busy_agents: 2,
+                    platform_supported: true,
+                    lid_closed: false,
+                    // 蓋閉じ継続 + 高温まで立てて、条件つきの行も含めて描かせる
+                    lid_sleep_disabled: true,
+                    lid_sleep_mode: LidSleepMode::WhileAgentsRunning,
+                    sudoers_installed: false,
+                    lid_setup_required: false,
+                    thermal_state: ThermalState::Serious,
+                    display_sleep_forced: false,
+                };
+                let device = Device::detect();
+                // チップのクリックハンドラが立てるのと同じ 2 つの状態を立てて開く
+                let opened = window
+                    .update(cx, |app, _, cx| {
+                        app.sleep_guard_state = Some(probe_state.clone());
+                        app.sleep_guard_popover_open = true;
+                        app.sleep_guard_popover_anchor = Some(gpui::point(px(120.), px(600.)));
+                        cx.notify();
+                        app.render_sleep_guard_overlay(cx).is_some()
+                    })
+                    .unwrap_or(false);
+                notify_and_draw(any, window, cx);
+                let texts = crate::ui_text::sleep_guard::popover_texts(&probe_state, device);
+                let mac = cfg!(target_os = "macos");
+                let foreign: Vec<&String> = texts
+                    .iter()
+                    .filter(|t| {
+                        !mac && (t.contains("Mac") || t.contains("pmset") || t.contains("sudoers"))
+                    })
+                    .collect();
+                // macOS では従来の呼び名が残っていること（後退していないこと）も見る
+                let mac_wording_kept = !mac || texts.iter().any(|t| t.contains("Mac"));
+                println!(
+                    "TAKO_SELF_TEST_905: device={device:?} opened={opened} texts={} \
+                     foreign={foreign:?} mac_wording_kept={mac_wording_kept}",
+                    texts.len()
+                );
+                check(
+                    opened && foreign.is_empty() && mac_wording_kept && texts.len() >= 11,
+                    &format!(
+                        "スリープ防止ポップオーバー: この OS で通じない文言が出ない \
+                         (#905。opened={opened} texts={} foreign={foreign:?})",
+                        texts.len()
+                    ),
+                );
+                // 開いたポップオーバーは閉じ、状態も元へ（以後の項目へ持ち越さない）
+                let _ = window.update(cx, |app, _, cx| {
+                    app.sleep_guard_popover_open = false;
+                    app.sleep_guard_popover_anchor = None;
+                    app.sleep_guard_state = None;
+                    cx.notify();
+                });
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
