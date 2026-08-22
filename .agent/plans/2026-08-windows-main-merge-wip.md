@@ -2139,6 +2139,75 @@ macOS（実 tmux 3.6b）でも同じ診断行で通り（`["tako-test2"]`）、�
 | `tako_tmux_resize` | **Pending 継続**（psmux が `-x` を反映しない） |
 | `tako_tmux_open` | **Pending 継続**（`env TMUX= tmux attach-session` = POSIX の `env` と attach 前提） |
 
+#### #727 の記録（設定画面のスリープ系。PR #904・2026-08-22）
+
+**症状**: Windows の設定画面（スリープ防止タブ）が macOS 前提のまま。蓋閉じ継続は #697 で
+**権限不要**に実装済みなのに「sudoers を登録 / 解除」ボタンが並び、説明文は「**Mac** が眠って…」。
+さらに**いま効いているのかがどこにも出ていない**（macOS はステータスバーのチップが補うが、
+Windows は蓋の開閉を観測しない = `lid_state_detectable() == false` ぶんチップが薄い）。
+
+**WIP の扱い**: `origin/windows/727-sleep-settings` の `5791a03`（保全コミット）に
+`settings_sleep.rs` + 設定タブの改修が丸ごと入っていた。**再実装ではなく移植**し、
+main の現行 API へ合わせたうえで次の 3 点を足した:
+
+1. `Device`（`Mac` / `Pc`）を**値として持ち回す**。WIP は `ui_text` の中に
+   `fn is_mac() -> bool { cfg!(target_os = "macos") }` を置いていたが、それだと
+   **macOS 上から Windows 側の文言を検証できない**（#515 の方針に反する）。
+   OS を見るのは `Device::detect()` の 1 か所だけにした
+2. 蓋閉じ継続の説明は `desc_sleep_lid(needs_privileged_setup: bool)` に。**main には
+   #697 の分岐が入っていなかった**（win467 側だけ）ので、Windows でも
+   「sudoers の登録が必要」と出ていた = Issue の棚卸しより 1 件多い
+3. 「反映中」と「AC 未接続 / エージェント待ち」の境目を
+   `sleep_guard::should_hold_assertion` / `should_disable_lid_sleep`（この PR で `pub` 化。
+   **ロジックは 1 行も変えていない**）と**総当たりで一致**することをテストで固定。
+   WIP はコメントで「揃える」と書くだけだった
+
+**表示構成は純粋関数へ**: `SleepTabPlan`（状態行 + 行 / ボタンの出し分け）と
+`visible_texts()`（その構成で画面に出る文字列すべて）を `settings_sleep` に置き、
+描画（`render_sleep_tab`）は並べるだけにした。おかげで「Windows に macOS 固有の語が
+出ない」を **GUI を起こさずに `cargo test` で**検査できる（実機の `cargo test` でも回る）。
+
+##### 実機実測（`ssh win`。GUI は `schtasks /it` で session 1）
+
+| 観点 | 実測 |
+|---|---|
+| 修正前（v0.5.13-win.3 = Issue 報告と同じ版） | 「**Mac** が眠って…」/「sudoers を登録」「sudoers を解除」/ 状態表示なし（スクショ取得） |
+| 修正後 | 「**この PC** が眠って…」/ sudoers ボタン**消滅** / 「いまの状態」= アイドル防止・蓋閉じ継続・電源 + 更新ボタン |
+| 状態と実効（アイドル） | busy ペインつき mode=on で表示「有効（自動スリープを止めています）」+「エージェント 1 体が稼働中」← 同時刻の `powercfg /requests` SYSTEM が `[PROCESS] …\tako-wt-727\target\debug\tako-app.exe / tako: sleep guard (always on)`。mode=off にすると表示も SYSTEM も消える |
+| 状態と実効（蓋閉じ） | 表示「有効（蓋を閉じても動き続けます）」のとき `<data_dir>\lid-guard.json` が存在（`{"scheme":"381b4222-…","ac":0,"dc":null}`）。off にすると記録が消える |
+| 外部（CLI）変更への追随 | `tako sleep-guard set --mode off` → タブ再表示で表示も「オフ」へ。on / off / while-agents-running の 3 状態を実測 |
+
+**測り方の落とし穴（次の worker のために）**:
+
+- **`powercfg /requests` は管理者権限が要る**。`schtasks /it`（session 1）の対話トークンは
+  非昇格なので中で叩くと失敗する。**SSH セッション側は既に昇格している**
+  （`IsInRole(544)` が True）ので、GUI を session 1 に置いたまま **SSH 側から**読む
+- **`CopyFromScreen` は「画面」を撮る**ので、対象ウィンドウが他のウィンドウに隠れていると
+  **別アプリの画素**が入る。しかも GPUI は**完全に隠れると描画を止める**（macOS の
+  セルフテスト項目 63 / 76d / 104 のスキップ理由と同じ）ので、隠れたまま撮ると
+  **古いフレーム**が残る。実際にこれで「モードのセグメントだけ古い」1 枚を撮ってしまい、
+  製品バグかと 30 分疑った。`SetForegroundWindow` + 1.2 秒待ってから撮ると解消
+- **この機の AC 側の蓋アクションは既に `0x00000000`**（= 何もしない）。tako が倒しても
+  値が動かないので、**レールの値だけでは効きを確かめられない**（tako の記録ファイルと
+  `powercfg /requests` を見る）。`set_stay_awake(_, false)` = **AC レールだけ**倒す設計（#697）
+  なので DC も動かない。production の `lid-guard.json` は不在 = 誰の保持でもない素の値
+- **busy 判定には器が要る**。`TAKO_ISOLATED=1` は persist を OFF にするので、
+  ペインに psmux の器が無く**子プロセスを走らせても busy_agents が 0 のまま**になる
+  （スライス 9 のスクリプトが `TAKO_PERSIST=1` を明示していたのはこのため）。
+  器を使ったら**明示 pid で** `tmux -L tako-iso-<pid> kill-server` まで片付ける
+- `tako split` にコマンドを渡すには **`--` が要る**（`split [OPTIONS] [-- <COMMAND>...]`）
+- **`tako sleep-guard` は IPC を通らない**（`sleep_guard_local`）。CLI から見えるのは
+  CLI プロセス自身の状態なので、`assertion_held` / `busy_agents` は常に 0。
+  **GUI の実状態を読める場所はこの設定画面だけ**（スライス 9 の申し送りどおり）
+
+##### 残り（別 Issue 候補）
+
+- `ui_text::sleep_guard` の**他の理由文**（`reason_always_on` / `reason_agents_running` /
+  `reason_no_prevention` / `reason_thermal` / `chip_active` の英語側）はまだ「Mac」と言う。
+  Issue #727 の棚卸しは `reason_system_disabled` だけを挙げていたのでこの PR も**そこだけ**
+  直した。ステータスバーのポップオーバーに残るので **#905 として起票**
+- `setup` の対話フロー（L3 の蓋閉じ案内）は未移植（スライス 9 の申し送りのまま）
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
@@ -2214,10 +2283,9 @@ CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 
   foreground runnable が再入して二重借用 panic → `extern "system"` を跨ぐので abort。
   WIP は `windows/724-port-crash` の `82d3dcb`（`webview.rs` の `CREATION_PUMPS_EVENT_LOOP` +
   `main.rs` の遅延生成キュー、計 260 行）
-- **#727（設定画面のスリープ系が macOS 前提）は未着手**。ボタンが**必ず失敗する**症状は
-  dispatch を `prepare_lid_control` 経由にしたぶん解消したが、文言（「Mac が眠って…」/
-  「sudoers を登録」）と状態表示の欠落は残る。WIP は `windows/727-sleep-settings` の
-  `5791a03`（`settings_sleep.rs` 新設 + 設定タブ、計 820 行）
+- ~~**#727（設定画面のスリープ系が macOS 前提）は未着手**~~ → **完了**（PR #904。
+  上の「#727 の記録」節）。ボタンが必ず失敗する症状はスライス 9 の dispatch 変更で
+  解消済みだったので、残っていた文言と状態表示の欠落を片付けた
 - **`tako sleep-guard status` は CLI プロセス自身の状態を返す**（`sleep_guard_local` 経由で
   IPC を通らないため `assertion_held` / `busy_agents` が常に 0）。**macOS でも同じ**の
   main 由来の設計。実際の保持は `powercfg /requests`（Windows）/ `pmset -g assertions`（macOS）で見る

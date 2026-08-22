@@ -88,6 +88,21 @@ pub(crate) mod tests_support {
         }
     }
 
+    /// 日英それぞれで `body` を 1 回ずつ走らせる（#727）。
+    ///
+    /// `check_ja_en` は「非空・絵文字なし・訳し漏れなし」を検査する専用形だが、
+    /// 「この文字列が出ない / 出る」のような**独自の検査を両言語で**やりたい場所もある。
+    /// 言語グローバルは共有なので、切り替えは同じロックの下で行う
+    pub(crate) fn for_each_lang(body: impl Fn()) {
+        let _guard = lang_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let original = i18n::lang();
+        for lang in [Lang::Ja, Lang::En] {
+            i18n::set_lang(lang);
+            body();
+        }
+        i18n::set_lang(original);
+    }
+
     fn assert_no_emoji(s: &str) {
         for c in s.chars() {
             let cp = c as u32;

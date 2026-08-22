@@ -725,8 +725,12 @@ pub fn set_disablesleep(enable: bool) -> Result<(), String> {
 /// アサーションを保持すべきかの判定（純粋関数）。
 ///
 /// モードと電源条件の組み合わせは**プラットフォームを問わず同じ規則**なので、
-/// macOS（IOKit）と Windows（電源要求）の両経路がこの 1 本を通る（#524）
-fn should_hold_assertion(
+/// macOS（IOKit）と Windows（電源要求）の両経路がこの 1 本を通る（#524）。
+///
+/// `pub` なのは、設定画面が「効くべきなのに効いていない」を「反映中」と
+/// 「AC 未接続」等に切り分けるため（#727）。同じ真理値を UI 側で書き直すと
+/// 片方だけ直したときに表示が嘘になるので、判定はここ 1 本に閉じる
+pub fn should_hold_assertion(
     mode: SleepGuardMode,
     power_condition: PowerCondition,
     on_ac: bool,
@@ -756,7 +760,9 @@ fn should_hold_assertion(
 ///
 /// **AC 接続を条件にするのは意図的**。蓋を閉じて持ち歩くのはたいていバッテリー駆動なので、
 /// バッテリー時まで蓋閉じ継続を効かせると鞄の中で電池が尽きる
-fn should_disable_lid_sleep(
+///
+/// `should_hold_assertion` と同じ理由で `pub`（#727）
+pub fn should_disable_lid_sleep(
     lid_sleep_mode: LidSleepMode,
     setup_done: bool,
     busy_agents: usize,

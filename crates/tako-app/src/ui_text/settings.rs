@@ -1,6 +1,8 @@
 //! 設定画面の UI 文字列カタログ（Issue #459 / #486 / #488）
 #![allow(dead_code)]
 
+use crate::settings_sleep::{Device, IdleStatus, LidStatus};
+
 pub fn window_title() -> &'static str {
     tr!("tako 設定", "tako Settings")
 }
@@ -584,11 +586,21 @@ pub fn sleep_mode_header() -> &'static str {
     tr!("スリープ防止モード", "Sleep prevention mode")
 }
 
-pub fn desc_sleep_mode() -> &'static str {
-    tr!(
-        "Mac が眠ってエージェントが止まるのを防ぐ",
-        "Keep the Mac awake so agents keep running"
-    )
+/// スリープ防止モードの説明（#727）。
+///
+/// 「Mac」は macOS でしか通じない**呼び名**なので、どう呼ぶかは呼び出し側から受け取る
+/// （`cfg!` をここへ書くと macOS 上から Windows 側の文言を検証できない）
+pub fn desc_sleep_mode(device: Device) -> &'static str {
+    match device {
+        Device::Mac => tr!(
+            "Mac が眠ってエージェントが止まるのを防ぐ",
+            "Keep the Mac awake so agents keep running"
+        ),
+        Device::Pc => tr!(
+            "この PC が眠ってエージェントが止まるのを防ぐ",
+            "Keep this PC awake so agents keep running"
+        ),
+    }
 }
 
 pub fn sleep_mode_off() -> &'static str {
@@ -626,11 +638,25 @@ pub fn sleep_lid_header() -> &'static str {
     tr!("蓋閉じ継続", "Lid close prevention")
 }
 
-pub fn desc_sleep_lid() -> &'static str {
-    tr!(
-        "蓋を閉じても動かし続ける（sudoers の登録が必要）",
-        "Keep running with the lid closed (requires a sudoers entry)"
-    )
+/// 蓋閉じ継続の説明（#727）。
+///
+/// 実現手段は OS で違う（macOS = sudoers + `pmset disablesleep` / Windows = 電源プランの
+/// `GUID_LIDCLOSE_ACTION`。#697）。**OS 名ではなく「初回登録が要る仕組みか」**で
+/// 出し分けるので、同じ性質の OS が増えても文言側を触らずに済む
+pub fn desc_sleep_lid(needs_privileged_setup: bool) -> &'static str {
+    if needs_privileged_setup {
+        tr!(
+            "蓋を閉じても動かし続ける（sudoers の登録が必要）",
+            "Keep running with the lid closed (requires a sudoers entry)"
+        )
+    } else {
+        // 権限が要らないことは自分から言う。macOS 向けの案内（sudoers 登録）を見た人が
+        // 「Windows でも何か登録が要るはず」と探しにいかないように
+        tr!(
+            "蓋を閉じても動かし続ける（管理者権限は不要。AC 接続時・エージェント稼働中のみ）",
+            "Keep running with the lid closed (no admin rights needed; only on AC power, while agents are running)"
+        )
+    }
 }
 
 pub fn sleep_lid_install() -> &'static str {
@@ -647,6 +673,116 @@ pub fn msg_lid_installed() -> &'static str {
 
 pub fn msg_lid_removed() -> &'static str {
     tr!("sudoers を解除しました", "Sudoers entry removed")
+}
+
+// --- スリープ防止タブ: いまの状態（#727） ---
+//
+// 設定値だけを並べても「で、いま効いているのか」が分からない。macOS はステータスバーの
+// チップとポップオーバーが補うが、Windows は蓋の開閉を観測しない（`lid_state_detectable()`）
+// ぶんチップの情報が薄いので、設定画面にも現在値を出す
+
+pub fn sleep_status_header() -> &'static str {
+    tr!("いまの状態", "Current status")
+}
+
+pub fn sleep_status_idle_label() -> &'static str {
+    tr!("アイドルスリープ防止", "Idle sleep prevention")
+}
+
+pub fn sleep_status_power_label() -> &'static str {
+    tr!("電源", "Power")
+}
+
+pub fn sleep_status_on_ac() -> &'static str {
+    tr!("AC 電源", "AC power")
+}
+
+pub fn sleep_status_on_battery() -> &'static str {
+    tr!("バッテリー", "Battery")
+}
+
+// 状態の値（アイドル防止と蓋閉じ継続で意味が同じものは共有する）
+
+pub fn sleep_status_unsupported() -> &'static str {
+    tr!("この OS では使えません", "Not available on this OS")
+}
+
+pub fn sleep_status_off() -> &'static str {
+    tr!("オフ", "Off")
+}
+
+pub fn sleep_status_applying() -> &'static str {
+    tr!("反映中…", "Applying…")
+}
+
+pub fn sleep_status_waiting_agents() -> &'static str {
+    tr!(
+        "待機中（エージェントが動き出すと有効）",
+        "Standing by (activates once agents start)"
+    )
+}
+
+pub fn sleep_status_paused_no_ac() -> &'static str {
+    tr!("停止中（AC 未接続）", "Paused (not on AC power)")
+}
+
+pub fn sleep_status_paused_thermal() -> &'static str {
+    tr!("停止中（本体が高温）", "Paused (device is running hot)")
+}
+
+pub fn sleep_status_idle_active() -> &'static str {
+    tr!(
+        "有効（自動スリープを止めています）",
+        "On (holding off automatic sleep)"
+    )
+}
+
+pub fn sleep_status_lid_active() -> &'static str {
+    tr!(
+        "有効（蓋を閉じても動き続けます）",
+        "On (keeps running with the lid closed)"
+    )
+}
+
+pub fn sleep_status_lid_setup_required() -> &'static str {
+    tr!(
+        "セットアップ待ち（下のボタンから登録）",
+        "Setup required (use the button below)"
+    )
+}
+
+/// アイドルスリープ防止のいまの状態
+pub fn sleep_idle_status(status: IdleStatus) -> &'static str {
+    match status {
+        IdleStatus::Unsupported => sleep_status_unsupported(),
+        IdleStatus::Off => sleep_status_off(),
+        IdleStatus::Active => sleep_status_idle_active(),
+        IdleStatus::PausedNoAc => sleep_status_paused_no_ac(),
+        IdleStatus::WaitingAgents => sleep_status_waiting_agents(),
+        IdleStatus::Applying => sleep_status_applying(),
+    }
+}
+
+/// 蓋閉じ継続のいまの状態
+pub fn sleep_lid_status(status: LidStatus) -> &'static str {
+    match status {
+        LidStatus::Unsupported => sleep_status_unsupported(),
+        LidStatus::Off => sleep_status_off(),
+        LidStatus::SetupRequired => sleep_status_lid_setup_required(),
+        LidStatus::Active => sleep_status_lid_active(),
+        LidStatus::WaitingAgents => sleep_status_waiting_agents(),
+        LidStatus::PausedNoAc => sleep_status_paused_no_ac(),
+        LidStatus::PausedThermal => sleep_status_paused_thermal(),
+        LidStatus::Applying => sleep_status_applying(),
+    }
+}
+
+/// 稼働中のエージェント数（状態の補足）
+pub fn sleep_status_agents(n: usize) -> String {
+    tr!(
+        format!("エージェント {n} 体が稼働中"),
+        format!("{n} agent(s) running")
+    )
 }
 
 // --- リモートタブ ---
@@ -1249,7 +1385,9 @@ mod tests {
                 setup_run_btn().into(),
                 msg_setup_started().into(),
                 sleep_mode_header().into(),
-                desc_sleep_mode().into(),
+                // 呼び名・仕組みで分岐する文言は両方の枝を検査する（#727）
+                desc_sleep_mode(Device::Mac).into(),
+                desc_sleep_mode(Device::Pc).into(),
                 sleep_mode_off().into(),
                 sleep_mode_on().into(),
                 sleep_mode_agents().into(),
@@ -1258,11 +1396,27 @@ mod tests {
                 sleep_power_ac().into(),
                 sleep_power_always().into(),
                 sleep_lid_header().into(),
-                desc_sleep_lid().into(),
+                desc_sleep_lid(true).into(),
+                desc_sleep_lid(false).into(),
                 sleep_lid_install().into(),
                 sleep_lid_remove().into(),
                 msg_lid_installed().into(),
                 msg_lid_removed().into(),
+                sleep_status_header().into(),
+                sleep_status_idle_label().into(),
+                sleep_status_power_label().into(),
+                sleep_status_on_ac().into(),
+                sleep_status_on_battery().into(),
+                sleep_status_unsupported().into(),
+                sleep_status_off().into(),
+                sleep_status_applying().into(),
+                sleep_status_waiting_agents().into(),
+                sleep_status_paused_no_ac().into(),
+                sleep_status_paused_thermal().into(),
+                sleep_status_idle_active().into(),
+                sleep_status_lid_active().into(),
+                sleep_status_lid_setup_required().into(),
+                sleep_status_agents(2),
                 remote_daemon_header().into(),
                 remote_status_label().into(),
                 remote_status_running().into(),

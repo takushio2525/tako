@@ -2669,3 +2669,22 @@
   境界の外に残っていない` を新設し、1 箇所を戻すと名指しで落ちることを実測
 - 関連: PR #902。**スライス 8 への申し送り**: `tako_tmux_list` / `tako_tmux_kill` は
   Supported へ倒せる材料が揃った（`tako_tmux_resize` / `tako_tmux_open` は Pending 継続）
+
+## 2026-08-22（#727: 設定画面のスリープ防止タブを能力ベースの表示へ）
+- Windows の設定画面が macOS 前提のまま（「Mac が眠って…」/ sudoers ボタン / 状態表示ゼロ）
+  だったのを、**表示構成を OS 名ではなく能力から決める**形へ。新設 `settings_sleep`（GPUI 非依存）が
+  status JSON を型へ落とし、行・ボタンの出し分け（`show_setup_buttons` = 初回登録が要る OS だけ）と
+  状態分類（有効 / 待機中 / AC 未接続 / 高温 / **反映中**）と `visible_texts` を決める。描画は並べるだけ
+- 呼び名（Mac / この PC）と手段名（pmset）は能力で表せないので `Device` を**値で持ち回す**
+  （OS を見るのは `Device::detect()` の 1 か所）。これで **macOS 上から Windows 側の文言を検査できる**。
+  「反映中」を用意したのは、設定を書くのは dispatch・電源要求を出すのは 2 秒 tick でその隙間があるため
+- 「反映中」と「AC 未接続 / エージェント待ち」の境目は `sleep_guard::should_hold_assertion` /
+  `should_disable_lid_sleep`（この PR で `pub` 化。ロジックは不変）と**総当たりで一致**をテストで固定
+- 検証: 実機 before/after のスクショ（v0.5.13-win.3 = sudoers ボタン + Mac 文言 → 消滅 + 状態 3 行）/
+  表示「有効」と同時刻の `powercfg /requests` が `[PROCESS] …tako-app.exe / tako: sleep guard (always on)`、
+  off で消滅 / 蓋閉じ「有効」時に `lid-guard.json` 存在 / CLI 外部変更 3 状態への追随 /
+  macOS セルフテスト項目 120 新設（`TAKO_APP_SELF_TEST_OK`。ボタンを消すと FAILED を実測）/
+  fmt・clippy（両 feature）・test 2463 passed・クロスチェック警告が main と一致
+- 関連: PR #904（`Closes #727` / `Refs #467`）。副産物 **#905 起票**（ポップオーバーの残りの「Mac」）
+- 次: なし（#727 クローズ）。実機の作法（powercfg は SSH 側が昇格済み / 隠れた窓は古い画素が撮れる /
+  busy 判定には器が要る）は plan の「#727 の記録」節へ

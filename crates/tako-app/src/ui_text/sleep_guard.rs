@@ -2,6 +2,8 @@
 
 use tako_control::sleep_guard::{SleepGuardMode, SleepGuardState};
 
+use crate::settings_sleep::Device;
+
 // --- チップ（キー: sleep_guard.chip_*） ---
 
 pub fn chip_active() -> &'static str {
@@ -84,11 +86,22 @@ pub fn reason_agents_finishing() -> &'static str {
         "Agents have finished; sleep prevention will be released shortly"
     )
 }
-pub fn reason_system_disabled() -> &'static str {
-    tr!(
-        "スリープ無効化（pmset disablesleep）が有効のため、Mac はスリープしません",
-        "System sleep is disabled (pmset disablesleep), so the Mac will not sleep"
-    )
+/// 蓋閉じ継続（システム側のスリープ無効化）が効いている理由（#727）。
+///
+/// 手段は OS で違う（macOS = `pmset disablesleep` / Windows = 電源プランの lid action。
+/// #697）。Windows でも `lid_sleep_disabled` は真になりうるので、macOS 固有の
+/// コマンド名をそのまま出さない。どちらの文面かは呼び名から決める
+pub fn reason_system_disabled(device: Device) -> &'static str {
+    match device {
+        Device::Mac => tr!(
+            "スリープ無効化（pmset disablesleep）が有効のため、Mac はスリープしません",
+            "System sleep is disabled (pmset disablesleep), so the Mac will not sleep"
+        ),
+        Device::Pc => tr!(
+            "蓋閉じ継続が有効のため、この PC はスリープしません",
+            "Lid-close prevention is on, so this PC will not sleep"
+        ),
+    }
 }
 pub fn reason_idle() -> &'static str {
     tr!(
@@ -118,7 +131,7 @@ pub fn reason(state: &SleepGuardState) -> String {
             SleepGuardMode::Off => reason_idle().to_string(),
         }
     } else if state.lid_sleep_disabled {
-        reason_system_disabled().to_string()
+        reason_system_disabled(Device::detect()).to_string()
     } else {
         reason_idle().to_string()
     }
@@ -297,7 +310,7 @@ mod tests {
     #[test]
     fn reason_system_disabled_without_assertion() {
         let s = state(false, SleepGuardMode::Off, 0, true, ThermalState::Nominal);
-        assert_eq!(reason(&s), reason_system_disabled());
+        assert_eq!(reason(&s), reason_system_disabled(Device::detect()));
     }
 
     #[test]
@@ -321,6 +334,17 @@ mod tests {
     }
 
     #[test]
+    fn mac以外の理由文にmacos固有の語を出さない() {
+        // #727: Windows でも lid_sleep_disabled は真になりうる。macOS のコマンド名
+        // （pmset）と呼び名（Mac）が出ると、存在しない設定を探しに行かせてしまう
+        tests_support::for_each_lang(|| {
+            let t = reason_system_disabled(Device::Pc);
+            assert!(!t.contains("pmset"), "pmset が残っている: {t:?}");
+            assert!(!t.contains("Mac"), "Mac が残っている: {t:?}");
+        });
+    }
+
+    #[test]
     fn catalog_has_both_languages_and_no_emoji() {
         // 日英カタログの機械検査（#435）。言語グローバルの切替を伴うため
         // tests_support::check_ja_en に集約（他の lang 依存テストは相対比較のみで安全）
@@ -339,7 +363,8 @@ mod tests {
                 mode_while_agents().to_string(),
                 reason_always_on().to_string(),
                 reason_agents_finishing().to_string(),
-                reason_system_disabled().to_string(),
+                reason_system_disabled(Device::Mac).to_string(),
+                reason_system_disabled(Device::Pc).to_string(),
                 reason_idle().to_string(),
                 reason_agents_running(2),
                 lid_keeps_running().to_string(),
