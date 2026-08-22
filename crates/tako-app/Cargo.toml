@@ -42,6 +42,8 @@ raw-window-handle.workspace = true
 windows.workspace = true
 # PDF 構造パーサ（#693）。ラスタライズは WinRT、リンク注釈・目次は lopdf で補う
 lopdf.workspace = true
+# PDF テキストレイヤ（#693）。文字ごとの座標つきで content stream を解釈する
+pdf-extract.workspace = true
 
 # アイコン / バージョン情報リソースの埋め込み（#587。build.rs 参照）。
 # cfg(windows) を付けて macOS のビルドグラフに載せない

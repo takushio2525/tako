@@ -81,8 +81,15 @@ winresource = "0.1"
 windows = { version = "0.62", features = ["Data_Pdf", "Foundation", "Storage_Streams"] }
 # PDF 構造パーサ（#693）。Windows.Data.Pdf にはリンク注釈・目次・テキスト抽出 API が無いため、
 # PDF オブジェクトツリーを自前で読んで補う。pure Rust・MIT。default features の
-# chrono/jiff/rayon/time は PDF 解析に不要なので切ってバイナリを抑える
-lopdf = { version = "0.44", default-features = false }
+# chrono/jiff/rayon/time は PDF 解析に不要なので切ってバイナリを抑える。
+# **バージョンは pdf-extract の要求（0.42）に合わせる**。ずらすと lopdf が 2 つ木に入り、
+# 型が別物になって pdf-extract の再エクスポートと混ざる
+lopdf = { version = "0.42", default-features = false }
+# PDF テキストレイヤの抽出（#693）。content stream の解釈とフォントエンコーディング
+# （標準 14 フォントの AFM 幅・/Differences・ToUnicode CMap・CID）を持っているのが採用理由で、
+# lopdf 単体では字面すら取り出せない。`OutputDev` が文字ごとに変換行列・送り幅・
+# フォントサイズを渡すので、選択・ヒットテスト用の文字矩形まで組める。MIT
+pdf-extract = { version = "0.12", default-features = false }
 # GPUI は zed リポの git rev 固定（自動更新しない。追従は意識的なタスク。.agent/architecture.md）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cafbf4b5df7fedb67fc0f248850a5654efcec5d9" }
 # font-kit feature 必須: 無いとテキストシステムがスタブ化し文字が一切描画されない（poc/README.md）

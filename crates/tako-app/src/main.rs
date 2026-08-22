@@ -13892,6 +13892,14 @@ impl PreviewHost for TakoApp {
             .ok_or_else(|| format!("リンクインデックス範囲外: {index}"))?;
         match &link.target {
             tako_core::PdfLinkTarget::Url { url } => {
+                // リンク注釈の中身は文書の作者が決めた文字列なので、OS のハンドラへ
+                // 渡す前に http / https だけへ絞る（#693）。
+                // 検査したものと開くものを同じにするため、前後の空白はここで落とす
+                let url = url.trim();
+                if !tako_core::is_openable_url(url) {
+                    let shown: String = url.chars().take(120).collect();
+                    return Err(format!("http / https 以外のリンクは開きません: {shown}"));
+                }
                 let _ = tako_control::platform::os_integration::open_url(url);
                 Ok(serde_json::json!({
                     "pane": pane.as_u64(),

@@ -57,7 +57,7 @@ pub use pane_tree::{
     ratio_for_position, PaneBorder, PaneNode, PaneTree, PaneTreeError, Rect, SplitAxis,
     SplitDirection,
 };
-pub use pdf_links::{PdfLink, PdfLinkTarget, PdfLinks};
+pub use pdf_links::{is_openable_url, PdfLink, PdfLinkTarget, PdfLinks};
 pub use ports::ListenPort;
 pub use preview_cache::{
     preview_cache_bytes, PreviewCacheStats, PREVIEW_CACHE_DEFAULT_MB, PREVIEW_CACHE_MAX_MB,
