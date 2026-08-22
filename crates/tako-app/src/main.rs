@@ -31854,13 +31854,30 @@ mod self_test {
             }
             if has_tmux_cli {
                 let sock = format!("tako-selftest-{}", std::process::id());
-                let created = tako_core::tmux::tmux_command(Some(&sock))
-                    .args(["new-session", "-d", "-s", "tako-test"])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                check(created, "テスト用 tmux セッション作成");
-                wait(cx, 500).await;
+                // 2 本立てる: **片方を kill してもう片方が残る**ことまで見る。
+                // `tako-test` は `tako-test2` の前方一致でもあるので、ターゲットが
+                // 完全一致になっていない実装（`=` を解さない psmux へ `=` を渡す等）だと
+                // 「消えない」か「隣も消える」のどちらかで落ちる（#866）
+                let mut sessions_up = false;
+                for name in ["tako-test", "tako-test2"] {
+                    let created = tako_core::tmux::tmux_command(Some(&sock))
+                        .args(["new-session", "-d", "-s", name])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    check(created, "テスト用 tmux セッション作成");
+                    // 「一覧に出る」は出来事なので固定待ちにしない（#796 の作法）
+                    for _ in 0..20 {
+                        wait(cx, 300).await;
+                        sessions_up = tako_core::tmux::list_sessions(Some(&sock))
+                            .iter()
+                            .any(|s| s.name == name);
+                        if sessions_up {
+                            break;
+                        }
+                    }
+                    check(sessions_up, "テスト用 tmux セッションが一覧に出る");
+                }
                 press(any, cx, sh.clear_line_key());
                 type_text(
                     any,
@@ -31885,10 +31902,10 @@ mod self_test {
                 );
                 // 「消える」は出来事なので固定待ちにしない（#796 の作法）。
                 // debug CLI の起動 + IPC 往復 + tmux の後始末は環境で数秒かかる
-                let mut gone = false;
+                let mut names: Vec<String> = Vec::new();
                 for _ in 0..24 {
                     wait(cx, 500).await;
-                    gone = window
+                    names = window
                         .update(cx, |app, _, _| {
                             let value = tako_control::dispatch(
                                 app,
@@ -31898,14 +31915,32 @@ mod self_test {
                                 PaneOrigin::Cli,
                             )
                             .expect("tmux list は常に成功する");
-                            value["sessions"].as_array().map(Vec::is_empty) == Some(true)
+                            value["sessions"]
+                                .as_array()
+                                .map(|list| {
+                                    list.iter()
+                                        .filter_map(|s| {
+                                            s["name"].as_str().map(std::string::ToString::to_string)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default()
                         })
-                        .unwrap_or(false);
-                    if gone {
+                        .unwrap_or_default();
+                    if !names.iter().any(|n| n == "tako-test") {
                         break;
                     }
                 }
-                check(gone, "tako tmux kill でセッションが消える");
+                println!("（項目 48: kill 後の一覧 = {names:?}）");
+                check(
+                    !names.iter().any(|n| n == "tako-test"),
+                    "tako tmux kill でセッションが消える",
+                );
+                // 完全一致の対照: 前方一致で隣にいる `tako-test2` は残っていること
+                check(
+                    names.iter().any(|n| n == "tako-test2"),
+                    "tako tmux kill が前方一致の別セッションを巻き込まない",
+                );
                 let _ = tako_core::tmux::tmux_command(Some(&sock))
                     .arg("kill-server")
                     .status();
