@@ -44380,6 +44380,40 @@ mod self_test {
                     }
                 }
                 if seen != Some(55) {
+                    // **判定に使った材料そのものを出す**（#796）。`seen=None` だけでは
+                    // 「fixture ペインが立っていない」と「立っているが footer を
+                    // 読めない」を区別できない
+                    let (pty, tail) = window
+                        .update(cx, |app, _, _| {
+                            let session = app.terminals.get(&master_pane);
+                            let tail = session
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .iter()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .rev()
+                                        .take(4)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                })
+                                .unwrap_or_default();
+                            (
+                                format!(
+                                    "session={} size={:?} state={:?} backend={:?}",
+                                    session.is_some(),
+                                    session.map(|s| s.size()),
+                                    session.map(|s| s.command_state()),
+                                    app.backend_sessions.get(&master_pane).cloned(),
+                                ),
+                                tail,
+                            )
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "TAKO_SELF_TEST_749_CTX: seen={seen:?} {pty} {} tail={tail:?}",
+                        env_line()
+                    );
                     fail(&format!("#749: 画面から ctx% を読めない: {seen:?}"));
                 }
 
