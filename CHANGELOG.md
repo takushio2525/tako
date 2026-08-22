@@ -8,6 +8,20 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.6] - 2026-08-23
+
+Nightly patch release (automated). Changes since v0.7.5:
+夜間パッチリリース（自動）。v0.7.5 以降の変更:
+
+- [修正] 器が拒否する符号化ペイロードを作らない: セルフテスト項目 101（#749）が Windows で止まる問題 (#906) (#467) (#914)
+- [機能追加] ドキュメントサイトに OGP / Twitter Card を追加: ページごとの OG 画像 (#911) (#912)
+- [修正] 器つきペインへの送達で非 ASCII が落ちる問題を根治: 打鍵ではなく器の注入口へ入れる (#907) (#467) (#910)
+- [修正] スリープ防止ポップオーバーの文言も呼び名で出し分ける: Windows に「Mac」が残る問題 (#905) (#467) (#909)
+- [修正] セルフテスト項目 100（#737）を Windows で通す: 器へ打ち込まずファイル駆動 + シェル片は -EncodedCommand (#903) (#467) (#908)
+- [修正] 設定画面のスリープ防止タブを能力ベースの表示へ: Windows で macOS 前提の案内が出る問題 (#727) (#467) (#904)
+- [修正] tmux の完全一致ターゲットを 1 つの境界へ寄せる: psmux で tako tmux kill が効かない問題 (#866) (#467) (#902)
+- [修正] セルフテストが PTY へ書く Enter を CR へ寄せる: 項目 94 が Windows で必ず止まる問題 (#897) (#467) (#901)
+
 ## [0.7.5] - 2026-08-22
 
 Nightly patch release (automated). Changes since v0.7.4:
