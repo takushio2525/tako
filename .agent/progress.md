@@ -2700,3 +2700,19 @@
 - 関連: PR #908（`Refs #903, #467`）。起票: **#906**（次の壁 = 項目 101 / #749）/
   **#907**（器つきペインへの非 ASCII 送達が落ちる = 製品側の疑い）
 - 次: #906 を直せば 101 以降（#761 / #772 / #781 / #789 / #803 / #813 / #826 / #830 / #835 …）が開く
+
+## 2026-08-22（#905: スリープ防止ポップオーバーの文言も呼び名で出し分け）
+- #727 の残り。ステータスバーのチップ + 詳細ポップオーバーに「Mac」が残っていたのを、
+  #727 の `settings_sleep::Device` をそのまま使って 5 本（`chip_active` / `reason_always_on` /
+  `reason_agents_running` / `lid_sleeps` / `thermal_note`）を呼び名で出し分ける形へ。
+  集約側が呼び名を受け取るので `Device::detect()` は renderer の先頭 1 か所だけ
+- drift 対策: `popover_texts(state, device)`（この状態で画面に出る文字列すべて）+
+  **renderer のソースを走査して文言関数の取りこぼしを名指しする番犬** + macOS 側を日英の
+  実文字列で固定（`tests_support::with_lang` 追加）
+- 検証: 実機でチップを実クリックしてポップオーバーを開き日英 2 枚（英語は "Keeping this PC awake" /
+  "Always-on is enabled, so this PC is kept from sleeping" / "This PC sleeps as usual…"）/
+  macOS セルフテスト項目 121 新設（`TAKO_SELF_TEST_905: device=Mac opened=true texts=12 foreign=[]`）/
+  fmt・clippy（両 feature）・test 2469 passed・クロスチェック警告が main と一致
+- 関連: PR #909（`Refs #905, #467`）
+- 次: なし（#905 クローズ）。実機の作法（ポップオーバーは実クリックが要る / 表示言語は
+  起動前に settings.json を **BOM なしで** 書く）は plan の「#905 の記録」節へ

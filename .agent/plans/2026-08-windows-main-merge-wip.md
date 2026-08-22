@@ -2294,6 +2294,53 @@ main の現行 API へ合わせたうえで次の 3 点を足した:
   直した。ステータスバーのポップオーバーに残るので **#905 として起票**
 - `setup` の対話フロー（L3 の蓋閉じ案内）は未移植（スライス 9 の申し送りのまま）
 
+#### #905 の記録（スリープ防止ポップオーバーの文言。PR #909・2026-08-22）
+
+**症状**: #727 で設定画面と `reason_system_disabled` は能力ベースへ直したが、**ステータスバーの
+チップ + 詳細ポップオーバーには「Mac」が残っていた**（#727 の棚卸しがそこだけを挙げていたため、
+あの PR も 1 本しか直していない）。Windows でもアイドル防止（#524）も蓋閉じ継続（#697）も
+効くので、同じ状態になると「Mac を自動スリープさせていません」と別 OS の話を読ませる。
+
+**直し方**: #727 の `settings_sleep::Device` をそのまま使い、機械を名指す 5 本
+（`chip_active` / `reason_always_on` / `reason_agents_running` / `lid_sleeps` / `thermal_note`）を
+呼び名で出し分ける。集約側（`chip_label` / `reason` / `lid_behavior`）は呼び名を**受け取る**形へ
+変えたので、`Device::detect()` を呼ぶのは `render_sleep_guard_overlay` の先頭 1 か所だけ
+（= macOS 上から Windows 側の文言をテストできる）。
+
+**drift 対策 2 本**（#727 の `visible_texts` と同じ思想）:
+
+- `popover_texts(state, device)` = 「この状態でチップとポップオーバーに出る文字列すべて」。
+  状態を受け取るので高温注記のような条件つきの行も実際に出るときだけ入る
+- **番犬テスト**が `status_bar::render_sleep_guard_overlay` のソースを走査し、そこで呼ばれて
+  いる文言関数がすべて `popover_texts` に載っていることを検査する。`ui_text::` の中にも
+  `text::` という並びがあるので**識別子境界**で弾く（最初これで `sleep_guard` を誤検出した）
+- macOS 不変は**日英の実文字列**で押さえた（相対比較では「両方いっしょに壊れた」を検出できない）。
+  そのために `tests_support::with_lang` を追加
+
+##### 実機実測（`ssh win`。GUI は `schtasks /it` で session 1）
+
+チップを**実際にクリックして**ポップオーバーを開き、日本語と英語の 2 枚を撮った
+（証拠は `~/dev/tako-evidence/905/`）。変更した 5 本のうち 3 本は英語側だけなので両方見る。
+
+| 表示 | 実測 |
+|---|---|
+| 日本語 | いまの状態が「常時オンの設定のため、**この PC** を自動スリープさせていません」 |
+| 英語 | チップ **"Keeping this PC awake"** / Status **"Always-on is enabled, so this PC is kept from sleeping"** / On lid close **"This PC sleeps as usual, stopping running processes"** |
+
+**測り方の落とし穴（#727 の記録に続くもの）**:
+
+- **ポップオーバーは CLI / MCP から開けない**（クリック専用の UI 状態）。Win32 の
+  `SetCursorPos` + `mouse_event` で実クリックする。座標はスクリーンショットを 1 枚撮って
+  そこから読む（チップはステータスバーの中央付近・ウィンドウ相対で約 (557, 730)）
+- **表示言語の切り替えは 3 通り試して 1 つだけ効いた**: ①起動前の `tako lang en` は
+  IPC 相手が居ないので**届かない**（`settings.json` は `"language": "system"` のまま）
+  ②起動後の `tako lang en` も**この隔離構成では表示が変わらなかった**（出力も空。
+  原因未確定なので製品バグとは断定しない）③**起動前に `settings.json` を直接書き換える**
+  のは効くが、**BOM を付けると全部が既定値へ落ちる**（PowerShell 5.1 の
+  `Set-Content -Encoding utf8` は BOM を付ける → serde が読めず、言語だけでなく
+  スリープ設定も既定へ戻ってチップごと消えた）。`[System.IO.File]::WriteAllText` +
+  `UTF8Encoding($false)` で解決
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
