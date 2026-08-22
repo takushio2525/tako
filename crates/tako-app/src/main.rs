@@ -43744,8 +43744,37 @@ mod self_test {
                             wait(cx, 150).await;
                         }
                         if !ready {
-                            let got = window.update(cx, |app, _, _| sample_input(app)).ok();
-                            println!("TAKO_SELF_TEST_737: expected={expected:?} got={got:?}");
+                            // **判定に使った材料そのものを出す**（#796）。`got=None` は
+                            // 「入力ボックスが見つからない」でしかなく、箱が塗れていないのか
+                            // `input_region` が `\u{276f}` 行を拾えないのかを区別できない。
+                            // 画面の末尾と表示種別まで出しておけば 1 回の run で切り分く
+                            let (got, display, tail) = window
+                                .update(cx, |app, _, _| {
+                                    let tail = app
+                                        .terminals
+                                        .get(&chat_pane)
+                                        .map(|s| {
+                                            s.visible_lines()
+                                                .iter()
+                                                .filter(|l| !l.trim().is_empty())
+                                                .rev()
+                                                .take(6)
+                                                .cloned()
+                                                .collect::<Vec<_>>()
+                                                .join(" | ")
+                                        })
+                                        .unwrap_or_default();
+                                    (
+                                        sample_input(app),
+                                        format!("{:?}", app.pane_display_for(chat_pane)),
+                                        tail,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            println!(
+                                "TAKO_SELF_TEST_737: expected={expected:?} got={got:?} \
+                                 display={display} tail={tail:?}"
+                            );
                             fail("#737: 合成した入力ボックスが画面に出ない");
                         }
                     }};
