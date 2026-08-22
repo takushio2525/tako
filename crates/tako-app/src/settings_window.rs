@@ -19,6 +19,7 @@ use tako_control::settings::{self, Settings};
 use tako_core::theme::{Rgb, Theme};
 
 use crate::file_icons::ui_icon;
+use crate::settings_sleep::{SleepSnapshot, SleepTabPlan, StatusTone};
 use crate::ui_text::settings as txt;
 use crate::TakoApp;
 
@@ -148,6 +149,8 @@ struct StatusCache {
     rules: Option<serde_json::Value>,
     changes: Option<serde_json::Value>,
     remote: Option<serde_json::Value>,
+    /// スリープ防止の現在値（#727。`tako sleep-guard status` と同じ dispatch を通す）
+    sleep: Option<serde_json::Value>,
     /// エージェント CLI の検出結果（名前, 導入済み）。background で取得する
     agents: Option<Vec<(String, bool)>>,
 }
@@ -334,6 +337,17 @@ impl SettingsWindow {
                 );
                 self.status.changes = self.query(Request::SetupChanges, cx);
                 self.refresh_agent_clis(cx);
+            }
+            SettingsTab::Sleep => {
+                self.status.sleep = self.query(
+                    Request::SleepGuard {
+                        action: Some("status".into()),
+                        mode: None,
+                        power_condition: None,
+                        lid_sleep_mode: None,
+                    },
+                    cx,
+                );
             }
             SettingsTab::Remote => {
                 self.status.remote = self.query(Request::RemoteStatus, cx);
@@ -1152,6 +1166,13 @@ impl SettingsWindow {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let request = req(&value_owned);
                         this.run(request, cx);
+                        // スリープ防止タブは「いまの状態」を出すので、切り替えたら
+                        // 取り直して表示と実値をずらさない（#727）。他タブは状態表示を
+                        // 持たない一方で、取り直しは UI スレッドの dispatch なので
+                        // （#168 の教訓）必要なタブだけに限る
+                        if this.tab == SettingsTab::Sleep {
+                            this.refresh_tab_status(cx);
+                        }
                     })),
             );
         }
@@ -2444,14 +2465,20 @@ impl SettingsWindow {
         let mode = s.sleep_guard_mode.as_str().to_string();
         let power = s.sleep_guard_power.as_str().to_string();
         let lid = s.lid_sleep_mode.as_str().to_string();
+        // 何を描くかは OS 名ではなくこの OS の能力から決める（#727）。
+        // Windows は蓋閉じ継続に初回セットアップが要らないので、その手のボタンは生えない。
+        // ここで描く文字列の一覧は `SleepTabPlan::visible_texts` と同じ集合にする
+        // （片方だけに足すと「Windows に macOS 固有の語が出ない」検査が空振りする）
+        let plan = SleepSnapshot::from_status_json(self.status.sleep.as_ref()).plan();
 
         div()
             .flex()
             .flex_col()
             .gap_1()
+            .child(self.render_sleep_status(&plan, cx))
             .child(self.row(
                 txt::sleep_mode_header(),
-                txt::desc_sleep_mode(),
+                txt::desc_sleep_mode(plan.device),
                 self.segmented(
                     "sleep-mode",
                     &[
@@ -2488,66 +2515,140 @@ impl SettingsWindow {
                     },
                 ),
             ))
-            .child(self.row(
-                txt::sleep_lid_header(),
-                txt::desc_sleep_lid(),
-                self.segmented(
-                    "sleep-lid",
-                    &[
-                        ("off", txt::sleep_mode_off().to_string()),
-                        ("while-agents-running", txt::sleep_mode_agents().to_string()),
-                    ],
-                    &lid,
-                    cx,
-                    |value| Request::SleepGuard {
-                        action: Some("set".into()),
-                        mode: None,
-                        power_condition: None,
-                        lid_sleep_mode: Some(value.to_string()),
-                    },
+            // 蓋閉じ継続を制御できない OS では、切り替えられる顔をしない
+            .when(plan.show_lid_row, |d| {
+                d.child(self.row(
+                    txt::sleep_lid_header(),
+                    txt::desc_sleep_lid(plan.needs_privileged_setup),
+                    self.segmented(
+                        "sleep-lid",
+                        &[
+                            ("off", txt::sleep_mode_off().to_string()),
+                            ("while-agents-running", txt::sleep_mode_agents().to_string()),
+                        ],
+                        &lid,
+                        cx,
+                        |value| Request::SleepGuard {
+                            action: Some("set".into()),
+                            mode: None,
+                            power_condition: None,
+                            lid_sleep_mode: Some(value.to_string()),
+                        },
+                    ),
+                ))
+            })
+            // 初回セットアップ（macOS の sudoers 登録）が要る OS でだけボタンを出す。
+            // Windows は電源プランを非管理者で書けるので登録も解除も無い（#697）
+            .when(plan.show_setup_buttons, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pt_2()
+                        .child(self.button(
+                            "lid-install",
+                            txt::sleep_lid_install(),
+                            BtnKind::Normal,
+                            cx.listener(|this, _, _, cx| {
+                                this.run_with_message(
+                                    Request::SleepGuard {
+                                        action: Some("install-lid-sleep".into()),
+                                        mode: None,
+                                        power_condition: None,
+                                        lid_sleep_mode: None,
+                                    },
+                                    txt::msg_lid_installed().to_string(),
+                                    cx,
+                                );
+                                this.refresh_tab_status(cx);
+                            }),
+                        ))
+                        .child(self.button(
+                            "lid-remove",
+                            txt::sleep_lid_remove(),
+                            BtnKind::Normal,
+                            cx.listener(|this, _, _, cx| {
+                                this.run_with_message(
+                                    Request::SleepGuard {
+                                        action: Some("remove-lid-sleep".into()),
+                                        mode: None,
+                                        power_condition: None,
+                                        lid_sleep_mode: None,
+                                    },
+                                    txt::msg_lid_removed().to_string(),
+                                    cx,
+                                );
+                                this.refresh_tab_status(cx);
+                            }),
+                        )),
+                )
+            })
+    }
+
+    /// 「いまの状態」セクション（#727）。
+    ///
+    /// 設定値だけを並べても「で、いま効いているのか」が読めない。とくに Windows は
+    /// 蓋の開閉を観測しない（`lid_state_detectable()`）ぶんステータスバーのチップが
+    /// 薄いので、設定画面にも現在値を出す。行の中身は `SleepTabPlan` が決めるので、
+    /// ここは色を付けて並べるだけ（判定は GPUI 非依存のまま単体テストできる）
+    fn render_sleep_status(&self, plan: &SleepTabPlan, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let mut section = div().flex().flex_col().child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(self.section(txt::sleep_status_header()))
+                .child(self.button(
+                    "sleep-refresh",
+                    txt::button_refresh(),
+                    BtnKind::Normal,
+                    cx.listener(|this, _, _, cx| {
+                        this.refresh_tab_status(cx);
+                        this.message = Some((txt::msg_refreshed().to_string(), false));
+                    }),
+                )),
+        );
+        for row in &plan.status_rows {
+            let color = match row.tone {
+                StatusTone::Active => theme.green,
+                StatusTone::Known => theme.text_muted,
+                StatusTone::Unknown => theme.text_faint,
+            };
+            section = section.child(
+                self.row(
+                    row.label,
+                    &row.note,
+                    div()
+                        .text_size(px(12.))
+                        .text_color(to_hsla(color))
+                        .child(row.value.to_string()),
                 ),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pt_2()
-                    .child(self.button(
-                        "lid-install",
-                        txt::sleep_lid_install(),
-                        BtnKind::Normal,
-                        cx.listener(|this, _, _, cx| {
-                            this.run_with_message(
-                                Request::SleepGuard {
-                                    action: Some("install-lid-sleep".into()),
-                                    mode: None,
-                                    power_condition: None,
-                                    lid_sleep_mode: None,
-                                },
-                                txt::msg_lid_installed().to_string(),
-                                cx,
-                            );
-                        }),
-                    ))
-                    .child(self.button(
-                        "lid-remove",
-                        txt::sleep_lid_remove(),
-                        BtnKind::Normal,
-                        cx.listener(|this, _, _, cx| {
-                            this.run_with_message(
-                                Request::SleepGuard {
-                                    action: Some("remove-lid-sleep".into()),
-                                    mode: None,
-                                    power_condition: None,
-                                    lid_sleep_mode: None,
-                                },
-                                txt::msg_lid_removed().to_string(),
-                                cx,
-                            );
-                        }),
-                    )),
-            )
+            );
+        }
+        section
+    }
+
+    // --- セルフテスト用の入口（スリープ防止タブ。#727）---
+    //
+    // このタブで壊れると困るのは見た目ではなく**構成**（macOS 専用の案内が Windows へ
+    // 出る / 押しても効かないボタンが出る / 状態が実態と食い違う）。ピクセルを見ずに
+    // 検証できるよう、描画が使うのと同じ表示構成をここから取れるようにする
+
+    /// 描画が使っているのと同じ表示構成（`render_sleep_tab` と同じ 1 行から作る）
+    pub(crate) fn st_sleep_plan(&self) -> SleepTabPlan {
+        SleepSnapshot::from_status_json(self.status.sleep.as_ref()).plan()
+    }
+
+    /// 状態を取り直す（「更新」ボタン・タブ表示と同じ経路）
+    pub(crate) fn st_sleep_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_tab_status(cx);
+    }
+
+    /// 状態取得の生 JSON（`tako sleep-guard status` と同一 dispatch の応答）
+    pub(crate) fn st_sleep_status_json(&self) -> Option<serde_json::Value> {
+        self.status.sleep.clone()
     }
 
     // --- リモートタブ ---

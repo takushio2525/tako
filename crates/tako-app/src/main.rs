@@ -36,6 +36,7 @@ mod preview_render;
 mod preview_watch;
 mod remote_panel;
 mod right_panel;
+mod settings_sleep;
 mod settings_window;
 mod sidebar;
 mod starter;
@@ -48434,6 +48435,132 @@ mod self_test {
                     invoked && grew,
                     "メニューバー: invoke が実際にアクションを発火する (#657)",
                 );
+            }
+
+            // 120: 設定画面「スリープ防止」タブの表示構成（#727）。
+            // このタブで壊れると困るのは見た目ではなく構成で、しかも壊れ方が OS で違う
+            // （macOS 専用の案内が Windows に出る / 押しても効かないボタンが出る /
+            // 状態が実態と食い違う）。ピクセルを見ずに次を確かめる:
+            // (a) この OS の能力に合った構成になっている（Windows は sudoers 系が消え、
+            //     macOS は従来どおり出る = 表示の後退が無い）
+            // (b) 画面に出る文字列に、その OS で通じない語が混ざっていない
+            // (c) 「いまの状態」が同じ dispatch（`tako sleep-guard status`）の実値と一致する
+            {
+                use crate::settings_sleep::{Device, IdleStatus, LidStatus};
+
+                window
+                    .update(cx, |app, _, cx| {
+                        app.open_settings_window_impl(Some(settings_window::SettingsTab::Sleep), cx);
+                    })
+                    .ok();
+                let mut settings = None;
+                for _ in 0..40 {
+                    settings = window
+                        .update(cx, |app, _, _| app.settings_window_handle)
+                        .ok()
+                        .flatten();
+                    if settings.is_some() {
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                let Some(settings) = settings else {
+                    fail("#727: 設定ウィンドウが開かない")
+                };
+                // タブ表示で status を引くが、開いた直後は間に合わないことがあるので
+                // 「更新」ボタンと同じ経路で取り直してから読む
+                let mut plan = None;
+                for _ in 0..20 {
+                    plan = settings
+                        .update(cx, |view, _, cx| {
+                            view.st_sleep_refresh(cx);
+                            view.st_sleep_plan()
+                        })
+                        .ok();
+                    if plan.as_ref().is_some_and(|p: &crate::settings_sleep::SleepTabPlan| {
+                        !p.status_rows.is_empty()
+                    }) {
+                        break;
+                    }
+                    wait(cx, 100).await;
+                }
+                let Some(plan) = plan else {
+                    fail("#727: スリープ防止タブの表示構成が取れない")
+                };
+
+                // (a) 構成が OS の能力に合っている
+                let mac = cfg!(target_os = "macos");
+                check(
+                    plan.device == if mac { Device::Mac } else { Device::Pc }
+                        && plan.needs_privileged_setup == mac
+                        && plan.show_setup_buttons == mac,
+                    &format!(
+                        "スリープ防止タブ: 初回セットアップのボタンはそれが要る OS だけに出る                          (#727。device={:?} setup_buttons={} needs_setup={})",
+                        plan.device, plan.show_setup_buttons, plan.needs_privileged_setup
+                    ),
+                );
+
+                // (b) その OS で通じない語が出ていない。macOS では sudoers の案内が要る
+                let texts = plan.visible_texts();
+                let offenders: Vec<&String> = texts
+                    .iter()
+                    .filter(|t| {
+                        !mac && (t.contains("sudoers") || t.contains("pmset") || t.contains("Mac"))
+                    })
+                    .collect();
+                let mac_guide_kept = !mac || texts.iter().any(|t| t.contains("sudoers"));
+                check(
+                    offenders.is_empty() && mac_guide_kept && texts.len() >= 14,
+                    &format!(
+                        "スリープ防止タブ: この OS で通じない文言が出ない                          (#727。texts={} offenders={:?} mac_guide={mac_guide_kept})",
+                        texts.len(),
+                        offenders
+                    ),
+                );
+
+                // (c) 「いまの状態」が dispatch の実値と一致する
+                let json = settings
+                    .update(cx, |view, _, _| view.st_sleep_status_json())
+                    .ok()
+                    .flatten();
+                let idle_row = plan.status_rows.first().map(|r| r.value);
+                let lid_row = plan.status_rows.get(1).map(|r| r.value);
+                let power_row = plan.status_rows.get(2).map(|r| r.value);
+                let agrees = json
+                    .as_ref()
+                    .map(|v| {
+                        let snap = crate::settings_sleep::SleepSnapshot::from_status_json(Some(v));
+                        let on_ac = v["on_ac_power"].as_bool().unwrap_or(false);
+                        // 実値から作り直した状態と、画面が出している行が一致する
+                        idle_row == Some(crate::ui_text::settings::sleep_idle_status(snap.idle_status()))
+                            && lid_row
+                                == Some(crate::ui_text::settings::sleep_lid_status(snap.lid_status()))
+                            && power_row
+                                == Some(if on_ac {
+                                    crate::ui_text::settings::sleep_status_on_ac()
+                                } else {
+                                    crate::ui_text::settings::sleep_status_on_battery()
+                                })
+                            // 「使えない」と出すのは実際に非対応のときだけ
+                            && (snap.idle_status() != IdleStatus::Unsupported
+                                || !v["platform_supported"].as_bool().unwrap_or(false))
+                            && (snap.lid_status() != LidStatus::Unsupported
+                                || !v["lid_control_supported"].as_bool().unwrap_or(false))
+                    })
+                    .unwrap_or(false);
+                check(
+                    agrees,
+                    &format!(
+                        "スリープ防止タブ: いまの状態が sleep-guard status の実値と一致する                          (#727。idle={idle_row:?} lid={lid_row:?} power={power_row:?} json={})",
+                        json.as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    ),
+                );
+
+                // 開いた設定ウィンドウは閉じる（以後の項目へ持ち越さない）
+                let _ = settings.update(cx, |_, window, _| window.remove_window());
+                let _ = window.update(cx, |app, _, _| app.settings_window_handle = None);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
