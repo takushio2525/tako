@@ -44327,8 +44327,11 @@ mod self_test {
                             .ok()
                             .and_then(|v| v["pane"].as_u64())
                             .map(PaneId::from_raw);
+                            // **PTY 起動の失敗理由を捨てない**（#903 と同じ理由。捨てると
+                            // 「起動できなかった」が「画面から読めない」として現れる）
                             for (p, options) in std::mem::take(&mut app.pending_attach) {
-                                if app.spawn_session(p, options, cx).is_err() {
+                                if let Err(e) = app.spawn_session(p, options, cx) {
+                                    println!("TAKO_SELF_TEST_749_SPAWN: pane={p} error={e}");
                                     app.remove_pane(p, cx);
                                 }
                             }
