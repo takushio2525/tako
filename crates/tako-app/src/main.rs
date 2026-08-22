@@ -43736,18 +43736,24 @@ mod self_test {
                     let started = std::time::Instant::now();
                     let ready =
                         wait_for_pane_ready(window, cx, chat_pane, Duration::from_secs(30)).await;
-                    let (size, state, backend) = window
+                    let (size, state, backend, outer_alt, inner_alt) = window
                         .update(cx, |app, _, _| {
                             (
                                 app.terminals.get(&chat_pane).map(|s| s.size()),
                                 app.terminals.get(&chat_pane).map(|s| s.command_state()),
                                 app.backend_sessions.get(&chat_pane).cloned(),
+                                // (g) の楽観 echo は**外側 PTY の alt screen** を条件にする
+                                // （器の client が smcup を出すかどうか）。器なしのペインでは
+                                // false なので、そこが (g) の成否を決める
+                                app.terminals.get(&chat_pane).map(|s| s.is_alt_screen()),
+                                app.pane_inner_alt_screen(chat_pane),
                             )
                         })
                         .unwrap_or_default();
                     println!(
                         "TAKO_SELF_TEST_737_READY: ready={ready} waited={:.1}s size={size:?} \
-                         state={state:?} backend={backend:?} keep_container={keep_container}",
+                         state={state:?} backend={backend:?} outer_alt={outer_alt:?} \
+                         inner_alt={inner_alt} keep_container={keep_container}",
                         started.elapsed().as_secs_f32()
                     );
                 } else {
