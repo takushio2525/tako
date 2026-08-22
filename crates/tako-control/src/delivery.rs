@@ -160,6 +160,10 @@ pub fn log_fallback(backend_session: &str, reason: &str) {
 /// `Ok(false)` = 迂回不要（従来どおり打鍵する）/ `Err` = 迂回すべきだが失敗した
 /// （呼び出し側は打鍵へ落ちる = 従来の壊れ方に留める。無音で失うより良い）
 pub fn inject_non_ascii(backend_session: Option<&str>, text: &str) -> Result<bool, &'static str> {
+    // `TAKO_907_NO_INJECT=1` で修正前（常に打鍵）へ戻せる = 同一バイナリで A/B が取れる
+    if std::env::var_os("TAKO_907_NO_INJECT").is_some() {
+        return Ok(false);
+    }
     let caps = tako_core::backend::capabilities();
     if !tako_core::backend::needs_text_injection(&caps, text) {
         return Ok(false);
