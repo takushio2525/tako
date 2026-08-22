@@ -2495,6 +2495,28 @@ fixture も同じ帯に入っている**（b64 長 560 / `==`）ので、壁が 
 **#913 へ起票**（#835 自体は macOS の Finder 固有機能なので、直し方は
 「Windows の入口に合わせて項目を gate する」か「`open_files` に Windows 形を教える」の判断が要る）。
 
+##### 実機テストのベースライン 22 件（失敗名。#906 で `--no-fail-fast` で全数採取）
+
+`cargo test --workspace` は**既定で fail-fast** なので、tako-control が落ちた時点で
+tako-core の 7 件が走らず「15 件」に見える。照合するときは `--no-fail-fast` を付ける。
+
+tako-control（15）: `acceptance_gates::tests::execute_command_true_false` /
+`…::execute_command_with_cwd` / `…::execute_command_with_output` /
+`…::gate_check_skips_custom` / `…::gate_check_with_command` /
+`config_share::env::tests::リポジトリ配下の実体も外部管理として検出する` /
+`dispatch::tests::tree_folder_symlink経由でも削除できる` /
+`…::tree_folder_symlink経由の重複追加は1エントリに畳まれる` / `…::tree_folder_追加と一覧と削除` /
+`orchestrator::tests::resolved_env_expands_tilde` /
+`remote::tests::daemon_stop_implはpid再利用時にkillしない` /
+`remote::tests::is_process_aliveは現在のプロセスをtrueで返す` /
+`setup_bootstrap::tests::導入計画は何をどこに入れるかを必ず含む` /
+`stale_binary::tests::test_pidpath_self` / `…::ランチャ探索は実行可能な通常ファイルだけを拾う`
+
+tako-core（7）: `links::tests::cwd不明でも絶対パスとホーム起点は検出する` /
+`links::tests::detect_absolute_path` / `links::tests::tuiの装飾付きsoft_wrapをまたぐパスを検出する` /
+`shell_profile::tests::path判定は完全一致で行う` / `…::既にpathにあるならファイルを触らない` /
+`tab::tests::pinned_folder_symlink経由でも削除できる` / `…::pinned_folder_symlink経由の重複は畳まれる`
+
 ##### 作法として残すもの
 
 - **器へ直接投げる対照実験を先にやる**（#903 と同じ）。tako 越しだと「spawn は成功」に
