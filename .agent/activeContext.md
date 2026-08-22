@@ -6,43 +6,49 @@
 ## 現在の対象（2026-08-22）
 
 - **#467 Windows 移植はスライス 1〜7c / 9 が main へ入り、残りはスライス 8（棚卸し）だけ**
-- **#897（セルフテスト項目 94 が Windows で必ず止まる）を解消**（PR #901）。原因はテスト側で、
-  **PTY へ書く Enter が LF だった**こと。端末の Enter は CR で、PSReadLine は素の LF を
-  継続行（`>>`）の開始と解釈するのでコマンドが確定しない。POSIX は tty の ICANON + ICRNL が
-  どちらも改行へ倒すので **CR に寄せれば両方通る**（方言差ではないので `ShellDialect` ではなく
-  `self_test::pty_line` に置いた）。**到達範囲は項目 0〜99**（次の壁は 100 = #903）
+- **#903（セルフテスト項目 100 = #737 チャット入力欄）を解消**（PR #908）。**Issue の仮説
+  （準備待ちの不足）は外れ**、実測で機序が 4 つ出た: ①状態切替の Ctrl+C で**器（psmux）の
+  client が終了**しペインごと死ぬ ②(g) の楽観 echo は**外側 PTY の alt screen** 条件なので
+  器は外せない（器なしで alt screen へ入ると内側扱いで表示が Chat → Terminal へ落ちる）
+  ③**器越しの打鍵から非 ASCII が落ちる**（`─` / `❯` が消える。出力経路は無傷と対照実験で確認）
+  ④器は**内側コマンドを自分で単語分割する**ので引用符入りの `-Command '<片>'` は即死（#875 の 3 層問題）。
+  直し方は疑似 TUI を**ペイン自身のコマンド + ファイル駆動**（`ShellDialect::repaint_file_loop`）に
+  し、シェル片を **`-EncodedCommand`**（base64 / UTF-16LE）で渡す
 - **#866（psmux で `tako tmux kill` が効かない）を解消**（PR #902）。psmux は `-t =name` を
   **解決せず「消えるまで 5 秒待つ」だけ**（素の名前が完全一致）。`=` の組み立てを
   `tako_core::tmux`（`TmuxTargetSyntax` / `exact_target`）1 本へ寄せ、直書き 33 箇所を通した。
-  **項目 48 は Windows でも回る**（隣の `tako-test2` が残る対照つき）
-- **#889（項目 93）/ #872（窓 0 枚の無音終了）も解消済み**（PR #900 / #895）。
-  境界は `ShellDialect::echo_stdin_command()` / `integration_shell_command()` /
-  `platform::window_lifecycle`
+  **項目 48 は Windows でも回る**
+- **#897（項目 94）/ #889（項目 93）/ #872（窓 0 枚の無音終了）/ #727（設定画面のスリープ防止
+  タブ）も解消済み**（PR #901 / #900 / #895 / #904）。境界は `self_test::pty_line` /
+  `ShellDialect::echo_stdin_command()` / `platform::window_lifecycle` / `platform::lid`
 - **#766 / #870 / #884 / #881 / #877 / #875 / #873 も main へ入っている**（器の中のシェル統合の
   側路・ホーム解決の一本化・空白入り cwd・器へ渡す第 1 語・agents 走査・実行ペイン・方言判定）
 
-## 実機セルフテストの到達範囲（#897 後の実測）
+## 実機セルフテストの到達範囲（#903 後の実測）
 
-**項目 94（#702 alt screen）/ 95（#716）/ 96（#721）/ 97（#720 準備中）/ 98（#725 チャット
-選択・コピー）/ 99（#739 起動カードのプロファイル）が Windows で初めて緑**になった。
-次の壁は **#903**（項目 100 = #737 チャット入力欄）。診断が `got=None display=Chat tail=""`
-= **画面に空でない行が 1 本も無い**（プロンプトすら出ていない）ので、シェルの準備を待たずに
-送って起動途中の PTY が打鍵を落としている（#640 と同型）で確定に近い。#897 の LF ではない。
+**項目 100（#737 チャット入力欄）が Windows で初めて緑**。4 状態すべて `tries=1` で
+`ready=true`（`outer_alt=Some(true)` / `inner_alt=false` / `backend=Some(...)` = 器つきのまま）。
+3 回連続で再現し、`TAKO_903_LEGACY=1`（旧経路）に戻すと同じバイナリで FAILED になる。
 
-## 実機テストの読み方（#897 で実測。ここを間違えると判定が壊れる）
+次の壁は **#906**（項目 101 = #749 の自動ハンドオフ）。`TAKO_SELF_TEST_749_SPAWN` が
+出ない = **spawn は成功しているのに fixture プロセスが終了している**
+（`seen=None session=false size=None backend=None tail=""`）。`paint_and_hold` +
+`Start-Sleep 3600` のはずが居なくなるので、`-EncodedCommand` 経由の
+`Clear-Host` / `Write-Host` / `Start-Sleep` のどれかが器の中で落ちている疑い。
 
-- **psmux の e2e は `schtasks /it`（session 1）で回す**。**SSH（session 0）で作った psmux の
-  detached セッションは約 1 秒で自然死する**（#866 worker の実測）ので、
-  `Invoke-CimMethod Win32_Process Create` で `cargo test` を投げると**測り方のせいで**落ちる。
-  #897 でこれを踏み、単独走行でも **main = 10 件失敗 / branch = 7 件失敗**（16 本中）と
-  main のほうが悪い結果になった。兄弟セッションの並行ビルドは増幅要因
-- **`schtasks /it` で回すと psmux_backend が 16 / 0 で全緑**（23.59 秒。session 0 では
-  91〜175 秒かけて 8〜10 件失敗）。**ワークスペース全体の失敗はちょうど 22 件で名前も一致**。
-  つまり **ベースラインは 23 件ではなく 22 件**で、#889 が足した 23 件目と **#896 のフレークは
-  どちらも session 0 で測っていた副作用**だった
-- **隔離セルフテストと psmux e2e は孤児を残す**（psmux サーバーはプロセス名 `tmux.exe`）。
-  `-L tako-iso-<pid>` / `-L tako-884test-<pid>` が自分の残骸で `-L tako` は本番。
-  溜まると psmux e2e の失敗が増えるので run のたびに**明示 pid** で落とす
+## 実機テストの読み方（#897 / #903 で実測。ここを間違えると判定が壊れる）
+
+- **psmux の e2e / GUI セルフテストは `schtasks /it`（session 1）で回す**。SSH（session 0）で
+  作った psmux の detached セッションは約 1 秒で自然死するので、測り方のせいで落ちる
+- **ベースラインは 22 件**（#903 で再確認。失敗名も一致）。`schtasks /it` で回すと
+  `psmux_backend` 16/0・`spawn_arg_quoting` 3/0・`shell_integration_powershell` 7/0・
+  `encoding_conpty` 5/0 が全緑で、残る 22 件は #583 系の POSIX 前提テスト
+- **孤児は run のたびに掃除する**（#903 で踏んだ）。隔離セルフテストは psmux サーバー
+  6 個前後 + pwsh を残す。psmux 19 / pwsh 56 まで溜めた状態で走らせたら**項目 20 / 24 の
+  固定待ちが落ちた**（掃除後は同じ HEAD で通った）。掃除は「tako-app が 1 つも居ない」を
+  確かめてから `-L tako-iso-*` を明示 pid で落とす（`-L tako` は本番）
+- **GPUI の DirectX アトラスで落ちることがある**（項目 66 付近で `directx_atlas.rs:255` の
+  unwrap panic → `STATUS_STACK_BUFFER_OVERRUN`）。#903 では 3 回踏んだ。再実行で通る
 
 ## 実機の作法（繰り返し踏んでいるもの）
 
@@ -51,28 +57,33 @@
 - **`Start-Process` で投げた長い処理は SSH が切れると死ぬ**。`schtasks`（GUI は `/it` で session 1）
   か `Invoke-CimMethod Win32_Process Create` で投げ、**完了はログの `EXITCODE=` 行で待つ**
   （プロセス消失で待つと `cargo run` の起動待ちを完了と誤判定する）。ログは UTF-8 で読む
-- **GPUI の DirectX アトラスで落ちることがある**（#897 の run 1 で実測: 項目 66 付近で
-  `directx_atlas.rs:255` の `unwrap` panic → `STATUS_STACK_BUFFER_OVERRUN`）。再実行で通った
+  （書き込み中は排他で `[System.IO.File]::ReadAllText` が失敗する。`Get-Content -Tail` は通る）
 - **fresh worktree は `web/tako-remote/dist/` を持たない**（.gitignore 済み）。`rust_embed` が
   埋め込むので tako-control のコンパイルが即失敗する。実機の `npm ci` は lock 不整合で落ちるので
   既存 worktree からコピーしてから cargo を回す
 - **`git checkout -- <path>` はそのファイルの未コミット変更を全部捨てる**。実験の巻き戻しに
   使うと自分の作業ごと消える（#889 で 1 回踏んだ）
+- **`git stash` を A/B に使わない**（#903 で踏んだ）。変更が無いと no-op なのに `git stash pop` が
+  他 worker の古い stash を pop してコンフリクトを作る。ファイルは
+  `git checkout <sha> -- <path>` で差し替える
+- **`cp` が `-i` の別名かもしれない**: スクリプトでは `command cp -f` を使う（上書き確認で 10 分ハングした）
 - **tmux ターゲットの `=` を直書きしない**（#866）。`tako_core::tmux::exact_target` /
   `session_pane_target` が `-V` の申告から決める（番犬が直書きを落とす。A/B は
   `TAKO_866_KEEP_EXACT_TARGET=1`）
 
 ## 次の一手
 
-- **#903（項目 100 = #737）**: 直せば 100 以降（#748 / #749 / #761 / #772 / #781 / #789 /
-  #803 / #813 / #815 / #816 / #826 / #830 / #835 / #822 / #868）が開く。
-  直し方の案は Issue に書いた（準備待ちを入れる / リトライで送り直す。#796 の作法）
-- **スライス 8（棚卸し）**: #865 の到達範囲表 + #872 / #875 / #877 / #884 / #889 / #897 の実測で
-  `tako_run` / `tako_run_interactive` / `tako_show_command` / `tako_orchestrator_watch` /
+- **#906（項目 101 = #749）**: 直せば 101 以降（#761 / #772 / #781 / #789 / #803 / #813 /
+  #815 / #816 / #826 / #830 / #835 / #822 / #868）が開く
+- **#907（器つきペインへの非 ASCII 送達が落ちる）**: #903 の副産物。`tako send` /
+  worker へのプロンプト送達（#32 の第 2 層）が Windows + persist ON で日本語を落とす疑い。
+  層は「PromptFlow の貼り付け」か「psmux の打鍵処理」のどちらか未確定（切り分け手順は Issue に）
+- **スライス 8（棚卸し）**: #865 の到達範囲表 + #872 / #875 / #877 / #884 / #889 / #897 / #903 の
+  実測で `tako_run` / `tako_run_interactive` / `tako_show_command` / `tako_orchestrator_watch` /
   `tako_orchestrator_worker_status` / `tako_window` / `tako_ui_mode` を `Pending` から倒せる材料が
   揃った。**#866 で `tako_tmux_list` / `tako_tmux_kill` も製品経路で通した**（`tako_tmux_resize` は
   psmux が `-x` を反映しないので Pending 継続 / `tako_tmux_open` は attach 前提で Pending 継続）。
-  作法 4 に従いマトリクスは #897 / #866 でも触っていない
+  作法 4 に従いマトリクスは #897 / #866 / #903 でも触っていない
 - **製品側の起票（未着手）**: **#898**（`dispatch::which` が POSIX 専用 = stale claude 検知が
   常に無効。境界 B16 `platform::exe::find` へ寄せる）/ **#899**（スターター・welcome の
   コマンド投入が LF + POSIX クォート = GUI モードのカードが機能しない）
@@ -84,8 +95,9 @@
 
 ## 現フェーズで Read すべき設計書
 
-- `.agent/plans/2026-08-windows-main-merge-wip.md`（「#897 の記録」節に 94 → 100 の A/B と
-  実機テストの読み方。「#889 の記録」節に 4 本の実機 A/B とベースライン内訳。「#872 の記録」節に
-  無音終了の機序と偽の緑。「#866 の記録」節に psmux の `=` の機序と session 0 では
-  測れない理由。「8 の前提」節に到達範囲・実機レシピ）
+- `.agent/plans/2026-08-windows-main-merge-wip.md`（「#903 の記録」節に 4 つの機序と A/B 表・
+  作法。「#897 の記録」節に 94 → 100 の A/B と実機テストの読み方・ベースライン内訳。
+  「#889 の記録」節に 4 本の実機 A/B。「#872 の記録」節に無音終了の機序と偽の緑。
+  「#866 の記録」節に psmux の `=` の機序と session 0 では測れない理由。
+  「8 の前提」節に到達範囲・実機レシピ）
 - `.agent/plans/2026-07-windows-port-architecture.md`（境界の定義）

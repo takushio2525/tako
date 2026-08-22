@@ -280,10 +280,12 @@ fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
 
 /// `-EncodedCommand` が要求する UTF-16LE + base64。
 ///
-/// base64 は 20 行で書けるうえ、この 1 箇所でしか使わない。
-/// 依存を増やさない判断（グローバル規約「新しいライブラリを無条件で追加しない」）
-#[cfg_attr(not(windows), allow(dead_code))]
-fn encode_powershell_command(script: &str) -> String {
+/// base64 は 20 行で書けるうえ、依存を増やさない判断
+/// （グローバル規約「新しいライブラリを無条件で追加しない」）。
+///
+/// **符号化はここ 1 箇所**。実行ペイン（#875）とセルフテストのシェル片
+/// （`ShellDialect::shell_snippet_command`。#903）が同じ実装を通る
+pub(crate) fn encode_powershell_command(script: &str) -> String {
     let mut bytes = Vec::with_capacity(script.len() * 2);
     for unit in script.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
@@ -291,7 +293,39 @@ fn encode_powershell_command(script: &str) -> String {
     base64_encode(&bytes)
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+/// [`encode_powershell_command`] の逆（**テストの検算用**）。
+///
+/// 符号化した文字列が元のスクリプトへ戻ることを、実行ペイン（#875）と
+/// セルフテストのシェル片（#903）の両方のテストから同じ 1 実装で確かめる
+#[cfg(test)]
+pub(crate) fn decode_powershell_command(arg: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = Vec::new();
+    for c in arg.bytes().filter(|&b| b != b'=') {
+        let v = TABLE.iter().position(|&t| t == c).expect("base64 の文字") as u32;
+        bits.push(v);
+    }
+    let mut bytes = Vec::new();
+    for chunk in bits.chunks(4) {
+        let mut n = 0u32;
+        for (i, v) in chunk.iter().enumerate() {
+            n |= v << (18 - 6 * i);
+        }
+        bytes.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            bytes.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            bytes.push(n as u8);
+        }
+    }
+    let units: Vec<u16> = bytes
+        .chunks(2)
+        .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+        .collect();
+    String::from_utf16(&units).expect("UTF-16LE")
+}
+
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -437,35 +471,7 @@ mod tests {
 
     const PWSH: &str = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
 
-    /// `-EncodedCommand` の引数を元のスクリプトへ戻す（テスト用の検算）
-    fn decode(arg: &str) -> String {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut bits = Vec::new();
-        for c in arg.bytes().filter(|&b| b != b'=') {
-            let v = TABLE.iter().position(|&t| t == c).expect("base64 の文字") as u32;
-            bits.push(v);
-        }
-        let mut bytes = Vec::new();
-        for chunk in bits.chunks(4) {
-            let mut n = 0u32;
-            for (i, v) in chunk.iter().enumerate() {
-                n |= v << (18 - 6 * i);
-            }
-            bytes.push((n >> 16) as u8);
-            if chunk.len() > 2 {
-                bytes.push((n >> 8) as u8);
-            }
-            if chunk.len() > 3 {
-                bytes.push(n as u8);
-            }
-        }
-        let units: Vec<u16> = bytes
-            .chunks(2)
-            .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
-            .collect();
-        String::from_utf16(&units).expect("UTF-16LE")
-    }
+    use super::decode_powershell_command as decode;
 
     #[test]
     fn base64は既知のベクタと一致する() {

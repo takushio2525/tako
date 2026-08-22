@@ -2056,6 +2056,92 @@ detached セッションは約 1 秒で自然死する**（`new-session -d` の 
   `psmux_backend.rs` の打鍵は導入時（`2947a19`）から `\r` で、真因は #896 の見立て
   （器が起動直後の入力を落とす = #640 と同型）のほう。Issue にも訂正を入れた
 
+#### #903 の記録（疑似 TUI をファイル駆動へ + シェル片を `-EncodedCommand` へ。PR #908・2026-08-22）
+
+**症状**: #897 で項目 94〜99 が開いた直後の壁。項目 100（#737 チャット入力欄）が
+「合成した入力ボックスが画面に出ない」で必ず止まり、**100 以降が 1 つも走らない**。
+
+##### Issue の仮説は外れていた（3 段の実測で機序を確定）
+
+Issue の見立ては「シェルの準備を待たずに送っているので起動途中の PTY が打鍵を落とす」
+（#640 と同型）だった。準備待ち + 送り直しを入れても直らず、**足した診断で
+別の機序が 3 つ出てきた**。同一バイナリの A/B（`TAKO_903_*`）で 1 つずつ潰した。
+
+| # | 実測 | 機序 |
+|---|---|---|
+| 1 | 送信直後は `session=Some(...)`、14.5 秒後に `session=false backend=None` | 状態切替の **Ctrl+C で器（psmux）の client が終了**し、外側 PTY ごと死んでペインが閉じる。client 自身が PowerShell スクリプトなので Ctrl+C で pipeline ごと終わる |
+| 2 | 器を外すと (a)〜(f) が通り **(g) だけ落ちる** | (g) の楽観 echo は `session.is_alt_screen()`（**外側 PTY** の alt screen）を条件にする。器なしで alt screen へ入ると今度は**内側** alt screen 扱いになり表示が Chat → Terminal へ落ちるので、**器つきでしか作れない状況**だった |
+| 3 | 器つきに戻すと画面に `Try "how does <filepath> work?"` だけが出て `─` と `❯` が消える（`nonempty=1`） | **器越しの打鍵から非 ASCII が落ちる**。psmux へ直接印字させた対照実験では出力経路は無傷（`capture-pane` の生バイトが `e29480` / `e29daf` / `c2a0`）だったので、落ちているのは打鍵側 |
+
+**器は外せない / 打ち込めない**の両立が要件だと分かったので、**状態を打鍵ではなく
+ファイルの書き換えで切り替える**形にした（`ShellDialect::repaint_file_loop`）。
+疑似 TUI はペイン自身のコマンドとして起動する = 項目 101 / 105 / 111 と同じ流儀。
+
+##### 4 つめの機序: 器は内側コマンドを自分で単語分割する（#875 の 3 層問題）
+
+ファイル駆動にしても**ペインが即死**した（`ready=true` の直後は `session=Some(...)`、
+7 秒後に `session=false`）。psmux へ直接投げた対照実験で確定:
+
+| 渡し方 | 実測 |
+|---|---|
+| `powershell -NoProfile -Command '<引用符入りの片>'`（`shell_snippet_command` の旧形） | `list-sessions` に出ず `no server running on session …` = **即死** |
+| `powershell -NoProfile -EncodedCommand <base64>` | **生存**して画面を描き続けた |
+
+`ShellDialect::shell_snippet_command` の PowerShell 側を `-EncodedCommand`
+（base64 / UTF-16LE）へ寄せた。符号化は #875 の
+`platform::shell::encode_powershell_command` を `pub(crate)` にして**実装 1 つ**を共有。
+base64 は `A-Za-z0-9+/=` だけなので単語分割・引用符解釈・コマンドライン組み立ての
+どの層も通り、**非 ASCII も UTF-16 のまま運べる**（機序 3 にも当たらない）。
+
+##### 実機 A/B（同じ worktree・HEAD だけ替えた）
+
+| アーム | 結果 |
+|---|---|
+| 旧挙動（器つき + 打ち込み + Ctrl+C） | **FAILED**（項目 100）。`session=false` / `tail=""` |
+| 器なし + 準備待ち + 送り直し | (a)〜(f) は通るが **(g) で FAILED**（`is_alt_screen` が false） |
+| 器つき + ファイル駆動 + `-Command` | **FAILED**（ペイン即死。単語分割） |
+| **器つき + ファイル駆動 + `-EncodedCommand`** | **項目 100 通過**（4 状態すべて `tries=1`。`ready=true waited=2.3s outer_alt=Some(true) inner_alt=false`）。2 回連続で再現 |
+
+到達範囲は **項目 0〜100**。次の壁は**項目 101（#749）**で、fixture ペインが
+PTY を持たない（`TAKO_SELF_TEST_749_CTX: seen=None session=false size=None backend=None`。
+`TAKO_SELF_TEST_749_SPAWN` は出ないので **spawn は成功していて後で終了している**）
+= **#906 へ起票**。
+
+##### 検出力（最終バイナリで旧経路へ戻して確認）
+
+`TAKO_903_LEGACY=1` を付けて同じバイナリで回すと**項目 100 が FAILED**:
+
+```
+TAKO_SELF_TEST_737_PAINT: expected="Try \"how does <filepath> work?\"" ready=false tries=1 legacy=true
+TAKO_SELF_TEST_737: … session=true state=Some(Idle) child=Some(4492) backend=Some("tako-778ee07e7b07")
+  nonempty=1 tail="Try \"how does <filepath> work?\""
+```
+
+この run はペインが生き残った（Ctrl+C が準備待ちの後に着弾した）ぶん、**機序 3 が
+そのまま見える**: 画面に残っているのは ASCII の本文 1 行だけで `─` と `❯` が消えている。
+非 ASCII の送達は**製品側の疑い**として **#907** へ分離した（`tako send` / worker への
+プロンプト送達の第 2 層が Windows + persist ON で日本語を落とす）。
+
+##### 作法として残すもの
+
+- **番犬テスト `打ち込む疑似画面のfixtureはシェルの準備を待っている`**: `paint_and_hold` の
+  使い方は「ペインの起動コマンドとして渡す」か「準備を待ってから打ち込む」の 2 通りしか
+  許さない（ソース走査。前後 100 行に `shell_snippet_command` か `wait_for_pane_ready`）
+- **`self_test::wait_for_pane_ready`**: 新しいペインへ最初の打鍵を送る前の準備待ちを 1 本化
+  （画面に空でない行が出るか OSC 133 の Idle）。ダイアログ fixture の同型ループもここへ寄せた
+- **PTY 起動の失敗理由を捨てない**: `spawn_session` の `Err` を捨てると
+  「起動できなかった」が「画面に出ない」として現れ、原因が疑似 TUI 側にあるように見える
+  （#903 が長引いた理由の 1 つ）。項目 100 / 101 の両方で `spawn_error` を出すようにした
+- **実機の孤児は run のたびに掃除する**: 隔離セルフテストは psmux サーバー 6 個前後 +
+  pwsh を残す。溜めたまま（psmux 19 / pwsh 56）走らせたら**項目 20 / 24 の固定待ちが落ちた**
+  （`tako read` / `tako focus`。掃除後は同じ HEAD で通った）。掃除は
+  「tako-app が 1 つも居ない」を確かめてから `-L tako-iso-*` を明示 pid で落とす
+- **`git stash` を A/B に使わない**: 変更が無いと no-op なのに `git stash pop` が
+  **他 worker の古い stash を pop** してコンフリクトを作る（このセッションで 1 回踏んだ。
+  `git restore --source=HEAD` で戻し、stash は失われていない）。ファイルを
+  `git checkout <sha> -- <path>` で差し替える方が安全
+- **`cp` は `-i` の別名かもしれない**: 上書きの確認待ちで 10 分ハングした。スクリプトでは
+  `command cp -f` を使う
 #### #866 の記録（tmux の完全一致ターゲット。PR #902・2026-08-22）
 
 **症状**: `tako tmux kill` が Windows で効かない。#865 で実機セルフテストが深く回るようになって

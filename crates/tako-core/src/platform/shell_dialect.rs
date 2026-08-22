@@ -298,15 +298,24 @@ impl ShellDialect {
     /// シェル片を走らせる **argv**（`Split { command }` / `spawn_session` へ渡す形）。
     ///
     /// 検証用の疑似 TUI をペインで走らせるのに使う。`/bin/sh` は Windows に無いので
-    /// ここで振り替える（`powershell` は 5.1 でも 7 でも同じ名前で起動できる）
+    /// ここで振り替える（`powershell` は 5.1 でも 7 でも同じ名前で起動できる）。
+    ///
+    /// **PowerShell 側は `-EncodedCommand`（base64 / UTF-16LE）で渡す**（#903）。
+    /// 素の `-Command "…"` にしないのは、器（psmux）が内側コマンドを
+    /// **自分で単語分割する**ため（#875 が実行ペインで踏んだのと同じ 3 層問題）。
+    /// 実機の A/B: 引用符入りのシェル片を `-Command` で渡すと**セッションが即死**し
+    /// （`no server running on session …`）、同じ片を `-EncodedCommand` で渡すと
+    /// 生き続けて画面を描いた。base64 の出力文字は `A-Za-z0-9+/=` だけなので、
+    /// 単語分割・引用符の解釈・コマンドライン組み立てのどの層も通過する。
+    /// 非 ASCII（罫線・`❯`）も UTF-16 のまま運べる = 器越しでも落ちない
     pub fn shell_snippet_command(self, snippet: &str) -> Vec<String> {
         match self {
             Self::Posix => vec!["/bin/sh".into(), "-c".into(), snippet.to_string()],
             Self::PowerShell => vec![
                 "powershell".into(),
                 "-NoProfile".into(),
-                "-Command".into(),
-                snippet.to_string(),
+                "-EncodedCommand".into(),
+                crate::platform::shell::encode_powershell_command(snippet),
             ],
         }
     }
@@ -390,6 +399,45 @@ impl ShellDialect {
                     .replace('\u{1b}', "$([char]27)")
                     .replace('\n', "`n");
                 format!("Clear-Host; Write-Host -NoNewline \"{escaped}\"; Start-Sleep {seconds}")
+            }
+        }
+    }
+
+    /// ファイルの中身を画面へ描き直し続ける（検証用の疑似 TUI。#903）。
+    ///
+    /// `paint_and_hold` は「描いて sleep で保持」なので、状態を切り替えるには
+    /// **Ctrl+C で sleep を止めて次のコマンドを打ち込む**必要がある。ところが
+    /// Windows では両方が壊れる:
+    ///
+    /// - 器（psmux）の client 自身が PowerShell スクリプトなので **Ctrl+C で終了**し、
+    ///   外側 PTY ごと死んでペインが閉じる（実測: 送った直後に `session=false`）
+    /// - **器越しの打鍵から非 ASCII が落ちる**（実測: `─` と `❯` が消えて ASCII の
+    ///   本文だけが画面に残る。器の中のシェル自身が印字する経路は無傷なので
+    ///   出力側ではなく打鍵側）
+    ///
+    /// ファイル経由なら打鍵も割り込みも要らず、**書き換えた瞬間に描き替わる**。
+    /// 中身は**生バイトのまま**出す（`printf '%b'` のような書式を通さない）ので
+    /// ESC 列も日本語もそのまま置ける。変化が無ければ描き直さない = ちらつかない
+    pub fn repaint_file_loop(self, path: &Path) -> String {
+        let shown = path.display().to_string();
+        match self {
+            Self::Posix => {
+                let quoted = crate::shell::quote_for_shell(&shown);
+                format!(
+                    "last=''; while :; do b=\"$(cat {quoted} 2>/dev/null)\"; \
+                     if [ \"$b\" != \"$last\" ]; then clear; printf '%s' \"$b\"; last=\"$b\"; fi; \
+                     sleep 0.3; done"
+                )
+            }
+            Self::PowerShell => {
+                let quoted = ps_quote(&shown);
+                format!(
+                    "$last = ''; while ($true) {{ \
+                     $b = Get-Content -Raw -Encoding UTF8 -ErrorAction SilentlyContinue {quoted}; \
+                     if ($null -ne $b -and $b -ne $last) {{ Clear-Host; \
+                     Write-Host -NoNewline $b; $last = $b }}; \
+                     Start-Sleep -Milliseconds 300 }}"
+                )
             }
         }
     }
@@ -726,6 +774,45 @@ mod tests {
         );
     }
 
+    /// ファイルの中身を描き直し続けるループ（#903）。
+    ///
+    /// 疑似 TUI の状態を**打鍵ではなくファイルの書き換え**で切り替えるための形。
+    /// 不変条件は 4 つ: 生の改行を出さない（1 行のシェル片として渡せる）/
+    /// 中身を書式解釈せずそのまま出す / 変化が無ければ描き直さない（ちらつき防止）/
+    /// パスを引用する（空白入りのパスで割れない）
+    #[test]
+    fn ファイルの中身を描き直し続ける() {
+        let posix = POSIX.repaint_file_loop(Path::new("/tmp/tako 903/body.txt"));
+        assert!(
+            posix.contains("cat '/tmp/tako 903/body.txt'"),
+            "パスが引用されていない: {posix}"
+        );
+        assert!(posix.contains("printf '%s'"), "書式解釈している: {posix}");
+        assert!(
+            posix.contains(r#""$b" != "$last""#),
+            "変化検出が無い: {posix}"
+        );
+        let ps = PS.repaint_file_loop(Path::new("C:\\Temp\\tako 903\\body.txt"));
+        assert!(
+            ps.contains(
+                "Get-Content -Raw -Encoding UTF8 -ErrorAction SilentlyContinue \
+                         'C:\\Temp\\tako 903\\body.txt'"
+            ),
+            "読み方 / 引用が想定と違う: {ps}"
+        );
+        assert!(
+            ps.contains("Write-Host -NoNewline $b"),
+            "生バイトのまま出していない: {ps}"
+        );
+        assert!(ps.contains("$b -ne $last"), "変化検出が無い: {ps}");
+        for rendered in [posix, ps] {
+            assert!(
+                !rendered.contains('\n'),
+                "生の改行が混ざっている: {rendered}"
+            );
+        }
+    }
+
     /// 疑似 TUI の 1 枚絵。**生の改行を出さない**（打ち込む文字列としても使える）
     #[test]
     fn 画面を描いて保持する() {
@@ -762,9 +849,22 @@ mod tests {
             POSIX.shell_snippet_command("echo x"),
             vec!["/bin/sh", "-c", "echo x"]
         );
+        // PowerShell 側は `-EncodedCommand`（#903）。器（psmux）が内側コマンドを
+        // 単語分割するので、引用符・空白・非 ASCII を含む片は符号化しないと死ぬ
+        let snippet = "$last = ''; Write-Host -NoNewline '❯ 箱'; Start-Sleep 30";
+        let got = PS.shell_snippet_command(snippet);
+        assert_eq!(got[..3], ["powershell", "-NoProfile", "-EncodedCommand"]);
+        assert!(
+            got[3]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "base64 以外の文字が混ざっている: {}",
+            got[3]
+        );
         assert_eq!(
-            PS.shell_snippet_command("echo x"),
-            vec!["powershell", "-NoProfile", "-Command", "echo x"]
+            crate::platform::shell::decode_powershell_command(&got[3]),
+            snippet,
+            "符号化した片が元に戻らない"
         );
     }
 
@@ -934,19 +1034,16 @@ mod tests {
     fn 打鍵をそのまま返すペインのargvは方言で変わる() {
         assert_eq!(POSIX.echo_stdin_command(), vec!["cat".to_string()]);
         let ps = PS.echo_stdin_command();
-        assert_eq!(ps[..3], ["powershell", "-NoProfile", "-Command"]);
-        let snippet = &ps[3];
+        // 渡し方は `shell_snippet_command` と同じ = `-EncodedCommand`（#903）
+        assert_eq!(ps[..3], ["powershell", "-NoProfile", "-EncodedCommand"]);
+        let snippet = crate::platform::shell::decode_powershell_command(&ps[3]);
+        let snippet = snippet.as_str();
         // 標準入力を読んで書き戻す = `cat` と同じ役（届いた行が実行されない）
         assert!(
             snippet.contains("ReadLine"),
             "stdin を読んでいない: {snippet}"
         );
         assert!(snippet.contains("WriteLine"), "書き戻していない: {snippet}");
-        // 引用符を混ぜない（`-Command` の 1 語として届くまでに複数の層を通る）
-        assert!(
-            !snippet.contains('"') && !snippet.contains('\''),
-            "引用符が混ざっている: {snippet}"
-        );
         // Rust の行継続でつないでいるので、空白が潰れていないことも固定する
         assert!(
             !snippet.contains("  ") && !snippet.contains(");if"),
