@@ -8,6 +8,8 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
+    "og": "node scripts/generate-og.mjs",
+    "og:verify": "node scripts/verify-og.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },

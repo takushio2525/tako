@@ -1,0 +1,30 @@
+{
+  "generatedBy": "docs/scripts/generate-og.mjs",
+  "width": 1200,
+  "height": 630,
+  "pages": {
+    "/development/architecture/": "/og/development-architecture.png",
+    "/development/building/": "/og/development-building.png",
+    "/features/file-preview/": "/og/features-file-preview.png",
+    "/features/git-integration/": "/og/features-git-integration.png",
+    "/features/gui-mode/": "/og/features-gui-mode.png",
+    "/features/mcp-server/": "/og/features-mcp-server.png",
+    "/features/orchestration/": "/og/features-orchestration.png",
+    "/features/orchestrator/": "/og/features-orchestrator.png",
+    "/features/port-detection/": "/og/features-port-detection.png",
+    "/features/remote/": "/og/features-remote.png",
+    "/features/shelving/": "/og/features-shelving.png",
+    "/features/tabs-and-panes/": "/og/features-tabs-and-panes.png",
+    "/features/telemetry/": "/og/features-telemetry.png",
+    "/features/tmux-backend/": "/og/features-tmux-backend.png",
+    "/getting-started/": "/og/getting-started.png",
+    "/getting-started/quickstart/": "/og/getting-started-quickstart.png",
+    "/guides/cli-reference/": "/og/guides-cli-reference.png",
+    "/guides/keyboard-shortcuts/": "/og/guides-keyboard-shortcuts.png",
+    "/guides/mcp-tools/": "/og/guides-mcp-tools.png",
+    "/guides/remote-migration/": "/og/guides-remote-migration.png",
+    "/guides/settings/": "/og/guides-settings.png",
+    "/": "/og/index.png",
+    "/releases/": "/og/releases.png"
+  }
+}
