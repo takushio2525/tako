@@ -22,17 +22,22 @@
 **項目 94（#702 alt screen）/ 95（#716）/ 96（#721）/ 97（#720 準備中）/ 98（#725 チャット
 選択・コピー）/ 99（#739 起動カードのプロファイル）が Windows で初めて緑**になった。
 次の壁は **#903**（項目 100 = #737 チャット入力欄。合成した箱が画面に出ない）。
-`#897` の LF ではない（製品の `Send` は `normalize_newlines_for_keys` で CR へ倒している）ので、
-有力な仮説は「シェルの準備を待たずに送っていて起動途中の PTY が打鍵を落とす」（#640 と同型）。
+`#897` の LF ではない（製品の `Send` は `normalize_newlines_for_keys` で CR へ倒している）。
+強化した診断が `got=None display=Chat tail=""` = **ペインの画面に空でない行が 1 本も無い**
+（箱どころかシェルのプロンプトすら出ていない）と出たので、**シェルの準備を待たずに送っていて
+起動途中の PTY が打鍵を落としている**（#640 と同型）で確定に近い。
 
 ## 実機テストの読み方（#897 で実測。ここを間違えると判定が壊れる）
 
-- **psmux / spawn の e2e は兄弟セッションのビルドと重なると桁で悪化する**。単独走行
-  （`--test-threads=1`）でも重なった窓では **main = 10 件失敗 / branch = 7 件失敗**（16 本中）
-  になり、**main のほうが悪い**ことがある。#896 の「並行ビルドと重なったときだけ崩れる」が正
-- **判定は非 e2e のスイートの失敗名でする**（tako-app / tako-cli / tako-control lib /
-  tako-core lib / platform_parity / encoding_conpty / shell_integration_powershell）。
-  ベースラインは **22 件**で、`Compare-Object` で名前まで一致するかを見る
+- **psmux の e2e は `schtasks /it`（session 1）で回す**。**SSH（session 0）で作った psmux の
+  detached セッションは約 1 秒で自然死する**（#866 worker の実測）ので、
+  `Invoke-CimMethod Win32_Process Create` で `cargo test` を投げると**測り方のせいで**落ちる。
+  #897 でこれを踏み、単独走行でも **main = 10 件失敗 / branch = 7 件失敗**（16 本中）と
+  main のほうが悪い結果になった。兄弟セッションの並行ビルドは増幅要因
+- **`schtasks /it` で回すと psmux_backend が 16 / 0 で全緑**（23.59 秒。session 0 では
+  91〜175 秒かけて 8〜10 件失敗）。**ワークスペース全体の失敗はちょうど 22 件で名前も一致**。
+  つまり **ベースラインは 23 件ではなく 22 件**で、#889 が足した 23 件目と **#896 のフレークは
+  どちらも session 0 で測っていた副作用**だった
 - **隔離セルフテストと psmux e2e は孤児を残す**（psmux サーバーはプロセス名 `tmux.exe`）。
   `-L tako-iso-<pid>` / `-L tako-884test-<pid>` が自分の残骸で `-L tako` は本番。
   溜まると psmux e2e の失敗が増えるので run のたびに**明示 pid** で落とす

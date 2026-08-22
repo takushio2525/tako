@@ -1972,17 +1972,25 @@ TAKO_SELF_TEST_739_PROFILES / _LAUNCH / _CTX                                   �
 
 ##### 次の壁は項目 100（#737 チャット入力欄）= **#903 へ起票**
 
-```
-TAKO_SELF_TEST_737: expected="Try \"how does <filepath> work?\"" got=Some(None)
-TAKO_APP_SELF_TEST_FAILED: #737: 合成した入力ボックスが画面に出ない
-```
-
 **#897 の LF ではない**（製品の `Send` は `normalize_newlines_for_keys` で CR へ倒している）。
 `paint_and_hold` が組む PowerShell コマンド自体も実機の pwsh 7 で
 **そのまま構文を通って箱を描く**ことを確認済み（`Invoke-Expression` で PARSE_OK・
-罫線と `❯` と ESC 列が出た）。`got=None` = `screen::input_region` が `❯` 行を見つけられない
-という以上のことは分からなかったので、**この PR で診断行に画面末尾 6 行と
-`pane_display_for` を足した**（#796 の作法）。次の run で切り分く。
+罫線と `❯` と ESC 列が出た）。
+
+`got=Some(None)` だけでは切り分けられなかったので、**この PR で診断行に画面末尾 6 行と
+`pane_display_for` を足した**（#796 の作法）。取り直した結果が決定的だった:
+
+```
+TAKO_SELF_TEST_737: expected="Try \"how does <filepath> work?\"" got=None display=Chat tail=""
+```
+
+**`tail=""`** = ペインの画面に**空でない行が 1 本も無い** =
+箱が塗れていないどころか**シェルがプロンプトすら出していない**。
+`display=Chat` なのでチャット表示の側は成立している。
+つまり **シェルの準備を待たずに送っていて、起動途中の PTY が打鍵を落としている**（#640 と同型）。
+項目 100 は分割の後 `wait(cx, 500)` の**固定待ちだけ**で `send` し、
+`await_box!` は**送り直さない**ので最初の 1 回が落ちるとそのまま FAILED になる
+（項目 94 は 40×100ms の準備待ちを持っている）。
 
 ##### 実機テストのベースライン（この Issue で分かったこと）
 
@@ -1999,12 +2007,36 @@ branch の通し走行は 31 件失敗だったが、増えた 8 件は**すべ�
 `psmux_backend` / `spawn_arg_quoting` は **tako-core の integration test**。
 main と branch でこれらのテストバイナリは同一の入力から作られる。
 
-**兄弟セッションのビルドと重なると桁で悪化する**（実測）。単独走行
-（`--test-threads=1`）でも #866 worker の `cargo build` と重なった窓では
-**main = 10 件失敗 / branch = 7 件失敗**（psmux 16 本中）になり、**main のほうが悪い**。
-非 e2e のスイート（tako-app / tako-cli / tako-control lib / tako-core lib /
-platform_parity / encoding_conpty / shell_integration_powershell）は
-**失敗名がベースライン 22 件と完全一致**していたので、判定はそちらで行う。
+**psmux の e2e は `schtasks /it`（session 1）で回さないと構造的に落ちる**（この Issue の最大の収穫）。
+#866 worker の実測（このセッション中に共有された）: **SSH（session 0）で作った psmux の
+detached セッションは約 1 秒で自然死する**（`new-session -d` の +500ms は `ls` に出て
++1000ms で消える。session 1 で作ったものは残る）。`Invoke-CimMethod Win32_Process Create`
+で `cargo test` を投げると session 0 なので、psmux e2e が**測り方のせいで**落ちる。
+
+実際 #897 の検証でこれを踏み、単独走行（`--test-threads=1`）でも
+**main = 10 件失敗 / branch = 7 件失敗**（psmux 16 本中）と **main のほうが悪い**結果になった
+（兄弟セッションの並行ビルドは増幅要因であって主因ではない）。
+
+**同じ HEAD を `schtasks /it`（session 1）で回し直したら psmux_backend が 16 / 0 で全緑**
+（23.59 秒。session 0 では 91〜175 秒かけて 8〜10 件失敗）。`spawn_arg_quoting` も 3 / 0。
+**ワークスペース全体の失敗はちょうど 22 件で、名前もベースラインと完全一致**した:
+
+| スイート | session 1 の結果 |
+|---|---|
+| `tako-app` (bin) | 453 / **0** |
+| `tako-cli` (lib) | 53 / **0** |
+| `tako-control` (lib) | 1027 / **15 failed**（ベースライン同一） |
+| `tako-core` (lib) | 800 / **7 failed**（ベースライン同一） |
+| `platform_parity` | 12 / 0 |
+| `encoding_conpty` | 5 / 0 |
+| `psmux_backend` | **16 / 0** ← session 0 では 8〜10 件失敗 |
+| `shell_integration_powershell` | 7 / 0 |
+| `spawn_arg_quoting` | 3 / 0 |
+
+つまり **ベースラインは 23 件ではなく 22 件**で、#889 が足した 23 件目
+（`psmux_backend::copy_mode滞在中の打鍵がin_band解除で届く`）と **#896 のフレークは
+どちらも session 0 で測っていた副作用**だった。以後、実機のテストは
+**`schtasks /it` で回す**（#896 へコメント済み）。
 
 **残骸の後始末を忘れない**（この run で踏んだ）: 隔離セルフテストと psmux e2e は
 **psmux サーバー（プロセス名は `tmux.exe`）と pwsh の孤児を残す**。`-L tako-iso-<pid>` /
