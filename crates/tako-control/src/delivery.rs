@@ -149,6 +149,45 @@ pub fn log_fallback(backend_session: &str, reason: &str) {
     ));
 }
 
+/// **非 ASCII の本文を器の注入口へ入れる**（#907）。
+///
+/// 器つきペインへのテキストは従来「外側 PTY への打鍵」で送っていたが、
+/// psmux の client は **cp932 に無い文字を黙って落とす**（実機実測: `テスト─❯` を
+/// 送ると `テスト` だけが届く）。器自身の `send-keys -l` は UTF-8 をそのまま運ぶので、
+/// 落ちる組み合わせのときだけそちらへ迂回する。
+///
+/// 戻り値: `Ok(true)` = 注入した（呼び出し側は本文を打鍵しない）/
+/// `Ok(false)` = 迂回不要（従来どおり打鍵する）/ `Err` = 迂回すべきだが失敗した
+/// （呼び出し側は打鍵へ落ちる = 従来の壊れ方に留める。無音で失うより良い）
+pub fn inject_non_ascii(backend_session: Option<&str>, text: &str) -> Result<bool, &'static str> {
+    let caps = tako_core::backend::capabilities();
+    if !tako_core::backend::needs_text_injection(&caps, text) {
+        return Ok(false);
+    }
+    let Some(session) = backend_session else {
+        // 器が無いペイン（能力が true でも起こり得る: persist OFF で作ったペイン）
+        return Ok(false);
+    };
+    match tako_core::backend::inject_text(session, text) {
+        Ok(()) => {
+            crate::diag::persist_log(&format!(
+                "送達: 器へ注入（session={session} 器={} 文字数={}）",
+                caps.label,
+                text.chars().count()
+            ));
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: 器への注入に失敗（session={session}）: {e}。\
+                 打鍵経路へ落ちるので非 ASCII が欠ける可能性がある（#907）"
+            );
+            crate::diag::persist_log(&format!("送達: 器への注入に失敗（session={session}）: {e}"));
+            Err("inject_failed")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

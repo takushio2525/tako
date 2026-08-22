@@ -5493,6 +5493,9 @@ impl TakoApp {
             // 「エージェント管理下の worker か」（role で判定。人間が話す master /
             // 素のペインは従来経路のまま = 前置きの意味を変えない）。
             // Enter 単独送達（#95）は「キーを送れ」という要求そのものなので対象外
+            // #907: 器の client が非 ASCII を落とす器（psmux）では、貼り付けの本文を
+            // 打鍵ではなく器の注入口へ入れる。宛先は器のセッション名
+            let backend_for_flow = self.backend_sessions.get(&flow.pane).cloned();
             let peer_ctx = if flow.enter_only || flow.prompt.trim().is_empty() {
                 None
             } else {
@@ -5629,7 +5632,7 @@ impl TakoApp {
                                 if let Some((backend, _)) = peer_ctx.as_ref() {
                                     tako_control::delivery::log_fallback(backend, reason);
                                 }
-                                session.paste(&flow.prompt);
+                                Self::paste_prompt(&flow, session, &backend_for_flow);
                                 flow.state = PromptFlowState::WaitTextInInput;
                                 flow.state_entered_at = now;
                             }
@@ -5669,7 +5672,7 @@ impl TakoApp {
                                 "warning: プロンプト貼り付けが入力欄に反映されず（pane={}）再貼り付けする",
                                 flow.pane.as_u64()
                             );
-                            session.paste(&flow.prompt);
+                            Self::paste_prompt(&flow, session, &backend_for_flow);
                             flow.state_entered_at = now;
                         } else {
                             // 反映を確認できないまま打ち切る。Enter は一応送るが、
@@ -5812,6 +5815,20 @@ impl TakoApp {
     /// enter_only（Enter 代行）は spawn プロンプトではないので記録対象外。
     /// レジストリ側は「同ペインの active かつ未決着エントリ」だけを更新するため、
     /// worker でないペインへの送信は no-op になる
+    /// プロンプト本文を入力欄へ入れる（#32 の貼り付け段）。
+    ///
+    /// **器の client が非 ASCII を落とす器（psmux）では器の注入口へ迂回する**（#907）。
+    /// 迂回できた場合も「貼り付けとして扱わせる」ための括り（bracketed paste）は
+    /// 打鍵で送る必要が無い: `send-keys -l` は 1 回の呼び出しで本文が入るので、
+    /// TUI 側は通常の連続入力として受け取る（実測で入力欄へ反映される）。
+    /// 迂回しない / 失敗した場合は従来どおり `paste`（挙動据え置き）
+    fn paste_prompt(flow: &PromptFlow, session: &TerminalSession, backend: &Option<String>) {
+        match tako_control::delivery::inject_non_ascii(backend.as_deref(), &flow.prompt) {
+            Ok(true) => {}
+            _ => session.paste(&flow.prompt),
+        }
+    }
+
     fn report_prompt_delivery(flow: &PromptFlow, reason: &'static str) {
         if flow.enter_only {
             return;

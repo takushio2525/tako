@@ -174,6 +174,16 @@ pub struct BackendCapabilities {
     /// （実測 2026-08-21・psmux 3.3.7）。false の器へは
     /// `platform::program_path::single_token` で空白の無い表記へ落として渡す
     pub quotes_program: bool,
+    /// **器の client の打鍵経路が ASCII しか運べないか**（#907）。
+    ///
+    /// tako は器つきペインへも「外側 PTY へ書く」= 器の client の打鍵として
+    /// テキストを送っている。psmux はこの経路で **cp932 に無い文字を落とす**
+    /// （実機実測: `テスト─❯` を送ると `テスト` だけが届き `─`（U+2500）と
+    /// `❯`（U+276F）が消える。器なしの同じ経路はバイト等価）。
+    /// 器自身の注入口（`send-keys -l` / `paste-buffer`）は UTF-8 をそのまま運ぶので、
+    /// true の器へは打鍵ではなく [`inject_text`] で入れる。
+    /// tmux は打鍵経路がバイト等価なので false（macOS の経路は据え置き）
+    pub keystrokes_ascii_only: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -222,6 +232,21 @@ impl BackendCapabilities {
 /// **呼び出し側は「tmux があるか」ではなく「何ができるか」を尋ねる**。
 /// この向きにしておくと、案 B-1（器あり・到達なし）が入ったときに
 /// 呼び出し側を書き換えずに済む（設計 §3.6 の合格条件）
+/// **打鍵ではなく器の注入口へ入れるべきテキストか**（#907。純粋関数）。
+///
+/// 器の client が ASCII しか運べない（`keystrokes_ascii_only`）のに
+/// 非 ASCII を含むときだけ true。ASCII だけのテキストは従来どおり打鍵で送る
+/// （経路を増やさないほうが挙動差が出ない。Enter・制御キーも同じ理由で打鍵のまま）
+pub fn needs_text_injection(caps: &BackendCapabilities, text: &str) -> bool {
+    caps.keystrokes_ascii_only && !text.is_ascii()
+}
+
+/// いまの器の注入口へテキストを入れる（#907）。器が無い / 対応していないなら `Err`
+pub fn inject_text(session: &str, text: &str) -> Result<(), BackendError> {
+    let session = SessionRef::new(session)?;
+    backend().inject_text(&session, text)
+}
+
 pub fn capabilities() -> BackendCapabilities {
     backend().capabilities()
 }
@@ -335,6 +360,21 @@ pub trait SessionBackend: Send + Sync {
         protected: &HashSet<SessionRef>,
         min_idle: Option<Duration>,
     ) -> Vec<SessionRef>;
+
+    /// **器の注入口へテキストを入れる**（#907）。既定は「無い」。
+    ///
+    /// 打鍵（外側 PTY への書き込み）ではなく器の CLI（`send-keys -l`）を通す経路。
+    /// 引数は Windows のコマンドラインとして UTF-16 で渡るので、
+    /// **cp932 に無い文字も落ちない**（実機実測: `send-keys -l` と
+    /// `load-buffer` + `paste-buffer` はどちらもバイト等価だった）。
+    ///
+    /// 改行は含めない（Enter は「貼り付けと分離した単独キー」として送るのが
+    /// tako の規約 = #95 / #32。ASCII なので打鍵経路でよい）
+    fn inject_text(&self, _session: &SessionRef, _text: &str) -> Result<(), BackendError> {
+        Err(BackendError::Operation(
+            "この器はテキスト注入に対応していない".into(),
+        ))
+    }
 
     /// 器の中のペインの制御端末。listen ポート検知（FR-2.4.2）の突き合わせに使う
     fn pane_tty(&self, session: &SessionRef) -> Option<String>;
@@ -857,6 +897,27 @@ mod pane_scoped_env_tests {
 
 #[cfg(test)]
 mod tests {
+    /// #907: 打鍵で運べない組み合わせだけ器の注入口へ迂回する
+    #[test]
+    fn 注入へ迂回するのは非asciiかつ打鍵がasciiのみの器のとき() {
+        let lossy = BackendCapabilities {
+            keystrokes_ascii_only: true,
+            ..tmux::TmuxBackend::new().capabilities()
+        };
+        let clean = BackendCapabilities {
+            keystrokes_ascii_only: false,
+            ..lossy
+        };
+        // 非 ASCII × 落とす器 = 迂回
+        assert!(needs_text_injection(&lossy, "テスト"));
+        assert!(needs_text_injection(&lossy, "ascii と 日本語"));
+        // ASCII だけなら経路を増やさない（挙動差を作らない）
+        assert!(!needs_text_injection(&lossy, "echo hello"));
+        assert!(!needs_text_injection(&lossy, ""));
+        // バイト等価な器（tmux / 器なし）は常に打鍵のまま
+        assert!(!needs_text_injection(&clean, "テスト"));
+    }
+
     use super::*;
 
     #[test]
@@ -1068,6 +1129,7 @@ mod tests {
             scrollback: ScrollbackAuthority::Backend,
             osc_passthrough: true,
             quotes_program: true,
+            keystrokes_ascii_only: false,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -1080,6 +1142,7 @@ mod tests {
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: true,
             quotes_program: true,
+            keystrokes_ascii_only: false,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -1098,6 +1161,7 @@ mod tests {
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: true,
             quotes_program: true,
+            keystrokes_ascii_only: false,
             label: "none",
         };
         let v = caps.describe();
@@ -1115,6 +1179,7 @@ mod tests {
             scrollback: ScrollbackAuthority::Backend,
             osc_passthrough: true,
             quotes_program: true,
+            keystrokes_ascii_only: false,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -1133,6 +1198,7 @@ mod tests {
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: false,
             quotes_program: false,
+            keystrokes_ascii_only: true,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -1171,6 +1237,7 @@ mod tests {
                 scrollback: ScrollbackAuthority::InProcess,
                 osc_passthrough: true,
                 quotes_program: true,
+                keystrokes_ascii_only: false,
                 label: "session-host",
             }
         }
@@ -1370,6 +1437,7 @@ mod tests {
             scrollback: ScrollbackAuthority::InProcess,
             osc_passthrough: true,
             quotes_program: true,
+            keystrokes_ascii_only: false,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -1432,6 +1500,7 @@ mod tests {
                 scrollback: ScrollbackAuthority::InProcess,
                 osc_passthrough: true,
                 quotes_program: true,
+                keystrokes_ascii_only: false,
                 label: "capture-only",
             }
         }
