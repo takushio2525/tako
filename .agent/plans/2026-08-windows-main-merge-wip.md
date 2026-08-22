@@ -2422,12 +2422,13 @@ ASCII のみの対照（`MARKA-ASCII-MARKA`）は before / after / 器なし の
 
 器（psmux）へ**同じシェル片を直接投げる対照実験**（`new-session -d` + `list-sessions` +
 `capture-pane -p`。session 1 = `schtasks /it`）で、落ちているのは**psmux の
-`new-session` そのもの**だと分かった。psmux は Rust 製で、失敗すると
-`psmux: アクセスが拒否されました。(os error 5)` / exit 5 を返す:
+`new-session` そのもの**だと分かった。失敗の表示は
+`psmux: アクセスが拒否されました。(os error 5)` / `Access is denied.` の 2 通り
+（`(os error 5)` は Rust の `io::Error` の表示形式）で、終了コードは 1 / 5:
 
 | アーム | 実測 |
 |---|---|
-| 項目 101 の片そのまま | **exit 5**（4 回とも）。セッションは作られない |
+| 項目 101 の片そのまま | **exit 5**（順序を入れ替えて 5/5・別 run で 4/4）。セッションは作られない |
 | 同じ片 + 末尾に空白 1 個 | **exit 0** で生存し画面も描く |
 | 同じ片で `Start-Sleep 30` / 改行 3 連 / 本文を `XMARK` へ / 保持をループへ | どれも exit 0 |
 | **本文だけ差し替えた同じ長さの新品 4 本** | **4 本とも exit 5** = 残骸の衝突ではなく内容依存 |
