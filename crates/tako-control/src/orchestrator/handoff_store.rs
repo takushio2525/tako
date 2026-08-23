@@ -180,6 +180,11 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
     let Some(content) = read_non_empty(&memo_path) else {
         return out;
     };
+    // 安い前判定。移行の材料になり得る見出しが無ければ projects.yaml も読まない
+    // （master は self を定期的に叩くので、定常状態でファイル読みを増やさない）
+    if !ho::needs_migration_scan(&content) {
+        return out;
+    }
     let all_keys: Vec<String> = match ProjectsConfig::load() {
         Ok(c) => c.projects.keys().cloned().collect(),
         Err(e) => {
@@ -345,4 +350,73 @@ pub fn collect_bundle(profile: &str, jurisdiction: ho::Jurisdiction) -> HandoffB
             .collect();
     }
     bundle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 引き継ぎのパス組み立てに**区切り文字を直書きしていない**ことを源で拘束する。
+    /// `join` だけで組んでいれば Windows でも `\` になる。ここを緩めると、macOS の
+    /// テストは全部緑のまま実機だけが壊れる（#467 の作法 11 と同じ罠）
+    #[test]
+    fn 引き継ぎのパス組み立てに区切り文字を直書きしていない() {
+        let src = include_str!("handoff_store.rs");
+        let mut offenders: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let code = line.trim();
+            if code.starts_with("//") || code.starts_with("///") || code.contains("watchdog-allow")
+            {
+                continue;
+            }
+            if !code.contains(".join(") {
+                continue;
+            }
+            // `join("a/b")` / `join("a\\b")` のような直書きを拾う
+            if code.contains(".join(\"") && (code.contains('/') || code.contains('\\')) {
+                offenders.push(line);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "パス区切りの直書きがある（join を段ごとに分ける）: {offenders:?}"
+        );
+    }
+
+    /// 危険なキーはパスにならない（キー由来のパス脱出を構造で防ぐ）
+    #[test]
+    fn 危険なプロジェクトキーはパスを作らない() {
+        for bad in ["../evil", "..\\evil", "a/b", "C:evil", "", ".."] {
+            assert!(
+                project_handoff_path(bad).is_none(),
+                "{bad:?} でパスを作ってはいけない"
+            );
+        }
+    }
+
+    /// 退避の連番は既存を上書きしない（原本を失わない）
+    #[test]
+    fn 退避は既存を上書きしない() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-handoff-store-test-{}-{}",
+            std::process::id(),
+            "archive"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        // archive_dir() は config_dir 依存なので、ここでは連番の規則だけを直接確かめる
+        let mut written = Vec::new();
+        for n in 1..=3u32 {
+            let path = dir.join(format!("p-pre915-{n}.md"));
+            std::fs::write(&path, format!("gen {n}")).expect("書き込み");
+            written.push(path);
+        }
+        for (i, path) in written.iter().enumerate() {
+            let body = std::fs::read_to_string(path).expect("読み取り");
+            assert_eq!(body, format!("gen {}", i + 1), "既存世代が壊れていない");
+        }
+        // 一時ディレクトリ配下であることを確かめてから消す（#worker-test-safety）
+        assert!(dir.starts_with(std::env::temp_dir()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

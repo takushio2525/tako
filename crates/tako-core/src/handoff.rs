@@ -746,6 +746,15 @@ impl MigrationPlan {
     }
 }
 
+/// 移行の走査が要るか（安い前判定）。
+///
+/// 移行の材料になり得るのは「節見出しでないトップレベル `##`」だけなので、それが 1 行も
+/// 無ければ projects.yaml の読み込みごと省ける。master は `tako_orchestrator_self` を
+/// 定期的に叩くため、定常状態の呼び出しでファイル読みを増やさないためのゲート
+pub fn needs_migration_scan(content: &str) -> bool {
+    content.lines().any(is_segment_boundary)
+}
+
 /// 旧形式（プロファイル単位の混在ファイル）をプロジェクト単位へ割る計画を立てる。
 ///
 /// `project_keys` は projects.yaml の全キー、`profile_projects` はそのプロファイルの

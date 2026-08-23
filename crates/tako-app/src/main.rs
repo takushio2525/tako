@@ -49257,6 +49257,41 @@ mod self_test {
                 if let Some(ref path) = memo_path {
                     let _ = std::fs::remove_file(path);
                 }
+                // #917 の測定準備: **分割する前**の master の矩形を控える。
+                // 交代の不変条件は「後任の close 後の矩形 == 前任が分割前に持っていた矩形」
+                let geom = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            app.workspace
+                                .active_tab()
+                                .tree()
+                                .layout(tako_core::Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 1000.0,
+                                    height: 800.0,
+                                })
+                                .into_iter()
+                                .map(|(p, r)| {
+                                    (
+                                        p.as_u64(),
+                                        format!(
+                                            "{:.1},{:.1},{:.1},{:.1}",
+                                            r.x, r.y, r.width, r.height
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .ok()
+                        .unwrap_or_default()
+                };
+                let before_geom = geom(cx);
+                let prev_rect = before_geom
+                    .iter()
+                    .find(|(p, _)| *p == prev.as_u64())
+                    .map(|(_, r)| r.clone());
+
                 let unresolved = run_handoff(None, cx);
                 match unresolved {
                     Some((res4, prompt4, successor4)) => {
@@ -49321,37 +49356,13 @@ mod self_test {
                 );
 
 
+
                 // #917: 交代後のレイアウトが交代前と一致する（「場所が入れ替わる」体験）。
                 // 後任は退役 master のペインを分割して作られるので、旧ペインを閉じた時点で
-                // 後任が旧ペインの矩形をそのまま継ぎ、周囲のペインは動かない
-                let geom = |cx: &mut AsyncApp| {
-                    window
-                        .update(cx, |app, _, _| {
-                            app.workspace
-                                .active_tab()
-                                .tree()
-                                .layout(tako_core::Rect {
-                                    x: 0.0,
-                                    y: 0.0,
-                                    width: 1000.0,
-                                    height: 800.0,
-                                })
-                                .into_iter()
-                                .map(|(p, r)| (p.as_u64(), format!("{:.1},{:.1},{:.1},{:.1}", r.x, r.y, r.width, r.height)))
-                                .collect::<Vec<_>>()
-                        })
-                        .ok()
-                        .unwrap_or_default()
-                };
-                // 直近の後任（= prev の兄弟）が prev の矩形を継ぐかを見る
+                // 後任が**分割前の**矩形をそのまま継ぎ、周囲のペインは動かない
                 let Some(&heir) = successors.last() else {
                     fail("#917: 後任のペインが無い")
                 };
-                let before_geom: Vec<(u64, String)> = geom(cx);
-                let prev_rect = before_geom
-                    .iter()
-                    .find(|(p, _)| *p == prev.as_u64())
-                    .map(|(_, r)| r.clone());
                 fire(
                     Req::Close {
                         pane: Some(prev.as_u64()),
