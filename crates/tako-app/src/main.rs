@@ -48589,13 +48589,40 @@ mod self_test {
                     })
                     .unwrap_or_default();
                 let joined = plan_lines.join("\n");
-                check(
+                // 期待値は**この環境の計画そのもの**から作る（#920）。unix の手順を
+                // リテラルで書くと Windows では原理的に満たせない（公式コマンドは
+                // `install.ps1` で置き場所の区切りは `\`）。`InstallRecipe` は
+                // `platform` を引数で受ける純粋関数なので、テストが OS を知る必要が無い
+                let recipe = tako_core::platform::agent_install::current_recipe(
+                    tako_core::platform::agent_install::AgentKind::Claude,
+                );
+                // 置き場所の表示は OS の区切りになるので `/` へ寄せてから突き合わせる
+                // （`launcher_rel` / `payload_rel` は両 OS で `/` 区切りの静的文字列）
+                let normalized = joined.replace('\\', "/");
+                let legacy920 = std::env::var_os("TAKO_920_LEGACY").is_some();
+                let facts_ok = if legacy920 {
+                    // `TAKO_920_LEGACY=1` で修正前（unix リテラル）へ戻せる
+                    // = 同一バイナリで A/B が取れる
                     joined.contains("claude.ai/install.sh")
                         && joined.contains(".local/bin/claude")
-                        && joined.contains("sudo"),
+                        && joined.contains("sudo")
+                } else {
+                    normalized.contains(recipe.source.url)
+                        && normalized.contains(recipe.launcher_rel)
+                        && normalized.contains(recipe.payload_rel)
+                        // 権限の説明。`sudo（管理者権限）は使いません` は
+                        // `InstallPlan::lines()` の固定行で、`管理者権限` は
+                        // プラットフォームに依らない語（`sudo` は unix 固有 = #925）
+                        && joined.contains("管理者権限")
+                };
+                check(
+                    facts_ok,
                     &format!(
-                        "119: install_plan が公式コマンド・置き場所・権限を含む (#868) lines={}",
-                        plan_lines.len()
+                        "119: install_plan が公式コマンド・置き場所・権限を含む (#868) \
+                         lines={} url={} launcher={} legacy={legacy920}",
+                        plan_lines.len(),
+                        recipe.source.url,
+                        recipe.launcher_rel
                     ),
                 );
 
