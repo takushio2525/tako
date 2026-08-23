@@ -98,3 +98,39 @@ fn stale検知がclaudeランチャと指紋を引ける() {
         "指紋が取れない = 版の張り直しを検知できない（#498 が無効）"
     );
 }
+
+/// #898 が **#899 の症状 2 を Windows で顕在化させる**ことの実測（#899 の受け入れ材料）。
+///
+/// スターター（#694）/ welcome バナー（#549）は
+/// `welcome::launch_command_line` の行をシェルへ書き込む。`shell_quote` の安全文字は
+/// `[A-Za-z0-9._-/]` なので、**Windows の絶対パスは `:` と `\` で「安全でない」判定**になり
+/// POSIX 形の `'…'` で囲まれる。PowerShell は引用符付き文字列を式として評価するので
+/// 実行されずそのまま表示される。
+///
+/// #898 の前は `resolve_tako_binary()` が裸の `tako` を返していたので囲まれなかった
+/// （PATH 依存で「たまたま動く」形）。**観測される最終結果は変わらない**: #899 の症状 1
+/// （行末が LF なので PSReadLine が継続行にして確定しない。#897 で実測）により、
+/// この行はどちらにせよ Windows では実行されない。
+///
+/// このテストは値を**記録する**のが目的なので、行が実体パスを含むことだけを見る。
+/// クォートと行末の是正は #899（`ShellDialect::program()` 経由へ寄せる）の担当
+#[test]
+#[ignore = "解決結果がそのマシンの導入状況に依存する（実機 e2e）"]
+fn スターターへ書き込む行の実測() {
+    let bin = tako_control::dispatch::resolve_tako_binary();
+    let line = tako_control::welcome::launch_command_line("master");
+    println!("resolve_tako_binary -> {bin}");
+    println!("launch_command_line(\"master\") -> {line}");
+    println!(
+        "  POSIX クォートで囲まれているか: {}",
+        line.starts_with('\'')
+    );
+    assert!(
+        line.contains(bin.trim_matches('\'')),
+        "実体パスが行に入っていない: {line}"
+    );
+    assert!(
+        line.ends_with(" master"),
+        "サブコマンドが付いていない: {line}"
+    );
+}
