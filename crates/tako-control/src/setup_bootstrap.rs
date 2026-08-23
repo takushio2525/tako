@@ -671,28 +671,59 @@ mod tests {
     /// 受け入れ条件 4: 実行前に「何をどこに入れるか」が必ず出ること
     #[test]
     fn 導入計画は何をどこに入れるかを必ず含む() {
-        let r = agent_install::recipe(
-            tako_core::platform::support::Platform::MacOs,
-            AgentKind::Claude,
-        );
+        use tako_core::platform::support::Platform;
+        // **両プラットフォームぶんを macOS から検証する**（#515 / #920）。
+        // リテラルを書かず「その計画の中身が行に出ているか」を見るので、
+        // 手順が変わってもテストがずれない
         let home = Path::new("/tmp/h");
-        let plan = InstallPlan {
-            agent: r.agent.as_str(),
-            official_command: r.source.official_command.to_string(),
-            source_url: r.source.url.to_string(),
-            launcher: r.launcher_path_in(home),
-            payload: r.payload_dir_in(home),
-            auto_updates: r.auto_updates,
-            can_run: r.tako_can_run,
-        };
-        let lines = plan.lines().join("\n");
-        assert!(lines.contains("curl -fsSL https://claude.ai/install.sh | bash"));
-        assert!(lines.contains(".local/bin/claude"), "置き場所が出ていない");
-        assert!(lines.contains(".local/share/claude/versions"));
-        assert!(lines.contains("sudo"), "権限の説明が無い");
-        let json = plan.to_json();
-        assert_eq!(json["can_run"], true);
-        assert!(json["lines"].as_array().is_some_and(|a| a.len() >= 5));
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let r = agent_install::recipe(platform, AgentKind::Claude);
+            let plan = InstallPlan {
+                agent: r.agent.as_str(),
+                official_command: r.source.official_command.to_string(),
+                source_url: r.source.url.to_string(),
+                launcher: r.launcher_path_in(home),
+                payload: r.payload_dir_in(home),
+                auto_updates: r.auto_updates,
+                can_run: r.tako_can_run,
+            };
+            // 置き場所の表示は**実行中の OS** の区切りになる（`launcher_path_in` は
+            // `PathBuf`）。`launcher_rel` / `payload_rel` は `/` 区切りの静的文字列なので
+            // 突き合わせる前に寄せる。これを忘れると Windows でだけ落ちる（#920 の原因）
+            let lines = plan.lines().join("\n").replace('\\', "/");
+            assert!(
+                lines.contains(r.source.official_command),
+                "{platform:?}: 公式コマンドが出ていない: {lines}"
+            );
+            assert!(
+                lines.contains(r.launcher_rel),
+                "{platform:?}: 置き場所が出ていない: {lines}"
+            );
+            assert!(
+                lines.contains(r.payload_rel),
+                "{platform:?}: 本体の置き場所が出ていない: {lines}"
+            );
+            assert!(
+                lines.contains("管理者権限"),
+                "{platform:?}: 権限の説明が無い: {lines}"
+            );
+            // **他方の手順が混ざっていない**（計画がプラットフォームに依らなくなる
+            // 退行の検出。`install.sh` と `install.ps1` は互いに排他）
+            let other = agent_install::recipe(
+                match platform {
+                    Platform::MacOs => Platform::Windows,
+                    Platform::Windows => Platform::MacOs,
+                },
+                AgentKind::Claude,
+            );
+            assert!(
+                !lines.contains(other.source.official_command),
+                "{platform:?}: 別プラットフォームの手順が混ざっている: {lines}"
+            );
+            let json = plan.to_json();
+            assert_eq!(json["can_run"], r.tako_can_run);
+            assert!(json["lines"].as_array().is_some_and(|a| a.len() >= 5));
+        }
     }
 
     /// Windows では「代行しない」ことが計画に出て、実行は具体的な案内つきで断られる
