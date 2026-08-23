@@ -4544,11 +4544,8 @@ fn dispatch_inner(
         // 移行はファイル操作だけで完結する（GUI の状態に触らない）。
         // GUI が壊れた設定で起動できない状況でも CLI から同じ経路が使えることが本質
         Request::Migrate { action, schema } => {
-            return crate::migrations::report_json(
-                action.as_deref().unwrap_or("status"),
-                schema.as_deref(),
-            )
-            .map_err(DispatchError::InvalidParams);
+            crate::migrations::report_json(action.as_deref().unwrap_or("status"), schema.as_deref())
+                .map_err(DispatchError::InvalidParams)
         }
         Request::Welcome { action } => {
             let action = action.as_deref().unwrap_or("status");
@@ -7889,7 +7886,17 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchE
         let content = std::fs::read_to_string(&path).map_err(|e| {
             DispatchError::Operation(format!("{} の読み取りに失敗: {e}", path.display()))
         })?;
-        serde_json::from_str(&content).unwrap_or_default()
+        // **既定値へ落として書き戻してはいけない**（#916）: ここは claude 自身の
+        // 設定ファイル（`~/.claude.json` / `.mcp.json`）で、空 map から書き直すと
+        // 利用者の MCP 登録・信頼済みフォルダ・履歴がまとめて消える。
+        // 読めないなら手を出さず理由を返す（旧実装は unwrap_or_default で全消しだった）
+        serde_json::from_str(&content).map_err(|e| {
+            DispatchError::Operation(format!(
+                "{} を JSON として解釈できないので書き換えを中止した（{e}）。\
+                 内容を直すか退避してからやり直してください",
+                path.display()
+            ))
+        })?
     } else {
         serde_json::Map::new()
     };

@@ -225,7 +225,10 @@ pub fn plan(
         }
     }
     if at != target {
-        return Err(PlanError::Overshoot { reached: at, target });
+        return Err(PlanError::Overshoot {
+            reached: at,
+            target,
+        });
     }
     Ok(out)
 }
@@ -352,6 +355,12 @@ impl MigrationReport {
     /// GUI / CLI の一言通知（何も起きていなければ None）。
     /// **移行したことを黙らない**ための唯一の文言生成口
     pub fn notice(&self) -> Option<String> {
+        self.notice_for(true)
+    }
+
+    /// [`notice`](Self::notice) の一般形。`applied = false`（見るだけ）のときは
+    /// 「これから移行する」の言い回しにする（済んだことのように見せない）
+    pub fn notice_for(&self, applied: bool) -> Option<String> {
         let migrated = self.changed_count();
         let attention = self.attention().count();
         if migrated == 0 && attention == 0 {
@@ -359,11 +368,12 @@ impl MigrationReport {
         }
         let mut parts = Vec::new();
         if migrated > 0 {
-            parts.push(
+            let note = if applied {
                 NOTICE_MIGRATED
-                    .text()
-                    .replace("{n}", &migrated.to_string()),
-            );
+            } else {
+                NOTICE_PENDING
+            };
+            parts.push(note.text().replace("{n}", &migrated.to_string()));
         }
         if attention > 0 {
             parts.push(
@@ -379,6 +389,10 @@ impl MigrationReport {
 const NOTICE_MIGRATED: Note = Note::new(
     "設定ファイル {n} 件を新しい形式へ自動移行しました（旧内容は .bak へ退避）",
     "Automatically migrated {n} config file(s) to the new format (old contents kept as .bak)",
+);
+const NOTICE_PENDING: Note = Note::new(
+    "設定ファイル {n} 件が旧形式です（tako migrate run で移行します）",
+    "{n} config file(s) are in an older format (run `tako migrate run` to migrate)",
 );
 const NOTICE_ATTENTION: Note = Note::new(
     "設定ファイル {n} 件は読めなかったので退避しました（tako migrate status で確認できます）",
@@ -558,7 +572,8 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
     if let Some(validate) = spec.validate {
         if let Err(reason) = validate(&text) {
             // 読めないものは移行しない。**捨てずに退避**して人へ申告する
-            let quarantine = quarantine_unreadable(path, io).unwrap_or_else(|| quarantine_path(path));
+            let quarantine =
+                quarantine_unreadable(path, io).unwrap_or_else(|| quarantine_path(path));
             return FileOutcome::Unreadable { quarantine, reason };
         }
     }
@@ -599,7 +614,10 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
     }
     if let Err(e) = io.write(path, &body) {
         return FileOutcome::Failed {
-            reason: format!("書き込みに失敗: {e}（旧内容は {} に残る）", backup.display()),
+            reason: format!(
+                "書き込みに失敗: {e}（旧内容は {} に残る）",
+                backup.display()
+            ),
         };
     }
     FileOutcome::Migrated {
@@ -860,10 +878,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "tako-migration-{}-{}-{tag}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("t").replace(
-                |c: char| !c.is_ascii_alphanumeric(),
-                "_"
-            )
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
@@ -896,7 +914,12 @@ mod tests {
         std::fs::write(&path, "x").expect("書ける");
         let report = migrate_file(&SPEC_V3, &path, &FsIo);
         match &report.outcome {
-            FileOutcome::Migrated { from, to, backup, applied } => {
+            FileOutcome::Migrated {
+                from,
+                to,
+                backup,
+                applied,
+            } => {
                 assert_eq!((*from, *to), (1, 3));
                 assert_eq!(applied.len(), 2);
                 assert_eq!(
@@ -920,7 +943,10 @@ mod tests {
         assert!(migrate_file(&SPEC_V3, &path, &FsIo).outcome.changed());
         let after_first = std::fs::read_to_string(&path).expect("読める");
         let second = migrate_file(&SPEC_V3, &path, &FsIo);
-        assert!(!second.outcome.changed(), "2 回目は書き換えない: {second:?}");
+        assert!(
+            !second.outcome.changed(),
+            "2 回目は書き換えない: {second:?}"
+        );
         assert_eq!(std::fs::read_to_string(&path).expect("読める"), after_first);
         assert_eq!(
             std::fs::read_to_string(backup_path(&path, 1)).expect("退避が読める"),
@@ -951,7 +977,10 @@ mod tests {
         let dir = temp_dir("once");
         let path = dir.join("default.yaml");
         std::fs::write(&path, "x").expect("書ける");
-        assert!(migrate_file(&SPEC, &path, &FsIo).outcome.changed(), "1 回目は当たる");
+        assert!(
+            migrate_file(&SPEC, &path, &FsIo).outcome.changed(),
+            "1 回目は当たる"
+        );
         // 利用者が旧い形へ意図して戻した
         std::fs::write(&path, "x").expect("書ける");
         let report = migrate_file(&SPEC, &path, &FsIo);
@@ -977,7 +1006,10 @@ mod tests {
         let path = dir.join("settings.json");
         std::fs::write(&path, "x").expect("書ける");
         let report = migrate_file(&SPEC, &path, &FsIo);
-        assert!(matches!(report.outcome, FileOutcome::Refused { .. }), "{report:?}");
+        assert!(
+            matches!(report.outcome, FileOutcome::Refused { .. }),
+            "{report:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("読める"),
             "x",
@@ -1008,7 +1040,10 @@ mod tests {
         let path = dir.join("settings.json");
         std::fs::write(&path, "もとの内容").expect("書ける");
         let report = migrate_file(&SPEC, &path, &FsIo);
-        assert!(matches!(report.outcome, FileOutcome::Failed { .. }), "{report:?}");
+        assert!(
+            matches!(report.outcome, FileOutcome::Failed { .. }),
+            "{report:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("読める"),
             "もとの内容"

@@ -179,10 +179,7 @@ fn strip_legacy_default_model(text: &str) -> Result<Option<String>, String> {
         })
     };
     if text.lines().any(is_legacy_model_line) {
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| !is_legacy_model_line(l))
-            .collect();
+        let kept: Vec<&str> = text.lines().filter(|l| !is_legacy_model_line(l)).collect();
         let mut out = kept.join("\n");
         out.push('\n');
         // 行を抜いた結果が読めるならそれを採る（コメント・書式を最大限保つ）
@@ -210,10 +207,7 @@ const PROFILE_STEPS: &[Step] = &[Step {
 // --- 登録簿 ------------------------------------------------------------------
 
 /// 版数フィールドを持たず移行手順もまだ無い種別の宣言（番地だけ切る）
-const fn pristine(
-    id: SchemaId,
-    validate: Option<migration::Validator>,
-) -> SchemaSpec {
+const fn pristine(id: SchemaId, validate: Option<migration::Validator>) -> SchemaSpec {
     SchemaSpec {
         id,
         target_version: 1,
@@ -225,10 +219,7 @@ const fn pristine(
 }
 
 /// 版数フィールドを持つが移行手順はまだ無い種別（将来の bump をここで受ける）
-const fn versioned(
-    id: SchemaId,
-    validate: Option<migration::Validator>,
-) -> SchemaSpec {
+const fn versioned(id: SchemaId, validate: Option<migration::Validator>) -> SchemaSpec {
     SchemaSpec {
         id,
         target_version: 1,
@@ -271,7 +262,10 @@ pub const SPECS: &[SchemaSpec] = &[
     // 引き継ぎは Markdown なので形式の決まりが無い。プロジェクト単位化（#915）は
     // ここへ Step を足す形で載る
     pristine(SchemaId::Handoff, None),
-    versioned(SchemaId::DiscoveryInstance, Some(validate_discovery_instance)),
+    versioned(
+        SchemaId::DiscoveryInstance,
+        Some(validate_discovery_instance),
+    ),
     pristine(SchemaId::RemoteDevices, Some(validate_remote_devices)),
 ];
 
@@ -287,9 +281,7 @@ pub fn spec(id: SchemaId) -> Option<&'static SchemaSpec> {
 pub fn targets(id: SchemaId) -> Vec<PathBuf> {
     let data = tako_core::paths::data_dir();
     let single = |rel: &str| -> Vec<PathBuf> {
-        data.as_ref()
-            .map(|d| vec![d.join(rel)])
-            .unwrap_or_default()
+        data.as_ref().map(|d| vec![d.join(rel)]).unwrap_or_default()
     };
     match id {
         SchemaId::Settings => crate::settings::settings_path().into_iter().collect(),
@@ -373,8 +365,7 @@ impl MigrationIo for ConfigIo {
     }
 
     fn write(&self, path: &Path, text: &str) -> std::io::Result<()> {
-        crate::config_io::atomic_write(path, text)
-            .map_err(std::io::Error::other)
+        crate::config_io::atomic_write(path, text).map_err(std::io::Error::other)
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -470,7 +461,6 @@ fn pending_notes(spec: &SchemaSpec, from: u32) -> Vec<Note> {
         .unwrap_or_default()
 }
 
-
 /// この プロセスで実行時発火を済ませたか。移行は冪等なので**1 プロセス 1 回**でよく、
 /// dispatch のような頻繁な経路から呼ばれても全設定ファイルを読み直さない
 static RUNTIME_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -508,7 +498,9 @@ pub fn setup_lines() -> Vec<String> {
     let mut lines = Vec::new();
     for file in &report.files {
         match &file.outcome {
-            FileOutcome::Migrated { backup, applied, .. } => {
+            FileOutcome::Migrated {
+                backup, applied, ..
+            } => {
                 for note in applied {
                     lines.push(format!("{}: {}", file.path.display(), note.text()));
                 }
@@ -535,11 +527,7 @@ pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value
     let mode = match action {
         "status" | "check" => Mode::Check,
         "run" | "apply" => Mode::Apply,
-        other => {
-            return Err(format!(
-                "不明な action: {other}（status | run）"
-            ))
-        }
+        other => return Err(format!("不明な action: {other}（status | run）")),
     };
     let only = match only {
         None => None,
@@ -560,7 +548,7 @@ pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value
         "applied": mode == Mode::Apply,
         "migrated": report.changed_count(),
         "needs_attention": report.attention().count(),
-        "notice": report.notice(),
+        "notice": report.notice_for(mode == Mode::Apply),
         "files": report
             .files
             .iter()
@@ -622,14 +610,12 @@ fn record(report: &MigrationReport, origin: &str) {
                 file.path.display(),
                 backup.display()
             )),
-            FileOutcome::Unreadable { quarantine, reason } => {
-                crate::diag::persist_log(&format!(
-                    "移行できず退避: {} {}（{reason}・退避 {}・発生源 {origin}）",
-                    file.id.as_str(),
-                    file.path.display(),
-                    quarantine.display()
-                ))
-            }
+            FileOutcome::Unreadable { quarantine, reason } => crate::diag::persist_log(&format!(
+                "移行できず退避: {} {}（{reason}・退避 {}・発生源 {origin}）",
+                file.id.as_str(),
+                file.path.display(),
+                quarantine.display()
+            )),
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
                 crate::diag::persist_log(&format!(
                     "移行を中止: {} {}（{reason}・発生源 {origin}）",
@@ -760,7 +746,8 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tako-migrations-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tako-migrations-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
         dir

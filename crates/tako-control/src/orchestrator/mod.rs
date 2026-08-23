@@ -75,11 +75,31 @@ pub fn render_conflict_prompt(template: &str, vars: &ConflictPromptVars) -> Stri
 
 /// テスト専用: config_dir() の返り先を隔離ディレクトリへ差し替える。
 /// テストが実運用の projects.yaml / profiles / config.yaml に書き込み、
-/// 世代バックアップをテスト由来の内容で汚染するのを防ぐ（#169）
+/// 世代バックアップをテスト由来の内容で汚染するのを防ぐ（#169）。
+///
+/// **初期化は [`config_dir`] 側で必ず行う**（#916）。以前はこれを初期化する
+/// ヘルパー（`with_test_project`）を通ったテストだけが隔離され、通らないテストは
+/// 本番へ書いていた。しかも `OnceLock` なので**テストの実行順で結果が変わる**
+/// （先に隔離するテストが走れば無害、そうでなければ本番が汚れる）。実測では
+/// 本番の profiles/ に `_tako_822_set_.yaml`・solo-profiles/ に
+/// `_tako_822_solo_.yaml` が残っていた
 #[cfg(test)]
 pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf> {
     static OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     &OVERRIDE
+}
+
+/// テストの隔離先（プロセスごとに 1 つ）。[`config_dir`] が必ずここへ倒す
+#[cfg(test)]
+fn test_config_dir() -> PathBuf {
+    test_config_dir_override()
+        .get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("tako-test-orchestrator-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+        .clone()
 }
 
 /// オーケストレーター設定ディレクトリのパス。
@@ -88,10 +108,16 @@ pub(crate) fn test_config_dir_override() -> &'static std::sync::OnceLock<PathBuf
 /// data_dir を本番のまま使うため、これが無いと projects.yaml / ledger.yaml へ
 /// 検証用のエントリが混ざる）
 pub fn config_dir() -> Option<PathBuf> {
+    // テストは**常に**隔離先へ倒す（本番の設定を触る経路をテストビルドから消す）
     #[cfg(test)]
-    if let Some(dir) = test_config_dir_override().get() {
-        return Some(dir.clone());
-    }
+    return Some(test_config_dir());
+    #[cfg(not(test))]
+    config_dir_live()
+}
+
+/// 本番のオーケストレーター設定ディレクトリ解決（[`config_dir`] の本体）
+#[cfg(not(test))]
+fn config_dir_live() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TAKO_ORCHESTRATOR_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
