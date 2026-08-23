@@ -50257,6 +50257,76 @@ mod self_test {
                     ),
                 );
 
+                // (h) **メニューから通知までの GUI 経路が繋がっている**（#919 要件 1）。
+                //
+                // 実ホストへは繋がない（CI でも回すので）。代わりに **RFC 2606 で
+                // 予約された `.invalid`** を選ぶ = 名前解決に必ず失敗するので、
+                // 「アクションでパレットが開く → ホストを選ぶと接続を試みる →
+                // 失敗すると理由が通知へ出る」が決定的に測れる。
+                // ここが繋がっていないと、CLI / MCP は動くのに GUI だけ無反応になる
+                // （#496 で実際に起きた「on_click が一度も発火しない」型の事故）
+                let (palette_opened, host_items) = window
+                    .update(cx, |app, _, cx| {
+                        app.remote_notice = None;
+                        app.open_remote_folder_palette(cx);
+                        let opened = matches!(
+                            app.command_palette.as_ref().map(|p| &p.mode),
+                            Some(PaletteMode::RemoteFolderHost(_))
+                        );
+                        let items = app
+                            .palette_items("")
+                            .iter()
+                            .filter(|i| matches!(i, PaletteItem::RemoteFolderHost(_)))
+                            .count();
+                        (opened, items)
+                    })
+                    .unwrap_or((false, 0));
+                // `~/.ssh/config` に Host が無い環境ではパレットの代わりに理由が出る
+                let no_hosts_notice = window
+                    .update(cx, |app, _, _| {
+                        app.remote_notice.as_ref().map(|n| n.text.clone())
+                    })
+                    .unwrap_or_default();
+                check(
+                    (palette_opened && host_items > 0)
+                        || no_hosts_notice.as_deref()
+                            == Some(crate::ui_text::remote_folder::no_hosts()),
+                    &format!(
+                        "リモートフォルダのホスト選択が開く（Host が無ければ理由が出る）                          (#919。opened={palette_opened} hosts={host_items}                          notice={no_hosts_notice:?})"
+                    ),
+                );
+
+                let (notice_is_error, notice_lines, palette_closed) = window
+                    .update(cx, |app, _, cx| {
+                        app.command_palette = None;
+                        app.remote_notice = None;
+                        // 解決できないホストを選ぶ = 接続の失敗が必ず起きる
+                        app.palette_execute(
+                            PaletteItem::RemoteFolderHost(tako_core::ssh_config::SshHost {
+                                name: "tako-selftest-no-such-host.invalid".into(),
+                                hostname: None,
+                                user: None,
+                                port: None,
+                            }),
+                            cx,
+                        );
+                        let n = app.remote_notice.as_ref();
+                        (
+                            n.map(|n| n.is_error).unwrap_or(false),
+                            n.map(|n| n.text.clone()).unwrap_or_default(),
+                            app.command_palette.is_none(),
+                        )
+                    })
+                    .unwrap_or((false, String::new(), false));
+                check(
+                    notice_is_error
+                        && notice_lines.contains("tako-selftest-no-such-host.invalid")
+                        && palette_closed,
+                    &format!(
+                        "解決できないホストを選ぶと理由が通知へ出る                          (#919。is_error={notice_is_error} closed={palette_closed}                          notice={notice_lines:?})"
+                    ),
+                );
+
                 // 後片付け: 以後の項目へ持ち越さない
                 let _ = window.update(cx, |app, _, cx| {
                     app.filetree.remove_remote_root(&root);
