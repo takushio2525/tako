@@ -46,6 +46,10 @@ tako/
 - **cmux（GPL-3.0）のソースコードを読まない・参照しない・移植しない**。設計思想のみ参考可（`.agent/concept.md`）
 - ペイン内容・送信テキスト・`TAKO_TOKEN` を**診断ログ**（persist.log / perf.log / stderr）に出さない
   （ペインログ機能 FR-5.13 はユーザー管理のローカルデータとして明示の例外。`.agent/requirements.md`）
+- **実ユーザー名・実ホームパス・実ホスト名を現行コードへ置かない（#927）**。public リポなので、
+  実機の採取物（ペインの capture・PowerShell のプロンプト行・`HOME` の値・claude TUI の cwd 行）は
+  貼る前にプレースホルダ（`testuser` / `winuser` / `山田` 等）へ置換する。番犬は
+  `crates/tako-control/tests/no_personal_data.rs`、書き方は `.agent/conventions.md`
 
 ## 機能実装時の必須ルール（開発不変条件）
 
