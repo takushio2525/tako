@@ -2757,3 +2757,26 @@
   （器の拒否でペインが消えたときに疑似 TUI 側を疑わせない）
 - 次の壁は **#913 へ起票**（項目 116 = #835。`self_test::file_url` と
   `open_files::file_url_to_path` が**両方 POSIX パス前提** = 器とも符号化とも無関係）
+
+## 2026-08-24（#919 / #65: リモートからフォルダを開く + 接続失敗の無言化を根治）
+- 無言失敗の正体を実測で確定: `ssh` を素のペインのプログラムにしていたため ①到達不能は
+  **1 秒でタブごと消えて理由が残らない** ②タイムアウトは **25 秒間画面が完全に空**
+  （= 「何も入力できない」）。happy path は正常だった。`ssh_pane_script` で包み
+  接続前バナー + `ConnectTimeout=10` + **exit 255 だけ**理由 + 次の一手で入力待ち
+- 機能側: ファイルメニュー / ⌘K → ホスト選択 → フォルダ選択 → ファイルツリーへ。
+  プレビューは SFTP で落として既存スタック再利用（**段階 1 = 読み取り専用**）。
+  CLI `tako remote-folder` / MCP `tako_remote_folder`（138 ツール）で 1:1
+- バックエンドは **システムの ssh / sftp + ControlMaster**（russh / ssh2 は
+  ControlMaster に相乗りできないので却下 = #65 の宿題への回答）。`sftp -b -` なので
+  相手が PowerShell でも同じ経路。対話ペインも同じ ControlPath を通る
+- 実測で直した罠: `-o ControlPath=<空白入り>` は OpenSSH が空白で切る（macOS の
+  既定 data_dir で必ず踏む。#833 と同型）/ `close` がタブ単位で空振り / 再起動後に
+  ツリーが閉じていて読み込みが進まない / 失敗の 3 行が横に切れて読めない
+- 検証: fmt / clippy（両 feature）/ test --workspace / 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 122 新設）/ visual-test 98 checkpoint が main と
+  完全一致 + `remote-tree` 節新設 / Windows クロスチェックの警告リストが main と一致 /
+  実 SSH 先 2 台（Linux・Windows）で通し。検出力は 3 通りの revert で FAILED を実測
+- 関連: `.agent/plans/2026-08-remote-folder.md`（設計・実測・罠・未検証を全部ここに）
+- 次: Windows 実機での実測（マトリクスは Pending / issue 919）・パスワード認証のみの
+  相手での通し・段階 2（SFTP put による書き戻し）
+

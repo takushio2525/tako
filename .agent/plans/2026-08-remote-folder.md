@@ -1,0 +1,150 @@
+# リモートからフォルダを開く（#919 / #65）— 設計と実測の記録
+
+> 2026-08-24。`feat/919-open-remote-folder` の作業記録。
+> 仕様の正は `.agent/requirements.md` FR-3.24 / FR-3.24.1。使い方は `AGENTS.md` のコマンド表。
+
+## 1. 出発点: ユーザー報告の正体
+
+> 今，ファイルから，リモート接続ってとこ押して出てきたタブ，なんか何も入力できないけどそういうもん？
+
+**当たりはユーザーの追加観察のほう**（「接続失敗しても何も出てこない」）だった。
+現行「リモート接続…」は `ssh` を**素のペインのプログラム**にしていたため:
+
+| ケース | before の実測 |
+|---|---|
+| 到達不能（名前解決できない） | `open-in remote` は tab/pane を返すが **1 秒後にはタブごと消えている**（`tabs=['1'] panes=[]`）。`Could not resolve hostname` はどこにも残らない |
+| タイムアウト（TCP ブラックホール） | タブは残るが **25 秒間画面に文字が 1 つも無い**。ssh の既定 `ConnectTimeout` は約 75 秒 = 「何も入力できない」の正体 |
+| 認証失敗 | `password:` プロンプトのみ（鍵認証が落ちたことは分からない） |
+| **happy path** | **正常**（PowerShell プロンプトが出て `send` も通る）= ここは壊れていなかった |
+
+再現手順（隔離のみ・本番に触れない）は `/tmp/tako919-before2.sh` 相当:
+`TAKO_ISOLATED=1` の tako-app を起こし、`tako open-in remote <host>` のあと
+`tako list` でタブの生死、`tako read --pane N` で画面の非空行数を数える。
+**「非空行数 0」を明示的に判定する**のが要点（`read` が空文字を返すのを
+「読めなかった」と読み間違えると原因を取り違える）。
+
+## 2. バックエンドの選定（#65 の宿題への回答）
+
+3 案を比較して **システムの `ssh` / `sftp` + ControlMaster** を採った。
+
+| 案 | 認証の再利用 | 依存 | Windows | 判定 |
+|---|---|---|---|---|
+| システムの ssh / sftp | `~/.ssh/config` / 鍵 / agent / known_hosts / 2FA / FIDO / ProxyJump / **ControlMaster** をそのまま | なし（OS 同梱） | 10 以降が OpenSSH クライアント同梱 | **採用** |
+| russh | 自前で作り直し。**ControlMaster には相乗りできない** | pure Rust | ○ | 却下 |
+| ssh2（libssh2） | 同上 | libssh2 + OpenSSL の C 依存 | クロスビルドが重い（#467） | 却下 |
+
+決め手は #919 要件 6 / #65 要件 1 の「**ControlMaster 共有で追加認証なし**」。
+ControlMaster は OpenSSH クライアント間の私的な多重化なので、crate からは原理的に
+相乗りできない。crate を採ると「ユーザーが `ssh <host>` で入れる先に tako だけ
+入れない」状態が残る。`git.rs` / `tmux.rs` が CLI を子プロセスで呼ぶのと同じ構え。
+
+**FUSE マウントには逃げていない**（#65 の方針）。tako が SFTP プロトコルを話す
+クライアントを駆動し、ツリー・プレビュー・キャッシュを自分で持つ。
+
+## 3. 実測で決めた仕様（推測でなく計測）
+
+すべて OpenSSH 10.2p1 / macOS 26 と、実ホスト 2 台（Linux = `cloud-computing-class`、
+Windows 11 + PowerShell = `win`）で確かめた。
+
+- **`sftp -b -` はログインシェルに依存しない**: `win` の既定シェルは PowerShell だが
+  `ls -la` / `get` がそのまま通る。Windows のドライブは `/C:/Users/...` の形で見える
+- **ControlMaster は `sftp` では作られない**: `-o ControlMaster=auto` を渡しても
+  ソケットができない。**明示的に `ssh -M -N -f`** で張ると以後 `sftp` が相乗りする
+  （0.603s vs 1.102s。速さより **再認証が起きない**ことが本題）
+- **`-o ControlPath=<空白入り>` は OpenSSH の設定パーサが空白で切る** →
+  `keyword controlpath extra arguments at end of line` で全操作が失敗する。
+  macOS の既定 data_dir は `Application Support` を含むので**既定構成で必ず踏む**
+  （#833 と同型）。値を二重引用符で包めば通る
+- **sftp は二重引用符の中で glob 展開をしない**: `ls "…/.b*"` は `.b*` を literal と
+  して扱い not found。空白・`*`・`?`・`[` 入りのパスは引用だけで安全に渡せる
+- **`ls -l` をファイルに掛けるとフルパスが返る**（nlink は `?`）。ディレクトリなら
+  basename。**Windows は owner / group が `-`、権限部が `*`、名前に空白が入る**
+  （`Application Data`）→ 列を自前で辿って末尾を名前にする
+- **`-q` でも `sftp> <cmd>` のエコーは消えない** → 剥がしてから解析する
+- **symlink の実体判定は末尾スラッシュで効く**: `ls -1 <link>/` はディレクトリなら
+  中身、ファイルなら `Can't ls: … not found`（バッチへ `-` 前置でまとめて投げる）
+- **ssh 自身の失敗は exit 255**（man 記載）。リモートシェルの `exit 1` と区別できる
+
+## 4. 静かな失敗を作らない構造
+
+- `RemoteError`（13 種別）が**日英で**「何が起きたか」「次に何をすべきか」を持つ。
+  握り潰しても空にならないことを、全種別 × 両言語の総当たりテストで固定
+- ツリーの読み込み失敗は**行として**出る（`RowNote::Error`。3 行を折り返して出す）
+- 接続・一覧の失敗はサイドバー上部の通知へ。**失敗は自動で消さない**（成功は 8 秒）
+- SSH ペインは `ssh_pane_script` で包み、接続前バナー + `ConnectTimeout=10` +
+  exit 255 のときだけ理由を出して入力待ち（成功して `exit` したら従来どおり閉じる）
+- 「読んでいない」を「失敗」と混同しない: `sidebar_closed` / `not_displayed` /
+  `pending` / `loading` / `loaded` / `error: <理由>` を状態として区別する
+
+## 5. 段階の切り方
+
+- **段階 1（この Issue）**: 閲覧 + プレビュー。**編集は構造的に禁じる**
+  （本体は `<data_dir>/remote-cache/` のローカルな写しなので、止めないと
+  「保存できた気になる」= リモートには何も書かれない）
+- **段階 2（別 Issue）**: 書き戻し（SFTP put）。ヘッダの「読み取り専用」表示と
+  `set_preview_editing_local` のガードを外す形になる
+- リモートツリーの**ポーリングはしない**（展開したときだけ読む）。ネットワーク I/O を
+  毎秒叩かないため。手動の再読み込みは右クリックから
+
+## 6. この機での検証手段（画面が撮れない）
+
+clamshell 閉 + 画面 OFF なので `screencapture` は**全面黒しか撮れない**（#828 の既知）。
+代わりに:
+
+- **セルフテスト項目 122**: 実 render でツリーの器を検査（ネットワーク非依存）。
+  (a) ルート行 + 読み込み中 (b) 中身の行が**全部 remote 印を持つ**（ローカル FS の
+  経路へ落ちない）(c) 失敗が理由つきの行 (d) 空ディレクトリ (e) 通知の期限
+  (f) フォルダ選択がフォルダだけ並べる (g) **リモートは編集できずローカルは編集できる**
+- **visual-test の `remote-tree` 節**: 実ピクセル。`changed` / `red_before` /
+  `red_after` を出し、`TAKO_VISUAL_DUMP=<path>` でサイドバーを切り出して**目視できる**
+- **`remote_fs_e2e --ignored`**: 実 SSH 先との通し（`TAKO_REMOTE_E2E_HOST=<host>`）
+
+### 検出力の実測（3 通りの revert で FAILED を確認）
+
+| 壊した箇所 | 落ちる検査 | 出た値 |
+|---|---|---|
+| 読み取り専用ガードを外す | 122 (g) | `blocked=false` |
+| 失敗を行として出さない | 122 (c) | `rows=0 reason=false` |
+| リモート行の `remote` 印を落とす | 122 (b) | `all_remote=false` |
+
+## 7. after の実測（受け入れの証拠）
+
+- **無言失敗の解消**: 到達不能 = タブが残り 7 行の理由 / タイムアウト = t=2s で
+  「接続しています…」・10 秒で理由 / 認証失敗 = 「先に SSH ペインでログイン」まで案内
+- **フォルダを開く**: `win:/C:/Users/<user>/dev` を開いて 117 件、`pending` →
+  `loaded` が約 2 秒。Linux ホスト（`/` = symlink 混在）も同様
+- **SSH ペイン導線**: `cd "C:/Users/<user>/dev"` が実行され PowerShell が移動
+  （`shell_path` が `/C:/…` の先頭スラッシュを落とす）
+- **MCP 1:1**: 138 ツール。`open` / `ls` / `list` / `open-file`（`read_only: true`）/
+  `ssh-pane` / `close` すべて実行。失敗は `isError` + 理由つき
+- **永続化**: layout.json に `remote_folders` が載り、再起動後に自動で読み込まれる
+- **回帰なし**: visual-test 98 checkpoint が main と**完全一致**（差は md の load ms のみ）
+
+## 8. 踏んだ罠（後続への申し送り）
+
+- **`s.index('"close" => {')` のような索引置換は同名の match アームを壊す**。
+  1 回やって無関係な箇所を破壊した（`git checkout` で復旧）。**一意なアンカー**
+  （前後 2 行つき）で置換し、`git diff --stat` で行数を必ず確認する
+- **`#[cfg(...)]` の直下へ関数を挿すと属性が新しい関数へ移る**。visual-test の
+  ヘルパが「見つからない」になったのはこれ。挿入後は**両方の feature でビルド**する
+- **セルフテストは「先に別の理由で落ちる」形になりやすい**。項目 122 (g) は最初
+  「プレビューペインではない」で落ちていて、ガードを外しても通る = 検出力ゼロだった。
+  **対照（ローカルなら編集できる）を同じテストに入れる**と気づける
+- **実測から採った fixture には相手のユーザー名がそのまま入る**。`ls -la` の出力を
+  そのままテストへ貼ったので、コミット前に `user` へ置換した（グローバル CLAUDE.md の
+  「個人情報のコミット禁止」。owner / group 列の幅は解析に効かないので置換して問題ない）
+- `crates/tako-control/src/claude_tui.rs` に**main 由来**の実ユーザー名が 2 箇所残っている
+  （テストの fixture パスと、その文字列を `contains` する判定）。#919 の射程外なので
+  触っていない = 別途起票が要る
+
+## 9. 未検証・既知の限界
+
+- **Windows 実機で 1 度も測っていない**（設計上は同梱の OpenSSH で動くが、
+  ControlMaster のソケット・`ControlPath` の引用・PowerShell 版 `ssh_pane_script` は
+  未実測）。対応マトリクスは `tako_remote_folder` を **Pending / issue 919** で登録
+- **パスワード認証しか無い相手での通し**は未実測（鍵認証で入れるホストしか無い）。
+  設計は「対話 SSH ペインで一度ログイン → 同じ ControlPath を共有」で、
+  ペイン側の argv がツリーと同じ ControlPath を通ることはユニットテストで固定
+- **実 IME・実マウスでのリモート行の右クリック**は未検証（画面 OFF）
+- リモートの **git status / 検索 / D&D** は対象外（ローカル FS 前提の機能なので
+  リモート行では出さない）
