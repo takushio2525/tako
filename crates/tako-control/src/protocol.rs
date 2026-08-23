@@ -1559,6 +1559,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
     },
+    /// 設定・データファイルのスキーマ自動マイグレーション（Issue #916）。
+    /// `action` = "status"（既定。見るだけ）/ "run"（当てる）。
+    /// `schema` でファイル種別を絞る（`tako_core::migration::SchemaId` の識別子）
+    Migrate {
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+    },
     /// 初回起動のウェルカムバナー（Issue #549）。
     /// `action` = "status"（既定。表示状態と案内コマンド）/ "show"（再表示）/
     /// "dismiss"（閉じて以後出さない）

@@ -120,7 +120,7 @@ pub enum RequestKind {
 
 /// devices.json のトップレベル形式
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct DevicesFile {
+pub(crate) struct DevicesFile {
     #[serde(default)]
     devices: Vec<Device>,
 }

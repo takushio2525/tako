@@ -36,6 +36,7 @@ tako_limit_service
 tako_list_panes
 tako_logs
 tako_menu
+tako_migrate
 tako_move_pane_to_tab
 tako_open_dir
 tako_open_file
