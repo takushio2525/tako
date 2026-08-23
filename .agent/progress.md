@@ -2949,3 +2949,37 @@
 - 起票: **#930**（`remote_fs_e2e::解決できないホストは接続前に分類される` が Windows で失敗。
   #919 由来。速い FAILED と >60 秒のハングの両方を観測）
 - 関連: PR #929（Refs #898 / #467）
+
+## 2026-08-24（#927 追い込み: Issue / PR の本文とコメントの実名マスクを機械的に完了）
+- **GitHub 検索は取りこぼす**（`in:comments` は 11 件しか挙げないが実際は 20 件）ので、
+  bulk endpoint（`/issues/comments` / `/pulls/comments`）で**全 1306 コメントを走査**した。
+  該当 31 件 + 本文 7 件 + given name の残り 2 件を更新し、**再取得して残ゼロを実測**
+  （issue+PR 930 件の本文・タイトル、コメント 1306 件）
+- **実ユーザー名と Windows アカウント名の 2 語だけを置換するルールでは半端に残る**:
+  Tailscale の FQDN は tailnet ID がそのまま残り、Cloudflare Workers のサブドメインは
+  **実の名前の方が残る**。長い順に 16 規則（FQDN / workers.dev / メール / ホスト名 /
+  tailnet ID / 名前付きパイプ / 姓 / 名 / アカウント名）へ分解した
+- **git author 名の言及 2 件は意図的に保持**。#81 で「受容」と決まっており
+  930 コミットのメタデータに存在するので 1 箇所隠しても意味がなく、記録の意味を壊す
+- **手を出さなかったもの**: Cloudflare の account ID が約 250 コメントにあるが、これは
+  Pages の bot が PR ごとに自動投稿する check コメントで消しても再生成される（直すなら
+  連携設定側）。#77 の監査も「account_id は秘密ではない」と判定済み
+
+## 2026-08-24（#899: スターター / welcome のコマンド投入を方言と送達確認つき経路へ — **実機検証未完で中断**）
+- 症状 1（行末 LF が PSReadLine の継続行になる）を #640 の `queue_command_flow` へ寄せ、
+  症状 2（POSIX 決め打ちのクォートで PowerShell が式評価する）を境界の
+  `ShellDialect::command_word` へ寄せた。**#322 の最簡形に従い必要なときだけ囲む**ので
+  Windows の典型パスは素のまま。**POSIX は 1 バイトも変えていない**。症状 3 は #898 で既に解消
+- セルフテスト 93(d) を「届いたか」から**「走ったか」**へ割った（旧テストはコメント自身が
+  「実行されるかは見ていない」と書いており、それが Windows の見逃しの理由だった）
+- **LF 側の A/B は作らなかった**: `TAKO_899_LEGACY` で生 write + LF へ戻す経路を置いたら
+  #897 の番犬が正しく落ちた。許可リストを持たない不変条件なので env の穴を作らない
+- 検証（macOS）: fmt / clippy / `test --workspace` **2589 passed 0 failed** / 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK` 完走・行は従来と同一 / クロスチェック エラー 0・警告 12 /
+  検出力は `TAKO_899_LEGACY=1` で (d1) が `queued=false` FAILED + 単体テストが旧形を固定 /
+  CI 3 ジョブ緑（PR #931）
+- **中断理由**: 実機（`desktop-28omtes`）が tailnet から落ちた（offline / last seen 1h）。
+  受け入れ条件①（実機 before/after）が未達なので **merge していない**。
+  再開手順は plan の「#899 の記録 → 残り」節。**実機のリポジトリはブランチ `w899` のまま**
+- 実機測定の作法 4 件を plan へ追加（`-EncodedCommand` を使わない / arm スクリプトを
+  `echo` で作らない = zsh が `\t` をタブにする / arm 側にも UTF-8 / DirectX アトラス panic は撃ち直す）
