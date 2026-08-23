@@ -706,6 +706,13 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #915: 引き継ぎファイルの管理（一覧 / 読み / 書き / 自動移行）。
+        // GUI も IPC も要らないローカルのファイル操作なので、実装は両 OS 共通
+        key: "tako_orchestrator_handoffs",
+        macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
         key: "tako_orchestrator_layout",
         macos: Support::Supported,
         windows: Support::Pending {

@@ -966,6 +966,21 @@ pub enum Request {
         tab: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_pid: Option<u32>,
+        /// 後任へ渡すプロジェクト（#915）。省略時はプロファイルの担当 + 稼働 worker から推定
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projects: Option<Vec<String>>,
+    },
+    /// オーケストレーター: 引き継ぎファイルの管理（#915）。
+    /// `handoff/projects/<key>.md` の一覧・読み・書きと、旧形式からの自動移行
+    OrchestratorHandoffFiles {
+        /// list / show / write / migrate
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
     /// オーケストレーター: worker の状態確認。`tmux_session` 指定時は pane が gone でも
     /// tmux session 経由で recent_output を取得する。

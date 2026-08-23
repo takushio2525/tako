@@ -44632,6 +44632,7 @@ mod self_test {
                             caller_role: Some(format!("master:{probe}")),
                             tab: None,
                             caller_pid: None,
+                            projects: None,
                         },
                         cx,
                     );
@@ -44880,6 +44881,7 @@ mod self_test {
                         caller_role: Some(format!("master:{probe}")),
                         tab: None,
                         caller_pid: None,
+                        projects: None,
                     },
                     cx,
                 );
@@ -44998,6 +45000,7 @@ mod self_test {
                                     caller_role: Some(format!("master:{probe}")),
                                     tab: None,
                                     caller_pid: None,
+                                    projects: None,
                                 },
                                 PaneOrigin::Cli,
                             )

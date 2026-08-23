@@ -570,7 +570,7 @@ impl JurisdictionSource {
 }
 
 /// 管轄プロジェクトの判定結果
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Jurisdiction {
     /// 管轄プロジェクトのキー（重複除去済み・入力順）
     pub projects: Vec<String>,
@@ -1005,27 +1005,33 @@ pub fn nudge_prompt_in(
         Lang::Ja => format!(
             "【tako 自動通知】コンテキスト使用率が {ctx_percent}%（閾値 {threshold}%）に達しました。\n\
              引き継ぎを開始してください。ユーザーの許可を求める必要はありません。\n\
-             1. 引き継ぎファイル `{path}` を今の状況で上書きする\
-             （進行中タスク・spawn 済み worker とその pane・未完の判断・次の一手・ユーザーの直近の意図）。\
-             書式は 2 節に分ける: `## {KNOWLEDGE_HEADING_JA}`（決定事項・方針・残タスクの意図。\
-             pane / tab 番号を書かない）と `## {RUNTIME_HEADING_JA}`（worker とその pane / tab・\
-             実行中のもの）。旧書式のままならこの機会に 2 節へ書き直す\n\
+             1. 引き継ぎを今の状況で書き直す。**プロジェクトごとに 1 ファイル**\
+             （`handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md`。パスは \
+             `tako_orchestrator_self` の `project_handoffs` に出ます）へ、進行中タスク・\
+             spawn 済み worker とその pane・未完の判断・次の一手・ユーザーの直近の意図を書く。\
+             プロジェクトに紐付かない運用知識だけを運用メモ `{path}` に置く。\
+             各ファイルは 2 節に分ける: `## {KNOWLEDGE_HEADING_JA}`（決定事項・方針・\
+             残タスクの意図。pane / tab 番号を書かない）と `## {RUNTIME_HEADING_JA}`\
+             （worker とその pane / tab・実行中のもの）\n\
              2. `tako_orchestrator_handoff` を呼ぶ（後任 master が同じタブに立ち、\
-             引き継ぎを確認してからこのペインを閉じます）\n\
+             引き継ぎを確認してからこのペインを閉じます。渡るのは**あなたの管轄\
+             プロジェクトの分だけ**です）\n\
              まだ返しきっていない報告があるなら、それだけ先に片付けてから 1 に進んでください。"
         ),
         Lang::En => format!(
             "[tako auto-notice] Context usage has reached {ctx_percent}% (threshold {threshold}%).\n\
              Start the handoff now. You do not need to ask the user for permission.\n\
-             1. Overwrite the handoff file `{path}` with your current state \
-             (in-flight tasks, spawned workers and their panes, open decisions, next steps, \
-             the user's most recent intent). Use two sections: \
-             `## {KNOWLEDGE_HEADING_EN}` (decisions, policies, the intent behind remaining \
-             tasks — no pane / tab numbers) and `## {RUNTIME_HEADING_EN}` (workers with their \
-             pane / tab ids, what is running). If the file is still in the old flat format, \
-             rewrite it into the two sections now.\n\
+             1. Rewrite the handoff for your current state. Use **one file per project** \
+             (`handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md`; the paths are listed under \
+             `project_handoffs` in `tako_orchestrator_self`) for in-flight tasks, spawned \
+             workers and their panes, open decisions, next steps, and the user's most recent \
+             intent. Keep only project-independent operating knowledge in the memo `{path}`. \
+             Give each file two sections: `## {KNOWLEDGE_HEADING_EN}` (decisions, policies, \
+             the intent behind remaining tasks — no pane / tab numbers) and \
+             `## {RUNTIME_HEADING_EN}` (workers with their pane / tab ids, what is running).\n\
              2. Call `tako_orchestrator_handoff`. A successor master starts in this tab, \
-             verifies the handoff, and then closes this pane.\n\
+             verifies the handoff, and then closes this pane. It receives **only the projects \
+             you own**.\n\
              If you owe the user a reply you have not delivered yet, finish that one thing first, \
              then go to step 1."
         ),
@@ -1061,6 +1067,30 @@ impl<'a> SuccessorHandoff<'a> {
                 .projects
                 .iter()
                 .any(|(_, body)| !body.trim().is_empty())
+    }
+
+    /// 渡した全本文で認識できた節のラベル（#792。定義順・重複なし）。
+    /// 1 本だけなら従来と同じ値になる
+    pub fn section_labels(&self) -> Vec<&'static str> {
+        let mut knowledge = false;
+        let mut runtime = false;
+        for body in self
+            .profile_memo
+            .into_iter()
+            .chain(self.projects.iter().map(|(_, b)| *b))
+        {
+            let doc = split_handoff(body);
+            knowledge |= doc.knowledge.is_some();
+            runtime |= doc.runtime.is_some();
+        }
+        let mut out = Vec::new();
+        if knowledge {
+            out.push(HandoffSection::Knowledge.as_str());
+        }
+        if runtime {
+            out.push(HandoffSection::Runtime.as_str());
+        }
+        out
     }
 
     /// 渡す全本文の書式（#792）。1 本だけなら従来と同じ値になる。

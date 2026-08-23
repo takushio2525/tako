@@ -5,6 +5,7 @@
 //! tako をインストールするだけで使える。
 
 pub mod agent;
+pub mod handoff_store;
 pub mod ledger;
 pub mod registry;
 pub mod supervisor;
