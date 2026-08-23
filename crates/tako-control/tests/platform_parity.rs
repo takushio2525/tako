@@ -449,6 +449,42 @@ fn tmuxの完全一致ターゲットの直書きが境界の外に残ってい�
     );
 }
 
+/// **#898 の番犬**: コマンド解決の `which` / `where` 直起動が、実行ファイル探索の境界
+/// （B16 = `tako_core::platform::exe::find`）の外に残っていないこと。
+///
+/// `which` は **Windows に存在しない**（実測: 「用語 'which' は…認識されません」）。
+/// 旧実装は `which` をコマンドとして 4 箇所で起こしており、Windows では例外なく
+/// `None` を返していた = tako.exe が PATH 上に居るのに tako 自身には「無い」ように見え、
+/// MCP 自動登録・stale claude 検知（#498）・設定画面のエージェント検出が丸ごと死んでいた。
+/// `where` へ替えるのも誤り（unix に無いので裏返るだけ）。**どちらも起こさず境界へ寄せる**。
+///
+/// 許可リストは**空**にしてある。境界の unix 実装が起こすのはログインシェルであって
+/// `which` ではないので、例外を持つ必要がない
+#[test]
+fn コマンド解決のwhich直起動が境界の外に残っていない() {
+    const ALLOWED: &[(&str, &str)] = &[];
+    const PATTERNS: &[&str] = &[
+        "Command::new(\"which\")",
+        "Command::new(\"where\")",
+        "Command::new(\"where.exe\")",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        let base = root.join("crates").join(crate_dir);
+        for sub in ["src", "tests"] {
+            collect_os_shell_calls(&base.join(sub), &root, PATTERNS, ALLOWED, &mut offenders);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`which` / `where` の直起動が境界の外にある:\n  {}\n\
+         → tako_core::platform::exe::find を通してください（#898 / 設計 §2 の B16）",
+        offenders.join("\n  ")
+    );
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///

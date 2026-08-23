@@ -78,7 +78,7 @@ fn resolve_claude_symlink() -> Option<PathBuf> {
 /// #772: 旧実装は `which claude` のサブプロセスだった。指紋取り（後述の
 /// `current_binary_fingerprint`）は 2 秒ごとに走るので、ここでプロセスを起こすと
 /// それだけで恒常的なコストになる。PATH の走査は stat だけで済むので自前で行い、
-/// 取りこぼし（PATH の解釈差）に備えて `which` を保険に残す
+/// 取りこぼし（PATH の解釈差・`PATHEXT`・PATH 未伝播）に備えて境界 B16 を保険に残す
 pub fn launcher_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -118,22 +118,19 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// PATH 走査で見つからなかったときの保険（サブプロセス）
+/// 上の PATH 走査で見つからなかったときの保険。境界 B16
+/// （[`tako_core::platform::exe::find`]）へ委ねる。
+///
+/// **`which` を起こしてはいけない**（#898）: Windows に `which` は無いので旧実装は
+/// 必ず `None` を返し、`claude` が PATH に伝播していない環境（インストーラが PATH を
+/// 書いても実行中プロセスには届かない）で**検知が丸ごと無効**になっていた。
+/// 境界は Windows では `PATHEXT`（`claude.cmd` の npm シムも拾う）と
+/// ユーザー導入先を**サブプロセスなしで**走査する。
+///
+/// 上の走査を残しているのは #772 のため（指紋取りは定期実行なので、
+/// 見つかる限り stat だけで済ませたい）。ここへ落ちるのは走査が空振りしたときだけ
 fn which_claude() -> Option<PathBuf> {
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    let which_out = tako_core::platform::process::no_console_window(
-        std::process::Command::new("which").arg("claude"),
-    )
-    .output()
-    .ok()
-    .filter(|o| o.status.success())?;
-    let raw = String::from_utf8_lossy(&which_out.stdout)
-        .trim()
-        .to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(raw))
+    tako_core::platform::exe::find("claude").map(PathBuf::from)
 }
 
 /// バイナリパスからバージョンを推定する。

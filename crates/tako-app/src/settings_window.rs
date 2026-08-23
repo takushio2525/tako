@@ -358,21 +358,18 @@ impl SettingsWindow {
         }
     }
 
-    /// エージェント CLI の検出は子プロセス（which）なので background で行う（#168 の教訓）
+    /// エージェント CLI の検出は重い（unix はログインシェルを起こす）ので
+    /// background で行う（#168 の教訓）。
+    ///
+    /// 解決は境界 B16（[`tako_core::platform::exe::find`]）。**`which` を起こしてはいけない**
+    /// （#898）: Windows に `which` は無いので、claude / codex / agy を導入済みでも
+    /// 設定画面が「未検出」と表示していた
     fn refresh_agent_clis(&mut self, cx: &mut Context<Self>) {
         let task = cx.background_executor().spawn(async move {
             ["claude", "codex", "agy"]
                 .iter()
                 .map(|cli| {
-                    // #586: GUI プロセスからの起動なのでコンソールウィンドウを出させない
-                    let found = tako_core::platform::process::no_console_window(
-                        std::process::Command::new("which").arg(cli),
-                    )
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
+                    let found = tako_core::platform::exe::find(cli).is_some();
                     (cli.to_string(), found)
                 })
                 .collect::<Vec<_>>()
