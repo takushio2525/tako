@@ -20564,10 +20564,16 @@ mod self_test {
 
     /// パスを NSURL の `absoluteString` 相当（`file://` + パーセントエンコード）へ。
     /// 項目 116（#835）が Finder から来る形そのままで受け口を叩くために使う。
-    /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて
+    /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて。
+    ///
+    /// **パス部は必ず `/` 始まり・区切りは `/`**（RFC 8089）。`path.display()` を
+    /// そのまま符号化すると Windows では `file://C%3A%5CUsers%5C…` になり、
+    /// 受け口（`open_files::file_url_to_path`）が「絶対パスでない」として全部弾く
+    /// = 項目 116 が `(1)` で落ちていた（#913）。OS を見ずに**形**で決めるので、
+    /// macOS 上でも Windows 形の入力を作れる
     pub(crate) fn file_url(path: &std::path::Path) -> String {
         let mut out = String::from("file://");
-        for b in path.display().to_string().bytes() {
+        for b in file_uri_path(path).bytes() {
             match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                     out.push(b as char)
@@ -20576,6 +20582,27 @@ mod self_test {
             }
         }
         out
+    }
+
+    /// [`file_url`] のパス部（純粋関数。**符号化の前**の形）。
+    /// 区切りを `/` へ寄せ、ドライブレター形式（`C:/…`）には先頭 `/` を足す
+    pub(crate) fn file_uri_path(path: &std::path::Path) -> String {
+        // `TAKO_913_LEGACY=1` で修正前（`path.display()` をそのまま）へ戻せる
+        // = 同一バイナリで A/B が取れる。**テスト側だけの仕掛け**で製品経路は読まない
+        if std::env::var_os("TAKO_913_LEGACY").is_some() {
+            return path.display().to_string();
+        }
+        legacy_free_file_uri_path(path)
+    }
+
+    /// [`file_uri_path`] の本体（純粋関数。env を読まないのでテストから直に呼べる）
+    pub(crate) fn legacy_free_file_uri_path(path: &std::path::Path) -> String {
+        let shown = path.display().to_string().replace('\\', "/");
+        if shown.starts_with('/') {
+            shown
+        } else {
+            format!("/{shown}")
+        }
     }
 
     /// ペインの PTY へ「Enter を押した」として書くバイト（#897）。
@@ -49625,6 +49652,64 @@ mod selftest_pty_enter_watchdog {
         assert!(lf_pty_writes(good_paren).is_empty());
         // 逃げ道そのものの検査: マーカーがある行は見逃す
         assert!(lf_pty_writes(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod self_test_file_url_tests {
+    use super::self_test::{file_url, legacy_free_file_uri_path as file_uri_path};
+    use std::path::Path;
+
+    /// #913: 項目 116 が受け口へ渡す URL は **RFC 8089 の形**（パス部は `/` 始まり・
+    /// 区切りは `/`）でなければならない。`path.display()` をそのまま符号化していたため
+    /// Windows では `file://C%3A%5CUsers%5C…` になり、受け口が全部弾いていた。
+    /// 判定は OS を見ず**形**で決めるので、macOS からも Windows 形を検査できる
+    #[test]
+    fn windowsのパスもrfc8089の形のurlになる() {
+        // Windows 形（ドライブレター + バックスラッシュ）
+        assert_eq!(
+            file_uri_path(Path::new(r"C:\Users\me\AppData\Local\Temp\a.md")),
+            "/C:/Users/me/AppData/Local/Temp/a.md"
+        );
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\me\a.md")),
+            "file:///C%3A/Users/me/a.md"
+        );
+        // `:` は RFC 3986 の unreserved ではないので `%3A` になる。受け口は
+        // パーセントデコードしてから境界へ渡すので、リテラルの `:`（Windows の
+        // `UrlCreateFromPath` が作る形）も `%3A` もどちらも通る
+        assert_eq!(
+            crate::open_files::file_url_to_path("file:///C%3A/Users/me/a.md"),
+            crate::open_files::file_url_to_path("file:///C:/Users/me/a.md"),
+            "リテラルの `:` と `%3A` は同じパスへ戻る"
+        );
+        // POSIX 形は 1 バイトも変わらない（macOS の回帰検出）
+        assert_eq!(file_uri_path(Path::new("/tmp/a.md")), "/tmp/a.md");
+        assert_eq!(file_url(Path::new("/tmp/a.md")), "file:///tmp/a.md");
+        // 非 ASCII と空白はパーセント符号化されたまま
+        assert_eq!(
+            file_url(Path::new(r"C:\tmp\my notes.md")),
+            "file:///C%3A/tmp/my%20notes.md"
+        );
+        assert_eq!(
+            file_url(Path::new("/tmp/読み.md")),
+            "file:///tmp/%E8%AA%AD%E3%81%BF.md"
+        );
+    }
+
+    /// 作った URL が**受け口でパスへ戻る**（項目 116 の (1) を単体で固定する）
+    #[test]
+    fn 作ったurlは受け口でパスへ戻る() {
+        for path in [
+            Path::new(r"C:\Users\me\AppData\Local\Temp\読み物.md"),
+            Path::new("/tmp/読み物.md"),
+        ] {
+            let url = file_url(path);
+            assert!(
+                crate::open_files::file_url_to_path(&url).is_some(),
+                "{url} がパスへ戻らない（#913）"
+            );
+        }
     }
 }
 
