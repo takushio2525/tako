@@ -3064,7 +3064,8 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     check_mcp_health_warning();
 
-    if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
+    // 旧形式の設定ファイルを master 起動のたびに検知して直す（#916）
+    if let Some(notice) = tako_control::migrations::ensure_migrated() {
         eprintln!("ℹ {notice}");
         eprintln!();
     }

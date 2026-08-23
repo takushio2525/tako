@@ -2208,69 +2208,9 @@ pub fn ensure_defaults() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// 旧バージョン（0.2.3 以前）が default.yaml に書き込んだ `model: claude-opus-4-6[1m]` を
-/// 検出し、バックアップを取って model 行を除去する（Issue #27）。
-/// 旧既定値と完全一致する場合のみ対象（ユーザーが別の値を明示した場合は触らない）。
-/// 戻り値: マイグレーションを実行した場合は通知メッセージ
-pub fn migrate_legacy_default_profile() -> Option<String> {
-    let path = profiles_dir()?.join("default.yaml");
-    migrate_legacy_model_file(&path)
-}
-
-/// マイグレーション本体（パス指定・テスト用に分離）。
-/// model 行だけを行単位で除去し、他の設定・コメントは保持する
-fn migrate_legacy_model_file(path: &Path) -> Option<String> {
-    if !path.is_file() {
-        return None;
-    }
-    // backup が既に存在 = 一度マイグレ済み。ユーザーが profiles set で再設定した可能性があるためスキップ
-    let backup = path.with_extension("yaml.backup-1m");
-    if backup.exists() {
-        return None;
-    }
-    let content = std::fs::read_to_string(path).ok()?;
-    let profile: Profile = serde_yaml::from_str(&content).ok()?;
-    if profile.model.as_deref() != Some(LEGACY_DEFAULT_MODEL) {
-        return None;
-    }
-
-    // トップレベル（行頭）の model 行だけを除去。ネスト行（インデント付き）は対象外
-    let is_legacy_model_line = |line: &str| {
-        line.strip_prefix("model:").is_some_and(|rest| {
-            let value = rest.trim();
-            value == LEGACY_DEFAULT_MODEL
-                || value == format!("'{LEGACY_DEFAULT_MODEL}'")
-                || value == format!("\"{LEGACY_DEFAULT_MODEL}\"")
-        })
-    };
-    // まず model 行だけを行単位で除去した候補を作り、Profile として読めるか検証する。
-    // 読めない場合（model 1 行のみ・特殊な書式等）は serde 経由の再構成にフォールバック
-    let line_surgery = || -> Option<String> {
-        if !content.lines().any(is_legacy_model_line) {
-            return None;
-        }
-        let kept: Vec<&str> = content
-            .lines()
-            .filter(|l| !is_legacy_model_line(l))
-            .collect();
-        let mut text = kept.join("\n");
-        text.push('\n');
-        serde_yaml::from_str::<Profile>(&text).ok()?;
-        Some(text)
-    };
-    let migrated = line_surgery().or_else(|| {
-        let mut p = profile;
-        p.model = None;
-        serde_yaml::to_string(&p).ok()
-    })?;
-
-    let _ = std::fs::copy(path, &backup);
-    std::fs::write(path, &migrated).ok()?;
-    Some(format!(
-        "profiles/default.yaml の model: {LEGACY_DEFAULT_MODEL}（旧既定値。Pro プランでは起動不能）を\n  削除しました。今後は claude CLI の既定モデルで起動します。\n  1M コンテキスト版を使う場合（Max / API プラン）は model を明示的に再設定してください。\n  バックアップ: {}",
-        backup.display()
-    ))
-}
+// #27 の「旧既定モデル [1m] を外す」移行は #916 の一般機構（`crate::migrations`）へ
+// 移した。発火点が 3 か所に散っていたのを 1 本（`migrations::ensure_migrated`）に
+// まとめ、退避・冪等・可視化の規約も機構側の 1 実装に寄せてある。
 
 /// エージェント列挙の走査先（claude の config ディレクトリ。Issue #571）。
 ///
@@ -3800,98 +3740,8 @@ worker_agents:
         assert!(one_m_model_warning("claude-sonnet-5", "worker").is_none());
     }
 
-    #[test]
-    fn migrate_removes_legacy_default_model_line() {
-        let tmp = std::env::temp_dir().join("tako-test-migrate-legacy");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("default.yaml");
-        // 旧バージョンが生成した形 + ユーザー追記のコメント・設定
-        std::fs::write(
-            &path,
-            "# user comment\nmodel: claude-opus-4-6[1m]\neffort: high\nworker_model_policy: inherit\n",
-        )
-        .unwrap();
-
-        let msg = migrate_legacy_model_file(&path);
-        assert!(msg.is_some(), "旧既定値はマイグレーションされる");
-
-        let migrated = std::fs::read_to_string(&path).unwrap();
-        assert!(!migrated.contains("model:"), "model 行が除去される");
-        assert!(migrated.contains("# user comment"), "コメントは保持");
-        assert!(migrated.contains("effort: high"), "他の設定は保持");
-        let p: Profile = serde_yaml::from_str(&migrated).unwrap();
-        assert_eq!(p.model, None);
-        assert_eq!(p.effort, "high");
-        // バックアップが作成される
-        assert!(path.with_extension("yaml.backup-1m").is_file());
-        // 2 回目は no-op
-        assert!(migrate_legacy_model_file(&path).is_none());
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn migrate_keeps_user_specified_models() {
-        let tmp = std::env::temp_dir().join("tako-test-migrate-keep");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("default.yaml");
-        // 旧既定値と異なる明示指定（[1m] を含んでいても）は opt-in として尊重
-        std::fs::write(&path, "model: claude-fable-5[1m]\neffort: max\n").unwrap();
-        assert!(migrate_legacy_model_file(&path).is_none());
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("claude-fable-5[1m]"), "ファイルは無変更");
-
-        // model 無しのファイルも no-op
-        std::fs::write(&path, "effort: max\n").unwrap();
-        assert!(migrate_legacy_model_file(&path).is_none());
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn migrate_skips_when_backup_exists_after_user_re_set() {
-        // Issue #67: profiles set で [1m] を再設定 → master 起動相当 → model が保持される
-        let tmp = std::env::temp_dir().join("tako-test-migrate-issue67");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("default.yaml");
-
-        // 1. 初回マイグレーション（旧既定値がある状態）
-        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").unwrap();
-        assert!(migrate_legacy_model_file(&path).is_some());
-        let backup = path.with_extension("yaml.backup-1m");
-        assert!(backup.is_file(), "backup が作成される");
-
-        // 2. ユーザーが profiles set で [1m] を意図的に再設定
-        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").unwrap();
-
-        // 3. 次の master 起動（migrate が再度呼ばれる）→ スキップされる
-        assert!(
-            migrate_legacy_model_file(&path).is_none(),
-            "backup 存在時はマイグレーションをスキップ"
-        );
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains("model: claude-opus-4-6[1m]"),
-            "ユーザーが再設定した model は保持される"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn migrate_model_only_file() {
-        let tmp = std::env::temp_dir().join("tako-test-migrate-only");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("default.yaml");
-        std::fs::write(&path, "model: claude-opus-4-6[1m]\n").unwrap();
-        assert!(migrate_legacy_model_file(&path).is_some());
-        let migrated = std::fs::read_to_string(&path).unwrap();
-        let p: Profile = serde_yaml::from_str(&migrated).unwrap();
-        assert_eq!(p.model, None);
-        assert_eq!(p.effort, "max", "serde default で補われる");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
+    // #27 の移行の振る舞い（コメント保持 / 明示モデル尊重 / #67 の再設定尊重 /
+    // model だけのファイル）は #916 で機構へ移したので `crate::migrations` のテストが持つ
 
     #[test]
     fn solo_default_profile_values() {

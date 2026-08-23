@@ -1502,8 +1502,9 @@ fn prepare_profile(
         .join("default.yaml");
     let existed = profile_path.is_file();
     orchestrator::ensure_defaults()?;
-    if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
-        eprintln!("  [移行] {notice}");
+    // setup は「一発で全ファイルが最新形式になる」担保（#916 の二段構え 1 段目）
+    for line in tako_control::migrations::setup_lines() {
+        eprintln!("  [移行] {line}");
     }
     if let Some(profile) = provided {
         profile.save("default")?;

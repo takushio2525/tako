@@ -8883,7 +8883,9 @@ fn resolve_caller_profile_with_role(
     caller: Option<PaneId>,
     role_suffix: &Option<String>,
 ) -> crate::orchestrator::Profile {
-    let _ = crate::orchestrator::migrate_legacy_default_profile();
+    // 旧形式のプロファイル・設定を実行時に検知して直す（#916 の二段構え 2 段目）。
+    // 1 プロセス 1 回しか実際には走らないので、この頻繁な経路から呼んでも軽い
+    let _ = crate::migrations::ensure_migrated();
     let suffix = role_suffix
         .clone()
         .or_else(|| caller.and_then(|pid| find_master_suffix_from(workspace, pid)))

@@ -421,6 +421,16 @@ pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
 }
 
 fn migrate_one(spec: &SchemaSpec, path: &Path, mode: Mode) -> FileReport {
+    // 無いファイルはロックも取らない。`config_io` のロックファイルは意図的に
+    // 消さない設計なので、ここで無条件に取ると使っていない機能の `.lock` が
+    // データディレクトリに散る（実測で 3 個作ってしまった）
+    if !path.exists() {
+        return FileReport {
+            id: spec.id,
+            path: path.to_path_buf(),
+            outcome: FileOutcome::Absent,
+        };
+    }
     match mode {
         Mode::Apply => {
             // 排他ロックは書く可能性があるときだけ取る（読み取りは rename により常に完全）
@@ -451,6 +461,104 @@ fn pending_notes(spec: &SchemaSpec, from: u32) -> Vec<Note> {
     migration::plan(from, spec.target_version, spec.steps)
         .map(|steps| steps.iter().map(|s| s.describe).collect())
         .unwrap_or_default()
+}
+
+
+/// この プロセスで実行時発火を済ませたか。移行は冪等なので**1 プロセス 1 回**でよく、
+/// dispatch のような頻繁な経路から呼ばれても全設定ファイルを読み直さない
+static RUNTIME_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// **実行時の差分検出からの発火**（二段構えの 2 段目。#916）。
+///
+/// GUI 起動・master 起動・CLI / MCP の経路の入口で呼ぶ。旧形式を見つけたらその場で
+/// 直し、何をしたかを persist.log へ残して一言（呼び出し側が出す文言）を返す。
+/// 何も起きていなければ `None`（黙る）。
+///
+/// 1 プロセスで 1 回だけ実際に走る。明示的にやり直したいときは [`run`] を使う
+pub fn ensure_migrated() -> Option<String> {
+    if !take_runtime_slot() {
+        return None;
+    }
+    let report = run(Mode::Apply, None);
+    record(&report, "runtime");
+    report.notice()
+}
+
+/// `tako setup` からの発火（二段構えの 1 段目）。
+/// setup は「誰の環境でも一発で最新形式にする」担保なので、
+/// 1 プロセス 1 回の制限にかからず必ず走る
+pub fn run_for_setup() -> MigrationReport {
+    RUNTIME_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = run(Mode::Apply, None);
+    record(&report, "setup");
+    report
+}
+
+/// `tako setup` が画面へ出す行（何もなければ空）。
+/// **移行は黙って済ませない**（設定ファイルを書き換えた事実は必ず見せる）
+pub fn setup_lines() -> Vec<String> {
+    let report = run_for_setup();
+    let mut lines = Vec::new();
+    for file in &report.files {
+        match &file.outcome {
+            FileOutcome::Migrated { backup, applied, .. } => {
+                for note in applied {
+                    lines.push(format!("{}: {}", file.path.display(), note.text()));
+                }
+                lines.push(format!("旧内容の退避先: {}", backup.display()));
+            }
+            FileOutcome::Unreadable { quarantine, reason } => lines.push(format!(
+                "{} は読めなかったので {} へ退避しました（{reason}）",
+                file.path.display(),
+                quarantine.display()
+            )),
+            FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
+                lines.push(format!("{}: {reason}", file.path.display()))
+            }
+            FileOutcome::Absent | FileOutcome::UpToDate { .. } => {}
+        }
+    }
+    lines
+}
+
+/// 実施の可視化。**何をどう変えたかは必ず監査ログへ残す**（黙って直さない）
+fn record(report: &MigrationReport, origin: &str) {
+    for file in &report.files {
+        match &file.outcome {
+            FileOutcome::Migrated {
+                from, to, backup, ..
+            } => crate::diag::persist_log(&format!(
+                "移行: {} v{from} -> v{to}: {}（退避 {}・発生源 {origin}）",
+                file.id.as_str(),
+                file.path.display(),
+                backup.display()
+            )),
+            FileOutcome::Unreadable { quarantine, reason } => {
+                crate::diag::persist_log(&format!(
+                    "移行できず退避: {} {}（{reason}・退避 {}・発生源 {origin}）",
+                    file.id.as_str(),
+                    file.path.display(),
+                    quarantine.display()
+                ))
+            }
+            FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
+                crate::diag::persist_log(&format!(
+                    "移行を中止: {} {}（{reason}・発生源 {origin}）",
+                    file.id.as_str(),
+                    file.path.display()
+                ))
+            }
+            FileOutcome::Absent | FileOutcome::UpToDate { .. } => {}
+        }
+    }
+}
+
+/// 実行時発火の枠を取る。**最初の 1 回だけ true**。
+/// 判定をここへ切り出してあるのは、テストが本番のデータディレクトリへ触らずに
+/// 「一度だけ」を確かめられるようにするため（ユニットテストが本番設定を
+/// 書き換える型の事故は #916 の棚卸しで実際に見つかっている）
+fn take_runtime_slot() -> bool {
+    !RUNTIME_FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -548,6 +656,155 @@ mod tests {
         assert_eq!(
             strip_legacy_default_model("model: claude-opus-5\n").expect("成功"),
             None
+        );
+    }
+    // --- #27 の移行を機構の上で通す（旧 orchestrator::migrate_legacy_model_file の
+    // 振る舞いをそのまま引き継ぐ。ここが production の Profiles spec を実際に通る） ---
+
+    fn profiles_spec() -> &'static SchemaSpec {
+        spec(SchemaId::Profiles).expect("Profiles は登録されている")
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-migrations-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        dir
+    }
+
+    #[test]
+    fn 旧既定モデルはコメントと他の設定を残して除去される() {
+        let dir = temp_dir("legacy");
+        let path = dir.join("default.yaml");
+        std::fs::write(
+            &path,
+            "# user comment\nmodel: claude-opus-4-6[1m]\neffort: high\nworker_model_policy: inherit\n",
+        )
+        .expect("書ける");
+        let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
+        assert!(report.outcome.changed(), "{report:?}");
+        let migrated = std::fs::read_to_string(&path).expect("読める");
+        assert!(!migrated.contains("model:"), "{migrated}");
+        assert!(migrated.contains("# user comment"), "{migrated}");
+        assert!(migrated.contains("effort: high"), "{migrated}");
+        let p: crate::orchestrator::Profile = serde_yaml::from_str(&migrated).expect("読める");
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "high");
+        assert!(
+            migration::backup_path(&path, 1).is_file(),
+            "旧内容が退避される"
+        );
+        // 2 回目は何もしない
+        let again = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
+        assert!(!again.outcome.changed(), "{again:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 利用者が明示したモデルには触らない() {
+        let dir = temp_dir("keep");
+        let path = dir.join("default.yaml");
+        // 旧既定値と異なる明示指定（[1m] を含んでいても）は opt-in として尊重
+        std::fs::write(&path, "model: claude-fable-5[1m]\neffort: max\n").expect("書ける");
+        let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
+        assert!(!report.outcome.changed(), "{report:?}");
+        assert!(std::fs::read_to_string(&path)
+            .expect("読める")
+            .contains("claude-fable-5[1m]"));
+        // model 無しのファイルも触らない
+        std::fs::write(&path, "effort: max\n").expect("書ける");
+        assert!(
+            !migration::migrate_file(profiles_spec(), &path, &migration::FsIo)
+                .outcome
+                .changed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #67: 移行後に利用者が profiles set で [1m] を再設定したら保持する
+    #[test]
+    fn 再設定された旧モデルは二度目に消さない() {
+        let dir = temp_dir("issue67");
+        let path = dir.join("default.yaml");
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").expect("書ける");
+        assert!(
+            migration::migrate_file(profiles_spec(), &path, &migration::FsIo)
+                .outcome
+                .changed(),
+            "初回は移行する"
+        );
+        // 利用者が意図して再設定
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").expect("書ける");
+        let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
+        assert!(!report.outcome.changed(), "{report:?}");
+        assert!(std::fs::read_to_string(&path)
+            .expect("読める")
+            .contains("model: claude-opus-4-6[1m]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧機構（#27）の印しか無い利用者にも二度当てない
+    #[test]
+    fn 旧機構の印だけがある場合も再設定を尊重する() {
+        let dir = temp_dir("legacy-marker");
+        let path = dir.join("default.yaml");
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").expect("書ける");
+        std::fs::write(dir.join("default.yaml.backup-1m"), "旧い退避").expect("書ける");
+        let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
+        assert!(!report.outcome.changed(), "{report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modelだけのファイルも移行できる() {
+        let dir = temp_dir("only");
+        let path = dir.join("default.yaml");
+        std::fs::write(&path, "model: claude-opus-4-6[1m]\n").expect("書ける");
+        assert!(
+            migration::migrate_file(profiles_spec(), &path, &migration::FsIo)
+                .outcome
+                .changed()
+        );
+        let migrated = std::fs::read_to_string(&path).expect("読める");
+        let p: crate::orchestrator::Profile = serde_yaml::from_str(&migrated).expect("読める");
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort, "max", "serde default で補われる");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 読めないプロファイルは移行せず退避する() {
+        let dir = temp_dir("broken");
+        let path = dir.join("default.yaml");
+        std::fs::write(&path, "model: [こわれた\n").expect("書ける");
+        let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
+        match &report.outcome {
+            FileOutcome::Unreadable { quarantine, .. } => {
+                assert_eq!(
+                    std::fs::read_to_string(quarantine).expect("読める"),
+                    "model: [こわれた\n"
+                );
+            }
+            other => panic!("退避されるはず: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("読める"),
+            "model: [こわれた\n",
+            "元は触らない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 実行時発火は 1 プロセス 1 回（頻繁な経路から呼んでも重くならない）。
+    /// **本番のデータディレクトリへは触らずに**枠取りだけを確かめる
+    #[test]
+    fn 実行時発火の枠は一度だけ取れる() {
+        assert!(take_runtime_slot(), "最初の 1 回だけ走る");
+        assert!(!take_runtime_slot(), "2 回目は走らない");
+        assert_eq!(
+            ensure_migrated(),
+            None,
+            "枠が埋まっていれば実ファイルを読みにも行かない"
         );
     }
 }
