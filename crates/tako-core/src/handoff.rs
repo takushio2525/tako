@@ -7,7 +7,7 @@
 //! - 閾値の値域と丸め（`clamp_ctx_threshold` / `parse_ctx_threshold`）
 //! - 「今ナッジを送るべきか」の純粋関数（`nudge_decision`）
 //! - master へ送る文面（`nudge_prompt` / `successor_prompt`）
-//! - 引き継ぎファイルの書式（`split_handoff` / `handoff_template`。Issue #792）
+//! - 引き継ぎファイルの書式（`split_handoff` / `project_handoff_template`。Issue #792 / #915）
 //!
 //! 実際の送信は tako-app の定期 tick（画面由来の ctx% を持っている層）が、
 //! 新 master の spawn は `tako-control::dispatch` が担う。
@@ -925,35 +925,6 @@ pub fn project_marker(key: &str) -> String {
     format!("{PROJECT_MARKER_PREFIX} {key} -->")
 }
 
-/// 新書式の雛形（master が最初に書くとき / 旧書式を書き直すときの下敷き）
-pub fn handoff_template(profile: &str) -> String {
-    handoff_template_in(lang(), profile)
-}
-
-/// 言語を明示しての雛形（#608: テストは言語グローバルに触らない）
-pub fn handoff_template_in(lang: Lang, profile: &str) -> String {
-    match lang {
-        Lang::Ja => format!(
-            "# master 引き継ぎ（profile: {profile}）\n\n\
-             ## {KNOWLEDGE_HEADING_JA}\n\n\
-             <!-- 別マシンでも意味が保たれるもの: 決定事項と理由・ユーザーの方針・\
-             残タスクとその意図・調べて分かったこと。pane / tab 番号は書かない -->\n\n\
-             ## {RUNTIME_HEADING_JA}\n\n\
-             <!-- このマシン限定: 進行中の worker とその pane / tab、いま開いているペイン、\
-             実行中のプロセス。別マシンへ持ち込んだら丸ごと無効になる前提で書く -->\n"
-        ),
-        Lang::En => format!(
-            "# Master handoff (profile: {profile})\n\n\
-             ## {KNOWLEDGE_HEADING_EN}\n\n\
-             <!-- Portable across machines: decisions and why, the user's policies, \
-             remaining tasks and their intent, what you found out. No pane / tab numbers here -->\n\n\
-             ## {RUNTIME_HEADING_EN}\n\n\
-             <!-- This machine only: in-flight workers with their pane / tab ids, panes that \
-             are open, running processes. Assume it is void on any other machine -->\n"
-        ),
-    }
-}
-
 /// プロジェクト単位の引き継ぎファイルの雛形（#915）
 pub fn project_handoff_template_in(lang: Lang, project: &str) -> String {
     let marker = project_marker(project);
@@ -1775,7 +1746,7 @@ mod tests {
     #[test]
     fn 雛形は自分で解析できる() {
         for lang in [Lang::Ja, Lang::En] {
-            let doc = split_handoff(&handoff_template_in(lang, "default"));
+            let doc = split_handoff(&project_handoff_template_in(lang, "default"));
             assert_eq!(doc.format(), HandoffFormat::Sectioned, "{lang:?}");
             assert_eq!(
                 doc.section_labels(),

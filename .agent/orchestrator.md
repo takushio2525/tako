@@ -539,7 +539,8 @@ spawn 済み worker とその pane と依頼内容 / 開いているペイン / 
   `tako orchestrator handoff` の応答は渡した全ファイルをまとめた `handoff_format`
   （新旧が混ざっていたら `mixed`）と `handoff_sections` を返す
 - 書式の正本は `tako_core::handoff`（`section_of_line` / `split_handoff` /
-  `handoff_template`。見出し定数は master system prompt と同期していることを単体テストが拘束）
+  `project_handoff_template` / `profile_memo_template`。見出し定数は master system prompt と
+  同期していることを単体テストが拘束）
 
 ```bash
 # 今の閾値と超過状態を見る（master 自身が使う）
