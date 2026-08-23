@@ -15764,7 +15764,6 @@ mod tests {
         assert_eq!(cmd, Some(exe.display().to_string()));
     }
 
-    #[test]
     /// #916: 壊れた JSON は**上書きしない**。旧実装は unwrap_or_default で
     /// 空 map から書き直し、利用者の MCP 登録・信頼済みフォルダ・履歴を消していた
     #[test]
