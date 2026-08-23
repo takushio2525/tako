@@ -3391,6 +3391,8 @@ impl TakoApp {
         self.preview_changelogs.remove(&pane_id);
         self.preview_run_profiles.remove(&pane_id);
         self.preview_run_selected.remove(&pane_id);
+        // #919: リモート由来の記録（読み取り専用の判定とヘッダ表示に使う）
+        self.preview_remote_origins.remove(&pane_id);
         if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
             self.preview_run_menu = None;
         }

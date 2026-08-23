@@ -1398,14 +1398,50 @@ pub enum Request {
         focus: Option<bool>,
     },
     /// SSH ホストに接続するペインを開く（#20）。
-    /// `host` は ~/.ssh/config の Host 名。新タブで `ssh <host>` を実行する
+    /// `host` は ~/.ssh/config の Host 名。新タブで `ssh <host>` を実行する。
+    ///
+    /// #919: 接続の失敗を**画面に残す**（旧実装は ssh が即死するとペインごと消え、
+    /// 理由がどこにも残らなかった）。`remote_dir` を渡すと接続後にそのフォルダへ
+    /// `cd` する（「リモートからフォルダを開く」からの導線）
     OpenRemote {
         host: String,
         #[serde(default)]
         focus: Option<bool>,
+        /// 接続後に `cd` するリモートのパス（#919 要件 4）
+        #[serde(default)]
+        remote_dir: Option<String>,
     },
     /// SSH config の Host 一覧を返す（#20）
     SshHosts,
+    /// リモート（SSH 先）のフォルダをワークスペースとして開く・閉じる・覗く
+    /// （#919 / #65。Zed / VSCode の Remote SSH 相当）。
+    ///
+    /// `action`:
+    /// - `"open"`: `host` に接続し、`path`（省略時はリモートのホーム）を
+    ///   ファイルツリーのルートとして開く。**接続に失敗したら開かずに理由を返す**
+    /// - `"close"`: 開いているリモートフォルダを閉じる（既定は**全タブ横断**。
+    ///   `path` 省略でそのホストの全部、`all` でホスト指定なしに全部、
+    ///   `tab` で 1 タブへ絞る）
+    /// - `"list"`: 開いているリモートフォルダの一覧（読み込み状態つき）
+    /// - `"ls"`: リモートのディレクトリを一覧する（**ツリーを開かずに覗ける**。
+    ///   AI がリモートの構造を把握するための経路 = #65 要件 5）
+    /// - `"open-file"`: リモートのファイルをプレビューで開く（SFTP で取得 → 読み取り専用）
+    /// - `"ssh-pane"`: そのフォルダを cwd にした SSH ペインを開く（#919 要件 4）
+    RemoteFolder {
+        action: String,
+        #[serde(default)]
+        host: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        /// 対象タブ（省略時はアクティブタブ）
+        #[serde(default)]
+        tab: Option<u64>,
+        #[serde(default)]
+        focus: Option<bool>,
+        /// `close` でホスト指定なしに全部閉じる
+        #[serde(default)]
+        all: bool,
+    },
     /// 最近開いた項目の一覧・クリア（#20）。
     /// `action`: "list" / "clear"
     RecentItems { action: String },

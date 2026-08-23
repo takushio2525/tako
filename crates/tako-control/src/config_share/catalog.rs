@@ -162,6 +162,12 @@ pub mod notes {
         "実行時の状態。デバイスごとに違って当然なので共有しない",
         "Runtime state that legitimately differs per device, so it is not shared",
     );
+    /// リモートファイルのキャッシュ（#919）。**共有してはいけない**: 中身は
+    /// SSH 先のファイルの写しで、リポジトリへ push すると相手のソースが漏れる
+    pub const REMOTE_CACHE: Note = Note::new(
+        "リモートファイルのプレビュー用キャッシュ。SSH 先の中身なので共有しない",
+        "Cache of remote files fetched for preview; contains remote content, so it is not shared",
+    );
     /// 器のオーナー記録（#519 M2）。**共有すると #177 の復元強奪ガードが誤作動する**:
     /// 別マシンの pid を「この器の持ち主」と読んでしまい、生きている器を
     /// 奪う / 逆に自分の器を諦める、のどちらにも倒れうる
@@ -388,6 +394,24 @@ pub const CATALOG: &[Entry] = &[
         path: "osc/",
         class: Class::Local,
         note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    Entry {
+        root: Root::TakoData,
+        // #919: SSH の ControlMaster ソケット（このマシンの生きた接続そのもの）
+        path: "ssh/",
+        class: Class::Local,
+        note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    Entry {
+        root: Root::TakoData,
+        // #919: リモートファイルのプレビュー用キャッシュ（リモートの実体の写し）
+        path: "remote-cache/",
+        class: Class::Local,
+        note: notes::REMOTE_CACHE,
         local_fields: &[],
         needs_local_unless: &[],
     },

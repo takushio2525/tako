@@ -38,6 +38,8 @@ actions!(
         OpenDirectory,
         OpenRepository,
         OpenRemote,
+        /// #919: リモートからフォルダを開く（ワークスペースとして）
+        OpenRemoteFolder,
         OpenRecent,
         NewWindow,
         OpenSettings,

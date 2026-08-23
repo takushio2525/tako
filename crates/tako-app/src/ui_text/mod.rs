@@ -36,6 +36,7 @@ pub mod panel;
 pub mod ports;
 pub mod preview;
 pub mod remote;
+pub mod remote_folder;
 pub mod settings;
 pub mod sidebar;
 pub mod sleep_guard;

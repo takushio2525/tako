@@ -84,6 +84,7 @@ tako_read_pane
 tako_recent
 tako_remote_agents
 tako_remote_devices
+tako_remote_folder
 tako_remote_messages
 tako_remote_scrollback
 tako_remote_setup
