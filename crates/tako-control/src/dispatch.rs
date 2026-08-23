@@ -2797,6 +2797,7 @@ fn dispatch_inner(
             caller_role,
             tab,
             caller_pid,
+            projects,
         } => dispatch_orchestrator_handoff(
             host,
             origin,
@@ -2804,6 +2805,19 @@ fn dispatch_inner(
             caller_role.as_deref(),
             tab,
             caller_pid,
+            projects,
+        ),
+
+        Request::OrchestratorHandoffFiles {
+            action,
+            project,
+            profile,
+            content,
+        } => dispatch_orchestrator_handoff_files(
+            &action,
+            project.as_deref(),
+            profile.as_deref(),
+            content.as_deref(),
         ),
 
         Request::OrchestratorSpawn {
@@ -5871,18 +5885,26 @@ fn dispatch_orchestrator_self(
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
-    let role_suffix = caller_role
-        .and_then(|r| r.strip_prefix("master:"))
-        .or_else(|| caller_role.and_then(|r| r.strip_prefix("solo:")))
-        .map(str::to_string);
-
     // #288: pid 祖先辿り → pane env → stale map → role（複数時エラー）
     let (tab_id, pane_id) = resolve_caller_pane(host, pane, caller_role, caller_pid)?;
 
-    let profile_name = role_suffix
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("default");
+    // #854: master のプロファイルは呼び出し元 env と**ペインの role ラベル**の両方から
+    // 解決する（env が失われていても tako 自身の記録から取り戻す）。solo は handoff を
+    // 持たないので従来どおり env の `solo:` 接頭辞だけを見る
+    let pane_role = host
+        .workspace()
+        .get_tab(tab_id)
+        .and_then(|t| t.tree().get(pane_id))
+        .and_then(|p| p.role())
+        .map(str::to_string);
+    let solo_suffix = caller_role
+        .and_then(|r| r.strip_prefix("solo:"))
+        .filter(|s| !s.is_empty());
+    let (profile_owned, profile_source) = match solo_suffix {
+        Some(s) => (s.to_string(), tako_core::handoff::ProfileSource::CallerRole),
+        None => tako_core::handoff::resolve_master_profile(caller_role, pane_role.as_deref()),
+    };
+    let profile_name = profile_owned.as_str();
 
     // session_id の自動解決（バックエンドセッション → pid 祖先辿り）
     let session_id = resolve_session_id_for_pane_via_host(host, pane_id);
@@ -5899,17 +5921,48 @@ fn dispatch_orchestrator_self(
     let threshold = profile.resolved_ctx_threshold();
     let ctx_threshold = threshold.value;
 
+    // #915 / #916: 読む前に旧形式を自動移行する（実行時の差分検出。冪等）
+    let migration = orchestrator::handoff_store::ensure_migrated(profile_name);
+
+    // #915: 管轄プロジェクトと、その引き継ぎファイルのパス群
+    let jurisdiction =
+        tako_core::handoff::resolve_jurisdiction(&tako_core::handoff::JurisdictionInput {
+            explicit: None,
+            profile_projects: profile.projects.clone().unwrap_or_default(),
+            worker_projects: worker_projects_in_tab(host, tab_id),
+        });
+    let project_handoffs: Vec<Value> = jurisdiction
+        .projects
+        .iter()
+        .map(|key| {
+            let path = orchestrator::handoff_store::project_handoff_path(key);
+            let body = orchestrator::handoff_store::read_project_handoff(key);
+            let doc = body.as_deref().map(tako_core::handoff::split_handoff);
+            json!({
+                "project": key,
+                "path": path.map(|p| p.display().to_string()),
+                "exists": body.is_some(),
+                "format": doc.as_ref().map(|d| d.format().as_str()),
+                "sections": doc.as_ref().map(|d| d.section_labels()),
+            })
+        })
+        .collect();
+
     let handoff_path = orchestrator::handoff_path(profile_name);
     let handoff_exists = handoff_path.as_ref().is_some_and(|p| p.is_file());
     // #792: 自分の引き継ぎファイルが新書式（知識 / 実行状態の 2 節）かどうかを master 自身が
     // 確認できるようにする。不在なら null（「まだ書いていない」と「旧書式」を混ぜない）
-    let handoff_doc =
-        orchestrator::read_handoff(profile_name).map(|c| tako_core::handoff::split_handoff(&c));
+    let memo_content = orchestrator::read_handoff(profile_name);
+    let handoff_doc = memo_content
+        .as_deref()
+        .map(tako_core::handoff::split_handoff);
 
     let mut result = json!({
         "pane_id": pane_id.as_u64(),
         "tab_id": tab_id.as_u64(),
         "profile": profile_name,
+        // #854: プロファイルの出どころ。pane_role なら呼び出し元の env が失われている
+        "profile_source": profile_source.as_str(),
         "role": caller_role,
         "session_id": session_id,
         "status": status,
@@ -5918,21 +5971,39 @@ fn dispatch_orchestrator_self(
         "ctx_threshold_source": threshold.source.as_str(),
         "ctx_over_threshold": ctx_percent.map(|c| c >= ctx_threshold),
         "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
+        // #915: `handoff_path` は**プロファイル運用メモ**（共通置き場）のパス。
+        // プロジェクト固有の引き継ぎは `project_handoffs` の各 path へ書く
         "handoff_path": handoff_path,
         "handoff_exists": handoff_exists,
         "handoff_format": handoff_doc.as_ref().map(|d| d.format().as_str()),
         "handoff_sections": handoff_doc.as_ref().map(|d| d.section_labels()),
+        "handoff_projects_dir": orchestrator::handoff_store::projects_handoff_dir()
+            .map(|p| p.display().to_string()),
+        "project_handoffs": project_handoffs,
+        "jurisdiction_source": jurisdiction.source.as_str(),
+        // #915: 旧形式からの自動移行の実施（可視化。migrated=false なら何もしていない）
+        "handoff_migration": migration,
     });
+    // 運用メモが膨らんでいたら肥大の再発なので警告する（#915 要件 3）
+    let mut warnings: Vec<String> = migration.warnings.clone();
+    warnings.extend(
+        memo_content
+            .as_deref()
+            .and_then(|m| tako_core::handoff::profile_memo_warning(profile_name, m)),
+    );
     // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
     if threshold.clamped() {
         result["ctx_threshold_raw"] = json!(threshold.raw);
-        result["warnings"] = json!([format!(
+        warnings.push(format!(
             "ctx_threshold={} は値域外のため {} へ丸めた（{}〜{}）",
             threshold.raw,
             ctx_threshold,
             tako_core::handoff::CTX_THRESHOLD_MIN,
             tako_core::handoff::CTX_THRESHOLD_MAX
-        )]);
+        ));
+    }
+    if !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
     }
     Ok(result)
 }
@@ -6166,6 +6237,177 @@ fn capture_scrollback_joined(session: &str, lines: usize) -> Option<String> {
     capture.capture_history_joined(&session, lines)
 }
 
+/// OrchestratorHandoffFiles — 引き継ぎファイルの管理（#915）。
+///
+/// GUI を持たないローカル処理なので CLI もこの関数を直接呼ぶ（`layout` / `accounts` と同じ形）。
+/// action: list（一覧）/ show（1 件）/ write（1 件を書く）/ migrate（旧形式の自動移行）
+pub fn dispatch_orchestrator_handoff_files(
+    action: &str,
+    project: Option<&str>,
+    profile: Option<&str>,
+    content: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator::handoff_store as store;
+    use tako_core::handoff as ho;
+
+    let describe = |path: &std::path::Path| {
+        let body = std::fs::read_to_string(path).unwrap_or_default();
+        let doc = ho::split_handoff(&body);
+        json!({
+            "path": path.display().to_string(),
+            "lines": body.lines().count(),
+            "bytes": body.len(),
+            "format": doc.format().as_str(),
+            "sections": doc.section_labels(),
+        })
+    };
+
+    match action {
+        "list" => {
+            let projects: Vec<Value> = store::list_project_handoffs()
+                .into_iter()
+                .map(|(key, path)| {
+                    let mut v = describe(&path);
+                    v["project"] = json!(key);
+                    v
+                })
+                .collect();
+            let memos: Vec<Value> = store::list_profile_memos()
+                .into_iter()
+                .map(|(name, path)| {
+                    let mut v = describe(&path);
+                    v["profile"] = json!(name);
+                    let body = std::fs::read_to_string(&path).unwrap_or_default();
+                    v["warning"] = json!(ho::profile_memo_warning(&name, &body));
+                    v
+                })
+                .collect();
+            Ok(json!({
+                "projects_dir": store::projects_handoff_dir().map(|p| p.display().to_string()),
+                "project_handoffs": projects,
+                "profile_memos": memos,
+                "archive_dir": store::archive_dir().map(|p| p.display().to_string()),
+            }))
+        }
+        "show" => match (project, profile) {
+            (Some(key), None) => {
+                let path = store::project_handoff_path(key).ok_or_else(|| {
+                    DispatchError::InvalidParams(format!(
+                        "プロジェクトキーがファイル名として使えない: {key}"
+                    ))
+                })?;
+                let body = store::read_project_handoff(key);
+                let doc = body.as_deref().map(ho::split_handoff);
+                Ok(json!({
+                    "project": key,
+                    "path": path.display().to_string(),
+                    "exists": body.is_some(),
+                    "format": doc.as_ref().map(|d| d.format().as_str()),
+                    "sections": doc.as_ref().map(|d| d.section_labels()),
+                    "content": body,
+                    "template": body.is_none().then(|| ho::project_handoff_template(key)),
+                }))
+            }
+            (None, Some(name)) => {
+                let path = crate::orchestrator::handoff_path(name)
+                    .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?;
+                let body = crate::orchestrator::read_handoff(name);
+                let doc = body.as_deref().map(ho::split_handoff);
+                Ok(json!({
+                    "profile": name,
+                    "path": path.display().to_string(),
+                    "exists": body.is_some(),
+                    "format": doc.as_ref().map(|d| d.format().as_str()),
+                    "sections": doc.as_ref().map(|d| d.section_labels()),
+                    "content": body,
+                    "warning": body.as_deref().and_then(|b| ho::profile_memo_warning(name, b)),
+                }))
+            }
+            _ => Err(DispatchError::InvalidParams(
+                "show は project か profile のどちらか一方を指定する".into(),
+            )),
+        },
+        "write" => {
+            let body = content.ok_or_else(|| {
+                DispatchError::InvalidParams("write は content を指定する".into())
+            })?;
+            let text = if body.ends_with('\n') {
+                body.to_string()
+            } else {
+                format!("{body}\n")
+            };
+            match (project, profile) {
+                (Some(key), None) => {
+                    let path = store::write_project_handoff(key, &text)
+                        .map_err(DispatchError::Operation)?;
+                    Ok(json!({
+                        "project": key,
+                        "path": path.display().to_string(),
+                        "bytes": text.len(),
+                        "format": ho::split_handoff(&text).format().as_str(),
+                    }))
+                }
+                (None, Some(name)) => {
+                    let path =
+                        store::write_profile_memo(name, &text).map_err(DispatchError::Operation)?;
+                    Ok(json!({
+                        "profile": name,
+                        "path": path.display().to_string(),
+                        "bytes": text.len(),
+                        "warning": ho::profile_memo_warning(name, &text),
+                    }))
+                }
+                _ => Err(DispatchError::InvalidParams(
+                    "write は project か profile のどちらか一方を指定する".into(),
+                )),
+            }
+        }
+        // #916 の段 2 を手でも撃てるようにしたもの（通常は自動で走る）
+        "migrate" => {
+            let outcomes = match profile {
+                Some(name) => vec![store::ensure_migrated(name)],
+                None => store::migrate_all(),
+            };
+            let summaries: Vec<String> = outcomes.iter().filter_map(|o| o.summary()).collect();
+            Ok(json!({
+                "migrations": outcomes,
+                "summaries": summaries,
+                "migrated": !summaries.is_empty(),
+            }))
+        }
+        other => Err(DispatchError::InvalidParams(format!(
+            "未知の action: {other}（list | show | write | migrate）"
+        ))),
+    }
+}
+
+/// このタブで稼働している worker のプロジェクト集合（#915 の管轄推定の材料）。
+///
+/// レジストリの active エントリのうち、**このタブに実在するペイン**のものだけを拾う
+/// （tako の運用は「1 グループ = 1 タブ」で、master が spawn した worker は同じタブに
+/// 並ぶ。番号再利用で他タブのペインを拾わないよう、タブの実在で絞る）
+fn worker_projects_in_tab(host: &dyn ControlHost, tab_id: TabId) -> Vec<String> {
+    let Ok(registry) = crate::orchestrator::registry::WorkerRegistry::load() else {
+        return Vec::new();
+    };
+    let Some(tab) = host.workspace().get_tab(tab_id) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in registry.workers.values().filter(|e| e.is_active()) {
+        if entry.project.is_empty() {
+            continue;
+        }
+        if tab.tree().get(PaneId::from_raw(entry.pane)).is_none() {
+            continue;
+        }
+        if !out.contains(&entry.project) {
+            out.push(entry.project.clone());
+        }
+    }
+    out
+}
+
 /// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
 /// handoff 内容を含むプロンプトを注入する。
@@ -6182,29 +6424,9 @@ fn dispatch_orchestrator_handoff(
     caller_role: Option<&str>,
     tab: Option<u64>,
     caller_pid: Option<u32>,
+    projects: Option<Vec<String>>,
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
-
-    // caller_role は env 由来（`master:<profile>`。MCP / CLI）とペインの role ラベル由来
-    // （`orchestrator-master:<profile>`。stale binary restart などの内部呼び出し）の
-    // 両方が流れ込む。どちらでもプロファイルへ解決する（#761）
-    let profile_name = caller_role
-        .and_then(tako_core::handoff::master_profile_of_any_role)
-        .unwrap_or(tako_core::handoff::DEFAULT_PROFILE);
-
-    // handoff ファイルの存在確認
-    let handoff_content = orchestrator::read_handoff(profile_name).ok_or_else(|| {
-        let path = orchestrator::handoff_path(profile_name)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        // #792: 書けと言うだけでなく**どう書くか**（2 節の雛形）まで返す。
-        // これを最初に読むのは AI なので、ここが書式を知る唯一の機会になりうる
-        let template = tako_core::handoff::handoff_template(profile_name);
-        DispatchError::Operation(format!(
-            "handoff ファイルが見つからない: {path}\n\
-                 master は引き継ぎ前にこのファイルに状態を書き込む必要がある。書式:\n{template}"
-        ))
-    })?;
 
     // #288: 分割元ペインの解決。`tab` 指定時はそのタブのフォーカスペインを分割元にする
     // ので、呼び出し元（= 退役する master）とは別物になりうる
@@ -6229,8 +6451,54 @@ fn dispatch_orchestrator_handoff(
             .is_some_and(|r| r.starts_with("orchestrator-master"))
     });
 
+    // #854: プロファイルは呼び出し元の env（`master:<profile>`）と**ペインの role ラベル**
+    // （`orchestrator-master:<profile>`）の両方から解決する。インライン前置きで注入した
+    // env はシェルへ export されないので、claude を撃ち直した master は env を失う
+    // （実発の症状 `TAKO_ORCHESTRATOR_ROLE=[master]` と一致）。tako 自身が持つ role
+    // ラベルを第 2 の出どころにすることで、後任がアカウント・モデル・引き継ぎファイルを
+    // 取り違えなくなる
+    let pane_role = previous_pane.or(caller.map(|(_, p)| p)).and_then(|p| {
+        host.workspace()
+            .get_tab(tab_id)
+            .and_then(|t| t.tree().get(p))
+            .and_then(|pane| pane.role())
+            .map(str::to_string)
+    });
+    let (profile_owned, profile_source) =
+        tako_core::handoff::resolve_master_profile(caller_role, pane_role.as_deref());
+    let profile_name = profile_owned.as_str();
+
+    // #915 / #916: 読む前に旧形式を自動移行する（実行時の差分検出。冪等）
+    let migration = orchestrator::handoff_store::ensure_migrated(profile_name);
+
     // プロファイルの読み込みとエージェント解決
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+
+    // #915: 管轄プロジェクトの解決。明示引数 → プロファイル担当 + 稼働 worker → worker のみ
+    let jurisdiction =
+        tako_core::handoff::resolve_jurisdiction(&tako_core::handoff::JurisdictionInput {
+            explicit: projects.clone(),
+            profile_projects: profile.projects.clone().unwrap_or_default(),
+            worker_projects: worker_projects_in_tab(host, tab_id),
+        });
+    let bundle = orchestrator::handoff_store::collect_bundle(profile_name, jurisdiction);
+    if !bundle.as_successor().has_content() && bundle.catalog.is_empty() {
+        let memo_path = orchestrator::handoff_path(profile_name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let projects_dir = orchestrator::handoff_store::projects_handoff_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        // #792 / #915: 書けと言うだけでなく**どこへどう書くか**まで返す。
+        // これを最初に読むのは AI なので、ここが書式を知る唯一の機会になりうる
+        let template = tako_core::handoff::project_handoff_template("<project-key>");
+        return Err(DispatchError::Operation(format!(
+            "引き継ぎの材料が無い（プロジェクト単位のファイルも運用メモも空）。\n\
+             プロジェクト固有の引き継ぎ: {projects_dir}/<project-key>.md\n\
+             プロジェクトに紐付かない運用メモ: {memo_path}\n\
+             master は引き継ぎ前に前者へ状態を書き込む必要がある。書式:\n{template}"
+        )));
+    }
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env().map_err(DispatchError::Operation)?;
     // 引き継ぎ先の master も master_account を反映する（#547。CLI の master 起動と同じ規則）
@@ -6269,13 +6537,26 @@ fn dispatch_orchestrator_handoff(
     // cwd はホームディレクトリ
     let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
 
-    // 新ペインを分割（右方向、spawn_worker レイアウト使用）
+    // 新ペインを分割。#917: 退役する master が同じタブに居るなら**その master のペインを
+    // 分割する**。旧ペインが閉じられた時点で残った後任が旧ペインの矩形をそのまま継ぐので、
+    // 交代の前後でレイアウトが変わらない（「場所が入れ替わる」体験）。周囲の worker /
+    // ユーザーペインには一切触らない。旧 master を特定できないときだけ従来の
+    // worker 領域レイアウトへ落とす
     let new_pane = tako_core::Pane::new(origin);
     let new_id = new_pane.id();
-    let layout = crate::setup::spawn_layout_config();
-    tree_mut(host.workspace_mut(), tab_id)
-        .spawn_worker(split_target, new_pane, &layout)
-        .map_err(op_err)?;
+    match previous_pane {
+        Some(prev) => {
+            tree_mut(host.workspace_mut(), tab_id)
+                .split(prev, tako_core::SplitDirection::Right, new_pane)
+                .map_err(op_err)?;
+        }
+        None => {
+            let layout = crate::setup::spawn_layout_config();
+            tree_mut(host.workspace_mut(), tab_id)
+                .spawn_worker(split_target, new_pane, &layout)
+                .map_err(op_err)?;
+        }
+    }
     let _ = tree_mut(host.workspace_mut(), tab_id).focus(split_target);
 
     // セッション起動（cwd をホームに、プロファイル env を注入。Issue #500）
@@ -6304,12 +6585,9 @@ fn dispatch_orchestrator_handoff(
     // handoff プロンプトの構成と送信（#749: 文面は tako-core の純粋関数が正）。
     // #792: 新書式（2 節）なら節ごとの扱い、旧書式なら「番号は実態で確認 + 次回は書き直せ」が
     // 文面に付く。**引き継ぎ内容そのものは書式に関係なく全文が渡る**（後方互換）
-    let handoff_doc = tako_core::handoff::split_handoff(&handoff_content);
-    let handoff_prompt = tako_core::handoff::successor_prompt(
-        profile_name,
-        &handoff_content,
-        previous_pane.map(PaneId::as_u64),
-    );
+    let successor = bundle.as_successor();
+    let handoff_prompt =
+        tako_core::handoff::successor_prompt(&successor, previous_pane.map(PaneId::as_u64));
     host.queue_prompt_flow(new_id, handoff_prompt.clone());
 
     // タイトルと role 設定
@@ -6322,16 +6600,29 @@ fn dispatch_orchestrator_handoff(
     pane_obj.set_role(Some(new_role.clone()));
 
     let handoff_path = orchestrator::handoff_path(profile_name);
+    let mut warnings: Vec<String> = migration.warnings.clone();
+    warnings.extend(bundle.memo_warning.clone());
     Ok(json!({
         "new_master_pane_id": new_id.as_u64(),
         "new_master_tab_id": tab_id.as_u64(),
         "profile": profile_name,
+        // #854: プロファイルをどこから決めたか（caller_role / pane_role / default）。
+        // pane_role が出たら呼び出し元の env が失われていたということ
+        "profile_source": profile_source.as_str(),
         "role": new_role,
         "handoff_file": handoff_path,
         "handoff_prompt_length": handoff_prompt.len(),
-        // #792: 読み取った引き継ぎファイルの書式。旧書式なら "legacy"（動作は従来どおり）
-        "handoff_format": handoff_doc.format().as_str(),
-        "handoff_sections": handoff_doc.section_labels(),
+        // #915: 渡した管轄プロジェクトと、その決め方
+        "projects": bundle.jurisdiction.projects,
+        "jurisdiction_source": bundle.jurisdiction.source.as_str(),
+        "project_files": bundle.projects.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        "missing_project_files": bundle.missing_projects,
+        // #915: 旧形式からの自動移行の実施（可視化。migrated=false なら何もしていない）
+        "handoff_migration": migration,
+        "warnings": warnings,
+        // #792: 渡した引き継ぎの書式。新旧が混ざっていたら "mixed"
+        "handoff_format": successor.format(),
+        "handoff_sections": successor.section_labels(),
         // #749: 退役するペイン。null なら後任に kill を指示していない
         // （旧 master を特定できなかった = 安全側に倒した）
         "previous_master_pane_id": previous_pane.map(PaneId::as_u64),
@@ -9391,7 +9682,7 @@ fn dispatch_stale_binary_restart(
 
     if is_master {
         // master: handoff 経由で新 master を spawn
-        dispatch_orchestrator_handoff(host, origin, pane, Some(&role), None, None)
+        dispatch_orchestrator_handoff(host, origin, pane, Some(&role), None, None, None)
     } else {
         // worker: session_id を解決して resume
         let backend = host.backend_session(pane_id);
@@ -13931,12 +14222,15 @@ mod tests {
                 caller_role: Some("master:".into()),
                 tab: None,
                 caller_pid: None,
+                projects: None,
             },
             PaneOrigin::Mcp,
         );
-        assert!(result.is_err(), "handoff ファイル不在はエラー");
+        assert!(result.is_err(), "引き継ぎの材料が無ければエラー");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("handoff ファイルが見つからない"), "{err}");
+        assert!(err.contains("引き継ぎの材料が無い"), "{err}");
+        // #915: プロジェクト単位の置き場と運用メモの**両方**のパスを返す
+        assert!(err.contains("projects/<project-key>.md"), "{err}");
         // #792: 書式（2 節の雛形）まで返す。ここが AI が書式を知る唯一の機会になりうる
         let lang = tako_core::i18n::lang();
         for section in [
@@ -14003,6 +14297,7 @@ mod tests {
                         caller_role: Some(format!("master:{profile}")),
                         tab: None,
                         caller_pid: None,
+                        projects: None,
                     },
                     PaneOrigin::Mcp,
                 )
@@ -14082,6 +14377,7 @@ mod tests {
                 caller_role: Some(format!("master:{profile}")),
                 tab: None,
                 caller_pid: None,
+                projects: None,
             },
             PaneOrigin::Mcp,
         )
@@ -14252,6 +14548,7 @@ mod tests {
                     caller_role: Some(format!("master:{profile}")),
                     tab: Some(tab_id),
                     caller_pid: None,
+                    projects: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -14319,6 +14616,7 @@ mod tests {
                     caller_role: Some(format!("master:{profile}")),
                     tab: None,
                     caller_pid: None,
+                    projects: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -14369,6 +14667,7 @@ mod tests {
                     caller_role: Some(format!("master:{profile}")),
                     tab: None,
                     caller_pid: None,
+                    projects: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -14458,6 +14757,7 @@ mod tests {
                     caller_role: Some(format!("master:{profile}")),
                     tab: None,
                     caller_pid: None,
+                    projects: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -14497,6 +14797,7 @@ mod tests {
                     caller_role: Some(format!("orchestrator-master:{profile}")),
                     tab: None,
                     caller_pid: None,
+                    projects: None,
                 },
                 PaneOrigin::Mcp,
             )

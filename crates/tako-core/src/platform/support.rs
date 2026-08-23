@@ -706,6 +706,16 @@ pub const MATRIX: &[Feature] = &[
         },
     },
     Feature {
+        // #915: 引き継ぎファイルの管理（一覧 / 読み / 書き / 自動移行）。
+        // GUI も IPC も要らないローカルのファイル操作で、実装は両 OS 共通（パスは
+        // `PathBuf::join` だけで組み、キーは両 OS で通る文字しか受理しない）。
+        // Windows 実機で 13/13 実測済み（移行・冪等・list / show / write・
+        // 日本語本文の保存・危険なキーの拒否・`\` 区切りのパス）
+        key: "tako_orchestrator_handoffs",
+        macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
         key: "tako_orchestrator_layout",
         macos: Support::Supported,
         windows: Support::Pending {

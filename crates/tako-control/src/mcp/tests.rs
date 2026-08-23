@@ -498,7 +498,8 @@ mod tests {
         // #657 の tako_menu（Windows 移植スライス 5）を追加して 135
         // #525 の tako_shell_integration（Windows 移植スライス 7）を追加して 136
         // #868 の tako_setup_bootstrap（ゼロスタート導入）を追加して 137
-        assert_eq!(tools.len(), 137);
+        // #915 の tako_orchestrator_handoffs（引き継ぎファイルの管理）を追加して 138
+        assert_eq!(tools.len(), 138);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

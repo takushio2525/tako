@@ -327,3 +327,30 @@ changes:
         tmux などの任意依存は brew があるときだけ案内する
       - AI からは `tako setup bootstrap`（MCP `tako_setup_bootstrap`）で
         同じ状態確認・実行ができる
+
+  - revision: 17
+    version: "0.7.7"
+    date: "2026-08-23"
+    kind: auto
+    title: 引き継ぎ（handoff）がプロジェクト単位になった
+    description: |
+      master の引き継ぎファイルはこれまで**プロファイル単位**（`handoff/<profile>.md`）
+      だった。`default` のような汎用プロファイルは複数の master が別々のミッションで
+      使うため、1 ファイルに全プロジェクトの知識が積み上がり（実測 528 行 / 62KB）、
+      交代した master は自分と無関係なプロジェクトの長文を最初に読まされていた
+      （Issue #915）。
+
+      置き場を**プロジェクト単位**へ移した:
+
+        - `handoff/projects/<project-key>.md` … プロジェクトごとの引き継ぎ。
+          交代のときは**そのプロジェクトを担当している master の後任にだけ**渡る
+        - `handoff/<profile>.md` … プロファイル運用メモ（共通置き場）。
+          プロジェクトに紐付かない運用知識だけを置く。常に渡る
+
+      確認事項:
+      - **移行は自動で完了する**（この setup の実行でも、master が引き継ぎを読む
+        タイミングでも走る。何度実行しても壊れない）。手で分割する作業は要らない
+      - 移行前のファイルは消さずに `handoff/archive/` へ退避する
+      - 持ち主を判別できなかった内容は捨てずに運用メモへ残す。運用メモが 80 行を
+        超えていると master へ警告が出るので、そこから先は master が整理する
+      - 交代した master が渡された内容は `tako orchestrator handoffs list` で確認できる
