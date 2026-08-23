@@ -55,6 +55,17 @@ tako/
 - 新機能の操作ロジックは tako-core の操作 API として実装し、`tako-control::dispatch`
   （protocol + ControlHost）へ 1:1 で載せる（UI 層に閉じたロジックを作らない）。
   Phase 2 以降、CLI はこの経路で操作できる。MCP 公開（Phase 3）も同じ dispatch を呼ぶ
+- **設定・データファイルのスキーマ変更は常に自動マイグレーション（#916）**: 永続ファイル
+  （`settings.json` / `layout.json` / `projects.yaml` / `profiles/*.yaml` / `handoff/` 等）の
+  **形式や置き場を変えるときは自動移行を同梱する**。ユーザーや master へ手動の移行作業を
+  要求してはならない（「移行手順を提示する」も不可）。実装は `tako-core::migration` の機構へ
+  `tako-control::migrations::SPECS` の `target_version` を上げて `Step` を足す形で載せる。
+  発火は二段構え（`tako setup` 実行時 + GUI / master / CLI の実行時差分検出）で既に配線済み
+  なので、登録するだけで両方から効く。安全要件（冪等 / 旧ファイルは `.pre-v<N>.bak` へ退避して
+  消さない / 解釈できない内容は `.unreadable.bak` へ保全 / persist.log へ記録）は機構側の
+  1 実装が担保する。**永続構造体のフィールドを増減・改名した PR は
+  `migration_registry` テスト（指紋スナップショット）が落ちる**ので、
+  「serde の default / alias で旧ファイルがそのまま読める」か「移行を足した」かを明示する
 - **「最も簡単なコマンドを提案する」原則（#322）**: ユーザーへ提示するコマンドは常に最簡形
   （既定値で済む引数を付けない。`tako master -default` ではなく `tako master`）。機能追加は
   新しい `--オプション` ではなく既定動作を賢くする方向で設計する。CLI 出力・system prompt・
@@ -103,6 +114,7 @@ tako/
 | Markdown コードブロックのコピー（#680） | `tako preview-copy-code [index]`（装飾なしの全文をクリップボードへ。index は出現順 0 始まり・省略で先頭。GUI はブロック右上のコピーボタンと同一経路。MCP `tako_preview_copy_code` と 1:1） |
 | プレビューライブリロード | `tako preview-reload [on\|off]`（引数なしで現在値。既定 ON・settings.json 永続化・MCP `tako_preview_reload` と 1:1。#233） |
 | プレビュー画像キャッシュ | `tako preview-cache [max_mb]`（引数なしで上限・使用量・件数。既定 512MiB、256〜8192MiB、settings.json 永続化・MCP `tako_preview_cache` と 1:1。#258） |
+| 設定の自動マイグレーション（#916） | `tako migrate [status\|run] [--schema <種別>]`（引数なしで全永続ファイルの形式を確認するだけ = 何も書き換えない。`run` で当てる）。**普段は呼ぶ必要がない**: `tako setup` 実行時と GUI / master / CLI の起動時に自動で当たる。旧内容は `.pre-v<N>.bak`、解釈できない内容は `.unreadable.bak` へ退避されるので消えない。冪等（何度流しても壊れない）。応答の `files[].state` が `unreadable` のものは「設定が壊れているので既定値で動いている」という意味。MCP `tako_migrate` と 1:1 |
 | 受け入れゲート（#244） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` / `tako task gate check <task_id>` / `tako task gate show <task_id>`（MCP `tako_task_gate` / `tako_task_gate_check` / `tako_task_gate_show` と 1:1） |
 | git ブランチ操作（#496） | `tako git checkout <branch>` / `branch <name> [--from <ref>] [--no-checkout]` / `merge <branch> [--no-ff]` / `abort` / `conflicts`（checkout・merge は既定で**実行せず**「何が起きるか」を出す。`--yes` で実行。MCP `tako_git_checkout` / `tako_git_branch_create` / `tako_git_merge` / `tako_git_merge_abort` / `tako_git_conflicts` と 1:1） |
 | コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude\|codex\|agy] [--tab N]`（同じタブにペインを立て、リポジトリ・未解決ファイル・マージ元/先を含む解消プロンプトを自動投入。文面は `<data_dir>/orchestrator/conflict-resolver.md` で差し替え可。MCP `tako_git_resolve_agent` と 1:1） |

@@ -323,3 +323,70 @@ echo "        ${registered}（${note}）"  # ○
 ```sh
 grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]' scripts/*.sh scripts/lib/*.sh
 ```
+
+## 設定・データファイルのスキーマ変更（Issue #916）
+
+**永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**
+「自動が難しいので移行手順を提示する」も不可（ユーザー確定方針）。
+
+### どこに何を足すか
+
+1. `tako-control::migrations::SPECS` の該当 `SchemaSpec` の `target_version` を +1
+2. 同じ spec の `steps` に `Step { from, to, describe, apply, once }` を 1 本足す
+3. `detect` が**内容から**新旧を見分けられるようにする（版数フィールドがあるなら
+   `detect_version_field`、無いなら構造の特徴で）
+4. `TAKO_UPDATE_SCHEMA_FINGERPRINT=1 cargo test -p tako-control --test migration_registry`
+   で指紋を更新する
+
+新しい永続ファイルを足すときは `SchemaId` に番地を切り、`SPECS` と
+`migrations::targets` と `config_share::catalog` の 3 つへ載せる
+（載せ忘れは `migration_registry` / `config_share_catalog` テストが名指しで落とす）。
+
+### 発火は既に配線されている
+
+- `tako setup` 実行時 = `migrations::setup_lines()`
+- 実行時の差分検出 = `migrations::ensure_migrated()`（GUI 起動 / `tako master` /
+  dispatch のプロファイル解決。1 プロセス 1 回）
+- 明示 = `tako migrate run` / MCP `tako_migrate`
+
+**発火点を新しく足さないこと**。増やすと「どこで直るか」が分からなくなる。
+
+### 守られる安全要件（機構側の 1 実装が担保する）
+
+| 要件 | 実装 |
+|---|---|
+| 冪等 | 版数は外部の記録ではなく**内容から判定**（`detect`）。`apply` は「もう当たっている」なら `Ok(None)` を返す |
+| 旧ファイルを消さない | 書く前に `<name>.pre-v<from>.bak` へ退避。退避が取れなければ**書かない** |
+| 解釈できない内容を捨てない | `validate` が Err なら `<name>.unreadable.bak` へ丸ごと退避して申告（既定値へ黙って落とさない） |
+| 失敗時に元を守る | `apply` が Err なら元のファイルを 1 バイトも触らない |
+| 未来の形式を壊さない | ファイルが `target_version` より新しければ触らず `Refused` |
+| 実施の可視化 | persist.log へ「移行: <種別> v1 -> v2: <パス>（退避 …・発生源 …）」 |
+
+### 一度だけの移行（`once: true`）
+
+「**利用者が旧い値へ意図して戻す自由がある**」移行だけに使う（例: #27 の `[1m]` 既定モデル
+除去。移行後にユーザーが自分で `[1m]` を選び直したら尊重する）。印は**退避ファイルの存在**で
+持つので状態ファイルを増やさない。機構より前の手書き移行を取り込むときは
+`once_markers` に旧い印の接尾辞を並べる（`.backup-1m`）。
+
+### 冪等性を「記録」で作らないこと
+
+「移行済み」を別ファイルへ記録する方式は #513 の設定共有で必ず壊れる
+（マシン A が移行して push → マシン B は新形式のファイルと古い記録を持つ）。
+判定は必ず内容から行う。
+
+### やってはいけない `unwrap_or_default()`
+
+永続ファイルを読んで `unwrap_or_default()` / `.ok()` で既定値へ落とすのは、
+**その直後の保存が利用者の内容を上書きして消す**ことを意味する。落とす前に
+`tako_core::migration::quarantine_unreadable` を通すか、`Err` を返して手を出さない
+（実測の被害例: `settings.json` の `theme_colors` / `theme_presets`、
+`~/.claude.json` の MCP 登録と信頼済みフォルダ）。
+
+### テストが本番の設定を触らないこと
+
+ユニットテストから設定ファイルの書き込み経路を呼ぶときは、隔離が
+**テストの実行順に依存しない**ことを確かめる（`OnceLock` の初期化をヘルパー任せに
+すると、そのヘルパーを通らないテストが本番へ書く）。`orchestrator::config_dir()` は
+`cfg(test)` で必ず隔離先へ倒れる。`migrations::run` は `TAKO_DATA_DIR` が明示されていない
+テストビルドでは何もしない。

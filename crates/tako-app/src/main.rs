@@ -20323,6 +20323,13 @@ fn main() {
             }
         }
     }
+    // 設定・データファイルの自動マイグレーション（#916 の二段構え 2 段目 = 実行時発火）。
+    // **どのファイルを読むより先**に置く（この直後の settings.json 読みも含めて、
+    // 全経路が最新形式のファイルを見ることになる）。旧形式・破損の申告は
+    // persist.log と、下の一言（起動ログ）に出る
+    if let Some(notice) = tako_control::migrations::ensure_migrated() {
+        eprintln!("info: {notice}");
+    }
     // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
     {
         let settings = tako_control::settings::load();
