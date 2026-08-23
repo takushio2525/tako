@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use tako_core::remote_fs::{RemoteEntry, RemoteRef};
+
 /// 1 ディレクトリの最大表示エントリ数（巨大ディレクトリの暴走防止）
 const MAX_ENTRIES: usize = 500;
 /// 展開を辿る最大深さ（シンボリックリンクループ等の暴走防止）
@@ -40,6 +42,34 @@ pub struct Row {
     pub expanded: bool,
     pub root: bool,
     pub git_status: Option<GitChange>,
+    /// `Some` = リモート（SSH 先）の行（#919）。**ローカル FS の操作を一切通さない**
+    /// ための目印で、クリック・右クリック・D&D はここを見て分岐する。
+    /// `entry.path` は表示と行の同定にだけ使い、ファイルシステムへは渡さない
+    pub remote: Option<RemoteRef>,
+    /// 読み込み中・失敗の説明行（クリックできない情報行）。
+    /// #919 の「静かな失敗禁止」= 失敗を行として必ず見せる
+    pub note: Option<RowNote>,
+}
+
+/// 情報行の種別（クリック不可の行に何を出すか）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowNote {
+    /// 読み込み中
+    Loading,
+    /// 失敗（要約 + 次の一手 + 詳細をそのまま出す）
+    Error(String),
+    /// 空ディレクトリ
+    Empty,
+}
+
+/// 1 リモートディレクトリの読み込み状態
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteDir {
+    pub entries: Vec<RemoteEntry>,
+    /// 失敗の説明（`RemoteError::report()` をそのまま持つ）
+    pub error: Option<String>,
+    /// 読み込みを投げて結果を待っている
+    pub loading: bool,
 }
 
 /// ファイルツリーの状態。`visible` は FR-3.7（折りたたみで純粋なターミナルに戻る）
@@ -60,6 +90,19 @@ pub struct FileTree {
     /// （実機で確認済み）。tako はホームを開いた初回印象が壊れるのを優先して
     /// ドット全体を既定で隠し、ワンクリックで戻せる形にしている
     show_hidden: bool,
+
+    // --- リモート（SSH 先）のワークスペースフォルダ（#919 / #65） -------------
+    //
+    // ローカルと**別の器**に持つ: `PathBuf` は OS 依存の区切りを持つので、
+    // リモートの POSIX パス（Windows の `/C:/...` を含む）を混ぜると
+    // Windows 側で `join` / `parent` が `\\` を作って壊れる。
+    // 読み込みはネットワーク I/O なので**展開したときだけ**背景で取る（ポーリングしない）
+    /// リモートルート（開いた順）
+    remote_roots: Vec<RemoteRef>,
+    /// 展開中のリモートディレクトリ（ルート自身も含む）
+    remote_expanded: HashSet<RemoteRef>,
+    /// リモートディレクトリの読み込み状態
+    remote_cache: HashMap<RemoteRef, RemoteDir>,
 }
 
 impl FileTree {
@@ -173,6 +216,12 @@ impl FileTree {
 
     fn build_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
+        // リモートルートを先に出す（#919）: 「リモートからフォルダを開く」直後に
+        // 開いたものが見えないと開けたことが分からない（ローカルルートは
+        // ペインの cwd 由来で何本も並ぶ）
+        for remote in &self.remote_roots {
+            self.collect_remote_rows(remote, 0, true, &mut rows);
+        }
         for root in &self.roots {
             let expanded = self.expanded.contains(root);
             rows.push(Row {
@@ -188,6 +237,8 @@ impl FileTree {
                 expanded,
                 root: true,
                 git_status: None,
+                remote: None,
+                note: None,
             });
             if expanded {
                 self.collect_rows(root, 1, &mut rows);
@@ -217,6 +268,8 @@ impl FileTree {
                 expanded,
                 root: false,
                 git_status,
+                remote: None,
+                note: None,
             });
             if expanded {
                 self.collect_rows(&entry.path, depth + 1, rows);
@@ -251,6 +304,215 @@ impl FileTree {
         targets.extend(self.expanded.iter().cloned());
         targets.dedup();
         targets
+    }
+
+    // --- リモート（SSH 先）のワークスペースフォルダ（#919 / #65） -------------
+
+    /// 開いているリモートルート
+    pub fn remote_roots(&self) -> &[RemoteRef] {
+        &self.remote_roots
+    }
+
+    /// リモートルートを追加する（既にあれば何もしない）。追加したら true。
+    /// 追加時は展開して読み込み待ちにする = 開いた直後から中身を取りに行く
+    pub fn add_remote_root(&mut self, remote: RemoteRef) -> bool {
+        if self.remote_roots.contains(&remote) {
+            // 既に開いているものを開き直したら、内容だけ取り直す
+            self.remote_cache.remove(&remote);
+            self.remote_expanded.insert(remote);
+            self.rows_cache = None;
+            return false;
+        }
+        self.remote_expanded.insert(remote.clone());
+        // 先頭に積む（最後に開いたものが一番上）
+        self.remote_roots.insert(0, remote);
+        self.rows_cache = None;
+        true
+    }
+
+    /// リモートルートを閉じる。配下の展開状態・キャッシュも落とす。閉じたら true
+    pub fn remove_remote_root(&mut self, remote: &RemoteRef) -> bool {
+        let before = self.remote_roots.len();
+        self.remote_roots.retain(|r| r != remote);
+        if self.remote_roots.len() == before {
+            return false;
+        }
+        let prefix = format!("{}/", remote.path.trim_end_matches('/'));
+        let under = |r: &RemoteRef| {
+            r.host == remote.host && (r.path == remote.path || r.path.starts_with(&prefix))
+        };
+        self.remote_expanded.retain(|r| !under(r));
+        self.remote_cache.retain(|r, _| !under(r));
+        self.rows_cache = None;
+        true
+    }
+
+    /// リモートディレクトリの展開 ⇄ 折りたたみ。展開したら読み込み待ちにする
+    pub fn toggle_remote_dir(&mut self, remote: &RemoteRef) {
+        if self.remote_expanded.contains(remote) {
+            self.remote_expanded.remove(remote);
+        } else {
+            self.remote_expanded.insert(remote.clone());
+        }
+        self.rows_cache = None;
+    }
+
+    /// 内容を取り直す（更新ボタン・開き直し）。配下のキャッシュも落とす
+    pub fn invalidate_remote(&mut self, remote: &RemoteRef) {
+        let prefix = format!("{}/", remote.path.trim_end_matches('/'));
+        self.remote_cache.retain(|r, _| {
+            !(r.host == remote.host && (r.path == remote.path || r.path.starts_with(&prefix)))
+        });
+        self.rows_cache = None;
+    }
+
+    /// これから読む必要があるリモートディレクトリ（展開済みでキャッシュが無いもの）。
+    /// 呼び出し側が background へ投げ、結果を [`Self::apply_remote_dir`] へ返す。
+    /// **ポーリングしない**（ネットワーク I/O を毎秒叩かない）ので、
+    /// 一度読んだものは `invalidate_remote` されるまで再取得しない
+    pub fn remote_pending(&mut self) -> Vec<RemoteRef> {
+        let targets: Vec<RemoteRef> = self
+            .remote_expanded
+            .iter()
+            .filter(|r| !self.remote_cache.contains_key(r))
+            .cloned()
+            .collect();
+        // 二重投げを防ぐため、返した時点で loading を立てる
+        for t in &targets {
+            self.remote_cache.insert(
+                t.clone(),
+                RemoteDir {
+                    loading: true,
+                    ..Default::default()
+                },
+            );
+        }
+        if !targets.is_empty() {
+            self.rows_cache = None;
+        }
+        targets
+    }
+
+    /// 読み込み結果を反映する（`Err` は失敗の説明を行として見せる）
+    pub fn apply_remote_dir(
+        &mut self,
+        remote: RemoteRef,
+        result: Result<Vec<RemoteEntry>, String>,
+    ) {
+        let state = match result {
+            Ok(entries) => RemoteDir {
+                entries,
+                error: None,
+                loading: false,
+            },
+            Err(report) => RemoteDir {
+                entries: Vec::new(),
+                error: Some(report),
+                loading: false,
+            },
+        };
+        self.remote_cache.insert(remote, state);
+        self.rows_cache = None;
+    }
+
+    /// その行の読み込み状態（ヘッダの表示・再試行の判断に使う）
+    pub fn remote_dir(&self, remote: &RemoteRef) -> Option<&RemoteDir> {
+        self.remote_cache.get(remote)
+    }
+
+    /// リモートルート（またはその配下）の行を積む
+    fn collect_remote_rows(
+        &self,
+        remote: &RemoteRef,
+        depth: usize,
+        root: bool,
+        rows: &mut Vec<Row>,
+    ) {
+        if depth >= MAX_DEPTH {
+            return;
+        }
+        let expanded = self.remote_expanded.contains(remote);
+        let name = if root {
+            // ルートは「host: 末尾要素」で、どのホストのものか一目で分かるようにする
+            format!("{}: {}", remote.host, remote.base_name())
+        } else {
+            remote.base_name()
+        };
+        rows.push(Row {
+            entry: Entry {
+                // 表示と行の同定にだけ使う（FS へは渡さない）
+                path: PathBuf::from(&remote.path),
+                name,
+                is_dir: true,
+            },
+            depth,
+            expanded,
+            root,
+            git_status: None,
+            remote: Some(remote.clone()),
+            note: None,
+        });
+        if !expanded {
+            return;
+        }
+        let child_depth = depth + 1;
+        let Some(state) = self.remote_cache.get(remote) else {
+            // 展開直後（読み込みを投げる前）も「待っている」と分かるようにする
+            rows.push(self.remote_note_row(remote, child_depth, RowNote::Loading));
+            return;
+        };
+        if state.loading {
+            rows.push(self.remote_note_row(remote, child_depth, RowNote::Loading));
+            return;
+        }
+        if let Some(err) = &state.error {
+            rows.push(self.remote_note_row(remote, child_depth, RowNote::Error(err.clone())));
+            return;
+        }
+        if state.entries.is_empty() {
+            rows.push(self.remote_note_row(remote, child_depth, RowNote::Empty));
+            return;
+        }
+        for entry in &state.entries {
+            // #550 と同じ規則: ドット始まりは既定で隠す（ルート見出しは対象外）
+            if !self.show_hidden && is_hidden_name(&entry.name) {
+                continue;
+            }
+            let child = RemoteRef::new(remote.host.clone(), entry.path.clone());
+            if entry.is_dir() {
+                self.collect_remote_rows(&child, child_depth, false, rows);
+            } else {
+                rows.push(Row {
+                    entry: Entry {
+                        path: PathBuf::from(&entry.path),
+                        name: entry.name.clone(),
+                        is_dir: false,
+                    },
+                    depth: child_depth,
+                    expanded: false,
+                    root: false,
+                    git_status: None,
+                    remote: Some(child),
+                    note: None,
+                });
+            }
+        }
+    }
+
+    fn remote_note_row(&self, remote: &RemoteRef, depth: usize, note: RowNote) -> Row {
+        Row {
+            entry: Entry {
+                path: PathBuf::from(&remote.path),
+                name: String::new(),
+                is_dir: false,
+            },
+            depth,
+            expanded: false,
+            root: false,
+            git_status: None,
+            remote: Some(remote.clone()),
+            note: Some(note),
+        }
     }
 
     /// background executor の結果を適用する。変化があれば true

@@ -2864,9 +2864,12 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_open_remote",
-            "description": "SSH ホストに接続する新タブを開く（#20）。~/.ssh/config の Host 名を\
+            "description": "SSH ホストに接続する新タブを開く（#20 / #919）。~/.ssh/config の Host 名を\
                 指定すると、HostName / User / Port 等の設定を尊重して ssh コマンドを実行する。\
-                未定義ホストでも ssh <host> として実行できる。",
+                未定義ホストでも ssh <host> として実行できる。\
+                接続に失敗した場合はペインを閉じずに理由と次の一手を表示する（#919）。\
+                ツリー側（tako_remote_folder）と同じ接続を共有するので、ここで一度ログインすれば\
+                パスワード認証しか無い相手でもリモートツリーが追加認証なしで開く。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2878,8 +2881,57 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean",
                         "description": "新タブにフォーカスを移すか（省略時 true）",
                     },
+                    "remote_dir": {
+                        "type": "string",
+                        "description": "接続後に cd するリモートのパス（省略時はログイン時の cwd）",
+                    },
                 },
                 "required": ["host"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_remote_folder",
+            "description": "リモート（SSH 先）のフォルダをワークスペースとして開く・閉じる・覗く\
+                （#919 / #65。Zed / VSCode の Remote SSH 相当）。ファイルツリーに SSH 先の\
+                ディレクトリ構造が並び、ファイルはプレビューで開ける（読み取り専用）。\
+                認証は ~/.ssh/config・鍵・ControlMaster をそのまま使う（追加設定なし）。\
+                action: open = 接続してフォルダをツリーへ開く（path 省略でリモートのホーム。\
+                接続に失敗したら開かずに理由を返す）/ close = 閉じる（path 省略でそのホストの全部、\
+                all=true で全ホスト）/ list = 開いているリモートフォルダの一覧（読み込み状態つき）/\
+                ls = ツリーを開かずにリモートのディレクトリを一覧する（構造の把握に使う）/\
+                open-file = リモートのファイルをプレビューで開く / ssh-pane = そのフォルダで\
+                SSH ペインを開く。GUI の「リモートからフォルダを開く」と 1:1。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["open", "close", "list", "ls", "open-file", "ssh-pane"],
+                        "description": "操作の種類",
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "SSH ホスト名（~/.ssh/config の Host）。list 以外で必須",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "リモート側の絶対パス（POSIX。Windows の相手は /C:/Users/... の形）",
+                    },
+                    "tab": {
+                        "type": "integer",
+                        "description": "対象タブ ID（省略時はアクティブタブ）",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "open-file / ssh-pane で新しいペイン・タブにフォーカスを移すか",
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "close でホスト指定なしに全部閉じる（既定は全タブ横断。tab で 1 タブへ絞れる）",
+                    },
+                },
+                "required": ["action"],
                 "additionalProperties": false,
             },
         }),

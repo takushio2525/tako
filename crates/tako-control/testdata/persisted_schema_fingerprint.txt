@@ -24,7 +24,7 @@ Settings: auto_rename, port_detect, autosuggest, autosuggest_hint, autosuggest_t
 SetupConfig: orchestrator, setup, agents_sync, spawn_layout, confirm_close, ctx_threshold
 SetupState: completed, completed_at, applied_revision, applied_version, selected_agent, provider_plans
 ShareState: repo, linked_at
-TabLayout: id, title, title_source, focused, tree, pinned_folders
+TabLayout: id, title, title_source, focused, tree, pinned_folders, remote_folders
 TaskCheckpoint: task_id, pane_id, issue, branch, phase, last_commit, agent, model, prompt_head, suspended_reason, project, cwd, updated_at
 TaskCheckpointStore: version, checkpoints
 ThemePreset: base, colors

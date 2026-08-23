@@ -188,6 +188,16 @@ impl TakoApp {
         let palette = self.command_palette.as_ref()?;
         let theme = self.theme.clone();
         let query = palette.query.clone();
+        // #919: モードごとに「何を選ぶ場面か」を出す（ホスト選択 / フォルダ選択）
+        let placeholder = match &palette.mode {
+            crate::PaletteMode::RemoteFolderHost(_) => {
+                crate::ui_text::remote_folder::pick_host_placeholder()
+            }
+            crate::PaletteMode::RemoteFolderDir { .. } => {
+                crate::ui_text::remote_folder::pick_dir_placeholder()
+            }
+            _ => crate::ui_text::palette::search_placeholder(),
+        };
         let items = self.palette_items(&query);
         let selected = palette.selected.min(items.len().saturating_sub(1));
         Some(
@@ -254,9 +264,11 @@ impl TakoApp {
                                         .items_center()
                                         .text_size(px(13.0))
                                         .when(query.is_empty(), |d| {
-                                            d.child(div().text_color(hsla(theme.text_faint)).child(
-                                                crate::ui_text::palette::search_placeholder(),
-                                            ))
+                                            d.child(
+                                                div()
+                                                    .text_color(hsla(theme.text_faint))
+                                                    .child(placeholder),
+                                            )
                                         })
                                         .when(!query.is_empty(), |d| {
                                             d.text_color(hsla(theme.foreground))

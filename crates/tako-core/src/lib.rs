@@ -32,6 +32,7 @@ pub mod preview_reload;
 pub mod preview_view;
 pub mod pty_loop;
 pub mod recent;
+pub mod remote_fs;
 pub mod runner;
 pub mod screen;
 pub mod scroll;

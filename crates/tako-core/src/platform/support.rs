@@ -160,6 +160,16 @@ pub mod notes {
         "Requires the remote transport and the Windows distribution channel",
     );
 
+    /// 「リモートからフォルダを開く」（#919 / #65）。
+    /// バックエンドは Windows 10 以降が同梱する OpenSSH クライアント（`ssh` / `sftp`）
+    /// なので**移植は要らない設計**だが、実機で 1 度も測っていないので Pending。
+    /// 実測すべき点: ControlMaster が Windows の named pipe / ソケットで張れるか、
+    /// `ControlPath` の引用が通るか、`ssh_pane_script` の PowerShell 版が動くか
+    pub const WIN_REMOTE_FOLDER: Note = Note::new(
+        "同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測",
+        "Designed to work with the bundled OpenSSH client, but not yet measured on Windows",
+    );
+
     /// GUI ライク表示モードのチャットビュー（#691 の G2 以降）。
     /// 表示レイヤだけの機能なので #517 で足りそうに見えるが、**会話の解決が
     /// 永続バックエンドのセッション名を鍵にしている**（`.agent/plans/2026-07-gui-mode.md`
@@ -1038,6 +1048,14 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Pending {
             note: notes::WIN_REMOTE,
             issue: 528,
+        },
+    },
+    Feature {
+        key: "tako_remote_folder",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_REMOTE_FOLDER,
+            issue: 919,
         },
     },
     Feature {
