@@ -2615,6 +2615,54 @@ POSIX 前提**。製品側（`agent_install::recipe(Windows, Claude)`）は正�
   `git worktree add -b <branch> ~/dev/tako-wt-<番号> origin/main` で分ける。
   fresh worktree は `web/tako-remote/dist/` を持たないので既存ツリーからコピーする
 
+#### #920 の記録（install_plan の期待値を計画から作る → **Windows のセルフテストが完走**。2026-08-24）
+
+**症状**: #913 で項目 116 を通した直後の壁。項目 119（#868 `install_plan`）が
+`119: install_plan が公式コマンド・置き場所・権限を含む (#868) lines=6` で止まる。
+`lines=6` = 計画は正しく 6 行返っていて、落ちていたのは**期待値の突き合わせだけ**。
+
+##### 原因はテスト側の unix リテラル（製品側は正しい。コードで確定）
+
+| 条件 | Windows の実際 | 判定 |
+|---|---|---|
+| `claude.ai/install.sh` | `https://claude.ai/install.ps1`（`interpreter = "powershell"`） | **不一致** |
+| `.local/bin/claude` | 相対は `.local/bin/claude.exe`、しかも表示は `\` 区切り | **不一致** |
+| `sudo` | `InstallPlan::lines()` の固定行 | 一致 |
+
+##### 直し方: 期待値を `agent_install::current_recipe` から作る
+
+`InstallRecipe` は `platform` を引数で受ける純粋関数なので、**テストが OS を知らずに済む**。
+取得元は `recipe.source.url`、置き場所は `recipe.launcher_rel` / `payload_rel`
+（**両 OS で `/` 区切りの静的文字列**）と突き合わせ、表示側は比較の前に `/` へ寄せる。
+権限の説明は `管理者権限`（プラットフォームに依らない語）で見る。
+
+**同型のリテラルが単体テストにもあった**: `setup_bootstrap::tests::導入計画は何をどこに
+入れるかを必ず含む` は**実機ベースライン 22 件の 1 つ**で、原因は同じ
+（`.local/bin/claude` を `/` 区切りで期待しているのに `launcher_path_in` が `PathBuf` =
+実行中 OS の区切りになる）。リテラルを消して**両プラットフォームぶんを macOS から検証**する
+形にし、「他方の手順が混ざっていない」（計画がプラットフォームに依らなくなる退行の検出）も足した。
+**これでベースラインは 22 → 21 に減る**。
+
+##### 実機実測: **セルフテストが完走した**（`TAKO_APP_SELF_TEST_OK` / exit 0）
+
+```
+TAKO_SELF_TEST_868: step=Some("auth") plan_lines=6 dry_run_performed=Some(false) rejected=true
+TAKO_APP_SELF_TEST_OK
+EXITCODE=0
+```
+
+**FAILED 0 件**。skip は 19 件で全部理由つきの既知（psmux が本物の tmux でない系 /
+PDF の text_layer 不在 #693 / WebView2 の panic #724 / macOS 固有の項目 79 /
+POSIX 専用の道具 = nc・ジョブ制御・`/dev/fd`・ECHOCTL / links の POSIX 前提 #522 /
+蓋閉じで未描画になる項目）。**#865 で項目 1b が落ちていた状態（カバレッジ 0）から、
+9 本の Issue（#866 / #870 → #913 / #872 / #875 / #877 / #881 / #884 / #889 / #897 /
+#903 / #906 / #913 / #920）を積んで全項目に到達した**。
+
+##### 分離した Issue
+
+- **#925**: 導入計画の権限説明が Windows でも「sudo」と言う（`InstallPlan` が `platform` を
+  持っていないので呼び名の出し分けには設計判断が要る = #905 と同型）
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）

@@ -2845,3 +2845,25 @@
   消すと排他が破れるので削除できない設計 = 最新でも起動ごとに増える）。両方直し、
   `cargo test --workspace` 前後で本番の files / locks が変わらないことを実測
 - 関連: PR #923（Closes #916）
+
+## 2026-08-24（#920: install_plan の期待値を計画から作る — **Windows のセルフテストが完走**）
+- 項目 119（#868）の `install_plan が公式コマンド・置き場所・権限を含む lines=6` は
+  **テスト側の unix リテラル**が原因（製品側は正しい）。Windows の計画は公式コマンドが
+  `install.ps1`・置き場所が `.local/bin/claude.exe` で区切りが `\` なので原理的に満たせない
+- 期待値を `agent_install::current_recipe(AgentKind::Claude)` から作る形へ。`InstallRecipe` は
+  `platform` を引数で受ける純粋関数なので**テストが OS を知らずに済む**。置き場所は
+  `launcher_rel` / `payload_rel`（両 OS で `/` 区切りの静的文字列）と突き合わせ、表示側は
+  比較の前に `/` へ寄せる。権限は `管理者権限`（プラットフォームに依らない語）で見る
+- **同型のリテラルが単体テストにもあった**: `setup_bootstrap::tests::導入計画は何をどこに
+  入れるかを必ず含む`（実機ベースライン 22 件の 1 つ）。リテラルを消して**両プラットフォーム
+  ぶんを macOS から検証**し「他方の手順が混ざっていない」も追加 → **ベースラインは 22 → 21**
+- **実機のセルフテストが完走した**（`TAKO_APP_SELF_TEST_OK` / exit 0 / FAILED 0）。
+  skip 19 件は全部理由つきの既知（psmux が本物の tmux でない #519 / PDF の text_layer #693 /
+  WebView2 の panic #724 / macOS 固有の 79 #872 / POSIX 専用の道具 #729 / links #522 / 蓋閉じ）。
+  #865 の「項目 1b で落ちてカバレッジ 0」から 13 本の Issue を積んで全項目に到達
+- 検証: macOS `TAKO_APP_SELF_TEST_OK` 完走 / test --workspace 2551 passed 0 failed /
+  fmt / clippy(-D warnings) / クロスチェックの警告リストが main と完全一致
+- 分離: **#925**（導入計画の権限説明が Windows でも「sudo」と言う。`InstallPlan` が
+  `platform` を持たないので呼び名の出し分けには設計判断が要る = #905 と同型）
+- 踏んだ罠: **未コミットのまま `git checkout HEAD -- <path>`** で自分の変更を全部捨てた
+  （main との比較の前に必ずコミットする）
