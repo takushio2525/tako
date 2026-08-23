@@ -890,7 +890,11 @@ impl TakoApp {
         theme: &tako_core::theme::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let remote = row.remote.clone().expect("リモート行にだけ呼ばれる");
+        // 呼び出し側が `row.remote.is_some()` で分岐しているので None は来ないが、
+        // **render の中で panic するとアプリごと落ちる**ので空行へ倒す（#828 の教訓）
+        let Some(remote) = row.remote.clone() else {
+            return div().id(("filetree-row", index as u64));
+        };
         let base = div()
             .id(("filetree-row", index as u64))
             .flex()
