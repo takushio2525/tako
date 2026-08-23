@@ -424,7 +424,8 @@ master（または任意の claude エージェント）から使える MCP ツ�
 | `tako_orchestrator_projects` | プロジェクト管理（list / add / remove） |
 | `tako_orchestrator_profiles` | プロファイル管理（list / show / set。モデル・effort・worker_agent / agent_* の設定と解除、ctx_threshold / auto_handoff（#749）） |
 | `tako_orchestrator_self` | 自分の pane / tab / ctx% / 引き継ぎ閾値の取得（`ctx_over_threshold` が true なら引き継ぎ時） |
-| `tako_orchestrator_handoff` | 後任 master への引き継ぎ（handoff ファイルを読んで spawn。前任ペインは後任が閉じる） |
+| `tako_orchestrator_handoff` | 後任 master への引き継ぎ（管轄プロジェクトの引き継ぎを読んで spawn。前任ペインは後任が閉じる） |
+| `tako_orchestrator_handoffs` | 引き継ぎファイルの管理（list / show / write / migrate。#915） |
 | `tako_orchestrator_spawn` | worker の spawn（agent パラメータで claude / codex / agy を選択） |
 | `tako_orchestrator_worker_status` | worker の状態確認（codex / agy は画面推定。異常停止は status=error + error.kind / recommended_action（#157）。停滞は status=stalled + stalled.detail / recommended_action（#224）。has_running_children / collapsed フラグ付き） |
 
@@ -440,8 +441,9 @@ master のコンテキストが埋まると判断が劣化する。tako は `/co
 
 1. tako が master ペインの ctx% を見張り、閾値（既定 60%・50〜60% で設定可）を
    超えたら `【tako 自動通知】…` をそのペインへ送る
-2. master が引き継ぎファイル（`<data_dir>/orchestrator/handoff/<プロファイル>.md`）を
-   今の状況で上書きし、`tako_orchestrator_handoff` を呼ぶ
+2. master が引き継ぎを今の状況で書き直し（**プロジェクトごとに 1 ファイル** =
+   `<data_dir>/orchestrator/handoff/projects/<project-key>.md`。プロジェクトに紐付かない
+   運用知識だけを `handoff/<プロファイル>.md` へ）、`tako_orchestrator_handoff` を呼ぶ
 3. 後任 master が同じタブ・同じ role・同じプロファイルで立ち上がり、引き継ぎファイルと
    実態（`tako_orchestrator_workers` / `tako_list_panes`）を突き合わせて「引き継ぎ完了」を報告する。
    **起動は `tako master -<プロファイル>` と同一経路**なので、モデル・effort・アカウント・
@@ -452,6 +454,56 @@ master のコンテキストが埋まると判断が劣化する。tako は `/co
    前任ペインを閉じる
 
 **閉じるのは後任だけ**なので、後任の起動に失敗しても前任の master は失われない。
+
+### 引き継ぎの置き場はプロジェクト単位（Issue #915）
+
+引き継ぎは**プロジェクトごとに 1 ファイル**。汎用プロファイル（`default` 等）は複数の
+master が別々のミッションで使うため、プロファイル単位の 1 ファイルだと全プロジェクトの
+知識が積み上がり（実測 528 行 / 62KB）、後任は自分と無関係な長文を最初に読まされていた。
+
+| 置き場 | 中身 | 後任へ渡るか |
+|---|---|---|
+| `handoff/projects/<project-key>.md` | そのプロジェクトの引き継ぎ（進行中タスク・worker と pane・未完の判断・次の一手） | **管轄している master の後任にだけ** |
+| `handoff/<profile>.md` | プロファイル運用メモ（共通置き場）。プロジェクトに紐付かない作法・ユーザーの好み・アカウント運用 | 常に |
+| `handoff/archive/<profile>-pre915-N.md` | 移行前の原本（退避。消さない） | 渡らない |
+
+**管轄の判定**は次の順（応答の `jurisdiction_source` にどれで決まったかが出る）:
+
+1. `tako_orchestrator_handoff` の `projects` 引数（`tako orchestrator handoff --projects a,b`）
+2. プロファイルの担当プロジェクト（`tako orchestrator profiles set <名前> --projects a,b`）
+   \+ 同じタブで稼働中の worker のプロジェクト
+3. 稼働中 worker のプロジェクトだけ
+4. どれも無い（`unresolved`）→ **本文は貼らず**、置いてあるファイルの一覧とパスだけを
+   後任へ渡す（無関係な全文で後任の文脈を食わない）
+
+運用メモが 80 行を超えると `self` / `handoff` の `warnings` に「プロジェクト固有の内容を
+projects/ へ移せ」が出る（肥大の再発防止）。
+
+```bash
+tako orchestrator handoffs list                       # 置いてあるファイルの一覧（行数・書式・警告）
+tako orchestrator handoffs show --project tako        # 1 件を読む
+tako orchestrator handoffs write --project tako --content "..."  # 1 件を書く（標準入力も可）
+tako orchestrator handoff --projects tako,hero-cpp    # 管轄を明示して引き継ぐ
+```
+
+#### 旧形式からの自動移行（手動移行はしない。#916）
+
+プロファイル単位の混在ファイルは**自動で**プロジェクト単位へ移る。発火点は 2 つ:
+
+1. `tako setup` の実行時（誰の環境でも setup 一発で最新形式になる）
+2. master が引き継ぎを読む / 書く経路（`tako_orchestrator_self` /
+   `tako_orchestrator_handoff`）で旧形式を検知したとき
+
+割り方はトップレベルの `##` 見出し単位で、持ち主は マーカー（`<!-- tako:project: <key> -->`）
+→ 見出しに出てくるプロジェクトキー → 見出しの語とキーの先頭要素の一致（`## 【bunpoushi 移行】`
+→ `bunpoushi-migration`）の順に決める。**本文からキーを探すことはしない**（`tako` のような
+キーはどの断片にも出てくるため、実測で 6 プロジェクトが誤ヒットした）。
+担当プロジェクトがちょうど 1 つのプロファイルは、見出しの無い先頭断片もそのプロジェクトへ移る。
+
+安全側の性質は 4 つ: **冪等**（何度実行しても同じ）/ **原本を消さない**（`handoff/archive/` へ
+退避してから書き換える。退避できなければ移行しない）/ **実施が見える**（応答の
+`handoff_migration` と setup の `[migrated]` 行）/ **持ち主不明の断片を捨てない**
+（共通置き場 = 運用メモへ残す）。
 
 ### 引き継ぎファイルの書式（Issue #792）
 
@@ -476,13 +528,16 @@ spawn 済み worker とその pane と依頼内容 / 開いているペイン / 
 半角括弧・強調（`**…**`）・語尾の省略（`## 知識`）も同じ節として認識する。
 
 - **旧書式（節なし）もそのまま読める**。`tako_orchestrator_handoff` は書式に関係なく
-  **全文を後任へ渡す**。旧書式のときは「番号への参照はすべて実態で確認しろ + 次の更新で
-  2 節へ書き直せ」が後任プロンプトに付くので、自然な更新で新書式へ移る（一括変換はしない）
+  **渡すファイルの全文を後任へ渡す**。旧書式のときは「番号への参照はすべて実態で確認しろ +
+  次の更新で 2 節へ書き直せ」が後任プロンプトに付くので、自然な更新で新書式へ移る
+  （節の書式は一括変換しない。置き場だけが #915 で自動移行される）
 - 新書式のときは節ごとの扱い（知識 = そのまま前提にしてよい / 実行状態 = 必ず実態で確認）が
   後任プロンプトに付く
 - いま自分のファイルがどちらかは `tako orchestrator self` の `handoff_format`
-  （`sectioned` / `legacy` / 未作成なら null）と `handoff_sections` で分かる。
-  `tako orchestrator handoff` の応答も同じ 2 フィールドを返す
+  （`sectioned` / `legacy` / 未作成なら null）と `handoff_sections`、
+  プロジェクト側は `project_handoffs` の各エントリの `format` で分かる。
+  `tako orchestrator handoff` の応答は渡した全ファイルをまとめた `handoff_format`
+  （新旧が混ざっていたら `mixed`）と `handoff_sections` を返す
 - 書式の正本は `tako_core::handoff`（`section_of_line` / `split_handoff` /
   `handoff_template`。見出し定数は master system prompt と同期していることを単体テストが拘束）
 

@@ -2355,6 +2355,28 @@ pub fn run_changes(json: bool) -> Result<(), String> {
 
 /// `tako setup` — メインのセットアップフロー。
 /// 通常実行と `--yes` はどちらも積極的自動化で質問ゼロ。`--answers` は検出値より優先する。
+/// 設定・データファイルのスキーマ移行を実行する（#916 の恒久原則: 手動移行はさせない）。
+///
+/// 冪等で、移したものがあるときだけ 1 行出す（無ければ無言）。失敗しても setup 自体は
+/// 止めない（移行できないのは原本が残っているという意味で、作業の続行を妨げない）
+fn run_data_migration_stage() {
+    let outcomes = tako_control::orchestrator::handoff_store::migrate_all();
+    if outcomes.is_empty() {
+        return;
+    }
+    eprintln!("設定ファイルの更新");
+    eprintln!("──────────────────");
+    for outcome in &outcomes {
+        if let Some(summary) = outcome.summary() {
+            eprintln!("  [migrated] {summary}");
+        }
+        for warning in &outcome.warnings {
+            eprintln!("  [warn] {warning}");
+        }
+    }
+    eprintln!();
+}
+
 pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Result<(), String> {
     eprintln!("tako セットアップ");
     eprintln!("═════════════════");
@@ -2372,6 +2394,11 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         eprintln!("  [previous] 前回の設定を引き継ぎます");
         eprintln!();
     }
+
+    // 設定ファイルの自動マイグレーション（#915 / #916 の段 1）。
+    // 依存チェックより**前**に置くのは、依存不足で早期 return するときも
+    // データの形式だけは最新化しておきたいため。冪等なので毎回呼んでよい
+    run_data_migration_stage();
 
     // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
