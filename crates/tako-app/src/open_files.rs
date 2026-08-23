@@ -44,15 +44,25 @@ pub(crate) fn file_urls_to_paths(urls: &[String]) -> Vec<PathBuf> {
 }
 
 /// 単一の `file://` URL をパスへ。変換できないものは `None`。
+///
+/// ドライブレター形式（`file:///C:/Users/x`）は
+/// [`tako_core::file_uri::strip_drive_slash`] が落とす（#913）。ここで自前に
+/// 判定しないのは、同じ RFC 8089 の規則が OSC 7 の cwd 追従（`osc_tap`）にもあり、
+/// **片方だけ POSIX 専用のまま取り残されていた**のがこの Issue の原因だから
 pub(crate) fn file_url_to_path(url: &str) -> Option<PathBuf> {
     let rest = strip_file_scheme(url)?;
     let decoded = percent_decode(rest)?;
-    // 絶対パスでなければ受け付けない（NSURL の absoluteString は必ず絶対パスになる。
-    // そうでないものは想定外の入力なので、相対解決してカレントを触りに行かない）
+    // 絶対パスでなければ受け付けない（NSURL / Windows の file URI はどちらも
+    // パス部が `/` 始まりになる。そうでないものは想定外の入力なので、
+    // 相対解決してカレントを触りに行かない）。**判定はドライブレターを落とす前**に
+    // 行う: `file:///C:/x` のパス部は `/C:/x` なのでここは通り、落としたあとの
+    // `C:/x` で見ると弾いてしまう
     if !decoded.starts_with('/') {
         return None;
     }
-    Some(PathBuf::from(decoded))
+    Some(PathBuf::from(tako_core::file_uri::strip_drive_slash(
+        &decoded,
+    )))
 }
 
 /// `file://` スキームを剥がす。`file://localhost/...` 形式にも対応する。
@@ -196,6 +206,55 @@ mod tests {
             file_url_to_path("file:///tmp/a%23b%25c.md"),
             Some(PathBuf::from("/tmp/a#b%c.md"))
         );
+    }
+
+    /// #913: Windows 形式（RFC 8089 のドライブレター）も受ける。
+    /// 修正前は `/` 始まりでない復号結果を弾いていたため、セルフテスト項目 116 が
+    /// 「4 本のうち 1 本しかパスへ戻らない」で止まっていた
+    #[test]
+    fn windows形式のドライブレターも受ける() {
+        assert_eq!(
+            file_url_to_path("file:///C:/Users/me/notes.md"),
+            Some(PathBuf::from("C:/Users/me/notes.md"))
+        );
+        // パーセントエンコード込み（実機の一時ディレクトリの形）
+        assert_eq!(
+            file_url_to_path(
+                "file:///C:/Users/me/AppData/Local/Temp/%E8%AA%AD%E3%81%BF%E7%89%A9.md"
+            ),
+            Some(PathBuf::from("C:/Users/me/AppData/Local/Temp/読み物.md"))
+        );
+        // 小文字のドライブ・ドライブ直下・末尾スラッシュ
+        assert_eq!(file_url_to_path("file:///d:/"), Some(PathBuf::from("d:/")));
+        // POSIX の絶対パスは 1 バイトも変わらない（macOS の回帰検出）
+        assert_eq!(
+            file_url_to_path("file:///Users/me/C:x/a.md"),
+            Some(PathBuf::from("/Users/me/C:x/a.md"))
+        );
+    }
+
+    /// 番犬テスト（#913）: RFC 8089 のドライブレター規則を**この場で書かない**。
+    /// 同じ規則が `osc_tap` にもあり、片方だけ直して片方が POSIX 専用のまま
+    /// 残ったのがこの Issue の原因なので、境界（`tako_core::file_uri`）を通す
+    #[test]
+    fn ドライブレターの判定は境界に任せる() {
+        // **テストより前**だけを見る（この番犬自身の文字列に当たらないように）
+        let src = include_str!("open_files.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .expect("テストモジュールの区切りが無い")
+            .0;
+        assert!(
+            prod.contains("tako_core::file_uri::strip_drive_slash"),
+            "境界を通っていない（#913）"
+        );
+        // 自前判定の痕跡（ドライブレターを直接見る形）が無いこと
+        for marker in ["is_ascii_alphabetic", "b':'"] {
+            assert!(
+                !prod.contains(marker),
+                "ドライブ判定をこのファイルで書いている（{marker}。境界へ寄せること。#913）"
+            );
+        }
     }
 
     #[test]
