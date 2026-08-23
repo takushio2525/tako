@@ -82,13 +82,13 @@ tako_read_pane
 tako_recent
 tako_remote_agents
 tako_remote_devices
+tako_remote_folder
 tako_remote_messages
 tako_remote_scrollback
 tako_remote_setup
 tako_remote_start
 tako_remote_status
 tako_remote_stop
-tako_remote_folder
 tako_rename_tab
 tako_reorder_tab
 tako_resize_pane

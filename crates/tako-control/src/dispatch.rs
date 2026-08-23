@@ -5947,6 +5947,8 @@ fn dispatch_remote_folder(
                                 "host": r.host,
                                 "path": r.path,
                                 "label": r.label(),
+                                // loaded / loading / pending / not_displayed / error: <理由>
+                                // （not_displayed = 裏タブなのでまだ読んでいない。異常ではない）
                                 "state": found.map(|(_, s, _)| s.clone()),
                                 "entries": found.map(|(_, _, n)| *n),
                                 "connected": remote_fs::master_alive(&r.host),

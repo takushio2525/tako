@@ -17178,11 +17178,20 @@ impl UiStateHost for TakoApp {
     }
 
     fn remote_folder_states(&self) -> Vec<(tako_core::remote_fs::RemoteRef, String, usize)> {
+        // ツリーはアクティブタブのぶんだけ読む（#919: 見えていないタブのために
+        // ネットワーク I/O を走らせない）。裏タブのフォルダを「pending」と呼ぶと
+        // **読み込みに失敗しているように見える**ので、状態を言い分ける
+        let active: Vec<tako_core::remote_fs::RemoteRef> =
+            self.workspace.active_tab().remote_folders().to_vec();
         self.workspace
             .tabs()
             .iter()
             .flat_map(|t| t.remote_folders().iter().cloned())
             .map(|remote| {
+                if !active.contains(&remote) {
+                    // そのタブを開けばそこで読む（異常ではない）
+                    return (remote, "not_displayed".to_string(), 0);
+                }
                 let (state, n) = match self.filetree.remote_dir(&remote) {
                     Some(d) if d.loading => ("loading".to_string(), 0),
                     Some(d) if d.error.is_some() => {
@@ -49188,6 +49197,311 @@ mod self_test {
                     app.sleep_guard_popover_open = false;
                     app.sleep_guard_popover_anchor = None;
                     app.sleep_guard_state = None;
+                    cx.notify();
+                });
+            }
+
+            // 122. リモートからフォルダを開く（#919 / #65）。
+            //
+            // ネットワークに依存させないため**バックエンドは呼ばない**: ツリーの器
+            // （リモートルート・展開・読み込み状態・行の生成）と「失敗が行として出る」
+            // ことだけを実 render で確かめる。実 SSH 先との通しは
+            // `cargo test -p tako-core --test remote_fs_e2e -- --ignored` が受け持つ。
+            //
+            // ここが守っているのは #919 の核: **リモートの行がローカル FS の経路へ
+            // 落ちない**（`row.remote` が付く）と、**失敗が黙って空にならない**
+            {
+                use tako_core::remote_fs::{RemoteEntry, RemoteKind, RemoteRef};
+                let root = RemoteRef::new("selftest-host", "/srv/app");
+                let sub = RemoteRef::new("selftest-host", "/srv/app/src");
+                let bad = RemoteRef::new("selftest-host", "/srv/app/denied");
+
+                // (a) ルートを開くと見出し行が出て、中身が来るまで「読み込み中」になる
+                let (root_rows, loading_rows) = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.visible = true;
+                        app.filetree.set_show_hidden(false);
+                        app.filetree.add_remote_root(root.clone());
+                        cx.notify();
+                        let rows = app.filetree.rows();
+                        let root_row = rows
+                            .iter()
+                            .filter(|r| r.root && r.remote.as_ref() == Some(&root))
+                            .count();
+                        let loading = rows
+                            .iter()
+                            .filter(|r| {
+                                matches!(r.note, Some(crate::filetree::RowNote::Loading))
+                            })
+                            .count();
+                        (root_row, loading)
+                    })
+                    .unwrap_or((0, 0));
+                check(
+                    root_rows == 1 && loading_rows == 1,
+                    &format!(
+                        "リモートルートが見出し行として出て読み込み中を見せる                          (#919。root={root_rows} loading={loading_rows})"
+                    ),
+                );
+
+                // (b) 中身を流し込むとディレクトリ・ファイル行になり、**全部 remote が付く**
+                //     （ローカル FS の経路へ落ちない = 誤って trash / rename されない）
+                let (dirs, files, all_remote, host_in_label) = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.apply_remote_dir(
+                            root.clone(),
+                            Ok(vec![
+                                RemoteEntry {
+                                    name: "src".into(),
+                                    path: "/srv/app/src".into(),
+                                    kind: RemoteKind::Dir,
+                                    size: 0,
+                                },
+                                RemoteEntry {
+                                    name: "denied".into(),
+                                    path: "/srv/app/denied".into(),
+                                    kind: RemoteKind::Dir,
+                                    size: 0,
+                                },
+                                RemoteEntry {
+                                    name: "README.md".into(),
+                                    path: "/srv/app/README.md".into(),
+                                    kind: RemoteKind::File,
+                                    size: 12,
+                                },
+                            ]),
+                        );
+                        cx.notify();
+                        let rows = app.filetree.rows();
+                        let remote_rows: Vec<_> =
+                            rows.iter().filter(|r| r.remote.is_some()).collect();
+                        let dirs = remote_rows
+                            .iter()
+                            .filter(|r| r.entry.is_dir && !r.root && r.note.is_none())
+                            .count();
+                        let files = remote_rows
+                            .iter()
+                            .filter(|r| !r.entry.is_dir && r.note.is_none())
+                            .count();
+                        // ルート見出しに「host: 末尾」が入る（どのホストか読める）
+                        let labeled = rows
+                            .iter()
+                            .any(|r| r.root && r.entry.name.starts_with("selftest-host: "));
+                        // リモート行が 1 つでもローカル扱いになっていないこと
+                        let all_remote = rows
+                            .iter()
+                            .filter(|r| {
+                                r.entry.path.starts_with("/srv/app")
+                            })
+                            .all(|r| r.remote.is_some());
+                        (dirs, files, all_remote, labeled)
+                    })
+                    .unwrap_or((0, 0, false, false));
+                check(
+                    dirs == 2 && files == 1 && all_remote && host_in_label,
+                    &format!(
+                        "リモートの中身がツリーへ出て全行が remote 印を持つ                          (#919。dirs={dirs} files={files} all_remote={all_remote}                          labeled={host_in_label})"
+                    ),
+                );
+
+                // (c) 読み込み失敗は**行として**出る（静かに空にしない）
+                let (err_rows, err_has_reason) = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.toggle_remote_dir(&bad);
+                        let report = tako_core::remote_fs::RemoteError::new(
+                            tako_core::remote_fs::RemoteErrorKind::PermissionDenied,
+                            bad.label(),
+                            "Couldn't stat remote file: Permission denied",
+                        )
+                        .report();
+                        app.filetree.apply_remote_dir(bad.clone(), Err(report));
+                        cx.notify();
+                        let rows = app.filetree.rows();
+                        let errs: Vec<String> = rows
+                            .iter()
+                            .filter_map(|r| match &r.note {
+                                Some(crate::filetree::RowNote::Error(t)) => Some(t.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let has_reason = errs.iter().any(|t| {
+                            t.lines().count() >= 3 && t.contains("/srv/app/denied")
+                        });
+                        (errs.len(), has_reason)
+                    })
+                    .unwrap_or((0, false));
+                check(
+                    err_rows == 1 && err_has_reason,
+                    &format!(
+                        "リモートの読み込み失敗が理由つきの行として出る                          (#919。rows={err_rows} reason={err_has_reason})"
+                    ),
+                );
+
+                // (d) 空ディレクトリも「空」と分かる（黙って何も出さない、をしない）
+                let empty_rows = window
+                    .update(cx, |app, _, cx| {
+                        app.filetree.toggle_remote_dir(&sub);
+                        app.filetree.apply_remote_dir(sub.clone(), Ok(Vec::new()));
+                        cx.notify();
+                        app.filetree
+                            .rows()
+                            .iter()
+                            .filter(|r| matches!(r.note, Some(crate::filetree::RowNote::Empty)))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                check(
+                    empty_rows == 1,
+                    &format!("空のリモートフォルダも空と分かる (#919。rows={empty_rows})"),
+                );
+
+                // (e) 通知は失敗だけ残る（成功は期限つき）。**失敗を自動で消さない**
+                let (err_kept, ok_gone) = window
+                    .update(cx, |app, _, cx| {
+                        app.set_remote_notice("接続できません".into(), true);
+                        let err_kept = app
+                            .remote_notice
+                            .as_ref()
+                            .is_some_and(|n| n.is_error && !n.expired());
+                        app.set_remote_notice("開きました".into(), false);
+                        let ok_expires = app
+                            .remote_notice
+                            .as_ref()
+                            .is_some_and(|n| !n.is_error && !n.expired());
+                        app.remote_notice = None;
+                        cx.notify();
+                        (err_kept, ok_expires)
+                    })
+                    .unwrap_or((false, false));
+                check(
+                    err_kept && ok_gone,
+                    &format!("リモート通知は失敗を残し成功は期限つき (#919。err={err_kept} ok={ok_gone})"),
+                );
+
+                // (f) パレットのフォルダ選択が「ここを開く」+ ディレクトリだけを並べる
+                //     （ファイルを選ばせない = フォルダを開く画面として成立している）
+                let (open_items, dir_items, file_items) = window
+                    .update(cx, |app, _, cx| {
+                        app.command_palette = Some(CommandPalette {
+                            query: String::new(),
+                            selected: 0,
+                            mode: PaletteMode::RemoteFolderDir {
+                                host: "selftest-host".into(),
+                                cwd: "/srv/app".into(),
+                                entries: vec![
+                                    RemoteEntry {
+                                        name: "src".into(),
+                                        path: "/srv/app/src".into(),
+                                        kind: RemoteKind::Dir,
+                                        size: 0,
+                                    },
+                                    RemoteEntry {
+                                        name: "README.md".into(),
+                                        path: "/srv/app/README.md".into(),
+                                        kind: RemoteKind::File,
+                                        size: 12,
+                                    },
+                                ],
+                            },
+                        });
+                        cx.notify();
+                        let items = app.palette_items("");
+                        let open = items
+                            .iter()
+                            .filter(|i| matches!(i, PaletteItem::RemoteFolderOpen(_, _)))
+                            .count();
+                        let descend: Vec<String> = items
+                            .iter()
+                            .filter_map(|i| match i {
+                                PaletteItem::RemoteFolderDescend(_, p, _) => Some(p.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let dirs = descend.iter().filter(|p| p.ends_with("/src")).count();
+                        let files = descend.iter().filter(|p| p.ends_with(".md")).count();
+                        app.command_palette = None;
+                        cx.notify();
+                        (open, dirs, files)
+                    })
+                    .unwrap_or((0, 0, 1));
+                check(
+                    open_items == 1 && dir_items == 1 && file_items == 0,
+                    &format!(
+                        "リモートフォルダ選択はフォルダだけ並べる                          (#919。open={open_items} dirs={dir_items} files={file_items})"
+                    ),
+                );
+
+                // (g) リモート由来のプレビューは編集できない（段階 1 = 読み取り専用）。
+                //     本体はローカルのキャッシュなので、止めないと
+                //     「保存できた気になる」（リモートには何も書かれない）。
+                //
+                //     **本物のプレビューペインで測る**: 適当なペインで試すと
+                //     「プレビューペインではない」で先に落ちて、読み取り専用の
+                //     ガードを外しても通ってしまう（検出力ゼロのテストになる）
+                let fixture = std::env::temp_dir()
+                    .join(format!("tako-selftest-919-{}.md", std::process::id()));
+                let _ = std::fs::write(&fixture, "# remote preview\n");
+                let (local_ok, blocked, msg) = window
+                    .update(cx, |app, _, cx| {
+                        // 分割元は「フォーカス → 各ターミナル」の順に試す（先行項目で
+                        // フォーカスがプレビューや webview になっていることがある）
+                        let mut bases = vec![app.focused_pane()];
+                        bases.extend(app.terminals.keys().copied());
+                        let mut pane = None;
+                        for base in bases {
+                            let res = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OpenFile {
+                                    pane: Some(base.as_u64()),
+                                    path: fixture.display().to_string(),
+                                    mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                    direction: Some(tako_control::protocol::Direction::Right),
+                                    focus: Some(false),
+                                    new_tab: false,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            if let Ok(v) = res {
+                                app.drain_pending_highlights(cx);
+                                if let Some(id) = v["pane"].as_u64() {
+                                    pane = Some(PaneId::from_raw(id));
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(pane) = pane else {
+                            cx.notify();
+                            return (false, false, "プレビューを開けない".to_string());
+                        };
+                        // まずローカルとして編集できることを確かめる（対照）
+                        let local_ok = app.set_preview_editing_local(pane, true).is_ok();
+                        let _ = app.set_preview_editing_local(pane, false);
+                        // 同じペインをリモート由来にすると編集できない
+                        app.preview_remote_origins.insert(
+                            pane,
+                            RemoteRef::new("selftest-host", "/srv/app/README.md"),
+                        );
+                        let r = app.set_preview_editing_local(pane, true);
+                        let out = (local_ok, r.is_err(), r.err().unwrap_or_default());
+                        app.preview_remote_origins.remove(&pane);
+                        app.remove_pane_with(pane, CloseReason::Explicit(CloseOrigin::Internal), cx);
+                        cx.notify();
+                        out
+                    })
+                    .unwrap_or((false, false, String::new()));
+                let _ = std::fs::remove_file(&fixture);
+                check(
+                    local_ok && blocked && msg == crate::ui_text::remote_folder::preview_read_only(),
+                    &format!(
+                        "リモートのプレビューは読み取り専用（ローカルは編集できる）                          (#919。local_ok={local_ok} blocked={blocked} msg={msg:?})"
+                    ),
+                );
+
+                // 後片付け: 以後の項目へ持ち越さない
+                let _ = window.update(cx, |app, _, cx| {
+                    app.filetree.remove_remote_root(&root);
+                    app.remote_notice = None;
+                    app.remote_context_menu = None;
                     cx.notify();
                 });
             }
