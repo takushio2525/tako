@@ -2651,7 +2651,12 @@ TAKO_APP_SELF_TEST_OK
 EXITCODE=0
 ```
 
-**FAILED 0 件**。skip は 19 件で全部理由つきの既知（psmux が本物の tmux でない系 /
+**FAILED 0 件**。**main を取り込んだ後（#915 handoff のプロジェクト単位化 / #916 自動
+マイグレーション / #919 リモートフォルダで自己テストが約 950 行増えた状態）でも完走**した
+（`TAKO_SELF_TEST_915_MIGRATE` / `_915_PROMPT` / `_915_IDEMPOTENT` / `_915_UNRESOLVED` /
+`_915_FILES` / `TAKO_SELF_TEST_916` が全部出て FAILED 0・skip 19）。
+
+skip は 19 件で全部理由つきの既知（psmux が本物の tmux でない系 /
 PDF の text_layer 不在 #693 / WebView2 の panic #724 / macOS 固有の項目 79 /
 POSIX 専用の道具 = nc・ジョブ制御・`/dev/fd`・ECHOCTL / links の POSIX 前提 #522 /
 蓋閉じで未描画になる項目）。**#865 で項目 1b が落ちていた状態（カバレッジ 0）から、
