@@ -2913,3 +2913,39 @@
   KV namespace ID は**アカウント ID ではなく deploy に必要な資源 ID**なので残置（#77 監査でも
   account_id とメールだけが除去対象だった）
 - 関連: PR（Closes #927）
+
+## 2026-08-24（#898: コマンド解決を実行ファイル探索の境界へ寄せる — Windows で tako / claude / tmux が常に見つからない）
+- `which` は **Windows に存在しない**（実測: `Get-Command which` → NOT FOUND）のに解決が
+  `which` の起動決め打ちで、**tako.exe が PATH 上に居るのに tako 自身には「無い」ように見える**
+  状態だった。境界 B16（`platform::exe::find`。unix はログインシェル経由 / Windows は
+  PATH + `PATHEXT` + ユーザー導入先の走査で**サブプロセスを起こさない**）へ一本化
+- **Issue の一覧より 2 箇所多かった**（値／形で全走査したので見つかった）: `stale_binary.rs` の
+  `which_claude` 複製（= stale 検知 #498 の保険）/ `tako-app/src/settings_window.rs`
+  （設定画面のエージェント検出。claude / codex / agy を導入済みでも「未検出」表示）。
+  #772 の高速路（stat だけの PATH 走査）は残し、境界へ落ちるのは空振り時だけ
+- 同じ関数の別の POSIX 前提も倒した: `resolve_tako_binary` の ③「隣」が `dir.join("tako")`
+  決め打ちで Windows の隣は `tako.exe` なので**常に空振り**（→ 裸の `tako`）。
+  `std::env::consts::EXE_SUFFIX` で組む形にし、判定順を純粋関数へ切り出して
+  **macOS 上から Windows の形も検査できる**ようにした
+- 実機 A/B（製品側 2 ファイルだけ `git checkout origin/main -- <path>`）: `resolve_tako_binary()`
+  が **裸の `tako` → `…\target\debug\tako.exe`** / MCP 自動登録の `command` が **`"tako"` →
+  絶対パス**（経路も `setup_mcp_direct` → `claude mcp add`）/ `.local\bin` を PATH から外して
+  高速路を空振りさせると `launcher_path()` が **`None` → `Some(…\claude.exe)`**。
+  **同一プロセス内の対照が決め手**（同じ run で `exe::find` は当てているのに旧経路は裸へ落ちる）
+- **Issue の記述を 1 点訂正**: stale 検知は「Windows で常に無効」ではなく **#772 の高速路が
+  空振りしたときだけ**無効（実機は `.local\bin` が PATH 上なので高速路が拾えていた）
+- **#899 とは統合しない判断**: #898 は #899 の症状 2 を顕在化させる（`shell_quote` の安全文字が
+  `[A-Za-z0-9._-/]` なので Windows の絶対パスが POSIX 形 `'…'` で囲まれる = 実測
+  `'C:\…\tako.exe' master`）。ただし症状 1（行末 LF で PSReadLine が確定しない。#897）により
+  **観測される最終結果は変わらない**ので、値を記録するテストだけ置いて是正は #899 へ渡した
+- 検証: macOS fmt / clippy（両 feature）/ `test --workspace` **2588 passed 0 failed** /
+  番犬の検出力（`which` を 1 箇所戻すと行番号を名指しして FAILED）/ 実機スイート
+  **22 件失敗 = 21（ベースライン）+ #930（main 由来）で新規ゼロ**・`tako-control --lib` は
+  14 = クレートのベースライン一致・新規 6 テストは Windows で全緑
+- 踏んだ罠: `Start-Process` で投げた長い処理は SSH 切断で死ぬ（`Invoke-CimMethod` + 自前
+  `Out-File` へ）/ `git checkout origin/main -- <path>` は index にも入るので戻すのは
+  `git restore --source=HEAD --staged --worktree` /
+  **純粋関数でも `Path::join` の結果を期待値のリテラルに書くと Windows だけ落ちる**（1 度落とした）
+- 起票: **#930**（`remote_fs_e2e::解決できないホストは接続前に分類される` が Windows で失敗。
+  #919 由来。速い FAILED と >60 秒のハングの両方を観測）
+- 関連: PR #929（Refs #898 / #467）

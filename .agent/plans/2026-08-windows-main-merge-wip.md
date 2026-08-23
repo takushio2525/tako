@@ -2668,6 +2668,98 @@ POSIX 専用の道具 = nc・ジョブ制御・`/dev/fd`・ECHOCTL / links の P
 - **#925**: 導入計画の権限説明が Windows でも「sudo」と言う（`InstallPlan` が `platform` を
   持っていないので呼び名の出し分けには設計判断が要る = #905 と同型）
 
+#### #898 の記録（コマンド解決を実行ファイル探索の境界へ。2026-08-24）
+
+`which` は **Windows に存在しない**（実測: `Get-Command which` → NOT FOUND）のに、
+コマンド解決が `which` の起動決め打ちだった。**tako.exe が PATH 上に居るのに tako 自身には
+「無い」ように見える**状態。境界 B16（`platform::exe::find`）へ寄せた。
+
+##### Issue の一覧より 2 箇所多い（走査で見つけた）
+
+`which` の直起動を全走査すると、Issue が名指しした `dispatch.rs` の 2 箇所に加えて
+`stale_binary.rs`（dispatch とは別の `which_claude` 複製）と
+`tako-app/src/settings_window.rs`（設定画面のエージェント検出。claude / codex / agy を
+導入済みでも「未検出」表示）があった。**Issue の一覧を信じず値／形で走査する**のが要点。
+
+##### 同じ関数にもう 1 つの POSIX 前提
+
+`resolve_tako_binary` の ③「実行中バイナリの隣」が `dir.join("tako")` 決め打ち。
+Windows の隣は `tako.exe` なので**常に空振り**して裸の `tako` へ落ちていた。
+`std::env::consts::EXE_SUFFIX` で組む形にすれば `cfg` は増えない。
+
+##### 実機の A/B（製品側 2 ファイルだけ `git checkout origin/main -- <path>` で差し替え）
+
+| 観測点 | BEFORE（main） | AFTER |
+|---|---|---|
+| `resolve_tako_binary()` | **`tako`**（裸） | `…\target\debug\tako.exe` |
+| MCP 自動登録の `command`（`setup-mcp --project`） | `"tako"` | `"C:\\…\\tako.exe"` |
+| 同・通った経路 | `setup_mcp_direct`（claude 解決が失敗） | `setup_mcp_via_cli`（`claude mcp add`） |
+| `launcher_path()`（`.local\bin` を PATH から外して高速路を空振りさせた場合） | **`None`** | `Some(…\claude.exe)` |
+
+**同一プロセス内の対照が決め手**: BEFORE の同じ run で `exe::find("tako")` は正しいパスを
+返しているのに `resolve_tako_binary()` は裸へ落ちている = ②の `which` が `None` を返し
+③も空振りしたことが 1 回の観測で見える。別ビルドを 2 本並べる必要がない。
+
+##### Issue の記述を 1 点訂正
+
+「stale 検知が Windows で**常に**無効」ではなく、**#772 の高速路（プロセス PATH の stat 走査）が
+空振りしたときだけ**無効。素の PATH に `claude.exe` が居る実機では高速路が拾えており、
+BEFORE でも検知は動いていた。無効になる実条件は「インストーラの PATH 更新が実行中プロセスへ
+伝播していない」か「claude が npm シム（`claude.cmd`）で入っている」（高速路は `claude.exe`
+しか stat しない）。**症状の再現条件を作ってから A/B を取る**。
+
+##### #899 との関係（統合しない判断）
+
+`welcome::launch_command_line` は `resolve_tako_binary()` を `shell_quote` に通す。
+安全文字が `[A-Za-z0-9._-/]` なので **Windows の絶対パスは `:` と `\` で「安全でない」判定**に
+なり POSIX 形の `'…'` で囲まれる（PowerShell は式として評価するので実行されない）。
+つまり #898 は #899 の症状 2 を**顕在化させる**。ただし #899 の症状 1（行末が LF なので
+PSReadLine が継続行にして確定しない。#897 で実測）により**観測される最終結果は変わらない**
+ので、値を記録するテストだけ置いて是正は #899 へ渡した（`ShellDialect::program()` 経由へ）。
+
+##### 踏んだ罠
+
+- **`Start-Process` で投げた長い処理は SSH セッションが切れると死ぬ**（ログ 0 バイト・
+  cargo も居ない、で気づいた）。作法どおり `Invoke-CimMethod`（`Win32_Process.Create`）で投げ、
+  **リダイレクトに頼らずスクリプト自身が `Out-File` でログへ書く**形にすると確実
+- **`git checkout origin/main -- <path>` は index にも入る**ので、戻すのは
+  `git checkout -- <path>` では**足りない**（index の main 版で上書きされる）。
+  `git restore --source=HEAD --staged --worktree -- <path>` を使う
+- **純粋関数のテストでも `Path::join` の結果を期待値のリテラルに書くと Windows だけ落ちる**
+  （区切りが `\`）。期待値も同じ `join` から作る（#920 と同じ型。実際に 1 度落とした）
+- 実機の孤児 `pwsh` が 13 個（1〜2 日前のもの）溜まっていた。run の前に
+  「tako-app が 1 つも居ない」を確かめてから**明示 pid で**落とす
+
+##### 実機スイートの照合（`--no-fail-fast`）
+
+| 段階 | 失敗数 | 内訳 |
+|---|---|---|
+| 最初の run | 23 | 21（ベースライン）+ 自作テスト 1 + #930 |
+| テスト修正後 | **22** | 21（ベースライン）+ **#930（main 由来）** = **新規ゼロ** |
+
+`tako-control --lib` 単体では **14 failed = このクレートのベースライン 14 と一致**、
+新規 6 テストは全部 Windows で緑。#930 は `origin/main`（`1d75598`）を実機で直接
+チェックアウトして同じ失敗を再現したので main 由来と確定した。
+
+**現在の実機ベースラインは 21 ではなく 22 件**（#919 が #906 のベースライン記録より後に
+main へ入ったぶん）。#930 が直れば 21 へ戻る。
+
+##### #899 の症状 2 の実測値（Windows）
+
+```
+resolve_tako_binary          -> C:\Users\<win>\dev\tako\target\debug\tako.exe
+launch_command_line("master") -> 'C:\Users\<win>\dev\tako\target\debug\tako.exe' master
+POSIX クォートで囲まれているか: true
+```
+
+macOS では `/Applications/tako.app/...` が安全文字だけなので囲まれない（= 回帰なし）。
+
+##### 分離した Issue
+
+- **#930**: `tako-core` の `remote_fs_e2e::解決できないホストは接続前に分類される` が
+  Windows 実機で失敗（#919 由来）。**速い FAILED と >60 秒のハングの両方**を観測した
+  ので、名前解決不能の枝は分類だけでなく戻ってこない経路がある疑い
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
