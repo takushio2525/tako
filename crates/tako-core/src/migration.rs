@@ -150,6 +150,15 @@ pub struct Step {
     pub describe: Note,
     /// 変換本体。`Ok(None)` = 変えるものが無かった（既に新形式）
     pub apply: fn(&str) -> Result<Option<String>, String>,
+    /// **一度だけ**当てる手順か。
+    ///
+    /// 既定は false = 内容が旧形式なら何度でも直す（構造の移行はこれでよい）。
+    /// true にするのは「**利用者が旧い値へ意図して戻す自由がある**」場合だけ
+    /// （例: #27 の `[1m]` 既定モデル除去。移行後にユーザーが自分で `[1m]` を
+    /// 選び直したら、それは尊重して二度と消してはいけない）。
+    /// 一度当てた印は**退避ファイルの存在**そのもの（[`backup_path`]）で持つので、
+    /// 別途の状態ファイルを増やさない
+    pub once: bool,
 }
 
 /// ファイル種別ごとの登録内容
@@ -397,6 +406,17 @@ pub fn migrate_text(
     spec: &SchemaSpec,
     text: &str,
 ) -> Result<Option<(String, u32, Vec<Note>)>, MigrateTextError> {
+    migrate_text_with(spec, text, &|_| false)
+}
+
+/// [`migrate_text`] の一般形。`already_once` は「その `from` 版数の一度だけの手順が
+/// 既に当たっているか」を答える（実体は退避ファイルの有無。[`migrate_file`] が渡す）
+#[allow(clippy::type_complexity)]
+pub fn migrate_text_with(
+    spec: &SchemaSpec,
+    text: &str,
+    already_once: &dyn Fn(u32) -> bool,
+) -> Result<Option<(String, u32, Vec<Note>)>, MigrateTextError> {
     let current = (spec.detect)(text);
     let steps = plan(current, spec.target_version, spec.steps).map_err(MigrateTextError::Plan)?;
     if steps.is_empty() {
@@ -405,6 +425,10 @@ pub fn migrate_text(
     let mut body = text.to_string();
     let mut applied = Vec::new();
     for step in steps {
+        if step.once && already_once(step.from) {
+            // 一度当てたあとに利用者が旧い値へ戻した = 意図された選択。触らない
+            continue;
+        }
         match (step.apply)(&body) {
             Ok(Some(next)) => {
                 body = next;
@@ -451,6 +475,129 @@ impl MigrateTextError {
     }
 }
 
+/// 実ファイルへの読み書き。**退避もアトミック書き込みもここを通す**。
+///
+/// 抽象にしてある理由は 2 つ。①アトミック書き込みと排他ロックの実装は
+/// tako-control（`config_io`。#169）にあり core からは呼べない ②テストでは
+/// 素の fs で回したい。実装差で安全要件が変わらないよう、退避の順序と
+/// 「書けなければ元を残す」判断は [`migrate_file`] 側に閉じている
+pub trait MigrationIo {
+    /// 読む。ファイルが無ければ `Ok(None)`
+    fn read(&self, path: &Path) -> std::io::Result<Option<String>>;
+    /// 書く（アトミックであること = 途中の内容が他プロセスから見えない）
+    fn write(&self, path: &Path, text: &str) -> std::io::Result<()>;
+    /// 存在確認（一度だけの手順の印を見るのに使う）
+    fn exists(&self, path: &Path) -> bool;
+}
+
+/// 素の `std::fs` で動く [`MigrationIo`]（テストと、排他が要らない読み取り系で使う）
+pub struct FsIo;
+
+impl MigrationIo for FsIo {
+    fn read(&self, path: &Path) -> std::io::Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write(&self, path: &Path, text: &str) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, text)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+}
+
+/// 1 ファイルを最新形式へ揃える。**安全要件（退避・冪等・保全・可視化）はここが唯一の実装**。
+///
+/// 手順は必ずこの順:
+///
+/// 1. 読む（無ければ [`FileOutcome::Absent`]。作らない）
+/// 2. 内容から版数を判定して計画を立てる（登録が壊れていれば触らず [`FileOutcome::Refused`]）
+/// 3. 変換する（失敗したら**元のファイルには触らない** = [`FileOutcome::Failed`]）
+/// 4. **先に旧内容を退避**してから書く（退避に失敗したら書かない）
+pub fn migrate_file(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) -> FileReport {
+    let outcome = migrate_file_outcome(spec, path, io);
+    FileReport {
+        id: spec.id,
+        path: path.to_path_buf(),
+        outcome,
+    }
+}
+
+fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) -> FileOutcome {
+    let text = match io.read(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return FileOutcome::Absent,
+        Err(e) => {
+            return FileOutcome::Failed {
+                reason: format!("読み取りに失敗: {e}"),
+            }
+        }
+    };
+    let already_once = |from: u32| io.exists(&backup_path(path, from));
+    let migrated = match migrate_text_with(spec, &text, &already_once) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return FileOutcome::UpToDate {
+                version: (spec.detect)(&text),
+            }
+        }
+        Err(e) if e.is_plan_error() => {
+            return FileOutcome::Refused {
+                reason: e.message(),
+            }
+        }
+        Err(e) => {
+            return FileOutcome::Failed {
+                reason: e.message(),
+            }
+        }
+    };
+    let (body, from, applied) = migrated;
+    let backup = backup_path(path, from);
+    // 退避が取れないなら書かない（旧内容を失う経路を作らない）
+    if !io.exists(&backup) {
+        if let Err(e) = io.write(&backup, &text) {
+            return FileOutcome::Failed {
+                reason: format!("退避に失敗したので移行しない ({}): {e}", backup.display()),
+            };
+        }
+    }
+    if let Err(e) = io.write(path, &body) {
+        return FileOutcome::Failed {
+            reason: format!("書き込みに失敗: {e}（旧内容は {} に残る）", backup.display()),
+        };
+    }
+    FileOutcome::Migrated {
+        from,
+        to: spec.target_version,
+        backup,
+        applied,
+    }
+}
+
+/// 解釈できなかったファイルを退避する（**既定値へ落とす前に必ず呼ぶ**）。
+///
+/// 「壊れた settings.json を黙って既定値扱いし、次の保存で上書きして消す」型の
+/// 事故（#916 の棚卸しで実測）を構造的に防ぐための共通口。退避できたパスを返す。
+/// 退避先が既にあるときは**上書きしない**（最初に壊れた内容こそ残す価値がある）
+pub fn quarantine_unreadable(path: &Path, io: &dyn MigrationIo) -> Option<PathBuf> {
+    let dest = quarantine_path(path);
+    if io.exists(&dest) {
+        return Some(dest);
+    }
+    let text = io.read(path).ok().flatten()?;
+    io.write(&dest, &text).ok()?;
+    Some(dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,12 +633,14 @@ mod tests {
             to: 2,
             describe: NOTE_A,
             apply: add_a,
+            once: false,
         },
         Step {
             from: 2,
             to: 3,
             describe: NOTE_B,
             apply: add_b,
+            once: false,
         },
     ];
 
@@ -536,6 +685,7 @@ mod tests {
             to: 2,
             describe: NOTE_A,
             apply: add_a,
+            once: false,
         }];
         assert_eq!(
             plan(1, 3, GAP),
@@ -547,6 +697,7 @@ mod tests {
             to: 1,
             describe: NOTE_A,
             apply: add_a,
+            once: false,
         }];
         assert_eq!(
             plan(1, 2, STUCK),
@@ -558,6 +709,7 @@ mod tests {
             to: 3,
             describe: NOTE_A,
             apply: add_a,
+            once: false,
         }];
         assert_eq!(
             plan(1, 2, JUMP),
@@ -602,6 +754,7 @@ mod tests {
             to: 2,
             describe: NOTE_A,
             apply: fail,
+            once: false,
         }];
         let spec = SchemaSpec {
             id: SchemaId::Settings,
@@ -665,5 +818,184 @@ mod tests {
         });
         assert_eq!(report.attention().count(), 1);
         assert!(report.notice().expect("両方言う").contains('/'));
+    }
+    // --- ファイル駆動（退避・冪等・保全・一度だけ） ---------------------------
+
+    /// テスト用の一時ディレクトリ。**必ず temp 配下**（#511 の事故を踏まないため、
+    /// 消すのは自分が作ったパスだけ）
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-migration-{}-{}-{tag}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t").replace(
+                |c: char| !c.is_ascii_alphanumeric(),
+                "_"
+            )
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        dir
+    }
+
+    const SPEC_V3: SchemaSpec = SchemaSpec {
+        id: SchemaId::Settings,
+        target_version: 3,
+        detect: detect_v1,
+        steps: STEPS,
+    };
+
+    #[test]
+    fn ファイルが無ければ作らない() {
+        let dir = temp_dir("absent");
+        let path = dir.join("settings.json");
+        let report = migrate_file(&SPEC_V3, &path, &FsIo);
+        assert_eq!(report.outcome, FileOutcome::Absent);
+        assert!(!path.exists(), "無いファイルを勝手に作らない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 移行は先に退避してから書く() {
+        let dir = temp_dir("backup");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "x").expect("書ける");
+        let report = migrate_file(&SPEC_V3, &path, &FsIo);
+        match &report.outcome {
+            FileOutcome::Migrated { from, to, backup, applied } => {
+                assert_eq!((*from, *to), (1, 3));
+                assert_eq!(applied.len(), 2);
+                assert_eq!(
+                    std::fs::read_to_string(backup).expect("退避が読める"),
+                    "x",
+                    "旧内容がそのまま残る"
+                );
+            }
+            other => panic!("移行されるはず: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).expect("読める"), "xab");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 冪等性の実測: 2 回目は何も起きない（退避も上書きしない）
+    #[test]
+    fn 二回流しても壊れない() {
+        let dir = temp_dir("idempotent");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "x").expect("書ける");
+        assert!(migrate_file(&SPEC_V3, &path, &FsIo).outcome.changed());
+        let after_first = std::fs::read_to_string(&path).expect("読める");
+        let second = migrate_file(&SPEC_V3, &path, &FsIo);
+        assert!(!second.outcome.changed(), "2 回目は書き換えない: {second:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("読める"), after_first);
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path, 1)).expect("退避が読める"),
+            "x",
+            "退避は最初の内容のまま（2 回目に新形式で塗り潰さない）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一度だけの手順は、利用者が旧い値へ戻したら二度と当てない（#27 の #67 回帰防止）
+    #[test]
+    fn 一度だけの手順は退避の存在で止まる() {
+        const ONCE: &[Step] = &[Step {
+            from: 1,
+            to: 2,
+            describe: NOTE_A,
+            apply: add_a,
+            once: true,
+        }];
+        const SPEC: SchemaSpec = SchemaSpec {
+            id: SchemaId::Profiles,
+            target_version: 2,
+            detect: detect_v1,
+            steps: ONCE,
+        };
+        let dir = temp_dir("once");
+        let path = dir.join("default.yaml");
+        std::fs::write(&path, "x").expect("書ける");
+        assert!(migrate_file(&SPEC, &path, &FsIo).outcome.changed(), "1 回目は当たる");
+        // 利用者が旧い形へ意図して戻した
+        std::fs::write(&path, "x").expect("書ける");
+        let report = migrate_file(&SPEC, &path, &FsIo);
+        assert!(!report.outcome.changed(), "2 回目は当てない: {report:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("読める"), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 未来の形式は触らずに拒否する() {
+        fn detect_v9(_: &str) -> u32 {
+            9
+        }
+        const SPEC: SchemaSpec = SchemaSpec {
+            id: SchemaId::Settings,
+            target_version: 3,
+            detect: detect_v9,
+            steps: STEPS,
+        };
+        let dir = temp_dir("future");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "x").expect("書ける");
+        let report = migrate_file(&SPEC, &path, &FsIo);
+        assert!(matches!(report.outcome, FileOutcome::Refused { .. }), "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("読める"),
+            "x",
+            "拒否したら 1 バイトも触らない"
+        );
+        assert!(report.outcome.needs_attention());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 変換が失敗したら元のファイルを守る() {
+        const BROKEN: &[Step] = &[Step {
+            from: 1,
+            to: 2,
+            describe: NOTE_A,
+            apply: fail,
+            once: false,
+        }];
+        const SPEC: SchemaSpec = SchemaSpec {
+            id: SchemaId::Settings,
+            target_version: 2,
+            detect: detect_v1,
+            steps: BROKEN,
+        };
+        let dir = temp_dir("failed");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "もとの内容").expect("書ける");
+        let report = migrate_file(&SPEC, &path, &FsIo);
+        assert!(matches!(report.outcome, FileOutcome::Failed { .. }), "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("読める"),
+            "もとの内容"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 解釈不能な内容の保全: 既定値へ落とす前に退避され、最初の内容が守られる
+    #[test]
+    fn 解釈できない内容は退避して残す() {
+        let dir = temp_dir("quarantine");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ こわれた").expect("書ける");
+        let dest = quarantine_unreadable(&path, &FsIo).expect("退避できる");
+        assert_eq!(
+            std::fs::read_to_string(&dest).expect("読める"),
+            "{ こわれた",
+            "捨てずに残す"
+        );
+        // 2 回目は最初の退避を塗り潰さない
+        std::fs::write(&path, "べつのこわれかた").expect("書ける");
+        let again = quarantine_unreadable(&path, &FsIo).expect("退避先を返す");
+        assert_eq!(again, dest);
+        assert_eq!(
+            std::fs::read_to_string(&dest).expect("読める"),
+            "{ こわれた",
+            "最初に壊れた内容こそ残す"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
