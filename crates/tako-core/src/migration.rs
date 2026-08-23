@@ -140,7 +140,7 @@ impl SchemaId {
 /// テキストなので、tako-core が serde_yaml へ依存せずに機構だけを持てる）。
 /// 未知のキーを落とさないため、実装側は必ず `serde_*::Value` のような
 /// 「全体を保持する型」を経由すること（構造体へ通すと未知キーが消える）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct Step {
     /// この手順が受け取る版数
     pub from: u32,
@@ -161,8 +161,11 @@ pub struct Step {
     pub once: bool,
 }
 
+/// 「今の形式として読めるか」を確かめる関数の型
+pub type Validator = fn(&str) -> Result<(), String>;
+
 /// ファイル種別ごとの登録内容
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct SchemaSpec {
     pub id: SchemaId,
     /// 現在のスキーマ世代。**スキーマを変えたらここを上げて [`Step`] を足す**
@@ -171,6 +174,17 @@ pub struct SchemaSpec {
     pub detect: fn(&str) -> u32,
     /// `from` の昇順に並べた変換手順
     pub steps: &'static [Step],
+    /// 「一度だけの手順（[`Step::once`]）が既に当たっている」印として認める
+    /// **旧世代の退避ファイル名の接尾辞**。
+    ///
+    /// 機構より前に手書きされていた移行を取り込むときだけ使う（例: #27 が使っていた
+    /// `.backup-1m`）。これを渡さないと、旧い印しか持たない利用者にもう一度当たってしまう
+    pub once_markers: &'static [&'static str],
+    /// **今の形式として読めるか**を確かめる（`None` = 形式に決まりがない = md 等）。
+    ///
+    /// これがあると `tako migrate status` が全設定ファイルの健康診断になり、
+    /// 「壊れているのに黙って既定値で動いている」状態を人が気付ける
+    pub validate: Option<Validator>,
 }
 
 impl SchemaSpec {
@@ -541,7 +555,20 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
             }
         }
     };
-    let already_once = |from: u32| io.exists(&backup_path(path, from));
+    if let Some(validate) = spec.validate {
+        if let Err(reason) = validate(&text) {
+            // 読めないものは移行しない。**捨てずに退避**して人へ申告する
+            let quarantine = quarantine_unreadable(path, io).unwrap_or_else(|| quarantine_path(path));
+            return FileOutcome::Unreadable { quarantine, reason };
+        }
+    }
+    let already_once = |from: u32| {
+        io.exists(&backup_path(path, from))
+            || spec
+                .once_markers
+                .iter()
+                .any(|suffix| io.exists(&sibling(path, suffix)))
+    };
     let migrated = match migrate_text_with(spec, &text, &already_once) {
         Ok(Some(v)) => v,
         Ok(None) => {
@@ -673,11 +700,11 @@ mod tests {
     fn planは壊れた登録を拒む() {
         // 目標より新しいファイル
         assert_eq!(
-            plan(4, 3, STEPS),
-            Err(PlanError::FromFuture {
+            plan(4, 3, STEPS).expect_err("拒否する"),
+            PlanError::FromFuture {
                 current: 4,
                 target: 3
-            })
+            }
         );
         // 手順が無い
         const GAP: &[Step] = &[Step {
@@ -688,8 +715,8 @@ mod tests {
             once: false,
         }];
         assert_eq!(
-            plan(1, 3, GAP),
-            Err(PlanError::MissingStep { from: 2, target: 3 })
+            plan(1, 3, GAP).expect_err("拒否する"),
+            PlanError::MissingStep { from: 2, target: 3 }
         );
         // 進まない手順
         const STUCK: &[Step] = &[Step {
@@ -700,8 +727,8 @@ mod tests {
             once: false,
         }];
         assert_eq!(
-            plan(1, 2, STUCK),
-            Err(PlanError::NotAdvancing { from: 1, to: 1 })
+            plan(1, 2, STUCK).expect_err("拒否する"),
+            PlanError::NotAdvancing { from: 1, to: 1 }
         );
         // 飛び越え
         const JUMP: &[Step] = &[Step {
@@ -712,11 +739,11 @@ mod tests {
             once: false,
         }];
         assert_eq!(
-            plan(1, 2, JUMP),
-            Err(PlanError::Overshoot {
+            plan(1, 2, JUMP).expect_err("拒否する"),
+            PlanError::Overshoot {
                 reached: 3,
                 target: 2
-            })
+            }
         );
     }
 
@@ -727,6 +754,8 @@ mod tests {
             target_version: 3,
             detect: detect_v1,
             steps: STEPS,
+            once_markers: &[],
+            validate: None,
         };
         let (text, from, applied) = migrate_text(&spec, "x").expect("成功").expect("変わる");
         assert_eq!(text, "xab");
@@ -742,6 +771,8 @@ mod tests {
             target_version: 3,
             detect: detect_v1,
             steps: STEPS,
+            once_markers: &[],
+            validate: None,
         };
         // detect は常に v1 を返すが、内容は既に新形式（a と b がある）
         assert_eq!(migrate_text(&spec, "xab").expect("成功"), None);
@@ -761,6 +792,8 @@ mod tests {
             target_version: 2,
             detect: detect_v1,
             steps: BROKEN,
+            once_markers: &[],
+            validate: None,
         };
         let err = migrate_text(&spec, "x").expect_err("失敗する");
         assert!(!err.is_plan_error());
@@ -842,6 +875,8 @@ mod tests {
         target_version: 3,
         detect: detect_v1,
         steps: STEPS,
+        once_markers: &[],
+        validate: None,
     };
 
     #[test]
@@ -910,6 +945,8 @@ mod tests {
             target_version: 2,
             detect: detect_v1,
             steps: ONCE,
+            once_markers: &[],
+            validate: None,
         };
         let dir = temp_dir("once");
         let path = dir.join("default.yaml");
@@ -933,6 +970,8 @@ mod tests {
             target_version: 3,
             detect: detect_v9,
             steps: STEPS,
+            once_markers: &[],
+            validate: None,
         };
         let dir = temp_dir("future");
         let path = dir.join("settings.json");
@@ -962,6 +1001,8 @@ mod tests {
             target_version: 2,
             detect: detect_v1,
             steps: BROKEN,
+            once_markers: &[],
+            validate: None,
         };
         let dir = temp_dir("failed");
         let path = dir.join("settings.json");
@@ -996,6 +1037,69 @@ mod tests {
             "{ こわれた",
             "最初に壊れた内容こそ残す"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn 読めない内容は移行せず退避して申告する() {
+        fn reject(_: &str) -> Result<(), String> {
+            Err("JSON として読めない".into())
+        }
+        const SPEC: SchemaSpec = SchemaSpec {
+            id: SchemaId::Settings,
+            target_version: 3,
+            detect: detect_v1,
+            steps: STEPS,
+            once_markers: &[],
+            validate: Some(reject),
+        };
+        let dir = temp_dir("validate");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ こわれた").expect("書ける");
+        let report = migrate_file(&SPEC, &path, &FsIo);
+        match &report.outcome {
+            FileOutcome::Unreadable { quarantine, reason } => {
+                assert!(reason.contains("JSON"), "{reason}");
+                assert_eq!(
+                    std::fs::read_to_string(quarantine).expect("読める"),
+                    "{ こわれた"
+                );
+            }
+            other => panic!("退避されるはず: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("読める"),
+            "{ こわれた",
+            "元のファイルは触らない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 機構より前の手書き移行を取り込むとき、旧い印を無視して二度当てない
+    #[test]
+    fn 旧世代の印も一度だけの印として認める() {
+        const ONCE: &[Step] = &[Step {
+            from: 1,
+            to: 2,
+            describe: NOTE_A,
+            apply: add_a,
+            once: true,
+        }];
+        const SPEC: SchemaSpec = SchemaSpec {
+            id: SchemaId::Profiles,
+            target_version: 2,
+            detect: detect_v1,
+            steps: ONCE,
+            once_markers: &[".backup-1m"],
+            validate: None,
+        };
+        let dir = temp_dir("legacy-marker");
+        let path = dir.join("default.yaml");
+        std::fs::write(&path, "x").expect("書ける");
+        // 旧い機構が残した印だけがある状態
+        std::fs::write(dir.join("default.yaml.backup-1m"), "x").expect("書ける");
+        let report = migrate_file(&SPEC, &path, &FsIo);
+        assert!(!report.outcome.changed(), "旧い印を尊重する: {report:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("読める"), "x");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

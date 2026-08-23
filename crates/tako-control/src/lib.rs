@@ -41,6 +41,7 @@ pub mod launch_cmd;
 pub mod layout;
 pub mod limit_stop;
 pub mod mcp;
+pub mod migrations;
 pub mod orchestrator;
 pub mod peer_messaging;
 pub mod platform;
