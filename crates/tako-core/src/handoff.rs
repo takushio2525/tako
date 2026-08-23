@@ -844,6 +844,12 @@ fn assign_segment(
         }
     }
     let heading = heading?;
+    // 持ち主の主張が読み取れない見出しは**そのままにする**（実測: 本番の `sol.md` に
+    // あった `## tako ログについて` が「tako プロジェクトの引き継ぎ」として掴まれた。
+    // 引き当てを外すより、掴み損なって運用メモに残すほうが安全）
+    if !heading_claims_ownership(heading) {
+        return None;
+    }
     let lower = heading.to_lowercase();
     let mut hits: Vec<&String> = project_keys
         .iter()
@@ -864,13 +870,39 @@ fn assign_segment(
         .filter(|k| valid_project_key(k))
         .filter(|k| {
             let head = k.split(['-', '_']).next().unwrap_or("").to_lowercase();
-            head.len() >= 3 && words.contains(&head)
+            // **数字だけの先頭要素は名前ではない**。実測: `2026-hackathon-team23` の
+            // `2026` が見出しの日付（2026-08-18 等）と当たり、候補が 2 件になって
+            // 本来割り当たるはずの `bunpoushi-migration` が丸ごと不明扱いになっていた
+            head.len() >= 3
+                && head.chars().any(|c| c.is_ascii_alphabetic())
+                && words.contains(&head)
         })
         .collect();
     if token_hits.len() == 1 {
         return Some((token_hits.remove(0).clone(), SegmentOwner::HeadingToken));
     }
     None
+}
+
+/// 見出しが「この節は誰かの担当だ」と主張しているか。
+///
+/// 本番データの慣習は `## 【<ミッション名>】担当 master — …`。囲み記号か担当を表す語が
+/// あるものだけを引き当ての候補にする（プロジェクト名がただ本文の話題として出てくる
+/// 見出しを掴まないため）
+fn heading_claims_ownership(heading: &str) -> bool {
+    let lower = heading.to_lowercase();
+    const OWNER_WORDS: &[&str] = &["担当", "owner", "owned by", "assigned", "managed by"];
+    if OWNER_WORDS.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    // 囲み記号（【】/「」/[]/《》）でミッション名を括る書き方
+    const BRACKETS: &[(char, char)] = &[('【', '】'), ('「', '」'), ('[', ']'), ('《', '》')];
+    BRACKETS.iter().any(
+        |(open, close)| match (heading.find(*open), heading.rfind(*close)) {
+            (Some(o), Some(c)) => c > o + 1,
+            _ => false,
+        },
+    )
 }
 
 /// `<!-- tako:project: <key> -->` からキーを取り出す（最初の 1 件）
@@ -2024,6 +2056,52 @@ mod tests {
     /// 移行は冪等: すでに割れているファイル（1 プロジェクト分）を再度かけても動かない
     /// 担当 1 件のプロファイルでも、移行済みの番地が入っていれば全文移動は起きない
     /// （これが無いと 2 回目の setup で運用メモの雛形が projects/ へ吸い込まれる）
+    /// 本番データで踏んだ 2 件。①持ち主を主張していない見出しは掴まない
+    /// ②数字だけのキー先頭要素（`2026-hackathon-team23` の `2026`）は名前として扱わない
+    #[test]
+    fn 本番データで踏んだ誤判定を再発させない() {
+        let all = keys(&[
+            "tako",
+            "bunpoushi-migration",
+            "streamdeck-lab",
+            "2026-hackathon-team23",
+        ]);
+        // ① `## tako ログについて` は tako プロジェクトの引き継ぎではない
+        let plan = migration_plan("## tako ログについて\n- 本文\n", &all, &[]);
+        assert!(!plan.has_moves(), "{plan:?}");
+        assert!(plan.residue().contains("- 本文"));
+        // ② 日付の `2026` が候補に混ざって bunpoushi が不明になってはいけない
+        let heading = "## 【bunpoushi 移行】担当 master — 最終盤（2026-08-18 未明に交代）";
+        let plan = migration_plan(&format!("{heading}\n- 本文\n"), &all, &[]);
+        assert_eq!(
+            plan.by_project(),
+            vec![(
+                "bunpoushi-migration".to_string(),
+                format!("{heading}\n- 本文")
+            )]
+        );
+    }
+
+    #[test]
+    fn 持ち主の主張がある見出しだけを候補にする() {
+        for owned in [
+            "## 【bunpoushi 移行】担当 master",
+            "## 【tako】",
+            "## tako 担当 master",
+            "## [tako] mission",
+            "## tako — owner: me",
+        ] {
+            assert!(heading_claims_ownership(owned), "{owned}");
+        }
+        for plain in [
+            "## tako ログについて",
+            "## 残キュー（優先順）",
+            "## 現況（7/24 夕方）",
+        ] {
+            assert!(!heading_claims_ownership(plain), "{plain}");
+        }
+    }
+
     #[test]
     fn 移行済みの番地があれば全文移動は再発しない() {
         let memo = profile_memo_template_in(Lang::Ja, "takodev");

@@ -180,9 +180,11 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
     let Some(content) = read_non_empty(&memo_path) else {
         return out;
     };
-    // 安い前判定。移行の材料になり得る見出しが無ければ projects.yaml も読まない
-    // （master は self を定期的に叩くので、定常状態でファイル読みを増やさない）
-    if !ho::needs_migration_scan(&content) {
+    // 安い前判定。**番地が入っていて**移行の材料になり得る見出しも無いなら、
+    // projects.yaml も読まない（master は self を定期的に叩くので定常状態で
+    // ファイル読みを増やさない）。番地が無いファイルは 1 度だけ本走査へ通す
+    let stamped = content.contains(ho::HANDOFF_FORMAT_MARKER);
+    if stamped && !ho::needs_migration_scan(&content) {
         return out;
     }
     let all_keys: Vec<String> = match ProjectsConfig::load() {
@@ -199,7 +201,14 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         .unwrap_or_default();
     let plan = ho::migration_plan(&content, &all_keys, &profile_projects);
     if !plan.has_moves() {
-        // 旧形式のままでも移す先が決まらないなら書き換えない（内容を触らないのが安全）
+        // 移す先が決まらないなら**本文には触らない**。ただし番地だけは打つ
+        // （次からは安い前判定で抜けられる。内容は 1 バイトも変えない）
+        if !stamped {
+            let stamped_body = format!("{}\n{content}", ho::HANDOFF_FORMAT_MARKER);
+            if let Err(e) = write_profile_memo(profile, &stamped_body) {
+                out.warnings.push(e);
+            }
+        }
         return out;
     }
 
