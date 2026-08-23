@@ -2574,8 +2574,29 @@ macOS 上から Windows 形の入力を検査できる（#515 の方針）。
 
 | アーム | 結果 |
 |---|---|
-| `TAKO_913_LEGACY=1`（旧挙動 = `path.display()` をそのまま符号化） | **項目 116 で FAILED**（Issue の報告と同一） |
+| main（修正なし。#906 セッションで実測） | **項目 116 で FAILED**（`116: file URL が 4 本ともパスへ戻る (1)`） |
 | 既定（このブランチ） | **項目 116 通過**。`TAKO_SELF_TEST_835: tabs=3->6 new=[("読み物.md", 1, Some("\\?\C:\…\読み物.md"), false), ("プロジェクト", 1, None, true), ("unknown.xyzzy", 1, Some(…), false)]` = macOS と同じ 3 タブ。**117 / 118 も通り到達範囲は 0〜118** |
+
+##### 同一バイナリの A/B は**単体で決定的に**取った（実機は途中でフレークした）
+
+`TAKO_913_LEGACY=1` は**テスト側と製品側の両方**に入れてある（片方だけだと
+「半分直った状態」になって A/B にならない。実機で 1 回踏んだ）。macOS の単体テストで
+決定的に振れる:
+
+```
+$ TAKO_913_LEGACY=1 cargo test -p tako-app --bin tako-app file_url
+… windowsのパスもrfc8089の形のurlになる ... FAILED
+  left: "file://C%3A%5CUsers%5Cme%5Ca.md"     ← Issue の報告と同じ壊れた形
+ right: "file:///C%3A/Users/me/a.md"
+… 作ったurlは受け口でパスへ戻る ... FAILED
+test result: FAILED. 1 passed; 2 failed
+```
+
+実機の legacy アームは**項目 116 へ届く前に 3 回落ちた**（`tako read` ×1 / #702 ×2）。
+`TAKO_913_LEGACY` は項目 116 以外に触らないので無関係のはずで、**直後に同じ掃除をして
+after アームを回したら同じく早期（`tako read`）で落ちた** = 環境ドリフト（この時間帯の
+実機は GUI セルフテストがフレークする状態）と切り分けた。到達範囲の実測は
+その前の安定していた 3 run（うち 2 run が項目 116 を通過して 119 まで到達）を採る。
 
 ##### 次の壁: 項目 119（#868 install_plan）
 
