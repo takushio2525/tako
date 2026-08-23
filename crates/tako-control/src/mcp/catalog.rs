@@ -2233,7 +2233,9 @@ pub fn tools() -> Vec<Value> {
                 action=run で実際に当てる（旧内容は .pre-v<N>.bak へ退避され消えない。\
                 冪等なので何度実行しても壊れない）。\
                 応答の files[].state は absent / up_to_date / migrated / unreadable / \
-                refused / failed。**unreadable は「設定が壊れているので既定値で動いている」\
+                refused / failed で、files[].steps に当てた（当てる）移行の説明が入る。\
+                action=status のときは書き換えていないので backup_planned / \
+                quarantine_planned というキー名になる（「退避済み」と読み違えないため）。**unreadable は「設定が壊れているので既定値で動いている」\
                 という意味**で、退避先（quarantine）に元の内容が残っているので\
                 ユーザーへ知らせること。schema でファイル種別を 1 つに絞れる。\
                 設定が壊れて GUI が起動しないときは CLI の `tako migrate` が同じ処理を\

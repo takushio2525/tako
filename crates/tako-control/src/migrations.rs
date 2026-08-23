@@ -552,12 +552,16 @@ pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value
         "files": report
             .files
             .iter()
-            .map(file_json)
+            .map(|f| file_json(f, mode == Mode::Apply))
             .collect::<Vec<_>>(),
     }))
 }
 
-fn file_json(file: &FileReport) -> serde_json::Value {
+/// 1 ファイルの結果を JSON へ。`applied = false`（見るだけ）のときは
+/// 「これからこうなる」であることが読み手に分かるキー名にする
+/// （退避していないのに `backup` / `quarantine` と書くと、AI が
+/// 「退避済み」と誤って報告してしまう）
+fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "schema": file.id.as_str(),
         "path": file.path.display().to_string(),
@@ -576,9 +580,18 @@ fn file_json(file: &FileReport) -> serde_json::Value {
         } => {
             map.insert("from".into(), (*from).into());
             map.insert("to".into(), (*to).into());
-            map.insert("backup".into(), backup.display().to_string().into());
             map.insert(
-                "applied".into(),
+                if did_apply {
+                    "backup"
+                } else {
+                    "backup_planned"
+                }
+                .into(),
+                backup.display().to_string().into(),
+            );
+            // 上位の `applied`（真偽値 = 当てたか）と紛れないよう `steps` と呼ぶ
+            map.insert(
+                "steps".into(),
                 applied
                     .iter()
                     .map(|n| serde_json::Value::from(n.text()))
@@ -587,7 +600,15 @@ fn file_json(file: &FileReport) -> serde_json::Value {
             );
         }
         FileOutcome::Unreadable { quarantine, reason } => {
-            map.insert("quarantine".into(), quarantine.display().to_string().into());
+            map.insert(
+                if did_apply {
+                    "quarantine"
+                } else {
+                    "quarantine_planned"
+                }
+                .into(),
+                quarantine.display().to_string().into(),
+            );
             map.insert("reason".into(), reason.clone().into());
         }
         FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
