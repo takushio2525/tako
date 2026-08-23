@@ -106,10 +106,16 @@ impl ShellKind {
                  end\n\
                  {BLOCK_END}\n"
             ),
+            // `dir_expr` は**そのまま埋めない**。PowerShell 5.1 は BOM 無しの `.ps1` を
+            // ANSI コードページ（日本語環境なら CP932）で読むので、非 ASCII が 1 バイトでも
+            // 混ざるとユーザーの `$PROFILE` 全体がパースエラーで壊れる（実機で観測済み。
+            // `shell_integration` の同じ注意書きを参照）。home 配下でないディレクトリは
+            // 絶対パスが入るため、ユーザー名が非 ASCII だと現実に踏む
             Self::PowerShell => format!(
                 "{BLOCK_BEGIN}\n\
                  # Managed by `tako setup`. Adds the Claude Code launcher directory to PATH.\n\
-                 if ($env:PATH -notlike \"*{dir_expr}*\") {{ $env:PATH = \"{dir_expr};\" + $env:PATH }}\n\
+                 $__takoPathDir = {dir_expr}\n\
+                 if ($env:PATH -notlike \"*$__takoPathDir*\") {{ $env:PATH = \"$__takoPathDir;\" + $env:PATH }}\n\
                  {BLOCK_END}\n"
             ),
         }
@@ -119,10 +125,17 @@ impl ShellKind {
     fn dir_expr(self, dir: &Path, home: &Path) -> String {
         let rel = dir.strip_prefix(home).ok();
         match (self, rel) {
-            (Self::PowerShell, Some(rel)) => {
-                format!("$HOME\\{}", rel.to_string_lossy().replace('/', "\\"))
-            }
-            (Self::PowerShell, None) => dir.to_string_lossy().replace('/', "\\"),
+            // どちらの枝も [`crate::shell_integration::powershell_ascii_literal`] を通す
+            // （非 ASCII は `[char]0xNNNN` へ逃げる）。実装は 1 本だけ持つ
+            (Self::PowerShell, Some(rel)) => format!(
+                "Join-Path $HOME {}",
+                crate::shell_integration::powershell_ascii_literal(
+                    &rel.to_string_lossy().replace('/', "\\")
+                )
+            ),
+            (Self::PowerShell, None) => crate::shell_integration::powershell_ascii_literal(
+                &dir.to_string_lossy().replace('/', "\\"),
+            ),
             (_, Some(rel)) => format!("$HOME/{}", rel.to_string_lossy().replace('\\', "/")),
             (_, None) => dir.to_string_lossy().replace('\\', "/"),
         }
@@ -418,6 +431,54 @@ mod tests {
                 || block.contains("-notlike");
             assert!(guarded, "{}: 二重追加ガードが無い", shell.as_str());
         }
+    }
+
+    /// **PowerShell 5.1 は BOM 無しの `.ps1` を ANSI（日本語環境なら CP932）で読む**ので、
+    /// ブロックに非 ASCII が 1 バイトでも混ざるとユーザーの `$PROFILE` 全体が壊れる。
+    ///
+    /// 元の `全シェルのブロックが…` は home が `/home/u` の ASCII しか見ておらず、
+    /// **非 ASCII のユーザー名（日本語 Windows では普通にある）を素通ししていた**。
+    /// home 配下・home 配下でない の両方で escape が効くことを固定する
+    #[test]
+    fn powershellブロックは非asciiのパスでもasciiだけになる() {
+        let home = Path::new(r"C:\Users\塩澤");
+        for dir in [
+            home.join(".local/bin"),                  // home 配下（相対部分は ASCII）
+            PathBuf::from(r"D:\ツール\bin"),          // home 配下でない = 絶対パスが入る
+            PathBuf::from(r"C:\Users\塩澤\bin ver2"), // 空白入り
+        ] {
+            let expr = ShellKind::PowerShell.dir_expr(&dir, home);
+            let block = ShellKind::PowerShell.block(&expr);
+            assert!(
+                block.is_ascii(),
+                "非 ASCII が残った（$PROFILE を壊す）: dir={} block={block}",
+                dir.display()
+            );
+            // ASCII になった理由が「escape した」であって「落とした」でないことの確認。
+            //
+            // home 配下は非 ASCII 部分が `$HOME`（PowerShell が実行時に展開する）へ
+            // くくり出されるので escape は要らない = `Join-Path` の形になる。
+            // 絶対パスを丸ごと入れる枝だけが escape を必要とする
+            let inlined_whole_path = !expr.starts_with("Join-Path");
+            if inlined_whole_path && !dir.to_string_lossy().is_ascii() {
+                assert!(
+                    expr.contains("[char]0x"),
+                    "非 ASCII が escape ではなく欠落している疑い: dir={} expr={expr}",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    /// 二重追加ガードは変数経由になっても効いていること（PowerShell）
+    #[test]
+    fn powershellブロックは変数経由でも二重追加ガードを持つ() {
+        let home = Path::new("/home/u");
+        let expr = ShellKind::PowerShell.dir_expr(&home.join(".local/bin"), home);
+        let block = ShellKind::PowerShell.block(&expr);
+        assert!(block.contains("$__takoPathDir = Join-Path $HOME"));
+        assert!(block.contains("-notlike"), "二重追加ガードが消えた");
+        assert!(block.contains("$env:PATH = \"$__takoPathDir;\" + $env:PATH"));
     }
 
     #[test]
