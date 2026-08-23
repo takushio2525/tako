@@ -3097,6 +3097,14 @@ impl TakoApp {
                 }
             };
 
+        // #919: リモートフォルダが残っているなら起動時にツリーを見せる
+        // （ツリーの開閉は永続化していないので、閉じたまま復元すると
+        // 「開いたリモートフォルダがどこにも見えない」= 消えたように見える）
+        let has_remote_folders = workspace
+            .tabs()
+            .iter()
+            .any(|t| !t.remote_folders().is_empty());
+
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
@@ -3164,6 +3172,16 @@ impl TakoApp {
                 // #550: ドット始まりの表示は settings.json に永続化する（既定 = 非表示）
                 let mut tree = filetree::FileTree::default();
                 tree.set_show_hidden(tako_control::settings::load().show_hidden_files);
+                // #919: リモートフォルダを開いたまま終了したら、次の起動でツリーを開く。
+                //
+                // ツリーの開閉自体は永続化していないので、閉じたまま復元すると
+                // 「開いたはずのリモートフォルダがどこにも見えない」= 消えたように
+                // 見える（読み込みもツリーが見えている間だけなので進まない）。
+                // リモートフォルダは**ユーザーがワークスペースとして開いたもの**なので、
+                // 1 本でも残っているならツリーを見せるのが素直
+                if has_remote_folders {
+                    tree.visible = true;
+                }
                 tree
             },
             previews: HashMap::new(),
@@ -17188,6 +17206,11 @@ impl UiStateHost for TakoApp {
             .iter()
             .flat_map(|t| t.remote_folders().iter().cloned())
             .map(|remote| {
+                if !self.filetree.visible {
+                    // ツリーが閉じている = まだ何も読んでいない（異常ではない）。
+                    // 「pending」だと読み込みが詰まっているように見えるので言い分ける
+                    return (remote, "sidebar_closed".to_string(), 0);
+                }
                 if !active.contains(&remote) {
                     // そのタブを開けばそこで読む（異常ではない）
                     return (remote, "not_displayed".to_string(), 0);
@@ -26137,6 +26160,187 @@ mod self_test {
         (stats.size_in_use as u64, u64::from(stats.blocks_in_use))
     }
 
+    /// リモート（SSH 先）ツリーの実描画（#919）。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=remote-tree`。
+    ///
+    /// この機は clamshell 閉 + 画面 OFF で `screencapture` が全面黒しか撮れない
+    /// （#828 の既知）ため、**視覚の証拠はここで採る**。ネットワークには依存させず
+    /// （バックエンドを呼ばず状態を直接注入する）、見たいのは 3 つ:
+    ///
+    /// 1. リモートルートと中身が**インクとして出ている**（行が見えている）
+    /// 2. 失敗の行が**赤で**出ている（見落とされない色になっている）
+    /// 3. 通知帯が出ている
+    #[cfg(feature = "visual-test")]
+    async fn remote_tree_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_core::remote_fs::{RemoteEntry, RemoteKind, RemoteRef};
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let root = RemoteRef::new("visualhost", "/srv/app");
+        let bad = RemoteRef::new("visualhost", "/srv/app/denied");
+
+        // 素のツリー（リモート無し）を基準に撮る
+        let _ = window.update(cx, |app, _, cx| {
+            app.filetree.visible = true;
+            app.remote_notice = None;
+            cx.notify();
+        });
+        wait(cx, 300).await;
+        let Some((before, scale)) = capture_frame(any, cx) else {
+            fail("visual-test remote-tree: 基準フレーム採取")
+        };
+
+        // リモートルート + 中身 + 失敗の行 + 通知帯を出す
+        let _ = window.update(cx, |app, _, cx| {
+            app.filetree.add_remote_root(root.clone());
+            app.filetree.apply_remote_dir(
+                root.clone(),
+                Ok(vec![
+                    RemoteEntry {
+                        name: "denied".into(),
+                        path: "/srv/app/denied".into(),
+                        kind: RemoteKind::Dir,
+                        size: 0,
+                    },
+                    RemoteEntry {
+                        name: "src".into(),
+                        path: "/srv/app/src".into(),
+                        kind: RemoteKind::Dir,
+                        size: 0,
+                    },
+                    RemoteEntry {
+                        name: "README.md".into(),
+                        path: "/srv/app/README.md".into(),
+                        kind: RemoteKind::File,
+                        size: 12,
+                    },
+                ]),
+            );
+            app.filetree.toggle_remote_dir(&bad);
+            app.filetree.apply_remote_dir(
+                bad.clone(),
+                Err(tako_core::remote_fs::RemoteError::new(
+                    tako_core::remote_fs::RemoteErrorKind::PermissionDenied,
+                    bad.label(),
+                    "Couldn't stat remote file: Permission denied",
+                )
+                .report()),
+            );
+            app.set_remote_notice("visualhost へ接続できません".into(), true);
+            cx.notify();
+        });
+        wait(cx, 400).await;
+        let Some((after, _)) = capture_frame(any, cx) else {
+            fail("visual-test remote-tree: リモート表示のフレーム採取")
+        };
+
+        // サイドバーの実矩形（行が描かれた領域）だけを見る
+        let sidebar = window
+            .update(cx, |app, _, _| {
+                let handle = app.filetree_scroll_handle.clone();
+                let rows = app.filetree.rows().len();
+                let mut rects: Vec<Bounds<Pixels>> = Vec::new();
+                let offset_y = handle.offset().y;
+                for index in 0..rows {
+                    if let Some(mut b) = handle.bounds_for_item(index) {
+                        b.origin.y += offset_y;
+                        rects.push(b);
+                    }
+                }
+                rects
+            })
+            .unwrap_or_default();
+        let changed = changed_pixels_in_bounds(&before, &after, &sidebar, scale);
+
+        // 赤（失敗の色）が出ているか。テーマの red と近い画素を数える
+        let red = window
+            .update(cx, |app, _, _| app.theme.red)
+            .unwrap_or(tako_core::theme::Rgb::new(255, 0, 0));
+        let (tr, tg, tb) = (red.r as i32, red.g as i32, red.b as i32);
+        let redish = |img: &image::RgbaImage| -> usize {
+            img.pixels()
+                .filter(|p| {
+                    let (r, g, b) = (p.0[0] as i32, p.0[1] as i32, p.0[2] as i32);
+                    // 「赤系で、緑よりはっきり赤が強い」= 見落とされない赤
+                    (r - tr).abs() < 48 && (g - tg).abs() < 48 && (b - tb).abs() < 48 && r > g + 30
+                })
+                .count()
+        };
+        let red_px = redish(&after);
+        let red_before = redish(&before);
+
+        let (rows, remote_rows, err_rows) = window
+            .update(cx, |app, _, _| {
+                let rows = app.filetree.rows();
+                (
+                    rows.len(),
+                    rows.iter().filter(|r| r.remote.is_some()).count(),
+                    rows.iter()
+                        .filter(|r| matches!(r.note, Some(crate::filetree::RowNote::Error(_))))
+                        .count(),
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: remote-tree rows={rows} remote_rows={remote_rows}              err_rows={err_rows} changed={changed} red_before={red_before} red_after={red_px}              scale={scale}"
+        );
+        check(
+            changed > 200,
+            &format!("visual-test remote-tree: リモートの行が実際に描かれる (changed={changed})"),
+        );
+        check(
+            remote_rows >= 4 && err_rows == 1,
+            &format!(
+                "visual-test remote-tree: リモート行と失敗行が並ぶ                  (remote={remote_rows} err={err_rows})"
+            ),
+        );
+        check(
+            red_px > red_before + 100,
+            &format!(
+                "visual-test remote-tree: 失敗が赤で出る (before={red_before} after={red_px})"
+            ),
+        );
+
+        // 人が見て確かめられる証拠も残す（この機は画面 OFF で screencapture が
+        // 全面黒しか撮れないため。#828）。サイドバーの実描画部分だけ切り出す
+        if let Ok(out) = std::env::var("TAKO_VISUAL_DUMP") {
+            let x = 0u32;
+            let w = ((sidebar
+                .iter()
+                .map(|b| f32::from(b.right()))
+                .fold(0.0f32, f32::max)
+                + 24.0)
+                * scale) as u32;
+            let h = ((sidebar
+                .iter()
+                .map(|b| f32::from(b.bottom()))
+                .fold(0.0f32, f32::max)
+                + 24.0)
+                * scale) as u32;
+            let w = w.min(after.width());
+            let h = h.min(after.height());
+            if w > 0 && h > 0 {
+                let crop = image::imageops::crop_imm(&after, x, 0, w, h).to_image();
+                match crop.save(&out) {
+                    Ok(()) => println!("TAKO_VISUAL_DUMP: {out} ({w}x{h})"),
+                    Err(e) => println!("TAKO_VISUAL_DUMP: 保存できない {out}: {e}"),
+                }
+            }
+        }
+
+        // 後片付け（以降の節へ持ち越さない）
+        let _ = window.update(cx, |app, _, cx| {
+            app.filetree.remove_remote_root(&root);
+            app.remote_notice = None;
+            cx.notify();
+        });
+        wait(cx, 200).await;
+    }
+
     /// コードプレビューの**見た目と操作**が仮想化（#821）で変わらないことを実ピクセルで見る。
     ///
     /// `TAKO_821_NO_VIRTUAL_LIST=1` を付けた同じバイナリの実行と並べて
@@ -27092,6 +27296,12 @@ mod self_test {
                 }
                 "preview-code" => {
                     preview_code_visual(any, window, cx).await;
+            remote_tree_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                "remote-tree" => {
+                    remote_tree_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
@@ -27099,7 +27309,8 @@ mod self_test {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
-                         grid-bench / preview-leak / chat-leak / preview-code）"
+                         grid-bench / preview-leak / chat-leak / preview-code / \
+                         remote-tree）"
                     );
                     std::process::exit(1);
                 }

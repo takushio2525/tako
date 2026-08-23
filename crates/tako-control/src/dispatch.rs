@@ -5867,52 +5867,57 @@ fn dispatch_remote_folder(
             }))
         }
 
+        // 閉じるのは**全タブ横断が既定**。`--tab` で 1 タブへ絞る。
+        //
+        // タブ単位に閉じ込めると「開いたのに閉じられない」（開いたあと別タブへ
+        // 移っていると空振りする）ので、host / path という**グローバルな指定**へ
+        // 素直な意味を持たせる（実測でこの取り違えを踏んだ）
         "close" => {
-            let tab_id = target_tab(host, tab)?;
+            let scope: Vec<TabId> = match tab {
+                Some(_) => vec![target_tab(host, tab)?],
+                None => host.workspace().tabs().iter().map(|t| t.id()).collect(),
+            };
+            let want_host = if all {
+                None
+            } else {
+                Some(need_host(&ssh_host)?)
+            };
+            let want_path = path
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
             let mut closed: Vec<String> = Vec::new();
-            let hosts_to_release: Vec<String>;
-            {
+            let mut touched_hosts: Vec<String> = Vec::new();
+            for tab_id in scope {
                 let Some(t) = host.workspace_mut().get_tab_mut(tab_id) else {
-                    return Err(DispatchError::Operation("タブが見つからない".into()));
+                    continue;
                 };
-                if all {
-                    let open = t.remote_folders().to_vec();
-                    closed = open.iter().map(|r| r.label()).collect();
-                    hosts_to_release = open.iter().map(|r| r.host.clone()).collect();
-                    for remote in &open {
-                        t.remove_remote_folder(remote);
-                    }
-                } else {
-                    let ssh_host = need_host(&ssh_host)?;
-                    hosts_to_release = vec![ssh_host.clone()];
-                    match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-                        Some(p) => {
-                            let remote = RemoteRef::new(ssh_host.clone(), p.to_string());
-                            if !t.remove_remote_folder(&remote) {
-                                return Err(DispatchError::Operation(format!(
-                                    "開いていないリモートフォルダ: {}",
-                                    remote.label()
-                                )));
-                            }
-                            closed.push(remote.label());
+                let targets: Vec<RemoteRef> = t
+                    .remote_folders()
+                    .iter()
+                    .filter(|r| want_host.as_deref().map(|h| r.host == h).unwrap_or(true))
+                    .filter(|r| want_path.as_deref().map(|p| r.path == p).unwrap_or(true))
+                    .cloned()
+                    .collect();
+                for remote in targets {
+                    if t.remove_remote_folder(&remote) {
+                        if !touched_hosts.contains(&remote.host) {
+                            touched_hosts.push(remote.host.clone());
                         }
-                        None => {
-                            let labels: Vec<String> = t
-                                .remote_folders()
-                                .iter()
-                                .filter(|r| r.host == ssh_host)
-                                .map(|r| r.label())
-                                .collect();
-                            if labels.is_empty() {
-                                return Err(DispatchError::Operation(format!(
-                                    "{ssh_host} のリモートフォルダは開いていない"
-                                )));
-                            }
-                            t.remove_remote_host(&ssh_host);
-                            closed = labels;
-                        }
+                        closed.push(remote.label());
                     }
                 }
+            }
+            if closed.is_empty() {
+                let what = match (want_host.as_deref(), want_path.as_deref()) {
+                    (Some(h), Some(p)) => format!("{h}:{p}"),
+                    (Some(h), None) => h.to_string(),
+                    (None, _) => "リモートフォルダ".to_string(),
+                };
+                return Err(DispatchError::Operation(format!(
+                    "開いていない: {what}（`list` で開いているものを確認できる）"
+                )));
             }
             // どのタブからも参照されなくなったホストは接続（ControlMaster）も畳む。
             // 開いたままにすると `ControlPersist` の間ずっと ssh が居座る
@@ -5922,7 +5927,7 @@ fn dispatch_remote_folder(
                 .iter()
                 .flat_map(|t| t.remote_folders().iter().map(|r| r.host.clone()))
                 .collect();
-            for h in hosts_to_release {
+            for h in touched_hosts {
                 if !still_open.contains(&h) {
                     remote_fs::close_master(&h);
                 }

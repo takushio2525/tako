@@ -2851,7 +2851,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "all": {
                         "type": "boolean",
-                        "description": "close で全ホストのリモートフォルダを閉じる",
+                        "description": "close でホスト指定なしに全部閉じる（既定は全タブ横断。tab で 1 タブへ絞れる）",
                     },
                 },
                 "required": ["action"],

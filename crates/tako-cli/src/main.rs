@@ -449,13 +449,13 @@ enum RemoteFolderCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
-    /// 開いているリモートフォルダを閉じる
+    /// 開いているリモートフォルダを閉じる（既定は全タブ横断）
     Close {
         /// ~/.ssh/config の Host 名（--all のときは省略可）
         host: Option<String>,
         /// リモート側の絶対パス（省略時はそのホストの全部）
         path: Option<String>,
-        /// 全ホストのリモートフォルダを閉じる
+        /// ホスト指定なしに全部閉じる（既定は全タブ横断。--tab で 1 タブへ絞る）
         #[arg(long)]
         all: bool,
         #[arg(long)]

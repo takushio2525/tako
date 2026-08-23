@@ -922,9 +922,16 @@ impl TakoApp {
                 ),
                 filetree::RowNote::Error(report) => (report.clone(), theme.red),
             };
+            // #919: 失敗の理由は 3 行（要約 / 次の一手 / 生の詳細）。サイドバーは狭いので
+            // **折り返す**（`whitespace_nowrap` + `text_ellipsis` だと理由が読めない =
+            // 静かな失敗に戻ってしまう）。`min_w(0)` は flex の自動最小サイズを外して
+            // 折り返し幅を親に合わせるため（#745 と同じ理由で縦積みには効かないので
+            // 行方向のここだけに置く）
             return base.py(px(2.0)).gap(px(4.0)).child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
+                    .pr(px(8.0))
                     .text_size(px(11.0))
                     .text_color(hsla(color))
                     .child(SharedString::from(text)),
@@ -995,7 +1002,7 @@ impl TakoApp {
                 )
                 .child(
                     svg()
-                        .path(file_icons::ui_icon::REMOTE)
+                        .path(file_icons::ui_icon::GLOBE)
                         .size(px(14.0))
                         .flex_none()
                         .text_color(hsla(theme.mauve)),

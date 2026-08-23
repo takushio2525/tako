@@ -875,6 +875,70 @@ mod tests {
             .limit_autoresume());
     }
 
+    /// #919: リモートフォルダが再起動をまたいで残る。
+    ///
+    /// **ローカル FS の存在検査を通さない**のが要点: `pinned_folders` は
+    /// `is_dir()` で生き残りを確かめるが、同じことをリモートのパスへやると
+    /// （ローカルには存在しないので）**必ず全部消える**
+    #[test]
+    fn issue919_リモートフォルダが保存復元され旧ファイルと後方互換() {
+        use tako_core::remote_fs::RemoteRef;
+        let mut ws = sample_workspace();
+        // `sample_workspace` は最後に create_tab するのでアクティブは 2 枚目。
+        // 「開いたタブにだけ載る」ことを見たいので**先頭のタブ**を明示して使う
+        let tab = ws.tabs()[0].id();
+        // POSIX の相手と Windows の相手（`/C:/…`）と空白入りを混ぜる
+        let win = RemoteRef::new("win", "/C:/Users/u/My Documents");
+        let linux = RemoteRef::new("srv", "/srv/app");
+        {
+            let t = ws.get_tab_mut(tab).unwrap();
+            assert!(t.add_remote_folder(linux.clone()));
+            assert!(t.add_remote_folder(win.clone()));
+            // 同じものは重ねない
+            assert!(!t.add_remote_folder(win.clone()));
+        }
+
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        let json = serde_json::to_string(&layout).unwrap();
+        // 開いていないタブでは項目ごと出さない（旧 tako でも読める JSON を保つ）
+        assert_eq!(
+            json.matches("remote_folders").count(),
+            1,
+            "リモートを持つタブのぶんだけ出力される: {json}"
+        );
+
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored, _) = restore(&back).expect("復元できる");
+        let folders = restored.tabs()[0].remote_folders();
+        assert_eq!(folders.len(), 2, "{folders:?}");
+        // 並び（最後に開いたものが先頭）も保たれる
+        assert_eq!(folders[0], win);
+        assert_eq!(folders[1], linux);
+        // 空白入りの Windows パスがそのまま戻る
+        assert_eq!(folders[0].path, "/C:/Users/u/My Documents");
+        // 他のタブへ混ざらない
+        assert!(restored.tabs()[1].remote_folders().is_empty());
+
+        // フィールドを持たない旧ファイルは「リモートなし」として読める
+        let legacy: LayoutFile =
+            serde_json::from_str(&json.replace("\"remote_folders\"", "\"_x\"")).unwrap();
+        let (legacy_ws, _) = restore(&legacy).expect("旧ファイルも復元できる");
+        assert!(legacy_ws.tabs()[0].remote_folders().is_empty());
+
+        // 壊れたエントリ（host / path が空）は落とす
+        let broken: LayoutFile = serde_json::from_str(&json.replace(
+            r#"{"host":"srv","path":"/srv/app"}"#,
+            r#"{"host":"","path":""}"#,
+        ))
+        .expect("壊れたエントリでもパースできる");
+        let (broken_ws, _) = restore(&broken).expect("復元できる");
+        assert_eq!(
+            broken_ws.tabs()[0].remote_folders(),
+            std::slice::from_ref(&win),
+            "空のエントリだけ落ちる"
+        );
+    }
+
     #[test]
     fn キャプチャと復元が往復しidが保たれる() {
         let ws = sample_workspace();
