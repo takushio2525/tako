@@ -1428,7 +1428,7 @@ spawn 経路では**まだ使われていない**。**#885 に起票**。
 
 ```
 capture-pane => with: The term 'with' is not recognized as a name of a cmdlet, ...
-pane_current_path => C:\Users\shioz   （-c が `…\dir` になり存在しないので落ちた先）
+pane_current_path => C:\Users\winuser   （-c が `…\dir` になり存在しないので落ちた先）
 ```
 
 `-c C:\…\dir with space` が `-c` `C:\…\dir` `with` `space` へ割れ、
@@ -1556,7 +1556,7 @@ Windows は `HOME` を持たない（`USERPROFILE` が正）ので必ず `None` 
 
 **`HOME` を外してから測る。** このマシンの `HOME` は **SSH セッションの Process
 スコープにだけ存在**する（実測: `HOME(User)` / `HOME(Machine)` はどちらも空、
-`HOME(Process)=C:\Users\shioz`）。GUI 起動の tako には渡らないので、
+`HOME(Process)=C:\Users\winuser`）。GUI 起動の tako には渡らないので、
 **SSH でそのまま `cargo test` すると `dirs_hint()` が動いて見えて壊れていることが分からない**
 （#877 の作法 12 とまったく同型。あちらは `SHELL`、こちらは `HOME`）。
 
@@ -1650,14 +1650,14 @@ Windows の既定構成（persist ON = 器が psmux）でシェル統合（OSC 7
 |---|---|---|
 | 起動後の `state` | `unknown` | **`idle`** |
 | `cmd.exe /c exit 3` の後 | `unknown` / `exit_code` なし | **`failed` / `exit_code = 3`** |
-| `cd` の cwd 追従 | `C:\Users\shioz`（動かない。区切り `\` = spawn 値） | `C:/Users/shioz` → **`C:/Users/shioz/dev`**（区切り `/` = OSC 7 由来） |
+| `cd` の cwd 追従 | `C:\Users\winuser`（動かない。区切り `\` = spawn 値） | `C:/Users/winuser` → **`C:/Users/winuser/dev`**（区切り `/` = OSC 7 由来） |
 | `tako shell-integration` の警告 | `[警告] 永続バックエンド（psmux）が…働かない` | **出ない** |
 | 側路ファイル | 無し | `iso/osc/2.osc` 57 バイト |
 
 側路の中身をバイト単位で確認したもの（束が 1 個 = 上書き方式が効いている）:
 
 ```
-<ESC>]133;D;0<BEL><ESC>]133;A<BEL><ESC>]7;file:///C:/Users/shioz/dev<BEL><ESC>]133;B<BEL>
+<ESC>]133;D;0<BEL><ESC>]133;A<BEL><ESC>]7;file:///C:/Users/winuser/dev<BEL><ESC>]133;B<BEL>
 ```
 
 **副産物の実測**: セルフテストの項目 41 / 41b のスキップ理由が
@@ -1701,7 +1701,7 @@ TAKO_SELF_TEST_694: pane=48 state=Some(Unknown) alt=Some(false) role=None backen
   `TAKO_PANE_ID` / `TAKO_TAB_ID` の**数値だけ**だったので、#766 が
   **`-e` に空白入り値を流す最初の経路**になる = 「#887 が無いと新規に壊れる」関係。
   #887 のマージ後に rebase し、統合テストの `data_dir` を**あえて空白入り**にして固定した
-- 実機の名前付きパイプ（`\\.\pipe\tako-shioz`）は先着が primary を取るので、**兄弟が
+- 実機の名前付きパイプ（`\\.\pipe\tako-winuser`）は先着が primary を取るので、**兄弟が
   隔離 GUI を立てている窓で測ると secondary 扱いになる**（復元スキップ）。#884 の worker が
   時刻つきで知らせてくれたので、その窓に当たった 1 本を測り直した。**session 1 は 1 本ずつ**
 
@@ -1797,7 +1797,7 @@ macOS 側: `test --workspace` **2411 passed / 0 failed**（main 2406 + 新規 5�
    「もう開いている」と誤認して開き直さない（macOS で 1 回踏んだ）
 5. **session 0（SSH）から session 1 のウィンドウは列挙できない**。`EnumWindows` /
    `MainWindowTitle` は空を返すので、「本当に画面に出ているか」は `schtasks /it` で
-   session 1 に**プローブを投げて**測る。道具は `C:\Users\shioz\dev\tako-evidence-872\` に
+   session 1 に**プローブを投げて**測る。道具は `C:\Users\winuser\dev\tako-evidence-872\` に
    残してある（`winprobe.ps1` = 可視ウィンドウの列挙 / `wmclose.ps1` = ✕ 相当の `WM_CLOSE` /
    `st-after.cmd` `st-before2.cmd` = セルフテストの A/B / `gui.ps1` = 隔離 GUI の起動）
 6. **`Start-Process` で投げたビルドは SSH セッションが切れると死ぬ**。長い処理は
@@ -1890,7 +1890,7 @@ selftest 93d: launch_line="tako master" expected="tako master"
 
 ```
 TAKO_SELF_TEST_702_ALT2: inner_alt=false backend=None
-  tail="… C:\Users\shioz>>|> Write-Host -NoNewline "$([char]27)[?1049h"; Start-Sleep 3600"
+  tail="… C:\Users\winuser>>|> Write-Host -NoNewline "$([char]27)[?1049h"; Start-Sleep 3600"
 ```
 
 `>>` は PSReadLine の継続行プロンプトで、書き込んだコマンドは**確定していない**。
@@ -1955,7 +1955,7 @@ TAKO_SELF_TEST_702_ALT2: inner_alt=false backend=None
 TAKO_APP_SELF_TEST_FAILED: alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)
 ```
 
-読み下すと `C:\Users\shioz>` の次の行が `>> Write-Host -NoNewline "$([char]27)[?1049h"; Start-Sleep 3600`
+読み下すと `C:\Users\winuser>` の次の行が `>> Write-Host -NoNewline "$([char]27)[?1049h"; Start-Sleep 3600`
 = **PSReadLine の継続行プロンプトで、書いたコマンドが確定していない**。
 branch 側ではこの診断行が**そもそも出ない**（= 判定が通った）。
 
@@ -2730,11 +2730,11 @@ POSIX 専用の道具 = nc・ジョブ制御・`/dev/fd`・ECHOCTL / links の P
 CLI は `TAKO_DISCOVERY_DIR=%TEMP%\tako-iso-discovery-<pid>` を指すと隔離 GUI へ届く。
 `tako split` は tako の外から叩くので `--pane` が必須。
 
-スライス 9 の道具は `C:\Users\shioz\dev\` に残してある（次スライスで使い回せる）:
+スライス 9 の道具は `C:\Users\winuser\dev\` に残してある（次スライスで使い回せる）:
 `s9-launch.ps1`（schtasks から session 1 へ GUI を投げる。persist ON）/
 `s9-drive.ps1`（SSH 側から CLI で駆動して観測）/ `s9-final.ps1`（受け入れ観点の通し）/
 `s9-lidcycle.ps1`（蓋の倒す → 自動解除 → `kill -9` 残留 → 起動時復元の 4 段）。
-採取物は `C:\Users\shioz\dev\tako-evidence-s9\`。
+採取物は `C:\Users\winuser\dev\tako-evidence-s9\`。
 
 #### スライス 9 が残した宿題
 
@@ -2844,7 +2844,7 @@ main に入っており呼び出しを足すだけだが、`guard_action` の `r
     座標操作をするスクリプトは冒頭で `SetProcessDPIAware()` を呼ぶ（呼ばないと座標が仮想化されて
     クリックが外れる）。`Add-Type` の C# に `static Main` という名前のメソッドを書くと
     「エントリポイントの署名が違う」で**コンパイルが落ちる**ので別名にする。
-    スライス 5 の道具は `s5-launch.ps1` / `s5-capture.ps1` / `s5-drive.ps1`（`C:\Users\shioz\dev\`）
+    スライス 5 の道具は `s5-launch.ps1` / `s5-capture.ps1` / `s5-drive.ps1`（`C:\Users\winuser\dev\`）
 
 #### 現在の Windows 実機ベースライン（`ssh win`。psmux 3.3.7 導入済み）
 

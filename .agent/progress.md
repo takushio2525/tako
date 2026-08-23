@@ -2576,7 +2576,7 @@
 - **器の能力申告（`osc_passthrough`）は変えていない**。既存テストをそのまま緑に保つことで
   「素通しは直っていない」と「側路が届いている」を**同時に固定**した（誤読されやすい修正の型）
 - 実測（製品経路 = CLI → IPC → GUI → ペイン → 器）: `state` が `unknown` → `idle`、
-  `cmd.exe /c exit 3` で **`failed` / `exit_code=3`**、`cd` で cwd が `C:/Users/shioz/dev` へ追従
+  `cmd.exe /c exit 3` で **`failed` / `exit_code=3`**、`cd` で cwd が `C:/Users/winuser/dev` へ追従
   （区切りが `/` = OSC 7 由来）、警告消滅、側路ファイル 57 バイトの中身をバイト単位で確認
 - **セルフテスト項目 93 の停止は #766 の射程外だった**（plan の見立ては外れ・訂正済み）。
   `TAKO_ISOLATED=1` が `TAKO_PERSIST=0` を立てるので**器なしのペイン**を測っており、実際の前提は
@@ -2889,4 +2889,27 @@
   `platform` を持たないので呼び名の出し分けには設計判断が要る = #905 と同型）
 - 踏んだ罠: **未コミットのまま `git checkout HEAD -- <path>`** で自分の変更を全部捨てた
   （main との比較の前に必ずコミットする）
-||||||| ac47793
+
+## 2026-08-24（#927: public リポの現行コードから実ユーザー名・実ホームパスを除去 + 再発防止番犬）
+- **値を軸に全リポ横断で走査**して 4 ファイル 16 行を特定・置換: `claude_tui.rs`（#425 の実採取
+  fixture の cwd 行 + それを見張る assert）/ `shell_profile.rs`（非 ASCII ユーザー名の枝）/
+  `.agent/plans/2026-08-windows-main-merge-wip.md` + `.agent/progress.md`（Windows 実機の
+  プロンプト行・`HOME` の値・道具の置き場）。混入経路は全部**実機の採取物をそのまま貼った**もの
+- 番犬 `crates/tako-control/tests/no_personal_data.rs` を新設。**2 本立てで片方だけでは穴が残る**:
+  ①ホームパス形（`/Users/<名前>` / `C:\Users\<名前>`）の名前は `PLACEHOLDER_NAMES` だけ = **CI で効く**
+  （誰のマシン由来でも落ちる）②`HOME` / `USERPROFILE` の basename・`USER`・ホスト名を**環境から作って**
+  全文検索 = **手元で効く**（パス形でない素の語も拾う。#927 の 2 箇所目は①では構造的に見えない形だった）
+- **検出語のハッシュはリポに置かない**（Issue の案の片方を棄却）。短く形の決まった語の SHA-256 は
+  総当たりで戻せるので、除去した値を別の形で public リポへ置くことになる。CI で特定の語も
+  見張るなら `TAKO_PII_TERMS`（`,` 区切り・secret 経由）で外から渡す
+- 実装の罠 2 件: worktree の `.git` は**ファイル**（`gitdir: <絶対パス>`）なので名前で外す /
+  番犬の検出力 fixture を `/Users/<架空名>` のリテラルで置くと**自分の検査で落ちる**ので実行時に組み立てる
+- 検証: 横断 grep が 5 パターンとも 0 件（tracked + 未追跡 + バイナリ + FS 走査 542 ファイル）/
+  A/B 3 本（除去した値を戻すと必ず FAILED。①は 3 本とも、②は素の語の 1 行も追加で名指し）/
+  置換後の検出力を製品コードの A/B で実証（罫線トリムを外すと `testuser` の assert が落ちる /
+  PowerShell の escape を外すと非 ASCII の assert が落ちる）/ fmt・clippy（両 feature）・
+  test --workspace 2580 passed 0 failed・Windows クロスチェック エラー 0 / 警告 12 = main 同数
+- git 履歴は書き換えない（#81 の確定判断どおり）。`web/tako-error-collector/wrangler.toml` の
+  KV namespace ID は**アカウント ID ではなく deploy に必要な資源 ID**なので残置（#77 監査でも
+  account_id とメールだけが除去対象だった）
+- 関連: PR（Closes #927）

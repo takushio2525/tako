@@ -441,11 +441,11 @@ mod tests {
     /// home 配下・home 配下でない の両方で escape が効くことを固定する
     #[test]
     fn powershellブロックは非asciiのパスでもasciiだけになる() {
-        let home = Path::new(r"C:\Users\塩澤");
+        let home = Path::new(r"C:\Users\山田");
         for dir in [
             home.join(".local/bin"),                  // home 配下（相対部分は ASCII）
             PathBuf::from(r"D:\ツール\bin"),          // home 配下でない = 絶対パスが入る
-            PathBuf::from(r"C:\Users\塩澤\bin ver2"), // 空白入り
+            PathBuf::from(r"C:\Users\山田\bin ver2"), // 空白入り
         ] {
             let expr = ShellKind::PowerShell.dir_expr(&dir, home);
             let block = ShellKind::PowerShell.block(&expr);

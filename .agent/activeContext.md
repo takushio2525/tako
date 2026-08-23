@@ -15,7 +15,12 @@
 - **#913（項目 116 = #835）を解消**。両側の POSIX 前提（テスト側が `file://C%3A%5C…` を作り、
   製品側は `/` 始まりでないと弾く）。**同じ RFC 8089 の規則が `osc_tap` に既にあった**ので
   `tako_core::file_uri` へ一本化。A/B は `TAKO_913_LEGACY=1`
-- **解消済み（詳細は plan の各記録節と progress.md）**: #907（器つきペインへの非 ASCII 送達 →
+- **#927（public リポの現行コードに残っていた実ユーザー名・実ホームパス）を除去**。
+  4 ファイル（`claude_tui.rs` / `shell_profile.rs` / plan / progress）をプレースホルダへ置換し、
+  番犬 `crates/tako-control/tests/no_personal_data.rs` を新設（ホームパス形の許可リスト = CI で効く +
+  環境から作る当該マシンの識別子 = 手元で効く の 2 本立て）。**実機の採取物を貼る前に置換する**
+  のが規約（`.agent/conventions.md` / AGENTS.md 絶対ルール）
+- **解消済み（詳細は plan の各記録節と progress.md）**: #927 / #907（器つきペインへの非 ASCII 送達 →
   打鍵ではなく器の注入口へ迂回）/ #903（項目 100 = 疑似 TUI をファイル駆動 + `-EncodedCommand`）/
   #866（psmux は `-t =name` を解決しない）/ #897（PTY へ書く Enter は CR）/ #889（項目 93）/
   #872（窓 0 枚の無音終了）/ #727 / #905（スリープ系の呼び名）/ #766 / #870 / #884 / #881 /

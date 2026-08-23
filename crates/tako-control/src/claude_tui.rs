@@ -1650,7 +1650,7 @@ esc to cancel                                       Claude Opus 4.6 (Thinking)"#
     /// #425 実採取相当: 画面上端のバナー・cwd・ユーザー発話が capture に含まれ、
     /// ダイアログ本体は罫線ボックスで囲まれる（tako read で観測した pane 5 の形）
     const CLAUDE_DIALOG_WITH_BANNER: &str = r#"▝▜█████▛▘  Fable 5 with xhigh effort · Claude Max
-/Users/shiozawatakumi
+/Users/testuser
 ⚠ 1 MCP server needs authentication · run /mcp
 Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
 ⏺ Running 1 shell command…
@@ -1686,7 +1686,7 @@ Bash ツールで「touch /tmp/te439/approval-test.txt」を実行して
             !dialog.command.contains("Fable 5")
                 && !dialog.command.contains("MCP server")
                 && !dialog.command.contains("を実行して")
-                && !dialog.command.contains("shiozawatakumi"),
+                && !dialog.command.contains("testuser"),
             "罫線より上のバナー・発話は含まない: {}",
             dialog.command
         );
