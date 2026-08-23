@@ -20587,6 +20587,16 @@ mod self_test {
     /// [`file_url`] のパス部（純粋関数。**符号化の前**の形）。
     /// 区切りを `/` へ寄せ、ドライブレター形式（`C:/…`）には先頭 `/` を足す
     pub(crate) fn file_uri_path(path: &std::path::Path) -> String {
+        // `TAKO_913_LEGACY=1` で修正前（`path.display()` をそのまま）へ戻せる
+        // = 同一バイナリで A/B が取れる。**テスト側だけの仕掛け**で製品経路は読まない
+        if std::env::var_os("TAKO_913_LEGACY").is_some() {
+            return path.display().to_string();
+        }
+        legacy_free_file_uri_path(path)
+    }
+
+    /// [`file_uri_path`] の本体（純粋関数。env を読まないのでテストから直に呼べる）
+    pub(crate) fn legacy_free_file_uri_path(path: &std::path::Path) -> String {
         let shown = path.display().to_string().replace('\\', "/");
         if shown.starts_with('/') {
             shown
@@ -49647,7 +49657,7 @@ mod selftest_pty_enter_watchdog {
 
 #[cfg(test)]
 mod self_test_file_url_tests {
-    use super::self_test::{file_uri_path, file_url};
+    use super::self_test::{file_url, legacy_free_file_uri_path as file_uri_path};
     use std::path::Path;
 
     /// #913: 項目 116 が受け口へ渡す URL は **RFC 8089 の形**（パス部は `/` 始まり・

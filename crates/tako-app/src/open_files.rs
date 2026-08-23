@@ -60,6 +60,11 @@ pub(crate) fn file_url_to_path(url: &str) -> Option<PathBuf> {
     if !decoded.starts_with('/') {
         return None;
     }
+    // `TAKO_913_LEGACY=1` で修正前（ドライブレターを知らない POSIX 専用）へ戻せる
+    // = 同一バイナリで A/B が取れる
+    if std::env::var_os("TAKO_913_LEGACY").is_some() {
+        return Some(PathBuf::from(decoded));
+    }
     Some(PathBuf::from(tako_core::file_uri::strip_drive_slash(
         &decoded,
     )))
