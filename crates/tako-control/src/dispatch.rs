@@ -6297,10 +6297,13 @@ pub fn dispatch_orchestrator_handoff_files(
                     ))
                 })?;
                 let body = store::read_project_handoff(key);
+                let doc = body.as_deref().map(ho::split_handoff);
                 Ok(json!({
                     "project": key,
                     "path": path.display().to_string(),
                     "exists": body.is_some(),
+                    "format": doc.as_ref().map(|d| d.format().as_str()),
+                    "sections": doc.as_ref().map(|d| d.section_labels()),
                     "content": body,
                     "template": body.is_none().then(|| ho::project_handoff_template(key)),
                 }))
@@ -6309,10 +6312,13 @@ pub fn dispatch_orchestrator_handoff_files(
                 let path = crate::orchestrator::handoff_path(name)
                     .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?;
                 let body = crate::orchestrator::read_handoff(name);
+                let doc = body.as_deref().map(ho::split_handoff);
                 Ok(json!({
                     "profile": name,
                     "path": path.display().to_string(),
                     "exists": body.is_some(),
+                    "format": doc.as_ref().map(|d| d.format().as_str()),
+                    "sections": doc.as_ref().map(|d| d.section_labels()),
                     "content": body,
                     "warning": body.as_deref().and_then(|b| ho::profile_memo_warning(name, b)),
                 }))
@@ -6531,13 +6537,26 @@ fn dispatch_orchestrator_handoff(
     // cwd はホームディレクトリ
     let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
 
-    // 新ペインを分割（右方向、spawn_worker レイアウト使用）
+    // 新ペインを分割。#917: 退役する master が同じタブに居るなら**その master のペインを
+    // 分割する**。旧ペインが閉じられた時点で残った後任が旧ペインの矩形をそのまま継ぐので、
+    // 交代の前後でレイアウトが変わらない（「場所が入れ替わる」体験）。周囲の worker /
+    // ユーザーペインには一切触らない。旧 master を特定できないときだけ従来の
+    // worker 領域レイアウトへ落とす
     let new_pane = tako_core::Pane::new(origin);
     let new_id = new_pane.id();
-    let layout = crate::setup::spawn_layout_config();
-    tree_mut(host.workspace_mut(), tab_id)
-        .spawn_worker(split_target, new_pane, &layout)
-        .map_err(op_err)?;
+    match previous_pane {
+        Some(prev) => {
+            tree_mut(host.workspace_mut(), tab_id)
+                .split(prev, tako_core::SplitDirection::Right, new_pane)
+                .map_err(op_err)?;
+        }
+        None => {
+            let layout = crate::setup::spawn_layout_config();
+            tree_mut(host.workspace_mut(), tab_id)
+                .spawn_worker(split_target, new_pane, &layout)
+                .map_err(op_err)?;
+        }
+    }
     let _ = tree_mut(host.workspace_mut(), tab_id).focus(split_target);
 
     // セッション起動（cwd をホームに、プロファイル env を注入。Issue #500）

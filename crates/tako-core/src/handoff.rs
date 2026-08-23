@@ -516,6 +516,14 @@ pub const PROFILE_MEMO_SOFT_LIMIT_LINES: usize = 80;
 /// 節の持ち主を明示するマーカー。移行の判定でも、master が自分で書くときにも使う
 pub const PROJECT_MARKER_PREFIX: &str = "<!-- tako:project:";
 
+/// 「このファイルはもうプロジェクト単位の形になっている」ことを示す番地（#916 の
+/// バージョン検知に相当）。運用メモへ移行が書き込み、次回以降は
+/// **「担当 1 件のプロファイルは全文をそのプロジェクトへ」という一度きりの推測を止める**
+/// （止めないと、移行後の運用メモそのものが毎回そのプロジェクトへ吸い込まれて
+/// 冪等でなくなる。実測: 2 回目の setup で運用メモの雛形が projects/ へ移った）。
+/// 見出しで持ち主が分かる断片の移行はマーカーがあっても続ける
+pub const HANDOFF_FORMAT_MARKER: &str = "<!-- tako:handoff-format: projects -->";
+
 /// プロジェクトキーが引き継ぎファイル名として安全か。
 ///
 /// Windows も含めた両 OS で通るものだけ許す（パス区切り・ドライブ指定・予約文字・
@@ -749,8 +757,10 @@ pub fn migration_plan(
     profile_projects: &[String],
 ) -> MigrationPlan {
     let mut plan = MigrationPlan::default();
+    // 既に新形式の番地が入っているファイルでは、全文を丸ごと移す推測を働かせない
+    let already_marked = content.contains(HANDOFF_FORMAT_MARKER);
     let single_owner = match dedup_keys(profile_projects.iter().map(String::as_str)).as_slice() {
-        [only] => Some(only.clone()),
+        [only] if !already_marked => Some(only.clone()),
         _ => None,
     };
 
@@ -937,14 +947,14 @@ pub fn project_handoff_template(project: &str) -> String {
 pub fn profile_memo_template_in(lang: Lang, profile: &str) -> String {
     match lang {
         Lang::Ja => format!(
-            "# プロファイル運用メモ（{profile}）\n\n\
+            "# プロファイル運用メモ（{profile}）\n{HANDOFF_FORMAT_MARKER}\n\n\
              <!-- ここは**プロジェクトに紐付かない**運用知識だけを置く場所です\
              （このプロファイル共通の作法・ユーザーの好み・アカウント運用など）。\
              プロジェクト固有の引き継ぎは handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md へ書く。\
              目安 {PROFILE_MEMO_SOFT_LIMIT_LINES} 行以内 -->\n"
         ),
         Lang::En => format!(
-            "# Profile operating memo ({profile})\n\n\
+            "# Profile operating memo ({profile})\n{HANDOFF_FORMAT_MARKER}\n\n\
              <!-- Keep only **project-independent** operating knowledge here (conventions for \
              this profile, the user's preferences, account handling). Project-specific handoff \
              goes to handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md. \
@@ -2003,6 +2013,30 @@ mod tests {
     }
 
     /// 移行は冪等: すでに割れているファイル（1 プロジェクト分）を再度かけても動かない
+    /// 担当 1 件のプロファイルでも、移行済みの番地が入っていれば全文移動は起きない
+    /// （これが無いと 2 回目の setup で運用メモの雛形が projects/ へ吸い込まれる）
+    #[test]
+    fn 移行済みの番地があれば全文移動は再発しない() {
+        let memo = profile_memo_template_in(Lang::Ja, "takodev");
+        assert!(memo.contains(HANDOFF_FORMAT_MARKER), "{memo}");
+        let plan = migration_plan(&memo, &keys(&["tako"]), &keys(&["tako"]));
+        assert!(!plan.has_moves(), "{plan:?}");
+        // 番地があっても、見出しで持ち主が分かる断片の移行は続く
+        let with_segment = format!("{memo}\n## 【bunpoushi 移行】\n- 本文\n");
+        let plan = migration_plan(
+            &with_segment,
+            &keys(&["tako", "bunpoushi-migration"]),
+            &keys(&["tako"]),
+        );
+        assert_eq!(
+            plan.by_project(),
+            vec![(
+                "bunpoushi-migration".to_string(),
+                "## 【bunpoushi 移行】\n- 本文".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn 移行は冪等() {
         let content =
