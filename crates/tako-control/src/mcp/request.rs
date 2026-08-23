@@ -576,6 +576,17 @@ pub(super) fn build_request(
             caller_role: caller_role.map(str::to_string),
             tab: u64_arg(args, "tab")?,
             caller_pid: u64_arg(args, "caller_pid")?.map(|v| v as u32),
+            // #915: 明示指定は推定より優先される（省略時はプロファイル担当 + 稼働 worker）
+            projects: match str_array_arg(args, "projects") {
+                v if v.is_empty() => None,
+                v => Some(v),
+            },
+        },
+        "tako_orchestrator_handoffs" => Request::OrchestratorHandoffFiles {
+            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            project: str_arg(args, "project")?,
+            profile: str_arg(args, "profile")?,
+            content: str_arg(args, "content")?,
         },
         "tako_orchestrator_spawn" => {
             let pane = u64_arg(args, "pane")?;

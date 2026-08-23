@@ -2530,6 +2530,91 @@ tako-core（7）: `links::tests::cwd不明でも絶対パスとホーム起点�
 - 実機の psmux は winget の `marlocarlo.psmux`。`pmux.exe` / `psmux.exe` / `tmux.exe` は
   同一バイト（6,883,328 B）でソースは同梱されない
 
+#### #913 の記録（file URI のドライブレター規則を境界へ。2026-08-23）
+
+**症状**: #906 で項目 101 を通した直後の壁。項目 116（#835 Finder の「このアプリケーションで
+開く」）が `116: file URL が 4 本ともパスへ戻る (1)` で止まる。
+
+##### 原因は**両側の POSIX 前提**（器とも符号化とも無関係。コードで確定）
+
+| 層 | 実際 |
+|---|---|
+| テスト側 `self_test::file_url` | `path.display()` をそのままパーセント符号化するので、Windows では `file://C%3A%5CUsers%5C…`（`file:///C:/…` にならない） |
+| 製品側 `open_files::file_url_to_path` | 復号結果が `/` で始まらないと `None`。ドライブレター形式を知らない |
+
+4 本のうち通ったのは `/` 始まりのダミー 1 本だけ = 観測値 `(1)` と一致する。
+
+##### 決め手: 同じ規則が既に**もう 1 か所**にあり、そちらは Windows 形を扱えていた
+
+`osc_tap` の `strip_drive_slash`（OSC 7 の cwd 追従。RFC 8089 の Windows 形式を落とす）が
+**同じ判定をすでに持っていた**。つまり「RFC 8089 の規則が 2 か所にあり、片方だけが
+POSIX 専用のまま取り残されていた」= #870（ホーム解決）・#873（方言判定）と同型の問題。
+
+`tako_core::file_uri` を新設して `strip_drive_slash` を移し、`osc_tap` と
+`open_files` の両方がそこを通る形にした。**プラットフォームで分岐しない**のが要点で、
+判定は URI の形だけ（`/` + ASCII 英字 + `:` の直後が `/` か終端）で決まるので
+macOS 上から Windows 形の入力を検査できる（#515 の方針）。
+
+**`percent_decode` は統合しなかった**。2 実装あるが**不正入力の方針が用途で違う**
+（OSC 7 は `%zz` を拒否 = 端末の壊れたバイト列で cwd を誤って移さない / 開く経路は
+素通り = 落として別のファイルを開くより「開けない」で止める）。意図的な分岐なので
+`file_uri` の doc にその理由を書いた。
+
+##### 踏んだ細部
+
+- **「絶対パスか」の判定はドライブレターを落とす前**に行う。落とした後の `C:/x` で
+  見ると弾いてしまう（file URI のパス部は必ず `/` 始まりなので、判定はその形に対して行う）
+- `:` は RFC 3986 の unreserved ではないので `self_test::file_url` は `%3A` を出す。
+  受け口は復号してから境界へ渡すので**リテラルの `:` も `%3A` もどちらも通る**
+  （テストで両者が同じパスへ戻ることを固定した）
+- 番犬テストは**テストモジュールより前だけ**を走査する。ファイル全体を見ると
+  番犬自身が書いた文字列（`is_ascii_alphabetic`）に当たって自分で落ちる（1 回踏んだ）
+
+##### 実機 A/B（同一バイナリ・env だけを変えた）
+
+| アーム | 結果 |
+|---|---|
+| main（修正なし。#906 セッションで実測） | **項目 116 で FAILED**（`116: file URL が 4 本ともパスへ戻る (1)`） |
+| 既定（このブランチ） | **項目 116 通過**。`TAKO_SELF_TEST_835: tabs=3->6 new=[("読み物.md", 1, Some("\\?\C:\…\読み物.md"), false), ("プロジェクト", 1, None, true), ("unknown.xyzzy", 1, Some(…), false)]` = macOS と同じ 3 タブ。**117 / 118 も通り到達範囲は 0〜118** |
+
+##### 同一バイナリの A/B は**単体で決定的に**取った（実機は途中でフレークした）
+
+`TAKO_913_LEGACY=1` は**テスト側と製品側の両方**に入れてある（片方だけだと
+「半分直った状態」になって A/B にならない。実機で 1 回踏んだ）。macOS の単体テストで
+決定的に振れる:
+
+```
+$ TAKO_913_LEGACY=1 cargo test -p tako-app --bin tako-app file_url
+… windowsのパスもrfc8089の形のurlになる ... FAILED
+  left: "file://C%3A%5CUsers%5Cme%5Ca.md"     ← Issue の報告と同じ壊れた形
+ right: "file:///C%3A/Users/me/a.md"
+… 作ったurlは受け口でパスへ戻る ... FAILED
+test result: FAILED. 1 passed; 2 failed
+```
+
+実機の legacy アームは**項目 116 へ届く前に 3 回落ちた**（`tako read` ×1 / #702 ×2）。
+`TAKO_913_LEGACY` は項目 116 以外に触らないので無関係のはずで、**直後に同じ掃除をして
+after アームを回したら同じく早期（`tako read`）で落ちた** = 環境ドリフト（この時間帯の
+実機は GUI セルフテストがフレークする状態）と切り分けた。到達範囲の実測は
+その前の安定していた 3 run（うち 2 run が項目 116 を通過して 119 まで到達）を採る。
+
+##### 次の壁: 項目 119（#868 install_plan）
+
+`119: install_plan が公式コマンド・置き場所・権限を含む (#868) lines=6`。
+セルフテストが unix の導入手順をリテラル期待している（`claude.ai/install.sh` /
+`.local/bin/claude`）が、Windows の計画は `install.ps1` で区切りが `\` = **116 と同種の
+POSIX 前提**。製品側（`agent_install::recipe(Windows, Claude)`）は正しい
+→ **#920 へ起票**（期待値を計画そのものから作る形が筋）。
+
+##### 作法として残すもの
+
+- **孤児は run のたびに掃除する（改めて実証）**: 1 回目の run は項目 111（#813）の
+  idle fixture が画面に出ずに落ちた。`-L tako-iso-*` の tmux/psmux 4 個を落として
+  再実行したら**同じバイナリで通った**（elapsed 284s → 短縮）。#903 の作法どおり
+- **共有ツリー `~/dev/tako` では作業しない**（このタスクから徹底）。
+  `git worktree add -b <branch> ~/dev/tako-wt-<番号> origin/main` で分ける。
+  fresh worktree は `web/tako-remote/dist/` を持たないので既存ツリーからコピーする
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）

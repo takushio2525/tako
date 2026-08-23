@@ -42,6 +42,7 @@ tako_open_file
 tako_open_remote
 tako_orchestrator_accounts
 tako_orchestrator_handoff
+tako_orchestrator_handoffs
 tako_orchestrator_layout
 tako_orchestrator_ledger
 tako_orchestrator_profiles

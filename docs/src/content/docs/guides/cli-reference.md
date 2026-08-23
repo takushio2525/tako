@@ -952,7 +952,11 @@ tako orchestrator profiles set default --auto-handoff false
 
 引き継ぎファイルは 2 つの節に分かれます。**知識（マシン非依存）** には決定事項・方針・残タスクの意図を、**実行状態（このマシン限定）** には worker とそのペイン番号や実行中のものを書きます。ペイン番号はそのパソコンでしか意味を持たないので、設定を別のパソコンと共有したとき（`tako config`）に知識だけが役に立つ形にしておくためです。節分けの無い古い引き継ぎファイルもそのまま読めます（後任には「番号は実際の画面で確認するように」が伝わり、次に更新されるときに 2 節へ書き直されます）。
 
-### tako orchestrator workers / respond / self / handoff
+引き継ぎは**プロジェクトごとに 1 ファイル**（`handoff/projects/<プロジェクトキー>.md`）です。交代のときに渡るのは、その master が担当しているプロジェクトの分だけなので、同じプロファイルを別のミッションで使っている master の話が混ざりません。プロジェクトに紐付かない運用知識だけを `handoff/<プロファイル>.md`（プロファイル運用メモ）に置きます。
+
+**古い形式（プロファイル単位の 1 ファイル）は自動で移行されます。** `tako setup` を実行したときと、master が引き継ぎを読むときの 2 か所で移行がかかり、何度実行しても壊れません。移行前のファイルは消さずに `handoff/archive/` へ退避します。手で分割する作業は要りません。
+
+### tako orchestrator workers / respond / self / handoff / handoffs
 
 ```bash
 tako orchestrator workers          # spawn 済み worker の一覧（ペインの生死と無関係）
@@ -960,6 +964,11 @@ tako orchestrator workers --all
 tako orchestrator respond --pane 5 # 権限確認ダイアログへ応答（不在時はエラー）
 tako orchestrator self             # master/solo が自分の pane・tab・コンテキスト残量と引き継ぎ閾値を知る
 tako orchestrator handoff          # master のバトンを新しい master へ渡す
+tako orchestrator handoff --projects tako,hero-cpp  # 渡すプロジェクトを明示する
+tako orchestrator handoffs list                     # 引き継ぎファイルの一覧（行数・書式・肥大警告）
+tako orchestrator handoffs show --project tako      # 1 件を読む
+tako orchestrator handoffs write --project tako --content "..."  # 1 件を書く（標準入力も可）
+tako orchestrator handoffs migrate                  # 古い形式を移行する（通常は自動で走る）
 tako orchestrator layout --policy master-reserved --master-ratio 0.5
 tako orchestrator supervisor       # worker 自動復旧 supervisor の操作
 tako orchestrator ledger           # 委任台帳の操作

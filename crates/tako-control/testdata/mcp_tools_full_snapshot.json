@@ -2204,7 +2204,7 @@
     "name": "tako_orchestrator_workers"
   },
   {
-    "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、ctx_over_threshold は閾値超えフラグ。ctx_over_threshold が true になったら、ユーザーの許可を待たずに handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。legacy なら次に更新するとき 2 節へ書き直す。pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）から自動解決する。",
+    "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。master は MCP 経由では自分のペイン ID を知る手段がなかったが（#123）、このツールで自己特定できる。ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値（プロファイルの ctx_threshold → config.yaml → 既定 60 の順で解決。値域 50〜60。出どころは ctx_threshold_source）、ctx_over_threshold は閾値超えフラグ。ctx_over_threshold が true になったら、ユーザーの許可を待たずに handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。handoff_path / handoff_exists は**プロファイル運用メモ**（handoff/<profile>.md。プロジェクトに紐付かない運用知識の置き場）。#915: プロジェクト固有の引き継ぎは project_handoffs の各 path（handoff/projects/<project-key>.md）に書く。そこへ書いたものは、そのプロジェクトを管轄する master の後任にだけ渡る。旧形式は読むついでに自動移行される（handoff_migration。冪等）。profile_source が pane_role なら呼び出し元のTAKO_ORCHESTRATOR_ROLE が失われている（ペインの role ラベルから復元した。#854）。handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。legacy なら次に更新するとき 2 節へ書き直す。pane を省略すると caller の環境変数（TAKO_PANE_ID / TAKO_ORCHESTRATOR_ROLE）から自動解決する。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2219,7 +2219,7 @@
     "name": "tako_orchestrator_self"
   },
   {
-    "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。role / プロファイル / タブは旧 master と同一を引き継ぐ。呼ぶ前に handoff ファイルを今の状況で最新化すること（このツールはファイルの内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。#749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**（初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄にユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が退役予定のペイン（null なら後任に close を指示していない）。handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。#792: 引き継ぎファイルは 2 節に分けて書く。「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで誤った指示の元になる。節分離前の旧書式もそのまま読める（応答の handoff_format がsectioned / legacy、handoff_sections が認識した節。legacy のときは後任へ「番号は実態で確認 + 次の更新で 2 節へ書き直す」が伝わる）。tab を省略すると呼び出し元と同タブに新 master を spawn する。",
+    "description": "master の引き継ぎを実行する。**管轄プロジェクトの引き継ぎだけ**を読み、同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。role / プロファイル / アカウント / モデル / effort / タブは旧 master と同一を引き継ぐ。呼ぶ前に引き継ぎファイルを今の状況で最新化すること（このツールはファイルの内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。#915: 置き場はプロジェクト単位（handoff/projects/<project-key>.md）。管轄は projects 引数 → プロファイルの担当プロジェクト + 稼働中 worker のプロジェクト → 稼働中 worker だけ の順で解決し（応答の jurisdiction_source）、どれも決まらなければ**本文を貼らずに一覧とパスだけ**を後任へ渡す（無関係なプロジェクトの長文で後任の文脈を食わない）。プロジェクトに紐付かない運用知識は handoff/<profile>.md（プロファイル運用メモ）に置き、こちらは常に渡る。旧形式（プロファイル単位の混在ファイル）はこの呼び出しの中で自動移行される（応答の handoff_migration。冪等・原本は退避）。#749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**（初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄にユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が退役予定のペイン（null なら後任に close を指示していない）。引き継ぎの材料が 1 つも無ければエラーを返す（master は事前に書く必要がある）。#792: 各ファイルは 2 節に分けて書く。「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで誤った指示の元になる。節分離前の旧書式もそのまま読める（応答の handoff_format がsectioned / legacy / mixed）。tab を省略すると呼び出し元と同タブに新 master を spawn する。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2227,6 +2227,13 @@
           "description": "呼び出し元ペイン ID（省略時は caller から自動解決）",
           "minimum": 0,
           "type": "integer"
+        },
+        "projects": {
+          "description": "後任へ渡すプロジェクトキー（#915）。指定すると推定より優先される。省略時はプロファイルの担当 + 稼働中 worker から推定",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "tab": {
           "description": "新 master を出すタブ ID（省略時は呼び出し元と同タブ）",
@@ -2237,6 +2244,38 @@
       "type": "object"
     },
     "name": "tako_orchestrator_handoff"
+  },
+  {
+    "description": "引き継ぎファイルの管理（Issue #915）。プロジェクト単位の引き継ぎ（handoff/projects/<project-key>.md）とプロファイル運用メモ（handoff/<profile>.md）の一覧・読み・書き、および旧形式からの移行。action: list（両方の一覧。行数・書式・肥大警告つき）/ show（project か profile のどちらか一方。内容と書式。未作成なら雛形を返す）/ write（project か profile のどちらか一方 + content。アトミック + 世代バックアップ）/ migrate（旧形式の自動移行。profile 省略で全プロファイル）。移行は通常 setup 実行時と master が引き継ぎを読む経路で**自動**で走るので、migrate を手で呼ぶ必要はない（冪等なので呼んでも壊れない）。プロジェクト固有の引き継ぎをここへ書けば、そのプロジェクトを管轄する master の後任にだけ渡る。運用メモは常に渡るので、プロジェクトに紐付かない知識だけを置く",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "操作（list / show / write / migrate）",
+          "enum": [
+            "list",
+            "show",
+            "write",
+            "migrate"
+          ],
+          "type": "string"
+        },
+        "content": {
+          "description": "書き込む内容（write 時に必須）",
+          "type": "string"
+        },
+        "profile": {
+          "description": "プロファイル名（運用メモ側。show / write でどちらか一方、migrate では対象の絞り込み）",
+          "type": "string"
+        },
+        "project": {
+          "description": "プロジェクトキー（projects.yaml のキー。show / write でどちらか一方）",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_orchestrator_handoffs"
   },
   {
     "description": "子 worker を spawn し、即座に run_id を返す（非同期。#121）。MCP 呼び出しが中断されても worker は孤児化せず、run_id で追跡できる。進捗確認は tako_orchestrator_run_status、結果回収は tako_orchestrator_run_result を使う。worker のエージェント CLI は claude（既定）/ codex / agy から選べる（agent パラメータ）。完了判定はバックグラウンドで OrchestratorWorkerStatus と同じロジックを繰り返す。タイムアウト（既定 1800 秒）に達した場合は run_status が status=timeout を返す。worker が API エラー等で停止した場合は status=worker_error + error オブジェクト。sync=true を指定すると旧挙動（完了までブロッキング）に戻る（後方互換）。",

@@ -1497,7 +1497,7 @@ enum OrchestratorCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// master の引き継ぎを実行する（#193）。handoff ファイルを読み新 master を spawn
+    /// master の引き継ぎを実行する（#193）。管轄プロジェクトの引き継ぎを読み新 master を spawn
     Handoff {
         /// 呼び出し元ペイン ID（省略時は自動解決）
         #[arg(long)]
@@ -1505,7 +1505,14 @@ enum OrchestratorCommand {
         /// 新 master を出すタブ ID（省略時は呼び出し元と同タブ）
         #[arg(long)]
         tab: Option<u64>,
+        /// 後任へ渡すプロジェクト（カンマ区切り。#915。省略時はプロファイルの担当 +
+        /// 稼働 worker から推定する）
+        #[arg(long, value_delimiter = ',')]
+        projects: Option<Vec<String>>,
     },
+    /// 引き継ぎファイルの管理（#915）。プロジェクト単位の一覧・読み・書きと旧形式の移行
+    #[command(subcommand)]
+    Handoffs(HandoffsCommand),
     /// worker の選択肢ダイアログに応答する（#319 → #748 で permission 以外も対象）。
     /// ダイアログ不在時はエラー（誤爆防止）。
     /// `--choice` を省略すると**送信せず**選択肢の構造だけを表示する（下見）
@@ -1610,6 +1617,42 @@ enum OrchestratorCommand {
     /// 委任台帳の操作（Issue #292）
     #[command(subcommand)]
     Ledger(LedgerCommand),
+}
+
+/// `tako orchestrator handoffs` — 引き継ぎファイルの管理（#915）。
+/// MCP `tako_orchestrator_handoffs` と同じ dispatch 関数を呼ぶ（二重実装を作らない）
+#[derive(Subcommand)]
+enum HandoffsCommand {
+    /// プロジェクト単位の引き継ぎとプロファイル運用メモの一覧
+    List,
+    /// 1 件を読む（--project か --profile のどちらか）
+    Show {
+        /// プロジェクトキー
+        #[arg(long)]
+        project: Option<String>,
+        /// プロファイル名（運用メモ側）
+        #[arg(long, conflicts_with = "project")]
+        profile: Option<String>,
+    },
+    /// 1 件を書く（--project か --profile のどちらか。内容は --content か標準入力）
+    Write {
+        /// プロジェクトキー
+        #[arg(long)]
+        project: Option<String>,
+        /// プロファイル名（運用メモ側）
+        #[arg(long, conflicts_with = "project")]
+        profile: Option<String>,
+        /// 書き込む内容（省略時は標準入力から読む）
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// 旧形式（プロファイル単位の混在ファイル）をプロジェクト単位へ移行する。
+    /// 通常は setup 実行時と master が引き継ぎを読む経路で自動で走る（#916）
+    Migrate {
+        /// 対象プロファイル（省略時は全プロファイル）
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 /// `tako orchestrator accounts` — アカウントレジストリ（accounts.yaml）の CRUD。
@@ -2759,7 +2802,11 @@ fn cli_main() -> ExitCode {
             })
             .map(|result| println!("{}", pretty_json(&result)))
         }
-        Command::Orchestrator(OrchestratorCommand::Handoff { pane, tab }) => {
+        Command::Orchestrator(OrchestratorCommand::Handoff {
+            pane,
+            tab,
+            ref projects,
+        }) => {
             let pane = pane.or_else(caller_pane);
             let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
             send_request(Request::OrchestratorHandoff {
@@ -2767,7 +2814,47 @@ fn cli_main() -> ExitCode {
                 caller_role,
                 tab,
                 caller_pid: Some(std::process::id()),
+                projects: projects.clone(),
             })
+            .map(|result| println!("{}", pretty_json(&result)))
+        }
+        Command::Orchestrator(OrchestratorCommand::Handoffs(ref sub)) => {
+            // 引き継ぎファイルはローカルのファイル操作なので IPC 不要。
+            // MCP `tako_orchestrator_handoffs` と同一関数を共用する（二重実装を作らない）
+            let (action, project, profile, content) = match sub {
+                HandoffsCommand::List => ("list", None, None, None),
+                HandoffsCommand::Show { project, profile } => {
+                    ("show", project.clone(), profile.clone(), None)
+                }
+                HandoffsCommand::Write {
+                    project,
+                    profile,
+                    content,
+                } => {
+                    let body = match content {
+                        Some(c) => c.clone(),
+                        None => {
+                            let mut buf = String::new();
+                            match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                                Ok(_) => buf,
+                                Err(e) => {
+                                    eprintln!("エラー: 標準入力の読み取りに失敗: {e}");
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+                        }
+                    };
+                    ("write", project.clone(), profile.clone(), Some(body))
+                }
+                HandoffsCommand::Migrate { profile } => ("migrate", None, profile.clone(), None),
+            };
+            tako_control::dispatch::dispatch_orchestrator_handoff_files(
+                action,
+                project.as_deref(),
+                profile.as_deref(),
+                content.as_deref(),
+            )
+            .map_err(|e| e.to_string())
             .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Layout {
@@ -5816,6 +5903,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { .. }) => {
             unreachable!("orchestrator self は run() を通らない（main() でローカル処理済み）")
+        }
+        Command::Orchestrator(OrchestratorCommand::Handoffs(_)) => {
+            unreachable!("orchestrator handoffs は run() を通らない（main() でローカル処理済み）")
         }
         Command::Orchestrator(OrchestratorCommand::Handoff { .. }) => {
             unreachable!("orchestrator handoff は run() を通らない（main() でローカル処理済み）")
