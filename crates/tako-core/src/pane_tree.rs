@@ -1496,4 +1496,57 @@ mod tests {
             assert_rect(&t, ws[4], 0.75, 0.5, 0.25, 0.5);
         }
     }
+
+    /// #917: master 交代のレイアウト継承。退役する master のペインを分割して後任を作り、
+    /// 退役ペインを閉じると**後任が元の矩形をそのまま継ぐ**。周囲のペインは動かない。
+    /// handoff がこの形（`split(previous_pane, ...)`）を使う根拠を型で押さえる
+    #[test]
+    fn 交代後のレイアウトが交代前と一致する() {
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 800.0,
+        };
+        let mut tree = PaneTree::new(Pane::new(PaneOrigin::User));
+        let master = tree.focused();
+        // ユーザーペインと worker を先に置く（交代で動いてはいけない周囲）
+        let user = tree
+            .split(master, SplitDirection::Down, Pane::new(PaneOrigin::User))
+            .expect("ユーザーペイン");
+        let worker = tree
+            .split(master, SplitDirection::Right, Pane::new(PaneOrigin::Mcp))
+            .expect("worker");
+        let before: Vec<(PaneId, Rect)> = tree.layout(bounds);
+        let rect_of = |layout: &[(PaneId, Rect)], id: PaneId| {
+            layout
+                .iter()
+                .find(|(p, _)| *p == id)
+                .map(|(_, r)| *r)
+                .expect("矩形がある")
+        };
+        let master_before = rect_of(&before, master);
+
+        // 後任は退役する master のペインを分割して作る
+        let successor = tree
+            .split(master, SplitDirection::Right, Pane::new(PaneOrigin::Mcp))
+            .expect("後任");
+        // 後任が引き継ぎを確認してから旧 master を閉じる（#749 の順序）
+        tree.close(master).expect("旧 master を閉じる");
+        let after = tree.layout(bounds);
+
+        assert_eq!(
+            rect_of(&after, successor),
+            master_before,
+            "後任が旧 master の矩形をそのまま継ぐ"
+        );
+        for id in [user, worker] {
+            assert_eq!(
+                rect_of(&after, id),
+                rect_of(&before, id),
+                "周囲のペインは動かない"
+            );
+        }
+        assert_eq!(after.len(), before.len(), "ペイン数も交代前と同じ");
+    }
 }

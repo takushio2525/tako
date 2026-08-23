@@ -20571,10 +20571,16 @@ mod self_test {
 
     /// パスを NSURL の `absoluteString` 相当（`file://` + パーセントエンコード）へ。
     /// 項目 116（#835）が Finder から来る形そのままで受け口を叩くために使う。
-    /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて
+    /// エスケープ対象は RFC 3986 の unreserved + パス区切り以外すべて。
+    ///
+    /// **パス部は必ず `/` 始まり・区切りは `/`**（RFC 8089）。`path.display()` を
+    /// そのまま符号化すると Windows では `file://C%3A%5CUsers%5C…` になり、
+    /// 受け口（`open_files::file_url_to_path`）が「絶対パスでない」として全部弾く
+    /// = 項目 116 が `(1)` で落ちていた（#913）。OS を見ずに**形**で決めるので、
+    /// macOS 上でも Windows 形の入力を作れる
     pub(crate) fn file_url(path: &std::path::Path) -> String {
         let mut out = String::from("file://");
-        for b in path.display().to_string().bytes() {
+        for b in file_uri_path(path).bytes() {
             match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                     out.push(b as char)
@@ -20583,6 +20589,27 @@ mod self_test {
             }
         }
         out
+    }
+
+    /// [`file_url`] のパス部（純粋関数。**符号化の前**の形）。
+    /// 区切りを `/` へ寄せ、ドライブレター形式（`C:/…`）には先頭 `/` を足す
+    pub(crate) fn file_uri_path(path: &std::path::Path) -> String {
+        // `TAKO_913_LEGACY=1` で修正前（`path.display()` をそのまま）へ戻せる
+        // = 同一バイナリで A/B が取れる。**テスト側だけの仕掛け**で製品経路は読まない
+        if std::env::var_os("TAKO_913_LEGACY").is_some() {
+            return path.display().to_string();
+        }
+        legacy_free_file_uri_path(path)
+    }
+
+    /// [`file_uri_path`] の本体（純粋関数。env を読まないのでテストから直に呼べる）
+    pub(crate) fn legacy_free_file_uri_path(path: &std::path::Path) -> String {
+        let shown = path.display().to_string().replace('\\', "/");
+        if shown.starts_with('/') {
+            shown
+        } else {
+            format!("/{shown}")
+        }
     }
 
     /// ペインの PTY へ「Enter を押した」として書くバイト（#897）。
@@ -44612,6 +44639,7 @@ mod self_test {
                             caller_role: Some(format!("master:{probe}")),
                             tab: None,
                             caller_pid: None,
+                            projects: None,
                         },
                         cx,
                     );
@@ -44860,6 +44888,7 @@ mod self_test {
                         caller_role: Some(format!("master:{probe}")),
                         tab: None,
                         caller_pid: None,
+                        projects: None,
                     },
                     cx,
                 );
@@ -44959,6 +44988,69 @@ mod self_test {
                     "102: 後任の orchestrator self がプロファイルと handoff_path を引き継ぐ (#761)",
                 );
 
+                // 102c: 呼び出し元の env がプロファイルのサフィックスを失っていても、
+                // **ペインの role ラベル**から取り戻す（#854）。インライン前置き
+                // （`TAKO_ORCHESTRATOR_ROLE=... claude`）はシェルへ export されないので、
+                // claude を撃ち直した master は素の `master` しか持たない。実発では
+                // これで後任が default プロファイル扱いになり、master_account が乗らず
+                // ユーザーの個人枠を消費していた
+                let degraded = fire(
+                    Req::OrchestratorHandoff {
+                        pane: Some(prev.as_u64()),
+                        caller_role: Some("master".into()),
+                        tab: None,
+                        caller_pid: None,
+                        projects: None,
+                    },
+                    cx,
+                );
+                let Some(degraded) = degraded else {
+                    fail("#854: env 劣化時の handoff が失敗した")
+                };
+                let degraded_pane = degraded["new_master_pane_id"]
+                    .as_u64()
+                    .map(PaneId::from_raw);
+                let degraded_cmd = degraded_pane.and_then(|pane| {
+                    window
+                        .update(cx, |app, _, _| {
+                            let _ = std::mem::take(&mut app.pending_attach);
+                            app.prompt_flows.retain(|f| f.pane != pane);
+                            std::mem::take(&mut app.command_flows)
+                                .into_iter()
+                                .find(|c| c.pane == pane)
+                                .map(|c| c.flow.command().to_string())
+                        })
+                        .ok()
+                        .flatten()
+                });
+                let degraded_role_env = degraded_cmd
+                    .as_deref()
+                    .and_then(|c| c.split("TAKO_ORCHESTRATOR_ROLE='").nth(1))
+                    .and_then(|rest| rest.split('\'').next())
+                    .unwrap_or("")
+                    .to_string();
+                println!(
+                    "TAKO_SELF_TEST_854: profile={:?} source={:?} role_env={degraded_role_env}",
+                    degraded["profile"].as_str(),
+                    degraded["profile_source"].as_str()
+                );
+                check(
+                    degraded["profile"].as_str() == Some(probe)
+                        && degraded["profile_source"].as_str() == Some("pane_role")
+                        && degraded_role_env == format!("master:{probe}"),
+                    "102c: env がサフィックスを失っても role ラベルからプロファイルを取り戻す (#854)",
+                );
+                if let Some(pane) = degraded_pane {
+                    fire(
+                        Req::Close {
+                            pane: Some(pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        cx,
+                    );
+                }
+
                 // ===== 102b: 引き継ぎファイルの書式（#792） =====
                 // 知識（マシン非依存）と実行状態（このマシン限定）の 2 節に分けた書式を
                 // 実 dispatch が認識し、後任へ節ごとの扱いを伝えること。そして
@@ -44978,6 +45070,7 @@ mod self_test {
                                     caller_role: Some(format!("master:{probe}")),
                                     tab: None,
                                     caller_pid: None,
+                                    projects: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -48878,7 +48971,463 @@ mod self_test {
                 });
             }
 
-            // 122: 設定ファイルの自動マイグレーション（#916）。
+            // 122: 引き継ぎのプロジェクト単位化と自動移行（#915）。
+            //
+            // 実発の害は 2 つ。①汎用プロファイル（default）を複数の master が別々の
+            // ミッションで使うため 1 ファイルに全プロジェクトの知識が積み上がった
+            // （実測 528 行 / 62KB）②後任が自分と無関係な 3 プロジェクトの長文を
+            // 初期プロンプトに注入された。ここでは
+            //   (a) 旧形式の混在ファイルが**実 dispatch を読むだけで**自動移行される
+            //   (b) 移行が冪等で、原本が退避され、持ち主不明の断片が捨てられない
+            //   (c) 後任へ渡るのが**管轄プロジェクトの分だけ**（無関係な本文が入らない）
+            //   (d) 管轄不明なら本文を貼らず一覧とパスだけを渡す
+            //   (e) CLI / MCP と同じ dispatch から一覧・読み・書きができる
+            // を、隔離した orchestrator dir の実ファイルで通しで測る（実 claude は不要）
+            {
+                use tako_control::protocol::Request as Req;
+                let probe = "_st915_";
+                // 受け入れ条件 1 の再現: **2 プロジェクトを管轄する master**。
+                // 担当がちょうど 1 件だと「全文をそのプロジェクトへ」の一度きりの推測
+                // （単一プロジェクト master の移行を通すための規則）が働き、
+                // 持ち主不明の断片も吸い込まれてしまう
+                let mine = "_st915_a_";
+                let mine2 = "_st915_b_";
+                let other = "_st915_x_";
+                let fire = |r: Req, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                // 2 プロジェクトを登録し、片方だけをプロファイルの担当にする
+                for (key, dir) in [(mine, "a"), (mine2, "b"), (other, "x")] {
+                    let cwd = std::env::temp_dir().join(format!("tako-st915-{dir}"));
+                    let _ = std::fs::create_dir_all(&cwd);
+                    if fire(
+                        Req::OrchestratorProjects {
+                            action: "add".into(),
+                            key: Some(key.into()),
+                            cwd: Some(cwd.display().to_string()),
+                            description: None,
+                        },
+                        cx,
+                    )
+                    .is_none()
+                    {
+                        fail("#915: 検証用プロジェクトを登録できない");
+                    }
+                }
+                let profiles_req = |action: &str, projects: Option<Vec<String>>| {
+                    Req::OrchestratorProfiles {
+                        action: action.into(),
+                        name: Some(probe.into()),
+                        kind: Some("master".into()),
+                        from: None,
+                        projects,
+                        clear_projects: false,
+                        master_agent: None,
+                        clear_master_agent: false,
+                        model: None,
+                        worker_model: None,
+                        effort: None,
+                        worker_effort: None,
+                        clear_model: false,
+                        clear_worker_model: false,
+                        worker_agent: None,
+                        clear_worker_agent: false,
+                        agent: None,
+                        agent_model: None,
+                        clear_agent_model: false,
+                        agent_effort: None,
+                        clear_agent_effort: false,
+                        agent_skip_permissions: None,
+                        agent_args: None,
+                        worker_model_policy: None,
+                        tab_naming_convention: None,
+                        env_set: None,
+                        env_unset: None,
+                        master_account: None,
+                        clear_master_account: false,
+                        worker_account: None,
+                        clear_worker_account: false,
+                        ctx_threshold: None,
+                        clear_ctx_threshold: false,
+                        auto_handoff: None,
+                        clear_auto_handoff: false,
+                        limit_resume: None,
+                        clear_limit_resume: false,
+                    }
+                };
+                if fire(
+                    profiles_req("set", Some(vec![mine.to_string(), mine2.to_string()])),
+                    cx,
+                )
+                .is_none()
+                {
+                    fail("#915: 検証用プロファイルを作れない");
+                }
+
+                // (a) 旧形式の混在ファイル: 自分の 2 節 + 他 master の節 2 つ
+                //     （うち 1 つは見出しからプロジェクトが決まり、1 つは決まらない）
+                let legacy = format!(
+                    "# master 引き継ぎ\n\n\
+                     ## {}\n- 自分の方針: 隔離で測る\n\n\
+                     ## {}\n- worker A: pane 7\n\n\
+                     ## 【{mine} 担当】自分のプロジェクト\n- 管轄の本文（後任へ渡ってよい）\n\n\
+                     ## 【{other} 担当】別ミッション\n- 他 master の長文（後任へ渡してはいけない）\n\n\
+                     ## 【名前も付いていない何か】\n- 捨ててはいけない断片\n",
+                    tako_core::handoff::KNOWLEDGE_HEADING_JA,
+                    tako_core::handoff::RUNTIME_HEADING_JA,
+                );
+                let memo_path = tako_control::orchestrator::handoff_path(probe);
+                if let Some(ref path) = memo_path {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(path, &legacy);
+                }
+
+                // 前任 master のペイン（role だけ立てる。中身は素のシェルでよい）
+                let anchor_pane = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor_pane) = anchor_pane else {
+                    fail("#915: 基準ペインの取得")
+                };
+                let prev = fire(
+                    Req::Split {
+                        pane: Some(anchor_pane.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Down),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    cx,
+                )
+                .and_then(|v| v["pane"].as_u64())
+                .map(PaneId::from_raw);
+                let Some(prev) = prev else {
+                    fail("#915: 前任ペインの作成")
+                };
+                let _ = window.update(cx, |app, _, _| {
+                    if let Some(obj) = app.workspace.active_tab_mut().tree_mut().get_mut(prev) {
+                        obj.set_role(Some(format!("orchestrator-master:{probe}")));
+                    }
+                });
+
+                // handoff を実行（読む経路で自動移行が走る = #916 の段 2）
+                let run_handoff = |projects: Option<Vec<String>>, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            let res = tako_control::dispatch(
+                                app,
+                                Req::OrchestratorHandoff {
+                                    pane: Some(prev.as_u64()),
+                                    caller_role: Some(format!("master:{probe}")),
+                                    tab: None,
+                                    caller_pid: None,
+                                    projects,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()?;
+                            let successor =
+                                res["new_master_pane_id"].as_u64().map(PaneId::from_raw)?;
+                            // claude は起動させない（起動コマンドと attach を捨てる）
+                            let _ = std::mem::take(&mut app.pending_attach);
+                            let _ = std::mem::take(&mut app.pending_writes);
+                            let _ = std::mem::take(&mut app.command_flows);
+                            let prompt = app
+                                .prompt_flows
+                                .iter()
+                                .find(|f| f.pane == successor)
+                                .map(|f| f.prompt.clone());
+                            app.prompt_flows.retain(|f| f.pane != successor);
+                            Some((res, prompt?, successor))
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let mut successors: Vec<PaneId> = Vec::new();
+                let Some((res, prompt, successor)) = run_handoff(None, cx) else {
+                    fail("#915: handoff が失敗した")
+                };
+                successors.push(successor);
+                let migration = &res["handoff_migration"];
+                let moved: Vec<String> = migration["moved"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v[0].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_915_MIGRATE: migrated={:?} moved={moved:?} kept_lines={:?} archived={} jurisdiction={:?} projects={:?}",
+                    migration["migrated"].as_bool(),
+                    migration["kept_lines"].as_u64(),
+                    migration["archived_to"].as_str().is_some(),
+                    res["jurisdiction_source"].as_str(),
+                    res["projects"].as_array().map(|a| a.len()),
+                );
+                check(
+                    migration["migrated"].as_bool() == Some(true)
+                        && moved == vec![mine.to_string(), other.to_string()]
+                        && migration["kept_lines"].as_u64().unwrap_or(0) > 0
+                        && migration["archived_to"].as_str().is_some(),
+                    "122: 旧形式の混在ファイルが読む経路で自動移行され原本が退避される (#915)",
+                );
+                // 持ち主不明の断片は運用メモへ残る（黙って捨てない）
+                let memo_after = memo_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+                check(
+                    memo_after
+                        .as_deref()
+                        .is_some_and(|m| m.contains("捨ててはいけない断片"))
+                        && memo_after
+                            .as_deref()
+                            .is_some_and(|m| !m.contains("他 master の長文")),
+                    "122: 持ち主不明の断片は共通置き場へ残り、決まった断片は抜ける (#915)",
+                );
+                // (c) 後任へ渡るのは管轄（mine）だけ。other の本文は入らない
+                println!(
+                    "TAKO_SELF_TEST_915_PROMPT: has_mine={} has_other={} format={:?}",
+                    prompt.contains("自分の方針: 隔離で測る"),
+                    prompt.contains("他 master の長文"),
+                    res["handoff_format"].as_str()
+                );
+                let missing: Vec<String> = res["missing_project_files"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                check(
+                    prompt.contains("管轄の本文（後任へ渡ってよい）")
+                        && prompt.contains("自分の方針: 隔離で測る")
+                        && prompt.contains("- worker A: pane 7")
+                        && !prompt.contains("他 master の長文")
+                        && res["jurisdiction_source"].as_str() == Some("profile")
+                        && missing == vec![mine2.to_string()],
+                    "122: 2 プロジェクト管轄で渡るのは管轄分だけ・未作成は作り直しを促す (#915)",
+                );
+
+                // (b) 冪等: もう一度 handoff しても移行は起きない（内容も変わらない）
+                let memo_snapshot = memo_after.clone();
+                let Some((res2, prompt2, successor2)) = run_handoff(None, cx) else {
+                    fail("#915: 2 回目の handoff が失敗した")
+                };
+                successors.push(successor2);
+                let memo_again = memo_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+                println!(
+                    "TAKO_SELF_TEST_915_IDEMPOTENT: migrated={:?} memo_same={}",
+                    res2["handoff_migration"]["migrated"].as_bool(),
+                    memo_again == memo_snapshot
+                );
+                check(
+                    res2["handoff_migration"]["migrated"].as_bool() == Some(false)
+                        && memo_again == memo_snapshot
+                        && prompt2.contains("管轄の本文（後任へ渡ってよい）")
+                        && !prompt2.contains("他 master の長文"),
+                    "122: 移行は冪等（2 回目は何も動かさない） (#915)",
+                );
+
+                // 明示引数は推定より優先される（other を明示すると other が渡る）
+                let Some((res3, prompt3, successor3)) =
+                    run_handoff(Some(vec![other.to_string()]), cx)
+                else {
+                    fail("#915: 明示指定つき handoff が失敗した")
+                };
+                successors.push(successor3);
+                check(
+                    res3["jurisdiction_source"].as_str() == Some("explicit")
+                        && prompt3.contains("他 master の長文")
+                        && !prompt3.contains("管轄の本文（後任へ渡ってよい）"),
+                    "122: projects 引数が推定より優先される (#915)",
+                );
+
+                // (d) 管轄不明（担当なし・worker なし）なら本文を貼らず一覧とパスを出す
+                let mut clear_req = profiles_req("set", None);
+                if let Req::OrchestratorProfiles {
+                    ref mut clear_projects,
+                    ..
+                } = clear_req
+                {
+                    *clear_projects = true;
+                }
+                if fire(clear_req, cx).is_none() {
+                    fail("#915: 担当プロジェクトを外せない");
+                }
+                if let Some(ref path) = memo_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                // #917 の測定準備: **分割する前**の master の矩形を控える。
+                // 交代の不変条件は「後任の close 後の矩形 == 前任が分割前に持っていた矩形」
+                let geom = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            app.workspace
+                                .active_tab()
+                                .tree()
+                                .layout(tako_core::Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 1000.0,
+                                    height: 800.0,
+                                })
+                                .into_iter()
+                                .map(|(p, r)| {
+                                    (
+                                        p.as_u64(),
+                                        format!(
+                                            "{:.1},{:.1},{:.1},{:.1}",
+                                            r.x, r.y, r.width, r.height
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .ok()
+                        .unwrap_or_default()
+                };
+                let before_geom = geom(cx);
+                let prev_rect = before_geom
+                    .iter()
+                    .find(|(p, _)| *p == prev.as_u64())
+                    .map(|(_, r)| r.clone());
+
+                let unresolved = run_handoff(None, cx);
+                match unresolved {
+                    Some((res4, prompt4, successor4)) => {
+                        successors.push(successor4);
+                        println!(
+                            "TAKO_SELF_TEST_915_UNRESOLVED: jurisdiction={:?} has_body={} has_path={}",
+                            res4["jurisdiction_source"].as_str(),
+                            prompt4.contains("他 master の長文"),
+                            prompt4.contains(&format!("{other}.md")),
+                        );
+                        check(
+                            res4["jurisdiction_source"].as_str() == Some("unresolved")
+                                && !prompt4.contains("他 master の長文")
+                                && !prompt4.contains("管轄の本文（後任へ渡ってよい）")
+                                && prompt4.contains(&format!("{other}.md")),
+                            "122: 管轄不明なら本文を貼らず一覧とパスだけを渡す (#915)",
+                        );
+                    }
+                    None => fail("#915: 管轄不明時の handoff が失敗した"),
+                }
+
+                // (e) CLI / MCP と同じ dispatch から一覧・読み・書きができる（1:1 公開）
+                let list = tako_control::dispatch::dispatch_orchestrator_handoff_files(
+                    "list", None, None, None,
+                )
+                .ok();
+                let listed: Vec<String> = list
+                    .as_ref()
+                    .and_then(|v| v["project_handoffs"].as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|e| e["project"].as_str().map(String::from))
+                    .collect();
+                let written = tako_control::dispatch::dispatch_orchestrator_handoff_files(
+                    "write",
+                    Some(mine),
+                    None,
+                    Some("## 知識（マシン非依存）\n- 書き込みの検証\n"),
+                )
+                .ok();
+                let shown = tako_control::dispatch::dispatch_orchestrator_handoff_files(
+                    "show",
+                    Some(mine),
+                    None,
+                    None,
+                )
+                .ok();
+                println!(
+                    "TAKO_SELF_TEST_915_FILES: listed={listed:?} written={} shown_format={:?}",
+                    written.is_some(),
+                    shown.as_ref().and_then(|v| v["format"].as_str()),
+                );
+                check(
+                    listed.contains(&mine.to_string())
+                        && listed.contains(&other.to_string())
+                        && written.is_some()
+                        && shown
+                            .as_ref()
+                            .and_then(|v| v["content"].as_str())
+                            .is_some_and(|c| c.contains("- 書き込みの検証")),
+                    "122: 引き継ぎファイルの一覧・書き・読みが dispatch から通る (#915)",
+                );
+
+
+
+                // #917: 交代後のレイアウトが交代前と一致する（「場所が入れ替わる」体験）。
+                // 後任は退役 master のペインを分割して作られるので、旧ペインを閉じた時点で
+                // 後任が**分割前の**矩形をそのまま継ぎ、周囲のペインは動かない
+                let Some(&heir) = successors.last() else {
+                    fail("#917: 後任のペインが無い")
+                };
+                fire(
+                    Req::Close {
+                        pane: Some(prev.as_u64()),
+                        force: true,
+                        caller_role: None,
+                    },
+                    cx,
+                );
+                let after_geom = geom(cx);
+                let successor_rect = after_geom
+                    .iter()
+                    .find(|(p, _)| *p == heir.as_u64())
+                    .map(|(_, r)| r.clone());
+                let others_same = before_geom
+                    .iter()
+                    .filter(|(p, _)| *p != prev.as_u64() && *p != heir.as_u64())
+                    .all(|(p, r)| after_geom.iter().any(|(q, s)| q == p && s == r));
+                println!(
+                    "TAKO_SELF_TEST_917: prev_rect={prev_rect:?} successor_rect={successor_rect:?} others_same={others_same}"
+                );
+                check(
+                    prev_rect.is_some() && successor_rect == prev_rect && others_same,
+                    "122: 交代後の後任が旧 master の矩形を継ぎ周囲は動かない (#917)",
+                );
+
+                // 後片付け（プロファイル・プロジェクト・ファイル・検証用ペイン）
+                fire(profiles_req("delete", None), cx);
+                for key in [mine, mine2, other] {
+                    fire(
+                        Req::OrchestratorProjects {
+                            action: "remove".into(),
+                            key: Some(key.into()),
+                            cwd: None,
+                            description: None,
+                        },
+                        cx,
+                    );
+                }
+                if let Some(dir) = tako_control::orchestrator::handoff_store::handoff_dir() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                if let Some(dir) = tako_control::orchestrator::config_dir() {
+                    let _ = std::fs::remove_file(dir.join(format!("_system_prompt_{probe}.md")));
+                }
+                // prev は #917 の検証で閉じている（二重 close はしない）
+                for pane in successors {
+                    fire(
+                        Req::Close {
+                            pane: Some(pane.as_u64()),
+                            force: true,
+                            caller_role: None,
+                        },
+                        cx,
+                    );
+                }
+            }
+
+            // 123: 設定ファイルの自動マイグレーション（#916）。
             // 旧形式のファイルを隔離ディレクトリへ置き、**製品と同じ dispatch**
             // （CLI / MCP が通るのと同じ経路）で移行させて、
             // ①直る ②旧内容が退避される ③2 回目は何もしない（冪等）
@@ -48888,7 +49437,7 @@ mod self_test {
                     .map(std::path::PathBuf::from)
                     .map(|d| d.join("profiles"));
                 if profiles_dir.is_none() {
-                    fail("122: TAKO_ORCHESTRATOR_DIR が隔離されていない (#916)");
+                    fail("123: TAKO_ORCHESTRATOR_DIR が隔離されていない (#916)");
                 }
                 let profiles_dir = profiles_dir.unwrap_or_else(std::env::temp_dir);
                 let _ = std::fs::create_dir_all(&profiles_dir);
@@ -49738,6 +50287,64 @@ mod selftest_pty_enter_watchdog {
         assert!(lf_pty_writes(good_paren).is_empty());
         // 逃げ道そのものの検査: マーカーがある行は見逃す
         assert!(lf_pty_writes(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod self_test_file_url_tests {
+    use super::self_test::{file_url, legacy_free_file_uri_path as file_uri_path};
+    use std::path::Path;
+
+    /// #913: 項目 116 が受け口へ渡す URL は **RFC 8089 の形**（パス部は `/` 始まり・
+    /// 区切りは `/`）でなければならない。`path.display()` をそのまま符号化していたため
+    /// Windows では `file://C%3A%5CUsers%5C…` になり、受け口が全部弾いていた。
+    /// 判定は OS を見ず**形**で決めるので、macOS からも Windows 形を検査できる
+    #[test]
+    fn windowsのパスもrfc8089の形のurlになる() {
+        // Windows 形（ドライブレター + バックスラッシュ）
+        assert_eq!(
+            file_uri_path(Path::new(r"C:\Users\me\AppData\Local\Temp\a.md")),
+            "/C:/Users/me/AppData/Local/Temp/a.md"
+        );
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\me\a.md")),
+            "file:///C%3A/Users/me/a.md"
+        );
+        // `:` は RFC 3986 の unreserved ではないので `%3A` になる。受け口は
+        // パーセントデコードしてから境界へ渡すので、リテラルの `:`（Windows の
+        // `UrlCreateFromPath` が作る形）も `%3A` もどちらも通る
+        assert_eq!(
+            crate::open_files::file_url_to_path("file:///C%3A/Users/me/a.md"),
+            crate::open_files::file_url_to_path("file:///C:/Users/me/a.md"),
+            "リテラルの `:` と `%3A` は同じパスへ戻る"
+        );
+        // POSIX 形は 1 バイトも変わらない（macOS の回帰検出）
+        assert_eq!(file_uri_path(Path::new("/tmp/a.md")), "/tmp/a.md");
+        assert_eq!(file_url(Path::new("/tmp/a.md")), "file:///tmp/a.md");
+        // 非 ASCII と空白はパーセント符号化されたまま
+        assert_eq!(
+            file_url(Path::new(r"C:\tmp\my notes.md")),
+            "file:///C%3A/tmp/my%20notes.md"
+        );
+        assert_eq!(
+            file_url(Path::new("/tmp/読み.md")),
+            "file:///tmp/%E8%AA%AD%E3%81%BF.md"
+        );
+    }
+
+    /// 作った URL が**受け口でパスへ戻る**（項目 116 の (1) を単体で固定する）
+    #[test]
+    fn 作ったurlは受け口でパスへ戻る() {
+        for path in [
+            Path::new(r"C:\Users\me\AppData\Local\Temp\読み物.md"),
+            Path::new("/tmp/読み物.md"),
+        ] {
+            let url = file_url(path);
+            assert!(
+                crate::open_files::file_url_to_path(&url).is_some(),
+                "{url} がパスへ戻らない（#913）"
+            );
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 //! tako をインストールするだけで使える。
 
 pub mod agent;
+pub mod handoff_store;
 pub mod ledger;
 pub mod registry;
 pub mod supervisor;
@@ -3997,8 +3998,17 @@ worker_agents:
             "区切りの良いタイミングの規範がある"
         );
         assert!(
-            master.contains("Refresh the handoff file first"),
+            master.contains("Refresh the handoff first"),
             "handoff 最新化が前提条件だと書いてある"
+        );
+        // #915: プロジェクト単位の置き場と運用メモの役割分担が書いてある
+        assert!(
+            master.contains("handoff/projects/<project-key>.md"),
+            "プロジェクト単位の置き場が書いてある"
+        );
+        assert!(
+            master.contains("only the projects you own"),
+            "後任へ渡るのは管轄分だけだと書いてある"
         );
         // solo にも未置換のプレースホルダを残さない
         let solo = p.build_solo_system_prompt("default");

@@ -275,8 +275,11 @@ pub const SPECS: &[SchemaSpec] = &[
     },
     pristine(SchemaId::SoloProfiles, Some(validate_profile)),
     pristine(SchemaId::Ledger, Some(validate_ledger)),
-    // 引き継ぎは Markdown なので形式の決まりが無い。プロジェクト単位化（#915）は
-    // ここへ Step を足す形で載る
+    // 引き継ぎ（#915）は「プロファイル単位の 1 ファイル」から
+    // 「プロジェクト単位の複数ファイル」への**分割**移行なので、テキスト置換の
+    // Step では表せない。手順そのものは `orchestrator::handoff_store` が持ち、
+    // ここは**発火と可視化だけ**を引き受ける（[`handoff_reports`]）。
+    // 「どこで直るか」を 1 本に保つのが番地に載せる目的
     pristine(SchemaId::Handoff, None),
     // 認証トークンを持ち、次回起動で作り直される。退避すると寿命を超えて
     // トークンの写しが残るので**退避しない**（読めない残骸は discovery 側の
@@ -325,10 +328,9 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         SchemaId::Ledger => crate::orchestrator::ledger::ledger_path()
             .into_iter()
             .collect(),
-        SchemaId::Handoff => dir_entries(
-            crate::orchestrator::config_dir().map(|d| d.join("handoff")),
-            ".md",
-        ),
+        // 引き継ぎは**1 ファイル → 複数ファイル**の分割移行（#915）なので、
+        // テキスト置換の Step では表せない。専用実装へ委譲する（[`handoff_reports`]）
+        SchemaId::Handoff => Vec::new(),
         SchemaId::DiscoveryInstance => {
             dir_entries(data.as_ref().map(|d| d.join("instances")), ".json")
         }
@@ -431,12 +433,123 @@ pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
         if only.is_some_and(|id| id != spec.id) {
             continue;
         }
+        if spec.id == SchemaId::Handoff {
+            for file in handoff_reports(mode) {
+                report.push(file);
+            }
+            continue;
+        }
         for path in targets(spec.id) {
             report.push(migrate_one(spec, &path, mode));
         }
     }
     report
 }
+
+/// 引き継ぎの移行（#915）を共通の記録へ載せる。
+///
+/// 手順は `handoff_store` が持つ（1 ファイル → 複数ファイルの分割なので Step で
+/// 表せない）。ここがやるのは**同じ発火点から呼ぶこと**と、結果を
+/// [`MigrationReport`] の語彙へ翻訳することだけ。これで
+/// `tako migrate` / GUI 起動 / `tako setup` のどれからでも引き継ぎまで面倒を見る
+fn handoff_reports(mode: Mode) -> Vec<FileReport> {
+    use crate::orchestrator::handoff_store;
+    let dir = handoff_store::handoff_dir();
+    let path_of = |profile: &str| {
+        dir.as_ref()
+            .map(|d| d.join(format!("{profile}.md")))
+            .unwrap_or_else(|| PathBuf::from(format!("{profile}.md")))
+    };
+    if mode == Mode::Check {
+        // 書かずに「旧形式が残っているか」だけを見る。判定は handoff_store の
+        // 前判定と同じ材料（形式マーカーの有無 + 分割の材料になる見出し）を使う
+        return handoff_store::list_profile_memos()
+            .into_iter()
+            .filter(|(_, path)| {
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    return false;
+                };
+                let stamped = text.contains(tako_core::handoff::HANDOFF_FORMAT_MARKER);
+                !stamped || tako_core::handoff::needs_migration_scan(&text)
+            })
+            .map(|(profile, _)| FileReport {
+                id: SchemaId::Handoff,
+                path: path_of(&profile),
+                outcome: FileOutcome::Migrated {
+                    from: 1,
+                    to: 2,
+                    backup: handoff_store::archive_dir()
+                        .unwrap_or_else(|| PathBuf::from("archive")),
+                    applied: vec![HANDOFF_V1_TO_V2],
+                },
+            })
+            .collect();
+    }
+    // 実際に何が変わったかは**中身を前後で比べて**決める。
+    // `MigrationOutcome::migrated` は「プロジェクトへ移した行があるか」なので、
+    // 形式マーカーの付与だけで済んだファイルが false になり、
+    // status の予告（2 件）と run の報告（1 件）が食い違っていた
+    let before: Vec<(String, PathBuf, Option<String>)> = handoff_store::list_profile_memos()
+        .into_iter()
+        .map(|(profile, path)| {
+            let text = std::fs::read_to_string(&path).ok();
+            (profile, path, text)
+        })
+        .collect();
+    let outcomes = handoff_store::migrate_all();
+    let mut reports = Vec::new();
+    for (profile, path, old) in before {
+        let now = std::fs::read_to_string(&path).ok();
+        let outcome = outcomes.iter().find(|o| o.profile == profile);
+        let warnings = outcome.map(|o| o.warnings.clone()).unwrap_or_default();
+        if !warnings.is_empty() {
+            reports.push(FileReport {
+                id: SchemaId::Handoff,
+                path,
+                outcome: FileOutcome::Failed {
+                    reason: warnings.join(" / "),
+                },
+            });
+            continue;
+        }
+        if now == old {
+            continue;
+        }
+        let backup = outcome
+            .and_then(|o| o.archived_to.as_deref().map(PathBuf::from))
+            .unwrap_or_else(|| sibling_bak(&path));
+        reports.push(FileReport {
+            id: SchemaId::Handoff,
+            path,
+            outcome: FileOutcome::Migrated {
+                from: 1,
+                to: 2,
+                backup,
+                applied: vec![HANDOFF_V1_TO_V2],
+            },
+        });
+    }
+    reports
+}
+
+/// `handoff_store` の書き込みが作る世代バックアップ（`<name>.bak.1`）。
+/// 分割が起きず形式マーカーの付与だけだった場合の退避先はこちら
+fn sibling_bak(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    name.push_str(".bak.1");
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+const HANDOFF_V1_TO_V2: Note = Note::new(
+    "プロファイル単位の引き継ぎをプロジェクト単位へ分割する（#915）",
+    "Split the per-profile handoff into per-project files (#915)",
+);
 
 fn migrate_one(spec: &SchemaSpec, path: &Path, mode: Mode) -> FileReport {
     // 無いファイルは触らない
@@ -950,6 +1063,18 @@ mod tests {
             "元は触らない"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 引き継ぎ（#915）は分割移行なので Step では表せないが、**番地には載っている**。
+    /// 走査の対象は持たず（専用実装へ委譲する）、報告は共通の語彙へ翻訳される
+    #[test]
+    fn 引き継ぎは番地に載るが走査対象を持たない() {
+        let spec = spec(SchemaId::Handoff).expect("登録されている");
+        assert!(spec.is_pristine(), "テキスト置換の手順は持たない");
+        assert!(
+            targets(SchemaId::Handoff).is_empty(),
+            "ファイル走査ではなく handoff_store へ委譲する"
+        );
     }
 
     /// トークン・秘匿情報を持つ種別は読めなくても**写しを残さない**。

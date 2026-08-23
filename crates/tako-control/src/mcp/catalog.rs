@@ -1609,7 +1609,13 @@ pub fn tools() -> Vec<Value> {
                 handoff_path のファイルを最新化して tako_orchestrator_handoff を呼ぶ（#749）。\
                 auto_handoff は tako 側の自動通知が有効かどうか（有効なら閾値超過で \
                 「【tako 自動通知】」で始まる指示が届く。届いたら即座に引き継ぎを始める）。\
-                handoff_exists は引き継ぎファイル（handoff/<profile>.md）の有無。\
+                handoff_path / handoff_exists は**プロファイル運用メモ**（handoff/<profile>.md。\
+                プロジェクトに紐付かない運用知識の置き場）。\
+                #915: プロジェクト固有の引き継ぎは project_handoffs の各 path\
+                （handoff/projects/<project-key>.md）に書く。そこへ書いたものは、そのプロジェクトを\
+                管轄する master の後任にだけ渡る。旧形式は読むついでに自動移行される\
+                （handoff_migration。冪等）。profile_source が pane_role なら呼び出し元の\
+                TAKO_ORCHESTRATOR_ROLE が失われている（ペインの role ラベルから復元した。#854）。\
                 handoff_format はその書式（#792。sectioned = 知識 / 実行状態の 2 節に分かれている、\
                 legacy = 節分離前、null = ファイル未作成）、handoff_sections は認識できた節。\
                 legacy なら次に更新するとき 2 節へ書き直す。\
@@ -1625,30 +1631,66 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_orchestrator_handoff",
-            "description": "master の引き継ぎを実行する。handoff ファイル（handoff/<profile>.md）を読み、\
+            "description": "master の引き継ぎを実行する。**管轄プロジェクトの引き継ぎだけ**を読み、\
                 同プロファイルの新 master を spawn して引き継ぎプロンプトを注入する。\
-                role / プロファイル / タブは旧 master と同一を引き継ぐ。\
-                呼ぶ前に handoff ファイルを今の状況で最新化すること（このツールはファイルの\
+                role / プロファイル / アカウント / モデル / effort / タブは旧 master と同一を引き継ぐ。\
+                呼ぶ前に引き継ぎファイルを今の状況で最新化すること（このツールはファイルの\
                 内容をそのまま後任へ渡すだけで、中身の鮮度は確認しない）。\
+                #915: 置き場はプロジェクト単位（handoff/projects/<project-key>.md）。\
+                管轄は projects 引数 → プロファイルの担当プロジェクト + 稼働中 worker の\
+                プロジェクト → 稼働中 worker だけ の順で解決し（応答の jurisdiction_source）、\
+                どれも決まらなければ**本文を貼らずに一覧とパスだけ**を後任へ渡す\
+                （無関係なプロジェクトの長文で後任の文脈を食わない）。\
+                プロジェクトに紐付かない運用知識は handoff/<profile>.md（プロファイル運用メモ）\
+                に置き、こちらは常に渡る。旧形式（プロファイル単位の混在ファイル）は\
+                この呼び出しの中で自動移行される（応答の handoff_migration。冪等・原本は退避）。\
                 #749: 旧 master のペインは**後任が引き継ぎを確認したあとに後任自身が閉じる**\
                 （初期プロンプトにその手順が入る: 実態突き合わせ → 旧ペインの入力欄に\
                 ユーザーの未送達指示が残っていないか確認 → close）。この呼び出しでは閉じないので、\
                 後任の起動が失敗しても旧 master は失われない。応答の previous_master_pane_id が\
                 退役予定のペイン（null なら後任に close を指示していない）。\
-                handoff ファイルが無ければエラーを返す（master は事前にファイルを更新する必要がある）。\
-                #792: 引き継ぎファイルは 2 節に分けて書く。\
+                引き継ぎの材料が 1 つも無ければエラーを返す（master は事前に書く必要がある）。\
+                #792: 各ファイルは 2 節に分けて書く。\
                 「## 知識（マシン非依存）」= 決定事項・方針・残タスクの意図（pane / tab 番号を書かない）、\
                 「## 実行状態（このマシン限定）」= worker とその pane / tab・実行中のもの。\
                 pane / tab はこのマシンでしか意味を持たないので、知識に混ぜると別デバイスで\
                 誤った指示の元になる。節分離前の旧書式もそのまま読める（応答の handoff_format が\
-                sectioned / legacy、handoff_sections が認識した節。legacy のときは後任へ\
-                「番号は実態で確認 + 次の更新で 2 節へ書き直す」が伝わる）。\
+                sectioned / legacy / mixed）。\
                 tab を省略すると呼び出し元と同タブに新 master を spawn する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("呼び出し元ペイン ID（省略時は caller から自動解決）"),
                     "tab": { "type": "integer", "minimum": 0, "description": "新 master を出すタブ ID（省略時は呼び出し元と同タブ）" },
+                    "projects": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "後任へ渡すプロジェクトキー（#915）。指定すると推定より優先される。省略時はプロファイルの担当 + 稼働中 worker から推定",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_orchestrator_handoffs",
+            "description": "引き継ぎファイルの管理（Issue #915）。プロジェクト単位の引き継ぎ\
+                （handoff/projects/<project-key>.md）とプロファイル運用メモ（handoff/<profile>.md）の\
+                一覧・読み・書き、および旧形式からの移行。\
+                action: list（両方の一覧。行数・書式・肥大警告つき）/ \
+                show（project か profile のどちらか一方。内容と書式。未作成なら雛形を返す）/ \
+                write（project か profile のどちらか一方 + content。アトミック + 世代バックアップ）/ \
+                migrate（旧形式の自動移行。profile 省略で全プロファイル）。\
+                移行は通常 setup 実行時と master が引き継ぎを読む経路で**自動**で走るので、\
+                migrate を手で呼ぶ必要はない（冪等なので呼んでも壊れない）。\
+                プロジェクト固有の引き継ぎをここへ書けば、そのプロジェクトを管轄する master の\
+                後任にだけ渡る。運用メモは常に渡るので、プロジェクトに紐付かない知識だけを置く",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "show", "write", "migrate"], "description": "操作（list / show / write / migrate）" },
+                    "project": { "type": "string", "description": "プロジェクトキー（projects.yaml のキー。show / write でどちらか一方）" },
+                    "profile": { "type": "string", "description": "プロファイル名（運用メモ側。show / write でどちらか一方、migrate では対象の絞り込み）" },
+                    "content": { "type": "string", "description": "書き込む内容（write 時に必須）" },
                 },
                 "additionalProperties": false,
             },

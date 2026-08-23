@@ -174,29 +174,9 @@ fn parse_cwd(uri: &[u8]) -> Option<OscEvent> {
     if path.is_empty() {
         return None;
     }
-    Some(OscEvent::CwdChanged(PathBuf::from(strip_drive_slash(
-        &path,
-    ))))
-}
-
-/// `file:///C:/Users/x` の先頭 `/` を落とす（RFC 8089 の Windows 形式 file URI）。
-///
-/// これを付けたまま渡すと Windows では**存在しないパス**になり cwd 追従が全滅する。
-/// 落とす条件は「`/` + ASCII 英字 + `:` の直後が `/` か終端」に限るので、
-/// `C:` という名前のディレクトリを持つ POSIX の絶対パスとは取り違えない
-/// （それでも当たるのは `/C:` ちょうどか `/C:/…` だけ。実在すれば異常な構成）
-fn strip_drive_slash(path: &str) -> &str {
-    let bytes = path.as_bytes();
-    let looks_like_drive = bytes.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-        && bytes[2] == b':'
-        && (bytes.len() == 3 || bytes[3] == b'/');
-    if looks_like_drive {
-        &path[1..]
-    } else {
-        path
-    }
+    Some(OscEvent::CwdChanged(PathBuf::from(
+        crate::file_uri::strip_drive_slash(&path),
+    )))
 }
 
 /// `A` / `B` / `C` / `D[;exit[;...]]`。各マークの後ろに `;key=value` が続く方言も先頭だけ見る
@@ -461,13 +441,16 @@ mod tests {
             parse_cwd(b"file:///Users/foo"),
             Some(OscEvent::CwdChanged(PathBuf::from("/Users/foo")))
         );
-        // 2 文字目が英字でも `:` が続かなければドライブではない
-        assert_eq!(strip_drive_slash("/Cx/tmp"), "/Cx/tmp");
-        // `:` の後ろが区切りでなければドライブではない
-        assert_eq!(strip_drive_slash("/C:x/tmp"), "/C:x/tmp");
-        assert_eq!(strip_drive_slash("/tmp"), "/tmp");
-        // ちょうど `/C:` は Windows のドライブ直下として扱う（RFC 8089）
-        assert_eq!(strip_drive_slash("/C:"), "C:");
+        // ドライブ判定そのものの網羅は境界側（`file_uri`）のテストが持つ。
+        // ここは **OSC 7 の経路が境界を通っている**ことだけを見る（#913）
+        assert_eq!(
+            parse_cwd(b"file:///Cx/tmp"),
+            Some(OscEvent::CwdChanged(PathBuf::from("/Cx/tmp")))
+        );
+        assert_eq!(
+            parse_cwd(b"file:///C:"),
+            Some(OscEvent::CwdChanged(PathBuf::from("C:")))
+        );
     }
 
     /// #816 の `Ground` 読み飛ばしは「1 バイトずつ送る」のと完全に同じ結果でなければ
