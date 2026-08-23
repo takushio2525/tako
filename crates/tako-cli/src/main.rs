@@ -461,6 +461,7 @@ enum RemoteFolderCommand {
         /// ホスト指定なしに全部閉じる（既定は全タブ横断。--tab で 1 タブへ絞る）
         #[arg(long)]
         all: bool,
+        /// 対象タブ ID（省略時は全タブ横断）
         #[arg(long)]
         tab: Option<u64>,
     },
@@ -468,13 +469,16 @@ enum RemoteFolderCommand {
     List,
     /// リモートのディレクトリを一覧する（ツリーを開かずに覗く）
     Ls {
+        /// ~/.ssh/config の Host 名
         host: String,
         /// リモート側の絶対パス（省略時はリモートのホーム）
         path: Option<String>,
     },
     /// リモートのファイルをプレビューで開く（読み取り専用）
     OpenFile {
+        /// ~/.ssh/config の Host 名
         host: String,
+        /// リモート側のファイルの絶対パス
         path: String,
         /// フォーカスを移さない
         #[arg(long)]
@@ -482,9 +486,11 @@ enum RemoteFolderCommand {
     },
     /// そのフォルダを cwd にした SSH ペインを開く
     SshPane {
+        /// ~/.ssh/config の Host 名
         host: String,
         /// リモート側の絶対パス（省略時はログイン時の cwd）
         path: Option<String>,
+        /// フォーカスを新タブに移さない
         #[arg(long)]
         no_focus: bool,
     },
