@@ -8066,14 +8066,7 @@ impl TakoApp {
                     // PowerShell の PSReadLine が継続行（`>>`）にするのでコマンドが
                     // 確定せず、押しても何も起きなかった（#897 で実測）。#640 の
                     // 送達確認つき経路（CR 送出・シェル準備待ち・エコー確認）へ寄せる
-                    if std::env::var_os("TAKO_899_LEGACY").is_some() {
-                        // A/B: #899 以前の生 write + LF
-                        if let Some(session) = self.terminals.get(&pane_id) {
-                            session.write(format!("{line}\n").into_bytes());
-                        }
-                    } else {
-                        self.queue_command_flow(pane_id, line);
-                    }
+                    self.queue_command_flow(pane_id, line);
                     // #720: エージェント起動はチャット確定まで数秒〜十数秒かかる。
                     // その間にシェルの実行中画面（起動ログ・claude の起動途中）を
                     // 見せないよう、押した瞬間から過渡期を張り直す
@@ -8166,13 +8159,7 @@ impl TakoApp {
         // #899: 新しいペインは器（psmux）が起動直後の入力を落とすことがあるので、
         // 生 write ではなく #640 の送達確認つき経路へ積む（行末も CR になる）
         if self.terminals.contains_key(&pane_id) {
-            if std::env::var_os("TAKO_899_LEGACY").is_some() {
-                if let Some(session) = self.terminals.get(&pane_id) {
-                    session.write(format!("{line}\n").into_bytes());
-                }
-            } else {
-                self.queue_command_flow(pane_id, line);
-            }
+            self.queue_command_flow(pane_id, line);
         }
         self.scroll_active_tab_into_view();
         self.sync_filetree_roots();

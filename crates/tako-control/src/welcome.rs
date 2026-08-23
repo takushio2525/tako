@@ -65,8 +65,14 @@ pub const MASTER_COMMAND: &str = "tako master";
 /// 組み立てることで、PATH の状態に関係なくボタンが必ず動く。
 /// 案内文（バナーの本文）は `SETUP_COMMAND` / `MASTER_COMMAND` の最簡形のままにする
 pub fn launch_command_line(subcommand: &str) -> String {
-    // A/B: `TAKO_899_LEGACY=1` で #899 以前（POSIX 決め打ちのクォート）へ戻す。
-    // 同一バイナリで実機の before/after を取るための逃げ道
+    // A/B: `TAKO_899_LEGACY=1` で #899 以前の**クォート（症状 2）だけ**を戻す。
+    // 同一バイナリで実機の before/after を取るための逃げ道。
+    //
+    // 行末（症状 1）の legacy 経路は**用意しない**: PTY へ LF を書く形は #897 の番犬
+    // （`セルフテストがptyへ書くenterはcrである`）が構造的に禁じている不変条件なので、
+    // env で戻せる穴を作らない。症状 2 だけ戻せば PowerShell では
+    // `'C:\…\tako.exe' --version` が式として評価されて実行されないので、
+    // CR で送っても実機の before は再現できる
     if std::env::var_os("TAKO_899_LEGACY").is_some() {
         let bin = crate::dispatch::resolve_tako_binary();
         let safe = !bin.is_empty()
