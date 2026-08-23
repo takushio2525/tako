@@ -722,6 +722,10 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             pane: u64_arg(args, "pane")?,
         },
+        "tako_migrate" => Request::Migrate {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            schema: str_arg(args, "schema")?.map(|s| s.to_string()),
+        },
         "tako_welcome" => Request::Welcome {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },

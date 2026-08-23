@@ -4541,6 +4541,15 @@ fn dispatch_inner(
             }
         }
 
+        // 移行はファイル操作だけで完結する（GUI の状態に触らない）。
+        // GUI が壊れた設定で起動できない状況でも CLI から同じ経路が使えることが本質
+        Request::Migrate { action, schema } => {
+            return crate::migrations::report_json(
+                action.as_deref().unwrap_or("status"),
+                schema.as_deref(),
+            )
+            .map_err(DispatchError::InvalidParams);
+        }
         Request::Welcome { action } => {
             let action = action.as_deref().unwrap_or("status");
             match action {

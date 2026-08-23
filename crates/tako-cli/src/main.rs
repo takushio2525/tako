@@ -130,6 +130,9 @@ enum Command {
     Theme(ThemeArgs),
     /// 設定画面を開く（Issue #459）
     Settings(SettingsArgs),
+    /// 設定・データファイルの自動マイグレーションの状態確認・手動発火（Issue #916）。
+    /// 引数なしで全永続ファイルの形式を確認するだけ（何も書き換えない）
+    Migrate(MigrateArgs),
     /// 初回起動のウェルカムバナーの状態確認・再表示・非表示（Issue #549）。
     /// 引数なしで現在の表示状態と案内すべきコマンドを表示する
     Welcome(WelcomeArgs),
@@ -2204,6 +2207,17 @@ struct SettingsArgs {
     tab: Option<String>,
 }
 
+/// 自動マイグレーションコマンドの引数（Issue #916）。
+/// 既定は「見るだけ」（#322 の最簡形 = `tako migrate` で状態が分かる）
+#[derive(Args)]
+struct MigrateArgs {
+    /// run（実際に当てる）。省略時は status = 見るだけ
+    action: Option<String>,
+    /// 対象のファイル種別（省略時は全種別）
+    #[arg(long)]
+    schema: Option<String>,
+}
+
 /// ウェルカムバナーコマンドの引数（Issue #549）
 #[derive(Args)]
 struct WelcomeArgs {
@@ -2876,6 +2890,9 @@ fn cli_main() -> ExitCode {
         Command::Agents(ref sub) => agents_local(sub),
         // レイアウト復旧もローカル処理（GUI 死亡・縮退保存後の復旧手段のため IPC 不要が本質）
         Command::Recover(ref args) => recover_local(args),
+        // 移行もローカル処理（IPC 不要）。**壊れた設定で GUI が起動しないときの
+        // 復旧手段**なので、GUI に依存しないことが本質（recover と同じ理由）
+        Command::Migrate(ref args) => migrate_local(args),
         // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
@@ -4273,6 +4290,16 @@ fn shell_integration_local(args: &ShellIntegrationArgs) -> Result<(), String> {
             "無効"
         }
     );
+    Ok(())
+}
+
+/// `tako migrate`（Issue #916）。GUI 無しで動くローカル処理
+fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
+    // CLI 単独で走るので表示言語を settings.json から解決する（platform と同じ。#435）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let action = args.action.as_deref().unwrap_or("status");
+    let result = tako_control::migrations::report_json(action, args.schema.as_deref())?;
+    println!("{}", pretty_json(&result));
     Ok(())
 }
 
@@ -6162,6 +6189,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::Migrate(_) => unreachable!("migrate は run() を通らない（ローカル処理）"),
         Command::ShellIntegration(_) => {
             unreachable!("shell-integration は run() を通らない（ローカル処理）")
         }

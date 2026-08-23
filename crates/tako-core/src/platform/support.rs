@@ -658,6 +658,13 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
     },
     Feature {
+        // 設定ファイルの読み書きだけで完結する（GUI に触らない）。**壊れた設定で
+        // GUI が起動しない環境でこそ要る**ので、両 OS で必ず動くことが要件（#916）
+        key: "tako_migrate",
+        macos: Support::Supported,
+        windows: Support::Supported,
+    },
+    Feature {
         key: "tako_move_pane_to_tab",
         macos: Support::Supported,
         windows: Support::Pending {

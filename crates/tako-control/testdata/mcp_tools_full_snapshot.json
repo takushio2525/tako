@@ -2944,6 +2944,28 @@
     "name": "tako_stale_binary"
   },
   {
+    "description": "設定・データファイルのスキーマ自動マイグレーション（Issue #916）。tako は設定ファイルの形式や置き場を変えたとき**利用者へ手動移行を要求しない**。旧形式は setup 実行時と実行時の差分検出で自動的に直る。このツールはその状態を確認・手動発火するためのもの。action=status（既定）で全永続ファイル（settings.json / layout.json / projects.yaml / profiles / accounts / sessions / workers / ledger 等）の形式の版数と、これから当たる移行を見るだけで返す（何も書き換えない）。action=run で実際に当てる（旧内容は .pre-v<N>.bak へ退避され消えない。冪等なので何度実行しても壊れない）。応答の files[].state は absent / up_to_date / migrated / unreadable / refused / failed。**unreadable は「設定が壊れているので既定値で動いている」という意味**で、退避先（quarantine）に元の内容が残っているのでユーザーへ知らせること。schema でファイル種別を 1 つに絞れる。設定が壊れて GUI が起動しないときは CLI の `tako migrate` が同じ処理をGUI 無しで実行できる。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "操作種別（省略時は status = 見るだけ）",
+          "enum": [
+            "status",
+            "run"
+          ],
+          "type": "string"
+        },
+        "schema": {
+          "description": "対象のファイル種別（省略時は全種別）",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_migrate"
+  },
+  {
     "description": "初回起動のウェルカムバナー（Issue #549）。tako を初めて起動したユーザーへ「tako setup で初期設定 → tako master で AI 司令塔」の導線を画面上部に出す。action=status（既定）で表示状態（visible / dismissed / first_launch）と案内すべきコマンド（setup_command / master_command）を返す。action=show でバナーを再表示（初期設定がまだのユーザーへ導線を出し直したいとき）。action=dismiss で閉じて以後出さない（settings.json に永続化）。ユーザーが「何から始めればいいか」で迷っていたら status で状態を確認し、setup_command をそのまま案内するか tako_setup を実行すること。",
     "inputSchema": {
       "additionalProperties": false,

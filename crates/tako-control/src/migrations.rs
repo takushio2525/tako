@@ -409,6 +409,13 @@ impl MigrationIo for ReadOnlyIo {
 /// `only` を渡すとその種別だけ扱う
 pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
     let mut report = MigrationReport::default();
+    // **ユニットテストは本番のデータディレクトリを触らない**。#916 の棚卸しで、
+    // 隔離せずに本番の profiles/ を書くテストが実際に残骸を作っていたのが見つかった
+    // （`_tako_822_set_.yaml`）。同じ穴を機構自身が開けないよう、テストビルドでは
+    // `TAKO_DATA_DIR` で明示的に隔離されているときだけ動かす
+    if cfg!(test) && std::env::var_os("TAKO_DATA_DIR").is_none() {
+        return report;
+    }
     for spec in SPECS {
         if only.is_some_and(|id| id != spec.id) {
             continue;
@@ -521,6 +528,88 @@ pub fn setup_lines() -> Vec<String> {
     lines
 }
 
+/// 移行の結果を JSON へ（**CLI と MCP はここ 1 本を通る** = 1:1 が構造的に保たれる）。
+///
+/// `action` = "status"（既定。見るだけ）/ "run"（当てる）。`only` でファイル種別を絞る
+pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value, String> {
+    let mode = match action {
+        "status" | "check" => Mode::Check,
+        "run" | "apply" => Mode::Apply,
+        other => {
+            return Err(format!(
+                "不明な action: {other}（status | run）"
+            ))
+        }
+    };
+    let only = match only {
+        None => None,
+        Some(name) => Some(SchemaId::parse(name).ok_or_else(|| {
+            let names: Vec<&str> = SchemaId::all().iter().map(|i| i.as_str()).collect();
+            format!("不明なファイル種別: {name}（{}）", names.join(" | "))
+        })?),
+    };
+    let report = if mode == Mode::Apply {
+        let report = run(Mode::Apply, only);
+        record(&report, "cli");
+        report
+    } else {
+        run(Mode::Check, only)
+    };
+    Ok(serde_json::json!({
+        "action": action,
+        "applied": mode == Mode::Apply,
+        "migrated": report.changed_count(),
+        "needs_attention": report.attention().count(),
+        "notice": report.notice(),
+        "files": report
+            .files
+            .iter()
+            .map(file_json)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn file_json(file: &FileReport) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "schema": file.id.as_str(),
+        "path": file.path.display().to_string(),
+        "state": file.outcome.kind(),
+    });
+    let map = obj.as_object_mut().expect("object");
+    match &file.outcome {
+        FileOutcome::UpToDate { version } => {
+            map.insert("version".into(), (*version).into());
+        }
+        FileOutcome::Migrated {
+            from,
+            to,
+            backup,
+            applied,
+        } => {
+            map.insert("from".into(), (*from).into());
+            map.insert("to".into(), (*to).into());
+            map.insert("backup".into(), backup.display().to_string().into());
+            map.insert(
+                "applied".into(),
+                applied
+                    .iter()
+                    .map(|n| serde_json::Value::from(n.text()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        FileOutcome::Unreadable { quarantine, reason } => {
+            map.insert("quarantine".into(), quarantine.display().to_string().into());
+            map.insert("reason".into(), reason.clone().into());
+        }
+        FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
+            map.insert("reason".into(), reason.clone().into());
+        }
+        FileOutcome::Absent => {}
+    }
+    obj
+}
+
 /// 実施の可視化。**何をどう変えたかは必ず監査ログへ残す**（黙って直さない）
 fn record(report: &MigrationReport, origin: &str) {
     for file in &report.files {
@@ -558,7 +647,12 @@ fn record(report: &MigrationReport, origin: &str) {
 /// 「一度だけ」を確かめられるようにするため（ユニットテストが本番設定を
 /// 書き換える型の事故は #916 の棚卸しで実際に見つかっている）
 fn take_runtime_slot() -> bool {
-    !RUNTIME_FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    take_slot(&RUNTIME_FIRED)
+}
+
+/// [`take_runtime_slot`] の純粋部分（テストが自分の旗で確かめられるように分けてある）
+fn take_slot(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -799,12 +893,17 @@ mod tests {
     /// **本番のデータディレクトリへは触らずに**枠取りだけを確かめる
     #[test]
     fn 実行時発火の枠は一度だけ取れる() {
-        assert!(take_runtime_slot(), "最初の 1 回だけ走る");
-        assert!(!take_runtime_slot(), "2 回目は走らない");
-        assert_eq!(
-            ensure_migrated(),
-            None,
-            "枠が埋まっていれば実ファイルを読みにも行かない"
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(take_slot(&flag), "最初の 1 回だけ走る");
+        assert!(!take_slot(&flag), "2 回目は走らない");
+    }
+
+    /// 機構自身が本番のデータディレクトリを触る穴を開けていないこと
+    #[test]
+    fn テストビルドでは隔離されていない限り走らない() {
+        assert!(
+            std::env::var_os("TAKO_DATA_DIR").is_some() || run(Mode::Apply, None).files.is_empty(),
+            "隔離されていないテストで本番を触ってはいけない"
         );
     }
 }
