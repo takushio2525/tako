@@ -3955,16 +3955,32 @@ fn dispatch_inner(
         Request::OpenRemote {
             host: ssh_host,
             focus,
+            remote_dir,
         } => {
-            let hosts = match tako_core::ssh_config::default_ssh_config_path() {
-                Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
-                None => Vec::new(),
-            };
-            let entry = hosts.iter().find(|h| h.name == ssh_host);
-            let cmd = match entry {
-                Some(h) => h.ssh_command(),
-                None => vec!["ssh".to_string(), ssh_host.clone()],
-            };
+            // #919: **ssh を素のペインのプログラムにしない**。
+            //
+            // 旧実装は `SpawnCommand { program: "ssh", args: [host] }` だったので
+            // ① 接続待ちのあいだ画面が完全に空（実測: TCP ブラックホールで 25 秒間
+            // 1 文字も出ない = 「何も入力できない」に見える）② ssh が即死すると
+            // PTY の死とともにペインが消え、タブごと閉じて理由が残らない
+            // （実測: 名前解決できないホストは 1 秒でタブが消滅）。
+            //
+            // `ssh_pane_script` で包むと、接続前にバナーが出て、ssh 自身の失敗
+            // （exit 255）だけ理由 + 次の一手を出して入力待ちで止まる
+            let argv = remote_ssh_argv(&ssh_host);
+            let dir = remote_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string);
+            let script = tako_core::remote_fs::ssh_pane_script(
+                tako_core::platform::shell::script_dialect(),
+                &argv,
+                &ssh_host,
+                dir.as_deref(),
+                tako_core::i18n::lang(),
+            );
+            let command = tako_core::platform::shell::script_pane_command(&script);
 
             let prev_active = host.workspace().active_tab_id();
             let pane = Pane::new(origin);
@@ -3983,13 +3999,18 @@ fn dispatch_inner(
             host.attach_session(
                 pane_id,
                 SpawnOptions {
-                    command: Some(SpawnCommand {
-                        program: cmd[0].clone(),
-                        args: cmd[1..].to_vec(),
-                    }),
+                    command: Some(command),
                     ..Default::default()
                 },
             );
+
+            // フォルダ指定つきは接続後に `cd` を打つ。相手のシェルが不明（POSIX とも
+            // PowerShell とも限らない）なので、**両方で通る `cd "<path>"`** を
+            // シェル準備待ち + エコー確認つきの経路（#640）で送る
+            if let Some(dir) = &dir {
+                let native = tako_core::remote_fs::shell_path(dir);
+                host.queue_command_flow(pane_id, format!("cd \"{native}\""));
+            }
 
             // Recent に記録
             let mut recent = tako_core::recent::RecentList::load();
@@ -3998,7 +4019,12 @@ fn dispatch_inner(
             });
             recent.save();
 
-            Ok(json!({ "tab": tab_id.as_u64(), "pane": pane_id.as_u64() }))
+            Ok(json!({
+                "tab": tab_id.as_u64(),
+                "pane": pane_id.as_u64(),
+                "host": ssh_host,
+                "remote_dir": dir,
+            }))
         }
 
         Request::SshHosts => {
@@ -4019,6 +4045,15 @@ fn dispatch_inner(
                 .collect();
             Ok(json!({ "hosts": list }))
         }
+
+        Request::RemoteFolder {
+            action,
+            host: ssh_host,
+            path,
+            tab,
+            focus,
+            all,
+        } => dispatch_remote_folder(host, origin, &action, ssh_host, path, tab, focus, all),
 
         Request::RecentItems { action } => match action.as_str() {
             "list" => {
@@ -5695,6 +5730,324 @@ pub fn dispatch_config_share(
         }
     };
     result.map_err(DispatchError::Operation)
+}
+
+/// SSH ペインの argv（#919）。
+///
+/// `~/.ssh/config` の Host 設定を反映しつつ、**ツリー側と同じ ControlPath** を通す
+/// （`remote_fs::ssh_pane_argv`）。ここで対話ログインした接続がそのまま共有されるので、
+/// パスワード認証しか無い相手でも一度入れば以後ツリーが追加認証なしで開く（#65）
+fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
+    let hosts = match tako_core::ssh_config::default_ssh_config_path() {
+        Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
+        None => Vec::new(),
+    };
+    // `~/.ssh/config` の Host に無い名前もそのまま ssh へ渡す（従来どおり）
+    let extra: Vec<String> = match hosts.iter().find(|h| h.name == ssh_host) {
+        // `ssh_command()` は `["ssh", "-p", port, "user@host"]` の形。
+        // 先頭の `ssh` と末尾の宛先は `ssh_pane_argv` 側が組むので、間だけ貰う
+        Some(h) => {
+            let cmd = h.ssh_command();
+            cmd[1..cmd.len().saturating_sub(1)].to_vec()
+        }
+        None => Vec::new(),
+    };
+    let mut argv = tako_core::remote_fs::ssh_pane_argv(ssh_host, &extra);
+    // 宛先は config の `User` を反映した形へ差し替える（`ssh_command()` と同じ規則）
+    if let Some(h) = hosts.iter().find(|h| h.name == ssh_host) {
+        if let Some(user) = &h.user {
+            if let Some(last) = argv.last_mut() {
+                *last = format!("{user}@{ssh_host}");
+            }
+        }
+    }
+    argv
+}
+
+/// リモート（SSH 先）フォルダの操作（#919 / #65）。
+///
+/// GUI の「リモートからフォルダを開く」・CLI `tako remote-folder`・MCP
+/// `tako_remote_folder` が**すべてここを通る**（開発不変条件: UI でできることは
+/// AI からもできる）。
+///
+/// # UI スレッドを止めない約束
+///
+/// ネットワーク I/O（接続・一覧・取得）のうち、**dispatch の中で待つのは
+/// `open` / `ls` / `open-file` の 1 回だけ**にしてある。`ssh` には
+/// `ConnectTimeout` / `BatchMode` / `ServerAliveInterval` が付いているので上限は
+/// 十数秒で、しかも 2 回目以降は ControlMaster に相乗りするので即返る。
+/// ツリーの展開（未知のディレクトリを何枚も読む方）は `request_remote_dir` で
+/// 背景へ投げ、ここでは待たない
+#[allow(clippy::too_many_arguments)]
+fn dispatch_remote_folder(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    action: &str,
+    ssh_host: Option<String>,
+    path: Option<String>,
+    tab: Option<u64>,
+    focus: Option<bool>,
+    all: bool,
+) -> Result<Value, DispatchError> {
+    use tako_core::remote_fs::{self, RemoteRef};
+
+    /// `RemoteError` を dispatch のエラーへ。**理由と次の一手を落とさない**
+    fn to_err(e: remote_fs::RemoteError) -> DispatchError {
+        DispatchError::Operation(format!(
+            "{} / {} / {}",
+            e.summary(),
+            e.next_step(),
+            e.detail.replace('\n', " ")
+        ))
+    }
+
+    fn need_host(ssh_host: &Option<String>) -> Result<String, DispatchError> {
+        ssh_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| DispatchError::InvalidParams("host が必要".into()))
+    }
+
+    fn need_path(path: &Option<String>) -> Result<String, DispatchError> {
+        path.as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| DispatchError::InvalidParams("path が必要".into()))
+    }
+
+    /// 対象タブ（省略時はアクティブタブ）
+    fn target_tab(host: &dyn ControlHost, tab: Option<u64>) -> Result<TabId, DispatchError> {
+        match tab {
+            Some(id) => host
+                .workspace()
+                .tabs()
+                .iter()
+                .find(|t| t.id().as_u64() == id)
+                .map(|t| t.id())
+                .ok_or_else(|| DispatchError::Operation(format!("タブ {id} が見つからない"))),
+            None => Ok(host.workspace().active_tab_id()),
+        }
+    }
+
+    match action {
+        // 接続してからルートを開く。**失敗したら開かない**（開いてから失敗すると
+        // #919 の「タブだけできて中身が無い」に戻る）
+        "open" => {
+            let ssh_host = need_host(&ssh_host)?;
+            // path 省略時はリモートのホーム（sftp の初期 cwd）
+            let home = remote_fs::connect(&ssh_host).map_err(to_err)?;
+            let dir = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(p) => p.to_string(),
+                None => home.clone(),
+            };
+            // 開く前に「本当にディレクトリとして読めるか」を確かめる。
+            // ここで弾くと、ツリーに開けないルートが並ぶのを防げる
+            let entries = remote_fs::list_dir(&ssh_host, &dir).map_err(to_err)?;
+            let remote = RemoteRef::new(ssh_host.clone(), dir.clone());
+            let tab_id = target_tab(host, tab)?;
+            let added = host
+                .workspace_mut()
+                .get_tab_mut(tab_id)
+                .map(|t| t.add_remote_folder(remote.clone()))
+                .unwrap_or(false);
+            host.set_filetree(true);
+            host.sync_filetree();
+            host.request_remote_dir(&remote);
+            Ok(json!({
+                "opened": added,
+                "host": ssh_host,
+                "path": dir,
+                "home": home,
+                "entries": entries.len(),
+                "tab": tab_id.as_u64(),
+                "label": remote.label(),
+            }))
+        }
+
+        "close" => {
+            let tab_id = target_tab(host, tab)?;
+            let mut closed: Vec<String> = Vec::new();
+            let hosts_to_release: Vec<String>;
+            {
+                let Some(t) = host.workspace_mut().get_tab_mut(tab_id) else {
+                    return Err(DispatchError::Operation("タブが見つからない".into()));
+                };
+                if all {
+                    let open = t.remote_folders().to_vec();
+                    closed = open.iter().map(|r| r.label()).collect();
+                    hosts_to_release = open.iter().map(|r| r.host.clone()).collect();
+                    for remote in &open {
+                        t.remove_remote_folder(remote);
+                    }
+                } else {
+                    let ssh_host = need_host(&ssh_host)?;
+                    hosts_to_release = vec![ssh_host.clone()];
+                    match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                        Some(p) => {
+                            let remote = RemoteRef::new(ssh_host.clone(), p.to_string());
+                            if !t.remove_remote_folder(&remote) {
+                                return Err(DispatchError::Operation(format!(
+                                    "開いていないリモートフォルダ: {}",
+                                    remote.label()
+                                )));
+                            }
+                            closed.push(remote.label());
+                        }
+                        None => {
+                            let labels: Vec<String> = t
+                                .remote_folders()
+                                .iter()
+                                .filter(|r| r.host == ssh_host)
+                                .map(|r| r.label())
+                                .collect();
+                            if labels.is_empty() {
+                                return Err(DispatchError::Operation(format!(
+                                    "{ssh_host} のリモートフォルダは開いていない"
+                                )));
+                            }
+                            t.remove_remote_host(&ssh_host);
+                            closed = labels;
+                        }
+                    }
+                }
+            }
+            // どのタブからも参照されなくなったホストは接続（ControlMaster）も畳む。
+            // 開いたままにすると `ControlPersist` の間ずっと ssh が居座る
+            let still_open: Vec<String> = host
+                .workspace()
+                .tabs()
+                .iter()
+                .flat_map(|t| t.remote_folders().iter().map(|r| r.host.clone()))
+                .collect();
+            for h in hosts_to_release {
+                if !still_open.contains(&h) {
+                    remote_fs::close_master(&h);
+                }
+            }
+            host.sync_filetree();
+            Ok(json!({ "closed": closed }))
+        }
+
+        "list" => {
+            let states = host.remote_folder_states();
+            let tabs: Vec<Value> = host
+                .workspace()
+                .tabs()
+                .iter()
+                .map(|t| {
+                    let folders: Vec<Value> = t
+                        .remote_folders()
+                        .iter()
+                        .map(|r| {
+                            let found = states.iter().find(|(sr, _, _)| sr == r);
+                            json!({
+                                "host": r.host,
+                                "path": r.path,
+                                "label": r.label(),
+                                "state": found.map(|(_, s, _)| s.clone()),
+                                "entries": found.map(|(_, _, n)| *n),
+                                "connected": remote_fs::master_alive(&r.host),
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "tab": t.id().as_u64(),
+                        "title": t.title(),
+                        "remote_folders": folders,
+                    })
+                })
+                .filter(|t| {
+                    !t["remote_folders"]
+                        .as_array()
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true)
+                })
+                .collect();
+            Ok(json!({ "tabs": tabs }))
+        }
+
+        // ツリーを開かずに覗く（#65 要件 5: AI がリモートの構造を把握する経路）
+        "ls" => {
+            let ssh_host = need_host(&ssh_host)?;
+            let dir = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(p) => p.to_string(),
+                None => remote_fs::connect(&ssh_host).map_err(to_err)?,
+            };
+            let entries = remote_fs::list_dir(&ssh_host, &dir).map_err(to_err)?;
+            let list: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "name": e.name,
+                        "path": e.path,
+                        "kind": match e.kind {
+                            remote_fs::RemoteKind::Dir => "dir",
+                            remote_fs::RemoteKind::File => "file",
+                            remote_fs::RemoteKind::Symlink => "symlink",
+                            remote_fs::RemoteKind::Unknown => "unknown",
+                        },
+                        "size": e.size,
+                    })
+                })
+                .collect();
+            Ok(json!({ "host": ssh_host, "path": dir, "entries": list }))
+        }
+
+        // SFTP で取得 → 既存のプレビュー経路（OpenFile）へ流す。
+        // 構文色・md・画像・PDF・目次・リンクの実装を二重に持たない
+        "open-file" => {
+            let ssh_host = need_host(&ssh_host)?;
+            let file = need_path(&path)?;
+            let local = remote_fs::fetch_file(&ssh_host, &file, remote_fs::MAX_PREVIEW_BYTES)
+                .map_err(to_err)?;
+            let result = dispatch(
+                host,
+                Request::OpenFile {
+                    pane: None,
+                    path: local.display().to_string(),
+                    mode: None,
+                    direction: None,
+                    focus,
+                    new_tab: false,
+                },
+                origin,
+            )?;
+            if let Some(pane) = result["pane"].as_u64() {
+                host.set_preview_remote_origin(
+                    PaneId::from_raw(pane),
+                    RemoteRef::new(ssh_host.clone(), file.clone()),
+                );
+            }
+            let mut out = result;
+            out["host"] = json!(ssh_host);
+            out["remote_path"] = json!(file);
+            out["cached_path"] = json!(local.display().to_string());
+            out["read_only"] = json!(true);
+            Ok(out)
+        }
+
+        // そのフォルダを cwd にした SSH ペイン（#919 要件 4）
+        "ssh-pane" => {
+            let ssh_host = need_host(&ssh_host)?;
+            let dir = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+            dispatch(
+                host,
+                Request::OpenRemote {
+                    host: ssh_host,
+                    focus,
+                    remote_dir: dir.map(str::to_string),
+                },
+                origin,
+            )
+        }
+
+        other => Err(DispatchError::InvalidParams(format!(
+            "不明な action: {other:?}（open / close / list / ls / open-file / ssh-pane のいずれか）"
+        ))),
+    }
 }
 
 /// アカウントレジストリの CRUD（Issue #504 / #512）。host 非依存
@@ -15383,6 +15736,7 @@ mod tests {
             Request::OpenRemote {
                 host: "nonexistent-host".into(),
                 focus: Some(true),
+                remote_dir: None,
             },
             PaneOrigin::Cli,
         )

@@ -842,8 +842,19 @@ pub(super) fn build_request(
         "tako_open_remote" => Request::OpenRemote {
             host: str_arg(args, "host")?.ok_or("host を指定する")?.to_string(),
             focus: bool_arg(args, "focus")?,
+            remote_dir: str_arg(args, "remote_dir")?.map(|s| s.to_string()),
         },
         "tako_ssh_hosts" => Request::SshHosts,
+        "tako_remote_folder" => Request::RemoteFolder {
+            action: str_arg(args, "action")?
+                .ok_or("action を指定する")?
+                .to_string(),
+            host: str_arg(args, "host")?.map(|s| s.to_string()),
+            path: str_arg(args, "path")?.map(|s| s.to_string()),
+            tab: u64_arg(args, "tab")?,
+            focus: bool_arg(args, "focus")?,
+            all: bool_arg(args, "all")?.unwrap_or(false),
+        },
         "tako_recent" => Request::RecentItems {
             action: str_arg(args, "action")?
                 .ok_or("action を指定する")?

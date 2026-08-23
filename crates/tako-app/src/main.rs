@@ -1450,6 +1450,16 @@ struct TakoApp {
     tmux_view_panes: HashMap<PaneId, TmuxViewTarget>,
     /// ファイルツリーのコンテキストメニュー（FR-3.12）
     context_menu: Option<ContextMenu>,
+    /// リモート（SSH 先）ツリー行のコンテキストメニュー（#919）。
+    /// ローカル用と項目が別物（Finder 表示・ゴミ箱が意味を持たない）なので分ける
+    remote_context_menu: Option<RemoteContextMenu>,
+    /// プレビューペインが「リモートのどこ由来か」（#919）。
+    /// 本体は SFTP で落としたローカルのキャッシュを開くので、これが無いと
+    /// キャッシュを本物と思って編集・保存してしまう
+    preview_remote_origins: HashMap<PaneId, tako_core::remote_fs::RemoteRef>,
+    /// リモート操作の通知（#919）。サイドバー上部に出す。
+    /// **失敗は自動で消さない**（静かな失敗を作らないため）
+    remote_notice: Option<RemoteNotice>,
     /// ペインヘッダ / タブの右クリックメニュー（#185）
     pane_context_menu: Option<PaneContextMenu>,
     /// ファイルツリーのインライン編集
@@ -2714,6 +2724,33 @@ struct ContextMenu {
     position: Point<Pixels>,
 }
 
+/// リモート操作の通知（#919）。
+///
+/// 汎用のトーストが無いので、**ユーザーが見ている場所**（ファイルツリーの上）へ出す。
+/// 成功は数秒で消え、失敗は次の操作まで残る（理由を読む時間を奪わない）
+struct RemoteNotice {
+    text: String,
+    is_error: bool,
+    at: std::time::Instant,
+}
+
+impl RemoteNotice {
+    /// 成功通知が消えるまで
+    const SUCCESS_TTL: Duration = Duration::from_secs(8);
+
+    fn expired(&self) -> bool {
+        !self.is_error && self.at.elapsed() > Self::SUCCESS_TTL
+    }
+}
+
+/// リモート（SSH 先）ツリー行の右クリックメニュー（#919）
+struct RemoteContextMenu {
+    remote: tako_core::remote_fs::RemoteRef,
+    is_dir: bool,
+    is_root: bool,
+    position: Point<Pixels>,
+}
+
 /// ペインヘッダ / タブの右クリックメニュー（#185）
 struct PaneContextMenu {
     pane: PaneId,
@@ -3109,6 +3146,9 @@ impl TakoApp {
             collapsed_tmux_tabs,
             tmux_view_panes: HashMap::new(),
             context_menu: None,
+            remote_context_menu: None,
+            preview_remote_origins: HashMap::new(),
+            remote_notice: None,
             pane_context_menu: None,
             inline_edit: None,
             sidebar_width: {
@@ -4397,6 +4437,35 @@ impl TakoApp {
                         break;
                     }
                 }
+                // ④-b background: リモート（SSH 先）ディレクトリの読み込み（#919）。
+                //
+                // **ポーリングしない**（`remote_pending` は「展開済みでキャッシュが無い」
+                // ものだけを返し、返した時点で loading を立てる）。ネットワーク I/O なので
+                // 必ず background で走らせ、失敗は行として画面に出す
+                let remote_jobs = this
+                    .update(cx, |app: &mut TakoApp, _| {
+                        if app.filetree.visible {
+                            app.filetree.remote_pending()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default();
+                for remote in remote_jobs {
+                    let job = remote.clone();
+                    let task = cx.background_executor().spawn(async move {
+                        tako_core::remote_fs::list_dir(&job.host, &job.path).map_err(|e| e.report())
+                    });
+                    let result = task.await;
+                    let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.filetree.apply_remote_dir(remote.clone(), result);
+                        cx.notify();
+                    });
+                    if ok.is_err() {
+                        break;
+                    }
+                }
+
                 // ④ background: サイドバー用の軽量 git サマリ（#217）
                 if let Some(cwd) = sidebar_git_cwd {
                     let task = cx
@@ -8175,6 +8244,48 @@ impl TakoApp {
                             .collect()
                     };
                 }
+                // #919: ホスト選択（選んだらフォルダ選択へ進む）
+                PaletteMode::RemoteFolderHost(hosts) => {
+                    let items: Vec<PaletteItem> = hosts
+                        .iter()
+                        .map(|h| PaletteItem::RemoteFolderHost(h.clone()))
+                        .collect();
+                    return if q.is_empty() {
+                        items
+                    } else {
+                        items
+                            .into_iter()
+                            .filter(|item| item.label().to_lowercase().contains(&q))
+                            .collect()
+                    };
+                }
+                // #919: フォルダ選択。先頭が「ここを開く」で、以下がディレクトリ
+                PaletteMode::RemoteFolderDir { host, cwd, entries } => {
+                    let mut items: Vec<PaletteItem> =
+                        vec![PaletteItem::RemoteFolderOpen(host.clone(), cwd.clone())];
+                    if let Some(parent) = tako_core::remote_fs::parent_remote(cwd) {
+                        items.push(PaletteItem::RemoteFolderDescend(
+                            host.clone(),
+                            parent,
+                            format!("..  {}", crate::ui_text::remote_folder::parent_dir()),
+                        ));
+                    }
+                    for e in entries.iter().filter(|e| e.is_dir()) {
+                        items.push(PaletteItem::RemoteFolderDescend(
+                            host.clone(),
+                            e.path.clone(),
+                            format!("{}/", e.name),
+                        ));
+                    }
+                    return if q.is_empty() {
+                        items
+                    } else {
+                        items
+                            .into_iter()
+                            .filter(|item| item.label().to_lowercase().contains(&q))
+                            .collect()
+                    };
+                }
                 PaletteMode::Normal => {}
             }
         }
@@ -8225,6 +8336,8 @@ impl TakoApp {
             "run-setup",
             "run-master",
             "open-settings",
+            // #919: リモートからフォルダを開く（ファイルメニューと同じ入口）
+            "open-remote-folder",
             "open-update",
             "new-tab",
             "toggle-theme",
@@ -8304,6 +8417,7 @@ impl TakoApp {
                 // #549: 初期設定・オーケストレーションへの導線
                 "run-setup" => self.run_setup_command(cx),
                 "run-master" => self.run_master_command(cx),
+                "open-remote-folder" => self.open_remote_folder_palette(cx),
                 "open-settings" => {
                     self.pending_settings_open = Some(None);
                     cx.notify();
@@ -8343,7 +8457,125 @@ impl TakoApp {
             PaletteItem::Recent(entry) => {
                 self.open_recent_entry(entry, cx);
             }
+            // #919: ホストを選んだ → 接続してフォルダ選択へ
+            PaletteItem::RemoteFolderHost(host) => {
+                self.open_remote_folder_picker(&host.name, None, cx);
+            }
+            // #919: このフォルダを開く
+            PaletteItem::RemoteFolderOpen(host, path) => {
+                self.open_remote_folder(&host, Some(&path), cx);
+            }
+            // #919: 1 階層降りる / 上がる
+            PaletteItem::RemoteFolderDescend(host, path, _) => {
+                self.open_remote_folder_picker(&host, Some(&path), cx);
+            }
         }
+    }
+
+    /// 「リモートからフォルダを開く」のホスト選択を開く（#919）。
+    /// `~/.ssh/config` に Host が無ければ、空の一覧を黙って出さずに理由を出す
+    fn open_remote_folder_palette(&mut self, cx: &mut Context<Self>) {
+        let hosts = match tako_core::ssh_config::default_ssh_config_path() {
+            Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
+            None => Vec::new(),
+        };
+        if hosts.is_empty() {
+            self.set_remote_notice(crate::ui_text::remote_folder::no_hosts().to_string(), true);
+            cx.notify();
+            return;
+        }
+        self.command_palette = Some(CommandPalette {
+            query: String::new(),
+            selected: 0,
+            mode: PaletteMode::RemoteFolderHost(hosts),
+        });
+        cx.notify();
+    }
+
+    /// リモートのフォルダ選択を開く（#919）。`path` 省略時はリモートのホーム。
+    ///
+    /// 接続と一覧は dispatch の `ls` を通す（CLI / MCP と同じ経路）。**失敗したら
+    /// パレットを開かず理由を出す**（空のパレットを見せない）
+    fn open_remote_folder_picker(
+        &mut self,
+        host: &str,
+        path: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_remote_notice(crate::ui_text::remote_folder::connecting(host), false);
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::RemoteFolder {
+                action: "ls".into(),
+                host: Some(host.to_string()),
+                path: path.map(str::to_string),
+                tab: None,
+                focus: None,
+                all: false,
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(v) => {
+                let cwd = v["path"].as_str().unwrap_or("/").to_string();
+                let entries: Vec<tako_core::remote_fs::RemoteEntry> = v["entries"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                Some(tako_core::remote_fs::RemoteEntry {
+                                    name: e["name"].as_str()?.to_string(),
+                                    path: e["path"].as_str()?.to_string(),
+                                    kind: match e["kind"].as_str()? {
+                                        "dir" => tako_core::remote_fs::RemoteKind::Dir,
+                                        "symlink" => tako_core::remote_fs::RemoteKind::Symlink,
+                                        "unknown" => tako_core::remote_fs::RemoteKind::Unknown,
+                                        _ => tako_core::remote_fs::RemoteKind::File,
+                                    },
+                                    size: e["size"].as_u64().unwrap_or(0),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.set_remote_notice(crate::ui_text::remote_folder::connected(host, &cwd), false);
+                self.command_palette = Some(CommandPalette {
+                    query: String::new(),
+                    selected: 0,
+                    mode: PaletteMode::RemoteFolderDir {
+                        host: host.to_string(),
+                        cwd,
+                        entries,
+                    },
+                });
+            }
+            Err(e) => self.set_remote_notice(e.to_string(), true),
+        }
+        cx.notify();
+    }
+
+    /// リモートフォルダをワークスペース（ファイルツリー）へ開く（#919）
+    fn open_remote_folder(&mut self, host: &str, path: Option<&str>, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::RemoteFolder {
+                action: "open".into(),
+                host: Some(host.to_string()),
+                path: path.map(str::to_string),
+                tab: None,
+                focus: None,
+                all: false,
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(v) => {
+                let label = v["label"].as_str().unwrap_or(host).to_string();
+                self.set_remote_notice(crate::ui_text::remote_folder::opened(&label), false);
+            }
+            Err(e) => self.set_remote_notice(e.to_string(), true),
+        }
+        cx.notify();
     }
 
     fn open_ssh_host(&mut self, host: tako_core::ssh_config::SshHost, cx: &mut Context<Self>) {
@@ -9448,6 +9680,14 @@ impl TakoApp {
     fn set_preview_editing_local(&mut self, pane_id: PaneId, enabled: bool) -> Result<(), String> {
         if !self.previews.contains_key(&pane_id) {
             return Err("プレビューペインではない".into());
+        }
+        // #919 段階 1: リモートファイルは読み取り専用。
+        //
+        // 本体は SFTP で落としたローカルのキャッシュなので、ここを止めないと
+        // **キャッシュを編集して「保存できた」と思わせる**（リモートには何も書かれない）。
+        // 書き戻し（SFTP put）は別 Issue へ切り出す
+        if enabled && self.preview_remote_origins.contains_key(&pane_id) {
+            return Err(crate::ui_text::remote_folder::preview_read_only().into());
         }
         if enabled && !self.preview_edits.contains_key(&pane_id) {
             let state = self.previews.get(&pane_id).expect("上で確認済み");
@@ -14914,16 +15154,26 @@ impl TakoApp {
             .map(|i| i + 1)
             .unwrap_or(0);
         // cwd チップ（カンプ: ~/projects/tako。クリックでコピー)
-        let cwd_display = self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
-            let full = p.to_string_lossy().to_string();
-            let home = std::env::var("HOME").unwrap_or_default();
-            let short = if !home.is_empty() && full.starts_with(&home) {
-                format!("~{}", &full[home.len()..])
-            } else {
-                full.clone()
-            };
-            (short, full)
-        });
+        //
+        // #919: リモートのファイルを開いたプレビューでは、**ローカルのキャッシュパスを
+        // 見せない**（`~/Library/.../remote-cache/…` は何のファイルか分からないし、
+        // 編集できると誤解させる）。リモートの位置をそのまま出す
+        let cwd_display = match self.preview_remote_origins.get(&pane_id) {
+            Some(remote) => {
+                let label = remote.label();
+                Some((crate::ui_text::remote_folder::preview_origin(&label), label))
+            }
+            None => self.terminals.get(&pane_id).and_then(|s| s.cwd()).map(|p| {
+                let full = p.to_string_lossy().to_string();
+                let home = std::env::var("HOME").unwrap_or_default();
+                let short = if !home.is_empty() && full.starts_with(&home) {
+                    format!("~{}", &full[home.len()..])
+                } else {
+                    full.clone()
+                };
+                (short, full)
+            }),
+        };
         // master: 子ワーカー一覧（spawned_by チェーン。全タブ走査）
         let workers: Vec<WorkerRow> = if is_master {
             self.collect_worker_rows(pane_id)
@@ -16919,6 +17169,41 @@ impl UiStateHost for TakoApp {
         self.sync_filetree_roots();
     }
 
+    // --- リモート（SSH 先）のフォルダ（#919 / #65） ---------------------------
+
+    fn request_remote_dir(&mut self, remote: &tako_core::remote_fs::RemoteRef) {
+        // 展開状態を立てるだけ。実際の読み込みは periodic が
+        // `filetree.remote_pending()` を拾って背景へ投げる（UI スレッドで待たない）
+        self.filetree.invalidate_remote(remote);
+    }
+
+    fn remote_folder_states(&self) -> Vec<(tako_core::remote_fs::RemoteRef, String, usize)> {
+        self.workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.remote_folders().iter().cloned())
+            .map(|remote| {
+                let (state, n) = match self.filetree.remote_dir(&remote) {
+                    Some(d) if d.loading => ("loading".to_string(), 0),
+                    Some(d) if d.error.is_some() => {
+                        (format!("error: {}", d.error.clone().unwrap_or_default()), 0)
+                    }
+                    Some(d) => ("loaded".to_string(), d.entries.len()),
+                    None => ("pending".to_string(), 0),
+                };
+                (remote, state, n)
+            })
+            .collect()
+    }
+
+    fn invalidate_remote_dir(&mut self, remote: &tako_core::remote_fs::RemoteRef) {
+        self.filetree.invalidate_remote(remote);
+    }
+
+    fn set_preview_remote_origin(&mut self, pane: PaneId, remote: tako_core::remote_fs::RemoteRef) {
+        self.preview_remote_origins.insert(pane, remote);
+    }
+
     fn pinned_previews(&self) -> Vec<tako_control::PinnedView> {
         self.pinned_previews
             .iter()
@@ -18656,6 +18941,15 @@ enum PaletteMode {
     Normal,
     SshHost(Vec<tako_core::ssh_config::SshHost>),
     RecentItems(Vec<tako_core::recent::RecentEntry>),
+    /// 「リモートからフォルダを開く」のホスト選択（#919）。
+    /// `SshHost` と分けるのは、選んだあとの遷移先が違うため（SSH ペインではなくフォルダ選択へ）
+    RemoteFolderHost(Vec<tako_core::ssh_config::SshHost>),
+    /// 同・フォルダ選択（#919）。リモートを 1 階層ずつ降りる
+    RemoteFolderDir {
+        host: String,
+        cwd: String,
+        entries: Vec<tako_core::remote_fs::RemoteEntry>,
+    },
 }
 
 /// コマンドパレットの候補 1 件（#217）
@@ -18668,6 +18962,12 @@ enum PaletteItem {
     SshHost(tako_core::ssh_config::SshHost),
     /// Recent エントリ
     Recent(tako_core::recent::RecentEntry),
+    /// 「リモートからフォルダを開く」のホスト（#919）
+    RemoteFolderHost(tako_core::ssh_config::SshHost),
+    /// 同・このフォルダを開く（host, path）
+    RemoteFolderOpen(String, String),
+    /// 同・1 階層降りる / 上がる（host, path, 表示名）
+    RemoteFolderDescend(String, String, String),
 }
 
 impl PaletteItem {
@@ -18693,6 +18993,17 @@ impl PaletteItem {
                 };
                 format!("[{prefix}] {}", e.label())
             }
+            PaletteItem::RemoteFolderHost(h) => {
+                let mut s = h.name.clone();
+                if let Some(ref hostname) = h.hostname {
+                    s.push_str(&format!(" ({hostname})"));
+                }
+                s
+            }
+            PaletteItem::RemoteFolderOpen(_, path) => {
+                crate::ui_text::remote_folder::open_this_folder(path)
+            }
+            PaletteItem::RemoteFolderDescend(_, _, label) => label.clone(),
         }
     }
 }
@@ -19099,6 +19410,8 @@ impl Render for TakoApp {
             .collect();
 
         let context_menu_overlay = self.render_context_menu(window, cx);
+        // #919: リモート行のメニュー（項目がローカル用とまったく別）
+        let remote_context_overlay = self.render_remote_context_menu(window, cx);
         let pane_context_overlay = self.render_pane_context_menu(window, cx);
         // サイドバー tmux ビューのホバープレビュー（FR-2.16.13。マウス位置に実画面サムネイル）
         let hover_preview_overlay = self.render_hover_preview(window);
@@ -19321,6 +19634,9 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &OpenRepository, _, cx| {
                 this.open_repository(cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenRemoteFolder, _, cx| {
+                this.open_remote_folder_palette(cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenRemote, _, cx| {
                 this.open_ssh_palette(cx);
             }))
@@ -19458,6 +19774,7 @@ impl Render for TakoApp {
                 ),
             )
             .child(ime_registration)
+            .children(remote_context_overlay)
             .children(context_menu_overlay)
             .children(pane_context_overlay)
             .children(hover_preview_overlay)
@@ -19787,6 +20104,10 @@ fn file_menu_common_items() -> Vec<gpui::MenuItem> {
         MenuItem::action(m::open_directory(), OpenDirectory),
         MenuItem::action(m::open_repository(), OpenRepository),
         MenuItem::action(m::open_remote(), OpenRemote),
+        MenuItem::action(
+            crate::ui_text::remote_folder::menu_open_remote_folder(),
+            OpenRemoteFolder,
+        ),
         MenuItem::action(m::open_recent(), OpenRecent),
         MenuItem::separator(),
         MenuItem::action(m::save_preview(), SavePreview),

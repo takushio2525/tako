@@ -154,6 +154,19 @@ pub struct TabLayout {
     /// AI が明示追加したフォルダ（#134。旧ファイル後方互換のため default + 空なら省略）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_folders: Vec<String>,
+    /// 「リモートからフォルダを開く」で開いた SSH 先（#919）。`host:/path` の組。
+    /// 旧ファイル後方互換のため default + 空なら省略
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_folders: Vec<RemoteFolderLayout>,
+}
+
+/// リモートフォルダ 1 本（#919）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteFolderLayout {
+    /// `~/.ssh/config` の Host 名
+    pub host: String,
+    /// リモート側の絶対パス（POSIX。Windows の相手なら `/C:/...`）
+    pub path: String,
 }
 
 /// 分割ツリーのノード（dispatch の list が返す tree 表現と同じ語彙: axis は "x" / "y"）
@@ -277,6 +290,14 @@ pub fn capture(
                     .pinned_folders()
                     .iter()
                     .map(|p| p.display().to_string())
+                    .collect(),
+                remote_folders: tab
+                    .remote_folders()
+                    .iter()
+                    .map(|r| RemoteFolderLayout {
+                        host: r.host.clone(),
+                        path: r.path.clone(),
+                    })
                     .collect(),
             })
             .collect(),
@@ -426,12 +447,25 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
                 })
                 .collect()
         };
+        // リモートは**ローカル FS の存在検査を通さない**（`is_dir()` に掛けると必ず
+        // 消える）。到達できるかは開いたあとにツリーが取りに行き、失敗は行として出る
+        let remote_folders: Vec<tako_core::remote_fs::RemoteRef> = {
+            let mut seen = std::collections::HashSet::new();
+            tab_layout
+                .remote_folders
+                .iter()
+                .filter(|r| !r.host.trim().is_empty() && !r.path.trim().is_empty())
+                .map(|r| tako_core::remote_fs::RemoteRef::new(r.host.clone(), r.path.clone()))
+                .filter(|r| seen.insert(r.clone()))
+                .collect()
+        };
         let tab = Tab::restore(
             tab_layout.id,
             tab_layout.title.clone(),
             parse_title_source(&tab_layout.title_source),
             tree,
             pinned,
+            remote_folders,
         );
         if tab_layout.id == file.active_tab {
             active = Some(tab.id());
@@ -1171,6 +1205,7 @@ mod tests {
                 focused: 1,
                 tree,
                 pinned_folders: Vec::new(),
+                remote_folders: Vec::new(),
             }],
             window: None,
             backgrounded: Vec::new(),
@@ -1334,6 +1369,7 @@ mod tests {
                 focused: 1,
                 tree,
                 pinned_folders: vec![],
+                remote_folders: vec![],
             }],
             window: None,
             backgrounded: vec![],

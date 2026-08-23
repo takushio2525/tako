@@ -52,6 +52,12 @@ pub struct Tab {
     tree: PaneTree,
     /// AI が明示追加したフォルダ（#134。ファイルツリーの root に cwd と並んで表示される）
     pinned_folders: Vec<PathBuf>,
+    /// 「リモートからフォルダを開く」で開いた SSH 先のフォルダ（#919 / #65）。
+    /// **`pinned_folders` と別に持つ**: `PathBuf` は OS 依存の区切りを持つので、
+    /// リモートの POSIX パス（Windows の `/C:/...` を含む）を混ぜると Windows 側で
+    /// `join` / `canonicalize` が `\\` を作って壊れるし、ローカル FS の存在検査
+    /// （`is_dir()`）を通してしまうと**必ず消える**
+    remote_folders: Vec<crate::remote_fs::RemoteRef>,
 }
 
 impl Tab {
@@ -62,6 +68,7 @@ impl Tab {
             title_source: TitleSource::Default,
             tree: PaneTree::new(root_pane),
             pinned_folders: Vec::new(),
+            remote_folders: Vec::new(),
         }
     }
 
@@ -73,6 +80,7 @@ impl Tab {
         title_source: TitleSource,
         tree: PaneTree,
         pinned_folders: Vec<PathBuf>,
+        remote_folders: Vec<crate::remote_fs::RemoteRef>,
     ) -> Self {
         TabId::reserve(id);
         Self {
@@ -81,6 +89,7 @@ impl Tab {
             title_source,
             tree,
             pinned_folders,
+            remote_folders,
         }
     }
 
@@ -144,6 +153,36 @@ impl Tab {
     /// タブを消費してペインツリーを取り出す（ペインの別タブ移送で使う）
     pub fn into_tree(self) -> PaneTree {
         self.tree
+    }
+
+    // --- remote_folders（#919: リモートからフォルダを開く） ---
+
+    /// このタブで開いているリモートフォルダ
+    pub fn remote_folders(&self) -> &[crate::remote_fs::RemoteRef] {
+        &self.remote_folders
+    }
+
+    /// リモートフォルダを開く（同じものは重ねない）。新規に追加したら true
+    pub fn add_remote_folder(&mut self, remote: crate::remote_fs::RemoteRef) -> bool {
+        if self.remote_folders.contains(&remote) {
+            return false;
+        }
+        self.remote_folders.insert(0, remote);
+        true
+    }
+
+    /// リモートフォルダを閉じる。閉じたら true
+    pub fn remove_remote_folder(&mut self, remote: &crate::remote_fs::RemoteRef) -> bool {
+        let before = self.remote_folders.len();
+        self.remote_folders.retain(|r| r != remote);
+        self.remote_folders.len() != before
+    }
+
+    /// そのホストのフォルダをまとめて閉じる。閉じた件数を返す
+    pub fn remove_remote_host(&mut self, host: &str) -> usize {
+        let before = self.remote_folders.len();
+        self.remote_folders.retain(|r| r.host != host);
+        before - self.remote_folders.len()
     }
 
     // --- pinned_folders（#134: AI からのフォルダ追加） ---

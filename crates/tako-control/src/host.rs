@@ -250,6 +250,32 @@ pub trait UiStateHost {
     }
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
+
+    // --- リモート（SSH 先）のフォルダ（#919 / #65） ---------------------------
+
+    /// リモートディレクトリの読み込みを**背景で**投げる（#919）。
+    ///
+    /// ネットワーク I/O なので dispatch（= UI スレッド）で待ってはいけない。
+    /// 結果はファイルツリーへ流れ込み、失敗は行として画面に出る
+    fn request_remote_dir(&mut self, _remote: &tako_core::remote_fs::RemoteRef) {}
+    /// 開いているリモートフォルダの読み込み状態（`list` の応答に載せる）。
+    /// 返すのは (リモート位置, 状態文字列, 件数)
+    fn remote_folder_states(&self) -> Vec<(tako_core::remote_fs::RemoteRef, String, usize)> {
+        Vec::new()
+    }
+    /// リモートフォルダの内容を捨てて取り直す（#919 の「再読み込み」）
+    fn invalidate_remote_dir(&mut self, _remote: &tako_core::remote_fs::RemoteRef) {}
+    /// プレビューペインに「これはリモートのどこのファイルか」を覚えさせる（#919）。
+    ///
+    /// ヘッダの表示と**編集の禁止**（段階 1 は読み取り専用）に使う。プレビュー本体は
+    /// SFTP で落としたローカルのキャッシュを開くので、これが無いと
+    /// 「キャッシュを編集して保存できた気になる」事故が起きる
+    fn set_preview_remote_origin(
+        &mut self,
+        _pane: PaneId,
+        _remote: tako_core::remote_fs::RemoteRef,
+    ) {
+    }
     /// ピン留め中のプレビュー一覧（FR-2.16.15）
     fn pinned_previews(&self) -> Vec<PinnedView> {
         Vec::new()

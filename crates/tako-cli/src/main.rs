@@ -287,6 +287,10 @@ enum Command {
     Recent(RecentCommand),
     /// SSH config の Host 一覧を表示する（#20）
     SshHosts,
+    /// リモート（SSH 先）のフォルダをワークスペースとして開く・閉じる・覗く（#919 / #65）。
+    /// GUI の「リモートからフォルダを開く」と同じ操作
+    #[command(subcommand, name = "remote-folder")]
+    RemoteFolder(RemoteFolderCommand),
     /// タスクチェックポイントの操作（Issue #242）。
     /// worker タスクの進行状態を永続化し、クラッシュや利用上限からの resume を可能にする
     #[command(subcommand)]
@@ -424,6 +428,60 @@ enum OpenInCommand {
         /// ~/.ssh/config の Host 名（未定義でも ssh コマンドとして実行）
         host: String,
         /// フォーカスを新タブに移さない
+        #[arg(long)]
+        no_focus: bool,
+        /// 接続後に cd するリモートのパス（#919）
+        #[arg(long)]
+        remote_dir: Option<String>,
+    },
+}
+
+/// リモートフォルダの操作（#919 / #65）。MCP `tako_remote_folder` と 1:1
+#[derive(Subcommand)]
+enum RemoteFolderCommand {
+    /// SSH 先のフォルダをファイルツリーに開く（接続に失敗したら開かず理由を返す）
+    Open {
+        /// ~/.ssh/config の Host 名
+        host: String,
+        /// リモート側の絶対パス（省略時はリモートのホーム）
+        path: Option<String>,
+        /// 対象タブ ID（省略時はアクティブタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// 開いているリモートフォルダを閉じる
+    Close {
+        /// ~/.ssh/config の Host 名（--all のときは省略可）
+        host: Option<String>,
+        /// リモート側の絶対パス（省略時はそのホストの全部）
+        path: Option<String>,
+        /// 全ホストのリモートフォルダを閉じる
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// 開いているリモートフォルダの一覧（読み込み状態つき）
+    List,
+    /// リモートのディレクトリを一覧する（ツリーを開かずに覗く）
+    Ls {
+        host: String,
+        /// リモート側の絶対パス（省略時はリモートのホーム）
+        path: Option<String>,
+    },
+    /// リモートのファイルをプレビューで開く（読み取り専用）
+    OpenFile {
+        host: String,
+        path: String,
+        /// フォーカスを移さない
+        #[arg(long)]
+        no_focus: bool,
+    },
+    /// そのフォルダを cwd にした SSH ペインを開く
+    SshPane {
+        host: String,
+        /// リモート側の絶対パス（省略時はログイン時の cwd）
+        path: Option<String>,
         #[arg(long)]
         no_focus: bool,
     },
@@ -6179,9 +6237,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     focus: Some(!no_focus),
                 }
             }
-            OpenInCommand::Remote { host, no_focus } => Request::OpenRemote {
+            OpenInCommand::Remote {
+                host,
+                no_focus,
+                remote_dir,
+            } => Request::OpenRemote {
                 host: host.clone(),
                 focus: Some(!no_focus),
+                remote_dir: remote_dir.clone(),
             },
         },
         Command::Recent(sub) => match sub {
@@ -6193,6 +6256,69 @@ fn build_request(command: &Command) -> Result<Request, String> {
             },
         },
         Command::SshHosts => Request::SshHosts,
+        Command::RemoteFolder(sub) => match sub {
+            RemoteFolderCommand::Open { host, path, tab } => Request::RemoteFolder {
+                action: "open".into(),
+                host: Some(host.clone()),
+                path: path.clone(),
+                tab: *tab,
+                focus: None,
+                all: false,
+            },
+            RemoteFolderCommand::Close {
+                host,
+                path,
+                all,
+                tab,
+            } => Request::RemoteFolder {
+                action: "close".into(),
+                host: host.clone(),
+                path: path.clone(),
+                tab: *tab,
+                focus: None,
+                all: *all,
+            },
+            RemoteFolderCommand::List => Request::RemoteFolder {
+                action: "list".into(),
+                host: None,
+                path: None,
+                tab: None,
+                focus: None,
+                all: false,
+            },
+            RemoteFolderCommand::Ls { host, path } => Request::RemoteFolder {
+                action: "ls".into(),
+                host: Some(host.clone()),
+                path: path.clone(),
+                tab: None,
+                focus: None,
+                all: false,
+            },
+            RemoteFolderCommand::OpenFile {
+                host,
+                path,
+                no_focus,
+            } => Request::RemoteFolder {
+                action: "open-file".into(),
+                host: Some(host.clone()),
+                path: Some(path.clone()),
+                tab: None,
+                focus: Some(!no_focus),
+                all: false,
+            },
+            RemoteFolderCommand::SshPane {
+                host,
+                path,
+                no_focus,
+            } => Request::RemoteFolder {
+                action: "ssh-pane".into(),
+                host: Some(host.clone()),
+                path: path.clone(),
+                tab: None,
+                focus: Some(!no_focus),
+                all: false,
+            },
+        },
         Command::Task(sub) => match sub {
             TaskCommand::Checkpoint {
                 task_id,
@@ -6933,6 +7059,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::OpenIn(_) => println!("{}", pretty_json(result)),
         Command::Recent(_) => println!("{}", pretty_json(result)),
         Command::SshHosts => println!("{}", pretty_json(result)),
+        Command::RemoteFolder(_) => println!("{}", pretty_json(result)),
         Command::Task(TaskCommand::List { json, .. }) => {
             if *json {
                 println!("{}", pretty_json(result));
@@ -7874,6 +8001,8 @@ mod platform_matrix_parity {
         ("list", "tako_list_panes"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),
+        // #919: CLI は `tako remote-folder <操作>`、MCP は action 引数を持つ 1 ツール
+        ("remote-folder", "tako_remote_folder"),
         ("open-in repo", "tako_open_dir"),
         ("open", "tako_open_file"),
         ("orchestrator status", "tako_orchestrator_worker_status"),

@@ -36,6 +36,27 @@ pub fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
     imp::run_pane_command(command, marker_prefix)
 }
 
+/// スクリプト本文をそのままシェルへ渡すペイン用コマンド（境界 B1。#919）。
+///
+/// [`run_pane_command`] との違いは**終了マーカーと入力待ちを付けない**こと。
+/// 「どこで待つか」「失敗したときだけ画面を残すか」をスクリプト側が決めたい用途
+/// （SSH ペインの接続前バナー + 失敗時の理由表示）で使う。
+///
+/// スクリプトの方言（POSIX / PowerShell）は呼び出し側が
+/// [`ShellDialect::for_scripts`] を見て組む
+pub fn script_pane_command(script: &str) -> SpawnCommand {
+    imp::script_pane_command(script)
+}
+
+/// このプラットフォームでペインへ流すスクリプトの方言（#919）。
+///
+/// 実行するシェルは [`script_pane_command`] が決めるので、**OS ではなくそのシェル**に
+/// 合わせた文法で組む必要がある。方言 enum は #873 で一本化した
+/// [`ShellDialect`] を使う（新しい判定を作らない）
+pub fn script_dialect() -> ShellDialect {
+    imp::script_dialect()
+}
+
 /// `tako:shell` 宣言（`# tako:shell: pwsh`）で指定されたシェルへコマンドを包む。
 ///
 /// **OS ではなく宣言されたシェルで決まる**ので `cfg` を持たない。判定は
@@ -120,6 +141,19 @@ mod imp {
         super::posix_run_pane_command(command, marker_prefix)
     }
 
+    pub(crate) fn script_pane_command(script: &str) -> SpawnCommand {
+        // `posix_run_pane_command` と同じ理由で `/bin/sh` 決め打ち
+        // （fish のような POSIX でないログインシェルでも成立させる）
+        SpawnCommand {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+        }
+    }
+
+    pub(crate) fn script_dialect() -> super::ShellDialect {
+        super::ShellDialect::Posix
+    }
+
     fn user_shell() -> String {
         std::env::var("SHELL")
             .ok()
@@ -162,6 +196,24 @@ mod imp {
 
     pub(crate) fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
         super::powershell_run_pane_command(&run_pane_shell(), command, marker_prefix)
+    }
+
+    pub(crate) fn script_pane_command(script: &str) -> SpawnCommand {
+        // `-EncodedCommand`（base64 / UTF-16LE）で渡す理由は
+        // `powershell_run_pane_command` の doc と同じ（引用符を解釈する層が 3 つある）
+        SpawnCommand {
+            program: run_pane_shell(),
+            args: vec![
+                "-NoLogo".to_string(),
+                "-EncodedCommand".to_string(),
+                super::encode_powershell_command(script),
+            ],
+        }
+    }
+
+    pub(crate) fn script_dialect() -> super::ShellDialect {
+        // 起こすのは必ず PowerShell（`run_pane_shell` は cmd.exe へ倒さない）
+        super::ShellDialect::PowerShell
     }
 
     /// 実行ペインを起こす PowerShell の実行ファイル。

@@ -154,6 +154,19 @@ impl TakoApp {
             }
         }
         self.filetree.set_roots(roots);
+
+        // #919: リモート（SSH 先）のルートはアクティブタブが持つものに合わせる。
+        // ローカルの `roots` とは別の器（`PathBuf` に POSIX パスを混ぜない）
+        let want: Vec<tako_core::remote_fs::RemoteRef> =
+            self.workspace.active_tab().remote_folders().to_vec();
+        let have = self.filetree.remote_roots().to_vec();
+        for gone in have.iter().filter(|r| !want.contains(r)) {
+            self.filetree.remove_remote_root(gone);
+        }
+        // タブが持つ順（新しいものが先頭）を保つため逆順に足す
+        for remote in want.iter().rev().filter(|r| !have.contains(r)) {
+            self.filetree.add_remote_root(remote.clone());
+        }
     }
     pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if !self.filetree.visible {
@@ -220,10 +233,20 @@ impl TakoApp {
                     expanded: false,
                     root: false,
                     git_status: None,
+                    remote: None,
+                    note: None,
                 },
             );
         }
         let inline_edit_snapshot = self.inline_edit.clone();
+        // #919: 期限切れの成功通知は落とす（失敗は expired() が false なので残る）
+        if self.remote_notice.as_ref().is_some_and(|n| n.expired()) {
+            self.remote_notice = None;
+        }
+        let remote_notice = self
+            .remote_notice
+            .as_ref()
+            .map(|n| (n.text.clone(), n.is_error));
         // #789: 親（root render）が渡す幅と同じ実効幅を使う（要求値ではない）
         let sidebar_w = self.effective_sidebar_width();
         let drop_highlight = self.sidebar_drop_highlight;
@@ -412,6 +435,33 @@ impl TakoApp {
                                 )
                         })),
                 )
+                // #919: リモート操作の通知（成功は数秒、失敗は次の操作まで残す）。
+                // 汎用のトーストが無いので、ユーザーが見ている場所へ出す
+                .children(remote_notice.map(|(text, is_error)| {
+                    div()
+                        .id("remote-notice")
+                        .flex_none()
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .text_size(px(11.0))
+                        .border_b_1()
+                        .border_color(hsla_alpha(theme.pane_border, 0.6))
+                        .bg(rgba_alpha(
+                            if is_error { theme.red } else { theme.green },
+                            0.12,
+                        ))
+                        .text_color(hsla(if is_error {
+                            theme.red
+                        } else {
+                            theme.foreground
+                        }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            this.remote_notice = None;
+                            cx.notify();
+                        }))
+                        .child(SharedString::from(text))
+                }))
                 .child(
                     div()
                         .id("filetree-list")
@@ -423,6 +473,14 @@ impl TakoApp {
                         .children(rows.into_iter().enumerate().map(|(index, row)| {
                             let path = row.entry.path.clone();
                             let is_dir = row.entry.is_dir;
+                            // リモート（SSH 先）の行は**ローカル FS の操作を一切通さない**
+                            // ので、インライン編集・git マーカー・D&D・Finder 系メニューの
+                            // どれにも入る前に分岐する（#919）。`entry.path` は
+                            // リモートの POSIX パスを載せた見せかけの PathBuf なので、
+                            // ここから下の `canonicalize` / `join` に触れさせない
+                            if row.remote.is_some() {
+                                return self.render_remote_row(index, &row, &theme, cx);
+                            }
                             // インライン編集中の行を検出
                             let is_inline = match &inline_edit_snapshot {
                                 Some(edit) if edit.kind == InlineEditKind::Rename => {
@@ -817,6 +875,274 @@ impl TakoApp {
                         ),
                 ),
         )
+    }
+
+    /// リモート（SSH 先）ツリーの 1 行（#919）。
+    ///
+    /// ローカル行と**別の関数**に分けているのは、ローカル行の経路にある
+    /// `canonicalize` / `join` / Finder 系メニュー / git マーカー / D&D が
+    /// リモートのパスに対して意味を持たないため。分岐を 1 か所に閉じることで
+    /// 「リモートのつもりでローカル FS を触る」事故を構造的に防ぐ
+    fn render_remote_row(
+        &self,
+        index: usize,
+        row: &filetree::Row,
+        theme: &tako_core::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let remote = row.remote.clone().expect("リモート行にだけ呼ばれる");
+        let base = div()
+            .id(("filetree-row", index as u64))
+            .flex()
+            .flex_row()
+            .items_center()
+            .py(px(1.0))
+            .when(row.depth >= 1, |d| {
+                d.ml(px(INDENT_STEP * row.depth as f32))
+                    .pl(px(14.0))
+                    .children(indent_guides(
+                        row.depth,
+                        hsla(theme.border_subtle),
+                        hsla(theme.border_subtle),
+                    ))
+            })
+            .when(row.depth == 0, |d| d.pl(px(12.0)));
+
+        // 状態行（読み込み中 / 失敗 / 空）は押せない情報行。
+        // #919 の要点: **失敗を必ず行として見せる**（黙って空にしない）
+        if let Some(note) = &row.note {
+            let (text, color) = match note {
+                filetree::RowNote::Loading => (
+                    crate::ui_text::remote_folder::row_loading().to_string(),
+                    theme.text_muted,
+                ),
+                filetree::RowNote::Empty => (
+                    crate::ui_text::remote_folder::row_empty().to_string(),
+                    theme.text_muted,
+                ),
+                filetree::RowNote::Error(report) => (report.clone(), theme.red),
+            };
+            return base.py(px(2.0)).gap(px(4.0)).child(
+                div()
+                    .flex_1()
+                    .text_size(px(11.0))
+                    .text_color(hsla(color))
+                    .child(SharedString::from(text)),
+            );
+        }
+
+        let is_dir = row.entry.is_dir;
+        let is_open = !is_dir
+            && self
+                .previews
+                .values()
+                .any(|p| self.preview_remote_origin(p).as_ref() == Some(&remote));
+        let mut el = base
+            .cursor_pointer()
+            .hover(|d| d.bg(rgba(theme.surface_hover)))
+            .on_click(cx.listener({
+                let remote = remote.clone();
+                move |this, _: &gpui::ClickEvent, _, cx| {
+                    if is_dir {
+                        this.filetree.toggle_remote_dir(&remote);
+                    } else {
+                        this.open_remote_file_row(&remote, cx);
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let remote = remote.clone();
+                    let is_root = row.root;
+                    move |this, e: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.remote_context_menu = Some(RemoteContextMenu {
+                            remote: remote.clone(),
+                            is_dir,
+                            is_root,
+                            position: e.position,
+                        });
+                        cx.notify();
+                    }
+                }),
+            )
+            .when(is_open, |d| {
+                d.bg(rgba_alpha(theme.accent, 0.13))
+                    .text_color(hsla(theme.foreground))
+            });
+
+        if row.root {
+            // リモートルート見出し: ローカルルートと同じ太字 + 仕切り線に、
+            // 「どのホストか」が一目で分かるバッジを足す
+            el = el
+                .when(index > 0, |d| {
+                    d.border_t_1()
+                        .border_color(hsla_alpha(theme.pane_border, 0.6))
+                        .mt_1()
+                })
+                .py(px(2.0))
+                .gap(px(4.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(hsla(theme.tab_active_foreground))
+                .child(
+                    svg()
+                        .path(file_icons::chevron_icon(row.expanded).svg_path())
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(hsla(theme.tab_inactive_foreground)),
+                )
+                .child(
+                    svg()
+                        .path(file_icons::ui_icon::REMOTE)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(hsla(theme.mauve)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(truncate(&row.entry.name, 24))),
+                );
+            return el;
+        }
+
+        el = el.py(px(2.0)).gap(px(4.0));
+        if is_dir {
+            let folder_color = if row.expanded {
+                theme.accent
+            } else {
+                theme.tab_inactive_foreground
+            };
+            el = el
+                .child(
+                    svg()
+                        .path(file_icons::chevron_icon(row.expanded).svg_path())
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(hsla(theme.tab_inactive_foreground)),
+                )
+                .child(
+                    svg()
+                        .path(file_icons::folder_icon(row.expanded).svg_path())
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(hsla(folder_color)),
+                );
+        } else {
+            let icon_kind = file_icons::resolve_file_icon(std::path::Path::new(&row.entry.name));
+            el = el
+                .text_color(hsla(theme.text_tertiary))
+                .child(div().w(px(14.0)).flex_none())
+                .child(
+                    svg()
+                        .path(icon_kind.svg_path())
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(hsla(theme.tab_inactive_foreground)),
+                );
+        }
+        el.child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(SharedString::from(truncate(&row.entry.name, 24))),
+        )
+    }
+
+    /// リモート行の右クリックメニュー（#919）。
+    /// ローカル用（`render_context_menu`）とは項目がまったく別物なので分ける
+    /// （Finder 表示・ゴミ箱・リネームはリモートのパスに対して意味を持たない）
+    pub(crate) fn render_remote_context_menu(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let ctx = self.remote_context_menu.as_ref()?;
+        let theme = &self.theme;
+        let remote = ctx.remote.clone();
+        let mut items: Vec<(&str, String)> = vec![(
+            "copy-path",
+            crate::ui_text::remote_folder::menu_copy_remote_path().to_string(),
+        )];
+        if ctx.is_dir {
+            items.push((
+                "ssh-pane",
+                crate::ui_text::remote_folder::menu_open_ssh_pane().to_string(),
+            ));
+            items.push((
+                "reload",
+                crate::ui_text::remote_folder::menu_reload().to_string(),
+            ));
+        }
+        if ctx.is_root {
+            items.push((
+                "close-root",
+                crate::ui_text::remote_folder::menu_close_remote_root().to_string(),
+            ));
+        }
+        // #346 と同じ規則: 画面外へ出ないよう反転・クランプする
+        let menu_width = 240.0;
+        let menu_height = 8.0 + items.len() as f32 * 22.0;
+        let adjusted = clamp_menu_position(ctx.position, menu_width, menu_height, window);
+        let menu = div()
+            .absolute()
+            .left(adjusted.x)
+            .top(adjusted.y)
+            .w(px(menu_width))
+            .py(px(4.0))
+            .bg(rgba(theme.tab_bar_background))
+            .border_1()
+            .border_color(hsla(theme.pane_border))
+            .rounded_md()
+            .text_size(px(12.0))
+            .text_color(hsla(theme.foreground))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .children(items.into_iter().enumerate().map(|(i, (id, label))| {
+                let remote = remote.clone();
+                div()
+                    .id(("remote-ctx-item", i as u64))
+                    .w_full()
+                    .px_2()
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remote_context_menu = None;
+                        this.remote_menu_action(id, &remote, cx);
+                    }))
+                    .child(SharedString::from(label))
+            }));
+        let backdrop = div()
+            .id("remote-ctx-backdrop")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.remote_context_menu = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.remote_context_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(menu);
+        Some(backdrop.into_any_element())
     }
 
     /// コンテキストメニューの描画（FR-3.12）
@@ -1244,6 +1570,121 @@ impl TakoApp {
                     PaneOrigin::User,
                 );
                 self.sync_filetree_roots();
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    // --- リモート（SSH 先）ツリーの操作（#919 / #65） -------------------------
+
+    /// このプレビューがリモート由来ならその位置
+    pub(crate) fn preview_remote_origin(
+        &self,
+        state: &crate::preview::PreviewState,
+    ) -> Option<tako_core::remote_fs::RemoteRef> {
+        self.preview_remote_origins
+            .iter()
+            .find(|(pane, _)| {
+                self.previews
+                    .get(pane)
+                    .map(|p| p.path == state.path)
+                    .unwrap_or(false)
+            })
+            .map(|(_, r)| r.clone())
+    }
+
+    /// リモートのファイル行をクリックしたときのプレビュー（#919）。
+    /// **dispatch 経由**なので CLI / MCP の `remote-folder open-file` と同じ経路
+    pub(crate) fn open_remote_file_row(
+        &mut self,
+        remote: &tako_core::remote_fs::RemoteRef,
+        cx: &mut Context<Self>,
+    ) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::RemoteFolder {
+                action: "open-file".into(),
+                host: Some(remote.host.clone()),
+                path: Some(remote.path.clone()),
+                tab: None,
+                focus: Some(true),
+                all: false,
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(_) => self.drain_pending_highlights(cx),
+            // #919: 静かに失敗させない。理由をトーストで出す
+            Err(e) => self.set_remote_notice(e.to_string(), true),
+        }
+        cx.notify();
+    }
+
+    /// リモート操作の通知を出す（#919）。失敗は自動で消さない
+    pub(crate) fn set_remote_notice(&mut self, text: String, is_error: bool) {
+        if is_error {
+            // 理由が読めなければ意味が無いので、閉じているサイドバーを開く
+            self.filetree.visible = true;
+        }
+        self.remote_notice = Some(RemoteNotice {
+            text,
+            is_error,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// リモート行の右クリックメニューの実行（#919）
+    pub(crate) fn remote_menu_action(
+        &mut self,
+        id: &str,
+        remote: &tako_core::remote_fs::RemoteRef,
+        cx: &mut Context<Self>,
+    ) {
+        match id {
+            "copy-path" => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(remote.path.clone()));
+            }
+            "reload" => {
+                self.filetree.invalidate_remote(remote);
+            }
+            "ssh-pane" => {
+                let result = tako_control::dispatch(
+                    self,
+                    tako_control::protocol::Request::RemoteFolder {
+                        action: "ssh-pane".into(),
+                        host: Some(remote.host.clone()),
+                        path: Some(remote.path.clone()),
+                        tab: None,
+                        focus: Some(true),
+                        all: false,
+                    },
+                    PaneOrigin::User,
+                );
+                if let Err(e) = result {
+                    self.set_remote_notice(e.to_string(), true);
+                }
+            }
+            "close-root" => {
+                let result = tako_control::dispatch(
+                    self,
+                    tako_control::protocol::Request::RemoteFolder {
+                        action: "close".into(),
+                        host: Some(remote.host.clone()),
+                        path: Some(remote.path.clone()),
+                        tab: None,
+                        focus: None,
+                        all: false,
+                    },
+                    PaneOrigin::User,
+                );
+                match result {
+                    Ok(_) => self.set_remote_notice(
+                        crate::ui_text::remote_folder::closed(&remote.label()),
+                        false,
+                    ),
+                    Err(e) => self.set_remote_notice(e.to_string(), true),
+                }
             }
             _ => {}
         }
@@ -1720,6 +2161,8 @@ mod tests {
             expanded: true,
             root,
             git_status: None,
+            remote: None,
+            note: None,
         }
     }
 
