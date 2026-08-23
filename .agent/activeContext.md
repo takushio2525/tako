@@ -6,6 +6,11 @@
 ## 現在の対象（2026-08-24）
 
 - **#467 Windows 移植はスライス 1〜7c / 9 が main へ入り、残りはスライス 8（棚卸し）だけ**
+- **#898（コマンド解決の `which` 決め打ち）を解消**。`which` は Windows に無いので
+  解決が例外なく `None` = tako.exe が PATH 上に居るのに「無い」ように見えていた。境界 B16
+  （`platform::exe::find`）へ寄せ、`resolve_tako_binary` の「隣」も `EXE_SUFFIX` で組む形へ。
+  **Issue の一覧より 2 箇所多かった**（`stale_binary` の複製 / 設定画面のエージェント検出）。
+  番犬は `which` / `where` の直起動をソース走査で禁止（許可リストは空）
 - **#920（項目 119 = #868 install_plan）を解消 → Windows のセルフテストが完走**
   （`TAKO_APP_SELF_TEST_OK` / exit 0 / FAILED 0・skip 19 は全部理由つきの既知）。
   原因はテスト側の unix リテラル（`claude.ai/install.sh` / `.local/bin/claude`）で、
@@ -47,9 +52,11 @@ POSIX 専用の道具 = nc・ジョブ制御・`/dev/fd`・ECHOCTL #729 / links 
 
 - **psmux の e2e / GUI セルフテストは `schtasks /it`（session 1）で回す**。SSH（session 0）で
   作った psmux の detached セッションは約 1 秒で自然死するので、測り方のせいで落ちる
-- **実機テストのベースラインは 21 件**（#920 で 1 件減った。失敗名まで照合する）。`schtasks /it` で回すと
+- **実機テストのベースラインは 22 件**（#920 で 21 へ減ったが、#919 由来の
+  `remote_fs_e2e::解決できないホストは接続前に分類される` が加わって 22。**#930** で起票済み。
+  失敗名まで照合する）。`schtasks /it` で回すと
   `psmux_backend` 16/0・`spawn_arg_quoting` 3/0・`shell_integration_powershell` 7/0・
-  `encoding_conpty` 5/0 が全緑で、残る 21 件は #583 系の POSIX 前提テスト
+  `encoding_conpty` 5/0 が全緑で、残る 21 件は #583 系の POSIX 前提テスト（+ #930 の 1 件）
 - **孤児は run のたびに掃除する**（psmux 19 / pwsh 56 まで溜めると項目 20 / 24 の固定待ちが落ちた）。
   「tako-app が 1 つも居ない」を確かめてから `-L tako-iso-*` を**明示 pid で**落とす（`-L tako` は本番）
 - **GPUI の DirectX アトラス panic**（項目 66 付近）は既知のフレーク。再実行で通る

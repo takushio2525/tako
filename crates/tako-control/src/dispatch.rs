@@ -8462,23 +8462,9 @@ fn read_mcp_registration(scope: &McpScope) -> Option<String> {
         .map(String::from)
 }
 
-/// claude CLI のパスを検出
+/// claude CLI のパスを検出（境界 B16。`which` を起こさない = #898）
 fn which_claude() -> Option<String> {
-    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(
-        std::process::Command::new("which").arg("claude"),
-    )
-    .output()
-    .ok()
-    .filter(|o| o.status.success())
-    .and_then(|o| {
-        let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if p.is_empty() {
-            None
-        } else {
-            Some(p)
-        }
-    })
+    which("claude")
 }
 
 fn setup_mcp_via_cli(
@@ -8625,24 +8611,46 @@ pub fn clean_legacy_settings_json() -> bool {
 /// MCP 登録に使う安定パス。/Applications/tako.app がある場合に最優先
 pub const STABLE_APP_BINARY: &str = "/Applications/tako.app/Contents/MacOS/tako";
 
+/// tako CLI の実行ファイル名。Windows は `tako.exe`（`EXE_SUFFIX` は空文字なので
+/// unix では従来どおり `tako`）。**`cfg` を書かずに済ませるための std 定数**
+fn tako_cli_file_name() -> String {
+    format!("tako{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// tako CLI バイナリのパスを解決する。
 /// ① /Applications/tako.app（安定パス）
-/// ② `which tako`
-/// ③ 実行中バイナリの隣（.app バンドル想定）
+/// ② 境界 B16 のコマンド解決（`which tako` 相当）
+/// ③ 実行中バイナリの隣（.app バンドル / zip 展開想定）
 /// ④ フォールバック "tako"
 pub fn resolve_tako_binary() -> String {
-    if std::path::Path::new(STABLE_APP_BINARY).is_file() {
+    resolve_tako_binary_with(
+        &|p| std::path::Path::new(p).is_file(),
+        &|| which("tako"),
+        std::env::current_exe().ok().as_deref(),
+        &tako_cli_file_name(),
+    )
+}
+
+/// [`resolve_tako_binary`] の判定順（純粋関数。**macOS 上から Windows の形も検査できる**）。
+///
+/// ③ を `cfg` ではなく `file_name` の引数で表すのが要点。旧実装は `dir.join("tako")`
+/// 決め打ちで、Windows の隣は `tako.exe` なので**常に空振り**していた（#898）
+fn resolve_tako_binary_with(
+    is_file: &dyn Fn(&str) -> bool,
+    resolve_in_path: &dyn Fn() -> Option<String>,
+    current_exe: Option<&std::path::Path>,
+    file_name: &str,
+) -> String {
+    if is_file(STABLE_APP_BINARY) {
         return STABLE_APP_BINARY.to_string();
     }
-    if let Some(path) = which("tako") {
+    if let Some(path) = resolve_in_path() {
         return path;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("tako");
-            if sibling.is_file() {
-                return sibling.display().to_string();
-            }
+    if let Some(dir) = current_exe.and_then(std::path::Path::parent) {
+        let sibling = dir.join(file_name).display().to_string();
+        if is_file(&sibling) {
+            return sibling;
         }
     }
     "tako".to_string()
@@ -8690,9 +8698,12 @@ fn check_health(host: &dyn ControlHost) -> Value {
     let app_version = env!("CARGO_PKG_VERSION").to_string();
     let mut issues: Vec<Value> = Vec::new();
 
-    // tako CLI が PATH に通っているか。
-    // ここで見るのは tako-app のプロセス環境（Dock 起動だと最小構成）なので、
-    // 「tako 内のシェルから打てるか」とは別物である点に注意（#601）
+    // tako CLI が PATH に通っているか。境界 B16 経由なので、見ているのは
+    // **ログインシェル（= 外部ターミナル）から引けるか**（Windows は PATH + `PATHEXT` +
+    // ユーザーが入れがちな場所）。下の案内が「外部ターミナルでも使いたい場合は」と
+    // 言っているのと同じ地平で測る。#898 より前は `which` をプロセス PATH で叩いていたので
+    // Dock 起動では常に「無い」に見え、Windows では `which` 自体が無く必ず失敗していた。
+    // 「tako 内のシェルから打てるか」は別物（そちらは `injected_cli_dir` が答える。#601）
     let cli_path = which("tako");
     let cli_in_path = cli_path.is_some();
     // #601: tako が開くシェルへ自動注入している CLI ディレクトリ（解決できなければ null）
@@ -8812,15 +8823,15 @@ fn home_dir() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// コマンド名から実行ファイルを解決する（境界 B16 = [`tako_core::platform::exe::find`]）。
+///
+/// **`which` コマンドを起こしてはいけない**（#898）。`which` は Windows に存在せず、
+/// 旧実装は Windows で例外なく `None` を返していた（tako.exe が PATH 上に居ても
+/// tako 自身には「無い」ように見える状態）。境界は unix ではログインシェル経由の
+/// `command -v`（`.app` を Dock から起動したときの痩せた PATH でも解決できる）、
+/// Windows では PATH + `PATHEXT` + ユーザーが入れがちな場所の走査（サブプロセスなし）。
 fn which(name: &str) -> Option<String> {
-    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(std::process::Command::new("which").arg(name))
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    tako_core::platform::exe::find(name)
 }
 
 /// 対象ペインが動画プレビューであることを確かめる（#484）
@@ -16543,6 +16554,99 @@ mod tests {
         // /Applications/tako.app が存在する場合のみこのテストが意味を持つ
         if std::path::Path::new(STABLE_APP_BINARY).is_file() {
             assert_eq!(resolve_tako_binary(), STABLE_APP_BINARY);
+        }
+    }
+
+    // --- #898: 解決順を純粋関数で固定する（**macOS 上から Windows の形も検査できる**）---
+
+    /// 与えた集合だけを「実在するファイル」と見なす判定
+    fn only_files(files: &[&str]) -> impl Fn(&str) -> bool + use<> {
+        let owned: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+        move |p: &str| owned.iter().any(|f| f == p)
+    }
+
+    #[test]
+    fn 解決順は安定パスが最優先() {
+        let got = resolve_tako_binary_with(
+            &only_files(&[STABLE_APP_BINARY, "/usr/local/bin/tako"]),
+            &|| Some("/usr/local/bin/tako".to_string()),
+            Some(std::path::Path::new("/tmp/bundle/tako-app")),
+            "tako",
+        );
+        assert_eq!(got, STABLE_APP_BINARY);
+    }
+
+    #[test]
+    fn 安定パスが無ければコマンド解決が隣より優先() {
+        let got = resolve_tako_binary_with(
+            &only_files(&["/tmp/bundle/tako"]),
+            &|| Some("/opt/homebrew/bin/tako".to_string()),
+            Some(std::path::Path::new("/tmp/bundle/tako-app")),
+            "tako",
+        );
+        assert_eq!(got, "/opt/homebrew/bin/tako");
+    }
+
+    #[test]
+    fn コマンド解決が空振りしたら実行中バイナリの隣を見る() {
+        // 期待値は**同じ `join` から作る**。`Path::join` の区切りは実行中 OS のもの
+        // （Windows は `\`）なので、連結後の形をリテラルで書くと実機だけ落ちる
+        // （#920 と同じ型の罠。実際にこのテストで Windows 実機を 1 度落とした）
+        let dir = std::path::Path::new("/tmp/tako-898-fixture");
+        let exe = dir.join("tako-app");
+        let sibling = dir.join("tako").display().to_string();
+        let got = resolve_tako_binary_with(
+            &only_files(&[sibling.as_str()]),
+            &|| None,
+            Some(&exe),
+            "tako",
+        );
+        assert_eq!(got, sibling);
+    }
+
+    /// **#898 の本体**: 旧実装は隣を `tako`（拡張子なし）決め打ちで探していたので、
+    /// zip 展開だけで導入した Windows では**常に空振りして裸の `tako`** へ落ちていた
+    /// （スターター #694 / welcome バナー #549 が PATH 依存のコマンドを書く原因）。
+    /// `EXE_SUFFIX` を渡す形にしたので `tako.exe` を見つける
+    #[test]
+    fn 実行ファイル名が拡張子つきかどうかで隣の見つかり方が変わる() {
+        // 区切り文字は**実行中 OS のもの**を使う（`Path` は unix では `\` を区切りと
+        // 見ないので、Windows 形のリテラルを macOS から検査することはできない）。
+        // 期待値も同じ `join` で作るので、両プラットフォームで同じ検査になる
+        let dir = std::path::Path::new("/tmp/tako-898-fixture");
+        let exe = dir.join("tako-app.exe");
+        let sibling = dir.join("tako.exe").display().to_string();
+        let files = only_files(&[sibling.as_str()]);
+        // 新: 名前に拡張子が付いているので隣が見つかる
+        assert_eq!(
+            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako.exe"),
+            sibling
+        );
+        // 旧（拡張子なし決め打ち）は空振りして裸の `tako` に落ちる = 直った差分の実証。
+        // Windows の隣は `tako.exe` なので、旧実装はこの枝を必ず通っていた
+        assert_eq!(
+            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako"),
+            "tako"
+        );
+    }
+
+    #[test]
+    fn どれも無ければ裸のtako() {
+        let got = resolve_tako_binary_with(&only_files(&[]), &|| None, None, "tako");
+        assert_eq!(got, "tako");
+    }
+
+    /// 実行中の OS に合った実行ファイル名を組み立てていること
+    /// （unix は拡張子なし / Windows は `.exe`）
+    #[test]
+    fn cli実行ファイル名はプラットフォームの拡張子を持つ() {
+        let name = tako_cli_file_name();
+        assert!(name.starts_with("tako"));
+        assert_eq!(name, format!("tako{}", std::env::consts::EXE_SUFFIX));
+        if cfg!(windows) {
+            assert_eq!(name, "tako.exe");
+        } else {
+            assert_eq!(name, "tako");
         }
     }
 
