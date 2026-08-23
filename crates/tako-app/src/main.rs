@@ -8060,22 +8060,30 @@ impl TakoApp {
                     return false;
                 };
                 // 実体パスで組み立てるので tako が PATH に無い zip 配布でも動く（#549）
-                let line = format!("{}\n", tako_control::welcome::launch_command_line(&sub));
-                match self.terminals.get(&pane_id) {
-                    Some(session) => {
-                        session.write(line.into_bytes());
-                        // #720: エージェント起動はチャット確定まで数秒〜十数秒かかる。
-                        // その間にシェルの実行中画面（起動ログ・claude の起動途中）を
-                        // 見せないよう、押した瞬間から過渡期を張り直す
-                        if action.expects_chat() {
-                            self.begin_pane_settle(pane_id, tako_core::ui_mode::SettleKind::Agent);
+                let line = tako_control::welcome::launch_command_line(&sub);
+                if self.terminals.contains_key(&pane_id) {
+                    // #899: 生の `session.write(… + "\n")` はやらない。行末 LF は
+                    // PowerShell の PSReadLine が継続行（`>>`）にするのでコマンドが
+                    // 確定せず、押しても何も起きなかった（#897 で実測）。#640 の
+                    // 送達確認つき経路（CR 送出・シェル準備待ち・エコー確認）へ寄せる
+                    if std::env::var_os("TAKO_899_LEGACY").is_some() {
+                        // A/B: #899 以前の生 write + LF
+                        if let Some(session) = self.terminals.get(&pane_id) {
+                            session.write(format!("{line}\n").into_bytes());
                         }
-                        true
+                    } else {
+                        self.queue_command_flow(pane_id, line);
                     }
-                    None => {
-                        eprintln!("warning: ペイン {} のシェルが無い", pane_id.as_u64());
-                        false
+                    // #720: エージェント起動はチャット確定まで数秒〜十数秒かかる。
+                    // その間にシェルの実行中画面（起動ログ・claude の起動途中）を
+                    // 見せないよう、押した瞬間から過渡期を張り直す
+                    if action.expects_chat() {
+                        self.begin_pane_settle(pane_id, tako_core::ui_mode::SettleKind::Agent);
                     }
+                    true
+                } else {
+                    eprintln!("warning: ペイン {} のシェルが無い", pane_id.as_u64());
+                    false
                 }
             }
         };
@@ -8146,10 +8154,7 @@ impl TakoApp {
         tab_title: &str,
         cx: &mut Context<Self>,
     ) {
-        let line = format!(
-            "{}\n",
-            tako_control::welcome::launch_command_line(subcommand)
-        );
+        let line = tako_control::welcome::launch_command_line(subcommand);
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
         self.workspace.create_tab(tab_title.to_string(), pane);
@@ -8158,8 +8163,16 @@ impl TakoApp {
             self.remove_pane(pane_id, cx);
             return;
         }
-        if let Some(session) = self.terminals.get(&pane_id) {
-            session.write(line.into_bytes());
+        // #899: 新しいペインは器（psmux）が起動直後の入力を落とすことがあるので、
+        // 生 write ではなく #640 の送達確認つき経路へ積む（行末も CR になる）
+        if self.terminals.contains_key(&pane_id) {
+            if std::env::var_os("TAKO_899_LEGACY").is_some() {
+                if let Some(session) = self.terminals.get(&pane_id) {
+                    session.write(format!("{line}\n").into_bytes());
+                }
+            } else {
+                self.queue_command_flow(pane_id, line);
+            }
         }
         self.scroll_active_tab_into_view();
         self.sync_filetree_roots();
@@ -41324,63 +41337,112 @@ mod self_test {
                     let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
                 }
 
-                // (d) 「AI チームに任せる」押下 → そのペインのシェルへコマンド行が届く。
+                // (d1) 「AI チームに任せる」押下 → そのペインへ #640 の送達フローが積まれ、
+                // 行は**方言に合った実行される形**になっている。
                 //
-                // 期待値は**製品が組んだ行そのもの**（`welcome::launch_command_line`）から
-                // 作る。`tako master` 決め打ちだと実体パスの引用形の差で外れる:
-                // POSIX は `/…/tako master` だが、Windows のパスは `:` と `\` を含むので
-                // 引用されて `'C:\…\tako.exe' master` になる（#889 で実測）。
-                // ディレクトリ部分を落として「実行ファイル名以降」で突き合わせるので、
-                // macOS では従来と同じ `tako master` を探すまま Windows でも成立する。
-                // なお (d) が見るのは**届いたか**で、届いた行が実行されるかは見ていない
-                // （echo ペインは行を実行しないので構造的に見られない）
+                // #899 まではここで生 write（本文 + LF）していたので「届いたか」しか
+                // 見られなかった。LF は PowerShell の PSReadLine が継続行にするので
+                // **届いても実行されない**（#897 で実測）= 届いた事実は安心の材料に
+                // ならなかった。いまは送達確認つき経路（CR 送出・エコー確認）に積むので、
+                // ここでは「積まれたか + 行の形」を見て、実行そのものは (d2) で見る
                 let launch_line = tako_control::welcome::launch_command_line("master");
-                let expected_delivery = launch_line
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(launch_line.as_str())
-                    .to_string();
+                let dialect_line = tako_control::welcome::launch_command_line_in(sh, "master");
                 println!(
-                    "selftest 93d: launch_line={launch_line:?} expected={expected_delivery:?}"
+                    "selftest 93d: launch_line={launch_line:?} dialect={:?} line={dialect_line:?}",
+                    sh.label()
                 );
                 let clicked = window
                     .update(cx, |app, _, cx| {
                         app.starter_action(echo_pane, StarterAction::Master, cx)
                     })
                     .unwrap_or(false);
-                let mut delivered = false;
-                for _ in 0..40 {
-                    wait(cx, 100).await;
-                    delivered = window
+                let queued = window
+                    .update(cx, |app, _, _| {
+                        app.command_flows.iter().any(|c| c.pane == echo_pane)
+                    })
+                    .unwrap_or(false);
+                // 積んだ `tako master` はここでは走らせない（エコーペインは実行しないが、
+                // 30 秒後に本文が書かれると後続の判定を汚すので取り下げる）
+                window
+                    .update(cx, |app, _, _| {
+                        app.command_flows.retain(|c| c.pane != echo_pane)
+                    })
+                    .ok();
+                // 実行される形か: POSIX は素のパス、PowerShell は素のパスか呼び出し演算子つき
+                let executable_form = if sh.is_posix() {
+                    !dialect_line.starts_with('\'')
+                } else {
+                    !dialect_line.starts_with('\'') || dialect_line.starts_with("& ")
+                };
+                if !(clicked && queued && executable_form) {
+                    eprintln!(
+                        "TAKO_SELF_TEST_694d: clicked={clicked} queued={queued} \
+                         executable_form={executable_form} line={dialect_line:?}"
+                    );
+                }
+                check(
+                    clicked && queued && executable_form,
+                    "スターターの「AI チームに任せる」が送達確認つき経路へ実行できる形で積む (#694 / #899)",
+                );
+
+                // (d2) **#899 の本体**: `launch_command_line` が組んだ行を同じ経路で
+                // 実シェルへ流すと**実際に実行される**。押しても何も起きない
+                // （PowerShell がクォート付き文字列を式として評価する / LF で確定しない）
+                // のが #899 の症状だったので、届いたかではなく**走ったか**を見る。
+                //
+                // `tako master` はエージェントを起こしてしまうので `--version` を使う。
+                // 出力は `tako 0.7.6` の形で、**エコーされたコマンド行には現れない**
+                // （あちらは `…/tako --version` = `tako` の次が `-`）ので、
+                // 空白を落とした画面から「`tako` の直後が数字」を探せば実行の証拠になる
+                let version_line = tako_control::welcome::launch_command_line("--version");
+                println!("selftest 93d2: version_line={version_line:?}");
+                window
+                    .update(cx, |app, _, _| {
+                        app.queue_command_flow(base, version_line.clone())
+                    })
+                    .ok();
+                let ran_marker = |screen: &str| {
+                    let squashed: String =
+                        screen.chars().filter(|c| !c.is_whitespace()).collect();
+                    squashed.match_indices("tako").any(|(i, _)| {
+                        squashed[i + 4..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit())
+                    })
+                };
+                let mut ran = false;
+                for _ in 0..120 {
+                    wait(cx, 250).await;
+                    ran = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&echo_pane)
-                                .map(|s| s.visible_lines().join(""))
-                                .unwrap_or_default()
-                                .contains(&expected_delivery)
+                                .get(&base)
+                                .map(|s| ran_marker(&s.visible_lines().join("\n")))
+                                .unwrap_or(false)
                         })
                         .unwrap_or(false);
-                    if delivered {
+                    if ran {
                         break;
                     }
                 }
-                if !delivered {
+                if !ran {
                     let screen = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&echo_pane)
+                                .get(&base)
                                 .map(|s| s.visible_lines().join("|"))
                                 .unwrap_or_else(|| "<ペインなし>".to_string())
                         })
                         .unwrap_or_default();
                     eprintln!(
-                        "TAKO_SELF_TEST_694d: clicked={clicked} expected={expected_delivery:?} \
-                         line={launch_line:?} screen={screen:?}"
+                        "TAKO_SELF_TEST_899: line={version_line:?} dialect={} screen={screen:?}",
+                        sh.label()
                     );
                 }
                 check(
-                    clicked && delivered,
-                    "スターターの「AI チームに任せる」で対象ペインへ tako master が届く (#694)",
+                    ran,
+                    "スターターが組む行は実シェルで実際に実行される (#899)",
                 );
 
                 // (e) 「コマンド入力へ」= 揮発解除 → そのペインだけターミナル表示。

@@ -65,22 +65,45 @@ pub const MASTER_COMMAND: &str = "tako master";
 /// 組み立てることで、PATH の状態に関係なくボタンが必ず動く。
 /// 案内文（バナーの本文）は `SETUP_COMMAND` / `MASTER_COMMAND` の最簡形のままにする
 pub fn launch_command_line(subcommand: &str) -> String {
+    // A/B: `TAKO_899_LEGACY=1` で #899 以前（POSIX 決め打ちのクォート）へ戻す。
+    // 同一バイナリで実機の before/after を取るための逃げ道
+    if std::env::var_os("TAKO_899_LEGACY").is_some() {
+        let bin = crate::dispatch::resolve_tako_binary();
+        let safe = !bin.is_empty()
+            && bin
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b));
+        let quoted = if safe {
+            bin
+        } else {
+            format!("'{}'", bin.replace('\'', r"'\''"))
+        };
+        return format!("{quoted} {subcommand}");
+    }
+    launch_command_line_in(default_dialect(), subcommand)
+}
+
+/// 方言を明示する版（**macOS 上から PowerShell 形も検査できる**）。
+///
+/// #899: 旧実装は POSIX 決め打ちのクォート 1 本で、Windows の絶対パスを
+/// `'C:\…\tako.exe'` と囲んでいた。PowerShell は引用符付き文字列を式として
+/// 評価するので実行されずそのまま表示される。境界
+/// [`tako_core::platform::shell_dialect::ShellDialect::command_word`] へ寄せた
+pub fn launch_command_line_in(
+    dialect: tako_core::platform::shell_dialect::ShellDialect,
+    subcommand: &str,
+) -> String {
     format!(
         "{} {subcommand}",
-        shell_quote(&crate::dispatch::resolve_tako_binary())
+        dialect.command_word(&crate::dispatch::resolve_tako_binary())
     )
 }
 
-/// POSIX シェル向けの最小クォート。安全な文字だけなら素のまま返す
-fn shell_quote(s: &str) -> String {
-    let safe = !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b));
-    if safe {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
+/// ペインの既定シェルの方言。判定できないシェル（cmd.exe / fish）は POSIX へ倒す
+/// （#867 / #873 の起動コマンドと同じ方針）
+pub fn default_dialect() -> tako_core::platform::shell_dialect::ShellDialect {
+    tako_core::platform::shell_dialect::for_default_shell()
+        .unwrap_or(tako_core::platform::shell_dialect::ShellDialect::Posix)
 }
 
 #[cfg(test)]
@@ -148,20 +171,59 @@ mod tests {
     }
 
     #[test]
-    fn shell_quoteは安全な文字をそのまま通す() {
+    fn posixのコマンド語は安全な文字をそのまま通す() {
+        use tako_core::platform::shell_dialect::ShellDialect::Posix;
         assert_eq!(
-            shell_quote("/Applications/tako.app/Contents/MacOS/tako"),
+            Posix.command_word("/Applications/tako.app/Contents/MacOS/tako"),
             "/Applications/tako.app/Contents/MacOS/tako"
         );
-        assert_eq!(shell_quote("tako"), "tako");
+        assert_eq!(Posix.command_word("tako"), "tako");
     }
 
     #[test]
-    fn shell_quoteは空白とクォートを閉じ込める() {
-        assert_eq!(shell_quote("/My Apps/tako"), "'/My Apps/tako'");
-        assert_eq!(shell_quote("/a'b/tako"), r"'/a'\''b/tako'");
+    fn posixのコマンド語は空白とクォートを閉じ込める() {
+        use tako_core::platform::shell_dialect::ShellDialect::Posix;
+        assert_eq!(Posix.command_word("/My Apps/tako"), "'/My Apps/tako'");
+        assert_eq!(Posix.command_word("/a'b/tako"), r"'/a'\''b/tako'");
         // シェル注入に使える文字はクォートの内側へ入る
-        assert_eq!(shell_quote("/x; rm -rf /"), "'/x; rm -rf /'");
+        assert_eq!(Posix.command_word("/x; rm -rf /"), "'/x; rm -rf /'");
+    }
+
+    /// **#899 の本体**: PowerShell では `:` と `\` を素で通し、囲むときは
+    /// 呼び出し演算子を付ける（囲むだけだと実行されずに表示される）
+    #[test]
+    fn powershellのコマンド語は実行される形になる() {
+        use tako_core::platform::shell_dialect::ShellDialect::{Posix, PowerShell};
+        // 典型的な Windows の絶対パスは素で通る = 最簡形（#322）
+        assert_eq!(
+            PowerShell.command_word(r"C:\Users\u\tako\tako.exe"),
+            r"C:\Users\u\tako\tako.exe"
+        );
+        // 旧実装（POSIX 決め打ち）は同じパスを囲んでしまい実行されない
+        assert_eq!(
+            Posix.command_word(r"C:\Users\u\tako\tako.exe"),
+            r"'C:\Users\u\tako\tako.exe'"
+        );
+        // 空白入りは囲むが、呼び出し演算子を付けるので実行される
+        assert_eq!(
+            PowerShell.command_word(r"C:\Program Files\tako\tako.exe"),
+            r"& 'C:\Program Files\tako\tako.exe'"
+        );
+        // `$` を含むパスは二重引用符だと展開されるので単引用符（リテラル）で囲む
+        assert_eq!(
+            PowerShell.command_word(r"C:\Users\a$b\tako.exe"),
+            r"& 'C:\Users\a$b\tako.exe'"
+        );
+    }
+
+    #[test]
+    fn 起動コマンド行は方言で組み立てる() {
+        use tako_core::platform::shell_dialect::ShellDialect::{Posix, PowerShell};
+        for d in [Posix, PowerShell] {
+            let line = launch_command_line_in(d, "master");
+            assert!(line.ends_with(" master"), "{d:?}: {line}");
+            assert!(!line.starts_with(' '), "{d:?}: バイナリ部が空: {line}");
+        }
     }
 
     #[test]
