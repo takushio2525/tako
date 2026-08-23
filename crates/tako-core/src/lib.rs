@@ -15,6 +15,7 @@ pub mod i18n;
 pub mod limit_resume;
 pub mod links;
 pub mod md_links;
+pub mod migration;
 pub mod osc_sink;
 pub mod osc_tap;
 pub mod pane;
