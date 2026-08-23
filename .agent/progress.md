@@ -2757,3 +2757,28 @@
   （器の拒否でペインが消えたときに疑似 TUI 側を疑わせない）
 - 次の壁は **#913 へ起票**（項目 116 = #835。`self_test::file_url` と
   `open_files::file_url_to_path` が**両方 POSIX パス前提** = 器とも符号化とも無関係）
+
+## 2026-08-23（#916: 設定ファイルのスキーマ変更を常に自動マイグレーションへ + 棚卸しの是正）
+- 機構を `tako-core::migration` に新設（版数の番地 / 手順の登録 / 退避規約 / 可視化）。**冪等性は
+  「移行した記録」を持たず内容から判定**する形にした（#513 の設定共有では記録方式が必ずズレる）。
+  一度だけの移行（#27 の `[1m]` 除去 = #67 で「ユーザーが戻す自由」がある）の印は**退避ファイルの
+  存在**で持ち、旧機構の印 `.backup-1m` も認める
+- 登録簿 `tako-control::migrations` に永続ファイル **18 種別を全部**載せ、発火を二段構え
+  （`tako setup` / GUI 起動・master 起動・dispatch の実行時検知）へ一本化。#27 の移行が
+  3 か所から呼ばれていたのを 1 本にした。`tako migrate` + MCP `tako_migrate`（138 ツール）は
+  **ローカル処理**（壊れた設定で GUI が起動しないときの復旧手段なので IPC 非依存が本質）
+- 棚卸し（git 履歴の削除フィールド機械抽出 + 本番実ファイルのキー全走査）で 5 件を是正:
+  ①`settings.json` の破損が黙って既定値になり直後の save が `theme_colors` 等を消していた
+  ②`recent.json` 同型 ③`~/.claude.json` を**空 map から書き直して** MCP 登録・信頼済みフォルダを
+  消しうる経路 ④`instances/control-*.json` の残骸 160 件（**ソケット固定パス化（6/23）の副作用**で
+  socket 判定が常に true。残骸の最古 mtime が同日）→ pid 生存判定へ ⑤**テストが本番 profiles へ
+  書いていた**（`_tako_822_set_.yaml`。隔離が `OnceLock` の実行順依存）→ `config_dir()` を
+  cfg(test) で必ず隔離
+- 規約は AGENTS.md + `.agent/conventions.md`、検出は `tests/migration_registry.rs` の 3 本
+  （網羅 / カタログとの対応 / **永続構造体の指紋スナップショット**）。設計記録は
+  `.agent/plans/2026-08-config-migration.md`
+- 検証: fmt / clippy（両 feature）/ test 2514 passed / クロスチェック 警告 10（全件が既存コード）/
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 122 新設）/ 隔離実測で setup 発火・実行時発火・
+  冪等・保全 / **Windows 実機**でテスト 54 本 + CLI e2e（GUI 無しで動くことも確認）/
+  検出力 4 通りの revert で FAILED を実測
+- 関連: PR #923（Closes #916）
