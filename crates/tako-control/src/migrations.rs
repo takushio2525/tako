@@ -439,9 +439,7 @@ pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
 }
 
 fn migrate_one(spec: &SchemaSpec, path: &Path, mode: Mode) -> FileReport {
-    // 無いファイルはロックも取らない。`config_io` のロックファイルは意図的に
-    // 消さない設計なので、ここで無条件に取ると使っていない機能の `.lock` が
-    // データディレクトリに散る（実測で 3 個作ってしまった）
+    // 無いファイルは触らない
     if !path.exists() {
         return FileReport {
             id: spec.id,
@@ -449,29 +447,40 @@ fn migrate_one(spec: &SchemaSpec, path: &Path, mode: Mode) -> FileReport {
             outcome: FileOutcome::Absent,
         };
     }
-    match mode {
-        Mode::Apply => {
-            // 排他ロックは書く可能性があるときだけ取る（読み取りは rename により常に完全）
-            let _lock = crate::config_io::lock_exclusive(path).ok();
-            migration::migrate_file(spec, path, &ConfigIo)
-        }
-        Mode::Check => {
-            let mut report = migration::migrate_file(spec, path, &ReadOnlyIo);
-            // Check では退避もしないので、結果の言い回しを「これから移行する」へ寄せる
-            if let FileOutcome::Failed { .. } = report.outcome {
-                if let Ok(Some(text)) = migration::FsIo.read(path) {
-                    let from = (spec.detect)(&text);
-                    report.outcome = FileOutcome::Migrated {
-                        from,
-                        to: spec.target_version,
-                        backup: migration::backup_path(path, from),
-                        applied: pending_notes(spec, from),
-                    };
-                }
-            }
-            report
+    // **まず読み取りだけで判定する**。`config_io` のロックファイルは
+    // 「消すと排他が破れる」ので削除できない設計（#169）。だから
+    // **書く必要があると分かってから**しか取ってはいけない。
+    // 無条件に取ると、全ファイルが最新のときでも起動のたびに `.lock` が増える
+    // （実測: 本番のデータディレクトリに 167 個作ってしまった。うち 160 個は
+    // `instances/control-*.json` の分）
+    let dry = dry_run(spec, path);
+    if mode == Mode::Check || !dry.outcome.changed() {
+        return dry;
+    }
+    // ここから先だけロックを取る（他プロセスの read-modify-write と直列化）。
+    // ロックの下でもう一度読み直すので、待っている間に別プロセスが移行を
+    // 済ませていれば `migrate_file` が「もう当たっている」と判断して何もしない
+    let _lock = crate::config_io::lock_exclusive(path).ok();
+    migration::migrate_file(spec, path, &ConfigIo)
+}
+
+/// 書かずに「何が起きるか」を出す。`ReadOnlyIo` は `write` を必ず失敗させるので、
+/// 退避しようとした時点で `Failed` になる。それは**移行が必要**という意味なので
+/// 「これから移行する」へ言い換える
+fn dry_run(spec: &SchemaSpec, path: &Path) -> FileReport {
+    let mut report = migration::migrate_file(spec, path, &ReadOnlyIo);
+    if let FileOutcome::Failed { .. } = report.outcome {
+        if let Ok(Some(text)) = migration::FsIo.read(path) {
+            let from = (spec.detect)(&text);
+            report.outcome = FileOutcome::Migrated {
+                from,
+                to: spec.target_version,
+                backup: migration::backup_path(path, from),
+                applied: pending_notes(spec, from),
+            };
         }
     }
+    report
 }
 
 /// `from` から目標までに当たる手順の説明（Check モードの表示用）
@@ -977,6 +986,67 @@ mod tests {
         assert!(
             !migration::quarantine_path(&path).exists(),
             "写しを作ってはいけない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **最新のファイルには `.lock` を作らない**（#916 の自省）。
+    /// `config_io` のロックファイルは「消すと排他が破れる」ので削除できない設計。
+    /// だから書く必要があると分かるまで取ってはいけない。無条件に取っていた結果、
+    /// 本番のデータディレクトリへ 167 個の空ロックを作ってしまった
+    #[test]
+    fn 最新のファイルにはロックを作らない() {
+        let dir = temp_dir("no-lock");
+        // 既に新形式のプロファイル（移行の必要なし）
+        let up_to_date = dir.join("default.yaml");
+        std::fs::write(&up_to_date, "effort: high\n").expect("書ける");
+        let spec = profiles_spec();
+        let report = migrate_one(spec, &up_to_date, Mode::Apply);
+        assert!(
+            matches!(report.outcome, FileOutcome::UpToDate { .. }),
+            "{report:?}"
+        );
+        assert!(
+            !dir.join("default.yaml.lock").exists(),
+            "最新のファイルにロックを作ってはいけない"
+        );
+
+        // 読めないファイルもロックを作らない（書き換えないので）
+        let broken = dir.join("broken.yaml");
+        std::fs::write(&broken, "model: [x\n").expect("書ける");
+        let _ = migrate_one(spec, &broken, Mode::Apply);
+        assert!(
+            !dir.join("broken.yaml.lock").exists(),
+            "読めないファイルにロックを作ってはいけない"
+        );
+
+        // 無いファイルもロックを作らない
+        let absent = dir.join("absent.yaml");
+        assert_eq!(
+            migrate_one(spec, &absent, Mode::Apply).outcome,
+            FileOutcome::Absent
+        );
+        assert!(!dir.join("absent.yaml.lock").exists());
+
+        // 確認モードは旧形式でもロックを作らない
+        let legacy = dir.join("legacy.yaml");
+        std::fs::write(
+            &legacy,
+            format!("model: {}\n", crate::orchestrator::LEGACY_DEFAULT_MODEL),
+        )
+        .expect("書ける");
+        let checked = migrate_one(spec, &legacy, Mode::Check);
+        assert!(checked.outcome.changed(), "移行が要ると分かる: {checked:?}");
+        assert!(
+            !dir.join("legacy.yaml.lock").exists(),
+            "確認モードでロックを作ってはいけない"
+        );
+
+        // 実際に移行するときだけロックを取る（そのときは残っていてよい = config_io の規約）
+        assert!(migrate_one(spec, &legacy, Mode::Apply).outcome.changed());
+        assert!(
+            dir.join("legacy.yaml.lock").exists(),
+            "書くときは排他を取る"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
