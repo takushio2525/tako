@@ -4590,6 +4590,12 @@ fn dispatch_inner(
             }
         }
 
+        // 移行はファイル操作だけで完結する（GUI の状態に触らない）。
+        // GUI が壊れた設定で起動できない状況でも CLI から同じ経路が使えることが本質
+        Request::Migrate { action, schema } => {
+            crate::migrations::report_json(action.as_deref().unwrap_or("status"), schema.as_deref())
+                .map_err(DispatchError::InvalidParams)
+        }
         Request::Welcome { action } => {
             let action = action.as_deref().unwrap_or("status");
             match action {
@@ -8531,7 +8537,22 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchE
         let content = std::fs::read_to_string(&path).map_err(|e| {
             DispatchError::Operation(format!("{} の読み取りに失敗: {e}", path.display()))
         })?;
-        serde_json::from_str(&content).unwrap_or_default()
+        // **既定値へ落として書き戻してはいけない**（#916）: ここは claude 自身の
+        // 設定ファイル（`~/.claude.json` / `.mcp.json`）で、空 map から書き直すと
+        // 利用者の MCP 登録・信頼済みフォルダ・履歴がまとめて消える。
+        // 読めないなら手を出さず理由を返す（旧実装は unwrap_or_default で全消しだった）。
+        // 中身が空（`touch` しただけ）のときだけは失うものが無いので新規扱いにする
+        if content.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            serde_json::from_str(&content).map_err(|e| {
+                DispatchError::Operation(format!(
+                    "{} を JSON として解釈できないので書き換えを中止した（{e}）。\
+                     内容を直すか退避してからやり直してください",
+                    path.display()
+                ))
+            })?
+        }
     } else {
         serde_json::Map::new()
     };
@@ -9534,7 +9555,9 @@ fn resolve_caller_profile_with_role(
     caller: Option<PaneId>,
     role_suffix: &Option<String>,
 ) -> crate::orchestrator::Profile {
-    let _ = crate::orchestrator::migrate_legacy_default_profile();
+    // 旧形式のプロファイル・設定を実行時に検知して直す（#916 の二段構え 2 段目）。
+    // 1 プロセス 1 回しか実際には走らないので、この頻繁な経路から呼んでも軽い
+    let _ = crate::migrations::ensure_migrated();
     let suffix = role_suffix
         .clone()
         .or_else(|| caller.and_then(|pid| find_master_suffix_from(workspace, pid)))
@@ -16401,6 +16424,44 @@ mod tests {
         let scope = McpScope::Project(dir.clone());
         let cmd = read_mcp_registration(&scope);
         assert_eq!(cmd, Some(exe.display().to_string()));
+    }
+
+    /// #916: 壊れた JSON は**上書きしない**。旧実装は unwrap_or_default で
+    /// 空 map から書き直し、利用者の MCP 登録・信頼済みフォルダ・履歴を消していた
+    #[test]
+    fn setup_mcp_direct_壊れたjsonは書き換えない() {
+        let dir = mcp_test_dir("direct-broken");
+        let target = dir.join(".mcp.json");
+        let broken = "{ \"mcpServers\": { \"other\": ";
+        std::fs::write(&target, broken).unwrap();
+        let scope = McpScope::Project(dir.clone());
+        let err =
+            setup_mcp_direct("/usr/local/bin/tako", &scope).expect_err("壊れた JSON では中止する");
+        assert!(
+            format!("{err:?}").contains("解釈できない"),
+            "理由を返す: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            broken,
+            "1 バイトも触らない"
+        );
+    }
+
+    /// 中身が空のファイル（`touch` しただけ）は失うものが無いので新規扱いにする
+    #[test]
+    fn setup_mcp_direct_空ファイルは新規扱い() {
+        let dir = mcp_test_dir("direct-empty");
+        let target = dir.join(".mcp.json");
+        std::fs::write(&target, "  \n").unwrap();
+        let scope = McpScope::Project(dir.clone());
+        setup_mcp_direct("/usr/local/bin/tako", &scope).expect("空なら登録できる");
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            "/usr/local/bin/tako"
+        );
     }
 
     #[test]

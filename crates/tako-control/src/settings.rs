@@ -259,10 +259,42 @@ pub fn load() -> Settings {
         .unwrap_or_default()
 }
 
-/// 指定パスから設定を読む（不在・破損は None）
+/// 指定パスから設定を読む（不在・破損は None）。
+///
+/// **破損していたら既定値へ落とす前に退避する**（#916）。settings.json は
+/// theme_colors / theme_presets / runner_defaults のようにユーザーが手で書く
+/// 情報を持つのに、旧実装は破損を黙って既定値扱いし、直後の [`save`] が
+/// 元の内容を上書きして復元不能にしていた
 pub fn load_from(path: &std::path::Path) -> Option<Settings> {
     let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&json).ok()
+    match serde_json::from_str(&json) {
+        Ok(settings) => Some(settings),
+        Err(e) => {
+            let quarantine =
+                tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo);
+            warn_unreadable_once(path, &e.to_string(), quarantine.as_deref());
+            None
+        }
+    }
+}
+
+/// 破損の申告は 1 プロセス 1 回だけ（`load` は多くの経路から呼ばれるのでログが溢れる）
+fn warn_unreadable_once(
+    path: &std::path::Path,
+    reason: &str,
+    quarantine: Option<&std::path::Path>,
+) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let where_to = quarantine
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "（退避できず）".to_string());
+    crate::diag::persist_log(&format!(
+        "settings.json を解釈できないので既定値で起動: {}（{reason}・退避 {where_to}）",
+        path.display()
+    ));
 }
 
 /// 設定を書き出す。tmp へ書いて rename する（読み手と競合しない。discovery と同方式）
@@ -293,6 +325,29 @@ pub fn save_to(path: &std::path::Path, settings: &Settings) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #916: 壊れた settings.json は既定値へ落ちる前に退避され、
+    /// 直後の保存で消えない
+    #[test]
+    fn 壊れた設定は退避されてから既定値になる() {
+        let path = temp_path("broken");
+        let dir = path.parent().expect("親がある").to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("作れる");
+        std::fs::write(&path, "{ \"theme\": ").expect("書ける");
+        assert!(load_from(&path).is_none(), "壊れているので None");
+        let quarantine = tako_core::migration::quarantine_path(&path);
+        assert_eq!(
+            std::fs::read_to_string(&quarantine).expect("退避が読める"),
+            "{ \"theme\": ",
+            "元の内容が残る"
+        );
+        // 既定値で保存し直しても退避は残る（= 復元できる）
+        save_to(&path, &Settings::default()).expect("保存できる");
+        assert!(quarantine.is_file());
+        assert!(load_from(&path).is_some(), "保存後は読める");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

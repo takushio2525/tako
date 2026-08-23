@@ -1502,9 +1502,6 @@ fn prepare_profile(
         .join("default.yaml");
     let existed = profile_path.is_file();
     orchestrator::ensure_defaults()?;
-    if let Some(notice) = orchestrator::migrate_legacy_default_profile() {
-        eprintln!("  [移行] {notice}");
-    }
     if let Some(profile) = provided {
         profile.save("default")?;
         eprintln!(
@@ -2360,19 +2357,16 @@ pub fn run_changes(json: bool) -> Result<(), String> {
 /// 冪等で、移したものがあるときだけ 1 行出す（無ければ無言）。失敗しても setup 自体は
 /// 止めない（移行できないのは原本が残っているという意味で、作業の続行を妨げない）
 fn run_data_migration_stage() {
-    let outcomes = tako_control::orchestrator::handoff_store::migrate_all();
-    if outcomes.is_empty() {
+    // 発火点は**ここ 1 本**（#916）。引き継ぎ（#915）の分割移行も登録簿から
+    // 呼ばれるので、種別が増えてもこの関数は変わらない
+    let lines = tako_control::migrations::setup_lines();
+    if lines.is_empty() {
         return;
     }
     eprintln!("設定ファイルの更新");
     eprintln!("──────────────────");
-    for outcome in &outcomes {
-        if let Some(summary) = outcome.summary() {
-            eprintln!("  [migrated] {summary}");
-        }
-        for warning in &outcome.warnings {
-            eprintln!("  [warn] {warning}");
-        }
+    for line in lines {
+        eprintln!("  [migrated] {line}");
     }
     eprintln!();
 }

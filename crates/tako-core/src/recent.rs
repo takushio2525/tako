@@ -48,9 +48,21 @@ impl RecentList {
             Some(p) => p,
             None => return Self::default(),
         };
-        match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => Self::default(),
+        Self::load_from(&path)
+    }
+
+    /// 指定パスから読む。**解釈できない内容は既定値へ落とす前に退避する**（#916）。
+    /// 退避しておかないと、直後の [`save`](Self::save) が元の内容を上書きして消す
+    pub fn load_from(path: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str(&text) {
+            Ok(list) => list,
+            Err(_) => {
+                let _ = crate::migration::quarantine_unreadable(path, &crate::migration::FsIo);
+                Self::default()
+            }
         }
     }
 
@@ -87,6 +99,23 @@ fn recent_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #916: 壊れた recent.json も既定値へ落ちる前に退避される
+    #[test]
+    fn 壊れた最近使った場所は退避されてから空になる() {
+        let dir = std::env::temp_dir().join(format!("tako-recent-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("作れる");
+        let path = dir.join("recent.json");
+        std::fs::write(&path, "[こわれた").expect("書ける");
+        let list = RecentList::load_from(&path);
+        assert!(list.entries.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(crate::migration::quarantine_path(&path)).expect("読める"),
+            "[こわれた"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn push_deduplicates() {

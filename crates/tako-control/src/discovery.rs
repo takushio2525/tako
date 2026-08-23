@@ -81,6 +81,7 @@ pub fn write(info: &ControlInfo) -> io::Result<PathBuf> {
     }
     write_to(&path, info)?;
     prune_dead_instances(info.pid);
+    prune_unparsable_instances(info.pid);
     Ok(path)
 }
 
@@ -123,8 +124,13 @@ pub fn cleanup(pid: u32) {
     }
 }
 
-/// 死んだインスタンス（ソケットへ接続できない）の残骸ファイルを消す。
-/// `keep_pid`（自分）は接続確認せず残す
+/// 死んだインスタンスの残骸ファイルを消す。`keep_pid`（自分）は確認せず残す。
+///
+/// **判断はソケットではなく pid の生存**（#916）。ソケットパスは
+/// `<data_dir>/tako.sock` に固定された（2026-06-23）ので、どの世代の
+/// インスタンスファイルも同じパスを指す = 生きている 1 個がいれば
+/// `socket_alive` は全件 true を返し、残骸が一切消えなくなっていた
+/// （実測: 本番に 160 件・最古は固定パス化と同じ 6/23）
 fn prune_dead_instances(keep_pid: u32) {
     let Some(dir) = instances_dir() else {
         return;
@@ -133,12 +139,46 @@ fn prune_dead_instances(keep_pid: u32) {
         if info.pid == keep_pid {
             continue;
         }
-        if !socket_alive(&info.socket) {
+        if !tako_core::platform::process::pid_alive(info.pid) {
             if let Some(path) = instance_path(info.pid) {
                 let _ = std::fs::remove_file(path);
             }
         }
     }
+}
+
+/// 解釈できないインスタンスファイルの残骸を消す。
+///
+/// `list_instances` はパースできないファイルを**列挙ごと落とす**ので、
+/// 形式が変わった世代のファイルは掃除の対象にすらならず永久に残る。
+/// 名前から pid が読めれば生存で判断できるので、そこだけは救う（#916）
+fn prune_unparsable_instances(keep_pid: u32) {
+    let Some(dir) = instances_dir() else {
+        return;
+    };
+    let Ok(reader) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in reader.flatten() {
+        let path = entry.path();
+        let Some(pid) = pid_from_instance_name(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        if pid == keep_pid || read_from(&path).is_some() {
+            continue;
+        }
+        if !tako_core::platform::process::pid_alive(pid) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// `control-<pid>.json` から pid を読む（読めなければ None = 触らない）
+fn pid_from_instance_name(name: &str) -> Option<u32> {
+    name.strip_prefix("control-")?
+        .strip_suffix(".json")?
+        .parse()
+        .ok()
 }
 
 /// ソケットが接続を受け付けるか（生存プローブ。認証はしない）
@@ -284,7 +324,11 @@ mod tests {
     }
 
     /// バグ (8) の回帰: 一時インスタンスが current を上書きして exit しても、
-    /// 候補列に生きているインスタンスが残り、死んだ候補は掃除される
+    /// 候補列に生きているインスタンスが残り、死んだ候補は掃除される。
+    ///
+    /// #916: 掃除の判断は**ソケットではなく pid の生存**。ソケットパスが
+    /// `<data_dir>/tako.sock` に固定されて以降、死んだインスタンスも
+    /// 「生きているソケット」を指すので socket 判定では一切消えなくなっていた
     #[test]
     fn 候補列はcurrentと生存インスタンスを返し死骸は掃除される() {
         // このテストは env（TAKO_DISCOVERY_DIR）でモジュール全体の置き場を差し替える。
@@ -293,50 +337,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("TAKO_DISCOVERY_DIR", &dir);
 
-        // 生きているソケット（実 UnixListener）と死んだソケットパス
-        let alive_socket = dir.join("alive.sock");
         std::fs::create_dir_all(&dir).unwrap();
+        // 生きているインスタンス = 生きた pid（自分）。死んだ方は実在しない pid。
+        // **ソケットパスは両者で同じ**にしてある（固定パス化後の実態。#916 の再現条件）
+        let shared_socket = dir.join("tako.sock");
+        // **実際に受け付けるソケット**を張る（これが無いと socket 判定でも死骸が
+        // 消えてしまい、旧実装との差が出ない = 回帰テストにならない）
         let _listener =
-            std::os::unix::net::UnixListener::bind(&alive_socket).expect("テスト用ソケット");
-        let alive = info(100, alive_socket.to_str().unwrap());
-        let dead = info(200, dir.join("dead.sock").to_str().unwrap());
+            std::os::unix::net::UnixListener::bind(&shared_socket).expect("テスト用ソケット");
+        assert!(
+            socket_alive(shared_socket.to_str().unwrap()),
+            "前提: ソケットは生きて見える"
+        );
+        let alive_pid = std::process::id();
+        let dead_pid = u32::MAX;
+        let alive = info(alive_pid, shared_socket.to_str().unwrap());
+        let dead = info(dead_pid, shared_socket.to_str().unwrap());
 
         // メイン（生存）→ 一時インスタンス（死亡。current を上書きして exit した状況）
         write(&alive).unwrap();
         write(&dead).unwrap();
-        // current は死んだ一時インスタンスを指しているが、候補列には生存側が続く
-        assert_eq!(read().map(|i| i.pid), Some(200));
+        // current は死んだ一時インスタンスを指している
+        assert_eq!(read().map(|i| i.pid), Some(dead_pid));
         let candidates = read_candidates();
-        assert_eq!(candidates[0].pid, 200, "先頭は current");
-        assert!(
-            candidates.iter().any(|c| c.pid == 100),
-            "生きているメインが候補に残る: {candidates:?}"
-        );
+        assert_eq!(candidates[0].pid, dead_pid, "先頭は current");
         // 死んだインスタンスのファイルは次の write で掃除される
+        // （ソケットが生きて見えても pid が死んでいれば消える）
         write(&alive).unwrap();
         let candidates = read_candidates();
         assert!(
-            candidates.iter().all(|c| c.pid != 200),
+            candidates.iter().all(|c| c.pid != dead_pid),
             "死骸が掃除される: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|c| c.pid == alive_pid),
+            "生きているメインが候補に残る: {candidates:?}"
         );
         // セカンダリモードの書き込み（Issue #113）: current ポインタを奪わず
         // instances/ のみに載る（プライマリへの既存接続を壊さない）
-        let secondary = info(300, dir.join("secondary.sock").to_str().unwrap());
+        let secondary = info(alive_pid + 1, dir.join("secondary.sock").to_str().unwrap());
         write_instance_only(&secondary).unwrap();
         assert_eq!(
             read().map(|i| i.pid),
-            Some(100),
+            Some(alive_pid),
             "current はプライマリのまま"
         );
         assert!(
-            read_candidates().iter().any(|c| c.pid == 300),
+            read_candidates().iter().any(|c| c.pid == alive_pid + 1),
             "セカンダリはフォールバック候補列に載る"
         );
-        cleanup(300);
+        cleanup(alive_pid + 1);
         // 明示終了のクリーンアップ: 自分のファイルと current が消える
-        cleanup(100);
+        cleanup(alive_pid);
         assert_eq!(read(), None);
         assert!(read_candidates().is_empty());
+
+        // 解釈できない残骸も、名前の pid が死んでいれば掃除される（#916）。
+        // 旧実装は list_instances がパース失敗で列挙ごと落とすため永久に残った
+        let junk = dir.join("instances").join("control-4294967294.json");
+        std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
+        std::fs::write(&junk, "{ 旧世代のこわれた形式").unwrap();
+        let mine = dir
+            .join("instances")
+            .join(format!("control-{}.json", std::process::id()));
+        std::fs::write(&mine, "{ 自分のは触らない").unwrap();
+        write(&info(std::process::id(), shared_socket.to_str().unwrap())).unwrap();
+        assert!(!junk.exists(), "死んだ pid の解釈不能な残骸は消える");
+        cleanup(std::process::id());
 
         std::env::remove_var("TAKO_DISCOVERY_DIR");
         let _ = std::fs::remove_dir_all(&dir);

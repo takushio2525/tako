@@ -323,3 +323,93 @@ echo "        ${registered}（${note}）"  # ○
 ```sh
 grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]' scripts/*.sh scripts/lib/*.sh
 ```
+
+## 設定・データファイルのスキーマ変更（Issue #916）
+
+**永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**
+「自動が難しいので移行手順を提示する」も不可（ユーザー確定方針）。
+
+### どこに何を足すか
+
+1. `tako-control::migrations::SPECS` の該当 `SchemaSpec` の `target_version` を +1
+2. 同じ spec の `steps` に `Step { from, to, describe, apply, once }` を 1 本足す
+3. `detect` が**内容から**新旧を見分けられるようにする（版数フィールドがあるなら
+   `detect_version_field`、無いなら構造の特徴で）
+4. `TAKO_UPDATE_SCHEMA_FINGERPRINT=1 cargo test -p tako-control --test migration_registry`
+   で指紋を更新する
+
+新しい永続ファイルを足すときは `SchemaId` に番地を切り、`SPECS` と
+`migrations::targets` と `config_share::catalog` の 3 つへ載せる
+（載せ忘れは `migration_registry` / `config_share_catalog` テストが名指しで落とす）。
+
+### 発火は既に配線されている
+
+- `tako setup` 実行時 = `migrations::setup_lines()`
+- 実行時の差分検出 = `migrations::ensure_migrated()`（GUI 起動 / `tako master` /
+  dispatch のプロファイル解決。1 プロセス 1 回）
+- 明示 = `tako migrate run` / MCP `tako_migrate`
+
+**発火点を新しく足さないこと**。増やすと「どこで直るか」が分からなくなる。
+
+### テキスト置換で表せない移行（1 ファイル → 複数ファイル）
+
+引き継ぎのプロジェクト単位化（#915）のように**分割・置き場の変更**を伴う移行は
+`Step`（テキスト → テキスト）では表せない。手順そのものは専用実装が持ち、
+`migrations::run` から呼んで結果を [`MigrationReport`] の語彙へ翻訳する
+（`handoff_reports` が実例）。**番地（`SchemaId`）には必ず載せる**: 載せないと
+`tako migrate` から見えず、発火点が分かれる。
+
+このとき「何が起きたか」は**専用実装のフラグではなく中身の前後比較で決める**。
+`MigrationOutcome::migrated` のようなフラグは意味が実装寄り（#915 のそれは
+「プロジェクトへ移した行があるか」）なので、形式マーカーの付与だけで済んだファイルが
+false になり、`status` の予告と `run` の報告が食い違った。
+
+### 守られる安全要件（機構側の 1 実装が担保する）
+
+| 要件 | 実装 |
+|---|---|
+| 冪等 | 版数は外部の記録ではなく**内容から判定**（`detect`）。`apply` は「もう当たっている」なら `Ok(None)` を返す |
+| 旧ファイルを消さない | 書く前に `<name>.pre-v<from>.bak` へ退避。退避が取れなければ**書かない** |
+| 解釈できない内容を捨てない | `validate` が Err なら `<name>.unreadable.bak` へ丸ごと退避して申告（既定値へ黙って落とさない） |
+| 秘匿情報の写しを残さない | `preserve_unreadable: false` の種別（`instances/control-*.json` = トークンつき / `remote/devices.json` = Secret）は**退避せず**「読めない」ことだけ申告する。退避は「利用者が手で書いた情報を守る」ためのものなので、寿命の短いトークンつきファイルには当てはまらない |
+| 失敗時に元を守る | `apply` が Err なら元のファイルを 1 バイトも触らない |
+| 未来の形式を壊さない | ファイルが `target_version` より新しければ触らず `Refused` |
+| 実施の可視化 | persist.log へ「移行: <種別> v1 -> v2: <パス>（退避 …・発生源 …）」 |
+
+### 一度だけの移行（`once: true`）
+
+「**利用者が旧い値へ意図して戻す自由がある**」移行だけに使う（例: #27 の `[1m]` 既定モデル
+除去。移行後にユーザーが自分で `[1m]` を選び直したら尊重する）。印は**退避ファイルの存在**で
+持つので状態ファイルを増やさない。機構より前の手書き移行を取り込むときは
+`once_markers` に旧い印の接尾辞を並べる（`.backup-1m`）。
+
+### 冪等性を「記録」で作らないこと
+
+「移行済み」を別ファイルへ記録する方式は #513 の設定共有で必ず壊れる
+（マシン A が移行して push → マシン B は新形式のファイルと古い記録を持つ）。
+判定は必ず内容から行う。
+
+### やってはいけない `unwrap_or_default()`
+
+永続ファイルを読んで `unwrap_or_default()` / `.ok()` で既定値へ落とすのは、
+**その直後の保存が利用者の内容を上書きして消す**ことを意味する。落とす前に
+`tako_core::migration::quarantine_unreadable` を通すか、`Err` を返して手を出さない
+（実測の被害例: `settings.json` の `theme_colors` / `theme_presets`、
+`~/.claude.json` の MCP 登録と信頼済みフォルダ）。
+
+### 排他ロックは「書くと決まってから」取る
+
+`config_io` のロックファイルは**消すと排他が破れる**（新旧 2 つの inode を別々にロック
+できてしまう）ので削除できない設計。したがって**書く必要があると分かってから**しか
+取ってはいけない。読み取りだけで判定 → 変更が要るときだけロック → ロックの下で
+読み直して実行、の順にする。無条件に取ると、全ファイルが最新のときでも起動のたびに
+空の `.lock` が増える（#916 の作業中に本番のデータディレクトリへ 167 個作ってしまった。
+うち 160 個は `instances/control-*.json` の分）。
+
+### テストが本番の設定を触らないこと
+
+ユニットテストから設定ファイルの書き込み経路を呼ぶときは、隔離が
+**テストの実行順に依存しない**ことを確かめる（`OnceLock` の初期化をヘルパー任せに
+すると、そのヘルパーを通らないテストが本番へ書く）。`orchestrator::config_dir()` は
+`cfg(test)` で必ず隔離先へ倒れる。`migrations::run` は `TAKO_DATA_DIR` が明示されていない
+テストビルドでは何もしない。

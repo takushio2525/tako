@@ -9,7 +9,7 @@ description: tako コマンド全 69 種の逆引き一覧 — 目的・使い�
 
 ## 共通の前提
 
-- **tako の中のターミナルで実行する**のが基本です。tako の外（通常のターミナル）で実行すると、接続情報が見つからない旨のエラーになります（`tako setup` / `tako setup-mcp` / `tako platform` / `tako recover` など一部はアプリ未起動でも動作します）
+- **tako の中のターミナルで実行する**のが基本です。tako の外（通常のターミナル）で実行すると、接続情報が見つからない旨のエラーになります（`tako setup` / `tako setup-mcp` / `tako platform` / `tako recover` / `tako migrate` など一部はアプリ未起動でも動作します）
 - **ペイン ID の自動特定**: tako のペイン内から実行すると、環境変数 `TAKO_PANE_ID` から「自分がいるペイン」が自動で分かります。`--pane` を省略したときの対象は呼び出し元ペインです
 - **ペイン ID の調べ方**: `tako list` で全ペインの ID・タイトル・作業ディレクトリが JSON で確認できます
 - **困ったら `--help`**: すべてのコマンド・サブコマンドで使えます
@@ -585,6 +585,25 @@ tako recover --apply 1         # 世代 1〜3 を指定して復元
 tako recover --apply good      # 最後に復元へ成功した「良品」へ戻す
 # tako を再起動する
 ```
+
+### tako migrate
+
+設定・データファイルの形式を確認します。**普段は呼ぶ必要がありません**: 形式が変わったときは
+`tako setup` の実行時と、GUI / master / CLI の起動時に自動で移行されます（tako は手動の移行作業を
+要求しません）。
+
+```bash
+tako migrate                       # 全永続ファイルの形式を確認するだけ（何も書き換えない）
+tako migrate run                   # 旧形式があればその場で移行する（冪等）
+tako migrate run --schema profiles # 種別を 1 つに絞る
+```
+
+旧内容は `<ファイル名>.pre-v<版数>.bak`、解釈できなかった内容は
+`<ファイル名>.unreadable.bak` へ退避されるので消えません。応答の `files[].state` が
+`unreadable` のものは「設定が壊れているので既定値で動いている」という意味です。
+
+**設定が壊れて GUI が起動しないときの復旧手段**なので、`tako recover` と同じく
+アプリが動いていなくても実行できます。
 
 ### tako logs / sessions
 
