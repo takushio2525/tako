@@ -16589,13 +16589,19 @@ mod tests {
 
     #[test]
     fn コマンド解決が空振りしたら実行中バイナリの隣を見る() {
+        // 期待値は**同じ `join` から作る**。`Path::join` の区切りは実行中 OS のもの
+        // （Windows は `\`）なので、連結後の形をリテラルで書くと実機だけ落ちる
+        // （#920 と同じ型の罠。実際にこのテストで Windows 実機を 1 度落とした）
+        let dir = std::path::Path::new("/tmp/tako-898-fixture");
+        let exe = dir.join("tako-app");
+        let sibling = dir.join("tako").display().to_string();
         let got = resolve_tako_binary_with(
-            &only_files(&["/tmp/bundle/tako"]),
+            &only_files(&[sibling.as_str()]),
             &|| None,
-            Some(std::path::Path::new("/tmp/bundle/tako-app")),
+            Some(&exe),
             "tako",
         );
-        assert_eq!(got, "/tmp/bundle/tako");
+        assert_eq!(got, sibling);
     }
 
     /// **#898 の本体**: 旧実装は隣を `tako`（拡張子なし）決め打ちで探していたので、
