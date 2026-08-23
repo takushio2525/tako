@@ -50440,6 +50440,36 @@ mod self_test {
                     ),
                 );
 
+                // (j) 「このフォルダを開く」の配線（パレット項目 → dispatch → 通知）。
+                //
+                // (h)(i) がホスト選択までを見るので、ここは**最後の 1 手**を見る。
+                // 実ホストへは繋がないので成功はしないが、**失敗が通知へ出る**ことで
+                // 「押しても何も起きない」型の断線を検出できる
+                let (open_notice_error, open_notice) = window
+                    .update(cx, |app, _, cx| {
+                        app.remote_notice = None;
+                        app.palette_execute(
+                            PaletteItem::RemoteFolderOpen(
+                                "tako-selftest-no-such-host.invalid".into(),
+                                "/srv/app".into(),
+                            ),
+                            cx,
+                        );
+                        let n = app.remote_notice.as_ref();
+                        (
+                            n.map(|n| n.is_error).unwrap_or(false),
+                            n.map(|n| n.text.clone()).unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or((false, String::new()));
+                check(
+                    open_notice_error
+                        && open_notice.contains("tako-selftest-no-such-host.invalid"),
+                    &format!(
+                        "「このフォルダを開く」が dispatch まで繋がっている                          (#919。is_error={open_notice_error} notice={open_notice:?})"
+                    ),
+                );
+
                 // 後片付け: 以後の項目へ持ち越さない
                 let _ = window.update(cx, |app, _, cx| {
                     app.filetree.remove_remote_root(&root);
