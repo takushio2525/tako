@@ -454,14 +454,25 @@ fn migrate_one(spec: &SchemaSpec, path: &Path, mode: Mode) -> FileReport {
     // （実測: 本番のデータディレクトリに 167 個作ってしまった。うち 160 個は
     // `instances/control-*.json` の分）
     let dry = dry_run(spec, path);
-    if mode == Mode::Check || !dry.outcome.changed() {
+    if mode == Mode::Check {
         return dry;
     }
-    // ここから先だけロックを取る（他プロセスの read-modify-write と直列化）。
-    // ロックの下でもう一度読み直すので、待っている間に別プロセスが移行を
-    // 済ませていれば `migrate_file` が「もう当たっている」と判断して何もしない
-    let _lock = crate::config_io::lock_exclusive(path).ok();
-    migration::migrate_file(spec, path, &ConfigIo)
+    match &dry.outcome {
+        // 書き換えるのはここだけ。ロックを取り、その下でもう一度読み直す
+        // （待っている間に別プロセスが移行を済ませていれば、内容ベースの
+        // 冪等性で `migrate_file` が「もう当たっている」と判断して何もしない）
+        FileOutcome::Migrated { .. } => {
+            let _lock = crate::config_io::lock_exclusive(path).ok();
+            migration::migrate_file(spec, path, &ConfigIo)
+        }
+        // 退避だけが要る。書き先は `<name>.unreadable.bak` で**元のファイルは触らない**
+        // のでロックは要らない（同着しても内容は同じで、先に在れば上書きしない）。
+        // ここを `dry` のまま返すと「退避した」と申告しながら 1 バイトも書いていない
+        // 嘘の応答になる（実際に一度そうしてしまった）
+        FileOutcome::Unreadable { .. } => migration::migrate_file(spec, path, &ConfigIo),
+        // 何もすることが無い（最新 / 不在 / 未来の形式で拒否 / 読めない）
+        _ => dry,
+    }
 }
 
 /// 書かずに「何が起きるか」を出す。`ReadOnlyIo` は `write` を必ず失敗させるので、
@@ -1011,10 +1022,21 @@ mod tests {
             "最新のファイルにロックを作ってはいけない"
         );
 
-        // 読めないファイルもロックを作らない（書き換えないので）
+        // 読めないファイルは**退避される**が、元を書き換えないのでロックは作らない。
+        // 「退避した」と申告しながら 1 バイトも書かない嘘を防ぐ（実際に一度やった）
         let broken = dir.join("broken.yaml");
         std::fs::write(&broken, "model: [x\n").expect("書ける");
-        let _ = migrate_one(spec, &broken, Mode::Apply);
+        let report = migrate_one(spec, &broken, Mode::Apply);
+        match &report.outcome {
+            FileOutcome::Unreadable { quarantine, .. } => {
+                let dest = quarantine.as_ref().expect("退避する種別");
+                assert_eq!(
+                    std::fs::read_to_string(dest).expect("申告した退避先が実在する"),
+                    "model: [x\n"
+                );
+            }
+            other => panic!("退避されるはず: {other:?}"),
+        }
         assert!(
             !dir.join("broken.yaml.lock").exists(),
             "読めないファイルにロックを作ってはいけない"

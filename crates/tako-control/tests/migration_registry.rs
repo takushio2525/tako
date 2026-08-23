@@ -93,6 +93,38 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         SchemaId::all().len(),
         "番地を足したら対応表にも足す（どのファイルの版数かが分からなくなる）"
     );
+
+    // **fail-closed 側**: 共有される宣言的設定（`Class::Shared`）は、
+    // 「版数の番地を持つ」か「自由文（スキーマが無い）」かのどちらかを必ず宣言する。
+    // ここを緩めると、共有はされるのに移行されないファイルが黙って増える。
+    // Local / Secret を対象にしないのは、ソケット・キャッシュ・ログのように
+    // そもそもスキーマを持たないものが正当に含まれるため
+    const SHARED_WITHOUT_SCHEMA: &[&str] = &[
+        // どれも AI へ渡す自由文の Markdown（形式の決まりが無い）
+        "orchestrator/local-rules.md",
+        "orchestrator/master-system.md",
+        "orchestrator/conflict-resolver.md",
+        "orchestrator/judgment-local.md",
+    ];
+    for entry in catalog::CATALOG {
+        if entry.root != catalog::Root::TakoData || entry.class != catalog::Class::Shared {
+            continue;
+        }
+        let mapped = MAPPING.iter().any(|(path, _)| *path == entry.path);
+        let free_text = SHARED_WITHOUT_SCHEMA.contains(&entry.path);
+        assert!(
+            mapped || free_text,
+            "共有される設定 {} に版数の番地が無い。\n\
+             tako-control::migrations へ SchemaId を足して対応表に載せるか、\n\
+             自由文（スキーマ無し）なら SHARED_WITHOUT_SCHEMA へ理由つきで足すこと（#916）",
+            entry.path
+        );
+        assert!(
+            !(mapped && free_text),
+            "{} が両方に載っている（どちらかにする）",
+            entry.path
+        );
+    }
 }
 
 /// 永続構造体のフィールド集合の指紋。
