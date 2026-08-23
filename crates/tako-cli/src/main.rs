@@ -2659,6 +2659,9 @@ fn cli_main() -> ExitCode {
     let result = match cli.command {
         Command::Mcp(McpCommand::Serve) => mcp_serve(),
         Command::Setup(ref args) => {
+            // setup も表示言語を settings.json から解決する（#435。移行の説明文など
+            // Note ベースの文言がここを通るので、設定が ja なら日本語で出る）
+            tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
             if let Some(SetupCommand::Bootstrap {
                 ref action,
                 dry_run,

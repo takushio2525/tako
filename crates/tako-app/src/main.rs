@@ -48878,6 +48878,112 @@ mod self_test {
                 });
             }
 
+            // 122: 設定ファイルの自動マイグレーション（#916）。
+            // 旧形式のファイルを隔離ディレクトリへ置き、**製品と同じ dispatch**
+            // （CLI / MCP が通るのと同じ経路）で移行させて、
+            // ①直る ②旧内容が退避される ③2 回目は何もしない（冪等）
+            // ④解釈できない内容は捨てずに退避される、を 1 度に見る
+            {
+                let profiles_dir = std::env::var_os("TAKO_ORCHESTRATOR_DIR")
+                    .map(std::path::PathBuf::from)
+                    .map(|d| d.join("profiles"));
+                if profiles_dir.is_none() {
+                    fail("122: TAKO_ORCHESTRATOR_DIR が隔離されていない (#916)");
+                }
+                let profiles_dir = profiles_dir.unwrap_or_else(std::env::temp_dir);
+                let _ = std::fs::create_dir_all(&profiles_dir);
+                let legacy_path = profiles_dir.join("_tako_916_.yaml");
+                let legacy = format!(
+                    "# ユーザーのコメント\nmodel: {}\neffort: high\n",
+                    tako_control::orchestrator::LEGACY_DEFAULT_MODEL
+                );
+                let _ = std::fs::write(&legacy_path, &legacy);
+                // 読めないファイルも 1 つ置く（保全の検証）
+                let broken_path = profiles_dir.join("_tako_916_broken_.yaml");
+                let broken = "model: [こわれた\n";
+                let _ = std::fs::write(&broken_path, broken);
+
+                let call = |app: &mut TakoApp, action: &str| -> serde_json::Value {
+                    tako_control::dispatch::dispatch(
+                        app,
+                        tako_control::protocol::Request::Migrate {
+                            action: Some(action.to_string()),
+                            schema: Some("profiles".into()),
+                        },
+                        PaneOrigin::Mcp,
+                    )
+                    .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                };
+
+                // 見るだけ（何も書き換わらない）
+                let before = window
+                    .update(cx, |app, _, _| call(app, "status"))
+                    .unwrap_or(serde_json::Value::Null);
+                let status_untouched =
+                    std::fs::read_to_string(&legacy_path).unwrap_or_default() == legacy;
+                let status_says_pending = before["migrated"].as_u64() == Some(1);
+
+                // 当てる
+                let applied = window
+                    .update(cx, |app, _, _| call(app, "run"))
+                    .unwrap_or(serde_json::Value::Null);
+                let migrated_text = std::fs::read_to_string(&legacy_path).unwrap_or_default();
+                let backup_text = std::fs::read_to_string(
+                    tako_core::migration::backup_path(&legacy_path, 1),
+                )
+                .unwrap_or_default();
+                let quarantine_text = std::fs::read_to_string(
+                    tako_core::migration::quarantine_path(&broken_path),
+                )
+                .unwrap_or_default();
+
+                // 2 回目（冪等）
+                let again = window
+                    .update(cx, |app, _, _| call(app, "run"))
+                    .unwrap_or(serde_json::Value::Null);
+                let after_second = std::fs::read_to_string(&legacy_path).unwrap_or_default();
+
+                let ok = status_untouched
+                    && status_says_pending
+                    && applied["migrated"].as_u64() == Some(1)
+                    && !migrated_text.contains("model:")
+                    && migrated_text.contains("# ユーザーのコメント")
+                    && migrated_text.contains("effort: high")
+                    && backup_text == legacy
+                    && quarantine_text == broken
+                    && std::fs::read_to_string(&broken_path).unwrap_or_default() == broken
+                    && again["migrated"].as_u64() == Some(0)
+                    && after_second == migrated_text;
+                check(
+                    ok,
+                    &format!(
+                        "設定ファイルの自動マイグレーション: 旧形式が直り退避が残り 2 回目は\
+                         何もしない (#916。status_untouched={status_untouched} \
+                         status_pending={status_says_pending} \
+                         applied={} again={} migrated={:?} backup_ok={} quarantine_ok={})",
+                        applied["migrated"],
+                        again["migrated"],
+                        migrated_text.replace('\n', "\\n"),
+                        backup_text == legacy,
+                        quarantine_text == broken
+                    ),
+                );
+                // 走ったことと材料を必ず残す（#796: 診断が無いと「通った」のか
+                // 「素通りした」のかが後から分からない）
+                eprintln!(
+                    "TAKO_SELF_TEST_916: status_untouched={status_untouched} \
+                     status_pending={status_says_pending} applied={} again={} \
+                     backup_ok={} quarantine_ok={} migrated={:?}",
+                    applied["migrated"],
+                    again["migrated"],
+                    backup_text == legacy,
+                    quarantine_text == broken,
+                    migrated_text.replace('\n', "\\n")
+                );
+                let _ = std::fs::remove_file(&legacy_path);
+                let _ = std::fs::remove_file(&broken_path);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
