@@ -185,6 +185,13 @@ pub struct SchemaSpec {
     /// これがあると `tako migrate status` が全設定ファイルの健康診断になり、
     /// 「壊れているのに黙って既定値で動いている」状態を人が気付ける
     pub validate: Option<Validator>,
+    /// 読めなかった内容を退避して残すか。
+    ///
+    /// 既定は true（利用者が手で書いた情報は捨てない）。**false にするのは
+    /// 秘匿情報を含むか、tako が作り直せる短命なファイルだけ**
+    /// （`instances/control-*.json` は認証トークンを持つし次回起動で作り直される。
+    /// 退避すると寿命を超えてトークンの写しが残ってしまう）
+    pub preserve_unreadable: bool,
 }
 
 impl SchemaSpec {
@@ -284,8 +291,12 @@ pub enum FileOutcome {
         /// 適用した手順の説明（日英）
         applied: Vec<Note>,
     },
-    /// 解釈できないので退避だけした（**内容は捨てない**）
-    Unreadable { quarantine: PathBuf, reason: String },
+    /// 解釈できない。退避したなら `quarantine` にその場所が入る
+    /// （`None` = 退避しない種別 = 秘匿情報つき / 作り直せる短命なファイル）
+    Unreadable {
+        quarantine: Option<PathBuf>,
+        reason: String,
+    },
     /// 登録の壊れ方が判明したので触らなかった
     Refused { reason: String },
     /// 移行しようとして失敗した（元のファイルは無傷）
@@ -395,8 +406,8 @@ const NOTICE_PENDING: Note = Note::new(
     "{n} config file(s) are in an older format (run `tako migrate run` to migrate)",
 );
 const NOTICE_ATTENTION: Note = Note::new(
-    "設定ファイル {n} 件は読めなかったので退避しました（tako migrate status で確認できます）",
-    "{n} config file(s) could not be read and were set aside (see `tako migrate status`)",
+    "設定ファイル {n} 件を読めないので既定値で動いています（tako migrate status で確認できます）",
+    "{n} config file(s) could not be read, so defaults are in use (see `tako migrate status`)",
 );
 
 /// 移行前の退避先（`<name>.pre-v<from>.bak`）。
@@ -571,9 +582,12 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
     };
     if let Some(validate) = spec.validate {
         if let Err(reason) = validate(&text) {
-            // 読めないものは移行しない。**捨てずに退避**して人へ申告する
-            let quarantine =
-                quarantine_unreadable(path, io).unwrap_or_else(|| quarantine_path(path));
+            // 読めないものは移行しない。退避してよい種別なら**捨てずに残す**
+            let quarantine = if spec.preserve_unreadable {
+                Some(quarantine_unreadable(path, io).unwrap_or_else(|| quarantine_path(path)))
+            } else {
+                None
+            };
             return FileOutcome::Unreadable { quarantine, reason };
         }
     }
@@ -774,6 +788,7 @@ mod tests {
             steps: STEPS,
             once_markers: &[],
             validate: None,
+            preserve_unreadable: true,
         };
         let (text, from, applied) = migrate_text(&spec, "x").expect("成功").expect("変わる");
         assert_eq!(text, "xab");
@@ -791,6 +806,7 @@ mod tests {
             steps: STEPS,
             once_markers: &[],
             validate: None,
+            preserve_unreadable: true,
         };
         // detect は常に v1 を返すが、内容は既に新形式（a と b がある）
         assert_eq!(migrate_text(&spec, "xab").expect("成功"), None);
@@ -812,6 +828,7 @@ mod tests {
             steps: BROKEN,
             once_markers: &[],
             validate: None,
+            preserve_unreadable: true,
         };
         let err = migrate_text(&spec, "x").expect_err("失敗する");
         assert!(!err.is_plan_error());
@@ -863,7 +880,7 @@ mod tests {
             id: SchemaId::Recent,
             path: PathBuf::from("/tmp/recent.json"),
             outcome: FileOutcome::Unreadable {
-                quarantine: PathBuf::from("/tmp/recent.json.unreadable.bak"),
+                quarantine: Some(PathBuf::from("/tmp/recent.json.unreadable.bak")),
                 reason: "壊れている".into(),
             },
         });
@@ -895,6 +912,7 @@ mod tests {
         steps: STEPS,
         once_markers: &[],
         validate: None,
+        preserve_unreadable: true,
     };
 
     #[test]
@@ -973,6 +991,7 @@ mod tests {
             steps: ONCE,
             once_markers: &[],
             validate: None,
+            preserve_unreadable: true,
         };
         let dir = temp_dir("once");
         let path = dir.join("default.yaml");
@@ -1001,6 +1020,7 @@ mod tests {
             steps: STEPS,
             once_markers: &[],
             validate: None,
+            preserve_unreadable: true,
         };
         let dir = temp_dir("future");
         let path = dir.join("settings.json");
@@ -1035,6 +1055,7 @@ mod tests {
             steps: BROKEN,
             once_markers: &[],
             validate: None,
+            preserve_unreadable: true,
         };
         let dir = temp_dir("failed");
         let path = dir.join("settings.json");
@@ -1086,6 +1107,7 @@ mod tests {
             steps: STEPS,
             once_markers: &[],
             validate: Some(reject),
+            preserve_unreadable: true,
         };
         let dir = temp_dir("validate");
         let path = dir.join("settings.json");
@@ -1094,6 +1116,7 @@ mod tests {
         match &report.outcome {
             FileOutcome::Unreadable { quarantine, reason } => {
                 assert!(reason.contains("JSON"), "{reason}");
+                let quarantine = quarantine.as_ref().expect("退避される種別");
                 assert_eq!(
                     std::fs::read_to_string(quarantine).expect("読める"),
                     "{ こわれた"
@@ -1126,6 +1149,7 @@ mod tests {
             steps: ONCE,
             once_markers: &[".backup-1m"],
             validate: None,
+            preserve_unreadable: true,
         };
         let dir = temp_dir("legacy-marker");
         let path = dir.join("default.yaml");

@@ -215,6 +215,20 @@ const fn pristine(id: SchemaId, validate: Option<migration::Validator>) -> Schem
         steps: &[],
         once_markers: &[],
         validate,
+        preserve_unreadable: true,
+    }
+}
+
+/// 読めない内容を**退避しない**種別（秘匿情報つき / tako が作り直せる短命なファイル）
+const fn ephemeral(id: SchemaId, validate: Option<migration::Validator>) -> SchemaSpec {
+    SchemaSpec {
+        id,
+        target_version: 1,
+        detect: detect_version_field,
+        steps: &[],
+        once_markers: &[],
+        validate,
+        preserve_unreadable: false,
     }
 }
 
@@ -227,6 +241,7 @@ const fn versioned(id: SchemaId, validate: Option<migration::Validator>) -> Sche
         steps: &[],
         once_markers: &[],
         validate,
+        preserve_unreadable: true,
     }
 }
 
@@ -256,17 +271,22 @@ pub const SPECS: &[SchemaSpec] = &[
         // #916 の機構より前に手書きされていた移行（#27）が残した印
         once_markers: &[".backup-1m"],
         validate: Some(validate_profile),
+        preserve_unreadable: true,
     },
     pristine(SchemaId::SoloProfiles, Some(validate_profile)),
     pristine(SchemaId::Ledger, Some(validate_ledger)),
     // 引き継ぎは Markdown なので形式の決まりが無い。プロジェクト単位化（#915）は
     // ここへ Step を足す形で載る
     pristine(SchemaId::Handoff, None),
-    versioned(
+    // 認証トークンを持ち、次回起動で作り直される。退避すると寿命を超えて
+    // トークンの写しが残るので**退避しない**（読めない残骸は discovery 側の
+    // prune_unparsable_instances が pid 生存で掃除する）
+    ephemeral(
         SchemaId::DiscoveryInstance,
         Some(validate_discovery_instance),
     ),
-    pristine(SchemaId::RemoteDevices, Some(validate_remote_devices)),
+    // 共有分類は Secret（`remote/`）。ペアリング情報の写しを残さない
+    ephemeral(SchemaId::RemoteDevices, Some(validate_remote_devices)),
 ];
 
 /// 種別から登録を引く
@@ -506,11 +526,17 @@ pub fn setup_lines() -> Vec<String> {
                 }
                 lines.push(format!("旧内容の退避先: {}", backup.display()));
             }
-            FileOutcome::Unreadable { quarantine, reason } => lines.push(format!(
-                "{} は読めなかったので {} へ退避しました（{reason}）",
-                file.path.display(),
-                quarantine.display()
-            )),
+            FileOutcome::Unreadable { quarantine, reason } => lines.push(match quarantine {
+                Some(dest) => format!(
+                    "{} は読めなかったので {} へ退避しました（{reason}）",
+                    file.path.display(),
+                    dest.display()
+                ),
+                None => format!(
+                    "{} は読めないので既定値で動きます（{reason}）",
+                    file.path.display()
+                ),
+            }),
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
                 lines.push(format!("{}: {reason}", file.path.display()))
             }
@@ -600,15 +626,18 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
             );
         }
         FileOutcome::Unreadable { quarantine, reason } => {
-            map.insert(
-                if did_apply {
-                    "quarantine"
-                } else {
-                    "quarantine_planned"
-                }
-                .into(),
-                quarantine.display().to_string().into(),
-            );
+            // 退避しない種別（秘匿情報つき / 短命）はキー自体を出さない
+            if let Some(dest) = quarantine {
+                map.insert(
+                    if did_apply {
+                        "quarantine"
+                    } else {
+                        "quarantine_planned"
+                    }
+                    .into(),
+                    dest.display().to_string().into(),
+                );
+            }
             map.insert("reason".into(), reason.clone().into());
         }
         FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
@@ -631,12 +660,17 @@ fn record(report: &MigrationReport, origin: &str) {
                 file.path.display(),
                 backup.display()
             )),
-            FileOutcome::Unreadable { quarantine, reason } => crate::diag::persist_log(&format!(
-                "移行できず退避: {} {}（{reason}・退避 {}・発生源 {origin}）",
-                file.id.as_str(),
-                file.path.display(),
-                quarantine.display()
-            )),
+            FileOutcome::Unreadable { quarantine, reason } => {
+                let where_to = match quarantine {
+                    Some(dest) => format!("退避 {}", dest.display()),
+                    None => "退避しない種別".to_string(),
+                };
+                crate::diag::persist_log(&format!(
+                    "移行できず: {} {}（{reason}・{where_to}・発生源 {origin}）",
+                    file.id.as_str(),
+                    file.path.display()
+                ))
+            }
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
                 crate::diag::persist_log(&format!(
                     "移行を中止: {} {}（{reason}・発生源 {origin}）",
@@ -882,8 +916,9 @@ mod tests {
         let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
         match &report.outcome {
             FileOutcome::Unreadable { quarantine, .. } => {
+                let dest = quarantine.as_ref().expect("プロファイルは退避する種別");
                 assert_eq!(
-                    std::fs::read_to_string(quarantine).expect("読める"),
+                    std::fs::read_to_string(dest).expect("読める"),
                     "model: [こわれた\n"
                 );
             }
@@ -893,6 +928,55 @@ mod tests {
             std::fs::read_to_string(&path).expect("読める"),
             "model: [こわれた\n",
             "元は触らない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// トークン・秘匿情報を持つ種別は読めなくても**写しを残さない**。
+    /// 退避は「利用者が手で書いた情報を守る」ためのものなので、寿命の短い
+    /// トークンつきファイルには当てはまらない（写しが寿命を超えて残る）
+    #[test]
+    fn 秘匿情報つきの種別は退避しない() {
+        for id in [SchemaId::DiscoveryInstance, SchemaId::RemoteDevices] {
+            let spec = spec(id).expect("登録されている");
+            assert!(
+                !spec.preserve_unreadable,
+                "{} は退避してはいけない（トークン / ペアリング情報の写しが残る）",
+                id.as_str()
+            );
+            assert!(
+                spec.validate.is_some(),
+                "{} は退避しないが「読めない」ことは申告する",
+                id.as_str()
+            );
+        }
+        // それ以外は利用者の手書き情報を守るので退避する
+        for id in [SchemaId::Settings, SchemaId::Profiles, SchemaId::Projects] {
+            assert!(
+                spec(id).expect("登録されている").preserve_unreadable,
+                "{} は退避する",
+                id.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn 退避しない種別は退避先を返さない() {
+        let dir = temp_dir("no-quarantine");
+        let path = dir.join("control-999999.json");
+        std::fs::write(&path, "{ broken").expect("書ける");
+        let spec = spec(SchemaId::DiscoveryInstance).expect("登録されている");
+        let report = migration::migrate_file(spec, &path, &migration::FsIo);
+        match &report.outcome {
+            FileOutcome::Unreadable { quarantine, .. } => assert!(
+                quarantine.is_none(),
+                "退避先を返してはいけない: {quarantine:?}"
+            ),
+            other => panic!("読めない扱いになるはず: {other:?}"),
+        }
+        assert!(
+            !migration::quarantine_path(&path).exists(),
+            "写しを作ってはいけない"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
