@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use tako_core::migration::SchemaId;
 use tako_control::migrations;
+use tako_core::migration::SchemaId;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -158,13 +158,19 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
                 "Profile",
             ],
         ),
-        ("crates/tako-core/src/recent.rs", &["RecentList", "RecentEntry"]),
+        (
+            "crates/tako-core/src/recent.rs",
+            &["RecentList", "RecentEntry"],
+        ),
         ("crates/tako-control/src/discovery.rs", &["ControlInfo"]),
         (
             "crates/tako-control/src/remote_auth.rs",
             &["DevicesFile", "Device"],
         ),
-        ("crates/tako-control/src/config_share/mod.rs", &["ShareState"]),
+        (
+            "crates/tako-control/src/config_share/mod.rs",
+            &["ShareState"],
+        ),
     ];
     let mut out = BTreeMap::new();
     for (file, names) in TARGETS {
@@ -235,10 +241,7 @@ fn struct_fields(text: &str, name: &str) -> Option<Vec<String>> {
         }
         // enum のバリアント（`Pane(PaneLayout),` / `Split { ... }`）
         if let Some(head) = line.split(['(', '{', ',', ' ']).next() {
-            if head
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase())
+            if head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
                 && head.chars().all(|c| c.is_alphanumeric() || c == '_')
             {
                 fields.push(pending_rename.take().unwrap_or_else(|| head.to_string()));
@@ -278,8 +281,7 @@ fn 永続構造体の指紋がスナップショットと一致する() {
     let snapshot = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("指紋を読めない {}: {e}", path.display()));
     assert_eq!(
-        rendered,
-        snapshot,
+        rendered, snapshot,
         "永続ファイルのスキーマが変わった。\n\
          旧いファイルがそのまま読めるか（serde の default / alias で足りるか）を確かめ、\n\
          読めないなら tako-control::migrations で target_version を上げて Step を足すこと。\n\
