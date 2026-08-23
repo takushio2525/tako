@@ -2804,5 +2804,9 @@
 - 検証: 品質ゲート全緑 + クロスチェック エラー 0 + 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
   （項目 102c / 122 新設）+ 隔離 e2e 2 本（setup 経由 15/15、隔離 GUI + 実 CLI の master 経路 11/11）
   + 検出力 6 通りの revert で FAILED を実測
-- 関連: PR #922（`Closes #915 #854 #917` / `Refs #916`）。**Windows 実機は並行 worker と
-  ビルドスロット共有のため空き待ち**（マトリクスは実測まで Pending 据え置き）
+- **Windows 実機実測**（`ssh win`。GUI 不要 = CLI だけで完結する）: `cargo build -p tako-cli`
+  2m04s → 検証 **13/13**（移行・冪等・list / show / write・日本語本文の保存・`\` 区切りの
+  パス・危険なキーの拒否）+ 新設の単体テスト 51 / 12 とも 0 failed。マトリクスの
+  `tako_orchestrator_handoffs` を Supported へ。**BOM 無しの `.ps1` は 5.1 が CP932 で読む**
+  ので検証スクリプトは BOM 付きで送り `pwsh -File` で回す（既知の罠を再度踏んだ）
+- 関連: PR #922（`Closes #915 #854 #917` / `Refs #916`）

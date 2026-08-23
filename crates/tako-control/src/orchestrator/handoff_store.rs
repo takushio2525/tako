@@ -214,6 +214,7 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         }
     }
 
+    let mut write_failed = false;
     for (key, body) in plan.by_project() {
         let merged = match read_project_handoff(&key) {
             // 既にファイルがあるなら**上書きしない**で追記する（内容を捨てない）
@@ -232,8 +233,21 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         };
         match write_project_handoff(&key, &merged) {
             Ok(path) => out.moved.push((key, path.display().to_string())),
-            Err(e) => out.warnings.push(e),
+            Err(e) => {
+                write_failed = true;
+                out.warnings.push(e);
+            }
         }
+    }
+    if write_failed {
+        // 1 つでも移せなかったら**運用メモは書き換えない**。書き換えると、移せなかった
+        // 断片が現用のファイルから消えて退避先にしか無くなる（原本は残っているので
+        // 復元はできるが、気づかないまま欠けた状態で動くほうが危ない）
+        out.warnings.push(
+            "移せないプロジェクトがあったため運用メモの書き換えを中止した（原本は退避済み）"
+                .to_string(),
+        );
+        return out;
     }
 
     let residue = plan.residue();
