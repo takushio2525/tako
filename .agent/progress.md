@@ -2974,6 +2974,9 @@
   利用者がそのまま読める。サイドバー「はじめに」+ セットアップページからリンク。OG 画像も焼き直し
 - 同梱: `known_limitations_lists_windows_gaps_bilingually` が理由文を直書きしていて落ちたので、
   期待値をマトリクスから作る形へ（#920 の install_plan と同型）
+- **踏んだ罠 2 件**: ①`--check` を CI へ入れたら落ちた = **生成物が実行環境の言語で変わる**
+  （`note` が `i18n::lang()` 追従。`TAKO_LANG` だけでは settings.json の `language` に負けるので
+  言語非依存の `note_ja` / `note_en` を応答へ足した）②既存 Issue を検索せず重複起票した
 - 検証: fmt / clippy(-D warnings) / `test --workspace` **2589 passed 0 failed** / platform_parity 14 本 /
   support 15 本（T7 2 本を新設）/ クロスチェック エラー 0・警告 10（ベースライン同数）/ docs build 25 ページ /
   `npm run og:verify` OK
