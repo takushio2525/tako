@@ -2796,7 +2796,7 @@ win467 ブランチの実装に対するもので、いまの main とは中身�
 
 | 種別 | 在庫 | 使った数 |
 |---|---|---|
-| `SelfTest` | 実機セルフテストの**通し**（#920。FAILED 0 / skip 19）。項目 → dispatch の対応は `main.rs` の `// NN.` コメントと `Request::` の出現から抽出 | 63 |
+| `SelfTest` | 実機セルフテストの**通し**（#920。FAILED 0 / skip 19）。項目 → dispatch の対応は `main.rs` の `// NN.` コメントと `Request::` の出現から抽出 | 64 |
 | `Measured` | この plan の各記録節（#866 / #875 / #877 / #915 / #727 / #766 / #867 / スライス 9 ほか） | 16 |
 | `ByDesign` | OS の仕様・設計判断で実測する対象が無いもの（TCC 不在 / PSReadLine の予測入力） | 2 |
 | `UnitTest` | 実機 `cargo test` のベースライン 21〜22 件（#906 が `--no-fail-fast` で採った失敗名の全数）に**含まれない**テスト | 11 |
@@ -2835,7 +2835,7 @@ prompt の枠（「操作が失敗したらまずここを疑ってください�
 | **#722**（既存） | `autorename.rs` の `detect_claude` が `$SHELL -l -c` 直書きで **`cfg(unix)` ガードが無い**（同型の一族 4 箇所のうちここだけ）。Windows は常に `None` → AI 命名が一度も走らない | `tako_auto_rename` を Degraded |
 | **#935** | `acceptance_gates::execute_command` が `sh -c` 決め打ち。実機ベースラインの 5 件はこれ | `tako_task_gate_check` を Degraded |
 | **#936**（新規。#726 の続き） | `stale_binary::pidpath` が Windows 未実装 → 実行中の claude を特定できず**古い claude の警告が出ない**。ベースラインの 2 件がこれ（#726 の `which` 側は #898 で解消済み） | `tako_stale_binary` を Degraded |
-| **#937** | 未実測項目の消し込み（追跡先。消し込み手順つき） | `Pending` 46 件の追跡先 |
+| **#937** | 未実測項目の消し込み（追跡先。消し込み手順つき） | `Pending` 47 件の追跡先 |
 
 ##### ベースラインの失敗名は「機能の判定材料」として読める
 
