@@ -1067,6 +1067,33 @@ fn pane_text_area_rect(
     )
 }
 
+/// テキスト領域に収まる端末グリッド（cols, rows）を求める（#647 で共通化）。
+///
+/// 表示中ペイン（`render_pane`）と非表示ペイン（`sync_offscreen_pane_sizes`）が
+/// 同じ式を使うことを型で保証するために切り出した。両者がずれると
+/// 「タブを表示した瞬間に grid が変わる」= 描画崩れの原因になる。
+///
+/// 急速リサイズで area が極小・負になる場合に備えて 0 クランプする（#385）。
+/// セル寸法が 0 以下（計測失敗）のときは 0 を返し、呼び出し側の
+/// `TerminalSession::resize` の下限クランプ（2）に委ねる
+fn grid_cells(area: Size<Pixels>, cell: Size<Pixels>) -> (usize, usize) {
+    let area_w = f32::from(area.width).max(0.0);
+    let area_h = f32::from(area.height).max(0.0);
+    let cell_w = f32::from(cell.width);
+    let cell_h = f32::from(cell.height);
+    let cols = if cell_w > 0.0 {
+        (area_w / cell_w).floor() as usize
+    } else {
+        0
+    };
+    let rows = if cell_h > 0.0 {
+        (area_h / cell_h).floor() as usize
+    } else {
+        0
+    };
+    (cols, rows)
+}
+
 /// 未確定文字列（marked text）のハイライト区間を組む（FR-1.9）。
 ///
 /// ハイライト範囲は重複禁止（`StyledText` の要求）なので、注目文節の前・文節・後の
@@ -1296,6 +1323,14 @@ struct TakoApp {
     drag_scroll: Option<DragScrollState>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
+    /// ペインごとの「最後に描画されたときのテキスト領域」（#647）。
+    /// `pane_text_areas` は表示中タブの分だけを持つ（マウス座標の誤ヒットを防ぐため
+    /// 非表示タブの分は毎 render で捨てる）。一方で PTY / グリッドのリサイズは
+    /// `render_pane` の副作用なので、それだけでは**非表示タブのペインへ寸法変更が
+    /// 一切届かない**。ここに残しておくことで、フォントサイズ変更のように
+    /// 「area は変わらないがセル寸法が変わる」ときにも全ペインへ反映できる。
+    /// ペインを閉じたときだけ捨てる
+    pane_last_text_areas: HashMap<PaneId, Bounds<Pixels>>,
     /// ペインを並べるコンテナ（絶対配置ペインの containing block）の実描画矩形。
     /// ウィンドウ単位（#339 の複数ウィンドウは同一 entity を共有するためキーが要る）。
     /// #684: ここが「正」。詳細は `PaneContentGeometry`
@@ -3145,6 +3180,7 @@ impl TakoApp {
             selecting: None,
             drag_scroll: None,
             pane_text_areas: Vec::new(),
+            pane_last_text_areas: HashMap::new(),
             pane_content: HashMap::new(),
             flicker_inject_frames: 0,
             pane_text_area_probes: HashMap::new(),
@@ -7261,6 +7297,7 @@ impl TakoApp {
                 self.scroll_ctls.remove(&pane_id);
                 self.pane_font_sizes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
+                self.pane_last_text_areas.remove(&pane_id);
                 self.pane_text_area_probes.remove(&pane_id);
                 self.pane_text_area_drift_logged.remove(&pane_id);
                 self.dock_webview_of(pane_id);
@@ -13551,6 +13588,101 @@ impl TakoApp {
         cell
     }
 
+    /// 表示中タブに居ないペインへも新しいセル寸法を反映する（#647）。
+    ///
+    /// PTY / グリッドのリサイズは `render_pane` の副作用なので、`render_pane` が
+    /// 走らないペイン（= どのウィンドウでも表示されていないタブのペイン）には
+    /// 寸法変更が届かない。フォントサイズを変えると表示中タブだけが新しい
+    /// cols/rows になり、他タブのペインは**古いセル寸法で計算した grid のまま**
+    /// 取り残される。そこで全画面 TUI（claude 等）を動かしていると、そのタブを
+    /// 表示した瞬間に grid が縮んで描画が崩れ、ウィンドウをリサイズして
+    /// もう一度リサイズが走るまで直らない。
+    ///
+    /// 面積は「最後に描画されたときの領域」を使う。タブが隠れてもウィンドウの
+    /// 大きさは変わらないので、次に表示されたときの領域と一致する。
+    ///
+    /// 一度も描画されていないペインだけは [`Self::hidden_tab_pane_areas`] で
+    /// レイアウトから割り出す
+    fn sync_offscreen_pane_sizes(&mut self, content: Bounds<Pixels>, window: &mut Window) {
+        // 表示中でないターミナルペイン。これが空なら（= 単一タブ運用）何もしない。
+        // render は毎フレーム通るので、ここから先の計算は必要なときだけ行う
+        let offscreen: Vec<PaneId> = self
+            .terminals
+            .keys()
+            .copied()
+            .filter(|pid| !self.pane_text_areas.iter().any(|(p, _)| p == pid))
+            .collect();
+        if offscreen.is_empty() {
+            return;
+        }
+        let scale_factor = window.scale_factor();
+        // 「まだ一度も描画されていないペイン」の領域は、非表示タブのレイアウトから
+        // 割り出す（同一ウィンドウなので content は共通）。ここを埋めないと、
+        // 背景タブに作られたペイン（`tako master --tab` / worker spawn）は spawn 時の
+        // 80x24 のまま全画面 TUI が起動してしまう。
+        // レイアウト計算は割り出しが必要なペインが居るときだけ行う（遅延評価）
+        let mut derived: Option<HashMap<PaneId, Bounds<Pixels>>> = None;
+        for pane_id in offscreen {
+            // 表示中ペインと同じ経路でセル寸法を決める（ペイン単位のズームも尊重する）
+            let cell = if self.pane_font_sizes.contains_key(&pane_id) {
+                self.measure_pane_cell(pane_id, window)
+            } else {
+                self.measure_cell(window)
+            };
+            // 実測済みの領域を優先し、無ければレイアウトから割り出したものを使う
+            let area = match self.pane_last_text_areas.get(&pane_id).copied() {
+                Some(area) => Some(area),
+                None => derived
+                    .get_or_insert_with(|| {
+                        Self::hidden_tab_pane_areas(&self.workspace, content, scale_factor)
+                    })
+                    .get(&pane_id)
+                    .copied(),
+            };
+            let Some(area) = area else {
+                continue;
+            };
+            let (cols, rows) = grid_cells(area.size, cell);
+            if let Some(session) = self.terminals.get_mut(&pane_id) {
+                session.resize(
+                    cols,
+                    rows,
+                    f32::from(cell.width).round() as u16,
+                    f32::from(cell.height).round() as u16,
+                );
+            }
+        }
+    }
+
+    /// どのウィンドウでも表示されていないタブのペインについて、表示されたときの
+    /// テキスト領域を割り出す（#647）。一度も描画されていないペインの寸法を
+    /// 決めるためだけに使うので、必要になった時点で 1 回だけ計算する。
+    ///
+    /// 積み上げ（stale バナー #781 / カード帯 #703）はここでは 0 で見積もる。
+    /// どちらもそのペインが**表示された時点で**改めて `render_pane` が正しい
+    /// 領域を入れ直すので、ここでのズレは「表示前の暫定値」にとどまる
+    fn hidden_tab_pane_areas(
+        workspace: &Workspace,
+        content: Bounds<Pixels>,
+        scale_factor: f32,
+    ) -> HashMap<PaneId, Bounds<Pixels>> {
+        let displayed: std::collections::HashSet<TabId> =
+            workspace.windows().iter().map(|w| w.active_tab()).collect();
+        let mut areas = HashMap::new();
+        for tab in workspace.tabs() {
+            if displayed.contains(&tab.id()) {
+                continue;
+            }
+            for (id, r) in tab.tree().layout(Rect::UNIT) {
+                areas.insert(
+                    id,
+                    pane_text_area_rect(content, r, PANE_TITLE_BAR, 0.0, scale_factor),
+                );
+            }
+        }
+        areas
+    }
+
     const FONT_SIZE_MIN: f32 = 8.0;
     const FONT_SIZE_MAX: f32 = 32.0;
     const FONT_SIZE_STEP: f32 = 1.0;
@@ -16084,12 +16216,10 @@ impl TakoApp {
             .or(self.cell_size)
             .expect("render 冒頭で実測済み");
 
-        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ。
-        // 急速リサイズで area が極小/負になる場合に備え 0 クランプ（#385）
-        let area_w = f32::from(area.size.width).max(0.0);
-        let area_h = f32::from(area.size.height).max(0.0);
-        let cols = (area_w / f32::from(cell.width)).floor() as usize;
-        let rows = (area_h / f32::from(cell.height)).floor() as usize;
+        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ（式は grid_cells に共通化）。
+        // 非表示タブへも同じ寸法を反映できるよう、領域を控えておく（#647）
+        self.pane_last_text_areas.insert(pane_id, area);
+        let (cols, rows) = grid_cells(area.size, cell);
         if let Some(session) = self.terminals.get_mut(&pane_id) {
             session.resize(
                 cols,
@@ -19447,6 +19577,9 @@ impl Render for TakoApp {
                 .is_some_and(|t| t != display_tab && visible_tabs.contains(&t))
         });
         self.pane_text_areas.extend(new_areas);
+        // 表示中タブ以外のペインへもセル寸法の変更を届ける（#647）。
+        // pane_text_areas を確定させた直後（= 誰が表示中かが分かった時点）に呼ぶ
+        self.sync_offscreen_pane_sizes(content_rect, window);
 
         let drop_layout = layout.clone();
         // #786: ペイン本体は 1 枚ずつ独立した子ビュー（`PaneBody`）にして
@@ -52165,6 +52298,109 @@ mod self_test {
                 }
             }
 
+            // 127. フォントサイズ変更が「表示中タブ以外」のペインへも届く（#647）。
+            //
+            // PTY / グリッドのリサイズは `render_pane` の副作用なので、裏タブの
+            // ペインには寸法変更が一切届かなかった。フォントを変えると表示中タブ
+            // だけが新しい cols/rows になり、裏タブは**古いセル寸法で計算した
+            // grid のまま**取り残される。そこで全画面 TUI（claude 等）を動かして
+            // いると、そのタブを表示した瞬間に grid が縮んで描画が崩れ、
+            // ウィンドウをリサイズするまで直らない（実機報告の症状）
+            {
+                let any647 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window647 = any647.downcast::<TakoApp>().unwrap_or(window);
+                let hidden647 = window647
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("647-hidden".into()),
+                                // focus させない = 裏タブのまま作る
+                                focus: Some(false),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        // dispatch を直接呼ぶので、セッション起動依頼はここで処理する
+                        // （PTY 無しのペインだと size() が動かない）
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        r["pane"].as_u64().map(PaneId::from_raw)
+                    })
+                    .ok()
+                    .flatten();
+                match hidden647 {
+                    None => println!("TAKO_SELF_TEST_SKIPPED: 127（裏タブを作れない）"),
+                    Some(hidden) => {
+                        notify_and_draw(any647, window647, cx);
+                        // 裏タブのペインの現在のグリッド。この時点で spawn 時の
+                        // 80x24 ではなく実寸へ揃っていること自体が #647 の効果
+                        // （背景タブに作られたペインが 80x24 のまま TUI を起動する問題）
+                        let before = window647
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals.get(&hidden).map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        // グローバルのフォントサイズを変える（設定ファイルは触らない）。
+                        // セル寸法のキャッシュを捨てるのは `reload_theme` 経路と同じ
+                        let (font_before, font_after) = window647
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let before = app.theme.font_size;
+                                let after = if before < 20.0 { 24.0 } else { 10.0 };
+                                app.theme.font_size = after;
+                                app.theme.line_height = after * 1.3;
+                                app.cell_size = None;
+                                app.pane_cell_sizes.clear();
+                                cx.notify();
+                                (before, after)
+                            })
+                            .unwrap_or((0.0, 0.0));
+                        notify_and_draw(any647, window647, cx);
+                        let after = window647
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals.get(&hidden).map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        // 表示中ペインも同じ向きに変わっていること（対照）。
+                        // 片方だけ動いていたら「裏タブへ届いた」とは言えない
+                        let visible_after = window647
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let v = app.focused_pane();
+                                app.terminals.get(&v).map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        let changed = matches!((before, after), (Some(b), Some(a)) if b != a);
+                        println!(
+                            "TAKO_SELF_TEST_647: font {font_before}->{font_after} \
+                             hidden {before:?}->{after:?} visible={visible_after:?}"
+                        );
+                        check(
+                            changed,
+                            &format!(
+                                "127: フォントサイズ変更が裏タブのペインへ届く \
+                                 (#647。hidden {before:?}->{after:?})"
+                            ),
+                        );
+                        // 後片付け: フォントを戻して裏タブを閉じる
+                        let _ = window647.update(cx, |app: &mut TakoApp, _, cx| {
+                            app.theme.font_size = font_before;
+                            app.theme.line_height = font_before * 1.3;
+                            app.cell_size = None;
+                            app.pane_cell_sizes.clear();
+                            if let Some(tab) = app.workspace.find_tab_of_pane(hidden) {
+                                app.remove_tab(tab, cx);
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -52392,6 +52628,55 @@ mod ime_tests {
     fn 非変換中はフォーカスペインを対象にする() {
         let focused = PaneId::from_raw(2);
         assert_eq!(resolve_ime_pane(None, |_| true, focused), focused);
+    }
+}
+
+/// #647: 端末グリッドの算出。表示中ペイン（`render_pane`）と非表示ペイン
+/// （`sync_offscreen_pane_sizes`）が同じ式を使うことをここで固定する。
+/// 式がずれると「タブを表示した瞬間に grid が変わる」= 描画崩れになる
+#[cfg(test)]
+mod grid_cells_tests {
+    use super::grid_cells;
+    use gpui::{px, size};
+
+    #[test]
+    fn 面積とセル寸法から収まるグリッドを求める() {
+        // font 13 相当（advance 7.617 / 行高 17）
+        assert_eq!(
+            grid_cells(size(px(1064.0), px(563.2)), size(px(7.6171875), px(17.0))),
+            (139, 33)
+        );
+        // font 22 相当（advance 12.890625 / 行高 28.769）。同じ面積でも縮む
+        assert_eq!(
+            grid_cells(
+                size(px(1064.0), px(563.2)),
+                size(px(12.890625), px(28.76923))
+            ),
+            (82, 19)
+        );
+        // 端数は切り捨て（はみ出した半端なセルは描かない）
+        assert_eq!(
+            grid_cells(size(px(99.0), px(99.0)), size(px(10.0), px(10.0))),
+            (9, 9)
+        );
+    }
+
+    #[test]
+    fn 極小や計測失敗でも破綻しない() {
+        // 急速リサイズで面積が 0 / 負（#385）。0 を返して下限クランプへ委ねる
+        assert_eq!(
+            grid_cells(size(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            (0, 0)
+        );
+        assert_eq!(
+            grid_cells(size(px(-40.0), px(-10.0)), size(px(8.0), px(16.0))),
+            (0, 0)
+        );
+        // セル寸法 0（フォント計測失敗）でゼロ除算 → inf → as usize を踏まない
+        assert_eq!(
+            grid_cells(size(px(800.0), px(400.0)), size(px(0.0), px(0.0))),
+            (0, 0)
+        );
     }
 }
 
