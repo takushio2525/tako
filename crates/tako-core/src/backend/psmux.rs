@@ -401,6 +401,27 @@ impl SessionBackend for PsmuxBackend {
         parse_pane_pids(&out)
     }
 
+    /// 器の中の全ペイン（#728）。**psmux も `list-panes -a` と
+    /// `#{session_name}:#{window_index}.#{pane_index}` に答える**（Windows 実機で実測。
+    /// `-J` を無視する・複合コマンドの後半を捨てる、といった他の非互換とは違って
+    /// ここは tmux と同じ挙動）。
+    ///
+    /// これがセッションカタログ（#112）と worker の状態解決（#592）の土台になる。
+    /// **`crate::tmux::tmux_command` 経由にしてはいけない**: そちらは `TAKO_TMUX_BIN`
+    /// → PATH の `tmux` を引くので、`TAKO_PSMUX_BIN` だけで入れた psmux を
+    /// 見つけられず「器の中の claude が 1 つも見えない」に化ける（#728 の G2）
+    fn pane_pids_all(&self) -> Vec<(String, u32)> {
+        let out = self
+            .run(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index}.#{pane_index} #{pane_pid}",
+            ])
+            .unwrap_or_default();
+        super::parse_pane_pids_all(&out)
+    }
+
     /// psmux は `#{pane_in_mode}` に答える（実測。`#{mouse_any_flag}` 等の
     /// 未対応変数と違って空文字にならない）。#686
     fn pane_in_mode(&self, session: &SessionRef) -> Option<bool> {

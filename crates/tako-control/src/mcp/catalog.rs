@@ -2746,7 +2746,7 @@ pub fn tools() -> Vec<Value> {
                 会話本文は claude の transcript（~/.claude/projects/）への参照のみ持つ。\
                 action=list: 一覧（role / project で絞り込み、last_seen の新しい順に limit 件）。\
                 action=show: id（前方一致可）のメタ情報 + 会話冒頭の抜粋。\
-                action=resume: ペイン / タブ / tmux が全滅していても、記録された cwd で\
+                action=resume: ペイン / タブ / 永続化の器（tmux / psmux）が全滅していても、記録された cwd で\
                 新しいペインを分割起動し `claude --resume <session_id>` で会話文脈ごと復元する。\
                 「昨日の #159 の子を呼び戻して」のような依頼は list で特定 → resume で復元する。\
                 制限: resume は claude セッションのみ（codex / agy は list に載るが復元不可）。",

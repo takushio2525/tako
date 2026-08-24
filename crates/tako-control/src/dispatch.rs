@@ -7378,12 +7378,17 @@ fn dispatch_orchestrator_spawn(
         .or_else(|| host.backend_session(new_id));
 
     // セッションカタログへ spawn 記録を残す（Issue #112 A）。session_id は claude 起動後に
-    // GUI の定期スキャンが検出して昇格する。失敗してもカタログの都合で spawn は止めない
-    if let Some(ref ts) = tmux_session {
+    // GUI の定期スキャンが検出して昇格する。失敗してもカタログの都合で spawn は止めない。
+    //
+    // #728: 器が無い構成（Windows で psmux 未導入 / tmux 不在の macOS）では
+    // `tmux_session` が None になる。以前はこのブロックごと飛ばしていたので、
+    // spawn 時のメタ（プロンプト・Issue 番号・model）が永久に記録されず、
+    // カタログが「発見性」という存在意義を果たせなかった。キーはペイン ID へ倒す
+    {
         let issues =
             crate::sessions::extract_issues(&format!("{} {prompt}", label.unwrap_or_default()));
         let record = crate::sessions::PendingSpawn {
-            tmux_session: ts.clone(),
+            tmux_session: tmux_session.clone(),
             kind: "worker".into(),
             label: label.map(str::to_string),
             project: Some(project.to_string()),
