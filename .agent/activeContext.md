@@ -8,7 +8,7 @@
 - **#467 Windows 移植はスライス 1〜9 がすべて main へ入り、最後の 8（棚卸し）も完了**。
   残りは「実機バグの消し込み」と「未実測項目の消し込み（#937）」だけ
 - **#591（対応マトリクスの棚卸し + docs ページ）を完了**。判定は
-  **supported 72 / degraded 11 / pending 55 / unsupported 2**（棚卸し前は 4 / 2 / 132 / 2）。
+  **supported 69 / degraded 13 / pending 56 / unsupported 2**（棚卸し前は 4 / 2 / 132 / 2）。
   `Feature::windows_evidence` を新設し **T7 が根拠なしの Supported を落とす**。
   docs は `docs/src/content/docs/windows-support.md`（生成物・CI で `--check`）
 - **Issue の「完了（`cf7c9a4`）」は main に入っていなかった**（#658 と同じ型）。

@@ -189,6 +189,18 @@ pub mod notes {
         "Checking for updates and rendering the release notes work, but applying an update (running the installer and restarting) has not been measured on Windows (#937)",
     );
 
+    /// #899。**画面は出るがボタンが効かない**（PR #931 が実機検証待ちで open）
+    pub const WIN_WELCOME_INJECTION: Note = Note::new(
+        "バナーの表示と案内コマンドの取得は動くが、ボタンからのコマンド投入が LF + POSIX クォート決め打ちなので Windows では実行されない（#899。PR #931 が実機検証待ち）",
+        "The banner renders and the suggested commands can be read, but the command injection behind its buttons hardcodes LF and POSIX quoting, so nothing runs on Windows (#899; PR #931 is awaiting verification on real hardware)",
+    );
+
+    /// #899。表示レイヤは動くがスターターのボタンだけが効かない
+    pub const WIN_STARTER_INJECTION: Note = Note::new(
+        "表示モードの切替とチャット表示は動くが、スターターカードのボタンからのコマンド投入が LF + POSIX クォート決め打ちなので Windows では実行されない（#899。PR #931 が実機検証待ち）",
+        "Switching the display mode and the chat view work, but the command injection behind the starter cards hardcodes LF and POSIX quoting, so nothing runs on Windows (#899; PR #931 is awaiting verification on real hardware)",
+    );
+
     /// #868 / #525。状態照会と手順の提示はできるが、実行の代行は macOS だけ
     pub const WIN_SETUP_BOOTSTRAP: Note = Note::new(
         "状態の確認と公式手順の案内はできるが、インストールの実行代行は macOS だけ（Windows は PowerShell 版インストーラを案内する）",
@@ -1355,10 +1367,13 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup",
         macos: Support::Supported,
-        windows: Support::Supported,
-        windows_evidence: Evidence::SelfTest(
-            "項目 97（スターターの setup リンクから tako setup が入る）+ 実機 setup_bootstrap / changes の単体が緑",
-        ),
+        // セルフテスト項目 97 が見ているのは**スターターに setup の行が入ること**で、
+        // `tako setup` そのものの実行ではない。dispatch の SetupRun は実機で未実測
+        windows: Support::Pending {
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
+        },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_setup_bootstrap",
@@ -1580,9 +1595,11 @@ pub const MATRIX: &[Feature] = &[
         // `tako_chat_copy`（WIN_GUI_CHAT）側で追跡する
         key: "tako_ui_mode",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_STARTER_INJECTION,
+        },
         windows_evidence: Evidence::SelfTest(
-            "項目 93 / 94 / 97 / 100 / 114 / 115（G1 スターター〜チャット表示と仮想化）",
+            "項目 93 / 94 / 97 / 100 / 114 / 115（G1 スターター〜チャット表示と仮想化は緑）。スターターのボタンの投入経路は main が LF + POSIX クォート決め打ちのまま（#899）",
         ),
     },
     Feature {
@@ -1642,9 +1659,11 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_welcome",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_WELCOME_INJECTION,
+        },
         windows_evidence: Evidence::SelfTest(
-            "項目 88（初回起動バナーと案内コマンド）",
+            "項目 88（初回起動バナーと案内コマンドの取得は緑）。ボタンの投入経路は main が LF + POSIX クォート決め打ちのまま（#899）",
         ),
     },
     Feature {

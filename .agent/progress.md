@@ -2957,10 +2957,10 @@
 - **根拠を型にした**: `Feature::windows_evidence`（`SelfTest` / `UnitTest` / `Measured` / `Unverified`）を
   新設し、**T7 が根拠なしの Supported / Degraded / Unsupported を落とす**。検出力は `tako_theme` の
   根拠を外して実測（機能名を名指しして FAILED）。根拠は 実機セルフテストの通し（#920。FAILED 0 / skip 19）
-  65 件・plan の実測記録 18 件・実機で緑のテスト 11 件から採り、残り 46 件は `Unverified` のまま
+  63 件・plan の実測記録 16 件・実機で緑のテスト 11 件・OS の仕様 2 件から採り、残り 47 件は `Unverified` のまま
   Pending（追跡 #937）。**「動く見込み」を Supported と言わない**のは、誤宣言が system prompt へ流れるため
   （`gate()` は production から呼ばれていないので実害は宣言だけ、と確認したうえでの判断）
-- 結果: **supported 72 / degraded 11 / pending 55 / unsupported 2**。prompt へ入る最大の 1 行が
+- 結果: **supported 69 / degraded 13 / pending 56 / unsupported 2**。prompt へ入る最大の 1 行が
   「GUI 起動とペイン / タブ管理の Windows 実装が前提（42 機能）」から「実装は共通だが実機で未実測
   （37 機能・#937）」へ変わった。known_limitations（#594）は同じ関数から出るので自動追随
 - **棚卸しで製品バグ 4 件を確認**: ゴミ箱が完全削除（**#617**）/ AI 命名が一度も走らない（**#722**）/
