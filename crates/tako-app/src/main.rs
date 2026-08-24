@@ -142,6 +142,12 @@ const MENU_BAR_HEIGHT: f32 = 30.0;
 const fn top_chrome_height() -> f32 {
     MENU_BAR_HEIGHT + TAB_BAR_HEIGHT
 }
+/// 人工ちらつきの注入（#932。検出力の実証用。既定は無効）
+fn inject_flicker() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TAKO_932_INJECT_FLICKER").is_some())
+}
+
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
 /// ペイン枠の丸め角（px。カンプ準拠）。
@@ -1620,6 +1626,8 @@ struct TakoApp {
     chrome_views: HashMap<view_cache::ChromePart, gpui::Entity<view_cache::Chrome>>,
     /// ペイン本体を実際に描き直した回数（#786 の効果検証用。単調増加）
     pane_body_renders: u64,
+    /// 人工ちらつきの注入フレーム数（#932。`TAKO_932_INJECT_FLICKER=1` のときだけ動く）
+    flicker_inject_frames: u64,
     /// ペインヘッダを実際に描き直した回数（#803 の効果検証用。単調増加）
     pane_header_renders: u64,
     /// クロームを実際に描き直した回数（同上）
@@ -3129,6 +3137,7 @@ impl TakoApp {
             drag_scroll: None,
             pane_text_areas: Vec::new(),
             pane_content: HashMap::new(),
+            flicker_inject_frames: 0,
             pane_text_area_probes: HashMap::new(),
             pane_text_area_drift_logged: HashMap::new(),
             pane_content_probes: HashMap::new(),
@@ -10841,17 +10850,34 @@ impl TakoApp {
                 continue;
             }
             self.pane_text_area_drift_logged.insert(pane, rounded);
+            // #932: **ずれた軸を必ず出す**。以前は y と高さだけを出していたので、
+            // 横方向（サイドバー幅ぶん等）にずれたときは「ずれ 362px」なのに
+            // 併記した数値が完全一致していて、ログだけでは何も追えなかった
+            let axis = [
+                ("x", d(used.origin.x, real.origin.x)),
+                ("y", d(used.origin.y, real.origin.y)),
+                ("w", d(used.size.width, real.size.width)),
+                ("h", d(used.size.height, real.size.height)),
+            ]
+            .into_iter()
+            .filter(|(_, v)| *v >= 1.0)
+            .map(|(n, v)| format!("{n}={:.0}", v))
+            .collect::<Vec<_>>()
+            .join(" ");
+            let fmt = |b: Bounds<Pixels>| {
+                (
+                    f32::from(b.origin.x).round(),
+                    f32::from(b.origin.y).round(),
+                    f32::from(b.size.width).round(),
+                    f32::from(b.size.height).round(),
+                )
+            };
             tako_control::diag::perf_log(&format!(
-                "テキスト領域の会計漏れ: pane={} ずれ {rounded}px（算術 {:?} / 実描画 {:?}。#781）",
+                "テキスト領域の会計漏れ: pane={} ずれ {rounded}px（{axis}。\
+                 算術 {:?} / 実描画 {:?} = (x, y, w, h)。#781）",
                 pane.as_u64(),
-                (
-                    f32::from(used.origin.y).round(),
-                    f32::from(used.size.height).round()
-                ),
-                (
-                    f32::from(real.origin.y).round(),
-                    f32::from(real.size.height).round()
-                ),
+                fmt(used),
+                fmt(real),
             ));
         }
     }
@@ -19840,6 +19866,21 @@ impl Render for TakoApp {
             // メニューバーのドロップダウン（#657）。パレットの手前 = 最上位に置く必要は
             // 無いが、タブバー・ペインより後（= 手前）でなければ隠れる
             .children(self.render_menu_dropdown(window, cx))
+            // #932: 検出力の実証用。`TAKO_932_INJECT_FLICKER=1` のときだけ、
+            // **フレームごとに色が変わる 8px の四角**を最前面の左上に置く
+            // （= 人工のちらつき）。ちらつき検査（`TAKO_VISUAL_ONLY=flicker`）が
+            // これを捕まえられなければ、検査は「動いていないこと」を見ていない
+            .children(inject_flicker().then(|| {
+                self.flicker_inject_frames = self.flicker_inject_frames.wrapping_add(1);
+                let on = self.flicker_inject_frames.is_multiple_of(2);
+                div()
+                    .absolute()
+                    .left(px(2.0))
+                    .top(px(2.0))
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .bg(if on { gpui::red() } else { gpui::green() })
+            }))
     }
 }
 
@@ -21535,6 +21576,71 @@ mod self_test {
         })
         .ok()
         .flatten()
+    }
+
+    /// フレームと**ウィンドウの活性状態**を一緒に採る（#932）。
+    ///
+    /// 「同じ状態なら同じ絵」を検査するので、活性状態は状態の一部として扱う必要がある
+    /// （非活性になるとフォーカス枠・タブの強調・信号機ボタンの色が正しく変わるため、
+    /// 検証中に前面が入れ替わると本物のちらつきと区別できない）
+    #[cfg(feature = "visual-test")]
+    fn capture_frame_active(
+        any: AnyWindowHandle,
+        cx: &mut AsyncApp,
+    ) -> Option<(image::RgbaImage, f32, bool)> {
+        any.update(cx, |_, window, cx| {
+            window.draw(cx).clear();
+            let scale = window.scale_factor();
+            let active = window.is_window_active();
+            match window.render_to_image() {
+                Ok(image) => Some((image, scale, active)),
+                Err(error) => {
+                    eprintln!("TAKO_VISUAL_CAPTURE_ERROR: {error:#}");
+                    None
+                }
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// フレーム 1 枚の指紋（#932）。実ピクセル全体の FNV-1a。
+    #[cfg(feature = "visual-test")]
+    fn frame_fingerprint(frame: &image::RgbaImage) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in frame.as_raw() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// 2 枚のフレームで色が違う画素の数と、その外接矩形（デバイス px。#932）。
+    /// 完全一致なら `None`
+    #[cfg(feature = "visual-test")]
+    fn frame_diff_bbox(
+        a: &image::RgbaImage,
+        b: &image::RgbaImage,
+    ) -> Option<(u32, u32, u32, u32, u64)> {
+        if a.dimensions() != b.dimensions() {
+            let (w, h) = a.dimensions();
+            return Some((0, 0, w, h, u64::from(w) * u64::from(h)));
+        }
+        let (w, h) = a.dimensions();
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut count = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                if a.get_pixel(x, y) != b.get_pixel(x, y) {
+                    count += 1;
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        (count > 0).then_some((x0, y0, x1, y1, count))
     }
 
     /// 実際にインクが乗っているターミナル行の数（#684）。`text_top` から 1 行ずつ
@@ -27128,6 +27234,631 @@ mod self_test {
         );
     }
 
+    /// 静止した画面が 1 ピクセルも動かないことを実フレームで固定する（#932）。
+    ///
+    /// tako はカーソルを点滅させない（`blink` の実装がワークスペースに 1 つも無い）。
+    /// アニメーションも持たない。だから**入力も notify も無いフレームを重ねたら
+    /// 実ピクセルは完全一致しなければならない**。ちらつきは「状態は同じなのに
+    /// フレームごとに絵が変わる」ことなので、見た目の良し悪しに踏み込まずに
+    /// この不変条件だけで機械検証できる。
+    ///
+    /// 出力が流れている状態は「変わってよい」が、**出力しているペインの外**が
+    /// 元の絵へ戻る（A → B → A）のはちらつきなので、そこだけ別に数える。
+    ///
+    /// 撮影のあいだに待ちを入れるのが要点: 詰めて撮ると数十 ms で終わり、
+    /// **2 秒ごとの定期更新**（`periodic_prep`。状態の作り直し・自動リネーム・
+    /// stale 検知・ポート検知・git ポーリング）が撮影窓に一度も入らない。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=flicker`
+    #[cfg(feature = "visual-test")]
+    async fn flicker_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let frames: usize = std::env::var("TAKO_FLICKER_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        // 既定 100 枚 × 50ms = 約 5 秒。2 秒ごとの定期更新が 2 回以上入る長さ
+        let gap: u64 = std::env::var("TAKO_FLICKER_GAP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        // 静止した状態で `frames` 枚を撮り、(異なる指紋の数, 変わったフレーム対の数,
+        // ずれの矩形一覧, scale) を返す。**notify も入力もしない**
+        // （`capture_frame` は draw → 読み戻しだけ）
+        async fn still_soak(
+            any: AnyWindowHandle,
+            cx: &mut AsyncApp,
+            frames: usize,
+            gap_ms: u64,
+        ) -> (usize, usize, Vec<(u32, u32, u32, u32, u64)>, f32) {
+            let mut prints: Vec<u64> = Vec::new();
+            let mut prev: Option<(image::RgbaImage, bool)> = None;
+            let mut diffs: Vec<(u32, u32, u32, u32, u64)> = Vec::new();
+            let mut changed = 0usize;
+            let mut active_flips = 0usize;
+            let mut scale = 1.0;
+            for i in 0..frames {
+                if i > 0 && gap_ms > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(gap_ms))
+                        .await;
+                }
+                let Some((frame, s, active)) = capture_frame_active(any, cx) else {
+                    continue;
+                };
+                scale = s;
+                // 活性状態が変わったフレームは「状態が変わった」ので比較から外す
+                // （前面の入れ替わりでフォーカス枠・タブ強調が正しく変わる）
+                let same_state = prev.as_ref().is_some_and(|(_, a)| *a == active);
+                if same_state {
+                    prints.push(frame_fingerprint(&frame));
+                }
+                if let Some((p, _)) = prev.as_ref().filter(|_| same_state) {
+                    if let Some(d) = frame_diff_bbox(p, &frame) {
+                        changed += 1;
+                        if !diffs.iter().any(|e| e.0 == d.0 && e.1 == d.1 && e.2 == d.2) {
+                            diffs.push(d);
+                        }
+                    }
+                }
+                if !same_state {
+                    active_flips += 1;
+                }
+                prev = Some((frame, active));
+            }
+            let distinct: std::collections::HashSet<u64> = prints.iter().copied().collect();
+            diffs.truncate(6);
+            if active_flips > 0 {
+                println!("TAKO_VISUAL_PIXEL: flicker (前面の入れ替わり {active_flips} 回を除外)");
+            }
+            (distinct.len().max(1), changed, diffs, scale)
+        }
+
+        // どのタイルが「戻った」か（A → B → A）。出力が流れている状態で使う。
+        // タイルは 32 デバイス px 角。返り値は (戻ったタイル数, 代表タイルの座標)
+        fn reverted_tiles(
+            frames: &[image::RgbaImage],
+            tile: u32,
+            skip: &[(u32, u32, u32, u32)],
+        ) -> (usize, Vec<(u32, u32)>) {
+            if frames.len() < 3 {
+                return (0, Vec::new());
+            }
+            let (w, h) = frames[0].dimensions();
+            let mut reverted = 0usize;
+            let mut spots: Vec<(u32, u32)> = Vec::new();
+            for ty in (0..h).step_by(tile as usize) {
+                for tx in (0..w).step_by(tile as usize) {
+                    if skip.iter().any(|(x0, y0, x1, y1)| {
+                        tx + tile > *x0 && tx < *x1 && ty + tile > *y0 && ty < *y1
+                    }) {
+                        continue;
+                    }
+                    let hashes: Vec<u64> = frames
+                        .iter()
+                        .map(|f| {
+                            let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
+                            for y in ty..(ty + tile).min(h) {
+                                for x in tx..(tx + tile).min(w) {
+                                    for b in f.get_pixel(x, y).0 {
+                                        hh ^= u64::from(b);
+                                        hh = hh.wrapping_mul(0x0000_0100_0000_01b3);
+                                    }
+                                }
+                            }
+                            hh
+                        })
+                        .collect();
+                    // 「変わったのに、あとで前の値へ戻る」= ちらつきの署名。
+                    // 前へ流れるだけの出力（スクロール・追記）では起きない
+                    let mut seen: std::collections::HashMap<u64, usize> =
+                        std::collections::HashMap::new();
+                    let mut flips = false;
+                    for (i, hv) in hashes.iter().enumerate() {
+                        if let Some(prev_i) = seen.get(hv) {
+                            if i - prev_i >= 2 {
+                                flips = true;
+                            }
+                        }
+                        seen.insert(*hv, i);
+                    }
+                    if flips {
+                        reverted += 1;
+                        if spots.len() < 12 {
+                            spots.push((tx, ty));
+                        }
+                    }
+                }
+            }
+            (reverted, spots)
+        }
+
+        /// 領域のインク量（背景と違う画素の数）。「一瞬まっさらになる」ちらつきは
+        /// これが落ち込むので、値の並びを見れば消えたフレームが分かる
+        fn region_ink(frame: &image::RgbaImage, r: (u32, u32, u32, u32)) -> u64 {
+            let (w, h) = frame.dimensions();
+            let bg = frame.get_pixel(r.0.min(w - 1), r.1.min(h - 1)).0;
+            let mut ink = 0u64;
+            for y in (r.1..r.3.min(h)).step_by(2) {
+                for x in (r.0..r.2.min(w)).step_by(2) {
+                    let p = frame.get_pixel(x, y).0;
+                    let d = (i32::from(p[0]) - i32::from(bg[0])).abs()
+                        + (i32::from(p[1]) - i32::from(bg[1])).abs()
+                        + (i32::from(p[2]) - i32::from(bg[2])).abs();
+                    if d > 24 {
+                        ink += 1;
+                    }
+                }
+            }
+            ink
+        }
+
+        // 直接 dispatch は PTY 起動依頼を `pending_attach` へ積むだけなので、
+        // IPC ループと同じ後処理（起動 + 保留書き込み + 重量プレビュー読み込み）を
+        // ここで回す。これを欠くとペインは木にあるのに端末が無く、
+        // 「出力しているつもりで 1 枚も動いていない」空振りになる
+        fn drain(app: &mut TakoApp, cx: &mut Context<TakoApp>) {
+            for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                let _ = app.spawn_session(pane, options, cx);
+            }
+            for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                if let Some(session) = app.terminals.get(&pane) {
+                    session.write(data);
+                }
+            }
+            app.drain_pending_highlights(cx);
+        }
+
+        // AI 自動リネーム（#552）はタブ名を実際に書き換える = 静止判定の対象外。
+        // 撮影を決定的にするため止める（ちらつきとは無関係の正常な変化）
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::AutoRename {
+                        enabled: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                cx.notify();
+            })
+            .ok();
+
+        // --- ラウンド 1: 起動直後の 1 ペイン（静止） ---
+        // 窓が落ち着くまで実フレームを重ねてから撮る（初回の全面描画を測らない）
+        for _ in 0..10 {
+            let _ = capture_frame(any, cx);
+        }
+        wait(cx, 2500).await;
+        let (d1, c1, w1, scale) = still_soak(any, cx, frames, gap).await;
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker idle-1pane frames={frames} gap={gap}ms distinct={d1} \
+             changed={c1} diffs={w1:?} scale={scale}"
+        );
+
+        // --- ラウンド 2: 3 分割 + サイドバー + 右パネル（git）を開いて静止 ---
+        let base = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                for dir in [
+                    tako_control::protocol::Direction::Right,
+                    tako_control::protocol::Direction::Down,
+                    tako_control::protocol::Direction::Right,
+                ] {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(base.as_u64()),
+                            tab: None,
+                            direction: Some(dir),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::User,
+                    );
+                    drain(app, cx);
+                }
+                // サイドバー（ファイルツリー）と右パネル（git）も開く。どちらも
+                // 2 秒ごとのポーリングで中身を作り直すので、周期的なちらつきがあれば出る
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Panel {
+                        visible: Some(true),
+                        width: None,
+                        view: Some(tako_control::protocol::PanelViewWire::Git),
+                        filetree: Some(true),
+                        sidebar_width: None,
+                        show_hidden: None,
+                    },
+                    PaneOrigin::User,
+                );
+                cx.notify();
+                base
+            })
+            .expect("flicker: 分割の基準ペイン");
+        wait(cx, 3000).await;
+        let (d2, c2, w2, _) = still_soak(any, cx, frames, gap).await;
+        let terms2 = window
+            .update(cx, |app, _, _| app.terminals.len())
+            .unwrap_or(0);
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker idle-4pane terminals={terms2} frames={frames} \
+             distinct={d2} changed={c2} diffs={w2:?}"
+        );
+
+        // --- ラウンド 3: プレビュー（コード + md + PDF。静止） ---
+        let dir = std::env::temp_dir().join(format!("tako-flicker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("flicker: fixture ディレクトリ");
+        let code = dir.join("sample.rs");
+        std::fs::write(
+            &code,
+            "fn main() {\n    // ちらつき検査用\n    println!(\"hi\");\n}\n",
+        )
+        .expect("flicker: code fixture");
+        let md = dir.join("sample.md");
+        std::fs::write(&md, "# 見出し\n\n本文と `コード`。\n\n- a\n- b\n").expect("flicker: md");
+        let pdf = dir.join("sample.pdf");
+        write_test_pdf(&pdf);
+        let previews = window
+            .update(cx, |app, _, cx| {
+                let mut opened = 0;
+                // **分割方向を明示**して 1 ファイル = 1 プレビューペインにする。
+                // 方向省略だと同じペインを差し替えるので 3 回開いても 1 枚しか残らない
+                for (path, dir) in [
+                    (&code, tako_control::protocol::Direction::Right),
+                    (&md, tako_control::protocol::Direction::Down),
+                    (&pdf, tako_control::protocol::Direction::Right),
+                ] {
+                    let ok = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(base.as_u64()),
+                            path: path.display().to_string(),
+                            mode: None,
+                            direction: Some(dir),
+                            focus: Some(false),
+                            new_tab: false,
+                        },
+                        PaneOrigin::User,
+                    )
+                    .is_ok();
+                    drain(app, cx);
+                    opened += usize::from(ok);
+                }
+                app.drain_pending_highlights(cx);
+                cx.notify();
+                opened
+            })
+            .unwrap_or(0);
+        // PDF の background ラスタライズと md の目次構築が終わるのを待つ
+        wait(cx, 5000).await;
+        for _ in 0..10 {
+            let _ = capture_frame(any, cx);
+        }
+        let (d3, c3, w3, _) = still_soak(any, cx, frames, gap).await;
+        let kinds = window
+            .update(cx, |app, _, _| {
+                let mut v: Vec<String> = app
+                    .previews
+                    .iter()
+                    .map(|(p, s)| format!("{}:{:?}", p.as_u64(), s.mode))
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker idle-preview opened={previews} kinds={kinds:?} \
+             frames={frames} distinct={d3} changed={c3} diffs={w3:?}"
+        );
+
+        // --- ラウンド 4: 片方のペインが出力し続けているあいだ、**外側**が戻らないか ---
+        // 専用タブへ移す（前ラウンドのタブは 7 ペインで 1 枚が数 px しかなく、
+        // TUI が 2x2 になって「動いていない」空振りになる）
+        let out_pane = window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::TabNew {
+                        title: None,
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                let pane = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|p| app.terminals.contains_key(p) && !app.previews.contains_key(p));
+                let target = pane.unwrap_or(base);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(target.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                cx.notify();
+                target
+            })
+            .unwrap_or(base);
+        wait(cx, 2500).await;
+        // 実エージェント TUI と同じ「同じ場所を塗り替え続ける」出力（スピナー）。
+        // 行が増えないので、外側が戻ったら原因は出力ではなく描画側
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Focus {
+                        pane: Some(out_pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::User,
+                );
+                if let Some(session) = app.terminals.get(&out_pane) {
+                    // 行末は `pty_line`（CR）で送る（#897 の番犬）
+                    session.write(pty_line(
+                        "clear; i=0; while [ $i -lt 4000 ]; do printf '\\rworking %d' $i; \
+                         i=$((i+1)); sleep 0.05; done",
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        wait(cx, 1500).await;
+        let (out_rect, tail) = window
+            .update(cx, |app, _, _| {
+                let rect = app
+                    .pane_text_areas
+                    .iter()
+                    .find(|(p, _)| *p == out_pane)
+                    .map(|(_, b)| {
+                        (
+                            (f32::from(b.origin.x) * scale) as u32,
+                            (f32::from(b.origin.y) * scale) as u32,
+                            ((f32::from(b.origin.x) + f32::from(b.size.width)) * scale) as u32,
+                            ((f32::from(b.origin.y) + f32::from(b.size.height)) * scale) as u32,
+                        )
+                    });
+                let tail = app.terminals.get(&out_pane).map(|s| {
+                    s.screen(&app.theme)
+                        .lines
+                        .iter()
+                        .rev()
+                        .find(|l| !l.text.trim().is_empty())
+                        .map(|l| l.text.trim().to_string())
+                        .unwrap_or_default()
+                });
+                (rect, tail)
+            })
+            .unwrap_or((None, None));
+        let mut shots: Vec<(image::RgbaImage, bool)> = Vec::new();
+        for i in 0..frames {
+            if i > 0 {
+                // 出力が実際に流れる速さ（スピナーは 50ms 間隔）に合わせて撮る
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+            }
+            if let Some((frame, _, active)) = capture_frame_active(any, cx) {
+                shots.push((frame, active));
+            }
+        }
+        // 多数派の活性状態のフレームだけを見る（前面の入れ替わりを混ぜない）
+        let want = shots.iter().filter(|(_, a)| *a).count() * 2 >= shots.len();
+        let shots: Vec<image::RgbaImage> = shots
+            .into_iter()
+            .filter(|(_, a)| *a == want)
+            .map(|(f, _)| f)
+            .collect();
+        // 出力ペインの本文とタイトルバーは除外する（そこは変わってよい）
+        let mut skip: Vec<(u32, u32, u32, u32)> = out_rect.into_iter().collect();
+        if let Some((x0, y0, x1, _)) = out_rect {
+            let top = y0.saturating_sub(((PANE_TITLE_BAR + PANE_PADDING) * scale) as u32);
+            skip.push((x0, top, x1, y0));
+        }
+        let (rev, spots) = reverted_tiles(&shots, 32, &skip);
+        let changed_pairs = shots
+            .windows(2)
+            .filter_map(|w| frame_diff_bbox(&w[0], &w[1]))
+            .count();
+        // 出力ペインの中が「一瞬まっさらになる」ちらつきの検出（インクの落ち込み）
+        let (ink_min, ink_med, ink_low) = match out_rect {
+            Some(r) => {
+                let mut ink: Vec<u64> = shots.iter().map(|f| region_ink(f, r)).collect();
+                let min = ink.iter().copied().min().unwrap_or(0);
+                ink.sort_unstable();
+                let med = ink.get(ink.len() / 2).copied().unwrap_or(0);
+                let low = ink.iter().filter(|v| **v * 2 < med).count();
+                (min, med, low)
+            }
+            None => (0, 0, 0),
+        };
+        // タブバー帯（`TAB_BAR_HEIGHT` の内側）の平均輝度の振れ幅（#932）。
+        // #217 の「実行中タブのドットを 2 秒周期で脈動させる」アニメーションは
+        // 面積が小さいのでインクの数では出ない。輝度の平均で見る
+        let strip_h = (TAB_BAR_HEIGHT * scale) as u32;
+        let (tab_lum_min, tab_lum_max) = shots.iter().fold((f64::MAX, 0f64), |(lo, hi), f| {
+            let (w, _) = f.dimensions();
+            let mut sum = 0u64;
+            let mut n = 0u64;
+            for y in (0..strip_h).step_by(2) {
+                for x in (0..w).step_by(2) {
+                    let p = f.get_pixel(x, y).0;
+                    sum += u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]);
+                    n += 3;
+                }
+            }
+            let m = sum as f64 / n.max(1) as f64;
+            (lo.min(m), hi.max(m))
+        });
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker tabbar-pulse lum_min={tab_lum_min:.3} \
+             lum_max={tab_lum_max:.3} swing={:.3}",
+            tab_lum_max - tab_lum_min
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker output-running frames={} out_pane={} tail={tail:?} \
+             changed_pairs={changed_pairs} reverted_tiles={rev} spots={spots:?} \
+             ink(min={ink_min} median={ink_med} frames_below_half={ink_low}) skip={skip:?}",
+            shots.len(),
+            out_pane.as_u64()
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let _ = std::fs::create_dir_all(&dump);
+            for (i, f) in shots.iter().take(8).enumerate() {
+                let _ = f.save(std::path::Path::new(&dump).join(format!("flicker-out-{i}.png")));
+            }
+        }
+
+        // --- ラウンド 5: 代替画面（alt screen）の全面塗り替え ---
+        // エージェント TUI（claude / codex）はここを通る。主画面の `\r` 上書きとは
+        // 経路が違う（スクロールミラー非経路・`is_alt_screen` の分岐）ので別に測る
+        let alt = dir.join("altscreen.sh");
+        std::fs::write(
+            &alt,
+            "printf '\\033[?1049h'\n\
+             i=0\n\
+             while [ $i -lt 2000 ]; do\n\
+             printf '\\033[H'\n\
+             j=0\n\
+             while [ $j -lt 20 ]; do\n\
+             printf '\\033[K row %02d frame %04d ------------------------------\\n' $j $i\n\
+             j=$((j+1))\n\
+             done\n\
+             i=$((i+1))\n\
+             sleep 0.05\n\
+             done\n",
+        )
+        .expect("flicker: alt screen fixture");
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&out_pane) {
+                    // 走っているスピナーを止めてから alt screen の fixture へ切り替える
+                    session.write(b"\x03".to_vec());
+                    session.write(pty_line(&format!("clear; sh {}", alt.display())));
+                }
+                cx.notify();
+            })
+            .ok();
+        wait(cx, 2000).await;
+        let alt_state = window
+            .update(cx, |app, _, _| {
+                app.terminals
+                    .get(&out_pane)
+                    .map(|s| (s.is_alt_screen(), s.size()))
+            })
+            .ok()
+            .flatten();
+        let mut alt_shots: Vec<(image::RgbaImage, bool)> = Vec::new();
+        for i in 0..frames {
+            if i > 0 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+            }
+            if let Some((frame, _, active)) = capture_frame_active(any, cx) {
+                alt_shots.push((frame, active));
+            }
+        }
+        let alt_want = alt_shots.iter().filter(|(_, a)| *a).count() * 2 >= alt_shots.len();
+        let alt_shots: Vec<image::RgbaImage> = alt_shots
+            .into_iter()
+            .filter(|(_, a)| *a == alt_want)
+            .map(|(f, _)| f)
+            .collect();
+        let (alt_rev, alt_spots) = reverted_tiles(&alt_shots, 32, &skip);
+        let alt_changed = alt_shots
+            .windows(2)
+            .filter_map(|w| frame_diff_bbox(&w[0], &w[1]))
+            .count();
+        let (alt_ink_min, alt_ink_med, alt_ink_low) = match out_rect {
+            Some(r) => {
+                let mut ink: Vec<u64> = alt_shots.iter().map(|f| region_ink(f, r)).collect();
+                let min = ink.iter().copied().min().unwrap_or(0);
+                ink.sort_unstable();
+                let med = ink.get(ink.len() / 2).copied().unwrap_or(0);
+                let low = ink.iter().filter(|v| **v * 2 < med).count();
+                (min, med, low)
+            }
+            None => (0, 0, 0),
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker alt-screen frames={} state={alt_state:?} \
+             changed_pairs={alt_changed} reverted_tiles={alt_rev} spots={alt_spots:?} \
+             ink(min={alt_ink_min} median={alt_ink_med} frames_below_half={alt_ink_low})",
+            alt_shots.len()
+        );
+
+        // 静止画面が動いたら、それがちらつきの実体（原因は diffs の矩形から追える）
+        check(
+            d1 == 1,
+            "ちらつき: 素の 1 ペインの静止画面が 1 ピクセルも動かない（#932）",
+        );
+        check(
+            terms2 >= 4,
+            "ちらつき: 分割ラウンドで端末が 4 枚立っている（空振り検出。#932）",
+        );
+        check(
+            d2 == 1,
+            "ちらつき: 4 分割 + サイドバー + git パネルの静止画面が 1 ピクセルも動かない（#932）",
+        );
+        check(
+            kinds.len() >= 3,
+            "ちらつき: プレビューが 3 枚開いている（空振り検出。#932）",
+        );
+        check(
+            d3 == 1,
+            "ちらつき: プレビュー（コード / md / PDF）の静止画面が 1 ピクセルも動かない（#932）",
+        );
+        // 出力が 1 枚も動いていなければこの検査は空振り（偽の緑）なので、
+        // 「動いていること」自体を先に確かめる（#796 の作法）
+        check(
+            changed_pairs > 0,
+            "ちらつき: 出力ラウンドで画面が実際に動いている（空振り検出。#932）",
+        );
+        check(
+            rev == 0,
+            "ちらつき: 出力中のペインの外側は前の絵へ戻らない（#932）",
+        );
+        check(
+            ink_low == 0,
+            "ちらつき: 出力中のペインの中身が一瞬まっさらにならない（#932）",
+        );
+        check(
+            alt_state.is_some_and(|(alt, _)| alt) && alt_changed > 0,
+            "ちらつき: 代替画面ラウンドが実際に alt screen で動いている（空振り検出。#932）",
+        );
+        check(
+            alt_rev == 0,
+            "ちらつき: 代替画面の塗り替え中も外側は前の絵へ戻らない（#932）",
+        );
+        check(
+            alt_ink_low == 0,
+            "ちらつき: 代替画面の塗り替え中に中身が一瞬まっさらにならない（#932）",
+        );
+    }
     /// 端末グリッド描画の 1 フレームあたりコストを測る（#787 / #782 / #786）。
     ///
     /// **ディスプレイが消えていても測れる**のが要点。実ウィンドウの表示に頼ると
@@ -27346,7 +28077,12 @@ mod self_test {
                 }
                 "preview-code" => {
                     preview_code_visual(any, window, cx).await;
-            remote_tree_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #932: 静止した画面が 1 ピクセルも動かないか（ちらつきの機械検証）
+                "flicker" => {
+                    flicker_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
@@ -27360,7 +28096,7 @@ mod self_test {
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
-                         remote-tree）"
+                         remote-tree / flicker）"
                     );
                     std::process::exit(1);
                 }
@@ -29567,6 +30303,10 @@ mod self_test {
             // 実データ規模（アカウント複数・プロジェクト複数・全項目表示）で開き、
             // **実際に描かれた矩形**（絶対配置 canvas で記録）から重なり・食み出しを数える
             profiles_form_visual(window, cx).await;
+
+            // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
+            // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
+            flicker_visual(any, window, cx).await;
 
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);
