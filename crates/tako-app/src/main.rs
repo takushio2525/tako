@@ -1094,6 +1094,21 @@ fn grid_cells(area: Size<Pixels>, cell: Size<Pixels>) -> (usize, usize) {
     (cols, rows)
 }
 
+/// `TakoApp::offscreen_areas` の作り直し条件（#932）。
+/// (コンテンツ矩形, タブ数, 端末数, stale バナー数, カードの有無, 拡大率のビット列)
+type OffscreenAreaKey = (Bounds<Pixels>, usize, usize, usize, bool, u32);
+
+/// 裏タブのペインを「表に出たときの寸法」へ合わせるのを切って、同じバイナリで
+/// A/B を取る逃げ道（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）。
+///
+/// 切ると #647 の挙動（= 最後に描かれたときの領域を使う）へ戻る。幾何が変わった
+/// あとで表に出すと切り替えの瞬間にリサイズが走る（#932 の症状）ので、
+/// 検出力の実証と切り分けに使う。既定は有効（未設定 = 表に出たときの寸法へ合わせる）
+fn offscreen_geometry_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_932_NO_OFFSCREEN_GEOMETRY").is_some())
+}
+
 /// 未確定文字列（marked text）のハイライト区間を組む（FR-1.9）。
 ///
 /// ハイライト範囲は重複禁止（`StyledText` の要求）なので、注目文節の前・文節・後の
@@ -1331,6 +1346,12 @@ struct TakoApp {
     /// 「area は変わらないがセル寸法が変わる」ときにも全ペインへ反映できる。
     /// ペインを閉じたときだけ捨てる
     pane_last_text_areas: HashMap<PaneId, Bounds<Pixels>>,
+    /// 非表示ペインの「表に出たときのテキスト領域」（#932）。
+    /// 材料（コンテンツ矩形・タブ数・端末数・バナー数・カードの有無・拡大率）が
+    /// 変わったときと、2 秒に 1 回だけ作り直す
+    offscreen_areas: Option<(OffscreenAreaKey, HashMap<PaneId, Bounds<Pixels>>)>,
+    /// `offscreen_areas` を最後に作り直した時刻（取りこぼしの保険。#932）
+    offscreen_areas_at: std::time::Instant,
     /// ペインを並べるコンテナ（絶対配置ペインの containing block）の実描画矩形。
     /// ウィンドウ単位（#339 の複数ウィンドウは同一 entity を共有するためキーが要る）。
     /// #684: ここが「正」。詳細は `PaneContentGeometry`
@@ -3181,6 +3202,8 @@ impl TakoApp {
             drag_scroll: None,
             pane_text_areas: Vec::new(),
             pane_last_text_areas: HashMap::new(),
+            offscreen_areas: None,
+            offscreen_areas_at: std::time::Instant::now(),
             pane_content: HashMap::new(),
             flicker_inject_frames: 0,
             pane_text_area_probes: HashMap::new(),
@@ -13616,28 +13639,29 @@ impl TakoApp {
             return;
         }
         let scale_factor = window.scale_factor();
-        // 「まだ一度も描画されていないペイン」の領域は、非表示タブのレイアウトから
-        // 割り出す（同一ウィンドウなので content は共通）。ここを埋めないと、
-        // 背景タブに作られたペイン（`tako master --tab` / worker spawn）は spawn 時の
-        // 80x24 のまま全画面 TUI が起動してしまう。
-        // レイアウト計算は割り出しが必要なペインが居るときだけ行う（遅延評価）
-        let mut derived: Option<HashMap<PaneId, Bounds<Pixels>>> = None;
+        let default_cell = self.measure_cell(window);
+        // #932: 「表に出たときの領域」を**表示中とまったく同じ会計**で割り出しておく
+        self.refresh_offscreen_pane_areas(content, scale_factor, default_cell);
         for pane_id in offscreen {
             // 表示中ペインと同じ経路でセル寸法を決める（ペイン単位のズームも尊重する）
             let cell = if self.pane_font_sizes.contains_key(&pane_id) {
                 self.measure_pane_cell(pane_id, window)
             } else {
-                self.measure_cell(window)
+                default_cell
             };
-            // 実測済みの領域を優先し、無ければレイアウトから割り出したものを使う
-            let area = match self.pane_last_text_areas.get(&pane_id).copied() {
-                Some(area) => Some(area),
-                None => derived
-                    .get_or_insert_with(|| {
-                        Self::hidden_tab_pane_areas(&self.workspace, content, scale_factor)
-                    })
-                    .get(&pane_id)
-                    .copied(),
+            // #932: **表に出たときの領域が正**。#647 は「最後に描かれたときの領域」を
+            // 使っていたが、それだとウィンドウ寸法・サイドバー幅が変わったあとも
+            // 古い寸法のまま残り、表に出した瞬間にリサイズ = SIGWINCH が飛ぶ。
+            // どのタブにも居ないペイン（たまり場）だけ、最後に描かれた領域へ落とす
+            let derived = self
+                .offscreen_areas
+                .as_ref()
+                .and_then(|(_, areas)| areas.get(&pane_id).copied());
+            let last = self.pane_last_text_areas.get(&pane_id).copied();
+            let area = if offscreen_geometry_disabled() {
+                last.or(derived)
+            } else {
+                derived.or(last)
             };
             let Some(area) = area else {
                 continue;
@@ -13654,33 +13678,95 @@ impl TakoApp {
         }
     }
 
-    /// どのウィンドウでも表示されていないタブのペインについて、表示されたときの
-    /// テキスト領域を割り出す（#647）。一度も描画されていないペインの寸法を
-    /// 決めるためだけに使うので、必要になった時点で 1 回だけ計算する。
+    /// どのウィンドウでも表示されていないタブのペインについて、**表示されたときの**
+    /// テキスト領域を割り出す（#647 / #932）。
     ///
-    /// 積み上げ（stale バナー #781 / カード帯 #703）はここでは 0 で見積もる。
-    /// どちらもそのペインが**表示された時点で**改めて `render_pane` が正しい
-    /// 領域を入れ直すので、ここでのズレは「表示前の暫定値」にとどまる
-    fn hidden_tab_pane_areas(
-        workspace: &Workspace,
+    /// 積み上げ（タイトルバー / stale バナー #781 / カード帯 #703）は
+    /// [`Self::pane_text_area_of`] を通すので**表示中とまったく同じ**になる。
+    /// ここを簡略化すると割り出した寸法と表示時の寸法が食い違い、
+    /// 表に出した瞬間に改めてリサイズが走る（= #932 の症状が戻る）。
+    ///
+    /// 毎フレーム作り直す必要は無いので、材料が変わったときと 2 秒に 1 回だけ回す
+    /// （分割比の変更のように材料に現れない変化を取りこぼさないための保険）
+    fn refresh_offscreen_pane_areas(
+        &mut self,
         content: Bounds<Pixels>,
         scale_factor: f32,
-    ) -> HashMap<PaneId, Bounds<Pixels>> {
-        let displayed: std::collections::HashSet<TabId> =
-            workspace.windows().iter().map(|w| w.active_tab()).collect();
+        default_cell: Size<Pixels>,
+    ) {
+        let key: OffscreenAreaKey = (
+            content,
+            self.workspace.tabs().len(),
+            self.terminals.len(),
+            self.stale_binary_banners.len(),
+            !self.command_cards.is_empty(),
+            scale_factor.to_bits(),
+        );
+        let fresh = self.offscreen_areas_at.elapsed() < Duration::from_secs(2);
+        if fresh
+            && self
+                .offscreen_areas
+                .as_ref()
+                .is_some_and(|(k, _)| *k == key)
+        {
+            return;
+        }
+        let displayed: std::collections::HashSet<TabId> = self
+            .workspace
+            .windows()
+            .iter()
+            .map(|w| w.active_tab())
+            .collect();
+        let hidden: Vec<Vec<(PaneId, Rect)>> = self
+            .workspace
+            .tabs()
+            .iter()
+            .filter(|t| !displayed.contains(&t.id()))
+            .map(|t| t.tree().layout(Rect::UNIT))
+            .collect();
         let mut areas = HashMap::new();
-        for tab in workspace.tabs() {
-            if displayed.contains(&tab.id()) {
-                continue;
-            }
-            for (id, r) in tab.tree().layout(Rect::UNIT) {
-                areas.insert(
-                    id,
-                    pane_text_area_rect(content, r, PANE_TITLE_BAR, 0.0, scale_factor),
-                );
+        for layout in hidden {
+            for (id, r) in layout {
+                let area = self.pane_text_area_of(id, content, r, scale_factor, default_cell);
+                areas.insert(id, area);
             }
         }
-        areas
+        self.offscreen_areas = Some((key, areas));
+        self.offscreen_areas_at = std::time::Instant::now();
+    }
+
+    /// ペイン 1 枚のテキスト領域（`pane_text_areas` に入る矩形）を組む。
+    ///
+    /// テキスト領域はタイトルバー（`PANE_TITLE_BAR`）の下から始まる。#781: stale claude
+    /// バナー（#498）もヘッダとテキスト領域のあいだに積まれる**流れの中の要素**なので
+    /// ここで一緒に会計する（引き忘れるとドラッグ選択・IME 位置・PTY 行数が同時にずれる）。
+    /// AI コマンド提案カードの帯（#703）はテキスト領域の**外**（下）なので先に差し引く。
+    ///
+    /// #932: 表示中のタブ（`render()` の `new_areas`）と、表示されていないタブの割り出し
+    /// （[`Self::refresh_offscreen_pane_areas`]）が**この 1 本**を通る。片方だけ変えると
+    /// 「裏で合わせた寸法」と「表に出たときの寸法」が食い違い、切り替えの瞬間に
+    /// またリサイズが走る
+    fn pane_text_area_of(
+        &mut self,
+        pane_id: PaneId,
+        content: Bounds<Pixels>,
+        r: Rect,
+        scale_factor: f32,
+        default_cell: Size<Pixels>,
+    ) -> Bounds<Pixels> {
+        let stacked_top = PANE_TITLE_BAR + self.stale_banner_height(pane_id);
+        let full = pane_text_area_rect(content, r, stacked_top, 0.0, scale_factor);
+        let cell_h = self
+            .cell_size_for_pane(pane_id)
+            .map(|c| f32::from(c.height))
+            .unwrap_or(f32::from(default_cell.height));
+        let band = self.card_band_height(
+            pane_id,
+            f32::from(full.size.height),
+            f32::from(full.size.width),
+            cell_h,
+        );
+        pane_text_area_rect(content, r, stacked_top, band, scale_factor)
     }
 
     const FONT_SIZE_MIN: f32 = 8.0;
@@ -19565,29 +19651,9 @@ impl Render for TakoApp {
         let new_areas: Vec<(PaneId, Bounds<Pixels>)> = layout
             .iter()
             .map(|(id, r)| {
-                // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる。
-                // #781: stale claude バナー（#498）もヘッダとテキスト領域のあいだに
-                // 積まれる**流れの中の要素**なので、ここで一緒に会計する
-                // （引き忘れるとドラッグ選択・IME 位置・PTY 行数が同時にずれる）
-                let stacked_top = PANE_TITLE_BAR + self.stale_banner_height(*id);
-                let full = pane_text_area_rect(content_rect, *r, stacked_top, 0.0, scale_factor);
-                // AI コマンド提案カードの帯（#703）はテキスト領域の**外**（下）に置く。
-                // ここで先に差し引いておくことで、PTY の行数・マウス座標変換・IME 位置が
-                // すべて「カードに隠されていない領域」だけを指すようになる
-                // （= 会話とカードが重なることが構造的に起きない）
-                let cell_h = self
-                    .cell_size_for_pane(*id)
-                    .map(|c| f32::from(c.height))
-                    .unwrap_or(f32::from(cell.height));
-                let band = self.card_band_height(
-                    *id,
-                    f32::from(full.size.height),
-                    f32::from(full.size.width),
-                    cell_h,
-                );
                 (
                     *id,
-                    pane_text_area_rect(content_rect, *r, stacked_top, band, scale_factor),
+                    self.pane_text_area_of(*id, content_rect, *r, scale_factor, cell),
                 )
             })
             .collect();
@@ -28964,6 +29030,590 @@ mod self_test {
             alt_shots.len()
         );
 
+        // --- ラウンド 6 / 7: 過渡期（タブ切り替え・ペインサイズ変更）（#932 第 2 ラウンド） ---
+        //
+        // 「一瞬まっさらになる」は**過渡期にしか出ない**ので、静止フレームの比較
+        // （ラウンド 1〜3）では原理的に捕まらない。ここでは 2 つの目盛りで測る。
+        //
+        // 1. **実フレーム**（`capture_frame`）: 実際に見える絵。ただし draw + GPU
+        //    読み戻しで 1 枚あたり数十〜数百 ms かかるので、**短い過渡期は取りこぼす**
+        // 2. **端末グリッド**（`screen()`）: GPU を通らないので桁違いに速く採れる。
+        //    「実フレームなら真っ黒に見えたはずの瞬間」はここで捕まる。
+        //    ディスプレイは 60Hz なので、**16ms 以上続いた消失は実際に 1 枚は描かれる**
+
+        /// 端末グリッドの「インクのある行数」を高頻度で採る（ペインごと）。
+        /// 返り値は (経過 ms, ペインごとの行数)
+        async fn grid_ink_trace(
+            window: &WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            panes: &[PaneId],
+            samples: usize,
+            interval_ms: u64,
+        ) -> Vec<(u64, Vec<usize>)> {
+            let start = std::time::Instant::now();
+            let mut out = Vec::with_capacity(samples);
+            for i in 0..samples {
+                if i > 0 && interval_ms > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(interval_ms))
+                        .await;
+                }
+                let row = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        panes
+                            .iter()
+                            .map(|p| {
+                                app.terminals
+                                    .get(p)
+                                    .map(|s| {
+                                        s.screen(&app.theme)
+                                            .lines
+                                            .iter()
+                                            .filter(|l| !l.text.trim().is_empty())
+                                            .count()
+                                    })
+                                    .unwrap_or(0)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                out.push((start.elapsed().as_millis() as u64, row));
+            }
+            out
+        }
+
+        /// トレースから「消えていた」サンプルを数える。基準は落ち着いた状態の行数。
+        /// 返り値は (消えていたサンプル数, 連続した最長 ms, 代表サンプル)
+        /// (消えていたサンプル数, 連続した最長 ms, 代表サンプル, 最小行数, 採取した長さ ms)
+        type Blackout = (usize, u64, Vec<(u64, Vec<usize>)>, usize, u64);
+        fn blackout_stats(trace: &[(u64, Vec<usize>)], baseline: &[usize]) -> Blackout {
+            let mut count = 0usize;
+            let mut worst = 0u64;
+            let mut run_start: Option<u64> = None;
+            let mut shown: Vec<(u64, Vec<usize>)> = Vec::new();
+            let mut last_t = 0u64;
+            // 部分的な描き直し（半分は超えているが落ちている）も見えるように最小値を返す。
+            // 採取の間隔（= この目盛りで見える最短の過渡期）も一緒に返す
+            let min_rows = trace
+                .iter()
+                .flat_map(|(_, r)| r.iter().copied())
+                .min()
+                .unwrap_or(0);
+            let span_ms = trace.last().map(|(t, _)| *t).unwrap_or(0);
+            for (t, rows) in trace {
+                let blank = rows
+                    .iter()
+                    .zip(baseline.iter())
+                    .any(|(r, b)| *b > 2 && *r * 2 < *b);
+                if blank {
+                    count += 1;
+                    if shown.len() < 6 {
+                        shown.push((*t, rows.clone()));
+                    }
+                    if run_start.is_none() {
+                        run_start = Some(*t);
+                    }
+                } else if let Some(s) = run_start.take() {
+                    worst = worst.max(t.saturating_sub(s));
+                }
+                last_t = *t;
+            }
+            if let Some(s) = run_start {
+                worst = worst.max(last_t.saturating_sub(s));
+            }
+            (count, worst, shown, min_rows, span_ms)
+        }
+
+        /// 実フレームのインクの谷（中央値の半分未満）。返り値は (中央値, 谷の数, 代表)
+        fn ink_transient_dips(ink: &[u64]) -> (u64, usize, Vec<(usize, u64)>) {
+            if ink.is_empty() {
+                return (0, 0, Vec::new());
+            }
+            let mut sorted = ink.to_vec();
+            sorted.sort_unstable();
+            let median = sorted[sorted.len() / 2];
+            let mut dips: Vec<(usize, u64)> = Vec::new();
+            for (i, v) in ink.iter().enumerate() {
+                if v * 2 < median && dips.len() < 8 {
+                    dips.push((i, *v));
+                }
+            }
+            (
+                median,
+                ink.iter().filter(|v| **v * 2 < median).count(),
+                dips,
+            )
+        }
+
+        // 表示中タブのテキスト領域の外接矩形（デバイス px）。左上はターミナル背景に
+        // なるので `region_ink` の基準色として正しい（ペイン枠・ヘッダを含めない）
+        fn text_union_px(app: &TakoApp, scale: f32) -> Option<(u32, u32, u32, u32)> {
+            let mut x0 = f32::MAX;
+            let mut y0 = f32::MAX;
+            let mut x1 = 0f32;
+            let mut y1 = 0f32;
+            for (_, b) in app.pane_text_areas.iter() {
+                x0 = x0.min(f32::from(b.origin.x));
+                y0 = y0.min(f32::from(b.origin.y));
+                x1 = x1.max(f32::from(b.origin.x) + f32::from(b.size.width));
+                y1 = y1.max(f32::from(b.origin.y) + f32::from(b.size.height));
+            }
+            (x1 > x0 && y1 > y0).then_some((
+                (x0 * scale) as u32,
+                (y0 * scale) as u32,
+                (x1 * scale) as u32,
+                (y1 * scale) as u32,
+            ))
+        }
+
+        // 静止したテキストを 1 ペインへ流し込む（走り続けるプログラムは残さない）。
+        //
+        // **密な色つきの行**にするのが要点。器（tmux）は寸法が変わると画面を丸ごと
+        // 描き直すので、その 1 回のバイト数が PTY のバッファを超えると**途中で切れて
+        // 届く**。切れ目で 1 フレーム描くと「消えかけの画面」が見える。
+        // 薄い内容だと 1 回の write に収まってしまい、この経路を一度も通らない
+        let fill_static =
+            |window: &WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId, tag: &str| {
+                let line = format!(
+                    "clear; i=1; while [ $i -le 60 ]; do \
+                     printf '\\033[3%dm{tag} row %02d \
+                     ================================================================\\033[0m\\n' \
+                     $((i%8)) $i; i=$((i+1)); done"
+                );
+                window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(pty_line(&line));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            };
+
+        // 落ち着いた状態のインク行数（グリッド基準値）
+        async fn settled_rows(
+            window: &WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            panes: &[PaneId],
+        ) -> Vec<usize> {
+            grid_ink_trace(window, cx, panes, 1, 0)
+                .await
+                .pop()
+                .map(|(_, r)| r)
+                .unwrap_or_default()
+        }
+
+        let trace_samples: usize = std::env::var("TAKO_FLICKER_TRACE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(150);
+        let switch_rounds: usize = std::env::var("TAKO_FLICKER_SWITCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let burst: usize = std::env::var("TAKO_FLICKER_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        // --- ラウンド 6: タブ切り替え ---
+        // 過渡期のラウンドは**実運用に近い画面サイズ**で測る。器やアプリが
+        // 描き直すバイト数は画面の面積に比例するので、小さい窓のままだと
+        // 「1 回の write に収まって切れない」= 経路を通らない
+        let transition_window = size(px(1500.0), px(950.0));
+        any.update(cx, |_, window, _| window.resize(transition_window))
+            .ok();
+        wait(cx, 800).await;
+        for _ in 0..6 {
+            let _ = capture_frame(any, cx);
+        }
+        // 切り替え用に 2 枚のタブを作る（どちらも 1 ペイン + 静止テキスト）
+        let mut switch_tabs: Vec<(TabId, PaneId)> = Vec::new();
+        for tag in ["F6A", "F6B"] {
+            let made = window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::TabNew {
+                            title: Some(tag.to_string()),
+                            focus: Some(true),
+                            cwd: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    drain(app, cx);
+                    cx.notify();
+                    let tab = app.workspace.active_tab();
+                    (tab.id(), tab.tree().focused())
+                })
+                .ok();
+            if let Some((tab, pane)) = made {
+                switch_tabs.push((tab, pane));
+                wait(cx, 900).await;
+                fill_static(&window, cx, pane, tag);
+                wait(cx, 900).await;
+            }
+        }
+        let switch_panes: Vec<PaneId> = switch_tabs.iter().map(|(_, p)| *p).collect();
+        wait(cx, 2500).await;
+        for _ in 0..8 {
+            let _ = capture_frame(any, cx);
+        }
+        let switch_region = window
+            .update(cx, |app, _, _| text_union_px(app, scale))
+            .ok()
+            .flatten();
+        let switch_baseline = settled_rows(&window, cx, &switch_panes).await;
+        let mut switch_ink: Vec<u64> = Vec::new();
+        let mut sw_blackouts = 0usize;
+        let mut sw_worst_ms = 0u64;
+        let mut sw_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut sw_traced = 0usize;
+        let mut sw_min_rows = usize::MAX;
+        let mut sw_span_ms = 0u64;
+        for round in 0..switch_rounds {
+            let Some(&(target, _)) = switch_tabs.get(round % switch_tabs.len().max(1)) else {
+                break;
+            };
+            // **GUI と同じ経路**で切り替える（クリックハンドラが呼ぶのはこれ。
+            // dispatch の TabSelect は可視性の申し送りリセット等を通らない）
+            window
+                .update(cx, |app, win, cx| {
+                    app.select_tab_in_viewport(target, win, cx);
+                })
+                .ok();
+            // 1) グリッドを高頻度で追う（短い過渡期を取りこぼさない）
+            let trace = grid_ink_trace(&window, cx, &switch_panes, trace_samples, 1).await;
+            sw_traced += trace.len();
+            let (c, w, s, minr, span) = blackout_stats(&trace, &switch_baseline);
+            sw_blackouts += c;
+            sw_worst_ms = sw_worst_ms.max(w);
+            sw_min_rows = sw_min_rows.min(minr);
+            sw_span_ms += span;
+            if sw_samples.len() < 6 {
+                sw_samples.extend(s);
+            }
+            // 2) 実フレームも撮る（見えている絵そのもの）
+            for _ in 0..burst {
+                if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                    if let Some(r) = switch_region {
+                        switch_ink.push(region_ink(&frame, r));
+                    }
+                }
+            }
+            wait(cx, 120).await;
+            if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                if let Some(r) = switch_region {
+                    switch_ink.push(region_ink(&frame, r));
+                }
+            }
+        }
+        let (sw_median, sw_low, sw_dips) = ink_transient_dips(&switch_ink);
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker tab-switch rounds={switch_rounds} baseline={switch_baseline:?} \
+             traced={sw_traced} span_ms={sw_span_ms} min_rows={sw_min_rows} \
+             grid_blackouts={sw_blackouts} worst_ms={sw_worst_ms} \
+             samples={sw_samples:?} | frames={} region={switch_region:?} median_ink={sw_median} \
+             blank_frames={sw_low} dips={sw_dips:?}",
+            switch_ink.len()
+        );
+
+        // --- ラウンド 7: ペインサイズ変更（分割比 + ウィンドウ寸法） ---
+        let resize_tab = window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::TabNew {
+                        title: Some("F7".to_string()),
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                let left = app.workspace.active_tab().tree().focused();
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(left.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                cx.notify();
+                let panes: Vec<PaneId> = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .collect();
+                (left, panes)
+            })
+            .ok();
+        let (resize_left, resize_panes) = resize_tab.unwrap_or((base, Vec::new()));
+        wait(cx, 1200).await;
+        for (i, p) in resize_panes.iter().enumerate() {
+            fill_static(&window, cx, *p, if i == 0 { "L" } else { "R" });
+        }
+        wait(cx, 2500).await;
+        for _ in 0..8 {
+            let _ = capture_frame(any, cx);
+        }
+        let resize_region = window
+            .update(cx, |app, _, _| text_union_px(app, scale))
+            .ok()
+            .flatten();
+        let resize_baseline = settled_rows(&window, cx, &resize_panes).await;
+        let mut resize_ink: Vec<u64> = Vec::new();
+        let mut rz_blackouts = 0usize;
+        let mut rz_worst_ms = 0u64;
+        let mut rz_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut rz_sizes_seen: std::collections::HashSet<Vec<(usize, usize)>> =
+            std::collections::HashSet::new();
+        let mut rz_min_rows = usize::MAX;
+        let mut rz_span_ms = 0u64;
+        let sweep: Vec<f32> = std::iter::repeat_n(0.04f32, 4)
+            .chain(std::iter::repeat_n(-0.04f32, 8))
+            .chain(std::iter::repeat_n(0.04f32, 4))
+            .collect();
+        for delta in sweep {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Resize {
+                            pane: Some(resize_left.as_u64()),
+                            axis: tako_control::protocol::Axis::X,
+                            delta: Some(delta),
+                            share: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            // 分割比を変えただけでは PTY は変わらない。**描いて初めて**
+            // `render_pane` が新しい cols/rows へリサイズするので 1 枚描く
+            let _ = capture_frame(any, cx);
+            let trace = grid_ink_trace(&window, cx, &resize_panes, trace_samples, 1).await;
+            let (c, w, s, minr, span) = blackout_stats(&trace, &resize_baseline);
+            rz_blackouts += c;
+            rz_worst_ms = rz_worst_ms.max(w);
+            rz_min_rows = rz_min_rows.min(minr);
+            rz_span_ms += span;
+            if rz_samples.len() < 6 {
+                rz_samples.extend(s);
+            }
+            for _ in 0..burst {
+                if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                    if let Some(r) = resize_region {
+                        resize_ink.push(region_ink(&frame, r));
+                    }
+                }
+            }
+            if let Ok(sizes) = window.update(cx, |app, _, _| {
+                resize_panes
+                    .iter()
+                    .filter_map(|p| app.terminals.get(p).map(|s| s.size()))
+                    .collect::<Vec<_>>()
+            }) {
+                rz_sizes_seen.insert(sizes);
+            }
+            wait(cx, 80).await;
+            if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                if let Some(r) = resize_region {
+                    resize_ink.push(region_ink(&frame, r));
+                }
+            }
+        }
+        let (rz_median, rz_low, rz_dips) = ink_transient_dips(&resize_ink);
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker pane-resize baseline={resize_baseline:?} \
+             distinct_sizes={} span_ms={rz_span_ms} min_rows={rz_min_rows} \
+             grid_blackouts={rz_blackouts} worst_ms={rz_worst_ms} \
+             samples={rz_samples:?} | frames={} region={resize_region:?} median_ink={rz_median} \
+             blank_frames={rz_low} dips={rz_dips:?}",
+            rz_sizes_seen.len(),
+            resize_ink.len()
+        );
+
+        // --- ラウンド 8: ウィンドウ寸法の変更（全ペインが一度にリサイズされる） ---
+        let base_size = any
+            .update(cx, |_, window, _| window.viewport_size())
+            .ok()
+            .unwrap_or(size(px(1200.0), px(800.0)));
+        let mut win_blackouts = 0usize;
+        let mut win_worst_ms = 0u64;
+        let mut win_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut win_steps = 0usize;
+        let mut win_min_rows = usize::MAX;
+        let mut win_span_ms = 0u64;
+        for step in [-60.0f32, -40.0, 40.0, 60.0, 40.0, -40.0, -60.0, 60.0] {
+            let want = size(
+                px((f32::from(base_size.width) + step).max(400.0)),
+                px((f32::from(base_size.height) + step).max(300.0)),
+            );
+            any.update(cx, |_, window, _| window.resize(want)).ok();
+            win_steps += 1;
+            let _ = capture_frame(any, cx);
+            let trace = grid_ink_trace(&window, cx, &resize_panes, trace_samples, 1).await;
+            let (c, w, s, minr, span) = blackout_stats(&trace, &resize_baseline);
+            win_blackouts += c;
+            win_worst_ms = win_worst_ms.max(w);
+            win_min_rows = win_min_rows.min(minr);
+            win_span_ms += span;
+            if win_samples.len() < 6 {
+                win_samples.extend(s);
+            }
+            wait(cx, 150).await;
+        }
+        any.update(cx, |_, window, _| window.resize(base_size)).ok();
+        wait(cx, 300).await;
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker window-resize steps={win_steps} baseline={resize_baseline:?} \
+             span_ms={win_span_ms} min_rows={win_min_rows} \
+             grid_blackouts={win_blackouts} worst_ms={win_worst_ms} samples={win_samples:?}"
+        );
+
+        // --- ラウンド 9: 裏タブのペインが表に出た瞬間にリサイズされないか（#932） ---
+        //
+        // 裏タブのペインは `render_pane` を通らない（`pane_text_areas` は表示タブ分しか
+        // 作らない）ので、**ウィンドウ寸法やサイドバー幅が変わっても PTY のサイズが
+        // 更新されない**。そのタブを表に出した瞬間に初めて新しい cols/rows が適用され、
+        // 中で走っているプログラムへ SIGWINCH が飛ぶ。TUI（claude 等）は画面を消して
+        // 描き直すので、そのあいだが「タブを切り替えたら一瞬まっさら」になる。
+        //
+        // ここでは 2 つを同時に測る。
+        //
+        // 1. **遅れリサイズそのもの**（表に出した瞬間に寸法が変わるか）= 原因。
+        //    中のアプリに依らないので、これを不変条件にする
+        // 2. **見えている画面が実際に消えるか** = 症状。SIGWINCH で
+        //    「画面を消してから描き直す」TUI をペインに置いて、消えている時間を測る
+        let tui = dir.join("winch-tui.sh");
+        std::fs::write(
+            &tui,
+            "printf '\\033[?1049h'\n\
+             paint() {\n\
+             printf '\\033[2J\\033[H'\n\
+             i=1\n\
+             while [ $i -le 60 ]; do\n\
+             printf '\\033[3%dmTUI row %02d \
+             ================================================================\\033[0m\\n' \
+             $((i%8)) $i\n\
+             i=$((i+1))\n\
+             done\n\
+             }\n\
+             trap paint WINCH\n\
+             paint\n\
+             while :; do sleep 0.05; done\n",
+        )
+        .expect("flicker: WINCH TUI fixture");
+        let hidden_pane = switch_tabs.first().copied();
+        let other_tab = switch_tabs.get(1).copied();
+        let mut hidden_before = (0usize, 0usize);
+        let mut hidden_after = (0usize, 0usize);
+        let mut hidden_displayed = (0usize, 0usize);
+        let mut hidden_baseline: Vec<usize> = Vec::new();
+        let mut hidden_blackouts = 0usize;
+        let mut hidden_worst_ms = 0u64;
+        let mut hidden_min_rows = 0usize;
+        let mut hidden_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        if let (Some((tab, pane)), Some((other, _))) = (hidden_pane, other_tab) {
+            // 表に出して、SIGWINCH で画面を消して描き直す TUI を起動する
+            window
+                .update(cx, |app, win, cx| app.select_tab_in_viewport(tab, win, cx))
+                .ok();
+            for _ in 0..4 {
+                let _ = capture_frame(any, cx);
+            }
+            window
+                .update(cx, |app: &mut TakoApp, _, cx| {
+                    if let Some(session) = app.terminals.get(&pane) {
+                        session.write(pty_line(&format!("clear; sh {}", tui.display())));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            wait(cx, 2500).await;
+            for _ in 0..4 {
+                let _ = capture_frame(any, cx);
+            }
+            hidden_baseline = settled_rows(&window, cx, &[pane]).await;
+            // 裏へ回す
+            window
+                .update(cx, |app, win, cx| {
+                    app.select_tab_in_viewport(other, win, cx)
+                })
+                .ok();
+            for _ in 0..4 {
+                let _ = capture_frame(any, cx);
+            }
+            wait(cx, 500).await;
+            // 裏に居るあいだにウィンドウ寸法を変える（サイドバー幅の変更でも同じ）
+            any.update(cx, |_, win, _| {
+                win.resize(size(
+                    transition_window.width - px(220.0),
+                    transition_window.height - px(140.0),
+                ))
+            })
+            .ok();
+            for _ in 0..6 {
+                let _ = capture_frame(any, cx);
+            }
+            wait(cx, 1200).await;
+            // 表に居るペイン（= 追従済み）と、裏に居るペイン（追従できていれば同じ幅）
+            let sizes = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    let hidden = app.terminals.get(&pane).map(|s| s.size()).unwrap_or((0, 0));
+                    let shown = other_tab
+                        .and_then(|(_, p)| app.terminals.get(&p))
+                        .map(|s| s.size())
+                        .unwrap_or((0, 0));
+                    (hidden, shown)
+                })
+                .ok()
+                .unwrap_or_default();
+            hidden_before = sizes.0;
+            hidden_displayed = sizes.1;
+            // 表に出す。ここで初めてリサイズされるなら SIGWINCH → TUI が画面を消す
+            window
+                .update(cx, |app, win, cx| app.select_tab_in_viewport(tab, win, cx))
+                .ok();
+            let _ = capture_frame(any, cx);
+            hidden_after = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.terminals.get(&pane).map(|s| s.size()).unwrap_or((0, 0))
+                })
+                .ok()
+                .unwrap_or_default();
+            // 切り替えた直後を高頻度で追う（消えている時間を測る）
+            let trace = grid_ink_trace(&window, cx, &[pane], trace_samples.max(120), 1).await;
+            let (c, w, s, minr, _span) = blackout_stats(&trace, &hidden_baseline);
+            hidden_blackouts = c;
+            hidden_worst_ms = w;
+            hidden_min_rows = minr;
+            hidden_samples = s;
+            any.update(cx, |_, win, _| win.resize(transition_window))
+                .ok();
+            wait(cx, 300).await;
+        }
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker hidden-resize hidden_before={hidden_before:?} \
+             displayed_same_time={hidden_displayed:?} hidden_after_show={hidden_after:?} \
+             late_resize={} baseline={hidden_baseline:?} min_rows={hidden_min_rows} \
+             grid_blackouts={hidden_blackouts} worst_ms={hidden_worst_ms} \
+             samples={hidden_samples:?}",
+            hidden_before != hidden_after
+        );
+
         // 静止画面が動いたら、それがちらつきの実体（原因は diffs の矩形から追える）
         check(
             d1 == 1,
@@ -29010,6 +29660,58 @@ mod self_test {
         check(
             alt_ink_low == 0,
             "ちらつき: 代替画面の塗り替え中に中身が一瞬まっさらにならない（#932）",
+        );
+        // 過渡期（タブ切り替え / ペインサイズ変更 / ウィンドウ寸法）。
+        // 静止では原理的に出ないので別に見る
+        check(
+            switch_region.is_some()
+                && sw_median > 0
+                && sw_traced >= trace_samples
+                && switch_baseline.iter().any(|r| *r > 2),
+            "ちらつき: タブ切り替えラウンドが実際に動いている（空振り検出。#932）",
+        );
+        check(
+            sw_blackouts == 0,
+            "ちらつき: タブ切り替えの過渡期に端末の中身が消えない（#932）",
+        );
+        check(
+            sw_low == 0,
+            "ちらつき: タブ切り替えの過渡期のフレームが一瞬まっさらにならない（#932）",
+        );
+        check(
+            resize_region.is_some()
+                && rz_median > 0
+                && rz_sizes_seen.len() >= 2
+                && resize_baseline.iter().any(|r| *r > 2),
+            "ちらつき: ペインサイズ変更ラウンドが実際に端末を作り直している（空振り検出。#932）",
+        );
+        check(
+            rz_blackouts == 0,
+            "ちらつき: ペインサイズ変更の過渡期に端末の中身が消えない（#932）",
+        );
+        check(
+            rz_low == 0,
+            "ちらつき: ペインサイズ変更の過渡期のフレームが一瞬まっさらにならない（#932）",
+        );
+        check(
+            win_steps > 0,
+            "ちらつき: ウィンドウ寸法変更ラウンドが実際に動いている（空振り検出。#932）",
+        );
+        check(
+            win_blackouts == 0,
+            "ちらつき: ウィンドウ寸法を変えている最中に端末の中身が消えない（#932）",
+        );
+        check(
+            hidden_before != (0, 0) && hidden_baseline.iter().any(|r| *r > 2),
+            "ちらつき: 裏タブラウンドが実際に動いている（空振り検出。#932）",
+        );
+        check(
+            hidden_before == hidden_after,
+            "ちらつき: 裏タブのペインを表に出しても端末の寸法が変わらない（#932）",
+        );
+        check(
+            hidden_blackouts == 0,
+            "ちらつき: 裏タブを表に出した直後に端末の中身が消えない（#932）",
         );
     }
     /// 端末グリッド描画の 1 フレームあたりコストを測る（#787 / #782 / #786）。
@@ -53034,6 +53736,62 @@ mod grid_cells_tests {
             grid_cells(size(px(800.0), px(400.0)), size(px(0.0), px(0.0))),
             (0, 0)
         );
+    }
+
+    // #932: 裏タブのペインは「最後に描かれたときの領域」ではなく
+    // 「**表に出たときの**領域」へ合わせる。ウィンドウ幅・サイドバー幅が変わった
+    // あとで前者を使うと、表に出した瞬間に寸法が変わる = SIGWINCH が飛び、
+    // 中の TUI が画面を作り直す（切り替えのたびに描画が乱れる）
+    #[test]
+    fn コンテンツ矩形が変われば同じ単位矩形でも寸法が変わる() {
+        use super::pane_text_area_rect;
+        use gpui::{point, Bounds};
+        use tako_core::Rect;
+
+        let cell = size(px(8.0), px(17.0));
+        let unit = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        let wide = Bounds::new(point(px(240.0), px(76.0)), size(px(1200.0), px(800.0)));
+        let narrow = Bounds::new(point(px(240.0), px(76.0)), size(px(900.0), px(660.0)));
+        let a = grid_cells(pane_text_area_rect(wide, unit, 28.0, 0.0, 2.0).size, cell);
+        let b = grid_cells(pane_text_area_rect(narrow, unit, 28.0, 0.0, 2.0).size, cell);
+        assert_ne!(a, b, "幅も高さも変えたのに同じ寸法になっている");
+        // 同じ材料なら決定的（表示中の経路と裏の割り出しが一致する前提）
+        assert_eq!(
+            a,
+            grid_cells(pane_text_area_rect(wide, unit, 28.0, 0.0, 2.0).size, cell)
+        );
+    }
+
+    #[test]
+    fn 積み上げの会計を落とすと行数がずれる() {
+        use super::pane_text_area_rect;
+        use gpui::{point, Bounds};
+        use tako_core::Rect;
+
+        // stale claude バナー（#498。28px）を会計に入れ忘れると、割り出した行数が
+        // 表示時より 1〜2 行多くなる = 表に出した瞬間にリサイズが走る
+        let cell = size(px(8.0), px(17.0));
+        let unit = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let content = Bounds::new(point(px(0.0), px(0.0)), size(px(1200.0), px(800.0)));
+        let with_banner = grid_cells(
+            pane_text_area_rect(content, unit, 28.0 + 28.0, 0.0, 2.0).size,
+            cell,
+        );
+        let without = grid_cells(
+            pane_text_area_rect(content, unit, 28.0, 0.0, 2.0).size,
+            cell,
+        );
+        assert_ne!(with_banner, without);
     }
 }
 
