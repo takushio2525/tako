@@ -3108,3 +3108,25 @@
   `TAKO_APP_SELF_TEST_OK`。検出力は 2 通りの revert（`tako_pane` 検出を外す /
   `upsert_pending` を旧挙動へ）で FAILED を実測
 - **実機未検証**（Windows 実機 offline）: 器なし / `TAKO_PSMUX_BIN` のみ構成での通し。#937 へ
+## 2026-08-24（#647: フォントサイズ変更が「表示中タブ以外」のペインへ届かない問題を根治）
+- win467 の `0e6766c` を main の現状（#781 / #684 で `pane_text_area_rect` が既に
+  切り出されている）へ合わせて移植。根因は `session.resize()` の呼び出しが
+  `render_pane` の 1 箇所だけで、`render_pane` は**そのウィンドウが今表示している
+  タブのペインしか通らない**こと。フォントサイズ変更はセル寸法のキャッシュを捨てる
+  だけで端末へ何も通知しないため、裏タブは古いセル寸法で計算した cols/rows のまま残り、
+  alt screen の TUI を動かしているとタブを表示した瞬間に grid が縮んで崩れていた
+- `render` で `pane_text_areas` を確定した直後に `sync_offscreen_pane_sizes` を呼ぶ。
+  面積は「最後に描画されたときの領域」（`pane_last_text_areas`）を使い、一度も描画されて
+  いないペインは `hidden_tab_pane_areas` でレイアウトから割り出す = **背景タブに作られた
+  ペインが spawn 時の 80x24 のまま TUI を起動する問題も同時に直る**
+- `grid_cells` を切り出し、表示中経路と非表示経路が同じ式を使うことを構造で保証した
+  （ずれると「タブを表示した瞬間に grid が変わる」= 同じ崩れ方に戻る）
+- `TerminalSession::resize` を純粋関数 `resize_plan` へ整理し、**cols/rows が同じでも
+  セル寸法が変われば PTY へ通知する**（`ws_xpixel` / `ws_ypixel` が古いまま残るのを防ぐ）。
+  セル寸法だけの変化では grid を reflow しない
+- `pane_text_areas` 自体を非表示タブぶんまで残す案は採らない（マウス座標→セル変換が
+  これを引くので、非表示ペインの残骸があると誤ヒットする = #153）
+- 検証: fmt / clippy(-D warnings) / `test --workspace` 緑 / 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 126 新設。`font 13->24` で
+  **裏タブが 119x27 → 48x15 = 表示中ペインと一致**することを実測）+ 単体 3 本
+- **実機未検証**（Windows 実機 offline）: 実 claude で「文字サイズ変更 → TUI 起動」の目視。#937 へ
