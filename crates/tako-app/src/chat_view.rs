@@ -2173,7 +2173,7 @@ impl TakoApp {
                                         .h(px(line_h))
                                         .whitespace_nowrap()
                                         .bg(rgba(theme.background))
-                                        .child(self.ime_preedit_text(text)),
+                                        .child(self.ime_preedit_text(text, pane_id)),
                                 )
                             }),
                     )
