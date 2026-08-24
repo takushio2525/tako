@@ -215,7 +215,9 @@ function render() {
     out.push('| 機能 | 状態 | 差分 | 根拠 |');
     out.push('| --- | --- | --- | --- |');
     for (const f of rows) {
-      const diff = f.status === 'supported' ? '—' : escapeCell(f.note);
+      // 表示言語に依存しない ja を明示的に使う。`note` は実行環境の言語で
+      // 変わるので、これを使うと生成した人のロケールで中身が変わってしまう
+      const diff = f.status === 'supported' ? '—' : escapeCell(f.note_ja);
       const ev = EVIDENCE_LABEL[f.evidence] ?? f.evidence;
       const detail = f.evidence_detail ? `${ev}: ${escapeCell(f.evidence_detail)}` : ev;
       out.push(`| \`${f.key}\` | ${STATUS_LABEL[f.status]} | ${diff} | ${detail} |`);

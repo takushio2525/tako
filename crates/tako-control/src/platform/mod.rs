@@ -135,6 +135,12 @@ pub fn report(
             // 理由文は表示言語に追従する（マトリクス 1 箇所定義・#435）
             if let Some(note) = s.note() {
                 o["note"] = json!(note.text());
+                // 表示言語に依存しない両言語も併せて返す（#591）。
+                // **docs の生成物が実行環境の言語で変わってはいけない**
+                // （生成した人のロケールで内容が変わると `--check` が CI で必ず落ちる。
+                // 実際に踏んだ: 手元は日本語・CI は英語で不一致になった）
+                o["note_ja"] = json!(note.ja());
+                o["note_en"] = json!(note.en());
             }
             if let Some(issue) = s.issue() {
                 o["issue"] = json!(issue);
@@ -178,6 +184,67 @@ pub fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// docs の生成物（`scripts/gen-windows-support-docs.mjs`）が**実行環境の言語で
+    /// 変わってはいけない**（#591）。
+    ///
+    /// `note` は表示言語に追従するので、生成器がそれを読むと
+    /// 「日本語ロケールで生成 → 英語ロケールの CI で `--check` が落ちる」が起きる。
+    /// 実際に踏んだので、言語に依存しない `note_ja` / `note_en` が必ず載ることを固定する
+    #[test]
+    fn 応答には言語に依存しない理由文が載る() {
+        let v = report(Some("windows"), None, false).expect("windows の表を引けない");
+        let features = v["features"].as_array().expect("features が配列でない");
+        let mut checked = 0;
+        for f in features {
+            if f["status"] == "supported" {
+                continue;
+            }
+            let key = f["key"].as_str().unwrap_or_default();
+            let ja = f["note_ja"].as_str().unwrap_or_default();
+            let en = f["note_en"].as_str().unwrap_or_default();
+            assert!(!ja.is_empty(), "{key} に note_ja が無い");
+            assert!(!en.is_empty(), "{key} に note_en が無い");
+            assert!(
+                !en.chars()
+                    .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
+                "{key} の note_en に日本語が残っている: {en}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "縮退が 1 件も無い（テストの前提が崩れている）");
+    }
+
+    /// 根拠（#591）も応答に載ること。docs の「根拠」列がここから来る
+    #[test]
+    fn 応答には判定の根拠が載る() {
+        let v = report(Some("windows"), None, false).unwrap();
+        for f in v["features"].as_array().unwrap() {
+            let key = f["key"].as_str().unwrap_or_default();
+            let kind = f["evidence"].as_str().unwrap_or_default();
+            assert!(
+                matches!(
+                    kind,
+                    "self-test" | "unit-test" | "measured" | "by-design" | "unverified"
+                ),
+                "{key} の evidence が未知の種別: {kind}"
+            );
+            if kind == "unverified" {
+                assert!(
+                    f["status"] == "pending",
+                    "{key} は未実測なのに pending でない"
+                );
+            } else {
+                assert!(
+                    f["evidence_detail"].as_str().is_some_and(|s| !s.is_empty()),
+                    "{key} に根拠の中身が無い"
+                );
+            }
+        }
+        // macOS 側は開発機なので根拠欄を持たない
+        let mac = report(Some("macos"), None, false).unwrap();
+        assert!(mac["features"][0]["evidence"].is_null());
+    }
 
     #[test]
     fn known_limitations_lists_windows_gaps_bilingually() {
