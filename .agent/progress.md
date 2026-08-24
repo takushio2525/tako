@@ -2949,3 +2949,37 @@
 - 起票: **#930**（`remote_fs_e2e::解決できないホストは接続前に分類される` が Windows で失敗。
   #919 由来。速い FAILED と >60 秒のハングの両方を観測）
 - 関連: PR #929（Refs #898 / #467）
+
+## 2026-08-24（#591: 対応マトリクスを実測ベースへ棚卸し + docs「Windows 対応状況」ページ = スライス 8 完了）
+- **前提が違った**: Issue の「完了（`cf7c9a4`）」は `windows/467-ipc-orchestration-local` にしか無く
+  **main は 1 行も入っていなかった**（#658 と同じ型）。しかも当時の判定は win467 の実装に対するもの
+  なので移植せず**引き直した**。main は棚卸し前で supported 4 / degraded 2 / pending 132 / unsupported 2
+- **根拠を型にした**: `Feature::windows_evidence`（`SelfTest` / `UnitTest` / `Measured` / `Unverified`）を
+  新設し、**T7 が根拠なしの Supported / Degraded / Unsupported を落とす**。検出力は `tako_theme` の
+  根拠を外して実測（機能名を名指しして FAILED）。根拠は 実機セルフテストの通し（#920。FAILED 0 / skip 19）
+  64 件・plan の実測記録 16 件・実機で緑のテスト 11 件・OS の仕様 2 件から採り、残り 47 件は `Unverified` のまま
+  Pending（追跡 #937）。**「動く見込み」を Supported と言わない**のは、誤宣言が system prompt へ流れるため
+  （`gate()` は production から呼ばれていないので実害は宣言だけ、と確認したうえでの判断）
+- 結果: **supported 69 / degraded 13 / pending 56 / unsupported 2**。prompt へ入る最大の 1 行が
+  「GUI 起動とペイン / タブ管理の Windows 実装が前提（42 機能）」から「実装は共通だが実機で未実測
+  （37 機能・#937）」へ変わった。known_limitations（#594）は同じ関数から出るので自動追随
+- **棚卸しで製品バグ 4 件を確認**: ゴミ箱が完全削除（**#617**）/ AI 命名が一度も走らない（**#722**）/
+  受け入れゲートが `sh -c` 決め打ち（**#935** 新規）/ 古い claude の警告が出ない（**#936** 新規。#726 の続き）。
+  いずれも Degraded の理由文へ明記。**最初 #933 / #934 として重複起票してしまい**（既存の #617 / #722 と同一）、
+  気づいた時点で自分の側を close して番号を差し替えた = 横断作業の前に `gh issue list --search` を通すこと
+- 実機ベースラインの失敗名（#906 の全数採取）を**製品の縮退**（acceptance_gates 5 / stale_binary 2 /
+  remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決め打ち・symlink）に切り分け、前者だけを根拠に使った
+- docs: `docs/src/content/docs/windows-support.md` は**生成物**（`node scripts/gen-windows-support-docs.mjs`。
+  `--check` を **CI の macOS ジョブ**へ入れて二重管理を止めた）。表に**根拠の列**を出すので「対応」の裏づけを
+  利用者がそのまま読める。サイドバー「はじめに」+ セットアップページからリンク。OG 画像も焼き直し
+- 同梱: `known_limitations_lists_windows_gaps_bilingually` が理由文を直書きしていて落ちたので、
+  期待値をマトリクスから作る形へ（#920 の install_plan と同型）
+- **踏んだ罠 2 件**: ①`--check` を CI へ入れたら落ちた = **生成物が実行環境の言語で変わる**
+  （`note` が `i18n::lang()` 追従。`TAKO_LANG` だけでは settings.json の `language` に負けるので
+  言語非依存の `note_ja` / `note_en` を応答へ足した）②既存 Issue を検索せず重複起票した
+- 検証: fmt / clippy(-D warnings) / `test --workspace` **2589 passed 0 failed** / platform_parity 14 本 /
+  support 15 本（T7 2 本を新設）/ クロスチェック エラー 0・警告 10（ベースライン同数）/ docs build 25 ページ /
+  `npm run og:verify` OK
+- **Windows 実機はセッションを通して offline**（`ssh win` が timeout）なので新規の実機実測は無し。
+  追試が要るものは #937 に積んだ
+- 次: #937 の消し込み（実機復帰後）。#617 / #722 / #935 / #936 の修正
