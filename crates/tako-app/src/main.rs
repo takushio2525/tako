@@ -13963,6 +13963,26 @@ impl TakoApp {
         } else {
             theme.line_height
         };
+        // #947: 字の大きさは**箱の `text_size`** で決まる。gpui の `StyledText` は
+        // レイアウトで `window.text_style()`（祖先から降る ambient なスタイル）から
+        // フォントサイズを取り、`with_default_highlights` へ渡す `TextRun` は
+        // フォント族・色・下線しか運ばない（サイズを持たない）。つまり
+        // `default_style` に per-pane のサイズを積んでも**それだけでは効かない**。
+        // 直さないと「箱（`line_h`）は伸びたのに字はテーマ既定のまま」になり、
+        // たまり場のサムネイル・ホバープレビュー・チャット入力欄のミラーが
+        // 拡大したペインで小さい字のまま並ぶ（#940 とまったく同じ機序）。
+        // `TAKO_947_LEGACY=1` で修正前（箱に載せない）へ戻せる = 同一バイナリで A/B が取れる。
+        //
+        // **オーバーライドが無いペインには載せない**: 既定サイズでは `text_size` は
+        // ルートの ambient と同値なので載せても何も変わらないが、`line_height` は
+        // ルートが設定していない（= gpui の既定の倍率）ため、明示すると既定サイズの
+        // 縦位置が 1 px 級で動く。壊れていない側を動かさないため、
+        // 直すのは食い違いが起きている「ペイン独自サイズ」の場合だけにする
+        let box_font_size = if has_custom_font && std::env::var_os("TAKO_947_LEGACY").is_none() {
+            Some(self.pane_font_size(pane_id))
+        } else {
+            None
+        };
         let cell_width = self
             .pane_cell_sizes
             .get(&pane_id)
@@ -13988,10 +14008,16 @@ impl TakoApp {
                         .iter()
                         .map(|run| (run.range.clone(), self.run_highlight(run)))
                         .collect();
-                    return div().h(px(line_h)).whitespace_nowrap().child(
-                        StyledText::new(line.text)
-                            .with_default_highlights(&default_style, highlights),
-                    );
+                    return div()
+                        .h(px(line_h))
+                        .when_some(box_font_size, |d, fs| {
+                            d.text_size(px(fs)).line_height(px(line_h))
+                        })
+                        .whitespace_nowrap()
+                        .child(
+                            StyledText::new(line.text)
+                                .with_default_highlights(&default_style, highlights),
+                        );
                 }
                 // 同スタイルの連続半角文字をグループ化して描画要素数を削減。
                 // 全角文字（char_cols > 1）とセル幅不一致グリフ（snaps == false）は
@@ -14006,6 +14032,9 @@ impl TakoApp {
                 let cw = cell_width.unwrap();
                 let row = div()
                     .h(px(line_h))
+                    .when_some(box_font_size, |d, fs| {
+                        d.text_size(px(fs)).line_height(px(line_h))
+                    })
                     .flex()
                     .flex_row()
                     .overflow_hidden()
@@ -26753,6 +26782,325 @@ mod self_test {
         (stats.size_in_use as u64, u64::from(stats.blocks_in_use))
     }
 
+    /// `terminal_screen_lines` の字の大きさがペインのフォントサイズに追従する（#947）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=screen-lines`
+    ///
+    /// 測るのは**タブツリーのホバープレビュー**（`PreviewTarget::Pane`）。
+    /// `terminal_screen_lines` を器へ並べるだけの経路で、ポップアップは既知サイズなので
+    /// 「ホバー無し / 有り」の差分がそのままポップアップの矩形になる。
+    ///
+    /// 指標は行ごとのインクの**高さ**と**間隔（ピッチ）**の 2 つ:
+    /// - ピッチは `line_h`（= `pane_line_height`）由来なので**壊れていても**拡大する
+    /// - 高さはグリフのサイズ由来なので、ambient 依存のままだと**拡大しない**
+    ///
+    /// なので「箱は大きくなったのに字が小さいまま」= `ink / pitch` が落ちる、を数値で言える。
+    /// `TAKO_947_LEGACY=1` で修正前（箱に `text_size` を載せない）へ戻せる
+    #[cfg(feature = "visual-test")]
+    async fn screen_lines_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        /// 指定した**画像座標**の矩形の、行ごとのインク量。
+        ///
+        /// `ink_row_profile` は論理座標 + 上下反転の自動判定が要るが、ここで測りたい
+        /// 矩形は「差分の bbox」= はじめから画像座標なので、変換を挟まない方が安全
+        /// （反転を「インクが多い方」で決める版はポップアップの外のターミナル本文を
+        /// 掴んで 101 行の塊に化けた。実測で踏んだ）
+        fn ink_rows(
+            frame: &image::RgbaImage,
+            x0: u32,
+            y0: u32,
+            x1: u32,
+            y1: u32,
+            bg: tako_core::Rgb,
+        ) -> Vec<u32> {
+            let (w, h) = frame.dimensions();
+            let (x1, y1) = (x1.min(w), y1.min(h));
+            let mut out = Vec::with_capacity((y1.saturating_sub(y0)) as usize);
+            for y in y0..y1 {
+                let mut ink = 0u32;
+                for x in x0..x1 {
+                    let p = frame.get_pixel(x, y).0;
+                    if (i32::from(p[0]) - i32::from(bg.r)).abs()
+                        + (i32::from(p[1]) - i32::from(bg.g)).abs()
+                        + (i32::from(p[2]) - i32::from(bg.b)).abs()
+                        > 24
+                    {
+                        ink += 1;
+                    }
+                }
+                out.push(ink);
+            }
+            out
+        }
+
+        /// 行ごとのインクから「連続した塊」を切り出す（1 塊 = 1 行のグリフ）。
+        /// 返すのは (**先頭の**塊の高さ, 塊の開始間隔の中央値, 塊の数)
+        fn runs(profile: &[u32]) -> Option<(f32, f32, usize)> {
+            let mut starts = Vec::new();
+            let mut heights = Vec::new();
+            let mut cur: Option<(usize, usize)> = None;
+            for (i, &ink) in profile.iter().enumerate() {
+                if ink >= 2 {
+                    cur = Some(match cur {
+                        Some((s, _)) => (s, i),
+                        None => (i, i),
+                    });
+                } else if let Some((s, e)) = cur.take() {
+                    starts.push(s);
+                    heights.push(e - s + 1);
+                }
+            }
+            if let Some((s, e)) = cur {
+                starts.push(s);
+                heights.push(e - s + 1);
+            }
+            if heights.len() < 2 {
+                return None;
+            }
+            let median = |mut v: Vec<usize>| -> f32 {
+                v.sort_unstable();
+                v[v.len() / 2] as f32
+            };
+            let pitches: Vec<usize> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+            if pitches.is_empty() {
+                return None;
+            }
+            // 高さは**先頭の塊**（= fixture の 1 行目 `MMMMMM`）を使う。
+            // 最大や中央値だと、拡大でプロンプト行が画面外へ出た瞬間に
+            // 「別の内容」と比べることになって比が崩れる（実測で踏んだ）
+            Some((heights[0] as f32, median(pitches), starts.len()))
+        }
+
+        // 対象ペインを決め、既定サイズへ戻す
+        let target = window
+            .update(cx, |app, _, cx| {
+                let focused = app.focused_pane();
+                let pane = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|id| app.terminals.contains_key(id))
+                    .unwrap_or(focused);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Focus {
+                        pane: Some(pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.hover_preview = None;
+                app.reset_zoom_focused_pane(cx);
+                cx.notify();
+                app.focused_pane()
+            })
+            .unwrap_or(PaneId::from_raw(0));
+
+        // 決まった絵を仕込む: 下端が揃った大文字だけの行を空行で挟む
+        // （インクの塊が 1 行 = 1 グリフ行にきれいに分かれる）
+        press(any, cx, "ctrl-u");
+        type_text(
+            any,
+            cx,
+            "clear; printf 'MMMMMM\n\nMMMMMM\n\nMMMMMM\n\nMMMMMM\n\n'",
+            true,
+        );
+        let mut seeded = false;
+        for _ in 0..40 {
+            wait(cx, 200).await;
+            seeded = window
+                .update(cx, |app, _, _| {
+                    app.terminals
+                        .get(&target)
+                        .map(|s| {
+                            s.screen(&app.theme)
+                                .lines
+                                .iter()
+                                .filter(|l| l.text.starts_with("MMMMMM"))
+                                .count()
+                                >= 4
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if seeded {
+                break;
+            }
+        }
+        if !seeded {
+            println!(
+                "TAKO_VISUAL_SKIPPED: screen-lines（fixture が画面に出ない = 未描画。\
+                 ウィンドウを前面にして再実行すると検証できる）"
+            );
+            return;
+        }
+
+        let mut measured: Vec<(&str, f32, f32, f32, usize)> = Vec::new();
+        for (label, delta) in [("default", 0.0f32), ("large", 8.0f32)] {
+            let font_size = window
+                .update(cx, |app, _, cx| {
+                    if delta != 0.0 {
+                        app.zoom_focused_pane(delta, cx);
+                    }
+                    app.hover_preview = None;
+                    cx.notify();
+                    app.pane_font_size(target)
+                })
+                .unwrap_or(0.0);
+            wait(cx, 400).await;
+
+            // ホバー無しの静止フレーム（画面が動いていたら撮り直す）
+            let mut base = None;
+            let mut base_scale = 1.0f32;
+            for _ in 0..20 {
+                notify_and_draw(any, window, cx);
+                let Some((a, scale)) = capture_frame(any, cx) else {
+                    fail("visual-test screen-lines: ホバー前フレーム採取")
+                };
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                let Some((b, _)) = capture_frame(any, cx) else {
+                    fail("visual-test screen-lines: ホバー前フレーム採取（2 枚目）")
+                };
+                if a == b {
+                    base = Some(b);
+                    base_scale = scale;
+                    break;
+                }
+            }
+            let Some(base) = base else {
+                fail("visual-test screen-lines: 画面が静止しない")
+            };
+
+            // ホバープレビューを出す（タブツリーのホバーと同じ状態）
+            let _ = window.update(cx, |app, _, cx| {
+                app.hover_preview = Some(HoverPreview {
+                    target: PreviewTarget::Pane(target),
+                    anchor: point(px(PREVIEW_POPUP_W + 80.0), px(PREVIEW_POPUP_H + 80.0)),
+                });
+                cx.notify();
+            });
+            wait(cx, 400).await;
+            notify_and_draw(any, window, cx);
+            let Some((shown, _)) = capture_frame(any, cx) else {
+                fail("visual-test screen-lines: ホバー後フレーム採取")
+            };
+
+            // 差分の矩形 = ポップアップ。上端のラベル帯を避けて本文だけを走査する
+            let (rect, changed) = {
+                let (w, h) = base.dimensions();
+                let mut minx = w;
+                let mut maxx = 0u32;
+                let mut miny = h;
+                let mut maxy = 0u32;
+                let mut total = 0u32;
+                for y in 0..h {
+                    for x in 0..w {
+                        if base.get_pixel(x, y) != shown.get_pixel(x, y) {
+                            minx = minx.min(x);
+                            maxx = maxx.max(x);
+                            miny = miny.min(y);
+                            maxy = maxy.max(y);
+                            total += 1;
+                        }
+                    }
+                }
+                ((minx, miny, maxx, maxy), total)
+            };
+            if changed == 0 {
+                println!(
+                    "TAKO_VISUAL_SKIPPED: screen-lines（ホバープレビューが 1 px も出ない = 未描画。\
+                     ウィンドウを前面にして再実行すると検証できる）"
+                );
+                let _ = window.update(cx, |app, window, cx| {
+                    app.hover_preview = None;
+                    app.reset_zoom_focused_pane(cx);
+                    let _ = window;
+                    cx.notify();
+                });
+                return;
+            }
+            let (minx, miny, maxx, maxy) = rect;
+            // ポップアップは「ラベル帯（`PIN_TITLE_BAR`。11px の固定サイズ）+ 本文」。
+            // 帯の字は per-pane ではないので、走査から外さないと測定が汚れる。
+            // 左右も枠とパディングのぶん詰める
+            let inset = ((PANE_PADDING + 2.0) * base_scale).round() as u32;
+            let top_skip = ((PIN_TITLE_BAR + PANE_PADDING + 2.0) * base_scale).round() as u32;
+            let bx0 = minx + inset;
+            let by0 = miny + top_skip;
+            let bx1 = maxx.saturating_sub(inset);
+            let by1 = maxy.saturating_sub(inset);
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let dir = std::path::Path::new(&dump);
+                let _ = shown.save(dir.join(format!("screen-lines-{label}.png")));
+            }
+            println!(
+                "TAKO_VISUAL_SCREEN_LINES_RECT: {label} diff=({minx},{miny})-({maxx},{maxy}) \
+                 body=({bx0},{by0})-({bx1},{by1}) scale={base_scale}"
+            );
+            let Some(bg) = window.update(cx, |app, _, _| app.theme.background).ok() else {
+                fail("visual-test screen-lines: テーマ背景色が採れない")
+            };
+            let profile = ink_rows(&shown, bx0, by0, bx1, by1, bg);
+            let Some((ink, pitch, count)) = runs(&profile) else {
+                fail(
+                    "visual-test screen-lines: 行の塊が 2 つ以上見つからない\
+                     （fixture がポップアップに出ていない）",
+                )
+            };
+            println!(
+                "TAKO_VISUAL_SCREEN_LINES: {label} font_size={font_size} \
+                 ink_h={ink} pitch={pitch} rows={count} ratio={:.3} popup_px={changed} \
+                 profile={:?}",
+                ink / pitch.max(1.0),
+                profile
+            );
+            measured.push((label, font_size, ink, pitch, count));
+
+            let _ = window.update(cx, |app, _, cx| {
+                app.hover_preview = None;
+                cx.notify();
+            });
+            wait(cx, 300).await;
+        }
+
+        let (_, small_fs, small_ink, small_pitch, _) = measured[0];
+        let (_, large_fs, large_ink, large_pitch, _) = measured[1];
+        let want = large_fs / small_fs;
+        let ink_ratio = large_ink / small_ink.max(1.0);
+        let pitch_ratio = large_pitch / small_pitch.max(1.0);
+        // 前提: 箱（行の高さ）は壊れていても伸びる（`line_h` 由来）。伸びていなければ
+        // そもそも拡大が効いていない = 測り方が間違っている
+        check(
+            pitch_ratio > 1.2,
+            &format!(
+                "visual-test screen-lines: 行の間隔がフォントサイズで伸びる（前提）                  (#947。font {small_fs}->{large_fs} pitch {small_pitch}->{large_pitch} 実比={pitch_ratio:.3})"
+            ),
+        );
+        // 本題: 字の大きさも追従する
+        check(
+            (ink_ratio - want).abs() <= 0.20,
+            &format!(
+                "visual-test screen-lines: 字の大きさもフォントサイズに追従する                  (#947。font {small_fs}->{large_fs} 期待比={want:.3}                  ink {small_ink}->{large_ink} 実比={ink_ratio:.3}                  pitch {small_pitch}->{large_pitch})"
+            ),
+        );
+
+        let _ = window.update(cx, |app, _, cx| {
+            app.hover_preview = None;
+            app.reset_zoom_focused_pane(cx);
+            cx.notify();
+        });
+        wait(cx, 300).await;
+    }
+
     /// IME 未確定文字列の字の大きさがペインのフォントサイズに追従する（#940）。
     /// 単独実行は `TAKO_VISUAL_ONLY=ime-preedit`
     ///
@@ -28898,6 +29246,15 @@ mod self_test {
                 }
                 "ime-preedit" => {
                     ime_preedit_visual(any, window, cx).await;
+
+            // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
+            // 追従するか（ホバープレビューで測る）
+            screen_lines_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                "screen-lines" => {
+                    screen_lines_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
@@ -28906,7 +29263,7 @@ mod self_test {
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
-                         remote-tree / flicker / ime-preedit）"
+                         remote-tree / flicker / ime-preedit / screen-lines）"
                     );
                     std::process::exit(1);
                 }
@@ -54181,6 +54538,40 @@ mod pane_content_geometry_tests {
             flat.matches(&fallback).count(),
             1,
             "推定値がフォールバック以外で使われている"
+        );
+    }
+
+    /// 番犬テスト（#947）: 端末の行を組み立てる箱にも `text_size` を載せる。
+    ///
+    /// #940 と同じ機序（gpui の `StyledText` はサイズを ambient から取り、`TextRun` は
+    /// サイズを運ばない）なので、`default_style` に per-pane のスタイルを渡しただけでは
+    /// 字が追従しない。`terminal_screen_lines` は行の箱を 2 通りで組む
+    /// （セル幅未計測のフォールバック / グループ div をぶら下げる本命）ので、
+    /// **両方**に載っていることを構造として固定する
+    #[test]
+    fn 端末の行の箱にフォントサイズが載っている() {
+        let source = include_str!("main.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .expect("テストモジュールの区切りが無い")
+            .0;
+        let body = prod
+            .split("fn terminal_screen_lines(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("terminal_screen_lines の定義が見つからない");
+        // per-pane のサイズを引いていること
+        assert!(
+            body.contains("self.pane_font_size(pane_id)"),
+            "行の箱に載せるサイズを per-pane から引いていない（#947 の再発）"
+        );
+        // 箱へ載せる形が 2 経路ぶんあること（フォールバック + 本命）
+        let loaded = body
+            .matches("d.text_size(px(fs)).line_height(px(line_h))")
+            .count();
+        assert_eq!(
+            loaded, 2,
+            "行の箱へサイズを載せている箇所が 2 つでない（#947。実際は {loaded} 箇所）"
         );
     }
 
