@@ -27539,18 +27539,6 @@ mod self_test {
                 opened
             })
             .unwrap_or(0);
-        let right_after = window
-            .update(cx, |app, _, _| {
-                let mut v: Vec<String> = app
-                    .previews
-                    .iter()
-                    .map(|(p, st)| format!("{}:{:?}", p.as_u64(), st.mode))
-                    .collect();
-                v.sort();
-                (v, app.terminals.len())
-            })
-            .unwrap_or_default();
-        println!("TAKO_VISUAL_PIXEL: flicker preview-right-after={right_after:?}");
         // PDF の background ラスタライズと md の目次構築が終わるのを待つ
         wait(cx, 5000).await;
         for _ in 0..10 {
