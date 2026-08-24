@@ -272,6 +272,9 @@ pub enum Evidence {
     UnitTest(&'static str),
     /// 実機で実際に実行した記録（`.agent/plans/` の記録節 / Issue コメント）
     Measured(&'static str),
+    /// OS の仕様・設計判断。**実測する対象がそもそも無い**もの
+    /// （Windows に TCC が無い / PSReadLine が予測入力を標準搭載している 等）
+    ByDesign(&'static str),
     /// 未実測。**`Supported` にはできない**（T7 が落とす）
     Unverified,
 }
@@ -280,7 +283,9 @@ impl Evidence {
     /// 判定の裏づけになる文言（未実測なら `None`）
     pub fn citation(self) -> Option<&'static str> {
         match self {
-            Self::SelfTest(s) | Self::UnitTest(s) | Self::Measured(s) => Some(s),
+            Self::SelfTest(s) | Self::UnitTest(s) | Self::Measured(s) | Self::ByDesign(s) => {
+                Some(s)
+            }
             Self::Unverified => None,
         }
     }
@@ -291,6 +296,7 @@ impl Evidence {
             Self::SelfTest(_) => "self-test",
             Self::UnitTest(_) => "unit-test",
             Self::Measured(_) => "measured",
+            Self::ByDesign(_) => "by-design",
             Self::Unverified => "unverified",
         }
     }
@@ -422,8 +428,8 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Unsupported {
             note: notes::WIN_NO_PSREADLINE_NEEDED,
         },
-        windows_evidence: Evidence::Measured(
-            "PowerShell が PSReadLine の予測入力を標準搭載（セルフテスト項目 41c / 41c-2 は zsh 不在で自動スキップ）",
+        windows_evidence: Evidence::ByDesign(
+            "PowerShell が PSReadLine の予測入力を標準搭載しているので注入する対象が無い（セルフテスト項目 41c / 41c-2 は zsh 不在で自動スキップ）",
         ),
     },
     Feature {
@@ -527,8 +533,8 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Unsupported {
             note: notes::WIN_NO_TCC,
         },
-        windows_evidence: Evidence::Measured(
-            "Windows に TCC 相当の仕組みが無い（設計判断。#515 の判定テストが固定）",
+        windows_evidence: Evidence::ByDesign(
+            "Windows に TCC（フルディスクアクセス）相当の仕組みが無いので許可を求める対象が無い（#515 の判定テストが固定）",
         ),
     },
     Feature {
@@ -982,7 +988,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "スライス 9 の実機実測: tako list が 8123/node.exe を拾い、psmux の偽 listen 21 個を 1 つも報告しない + セルフテスト項目 55（ON/OFF）",
+            "スライス 9 で tako list が 8123/node.exe を拾い、psmux の偽 listen 21 個を 1 つも報告しない + セルフテスト項目 55（ON/OFF）",
         ),
     },
     Feature {
@@ -1388,7 +1394,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_SHELL_INTEGRATION_PSMUX,
         },
         windows_evidence: Evidence::Measured(
-            "#766 の実機実測: 側路で state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）",
+            "#766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）",
         ),
     },
     Feature {
@@ -1404,7 +1410,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#727 の実機実測: powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121",
+            "powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121",
         ),
     },
     Feature {
@@ -1430,7 +1436,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_STALE_BINARY_PID,
         },
         windows_evidence: Evidence::UnitTest(
-            "実機の cargo test で stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み",
+            "stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み",
         ),
     },
     Feature {

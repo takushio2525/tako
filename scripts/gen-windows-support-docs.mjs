@@ -98,6 +98,7 @@ const EVIDENCE_LABEL = {
   'self-test': '実機セルフテスト',
   'unit-test': '実機テスト',
   measured: '実機実測',
+  'by-design': 'OS の仕様',
   unverified: '未実測',
 };
 
@@ -183,6 +184,7 @@ function render() {
   out.push('| 実機セルフテスト | Windows 実機の GUI セルフテスト（通しで失敗 0 件）が実際に通した項目 |');
   out.push('| 実機テスト | Windows 実機の `cargo test` で緑のテスト |');
   out.push('| 実機実測 | Windows 実機で操作を実行して結果を記録したもの |');
+  out.push('| OS の仕様 | Windows の仕様・設計判断で、実測する対象がそもそも無いもの |');
   out.push('| 未実測 | まだ実機で動かしていないもの |');
   out.push('');
 
