@@ -59,7 +59,7 @@ const C = {
  * 未分類のページがあれば落とす = 新設ページの取りこぼしに気づける。
  */
 const SECTIONS = [
-  [/^getting-started(\/|$)|^releases$/, 'はじめに'],
+  [/^getting-started(\/|$)|^releases$|^windows-support$/, 'はじめに'],
   [/^features\/(orchestration|orchestrator|mcp-server)$/, 'AI と使う'],
   [/^features\//, '機能紹介'],
   [/^guides\//, '使い方ガイド'],

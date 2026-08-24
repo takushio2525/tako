@@ -139,6 +139,14 @@ pub fn report(
             if let Some(issue) = s.issue() {
                 o["issue"] = json!(issue);
             }
+            // 判定の根拠（#591）。**何をもってそう言えるのか**を応答にも出す。
+            // Windows 側だけなのは、macOS が開発機で常に実測されているため
+            if target == Platform::Windows {
+                o["evidence"] = json!(f.windows_evidence.kind());
+                if let Some(citation) = f.windows_evidence.citation() {
+                    o["evidence_detail"] = json!(citation);
+                }
+            }
             o
         })
         .collect();
@@ -179,12 +187,17 @@ mod tests {
             "見出しが期待と違う: {}",
             md.lines().next().unwrap_or_default()
         );
-        // 日英併記（生成物なので実行環境の言語設定に依存してはならない）
-        assert!(
-            md.contains("Requires the Windows implementation"),
-            "英文が無い"
-        );
-        assert!(md.contains("Windows 実装が前提"), "日本語文が無い");
+        // 日英併記（生成物なので実行環境の言語設定に依存してはならない）。
+        //
+        // **期待値は理由文の直書きではなくマトリクスから作る**。文面を直書きすると
+        // 棚卸しで理由を書き換えるたびにここが落ちる（#591 で実際に踏んだ。
+        // 同じ轍は #920 の install_plan でも踏んでいる）
+        let sample = support::MATRIX
+            .iter()
+            .find_map(|f| f.on(Platform::Windows).note())
+            .expect("Windows に縮退が 1 件も無い（テストの前提が崩れている）");
+        assert!(md.contains(sample.en()), "英文が無い: {}", sample.en());
+        assert!(md.contains(sample.ja()), "日本語文が無い: {}", sample.ja());
         // 追跡 Issue が付く
         assert!(md.contains("tracking: #"), "追跡 Issue が無い");
     }

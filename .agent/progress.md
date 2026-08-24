@@ -2949,3 +2949,34 @@
 - 起票: **#930**（`remote_fs_e2e::解決できないホストは接続前に分類される` が Windows で失敗。
   #919 由来。速い FAILED と >60 秒のハングの両方を観測）
 - 関連: PR #929（Refs #898 / #467）
+
+## 2026-08-24（#591: 対応マトリクスを実測ベースへ棚卸し + docs「Windows 対応状況」ページ = スライス 8 完了）
+- **前提が違った**: Issue の「完了（`cf7c9a4`）」は `windows/467-ipc-orchestration-local` にしか無く
+  **main は 1 行も入っていなかった**（#658 と同じ型）。しかも当時の判定は win467 の実装に対するもの
+  なので移植せず**引き直した**。main は棚卸し前で supported 4 / degraded 2 / pending 132 / unsupported 2
+- **根拠を型にした**: `Feature::windows_evidence`（`SelfTest` / `UnitTest` / `Measured` / `Unverified`）を
+  新設し、**T7 が根拠なしの Supported / Degraded / Unsupported を落とす**。検出力は `tako_theme` の
+  根拠を外して実測（機能名を名指しして FAILED）。根拠は 実機セルフテストの通し（#920。FAILED 0 / skip 19）
+  65 件・plan の実測記録 18 件・実機で緑のテスト 11 件から採り、残り 46 件は `Unverified` のまま
+  Pending（追跡 #937）。**「動く見込み」を Supported と言わない**のは、誤宣言が system prompt へ流れるため
+  （`gate()` は production から呼ばれていないので実害は宣言だけ、と確認したうえでの判断）
+- 結果: **supported 72 / degraded 11 / pending 55 / unsupported 2**。prompt へ入る最大の 1 行が
+  「GUI 起動とペイン / タブ管理の Windows 実装が前提（42 機能）」から「実装は共通だが実機で未実測
+  （37 機能・#937）」へ変わった。known_limitations（#594）は同じ関数から出るので自動追随
+- **棚卸しで製品バグ 4 件を発見・起票**: **#933**（`move_to_trash` が Windows では完全削除 = 元に戻せない。
+  UI の文言は macOS と同じ「ゴミ箱に移動」）/ **#934**（`autorename` の claude 検出だけ `cfg(unix)` ガードが
+  無く AI 命名が一度も走らない）/ **#935**（受け入れゲートが `sh -c` 決め打ち）/ **#936**（`pidpath` 未実装で
+  古い claude の警告が出ない）。いずれも Degraded の理由文へ明記
+- 実機ベースラインの失敗名（#906 の全数採取）を**製品の縮退**（acceptance_gates 5 / stale_binary 2 /
+  remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決め打ち・symlink）に切り分け、前者だけを根拠に使った
+- docs: `docs/src/content/docs/windows-support.md` は**生成物**（`node scripts/gen-windows-support-docs.mjs`。
+  `--check` を **CI の macOS ジョブ**へ入れて二重管理を止めた）。表に**根拠の列**を出すので「対応」の裏づけを
+  利用者がそのまま読める。サイドバー「はじめに」+ セットアップページからリンク。OG 画像も焼き直し
+- 同梱: `known_limitations_lists_windows_gaps_bilingually` が理由文を直書きしていて落ちたので、
+  期待値をマトリクスから作る形へ（#920 の install_plan と同型）
+- 検証: fmt / clippy(-D warnings) / `test --workspace` **2589 passed 0 failed** / platform_parity 14 本 /
+  support 15 本（T7 2 本を新設）/ クロスチェック エラー 0・警告 10（ベースライン同数）/ docs build 25 ページ /
+  `npm run og:verify` OK
+- **Windows 実機はセッションを通して offline**（`ssh win` が timeout）なので新規の実機実測は無し。
+  追試が要るものは #937 に積んだ
+- 次: #937 の消し込み（実機復帰後）。#933〜#936 の修正

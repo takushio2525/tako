@@ -97,97 +97,105 @@ impl Note {
 pub mod notes {
     use super::Note;
 
-    /// #517 の担当範囲
-    pub const WIN_TERMINAL: Note = Note::new(
-        "GUI 起動とペイン / タブ管理の Windows 実装が前提",
-        "Requires the Windows implementation of GUI startup and pane / tab management",
+    // ─── 未実測（実装はあるが Windows 実機で確かめていない） ───────────────
+
+    /// 実装がプラットフォーム共通で、macOS と同じ経路を通るもの。
+    /// **動く見込みはあるが実機で 1 度も実行していない**ので Supported にはしない
+    /// （過大申告は system prompt 経由でエージェントを誤らせる。#516）。
+    /// 消し込みの手順は追跡 Issue に書いてある
+    pub const WIN_UNVERIFIED: Note = Note::new(
+        "実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う）",
+        "The implementation is platform-neutral and takes the same path as macOS, but it has not been exercised on real Windows hardware yet (expected to work; suspect this first if it fails)",
     );
-    /// #519 の担当範囲
-    pub const WIN_PERSIST: Note = Note::new(
-        "tmux バックエンドに依存。Windows の永続化戦略の決定が前提",
-        "Depends on the tmux backend; requires deciding the Windows persistence strategy",
+
+    // ─── 実測で分かっている縮退 ───────────────────────────────────
+
+    /// #693。Windows.Data.Pdf はページ画像は返すが文字位置を返さない
+    pub const WIN_PDF_NO_TEXT_LAYER: Note = Note::new(
+        "PDF はページ画像として表示できるが、Windows のレンダラが文字位置を返さないため文字選択・目次・PDF 内リンクは使えない（#693）",
+        "PDFs render as page images, but the Windows renderer does not expose glyph positions, so text selection, outlines and in-PDF links are unavailable (#693)",
     );
-    /// #520 の担当範囲
-    pub const WIN_GIT: Note = Note::new(
-        "git タブの Windows 対応（パス表記と改行コードの可搬性）が前提",
-        "Requires Windows support for the git tab (path notation and line-ending portability)",
+
+    /// #521。動画は macOS の AVFoundation 実装しかなく、非 macOS はスタブ
+    pub const WIN_VIDEO: Note = Note::new(
+        "動画デコーダの Windows 実装が無く、動画ファイルを開くとエラーになる",
+        "There is no Windows video decoder implementation, so opening a video file returns an error",
     );
-    /// #520 + #526 の担当範囲（#496 のコンフリクト解消エージェント）。
-    /// git タブの状態検出だけでなく**エージェントペインの spawn** にも依存するので、
-    /// WIN_GIT とは別に「両方が要る」ことを明示する
-    pub const WIN_GIT_RESOLVE_AGENT: Note = Note::new(
-        "git タブの Windows 対応に加えて、エージェントペインの spawn（orchestrator の Windows 縮退モード）が前提",
-        "Requires Windows support for the git tab plus agent pane spawning (the degraded orchestrator mode on Windows)",
+
+    /// #724 症状②。`wry` の WebView2 が COM コールバック内で unwrap して abort する
+    pub const WIN_WEBVIEW2_PANIC: Note = Note::new(
+        "Web ビューは WebView2 側の巻き戻せない panic でアプリごと落ちるため開けない",
+        "The web view cannot be opened: WebView2 raises a non-unwinding panic that aborts the whole app",
     );
-    /// #521 の担当範囲
-    pub const WIN_PREVIEW: Note = Note::new(
-        "プレビュー / Web ビューの Windows 実装（WebView2・PDF・動画）が前提",
-        "Requires the Windows implementation of preview / web view (WebView2, PDF, video)",
+
+    /// #528。daemon の起動・停止が `setsid` / シグナルマスク前提のまま
+    pub const WIN_REMOTE_UNVERIFIED: Note = Note::new(
+        "remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了",
+        "Starting and stopping the remote daemon still relies on unix-only handling, and no end-to-end run has been measured on Windows",
     );
-    /// #522 の担当範囲
-    pub const WIN_OS_INTEGRATION: Note = Note::new(
-        "OS 連携（既定アプリ・ゴミ箱・ファイルマネージャ）の Windows 実装が前提",
-        "Requires the Windows implementation of OS integration (default app, trash, file manager)",
+
+    /// #919 / #65 / #930。バックエンドは同梱の OpenSSH なので移植は要らない設計だが、
+    /// 実機テストではホスト解決の分類がまだ落ちている
+    pub const WIN_REMOTE_FOLDER: Note = Note::new(
+        "同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測（ホスト解決の分類は実機テストで失敗中。#930）",
+        "Designed to work with the bundled OpenSSH client, but not measured on Windows yet (host resolution classification still fails in the real-hardware test suite, #930)",
     );
-    /// #524 の担当範囲
-    pub const WIN_OS_API: Note = Note::new(
-        "OS API（プロセス検査・スリープ防止）の Windows 実装が前提",
-        "Requires the Windows implementation of OS APIs (process inspection, sleep prevention)",
+
+    /// #519。器は psmux。一覧と kill は通るが attach 系は通らない
+    pub const WIN_TMUX_ATTACH: Note = Note::new(
+        "永続化の器は psmux で、attach と send-keys を前提にする tmux 操作は動かない",
+        "The persistence container is psmux, so tmux operations that assume attach and send-keys do not work",
     );
-    /// #525 の担当範囲
-    pub const WIN_SETUP: Note = Note::new(
-        "PowerShell シェル統合と setup の Windows 対応が前提",
-        "Requires PowerShell shell integration and Windows support in setup",
+
+    /// #519。psmux は `-x` / `-y` を受け取るが反映しない
+    pub const WIN_TMUX_RESIZE: Note = Note::new(
+        "psmux がセッションの寸法指定（-x / -y）を反映しないため寸法を変えられない",
+        "psmux ignores the session size options (-x / -y), so the size cannot be changed",
     );
+
+    /// #933 / #522。**データを失う差**なので必ず理由文に出す
+    pub const WIN_TRASH_PERMANENT: Note = Note::new(
+        "作成・リネーム・パスのコピーは動くが、ゴミ箱へ送る操作が完全削除になり元に戻せない（#933）。既定アプリで開く / アプリを指定して開く / ファイルマネージャで表示は未対応（#522）",
+        "Create, rename and copy-path work, but sending to the trash deletes permanently with no way to undo (#933). Open with the default app, open with a chosen app and reveal in the file manager are unavailable (#522)",
+    );
+
+    /// #934。名前は付くので気づきにくい縮退
+    pub const WIN_AUTORENAME_HEURISTIC: Note = Note::new(
+        "タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#934）",
+        "Tabs still get named, but claude detection for AI naming assumes a POSIX login shell, so naming always falls back to the heuristic path (#934)",
+    );
+
+    /// #935。登録と表示は動き、実行だけが落ちる
+    pub const WIN_GATE_CHECK_SH: Note = Note::new(
+        "ゲートの登録と表示は動くが、コマンド型ゲートの実行が sh -c 決め打ちのため Windows では判定できない（#935）",
+        "Registering and showing gates works, but command gates run through a hardcoded sh -c, so they cannot be evaluated on Windows (#935)",
+    );
+
+    /// #936。PATH 上の探索（#898 で境界へ寄せた）は動くが、実行中プロセスを特定できない
+    pub const WIN_STALE_BINARY_PID: Note = Note::new(
+        "PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936）",
+        "Checking that claude exists on PATH works, but the running claude's path cannot be resolved, so the stale binary warning never appears (#936)",
+    );
+
+    /// #766 / #525。側路（`TAKO_OSC_SINK`）で届くが、能力申告は素通し不可のまま
+    pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
+        "cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766）",
+        "cwd tracking and command state are delivered through a side channel even inside the psmux container, but because psmux does not pass OSC through, the status field effective stays false (#766)",
+    );
+
+    /// #937。確認とノート表示は動くが、適用（インストーラー実行）は未実測
+    pub const WIN_UPDATE_APPLY_UNVERIFIED: Note = Note::new(
+        "更新の確認とリリースノートの表示は動くが、更新の適用（インストーラーの実行と再起動）は Windows 実機で未実測（#937）",
+        "Checking for updates and rendering the release notes work, but applying an update (running the installer and restarting) has not been measured on Windows (#937)",
+    );
+
     /// #868 / #525。状態照会と手順の提示はできるが、実行の代行は macOS だけ
     pub const WIN_SETUP_BOOTSTRAP: Note = Note::new(
         "状態の確認と公式手順の案内はできるが、インストールの実行代行は macOS だけ（Windows は PowerShell 版インストーラを案内する）",
         "Status and official instructions work, but tako only runs the installer for you on macOS (on Windows it points to the PowerShell installer)",
     );
-    /// #525。配置はできるが器が OSC を落とす
-    pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
-        "配置はできるが psmux が OSC を外へ通さないため、cwd 追従とコマンド状態は TAKO_BACKEND=none のときだけ働く",
-        "Installs, but psmux does not pass OSC through, so cwd tracking and command state only work with TAKO_BACKEND=none",
-    );
-    /// #526 の担当範囲
-    pub const WIN_ORCHESTRATOR: Note = Note::new(
-        "orchestrator の Windows 縮退モードが前提",
-        "Requires the degraded orchestrator mode on Windows",
-    );
-    /// #528 の担当範囲
-    pub const WIN_REMOTE: Note = Note::new(
-        "remote トランスポートと Windows 配布系統が前提",
-        "Requires the remote transport and the Windows distribution channel",
-    );
 
-    /// 「リモートからフォルダを開く」（#919 / #65）。
-    /// バックエンドは Windows 10 以降が同梱する OpenSSH クライアント（`ssh` / `sftp`）
-    /// なので**移植は要らない設計**だが、実機で 1 度も測っていないので Pending。
-    /// 実測すべき点: ControlMaster が Windows の named pipe / ソケットで張れるか、
-    /// `ControlPath` の引用が通るか、`ssh_pane_script` の PowerShell 版が動くか
-    pub const WIN_REMOTE_FOLDER: Note = Note::new(
-        "同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測",
-        "Designed to work with the bundled OpenSSH client, but not yet measured on Windows",
-    );
-
-    /// GUI ライク表示モードのチャットビュー（#691 の G2 以降）。
-    /// 表示レイヤだけの機能なので #517 で足りそうに見えるが、**会話の解決が
-    /// 永続バックエンドのセッション名を鍵にしている**（`.agent/plans/2026-07-gui-mode.md`
-    /// §4 G2 の帰結: チャット化されるのはバックエンドを持つペインだけ）ため、
-    /// GUI 起動と永続化戦略の両方が要る。スターター側（#694 / #739）は GUI 起動だけで
-    /// 動くので `tako_ui_mode` は `WIN_TERMINAL` のまま
-    pub const WIN_GUI_CHAT: Note = Note::new(
-        "GUI 起動に加えて、チャットビューが会話をひも付けるための永続バックエンド（tmux 相当）の決定が前提",
-        "Requires GUI startup plus deciding the persistent backend (the tmux equivalent) that the chat view resolves conversations through",
-    );
-
-    /// #513 の担当範囲。実装はプラットフォーム共通（ファイル操作 + git のみ）で、
-    /// パス可搬化の Windows 表記も macOS 上の単体テストで検証済み。
-    /// 残っているのは**実機での配線確認**だけなので、その一点だけを理由として書く
-    pub const WIN_CONFIG_SHARE: Note = Note::new(
-        "実装はプラットフォーム共通だが、Windows 実機での配線確認が未了",
-        "The implementation is platform-neutral, but wiring has not yet been verified on real Windows hardware",
-    );
+    // ─── そもそも要らない / 概念が無い ─────────────────────────────
 
     /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
     pub const WIN_NO_PSREADLINE_NEEDED: Note = Note::new(
@@ -248,11 +256,53 @@ impl Support {
     }
 }
 
+/// Windows 判定の根拠。**何をもってそう言えるのか**を表そのものに持たせる。
+///
+/// マトリクスは `PlatformFacts` 経由で system prompt へ流れる（#516）ので、
+/// 宣言が実態より甘いと「使える」と信じたエージェントが失敗し続ける。
+/// 逆に辛いと使える機能を回避する。どちらも実害があるため、
+/// **`Supported` / `Degraded` / `Unsupported` は根拠を持つことをテストで強制する**（T7）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// 実機の GUI セルフテスト（`TAKO_SELF_TEST=1`）が通した項目。
+    /// 2026-08-24 の通しで **FAILED 0 / skip 19** まで到達している（#920）
+    SelfTest(&'static str),
+    /// 実機の `cargo test` で緑のテスト。
+    /// 既知の失敗（#583 系のベースライン）に含まれないことが条件
+    UnitTest(&'static str),
+    /// 実機で実際に実行した記録（`.agent/plans/` の記録節 / Issue コメント）
+    Measured(&'static str),
+    /// 未実測。**`Supported` にはできない**（T7 が落とす）
+    Unverified,
+}
+
+impl Evidence {
+    /// 判定の裏づけになる文言（未実測なら `None`）
+    pub fn citation(self) -> Option<&'static str> {
+        match self {
+            Self::SelfTest(s) | Self::UnitTest(s) | Self::Measured(s) => Some(s),
+            Self::Unverified => None,
+        }
+    }
+
+    /// 根拠の種別（docs の表と `tako platform --json` に出す）
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::SelfTest(_) => "self-test",
+            Self::UnitTest(_) => "unit-test",
+            Self::Measured(_) => "measured",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
 /// 1 機能ぶんの対応状況。`key` は MCP ツール名
 pub struct Feature {
     pub key: &'static str,
     pub macos: Support,
     pub windows: Support,
+    /// Windows 判定の根拠。macOS 側は開発機なので根拠欄を持たない
+    pub windows_evidence: Evidence,
 }
 
 impl Feature {
@@ -350,17 +400,20 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_agents_sync_rules",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_auto_rename",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+        windows: Support::Degraded {
+            note: notes::WIN_AUTORENAME_HEURISTIC,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#934）",
+        ),
     },
     Feature {
         // #600: tako 内 zsh の入力予測（zsh-autosuggestions をシェル統合経路で注入）
@@ -369,97 +422,104 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Unsupported {
             note: notes::WIN_NO_PSREADLINE_NEEDED,
         },
+        windows_evidence: Evidence::Measured(
+            "PowerShell が PSReadLine の予測入力を標準搭載（セルフテスト項目 41c / 41c-2 は zsh 不在で自動スキップ）",
+        ),
     },
     Feature {
         key: "tako_background_kill",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_background_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 47c（ドロワーに実画面プレビューが並ぶ）",
+        ),
     },
     Feature {
         key: "tako_background_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 47b（ー ボタンでバックグラウンドへ退避）",
+        ),
     },
     Feature {
         // #725: GUI モードのチャットビュー本文コピー。表示レイヤの機能だが、
         // 会話の解決に永続バックエンドが要る（#739 で理由を精緻化）
         key: "tako_chat_copy",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GUI_CHAT,
-            issue: 519,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 98 / 115（チャット本文の選択・コピー・索引）",
+        ),
     },
     Feature {
         key: "tako_check_health",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_close_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 6 / 28 / 40 / 40b（cmd+W・tako close・非フォーカス側 close・10 周の fd 検査）",
+        ),
     },
     Feature {
         key: "tako_collapse_tab",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         // #513: AI 系設定の git ベース共有。GUI にも tmux にも依存しない
         key: "tako_config_share",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_CONFIG_SHARE,
-            issue: 513,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_confirm_close",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 73a〜73f（確認ダイアログの表示・Esc・Enter・即 close）",
+        ),
     },
     Feature {
         key: "tako_create_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 7 / 25 / 116（cmd+T・tako tab new・--cwd 指定）",
+        ),
     },
     Feature {
         key: "tako_equalize_layout",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 23（tako equalize）",
+        ),
     },
     Feature {
         key: "tako_fda",
@@ -467,184 +527,197 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Unsupported {
             note: notes::WIN_NO_TCC,
         },
+        windows_evidence: Evidence::Measured(
+            "Windows に TCC 相当の仕組みが無い（設計判断。#515 の判定テストが固定）",
+        ),
     },
     Feature {
         key: "tako_file_op",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_OS_INTEGRATION,
-            issue: 522,
+        windows: Support::Degraded {
+            note: notes::WIN_TRASH_PERMANENT,
         },
+        windows_evidence: Evidence::Measured(
+            "os_integration の非 macOS 実装: move_to_trash が remove_file / remove_dir_all（#933）、open_default / open_with / reveal は Err(unsupported)（#522）",
+        ),
     },
     Feature {
         key: "tako_focus_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 4 / 24（方向フォーカス移動・tako focus）",
+        ),
     },
     Feature {
         key: "tako_foreground_pane",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_branch_create",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_checkout",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_commit",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 79 / 79b / 86（コミットメッセージ入力欄・両経路のコミット・IME）",
+        ),
     },
     Feature {
         key: "tako_git_conflicts",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 82b / 109（使い捨てリポのコンフリクトを git パネルが認識する）",
+        ),
     },
     Feature {
         key: "tako_git_diff",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 85 / 79b（変更ファイルの分類と diff）+ #520 の parse_diff CRLF 耐性",
+        ),
     },
     Feature {
         key: "tako_git_log",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 85（git タブのセクション表示順）+ #520 のパス可搬化と CRLF 耐性テストが実機で緑",
+        ),
     },
     Feature {
         key: "tako_git_merge",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_merge_abort",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_pull",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_push",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_git_resolve_agent",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT_RESOLVE_AGENT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 82b / 109（3 択の開閉と起動）+ #867 でエージェントペインの実起動を実機実測",
+        ),
     },
     Feature {
         key: "tako_git_show",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 85（コミット詳細）+ #520 の to_git_path / repo_relative",
+        ),
     },
     Feature {
         key: "tako_git_stage",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 79b（ステージング UI の分類とコミット挙動。git データが取れない環境では自己スキップする項目）",
+        ),
     },
     Feature {
         key: "tako_git_unstage",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_GIT,
-            issue: 520,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 79b（同上）",
+        ),
     },
     Feature {
         key: "tako_lang",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 33c（MCP tako_lang: en 適用 → i18n 反映 → system 復帰）",
+        ),
     },
     Feature {
         // #813: 上限後の自動復帰。ダイアログへの応答が tmux バックエンド（detached access）
         // 経由なので、Windows は永続バックエンドの移植（#526 のオーケストレーション層）待ち
         key: "tako_limit_resume",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 111 / 117（オプトイン・ダイアログ型 / idle 型の出し分け・試行上限・プロファイル既定）",
+        ),
     },
     Feature {
         key: "tako_limit_service",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_list_panes",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 17 / 33（tako list・MCP tako_list_panes）",
+        ),
     },
     Feature {
         key: "tako_logs",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 87 / 104（ペインログのクローズマーカーと発生源）",
+        ),
     },
     Feature {
         // #657: メニューの操作。両プラットフォームで「メニューは存在し、一覧 list と
@@ -666,6 +739,9 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_menu",
         macos: Support::Supported,
         windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 118（in-window メニューバー #657 の open / invoke / close）",
+        ),
     },
     Feature {
         // 設定ファイルの読み書きだけで完結する（GUI に触らない）。**壊れた設定で
@@ -673,54 +749,60 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_migrate",
         macos: Support::Supported,
         windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 123（実 dispatch で自動マイグレーション）+ migrations の単体 20 本が実機で緑",
+        ),
     },
     Feature {
         key: "tako_move_pane_to_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 26 / 68c（tako tab move-pane・target + direction）",
+        ),
     },
     Feature {
         key: "tako_open_dir",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_open_file",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 66 / 66b / 68b / 112 / 114 / 116（dispatch・tako open・direction・新しいタブ）",
+        ),
     },
     Feature {
         key: "tako_open_remote",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_accounts",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_handoff",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 101 / 102 / 102b / 102c / 122（自動通知・後任起動・新旧書式・管轄解決）",
+        ),
     },
     Feature {
         // #915: 引き継ぎファイルの管理（一覧 / 読み / 書き / 自動移行）。
@@ -731,324 +813,354 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_orchestrator_handoffs",
         macos: Support::Supported,
         windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#915 で実機 13/13（移行・冪等・list / show / write・日本語本文・円記号区切りのパス）+ セルフテスト項目 122",
+        ),
     },
     Feature {
         key: "tako_orchestrator_layout",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 72（master-reserved の配置と close 後のリフロー）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_ledger",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_profiles",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 96 / 99 / 117（設定画面のフォーム・スターターの ▾・limit_resume の既定）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_projects",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 117（一時プロジェクトの登録と解除）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_report",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_respond",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 95 / 102 / 111（選択肢ダイアログの検知と番号 / ラベル確定）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_run",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_run_result",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_run_status",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_self",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 102（後任 master の self がプロファイルと handoff_path を引き継ぐ）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_spawn",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 72 / 117（配置エンジンとプロファイル適用）+ #867 で実機の claude 起動と env 到達を PEB で確認",
+        ),
     },
     Feature {
         key: "tako_orchestrator_supervisor",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_orchestrator_worker_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 74 / 105（IPC 応答と busy 中の後続 send）+ #877 で agents 経由の status=idle を実機実測",
+        ),
     },
     Feature {
         key: "tako_orchestrator_workers",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 105（レジストリの登録・再読込・再解決）",
+        ),
     },
     Feature {
         key: "tako_panel",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 49 / 56 / 64 / 64b（fleet ビュー・タブ枠・tako panel roundtrip・ファイルツリー経路）",
+        ),
     },
     Feature {
         key: "tako_persist",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 58（tako persist の ON/OFF と状態取得）+ 実機 psmux_backend 16/0",
+        ),
     },
     Feature {
         key: "tako_pin_preview",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         // #552: 自動命名された名前の固定（GUI のピン印と 1:1）
         key: "tako_pin_tab_title",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 51b（自動命名直後の「この名前を固定」）",
+        ),
     },
     Feature {
         key: "tako_platform",
         macos: Support::Supported,
         windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "platform_parity 13 本と support の単体が実機で緑（判定は純粋関数）",
+        ),
     },
     Feature {
         key: "tako_port_detect",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_OS_API,
-            issue: 524,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "スライス 9 の実機実測: tako list が 8123/node.exe を拾い、psmux の偽 listen 21 個を 1 つも報告しない + セルフテスト項目 55（ON/OFF）",
+        ),
     },
     Feature {
         key: "tako_preview_apply",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 66d（全文適用）",
+        ),
     },
     Feature {
         key: "tako_preview_autosave",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_preview_cache",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 33d / 66c（MCP と CLI から同じ LRU 上限へ反映）",
+        ),
     },
     Feature {
         key: "tako_preview_changelog",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_preview_copy_code",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 90 / 114（画面外のコードブロックも含めてコピー）",
+        ),
     },
     Feature {
         key: "tako_preview_edit",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 66d（tako edit で開始 → 適用 → 保存）",
+        ),
     },
     Feature {
         key: "tako_preview_follow_link",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+        windows: Support::Degraded {
+            note: notes::WIN_PDF_NO_TEXT_LAYER,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 90（Markdown の ⌘+クリックは緑。URL は cmd /C start で開く。PDF 内リンクは不可）",
+        ),
     },
     Feature {
         key: "tako_preview_link_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+        windows: Support::Degraded {
+            note: notes::WIN_PDF_NO_TEXT_LAYER,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 90 / 114（Markdown リンク索引は緑。PDF 注釈リンクは不可）",
+        ),
     },
     Feature {
         key: "tako_preview_outline",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+        windows: Support::Degraded {
+            note: notes::WIN_PDF_NO_TEXT_LAYER,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 114（Markdown 目次のジャンプは緑。PDF 目次は text_layer 不在でスキップ）",
+        ),
     },
     Feature {
         key: "tako_preview_redo",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_preview_reload",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 66c（実 CLI の ON/OFF と OS イベントでの再生成）",
+        ),
     },
     Feature {
         key: "tako_preview_replace",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_preview_save",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 66d（保存と外部変更の拒否）",
+        ),
     },
     Feature {
         key: "tako_preview_search",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_preview_undo",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_preview_view",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+        windows: Support::Degraded {
+            note: notes::WIN_PDF_NO_TEXT_LAYER,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 66b-2 / 70 / 112 / 114（コード・md・画像は緑。PDF はページ画像だけ通り文字座標の検査はスキップ）",
+        ),
     },
     Feature {
         key: "tako_read_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 20 / 33（tako read・MCP tako_read_pane）",
+        ),
     },
     Feature {
         key: "tako_recent",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_agents",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_devices",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_folder",
@@ -1057,371 +1169,403 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_REMOTE_FOLDER,
             issue: 919,
         },
+        windows_evidence: Evidence::UnitTest(
+            "セルフテスト項目 124 はバックエンドを呼ばない（器だけの検証）。実 SSH の remote_fs_e2e は実機で 1 件失敗中（#930）",
+        ),
     },
     Feature {
         key: "tako_remote_messages",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_scrollback",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_setup",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_start",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::UnitTest(
+            "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗",
+        ),
     },
     Feature {
         key: "tako_remote_status",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_remote_stop",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE,
+            note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
+        windows_evidence: Evidence::UnitTest(
+            "同上（daemon_stop_impl はpid再利用時にkillしない が失敗）",
+        ),
     },
     Feature {
         key: "tako_rename_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 50（tako tab rename）",
+        ),
     },
     Feature {
         key: "tako_reorder_tab",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_resize_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 5 / 5b / 22（キーボード・境界ドラッグ・tako resize --share-y）",
+        ),
     },
     Feature {
         key: "tako_run",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true",
+        ),
     },
     Feature {
         key: "tako_run_defaults",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑",
+        ),
     },
     Feature {
         key: "tako_run_interactive",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_run_interactive_status",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_run_resolve",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）",
+        ),
     },
     Feature {
         key: "tako_scroll_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 43 / 44 / 44b（ホイールの出し分け・tako scroll・ピクセル単位スクロール）",
+        ),
     },
     Feature {
         key: "tako_select_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 12 / 27（cmd+1・tako tab select）",
+        ),
     },
     Feature {
         key: "tako_send_input",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み",
+        ),
     },
     Feature {
         key: "tako_sessions",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑",
+        ),
     },
     Feature {
         key: "tako_set_title",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 21（tako title --role）",
+        ),
     },
     Feature {
         key: "tako_settings",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 96 / 120（プロファイルタブ・スリープ防止タブの表示構成）",
+        ),
     },
     Feature {
         key: "tako_setup",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 97（スターターの setup リンクから tako setup が入る）+ 実機 setup_bootstrap / changes の単体が緑",
+        ),
     },
-    // #868。macOS は公式 native インストーラ（install.sh）で実行まで代行する。
-    // Windows は install.sh 自身が非対応（MINGW*/MSYS*/CYGWIN* で exit 1）で、
-    // 公式手順は PowerShell の install.ps1。状態照会と手順の提示までは動くが
-    // 実行の代行は実機で確かめてから倒す（#525）
     Feature {
         key: "tako_setup_bootstrap",
         macos: Support::Supported,
         windows: Support::Degraded {
             note: notes::WIN_SETUP_BOOTSTRAP,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 119（status が next_step を返す・install --dry-run は実行しない・不明な action を拒否）",
+        ),
     },
     Feature {
         key: "tako_setup_changes",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "changes.yaml の連番・platforms 絞り込みテストが実機で緑（#525 が platforms: を最初に使う）",
+        ),
     },
     Feature {
         key: "tako_setup_mcp",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
-    // #525。Windows 実機で実測して倒した（作法どおり、動くことを確認してから）:
-    // 配置・冪等・解除の完全復帰と OSC 7 / 133 の到達（pwsh 7 と 5.1 の両方）を確認。
-    // ただし**器が psmux だと OSC が外へ出ない**ので Supported ではなく Degraded
     Feature {
         key: "tako_shell_integration",
         macos: Support::Supported,
         windows: Support::Degraded {
             note: notes::WIN_SHELL_INTEGRATION_PSMUX,
         },
+        windows_evidence: Evidence::Measured(
+            "#766 の実機実測: 側路で state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）",
+        ),
     },
     Feature {
         key: "tako_show_command",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 91 / 91b（カードとカード帯）+ #875 で新規ペイン実行を実機実測",
+        ),
     },
     Feature {
         key: "tako_sleep_guard",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_OS_API,
-            issue: 524,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#727 の実機実測: powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121",
+        ),
     },
     Feature {
         key: "tako_split_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 2 / 18 / 34（cmd+D・tako split・MCP tako_split_pane）",
+        ),
     },
     Feature {
         key: "tako_ssh_hosts",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "~/.ssh/config の解析は純粋関数で、remote_fs / ssh_hosts の単体が実機で緑（ホーム解決は #870 で一本化）",
+        ),
     },
     Feature {
         key: "tako_stale_binary",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_SETUP,
-            issue: 525,
+        windows: Support::Degraded {
+            note: notes::WIN_STALE_BINARY_PID,
         },
+        windows_evidence: Evidence::UnitTest(
+            "実機の cargo test で stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み",
+        ),
     },
     Feature {
         key: "tako_task_checkpoint",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_task_gate",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "acceptance_gates のゲート登録テストが実機で緑（落ちているのは execute_command の 5 件だけ）",
+        ),
     },
     Feature {
         key: "tako_task_gate_check",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+        windows: Support::Degraded {
+            note: notes::WIN_GATE_CHECK_SH,
         },
+        windows_evidence: Evidence::UnitTest(
+            "実機の cargo test で execute_command 系 5 件が失敗（sh 不在）。PR / custom ゲートの判定は動く",
+        ),
     },
     Feature {
         key: "tako_task_gate_show",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "acceptance_gates の表示テストが実機で緑",
+        ),
     },
     Feature {
         key: "tako_task_list",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_task_resume",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_ORCHESTRATOR,
-            issue: 526,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_telemetry",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_theme",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 33b（MCP tako_theme: light 適用 → GUI 反映 → toggle）",
+        ),
     },
     Feature {
         key: "tako_tmux_cleanup",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_ATTACH,
             issue: 519,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_tmux_kill",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#866 の製品経路 A/B: 項目 48 で対象だけが消え、隣の tako-test2 が残ることまで実測",
+        ),
     },
     Feature {
         key: "tako_tmux_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_PERSIST,
-            issue: 519,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#866 の製品経路 A/B: 項目 48 が既定で通過（TAKO_866_KEEP_EXACT_TARGET=1 では FAILED）",
+        ),
     },
     Feature {
         key: "tako_tmux_open",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_ATTACH,
             issue: 519,
         },
+        windows_evidence: Evidence::Measured(
+            "セルフテスト項目 68 / 73 は attach / send-keys 前提のため psmux ではスキップ",
+        ),
     },
     Feature {
         key: "tako_tmux_resize",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_RESIZE,
             issue: 519,
         },
+        windows_evidence: Evidence::Measured(
+            "psmux が -x / -y を受け取っても反映しないことを #866 の調査で確認",
+        ),
     },
     Feature {
         key: "tako_tmux_select_window",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PERSIST,
+            note: notes::WIN_TMUX_ATTACH,
             issue: 519,
         },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_tree_folder",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 67 / 85（タブ = ワークスペース・TreeFolder 経由の git セクション）",
+        ),
     },
     Feature {
         // #694 / #739: 表示レイヤだけの切替で、モードトグルとスターター
@@ -1430,66 +1574,80 @@ pub const MATRIX: &[Feature] = &[
         // `tako_chat_copy`（WIN_GUI_CHAT）側で追跡する
         key: "tako_ui_mode",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 93 / 94 / 97 / 100 / 114 / 115（G1 スターター〜チャット表示と仮想化）",
+        ),
     },
     Feature {
         key: "tako_update",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE,
-            issue: 528,
+        windows: Support::Degraded {
+            note: notes::WIN_UPDATE_APPLY_UNVERIFIED,
         },
+        windows_evidence: Evidence::SelfTest(
+            "項目 90（更新画面と Markdown のリリースノート）+ #587 / #723 で実機の配布物生成とバージョン解析を実測。適用そのものは未実測",
+        ),
     },
     Feature {
         key: "tako_video_playback",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_VIDEO,
             issue: 521,
         },
+        windows_evidence: Evidence::Measured(
+            "video_player.rs の非 macOS 実装が Err(\"動画再生は macOS でのみ対応\") を返すスタブ",
+        ),
     },
     Feature {
         key: "tako_video_seek",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_VIDEO,
             issue: 521,
         },
+        windows_evidence: Evidence::Measured(
+            "video_player.rs の非 macOS 実装が Err を返すスタブ",
+        ),
     },
     Feature {
         key: "tako_video_volume",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
+            note: notes::WIN_VIDEO,
             issue: 521,
         },
+        windows_evidence: Evidence::Measured(
+            "video_player.rs の非 macOS 実装が Err を返すスタブ",
+        ),
     },
     Feature {
         key: "tako_web",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_PREVIEW,
-            issue: 521,
+            note: notes::WIN_WEBVIEW2_PANIC,
+            issue: 724,
         },
+        windows_evidence: Evidence::Measured(
+            "セルフテスト項目 71 は WebView2 の非巻き戻し panic（wry/src/webview2/mod.rs:910）でアプリごと落ちるためスキップ",
+        ),
     },
     Feature {
         key: "tako_welcome",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 88（初回起動バナーと案内コマンド）",
+        ),
     },
     Feature {
         key: "tako_window",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TERMINAL,
-            issue: 517,
-        },
+        windows: Support::Supported,
+        windows_evidence: Evidence::SelfTest(
+            "項目 77（window new → move-tab）+ #872 で 0 枚化の寿命を Windows 向けに実装（項目 79b）",
+        ),
     },
 ];
 
@@ -1497,6 +1655,50 @@ pub const MATRIX: &[Feature] = &[
 mod tests {
     use super::*;
     use crate::i18n::{self, Lang};
+
+    /// T7: **根拠なき判定を構造的に禁止する**（#591）。
+    ///
+    /// Windows の宣言は `PlatformFacts` 経由で system prompt へ流れる（#516）。
+    /// 甘い宣言は「使える」と信じたエージェントを失敗させ、辛い宣言は使える機能を
+    /// 回避させる。どちらも実害があるので、**未実測のまま「動く」と言えない**ことを
+    /// 型とテストで縛る。実測できたら `Pending` を外すと同時に根拠を書く
+    #[test]
+    fn t7_windowsの判定には実測根拠が要る() {
+        for f in MATRIX {
+            match f.windows {
+                Support::Supported | Support::Degraded { .. } | Support::Unsupported { .. } => {
+                    assert!(
+                        f.windows_evidence != Evidence::Unverified,
+                        "{} は Windows で「使える / 使えないと分かっている」と宣言しているのに根拠が無い。\
+                         実機セルフテストの項目・実機で緑のテスト名・実測の記録のどれかを \
+                         windows_evidence へ書くこと（書けないなら Pending のままにする）",
+                        f.key
+                    );
+                }
+                // Pending は「未実装」か「未実測」。根拠があってもなくてもよい
+                Support::Pending { .. } => {}
+            }
+            if let Some(citation) = f.windows_evidence.citation() {
+                assert!(!citation.trim().is_empty(), "{} の根拠が空文字", f.key);
+            }
+        }
+    }
+
+    /// T7 の対: **未実測を Pending 以外へ倒す退行**は上で落ちるが、
+    /// 逆に「根拠を書いたのに Pending のまま」も棚卸し漏れなので数えておく。
+    /// 落とさずに件数だけ固定するのは、実測が先行してもよいから
+    /// （実測 → 宣言更新の順で 2 回に分けて入れられる）
+    #[test]
+    fn t7_未実測のpendingは追跡issueを持つ() {
+        for f in MATRIX {
+            if f.windows_evidence == Evidence::Unverified {
+                let Support::Pending { issue, .. } = f.windows else {
+                    continue; // 上のテストが落とす
+                };
+                assert!(issue != 0, "{} は未実測なのに追跡 Issue が無い", f.key);
+            }
+        }
+    }
 
     /// T4: 縮退には必ず理由が要る。`Pending` には追跡先も要る。
     /// 「理由も追跡先も無い縮退」を構造的に禁止する

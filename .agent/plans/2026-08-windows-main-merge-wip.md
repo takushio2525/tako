@@ -2760,7 +2760,7 @@ macOS では `/Applications/tako.app/...` が安全文字だけなので囲ま�
   Windows 実機で失敗（#919 由来）。**速い FAILED と >60 秒のハングの両方**を観測した
   ので、名前解決不能の枝は分類だけでなく戻ってこない経路がある疑い
 
-### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）
+### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）— ✅ **完了**（2026-08-24）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
 - 編集: `docs/.../getting-started/index.mdx`（Windows タブ）/
@@ -2770,6 +2770,101 @@ macOS では `/Applications/tako.app/...` が安全文字だけなので囲ま�
 - `keyboard-shortcuts.md` は main が 2 列のまま行を約 47 追加しているので、
   **3 列へ寄せて main の行を移植する**作業が要る。
   `windows/467-main-merge-wip` にこの 7 hunk が未解決のまま残してあるので材料になる
+
+
+#### 8 の記録（マトリクス棚卸し + docs ページ。2026-08-24）
+
+##### 前提の訂正: **`cf7c9a4` は main に 1 行も入っていない**
+
+Issue #591 には「完了（`cf7c9a4`）」というコメントが付いているが、あのコミットは
+`windows/467-ipc-orchestration-local` にしか無い（**#658 と同じ型**）。main の
+`tako platform --platform windows` は棚卸し前で **supported 4 / degraded 2 /
+pending 132 / unsupported 2** のままだった。しかも当時（2026-07-27）の判定は
+win467 ブランチの実装に対するもので、いまの main とは中身が違う
+（#665 / #662 / #709 は持ち込まない裁定・逆にスライス 1〜9 と #866 以降 13 本が入った）
+ので**移植ではなく引き直し**にした。
+
+##### 判定の作り方（根拠を型にした）
+
+`Feature` に `windows_evidence: Evidence` を足し、`SelfTest` / `UnitTest` /
+`Measured` / `Unverified` の 4 種で**何をもってそう言えるのか**を表そのものに持たせた。
+**T7（`t7_windowsの判定には実測根拠が要る`）が、根拠なしに
+`Supported` / `Degraded` / `Unsupported` へ倒すことを落とす。**
+検出力は `tako_theme` の根拠を外して実測（機能名を名指しして FAILED）。
+
+根拠の在庫はこの plan とセルフテストから機械的に採った:
+
+| 種別 | 在庫 | 使った数 |
+|---|---|---|
+| `SelfTest` | 実機セルフテストの**通し**（#920。FAILED 0 / skip 19）。項目 → dispatch の対応は `main.rs` の `// NN.` コメントと `Request::` の出現から抽出 | 65 |
+| `Measured` | この plan の各記録節（#866 / #875 / #877 / #915 / #727 / #766 / #867 / スライス 9 ほか） | 18 |
+| `UnitTest` | 実機 `cargo test` のベースライン 21〜22 件（#906 が `--no-fail-fast` で採った失敗名の全数）に**含まれない**テスト | 11 |
+| `Unverified` | 上のどれも無いもの | 46 |
+
+##### 前後
+
+| | supported | degraded | pending | unsupported |
+|---|---:|---:|---:|---:|
+| 変更前（main） | 4 | 2 | 132 | 2 |
+| 変更後 | **72** | **11** | **55** | 2 |
+
+system prompt へ流れる縮退理由（`degraded_note_items`）は 17 行 → 17 行だが**中身が別物**。
+最大の 1 行が「GUI 起動とペイン / タブ管理の Windows 実装が前提（42 機能）」から
+「実装はプラットフォーム共通だが Windows 実機での実測がまだ無い（37 機能・追跡 #937）」へ変わった。
+
+##### 「未実測」を Supported にしなかった理由
+
+`Pending` は `gate()` の対象だが **`gate()` は production から 1 か所も呼ばれていない**
+（確認済み）。つまり誤判定の実害は「実行が止まる」ことではなく
+**system prompt と docs に嘘が載る**ことだけ。であれば
+「動く見込みだが未実測」を Supported と言う理由が無い。
+`notes::WIN_UNVERIFIED` の文面を「動く見込み。失敗したらまずここを疑う」にして、
+prompt の枠（「操作が失敗したらまずここを疑ってください」）で正しく読めるようにした。
+
+##### 棚卸しで見つけた製品バグ（起票して Pending / Degraded に紐づけた）
+
+| Issue | 中身 | 判定への反映 |
+|---|---|---|
+| **#933** | `move_to_trash` の非 macOS 実装が `remove_file` / `remove_dir_all` = **ゴミ箱に入らず完全削除**。UI の文言は macOS と同じ「ゴミ箱に移動」 | `tako_file_op` を Degraded にし理由文へ明記 |
+| **#934** | `autorename.rs` の `detect_claude` が `$SHELL -l -c` 直書きで **`cfg(unix)` ガードが無い**（同型の一族 4 箇所のうちここだけ）。Windows は常に `None` → AI 命名が一度も走らない | `tako_auto_rename` を Degraded |
+| **#935** | `acceptance_gates::execute_command` が `sh -c` 決め打ち。実機ベースラインの 5 件はこれ | `tako_task_gate_check` を Degraded |
+| **#936** | `stale_binary::pidpath` が Windows 未実装 → 実行中の claude を特定できず**古い claude の警告が出ない**。ベースラインの 2 件がこれ | `tako_stale_binary` を Degraded |
+| **#937** | 未実測項目の消し込み（追跡先。消し込み手順つき） | `Pending` 46 件の追跡先 |
+
+##### ベースラインの失敗名は「機能の判定材料」として読める
+
+#906 が採った 22 件（#920 で 21・#919 で +1）は POSIX 前提のテスト側都合が多いが、
+**製品の縮退を指しているものが混ざっている**。切り分けた結果:
+
+- 製品の縮退 = `acceptance_gates` 5 件（#935）/ `stale_binary` 2 件（#936）/
+  `remote` 2 件（Windows 実機で未確認の裏づけ）
+- テスト側の POSIX 前提 = `dispatch::tests::tree_folder_*` 3 件（`/tmp` 直書き）/
+  `orchestrator::tests::resolved_env_expands_tilde`（`v.ends_with("/test-dir")` = 区切り決め打ち。
+  **製品は正しく展開している**）/ `tab::tests::pinned_folder_symlink` 2 件 /
+  `links` 3 件（#522 / #870）/ `shell_profile` 2 件 /
+  `config_share::env`（リポジトリ配下の実体検出）
+
+前者だけを Degraded の根拠に使い、後者は判定に影響させていない。
+
+##### docs
+
+`docs/src/content/docs/windows-support.md` は**生成物**
+（`node scripts/gen-windows-support-docs.mjs`。`--check` で同期検査）。
+サイドバー「はじめに」へ登録し、セットアップページの動作環境表からリンクした。
+
+- **二重管理を構造で止める**: `--check` を **CI の macOS ジョブ**へ入れた
+  （`cargo build --workspace` が `target/debug/tako` を作った後に走る）。
+  カテゴリ未分類の機能があると生成が失敗するので、機能追加時の分類漏れもここで落ちる
+- 表には**根拠の列**を出す。「対応」と書いてある行が何で確かめられたのかを
+  利用者がそのまま読める（この列があるので「未実測」を隠さずに済む）
+- OG 画像は `docs/scripts/generate-og.mjs` にも同型の未分類ガードがあり、
+  `SECTIONS` へ 1 行足すまで `npm run og` が落ちた（**設計が揃っていて助かった例**）
+
+##### 実機で追試できなかったこと（このセッションの制約）
+
+**Windows 実機はセッションを通して offline**（`ssh win` が 3 回とも timeout）。
+そのため「新たに実機で測って Supported へ倒す」ことはしていない。
+判定はすべて**既存の実測記録の集約**で、追試が要るものは #937 に積んである。
 
 ### 9. スリープ防止 + 蓋閉じ継続 + ポート検知（#524 / #697 / #724）— ✅ **完了**（PR #863）
 
