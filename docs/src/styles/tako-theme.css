@@ -1108,6 +1108,11 @@ starlight-theme-select select {
 .expressive-code .frame,
 .expressive-code .frame.is-terminal,
 .expressive-code .frame.has-title {
+  /* 角丸と枠線色は EC 側の変数へ渡す。帯（header）の角丸は EC が
+   * calc(--ec-brdRad + --ec-brdWd) で算出するので、ここを揃えないと
+   * 帯・本体・フレームの角丸がばらけて接合部の枠線が欠ける（#950） */
+  --ec-brdRad: var(--tako-radius-md);
+  --ec-brdCol: var(--tako-border);
   --ec-codeBg: var(--tako-surface);
   --ec-codeFg: var(--tako-ink);
   --ec-codeSelBg: var(--tako-accent-soft);
@@ -1132,11 +1137,26 @@ starlight-theme-select select {
   --ec-gtrFg: var(--tako-ink-subtle);
 }
 
+/* フレームの角丸は帯の角丸（--header-border-radius）と同じ値にする。
+ * overflow: hidden は付けない（クリップすると帯・本体の枠線が角丸の R で
+ * 切り落とされ、帯と本体が分離して見える。#950） */
 .expressive-code .frame,
 .expressive-code .frame.is-terminal,
 .expressive-code .frame.has-title {
-  border-radius: var(--tako-radius-md) !important;
-  overflow: hidden;
+  border-radius: var(--header-border-radius) !important;
+}
+
+/* 帯つきフレームの本体は上辺の枠線・角丸を落として帯と 1 枚のカードにする。
+ * EC の既定に同じ指定があるが、Starlight は EC のスタイルを
+ * `@layer starlight.components` へ入れるため、レイヤー外の customCss
+ * （`.sl-markdown-content pre` の一括指定）に詳細度と無関係に必ず負ける。
+ * そのため本体の上辺が 12px の角丸で内側へ食い込み、帯との間に
+ * ページ背景が楔状に覗いていた（#950） */
+.expressive-code .frame.has-title pre,
+.expressive-code .frame.is-terminal pre {
+  border-top: none;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
 }
 
 .expressive-code .copy button,
@@ -1333,6 +1353,15 @@ kbd,
   .sl-markdown-content pre {
     padding: 0.9em 1em;
     border-radius: var(--tako-radius-sm);
+  }
+
+  /* 上の指定は EC の本体（pre）にも効くので、帯側の角丸も同じ値に揃える。
+   * 揃えないとカードの上辺だけ 12px・下辺が 8px の非対称になる（#950） */
+  .expressive-code,
+  .expressive-code .frame,
+  .expressive-code .frame.is-terminal,
+  .expressive-code .frame.has-title {
+    --ec-brdRad: var(--tako-radius-sm);
   }
 
   /* モバイルのリンクはタップしやすく */
