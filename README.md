@@ -24,7 +24,7 @@ Working with AI agents like Claude Code, a single task naturally splits into the
 - **エージェント集約監視 / Agent fleet monitoring** — 3 層の検知・制御（汎用 CLI、**設定ゼロで使える内蔵 MCP サーバー**、opt-in のパッシブ検知）/ Three integration layers: a generic CLI, a **built-in zero-config MCP server**, and opt-in passive detection
 - **Zed 級の速度 / Zed-class speed** — Rust + GPUI + alacritty_terminal によるネイティブ GPU 描画 / Native GPU rendering, no Electron
 - **軽量ワークスペース / Lightweight workspace** — cwd 連動ファイルツリー、自動更新されるコード / Markdown / 画像 / PDF プレビュー、git graph / cwd-aware file tree, live code / Markdown / image / PDF previews, git graph
-- **セッション永続化 / Persistent sessions** — tmux をバックエンドに使い、tako を再起動しても実行中プロセスと画面が復元される / With tmux as the backend, running processes and screen contents survive a restart
+- **セッション永続化 / Persistent sessions** — tmux があれば、tako を再起動しても実行中プロセスと画面がそのまま復元される（無い場合はタブ・ペイン構成と cwd の復元まで）/ With tmux installed, running processes and screen contents survive a restart; without it, the tab/pane layout and cwds are restored
 - **クロスプラットフォーム / Cross-platform** — macOS 先行、Windows 対応必須 / macOS first, Windows is a hard requirement
 
 ## インストール / Install
