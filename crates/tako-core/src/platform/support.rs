@@ -581,7 +581,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 79 / 79b / 86（コミットメッセージ入力欄・両経路のコミット・IME）",
+            "項目 79 / 79b / 86（コミットメッセージ入力欄・両経路のコミット・IME。git データを取得できない環境ではこの項目は自己スキップする）",
         ),
     },
     Feature {
@@ -589,7 +589,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 82b / 109（使い捨てリポのコンフリクトを git パネルが認識する）",
+            "項目 82b / 109（使い捨てリポのコンフリクトを git パネルが認識する。git データを取得できない環境ではこの項目は自己スキップする）",
         ),
     },
     Feature {
@@ -597,7 +597,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 85 / 79b（変更ファイルの分類と diff）+ #520 の parse_diff CRLF 耐性",
+            "項目 85 / 79b（変更ファイルの分類と diff。git データを取得できない環境ではこの項目は自己スキップする）+ #520 の parse_diff CRLF 耐性",
         ),
     },
     Feature {
@@ -605,7 +605,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 85（git タブのセクション表示順）+ #520 のパス可搬化と CRLF 耐性テストが実機で緑",
+            "項目 85（git タブのセクション表示順。git データを取得できない環境ではこの項目は自己スキップする）+ #520 のパス可搬化と CRLF 耐性テストが実機で緑",
         ),
     },
     Feature {
@@ -649,7 +649,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 82b / 109（3 択の開閉と起動）+ #867 でエージェントペインの実起動を実機実測",
+            "項目 82b / 109（3 択の開閉と起動。git データを取得できない環境ではこの項目は自己スキップする）+ #867 でエージェントペインの実起動を実機実測",
         ),
     },
     Feature {
@@ -657,7 +657,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 85（コミット詳細）+ #520 の to_git_path / repo_relative",
+            "項目 85（コミット詳細。git データを取得できない環境ではこの項目は自己スキップする）+ #520 の to_git_path / repo_relative",
         ),
     },
     Feature {
@@ -673,7 +673,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
-            "項目 79b（同上）",
+            "項目 79b（ステージング UI の分類とコミット挙動。git データを取得できない環境ではこの項目は自己スキップする）",
         ),
     },
     Feature {
