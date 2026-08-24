@@ -63,7 +63,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_collapse_tab` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 | `tako_pin_tab_title` | 対応 | — | 実機セルフテスト: 項目 51b（自動命名直後の「この名前を固定」） |
 | `tako_confirm_close` | 対応 | — | 実機セルフテスト: 項目 73a〜73f（確認ダイアログの表示・Esc・Enter・即 close） |
-| `tako_auto_rename` | 一部対応 | タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#934） | 実機セルフテスト: 項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#934） |
+| `tako_auto_rename` | 一部対応 | タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#722） | 実機セルフテスト: 項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#722） |
 | `tako_autosuggest` | 対象外 | Windows の PowerShell は PSReadLine の予測入力を標準搭載しているため、tako 側の注入は要らない | OS の仕様: PowerShell が PSReadLine の予測入力を標準搭載しているので注入する対象が無い（セルフテスト項目 41c / 41c-2 は zsh 不在で自動スキップ） |
 | `tako_window` | 対応 | — | 実機セルフテスト: 項目 77（window new → move-tab）+ #872 で 0 枚化の寿命を Windows 向けに実装（項目 79b） |
 | `tako_menu` | 対応 | — | 実機セルフテスト: 項目 118（in-window メニューバー #657 の open / invoke / close） |
@@ -191,12 +191,12 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
-| `tako_file_op` | 一部対応 | 作成・リネーム・パスのコピーは動くが、ゴミ箱へ送る操作が完全削除になり元に戻せない（#933）。既定アプリで開く / アプリを指定して開く / ファイルマネージャで表示は未対応（#522） | 実機実測: os_integration の非 macOS 実装: move_to_trash が remove_file / remove_dir_all（#933）、open_default / open_with / reveal は Err(unsupported)（#522） |
+| `tako_file_op` | 一部対応 | 作成・リネーム・パスのコピーは動くが、ゴミ箱へ送る操作が完全削除になり元に戻せない（#617）。既定アプリで開く / アプリを指定して開く / ファイルマネージャで表示は未対応（#617 / #522） | 実機実測: os_integration の非 macOS 実装: move_to_trash が remove_file / remove_dir_all（#617）、open_default / open_with / reveal は Err(unsupported)（#617 / #522） |
 | `tako_sleep_guard` | 対応 | — | 実機実測: powercfg /requests の SYSTEM に tako のアサーションが出て mode=off で消える。蓋閉じは lid-guard.json の生成まで確認 + セルフテスト項目 120 / 121 |
 | `tako_port_detect` | 対応 | — | 実機実測: スライス 9 で tako list が 8123/node.exe を拾い、psmux の偽 listen 21 個を 1 つも報告しない + セルフテスト項目 55（ON/OFF） |
 | `tako_fda` | 対象外 | Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い | OS の仕様: Windows に TCC（フルディスクアクセス）相当の仕組みが無いので許可を求める対象が無い（#515 の判定テストが固定） |
 | `tako_shell_integration` | 一部対応 | cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766） | 実機実測: #766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525） |
-| `tako_stale_binary` | 一部対応 | PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936） | 実機テスト: stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み |
+| `tako_stale_binary` | 一部対応 | PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936 / #726） | 実機テスト: stale_binary::tests::test_pidpath_self と ランチャ探索…の 2 件が失敗。PATH 上の探索は #898 で境界 B16 へ寄せて実機実測済み |
 | `tako_check_health` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 | `tako_telemetry` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 

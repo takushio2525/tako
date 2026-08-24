@@ -2963,10 +2963,10 @@
 - 結果: **supported 72 / degraded 11 / pending 55 / unsupported 2**。prompt へ入る最大の 1 行が
   「GUI 起動とペイン / タブ管理の Windows 実装が前提（42 機能）」から「実装は共通だが実機で未実測
   （37 機能・#937）」へ変わった。known_limitations（#594）は同じ関数から出るので自動追随
-- **棚卸しで製品バグ 4 件を発見・起票**: **#933**（`move_to_trash` が Windows では完全削除 = 元に戻せない。
-  UI の文言は macOS と同じ「ゴミ箱に移動」）/ **#934**（`autorename` の claude 検出だけ `cfg(unix)` ガードが
-  無く AI 命名が一度も走らない）/ **#935**（受け入れゲートが `sh -c` 決め打ち）/ **#936**（`pidpath` 未実装で
-  古い claude の警告が出ない）。いずれも Degraded の理由文へ明記
+- **棚卸しで製品バグ 4 件を確認**: ゴミ箱が完全削除（**#617**）/ AI 命名が一度も走らない（**#722**）/
+  受け入れゲートが `sh -c` 決め打ち（**#935** 新規）/ 古い claude の警告が出ない（**#936** 新規。#726 の続き）。
+  いずれも Degraded の理由文へ明記。**最初 #933 / #934 として重複起票してしまい**（既存の #617 / #722 と同一）、
+  気づいた時点で自分の側を close して番号を差し替えた = 横断作業の前に `gh issue list --search` を通すこと
 - 実機ベースラインの失敗名（#906 の全数採取）を**製品の縮退**（acceptance_gates 5 / stale_binary 2 /
   remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決め打ち・symlink）に切り分け、前者だけを根拠に使った
 - docs: `docs/src/content/docs/windows-support.md` は**生成物**（`node scripts/gen-windows-support-docs.mjs`。
@@ -2979,4 +2979,4 @@
   `npm run og:verify` OK
 - **Windows 実機はセッションを通して offline**（`ssh win` が timeout）なので新規の実機実測は無し。
   追試が要るものは #937 に積んだ
-- 次: #937 の消し込み（実機復帰後）。#933〜#936 の修正
+- 次: #937 の消し込み（実機復帰後）。#617 / #722 / #935 / #936 の修正

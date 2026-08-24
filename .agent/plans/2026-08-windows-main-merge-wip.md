@@ -2821,14 +2821,19 @@ system prompt へ流れる縮退理由（`degraded_note_items`）は 17 行 → 
 `notes::WIN_UNVERIFIED` の文面を「動く見込み。失敗したらまずここを疑う」にして、
 prompt の枠（「操作が失敗したらまずここを疑ってください」）で正しく読めるようにした。
 
-##### 棚卸しで見つけた製品バグ（起票して Pending / Degraded に紐づけた）
+##### 棚卸しで見つけた製品バグ（Pending / Degraded に紐づけた）
+
+**先に既存 Issue を検索しなかったため #933 / #934 を重複起票した**（それぞれ #617 / #722 と同一）。
+気づいた時点で自分の側を close して、マトリクスの理由文は**既存の番号**を指すように直した。
+**棚卸しのように「全機能を横断して見る」作業ほど、起票の前に `gh issue list --search` を通すこと。**
+
 
 | Issue | 中身 | 判定への反映 |
 |---|---|---|
-| **#933** | `move_to_trash` の非 macOS 実装が `remove_file` / `remove_dir_all` = **ゴミ箱に入らず完全削除**。UI の文言は macOS と同じ「ゴミ箱に移動」 | `tako_file_op` を Degraded にし理由文へ明記 |
-| **#934** | `autorename.rs` の `detect_claude` が `$SHELL -l -c` 直書きで **`cfg(unix)` ガードが無い**（同型の一族 4 箇所のうちここだけ）。Windows は常に `None` → AI 命名が一度も走らない | `tako_auto_rename` を Degraded |
+| **#617**（既存） | `move_to_trash` の非 macOS 実装が `remove_file` / `remove_dir_all` = **ゴミ箱に入らず完全削除**。UI の文言は macOS と同じ「ゴミ箱に移動」 | `tako_file_op` を Degraded にし理由文へ明記 |
+| **#722**（既存） | `autorename.rs` の `detect_claude` が `$SHELL -l -c` 直書きで **`cfg(unix)` ガードが無い**（同型の一族 4 箇所のうちここだけ）。Windows は常に `None` → AI 命名が一度も走らない | `tako_auto_rename` を Degraded |
 | **#935** | `acceptance_gates::execute_command` が `sh -c` 決め打ち。実機ベースラインの 5 件はこれ | `tako_task_gate_check` を Degraded |
-| **#936** | `stale_binary::pidpath` が Windows 未実装 → 実行中の claude を特定できず**古い claude の警告が出ない**。ベースラインの 2 件がこれ | `tako_stale_binary` を Degraded |
+| **#936**（新規。#726 の続き） | `stale_binary::pidpath` が Windows 未実装 → 実行中の claude を特定できず**古い claude の警告が出ない**。ベースラインの 2 件がこれ（#726 の `which` 側は #898 で解消済み） | `tako_stale_binary` を Degraded |
 | **#937** | 未実測項目の消し込み（追跡先。消し込み手順つき） | `Pending` 46 件の追跡先 |
 
 ##### ベースラインの失敗名は「機能の判定材料」として読める

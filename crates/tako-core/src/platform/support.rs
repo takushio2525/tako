@@ -153,16 +153,16 @@ pub mod notes {
         "psmux ignores the session size options (-x / -y), so the size cannot be changed",
     );
 
-    /// #933 / #522。**データを失う差**なので必ず理由文に出す
+    /// #617 / #522。**データを失う差**なので必ず理由文に出す
     pub const WIN_TRASH_PERMANENT: Note = Note::new(
-        "作成・リネーム・パスのコピーは動くが、ゴミ箱へ送る操作が完全削除になり元に戻せない（#933）。既定アプリで開く / アプリを指定して開く / ファイルマネージャで表示は未対応（#522）",
-        "Create, rename and copy-path work, but sending to the trash deletes permanently with no way to undo (#933). Open with the default app, open with a chosen app and reveal in the file manager are unavailable (#522)",
+        "作成・リネーム・パスのコピーは動くが、ゴミ箱へ送る操作が完全削除になり元に戻せない（#617）。既定アプリで開く / アプリを指定して開く / ファイルマネージャで表示は未対応（#617 / #522）",
+        "Create, rename and copy-path work, but sending to the trash deletes permanently with no way to undo (#617). Open with the default app, open with a chosen app and reveal in the file manager are unavailable (#617 / #522)",
     );
 
-    /// #934。名前は付くので気づきにくい縮退
+    /// #722。名前は付くので気づきにくい縮退
     pub const WIN_AUTORENAME_HEURISTIC: Note = Note::new(
-        "タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#934）",
-        "Tabs still get named, but claude detection for AI naming assumes a POSIX login shell, so naming always falls back to the heuristic path (#934)",
+        "タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#722）",
+        "Tabs still get named, but claude detection for AI naming assumes a POSIX login shell, so naming always falls back to the heuristic path (#722)",
     );
 
     /// #935。登録と表示は動き、実行だけが落ちる
@@ -173,8 +173,8 @@ pub mod notes {
 
     /// #936。PATH 上の探索（#898 で境界へ寄せた）は動くが、実行中プロセスを特定できない
     pub const WIN_STALE_BINARY_PID: Note = Note::new(
-        "PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936）",
-        "Checking that claude exists on PATH works, but the running claude's path cannot be resolved, so the stale binary warning never appears (#936)",
+        "PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936 / #726）",
+        "Checking that claude exists on PATH works, but the running claude's path cannot be resolved, so the stale binary warning never appears (#936 / #726)",
     );
 
     /// #766 / #525。側路（`TAKO_OSC_SINK`）で届くが、能力申告は素通し不可のまま
@@ -418,7 +418,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_AUTORENAME_HEURISTIC,
         },
         windows_evidence: Evidence::SelfTest(
-            "項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#934）",
+            "項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#722）",
         ),
     },
     Feature {
@@ -544,7 +544,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_TRASH_PERMANENT,
         },
         windows_evidence: Evidence::Measured(
-            "os_integration の非 macOS 実装: move_to_trash が remove_file / remove_dir_all（#933）、open_default / open_with / reveal は Err(unsupported)（#522）",
+            "os_integration の非 macOS 実装: move_to_trash が remove_file / remove_dir_all（#617）、open_default / open_with / reveal は Err(unsupported)（#617 / #522）",
         ),
     },
     Feature {
