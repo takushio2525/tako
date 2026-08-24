@@ -5,6 +5,8 @@
 
 > 🚧 開発中（macOS で動作）。 / In development — runs on macOS.
 
+📖 **ドキュメント / Documentation**: [tako-docs.pages.dev](https://tako-docs.pages.dev/) — セットアップ・クイックスタート・CLI・MCP リファレンス / Setup, quickstart, CLI and MCP reference
+
 ## なぜ tako？ / Why tako?
 
 Claude Code のような AI エージェントを使う開発では、1 つの作業が「エージェント本体 + 子エージェント + dev サーバー + ログ」に分裂し、既存ターミナルではタブやウィンドウに散らばってしまいます。tako は **「1 グループ = 1 タブ」** で、エージェントが起動した子プロセスのペインを同じタブ内に自動で生やし、全体をひと目で監視できるようにします。
