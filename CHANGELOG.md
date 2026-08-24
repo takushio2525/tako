@@ -8,6 +8,25 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+### Fixed
+
+- [修正] タブを切り替えた瞬間に端末がリサイズされる問題を根治（裏タブのペインを
+  「表に出たときの寸法」へ合わせる）(#932)。#647 は非表示ペインへ**セル寸法**の変更を
+  届けるようになったが、使う領域が「最後に描かれたときの領域」だったため、
+  ウィンドウ寸法・サイドバー幅・バナーの出入りといった**幾何の変更**は届かず、
+  そのタブを表に出した瞬間に初めてリサイズ = SIGWINCH が飛んでいた（中の TUI が
+  画面を作り直すので切り替えのたびに描画が乱れる）。実測: 裏 116x37 / 表 88x33 →
+  表に出した瞬間 88x33 へ変化していたのが、追従後は最初から 88x33 で
+  **切り替えの瞬間に 1 度も変わらない**
+- [Fixed] Terminals no longer resize at the moment you switch tabs (#932). #647 started
+  pushing *cell size* changes to off-screen panes, but it used each pane's last rendered
+  rect, so *geometry* changes (window size, sidebar width, banners) never reached them:
+  the pane was resized — sending SIGWINCH into the running program — exactly when its tab
+  was brought to the front. Off-screen panes now derive the rect they will get when shown,
+  through the same single code path used for the visible tab.
+
 ## [0.7.7] - 2026-08-24
 
 Nightly patch release (automated). Changes since v0.7.6:
