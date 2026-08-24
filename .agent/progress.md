@@ -2983,3 +2983,17 @@
 - **Windows 実機はセッションを通して offline**（`ssh win` が timeout）なので新規の実機実測は無し。
   追試が要るものは #937 に積んだ
 - 次: #937 の消し込み（実機復帰後）。#617 / #722 / #935 / #936 の修正
+
+## 2026-08-24（#586: tako-app を release で GUI サブシステムへリンク + 無音死の防止）
+- win467 の `c363a5a` のうち **main に無かった 2 点だけ**を移植（`no_console_window` の
+  配線 = #628 分はスライス 1 で既に main に在り、`git grep` で 38 箇所を実測確認）。
+  ①`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（release だけ GUI
+  サブシステム。debug はコンソールを残す）②起動を中断する `fatal:` を **persist.log にも残す**
+  （GUI サブシステムでは stderr が捨てられるので、直さないと Windows release が無音死する）
+- 番犬 `tako_appはreleaseでguiサブシステムへリンクされる` を platform_parity へ新設。
+  サブシステムは**リンク時の属性で実行時には検査できない**ので、属性の存在と
+  「`eprintln!("fatal:` の直後 3 行に `persist_diag` がある」をソース走査で固定した
+- 検証: fmt / clippy(-D warnings) / `test --workspace` **2592 passed 0 failed** /
+  `cargo check --release -p tako-app`（= 属性が効く側）警告 0 / クロスチェック エラー 0・警告 12
+  （ベースライン同数）。検出力は 2 通りの revert（属性削除 / persist_diag 削除）で FAILED を実測
+- **実機未検証**（Windows 実機 offline）: 「エクスプローラー起動でコンソール窓が出ない」の目視。#937 へ
