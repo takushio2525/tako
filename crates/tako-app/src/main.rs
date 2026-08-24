@@ -1525,6 +1525,11 @@ struct TakoApp {
     /// false になると下線オーバーレイが描画されない。カーソル非表示ペインでも
     /// true であることをセルフテスト 76c / 76d が固定する
     ime_overlay_anchored: bool,
+    /// 直近に組み立てた未確定文字列の**実フォントサイズ**（#940 の回帰検出用）。
+    /// `ime_preedit_text`（唯一の組み立て地点）が書くので、ここに載る値は
+    /// 画面に出た字の大きさそのもの。セルフテスト項目 125 がペインの
+    /// フォントサイズと一致することを固定する
+    ime_preedit_font_size: std::cell::Cell<Option<f32>>,
     /// アプリ内テキスト入力のキャレットが**実際に描かれた**矩形（ウィンドウ座標。#561）。
     /// 変換候補ウィンドウの位置出し（`bounds_for_range`）に使う。
     /// paint フェーズでしか分からないので `Rc<Cell>` で render から書き戻す
@@ -3254,6 +3259,7 @@ impl TakoApp {
             git_feedback: None,
             git_busy: None,
             ime_overlay_anchored: false,
+            ime_preedit_font_size: std::cell::Cell::new(None),
             text_input_caret_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             git_commit_input_focused: false,
             git_branch_confirm: None,
@@ -10690,7 +10696,24 @@ impl TakoApp {
     /// **ウィンドウ側のオーバーレイとチャット入力欄のインライン表示が共有する
     /// 唯一の実装**。2 か所で組み立てていると、片方だけ直して見た目が食い違う
     /// （#29 / #497 で実際に起きた壊れ方）
-    fn ime_preedit_text(&self, text: String) -> gpui::StyledText {
+    ///
+    /// #940: 字の大きさは**変換先ペインの**フォントサイズに追従させる。
+    ///
+    /// 以前はテーマ既定（`text_style()`）を固定参照していたため、cmd+= でペインを
+    /// 拡大しても未確定文字列だけ既定サイズのまま小さく描かれていた
+    /// （周囲のターミナル本文は専用 element `TerminalGrid`（#787）が
+    /// `shape_line` へフォントサイズを直接渡すので追従していた）。
+    ///
+    /// **サイズは `TextStyle` ではなく箱の `text_size` で決まる**: gpui の
+    /// `StyledText` はレイアウトで `window.text_style()`（= 祖先から降ってくる
+    /// ambient なスタイル）からフォントサイズを取り、`TextRun` は
+    /// フォント族・色・下線しか運ばない（サイズを持たない）。
+    /// なので `with_default_highlights` に大きいサイズの style を渡しても字は大きくならない。
+    /// ここが「1 実装を共有する」地点なので、**箱ごと**返して呼び出し側が
+    /// 取りこぼせないようにしてある。
+    ///
+    /// `TAKO_940_LEGACY=1` で修正前（テーマ既定を固定参照）へ戻せる = 同一バイナリで A/B が取れる
+    fn ime_preedit_text(&self, text: String, pane: PaneId) -> gpui::Div {
         let highlights = ime_highlight_ranges(
             &text,
             self.ime
@@ -10698,7 +10721,28 @@ impl TakoApp {
                 .and_then(|ime| ime.selected_utf16.as_ref()),
             &self.theme,
         );
-        StyledText::new(text).with_default_highlights(&self.text_style(), highlights)
+        let legacy = std::env::var_os("TAKO_940_LEGACY").is_some();
+        let (style, fs, lh) = if legacy {
+            (
+                self.text_style(),
+                self.theme.font_size,
+                self.theme.line_height,
+            )
+        } else {
+            (
+                self.pane_text_style(pane),
+                self.pane_font_size(pane),
+                self.pane_line_height(pane),
+            )
+        };
+        // 実際に使ったサイズを控える（セルフテスト項目 125 の回帰検出用。
+        // ここが唯一の組み立て地点なので、控えた値は「画面に出た字の大きさ」そのもの）
+        self.ime_preedit_font_size.set(Some(fs));
+        div()
+            .flex_none()
+            .text_size(px(fs))
+            .line_height(px(lh))
+            .child(StyledText::new(text).with_default_highlights(&style, highlights))
     }
 
     /// 未確定文字列の先頭から指定プレフィックスまでの描画幅（候補ウィンドウの位置出し用）
@@ -19505,18 +19549,20 @@ impl Render for TakoApp {
         let ime_overlay = self
             .ime
             .as_ref()
-            .map(|ime| ime.text.clone())
-            .and_then(|text| {
+            .map(|ime| (ime.pane, ime.text.clone()))
+            .and_then(|(pane, text)| {
                 let anchor = ime_anchor?;
-                // 字の見た目は `ime_preedit_text` が正（チャット入力欄のインライン表示と共有）
+                // 字の見た目は `ime_preedit_text` が正（チャット入力欄のインライン表示と共有）。
+                // #940: 箱の高さも**そのペインの**行高に合わせる（テーマ既定のままだと
+                // 拡大したペインで背景が字の高さに足りず、下端が隣の行に食い込む）
                 Some(
                     div()
                         .absolute()
                         .left(anchor.x - content_origin.x)
                         .top(anchor.y - content_origin.y)
-                        .h(px(theme.line_height))
+                        .h(px(self.pane_line_height(pane)))
                         .bg(rgba(theme.background))
-                        .child(self.ime_preedit_text(text)),
+                        .child(self.ime_preedit_text(text, pane)),
                 )
             });
 
@@ -26316,6 +26362,374 @@ mod self_test {
         (stats.size_in_use as u64, u64::from(stats.blocks_in_use))
     }
 
+    /// IME 未確定文字列の字の大きさがペインのフォントサイズに追従する（#940）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=ime-preedit`
+    ///
+    /// この機に日本語入力ソースが無くても**実描画のピクセルで**測れるようにしてある:
+    /// 変換の入口は OS が呼ぶ `replace_and_mark_text_in_range` そのものなので、
+    /// そこを直接叩けば render 経路は実 IME と同じものが走る。測るのは
+    /// 「変換していないフレーム」と「変換中フレーム」の**差分の外形**で、
+    /// これは画面に増えたもの = 描かれた未確定文字列そのもの。
+    ///
+    /// 固定するのは外形の**比**（フォントサイズの比と一致すること）。絶対値は
+    /// フォント・DPI・テーマに依存するが、比なら環境に依らない。
+    /// 修正前（`TAKO_940_LEGACY=1`）は拡大しても外形が変わらないので必ず落ちる
+    #[cfg(feature = "visual-test")]
+    async fn ime_preedit_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        const TEXT: &str = "にほんご";
+
+        // 差分の外形（幅・高さ）。上下反転の向きは幅・高さを変えないが、
+        // 走査窓（ペインのテキスト領域）を正しく当てるため両向き試して濃い側を採る。
+        // 1 行 / 1 列あたり 2 px 未満の差分は AA のにじみとして捨てる
+        fn diff_extent(
+            before: &image::RgbaImage,
+            after: &image::RgbaImage,
+            area: &Bounds<Pixels>,
+            scale: f32,
+        ) -> Option<(u32, u32, u32, u32, u32)> {
+            if before.dimensions() != after.dimensions() {
+                return None;
+            }
+            let (width, height) = before.dimensions();
+            let left = (f32::from(area.left()) * scale).floor().max(0.0) as u32;
+            let right = ((f32::from(area.right()) * scale).ceil().max(0.0) as u32).min(width);
+            let raw_top = (f32::from(area.top()) * scale).floor().max(0.0) as u32;
+            let raw_bottom =
+                ((f32::from(area.bottom()) * scale).ceil().max(0.0) as u32).min(height);
+            let measure = |flip_y: bool| -> (u32, u32, u32, u32, u32) {
+                let (top, bottom) = if flip_y {
+                    (
+                        height.saturating_sub(raw_bottom),
+                        height.saturating_sub(raw_top),
+                    )
+                } else {
+                    (raw_top.min(height), raw_bottom.min(height))
+                };
+                let mut rows = vec![0u32; (bottom.saturating_sub(top)) as usize];
+                let mut cols = vec![0u32; (right.saturating_sub(left)) as usize];
+                let mut total = 0u32;
+                for y in top..bottom {
+                    for x in left..right {
+                        if before.get_pixel(x, y) != after.get_pixel(x, y) {
+                            rows[(y - top) as usize] += 1;
+                            cols[(x - left) as usize] += 1;
+                            total += 1;
+                        }
+                    }
+                }
+                let span = |v: &[u32]| -> (u32, u32) {
+                    let first = v.iter().position(|&c| c >= 2);
+                    let last = v.iter().rposition(|&c| c >= 2);
+                    match (first, last) {
+                        (Some(a), Some(b)) => (a as u32, (b - a + 1) as u32),
+                        _ => (0, 0),
+                    }
+                };
+                let (x0, w) = span(&cols);
+                let (y0, h) = span(&rows);
+                (w, h, total, left + x0, top + y0)
+            };
+            let normal = measure(false);
+            let flipped = measure(true);
+            Some(if flipped.2 > normal.2 {
+                flipped
+            } else {
+                normal
+            })
+        }
+
+        // 前提: ターミナルペインへフォーカスし、フォントサイズを既定へ戻す
+        let target = window
+            .update(cx, |app, window, cx| {
+                app.unmark_text(window, cx);
+                let focused = app.focused_pane();
+                let pane = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|id| app.terminals.contains_key(id))
+                    .unwrap_or(focused);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Focus {
+                        pane: Some(pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.reset_zoom_focused_pane(cx);
+                cx.notify();
+                app.focused_pane()
+            })
+            .unwrap_or(PaneId::from_raw(0));
+        wait(cx, 400).await;
+
+        let mut measured: Vec<(&str, f32, u32, u32)> = Vec::new();
+        for (label, delta) in [("default", 0.0f32), ("large", 8.0f32)] {
+            // サイズを決める（既定 → 拡大の順。既定は reset のまま）
+            let font_size = window
+                .update(cx, |app, _, cx| {
+                    if delta != 0.0 {
+                        app.zoom_focused_pane(delta, cx);
+                    }
+                    cx.notify();
+                    app.pane_font_size(target)
+                })
+                .unwrap_or(0.0);
+            wait(cx, 400).await;
+            // **画面が静止してから撮る**。シェルのプロンプト再描画や direnv の出力が
+            // 2 枚のあいだに挟まると、差分に未確定文字列以外のものが混ざって
+            // 測定が丸ごと壊れる（実測で ink_w が 6 倍に化けた）
+            let mut before_scale = None;
+            let mut quiet: Option<image::RgbaImage> = None;
+            for _ in 0..20 {
+                notify_and_draw(any, window, cx);
+                let Some((a, scale)) = capture_frame(any, cx) else {
+                    fail("visual-test ime-preedit: 変換前フレーム採取")
+                };
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                let Some((b, _)) = capture_frame(any, cx) else {
+                    fail("visual-test ime-preedit: 変換前フレーム採取（2 枚目）")
+                };
+                if a == b {
+                    before_scale = Some(scale);
+                    quiet = Some(b);
+                    break;
+                }
+            }
+            let (Some(before), Some(scale)) = (quiet, before_scale) else {
+                fail(
+                    "visual-test ime-preedit: 画面が静止しない\
+                     （シェルの出力が続いている）",
+                )
+            };
+
+            // 変換開始（OS が呼ぶのと同じ入口）
+            let diag = window
+                .update(cx, |app, window, cx| {
+                    app.replace_and_mark_text_in_range(None, TEXT, None, window, cx);
+                    app.ime_preedit_font_size.set(None);
+                    cx.notify();
+                    let ime_pane = app.ime.as_ref().map(|i| i.pane);
+                    (
+                        ime_pane,
+                        ime_pane.map(|p| app.pane_font_size(p)),
+                        app.pane_font_size(target),
+                    )
+                })
+                .unwrap_or((None, None, 0.0));
+            wait(cx, 400).await;
+            notify_and_draw(any, window, cx);
+            let Some((after, _)) = capture_frame(any, cx) else {
+                fail("visual-test ime-preedit: 変換中フレーム採取")
+            };
+
+            // 走査窓は**未確定文字列が置かれる行だけ**（アンカーから右へ、1 行ぶんの高さ）。
+            // ペイン全体だと、ヘッダの経過秒やシェルの出力が混ざって外形が化ける
+            let area = window
+                .update(cx, |app, window, _| {
+                    let text_area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == target)
+                        .map(|(_, b)| *b)?;
+                    let anchor = app.ime_overlay_anchor(window)?;
+                    let lh = px(app.pane_line_height(target));
+                    Some(Bounds {
+                        origin: anchor,
+                        size: size(text_area.right() - anchor.x, lh),
+                    })
+                })
+                .unwrap_or(None);
+            let Some(area) = area else {
+                fail(
+                    "visual-test ime-preedit: 未確定文字列のアンカーが採れない\
+                     （未描画。ウィンドウを前面にして再実行すると検証できる）",
+                )
+            };
+            let Some((w, h, total, x0, y0)) = diff_extent(&before, &after, &area, scale) else {
+                fail("visual-test ime-preedit: フレームの寸法が揃わない")
+            };
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let dir = std::path::Path::new(&dump);
+                let _ = before.save(dir.join(format!("ime-preedit-{label}-before.png")));
+                let _ = after.save(dir.join(format!("ime-preedit-{label}-after.png")));
+            }
+            let used = window
+                .update(cx, |app, _, _| app.ime_preedit_font_size.get())
+                .unwrap_or(None);
+            println!(
+                "TAKO_VISUAL_IME_PREEDIT: {label} font_size={font_size} \
+                 ink_w={w} ink_h={h} at=({x0},{y0}) diff_px={total} scale={scale} \
+                 ime_pane={:?} ime_pane_fs={:?} target_fs={} used_fs={used:?} \
+                 area=({:.0},{:.0})-({:.0},{:.0})",
+                diag.0,
+                diag.1,
+                diag.2,
+                f32::from(area.left()),
+                f32::from(area.top()),
+                f32::from(area.right()),
+                f32::from(area.bottom()),
+            );
+            if total == 0 {
+                // ウィンドウが他アプリに完全に隠れている / 画面が消えていると GPUI が
+                // 描画を止め、差分がまったく出ない。product の欠陥ではないので
+                // 落とさず飛ばす（項目 76c / 104 と同じ扱い。黙って通さない）
+                println!(
+                    "TAKO_VISUAL_SKIPPED: ime-preedit（変換中フレームに差分が無い = 未描画。\
+                     ウィンドウを前面にして再実行すると検証できる）"
+                );
+                let _ = window.update(cx, |app, window, cx| {
+                    app.unmark_text(window, cx);
+                    app.reset_zoom_focused_pane(cx);
+                    cx.notify();
+                });
+                return;
+            }
+            measured.push((label, font_size, w, h));
+
+            // 次のラウンドのために変換を畳み、**シェルの入力行も捨てる**。
+            // `unmark_text` は未確定文字列を PTY へ確定させるので、掃除しないと
+            // 次のラウンドの「変換前」フレームに前回の文字列が残り、
+            // アンカーも 4 文字ぶん右へずれて測定が汚れる
+            let _ = window.update(cx, |app, window, cx| {
+                app.unmark_text(window, cx);
+                if let Some(s) = app.terminals.get(&target) {
+                    // Ctrl-U（行を捨てる）→ Ctrl-C（保険）
+                    s.write(vec![0x15]);
+                    s.write(vec![0x03]);
+                }
+                cx.notify();
+            });
+            wait(cx, 600).await;
+        }
+
+        let (_, small_fs, small_w, small_h) = measured[0];
+        let (_, large_fs, large_w, large_h) = measured[1];
+        let want = large_fs / small_fs;
+        let got_w = large_w as f32 / small_w.max(1) as f32;
+        let got_h = large_h as f32 / small_h.max(1) as f32;
+        // 幅はグリフ 4 文字ぶんなので比が素直に出る。高さは 1 行ぶんで丸めが効くため許容を広く取る
+        check(
+            large_fs > small_fs && (got_w - want).abs() <= 0.08 && (got_h - want).abs() <= 0.20,
+            &format!(
+                "visual-test ime-preedit: 未確定文字列の実描画がフォントサイズに追従する                  (#940。font {small_fs}->{large_fs} 期待比={want:.3}                  幅 {small_w}->{large_w} 実比={got_w:.3}                  高さ {small_h}->{large_h} 実比={got_h:.3})"
+            ),
+        );
+
+        // (3) **変換中に**サイズを変えたときの実描画（受け入れ条件 3）。
+        //
+        // (1)(2) は「変えてから変換」なので、変換開始時のスタイルを持ち回して
+        // しまう作りでも通ってしまう。ここは変換を始めた**あとで**拡大し、
+        // その状態の実ピクセルを測る（将来オーバーレイを memo 化したときの
+        // 取りこぼしもここで落ちる）。
+        // 静止フレームは「畳んでシェル行も捨てた後」の同じサイズで撮るので、
+        // 走査帯の中身は未確定文字列だけが違う
+        let mid = {
+            // 既定サイズから変換を始める
+            let _ = window.update(cx, |app, window, cx| {
+                app.reset_zoom_focused_pane(cx);
+                app.replace_and_mark_text_in_range(None, TEXT, None, window, cx);
+                cx.notify();
+            });
+            wait(cx, 400).await;
+            // **変換したまま**拡大する
+            let fs = window
+                .update(cx, |app, _, cx| {
+                    app.zoom_focused_pane(12.0, cx);
+                    cx.notify();
+                    app.pane_font_size(target)
+                })
+                .unwrap_or(0.0);
+            wait(cx, 400).await;
+            notify_and_draw(any, window, cx);
+            let composing = capture_frame(any, cx);
+            let area = window
+                .update(cx, |app, window, _| {
+                    let text_area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == target)
+                        .map(|(_, b)| *b)?;
+                    let anchor = app.ime_overlay_anchor(window)?;
+                    let lh = px(app.pane_line_height(target));
+                    Some(Bounds {
+                        origin: anchor,
+                        size: size(text_area.right() - anchor.x, lh),
+                    })
+                })
+                .unwrap_or(None);
+            // 畳んでシェル行も捨て、**同じサイズのまま**静止フレームを撮る
+            let _ = window.update(cx, |app, window, cx| {
+                app.unmark_text(window, cx);
+                if let Some(s) = app.terminals.get(&target) {
+                    s.write(vec![0x15]);
+                    s.write(vec![0x03]);
+                }
+                cx.notify();
+            });
+            wait(cx, 600).await;
+            let mut quiet = None;
+            for _ in 0..20 {
+                notify_and_draw(any, window, cx);
+                let a = capture_frame(any, cx).map(|(f, _)| f);
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                let b = capture_frame(any, cx).map(|(f, _)| f);
+                if a.is_some() && a == b {
+                    quiet = b;
+                    break;
+                }
+            }
+            match (composing, area, quiet) {
+                (Some((composing, scale)), Some(area), Some(quiet)) => {
+                    diff_extent(&quiet, &composing, &area, scale)
+                        .map(|(w, h, t, _, _)| (fs, w, h, t))
+                }
+                _ => None,
+            }
+        };
+        match mid {
+            Some((fs, w, h, total)) if total > 0 => {
+                let want = fs / measured[0].1;
+                let got = w as f32 / measured[0].2.max(1) as f32;
+                println!(
+                    "TAKO_VISUAL_IME_PREEDIT: mid font_size={fs} ink_w={w} ink_h={h} \
+                     diff_px={total} 期待比={want:.3} 実比={got:.3}"
+                );
+                check(
+                    (got - want).abs() <= 0.10,
+                    &format!(
+                        "visual-test ime-preedit: 変換中にサイズを変えても実描画が追従する                          (#940。font {}->{fs} 期待比={want:.3} 幅 {}->{w} 実比={got:.3})",
+                        measured[0].1, measured[0].2
+                    ),
+                );
+            }
+            _ => println!(
+                "TAKO_VISUAL_SKIPPED: ime-preedit mid（変換中の拡大を測れなかった = 未描画。\
+                 ウィンドウを前面にして再実行すると検証できる）"
+            ),
+        }
+
+        // 後片付け: 既定サイズへ戻す
+        let _ = window.update(cx, |app, window, cx| {
+            app.unmark_text(window, cx);
+            app.reset_zoom_focused_pane(cx);
+            cx.notify();
+        });
+        wait(cx, 300).await;
+    }
+
     /// リモート（SSH 先）ツリーの実描画（#919）。
     ///
     /// 単独実行は `TAKO_VISUAL_ONLY=remote-tree`。
@@ -28091,12 +28505,17 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                "ime-preedit" => {
+                    ime_preedit_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
-                         remote-tree / flicker）"
+                         remote-tree / flicker / ime-preedit）"
                     );
                     std::process::exit(1);
                 }
@@ -28122,6 +28541,11 @@ mod self_test {
             // #496: コンフリクトカードの操作が実マウスで発火するか
             // （一括 dismiss #503 に食われて GUI から一度も起動できていなかった）
             conflict_card_visual(window, cx).await;
+
+            // #940: IME 未確定文字列の字の大きさがペインのフォントサイズに追従するか。
+            // 変換していないフレームと変換中フレームの差分の外形を測るので、
+            // 日本語入力ソースが無い機でも実描画で確かめられる
+            ime_preedit_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -51262,6 +51686,142 @@ mod self_test {
                 });
             }
 
+            // 125. IME 未確定文字列の字の大きさは**変換先ペインの**フォントサイズに
+            // 追従する（#940）。
+            //
+            // 修正前は組み立てが `text_style()`（テーマ既定）を固定参照していたので、
+            // cmd+= でペインを拡大しても未確定文字列だけ既定サイズのまま小さく描かれた
+            // （周囲のターミナル本文は `pane_text_style` を通るので追従していた）。
+            //
+            // 見るのは `ime_preedit_font_size` = **実際に組み立てた StyledText の
+            // フォントサイズ**。`ime_preedit_text` が唯一の組み立て地点なので、
+            // ここに載る値は「画面に出た字の大きさ」そのもの。
+            // `TAKO_940_LEGACY=1` で修正前へ戻すと (a)(b)(c) が落ちる（(d) は
+            // オーバーライドが無い状態 = テーマ既定と一致するので旧挙動でも通る）
+            {
+                const IME_TEXT: &str = "にほんご";
+                // 前提を揃える: 変換状態を畳み、ターミナルペインへフォーカスを移す。
+                // プレビュー / webview にフォーカスが残っていると `zoom_focused_pane` が
+                // コンテンツズームへ分岐してフォントサイズが動かない（= 検出力ゼロになる）
+                let target = window
+                    .update(cx, |app, window, cx| {
+                        app.unmark_text(window, cx);
+                        let focused = app.focused_pane();
+                        let pane = app
+                            .workspace
+                            .active_tab()
+                            .tree()
+                            .panes()
+                            .iter()
+                            .map(|p| p.id())
+                            .find(|id| app.terminals.contains_key(id))
+                            .unwrap_or(focused);
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Focus {
+                                pane: Some(pane.as_u64()),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        // 既定サイズから始める（先行項目のズームを持ち越さない）
+                        app.reset_zoom_focused_pane(cx);
+                        cx.notify();
+                        app.focused_pane()
+                    })
+                    .unwrap_or(PaneId::from_raw(0));
+
+                // (a) 拡大 → 変換開始（Issue の再現手順そのまま）
+                let (theme_fs, pane_fs, ime_fs) = window
+                    .update(cx, |app, window, cx| {
+                        // cmd+= と同じ経路（ZoomIn → zoom_focused_pane）
+                        app.zoom_focused_pane(4.0, cx);
+                        let pane_fs = app.pane_font_size(target);
+                        app.replace_and_mark_text_in_range(None, IME_TEXT, None, window, cx);
+                        app.ime_preedit_font_size.set(None);
+                        let _ = app.ime_preedit_text(IME_TEXT.to_string(), target);
+                        (
+                            app.theme.font_size,
+                            pane_fs,
+                            app.ime_preedit_font_size.get(),
+                        )
+                    })
+                    .unwrap_or((0.0, 0.0, None));
+                check(
+                    pane_fs > theme_fs && ime_fs == Some(pane_fs),
+                    &format!(
+                        "IME 未確定文字列は拡大したペインのフォントサイズで描かれる                          (#940。theme={theme_fs} pane={pane_fs} ime={ime_fs:?})"
+                    ),
+                );
+
+                // (b) **実 render 経路**でも同じ値になる（呼び出し側が渡すペインの取り違えを
+                //     検出する）。ウィンドウが他アプリに完全に隠れていると GPUI が描画を
+                //     止めてオーバーレイが一度も組まれないので、そのときは落とさず飛ばす
+                //     （項目 76c / 76d と同じ扱い）
+                let _ = window.update(cx, |app, _, _| app.ime_preedit_font_size.set(None));
+                notify_and_draw(any, window, cx);
+                let rendered = window
+                    .update(cx, |app, _, _| app.ime_preedit_font_size.get())
+                    .unwrap_or(None);
+                match rendered {
+                    Some(fs) => check(
+                        fs == pane_fs,
+                        &format!(
+                            "IME 未確定文字列: 実 render 経路も同じサイズ                              (#940。rendered={fs} pane={pane_fs})"
+                        ),
+                    ),
+                    None => println!(
+                        "TAKO_SELF_TEST_SKIPPED: 125(b)（未確定文字列のオーバーレイが\
+                         一度も組まれなかった = 未描画。ウィンドウを前面にして再実行すると検証できる）"
+                    ),
+                }
+
+                // (c) 変換中にサイズを変えても追従する（受け入れ条件 2 の後半）
+                let (mid_pane_fs, mid_ime_fs) = window
+                    .update(cx, |app, _, cx| {
+                        app.zoom_focused_pane(4.0, cx);
+                        app.ime_preedit_font_size.set(None);
+                        let _ = app.ime_preedit_text(IME_TEXT.to_string(), target);
+                        (
+                            app.pane_font_size(target),
+                            app.ime_preedit_font_size.get(),
+                        )
+                    })
+                    .unwrap_or((0.0, None));
+                check(
+                    mid_pane_fs > pane_fs && mid_ime_fs == Some(mid_pane_fs),
+                    &format!(
+                        "IME 未確定文字列: 変換中のサイズ変更にも追従する                          (#940。pane={mid_pane_fs} ime={mid_ime_fs:?} 変更前={pane_fs})"
+                    ),
+                );
+
+                // (d) 既定へ戻すとテーマ既定サイズへ戻る（オーバーライドの解除も追従する）
+                let (reset_pane_fs, reset_ime_fs) = window
+                    .update(cx, |app, _, cx| {
+                        app.reset_zoom_focused_pane(cx);
+                        app.ime_preedit_font_size.set(None);
+                        let _ = app.ime_preedit_text(IME_TEXT.to_string(), target);
+                        (
+                            app.pane_font_size(target),
+                            app.ime_preedit_font_size.get(),
+                        )
+                    })
+                    .unwrap_or((0.0, None));
+                check(
+                    reset_pane_fs == theme_fs && reset_ime_fs == Some(theme_fs),
+                    &format!(
+                        "IME 未確定文字列: 既定へ戻すとテーマ既定サイズになる                          (#940。pane={reset_pane_fs} ime={reset_ime_fs:?} theme={theme_fs})"
+                    ),
+                );
+
+                // 後片付け: 変換状態とズームを以後の項目へ持ち越さない
+                let _ = window.update(cx, |app, window, cx| {
+                    app.unmark_text(window, cx);
+                    app.reset_zoom_focused_pane(cx);
+                    cx.notify();
+                });
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -52946,6 +53506,111 @@ mod pane_content_geometry_tests {
             flat.matches(&fallback).count(),
             1,
             "推定値がフォールバック以外で使われている"
+        );
+    }
+
+    /// 番犬テスト（#940）: 未確定文字列の大きさは**箱の `text_size`** で決める。
+    ///
+    /// gpui の `StyledText` はレイアウトで `window.text_style()`（祖先から降る
+    /// ambient なスタイル）からフォントサイズを取り、`with_default_highlights` へ
+    /// 渡した `TextRun` はサイズを運ばない。だから `TextStyle` だけ差し替えても
+    /// 字は大きくならない（#940 で実際にここを踏み、`used_fs=21` なのに 13pt で
+    /// 描かれていた）。ペイン由来のサイズを引くことと、それを箱へ載せることの
+    /// **両方**を構造として固定する
+    #[test]
+    fn 未確定文字列のサイズはペイン由来で箱に載る() {
+        let source = include_str!("main.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .expect("テストモジュールの区切りが無い")
+            .0;
+        let body = prod
+            .split("fn ime_preedit_text(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// 未確定文字列の先頭から").next())
+            .expect("ime_preedit_text の定義が見つからない");
+        for marker in [
+            "self.pane_text_style(pane)",
+            "self.pane_font_size(pane)",
+            "self.pane_line_height(pane)",
+            ".text_size(px(fs))",
+            ".line_height(px(lh))",
+        ] {
+            assert!(
+                body.contains(marker),
+                "未確定文字列の組み立てに {marker} が無い（#940 の再発）"
+            );
+        }
+        // 呼び出し側が pane を渡し忘れられない形になっているか
+        // （引数なしの呼び出しが 1 つでもあれば型で落ちるが、意図を明示しておく）
+        // 引数は**括弧の釣り合い**で切り出す（`to_string()` のような内側の括弧で
+        // 切ると引数リストを取り違える。#897 の番犬で踏んだのと同じ型）
+        fn arg_list(src: &str, from: usize) -> &str {
+            let open = match src[from..].find('(') {
+                Some(i) => from + i,
+                None => return "",
+            };
+            let mut depth = 0usize;
+            for (i, ch) in src[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open + 1..open + i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ""
+        }
+        // 定義も呼び出しも**引数 2 つ**（本文とペイン）。1 つの形は #940 以前の姿。
+        // 引数名は呼び出し側の変数名なので数で見る（`target` のように別名が来る）
+        fn top_level_args(args: &str) -> usize {
+            if args.trim().is_empty() {
+                return 0;
+            }
+            let mut depth = 0usize;
+            let mut n = 1usize;
+            for ch in args.chars() {
+                match ch {
+                    '(' | '[' | '<' => depth += 1,
+                    ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => n += 1,
+                    _ => {}
+                }
+            }
+            n
+        }
+        // 走査は**製品部分だけ**（テストモジュールを含めると、この番犬自身が書いている
+        // 文字列リテラル `"ime_preedit_text("` に当たって自分で落ちる）
+        let chat = include_str!("chat_view.rs");
+        let chat_prod = chat
+            .split_once("#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(chat);
+        let mut calls = 0usize;
+        for src in [prod, chat_prod] {
+            for (at, _) in src.match_indices("ime_preedit_text(") {
+                let args = arg_list(src, at);
+                // 定義（`&self, ...`）は型検査が守るので数えない。見たいのは呼び出し側
+                if args.trim_start().starts_with("&self") {
+                    continue;
+                }
+                calls += 1;
+                assert_eq!(
+                    top_level_args(args),
+                    2,
+                    "ime_preedit_text の呼び出しがペインを渡していない（#940 の再発）: {args:?}"
+                );
+            }
+        }
+        // ウィンドウ側オーバーレイ / チャット入力欄の 2 経路
+        //（+ セルフテスト / visual-test）。0 件なら走査が空振りしている
+        assert!(
+            calls >= 2,
+            "ime_preedit_text の呼び出しが見つからない（走査の空振り）"
         );
     }
 
