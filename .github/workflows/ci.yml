@@ -48,6 +48,11 @@ jobs:
         run: cargo build --workspace
       - name: テスト
         run: cargo test --workspace
+      # 対応マトリクス（support.rs）から生成している docs ページが古いまま
+      # コミットされるのを止める。宣言は system prompt にも流れるので
+      # 「docs だけ古い」を許すと利用者と AI で見えている事実が食い違う（#591 / #516）
+      - name: Windows 対応状況ページがマトリクスと同期している
+        run: node scripts/gen-windows-support-docs.mjs --check
 
   windows:
     name: Windows（build + test スモーク）

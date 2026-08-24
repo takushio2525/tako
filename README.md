@@ -1,9 +1,17 @@
-# 🐙 tako
+# tako
 
 **AI エージェント時代の、集約監視に特化した高速 GUI ターミナル**
 **A fast GUI terminal built for the AI-agent era — monitor your whole agent fleet in one tab.**
 
-> 🚧 開発中（macOS で動作）。 / In development — runs on macOS.
+開発中です。macOS で動作し、Windows は移植を進めています（[対応状況](https://tako-docs.pages.dev/windows-support/)）。
+In development. Runs on macOS; the Windows port is in progress.
+
+**ドキュメント / Documentation — [tako-docs.pages.dev](https://tako-docs.pages.dev/)**
+[セットアップ](https://tako-docs.pages.dev/getting-started/) ・
+[クイックスタート](https://tako-docs.pages.dev/getting-started/quickstart/) ・
+[CLI リファレンス](https://tako-docs.pages.dev/guides/cli-reference/) ・
+[MCP ツール一覧](https://tako-docs.pages.dev/guides/mcp-tools/) ・
+[オーケストレーション](https://tako-docs.pages.dev/features/orchestration/)
 
 ## なぜ tako？ / Why tako?
 
@@ -16,92 +24,88 @@ Working with AI agents like Claude Code, a single task naturally splits into the
 - **エージェント集約監視 / Agent fleet monitoring** — 3 層の検知・制御（汎用 CLI、**設定ゼロで使える内蔵 MCP サーバー**、opt-in のパッシブ検知）/ Three integration layers: a generic CLI, a **built-in zero-config MCP server**, and opt-in passive detection
 - **Zed 級の速度 / Zed-class speed** — Rust + GPUI + alacritty_terminal によるネイティブ GPU 描画 / Native GPU rendering, no Electron
 - **軽量ワークスペース / Lightweight workspace** — cwd 連動ファイルツリー、自動更新されるコード / Markdown / 画像 / PDF プレビュー、git graph / cwd-aware file tree, live code / Markdown / image / PDF previews, git graph
+- **セッション永続化 / Persistent sessions** — tmux があれば、tako を再起動しても実行中プロセスと画面がそのまま復元される（無い場合はタブ・ペイン構成と cwd の復元まで）/ With tmux installed, running processes and screen contents survive a restart; without it, the tab/pane layout and cwds are restored
 - **クロスプラットフォーム / Cross-platform** — macOS 先行、Windows 対応必須 / macOS first, Windows is a hard requirement
 
-## ステータス / Status
+## インストール / Install
 
-仕様は [`.agent/`](.agent/) にあります（concept / requirements / architecture / roadmap）。
-ターミナル基盤（タブ・分割・IME）、`tako` CLI、内蔵 MCP サーバー（Claude Code 連携）まで動作します。
+配布しているビルド済みバイナリは **Apple Silicon（macOS 11 以降）** 向けです。
+The prebuilt binaries target **Apple Silicon (macOS 11+)**.
 
-Specs live in [`.agent/`](.agent/) (concept / requirements / architecture / roadmap).
-The terminal core (tabs, splits, IME), the `tako` CLI, and the built-in MCP server (Claude Code integration) are working.
-
-## ダウンロード / Download
-
-[GitHub Releases](https://github.com/takushio2525/tako/releases) から最新の zip をダウンロードできます。
-Pre-built macOS binaries are available on the [Releases](https://github.com/takushio2525/tako/releases) page.
-
-### インストール手順 / Installation
-
-1. `tako-vX.X.X-macos-arm64.zip` をダウンロード / Download the zip
-2. ダブルクリックで展開 / Extract by double-clicking
-3. `tako.app` を `/Applications` へドラッグ / Drag `tako.app` into `/Applications`
-4. 初回起動時に Gatekeeper の警告が表示される（Developer ID 署名がないため） / macOS Gatekeeper will warn on first launch (not notarized yet):
-   - `tako.app` をダブルクリックして警告が出たら一旦キャンセル / Double-click, then cancel the warning
-   - **システム設定 → プライバシーとセキュリティ** を開く / Open **System Settings → Privacy & Security**
-   - 下部に「"tako"は開発元を確認できないため〜」と表示されるので **「このまま開く」** をクリック / Click **"Open Anyway"** next to the tako warning
-   - もう一度 `tako.app` を起動すると「開く」ボタンが表示される / Launch again and click **"Open"**
-
-## ソースからビルド / Build from Source
-
-macOS で `tako.app` を生成して `/Applications` へ配置するには:
+### Homebrew（推奨） / Homebrew (recommended)
 
 ```sh
-# dist/tako.app を生成（--verify でバンドル版のセルフテストも実行）
-scripts/build-app.sh --verify
-
-# /Applications へ配置（配置後、ビルド出力の dist/tako.app は片付けられる）
-scripts/build-app.sh --install
+brew install --cask takushio2525/tako/tako
 ```
 
-同じ `.app` が 2 つディスク上にあると macOS の Launch Services が両方を登録し、Finder の
-「このアプリケーションで開く」に tako が 2 つ並びます。`--install` は配置後にビルド出力を
-消して登録も外すので、候補は `/Applications` の 1 つだけになります。
+更新は `brew upgrade --cask takushio2525/tako/tako`、またはアプリ内の更新通知から行えます。
+tako CLI も同時に PATH へ入るため、`tako` コマンドがそのまま使えます。
 
-アイコンの再描画には `rsvg-convert`（`brew install librsvg`）を使います。
-無い場合は同梱の PNG から自動でフォールバックします。
+Update with `brew upgrade --cask takushio2525/tako/tako`, or from the in-app update notification.
+The cask also links the `tako` CLI into your PATH.
 
-開発時はバンドル不要で `cargo run -p tako-app` がそのまま使えます。
+### zip を手動で / Manual zip
 
-To build `tako.app` on macOS, run `scripts/build-app.sh --verify` (creates `dist/tako.app` and
-runs the bundled self-test), then `scripts/build-app.sh --install` to copy it into `/Applications`.
-`--install` also removes the build copy afterwards and unregisters it from Launch Services, so
-Finder's "Open With" lists tako only once.
-Icon rendering uses `rsvg-convert` (`brew install librsvg`) with a PNG fallback.
-For development, plain `cargo run -p tako-app` works without bundling.
+[GitHub Releases](https://github.com/takushio2525/tako/releases) から `tako-vX.X.X-macos-arm64.zip` を取得します。
+Grab `tako-vX.X.X-macos-arm64.zip` from the [Releases](https://github.com/takushio2525/tako/releases) page.
 
-### Claude Code 連携 / Claude Code integration
+1. zip をダブルクリックで展開し、`tako.app` を `/Applications` へドラッグ / Extract and drag `tako.app` into `/Applications`
+2. 未署名のため初回起動時に Gatekeeper の警告が出ます / macOS Gatekeeper warns on first launch (not notarized yet):
+   - `tako.app` をダブルクリックして警告が出たら一旦キャンセル / Double-click, then cancel the warning
+   - **システム設定 → プライバシーとセキュリティ** を開く / Open **System Settings → Privacy & Security**
+   - 下部の「"tako"は開発元を確認できないため〜」の隣の **「このまま開く」** をクリック / Click **"Open Anyway"** next to the tako warning
+   - もう一度 `tako.app` を起動すると「開く」ボタンが表示される / Launch again and click **"Open"**
 
-tako 内で Claude Code からペイン操作（分割・送信・読み取り等）を使うには、初回 1 回だけ
-MCP サーバーの接続設定が必要です（以後はどのプロジェクトでも設定ゼロ）。
+## 使い始める / Getting started
 
-**方法 1: コマンド一発（推奨） / One command (recommended)**
+素のターミナルとして使うなら、起動すればそのまま使えます。AI 連携を使う場合は tako 内のターミナルで次の 2 つを実行します。
+As a plain terminal, just launch it. To use the AI integration, run these two commands inside tako:
+
+```sh
+tako setup     # 初回のみ。claude / codex / agy を検出して設定を整える
+tako master    # 司令塔の AI（マスター）を今いるペインで起動する
+```
+
+あとは日本語で頼むだけです。マスターが作業役の AI（worker）を隣のペインに立ち上げ、指示を渡し、完了を見届けて報告します。
+
+```
+「~/Documents/webapp にあるリポジトリを管理対象に追加して」
+「webapp の README の誤字を直しておいて」
+```
+
+オーケストレーションを使わず 1 対 1 で相談したいときは `tako solo`。専用タブで動かしたいときは `tako master --tab` です。
+初回起動時はタブバー下のバナー（および Cmd+K のコマンドパレット）から同じ操作ができます。
+詳しい流れは[クイックスタート](https://tako-docs.pages.dev/getting-started/quickstart/)、設定項目は[セットアップガイド](https://tako-docs.pages.dev/getting-started/)にあります。
+
+`tako setup` detects your installed and authenticated agent CLIs (claude / codex / agy) and fills in the rest with previous or safe default values — with a single authenticated CLI it asks nothing. `tako master` then starts the orchestrator in the current pane, and you talk to it in plain language; it spawns workers next to itself and reports back. Use `tako solo` for one-on-one work without orchestration, and `tako master --tab` for a dedicated tab.
+
+## Claude Code 連携 / Claude Code integration
+
+tako 内の Claude Code からペイン操作（分割・送信・読み取り等）を使うには、初回 1 回だけ MCP サーバーの接続設定が必要です（以後はどのプロジェクトでも設定ゼロ）。
 
 ```sh
 tako setup-mcp
 ```
 
-Claude Code のユーザー設定に tako MCP サーバーを自動登録します（`claude mcp add --scope user` を内部で呼び出します）。
-プロジェクト単位で設定したい場合は `tako setup-mcp --project`（カレントディレクトリの `.mcp.json` に追加）。
+Claude Code のユーザー設定に tako MCP サーバーを自動登録します（内部で `claude mcp add --scope user` を呼び出します）。
+プロジェクト単位にしたい場合は `tako setup-mcp --project`（カレントディレクトリの `.mcp.json` に追加）。
 tako アプリが起動中なら、Claude Code に「tako の MCP を設定して」と頼んでも設定できます（MCP ツール `tako_setup_mcp`）。
 旧バージョンが `~/.claude/settings.json` に書いた無効な設定は自動で掃除されます。
 
-This registers the tako MCP server in Claude Code's user config (internally calls `claude mcp add --scope user`).
-Use `--project` to write to the current directory's `.mcp.json` instead.
-If the tako app is running, you can also ask Claude Code "set up tako MCP" (via the `tako_setup_mcp` tool).
-Legacy entries written to `~/.claude/settings.json` by older versions are automatically cleaned up.
+This registers the tako MCP server in Claude Code's user config (internally `claude mcp add --scope user`); `--project` writes to the current directory's `.mcp.json` instead. If tako is running you can also ask Claude Code to "set up tako MCP" (the `tako_setup_mcp` tool). Outside tako the bridge exposes 0 tools and stays out of the way.
 
-**方法 2: claude コマンド / Using claude CLI**
+<details>
+<summary>手動で設定する場合 / Setting it up manually</summary>
+
+claude CLI から登録する場合:
 
 ```sh
 claude mcp add --scope user --transport stdio tako -- /Applications/tako.app/Contents/MacOS/tako mcp serve
 ```
 
-`command` のパスは tako CLI のインストール場所に合わせてください（`which tako` で確認可）。
+`command` のパスは tako CLI のインストール場所に合わせてください（`which tako` で確認できます）。
 
-**方法 3: 手動設定 / Manual setup**
-
-`~/.claude.json` の `mcpServers` に以下を追加（既存のキーを壊さないよう注意）:
+設定ファイルを直接書く場合は `~/.claude.json` の `mcpServers` に以下を追加します（既存のキーを壊さないよう注意）。プロジェクト単位ならプロジェクトルートの `.mcp.json` に同じ構造を書きます。
 
 ```json
 {
@@ -116,47 +120,62 @@ claude mcp add --scope user --transport stdio tako -- /Applications/tako.app/Con
 }
 ```
 
-プロジェクト単位の場合はプロジェクトルートの `.mcp.json` に同じ構造を書きます。
-
-Register the bundled stdio bridge with any of the methods above; after that, pane-control tools are available with zero per-project setup. Outside tako the bridge exposes 0 tools and stays out of the way.
+</details>
 
 ## リモートアクセス / Remote access
 
-`tako remote start` はスマホのブラウザから tako のペインを操作するための HTTP API サーバーを起動します。**この機能は既定で無効**で、明示的に起動したときだけ動きます。
+`tako remote start` は、外出先のスマホのブラウザから tako のペインを見て操作するための API サーバーを起動します。**既定で無効**で、明示的に起動したときだけ動きます。セットアップは `tako remote setup` の対話ウィザードが案内します。
 
-**transport**: サーバーは Unix domain socket（0600）のみで listen し、TCP ポートは一切開きません。[Tailscale](https://tailscale.com/) の `serve` 機能が HTTPS → UDS のプロキシとして tailnet（プライベートネットワーク）内限定の恒久固定 URL `https://<ホスト名>.<tailnet>.ts.net` で公開します。通信は WireGuard で**エンドツーエンド暗号化**され、URL は public internet には存在しません。Mac とスマホの両方に Tailscale アプリを入れ、同一アカウントでログインしている必要があります。Tailscale が未セットアップの場合、`tako remote start` は不足項目を列挙して起動を拒否します。
+通信は [Tailscale](https://tailscale.com/) の `serve` が HTTPS → Unix domain socket をプロキシする構成で、daemon は TCP ポートを一切開きません。URL は tailnet 内にのみ存在し、WireGuard でエンドツーエンド暗号化されます。認証は二層で、層①が `tailscale whois` による tailnet ノードの検証、層②が機器ペアリング（初回接続時に Mac 画面の承認ダイアログを通すまで画面データを受け取れない）です。仕組みの詳細は[リモートアクセスのドキュメント](https://tako-docs.pages.dev/features/remote/)にあります。
 
-**認証（機器ペアリング方式）**: 二層の認証でアクセスを制御します。層①では `tailscale whois` で接続元が tailnet 上の実在ノードであることを検証します。層②では、初回接続時にスマホ側からペアリング要求を送り、Mac 画面に表示される承認ダイアログで許可するまで画面データを一切受け取れません。一度ペアリングしたデバイスは以降自動で認証されます。各デバイスには role（閲覧のみ / 入力可 / 管理 / 全権）を割り当てられ、不要になったら Mac 側から失効できます。
-
-**セキュリティ上の注意（使う前に必ず読んでください）:**
+**使う前に必ず読んでください / Read before use:**
 
 - **これは正規の遠隔操作ツールです。** 接続すると、リモートのブラウザから**あなたのターミナルへ任意のキー入力・コマンドを送信できます**（＝実質的にシェルへのフルアクセス）。自分の端末を自分で操作する目的でのみ使ってください。他人の端末に無断で導入・接続する用途のものではありません。
-- **接続 URL は tailnet 内でのみ有効ですが、共有しないでください。** URL 自体にはトークンは含まれませんが、tailnet 内の端末からはアクセス可能です。SNS やスクリーンショットで公開しないでください。
-- **到達できるのは同じ tailnet の端末だけです。** それでも tailnet 内の全端末が信頼できるとは限らない場合（共有 tailnet 等）は、この機能を使わないでください。Tailscale アカウント自体の保護（2 要素認証等）も重要です。
+- **接続 URL を共有しないでください。** URL 自体にトークンは含まれませんが、tailnet 内の端末からはアクセス可能です。SNS やスクリーンショットで公開しないでください。
+- **到達できるのは同じ tailnet の端末だけです。** それでも tailnet 内の全端末を信頼できない場合（共有 tailnet 等）は、この機能を使わないでください。Tailscale アカウント自体の保護（2 要素認証・tailnet lock）も重要です。
 
----
+`tako remote start` launches an API server that lets you drive tako's panes from a phone browser. **It is disabled by default.** Treat it as a legitimate remote-control tool: once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine, never share the connection URL, and do not enable it if you cannot trust every device on your tailnet.
 
-`tako remote start` launches an HTTP API server that lets you drive tako's panes from a phone browser. **It is disabled by default** and only runs when you explicitly start it. Treat it as a legitimate remote-control tool: once connected, the remote browser can send **arbitrary keystrokes and commands to your terminal** (effectively full shell access).
+## ソースからビルド / Build from source
 
-**Transport**: The daemon listens only on a Unix domain socket (0600) and opens no TCP ports. Tailscale's `serve` feature proxies HTTPS → UDS, publishing the server exclusively inside your tailnet at a permanent URL (`https://<host>.<tailnet>.ts.net`), end-to-end encrypted via WireGuard and invisible to the public internet. Both your Mac and phone need the Tailscale app signed into the same account; if Tailscale is not set up, `tako remote start` lists what is missing and refuses to start.
+開発中は `cargo run -p tako-app` がそのまま使えます（バンドル不要）。
+For development, plain `cargo run -p tako-app` works without bundling.
 
-**Authentication (device pairing)**: Access is controlled by two layers. Layer 1 verifies via `tailscale whois` that the connecting device is a real node on your tailnet. Layer 2 requires first-time devices to send a pairing request; until you approve it on the Mac's dialog, the device cannot receive any screen data. Once paired, a device is recognized automatically on subsequent connections. Each device is assigned a role (observe / interact / manage / admin), and you can revoke access from the Mac at any time.
+`tako.app` を生成して `/Applications` へ配置する場合:
 
-**Security notes (read before use):**
+```sh
+# dist/tako.app を生成（--verify でバンドル版のセルフテストも実行）
+scripts/build-app.sh --verify
 
-- **This is a legitimate remote-control tool.** Once connected, the remote browser can send arbitrary keystrokes and commands to your terminal — effectively full shell access. Use it only to control your own machine. It is not intended for unauthorized access to someone else's device.
-- **Do not share the connection URL.** While the URL contains no token, it is reachable from any device on the same tailnet. Do not post it on social media or include it in screenshots.
-- **Only devices on your tailnet can reach it.** If you cannot trust every device on the tailnet (e.g. shared tailnets), do not use this feature. Protecting your Tailscale account itself (2FA, etc.) is also important.
+# /Applications へ配置（配置後、ビルド出力の dist/tako.app は片付けられる）
+scripts/build-app.sh --install
+```
+
+同じ `.app` が 2 つディスク上にあると macOS の Launch Services が両方を登録し、Finder の「このアプリケーションで開く」に tako が 2 つ並びます。`--install` は配置後にビルド出力を消して登録も外すので、候補は `/Applications` の 1 つだけになります。
+
+アイコンの再描画には `rsvg-convert`（`brew install librsvg`）を使います。無い場合は同梱の PNG から自動でフォールバックします。
+
+`scripts/build-app.sh --verify` creates `dist/tako.app` and runs the bundled self-test; `--install` copies it into `/Applications`, then removes the build copy and unregisters it from Launch Services so Finder's "Open With" lists tako only once. Icon rendering uses `rsvg-convert` (`brew install librsvg`) with a PNG fallback.
+
+### 開発コマンド / Development commands
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+
+AI エージェント向けの規約は [AGENTS.md](AGENTS.md)、詳細仕様は [`.agent/`](.agent/) にあります。
+Conventions for AI agents live in [AGENTS.md](AGENTS.md); detailed specs are in [`.agent/`](.agent/).
 
 ## トラブルシューティング / Troubleshooting
 
-### brew upgrade が失敗して更新できなくなった場合
+<details>
+<summary>brew upgrade が失敗して更新できなくなった場合</summary>
 
-Homebrew の Swift toolchain（`copy-xattrs.swift`）が CommandLineTools/SDK のバージョン不整合でビルド失敗し、`brew upgrade --cask tako` が中断されると、cask 台帳から tako が消えているのに `/Applications/tako.app` の実体は残る「詰み状態」が発生することがあります。
+Homebrew の Swift toolchain（`copy-xattrs.swift`）が CommandLineTools/SDK のバージョン不整合でビルド失敗し、`brew upgrade --cask tako` が中断されると、cask 台帳から tako が消えているのに `/Applications/tako.app` の実体は残る「詰み状態」が発生することがあります。この状態では `brew install --cask tako` も「It seems there is already an App at '/Applications/tako.app'」で失敗します。
 
-この状態では `brew install --cask tako` も「It seems there is already an App at '/Applications/tako.app'」で失敗します。
-
-**復旧方法（いずれか）:**
+復旧方法（いずれか）:
 
 ```sh
 # 方法 1: tako CLI で修復（推奨。tako が起動している場合）
@@ -171,16 +190,19 @@ tako update apply-zip
 
 `tako update status` で現在の配布系統を確認できます。`install_method` が `broken-brew` と表示される場合、上記の復旧が必要です。
 
-**根本原因の解消:** Homebrew の Swift toolchain エラーが根本原因の場合、以下で Xcode CommandLineTools を再インストールすると brew 側の問題も解消します:
+根本原因の解消: Homebrew の Swift toolchain エラーが根本原因の場合、以下で Xcode CommandLineTools を再インストールすると brew 側の問題も解消します。
 
 ```sh
 sudo rm -rf /Library/Developer/CommandLineTools
 xcode-select --install
 ```
 
-### 「ほかのアプリからのデータへのアクセス」ダイアログが繰り返し出る場合
+</details>
 
-macOS 26 (Tahoe) 以降では、tako 内で動く AI エージェント（Claude Code 等）のサンドボックス化されたコマンドが iCloud Drive・Google Drive・他アプリのデータ領域に触れるたびに、macOS が**対象ごとに個別の**許可ダイアログを tako.app 名義で表示します（tako 自身がこれらの領域を読むわけではありません）。対象（クラウドドライブのアカウントやアプリ）の数だけダイアログが出るため、頻発する場合は以下で恒久解消できます:
+<details>
+<summary>「ほかのアプリからのデータへのアクセス」ダイアログが繰り返し出る場合</summary>
+
+macOS 26 (Tahoe) 以降では、tako 内で動く AI エージェント（Claude Code 等）のサンドボックス化されたコマンドが iCloud Drive・Google Drive・他アプリのデータ領域に触れるたびに、macOS が**対象ごとに個別の**許可ダイアログを tako.app 名義で表示します（tako 自身がこれらの領域を読むわけではありません）。対象の数だけダイアログが出るため、頻発する場合は以下で恒久解消できます。
 
 **システム設定 → プライバシーとセキュリティ → フルディスクアクセス → tako を ON**
 
@@ -188,9 +210,12 @@ macOS 26 (Tahoe) 以降では、tako 内で動く AI エージェント（Claude
 
 v0.2.6 以降は署名の designated requirement が identifier 固定になり、付与した許可（フルディスクアクセス・個別許可とも）が再ビルド・アプリ内更新をまたいで保持されます。**v0.2.5 以前からの更新直後は署名要件の移行のため 1 回だけ再許可が必要です。**
 
-### タブ・ペインが大量に消えてしまった場合
+</details>
 
-タブやターミナルペインが突然大量に消えても、**実体のプロセスはバックエンド tmux セッションの中で生き続けていることがほとんど**です（AI エージェントは会話の文脈ごと生存しています）。以下の順で復旧してください:
+<details>
+<summary>タブ・ペインが大量に消えてしまった場合</summary>
+
+タブやターミナルペインが突然大量に消えても、**実体のプロセスはバックエンド tmux セッションの中で生き続けていることがほとんど**です（AI エージェントは会話の文脈ごと生存しています）。以下の順で復旧してください。
 
 1. **レイアウトのバックアップから戻す（推奨）**: ペイン数が大きく減る保存の直前には、レイアウトが自動で世代バックアップされています。
 
@@ -209,10 +234,12 @@ v0.2.6 以降は署名の designated requirement が identifier 固定になり�
    tako tmux open --socket tako --pane <ペインID> <セッション名>
    ```
 
+</details>
+
 ## ライセンス / License
 
 [GPL-3.0-or-later](LICENSE) — 依存クレート（zlog / ztracing、Zed リポ由来）が GPL-3.0 のため。
 
 同梱している第三者成果物（zsh-autosuggestions ほか）の告知は
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にある。
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にあります。
 Notices for bundled third-party works are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

@@ -669,6 +669,53 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
     );
 }
 
+/// **#586 の番犬**: `tako-app` が release で GUI サブシステムへリンクされること。
+///
+/// Rust 既定の console サブシステムのままだと、コンソールを持たない親
+/// （エクスプローラー / スタートメニュー）から起動されたときに OS が exe 用の
+/// コンソールを新規作成し、GUI とは別に黒い窓が開いて診断ログが流れる。
+/// サブシステムは**リンク時の属性**なので実行時には検査できない。属性がソースから
+/// 消えたことだけは機械で分かるので、ここで固定する（`tako.exe` = CLI は console の
+/// ままが正なので、対象は `tako-app` だけ）。
+///
+/// 併せて、GUI サブシステムでは stdout / stderr が捨てられるため、**起動を中断する
+/// `fatal:` が persist.log にも残る**ことを見る（残さないと Windows release で無音死する）。
+#[test]
+fn tako_appはreleaseでguiサブシステムへリンクされる() {
+    let main_rs = repo_root().join("crates/tako-app/src/main.rs");
+    let src = std::fs::read_to_string(&main_rs).expect("tako-app の main.rs を読めない");
+
+    assert!(
+        src.contains(r#"#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]"#),
+        "crates/tako-app/src/main.rs に windows_subsystem 属性が無い\n\
+         → `#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]` を戻してください（#586）"
+    );
+
+    // 起動を中断する fatal は persist.log にも残す（GUI サブシステムでは stderr が届かない）
+    let mut unlogged = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        if !line.contains(r#"eprintln!("fatal:"#) {
+            continue;
+        }
+        // 直後 3 行以内に persist_diag があること
+        let logged = src
+            .lines()
+            .skip(i + 1)
+            .take(3)
+            .any(|l| l.contains("persist_diag"));
+        if !logged {
+            unlogged.push(format!("main.rs:{}: {}", i + 1, line.trim()));
+        }
+    }
+    assert!(
+        unlogged.is_empty(),
+        "起動中断の fatal が persist.log に残っていない:\n  {}\n\
+         → GUI サブシステム（Windows release）では stderr が捨てられ無音死するので \
+         persist_diag も呼んでください（#586）",
+        unlogged.join("\n  ")
+    );
+}
+
 /// `Command::new(` の出現のうち、対応する `no_console_window` が無いものをファイル単位で数える。
 ///
 /// **1 個の抑止呼び出しは 1 個の起動しか守れない**ので、近傍にあるかを見るだけでは足りない

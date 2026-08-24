@@ -13,6 +13,16 @@
 //! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
+// Windows: release ビルドを GUI サブシステムでリンクする（#586）。
+// Rust 既定の console サブシステムのままだと、コンソールを持たない親
+// （エクスプローラー / スタートメニュー）から起動されたときに OS が exe 用の
+// コンソールを新規作成し、GUI とは別に黒いウィンドウが開いて診断ログが流れる。
+// debug ビルドはコンソールを残す（`cargo run` で開発ログを見られるようにするため）。
+// この属性は Windows 以外のターゲットでは無視されるので macOS には影響しない。
+// stdout / stderr が捨てられる前提になるため、残すべき診断は persist.log 側へ書く
+// （`persist_diag`）。子プロセス側の対策は `platform::process::no_console_window`
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod about_window;
 mod autorename;
 mod chat_view;
@@ -3532,8 +3542,12 @@ impl TakoApp {
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
             if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
-                // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する
+                // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する。
+                // #586: GUI サブシステム（Windows release）では stderr が捨てられ、
+                // 「起動したのに何も出ずに落ちた」になるためファイルにも残す
+                // （persist_diag はセルフテスト中は書かないので eprintln も残す）
                 eprintln!("fatal: 最初のシェルを起動できない: {e}");
+                persist_diag(&format!("fatal: 最初のシェルを起動できない: {e}"));
                 std::process::exit(1);
             }
         } else {
@@ -3659,7 +3673,9 @@ impl TakoApp {
                 && app.previews.is_empty()
                 && app.pending_webview_restore.is_empty()
             {
+                // #586: 同上（無音死を避けるため persist.log にも残す）
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
+                persist_diag("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
             let report = format!(
