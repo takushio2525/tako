@@ -2357,6 +2357,10 @@ async fn batch_term_events(
         // グリッドを読む直前にゲートを倒す（#816）
         release_wakeup_gate(gate);
         let applied = this.update(cx, |app: &mut TakoApp, cx| {
+            // #643: 高頻度のメインスレッド経路なのに計測の外にあった。
+            // perf.log に出しておかないと「UI ストール」の原因分類で
+            // 「計測区間なし = 再開経路の遅延」へ誤って倒れる
+            let _span = tako_control::diag::perf_span("term_events");
             if wakeup {
                 app.on_term_event(
                     pane_id,
@@ -3988,17 +3992,27 @@ impl TakoApp {
         .detach();
 
         // UI ストールウォッチドッグ（Issue #113 診断）: この async タスクは UI スレッド
-        // （foreground executor）上で走るため、1 秒 timer からの再開遅延 = 「UI スレッドが
-        // 他の処理で塞がっていた時間」になる。しきい値超えを perf.log に記録し、
+        // （foreground executor）上で走るため、1 秒 timer からの再開遅延には「UI スレッドが
+        // 塞がっていた時間」が含まれる。しきい値超えを perf.log に記録し、
         // 次に無応答が起きたとき時刻と長さがファイルに残るようにする（正常時は何も書かない）
+        //
+        // #643: ただし再開遅延には**再開経路そのものの遅延**も混ざる（Windows では
+        // timer が WinRT スレッドプール、再開がメインスレッドのキュー）。この値だけを
+        // 「UI ストール」と呼ぶと、マシンが他所で飽和しているだけの状況を tako の
+        // 専有と誤認する。素の OS スレッドの sleep 超過（スケジューラ遅延）と
+        // 実行中の計測区間を突き合わせて分類してから記録する
         cx.spawn(async move |this, cx| loop {
             let t0 = std::time::Instant::now();
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let lag = t0.elapsed().saturating_sub(Duration::from_secs(1));
+            // 毎周回 take する（記録するときだけ取ると古いピークが混ざる）
+            let sched_lag = tako_control::diag::take_scheduler_lag_peak();
             if lag >= Duration::from_millis(500) {
-                tako_control::diag::perf_log(&format!(
-                    "UI ストール: イベントループ再開が {:.2}s 遅延",
-                    lag.as_secs_f64()
+                let span = tako_control::diag::current_span_snapshot();
+                tako_control::diag::perf_log(&tako_control::diag::classify_stall(
+                    lag,
+                    sched_lag,
+                    span.as_ref().map(|(tag, ms)| (tag.as_str(), *ms)),
                 ));
             }
             // View 破棄でループ終了（他の定期ループと同じ生存判定）
@@ -6343,6 +6357,8 @@ impl TakoApp {
                 // 1 件目は即処理（打鍵の反応 = レイテンシ優先）
                 if this
                     .update(cx, |app: &mut TakoApp, cx| {
+                        // #643: まとめ処理側（`batch_term_events`）と同じタグで計測する
+                        let _span = tako_control::diag::perf_span("term_events");
                         app.on_term_event(pane_id, event, cx);
                     })
                     .is_err()
