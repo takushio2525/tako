@@ -90,7 +90,7 @@ const CATEGORIES = [
 const STATUS_LABEL = {
   supported: '対応',
   degraded: '一部対応',
-  pending: '未対応 / 未実測',
+  pending: '未対応 / 未実測', // 行ごとの内訳は「根拠」列（未実測かどうか）で読む
   unsupported: '対象外',
 };
 
@@ -166,7 +166,17 @@ function render() {
   out.push('| --- | --- | --- |');
   out.push(`| 対応 | ${c.supported} / ${total}（${pct(c.supported)}%） | macOS と同じように使えます |`);
   out.push(`| 一部対応 | ${c.degraded} | 使えますが機能が落ちます。落ち方は各表の「差分」列 |`);
-  out.push(`| 未対応 / 未実測 | ${c.pending} | 未実装のもの、または実装はあるが Windows 実機で確かめていないもの |`);
+  // pending は「未実装」と「未実測」が混ざる。合算だけ見せると
+  // 「半分動かない」と読まれるので内訳を出す（実測が無いだけのものが大半）
+  const unverified = win.features.filter(
+    (f) => f.status === 'pending' && f.evidence === 'unverified',
+  ).length;
+  out.push(
+    `| 未実測 | ${unverified} | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |`,
+  );
+  out.push(
+    `| 未対応 | ${c.pending - unverified} | Windows 側の実装が無い、または動かないことが分かっているもの |`,
+  );
   out.push(`| 対象外 | ${c.unsupported} | Windows にその概念が無い、または OS が同等機能を標準で持つ |`);
   out.push('');
   out.push('### 「未実測」について');
