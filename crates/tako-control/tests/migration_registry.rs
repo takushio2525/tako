@@ -150,7 +150,10 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         ),
         (
             "crates/tako-control/src/sessions.rs",
-            &["SessionCatalog", "SessionEntry"],
+            // #728: `PendingSpawn` は `SessionCatalog.pending` として sessions.yaml へ
+            // 直に serde される永続構造体なのに、この表から漏れていた。
+            // `tmux_session` の型を変えたときに指紋が動かず素通りしたので追加する
+            &["SessionCatalog", "SessionEntry", "PendingSpawn"],
         ),
         (
             "crates/tako-control/src/orchestrator/registry.rs",

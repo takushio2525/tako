@@ -53,21 +53,21 @@ pub fn attach_pane_ids(agents: &mut [Value], panes: &[(String, u32)], parents: &
             continue;
         };
         if let Some(pane_id) = find_ancestor_pane(pid, parents, &pane_by_pid) {
-            agent["pane"] = json!(pane_id);
+            agent["pane"] = json!(pane_id.to_string());
         }
     }
 }
 
 /// pid の祖先チェーン（自身を含む）を辿り、pane_pid 集合に一致するものを探す
-fn find_ancestor_pane(
+fn find_ancestor_pane<T: Copy>(
     pid: u32,
     parents: &HashMap<u32, u32>,
-    pane_by_pid: &HashMap<u32, &str>,
-) -> Option<String> {
+    pane_by_pid: &HashMap<u32, T>,
+) -> Option<T> {
     let mut current = pid;
     for _ in 0..MAX_ANCESTOR_HOPS {
         if let Some(pane_id) = pane_by_pid.get(&current) {
-            return Some(pane_id.to_string());
+            return Some(*pane_id);
         }
         match parents.get(&current) {
             Some(&ppid) if ppid != 0 && ppid != current => current = ppid,
@@ -118,8 +118,7 @@ pub struct ProcessSnapshot {
 impl ProcessSnapshot {
     /// tmux と ps を各 1 回だけ実行して採取する。background executor 専用。
     pub fn capture() -> Self {
-        let socket = tako_core::tmux_backend::socket_name();
-        let panes = tmux_pane_pids(Some(&socket));
+        let panes = backend_pane_pids();
         let parents = process_parent_map();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&child, &parent) in &parents {
@@ -278,10 +277,20 @@ fn find_ancestor_backend(
     None
 }
 
+/// 器の中の全ペイン（`session:window.pane` と pane_pid）を**境界経由**で列挙する（#728）。
+///
+/// `tmux_pane_pids(Some(socket_name()))` の置き換え。あちらは `TAKO_TMUX_BIN` →
+/// PATH の `tmux` を引くので、`TAKO_PSMUX_BIN` だけで psmux を入れた Windows 構成では
+/// 器が動いていても 1 件も返らず、claude の検出が全滅する（#728 の G2）。
+/// 器の binary と socket を知っているのは `tako_core::backend` だけなので、
+/// 自前のソケット指定が要らない経路はすべてここを通す
+pub fn backend_pane_pids() -> Vec<(String, u32)> {
+    tako_core::backend::backend().pane_pids_all()
+}
+
 /// caller_pid のプロセス祖先を辿り、tako バックエンドの pane_pid に一致するペインを返す（#288）
 pub fn resolve_pane_by_pid(caller_pid: u32, pane_backends: &[(u64, String)]) -> Option<u64> {
-    let socket = tako_core::tmux_backend::socket_name();
-    let all_tmux_panes = tmux_pane_pids(Some(&socket));
+    let all_tmux_panes = backend_pane_pids();
     if all_tmux_panes.is_empty() {
         return None;
     }
@@ -332,8 +341,7 @@ pub fn tmux_pane_pids(socket: Option<&str>) -> Vec<(String, u32)> {
 /// `backend_session` は tako の tmux バックエンドセッション名（例: `tako-s3`）。
 /// そのセッション内の pane_pid から `claude agents --json` の pid を祖先辿りでマッチする
 pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
-    let socket = tako_core::tmux_backend::socket_name();
-    let panes = tmux_pane_pids(Some(&socket));
+    let panes = backend_pane_pids();
     let target_panes: Vec<_> = panes
         .into_iter()
         .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
@@ -411,8 +419,7 @@ pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
     // だけを忘れる
     static STICKY: Mutex<Option<HashMap<String, LiveClaudeSession>>> = Mutex::new(None);
 
-    let socket = tako_core::tmux_backend::socket_name();
-    let panes = tmux_pane_pids(Some(&socket));
+    let panes = backend_pane_pids();
     if panes.is_empty() {
         return HashMap::new();
     }
@@ -497,8 +504,7 @@ fn live_sessions_inner(
 /// tmux ペインの pane_pid の子孫プロセスを走査し、tmux クライアント自体を除いた
 /// 実ユーザープロセスが 1 つでもあれば true を返す
 pub fn has_running_children(backend_session: &str) -> bool {
-    let socket = tako_core::tmux_backend::socket_name();
-    let panes = tmux_pane_pids(Some(&socket));
+    let panes = backend_pane_pids();
     let target_pids: Vec<u32> = panes
         .into_iter()
         .filter(|(id, _)| id.starts_with(&format!("{backend_session}:")))
@@ -594,20 +600,95 @@ fn is_descendant_of(
 /// `socket` 省略時は tako バックエンドソケットを使う
 pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {
     let mut agents = list_agents()?;
-    let backend;
-    let socket = match socket {
-        Some(s) => s,
-        None => {
-            backend = tako_core::tmux_backend::socket_name();
-            &backend
-        }
+    let panes = match socket {
+        // 明示ソケット指定（remote デーモンの tmux 直参照）は従来どおり tmux CLI
+        Some(s) => tmux_pane_pids(Some(s)),
+        None => backend_pane_pids(),
     };
-    let panes = tmux_pane_pids(Some(socket));
     if !panes.is_empty() {
         let parents = process_parent_map();
         attach_pane_ids(&mut agents, &panes, &parents);
     }
     Ok(json!({ "agents": agents }))
+}
+
+/// 定期スキャン用の一覧（#728）。器あり / 器なしの**両方**でペインへ対応付ける。
+///
+/// `list_agents_with_panes` は器のセッション名（`pane` フィールド）しか付けないので、
+/// 器を持たない構成（Windows で psmux 未導入 / tmux 不在の macOS）では
+/// どのエージェントもペインに紐付かず、セッションカタログ（#112）が永久に空になる。
+///
+/// ここでは #592 と同じ二段構えを取る:
+/// 1. 器があるペイン → 器のセッション名（`pane` = `session:window.pane`）
+/// 2. 器がないペイン → **PTY 直下の子 pid**（`tako_pane` = tako のペイン ID）
+///
+/// `pane_pids` は「器を持たないペイン」の `(tako ペイン ID, PTY 子 pid)`。
+/// プロセス表・器のペイン列挙・`claude agents --json` は**各 1 回だけ**実行する
+/// （2 秒ポーリング経路なので、ペイン数ぶん起こすと #168 / #212 の再来になる）
+pub fn list_agents_for_scan(pane_pids: &[(u64, u32)]) -> Result<Value, String> {
+    let mut agents = list_agents()?;
+    let backend_panes = backend_pane_pids();
+    if !backend_panes.is_empty() || !pane_pids.is_empty() {
+        let parents = process_parent_map();
+        attach_pane_ids(&mut agents, &backend_panes, &parents);
+        attach_tako_pane_ids(&mut agents, pane_pids, &parents);
+    }
+    Ok(json!({ "agents": agents }))
+}
+
+/// 器を持たないペインへ `tako_pane` フィールド（tako のペイン ID）を付与する（#728）。
+/// `panes` は (tako ペイン ID, PTY 直下の子 pid)。
+/// **すでに `pane`（器のセッション名）が付いているエージェントは触らない**
+/// （器あり経路の方が世代の取り違えに強い。器なしは pid だけが手がかり）
+pub fn attach_tako_pane_ids(
+    agents: &mut [Value],
+    panes: &[(u64, u32)],
+    parents: &HashMap<u32, u32>,
+) {
+    if panes.is_empty() {
+        return;
+    }
+    let pane_by_pid: HashMap<u32, u64> = panes.iter().map(|(pane, pid)| (*pid, *pane)).collect();
+    for agent in agents.iter_mut() {
+        if agent["pane"].is_string() {
+            continue;
+        }
+        let Some(pid) = agent["pid"].as_u64().map(|p| p as u32) else {
+            continue;
+        };
+        if let Some(pane) = find_ancestor_pane(pid, parents, &pane_by_pid) {
+            agent["tako_pane"] = json!(pane);
+        }
+    }
+}
+
+/// スキャンの前段ガード（#368 / #728）: 器のセッション群とペイン pid 群のうち
+/// **どれか 1 つでも**実行中の子プロセスを持つか。
+///
+/// プロセス表と器のペイン列挙を各 1 回で判定する（`claude agents --json` の
+/// Node 起動 200ms を避けるためのガードなので、ガード自身が重くては意味がない）
+pub fn any_target_has_running_children(sessions: &[&str], pane_pids: &[u32]) -> bool {
+    if sessions.is_empty() && pane_pids.is_empty() {
+        return false;
+    }
+    let panes = if sessions.is_empty() {
+        Vec::new()
+    } else {
+        backend_pane_pids()
+    };
+    if panes.is_empty() && pane_pids.is_empty() {
+        return false;
+    }
+    let parents = process_parent_map();
+    if !panes.is_empty() && !sessions_with_children_inner(sessions, &panes, &parents).is_empty() {
+        return true;
+    }
+    // 器が無いペインは PTY 直下の子 pid が起点。その子孫が 1 つでも居れば稼働中
+    let targets: std::collections::HashSet<u32> = pane_pids.iter().copied().collect();
+    !targets.is_empty()
+        && parents.iter().any(|(&pid, &ppid)| {
+            !targets.contains(&pid) && is_descendant_of(ppid, &targets, &parents)
+        })
 }
 
 #[cfg(test)]
@@ -669,9 +750,48 @@ mod tests {
     }
 
     #[test]
+    fn 器がないペインはtakoペインidで対応付ける() {
+        // #728: 器が無いとペインのシェルは tako-app の直接の子。
+        // 起点は器のセッション名ではなく PTY 直下の子 pid になる
+        let parents: HashMap<u32, u32> = [(300, 200), (200, 100), (100, 1), (777, 1)].into();
+        let panes = vec![(12u64, 100u32)];
+        let mut agents = vec![
+            json!({ "session_id": "a", "pid": 300 }),
+            json!({ "session_id": "b", "pid": 777 }), // どのペインにも属さない
+            json!({ "session_id": "c" }),             // pid なし
+        ];
+        attach_tako_pane_ids(&mut agents, &panes, &parents);
+        assert_eq!(agents[0]["tako_pane"], 12);
+        assert!(agents[1]["tako_pane"].is_null());
+        assert!(agents[2]["tako_pane"].is_null());
+    }
+
+    #[test]
+    fn 器あり側の対応付けはtakoペインidで上書きされない() {
+        // 器のセッション名は tako 再起動をまたいでも同じものを指すので、
+        // 両方引けた場合は器あり側を残す（#728）
+        let parents: HashMap<u32, u32> = [(300, 100), (100, 1)].into();
+        let mut agents = vec![json!({ "session_id": "a", "pid": 300 })];
+        attach_pane_ids(&mut agents, &[("tako-x:0.0".to_string(), 100)], &parents);
+        attach_tako_pane_ids(&mut agents, &[(12, 100)], &parents);
+        assert_eq!(agents[0]["pane"], "tako-x:0.0");
+        assert!(
+            agents[0]["tako_pane"].is_null(),
+            "器あり側が付いていれば pane_pid 経路は触らない"
+        );
+    }
+
+    #[test]
+    fn 走査対象が空なら前段ガードは何も起こさない() {
+        // #728: 器のセッションもペイン pid も無いなら、プロセス表すら作らない
+        // （2 秒ポーリング経路のガードなので、ガード自身が重くては本末転倒）
+        assert!(!any_target_has_running_children(&[], &[]));
+    }
+
+    #[test]
     fn ancestor_traversal_stops_on_cycle() {
         let parents: HashMap<u32, u32> = [(10, 20), (20, 10)].into();
-        let pane_by_pid = HashMap::new();
+        let pane_by_pid: HashMap<u32, &str> = HashMap::new();
         assert_eq!(find_ancestor_pane(10, &parents, &pane_by_pid), None);
     }
 

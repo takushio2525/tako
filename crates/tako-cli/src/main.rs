@@ -6941,11 +6941,17 @@ fn print_sessions_list(result: &Value) {
     if !pending.is_empty() {
         println!("--- session 未検出の spawn 記録（codex / agy・起動直後の claude）---");
         for p in &pending {
+            // 器がある構成はセッション名、無い構成はペイン ID がキー（#728）
+            let key = p["tmux_session"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| p["pane"].as_u64().map(|n| format!("pane {n}")))
+                .unwrap_or_else(|| "-".into());
             println!(
                 "{}  {}  {}  {}",
                 p["recorded_at"].as_str().unwrap_or("-"),
                 p["agent"].as_str().unwrap_or("-"),
-                p["tmux_session"].as_str().unwrap_or("-"),
+                key,
                 p["label"].as_str().or(p["project"].as_str()).unwrap_or("-"),
             );
         }

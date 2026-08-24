@@ -3081,3 +3081,30 @@
 - 検証: fmt / clippy(-D warnings) / `test --workspace` 緑 / クロスチェック エラー 0・警告 12
   （ベースライン同数）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / 単体 5 本。
   検出力は 2 通りの revert（過負荷判定を殺す / ピーク記録を殺す）で FAILED を実測
+
+## 2026-08-24（#728: セッションカタログを「器なし構成」でも動かす + 器のペイン列挙を境界経由へ）
+- `windows/728-sessions` の `8c88a48` を main の現状へ合わせて移植。**マトリクスは
+  既に Supported**（#591 が #877 の実機実測を根拠に倒していた）ので、残っていたのは
+  Issue が「本当の欠落」と呼んでいた 2 件だけ
+- **G1: 器なし構成でカタログが永久に空**（psmux 未導入の Windows / tmux 不在の macOS。
+  Windows 専用の縮退ではなく共通の穴）。①spawn の pending 記録が器の名前が無いと
+  丸ごと飛ばされていた ②定期スキャンが `backend_sessions.is_empty()` で丸ごとスキップ
+  ③検出の対応付けが器のセッション名しか見ていなかった → #592 と同じ二段構えへ
+  （器があればセッション名、無ければ PTY 直下の子 pid から祖先辿りでペイン ID）
+- **G2: 器のペイン列挙が境界（#519）を通っていない**。`agents.rs` が
+  `tmux::tmux_command()`（`TAKO_TMUX_BIN` → PATH の `tmux`）を直叩きしていたため、
+  `TAKO_PSMUX_BIN` だけで psmux を入れた構成では器が動いていても 1 件も返らず検出が全滅。
+  `SessionBackend::pane_pids_all()` を境界へ追加し、ソケット指定の要らない 5 経路を寄せた
+  （明示ソケットの remote 経路は従来どおり）
+- キーの解釈は `PendingSpawn::matches` へ一本化し、`tmux_session` の直接比較を無くした。
+  重複排除も `SessionCatalog::upsert_pending` へ切り出して**テストが実装をなぞらず
+  production 経路そのものを通る**形にした（最初の移植は実装をコピーしていて検出力ゼロだった）
+- **スキーマ変更**（`PendingSpawn.tmux_session: String → Option<String>`）。旧形式は
+  serde がそのまま `Some(...)` として読むので**移行 Step は不要**（回帰テストで固定）。
+  併せて **`PendingSpawn` が #916 の指紋表から漏れていた**のを追加した（sessions.yaml へ
+  直に serde される永続構造体なのに、型を変えても指紋が動かず素通りしていた）
+- 検証: fmt / clippy(-D warnings) / `test --workspace` 全緑（sessions 21 → 26 / agents +3 /
+  backend +2）/ クロスチェック エラー 0・警告 12（ベースライン同数）/ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`。検出力は 2 通りの revert（`tako_pane` 検出を外す /
+  `upsert_pending` を旧挙動へ）で FAILED を実測
+- **実機未検証**（Windows 実機 offline）: 器なし / `TAKO_PSMUX_BIN` のみ構成での通し。#937 へ

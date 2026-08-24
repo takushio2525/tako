@@ -365,6 +365,45 @@ pub fn mark_closed_by_pane_at(path: &Path, pane: u64, reason: &str) -> Result<()
     })
 }
 
+/// 検出済み claude session をレジストリへ反映する（ペイン ID キー。#728）。
+///
+/// 器を持たない構成（Windows で psmux 未導入 / tmux 不在の macOS）では
+/// `tmux_session` が無く [`record_session_detected`] が 1 件も引けない。
+/// ペイン ID で active な worker を引いて同じ更新をかける。
+///
+/// ペイン ID 再利用の誤マッチが気になるところだが、ここで渡ってくるのは
+/// **今まさにそのペインで claude が動いている**という実プロセスの観測結果なので、
+/// active な worker が居るなら同一世代とみなしてよい。
+/// 冪等（変化が無ければ書き込まない）なのは tmux_session 版と同じ
+pub fn record_session_detected_by_pane(pane: u64, session_id: &str) -> Result<(), String> {
+    let Some(path) = registry_path() else {
+        return Ok(());
+    };
+    if !path.is_file() {
+        return Ok(());
+    }
+    let current = WorkerRegistry::load_from(&path)?;
+    let needs_update = current.workers.values().any(|e| {
+        e.is_active()
+            && e.pane == pane
+            && (e.session_id.as_deref() != Some(session_id) || e.prompt_delivered_at.is_none())
+    });
+    if !needs_update {
+        return Ok(());
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(&path, |reg| {
+        for entry in reg.workers.values_mut() {
+            if entry.is_active() && entry.pane == pane {
+                entry.session_id = Some(session_id.to_string());
+                if entry.prompt_delivered_at.is_none() {
+                    entry.prompt_delivered_at = Some(now.clone());
+                }
+            }
+        }
+    })
+}
+
 /// 検出済み claude session をレジストリへ反映する（tmux_session キー）。
 /// session_id の初観測 = transcript 生成 = プロンプト到達の証跡として
 /// `prompt_delivered_at` も同時に記録する。GUI の定期スキャンおよび
