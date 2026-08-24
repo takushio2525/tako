@@ -5,6 +5,13 @@
 
 ## 現在の対象（2026-08-24）
 
+- **#932（ちらつき）は再現せず = ユーザーの追加情報待ち**。代わりに機械検証を新設した
+  （`TAKO_VISUAL_ONLY=flicker`）: 静止画面は 1 ピクセルも動かない・出力中のペインの外側は
+  前の絵へ戻らない・中身が一瞬まっさらにならない、の 5 ラウンド。検出力は
+  `TAKO_932_INJECT_FLICKER=1`（8px の四角をフレームごとに色替え）で実証。
+  **ユーザーの実バイナリは v0.7.4 タグではなく main@`fb0f8e3`**（/Applications は
+  8/21 06:21 のビルド）。v0.7.3 以降で描画に触った変更は #838 だけで、それは
+  Web ビューペインが 1 枚も無いと完全に無効（ユーザーの layout.json に webview 0 件）
 - **#467 Windows 移植はスライス 1〜7c / 9 が main へ入り、残りはスライス 8（棚卸し）だけ**
 - **#898（コマンド解決の `which` 決め打ち）を解消**。`which` は Windows に無いので
   解決が例外なく `None` = tako.exe が PATH 上に居るのに「無い」ように見えていた。境界 B16
@@ -71,6 +78,19 @@ POSIX 専用の道具 = nc・ジョブ制御・`/dev/fd`・ECHOCTL #729 / links 
 - **fresh worktree は `web/tako-remote/dist/` を持たない**（`rust_embed` が埋め込むので即失敗）。
   実機の `npm ci` は lock 不整合で落ちるので既存 worktree からコピーする
 - **`cp` が `-i` の別名かもしれない**: スクリプトでは `command cp -f` を使う
+
+## 測り方の落とし穴（#932 で踏んだ。他の検証にも効く）
+
+- **セルフテストは `-u TERM -u COLORTERM` で起動する**。tako のペインへ渡る TERM は
+  親から継承されるので、tako のペインの中（`TERM=tmux-256color`）から起こすと
+  項目 1b（TERM / COLORTERM 注入）が**決定的に落ちる**（main でも 3/3 で落ちた）。
+  GUI 起動には親の TERM が無いので、外して測るのが本番と同じ条件
+- **`cargo test` は本番 data dir へ書く**。`TAKO_DATA_DIR` を渡さずに走らせると
+  本番 `perf.log` へ `pdf_rasterize` 等が入り、しかもテストプロセスは
+  `mark_main_thread()` を呼ばないので**全部「メインスレッド専有」と誤記録**される
+  （ユーザーの perf.log の 643 行の正体がこれ）
+- **`visual-test` の全節は現状 main でも `term-grid attrs-underline` で止まる**
+  （`ul_strip=32` が期待の 40 未満。e703e40 で同じ数値を実測 = main 由来）
 
 ## 次の一手
 
