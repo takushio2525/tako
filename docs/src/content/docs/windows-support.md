@@ -142,7 +142,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_orchestrator_ledger` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 | `tako_limit_resume` | 対応 | — | 実機セルフテスト: 項目 111 / 117（オプトイン・ダイアログ型 / idle 型の出し分け・試行上限・プロファイル既定） |
 | `tako_limit_service` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
-| `tako_sessions` | 対応 | — | 実機実測: #877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑 |
+| `tako_sessions` | 対応 | — | 実機実測: #877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ |
 | `tako_task_gate` | 対応 | — | 実機テスト: acceptance_gates のゲート登録テストが実機で緑（落ちているのは execute_command の 5 件だけ） |
 | `tako_task_gate_check` | 一部対応 | ゲートの登録と表示は動くが、コマンド型ゲートの実行が sh -c 決め打ちのため Windows では判定できない（#935） | 実機テスト: 実機の cargo test で execute_command 系 5 件が失敗（sh 不在）。PR / custom ゲートの判定は動く |
 | `tako_task_gate_show` | 対応 | — | 実機テスト: acceptance_gates の表示テストが実機で緑 |

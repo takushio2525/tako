@@ -1345,7 +1345,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑",
+            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ",
         ),
     },
     Feature {
