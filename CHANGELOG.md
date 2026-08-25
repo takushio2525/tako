@@ -8,6 +8,57 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.8] - 2026-08-25
+
+Nightly patch release (automated). Changes since v0.7.7:
+夜間パッチリリース（自動）。v0.7.7 以降の変更:
+
+- [修正] タブを切り替えた瞬間の端末リサイズを根治: 裏タブのペインを「表に出たときの寸法」へ合わせる (#932) (#958)
+- [修正] 端末の行の字の大きさもペインのフォントサイズへ追従させる (#947) (#957)
+- [修正] フォントサイズ変更が表示中タブ以外のペインへ届かない問題を根治 (#647) (#467) (#952)
+- [機能追加] tako sessions を器なし構成でも動かす: 検出の二段構えと境界経由のペイン列挙 (#728) (#467) (#956)
+- [修正] UI ストール診断の誤認を正し、端末取り込み経路を計測対象に入れる (#643) (#467) (#954)
+- [修正] IME を壊す「入力ハンドラ未登録のフレーム」を作らない (#623) (#467) (#953)
+- [修正] docs のコードブロックで帯と本体の接合部が分離して見える問題を根治 (#950) (#955)
+- [修正] IME 未確定文字列の大きさを変換先ペインのフォントサイズへ追従させる (#940) (#949)
+- [機能追加] 静止画面のちらつきを機械検証する visual-test 節を新設 (#932) (#942)
+- [修正] tako-app を release で GUI サブシステムへリンクし、無音死を防ぐ (#586) (#467) (#941)
+- [ドキュメント] README を再構成 + Homebrew 導入手順とドキュメントサイトへの導線を追加 (#939)
+- [改善] 対応マトリクスを実測根拠つきで棚卸し + docs「Windows 対応状況」ページ (#591) (#938)
+
+## [Unreleased]
+
+### Fixed
+
+- [修正] タブを切り替えた瞬間に端末がリサイズされる問題を根治（裏タブのペインを
+  「表に出たときの寸法」へ合わせる）(#932)。#647 は非表示ペインへ**セル寸法**の変更を
+  届けるようになったが、使う領域が「最後に描かれたときの領域」だったため、
+  ウィンドウ寸法・サイドバー幅・バナーの出入りといった**幾何の変更**は届かず、
+  そのタブを表に出した瞬間に初めてリサイズ = SIGWINCH が飛んでいた（中の TUI が
+  画面を作り直すので切り替えのたびに描画が乱れる）。実測: 裏 116x37 / 表 88x33 →
+  表に出した瞬間 88x33 へ変化していたのが、追従後は最初から 88x33 で
+  **切り替えの瞬間に 1 度も変わらない**
+- [Fixed] Terminals no longer resize at the moment you switch tabs (#932). #647 started
+  pushing *cell size* changes to off-screen panes, but it used each pane's last rendered
+  rect, so *geometry* changes (window size, sidebar width, banners) never reached them:
+  the pane was resized — sending SIGWINCH into the running program — exactly when its tab
+  was brought to the front. Off-screen panes now derive the rect they will get when shown,
+  through the same single code path used for the visible tab.
+
+## [0.7.7] - 2026-08-24
+
+Nightly patch release (automated). Changes since v0.7.6:
+夜間パッチリリース（自動）。v0.7.6 以降の変更:
+
+- [修正] コマンド解決を実行ファイル探索の境界へ寄せる: Windows で tako / claude / tmux が常に見つからない問題 (#898) (#467) (#929)
+- [修正] public リポの現行コードから実ユーザー名・実ホームパスを除去 + 再発防止の番犬を新設 (#927) (#928)
+- [修正] install_plan の期待値を計画そのものから作る: セルフテスト項目 119（#868）が Windows で止まる問題 (#920) (#467) (#926)
+- [機能追加] リモートからフォルダを開く（SSH 先のワークスペース化）+ 接続失敗の無言化を根治 (#919) (#65) (#924)
+- [機能追加] 設定ファイルのスキーマ変更を常に自動マイグレーションにする + 未対応箇所の棚卸しと是正 (#916) (#923)
+- [機能追加] handoff をプロジェクト単位へ再設計し旧形式を自動移行する（後任へ渡すのは管轄分だけ） (#922)
+- [修正] file URI のドライブレター規則を境界へ一本化: セルフテスト項目 116（#835）が Windows で止まる問題 (#913) (#467) (#921)
+- [修正] PowerShell の PATH ブロックが非 ASCII のパスで $PROFILE を壊す問題（#868 / #525） (#890)
+
 ## [0.7.6] - 2026-08-23
 
 Nightly patch release (automated). Changes since v0.7.5:

@@ -2950,6 +2950,236 @@
   #919 由来。速い FAILED と >60 秒のハングの両方を観測）
 - 関連: PR #929（Refs #898 / #467）
 
+## 2026-08-24（#591: 対応マトリクスを実測ベースへ棚卸し + docs「Windows 対応状況」ページ = スライス 8 完了）
+- **前提が違った**: Issue の「完了（`cf7c9a4`）」は `windows/467-ipc-orchestration-local` にしか無く
+  **main は 1 行も入っていなかった**（#658 と同じ型）。しかも当時の判定は win467 の実装に対するもの
+  なので移植せず**引き直した**。main は棚卸し前で supported 4 / degraded 2 / pending 132 / unsupported 2
+- **根拠を型にした**: `Feature::windows_evidence`（`SelfTest` / `UnitTest` / `Measured` / `Unverified`）を
+  新設し、**T7 が根拠なしの Supported / Degraded / Unsupported を落とす**。検出力は `tako_theme` の
+  根拠を外して実測（機能名を名指しして FAILED）。根拠は 実機セルフテストの通し（#920。FAILED 0 / skip 19）
+  64 件・plan の実測記録 16 件・実機で緑のテスト 11 件・OS の仕様 2 件から採り、残り 47 件は `Unverified` のまま
+  Pending（追跡 #937）。**「動く見込み」を Supported と言わない**のは、誤宣言が system prompt へ流れるため
+  （`gate()` は production から呼ばれていないので実害は宣言だけ、と確認したうえでの判断）
+- 結果: **supported 69 / degraded 13 / pending 56 / unsupported 2**。prompt へ入る最大の 1 行が
+  「GUI 起動とペイン / タブ管理の Windows 実装が前提（42 機能）」から「実装は共通だが実機で未実測
+  （37 機能・#937）」へ変わった。known_limitations（#594）は同じ関数から出るので自動追随
+- **棚卸しで製品バグ 4 件を確認**: ゴミ箱が完全削除（**#617**）/ AI 命名が一度も走らない（**#722**）/
+  受け入れゲートが `sh -c` 決め打ち（**#935** 新規）/ 古い claude の警告が出ない（**#936** 新規。#726 の続き）。
+  いずれも Degraded の理由文へ明記。**最初 #933 / #934 として重複起票してしまい**（既存の #617 / #722 と同一）、
+  気づいた時点で自分の側を close して番号を差し替えた = 横断作業の前に `gh issue list --search` を通すこと
+- 実機ベースラインの失敗名（#906 の全数採取）を**製品の縮退**（acceptance_gates 5 / stale_binary 2 /
+  remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決め打ち・symlink）に切り分け、前者だけを根拠に使った
+- docs: `docs/src/content/docs/windows-support.md` は**生成物**（`node scripts/gen-windows-support-docs.mjs`。
+  `--check` を **CI の macOS ジョブ**へ入れて二重管理を止めた）。表に**根拠の列**を出すので「対応」の裏づけを
+  利用者がそのまま読める。サイドバー「はじめに」+ セットアップページからリンク。OG 画像も焼き直し
+- 同梱: `known_limitations_lists_windows_gaps_bilingually` が理由文を直書きしていて落ちたので、
+  期待値をマトリクスから作る形へ（#920 の install_plan と同型）
+- **踏んだ罠 2 件**: ①`--check` を CI へ入れたら落ちた = **生成物が実行環境の言語で変わる**
+  （`note` が `i18n::lang()` 追従。`TAKO_LANG` だけでは settings.json の `language` に負けるので
+  言語非依存の `note_ja` / `note_en` を応答へ足した）②既存 Issue を検索せず重複起票した
+- 検証: fmt / clippy(-D warnings) / `test --workspace` **2589 passed 0 failed** / platform_parity 14 本 /
+  support 15 本（T7 2 本を新設）/ クロスチェック エラー 0・警告 10（ベースライン同数）/ docs build 25 ページ /
+  `npm run og:verify` OK
+- **Windows 実機はセッションを通して offline**（`ssh win` が timeout）なので新規の実機実測は無し。
+  追試が要るものは #937 に積んだ
+- 次: #937 の消し込み（実機復帰後）。#617 / #722 / #935 / #936 の修正
+
+## 2026-08-24（#586: tako-app を release で GUI サブシステムへリンク + 無音死の防止）
+- win467 の `c363a5a` のうち **main に無かった 2 点だけ**を移植（`no_console_window` の
+  配線 = #628 分はスライス 1 で既に main に在り、`git grep` で 38 箇所を実測確認）。
+  ①`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（release だけ GUI
+  サブシステム。debug はコンソールを残す）②起動を中断する `fatal:` を **persist.log にも残す**
+  （GUI サブシステムでは stderr が捨てられるので、直さないと Windows release が無音死する）
+- 番犬 `tako_appはreleaseでguiサブシステムへリンクされる` を platform_parity へ新設。
+  サブシステムは**リンク時の属性で実行時には検査できない**ので、属性の存在と
+  「`eprintln!("fatal:` の直後 3 行に `persist_diag` がある」をソース走査で固定した
+- 検証: fmt / clippy(-D warnings) / `test --workspace` **2592 passed 0 failed** /
+  `cargo check --release -p tako-app`（= 属性が効く側）警告 0 / クロスチェック エラー 0・警告 12
+  （ベースライン同数）。検出力は 2 通りの revert（属性削除 / persist_diag 削除）で FAILED を実測
+- **実機未検証**（Windows 実機 offline）: 「エクスプローラー起動でコンソール窓が出ない」の目視。#937 へ
+
+## 2026-08-24（#932: ちらつきの再現調査 + 機械検証の新設）
+- 再現せず。静止 3 種（1 ペイン / 4 分割 + サイドバー + git / コード・md・PDF プレビュー）を
+  100 フレーム × 50ms = 5 秒撮って**ピクセル差 0**、出力中（主画面の `\r` 上書き / 代替画面の
+  全面塗り替え）も外側の戻り 0・中身の消失 0。tmux バックエンド ON で実測
+- 前提の訂正: ユーザーの実バイナリは **v0.7.4 タグではなく main@`fb0f8e3`**（8/21 06:21 ビルド）。
+  v0.7.3 以降で描画に触ったのは #838 だけで、webview ペイン 0 件のユーザー環境では完全に無効
+- 新設: `TAKO_VISUAL_ONLY=flicker`（5 ラウンド。検出力は `TAKO_932_INJECT_FLICKER=1` で実証）+
+  #781 の会計漏れログにずれた軸を出す + `run_visual` の `preview-code` 節の混入除去
+- 副産物（別 Issue へ）: `cargo test` が本番 perf.log を汚し「メインスレッド専有」と誤記録 /
+  visual-test の `term-grid attrs-underline` が main でも落ちる / タブのドット脈動（#217）は
+  エージェントタブでは恒久的に動き続ける
+- 関連コミット: `e9855d8`。次: ユーザーへ症状の具体化（どの画面・どの操作・頻度・出始め）を確認
+## 2026-08-24（#940: IME 未確定文字列のサイズがフォントサイズ変更に追従しない）
+- 原因は**2 層**あった。層 1 = `ime_preedit_text` が `text_style()`（テーマ既定）を固定参照し
+  ペイン単位のオーバーライド（cmd+= が書く `pane_font_sizes`）を見ていなかった
+  （実測 `theme=13 pane=17 ime=Some(13.0)`）。周囲の本文が追従していたのは専用 element
+  `TerminalGrid`（#787）が `shape_line` へサイズを直接渡すため。同じファイルの
+  `ime_prefix_width` はすでに `pane_font_size` を使っており**内部で不整合**だった
+- 層 2 = **`TextStyle` を渡しても字は大きくならない**。gpui の `StyledText` はレイアウトで
+  `window.text_style()`（祖先から降る ambient）からサイズを取り、`TextRun` は
+  フォント族・色・下線しか運ばない（サイズを持たない）。層 1 だけ直すと
+  `used_fs=21` なのに実描画は 13pt のまま = 実測で判明。サイズは**箱の `text_size`** で決まる
+- 直し方: `ime_preedit_text(text, pane)` にして `pane_text_style(pane)` を使い、
+  `text_size` / `line_height` を載せた**箱ごと**返す（呼び出し 2 か所が同じ 1 実装を通る）。
+  オーバーレイの箱の高さも `pane_line_height(pane)` へ。位置（`left` / `top`）は不変 =
+  #582 / #642 には触っていない
+- 検証: visual-test 新節 `ime-preedit`（変換前 / 変換中フレームの差分の外形を実ピクセルで測る。
+  日本語入力ソースが無い機でも OS が呼ぶ入口 `replace_and_mark_text_in_range` を叩いて測れる）が
+  13pt→21pt で**インク幅 52→83 px（実比 1.596 / 期待 1.615）**、**変換中の拡大**でも
+  13pt→25pt で 52→96 px（実比 1.846 / 期待 1.923）。`TAKO_940_LEGACY=1` では
+  それぞれ 52→52（1.000）/ 52→51（0.981）で FAILED。**既定サイズのフレームは修正前後で
+  960×600 の全画素一致**（`differing bytes: 0` = 見た目・位置の回帰なし）
+- セルフテストは main の製品コードと**同一低負荷で A/B**: main `hops=63` / 本ブランチ `hops=66`
+  でどちらも `TAKO_APP_SELF_TEST_OK`。高負荷（load 8.7 / 29.8）だと項目 113（#816）の
+  `hops <= 80` を 84 / 85 で超えて落ちるが、これは**閾値が負荷に追随していない**もので
+  main でも同型（#943 と同じ形）
+- セルフテスト項目 125（拡大→変換 / 実 render 経路 / **変換中のサイズ変更** / 既定へ戻す）+
+  番犬 `未確定文字列のサイズはペイン由来で箱に載る`（層 2 の再発を構造で止める）
+- 派生（範囲外・別途起票）: `terminal_screen_lines` も同じ機序で ambient サイズ依存
+  （チャット入力欄のミラー / たまり場サムネイル / ホバープレビュー）/ visual-test の
+  `preview-code` 分岐に `remote_tree_visual` の呼び出しが混入（main 由来）
+- **実 IME の手打ち目視は未検証**（この機は日本語入力ソースが無効。#737 と同じ制約）
+## 2026-08-24（#623: IME を壊す「入力ハンドラ未登録のフレーム」を作らない）
+- **境界（`platform::ime` の `is_associated` / `reassociate` / `guard_action` + 単体 6 本）は
+  #467 スライス 1 で既に main に在り、配線だけが無かった**。win467 の `bd239ba` / `e8092af` から
+  tako-app 側の配線を移植（`0afcb92` = 長文プロンプトの Enter 早撃ちは IME ではなく送達の話で、
+  main は #790 / #907 / #32 で経路が別物になっているため移植対象外とした）
+- 機序: `Window::handle_input` は**自分の `focus_handle` にフォーカスがあるときだけ**入力ハンドラを
+  登録する。登録が飛んだフレームは GPUI Windows の `update_ime_enabled()` が「文字入力を
+  受け付けないウィンドウ」と誤認し、`ImmNotifyIME(CPS_COMPLETE)` = **未確定文字列の強制確定**と
+  IME の切り離しを行う（実機の「ばーじょん → ｂーじょん」+ その打鍵の消失）
+- 直したのは 3 点: ①`render` 冒頭の自己修復を `focused(cx).is_none()`（どこにも無い）→
+  「自分のハンドルに無い」へ強化 ②`handle_input` を呼ぶ canvas の **prepaint** に同一フレーム内の
+  最終防衛線 ③切り離しを検知したら結合し直す保険。診断は `TAKO_IME_DIAG=1`（既定オフ・
+  **打鍵内容は出さない**）
+- **`on_focus_lost`（#332）では間に合わない**ことを実測で確定: あれは draw の**末尾**で発火するので
+  フォーカスは戻るが、`handle_input` の登録可否はその手前の paint で決まっている。
+  最初に書いた「フォーカスが戻るか」を見る検査は**旧挙動でも通ってしまい**、
+  「入力ハンドラを登録できなかったフレーム数」を数える形へ書き直して初めて検出力が出た
+- 検証: fmt / clippy(-D warnings) / `test --workspace` 緑 / クロスチェック エラー 0・警告 12
+  （ベースライン同数）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 125 新設）。
+  **A/B（旧挙動へ戻す）で `skipped=0->1` の FAILED を実測** = 1 フレームだけ登録が飛んでいた
+- **実機未検証**（Windows 実機 offline）: 「ばーじょん」「にゅうりょく」の実 IME 入力。#937 へ
+## 2026-08-24（#643: UI ストール診断の誤認を正し、端末取り込み経路を計測対象に入れる）
+- win467 の `e867e7c` のうち **main にまだ無い部分だけ**を移植。「UI ストール」は
+  foreground executor の再開遅延で測っていたが、Windows ではタイマーが WinRT
+  スレッドプール・再開がメインスレッドのキューという 2 段構えで**遅れたのがどちらか
+  区別できない**。実機の perf.log は 98 件中 94 件が `perf_span` と共起しておらず
+  （#168 のときは 1021 件すべてが共起 = 対照的）、tako の専有では説明できないのに
+  「UI ストール」と記録され続けていた
+- watchdog の**素の OS スレッド**自身の sleep 超過を「スケジューラ遅延」として記録し、
+  `classify_stall` で 3 通りに書き分ける（マシン全体の過負荷 / tako の専有（区間名つき）/
+  再開経路の遅延）。**根拠が無いときは原因を騙らない**
+- 取り込み経路（`on_term_event` を回す 2 か所）へ `perf_span("term_events")` を新設。
+  高頻度のメインスレッド経路なのに計測の外にあり、そのままだと分類が
+  「計測区間なし = 再開経路の遅延」へ誤って倒れる
+- **`TAKO_TERM_EVENT_DRAIN` の畳み込みは移植しない**: main は #782（4ms 窓の
+  `batch_term_events`）+ #816（Wakeup ゲート + 16ms hop 制限）で**より強く**同じことを
+  しており、重ねると 2 つの畳み込み機構が並ぶ。#643 の ① ちらつき（コンソール窓）も
+  #628 分がスライス 1 で main に入っているのでコード変更は不要
+- 検証: fmt / clippy(-D warnings) / `test --workspace` 緑 / クロスチェック エラー 0・警告 12
+  （ベースライン同数）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / 単体 5 本。
+  検出力は 2 通りの revert（過負荷判定を殺す / ピーク記録を殺す）で FAILED を実測
+
+## 2026-08-24（#728: セッションカタログを「器なし構成」でも動かす + 器のペイン列挙を境界経由へ）
+- `windows/728-sessions` の `8c88a48` を main の現状へ合わせて移植。**マトリクスは
+  既に Supported**（#591 が #877 の実機実測を根拠に倒していた）ので、残っていたのは
+  Issue が「本当の欠落」と呼んでいた 2 件だけ
+- **G1: 器なし構成でカタログが永久に空**（psmux 未導入の Windows / tmux 不在の macOS。
+  Windows 専用の縮退ではなく共通の穴）。①spawn の pending 記録が器の名前が無いと
+  丸ごと飛ばされていた ②定期スキャンが `backend_sessions.is_empty()` で丸ごとスキップ
+  ③検出の対応付けが器のセッション名しか見ていなかった → #592 と同じ二段構えへ
+  （器があればセッション名、無ければ PTY 直下の子 pid から祖先辿りでペイン ID）
+- **G2: 器のペイン列挙が境界（#519）を通っていない**。`agents.rs` が
+  `tmux::tmux_command()`（`TAKO_TMUX_BIN` → PATH の `tmux`）を直叩きしていたため、
+  `TAKO_PSMUX_BIN` だけで psmux を入れた構成では器が動いていても 1 件も返らず検出が全滅。
+  `SessionBackend::pane_pids_all()` を境界へ追加し、ソケット指定の要らない 5 経路を寄せた
+  （明示ソケットの remote 経路は従来どおり）
+- キーの解釈は `PendingSpawn::matches` へ一本化し、`tmux_session` の直接比較を無くした。
+  重複排除も `SessionCatalog::upsert_pending` へ切り出して**テストが実装をなぞらず
+  production 経路そのものを通る**形にした（最初の移植は実装をコピーしていて検出力ゼロだった）
+- **スキーマ変更**（`PendingSpawn.tmux_session: String → Option<String>`）。旧形式は
+  serde がそのまま `Some(...)` として読むので**移行 Step は不要**（回帰テストで固定）。
+  併せて **`PendingSpawn` が #916 の指紋表から漏れていた**のを追加した（sessions.yaml へ
+  直に serde される永続構造体なのに、型を変えても指紋が動かず素通りしていた）
+- 検証: fmt / clippy(-D warnings) / `test --workspace` 全緑（sessions 21 → 26 / agents +3 /
+  backend +2）/ クロスチェック エラー 0・警告 12（ベースライン同数）/ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`。検出力は 2 通りの revert（`tako_pane` 検出を外す /
+  `upsert_pending` を旧挙動へ）で FAILED を実測
+- **実機未検証**（Windows 実機 offline）: 器なし / `TAKO_PSMUX_BIN` のみ構成での通し。#937 へ
+## 2026-08-24（#647: フォントサイズ変更が「表示中タブ以外」のペインへ届かない問題を根治）
+- win467 の `0e6766c` を main の現状（#781 / #684 で `pane_text_area_rect` が既に
+  切り出されている）へ合わせて移植。根因は `session.resize()` の呼び出しが
+  `render_pane` の 1 箇所だけで、`render_pane` は**そのウィンドウが今表示している
+  タブのペインしか通らない**こと。フォントサイズ変更はセル寸法のキャッシュを捨てる
+  だけで端末へ何も通知しないため、裏タブは古いセル寸法で計算した cols/rows のまま残り、
+  alt screen の TUI を動かしているとタブを表示した瞬間に grid が縮んで崩れていた
+- `render` で `pane_text_areas` を確定した直後に `sync_offscreen_pane_sizes` を呼ぶ。
+  面積は「最後に描画されたときの領域」（`pane_last_text_areas`）を使い、一度も描画されて
+  いないペインは `hidden_tab_pane_areas` でレイアウトから割り出す = **背景タブに作られた
+  ペインが spawn 時の 80x24 のまま TUI を起動する問題も同時に直る**
+- `grid_cells` を切り出し、表示中経路と非表示経路が同じ式を使うことを構造で保証した
+  （ずれると「タブを表示した瞬間に grid が変わる」= 同じ崩れ方に戻る）
+- `TerminalSession::resize` を純粋関数 `resize_plan` へ整理し、**cols/rows が同じでも
+  セル寸法が変われば PTY へ通知する**（`ws_xpixel` / `ws_ypixel` が古いまま残るのを防ぐ）。
+  セル寸法だけの変化では grid を reflow しない
+- `pane_text_areas` 自体を非表示タブぶんまで残す案は採らない（マウス座標→セル変換が
+  これを引くので、非表示ペインの残骸があると誤ヒットする = #153）
+- 検証: fmt / clippy(-D warnings) / `test --workspace` 緑 / 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 126 新設。`font 13->24` で
+  **裏タブが 119x27 → 48x15 = 表示中ペインと一致**することを実測）+ 単体 3 本
+- **実機未検証**（Windows 実機 offline）: 実 claude で「文字サイズ変更 → TUI 起動」の目視。#937 へ
+## 2026-08-24（#947: terminal_screen_lines の字がペインのフォントサイズに追従しない）
+- #940 と同じ機序（gpui の `StyledText` はサイズを**箱の ambient** から取り、`TextRun` は
+  フォント族・色・下線しか運ばない）。`default_style` に `pane_text_style` を渡していても
+  効かず、**箱（`line_h`）は伸びるのに字はテーマ既定のまま**になっていた
+- **ユーザー可視かを先に実測して確定**した（起票時は「要実測」）。タブツリーのホバー
+  プレビューを visual-test で駆動し、行ごとのインクの高さと間隔を測ると
+  13pt→21pt で **間隔 34→54（追従）に対し 字 9→9（不追従）**。実フレームでも
+  「行の間隔だけ広がって字は小さいまま」が目で見える
+- 直し方: `terminal_screen_lines` の行の箱**2 経路**（セル幅未計測のフォールバック /
+  グループ div をぶら下げる本命）へ `text_size(px(fs))` / `line_height(px(line_h))` を載せた。
+  `TAKO_947_LEGACY=1` で修正前へ戻せる
+- **オーバーライドが無いペインには載せない**: 既定サイズでは `text_size` は ambient と同値で
+  無害だが、`line_height` は**ルートが設定していない**（= gpui 既定の倍率）ので明示すると
+  既定サイズの縦位置が 1 px 級で動く。壊れていない側を動かさないため対象を絞った。
+  結果、既定サイズのフレームは修正前後で**全画素一致**（`differing bytes: 0`）、
+  拡大時だけ 10,992 バイト差
+- 効果: 字 9→**16**（実比 1.778 / 期待 1.615）。**同じ 1 実装**を通る 4 経路
+  （たまり場サムネイル / チャット入力欄のミラー / ホバー・ピン留めプレビュー /
+  `TAKO_787_NO_GRID_ELEMENT=1` の旧ペイン本体）がまとめて直る
+- 設計判断: サムネイルを小さいままにする案は採らない。行の高さが既に per-pane なので
+  「箱は大きいが字は既定」は意図ではなくバグ。固定サイズが欲しい面は
+  **明示的に固定サイズを箱へ載せる**のが正しい形（Issue の指摘と同じ）
+- 検証: visual-test 新節 `screen-lines`（`TAKO_VISUAL_ONLY=screen-lines`）+ 番犬
+  `端末の行の箱にフォントサイズが載っている`（2 経路ぶん載っているかをソース走査）。
+  検出力は `TAKO_947_LEGACY=1`（字 9→9・プロファイル完全一致で FAILED）と
+  片方の載せを外す revert（番犬が「1 箇所」と名指し）で実証
+- 測定の落とし穴 2 件: `ink_row_profile` の上下反転を「インクが多い方」で決めると
+  ポップアップ外のターミナル本文を掴む（→ 差分 bbox は画像座標なので画像座標で直接舐める）/
+  塊の高さを最大や中央値で採ると、拡大でプロンプト行が画面外へ出た瞬間に別の内容と
+  比べてしまう（→ 先頭の塊で測る）
+
+## 2026-08-24（#932 第 2 ラウンド: タブ切り替えの「遅れリサイズ」を根治）
+- 症状「タブ切り替え / ペインサイズ変更で描画が一瞬消える（低頻度）」の**原因になりうる
+  唯一の状態変化**を特定して潰した: 裏タブのペインは `render_pane` を通らないので、
+  #647 が入ったあとも**幾何の変更**（ウィンドウ寸法・サイドバー幅・バナー）が届かず、
+  表に出した瞬間に初めてリサイズ = SIGWINCH が飛ぶ。実測 裏 116x37 / 表 88x33 →
+  表に出した瞬間 88x33（`late_resize=true`）。割り出しを表示中と同じ 1 本
+  （`pane_text_area_of` → `grid_cells`）へ寄せて `late_resize=false` へ
+- 実測で**否定**した仮説（周回防止）: 器（tmux）はリサイズで画面を消さない（`ED 2` 0 回・
+  再描画は 3〜5 チャンクに割れるが全体 0.1〜0.4ms）/ 実 claude の TUI は SIGWINCH で
+  消えない（tmux 越し 4.7ms 刻みで一度も半分未満にならない）/ タブ切り替え・分割比変更・
+  ウィンドウ寸法変更でグリッドが空になることは無い（1〜5ms 刻みで `grid_blackouts=0`）
+- visual-test `flicker` へ過渡期 4 ラウンドを常設（tab-switch / pane-resize /
+  window-resize / hidden-resize）。実フレームのインクの谷 + **グリッドの高頻度トレース**
+  （実フレームは 1 枚 100ms 級で短い過渡期を取りこぼすため）の 2 目盛りで測る
+- 検証: A/B は `TAKO_932_NO_OFFSCREEN_GEOMETRY=1`（同一バイナリで旧挙動 = FAILED）。
+  fmt / clippy（両 feature）/ test --workspace / 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` /
+  Windows クロスチェック エラー 0・警告 12（main 同数）
+- 次: ユーザー実機での症状消失の確認（#932 のクローズは master 判断）
+
 ## 2026-08-24（#927 追い込み: Issue / PR の本文とコメントの実名マスクを機械的に完了）
 - **GitHub 検索は取りこぼす**（`in:comments` は 11 件しか挙げないが実際は 20 件）ので、
   bulk endpoint（`/issues/comments` / `/pulls/comments`）で**全 1306 コメントを走査**した。

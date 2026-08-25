@@ -13,6 +13,16 @@
 //! IPC・`tako` CLI の e2e）と Phase 3 の内蔵 MCP サーバー（Streamable HTTP +
 //! stdio ブリッジ）、Phase 3.5 の IME 変換状態（marked text）を機械検証して終了する。
 
+// Windows: release ビルドを GUI サブシステムでリンクする（#586）。
+// Rust 既定の console サブシステムのままだと、コンソールを持たない親
+// （エクスプローラー / スタートメニュー）から起動されたときに OS が exe 用の
+// コンソールを新規作成し、GUI とは別に黒いウィンドウが開いて診断ログが流れる。
+// debug ビルドはコンソールを残す（`cargo run` で開発ログを見られるようにするため）。
+// この属性は Windows 以外のターゲットでは無視されるので macOS には影響しない。
+// stdout / stderr が捨てられる前提になるため、残すべき診断は persist.log 側へ書く
+// （`persist_diag`）。子プロセス側の対策は `platform::process::no_console_window`
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod about_window;
 mod autorename;
 mod chat_view;
@@ -132,6 +142,12 @@ const MENU_BAR_HEIGHT: f32 = 30.0;
 const fn top_chrome_height() -> f32 {
     MENU_BAR_HEIGHT + TAB_BAR_HEIGHT
 }
+/// 人工ちらつきの注入（#932。検出力の実証用。既定は無効）
+fn inject_flicker() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TAKO_932_INJECT_FLICKER").is_some())
+}
+
 /// ペイン枠線の太さ（px）
 const PANE_BORDER: f32 = 1.0;
 /// ペイン枠の丸め角（px。カンプ準拠）。
@@ -1051,6 +1067,48 @@ fn pane_text_area_rect(
     )
 }
 
+/// テキスト領域に収まる端末グリッド（cols, rows）を求める（#647 で共通化）。
+///
+/// 表示中ペイン（`render_pane`）と非表示ペイン（`sync_offscreen_pane_sizes`）が
+/// 同じ式を使うことを型で保証するために切り出した。両者がずれると
+/// 「タブを表示した瞬間に grid が変わる」= 描画崩れの原因になる。
+///
+/// 急速リサイズで area が極小・負になる場合に備えて 0 クランプする（#385）。
+/// セル寸法が 0 以下（計測失敗）のときは 0 を返し、呼び出し側の
+/// `TerminalSession::resize` の下限クランプ（2）に委ねる
+fn grid_cells(area: Size<Pixels>, cell: Size<Pixels>) -> (usize, usize) {
+    let area_w = f32::from(area.width).max(0.0);
+    let area_h = f32::from(area.height).max(0.0);
+    let cell_w = f32::from(cell.width);
+    let cell_h = f32::from(cell.height);
+    let cols = if cell_w > 0.0 {
+        (area_w / cell_w).floor() as usize
+    } else {
+        0
+    };
+    let rows = if cell_h > 0.0 {
+        (area_h / cell_h).floor() as usize
+    } else {
+        0
+    };
+    (cols, rows)
+}
+
+/// `TakoApp::offscreen_areas` の作り直し条件（#932）。
+/// (コンテンツ矩形, タブ数, 端末数, stale バナー数, カードの有無, 拡大率のビット列)
+type OffscreenAreaKey = (Bounds<Pixels>, usize, usize, usize, bool, u32);
+
+/// 裏タブのペインを「表に出たときの寸法」へ合わせるのを切って、同じバイナリで
+/// A/B を取る逃げ道（`TAKO_932_NO_OFFSCREEN_GEOMETRY=1`）。
+///
+/// 切ると #647 の挙動（= 最後に描かれたときの領域を使う）へ戻る。幾何が変わった
+/// あとで表に出すと切り替えの瞬間にリサイズが走る（#932 の症状）ので、
+/// 検出力の実証と切り分けに使う。既定は有効（未設定 = 表に出たときの寸法へ合わせる）
+fn offscreen_geometry_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_932_NO_OFFSCREEN_GEOMETRY").is_some())
+}
+
 /// 未確定文字列（marked text）のハイライト区間を組む（FR-1.9）。
 ///
 /// ハイライト範囲は重複禁止（`StyledText` の要求）なので、注目文節の前・文節・後の
@@ -1280,6 +1338,20 @@ struct TakoApp {
     drag_scroll: Option<DragScrollState>,
     /// 直近 render でのアクティブタブ各ペインのテキスト領域（マウス座標→セル変換用）
     pane_text_areas: Vec<(PaneId, Bounds<Pixels>)>,
+    /// ペインごとの「最後に描画されたときのテキスト領域」（#647）。
+    /// `pane_text_areas` は表示中タブの分だけを持つ（マウス座標の誤ヒットを防ぐため
+    /// 非表示タブの分は毎 render で捨てる）。一方で PTY / グリッドのリサイズは
+    /// `render_pane` の副作用なので、それだけでは**非表示タブのペインへ寸法変更が
+    /// 一切届かない**。ここに残しておくことで、フォントサイズ変更のように
+    /// 「area は変わらないがセル寸法が変わる」ときにも全ペインへ反映できる。
+    /// ペインを閉じたときだけ捨てる
+    pane_last_text_areas: HashMap<PaneId, Bounds<Pixels>>,
+    /// 非表示ペインの「表に出たときのテキスト領域」（#932）。
+    /// 材料（コンテンツ矩形・タブ数・端末数・バナー数・カードの有無・拡大率）が
+    /// 変わったときと、2 秒に 1 回だけ作り直す
+    offscreen_areas: Option<(OffscreenAreaKey, HashMap<PaneId, Bounds<Pixels>>)>,
+    /// `offscreen_areas` を最後に作り直した時刻（取りこぼしの保険。#932）
+    offscreen_areas_at: std::time::Instant,
     /// ペインを並べるコンテナ（絶対配置ペインの containing block）の実描画矩形。
     /// ウィンドウ単位（#339 の複数ウィンドウは同一 entity を共有するためキーが要る）。
     /// #684: ここが「正」。詳細は `PaneContentGeometry`
@@ -1509,6 +1581,11 @@ struct TakoApp {
     /// false になると下線オーバーレイが描画されない。カーソル非表示ペインでも
     /// true であることをセルフテスト 76c / 76d が固定する
     ime_overlay_anchored: bool,
+    /// 直近に組み立てた未確定文字列の**実フォントサイズ**（#940 の回帰検出用）。
+    /// `ime_preedit_text`（唯一の組み立て地点）が書くので、ここに載る値は
+    /// 画面に出た字の大きさそのもの。セルフテスト項目 125 がペインの
+    /// フォントサイズと一致することを固定する
+    ime_preedit_font_size: std::cell::Cell<Option<f32>>,
     /// アプリ内テキスト入力のキャレットが**実際に描かれた**矩形（ウィンドウ座標。#561）。
     /// 変換候補ウィンドウの位置出し（`bounds_for_range`）に使う。
     /// paint フェーズでしか分からないので `Rc<Cell>` で render から書き戻す
@@ -1610,6 +1687,8 @@ struct TakoApp {
     chrome_views: HashMap<view_cache::ChromePart, gpui::Entity<view_cache::Chrome>>,
     /// ペイン本体を実際に描き直した回数（#786 の効果検証用。単調増加）
     pane_body_renders: u64,
+    /// 人工ちらつきの注入フレーム数（#932。`TAKO_932_INJECT_FLICKER=1` のときだけ動く）
+    flicker_inject_frames: u64,
     /// ペインヘッダを実際に描き直した回数（#803 の効果検証用。単調増加）
     pane_header_renders: u64,
     /// クロームを実際に描き直した回数（同上）
@@ -2334,6 +2413,10 @@ async fn batch_term_events(
         // グリッドを読む直前にゲートを倒す（#816）
         release_wakeup_gate(gate);
         let applied = this.update(cx, |app: &mut TakoApp, cx| {
+            // #643: 高頻度のメインスレッド経路なのに計測の外にあった。
+            // perf.log に出しておかないと「UI ストール」の原因分類で
+            // 「計測区間なし = 再開経路の遅延」へ誤って倒れる
+            let _span = tako_control::diag::perf_span("term_events");
             if wakeup {
                 app.on_term_event(
                     pane_id,
@@ -3118,7 +3201,11 @@ impl TakoApp {
             selecting: None,
             drag_scroll: None,
             pane_text_areas: Vec::new(),
+            pane_last_text_areas: HashMap::new(),
+            offscreen_areas: None,
+            offscreen_areas_at: std::time::Instant::now(),
             pane_content: HashMap::new(),
+            flicker_inject_frames: 0,
             pane_text_area_probes: HashMap::new(),
             pane_text_area_drift_logged: HashMap::new(),
             pane_content_probes: HashMap::new(),
@@ -3235,6 +3322,7 @@ impl TakoApp {
             git_feedback: None,
             git_busy: None,
             ime_overlay_anchored: false,
+            ime_preedit_font_size: std::cell::Cell::new(None),
             text_input_caret_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             git_commit_input_focused: false,
             git_branch_confirm: None,
@@ -3523,8 +3611,12 @@ impl TakoApp {
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
             if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
-                // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する
+                // 最初のペインすら開けない環境では使いようがない。SIGABRT ではなく明示終了する。
+                // #586: GUI サブシステム（Windows release）では stderr が捨てられ、
+                // 「起動したのに何も出ずに落ちた」になるためファイルにも残す
+                // （persist_diag はセルフテスト中は書かないので eprintln も残す）
                 eprintln!("fatal: 最初のシェルを起動できない: {e}");
+                persist_diag(&format!("fatal: 最初のシェルを起動できない: {e}"));
                 std::process::exit(1);
             }
         } else {
@@ -3650,7 +3742,9 @@ impl TakoApp {
                 && app.previews.is_empty()
                 && app.pending_webview_restore.is_empty()
             {
+                // #586: 同上（無音死を避けるため persist.log にも残す）
                 eprintln!("fatal: 復元したペインを 1 つも起動できない");
+                persist_diag("fatal: 復元したペインを 1 つも起動できない");
                 std::process::exit(1);
             }
             let report = format!(
@@ -3866,31 +3960,43 @@ impl TakoApp {
                 if !event_triggered && !timer_triggered {
                     continue;
                 }
-                let (should_scan, backends) = this
+                // #728: 走査対象は「器のセッション」と「器を持たないペインの PTY 子 pid」の
+                // 両方。以前は前者が空なら丸ごとスキップしていたので、psmux 未導入の
+                // Windows（と tmux 不在の macOS）ではカタログも resume マップも永久に空だった
+                let (should_scan, backends, pane_pids) = this
                     .update(cx, |app: &mut TakoApp, _| {
+                        let mut backends: Vec<String> = Vec::new();
+                        // 器を持たないペインの (tako ペイン ID, PTY 直下の子 pid)
+                        let mut pane_pids: Vec<(u64, u32)> = Vec::new();
+                        for (pane, session) in &app.terminals {
+                            match app.backend_sessions.get(pane) {
+                                Some(backend) => backends.push(backend.clone()),
+                                None => pane_pids
+                                    .extend(session.child_pid().map(|pid| (pane.as_u64(), pid))),
+                            }
+                        }
                         let should = app.tmux_persist
                             && !app.secondary
-                            && !app.backend_sessions.is_empty()
+                            && !(backends.is_empty() && pane_pids.is_empty())
                             && std::env::var_os("TAKO_SELF_TEST").is_none();
-                        let bs: Vec<String> = if should {
-                            app.backend_sessions.values().cloned().collect()
-                        } else {
-                            Vec::new()
-                        };
-                        (should, bs)
+                        match should {
+                            true => (true, backends, pane_pids),
+                            false => (false, Vec::new(), Vec::new()),
+                        }
                     })
-                    .unwrap_or((false, Vec::new()));
+                    .unwrap_or((false, Vec::new(), Vec::new()));
                 if !should_scan {
                     last_scan = std::time::Instant::now();
                     continue;
                 }
-                // 前段ガード: バックエンドセッションに実行中の子プロセスがなければ
-                // claude も居ないので Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                // 前段ガード: 走査対象に実行中の子プロセスがなければ claude も居ないので
+                // Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                let guard_pids: Vec<u32> = pane_pids.iter().map(|(_, pid)| *pid).collect();
                 let has_children = cx
                     .background_executor()
                     .spawn(async move {
                         let refs: Vec<&str> = backends.iter().map(|s| s.as_str()).collect();
-                        tako_control::agents::count_sessions_with_running_children(&refs) > 0
+                        tako_control::agents::any_target_has_running_children(&refs, &guard_pids)
                     })
                     .await;
                 if !has_children {
@@ -3907,19 +4013,15 @@ impl TakoApp {
                 // セッションカタログの検出（Issue #112 A）の両方を導出する
                 let agents_value = cx
                     .background_executor()
-                    .spawn(async { tako_control::agents::list_agents_with_panes(None) })
+                    .spawn(async move { tako_control::agents::list_agents_for_scan(&pane_pids) })
                     .await;
                 last_scan = std::time::Instant::now();
                 let Ok(agents_value) = agents_value else {
                     continue;
                 };
                 let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
-                let resume_map: HashMap<String, String> = detected
-                    .iter()
-                    .map(|d| (d.tmux_session.clone(), d.session_id.clone()))
-                    .collect();
                 let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
-                    app.apply_claude_resume_sessions(&resume_map);
+                    app.apply_claude_resume_sessions(&detected);
                     app.save_layout();
                     app.collect_pane_meta_snapshots()
                 });
@@ -3937,13 +4039,22 @@ impl TakoApp {
                             }
                             // #390: worker レジストリへも session_id を反映
                             // （prompt 到達の証跡。未変更ならファイル書き込みしない）
+                            // #728: 器が無ければペイン ID キーで引く
                             for d in &detected {
-                                if let Err(e) =
-                                    tako_control::orchestrator::registry::record_session_detected(
-                                        &d.tmux_session,
-                                        &d.session_id,
-                                    )
-                                {
+                                use tako_control::orchestrator::registry;
+                                let result = match (&d.tmux_session, d.pane) {
+                                    (Some(ts), _) => {
+                                        registry::record_session_detected(ts, &d.session_id)
+                                    }
+                                    (None, Some(pane)) => {
+                                        registry::record_session_detected_by_pane(
+                                            pane,
+                                            &d.session_id,
+                                        )
+                                    }
+                                    (None, None) => Ok(()),
+                                };
+                                if let Err(e) = result {
                                     eprintln!(
                                         "warning: worker レジストリの session 反映に失敗: {e}"
                                     );
@@ -3957,17 +4068,27 @@ impl TakoApp {
         .detach();
 
         // UI ストールウォッチドッグ（Issue #113 診断）: この async タスクは UI スレッド
-        // （foreground executor）上で走るため、1 秒 timer からの再開遅延 = 「UI スレッドが
-        // 他の処理で塞がっていた時間」になる。しきい値超えを perf.log に記録し、
+        // （foreground executor）上で走るため、1 秒 timer からの再開遅延には「UI スレッドが
+        // 塞がっていた時間」が含まれる。しきい値超えを perf.log に記録し、
         // 次に無応答が起きたとき時刻と長さがファイルに残るようにする（正常時は何も書かない）
+        //
+        // #643: ただし再開遅延には**再開経路そのものの遅延**も混ざる（Windows では
+        // timer が WinRT スレッドプール、再開がメインスレッドのキュー）。この値だけを
+        // 「UI ストール」と呼ぶと、マシンが他所で飽和しているだけの状況を tako の
+        // 専有と誤認する。素の OS スレッドの sleep 超過（スケジューラ遅延）と
+        // 実行中の計測区間を突き合わせて分類してから記録する
         cx.spawn(async move |this, cx| loop {
             let t0 = std::time::Instant::now();
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let lag = t0.elapsed().saturating_sub(Duration::from_secs(1));
+            // 毎周回 take する（記録するときだけ取ると古いピークが混ざる）
+            let sched_lag = tako_control::diag::take_scheduler_lag_peak();
             if lag >= Duration::from_millis(500) {
-                tako_control::diag::perf_log(&format!(
-                    "UI ストール: イベントループ再開が {:.2}s 遅延",
-                    lag.as_secs_f64()
+                let span = tako_control::diag::current_span_snapshot();
+                tako_control::diag::perf_log(&tako_control::diag::classify_stall(
+                    lag,
+                    sched_lag,
+                    span.as_ref().map(|(tag, ms)| (tag.as_str(), *ms)),
                 ));
             }
             // View 破棄でループ終了（他の定期ループと同じ生存判定）
@@ -6312,6 +6433,8 @@ impl TakoApp {
                 // 1 件目は即処理（打鍵の反応 = レイテンシ優先）
                 if this
                     .update(cx, |app: &mut TakoApp, cx| {
+                        // #643: まとめ処理側（`batch_term_events`）と同じタグで計測する
+                        let _span = tako_control::diag::perf_span("term_events");
                         app.on_term_event(pane_id, event, cx);
                     })
                     .is_err()
@@ -7197,6 +7320,7 @@ impl TakoApp {
                 self.scroll_ctls.remove(&pane_id);
                 self.pane_font_sizes.remove(&pane_id);
                 self.pane_cell_sizes.remove(&pane_id);
+                self.pane_last_text_areas.remove(&pane_id);
                 self.pane_text_area_probes.remove(&pane_id);
                 self.pane_text_area_drift_logged.remove(&pane_id);
                 self.dock_webview_of(pane_id);
@@ -7582,18 +7706,36 @@ impl TakoApp {
         }
     }
 
-    /// 1 回の `claude agents --json` 成功結果を現在の backend ペインへ反映する。
+    /// 1 回の `claude agents --json` 成功結果を「ペイン → claude セッション」へ落とす
+    /// （layout.json に保存し、復元時の `claude --resume` に使う。#652）。
     /// 成功結果に存在しないペインは Claude が終了済みなので関連を外し、次回 PC 起動で
     /// 古い会話を勝手に resume しない。スキャン自体が失敗した場合は呼ばれない。
-    fn apply_claude_resume_sessions(&mut self, by_backend: &HashMap<String, String>) {
-        self.claude_resume_sessions = self
-            .backend_sessions
+    ///
+    /// #728: 器のセッション名だけでなく**ペイン ID 直付け**の検出も受ける。
+    /// 器が無い構成ではセッション名が付かず、以前はここで全部こぼれていた
+    fn apply_claude_resume_sessions(
+        &mut self,
+        detected: &[tako_control::sessions::DetectedSession],
+    ) {
+        let by_backend: HashMap<&str, &str> = detected
             .iter()
-            .filter_map(|(pane, backend)| {
-                by_backend
-                    .get(backend)
-                    .filter(|id| tako_control::transcript::is_valid_session_id(id))
-                    .map(|id| (*pane, id.clone()))
+            .filter_map(|d| Some((d.tmux_session.as_deref()?, d.session_id.as_str())))
+            .collect();
+        let by_pane: HashMap<u64, &str> = detected
+            .iter()
+            .filter_map(|d| Some((d.pane?, d.session_id.as_str())))
+            .collect();
+        self.claude_resume_sessions = self
+            .terminals
+            .keys()
+            .filter_map(|pane| {
+                let id = self
+                    .backend_sessions
+                    .get(pane)
+                    .and_then(|backend| by_backend.get(backend.as_str()))
+                    .or_else(|| by_pane.get(&pane.as_u64()))?;
+                tako_control::transcript::is_valid_session_id(id)
+                    .then(|| (*pane, (*id).to_string()))
             })
             .collect();
     }
@@ -7763,14 +7905,20 @@ impl TakoApp {
         mgr.flush_close(pane.as_u64(), &data.meta, &data.visible, origin, caller);
     }
 
-    /// カタログ同期用のペインメタ（Issue #112 A。backend セッション対応のあるペインのみ）
+    /// カタログ同期用のペインメタ（Issue #112 A）。
+    ///
+    /// #728: 対象は**ターミナルを持つ全ペイン**。以前は `backend_sessions`（器のある
+    /// ペイン）だけを見ていたので、器が無い構成（Windows で psmux 未導入 /
+    /// tmux 不在の macOS）では 1 件も返らず、セッションカタログが永久に空になった。
+    /// 器が無いペインは `tmux_session = None` で表す（対応付けは検出側が
+    /// PTY 直下の子 pid で済ませている）
     fn collect_pane_meta_snapshots(&self) -> Vec<tako_control::sessions::PaneMetaSnapshot> {
         let logs = self.pane_logs_lock();
         let mut out = Vec::new();
-        for (pane, backend) in &self.backend_sessions {
+        for (pane, session) in &self.terminals {
             let mut snap = tako_control::sessions::PaneMetaSnapshot {
                 pane: pane.as_u64(),
-                tmux_session: backend.clone(),
+                tmux_session: self.backend_sessions.get(pane).cloned(),
                 ..Default::default()
             };
             for tab in self.workspace.tabs() {
@@ -7793,11 +7941,7 @@ impl TakoApp {
                     snap.title = bp.pane().title().map(str::to_string);
                 }
             }
-            snap.cwd = self
-                .terminals
-                .get(pane)
-                .and_then(|s| s.cwd())
-                .map(|p| p.display().to_string());
+            snap.cwd = session.cwd().map(|p| p.display().to_string());
             snap.log_file = logs.path_of(pane.as_u64()).map(|p| p.display().to_string());
             out.push(snap);
         }
@@ -10497,6 +10641,24 @@ impl TakoApp {
                 }
                 // ここで処理済みを宣言しないと、macOS が未処理キーを IME（input handler）へ
                 // 回送し insertText → replace_text_in_range で二重入力になる（FR-1.9）
+                //
+                // #623 の診断: ここを通ると Windows では GPUI の translate_accelerator が
+                // TranslateMessage / DispatchMessageW を飛ばすため、その打鍵は IME へ
+                // 一切届かなくなる。変換中に出ていたら「打鍵が消える」症状の犯人
+                //
+                // ## 調査済み: 変換中の打鍵はここへ来ない（#623。再調査しないこと）
+                //
+                // 「IME が食った打鍵まで奪っているのでは」という筋は**否定済み**。
+                // IME が処理する打鍵の WM_KEYDOWN は wParam = `VK_PROCESSKEY`(0xE5) で来るが、
+                // GPUI の `handle_key_event` に 0xE5 の分岐は無く `parse_normal_key` へ落ちる。
+                // そこでキー名を解決する `get_key_from_vkey` は
+                // `MapVirtualKeyW(0xE5, MAPVK_VK_TO_CHAR)` を使い、**実機で戻り値 0** を確認した
+                // （比較: 'N'(0x4E)=78 / Enter(0x0D)=13）。0 は解決不能なので
+                // `parse_normal_key` は `None` を返し、`handle_keydown_msg` は
+                // 「未処理」(`Some(1)`) を返す。よって translate_accelerator は素通りし、
+                // TranslateMessage / DispatchMessageW が走って IME へ正しく届く。
+                // 実測でも、実 IME で変換中にこの診断行が出るのは Esc のときだけだった
+                ime_diag_event("handle_key(ターミナルへ書き込み・IME を飛ばす)", 0);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -10665,7 +10827,24 @@ impl TakoApp {
     /// **ウィンドウ側のオーバーレイとチャット入力欄のインライン表示が共有する
     /// 唯一の実装**。2 か所で組み立てていると、片方だけ直して見た目が食い違う
     /// （#29 / #497 で実際に起きた壊れ方）
-    fn ime_preedit_text(&self, text: String) -> gpui::StyledText {
+    ///
+    /// #940: 字の大きさは**変換先ペインの**フォントサイズに追従させる。
+    ///
+    /// 以前はテーマ既定（`text_style()`）を固定参照していたため、cmd+= でペインを
+    /// 拡大しても未確定文字列だけ既定サイズのまま小さく描かれていた
+    /// （周囲のターミナル本文は専用 element `TerminalGrid`（#787）が
+    /// `shape_line` へフォントサイズを直接渡すので追従していた）。
+    ///
+    /// **サイズは `TextStyle` ではなく箱の `text_size` で決まる**: gpui の
+    /// `StyledText` はレイアウトで `window.text_style()`（= 祖先から降ってくる
+    /// ambient なスタイル）からフォントサイズを取り、`TextRun` は
+    /// フォント族・色・下線しか運ばない（サイズを持たない）。
+    /// なので `with_default_highlights` に大きいサイズの style を渡しても字は大きくならない。
+    /// ここが「1 実装を共有する」地点なので、**箱ごと**返して呼び出し側が
+    /// 取りこぼせないようにしてある。
+    ///
+    /// `TAKO_940_LEGACY=1` で修正前（テーマ既定を固定参照）へ戻せる = 同一バイナリで A/B が取れる
+    fn ime_preedit_text(&self, text: String, pane: PaneId) -> gpui::Div {
         let highlights = ime_highlight_ranges(
             &text,
             self.ime
@@ -10673,7 +10852,28 @@ impl TakoApp {
                 .and_then(|ime| ime.selected_utf16.as_ref()),
             &self.theme,
         );
-        StyledText::new(text).with_default_highlights(&self.text_style(), highlights)
+        let legacy = std::env::var_os("TAKO_940_LEGACY").is_some();
+        let (style, fs, lh) = if legacy {
+            (
+                self.text_style(),
+                self.theme.font_size,
+                self.theme.line_height,
+            )
+        } else {
+            (
+                self.pane_text_style(pane),
+                self.pane_font_size(pane),
+                self.pane_line_height(pane),
+            )
+        };
+        // 実際に使ったサイズを控える（セルフテスト項目 125 の回帰検出用。
+        // ここが唯一の組み立て地点なので、控えた値は「画面に出た字の大きさ」そのもの）
+        self.ime_preedit_font_size.set(Some(fs));
+        div()
+            .flex_none()
+            .text_size(px(fs))
+            .line_height(px(lh))
+            .child(StyledText::new(text).with_default_highlights(&style, highlights))
     }
 
     /// 未確定文字列の先頭から指定プレフィックスまでの描画幅（候補ウィンドウの位置出し用）
@@ -10825,17 +11025,34 @@ impl TakoApp {
                 continue;
             }
             self.pane_text_area_drift_logged.insert(pane, rounded);
+            // #932: **ずれた軸を必ず出す**。以前は y と高さだけを出していたので、
+            // 横方向（サイドバー幅ぶん等）にずれたときは「ずれ 362px」なのに
+            // 併記した数値が完全一致していて、ログだけでは何も追えなかった
+            let axis = [
+                ("x", d(used.origin.x, real.origin.x)),
+                ("y", d(used.origin.y, real.origin.y)),
+                ("w", d(used.size.width, real.size.width)),
+                ("h", d(used.size.height, real.size.height)),
+            ]
+            .into_iter()
+            .filter(|(_, v)| *v >= 1.0)
+            .map(|(n, v)| format!("{n}={:.0}", v))
+            .collect::<Vec<_>>()
+            .join(" ");
+            let fmt = |b: Bounds<Pixels>| {
+                (
+                    f32::from(b.origin.x).round(),
+                    f32::from(b.origin.y).round(),
+                    f32::from(b.size.width).round(),
+                    f32::from(b.size.height).round(),
+                )
+            };
             tako_control::diag::perf_log(&format!(
-                "テキスト領域の会計漏れ: pane={} ずれ {rounded}px（算術 {:?} / 実描画 {:?}。#781）",
+                "テキスト領域の会計漏れ: pane={} ずれ {rounded}px（{axis}。\
+                 算術 {:?} / 実描画 {:?} = (x, y, w, h)。#781）",
                 pane.as_u64(),
-                (
-                    f32::from(used.origin.y).round(),
-                    f32::from(used.size.height).round()
-                ),
-                (
-                    f32::from(real.origin.y).round(),
-                    f32::from(real.size.height).round()
-                ),
+                fmt(used),
+                fmt(real),
             ));
         }
     }
@@ -13394,6 +13611,164 @@ impl TakoApp {
         cell
     }
 
+    /// 表示中タブに居ないペインへも新しいセル寸法を反映する（#647）。
+    ///
+    /// PTY / グリッドのリサイズは `render_pane` の副作用なので、`render_pane` が
+    /// 走らないペイン（= どのウィンドウでも表示されていないタブのペイン）には
+    /// 寸法変更が届かない。フォントサイズを変えると表示中タブだけが新しい
+    /// cols/rows になり、他タブのペインは**古いセル寸法で計算した grid のまま**
+    /// 取り残される。そこで全画面 TUI（claude 等）を動かしていると、そのタブを
+    /// 表示した瞬間に grid が縮んで描画が崩れ、ウィンドウをリサイズして
+    /// もう一度リサイズが走るまで直らない。
+    ///
+    /// 面積は「最後に描画されたときの領域」を使う。タブが隠れてもウィンドウの
+    /// 大きさは変わらないので、次に表示されたときの領域と一致する。
+    ///
+    /// 一度も描画されていないペインだけは [`Self::hidden_tab_pane_areas`] で
+    /// レイアウトから割り出す
+    fn sync_offscreen_pane_sizes(&mut self, content: Bounds<Pixels>, window: &mut Window) {
+        // 表示中でないターミナルペイン。これが空なら（= 単一タブ運用）何もしない。
+        // render は毎フレーム通るので、ここから先の計算は必要なときだけ行う
+        let offscreen: Vec<PaneId> = self
+            .terminals
+            .keys()
+            .copied()
+            .filter(|pid| !self.pane_text_areas.iter().any(|(p, _)| p == pid))
+            .collect();
+        if offscreen.is_empty() {
+            return;
+        }
+        let scale_factor = window.scale_factor();
+        let default_cell = self.measure_cell(window);
+        // #932: 「表に出たときの領域」を**表示中とまったく同じ会計**で割り出しておく
+        self.refresh_offscreen_pane_areas(content, scale_factor, default_cell);
+        for pane_id in offscreen {
+            // 表示中ペインと同じ経路でセル寸法を決める（ペイン単位のズームも尊重する）
+            let cell = if self.pane_font_sizes.contains_key(&pane_id) {
+                self.measure_pane_cell(pane_id, window)
+            } else {
+                default_cell
+            };
+            // #932: **表に出たときの領域が正**。#647 は「最後に描かれたときの領域」を
+            // 使っていたが、それだとウィンドウ寸法・サイドバー幅が変わったあとも
+            // 古い寸法のまま残り、表に出した瞬間にリサイズ = SIGWINCH が飛ぶ。
+            // どのタブにも居ないペイン（たまり場）だけ、最後に描かれた領域へ落とす
+            let derived = self
+                .offscreen_areas
+                .as_ref()
+                .and_then(|(_, areas)| areas.get(&pane_id).copied());
+            let last = self.pane_last_text_areas.get(&pane_id).copied();
+            let area = if offscreen_geometry_disabled() {
+                last.or(derived)
+            } else {
+                derived.or(last)
+            };
+            let Some(area) = area else {
+                continue;
+            };
+            let (cols, rows) = grid_cells(area.size, cell);
+            if let Some(session) = self.terminals.get_mut(&pane_id) {
+                session.resize(
+                    cols,
+                    rows,
+                    f32::from(cell.width).round() as u16,
+                    f32::from(cell.height).round() as u16,
+                );
+            }
+        }
+    }
+
+    /// どのウィンドウでも表示されていないタブのペインについて、**表示されたときの**
+    /// テキスト領域を割り出す（#647 / #932）。
+    ///
+    /// 積み上げ（タイトルバー / stale バナー #781 / カード帯 #703）は
+    /// [`Self::pane_text_area_of`] を通すので**表示中とまったく同じ**になる。
+    /// ここを簡略化すると割り出した寸法と表示時の寸法が食い違い、
+    /// 表に出した瞬間に改めてリサイズが走る（= #932 の症状が戻る）。
+    ///
+    /// 毎フレーム作り直す必要は無いので、材料が変わったときと 2 秒に 1 回だけ回す
+    /// （分割比の変更のように材料に現れない変化を取りこぼさないための保険）
+    fn refresh_offscreen_pane_areas(
+        &mut self,
+        content: Bounds<Pixels>,
+        scale_factor: f32,
+        default_cell: Size<Pixels>,
+    ) {
+        let key: OffscreenAreaKey = (
+            content,
+            self.workspace.tabs().len(),
+            self.terminals.len(),
+            self.stale_binary_banners.len(),
+            !self.command_cards.is_empty(),
+            scale_factor.to_bits(),
+        );
+        let fresh = self.offscreen_areas_at.elapsed() < Duration::from_secs(2);
+        if fresh
+            && self
+                .offscreen_areas
+                .as_ref()
+                .is_some_and(|(k, _)| *k == key)
+        {
+            return;
+        }
+        let displayed: std::collections::HashSet<TabId> = self
+            .workspace
+            .windows()
+            .iter()
+            .map(|w| w.active_tab())
+            .collect();
+        let hidden: Vec<Vec<(PaneId, Rect)>> = self
+            .workspace
+            .tabs()
+            .iter()
+            .filter(|t| !displayed.contains(&t.id()))
+            .map(|t| t.tree().layout(Rect::UNIT))
+            .collect();
+        let mut areas = HashMap::new();
+        for layout in hidden {
+            for (id, r) in layout {
+                let area = self.pane_text_area_of(id, content, r, scale_factor, default_cell);
+                areas.insert(id, area);
+            }
+        }
+        self.offscreen_areas = Some((key, areas));
+        self.offscreen_areas_at = std::time::Instant::now();
+    }
+
+    /// ペイン 1 枚のテキスト領域（`pane_text_areas` に入る矩形）を組む。
+    ///
+    /// テキスト領域はタイトルバー（`PANE_TITLE_BAR`）の下から始まる。#781: stale claude
+    /// バナー（#498）もヘッダとテキスト領域のあいだに積まれる**流れの中の要素**なので
+    /// ここで一緒に会計する（引き忘れるとドラッグ選択・IME 位置・PTY 行数が同時にずれる）。
+    /// AI コマンド提案カードの帯（#703）はテキスト領域の**外**（下）なので先に差し引く。
+    ///
+    /// #932: 表示中のタブ（`render()` の `new_areas`）と、表示されていないタブの割り出し
+    /// （[`Self::refresh_offscreen_pane_areas`]）が**この 1 本**を通る。片方だけ変えると
+    /// 「裏で合わせた寸法」と「表に出たときの寸法」が食い違い、切り替えの瞬間に
+    /// またリサイズが走る
+    fn pane_text_area_of(
+        &mut self,
+        pane_id: PaneId,
+        content: Bounds<Pixels>,
+        r: Rect,
+        scale_factor: f32,
+        default_cell: Size<Pixels>,
+    ) -> Bounds<Pixels> {
+        let stacked_top = PANE_TITLE_BAR + self.stale_banner_height(pane_id);
+        let full = pane_text_area_rect(content, r, stacked_top, 0.0, scale_factor);
+        let cell_h = self
+            .cell_size_for_pane(pane_id)
+            .map(|c| f32::from(c.height))
+            .unwrap_or(f32::from(default_cell.height));
+        let band = self.card_band_height(
+            pane_id,
+            f32::from(full.size.height),
+            f32::from(full.size.width),
+            cell_h,
+        );
+        pane_text_area_rect(content, r, stacked_top, band, scale_factor)
+    }
+
     const FONT_SIZE_MIN: f32 = 8.0;
     const FONT_SIZE_MAX: f32 = 32.0;
     const FONT_SIZE_STEP: f32 = 1.0;
@@ -13674,6 +14049,26 @@ impl TakoApp {
         } else {
             theme.line_height
         };
+        // #947: 字の大きさは**箱の `text_size`** で決まる。gpui の `StyledText` は
+        // レイアウトで `window.text_style()`（祖先から降る ambient なスタイル）から
+        // フォントサイズを取り、`with_default_highlights` へ渡す `TextRun` は
+        // フォント族・色・下線しか運ばない（サイズを持たない）。つまり
+        // `default_style` に per-pane のサイズを積んでも**それだけでは効かない**。
+        // 直さないと「箱（`line_h`）は伸びたのに字はテーマ既定のまま」になり、
+        // たまり場のサムネイル・ホバープレビュー・チャット入力欄のミラーが
+        // 拡大したペインで小さい字のまま並ぶ（#940 とまったく同じ機序）。
+        // `TAKO_947_LEGACY=1` で修正前（箱に載せない）へ戻せる = 同一バイナリで A/B が取れる。
+        //
+        // **オーバーライドが無いペインには載せない**: 既定サイズでは `text_size` は
+        // ルートの ambient と同値なので載せても何も変わらないが、`line_height` は
+        // ルートが設定していない（= gpui の既定の倍率）ため、明示すると既定サイズの
+        // 縦位置が 1 px 級で動く。壊れていない側を動かさないため、
+        // 直すのは食い違いが起きている「ペイン独自サイズ」の場合だけにする
+        let box_font_size = if has_custom_font && std::env::var_os("TAKO_947_LEGACY").is_none() {
+            Some(self.pane_font_size(pane_id))
+        } else {
+            None
+        };
         let cell_width = self
             .pane_cell_sizes
             .get(&pane_id)
@@ -13699,10 +14094,16 @@ impl TakoApp {
                         .iter()
                         .map(|run| (run.range.clone(), self.run_highlight(run)))
                         .collect();
-                    return div().h(px(line_h)).whitespace_nowrap().child(
-                        StyledText::new(line.text)
-                            .with_default_highlights(&default_style, highlights),
-                    );
+                    return div()
+                        .h(px(line_h))
+                        .when_some(box_font_size, |d, fs| {
+                            d.text_size(px(fs)).line_height(px(line_h))
+                        })
+                        .whitespace_nowrap()
+                        .child(
+                            StyledText::new(line.text)
+                                .with_default_highlights(&default_style, highlights),
+                        );
                 }
                 // 同スタイルの連続半角文字をグループ化して描画要素数を削減。
                 // 全角文字（char_cols > 1）とセル幅不一致グリフ（snaps == false）は
@@ -13717,6 +14118,9 @@ impl TakoApp {
                 let cw = cell_width.unwrap();
                 let row = div()
                     .h(px(line_h))
+                    .when_some(box_font_size, |d, fs| {
+                        d.text_size(px(fs)).line_height(px(line_h))
+                    })
                     .flex()
                     .flex_row()
                     .overflow_hidden()
@@ -15927,12 +16331,10 @@ impl TakoApp {
             .or(self.cell_size)
             .expect("render 冒頭で実測済み");
 
-        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ。
-        // 急速リサイズで area が極小/負になる場合に備え 0 クランプ（#385）
-        let area_w = f32::from(area.size.width).max(0.0);
-        let area_h = f32::from(area.size.height).max(0.0);
-        let cols = (area_w / f32::from(cell.width)).floor() as usize;
-        let rows = (area_h / f32::from(cell.height)).floor() as usize;
+        // PTY リサイズ追従: テキスト領域に収まる cols/rows へ（式は grid_cells に共通化）。
+        // 非表示タブへも同じ寸法を反映できるよう、領域を控えておく（#647）
+        self.pane_last_text_areas.insert(pane_id, area);
+        let (cols, rows) = grid_cells(area.size, cell);
         if let Some(session) = self.terminals.get_mut(&pane_id) {
             session.resize(
                 cols,
@@ -18381,6 +18783,10 @@ impl EntityInputHandler for TakoApp {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ime_diag_event(
+            "unmark_text",
+            self.ime.as_ref().map(|i| utf16_len(&i.text)).unwrap_or(0),
+        );
         // NSTextInputClient の規約: unmark は「未確定文字列をそのまま挿入扱いにする」
         if let Some(ime) = self.ime.take() {
             // #561: アプリ内テキスト入力宛ての変換はそこへ入れる。
@@ -18432,6 +18838,7 @@ impl EntityInputHandler for TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        ime_diag_event("replace_text_in_range(確定)", utf16_len(text));
         // #561: 変換中のアプリ内テキスト入力があればそこへ確定する。
         // 変換開始時に決めた宛先を使うので、途中でフォーカスが外れても確定先はぶれない
         if let Some(target) = self.ime.as_ref().and_then(|ime| ime.app_input) {
@@ -18540,6 +18947,7 @@ impl EntityInputHandler for TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        ime_diag_event("replace_and_mark(未確定)", utf16_len(new_text));
         // IME は毎回未確定文字列の全文を渡してくるので丸ごと差し替える。
         // 空文字は変換キャンセル（esc）を意味する
         if new_text.is_empty() {
@@ -19065,9 +19473,16 @@ impl Render for TakoApp {
         // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
         // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
         // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
-        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが無い」
-        // 正当な状態は存在しない
-        if window.focused(cx).is_none() {
+        // 復元する多層防御。tako は単一 focus_handle 設計で「フォーカスが自分に無い」
+        // 正当な状態は存在しない。
+        //
+        // #623: 判定を `focused(cx).is_none()`（フォーカスが**どこにも**無い）から
+        // 「自分のハンドルに無い」へ強化した。旧判定は他ハンドルへ移った場合を
+        // 素通りさせるが、`Window::handle_input` の登録条件は
+        // 「自分のハンドルにフォーカスがあること」なので、素通りしたフレームは
+        // 入力ハンドラが未登録になり Windows では未確定文字列が強制確定される。
+        // なお本線の防御は同一フレーム内で効く `ime_guard_frame`（canvas の prepaint）
+        if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle.clone(), cx);
             window.invalidate_character_coordinates();
         }
@@ -19236,29 +19651,9 @@ impl Render for TakoApp {
         let new_areas: Vec<(PaneId, Bounds<Pixels>)> = layout
             .iter()
             .map(|(id, r)| {
-                // テキスト領域はタイトルバー（PANE_TITLE_BAR）の下から始まる。
-                // #781: stale claude バナー（#498）もヘッダとテキスト領域のあいだに
-                // 積まれる**流れの中の要素**なので、ここで一緒に会計する
-                // （引き忘れるとドラッグ選択・IME 位置・PTY 行数が同時にずれる）
-                let stacked_top = PANE_TITLE_BAR + self.stale_banner_height(*id);
-                let full = pane_text_area_rect(content_rect, *r, stacked_top, 0.0, scale_factor);
-                // AI コマンド提案カードの帯（#703）はテキスト領域の**外**（下）に置く。
-                // ここで先に差し引いておくことで、PTY の行数・マウス座標変換・IME 位置が
-                // すべて「カードに隠されていない領域」だけを指すようになる
-                // （= 会話とカードが重なることが構造的に起きない）
-                let cell_h = self
-                    .cell_size_for_pane(*id)
-                    .map(|c| f32::from(c.height))
-                    .unwrap_or(f32::from(cell.height));
-                let band = self.card_band_height(
-                    *id,
-                    f32::from(full.size.height),
-                    f32::from(full.size.width),
-                    cell_h,
-                );
                 (
                     *id,
-                    pane_text_area_rect(content_rect, *r, stacked_top, band, scale_factor),
+                    self.pane_text_area_of(*id, content_rect, *r, scale_factor, cell),
                 )
             })
             .collect();
@@ -19277,6 +19672,9 @@ impl Render for TakoApp {
                 .is_some_and(|t| t != display_tab && visible_tabs.contains(&t))
         });
         self.pane_text_areas.extend(new_areas);
+        // 表示中タブ以外のペインへもセル寸法の変更を届ける（#647）。
+        // pane_text_areas を確定させた直後（= 誰が表示中かが分かった時点）に呼ぶ
+        self.sync_offscreen_pane_sizes(content_rect, window);
 
         let drop_layout = layout.clone();
         // #786: ペイン本体は 1 枚ずつ独立した子ビュー（`PaneBody`）にして
@@ -19463,18 +19861,20 @@ impl Render for TakoApp {
         let ime_overlay = self
             .ime
             .as_ref()
-            .map(|ime| ime.text.clone())
-            .and_then(|text| {
+            .map(|ime| (ime.pane, ime.text.clone()))
+            .and_then(|(pane, text)| {
                 let anchor = ime_anchor?;
-                // 字の見た目は `ime_preedit_text` が正（チャット入力欄のインライン表示と共有）
+                // 字の見た目は `ime_preedit_text` が正（チャット入力欄のインライン表示と共有）。
+                // #940: 箱の高さも**そのペインの**行高に合わせる（テーマ既定のままだと
+                // 拡大したペインで背景が字の高さに足りず、下端が隣の行に食い込む）
                 Some(
                     div()
                         .absolute()
                         .left(anchor.x - content_origin.x)
                         .top(anchor.y - content_origin.y)
-                        .h(px(theme.line_height))
+                        .h(px(self.pane_line_height(pane)))
                         .bg(rgba(theme.background))
-                        .child(self.ime_preedit_text(text)),
+                        .child(self.ime_preedit_text(text, pane)),
                 )
             });
 
@@ -19516,6 +19916,7 @@ impl Render for TakoApp {
         let ime_registration = {
             let entity = cx.entity();
             let focus = self.focus_handle.clone();
+            let guard_focus = self.focus_handle.clone();
             let target = self.ime_target();
             let target_bounds = self
                 .pane_text_areas
@@ -19524,8 +19925,14 @@ impl Render for TakoApp {
                 .map(|(_, b)| *b)
                 .unwrap_or_else(|| Bounds::new(content_origin, content_size));
             canvas(
-                |_, _, _| (),
+                // #623: paint より**前**に、この canvas が確実に入力ハンドラを
+                // 登録できる状態へ整える。詳細は `ime_guard_frame` の doc
+                move |_, window, cx| ime_guard_frame(window, &guard_focus, cx),
                 move |_, _, window, cx| {
+                    // #623: `handle_input` は自分のハンドルにフォーカスがあるときしか
+                    // 登録しない。登録できなかったフレームこそが「IME が壊れる
+                    // フレーム」なので、その回数を数えて観測できるようにする
+                    note_ime_handler_frame(focus.is_focused(window));
                     window.handle_input(
                         &focus,
                         ElementInputHandler::new(target_bounds, entity),
@@ -19824,6 +20231,21 @@ impl Render for TakoApp {
             // メニューバーのドロップダウン（#657）。パレットの手前 = 最上位に置く必要は
             // 無いが、タブバー・ペインより後（= 手前）でなければ隠れる
             .children(self.render_menu_dropdown(window, cx))
+            // #932: 検出力の実証用。`TAKO_932_INJECT_FLICKER=1` のときだけ、
+            // **フレームごとに色が変わる 8px の四角**を最前面の左上に置く
+            // （= 人工のちらつき）。ちらつき検査（`TAKO_VISUAL_ONLY=flicker`）が
+            // これを捕まえられなければ、検査は「動いていないこと」を見ていない
+            .children(inject_flicker().then(|| {
+                self.flicker_inject_frames = self.flicker_inject_frames.wrapping_add(1);
+                let on = self.flicker_inject_frames.is_multiple_of(2);
+                div()
+                    .absolute()
+                    .left(px(2.0))
+                    .top(px(2.0))
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .bg(if on { gpui::red() } else { gpui::green() })
+            }))
     }
 }
 
@@ -20386,6 +20808,173 @@ fn restore_window(window: &mut Window) {
     // 対象ウィンドウのスレッドへポストするだけで、この場でブロックしない
     unsafe {
         ShowWindowAsync(win32.hwnd.get(), SW_RESTORE);
+    }
+}
+
+thread_local! {
+    /// IME 結合状態を最後に IMM32 へ問い合わせた時刻（#623。UI スレッド専用）
+    static IME_ASSOC_PROBED_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// 防御が発火したことを最後に記録した時刻（ログの間引き用）
+    static IME_GUARD_LOGGED_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// `TAKO_IME_DIAG=1` のときに前フレームで観測した状態（遷移だけ記録するため）
+    static IME_DIAG_LAST: std::cell::Cell<Option<(bool, Option<bool>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// IME コールバックの到達順を記録する（`TAKO_IME_DIAG=1` のときだけ）。
+///
+/// **文字列そのものは絶対に出さない**（AGENTS.md の絶対ルール: 送信テキストを
+/// 診断ログへ出さない）。出すのは呼ばれた種別と UTF-16 長だけで、
+/// 「未確定文字列が途中で確定された」「長さが巻き戻った」の判別にはこれで足りる
+fn ime_diag_event(kind: &str, utf16_len: usize) {
+    if ime_diag_enabled() {
+        tako_control::diag::perf_log(&format!("ime-diag: {kind} utf16_len={utf16_len}"));
+    }
+}
+
+/// IME の毎フレーム診断を出すか（`TAKO_IME_DIAG=1`）。既定は無効で、
+/// 有効にすると IMM32 への問い合わせが毎フレームに増える（#623 の追跡用）
+fn ime_diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_IME_DIAG").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 防御の累積発火回数（#623 の実測用。診断ログにだけ出す）
+static IME_REFOCUS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IME_REASSOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `refocus` の累計発火回数（セルフテストの観測用。#623）
+fn ime_refocus_count() -> u64 {
+    IME_REFOCUS_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 入力ハンドラを登録できたフレーム数と、**登録できなかった**フレーム数（#623）。
+///
+/// 後者がこの Issue の核心。1 でも増えたフレームでは GPUI Windows の
+/// `update_ime_enabled()` が「文字入力を受け付けないウィンドウ」と誤認して
+/// 未確定文字列を強制確定し、IME を切り離す
+static IME_HANDLER_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IME_HANDLER_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 入力ハンドラ登録の可否を記録する（`handle_input` を呼ぶ直前に paint から呼ぶ）
+fn note_ime_handler_frame(registered: bool) {
+    IME_HANDLER_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !registered {
+        IME_HANDLER_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// (描いたフレーム数, 入力ハンドラを登録できなかったフレーム数)（セルフテストの観測用）
+fn ime_handler_counts() -> (u64, u64) {
+    (
+        IME_HANDLER_FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+        IME_HANDLER_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// IME 破壊の防御（#623）。`handle_input` を呼ぶ canvas の **prepaint** から毎フレーム走る。
+///
+/// ## 何を防いでいるか
+///
+/// `Window::handle_input` は `focus_handle.is_focused(window)` が真のときしか入力ハンドラを
+/// 登録しない（`gpui/src/window.rs`）。登録が飛んだフレームは draw 末尾でハンドラが
+/// プラットフォームへ戻らず、GPUI Windows の `update_ime_enabled()` が
+/// 「このウィンドウは文字入力を受け付けない」と誤認して
+///
+/// 1. `ImmNotifyIME(NI_COMPOSITIONSTR, CPS_COMPLETE)` = **変換中の未確定文字列を強制確定**
+/// 2. `ImmAssociateContextEx(hwnd, NULL, 0)` = **IME を切り離す**（以後の打鍵が落ちる）
+///
+/// を実行する。ユーザー実機では「ばーじょん」が `ｂーじょん` になるなど、
+/// 未確定文字列が途中で確定し、その打鍵が消える形で現れた。
+///
+/// ## なぜ prepaint なのか
+///
+/// 既存の自己修復（`render` 冒頭 / `on_focus_lost`）はどちらも**このフレームの paint に
+/// 間に合わない**。`on_focus_lost` は draw 末尾で発火し、`render` 冒頭は次の notify 契機。
+/// macOS は「1 フレーム遅れて直る」で実害が無かったが、Windows はその 1 フレームで
+/// `CPS_COMPLETE` が飛ぶため取り返しがつかない。prepaint は同一フレームの paint より
+/// 前に走るので、ここで直せば「ハンドラ未登録のフレーム」自体が発生しない。
+///
+/// tako は単一 `focus_handle` 設計（メインウィンドウの `FocusHandle` はこの 1 個だけ）で、
+/// 「フォーカスが自分に無い」正当な状態は存在しない。よってフォーカスの奪い合いは起きない
+fn ime_guard_frame(window: &mut Window, focus: &FocusHandle, cx: &mut App) {
+    let focus_held = focus.is_focused(window);
+    // `TAKO_IME_DIAG=1` で毎フレーム問い合わせ、状態が変わった瞬間だけ記録する。
+    // 間引いていると「1 フレームだけ切り離されて戻る」振る舞いを取りこぼすため、
+    // #623 のような再現性の低い事象の追跡にはこれが要る
+    let diag = ime_diag_enabled();
+    // IMM32 への問い合わせは毎フレームやる必要が無いので 500ms に 1 回へ間引く。
+    // ただしフォーカスが外れたフレームは GPUI が切り離した直後の可能性が高いので必ず見る
+    let probe = diag
+        || !focus_held
+        || IME_ASSOC_PROBED_AT.with(|at| {
+            let now = std::time::Instant::now();
+            match at.get() {
+                Some(prev) if now.duration_since(prev) < Duration::from_millis(500) => false,
+                _ => {
+                    at.set(Some(now));
+                    true
+                }
+            }
+        });
+    let handle = if probe {
+        native_window_handle(window)
+    } else {
+        None
+    };
+    // probe しないフレームは `None` = 「結合状態は不明」となり、結合には触らない
+    let associated = tako_core::platform::ime::is_associated(handle);
+    if diag {
+        // 状態が変わった瞬間だけ 1 行出す（毎フレーム出すとログが埋まる）
+        IME_DIAG_LAST.with(|last| {
+            let now = (focus_held, associated);
+            if last.get() != Some(now) {
+                last.set(Some(now));
+                tako_control::diag::perf_log(&format!(
+                    "ime-diag: focus_held={focus_held} associated={associated:?}"
+                ));
+            }
+        });
+    }
+    let action = tako_core::platform::ime::guard_action(focus_held, associated);
+    if action.is_noop() {
+        return;
+    }
+    if action.refocus {
+        IME_REFOCUS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        window.focus(focus, cx);
+    }
+    if action.reassociate {
+        IME_REASSOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tako_core::platform::ime::reassociate(handle);
+    }
+    // 発火は異常事象なので記録する。毎フレーム連続で起きうるので 1 秒に 1 行へ間引く。
+    // 出すのは真偽値と回数だけで、未確定文字列は**絶対に出さない**（AGENTS.md の絶対ルール）
+    let should_log = IME_GUARD_LOGGED_AT.with(|at| {
+        let now = std::time::Instant::now();
+        match at.get() {
+            Some(prev) if now.duration_since(prev) < Duration::from_secs(1) => false,
+            _ => {
+                at.set(Some(now));
+                true
+            }
+        }
+    });
+    if should_log {
+        tako_control::diag::perf_log(&format!(
+            "ime-guard: refocus={} reassociate={} (累計 refocus={} reassoc={})",
+            action.refocus,
+            action.reassociate,
+            IME_REFOCUS_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            IME_REASSOC_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ));
     }
 }
 
@@ -21519,6 +22108,71 @@ mod self_test {
         })
         .ok()
         .flatten()
+    }
+
+    /// フレームと**ウィンドウの活性状態**を一緒に採る（#932）。
+    ///
+    /// 「同じ状態なら同じ絵」を検査するので、活性状態は状態の一部として扱う必要がある
+    /// （非活性になるとフォーカス枠・タブの強調・信号機ボタンの色が正しく変わるため、
+    /// 検証中に前面が入れ替わると本物のちらつきと区別できない）
+    #[cfg(feature = "visual-test")]
+    fn capture_frame_active(
+        any: AnyWindowHandle,
+        cx: &mut AsyncApp,
+    ) -> Option<(image::RgbaImage, f32, bool)> {
+        any.update(cx, |_, window, cx| {
+            window.draw(cx).clear();
+            let scale = window.scale_factor();
+            let active = window.is_window_active();
+            match window.render_to_image() {
+                Ok(image) => Some((image, scale, active)),
+                Err(error) => {
+                    eprintln!("TAKO_VISUAL_CAPTURE_ERROR: {error:#}");
+                    None
+                }
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// フレーム 1 枚の指紋（#932）。実ピクセル全体の FNV-1a。
+    #[cfg(feature = "visual-test")]
+    fn frame_fingerprint(frame: &image::RgbaImage) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in frame.as_raw() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// 2 枚のフレームで色が違う画素の数と、その外接矩形（デバイス px。#932）。
+    /// 完全一致なら `None`
+    #[cfg(feature = "visual-test")]
+    fn frame_diff_bbox(
+        a: &image::RgbaImage,
+        b: &image::RgbaImage,
+    ) -> Option<(u32, u32, u32, u32, u64)> {
+        if a.dimensions() != b.dimensions() {
+            let (w, h) = a.dimensions();
+            return Some((0, 0, w, h, u64::from(w) * u64::from(h)));
+        }
+        let (w, h) = a.dimensions();
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut count = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                if a.get_pixel(x, y) != b.get_pixel(x, y) {
+                    count += 1;
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        (count > 0).then_some((x0, y0, x1, y1, count))
     }
 
     /// 実際にインクが乗っているターミナル行の数（#684）。`text_top` から 1 行ずつ
@@ -26194,6 +26848,693 @@ mod self_test {
         (stats.size_in_use as u64, u64::from(stats.blocks_in_use))
     }
 
+    /// `terminal_screen_lines` の字の大きさがペインのフォントサイズに追従する（#947）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=screen-lines`
+    ///
+    /// 測るのは**タブツリーのホバープレビュー**（`PreviewTarget::Pane`）。
+    /// `terminal_screen_lines` を器へ並べるだけの経路で、ポップアップは既知サイズなので
+    /// 「ホバー無し / 有り」の差分がそのままポップアップの矩形になる。
+    ///
+    /// 指標は行ごとのインクの**高さ**と**間隔（ピッチ）**の 2 つ:
+    /// - ピッチは `line_h`（= `pane_line_height`）由来なので**壊れていても**拡大する
+    /// - 高さはグリフのサイズ由来なので、ambient 依存のままだと**拡大しない**
+    ///
+    /// なので「箱は大きくなったのに字が小さいまま」= `ink / pitch` が落ちる、を数値で言える。
+    /// `TAKO_947_LEGACY=1` で修正前（箱に `text_size` を載せない）へ戻せる
+    #[cfg(feature = "visual-test")]
+    async fn screen_lines_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+
+        /// 指定した**画像座標**の矩形の、行ごとのインク量。
+        ///
+        /// `ink_row_profile` は論理座標 + 上下反転の自動判定が要るが、ここで測りたい
+        /// 矩形は「差分の bbox」= はじめから画像座標なので、変換を挟まない方が安全
+        /// （反転を「インクが多い方」で決める版はポップアップの外のターミナル本文を
+        /// 掴んで 101 行の塊に化けた。実測で踏んだ）
+        fn ink_rows(
+            frame: &image::RgbaImage,
+            x0: u32,
+            y0: u32,
+            x1: u32,
+            y1: u32,
+            bg: tako_core::Rgb,
+        ) -> Vec<u32> {
+            let (w, h) = frame.dimensions();
+            let (x1, y1) = (x1.min(w), y1.min(h));
+            let mut out = Vec::with_capacity((y1.saturating_sub(y0)) as usize);
+            for y in y0..y1 {
+                let mut ink = 0u32;
+                for x in x0..x1 {
+                    let p = frame.get_pixel(x, y).0;
+                    if (i32::from(p[0]) - i32::from(bg.r)).abs()
+                        + (i32::from(p[1]) - i32::from(bg.g)).abs()
+                        + (i32::from(p[2]) - i32::from(bg.b)).abs()
+                        > 24
+                    {
+                        ink += 1;
+                    }
+                }
+                out.push(ink);
+            }
+            out
+        }
+
+        /// 行ごとのインクから「連続した塊」を切り出す（1 塊 = 1 行のグリフ）。
+        /// 返すのは (**先頭の**塊の高さ, 塊の開始間隔の中央値, 塊の数)
+        fn runs(profile: &[u32]) -> Option<(f32, f32, usize)> {
+            let mut starts = Vec::new();
+            let mut heights = Vec::new();
+            let mut cur: Option<(usize, usize)> = None;
+            for (i, &ink) in profile.iter().enumerate() {
+                if ink >= 2 {
+                    cur = Some(match cur {
+                        Some((s, _)) => (s, i),
+                        None => (i, i),
+                    });
+                } else if let Some((s, e)) = cur.take() {
+                    starts.push(s);
+                    heights.push(e - s + 1);
+                }
+            }
+            if let Some((s, e)) = cur {
+                starts.push(s);
+                heights.push(e - s + 1);
+            }
+            if heights.len() < 2 {
+                return None;
+            }
+            let median = |mut v: Vec<usize>| -> f32 {
+                v.sort_unstable();
+                v[v.len() / 2] as f32
+            };
+            let pitches: Vec<usize> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+            if pitches.is_empty() {
+                return None;
+            }
+            // 高さは**先頭の塊**（= fixture の 1 行目 `MMMMMM`）を使う。
+            // 最大や中央値だと、拡大でプロンプト行が画面外へ出た瞬間に
+            // 「別の内容」と比べることになって比が崩れる（実測で踏んだ）
+            Some((heights[0] as f32, median(pitches), starts.len()))
+        }
+
+        // 対象ペインを決め、既定サイズへ戻す
+        let target = window
+            .update(cx, |app, _, cx| {
+                let focused = app.focused_pane();
+                let pane = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|id| app.terminals.contains_key(id))
+                    .unwrap_or(focused);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Focus {
+                        pane: Some(pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.hover_preview = None;
+                app.reset_zoom_focused_pane(cx);
+                cx.notify();
+                app.focused_pane()
+            })
+            .unwrap_or(PaneId::from_raw(0));
+
+        // 決まった絵を仕込む: 下端が揃った大文字だけの行を空行で挟む
+        // （インクの塊が 1 行 = 1 グリフ行にきれいに分かれる）
+        press(any, cx, "ctrl-u");
+        type_text(
+            any,
+            cx,
+            "clear; printf 'MMMMMM\n\nMMMMMM\n\nMMMMMM\n\nMMMMMM\n\n'",
+            true,
+        );
+        let mut seeded = false;
+        for _ in 0..40 {
+            wait(cx, 200).await;
+            seeded = window
+                .update(cx, |app, _, _| {
+                    app.terminals
+                        .get(&target)
+                        .map(|s| {
+                            s.screen(&app.theme)
+                                .lines
+                                .iter()
+                                .filter(|l| l.text.starts_with("MMMMMM"))
+                                .count()
+                                >= 4
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if seeded {
+                break;
+            }
+        }
+        if !seeded {
+            println!(
+                "TAKO_VISUAL_SKIPPED: screen-lines（fixture が画面に出ない = 未描画。\
+                 ウィンドウを前面にして再実行すると検証できる）"
+            );
+            return;
+        }
+
+        let mut measured: Vec<(&str, f32, f32, f32, usize)> = Vec::new();
+        for (label, delta) in [("default", 0.0f32), ("large", 8.0f32)] {
+            let font_size = window
+                .update(cx, |app, _, cx| {
+                    if delta != 0.0 {
+                        app.zoom_focused_pane(delta, cx);
+                    }
+                    app.hover_preview = None;
+                    cx.notify();
+                    app.pane_font_size(target)
+                })
+                .unwrap_or(0.0);
+            wait(cx, 400).await;
+
+            // ホバー無しの静止フレーム（画面が動いていたら撮り直す）
+            let mut base = None;
+            let mut base_scale = 1.0f32;
+            for _ in 0..20 {
+                notify_and_draw(any, window, cx);
+                let Some((a, scale)) = capture_frame(any, cx) else {
+                    fail("visual-test screen-lines: ホバー前フレーム採取")
+                };
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                let Some((b, _)) = capture_frame(any, cx) else {
+                    fail("visual-test screen-lines: ホバー前フレーム採取（2 枚目）")
+                };
+                if a == b {
+                    base = Some(b);
+                    base_scale = scale;
+                    break;
+                }
+            }
+            let Some(base) = base else {
+                fail("visual-test screen-lines: 画面が静止しない")
+            };
+
+            // ホバープレビューを出す（タブツリーのホバーと同じ状態）
+            let _ = window.update(cx, |app, _, cx| {
+                app.hover_preview = Some(HoverPreview {
+                    target: PreviewTarget::Pane(target),
+                    anchor: point(px(PREVIEW_POPUP_W + 80.0), px(PREVIEW_POPUP_H + 80.0)),
+                });
+                cx.notify();
+            });
+            wait(cx, 400).await;
+            notify_and_draw(any, window, cx);
+            let Some((shown, _)) = capture_frame(any, cx) else {
+                fail("visual-test screen-lines: ホバー後フレーム採取")
+            };
+
+            // 差分の矩形 = ポップアップ。上端のラベル帯を避けて本文だけを走査する
+            let (rect, changed) = {
+                let (w, h) = base.dimensions();
+                let mut minx = w;
+                let mut maxx = 0u32;
+                let mut miny = h;
+                let mut maxy = 0u32;
+                let mut total = 0u32;
+                for y in 0..h {
+                    for x in 0..w {
+                        if base.get_pixel(x, y) != shown.get_pixel(x, y) {
+                            minx = minx.min(x);
+                            maxx = maxx.max(x);
+                            miny = miny.min(y);
+                            maxy = maxy.max(y);
+                            total += 1;
+                        }
+                    }
+                }
+                ((minx, miny, maxx, maxy), total)
+            };
+            if changed == 0 {
+                println!(
+                    "TAKO_VISUAL_SKIPPED: screen-lines（ホバープレビューが 1 px も出ない = 未描画。\
+                     ウィンドウを前面にして再実行すると検証できる）"
+                );
+                let _ = window.update(cx, |app, window, cx| {
+                    app.hover_preview = None;
+                    app.reset_zoom_focused_pane(cx);
+                    let _ = window;
+                    cx.notify();
+                });
+                return;
+            }
+            let (minx, miny, maxx, maxy) = rect;
+            // ポップアップは「ラベル帯（`PIN_TITLE_BAR`。11px の固定サイズ）+ 本文」。
+            // 帯の字は per-pane ではないので、走査から外さないと測定が汚れる。
+            // 左右も枠とパディングのぶん詰める
+            let inset = ((PANE_PADDING + 2.0) * base_scale).round() as u32;
+            let top_skip = ((PIN_TITLE_BAR + PANE_PADDING + 2.0) * base_scale).round() as u32;
+            let bx0 = minx + inset;
+            let by0 = miny + top_skip;
+            let bx1 = maxx.saturating_sub(inset);
+            let by1 = maxy.saturating_sub(inset);
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let dir = std::path::Path::new(&dump);
+                let _ = shown.save(dir.join(format!("screen-lines-{label}.png")));
+            }
+            println!(
+                "TAKO_VISUAL_SCREEN_LINES_RECT: {label} diff=({minx},{miny})-({maxx},{maxy}) \
+                 body=({bx0},{by0})-({bx1},{by1}) scale={base_scale}"
+            );
+            let Some(bg) = window.update(cx, |app, _, _| app.theme.background).ok() else {
+                fail("visual-test screen-lines: テーマ背景色が採れない")
+            };
+            let profile = ink_rows(&shown, bx0, by0, bx1, by1, bg);
+            let Some((ink, pitch, count)) = runs(&profile) else {
+                fail(
+                    "visual-test screen-lines: 行の塊が 2 つ以上見つからない\
+                     （fixture がポップアップに出ていない）",
+                )
+            };
+            println!(
+                "TAKO_VISUAL_SCREEN_LINES: {label} font_size={font_size} \
+                 ink_h={ink} pitch={pitch} rows={count} ratio={:.3} popup_px={changed} \
+                 profile={:?}",
+                ink / pitch.max(1.0),
+                profile
+            );
+            measured.push((label, font_size, ink, pitch, count));
+
+            let _ = window.update(cx, |app, _, cx| {
+                app.hover_preview = None;
+                cx.notify();
+            });
+            wait(cx, 300).await;
+        }
+
+        let (_, small_fs, small_ink, small_pitch, _) = measured[0];
+        let (_, large_fs, large_ink, large_pitch, _) = measured[1];
+        let want = large_fs / small_fs;
+        let ink_ratio = large_ink / small_ink.max(1.0);
+        let pitch_ratio = large_pitch / small_pitch.max(1.0);
+        // 前提: 箱（行の高さ）は壊れていても伸びる（`line_h` 由来）。伸びていなければ
+        // そもそも拡大が効いていない = 測り方が間違っている
+        check(
+            pitch_ratio > 1.2,
+            &format!(
+                "visual-test screen-lines: 行の間隔がフォントサイズで伸びる（前提）                  (#947。font {small_fs}->{large_fs} pitch {small_pitch}->{large_pitch} 実比={pitch_ratio:.3})"
+            ),
+        );
+        // 本題: 字の大きさも追従する
+        check(
+            (ink_ratio - want).abs() <= 0.20,
+            &format!(
+                "visual-test screen-lines: 字の大きさもフォントサイズに追従する                  (#947。font {small_fs}->{large_fs} 期待比={want:.3}                  ink {small_ink}->{large_ink} 実比={ink_ratio:.3}                  pitch {small_pitch}->{large_pitch})"
+            ),
+        );
+
+        let _ = window.update(cx, |app, _, cx| {
+            app.hover_preview = None;
+            app.reset_zoom_focused_pane(cx);
+            cx.notify();
+        });
+        wait(cx, 300).await;
+    }
+
+    /// IME 未確定文字列の字の大きさがペインのフォントサイズに追従する（#940）。
+    /// 単独実行は `TAKO_VISUAL_ONLY=ime-preedit`
+    ///
+    /// この機に日本語入力ソースが無くても**実描画のピクセルで**測れるようにしてある:
+    /// 変換の入口は OS が呼ぶ `replace_and_mark_text_in_range` そのものなので、
+    /// そこを直接叩けば render 経路は実 IME と同じものが走る。測るのは
+    /// 「変換していないフレーム」と「変換中フレーム」の**差分の外形**で、
+    /// これは画面に増えたもの = 描かれた未確定文字列そのもの。
+    ///
+    /// 固定するのは外形の**比**（フォントサイズの比と一致すること）。絶対値は
+    /// フォント・DPI・テーマに依存するが、比なら環境に依らない。
+    /// 修正前（`TAKO_940_LEGACY=1`）は拡大しても外形が変わらないので必ず落ちる
+    #[cfg(feature = "visual-test")]
+    async fn ime_preedit_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        const TEXT: &str = "にほんご";
+
+        // 差分の外形（幅・高さ）。上下反転の向きは幅・高さを変えないが、
+        // 走査窓（ペインのテキスト領域）を正しく当てるため両向き試して濃い側を採る。
+        // 1 行 / 1 列あたり 2 px 未満の差分は AA のにじみとして捨てる
+        fn diff_extent(
+            before: &image::RgbaImage,
+            after: &image::RgbaImage,
+            area: &Bounds<Pixels>,
+            scale: f32,
+        ) -> Option<(u32, u32, u32, u32, u32)> {
+            if before.dimensions() != after.dimensions() {
+                return None;
+            }
+            let (width, height) = before.dimensions();
+            let left = (f32::from(area.left()) * scale).floor().max(0.0) as u32;
+            let right = ((f32::from(area.right()) * scale).ceil().max(0.0) as u32).min(width);
+            let raw_top = (f32::from(area.top()) * scale).floor().max(0.0) as u32;
+            let raw_bottom =
+                ((f32::from(area.bottom()) * scale).ceil().max(0.0) as u32).min(height);
+            let measure = |flip_y: bool| -> (u32, u32, u32, u32, u32) {
+                let (top, bottom) = if flip_y {
+                    (
+                        height.saturating_sub(raw_bottom),
+                        height.saturating_sub(raw_top),
+                    )
+                } else {
+                    (raw_top.min(height), raw_bottom.min(height))
+                };
+                let mut rows = vec![0u32; (bottom.saturating_sub(top)) as usize];
+                let mut cols = vec![0u32; (right.saturating_sub(left)) as usize];
+                let mut total = 0u32;
+                for y in top..bottom {
+                    for x in left..right {
+                        if before.get_pixel(x, y) != after.get_pixel(x, y) {
+                            rows[(y - top) as usize] += 1;
+                            cols[(x - left) as usize] += 1;
+                            total += 1;
+                        }
+                    }
+                }
+                let span = |v: &[u32]| -> (u32, u32) {
+                    let first = v.iter().position(|&c| c >= 2);
+                    let last = v.iter().rposition(|&c| c >= 2);
+                    match (first, last) {
+                        (Some(a), Some(b)) => (a as u32, (b - a + 1) as u32),
+                        _ => (0, 0),
+                    }
+                };
+                let (x0, w) = span(&cols);
+                let (y0, h) = span(&rows);
+                (w, h, total, left + x0, top + y0)
+            };
+            let normal = measure(false);
+            let flipped = measure(true);
+            Some(if flipped.2 > normal.2 {
+                flipped
+            } else {
+                normal
+            })
+        }
+
+        // 前提: ターミナルペインへフォーカスし、フォントサイズを既定へ戻す
+        let target = window
+            .update(cx, |app, window, cx| {
+                app.unmark_text(window, cx);
+                let focused = app.focused_pane();
+                let pane = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|id| app.terminals.contains_key(id))
+                    .unwrap_or(focused);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Focus {
+                        pane: Some(pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.reset_zoom_focused_pane(cx);
+                cx.notify();
+                app.focused_pane()
+            })
+            .unwrap_or(PaneId::from_raw(0));
+        wait(cx, 400).await;
+
+        let mut measured: Vec<(&str, f32, u32, u32)> = Vec::new();
+        for (label, delta) in [("default", 0.0f32), ("large", 8.0f32)] {
+            // サイズを決める（既定 → 拡大の順。既定は reset のまま）
+            let font_size = window
+                .update(cx, |app, _, cx| {
+                    if delta != 0.0 {
+                        app.zoom_focused_pane(delta, cx);
+                    }
+                    cx.notify();
+                    app.pane_font_size(target)
+                })
+                .unwrap_or(0.0);
+            wait(cx, 400).await;
+            // **画面が静止してから撮る**。シェルのプロンプト再描画や direnv の出力が
+            // 2 枚のあいだに挟まると、差分に未確定文字列以外のものが混ざって
+            // 測定が丸ごと壊れる（実測で ink_w が 6 倍に化けた）
+            let mut before_scale = None;
+            let mut quiet: Option<image::RgbaImage> = None;
+            for _ in 0..20 {
+                notify_and_draw(any, window, cx);
+                let Some((a, scale)) = capture_frame(any, cx) else {
+                    fail("visual-test ime-preedit: 変換前フレーム採取")
+                };
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                let Some((b, _)) = capture_frame(any, cx) else {
+                    fail("visual-test ime-preedit: 変換前フレーム採取（2 枚目）")
+                };
+                if a == b {
+                    before_scale = Some(scale);
+                    quiet = Some(b);
+                    break;
+                }
+            }
+            let (Some(before), Some(scale)) = (quiet, before_scale) else {
+                fail(
+                    "visual-test ime-preedit: 画面が静止しない\
+                     （シェルの出力が続いている）",
+                )
+            };
+
+            // 変換開始（OS が呼ぶのと同じ入口）
+            let diag = window
+                .update(cx, |app, window, cx| {
+                    app.replace_and_mark_text_in_range(None, TEXT, None, window, cx);
+                    app.ime_preedit_font_size.set(None);
+                    cx.notify();
+                    let ime_pane = app.ime.as_ref().map(|i| i.pane);
+                    (
+                        ime_pane,
+                        ime_pane.map(|p| app.pane_font_size(p)),
+                        app.pane_font_size(target),
+                    )
+                })
+                .unwrap_or((None, None, 0.0));
+            wait(cx, 400).await;
+            notify_and_draw(any, window, cx);
+            let Some((after, _)) = capture_frame(any, cx) else {
+                fail("visual-test ime-preedit: 変換中フレーム採取")
+            };
+
+            // 走査窓は**未確定文字列が置かれる行だけ**（アンカーから右へ、1 行ぶんの高さ）。
+            // ペイン全体だと、ヘッダの経過秒やシェルの出力が混ざって外形が化ける
+            let area = window
+                .update(cx, |app, window, _| {
+                    let text_area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == target)
+                        .map(|(_, b)| *b)?;
+                    let anchor = app.ime_overlay_anchor(window)?;
+                    let lh = px(app.pane_line_height(target));
+                    Some(Bounds {
+                        origin: anchor,
+                        size: size(text_area.right() - anchor.x, lh),
+                    })
+                })
+                .unwrap_or(None);
+            let Some(area) = area else {
+                fail(
+                    "visual-test ime-preedit: 未確定文字列のアンカーが採れない\
+                     （未描画。ウィンドウを前面にして再実行すると検証できる）",
+                )
+            };
+            let Some((w, h, total, x0, y0)) = diff_extent(&before, &after, &area, scale) else {
+                fail("visual-test ime-preedit: フレームの寸法が揃わない")
+            };
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let dir = std::path::Path::new(&dump);
+                let _ = before.save(dir.join(format!("ime-preedit-{label}-before.png")));
+                let _ = after.save(dir.join(format!("ime-preedit-{label}-after.png")));
+            }
+            let used = window
+                .update(cx, |app, _, _| app.ime_preedit_font_size.get())
+                .unwrap_or(None);
+            println!(
+                "TAKO_VISUAL_IME_PREEDIT: {label} font_size={font_size} \
+                 ink_w={w} ink_h={h} at=({x0},{y0}) diff_px={total} scale={scale} \
+                 ime_pane={:?} ime_pane_fs={:?} target_fs={} used_fs={used:?} \
+                 area=({:.0},{:.0})-({:.0},{:.0})",
+                diag.0,
+                diag.1,
+                diag.2,
+                f32::from(area.left()),
+                f32::from(area.top()),
+                f32::from(area.right()),
+                f32::from(area.bottom()),
+            );
+            if total == 0 {
+                // ウィンドウが他アプリに完全に隠れている / 画面が消えていると GPUI が
+                // 描画を止め、差分がまったく出ない。product の欠陥ではないので
+                // 落とさず飛ばす（項目 76c / 104 と同じ扱い。黙って通さない）
+                println!(
+                    "TAKO_VISUAL_SKIPPED: ime-preedit（変換中フレームに差分が無い = 未描画。\
+                     ウィンドウを前面にして再実行すると検証できる）"
+                );
+                let _ = window.update(cx, |app, window, cx| {
+                    app.unmark_text(window, cx);
+                    app.reset_zoom_focused_pane(cx);
+                    cx.notify();
+                });
+                return;
+            }
+            measured.push((label, font_size, w, h));
+
+            // 次のラウンドのために変換を畳み、**シェルの入力行も捨てる**。
+            // `unmark_text` は未確定文字列を PTY へ確定させるので、掃除しないと
+            // 次のラウンドの「変換前」フレームに前回の文字列が残り、
+            // アンカーも 4 文字ぶん右へずれて測定が汚れる
+            let _ = window.update(cx, |app, window, cx| {
+                app.unmark_text(window, cx);
+                if let Some(s) = app.terminals.get(&target) {
+                    // Ctrl-U（行を捨てる）→ Ctrl-C（保険）
+                    s.write(vec![0x15]);
+                    s.write(vec![0x03]);
+                }
+                cx.notify();
+            });
+            wait(cx, 600).await;
+        }
+
+        let (_, small_fs, small_w, small_h) = measured[0];
+        let (_, large_fs, large_w, large_h) = measured[1];
+        let want = large_fs / small_fs;
+        let got_w = large_w as f32 / small_w.max(1) as f32;
+        let got_h = large_h as f32 / small_h.max(1) as f32;
+        // 幅はグリフ 4 文字ぶんなので比が素直に出る。高さは 1 行ぶんで丸めが効くため許容を広く取る
+        check(
+            large_fs > small_fs && (got_w - want).abs() <= 0.08 && (got_h - want).abs() <= 0.20,
+            &format!(
+                "visual-test ime-preedit: 未確定文字列の実描画がフォントサイズに追従する                  (#940。font {small_fs}->{large_fs} 期待比={want:.3}                  幅 {small_w}->{large_w} 実比={got_w:.3}                  高さ {small_h}->{large_h} 実比={got_h:.3})"
+            ),
+        );
+
+        // (3) **変換中に**サイズを変えたときの実描画（受け入れ条件 3）。
+        //
+        // (1)(2) は「変えてから変換」なので、変換開始時のスタイルを持ち回して
+        // しまう作りでも通ってしまう。ここは変換を始めた**あとで**拡大し、
+        // その状態の実ピクセルを測る（将来オーバーレイを memo 化したときの
+        // 取りこぼしもここで落ちる）。
+        // 静止フレームは「畳んでシェル行も捨てた後」の同じサイズで撮るので、
+        // 走査帯の中身は未確定文字列だけが違う
+        let mid = {
+            // 既定サイズから変換を始める
+            let _ = window.update(cx, |app, window, cx| {
+                app.reset_zoom_focused_pane(cx);
+                app.replace_and_mark_text_in_range(None, TEXT, None, window, cx);
+                cx.notify();
+            });
+            wait(cx, 400).await;
+            // **変換したまま**拡大する
+            let fs = window
+                .update(cx, |app, _, cx| {
+                    app.zoom_focused_pane(12.0, cx);
+                    cx.notify();
+                    app.pane_font_size(target)
+                })
+                .unwrap_or(0.0);
+            wait(cx, 400).await;
+            notify_and_draw(any, window, cx);
+            let composing = capture_frame(any, cx);
+            let area = window
+                .update(cx, |app, window, _| {
+                    let text_area = app
+                        .pane_text_areas
+                        .iter()
+                        .find(|(id, _)| *id == target)
+                        .map(|(_, b)| *b)?;
+                    let anchor = app.ime_overlay_anchor(window)?;
+                    let lh = px(app.pane_line_height(target));
+                    Some(Bounds {
+                        origin: anchor,
+                        size: size(text_area.right() - anchor.x, lh),
+                    })
+                })
+                .unwrap_or(None);
+            // 畳んでシェル行も捨て、**同じサイズのまま**静止フレームを撮る
+            let _ = window.update(cx, |app, window, cx| {
+                app.unmark_text(window, cx);
+                if let Some(s) = app.terminals.get(&target) {
+                    s.write(vec![0x15]);
+                    s.write(vec![0x03]);
+                }
+                cx.notify();
+            });
+            wait(cx, 600).await;
+            let mut quiet = None;
+            for _ in 0..20 {
+                notify_and_draw(any, window, cx);
+                let a = capture_frame(any, cx).map(|(f, _)| f);
+                wait(cx, 250).await;
+                notify_and_draw(any, window, cx);
+                let b = capture_frame(any, cx).map(|(f, _)| f);
+                if a.is_some() && a == b {
+                    quiet = b;
+                    break;
+                }
+            }
+            match (composing, area, quiet) {
+                (Some((composing, scale)), Some(area), Some(quiet)) => {
+                    diff_extent(&quiet, &composing, &area, scale)
+                        .map(|(w, h, t, _, _)| (fs, w, h, t))
+                }
+                _ => None,
+            }
+        };
+        match mid {
+            Some((fs, w, h, total)) if total > 0 => {
+                let want = fs / measured[0].1;
+                let got = w as f32 / measured[0].2.max(1) as f32;
+                println!(
+                    "TAKO_VISUAL_IME_PREEDIT: mid font_size={fs} ink_w={w} ink_h={h} \
+                     diff_px={total} 期待比={want:.3} 実比={got:.3}"
+                );
+                check(
+                    (got - want).abs() <= 0.10,
+                    &format!(
+                        "visual-test ime-preedit: 変換中にサイズを変えても実描画が追従する                          (#940。font {}->{fs} 期待比={want:.3} 幅 {}->{w} 実比={got:.3})",
+                        measured[0].1, measured[0].2
+                    ),
+                );
+            }
+            _ => println!(
+                "TAKO_VISUAL_SKIPPED: ime-preedit mid（変換中の拡大を測れなかった = 未描画。\
+                 ウィンドウを前面にして再実行すると検証できる）"
+            ),
+        }
+
+        // 後片付け: 既定サイズへ戻す
+        let _ = window.update(cx, |app, window, cx| {
+            app.unmark_text(window, cx);
+            app.reset_zoom_focused_pane(cx);
+            cx.notify();
+        });
+        wait(cx, 300).await;
+    }
+
     /// リモート（SSH 先）ツリーの実描画（#919）。
     ///
     /// 単独実行は `TAKO_VISUAL_ONLY=remote-tree`。
@@ -27112,6 +28453,1267 @@ mod self_test {
         );
     }
 
+    /// 静止した画面が 1 ピクセルも動かないことを実フレームで固定する（#932）。
+    ///
+    /// tako はカーソルを点滅させない（`blink` の実装がワークスペースに 1 つも無い）。
+    /// アニメーションも持たない。だから**入力も notify も無いフレームを重ねたら
+    /// 実ピクセルは完全一致しなければならない**。ちらつきは「状態は同じなのに
+    /// フレームごとに絵が変わる」ことなので、見た目の良し悪しに踏み込まずに
+    /// この不変条件だけで機械検証できる。
+    ///
+    /// 出力が流れている状態は「変わってよい」が、**出力しているペインの外**が
+    /// 元の絵へ戻る（A → B → A）のはちらつきなので、そこだけ別に数える。
+    ///
+    /// 撮影のあいだに待ちを入れるのが要点: 詰めて撮ると数十 ms で終わり、
+    /// **2 秒ごとの定期更新**（`periodic_prep`。状態の作り直し・自動リネーム・
+    /// stale 検知・ポート検知・git ポーリング）が撮影窓に一度も入らない。
+    ///
+    /// 単独実行は `TAKO_VISUAL_ONLY=flicker`
+    #[cfg(feature = "visual-test")]
+    async fn flicker_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let frames: usize = std::env::var("TAKO_FLICKER_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        // 既定 100 枚 × 50ms = 約 5 秒。2 秒ごとの定期更新が 2 回以上入る長さ
+        let gap: u64 = std::env::var("TAKO_FLICKER_GAP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        // 静止した状態で `frames` 枚を撮り、(異なる指紋の数, 変わったフレーム対の数,
+        // ずれの矩形一覧, scale) を返す。**notify も入力もしない**
+        // （`capture_frame` は draw → 読み戻しだけ）
+        async fn still_soak(
+            any: AnyWindowHandle,
+            cx: &mut AsyncApp,
+            frames: usize,
+            gap_ms: u64,
+        ) -> (usize, usize, Vec<(u32, u32, u32, u32, u64)>, f32) {
+            let mut prints: Vec<u64> = Vec::new();
+            let mut prev: Option<(image::RgbaImage, bool)> = None;
+            let mut diffs: Vec<(u32, u32, u32, u32, u64)> = Vec::new();
+            let mut changed = 0usize;
+            let mut active_flips = 0usize;
+            let mut scale = 1.0;
+            for i in 0..frames {
+                if i > 0 && gap_ms > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(gap_ms))
+                        .await;
+                }
+                let Some((frame, s, active)) = capture_frame_active(any, cx) else {
+                    continue;
+                };
+                scale = s;
+                // 活性状態が変わったフレームは「状態が変わった」ので比較から外す
+                // （前面の入れ替わりでフォーカス枠・タブ強調が正しく変わる）
+                let same_state = prev.as_ref().is_some_and(|(_, a)| *a == active);
+                if same_state {
+                    prints.push(frame_fingerprint(&frame));
+                }
+                if let Some((p, _)) = prev.as_ref().filter(|_| same_state) {
+                    if let Some(d) = frame_diff_bbox(p, &frame) {
+                        changed += 1;
+                        if !diffs.iter().any(|e| e.0 == d.0 && e.1 == d.1 && e.2 == d.2) {
+                            diffs.push(d);
+                        }
+                    }
+                }
+                if !same_state {
+                    active_flips += 1;
+                }
+                prev = Some((frame, active));
+            }
+            let distinct: std::collections::HashSet<u64> = prints.iter().copied().collect();
+            diffs.truncate(6);
+            if active_flips > 0 {
+                println!("TAKO_VISUAL_PIXEL: flicker (前面の入れ替わり {active_flips} 回を除外)");
+            }
+            (distinct.len().max(1), changed, diffs, scale)
+        }
+
+        // どのタイルが「戻った」か（A → B → A）。出力が流れている状態で使う。
+        // タイルは 32 デバイス px 角。返り値は (戻ったタイル数, 代表タイルの座標)
+        fn reverted_tiles(
+            frames: &[image::RgbaImage],
+            tile: u32,
+            skip: &[(u32, u32, u32, u32)],
+        ) -> (usize, Vec<(u32, u32)>) {
+            if frames.len() < 3 {
+                return (0, Vec::new());
+            }
+            let (w, h) = frames[0].dimensions();
+            let mut reverted = 0usize;
+            let mut spots: Vec<(u32, u32)> = Vec::new();
+            for ty in (0..h).step_by(tile as usize) {
+                for tx in (0..w).step_by(tile as usize) {
+                    if skip.iter().any(|(x0, y0, x1, y1)| {
+                        tx + tile > *x0 && tx < *x1 && ty + tile > *y0 && ty < *y1
+                    }) {
+                        continue;
+                    }
+                    let hashes: Vec<u64> = frames
+                        .iter()
+                        .map(|f| {
+                            let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
+                            for y in ty..(ty + tile).min(h) {
+                                for x in tx..(tx + tile).min(w) {
+                                    for b in f.get_pixel(x, y).0 {
+                                        hh ^= u64::from(b);
+                                        hh = hh.wrapping_mul(0x0000_0100_0000_01b3);
+                                    }
+                                }
+                            }
+                            hh
+                        })
+                        .collect();
+                    // 「変わったのに、あとで前の値へ戻る」= ちらつきの署名。
+                    // 前へ流れるだけの出力（スクロール・追記）では起きない
+                    let mut seen: std::collections::HashMap<u64, usize> =
+                        std::collections::HashMap::new();
+                    let mut flips = false;
+                    for (i, hv) in hashes.iter().enumerate() {
+                        if let Some(prev_i) = seen.get(hv) {
+                            if i - prev_i >= 2 {
+                                flips = true;
+                            }
+                        }
+                        seen.insert(*hv, i);
+                    }
+                    if flips {
+                        reverted += 1;
+                        if spots.len() < 12 {
+                            spots.push((tx, ty));
+                        }
+                    }
+                }
+            }
+            (reverted, spots)
+        }
+
+        /// 領域のインク量（背景と違う画素の数）。「一瞬まっさらになる」ちらつきは
+        /// これが落ち込むので、値の並びを見れば消えたフレームが分かる
+        fn region_ink(frame: &image::RgbaImage, r: (u32, u32, u32, u32)) -> u64 {
+            let (w, h) = frame.dimensions();
+            let bg = frame.get_pixel(r.0.min(w - 1), r.1.min(h - 1)).0;
+            let mut ink = 0u64;
+            for y in (r.1..r.3.min(h)).step_by(2) {
+                for x in (r.0..r.2.min(w)).step_by(2) {
+                    let p = frame.get_pixel(x, y).0;
+                    let d = (i32::from(p[0]) - i32::from(bg[0])).abs()
+                        + (i32::from(p[1]) - i32::from(bg[1])).abs()
+                        + (i32::from(p[2]) - i32::from(bg[2])).abs();
+                    if d > 24 {
+                        ink += 1;
+                    }
+                }
+            }
+            ink
+        }
+
+        // 直接 dispatch は PTY 起動依頼を `pending_attach` へ積むだけなので、
+        // IPC ループと同じ後処理（起動 + 保留書き込み + 重量プレビュー読み込み）を
+        // ここで回す。これを欠くとペインは木にあるのに端末が無く、
+        // 「出力しているつもりで 1 枚も動いていない」空振りになる
+        fn drain(app: &mut TakoApp, cx: &mut Context<TakoApp>) {
+            for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                let _ = app.spawn_session(pane, options, cx);
+            }
+            for (pane, data) in std::mem::take(&mut app.pending_writes) {
+                if let Some(session) = app.terminals.get(&pane) {
+                    session.write(data);
+                }
+            }
+            app.drain_pending_highlights(cx);
+        }
+
+        // AI 自動リネーム（#552）はタブ名を実際に書き換える = 静止判定の対象外。
+        // 撮影を決定的にするため止める（ちらつきとは無関係の正常な変化）
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::AutoRename {
+                        enabled: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                cx.notify();
+            })
+            .ok();
+
+        // --- ラウンド 1: 起動直後の 1 ペイン（静止） ---
+        // 窓が落ち着くまで実フレームを重ねてから撮る（初回の全面描画を測らない）
+        for _ in 0..10 {
+            let _ = capture_frame(any, cx);
+        }
+        wait(cx, 2500).await;
+        let (d1, c1, w1, scale) = still_soak(any, cx, frames, gap).await;
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker idle-1pane frames={frames} gap={gap}ms distinct={d1} \
+             changed={c1} diffs={w1:?} scale={scale}"
+        );
+
+        // --- ラウンド 2: 3 分割 + サイドバー + 右パネル（git）を開いて静止 ---
+        let base = window
+            .update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                for dir in [
+                    tako_control::protocol::Direction::Right,
+                    tako_control::protocol::Direction::Down,
+                    tako_control::protocol::Direction::Right,
+                ] {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Split {
+                            pane: Some(base.as_u64()),
+                            tab: None,
+                            direction: Some(dir),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::User,
+                    );
+                    drain(app, cx);
+                }
+                // サイドバー（ファイルツリー）と右パネル（git）も開く。どちらも
+                // 2 秒ごとのポーリングで中身を作り直すので、周期的なちらつきがあれば出る
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Panel {
+                        visible: Some(true),
+                        width: None,
+                        view: Some(tako_control::protocol::PanelViewWire::Git),
+                        filetree: Some(true),
+                        sidebar_width: None,
+                        show_hidden: None,
+                    },
+                    PaneOrigin::User,
+                );
+                cx.notify();
+                base
+            })
+            .expect("flicker: 分割の基準ペイン");
+        wait(cx, 3000).await;
+        let (d2, c2, w2, _) = still_soak(any, cx, frames, gap).await;
+        let terms2 = window
+            .update(cx, |app, _, _| app.terminals.len())
+            .unwrap_or(0);
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker idle-4pane terminals={terms2} frames={frames} \
+             distinct={d2} changed={c2} diffs={w2:?}"
+        );
+
+        // --- ラウンド 3: プレビュー（コード + md + PDF。静止） ---
+        let dir = std::env::temp_dir().join(format!("tako-flicker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("flicker: fixture ディレクトリ");
+        let code = dir.join("sample.rs");
+        std::fs::write(
+            &code,
+            "fn main() {\n    // ちらつき検査用\n    println!(\"hi\");\n}\n",
+        )
+        .expect("flicker: code fixture");
+        let md = dir.join("sample.md");
+        std::fs::write(&md, "# 見出し\n\n本文と `コード`。\n\n- a\n- b\n").expect("flicker: md");
+        let pdf = dir.join("sample.pdf");
+        write_test_pdf(&pdf);
+        let previews = window
+            .update(cx, |app, _, cx| {
+                let mut opened = 0;
+                // **分割方向を明示**して 1 ファイル = 1 プレビューペインにする。
+                // 方向省略だと同じペインを差し替えるので 3 回開いても 1 枚しか残らない
+                for (path, dir) in [
+                    (&code, tako_control::protocol::Direction::Right),
+                    (&md, tako_control::protocol::Direction::Down),
+                    (&pdf, tako_control::protocol::Direction::Right),
+                ] {
+                    let ok = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::OpenFile {
+                            pane: Some(base.as_u64()),
+                            path: path.display().to_string(),
+                            mode: None,
+                            direction: Some(dir),
+                            focus: Some(false),
+                            new_tab: false,
+                        },
+                        PaneOrigin::User,
+                    )
+                    .is_ok();
+                    drain(app, cx);
+                    opened += usize::from(ok);
+                }
+                app.drain_pending_highlights(cx);
+                cx.notify();
+                opened
+            })
+            .unwrap_or(0);
+        // PDF の background ラスタライズと md の目次構築が終わるのを待つ
+        wait(cx, 5000).await;
+        for _ in 0..10 {
+            let _ = capture_frame(any, cx);
+        }
+        let (d3, c3, w3, _) = still_soak(any, cx, frames, gap).await;
+        let kinds = window
+            .update(cx, |app, _, _| {
+                let mut v: Vec<String> = app
+                    .previews
+                    .iter()
+                    .map(|(p, s)| format!("{}:{:?}", p.as_u64(), s.mode))
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker idle-preview opened={previews} kinds={kinds:?} \
+             frames={frames} distinct={d3} changed={c3} diffs={w3:?}"
+        );
+
+        // --- ラウンド 4: 片方のペインが出力し続けているあいだ、**外側**が戻らないか ---
+        // 専用タブへ移す（前ラウンドのタブは 7 ペインで 1 枚が数 px しかなく、
+        // TUI が 2x2 になって「動いていない」空振りになる）
+        let out_pane = window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::TabNew {
+                        title: None,
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                let pane = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .find(|p| app.terminals.contains_key(p) && !app.previews.contains_key(p));
+                let target = pane.unwrap_or(base);
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(target.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                cx.notify();
+                target
+            })
+            .unwrap_or(base);
+        wait(cx, 2500).await;
+        // 実エージェント TUI と同じ「同じ場所を塗り替え続ける」出力（スピナー）。
+        // 行が増えないので、外側が戻ったら原因は出力ではなく描画側
+        window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Focus {
+                        pane: Some(out_pane.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::User,
+                );
+                if let Some(session) = app.terminals.get(&out_pane) {
+                    // 行末は `pty_line`（CR）で送る（#897 の番犬）
+                    session.write(pty_line(
+                        "clear; i=0; while [ $i -lt 4000 ]; do printf '\\rworking %d' $i; \
+                         i=$((i+1)); sleep 0.05; done",
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        wait(cx, 1500).await;
+        let (out_rect, tail) = window
+            .update(cx, |app, _, _| {
+                let rect = app
+                    .pane_text_areas
+                    .iter()
+                    .find(|(p, _)| *p == out_pane)
+                    .map(|(_, b)| {
+                        (
+                            (f32::from(b.origin.x) * scale) as u32,
+                            (f32::from(b.origin.y) * scale) as u32,
+                            ((f32::from(b.origin.x) + f32::from(b.size.width)) * scale) as u32,
+                            ((f32::from(b.origin.y) + f32::from(b.size.height)) * scale) as u32,
+                        )
+                    });
+                let tail = app.terminals.get(&out_pane).map(|s| {
+                    s.screen(&app.theme)
+                        .lines
+                        .iter()
+                        .rev()
+                        .find(|l| !l.text.trim().is_empty())
+                        .map(|l| l.text.trim().to_string())
+                        .unwrap_or_default()
+                });
+                (rect, tail)
+            })
+            .unwrap_or((None, None));
+        let mut shots: Vec<(image::RgbaImage, bool)> = Vec::new();
+        for i in 0..frames {
+            if i > 0 {
+                // 出力が実際に流れる速さ（スピナーは 50ms 間隔）に合わせて撮る
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+            }
+            if let Some((frame, _, active)) = capture_frame_active(any, cx) {
+                shots.push((frame, active));
+            }
+        }
+        // 多数派の活性状態のフレームだけを見る（前面の入れ替わりを混ぜない）
+        let want = shots.iter().filter(|(_, a)| *a).count() * 2 >= shots.len();
+        let shots: Vec<image::RgbaImage> = shots
+            .into_iter()
+            .filter(|(_, a)| *a == want)
+            .map(|(f, _)| f)
+            .collect();
+        // 出力ペインの本文とタイトルバーは除外する（そこは変わってよい）
+        let mut skip: Vec<(u32, u32, u32, u32)> = out_rect.into_iter().collect();
+        if let Some((x0, y0, x1, _)) = out_rect {
+            let top = y0.saturating_sub(((PANE_TITLE_BAR + PANE_PADDING) * scale) as u32);
+            skip.push((x0, top, x1, y0));
+        }
+        let (rev, spots) = reverted_tiles(&shots, 32, &skip);
+        let changed_pairs = shots
+            .windows(2)
+            .filter_map(|w| frame_diff_bbox(&w[0], &w[1]))
+            .count();
+        // 出力ペインの中が「一瞬まっさらになる」ちらつきの検出（インクの落ち込み）
+        let (ink_min, ink_med, ink_low) = match out_rect {
+            Some(r) => {
+                let mut ink: Vec<u64> = shots.iter().map(|f| region_ink(f, r)).collect();
+                let min = ink.iter().copied().min().unwrap_or(0);
+                ink.sort_unstable();
+                let med = ink.get(ink.len() / 2).copied().unwrap_or(0);
+                let low = ink.iter().filter(|v| **v * 2 < med).count();
+                (min, med, low)
+            }
+            None => (0, 0, 0),
+        };
+        // タブバー帯（`TAB_BAR_HEIGHT` の内側）の平均輝度の振れ幅（#932）。
+        // #217 の「実行中タブのドットを 2 秒周期で脈動させる」アニメーションは
+        // 面積が小さいのでインクの数では出ない。輝度の平均で見る
+        let strip_h = (TAB_BAR_HEIGHT * scale) as u32;
+        let (tab_lum_min, tab_lum_max) = shots.iter().fold((f64::MAX, 0f64), |(lo, hi), f| {
+            let (w, _) = f.dimensions();
+            let mut sum = 0u64;
+            let mut n = 0u64;
+            for y in (0..strip_h).step_by(2) {
+                for x in (0..w).step_by(2) {
+                    let p = f.get_pixel(x, y).0;
+                    sum += u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]);
+                    n += 3;
+                }
+            }
+            let m = sum as f64 / n.max(1) as f64;
+            (lo.min(m), hi.max(m))
+        });
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker tabbar-pulse lum_min={tab_lum_min:.3} \
+             lum_max={tab_lum_max:.3} swing={:.3}",
+            tab_lum_max - tab_lum_min
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker output-running frames={} out_pane={} tail={tail:?} \
+             changed_pairs={changed_pairs} reverted_tiles={rev} spots={spots:?} \
+             ink(min={ink_min} median={ink_med} frames_below_half={ink_low}) skip={skip:?}",
+            shots.len(),
+            out_pane.as_u64()
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let _ = std::fs::create_dir_all(&dump);
+            for (i, f) in shots.iter().take(8).enumerate() {
+                let _ = f.save(std::path::Path::new(&dump).join(format!("flicker-out-{i}.png")));
+            }
+        }
+
+        // --- ラウンド 5: 代替画面（alt screen）の全面塗り替え ---
+        // エージェント TUI（claude / codex）はここを通る。主画面の `\r` 上書きとは
+        // 経路が違う（スクロールミラー非経路・`is_alt_screen` の分岐）ので別に測る
+        let alt = dir.join("altscreen.sh");
+        std::fs::write(
+            &alt,
+            "printf '\\033[?1049h'\n\
+             i=0\n\
+             while [ $i -lt 2000 ]; do\n\
+             printf '\\033[H'\n\
+             j=0\n\
+             while [ $j -lt 20 ]; do\n\
+             printf '\\033[K row %02d frame %04d ------------------------------\\n' $j $i\n\
+             j=$((j+1))\n\
+             done\n\
+             i=$((i+1))\n\
+             sleep 0.05\n\
+             done\n",
+        )
+        .expect("flicker: alt screen fixture");
+        window
+            .update(cx, |app, _, cx| {
+                if let Some(session) = app.terminals.get(&out_pane) {
+                    // 走っているスピナーを止めてから alt screen の fixture へ切り替える
+                    session.write(b"\x03".to_vec());
+                    session.write(pty_line(&format!("clear; sh {}", alt.display())));
+                }
+                cx.notify();
+            })
+            .ok();
+        wait(cx, 2000).await;
+        let alt_state = window
+            .update(cx, |app, _, _| {
+                app.terminals
+                    .get(&out_pane)
+                    .map(|s| (s.is_alt_screen(), s.size()))
+            })
+            .ok()
+            .flatten();
+        let mut alt_shots: Vec<(image::RgbaImage, bool)> = Vec::new();
+        for i in 0..frames {
+            if i > 0 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+            }
+            if let Some((frame, _, active)) = capture_frame_active(any, cx) {
+                alt_shots.push((frame, active));
+            }
+        }
+        let alt_want = alt_shots.iter().filter(|(_, a)| *a).count() * 2 >= alt_shots.len();
+        let alt_shots: Vec<image::RgbaImage> = alt_shots
+            .into_iter()
+            .filter(|(_, a)| *a == alt_want)
+            .map(|(f, _)| f)
+            .collect();
+        let (alt_rev, alt_spots) = reverted_tiles(&alt_shots, 32, &skip);
+        let alt_changed = alt_shots
+            .windows(2)
+            .filter_map(|w| frame_diff_bbox(&w[0], &w[1]))
+            .count();
+        let (alt_ink_min, alt_ink_med, alt_ink_low) = match out_rect {
+            Some(r) => {
+                let mut ink: Vec<u64> = alt_shots.iter().map(|f| region_ink(f, r)).collect();
+                let min = ink.iter().copied().min().unwrap_or(0);
+                ink.sort_unstable();
+                let med = ink.get(ink.len() / 2).copied().unwrap_or(0);
+                let low = ink.iter().filter(|v| **v * 2 < med).count();
+                (min, med, low)
+            }
+            None => (0, 0, 0),
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker alt-screen frames={} state={alt_state:?} \
+             changed_pairs={alt_changed} reverted_tiles={alt_rev} spots={alt_spots:?} \
+             ink(min={alt_ink_min} median={alt_ink_med} frames_below_half={alt_ink_low})",
+            alt_shots.len()
+        );
+
+        // --- ラウンド 6 / 7: 過渡期（タブ切り替え・ペインサイズ変更）（#932 第 2 ラウンド） ---
+        //
+        // 「一瞬まっさらになる」は**過渡期にしか出ない**ので、静止フレームの比較
+        // （ラウンド 1〜3）では原理的に捕まらない。ここでは 2 つの目盛りで測る。
+        //
+        // 1. **実フレーム**（`capture_frame`）: 実際に見える絵。ただし draw + GPU
+        //    読み戻しで 1 枚あたり数十〜数百 ms かかるので、**短い過渡期は取りこぼす**
+        // 2. **端末グリッド**（`screen()`）: GPU を通らないので桁違いに速く採れる。
+        //    「実フレームなら真っ黒に見えたはずの瞬間」はここで捕まる。
+        //    ディスプレイは 60Hz なので、**16ms 以上続いた消失は実際に 1 枚は描かれる**
+
+        /// 端末グリッドの「インクのある行数」を高頻度で採る（ペインごと）。
+        /// 返り値は (経過 ms, ペインごとの行数)
+        async fn grid_ink_trace(
+            window: &WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            panes: &[PaneId],
+            samples: usize,
+            interval_ms: u64,
+        ) -> Vec<(u64, Vec<usize>)> {
+            let start = std::time::Instant::now();
+            let mut out = Vec::with_capacity(samples);
+            for i in 0..samples {
+                if i > 0 && interval_ms > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(interval_ms))
+                        .await;
+                }
+                let row = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        panes
+                            .iter()
+                            .map(|p| {
+                                app.terminals
+                                    .get(p)
+                                    .map(|s| {
+                                        s.screen(&app.theme)
+                                            .lines
+                                            .iter()
+                                            .filter(|l| !l.text.trim().is_empty())
+                                            .count()
+                                    })
+                                    .unwrap_or(0)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                out.push((start.elapsed().as_millis() as u64, row));
+            }
+            out
+        }
+
+        /// トレースから「消えていた」サンプルを数える。基準は落ち着いた状態の行数。
+        /// 返り値は (消えていたサンプル数, 連続した最長 ms, 代表サンプル)
+        /// (消えていたサンプル数, 連続した最長 ms, 代表サンプル, 最小行数, 採取した長さ ms)
+        type Blackout = (usize, u64, Vec<(u64, Vec<usize>)>, usize, u64);
+        fn blackout_stats(trace: &[(u64, Vec<usize>)], baseline: &[usize]) -> Blackout {
+            let mut count = 0usize;
+            let mut worst = 0u64;
+            let mut run_start: Option<u64> = None;
+            let mut shown: Vec<(u64, Vec<usize>)> = Vec::new();
+            let mut last_t = 0u64;
+            // 部分的な描き直し（半分は超えているが落ちている）も見えるように最小値を返す。
+            // 採取の間隔（= この目盛りで見える最短の過渡期）も一緒に返す
+            let min_rows = trace
+                .iter()
+                .flat_map(|(_, r)| r.iter().copied())
+                .min()
+                .unwrap_or(0);
+            let span_ms = trace.last().map(|(t, _)| *t).unwrap_or(0);
+            for (t, rows) in trace {
+                let blank = rows
+                    .iter()
+                    .zip(baseline.iter())
+                    .any(|(r, b)| *b > 2 && *r * 2 < *b);
+                if blank {
+                    count += 1;
+                    if shown.len() < 6 {
+                        shown.push((*t, rows.clone()));
+                    }
+                    if run_start.is_none() {
+                        run_start = Some(*t);
+                    }
+                } else if let Some(s) = run_start.take() {
+                    worst = worst.max(t.saturating_sub(s));
+                }
+                last_t = *t;
+            }
+            if let Some(s) = run_start {
+                worst = worst.max(last_t.saturating_sub(s));
+            }
+            (count, worst, shown, min_rows, span_ms)
+        }
+
+        /// 実フレームのインクの谷（中央値の半分未満）。返り値は (中央値, 谷の数, 代表)
+        fn ink_transient_dips(ink: &[u64]) -> (u64, usize, Vec<(usize, u64)>) {
+            if ink.is_empty() {
+                return (0, 0, Vec::new());
+            }
+            let mut sorted = ink.to_vec();
+            sorted.sort_unstable();
+            let median = sorted[sorted.len() / 2];
+            let mut dips: Vec<(usize, u64)> = Vec::new();
+            for (i, v) in ink.iter().enumerate() {
+                if v * 2 < median && dips.len() < 8 {
+                    dips.push((i, *v));
+                }
+            }
+            (
+                median,
+                ink.iter().filter(|v| **v * 2 < median).count(),
+                dips,
+            )
+        }
+
+        // 表示中タブのテキスト領域の外接矩形（デバイス px）。左上はターミナル背景に
+        // なるので `region_ink` の基準色として正しい（ペイン枠・ヘッダを含めない）
+        fn text_union_px(app: &TakoApp, scale: f32) -> Option<(u32, u32, u32, u32)> {
+            let mut x0 = f32::MAX;
+            let mut y0 = f32::MAX;
+            let mut x1 = 0f32;
+            let mut y1 = 0f32;
+            for (_, b) in app.pane_text_areas.iter() {
+                x0 = x0.min(f32::from(b.origin.x));
+                y0 = y0.min(f32::from(b.origin.y));
+                x1 = x1.max(f32::from(b.origin.x) + f32::from(b.size.width));
+                y1 = y1.max(f32::from(b.origin.y) + f32::from(b.size.height));
+            }
+            (x1 > x0 && y1 > y0).then_some((
+                (x0 * scale) as u32,
+                (y0 * scale) as u32,
+                (x1 * scale) as u32,
+                (y1 * scale) as u32,
+            ))
+        }
+
+        // 静止したテキストを 1 ペインへ流し込む（走り続けるプログラムは残さない）。
+        //
+        // **密な色つきの行**にするのが要点。器（tmux）は寸法が変わると画面を丸ごと
+        // 描き直すので、その 1 回のバイト数が PTY のバッファを超えると**途中で切れて
+        // 届く**。切れ目で 1 フレーム描くと「消えかけの画面」が見える。
+        // 薄い内容だと 1 回の write に収まってしまい、この経路を一度も通らない
+        let fill_static =
+            |window: &WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId, tag: &str| {
+                let line = format!(
+                    "clear; i=1; while [ $i -le 60 ]; do \
+                     printf '\\033[3%dm{tag} row %02d \
+                     ================================================================\\033[0m\\n' \
+                     $((i%8)) $i; i=$((i+1)); done"
+                );
+                window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        if let Some(session) = app.terminals.get(&pane) {
+                            session.write(pty_line(&line));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            };
+
+        // 落ち着いた状態のインク行数（グリッド基準値）
+        async fn settled_rows(
+            window: &WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            panes: &[PaneId],
+        ) -> Vec<usize> {
+            grid_ink_trace(window, cx, panes, 1, 0)
+                .await
+                .pop()
+                .map(|(_, r)| r)
+                .unwrap_or_default()
+        }
+
+        let trace_samples: usize = std::env::var("TAKO_FLICKER_TRACE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(150);
+        let switch_rounds: usize = std::env::var("TAKO_FLICKER_SWITCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let burst: usize = std::env::var("TAKO_FLICKER_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        // --- ラウンド 6: タブ切り替え ---
+        // 過渡期のラウンドは**実運用に近い画面サイズ**で測る。器やアプリが
+        // 描き直すバイト数は画面の面積に比例するので、小さい窓のままだと
+        // 「1 回の write に収まって切れない」= 経路を通らない
+        let transition_window = size(px(1500.0), px(950.0));
+        any.update(cx, |_, window, _| window.resize(transition_window))
+            .ok();
+        wait(cx, 800).await;
+        for _ in 0..6 {
+            let _ = capture_frame(any, cx);
+        }
+        // 切り替え用に 2 枚のタブを作る（どちらも 1 ペイン + 静止テキスト）
+        let mut switch_tabs: Vec<(TabId, PaneId)> = Vec::new();
+        for tag in ["F6A", "F6B"] {
+            let made = window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::TabNew {
+                            title: Some(tag.to_string()),
+                            focus: Some(true),
+                            cwd: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    drain(app, cx);
+                    cx.notify();
+                    let tab = app.workspace.active_tab();
+                    (tab.id(), tab.tree().focused())
+                })
+                .ok();
+            if let Some((tab, pane)) = made {
+                switch_tabs.push((tab, pane));
+                wait(cx, 900).await;
+                fill_static(&window, cx, pane, tag);
+                wait(cx, 900).await;
+            }
+        }
+        let switch_panes: Vec<PaneId> = switch_tabs.iter().map(|(_, p)| *p).collect();
+        wait(cx, 2500).await;
+        for _ in 0..8 {
+            let _ = capture_frame(any, cx);
+        }
+        let switch_region = window
+            .update(cx, |app, _, _| text_union_px(app, scale))
+            .ok()
+            .flatten();
+        let switch_baseline = settled_rows(&window, cx, &switch_panes).await;
+        let mut switch_ink: Vec<u64> = Vec::new();
+        let mut sw_blackouts = 0usize;
+        let mut sw_worst_ms = 0u64;
+        let mut sw_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut sw_traced = 0usize;
+        let mut sw_min_rows = usize::MAX;
+        let mut sw_span_ms = 0u64;
+        for round in 0..switch_rounds {
+            let Some(&(target, _)) = switch_tabs.get(round % switch_tabs.len().max(1)) else {
+                break;
+            };
+            // **GUI と同じ経路**で切り替える（クリックハンドラが呼ぶのはこれ。
+            // dispatch の TabSelect は可視性の申し送りリセット等を通らない）
+            window
+                .update(cx, |app, win, cx| {
+                    app.select_tab_in_viewport(target, win, cx);
+                })
+                .ok();
+            // 1) グリッドを高頻度で追う（短い過渡期を取りこぼさない）
+            let trace = grid_ink_trace(&window, cx, &switch_panes, trace_samples, 1).await;
+            sw_traced += trace.len();
+            let (c, w, s, minr, span) = blackout_stats(&trace, &switch_baseline);
+            sw_blackouts += c;
+            sw_worst_ms = sw_worst_ms.max(w);
+            sw_min_rows = sw_min_rows.min(minr);
+            sw_span_ms += span;
+            if sw_samples.len() < 6 {
+                sw_samples.extend(s);
+            }
+            // 2) 実フレームも撮る（見えている絵そのもの）
+            for _ in 0..burst {
+                if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                    if let Some(r) = switch_region {
+                        switch_ink.push(region_ink(&frame, r));
+                    }
+                }
+            }
+            wait(cx, 120).await;
+            if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                if let Some(r) = switch_region {
+                    switch_ink.push(region_ink(&frame, r));
+                }
+            }
+        }
+        let (sw_median, sw_low, sw_dips) = ink_transient_dips(&switch_ink);
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker tab-switch rounds={switch_rounds} baseline={switch_baseline:?} \
+             traced={sw_traced} span_ms={sw_span_ms} min_rows={sw_min_rows} \
+             grid_blackouts={sw_blackouts} worst_ms={sw_worst_ms} \
+             samples={sw_samples:?} | frames={} region={switch_region:?} median_ink={sw_median} \
+             blank_frames={sw_low} dips={sw_dips:?}",
+            switch_ink.len()
+        );
+
+        // --- ラウンド 7: ペインサイズ変更（分割比 + ウィンドウ寸法） ---
+        let resize_tab = window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::TabNew {
+                        title: Some("F7".to_string()),
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                let left = app.workspace.active_tab().tree().focused();
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(left.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                drain(app, cx);
+                cx.notify();
+                let panes: Vec<PaneId> = app
+                    .workspace
+                    .active_tab()
+                    .tree()
+                    .panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .collect();
+                (left, panes)
+            })
+            .ok();
+        let (resize_left, resize_panes) = resize_tab.unwrap_or((base, Vec::new()));
+        wait(cx, 1200).await;
+        for (i, p) in resize_panes.iter().enumerate() {
+            fill_static(&window, cx, *p, if i == 0 { "L" } else { "R" });
+        }
+        wait(cx, 2500).await;
+        for _ in 0..8 {
+            let _ = capture_frame(any, cx);
+        }
+        let resize_region = window
+            .update(cx, |app, _, _| text_union_px(app, scale))
+            .ok()
+            .flatten();
+        let resize_baseline = settled_rows(&window, cx, &resize_panes).await;
+        let mut resize_ink: Vec<u64> = Vec::new();
+        let mut rz_blackouts = 0usize;
+        let mut rz_worst_ms = 0u64;
+        let mut rz_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut rz_sizes_seen: std::collections::HashSet<Vec<(usize, usize)>> =
+            std::collections::HashSet::new();
+        let mut rz_min_rows = usize::MAX;
+        let mut rz_span_ms = 0u64;
+        let sweep: Vec<f32> = std::iter::repeat_n(0.04f32, 4)
+            .chain(std::iter::repeat_n(-0.04f32, 8))
+            .chain(std::iter::repeat_n(0.04f32, 4))
+            .collect();
+        for delta in sweep {
+            window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::Resize {
+                            pane: Some(resize_left.as_u64()),
+                            axis: tako_control::protocol::Axis::X,
+                            delta: Some(delta),
+                            share: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    cx.notify();
+                })
+                .ok();
+            // 分割比を変えただけでは PTY は変わらない。**描いて初めて**
+            // `render_pane` が新しい cols/rows へリサイズするので 1 枚描く
+            let _ = capture_frame(any, cx);
+            let trace = grid_ink_trace(&window, cx, &resize_panes, trace_samples, 1).await;
+            let (c, w, s, minr, span) = blackout_stats(&trace, &resize_baseline);
+            rz_blackouts += c;
+            rz_worst_ms = rz_worst_ms.max(w);
+            rz_min_rows = rz_min_rows.min(minr);
+            rz_span_ms += span;
+            if rz_samples.len() < 6 {
+                rz_samples.extend(s);
+            }
+            for _ in 0..burst {
+                if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                    if let Some(r) = resize_region {
+                        resize_ink.push(region_ink(&frame, r));
+                    }
+                }
+            }
+            if let Ok(sizes) = window.update(cx, |app, _, _| {
+                resize_panes
+                    .iter()
+                    .filter_map(|p| app.terminals.get(p).map(|s| s.size()))
+                    .collect::<Vec<_>>()
+            }) {
+                rz_sizes_seen.insert(sizes);
+            }
+            wait(cx, 80).await;
+            if let Some((frame, _, _)) = capture_frame_active(any, cx) {
+                if let Some(r) = resize_region {
+                    resize_ink.push(region_ink(&frame, r));
+                }
+            }
+        }
+        let (rz_median, rz_low, rz_dips) = ink_transient_dips(&resize_ink);
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker pane-resize baseline={resize_baseline:?} \
+             distinct_sizes={} span_ms={rz_span_ms} min_rows={rz_min_rows} \
+             grid_blackouts={rz_blackouts} worst_ms={rz_worst_ms} \
+             samples={rz_samples:?} | frames={} region={resize_region:?} median_ink={rz_median} \
+             blank_frames={rz_low} dips={rz_dips:?}",
+            rz_sizes_seen.len(),
+            resize_ink.len()
+        );
+
+        // --- ラウンド 8: ウィンドウ寸法の変更（全ペインが一度にリサイズされる） ---
+        let base_size = any
+            .update(cx, |_, window, _| window.viewport_size())
+            .ok()
+            .unwrap_or(size(px(1200.0), px(800.0)));
+        let mut win_blackouts = 0usize;
+        let mut win_worst_ms = 0u64;
+        let mut win_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut win_steps = 0usize;
+        let mut win_min_rows = usize::MAX;
+        let mut win_span_ms = 0u64;
+        for step in [-60.0f32, -40.0, 40.0, 60.0, 40.0, -40.0, -60.0, 60.0] {
+            let want = size(
+                px((f32::from(base_size.width) + step).max(400.0)),
+                px((f32::from(base_size.height) + step).max(300.0)),
+            );
+            any.update(cx, |_, window, _| window.resize(want)).ok();
+            win_steps += 1;
+            let _ = capture_frame(any, cx);
+            let trace = grid_ink_trace(&window, cx, &resize_panes, trace_samples, 1).await;
+            let (c, w, s, minr, span) = blackout_stats(&trace, &resize_baseline);
+            win_blackouts += c;
+            win_worst_ms = win_worst_ms.max(w);
+            win_min_rows = win_min_rows.min(minr);
+            win_span_ms += span;
+            if win_samples.len() < 6 {
+                win_samples.extend(s);
+            }
+            wait(cx, 150).await;
+        }
+        any.update(cx, |_, window, _| window.resize(base_size)).ok();
+        wait(cx, 300).await;
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker window-resize steps={win_steps} baseline={resize_baseline:?} \
+             span_ms={win_span_ms} min_rows={win_min_rows} \
+             grid_blackouts={win_blackouts} worst_ms={win_worst_ms} samples={win_samples:?}"
+        );
+
+        // --- ラウンド 9: 裏タブのペインが表に出た瞬間にリサイズされないか（#932） ---
+        //
+        // 裏タブのペインは `render_pane` を通らない（`pane_text_areas` は表示タブ分しか
+        // 作らない）ので、**ウィンドウ寸法やサイドバー幅が変わっても PTY のサイズが
+        // 更新されない**。そのタブを表に出した瞬間に初めて新しい cols/rows が適用され、
+        // 中で走っているプログラムへ SIGWINCH が飛ぶ。TUI（claude 等）は画面を消して
+        // 描き直すので、そのあいだが「タブを切り替えたら一瞬まっさら」になる。
+        //
+        // ここでは 2 つを同時に測る。
+        //
+        // 1. **遅れリサイズそのもの**（表に出した瞬間に寸法が変わるか）= 原因。
+        //    中のアプリに依らないので、これを不変条件にする
+        // 2. **見えている画面が実際に消えるか** = 症状。SIGWINCH で
+        //    「画面を消してから描き直す」TUI をペインに置いて、消えている時間を測る
+        let tui = dir.join("winch-tui.sh");
+        std::fs::write(
+            &tui,
+            "printf '\\033[?1049h'\n\
+             paint() {\n\
+             printf '\\033[2J\\033[H'\n\
+             i=1\n\
+             while [ $i -le 60 ]; do\n\
+             printf '\\033[3%dmTUI row %02d \
+             ================================================================\\033[0m\\n' \
+             $((i%8)) $i\n\
+             i=$((i+1))\n\
+             done\n\
+             }\n\
+             trap paint WINCH\n\
+             paint\n\
+             while :; do sleep 0.05; done\n",
+        )
+        .expect("flicker: WINCH TUI fixture");
+        let hidden_pane = switch_tabs.first().copied();
+        let other_tab = switch_tabs.get(1).copied();
+        let mut hidden_before = (0usize, 0usize);
+        let mut hidden_after = (0usize, 0usize);
+        let mut hidden_displayed = (0usize, 0usize);
+        let mut hidden_baseline: Vec<usize> = Vec::new();
+        let mut hidden_blackouts = 0usize;
+        let mut hidden_worst_ms = 0u64;
+        let mut hidden_min_rows = 0usize;
+        let mut hidden_samples: Vec<(u64, Vec<usize>)> = Vec::new();
+        if let (Some((tab, pane)), Some((other, _))) = (hidden_pane, other_tab) {
+            // 表に出して、SIGWINCH で画面を消して描き直す TUI を起動する
+            window
+                .update(cx, |app, win, cx| app.select_tab_in_viewport(tab, win, cx))
+                .ok();
+            for _ in 0..4 {
+                let _ = capture_frame(any, cx);
+            }
+            window
+                .update(cx, |app: &mut TakoApp, _, cx| {
+                    if let Some(session) = app.terminals.get(&pane) {
+                        session.write(pty_line(&format!("clear; sh {}", tui.display())));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            wait(cx, 2500).await;
+            for _ in 0..4 {
+                let _ = capture_frame(any, cx);
+            }
+            hidden_baseline = settled_rows(&window, cx, &[pane]).await;
+            // 裏へ回す
+            window
+                .update(cx, |app, win, cx| {
+                    app.select_tab_in_viewport(other, win, cx)
+                })
+                .ok();
+            for _ in 0..4 {
+                let _ = capture_frame(any, cx);
+            }
+            wait(cx, 500).await;
+            // 裏に居るあいだにウィンドウ寸法を変える（サイドバー幅の変更でも同じ）
+            any.update(cx, |_, win, _| {
+                win.resize(size(
+                    transition_window.width - px(220.0),
+                    transition_window.height - px(140.0),
+                ))
+            })
+            .ok();
+            for _ in 0..6 {
+                let _ = capture_frame(any, cx);
+            }
+            wait(cx, 1200).await;
+            // 表に居るペイン（= 追従済み）と、裏に居るペイン（追従できていれば同じ幅）
+            let sizes = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    let hidden = app.terminals.get(&pane).map(|s| s.size()).unwrap_or((0, 0));
+                    let shown = other_tab
+                        .and_then(|(_, p)| app.terminals.get(&p))
+                        .map(|s| s.size())
+                        .unwrap_or((0, 0));
+                    (hidden, shown)
+                })
+                .ok()
+                .unwrap_or_default();
+            hidden_before = sizes.0;
+            hidden_displayed = sizes.1;
+            // 表に出す。ここで初めてリサイズされるなら SIGWINCH → TUI が画面を消す
+            window
+                .update(cx, |app, win, cx| app.select_tab_in_viewport(tab, win, cx))
+                .ok();
+            let _ = capture_frame(any, cx);
+            hidden_after = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.terminals.get(&pane).map(|s| s.size()).unwrap_or((0, 0))
+                })
+                .ok()
+                .unwrap_or_default();
+            // 切り替えた直後を高頻度で追う（消えている時間を測る）
+            let trace = grid_ink_trace(&window, cx, &[pane], trace_samples.max(120), 1).await;
+            let (c, w, s, minr, _span) = blackout_stats(&trace, &hidden_baseline);
+            hidden_blackouts = c;
+            hidden_worst_ms = w;
+            hidden_min_rows = minr;
+            hidden_samples = s;
+            any.update(cx, |_, win, _| win.resize(transition_window))
+                .ok();
+            wait(cx, 300).await;
+        }
+        println!(
+            "TAKO_VISUAL_PIXEL: flicker hidden-resize hidden_before={hidden_before:?} \
+             displayed_same_time={hidden_displayed:?} hidden_after_show={hidden_after:?} \
+             late_resize={} baseline={hidden_baseline:?} min_rows={hidden_min_rows} \
+             grid_blackouts={hidden_blackouts} worst_ms={hidden_worst_ms} \
+             samples={hidden_samples:?}",
+            hidden_before != hidden_after
+        );
+
+        // 静止画面が動いたら、それがちらつきの実体（原因は diffs の矩形から追える）
+        check(
+            d1 == 1,
+            "ちらつき: 素の 1 ペインの静止画面が 1 ピクセルも動かない（#932）",
+        );
+        check(
+            terms2 >= 4,
+            "ちらつき: 分割ラウンドで端末が 4 枚立っている（空振り検出。#932）",
+        );
+        check(
+            d2 == 1,
+            "ちらつき: 4 分割 + サイドバー + git パネルの静止画面が 1 ピクセルも動かない（#932）",
+        );
+        check(
+            kinds.len() >= 3,
+            "ちらつき: プレビューが 3 枚開いている（空振り検出。#932）",
+        );
+        check(
+            d3 == 1,
+            "ちらつき: プレビュー（コード / md / PDF）の静止画面が 1 ピクセルも動かない（#932）",
+        );
+        // 出力が 1 枚も動いていなければこの検査は空振り（偽の緑）なので、
+        // 「動いていること」自体を先に確かめる（#796 の作法）
+        check(
+            changed_pairs > 0,
+            "ちらつき: 出力ラウンドで画面が実際に動いている（空振り検出。#932）",
+        );
+        check(
+            rev == 0,
+            "ちらつき: 出力中のペインの外側は前の絵へ戻らない（#932）",
+        );
+        check(
+            ink_low == 0,
+            "ちらつき: 出力中のペインの中身が一瞬まっさらにならない（#932）",
+        );
+        check(
+            alt_state.is_some_and(|(alt, _)| alt) && alt_changed > 0,
+            "ちらつき: 代替画面ラウンドが実際に alt screen で動いている（空振り検出。#932）",
+        );
+        check(
+            alt_rev == 0,
+            "ちらつき: 代替画面の塗り替え中も外側は前の絵へ戻らない（#932）",
+        );
+        check(
+            alt_ink_low == 0,
+            "ちらつき: 代替画面の塗り替え中に中身が一瞬まっさらにならない（#932）",
+        );
+        // 過渡期（タブ切り替え / ペインサイズ変更 / ウィンドウ寸法）。
+        // 静止では原理的に出ないので別に見る
+        check(
+            switch_region.is_some()
+                && sw_median > 0
+                && sw_traced >= trace_samples
+                && switch_baseline.iter().any(|r| *r > 2),
+            "ちらつき: タブ切り替えラウンドが実際に動いている（空振り検出。#932）",
+        );
+        check(
+            sw_blackouts == 0,
+            "ちらつき: タブ切り替えの過渡期に端末の中身が消えない（#932）",
+        );
+        check(
+            sw_low == 0,
+            "ちらつき: タブ切り替えの過渡期のフレームが一瞬まっさらにならない（#932）",
+        );
+        check(
+            resize_region.is_some()
+                && rz_median > 0
+                && rz_sizes_seen.len() >= 2
+                && resize_baseline.iter().any(|r| *r > 2),
+            "ちらつき: ペインサイズ変更ラウンドが実際に端末を作り直している（空振り検出。#932）",
+        );
+        check(
+            rz_blackouts == 0,
+            "ちらつき: ペインサイズ変更の過渡期に端末の中身が消えない（#932）",
+        );
+        check(
+            rz_low == 0,
+            "ちらつき: ペインサイズ変更の過渡期のフレームが一瞬まっさらにならない（#932）",
+        );
+        check(
+            win_steps > 0,
+            "ちらつき: ウィンドウ寸法変更ラウンドが実際に動いている（空振り検出。#932）",
+        );
+        check(
+            win_blackouts == 0,
+            "ちらつき: ウィンドウ寸法を変えている最中に端末の中身が消えない（#932）",
+        );
+        check(
+            hidden_before != (0, 0) && hidden_baseline.iter().any(|r| *r > 2),
+            "ちらつき: 裏タブラウンドが実際に動いている（空振り検出。#932）",
+        );
+        check(
+            hidden_before == hidden_after,
+            "ちらつき: 裏タブのペインを表に出しても端末の寸法が変わらない（#932）",
+        );
+        check(
+            hidden_blackouts == 0,
+            "ちらつき: 裏タブを表に出した直後に端末の中身が消えない（#932）",
+        );
+    }
     /// 端末グリッド描画の 1 フレームあたりコストを測る（#787 / #782 / #786）。
     ///
     /// **ディスプレイが消えていても測れる**のが要点。実ウィンドウの表示に頼ると
@@ -27330,7 +29932,12 @@ mod self_test {
                 }
                 "preview-code" => {
                     preview_code_visual(any, window, cx).await;
-            remote_tree_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #932: 静止した画面が 1 ピクセルも動かないか（ちらつきの機械検証）
+                "flicker" => {
+                    flicker_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
@@ -27339,12 +29946,26 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                "ime-preedit" => {
+                    ime_preedit_visual(any, window, cx).await;
+
+            // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
+            // 追従するか（ホバープレビューで測る）
+            screen_lines_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                "screen-lines" => {
+                    screen_lines_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
                          profiles / chat-table / conflict-card / terminal-grid / \
                          grid-bench / preview-leak / chat-leak / preview-code / \
-                         remote-tree）"
+                         remote-tree / flicker / ime-preedit / screen-lines）"
                     );
                     std::process::exit(1);
                 }
@@ -27370,6 +29991,11 @@ mod self_test {
             // #496: コンフリクトカードの操作が実マウスで発火するか
             // （一括 dismiss #503 に食われて GUI から一度も起動できていなかった）
             conflict_card_visual(window, cx).await;
+
+            // #940: IME 未確定文字列の字の大きさがペインのフォントサイズに追従するか。
+            // 変換していないフレームと変換中フレームの差分の外形を測るので、
+            // 日本語入力ソースが無い機でも実描画で確かめられる
+            ime_preedit_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -29551,6 +32177,10 @@ mod self_test {
             // 実データ規模（アカウント複数・プロジェクト複数・全項目表示）で開き、
             // **実際に描かれた矩形**（絶対配置 canvas で記録）から重なり・食み出しを数える
             profiles_form_visual(window, cx).await;
+
+            // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
+            // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
+            flicker_visual(any, window, cx).await;
 
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);
@@ -50555,6 +53185,330 @@ mod self_test {
                 });
             }
 
+            // 125. IME 未確定文字列の字の大きさは**変換先ペインの**フォントサイズに
+            // 追従する（#940）。
+            //
+            // 修正前は組み立てが `text_style()`（テーマ既定）を固定参照していたので、
+            // cmd+= でペインを拡大しても未確定文字列だけ既定サイズのまま小さく描かれた
+            // （周囲のターミナル本文は `pane_text_style` を通るので追従していた）。
+            //
+            // 見るのは `ime_preedit_font_size` = **実際に組み立てた StyledText の
+            // フォントサイズ**。`ime_preedit_text` が唯一の組み立て地点なので、
+            // ここに載る値は「画面に出た字の大きさ」そのもの。
+            // `TAKO_940_LEGACY=1` で修正前へ戻すと (a)(b)(c) が落ちる（(d) は
+            // オーバーライドが無い状態 = テーマ既定と一致するので旧挙動でも通る）
+            {
+                const IME_TEXT: &str = "にほんご";
+                // 前提を揃える: 変換状態を畳み、ターミナルペインへフォーカスを移す。
+                // プレビュー / webview にフォーカスが残っていると `zoom_focused_pane` が
+                // コンテンツズームへ分岐してフォントサイズが動かない（= 検出力ゼロになる）
+                let target = window
+                    .update(cx, |app, window, cx| {
+                        app.unmark_text(window, cx);
+                        let focused = app.focused_pane();
+                        let pane = app
+                            .workspace
+                            .active_tab()
+                            .tree()
+                            .panes()
+                            .iter()
+                            .map(|p| p.id())
+                            .find(|id| app.terminals.contains_key(id))
+                            .unwrap_or(focused);
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Focus {
+                                pane: Some(pane.as_u64()),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        // 既定サイズから始める（先行項目のズームを持ち越さない）
+                        app.reset_zoom_focused_pane(cx);
+                        cx.notify();
+                        app.focused_pane()
+                    })
+                    .unwrap_or(PaneId::from_raw(0));
+
+                // (a) 拡大 → 変換開始（Issue の再現手順そのまま）
+                let (theme_fs, pane_fs, ime_fs) = window
+                    .update(cx, |app, window, cx| {
+                        // cmd+= と同じ経路（ZoomIn → zoom_focused_pane）
+                        app.zoom_focused_pane(4.0, cx);
+                        let pane_fs = app.pane_font_size(target);
+                        app.replace_and_mark_text_in_range(None, IME_TEXT, None, window, cx);
+                        app.ime_preedit_font_size.set(None);
+                        let _ = app.ime_preedit_text(IME_TEXT.to_string(), target);
+                        (
+                            app.theme.font_size,
+                            pane_fs,
+                            app.ime_preedit_font_size.get(),
+                        )
+                    })
+                    .unwrap_or((0.0, 0.0, None));
+                check(
+                    pane_fs > theme_fs && ime_fs == Some(pane_fs),
+                    &format!(
+                        "IME 未確定文字列は拡大したペインのフォントサイズで描かれる                          (#940。theme={theme_fs} pane={pane_fs} ime={ime_fs:?})"
+                    ),
+                );
+
+                // (b) **実 render 経路**でも同じ値になる（呼び出し側が渡すペインの取り違えを
+                //     検出する）。ウィンドウが他アプリに完全に隠れていると GPUI が描画を
+                //     止めてオーバーレイが一度も組まれないので、そのときは落とさず飛ばす
+                //     （項目 76c / 76d と同じ扱い）
+                let _ = window.update(cx, |app, _, _| app.ime_preedit_font_size.set(None));
+                notify_and_draw(any, window, cx);
+                let rendered = window
+                    .update(cx, |app, _, _| app.ime_preedit_font_size.get())
+                    .unwrap_or(None);
+                match rendered {
+                    Some(fs) => check(
+                        fs == pane_fs,
+                        &format!(
+                            "IME 未確定文字列: 実 render 経路も同じサイズ                              (#940。rendered={fs} pane={pane_fs})"
+                        ),
+                    ),
+                    None => println!(
+                        "TAKO_SELF_TEST_SKIPPED: 125(b)（未確定文字列のオーバーレイが\
+                         一度も組まれなかった = 未描画。ウィンドウを前面にして再実行すると検証できる）"
+                    ),
+                }
+
+                // (c) 変換中にサイズを変えても追従する（受け入れ条件 2 の後半）
+                let (mid_pane_fs, mid_ime_fs) = window
+                    .update(cx, |app, _, cx| {
+                        app.zoom_focused_pane(4.0, cx);
+                        app.ime_preedit_font_size.set(None);
+                        let _ = app.ime_preedit_text(IME_TEXT.to_string(), target);
+                        (
+                            app.pane_font_size(target),
+                            app.ime_preedit_font_size.get(),
+                        )
+                    })
+                    .unwrap_or((0.0, None));
+                check(
+                    mid_pane_fs > pane_fs && mid_ime_fs == Some(mid_pane_fs),
+                    &format!(
+                        "IME 未確定文字列: 変換中のサイズ変更にも追従する                          (#940。pane={mid_pane_fs} ime={mid_ime_fs:?} 変更前={pane_fs})"
+                    ),
+                );
+
+                // (d) 既定へ戻すとテーマ既定サイズへ戻る（オーバーライドの解除も追従する）
+                let (reset_pane_fs, reset_ime_fs) = window
+                    .update(cx, |app, _, cx| {
+                        app.reset_zoom_focused_pane(cx);
+                        app.ime_preedit_font_size.set(None);
+                        let _ = app.ime_preedit_text(IME_TEXT.to_string(), target);
+                        (
+                            app.pane_font_size(target),
+                            app.ime_preedit_font_size.get(),
+                        )
+                    })
+                    .unwrap_or((0.0, None));
+                check(
+                    reset_pane_fs == theme_fs && reset_ime_fs == Some(theme_fs),
+                    &format!(
+                        "IME 未確定文字列: 既定へ戻すとテーマ既定サイズになる                          (#940。pane={reset_pane_fs} ime={reset_ime_fs:?} theme={theme_fs})"
+                    ),
+                );
+
+                // 後片付け: 変換状態とズームを以後の項目へ持ち越さない
+                let _ = window.update(cx, |app, window, cx| {
+                    app.unmark_text(window, cx);
+                    app.reset_zoom_focused_pane(cx);
+                    cx.notify();
+                });
+            }
+
+            // 126. IME を壊す「入力ハンドラ未登録のフレーム」を作らない（#623）。
+            //
+            // `Window::handle_input` は **自分の `focus_handle` にフォーカスがある
+            // ときだけ** 入力ハンドラを登録する。登録が飛んだフレームは GPUI Windows の
+            // `update_ime_enabled()` が「文字入力を受け付けないウィンドウ」と誤認し、
+            // `ImmNotifyIME(CPS_COMPLETE)` = **変換中の未確定文字列の強制確定**と
+            // IME の切り離しを行う（実機の「ばーじょん → ｂーじょん」+ 打鍵消失）。
+            //
+            // 判定そのもの（`platform::ime::guard_action`）は tako-core の単体テストが
+            // 網羅している。ここで見るのは **配線**: 他ハンドルへフォーカスが移っても
+            // 同一フレーム内で自分へ戻ること。修正前の判定は
+            // `window.focused(cx).is_none()`（= どこにもフォーカスが無い）だったので、
+            // 他ハンドルへ移った場合を素通りしていた
+            {
+                // フォーカスを奪う「他のハンドル」。この変数が生きている間だけ有効なので
+                // 検査が終わるまで手放さない
+                let foreign = cx.update(|cx| cx.focus_handle());
+                {
+                    // (a) **入力ハンドラが登録されないフレームを作らない**。
+                    //
+                    //     ここが #623 の核心で、「フォーカスが最終的に戻るか」では
+                    //     ない。既存の `on_focus_lost`（#332）は draw の**末尾**で
+                    //     発火するので、フォーカスは 1 フレーム後に戻る。だが
+                    //     `handle_input` はその手前の paint で登録可否が決まって
+                    //     おり、登録を飛ばしたフレームで GPUI Windows は
+                    //     `CPS_COMPLETE`（未確定文字列の強制確定）を撃つ。
+                    //     取り返しがつかないので、**そのフレームの中で**直っている
+                    //     ことを見る
+                    let (frames0, skipped0) = ime_handler_counts();
+                    let stolen = window
+                        .update(cx, |app, window, cx| {
+                            window.focus(&foreign, cx);
+                            !app.focus_handle.is_focused(window)
+                        })
+                        .unwrap_or(false);
+                    notify_and_draw(any, window, cx);
+                    let (frames1, skipped1) = ime_handler_counts();
+                    let drew = frames1 > frames0;
+                    let no_skip = skipped1 == skipped0;
+                    check(
+                        stolen && drew && no_skip,
+                        &format!(
+                            "他ハンドルへ移ったフレームでも入力ハンドラが登録される \
+                             (#623。stolen={stolen} frames={frames0}->{frames1} \
+                             skipped={skipped0}->{skipped1})"
+                        ),
+                    );
+
+                    // (b) 同一フレーム内の最終防衛線（canvas の prepaint）が、
+                    //     その場でフォーカスを戻して発火回数を数える。
+                    //     `render` を経由しないので prepaint の配線だけを測れる
+                    let (guard_restored, fired) = window
+                        .update(cx, |app, window, cx| {
+                            let before = ime_refocus_count();
+                            window.focus(&foreign, cx);
+                            let own = app.focus_handle.clone();
+                            ime_guard_frame(window, &own, cx);
+                            (own.is_focused(window), ime_refocus_count() > before)
+                        })
+                        .unwrap_or((false, false));
+                    check(
+                        guard_restored && fired,
+                        &format!(
+                            "prepaint の防御が同一フレーム内でフォーカスを戻す \
+                             (#623。restored={guard_restored} fired={fired})"
+                        ),
+                    );
+
+                    // (c) 正常なフレームでは何もしない（毎フレーム走る判定なので、
+                    //     健全時に副作用を持たないことを固定する）
+                    let noop = window
+                        .update(cx, |app, window, cx| {
+                            let before = ime_refocus_count();
+                            let own = app.focus_handle.clone();
+                            ime_guard_frame(window, &own, cx);
+                            ime_refocus_count() == before && own.is_focused(window)
+                        })
+                        .unwrap_or(false);
+                    check(
+                        noop,
+                        &format!("正常なフレームでは防御が発火しない (#623。noop={noop})"),
+                    );
+                }
+            }
+
+            // 127. フォントサイズ変更が「表示中タブ以外」のペインへも届く（#647）。
+            //
+            // PTY / グリッドのリサイズは `render_pane` の副作用なので、裏タブの
+            // ペインには寸法変更が一切届かなかった。フォントを変えると表示中タブ
+            // だけが新しい cols/rows になり、裏タブは**古いセル寸法で計算した
+            // grid のまま**取り残される。そこで全画面 TUI（claude 等）を動かして
+            // いると、そのタブを表示した瞬間に grid が縮んで描画が崩れ、
+            // ウィンドウをリサイズするまで直らない（実機報告の症状）
+            {
+                let any647 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window647 = any647.downcast::<TakoApp>().unwrap_or(window);
+                let hidden647 = window647
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("647-hidden".into()),
+                                // focus させない = 裏タブのまま作る
+                                focus: Some(false),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        // dispatch を直接呼ぶので、セッション起動依頼はここで処理する
+                        // （PTY 無しのペインだと size() が動かない）
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        r["pane"].as_u64().map(PaneId::from_raw)
+                    })
+                    .ok()
+                    .flatten();
+                match hidden647 {
+                    None => println!("TAKO_SELF_TEST_SKIPPED: 127（裏タブを作れない）"),
+                    Some(hidden) => {
+                        notify_and_draw(any647, window647, cx);
+                        // 裏タブのペインの現在のグリッド。この時点で spawn 時の
+                        // 80x24 ではなく実寸へ揃っていること自体が #647 の効果
+                        // （背景タブに作られたペインが 80x24 のまま TUI を起動する問題）
+                        let before = window647
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals.get(&hidden).map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        // グローバルのフォントサイズを変える（設定ファイルは触らない）。
+                        // セル寸法のキャッシュを捨てるのは `reload_theme` 経路と同じ
+                        let (font_before, font_after) = window647
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let before = app.theme.font_size;
+                                let after = if before < 20.0 { 24.0 } else { 10.0 };
+                                app.theme.font_size = after;
+                                app.theme.line_height = after * 1.3;
+                                app.cell_size = None;
+                                app.pane_cell_sizes.clear();
+                                cx.notify();
+                                (before, after)
+                            })
+                            .unwrap_or((0.0, 0.0));
+                        notify_and_draw(any647, window647, cx);
+                        let after = window647
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals.get(&hidden).map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        // 表示中ペインも同じ向きに変わっていること（対照）。
+                        // 片方だけ動いていたら「裏タブへ届いた」とは言えない
+                        let visible_after = window647
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let v = app.focused_pane();
+                                app.terminals.get(&v).map(|s| s.size())
+                            })
+                            .ok()
+                            .flatten();
+                        let changed = matches!((before, after), (Some(b), Some(a)) if b != a);
+                        println!(
+                            "TAKO_SELF_TEST_647: font {font_before}->{font_after} \
+                             hidden {before:?}->{after:?} visible={visible_after:?}"
+                        );
+                        check(
+                            changed,
+                            &format!(
+                                "127: フォントサイズ変更が裏タブのペインへ届く \
+                                 (#647。hidden {before:?}->{after:?})"
+                            ),
+                        );
+                        // 後片付け: フォントを戻して裏タブを閉じる
+                        let _ = window647.update(cx, |app: &mut TakoApp, _, cx| {
+                            app.theme.font_size = font_before;
+                            app.theme.line_height = font_before * 1.3;
+                            app.cell_size = None;
+                            app.pane_cell_sizes.clear();
+                            if let Some(tab) = app.workspace.find_tab_of_pane(hidden) {
+                                app.remove_tab(tab, cx);
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -50782,6 +53736,111 @@ mod ime_tests {
     fn 非変換中はフォーカスペインを対象にする() {
         let focused = PaneId::from_raw(2);
         assert_eq!(resolve_ime_pane(None, |_| true, focused), focused);
+    }
+}
+
+/// #647: 端末グリッドの算出。表示中ペイン（`render_pane`）と非表示ペイン
+/// （`sync_offscreen_pane_sizes`）が同じ式を使うことをここで固定する。
+/// 式がずれると「タブを表示した瞬間に grid が変わる」= 描画崩れになる
+#[cfg(test)]
+mod grid_cells_tests {
+    use super::grid_cells;
+    use gpui::{px, size};
+
+    #[test]
+    fn 面積とセル寸法から収まるグリッドを求める() {
+        // font 13 相当（advance 7.617 / 行高 17）
+        assert_eq!(
+            grid_cells(size(px(1064.0), px(563.2)), size(px(7.6171875), px(17.0))),
+            (139, 33)
+        );
+        // font 22 相当（advance 12.890625 / 行高 28.769）。同じ面積でも縮む
+        assert_eq!(
+            grid_cells(
+                size(px(1064.0), px(563.2)),
+                size(px(12.890625), px(28.76923))
+            ),
+            (82, 19)
+        );
+        // 端数は切り捨て（はみ出した半端なセルは描かない）
+        assert_eq!(
+            grid_cells(size(px(99.0), px(99.0)), size(px(10.0), px(10.0))),
+            (9, 9)
+        );
+    }
+
+    #[test]
+    fn 極小や計測失敗でも破綻しない() {
+        // 急速リサイズで面積が 0 / 負（#385）。0 を返して下限クランプへ委ねる
+        assert_eq!(
+            grid_cells(size(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            (0, 0)
+        );
+        assert_eq!(
+            grid_cells(size(px(-40.0), px(-10.0)), size(px(8.0), px(16.0))),
+            (0, 0)
+        );
+        // セル寸法 0（フォント計測失敗）でゼロ除算 → inf → as usize を踏まない
+        assert_eq!(
+            grid_cells(size(px(800.0), px(400.0)), size(px(0.0), px(0.0))),
+            (0, 0)
+        );
+    }
+
+    // #932: 裏タブのペインは「最後に描かれたときの領域」ではなく
+    // 「**表に出たときの**領域」へ合わせる。ウィンドウ幅・サイドバー幅が変わった
+    // あとで前者を使うと、表に出した瞬間に寸法が変わる = SIGWINCH が飛び、
+    // 中の TUI が画面を作り直す（切り替えのたびに描画が乱れる）
+    #[test]
+    fn コンテンツ矩形が変われば同じ単位矩形でも寸法が変わる() {
+        use super::pane_text_area_rect;
+        use gpui::{point, Bounds};
+        use tako_core::Rect;
+
+        let cell = size(px(8.0), px(17.0));
+        let unit = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        let wide = Bounds::new(point(px(240.0), px(76.0)), size(px(1200.0), px(800.0)));
+        let narrow = Bounds::new(point(px(240.0), px(76.0)), size(px(900.0), px(660.0)));
+        let a = grid_cells(pane_text_area_rect(wide, unit, 28.0, 0.0, 2.0).size, cell);
+        let b = grid_cells(pane_text_area_rect(narrow, unit, 28.0, 0.0, 2.0).size, cell);
+        assert_ne!(a, b, "幅も高さも変えたのに同じ寸法になっている");
+        // 同じ材料なら決定的（表示中の経路と裏の割り出しが一致する前提）
+        assert_eq!(
+            a,
+            grid_cells(pane_text_area_rect(wide, unit, 28.0, 0.0, 2.0).size, cell)
+        );
+    }
+
+    #[test]
+    fn 積み上げの会計を落とすと行数がずれる() {
+        use super::pane_text_area_rect;
+        use gpui::{point, Bounds};
+        use tako_core::Rect;
+
+        // stale claude バナー（#498。28px）を会計に入れ忘れると、割り出した行数が
+        // 表示時より 1〜2 行多くなる = 表に出した瞬間にリサイズが走る
+        let cell = size(px(8.0), px(17.0));
+        let unit = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let content = Bounds::new(point(px(0.0), px(0.0)), size(px(1200.0), px(800.0)));
+        let with_banner = grid_cells(
+            pane_text_area_rect(content, unit, 28.0 + 28.0, 0.0, 2.0).size,
+            cell,
+        );
+        let without = grid_cells(
+            pane_text_area_rect(content, unit, 28.0, 0.0, 2.0).size,
+            cell,
+        );
+        assert_ne!(with_banner, without);
     }
 }
 
@@ -52123,6 +55182,53 @@ mod pane_text_area_tests {
         );
     }
 
+    /// IME を守る 2 つの防御が配線から外れていない（#623）。
+    ///
+    /// どちらも「発火しないのが正常」なので、外れても見た目は何も変わらない。
+    /// `render` 冒頭の自己修復は判定が弱いと**他ハンドルへ移った場合を素通り**し、
+    /// prepaint の防御は canvas から外れると**同一フレーム内で間に合う手が消える**
+    /// （`render` / `on_focus_lost` はどちらもそのフレームの paint に間に合わない）。
+    /// セルフテスト項目 125 は挙動を見るが、要素ツリーが再利用されたフレームまでは
+    /// 再現できないので、配線そのものはここで固定する。
+    ///
+    /// 探す文字列は `format!` で組み立てる。リテラルで書くと**この検査自身が
+    /// ソース走査に引っかかって**件数が合わなくなる（#913 で踏んだのと同じ罠）
+    #[test]
+    fn imeの防御が配線から外れていない() {
+        let source = include_str!("main.rs");
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // (1) `render` 冒頭の自己修復は「自分のハンドルにフォーカスがあるか」で見る。
+        //     旧判定（フォーカスがどこにも無い）は他ハンドルへ移った場合を素通りする
+        let self_heal = format!(
+            "if !self.focus_handle.{}(window) {{ window.focus(",
+            "is_focused"
+        );
+        assert!(
+            flat.contains(&self_heal),
+            "render 冒頭の自己修復が「自分のハンドルにフォーカスがあるか」で見ていない\n\
+             → `window.focused(cx).is_none()` は他ハンドルへ移った場合を素通りする（#623）"
+        );
+
+        // (2) 入力ハンドラを登録する canvas の **prepaint** が防御を呼ぶ
+        let guard_call = format!("{}(window, &guard_focus, cx)", "ime_guard_frame");
+        assert_eq!(
+            source.matches(&guard_call).count(),
+            1,
+            "prepaint の防御の呼び出し元は canvas 1 か所だけ（#623）"
+        );
+
+        // (3) 判定は境界（tako-core）の純粋関数に委ねる（macOS からも検証できる形を保つ）
+        let boundary = format!(
+            "tako_core::platform::ime::{}(focus_held, associated)",
+            "guard_action"
+        );
+        assert!(
+            source.contains(&boundary),
+            "防御の判定が境界の純粋関数を通っていない（#623 / B17）"
+        );
+    }
+
     /// ペインヘッダはルート側の兄弟に居る（#803 の持ち上げが戻っていない）。
     ///
     /// GPUI の `AnyView::cached` は入れ子にできないので、ヘッダをペイン本体の内側から
@@ -52239,6 +55345,145 @@ mod pane_content_geometry_tests {
             flat.matches(&fallback).count(),
             1,
             "推定値がフォールバック以外で使われている"
+        );
+    }
+
+    /// 番犬テスト（#947）: 端末の行を組み立てる箱にも `text_size` を載せる。
+    ///
+    /// #940 と同じ機序（gpui の `StyledText` はサイズを ambient から取り、`TextRun` は
+    /// サイズを運ばない）なので、`default_style` に per-pane のスタイルを渡しただけでは
+    /// 字が追従しない。`terminal_screen_lines` は行の箱を 2 通りで組む
+    /// （セル幅未計測のフォールバック / グループ div をぶら下げる本命）ので、
+    /// **両方**に載っていることを構造として固定する
+    #[test]
+    fn 端末の行の箱にフォントサイズが載っている() {
+        let source = include_str!("main.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .expect("テストモジュールの区切りが無い")
+            .0;
+        let body = prod
+            .split("fn terminal_screen_lines(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("terminal_screen_lines の定義が見つからない");
+        // per-pane のサイズを引いていること
+        assert!(
+            body.contains("self.pane_font_size(pane_id)"),
+            "行の箱に載せるサイズを per-pane から引いていない（#947 の再発）"
+        );
+        // 箱へ載せる形が 2 経路ぶんあること（フォールバック + 本命）
+        let loaded = body
+            .matches("d.text_size(px(fs)).line_height(px(line_h))")
+            .count();
+        assert_eq!(
+            loaded, 2,
+            "行の箱へサイズを載せている箇所が 2 つでない（#947。実際は {loaded} 箇所）"
+        );
+    }
+
+    /// 番犬テスト（#940）: 未確定文字列の大きさは**箱の `text_size`** で決める。
+    ///
+    /// gpui の `StyledText` はレイアウトで `window.text_style()`（祖先から降る
+    /// ambient なスタイル）からフォントサイズを取り、`with_default_highlights` へ
+    /// 渡した `TextRun` はサイズを運ばない。だから `TextStyle` だけ差し替えても
+    /// 字は大きくならない（#940 で実際にここを踏み、`used_fs=21` なのに 13pt で
+    /// 描かれていた）。ペイン由来のサイズを引くことと、それを箱へ載せることの
+    /// **両方**を構造として固定する
+    #[test]
+    fn 未確定文字列のサイズはペイン由来で箱に載る() {
+        let source = include_str!("main.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .expect("テストモジュールの区切りが無い")
+            .0;
+        let body = prod
+            .split("fn ime_preedit_text(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// 未確定文字列の先頭から").next())
+            .expect("ime_preedit_text の定義が見つからない");
+        for marker in [
+            "self.pane_text_style(pane)",
+            "self.pane_font_size(pane)",
+            "self.pane_line_height(pane)",
+            ".text_size(px(fs))",
+            ".line_height(px(lh))",
+        ] {
+            assert!(
+                body.contains(marker),
+                "未確定文字列の組み立てに {marker} が無い（#940 の再発）"
+            );
+        }
+        // 呼び出し側が pane を渡し忘れられない形になっているか
+        // （引数なしの呼び出しが 1 つでもあれば型で落ちるが、意図を明示しておく）
+        // 引数は**括弧の釣り合い**で切り出す（`to_string()` のような内側の括弧で
+        // 切ると引数リストを取り違える。#897 の番犬で踏んだのと同じ型）
+        fn arg_list(src: &str, from: usize) -> &str {
+            let open = match src[from..].find('(') {
+                Some(i) => from + i,
+                None => return "",
+            };
+            let mut depth = 0usize;
+            for (i, ch) in src[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open + 1..open + i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ""
+        }
+        // 定義も呼び出しも**引数 2 つ**（本文とペイン）。1 つの形は #940 以前の姿。
+        // 引数名は呼び出し側の変数名なので数で見る（`target` のように別名が来る）
+        fn top_level_args(args: &str) -> usize {
+            if args.trim().is_empty() {
+                return 0;
+            }
+            let mut depth = 0usize;
+            let mut n = 1usize;
+            for ch in args.chars() {
+                match ch {
+                    '(' | '[' | '<' => depth += 1,
+                    ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => n += 1,
+                    _ => {}
+                }
+            }
+            n
+        }
+        // 走査は**製品部分だけ**（テストモジュールを含めると、この番犬自身が書いている
+        // 文字列リテラル `"ime_preedit_text("` に当たって自分で落ちる）
+        let chat = include_str!("chat_view.rs");
+        let chat_prod = chat
+            .split_once("#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(chat);
+        let mut calls = 0usize;
+        for src in [prod, chat_prod] {
+            for (at, _) in src.match_indices("ime_preedit_text(") {
+                let args = arg_list(src, at);
+                // 定義（`&self, ...`）は型検査が守るので数えない。見たいのは呼び出し側
+                if args.trim_start().starts_with("&self") {
+                    continue;
+                }
+                calls += 1;
+                assert_eq!(
+                    top_level_args(args),
+                    2,
+                    "ime_preedit_text の呼び出しがペインを渡していない（#940 の再発）: {args:?}"
+                );
+            }
+        }
+        // ウィンドウ側オーバーレイ / チャット入力欄の 2 経路
+        //（+ セルフテスト / visual-test）。0 件なら走査が空振りしている
+        assert!(
+            calls >= 2,
+            "ime_preedit_text の呼び出しが見つからない（走査の空振り）"
         );
     }
 
