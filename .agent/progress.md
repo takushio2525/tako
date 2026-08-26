@@ -3206,10 +3206,26 @@
   #897 の番犬が正しく落ちた。許可リストを持たない不変条件なので env の穴を作らない
 - 検証（macOS）: fmt / clippy / `test --workspace` **2589 passed 0 failed** / 隔離セルフテスト
   `TAKO_APP_SELF_TEST_OK` 完走・行は従来と同一 / クロスチェック エラー 0・警告 12 /
-  検出力は `TAKO_899_LEGACY=1` で (d1) が `queued=false` FAILED + 単体テストが旧形を固定 /
+  検出力は単体テスト（旧 POSIX 決め打ちが同じ Windows パスを囲むことを固定）/
   CI 3 ジョブ緑（PR #931）
-- **中断理由**: 実機（`desktop-28omtes`）が tailnet から落ちた（offline / last seen 1h）。
-  受け入れ条件①（実機 before/after）が未達なので **merge していない**。
-  再開手順は plan の「#899 の記録 → 残り」節。**実機のリポジトリはブランチ `w899` のまま**
+- **中断理由（1 回目）**: 実機が tailnet から落ちた（offline / last seen 1h）。
+  受け入れ条件①（実機 before/after）が未達なので **merge していない**
 - 実機測定の作法 4 件を plan へ追加（`-EncodedCommand` を使わない / arm スクリプトを
   `echo` で作らない = zsh が `\t` をタブにする / arm 側にも UTF-8 / DirectX アトラス panic は撃ち直す）
+
+## 2026-08-26（#899 再開: main を取り込んで CI 緑まで。**実機がまた落ちて before/after は未達**）
+- PR #931 へ main 14 コミット（v0.7.8 まで）をマージ。**コードのコンフリクトはゼロ**で、
+  衝突は `progress.md` / plan の追記 2 件だけ（両側を保持）。抜けていた CHANGELOG も追加
+- macOS は全緑: fmt / clippy(-D warnings) / `test --workspace` **2618 passed 0 failed** /
+  クロスチェック エラー 0・警告 12（main 同数）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
+  （項目 93 の行は `/Applications/tako.app/Contents/MacOS/tako master` = **囲まれない従来と同一**）/
+  CI 3 ジョブ緑（`39aba3c` と `002e64e` の両方）
+- 実機は `w899` を `39aba3c` へ更新して**ビルド成功**（`EXITCODE=0`）、after arm を
+  `schtasks /it` で投入し**項目 53 / 54 まで進行を実測**。その直後に回線が落ち、
+  以後 **3 時間以上** SSH・ICMP・`tailscale ping` が不通のまま（control plane 上は `Online: True`
+  なのに `CurAddr: False` = データパスだけが死ぬ）。**ログ `~\st899-after.log` は残っている**
+- 回線の作法を plan へ追加（長いペイロードは通らない / 長い処理は `Invoke-CimMethod` で
+  切り離して `EXITCODE=` を待つ / arm は `schtasks /it` なので切断でも死なない /
+  `run-arms.ps1` は cp932 で壊れていて使えない / ログ読みは `-Encoding UTF8`）
+- **A/B の意味が 8/24 から変わっている**（`87feff8` で LF legacy を撤去したため、
+  `TAKO_899_LEGACY=1` はクォートだけを戻す = 落ちるのは (d1) ではなく **(d2)**）

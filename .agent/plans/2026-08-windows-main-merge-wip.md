@@ -2763,6 +2763,8 @@ macOS では `/Applications/tako.app/...` が安全文字だけなので囲ま�
 #### #899 の記録（スターター / welcome のコマンド投入を方言と送達確認つき経路へ。2026-08-24）
 
 **⚠ 実機検証が未完のまま中断**（PR #931 は open。下の「残り」を参照）。
+2026-08-26 に再開して main を取り込み CI 3 ジョブ緑まで進めたが、**実機がまた落ちて**
+before/after は取れていない。
 
 スターターカード（#694）と初回起動バナー（#549）は「シェルへコマンド行を書き込む」方式で、
 **組み立てと書き込みが 2 つとも POSIX 決め打ち**だった。症状 3（パス解決）は #898 で解消済み。
@@ -2812,13 +2814,50 @@ A/B はクォート（症状 2）だけ残せば足りる: PowerShell では
 - **GPUI の DirectX アトラス panic は本当に出る**（`directx_atlas.rs:255` の unwrap。
   項目 66 付近）。ランナーに「`directx_atlas` を見たら撃ち直す」を入れておくと止まらない
 
-##### 残り（再開時にやること）
+##### 残り（再開時にやること。2026-08-26 に一度再開して**また実機が落ちた**）
 
-1. **実機の before/after**（受け入れ条件 ①）。`TAKO_899_LEGACY=1` が before。
-   道具は実機の `~\arm-after.ps1` / `arm-before.ps1` / `run-arms.ps1` / `kick.ps1` に置いてある
-2. 実機テストのベースライン 22 件（#930 込み）の照合
+**いまの状態**: main を取り込んで CI 3 ジョブ緑（`002e64e`）。macOS の品質ゲート・隔離
+セルフテストも緑。**実機の before/after だけが未達**なので PR #931 は open のまま。
+
+1. **実機の before/after**（受け入れ条件 ①）。実機リポは **`w899` @ `39aba3c`**
+   （main 取り込み済み・`cargo build -j 2 -p tako-app -p tako-cli` が `EXITCODE=0`）。
+   after arm は session 1 で**項目 53 / 54 まで進行を実測**したところで回線が落ちた。
+   **ログは `~\st899-after.log` に残っている**ので、まずこれを読めば続きが分かる
+2. 実機テストのベースライン照合（`--no-fail-fast`。main が 14 コミット進んだので、
+   合わない場合は**同じ実機で main と突き合わせて「新規ゼロ」を見る**のが正）
 3. **実機のリポジトリはブランチ `w899` のまま**。`main` へ戻す
-4. 1〜2 が緑なら PR #931 を squash merge → #899 クローズ → この節の「⚠」を外す
+4. 1〜2 が緑なら PR #931 を squash merge → #899 クローズ
+
+##### A/B の意味が 8/24 から変わっている（**再開時の最大の注意点**）
+
+`87feff8` で LF 側の legacy 経路を撤去したので、いまの `TAKO_899_LEGACY=1` は
+**クォート（症状 2）だけ**を戻す。したがって**落ちるのは (d1) ではなく (d2)**:
+
+```
+TAKO_APP_SELF_TEST_FAILED: スターターが組む行は実シェルで実際に実行される (#899)
+TAKO_SELF_TEST_899: line="'C:\…\tako.exe' --version" dialect=powershell screen=…
+```
+
+(d1) は `launch_command_line_in(sh, …)`（env で切り替わらない方）を見ているので
+legacy でも通る。これは**「届いてはいるが実行されない」= #899 の症状そのもの**を
+狙って切り分ける形になっている。
+
+##### 実機の回線について（2026-08-26 の実測。作法へ追加）
+
+- **「数分つながって 10 分前後落ちる」を繰り返し、最後は 3 時間以上落ちたまま**だった。
+  Tailscale の control plane 上は `Online: True`（ノードの tailscaled は生きている）なのに
+  `CurAddr: False` で SSH・ICMP・`tailscale ping` がすべて通らない = データパスだけが死ぬ
+- **長いペイロードは通らない**。`scp` と 1.5KB 級の base64 ワンライナーは連続で失敗した。
+  **SSH コマンドは短く保ち、長い処理は切り離す**:
+  `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=…}`
+  でログへリダイレクトし、`EXITCODE=` 行を待つ（ビルドはこの形で通った）。
+  `cmd /v:on /c … & echo EXITCODE=!ERRORLEVEL! >> <log>` で終了コードを残せる
+- **GUI が要る arm は `schtasks /it` で切り離す**ので、回線が落ちても走り続ける。
+  結果はディスクに残るので、窓が開いた 1 回の短いコマンドで回収できる形にしておく
+- **`~\run-arms.ps1` は使わない**。日本語コメントが cp932 で壊れていて
+  「`directx_atlas` を見たら撃ち直す」の `if` 文がコメント行に飲まれている。
+  `~\arm-after.ps1` / `~\arm-before.ps1` は ASCII で健全なのでそのまま使える
+- **`Get-Content` は既定で cp932** なので、arm のログを読むときは `-Encoding UTF8` を付ける
 
 ##### 申し送り
 
