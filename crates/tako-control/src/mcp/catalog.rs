@@ -918,12 +918,13 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_file_op",
             "description": "ファイル操作を実行する。op で種別を指定:\n\
                 copy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\n\
-                reveal = Finder でファイルの場所を表示（macOS）/\n\
+                reveal = ファイルマネージャ（Finder / エクスプローラー）でファイルの場所を表示 /\n\
                 open_terminal = 指定パスのディレクトリへペイン内で cd /\n\
                 rename = name でファイル名を変更 / create_file = path 配下に name でファイル作成 /\n\
-                create_dir = path 配下に name でフォルダ作成 / trash = ゴミ箱へ移動 /\n\
-                open_default = デフォルトアプリで開く（macOS）/\n\
-                open_with = name で指定したアプリで開く（macOS。name 必須）。\n\
+                create_dir = path 配下に name でフォルダ作成 /\n\
+                trash = ゴミ箱（Windows はごみ箱）へ移動。完全削除ではないので復元できる /\n\
+                open_default = デフォルトアプリで開く /\n\
+                open_with = name で指定したアプリで開く（name 必須）。\n\
                 rename / create_file / create_dir / open_with は name パラメータが必須。\
                 open_terminal / copy_relative_path は pane パラメータでペインを指定する。",
             "inputSchema": {

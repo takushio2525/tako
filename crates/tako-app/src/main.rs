@@ -19103,15 +19103,17 @@ impl TakoApp {
             .flat_map(|t| t.tree().panes())
             .find(|p| p.id() == pane_id)
             .map(|p| p.limit_autoresume());
+        // ファイルマネージャの呼び名は OS で変わる（#617）
+        let fm = tako_control::platform::os_integration::file_manager();
         let mut items: Vec<(&str, &str)> = Vec::new();
         if is_preview {
             items.push(("copy-path", ui_text::pane_menu::copy_path()));
-            items.push(("reveal", ui_text::pane_menu::reveal()));
+            items.push(("reveal", ui_text::pane_menu::reveal(fm)));
             items.push(("open-default", ui_text::pane_menu::open_default()));
             items.push(("sep1", ""));
         } else if cwd.is_some() {
             items.push(("copy-cwd", ui_text::pane_menu::copy_cwd()));
-            items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd()));
+            items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd(fm)));
             items.push(("sep1", ""));
         }
         items.push(("split-right", ui_text::pane_menu::split_right()));

@@ -321,12 +321,17 @@ fn os連携の直呼びが境界の外に残っていない() {
              汎用の昇格 API を B8 に置くと危険なため境界 B9 の内側に留める",
         ),
     ];
-    // 実際にプロセスを起こす形だけを対象にする（コメント・ドキュメント中の言及は無視）
+    // 実際にプロセスを起こす形・シェル API を直接叩く形だけを対象にする
+    // （コメント・ドキュメント中の言及は無視）
     const PATTERNS: &[&str] = &[
         "Command::new(\"open\")",
         "Command::new(\"osascript\")",
         "Command::new(\"xdg-open\")",
         "\"/C\", \"start\"",
+        // Windows 側（#617）。プロセス起動ではなく FFI なので関数名で見る
+        "Command::new(\"explorer",
+        "ShellExecuteW(",
+        "SHFileOperationW(",
     ];
 
     let root = repo_root();
@@ -339,6 +344,54 @@ fn os連携の直呼びが境界の外に残っていない() {
         offenders.is_empty(),
         "OS シェル連携の直呼びが境界の外にある:\n  {}\n\
          → tako_control::platform::os_integration へ寄せてください（#522 / 設計 §2 の B8）",
+        offenders.join("\n  ")
+    );
+}
+
+/// **ゴミ箱への移動が完全削除へ劣化していない**（#617。データ消失の再発防止）。
+///
+/// 修正前は非 macOS の `move_to_trash` が `remove_file` / `remove_dir_all` で、
+/// ラベルは「Move to Trash」なのに復元できなかった。UI にもコマンドにも確認が無いので、
+/// 誰かが「未対応環境では消すだけにしておこう」と戻したら **無音でデータを失う**。
+/// 境界の実装本体（テストコードより前）に削除の直呼びが 1 つも無いことを固定する。
+/// ソース走査なので **macOS からも Windows CI からも同じ判定が走る**
+#[test]
+fn ゴミ箱移動が完全削除へ劣化していない() {
+    let path = repo_root().join("crates/tako-control/src/platform/os_integration.rs");
+    let src = std::fs::read_to_string(&path).expect("境界 B8 の実装本体を読める");
+
+    // 走査対象は実装だけ（テストは後始末で remove_file を使う）。
+    // 目印が無くなったら「走査範囲が空 = いつでも通る」になるので先に落とす
+    let (impl_src, _) = src
+        .split_once("#[cfg(test)]")
+        .expect("os_integration.rs に #[cfg(test)] の目印がある");
+
+    // 走査先を間違えていないこと（ファイル移動・改名で空振りするのを防ぐ）
+    assert!(
+        impl_src.contains("pub fn move_to_trash"),
+        "move_to_trash が見つからない: 走査先が間違っている"
+    );
+    assert!(
+        impl_src.contains("FOF_ALLOWUNDO"),
+        "Windows のごみ箱フラグが見つからない: 走査先が間違っている"
+    );
+
+    let mut offenders = Vec::new();
+    for (i, line) in impl_src.lines().enumerate() {
+        // コメント行の言及（「削除へ劣化させない」の説明）は対象外
+        let code = line.trim_start();
+        if code.starts_with("//") || code.starts_with("///") {
+            continue;
+        }
+        for pattern in ["remove_file(", "remove_dir_all(", "remove_dir("] {
+            if code.contains(pattern) {
+                offenders.push(format!("os_integration.rs:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "ゴミ箱への移動が完全削除になりうる（復元できない）:\n  {}\n         → ゴミ箱へ入れられない環境では削除せずエラーにしてください（#617）",
         offenders.join("\n  ")
     );
 }

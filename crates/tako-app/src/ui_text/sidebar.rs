@@ -1,5 +1,7 @@
 //! 左サイドバー（ファイルツリー）の文言（キー: sidebar.*）
 
+use tako_control::platform::os_integration::FileManager;
+
 // --- コンテキストメニュー（FR-3.12 / #314。キー: sidebar.menu_*） ---
 
 pub fn menu_copy_rel() -> &'static str {
@@ -8,8 +10,14 @@ pub fn menu_copy_rel() -> &'static str {
 pub fn menu_copy_abs() -> &'static str {
     tr!("絶対パスをコピー", "Copy absolute path")
 }
-pub fn menu_reveal() -> &'static str {
-    tr!("Finder で表示", "Reveal in Finder")
+/// ファイルマネージャの呼び名は OS ごとに違う（#617）。
+/// 「Finder で表示」を Windows で出すと、押しても何も起きないうえに何を指すか伝わらない。
+/// 判定は境界 B8（`os_integration::file_manager`）の 1 か所で、ここは値を受け取るだけ
+pub fn menu_reveal(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("Finder で表示", "Reveal in Finder"),
+        FileManager::Explorer => tr!("エクスプローラーで表示", "Reveal in Explorer"),
+    }
 }
 pub fn menu_open_term() -> &'static str {
     tr!("ターミナルで開く", "Open in terminal")
@@ -29,8 +37,14 @@ pub fn menu_new_file() -> &'static str {
 pub fn menu_new_dir() -> &'static str {
     tr!("新しいフォルダ", "New folder")
 }
-pub fn menu_trash() -> &'static str {
-    tr!("削除", "Move to Trash")
+/// ごみ箱の呼び名も OS ごとに違う（ファイルマネージャと同じ「OS のシェル」の軸なので
+/// 同じ値で決める）。**この操作が復元可能であること**をラベルで約束しているので、
+/// 実装（B8 の `move_to_trash`）と表記を必ず揃える（#617）
+pub fn menu_trash(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("削除", "Move to Trash"),
+        FileManager::Explorer => tr!("ごみ箱に移動", "Move to Recycle Bin"),
+    }
 }
 pub fn menu_remove_root() -> &'static str {
     tr!("ツリーから除去", "Remove from tree")
@@ -83,14 +97,16 @@ mod tests {
             vec![
                 menu_copy_rel().to_string(),
                 menu_copy_abs().to_string(),
-                menu_reveal().to_string(),
+                menu_reveal(FileManager::Finder).to_string(),
+                menu_reveal(FileManager::Explorer).to_string(),
                 menu_open_term().to_string(),
                 menu_open_default().to_string(),
                 menu_open_with().to_string(),
                 menu_rename().to_string(),
                 menu_new_file().to_string(),
                 menu_new_dir().to_string(),
-                menu_trash().to_string(),
+                menu_trash(FileManager::Finder).to_string(),
+                menu_trash(FileManager::Explorer).to_string(),
                 menu_remove_root().to_string(),
                 hidden_show().to_string(),
                 hidden_hide().to_string(),
