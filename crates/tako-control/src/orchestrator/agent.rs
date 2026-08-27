@@ -90,7 +90,10 @@ impl WorkerAgent {
             Self::Codex => &[
                 "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
             ],
-            Self::Agy => &[],
+            // agy の --effort（実測 1.1.22: `agy models` の全モデルで不正値が
+            // `invalid --effort "bogus" (valid: low, medium, high)` として咎められる。
+            // 表示名の "(High)" 等はモデル側の設定で、--effort とは別物。#1002）
+            Self::Agy => &["low", "medium", "high"],
         }
     }
 
@@ -198,6 +201,27 @@ pub fn build_worker_cmd(launch: &WorkerLaunch) -> String {
     build_worker_cmd_in(launch, crate::launch_cmd::launch_dialect())
 }
 
+/// agy へ付ける effort の断片。**判断を純粋関数に置く**ので、env を読まずに
+/// 新旧どちらの形も検査できる（env グローバルを触るテストは並列で競合する。#608 / #807）
+pub(crate) fn agy_effort_suffix(
+    effort: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+    legacy: bool,
+) -> String {
+    if legacy {
+        return String::new();
+    }
+    format!(" --effort {}", crate::launch_cmd::quote(dialect, effort))
+}
+
+/// #1002 の A/B 用の env。`TAKO_1002_LEGACY=1` で**同一バイナリのまま**
+/// 「agy には effort を渡さない」旧挙動へ戻す
+pub fn legacy_skip_agy_effort() -> bool {
+    std::env::var("TAKO_1002_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// 方言を明示して組み立てる（#867。macOS 上から PowerShell 側の出力を検証するため）
 pub fn build_worker_cmd_in(
     launch: &WorkerLaunch,
@@ -232,8 +256,13 @@ pub fn build_worker_cmd_in(
                 " -c model_reasoning_effort={}",
                 lc::quote(dialect, effort)
             )),
-            // agy に effort 指定は無い（モデル名の "(High)" 等に組込み）
-            WorkerAgent::Agy => {}
+            // agy にも `--effort low|medium|high` が実在する（#1002 で実測）。
+            // 旧挙動（何も付けない）へは `TAKO_1002_LEGACY=1` で戻せる
+            WorkerAgent::Agy => cmd.push_str(&agy_effort_suffix(
+                effort,
+                dialect,
+                legacy_skip_agy_effort(),
+            )),
         }
     }
     if launch.skip_permissions {
@@ -468,23 +497,40 @@ mod tests {
     }
 
     #[test]
-    fn agy_cmd_ignores_effort_and_quotes_model() {
-        // agy のモデル名は空白・括弧入りの表示名（"Gemini 3.5 Flash (High)" 等）
-        let cmd = build_worker_cmd_in(
-            &WorkerLaunch {
-                agent: WorkerAgent::Agy,
-                role: "worker:demo",
-                model: Some("Gemini 3.5 Flash (High)"),
-                effort: Some("high"),
-                ..Default::default()
-            },
-            POSIX,
-        );
+    fn agy_cmd_passes_effort_and_quotes_model() {
+        // agy のモデル名は空白・括弧入りの表示名（"Gemini 3.5 Flash (High)" 等）。
+        // effort は `--effort low|medium|high`（#1002 で実測。CLI 自身が valid 値を挙げる）
+        let launch = WorkerLaunch {
+            agent: WorkerAgent::Agy,
+            role: "worker:demo",
+            model: Some("Gemini 3.5 Flash (High)"),
+            effort: Some("high"),
+            ..Default::default()
+        };
         assert_eq!(
-            cmd,
-            "TAKO_ORCHESTRATOR_ROLE='worker:demo' agy --model 'Gemini 3.5 Flash (High)'"
+            build_worker_cmd_in(&launch, POSIX),
+            "TAKO_ORCHESTRATOR_ROLE='worker:demo' agy --model 'Gemini 3.5 Flash (High)' --effort high"
         );
-        assert!(!cmd.contains("effort"), "agy に effort は渡さない");
+        // 語彙の正本と食い違わない（ピッカーで選べた値が起動で弾かれない）
+        assert_eq!(
+            WorkerAgent::Agy.effort_options(),
+            ["low", "medium", "high"],
+            "agy 1.1.22 の --help / 不正値エラーが挙げる値"
+        );
+    }
+
+    /// #1002 の A/B。`TAKO_1002_LEGACY=1` で「agy に effort を渡さない」旧挙動へ戻せる。
+    /// 判断は純粋関数なので env グローバルに触らずに新旧の両方を検査できる
+    #[test]
+    fn agy_effort_suffix_has_legacy_form() {
+        assert_eq!(agy_effort_suffix("high", POSIX, false), " --effort high");
+        assert_eq!(agy_effort_suffix("high", POSIX, true), "");
+        // 値のクオートは方言の 1 本（`launch_cmd::quote`）を通る。
+        // PowerShell は常に囲む形なので codex の `-c model_reasoning_effort=` と同じ見た目になる
+        assert_eq!(
+            agy_effort_suffix("high", crate::launch_cmd::ShellDialect::PowerShell, false),
+            " --effort 'high'"
+        );
     }
 
     #[test]

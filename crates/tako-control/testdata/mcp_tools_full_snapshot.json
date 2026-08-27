@@ -3340,6 +3340,26 @@
     "name": "tako_setup_bootstrap"
   },
   {
+    "description": "エージェント CLI が使えるモデルの一覧を返す（Issue #1002）。読み取り専用。**モデルを勧める前に必ずこれを引くこと**（学習時点の知識で存在しないモデル名を提案すると起動が失敗する）。一覧は各 CLI の一覧コマンドから実取得する（codex = `codex debug models` / agy = `agy models`）。claude は該当コマンドが無いので同梱の既知エイリアス（opus / sonnet / fable）+ ローカルキャッシュを返し、failure.kind = no_list_command で「実取得ではない」ことを明示する。各モデルの efforts はその系統・そのモデルが受け付ける effort 語彙（codex はモデルごとに違う）なので、effort はここに載っている値から選ぶ。失敗は failure.kind で分類される（cli_not_found = 未導入・install に導入手順 / not_authenticated = 未ログイン / no_list_command = 一覧コマンドが無い / command_failed / parse_failed）。**選んだ値の反映はこのツールではしない**: tako_orchestrator_profiles の model / effort へ書くこと（apply_command が形を示す）。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "description": "対象の系統（省略時 = all で全系統）",
+          "enum": [
+            "claude",
+            "codex",
+            "agy",
+            "all"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_setup_models"
+  },
+  {
     "description": "tako setup を非対話で実行する（Issue #262）。ユーザーが日本語で伝えた好みを answers に変換して代行する。省略項目は detected → previous → default の順で自動解決され、標準ケースは質問ゼロで完走する。instructions / profile / projects / orchestrator / sleep_guard は明示指定時だけ既存値を更新する。",
     "inputSchema": {
       "additionalProperties": false,

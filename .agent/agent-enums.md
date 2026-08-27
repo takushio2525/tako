@@ -58,6 +58,7 @@
 | `agent_install::AgentKind` → `Agent` | 同上 |
 | `WorkerAgent` ⇄ `Agent` | `tako-control/src/orchestrator/agent.rs`（`From` / `TryFrom`） |
 | `agents_sync::AgentKind` → `Agent` | 変換は持たず `label()` の表記一致で縛る |
+| `SetupAgent` → `WorkerAgent` | `tako-cli/src/setup.rs`（`worker_agent_of`。**非公開 enum なので `From` を持てない**ので、`as_str()` 一致を単体テスト `系統の写しは新しいenumを作らずに済んでいる` で縛る。#1002） |
 
 **`Agent` → `WorkerAgent` は `TryFrom`**（`Local` を落とす部分写像）。
 ローカル LLM を worker として起動できるようになったら、ここが変換できるようになる時点で
@@ -83,6 +84,7 @@
 | `dispatch.rs` の transcript アダプタ | claude 固定（拡張点のコメントあり） | #984 |
 | `WorkerLaunch` の MCP 注入 | 配線が無い | #986 |
 | `agent_install::AgentKind` の拡張 | Claude 1 値 | #989 |
+| モデル一覧の取得手段（`agent_models::catalog_argv`） | 系統ごとの `match`。**能力マトリクスには「ピッカーが使えるか」だけ**が載る（claude = 基準系 = 全 Supported の不変条件があるため、取得手段の差はマトリクスの 1 マスでは表せない） | #1002（済） |
 
 ## 新しい系統を足すとき
 

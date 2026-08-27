@@ -2578,6 +2578,15 @@ struct SetupArgs {
 /// ゼロスタート導入（#868）を AI から段ごとに操作するための入口
 #[derive(Subcommand)]
 enum SetupCommand {
+    /// 各エージェント CLI が使えるモデル一覧を表示する（#1002）
+    Models {
+        /// 対象の系統（claude / codex / agy。省略で全系統）
+        #[arg(long)]
+        agent: Option<String>,
+        /// 出力を JSON にする（MCP tako_setup_models と同一ペイロード）
+        #[arg(long)]
+        json: bool,
+    },
     /// エージェント CLI の導入状況を確認・実行する（#868）
     Bootstrap {
         /// status（既定・読み取り専用）/ install / path / undo-path
@@ -2829,7 +2838,9 @@ fn cli_main() -> ExitCode {
             // setup も表示言語を settings.json から解決する（#435。移行の説明文など
             // Note ベースの文言がここを通るので、設定が ja なら日本語で出る）
             tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
-            if let Some(SetupCommand::Bootstrap {
+            if let Some(SetupCommand::Models { ref agent, json }) = args.command {
+                setup::run_models(agent.as_deref(), json)
+            } else if let Some(SetupCommand::Bootstrap {
                 ref action,
                 dry_run,
                 json,

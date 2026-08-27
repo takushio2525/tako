@@ -28,6 +28,7 @@
 
 pub mod acceptance_gates;
 pub mod agent_mcp;
+pub mod agent_models;
 pub mod agent_support;
 pub mod agents;
 pub mod agents_sync;

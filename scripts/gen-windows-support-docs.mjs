@@ -75,6 +75,7 @@ const CATEGORIES = [
   ]],
   ['セットアップと設定', [
     'tako_setup', 'tako_setup_bootstrap', 'tako_setup_changes', 'tako_setup_mcp',
+    'tako_setup_models',
     'tako_settings', 'tako_migrate', 'tako_agents_sync_rules',
     'tako_config_share', 'tako_platform', 'tako_agent_support',
   ]],

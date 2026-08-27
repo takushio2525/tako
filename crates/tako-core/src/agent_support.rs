@@ -281,6 +281,8 @@ pub mod keys {
     pub const SETUP_DETECT: &str = "setup_detect";
     /// setup の MCP 恒久登録
     pub const SETUP_MCP_REGISTER: &str = "setup_mcp_register";
+    /// setup でのモデル選択（一覧の取得手段は系統ごとに違う。#1002）
+    pub const SETUP_MODEL_PICKER: &str = "setup_model_picker";
     /// setup のプラン検出
     pub const SETUP_PLAN_DETECT: &str = "setup_plan_detect";
     /// setup の推奨プロファイル生成
@@ -377,12 +379,6 @@ pub mod notes {
     pub const AGY_NO_LIMIT_RESET: Note = Note::new(
         "agy はクレジットを使い切っても「解除を待つ」出口が無い（買い足す導線しか無い）ので、待って再開するという動作が成立しない（#985）",
         "When agy runs out of credits there is no \"wait for the reset\" exit at all, only a purchase link, so waiting and resuming cannot work (#985)",
-    );
-
-    /// effort が CLI 引数ではなくモデル名に埋まっている
-    pub const AGY_EFFORT_IN_MODEL: Note = Note::new(
-        "agy は effort を CLI から指定できない（モデル名の \"(High)\" 等に組み込まれている）",
-        "agy has no CLI option for effort; it is baked into the model name (e.g. \"(High)\")",
     );
 
     // ─── 実測で分かっている縮退 ─────────────────────────────────
@@ -606,11 +602,17 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: unsupported(notes::AGY_EFFORT_IN_MODEL),
+        agy: S::Supported,
         local: local_pending(),
-        evidence: AgentEvidence::Source(
-            "orchestrator/agent.rs: claude は --effort、codex は -c model_reasoning_effort= へ \
-             写像する。agy は effort_options() が空で、コマンド組み立ても何も付けない",
+        evidence: AgentEvidence::Measured(
+            "#1002 の実測（agy 1.1.22）: `--effort（low|medium|high）` が --help に実在し、\
+             `agy models` が挙げる 6 モデルすべてで不正値が \
+             `invalid --effort \"bogus\" (valid: low, medium, high)` として咎められる \
+             = 表示名に \"(High)\" 等を含むモデルでも --effort の検証が走る。正しい組み合わせは \
+             検証を通り API 呼び出しへ進む。**未知のモデル名のときだけ** \
+             `--effort is not supported for model \"…\"` になる（この文言を「agy は effort 非対応」と \
+             読み違えないこと）。orchestrator/agent.rs は claude = --effort / \
+             codex = -c model_reasoning_effort= / agy = --effort へ写像する（旧挙動は TAKO_1002_LEGACY=1）",
         ),
     },
     AgentFeature {
@@ -838,12 +840,37 @@ pub const MATRIX: &[AgentFeature] = &[
             "Setup registers tako's MCP server with this CLI persistently",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 979),
-        agy: pending(notes::NOT_WIRED, 979),
+        codex: S::Supported,
+        agy: S::Supported,
         local: local_pending(),
-        evidence: AgentEvidence::Source(
-            "setup-mcp の書き先は ~/.claude.json と .mcp.json だけ（棚卸し §5）。\
-             codex / agy の設定ファイルへ書く経路が無い",
+        evidence: AgentEvidence::Measured(
+            "#979（main の 63a7c26）で `tako setup-mcp` が 3 系統へ登録するようになった。\
+             書き先は claude = ~/.claude.json / codex = ~/.codex/config.toml の \
+             [mcp_servers.tako] / agy = ~/.gemini/config/mcp_config.json で、codex は \
+             env_vars 許可リストまで足して実セッションから tako_list_panes が通ることを実測。\
+             正本は tako-control::agent_mcp",
+        ),
+    },
+    AgentFeature {
+        key: keys::SETUP_MODEL_PICKER,
+        summary: Note::new(
+            "setup でモデルを選んでプロファイルへ反映できる（一覧は CLI から実取得し、\
+             一覧コマンドを持たない系統は同梱の既知リスト + 取得不可の明示。#1002）",
+            "Setup can pick a model and write it to the profile (the list is fetched from the CLI; \
+             agents without a list command fall back to a built-in list and say so explicitly) (#1002)",
+        ),
+        claude: S::Supported,
+        codex: S::Supported,
+        agy: S::Supported,
+        local: local_pending(),
+        evidence: AgentEvidence::Measured(
+            "#1002 の実測（2026-08-27）: codex 0.150.1 は `codex debug models` が \
+             `Render the raw model catalog as JSON` で slug / display_name / \
+             supported_reasoning_levels / context_window を返す（未認証でも既定カタログ、 \
+             認証すると内容が変わる）。agy 1.1.22 は `agy models` が `id<TAB>表示名` の TSV を \
+             stdout へ返し未認証は exit 1 + `Please sign in to view available models.`。 \
+             claude 2.1.232 は該当サブコマンドが無く `claude models` は**プロンプトとして \
+             解釈される**（一覧はセッション内の /model のみ）",
         ),
     },
     AgentFeature {

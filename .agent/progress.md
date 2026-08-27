@@ -3630,3 +3630,53 @@
 - **副産物（別 Issue 化が要る）**: claude 2.1.232 の `agents --json` に
   **`contextPercentUsed` / `model` が無い**（実測 13 件すべて null）→ `orchestrator self` の
   `ctx_percent` / `ctx_over_threshold` が常に null = **#749 の自動ハンドオフがこの経路から発火しない**
+## 2026-08-27（#1002: setup のエージェント選択とモデルの実取得ピッカー）
+- **モデル一覧の取得手段を実物で確定**（憶測禁止の要件）: **codex = `codex debug models`**
+  （`Render the raw model catalog as JSON`。`visibility=list` を `priority` 昇順で並べ、
+  `supported_reasoning_levels` から**モデル別**の effort 語彙と `context_window` も取る。
+  未認証でも既定カタログを返し、認証すると内容が変わる = ユーザー固有）/ **agy = `agy models`**
+  （stdout に `id<TAB>表示名`。stderr は進捗。未認証は exit 1 + `Please sign in ...`）/
+  **claude は一覧コマンドを持たない**（`claude models` は**プロンプトとして解釈され実際に
+  セッションが走る**。`~/.claude/.claude.json` の `modelAccessCache` は空・
+  `additionalModelOptionsCache` は 1 件だけの部分キャッシュ）→ 同梱の**エイリアス**
+  （`opus` / `sonnet` / `fable` = `claude --model` の help が documented している語）+
+  キャッシュを加算し `failure.kind = no_list_command` で明示
+- 正本は `tako-control::agent_models`（argv・純粋パーサ・5 種の失敗分類）。実出力を fixture へ
+  固定（`testdata/codex_debug_models.json` は**読まないフィールド 2 つを残して**知らないキーの
+  無視も検査）。CLI `tako setup models` / MCP `tako_setup_models`（**142 ツール**）で、
+  **反映は既存の `tako orchestrator profiles set` に任せ書き込みツールを増やさない**
+- **対話ピッカーは `--review` だけ**（#262 の質問ゼロを壊さない）。標準経路は
+  「いま何が選ばれているか + 選択肢の件数 + `tako setup models` / `--review`」の 2 行。
+  **1 番は常に「CLI の既定に任せる」**（#27 / #67 の教訓）。未導入の系統も選択肢に並び、
+  選ぶと #983 の導入案内が返る
+- **agy の `--effort` を実測で確定して配線**（マトリクスの `effort_control` を Unsupported →
+  Supported）: `agy models` の**全モデル**で `--effort low|medium|high` の検証が走る
+  （不正値は `invalid --effort "bogus" (valid: low, medium, high)`）。表示名の `(High)` は
+  モデル側の設定で別物。**未知のモデル名のときだけ** `--effort is not supported for model "…"`
+  になるので読み違えないこと。A/B は `TAKO_1002_LEGACY=1`
+- **能力マトリクスの設計上の限界を 1 つ確認**: `claudeは基準系なので全て対応済み` が
+  claude = 全 Supported を強制するので、**claude が最弱になる能力は 1 マスで表せない**。
+  能力を「setup でモデルを選べるか」（3 系統 Supported）へ切り出し、取得手段の差は実行時の
+  `source`（cli / builtin / none）+ `failure.kind` で表した（`.agent/agent-enums.md` に記録）
+- **#979 の過小申告を是正**: `setup_mcp_register` が codex / agy とも `Pending(#979)` のまま
+  だった（#982 が #979 の merge 前に書かれた）。system prompt へ流れるので Supported へ
+- 検証: fmt / clippy(-D warnings、--all-targets) / `cargo test --workspace` /
+  docs 2 本の `--check` / **実 3 系統の通し**（expect で TTY を張り claude → opus・
+  codex → gpt-5.6-sol・agy → gemini-3.7-flash-medium を選んでプロファイルへ反映）/
+  失敗 3 種の実測（`no_list_command` / `not_authenticated` = 隔離 HOME /
+  `cli_not_found` = ログインシェルの PATH を絞る）/ **冪等性**（標準再実行と
+  `--review` の「1 = 変更しない」でプロファイルがバイト一致）
+- 実測で見つけて直した欠陥 2 件: ①`--review` で既存プロファイルと**別の系統**を選ぶと
+  master のモデル名が混ざる（master=claude のプロファイルへ codex のモデルを書いていた）→
+  master が選択系統で動いているときだけ master 側へ書く ②agy へ `--master-agent agy` を
+  勧めていた（agy は master 非対応 = 起動前エラーになる案内）
+- **測り方の落とし穴**: `script -q` + パイプ入力は**先頭の 1 行が消える**（`^D` が echo される）
+  ので質問と入力がずれる → `expect` で 1 問ずつ送る。zsh スクリプト内の `cmd &` は
+  **stdin が /dev/null になる**ので TTY 判定が false になりピッカーが出ない（foreground + 別途 killer）。
+  agy の検査は**空プロンプト検査が先**に走るので `-p ""` では effort の受理を測れない
+- **事故**: `~/.claude.json` / `~/.claude/.claude.json` を「変更検知 → 復元」の対象に入れたが、
+  この 2 つは**稼働中の claude が常時書いている**ので比較は無意味だった（2 分前の写しへ
+  巻き戻した。直後に稼働セッションが上書きし JSON も tako MCP 登録も健全）。setup が
+  決定的に書く 3 ファイル（`CLAUDE.md` / `config.toml` / `mcp_config.json`）は**すべて不変**。
+  以後、実設定の原状回復検査は**稼働プロセスが書かないファイルだけ**を対象にする
+- 関連: PR（`Refs #1002`）。FR-2.32 を新設

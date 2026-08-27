@@ -16,14 +16,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 40 件の内訳です。
+能力 41 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 40 / 40 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 24 / 40 | 5 | 10 | 1 |
-| Antigravity CLI | 9 / 40 | 6 | 18 | 7 |
-| Local LLM | 0 / 40 | 0 | 35 | 5 |
+| Claude Code（基準） | 41 / 41 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 26 / 41 | 5 | 9 | 1 |
+| Antigravity CLI | 12 / 41 | 6 | 17 | 6 |
+| Local LLM | 0 / 41 | 0 | 36 | 5 |
 
 ### 状態の意味
 
@@ -65,7 +65,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **CLI 自体が入っていない環境へ setup が導入する（#868）**<br />`setup_cli_install` | 対応 | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#989](https://github.com/takushio2525/tako/issues/989)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: platform/agent_install.rs の AgentKind が Claude 1 値しか持たず、recipe() も claude ぶんしか無い（#868 の Out of scope。拡張は #989） |
 | **setup が起動プロファイルを組み立てる**<br />`setup_profile_recommend` | 対応 | 対応 | 一部対応<br />worker としてのプロファイルは作れるが、master には別系統が自動で選ばれる | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup.rs は選択した agent を worker_agent へ書くが、master_agent は claude / codex しか受け付けない（agy は起動前エラーになるため） |
 | **共通ルールをこの CLI のグローバル指示ファイルへ同期する（#136）**<br />`setup_rules_sync` | 対応 | 対応 | 対応 | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ （~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md） |
-| **setup が tako の MCP サーバーをこの CLI へ恒久登録する**<br />`setup_mcp_register` | 対応 | 未対応 [#979](https://github.com/takushio2525/tako/issues/979)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#979](https://github.com/takushio2525/tako/issues/979)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: setup-mcp の書き先は ~/.claude.json と .mcp.json だけ（棚卸し §5）。codex / agy の設定ファイルへ書く経路が無い |
+| **setup が tako の MCP サーバーをこの CLI へ恒久登録する**<br />`setup_mcp_register` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #979（main の 63a7c26）で `tako setup-mcp` が 3 系統へ登録するようになった。書き先は claude = ~/.claude.json / codex = ~/.codex/config.toml の [mcp_servers.tako] / agy = ~/.gemini/config/mcp_config.json で、codex は env_vars 許可リストまで足して実セッションから tako_list_panes が通ることを実測。正本は tako-control::agent_mcp |
+| **setup でモデルを選んでプロファイルへ反映できる（一覧は CLI から実取得し、一覧コマンドを持たない系統は同梱の既知リスト + 取得不可の明示。#1002）**<br />`setup_model_picker` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1002 の実測（2026-08-27）: codex 0.150.1 は `codex debug models` が `Render the raw model catalog as JSON` で slug / display_name / supported_reasoning_levels / context_window を返す（未認証でも既定カタログ、 認証すると内容が変わる）。agy 1.1.22 は `agy models` が `id<TAB>表示名` の TSV を stdout へ返し未認証は exit 1 + `Please sign in to view available models.`。 claude 2.1.232 は該当サブコマンドが無く `claude models` は**プロンプトとして 解釈される**（一覧はセッション内の /model のみ） |
 
 ## オーケストレーター（master / solo）
 
@@ -87,7 +88,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **worker を立てるときに系統を選べる（設定の書き換えや再起動なしで）**<br />`agent_select_at_spawn` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: orchestrator/agent.rs の WorkerAgent が spawn 引数・プロファイルの両方から 解決され、build_worker_cmd_in が 3 系統ぶんのコマンドを組む。ペイン単位・タスク単位の切替導線は #988 |
 | **作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）**<br />`worker_trust` | 対応 | 一部対応<br />設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない | 一部対応<br />設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: orchestrator/agent.rs の ensure_trusted_in が 3 系統ぶん書き分けてある （claude = <config dir>/.claude.json / codex = ~/.codex/config.toml / agy = ~/.gemini/antigravity-cli/settings.json）。claude 以外は固定パス |
 | **起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）**<br />`worker_bypass_preaccept` | 対応 | 未対応 [#983](https://github.com/takushio2525/tako/issues/983)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#983](https://github.com/takushio2525/tako/issues/983)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い） | コード本文: dispatch.rs の事前承諾は 2 箇所とも WorkerAgent::Claude を条件にしている。codex / agy は default_skip_permissions() が true なので常に skip 側なのに 事前承諾が無い（棚卸し §1.3(c)） |
-| **thinking / reasoning effort を tako から指定する**<br />`effort_control` | 対応 | 対応 | 対象外<br />agy は effort を CLI から指定できない（モデル名の "(High)" 等に組み込まれている） | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: orchestrator/agent.rs: claude は --effort、codex は -c model_reasoning_effort= へ 写像する。agy は effort_options() が空で、コマンド組み立ても何も付けない |
+| **thinking / reasoning effort を tako から指定する**<br />`effort_control` | 対応 | 対応 | 対応 | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1002 の実測（agy 1.1.22）: `--effort（low\|medium\|high）` が --help に実在し、`agy models` が挙げる 6 モデルすべてで不正値が `invalid --effort "bogus" (valid: low, medium, high)` として咎められる = 表示名に "(High)" 等を含むモデルでも --effort の検証が走る。正しい組み合わせは 検証を通り API 呼び出しへ進む。**未知のモデル名のときだけ** `--effort is not supported for model "…"` になる（この文言を「agy は effort 非対応」と 読み違えないこと）。orchestrator/agent.rs は claude = --effort / codex = -c model_reasoning_effort= / agy = --effort へ写像する（旧挙動は TAKO_1002_LEGACY=1） |
 | **アカウント（資格情報）の切替に追従する**<br />`account_switch` | 対応 | 未対応 [#975](https://github.com/takushio2525/tako/issues/975)<br />設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない | 未対応 [#975](https://github.com/takushio2525/tako/issues/975)<br />設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: orchestrator/agent.rs の事前信頼は claude だけ CLAUDE_CONFIG_DIR（#512 / #558）を 見て書き先を決め、codex は ~/.codex/config.toml、agy は ~/.gemini/antigravity-cli/settings.json を固定で開く（同ファイルのコメントが明示） |
 
 ## worker の監視

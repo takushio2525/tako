@@ -1207,6 +1207,14 @@ pub enum Request {
         #[serde(default)]
         dry_run: Option<bool>,
     },
+    /// 利用可能なモデル一覧の照会（Issue #1002。**読み取り専用**）。
+    /// `agent` 省略で全系統。取得手段は各 CLI の一覧コマンド（codex = `codex debug models` /
+    /// agy = `agy models`）で、持たない系統（claude）は同梱の既知リスト + 取得不可の明示。
+    /// 選んだ値の反映は `OrchestratorProfiles`（`--model` / `--effort`）が担当する
+    SetupModels {
+        #[serde(default)]
+        agent: Option<String>,
+    },
     /// setup を非対話実行する（Issue #262）。answers は CLI `tako setup --answers` と同じ JSON。
     SetupRun {
         #[serde(default)]
@@ -1873,6 +1881,10 @@ mod tests {
         assert_eq!(Request::List.kind_name(), "List");
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
         assert_eq!(Request::SetupRun { answers: None }.kind_name(), "SetupRun");
+        assert_eq!(
+            Request::SetupModels { agent: None }.kind_name(),
+            "SetupModels"
+        );
         assert_eq!(
             Request::SetupBootstrap {
                 action: None,
