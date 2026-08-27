@@ -494,6 +494,23 @@ enum RemoteFolderCommand {
         #[arg(long)]
         no_focus: bool,
     },
+    /// リモートへ押し出せていない保存の一覧（切断中の保存はここに残る。#966）
+    Pending {
+        /// ~/.ssh/config の Host 名（省略時は全ホスト）
+        host: Option<String>,
+        /// リモート側のファイルの絶対パス（省略時はそのホストの全部）
+        path: Option<String>,
+    },
+    /// 押し出せていない保存を再試行する（#966）
+    Push {
+        /// ~/.ssh/config の Host 名（省略時は全件）
+        host: Option<String>,
+        /// リモート側のファイルの絶対パス（省略時はそのホストの全部）
+        path: Option<String>,
+        /// 競合（開いた時点からリモートが変わっている）を承知のうえ上書きする
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6392,6 +6409,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: *tab,
                 focus: None,
                 all: false,
+                force: false,
             },
             RemoteFolderCommand::Close {
                 host,
@@ -6405,6 +6423,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: *tab,
                 focus: None,
                 all: *all,
+                force: false,
             },
             RemoteFolderCommand::List => Request::RemoteFolder {
                 action: "list".into(),
@@ -6413,6 +6432,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: None,
                 focus: None,
                 all: false,
+                force: false,
             },
             RemoteFolderCommand::Ls { host, path } => Request::RemoteFolder {
                 action: "ls".into(),
@@ -6421,6 +6441,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: None,
                 focus: None,
                 all: false,
+                force: false,
             },
             RemoteFolderCommand::OpenFile {
                 host,
@@ -6433,6 +6454,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: None,
                 focus: Some(!no_focus),
                 all: false,
+                force: false,
             },
             RemoteFolderCommand::SshPane {
                 host,
@@ -6445,6 +6467,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: None,
                 focus: Some(!no_focus),
                 all: false,
+                force: false,
+            },
+            RemoteFolderCommand::Pending { host, path } => Request::RemoteFolder {
+                action: "pending".into(),
+                host: host.clone(),
+                path: path.clone(),
+                tab: None,
+                focus: None,
+                all: false,
+                force: false,
+            },
+            RemoteFolderCommand::Push { host, path, force } => Request::RemoteFolder {
+                action: "push".into(),
+                host: host.clone(),
+                path: path.clone(),
+                tab: None,
+                focus: None,
+                all: false,
+                force: *force,
             },
         },
         Command::Task(sub) => match sub {

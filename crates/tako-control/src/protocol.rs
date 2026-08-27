@@ -1441,6 +1441,9 @@ pub enum Request {
         /// `close` でホスト指定なしに全部閉じる
         #[serde(default)]
         all: bool,
+        /// `push` で競合を承知のうえ上書きする（#966）
+        #[serde(default)]
+        force: bool,
     },
     /// 最近開いた項目の一覧・クリア（#20）。
     /// `action`: "list" / "clear"

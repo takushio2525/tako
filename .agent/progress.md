@@ -3351,3 +3351,23 @@
   項目 129 が FAILED（検出力）+ 番犬ユニット（領域の中の 4 要素が `occlude_scrolling` を使う）+
   delta 規則のユニット + fmt / clippy / `cargo test --workspace` 全緑 + CI 全 pass
 - 関連コミット: PR #968（`Refs #961`）
+
+## 2026-08-27（#966: リモートファイルの編集・保存を SFTP の書き戻しで開放）
+- 段階 1（#919）が編集を構造的に禁じていたのを、**禁止を外す代わりの 3 つ**へ置き換えた:
+  一時ファイル + `rename` のアトミック書き戻し（`posix-rename` は既存を上書き = Linux /
+  Windows 実機で実測）/ **内容そのもの**を突き合わせる競合検知（`ls -la` の日時は分の
+  分解能しかなく同じ分・同じサイズの書き換えを見逃す）/ 押し出せなかった保存の退避と再試行
+- `put` は元の mode を引き継がない（実測 `-rwxr-xr-x` → `-rw-r--r--` = **実行権が落ちる**）ので
+  POSIX として読める mode なら `chmod` で戻す。Windows は権限欄が `*` 埋めで効かないので送らない
+- **GUI の ⌘S はローカルへ同期・リモートへは背景**（1 バッチ 1〜2 秒の実測。UI スレッドで
+  待たない）。**dispatch = CLI / MCP は同期**で、応答の `remote.state` で書けたかが読める。
+  CLI `remote-folder pending` / `push [--force]` + MCP の同 action / `force` を 1:1 追加
+- 検証: 実 SSH 先 2 台（Linux / Windows 11 + PowerShell）で e2e 6/6（読み戻しは **tako の
+  実装を通さない素の sftp**）+ 隔離 GUI + 実 CLI で編集 → 保存 → 競合 → 退避 → 再試行の通し +
+  品質ゲート全緑（test 2640）+ クロスチェック エラー 0・警告 12（main 同数）+
+  セルフテスト `TAKO_APP_SELF_TEST_OK`。検出力は `TAKO_966_LEGACY=1` と押し出しの revert で実測
+- 読み直しで見つけた欠陥 2 件も同 PR で修正: 一時ファイル名が内容の大きさ由来で
+  **同じ大きさの 2 ファイルの同時保存が取り違える** / ヘッダのチップが `has_pending()` を
+  毎フレーム呼んでいた（開いたときの 1 回へ）
+- 関連: PR #969（Closes #966 は master 判断で実利用確認後）。**visual-test は未実施**
+  （この機はウィンドウが描画されず 1 checkpoint も進まない = #828 の既知）

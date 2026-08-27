@@ -1623,6 +1623,7 @@ impl TakoApp {
                 tab: None,
                 focus: Some(true),
                 all: false,
+                force: false,
             },
             PaneOrigin::User,
         );
@@ -1671,6 +1672,7 @@ impl TakoApp {
                         tab: None,
                         focus: Some(true),
                         all: false,
+                        force: false,
                     },
                     PaneOrigin::User,
                 );
@@ -1688,6 +1690,7 @@ impl TakoApp {
                         tab: None,
                         focus: None,
                         all: false,
+                        force: false,
                     },
                     PaneOrigin::User,
                 );

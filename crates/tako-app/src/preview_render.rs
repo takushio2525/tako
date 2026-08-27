@@ -3391,8 +3391,13 @@ impl TakoApp {
         self.preview_changelogs.remove(&pane_id);
         self.preview_run_profiles.remove(&pane_id);
         self.preview_run_selected.remove(&pane_id);
-        // #919: リモート由来の記録（読み取り専用の判定とヘッダ表示に使う）
+        // #919: リモート由来の記録（ヘッダ表示と保存先の切り替えに使う）
         self.preview_remote_origins.remove(&pane_id);
+        // #966: 書き戻しの進行状態。**退避（pending）は消さない**
+        // （閉じても「押し出せていない保存」は残り、`push` で再試行できる）
+        self.preview_remote_read_only.remove(&pane_id);
+        self.preview_remote_push.remove(&pane_id);
+        self.remote_push_again.remove(&pane_id);
         if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
             self.preview_run_menu = None;
         }
