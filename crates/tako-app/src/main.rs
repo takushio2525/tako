@@ -1687,6 +1687,11 @@ struct TakoApp {
     chrome_views: HashMap<view_cache::ChromePart, gpui::Entity<view_cache::Chrome>>,
     /// ペイン本体を実際に描き直した回数（#786 の効果検証用。単調増加）
     pane_body_renders: u64,
+    /// ルート（= ウィンドウ 1 枚ぶんのフレーム）を描いた回数（#945 の効果検証用。単調増加）。
+    ///
+    /// アニメーションは動いているあいだ毎フレーム `request_animation_frame()` を
+    /// 呼ぶので、「操作していないのにこれが増え続ける」= フレーム要求が恒久化している
+    root_renders: u64,
     /// 人工ちらつきの注入フレーム数（#932。`TAKO_932_INJECT_FLICKER=1` のときだけ動く）
     flicker_inject_frames: u64,
     /// ペインヘッダを実際に描き直した回数（#803 の効果検証用。単調増加）
@@ -3367,6 +3372,7 @@ impl TakoApp {
             last_header_clock_tick: std::time::Instant::now(),
             chrome_views: HashMap::new(),
             pane_body_renders: 0,
+            root_renders: 0,
             pane_header_renders: 0,
             chrome_renders: 0,
             term_app_notifies: 0,
@@ -19103,15 +19109,17 @@ impl TakoApp {
             .flat_map(|t| t.tree().panes())
             .find(|p| p.id() == pane_id)
             .map(|p| p.limit_autoresume());
+        // ファイルマネージャの呼び名は OS で変わる（#617）
+        let fm = tako_control::platform::os_integration::file_manager();
         let mut items: Vec<(&str, &str)> = Vec::new();
         if is_preview {
             items.push(("copy-path", ui_text::pane_menu::copy_path()));
-            items.push(("reveal", ui_text::pane_menu::reveal()));
+            items.push(("reveal", ui_text::pane_menu::reveal(fm)));
             items.push(("open-default", ui_text::pane_menu::open_default()));
             items.push(("sep1", ""));
         } else if cwd.is_some() {
             items.push(("copy-cwd", ui_text::pane_menu::copy_cwd()));
-            items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd()));
+            items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd(fm)));
             items.push(("sep1", ""));
         }
         items.push(("split-right", ui_text::pane_menu::split_right()));
@@ -19470,6 +19478,8 @@ impl Render for TakoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #168: フレーム構築（element tree 生成）のメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("render");
+        // #945: 「操作していないのにフレームが要求され続けていないか」の実測用
+        self.root_renders = self.root_renders.saturating_add(1);
         // IME 経路の自己修復の保険（#332）: 本線は wire_focus_self_heal の
         // on_focus_lost（draw 末尾で発火し view render の reuse に依存しない）。
         // ここは購読が何らかの理由で効かなかった場合に、次の notify 契機で
@@ -53501,6 +53511,183 @@ mod self_test {
                             app.cell_size = None;
                             app.pane_cell_sizes.clear();
                             if let Some(tab) = app.workspace.find_tab_of_pane(hidden) {
+                                app.remove_tab(tab, cx);
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+
+            // 128. 実行中ドットの脈動が「走り続けるコマンド」で恒久化しない（#945）。
+            //
+            // タブの状態ドットは #217 以来「Running のあいだ 2 秒周期で脈動」だった。
+            // GPUI の `AnimationElement` は**アニメーションが終わっていないフレームだけ**
+            // `request_animation_frame()` を呼ぶので、エージェント（claude / codex）の
+            // ようにフォアグラウンドで走り続けるペインがあるタブでは、操作していなくても
+            // アプリがアイドルフレームに到達しない（#786 / #801 / #803 で削った
+            // 毎フレームの固定費がここで復活する）。
+            //
+            // 側路 API（`feed_osc_bytes`。#766 で Windows が使うのと同じ osc_tap の
+            // 状態機械）で 1 ペインを Running にして
+            // ① 走り始めは脈動する = 合図としての意味が残っている
+            // ② 全長を過ぎたら、時間を空けて描き直しても不透明度が動かない
+            //    = GPUI が `done` にしていて**フレーム要求も止まっている**
+            // ③ 次に何かが走り始めたら脈動はやり直される
+            // の 3 点を見る。判定を「実際に描かれたフレーム数」ではなく
+            // 「アニメーターが計算した不透明度」に置いたのは、ディスプレイリンクが
+            // 動かない環境（蓋閉じ・ヘッドレス）でも A/B が成立するようにするため。
+            // `TAKO_945_LEGACY=1`（= #945 前の無限 repeat）では ② が落ちる
+            {
+                let any945 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window945 = any945.downcast::<TakoApp>().unwrap_or(window);
+                let pane945 = window945
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("945-running".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        r["pane"].as_u64().map(PaneId::from_raw)
+                    })
+                    .ok()
+                    .flatten();
+                match pane945 {
+                    None => println!("TAKO_SELF_TEST_SKIPPED: 128（検証用タブを作れない）"),
+                    Some(pane) => {
+                        // シェルの起動出力（プロンプト + OSC 133）が落ち着くまで待つ。
+                        // ここが済むまでは実行状態が勝手に動く
+                        notify_and_draw(any945, window945, cx);
+                        wait(cx, 1500).await;
+                        let running = window945
+                            .update(cx, |app: &mut TakoApp, _, cx| {
+                                let ok = match app.terminals.get_mut(&pane) {
+                                    Some(session) => {
+                                        session.feed_osc_bytes(b"\x1b]133;A\x07");
+                                        session.feed_osc_bytes(b"\x1b]133;C\x07");
+                                        session.command_state() == tako_core::CommandState::Running
+                                    }
+                                    None => false,
+                                };
+                                cx.notify();
+                                ok
+                            })
+                            .unwrap_or(false);
+                        check(
+                            running,
+                            "128: 検証用ペインが Running になる（脈動の前提。#945）",
+                        );
+                        let started = std::time::Instant::now();
+                        // 汚してから 1 フレーム描き、そのフレームで脈動が計算した
+                        // 不透明度を読む（#786 のキャッシュがあるので notify が要る）
+                        let sample = |cx: &mut gpui::AsyncApp| {
+                            notify_and_draw(any945, window945, cx);
+                            tab_bar::dot_pulse_probe()
+                        };
+                        let spread = |v: &[f32]| {
+                            let hi = v.iter().cloned().fold(f32::MIN, f32::max);
+                            let lo = v.iter().cloned().fold(f32::MAX, f32::min);
+                            hi - lo
+                        };
+                        // ① 走り始め: 脈動している
+                        let mut early: Vec<f32> = Vec::new();
+                        let frames0 = tab_bar::dot_pulse_probe().0;
+                        for _ in 0..5 {
+                            early.push(sample(cx).1);
+                            wait(cx, 200).await;
+                        }
+                        let animated = tab_bar::dot_pulse_probe().0 > frames0;
+                        // ② 全長を過ぎたら止まっている。
+                        //    経過は実時間で見る（サンプリングに掛かった時間ぶんを差し引く）
+                        let total = tab_bar::dot_pulse_total() + Duration::from_millis(700);
+                        let remain = total.saturating_sub(started.elapsed());
+                        if remain > Duration::ZERO {
+                            wait(cx, remain.as_millis() as u64).await;
+                        }
+                        // 何も汚さずに置いた区間でフレームが増えるか（= 直接の傍証。
+                        // ディスプレイリンクが動かない環境では両アームとも 0 になるので
+                        // 判定には使わず、数字だけ出す）
+                        let idle_before = window945
+                            .update(cx, |app: &mut TakoApp, _, _| app.root_renders)
+                            .unwrap_or(0);
+                        wait(cx, 1200).await;
+                        let idle_after = window945
+                            .update(cx, |app: &mut TakoApp, _, _| app.root_renders)
+                            .unwrap_or(0);
+                        let mut late: Vec<f32> = Vec::new();
+                        for _ in 0..5 {
+                            late.push(sample(cx).1);
+                            wait(cx, 250).await;
+                        }
+                        println!(
+                            "TAKO_SELF_TEST_945: legacy={} early={:.3}..{:.3}(spread {:.3}) \
+                             late={:.3}..{:.3}(spread {:.3}) idle_frames={} animated={animated}",
+                            std::env::var_os("TAKO_945_LEGACY").is_some(),
+                            early.iter().cloned().fold(f32::MAX, f32::min),
+                            early.iter().cloned().fold(f32::MIN, f32::max),
+                            spread(&early),
+                            late.iter().cloned().fold(f32::MAX, f32::min),
+                            late.iter().cloned().fold(f32::MIN, f32::max),
+                            spread(&late),
+                            idle_after.saturating_sub(idle_before),
+                        );
+                        check(
+                            animated && spread(&early) > 0.1,
+                            &format!(
+                                "128: 走り始めはドットが脈動する \
+                                 (#945。spread {:.3} / animated {animated})",
+                                spread(&early)
+                            ),
+                        );
+                        check(
+                            spread(&late) < 0.01
+                                && late.iter().all(|o| (o - 1.0).abs() < 0.01),
+                            &format!(
+                                "128: 脈動の全長を過ぎたら止まる = フレーム要求も止まる \
+                                 (#945。spread {:.3} / last {:.3})",
+                                spread(&late),
+                                late.last().copied().unwrap_or(f32::NAN)
+                            ),
+                        );
+                        // ③ 走り終わって次のコマンドが走り始めたら脈動はやり直される。
+                        //
+                        // 時計を自前で持たず GPUI の element state の寿命に任せている
+                        //（描かれなかったフレームがあると捨てられる）ので、
+                        // 「Idle を 1 フレーム挟む」ところまで含めて実際に確かめる
+                        let restart = {
+                            let feed = |cx: &mut gpui::AsyncApp, bytes: &'static [u8]| {
+                                let _ = window945.update(cx, |app: &mut TakoApp, _, cx| {
+                                    if let Some(session) = app.terminals.get_mut(&pane) {
+                                        session.feed_osc_bytes(bytes);
+                                    }
+                                    cx.notify();
+                                });
+                                notify_and_draw(any945, window945, cx);
+                            };
+                            feed(cx, b"\x1b]133;D;0\x07");
+                            feed(cx, b"\x1b]133;C\x07");
+                            wait(cx, 400).await;
+                            sample(cx).1
+                        };
+                        println!("TAKO_SELF_TEST_945_RESTART: opacity={restart:.3}");
+                        check(
+                            restart < 0.9,
+                            &format!(
+                                "128: 次に走り始めたら脈動がやり直される \
+                                 (#945。opacity {restart:.3})"
+                            ),
+                        );
+                        // 後片付け: 検証用タブを閉じる
+                        let _ = window945.update(cx, |app: &mut TakoApp, _, cx| {
+                            if let Some(tab) = app.workspace.find_tab_of_pane(pane) {
                                 app.remove_tab(tab, cx);
                             }
                             cx.notify();

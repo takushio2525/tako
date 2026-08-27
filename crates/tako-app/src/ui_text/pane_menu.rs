@@ -3,11 +3,17 @@
 //! #813 で自動復帰のトグルを足すにあたり、それまで render へ直書きだった
 //! 既存項目もここへ集約した（1 つだけ i18n 化すると英語表示で日本語が混ざるため）
 
+use tako_control::platform::os_integration::FileManager;
+
 pub fn copy_path() -> &'static str {
     tr!("パスをコピー", "Copy path")
 }
-pub fn reveal() -> &'static str {
-    tr!("Finder で表示", "Reveal in Finder")
+/// ファイルマネージャの呼び名は OS ごとに違う（#617。`sidebar::menu_reveal` と同じ理由）
+pub fn reveal(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("Finder で表示", "Reveal in Finder"),
+        FileManager::Explorer => tr!("エクスプローラーで表示", "Reveal in Explorer"),
+    }
 }
 pub fn open_default() -> &'static str {
     tr!("デフォルトアプリで開く", "Open with default app")
@@ -15,8 +21,12 @@ pub fn open_default() -> &'static str {
 pub fn copy_cwd() -> &'static str {
     tr!("cwd をコピー", "Copy cwd")
 }
-pub fn reveal_cwd() -> &'static str {
-    tr!("Finder で開く", "Open in Finder")
+/// ディレクトリ（ペインの cwd）をファイルマネージャで開く
+pub fn reveal_cwd(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("Finder で開く", "Open in Finder"),
+        FileManager::Explorer => tr!("エクスプローラーで開く", "Open in Explorer"),
+    }
 }
 pub fn split_right() -> &'static str {
     tr!("右に分割", "Split right")
@@ -64,10 +74,12 @@ mod tests {
         tests_support::check_ja_en(|| {
             vec![
                 copy_path().to_string(),
-                reveal().to_string(),
+                reveal(FileManager::Finder).to_string(),
+                reveal(FileManager::Explorer).to_string(),
                 open_default().to_string(),
                 copy_cwd().to_string(),
-                reveal_cwd().to_string(),
+                reveal_cwd(FileManager::Finder).to_string(),
+                reveal_cwd(FileManager::Explorer).to_string(),
                 split_right().to_string(),
                 split_down().to_string(),
                 background().to_string(),

@@ -2904,6 +2904,8 @@ impl SettingsWindow {
                 }
             }));
 
+        // ファイルマネージャの呼び名は OS で変わる（#617）
+        let fm = tako_control::platform::os_integration::file_manager();
         div()
             .flex()
             .flex_col()
@@ -2956,7 +2958,7 @@ impl SettingsWindow {
                     ))
                     .child(self.button(
                         "adv-reveal",
-                        txt::advanced_open_finder(),
+                        txt::advanced_reveal(fm),
                         BtnKind::Normal,
                         |_, _, _| {
                             if let Some(path) = settings::settings_path() {

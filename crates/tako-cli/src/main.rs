@@ -183,7 +183,7 @@ enum Command {
     /// バックグラウンドのペイン一覧を JSON で出力する
     #[command(name = "backgrounded")]
     BackgroundList,
-    /// ファイル操作（パスコピー / Finder 表示 / cd / リネーム / 作成 / ゴミ箱）
+    /// ファイル操作（パスコピー / ファイルマネージャ表示 / cd / リネーム / 作成 / ゴミ箱）
     #[command(subcommand)]
     File(FileCommand),
     /// git リポジトリ情報の取得（コミット履歴 / diff）
@@ -1256,7 +1256,7 @@ enum FileCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// Finder でファイルの場所を表示する（macOS のみ）
+    /// ファイルマネージャ（Finder / エクスプローラー）でファイルの場所を表示する
     Reveal { path: String },
     /// 指定パスのディレクトリへペイン内で cd する
     OpenTerminal {
@@ -1270,11 +1270,11 @@ enum FileCommand {
     Create { path: String, name: String },
     /// 新しいフォルダを作成する（path 配下に name で作成）
     Mkdir { path: String, name: String },
-    /// ファイル・フォルダをゴミ箱へ移動する
+    /// ファイル・フォルダをゴミ箱（Windows はごみ箱）へ移動する（完全削除ではない）
     Trash { path: String },
-    /// デフォルトアプ��で開く（macOS）
+    /// デフォルトアプリで開く
     Open { path: String },
-    /// 指定アプリで開く（macOS）
+    /// 指定アプリで開く
     OpenWith { path: String, name: String },
 }
 

@@ -1,5 +1,7 @@
 //! 左サイドバー（ファイルツリー）の文言（キー: sidebar.*）
 
+use tako_control::platform::os_integration::FileManager;
+
 // --- コンテキストメニュー（FR-3.12 / #314。キー: sidebar.menu_*） ---
 
 pub fn menu_copy_rel() -> &'static str {
@@ -8,8 +10,14 @@ pub fn menu_copy_rel() -> &'static str {
 pub fn menu_copy_abs() -> &'static str {
     tr!("絶対パスをコピー", "Copy absolute path")
 }
-pub fn menu_reveal() -> &'static str {
-    tr!("Finder で表示", "Reveal in Finder")
+/// ファイルマネージャの呼び名は OS ごとに違う（#617）。
+/// 「Finder で表示」を Windows で出すと、押しても何も起きないうえに何を指すか伝わらない。
+/// 判定は境界 B8（`os_integration::file_manager`）の 1 か所で、ここは値を受け取るだけ
+pub fn menu_reveal(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("Finder で表示", "Reveal in Finder"),
+        FileManager::Explorer => tr!("エクスプローラーで表示", "Reveal in Explorer"),
+    }
 }
 pub fn menu_open_term() -> &'static str {
     tr!("ターミナルで開く", "Open in terminal")
@@ -29,8 +37,14 @@ pub fn menu_new_file() -> &'static str {
 pub fn menu_new_dir() -> &'static str {
     tr!("新しいフォルダ", "New folder")
 }
-pub fn menu_trash() -> &'static str {
-    tr!("削除", "Move to Trash")
+/// ごみ箱の呼び名も OS ごとに違う（ファイルマネージャと同じ「OS のシェル」の軸なので
+/// 同じ値で決める）。**この操作が復元可能であること**をラベルで約束しているので、
+/// 実装（B8 の `move_to_trash`）と表記を必ず揃える（#617）
+pub fn menu_trash(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("削除", "Move to Trash"),
+        FileManager::Explorer => tr!("ごみ箱に移動", "Move to Recycle Bin"),
+    }
 }
 pub fn menu_remove_root() -> &'static str {
     tr!("ツリーから除去", "Remove from tree")
@@ -76,6 +90,65 @@ pub fn note_external_change() -> &'static str {
 mod tests {
     use super::super::tests_support;
     use super::*;
+    use tako_core::i18n::Lang;
+
+    /// ファイルマネージャ / ごみ箱の呼び名が **OS ごとに実際に分かれている**（#617）。
+    ///
+    /// `cfg!(windows)` で分岐していた頃は macOS 側の CI で Windows の文言を 1 文字も
+    /// 検査できなかった。`FileManager` を値で受け取る形にしたので、**macOS 上から
+    /// Windows 側の表記も固定できる**（`settings_sleep::Device` と同じ作法。#905）。
+    /// 「Windows で押しても何も起きない Finder ラベル」の再発をここで止める
+    #[test]
+    fn ファイルマネージャの呼び名がosごとに分かれている() {
+        use super::super::{pane_menu, settings};
+        tests_support::with_lang(Lang::Ja, || {
+            assert_eq!(menu_reveal(FileManager::Finder), "Finder で表示");
+            assert_eq!(menu_reveal(FileManager::Explorer), "エクスプローラーで表示");
+            assert_eq!(menu_trash(FileManager::Finder), "削除");
+            assert_eq!(menu_trash(FileManager::Explorer), "ごみ箱に移動");
+            assert_eq!(
+                pane_menu::reveal_cwd(FileManager::Explorer),
+                "エクスプローラーで開く"
+            );
+            assert_eq!(
+                settings::advanced_reveal(FileManager::Explorer),
+                "エクスプローラーで表示"
+            );
+        });
+        tests_support::with_lang(Lang::En, || {
+            assert_eq!(menu_reveal(FileManager::Finder), "Reveal in Finder");
+            assert_eq!(menu_reveal(FileManager::Explorer), "Reveal in Explorer");
+            assert_eq!(menu_trash(FileManager::Finder), "Move to Trash");
+            assert_eq!(menu_trash(FileManager::Explorer), "Move to Recycle Bin");
+        });
+        // 出し分けが「同じ文字列を 2 回返す」形へ退化していないこと（両言語で）
+        tests_support::for_each_lang(|| {
+            for (finder, explorer) in [
+                (
+                    menu_reveal(FileManager::Finder),
+                    menu_reveal(FileManager::Explorer),
+                ),
+                (
+                    menu_trash(FileManager::Finder),
+                    menu_trash(FileManager::Explorer),
+                ),
+                (
+                    pane_menu::reveal(FileManager::Finder),
+                    pane_menu::reveal(FileManager::Explorer),
+                ),
+                (
+                    pane_menu::reveal_cwd(FileManager::Finder),
+                    pane_menu::reveal_cwd(FileManager::Explorer),
+                ),
+                (
+                    settings::advanced_reveal(FileManager::Finder),
+                    settings::advanced_reveal(FileManager::Explorer),
+                ),
+            ] {
+                assert_ne!(finder, explorer, "OS 別の出し分けが効いていない");
+            }
+        });
+    }
 
     #[test]
     fn catalog_has_both_languages_and_no_emoji() {
@@ -83,14 +156,16 @@ mod tests {
             vec![
                 menu_copy_rel().to_string(),
                 menu_copy_abs().to_string(),
-                menu_reveal().to_string(),
+                menu_reveal(FileManager::Finder).to_string(),
+                menu_reveal(FileManager::Explorer).to_string(),
                 menu_open_term().to_string(),
                 menu_open_default().to_string(),
                 menu_open_with().to_string(),
                 menu_rename().to_string(),
                 menu_new_file().to_string(),
                 menu_new_dir().to_string(),
-                menu_trash().to_string(),
+                menu_trash(FileManager::Finder).to_string(),
+                menu_trash(FileManager::Explorer).to_string(),
                 menu_remove_root().to_string(),
                 hidden_show().to_string(),
                 hidden_hide().to_string(),

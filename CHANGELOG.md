@@ -28,6 +28,23 @@ Nightly patch release (automated). Changes since v0.7.7:
 
 ## [Unreleased]
 
+### Changed
+
+- [改善] 実行中タブのドット脈動を「走り始めの合図」に限り、フレーム要求の恒久化を
+  止めた (#945)。状態ドットは `Running` のあいだ 2 秒周期で脈動していたが、GPUI は
+  アニメーションが動いているあいだ**毎フレーム再描画を要求する**ため、エージェント
+  （claude / codex）のようにフォアグラウンドで走り続けるペインがあるタブでは、
+  操作していなくてもアプリがアイドルに到達しなかった（#786 / #801 / #803 で削った
+  毎フレームの固定費がここで復活していた）。脈動を有限回（2 秒 × 3）で終わらせ、
+  以後は色だけの静的表示にした。実測: 出力ゼロのペイン 1 枚で tako 自身の CPU が
+  **19.09% → 2.93%**。走り始めの合図は残るので「いま何か走っている」は従来どおり分かる
+- [Changed] The pulsing dot on a running tab now pulses only while a command *starts*,
+  instead of forever (#945). GPUI requests a new frame on every frame while an animation
+  is running, so a tab holding a long-lived foreground process — any coding agent — kept
+  the whole app off its idle path and re-paid the per-frame cost that #786 / #801 / #803
+  had removed. The dot now pulses three times and then stays a solid color. Measured on an
+  otherwise silent pane: tako's own CPU dropped from **19.09% to 2.93%**.
+
 ### Fixed
 
 - [修正] タブを切り替えた瞬間に端末がリサイズされる問題を根治（裏タブのペインを

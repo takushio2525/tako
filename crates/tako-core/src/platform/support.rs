@@ -153,12 +153,6 @@ pub mod notes {
         "psmux ignores the session size options (-x / -y), so the size cannot be changed",
     );
 
-    /// #617 / #522。**データを失う差**なので必ず理由文に出す
-    pub const WIN_TRASH_PERMANENT: Note = Note::new(
-        "作成・リネーム・パスのコピーは動くが、ゴミ箱へ送る操作が完全削除になり元に戻せない（#617）。既定アプリで開く / アプリを指定して開く / ファイルマネージャで表示は未対応（#617 / #522）",
-        "Create, rename and copy-path work, but sending to the trash deletes permanently with no way to undo (#617). Open with the default app, open with a chosen app and reveal in the file manager are unavailable (#617 / #522)",
-    );
-
     /// #722。名前は付くので気づきにくい縮退
     pub const WIN_AUTORENAME_HEURISTIC: Note = Note::new(
         "タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#722）",
@@ -552,11 +546,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_file_op",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_TRASH_PERMANENT,
-        },
+        windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "os_integration の非 macOS 実装: move_to_trash が remove_file / remove_dir_all（#617）、open_default / open_with / reveal は Err(unsupported)（#617 / #522）",
+            "#617 の Windows 11 実測: 空白 + 日本語名 / 読み取り専用 / ディレクトリ / 315 文字のパスがいずれも復元可能な状態でごみ箱へ入り、reveal で対象が選択され、既定アプリが起動する。実機で緑のテスト: os_integration の windows モジュール（FOF_ALLOWUNDO のフラグ構成 / 絶対化 / /select, の形）",
         ),
     },
     Feature {
