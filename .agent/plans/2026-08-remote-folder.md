@@ -327,6 +327,20 @@ clamshell 閉 + 画面 OFF なので `screencapture` は**全面黒しか撮れ�
 
 `detection` は `pending`（起動直後・走査前）→ `active`（走査後）と動く。
 
+### 自動追加されたルートの操作感（スコープ 3。実 SSH）
+
+自動追加で出たルートの配下で、**展開 → プレビュー → 編集 → 保存**が #919 / #966 の経路
+そのままで通ることを実ホストで確認した（リモートには一時ファイルを 1 つ作り最後に消した）:
+
+| 段 | 実測 |
+|---|---|
+| 自動追加 | `AUTO_ROOT=/C:/Users/<user>`（**8 秒**） |
+| 展開（`ls`） | 一時ファイルが見える |
+| プレビュー（`open-file`） | `read_only: false` / `remote_path` / `mode: -rw-------` / `size: 17` |
+| 編集 → 保存（`edit apply` → `edit save`） | `remote: {state: "saved", conflict_checked: true, bytes: 31, pending_write: false}` |
+| リモートの実体 | `Get-Content` が編集後の内容を返す（`hello from 976 (edited by tako)`） |
+| 後片付け | 一時ファイルを削除し `Test-Path` = False |
+
 ### アイドル時のコスト（受け入れ条件 6）
 
 `ps` を PATH で中継して**採取回数そのもの**を数えた（`ps -axo pid=,ppid=,command=` =
