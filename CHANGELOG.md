@@ -153,6 +153,14 @@ Nightly patch release (automated). Changes since v0.7.7:
   listed, and picking one returns install guidance. The choice is written to the default
   profile's model / effort under a lock, so the rest of your profile is untouched (and the
   master side is left alone when master runs a different agent).
+- [機能追加] 設定画面（Cmd+, → プロファイル）の model 行からも同じ候補を選べるようにした
+  (#1002)。「候補を取得」を**押したときだけ** background で一覧を取るので、タブを開く動作は
+  今までどおり軽い（`agy models` はネットワーク取得で数秒かかる）。自由入力は残してある。
+  agy の effort チップも同じ変更で出るようになった
+- [Added] The settings screen (Cmd+, → Profiles) can pick from the same list on its model row
+  (#1002). The list is fetched in the background **only when you press "Fetch options"**, so
+  opening the tab stays as fast as before (`agy models` does a network round-trip that takes
+  seconds). Free-text entry is still available. agy's effort chips now appear too.
 - [機能追加] agy の worker へも `--effort` を渡すようにした (#1002)。`agy models` が挙げる
   全モデルで `--effort low|medium|high` が受理されることを実測した（表示名の `(High)` 等は
   モデル側の設定で `--effort` とは別物）。旧挙動は `TAKO_1002_LEGACY=1`

@@ -1139,6 +1139,23 @@ pub fn prof_option_unset() -> &'static str {
     tr!("未設定", "Not set")
 }
 
+/// #1002: モデル一覧の取得ボタン
+pub fn prof_model_fetch() -> &'static str {
+    tr!("候補を取得", "Fetch options")
+}
+
+pub fn prof_model_fetching() -> &'static str {
+    tr!("取得中…", "Fetching…")
+}
+
+/// 一覧が実 CLI 由来でないとき（claude）に添える 1 行
+pub fn prof_model_builtin_note() -> &'static str {
+    tr!(
+        "この CLI は一覧コマンドを持たないため、同梱の既知モデルを並べています",
+        "This CLI has no list command, so these are tako's built-in known models"
+    )
+}
+
 pub fn prof_agent_target() -> &'static str {
     tr!("設定するエージェント", "Agent to configure")
 }

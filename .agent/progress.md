@@ -3679,4 +3679,13 @@
   巻き戻した。直後に稼働セッションが上書きし JSON も tako MCP 登録も健全）。setup が
   決定的に書く 3 ファイル（`CLAUDE.md` / `config.toml` / `mcp_config.json`）は**すべて不変**。
   以後、実設定の原状回復検査は**稼働プロセスが書かないファイルだけ**を対象にする
-- 関連: PR（`Refs #1002`）。FR-2.32 を新設
+- **GUI も同じ候補から選べるようにした**（設定画面 → プロファイルの model 行）。
+  「候補を取得」を**押したときだけ** background（`refresh_agent_clis` と同じ形）で取る =
+  **タブを開いた時点では取らない**（`agy models` はネットワーク取得で実測数秒。同期で呼ぶと
+  #168 / #212 の「画面が固まる」を作る）。自由入力は残す（上流のリリースで増えた名前を
+  打てないと困る）。押下は既存の `commit_profile_field` = CLI / MCP と同じ dispatch。
+  **agy の effort チップも同じ変更で出るようになった**（`effort_options()` が空でなくなったため）
+- GUI で踏んだ欠陥 1 件: `master_agent` 未設定（`""`）のプロファイルで
+  `WorkerAgent::parse("")` が Err → **取得ボタンが無反応**。`model_agent_of` で
+  未設定・不正値を claude 既定へ寄せた（`effort_row` と同じ規則）。セルフテストで固定
+- 関連: PR #1014（`Refs #1002`）。FR-2.32 を新設

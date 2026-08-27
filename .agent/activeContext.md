@@ -182,6 +182,9 @@ remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決
   claude = 全 Supported を強制するので、**claude が最弱になる能力は 1 マスで表せない**。
   #1002 は能力を「setup でモデルを選べるか」へ切り出し、取得手段の差は実行時の
   `source`（cli / builtin / none）+ `failure.kind` で表した
+- **GUI のモデル候補は「押したときだけ background」**（設定画面 → プロファイルの model 行）。
+  `agy models` はネットワーク取得なのでタブを開くたびに取ってはいけない。取得の形は
+  `settings_window.rs` の `refresh_agent_clis`（#168 の教訓）と同じ
 - **setup を測るときの作法（#1002 で踏んだ）**: `script -q` + パイプ入力は**先頭 1 行が消える**
   → `expect` で 1 問ずつ送る / zsh スクリプト内の `cmd &` は **stdin が /dev/null** になり
   TTY 判定が false（ピッカーが出ない）/ `setup_dir()` は `TAKO_DATA_DIR` を見ない
