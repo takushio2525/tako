@@ -67,6 +67,7 @@ Nightly patch release (automated). Changes since v0.7.7:
 Nightly patch release (automated). Changes since v0.7.6:
 夜間パッチリリース（自動）。v0.7.6 以降の変更:
 
+- [修正] スターター / welcome のコマンド投入を方言と送達確認つき経路へ寄せる: Windows で押しても何も起きない問題 (#899) (#467) (#931)
 - [修正] コマンド解決を実行ファイル探索の境界へ寄せる: Windows で tako / claude / tmux が常に見つからない問題 (#898) (#467) (#929)
 - [修正] public リポの現行コードから実ユーザー名・実ホームパスを除去 + 再発防止の番犬を新設 (#927) (#928)
 - [修正] install_plan の期待値を計画そのものから作る: セルフテスト項目 119（#868）が Windows で止まる問題 (#920) (#467) (#926)

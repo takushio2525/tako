@@ -3266,3 +3266,63 @@
 - 副産物 **#962 起票**: `daemon_stop_implはゾンビpidを終了済みとして扱う` が負荷次第で落ちる
   （2 秒アサートに対し実測 2.27 / 5.10 / 10.07 秒）。#617 では `origin/main` の remote.rs へ
   差し替えても落ち、#722 では remote.rs の差分が **0 行**なのに落ちたので main 由来で確定
+
+
+## 2026-08-24（#927 追い込み: Issue / PR の本文とコメントの実名マスクを機械的に完了）
+- **GitHub 検索は取りこぼす**（`in:comments` は 11 件しか挙げないが実際は 20 件）ので、
+  bulk endpoint（`/issues/comments` / `/pulls/comments`）で**全 1306 コメントを走査**した。
+  該当 31 件 + 本文 7 件 + given name の残り 2 件を更新し、**再取得して残ゼロを実測**
+  （issue+PR 930 件の本文・タイトル、コメント 1306 件）
+- **実ユーザー名と Windows アカウント名の 2 語だけを置換するルールでは半端に残る**:
+  Tailscale の FQDN は tailnet ID がそのまま残り、Cloudflare Workers のサブドメインは
+  **実の名前の方が残る**。長い順に 16 規則（FQDN / workers.dev / メール / ホスト名 /
+  tailnet ID / 名前付きパイプ / 姓 / 名 / アカウント名）へ分解した
+- **git author 名の言及 2 件は意図的に保持**。#81 で「受容」と決まっており
+  930 コミットのメタデータに存在するので 1 箇所隠しても意味がなく、記録の意味を壊す
+- **手を出さなかったもの**: Cloudflare の account ID が約 250 コメントにあるが、これは
+  Pages の bot が PR ごとに自動投稿する check コメントで消しても再生成される（直すなら
+  連携設定側）。#77 の監査も「account_id は秘密ではない」と判定済み
+
+## 2026-08-24（#899: スターター / welcome のコマンド投入を方言と送達確認つき経路へ — **実機検証未完で中断**）
+- 症状 1（行末 LF が PSReadLine の継続行になる）を #640 の `queue_command_flow` へ寄せ、
+  症状 2（POSIX 決め打ちのクォートで PowerShell が式評価する）を境界の
+  `ShellDialect::command_word` へ寄せた。**#322 の最簡形に従い必要なときだけ囲む**ので
+  Windows の典型パスは素のまま。**POSIX は 1 バイトも変えていない**。症状 3 は #898 で既に解消
+- セルフテスト 93(d) を「届いたか」から**「走ったか」**へ割った（旧テストはコメント自身が
+  「実行されるかは見ていない」と書いており、それが Windows の見逃しの理由だった）
+- **LF 側の A/B は作らなかった**: `TAKO_899_LEGACY` で生 write + LF へ戻す経路を置いたら
+  #897 の番犬が正しく落ちた。許可リストを持たない不変条件なので env の穴を作らない
+- 検証（macOS）: fmt / clippy / `test --workspace` **2589 passed 0 failed** / 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK` 完走・行は従来と同一 / クロスチェック エラー 0・警告 12 /
+  検出力は単体テスト（旧 POSIX 決め打ちが同じ Windows パスを囲むことを固定）/
+  CI 3 ジョブ緑（PR #931）
+- **中断理由（1 回目）**: 実機が tailnet から落ちた（offline / last seen 1h）。
+  受け入れ条件①（実機 before/after）が未達なので **merge していない**
+- 実機測定の作法 4 件を plan へ追加（`-EncodedCommand` を使わない / arm スクリプトを
+  `echo` で作らない = zsh が `\t` をタブにする / arm 側にも UTF-8 / DirectX アトラス panic は撃ち直す）
+
+## 2026-08-26〜27（#899: main を取り込み直して**実機の before/after を確定** → 完了）
+- PR #931 へ main 14 コミット（v0.7.8 まで）をマージ。**コードのコンフリクトはゼロ**で、
+  衝突は `progress.md` / plan の追記 2 件だけ（両側を保持）。抜けていた CHANGELOG も追加
+- macOS は全緑: fmt / clippy(-D warnings) / `test --workspace` **2625 passed 0 failed** /
+  クロスチェック エラー 0・警告 12（main 同数）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
+  （項目 93 の行は `/Applications/tako.app/Contents/MacOS/tako master` = **囲まれない従来と同一**）
+- 実機の A/B（同一バイナリ・`TAKO_899_LEGACY=1` が before）を `97b2edc` で確定:
+  **before** = `launch_line="'C:\…\tako.exe' master"`（囲まれている）で項目 93 (d2) が
+  `TAKO_APP_SELF_TEST_FAILED: スターターが組む行は実シェルで実際に実行される (#899)`。
+  画面は **PowerShell の `ParserError: Unexpected token 'version' in expression or statement.`**
+  = パースの時点で撥ねられ**コマンドが走らない**（#899 の症状そのもの）。
+  **after** = `launch_line="C:\…\tako.exe master"`（囲まれない）で (d1)(d2) とも通過
+- 実機テストのベースライン照合（`--no-fail-fast`）: **22 件失敗 = 記録済みベースラインと
+  完全一致（新規ゼロ）**。tako-control 14 / tako-core 7 / `remote_fs_e2e` 1（#930）。
+  **#899 が足した単体テストは実機で緑**
+- **停止位置の項目 97 (d) は #899 とは無関係**（#967 を起票）。判定が画面のリテラル
+  `"tako setup"` を見ているのに Windows の実行ファイル名は `tako.exe` なので
+  `…\tako.exe setup` になり部分文字列が無い。**#898 が実体パスを返すようにした時点**で
+  壊れており、before の `'C:\…\tako.exe' setup` でも同じく通らないことを実測が示す
+- 実機の回線は 8/26 に 3 時間以上落ちて一度中断した（Tailscale の資格情報競合。master が根治）。
+  そのときの作法を plan へ追加（長いペイロードは通らない / 長い処理は `Invoke-CimMethod` で
+  切り離して `EXITCODE=` を待つ / arm は `schtasks /it` なので切断でも死なない /
+  `run-arms.ps1` は cp932 で壊れていて使えない / ログ読みは `-Encoding Default`）
+- **A/B の意味が 8/24 から変わっている**（`87feff8` で LF legacy を撤去したため、
+  `TAKO_899_LEGACY=1` はクォートだけを戻す = 落ちるのは (d1) ではなく **(d2)**）

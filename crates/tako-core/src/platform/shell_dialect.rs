@@ -286,6 +286,48 @@ impl ShellDialect {
         }
     }
 
+    /// **コマンド位置**に置く 1 語（実行ファイルのパス）。#322 の最簡形に従い
+    /// **囲む必要が無いときは囲まない**。
+    ///
+    /// `program` との違いは「必要なときだけ囲む」ことと、PowerShell 側で
+    /// **単引用符（リテラル）**を使うこと。二重引用符だと `$` が展開されるので、
+    /// `C:\Users\a$b\tako.exe` のようなパスが壊れる。
+    ///
+    /// #899: 旧実装は POSIX 前提の 1 本しかなく、安全文字が `[A-Za-z0-9._-/]` だったため
+    /// **Windows の絶対パスは `:` と `\` で「安全でない」判定**になり `'C:\…\tako.exe'` と
+    /// なっていた。PowerShell は引用符付き文字列を**式として評価する**ので、これは
+    /// 実行されずそのまま表示される。`:` と `\` は PowerShell では素で通るので、
+    /// 素で通る形を第一候補にし、囲むときだけ呼び出し演算子 `&` を付ける。
+    pub fn command_word(self, path: &str) -> String {
+        let plain = |extra: &[u8]| {
+            !path.is_empty()
+                && path.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b"._-/".contains(&b) || extra.contains(&b)
+                })
+        };
+        match self {
+            // POSIX は従来と 1 バイトも変えない（macOS の見た目を動かさない）。
+            // `shell::quote_for_shell` へ委譲しないのは安全文字の集合が違うため
+            // （あちらは `:` `@` `%` `+` `,` `=` も素で通す）。#873 で「クォートは
+            // 統合しない」と決めた理由と同じで、ユーザーと AI に見える文字列なので
+            // リファクタで形を変えない
+            Self::Posix => {
+                if plain(b"") {
+                    path.to_string()
+                } else {
+                    format!("'{}'", path.replace('\'', r"'\''"))
+                }
+            }
+            Self::PowerShell => {
+                if plain(br"\:") {
+                    path.to_string()
+                } else {
+                    format!("& {}", ps_quote(path))
+                }
+            }
+        }
+    }
+
     /// 1 個の引数としてそのまま渡す形にクオートする（中身は展開されない）。
     /// `tako send '<コマンド>'` のように**別のシェルで評価される文字列**を運ぶのに使う
     pub fn quote_arg(self, word: &str) -> String {

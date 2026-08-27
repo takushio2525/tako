@@ -2760,6 +2760,107 @@ macOS では `/Applications/tako.app/...` が安全文字だけなので囲ま�
   Windows 実機で失敗（#919 由来）。**速い FAILED と >60 秒のハングの両方**を観測した
   ので、名前解決不能の枝は分類だけでなく戻ってこない経路がある疑い
 
+#### #899 の記録（スターター / welcome のコマンド投入を方言と送達確認つき経路へ。2026-08-24 → 実機検証 2026-08-27）— ✅ **完了**
+
+スターターカード（#694）と初回起動バナー（#549）は「シェルへコマンド行を書き込む」方式で、
+**組み立てと書き込みが 2 つとも POSIX 決め打ち**だった。症状 3（パス解決）は #898 で解消済み。
+
+| 症状 | 内容 | 対処 |
+|---|---|---|
+| 1. 行末が LF | 生 `session.write(… + "\n")`。LF は PSReadLine が継続行にするので確定しない（#897 実測） | #640 の `queue_command_flow` へ（本文と Enter を分離して `b'\r'`・エコー確認・再送） |
+| 2. 引用が POSIX 形 | 安全文字が `[A-Za-z0-9._-/]` で Windows の絶対パスが `'C:\…\tako.exe'` になる。PowerShell は式として評価するので実行されない | 境界へ `ShellDialect::command_word` を新設 |
+
+##### `command_word` の設計（#322 の最簡形）
+
+**必要なときだけ囲む**。PowerShell は `:` と `\` を素で通すので典型的な絶対パスは囲まない
+（ユーザーに見えるコマンドが最簡形のまま）。囲むときだけ呼び出し演算子 `&` を付ける。
+引用符は**単引用符（リテラル）**にした: 二重引用符だと `$` が展開されて
+`C:\Users\a$b\tako.exe` のようなパスが壊れる。
+
+**POSIX 側は 1 バイトも変えていない。** `shell::quote_for_shell` へ委譲しなかったのは
+安全文字の集合が違うため（あちらは `:` `@` `%` `+` `,` `=` も素で通す）。#873 の
+「クォートは統合しない」と同じ理由 = ユーザーと AI に見える文字列は形を変えない。
+
+##### セルフテストを「届いたか」から「走ったか」へ
+
+旧 93(d) はエコーペインへの到達しか見ておらず、**コメント自身が「届いた行が実行されるかは
+見ていない」と書いていた**。これが「Windows では届くが実行されない」を見逃した理由。
+(d1) = カードが送達確認つき経路へ実行できる形で積む / (d2) = 組んだ行が**実シェルで実際に
+実行される**（`tako master` はエージェントを起こすので `--version`。出力 `tako 0.7.6` は
+エコー行に現れない性質 = 「`tako` の直後が数字」で判定するので版に依存しない）へ割った。
+
+##### LF 側に A/B の逃げ道を作らなかった
+
+`TAKO_899_LEGACY` で「生 write + LF」へ戻す経路も置いたが、**#897 の番犬が正しく落ちた**
+（`cargo test --workspace` が赤）。あの番犬は許可リストを持たない絶対の不変条件で、
+**#899 が確立しようとしているものそのもの**なので env で戻せる穴は作らない方針にした。
+A/B はクォート（症状 2）だけ残せば足りる: PowerShell では
+`'C:\…\tako.exe' --version` が式評価されて実行されないので、CR で送っても before が出る。
+
+##### 実機測定で踏んだ罠（作法へ追加）
+
+- **`schtasks` のペイロードに `-EncodedCommand` を使わない**。引用の層が増えて失敗しても
+  何も残らない（1 回まるごと空振りした）。**`.ps1` ファイルを置いて `pwsh -File` で走らせる**
+- **arm スクリプトを `echo` で生成しない**。zsh の `echo` は `\t` をタブに変えるので
+  `dev\tako` が `dev<TAB>ako` になり、`Set-Location` が黙って失敗して
+  cwd が `C:\Windows\System32` のまま `cargo` が動く（`could not find Cargo.toml` で気づいた）。
+  **heredoc（`<<'PS1'`）で書き、`Join-Path` + `-LiteralPath` で組む**
+- **arm スクリプト側にも `[Console]::OutputEncoding = UTF8` を置く**。置かないと
+  採取ログが cp932 で化けて読めない
+- **GPUI の DirectX アトラス panic は本当に出る**（`directx_atlas.rs:255` の unwrap。
+  項目 66 付近）。ランナーに「`directx_atlas` を見たら撃ち直す」を入れておくと止まらない
+
+##### 実機の before/after（2026-08-26〜27）
+
+**A/B は同一バイナリ**（`TAKO_899_LEGACY=1` が before = クォートだけ #899 以前へ戻す）。
+どちらも `schtasks /it` で session 1 へ投げた隔離セルフテスト。
+
+| arm | 項目 93 の実測 | 判定 |
+|---|---|---|
+| **before**（legacy） | `launch_line="'C:\…\tako.exe' master"`（**囲まれている**）<br>`version_line="'C:\…\tako.exe' --version"` | **FAILED** |
+| **after**（既定） | `launch_line="C:\…\tako.exe master"`（**囲まれない**）<br>`version_line="C:\…\tako.exe --version"` | **通過**（(d1)(d2) とも） |
+
+before の失敗はこう出る。**PowerShell がパースの時点で撥ねてコマンドが走らない**:
+
+```
+TAKO_SELF_TEST_899: line="'C:\…\tako.exe' --version" dialect=powershell
+  screen="ParserError:|Line ||   1 |  'C:\…\tako.exe' --version|
+          |                        ~~~~~~~|
+          | Unexpected token 'version' in expression or statement.|PS C:\Users\<winuser>>"
+TAKO_APP_SELF_TEST_FAILED: スターターが組む行は実シェルで実際に実行される (#899)
+```
+
+これが #899 の症状そのもの（「押しても何も起きない」）で、`command_word` が
+`:` と `\` を素で通すようになった after では実行される。**症状 1（行末 LF）は #897 の
+番犬が構造的に禁じている**ので env で戻す穴は作っていない（作ると `cargo test` が赤になる）。
+
+##### 実機テストのベースライン照合（`--no-fail-fast`）
+
+**22 件失敗 = 記録済みベースラインと完全一致（新規ゼロ）**。内訳:
+
+| バイナリ | 結果 |
+|---|---|
+| `tako-control` (lib) | 1080 passed / **14 failed**（#920 で `setup_bootstrap::…導入計画…` が消えて 15 → 14） |
+| `tako-core` (lib) | 887 passed / **7 failed**（ベースライン同一） |
+| `remote_fs_e2e` | **1 failed** = `解決できないホストは接続前に分類される`（#930） |
+
+**#899 が足した単体テストは実機で緑**（`welcome::tests::powershellのコマンド語は実行される形になる ... ok` /
+`posixのコマンド語は…`）。`shell_integration_powershell` 7/0・`spawn_arg_quoting` 3/0 も緑。
+
+##### 項目 97 (d) で止まるのは #899 とは無関係（#967 を起票）
+
+after arm は項目 93 を通ったあと **項目 97 (d)**
+（`スターターの setup リンクで tako setup が届く（覆わない）(#720)`）で止まる。
+判定が画面のリテラル `"tako setup"` を見ているのに、Windows の実行ファイル名は `tako.exe` なので
+`…\tako.exe setup` になり部分文字列が存在しない。**#898 が `resolve_tako_binary()` を
+実体パスへ変えた時点**で壊れており（#920 の完走時は裸の `tako` だった）、
+**before の `'C:\…\tako.exe' setup` でも同じく通らない**ことを上の実測が示している。
+
+##### 申し送り
+
+`starter_action` が GUI 専用で CLI / MCP から叩けない（#899 本文が指摘した設計原則 5 の穴）。
+バグ修正と設計サーフェスの追加を混ぜないため本 PR には入れていない。別 Issue の価値あり。
+
 ### 8. doc / 対応マトリクスの最終棚卸し（#528 / #591 / #515）— ✅ **完了**（2026-08-24）
 
 - 持ち込む新規: `scripts/gen-windows-support-docs.mjs` / `docs/.../windows-support.md`（生成物）
