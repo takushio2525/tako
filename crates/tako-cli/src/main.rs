@@ -428,16 +428,29 @@ enum OpenInCommand {
         #[arg(long)]
         no_focus: bool,
     },
-    /// SSH ホストに接続する新タブを開く
+    /// SSH ホストに接続する（既定 = いま開いているタブへ新ペイン。#1006）
     Remote {
         /// ~/.ssh/config の Host 名（未定義でも ssh コマンドとして実行）
         host: String,
-        /// フォーカスを新タブに移さない
+        /// フォーカスを接続したペインに移さない
         #[arg(long)]
         no_focus: bool,
         /// 接続後に cd するリモートのパス（#919）
         #[arg(long)]
         remote_dir: Option<String>,
+        /// 開き先（#1006。split = いまのタブへ新ペイン（既定）/ tab = 新しいタブ /
+        /// pane = 既存ペインをそのまま SSH 化）
+        #[arg(long, value_parser = ["split", "tab", "pane"])]
+        target: Option<String>,
+        /// 対象ペイン ID（--target pane は SSH 化するペイン / split は分割元）
+        #[arg(long)]
+        pane: Option<u64>,
+        /// 対象タブ ID（--target split のとき。省略時はアクティブタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 分割方向（--target split のとき。省略時 right）
+        #[arg(long, value_parser = ["right", "down", "left", "up"])]
+        direction: Option<String>,
     },
 }
 
@@ -6588,10 +6601,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 host,
                 no_focus,
                 remote_dir,
+                target,
+                pane,
+                tab,
+                direction,
             } => Request::OpenRemote {
                 host: host.clone(),
                 focus: Some(!no_focus),
                 remote_dir: remote_dir.clone(),
+                // #1006: 語彙の正本は `tako_core::remote_open`（MCP / GUI と同じ表）。
+                // clap の value_parser も同じ 3 値なので、ここへ来る文字列は必ず解釈できる
+                target: target.as_deref().map(|t| {
+                    tako_core::remote_open::RemoteOpenTarget::parse(t)
+                        .expect("value_parser が VALUES と同じ 3 値に絞っている")
+                }),
+                pane: *pane,
+                tab: *tab,
+                direction: direction
+                    .as_deref()
+                    .map(|d| parse_direction(d).expect("value_parser が 4 方向に絞っている")),
             },
         },
         Command::Recent(sub) => match sub {

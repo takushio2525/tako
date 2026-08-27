@@ -3968,6 +3968,10 @@ fn dispatch_inner(
             host: ssh_host,
             focus,
             remote_dir,
+            target,
+            pane,
+            tab,
+            direction,
         } => {
             // #919: **ssh を素のペインのプログラムにしない**。
             //
@@ -3979,12 +3983,83 @@ fn dispatch_inner(
             //
             // `ssh_pane_script` で包むと、接続前にバナーが出て、ssh 自身の失敗
             // （exit 255）だけ理由 + 次の一手を出して入力待ちで止まる
+            //
+            // #1006: 開き先は 3 通り（既定 = 現在タブへ新ペイン）。語彙の正本は
+            // `tako_core::remote_open`（CLI の値一覧・MCP の enum・GUI の分岐が同じ表を引く）
+            let open_target = target.unwrap_or_default();
             let argv = remote_ssh_argv(&ssh_host);
             let dir = remote_dir
                 .as_deref()
                 .map(str::trim)
                 .filter(|d| !d.is_empty())
                 .map(str::to_string);
+
+            // Recent への記録は 3 経路で共通（どの開き方でも「最近つないだ相手」）
+            let record_recent = |host_name: &str| {
+                let mut recent = tako_core::recent::RecentList::load();
+                recent.push(tako_core::recent::RecentEntry::Ssh {
+                    host: host_name.to_string(),
+                });
+                recent.save();
+            };
+
+            // 既存ペインをそのまま SSH にする（#1006）。
+            // **ペインを作らない・閉じない**ので pane ID が変わらず、ssh が失敗しても
+            // 下のシェルがそのまま残る（= シェルのプロンプトへ戻る）
+            if open_target == tako_core::remote_open::RemoteOpenTarget::Pane {
+                let (tab_id, pane_id) = resolve_pane_or_active(host.workspace(), pane)?;
+                let role = host
+                    .workspace()
+                    .get_tab(tab_id)
+                    .and_then(|t| t.tree().get(pane_id))
+                    .and_then(|p| p.role())
+                    .map(str::to_string);
+                // 器（tmux）つきのペインでは**外側**の alt screen を信じてはいけない
+                // （tmux クライアント自身が alt screen に入る = 中身が素のシェルでも
+                // 常に true。#694 と同じ罠で、隔離セルフテストで実測した）
+                let backend = host.backend_session(pane_id).is_some();
+                let (has_session, alt, state) = match host.session(pane_id) {
+                    Some(s) => (true, !backend && s.is_alt_screen(), s.command_state()),
+                    None => (false, false, tako_core::terminal::CommandState::Unknown),
+                };
+                tako_core::remote_open::can_ssh_pane(has_session, alt, state, role.as_deref())
+                    .map_err(|b| DispatchError::Operation(b.message(pane_id.as_u64())))?;
+
+                // 素のシェルへ打つので**スクリプトでは包まない**（包むと入れ子の
+                // シェルが増え、失敗時に「戻る先」がプロンプトでなくなる）。
+                // ssh 自身の失敗はシェルがそのまま表示し、プロンプトが戻る
+                // 引用は「必要なときだけ」（#322 = 人が打つ形と同じにする。
+                // 方言の解決は `launch_cmd` の 1 本 = #873）
+                let dialect = crate::launch_cmd::launch_dialect();
+                let line = argv
+                    .iter()
+                    .map(|a| crate::launch_cmd::quote(dialect, a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // 器（psmux）は起動直後だけでなく高負荷時も入力を落とすので、
+                // 送達確認つきの経路（#640）へ載せる
+                host.queue_command_flow(pane_id, line.clone());
+                if let Some(d) = &dir {
+                    // 接続後にリモートで `cd`。相手のシェルが不明なので両方言で通る形
+                    // （同一ペインの 2 本目は先行フローの完了まで待つ = UI 側で直列化）
+                    let native = tako_core::remote_fs::shell_path(d);
+                    host.queue_command_flow(pane_id, format!("cd \"{native}\""));
+                }
+                if focus.unwrap_or(true) {
+                    let _ = host.workspace_mut().activate_tab(tab_id);
+                    let _ = tree_mut(host.workspace_mut(), tab_id).focus(pane_id);
+                }
+                record_recent(&ssh_host);
+                return Ok(json!({
+                    "tab": tab_id.as_u64(),
+                    "pane": pane_id.as_u64(),
+                    "host": ssh_host,
+                    "remote_dir": dir,
+                    "target": open_target.as_str(),
+                    "command": line,
+                }));
+            }
+
             let script = tako_core::remote_fs::ssh_pane_script(
                 tako_core::platform::shell::script_dialect(),
                 &argv,
@@ -3995,18 +4070,55 @@ fn dispatch_inner(
             let command = tako_core::platform::shell::script_pane_command(&script);
 
             let prev_active = host.workspace().active_tab_id();
-            let pane = Pane::new(origin);
-            let pane_id = pane.id();
-            let tab_title = format!("ssh:{ssh_host}");
-            let tab_id = host.workspace_mut().create_tab(tab_title, pane);
-            if let Some(tab) = host.workspace_mut().get_tab_mut(tab_id) {
-                let t = tab.title().to_string();
-                tab.set_title_manual(t);
-            }
+            let new_pane = Pane::new(origin);
+            let pane_id = new_pane.id();
 
-            if !focus.unwrap_or(true) {
-                let _ = host.workspace_mut().activate_tab(prev_active);
-            }
+            let tab_id = if open_target == tako_core::remote_open::RemoteOpenTarget::Tab {
+                // #20 の従来動作: 新しいタブを立てて `ssh:<host>` と名付ける
+                let tab_title = format!("ssh:{ssh_host}");
+                let tab_id = host.workspace_mut().create_tab(tab_title, new_pane);
+                if let Some(tab) = host.workspace_mut().get_tab_mut(tab_id) {
+                    let t = tab.title().to_string();
+                    tab.set_title_manual(t);
+                }
+                if !focus.unwrap_or(true) {
+                    let _ = host.workspace_mut().activate_tab(prev_active);
+                }
+                tab_id
+            } else {
+                // #1006 の既定: いま開いているタブへ新ペインを作る。
+                // 分割元は `pane` → 呼び出し元 → （`tab` 指定なら）そのタブの
+                // フォーカス中ペイン、の順で解決する（`Request::Split` と同じ規則）
+                let (tab_id, base) = if let Some(tab_raw) = tab {
+                    let tab_id = find_tab(host.workspace(), tab_raw)?;
+                    let focused = host
+                        .workspace()
+                        .get_tab(tab_id)
+                        .expect("find_tab で存在確認済み")
+                        .tree()
+                        .focused();
+                    (tab_id, focused)
+                } else {
+                    resolve_pane_or_active(host.workspace(), pane)?
+                };
+                let focused_before = host.workspace().get_tab(tab_id).map(|t| t.tree().focused());
+                tree_mut(host.workspace_mut(), tab_id)
+                    .split_with_ratio(
+                        base,
+                        direction.unwrap_or(Direction::Right).to_core(),
+                        0.5,
+                        new_pane,
+                    )
+                    .map_err(op_err)?;
+                if focus.unwrap_or(true) {
+                    let _ = host.workspace_mut().activate_tab(tab_id);
+                    let _ = tree_mut(host.workspace_mut(), tab_id).focus(pane_id);
+                } else if let Some(prev) = focused_before.filter(|p| *p != pane_id) {
+                    // 分割の副作用で移ったフォーカスを元へ戻す（#676 と同じ配慮）
+                    let _ = tree_mut(host.workspace_mut(), tab_id).focus(prev);
+                }
+                tab_id
+            };
 
             host.attach_session(
                 pane_id,
@@ -4024,18 +4136,14 @@ fn dispatch_inner(
                 host.queue_command_flow(pane_id, format!("cd \"{native}\""));
             }
 
-            // Recent に記録
-            let mut recent = tako_core::recent::RecentList::load();
-            recent.push(tako_core::recent::RecentEntry::Ssh {
-                host: ssh_host.clone(),
-            });
-            recent.save();
+            record_recent(&ssh_host);
 
             Ok(json!({
                 "tab": tab_id.as_u64(),
                 "pane": pane_id.as_u64(),
                 "host": ssh_host,
                 "remote_dir": dir,
+                "target": open_target.as_str(),
             }))
         }
 
@@ -6189,6 +6297,12 @@ fn dispatch_remote_folder(
                     host: ssh_host,
                     focus,
                     remote_dir: dir.map(str::to_string),
+                    // #1006: 開き先は既定（現在タブへ新ペイン）に従う。
+                    // ツリーの「このフォルダで SSH ペイン」も同じ体験になる
+                    target: None,
+                    pane: None,
+                    tab,
+                    direction: None,
                 },
                 origin,
             )
@@ -9299,6 +9413,30 @@ pub(crate) fn resolve_pane(
     Err(DispatchError::PaneNotFound(raw))
 }
 
+/// 呼び出し元ペインが分からないときは「いま見えているタブのフォーカス中ペイン」へ倒す（#1006）。
+///
+/// SSH の開き先（既定 = 現在タブへ新ペイン）は、GUI のファイルメニューや tako の外から
+/// 叩いた CLI のように**呼び出し元ペインが無い**経路でも成立しなければならない。
+/// ただし**存在しないペインを渡された場合は倒さない**（黙って別のペインを対象にすると
+/// 「言ったつもりの場所と違う場所が SSH になる」事故になる）
+fn resolve_pane_or_active(
+    ws: &Workspace,
+    pane: Option<u64>,
+) -> Result<(TabId, PaneId), DispatchError> {
+    match resolve_pane(ws, pane) {
+        Err(DispatchError::NoTargetPane) => {
+            let tab = ws.active_tab_id();
+            let focused = ws
+                .get_tab(tab)
+                .ok_or(DispatchError::NoTargetPane)?
+                .tree()
+                .focused();
+            Ok((tab, focused))
+        }
+        other => other,
+    }
+}
+
 /// 呼び出し元ペインの解決に使った手段（Issue #567。応答の `method` フィールド）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneResolveMethod {
@@ -10573,6 +10711,9 @@ mod tests {
         writes: Vec<(PaneId, String)>,
         /// #640: 送達確認つきで積まれた起動コマンド（pane, 本文）
         command_flows: Vec<(PaneId, String)>,
+        /// #1006: 実 PTY のセッション（既存ペインの SSH 化は「素のシェルか」を
+        /// セッションから判定するので、モックでは実物を持たせる）
+        sessions: std::collections::HashMap<u64, TerminalSession>,
     }
 
     impl MockHost {
@@ -10607,6 +10748,7 @@ mod tests {
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
+                sessions: std::collections::HashMap::new(),
                 welcome_banner: false,
                 autosuggest: true,
                 autosuggest_hint: true,
@@ -10646,8 +10788,8 @@ mod tests {
     }
 
     impl SessionHost for MockHost {
-        fn session(&self, _pane: PaneId) -> Option<&TerminalSession> {
-            None
+        fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
+            self.sessions.get(&pane.as_u64())
         }
         fn attach_session(&mut self, pane: PaneId, options: SpawnOptions) {
             self.attached.push(pane.as_u64());
@@ -16630,21 +16772,170 @@ mod tests {
         assert!(result["pane"].as_u64().is_some());
     }
 
+    /// #1006 用のリクエスト組み立て（省略値だらけなのでテストの意図が読めるように）
+    #[cfg(test)]
+    fn open_remote_req(
+        target: Option<tako_core::remote_open::RemoteOpenTarget>,
+        pane: Option<u64>,
+    ) -> Request {
+        Request::OpenRemote {
+            host: "nonexistent-host".into(),
+            focus: Some(true),
+            remote_dir: None,
+            target,
+            pane,
+            tab: None,
+            direction: None,
+        }
+    }
+
     #[test]
-    fn open_remote_は新タブを作成() {
+    fn open_remote_の既定は現在タブへの新ペイン() {
+        // #1006: 既定の開き先を「新タブ」から「いまのタブへ新ペイン」へ変えた。
+        // タブが増えず、そのタブのペインが 1 枚増えるのが正
         let mut host = MockHost::new();
+        let tabs_before = host.workspace().tabs().len();
+        let tab_id = host.workspace().active_tab_id();
+        let panes_before = host
+            .workspace()
+            .get_tab(tab_id)
+            .unwrap()
+            .tree()
+            .panes()
+            .len();
+
+        let result = dispatch(&mut host, open_remote_req(None, None), PaneOrigin::Cli).unwrap();
+
+        assert_eq!(
+            host.workspace().tabs().len(),
+            tabs_before,
+            "タブは増えない（#1006 の要望そのもの）"
+        );
+        assert_eq!(result["tab"].as_u64(), Some(tab_id.as_u64()));
+        assert_eq!(result["target"], "split");
+        let panes_after = host
+            .workspace()
+            .get_tab(tab_id)
+            .unwrap()
+            .tree()
+            .panes()
+            .len();
+        assert_eq!(
+            panes_after,
+            panes_before + 1,
+            "同じタブにペインが 1 枚生える"
+        );
+        let new_pane = result["pane"].as_u64().unwrap();
+        assert!(
+            host.attached.contains(&new_pane),
+            "新ペインへ ssh のセッションが張られる"
+        );
+    }
+
+    #[test]
+    fn open_remote_はtarget_tabで新タブを作成() {
+        // 従来動作（#20）は target=tab で明示すれば残る
+        let mut host = MockHost::new();
+        let tabs_before = host.workspace().tabs().len();
         let result = dispatch(
             &mut host,
-            Request::OpenRemote {
-                host: "nonexistent-host".into(),
-                focus: Some(true),
-                remote_dir: None,
-            },
+            open_remote_req(Some(tako_core::remote_open::RemoteOpenTarget::Tab), None),
             PaneOrigin::Cli,
         )
         .unwrap();
+        assert_eq!(host.workspace().tabs().len(), tabs_before + 1);
         assert!(result["tab"].as_u64().is_some());
         assert!(result["pane"].as_u64().is_some());
+        assert_eq!(result["target"], "tab");
+    }
+
+    #[test]
+    fn open_remote_はtarget_paneで既存ペインをssh化する() {
+        // #1006 の本題: ペインを増やさず・タブも増やさず・**pane ID も変えず**に
+        // そのペインへ ssh の行を送る（素のシェルなので失敗すればプロンプトへ戻る）
+        let mut host = MockHost::new();
+        let tab_id = host.workspace().active_tab_id();
+        let pane_id = host.workspace().get_tab(tab_id).unwrap().tree().focused();
+        // 素のシェルのセッションを実際に張る（判定材料がセッション由来のため）
+        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
+            .expect("既定シェルの PTY を張れる");
+        host.sessions.insert(pane_id.as_u64(), session);
+
+        let tabs_before = host.workspace().tabs().len();
+        let panes_before = host
+            .workspace()
+            .get_tab(tab_id)
+            .unwrap()
+            .tree()
+            .panes()
+            .len();
+
+        let result = dispatch(
+            &mut host,
+            open_remote_req(
+                Some(tako_core::remote_open::RemoteOpenTarget::Pane),
+                Some(pane_id.as_u64()),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["pane"].as_u64(),
+            Some(pane_id.as_u64()),
+            "pane ID が変わらない（受け入れ条件）"
+        );
+        assert_eq!(result["target"], "pane");
+        assert_eq!(host.workspace().tabs().len(), tabs_before, "タブは増えない");
+        assert_eq!(
+            host.workspace()
+                .get_tab(tab_id)
+                .unwrap()
+                .tree()
+                .panes()
+                .len(),
+            panes_before,
+            "ペインも増えない"
+        );
+        assert!(
+            host.attached.is_empty(),
+            "セッションを張り直さない（実行中のシェルを殺さない）"
+        );
+        // 送達確認つきの経路（#640）へ ssh の行が積まれる
+        let (flow_pane, line) = host
+            .command_flows
+            .first()
+            .cloned()
+            .expect("ssh の行が積まれる");
+        assert_eq!(flow_pane, pane_id);
+        assert!(line.contains("nonexistent-host"), "宛先が入る: {line}");
+        assert_eq!(
+            line, result["command"],
+            "応答の command と実際に送る行は同一（AI が何が起きるかを読める）"
+        );
+    }
+
+    #[test]
+    fn open_remote_のtarget_paneは素のシェルでないペインを断る() {
+        // セッションが無いペイン（プレビュー等）は理由 + 次の一手つきで断る。
+        // **黙って新タブへ逃げない**（何が起きたか分からなくなる）
+        let mut host = MockHost::new();
+        let tab_id = host.workspace().active_tab_id();
+        let pane_id = host.workspace().get_tab(tab_id).unwrap().tree().focused();
+        let tabs_before = host.workspace().tabs().len();
+        let err = dispatch(
+            &mut host,
+            open_remote_req(
+                Some(tako_core::remote_open::RemoteOpenTarget::Pane),
+                Some(pane_id.as_u64()),
+            ),
+            PaneOrigin::Cli,
+        )
+        .expect_err("セッションが無いので断る");
+        let msg = format!("{err}");
+        assert!(msg.contains("target=split"), "次の一手を添える: {msg}");
+        assert_eq!(host.workspace().tabs().len(), tabs_before);
+        assert!(host.command_flows.is_empty(), "何も送らない");
     }
 
     #[test]

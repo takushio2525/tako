@@ -8,6 +8,27 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+### Changed / 変更
+
+- [改善] SSH 接続の開き方を 2 点変えた (#1006)
+  ① **ペインの右クリックメニューに「このペインでリモート接続…」を追加**。ホストを選ぶと
+  そのペイン自体が SSH セッションになる（ペインもタブも増えず、ペイン ID も変わらない）。
+  素のシェルのペインにだけ出る（全画面 TUI・実行中・AI エージェント・プレビューには出さない）。
+  ② **ファイルメニュー「リモート接続…」の開き先を新タブから「いま開いているタブの新ペイン」へ**。
+  CLI / MCP も同じ既定で、`--target split | tab | pane`（MCP は `target`）で選べる。
+  併せて GUI 経路が dispatch を通るようになったので、#919 の契約（接続前バナー・
+  ConnectTimeout・失敗の理由を画面に残す）がファイルメニュー経路にも効く。
+
+  ① The pane context menu gains "Connect this pane via SSH…": picking a host turns that
+  very pane into an SSH session — no new pane, no new tab, same pane ID. It only appears
+  for plain shell panes (not full-screen TUIs, running commands, agent panes or previews).
+  ② "Open Remote…" now opens a new pane in the current tab instead of a new tab. The CLI
+  and MCP share the default and can choose with `--target split | tab | pane`. The GUI path
+  now goes through the same dispatch, so the #919 guarantees (connecting banner,
+  ConnectTimeout, failures staying on screen) finally apply to it too.
+
 ## [0.7.10] - 2026-08-27
 
 Nightly patch release (automated). Changes since v0.7.9:

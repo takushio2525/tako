@@ -1412,11 +1412,16 @@ pub enum Request {
         focus: Option<bool>,
     },
     /// SSH ホストに接続するペインを開く（#20）。
-    /// `host` は ~/.ssh/config の Host 名。新タブで `ssh <host>` を実行する。
+    /// `host` は ~/.ssh/config の Host 名。
     ///
     /// #919: 接続の失敗を**画面に残す**（旧実装は ssh が即死するとペインごと消え、
     /// 理由がどこにも残らなかった）。`remote_dir` を渡すと接続後にそのフォルダへ
     /// `cd` する（「リモートからフォルダを開く」からの導線）
+    ///
+    /// #1006: **開き先を選べる**（既定 = `split` = いま開いているタブへ新ペイン）。
+    /// 従来の既定は新タブ（`tab`）だったが、ユーザーの実利用で「原則いまのタブに
+    /// 新ペインで出したい」と分かったので既定を変えた。`pane` は**すでにあるペインを
+    /// そのまま SSH にする**（ペイン ID が変わらない = ペインの右クリックメニュー用）
     OpenRemote {
         host: String,
         #[serde(default)]
@@ -1424,6 +1429,20 @@ pub enum Request {
         /// 接続後に `cd` するリモートのパス（#919 要件 4）
         #[serde(default)]
         remote_dir: Option<String>,
+        /// 開き先（#1006。省略時 = `split`）
+        #[serde(default)]
+        target: Option<tako_core::remote_open::RemoteOpenTarget>,
+        /// 対象ペイン（#1006。`target=pane` は SSH 化するペイン / `target=split` は
+        /// 分割元。省略時は呼び出し元ペイン、それも無ければフォーカス中のペイン）
+        #[serde(default)]
+        pane: Option<u64>,
+        /// 対象タブ（#1006。`target=split` のとき、そのタブのフォーカス中ペインを
+        /// 分割元にする。省略時はアクティブタブ）
+        #[serde(default)]
+        tab: Option<u64>,
+        /// 分割方向（#1006。`target=split` のとき。省略時は右）
+        #[serde(default)]
+        direction: Option<Direction>,
     },
     /// SSH config の Host 一覧を返す（#20）
     SshHosts,

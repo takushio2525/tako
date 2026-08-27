@@ -122,7 +122,7 @@ tako orchestrator spawn --help
 
 | コマンド | 何をするか |
 |---|---|
-| [`open-in`](#tako-open-in--recent--ssh-hosts) | ディレクトリ / リポジトリ / SSH を新タブで開く |
+| [`open-in`](#tako-open-in--recent--ssh-hosts) | ディレクトリ / リポジトリ を新タブで、SSH をいまのタブの新ペインで開く |
 | [`recent`](#tako-open-in--recent--ssh-hosts) | 最近開いた項目の一覧・クリア |
 | [`ssh-hosts`](#tako-open-in--recent--ssh-hosts) | `~/.ssh/config` の Host 一覧 |
 
@@ -816,11 +816,29 @@ tako welcome dismiss   # 消す
 ```bash
 tako open-in dir ~/Documents/webapp   # 新タブで開く（ファイルツリーにも追加）
 tako open-in repo ~/Documents/webapp  # git root を自動検出して開く
-tako open-in remote myserver          # SSH ホストへ接続する新タブ
+tako open-in remote myserver          # SSH 接続（いまのタブに新ペイン）
 
 tako recent                           # 最近開いた項目
 tako ssh-hosts                        # ~/.ssh/config の Host 一覧
 ```
+
+SSH の開き先は `--target` で選べます（省略時 `split`）。
+
+```bash
+tako open-in remote myserver                  # いまのタブに新ペイン（既定）
+tako open-in remote myserver --target tab     # 新しいタブ
+tako open-in remote myserver --target pane    # いまのペイン自体を SSH にする
+tako open-in remote myserver --target pane --pane 3   # ペイン 3 を SSH にする
+tako open-in remote myserver --remote-dir /srv/app    # 接続後にそのフォルダへ cd
+```
+
+`--target pane` は **ペインを増やさずそのペイン自体を SSH セッションにします**（ペイン ID は
+変わりません）。素のシェルのペインだけが対象で、全画面 TUI が動いている・コマンド実行中・
+AI エージェントのペイン・プレビューは理由と次の一手つきで断られます。接続に失敗しても
+そのペインのシェルのプロンプトへ戻るので、やり直しはその場でできます。
+
+GUI では **ペインの右クリック →「このペインでリモート接続…」**が同じ操作です
+（ファイルメニューの「リモート接続…」は新しいペインを作る側）。
 
 ## リモートアクセス
 
