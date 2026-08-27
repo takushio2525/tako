@@ -2895,20 +2895,26 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_remote_folder",
             "description": "リモート（SSH 先）のフォルダをワークスペースとして開く・閉じる・覗く\
                 （#919 / #65。Zed / VSCode の Remote SSH 相当）。ファイルツリーに SSH 先の\
-                ディレクトリ構造が並び、ファイルはプレビューで開ける（読み取り専用）。\
+                ディレクトリ構造が並び、ファイルはプレビューで開いて**編集・保存できる**\
+                （#966。保存は SFTP の一時ファイル + rename でアトミック。開いた時点から\
+                リモートが変わっていたら上書きせず conflict を返す。書けないファイルは\
+                read_only=true で返る）。\
                 認証は ~/.ssh/config・鍵・ControlMaster をそのまま使う（追加設定なし）。\
                 action: open = 接続してフォルダをツリーへ開く（path 省略でリモートのホーム。\
                 接続に失敗したら開かずに理由を返す）/ close = 閉じる（path 省略でそのホストの全部、\
                 all=true で全ホスト）/ list = 開いているリモートフォルダの一覧（読み込み状態つき）/\
                 ls = ツリーを開かずにリモートのディレクトリを一覧する（構造の把握に使う）/\
-                open-file = リモートのファイルをプレビューで開く / ssh-pane = そのフォルダで\
-                SSH ペインを開く。GUI の「リモートからフォルダを開く」と 1:1。",
+                open-file = リモートのファイルをプレビューで開く（応答の read_only / size /\
+                mode / mtime で書けるかが分かる。保存は tako_preview_save）/ ssh-pane = そのフォルダで\
+                SSH ペインを開く / pending = リモートへ押し出せていない保存の一覧（切断中の保存は\
+                ここに残るので無言で消えない）/ push = 押し出せていない保存の再試行\
+                （force=true で競合を承知のうえ上書き）。GUI の「リモートからフォルダを開く」と 1:1。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "close", "list", "ls", "open-file", "ssh-pane"],
+                        "enum": ["open", "close", "list", "ls", "open-file", "ssh-pane", "pending", "push"],
                         "description": "操作の種類",
                     },
                     "host": {
@@ -2930,6 +2936,10 @@ pub fn tools() -> Vec<Value> {
                     "all": {
                         "type": "boolean",
                         "description": "close でホスト指定なしに全部閉じる（既定は全タブ横断。tab で 1 タブへ絞れる）",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "push で競合（開いた時点からリモートが変わっている）を承知のうえ上書きする（#966）",
                     },
                 },
                 "required": ["action"],

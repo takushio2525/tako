@@ -110,11 +110,34 @@ pub fn menu_close_remote_root() -> &'static str {
 
 // --- プレビュー -------------------------------------------------------------
 
-/// リモートファイルのプレビューは読み取り専用（段階 1。編集は別 Issue）
+/// **書けない**リモートファイル（mode のどこにも `w` が無い）は読み取り専用（#966）
 pub fn preview_read_only() -> &'static str {
     tr!(
-        "リモートファイルは読み取り専用です（保存はできません）",
-        "Remote files are read-only (saving is not supported)"
+        "このリモートファイルは書き込み権限がありません（読み取り専用）",
+        "You do not have write permission for this remote file (read-only)"
+    )
+}
+
+// --- 書き戻し（#966） -------------------------------------------------------
+
+/// リモートへ押し出し中（ローカルの写しへは書けている）
+pub fn preview_pushing() -> &'static str {
+    tr!("リモートへ保存しています…", "Saving to the remote host…")
+}
+
+/// リモートへ書けた
+pub fn preview_pushed(label: &str) -> String {
+    tr!(
+        format!("リモートへ保存しました: {label}"),
+        format!("Saved to the remote host: {label}")
+    )
+}
+
+/// 押し出せず退避した（無言で消えないことを伝える）
+pub fn preview_push_pending() -> &'static str {
+    tr!(
+        "リモートへ送れていません（編集内容はローカルに残っています。`tako remote-folder push` で再試行）",
+        "Not sent to the remote host yet (your edit is kept locally; retry with `tako remote-folder push`)"
     )
 }
 

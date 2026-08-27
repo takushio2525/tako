@@ -2071,12 +2071,18 @@ fn dispatch_inner(
             host.save_preview(target)
                 .map_err(DispatchError::Operation)?;
             let (editing, dirty) = host.preview_edit_state(target).unwrap_or((false, false));
-            Ok(json!({
+            let mut out = json!({
                 "pane": target.as_u64(),
                 "editing": editing,
                 "dirty": dirty,
                 "saved": true,
-            }))
+            });
+            // #966: リモート由来なら「リモートへ書けたのか」まで応答に載せる
+            // （ローカルの写しへ書けただけで saved=true とは言わせない）
+            if let Some(remote) = host.preview_remote_state(target) {
+                out["remote"] = remote;
+            }
+            Ok(out)
         }
         Request::PreviewUndo { pane } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -4067,7 +4073,10 @@ fn dispatch_inner(
             tab,
             focus,
             all,
-        } => dispatch_remote_folder(host, origin, &action, ssh_host, path, tab, focus, all),
+            force,
+        } => dispatch_remote_folder(
+            host, origin, &action, ssh_host, path, tab, focus, all, force,
+        ),
 
         Request::RecentItems { action } => match action.as_str() {
             "list" => {
@@ -5808,6 +5817,7 @@ fn dispatch_remote_folder(
     tab: Option<u64>,
     focus: Option<bool>,
     all: bool,
+    force: bool,
 ) -> Result<Value, DispatchError> {
     use tako_core::remote_fs::{self, RemoteRef};
 
@@ -6028,8 +6038,17 @@ fn dispatch_remote_folder(
         "open-file" => {
             let ssh_host = need_host(&ssh_host)?;
             let file = need_path(&path)?;
-            let local = remote_fs::fetch_file(&ssh_host, &file, remote_fs::MAX_PREVIEW_BYTES)
-                .map_err(to_err)?;
+            let (local, stat) =
+                remote_fs::fetch_file(&ssh_host, &file, remote_fs::MAX_PREVIEW_BYTES)
+                    .map_err(to_err)?;
+            // #966: 編集は開放したが、**確実に書けないものは読み取り専用のまま**にする
+            // （mode のどこにも `w` が無いときだけ。Windows は権限欄が `*` 埋めで
+            // 判定材料が無いので「書けるかもしれない」側 = 編集できる）
+            let read_only = stat
+                .as_ref()
+                .and_then(|s| s.writable_hint())
+                .map(|writable| !writable)
+                .unwrap_or(false);
             let result = dispatch(
                 host,
                 Request::OpenFile {
@@ -6046,14 +6065,101 @@ fn dispatch_remote_folder(
                 host.set_preview_remote_origin(
                     PaneId::from_raw(pane),
                     RemoteRef::new(ssh_host.clone(), file.clone()),
+                    read_only,
                 );
             }
             let mut out = result;
             out["host"] = json!(ssh_host);
             out["remote_path"] = json!(file);
             out["cached_path"] = json!(local.display().to_string());
-            out["read_only"] = json!(true);
+            out["read_only"] = json!(read_only);
+            if let Some(stat) = &stat {
+                out["size"] = json!(stat.size);
+                out["mode"] = json!(stat.mode);
+                out["mtime"] = json!(stat.mtime);
+            }
+            out["pending_write"] = json!(remote_fs::has_pending(&ssh_host, &file));
             Ok(out)
+        }
+
+        // 押し出せていない保存の一覧（#966 受け入れ条件 3）。
+        // **切断中の保存が無言で消えない**ことを見せる窓口
+        "pending" => {
+            let entries: Vec<Value> = remote_fs::list_pending()
+                .iter()
+                .filter(|e| ssh_host.as_deref().map(|h| e.host == h).unwrap_or(true))
+                .filter(|e| path.as_deref().map(|p| e.path == p).unwrap_or(true))
+                .map(|e| {
+                    json!({
+                        "host": e.host,
+                        "path": e.path,
+                        "label": e.label(),
+                        "kind": e.kind,
+                        "error": e.error,
+                        "at": e.at,
+                        "attempts": e.attempts,
+                        "size": e.size,
+                    })
+                })
+                .collect();
+            Ok(json!({ "pending": entries }))
+        }
+
+        // 押し出せていない保存を再試行する（#966 受け入れ条件 3）。
+        // host / path 省略で全件。`force` は競合を承知で上書きする
+        "push" => {
+            let want_host = ssh_host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+            let want_path = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+            let targets: Vec<(String, String)> = remote_fs::list_pending()
+                .iter()
+                .filter(|e| want_host.map(|h| e.host == h).unwrap_or(true))
+                .filter(|e| want_path.map(|p| e.path == p).unwrap_or(true))
+                .filter(|e| !e.host.is_empty())
+                .map(|e| (e.host.clone(), e.path.clone()))
+                .collect();
+            if targets.is_empty() {
+                return Err(DispatchError::Operation(
+                    "押し出せていない保存はありません（`pending` で確認できます）".into(),
+                ));
+            }
+            let mut pushed: Vec<Value> = Vec::new();
+            let mut failed: Vec<Value> = Vec::new();
+            for (h, pth) in targets {
+                match remote_fs::push_pending(&h, &pth, force) {
+                    Ok(report) => pushed.push(json!({
+                        "host": h,
+                        "path": pth,
+                        "bytes": report.bytes,
+                        "atomic": report.atomic,
+                        "verified": report.verified,
+                        "mode_restored": report.mode_restored,
+                    })),
+                    Err(e) => failed.push(json!({
+                        "host": h,
+                        "path": pth,
+                        "kind": e.kind.as_str(),
+                        "error": e.summary(),
+                        "next_step": e.next_step(),
+                        "detail": e.detail.replace('\n', " "),
+                    })),
+                }
+            }
+            // **失敗を成功に混ぜて 200 で返さない**（無言で失われるのと同じになる）
+            if pushed.is_empty() {
+                let first = failed
+                    .first()
+                    .map(|f| {
+                        format!(
+                            "{} / {} / {}",
+                            f["error"].as_str().unwrap_or_default(),
+                            f["next_step"].as_str().unwrap_or_default(),
+                            f["detail"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default();
+                return Err(DispatchError::Operation(first));
+            }
+            Ok(json!({ "pushed": pushed, "failed": failed }))
         }
 
         // そのフォルダを cwd にした SSH ペイン（#919 要件 4）
@@ -6072,7 +6178,7 @@ fn dispatch_remote_folder(
         }
 
         other => Err(DispatchError::InvalidParams(format!(
-            "不明な action: {other:?}（open / close / list / ls / open-file / ssh-pane のいずれか）"
+            "不明な action: {other:?}（open / close / list / ls / open-file / ssh-pane / pending / push のいずれか）"
         ))),
     }
 }

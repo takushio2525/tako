@@ -151,11 +151,32 @@ pub enum RemoteErrorKind {
     NotDirectory,
     /// サイズ上限を超えた
     TooLarge,
+    /// **開いた時点とリモートの実体が食い違っている**（#966。書き戻しを止めた）
+    Conflict,
     /// 応答が読めない・想定外の失敗
     Other,
 }
 
 impl RemoteErrorKind {
+    /// 種別の全列挙。**足したらここにも足す**（`種別の全列挙に漏れがない` が
+    /// 網羅 match で足し忘れを落とす）
+    pub const ALL: &'static [RemoteErrorKind] = &[
+        RemoteErrorKind::ClientMissing,
+        RemoteErrorKind::HostUnresolved,
+        RemoteErrorKind::Unreachable,
+        RemoteErrorKind::Refused,
+        RemoteErrorKind::Timeout,
+        RemoteErrorKind::AuthFailed,
+        RemoteErrorKind::HostKeyMismatch,
+        RemoteErrorKind::SftpUnavailable,
+        RemoteErrorKind::NotFound,
+        RemoteErrorKind::PermissionDenied,
+        RemoteErrorKind::NotDirectory,
+        RemoteErrorKind::TooLarge,
+        RemoteErrorKind::Conflict,
+        RemoteErrorKind::Other,
+    ];
+
     /// 何が起きたか（1 行）
     pub fn summary_note(self) -> Note {
         match self {
@@ -202,6 +223,10 @@ impl RemoteErrorKind {
             RemoteErrorKind::TooLarge => Note::new(
                 "ファイルが大きすぎます（プレビュー上限を超えています）",
                 "The file is too large to preview",
+            ),
+            RemoteErrorKind::Conflict => Note::new(
+                "開いたときからリモート側が変わっています（上書きしませんでした）",
+                "The remote file changed since you opened it (nothing was overwritten)",
             ),
             RemoteErrorKind::Other => Note::new("接続に失敗しました", "The connection failed"),
         }
@@ -254,6 +279,10 @@ impl RemoteErrorKind {
                 "小さいファイルを選ぶか、SSH ペインで直接開いてください",
                 "Pick a smaller file, or open it directly in an SSH pane",
             ),
+            RemoteErrorKind::Conflict => Note::new(
+                "リモートを読み直して編集をやり直すか、こちらの内容で上書きしてよければ強制保存してください（編集内容はローカルに残っています）",
+                "Reload the remote file and redo your edit, or force-save to overwrite it with your version (your edit is kept locally)",
+            ),
             RemoteErrorKind::Other => Note::new(
                 "下の詳細を確認してください",
                 "Check the details below",
@@ -276,6 +305,7 @@ impl RemoteErrorKind {
             RemoteErrorKind::PermissionDenied => "permission_denied",
             RemoteErrorKind::NotDirectory => "not_directory",
             RemoteErrorKind::TooLarge => "too_large",
+            RemoteErrorKind::Conflict => "conflict",
             RemoteErrorKind::Other => "other",
         }
     }
@@ -533,6 +563,78 @@ fn kind_from_mode(field: &str) -> Option<RemoteKind> {
     })
 }
 
+/// `ls -la` の 1 行を列へ分解した結果（純粋関数の内部表現）
+struct LsRow {
+    kind: RemoteKind,
+    /// mode 欄（`-rw-r--r--` / Windows の `-rw-******`）
+    mode: String,
+    size: u64,
+    /// 日時欄 3 列をまとめたもの（`Aug 27 14:58` / `Aug 27 2025`）。
+    /// **分の分解能しかない**ので単独では競合検知に使わない（#966）
+    mtime: String,
+    /// 末尾の名前（`ls -l <file>` はフルパスを返すので末尾要素へ寄せる）
+    name: String,
+}
+
+/// `ls -la` の 1 行を列へ分解する（純粋関数）。mode が読めない行は None。
+///
+/// 列の区切りを自前で辿るのは、**名前に空白が入る**（Windows の `Application Data`）ので
+/// `splitn` では最後の列を切り出せないため。`?` が入ることもある（`ls -l <file>` の
+/// nlink など）ので数値を仮定しない
+fn parse_ls_row(line: &str) -> Option<LsRow> {
+    let mode = line.split_whitespace().next().unwrap_or_default();
+    let kind = kind_from_mode(mode)?;
+    // mode の後ろ 7 列（nlink owner group size month day time）を辿って名前へ
+    let mut size = 0u64;
+    let mut date: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+    let mut rest_start = None;
+    let mut cursor = mode.len();
+    let bytes = line.as_bytes();
+    while skipped < 7 && cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if start == cursor {
+            break;
+        }
+        match skipped {
+            // 4 列目（mode から数えて 4 番目）が size
+            3 => size = line[start..cursor].parse::<u64>().unwrap_or(0),
+            // 5〜7 列目が日時（month day time-or-year）
+            4..=6 => date.push(line[start..cursor].to_string()),
+            _ => {}
+        }
+        skipped += 1;
+        if skipped == 7 {
+            // 残りが名前（先頭の空白だけ落とす。名前中の空白は残す）
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            rest_start = Some(cursor);
+        }
+    }
+    let start = rest_start?;
+    let name = &line[start..];
+    // `ls -l <file>` は名前ではなくフルパスを返す（実測）。その場合は末尾要素を名前にする
+    let name = if name.contains('/') {
+        base_name(name)
+    } else {
+        name.to_string()
+    };
+    Some(LsRow {
+        kind,
+        mode: mode.to_string(),
+        size,
+        mtime: date.join(" "),
+        name,
+    })
+}
+
 /// `sftp` の `ls -la <dir>` 出力を解析する（純粋関数）。
 ///
 /// 形は `mode nlink owner group size month day time-or-year name`（9 列目以降が名前 =
@@ -549,9 +651,7 @@ pub fn parse_ls_long(stdout: &str, dir: &str) -> Vec<RemoteEntry> {
         if line.starts_with("Can't ") || line.starts_with("Couldn't ") {
             continue;
         }
-        let mut fields = line.split_whitespace();
-        let mode = fields.next().unwrap_or_default();
-        let Some(kind) = kind_from_mode(mode) else {
+        let Some(row) = parse_ls_row(line) else {
             // mode に見えない = longname の形が違う。行全体を名前として扱う
             let name = line.trim().to_string();
             if name == "." || name == ".." || name.is_empty() {
@@ -568,56 +668,14 @@ pub fn parse_ls_long(stdout: &str, dir: &str) -> Vec<RemoteEntry> {
             }
             continue;
         };
-        // mode の後ろ 7 列（nlink owner group size month day time）を飛ばして名前へ。
-        // `?` が入ることもある（`ls -l <file>` の nlink など）ので数値を仮定しない。
-        // 列の区切りを自前で辿るのは、**名前に空白が入る**（Windows の
-        // `Application Data`）ので `splitn` では最後の列を切り出せないため
-        let mut size = 0u64;
-        let mut skipped = 0usize;
-        let mut rest_start = None;
-        let mut cursor = mode.len();
-        let bytes = line.as_bytes();
-        while skipped < 7 && cursor < bytes.len() {
-            // 空白を飛ばす
-            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            let start = cursor;
-            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            if start == cursor {
-                break;
-            }
-            // 4 列目（mode から数えて 4 番目）が size
-            if skipped == 3 {
-                size = line[start..cursor].parse::<u64>().unwrap_or(0);
-            }
-            skipped += 1;
-            if skipped == 7 {
-                // 残りが名前（先頭の空白だけ落とす。名前中の空白は残す）
-                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                    cursor += 1;
-                }
-                rest_start = Some(cursor);
-            }
-        }
-        let Some(start) = rest_start else { continue };
-        let name = line[start..].to_string();
-        if name.is_empty() || name == "." || name == ".." {
+        if row.name.is_empty() || row.name == "." || row.name == ".." {
             continue;
         }
-        // `ls -l <file>` は名前ではなくフルパスを返す（実測）。その場合は末尾要素を名前にする
-        let name = if name.contains('/') {
-            base_name(&name)
-        } else {
-            name
-        };
         out.push(RemoteEntry {
-            path: join_remote(dir, &name),
-            name,
-            kind,
-            size,
+            path: join_remote(dir, &row.name),
+            name: row.name,
+            kind: row.kind,
+            size: row.size,
         });
         if out.len() >= MAX_ENTRIES {
             break;
@@ -1142,33 +1200,53 @@ pub fn list_dir(host: &str, path: &str) -> Result<Vec<RemoteEntry>, RemoteError>
     Ok(entries)
 }
 
-/// リモートファイルをローカルのキャッシュへ落とし、そのパスを返す。
+/// リモートファイルの写しを置くローカルのパス（純粋関数）。
+///
+/// 拡張子を保つのはプレビューの種別判定が拡張子を見るため。パスをハッシュへ落とすのは
+/// リモートのディレクトリ構造をローカルへ再現しないため（深いパス・記号を持ち込まない）
+pub fn local_cache_path(cache: &Path, host: &str, path: &str) -> PathBuf {
+    cache
+        .join(short_hash(host))
+        .join(format!("{}-{}", short_hash(path), base_name(path)))
+}
+
+/// リモートファイルをローカルのキャッシュへ落とし、パスと素性を返す。
 ///
 /// プレビューは**この実体（ローカル）**を開くので、構文色・md・画像・PDF・目次・リンクの
-/// 既存スタックがそのまま効く。サイズ上限は [`MAX_PREVIEW_BYTES`]（#65 要件 3）
-pub fn fetch_file(host: &str, path: &str, max_bytes: u64) -> Result<PathBuf, RemoteError> {
+/// 既存スタックがそのまま効く。サイズ上限は [`MAX_PREVIEW_BYTES`]（#65 要件 3）。
+///
+/// 素性（mode）も返すのは、**書けないファイルを読み取り専用として見せる**ため（#966）
+pub fn fetch_file(
+    host: &str,
+    path: &str,
+    max_bytes: u64,
+) -> Result<(PathBuf, Option<RemoteStat>), RemoteError> {
     let target = format!("{host}:{path}");
     ensure_master(host)?;
 
     // サイズを先に見る（大きいファイルを掴んでから気づくのを避ける）
-    let stat = sftp_batch(host, &target, &[format!("ls -la {}", quote_sftp_arg(path))])?;
-    if !stat.status_ok {
-        return Err(RemoteError::new(stat.classify(), target, stat.diagnosis()));
+    let listing = sftp_batch(host, &target, &[format!("ls -la {}", quote_sftp_arg(path))])?;
+    if !listing.status_ok {
+        return Err(RemoteError::new(
+            listing.classify(),
+            target,
+            listing.diagnosis(),
+        ));
     }
-    let listed = parse_ls_long(&stat.stdout, "");
-    if let Some(entry) = listed.first() {
-        if entry.kind == RemoteKind::Dir {
+    let stat = parse_stat(&listing.stdout);
+    if let Some(stat) = &stat {
+        if kind_from_mode(&stat.mode) == Some(RemoteKind::Dir) {
             return Err(RemoteError::new(
                 RemoteErrorKind::NotDirectory,
                 target,
                 "ディレクトリはプレビューできない",
             ));
         }
-        if entry.size > max_bytes {
+        if stat.size > max_bytes {
             return Err(RemoteError::new(
                 RemoteErrorKind::TooLarge,
                 target,
-                format!("{} バイト > 上限 {} バイト", entry.size, max_bytes),
+                format!("{} バイト > 上限 {} バイト", stat.size, max_bytes),
             ));
         }
     }
@@ -1180,16 +1258,16 @@ pub fn fetch_file(host: &str, path: &str, max_bytes: u64) -> Result<PathBuf, Rem
             "data_dir を解決できない",
         ));
     };
-    let host_dir = dir.join(short_hash(host));
-    if let Err(e) = std::fs::create_dir_all(&host_dir) {
-        return Err(RemoteError::new(
-            RemoteErrorKind::Other,
-            target,
-            format!("{}: {e}", host_dir.display()),
-        ));
+    let local = local_cache_path(&dir, host, path);
+    if let Some(host_dir) = local.parent() {
+        if let Err(e) = std::fs::create_dir_all(host_dir) {
+            return Err(RemoteError::new(
+                RemoteErrorKind::Other,
+                target,
+                format!("{}: {e}", host_dir.display()),
+            ));
+        }
     }
-    // 拡張子を保つ（プレビューの種別判定が拡張子を見るため）
-    let local = host_dir.join(format!("{}-{}", short_hash(path), base_name(path)));
     let cmd = format!(
         "get {} {}",
         quote_sftp_arg(path),
@@ -1199,7 +1277,555 @@ pub fn fetch_file(host: &str, path: &str, max_bytes: u64) -> Result<PathBuf, Rem
     if !out.status_ok || !local.exists() {
         return Err(RemoteError::new(out.classify(), target, out.diagnosis()));
     }
+    // **取れた中身がそのときのリモートの内容**なので、ここで競合検知の基準を進める（#966）。
+    // 編集を始めるときに作るのではなく取得のたびに更新するのは、「リモートを読み直して
+    // 競合を解消する」導線（もう一度 open-file する）がそのまま効くようにするため
+    if let Ok(bytes) = std::fs::read(&local) {
+        if let Err(e) = write_baseline(host, path, &bytes) {
+            tracing::warn!("開いた時点の記録を作れない {target}: {e}");
+        }
+    }
+    Ok((local, stat))
+}
+
+// --- 書き戻し（#966。リモートフォルダ段階 2） -------------------------------
+//
+// # 「キャッシュを本物と思って保存する」事故を何で置き換えたか
+//
+// 段階 1（#919）は編集を**構造的に禁じて**いた。本体は `remote-cache/` に落ちた
+// ローカルの写しなので、止めないと「保存できた気になる」（リモートには何も書かれない）。
+// 禁止を外す代わりに置いたのがこの節の 3 つ:
+//
+// 1. **アトミックな書き戻し**: 同じディレクトリへ一時ファイルを `put` してから
+//    `rename` で被せる（OpenSSH の `posix-rename@openssh.com` は既存を上書きする =
+//    Linux / Windows の実機で実測）。途中で切れても**元のファイルは壊れない**
+// 2. **競合検知**: 「開いた時点の内容」を [`baseline_path`] に持ち、書く前に
+//    リモートの実体と突き合わせる。**サイズと mtime ではなく内容そのもの**を見る
+//    （`ls -la` の日時は分の分解能しかなく、同じ分・同じサイズの書き換えを見逃す）
+// 3. **失われない失敗**: 押し出しに失敗したら [`record_pending`] で
+//    「書きたかった内容」をローカルへ退避し、[`push_pending`] で再試行できる。
+//    切断中の保存が無言で消えないのはこれ
+//
+// # mode を戻すのはなぜか
+//
+// `put` は元のファイルの mode を引き継がない（実測: `-rwxr-xr-x` が `-rw-r--r--` に
+// なる）。`rename` で被せると**実行権が落ちる**ので、POSIX として読める mode なら
+// 書き戻したあとに `chmod` で戻す。Windows の sftp-server は mode 欄が `-rw-******`
+// で意味を持たない（`chmod` は成功するが効かない = 実測）ので送らない
+
+/// リモートの 1 ファイルの素性。競合検知の材料と、書けるかの見立てに使う
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteStat {
+    pub size: u64,
+    /// `ls -la` の日時欄（`Aug 27 14:58` / `Aug 27 2025`）。
+    /// **分の分解能しかない**ので単独では競合検知に使わない
+    pub mtime: String,
+    /// mode 欄（`-rw-r--r--` / Windows の `-rw-******`）
+    pub mode: String,
+}
+
+impl RemoteStat {
+    /// 書き込めそうか。`Some(false)` は「**どの位置にも `w` が無い** = 確実に書けない」、
+    /// `Some(true)` は「どこかに `w` がある」、`None` は「mode が読めない」
+    /// （Windows の `*` 埋め）。
+    ///
+    /// 所有者が自分かは sftp からは分からないので、`Some(true)` は
+    /// **書ける保証ではない**（実際の可否は書いてみて分類する）。
+    /// 使い道は「確実に書けないものを読み取り専用として見せる」側だけ
+    pub fn writable_hint(&self) -> Option<bool> {
+        writable_hint(&self.mode)
+    }
+
+    /// `chmod` で戻すべき 8 進数 mode（POSIX として読めるときだけ）
+    pub fn octal_mode(&self) -> Option<String> {
+        octal_mode(&self.mode)
+    }
+}
+
+/// mode 欄から「確実に書けないか」を読む（純粋関数）。[`RemoteStat::writable_hint`] の実体
+pub fn writable_hint(mode: &str) -> Option<bool> {
+    let perms: Vec<char> = mode.chars().skip(1).collect();
+    if perms.len() != 9 {
+        return None;
+    }
+    // Windows の sftp-server は権限を `*` で埋める = 判定材料が無い
+    if perms.contains(&'*') {
+        return None;
+    }
+    Some(perms.contains(&'w'))
+}
+
+/// mode 欄を 8 進数へ（純粋関数）。`*` が混ざる（Windows）・長さが違うときは None
+pub fn octal_mode(mode: &str) -> Option<String> {
+    let perms: Vec<char> = mode.chars().skip(1).collect();
+    if perms.len() != 9 || perms.contains(&'*') {
+        return None;
+    }
+    let mut digits = String::new();
+    for chunk in perms.chunks(3) {
+        let mut v = 0u8;
+        if chunk[0] == 'r' {
+            v += 4;
+        }
+        if chunk[1] == 'w' {
+            v += 2;
+        }
+        // 実行ビットは `x` に加えて setuid / setgid / sticky の小文字（`s` / `t`）でも立つ。
+        // 大文字（`S` / `T`）は実行ビットが落ちている形
+        if matches!(chunk[2], 'x' | 's' | 't') {
+            v += 1;
+        }
+        digits.push((b'0' + v) as char);
+    }
+    Some(digits)
+}
+
+/// 書き戻し用の一時パス（純粋関数）。
+///
+/// **同じディレクトリ**に置くのが要点: `rename` は同一ファイルシステム内でしか
+/// 成立しないので、`/tmp` へ置いてから被せることはできない。
+/// 名前をドット始まりにするのは、失敗して残ってもツリーの既定表示（#550）で
+/// 目に入らないようにするため
+pub fn temp_remote_path(path: &str) -> String {
+    let name = base_name(path);
+    let tmp = format!(".{}.tako-{}.tmp", name, short_hash(path));
+    match parent_remote(path) {
+        Some(dir) => join_remote(&dir, &tmp),
+        None => join_remote("/", &tmp),
+    }
+}
+
+/// 競合の説明（純粋関数）。同じなら None。
+/// **何がどう変わったか**を出す（「変わりました」だけだと次の一手を選べない）
+pub fn conflict_detail(baseline: &[u8], current: &[u8]) -> Option<String> {
+    if baseline == current {
+        return None;
+    }
+    let b = baseline.len();
+    let c = current.len();
+    if b == c {
+        Some(format!("サイズは同じ（{c} バイト）だが内容が違う"))
+    } else {
+        Some(format!("開いた時点 {b} バイト → 現在 {c} バイト"))
+    }
+}
+
+/// 「開いた時点のリモート内容」の置き場。[`fetch_file`] が落とす作業用の写しの隣。
+///
+/// ファイルとして持つのは ①8MiB までの内容をメモリに抱えない ②tako を再起動しても
+/// 競合検知が続けられる ③ペインを閉じても再試行できる、の 3 つのため
+pub fn baseline_path(host: &str, path: &str) -> Option<PathBuf> {
+    let local = local_cache_path(&cache_dir()?, host, path);
+    // 拡張子を**置き換えず後ろへ足す**（`README.md` → `README.md.tako-base`）。
+    // `with_extension` だと `a.b.c` と `a.b.d` が同じ名前へ落ちうる
+    Some(PathBuf::from(format!("{}.tako-base", local.display())))
+}
+
+/// 開いた時点の内容を記録する（編集セッションを作るときに呼ぶ）
+pub fn write_baseline(host: &str, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(base) = baseline_path(host, path) else {
+        return Err(std::io::Error::other("data_dir を解決できない"));
+    };
+    if let Some(dir) = base.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(base, bytes)
+}
+
+/// 開いた時点の内容（無ければ None = 競合を判定する材料が無い）
+pub fn read_baseline(host: &str, path: &str) -> Option<Vec<u8>> {
+    std::fs::read(baseline_path(host, path)?).ok()
+}
+
+/// 書き戻しの結果（応答に載せる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveReport {
+    /// 書いたバイト数
+    pub bytes: u64,
+    /// 一時ファイル + rename を通ったか（常に true。false になる経路は作っていない）
+    pub atomic: bool,
+    /// `chmod` で戻した mode（POSIX として読めなかったときは None）
+    pub mode_restored: Option<String>,
+    /// 書き戻した後のリモートの素性（読めたときだけ）
+    pub stat: Option<RemoteStat>,
+    /// 競合検知でリモートの内容を実際に取って突き合わせたか
+    /// （false = 開いた時点と同じサイズ・同じ内容だと分かる材料が無く force で通した）
+    pub verified: bool,
+}
+
+/// 1 ファイルの素性を読む（`ls -la <path>` 1 回）
+pub fn stat_file(host: &str, path: &str) -> Result<RemoteStat, RemoteError> {
+    let target = format!("{host}:{path}");
+    ensure_master(host)?;
+    let out = sftp_batch(host, &target, &[format!("ls -la {}", quote_sftp_arg(path))])?;
+    if !out.status_ok {
+        return Err(RemoteError::new(out.classify(), target, out.diagnosis()));
+    }
+    parse_stat(&out.stdout).ok_or_else(|| {
+        RemoteError::new(
+            RemoteErrorKind::Other,
+            target,
+            format!("ls の出力を解析できない: {}", first_lines(&out.stdout, 2)),
+        )
+    })
+}
+
+/// `ls -la <file>` の出力から素性を読む（純粋関数）
+pub fn parse_stat(stdout: &str) -> Option<RemoteStat> {
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || is_echo_line(line) {
+            continue;
+        }
+        if line.starts_with("Can't ") || line.starts_with("Couldn't ") {
+            continue;
+        }
+        if let Some(row) = parse_ls_row(line) {
+            if row.name == "." || row.name == ".." {
+                continue;
+            }
+            return Some(RemoteStat {
+                size: row.size,
+                mtime: row.mtime,
+                mode: row.mode,
+            });
+        }
+    }
+    None
+}
+
+/// リモートのファイルへ書き戻す（#966）。
+///
+/// 手順は 3 バッチ:
+///
+/// 1. `ls -la` で素性を読む（消えていれば競合、ディレクトリなら拒否、
+///    上限を超える大きさに化けていれば競合）
+/// 2. `get` で**現在の内容**を取り、開いた時点（[`baseline_path`]）と突き合わせる。
+///    食い違えば書かずに [`RemoteErrorKind::Conflict`] を返す（`force` で上書き可）
+/// 3. 一時ファイルへ `put` → `rename` で被せる → POSIX mode なら `chmod` で戻す →
+///    `ls -la` で書けたことを確かめる
+///
+/// 成功したら開いた時点の記録を**書いた内容へ更新する**（次の保存の基準になる）。
+///
+/// **UI スレッドで呼ばないこと**（ネットワーク I/O。GUI は背景へ投げる）
+pub fn save_file(
+    host: &str,
+    path: &str,
+    bytes: &[u8],
+    force: bool,
+) -> Result<SaveReport, RemoteError> {
+    let target = format!("{host}:{path}");
+    ensure_master(host)?;
+
+    // (1) 素性
+    let stat = stat_file(host, path)?;
+    if kind_from_mode(&stat.mode) == Some(RemoteKind::Dir) {
+        return Err(RemoteError::new(
+            RemoteErrorKind::NotDirectory,
+            target,
+            "ディレクトリへは書き戻せない",
+        ));
+    }
+
+    // (2) 競合検知
+    let mut verified = false;
+    match read_baseline(host, path) {
+        Some(baseline) => {
+            if stat.size > MAX_PREVIEW_BYTES {
+                // 開いた時点は上限以下だったので、上限超えは変わった証拠
+                if !force {
+                    return Err(RemoteError::new(
+                        RemoteErrorKind::Conflict,
+                        target,
+                        format!(
+                            "リモート側が上限を超える大きさ（{} バイト）に変わっている",
+                            stat.size
+                        ),
+                    ));
+                }
+            } else {
+                let current = fetch_to_temp(host, path)?;
+                let read = std::fs::read(&current);
+                let _ = std::fs::remove_file(&current);
+                let current = read.map_err(|e| {
+                    RemoteError::new(
+                        RemoteErrorKind::Other,
+                        target.clone(),
+                        format!("取得した内容を読めない: {e}"),
+                    )
+                })?;
+                verified = true;
+                if let Some(detail) = conflict_detail(&baseline, &current) {
+                    if !force {
+                        return Err(RemoteError::new(RemoteErrorKind::Conflict, target, detail));
+                    }
+                }
+            }
+        }
+        None if !force => {
+            return Err(RemoteError::new(
+                RemoteErrorKind::Conflict,
+                target,
+                "開いた時点の内容が分からない（競合を判定できない）",
+            ));
+        }
+        None => {}
+    }
+
+    // (3) 一時ファイルへ put → rename で被せる
+    let local = write_temp(bytes).map_err(|e| {
+        RemoteError::new(
+            RemoteErrorKind::Other,
+            target.clone(),
+            format!("一時ファイルを作れない: {e}"),
+        )
+    })?;
+    let remote_tmp = temp_remote_path(path);
+    let mode_restored = stat.octal_mode();
+    let mut commands = vec![
+        format!(
+            "put {} {}",
+            quote_sftp_arg(&local.to_string_lossy()),
+            quote_sftp_arg(&remote_tmp)
+        ),
+        format!(
+            "rename {} {}",
+            quote_sftp_arg(&remote_tmp),
+            quote_sftp_arg(path)
+        ),
+    ];
+    if let Some(octal) = &mode_restored {
+        commands.push(format!("chmod {octal} {}", quote_sftp_arg(path)));
+    }
+    commands.push(format!("ls -la {}", quote_sftp_arg(path)));
+    let out = sftp_batch(host, &target, &commands);
+    let _ = std::fs::remove_file(&local);
+    let out = out?;
+    if !out.status_ok {
+        // 一時ファイルが残っていたら片付ける（`-` 前置 = 失敗しても打ち切らない）
+        let _ = sftp_batch(
+            host,
+            &target,
+            &[format!("-rm {}", quote_sftp_arg(&remote_tmp))],
+        );
+        return Err(RemoteError::new(out.classify(), target, out.diagnosis()));
+    }
+
+    // 次の保存の基準を「いま書いた内容」へ進める
+    if let Err(e) = write_baseline(host, path, bytes) {
+        // ここで失敗しても書き戻し自体は成立している。次の保存が
+        // 「開いた時点が分からない」になるだけなので、握り潰さず detail へ出す
+        tracing::warn!("開いた時点の記録を更新できない {target}: {e}");
+    }
+    Ok(SaveReport {
+        bytes: bytes.len() as u64,
+        atomic: true,
+        mode_restored,
+        stat: parse_stat(&out.stdout),
+        verified,
+    })
+}
+
+/// リモートの現在の内容を一時ファイルへ落とす（競合検知用。キャッシュは汚さない）
+fn fetch_to_temp(host: &str, path: &str) -> Result<PathBuf, RemoteError> {
+    let target = format!("{host}:{path}");
+    let dir = temp_dir_for_writes().map_err(|e| {
+        RemoteError::new(
+            RemoteErrorKind::Other,
+            target.clone(),
+            format!("一時ディレクトリを作れない: {e}"),
+        )
+    })?;
+    let local = dir.join(format!("cur-{}", short_hash(&target)));
+    let _ = std::fs::remove_file(&local);
+    let out = sftp_batch(
+        host,
+        &target,
+        &[format!(
+            "get {} {}",
+            quote_sftp_arg(path),
+            quote_sftp_arg(&local.to_string_lossy())
+        )],
+    )?;
+    if !out.status_ok || !local.exists() {
+        return Err(RemoteError::new(out.classify(), target, out.diagnosis()));
+    }
     Ok(local)
+}
+
+/// 書き戻す内容を置く一時ファイル
+fn write_temp(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let dir = temp_dir_for_writes()?;
+    let local = dir.join(format!("put-{}", short_hash(&format!("{}", bytes.len()))));
+    std::fs::write(&local, bytes)?;
+    Ok(local)
+}
+
+fn temp_dir_for_writes() -> std::io::Result<PathBuf> {
+    let dir = match cache_dir() {
+        Some(d) => d.join("tmp"),
+        None => std::env::temp_dir().join("tako-remote-tmp"),
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+// --- 送れなかった保存の退避と再試行（#966 受け入れ条件 3） -------------------
+
+/// 押し出せなかった保存 1 件。**内容そのものは隣の `.body` に置く**（JSON に
+/// 埋めると 8MiB のテキストが 1 行になり、壊れたときに手で救えない）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingWrite {
+    pub host: String,
+    pub path: String,
+    /// 最後の失敗の種別（[`RemoteErrorKind::as_str`]）
+    #[serde(default)]
+    pub kind: String,
+    /// 最後の失敗理由（要約 + 次の一手）
+    #[serde(default)]
+    pub error: String,
+    /// 記録した時刻（UNIX 秒）
+    #[serde(default)]
+    pub at: u64,
+    /// 試行回数
+    #[serde(default)]
+    pub attempts: u32,
+    /// 書きたい内容のバイト数
+    #[serde(default)]
+    pub size: u64,
+}
+
+impl PendingWrite {
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.host, self.path)
+    }
+}
+
+/// 退避の置き場（`<data_dir>/remote-cache/pending/`）
+pub fn pending_dir() -> Option<PathBuf> {
+    Some(cache_dir()?.join("pending"))
+}
+
+/// 退避 1 件の識別子（host + path で決まる = 同じファイルを何度保存しても増えない）
+pub fn pending_id(host: &str, path: &str) -> String {
+    format!("{}-{}", short_hash(host), short_hash(path))
+}
+
+/// 押し出せなかった保存を退避する。**ここが「無言で消えない」の実体**
+pub fn record_pending(
+    host: &str,
+    path: &str,
+    bytes: &[u8],
+    error: &RemoteError,
+) -> std::io::Result<()> {
+    let Some(dir) = pending_dir() else {
+        return Err(std::io::Error::other("data_dir を解決できない"));
+    };
+    std::fs::create_dir_all(&dir)?;
+    let id = pending_id(host, path);
+    std::fs::write(dir.join(format!("{id}.body")), bytes)?;
+    let attempts = read_pending(&dir, &id).map(|p| p.attempts).unwrap_or(0) + 1;
+    let entry = PendingWrite {
+        host: host.to_string(),
+        path: path.to_string(),
+        kind: error.kind.as_str().to_string(),
+        error: format!("{} / {}", error.summary(), error.next_step()),
+        at: unix_secs(),
+        attempts,
+        size: bytes.len() as u64,
+    };
+    let json = serde_json::to_vec_pretty(&entry).map_err(std::io::Error::other)?;
+    std::fs::write(dir.join(format!("{id}.json")), json)
+}
+
+/// 退避を捨てる（押し出せた・ユーザーが要らないと言った）
+pub fn clear_pending(host: &str, path: &str) {
+    let Some(dir) = pending_dir() else { return };
+    let id = pending_id(host, path);
+    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+    let _ = std::fs::remove_file(dir.join(format!("{id}.body")));
+}
+
+/// 退避の一覧（新しいものが先）。**読めない断片は落とさず error として出す**
+pub fn list_pending() -> Vec<PendingWrite> {
+    let Some(dir) = pending_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PendingWrite> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match read_pending(&dir, id) {
+            Some(entry) => out.push(entry),
+            None => out.push(PendingWrite {
+                host: String::new(),
+                path: p.display().to_string(),
+                kind: RemoteErrorKind::Other.as_str().to_string(),
+                error: "退避の記録を読めない（内容は隣の .body に残っている）".into(),
+                at: 0,
+                attempts: 0,
+                size: 0,
+            }),
+        }
+    }
+    out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.path.cmp(&b.path)));
+    out
+}
+
+/// この位置に押し出せていない保存が残っているか（応答へ載せる安価な確認）
+pub fn has_pending(host: &str, path: &str) -> bool {
+    pending_dir()
+        .map(|d| d.join(format!("{}.body", pending_id(host, path))).exists())
+        .unwrap_or(false)
+}
+
+/// 退避された内容（再試行に使う）
+pub fn pending_body(host: &str, path: &str) -> Option<Vec<u8>> {
+    let dir = pending_dir()?;
+    std::fs::read(dir.join(format!("{}.body", pending_id(host, path)))).ok()
+}
+
+fn read_pending(dir: &Path, id: &str) -> Option<PendingWrite> {
+    let text = std::fs::read_to_string(dir.join(format!("{id}.json"))).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 退避 1 件を押し出す（再試行）。押し出せたら退避を捨てる
+pub fn push_pending(host: &str, path: &str, force: bool) -> Result<SaveReport, RemoteError> {
+    let target = format!("{host}:{path}");
+    let Some(bytes) = pending_body(host, path) else {
+        return Err(RemoteError::new(
+            RemoteErrorKind::NotFound,
+            target,
+            "退避された内容が無い（すでに押し出したか、退避を捨てた）",
+        ));
+    };
+    match save_file(host, path, &bytes, force) {
+        Ok(report) => {
+            clear_pending(host, path);
+            Ok(report)
+        }
+        Err(e) => {
+            // 失敗しても退避は残す（試行回数と理由だけ進める）
+            let _ = record_pending(host, path, &bytes, &e);
+            Err(e)
+        }
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// キャッシュに落ちたファイルか（プレビューの編集を止める判定に使う）
@@ -1594,5 +2220,171 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             ));
         }
         assert_eq!(parse_ls_long(&out, "/big").len(), MAX_ENTRIES);
+    }
+
+    // --- 書き戻し（#966） ---------------------------------------------------
+
+    #[test]
+    fn 種別の全列挙に漏れがない() {
+        // 網羅 match: 種別を足すとここがコンパイルエラーになるので、
+        // ALL への追加を忘れたまま素通りできない（#966 で Conflict を足したときの学び）
+        for kind in RemoteErrorKind::ALL {
+            let tag = match kind {
+                RemoteErrorKind::ClientMissing => "client_missing",
+                RemoteErrorKind::HostUnresolved => "host_unresolved",
+                RemoteErrorKind::Unreachable => "unreachable",
+                RemoteErrorKind::Refused => "refused",
+                RemoteErrorKind::Timeout => "timeout",
+                RemoteErrorKind::AuthFailed => "auth_failed",
+                RemoteErrorKind::HostKeyMismatch => "host_key_mismatch",
+                RemoteErrorKind::SftpUnavailable => "sftp_unavailable",
+                RemoteErrorKind::NotFound => "not_found",
+                RemoteErrorKind::PermissionDenied => "permission_denied",
+                RemoteErrorKind::NotDirectory => "not_directory",
+                RemoteErrorKind::TooLarge => "too_large",
+                RemoteErrorKind::Conflict => "conflict",
+                RemoteErrorKind::Other => "other",
+            };
+            assert_eq!(tag, kind.as_str(), "as_str と全列挙が食い違う: {kind:?}");
+        }
+        assert_eq!(
+            RemoteErrorKind::ALL.len(),
+            14,
+            "種別を足したら ALL にも足す（網羅テストが回らなくなる）"
+        );
+    }
+
+    #[test]
+    fn 素性は_ls_の_mode_と日時とサイズを拾う() {
+        // Linux（実測の形）
+        let stat = parse_stat(
+            "sftp> ls -la \"/tmp/t/target.txt\"\n\
+             -rwxr-xr-x    1 user     user           16 Aug 27 14:57 /tmp/t/target.txt\n",
+        )
+        .expect("解析できる");
+        assert_eq!(stat.size, 16);
+        assert_eq!(stat.mode, "-rwxr-xr-x");
+        assert_eq!(stat.mtime, "Aug 27 14:57");
+        // Windows（実測の形。owner / group が `-`、権限が `*` 埋め）
+        let win = parse_stat(
+            "sftp> ls -la \"/C:/Users/u/t/target.txt\"\n\
+             -rw-******    1 -        -              22 Aug 27 14:58 target.txt\n",
+        )
+        .expect("解析できる");
+        assert_eq!(win.size, 22);
+        assert_eq!(win.mode, "-rw-******");
+        // 診断行だけなら None（黙って 0 バイトの素性を作らない）
+        assert!(parse_stat("sftp> ls -la \"/nope\"\nCan't ls: \"/nope\" not found\n").is_none());
+    }
+
+    #[test]
+    fn 書けないファイルだけを読み取り専用と見なす() {
+        // どの位置にも w が無い = 確実に書けない
+        assert_eq!(writable_hint("-r--r--r--"), Some(false));
+        assert_eq!(writable_hint("-rw-r--r--"), Some(true));
+        assert_eq!(writable_hint("----------"), Some(false));
+        // Windows の `*` 埋めは判定材料が無い（読み取り専用にはしない）
+        assert_eq!(writable_hint("-rw-******"), None);
+        assert_eq!(writable_hint("*********"), None);
+        // 形が違うものも None
+        assert_eq!(writable_hint("-rw-"), None);
+    }
+
+    #[test]
+    fn mode_を_8_進数へ戻す() {
+        assert_eq!(octal_mode("-rwxr-xr-x").as_deref(), Some("755"));
+        assert_eq!(octal_mode("-rw-r--r--").as_deref(), Some("644"));
+        assert_eq!(octal_mode("-rw-------").as_deref(), Some("600"));
+        // setuid / sticky の小文字は実行ビットが立っている形
+        assert_eq!(octal_mode("-rwsr-xr-x").as_deref(), Some("755"));
+        // 大文字は実行ビットが落ちている
+        assert_eq!(octal_mode("-rwSr-xr-x").as_deref(), Some("655"));
+        // Windows は送らない（chmod は成功するが効かない = 実測）
+        assert_eq!(octal_mode("-rw-******"), None);
+    }
+
+    #[test]
+    fn 書き戻しの一時パスは同じディレクトリのドット始まり() {
+        // rename は同一ファイルシステム内でしか成立しないので、必ず同じディレクトリ
+        let tmp = temp_remote_path("/srv/app/README.md");
+        assert!(
+            tmp.starts_with("/srv/app/."),
+            "同じディレクトリのドット始まりでない: {tmp}"
+        );
+        assert!(tmp.ends_with(".tmp"), "{tmp}");
+        assert!(tmp.contains("README.md"), "元の名前が分かる: {tmp}");
+        // ルート直下でも壊れない
+        assert!(temp_remote_path("/a.txt").starts_with("/."));
+        // Windows のドライブ表記
+        let win = temp_remote_path("/C:/Users/u/dev/a.txt");
+        assert!(win.starts_with("/C:/Users/u/dev/."), "{win}");
+        // パスごとに違う（別ファイルの保存が同じ一時ファイルを踏まない）
+        assert_ne!(
+            temp_remote_path("/a/README.md"),
+            temp_remote_path("/b/README.md")
+        );
+    }
+
+    #[test]
+    fn 競合は何がどう変わったかを言う() {
+        assert_eq!(conflict_detail(b"same", b"same"), None);
+        // サイズが同じで内容が違う = mtime とサイズだけでは見逃す形
+        let same_size = conflict_detail(b"abcd", b"abce").expect("競合");
+        assert!(same_size.contains("サイズは同じ"), "{same_size}");
+        let grown = conflict_detail(b"ab", b"abcd").expect("競合");
+        assert!(grown.contains("2") && grown.contains("4"), "{grown}");
+    }
+
+    #[test]
+    fn 開いた時点の記録は作業用の写しと別のファイルへ置く() {
+        let cache = std::path::Path::new("/cache");
+        let local = local_cache_path(cache, "win", "/C:/Users/u/a.md");
+        // 拡張子は保つ（プレビューの種別判定が見る）
+        assert!(local.to_string_lossy().ends_with("-a.md"), "{local:?}");
+        // 別のパスは別の写しへ（同名ファイルがぶつからない）
+        assert_ne!(local, local_cache_path(cache, "win", "/C:/Users/u/b/a.md"));
+        // 別のホストも分かれる
+        assert_ne!(local, local_cache_path(cache, "other", "/C:/Users/u/a.md"));
+    }
+
+    #[test]
+    fn 退避の識別子はホストとパスで決まる() {
+        // 同じファイルを何度保存しても退避が増えない
+        assert_eq!(pending_id("win", "/a/b.md"), pending_id("win", "/a/b.md"));
+        assert_ne!(pending_id("win", "/a/b.md"), pending_id("win", "/a/c.md"));
+        assert_ne!(pending_id("win", "/a/b.md"), pending_id("lin", "/a/b.md"));
+    }
+
+    #[test]
+    fn 書き戻しの_sftp_バッチは一時ファイルへ入れて_rename_で被せる() {
+        // 直接 put で被せると、途中で切れたときに**元のファイルが壊れる**。
+        // 組み立ての順序をここで固定する（put → rename → chmod → 確認）
+        let path = "/srv/app/run.sh";
+        let tmp = temp_remote_path(path);
+        let commands = vec![
+            format!(
+                "put {} {}",
+                quote_sftp_arg("/local/tmp"),
+                quote_sftp_arg(&tmp)
+            ),
+            format!("rename {} {}", quote_sftp_arg(&tmp), quote_sftp_arg(path)),
+            format!("chmod 755 {}", quote_sftp_arg(path)),
+            format!("ls -la {}", quote_sftp_arg(path)),
+        ];
+        let script = batch_script(&commands);
+        let put = script.find("put ").expect("put がある");
+        let rename = script.find("rename ").expect("rename がある");
+        let chmod = script.find("chmod ").expect("chmod がある");
+        assert!(put < rename && rename < chmod, "順序が違う:\n{script}");
+        // 対象を直接開く `put ... "/srv/app/run.sh"` が無いこと（= 非アトミックな上書き）
+        assert!(
+            !script.contains(&format!(
+                "put {} {}",
+                quote_sftp_arg("/local/tmp"),
+                quote_sftp_arg(path)
+            )),
+            "対象を直接 put している:\n{script}"
+        );
+        assert!(script.ends_with("bye\n"));
     }
 }

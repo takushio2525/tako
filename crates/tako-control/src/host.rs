@@ -265,16 +265,28 @@ pub trait UiStateHost {
     }
     /// リモートフォルダの内容を捨てて取り直す（#919 の「再読み込み」）
     fn invalidate_remote_dir(&mut self, _remote: &tako_core::remote_fs::RemoteRef) {}
-    /// プレビューペインに「これはリモートのどこのファイルか」を覚えさせる（#919）。
+    /// プレビューペインに「これはリモートのどこのファイルか」を覚えさせる（#919 / #966）。
     ///
-    /// ヘッダの表示と**編集の禁止**（段階 1 は読み取り専用）に使う。プレビュー本体は
-    /// SFTP で落としたローカルのキャッシュを開くので、これが無いと
-    /// 「キャッシュを編集して保存できた気になる」事故が起きる
+    /// ヘッダの表示と**保存先の切り替え**に使う。プレビュー本体は SFTP で落とした
+    /// ローカルのキャッシュを開くので、これが無いと「キャッシュを編集して保存できた
+    /// 気になる」事故が起きる（リモートには何も書かれない）。
+    ///
+    /// `read_only` は **mode のどこにも `w` が無い**と分かったときだけ true
+    /// （#966。Windows は権限欄が `*` 埋めで判定材料が無いので false）
     fn set_preview_remote_origin(
         &mut self,
         _pane: PaneId,
         _remote: tako_core::remote_fs::RemoteRef,
+        _read_only: bool,
     ) {
+    }
+
+    /// リモート由来プレビューの書き戻し状態（#966）。ローカルのファイルなら None。
+    ///
+    /// `PreviewSave` の応答に載せるので、**AI が「リモートへ書けたのか」を
+    /// 応答だけで判断できる**（GUI はヘッダに同じ状態を出す）
+    fn preview_remote_state(&self, _pane: PaneId) -> Option<Value> {
+        None
     }
     /// ピン留め中のプレビュー一覧（FR-2.16.15）
     fn pinned_previews(&self) -> Vec<PinnedView> {

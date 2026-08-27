@@ -1527,8 +1527,17 @@ struct TakoApp {
     remote_context_menu: Option<RemoteContextMenu>,
     /// プレビューペインが「リモートのどこ由来か」（#919）。
     /// 本体は SFTP で落としたローカルのキャッシュを開くので、これが無いと
-    /// キャッシュを本物と思って編集・保存してしまう
+    /// キャッシュを本物と思って編集・保存してしまう（#966 で保存先の切り替えにも使う）
     preview_remote_origins: HashMap<PaneId, tako_core::remote_fs::RemoteRef>,
+    /// **確実に書けない**リモートファイルのペイン（#966）。mode のどこにも `w` が
+    /// 無いと分かったときだけ入る（Windows は権限欄が `*` 埋めなので入らない）
+    preview_remote_read_only: std::collections::HashSet<PaneId>,
+    /// リモートへの書き戻しの進行状態（#966）。GUI の ⌘S は**背景で押し出す**ので、
+    /// 「ローカルへは書けたがリモートはまだ」を画面と応答の両方に出すために持つ
+    preview_remote_push: HashMap<PaneId, RemotePush>,
+    /// 押し出し中にもう一度保存されたペイン（#966）。終わってから 1 回だけ押し直す
+    /// （保存のたびに背景ジョブを積み上げると、遅い相手で順序が入れ替わる）
+    remote_push_again: std::collections::HashSet<PaneId>,
     /// リモート操作の通知（#919）。サイドバー上部に出す。
     /// **失敗は自動で消さない**（静かな失敗を作らないため）
     remote_notice: Option<RemoteNotice>,
@@ -2831,6 +2840,31 @@ impl RemoteNotice {
     }
 }
 
+/// リモートへの書き戻しの進行状態（#966）。
+///
+/// GUI の ⌘S は「ローカルの写しへ書く（同期・即時）」→「リモートへ押し出す（背景）」の
+/// 2 段。**ネットワーク I/O を UI スレッドで待たない**ため（実測: ControlMaster に
+/// 相乗りしても 1 バッチ 1〜2 秒）。その途中の状態を画面と応答の両方に出す
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemotePush {
+    /// 押し出し中（ローカルへは書けている）
+    Uploading,
+    /// 押し出せた（`bytes` バイト。競合検知でリモートの内容を突き合わせたか）
+    Done { bytes: u64, verified: bool },
+    /// 押し出せなかった。**内容は退避されている**ので `push` で再試行できる
+    Failed { kind: String, message: String },
+}
+
+impl RemotePush {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RemotePush::Uploading => "uploading",
+            RemotePush::Done { .. } => "saved",
+            RemotePush::Failed { .. } => "failed",
+        }
+    }
+}
+
 /// リモート（SSH 先）ツリー行の右クリックメニュー（#919）
 struct RemoteContextMenu {
     remote: tako_core::remote_fs::RemoteRef,
@@ -3248,6 +3282,9 @@ impl TakoApp {
             context_menu: None,
             remote_context_menu: None,
             preview_remote_origins: HashMap::new(),
+            preview_remote_read_only: std::collections::HashSet::new(),
+            preview_remote_push: HashMap::new(),
+            remote_push_again: std::collections::HashSet::new(),
             remote_notice: None,
             pane_context_menu: None,
             inline_edit: None,
@@ -8680,6 +8717,7 @@ impl TakoApp {
                 tab: None,
                 focus: None,
                 all: false,
+                force: false,
             },
             PaneOrigin::User,
         );
@@ -8733,6 +8771,7 @@ impl TakoApp {
                 tab: None,
                 focus: None,
                 all: false,
+                force: false,
             },
             PaneOrigin::User,
         );
@@ -9849,18 +9888,26 @@ impl TakoApp {
         if !self.previews.contains_key(&pane_id) {
             return Err("プレビューペインではない".into());
         }
-        // #919 段階 1: リモートファイルは読み取り専用。
+        // #966: リモートファイルも編集できる（段階 2）。ただし **mode のどこにも `w` が
+        // 無いと分かっているもの**は読み取り専用のまま止める。
         //
-        // 本体は SFTP で落としたローカルのキャッシュなので、ここを止めないと
-        // **キャッシュを編集して「保存できた」と思わせる**（リモートには何も書かれない）。
-        // 書き戻し（SFTP put）は別 Issue へ切り出す
-        if enabled && self.preview_remote_origins.contains_key(&pane_id) {
+        // 本体は SFTP で落としたローカルのキャッシュなので、保存は
+        // `push_preview_remote_sync` / `push_preview_remote_async` が SFTP で書き戻す。
+        // どちらも通らない経路を作ると「キャッシュを編集して保存できた気になる」
+        // （リモートには何も書かれない）事故に戻る
+        if enabled && self.preview_remote_read_only.contains(&pane_id) {
             return Err(crate::ui_text::remote_folder::preview_read_only().into());
         }
         if enabled && !self.preview_edits.contains_key(&pane_id) {
             let state = self.previews.get(&pane_id).expect("上で確認済み");
-            self.preview_edits
-                .insert(pane_id, preview::EditState::open(state)?);
+            let mut edit = preview::EditState::open(state)?;
+            if self.preview_remote_origins.contains_key(&pane_id) {
+                // #966: リモートは自動保存を既定 OFF にする。1 回の保存が SFTP の
+                // 3 バッチ（素性 → 内容の突き合わせ → 書き戻し）なので、打鍵ごとに
+                // 走らせると回線を占有し続ける。Zed / VSCode も既定は手動保存
+                edit.autosave = false;
+            }
+            self.preview_edits.insert(pane_id, edit);
         }
         if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
             edit.editing = enabled;
@@ -9906,9 +9953,178 @@ impl TakoApp {
         }
     }
 
+    // --- リモートファイルの書き戻し（#966） ---------------------------------
+
+    /// このペインのプレビューがリモート由来ならその位置
+    fn preview_remote_ref(&self, pane_id: PaneId) -> Option<tako_core::remote_fs::RemoteRef> {
+        self.preview_remote_origins.get(&pane_id).cloned()
+    }
+
+    /// 押し出す内容（編集バッファの現在の中身）。編集セッションが無ければ None
+    fn preview_remote_payload(&self, pane_id: PaneId) -> Option<Vec<u8>> {
+        Some(
+            self.preview_edits
+                .get(&pane_id)?
+                .buffer
+                .text()
+                .as_bytes()
+                .to_vec(),
+        )
+    }
+
+    /// 押し出しの結果をペインへ反映する（成功 / 失敗の両方）。
+    /// 失敗は**内容を退避してから**記録するので、無言で失われない
+    fn apply_remote_push_result(
+        &mut self,
+        pane_id: PaneId,
+        remote: &tako_core::remote_fs::RemoteRef,
+        bytes: Vec<u8>,
+        result: Result<tako_core::remote_fs::SaveReport, tako_core::remote_fs::RemoteError>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(report) => {
+                self.preview_remote_push.insert(
+                    pane_id,
+                    RemotePush::Done {
+                        bytes: report.bytes,
+                        verified: report.verified,
+                    },
+                );
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    edit.save_status = Some(preview::SaveStatus::Saved);
+                    edit.message = Some(crate::ui_text::remote_folder::preview_pushed(
+                        &remote.label(),
+                    ));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // **ここが「切断中の保存が無言で消えない」の実体**:
+                // 書きたかった内容をローカルへ退避し、`push` で再試行できる形にする
+                if let Err(io) =
+                    tako_core::remote_fs::record_pending(&remote.host, &remote.path, &bytes, &e)
+                {
+                    eprintln!("warning: 退避できない {}: {io}", remote.label());
+                }
+                let message = format!("{} / {} / {}", e.summary(), e.next_step(), e.detail);
+                self.preview_remote_push.insert(
+                    pane_id,
+                    RemotePush::Failed {
+                        kind: e.kind.as_str().to_string(),
+                        message: message.clone(),
+                    },
+                );
+                if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    edit.save_status = Some(
+                        if e.kind == tako_core::remote_fs::RemoteErrorKind::Conflict {
+                            preview::SaveStatus::Conflict
+                        } else {
+                            preview::SaveStatus::Error(message.clone())
+                        },
+                    );
+                    edit.message = Some(message.clone());
+                }
+                Err(message)
+            }
+        }
+    }
+
+    /// リモートへ**同期で**押し出す（dispatch = CLI / MCP 経路）。
+    ///
+    /// dispatch は UI スレッドで走るので待つのは本来避けたいが、#919 の
+    /// `open` / `ls` / `open-file` と同じ「ユーザー / AI が明示的に起こした 1 回の操作」
+    /// なので同じ扱いにしてある。**AI が応答だけで「リモートへ書けたか」を判断できる**
+    /// ことのほうが重要（GUI 側は `push_preview_remote_async` で待たない）
+    fn push_preview_remote_sync(&mut self, pane_id: PaneId, force: bool) -> Result<(), String> {
+        let Some(remote) = self.preview_remote_ref(pane_id) else {
+            return Ok(());
+        };
+        let Some(bytes) = self.preview_remote_payload(pane_id) else {
+            return Err("編集モードを開始していない".into());
+        };
+        self.preview_remote_push
+            .insert(pane_id, RemotePush::Uploading);
+        let result = tako_core::remote_fs::save_file(&remote.host, &remote.path, &bytes, force);
+        self.apply_remote_push_result(pane_id, &remote, bytes, result)
+    }
+
+    /// リモートへ**背景で**押し出す（GUI の ⌘S / 保存ボタン / 自動保存）。
+    ///
+    /// ネットワーク I/O を UI スレッドで待たない（実測: ControlMaster に相乗りしても
+    /// 1 バッチ 1〜2 秒。⌘S ごとに固まると #212 / #772 と同じ体感の悪化になる）。
+    /// 進行中にもう一度保存されたら、終わってから 1 回だけ押し直す（積み上げない）
+    fn push_preview_remote_async(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let Some(remote) = self.preview_remote_ref(pane_id) else {
+            return;
+        };
+        let Some(bytes) = self.preview_remote_payload(pane_id) else {
+            return;
+        };
+        if self.preview_remote_push.get(&pane_id) == Some(&RemotePush::Uploading) {
+            // 進行中。終わったところで最新の内容をもう一度押し出す
+            self.remote_push_again.insert(pane_id);
+            return;
+        }
+        self.preview_remote_push
+            .insert(pane_id, RemotePush::Uploading);
+        let target = remote.clone();
+        let payload = bytes.clone();
+        cx.spawn(async move |this, cx| {
+            let job = {
+                let host = target.host.clone();
+                let path = target.path.clone();
+                let payload = payload.clone();
+                cx.background_spawn(async move {
+                    tako_core::remote_fs::save_file(&host, &path, &payload, false)
+                })
+            };
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                let _ = this.apply_remote_push_result(pane_id, &target, payload, result);
+                if this.remote_push_again.remove(&pane_id) {
+                    // 進行中に入った保存を 1 回だけ拾う
+                    this.push_preview_remote_async(pane_id, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// リモート由来プレビューの書き戻し状態（応答・ヘッダ共通の 1 実装）
+    fn preview_remote_state_json(&self, pane_id: PaneId) -> Option<serde_json::Value> {
+        let remote = self.preview_remote_origins.get(&pane_id)?;
+        let push = self.preview_remote_push.get(&pane_id);
+        let mut out = serde_json::json!({
+            "host": remote.host,
+            "path": remote.path,
+            "label": remote.label(),
+            "read_only": self.preview_remote_read_only.contains(&pane_id),
+            "state": push.map(|p| p.as_str()).unwrap_or("idle"),
+            "pending_write": tako_core::remote_fs::has_pending(&remote.host, &remote.path),
+        });
+        match push {
+            Some(RemotePush::Done { bytes, verified }) => {
+                out["bytes"] = serde_json::json!(bytes);
+                out["conflict_checked"] = serde_json::json!(verified);
+            }
+            Some(RemotePush::Failed { kind, message }) => {
+                out["kind"] = serde_json::json!(kind);
+                out["error"] = serde_json::json!(message);
+            }
+            _ => {}
+        }
+        Some(out)
+    }
+
     fn save_focused_preview(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.focused_pane();
-        let _ = self.save_preview_local(pane_id);
+        // ローカルの写しへ書くところまでは同期（速い・確実に残る）。
+        // リモートへの押し出しは背景（UI スレッドで待たない）
+        if self.save_preview_local(pane_id).is_ok() {
+            self.push_preview_remote_async(pane_id, cx);
+        }
         cx.notify();
     }
 
@@ -10070,7 +10286,7 @@ impl TakoApp {
                 .timer(std::time::Duration::from_millis(500))
                 .await;
             this.update(cx, |this, cx| {
-                this.run_autosave(pane_id);
+                this.run_autosave(pane_id, cx);
                 cx.notify();
             })
             .ok();
@@ -10078,7 +10294,7 @@ impl TakoApp {
         .detach();
     }
 
-    fn run_autosave(&mut self, pane_id: PaneId) {
+    fn run_autosave(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         if !self.autosave_pending.remove(&pane_id) {
             return;
         }
@@ -10095,6 +10311,10 @@ impl TakoApp {
                     edit.save_status = Some(preview::SaveStatus::Saved);
                     edit.message = None;
                 }
+                // #966: リモート由来なら背景で押し出す（ローカルの写しだけ新しい
+                // 状態を残さない）。リモートの編集セッションは自動保存を既定 OFF に
+                // してあるので、ここへ来るのはユーザーが明示的に入れたときだけ
+                self.push_preview_remote_async(pane_id, cx);
             }
             Err(msg) => {
                 if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
@@ -15602,6 +15822,43 @@ impl TakoApp {
                 (short, full)
             }),
         };
+        // #966: リモートへの書き戻しの状態チップ。cwd チップは 28 文字で切るので、
+        // 「ローカルへは書けたがリモートはまだ」を**別のチップ**として出す
+        // （ここを出さないと、切断中の保存がユーザーから見て「保存できた」になる）
+        let remote_save_chip: Option<(String, bool)> = self
+            .preview_remote_origins
+            .get(&pane_id)
+            .map(|remote| {
+                if self.preview_remote_read_only.contains(&pane_id) {
+                    return (
+                        crate::ui_text::remote_folder::preview_read_only().to_string(),
+                        false,
+                    );
+                }
+                match self.preview_remote_push.get(&pane_id) {
+                    Some(RemotePush::Uploading) => (
+                        crate::ui_text::remote_folder::preview_pushing().to_string(),
+                        false,
+                    ),
+                    Some(RemotePush::Done { .. }) => (
+                        crate::ui_text::remote_folder::preview_pushed(&remote.label()),
+                        false,
+                    ),
+                    Some(RemotePush::Failed { message, .. }) => (
+                        format!(
+                            "{} {message}",
+                            crate::ui_text::remote_folder::preview_push_pending()
+                        ),
+                        true,
+                    ),
+                    None if tako_core::remote_fs::has_pending(&remote.host, &remote.path) => (
+                        crate::ui_text::remote_folder::preview_push_pending().to_string(),
+                        true,
+                    ),
+                    None => (String::new(), false),
+                }
+            })
+            .filter(|(text, _)| !text.is_empty());
         // master: 子ワーカー一覧（spawned_by チェーン。全タブ走査）
         let workers: Vec<WorkerRow> = if is_master {
             self.collect_worker_rows(pane_id)
@@ -15974,6 +16231,47 @@ impl TakoApp {
                                         .text_color(hsla(theme.text_muted)),
                                 )
                                 .child(SharedString::from(truncate(&short, 28)))
+                        }))
+                    })
+                    // #966: リモートへの書き戻しの状態（読み取り専用 / 送信中 /
+                    // 送れていない）。**失敗は赤で、消さずに残す**
+                    .when(hv.cwd_chip, |d| {
+                        d.children(remote_save_chip.map(|(text, is_error)| {
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(rgba(theme.chip_surface))
+                                .border_1()
+                                .border_color(hsla(if is_error {
+                                    theme.red
+                                } else {
+                                    theme.border_subtle
+                                }))
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(if is_error {
+                                    theme.red
+                                } else {
+                                    theme.text_muted
+                                }))
+                                .child(
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::REMOTE)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .text_color(hsla(if is_error {
+                                            theme.red
+                                        } else {
+                                            theme.text_muted
+                                        })),
+                                )
+                                .child(SharedString::from(truncate(&text, 64)))
                         }))
                     })
                     // ターミナル情報（シェル名 · cols x rows）
@@ -17640,8 +17938,24 @@ impl UiStateHost for TakoApp {
         self.filetree.invalidate_remote(remote);
     }
 
-    fn set_preview_remote_origin(&mut self, pane: PaneId, remote: tako_core::remote_fs::RemoteRef) {
+    fn set_preview_remote_origin(
+        &mut self,
+        pane: PaneId,
+        remote: tako_core::remote_fs::RemoteRef,
+        read_only: bool,
+    ) {
         self.preview_remote_origins.insert(pane, remote);
+        if read_only {
+            self.preview_remote_read_only.insert(pane);
+        } else {
+            self.preview_remote_read_only.remove(&pane);
+        }
+        // 開き直し（= 競合を解消するための読み直し）で前回の押し出し結果を残さない
+        self.preview_remote_push.remove(&pane);
+    }
+
+    fn preview_remote_state(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.preview_remote_state_json(pane)
     }
 
     fn pinned_previews(&self) -> Vec<tako_control::PinnedView> {
@@ -18200,7 +18514,10 @@ impl PreviewHost for TakoApp {
     }
 
     fn save_preview(&mut self, pane: PaneId) -> Result<(), String> {
-        self.save_preview_local(pane)
+        self.save_preview_local(pane)?;
+        // #966: リモート由来なら**リモートへ書けるまでが保存**。
+        // ローカルの写しへ書けただけで Ok を返すと「保存できた気になる」に戻る
+        self.push_preview_remote_sync(pane, false)
     }
 
     fn preview_undo(&mut self, pane: PaneId) -> Result<bool, String> {
@@ -53020,9 +53337,11 @@ mod self_test {
                     ),
                 );
 
-                // (g) リモート由来のプレビューは編集できない（段階 1 = 読み取り専用）。
-                //     本体はローカルのキャッシュなので、止めないと
-                //     「保存できた気になる」（リモートには何も書かれない）。
+                // (g) リモート由来のプレビューは**編集できる**（#966 = 段階 2）。ただし
+                //     ①mode のどこにも `w` が無いと分かっているものは読み取り専用
+                //     ②保存は **SFTP の書き戻しまで**が保存（ローカルの写しへ書けた
+                //     だけで成功と言わない）。②が無いと段階 1 で禁じていた
+                //     「キャッシュを編集して保存できた気になる」へ戻る
                 //
                 //     **本物のプレビューペインで測る**: 適当なペインで試すと
                 //     「プレビューペインではない」で先に落ちて、読み取り専用の
@@ -53065,24 +53384,152 @@ mod self_test {
                         // まずローカルとして編集できることを確かめる（対照）
                         let local_ok = app.set_preview_editing_local(pane, true).is_ok();
                         let _ = app.set_preview_editing_local(pane, false);
-                        // 同じペインをリモート由来にすると編集できない
-                        app.preview_remote_origins.insert(
-                            pane,
-                            RemoteRef::new("selftest-host", "/srv/app/README.md"),
-                        );
+                        // #966: 書けるリモートファイルは編集できる（段階 2）
+                        let remote = RemoteRef::new("selftest-host", "/srv/app/README.md");
+                        app.set_preview_remote_origin(pane, remote.clone(), false);
+                        let writable_ok = app.set_preview_editing_local(pane, true).is_ok();
+                        // リモートは自動保存を既定 OFF（1 保存 = SFTP 3 バッチなので
+                        // 打鍵ごとに走らせない）
+                        let autosave_off =
+                            app.preview_edits.get(&pane).map(|e| e.autosave) == Some(false);
+                        let _ = app.set_preview_editing_local(pane, false);
+                        // 書けないと分かっているものは読み取り専用のまま
+                        app.set_preview_remote_origin(pane, remote, true);
                         let r = app.set_preview_editing_local(pane, true);
-                        let out = (local_ok, r.is_err(), r.err().unwrap_or_default());
+                        let out = (
+                            local_ok && writable_ok && autosave_off,
+                            r.is_err(),
+                            r.err().unwrap_or_default(),
+                        );
                         app.preview_remote_origins.remove(&pane);
+                        app.preview_remote_read_only.remove(&pane);
                         app.remove_pane_with(pane, CloseReason::Explicit(CloseOrigin::Internal), cx);
                         cx.notify();
                         out
                     })
                     .unwrap_or((false, false, String::new()));
-                let _ = std::fs::remove_file(&fixture);
                 check(
                     local_ok && blocked && msg == crate::ui_text::remote_folder::preview_read_only(),
                     &format!(
-                        "リモートのプレビューは読み取り専用（ローカルは編集できる）                          (#919。local_ok={local_ok} blocked={blocked} msg={msg:?})"
+                        "書けるリモートは編集でき書けないものは読み取り専用             (#966。editable={local_ok} blocked={blocked} msg={msg:?})"
+                    ),
+                );
+
+                // (g2) #966 の核心: **保存はリモートへ書けるまでが保存**。
+                //      到達できないホストを相手にすると `save_preview`（= dispatch の
+                //      `tako_preview_save` が通る経路）は失敗し、書きたかった内容が
+                //      退避される。押し出しを外すと「ローカルの写しへ書けただけ」で
+                //      成功してしまうので、ここが FAILED になる
+                let unreachable_host = "tako966-selftest.invalid";
+                let remote_path = "/srv/app/README.md";
+                tako_core::remote_fs::clear_pending(unreachable_host, remote_path);
+                let (save_failed, save_msg, pending_listed, pending_body_ok, push_failed) = window
+                    .update(cx, |app, _, cx| {
+                        let mut bases = vec![app.focused_pane()];
+                        bases.extend(app.terminals.keys().copied());
+                        let mut pane = None;
+                        for base in bases {
+                            let res = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::OpenFile {
+                                    pane: Some(base.as_u64()),
+                                    path: fixture.display().to_string(),
+                                    mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                                    direction: Some(tako_control::protocol::Direction::Right),
+                                    focus: Some(false),
+                                    new_tab: false,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            if let Ok(v) = res {
+                                app.drain_pending_highlights(cx);
+                                if let Some(id) = v["pane"].as_u64() {
+                                    pane = Some(PaneId::from_raw(id));
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(pane) = pane else {
+                            cx.notify();
+                            return (false, "プレビューを開けない".to_string(), false, false, false);
+                        };
+                        app.set_preview_remote_origin(
+                            pane,
+                            RemoteRef::new(unreachable_host, remote_path),
+                            false,
+                        );
+                        let _ = app.set_preview_editing_local(pane, true);
+                        let _ = app.apply_preview_text_local(pane, "edited by selftest\n".into());
+                        // dispatch と同じ経路（ControlHost::save_preview）
+                        let saved = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::PreviewSave {
+                                pane: Some(pane.as_u64()),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        let save_failed = saved.is_err();
+                        let save_msg = saved.err().map(|e| e.to_string()).unwrap_or_default();
+                        // 退避が CLI / MCP から見える（`pending`）
+                        let listed = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::RemoteFolder {
+                                action: "pending".into(),
+                                host: Some(unreachable_host.into()),
+                                path: None,
+                                tab: None,
+                                focus: None,
+                                all: false,
+                                force: false,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok();
+                        let pending_listed = listed
+                            .as_ref()
+                            .and_then(|v| v["pending"].as_array())
+                            .map(|a| a.iter().any(|e| e["path"] == remote_path))
+                            .unwrap_or(false);
+                        // **書きたかった内容**が残っている（無言で消えない）
+                        let pending_body_ok = tako_core::remote_fs::pending_body(
+                            unreachable_host,
+                            remote_path,
+                        )
+                        .map(|b| b == b"edited by selftest\n")
+                        .unwrap_or(false);
+                        // 再試行はやはり届かない = 退避は残る（成功を騙らない）
+                        let push_failed = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::RemoteFolder {
+                                action: "push".into(),
+                                host: Some(unreachable_host.into()),
+                                path: Some(remote_path.into()),
+                                tab: None,
+                                focus: None,
+                                all: false,
+                                force: false,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_err()
+                            && tako_core::remote_fs::has_pending(unreachable_host, remote_path);
+                        app.remove_pane_with(pane, CloseReason::Explicit(CloseOrigin::Internal), cx);
+                        cx.notify();
+                        (
+                            save_failed,
+                            save_msg,
+                            pending_listed,
+                            pending_body_ok,
+                            push_failed,
+                        )
+                    })
+                    .unwrap_or((false, String::new(), false, false, false));
+                tako_core::remote_fs::clear_pending(unreachable_host, remote_path);
+                let _ = std::fs::remove_file(&fixture);
+                check(
+                    save_failed && pending_listed && pending_body_ok && push_failed,
+                    &format!(
+                        "リモートの保存は書き戻しまで（失敗は退避して再試行できる）    (#966。failed={save_failed} listed={pending_listed} body={pending_body_ok} retry={push_failed} msg={save_msg:?})"
                     ),
                 );
 
