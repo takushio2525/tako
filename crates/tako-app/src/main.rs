@@ -9989,7 +9989,7 @@ impl TakoApp {
         &mut self,
         pane_id: PaneId,
         remote: &tako_core::remote_fs::RemoteRef,
-        bytes: Vec<u8>,
+        bytes: &[u8],
         result: Result<tako_core::remote_fs::SaveReport, tako_core::remote_fs::RemoteError>,
     ) -> Result<(), String> {
         match result {
@@ -10013,7 +10013,7 @@ impl TakoApp {
                 // **ここが「切断中の保存が無言で消えない」の実体**:
                 // 書きたかった内容をローカルへ退避し、`push` で再試行できる形にする
                 if let Err(io) =
-                    tako_core::remote_fs::record_pending(&remote.host, &remote.path, &bytes, &e)
+                    tako_core::remote_fs::record_pending(&remote.host, &remote.path, bytes, &e)
                 {
                     eprintln!("warning: 退避できない {}: {io}", remote.label());
                 }
@@ -10059,7 +10059,7 @@ impl TakoApp {
         self.preview_remote_push
             .insert(pane_id, RemotePush::Uploading);
         let result = tako_core::remote_fs::save_file(&remote.host, &remote.path, &bytes, force);
-        self.apply_remote_push_result(pane_id, &remote, bytes, result)
+        self.apply_remote_push_result(pane_id, &remote, &bytes, result)
     }
 
     /// リモートへ**背景で**押し出す（GUI の ⌘S / 保存ボタン / 自動保存）。
@@ -10085,19 +10085,19 @@ impl TakoApp {
         self.preview_remote_push
             .insert(pane_id, RemotePush::Uploading);
         let target = remote.clone();
-        let payload = bytes.clone();
+        // 押し出す内容は最大 8MiB。背景ジョブと結果反映で 2 重に持たないよう Arc で渡す
+        let payload = std::sync::Arc::new(bytes);
         cx.spawn(async move |this, cx| {
-            let job = {
-                let host = target.host.clone();
-                let path = target.path.clone();
-                let payload = payload.clone();
-                cx.background_spawn(async move {
-                    tako_core::remote_fs::save_file(&host, &path, &payload, false)
+            let host = target.host.clone();
+            let path = target.path.clone();
+            let body = payload.clone();
+            let result = cx
+                .background_spawn(async move {
+                    tako_core::remote_fs::save_file(&host, &path, &body, false)
                 })
-            };
-            let result = job.await;
+                .await;
             this.update(cx, |this, cx| {
-                let _ = this.apply_remote_push_result(pane_id, &target, payload, result);
+                let _ = this.apply_remote_push_result(pane_id, &target, &payload, result);
                 if this.remote_push_again.remove(&pane_id) {
                     // 進行中に入った保存を 1 回だけ拾う
                     this.push_preview_remote_async(pane_id, cx);

@@ -1636,7 +1636,7 @@ fn fetch_to_temp(host: &str, path: &str) -> Result<PathBuf, RemoteError> {
             format!("一時ディレクトリを作れない: {e}"),
         )
     })?;
-    let local = dir.join(format!("cur-{}", short_hash(&target)));
+    let local = dir.join(format!("cur-{}", temp_token()));
     let _ = std::fs::remove_file(&local);
     let out = sftp_batch(
         host,
@@ -1656,9 +1656,23 @@ fn fetch_to_temp(host: &str, path: &str) -> Result<PathBuf, RemoteError> {
 /// 書き戻す内容を置く一時ファイル
 fn write_temp(bytes: &[u8]) -> std::io::Result<PathBuf> {
     let dir = temp_dir_for_writes()?;
-    let local = dir.join(format!("put-{}", short_hash(&format!("{}", bytes.len()))));
+    let local = dir.join(format!("put-{}", temp_token()));
     std::fs::write(&local, bytes)?;
     Ok(local)
+}
+
+/// プロセス内で一意な一時ファイル名。
+///
+/// **内容やパスから作ってはいけない**: 2 枚のペインが同時に保存すると同じ名前へ
+/// 落ちて、片方の内容がもう片方のファイルへ書かれる（同じ大きさのファイルで踏む）
+fn temp_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn temp_dir_for_writes() -> std::io::Result<PathBuf> {
@@ -2386,5 +2400,15 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             "対象を直接 put している:\n{script}"
         );
         assert!(script.ends_with("bye\n"));
+    }
+
+    #[test]
+    fn 一時ファイル名はプロセス内で一意() {
+        // 内容やパスから作ると、同じ大きさの 2 ファイルを同時に保存したときに
+        // 片方の内容がもう片方へ書かれる
+        let a = temp_token();
+        let b = temp_token();
+        assert_ne!(a, b, "同じ名前が 2 回出た: {a}");
+        assert!(a.starts_with(&format!("{}-", std::process::id())), "{a}");
     }
 }
