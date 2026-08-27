@@ -310,7 +310,70 @@ clamshell 閉 + 画面 OFF なので `screencapture` は**全面黒しか撮れ�
 
 ## 16. 実測（受け入れの証拠）
 
-（このセクションは実測後に埋める）
+### 実 SSH での通し（隔離インスタンス + 実ホスト = Windows 11 / PowerShell）
+
+隔離起動（`TAKO_ISOLATED=1` + 明示の data / discovery / tmux socket。**persist ON** =
+器つきの既定構成）で、CLI から `tako send --pane 1 "ssh <host>"` を打っただけの状態から:
+
+| 測ったもの | 実測 |
+|---|---|
+| 検知（`auto` の `sessions` に出る） | **5 秒** |
+| ツリーへ出る（`list` にルートが載る） | **12 秒** |
+| 自動追加されたルート | `<host>:/C:/Users/<user>`（Windows のホーム。sftp の初期 cwd） |
+| 中身 | 91 件（`list` の `entries`） |
+| 切断の検知（`exit` から） | **約 8 秒**（`ssh` 送信から 20 秒） |
+| 切断後のルート | **残る**（`state: loaded` / 91 件 / `sessions[].state: disconnected`） |
+| `persist.log` | `ssh 自動追加: <host>:/C:/Users/<user> （91 件・追加=true）` / `ssh 切断を検知: <host>` |
+
+`detection` は `pending`（起動直後・走査前）→ `active`（走査後）と動く。
+
+### アイドル時のコスト（受け入れ条件 6）
+
+`ps` を PATH で中継して**採取回数そのもの**を数えた（`ps -axo pid=,ppid=,command=` =
+`ProcessSnapshot` の採取だけを数える）。ペインはプロンプト待ち（OSC 133 = `idle`）:
+
+| 窓 | ProcessSnapshot の採取 |
+|---|---|
+| 自動追加 **ON** 120 秒 | **6 回** |
+| 自動追加 **OFF** 120 秒 | **6 回** |
+
+**同数** = 検知由来の増加はゼロ（6 回は sleep_guard #779 と stale binary #772 の
+60 秒保険で、位相がずれて交互に出る既存分）。フレーム要求も増えない
+（`apply_ssh_scan` は `cx.notify()` を呼ばず、通知するのは実際に追加・切断した瞬間だけ）。
+
+### 見た目（実ピクセル。`TAKO_VISUAL_ONLY=remote-tree`）
+
+```
+TAKO_VISUAL_PIXEL: remote-badge order_ok=true local_y=254.0 remote_y=281.5
+  badge_live=547 badge_lost_red=619 badge_live_after_lost=60 rows_after_lost=6
+```
+
+- `order_ok=true` / `local_y=254.0` → `remote_y=281.5`: リモートルートが
+  **ローカルルートの 1 行下**に並ぶ（#919 は先頭へ hoist していた）
+- `badge_live=547`: ルート行に mauve のバッジが実際に描かれている
+- `badge_lost_red=619` / `badge_live_after_lost=60`: 切断でバッジが赤へ変わる
+- `rows_after_lost=6`: 行数は変わらない（**消さない**）
+
+切り出した画像は `TAKO_VISUAL_DUMP` で保存できる（ユーザー名が写るので**リポジトリ外**へ）。
+実際の絵は「ローカルの見出し（フォルダ名 + フォルダアイコン）の下に、同じ形の
+リモート見出し + 行末に `SSH <host>` バッジ」で、子の行はローカルと同じアイコン。
+
+### セルフテスト（項目 130）
+
+```
+TAKO_SELF_TEST_976: legacy=false targets(off/on)=0/6 jobs=1 live=true after_local=true
+  root_name="home" dup_jobs=0 rows_kept=true disconnected=true auto(on/off)=true/false sessions=true
+```
+
+`TAKO_APP_SELF_TEST_OK`（全項目完走）。skip 3 件は「ウィンドウが隠れて未描画」の既知。
+
+### 検出力（同一バイナリの A/B）
+
+| 壊した箇所 | 落ちる検査 | 出た値 |
+|---|---|---|
+| `TAKO_976_LEGACY=1`（検知しない） | 項目 130 (a) | `off=0 on=0` |
+| `TAKO_976_LEGACY=1`（`host: ` 付きの旧ルート名。項目 124 を A/B 対応にする前） | 項目 124 (b) | `root_like_local=false` |
+| ローカルルートを実在させないまま並びを測る（visual-test の場面不備） | `remote-badge` | `order_ok=false local_y=-1.0` |
 
 ## 17. 未検証・既知の限界
 

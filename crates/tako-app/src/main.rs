@@ -28016,10 +28016,27 @@ mod self_test {
         let root = RemoteRef::new("visualhost", "/srv/app");
         let bad = RemoteRef::new("visualhost", "/srv/app/denied");
 
-        // 素のツリー（リモート無し）を基準に撮る
+        // 素のツリー（リモート無し）を基準に撮る。
+        // #976 の「ローカルの後ろに並ぶ」を測るので、**ローカルルートも実在させる**
+        // （`sync_filetree_roots` がペインの cwd から作る = 本番と同じ経路）
         let _ = window.update(cx, |app, _, cx| {
             app.filetree.visible = true;
             app.remote_notice = None;
+            app.sync_filetree_roots();
+            // ローカルルートは畳んでおく: 中身が何十行も出るとリモートルートが
+            // 画面外へ押し出され、**バッジが 1 ピクセルも描かれない**（実測）。
+            // 畳めば「ローカルの見出しの下にリモートの見出しが並ぶ」絵がそのまま撮れる
+            let local: Vec<std::path::PathBuf> = app.filetree.roots().to_vec();
+            for path in local {
+                let expanded = app
+                    .filetree
+                    .rows()
+                    .iter()
+                    .any(|row| row.root && row.remote.is_none() && row.entry.path == path && row.expanded);
+                if expanded {
+                    app.filetree.toggle_dir(&path);
+                }
+            }
             cx.notify();
         });
         wait(cx, 300).await;
@@ -28027,9 +28044,15 @@ mod self_test {
             fail("visual-test remote-tree: 基準フレーム採取")
         };
 
-        // リモートルート + 中身 + 失敗の行 + 通知帯を出す
+        // リモートルート + 中身 + 失敗の行 + 通知帯を出す。
+        // ルートは**タブへ**足して `sync_filetree_roots` で反映する（本番と同じ経路。
+        // `filetree` へ直に足すと次の tick の同期で消える = 撮る前に消えることがある）
         let _ = window.update(cx, |app, _, cx| {
-            app.filetree.add_remote_root(root.clone());
+            let tab = app.workspace.active_tab_id();
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.add_remote_folder(root.clone());
+            }
+            app.sync_filetree_roots();
             app.filetree.apply_remote_dir(
                 root.clone(),
                 Ok(vec![
@@ -28294,6 +28317,10 @@ mod self_test {
 
         // 後片付け（以降の節へ持ち越さない）
         let _ = window.update(cx, |app, _, cx| {
+            let tab = app.workspace.active_tab_id();
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.remove_remote_folder(&root);
+            }
             app.filetree.remove_remote_root(&root);
             app.ssh_links.clear();
             app.remote_notice = None;

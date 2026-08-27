@@ -28,6 +28,40 @@ Nightly patch release (automated). Changes since v0.7.7:
 
 ## [Unreleased]
 
+### Added
+
+- [機能追加] ペインで `ssh <host>` に入るだけで、そのホストのフォルダがファイルツリーへ
+  並ぶようにした (#976)。明示的な「リモートからフォルダを開く」操作は要らない（初期パスは
+  sftp の初期 cwd = リモートのホーム）。ルートは**ローカルフォルダと同じ形**（フォルダ名 +
+  フォルダアイコン）で**ローカルの後ろに**並び、SSH であることと相手は行末のバッジ
+  （`SSH <host>`）が示す。**切断してもフォルダは消さず**バッジが「切断」へ変わる
+  （右クリックの「再読み込み」で復帰）。宛先を取り違える形（`-p` / `-J` /
+  `-o Hostname=` / `ssh host <コマンド>` / `-N` 等）は**見送って理由を残し**、鍵・agent で
+  入れない相手はパスワードを聞かずに見送る。**アイドル時のコストはゼロ**: 走査の材料は
+  OSC 133 のコマンド状態とペインの子 pid で、指紋が動いたときと 60 秒の保険
+  （生きた ssh を抱えている間だけ）でのみプロセス表を採り、採取は #772 / #779 の
+  `ProcessSnapshot` へ相乗りする（実測: 自動追加 ON / OFF どちらもアイドル 120 秒で
+  採取 6 回 = **同数**）。実測では `ssh <host>` から検知 5 秒・ツリー表示 12 秒。
+  切替は 設定画面 → リモート / `tako remote-folder auto [on|off]` / MCP
+  `tako_remote_folder` の `action: "auto"`（既定 ON）。Windows はプロセスのコマンド行を
+  採れないので自動検知は働かない（明示経路はそのまま使える）
+- [Added] Entering `ssh <host>` in a pane now makes that host's folder appear in the file
+  tree (#976) — no explicit "Open Remote Folder" step, and the initial path is the remote
+  home (sftp's initial cwd). The root looks exactly like a local workspace folder (name +
+  folder icon) and sits after the local ones; a badge at the end of the row (`SSH <host>`)
+  says it is remote and which machine it is. **Disconnecting never removes the folder** —
+  the badge turns red and reads "offline", and the right-click "Reload" brings it back.
+  Command lines where tako cannot guarantee it would reach the same machine (`-p`, `-J`,
+  `-o Hostname=`, `ssh host <command>`, `-N`, …) are skipped with a recorded reason, and
+  hosts that need a password are skipped instead of prompting. Idle cost is zero: the scan
+  is gated on OSC 133 command state plus the pane's child pid, runs only on fingerprint
+  changes and a 60 s safety net (only while a live ssh is tracked), and shares the
+  `ProcessSnapshot` introduced by #772 / #779 (measured: 6 captures per idle 120 s with the
+  feature both on and off). Measured latency: detected 5 s after `ssh <host>`, folder shown
+  at 12 s. Toggle it in Settings → Remote, `tako remote-folder auto [on|off]`, or MCP
+  `tako_remote_folder` with `action: "auto"` (on by default). Windows cannot read process
+  command lines, so auto-detection does not run there (the explicit path still works)
+
 ### Fixed
 
 - [修正] codex を master / solo / worker に使うとき、承認とサンドボックスを丸ごと外す
