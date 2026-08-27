@@ -13,6 +13,8 @@
 //!   claude agents プロキシ・会話ログ正規化）
 //! - tailscale: Tailscale Serve transport（Issue #282。CLI 検出・setup 判定・serve 管理）
 //! - claude_tui: Claude Code TUI の画面状態検出とプロンプト送達確認（Issue #32）
+//! - claude_session: claude のセッション台帳（`<config dir>/sessions/<pid>.json`）の
+//!   直読み。`claude agents --json` の Node 起動を起こさずに済ませる前段ガードの材料（Issue #1011）
 //! - peer_messaging / delivery: claude の Cross-Session Messaging による指示送達と
 //!   経路選択（peer 優先 + 従来のキー操作経路へフォールバック。Issue #790）
 //! - config_io: 設定ファイルの安全な読み書き共通部品（アトミック書き込み・
@@ -29,6 +31,7 @@ pub mod agent_mcp;
 pub mod agent_support;
 pub mod agents;
 pub mod agents_sync;
+pub mod claude_session;
 pub mod claude_tui;
 pub mod codex_session;
 pub mod config_io;

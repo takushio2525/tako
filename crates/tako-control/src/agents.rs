@@ -9,14 +9,26 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::orchestrator::AgentScanFreshness;
+
 /// プロセス祖先辿りの最大段数（暴走防止。シェル → claude は通常 1〜3 段）
 const MAX_ANCESTOR_HOPS: usize = 20;
 
 /// `claude agents --json` を実行してエージェント一覧を正規化して返す。
 /// 各要素: `{ session_id, status, ctx_percent, model, name, kind, cwd, pid, started_at }`
 /// （元 JSON に無いフィールドは null）
+///
+/// 鮮度は [`AgentScanFreshness::Monitoring`]（5 秒）。**master の worker 監視から
+/// 呼ばれる経路**（`resolve_session_id_for_backend` → `worker_status`）が
+/// この既定を使うため。画面表示・一覧は [`list_agents_with_freshness`] へ
+/// [`AgentScanFreshness::Ui`] を渡して 30 秒古い結果に相乗りする（Issue #1011）
 pub fn list_agents() -> Result<Vec<Value>, String> {
-    let stdout = crate::orchestrator::run_claude_agents_json()
+    list_agents_with_freshness(AgentScanFreshness::Monitoring)
+}
+
+/// [`list_agents`] の鮮度を明示する版（Issue #1011）
+pub fn list_agents_with_freshness(freshness: AgentScanFreshness) -> Result<Vec<Value>, String> {
+    let stdout = crate::orchestrator::run_claude_agents_json(freshness)
         .ok_or("claude agents --json の実行に失敗（claude CLI が見つからないか異常終了）")?;
     let text = String::from_utf8(stdout).map_err(|e| format!("出力が UTF-8 でない: {e}"))?;
     let parsed: Value =
@@ -425,6 +437,8 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
         return None;
     }
 
+    // #1011: `worker_status` の `agents-auto` 経路から呼ばれる = worker 監視なので
+    // 既定（Monitoring / 5 秒）のまま
     let agents = list_agents().ok()?;
     if agents.is_empty() {
         return None;
@@ -487,7 +501,7 @@ pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
     use std::sync::Mutex;
     // 最後に live 解決できた backend → セッションの記憶（#466）。
     // `claude agents --json` は一時失敗・実行中エージェントの列挙漏れが現実に起きる
-    // （run_claude_agents_json は TTL 5 秒で失敗もキャッシュする）。素通しで空を返すと
+    // （run_claude_agents_json は鮮度窓のあいだ失敗もキャッシュする）。素通しで空を返すと
     // 呼び出し側（remote の v2 panes）が sessions カタログの stale な旧世代セッションへ
     // フォールバックし、リモートのチャットビューが凍結した古い transcript を
     // 読み続ける。失敗・欠落時は直近の成功結果で補い、ペインごと消えた backend
@@ -498,7 +512,10 @@ pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
     if panes.is_empty() {
         return HashMap::new();
     }
-    let fresh = match list_agents() {
+    // #1011: ここは**画面表示**（チャットヘッダの model / ctx% / status、リモートの
+    // ペイン一覧の agent 種別 / session_id）の材料なので 30 秒古くてよい。
+    // Monitoring（5 秒）で引くと UI 側が master のペースで Node を起こしてしまう
+    let fresh = match list_agents_with_freshness(AgentScanFreshness::Ui) {
         Ok(agents) if !agents.is_empty() => {
             let parents = process_parent_map();
             Some(live_sessions_inner(&panes, &agents, &parents))
@@ -674,7 +691,9 @@ fn is_descendant_of(
 /// エージェント一覧に tmux ペイン対応を付与した完全版を返す（remote / dispatch / CLI 共用）。
 /// `socket` 省略時は tako バックエンドソケットを使う
 pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {
-    let mut agents = list_agents()?;
+    // 表示用の一覧（`tako remote agents` / dispatch RemoteAgents / remote デーモン）なので
+    // 30 秒古くてよい（#1011）
+    let mut agents = list_agents_with_freshness(AgentScanFreshness::Ui)?;
     let panes = match socket {
         // 明示ソケット指定（remote デーモンの tmux 直参照）は従来どおり tmux CLI
         Some(s) => tmux_pane_pids(Some(s)),
@@ -701,7 +720,8 @@ pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {
 /// プロセス表・器のペイン列挙・`claude agents --json` は**各 1 回だけ**実行する
 /// （2 秒ポーリング経路なので、ペイン数ぶん起こすと #168 / #212 の再来になる）
 pub fn list_agents_for_scan(pane_pids: &[(u64, u32)]) -> Result<Value, String> {
-    let mut agents = list_agents()?;
+    // 30 秒周期の定期スキャン（`CLAUDE_SESSION_SCAN_INTERVAL`）なので鮮度要求も 30 秒（#1011）
+    let mut agents = list_agents_with_freshness(AgentScanFreshness::Ui)?;
     let backend_panes = backend_pane_pids();
     if !backend_panes.is_empty() || !pane_pids.is_empty() {
         let parents = process_parent_map();
