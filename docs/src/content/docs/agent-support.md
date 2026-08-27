@@ -21,8 +21,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
 | Claude Code（基準） | 40 / 40 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 22 / 40 | 7 | 10 | 1 |
-| Antigravity CLI | 9 / 40 | 6 | 20 | 5 |
+| OpenAI Codex CLI | 24 / 40 | 5 | 10 | 1 |
+| Antigravity CLI | 9 / 40 | 6 | 18 | 7 |
 | Local LLM | 0 / 40 | 0 | 35 | 5 |
 
 ### 状態の意味
@@ -123,10 +123,10 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 | 能力 | Claude Code | OpenAI Codex CLI | Antigravity CLI | Local LLM | 根拠 |
 | --- | --- | --- | --- | --- | --- |
-| **利用上限で止まったことを検知する**<br />`worker_limit_detect` | 対応 | 対応 | 未対応 [#985](https://github.com/takushio2525/tako/issues/985)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | コード本文: claude_tui.rs の usage limit 分類は claude の「What do you want to do?」と codex の「Approaching rate limits」を実採取して持つ。agy の記述は無い （#357 が調べたのはメトリクス表示で、停止ダイアログの有無は別問題） |
-| **利用上限の解除後に自分で再開する（#813）**<br />`worker_limit_autoresume` | 対応 | 一部対応<br />上限で止まったことは検知できるが、ダイアログ型のため自動復帰まで到達していない（#985） | 未対応 [#985](https://github.com/takushio2525/tako/issues/985)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | コード本文: limit_stop.rs は claude の idle 型と codex のダイアログ型を分類するが、自動復帰まで到達するのは claude 経路だけ。agy のパターンは 1 件も無い |
-| **利用制限の残量（%）を取り出す（#357）**<br />`worker_limit_metrics` | 対応 | 一部対応<br />抽出パターンはあるが、実データが出るのは有料プランのみで未実測（#357 の残課題） | 対象外<br />agy は利用制限の残量を表示・出力しないため取得できない（#357 で実地確認） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | 実測: #357: codex の primary / secondary NN% はスクレイピング実装済みだが有料プラン 限定で未実測、agy は v1.1.4 の実地調査で取得不能と確定（再確認は #985）。**#984 の副産物**: codex の rollout JSONL の token_count イベントに rate_limits.primary.used_percent / window_minutes / resets_at が構造化されて 入っている（実測）ので、画面スクレイピングに頼らず取れる。配線は #985 |
-| **ステータスバーの利用制限表示をこの系統へ切り替えられる（#217 / #357）**<br />`limit_service_switch` | 対応 | 一部対応<br />抽出パターンはあるが、実データが出るのは有料プランのみで未実測（#357 の残課題） | 対象外<br />agy は利用制限の残量を表示・出力しないため取得できない（#357 で実地確認） | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #357 の完了報告: codex は TUI の primary / secondary NN% を抽出できるが実データは 有料プラン限定で未実測、agy は取得不能を実地確認して unsupported を明示表示にした |
+| **利用上限で止まったことを検知する**<br />`worker_limit_detect` | 対応 | 対応 | 対象外<br />agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | 実測: #985 実測（2026-08-27）: codex 0.150.1 の停止文言 `You've hit your usage limit.` と 接近ダイアログ `Approaching rate limits` をバイナリ内文字列で確認し、`limit_stop.rs` の実採取 fixture が両方を検知することをテストで固定した。agy 1.1.22 は**窓つきの利用上限を持たない**（`agy --help` に usage / quota 系の サブコマンドが無く、バイナリの `RateLimit` は全部 PR レビュー設定と Go / sentry の内部名。残量は `/credits` = 前払いクレジット）ので、検知すべき「上限で止まった状態」自体が存在しない |
+| **利用上限の解除後に自分で再開する（#813）**<br />`worker_limit_autoresume` | 対応 | 一部対応<br />5h / 週の枠は解除を待って自分で再開するが、ワークスペースのクレジットが尽きた場合は「待つ」出口が無い（増枠申請・購入・獲得済みリセットの引き換えしか無いので、tako は何も選ばずに止まる） | 対象外<br />agy はクレジットを使い切っても「解除を待つ」出口が無い（買い足す導線しか無い）ので、待って再開するという動作が成立しない（#985） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | 実測: #985 実測（2026-08-27 / codex-cli 0.150.1）: codex の解除時刻は 2 つの経路で 取れる。① 画面の `Try again at Aug 28th, 2026 4:24 AM.`（バイナリ内書式 `" Try again at "` + `", %Y %-I:%M %p"`。日付を挟む形は #985 前は読めず、不明の猶予 900 秒で早撃ちして 3 回で諦めていた）② rollout の `rate_limits.<枠>.resets_at`（epoch 秒。書式にもタイムゾーンにも依存しない）。セルフテスト項目 111 の codex 節が解除前は撃たず解除後に再開するところまで見る （`TAKO_985_LEGACY=1` へ戻すと reset_at=None で FAILED になることを実測）。agy 1.1.22 は `/credits` に「待つ」出口が無く（Get More AI Credits / See Activity）、待って再開する動作そのものが成立しない |
+| **利用制限の残量（%）を取り出す（#357）**<br />`worker_limit_metrics` | 対応 | 対応 | 対象外<br />agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | 実測: #985 実測（2026-08-27 / codex-cli 0.150.1 / plan_type = plus = **有料プラン**）: rollout の `token_count` に `rate_limits.primary`（`window_minutes: 300` = 5h）と `.secondary`（`10080` = 週）が数値で載る。**#357 の画面スクレイピングは 0.150.1 では成立しない**（実測: TUI のフッターはモデル名と cwd だけで、`5h limit: [██…] 90% left (resets 23:23)` は `/status` のモーダルの中にしか 出ない = 常時見えるところに `primary NN%` は無い）ので、構造化ソースが正になった。両者の解除時刻が一致することも確認（rollout の 1787840583 = 画面の 23:23）。agy 1.1.22 は前払いクレジットで枠が無い（`/credits` を実行して確認） |
+| **ステータスバーの利用制限表示をこの系統へ切り替えられる（#217 / #357）**<br />`limit_service_switch` | 対応 | 対応 | 対象外<br />agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査） | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を 読む形になり、有料プランの実データが出る。agy は取得不能を再確認して unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持） |
 
 ## その他
 

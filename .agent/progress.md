@@ -3534,3 +3534,36 @@
   = **#357 が未実測に残した codex の limit メトリクス**。#985 へコメントで申し送り
 - 事故: `tako orchestrator projects add` は**ローカル処理**なので CLI 側にも `TAKO_DATA_DIR` が
   必要。付け忘れて本番 projects.yaml へ probe を書いた（即除去・diff で 2 行のみを確認）
+
+## 2026-08-27（#985: codex / agy の limit を実測で確定し、codex の自動復帰を成立させる）
+- **前提が 2 つ外れていた**。①レポートの「codex のダイアログ型 limit は `limit_stop.rs:53` の
+  `LimitDialog` 落ちで自動復帰へ繋がらない」は**実採取画面では起きない**（`detect_choice_dialog`
+  が先に `UsageLimit` へ分類するので Dialog 型として検知され、応答まで通る）。
+  ②**本当の穴は日付つきの解除時刻**: codex 0.150.1 は日をまたぐと
+  `Try again at Aug 28th, 2026 4:24 AM.` と出す（バイナリ内書式 `" Try again at "` +
+  `", %Y %-I:%M %p"`）のに `parse_time_of_day` がアンカー直後の数字しか読まず `reset_at=None` →
+  **不明の猶予 900 秒で上限が解けるずっと前に撃ち始め、3 回で諦めていた**（= 朝まで止まったまま）
+- 直したのは 3 層: ①`parse_reset_at` が日付を挟んだ時刻を読む（走査は 40 バイトまで・
+  `:` か am/pm を必須にして `28th` の 28 や `2026` を時刻と読み違えない）②`codex_session` が
+  `token_count.rate_limits` を型へ落とす（`primary` = 5h / `secondary` = 週 / `resets_at` は
+  epoch。**上限に当たっている枠が無ければ解除時刻を返さない** = 上限でもないのに待たない）
+  ③`limit_stop::detect_limit_stop_with` が構造化ソースの epoch を文言パースより優先する。
+  **手がかりだけでは停止と判定しない**（上限の根拠は画面のまま = #813 の安全条件を 1 か所で守る）
+- **#357 の宿題への回答は「スクレイピングは成立しない」**（実測）: codex 0.150.1 の TUI
+  フッターはモデル名と cwd だけで `primary NN%` が無く、`5h limit: [██…] 90% left (resets 23:23)`
+  は `/status` のモーダルの中にしかない。構造化ソースを正にしてステータスバーへ配線した
+  （読むのは background の 60 秒に 1 回・#772 / #779 の `ProcessSnapshot` へ相乗りなので
+  プロセス起動は増えない）。rollout の `resets_at` と画面の `resets 23:23` が一致することも確認
+- **agy 1.1.22 を再調査して「窓つきの利用上限を持たない」と確定**（#357 の v1.1.4 調査の更新）:
+  `/credits` は在るが中身は**前払いの AI クレジット残高**（実行結果 = `AI Credits not enabled`）で
+  枠もリセット時刻も無く、出口は購入導線だけ。バイナリの `RateLimit` は全部 PR レビュー設定と
+  Go / sentry の内部名、`Quota available/exhausted` は subagent の話。マトリクスは
+  metrics / detect / autoresume / limit_service_switch の 4 セットを **Unsupported + 理由**へ
+- 受け入れ条件 4（課金・資源消費を選ばない）は codex の実文言で固定: 拒否リストへ
+  `use reset` / `request increase` / `limit increase` / `notify owner` / `add more` を追加し、
+  実採取の `/usage` ダイアログ（`Redeem usage limit reset`）で `safe_choice = None` を固定
+- 検証: fmt / clippy(-D warnings) / `test --workspace` **2765 passed 0 failed** /
+  クロスチェック エラー 0・警告 12（**全件が未変更ファイル由来**）/ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 111 へ codex の正例 + メトリクス通しを新設）/ docs 再生成 + `--check`。
+  **検出力は `TAKO_985_LEGACY=1` の A/B で 2 通り実証**（unit が 1 本 FAILED / セルフテストが
+  `reset_at=None` で FAILED・exit 1）

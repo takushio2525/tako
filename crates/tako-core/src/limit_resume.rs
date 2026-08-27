@@ -247,7 +247,13 @@ pub const SAFE_CHOICE_ALLOW: [&str; 2] = ["wait for limit to reset", "keep curre
 /// 他の選択肢は課金プラン変更・従量課金・モデル切替を伴うので、
 /// 自動操作で確定させてはいけない（実採取: 「Upgrade to Max 20x for higher session
 /// limits every month」「Continue with usage credits」「Switch to gpt-…」）
-pub const SAFE_CHOICE_DENY: [&str; 12] = [
+///
+/// **codex 0.150.1 のバイナリ内文字列で確認した追加分（#985）**。codex の上限まわりは
+/// 「待つ」以外の出口しか持たないので、取り違えると人のお金・限りある資源を使う:
+/// - 「Request a limit increase from your owner …」= 管理者へ増枠を申請する
+/// - 「Your workspace is out of credits. Ask your workspace owner to add more. Notify owner?」
+/// - 「Use this reset? / Yes, use reset」= **獲得済みリセットの引き換え**（在庫が減る）
+pub const SAFE_CHOICE_DENY: [&str; 17] = [
     "upgrade",
     "credit",
     "billing",
@@ -260,6 +266,12 @@ pub const SAFE_CHOICE_DENY: [&str; 12] = [
     "extra usage",
     "pay ",
     "$",
+    // --- #985: codex ---
+    "use reset",
+    "request increase",
+    "limit increase",
+    "notify owner",
+    "add more",
 ];
 
 /// ラベルが自動確定してよいものか（許可リストに当たり、拒否リストに当たらない）
@@ -320,7 +332,7 @@ pub fn parse_reset_at(text: &str, reference: i64, tz_offset: i32) -> Option<i64>
     let lower = text.to_lowercase();
     let tod = RESET_ANCHORS.iter().find_map(|anchor| {
         let pos = lower.find(anchor)?;
-        parse_time_of_day(&lower[pos + anchor.len()..])
+        find_time_of_day(&lower[pos + anchor.len()..])
     })?;
     let local_ref = reference + i64::from(tz_offset);
     let day_start = local_ref - local_ref.rem_euclid(86_400);
@@ -333,6 +345,67 @@ pub fn parse_reset_at(text: &str, reference: i64, tz_offset: i32) -> Option<i64>
         return None;
     }
     Some(target - i64::from(tz_offset))
+}
+
+/// アンカー直後から時刻表記を探す（**日付が挟まっていても読む**。#985）。
+///
+/// codex 0.150.1 は 2 つの形を出す（バイナリ内の書式文字列で確認）:
+/// - 同じ日: `try again at 4:24 AM.`（アンカーの直後が時刻 = 従来の形）
+/// - 日をまたぐ: `Try again at Aug 28th, 2026 4:24 AM.`（**日付が挟まる**）
+///
+/// 直後に読めなければ**短い範囲だけ**前へ進んで探す。進んだ先では
+/// 「`:` か am/pm を伴う」ことを必須にする — そうしないと `28th` の 28 や
+/// `2026` の一部を時刻と読んでしまう（`Aug 28th, 2026` で実際に踏む形）
+fn find_time_of_day(rest: &str) -> Option<i64> {
+    // アンカー直後の解釈は従来どおり（**ここだけは裸の時（`resets 3`）も許す**）
+    if let Some(t) = parse_time_of_day(rest) {
+        return Some(t);
+    }
+    if legacy_reset_parse() {
+        return None;
+    }
+    let mut prev_digit = false;
+    for (i, ch) in rest.char_indices() {
+        if i >= RESET_SCAN_BYTES {
+            break;
+        }
+        let digit = ch.is_ascii_digit();
+        // 数字の途中からは読まない（`2026` の `026` を時刻にしない）
+        if digit && !prev_digit {
+            let seg = &rest[i..];
+            if is_explicit_time(seg) {
+                if let Some(t) = parse_time_of_day(seg) {
+                    return Some(t);
+                }
+            }
+        }
+        prev_digit = digit;
+    }
+    None
+}
+
+/// 「時刻だと言い切れる形」か = 1〜2 桁の数字のあとに `:` が続く（`4:24`）か、
+/// am/pm が続く（`3am` / `3 pm`）。日付の一部（`28th` / `2026`）を弾くための必須条件
+fn is_explicit_time(seg: &str) -> bool {
+    let digits = seg.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || digits > 2 {
+        return false; // `2026` のような 3 桁以上は時刻ではない
+    }
+    let tail = &seg[digits..];
+    tail.starts_with(':') || {
+        let t = tail.trim_start();
+        t.starts_with("am") || t.starts_with("pm")
+    }
+}
+
+/// アンカーから時刻表記を探す範囲（バイト）。`Aug 28th, 2026 ` を跨げる長さで、
+/// 関係ない数字まで届かない程度に短く取る
+const RESET_SCAN_BYTES: usize = 40;
+
+/// `TAKO_985_LEGACY=1` で #985 前の解釈（アンカー直後だけ）へ戻す（A/B 用）
+fn legacy_reset_parse() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_985_LEGACY").is_some())
 }
 
 /// 「3am」「3:00 am」「15:00」「4:24 AM」を 0:00 からの秒数に変換する。
@@ -787,5 +860,120 @@ mod tests {
     fn ナッジ文面は自動通知と分かる形で日英ある() {
         assert!(nudge_prompt_in(Lang::Ja).starts_with("【tako 自動通知】"));
         assert!(nudge_prompt_in(Lang::En).starts_with("[tako auto-notice]"));
+    }
+
+    // --- #985: codex の実文言に対する回帰 ---
+
+    /// codex 0.150.1 のバイナリ内書式（`" Try again at "` + `", %Y %-I:%M %p"`）が作る
+    /// **日付つき**の形。#985 前はここが読めず「不明」に落ち、900 秒の猶予で
+    /// 早すぎる再開を 3 回撃って諦めていた（= 上限が解けても朝まで止まったまま）
+    #[test]
+    fn issue985_codexの日付つきリセット時刻を読む() {
+        let reference = REF_MIDNIGHT_JST + 30 * 60; // 00:30 JST に観測
+        for text in [
+            "■ You've hit your usage limit. ... try again at Aug 28th, 2026 4:24 AM.",
+            "You've hit your usage limit. Try again at Aug 28, 2026 4:24 AM.",
+            "Try again at Sep 3rd, 2026 4:24 AM or try again later.",
+        ] {
+            assert_eq!(
+                parse_reset_at(text, reference, JST),
+                Some(REF_MIDNIGHT_JST + 4 * 3600 + 24 * 60),
+                "日付を挟んだ時刻が読めない: {text}"
+            );
+        }
+    }
+
+    /// 従来の形（アンカー直後が時刻）は**1 ビットも変えない**
+    #[test]
+    fn issue985_従来のリセット時刻表記に回帰しない() {
+        let reference = REF_MIDNIGHT_JST + 30 * 60;
+        let cases = [
+            (
+                "Claude usage limit reached. Your limit will reset at 3am.",
+                3 * 3600,
+            ),
+            ("5-hour limit reached ∙ resets 3am", 3 * 3600),
+            (
+                "You've hit your usage limit. Please try again at 4:24 AM.",
+                4 * 3600 + 24 * 60,
+            ),
+            ("Your limit will reset at 15:30 (JST)", 15 * 3600 + 30 * 60),
+        ];
+        for (text, tod) in cases {
+            assert_eq!(
+                parse_reset_at(text, reference, JST),
+                Some(REF_MIDNIGHT_JST + tod),
+                "{text}"
+            );
+        }
+    }
+
+    /// 日付の数字を時刻と読み違えない（`28th` の 28 / `2026` の一部）
+    #[test]
+    fn issue985_日付の数字を時刻と読み違えない() {
+        let reference = REF_MIDNIGHT_JST + 30 * 60;
+        // 時刻が無ければ「不明」に落ちる（誤った時刻を作らない）
+        assert_eq!(
+            parse_reset_at("Try again at Aug 28th, 2026.", reference, JST),
+            None,
+            "日付だけの行から時刻を捏造してはいけない"
+        );
+        assert_eq!(
+            parse_reset_at("Try again at some point next week.", reference, JST),
+            None
+        );
+        // 遠くにある無関係な数字は拾わない（走査範囲を超える）
+        let far = format!("Try again at {} 4:24 AM.", "x".repeat(60));
+        assert_eq!(parse_reset_at(&far, reference, JST), None);
+    }
+
+    /// #985 受け入れ条件 4: 課金・モデル変更・**限りある資源の引き換え**を選ばない。
+    /// ラベルは codex 0.150.1 のバイナリ内文字列と claude の実採取から採った
+    #[test]
+    fn issue985_課金や資源消費の選択肢は決して選ばない() {
+        let unsafe_labels = [
+            // claude（実採取）
+            "Upgrade to Max 20x for higher session limits every month",
+            "Continue with usage credits",
+            // codex（バイナリ内文字列）
+            "Switch to gpt-5.4-mini",
+            "Upgrade to Plus to continue using Codex",
+            "Visit https://chatgpt.com/codex/settings/usage to purchase more credits",
+            "Request a limit increase from your owner to continue using codex",
+            "Yes, use reset",
+            "Get More AI Credits",
+            "Ask your workspace owner to add more",
+        ];
+        for label in unsafe_labels {
+            assert!(
+                !is_safe_choice_label(label),
+                "自動確定してはいけないラベルが許可された: {label}"
+            );
+            // 単独で並んでいても選ばれない（= 何もしないほうへ落ちる）
+            assert_eq!(
+                safe_choice(&[(Some(1), label.to_string())]),
+                None,
+                "{label}"
+            );
+        }
+    }
+
+    /// codex の「Use this reset?」ダイアログでは**何も選ばない**（在庫のあるリセットを
+    /// 勝手に引き換えない）。「No, go back」は安全に見えるが、選ぶ理由が無いので選ばない
+    #[test]
+    fn issue985_codexのリセット引き換えダイアログでは何も選ばない() {
+        let opts = opts(&["Yes, use reset", "No, go back", "Choose a different reset."]);
+        assert_eq!(safe_choice(&opts), None);
+    }
+
+    /// codex の「Approaching rate limits」だけは安全な出口がある（現状維持）
+    #[test]
+    fn issue985_codexの接近ダイアログは現状維持を選ぶ() {
+        let opts = opts(&[
+            "Switch to gpt-5.4-mini",
+            "Keep current model",
+            "Keep current model (never show again)",
+        ]);
+        assert_eq!(safe_choice(&opts), Some((2, "Keep current model")));
     }
 }
