@@ -126,6 +126,48 @@ Nightly patch release (automated). Changes since v0.7.7:
 
 ### Added
 
+- [機能追加] `tako setup` がエージェントごとの**モデル一覧を実取得**して選べるようにした
+  (#1002)。取得は各 CLI の一覧コマンド（**codex = `codex debug models`** / **agy = `agy models`**）で、
+  codex はモデル別の effort 語彙とコンテキスト長まで並ぶ。**claude は一覧コマンドを持たない**
+  （`claude models` はプロンプトとして解釈される）ので同梱のエイリアス（`opus` / `sonnet` /
+  `fable`）を並べ、「実取得ではない」ことを明示する。取得の失敗は 5 種に分類して
+  「理由 + 次の一手」を返す（未導入 = 導入コマンド / 未ログイン / 一覧コマンドが無い /
+  コマンド失敗 / 書式が変わった）。一覧は `tako setup models [--agent <系統>] [--json]` /
+  MCP `tako_setup_models` から読める。**対話ピッカーは `tako setup --review` だけ**で、
+  標準 `tako setup` は質問ゼロのまま「いま何が選ばれているか + 変えたいときのコマンド」を
+  出す。**1 番は常に「CLI の既定に任せる」**（tako はモデルを固定しない）。未導入の系統も
+  選択肢に並び、選ぶと導入手順が返る。選択は既定プロファイルの model / effort へ
+  ロック付きで書くので既存の設定は壊れない（master が別系統のときは master 側へ書かない）
+- [Added] `tako setup` can now **fetch the real model list from each agent CLI** and let you
+  pick one (#1002). The list comes from each CLI's own command (**codex = `codex debug
+  models`**, **agy = `agy models`**); for codex it includes the per-model effort vocabulary
+  and context window. **claude has no such command** (`claude models` is interpreted as a
+  prompt), so tako offers its built-in aliases (`opus` / `sonnet` / `fable`) and says
+  explicitly that this is not a live fetch. Failures are classified into five kinds with a
+  reason and a next step (not installed — with the install command / not signed in / no list
+  command / command failed / format changed). Read the list with `tako setup models
+  [--agent <agent>] [--json]` or MCP `tako_setup_models`. **The interactive picker only runs
+  under `tako setup --review`**; plain `tako setup` stays question-free and just prints what
+  is selected plus the command to change it. **Option 1 is always "leave it to the CLI
+  default"** — tako never pins a model for you. Agents that are not installed are still
+  listed, and picking one returns install guidance. The choice is written to the default
+  profile's model / effort under a lock, so the rest of your profile is untouched (and the
+  master side is left alone when master runs a different agent).
+- [機能追加] 設定画面（Cmd+, → プロファイル）の model 行からも同じ候補を選べるようにした
+  (#1002)。「候補を取得」を**押したときだけ** background で一覧を取るので、タブを開く動作は
+  今までどおり軽い（`agy models` はネットワーク取得で数秒かかる）。自由入力は残してある。
+  agy の effort チップも同じ変更で出るようになった
+- [Added] The settings screen (Cmd+, → Profiles) can pick from the same list on its model row
+  (#1002). The list is fetched in the background **only when you press "Fetch options"**, so
+  opening the tab stays as fast as before (`agy models` does a network round-trip that takes
+  seconds). Free-text entry is still available. agy's effort chips now appear too.
+- [機能追加] agy の worker へも `--effort` を渡すようにした (#1002)。`agy models` が挙げる
+  全モデルで `--effort low|medium|high` が受理されることを実測した（表示名の `(High)` 等は
+  モデル側の設定で `--effort` とは別物）。旧挙動は `TAKO_1002_LEGACY=1`
+- [Added] agy workers now receive `--effort` as well (#1002). Measured that
+  `--effort low|medium|high` is accepted for every model `agy models` reports (the `(High)`
+  suffix in a display name is a property of the model, not the `--effort` flag). Set
+  `TAKO_1002_LEGACY=1` for the previous behaviour.
 - [機能追加] ペインで `ssh <host>` に入るだけで、そのホストのフォルダがファイルツリーへ
   並ぶようにした (#976)。明示的な「リモートからフォルダを開く」操作は要らない（初期パスは
   sftp の初期 cwd = リモートのホーム）。ルートは**ローカルフォルダと同じ形**（フォルダ名 +

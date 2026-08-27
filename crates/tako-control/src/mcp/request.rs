@@ -798,6 +798,9 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             dry_run: bool_arg(args, "dry_run")?,
         },
+        "tako_setup_models" => Request::SetupModels {
+            agent: str_arg(args, "agent")?,
+        },
         "tako_setup" => Request::SetupRun {
             answers: Some(args.clone()),
         },

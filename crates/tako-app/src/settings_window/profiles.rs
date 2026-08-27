@@ -88,6 +88,23 @@ pub struct ProfilesTabState {
     /// 環境変数追加の入力バッファ
     env_key: String,
     env_value: String,
+    /// モデル一覧（#1002）。**タブを開いただけでは取らない**（agy は
+    /// ネットワーク取得なので数秒かかる）。`候補を取得` を押したときだけ
+    /// background で取り、系統ごとに覚える
+    model_catalogs: std::collections::BTreeMap<String, ModelCatalogState>,
+}
+
+/// 1 系統ぶんのモデル一覧の状態（#1002）
+#[derive(Debug, Clone)]
+pub enum ModelCatalogState {
+    Loading,
+    /// (id, 表示名) の並び + 実 CLI から取れたか
+    Loaded {
+        models: Vec<(String, String)>,
+        live: bool,
+    },
+    /// 取れなかった理由（`agent_models` が組んだ「理由 + 次の一手」の 1 行目）
+    Failed(String),
 }
 
 impl SettingsWindow {
@@ -581,8 +598,9 @@ impl SettingsWindow {
                 .child(self.model_row(
                     txt::prof_label_model(),
                     txt::desc_prof_model(),
-                    EditField::Profile(ProfileField::Model),
+                    ProfileField::Model,
                     detail["model"].as_str().unwrap_or(""),
+                    &master_agent,
                     cx,
                 ))
                 .child(self.effort_row(
@@ -660,8 +678,9 @@ impl SettingsWindow {
                 .child(self.model_row(
                     txt::prof_label_worker_model(),
                     txt::desc_prof_worker_model(),
-                    EditField::Profile(ProfileField::WorkerModel),
+                    ProfileField::WorkerModel,
                     detail["worker_model"].as_str().unwrap_or(""),
+                    &worker_agent,
                     cx,
                 ))
                 .child(self.effort_row(
@@ -816,8 +835,9 @@ impl SettingsWindow {
             .child(self.model_row(
                 txt::prof_label_model(),
                 txt::desc_prof_model(),
-                EditField::Profile(ProfileField::AgentModel(target_for_model)),
+                ProfileField::AgentModel(target_for_model.clone()),
                 &model,
+                &target_for_model,
                 cx,
             ))
             .child(self.effort_row(
@@ -1252,16 +1272,87 @@ impl SettingsWindow {
         row
     }
 
-    /// モデル行（自由入力 + [1m] の保存前警告）。
-    /// 選択肢を持てない（上流 CLI のリリースでモデル名が変わる）ため入力欄にしている
+    /// モデル一覧を引く系統名。**未設定は claude 既定**（`effort_row` と同じ規則）。
+    /// ここを揃えないと、`master_agent` を書いていないプロファイルで
+    /// 取得ボタンが無反応になる（`WorkerAgent::parse("")` が Err）
+    fn model_agent_of(agent: &str) -> &str {
+        if WorkerAgent::parse(agent).is_ok() {
+            agent
+        } else {
+            "claude"
+        }
+    }
+
+    /// モデル一覧を background で取る（#1002）。
+    ///
+    /// **UI スレッドで取ってはいけない**: `codex debug models` は子プロセス起動、
+    /// `agy models` は**ネットワーク取得**（実測で数秒）なので、同期で呼ぶと
+    /// #168 / #212 と同じ「画面が固まる」を作る。押されたときだけ取り、結果は覚える
+    fn fetch_model_catalog(&mut self, agent: &str, cx: &mut Context<Self>) {
+        let Ok(kind) = WorkerAgent::parse(agent) else {
+            return;
+        };
+        let key = agent.to_string();
+        if matches!(
+            self.profiles.model_catalogs.get(&key),
+            Some(ModelCatalogState::Loading)
+        ) {
+            return; // 二重取得を作らない
+        }
+        self.profiles
+            .model_catalogs
+            .insert(key.clone(), ModelCatalogState::Loading);
+        let task = cx
+            .background_executor()
+            .spawn(async move { tako_control::agent_models::catalog(kind) });
+        cx.spawn(async move |this, cx| {
+            let catalog = task.await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                let state = if catalog.models.is_empty() {
+                    let reason = catalog
+                        .failure
+                        .as_ref()
+                        .map(|f| {
+                            f.message_in(catalog.agent, tako_core::i18n::lang())
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    ModelCatalogState::Failed(reason)
+                } else {
+                    ModelCatalogState::Loaded {
+                        models: catalog
+                            .models
+                            .iter()
+                            .map(|m| (m.id.clone(), m.label.clone()))
+                            .collect(),
+                        live: catalog.is_live(),
+                    }
+                };
+                this.profiles.model_catalogs.insert(key, state);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// モデル行（自由入力 + 実取得の候補ピッカー + [1m] の保存前警告）。
+    ///
+    /// 自由入力は**残す**（上流 CLI のリリースでモデル名が変わるので、一覧に無い値も
+    /// 打てないと困る）。そのうえで #1002 の実取得した候補を押せるようにした。
+    /// **一覧はタブを開いた時点では取らない**（`agy models` はネットワーク取得）
     fn model_row(
         &self,
         label: &str,
         desc: &str,
-        field: EditField,
+        pf: ProfileField,
         current: &str,
+        agent: &str,
         cx: &mut Context<Self>,
     ) -> Div {
+        let field = EditField::Profile(pf.clone());
         let theme = self.theme();
         // 入力中のバッファを見るので、Enter を押す前に警告が出る（受け入れ条件 3）
         let pending = self
@@ -1283,6 +1374,7 @@ impl SettingsWindow {
                     cx,
                 ),
             ))
+            .child(self.model_options(pf, agent, current, cx))
             .when(warn_1m, |d| {
                 d.child(
                     div()
@@ -1292,6 +1384,94 @@ impl SettingsWindow {
                         .child(txt::prof_model_1m_warning()),
                 )
             })
+    }
+
+    /// モデル候補の表示（#1002）。未取得なら取得ボタン、取得中なら進捗、
+    /// 取れたらチップ、取れなければ理由の 1 行
+    fn model_options(
+        &self,
+        pf: ProfileField,
+        agent: &str,
+        current: &str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme();
+        let agent = Self::model_agent_of(agent);
+        let agent_owned = agent.to_string();
+        match self.profiles.model_catalogs.get(agent) {
+            None => self.row_wrapping(
+                "",
+                "",
+                div().flex().child(
+                    div()
+                        .id(SharedString::from(format!("prof-model-fetch-{agent}")))
+                        .px_2()
+                        .py(px(3.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(to_hsla(theme.border_subtle))
+                        .text_color(to_hsla(theme.text_secondary))
+                        .text_size(px(11.))
+                        .hover(|d| d.bg(to_hsla(theme.surface_2)))
+                        .child(txt::prof_model_fetch())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.fetch_model_catalog(&agent_owned, cx);
+                        })),
+                ),
+            ),
+            Some(ModelCatalogState::Loading) => self.row_wrapping(
+                "",
+                "",
+                div()
+                    .text_color(to_hsla(theme.text_muted))
+                    .text_size(px(11.))
+                    .child(txt::prof_model_fetching()),
+            ),
+            Some(ModelCatalogState::Failed(reason)) => self.row_wrapping(
+                "",
+                "",
+                div()
+                    .text_color(to_hsla(theme.text_muted))
+                    .text_size(px(11.))
+                    .child(reason.clone()),
+            ),
+            Some(ModelCatalogState::Loaded { models, live }) => {
+                let mut values: Vec<(String, String)> =
+                    vec![(String::new(), txt::prof_option_default().to_string())];
+                values.extend(models.iter().cloned());
+                // 一覧に無い現在値も選択肢として残す（外して直せるようにする）
+                if !current.is_empty() && !models.iter().any(|(id, _)| id == current) {
+                    values.push((current.to_string(), current.to_string()));
+                }
+                let field_for_pick = pf.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(self.row_wrapping(
+                        "",
+                        "",
+                        self.option_chips(
+                            &format!("prof-model-opt-{agent}"),
+                            &values,
+                            current,
+                            cx,
+                            move |this, value, cx| {
+                                this.commit_profile_field(field_for_pick.clone(), value, cx);
+                            },
+                        ),
+                    ))
+                    .when(!*live, |d| {
+                        d.child(
+                            div()
+                                .pb(px(4.))
+                                .text_color(to_hsla(theme.text_muted))
+                                .text_size(px(11.))
+                                .child(txt::prof_model_builtin_note()),
+                        )
+                    })
+            }
+        }
     }
 
     /// effort 行。選択肢はエージェント種別ごとの既知の値（agy は指定手段なし）
@@ -1439,6 +1619,42 @@ impl SettingsWindow {
         self.set_profile(|p| p.effort = Some(value), cx);
     }
 
+    /// モデル一覧の取得ボタン（#1002）。取得は background なので**戻ってこない**:
+    /// 呼び出し側は [`st_profiles_model_catalog`] を数回見て状態の遷移を確かめる
+    pub(crate) fn st_profiles_fetch_models(&mut self, agent: &str, cx: &mut Context<Self>) {
+        self.fetch_model_catalog(agent, cx);
+    }
+
+    /// モデル一覧の状態（`"none"` / `"loading"` / `"loaded:<件数>:<live>"` / `"failed"`）と
+    /// 取れた場合の先頭 id。**押していないのに取得が走っていない**ことも見られる
+    pub(crate) fn st_profiles_model_catalog(&self, agent: &str) -> (String, Option<String>) {
+        match self.profiles.model_catalogs.get(agent) {
+            None => ("none".into(), None),
+            Some(ModelCatalogState::Loading) => ("loading".into(), None),
+            Some(ModelCatalogState::Failed(_)) => ("failed".into(), None),
+            Some(ModelCatalogState::Loaded { models, live }) => (
+                format!("loaded:{}:{live}", models.len()),
+                models.first().map(|(id, _)| id.clone()),
+            ),
+        }
+    }
+
+    /// 一覧を引く系統名の正規化（未設定 → claude）。#1002 で
+    /// 「`master_agent` 未設定のプロファイルで取得ボタンが無反応」を踏んだので固定する
+    pub(crate) fn st_profiles_model_agent(agent: &str) -> &str {
+        Self::model_agent_of(agent)
+    }
+
+    /// モデル候補チップの押下（一覧から選んで保存する = UI と同じ経路）
+    pub(crate) fn st_profiles_pick_model(
+        &mut self,
+        field: ProfileField,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_profile_field(field, value.to_string(), cx);
+    }
+
     /// 削除ボタン 1 回目（確認待ちにするだけ。まだ消さない）
     pub(crate) fn st_profiles_request_delete(&mut self, name: &str) {
         self.profiles.confirm_delete = Some(name.to_string());
@@ -1576,5 +1792,44 @@ impl ProfilesSet {
             clear_limit_resume: self.clear_limit_resume,
             bypass_sandbox: self.bypass_sandbox,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// #1002 の不変条件を**ソース走査**で固定する。
+    ///
+    /// GUI セルフテストの項目 96 (b2) も同じことを見ているが、あちらは実 GUI が要るうえ
+    /// 高負荷では手前の項目（#181 / #694）が負荷依存で落ちて到達しないことがある。
+    /// ここが落ちれば `cargo test` だけで気づける
+    #[test]
+    fn モデル一覧はタブを開いた時点では取らない() {
+        let src = include_str!("profiles.rs");
+        // `refresh_profiles` の本体だけを切り出す（次の `pub(super) fn` / `pub fn` まで）
+        let start = src
+            .find("pub(super) fn refresh_profiles(")
+            .expect("refresh_profiles がある");
+        let rest = &src[start + 1..];
+        let end = rest
+            .find("\n    pub(super) fn ")
+            .or_else(|| rest.find("\n    pub fn "))
+            .or_else(|| rest.find("\n    fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("fetch_model_catalog"),
+            "refresh_profiles がモデル一覧を取っている。`agy models` はネットワーク取得（実測で数秒）\n\
+             なので、タブを開くたびに呼ぶと #168 / #212 と同じ「画面が固まる」を作る。\n\
+             取得は「候補を取得」ボタン（`model_options`）から background で行うこと"
+        );
+        // 取得そのものは background へ出ていること（同期呼び出しへ戻していない）
+        let fetch_start = src
+            .find("fn fetch_model_catalog(")
+            .expect("fetch_model_catalog がある");
+        let fetch_body = &src[fetch_start..fetch_start + 1200];
+        assert!(
+            fetch_body.contains("background_executor()"),
+            "fetch_model_catalog が background executor を通っていない"
+        );
     }
 }

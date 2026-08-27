@@ -345,6 +345,229 @@ fn decode_base64url(input: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
+// --- モデル一覧の実取得とピッカー（Issue #1002）---
+
+/// `SetupAgent` を能力マトリクス側の系統 enum へ写す。
+/// **新しい enum を作らない**（agent 種別の並存は `.agent/agent-enums.md` の対応表が正）
+fn worker_agent_of(kind: SetupAgent) -> tako_control::orchestrator::agent::WorkerAgent {
+    use tako_control::orchestrator::agent::WorkerAgent;
+    match kind {
+        SetupAgent::Claude => WorkerAgent::Claude,
+        SetupAgent::Codex => WorkerAgent::Codex,
+        SetupAgent::Agy => WorkerAgent::Agy,
+    }
+}
+
+/// `tako setup models`。MCP `tako_setup_models` と同じ結果をローカルで出す
+/// （GUI 不要の処理なので IPC を経由しない。#868 の bootstrap と同じ作法）
+pub fn run_models(agent: Option<&str>, json: bool) -> Result<(), String> {
+    use tako_control::agent_models;
+    use tako_control::orchestrator::agent::WorkerAgent;
+
+    let catalogs = match agent {
+        None | Some("") | Some("all") => agent_models::catalog_all(),
+        Some(name) => vec![agent_models::catalog(WorkerAgent::parse(name)?)],
+    };
+    if json {
+        println!(
+            "{}",
+            crate::pretty_json(&serde_json::json!({
+                "agents": catalogs.iter().map(agent_models::ModelCatalog::to_json).collect::<Vec<_>>(),
+                "apply_command": APPLY_MODEL_COMMAND,
+            }))
+        );
+        return Ok(());
+    }
+    for catalog in &catalogs {
+        print_catalog(catalog);
+    }
+    eprintln!("選んだ値を既定プロファイルへ反映するには:");
+    eprintln!("  {APPLY_MODEL_COMMAND}");
+    Ok(())
+}
+
+/// 反映は既存の 1 経路（プロファイル）に任せる。ここでモデルを書かないので
+/// 「一覧を見る」と「設定する」が別コマンドで完結する（#322 の最簡形）
+const APPLY_MODEL_COMMAND: &str =
+    "tako orchestrator profiles set default --model <id> --effort <値>";
+
+fn print_catalog(catalog: &tako_control::agent_models::ModelCatalog) {
+    let name = catalog.agent.as_str();
+    eprintln!();
+    eprintln!("{name} が使えるモデル");
+    eprintln!("─────────────────────");
+    match &catalog.list_command {
+        Some(cmd) if catalog.is_live() => eprintln!("  取得元: {cmd}"),
+        Some(cmd) => eprintln!("  取得元: {cmd}（失敗）"),
+        None => eprintln!("  取得元: tako 同梱の既知リスト（一覧コマンドが無い系統）"),
+    }
+    if let Some(failure) = &catalog.failure {
+        for line in failure
+            .message_in(catalog.agent, tako_core::i18n::lang())
+            .lines()
+        {
+            eprintln!("  {line}");
+        }
+    }
+    if catalog.models.is_empty() {
+        eprintln!("  （並べられるモデルがありません）");
+    }
+    for (index, model) in catalog.models.iter().enumerate() {
+        let mut extra = Vec::new();
+        if !model.efforts.is_empty() {
+            extra.push(format!("effort: {}", model.efforts.join("/")));
+        }
+        if let Some(window) = model.context_window {
+            extra.push(format!("ctx: {}k", window / 1000));
+        }
+        let suffix = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", extra.join("  "))
+        };
+        eprintln!("  {}) {} — {}{suffix}", index + 1, model.id, model.label);
+    }
+    if !catalog.efforts.is_empty() {
+        eprintln!("  この系統の effort 語彙: {}", catalog.efforts.join(" / "));
+    }
+}
+
+/// ピッカーの選択結果。どちらも None なら「CLI の既定に任せる」
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelChoice {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// 番号入力を選択へ解決する純粋関数。
+/// 空入力 = 既定（先頭 = CLI 既定に任せる）、範囲外はエラー。
+/// **1 は常に「CLI の既定に任せる」**（#27 の教訓: モデルを勝手に固定しない）
+fn resolve_model_choice(
+    models: &[tako_control::agent_models::ModelOption],
+    input: &str,
+) -> Result<Option<usize>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let index = input
+        .parse::<usize>()
+        .map_err(|_| "選択は番号で入力してください".to_string())?;
+    if index == 1 {
+        return Ok(None);
+    }
+    let picked = index
+        .checked_sub(2)
+        .filter(|picked| *picked < models.len())
+        .ok_or_else(|| format!("選択範囲は 1〜{} です", models.len() + 1))?;
+    Ok(Some(picked))
+}
+
+/// effort の番号入力を解決する。空入力 = 変更しない（None）
+fn resolve_effort_choice(efforts: &[String], input: &str) -> Result<Option<String>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let index = input
+        .parse::<usize>()
+        .map_err(|_| "選択は番号で入力してください".to_string())?;
+    if index == 1 {
+        return Ok(None);
+    }
+    index
+        .checked_sub(2)
+        .and_then(|picked| efforts.get(picked))
+        .map(|effort| Some(effort.clone()))
+        .ok_or_else(|| format!("選択範囲は 1〜{} です", efforts.len() + 1))
+}
+
+fn read_line() -> String {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+    input
+}
+
+/// モデルと effort の対話ピッカー（`--review` 専用）。
+///
+/// **標準 `tako setup` からは呼ばない**: #262 が標準経路を「最終サマリだけの質問ゼロ」に
+/// したので、ここへ質問を足すと回帰になる。標準経路は解決値と
+/// 「変えたいときのコマンド」を出すだけ（[`print_model_hint`]）
+fn pick_model_interactive(kind: SetupAgent) -> ModelChoice {
+    use tako_control::agent_models;
+
+    let catalog = agent_models::catalog(worker_agent_of(kind));
+    print_catalog(&catalog);
+    eprintln!();
+    eprintln!("{} のモデルを選択してください:", kind.as_str());
+    eprintln!("  1) CLI の既定に任せる（推奨。tako はモデルを固定しません）");
+    for (index, model) in catalog.models.iter().enumerate() {
+        eprintln!("  {}) {} — {}", index + 2, model.id, model.label);
+    }
+    eprint!("選択 [1]: ");
+    let raw = read_line();
+    let picked = match resolve_model_choice(&catalog.models, &raw) {
+        Ok(picked) => picked,
+        Err(e) => {
+            eprintln!("  [警告] {e}。CLI の既定に任せます");
+            None
+        }
+    };
+    let model = picked.map(|index| catalog.models[index].id.clone());
+    if let Some(model) = &model {
+        eprintln!("  [input] model: {model}");
+    } else {
+        eprintln!("  [default] model: 指定しない（各 CLI の既定）");
+    }
+
+    // effort の語彙は「選んだモデルが受け付ける値」を優先する
+    // （codex は per-model で違う。実測: gpt-5.6-luna は ultra を持たない）
+    let efforts = picked
+        .map(|index| catalog.models[index].efforts.clone())
+        .filter(|efforts| !efforts.is_empty())
+        .unwrap_or_else(|| catalog.efforts.clone());
+    if efforts.is_empty() {
+        return ModelChoice {
+            model,
+            effort: None,
+        };
+    }
+    eprintln!();
+    eprintln!("{} の effort を選択してください:", kind.as_str());
+    eprintln!("  1) 変更しない（プラン規模からの推奨値を使う）");
+    for (index, effort) in efforts.iter().enumerate() {
+        eprintln!("  {}) {effort}", index + 2);
+    }
+    eprint!("選択 [1]: ");
+    let raw = read_line();
+    let effort = match resolve_effort_choice(&efforts, &raw) {
+        Ok(effort) => effort,
+        Err(e) => {
+            eprintln!("  [警告] {e}。推奨値を使います");
+            None
+        }
+    };
+    match &effort {
+        Some(effort) => eprintln!("  [input] effort: {effort}"),
+        None => eprintln!("  [default] effort: 推奨値のまま"),
+    }
+    ModelChoice { model, effort }
+}
+
+/// 標準経路（質問ゼロ）で出す 1 行。**何が選ばれているか**と
+/// **変えたいときの最簡コマンド**だけを出す（#322）
+fn print_model_hint(kind: SetupAgent, profile_model: Option<&str>) {
+    use tako_control::agent_models;
+
+    let count = agent_models::catalog(worker_agent_of(kind)).models.len();
+    let current = profile_model.unwrap_or("指定しない（各 CLI の既定）");
+    eprintln!(
+        "  [OK] model: {current}（{} の選択肢 {count} 件）",
+        kind.as_str()
+    );
+    eprintln!("       一覧: tako setup models   変更: tako setup --review");
+}
+
 // --- ゼロスタート導入（Issue #868）---
 
 /// `tako setup bootstrap`。MCP `tako_setup_bootstrap` と同じ dispatch 相当を
@@ -1126,6 +1349,8 @@ fn select_setup_agent(
                 };
                 eprintln!("  {}) {}（{auth}）", index + 1, agent.kind.as_str());
             }
+            // 未導入の系統も見せる（選べないが「他にもある」ことは伝える。#1002）
+            print_missing_agents(agents);
             let default_index = default_agent_index(agents);
             eprint!("選択 [{default_index}]: ");
             let mut input = String::new();
@@ -1137,6 +1362,34 @@ fn select_setup_agent(
             };
             choose_setup_agent(agents, input.trim()).map(|agent| (agent, source))
         }
+    }
+}
+
+/// 未導入の系統（**選択肢には出す**が選べない。#1002 スコープ 1）。
+/// 「そもそも選択肢として存在することを知らせる」のが目的で、選ぶと
+/// #983 の導入案内（理由 + 次の一手）が返る
+fn missing_agents(detected: &[DetectedAgent]) -> Vec<SetupAgent> {
+    SetupAgent::ALL
+        .into_iter()
+        .filter(|kind| !detected.iter().any(|agent| agent.kind == *kind))
+        .collect()
+}
+
+/// 未導入の系統を選択肢として並べる（番号は検出済みの後ろに続く）
+fn print_missing_agents(detected: &[DetectedAgent]) {
+    use tako_control::orchestrator::agent_cli;
+    for (offset, kind) in missing_agents(detected).iter().enumerate() {
+        let guidance = agent_cli::guidance(worker_agent_of(*kind));
+        let hint = guidance
+            .command
+            .map(|cmd| format!("導入: {cmd}"))
+            .or_else(|| guidance.manual.map(|note| note.text().to_string()))
+            .unwrap_or_else(|| "導入して PATH へ通す".to_string());
+        eprintln!(
+            "  {}) {}（未導入 — {hint}）",
+            detected.len() + offset + 1,
+            kind.as_str()
+        );
     }
 }
 
@@ -1156,10 +1409,26 @@ fn choose_setup_agent(agents: &[DetectedAgent], input: &str) -> Result<SetupAgen
             .parse::<usize>()
             .map_err(|_| "選択は番号で入力してください".to_string())?
     };
-    agents
-        .get(selected.saturating_sub(1))
-        .map(|agent| agent.kind)
-        .ok_or_else(|| format!("選択範囲は 1〜{} です", agents.len()))
+    if let Some(agent) = agents.get(selected.saturating_sub(1)) {
+        return Ok(agent.kind);
+    }
+    // 検出済みの後ろに並べた未導入の系統を選んだ場合は、理由 + 次の一手を返す（#1002 / #983）
+    let missing = missing_agents(agents);
+    if let Some(kind) = selected
+        .checked_sub(agents.len() + 1)
+        .and_then(|offset| missing.get(offset))
+    {
+        use tako_control::orchestrator::agent_cli::{AgentCliError, AgentCliProblem};
+        return Err(AgentCliError {
+            agent: worker_agent_of(*kind),
+            problem: AgentCliProblem::NotFound,
+        }
+        .message());
+    }
+    Err(format!(
+        "選択範囲は 1〜{} です",
+        agents.len() + missing.len()
+    ))
 }
 
 /// 認証済み CLI に対応するプロバイダと検出プランだけを返す。
@@ -1513,6 +1782,81 @@ fn recommended_profile(
         )
     };
     (profile, note)
+}
+
+/// ピッカーの選択をプロファイルへ反映する。
+///
+/// **既存プロファイルは model / effort（と選択系統の worker 設定）だけ触る**ので、
+/// 他のカスタマイズは壊れない（受け入れ条件 4 の冪等性）。
+/// 選択が空（= CLI 既定に任せる）なら 1 バイトも書かない
+fn apply_model_choice(selected: SetupAgent, choice: &ModelChoice) -> Result<(), String> {
+    use tako_control::orchestrator::{self, AgentWorkerConfig};
+
+    if choice.model.is_none() && choice.effort.is_none() {
+        return Ok(());
+    }
+    // ロック付き read-modify-write（#169）。素朴な load → save は並行更新を巻き戻す
+    let (_, wrote_master) =
+        orchestrator::mutate_profile_of(orchestrator::ProfileKind::Master, "default", |profile| {
+            // **master が選択した系統で動いているときだけ** master 側の model / effort へ書く。
+            // agy は master 非対応（別系統が master になる）だけでなく、既存プロファイルの
+            // master が別系統のまま残っている場合もある（`--review` は既存を維持するので、
+            // master=claude のプロファイルに codex のモデル名を書くと起動が壊れる）
+            let master_is_selected = profile
+                .resolve_master_agent()
+                .is_ok_and(|master| master == worker_agent_of(selected));
+            let wrote_master = selected.supports_master() && master_is_selected;
+            if wrote_master {
+                if let Some(model) = &choice.model {
+                    profile.model = Some(model.clone());
+                }
+                if let Some(effort) = &choice.effort {
+                    profile.effort = effort.clone();
+                }
+            }
+            let entry = profile
+                .worker_agents
+                .entry(selected.as_str().to_string())
+                .or_insert_with(|| AgentWorkerConfig {
+                    model: None,
+                    effort: None,
+                    skip_permissions: worker_agent_of(selected).default_skip_permissions(),
+                    args: Vec::new(),
+                });
+            if let Some(model) = &choice.model {
+                entry.model = Some(model.clone());
+            }
+            if let Some(effort) = &choice.effort {
+                entry.effort = Some(effort.clone());
+            }
+            wrote_master
+        })?;
+    if wrote_master {
+        eprintln!("  [input] profile の model / effort を更新しました（master / worker とも）");
+    } else {
+        // どこへ書いたかを言う（master が別系統のときに黙って worker だけ変わると
+        // 「選んだのに効いていない」に見える）
+        // 全角空白を行継続の直後に置くと Rust が「スキップされない空白」として警告する
+        // （#837 と同型の踏み方）。行を分けて素の ASCII インデントで書く
+        eprintln!(
+            "  [input] profile の worker_agents.{} の model / effort を更新しました",
+            selected.as_str()
+        );
+        // master にできない系統（agy）へ `--master-agent` を勧めない
+        // （起動前エラーになる案内を出すのは #983 の思想に反する）
+        if selected.supports_master() {
+            eprintln!(
+                "          master は別の系統なので master 側は変えていません（master も変えるなら `tako orchestrator profiles set default --master-agent {}`）",
+                selected.as_str()
+            );
+        } else {
+            eprintln!(
+                "          {} は worker 専用なので master 側は変えていません（master のモデルは master の系統を選び直してから変えてください）",
+                selected.as_str()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn prepare_profile(
@@ -2550,6 +2894,18 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         false
     };
 
+    // モデル / effort（#1002）。**聞くのは書き込みより前**にまとめる（途中で中断しても
+    // 半端な状態を作らない）。**質問を足すのは --review だけ**（#262 の質問ゼロを守る）。
+    // answers 明示時はその profile が正なので触らない
+    let model_choice = if review_mode
+        && answers.profile.is_none()
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+    {
+        pick_model_interactive(selected)
+    } else {
+        ModelChoice::default()
+    };
+
     let mut plan = SetupPlan::default();
     plan.push_if_changed(
         "setup.completed",
@@ -2610,6 +2966,22 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
             None,
             "検出プランにもとづく推奨 profile を作成",
             SetupValueSource::Default,
+        );
+    }
+    if let Some(model) = &model_choice.model {
+        plan.push_if_changed(
+            "profiles/default.yaml の model",
+            None,
+            model.clone(),
+            SetupValueSource::Input,
+        );
+    }
+    if let Some(effort) = &model_choice.effort {
+        plan.push_if_changed(
+            "profiles/default.yaml の effort",
+            None,
+            effort.clone(),
+            SetupValueSource::Input,
         );
     }
     if claude_mcp_missing {
@@ -2722,6 +3094,17 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     sync_pending_changes_file(&dir, &pending, config.setup.applied_revision)?;
 
     let profile_note = prepare_profile(selected, &agents, &plans, answers.profile.as_ref())?;
+    apply_model_choice(selected, &model_choice)?;
+    if !review_mode {
+        // 標準経路は「いま何が選ばれているか」と「変えたいときの最簡コマンド」だけ（#322）
+        let current = tako_control::orchestrator::load_profile_of(
+            tako_control::orchestrator::ProfileKind::Master,
+            "default",
+        )
+        .ok()
+        .and_then(|profile| profile.model);
+        print_model_hint(selected, current.as_deref());
+    }
     apply_projects(answers.projects.as_ref())?;
     // 設定共有の現状（#793）。読み取りだけで副作用は無い。
     // 表示（サマリ / --check）と対話アシスタントへの引き渡しで同じ検出結果を使う
@@ -2968,6 +3351,74 @@ mod tests {
         .unwrap();
         assert_eq!(codex_plan_from_auth_file_at(&path).as_deref(), Some("plus"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 未導入の系統も選択肢に並び選ぶと導入案内が返る() {
+        // 検出済みは claude だけ。codex / agy は「未導入」として 2) 3) に並ぶ（#1002）
+        let agents = vec![detected(SetupAgent::Claude, true, Some("pro"))];
+        assert_eq!(
+            missing_agents(&agents),
+            vec![SetupAgent::Codex, SetupAgent::Agy]
+        );
+        let err = choose_setup_agent(&agents, "2").expect_err("未導入は選べない");
+        assert!(err.contains("codex"), "どの CLI かを名指しする: {err}");
+        // 文言は表示言語で変わるので**言語に依らない事実**で見る（#608 / #807 の作法）。
+        // 「次の一手」が日英そろっていることは agent_cli 側のテストが担保する
+        assert!(err.contains("install.sh"), "導入コマンドが要る: {err}");
+        let err = choose_setup_agent(&agents, "3").expect_err("未導入は選べない");
+        assert!(err.contains("agy"), "{err}");
+        // 未導入ぶんより後ろは範囲外
+        let err = choose_setup_agent(&agents, "4").expect_err("範囲外");
+        assert!(err.contains("1〜3"), "{err}");
+        // 3 系統とも入っているなら未導入は 0 件（並びが増えない）
+        let all = vec![
+            detected(SetupAgent::Claude, true, None),
+            detected(SetupAgent::Codex, true, None),
+            detected(SetupAgent::Agy, true, None),
+        ];
+        assert!(missing_agents(&all).is_empty());
+        assert!(choose_setup_agent(&all, "4").is_err());
+    }
+
+    #[test]
+    fn モデル選択は1番が常にcli既定に任せる() {
+        use tako_control::agent_models;
+        let models = agent_models::builtin_claude_models();
+        // 空入力と 1 は「指定しない」（#27 の教訓。tako がモデルを固定しない）
+        assert_eq!(resolve_model_choice(&models, ""), Ok(None));
+        assert_eq!(resolve_model_choice(&models, "  "), Ok(None));
+        assert_eq!(resolve_model_choice(&models, "1"), Ok(None));
+        // 2 以降が一覧の 0 始まり添字
+        assert_eq!(resolve_model_choice(&models, "2"), Ok(Some(0)));
+        assert_eq!(resolve_model_choice(&models, "4"), Ok(Some(2)));
+        let err = resolve_model_choice(&models, "5").expect_err("範囲外");
+        assert!(err.contains("1〜4"), "{err}");
+        assert!(resolve_model_choice(&models, "opus").is_err(), "番号で入力");
+    }
+
+    #[test]
+    fn effort選択も1番が変更しない() {
+        let efforts = vec!["low".to_string(), "high".to_string()];
+        assert_eq!(resolve_effort_choice(&efforts, ""), Ok(None));
+        assert_eq!(resolve_effort_choice(&efforts, "1"), Ok(None));
+        assert_eq!(
+            resolve_effort_choice(&efforts, "3"),
+            Ok(Some("high".to_string()))
+        );
+        assert!(resolve_effort_choice(&efforts, "4").is_err());
+        assert!(resolve_effort_choice(&efforts, "high").is_err());
+    }
+
+    #[test]
+    fn 系統の写しは新しいenumを作らずに済んでいる() {
+        use tako_control::orchestrator::agent::WorkerAgent;
+        // SetupAgent は非公開 enum なので、対応は agent_parity のソース走査 +
+        // ここでの値の突き合わせで担保する（`.agent/agent-enums.md`）
+        for kind in SetupAgent::ALL {
+            assert_eq!(worker_agent_of(kind).as_str(), kind.as_str());
+        }
+        assert_eq!(WorkerAgent::ALL.len(), SetupAgent::ALL.len());
     }
 
     #[test]

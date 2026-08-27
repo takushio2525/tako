@@ -3237,6 +3237,28 @@ fn dispatch_inner(
             }
         }
 
+        Request::SetupModels { agent } => {
+            // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。
+            // 実取得は各 CLI の一覧コマンドで、選んだ値の反映は
+            // `OrchestratorProfiles`（--model / --effort）が担当する（#1002）
+            use crate::agent_models;
+            let catalogs = match agent.as_deref() {
+                None | Some("") | Some("all") => agent_models::catalog_all(),
+                Some(name) => {
+                    let kind = crate::orchestrator::agent::WorkerAgent::parse(name)
+                        .map_err(DispatchError::InvalidParams)?;
+                    vec![agent_models::catalog(kind)]
+                }
+            };
+            Ok(serde_json::json!({
+                "agents": catalogs
+                    .iter()
+                    .map(agent_models::ModelCatalog::to_json)
+                    .collect::<Vec<_>>(),
+                "apply_command": "tako orchestrator profiles set <プロファイル> --model <id> --effort <値>",
+            }))
+        }
+
         Request::SetupRun { answers } => {
             let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
             let parsed: crate::setup::SetupAnswers = serde_json::from_value(answers_value)
@@ -11092,6 +11114,64 @@ mod tests {
             .unwrap()
     }
 
+    /// #1002: モデル一覧は dispatch を通るので CLI・MCP・GUI が同じペイロードを見る。
+    /// **書き込みツールを増やしていない**ことも応答の `apply_command` で示す
+    #[test]
+    fn issue1002_モデル一覧はdispatchから同じ形で読める() {
+        let mut host = MockHost::new();
+
+        // 省略 = 3 系統ぶん（並びは WorkerAgent::ALL と同じ）
+        let all = dispatch(
+            &mut host,
+            Request::SetupModels { agent: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let agents = all["agents"].as_array().expect("agents 配列");
+        assert_eq!(agents.len(), 3);
+        assert_eq!(agents[0]["agent"], "claude");
+        assert_eq!(agents[1]["agent"], "codex");
+        assert_eq!(agents[2]["agent"], "agy");
+        // claude は一覧コマンドを持たないので静的リスト + 取得不可の明示
+        assert_eq!(agents[0]["failure"]["kind"], "no_list_command");
+        assert_eq!(agents[0]["source"], "builtin");
+        assert!(!agents[0]["models"].as_array().unwrap().is_empty());
+        // 取得元のコマンドは正本 1 本から出る（表示と実行が食い違わない）
+        assert_eq!(agents[1]["list_command"], "codex debug models");
+        assert_eq!(agents[2]["list_command"], "agy models");
+        // 反映は既存のプロファイル経路に任せる
+        assert!(all["apply_command"]
+            .as_str()
+            .unwrap()
+            .contains("orchestrator profiles set"));
+
+        // 系統を絞れる（CLI `--agent` / MCP `agent` と 1:1）
+        let one = dispatch(
+            &mut host,
+            Request::SetupModels {
+                agent: Some("agy".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(one["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(one["agents"][0]["agent"], "agy");
+
+        // 不正な系統は分類済みエラー（対応値を挙げる）
+        let err = dispatch(
+            &mut host,
+            Request::SetupModels {
+                agent: Some("gemini".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect_err("未対応の系統は拒否する");
+        assert!(
+            format!("{err:?}").contains("claude / codex / agy"),
+            "{err:?}"
+        );
+    }
+
     /// #813: 自動復帰のオプトインは既定 OFF で、dispatch から読み書きでき、
     /// list / read にも同じ値が出る（UI・CLI・MCP はすべてこの dispatch を通る）
     #[test]
@@ -13521,7 +13601,12 @@ mod tests {
                     || cmd.contains("--model \"Gemini 3.5 Flash (High)\""),
                 "{cmd}"
             );
-            assert!(!cmd.contains("effort"), "agy に effort は渡さない: {cmd}");
+            // agy にも `--effort low|medium|high` が実在する（#1002 で実測）。
+            // 値のクォートは方言で変わるので、フラグと値が並ぶことだけを見る
+            assert!(
+                cmd.contains("--effort high") || cmd.contains("--effort 'high'"),
+                "agy へ effort を渡す: {cmd}"
+            );
         });
     }
 

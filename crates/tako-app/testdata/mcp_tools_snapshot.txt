@@ -110,6 +110,7 @@ tako_setup
 tako_setup_bootstrap
 tako_setup_changes
 tako_setup_mcp
+tako_setup_models
 tako_shell_integration
 tako_show_command
 tako_sleep_guard

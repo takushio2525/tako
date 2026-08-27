@@ -1402,6 +1402,18 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_setup_models",
+        macos: Support::Supported,
+        // 取得は境界 B16（`platform::exe::find`）で解決した CLI を子プロセスとして
+        // 起動するだけなので構造上は動くが、Windows 実機での取得は**未実測**。
+        // #591 の規約どおり Pending + 追跡 #937 のまま置く（過大申告しない）
+        windows: Support::Pending {
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
+        },
+        windows_evidence: Evidence::Unverified,
+    },
+    Feature {
         key: "tako_shell_integration",
         macos: Support::Supported,
         windows: Support::Degraded {

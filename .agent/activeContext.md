@@ -170,11 +170,35 @@ remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決
 - **`visual-test` の全節は現状 main でも `term-grid attrs-underline` で止まる**（#943。
   `ul_strip=32` が期待の 40 未満。e703e40 で同じ数値を実測）
 
+- **#1002（setup のモデル実取得ピッカー）完了 = #975 エピックのスライス**。取得手段の正本は
+  `tako-control::agent_models`（**codex = `codex debug models`** / **agy = `agy models`** /
+  **claude は一覧コマンドが無い** = 同梱エイリアス + 取得不可の明示）。CLI `tako setup models` /
+  MCP `tako_setup_models`（**142 ツール**）。**対話ピッカーは `--review` だけ**（標準経路の
+  質問ゼロ = #262 を壊さない）。**1 番は常に「CLI の既定に任せる」**（#27 / #67）
+- **agy の `--effort` は実在する**（実測: `agy models` の全モデルで `low|medium|high` の検証が
+  走る。表示名の `(High)` は別物。**未知のモデル名のときだけ**「effort 非対応」と言う）。
+  マトリクスの `effort_control` を Supported へ倒し worker 起動へ渡した。A/B は `TAKO_1002_LEGACY=1`
+- **能力マトリクスの構造的な限界（再調査を避ける）**: `claudeは基準系なので全て対応済み` が
+  claude = 全 Supported を強制するので、**claude が最弱になる能力は 1 マスで表せない**。
+  #1002 は能力を「setup でモデルを選べるか」へ切り出し、取得手段の差は実行時の
+  `source`（cli / builtin / none）+ `failure.kind` で表した
+- **GUI のモデル候補は「押したときだけ background」**（設定画面 → プロファイルの model 行）。
+  `agy models` はネットワーク取得なのでタブを開くたびに取ってはいけない。取得の形は
+  `settings_window.rs` の `refresh_agent_clis`（#168 の教訓）と同じ
+- **setup を測るときの作法（#1002 で踏んだ）**: `script -q` + パイプ入力は**先頭 1 行が消える**
+  → `expect` で 1 問ずつ送る / zsh スクリプト内の `cmd &` は **stdin が /dev/null** になり
+  TTY 判定が false（ピッカーが出ない）/ `setup_dir()` は `TAKO_DATA_DIR` を見ない
+  （`~/Library/Application Support/tako/setup` へ書く。中身は同梱テンプレなので無害）/
+  **`~/.claude.json` と `~/.claude/.claude.json` は稼働中の claude が常時書く**ので
+  「変更検知 → 復元」の対象にしてはいけない
+
 ## 次の一手
 
 - **v0.7.9 の初回同時リリース**（#965。PR merge 後）: main を pull → `git tag -a v0.7.9` を
   push（ここで Windows のワークフローが走る）→ `scripts/release.sh --test`。
   release.sh が Windows の添付を待ってノートを作り直し、揃わなければ exit 3 を返す
+- **#1002 の残り**: モデル一覧の Windows 実機実測（マトリクスは `Pending` + 追跡 #937 のまま）。
+  ローカル LLM の一覧は #990 の範囲（`Agent::Local` は `Pending`）
 - **#935 / #936**: どちらも「境界へ寄せる」既存の型がある（#875 = B1 / #898 = B16 /
   スライス 9 = procinfo）ので寄せ先は決まっている
 - **#970〜#974**: #937 の消し込みで見つけた実機バグ。#971 が片付くまで remote 系は測れない

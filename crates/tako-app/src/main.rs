@@ -46347,6 +46347,68 @@ mod self_test {
                     "プロファイルタブ: GUI の保存が profiles show と一致する (#721)",
                 );
 
+                // (b2) #1002: モデル一覧の実取得ピッカー。
+                // **タブを開いただけでは取らない**（`agy models` はネットワーク取得なので
+                // 開くたびに数秒かかる形にしない）→ 押して初めて loading になり、
+                // 取れたらチップから保存できる。取得は background なので状態遷移で見る
+                let before_fetch = settings
+                    .update(cx, |view, _, _| view.st_profiles_model_catalog("claude").0)
+                    .unwrap_or_default();
+                settings
+                    .update(cx, |view, _, cx| {
+                        view.st_profiles_fetch_models("claude", cx);
+                    })
+                    .ok();
+                // claude は一覧コマンドを持たないので同梱リストが即座に確定する（live=false）
+                let mut catalog = (String::new(), None);
+                for _ in 0..40 {
+                    catalog = settings
+                        .update(cx, |view, _, _| view.st_profiles_model_catalog("claude"))
+                        .unwrap_or_default();
+                    if catalog.0.starts_with("loaded") || catalog.0 == "failed" {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(100))
+                        .await;
+                }
+                let picked = catalog.1.clone().unwrap_or_default();
+                if !picked.is_empty() {
+                    let picked_owned = picked.clone();
+                    settings
+                        .update(cx, |view, _, cx| {
+                            view.st_profiles_pick_model(
+                                ProfileField::Model,
+                                &picked_owned,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+                let after_pick = fire(req("show", "master", Some(probe)), cx)
+                    .and_then(|v| v["model"].as_str().map(String::from));
+                // 系統名の正規化: 未設定・不正値は claude 既定へ寄せる
+                // （寄せないと `master_agent` を書いていないプロファイルで取得ボタンが無反応）
+                let agent_norm_ok = settings_window::SettingsWindow::st_profiles_model_agent("") == "claude"
+                    && settings_window::SettingsWindow::st_profiles_model_agent("bogus") == "claude"
+                    && settings_window::SettingsWindow::st_profiles_model_agent("codex") == "codex";
+                let models_ok = agent_norm_ok
+                    && before_fetch == "none"
+                    && catalog.0.starts_with("loaded:")
+                    && catalog.0.ends_with(":false") // claude は実取得ではない
+                    && !picked.is_empty()
+                    && after_pick.as_deref() == Some(picked.as_str());
+                if !models_ok {
+                    eprintln!(
+                        "[selftest 96] before={before_fetch} catalog={} picked={picked:?} after={after_pick:?}",
+                        catalog.0
+                    );
+                }
+                check(
+                    models_ok,
+                    "プロファイルタブ: モデル一覧は押して初めて取り、チップから保存できる (#1002)",
+                );
+
                 // (c) 外部変更（CLI / MCP 相当の dispatch）→ 再表示で反映される
                 let copied = {
                     let mut r = req("copy", "master", Some(copy));

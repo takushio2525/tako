@@ -16,9 +16,9 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 111 / 141（79%） | macOS と同じように使えます |
+| 対応 | 111 / 142（78%） | macOS と同じように使えます |
 | 一部対応 | 13 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
-| 未実測 | 0 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
+| 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
@@ -203,7 +203,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## セットアップと設定
 
-対応 9・一部対応 1
+対応 9・一部対応 1・未対応 / 未実測 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -211,6 +211,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_setup_bootstrap` | 一部対応 | 状態の確認と公式手順の案内はできるが、インストールの実行代行は macOS だけ（Windows は PowerShell 版インストーラを案内する） | 実機セルフテスト: 項目 119（status が next_step を返す・install --dry-run は実行しない・不明な action を拒否） |
 | `tako_setup_changes` | 対応 | — | 実機テスト: changes.yaml の連番・platforms 絞り込みテストが実機で緑（#525 が platforms: を最初に使う） |
 | `tako_setup_mcp` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako setup-mcp` が claude の設定（スクラッチ HOME 側）へ tako を登録し旧内容を backups へ退避する。別途、実 HOME の登録に対して `claude mcp list` が `tako.exe mcp serve` を Connected と健康判定したので、stdio ブリッジ自体も Windows で通る |
+| `tako_setup_models` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 | `tako_settings` | 対応 | — | 実機セルフテスト: 項目 96 / 120（プロファイルタブ・スリープ防止タブの表示構成） |
 | `tako_migrate` | 対応 | — | 実機セルフテスト: 項目 123（実 dispatch で自動マイグレーション）+ migrations の単体 20 本が実機で緑 |
 | `tako_agents_sync_rules` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako agents sync-rules --source <正本>` が claude のグローバル指示へマーカーブロックを書き（action=updated + .bak 生成）、未導入の codex / agy は理由つきで skip される |

@@ -293,6 +293,26 @@ mod tests {
     }
 
     #[test]
+    fn tako_setup_modelsはsetup_modelsリクエストに変換される() {
+        // 省略 = 全系統
+        let (response, requests) = run(call("tako_setup_models", json!({})), None, true);
+        assert_eq!(requests, vec![Request::SetupModels { agent: None }]);
+        assert_eq!(response.unwrap()["result"]["isError"], false);
+        // 系統の絞り込みがそのまま渡る（CLI `--agent` と 1:1）
+        let (_, requests) = run(
+            call("tako_setup_models", json!({"agent": "codex"})),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::SetupModels {
+                agent: Some("codex".into())
+            }]
+        );
+    }
+
+    #[test]
     fn tako_setupは全回答をsetup_runリクエストに変換する() {
         let answers = json!({
             "selected_agent": "codex",
@@ -501,7 +521,8 @@ mod tests {
         // #915 の tako_orchestrator_handoffs（引き継ぎファイルの管理）を追加して 138
         // #916 の tako_migrate（設定の自動マイグレーション）を追加して 139
         // #919 の tako_remote_folder（リモートからフォルダを開く）を追加して 140
-        assert_eq!(tools.len(), 141);
+        // #1002 の tako_setup_models（モデル一覧の実取得）を追加して 142
+        assert_eq!(tools.len(), 142);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

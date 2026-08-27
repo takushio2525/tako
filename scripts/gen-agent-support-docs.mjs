@@ -28,7 +28,7 @@ const CATEGORIES = [
   ['セットアップ', [
     'setup_detect', 'setup_auth_check', 'setup_auth_launch', 'setup_plan_detect',
     'setup_cli_install', 'setup_profile_recommend', 'setup_rules_sync',
-    'setup_mcp_register',
+    'setup_mcp_register', 'setup_model_picker',
   ]],
   ['オーケストレーター（master / solo）', [
     'master_launch', 'solo_launch', 'master_system_prompt', 'master_mcp',
