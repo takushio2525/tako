@@ -3,6 +3,27 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
+## 現在の対象（2026-08-28）
+
+- **#1011（`claude agents --json` の起動コスト）を実装。#1001 軽量化エピックの C1**。
+  ①**前段ガード** = `<config dir>/sessions/<pid>.json`（claude の台帳。CLI の出力と集合まで
+  一致するのを実測）で「その走査先に live な claude が居るか」を Node 無しで見て、
+  居ない**明示アカウント**の起動を省く ②**鮮度の用途分離** = `AgentScanFreshness`
+  （Monitoring 5s / Ui 30s）。**キャッシュは 1 本のまま**（分けると同時に 2 本走って倍になる）。
+  実測 **Node 4 → 2 本 / CPU 0.89 → 0.46s（−48%）で結果は完全一致**
+- **#1011 を触るときの不変条件**: ①**既定 config dir は必ず起こす**（`always_scan`。
+  #571 の「既定を必ず観測する」保証 + 台帳の取りこぼし検出の機会）②台帳の
+  `Missing`（ディレクトリ無し）を空と読むのは**他の走査先で仕組みが確認できたときだけ**
+  （台帳を書かない claude で全滅するため）③省いた走査先は `Some("[]")` を返す
+  （`None` にすると merge の `any_ok` が汚れて #466 の sticky が壊れる）
+  ④答えは**従来どおり `claude agents --json`**（台帳は「起こさなくてよい Node」の
+  見分けにしか使わない。誤っても Node を起こす側へ倒れる）
+- **claude 2.1.232 の実測（再調査を避ける）**: `claude agents --json` に
+  **`contextPercentUsed` / `model` が無い**（実測 13 件すべて null）。
+  → `orchestrator self` の `ctx_percent` / `ctx_over_threshold` が常に null なので
+  **#749 の自動ハンドオフはこの経路からは発火しない**（別 Issue 化が要る）。
+  `claude agents --help` に**複数 config dir をまとめて見る手段は無い**（走査先の統合は不可）
+
 ## 現在の対象（2026-08-27）
 
 - **#965（リリースの両 OS 同時化）を実装。初回の同時リリースは v0.7.9 で実行する**。
@@ -87,7 +108,8 @@
   ログインし直すまで測れない
 - **A/B の env（同一バイナリで旧挙動へ戻せる）**: `TAKO_920_LEGACY` / `TAKO_913_LEGACY` /
   `TAKO_906_NO_PAD` / `TAKO_907_NO_INJECT` / `TAKO_903_LEGACY` / `TAKO_866_KEEP_EXACT_TARGET` /
-  `TAKO_932_NO_OFFSCREEN_GEOMETRY` / `TAKO_961_LEGACY` / `TAKO_966_LEGACY`
+  `TAKO_932_NO_OFFSCREEN_GEOMETRY` / `TAKO_961_LEGACY` / `TAKO_966_LEGACY` /
+  `TAKO_1011_LEGACY`（+ 故障注入 `TAKO_1011_INJECT_LEDGER_GAP`）
 
 - **#982（agent 能力マトリクス）完了 = #975 エピックの土台**。`tako-core::agent_support` が
   「どの agent がどこまで使えるか」の正本（40 能力 × claude / codex / agy / ローカル LLM）。
