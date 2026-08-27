@@ -216,11 +216,11 @@ impl FileTree {
 
     fn build_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        // リモートルートを先に出す（#919）: 「リモートからフォルダを開く」直後に
-        // 開いたものが見えないと開けたことが分からない（ローカルルートは
-        // ペインの cwd 由来で何本も並ぶ）
-        for remote in &self.remote_roots {
-            self.collect_remote_rows(remote, 0, true, &mut rows);
+        // A/B（`TAKO_976_LEGACY=1`）: #919 の「リモートを先頭へ hoist」へ戻す
+        if crate::ssh_folders::legacy_mode() {
+            for remote in &self.remote_roots {
+                self.collect_remote_rows(remote, 0, true, &mut rows);
+            }
         }
         for root in &self.roots {
             let expanded = self.expanded.contains(root);
@@ -242,6 +242,16 @@ impl FileTree {
             });
             if expanded {
                 self.collect_rows(root, 1, &mut rows);
+            }
+        }
+        // #976: リモートルートは**ローカルの後ろに普通に並ぶ**。#919 は「開いた直後に
+        // 見えないと分からない」として先頭へ hoist していたが、ssh の自動検知
+        // （#976）で日常的に増えるものになったので、特別扱いをやめて
+        // 「ワークスペースフォルダが 1 つ増えた」と同じ見え方へ寄せる。
+        // 開けたことは行の SSH バッジと上部の通知で分かる
+        if !crate::ssh_folders::legacy_mode() {
+            for remote in &self.remote_roots {
+                self.collect_remote_rows(remote, 0, true, &mut rows);
             }
         }
         rows
@@ -324,8 +334,9 @@ impl FileTree {
             return false;
         }
         self.remote_expanded.insert(remote.clone());
-        // 先頭に積む（最後に開いたものが一番上）
-        self.remote_roots.insert(0, remote);
+        // #976: 末尾へ積む（開いた順に並ぶ）。ローカルルートと同じ「並んだ順」の
+        // 規則にすると、リモートだけ最新が飛び込んでくる特別扱いが消える
+        self.remote_roots.push(remote);
         self.rows_cache = None;
         true
     }
@@ -432,11 +443,13 @@ impl FileTree {
             return;
         }
         let expanded = self.remote_expanded.contains(remote);
-        let name = if root {
-            // ルートは「host: 末尾要素」で、どのホストのものか一目で分かるようにする
-            format!("{}: {}", remote.host, remote.base_name())
-        } else {
-            remote.base_name()
+        // #976: ルートの名前も**ローカルと同じ「フォルダ名」だけ**にする。
+        // どのホストかは行の SSH バッジ（`render_remote_row`）が示すので、
+        // 名前に `host: ` を混ぜると同じ深さのローカルルートと形が揃わない
+        let name = match root && crate::ssh_folders::legacy_mode() {
+            // A/B（`TAKO_976_LEGACY=1`）: #919 の `host: 末尾要素` へ戻す
+            true => format!("{}: {}", remote.host, remote.base_name()),
+            false => remote.base_name(),
         };
         rows.push(Row {
             entry: Entry {

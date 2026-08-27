@@ -163,7 +163,9 @@ impl TakoApp {
         for gone in have.iter().filter(|r| !want.contains(r)) {
             self.filetree.remove_remote_root(gone);
         }
-        // タブが持つ順（新しいものが先頭）を保つため逆順に足す
+        // #976: タブは「最後に開いたものが先頭」で持つので、**逆順に足して**
+        // ツリー側を「開いた順（古いものが上）」へ揃える。ローカルルートが
+        // ペインの並び順で出るのと同じ規則にするため
         for remote in want.iter().rev().filter(|r| !have.contains(r)) {
             self.filetree.add_remote_root(remote.clone());
         }
@@ -979,14 +981,25 @@ impl TakoApp {
                     }
                 }),
             )
+            // #976: 開いているファイルの強調もローカル行とまったく同じにする
+            // （左端の accent 線 + 背景）。片方だけ違うと「別物」に見える
             .when(is_open, |d| {
                 d.bg(rgba_alpha(theme.accent, 0.13))
                     .text_color(hsla(theme.foreground))
+                    .shadow(vec![BoxShadow {
+                        color: hsla(theme.accent),
+                        offset: point(px(2.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(0.),
+                        inset: true,
+                    }])
             });
 
         if row.root {
-            // リモートルート見出し: ローカルルートと同じ太字 + 仕切り線に、
-            // 「どのホストか」が一目で分かるバッジを足す
+            // #976: リモートルート見出しは**ローカルルートと同じ形**にする
+            // （太字 + 仕切り線 + chevron + フォルダアイコン + フォルダ名）。
+            // 「SSH のフォルダで、どのホストか」は行末のバッジが担う =
+            // 同じ深さに並んだときにローカルと形が揃う
             el = el
                 .when(index > 0, |d| {
                     d.border_t_1()
@@ -1006,10 +1019,10 @@ impl TakoApp {
                 )
                 .child(
                     svg()
-                        .path(file_icons::ui_icon::GLOBE)
-                        .size(px(14.0))
+                        .path(file_icons::folder_icon(row.expanded).svg_path())
+                        .size(px(16.0))
                         .flex_none()
-                        .text_color(hsla(theme.mauve)),
+                        .text_color(hsla(theme.accent)),
                 )
                 .child(
                     div()
@@ -1017,8 +1030,9 @@ impl TakoApp {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(SharedString::from(truncate(&row.entry.name, 24))),
-                );
+                        .child(SharedString::from(truncate(&row.entry.name, 22))),
+                )
+                .child(self.render_ssh_badge(&remote, theme));
             return el;
         }
 
@@ -1065,6 +1079,61 @@ impl TakoApp {
                 .text_ellipsis()
                 .child(SharedString::from(truncate(&row.entry.name, 24))),
         )
+    }
+
+    /// リモートルート行の SSH バッジ（#976）。
+    ///
+    /// **絵文字は使わない**（#217）: 地球アイコンの SVG マスク + `SSH` + ホスト名。
+    /// 検知していた ssh セッションが消えたホストは色が変わり「切断」が付く
+    /// （行そのものは消さない = #976 受け入れ条件 3）
+    fn render_ssh_badge(
+        &self,
+        remote: &tako_core::remote_fs::RemoteRef,
+        theme: &tako_core::theme::Theme,
+    ) -> gpui::Div {
+        // 検知したことのないホスト（明示的に開いただけ）は状態を騙らない
+        let disconnected = self
+            .ssh_link_of_host(&remote.host)
+            .is_some_and(|link| !link.live);
+        let tint = if disconnected { theme.red } else { theme.mauve };
+        let mut badge = div()
+            .flex()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .gap(px(3.0))
+            .ml(px(4.0))
+            .px(px(4.0))
+            .py(px(1.0))
+            .rounded(px(4.0))
+            .bg(rgba_alpha(tint, 0.16))
+            .text_size(px(9.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(hsla(tint))
+            .child(
+                svg()
+                    .path(file_icons::ui_icon::GLOBE)
+                    .size(px(9.0))
+                    .flex_none()
+                    .text_color(hsla(tint)),
+            )
+            .child(SharedString::from(
+                crate::ui_text::remote_folder::BADGE_LABEL,
+            ))
+            .child(
+                div()
+                    .max_w(px(96.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(SharedString::from(remote.host.clone())),
+            );
+        if disconnected {
+            badge = badge.child(SharedString::from(
+                crate::ui_text::remote_folder::badge_disconnected(),
+            ));
+        }
+        badge
     }
 
     /// リモート行の右クリックメニュー（#919）。
@@ -1624,6 +1693,7 @@ impl TakoApp {
                 focus: Some(true),
                 all: false,
                 force: false,
+                enabled: None,
             },
             PaneOrigin::User,
         );
@@ -1673,6 +1743,7 @@ impl TakoApp {
                         focus: Some(true),
                         all: false,
                         force: false,
+                        enabled: None,
                     },
                     PaneOrigin::User,
                 );
@@ -1691,6 +1762,7 @@ impl TakoApp {
                         focus: None,
                         all: false,
                         force: false,
+                        enabled: None,
                     },
                     PaneOrigin::User,
                 );

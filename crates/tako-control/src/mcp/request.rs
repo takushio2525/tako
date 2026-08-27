@@ -872,6 +872,7 @@ pub(super) fn build_request(
             focus: bool_arg(args, "focus")?,
             all: bool_arg(args, "all")?.unwrap_or(false),
             force: bool_arg(args, "force")?.unwrap_or(false),
+            enabled: bool_arg(args, "enabled")?,
         },
         "tako_recent" => Request::RecentItems {
             action: str_arg(args, "action")?

@@ -265,6 +265,30 @@ pub trait UiStateHost {
     }
     /// リモートフォルダの内容を捨てて取り直す（#919 の「再読み込み」）
     fn invalidate_remote_dir(&mut self, _remote: &tako_core::remote_fs::RemoteRef) {}
+
+    /// ペインの `ssh` 検知によるリモートフォルダの自動追加が有効か（#976。既定 ON）
+    fn ssh_auto_folders_enabled(&self) -> bool {
+        crate::settings::load().ssh_auto_folders
+    }
+    /// 自動追加の有効・無効を切り替える（GUI 側が settings.json へ永続化する。#976）。
+    ///
+    /// 既定は**何もしない**: 検知の実体は GUI が持つので、GUI が居ない host
+    /// （テスト等）での切替は意味を持たない。切り替わっていないことは応答の
+    /// `enabled`（= `ssh_auto_folders_enabled` の現在値）と
+    /// `detection: "unavailable"` の両方に出るので、黙って成功したことにはならない
+    fn set_ssh_auto_folders(&mut self, _enabled: bool) {}
+    /// 検知した ssh セッションと自動追加の状態（`auto` の応答本体。#976）。
+    ///
+    /// GUI（tako-app）だけが実体を持つ。**「見ていない」「見られない」「見た」を
+    /// 区別できる形**で返す（`detection` = `pending` / `unavailable`（argv を採れない
+    /// 環境）/ `active`）
+    fn ssh_auto_folder_status(&self) -> Value {
+        serde_json::json!({
+            "detection": "unavailable",
+            "reason": "GUI が接続していないので検知状態を読めない",
+            "sessions": [],
+        })
+    }
     /// プレビューペインに「これはリモートのどこのファイルか」を覚えさせる（#919 / #966）。
     ///
     /// ヘッダの表示と**保存先の切り替え**に使う。プレビュー本体は SFTP で落とした

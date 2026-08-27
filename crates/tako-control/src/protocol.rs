@@ -1432,6 +1432,7 @@ pub enum Request {
     ///   AI がリモートの構造を把握するための経路 = #65 要件 5）
     /// - `"open-file"`: リモートのファイルをプレビューで開く（SFTP で取得 → 読み取り専用）
     /// - `"ssh-pane"`: そのフォルダを cwd にした SSH ペインを開く（#919 要件 4）
+    /// - `"auto"`: ペインの `ssh` 検知による自動追加の状態（`enabled` で切替）。#976
     RemoteFolder {
         action: String,
         #[serde(default)]
@@ -1449,6 +1450,9 @@ pub enum Request {
         /// `push` で競合を承知のうえ上書きする（#966）
         #[serde(default)]
         force: bool,
+        /// `auto` の切替（省略で現在値の照会だけ。#976）
+        #[serde(default)]
+        enabled: Option<bool>,
     },
     /// 最近開いた項目の一覧・クリア（#20）。
     /// `action`: "list" / "clear"

@@ -501,6 +501,12 @@ enum RemoteFolderCommand {
         /// リモート側のファイルの絶対パス（省略時はそのホストの全部）
         path: Option<String>,
     },
+    /// ペインの ssh 検知による自動追加の状態・切替（#976）
+    Auto {
+        /// on / off（省略で現在値と検知状態の照会だけ）
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// 押し出せていない保存を再試行する（#966）
     Push {
         /// ~/.ssh/config の Host 名（省略時は全件）
@@ -6463,6 +6469,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: None,
                 all: false,
                 force: false,
+                enabled: None,
             },
             RemoteFolderCommand::Close {
                 host,
@@ -6477,6 +6484,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: None,
                 all: *all,
                 force: false,
+                enabled: None,
             },
             RemoteFolderCommand::List => Request::RemoteFolder {
                 action: "list".into(),
@@ -6486,6 +6494,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: None,
                 all: false,
                 force: false,
+                enabled: None,
             },
             RemoteFolderCommand::Ls { host, path } => Request::RemoteFolder {
                 action: "ls".into(),
@@ -6495,6 +6504,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: None,
                 all: false,
                 force: false,
+                enabled: None,
             },
             RemoteFolderCommand::OpenFile {
                 host,
@@ -6508,6 +6518,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: Some(!no_focus),
                 all: false,
                 force: false,
+                enabled: None,
             },
             RemoteFolderCommand::SshPane {
                 host,
@@ -6521,6 +6532,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: Some(!no_focus),
                 all: false,
                 force: false,
+                enabled: None,
             },
             RemoteFolderCommand::Pending { host, path } => Request::RemoteFolder {
                 action: "pending".into(),
@@ -6530,6 +6542,17 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: None,
                 all: false,
                 force: false,
+                enabled: None,
+            },
+            RemoteFolderCommand::Auto { state } => Request::RemoteFolder {
+                action: "auto".into(),
+                host: None,
+                path: None,
+                tab: None,
+                focus: None,
+                all: false,
+                force: false,
+                enabled: state.as_deref().map(|s| s == "on"),
             },
             RemoteFolderCommand::Push { host, path, force } => Request::RemoteFolder {
                 action: "push".into(),
@@ -6539,6 +6562,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: None,
                 all: false,
                 force: *force,
+                enabled: None,
             },
         },
         Command::Task(sub) => match sub {

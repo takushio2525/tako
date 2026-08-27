@@ -228,3 +228,193 @@ clamshell 閉 + 画面 OFF なので `screencapture` は**全面黒しか撮れ�
   `.body` は残るので、行として見せて手で救える）
 - 段階 3 の候補: 競合したときの**差分表示と 3 方向マージ**（いまは「読み直す」か
   「上書き」の二択）。リモート側のファイル作成・削除・リネーム（いまは読み書きだけ）
+
+---
+
+# 段階 3: ペインの `ssh` を自動検知する（#976 / #65 要件 1）
+
+> 2026-08-27。`feat/976-ssh-auto-detect` の作業記録。仕様の正は
+> `.agent/requirements.md` FR-3.24.3。
+
+## 11. 何が新規で、何を使い回したか
+
+基盤（`remote_fs` の SFTP 経路・ツリー・プレビュー・編集保存 #966）は完成済みだったので、
+新規は**検知**と**見た目の統合**の 2 つだけ。
+
+| 層 | 置いたもの |
+|---|---|
+| `tako_core::ssh_detect` | コマンド行 → 宛先（純関数。**両プラットフォームぶんを macOS からテストできる**） |
+| `tako_control::ssh_detect` | 「どのペインの配下か」+ **再走査の間引き** |
+| `tako-app::ssh_folders` | 追加してよいかの判断・background の接続確認・切断の見せ方 |
+| `dispatch::attach_remote_root` | `open` から**器づけだけ**を切り出し、自動追加と共有 |
+
+## 12. 検知の設計（推測ではなく既存の実測に乗せた）
+
+- **`ps` を増やさない**: 親子マップは `agents::process_parent_map` が既に 1 回だけ
+  採っていたので、同じ `ps` へ `command=` の列を足して argv も一緒に採る形へ変えた
+  （`capture_process_table`）。番犬（`コンソール窓を抑止していない子プロセス起動が
+  増えていない`）のベースラインが agents.rs = 1 のままで済む
+- **間引きの指紋は OSC 133**: 対話 `ssh` はフォアグラウンドのコマンドなので
+  `Idle → Running`（入った）/ `Running → Idle`（抜けた）が必ず出る。指紋 =
+  (ペイン集合, PTY 直下の子 pid, コマンド状態) にすると、**検知も切断も指紋の変化で拾え**、
+  ssh が生きている間・全ペインが idle の間は走査そのものが起きない
+- **見送る側に倒す**: 宛先を取り違えると別のマシンの中身をそのホスト名で見せてしまう。
+  `-p` / `-o Port=` / `-J` / `-W` / `-o ProxyJump=` / `-o ProxyCommand=` /
+  `-o Hostname=` / `ssh host <コマンド>` / `-N` / `-s` は全部見送り、
+  理由（`SkipReason` 7 種別・日英）を `auto` の応答と `persist.log` に残す。
+  `-l user` / `-o User=` だけは `user@host` へ**畳み込む**（見送るより忠実）
+- **`-N` を弾くのが効く場面**: tako 自身の ControlMaster（`ssh -M -N -f`）はペイン配下に
+  居ないが、ユーザーの `ssh -N -L 8080:…` はペイン配下に居る。転送だけの接続で
+  フォルダを開かない
+- **入れ子は外側**: `descendants_with_root` を幅優先にして、`ssh a` の中で `ssh b` した
+  ときに外側（このマシンから届く方）を採る
+
+## 13. 見た目の統合（#919 の独自形をやめた）
+
+| | #919（前） | #976（後） |
+|---|---|---|
+| 並び | リモートを**先頭へ hoist** | ローカルの後ろに普通に並ぶ |
+| ルート名 | `host: 末尾要素` | 末尾要素だけ（ローカルと同じ） |
+| アイコン | 地球（mauve） | フォルダ（accent。ローカルと同じ） |
+| ホスト名 | 名前に混ぜる | **行末のバッジ**（`SSH <host>`。絵文字なし = SVG マスク + テキスト） |
+| 切断 | 表示なし | 同じバッジが赤 + 「切断」（**行は消さない**） |
+
+`FileTree::add_remote_root` を `insert(0)` → `push` にしたので、リモートも
+**開いた順**に並ぶ（ローカルルートの「並んだ順」と同じ規則）。タブ側
+（`Tab::add_remote_folder` = layout.json の順）は触っていないので永続化は不変。
+
+## 14. 安全側の判断（実装で決めたこと）
+
+- **パスワードを聞きに行かない**: 接続は `ensure_master`（`BatchMode=yes`）のまま。
+  鍵・agent で入れない相手は理由を出して見送る。ただし**FIDO 鍵のタッチ要求は
+  BatchMode でも起こりうる**（ssh-agent 越しの通常運用では起きない）。気になるなら
+  `tako remote-folder auto off`
+- **試行は 1 エピソード 1 回**。失敗して繰り返し `ssh` を撃たない。抜けて入り直したら再試行
+- **同じホストのルートがそのタブにあれば何もしない**（明示経路と共存。「リモート接続…」の
+  隣に home が二重に並ばない）
+- **設定を切っても開いたルートは閉じない**（ユーザーのワークスペースなので勝手に消さない）
+- 自動処理の失敗は**画面を奪わない**（期限つき通知 + `persist.log`。エラー通知にすると
+  サイドバーを勝手に開いて居座る）
+
+## 15. 検証の手段（この機は画面が撮れない）
+
+- **セルフテスト項目 130**: プロセス表を `ProcessSnapshot::from_parts_for_test` で組み、
+  (a) オプトアウトで走査対象が空 (b) 検知して仕事が 1 件出る (c) 器づけ後に
+  **ローカルの後ろ**に並び名前に `host: ` が混ざらない (d) 同じホストは二重に並べない
+  (e) 切断でルートが消えず状態が出る (f) `auto` が照会と切替を返す
+- **visual-test `remote-tree`**: `TAKO_VISUAL_PIXEL: remote-badge …` に
+  `order_ok` / `badge_live`（mauve の実ピクセル）/ `badge_lost_red`（切断で赤へ）/
+  `rows_after_lost`（行が消えない）を出す
+- **実 SSH**: `TAKO_REMOTE_E2E_HOST=<host> cargo test -p tako-core --test remote_fs_e2e -- --ignored`
+  は基盤側。検知の通しは隔離 GUI + 実 `ssh` ペインで測る（下記 16）
+
+## 16. 実測（受け入れの証拠）
+
+### 実 SSH での通し（隔離インスタンス + 実ホスト = Windows 11 / PowerShell）
+
+隔離起動（`TAKO_ISOLATED=1` + 明示の data / discovery / tmux socket。**persist ON** =
+器つきの既定構成）で、CLI から `tako send --pane 1 "ssh <host>"` を打っただけの状態から:
+
+| 測ったもの | 実測 |
+|---|---|
+| 検知（`auto` の `sessions` に出る） | **5 秒** |
+| ツリーへ出る（`list` にルートが載る） | **12 秒** |
+| 自動追加されたルート | `<host>:/C:/Users/<user>`（Windows のホーム。sftp の初期 cwd） |
+| 中身 | 91 件（`list` の `entries`） |
+| 切断の検知（`exit` から） | **約 8 秒**（`ssh` 送信から 20 秒） |
+| 切断後のルート | **残る**（`state: loaded` / 91 件 / `sessions[].state: disconnected`） |
+| `persist.log` | `ssh 自動追加: <host>:/C:/Users/<user> （91 件・追加=true）` / `ssh 切断を検知: <host>` |
+
+`detection` は `pending`（起動直後・走査前）→ `active`（走査後）と動く。
+
+### 自動追加されたルートの操作感（スコープ 3。実 SSH）
+
+自動追加で出たルートの配下で、**展開 → プレビュー → 編集 → 保存**が #919 / #966 の経路
+そのままで通ることを実ホストで確認した（リモートには一時ファイルを 1 つ作り最後に消した）:
+
+| 段 | 実測 |
+|---|---|
+| 自動追加 | `AUTO_ROOT=/C:/Users/<user>`（**8 秒**） |
+| 展開（`ls`） | 一時ファイルが見える |
+| プレビュー（`open-file`） | `read_only: false` / `remote_path` / `mode: -rw-------` / `size: 17` |
+| 編集 → 保存（`edit apply` → `edit save`） | `remote: {state: "saved", conflict_checked: true, bytes: 31, pending_write: false}` |
+| リモートの実体 | `Get-Content` が編集後の内容を返す（`hello from 976 (edited by tako)`） |
+| 後片付け | 一時ファイルを削除し `Test-Path` = False |
+
+### アイドル時のコスト（受け入れ条件 6）
+
+`ps` を PATH で中継して**採取回数そのもの**を数えた（`ps -axo pid=,ppid=,command=` =
+`ProcessSnapshot` の採取だけを数える）。ペインはプロンプト待ち（OSC 133 = `idle`）:
+
+| 窓 | ProcessSnapshot の採取 | プロセスの CPU 時間（別 run・180 秒窓） |
+|---|---|---|
+| 自動追加 **ON** | **6 回 / 120 秒** | 2.60 秒（1.44%） |
+| 自動追加 **OFF** | **6 回 / 120 秒** | 2.50 秒（1.39%） |
+
+採取回数が**同数** = 検知由来の増加はゼロ（6 回は sleep_guard #779 と stale binary #772 の
+60 秒保険で、位相がずれて交互に出る既存分）。CPU の差 0.10 秒 / 180 秒（0.06 ポイント）は
+計測ノイズの範囲（ON の窓が先で起動直後の一時的な作業を含む。`ps` を 1 回も余分に
+起動していない事実と合わせて読む）。フレーム要求も増えない（`apply_ssh_scan` は
+`cx.notify()` を呼ばず、通知するのは実際に追加・切断した瞬間だけ）。
+
+### 見た目（実ピクセル。`TAKO_VISUAL_ONLY=remote-tree`）
+
+```
+TAKO_VISUAL_PIXEL: remote-badge order_ok=true local_y=254.0 remote_y=281.5
+  badge_live=547 badge_lost_red=619 badge_live_after_lost=60 rows_after_lost=6
+```
+
+- `order_ok=true` / `local_y=254.0` → `remote_y=281.5`: リモートルートが
+  **ローカルルートの 1 行下**に並ぶ（#919 は先頭へ hoist していた）
+- `badge_live=547`: ルート行に mauve のバッジが実際に描かれている
+- `badge_lost_red=619` / `badge_live_after_lost=60`: 切断でバッジが赤へ変わる
+- `rows_after_lost=6`: 行数は変わらない（**消さない**）
+
+切り出した画像は `TAKO_VISUAL_DUMP` で保存できる（ユーザー名が写るので**リポジトリ外**へ）。
+実際の絵は「ローカルの見出し（フォルダ名 + フォルダアイコン）の下に、同じ形の
+リモート見出し + 行末に `SSH <host>` バッジ」で、子の行はローカルと同じアイコン。
+
+### セルフテスト（項目 130）
+
+```
+TAKO_SELF_TEST_976: legacy=false targets(off/on)=0/6 jobs=1 live=true after_local=true
+  root_name="home" dup_jobs=0 rows_kept=true disconnected=true auto(on/off)=true/false sessions=true
+```
+
+`TAKO_APP_SELF_TEST_OK`（全項目完走）。skip 3 件は「ウィンドウが隠れて未描画」の既知。
+
+### 検出力（同一バイナリの A/B）
+
+| 壊した箇所 | 落ちる検査 | 出た値 |
+|---|---|---|
+| `TAKO_976_LEGACY=1`（検知しない） | 項目 130 (a) | `off=0 on=0` |
+| `TAKO_976_LEGACY=1`（`host: ` 付きの旧ルート名。項目 124 を A/B 対応にする前） | 項目 124 (b) | `root_like_local=false` |
+| ローカルルートを実在させないまま並びを測る（visual-test の場面不備） | `remote-badge` | `order_ok=false local_y=-1.0` |
+
+## 18. visual-test 全節の状況（main 由来の失敗を切り分けた）
+
+`TAKO_VISUAL_TEST=1`（全節）は **main でも** ちらつき節の
+「出力中のペインの外側は前の絵へ戻らない（#932）」で落ちる。同一 worktree で
+`git checkout origin/main -- crates/` して同じ節を回した A/B:
+
+| | 実測 |
+|---|---|
+| main（`origin/main` の crates） | `output-running … reverted_tiles=5 spots=[(320,0),(320,32),(256,64),(288,64),(320,64)]` → FAILED |
+| このブランチ | `output-running … reverted_tiles=7 spots=[(320,0),(352,0),(384,0),(384,32),(320,64),(352,64),(384,64)]` → FAILED |
+
+`spots` はどちらも**タブバーの帯**（y=0〜64）で、#945 の「走り始めのドット脈動」が
+反転タイルとして数えられている。件数の 5 / 7 は run ごとの揺れ（脈動の位相）で、
+このブランチの変更はタブバーに触っていない = **main 由来**。
+
+なお `TAKO_VISUAL_ONLY=flicker` 単独では `idle-4pane` は `distinct=1 changed=0`
+（きれい）で、全節通しのときだけ汚れる: 前の節が残したペイン（7 枚）と出力が
+「静止画面」の前提を崩している。これも main と同じ形。
+
+## 17. 未検証・既知の限界
+
+- **Windows は自動検知が働かない**: 境界（`platform::procinfo`）が実行ファイル名しか
+  返さないので argv が無い。`auto` の応答は `detection: "unavailable"` を返すので
+  「検知していない」と混同しない。対応マトリクスの注記へ明記済み
+- **リモート側の cwd 追従は範囲外**（#65 要件 2）。開くのは常に sftp の初期 cwd
+- シェル統合が効いていないペイン（`CommandState::Unknown`）は指紋が動かないので
+  検知が最大 60 秒遅れる（保険の間隔）

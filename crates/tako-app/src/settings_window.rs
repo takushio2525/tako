@@ -2655,6 +2655,8 @@ impl SettingsWindow {
     fn render_remote_tab(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let status = self.status.remote.clone();
+        // #976: ペインの ssh 検知による自動追加（リモートデーモンとは別の機能）
+        let ssh_auto_folders = self.settings.ssh_auto_folders;
         let running = status
             .as_ref()
             .and_then(|v| v.get("running"))
@@ -2677,6 +2679,32 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap_1()
+            // #976: ツリー側（SSH フォルダの自動追加）。CLI / MCP の
+            // `remote-folder auto` と同じ dispatch を通す
+            .child(self.section(txt::remote_folders_header()))
+            .child(self.row(
+                txt::label_ssh_auto_folders(),
+                txt::desc_ssh_auto_folders(),
+                self.toggle(
+                    "ssh-auto-folders",
+                    ssh_auto_folders,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::RemoteFolder {
+                                action: "auto".into(),
+                                host: None,
+                                path: None,
+                                tab: None,
+                                focus: None,
+                                all: false,
+                                force: false,
+                                enabled: Some(!ssh_auto_folders),
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
             .child(
                 div()
                     .flex()

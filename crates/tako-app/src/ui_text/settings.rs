@@ -793,6 +793,23 @@ pub fn remote_daemon_header() -> &'static str {
     tr!("リモートデーモン", "Remote daemon")
 }
 
+/// #976: ペインの ssh 検知によるリモートフォルダの自動追加
+pub fn label_ssh_auto_folders() -> &'static str {
+    tr!("SSH フォルダの自動追加", "Auto-add SSH folders")
+}
+
+pub fn desc_ssh_auto_folders() -> &'static str {
+    tr!(
+        "ペインで ssh に入ったらそのホストのフォルダをツリーへ出す（切断しても消さない）",
+        "When a pane enters ssh, show that host's folder in the tree (kept even after disconnect)"
+    )
+}
+
+/// 自動追加の節（リモートデーモンとは別の話なので見出しを分ける）
+pub fn remote_folders_header() -> &'static str {
+    tr!("リモートフォルダ", "Remote folders")
+}
+
 pub fn remote_status_label() -> &'static str {
     tr!("状態", "Status")
 }
@@ -1309,6 +1326,10 @@ mod tests {
                 desc_auto_rename().into(),
                 label_port_detect().into(),
                 desc_port_detect().into(),
+                // #976: SSH フォルダの自動追加（リモートタブ）
+                label_ssh_auto_folders().into(),
+                desc_ssh_auto_folders().into(),
+                remote_folders_header().into(),
                 label_autosuggest().into(),
                 desc_autosuggest().into(),
                 label_autosuggest_tab().into(),

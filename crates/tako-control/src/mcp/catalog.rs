@@ -2922,13 +2922,16 @@ pub fn tools() -> Vec<Value> {
                 mode / mtime で書けるかが分かる。保存は tako_preview_save）/ ssh-pane = そのフォルダで\
                 SSH ペインを開く / pending = リモートへ押し出せていない保存の一覧（切断中の保存は\
                 ここに残るので無言で消えない）/ push = 押し出せていない保存の再試行\
-                （force=true で競合を承知のうえ上書き）。GUI の「リモートからフォルダを開く」と 1:1。",
+                （force=true で競合を承知のうえ上書き）/ auto = ペインの ssh を検知した自動追加の\
+                状態を返す（enabled=true/false で切替。#976。ユーザーがペインで `ssh <host>` に\
+                入ると、そのホストのホームがツリーへ自動で並ぶ。検知した接続の生死・見送った\
+                理由もここで読める）。GUI の「リモートからフォルダを開く」と 1:1。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "close", "list", "ls", "open-file", "ssh-pane", "pending", "push"],
+                        "enum": ["open", "close", "list", "ls", "open-file", "ssh-pane", "pending", "push", "auto"],
                         "description": "操作の種類",
                     },
                     "host": {
@@ -2954,6 +2957,10 @@ pub fn tools() -> Vec<Value> {
                     "force": {
                         "type": "boolean",
                         "description": "push で競合（開いた時点からリモートが変わっている）を承知のうえ上書きする（#966）",
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "auto で自動追加の有効・無効を切り替える（省略で現在値の照会だけ。#976）",
                     },
                 },
                 "required": ["action"],

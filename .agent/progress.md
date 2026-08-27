@@ -3419,3 +3419,13 @@
   旧経路へ戻す）で FAILED を実測
 - 関連コミット: PR #996（`Refs #981`）
 - 次: #983（非 claude agent の spawn が無言で死ぬ）
+## 2026-08-27（#976: ペインの ssh 検知でリモートフォルダを自動追加 + ツリーの見た目統合）
+- 検知は 3 層（`tako_core::ssh_detect` = 宛先の純関数 / `tako_control::ssh_detect` = ペイン配下の
+  判定と間引き / `tako-app::ssh_folders` = 追加判断・background 接続・切断表示）。**取り違える形は
+  全部見送り**（`-p` / `-J` / `-o Hostname=` / `ssh host <cmd>` / `-N` 等）理由を日英で残す
+- 指紋は OSC 133 + 子 pid で、採取は #772 / #779 の `ProcessSnapshot` へ相乗り。実測: アイドル
+  120 秒の `ps` 採取が **ON 6 / OFF 6 = 同数**（増加ゼロ）。実 SSH は検知 5 秒・ツリー表示 12 秒
+- 見た目は #919 の独自形（先頭 hoist + `host: 名前` + 地球）をやめ、ローカルと同じ形 +
+  行末バッジ（`SSH <host>`・切断で赤）へ。実ピクセルで `order_ok=true` / `badge_live=547`
+- 関連: PR #998（`Refs #976`）。セルフテスト項目 130 新設で `TAKO_APP_SELF_TEST_OK`。A/B は `TAKO_976_LEGACY=1`
+- 次: ユーザー体感の確認（close は master 判断）。Windows は argv が採れず自動検知は未対応（明示経路のみ）

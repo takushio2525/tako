@@ -232,7 +232,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_remote_messages` | 未対応 / 未実測 | remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了 | 実機実測: #937 の Windows 11 実測: CLI が <SESSION_ID> を要求するところまで確認。実機の claude が未認証で会話を作れないため本体は未実測（デーモン側は #971 でブロック） |
 | `tako_remote_scrollback` | 未対応 / 未実測 | スクロールバックの取得が器の境界を通らず psmux で解決できない（セッション名でもペイン ID でも `no server running` になる。#972） | 実機実測: #937 の Windows 11 実測: セッション名でもペイン ID でも `psmux: no server running on session '<socket>__<target>'` になる。同じソケットへ境界経由で叩く `tako tmux list` は成功する（#972） |
 | `tako_open_remote` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako open-in remote <host>` が新タブで接続前バナーを出し、到達不能なホストでもタブを閉じず ssh exit 255 の理由 + 次の一手 + 入力待ちまで出す（#919 の契約） |
-| `tako_remote_folder` | 未対応 / 未実測 | 同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測（ホスト解決の分類は実機テストで失敗中。#930） | 実機テスト: セルフテスト項目 124 はバックエンドを呼ばない（器だけの検証）。実 SSH の remote_fs_e2e は実機で 1 件失敗中（#930） |
+| `tako_remote_folder` | 未対応 / 未実測 | 同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測（ホスト解決の分類は実機テストで失敗中。#930）。ペインの ssh を検知した自動追加（#976）は、プロセスのコマンド行を採れないので働かない（明示的に開く経路だけが使える） | 実機テスト: セルフテスト項目 124 はバックエンドを呼ばない（器だけの検証）。実 SSH の remote_fs_e2e は実機で 1 件失敗中（#930） |
 | `tako_ssh_hosts` | 対応 | — | 実機テスト: ~/.ssh/config の解析は純粋関数で、remote_fs / ssh_hosts の単体が実機で緑（ホーム解決は #870 で一本化） |
 
 ## アップデート

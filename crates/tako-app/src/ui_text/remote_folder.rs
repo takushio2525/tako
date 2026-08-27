@@ -90,6 +90,42 @@ pub fn row_empty() -> &'static str {
     tr!("（空のフォルダ）", "(empty folder)")
 }
 
+// --- SSH バッジ・自動追加（#976） -------------------------------------------
+
+/// リモートルート行のバッジの見出し。**言語に依らない**ので `pub const`
+/// （`.agent/conventions.md`「UI 文字列の i18n」の但し書き）。
+/// ホスト名はこの後ろに素で並べる = 絵文字なしで「SSH のフォルダ」が読める
+pub const BADGE_LABEL: &str = "SSH";
+
+/// 検知していた ssh セッションが消えたルートに出す状態（**行は消さない**）
+pub fn badge_disconnected() -> &'static str {
+    tr!("切断", "offline")
+}
+
+/// ペインの ssh を検知して自動で開いたときの通知（#976）
+pub fn auto_added(label: &str) -> String {
+    tr!(
+        format!("SSH を検知: {label} をツリーへ追加しました"),
+        format!("Detected SSH: added {label} to the tree")
+    )
+}
+
+/// 検知はしたが自動で開けなかったときの通知（理由つき。黙って何もしない、をしない）
+pub fn auto_skipped(host: &str, reason: &str) -> String {
+    tr!(
+        format!("{host}: 自動追加を見送りました（{reason}）"),
+        format!("{host}: skipped auto-add ({reason})")
+    )
+}
+
+/// 切断を検知したときの通知
+pub fn auto_disconnected(host: &str) -> String {
+    tr!(
+        format!("{host}: SSH が切断されました（フォルダは残します）"),
+        format!("{host}: SSH disconnected (the folder stays in the tree)")
+    )
+}
+
 // --- 右クリックメニュー -----------------------------------------------------
 
 pub fn menu_copy_remote_path() -> &'static str {
@@ -144,4 +180,43 @@ pub fn preview_push_pending() -> &'static str {
 /// プレビューヘッダに出す「どこのファイルか」
 pub fn preview_origin(label: &str) -> String {
     tr!(format!("リモート: {label}"), format!("Remote: {label}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 日英併記かつ絵文字なし() {
+        crate::ui_text::tests_support::check_ja_en(|| {
+            vec![
+                menu_open_remote_folder().into(),
+                pick_host_placeholder().into(),
+                no_hosts().into(),
+                pick_dir_placeholder().into(),
+                open_this_folder("/srv/app"),
+                parent_dir().into(),
+                connecting("host"),
+                connected("host", "/srv/app"),
+                opened("host:/srv/app"),
+                closed("host:/srv/app"),
+                row_loading().into(),
+                row_empty().into(),
+                // #976: SSH バッジと自動追加の通知
+                badge_disconnected().into(),
+                auto_added("host:/srv/app"),
+                auto_skipped("host", "reason"),
+                auto_disconnected("host"),
+                menu_copy_remote_path().into(),
+                menu_open_ssh_pane().into(),
+                menu_reload().into(),
+                menu_close_remote_root().into(),
+                preview_read_only().into(),
+                preview_pushing().into(),
+                preview_pushed("host:/srv/app"),
+                preview_push_pending().into(),
+                preview_origin("host:/srv/app"),
+            ]
+        });
+    }
 }
