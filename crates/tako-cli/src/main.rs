@@ -1950,6 +1950,11 @@ enum ProfilesCommand {
         /// limit_resume を解除して既定（無効）へ戻す（#822）
         #[arg(long)]
         clear_limit_resume: bool,
+        /// codex（master / worker）のサンドボックスと承認を丸ごと外して起動することを
+        /// 許可する（既定 false。#981。true にすると codex は確認なしでコマンドを実行し、
+        /// 書き込み先もネットワークも制限されなくなる）
+        #[arg(long)]
+        bypass_sandbox: Option<bool>,
     },
 }
 
@@ -3241,7 +3246,7 @@ fn check_mcp_health_warning() {
 /// master / solo 起動時の env とアカウントの可視化（Issue #500 / #547）。
 /// 値はマスクし、キー名と解決後の config dir だけを出す。
 /// アカウント解決の失敗は build_master_cmd が起動前に Err にするので、ここは表示だけ
-fn print_master_env(profile: &tako_control::orchestrator::Profile) {
+fn print_master_env(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
     use tako_control::orchestrator;
     if !profile.env.is_empty() {
         let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
@@ -3263,6 +3268,29 @@ fn print_master_env(profile: &tako_control::orchestrator::Profile) {
             }
         }
         Err(e) => eprintln!("warning: {e}"),
+    }
+    print_sandbox_state(profile, profile_name);
+}
+
+/// codex 系 master / solo のサンドボックス状態を 1 行で出す（Issue #981）。
+/// **外れているときも外れていないときも出す**（承認プロンプトで止まったとき、
+/// 画面に理由が残っていなければ「黙って動かない」に見えるため）
+fn print_sandbox_state(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
+    use tako_control::orchestrator;
+    // codex 以外はサンドボックスの概念が無い（claude / agy にこのフラグは存在しない）
+    if !matches!(
+        profile.resolve_master_agent(),
+        Ok(orchestrator::WorkerAgent::Codex)
+    ) {
+        return;
+    }
+    let enabled = profile.bypass_sandbox || orchestrator::legacy_unconditional_bypass();
+    eprintln!("{}", orchestrator::sandbox_bypass_line(enabled).text());
+    if !enabled {
+        eprintln!(
+            "  外す場合: {}",
+            orchestrator::sandbox_bypass_hint_command(profile_name)
+        );
     }
 }
 
@@ -3406,7 +3434,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
     eprintln!("worker モデルポリシー: {policy_desc}");
     // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
-    print_master_env(&profile);
+    print_master_env(&profile, profile_name);
     if let Some(ref projects) = profile.projects {
         eprintln!("projects 制限: {}", projects.join(", "));
     }
@@ -3563,7 +3591,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     );
     eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
     // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
-    print_master_env(&profile);
+    print_master_env(&profile, profile_name);
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
@@ -3942,6 +3970,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_auto_handoff,
             limit_resume,
             clear_limit_resume,
+            bypass_sandbox,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -3980,6 +4009,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             clear_auto_handoff: *clear_auto_handoff,
             limit_resume: *limit_resume,
             clear_limit_resume: *clear_limit_resume,
+            bypass_sandbox: *bypass_sandbox,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;

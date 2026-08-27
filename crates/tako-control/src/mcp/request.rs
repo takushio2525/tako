@@ -552,6 +552,7 @@ pub(super) fn build_request(
             clear_auto_handoff: bool_arg(args, "clear_auto_handoff")?.unwrap_or(false),
             limit_resume: bool_arg(args, "limit_resume")?,
             clear_limit_resume: bool_arg(args, "clear_limit_resume")?.unwrap_or(false),
+            bypass_sandbox: bool_arg(args, "bypass_sandbox")?,
         },
         "tako_orchestrator_accounts" => Request::OrchestratorAccounts {
             action: str_arg(args, "action")?.ok_or("action を指定する")?,

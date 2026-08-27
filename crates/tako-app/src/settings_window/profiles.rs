@@ -498,6 +498,7 @@ impl SettingsWindow {
             clear_auto_handoff: false,
             limit_resume: None,
             clear_limit_resume: false,
+            bypass_sandbox: None,
         };
         match self.dispatch(request, cx) {
             Ok(_) => {
@@ -975,6 +976,7 @@ impl SettingsWindow {
             .unwrap_or(u64::from(tako_core::handoff::CTX_THRESHOLD_DEFAULT));
         let auto = detail["resolved_auto_handoff"].as_bool().unwrap_or(true);
         let limit_resume = detail["resolved_limit_resume"].as_bool().unwrap_or(false);
+        let bypass_sandbox = detail["bypass_sandbox"].as_bool().unwrap_or(false);
         div()
             .flex()
             .flex_col()
@@ -1010,6 +1012,19 @@ impl SettingsWindow {
                     limit_resume,
                     cx.listener(move |this, _, _, cx| {
                         this.set_profile(|p| p.limit_resume = Some(!limit_resume), cx);
+                    }),
+                ),
+            ))
+            // codex のサンドボックス解除（#981）。既定 OFF = 安全側で、
+            // ここを ON にしたときだけ --dangerously-bypass-approvals-and-sandbox が付く
+            .child(self.row(
+                txt::prof_label_bypass_sandbox(),
+                txt::desc_prof_bypass_sandbox(),
+                self.toggle(
+                    "prof-bypass-sandbox",
+                    bypass_sandbox,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_profile(|p| p.bypass_sandbox = Some(!bypass_sandbox), cx);
                     }),
                 ),
             ))
@@ -1475,6 +1490,7 @@ fn profiles_request(action: &str, kind: ProfileKind, name: Option<&str>) -> Requ
         clear_auto_handoff: false,
         limit_resume: None,
         clear_limit_resume: false,
+        bypass_sandbox: None,
     }
 }
 
@@ -1515,6 +1531,7 @@ struct ProfilesSet {
     clear_auto_handoff: bool,
     limit_resume: Option<bool>,
     clear_limit_resume: bool,
+    bypass_sandbox: Option<bool>,
 }
 
 impl ProfilesSet {
@@ -1557,6 +1574,7 @@ impl ProfilesSet {
             clear_auto_handoff: self.clear_auto_handoff,
             limit_resume: self.limit_resume,
             clear_limit_resume: self.clear_limit_resume,
+            bypass_sandbox: self.bypass_sandbox,
         }
     }
 }

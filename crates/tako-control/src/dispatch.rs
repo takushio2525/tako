@@ -2672,6 +2672,7 @@ fn dispatch_inner(
             clear_auto_handoff,
             limit_resume,
             clear_limit_resume,
+            bypass_sandbox,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2710,6 +2711,7 @@ fn dispatch_inner(
             clear_auto_handoff,
             limit_resume,
             clear_limit_resume,
+            bypass_sandbox,
         }),
 
         // #504: アカウントレジストリの CRUD
@@ -5199,6 +5201,9 @@ pub struct ProfilesParams {
     /// spawn した worker で利用上限後の自動復帰を既定 ON にするか（Issue #822）
     pub limit_resume: Option<bool>,
     pub clear_limit_resume: bool,
+    /// codex の `--dangerously-bypass-approvals-and-sandbox` を許可するか（Issue #981）。
+    /// bool 1 つで表せる方針なので clear は要らない（false が「既定へ戻す」）
+    pub bypass_sandbox: Option<bool>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -5293,6 +5298,29 @@ fn profile_to_json(
         let mut warnings: Vec<Value> = v["warnings"].as_array().cloned().unwrap_or_default();
         warnings.push(json!(
             "limit_resume は spawn した worker ペインへ適用される設定ですが、solo プロファイルは worker を spawn しません（この設定は効きません）。\n  ペイン単位で有効にするには `tako limit-resume on --pane <id>` を使ってください"
+        ));
+        v["warnings"] = Value::Array(warnings);
+    }
+    // codex のサンドボックス解除（#981）。値そのものは常に返す（既定 false でも
+    // 「今どうなっているか」が読めるようにする = 安全に関わる設定なので隠さない）
+    v["bypass_sandbox"] = json!(profile.bypass_sandbox);
+    // codex worker の skip_permissions を頼んでいるのにサンドボックス解除が無いと
+    // フラグが 1 つも付かない（codex は両者が同一フラグ）。効かない設定を黙って
+    // 抱えさせないため警告で見せる
+    let codex_skip_requested = profile
+        .worker_agents
+        .get(orchestrator::WorkerAgent::Codex.as_str())
+        .map(|c| c.skip_permissions)
+        .unwrap_or_else(|| orchestrator::WorkerAgent::Codex.default_skip_permissions());
+    let codex_in_use = profile.worker_agent.as_deref() == Some("codex")
+        || profile.master_agent.as_deref() == Some("codex")
+        || profile
+            .worker_agents
+            .contains_key(orchestrator::WorkerAgent::Codex.as_str());
+    if codex_in_use && codex_skip_requested && !profile.bypass_sandbox {
+        let mut warnings: Vec<Value> = v["warnings"].as_array().cloned().unwrap_or_default();
+        warnings.push(json!(
+            "codex は承認スキップとサンドボックス解除が同じフラグ（--dangerously-bypass-approvals-and-sandbox）なので、bypass_sandbox が false のあいだ skip_permissions は効きません（コマンド実行に承認プロンプトが出ます）。\n  外す場合は `--bypass-sandbox true`（サンドボックスと承認が両方無効になります）"
         ));
         v["warnings"] = Value::Array(warnings);
     }
@@ -5596,6 +5624,10 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     profile.limit_resume = Some(v);
                 } else if params.clear_limit_resume {
                     profile.limit_resume = None;
+                }
+                // codex のサンドボックス解除（#981）
+                if let Some(v) = params.bypass_sandbox {
+                    profile.bypass_sandbox = v;
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
@@ -7161,6 +7193,7 @@ fn dispatch_git_resolve_agent(
         model: launch.model.as_deref(),
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
+        allow_sandbox_bypass: launch.allow_sandbox_bypass,
         extra_args: &launch.extra_args,
         env: &profile_env,
     });
@@ -7388,6 +7421,7 @@ fn dispatch_orchestrator_spawn(
         model: launch.model.as_deref(),
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
+        allow_sandbox_bypass: launch.allow_sandbox_bypass,
         extra_args: &launch.extra_args,
         env: &profile_env,
     });
@@ -15486,6 +15520,70 @@ mod tests {
             .expect_err("範囲外は拒否する");
             assert!(err.to_string().contains("50〜60"), "{err}");
         }
+    }
+
+    /// #981: サンドボックス解除は CLI / MCP / GUI が同じ dispatch を通り、
+    /// 既定は false・set した値が show へ往復する（開発不変条件の 1:1）
+    #[test]
+    fn issue981_サンドボックス解除は既定offで往復する() {
+        let profile = "_tako_981_";
+        let show = || {
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "show".into(),
+                name: Some(profile.into()),
+                ..Default::default()
+            })
+            .expect("show は成功する")
+        };
+        let set = |bypass: Option<bool>, master_agent: Option<String>| {
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                bypass_sandbox: bypass,
+                master_agent,
+                ..Default::default()
+            })
+            .expect("set は成功する")
+        };
+
+        // 作った直後は false（既定が安全側）。値は常に応答へ載る
+        set(None, Some("codex".into()));
+        assert_eq!(show()["bypass_sandbox"].as_bool(), Some(false));
+        // codex を使うのに解除していないと「skip_permissions が効かない」旨の警告が出る
+        let warnings = show()["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|w| w.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            warnings.contains("bypass_sandbox"),
+            "効かない設定を黙って抱えさせない: {warnings}"
+        );
+
+        // 明示 opt-in → 往復する（ファイルにも書かれる）
+        assert_eq!(
+            set(Some(true), None)["bypass_sandbox"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(show()["bypass_sandbox"].as_bool(), Some(true));
+        let path = show()["path"].as_str().expect("path が返る").to_string();
+        assert!(std::fs::read_to_string(&path)
+            .expect("読める")
+            .contains("bypass_sandbox: true"));
+        // false へ戻せる（clear は要らない = bool 1 つで表せる方針）
+        assert_eq!(
+            set(Some(false), None)["bypass_sandbox"].as_bool(),
+            Some(false)
+        );
+
+        let _ = dispatch_orchestrator_profiles(ProfilesParams {
+            action: "delete".into(),
+            name: Some(profile.into()),
+            ..Default::default()
+        });
     }
 
     /// #822: プロファイルの limit_resume が spawn 先の worker ペインへ適用される。

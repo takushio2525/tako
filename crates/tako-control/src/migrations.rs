@@ -139,23 +139,43 @@ fn detect_version_field(text: &str) -> u32 {
     1
 }
 
-/// プロファイルの世代。旧既定値 `claude-opus-4-6[1m]` が残っていれば v1（Issue #27）
+/// プロファイルの世代。
+///
+/// - v1: 旧既定値 `claude-opus-4-6[1m]` が残っている（Issue #27）
+/// - v2: `bypass_sandbox` を**書いていない** = codex のサンドボックス解除が
+///   無条件だった頃に作られたファイル（Issue #981）
+/// - v3: 現在
+///
+/// v2 の判定に「キーの有無」を使えるのは、`Profile::bypass_sandbox` に
+/// `skip_serializing_if` を付けていない（= 新しく書いたファイルには必ず載る）から。
+/// 外部の記録ではなく**内容だけ**で世代が決まるので冪等性が保てる
 fn detect_profile(text: &str) -> u32 {
     let Ok(profile) = serde_yaml::from_str::<crate::orchestrator::Profile>(text) else {
         // 読めないものは validate 側が退避して申告する。版数判定では触らない扱いにする
         return PROFILE_VERSION;
     };
     if profile.model.as_deref() == Some(crate::orchestrator::LEGACY_DEFAULT_MODEL) {
-        1
-    } else {
-        PROFILE_VERSION
+        return 1;
     }
+    if !has_top_level_key(text, "bypass_sandbox") {
+        return 2;
+    }
+    PROFILE_VERSION
+}
+
+/// YAML の最上位にそのキーがあるか。**値ではなくキーの有無**を見る
+/// （`bypass_sandbox: false` と「書いていない」を区別する必要がある）
+fn has_top_level_key(text: &str, key: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(text)
+        .ok()
+        .and_then(|v| v.get(key).cloned())
+        .is_some()
 }
 
 // --- 変換手順 ----------------------------------------------------------------
 
 /// プロファイルの現在の世代
-const PROFILE_VERSION: u32 = 2;
+const PROFILE_VERSION: u32 = 3;
 
 const PROFILE_V1_TO_V2: Note = Note::new(
     "旧既定モデル claude-opus-4-6[1m] の指定を外す（Pro プランで master が起動できないため。#27）",
@@ -195,14 +215,65 @@ fn strip_legacy_default_model(text: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("YAML の再構成に失敗: {e}"))
 }
 
-const PROFILE_STEPS: &[Step] = &[Step {
-    from: 1,
-    to: 2,
-    describe: PROFILE_V1_TO_V2,
-    // 移行後に利用者が自分で [1m] を選び直したら、それは意図された選択なので触らない（#67）
-    once: true,
-    apply: strip_legacy_default_model,
-}];
+const PROFILE_V2_TO_V3: Note = Note::new(
+    "codex のサンドボックス解除が無条件だった頃の挙動を保つため bypass_sandbox: true を明示する（新規プロファイルは安全側の false。#981）",
+    "Pin bypass_sandbox: true so the codex sandbox bypass keeps behaving as it did when it was unconditional (new profiles default to the safe false; #981)",
+);
+
+/// #981: 既存プロファイルへ `bypass_sandbox: true` を明示する。
+///
+/// 既定を安全側（バイパスしない）へ変えると、今まで動いていた codex master /
+/// codex worker が承認プロンプトで止まる。**既存ユーザーの体験は変えない**ため、
+/// この項目が無いファイル（= 変更前に作られたファイル）には従来と同じ挙動になる値を書く
+fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
+    if has_top_level_key(text, "bypass_sandbox") {
+        // 既に明示されている = 二度目。冪等（何もしない）
+        return Ok(None);
+    }
+    // 読めることを確かめてから触る（読めないものは validate 側が退避する）
+    serde_yaml::from_str::<crate::orchestrator::Profile>(text)
+        .map_err(|e| format!("プロファイルとして読めない: {e}"))?;
+    // **行の追記で済ませる**（コメントも書式もそのまま残す。serde で作り直すと
+    // 利用者が書いたコメントが消える）
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("bypass_sandbox: true\n");
+    if serde_yaml::from_str::<crate::orchestrator::Profile>(&out).is_err() {
+        // 追記で読めなくなる書式（フロー形式など）は serde で作り直す
+        let mut rebuilt: crate::orchestrator::Profile =
+            serde_yaml::from_str(text).map_err(|e| format!("プロファイルとして読めない: {e}"))?;
+        rebuilt.bypass_sandbox = true;
+        return serde_yaml::to_string(&rebuilt)
+            .map(Some)
+            .map_err(|e| format!("YAML の再構成に失敗: {e}"));
+    }
+    Ok(Some(out))
+}
+
+const PROFILE_STEPS: &[Step] = &[
+    Step {
+        from: 1,
+        to: 2,
+        describe: PROFILE_V1_TO_V2,
+        // 移行後に利用者が自分で [1m] を選び直したら、それは意図された選択なので触らない（#67）
+        once: true,
+        apply: strip_legacy_default_model,
+    },
+    Step {
+        from: 2,
+        to: 3,
+        describe: PROFILE_V2_TO_V3,
+        // once にしない。理由は 2 つある:
+        // ① 利用者が `--bypass-sandbox false` で戻すと**キーは残る**（v3 のまま）ので
+        //    再適用されない = once の目的（利用者の選択を尊重）は detect 側で足りている
+        // ② `once_markers`（#27 の `.backup-1m`）は from を問わず「一度当たった」と
+        //    答えるので、#27 を通った古い利用者だけこの手順が飛ばされてしまう
+        once: false,
+        apply: pin_sandbox_bypass,
+    },
+];
 
 // --- 登録簿 ------------------------------------------------------------------
 
@@ -245,6 +316,20 @@ const fn versioned(id: SchemaId, validate: Option<migration::Validator>) -> Sche
     }
 }
 
+/// プロファイル（master / solo）の登録。同じ `Profile` 型なので世代も手順も共通
+const fn profile_spec(id: SchemaId) -> SchemaSpec {
+    SchemaSpec {
+        id,
+        target_version: PROFILE_VERSION,
+        detect: detect_profile,
+        steps: PROFILE_STEPS,
+        // #916 の機構より前に手書きされていた移行（#27）が残した印
+        once_markers: &[".backup-1m"],
+        validate: Some(validate_profile),
+        preserve_unreadable: true,
+    }
+}
+
 /// 全種別の登録。**新しい永続ファイルを足したらここへ 1 行**
 pub const SPECS: &[SchemaSpec] = &[
     pristine(SchemaId::Settings, Some(validate_settings)),
@@ -263,17 +348,10 @@ pub const SPECS: &[SchemaSpec] = &[
     ),
     pristine(SchemaId::Projects, Some(validate_projects)),
     pristine(SchemaId::Accounts, Some(validate_accounts)),
-    SchemaSpec {
-        id: SchemaId::Profiles,
-        target_version: PROFILE_VERSION,
-        detect: detect_profile,
-        steps: PROFILE_STEPS,
-        // #916 の機構より前に手書きされていた移行（#27）が残した印
-        once_markers: &[".backup-1m"],
-        validate: Some(validate_profile),
-        preserve_unreadable: true,
-    },
-    pristine(SchemaId::SoloProfiles, Some(validate_profile)),
+    profile_spec(SchemaId::Profiles),
+    // solo プロファイルも同じ `Profile` 型で、`master_agent: codex` を持てる
+    // （`tako solo` は build_master_cmd を通る）。#981 の移行は solo にも要る
+    profile_spec(SchemaId::SoloProfiles),
     pristine(SchemaId::Ledger, Some(validate_ledger)),
     // 引き継ぎ（#915）は「プロファイル単位の 1 ファイル」から
     // 「プロジェクト単位の複数ファイル」への**分割**移行なので、テキスト置換の
@@ -882,11 +960,99 @@ mod tests {
     }
 
     #[test]
-    fn 旧既定モデルのプロファイルはv1と判定する() {
+    fn プロファイルの世代は内容だけで決まる() {
+        // v1: 旧既定モデルが残っている（#27）
         let legacy = format!("model: {}\n", crate::orchestrator::LEGACY_DEFAULT_MODEL);
         assert_eq!(detect_profile(&legacy), 1);
-        assert_eq!(detect_profile("model: claude-sonnet-5\n"), PROFILE_VERSION);
-        assert_eq!(detect_profile("effort: high\n"), PROFILE_VERSION);
+        // v2: bypass_sandbox を書いていない = #981 より前に作られたファイル
+        assert_eq!(detect_profile("model: claude-sonnet-5\n"), 2);
+        assert_eq!(detect_profile("effort: high\n"), 2);
+        // v3: 明示されている（false でも「書いてある」= 現行世代）
+        assert_eq!(
+            detect_profile("effort: high\nbypass_sandbox: false\n"),
+            PROFILE_VERSION
+        );
+        assert_eq!(
+            detect_profile("effort: high\nbypass_sandbox: true\n"),
+            PROFILE_VERSION
+        );
+    }
+
+    /// 手書きのテンプレートも現行世代でなければならない。
+    /// **実測で踏んだ**: `ensure_defaults` の default.yaml は serde ではなく
+    /// テンプレート文字列なので、`bypass_sandbox` を書き忘れると新規インストールが
+    /// v2 と判定され、移行が `true`（= 危険な旧既定）を書き込んでしまう（#981）
+    #[test]
+    fn 手書きのプロファイルテンプレートは現行世代である() {
+        for (label, text) in [
+            ("master", crate::orchestrator::DEFAULT_PROFILE_YAML),
+            ("solo", crate::orchestrator::SOLO_DEFAULT_PROFILE_YAML),
+        ] {
+            assert_eq!(
+                detect_profile(text),
+                PROFILE_VERSION,
+                "{label} のテンプレートが移行対象になっている（新規インストールへ移行が当たる）"
+            );
+            assert_eq!(
+                migration::migrate_text(profiles_spec(), text).expect("読める"),
+                None,
+                "{label}: 生成直後のファイルを書き換えてはいけない"
+            );
+        }
+    }
+
+    /// #981 の核心: **新しく作ったプロファイルへ true を書き込まない**
+    /// （`Profile::default()` を保存したファイルは既に v3 なので移行対象外）
+    #[test]
+    fn 新規プロファイルは移行対象にならない() {
+        let yaml = serde_yaml::to_string(&crate::orchestrator::Profile::default()).expect("書ける");
+        assert!(
+            yaml.contains("bypass_sandbox: false"),
+            "新規プロファイルは安全側の値を明示する: {yaml}"
+        );
+        assert_eq!(detect_profile(&yaml), PROFILE_VERSION);
+        assert_eq!(pin_sandbox_bypass(&yaml).expect("成功"), None, "触らない");
+    }
+
+    /// #981 の移行: 既存ファイル（キーが無い）へ true を書き、コメントと書式を残す
+    #[test]
+    fn 既存プロファイルにはbypass_sandboxのtrueが明示される() {
+        let text = "# ユーザーのコメント\nmaster_agent: codex\neffort: high\n";
+        let out = pin_sandbox_bypass(text).expect("成功").expect("変わる");
+        assert!(out.contains("# ユーザーのコメント"), "{out}");
+        assert!(out.contains("master_agent: codex"), "{out}");
+        assert!(out.contains("bypass_sandbox: true"), "{out}");
+        let p: crate::orchestrator::Profile = serde_yaml::from_str(&out).expect("読める");
+        assert!(p.bypass_sandbox, "移行後は従来と同じ挙動になる");
+        // 冪等
+        assert_eq!(pin_sandbox_bypass(&out).expect("成功"), None);
+        // 利用者が false へ戻したら尊重する（キーは残るので再適用されない）
+        let disabled = out.replace("bypass_sandbox: true", "bypass_sandbox: false");
+        assert_eq!(detect_profile(&disabled), PROFILE_VERSION);
+        assert_eq!(pin_sandbox_bypass(&disabled).expect("成功"), None);
+    }
+
+    #[test]
+    fn bypass_sandboxの明示はフロー形式でも通る() {
+        let out = pin_sandbox_bypass("{effort: high, master_agent: codex}\n")
+            .expect("成功")
+            .expect("変わる");
+        let p: crate::orchestrator::Profile = serde_yaml::from_str(&out).expect("読める");
+        assert!(p.bypass_sandbox);
+        assert_eq!(p.effort, "high");
+    }
+
+    /// solo プロファイルも同じ型・同じ世代なので同じ手順が当たる（#981）
+    #[test]
+    fn soloプロファイルも同じ移行を通る() {
+        let master = spec(SchemaId::Profiles).expect("登録されている");
+        let solo = spec(SchemaId::SoloProfiles).expect("登録されている");
+        assert_eq!(solo.target_version, master.target_version);
+        assert_eq!(solo.steps.len(), master.steps.len());
+        assert!(
+            !solo.is_pristine(),
+            "solo にも手順が要る（master_agent: codex）"
+        );
     }
 
     #[test]
@@ -973,15 +1139,20 @@ mod tests {
     fn 利用者が明示したモデルには触らない() {
         let dir = temp_dir("keep");
         let path = dir.join("default.yaml");
-        // 旧既定値と異なる明示指定（[1m] を含んでいても）は opt-in として尊重
-        std::fs::write(&path, "model: claude-fable-5[1m]\neffort: max\n").expect("書ける");
+        // 旧既定値と異なる明示指定（[1m] を含んでいても）は opt-in として尊重。
+        // #981 の関心事を混ぜないため bypass_sandbox は明示しておく（= v3 の形）
+        std::fs::write(
+            &path,
+            "model: claude-fable-5[1m]\neffort: max\nbypass_sandbox: false\n",
+        )
+        .expect("書ける");
         let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
         assert!(!report.outcome.changed(), "{report:?}");
         assert!(std::fs::read_to_string(&path)
             .expect("読める")
             .contains("claude-fable-5[1m]"));
         // model 無しのファイルも触らない
-        std::fs::write(&path, "effort: max\n").expect("書ける");
+        std::fs::write(&path, "effort: max\nbypass_sandbox: false\n").expect("書ける");
         assert!(
             !migration::migrate_file(profiles_spec(), &path, &migration::FsIo)
                 .outcome
@@ -1002,8 +1173,12 @@ mod tests {
                 .changed(),
             "初回は移行する"
         );
-        // 利用者が意図して再設定
-        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").expect("書ける");
+        // 利用者が意図して再設定（#981 の移行は初回で済んでいるので値は残す）
+        std::fs::write(
+            &path,
+            "model: claude-opus-4-6[1m]\neffort: high\nbypass_sandbox: true\n",
+        )
+        .expect("書ける");
         let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
         assert!(!report.outcome.changed(), "{report:?}");
         assert!(std::fs::read_to_string(&path)
@@ -1017,7 +1192,11 @@ mod tests {
     fn 旧機構の印だけがある場合も再設定を尊重する() {
         let dir = temp_dir("legacy-marker");
         let path = dir.join("default.yaml");
-        std::fs::write(&path, "model: claude-opus-4-6[1m]\neffort: high\n").expect("書ける");
+        std::fs::write(
+            &path,
+            "model: claude-opus-4-6[1m]\neffort: high\nbypass_sandbox: true\n",
+        )
+        .expect("書ける");
         std::fs::write(dir.join("default.yaml.backup-1m"), "旧い退避").expect("書ける");
         let report = migration::migrate_file(profiles_spec(), &path, &migration::FsIo);
         assert!(!report.outcome.changed(), "{report:?}");
@@ -1135,7 +1314,7 @@ mod tests {
         let dir = temp_dir("no-lock");
         // 既に新形式のプロファイル（移行の必要なし）
         let up_to_date = dir.join("default.yaml");
-        std::fs::write(&up_to_date, "effort: high\n").expect("書ける");
+        std::fs::write(&up_to_date, "effort: high\nbypass_sandbox: false\n").expect("書ける");
         let spec = profiles_spec();
         let report = migrate_one(spec, &up_to_date, Mode::Apply);
         assert!(

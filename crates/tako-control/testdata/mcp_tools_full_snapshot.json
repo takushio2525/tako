@@ -1866,6 +1866,10 @@
           "description": "閾値超過時に tako が master へ引き継ぎを促す自動通知（既定 true）。false にすると通知は止まるが tako_orchestrator_self / tako_orchestrator_handoff は従来どおり使える（set 時。#749）",
           "type": "boolean"
         },
+        "bypass_sandbox": {
+          "description": "codex（master / worker）を --dangerously-bypass-approvals-and-sandbox で起動することを許可する（既定 false = 許可しない。set 時。#981）。true にすると承認プロンプトと codex のサンドボックスが両方無効になり、書き込み先もネットワークも制限されなくなる。false へ戻すと codex の既定（承認プロンプトが出る）に戻る",
+          "type": "boolean"
+        },
         "clear_agent_effort": {
           "description": "対象エージェントの effort 指定を解除する",
           "type": "boolean"

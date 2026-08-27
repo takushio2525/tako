@@ -886,6 +886,9 @@ pub enum Request {
         limit_resume: Option<bool>,
         #[serde(default)]
         clear_limit_resume: bool,
+        /// codex の `--dangerously-bypass-approvals-and-sandbox` を許可するか（#981）
+        #[serde(default)]
+        bypass_sandbox: Option<bool>,
     },
     /// オーケストレーター: アカウントレジストリの CRUD（Issue #504）。
     /// action: list / show / add / remove
