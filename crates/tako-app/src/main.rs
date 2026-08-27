@@ -53753,6 +53753,21 @@ mod self_test {
                     overflow,
                     "129: タブを増やせばタブバーがはみ出す（スクロールの前提。#961）",
                 );
+                // 症状（「増えたタブが埋もれて**アクセスできない**」）の前提を
+                // スクロールする前に採っておく。索引は**全タブ**の最後（作った分だけでなく
+                // セルフテストが元から持っているタブも scroll area の子に並ぶ）
+                let (last_ix, hidden_before) = window961
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let ix = app.workspace.tabs().len().saturating_sub(1);
+                        let area = app.tab_scroll_handle.bounds();
+                        let hidden = app
+                            .tab_scroll_handle
+                            .bounds_for_item(ix)
+                            .map(|b| b.right() > area.right())
+                            .unwrap_or(false);
+                        (ix, hidden)
+                    })
+                    .unwrap_or((0, false));
                 // 実描画されたタブピルの矩形（= スクロール領域の子）。
                 // 先頭は端に寄っているので 2 枚目の中心を使う
                 let pill = window961
@@ -53827,17 +53842,6 @@ mod self_test {
                         // 症状そのもの（「増えたタブが埋もれて**アクセスできない**」）が
                         // 直っているかを、最後のタブの実描画矩形で見る。
                         // 端まで転がして、スクロール領域の中に入ってくること
-                        let last_ix = made.len().saturating_sub(1);
-                        let hidden_before = window961
-                            .update(cx, |app: &mut TakoApp, _, _| {
-                                let area = app.tab_scroll_handle.bounds();
-                                app.tab_scroll_handle
-                                    .bounds_for_item(last_ix)
-                                    .map(|b| b.right() > area.right())
-                            })
-                            .ok()
-                            .flatten()
-                            .unwrap_or(false);
                         for _ in 0..30 {
                             let _ = any961.update(cx, |_, win, cx| {
                                 win.dispatch_event(
