@@ -56,6 +56,13 @@
 - **A/B の env（同一バイナリで旧挙動へ戻せる）**: `TAKO_920_LEGACY` / `TAKO_913_LEGACY` /
   `TAKO_906_NO_PAD` / `TAKO_907_NO_INJECT` / `TAKO_903_LEGACY` / `TAKO_866_KEEP_EXACT_TARGET`
 
+- **#982（agent 能力マトリクス）完了 = #975 エピックの土台**。`tako-core::agent_support` が
+  「どの agent がどこまで使えるか」の正本（40 能力 × claude / codex / agy / ローカル LLM）。
+  **claude 以外を断定するなら根拠が必須**（T7 相当が落とす）で、**未調査を `Unsupported` へ
+  倒さない**（`Pending` + 追跡 Issue）。agent 種別の enum は 5 つ並存のまま対応を機械検証する
+  （統合しない理由と寄せ先一覧は `.agent/agent-enums.md`）。以降のスライスは
+  「1 マスを動かして根拠を書く」粒度
+
 ## 対応マトリクスを触るときの規約（#591）
 
 - **根拠なしに `Supported` / `Degraded` / `Unsupported` へ倒さない**。`windows_evidence` へ

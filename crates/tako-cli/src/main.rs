@@ -144,6 +144,8 @@ enum Command {
     ShowCommand(ShowCommandArgs),
     /// プラットフォーム対応マトリクスの参照（Issue #515）。
     /// この環境でどの機能が使えるか・縮退しているか・未実装かを表示する
+    /// agent 能力マトリクスを表示する（どの CLI でどこまで使えるか。Issue #982）
+    AgentSupport(AgentSupportArgs),
     Platform(PlatformArgs),
     /// シェル統合（OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態）の
     /// 配置状態の確認と配置・解除（Issue #525）。引数なしで現在の状態を表示。
@@ -2412,6 +2414,20 @@ impl ShowCommandArgs {
     }
 }
 
+/// agent 能力マトリクスの参照引数（Issue #982）
+#[derive(Args)]
+struct AgentSupportArgs {
+    /// 対象の系統（省略時は全系統ぶんの表）
+    #[arg(long, value_parser = ["claude", "codex", "agy", "local"])]
+    agent: Option<String>,
+    /// この状態のものだけに絞る（省略時は全件）
+    #[arg(long, value_parser = ["supported", "degraded", "pending", "unsupported"])]
+    status: Option<String>,
+    /// 生の JSON で出力する
+    #[arg(long)]
+    json: bool,
+}
+
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
 #[derive(Args)]
 struct PlatformArgs {
@@ -3081,6 +3097,7 @@ fn cli_main() -> ExitCode {
         // 対応マトリクスはバイナリに埋め込まれた静的な表なのでローカル処理。
         // GUI が動いていない環境（移植作業中の Windows がまさにそれ）でも引けることが本質
         Command::Platform(ref args) => platform_local(args),
+        Command::AgentSupport(ref args) => agent_support_local(args),
         // GUI を必要としないローカル処理（platform と同じ扱い）。
         // 実体は dispatch と共通の tako_control::shell_integration::run
         Command::ShellIntegration(ref args) => shell_integration_local(args),
@@ -4530,6 +4547,117 @@ fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
     let action = args.action.as_deref().unwrap_or("status");
     let result = tako_control::migrations::report_json(action, args.schema.as_deref())?;
     println!("{}", pretty_json(&result));
+    Ok(())
+}
+
+/// agent 能力マトリクスの表示（#982。ローカル処理・IPC 不要）。
+///
+/// **GUI が無くても引ける**ことが要件。「codex worker を立てたが動かない」を
+/// 調べるときに tako 本体が生きているとは限らない（`platform` と同じ判断）。
+/// MCP からは `tako_agent_support` が同じ `agent_support::report` を通る
+fn agent_support_local(args: &AgentSupportArgs) -> Result<(), String> {
+    // 表示言語のグローバルは既定が英語。CLI 単独で走るここでも settings.json から
+    // 解決しないと、日本語設定なのに英語で出てしまう（#435。platform_local と同じ）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let report =
+        tako_control::agent_support::report(args.agent.as_deref(), args.status.as_deref())?;
+    if args.json {
+        println!("{}", pretty_json(&report));
+        return Ok(());
+    }
+
+    use tako_core::i18n::Lang;
+    let ja = matches!(tako_core::i18n::lang(), Lang::Ja);
+    let agents: Vec<(String, String)> = report["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            Some((
+                a["key"].as_str()?.to_string(),
+                a["label"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+
+    // 見出し: 系統ごとの内訳
+    for (key, label) in &agents {
+        let c = &report["counts"][key];
+        let line: Vec<String> = ["supported", "degraded", "pending", "unsupported"]
+            .iter()
+            .filter_map(|s| c[*s].as_u64().map(|n| format!("{s} {n}")))
+            .collect();
+        println!("{label:<18} {}", line.join(" / "));
+    }
+    println!();
+
+    // 単独指定なら 1 列、全系統なら記号の表（○ を使わず status を短縮する）
+    let short = |st: &str| match st {
+        "supported" => "ok",
+        "degraded" => "part",
+        "pending" => "todo",
+        "unsupported" => "n/a",
+        _ => "?",
+    };
+    if agents.len() > 1 {
+        let head: Vec<String> = agents.iter().map(|(k, _)| format!("{k:>7}")).collect();
+        println!("{:<30} {}", "", head.join(" "));
+    }
+    let mut shown = 0;
+    for f in report["features"].as_array().into_iter().flatten() {
+        let key = f["key"].as_str().unwrap_or("?");
+        shown += 1;
+        if agents.len() > 1 {
+            let cells: Vec<String> = agents
+                .iter()
+                .map(|(k, _)| {
+                    format!(
+                        "{:>7}",
+                        short(f["agents"][k]["status"].as_str().unwrap_or("?"))
+                    )
+                })
+                .collect();
+            println!("{key:<30} {}", cells.join(" "));
+        } else {
+            let cell = &f["agents"][&agents[0].0];
+            print!("{:<6} {key}", short(cell["status"].as_str().unwrap_or("?")));
+            if let Some(issue) = cell["issue"].as_u64() {
+                print!("  #{issue}");
+            }
+            println!();
+            if let Some(note) = cell["note"].as_str() {
+                println!("{:<6} {note}", "");
+            }
+        }
+    }
+    if shown == 0 {
+        println!(
+            "{}",
+            if ja {
+                "（該当なし）"
+            } else {
+                "(no matches)"
+            }
+        );
+    } else if agents.len() > 1 {
+        println!();
+        println!(
+            "{}",
+            if ja {
+                "ok = claude 同等 / part = 縮退 / todo = 未実装か未調査 / n/a = 上流に手段が無い"
+            } else {
+                "ok = same as claude / part = degraded / todo = unimplemented or uninvestigated / n/a = no upstream mechanism"
+            }
+        );
+        println!(
+            "{}",
+            if ja {
+                "理由と根拠は --agent <系統> か --json で読める"
+            } else {
+                "Run with --agent <name> or --json to read the reasons and evidence"
+            }
+        );
+    }
     Ok(())
 }
 
@@ -6422,6 +6550,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Agents(_) => unreachable!("agents は run() を通らない"),
         Command::Recover(_) => unreachable!("recover は run() を通らない（ローカル処理）"),
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
+        Command::AgentSupport(_) => {
+            unreachable!("agent-support は run() を通らない（ローカル処理）")
+        }
         Command::Migrate(_) => unreachable!("migrate は run() を通らない（ローカル処理）"),
         Command::ShellIntegration(_) => {
             unreachable!("shell-integration は run() を通らない（ローカル処理）")

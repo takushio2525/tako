@@ -762,6 +762,10 @@ pub(super) fn build_request(
         "tako_shell_integration" => Request::ShellIntegration {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
+        "tako_agent_support" => Request::AgentSupport {
+            agent: str_arg(args, "agent")?.map(|s| s.to_string()),
+            status: str_arg(args, "status")?.map(|s| s.to_string()),
+        },
         "tako_platform" => Request::Platform {
             platform: str_arg(args, "platform")?.map(|s| s.to_string()),
             status: str_arg(args, "status")?.map(|s| s.to_string()),

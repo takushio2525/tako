@@ -16,7 +16,7 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 110 / 140（79%） | macOS と同じように使えます |
+| 対応 | 111 / 141（79%） | macOS と同じように使えます |
 | 一部対応 | 13 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 0 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
@@ -203,7 +203,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## セットアップと設定
 
-対応 8・一部対応 1
+対応 9・一部対応 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -216,6 +216,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_agents_sync_rules` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako agents sync-rules --source <正本>` が claude のグローバル指示へマーカーブロックを書き（action=updated + .bak 生成）、未導入の codex / agy は理由つきで skip される |
 | `tako_config_share` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako config init` が共有リポジトリを作って初回コミット（7 ファイル）、`tako config` が差分（same 4）を出し、`tako config pull` が 1 件取り込む |
 | `tako_platform` | 対応 | — | 実機テスト: platform_parity 13 本と support の単体が実機で緑（判定は純粋関数） |
+| `tako_agent_support` | 対応 | — | 実機テスト: agent_parity 5 本と agent_support の単体 15 本が緑（判定は純粋関数で OS を見ない） |
 
 ## リモートアクセス
 

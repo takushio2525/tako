@@ -4,6 +4,7 @@
 //! GPUI への依存はここに置かない（GPUI 破壊的変更リスクの防波堤。`.agent/architecture.md`）。
 
 pub mod acceptance_gate;
+pub mod agent_support;
 pub mod backend;
 pub mod byte_lru;
 pub mod command_card;

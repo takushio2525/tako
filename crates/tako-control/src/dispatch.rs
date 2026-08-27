@@ -3598,6 +3598,13 @@ fn dispatch_inner(
             }
         }
 
+        // agent 能力マトリクスの参照（#982）。#515 と同じく静的な表を引くだけ。
+        // CLI・MCP・docs 生成が crate::agent_support::report の 1 本を通る
+        Request::AgentSupport { agent, status } => {
+            crate::agent_support::report(agent.as_deref(), status.as_deref())
+                .map_err(DispatchError::InvalidParams)
+        }
+
         // 対応マトリクスの参照（#515）。静的な表を引くだけなのでホスト状態に触れない。
         // CLI・MCP とも crate::platform::report を通るので表示が食い違わない
         Request::Platform {

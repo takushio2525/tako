@@ -1048,7 +1048,30 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 実機 e2e（codex 0.144.4 / gpt-5.6-sol: 既定は MCP ツール承認ダイアログで停止しファイル
 未作成 / opt-in はコマンド実行まで通りファイル作成）。
 
-FR-2.8〜2.28 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
+### FR-2.29 agent 能力マトリクス（✅ 2026-08-27、#982。エピック #975 / 設計の写し元は #515 / #591）
+
+> tako は claude を基準に実装してきたため、codex / agy では落ちる機能・まだ使えない機能がある。
+> その判断が**コードのあちこちへ散っている**（棚卸し #975 §1: 監視・送達・resume・setup・MCP は
+> `WorkerAgent` を通らず `"claude"` 文字列か claude 固有モジュールへ直結）ので、
+> 「どの系統でどこまで使えるか」を機械可読の正本 1 本にする。OS 軸（`platform::support`）で
+> 一度解いた問題の agent 軸版。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.29.1 | **正本は 1 箇所**（`tako-core::agent_support`）。`AgentFeature { key, summary, claude, codex, agy, local, evidence }` の表で、状態は `Supported` / `Degraded` / `Pending` / `Unsupported` の 4 値（`platform::support::Support` と同じ意味） | M | ✅ |
+| FR-2.29.2 | **根拠なき断定を禁止**。claude 以外について `Supported` / `Degraded` / `Unsupported` を宣言するなら `AgentEvidence`（コード本文の引用 / 上流の仕様 / 実測 / テスト名）を持つ。持たずに倒すとテストが落ちる（#591 の T7 と同じ構造） | M | ✅ |
+| FR-2.29.3 | **「上流に手段が無い」と「まだ調べていない」を混ぜない**。未調査は `Pending`（追跡 Issue つき）に置く。未調査を `Unsupported` へ倒すと、宣言を読む AI が open な道を永久に避ける | M | ✅ |
+| FR-2.29.4 | 縮退の理由文は `Note`（日英対）で**マトリクス 1 箇所に定義**し、診断・docs・将来の system prompt がすべてそこから引く（#435 / #516 と同じ方針） | M | ✅ |
+| FR-2.29.5 | **同じ概念の enum が 5 つ並存している**現状（`WorkerAgent` / `SetupAgent` / `agents_sync::AgentKind` / `agent_install::AgentKind` / `LimitService`）を統合ではなく**対応の機械検証**で縛る。どれかに値が増減したらテストが落ちる。値の集合が本当に違う（`Local` は `WorkerAgent` に無いのが正しい）ため統合しない。対応表は `.agent/agent-enums.md` | M | ✅ |
+| FR-2.29.6 | 操作は CLI `tako agent-support` + MCP `tako_agent_support` で 1:1（開発不変条件）。**CLI 側はローカル処理**（GUI が無くても引ける = 「worker が動かない」を調べるときに tako 本体が生きている前提を置かない。`tako platform` と同じ判断） | M | ✅ |
+| FR-2.29.7 | docs（`docs/src/content/docs/agent-support.md`）は**生成物**で、CI が `node scripts/gen-agent-support-docs.mjs --check` で同期を検査する。カテゴリ未分類の能力があると生成が失敗する（分類漏れの検出） | M | ✅ |
+| FR-2.29.8 | 能力判断の呼び出し側は**各スライスがその機能を実装するときに**マトリクス経由へ寄せる（一斉置換しない）。#982 では `WorkerAgent::has_agents_api()` を吸収した（`TAKO_982_LEGACY=1` で吸収前へ戻せる）。残りの寄せ先一覧は `.agent/agent-enums.md` | M | ✅ |
+
+初期値（40 能力 × 4 系統）は棚卸しレポートの §1 / §9 から引いた。**実機を動かしていない**ため
+根拠は原則としてコード本文の引用と既存 Issue の実測記録に限り、実機で確かめるべきものは
+`Pending` + 追跡 Issue のまま置いている（過大申告しない。#591 / #617 と同じ基準）。
+
+FR-2.8〜2.29 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
 対応する MCP / CLI 操作（表示・読み取り・応答送信）を同時に提供する。
 提示系の体験は FR-2.7（AI 成果物プレゼンテーション）と一体で設計する。
 

@@ -1272,6 +1272,15 @@ pub enum Request {
     /// プラットフォーム対応マトリクスの参照（Issue #515 / #467）。
     /// どの機能がどのプラットフォームで使えるか・縮退しているかを返す。
     /// Windows 上の master が自環境の制約を自己認識するために使う
+    /// agent 能力マトリクスの参照（Issue #982）
+    AgentSupport {
+        /// "claude" / "codex" / "agy" / "local"（省略時は全系統ぶんの表）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// "supported" / "degraded" / "pending" / "unsupported"（省略時は全件）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
     Platform {
         /// "macos" / "windows"（省略時は実行中のプラットフォーム）
         #[serde(default, skip_serializing_if = "Option::is_none")]

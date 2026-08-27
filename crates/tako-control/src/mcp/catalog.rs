@@ -2463,6 +2463,35 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_agent_support",
+            "description": "agent 能力マトリクスの参照（Issue #982 / #975）。\
+                どのエージェント CLI（claude / codex / agy / ローカル LLM）でどの機能が \
+                claude 同等に使えるか・縮退しているか・まだ使えないかを返す。\
+                tako は claude を基準に実装してきたため、系統によって使えない操作がある。\
+                **worker を codex / agy で立てる前と、その worker が期待どおり動かないときに引くこと**。\
+                agent: 対象の系統（省略時は全系統ぶんの表）。\
+                status: 絞り込み（supported / degraded / pending / unsupported。省略時は全件）。\
+                応答の各項目は key（能力名）・summary（説明）・agents（系統ごとの status / note / issue）・\
+                evidence（判定の根拠の種別）を持つ。pending は「tako が未実装」か「まだ調べていない」で、\
+                unsupported は「上流の CLI にその手段が無い」の意味。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy", "local"],
+                        "description": "対象の系統（省略時は全系統ぶんの表）",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["supported", "degraded", "pending", "unsupported"],
+                        "description": "この状態のものだけに絞る（省略時は全件）",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_platform",
             "description": "プラットフォーム対応マトリクスの参照（Issue #515 / #467）。\
                 どの機能がこの環境で使えるか・縮退しているか・未実装かを返す。\
