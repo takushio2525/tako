@@ -3281,6 +3281,9 @@
   画面は **PowerShell の `ParserError: Unexpected token 'version' in expression or statement.`**
   = パースの時点で撥ねられ**コマンドが走らない**（#899 の症状そのもの）。
   **after** = `launch_line="C:\…\tako.exe master"`（囲まれない）で (d1)(d2) とも通過
+- 実機テストのベースライン照合（`--no-fail-fast`）: **22 件失敗 = 記録済みベースラインと
+  完全一致（新規ゼロ）**。tako-control 14 / tako-core 7 / `remote_fs_e2e` 1（#930）。
+  **#899 が足した単体テストは実機で緑**
 - **停止位置の項目 97 (d) は #899 とは無関係**（#967 を起票）。判定が画面のリテラル
   `"tako setup"` を見ているのに Windows の実行ファイル名は `tako.exe` なので
   `…\tako.exe setup` になり部分文字列が無い。**#898 が実体パスを返すようにした時点**で

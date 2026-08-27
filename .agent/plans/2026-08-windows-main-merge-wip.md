@@ -2834,6 +2834,19 @@ TAKO_APP_SELF_TEST_FAILED: スターターが組む行は実シェルで実際�
 `:` と `\` を素で通すようになった after では実行される。**症状 1（行末 LF）は #897 の
 番犬が構造的に禁じている**ので env で戻す穴は作っていない（作ると `cargo test` が赤になる）。
 
+##### 実機テストのベースライン照合（`--no-fail-fast`）
+
+**22 件失敗 = 記録済みベースラインと完全一致（新規ゼロ）**。内訳:
+
+| バイナリ | 結果 |
+|---|---|
+| `tako-control` (lib) | 1080 passed / **14 failed**（#920 で `setup_bootstrap::…導入計画…` が消えて 15 → 14） |
+| `tako-core` (lib) | 887 passed / **7 failed**（ベースライン同一） |
+| `remote_fs_e2e` | **1 failed** = `解決できないホストは接続前に分類される`（#930） |
+
+**#899 が足した単体テストは実機で緑**（`welcome::tests::powershellのコマンド語は実行される形になる ... ok` /
+`posixのコマンド語は…`）。`shell_integration_powershell` 7/0・`spawn_arg_quoting` 3/0 も緑。
+
 ##### 項目 97 (d) で止まるのは #899 とは無関係（#967 を起票）
 
 after arm は項目 93 を通ったあと **項目 97 (d)**
