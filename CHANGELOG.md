@@ -30,6 +30,23 @@ Nightly patch release (automated). Changes since v0.7.7:
 
 ### Fixed
 
+- [修正] codex を master / solo / worker に使うとき、承認とサンドボックスを丸ごと外す
+  `--dangerously-bypass-approvals-and-sandbox` が**無条件で付いていた**のを、
+  プロファイルの `bypass_sandbox`（既定 false）による明示 opt-in へ変更 (#981)。
+  claude master には相当するフラグが無いので系統間で既定の安全性が非対称で、
+  外す手段（opt-out）も無かった。既存プロファイルは自動マイグレーション（#916）で
+  `bypass_sandbox: true` が書かれるので**挙動は変わらない**（新規だけ安全側になる）。
+  操作は CLI `--bypass-sandbox` / MCP `bypass_sandbox` / 設定画面のトグルの 3 経路。
+  起動時に「サンドボックスが今どうなっているか」を 1 行出す（外れていないときも出して
+  外し方を添えるので、承認プロンプトで止まっても理由が画面に残る）
+- [Fixed] Launching codex as master / solo / worker no longer passes
+  `--dangerously-bypass-approvals-and-sandbox` unconditionally; it is now an explicit
+  opt-in via the profile's `bypass_sandbox` (default false) (#981). claude master has no
+  equivalent flag, so the previous default made the two agents asymmetric in safety with
+  no way to opt out. Existing profiles are auto-migrated (#916) to `bypass_sandbox: true`,
+  so **behavior does not change for them** — only newly created profiles get the safe
+  default. Configurable from the CLI (`--bypass-sandbox`), MCP (`bypass_sandbox`) and the
+  settings window, and the launch output now states whether the sandbox is on or off
 - [修正] タブバーの横スクロールが効かず、タブが増えると画面外に埋もれてアクセスできない
   問題を根治 (#961)。原因は #576（`0880c26` で main へ）がタブピルへ付けた `occlude()`。
   GPUI の `hit_test` は `occlude()` で走査を **break** するため、祖先である

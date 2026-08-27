@@ -1027,7 +1027,28 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 延びる = その場合は自動復帰せず状態照会にそのまま出る）。機械検証は unit 26 本 +
 セルフテスト項目 111（正例 2 型 / 負例 3 型 / 試行上限 / list・read の一致）。
 
-FR-2.8〜2.27 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
+### FR-2.28 codex のサンドボックス解除は明示 opt-in（✅ 2026-08-27、#981）
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-2.28.1 | **既定でサンドボックスを外さない**。`master_agent: codex` の master / solo と codex worker の起動コマンドに `--dangerously-bypass-approvals-and-sandbox` を付けるのは、プロファイルの `bypass_sandbox`（既定 false）が明示的に true のときだけとする。claude master に相当するフラグは無く、外部ユーザーが codex を選んだ瞬間に承認とサンドボックスが両方外れるのは系統間で非対称な既定だった（#132 は開発者 1 人の環境を前提に無条件で入れた） | M |
+| FR-2.28.2 | **codex は「承認だけ外す」を選べない**（同一フラグ）。実測（codex 0.144.4 の `codex sandbox`）で 既定 = read-only は cwd 内への書き込みすら不可 / `workspace-write` は cwd 内のみ可でネットワークと cwd 外は不可 / `danger-full-access` で両方可。worker の実務（cargo・gh・data dir への書き込み）が成立しないため中間状態は用意せず 2 択にし、`skip_permissions: true` だけでフラグが付かないことを `profiles show` の `warnings` と master プロンプトで見せる（効かない設定を黙って抱えさせない） | M |
+| FR-2.28.3 | **起動時に状態を 1 行出す**。外れているときは何が外れているか（フラグ名）、外れていないときは「承認プロンプトが出る」と外し方を出す。承認プロンプトで止まったときに理由が画面に残る形にする（日英） | M |
+| FR-2.28.4 | **既存ユーザーの挙動を変えない**。`bypass_sandbox` を書いていないプロファイル（= 変更前に作られたファイル）には自動マイグレーション（FR-5.16 / #916）で `true` を明示する。世代判定は**キーの有無**なので `Profile::bypass_sandbox` に `skip_serializing_if` を付けない。手書きテンプレート（`ensure_defaults` の default.yaml / solo の default.yaml）も現行世代で書き出す（**書き忘れると新規インストールが移行対象になり危険な旧既定が書き込まれる**。実測で踏んだ） | M |
+| FR-2.28.5 | 操作は CLI `tako orchestrator profiles set <名前> --bypass-sandbox <bool>` / MCP `tako_orchestrator_profiles` の `bypass_sandbox` / 設定画面 → プロファイル → 「codex のサンドボックスを外す」の 3 経路が**同じ dispatch** を通る（設計原則 5）。値は `profiles show` が常に返す（安全に関わる設定なので既定値でも隠さない） | M |
+
+実装メモ（2026-08-27）: 判定は `Profile::bypass_sandbox` 1 本で、master は
+`orchestrator::build_master_cmd_in`、worker は `ResolvedWorkerLaunch::allow_sandbox_bypass`
+→ `agent::build_worker_cmd_in` が読む。文言は `orchestrator::sandbox_bypass_line`（`Note` =
+日英）と `sandbox_bypass_hint_command`。移行は `migrations` の profiles v2 → v3
+（`pin_sandbox_bypass`。`once: false` = `once_markers` が from を問わず「当たった」と
+答えるため #27 を通った利用者が飛ばされるのを避ける）で、solo プロファイルも同じ spec
+に載せた。A/B は `TAKO_981_LEGACY=1`（同一バイナリで無条件バイパスへ戻す）。
+機械検証は unit 12 本（両方向・claude / agy の回帰ゼロ・テンプレート番犬）+
+実機 e2e（codex 0.144.4 / gpt-5.6-sol: 既定は MCP ツール承認ダイアログで停止しファイル
+未作成 / opt-in はコマンド実行まで通りファイル作成）。
+
+FR-2.8〜2.28 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
 対応する MCP / CLI 操作（表示・読み取り・応答送信）を同時に提供する。
 提示系の体験は FR-2.7（AI 成果物プレゼンテーション）と一体で設計する。
 
