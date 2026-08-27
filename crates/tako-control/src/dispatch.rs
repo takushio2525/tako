@@ -2578,7 +2578,7 @@ fn dispatch_inner(
 
         Request::CheckHealth => Ok(check_health(host)),
 
-        Request::SetupMcp { scope, pane } => {
+        Request::SetupMcp { scope, pane, agent } => {
             let scope_str = scope.as_deref().unwrap_or("global");
             let mcp_scope = match scope_str {
                 "project" => {
@@ -2591,24 +2591,7 @@ fn dispatch_inner(
                 }
                 _ => McpScope::User,
             };
-            let tako_bin = resolve_tako_binary();
-            let result = setup_mcp(&tako_bin, &mcp_scope)?;
-            let mut resp = json!({
-                "configured": result.configured,
-                "already_existed": result.already_existed,
-                "target_path": result.target_path.display().to_string(),
-                "command": tako_bin,
-            });
-            if result.repaired {
-                resp["repaired"] = json!(true);
-                if let Some(old) = &result.old_command {
-                    resp["old_command"] = json!(old);
-                }
-            }
-            if result.legacy_cleaned {
-                resp["legacy_cleaned"] = json!(true);
-            }
-            Ok(resp)
+            setup_mcp_agents(agent.as_deref(), &mcp_scope, scope_str)
         }
 
         Request::VideoPlayback { pane, action } => {
@@ -8551,6 +8534,124 @@ pub fn setup_mcp(tako_binary: &str, scope: &McpScope) -> Result<SetupMcpResult, 
         target_path: mcp_target_path(scope),
         legacy_cleaned,
     })
+}
+
+/// `Request::SetupMcp` の実処理。**対象エージェントを 1 つに絞らない**のが既定（#979）。
+///
+/// `agent` を省略すると claude + この環境に導入済みの codex / agy へまとめて登録する
+/// （未導入は理由つきの skip）。明示指定したエージェントが未導入・非対応スコープの
+/// ときだけ分類済みエラーで止める（#979 スコープ 3・受け入れ条件 4）。
+///
+/// 応答は `agents` 配列が正で、claude ぶんは**従来のキーを平置きしたまま**残す
+/// （既存の CLI 表示・MCP 呼び出し側を壊さないため）。
+pub fn setup_mcp_agents(
+    agent: Option<&str>,
+    scope: &McpScope,
+    scope_label: &str,
+) -> Result<Value, DispatchError> {
+    use crate::agent_mcp;
+    use crate::orchestrator::agent::WorkerAgent;
+
+    let explicit = match agent {
+        Some(name) => Some(WorkerAgent::parse(name).map_err(DispatchError::Operation)?),
+        None => None,
+    };
+    let targets: Vec<WorkerAgent> = match explicit {
+        Some(a) => vec![a],
+        // 未導入の CLI も列挙して「なぜ登録されていないか」を応答に残す
+        // （黙って消すと AI / 利用者が原因を追えない。#979 スコープ 3）
+        None => WorkerAgent::ALL.to_vec(),
+    };
+
+    let tako_bin = resolve_tako_binary();
+    let project_scope = matches!(scope, McpScope::Project(_));
+    let mut entries: Vec<Value> = Vec::new();
+    let mut claude_flat: Option<Value> = None;
+
+    for target in targets {
+        if target == WorkerAgent::Claude {
+            let result = setup_mcp(&tako_bin, scope)?;
+            let mut entry = json!({
+                "agent": "claude",
+                "configured": result.configured,
+                "already_existed": result.already_existed,
+                "target_path": result.target_path.display().to_string(),
+                "command": tako_bin,
+            });
+            if result.repaired {
+                entry["repaired"] = json!(true);
+                if let Some(old) = &result.old_command {
+                    entry["old_command"] = json!(old);
+                }
+            }
+            if result.legacy_cleaned {
+                entry["legacy_cleaned"] = json!(true);
+            }
+            claude_flat = Some(entry.clone());
+            entries.push(entry);
+            continue;
+        }
+
+        // codex / agy は各 CLI の `mcp add` が user スコープしか持たない（実測）。
+        // project を頼まれたら黙って global へ倒さず、理由を出す
+        if project_scope {
+            let err = agent_mcp::AgentMcpError::ScopeUnsupported {
+                agent: target,
+                scope: "project",
+            };
+            if explicit.is_some() {
+                return Err(DispatchError::Operation(err.to_string()));
+            }
+            entries.push(json!({
+                "agent": target.as_str(),
+                "skipped": true,
+                "error_kind": err.kind(),
+                "message": err.to_string(),
+            }));
+            continue;
+        }
+
+        match agent_mcp::register(target, &tako_bin) {
+            Ok(result) => {
+                let mut entry = json!({
+                    "agent": result.agent.as_str(),
+                    "configured": result.configured,
+                    "already_existed": result.already_existed,
+                    "command": result.command,
+                });
+                if let Some(path) = &result.target_path {
+                    entry["target_path"] = json!(path.display().to_string());
+                }
+                if result.repaired {
+                    entry["repaired"] = json!(true);
+                    if let Some(old) = &result.old_command {
+                        entry["old_command"] = json!(old);
+                    }
+                }
+                entries.push(entry);
+            }
+            Err(err) => {
+                if explicit.is_some() {
+                    return Err(DispatchError::Operation(err.to_string()));
+                }
+                entries.push(json!({
+                    "agent": target.as_str(),
+                    "skipped": true,
+                    "error_kind": err.kind(),
+                    "message": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    let mut resp = claude_flat.unwrap_or_else(|| json!({}));
+    if let Some(obj) = resp.as_object_mut() {
+        // 平置きは claude の結果なので、claude が対象外のときは残さない
+        obj.remove("agent");
+    }
+    resp["agents"] = json!(entries);
+    resp["scope"] = json!(scope_label);
+    Ok(resp)
 }
 
 fn mcp_target_path(scope: &McpScope) -> std::path::PathBuf {

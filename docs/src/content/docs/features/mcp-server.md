@@ -15,7 +15,19 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 2. 各ペインのシェルに環境変数（`TAKO_PANE_ID`、`TAKO_MCP_URL` 等）を注入
 3. AI エージェントは環境変数から MCP サーバーを自動発見し、ツールとして利用
 
-初回に `tako setup`（または `tako setup-mcp`）で stdio ブリッジを登録すれば、以降はどのプロジェクトでも設定不要です。
+初回に `tako setup`（または `tako setup-mcp`）で stdio ブリッジを登録すれば、以降はどのプロジェクトでも設定不要です。登録先は **claude / codex / agy の 3 系統**で、導入済みの CLI すべてに一度でまとめて入ります。
+
+## 対応エージェントと登録先
+
+| エージェント | 書き込み先 | 手段 | 環境変数の渡し方 |
+|---|---|---|---|
+| claude | `~/.claude.json` / `<cwd>/.mcp.json` | `claude mcp add` | そのまま継承する |
+| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 | 転送する変数名を書いたものだけ |
+| agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | そのまま継承する |
+
+tako の MCP サーバーは、**tako の中から起動されたこと**を環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してから 128 個のツールを公開します。tako の外で立ち上がったエージェントに画面操作をさせないための線引きです（後述の[アクセス制御](#アクセス制御)）。
+
+そのため codex の登録には、転送する変数名の一覧（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE`）も一緒に書き込みます。**書くのは変数名だけで、トークンは設定ファイルに残りません。**ペインごとに違う値がそのまま届くので、「どのペインから呼ばれたか」もこれまでどおり解決されます。
 
 ## 128 個の MCP ツール
 

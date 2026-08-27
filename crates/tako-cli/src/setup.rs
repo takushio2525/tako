@@ -945,30 +945,56 @@ fn run_setup_mcp() -> Result<(), String> {
     }
 }
 
-fn configure_agent_mcp(agent: &DetectedAgent) -> Result<(), String> {
-    match agent.kind {
-        SetupAgent::Claude => {
-            let (registered, healthy) = check_claude_mcp_health(&agent.path);
-            if registered && healthy {
-                eprintln!("  [OK] Claude MCP: tako が登録済み");
-                Ok(())
-            } else if registered && !healthy {
+/// 検出済みの全エージェントへ tako MCP を登録する（#979）。
+///
+/// **選択したエージェントだけに絞らない**: 推奨プロファイルは `worker_agents` に
+/// 複数を並べるので（`recommended_profile`）、worker として使う CLI からも
+/// tako のツールが見えないと設計原則 5「AI フルコントロール」が破れる。
+/// 個別の失敗は setup 全体を止めず理由を出す（未導入の CLI はそもそも列挙されない）
+fn configure_agent_mcp(agents: &[DetectedAgent]) -> Result<(), String> {
+    // claude は登録の健全性まで見て修復する（従来経路。回帰させない）
+    if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
+        let (registered, healthy) = check_claude_mcp_health(&claude.path);
+        if registered && healthy {
+            eprintln!("  [OK] Claude MCP: tako が登録済み");
+        } else {
+            if registered {
                 eprintln!("  [警告] Claude MCP: 登録パスが消失しています。修復します");
-                run_setup_mcp()
             } else {
                 eprintln!("  [設定] Claude MCP を自動登録します");
-                run_setup_mcp()
             }
-        }
-        SetupAgent::Codex => {
-            eprintln!("  [OK] Codex MCP: tako master 起動時に一時設定を注入します");
-            Ok(())
-        }
-        SetupAgent::Agy => {
-            eprintln!("  [情報] agy は worker 専用のため MCP 登録は不要です");
-            Ok(())
+            run_setup_mcp()?;
         }
     }
+
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
+    for agent in agents {
+        let kind = match agent.kind {
+            SetupAgent::Codex => tako_control::orchestrator::agent::WorkerAgent::Codex,
+            SetupAgent::Agy => tako_control::orchestrator::agent::WorkerAgent::Agy,
+            SetupAgent::Claude => continue,
+        };
+        match tako_control::agent_mcp::register(kind, &tako_bin) {
+            Ok(result) if !result.configured => {
+                eprintln!("  [OK] {} MCP: tako が登録済み", kind.as_str());
+            }
+            Ok(result) if result.repaired => {
+                eprintln!(
+                    "  [修復] {} MCP: 登録パスが消失していたため付け替えました",
+                    kind.as_str()
+                );
+            }
+            Ok(_) => {
+                eprintln!("  [設定] {} MCP に tako を登録しました", kind.as_str());
+            }
+            // setup 全体は止めない（他の設定は進めたい）が、無言にはしない
+            Err(e) => eprintln!("  [警告] {} MCP: {e}", kind.as_str()),
+        }
+    }
+    if agents.iter().any(|a| a.kind == SetupAgent::Codex) {
+        eprintln!("         codex は master 起動時にも一時設定を注入します");
+    }
+    Ok(())
 }
 
 // --- リソース書き出し ---
@@ -2122,7 +2148,7 @@ pub fn run_check() -> Result<(), String> {
     // エージェント CLI + 任意依存。--check では表示のみ。
     let (agents, _) = run_dependency_check(false);
 
-    // MCP 登録（claude のみ永続登録。codex は master 起動時注入、agy は worker 専用）
+    // MCP 登録（#979 で claude / codex / agy の 3 系統とも永続登録になった）
     if let Some(claude) = agents.iter().find(|a| a.kind == SetupAgent::Claude) {
         let (registered, healthy) = check_claude_mcp_health(&claude.path);
         if registered && healthy {
@@ -2137,11 +2163,44 @@ pub fn run_check() -> Result<(), String> {
             eprintln!("  [不足] Claude MCP: tako が未登録（tako setup-mcp で登録できます）");
         }
     }
+    for agent in &agents {
+        let kind = match agent.kind {
+            SetupAgent::Codex => tako_control::orchestrator::agent::WorkerAgent::Codex,
+            SetupAgent::Agy => tako_control::orchestrator::agent::WorkerAgent::Agy,
+            SetupAgent::Claude => continue,
+        };
+        let name = kind.as_str();
+        use tako_control::agent_mcp::McpState;
+        match tako_control::agent_mcp::state(kind) {
+            McpState::Ready { .. } => eprintln!("  [OK] {name} MCP: tako が登録済み"),
+            McpState::Dead { command } => {
+                eprintln!("  [警告] {name} MCP: 登録済みだがパスが消失しています");
+                eprintln!("         登録パス: {command}");
+                eprintln!("         tako setup または tako setup-mcp で修復できます");
+            }
+            // 登録行はあるのに env の転送が無い = ツールが 0 個になる（#979 の実測）。
+            // 「未登録」と混ぜると原因を追えないので別の文言にする
+            McpState::EnvMissing { .. } => {
+                eprintln!(
+                    "  [警告] {name} MCP: 登録済みだが tako と通信する env の転送設定がありません"
+                );
+                eprintln!("         そのままだとツールが 0 個になります");
+                eprintln!("         tako setup-mcp --agent {name} で入れ直せます");
+            }
+            McpState::NotRegistered => {
+                eprintln!("  [不足] {name} MCP: tako が未登録（tako setup-mcp で登録できます）")
+            }
+            // CLI は検出できているので Unknown は「一覧を読めなかった」だけ
+            McpState::Unknown => {
+                eprintln!("  [警告] {name} MCP: 登録状態を確認できません（{name} mcp list を手で確認してください）")
+            }
+        }
+    }
     if agents.iter().any(|a| a.kind == SetupAgent::Codex) {
-        eprintln!("  [OK] Codex MCP: tako master 起動時に一時注入");
+        eprintln!("  [OK] Codex: master 起動時にも一時注入");
     }
     if agents.iter().any(|a| a.kind == SetupAgent::Agy) {
-        eprintln!("  [情報] agy: worker 専用（master / MCP 接続は非対応）");
+        eprintln!("  [情報] agy: worker 専用（master は非対応）");
     }
 
     // config.yaml
@@ -2561,6 +2620,24 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
             SetupValueSource::Default,
         );
     }
+    // codex / agy も導入済みなら登録対象（#979）。既に登録済みなら plan へ出さない
+    for agent in &agents {
+        let kind = match agent.kind {
+            SetupAgent::Codex => tako_control::orchestrator::agent::WorkerAgent::Codex,
+            SetupAgent::Agy => tako_control::orchestrator::agent::WorkerAgent::Agy,
+            SetupAgent::Claude => continue,
+        };
+        let state = tako_control::agent_mcp::state(kind);
+        let Some(gap) = state.describe_gap() else {
+            continue; // 使える or 判定できない = プランに出さない
+        };
+        plan.push_if_changed(
+            format!("{} MCP", kind.as_str()),
+            Some(gap),
+            "tako を登録",
+            SetupValueSource::Default,
+        );
+    }
     if let Some(sleep) = &answers.sleep_guard {
         let settings = tako_control::settings::load();
         if let Some(mode) = sleep.mode.as_deref() {
@@ -2621,7 +2698,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     }
 
     // 検出値・既定値だけの標準ケースは確認を挟まず適用する（Issue #262 要件 D）。
-    configure_agent_mcp(selected_agent)?;
+    configure_agent_mcp(&agents)?;
     let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     apply_sleep_guard_answers(answers.sleep_guard.as_ref())?;
 

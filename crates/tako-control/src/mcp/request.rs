@@ -494,6 +494,7 @@ pub(super) fn build_request(
         "tako_setup_mcp" => Request::SetupMcp {
             scope: str_arg(args, "scope")?,
             pane: u64_arg(args, "pane")?.or(caller),
+            agent: str_arg(args, "agent")?,
         },
         "tako_video_playback" => Request::VideoPlayback {
             pane: Some(target_pane(args, caller)?),

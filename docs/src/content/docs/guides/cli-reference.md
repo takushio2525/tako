@@ -176,12 +176,33 @@ tako setup --reset
 
 ### tako setup-mcp
 
-Claude Code の設定ファイル（`~/.claude/settings.json`）に tako の MCP サーバーを登録します。対話なしで登録だけしたいときに使います。
+エージェント CLI に tako の MCP サーバーを登録します。対話なしで登録だけしたいときに使います。
 
 ```bash
-tako setup-mcp             # ユーザー全体に登録（既定）
-tako setup-mcp --project   # 現在のディレクトリだけに登録
+tako setup-mcp                   # claude + 導入済みの codex / agy へまとめて登録（既定）
+tako setup-mcp --agent codex     # codex だけに登録
+tako setup-mcp --project         # 現在のディレクトリだけに登録（claude のみ）
 ```
+
+引数なしのときは **claude と、この環境に導入済みの codex / agy** をまとめて対象にします。未導入の CLI は理由つきで skip するだけでエラーになりません。`--agent` で明示指定したときだけ、その CLI が未導入なら分類済みエラー（理由 + 次の一手）で止まります。
+
+| エージェント | 書き込み先 | 手段 |
+|---|---|---|
+| claude | `~/.claude.json`（`--project` 時は `<cwd>/.mcp.json`） | `claude mcp add`（無ければ JSON を直接マージ） |
+| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 |
+| agy | `~/.gemini/config/mcp_config.json` の `mcpServers.tako` | `agy mcp add` |
+
+codex / agy は各 CLI の `mcp add` に書き込みを任せています。自分で TOML / JSON を書くと CLI 側の正規化と二重にずれるため、利用者が手で `codex mcp add` を打ったのと同じ結果になる経路へ寄せてあります。何度実行しても設定は同じ内容に収束します（`--project` は codex / agy が対応していないので、明示指定すると理由を出して止まります）。
+
+:::note[codex は環境変数の転送設定も一緒に入ります]
+tako の MCP サーバーは、tako の中から起動されたことを環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してからツールを公開します。agy は MCP サーバーへ環境変数をそのまま渡すので登録だけで足りますが、codex は既定で 1 つも渡しません。そのため codex の登録には転送する変数名の一覧（`env_vars`）も一緒に書き込みます。**変数名だけを書くので、トークンが設定ファイルに残ることはありません。**
+
+`codex mcp add` はこの一覧を上書きで消してしまうため、`tako setup-mcp` は登録のあとに書き足し、`codex mcp list` で反映を確認します。確認できなければ理由つきのエラーになります。
+:::
+
+:::caution[各 CLI が設定ファイル全体を書き直します]
+`codex mcp add` / `agy mcp add` は設定ファイルを自分の書式で書き戻します。コメントや項目の並びは保たれますが、`args = []` のような空の項目が消えたり、数値の書き方（`120` → `120.0`）や環境変数の並び順が変わることがあります。意味は変わりません（各 CLI を手で叩いたときと同じ結果です）。
+:::
 
 ### tako update
 
