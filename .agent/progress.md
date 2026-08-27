@@ -3378,3 +3378,14 @@
 - 製品バグ 5 件起票（#970 verbatim cwd で git タブ全滅 / #971 remote の tailscale serve /
   #972 remote scrollback / #973 autosave が CLI 編集で不発（macOS も）/ #974 psmux の設定警告）
 - 次: #722 の AI 命名と remote 系は実機 claude の OAuth 期限切れ・#971 でブロック
+
+## 2026-08-27（#979: codex / agy へ tako MCP を登録し env の引き継ぎまで通す）
+- `tako setup-mcp` を 3 系統へ（引数なしで claude + 導入済みの codex / agy。未導入は理由つき skip、
+  `--agent` 明示時だけ分類済みエラー）。書き込みは各 CLI の `mcp add` に委譲 = 二重正規化を避ける
+- **実測で設計が変わった**: `tako mcp serve` は `TAKO_SOCKET` + `TAKO_TOKEN` が env に無いと 0 ツール。
+  偽 MCP サーバーで測ると **agy は親 env をそのまま渡し（#975 §5.2 の記述は誤り）、codex は 1 つも渡さない**
+  → codex には `env_vars` 許可リスト（変数名だけ = トークンを残さない）を add の後に足して `mcp list` で反映確認
+- 実 codex / agy セッションから `tako_list_panes` が通り両者の件数が一致（8 タブ / 23 ペイン）。
+  冪等はバイト一致 3 回、claude 無回帰、未導入エラーまで実測。検証環境は原状回復済み
+- 関連コミット: `63a7c26` `[機能追加] tako setup / setup-mcp で codex・agy にも tako MCP を登録する (#979) (#993)`
+- 次: Windows 実機での codex / agy 実測（対応マトリクスは claude 経路の実測のまま据え置き）
