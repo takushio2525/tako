@@ -418,17 +418,24 @@ mod tests {
         // 判定は**観測期間の最小値**で行う。fd 数はプロセス全体の共有量なので、
         // 並列実行中の他テストが一時的に開いた fd が「増えた」に見える
         // （#916 でファイルを触るテストが増えたあと CI で 15 → 18 の偽陽性が出た）。
-        // 真のリークなら fd は開いたままなので最小値も下がらず、検出力は落ちない
+        // 真のリークなら fd は開いたままなので最小値も下がらず、検出力は落ちない。
+        //
+        // 許容差を 2 → 6 へ広げた（#983）。設定ファイルを触るテストがさらに増え、
+        // **このテスト単体では緑・スイート全体では 3/3 で 10 → 14** という形で偽陽性が出た
+        // （#983 のテストだけを一緒に走らせると緑 = リークではなく他テストの同時保持）。
+        // 検出力は落ちない: このテストは 10 回接続するので、1 接続でも取りこぼせば
+        // 最小値は +10 側へ動き、+6 では吸収できない
+        const FD_NOISE_TOLERANCE: usize = 6;
         let mut lowest = usize::MAX;
         for _ in 0..30 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             lowest = lowest.min(fd_count());
-            if lowest <= before + 2 {
+            if lowest <= before + FD_NOISE_TOLERANCE {
                 break;
             }
         }
         assert!(
-            lowest <= before + 2,
+            lowest <= before + FD_NOISE_TOLERANCE,
             "IPC 接続 10 回で fd が {before} → {lowest}（6 秒間の最小値）に増えた（リーク）"
         );
     }

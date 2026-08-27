@@ -3365,7 +3365,15 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             .map_err(|e| format!("プロファイルの cwd に移動できない: {} ({e})", cwd.display()))?;
     }
 
+    // #983: この経路は表示言語を初期化していなかったため、`Note` 由来の文言
+    // （サンドボックス状態 #981 / CLI 不在の案内）が設定と無関係に英語で出ていた。
+    // 既に他のサブコマンドが使っている 1 行と同じ形で揃える（既定は En の静的値）
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+
     let master_agent = profile.resolve_master_agent()?;
+    // #983: CLI が無ければタブを作る前に理由 + 次の一手で落ちる
+    // （組み立てたコマンドをそのまま流すと、新しいタブに command not found が出るだけ）
+    orchestrator::agent_cli::preflight(master_agent).map_err(|e| e.message())?;
 
     if profile.master_agent_is_claude() {
         if let Some(warning) = profile
@@ -3553,7 +3561,11 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             .map_err(|e| format!("プロファイルの cwd に移動できない: {} ({e})", cwd.display()))?;
     }
 
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+
     let solo_agent = profile.resolve_master_agent()?;
+    // #983: master と同じ理由で、起動前に CLI の実在を確かめる
+    orchestrator::agent_cli::preflight(solo_agent).map_err(|e| e.message())?;
 
     if profile.master_agent_is_claude() {
         if let Some(warning) = profile

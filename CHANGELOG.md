@@ -131,6 +131,25 @@ Nightly patch release (automated). Changes since v0.7.7:
 
 ### Fixed
 
+- [修正] codex / agy / claude の CLI が入っていない環境で worker を spawn すると、tako が
+  構造化された失敗を 1 つも出さずに「成功」と報告していた問題を修正 (#983)。ペインには
+  `command not found` が出るだけ、送達検査は「実行された」までしか見ず、`prompt_delivery` も
+  claude 以外は `n/a` だったため、**spawn は成功したと言われたのに worker が何もしない**
+  状態（無言死）になっていた。**ペインを作る前に**実行ファイルの実在を確かめ、無ければ
+  理由 + 次の一手（公式の導入コマンド・参考 URL・`tako setup` の案内）を返す。
+  失敗しても空ペインもレジストリの active も残らない。解決した実行ファイルは spawn 応答の
+  `agent_path` に載る。同じ検査は `tako master` / `tako solo` / 引き継ぎの後任 master /
+  コンフリクト解消エージェントにも入っている
+- [Fixed] Spawning a worker when the agent CLI (codex / agy / claude) is not installed no
+  longer reports success while nothing happens (#983). Previously the assembled command was
+  piped straight into the shell, so the pane just showed `command not found`: the delivery
+  check only verifies that *something* ran, and `prompt_delivery` returns `n/a` for
+  non-claude agents — a silent death. tako now checks that the executable exists **before
+  creating the pane** and, when it is missing, returns the reason plus the next step (the
+  official install command, a reference URL and a pointer to `tako setup`). No empty pane
+  and no active registry entry is left behind, and the resolved executable is reported as
+  `agent_path` in the spawn response. The same check guards `tako master`, `tako solo`, the
+  successor master created by a handoff, and the conflict-resolver agent
 - [修正] codex を master / solo / worker に使うとき、承認とサンドボックスを丸ごと外す
   `--dangerously-bypass-approvals-and-sandbox` が**無条件で付いていた**のを、
   プロファイルの `bypass_sandbox`（既定 false）による明示 opt-in へ変更 (#981)。

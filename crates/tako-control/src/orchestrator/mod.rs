@@ -18,6 +18,9 @@ use tako_core::platform::support::Note;
 
 pub use agent::WorkerAgent;
 
+/// agent CLI の実在検査と分類済みの失敗（#983）
+pub mod agent_cli;
+
 /// バイナリ埋め込みのデフォルト system prompt（master 用）
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_system_prompt.md");
 

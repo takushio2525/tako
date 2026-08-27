@@ -7035,6 +7035,10 @@ fn dispatch_orchestrator_handoff(
     let master_agent = profile
         .resolve_master_agent()
         .map_err(DispatchError::InvalidParams)?;
+    // #983: 後任 master の CLI が無ければ**ペインを分割する前に**落とす
+    // （引き継ぎで後任が黙って死ぬと、前任を閉じる主体そのものが居なくなる）
+    orchestrator::agent_cli::preflight(master_agent)
+        .map_err(|e| DispatchError::Operation(e.message()))?;
 
     // #761: role には語彙が 2 つある。ペインに貼る表示用ラベルと、起動コマンドが注入する
     // `TAKO_ORCHESTRATOR_ROLE`（`master:<profile>`）。以前は表示用を env にも入れていたため、
@@ -7191,6 +7195,10 @@ fn dispatch_git_resolve_agent(
     let worker_agent = profile
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
+    // #983: CLI が無ければ**ペインを作る前に**落とす（作ってから流すと
+    // ペインに `command not found` が出るだけで、tako は成功と報告してしまう）
+    let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
+        .map_err(|e| DispatchError::Operation(e.message()))?;
     let launch = profile.resolve_agent_launch(worker_agent, None, None);
 
     // 分割先タブの解決（tab 指定 > 呼び出し元ペインのタブ）。
@@ -7292,6 +7300,8 @@ fn dispatch_git_resolve_agent(
         "tab_id": tab_id.as_u64(),
         "spawned_by": split_target.as_u64(),
         "agent": worker_agent.as_str(),
+        // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
+        "agent_path": agent_cli_path,
         "model": launch.model,
         "effort": launch.effort,
         "title": window_title,
@@ -7404,6 +7414,11 @@ fn dispatch_orchestrator_spawn(
     let worker_agent = profile
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
+    // #983: agent CLI の実在検査。**ペイン分割・レジストリ登録より前**に落とすので、
+    // 失敗しても空ペインも active エントリも残らない（不正 agent の検証と同じ位置）。
+    // 無ければ「理由 + 次の一手」を返す（無言死を作らない）
+    let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
+        .map_err(|e| DispatchError::Operation(e.message()))?;
     // アカウントの default_model / default_effort をフォールバックに使う（#504）
     let effective_model = model.or(resolved_account
         .as_ref()
@@ -7629,6 +7644,8 @@ fn dispatch_orchestrator_spawn(
         "title": window_title,
         "cwd": cwd,
         "agent": worker_agent.as_str(),
+        // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
+        "agent_path": agent_cli_path,
         "model": launch.model,
         "effort": launch.effort,
         "command": worker_cmd,
@@ -15622,6 +15639,116 @@ mod tests {
             action: "delete".into(),
             name: Some(profile.into()),
             ..Default::default()
+        });
+    }
+
+    /// #983: agent CLI が無い環境の spawn は**ペインを作る前に**分類済みエラーで落ちる。
+    /// 「spawn は成功したと言われたのに worker が何もしない」= 無言死を作らないこと
+    #[test]
+    fn issue983_cli不在のspawnはペインを作らずに落ちる() {
+        with_test_project(|| {
+            // 代表 1 系統だけを dispatch 層で確かめる（agent ごとの文言は
+            // `agent_cli` の unit テストが 3 系統ぶん見ている）。ここで系統数ぶん
+            // 回すと設定ファイルの読み書きが増え、プロセス全体の fd 数を見ている
+            // `ipc::連続接続でfdが漏れない` を揺らす（既に #916 で一度踏んでいる罠）
+            {
+                let agent = crate::orchestrator::WorkerAgent::Codex;
+                let _guard = crate::orchestrator::agent_cli::test_force_missing(&[agent]);
+                let mut host = MockHost::new();
+                let master = host.root_pane();
+                let panes_before = host
+                    .workspace()
+                    .tabs()
+                    .iter()
+                    .flat_map(|t| t.tree().panes())
+                    .count();
+                let err = dispatch_orchestrator_spawn(
+                    &mut host,
+                    PaneOrigin::Mcp,
+                    SpawnParams {
+                        project: TEST_PROJECT,
+                        prompt: "cli missing test",
+                        label: None,
+                        model: None,
+                        effort: None,
+                        pane: Some(master),
+                        tab: None,
+                        caller_role: None,
+                        agent: Some(agent.as_str()),
+                        caller_pid: None,
+                        task_type: None,
+                        account: None,
+                        limit_resume: None,
+                    },
+                )
+                .expect_err("CLI が無ければ spawn は失敗する");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(agent.as_str()),
+                    "どの CLI が無いのか名指しすること: {msg}"
+                );
+                assert!(
+                    msg.contains("tako setup"),
+                    "次の一手が付いていること: {msg}"
+                );
+                let panes_after = host
+                    .workspace()
+                    .tabs()
+                    .iter()
+                    .flat_map(|t| t.tree().panes())
+                    .count();
+                assert_eq!(
+                    panes_after,
+                    panes_before,
+                    "{}: 失敗した spawn がペインを残してはいけない",
+                    agent.as_str()
+                );
+            }
+        });
+    }
+
+    /// 正常系（CLI が在る）の spawn は従来どおり成功し、どの実行ファイルを
+    /// 起動したかが応答に載る（#983 の可視化）
+    #[test]
+    fn issue983_cliが在れば従来どおりspawnできて実行ファイルが応答に載る() {
+        with_test_project(|| {
+            // 実探索（ログインシェルの起動）はここでは通さない。この経路の関心事は
+            // 「見つかったら従来どおり spawn できて、解決したパスが応答に載る」ことで、
+            // 探索そのものは agent_cli の unit テストが担保する（重い経路を本筋から
+            // 外す。プロセス全体の fd 数を見る `ipc::連続接続でfdが漏れない` が
+            // 一時的な子プロセスで揺れるため）
+            let _guard = crate::orchestrator::agent_cli::test_force_found(&[(
+                crate::orchestrator::WorkerAgent::Claude,
+                "/usr/local/bin/claude",
+            )]);
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            let val = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                SpawnParams {
+                    project: TEST_PROJECT,
+                    prompt: "cli present test",
+                    label: None,
+                    model: None,
+                    effort: None,
+                    pane: Some(master),
+                    tab: None,
+                    caller_role: None,
+                    agent: None,
+                    caller_pid: None,
+                    task_type: None,
+                    account: None,
+                    limit_resume: None,
+                },
+            )
+            .expect("claude が在る環境では成功する");
+            assert_eq!(val["agent"].as_str(), Some("claude"));
+            assert_eq!(
+                val["agent_path"].as_str(),
+                Some("/usr/local/bin/claude"),
+                "解決した実行ファイルがそのまま応答に載る"
+            );
         });
     }
 
