@@ -2849,6 +2849,9 @@ impl RemoteNotice {
 enum RemotePush {
     /// 押し出し中（ローカルへは書けている）
     Uploading,
+    /// **前のセッション**で押し出せなかった保存が退避に残っている
+    /// （このセッションではまだ保存していない。開いたときに 1 回だけ確認する）
+    Stale,
     /// 押し出せた（`bytes` バイト。競合検知でリモートの内容を突き合わせたか）
     Done { bytes: u64, verified: bool },
     /// 押し出せなかった。**内容は退避されている**ので `push` で再試行できる
@@ -2859,6 +2862,7 @@ impl RemotePush {
     fn as_str(&self) -> &'static str {
         match self {
             RemotePush::Uploading => "uploading",
+            RemotePush::Stale => "pending",
             RemotePush::Done { .. } => "saved",
             RemotePush::Failed { .. } => "failed",
         }
@@ -15857,6 +15861,10 @@ impl TakoApp {
                         crate::ui_text::remote_folder::preview_pushing().to_string(),
                         false,
                     ),
+                    Some(RemotePush::Stale) => (
+                        crate::ui_text::remote_folder::preview_push_pending().to_string(),
+                        true,
+                    ),
                     Some(RemotePush::Done { .. }) => (
                         crate::ui_text::remote_folder::preview_pushed(&remote.label()),
                         false,
@@ -15866,10 +15874,6 @@ impl TakoApp {
                             "{} {message}",
                             crate::ui_text::remote_folder::preview_push_pending()
                         ),
-                        true,
-                    ),
-                    None if tako_core::remote_fs::has_pending(&remote.host, &remote.path) => (
-                        crate::ui_text::remote_folder::preview_push_pending().to_string(),
                         true,
                     ),
                     None => (String::new(), false),
@@ -17967,8 +17971,15 @@ impl UiStateHost for TakoApp {
         } else {
             self.preview_remote_read_only.remove(&pane);
         }
-        // 開き直し（= 競合を解消するための読み直し）で前回の押し出し結果を残さない
+        // 開き直し（= 競合を解消するための読み直し）で前回の押し出し結果を残さない。
+        // ただし**前のセッションで押し出せなかった保存**が残っていれば状態として載せる
+        // （描画のたびにファイルの有無を見に行かないため。#772 / #801 の規範）
         self.preview_remote_push.remove(&pane);
+        if let Some(r) = self.preview_remote_origins.get(&pane) {
+            if tako_core::remote_fs::has_pending(&r.host, &r.path) {
+                self.preview_remote_push.insert(pane, RemotePush::Stale);
+            }
+        }
     }
 
     fn preview_remote_state(&self, pane: PaneId) -> Option<serde_json::Value> {
