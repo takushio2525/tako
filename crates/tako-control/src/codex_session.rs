@@ -145,8 +145,8 @@ pub fn parse_turn_state(lines: &[&str]) -> TurnState {
                     .or_else(|| info["total_token_usage"]["total_tokens"].as_u64());
                 let window = info["model_context_window"].as_u64();
                 if let (Some(used), Some(window)) = (used, window) {
-                    if window > 0 {
-                        st.ctx_percent = Some(((used * 100) / window).min(100) as u32);
+                    if let Some(pct) = used.saturating_mul(100).checked_div(window) {
+                        st.ctx_percent = Some(pct.min(100) as u32);
                     }
                 }
             }
@@ -232,10 +232,13 @@ pub fn thread_id_from_lsof(out: &str) -> Option<String> {
 /// 生きている codex プロセスが握るロックから thread_id を得る。
 /// **1 ペインにつき 1 回だけ呼ぶ**（呼び出し側が sticky に持つ）
 pub fn thread_id_for_pid(pid: u32) -> Option<String> {
-    let out = std::process::Command::new("lsof")
-        .args(["-p", &pid.to_string(), "-Fn"])
-        .output()
-        .ok()?;
+    // GUI から到達する経路なのでコンソール窓の抑止を通す（#628 / #586）。
+    // なお `lsof` は POSIX の道具で Windows には無い（Windows の codex 対応は
+    // ロックの持ち主を別の手段で引く必要がある）
+    let mut cmd = std::process::Command::new("lsof");
+    cmd.args(["-p", &pid.to_string(), "-Fn"]);
+    tako_core::platform::process::no_console_window(&mut cmd);
+    let out = cmd.output().ok()?;
     thread_id_from_lsof(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -367,30 +370,71 @@ pub fn resolve_thread_id_for_backend(backend_session: &str) -> Option<String> {
     static STICKY: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
     let panes = crate::agents::backend_pane_pids();
-    let alive: Vec<&str> = panes.iter().map(|(b, _)| b.as_str()).collect();
     let mut sticky = STICKY.lock().unwrap_or_else(|e| e.into_inner());
     let mut map = sticky.take().unwrap_or_default();
-    // 消えたペインの記憶は捨てる（pane ID 再利用で別 worker の会話を返さない）
-    map.retain(|b, _| alive.contains(&b.as_str()));
+    // 消えたペインの記憶は捨てる（pane ID 再利用で別 worker の会話を返さない）。
+    // **ID は `session:window.pane` 形式**なので接頭辞で見る（下の探索と同じ規則）
+    map.retain(|b, _| session_has_pane(&panes, b));
     if let Some(id) = map.get(backend_session) {
         let id = id.clone();
         *sticky = Some(map);
         return Some(id);
     }
-    let pane_pid = panes
-        .iter()
-        .find(|(b, _)| b == backend_session)
-        .map(|(_, pid)| *pid);
+    // **器のペイン ID は `session:window.pane`**（`agents::tmux_pane_pids` の -F 書式）。
+    // 素の等値で比べると必ず外れる（実測で踏んだ）。claude 側
+    // `resolve_session_id_for_backend` と同じ接頭辞判定にそろえる
+    let pane_pid = pane_pid_of(&panes, backend_session);
+    let diag = std::env::var_os("TAKO_984_DIAG").is_some();
+    if diag {
+        eprintln!(
+            "[984] backend={backend_session} panes={} pane_pid={pane_pid:?}",
+            panes.len()
+        );
+    }
     let resolved = pane_pid.and_then(|pane_pid| {
         let (parents, commands) = crate::agents::capture_process_table();
-        let codex_pid = find_codex_pid(pane_pid, &parents, &commands)?;
-        thread_id_for_pid(codex_pid)
+        if diag {
+            let codex: Vec<u32> = commands
+                .iter()
+                .filter(|(_, c)| is_codex_command(c))
+                .map(|(p, _)| *p)
+                .collect();
+            eprintln!(
+                "[984] parents={} commands={} codex候補={codex:?}",
+                parents.len(),
+                commands.len()
+            );
+        }
+        let codex_pid = find_codex_pid(pane_pid, &parents, &commands);
+        if diag {
+            eprintln!("[984] codex_pid={codex_pid:?}");
+        }
+        let id = thread_id_for_pid(codex_pid?);
+        if diag {
+            eprintln!("[984] thread_id={id:?}");
+        }
+        id
     });
     if let Some(ref id) = resolved {
         map.insert(backend_session.to_string(), id.clone());
     }
     *sticky = Some(map);
     resolved
+}
+
+/// 器のペイン一覧（`session:window.pane`, pane_pid）から、そのセッションの
+/// 代表ペインの pid を取る（**純粋関数**）
+pub fn pane_pid_of(panes: &[(String, u32)], backend_session: &str) -> Option<u32> {
+    let prefix = format!("{backend_session}:");
+    panes
+        .iter()
+        .find(|(id, _)| id.starts_with(&prefix))
+        .map(|(_, pid)| *pid)
+}
+
+/// そのセッションのペインが 1 つでも残っているか（**純粋関数**）
+pub fn session_has_pane(panes: &[(String, u32)], backend_session: &str) -> bool {
+    pane_pid_of(panes, backend_session).is_some()
 }
 
 /// 構造化ソースを使わず画面推定だけに戻す逃げ道（#984 の A/B）
@@ -521,5 +565,30 @@ mod tests {
         assert_eq!(find_codex_pid(100, &parents, &commands), Some(300));
         // 別ペイン配下（800）の codex は拾わない
         assert_eq!(find_codex_pid(700, &parents, &commands), None);
+    }
+}
+
+#[cfg(test)]
+mod pane_lookup_tests {
+    use super::*;
+
+    /// **器のペイン ID は `session:window.pane`**。素の等値で比べると必ず外れる
+    /// （実測で踏んだ回帰。claude 側の `resolve_session_id_for_backend` と同じ規則にする）
+    #[test]
+    fn セッション名の接頭辞でペインpidを引く() {
+        let panes = vec![
+            ("tako-82fbb28dec29:0.0".to_string(), 4242_u32),
+            ("tako-other:0.0".to_string(), 9999_u32),
+        ];
+        assert_eq!(pane_pid_of(&panes, "tako-82fbb28dec29"), Some(4242));
+        assert!(session_has_pane(&panes, "tako-82fbb28dec29"));
+        // 素の等値だった頃の形（`tako-82fbb28dec29` そのもの）では引けない
+        assert_eq!(
+            pane_pid_of(&panes, "tako-82fbb28dec2"),
+            None,
+            "接頭辞の途中一致で誤ヒットしない"
+        );
+        assert_eq!(pane_pid_of(&panes, "tako-missing"), None);
+        assert!(!session_has_pane(&panes, "tako-missing"));
     }
 }
