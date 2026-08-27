@@ -53484,7 +53484,8 @@ mod self_test {
             // ① 走り始めは脈動する = 合図としての意味が残っている
             // ② 全長を過ぎたら、時間を空けて描き直しても不透明度が動かない
             //    = GPUI が `done` にしていて**フレーム要求も止まっている**
-            // の 2 点を見る。判定を「実際に描かれたフレーム数」ではなく
+            // ③ 次に何かが走り始めたら脈動はやり直される
+            // の 3 点を見る。判定を「実際に描かれたフレーム数」ではなく
             // 「アニメーターが計算した不透明度」に置いたのは、ディスプレイリンクが
             // 動かない環境（蓋閉じ・ヘッドレス）でも A/B が成立するようにするため。
             // `TAKO_945_LEGACY=1`（= #945 前の無限 repeat）では ② が落ちる
@@ -53605,6 +53606,34 @@ mod self_test {
                                  (#945。spread {:.3} / last {:.3})",
                                 spread(&late),
                                 late.last().copied().unwrap_or(f32::NAN)
+                            ),
+                        );
+                        // ③ 走り終わって次のコマンドが走り始めたら脈動はやり直される。
+                        //
+                        // 時計を自前で持たず GPUI の element state の寿命に任せている
+                        //（描かれなかったフレームがあると捨てられる）ので、
+                        // 「Idle を 1 フレーム挟む」ところまで含めて実際に確かめる
+                        let restart = {
+                            let feed = |cx: &mut gpui::AsyncApp, bytes: &'static [u8]| {
+                                let _ = window945.update(cx, |app: &mut TakoApp, _, cx| {
+                                    if let Some(session) = app.terminals.get_mut(&pane) {
+                                        session.feed_osc_bytes(bytes);
+                                    }
+                                    cx.notify();
+                                });
+                                notify_and_draw(any945, window945, cx);
+                            };
+                            feed(cx, b"\x1b]133;D;0\x07");
+                            feed(cx, b"\x1b]133;C\x07");
+                            wait(cx, 400).await;
+                            sample(cx).1
+                        };
+                        println!("TAKO_SELF_TEST_945_RESTART: opacity={restart:.3}");
+                        check(
+                            restart < 0.9,
+                            &format!(
+                                "128: 次に走り始めたら脈動がやり直される \
+                                 (#945。opacity {restart:.3})"
                             ),
                         );
                         // 後片付け: 検証用タブを閉じる
