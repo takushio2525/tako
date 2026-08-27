@@ -3486,3 +3486,26 @@
   `--check-assets v0.7.8` が `[NG] Windows: 配布物が無い` + exit 1。番犬も revert で FAILED を実測
 - 次: PR merge → **v0.7.9 として初回の両 OS 同時リリースを実行**（タグ push で Windows の
   ワークフローが走る → `scripts/release.sh --test`）
+
+## 2026-08-27（#983 変更 1: 非 claude agent の spawn の無言死を塞ぐ）
+- CLI が無い環境の spawn は「成功」と報告されるのに worker が何もしない状態だった
+  （ペインに `command not found` が出るだけ / 送達検査は「実行された」までしか見ない /
+  `prompt_delivery` は claude 以外 `n/a`）。**ペインを作る前**に境界 B16 で実在を確かめ、
+  無ければ理由 + 次の一手（公式の導入コマンド・参考 URL・`tako setup`）を返す形へ
+- 入れた場所は agent CLI を起動する 5 経路（spawn / master / solo / 引き継ぎの後任 master /
+  コンフリクト解消）。応答に `agent_path`（解決した実行ファイル）を追加
+- 実機 A/B（同一バイナリ・`TAKO_983_LEGACY=1` が before）: **before** = spawn が成功して
+  pane 2 が生え、ペインに `zsh: command not found: codex`、レジストリは
+  `status=active` / `prompt_delivery=n/a`（= 報告どおりの無言死）。**after** = 3 系統とも
+  分類済みエラー + ペイン数不変（1 → 1）+ workers.yaml が作られない
+- **副産物で 1 件直した**: `tako master` / `tako solo` は表示言語を初期化していなかったため、
+  `Note` 由来の文言（#981 のサンドボックス行・#983 の案内）が設定と無関係に英語で出ていた
+  （`CURRENT` の静的既定が En）。既に setup 等が使っている 1 行と同じ形で揃えた
+- **`ipc::連続接続でfdが漏れない` の許容差を 2 → 6 へ**。#983 のテストを加えるとスイート全体で
+  3/3 落ちる（fd 10 → 14）が、**自分のテストだけを一緒に走らせると緑** = リークではなく
+  他テストの同時保持。意図的なリーク注入（`mem::forget`）では 17 → 57 になり +6 では
+  吸収できないことを実測して検出力を確かめた
+- 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 全緑（3 連続）/ Windows
+  クロスチェックの警告リストが main と完全一致 / 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
+- 次: 変更 2 / 3（送達観測手段の無い agent を `NotApplicable` のまま黙らせない・系統の網羅）は
+  #982（agent 能力マトリクス）の merge 後
