@@ -59,6 +59,65 @@ const CHAR_WIDTH_PX: f32 = 7.0;
 const LABEL_MAX_CHARS: usize = 24;
 /// タブラベルの最小文字数（縮小限界）
 const LABEL_MIN_CHARS: usize = 6;
+/// 実行中ドットの脈動（#217）を「走り始めの合図」に限る回数（Issue #945）。
+///
+/// 1 回 = [`DOT_PULSE_PERIOD`]（不透明度 1.0 → 0.35 → 1.0 の 1 往復）。
+/// 3 回 = 6 秒で、そのあとは色だけの静的表示になる
+const DOT_PULSE_COUNT: u32 = 3;
+/// 脈動 1 往復ぶんの長さ（#217 から不変。合計は [`DOT_PULSE_COUNT`] 倍）
+const DOT_PULSE_PERIOD: Duration = Duration::from_secs(2);
+
+/// 実行中ドットの不透明度（`t` は脈動全体の進捗 0.0〜1.0）。
+///
+/// [`DOT_PULSE_COUNT`] 回ぶんの正弦の山を並べたもの。**両端がちょうど 1.0** に
+/// なるので、脈動が終わった瞬間に不透明度が飛ばない（#945）
+fn tab_dot_opacity(t: f32) -> f32 {
+    let phase = std::f32::consts::PI * t * DOT_PULSE_COUNT as f32;
+    1.0 - 0.65 * phase.sin().abs()
+}
+
+/// 脈動が最後に計算した不透明度（#945 の検証用。f32 のビット列。初期値 = 1.0）
+static DOT_PULSE_LAST_OPACITY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000);
+/// 脈動のフレームを計算した回数（同上。単調増加）
+static DOT_PULSE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 脈動が 1 フレーム計算されたことを記録する（引数はそのまま返す）。
+///
+/// GPUI の `AnimationElement` は**アニメーションが終わっていないフレームだけ**
+/// `request_animation_frame()` を呼ぶので、「時間を空けて描き直しても不透明度が
+/// 動かない」= 完了していて**フレーム要求も止まっている**、と言い切れる。
+/// 画面（ディスプレイリンク）の有無に依存せず A/B が取れるのでこの形にした
+fn record_dot_opacity(opacity: f32) -> f32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    DOT_PULSE_LAST_OPACITY.store(opacity.to_bits(), Relaxed);
+    DOT_PULSE_FRAMES.fetch_add(1, Relaxed);
+    opacity
+}
+
+/// 脈動の観測値（計算フレーム数, 最後の不透明度）。セルフテスト項目 128（#945）用
+pub(crate) fn dot_pulse_probe() -> (u64, f32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DOT_PULSE_FRAMES.load(Relaxed),
+        f32::from_bits(DOT_PULSE_LAST_OPACITY.load(Relaxed)),
+    )
+}
+
+/// 脈動 1 巡の長さ（セルフテストが待ち時間をここから作るための公開。#945）
+pub(crate) fn dot_pulse_total() -> Duration {
+    DOT_PULSE_PERIOD * DOT_PULSE_COUNT
+}
+
+/// 脈動を #945 前（2 秒周期の無限 repeat）へ戻す逃げ道（`TAKO_945_LEGACY=1`）。
+///
+/// 同じバイナリで「フレーム要求が止まるか」を A/B するために使う。
+/// 既定は有効（未設定 = 有限回で終わる）
+fn dot_pulse_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_945_LEGACY").is_some())
+}
+
 /// 右端コントロール群の概算幅
 /// （⌘K(210+px) + bell(30) + ui-mode(30) + theme(30) + gap + margin。#694 で +30）
 const RIGHT_CONTROLS_PX: f32 = 330.0;
@@ -324,13 +383,35 @@ impl TakoApp {
                                         inset: false,
                                     }])
                                 });
-                            let dot = if pulsing {
+                            // 脈動は「走り始めた」の合図なので有限回で終わらせる（#945）。
+                            //
+                            // GPUI の `AnimationElement` は動いているあいだ毎フレーム
+                            // `request_animation_frame()` を呼ぶ。`repeat()` だと
+                            // エージェント（claude / codex）のようにフォアグラウンドで
+                            // 走り続けるペインのタブが**永久にフレームを要求し続ける**ので、
+                            // #786 / #801 / #803 で削った毎フレームの固定費が復活する。
+                            // oneshot なら完了フレームで要求が止まり、以後は色だけの
+                            // 静的表示（= 走っていること自体は分かる）になる。
+                            //
+                            // 走り終われば `pulsing` が false になって要素ごと消えるため、
+                            // 次に何かが走り始めたときは element state が作り直されて
+                            // 脈動もやり直される（GPUI は描かれなかった element state を捨てる）
+                            let dot = if pulsing && dot_pulse_legacy() {
                                 dot.with_animation(
                                     ("tab-dot-pulse", id.as_u64()),
-                                    Animation::new(Duration::from_secs(2)).repeat(),
+                                    Animation::new(DOT_PULSE_PERIOD).repeat(),
                                     |el, t| {
-                                        el.opacity(1.0 - 0.65 * (std::f32::consts::PI * t).sin())
+                                        el.opacity(record_dot_opacity(
+                                            1.0 - 0.65 * (std::f32::consts::PI * t).sin(),
+                                        ))
                                     },
+                                )
+                                .into_any_element()
+                            } else if pulsing {
+                                dot.with_animation(
+                                    ("tab-dot-pulse", id.as_u64()),
+                                    Animation::new(dot_pulse_total()),
+                                    |el, t| el.opacity(record_dot_opacity(tab_dot_opacity(t))),
                                 )
                                 .into_any_element()
                             } else {
@@ -872,5 +953,54 @@ impl TakoApp {
                             .text_color(hsla(theme.text_muted)),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 脈動の**両端**が不透明度 1.0 になる（#945）。
+    ///
+    /// GPUI の oneshot は完了後 `delta` を 1.0 に貼り付けたまま止まるので、
+    /// t=1.0 が 1.0 でないと「脈動が終わった瞬間に色が飛ぶ」ことになる
+    #[test]
+    fn 脈動の両端は不透明度_1_0() {
+        assert!((tab_dot_opacity(0.0) - 1.0).abs() < 1e-4);
+        assert!((tab_dot_opacity(1.0) - 1.0).abs() < 1e-4);
+    }
+
+    /// 山の数は [`DOT_PULSE_COUNT`] 回で、山の底は #217 と同じ 0.35
+    #[test]
+    fn 脈動は指定回数ぶん同じ山を並べる() {
+        for k in 0..DOT_PULSE_COUNT {
+            // 各山の頂点（= 最も薄いところ）
+            let t = (k as f32 + 0.5) / DOT_PULSE_COUNT as f32;
+            assert!(
+                (tab_dot_opacity(t) - 0.35).abs() < 1e-4,
+                "山 {k} の底が 0.35 でない: {}",
+                tab_dot_opacity(t)
+            );
+            // 山と山の境目は 1.0 へ戻る
+            let edge = k as f32 / DOT_PULSE_COUNT as f32;
+            assert!((tab_dot_opacity(edge) - 1.0).abs() < 1e-4);
+        }
+    }
+
+    /// 不透明度は常に 0.0〜1.0（`.abs()` を外すと 1.0 を超える）
+    #[test]
+    fn 不透明度は常に範囲内() {
+        for i in 0..=1000 {
+            let t = i as f32 / 1000.0;
+            let o = tab_dot_opacity(t);
+            assert!((0.0..=1.0).contains(&o), "t={t} で {o}");
+        }
+    }
+
+    /// 脈動の長さは「1 往復 × 回数」（セルフテストの待ち時間の根拠）
+    #[test]
+    fn 脈動の全長は往復の整数倍() {
+        assert_eq!(dot_pulse_total(), DOT_PULSE_PERIOD * DOT_PULSE_COUNT);
+        assert_eq!(dot_pulse_total(), Duration::from_secs(6));
     }
 }
