@@ -468,6 +468,105 @@ fn agents走査がposixシェルの直起動へ戻っていない() {
     );
 }
 
+/// **#722 の番犬**: 実行ファイルの探索が、ログインシェルへ `command -v` を尋ねる形で
+/// 抽象境界 B16（`tako_core::platform::exe::find`）の外に残っていないこと。
+///
+/// この直呼びは **Windows で必ず失敗するのに `Option` へ化けて握り潰される**のが厄介で、
+/// 「機能が無い」ではなく「機能が黙って無効になる」形で現れる。#525 は `tako setup` が
+/// 全滅し、#722 は AI 自動命名が一度も走らなかった（`SHELL` も `/bin/sh` も無いので
+/// `CreateProcess` が失敗 → `.ok()?` で `None`。`claude_bin()` は `OnceLock` なので
+/// プロセスが生きている限り復活しない）。**どちらもエラーは 1 つも出ていない**。
+///
+/// #898 の番犬（`which` / `where` の直起動）とは形が違うので別に見る。あちらは
+/// 「Windows に無いコマンドを起こす」形、こちらは「Windows に無いシェルを起こす」形
+#[test]
+fn 実行ファイルの探索がログインシェル経由で境界の外に残っていない() {
+    // 素の名前（`Command::new("gh")`）へ先にフォールバックする実装は Windows でも
+    // 解決できるので許可する。**握り潰す形だけ**を落とす
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/tako-core/src/platform/exe.rs",
+            "境界 B16 の実装本体（unix 経路）",
+        ),
+        (
+            "crates/tako-core/src/lib.rs",
+            "resolve_bin(): 素の名前へフォールバックするので Windows でも解決できる\
+             （PATHEXT とユーザー導入先を見ないぶん B16 より弱いだけ）",
+        ),
+        (
+            "crates/tako-app/src/preview.rs",
+            "resolve_bin() と同型のヘルパー。理由も同じ（素の名前へフォールバックする）",
+        ),
+        (
+            "crates/tako-control/src/config_share/env.rs",
+            "find_gh(): `gh --version`（素の名前）を先に試し、シェル経路は #[cfg(unix)] の中",
+        ),
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        collect_login_shell_lookups(
+            &root.join("crates").join(crate_dir).join("src"),
+            &root,
+            ALLOWED,
+            &mut offenders,
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "実行ファイルの探索がログインシェル経由で境界の外にある:\n  {}\n\
+         → tako_core::platform::exe::find へ寄せてください（#525 / #722 / 設計 §2 の B16）",
+        offenders.join("\n  ")
+    );
+}
+
+/// 「ログインシェルに `command -v` で場所を尋ねる」行だけを拾う。
+/// **2 条件の AND** にしてあるのは、ペインへ打ち込む文字列（セルフテストの
+/// `type_text(.., "command -v tako", ..)`）や doc コメント中の言及を巻き込まないため
+fn collect_login_shell_lookups(
+    dir: &Path,
+    root: &Path,
+    allowed: &[(&str, &str)],
+    out: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_login_shell_lookups(&path, root, allowed, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        // 許可リストも報告文も `/` 区切りで書く（Windows の strip_prefix は `\` を返す）
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        if allowed.iter().any(|(p, _)| rel == *p) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (idx, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code.contains("\"-l\", \"-c\"") && code.contains("command -v") {
+                out.push(format!("{rel}:{}", idx + 1));
+            }
+        }
+    }
+}
+
 /// **#866 の番犬**: tmux の完全一致ターゲット（`=name`）の直書きが、ターゲット構文の境界
 /// （`tako_core::tmux::exact_target` / `session_pane_target`）の外に残っていないこと。
 ///
