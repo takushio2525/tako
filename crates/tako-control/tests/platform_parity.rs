@@ -607,8 +607,9 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/platform/os_integration.rs",
-            8,
-            "境界 B8 の macOS / Linux 実装（open / osascript / xdg-open）。Windows 側は適用済み",
+            7,
+            "境界 B8 の macOS / Linux 実装（open / osascript / xdg-open）+ テストの osascript 1 件。\
+             Windows 側（explorer / cmd start）は #617 で適用済みなので数に入らない",
         ),
         (
             "crates/tako-control/src/remote.rs",

@@ -90,6 +90,65 @@ pub fn note_external_change() -> &'static str {
 mod tests {
     use super::super::tests_support;
     use super::*;
+    use tako_core::i18n::Lang;
+
+    /// ファイルマネージャ / ごみ箱の呼び名が **OS ごとに実際に分かれている**（#617）。
+    ///
+    /// `cfg!(windows)` で分岐していた頃は macOS 側の CI で Windows の文言を 1 文字も
+    /// 検査できなかった。`FileManager` を値で受け取る形にしたので、**macOS 上から
+    /// Windows 側の表記も固定できる**（`settings_sleep::Device` と同じ作法。#905）。
+    /// 「Windows で押しても何も起きない Finder ラベル」の再発をここで止める
+    #[test]
+    fn ファイルマネージャの呼び名がosごとに分かれている() {
+        use super::super::{pane_menu, settings};
+        tests_support::with_lang(Lang::Ja, || {
+            assert_eq!(menu_reveal(FileManager::Finder), "Finder で表示");
+            assert_eq!(menu_reveal(FileManager::Explorer), "エクスプローラーで表示");
+            assert_eq!(menu_trash(FileManager::Finder), "削除");
+            assert_eq!(menu_trash(FileManager::Explorer), "ごみ箱に移動");
+            assert_eq!(
+                pane_menu::reveal_cwd(FileManager::Explorer),
+                "エクスプローラーで開く"
+            );
+            assert_eq!(
+                settings::advanced_reveal(FileManager::Explorer),
+                "エクスプローラーで表示"
+            );
+        });
+        tests_support::with_lang(Lang::En, || {
+            assert_eq!(menu_reveal(FileManager::Finder), "Reveal in Finder");
+            assert_eq!(menu_reveal(FileManager::Explorer), "Reveal in Explorer");
+            assert_eq!(menu_trash(FileManager::Finder), "Move to Trash");
+            assert_eq!(menu_trash(FileManager::Explorer), "Move to Recycle Bin");
+        });
+        // 出し分けが「同じ文字列を 2 回返す」形へ退化していないこと（両言語で）
+        tests_support::for_each_lang(|| {
+            for (finder, explorer) in [
+                (
+                    menu_reveal(FileManager::Finder),
+                    menu_reveal(FileManager::Explorer),
+                ),
+                (
+                    menu_trash(FileManager::Finder),
+                    menu_trash(FileManager::Explorer),
+                ),
+                (
+                    pane_menu::reveal(FileManager::Finder),
+                    pane_menu::reveal(FileManager::Explorer),
+                ),
+                (
+                    pane_menu::reveal_cwd(FileManager::Finder),
+                    pane_menu::reveal_cwd(FileManager::Explorer),
+                ),
+                (
+                    settings::advanced_reveal(FileManager::Finder),
+                    settings::advanced_reveal(FileManager::Explorer),
+                ),
+            ] {
+                assert_ne!(finder, explorer, "OS 別の出し分けが効いていない");
+            }
+        });
+    }
 
     #[test]
     fn catalog_has_both_languages_and_no_emoji() {

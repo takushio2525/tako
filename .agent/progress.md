@@ -3179,3 +3179,40 @@
   fmt / clippy（両 feature）/ test --workspace / 隔離セルフテスト `TAKO_APP_SELF_TEST_OK` /
   Windows クロスチェック エラー 0・警告 12（main 同数）
 - 次: ユーザー実機での症状消失の確認（#932 のクローズは master 判断）
+
+## 2026-08-26（#617: Windows のファイル操作を是正 — 完全削除をごみ箱移動へ）
+- **実装は main に 1 行も入っていなかった**（win467 の `d528058` / `4752eee` 止まり = #658 /
+  #591 と同じ型）。Issue 本文が「実装済み + 実機実測つき」に見えるので**ブランチの所在を
+  先に確かめる**こと。base の `os_integration.rs` は main と完全一致だったのでファイルごと
+  移植し、この 1 か月ぶんの main の変化（`ui_text::pane_menu` の新設 / MCP カタログの分割 /
+  #591 の `windows_evidence`）へ合わせ直した
+- 中身 4 つ: **ごみ箱** = `SHFileOperationW` + `FOF_ALLOWUNDO`（絶対化は境界の内側。
+  `canonicalize` の verbatim 形式はシェル API が解釈できないので `std::path::absolute`）/
+  **reveal** = `explorer /select,"<パス>"` を `raw_arg` で（explorer は `CommandLineToArgvW` を
+  使わないので引数全体を括ると既定フォルダが開く）/ **開く系** = `ShellExecuteW`
+  （「このアプリで開く…」は `openas` verb が選択と起動を 1 操作で行うため境界 API を
+  `pick_application()` → `open_with_dialog(path)` へ）/ **通知** = 戻り値を `bool` へ
+- **その他 unix は削除への劣化をやめエラーにした**。ラベルが復元を約束していて確認も無いので、
+  「ゴミ箱のつもりの完全削除」だけは構造的に起こさない
+- 表記は `os_integration::file_manager()` の 1 か所で決め、ラベル側は `FileManager` を
+  **値で受け取る**（#905 の `Device` と同じ作法 = **macOS 上から Windows 側の文言も検査できる**）。
+  win467 版の `cfg!(windows)` 直書きだと macOS の CI で Windows の文言を 1 文字も見られない
+- 番犬 2 つ: B8 の直呼び検査へ `explorer` / `ShellExecuteW` / `SHFileOperationW` を追加 +
+  **「ゴミ箱移動が完全削除へ劣化していない」**（ソース走査なので macOS からも Windows CI からも走る）
+- マトリクスは `tako_file_op` を `Degraded` → `Supported`、注記 `WIN_TRASH_PERMANENT` を削除。
+  この文言は system prompt へ流れる（#516）ので、放置すると**エージェントが tako のごみ箱を
+  避けて自前の `Remove-Item` を打ちうる** = Issue が防ごうとした事故そのものを誘発する
+- 検証: fmt / clippy(--all-targets -D warnings) / test（tako-core 928・tako-app 488 +
+  ui_text 40・tako-control lib 1100・platform_parity 16・no_personal_data 4・
+  migration_registry 3・config_share_catalog 6・mcp スナップショット 3）/ Windows クロスチェック
+  `--all-targets` エラー 0・警告 24（発生源は video_player / scroll / tmux_backend / remote の
+  既存 test-only 項目のみで、**触ったファイルは 1 件も含まない**）/ docs 再生成 + `--check` 同期。
+  検出力 3 件（完全削除へ戻す → 行番号つき FAILED / 境界の外の `ShellExecuteW(` → FAILED /
+  出し分けの退化 → FAILED）を実測
+- **高負荷時のフレーク 2 件は main 由来**: 並行ビルド中の run で
+  `ipc::tests::連続接続でfdが漏れない`（fd 12→16）と
+  `remote::tests::daemon_stop_implはゾンビpidを終了済みとして扱う`（5s 想定に対し 10.07s）が
+  落ちたが、後者は `origin/main` の `remote.rs` へ差し替えても同じく落ちる = 私の変更とは無関係。
+  **負荷が引いた最終 run では tako-control lib 1102 passed / 0 failed で両方とも緑**
+- **実機未検証**（Windows offline）: ごみ箱への実移動 / エクスプローラーの選択表示 /
+  既定アプリ起動 / `#[cfg(windows)]` の単体テスト 5 本。#617 は open 維持で確認項目をコメント
