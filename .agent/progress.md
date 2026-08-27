@@ -3263,3 +3263,6 @@
   `autorename.rs:278` を名指して FAILED することを実測
 - **実機未検証**（Windows offline）: AI 命名が実際に走ってタブ名が AI 由来になること /
   claude 不在時のヒューリスティック落ち / `#[ignore]` の実 claude e2e。#722 は open 維持
+- 副産物 **#962 起票**: `daemon_stop_implはゾンビpidを終了済みとして扱う` が負荷次第で落ちる
+  （2 秒アサートに対し実測 2.27 / 5.10 / 10.07 秒）。#617 では `origin/main` の remote.rs へ
+  差し替えても落ち、#722 では remote.rs の差分が **0 行**なのに落ちたので main 由来で確定
