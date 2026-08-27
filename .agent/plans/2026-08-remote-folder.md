@@ -332,14 +332,16 @@ clamshell 閉 + 画面 OFF なので `screencapture` は**全面黒しか撮れ�
 `ps` を PATH で中継して**採取回数そのもの**を数えた（`ps -axo pid=,ppid=,command=` =
 `ProcessSnapshot` の採取だけを数える）。ペインはプロンプト待ち（OSC 133 = `idle`）:
 
-| 窓 | ProcessSnapshot の採取 |
-|---|---|
-| 自動追加 **ON** 120 秒 | **6 回** |
-| 自動追加 **OFF** 120 秒 | **6 回** |
+| 窓 | ProcessSnapshot の採取 | プロセスの CPU 時間（別 run・180 秒窓） |
+|---|---|---|
+| 自動追加 **ON** | **6 回 / 120 秒** | 2.60 秒（1.44%） |
+| 自動追加 **OFF** | **6 回 / 120 秒** | 2.50 秒（1.39%） |
 
-**同数** = 検知由来の増加はゼロ（6 回は sleep_guard #779 と stale binary #772 の
-60 秒保険で、位相がずれて交互に出る既存分）。フレーム要求も増えない
-（`apply_ssh_scan` は `cx.notify()` を呼ばず、通知するのは実際に追加・切断した瞬間だけ）。
+採取回数が**同数** = 検知由来の増加はゼロ（6 回は sleep_guard #779 と stale binary #772 の
+60 秒保険で、位相がずれて交互に出る既存分）。CPU の差 0.10 秒 / 180 秒（0.06 ポイント）は
+計測ノイズの範囲（ON の窓が先で起動直後の一時的な作業を含む。`ps` を 1 回も余分に
+起動していない事実と合わせて読む）。フレーム要求も増えない（`apply_ssh_scan` は
+`cx.notify()` を呼ばず、通知するのは実際に追加・切断した瞬間だけ）。
 
 ### 見た目（実ピクセル。`TAKO_VISUAL_ONLY=remote-tree`）
 
@@ -374,6 +376,25 @@ TAKO_SELF_TEST_976: legacy=false targets(off/on)=0/6 jobs=1 live=true after_loca
 | `TAKO_976_LEGACY=1`（検知しない） | 項目 130 (a) | `off=0 on=0` |
 | `TAKO_976_LEGACY=1`（`host: ` 付きの旧ルート名。項目 124 を A/B 対応にする前） | 項目 124 (b) | `root_like_local=false` |
 | ローカルルートを実在させないまま並びを測る（visual-test の場面不備） | `remote-badge` | `order_ok=false local_y=-1.0` |
+
+## 18. visual-test 全節の状況（main 由来の失敗を切り分けた）
+
+`TAKO_VISUAL_TEST=1`（全節）は **main でも** ちらつき節の
+「出力中のペインの外側は前の絵へ戻らない（#932）」で落ちる。同一 worktree で
+`git checkout origin/main -- crates/` して同じ節を回した A/B:
+
+| | 実測 |
+|---|---|
+| main（`origin/main` の crates） | `output-running … reverted_tiles=5 spots=[(320,0),(320,32),(256,64),(288,64),(320,64)]` → FAILED |
+| このブランチ | `output-running … reverted_tiles=7 spots=[(320,0),(352,0),(384,0),(384,32),(320,64),(352,64),(384,64)]` → FAILED |
+
+`spots` はどちらも**タブバーの帯**（y=0〜64）で、#945 の「走り始めのドット脈動」が
+反転タイルとして数えられている。件数の 5 / 7 は run ごとの揺れ（脈動の位相）で、
+このブランチの変更はタブバーに触っていない = **main 由来**。
+
+なお `TAKO_VISUAL_ONLY=flicker` 単独では `idle-4pane` は `distinct=1 changed=0`
+（きれい）で、全節通しのときだけ汚れる: 前の節が残したペイン（7 枚）と出力が
+「静止画面」の前提を崩している。これも main と同じ形。
 
 ## 17. 未検証・既知の限界
 

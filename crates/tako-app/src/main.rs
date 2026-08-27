@@ -28028,11 +28028,9 @@ mod self_test {
             // 畳めば「ローカルの見出しの下にリモートの見出しが並ぶ」絵がそのまま撮れる
             let local: Vec<std::path::PathBuf> = app.filetree.roots().to_vec();
             for path in local {
-                let expanded = app
-                    .filetree
-                    .rows()
-                    .iter()
-                    .any(|row| row.root && row.remote.is_none() && row.entry.path == path && row.expanded);
+                let expanded = app.filetree.rows().iter().any(|row| {
+                    row.root && row.remote.is_none() && row.entry.path == path && row.expanded
+                });
                 if expanded {
                     app.filetree.toggle_dir(&path);
                 }
