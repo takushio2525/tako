@@ -96,7 +96,7 @@ tako/
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱。**`--install` は配置後にビルド出力を消して Launch Services の登録も外す** = Finder の「このアプリケーションで開く」に tako が 2 つ並ばない。#837） |
 | リリース（**両 OS 同時が既定**。#594/#965） | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト。ノートは実アセットから生成 = ダウンロード表 + **動作要件** + OS 別手順 + Known limitations。`--notes-only` で生成物のドライラン、`--update-notes [tag]` でアセット後付け後のノート作り直し）。<br>**リリースは macOS / Windows の配布物が揃って初めて成立する（#965）**: タグ push が `.github/workflows/release-windows.yml` を起こして windows ランナーが installer exe / zip を同じ Release へ添付し、`release.sh` は**その添付を待ってから**ノートを作り直す。揃わなければ **exit 3**（= Release は作られたが片肺）で回収手順を出す。緊急の macOS 先行公開は `--no-wait-windows`。公開済みリリースの検査は `--check-assets [tag]`（揃っていなければ exit 1） |
-| 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166）。**両 OS 対応（#965）**: タグ push で Windows 配布物のワークフローが走り、`release.sh` の待ち合わせを通るので夜間も両 OS が揃う。片肺で終わったら通知 + ログに回収手順（Release 自体は成立しているのでロールバックはしない） |
+| 夜間リリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166）。**両 OS 対応（#965）**: タグ push で Windows 配布物のワークフローが走り、`release.sh` の待ち合わせを通るので夜間も両 OS が揃う。片肺で終わったら通知 + ログに回収手順（Release 自体は成立しているのでロールバックはしない）。<br>**次回バージョンの予約（#1005）**: 既定は patch bump だが、節目の minor / major を夜間発火に乗せたいときは `scripts/nightly-release.sh --reserve 0.8.0`（確認は引数なしの `--reserve`、取消は `--unreserve`）。**予約は成立したリリース 1 回で消費**され、使えない値（semver 外 / 現行以下 / タグが既に在る）は**無視して patch bump へフォールバック**しつつ警告 + 通知を出す。リリースに至らなかった夜（変更ゼロ・dirty・ビルド失敗・dry-run）は**予約を保持**して次の夜へ持ち越す。正本は `scripts/lib/nightly-reserve.sh`、モックテストは `bash scripts/test-nightly-reserve.sh`（本番のタグ / Release / 予約に触らない） |
 | **Windows 配布物生成（既定は CI。#587/#965）** | 通常はタグ push で `.github/workflows/release-windows.yml`（windows ランナー）が自動生成・自動添付するので**手で叩く必要はない**。実機で作るなら `pwsh -File installer/windows/build-installer.ps1 [-Version v0.7.0]`（`dist/windows/` に `tako-<tag>-windows-x86_64.exe`（インストーラー = 主形式）+ `tako-<tag>-windows-x86_64.zip`（ポータブル）。Inno Setup 6 の ISCC が要る。**アセット名の正は `tako-core::platform::release_assets`** で、PowerShell 側の写し `installer/windows/lib/release-assets.ps1` を経由して組む = リリース側と `tako update` の判定が食い違わない（#594/#595）） |
 | **Windows リリース（CI が使えないときの実機経路。#587/#965）** | `pwsh -File installer/windows/release-windows.ps1`（前検査 → ビルド → 配布物検査まで。**既定は dry-run**、`-Upload` で GitHub Release へ添付、`-CreateRelease` で prerelease 新規作成。タグ省略時は Cargo.toml から `v<version>`）。配布物の検査は CI と同じ 1 実装（`installer/windows/lib/verify-assets.ps1`）を通るので、生成場所で基準が変わらない |
 | Windows アプリアイコン再生成 | `pwsh -File installer/windows/make-icon.ps1`（A 案 PNG → `assets/icon/tako.ico`。System.Drawing だけで動く = Windows 専用。`.ico` はコミット済みなので通常は不要） |
@@ -219,14 +219,47 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
   `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
   テストが検証する（ノートの要件と配布物の実際の下限がズレない）
 
-### 夜間パッチリリース（自動。#166）
+### 夜間リリース（自動。#166 / #1005）
 
 - `scripts/nightly-release.sh` が launchd（`com.takushio.tako-nightly-release`、毎日 5:00）から
-  実行され、前回タグ以降に main へ変更があった夜だけパッチバージョンを自動リリースする
-  （patch bump → CHANGELOG 自動節 → コミット → annotated tag → release.sh でバイナリ付き
+  実行され、前回タグ以降に main へ変更があった夜だけ自動リリースする
+  （version bump → CHANGELOG 自動節 → コミット → annotated tag → release.sh でバイナリ付き
   GitHub Release）。クラウドルーチンでの夜間リリースはバイナリを作れず廃止した（経緯は #166）
 - 自動スキップ条件: 変更なし / worktree dirty / 手動リリース進行中（Cargo.toml version ≠ 最新タグ）/
-  多重起動。ログは `~/.claude-orchestrator/logs/tako-nightly-release.log`
+  プレリリース版 / 多重起動。ログは `~/.claude-orchestrator/logs/tako-nightly-release.log`
 - ジョブ登録は `scripts/nightly-release.sh --install-launchd`（解除は `--uninstall-launchd`、
   確認は `launchctl list | grep tako-nightly`）。plist はリポに置かず実行時に生成する
-- minor / major リリース・Homebrew cask 更新・リリースノートの日英併記は従来どおり手動で行う
+- Homebrew cask 更新・リリースノートの日英併記は従来どおり手動で行う
+
+#### 次回バージョンの予約（#1005）
+
+**版数は既定で patch bump**。節目の minor / major を夜間発火に乗せたいときだけ予約する
+（Cargo.toml を先に上げると「≠ 最新タグ = 手動リリース進行中」でスキップされるため、
+版数の指定は**リポジトリの外**の状態ファイルで持つ）。
+
+| 操作 | コマンド |
+|---|---|
+| 予約する | `scripts/nightly-release.sh --reserve 0.8.0` |
+| 確認する | `scripts/nightly-release.sh --reserve`（引数なし） |
+| 取消する | `scripts/nightly-release.sh --unreserve` |
+
+- 正本は `scripts/lib/nightly-reserve.sh`（読み書き・検証・版種判定の 1 実装）。
+  予約ファイルは `~/.claude-orchestrator/state/tako-nightly-next-version`
+  （ログ / ロックと同じ置き場。**リポジトリの外**なので worktree を dirty にせず、
+  ロールバックの `git reset --hard` でも消えず、誤コミットの余地も無い）
+- **予約は成立したリリース 1 回で消費**される（タグを push した時点でクリア）。
+  版種（patch / minor / major）は CHANGELOG の節・コミット件名・タグ注釈へ自動で載る
+- **予約しても配布形態は変わらない**: 夜間リリースは常に**テスト版（prerelease）**として出る
+  （#403）。節目の版を安定版として出したいときは、出たあとに
+  `scripts/release.sh --promote v<tag>` で昇格させる
+- 使えない予約値（semver 外 / プレリリース付き / 現行以下 / タグが既に在る）は
+  **予約を無視して patch bump へフォールバック**し、警告ログ + 通知を出す
+  （`--reserve` での指定時にも同じ検証で弾く）
+- **リリースに至らなかった夜は予約を保持する**。「予約あり + 変更ゼロ」でも消費せず、
+  次に変更が入った夜へ持ち越す（dirty / 手動リリース進行中 / プレリリース版 /
+  ビルド失敗 / `--dry-run` も同じ）
+- 検証は `bash scripts/test-nightly-reserve.sh`（一時ディレクトリに origin + 作業リポを
+  作り、launchd と同じ `/bin/bash` で実走させる。release.sh はスタブ・HOME も隔離するので
+  **本番のタグ / Release / 予約ファイル / launchd には触らない**）
+- **launchd が実行するのは install_root 側のスクリプト**（既定 `~/dev/tako/scripts/nightly-release.sh`）。
+  予約機構を直したときは、そのパスへ反映されているか（= main を pull 済みか）まで確認する

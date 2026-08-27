@@ -3567,3 +3567,16 @@
   `TAKO_APP_SELF_TEST_OK`（項目 111 へ codex の正例 + メトリクス通しを新設）/ docs 再生成 + `--check`。
   **検出力は `TAKO_985_LEGACY=1` の A/B で 2 通り実証**（unit が 1 本 FAILED / セルフテストが
   `reset_at=None` で FAILED・exit 1）
+## 2026-08-27（#1005: 夜間リリースの次回バージョン予約 — patch 固定からの脱却）
+- 節目の minor / major を夜間発火に乗せられなかった（Cargo.toml を先に上げると
+  「≠ 最新タグ = 手動リリース進行中」でスキップ）ので、版数の指定を**リポジトリの外**の
+  予約ファイル（`~/.claude-orchestrator/state/tako-nightly-next-version`）で持つ形にした。
+  正本は `scripts/lib/nightly-reserve.sh`、操作は `--reserve [<X.Y.Z>]` / `--unreserve`
+- 予約は**成立したリリース 1 回で消費**（タグ push 時点）。無効な値（semver 外 / 現行以下 /
+  タグ既存）は警告 + 通知のうえ patch bump へフォールバック。**リリースに至らなかった夜
+  （変更ゼロ・dirty・ビルド失敗・dry-run）は保持**して次の夜へ持ち越す。版種（patch / minor /
+  major）は CHANGELOG の節・コミット件名・タグ注釈へ自動で載る
+- 検証: モックテスト `scripts/test-nightly-reserve.sh` 77 pass / 0 fail（一時ディレクトリに
+  origin + 作業リポを作り **launchd と同じ /bin/bash（3.2）** で実走。release.sh はスタブ・
+  HOME 隔離なので本番のタグ / Release / 予約に触らない）+ 品質ゲート全緑（test 2747 passed）。
+  検出力は 3 通りの revert（patch 固定 / 消費削除 / 早期消費）で FAILED を実測

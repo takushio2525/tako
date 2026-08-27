@@ -4,6 +4,9 @@
 # 使い方:
 #   scripts/nightly-release.sh                     # 実行（変更が無ければスキップ）
 #   scripts/nightly-release.sh --dry-run           # 判定のみ（何も変更しない）
+#   scripts/nightly-release.sh --reserve           # 次回バージョンの予約を表示
+#   scripts/nightly-release.sh --reserve 0.8.0     # 次回バージョンを予約（1 回で消費）
+#   scripts/nightly-release.sh --unreserve         # 予約を取消
 #   scripts/nightly-release.sh --install-launchd   # launchd ジョブ（毎日 5:00）を登録
 #   scripts/nightly-release.sh --uninstall-launchd # launchd ジョブを解除
 #
@@ -16,8 +19,9 @@
 #   1. 多重起動ロック（~/.claude-orchestrator/locks/）を取得。取れなければ即終了
 #   2. worktree が clean か確認（dirty = 人間の作業中 → スキップ）
 #   3. git fetch → 最新タグ vs origin/main。差分ゼロなら「変更なしスキップ」
-#   4. Cargo.toml の version == 最新タグのときのみパッチ bump
+#   4. Cargo.toml の version == 最新タグのときのみ bump する
 #      （≠ は手動リリース進行中とみなしてスキップ。夜間ジョブは人間の作業に割り込まない）
+#      版数は「次回バージョン予約があればその値、無ければ patch bump」（#1005）
 #   5. origin/main へ detach → version bump + CHANGELOG 自動節 + Cargo.lock 同期をコミット
 #   6. release.sh（ビルド + zip）→ 成功後にはじめて push（main → annotated tag）
 #      → release.sh --skip-build --test（GitHub Release + Pages デプロイ）
@@ -30,6 +34,22 @@
 #   **両 OS が揃うまで（既定で最大 75 分）待って**から完了する。
 #   片肺で終わった場合は release.sh が exit 3 を返し、ここで警告として通知する
 #   （Release 自体は macOS 版で成立しているので、ロールバックはしない）。
+#
+# 次回バージョンの予約（#1005）:
+#   節目のリリース（minor / major の繰り上げ）を夜間発火に乗せるための仕組み。
+#   Cargo.toml を先に上げると「≠ 最新タグ = 手動リリース進行中」でスキップされるため、
+#   版数の指定はリポジトリの外の状態ファイルで持つ（正本は scripts/lib/nightly-reserve.sh）。
+#
+#     予約する: scripts/nightly-release.sh --reserve 0.8.0
+#     確認する: scripts/nightly-release.sh --reserve
+#     取消する: scripts/nightly-release.sh --unreserve
+#
+#   - 予約は **成立したリリース 1 回で消費**される（タグを push した時点でクリア）
+#   - 予約が使えない（semver 外 / 現行以下 / タグが既に在る）ときは**予約を無視**して
+#     既定の patch bump へフォールバックし、警告ログ + 通知を出す
+#   - **リリースに至らなかったときは予約を保持する**。「予約あり + 変更ゼロ」でも
+#     消費しない（次に変更が入った夜へ持ち越す）。dry-run・worktree dirty・
+#     手動リリース進行中・プレリリース版・ビルド失敗も同じく保持
 #
 # ログ: ~/.claude-orchestrator/logs/tako-nightly-release.log
 # 注意: Homebrew cask（homebrew-tako）の更新は対象外（手動リリース時のみ）
@@ -61,6 +81,69 @@ log() {
 
 notify() {
   osascript -e "display notification \"$1\" with title \"tako 夜間リリース\"" 2>/dev/null || true
+}
+
+# 次回バージョン予約の正本（#1005。読み書き・検証・版種判定）
+# shellcheck source=lib/nightly-reserve.sh
+if [[ ! -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" ]]; then
+  log "ERROR: scripts/lib/nightly-reserve.sh が見つからない（${REPO_ROOT}）。リポジトリが不完全"
+  notify "失敗: nightly-reserve.sh が見つからない"
+  exit 1
+fi
+source "$REPO_ROOT/scripts/lib/nightly-reserve.sh"
+
+# ---- 次回バージョン予約の CLI（#1005）--------------------------------------
+
+# 予約時点の「現行」は最新の v* タグ（オフラインで引ける・実際に出た版）。
+# ローカルの取得状況次第で古いことがあるが、**発火時に origin/main の Cargo.toml で
+# 再検証する**ので、抜けた予約はその場で無視される（二段の検証）
+released_version() {
+  local tag
+  tag=$(git -C "$REPO_ROOT" tag --list 'v*' --sort=-v:refname 2>/dev/null | head -1 || true)
+  printf '%s' "${tag#v}"
+}
+
+show_reservation() {
+  local reserved current reason kind
+  reserved=$(nightly_reserve_read)
+  current=$(released_version)
+  if [[ -z "$reserved" ]]; then
+    echo "予約: なし（次回は patch bump: ${current:-?} → $(nightly_patch_bump "${current:-0.0.0}")）"
+  elif reason=$(nightly_reserve_reject_reason "$reserved" "$current" "$REPO_ROOT"); then
+    kind=$(nightly_bump_kind "$current" "$reserved")
+    echo "予約: ${reserved}（現行 ${current} → v${reserved}・$(nightly_bump_label_ja "${kind}")繰り上げ）"
+  else
+    echo "予約: ${reserved}（**無効**: ${reason} → 次回は予約を無視して patch bump）"
+  fi
+  echo "予約ファイル: $(nightly_reserve_file)"
+  echo "操作: --reserve <X.Y.Z> で予約 / --unreserve で取消"
+}
+
+reserve_version() {
+  local version="$1"
+  local current reason kind
+  current=$(released_version)
+  if ! reason=$(nightly_reserve_reject_reason "$version" "$current" "$REPO_ROOT"); then
+    echo "ERROR: 予約できない: ${reason}" >&2
+    echo "  安定版の semver（X.Y.Z）で、現行 ${current} より大きく、タグが未存在の版数を指定してください" >&2
+    exit 2
+  fi
+  kind=$(nightly_bump_kind "$current" "$version")
+  nightly_reserve_write "$version" "現行 ${current} からの$(nightly_bump_label_ja "${kind}")繰り上げ"
+  echo "予約しました: ${version}（現行 ${current} → 次回の夜間リリースは v${version}・$(nightly_bump_label_ja "${kind}")繰り上げ）"
+  echo "予約ファイル: $(nightly_reserve_file)"
+  echo "取消: scripts/nightly-release.sh --unreserve"
+}
+
+unreserve_version() {
+  local reserved
+  reserved=$(nightly_reserve_read)
+  nightly_reserve_clear
+  if [[ -n "$reserved" ]]; then
+    echo "予約を取消しました: ${reserved}（次回は patch bump）"
+  else
+    echo "予約はありません（変更なし）"
+  fi
 }
 
 # ---- launchd 登録 / 解除 ------------------------------------------------
@@ -139,12 +222,24 @@ uninstall_launchd() {
   echo "解除完了: $LABEL"
 }
 
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run)            DRY_RUN=1 ;;
+ARG_HINT="--dry-run / --reserve [<X.Y.Z>] / --unreserve / --install-launchd / --uninstall-launchd"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)            DRY_RUN=1; shift ;;
     --install-launchd)    install_launchd; exit 0 ;;
     --uninstall-launchd)  uninstall_launchd; exit 0 ;;
-    *) echo "不明な引数: ${arg}（--dry-run / --install-launchd / --uninstall-launchd）" >&2; exit 2 ;;
+    # 引数なしで現在値（#322 の「最も簡単なコマンド」原則）
+    --reserve)
+      shift
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        reserve_version "$1"
+      else
+        show_reservation
+      fi
+      exit 0
+      ;;
+    --unreserve)          unreserve_version; exit 0 ;;
+    *) echo "不明な引数: ${1}（${ARG_HINT}）" >&2; exit 2 ;;
   esac
 done
 
@@ -191,12 +286,22 @@ fi
 echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT
 
+# ---- 次回バージョン予約の読み取り（この時点では消費しない）------------------
+# 「リリースに至ったときだけ消費する」ため、以降のスキップ経路では保持したまま抜ける
+
+RESERVED=$(nightly_reserve_read)
+RESERVE_KEPT=""
+if [[ -n "$RESERVED" ]]; then
+  RESERVE_KEPT="（予約 ${RESERVED} は保持）"
+  log "予約あり: ${RESERVED}（$(nightly_reserve_file)）"
+fi
+
 # ---- 変更検知 --------------------------------------------------------------
 
 # untracked はビルド残骸の可能性が高いので無視し、tracked の変更のみを作業中とみなす
 # （リリースコミットは明示 add の 3 ファイルのみのため untracked が混入する余地はない）
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
-  log "SKIP: worktree が dirty（人間の作業中と判断）: $REPO_ROOT"
+  log "SKIP: worktree が dirty（人間の作業中と判断）: ${REPO_ROOT}${RESERVE_KEPT}"
   notify "スキップ: worktree が dirty"
   exit 0
 fi
@@ -211,34 +316,57 @@ fi
 
 COMMITS=$(git rev-list --count "$LATEST_TAG..origin/main")
 if [[ "$COMMITS" -eq 0 ]]; then
-  log "SKIP: 変更なし（$LATEST_TAG == origin/main）"
+  # 予約は消費しない。リリースが 1 回も成立していないので次の夜へ持ち越す（#1005）
+  log "SKIP: 変更なし（${LATEST_TAG} == origin/main）${RESERVE_KEPT}"
   exit 0
 fi
 
 CUR_VERSION=$(git show origin/main:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
 TAG_VERSION="${LATEST_TAG#v}"
 if [[ "$CUR_VERSION" != "$TAG_VERSION" ]]; then
-  log "SKIP: Cargo.toml version ($CUR_VERSION) ≠ 最新タグ ($TAG_VERSION)。手動リリース進行中とみなす"
+  log "SKIP: Cargo.toml version (${CUR_VERSION}) ≠ 最新タグ (${TAG_VERSION})。手動リリース進行中とみなす${RESERVE_KEPT}"
   notify "スキップ: 手動リリース進行中（${CUR_VERSION}）"
   exit 0
 fi
 
-# テスト版バージョン（-test.N 等のプレリリースサフィックス付き）はパッチ bump の対象外
+# テスト版バージョン（-test.N 等のプレリリースサフィックス付き）は bump の対象外
 if [[ "$CUR_VERSION" == *-* ]]; then
-  log "SKIP: プレリリース版 ($CUR_VERSION)。夜間パッチ bump は安定版のみ対象"
+  log "SKIP: プレリリース版 (${CUR_VERSION})。夜間 bump は安定版のみ対象${RESERVE_KEPT}"
   notify "スキップ: プレリリース版（${CUR_VERSION}）"
   exit 0
 fi
 
-IFS=. read -r major minor patch <<< "$CUR_VERSION"
-NEW_VERSION="$major.$minor.$((patch + 1))"
+# ---- 次回バージョンの決定（予約 > 既定の patch bump。#1005）------------------
+
+PATCH_VERSION=$(nightly_patch_bump "$CUR_VERSION")
+NEW_VERSION="$PATCH_VERSION"
+VERSION_SOURCE="既定の patch bump"
+if [[ -n "$RESERVED" ]]; then
+  if REJECT=$(nightly_reserve_reject_reason "$RESERVED" "$CUR_VERSION" "$REPO_ROOT"); then
+    NEW_VERSION="$RESERVED"
+    VERSION_SOURCE="予約（--reserve ${RESERVED}）"
+  else
+    # 予約は無視して従来どおり patch bump（予約自体はリリース成立時にまとめて消費する）
+    log "WARN: 予約 ${RESERVED} は使えないので無視する（${REJECT}）→ 既定の patch bump (${PATCH_VERSION}) で続行"
+    notify "予約を無視: ${RESERVED}（${REJECT}）"
+    VERSION_SOURCE="既定の patch bump（予約 ${RESERVED} は無効: ${REJECT}）"
+  fi
+fi
 NEW_TAG="v$NEW_VERSION"
+BUMP_KIND=$(nightly_bump_kind "$CUR_VERSION" "$NEW_VERSION")
+BUMP_JA=$(nightly_bump_label_ja "$BUMP_KIND")
+BUMP_EN=$(nightly_bump_label_en "$BUMP_KIND")
 TODAY=$(date '+%Y-%m-%d')
 
-log "変更 $COMMITS 件（$LATEST_TAG..origin/main）→ $NEW_TAG としてリリースする"
+log "変更 ${COMMITS} 件（${LATEST_TAG}..origin/main）→ ${NEW_TAG} としてリリースする（${BUMP_KIND} / ${VERSION_SOURCE}）"
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  log "DRY-RUN: ここで終了（bump: $CUR_VERSION → ${NEW_VERSION}、コミット一覧は下記）"
+  # dry-run は何も変更しない。予約もクリアしない
+  log "DRY-RUN: ここで終了（bump: ${CUR_VERSION} → ${NEW_VERSION}、種別: ${BUMP_KIND}、由来: ${VERSION_SOURCE}）"
+  if [[ -n "$RESERVED" ]]; then
+    log "DRY-RUN: 予約 ${RESERVED} はクリアしない（消費は実リリース時のみ）"
+  fi
+  log "DRY-RUN: コミット一覧は下記"
   git log --format='  - %s' "$LATEST_TAG..origin/main" | tee -a "$LOG_FILE"
   exit 0
 fi
@@ -263,8 +391,8 @@ SECTION_FILE=$(mktemp)
 {
   echo "## [$NEW_VERSION] - $TODAY"
   echo ""
-  echo "Nightly patch release (automated). Changes since $LATEST_TAG:"
-  echo "夜間パッチリリース（自動）。$LATEST_TAG 以降の変更:"
+  echo "Nightly ${BUMP_EN} release (automated). Changes since ${LATEST_TAG}:"
+  echo "夜間${BUMP_JA}リリース（自動）。${LATEST_TAG} 以降の変更:"
   echo ""
   git log --format='- %s' "$LATEST_TAG..origin/main"
   echo ""
@@ -284,9 +412,10 @@ if ! cargo update --workspace --quiet; then
 fi
 
 git add Cargo.toml Cargo.lock CHANGELOG.md
-git commit --quiet -m "[リリース] $NEW_TAG: 夜間パッチリリース（自動）
+git commit --quiet -m "[リリース] ${NEW_TAG}: 夜間${BUMP_JA}リリース（自動）
 
-$LATEST_TAG 以降の変更 $COMMITS 件を自動リリース。scripts/nightly-release.sh による。
+${LATEST_TAG} 以降の変更 ${COMMITS} 件を自動リリース。scripts/nightly-release.sh による。
+版数の由来: ${VERSION_SOURCE}
 
 $(git log --format='- %s' "$LATEST_TAG..origin/main")"
 
@@ -305,11 +434,18 @@ fi
 log "ビルド成功 → push + タグ + GitHub Release"
 git push origin HEAD:main --quiet
 
-git tag -a "$NEW_TAG" -m "tako $NEW_TAG — 夜間パッチリリース（自動）
+git tag -a "$NEW_TAG" -m "tako ${NEW_TAG} — 夜間${BUMP_JA}リリース（自動）
 
 $LATEST_TAG 以降の変更:
 $(git log --format='- %s' "$LATEST_TAG..HEAD~1")"
 git push origin "$NEW_TAG" --quiet
+
+# 予約は「次の 1 回」ぶん。**版数が確定した（タグを push した）時点で消費**する。
+# ここへ到達しなかった場合（スキップ / ビルド失敗 / dry-run）は予約を保持する（#1005）
+if [[ -n "$RESERVED" ]]; then
+  nightly_reserve_clear
+  log "予約 ${RESERVED} を消費した（予約ファイルをクリア。次回からは patch bump）"
+fi
 
 # 夜間リリースはテスト版（prerelease）として配布する（#403）。
 # release.sh は Windows 配布物（tag push で起動する GitHub Actions）を待ってから
@@ -320,8 +456,8 @@ RELEASE_RC=0
 RELEASE_URL="https://github.com/takushio2525/tako/releases/tag/${NEW_TAG}"
 case "$RELEASE_RC" in
   0)
-    log "完了: ${NEW_TAG}（テスト版・両 OS の配布物あり、$COMMITS 件、${RELEASE_URL}）"
-    notify "テスト版リリース完了: ${NEW_TAG}（$COMMITS 件、mac/win 両方）"
+    log "完了: ${NEW_TAG}（テスト版・両 OS の配布物あり、${COMMITS} 件、${BUMP_KIND}、${RELEASE_URL}）"
+    notify "テスト版リリース完了: ${NEW_TAG}（${COMMITS} 件、mac/win 両方）"
     ;;
   3)
     # Release 自体は macOS 版で成立している。ロールバックはしない（tag も push 済み）
