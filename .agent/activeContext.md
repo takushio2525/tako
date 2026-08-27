@@ -38,7 +38,19 @@
   （素材が不変なので命名はタブごとに 1 回だけ）へ差し替えた
 - **棚卸しで確認した残りの製品バグ（未着手）**: **#935**（受け入れゲートが `sh -c`）/
   **#936**（古い claude の警告が出ない。#726 の続き）
-- **#937**: 未実測 46 件の消し込み（手順は Issue 本文）。実機復帰後の作業
+- **#937 の消し込みで見つけた製品バグ（未着手）**: **#970**（`open-in dir` の cwd が
+  `///?/C:/…` へ壊れ、そのタブの git 操作が全滅）/ **#971**（remote の tailscale serve が
+  unix ソケット target で Windows 非対応 = デーモンを起動できない）/ **#972**（remote
+  scrollback が器の境界を通らない）/ **#973**（autosave が CLI / MCP 編集で不発。macOS も同じ）/
+  **#974**（psmux が持たないオプションを tako が conf へ書いていて毎回警告）
+- **実機の claude は OAuth 期限切れ**（`Failed to authenticate: OAuth session expired`）。
+  会話が要る検証（#722 の AI 命名 / report の transcript 層 / run の完遂 / setup の対話の通し）は
+  ログインし直すまで測れない
+- **#937（消し込み完了）**: 未実測 47 件を Windows 実機で実測し **未実測 0 件**へ。
+  判定は **supported 110 / degraded 13 / pending 15 / unsupported 2**（棚卸し時は 69 / 12 / 56 / 2）。
+  測り方は plan の「#937 の記録」節（隔離 GUI を `schtasks /it` で session 1 へ + CLI は
+  SSH から named pipe 越し + MCP は同じ token で `mcp_url` へ POST）。
+  **残った pending 15 は「実装が無い / 動かないと分かっている」もの**で、未実測ではない
 - **解消済み（詳細は plan の各記録節と progress.md）**: #898 / #927 / #920 / #913 / #907 /
   #906 / #903 / #866 / #897 / #889 / #872 / #727 / #905 / #766 / #870 / #884 / #881 / #877 / #875 / #873
 - **A/B の env（同一バイナリで旧挙動へ戻せる）**: `TAKO_920_LEGACY` / `TAKO_913_LEGACY` /
