@@ -53760,10 +53760,14 @@ mod self_test {
                     .update(cx, |app: &mut TakoApp, _, _| {
                         let ix = app.workspace.tabs().len().saturating_sub(1);
                         let area = app.tab_scroll_handle.bounds();
+                        // `bounds_for_item` は**スクロール量を含まない**レイアウト座標を返す
+                        //（実測: offset を -196 まで転がしても right は 766.0 のまま）ので、
+                        // 見えているかは offset を足して判定する
+                        let off = app.tab_scroll_handle.offset().x;
                         let hidden = app
                             .tab_scroll_handle
                             .bounds_for_item(ix)
-                            .map(|b| b.right() > area.right())
+                            .map(|b| b.right() + off > area.right())
                             .unwrap_or(false);
                         (ix, hidden)
                     })
@@ -53842,6 +53846,8 @@ mod self_test {
                         // 症状そのもの（「増えたタブが埋もれて**アクセスできない**」）が
                         // 直っているかを、最後のタブの実描画矩形で見る。
                         // 端まで転がして、スクロール領域の中に入ってくること
+                        // 1 回ずつ描きながら端まで転がす（クランプは prepaint で効くので、
+                        // 描かずに撃ち込むと未クランプの値が積み上がるだけで実態とずれる）
                         for _ in 0..30 {
                             let _ = any961.update(cx, |_, win, cx| {
                                 win.dispatch_event(
@@ -53853,21 +53859,29 @@ mod self_test {
                                     cx,
                                 )
                             });
+                            notify_and_draw(any961, window961, cx);
                         }
-                        notify_and_draw(any961, window961, cx);
-                        let reachable = window961
+                        let (reachable, rolled, area_r, last_r) = window961
                             .update(cx, |app: &mut TakoApp, _, _| {
                                 let area = app.tab_scroll_handle.bounds();
-                                app.tab_scroll_handle
-                                    .bounds_for_item(last_ix)
-                                    .map(|b| b.right() <= area.right() + px(1.0))
+                                let last = app.tab_scroll_handle.bounds_for_item(last_ix);
+                                let off = app.tab_scroll_handle.offset().x;
+                                (
+                                    last.map(|b| b.right() + off <= area.right() + px(1.0))
+                                        .unwrap_or(false),
+                                    off,
+                                    area.right(),
+                                    last.map(|b| b.right() + off).unwrap_or(px(0.0)),
+                                )
                             })
-                            .ok()
-                            .flatten()
-                            .unwrap_or(false);
+                            .unwrap_or((false, px(0.0), px(0.0), px(0.0)));
                         println!(
                             "TAKO_SELF_TEST_961_REACH: last_ix={last_ix} \
-                             hidden_before={hidden_before} reachable_after={reachable}"
+                             hidden_before={hidden_before} reachable_after={reachable} \
+                             rolled={:.1} area_right={:.1} last_right={:.1}",
+                            f32::from(rolled),
+                            f32::from(area_r),
+                            f32::from(last_r),
                         );
                         check(
                             hidden_before && reachable,
