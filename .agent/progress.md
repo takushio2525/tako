@@ -3389,3 +3389,33 @@
   冪等はバイト一致 3 回、claude 無回帰、未導入エラーまで実測。検証環境は原状回復済み
 - 関連コミット: `63a7c26` `[機能追加] tako setup / setup-mcp で codex・agy にも tako MCP を登録する (#979) (#993)`
 - 次: Windows 実機での codex / agy 実測（対応マトリクスは claude 経路の実測のまま据え置き）
+
+## 2026-08-27（#981: codex のサンドボックス解除を明示 opt-in へ）
+- `master_agent: codex` を選ぶと `--dangerously-bypass-approvals-and-sandbox` が**無条件**で
+  付き、claude master と非対称・opt-out 無しだった。プロファイル `bypass_sandbox`（既定 false）
+  1 本で master / solo と **codex worker** の両方を gate し、CLI `--bypass-sandbox` / MCP /
+  設定画面のトグルが同じ dispatch を通る形にした（MCP ツール数は不変）
+- **codex は「承認だけ外す」を選べない**ことを実測で確定（`codex sandbox` で 既定 read-only は
+  cwd 内への書き込みすら不可 / `workspace-write` はネットワークと cwd 外が不可 /
+  `danger-full-access` で両方可）。worker の実務（cargo・gh・data dir 書込）が成立しないので
+  中間状態は作らず 2 択にし、`skip_permissions` だけでは効かない旨を warnings と master
+  プロンプトに出す（効かない設定を黙って抱えさせない）
+- 既存ファイルは移行（profiles v2 → v3）で `bypass_sandbox: true` を明示 = 挙動不変。
+  世代判定は**キーの有無**なので `skip_serializing_if` を付けない。`once: false` にしたのは
+  `once_markers`（#27 の `.backup-1m`）が from を問わず「当たった」と答えるため。
+  solo プロファイルも同じ spec へ載せた（solo も `master_agent: codex` を持つ）
+- **実機実測が穴を 1 つ見つけた**: `ensure_defaults` の default.yaml は serde ではなく
+  手書きテンプレートなので、キーを書き忘れると**新規インストールが v2 と判定され移行が
+  `true`（危険な旧既定）を書き込む**。テンプレート 2 本を現行世代にし、番犬テスト
+  （手書きテンプレートは現行世代である）で再発を止めた
+- 実機 A/B（codex 0.144.4 / gpt-5.6-sol・同一バイナリ・プロファイルだけ差し替え）:
+  既定 = argv にフラグ無し + `Sandbox: codex defaults kept` + **MCP ツール承認ダイアログで
+  停止しファイル未作成** / opt-in = フラグあり + `Sandbox: disabled (…)` + コマンド実行まで
+  通りファイル作成（`probe\n` / exit 0）。`TAKO_981_LEGACY=1` で旧挙動へ戻ることも実測
+- 検証: fmt / clippy(-D warnings、visual-test 有無とも) / `cargo test --workspace` 全緑 /
+  Windows クロスチェックの**警告リストが main と完全一致**（12 件・エラー 0）/ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（初回は項目 93 = #694 が load 8.59 で落ちたが、負荷が引いた 2 回は
+  完走 = 負荷依存のフレーク）。検出力は 2 通りの revert（テンプレートから 1 行落とす /
+  旧経路へ戻す）で FAILED を実測
+- 関連コミット: PR #996（`Refs #981`）
+- 次: #983（非 claude agent の spawn が無言で死ぬ）

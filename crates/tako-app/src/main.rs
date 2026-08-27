@@ -24096,6 +24096,7 @@ mod self_test {
             clear_auto_handoff: false,
             limit_resume: None,
             clear_limit_resume: false,
+            bypass_sandbox: None,
         };
 
         // --- 実データ規模を用意する ---
@@ -45835,6 +45836,7 @@ mod self_test {
                     clear_auto_handoff: false,
                     limit_resume: None,
                     clear_limit_resume: false,
+                    bypass_sandbox: None,
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
                     window
@@ -47049,6 +47051,7 @@ mod self_test {
                         clear_auto_handoff: false,
                         limit_resume: None,
                         clear_limit_resume: false,
+                        bypass_sandbox: None,
                     }
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
@@ -47907,6 +47910,7 @@ mod self_test {
                         clear_auto_handoff: false,
                         limit_resume: None,
                         clear_limit_resume: false,
+                        bypass_sandbox: None,
                     }
                 };
                 let fire = |r: Req, cx: &mut AsyncApp| {
@@ -48410,6 +48414,7 @@ mod self_test {
                     clear_auto_handoff: false,
                     limit_resume: None,
                     clear_limit_resume: false,
+                    bypass_sandbox: None,
                 };
                 if fire(profiles_req("set", true), cx).is_none() {
                     fail("#761: 検証用プロファイルを作れない");
@@ -52660,6 +52665,7 @@ mod self_test {
                         clear_auto_handoff: false,
                         limit_resume: None,
                         clear_limit_resume: false,
+                        bypass_sandbox: None,
                     }
                 };
                 if fire(

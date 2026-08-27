@@ -1213,6 +1213,17 @@ pub fn desc_prof_limit_resume() -> &'static str {
     )
 }
 
+pub fn prof_label_bypass_sandbox() -> &'static str {
+    tr!("codex のサンドボックスを外す", "Disable the codex sandbox")
+}
+
+pub fn desc_prof_bypass_sandbox() -> &'static str {
+    tr!(
+        "codex を --dangerously-bypass-approvals-and-sandbox で起動する（確認なしでコマンドを実行し、書き込み先もネットワークも制限されなくなる）。OFF なら codex の既定どおり承認プロンプトが出る",
+        "Launch codex with --dangerously-bypass-approvals-and-sandbox (commands run without confirmation and neither writes nor network are restricted). When off, codex asks for approval as usual"
+    )
+}
+
 pub fn prof_ctx_threshold_range() -> &'static str {
     tr!(
         "引き継ぎ閾値は 50〜60 の数字で指定してください",
@@ -1509,6 +1520,8 @@ mod tests {
                 desc_prof_auto_handoff().into(),
                 prof_label_limit_resume().into(),
                 desc_prof_limit_resume().into(),
+                prof_label_bypass_sandbox().into(),
+                desc_prof_bypass_sandbox().into(),
                 prof_ctx_threshold_range().into(),
                 prof_env_add().into(),
                 prof_env_masked().into(),

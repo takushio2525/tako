@@ -14,6 +14,8 @@ pub mod wait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use tako_core::platform::support::Note;
+
 pub use agent::WorkerAgent;
 
 /// バイナリ埋め込みのデフォルト system prompt（master 用）
@@ -683,6 +685,9 @@ pub struct ResolvedWorkerLaunch {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub skip_permissions: bool,
+    /// プロファイルの `bypass_sandbox`（Issue #981）。codex worker の
+    /// `--dangerously-bypass-approvals-and-sandbox` はこれが true のときだけ付く
+    pub allow_sandbox_bypass: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -782,6 +787,20 @@ pub struct Profile {
     /// （`profile_to_json` が警告を返す）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_resume: Option<bool>,
+
+    /// codex 系の起動で `--dangerously-bypass-approvals-and-sandbox`
+    /// （承認プロンプトのスキップ + codex サンドボックスの解除）を許可するか（Issue #981）。
+    ///
+    /// **既定 false = 付けない**。`master_agent: codex` の master / solo と codex worker の
+    /// 両方に効く。true にすると codex はコマンド実行を確認なしで行い、書き込み先も
+    /// ネットワークも制限されなくなる（外部で別途サンドボックスされている環境向け）。
+    ///
+    /// `skip_serializing_if` を**付けない**（常に書き出す）のは、この項目の有無が
+    /// 「#981 より前に作られたファイルか」の判定そのものだから（`migrations::detect_profile`）。
+    /// 既存プロファイルには自動マイグレーションで `true` が書かれ、無条件バイパスだった
+    /// 頃の挙動が保たれる。新規プロファイルは false = 安全側
+    #[serde(default)]
+    pub bypass_sandbox: bool,
 }
 
 /// master / claude worker の既定 effort
@@ -817,6 +836,7 @@ impl Default for Profile {
             ctx_threshold: None,
             auto_handoff: None,
             limit_resume: None,
+            bypass_sandbox: false,
         }
     }
 }
@@ -1149,6 +1169,7 @@ impl Profile {
             skip_permissions: cfg
                 .map(|c| c.skip_permissions)
                 .unwrap_or_else(|| agent.default_skip_permissions()),
+            allow_sandbox_bypass: self.bypass_sandbox,
             extra_args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
         }
     }
@@ -1350,7 +1371,18 @@ impl Profile {
                 .map(|c| c.skip_permissions)
                 .unwrap_or_else(|| agent.default_skip_permissions());
             if effective_skip {
-                extras.push("skip_permissions".to_string());
+                // codex は承認スキップとサンドボックス解除が同一フラグなので、
+                // bypass_sandbox が無いと skip_permissions は効かない（#981）。
+                // master へ「効かない設定」を効くものとして見せない
+                if agent == WorkerAgent::Codex && !self.bypass_sandbox {
+                    extras.push(
+                        "approval prompts ON (codex skips them only with profile \
+                         `bypass_sandbox: true`)"
+                            .to_string(),
+                    );
+                } else {
+                    extras.push("skip_permissions".to_string());
+                }
             }
             let extras = if extras.is_empty() {
                 String::new()
@@ -1643,10 +1675,12 @@ impl Profile {
 // --- solo プロファイル ---
 
 /// solo 用の新規生成する default プロファイル内容
-const SOLO_DEFAULT_PROFILE_YAML: &str = "\
+pub(crate) const SOLO_DEFAULT_PROFILE_YAML: &str = "\
 # tako solo のプロファイル設定
 # model 未指定 = claude CLI の既定モデルで起動する（プラン非依存・推奨）
 effort: high
+# codex を使うときサンドボックスと承認を丸ごと外すか（#981。false = 外さない）
+bypass_sandbox: false
 ";
 
 /// solo 用のプロファイルディレクトリ
@@ -1791,8 +1825,12 @@ pub fn build_master_cmd_in(
             ));
             // MCP ツール呼び出し・コマンド実行の承認をスキップ（#132）。
             // `-a never` はコマンド承認のみでMCPツール承認はバイパスしない（実測）。
-            // `--dangerously-bypass-approvals-and-sandbox` は両方バイパスする
-            cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
+            // `--dangerously-bypass-approvals-and-sandbox` は両方バイパスする。
+            // **明示 opt-in が無いと付けない**（#981。既定で codex のサンドボックスを
+            // 外すのは claude master と非対称で、外部ユーザーには危険な既定だった）
+            if profile.bypass_sandbox || legacy_unconditional_bypass() {
+                cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
+            }
             // MCP 接続は起動時の -c 一時注入（~/.codex/config.toml を汚さず、
             // tako 外で起動した codex にツールを公開しない = FR-2.3.2 と同方針）
             cmd.push_str(&format!(
@@ -1846,6 +1884,38 @@ pub fn build_worker_claude_cmd_in(
         },
         syntax,
     )
+}
+
+/// #981 の A/B 用の env。`TAKO_981_LEGACY=1` で **同一バイナリのまま**
+/// 「codex には常に `--dangerously-bypass-approvals-and-sandbox` を付ける」旧挙動へ戻す
+/// （検証で修正前後を比べるためだけの逃げ道。既定は無効）
+pub fn legacy_unconditional_bypass() -> bool {
+    std::env::var("TAKO_981_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// codex 系 master / solo の起動時に「サンドボックスが今どうなっているか」を出す 1 行
+/// （Issue #981 の受け入れ条件 3）。**外れているときも外れていないときも出す**
+/// ので、承認プロンプトで止まったときに理由が画面に残る（無言の詰まりを作らない）
+pub fn sandbox_bypass_line(enabled: bool) -> Note {
+    if enabled {
+        Note::new(
+            "サンドボックス: 解除（--dangerously-bypass-approvals-and-sandbox。承認プロンプトと codex のサンドボックスが両方無効です）",
+            "Sandbox: disabled (--dangerously-bypass-approvals-and-sandbox: both approval prompts and the codex sandbox are off)",
+        )
+    } else {
+        Note::new(
+            "サンドボックス: codex の既定のまま（コマンド実行に承認プロンプトが出ます）",
+            "Sandbox: codex defaults kept (commands will ask for approval)",
+        )
+    }
+}
+
+/// `sandbox_bypass_line(false)` に添える「外し方」の案内コマンド。
+/// 引数は最簡形（既定値で済む引数を付けない。#322）
+pub fn sandbox_bypass_hint_command(profile_name: &str) -> String {
+    format!("tako orchestrator profiles set {profile_name} --bypass-sandbox true")
 }
 
 /// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
@@ -2205,13 +2275,17 @@ pub fn profile_warnings(profile: &Profile) -> Vec<String> {
 
 /// 新規生成する default.yaml の内容。
 /// model は意図的に未指定 = claude CLI の既定モデルで起動する（プラン非依存。Issue #27）
-const DEFAULT_PROFILE_YAML: &str = "\
+pub(crate) const DEFAULT_PROFILE_YAML: &str = "\
 # tako master のプロファイル設定
 # model 未指定 = claude CLI の既定モデルで起動する（プラン非依存・推奨）
 #   例: model: claude-opus-4-6        … モデルを固定する場合
 #   例: model: claude-opus-4-6[1m]    … 1M コンテキスト版（Max / API プラン限定）
 effort: max
 worker_model_policy: inherit
+# codex を master / worker に使うときサンドボックスと承認を丸ごと外すか（#981）。
+# false = 外さない（安全側）。**この行を消すと「移行前のファイル」と見分けが
+# 付かなくなり、自動マイグレーションが true を書き込む**（migrations の世代判定）
+bypass_sandbox: false
 ";
 
 /// 初回実行時にデフォルトのディレクトリとファイルを生成する
@@ -3366,6 +3440,8 @@ prompt_blocks:
             master_agent: Some("codex".into()),
             model: Some("gpt-5.6-sol".into()),
             effort: "xhigh".into(),
+            // #981: サンドボックス解除は明示 opt-in（この完全一致は「外したとき」の形）
+            bypass_sandbox: true,
             ..Default::default()
         };
         let cmd = build_master_cmd_in(
@@ -3529,6 +3605,8 @@ prompt_blocks:
         let p = Profile {
             master_agent: Some("codex".into()),
             effort: "high".into(),
+            // #981: 明示 opt-in したときだけサンドボックスが外れる
+            bypass_sandbox: true,
             ..Default::default()
         };
         let cmd =
@@ -3537,9 +3615,185 @@ prompt_blocks:
         assert!(cmd.contains("-c model_reasoning_effort=high"));
         assert!(
             cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
-            "codex master/solo は承認スキップ"
+            "codex master/solo は opt-in すれば承認スキップ"
         );
         assert!(cmd.contains("mcp_servers.tako.command"));
+    }
+
+    // --- #981: codex のサンドボックス解除は明示 opt-in --------------------------
+
+    /// 受け入れ条件 1: プロファイル無指定の codex master にフラグが**付かない**
+    #[test]
+    fn codex_masterは既定でサンドボックスを外さない() {
+        for (label, profile) in [
+            (
+                "master",
+                Profile {
+                    master_agent: Some("codex".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "solo",
+                Profile {
+                    master_agent: Some("codex".into()),
+                    effort: "high".into(),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let cmd =
+                build_master_cmd_in("master:x", &profile, Path::new("/tmp/p.md"), "tako", POSIX)
+                    .unwrap();
+            assert!(
+                !cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+                "{label}: 既定でサンドボックスを外してはいけない: {cmd}"
+            );
+            // 起動そのものは従来どおり成立する（MCP 注入・prompt 注入は変えていない）
+            assert!(cmd.contains("mcp_servers.tako.command"), "{label}");
+            assert!(cmd.contains("developer_instructions"), "{label}");
+        }
+    }
+
+    /// 受け入れ条件 2: 明示 opt-in したときだけ付く（両方向）
+    #[test]
+    fn codex_masterは明示optinでだけサンドボックスを外す() {
+        let flag = "--dangerously-bypass-approvals-and-sandbox";
+        for (bypass, expected) in [(false, false), (true, true)] {
+            let p = Profile {
+                master_agent: Some("codex".into()),
+                bypass_sandbox: bypass,
+                ..Default::default()
+            };
+            let cmd =
+                build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
+            assert_eq!(
+                cmd.contains(flag),
+                expected,
+                "bypass_sandbox={bypass} のとき contains={expected} を期待: {cmd}"
+            );
+        }
+    }
+
+    /// 受け入れ条件 6: claude master には元からこのフラグが無い（非対称の解消）
+    #[test]
+    fn claude_masterにはサンドボックスのフラグが無い() {
+        for bypass in [false, true] {
+            let p = Profile {
+                bypass_sandbox: bypass,
+                ..Default::default()
+            };
+            let cmd =
+                build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
+            assert!(
+                !cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+                "claude に codex のフラグを渡してはいけない（bypass_sandbox={bypass}）: {cmd}"
+            );
+        }
+    }
+
+    /// 受け入れ条件 3: 起動ログの 1 行は日英で固定（表示言語グローバルに触らず検査する）
+    #[test]
+    fn サンドボックス状態の行は日英で固定されている() {
+        let on = sandbox_bypass_line(true);
+        assert!(on.ja().contains("解除"), "{}", on.ja());
+        assert!(
+            on.ja()
+                .contains("--dangerously-bypass-approvals-and-sandbox"),
+            "何が外れているかをフラグ名で示す: {}",
+            on.ja()
+        );
+        assert!(on.en().contains("Sandbox: disabled"), "{}", on.en());
+        let off = sandbox_bypass_line(false);
+        assert!(off.ja().contains("codex の既定"), "{}", off.ja());
+        assert!(off.en().contains("codex defaults kept"), "{}", off.en());
+        // 外し方の案内は最簡形（#322）
+        assert_eq!(
+            sandbox_bypass_hint_command("sol"),
+            "tako orchestrator profiles set sol --bypass-sandbox true"
+        );
+    }
+
+    /// worker 側も既定では bypass しない（ユーザーの確定方針）。
+    /// codex は承認スキップとサンドボックス解除が同一フラグなので、
+    /// skip_permissions だけではフラグが 1 つも付かない
+    #[test]
+    fn codex_workerは既定でサンドボックスを外さない() {
+        let p = Profile::default();
+        let launch = p.resolve_agent_launch(WorkerAgent::Codex, None, None);
+        assert!(
+            launch.skip_permissions,
+            "既定の skip_permissions は従来どおり"
+        );
+        assert!(!launch.allow_sandbox_bypass, "既定で解除は許可しない");
+        let cmd = agent::build_worker_cmd_in(
+            &agent::WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:p",
+                skip_permissions: launch.skip_permissions,
+                allow_sandbox_bypass: launch.allow_sandbox_bypass,
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(
+            !cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "既定の codex worker はサンドボックスを外さない: {cmd}"
+        );
+
+        // opt-in すると従来どおり付く
+        let p_opt = Profile {
+            bypass_sandbox: true,
+            ..Default::default()
+        };
+        let launch_opt = p_opt.resolve_agent_launch(WorkerAgent::Codex, None, None);
+        assert!(launch_opt.allow_sandbox_bypass);
+        let cmd_opt = agent::build_worker_cmd_in(
+            &agent::WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:p",
+                skip_permissions: launch_opt.skip_permissions,
+                allow_sandbox_bypass: launch_opt.allow_sandbox_bypass,
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(
+            cmd_opt.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "opt-in した codex worker は従来と同じ: {cmd_opt}"
+        );
+    }
+
+    /// claude / agy worker は `--dangerously-skip-permissions`（サンドボックスを
+    /// 外すフラグではない）なので bypass_sandbox に左右されない = 回帰ゼロ
+    #[test]
+    fn claudeとagyのworkerはbypass_sandboxに左右されない() {
+        for agent in [WorkerAgent::Claude, WorkerAgent::Agy] {
+            let mut cmds = Vec::new();
+            for bypass in [false, true] {
+                cmds.push(agent::build_worker_cmd_in(
+                    &agent::WorkerLaunch {
+                        agent,
+                        role: "worker:p",
+                        skip_permissions: true,
+                        allow_sandbox_bypass: bypass,
+                        ..Default::default()
+                    },
+                    POSIX,
+                ));
+            }
+            assert_eq!(cmds[0], cmds[1], "{agent:?} のコマンドが変わってはいけない");
+            assert!(
+                cmds[0].contains("--dangerously-skip-permissions"),
+                "{agent:?}: {}",
+                cmds[0]
+            );
+            assert!(
+                !cmds[0].contains("--dangerously-bypass-approvals-and-sandbox"),
+                "{agent:?}: codex のフラグを渡してはいけない: {}",
+                cmds[0]
+            );
+        }
     }
 
     #[test]

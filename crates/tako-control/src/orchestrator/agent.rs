@@ -74,7 +74,10 @@ impl WorkerAgent {
 
     /// プロファイルで明示設定されていない場合の skip_permissions 既定値。
     /// codex / agy は承認ダイアログで worker が停止するため既定でスキップする。
-    /// claude は従来どおり承認あり（auto accept は Claude Code 側の設定に委ねる）
+    /// claude は従来どおり承認あり（auto accept は Claude Code 側の設定に委ねる）。
+    ///
+    /// **codex はこれが true でも `bypass_sandbox` が無ければフラグが付かない**
+    /// （承認スキップとサンドボックス解除が同一フラグのため。#981）
     pub fn default_skip_permissions(&self) -> bool {
         match self {
             Self::Claude => false,
@@ -93,9 +96,15 @@ pub struct WorkerLaunch<'a> {
     /// thinking / reasoning effort。claude は `--effort`、codex は
     /// `-c model_reasoning_effort=`、agy は指定手段が無いため無視される
     pub effort: Option<&'a str>,
-    /// 許可プロンプトのスキップ（claude / agy: `--dangerously-skip-permissions`、
-    /// codex: `--dangerously-bypass-approvals-and-sandbox`）。codex / agy は既定 true
+    /// 許可プロンプトのスキップ（claude / agy: `--dangerously-skip-permissions`）。
+    /// codex / agy は既定 true。**codex は承認スキップだけを頼む手段が無い**ため、
+    /// `allow_sandbox_bypass` が false のときは何も付けない（#981）
     pub skip_permissions: bool,
+    /// codex の `--dangerously-bypass-approvals-and-sandbox` を許可するか
+    /// （プロファイルの `bypass_sandbox`。既定 false = 許可しない。Issue #981）。
+    /// claude / agy の `--dangerously-skip-permissions` はサンドボックスを外さないので
+    /// この項目の対象外
+    pub allow_sandbox_bypass: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],
     /// プロファイル + アカウント解決の env 計画（展開済み）。コマンド先頭で
@@ -112,6 +121,7 @@ impl Default for WorkerLaunch<'_> {
             model: None,
             effort: None,
             skip_permissions: false,
+            allow_sandbox_bypass: false,
             extra_args: &[],
             env: &EMPTY_ENV_PLAN,
         }
@@ -168,7 +178,17 @@ pub fn build_worker_cmd_in(
             WorkerAgent::Claude | WorkerAgent::Agy => {
                 cmd.push_str(" --dangerously-skip-permissions")
             }
-            WorkerAgent::Codex => cmd.push_str(" --dangerously-bypass-approvals-and-sandbox"),
+            // codex の承認スキップはサンドボックス解除と同じフラグしか無い
+            // （実測: 既定の read-only サンドボックスでは `-a never` を足しても
+            // cwd 内への書き込み自体が拒否され、`-s workspace-write` でも
+            // ネットワークと cwd 外への書き込みが閉じるので worker が実務で使えない）。
+            // だから**サンドボックス解除の明示 opt-in が無ければ何も付けない** =
+            // codex の既定（承認プロンプトが出る）で起動する。#981
+            WorkerAgent::Codex => {
+                if launch.allow_sandbox_bypass || super::legacy_unconditional_bypass() {
+                    cmd.push_str(" --dangerously-bypass-approvals-and-sandbox")
+                }
+            }
         }
     }
     for arg in launch.extra_args {
@@ -390,8 +410,17 @@ mod tests {
             .ends_with("claude --dangerously-skip-permissions"));
         assert!(build_worker_cmd_in(&base(WorkerAgent::Agy), POSIX)
             .ends_with("agy --dangerously-skip-permissions"));
-        assert!(build_worker_cmd_in(&base(WorkerAgent::Codex), POSIX)
-            .ends_with("codex --dangerously-bypass-approvals-and-sandbox"));
+        // codex は「承認スキップだけ」を頼めない（同一フラグ）ので、
+        // サンドボックス解除の明示 opt-in が無ければ何も付かない（#981）
+        assert!(build_worker_cmd_in(&base(WorkerAgent::Codex), POSIX).ends_with("codex"));
+        assert!(build_worker_cmd_in(
+            &WorkerLaunch {
+                allow_sandbox_bypass: true,
+                ..base(WorkerAgent::Codex)
+            },
+            POSIX
+        )
+        .ends_with("codex --dangerously-bypass-approvals-and-sandbox"));
     }
 
     #[test]

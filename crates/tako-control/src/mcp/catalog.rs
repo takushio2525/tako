@@ -1420,6 +1420,7 @@ pub fn tools() -> Vec<Value> {
                     "clear_auto_handoff": { "type": "boolean", "description": "auto_handoff の指定を解除して既定（有効）へ戻す（set 時。#749）" },
                     "limit_resume": { "type": "boolean", "description": "このプロファイルから spawn した worker ペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時。#822）。spawn 側の limit_resume が指定されていればそちらが勝つ" },
                     "clear_limit_resume": { "type": "boolean", "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）" },
+                    "bypass_sandbox": { "type": "boolean", "description": "codex（master / worker）を --dangerously-bypass-approvals-and-sandbox で起動することを許可する（既定 false = 許可しない。set 時。#981）。true にすると承認プロンプトと codex のサンドボックスが両方無効になり、書き込み先もネットワークも制限されなくなる。false へ戻すと codex の既定（承認プロンプトが出る）に戻る" },
                 },
                 "additionalProperties": false,
             },
