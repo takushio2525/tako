@@ -3269,19 +3269,25 @@
 - 実機測定の作法 4 件を plan へ追加（`-EncodedCommand` を使わない / arm スクリプトを
   `echo` で作らない = zsh が `\t` をタブにする / arm 側にも UTF-8 / DirectX アトラス panic は撃ち直す）
 
-## 2026-08-26（#899 再開: main を取り込んで CI 緑まで。**実機がまた落ちて before/after は未達**）
+## 2026-08-26〜27（#899: main を取り込み直して**実機の before/after を確定** → 完了）
 - PR #931 へ main 14 コミット（v0.7.8 まで）をマージ。**コードのコンフリクトはゼロ**で、
   衝突は `progress.md` / plan の追記 2 件だけ（両側を保持）。抜けていた CHANGELOG も追加
-- macOS は全緑: fmt / clippy(-D warnings) / `test --workspace` **2618 passed 0 failed** /
+- macOS は全緑: fmt / clippy(-D warnings) / `test --workspace` **2625 passed 0 failed** /
   クロスチェック エラー 0・警告 12（main 同数）/ 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
-  （項目 93 の行は `/Applications/tako.app/Contents/MacOS/tako master` = **囲まれない従来と同一**）/
-  CI 3 ジョブ緑（`39aba3c` と `002e64e` の両方）
-- 実機は `w899` を `39aba3c` へ更新して**ビルド成功**（`EXITCODE=0`）、after arm を
-  `schtasks /it` で投入し**項目 53 / 54 まで進行を実測**。その直後に回線が落ち、
-  以後 **3 時間以上** SSH・ICMP・`tailscale ping` が不通のまま（control plane 上は `Online: True`
-  なのに `CurAddr: False` = データパスだけが死ぬ）。**ログ `~\st899-after.log` は残っている**
-- 回線の作法を plan へ追加（長いペイロードは通らない / 長い処理は `Invoke-CimMethod` で
+  （項目 93 の行は `/Applications/tako.app/Contents/MacOS/tako master` = **囲まれない従来と同一**）
+- 実機の A/B（同一バイナリ・`TAKO_899_LEGACY=1` が before）を `97b2edc` で確定:
+  **before** = `launch_line="'C:\…\tako.exe' master"`（囲まれている）で項目 93 (d2) が
+  `TAKO_APP_SELF_TEST_FAILED: スターターが組む行は実シェルで実際に実行される (#899)`。
+  画面は **PowerShell の `ParserError: Unexpected token 'version' in expression or statement.`**
+  = パースの時点で撥ねられ**コマンドが走らない**（#899 の症状そのもの）。
+  **after** = `launch_line="C:\…\tako.exe master"`（囲まれない）で (d1)(d2) とも通過
+- **停止位置の項目 97 (d) は #899 とは無関係**（#967 を起票）。判定が画面のリテラル
+  `"tako setup"` を見ているのに Windows の実行ファイル名は `tako.exe` なので
+  `…\tako.exe setup` になり部分文字列が無い。**#898 が実体パスを返すようにした時点**で
+  壊れており、before の `'C:\…\tako.exe' setup` でも同じく通らないことを実測が示す
+- 実機の回線は 8/26 に 3 時間以上落ちて一度中断した（Tailscale の資格情報競合。master が根治）。
+  そのときの作法を plan へ追加（長いペイロードは通らない / 長い処理は `Invoke-CimMethod` で
   切り離して `EXITCODE=` を待つ / arm は `schtasks /it` なので切断でも死なない /
-  `run-arms.ps1` は cp932 で壊れていて使えない / ログ読みは `-Encoding UTF8`）
+  `run-arms.ps1` は cp932 で壊れていて使えない / ログ読みは `-Encoding Default`）
 - **A/B の意味が 8/24 から変わっている**（`87feff8` で LF legacy を撤去したため、
   `TAKO_899_LEGACY=1` はクォートだけを戻す = 落ちるのは (d1) ではなく **(d2)**）
