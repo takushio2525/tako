@@ -8,6 +8,14 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.10] - 2026-08-27
+
+Nightly patch release (automated). Changes since v0.7.9:
+夜間パッチリリース（自動）。v0.7.9 以降の変更:
+
+- [改善] codex worker の状態監視を claude 同等へ: 構造化ソース + 弱マーカーの agent 別分離 (#984) (#1000)
+- [修正] 非 claude agent の spawn の無言死を塞ぐ: CLI の実在をペイン作成前に確かめる (#983) (#999)
+
 ## [0.7.9] - 2026-08-27
 
 テスト版。**初めて macOS と Windows の配布物が同じリリースに揃う**節目のリリース。
