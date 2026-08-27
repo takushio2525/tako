@@ -2501,12 +2501,14 @@ pub fn agents_scan_plan(
 /// `sessions/` のレイアウトを変えたときに**黙って worker を見失わない**ための逃げ道
 static LEDGER_TRUSTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// 起こした Node の本数（計測用。#1011 の before / after 証拠）
+/// **起こそうとした**走査の本数（計測用。#1011 の before / after 証拠）。
+/// `claude` の実体が PATH に無ければ起動には至らないが、ガードの効きを測る指標としては
+/// 「ガードを通り抜けた走査先の数」が正しいのでここで数える
 static SCAN_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 前段ガードで省いた本数（計測用）
 static SCAN_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// (起こした本数, 省いた本数, 台帳を信頼しているか)。計測とテストが読む
+/// (起こそうとした本数, 省いた本数, 台帳を信頼しているか)。計測とテストが読む
 pub fn agents_scan_counters() -> (u64, u64, bool) {
     use std::sync::atomic::Ordering;
     (

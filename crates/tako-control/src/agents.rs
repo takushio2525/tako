@@ -514,7 +514,12 @@ pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
     }
     // #1011: ここは**画面表示**（チャットヘッダの model / ctx% / status、リモートの
     // ペイン一覧の agent 種別 / session_id）の材料なので 30 秒古くてよい。
-    // Monitoring（5 秒）で引くと UI 側が master のペースで Node を起こしてしまう
+    //
+    // **ここが 5 秒だと GUI モードのチャット表示だけで master 稼働時と同じコストになる**:
+    // 呼び出し元（`chat_view::load_chat_refresh`）は 2 秒 tick の中に居るので、
+    // 5 秒窓では 5 秒ごとに必ず再走査が起きる（実測 1 スキャン CPU 0.89 秒 = 1 コアの約 18%）。
+    // 30 秒にすると約 3% になる。新しく起動した claude の認識は最悪 30 秒遅れるが、
+    // 既に解決済みのペインは #466 の sticky が保つ
     let fresh = match list_agents_with_freshness(AgentScanFreshness::Ui) {
         Ok(agents) if !agents.is_empty() => {
             let parents = process_parent_map();
