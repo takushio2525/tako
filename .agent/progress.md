@@ -3371,3 +3371,10 @@
   毎フレーム呼んでいた（開いたときの 1 回へ）
 - 関連: PR #969（Closes #966 は master 判断で実利用確認後）。**visual-test は未実施**
   （この機はウィンドウが描画されず 1 checkpoint も進まない = #828 の既知）
+
+## 2026-08-27（#937: 対応マトリクスの未実測 47 件を Windows 実機で消し込み）
+- 隔離 GUI を session 1 へ投げ、SSH（session 0）から named pipe / MCP で 47 件すべてを実測。
+  **未実測 0 件**（supported 69 → 110 / degraded 12 → 13 / pending 56 → 15）。#617 のごみ箱も実機確認
+- 製品バグ 5 件起票（#970 verbatim cwd で git タブ全滅 / #971 remote の tailscale serve /
+  #972 remote scrollback / #973 autosave が CLI 編集で不発（macOS も）/ #974 psmux の設定警告）
+- 次: #722 の AI 命名と remote 系は実機 claude の OAuth 期限切れ・#971 でブロック

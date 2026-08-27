@@ -3295,3 +3295,63 @@ gh api 'repos/takushio2525/tako/contents/<path>?ref=windows%2F467-...' -q .conte
 `...2aefs/heads/...` のような壊れた refspec になって
 `src refspec ... does not match any` で落ちる。このセッションで 2 回踏んだ。
 **`"${C}:refs/heads/${B}"` と必ず波括弧で囲む。**
+
+## #937 の記録（未実測 47 件の消し込み。2026-08-27）
+
+**結果: 未実測 0 件**。マトリクスは supported 69 → **110** / degraded 12 → **13** /
+pending 56 → **15** / unsupported 2（合計 140 は不変）。docs の「未実測」欄が 0 になった。
+
+### 測り方（これが一番の収穫。次の実機作業はここから始める）
+
+**隔離 GUI を session 1 へ投げ、CLI は SSH（session 0）から名前付きパイプ越しに叩く。**
+named pipe はセッションを跨げるので、GUI 操作を伴わない機能は**全部 SSH 側から実測できる**。
+
+1. 実機の共有リポ（`dev\tako`）の `target\debug\{tako,tako-app}.exe` を**自分の作業ディレクトリへ
+   コピーして**使う（並行 worker が同じリポでリビルドしても足元が入れ替わらない。
+   バイナリの由来コミットは記録しておく）
+2. 起動は `schtasks /create … /it` + `/run`（session 0 に DirectX が無いので直起動は panic）。
+   env は `TAKO_ISOLATED=1` + `TAKO_PERSIST=1` + **`TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR` を明示**
+   （pid 依存の既定パスだと SSH 側から接続情報を引けない）
+3. SSH 側は `disc\control.json` の `socket` / `token` を読んで `TAKO_SOCKET` / `TAKO_TOKEN` へ入れる。
+   MCP は同じ token で `mcp_url` へ JSON-RPC を POST すれば `tools/call` が通る
+   （CLI が無い機能 = `tako_check_health` / `tako_background_kill` はこれで測る）
+4. **HOME を触る機能**（`setup` / `setup-mcp` / `agents sync-rules` / `config`）は
+   `HOME` / `USERPROFILE` / `APPDATA` をスクラッチへ向けてから測る。
+   ただし **claude 本体は `USERPROFILE` の上書きを見ない**（`claude mcp list` は実 `~/.claude.json` を読んだ）
+5. git 系は **対向の bare リポジトリを作って push / pull まで実測**できる（ネットワーク不要）
+
+### 踏んだ落とし穴
+
+- **ssh の 1 コマンドは 2 分で切られる**。`--wait` や `run --timeout 1800` のような
+  ブロッキングは**必ず短い timeout を渡す**か `Start-Job` + `Wait-Job -Timeout` で囲む。
+  切られても**リモートの powershell は生き残る**ので、明示 pid で止める
+- **`tee ... | head -N` は ssh を SIGPIPE で殺す**（出力が途中で切れて「スクリプトが止まった」に見える）。
+  ファイルへ落としてから読む
+- **狭いペインで測ると結論が逆になる**: `run-interactive` の exit マーカーが折り返して
+  `status` が永久に running（#651）。`orchestrator run` の output も 10 桁で折り返す。
+  **測る前に `tako list` の cols を見る**
+- **表示していないタブのペインでは render 依存の機能が動かない**（autosave のタイマーは
+  render から始まる）。#647 / #932 と同じ型なので、render 依存を測るときはタブを前に出す
+- PowerShell のダブルクォート内で `$_` / `%i` は展開・解釈される。ペインへ打ち込む文字列は
+  **シングルクォート**にする（`git status` が ParserError になって「送達が壊れた」に見えた）
+
+### 実測できなかったもの（理由つき）
+
+- **実機の claude が OAuth 期限切れ**（`Failed to authenticate: OAuth session expired`）。
+  会話が要るもの = `orchestrator report` の transcript 層 / `run` の完遂 / `remote messages` /
+  `setup` の対話の通し / #722 の AI 命名の実発火。**spawn・run・resume の骨格は測れた**
+  （spawn が PowerShell 方言の env 前置きで claude を起こし、`run` は status=timeout を返す）
+- **remote 系はデーモンが起動できない**（#971。`tailscale serve` へ unix ソケットを渡している）。
+  1〜3 段（検出 / ログイン / 証明書）までは通る
+- #617 の reveal / 開く系 / 文言は**画面を見る人が要る**ので未実施（ごみ箱だけ機械判定した）
+
+### この消し込みで見つけた製品バグ
+
+| Issue | 症状 | 直す場所 |
+|---|---|---|
+| #970 | `open-in dir` の cwd が `\\?\` → OSC 7 で `///?/C:/…` へ壊れ、そのタブの git 操作が全滅 | `canonicalize` の出口に境界を 1 本 |
+| #971 | `tako remote setup` が serve 設定で失敗（unix ソケット target） | Windows は loopback TCP へ（#841 と併せて設計） |
+| #972 | `remote scrollback` が器の境界を通らず psmux で解決できない | `DetachedCapture` へ寄せる |
+| #973 | プレビューの自動保存が CLI / MCP 編集で発火しない（**macOS も同じ**） | `schedule_autosave` がタイマーまで始める |
+| #974 | tako が書く `tmux-backend.conf` に psmux が持たない 4 オプション | 能力で出し分け |
+| #651 | 狭いペインで `--wait` が永久待機（既存 Issue に Windows 実測を追記） | マーカー検出を折り返し耐性へ |

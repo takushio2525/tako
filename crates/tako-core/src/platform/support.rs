@@ -201,6 +201,24 @@ pub mod notes {
         "Status and official instructions work, but tako only runs the installer for you on macOS (on Windows it points to the PowerShell installer)",
     );
 
+    /// #970。`canonicalize` の verbatim prefix が OSC 7 経路で `///?/…` へ壊れる
+    pub const WIN_OPEN_DIR_VERBATIM: Note = Note::new(
+        "新タブは開けるが、ペインの cwd が `///?/C:/…` になり、そのタブでは git 操作が「git リポジトリではない」で止まる（`tab new --cwd` / `tree add` も同じ。#970）",
+        "The new tab opens, but the pane cwd becomes `///?/C:/...`, so git operations in that tab stop with \"not a git repository\" (`tab new --cwd` and `tree add` share this; #970)",
+    );
+
+    /// #971。Windows の tailscale は unix ソケット target を持たない
+    pub const WIN_REMOTE_SERVE_UNIX: Note = Note::new(
+        "`tako remote setup` が serve の設定で失敗する（tailscale serve へ unix ソケットを渡しており Windows は非対応）ため、リモートアクセスのデーモンを起動できない。状態照会は動くが常に running=false（#971）",
+        "`tako remote setup` fails while configuring serve (it passes a unix socket target to tailscale serve, which Windows does not support), so the remote daemon cannot start. Status queries work but always report running=false (#971)",
+    );
+
+    /// #972。器の境界（#519）を通らず `tako_core::tmux` を直に叩いている
+    pub const WIN_REMOTE_SCROLLBACK_BACKEND: Note = Note::new(
+        "スクロールバックの取得が器の境界を通らず psmux で解決できない（セッション名でもペイン ID でも `no server running` になる。#972）",
+        "Scrollback capture bypasses the container boundary and psmux cannot resolve it (both a session name and a pane id return `no server running`; #972)",
+    );
+
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
 
     /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
@@ -411,11 +429,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_agents_sync_rules",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako agents sync-rules --source <正本>` が claude のグローバル指示へマーカーブロックを書き（action=updated + .bak 生成）、未導入の codex / agy は理由つきで skip される",
+        ),
     },
     Feature {
         key: "tako_auto_rename",
@@ -441,11 +458,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_background_kill",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: MCP `tako_background_kill` が killed=2 を返し、`tako backgrounded` が 1 件から空になる",
+        ),
     },
     Feature {
         key: "tako_background_list",
@@ -476,11 +492,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_check_health",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: MCP `tako_check_health` が HTTP 200 で healthy=true / tmux_available=true / persist_enabled=true / version_match=true / issues=[] を返す",
+        ),
     },
     Feature {
         key: "tako_close_pane",
@@ -493,21 +508,19 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_collapse_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako collapse --tab 1 on` が collapsed=true を返し `tako list` の collapsed も true、`off` で戻る",
+        ),
     },
     Feature {
         // #513: AI 系設定の git ベース共有。GUI にも tmux にも依存しない
         key: "tako_config_share",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako config init` が共有リポジトリを作って初回コミット（7 ファイル）、`tako config` が差分（same 4）を出し、`tako config pull` が 1 件取り込む",
+        ),
     },
     Feature {
         key: "tako_confirm_close",
@@ -562,29 +575,26 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_foreground_pane",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako background --pane N` で外したペインが `tako foreground N` で由来タブへ戻る（list の panes が 1 → 1,2）",
+        ),
     },
     Feature {
         key: "tako_git_branch_create",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako git branch <名前> --pane <p>` が新ブランチを作ってチェックアウトする（cwd が通常形のペインで実施。verbatim prefix の cwd では解決できない = #970）",
+        ),
     },
     Feature {
         key: "tako_git_checkout",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako git checkout topic --pane <p>` が checked_out=true を返し実リポジトリの HEAD が移る（cwd が通常形のペインで実施 = #970）",
+        ),
     },
     Feature {
         key: "tako_git_commit",
@@ -621,38 +631,34 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_git_merge",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako git merge topic -y --pane <p>` が merge コミットを作り、`-y` なしのドライランは作業ツリーを変えずに予測（predicted_conflicts）だけ返す",
+        ),
     },
     Feature {
         key: "tako_git_merge_abort",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: 衝突する merge が conflicted=true / conflicts=[c.txt] になり、`tako git abort` が aborted=merging を返して HEAD と作業ツリーが元へ戻る",
+        ),
     },
     Feature {
         key: "tako_git_pull",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako git pull --pane <p>` が対向 bare リポジトリの新コミットを取り込み merge コミットを作る",
+        ),
     },
     Feature {
         key: "tako_git_push",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako git push --pane <p>` で対向 bare リポジトリの main が push 後の HEAD へ進む",
+        ),
     },
     Feature {
         key: "tako_git_resolve_agent",
@@ -707,11 +713,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_limit_service",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako limit-service` が現在サービスを返し、claude → codex → claude の切替が反映される",
+        ),
     },
     Feature {
         key: "tako_list_panes",
@@ -774,11 +779,12 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_dir",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
+        windows: Support::Degraded {
+            note: notes::WIN_OPEN_DIR_VERBATIM,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako open-in dir <path>` は新タブを作り `tako recent list` にも載るが、ペインの cwd が `///?/C:/…` になりそのタブの git 操作が全滅する（#970）",
+        ),
     },
     Feature {
         key: "tako_open_file",
@@ -791,20 +797,18 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_remote",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako open-in remote <host>` が新タブで接続前バナーを出し、到達不能なホストでもタブを閉じず ssh exit 255 の理由 + 次の一手 + 入力待ちまで出す（#919 の契約）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_accounts",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `accounts list`（空）→ `add --inherit` → `show` → `list`（1 件）→ `remove` → `list`（空）の往復",
+        ),
     },
     Feature {
         key: "tako_orchestrator_handoff",
@@ -838,11 +842,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_ledger",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: spawn が作った台帳エントリを `ledger list` が返し、`ledger record --outcome pass` / `ledger amend` が反映され `ledger stats` が pass_rate=100 になる",
+        ),
     },
     Feature {
         key: "tako_orchestrator_profiles",
@@ -863,11 +866,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_report",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako orchestrator report --pane <p>` が source=scrollback で実ペインの出力を返す（第 1 層）。transcript 層は実機の claude が未認証で会話を作れず未実測",
+        ),
     },
     Feature {
         key: "tako_orchestrator_respond",
@@ -880,29 +882,26 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_run",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: MCP `tako_orchestrator_run` が run_id を即返して worker を spawn し、CLI の同期版は status=timeout + 出力 + closed=true まで返す（完遂は実機の claude が未認証のため未実測）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_run_result",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako orchestrator run-result <run_id>` が status / duration_seconds / output / pane_id を返す",
+        ),
     },
     Feature {
         key: "tako_orchestrator_run_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako orchestrator run-status` が starting/running → timeout/finished と elapsed_seconds を返す（MCP と CLI の両経路）",
+        ),
     },
     Feature {
         key: "tako_orchestrator_self",
@@ -923,11 +922,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_orchestrator_supervisor",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `supervisor status` → `set_mode --mode notify_only` → `status` → `set_mode --mode auto` の往復と `history --lines 5`",
+        ),
     },
     Feature {
         key: "tako_orchestrator_worker_status",
@@ -964,11 +962,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_pin_preview",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako pin --pane N on` が pinned へ矩形つきで載り、`off` で消える",
+        ),
     },
     Feature {
         // #552: 自動命名された名前の固定（GUI のピン印と 1:1）
@@ -1006,11 +1003,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_autosave",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako edit autosave true/false` が状態を往復する。有効化後の CLI / MCP 編集で自動保存が発火しないのは実装が共通なので macOS でも同じ（タイマーを始めるのが GUI 入力経路だけ。#973）",
+        ),
     },
     Feature {
         key: "tako_preview_cache",
@@ -1023,11 +1019,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_changelog",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako preview-changelog on --pane <p>` が changelog=true / commits=2 を返し `off` で戻る",
+        ),
     },
     Feature {
         key: "tako_preview_copy_code",
@@ -1078,11 +1073,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_redo",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako edit redo --pane <p>` が redone=true を返す（undo と対で実測）",
+        ),
     },
     Feature {
         key: "tako_preview_reload",
@@ -1095,11 +1089,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_replace",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako edit replace <前> <後>` と `--all` が replaced を返し、`tako edit save` 後の実ファイルが置換後の内容になる",
+        ),
     },
     Feature {
         key: "tako_preview_save",
@@ -1112,20 +1105,18 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_preview_search",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako edit search <語>` が index=2 / total=2 を返し、`--direction next/prev` で index が 1 ↔ 2 と動く",
+        ),
     },
     Feature {
         key: "tako_preview_undo",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako edit undo --pane <p>` が undone=true を返す（redo と対で実測）",
+        ),
     },
     Feature {
         key: "tako_preview_view",
@@ -1148,29 +1139,32 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_recent",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako recent list` が `open-in dir` で開いたディレクトリを返す",
+        ),
     },
     Feature {
         key: "tako_remote_agents",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
+            note: notes::WIN_REMOTE_SERVE_UNIX,
+            issue: 971,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako remote agents` は agents=[] を返し走査そのものは動く（#877 の境界）が、`tako remote setup` が serve 設定で失敗しデーモンを起動できない（#971）",
+        ),
     },
     Feature {
         key: "tako_remote_devices",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
+            note: notes::WIN_REMOTE_SERVE_UNIX,
+            issue: 971,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako remote devices list` は running=false の形を返すが、デーモンを起動できないので端末を登録できない（#971）",
+        ),
     },
     Feature {
         key: "tako_remote_folder",
@@ -1190,25 +1184,31 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_REMOTE_UNVERIFIED,
             issue: 528,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: CLI が <SESSION_ID> を要求するところまで確認。実機の claude が未認証で会話を作れないため本体は未実測（デーモン側は #971 でブロック）",
+        ),
     },
     Feature {
         key: "tako_remote_scrollback",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
+            note: notes::WIN_REMOTE_SCROLLBACK_BACKEND,
+            issue: 972,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: セッション名でもペイン ID でも `psmux: no server running on session '<socket>__<target>'` になる。同じソケットへ境界経由で叩く `tako tmux list` は成功する（#972）",
+        ),
     },
     Feature {
         key: "tako_remote_setup",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
+            note: notes::WIN_REMOTE_SERVE_UNIX,
+            issue: 971,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: 1〜3 段（Tailscale 検出 / ログイン / HTTPS 証明書）は OK で、4 段目の serve 設定が `unix socket serve target is not supported on Windows` で失敗する（#971）",
+        ),
     },
     Feature {
         key: "tako_remote_start",
@@ -1225,10 +1225,12 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_remote_status",
         macos: Support::Supported,
         windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
+            note: notes::WIN_REMOTE_SERVE_UNIX,
+            issue: 971,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako remote status` は running=false を返すが、デーモンを起動できないので常にこの状態（#971）",
+        ),
     },
     Feature {
         key: "tako_remote_stop",
@@ -1252,11 +1254,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_reorder_tab",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako tab reorder 1 --index 1` でタブ順が tab2,tab1,tab3 へ入れ替わり `--index 0` で戻る",
+        ),
     },
     Feature {
         key: "tako_resize_pane",
@@ -1285,20 +1286,18 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_run_interactive",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako run-interactive --pane <p> <コマンド>` が新ペインで実行し、`--wait` が exit_code=0 / status=exited を返す（ペインが極端に狭いとマーカーが折り返して検出できない = #651。macOS も同様）",
+        ),
     },
     Feature {
         key: "tako_run_interactive_status",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako run-interactive-status <pane>` が exit_code=0 / status=exited を返す（狭いペインの折り返しは #651）",
+        ),
     },
     Feature {
         key: "tako_run_resolve",
@@ -1361,11 +1360,10 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         // セルフテスト項目 97 が見ているのは**スターターに setup の行が入ること**で、
         // `tako setup` そのものの実行ではない。dispatch の SetupRun は実機で未実測
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako setup --check` が claude（未認証）/ psmux / git / tailscale / スリープ防止 / MCP 未登録を正しく列挙し、`--changes --json` が revision 17 と未適用一覧を返す。対話の通し（エージェント起動）は実機の claude が未認証のため未実測",
+        ),
     },
     Feature {
         key: "tako_setup_bootstrap",
@@ -1388,11 +1386,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup_mcp",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako setup-mcp` が claude の設定へ tako を登録（旧内容は backups へ退避）し、`claude mcp list` が tako … `tako.exe mcp serve` を Connected と健康判定する",
+        ),
     },
     Feature {
         key: "tako_shell_integration",
@@ -1449,11 +1446,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_task_checkpoint",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako task checkpoint --task-id … --phase running` が保存され、`tako task update --phase verifying` が反映される",
+        ),
     },
     Feature {
         key: "tako_task_gate",
@@ -1484,29 +1480,26 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_task_list",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako task list --json` が保存したチェックポイントを issue / branch / project / prompt_head / phase つきで返す",
+        ),
     },
     Feature {
         key: "tako_task_resume",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako task resume <id> --tab <t>` が PowerShell 方言の env 前置き（`$env:TAKO_ORCHESTRATOR_ROLE=…; claude …`）でペインを立てる",
+        ),
     },
     Feature {
         key: "tako_telemetry",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: `tako telemetry status` → `on` → `status`（true）→ `off` → `status`（false）の往復",
+        ),
     },
     Feature {
         key: "tako_theme",
@@ -1519,11 +1512,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_tmux_cleanup",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TMUX_ATTACH,
-            issue: 519,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: 器へ孤児セッションを 1 つ作ると `tako tmux cleanup` が killed=[tako-orphan937] を返し、使用中の 5 セッションには触らない",
+        ),
     },
     Feature {
         key: "tako_tmux_kill",
@@ -1566,11 +1558,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_tmux_select_window",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_TMUX_ATTACH,
-            issue: 519,
-        },
-        windows_evidence: Evidence::Unverified,
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測: 2 つ目の window を作ってから `tako tmux select-window 0 / 1 --pane 1` でアクティブ window が実際に切り替わる",
+        ),
     },
     Feature {
         key: "tako_tree_folder",
