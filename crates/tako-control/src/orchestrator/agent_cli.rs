@@ -268,8 +268,8 @@ pub fn locate(agent: WorkerAgent) -> Result<String, AgentCliError> {
     // テストでは**既定で実探索をしない**。実探索は unix ではログインシェルを起動する
     // （`$SHELL -l -c`）ので、spawn 系テスト 1 本ごとに子プロセスが増え、プロセス全体の
     // fd 数を見ている `ipc::連続接続でfdが漏れない` が 6 秒間の最小値でも tolerance を
-    // 超える（実測: fd 10 → 14。main では緑）。探索そのものは
-    // `実在するcliは見つかる` が 1 回だけ通し、実環境での挙動は実機検証で見る
+    // 超える（実測: fd 10 → 14。main では緑）。探索そのものは別のテストバイナリにある
+    // `tako_core::platform::exe::tests::実環境の基本コマンドを解決できる` が担保する
     #[cfg(test)]
     {
         if forced_missing(agent) {
