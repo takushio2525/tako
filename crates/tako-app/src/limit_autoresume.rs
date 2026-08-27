@@ -25,6 +25,57 @@ use tako_core::PaneId;
 
 use crate::TakoApp;
 
+/// codex の構造化レート制限を読み直す間隔（#985）。
+///
+/// 短くしても意味が無い: 使用率は 1 ターンごとにしか動かず、リセット時刻は枠のあいだ不変。
+/// **長くしすぎない**のは、上限に当たったペインが正確な解除時刻を早く得られるようにするため
+const CODEX_LIMITS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// codex レート制限の読み直しを間引くための状態
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CodexLimitsScan {
+    last: Option<std::time::Instant>,
+}
+
+impl CodexLimitsScan {
+    /// 読み直す時期か（対象が 1 つも無ければ常に false = 何も起こさない）
+    pub(crate) fn due(&self, targets: usize, now: std::time::Instant) -> bool {
+        targets > 0
+            && self
+                .last
+                .is_none_or(|t| now.duration_since(t) >= CODEX_LIMITS_INTERVAL)
+    }
+
+    pub(crate) fn mark(&mut self, now: std::time::Instant) {
+        self.last = Some(now);
+    }
+}
+
+/// background で codex のレート制限を集める（#985）。
+///
+/// **プロセス起動を増やさない**のが要点: 呼び出し側が既に採った `ProcessSnapshot` を
+/// 1 枚だけ使い回すので、対象が何ペインでも tmux / ps は増えない（#772 / #779 の枠組み）。
+/// `lsof` は codex を見つけたペインに 1 回ずつだけ（結果は sticky）
+pub(crate) fn scan_codex_limits(
+    targets: &[(PaneId, String)],
+    snapshot: &tako_control::agents::ProcessSnapshot,
+) -> HashMap<PaneId, tako_control::codex_session::RateLimits> {
+    let backends: Vec<String> = targets.iter().map(|(_, b)| b.clone()).collect();
+    let threads = tako_control::codex_session::resolve_thread_ids_with(&backends, snapshot);
+    let mut out = HashMap::new();
+    for (pane, backend) in targets {
+        let Some(tid) = threads.get(backend) else {
+            continue;
+        };
+        if let Some(rl) =
+            tako_control::codex_session::read_turn_state(tid).and_then(|st| st.rate_limits)
+        {
+            out.insert(*pane, rl);
+        }
+    }
+    out
+}
+
 /// ペイン 1 つぶんの自動復帰の追跡状態（1 エピソード = 上限で止まってから復帰するまで）
 #[derive(Debug, Clone)]
 pub(crate) struct LimitResumeTracker {
@@ -90,7 +141,15 @@ impl TakoApp {
             };
             let lines = session.visible_lines();
             let fingerprint = tako_control::limit_stop::screen_fingerprint(&lines);
-            let stop = tako_control::limit_stop::detect_limit_stop(&lines, now, tz);
+            // #985: codex は rollout の `rate_limits.resets_at`（epoch）で解除時刻が
+            // **書式にもタイムゾーンにも依存せず**分かる。画面の文言パースより確かなので
+            // 読めていればそちらを採る。**停止の根拠は画面のまま**（#813 の安全条件）
+            let hint = self
+                .codex_limits
+                .get(&pane)
+                .map(tako_control::limit_stop::LimitHint::from_codex);
+            let stop =
+                tako_control::limit_stop::detect_limit_stop_with(&lines, now, tz, hint.as_ref());
             let Some(stop) = stop else {
                 // 上限ではなくなった = エピソード終了。次に止まったら 1 からやり直す
                 if let Some(prev) = self.limit_resume.remove(&pane) {

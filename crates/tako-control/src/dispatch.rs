@@ -7757,6 +7757,30 @@ fn normalize_agent_status(raw: &str) -> &'static str {
     }
 }
 
+/// codex の `rate_limits` を応答 JSON へ落とす（#985）。
+/// **キー名は codex の rollout と同じ**にして、上流のドキュメントと突き合わせられるようにする
+fn rate_limits_json(rl: &crate::codex_session::RateLimits) -> serde_json::Value {
+    let window = |w: Option<crate::codex_session::RateWindow>| {
+        w.map(|w| {
+            json!({
+                "used_percent": w.used_percent,
+                "window_minutes": w.window_minutes,
+                "resets_at": w.resets_at,
+            })
+        })
+    };
+    json!({
+        "primary": window(rl.primary),
+        "secondary": window(rl.secondary),
+        "plan_type": rl.plan_type,
+        // 上限に当たっている枠（`x-codex-rate-limit-reached-type` 由来。通常は null）
+        "reached": rl.reached,
+        "limited": rl.limited(),
+        // 止まっている枠が空く時刻（unix 秒）。上限でなければ null
+        "reset_at": rl.reset_at(),
+    })
+}
+
 fn finish_worker_status(
     ctx: WorkerStatusCtx,
     session_id: Option<&str>,
@@ -7821,6 +7845,7 @@ fn finish_worker_status(
     // #267: agents の生ステータスを dispatch の語彙に正規化する。
     // 正規化しないと watch ループの unknown フォールバック（スクリーン末尾 5 行判定）に
     // 落ち、長時間ツール出力で busy パターンが流れた瞬間に偽 IDLE が出る
+    let mut codex_rate_limits: Option<crate::codex_session::RateLimits> = None;
     let (status, ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -7831,10 +7856,14 @@ fn finish_worker_status(
         // #984: rollout のターン状態。**まだ 1 ターンも走っていなければ何も言わない**
         // （`status()` が None）。ここで idle と言うとプロンプト投入前を完了と誤認する
         match crate::codex_session::read_turn_state(tid) {
-            Some(st) => match st.status() {
-                Some(s) => (s.to_string(), st.ctx_percent),
-                None => ("unknown".to_string(), st.ctx_percent),
-            },
+            Some(st) => {
+                // #985: 同じ読み取りにレート制限も載っている（追加の I/O ゼロ）
+                codex_rate_limits = st.rate_limits.clone();
+                match st.status() {
+                    Some(s) => (s.to_string(), st.ctx_percent),
+                    None => ("unknown".to_string(), st.ctx_percent),
+                }
+            }
             None => ("unknown".to_string(), None),
         }
     } else if pane_exists {
@@ -7914,6 +7943,7 @@ fn finish_worker_status(
         registry_resume_command,
         agent_process_alive,
         limit_resume,
+        codex_rate_limits,
     })
 }
 
@@ -7942,6 +7972,8 @@ struct ResolvedWorkerStatus {
     agent_process_alive: bool,
     /// #813: 利用上限後の自動復帰の状態（UI スレッドで写し取った値をそのまま載せる）
     limit_resume: Value,
+    /// #985: codex の構造化されたレート制限（rollout の `rate_limits`。他 agent は None）
+    codex_rate_limits: Option<crate::codex_session::RateLimits>,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -7950,6 +7982,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     let ResolvedWorkerStatus {
         mut status,
         status_source,
+        codex_rate_limits,
         ctx_percent,
         resolved_sid,
         pane_exists,
@@ -8215,6 +8248,10 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "ctx_percent": ctx_percent,
         "recent_output": recent_output,
         "status_source": status_source,
+        // #985: codex の**構造化された**利用制限（rollout の `rate_limits`）。
+        // 画面スクレイピングと違い used_percent は数値、resets_at は epoch 秒なので、
+        // AI が「いつ解けるか」を書式に依存せず読める（claude / agy では null）
+        "rate_limits": codex_rate_limits.as_ref().map(rate_limits_json),
         "resolved_session_id": resolved_sid,
         "error": error_info,
         "stalled": stalled_info,

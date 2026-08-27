@@ -23,6 +23,55 @@ use crate::orchestrator::wait::{detect_worker_error, WorkerErrorKind};
 /// UTC オフセット（秒）。リセット時刻は日付を持たない表記なので、**観測時刻から見て
 /// 次に来る同じ時刻**として解決する（`tako_core::limit_resume::parse_reset_at`）
 pub fn detect_limit_stop(lines: &[String], observed_at: i64, tz_offset: i32) -> Option<LimitStop> {
+    detect_limit_stop_with(lines, observed_at, tz_offset, None)
+}
+
+/// 構造化ソースの手がかりを添えて判定する（#985）。
+///
+/// `hint` は codex の rollout（`codex_session::rate_limits_for_backend`）から採った
+/// **正確なリセット時刻**。画面の文言パースは版ごとの書式に依存する
+/// （codex 0.150.1 は同日なら `4:24 AM`、日をまたぐと `Aug 28th, 2026 4:24 AM`）のに対し、
+/// こちらは epoch 秒なので**書式にもタイムゾーンにも依存しない**。
+///
+/// **手がかりだけでは停止と判定しない**のが要点。停止の根拠は画面のままにしておくことで
+/// 「上限由来の停止に限る」という #813 の安全条件を 1 か所で守り続ける
+/// （claude 経路は `hint = None` で通るので 1 ビットも変わらない）
+pub fn detect_limit_stop_with(
+    lines: &[String],
+    observed_at: i64,
+    tz_offset: i32,
+    hint: Option<&LimitHint>,
+) -> Option<LimitStop> {
+    let mut stop = detect_limit_stop_from_screen(lines, observed_at, tz_offset)?;
+    // 構造化ソースの時刻が読めていれば**そちらを採る**（文言パースより確か）
+    if let Some(at) = hint.and_then(|h| h.reset_at) {
+        stop.reset_at = Some(at);
+    }
+    Some(stop)
+}
+
+/// 構造化ソースから採った手がかり（#985）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimitHint {
+    /// 上限が解ける時刻（unix 秒）。`None` = 構造化ソースでも分からない
+    pub reset_at: Option<i64>,
+}
+
+impl LimitHint {
+    /// codex の `rate_limits` から手がかりを作る。
+    /// **上限に当たっている枠が無ければ空**（= 手がかり無し）
+    pub fn from_codex(rl: &crate::codex_session::RateLimits) -> Self {
+        Self {
+            reset_at: rl.reset_at(),
+        }
+    }
+}
+
+fn detect_limit_stop_from_screen(
+    lines: &[String],
+    observed_at: i64,
+    tz_offset: i32,
+) -> Option<LimitStop> {
     // ダイアログが入力欄を奪っているならそちらが優先（idle 判定より確実）。
     // usage_limit 以外のダイアログ（permission / plan 確認 / model 選択）では
     // **何も返さない** = 自動復帰は発動しない
@@ -212,5 +261,150 @@ mod tests {
             tako_core::limit_resume::safe_choice(&options),
             Some((1, "Stop and wait for limit to reset"))
         );
+    }
+
+    // --- #985: codex ---
+
+    /// codex 0.150.1 の上限停止画面（**日付つきの `Try again at`**）。
+    /// 書式はバイナリ内の `" Try again at "` + `", %Y %-I:%M %p"` から。
+    /// 到達文言（`You've hit your usage limit.`）も同じくバイナリ内文字列
+    const CODEX_LIMIT_DATED: &str = r#"■ You've hit your usage limit. Upgrade to Pro
+(https://chatgpt.com/explore/pro), visit
+https://chatgpt.com/codex/settings/usage to purchase more credits or
+try again at Aug 28th, 2026 4:24 AM.
+
+›
+"#;
+
+    /// codex の「Approaching rate limits」ダイアログ（実採取。#157 / #748）
+    const CODEX_APPROACHING: &str = r#"  Approaching rate limits
+  Switch to gpt-5.4-mini for lower credit usage?
+
+› 1. Switch to gpt-5.4-mini
+  2. Keep current model
+  3. Keep current model (never show again)
+
+  Press enter to confirm or esc to go back"#;
+
+    /// codex の `/usage` ダイアログ（**実採取**。2026-08-27 / 0.150.1）。
+    /// 「Redeem usage limit reset」は在庫のあるリセットを引き換える = 自動確定禁止
+    const CODEX_USAGE_MENU: &str = r#"  Usage
+  View account usage or redeem an earned reset.
+
+› 1. Show usage                View recent account token usage.
+  2. Redeem usage limit reset  You have 1 usage limit reset available.
+
+  Press enter to confirm or esc to go back"#;
+
+    fn codex_limits(reset_at: Option<i64>) -> crate::codex_session::RateLimits {
+        crate::codex_session::RateLimits {
+            primary: Some(crate::codex_session::RateWindow {
+                used_percent: 100,
+                window_minutes: 300,
+                resets_at: reset_at,
+            }),
+            secondary: None,
+            plan_type: Some("plus".into()),
+            reached: Some("primary".into()),
+        }
+    }
+
+    #[test]
+    fn issue985_codexの日付つき上限画面を解除時刻つきで検知する() {
+        let stop =
+            detect_limit_stop(&screen(CODEX_LIMIT_DATED), OBSERVED, JST).expect("検知される");
+        assert_eq!(
+            stop.kind,
+            LimitStopKind::Idle,
+            "codex の停止はダイアログ無し"
+        );
+        assert_eq!(
+            stop.reset_at,
+            Some(1_786_752_000 - 9 * 3600 + 4 * 3600 + 24 * 60),
+            "日付を挟んだ `Try again at Aug 28th, 2026 4:24 AM` が読めていない"
+        );
+    }
+
+    #[test]
+    fn issue985_構造化ソースの解除時刻が画面のパースより優先される() {
+        // rollout の `resets_at`（epoch）は書式にもタイムゾーンにも依存しない
+        let exact = 1_786_752_000 - 9 * 3600 + 4 * 3600 + 24 * 60 + 37;
+        let hint = LimitHint::from_codex(&codex_limits(Some(exact)));
+        let stop = detect_limit_stop_with(&screen(CODEX_LIMIT_DATED), OBSERVED, JST, Some(&hint))
+            .expect("検知される");
+        assert_eq!(stop.reset_at, Some(exact), "構造化ソースの epoch を採る");
+    }
+
+    #[test]
+    fn issue985_構造化ソースだけでは停止と判定しない() {
+        // 上限の根拠は画面のまま（#813 の安全条件を 1 か所で守る）。
+        // 通常の idle 画面に手がかりを添えても発動しない
+        let hint = LimitHint::from_codex(&codex_limits(Some(OBSERVED + 3600)));
+        assert!(
+            detect_limit_stop_with(&screen(NORMAL_IDLE), OBSERVED, JST, Some(&hint)).is_none(),
+            "画面が上限でないのに手がかりだけで自動復帰が発動しうる"
+        );
+    }
+
+    #[test]
+    fn issue985_上限でない構造化ソースは解除時刻を上書きしない() {
+        // まだ上限に当たっていない（4% / 1%）なら `reset_at()` は None なので、
+        // 画面から読めた時刻がそのまま残る
+        let rl = crate::codex_session::RateLimits {
+            primary: Some(crate::codex_session::RateWindow {
+                used_percent: 4,
+                window_minutes: 300,
+                resets_at: Some(1_787_840_583),
+            }),
+            secondary: None,
+            plan_type: Some("plus".into()),
+            reached: None,
+        };
+        let hint = LimitHint::from_codex(&rl);
+        let stop = detect_limit_stop_with(&screen(CODEX_LIMIT_DATED), OBSERVED, JST, Some(&hint))
+            .expect("検知される");
+        assert_eq!(
+            stop.reset_at,
+            Some(1_786_752_000 - 9 * 3600 + 4 * 3600 + 24 * 60),
+            "上限でない枠の resets_at で復帰予定を書き換えてはいけない"
+        );
+    }
+
+    #[test]
+    fn issue985_codexの接近ダイアログは現状維持で応答できる() {
+        let stop =
+            detect_limit_stop(&screen(CODEX_APPROACHING), OBSERVED, JST).expect("検知される");
+        assert_eq!(stop.kind, LimitStopKind::Dialog);
+        let dialog =
+            crate::claude_tui::detect_choice_dialog(&screen(CODEX_APPROACHING)).expect("検知");
+        let options: Vec<(Option<u32>, String)> = dialog
+            .options
+            .iter()
+            .map(|o| (o.number, o.label.clone()))
+            .collect();
+        assert_eq!(
+            tako_core::limit_resume::safe_choice(&options),
+            Some((2, "Keep current model")),
+            "モデル切替（課金に効く）ではなく現状維持を選ぶ"
+        );
+    }
+
+    /// #985 受け入れ条件 4 の回帰: codex の `/usage` ダイアログでは**何も選ばない**
+    #[test]
+    fn issue985_codexのusageダイアログでは何も選ばない() {
+        let dialog =
+            crate::claude_tui::detect_choice_dialog(&screen(CODEX_USAGE_MENU)).expect("検知");
+        let options: Vec<(Option<u32>, String)> = dialog
+            .options
+            .iter()
+            .map(|o| (o.number, o.label.clone()))
+            .collect();
+        assert_eq!(
+            tako_core::limit_resume::safe_choice(&options),
+            None,
+            "在庫のあるリセットを勝手に引き換えてはいけない"
+        );
+        // そもそも自動復帰の対象にもしない（上限で「止まって」いる画面ではない）
+        assert!(detect_limit_stop(&screen(CODEX_USAGE_MENU), OBSERVED, JST).is_none());
     }
 }

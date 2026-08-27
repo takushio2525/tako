@@ -367,10 +367,16 @@ pub mod notes {
         "agy stores conversations in SQLite (~/.gemini/antigravity-cli/conversations/), so reading them needs a new dependency; liveness is visible via its presence lock, but turn start/completion is not",
     );
 
-    /// #357 の実地調査。上限メトリクスを取り出す口が無い
-    pub const AGY_NO_LIMIT_METRICS: Note = Note::new(
-        "agy は利用制限の残量を表示・出力しないため取得できない（#357 で実地確認）",
-        "agy neither displays nor reports usage-limit headroom, so it cannot be read (verified in #357)",
+    /// #985 の再調査（agy 1.1.22）。**窓つきの利用上限という概念自体が無い**
+    pub const AGY_CREDITS_NOT_WINDOWED: Note = Note::new(
+        "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）",
+        "In agy, headroom is a prepaid AI-credit balance: there is no 5h/weekly window and no reset time. The balance appears only inside the interactive /credits modal, so there is no way to read it without disturbing the worker's screen (re-verified on agy 1.1.22 in #985)",
+    );
+
+    /// #985: 上限で「止まる」概念が無いので待つべきリセットが存在しない
+    pub const AGY_NO_LIMIT_RESET: Note = Note::new(
+        "agy はクレジットを使い切っても「解除を待つ」出口が無い（買い足す導線しか無い）ので、待って再開するという動作が成立しない（#985）",
+        "When agy runs out of credits there is no \"wait for the reset\" exit at all, only a purchase link, so waiting and resuming cannot work (#985)",
     );
 
     /// effort が CLI 引数ではなくモデル名に埋まっている
@@ -399,16 +405,10 @@ pub mod notes {
         "The config file location is fixed, so tako's account switching has no effect for this agent",
     );
 
-    /// codex の上限はダイアログ型で、自動復帰の選択が要る（#985）
-    pub const LIMIT_DIALOG_ONLY: Note = Note::new(
-        "上限で止まったことは検知できるが、ダイアログ型のため自動復帰まで到達していない（#985）",
-        "Hitting the limit is detected, but because it appears as a dialog the automatic resume does not complete yet (#985)",
-    );
-
-    /// #357 が宿題として残した「有料プランでの実データ表示」
-    pub const LIMIT_METRICS_UNMEASURED: Note = Note::new(
-        "抽出パターンはあるが、実データが出るのは有料プランのみで未実測（#357 の残課題）",
-        "The extraction pattern exists, but real data appears only on paid plans and has not been measured (open item from #357)",
+    /// #985: codex はクレジット切れの出口が課金しか無い
+    pub const CODEX_CREDITS_NEED_PURCHASE: Note = Note::new(
+        "5h / 週の枠は解除を待って自分で再開するが、ワークスペースのクレジットが尽きた場合は「待つ」出口が無い（増枠申請・購入・獲得済みリセットの引き換えしか無いので、tako は何も選ばずに止まる）",
+        "The 5h and weekly windows resume by themselves once they reset, but when workspace credits run out there is no \"wait\" exit at all (only request-an-increase, purchase, or redeeming an earned reset), so tako stops without choosing anything",
     );
 
     /// spawn は通るが pending のまま索引が育たない（transcript が無いため）
@@ -635,12 +635,13 @@ pub const MATRIX: &[AgentFeature] = &[
             "The status-bar usage-limit readout can be switched to this agent (#217 / #357)",
         ),
         claude: S::Supported,
-        codex: degraded(notes::LIMIT_METRICS_UNMEASURED),
-        agy: unsupported(notes::AGY_NO_LIMIT_METRICS),
+        codex: S::Supported,
+        agy: unsupported(notes::AGY_CREDITS_NOT_WINDOWED),
         local: local_pending(),
         evidence: AgentEvidence::Measured(
-            "#357 の完了報告: codex は TUI の primary / secondary NN% を抽出できるが実データは \
-             有料プラン限定で未実測、agy は取得不能を実地確認して unsupported を明示表示にした",
+            "#985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を \
+             読む形になり、有料プランの実データが出る。agy は取得不能を再確認して \
+             unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持）",
         ),
     },
     AgentFeature {
@@ -999,12 +1000,19 @@ pub const MATRIX: &[AgentFeature] = &[
             "Work resumes by itself once the usage limit resets (#813)",
         ),
         claude: S::Supported,
-        codex: degraded(notes::LIMIT_DIALOG_ONLY),
-        agy: pending(notes::NOT_INVESTIGATED, 985),
+        codex: degraded(notes::CODEX_CREDITS_NEED_PURCHASE),
+        agy: unsupported(notes::AGY_NO_LIMIT_RESET),
         local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
-        evidence: AgentEvidence::Source(
-            "limit_stop.rs は claude の idle 型と codex のダイアログ型を分類するが、\
-             自動復帰まで到達するのは claude 経路だけ。agy のパターンは 1 件も無い",
+        evidence: AgentEvidence::Measured(
+            "#985 実測（2026-08-27 / codex-cli 0.150.1）: codex の解除時刻は 2 つの経路で \
+             取れる。① 画面の `Try again at Aug 28th, 2026 4:24 AM.`（バイナリ内書式 \
+             `\" Try again at \"` + `\", %Y %-I:%M %p\"`。日付を挟む形は #985 前は読めず、\
+             不明の猶予 900 秒で早撃ちして 3 回で諦めていた）② rollout の \
+             `rate_limits.<枠>.resets_at`（epoch 秒。書式にもタイムゾーンにも依存しない）。\
+             セルフテスト項目 111 の codex 節が解除前は撃たず解除後に再開するところまで見る \
+             （`TAKO_985_LEGACY=1` へ戻すと reset_at=None で FAILED になることを実測）。\
+             agy 1.1.22 は `/credits` に「待つ」出口が無く（Get More AI Credits / See Activity）、\
+             待って再開する動作そのものが成立しない",
         ),
     },
     AgentFeature {
@@ -1015,12 +1023,16 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: pending(notes::NOT_INVESTIGATED, 985),
+        agy: unsupported(notes::AGY_CREDITS_NOT_WINDOWED),
         local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
-        evidence: AgentEvidence::Source(
-            "claude_tui.rs の usage limit 分類は claude の「What do you want to do?」と \
-             codex の「Approaching rate limits」を実採取して持つ。agy の記述は無い \
-             （#357 が調べたのはメトリクス表示で、停止ダイアログの有無は別問題）",
+        evidence: AgentEvidence::Measured(
+            "#985 実測（2026-08-27）: codex 0.150.1 の停止文言 `You've hit your usage limit.` と \
+             接近ダイアログ `Approaching rate limits` をバイナリ内文字列で確認し、\
+             `limit_stop.rs` の実採取 fixture が両方を検知することをテストで固定した。\
+             agy 1.1.22 は**窓つきの利用上限を持たない**（`agy --help` に usage / quota 系の \
+             サブコマンドが無く、バイナリの `RateLimit` は全部 PR レビュー設定と \
+             Go / sentry の内部名。残量は `/credits` = 前払いクレジット）ので、\
+             検知すべき「上限で止まった状態」自体が存在しない",
         ),
     },
     AgentFeature {
@@ -1030,15 +1042,18 @@ pub const MATRIX: &[AgentFeature] = &[
             "Usage-limit headroom (%) can be read (#357)",
         ),
         claude: S::Supported,
-        codex: degraded(notes::LIMIT_METRICS_UNMEASURED),
-        agy: unsupported(notes::AGY_NO_LIMIT_METRICS),
+        codex: S::Supported,
+        agy: unsupported(notes::AGY_CREDITS_NOT_WINDOWED),
         local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
         evidence: AgentEvidence::Measured(
-            "#357: codex の primary / secondary NN% はスクレイピング実装済みだが有料プラン \
-             限定で未実測、agy は v1.1.4 の実地調査で取得不能と確定（再確認は #985）。\
-             **#984 の副産物**: codex の rollout JSONL の token_count イベントに \
-             rate_limits.primary.used_percent / window_minutes / resets_at が構造化されて \
-             入っている（実測）ので、画面スクレイピングに頼らず取れる。配線は #985",
+            "#985 実測（2026-08-27 / codex-cli 0.150.1 / plan_type = plus = **有料プラン**）: \
+             rollout の `token_count` に `rate_limits.primary`（`window_minutes: 300` = 5h）と \
+             `.secondary`（`10080` = 週）が数値で載る。**#357 の画面スクレイピングは \
+             0.150.1 では成立しない**（実測: TUI のフッターはモデル名と cwd だけで、\
+             `5h limit: [██…] 90% left (resets 23:23)` は `/status` のモーダルの中にしか \
+             出ない = 常時見えるところに `primary NN%` は無い）ので、構造化ソースが正になった。\
+             両者の解除時刻が一致することも確認（rollout の 1787840583 = 画面の 23:23）。\
+             agy 1.1.22 は前払いクレジットで枠が無い（`/credits` を実行して確認）",
         ),
     },
     AgentFeature {

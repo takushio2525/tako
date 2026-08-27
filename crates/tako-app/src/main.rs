@@ -1663,6 +1663,13 @@ struct TakoApp {
     limit_resume: limit_autoresume::LimitResumeTrackers,
     /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
     codex_metrics: AgentMetrics,
+    /// codex の**構造化されたレート制限**（#985。ペイン → rollout の `rate_limits`）。
+    /// 画面スクレイピング（#357）は codex 0.150.1 の TUI が `primary NN%` を
+    /// 出さなくなった（実測: フッターはモデル名と cwd だけ / 数値は `/status` の
+    /// モーダルの中）ため成立しない。ここが実データの出どころになる
+    codex_limits: HashMap<PaneId, tako_control::codex_session::RateLimits>,
+    /// 上の更新を間引くための状態（background で 60 秒に 1 回だけ読む）
+    codex_limits_scan: limit_autoresume::CodexLimitsScan,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
     limit_service: tako_core::LimitService,
     /// UI 表示言語の設定値（Issue #435。system / ja / en。settings.json 永続化。
@@ -3407,6 +3414,8 @@ impl TakoApp {
             handoff_nudges: HashMap::new(),
             handoff_policy_cache: HashMap::new(),
             limit_resume: HashMap::new(),
+            codex_limits: HashMap::new(),
+            codex_limits_scan: limit_autoresume::CodexLimitsScan::default(),
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
             lang_setting: {
@@ -4270,6 +4279,16 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
                         app.collect_stale_binary_scan()
                     };
+                    // #985: codex のレート制限を読む対象（ペイン → backend セッション）。
+                    // ここは in-memory の走査だけ（プロセスは起こさない）
+                    let codex_limits_scan = {
+                        let _s = tako_control::diag::perf_span("periodic_prep:codex_limits");
+                        let targets = app.collect_codex_limits_targets();
+                        let due = app
+                            .codex_limits_scan
+                            .due(targets.len(), std::time::Instant::now());
+                        due.then_some(targets)
+                    };
                     // #976: ssh 検知の材料（ペイン集合・子 pid・OSC 133 状態）。
                     // 自動追加が無効なら空 = プロセス表の採取そのものが起きない
                     let ssh_scan = {
@@ -4343,6 +4362,7 @@ impl TakoApp {
                         running_children_scan,
                         stale_binary_scan,
                         ssh_scan,
+                        codex_limits_scan,
                         limit_resume_jobs,
                     )
                 });
@@ -4365,6 +4385,7 @@ impl TakoApp {
                     running_children_scan,
                     stale_binary_scan,
                     ssh_scan,
+                    codex_limits_scan,
                     limit_resume_jobs,
                 )) = prep
                 else {
@@ -4393,66 +4414,87 @@ impl TakoApp {
                 // 初回 / 対象・role・OSC 状態変化 / 60 秒保険でだけ tmux + ps を起動し、
                 // 両方が同じ tick で必要なら 1 個の ProcessSnapshot を共有する。
                 {
-                    let (settings, running_children_scan, stale_outcome, ssh_state) = cx
-                        .background_executor()
-                        .spawn(async move {
-                            let settings = tako_control::settings::load();
-                            let sleep_guard_active = settings.sleep_guard_mode
+                    let (settings, running_children_scan, stale_outcome, ssh_state, codex_limits) =
+                        cx.background_executor()
+                            .spawn(async move {
+                                let settings = tako_control::settings::load();
+                                let sleep_guard_active = settings.sleep_guard_mode
                                 == tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
-                            let (running_targets, running_prev) = running_children_scan;
-                            let (ssh_targets, ssh_prev, ssh_tracked) = ssh_scan;
-                            let now = std::time::Instant::now();
-                            let rescan_running =
-                                tako_control::agents::should_rescan_running_children(
-                                    &running_prev,
-                                    &running_targets,
-                                    sleep_guard_active,
+                                let (running_targets, running_prev) = running_children_scan;
+                                let (ssh_targets, ssh_prev, ssh_tracked) = ssh_scan;
+                                let now = std::time::Instant::now();
+                                let rescan_running =
+                                    tako_control::agents::should_rescan_running_children(
+                                        &running_prev,
+                                        &running_targets,
+                                        sleep_guard_active,
+                                        now,
+                                    );
+                                // #976: ssh 検知も同じ判断で間引く。両方が要るときは
+                                // **1 個の ProcessSnapshot を共有**するので、子プロセスの
+                                // 起動回数は増えない（#772 / #779 の枠組みをそのまま使う）
+                                let rescan_ssh = tako_control::ssh_detect::should_rescan(
+                                    &ssh_prev,
+                                    &ssh_targets,
+                                    ssh_tracked,
                                     now,
                                 );
-                            // #976: ssh 検知も同じ判断で間引く。両方が要るときは
-                            // **1 個の ProcessSnapshot を共有**するので、子プロセスの
-                            // 起動回数は増えない（#772 / #779 の枠組みをそのまま使う）
-                            let rescan_ssh = tako_control::ssh_detect::should_rescan(
-                                &ssh_prev,
-                                &ssh_targets,
-                                ssh_tracked,
-                                now,
-                            );
-                            let snapshot =
-                                if (rescan_running && !running_targets.is_empty()) || rescan_ssh {
+                                // #985 も同じ 1 枚のスナップショットに相乗りする
+                                let want_codex = codex_limits_scan.is_some();
+                                let snapshot = if (rescan_running && !running_targets.is_empty())
+                                    || rescan_ssh
+                                    || want_codex
+                                {
                                     Some(tako_control::agents::ProcessSnapshot::capture())
                                 } else {
                                     None
                                 };
-                            let ssh_state = tako_control::ssh_detect::scan(
-                                &ssh_prev,
-                                ssh_targets,
-                                snapshot.as_ref().filter(|_| rescan_ssh),
-                                now,
-                            );
-                            let running_state = if rescan_running {
-                                tako_control::agents::scan_running_children(
-                                    running_targets,
-                                    sleep_guard_active,
+                                let codex_limits = match (&codex_limits_scan, snapshot.as_ref()) {
+                                    (Some(targets), Some(snap)) => {
+                                        Some(limit_autoresume::scan_codex_limits(targets, snap))
+                                    }
+                                    _ => None,
+                                };
+                                let ssh_state = tako_control::ssh_detect::scan(
+                                    &ssh_prev,
+                                    ssh_targets,
+                                    snapshot.as_ref().filter(|_| rescan_ssh),
                                     now,
-                                    snapshot.as_ref(),
+                                );
+                                let running_state = if rescan_running {
+                                    tako_control::agents::scan_running_children(
+                                        running_targets,
+                                        sleep_guard_active,
+                                        now,
+                                        snapshot.as_ref(),
+                                    )
+                                } else {
+                                    let mut state = running_prev;
+                                    state.sleep_guard_active = sleep_guard_active;
+                                    state
+                                };
+                                let stale_outcome = stale_binary_scan.map(|(targets, prev)| {
+                                    tako_control::stale_binary::poll_with_snapshot(
+                                        targets,
+                                        &prev,
+                                        snapshot.as_ref(),
+                                    )
+                                });
+                                (
+                                    settings,
+                                    running_state,
+                                    stale_outcome,
+                                    ssh_state,
+                                    codex_limits,
                                 )
-                            } else {
-                                let mut state = running_prev;
-                                state.sleep_guard_active = sleep_guard_active;
-                                state
-                            };
-                            let stale_outcome = stale_binary_scan.map(|(targets, prev)| {
-                                tako_control::stale_binary::poll_with_snapshot(
-                                    targets,
-                                    &prev,
-                                    snapshot.as_ref(),
-                                )
-                            });
-                            (settings, running_state, stale_outcome, ssh_state)
-                        })
-                        .await;
+                            })
+                            .await;
                     let ok = this.update(cx, |app: &mut TakoApp, cx| {
+                        // #985: 反映はメモリ操作だけ
+                        if let Some(limits) = codex_limits {
+                            app.codex_limits = limits;
+                            app.codex_limits_scan.mark(std::time::Instant::now());
+                        }
                         let busy_sessions = running_children_scan.busy_sessions.clone();
                         app.running_children_scan = running_children_scan;
                         app.apply_sleep_guard(&settings, busy_sessions);
@@ -11431,6 +11473,48 @@ impl TakoApp {
 
     /// kill 確認のインラインブロック（FR-2.16.7）。メッセージ行（折り返し）+ ボタン行の
     /// 全ペインから Claude / Codex TUI のメトリクス（ctx%/usage）を収集・更新する（#357 拡張）
+    /// codex のレート制限を読む対象（#985）。**in-memory の走査だけ**で、
+    /// 永続バックエンドを持つペインを列挙する（codex かどうかの判定は background 側の
+    /// `ProcessSnapshot` が行う。ここで判定しようとすると UI スレッドで ps を起こす）
+    fn collect_codex_limits_targets(&self) -> Vec<(PaneId, String)> {
+        use tako_control::host::TmuxHost;
+        self.workspace
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.tree().panes())
+            .map(|p| p.id())
+            .filter_map(|id| TmuxHost::backend_session(self, id).map(|b| (id, b)))
+            .collect()
+    }
+
+    /// 構造化ソースから codex のメトリクスを組む（#985）。
+    ///
+    /// **画面スクレイピング（#357）は codex 0.150.1 では成立しない**（実測: TUI の
+    /// フッターはモデル名と cwd だけで、5h / 週の数値は `/status` のモーダルの中にしか
+    /// 出ない）。rollout の `rate_limits` は同じ数値をイベントとして持っているので、
+    /// **プランや TUI の書式に依存せず**取れる
+    fn codex_metrics_from_limits(&self) -> Option<AgentMetrics> {
+        use tako_core::MetricsSource;
+        // フォーカスペインを優先（複数の codex ペインがあるときの選び方を
+        // 画面由来の集約（`refresh_agent_metrics`）とそろえる）
+        let focused = self.workspace.active_tab().tree().focused();
+        let rl = self.codex_limits.get(&focused).or_else(|| {
+            self.workspace
+                .tabs()
+                .iter()
+                .flat_map(|tab| tab.tree().panes())
+                .find_map(|p| self.codex_limits.get(&p.id()))
+        })?;
+        Some(AgentMetrics {
+            // 5h 枠 / 週枠は codex の primary / secondary と 1:1（実測: window_minutes
+            // 300 / 10080）。UI は claude と共通のメーター構造を使う
+            limit_5h: rl.primary.map(|w| w.used_percent),
+            limit_week: rl.secondary.map(|w| w.used_percent),
+            source: MetricsSource::Codex,
+            ..AgentMetrics::default()
+        })
+    }
+
     fn refresh_agent_metrics(&mut self) {
         use tako_core::MetricsSource;
         let mut best_claude: Option<AgentMetrics> = None;
@@ -11473,7 +11557,13 @@ impl TakoApp {
             }
         }
         self.agent_metrics = best_claude.unwrap_or_default();
-        self.codex_metrics = best_codex.unwrap_or_default();
+        // #985: 構造化ソース（rollout の rate_limits）があればそちらが正。
+        // 画面由来（#357 のスクレイピング）は codex の TUI が数値を出していた版への
+        // 後方互換として残す
+        self.codex_metrics = self
+            .codex_metrics_from_limits()
+            .or(best_codex)
+            .unwrap_or_default();
         // usage トークン推移の履歴（#217 スパークライン。取れたときだけ・変化時だけ積む）
         if let Some(tok) = self
             .agent_metrics
@@ -50780,6 +50870,61 @@ mod self_test {
                     "111: 実画面のダイアログから「待つ」選択肢をラベルで選ぶ (#813)",
                 );
 
+                // --- 正例 ③ codex の日付つき上限画面（#985） ---
+                // codex 0.150.1 は日をまたぐと `Try again at Aug 28th, 2026 4:24 AM.` と
+                // 出す（バイナリ内の書式文字列 `" Try again at "` + `", %Y %-I:%M %p"`）。
+                // #985 前はここが読めず reset_at=None → 900 秒の猶予で**上限が解ける
+                // ずっと前に**撃ち始め、3 回で諦めていた（= 朝まで止まったまま）
+                let codex_body = format!(
+                    "{filler813}You have hit your usage limit. Upgrade to Pro or\n\
+                     try again at Aug 28th, 2026 4:24 AM.\n"
+                );
+                let Some(codex_pane) = make_fixture_pane(cx, &codex_body).await else {
+                    fail("#985: codex 型ペインの作成")
+                };
+                if !wait_screen(cx, codex_pane, "try again at").await {
+                    fail("#985: codex fixture が画面に出ない");
+                }
+                settle813(cx, codex_pane).await;
+                let _ = set_enabled(cx, codex_pane, true);
+                let (_, kind_codex, _) = drive(cx, codex_pane);
+                let reset_codex = window
+                    .update(cx, |app, _, _| {
+                        app.limit_resume.get(&codex_pane).and_then(|t| t.reset_at)
+                    })
+                    .ok()
+                    .flatten();
+                println!(
+                    "TAKO_SELF_TEST_985_CODEX: kind={kind_codex:?} reset_at={reset_codex:?} \
+                     state=({})",
+                    state813(cx, codex_pane),
+                );
+                check(
+                    kind_codex.as_deref() == Some("idle"),
+                    "111: codex の上限画面を idle 型として検知する (#985)",
+                );
+                check(
+                    reset_codex.is_some(),
+                    "111: codex の日付つき `try again at` から解除時刻を解決する (#985)",
+                );
+                // 解除前は撃たない（不明に落ちていると 900 秒の猶予で撃ってしまう）
+                let (sent_early, _, _) = drive(cx, codex_pane);
+                check(
+                    sent_early.is_empty(),
+                    "111: 解除時刻より前は継続ナッジを送らない (#985)",
+                );
+                // 解除後は撃つ（= 自動復帰が実際に発火する）
+                backdate(cx, codex_pane);
+                let (sent_codex, _, attempts_codex) = drive(cx, codex_pane);
+                println!(
+                    "TAKO_SELF_TEST_985_CODEX_RESUME: sent={} attempts={attempts_codex}",
+                    sent_codex.len()
+                );
+                check(
+                    sent_codex.len() == 1 && attempts_codex == 1,
+                    "111: 解除後に codex ペインの作業が再開される (#985)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -50872,14 +51017,66 @@ mod self_test {
                     .flatten();
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
-                    // 有効にしたのは idle / dialog / permission / api の 4 ペインだけ。
-                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
-                    persisted == Some((4, 4)),
+                    // 有効にしたのは idle / dialog / codex / permission / api の 5 ペインだけ
+                    // （codex は #985 で追加）。OFF のペインはフィールドごと出ない
+                    // （旧 tako でも読める JSON を保つ）
+                    persisted == Some((5, 5)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 
+                // --- #985: 構造化ソースがステータスバーの表示まで届く ---
+                // #357 の画面スクレイピングは codex 0.150.1 では成立しない（実測: TUI の
+                // フッターに `primary NN%` が無く、数値は `/status` のモーダルの中）。
+                // rollout の `rate_limits` が実データの出どころになったので、
+                // **そこからメーターの値まで通っている**ことをここで見る
+                let metrics985 = window
+                    .update(cx, |app, _, _| {
+                        app.codex_limits.insert(
+                            codex_pane,
+                            tako_control::codex_session::RateLimits {
+                                primary: Some(tako_control::codex_session::RateWindow {
+                                    used_percent: 10,
+                                    window_minutes: 300,
+                                    resets_at: Some(1_787_840_583),
+                                }),
+                                secondary: Some(tako_control::codex_session::RateWindow {
+                                    used_percent: 2,
+                                    window_minutes: 10_080,
+                                    resets_at: Some(1_788_427_383),
+                                }),
+                                plan_type: Some("plus".to_string()),
+                                reached: None,
+                            },
+                        );
+                        app.refresh_agent_metrics();
+                        (
+                            app.codex_metrics.limit_5h,
+                            app.codex_metrics.limit_week,
+                            app.codex_metrics.source,
+                            app.agent_metrics.limit_5h,
+                        )
+                    })
+                    .unwrap_or((None, None, tako_core::MetricsSource::Unknown, None));
+                println!(
+                    "TAKO_SELF_TEST_985_METRICS: 5h={:?} week={:?} source={:?} claude_5h={:?}",
+                    metrics985.0, metrics985.1, metrics985.2, metrics985.3
+                );
+                check(
+                    metrics985.0 == Some(10)
+                        && metrics985.1 == Some(2)
+                        && metrics985.2 == tako_core::MetricsSource::Codex,
+                    "111: codex の構造化レート制限がステータスバーの値になる (#985)",
+                );
+                // claude 側のメーターは別のペイン由来で埋まりうる（それが正しい）。
+                // 見たいのは「codex の値が claude 側へ流れ込まないこと」
+                check(
+                    metrics985.3 != Some(10),
+                    "111: codex の値を claude 側のメーターへ混ぜない (#985)",
+                );
+                let _ = window.update(cx, |app, _, _| app.codex_limits.clear());
+
                 // 後始末: 検証用ペインを閉じる
-                for p in [idle_pane, dialog_pane, perm_pane, api_pane] {
+                for p in [idle_pane, dialog_pane, codex_pane, perm_pane, api_pane] {
                     let _ = window.update(cx, |app, _, cx| {
                         app.remove_pane(p, cx);
                     });

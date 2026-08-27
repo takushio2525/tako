@@ -80,6 +80,121 @@ pub struct TurnState {
     pub ctx_percent: Option<u32>,
     /// 観測できたイベント数（0 なら「まだ 1 ターンも走っていない」= 起動直後）
     pub events: usize,
+    /// 直近の `token_count` に載っていたレート制限（#985）。
+    /// **画面スクレイピングではなく構造化データ**なので、プランによる表示揺れが無い
+    pub rate_limits: Option<RateLimits>,
+}
+
+/// レート制限の 1 枠（codex の `rate_limits.primary` / `.secondary`）。
+///
+/// **実採取（2026-08-27 / codex-cli 0.150.1 / plan_type = plus）**:
+/// `primary` = `window_minutes: 300`（5 時間枠）、`secondary` = `10080`（週枠）。
+/// tako のステータスバーが持つ 5h / 7d の 2 枠とそのまま対応する
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RateWindow {
+    /// 使用率（0–100 に丸めた整数。元は小数）
+    pub used_percent: u32,
+    /// 枠の長さ（分）。300 = 5 時間 / 10080 = 週
+    pub window_minutes: u64,
+    /// 枠が空くまでの時刻（**unix 秒**）。文言パースと違い日付ごと確定している
+    pub resets_at: Option<i64>,
+}
+
+impl RateWindow {
+    /// この枠を使い切っているか。**閾値は 100 ちょうど**（99% は「まだ動ける」）
+    pub fn exhausted(&self) -> bool {
+        self.used_percent >= 100
+    }
+}
+
+/// codex の `token_count` イベントに載るレート制限のスナップショット。
+///
+/// フィールド名は codex 0.150.1 の `RateLimitSnapshot`（バイナリ内の構造体名から確認）に
+/// そろえてある。**知らないフィールドは読まない**ので、上流が足しても壊れない
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RateLimits {
+    pub primary: Option<RateWindow>,
+    pub secondary: Option<RateWindow>,
+    /// プラン種別（実採取: `"plus"`）。無料プランでも構造は同じ
+    pub plan_type: Option<String>,
+    /// **どの枠で上限に当たったか**（`rate_limit_reached_type`。上限前は null）。
+    /// 値は HTTP ヘッダ `x-codex-rate-limit-reached-type` 由来
+    pub reached: Option<String>,
+}
+
+impl RateLimits {
+    /// 上限に当たっているか。上流の申告（`reached`）を優先し、無ければ使用率で見る
+    pub fn limited(&self) -> bool {
+        self.reached.is_some()
+            || self.primary.is_some_and(|w| w.exhausted())
+            || self.secondary.is_some_and(|w| w.exhausted())
+    }
+
+    /// **止まっている枠が空く時刻**（unix 秒）。
+    ///
+    /// 上流が `reached` でどの枠かを言っていればその枠、言っていなければ
+    /// 「使い切っている枠のうち最も早く空くもの」。どちらも決まらなければ `None`
+    /// （= まだ上限ではない。ここで primary を返すと「上限でもないのに待つ」になる）
+    pub fn reset_at(&self) -> Option<i64> {
+        if let Some(w) = self.reached_window() {
+            return w.resets_at;
+        }
+        [self.primary, self.secondary]
+            .into_iter()
+            .flatten()
+            .filter(|w| w.exhausted())
+            .filter_map(|w| w.resets_at)
+            .min()
+    }
+
+    /// `reached` が名指ししている枠（`"primary"` / `"secondary"` の前方一致で見る）
+    fn reached_window(&self) -> Option<RateWindow> {
+        let kind = self.reached.as_deref()?.to_ascii_lowercase();
+        if kind.contains("secondary") {
+            self.secondary
+        } else if kind.contains("primary") {
+            self.primary
+        } else {
+            None
+        }
+    }
+}
+
+/// `rate_limits` オブジェクトを型へ落とす（**純粋関数**）。
+/// 枠が 1 つも読めなければ `None`（= レート制限の情報が無い、と扱う）
+fn parse_rate_limits(v: &Value) -> Option<RateLimits> {
+    let window = |key: &str| -> Option<RateWindow> {
+        let w = v.get(key)?;
+        // `used_percent` は小数（実採取: 4.0）。**四捨五入せず切り捨てる**のは
+        // 99.7% を 100（= 使い切り）と言わないため
+        let used = w.get("used_percent")?.as_f64()?;
+        Some(RateWindow {
+            used_percent: used.clamp(0.0, 100.0) as u32,
+            window_minutes: w.get("window_minutes").and_then(Value::as_u64).unwrap_or(0),
+            resets_at: w
+                .get("resets_at")
+                .and_then(Value::as_i64)
+                .filter(|t| *t > 0),
+        })
+    };
+    let primary = window("primary");
+    let secondary = window("secondary");
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+    Some(RateLimits {
+        primary,
+        secondary,
+        plan_type: v
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reached: v
+            .get("rate_limit_reached_type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 impl TurnState {
@@ -139,6 +254,10 @@ pub fn parse_turn_state(lines: &[&str]) -> TurnState {
                 }
             }
             Some("token_count") => {
+                // #985: 同じイベントにレート制限が載っている。**最後の 1 件が最新**
+                if let Some(rl) = parse_rate_limits(&v["payload"]["rate_limits"]) {
+                    st.rate_limits = Some(rl);
+                }
                 let info = &v["payload"]["info"];
                 let used = info["last_token_usage"]["total_tokens"]
                     .as_u64()
@@ -303,6 +422,54 @@ pub fn read_turn_state(thread_id: &str) -> Option<TurnState> {
     Some(parse_turn_state(&lines))
 }
 
+/// 複数ペインぶんの thread_id を **1 個の `ProcessSnapshot` から**まとめて解決する（#985）。
+///
+/// 単発の [`resolve_thread_id_for_backend`] は 1 回ごとに tmux と ps を起こすので、
+/// ステータスバーのような**定期処理からペイン数ぶん呼ぶと #772 / #779 で削った
+/// subprocess が戻る**。ここは呼び出し側が既に採った 1 枚のスナップショットを使うので、
+/// 対象が何ペインでもプロセス起動は増えない（`lsof` だけは codex を見つけたペインに
+/// 1 回ずつ要るが、結果は sticky なので次回以降は 0 回）。
+///
+/// **background executor 専用**（`lsof` を起こしうる）
+pub fn resolve_thread_ids_with(
+    backends: &[String],
+    snap: &crate::agents::ProcessSnapshot,
+) -> HashMap<String, String> {
+    if legacy_screen_only() {
+        return HashMap::new();
+    }
+    let mut out = HashMap::new();
+    for backend in backends {
+        if let Some(id) = sticky_lookup(backend) {
+            out.insert(backend.clone(), id);
+            continue;
+        }
+        // ペイン配下でいちばん新しい codex プロセスを snapshot から拾う
+        let mut hits: Vec<u32> = snap
+            .descendant_pids(backend)
+            .into_iter()
+            .filter(|pid| snap.argv(*pid).is_some_and(is_codex_command))
+            .collect();
+        hits.sort_unstable();
+        let Some(pid) = hits.pop() else { continue };
+        if let Some(id) = thread_id_for_pid(pid) {
+            sticky_insert(backend, &id);
+            out.insert(backend.clone(), id);
+        }
+    }
+    out
+}
+
+/// ペイン（backend セッション）の codex のレート制限を読む（#985）。
+///
+/// **呼び出し側の責務**: これは `lsof`（sticky なので初回だけ）+ rollout 末尾の読み取りを
+/// 伴う I/O なので、**2 秒 tick の UI スレッドから直接呼ばない**
+/// （#772 / #779 / #816 で削った subprocess を復活させない）。tako-app は background で呼ぶ
+pub fn rate_limits_for_backend(backend_session: &str) -> Option<RateLimits> {
+    let tid = resolve_thread_id_for_backend(backend_session)?;
+    read_turn_state(&tid)?.rate_limits
+}
+
 /// thread_id の直近 N 件の assistant 発話（transcript アダプタの入口）
 pub fn last_assistant_texts(thread_id: &str, limit: usize) -> Result<Vec<String>, String> {
     let path = find_rollout(thread_id)
@@ -366,18 +533,11 @@ pub fn resolve_thread_id_for_backend(backend_session: &str) -> Option<String> {
     if legacy_screen_only() {
         return None;
     }
-    use std::sync::Mutex;
-    static STICKY: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
     let panes = crate::agents::backend_pane_pids();
-    let mut sticky = STICKY.lock().unwrap_or_else(|e| e.into_inner());
-    let mut map = sticky.take().unwrap_or_default();
     // 消えたペインの記憶は捨てる（pane ID 再利用で別 worker の会話を返さない）。
     // **ID は `session:window.pane` 形式**なので接頭辞で見る（下の探索と同じ規則）
-    map.retain(|b, _| session_has_pane(&panes, b));
-    if let Some(id) = map.get(backend_session) {
-        let id = id.clone();
-        *sticky = Some(map);
+    sticky_forget_gone(&panes);
+    if let Some(id) = sticky_lookup(backend_session) {
         return Some(id);
     }
     // **器のペイン ID は `session:window.pane`**（`agents::tmux_pane_pids` の -F 書式）。
@@ -416,9 +576,8 @@ pub fn resolve_thread_id_for_backend(backend_session: &str) -> Option<String> {
         id
     });
     if let Some(ref id) = resolved {
-        map.insert(backend_session.to_string(), id.clone());
+        sticky_insert(backend_session, id);
     }
-    *sticky = Some(map);
     resolved
 }
 
@@ -438,6 +597,30 @@ pub fn session_has_pane(panes: &[(String, u32)], backend_session: &str) -> bool 
 }
 
 /// 構造化ソースを使わず画面推定だけに戻す逃げ道（#984 の A/B）
+/// 解決済み backend → thread_id の記憶（sticky）。
+/// `resolve_thread_id_for_backend`（単発）と `resolve_thread_ids_with`（一括）が共有する
+fn sticky() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static STICKY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    STICKY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn sticky_lookup(backend_session: &str) -> Option<String> {
+    let map = sticky().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(backend_session).cloned()
+}
+
+fn sticky_insert(backend_session: &str, thread_id: &str) {
+    let mut map = sticky().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(backend_session.to_string(), thread_id.to_string());
+}
+
+/// 消えたペインの記憶を捨てる
+fn sticky_forget_gone(panes: &[(String, u32)]) {
+    let mut map = sticky().lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|b, _| session_has_pane(panes, b));
+}
+
 pub fn legacy_screen_only() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_984_LEGACY").is_some())
@@ -445,6 +628,105 @@ pub fn legacy_screen_only() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    // --- #985: レート制限（実採取。2026-08-27 / codex-cli 0.150.1 / plan_type = plus） ---
+
+    /// **実採取の 1 行をそのまま**（本文は含まないので個人情報なし。#927）。
+    /// この行は `token_count` イベントで、ctx% の材料と **同じイベントに**
+    /// `rate_limits` が載っていることを示す
+    const REAL_TOKEN_COUNT: &str = r#"{"timestamp": "2026-08-27T09:57:16.392Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 158324}, "last_token_usage": {"total_tokens": 32564}, "model_context_window": 258400}, "rate_limits": {"limit_id": "codex", "limit_name": null, "primary": {"used_percent": 4.0, "window_minutes": 300, "resets_at": 1787840583}, "secondary": {"used_percent": 1.0, "window_minutes": 10080, "resets_at": 1788427383}, "credits": {"has_credits": false, "unlimited": false, "balance": "0"}, "individual_limit": null, "plan_type": "plus", "rate_limit_reached_type": null}}}"#;
+
+    /// 5 時間枠を使い切った形。`rate_limit_reached_type` は HTTP ヘッダ
+    /// `x-codex-rate-limit-reached-type`（バイナリ内文字列で確認）由来なので
+    /// **上流が「どの枠か」を名指しする**。実採取の枠組みに使い切りの値を入れた合成
+    const REACHED_PRIMARY: &str = r#"{"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"total_tokens": 10}, "model_context_window": 100}, "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 100.0, "window_minutes": 300, "resets_at": 1787840583}, "secondary": {"used_percent": 62.0, "window_minutes": 10080, "resets_at": 1788427383}, "plan_type": "plus", "rate_limit_reached_type": "primary"}}}"#;
+
+    #[test]
+    fn issue985_実採取のtoken_countからレート制限を取り出す() {
+        let st = parse_turn_state(&[REAL_TOKEN_COUNT]);
+        let rl = st.rate_limits.expect("rate_limits が読める");
+        let p = rl.primary.expect("primary");
+        let s = rl.secondary.expect("secondary");
+        assert_eq!(p.used_percent, 4, "used_percent は小数 4.0 → 4");
+        assert_eq!(p.window_minutes, 300, "primary = 5 時間枠");
+        assert_eq!(p.resets_at, Some(1_787_840_583), "epoch 秒がそのまま取れる");
+        assert_eq!(s.used_percent, 1);
+        assert_eq!(s.window_minutes, 10_080, "secondary = 週枠");
+        assert_eq!(
+            rl.plan_type.as_deref(),
+            Some("plus"),
+            "有料プランの実データ"
+        );
+        assert_eq!(rl.reached, None, "上限前は null");
+        // ctx% は従来どおり同じイベントから取れる（#984 の回帰）
+        assert_eq!(st.ctx_percent, Some(12));
+    }
+
+    #[test]
+    fn issue985_上限前はリセット待ちの時刻を出さない() {
+        let rl = parse_turn_state(&[REAL_TOKEN_COUNT])
+            .rate_limits
+            .expect("読める");
+        assert!(!rl.limited(), "4% / 1% は上限ではない");
+        assert_eq!(
+            rl.reset_at(),
+            None,
+            "上限でないのに primary の resets_at を返すと「上限でもないのに待つ」になる"
+        );
+    }
+
+    #[test]
+    fn issue985_使い切った枠の解除時刻を名指しで返す() {
+        let rl = parse_turn_state(&[REACHED_PRIMARY])
+            .rate_limits
+            .expect("読める");
+        assert!(rl.limited());
+        assert_eq!(
+            rl.reset_at(),
+            Some(1_787_840_583),
+            "reached=primary なので **週枠ではなく** 5 時間枠の解除時刻"
+        );
+    }
+
+    #[test]
+    fn issue985_reachedが無くても使い切った枠から解除時刻を選ぶ() {
+        // 上流が種別を返さない版・プランでも、使用率だけで決められる
+        let src = REACHED_PRIMARY.replace(r#", "rate_limit_reached_type": "primary""#, "");
+        let rl = parse_turn_state(&[&src]).rate_limits.expect("読める");
+        assert!(rl.limited(), "100% は使い切り");
+        assert_eq!(rl.reset_at(), Some(1_787_840_583));
+        // 両方使い切っていれば「先に空くほう」
+        let both = src.replace(r#""used_percent": 62.0"#, r#""used_percent": 100.0"#);
+        let rl = parse_turn_state(&[&both]).rate_limits.expect("読める");
+        assert_eq!(rl.reset_at(), Some(1_787_840_583), "早く空くほう = primary");
+    }
+
+    #[test]
+    fn issue985_レート制限が無い版でも壊れない() {
+        // `rate_limits` を持たない rollout（旧版 / 別プラン）でも ctx% は従来どおり
+        let src = REAL_TOKEN_COUNT
+            .split(r#", "rate_limits""#)
+            .next()
+            .unwrap()
+            .to_string()
+            + "}}";
+        let st = parse_turn_state(&[&src]);
+        assert_eq!(st.rate_limits, None, "無いものを捏造しない");
+        assert_eq!(st.ctx_percent, Some(12), "#984 の経路は無傷");
+    }
+
+    #[test]
+    fn issue985_使用率は切り捨てで99を100と言わない() {
+        let src = REACHED_PRIMARY.replace(r#""used_percent": 100.0"#, r#""used_percent": 99.7"#);
+        let rl = parse_turn_state(&[&src]).rate_limits.expect("読める");
+        let p = rl.primary.expect("primary");
+        assert_eq!(
+            p.used_percent, 99,
+            "四捨五入すると 100 = 使い切りと誤認する"
+        );
+        assert!(!p.exhausted());
+    }
+
     use super::*;
 
     /// 実採取した rollout の形（codex-cli 0.150.1・2026-08-27）。
