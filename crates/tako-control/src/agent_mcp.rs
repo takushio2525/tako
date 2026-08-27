@@ -318,7 +318,7 @@ pub fn upsert_env_vars_toml(text: &str, server: &str, vars: &[&str]) -> Option<S
     let mut inserted = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        if is_table_header(trimmed) {
             // 別のセクションへ移る = 対象セクションは終わり
             in_section = trimmed == header;
             out.push(line.to_string());
@@ -337,11 +337,27 @@ pub fn upsert_env_vars_toml(text: &str, server: &str, vars: &[&str]) -> Option<S
     if !inserted {
         return None;
     }
-    let mut joined = out.join("\n");
+    // CRLF のファイルを LF へ書き換えない（全行が差分になるのを避ける）
+    let sep = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut joined = out.join(sep);
     if text.ends_with('\n') {
-        joined.push('\n');
+        joined.push_str(sep);
     }
     Some(joined)
+}
+
+/// TOML のテーブル見出し行か（純粋関数）。
+///
+/// **複数行配列の途中の行を見出しと誤認しない**のが要点: `matrix = [` の続きに
+/// `[1, 2]` のような行が来ることがあり、素朴に `[`〜`]` で判定するとセクションの
+/// 境界を取り違える（対象セクションの既存 `env_vars` を消し損ねて重複キーになり、
+/// codex が設定を読めなくなる）。見出しにカンマは現れない
+fn is_table_header(trimmed: &str) -> bool {
+    let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let inner = inner.trim_start_matches('[').trim_end_matches(']');
+    !inner.is_empty() && !inner.contains(',')
 }
 
 /// agy の `mcp_config.json` から tako の command を読む（純粋関数）。
@@ -807,6 +823,39 @@ mod tests {
         assert!(out.contains("env_vars = [\"NEW\"]"), "{out}");
         assert!(!out.contains("OLD"), "{out}");
         assert_eq!(out.matches("env_vars").count(), 1);
+    }
+
+    #[test]
+    fn 複数行配列の途中の行を見出しと誤認しない() {
+        assert!(is_table_header("[mcp_servers.tako]"));
+        assert!(is_table_header("[features]"));
+        assert!(is_table_header("[[bin]]"));
+        // 配列の要素行（カンマを含む / 空）は見出しではない
+        assert!(!is_table_header("[1, 2]"));
+        assert!(!is_table_header("[]"));
+        assert!(!is_table_header("]"));
+        assert!(!is_table_header("command = \"/x\""));
+
+        // 実害の再現: 見出しを誤認するとセクション境界がずれて env_vars が 2 本残る
+        let text =
+            "[mcp_servers.tako]\nenv_vars = [\"OLD\"]\nmatrix = [\n  [1, 2]\n]\ncommand = \"/x\"\n";
+        let out = upsert_env_vars_toml(text, "tako", &["NEW"]).unwrap();
+        assert_eq!(out.matches("env_vars").count(), 1, "{out}");
+        assert!(out.contains("env_vars = [\"NEW\"]"), "{out}");
+        assert!(out.contains("[1, 2]"), "配列の中身は残す: {out}");
+    }
+
+    #[test]
+    fn crlfのファイルを行末ごと書き換えない() {
+        let text = "[mcp_servers.tako]\r\ncommand = \"/x\"\r\n";
+        let out = upsert_env_vars_toml(text, "tako", &["A"]).unwrap();
+        assert!(out.contains("\r\n"), "{out:?}");
+        assert!(!out.contains("\n\n"), "LF だけの行を混ぜない: {out:?}");
+        assert_eq!(out.matches('\r').count(), out.lines().count(), "{out:?}");
+        // LF のファイルは LF のまま
+        let lf = "[mcp_servers.tako]\ncommand = \"/x\"\n";
+        let out = upsert_env_vars_toml(lf, "tako", &["A"]).unwrap();
+        assert!(!out.contains('\r'), "{out:?}");
     }
 
     #[test]
