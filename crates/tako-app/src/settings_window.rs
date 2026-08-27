@@ -2397,6 +2397,8 @@ impl SettingsWindow {
                             Request::SetupMcp {
                                 scope: None,
                                 pane: None,
+                                // 対象は絞らない = claude + 導入済みの codex / agy（#979）
+                                agent: None,
                             },
                             txt::msg_mcp_registered().to_string(),
                             cx,

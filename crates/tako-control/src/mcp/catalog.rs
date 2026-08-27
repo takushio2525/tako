@@ -1271,11 +1271,17 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_setup_mcp",
-            "description": "Claude Code に tako MCP サーバーの接続設定を\
+            "description": "エージェント CLI に tako MCP サーバーの接続設定を\
                 自動追加する。初回セットアップ時に呼ぶ。既に設定済みなら何もしない。\
-                scope=global（既定）はユーザーグローバル（claude mcp add --scope user 相当）、\
-                scope=project は呼び出し元ペインの cwd の .mcp.json に書き込む。\
-                旧バージョンが ~/.claude/settings.json に書いた無効な設定は自動で掃除する。",
+                agent を省略すると claude + この環境に導入済みの codex / agy へまとめて\
+                登録する（未導入は理由つきで skip）。agent を明示したときだけ、\
+                その CLI が未導入・非対応スコープなら分類済みエラーで止まる。\
+                書き込み先は claude = ~/.claude.json、codex = codex mcp add\
+                （~/.codex/config.toml）、agy = agy mcp add（~/.gemini/config/mcp_config.json）。\
+                scope=global（既定）はユーザーグローバル、scope=project は\
+                呼び出し元ペインの cwd の .mcp.json に書き込む（claude のみ対応）。\
+                旧バージョンが ~/.claude/settings.json に書いた無効な設定は自動で掃除する。\
+                応答の agents 配列が各エージェントの結果（skipped / error_kind つき）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1283,6 +1289,11 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": ["global", "project"],
                         "description": "設定の書き込み先スコープ（省略時は global = ユーザーグローバル）",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "agy"],
+                        "description": "登録対象のエージェント（省略時は claude + 導入済みの codex / agy すべて）",
                     },
                     "pane": pane_schema("対象ペイン ID（scope=project 時の cwd 解決に使う。省略時は呼び出し元）"),
                 },

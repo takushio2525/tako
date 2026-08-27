@@ -176,12 +176,27 @@ tako setup --reset
 
 ### tako setup-mcp
 
-Claude Code の設定ファイル（`~/.claude/settings.json`）に tako の MCP サーバーを登録します。対話なしで登録だけしたいときに使います。
+エージェント CLI に tako の MCP サーバーを登録します。対話なしで登録だけしたいときに使います。
 
 ```bash
-tako setup-mcp             # ユーザー全体に登録（既定）
-tako setup-mcp --project   # 現在のディレクトリだけに登録
+tako setup-mcp                   # claude + 導入済みの codex / agy へまとめて登録（既定）
+tako setup-mcp --agent codex     # codex だけに登録
+tako setup-mcp --project         # 現在のディレクトリだけに登録（claude のみ）
 ```
+
+引数なしのときは **claude と、この環境に導入済みの codex / agy** をまとめて対象にします。未導入の CLI は理由つきで skip するだけでエラーになりません。`--agent` で明示指定したときだけ、その CLI が未導入なら分類済みエラー（理由 + 次の一手）で止まります。
+
+| エージェント | 書き込み先 | 手段 |
+|---|---|---|
+| claude | `~/.claude.json`（`--project` 時は `<cwd>/.mcp.json`） | `claude mcp add`（無ければ JSON を直接マージ） |
+| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` |
+| agy | `~/.gemini/config/mcp_config.json` の `mcpServers.tako` | `agy mcp add` |
+
+codex / agy は各 CLI の `mcp add` に書き込みを任せています。自分で TOML / JSON を書くと CLI 側の正規化と二重にずれるため、利用者が手で `codex mcp add` を打ったのと同じ結果になる経路へ寄せてあります。何度実行しても設定は同じ内容に収束します（`--project` は codex / agy が対応していないので、明示指定すると理由を出して止まります）。
+
+:::note[codex / agy では呼び出し元ペインの自動特定が効きません]
+tako の MCP ツールでペインを省略したときの「呼び出し元ペイン」は環境変数（`TAKO_PANE_ID`）で決まります。codex は MCP 子プロセスへ渡す環境変数を許可リストで絞り、agy は静的な指定しか持たないため、この 2 つでは省略時の既定ペインが解決されません。`tako mcp serve` は接続情報が無ければ稼働中の tako を自力で見つけるので**ツール呼び出し自体は通ります**。`pane` を明示すればすべての操作ができます。
+:::
 
 ### tako update
 

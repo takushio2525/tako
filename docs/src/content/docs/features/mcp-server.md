@@ -15,7 +15,17 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 2. 各ペインのシェルに環境変数（`TAKO_PANE_ID`、`TAKO_MCP_URL` 等）を注入
 3. AI エージェントは環境変数から MCP サーバーを自動発見し、ツールとして利用
 
-初回に `tako setup`（または `tako setup-mcp`）で stdio ブリッジを登録すれば、以降はどのプロジェクトでも設定不要です。
+初回に `tako setup`（または `tako setup-mcp`）で stdio ブリッジを登録すれば、以降はどのプロジェクトでも設定不要です。登録先は **claude / codex / agy の 3 系統**で、導入済みの CLI すべてに一度でまとめて入ります。
+
+## 対応エージェントと登録先
+
+| エージェント | 書き込み先 | 手段 | 呼び出し元ペインの自動特定 |
+|---|---|---|---|
+| claude | `~/.claude.json` / `<cwd>/.mcp.json` | `claude mcp add` | ○（環境変数を継承する） |
+| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` | ×（許可リスト外の環境変数を渡さない） |
+| agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | ×（静的な指定のみ） |
+
+codex / agy でペインの自動特定が効かないのは、両 CLI が MCP 子プロセスへ per-pane の環境変数（`TAKO_PANE_ID` 等）を素通しできないためです。`tako mcp serve` は接続情報が無ければ稼働中の tako を自力で見つけるので**ツール呼び出しそのものは通り**、`pane` を明示すればすべての操作ができます。
 
 ## 128 個の MCP ツール
 

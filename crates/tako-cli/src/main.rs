@@ -2605,9 +2605,12 @@ struct SetupMcpArgs {
     /// ユーザーグローバルに書き込む（既定）
     #[arg(long, conflicts_with = "project")]
     global: bool,
-    /// カレントディレクトリの .mcp.json に書き込む
+    /// カレントディレクトリの .mcp.json に書き込む（claude のみ）
     #[arg(long)]
     project: bool,
+    /// 登録対象のエージェント（省略時は claude + 導入済みの codex / agy すべて）
+    #[arg(long, value_parser = ["claude", "codex", "agy"])]
+    agent: Option<String>,
 }
 
 #[derive(Args)]
@@ -3149,35 +3152,55 @@ fn mcp_serve() -> Result<(), String> {
 
 /// MCP セットアップ（アプリ未起動でも動作）。settings.json に tako MCP 設定を追加する
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
-    let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let scope = if args.project {
+    let (scope, scope_label) = if args.project {
         let cwd = std::env::current_dir()
             .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?;
-        tako_control::dispatch::McpScope::Project(cwd)
+        (tako_control::dispatch::McpScope::Project(cwd), "project")
     } else {
-        tako_control::dispatch::McpScope::User
+        (tako_control::dispatch::McpScope::User, "global")
     };
-    match tako_control::dispatch::setup_mcp(&tako_bin, &scope) {
-        Ok(result) => {
-            if result.repaired {
-                let old = result.old_command.as_deref().unwrap_or("(不明)");
-                eprintln!(
-                    "登録パスが消失していたため付け替えました: {}",
-                    result.target_path.display()
-                );
-                eprintln!("  旧: {old}");
-                eprintln!("  新: {tako_bin}");
-            } else if result.already_existed {
-                eprintln!("既に設定されています: {}", result.target_path.display());
-            } else {
-                eprintln!("設定を追加しました: {}", result.target_path.display());
-            }
-            if result.legacy_cleaned {
-                eprintln!("旧 ~/.claude/settings.json の無効な MCP 設定を除去しました");
-            }
-            Ok(())
+    // GUI が動いていなくても登録できる必要があるのでローカル処理（IPC を張らない）。
+    // 対象の選び方・分類済みエラーは dispatch 側の 1 実装（MCP / CLI で同一）
+    let resp = tako_control::dispatch::setup_mcp_agents(args.agent.as_deref(), &scope, scope_label)
+        .map_err(|e| e.to_string())?;
+    print_setup_mcp_report(&resp);
+    println!("{}", pretty_json(&resp));
+    Ok(())
+}
+
+/// `setup-mcp` の人間向けサマリを stderr へ出す（機械可読な JSON は stdout）
+fn print_setup_mcp_report(resp: &serde_json::Value) {
+    let Some(agents) = resp.get("agents").and_then(|a| a.as_array()) else {
+        return;
+    };
+    for entry in agents {
+        let name = entry.get("agent").and_then(|a| a.as_str()).unwrap_or("?");
+        if entry.get("skipped").and_then(|s| s.as_bool()) == Some(true) {
+            let msg = entry.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            eprintln!("  [skip] {name}: {msg}");
+            continue;
         }
-        Err(e) => Err(e.to_string()),
+        let target = entry
+            .get("target_path")
+            .and_then(|t| t.as_str())
+            .unwrap_or("(不明)");
+        if entry.get("repaired").and_then(|r| r.as_bool()) == Some(true) {
+            let old = entry
+                .get("old_command")
+                .and_then(|o| o.as_str())
+                .unwrap_or("(不明)");
+            let new = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            eprintln!("  [修復] {name}: 登録パスが消失していたため付け替えました（{target}）");
+            eprintln!("         旧: {old}");
+            eprintln!("         新: {new}");
+        } else if entry.get("configured").and_then(|c| c.as_bool()) == Some(true) {
+            eprintln!("  [設定] {name}: 追加しました（{target}）");
+        } else {
+            eprintln!("  [OK] {name}: 既に設定されています（{target}）");
+        }
+        if entry.get("legacy_cleaned").and_then(|l| l.as_bool()) == Some(true) {
+            eprintln!("         旧 ~/.claude/settings.json の無効な MCP 設定を除去しました");
+        }
     }
 }
 

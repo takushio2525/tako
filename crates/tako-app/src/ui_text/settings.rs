@@ -509,9 +509,10 @@ pub fn setup_mcp_header() -> &'static str {
 }
 
 pub fn desc_mcp() -> &'static str {
+    // #979: 対象は claude だけではない（導入済みの codex / agy へもまとめて登録する）
     tr!(
-        "Claude Code から tako を操作できるようにする",
-        "Let Claude Code drive tako"
+        "claude / codex / agy から tako を操作できるようにする",
+        "Let claude / codex / agy drive tako"
     )
 }
 

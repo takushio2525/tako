@@ -758,12 +758,14 @@ pub enum Request {
     BackgroundKill { pane: u64 },
     /// 環境の健全性診断。CLI の PATH / バージョン一致 / 外部ツールの有無等をチェックする
     CheckHealth,
-    /// Claude Code の settings.json に tako MCP サーバーの接続設定を追加する（FR-2.14）。
-    /// `scope` = "global"（`~/.claude/settings.json`、既定）/ "project"（ペインの cwd
-    /// 配下 `.claude/settings.json`）
+    /// エージェント CLI へ tako MCP サーバーの接続設定を追加する（FR-2.14 / #979）。
+    /// `scope` = "global"（既定）/ "project"（ペインの cwd 配下 `.mcp.json`。claude のみ）。
+    /// `agent` = "claude" / "codex" / "agy"。**省略時は導入済みの全エージェント**
+    /// （未導入は skip。明示指定した CLI が未導入のときだけ分類済みエラー）
     SetupMcp {
         scope: Option<String>,
         pane: Option<u64>,
+        agent: Option<String>,
     },
     /// 動画の再生/一時停止/ミュート/ループ（プレビューペインが Video モードの場合のみ有効）。
     /// `action` = "play" / "pause" / "toggle" / "mute" / "unmute" / "toggle_mute" /
