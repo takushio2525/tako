@@ -8,6 +8,18 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.0] - 2026-08-28
+
+Nightly minor release (automated). Changes since v0.7.10:
+夜間マイナーリリース（自動）。v0.7.10 以降の変更:
+
+- [機能追加] setup でエージェントごとのモデル一覧を実取得して選べるようにする (#1002) (#1014)
+- [改善] claude agents --json の起動コストを削る: 前段ガード + 鮮度の用途分離 (#1011) (#1018)
+- [ドキュメント] progress.md に #1006（SSH 接続の開き方 2 点）の記録を追記
+- [改善] SSH 接続の開き方 2 点: ペインメニューからの SSH 化 + 既定を現在タブの新ペインへ (#1006) (#1017)
+- [機能追加] 夜間リリースの次回バージョン予約: patch 固定をやめ minor / major を夜間発火に乗せる (#1005) (#1008)
+- [改善] codex の利用上限を構造化データで扱い自動復帰を成立させる / agy の可否を実測で確定 (#985) (#1003)
+
 ## [Unreleased]
 
 ### Changed / 変更

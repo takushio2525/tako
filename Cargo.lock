@@ -6744,7 +6744,7 @@ checksum = "8bdb6fa0dfa67b38c1e66b7041ba9dcf23b99d8121907cd31c807a332f7a0bbb"
 
 [[package]]
 name = "tako-app"
-version = "0.7.10"
+version = "0.8.0"
 dependencies = [
  "futures",
  "gpui",
@@ -6768,7 +6768,7 @@ dependencies = [
 
 [[package]]
 name = "tako-cli"
-version = "0.7.10"
+version = "0.8.0"
 dependencies = [
  "clap",
  "serde",
@@ -6781,7 +6781,7 @@ dependencies = [
 
 [[package]]
 name = "tako-control"
-version = "0.7.10"
+version = "0.8.0"
 dependencies = [
  "futures",
  "getrandom 0.3.4",
@@ -6803,7 +6803,7 @@ dependencies = [
 
 [[package]]
 name = "tako-core"
-version = "0.7.10"
+version = "0.8.0"
 dependencies = [
  "alacritty_terminal",
  "futures",
