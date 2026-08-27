@@ -4059,8 +4059,9 @@ fn dispatch_inner(
             focus,
             all,
             force,
+            enabled,
         } => dispatch_remote_folder(
-            host, origin, &action, ssh_host, path, tab, focus, all, force,
+            host, origin, &action, ssh_host, path, tab, focus, all, force, enabled,
         ),
 
         Request::RecentItems { action } => match action.as_str() {
@@ -5833,6 +5834,7 @@ fn dispatch_remote_folder(
     focus: Option<bool>,
     all: bool,
     force: bool,
+    enabled: Option<bool>,
 ) -> Result<Value, DispatchError> {
     use tako_core::remote_fs::{self, RemoteRef};
 
@@ -5891,16 +5893,9 @@ fn dispatch_remote_folder(
             // 開く前に「本当にディレクトリとして読めるか」を確かめる。
             // ここで弾くと、ツリーに開けないルートが並ぶのを防げる
             let entries = remote_fs::list_dir(&ssh_host, &dir).map_err(to_err)?;
-            let remote = RemoteRef::new(ssh_host.clone(), dir.clone());
             let tab_id = target_tab(host, tab)?;
-            let added = host
-                .workspace_mut()
-                .get_tab_mut(tab_id)
-                .map(|t| t.add_remote_folder(remote.clone()))
-                .unwrap_or(false);
-            host.set_filetree(true);
-            host.sync_filetree();
-            host.request_remote_dir(&remote);
+            let remote = RemoteRef::new(ssh_host.clone(), dir.clone());
+            let added = attach_remote_root(host, remote.clone(), tab_id);
             Ok(json!({
                 "opened": added,
                 "host": ssh_host,
@@ -6192,10 +6187,47 @@ fn dispatch_remote_folder(
             )
         }
 
+        // #976: ペインの ssh を検知した自動追加の照会・切替。
+        // **状態は GUI（tako-app）側が持つ**ので ControlHost 経由で読む
+        // （検知はプロセス表の走査を伴うため CLI プロセス側では再現できない）
+        "auto" => {
+            if let Some(enabled) = enabled {
+                host.set_ssh_auto_folders(enabled);
+            }
+            let mut payload = host.ssh_auto_folder_status();
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("enabled".into(), json!(host.ssh_auto_folders_enabled()));
+            }
+            Ok(payload)
+        }
+
         other => Err(DispatchError::InvalidParams(format!(
-            "不明な action: {other:?}（open / close / list / ls / open-file / ssh-pane / pending / push のいずれか）"
+            "不明な action: {other:?}（open / close / list / ls / open-file / ssh-pane / pending / push / auto のいずれか）"
         ))),
     }
+}
+
+/// リモートフォルダをタブのワークスペースへ足してツリーへ出す（#919 / #976）。
+///
+/// **接続の確認は呼び出し側の責務**。`open` は先に `connect` + `list_dir` で確かめ、
+/// #976 の自動追加は同じ確認を background で済ませてからここへ来る
+/// （UI スレッドでネットワークを待たせない = #212 / #772 の教訓）。
+/// 器づけを 1 実装にしておくのは、片方だけ `sync_filetree` を忘れると
+/// 「開いたのにツリーに出ない」形で壊れるため
+pub fn attach_remote_root(
+    host: &mut dyn ControlHost,
+    remote: tako_core::remote_fs::RemoteRef,
+    tab_id: TabId,
+) -> bool {
+    let added = host
+        .workspace_mut()
+        .get_tab_mut(tab_id)
+        .map(|t| t.add_remote_folder(remote.clone()))
+        .unwrap_or(false);
+    host.set_filetree(true);
+    host.sync_filetree();
+    host.request_remote_dir(&remote);
+    added
 }
 
 /// アカウントレジストリの CRUD（Issue #504 / #512）。host 非依存

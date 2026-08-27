@@ -58,6 +58,7 @@ pub mod setup;
 pub mod setup_bootstrap;
 pub mod shell_integration;
 pub mod sleep_guard;
+pub mod ssh_detect;
 pub mod stale_binary;
 pub mod tailscale;
 pub mod task_checkpoints;

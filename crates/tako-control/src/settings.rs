@@ -16,6 +16,11 @@ pub struct Settings {
     /// listen ポート検知 + 提案チップ（FR-2.4.4。既定 ON）
     #[serde(default = "default_true")]
     pub port_detect: bool,
+    /// ペインの `ssh` を検知してリモートフォルダをツリーへ自動追加する
+    /// （FR-3.24.3 / Issue #976。既定 ON）。
+    /// OFF にしても明示的な「リモートからフォルダを開く」経路はそのまま使える
+    #[serde(default = "default_true")]
+    pub ssh_auto_folders: bool,
     /// tako 内 zsh の入力予測（FR-2.4.5 / Issue #600。既定 ON）。
     /// zsh 以外のシェル・ユーザーが自前で導入済みの環境では設定に関わらず無害に素通しする
     #[serde(default = "default_true")]
@@ -157,6 +162,7 @@ impl Default for Settings {
         Self {
             auto_rename: true,
             port_detect: true,
+            ssh_auto_folders: true,
             autosuggest: true,
             autosuggest_hint: true,
             autosuggest_tab: true,
@@ -363,6 +369,7 @@ mod tests {
         let settings = Settings {
             auto_rename: false,
             port_detect: false,
+            ssh_auto_folders: false,
             autosuggest: false,
             autosuggest_hint: false,
             autosuggest_tab: false,
@@ -405,6 +412,9 @@ mod tests {
         assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);
         assert!(parsed.port_detect);
+        // #976: SSH の自動フォルダ追加は既定 ON（旧ファイルにキーが無くても立つ =
+        // 移行 Step 不要。指紋テストへ書く「serde default で読める」の根拠がここ）
+        assert!(parsed.ssh_auto_folders);
         // #600: 入力予測は既定 ON（旧ファイル後方互換）
         assert!(parsed.autosuggest);
         // #614: 確定キーのヒントと Tab 確定も既定 ON（#600 時代のファイルでも立つ）

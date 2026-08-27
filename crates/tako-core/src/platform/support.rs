@@ -137,8 +137,8 @@ pub mod notes {
     /// #919 / #65 / #930。バックエンドは同梱の OpenSSH なので移植は要らない設計だが、
     /// 実機テストではホスト解決の分類がまだ落ちている
     pub const WIN_REMOTE_FOLDER: Note = Note::new(
-        "同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測（ホスト解決の分類は実機テストで失敗中。#930）",
-        "Designed to work with the bundled OpenSSH client, but not measured on Windows yet (host resolution classification still fails in the real-hardware test suite, #930)",
+        "同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測（ホスト解決の分類は実機テストで失敗中。#930）。ペインの ssh を検知した自動追加（#976）は、プロセスのコマンド行を採れないので働かない（明示的に開く経路だけが使える）",
+        "Designed to work with the bundled OpenSSH client, but not measured on Windows yet (host resolution classification still fails in the real-hardware test suite, #930). Auto-adding folders by detecting ssh in a pane (#976) does not work because process command lines are unavailable; only the explicit open path is usable",
     );
 
     /// #519。器は psmux。一覧と kill は通るが attach 系は通らない

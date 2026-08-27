@@ -77,27 +77,65 @@ fn find_ancestor_pane<T: Copy>(
     None
 }
 
-/// `ps -axo pid=,ppid=` で全プロセスの親子マップを作る
+/// 全プロセスの親子マップを作る（`ps` 1 回。argv は捨てる）
 pub fn process_parent_map() -> HashMap<u32, u32> {
-    // 境界 B5（`platform::procinfo`）が親子関係を返せる環境（Windows の
-    // Toolhelp32 スナップショット）はそれを使う。返せない環境は空 Vec が来るので
-    // 従来の `ps` 経路へ落ちる（#524。スライス 1 が置いた境界の配線）。
-    //
-    // **ここに `cfg(windows)` を書かない**のが肝。書くと FFI の転記が
-    // `procinfo` と二重になり、両方を直さないと壊れる形になる（規約は
-    // `platform/mod.rs` の冒頭）。判定材料は「OS 名」ではなく
-    // 「境界が答えを持っているか」
+    capture_process_table().0
+}
+
+/// 全プロセスの「親子関係」と「コマンド行」を **1 回の採取**で作る。
+///
+/// コマンド行が要るのは #976（ペインの `ssh` の宛先を読む）だけだが、`ps` を
+/// 2 回起動しないよう同じ 1 回に相乗りさせる（#772 / #779 で削った子プロセス
+/// 起動を復活させない）。列を 1 つ増やすぶんの追加コストは無視できる。
+///
+/// 境界 B5（`platform::procinfo`）が親子関係を返せる環境（Windows の Toolhelp32
+/// スナップショット）はそれを使う。返せない環境は空 Vec が来るので従来の `ps`
+/// 経路へ落ちる（#524。スライス 1 が置いた境界の配線）。
+///
+/// **ここに `cfg(windows)` を書かない**のが肝。書くと FFI の転記が `procinfo` と
+/// 二重になり、両方を直さないと壊れる形になる（規約は `platform/mod.rs` の冒頭）。
+/// 判定材料は「OS 名」ではなく「境界が答えを持っているか」。
+///
+/// なお境界は実行ファイル名までしか返さないので、**その環境では argv が空になる**
+/// （= #976 の自動検知は働かない。対応マトリクスで Pending として申告する）。
+pub fn capture_process_table() -> (HashMap<u32, u32>, HashMap<u32, String>) {
     let snapshot = tako_core::platform::procinfo::snapshot();
     if !snapshot.is_empty() {
-        return snapshot.into_iter().map(|p| (p.pid, p.ppid)).collect();
+        return (
+            snapshot.into_iter().map(|p| (p.pid, p.ppid)).collect(),
+            HashMap::new(),
+        );
     }
     let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
+        .args(["-axo", "pid=,ppid=,command="])
         .output();
     let Ok(output) = output else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
-    parse_parent_map(&String::from_utf8_lossy(&output.stdout))
+    parse_process_table(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `ps -axo pid=,ppid=,command=` の出力を (親子マップ, コマンド行) へ割る純粋関数。
+///
+/// コマンド行は空白を含むので **前 2 列だけを数値として切り、残り全部**を argv とする
+fn parse_process_table(text: &str) -> (HashMap<u32, u32>, HashMap<u32, String>) {
+    let mut parents = HashMap::new();
+    let mut argv = HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        parents.insert(pid, ppid);
+        let rest = it.collect::<Vec<_>>().join(" ");
+        if !rest.is_empty() {
+            argv.insert(pid, rest);
+        }
+    }
+    (parents, argv)
 }
 
 /// tmux ペイン PID と全プロセスの親子関係を 1 回で採取した共有スナップショット。
@@ -113,13 +151,15 @@ pub struct ProcessSnapshot {
     parents: HashMap<u32, u32>,
     /// pid → 直接の子 PID 集合
     children: HashMap<u32, Vec<u32>>,
+    /// pid → コマンド行（#976 の ssh 検知が読む。境界が argv を返せない環境では空）
+    argv: HashMap<u32, String>,
 }
 
 impl ProcessSnapshot {
     /// tmux と ps を各 1 回だけ実行して採取する。background executor 専用。
     pub fn capture() -> Self {
         let panes = backend_pane_pids();
-        let parents = process_parent_map();
+        let (parents, argv) = capture_process_table();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&child, &parent) in &parents {
             children.entry(parent).or_default().push(child);
@@ -128,7 +168,46 @@ impl ProcessSnapshot {
             panes,
             parents,
             children,
+            argv,
         }
+    }
+
+    /// pid のコマンド行（採取できていなければ None）
+    pub fn argv(&self, pid: u32) -> Option<&str> {
+        self.argv.get(&pid).map(String::as_str)
+    }
+
+    /// `root` とその子孫の pid（**`root` 自身を含む**）。
+    ///
+    /// `descendant_pids` が器のセッション名から引くのに対し、こちらは pid から引く
+    /// （器を持たないペインの PTY 直下の子から辿るため。#728 と同じ二段構え）。
+    /// 壊れた ppid による循環は訪問済み集合で止める
+    pub fn descendants_with_root(&self, root: u32) -> Vec<u32> {
+        // **幅優先**で返す（呼び出し側が「手前にあるもの」を先に見られるように。
+        // #976 の入れ子 ssh で外側を採るのはこの順番に依っている）
+        let mut queue = std::collections::VecDeque::from([root]);
+        let mut found = Vec::new();
+        let mut visited = HashSet::new();
+        while let Some(pid) = queue.pop_front() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            found.push(pid);
+            if let Some(kids) = self.children.get(&pid) {
+                queue.extend(kids.iter().copied().filter(|k| *k != pid));
+            }
+        }
+        found
+    }
+
+    /// 器のセッションに属するペインの pid（`session:window.pane` の接頭辞一致）
+    pub fn pane_pids_of(&self, backend_session: &str) -> Vec<u32> {
+        let prefix = format!("{backend_session}:");
+        self.panes
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .map(|(_, pid)| *pid)
+            .collect()
     }
 
     /// 指定 backend session の pane PID を除いた全子孫 PID を返す。
@@ -159,8 +238,13 @@ impl ProcessSnapshot {
         sessions_with_children_inner(sessions, &self.panes, &self.parents)
     }
 
-    #[cfg(test)]
-    fn from_parts(panes: Vec<(String, u32)>, parents: HashMap<u32, u32>) -> Self {
+    /// テストと**セルフテスト**で実プロセスを使わずに組み立てる（#976 の検知の
+    /// 判定部分をネットワーク・実 ssh 無しで検証するため）
+    pub fn from_parts_for_test(
+        panes: Vec<(String, u32)>,
+        parents: HashMap<u32, u32>,
+        argv: HashMap<u32, String>,
+    ) -> Self {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&child, &parent) in &parents {
             children.entry(parent).or_default().push(child);
@@ -169,7 +253,13 @@ impl ProcessSnapshot {
             panes,
             parents,
             children,
+            argv,
         }
+    }
+
+    #[cfg(test)]
+    fn from_parts(panes: Vec<(String, u32)>, parents: HashMap<u32, u32>) -> Self {
+        Self::from_parts_for_test(panes, parents, HashMap::new())
     }
 }
 
@@ -237,21 +327,6 @@ pub fn scan_running_children(
         scanned_at: Some(now),
         sleep_guard_active,
     }
-}
-
-/// `ps -axo pid=,ppid=` の出力をパースする
-fn parse_parent_map(text: &str) -> HashMap<u32, u32> {
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
-            continue;
-        };
-        if let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse()) {
-            map.insert(pid, ppid);
-        }
-    }
-    map
 }
 
 /// caller_pid の祖先チェーンを辿り、バックエンドセッションの pane_pid に到達時にセッション名を返す（#288）
@@ -797,10 +872,22 @@ mod tests {
 
     #[test]
     fn ps出力のパース() {
-        let map = parse_parent_map("  1     0\n  345   1\n 9999 345\nbad line\n");
+        // 前 2 列が pid / ppid、残り全部が argv（#976 で列を 1 つ増やした）
+        let (map, argv) = parse_process_table(
+            "  1     0 /sbin/launchd\n  345   1 -zsh\n 9999 345 ssh -o Foo=bar my host\nbad line\n",
+        );
         assert_eq!(map.get(&345), Some(&1));
         assert_eq!(map.get(&9999), Some(&345));
         assert_eq!(map.len(), 3);
+        assert_eq!(argv.get(&345).map(String::as_str), Some("-zsh"));
+        // 空白を含むコマンド行が途中で切れない
+        assert_eq!(
+            argv.get(&9999).map(String::as_str),
+            Some("ssh -o Foo=bar my host")
+        );
+        // `command=` が空の行（カーネルスレッド等）は argv を持たない
+        let (_, empty) = parse_process_table(" 42 0 \n");
+        assert!(empty.is_empty());
     }
 
     #[test]

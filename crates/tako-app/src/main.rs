@@ -49,6 +49,7 @@ mod right_panel;
 mod settings_sleep;
 mod settings_window;
 mod sidebar;
+mod ssh_folders;
 mod starter;
 mod status_bar;
 mod tab_bar;
@@ -650,6 +651,15 @@ fn initial_auto_rename() -> bool {
         return false;
     }
     tako_control::settings::load().auto_rename
+}
+
+/// #976: SSH の自動フォルダ追加の起動時の有効判定（settings.json。既定 ON）。
+/// セルフテストでは実 ssh へ触らせない（検知の判定はセルフテスト項目が直接駆動する）
+fn initial_ssh_auto_folders() -> bool {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return false;
+    }
+    tako_control::settings::load().ssh_auto_folders
 }
 
 /// listen ポート検知（FR-2.4.4）の起動時の有効判定。
@@ -1481,6 +1491,12 @@ struct TakoApp {
     autosuggest_tab: bool,
     /// 表示中の提案チップ（FR-2.4.3。新規 listen ポートごとに 1 件）
     port_suggestions: Vec<PortSuggestion>,
+    /// ペインの ssh を検知してリモートフォルダを自動追加するか（#976。dispatch から切替）
+    ssh_auto_folders: bool,
+    /// ssh 検知の最後の走査結果 + 再走査の間引き用の指紋（#976）
+    ssh_scan: tako_control::ssh_detect::SshScanState,
+    /// 宛先 → 自動追加の状態（#976。切断してもルートは消さず、ここの `live` が落ちる）
+    ssh_links: HashMap<String, ssh_folders::SshAutoLink>,
     /// 却下済みの (ペイン, ポート)。ポートが消えるまで再提案しない
     dismissed_ports: std::collections::HashSet<(PaneId, u16)>,
     /// tmux バックエンド永続化（Phase 5.5 / FR-5）の有効状態（dispatch から切替）
@@ -3337,6 +3353,9 @@ impl TakoApp {
             autosuggest_hint: initial_autosuggest_hint(),
             autosuggest_tab: initial_autosuggest_tab(),
             port_suggestions: Vec::new(),
+            ssh_auto_folders: initial_ssh_auto_folders(),
+            ssh_scan: tako_control::ssh_detect::SshScanState::default(),
+            ssh_links: HashMap::new(),
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
             secondary,
@@ -4251,6 +4270,16 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:stale_binary");
                         app.collect_stale_binary_scan()
                     };
+                    // #976: ssh 検知の材料（ペイン集合・子 pid・OSC 133 状態）。
+                    // 自動追加が無効なら空 = プロセス表の採取そのものが起きない
+                    let ssh_scan = {
+                        let _s = tako_control::diag::perf_span("periodic_prep:ssh_detect");
+                        (
+                            app.collect_ssh_scan_targets(),
+                            app.ssh_scan.clone(),
+                            app.ssh_auto_tracked(),
+                        )
+                    };
                     app.detect_new_failures();
                     // ペインログ: 直接ペインはここで取り込み、バックエンドはジョブ化（Issue #112 B）
                     let log_jobs = {
@@ -4313,6 +4342,7 @@ impl TakoApp {
                         app.pane_logs.clone(),
                         running_children_scan,
                         stale_binary_scan,
+                        ssh_scan,
                         limit_resume_jobs,
                     )
                 });
@@ -4334,6 +4364,7 @@ impl TakoApp {
                     pane_logs,
                     running_children_scan,
                     stale_binary_scan,
+                    ssh_scan,
                     limit_resume_jobs,
                 )) = prep
                 else {
@@ -4362,13 +4393,14 @@ impl TakoApp {
                 // 初回 / 対象・role・OSC 状態変化 / 60 秒保険でだけ tmux + ps を起動し、
                 // 両方が同じ tick で必要なら 1 個の ProcessSnapshot を共有する。
                 {
-                    let (settings, running_children_scan, stale_outcome) = cx
+                    let (settings, running_children_scan, stale_outcome, ssh_state) = cx
                         .background_executor()
                         .spawn(async move {
                             let settings = tako_control::settings::load();
                             let sleep_guard_active = settings.sleep_guard_mode
                                 == tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
                             let (running_targets, running_prev) = running_children_scan;
+                            let (ssh_targets, ssh_prev, ssh_tracked) = ssh_scan;
                             let now = std::time::Instant::now();
                             let rescan_running =
                                 tako_control::agents::should_rescan_running_children(
@@ -4377,11 +4409,27 @@ impl TakoApp {
                                     sleep_guard_active,
                                     now,
                                 );
-                            let snapshot = if rescan_running && !running_targets.is_empty() {
-                                Some(tako_control::agents::ProcessSnapshot::capture())
-                            } else {
-                                None
-                            };
+                            // #976: ssh 検知も同じ判断で間引く。両方が要るときは
+                            // **1 個の ProcessSnapshot を共有**するので、子プロセスの
+                            // 起動回数は増えない（#772 / #779 の枠組みをそのまま使う）
+                            let rescan_ssh = tako_control::ssh_detect::should_rescan(
+                                &ssh_prev,
+                                &ssh_targets,
+                                ssh_tracked,
+                                now,
+                            );
+                            let snapshot =
+                                if (rescan_running && !running_targets.is_empty()) || rescan_ssh {
+                                    Some(tako_control::agents::ProcessSnapshot::capture())
+                                } else {
+                                    None
+                                };
+                            let ssh_state = tako_control::ssh_detect::scan(
+                                &ssh_prev,
+                                ssh_targets,
+                                snapshot.as_ref().filter(|_| rescan_ssh),
+                                now,
+                            );
                             let running_state = if rescan_running {
                                 tako_control::agents::scan_running_children(
                                     running_targets,
@@ -4401,7 +4449,7 @@ impl TakoApp {
                                     snapshot.as_ref(),
                                 )
                             });
-                            (settings, running_state, stale_outcome)
+                            (settings, running_state, stale_outcome, ssh_state)
                         })
                         .await;
                     let ok = this.update(cx, |app: &mut TakoApp, cx| {
@@ -4412,9 +4460,34 @@ impl TakoApp {
                         {
                             cx.notify();
                         }
+                        // #976: 検知の反映はメモリ操作だけ（接続の確認は次の段で背景へ）
+                        app.apply_ssh_scan(ssh_state)
                     });
-                    if ok.is_err() {
+                    let Ok(ssh_jobs) = ok else {
                         break;
+                    };
+                    // #976: 自動追加は **接続の確認まで background**。UI スレッドで
+                    // ネットワークを待たせると、ユーザーが頼んでいない処理が
+                    // 数百 ms〜数秒のストールとして現れる（#212 / #772 の教訓）。
+                    //
+                    // **この tick では待たない**（切り離して投げる）: 到達できない相手だと
+                    // `ConnectTimeout` + sftp の keepalive で 20 秒級かかることがあり、
+                    // ここで待つと定期更新（sleep guard / layout 保存 / ペインログ）が
+                    // まとめて止まる。二重起動は `apply_ssh_scan` が仕事を作る前に
+                    // 立てる `attempted` が防ぐ
+                    for job in ssh_jobs {
+                        let this = this.clone();
+                        let destination = job.destination.clone();
+                        cx.spawn(async move |cx| {
+                            let outcome = cx
+                                .background_executor()
+                                .spawn(async move { ssh_folders::probe_remote_home(&destination) })
+                                .await;
+                            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                                app.apply_ssh_auto_open(&job, outcome, cx);
+                            });
+                        })
+                        .detach();
                     }
                 }
                 // ② background: GUI モードのチャット読み取り（#702）。sleep_guard の
@@ -8722,6 +8795,7 @@ impl TakoApp {
                 focus: None,
                 all: false,
                 force: false,
+                enabled: None,
             },
             PaneOrigin::User,
         );
@@ -8776,6 +8850,7 @@ impl TakoApp {
                 focus: None,
                 all: false,
                 force: false,
+                enabled: None,
             },
             PaneOrigin::User,
         );
@@ -17611,6 +17686,33 @@ impl UiStateHost for TakoApp {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
         }
+    }
+
+    fn ssh_auto_folders_enabled(&self) -> bool {
+        self.ssh_auto_folders
+    }
+
+    fn set_ssh_auto_folders(&mut self, enabled: bool) {
+        self.ssh_auto_folders = enabled;
+        if !enabled {
+            // 検知の記録も落とす（**開いたルートは消さない**: ユーザーの
+            // ワークスペースなので、設定の切替で勝手に閉じない = #976 の
+            // 「勝手に消さない」と同じ原則）。バッジの状態表示だけが消える
+            self.ssh_links.clear();
+            self.ssh_scan = tako_control::ssh_detect::SshScanState::default();
+        }
+        // 永続化（FR-3.24.3）。セルフテスト中はユーザー設定を汚さない
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.ssh_auto_folders = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
+    fn ssh_auto_folder_status(&self) -> serde_json::Value {
+        self.ssh_auto_status_json()
     }
 
     fn port_detect_enabled(&self) -> bool {
@@ -28036,6 +28138,133 @@ mod self_test {
             ),
         );
 
+        // --- #976: ローカルと同じ並び・SSH バッジ・切断表示 ----------------------
+        //
+        // 見たいのは 3 つで、どれも**実描画の矩形と実ピクセル**で確かめる:
+        //
+        // 1. リモートルートが**ローカルルートより下**に来る（#919 は先頭へ hoist していた）
+        // 2. ルート行にホスト名つきの色付きバッジが出ている（`mauve` の実ピクセル）
+        // 3. 検知していた ssh が消えると**同じ行が赤へ変わる**（行は消えない）
+        let row_rect = |app: &TakoApp, index: usize| -> Option<Bounds<Pixels>> {
+            let handle = app.filetree_scroll_handle.clone();
+            let mut b = handle.bounds_for_item(index)?;
+            b.origin.y += handle.offset().y;
+            Some(b)
+        };
+        let tinted = |img: &image::RgbaImage, want: tako_core::Rgb, rects: &[Bounds<Pixels>]| {
+            let (tr, tg, tb) = (want.r as i32, want.g as i32, want.b as i32);
+            let (width, height) = img.dimensions();
+            let count = |flip_y: bool| {
+                let mut n = 0usize;
+                for b in rects {
+                    let left = (f32::from(b.left()) * scale).floor().max(0.0) as u32;
+                    let right = ((f32::from(b.right()) * scale).ceil().max(0.0) as u32).min(width);
+                    let raw_top = (f32::from(b.top()) * scale).floor().max(0.0) as u32;
+                    let raw_bottom =
+                        ((f32::from(b.bottom()) * scale).ceil().max(0.0) as u32).min(height);
+                    let (top, bottom) = if flip_y {
+                        (
+                            height.saturating_sub(raw_bottom),
+                            height.saturating_sub(raw_top),
+                        )
+                    } else {
+                        (raw_top.min(height), raw_bottom.min(height))
+                    };
+                    for y in top..bottom {
+                        for x in left..right {
+                            let p = img.get_pixel(x, y);
+                            let (r, g, bl) = (p[0] as i32, p[1] as i32, p[2] as i32);
+                            if (r - tr).abs() < 40 && (g - tg).abs() < 40 && (bl - tb).abs() < 40 {
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                n
+            };
+            count(false).max(count(true))
+        };
+
+        let (order_ok, root_rect, mauve, red_theme, local_y, remote_y) = window
+            .update(cx, |app, _, _| {
+                let rows = app.filetree.rows();
+                let remote_ix = rows.iter().position(|r| r.root && r.remote.is_some());
+                let local_ix = rows.iter().rposition(|r| r.root && r.remote.is_none());
+                let remote_top = remote_ix.and_then(|i| row_rect(app, i)).map(|b| b.top());
+                let local_top = local_ix.and_then(|i| row_rect(app, i)).map(|b| b.top());
+                (
+                    matches!((local_top, remote_top), (Some(l), Some(r)) if r > l),
+                    remote_ix.and_then(|i| row_rect(app, i)),
+                    app.theme.mauve,
+                    app.theme.red,
+                    local_top.map(f32::from).unwrap_or(-1.0),
+                    remote_top.map(f32::from).unwrap_or(-1.0),
+                )
+            })
+            .unwrap_or((
+                false,
+                None,
+                tako_core::theme::Rgb::new(0, 0, 0),
+                tako_core::theme::Rgb::new(0, 0, 0),
+                -1.0,
+                -1.0,
+            ));
+        let badge_live = root_rect.map(|r| tinted(&after, mauve, &[r])).unwrap_or(0);
+
+        // 検知していた ssh が消えた状態にして同じ行を撮り直す（切断のバッジ）
+        let _ = window.update(cx, |app, _, cx| {
+            app.ssh_links.insert(
+                root.host.clone(),
+                crate::ssh_folders::SshAutoLink {
+                    pane: 0,
+                    tab: app.workspace.active_tab_id().as_u64(),
+                    live: false,
+                    attempted: true,
+                    root: Some(root.clone()),
+                    note: None,
+                },
+            );
+            cx.notify();
+        });
+        wait(cx, 300).await;
+        let lost_frame = capture_frame(any, cx).map(|(f, _)| f);
+        let (badge_lost_red, rows_after_lost) = match (&lost_frame, root_rect) {
+            (Some(frame), Some(rect)) => (
+                tinted(frame, red_theme, &[rect]),
+                window
+                    .update(cx, |app, _, _| app.filetree.rows().len())
+                    .unwrap_or(0),
+            ),
+            _ => (0, 0),
+        };
+        let badge_live_after_lost = match (&lost_frame, root_rect) {
+            (Some(frame), Some(rect)) => tinted(frame, mauve, &[rect]),
+            _ => 0,
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: remote-badge order_ok={order_ok} local_y={local_y:.1} \
+             remote_y={remote_y:.1} badge_live={badge_live} badge_lost_red={badge_lost_red} \
+             badge_live_after_lost={badge_live_after_lost} rows_after_lost={rows_after_lost}"
+        );
+        check(
+            order_ok,
+            &format!(
+                "visual-test remote-tree: リモートルートがローカルの後ろに並ぶ \
+                 (#976。local_y={local_y:.1} remote_y={remote_y:.1})"
+            ),
+        );
+        check(
+            badge_live > 20,
+            &format!("visual-test remote-tree: SSH バッジが描かれる (#976。mauve={badge_live})"),
+        );
+        check(
+            badge_lost_red > 20 && rows_after_lost == rows,
+            &format!(
+                "visual-test remote-tree: 切断でバッジが赤へ変わり行は消えない \
+                 (#976。red={badge_lost_red} rows {rows}->{rows_after_lost})"
+            ),
+        );
+
         // 人が見て確かめられる証拠も残す（この機は画面 OFF で screencapture が
         // 全面黒しか撮れないため。#828）。サイドバーの実描画部分だけ切り出す
         if let Ok(out) = std::env::var("TAKO_VISUAL_DUMP") {
@@ -28066,6 +28295,7 @@ mod self_test {
         // 後片付け（以降の節へ持ち越さない）
         let _ = window.update(cx, |app, _, cx| {
             app.filetree.remove_remote_root(&root);
+            app.ssh_links.clear();
             app.remote_notice = None;
             cx.notify();
         });
@@ -53223,10 +53453,21 @@ mod self_test {
                             .iter()
                             .filter(|r| !r.entry.is_dir && r.note.is_none())
                             .count();
-                        // ルート見出しに「host: 末尾」が入る（どのホストか読める）
-                        let labeled = rows
-                            .iter()
-                            .any(|r| r.root && r.entry.name.starts_with("selftest-host: "));
+                        // #976: ルート見出しは**ローカルと同じ「フォルダ名」だけ**で、
+                        // どのホストかは行が持つ remote（= SSH バッジの材料）から読める。
+                        // 名前に `host: ` を混ぜると同じ深さのローカルルートと形が揃わない。
+                        // `TAKO_976_LEGACY=1`（A/B）のときだけ #919 の旧形を期待する
+                        // ので、**どちらのモードでも「その形になっている」ことを見る**
+                        let want_name = match crate::ssh_folders::legacy_mode() {
+                            true => "selftest-host: app",
+                            false => "app",
+                        };
+                        let labeled = rows.iter().any(|r| {
+                            r.root
+                                && r.entry.name == want_name
+                                && r.remote.as_ref().map(|m| m.host.as_str())
+                                    == Some("selftest-host")
+                        });
                         // リモート行が 1 つでもローカル扱いになっていないこと
                         let all_remote = rows
                             .iter()
@@ -53240,7 +53481,7 @@ mod self_test {
                 check(
                     dirs == 2 && files == 1 && all_remote && host_in_label,
                     &format!(
-                        "リモートの中身がツリーへ出て全行が remote 印を持つ                          (#919。dirs={dirs} files={files} all_remote={all_remote}                          labeled={host_in_label})"
+                        "リモートの中身がツリーへ出て全行が remote 印を持つ                          (#919 / #976。dirs={dirs} files={files} all_remote={all_remote}                          root_like_local={host_in_label})"
                     ),
                 );
 
@@ -53515,6 +53756,7 @@ mod self_test {
                                 focus: None,
                                 all: false,
                                 force: false,
+                                enabled: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -53542,6 +53784,7 @@ mod self_test {
                                 focus: None,
                                 all: false,
                                 force: false,
+                                enabled: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -54381,6 +54624,235 @@ mod self_test {
                     cx.notify();
                 });
                 notify_and_draw(any961, window961, cx);
+            }
+
+            // 130. ペインの ssh を検知してリモートフォルダを自動追加する（#976 / #65 要件 1）。
+            //
+            // ネットワークにも実 ssh にも依存させない: プロセス表は
+            // `ProcessSnapshot::from_parts_for_test` で組み、判定
+            //（`ssh_detect::scan` → `apply_ssh_scan`）と**見た目の統合**
+            //（ローカルの後ろに並ぶ / 名前に `host: ` を混ぜない / SSH バッジ）を
+            // 実 render で確かめる。実 SSH 先との通しは
+            // `cargo test -p tako-core --test remote_fs_e2e -- --ignored` が受け持つ。
+            //
+            // ここが守っているのは #976 の核: **ペインで ssh に入るだけで出てくる** /
+            // **明示的に開いたものと二重にしない** / **切断しても消えない**
+            {
+                use std::collections::HashMap as StdMap;
+                use tako_core::remote_fs::RemoteRef;
+                use tako_control::ssh_detect::{SshScanState, SshScanTarget};
+
+                let host130 = "selftest-ssh-host";
+                let tab130 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.workspace.active_tab_id().as_u64()
+                    })
+                    .unwrap_or(0);
+
+                // (a) オプトアウトが**走査そのもの**を止める（#976 スコープ 4）。
+                //     無効なら対象が空 = `should_rescan` が false = ps を起動しない
+                let (off_targets, on_targets) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.ssh_auto_folders = false;
+                        let off = app.collect_ssh_scan_targets().len();
+                        app.ssh_auto_folders = true;
+                        let on = app.collect_ssh_scan_targets().len();
+                        (off, on)
+                    })
+                    .unwrap_or((1, 0));
+                check(
+                    off_targets == 0 && on_targets > 0,
+                    &format!(
+                        "130: 自動追加を切ると走査対象が空になる \
+                         (#976。off={off_targets} on={on_targets})"
+                    ),
+                );
+
+                // (b) ペイン配下の ssh を検知して「開く仕事」が 1 件出る。
+                //     宛先はコマンド行から読んだものがそのまま渡る
+                let shell_pid = 91_130;
+                let ssh_pid = 91_131;
+                let make_state = |sessions: bool| {
+                    let targets = vec![SshScanTarget {
+                        pane: 1,
+                        tab: tab130,
+                        backend_session: None,
+                        child_pid: Some(shell_pid),
+                        state: tako_core::CommandState::Running,
+                    }];
+                    let argv: StdMap<u32, String> = match sessions {
+                        true => [(ssh_pid, format!("ssh {host130}"))].into_iter().collect(),
+                        false => StdMap::new(),
+                    };
+                    let snapshot = tako_control::agents::ProcessSnapshot::from_parts_for_test(
+                        Vec::new(),
+                        [(ssh_pid, shell_pid)].into_iter().collect(),
+                        argv,
+                    );
+                    tako_control::ssh_detect::scan(
+                        &SshScanState::default(),
+                        targets,
+                        Some(&snapshot),
+                        std::time::Instant::now(),
+                    )
+                };
+                let (jobs, live) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.ssh_links.clear();
+                        let jobs = app.apply_ssh_scan(make_state(true));
+                        let live = app
+                            .ssh_link_of_host(host130)
+                            .map(|l| l.live)
+                            .unwrap_or(false);
+                        (jobs, live)
+                    })
+                    .unwrap_or_default();
+                check(
+                    jobs.len() == 1
+                        && jobs[0].destination == host130
+                        && jobs[0].tab == tab130
+                        && live,
+                    &format!(
+                        "130: ペイン配下の ssh を検知して自動追加の仕事が出る \
+                         (#976。jobs={} dest={:?} live={live})",
+                        jobs.len(),
+                        jobs.first().map(|j| j.destination.clone())
+                    ),
+                );
+
+                // (c) 器づけ（`attach_remote_root`）を通すとツリーへ出る。
+                //     **ローカルルートの後ろ**に並び、名前に `host: ` を混ぜない
+                //     （#976 スコープ 2。#919 は先頭へ hoist + `host: 名前` だった）
+                let (order_ok, name_ok, badge_host) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.filetree.visible = true;
+                        let remote = RemoteRef::new(host130, "/srv/home");
+                        app.apply_ssh_auto_open(
+                            &crate::ssh_folders::SshAutoOpenJob {
+                                destination: host130.to_string(),
+                                tab: tab130,
+                            },
+                            Ok(("/srv/home".to_string(), 3)),
+                            cx,
+                        );
+                        let rows = app.filetree.rows();
+                        let remote_ix = rows.iter().position(|r| r.remote.as_ref() == Some(&remote));
+                        let local_root_ix = rows.iter().position(|r| r.root && r.remote.is_none());
+                        let order = match (remote_ix, local_root_ix) {
+                            (Some(r), Some(l)) => r > l,
+                            _ => false,
+                        };
+                        let name = rows
+                            .iter()
+                            .find(|r| r.root && r.remote.as_ref() == Some(&remote))
+                            .map(|r| r.entry.name.clone())
+                            .unwrap_or_default();
+                        (order, name, app.ssh_link_of_host(host130).is_some())
+                    })
+                    .unwrap_or((false, String::new(), false));
+                check(
+                    order_ok && name_ok == "home" && badge_host,
+                    &format!(
+                        "130: 自動追加したルートがローカルの後ろに同じ形で並ぶ \
+                         (#976。after_local={order_ok} name={name_ok:?} badge={badge_host})"
+                    ),
+                );
+
+                // (d) 明示的に開いてあるホストは**二重に並べない**（#919 の経路と共存）
+                let dup_jobs = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.ssh_links.clear();
+                        app.apply_ssh_scan(make_state(true)).len()
+                    })
+                    .unwrap_or(1);
+                check(
+                    dup_jobs == 0,
+                    &format!("130: 同じホストのルートがあれば自動追加しない (#976。jobs={dup_jobs})"),
+                );
+
+                // (e) 切断は**状態として出る**（行は消さない）。#976 受け入れ条件 3
+                let (still_there, disconnected, badge_text) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let before = app.filetree.rows().len();
+                        // ssh が消えた走査結果（argv に ssh が居ない）
+                        let _ = app.apply_ssh_scan(make_state(false));
+                        cx.notify();
+                        let after = app.filetree.rows().len();
+                        (
+                            before == after,
+                            app.ssh_link_of_host(host130).map(|l| !l.live).unwrap_or(false),
+                            crate::ui_text::remote_folder::badge_disconnected().to_string(),
+                        )
+                    })
+                    .unwrap_or((false, false, String::new()));
+                check(
+                    still_there && disconnected && !badge_text.is_empty(),
+                    &format!(
+                        "130: 切断してもルートは消えず状態が出る \
+                         (#976。rows_kept={still_there} disconnected={disconnected} \
+                         badge={badge_text:?})"
+                    ),
+                );
+
+                // (f) CLI / MCP と 1:1（`remote-folder auto`）。**照会と切替の両方**
+                let (auto_on, auto_off, has_session) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let req = |enabled: Option<bool>| {
+                            tako_control::protocol::Request::RemoteFolder {
+                                action: "auto".into(),
+                                host: None,
+                                path: None,
+                                tab: None,
+                                focus: None,
+                                all: false,
+                                force: false,
+                                enabled,
+                            }
+                        };
+                        let on = tako_control::dispatch(app, req(Some(true)), PaneOrigin::Cli)
+                            .unwrap_or_default();
+                        let off = tako_control::dispatch(app, req(Some(false)), PaneOrigin::Cli)
+                            .unwrap_or_default();
+                        let sessions = on["sessions"].as_array().map(|a| a.len()).unwrap_or(0);
+                        (
+                            on["enabled"].as_bool().unwrap_or(false),
+                            off["enabled"].as_bool().unwrap_or(true),
+                            sessions > 0,
+                        )
+                    })
+                    .unwrap_or((false, true, false));
+                check(
+                    auto_on && !auto_off && has_session,
+                    &format!(
+                        "130: remote-folder auto が照会と切替を返す \
+                         (#976。on={auto_on} off={auto_off} sessions={has_session})"
+                    ),
+                );
+
+                // 診断（#796 の作法。合格時も測った値をログへ残す）
+                println!(
+                    "TAKO_SELF_TEST_976: legacy={} targets(off/on)={off_targets}/{on_targets} \
+                     jobs={} live={live} after_local={order_ok} root_name={name_ok:?} \
+                     dup_jobs={dup_jobs} rows_kept={still_there} disconnected={disconnected} \
+                     auto(on/off)={auto_on}/{auto_off} sessions={has_session}",
+                    std::env::var_os("TAKO_976_LEGACY").is_some(),
+                    jobs.len(),
+                );
+
+                // 後片付け: 検証で開いたルートと検知の記録を落とし、既定（OFF）へ戻す
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    let remote = RemoteRef::new(host130, "/srv/home");
+                    if let Some(tab) = app.workspace.get_tab_mut(TabId::from_raw(tab130)) {
+                        tab.remove_remote_folder(&remote);
+                    }
+                    app.filetree.remove_remote_root(&remote);
+                    app.ssh_links.clear();
+                    app.ssh_scan = SshScanState::default();
+                    app.ssh_auto_folders = false;
+                    app.remote_notice = None;
+                    cx.notify();
+                });
+                notify_and_draw(any, window, cx);
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す
