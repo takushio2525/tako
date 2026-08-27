@@ -53,12 +53,22 @@ impl WorkerAgent {
     }
 
     /// `claude agents --json` による一次 status シグナルを持つか。
-    /// 持たない種別（codex / agy）の worker_status は画面推定にフォールバックする。
     ///
-    /// **判定の正本は `tako_core::agent_support`**（#982）。ここは同じ問いを
-    /// 型の近いところから引けるようにする薄い入口で、能力の増減はマトリクス側で行う。
-    /// `TAKO_982_LEGACY=1` で吸収前（この場所の直書き）へ戻せる
+    /// **これは claude 固有の API を指す**（#984 で意味を分けた）。#982 では
+    /// 「構造化された状態を持つか」と同義だったが、codex が別の構造化ソース
+    /// （rollout JSONL）を持つことが分かったので、汎用の問いは
+    /// `has_structured_status` へ移した。名前どおりの意味に戻してある
     pub fn has_agents_api(&self) -> bool {
+        matches!(self, Self::Claude)
+    }
+
+    /// 画面に依らない一次シグナルで状態を取れるか（agent を問わない一般形）。
+    ///
+    /// **判定の正本は `tako_core::agent_support`**（#982 のマトリクス）。
+    /// claude は `claude agents --json`、codex は rollout JSONL の
+    /// `task_started` / `task_complete`（#984 で実測）。
+    /// `TAKO_982_LEGACY=1` でマトリクス参照前（claude だけ true）へ戻せる
+    pub fn has_structured_status(&self) -> bool {
         if legacy_capability_check() {
             return matches!(self, Self::Claude);
         }
@@ -368,25 +378,30 @@ fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    /// 能力判定をマトリクスへ吸収した（#982）が、**判定結果は 1 ビットも変わっていない**こと。
-    ///
-    /// `TAKO_982_LEGACY=1` は同一バイナリから吸収前の直書きへ戻す逃げ道だが、
-    /// 環境変数は `OnceLock` でキャッシュするのでテストから切り替えられない。
-    /// 代わりに**両者が同じ答えを返す**ことを静的に固定する
-    /// （これが崩れたときだけ A/B の env が意味を持つ）
+    /// `has_agents_api` は**claude 固有の API** を指す（#984 で意味を分けた）。
+    /// codex が別の構造化ソースを持つようになっても、この問いの答えは変わらない
     #[test]
-    fn 構造化シグナルの判定は吸収前と一致する() {
+    fn agents_apiはclaude固有のまま() {
         for a in WorkerAgent::ALL {
-            let legacy = matches!(a, WorkerAgent::Claude);
             assert_eq!(
                 a.has_agents_api(),
-                legacy,
-                "{} で吸収前後の判定が食い違う。マトリクス側を変えたなら \
-                 crates/tako-core/src/agent_support.rs の worker_status_structured 行と \
-                 ここの期待値を同時に見直すこと",
+                matches!(a, WorkerAgent::Claude),
+                "{} で has_agents_api が claude 固有の意味から外れている",
                 a.as_str()
             );
         }
+    }
+
+    /// 汎用の「構造化された状態を持つか」はマトリクスから引く（#982 / #984）。
+    /// claude と codex が持ち、agy はまだ持たない
+    #[test]
+    fn 構造化状態の判定はマトリクスから引く() {
+        assert!(WorkerAgent::Claude.has_structured_status());
+        assert!(
+            WorkerAgent::Codex.has_structured_status(),
+            "codex は rollout JSONL の task_started / task_complete を持つ（#984 で実測）"
+        );
+        assert!(!WorkerAgent::Agy.has_structured_status());
     }
 
     /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。

@@ -6709,7 +6709,7 @@ fn dispatch_orchestrator_report(
         None
     };
 
-    // 第 2 層: transcript アダプタ（claude のみ。将来 codex 等を追加する拡張点）
+    // 第 2 層: transcript アダプタ（claude / codex）。
     // messages パラメータで直近 N 件を取得（#374。既定 1 件で後方互換）。
     // pane 経由の session 解決は pane の同一性が確認できた場合のみ
     // （pane ID 再利用時に別 worker の transcript を返さない。#390）。
@@ -6726,6 +6726,21 @@ fn dispatch_orchestrator_report(
             return None;
         }
         result["session_id"] = json!(sid);
+        result["transcript_agent"] = json!("claude");
+        Some(texts)
+    });
+    // #984: claude の会話ログが無ければ codex の実況を読む（`$CODEX_HOME/sessions/` の
+    // rollout JSONL。`response_item` の `role == "assistant"` が発話本文）。
+    // これで `report --messages N` が codex worker でも実データを返す
+    let transcript = transcript.or_else(|| {
+        let backend = backend.as_deref()?;
+        let tid = crate::codex_session::resolve_thread_id_for_backend(backend)?;
+        let texts = crate::codex_session::last_assistant_texts(&tid, msg_count).ok()?;
+        if texts.is_empty() {
+            return None;
+        }
+        result["session_id"] = json!(tid);
+        result["transcript_agent"] = json!("codex");
         Some(texts)
     });
 
@@ -7769,7 +7784,13 @@ fn finish_worker_status(
                     .map(|(id, e)| (id.clone(), e.clone()))
             });
 
-    // session_id の解決: 明示指定 > pane→session 自動解決 > フォールバック
+    // session_id の解決: 明示指定 > pane→session 自動解決 > codex の実況 > フォールバック
+    //
+    // #984: claude の一次シグナル（`claude agents --json`）が取れないペインでも、
+    // codex なら**セッションの実況が構造化ソースになる**（`$CODEX_HOME/sessions/` の
+    // rollout JSONL に `task_started` / `task_complete` が逐次書かれる。実測済み）。
+    // 画面推定へ落ちるのは「claude でも codex でもない」ときだけになる
+    let mut codex_thread: Option<String> = None;
     let (resolved_sid, status_source);
     if let Some(sid) = session_id {
         resolved_sid = Some(sid.to_string());
@@ -7780,6 +7801,10 @@ fn finish_worker_status(
             if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
                 resolved_sid = Some(sid);
                 status_source = "agents-auto";
+            } else if let Some(tid) = crate::codex_session::resolve_thread_id_for_backend(backend) {
+                codex_thread = Some(tid);
+                resolved_sid = None;
+                status_source = "codex-session";
             } else {
                 resolved_sid = None;
                 status_source = "screen";
@@ -7802,6 +7827,16 @@ fn finish_worker_status(
             normalize_agent_status(&agent.status).to_string(),
             agent.ctx_percent,
         )
+    } else if let Some(ref tid) = codex_thread {
+        // #984: rollout のターン状態。**まだ 1 ターンも走っていなければ何も言わない**
+        // （`status()` が None）。ここで idle と言うとプロンプト投入前を完了と誤認する
+        match crate::codex_session::read_turn_state(tid) {
+            Some(st) => match st.status() {
+                Some(s) => (s.to_string(), st.ctx_percent),
+                None => ("unknown".to_string(), st.ctx_percent),
+            },
+            None => ("unknown".to_string(), None),
+        }
     } else if pane_exists {
         ("unknown".to_string(), None)
     } else {
@@ -7947,8 +7982,13 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // gone → unknown へ降格 / コマンド自体が失敗 = unknown）なら、以降の根拠は画面しかない。
     // status_source を "agents*" のままにすると、画面推定の結果を watch が
     // 一次シグナル扱い（idle 連続 3 回で確定）してしまう。source を実態に合わせる
+    //
+    // #984: codex の実況（codex-session）も同じ扱い。rollout がまだ無い＝ターン未実行の
+    // ときは構造化ソースとして何も言えないので、根拠を画面へ落とす
     let mut status_source = status_source;
-    if status == "unknown" && status_source.starts_with("agents") {
+    if status == "unknown"
+        && (status_source.starts_with("agents") || status_source == "codex-session")
+    {
         status_source = "screen".to_string();
     }
 
@@ -7957,7 +7997,14 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // バックグラウンドシェル（tailscaled 等）の常駐子プロセスが IDLE 検知を
     // 永久にブロックする問題を根治する（#289）。
     // 一時的な idle（サブエージェント完了瞬間）は watch の idle_streak（3 回連続）で防ぐ
-    let agents_authoritative = status_source == "agents" || status_source == "agents-auto";
+    //
+    // #984: codex の実況も一次情報なので同じ権威を持たせる。**これを入れないと
+    // 構造化ソースを足した意味が無い**: エージェント CLI の TUI 自身がペインシェルの
+    // 子なので `has_children` は生きている限り必ず true で、idle が必ず busy へ
+    // 上書きされてしまう（#571 で claude について踏んだのと同じ形）
+    let agents_authoritative = status_source == "agents"
+        || status_source == "agents-auto"
+        || status_source == "codex-session";
     if status == "idle" {
         let screen_busy = recent_output
             .as_ref()

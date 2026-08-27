@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use tako_core::agent_support::Agent;
 
 use crate::protocol::Request;
 
@@ -1004,24 +1005,97 @@ const BUSY_WEAK_TAIL: usize = 5;
 /// 「Claude Opus 4.6 (Thinking)」（常時表示）に誤爆して永遠に busy 判定になるため、
 /// claude スピナーの実表示「Thinking…」に限定する（実機検証 2026-07-10 で発見）
 pub fn screen_looks_busy(output: &str) -> bool {
+    screen_looks_busy_for(output, detect_screen_agent(output))
+}
+
+/// 画面がどの TUI のものかを**画面自身から**見分ける（#984）。
+///
+/// 弱マーカーを agent で分けるには「いまどの CLI を見ているか」が要る。呼び出し側が
+/// 知っているなら渡してもらうのが正確だが（レジストリの `agent`）、知らない経路も
+/// あるので画面から推測できるようにしておく。**曖昧なら `None`** を返し、
+/// 呼び出し側は従来どおり和集合で判定する（推測外れで挙動が変わらない = 回帰ゼロ）。
+///
+/// 材料は実採取（#120 の表 / #984 の再採取）:
+///
+/// | 手がかり | agent |
+/// |---|---|
+/// | `esc to cancel` / `Generating` / `(Thinking)`（モデル名の括弧） | agy |
+/// | 入力欄 `›` U+203A / `Working (` | codex |
+/// | 入力欄 `❯` U+276F | claude |
+///
+/// agy を先に見るのは、`(Thinking)` が**常時表示のフッター**で誤爆源そのものだから
+/// （#120 で実測。claude の弱マーカー `Thinking…` と紛れる）
+pub fn detect_screen_agent(output: &str) -> Option<Agent> {
+    let tail = tail_lines(output, BUSY_STRONG_TAIL);
+    let has = |needle: &str| tail.iter().any(|l| l.contains(needle));
+    if has("esc to cancel") || has("Generating") || has("(Thinking)") {
+        return Some(Agent::Agy);
+    }
+    if has("Working (") || tail.iter().any(|l| l.trim_start().starts_with('›')) {
+        return Some(Agent::Codex);
+    }
+    if tail.iter().any(|l| l.trim_start().starts_with('❯')) {
+        return Some(Agent::Claude);
+    }
+    None
+}
+
+/// 画面が busy を示すか。**agent が分かっているならその CLI のマーカーだけを見る**（#984）。
+///
+/// 和集合を全 agent へ当てていたのが誤検知の構造的な原因だった。実例が
+/// agy フッターのモデル名 `Claude Opus 4.6 (Thinking)`（**常時表示**）で、
+/// claude スピナーの `Thinking…` に誤爆して worker が永遠に完了しなくなる
+/// （#120 で実測・当時は「三点リーダ付きに限定」で凌いだ）。
+/// agent 別に分ければ **agy の画面で claude のマーカーを引かない**ので構造で防げる。
+///
+/// `agent` が `None`（不明）のときは従来どおり和集合 = 挙動不変
+pub fn screen_looks_busy_for(output: &str, agent: Option<Agent>) -> bool {
     let strong = tail_lines(output, BUSY_STRONG_TAIL)
         .iter()
-        .any(|l| l.contains("esc to interrupt") || l.contains("esc to cancel") || is_spinner(l));
+        .any(|l| strong_marker(l, agent));
     if strong {
         return true;
     }
-    tail_lines(output, BUSY_WEAK_TAIL).iter().any(|l| {
-        l.contains("Generating")
-            || l.contains("Working (")
-            || l.contains("ing… (")
-            || l.contains("Thinking…")
-            || l.contains("Thinking...")
-            || l.contains("Reading")
-            || l.contains("Editing")
-            || l.contains("Running")
-            || l.contains("Writing")
-            || l.contains("Searching")
-    })
+    tail_lines(output, BUSY_WEAK_TAIL)
+        .iter()
+        .any(|l| weak_marker(l, agent))
+}
+
+/// 強マーカー（実行中にしか描画されない）。誤爆しないので広い範囲から探す。
+///
+/// **ここは agent で分けない**。誤検知の実例（#120 の 6 件）はすべて弱マーカー由来で、
+/// 強マーカーが他系統の画面へ現れた記録は無い。逆に分けると
+/// 「画面の推測を外したときに本物の busy を見落とす」新しい失敗を作ってしまう
+/// （例: claude が busy で `esc to interrupt` を出しているのに、出力本文に
+/// `esc to cancel` の文字列が混ざって agy と誤推測されると強マーカーを引けない）
+fn strong_marker(line: &str, _agent: Option<Agent>) -> bool {
+    line.contains("esc to interrupt") || line.contains("esc to cancel") || is_spinner(line)
+}
+
+/// 弱マーカー（完了後の出力にも現れる一般語）。末尾の狭い範囲だけを見る。
+///
+/// **`Thinking` を agy から外す**のがこの関数の要点（上記のフッター誤爆）
+fn weak_marker(line: &str, agent: Option<Agent>) -> bool {
+    // 3 系統に共通のツール進行語（どの CLI も英語の現在進行形で出す）
+    let common = ["Reading", "Editing", "Running", "Writing", "Searching"];
+    let hit = |set: &[&str]| set.iter().any(|m| line.contains(m));
+    match agent {
+        Some(Agent::Claude) => hit(&["Thinking…", "Thinking...", "ing… ("]) || hit(&common),
+        Some(Agent::Codex) => {
+            hit(&["Working (", "Thinking…", "Thinking...", "ing… ("]) || hit(&common)
+        }
+        // agy: "Generating" は実採取のスピナー語。Thinking 系は**引かない**
+        Some(Agent::Agy) => hit(&["Generating"]) || hit(&common),
+        _ => {
+            hit(&[
+                "Generating",
+                "Working (",
+                "ing… (",
+                "Thinking…",
+                "Thinking...",
+            ]) || hit(&common)
+        }
+    }
 }
 
 /// スピナー行（作業中にしか描画されない）か。強マーカーとして広い範囲から探す。
@@ -2872,5 +2946,209 @@ Running 1 shell command...\n\
         }
         // busy 中は停止側の判定をしない
         assert!(collect_worker_events("busy", Some(PERMISSION_SCREEN_577), None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod issue984_screen_markers {
+    use super::*;
+
+    /// agy の実画面（#120 の採取に基づく再構成）。**フッターのモデル名が常時 `(Thinking)`**。
+    /// 入力欄は ASCII `>`。これが誤検知 #1 / #2 の現場
+    const AGY_IDLE: &str = "\
+Done. I updated the config and verified the build.
+
+────────────────────────────────────────────
+> 
+────────────────────────────────────────────
+  Claude Opus 4.6 (Thinking)   ctx 12%   /help for commands";
+
+    /// agy が実際に作業中の画面（スピナー語は `Generating`・中断は `esc to cancel`）
+    const AGY_BUSY: &str = "\
+⣻ Generating...
+
+────────────────────────────────────────────
+>
+────────────────────────────────────────────
+  Claude Opus 4.6 (Thinking)   esc to cancel";
+
+    /// claude の idle 画面。**2026-08-27 に実採取**したもの
+    /// （実ユーザー名・メール・組織名はプレースホルダへ置換。#927）。
+    /// 入力欄は行頭の `❯` + プレースホルダ文で、下にフッターが 5 行続く
+    const CLAUDE_IDLE: &str = "\
+⏺ Finished the refactor.
+
+                                                    ◉ xhigh · /effort
+────────────────────────────────────────────────────────────────────
+❯ Try \"write a test for <filepath>\"
+────────────────────────────────────────────────────────────────────
+  [Opus 5 (1M context) · xH]  ▸ 2.1.232 (親: claude)
+  ctx   0% ░░░░░░░░░░
+  5h   --
+  7d   --
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+
+    /// claude が拡張思考中（`esc to interrupt` が消えスピナーだけが残る形。#571 の実採取）
+    const CLAUDE_BUSY: &str = "\
+✻ Misting… (3m 27s · ↓ 8.4k tokens · thinking with max effort)
+
+────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────
+  [Opus 5 (1M context) · xH]
+  ctx  12% █░░░░░░░░░";
+
+    /// codex の idle 画面。**2026-08-27 に codex-cli 0.150.1 で実採取**
+    /// （入力欄は行頭の `›` + プレースホルダ文。下に 1 行のフッター）
+    const CODEX_IDLE: &str = "\
+• You have 1 usage limit reset available. Run /usage to use one.
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp";
+
+    /// codex が作業中（`Working (Ns • Esc to interrupt)`。#120 の実採取）
+    const CODEX_BUSY: &str = "\
+• Working (12s • Esc to interrupt)
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · /private/tmp";
+
+    /// **agy 1.1.22 の実採取（2026-08-27）**。承諾後の idle 画面で、
+    /// `(Thinking)` が**バナーとフッターバーの 2 箇所**に出る。
+    /// これが誤検知 #1（#120）の現場そのもの。メールはプレースホルダへ置換（#927）
+    const AGY_IDLE_REAL: &str = "\
+  ▄▀▀▄        Antigravity CLI 1.1.22
+  ▀▀▀▀▀▀       testuser@example.com (Google AI Pro)
+  ▀▀▀▀▀▀▀▀      Claude Opus 4.6 (Thinking)
+  ▄▀▀    ▀▀▄     /tmp/probe
+
+────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────
+? for shortcuts                          Claude Opus 4.6 (Thinking)";
+
+    /// **agy の信頼ダイアログの実採取**。選択カーソルが `>` なので
+    /// 「入力欄がある = idle」と読める形。フッターの `(Thinking)` も出ている
+    const AGY_TRUST_REAL: &str = "\
+Accessing workspace:
+
+/tmp/probe
+
+Do you trust the contents of this project?
+
+Antigravity CLI requires permission to read, edit, and execute files here.
+
+> Yes, I trust this folder
+  No, exit
+
+  ↑/↓ Navigate · enter Confirm
+                                          Claude Opus 4.6 (Thinking)";
+
+    /// **実採取の idle 画面で busy にならない**（誤検知 #1 の回帰検査）。
+    /// `(Thinking)` が 2 箇所あっても busy にしない
+    #[test]
+    fn agyの実採取idle画面でbusyにならない() {
+        assert_eq!(detect_screen_agent(AGY_IDLE_REAL), Some(Agent::Agy));
+        assert!(
+            !screen_looks_busy(AGY_IDLE_REAL),
+            "agy の実 idle 画面で busy 判定になっている（#120 の誤検知が再発）"
+        );
+        assert!(
+            screen_looks_idle(AGY_IDLE_REAL),
+            "入力欄 > を idle と読めていない"
+        );
+        // 信頼ダイアログ待ちも busy ではない（人間 / PromptFlow の承諾待ち）
+        assert!(!screen_looks_busy(AGY_TRUST_REAL));
+    }
+
+    #[test]
+    fn 画面からagentを見分ける() {
+        assert_eq!(detect_screen_agent(AGY_IDLE), Some(Agent::Agy));
+        assert_eq!(detect_screen_agent(AGY_BUSY), Some(Agent::Agy));
+        assert_eq!(detect_screen_agent(CLAUDE_IDLE), Some(Agent::Claude));
+        assert_eq!(detect_screen_agent(CODEX_IDLE), Some(Agent::Codex));
+        assert_eq!(detect_screen_agent(CODEX_BUSY), Some(Agent::Codex));
+        // 手がかりが無ければ推測しない（呼び出し側は和集合へ落ちる）
+        assert_eq!(detect_screen_agent("$ ls\nfoo bar\n$ "), None);
+    }
+
+    /// **誤検知 #1 / #2（#120 の実測）**: agy フッターのモデル名 `(Thinking)` は
+    /// 常時表示なので、これで busy になると worker が永遠に完了しない
+    #[test]
+    fn agyのモデル名thinkingでbusyにならない() {
+        assert!(
+            !screen_looks_busy(AGY_IDLE),
+            "agy フッターの (Thinking) で busy になっている（#120 の誤検知が再発）"
+        );
+        assert!(!screen_looks_busy_for(AGY_IDLE, Some(Agent::Agy)));
+        // agent を明示しても、claude の Thinking マーカーは agy 画面へ当てない
+        let footer_only = "  Claude Opus 4.6 (Thinking)   ctx 5%";
+        assert!(!screen_looks_busy_for(footer_only, Some(Agent::Agy)));
+    }
+
+    /// agy が本当に作業中なら検知する（緩めすぎていないことの対）
+    #[test]
+    fn agyの実作業はbusyと判定する() {
+        assert!(screen_looks_busy(AGY_BUSY));
+        assert!(screen_looks_busy_for(AGY_BUSY, Some(Agent::Agy)));
+    }
+
+    /// **誤検知 #5**: ASCII `>` は PS2 プロンプト等と紛れる。
+    /// 「`>` 単独 or `> `+内容」に限る（既存仕様の固定）
+    #[test]
+    fn ascii_プロンプトの誤検知を広げない() {
+        assert!(screen_looks_idle(AGY_IDLE));
+        // 引用や比較演算子は入力欄ではない
+        assert!(!screen_looks_idle("if (a >b) {\n  return 1;\n}"));
+        assert!(!screen_looks_idle("value=>result"));
+        // PS2 の継続プロンプトは `> ` なので idle に見えるのは既存仕様どおり
+        assert!(screen_looks_idle("> "));
+    }
+
+    /// claude 経路に回帰が無いこと（受け入れ条件 3）。
+    /// **agent 別分離の前後で claude の判定が 1 つも変わらない**
+    #[test]
+    fn claude経路の判定は変わらない() {
+        assert!(screen_looks_busy(CLAUDE_BUSY));
+        assert!(screen_looks_busy_for(CLAUDE_BUSY, Some(Agent::Claude)));
+        assert!(!screen_looks_busy(CLAUDE_IDLE));
+        assert!(screen_looks_idle(CLAUDE_IDLE));
+        // claude のツール進行語は従来どおり弱マーカー
+        for w in [
+            "Reading foo.rs",
+            "Editing bar.rs",
+            "Running tests",
+            "Writing out",
+            "Searching",
+        ] {
+            assert!(
+                screen_looks_busy_for(w, Some(Agent::Claude)),
+                "{w} が busy にならない"
+            );
+        }
+        assert!(screen_looks_busy_for(
+            "✻ Thinking… (2m 1s)",
+            Some(Agent::Claude)
+        ));
+    }
+
+    #[test]
+    fn codexの実作業はbusyと判定する() {
+        assert!(screen_looks_busy(CODEX_BUSY));
+        assert!(screen_looks_busy_for(CODEX_BUSY, Some(Agent::Codex)));
+        assert!(!screen_looks_busy(CODEX_IDLE));
+        assert!(screen_looks_idle(CODEX_IDLE));
+    }
+
+    /// agent 不明のときは**従来どおり和集合**（推測外れで挙動が変わらない）
+    #[test]
+    fn agent不明なら従来の和集合() {
+        assert!(screen_looks_busy_for("✻ Thinking… (1s)", None));
+        assert!(screen_looks_busy_for("⣻ Generating...", None));
+        assert!(screen_looks_busy_for("Working (3s", None));
+        assert!(screen_looks_busy_for("esc to cancel", None));
+        assert!(screen_looks_busy_for("esc to interrupt", None));
     }
 }

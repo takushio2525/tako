@@ -361,6 +361,12 @@ pub mod notes {
         "agy is worker-only; launching it as master or solo fails before start-up (#127)",
     );
 
+    /// #984 の実物調査。agy の会話は SQLite なので読むには新しい依存が要る
+    pub const AGY_CONVERSATION_SQLITE: Note = Note::new(
+        "agy は会話を SQLite で持つため（~/.gemini/antigravity-cli/conversations/）読むには新しい依存が要る。生存は presence のロックで分かるがターンの開始・完了は取れない",
+        "agy stores conversations in SQLite (~/.gemini/antigravity-cli/conversations/), so reading them needs a new dependency; liveness is visible via its presence lock, but turn start/completion is not",
+    );
+
     /// #357 の実地調査。上限メトリクスを取り出す口が無い
     pub const AGY_NO_LIMIT_METRICS: Note = Note::new(
         "agy は利用制限の残量を表示・出力しないため取得できない（#357 で実地確認）",
@@ -659,10 +665,17 @@ pub const MATRIX: &[AgentFeature] = &[
             "The remaining context ratio can be read off the screen",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_INVESTIGATED, 984),
-        agy: pending(notes::NOT_INVESTIGATED, 984),
+        codex: degraded(Note::new(
+            "worker の状態照会では構造化ソースから ctx% が取れるが、master の自動ハンドオフは画面のパターンを見るので master 経路では未確認",
+            "The context ratio is available from the structured source for worker status queries, but the master auto-handoff reads screen patterns, so the master path is unverified",
+        )),
+        agy: pending(notes::AGY_CONVERSATION_SQLITE, 984),
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Unverified,
+        evidence: AgentEvidence::Measured(
+            "#984: rollout の token_count に last_token_usage.total_tokens と \
+             model_context_window があり、worker_status の ctx_percent へ載せた（実測で 8%）。\
+             master の #749 は terminal.rs の画面パターンを見る別経路なのでそこは未確認",
+        ),
     },
     AgentFeature {
         key: keys::MASTER_HANDOFF,
@@ -1022,7 +1035,10 @@ pub const MATRIX: &[AgentFeature] = &[
         local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
         evidence: AgentEvidence::Measured(
             "#357: codex の primary / secondary NN% はスクレイピング実装済みだが有料プラン \
-             限定で未実測、agy は v1.1.4 の実地調査で取得不能と確定（再確認は #985）",
+             限定で未実測、agy は v1.1.4 の実地調査で取得不能と確定（再確認は #985）。\
+             **#984 の副産物**: codex の rollout JSONL の token_count イベントに \
+             rate_limits.primary.used_percent / window_minutes / resets_at が構造化されて \
+             入っている（実測）ので、画面スクレイピングに頼らず取れる。配線は #985",
         ),
     },
     AgentFeature {
@@ -1107,12 +1123,13 @@ pub const MATRIX: &[AgentFeature] = &[
             "Reports can be pulled from the structured transcript (second layer of #364)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 984),
-        agy: pending(notes::NOT_WIRED, 984),
+        codex: S::Supported,
+        agy: pending(notes::AGY_CONVERSATION_SQLITE, 984),
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
-            "dispatch.rs のコメントどおり transcript アダプタは claude のみで、\
-             同じ場所が「将来 codex 等を追加する拡張点」と宣言されている",
+        evidence: AgentEvidence::Measured(
+            "#984 で codex アダプタを実装。rollout JSONL の response_item（role=assistant）を \
+             読むので `report --messages N` が codex でも実データを返す。応答の \
+             transcript_agent でどちらを読んだか分かる。agy は会話が SQLite なので未対応",
         ),
     },
     AgentFeature {
@@ -1137,13 +1154,16 @@ pub const MATRIX: &[AgentFeature] = &[
             "Determines whether the agent is working or done",
         ),
         claude: S::Supported,
-        codex: degraded(notes::SCREEN_ONLY_STATUS),
-        agy: degraded(notes::SCREEN_ONLY_STATUS_AGY),
+        codex: S::Supported,
+        agy: degraded(notes::SCREEN_ONLY_STATUS),
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
-            "dispatch.rs のコメントが「agents シグナルの無い worker（codex / agy…）は \
-             画面推定で busy / idle を判定する」と明示し、wait.rs の need_streak が \
-             画面経路だけ 8 回を要求する",
+        evidence: AgentEvidence::Measured(
+            "#984: codex は構造化ソース（codex-session）を得たので need_streak が 8 → 3 に \
+             なり claude と同じ確定速度になる。同一タスクの A/B 実測（primes 25 個）で \
+             before = source=screen / ctx=None / **開始前の t=3s・6s に idle を出す**、\
+             after = t=9s から source=codex-session で busy を 2 標本とも捉え t=15s から \
+             idle + ctx=8。agy は画面推定のままだが、弱マーカーを agent 別に分離したので \
+             (Thinking) 型の誤爆は構造的に起こらない（残る差は確定までの回数だけ）",
         ),
     },
     AgentFeature {
@@ -1153,12 +1173,15 @@ pub const MATRIX: &[AgentFeature] = &[
             "State is available from a primary signal that does not depend on the screen (equivalent to `claude agents --json`)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_INVESTIGATED, 984),
-        agy: pending(notes::NOT_INVESTIGATED, 984),
+        codex: S::Supported,
+        agy: pending(notes::AGY_CONVERSATION_SQLITE, 984),
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
-            "WorkerAgent::has_agents_api() が claude だけ true。codex / agy に同等の出口 \
-             （codex mcp・ローカル DB・agy inspect 等）があるかは未調査（棚卸し §8 の S3）",
+        evidence: AgentEvidence::Measured(
+            "#984 で codex-cli 0.150.1 を実物調査: $CODEX_HOME/sessions/ の rollout JSONL に \
+             task_started / task_complete が**逐次**書かれる（250 語生成を 1 秒刻みで観測: \
+             t=1s 開始 → t=27s 完了）。tako は status_source=codex-session として読む。\
+             agy は会話が SQLite（~/.gemini/antigravity-cli/conversations/<id>.db）で、\
+             生存は presence/<id>.lock で分かるがターンの開始・完了は取れない",
         ),
     },
     AgentFeature {
@@ -1434,11 +1457,15 @@ mod tests {
         assert_eq!(support_for(Agent::Agy, "存在しない能力"), None);
     }
 
-    /// `has_agents_api()` が吸収された先。**claude だけが構造化シグナルを持つ**
+    /// 構造化された状態の出口を持つ系統（`has_structured_status` の参照先）。
+    ///
+    /// #982 の時点では claude だけだったが、**#984 で codex も持つことが分かった**
+    /// （rollout JSONL の `task_started` / `task_complete`。実測）。
+    /// agy は会話が SQLite なので未対応
     #[test]
-    fn 構造化シグナルはclaudeだけ() {
+    fn 構造化シグナルはclaudeとcodex() {
         assert!(supports(Agent::Claude, keys::WORKER_STATUS_STRUCTURED));
-        assert!(!supports(Agent::Codex, keys::WORKER_STATUS_STRUCTURED));
+        assert!(supports(Agent::Codex, keys::WORKER_STATUS_STRUCTURED));
         assert!(!supports(Agent::Agy, keys::WORKER_STATUS_STRUCTURED));
         assert!(!supports(Agent::Local, keys::WORKER_STATUS_STRUCTURED));
     }

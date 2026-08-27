@@ -3509,3 +3509,28 @@
   クロスチェックの警告リストが main と完全一致 / 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`
 - 次: 変更 2 / 3（送達観測手段の無い agent を `NotApplicable` のまま黙らせない・系統の網羅）は
   #982（agent 能力マトリクス）の merge 後
+
+## 2026-08-27（#984: codex worker の状態監視を claude 同等へ）
+- **棚卸しの前提が覆った**: 「codex に status API は無い」は **0.144.1 時点**の調査で、
+  **0.150.1 には構造化された出口がある**。`$CODEX_HOME/sessions/**/rollout-*.jsonl` に
+  `task_started` / `task_complete` / `token_count` / assistant 発話が**逐次**書かれる
+  （250 語生成を 1 秒刻みで観測: t=1s 開始 → t=27s 完了）
+- `codex_session` 新設（純粋パーサ + sticky 解決）。`status_source=codex-session` を足したので
+  `need_streak` が 8 → 3。**`agents_authoritative` へ含めるのが要点**（含めないと TUI 自身が
+  ペインの子である以上 `has_children` に idle を潰されて意味が無い = #571 と同じ形）
+- ペイン → セッションの写像は **`thread-writer-locks/<thread_id>.lock` を開いている pid**
+  （実測。rollout 本体は開いたままにしない）。`lsof` は 40〜70ms なので 1 ペイン 1 回 + sticky
+- report 第 2 層に codex アダプタ（`report --messages` が codex で効く。応答の `transcript_agent`）
+- 弱マーカーを agent 別に分離（**強マーカーは和集合のまま** = 推測外れで本物の busy を
+  見落とさない）。画面から agent を推測するので呼び出し 6 箇所の signature を変えずに効く
+- **A/B 実測**（同一タスク・隔離インスタンス）: before(`TAKO_984_LEGACY=1`) = `source=screen` /
+  `ctx=None` / **開始前の t=3s・6s に idle を出す**、after = t=9s から `codex-session` で
+  busy を 2 標本とも捉え t=15s から idle + `ctx=8`
+- 途中で踏んだ実装バグ: 器のペイン ID は **`session:window.pane`** 形式なので素の等値では
+  必ず外れる（`pane_pid=None` を診断で観測 → 接頭辞判定へ。claude 側と同じ規則）
+- `has_agents_api`（claude 固有）と `has_structured_status`（汎用・マトリクス参照）へ**意味を分離**。
+  #982 では同義だったが codex が別の構造化ソースを持つので分けた
+- 副産物: rollout の `token_count` に `rate_limits.primary.used_percent` / `resets_at` がある
+  = **#357 が未実測に残した codex の limit メトリクス**。#985 へコメントで申し送り
+- 事故: `tako orchestrator projects add` は**ローカル処理**なので CLI 側にも `TAKO_DATA_DIR` が
+  必要。付け忘れて本番 projects.yaml へ probe を書いた（即除去・diff で 2 行のみを確認）

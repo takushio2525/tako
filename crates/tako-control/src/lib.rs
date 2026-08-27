@@ -30,6 +30,7 @@ pub mod agent_support;
 pub mod agents;
 pub mod agents_sync;
 pub mod claude_tui;
+pub mod codex_session;
 pub mod config_io;
 pub mod config_share;
 pub mod delivery;

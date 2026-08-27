@@ -1090,7 +1090,27 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 **変更 2（送達観測手段が無い agent の `NotApplicable` を FR-2.29 のマトリクスから引く）と
 変更 3（系統の網羅）は未実装**（#982 が入ったので着手可能になった。Issue #983 に残タスクとして記録）。
 
-FR-2.8〜2.30 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
+### FR-2.31 codex worker の状態監視を claude 同等へ（✅ 2026-08-27、#984。エピック #975）
+
+> 「codex worker は不安定」という体感の正体は**完了検知の遅さと誤爆**だった。
+> claude だけが一次シグナル（`claude agents --json`）を持ち、他系統は画面推定に落ちるため
+> 確定に要する連続一致が 8 回（claude は 3 回）で、さらに弱マーカーを全系統の和集合で
+> 当てていたので `(Thinking)` 型の誤爆が起こりうる状態だった。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.31.1 | **codex の構造化された状態を読む**。`$CODEX_HOME/sessions/**/rollout-<ts>-<thread_id>.jsonl` の `task_started` / `task_complete` を一次シグナルとし、`status_source` に `codex-session` を足す。`need_streak` は既存の「画面推定以外は 3」規則にそのまま乗る | M | ✅ |
+| FR-2.31.2 | **一次シグナルは権威**。`codex-session` も `agents` / `agents-auto` と同じく `has_children` で覆さない。エージェント CLI の TUI 自身がペインシェルの子なので、これを外すと idle が必ず busy へ上書きされ構造化ソースの意味が消える（#571 で claude について踏んだ形） | M | ✅ |
+| FR-2.31.3 | **ターン未実行なら何も言わない**。rollout が無い / ターンのイベントが 0 件のときは `status` を `unknown` にし `status_source` を `screen` へ降格する。ここで idle と言うとプロンプト投入前を完了と誤認する | M | ✅ |
+| FR-2.31.4 | **解決は 1 ペイン 1 回**。ペイン → codex プロセス → 開いているロック（`thread-writer-locks/<thread_id>.lock`）で thread_id を引く。`lsof` は 40〜70ms かかるので sticky に持ち、ペインが消えたら捨てる（#772 / #779 / #816 で削った subprocess を戻さない） | M | ✅ |
+| FR-2.31.5 | **弱マーカーを agent 別に分離**する。和集合を全系統へ当てるのをやめ、`(Thinking)`（agy フッターのモデル名・常時表示）を agy の判定から構造的に外す。**強マーカーは和集合のまま**（誤検知の実例はすべて弱マーカー由来で、分けると推測外れ時に本物の busy を見落とす） | M | ✅ |
+| FR-2.31.6 | codex の transcript アダプタ。rollout の `response_item`（`role == "assistant"`）を読み `orchestrator report --messages N` が codex でも実データを返す。応答の `transcript_agent` でどちらを読んだか分かる | M | ✅ |
+| FR-2.31.7 | agy は画面推定のまま。会話が SQLite（`~/.gemini/antigravity-cli/conversations/<id>.db`）で読むには新しい依存が要るため、可否と理由を能力マトリクス（FR-2.29）へ根拠つきで載せる | M | ✅ |
+
+`TAKO_984_LEGACY=1` で構造化ソースを無効化し画面推定のみ（旧挙動）へ戻せる。
+実測は Issue #984 のコメント（同一タスクの A/B と 3 系統の比較）。
+
+FR-2.8〜2.31 はいずれも設計原則 5（AI フルコントロール）の不変条件に従い、
 対応する MCP / CLI 操作（表示・読み取り・応答送信）を同時に提供する。
 提示系の体験は FR-2.7（AI 成果物プレゼンテーション）と一体で設計する。
 
