@@ -967,13 +967,13 @@ fn configure_agent_mcp(agents: &[DetectedAgent]) -> Result<(), String> {
         }
     }
 
+    let tako_bin = tako_control::dispatch::resolve_tako_binary();
     for agent in agents {
         let kind = match agent.kind {
             SetupAgent::Codex => tako_control::orchestrator::agent::WorkerAgent::Codex,
             SetupAgent::Agy => tako_control::orchestrator::agent::WorkerAgent::Agy,
             SetupAgent::Claude => continue,
         };
-        let tako_bin = tako_control::dispatch::resolve_tako_binary();
         match tako_control::agent_mcp::register(kind, &tako_bin) {
             Ok(result) if !result.configured => {
                 eprintln!("  [OK] {} MCP: tako が登録済み", kind.as_str());
@@ -2170,17 +2170,29 @@ pub fn run_check() -> Result<(), String> {
             SetupAgent::Claude => continue,
         };
         let name = kind.as_str();
-        match tako_control::agent_mcp::current_registration(kind) {
-            Some(cmd) if std::path::Path::new(&cmd).is_file() => {
-                eprintln!("  [OK] {name} MCP: tako が登録済み");
-            }
-            Some(cmd) => {
+        use tako_control::agent_mcp::McpState;
+        match tako_control::agent_mcp::state(kind) {
+            McpState::Ready { .. } => eprintln!("  [OK] {name} MCP: tako が登録済み"),
+            McpState::Dead { command } => {
                 eprintln!("  [警告] {name} MCP: 登録済みだがパスが消失しています");
-                eprintln!("         登録パス: {cmd}");
+                eprintln!("         登録パス: {command}");
                 eprintln!("         tako setup または tako setup-mcp で修復できます");
             }
-            None => {
+            // 登録行はあるのに env の転送が無い = ツールが 0 個になる（#979 の実測）。
+            // 「未登録」と混ぜると原因を追えないので別の文言にする
+            McpState::EnvMissing { .. } => {
+                eprintln!(
+                    "  [警告] {name} MCP: 登録済みだが tako と通信する env の転送設定がありません"
+                );
+                eprintln!("         そのままだとツールが 0 個になります");
+                eprintln!("         tako setup-mcp --agent {name} で入れ直せます");
+            }
+            McpState::NotRegistered => {
                 eprintln!("  [不足] {name} MCP: tako が未登録（tako setup-mcp で登録できます）")
+            }
+            // CLI は検出できているので Unknown は「一覧を読めなかった」だけ
+            McpState::Unknown => {
+                eprintln!("  [警告] {name} MCP: 登録状態を確認できません（{name} mcp list を手で確認してください）")
             }
         }
     }
@@ -2615,17 +2627,13 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
             SetupAgent::Agy => tako_control::orchestrator::agent::WorkerAgent::Agy,
             SetupAgent::Claude => continue,
         };
-        let registered = tako_control::agent_mcp::current_registration(kind);
-        if tako_control::agent_mcp::registration_is_alive(registered.as_deref()) {
-            continue;
-        }
+        let state = tako_control::agent_mcp::state(kind);
+        let Some(gap) = state.describe_gap() else {
+            continue; // 使える or 判定できない = プランに出さない
+        };
         plan.push_if_changed(
             format!("{} MCP", kind.as_str()),
-            Some(if registered.is_some() {
-                "登録パス消失"
-            } else {
-                "未登録"
-            }),
+            Some(gap),
             "tako を登録",
             SetupValueSource::Default,
         );

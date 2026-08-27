@@ -18,14 +18,26 @@
 //!   起動できない）。claude と違いフォールバックの直書きは用意せず、
 //!   **未導入は分類済みエラー**にして次の一手を出す（#979 スコープ 3）
 //!
-//! ## 到達手段の限界（既知・docs にも書く）
+//! ## env の引き継ぎ（ここが成否を分ける。実測 2026-08-27）
 //!
-//! MCP 子プロセスへ per-pane の env（`TAKO_PANE_ID` 等）を渡す仕組みは
-//! agy には無く（`env` は静的 map だけ）、codex も `mcp add` からは
-//! `env_vars` 許可リストを設定できない。ただし `tako mcp serve` は
-//! `TAKO_SOCKET` / `TAKO_TOKEN` が無ければ discovery（control.json + 生存確認）へ
-//! 落ちるので、**ツール呼び出し自体は env なしで通る**。省略されるのは
-//! 「呼び出し元ペインの既定解決」だけで、pane を明示すれば全操作できる。
+//! `tako mcp serve` は **`TAKO_SOCKET` + `TAKO_TOKEN` が env に無いと 0 ツールを返す**
+//! （FR-2.3.2「tako 外で 0 ツール」。discovery ファイルは意図的に見ない）。
+//! つまり「登録できたか」ではなく「MCP 子プロセスへ env が届くか」で決まる。
+//! env を吐くだけの偽 MCP サーバーを両 CLI に登録して実測した結果:
+//!
+//! - **agy は親プロセスの env をそのまま渡す**（`TAKO_SOCKET` / `TAKO_TOKEN` /
+//!   `TAKO_PANE_ID` / `TAKO_TAB_ID` / `TAKO_ORCHESTRATOR_ROLE` が届いた）。
+//!   登録に env を書く必要はない
+//! - **codex は既定で 1 つも渡さない**（偽サーバーが見た TAKO_* はゼロ件）。
+//!   `env_vars` 許可リストに名前を並べると、並べたものだけが届く（実測）
+//!
+//! `env_vars` は**値ではなく名前**の列なので、ペインごとに違う値のまま正しく届き、
+//! **トークンを設定ファイルへ書き残さない**（`--env KEY=VALUE` の静的 map だと
+//! `~/.gemini/config/mcp_config.json` のような 644 のファイルへ token が載る）。
+//! `codex mcp add` には `env_vars` を書くフラグが無く、しかも**再 add で
+//! 既存の `env_vars` を消す**（実測）ので、順序は「`codex mcp add` → `env_vars` を
+//! 1 行足す → `codex mcp list --json` で届いたか確認」。行の挿入だけなので
+//! ファイルの他の部分はバイト単位でそのまま残る。
 
 use std::path::PathBuf;
 
@@ -151,6 +163,24 @@ pub struct AgentMcpResult {
     pub command: String,
 }
 
+/// codex の MCP 子プロセスへ転送する env の名前（`env_vars` 許可リスト）。
+///
+/// **`tako mcp serve` が実際に読むものだけ**を並べる（`main.rs` の `mcp_serve` /
+/// `caller_pane`）。値ではなく名前なので、ペインごとに違う値がそのまま届き、
+/// 設定ファイルへトークンを書き残さない
+pub const CODEX_FORWARD_ENV: &[&str] = &[
+    "TAKO_SOCKET",
+    "TAKO_TOKEN",
+    "TAKO_PANE_ID",
+    "TAKO_ORCHESTRATOR_ROLE",
+];
+
+/// このエージェントで `env_vars` 相当の明示指定が必要か。
+/// agy は親 env をそのまま渡すので不要（実測）
+pub fn needs_env_allowlist(agent: WorkerAgent) -> bool {
+    matches!(agent, WorkerAgent::Codex)
+}
+
 /// 導入の案内先（`SetupAgent::install_hint` と同じ内容を CLI 非依存の場所に置く）
 pub fn install_hint(agent: WorkerAgent) -> &'static str {
     match agent {
@@ -241,6 +271,79 @@ pub fn codex_registered_command(listing_json: &str) -> Option<String> {
     })
 }
 
+/// `codex mcp list --json` の出力から tako の `env_vars` を読む（純粋関数）
+pub fn codex_registered_env_vars(listing_json: &str) -> Vec<String> {
+    let Ok(items) = serde_json::from_str::<serde_json::Value>(listing_json) else {
+        return Vec::new();
+    };
+    let Some(arr) = items.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .find(|item| item.get("name").and_then(|n| n.as_str()) == Some(SERVER_NAME))
+        .and_then(|item| item.get("transport")?.get("env_vars")?.as_array().cloned())
+        .map(|v| {
+            v.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 必要な env の名前がすべて許可リストに入っているか（純粋関数）
+pub fn env_allowlist_covers(registered: &[String], needed: &[&str]) -> bool {
+    needed
+        .iter()
+        .all(|n| registered.iter().any(|r| r.as_str() == *n))
+}
+
+/// TOML の `[mcp_servers.<name>]` セクションへ `env_vars = [...]` を足す / 差し替える（純粋関数）。
+///
+/// **セクション見出しの直後に 1 行入れる / 既存の 1 行を置き換える**だけなので、
+/// ファイルの他の部分（コメント・並び順・他サーバー）はバイト単位でそのまま残る。
+/// TOML ライブラリで読み書きすると CLI 側の正規化と二重にずれるのでそれはしない。
+/// セクションが見つからなければ `None`（呼び出し側が「反映されていない」として扱う）
+pub fn upsert_env_vars_toml(text: &str, server: &str, vars: &[&str]) -> Option<String> {
+    let header = format!("[mcp_servers.{server}]");
+    let rendered = format!(
+        "env_vars = [{}]",
+        vars.iter()
+            .map(|v| format!("\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut inserted = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // 別のセクションへ移る = 対象セクションは終わり
+            in_section = trimmed == header;
+            out.push(line.to_string());
+            if in_section {
+                out.push(rendered.clone());
+                inserted = true;
+            }
+            continue;
+        }
+        // 対象セクション内の既存 env_vars 行は落とす（上で入れ直したものが正）
+        if in_section && trimmed.starts_with("env_vars") {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if !inserted {
+        return None;
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
 /// agy の `mcp_config.json` から tako の command を読む（純粋関数）。
 /// 形は実測（2026-08-27）: `{ "mcpServers": { "tako": { "command": "...", "args": [...] } } }`
 pub fn agy_registered_command(config_json: &str) -> Option<String> {
@@ -277,24 +380,80 @@ fn run(
     })
 }
 
-/// 現在の登録 command を CLI / 設定ファイルから読む。読めなければ None
-fn read_registration(agent: WorkerAgent, bin: &str) -> Option<String> {
+/// いまの登録内容（command と転送 env）。読めなければ command は None
+#[derive(Debug, Default, Clone)]
+struct Registration {
+    command: Option<String>,
+    env_vars: Vec<String>,
+}
+
+impl Registration {
+    /// このまま使えるか = command が実在し、必要な env の転送も揃っている
+    fn is_usable(&self, agent: WorkerAgent, tako_binary: &str) -> bool {
+        if self.command.as_deref() != Some(tako_binary) {
+            return false;
+        }
+        if !registration_is_alive(self.command.as_deref()) {
+            return false;
+        }
+        !needs_env_allowlist(agent) || env_allowlist_covers(&self.env_vars, CODEX_FORWARD_ENV)
+    }
+}
+
+/// 現在の登録を CLI / 設定ファイルから読む
+fn read_registration(agent: WorkerAgent, bin: &str) -> Registration {
     match agent {
         WorkerAgent::Codex => {
-            let out = run(agent, bin, &list_args(agent)).ok()?;
+            let Ok(out) = run(agent, bin, &list_args(agent)) else {
+                return Registration::default();
+            };
             if !out.status.success() {
-                return None;
+                return Registration::default();
             }
-            codex_registered_command(&String::from_utf8_lossy(out.stdout.as_slice()))
+            let listing = String::from_utf8_lossy(out.stdout.as_slice()).to_string();
+            Registration {
+                command: codex_registered_command(&listing),
+                env_vars: codex_registered_env_vars(&listing),
+            }
         }
-        // agy の `mcp list` は表形式（列幅がバージョンで動く）なので設定 JSON を読む
+        // agy の `mcp list` は表形式（列幅がバージョンで動く）なので設定 JSON を読む。
+        // agy は親 env をそのまま渡すので env_vars は空のままでよい（実測）
         WorkerAgent::Agy => {
-            let path = config_path(agent)?;
-            let content = std::fs::read_to_string(path).ok()?;
-            agy_registered_command(&content)
+            let Some(path) = config_path(agent) else {
+                return Registration::default();
+            };
+            let Ok(content) = std::fs::read_to_string(path) else {
+                return Registration::default();
+            };
+            Registration {
+                command: agy_registered_command(&content),
+                env_vars: Vec::new(),
+            }
         }
-        WorkerAgent::Claude => None,
+        WorkerAgent::Claude => Registration::default(),
     }
+}
+
+/// codex の `[mcp_servers.tako]` へ `env_vars` を足す。
+/// `codex mcp add` にはこれを書くフラグが無く、**再 add で消える**ので add の後に呼ぶ
+fn apply_env_allowlist(agent: WorkerAgent) -> Result<(), AgentMcpError> {
+    if !needs_env_allowlist(agent) {
+        return Ok(());
+    }
+    let path = config_path(agent).ok_or(AgentMcpError::NotReflected { agent })?;
+    let text = std::fs::read_to_string(&path).map_err(|e| AgentMcpError::Spawn {
+        agent,
+        detail: format!("{} を読めない: {e}", path.display()),
+    })?;
+    let updated = upsert_env_vars_toml(&text, SERVER_NAME, CODEX_FORWARD_ENV)
+        .ok_or(AgentMcpError::NotReflected { agent })?;
+    if updated == text {
+        return Ok(());
+    }
+    std::fs::write(&path, updated).map_err(|e| AgentMcpError::Spawn {
+        agent,
+        detail: format!("{} へ書けない: {e}", path.display()),
+    })
 }
 
 /// codex / agy へ tako MCP サーバーを登録する。
@@ -309,25 +468,24 @@ pub fn register(agent: WorkerAgent, tako_binary: &str) -> Result<AgentMcpResult,
         .ok_or(AgentMcpError::CliNotFound { agent })?;
 
     let existing = read_registration(agent, &bin);
-    if registration_is_alive(existing.as_deref()) {
-        // 既存が同じパスを指していればもう何もしない。別のパスでも「生きている」なら
-        // 利用者が意図して別ビルドを向けている可能性があるので、tako 自身の
-        // パスと違うときだけ付け替える
-        if existing.as_deref() == Some(tako_binary) {
-            return Ok(AgentMcpResult {
-                agent,
-                configured: false,
-                already_existed: true,
-                repaired: false,
-                old_command: None,
-                target_path: config_path(agent),
-                command: tako_binary.to_string(),
-            });
-        }
+    if existing.is_usable(agent, tako_binary) {
+        return Ok(AgentMcpResult {
+            agent,
+            configured: false,
+            already_existed: true,
+            repaired: false,
+            old_command: None,
+            target_path: config_path(agent),
+            command: tako_binary.to_string(),
+        });
     }
 
-    let old_command = existing.filter(|c| !c.is_empty());
-    let repaired = old_command.is_some();
+    let old_command = existing.command.clone().filter(|c| !c.is_empty());
+    // 「登録はあるが command が死んでいた」ときだけ修復扱い。env の転送が
+    // 足りないだけ（旧 tako が入れた登録）は付け替えではないので repaired にしない
+    let repaired = old_command
+        .as_deref()
+        .is_some_and(|c| !registration_is_alive(Some(c)));
 
     let args = add_args(agent, tako_binary);
     let out = run(agent, &bin, &args)?;
@@ -345,15 +503,15 @@ pub fn register(agent: WorkerAgent, tako_binary: &str) -> Result<AgentMcpResult,
             },
         });
     }
+    // add の後（add は env_vars を消す）
+    apply_env_allowlist(agent)?;
 
-    // 書けたと言われても本当に一覧へ出るかを確認する（無言死させない。#979 スコープ 3）
-    match read_registration(agent, &bin) {
-        Some(cmd) if cmd == tako_binary => {}
-        // 読めない = 判定材料が無いだけなので成功として扱う（agy の設定ファイルが
-        // 別の場所に移った将来のバージョン等）。登録が効いていないときは
-        // codex のように一覧が読める側で NotReflected が出る
-        None => {}
-        Some(_) => return Err(AgentMcpError::NotReflected { agent }),
+    // 書けたと言われても本当に効いているかを確認する（無言死させない。#979 スコープ 3）。
+    // command が読めない = 判定材料が無いだけなので成功として扱うが、
+    // 読めたのに食い違う・env の転送が欠けるなら NotReflected
+    let after = read_registration(agent, &bin);
+    if after.command.is_some() && !after.is_usable(agent, tako_binary) {
+        return Err(AgentMcpError::NotReflected { agent });
     }
 
     Ok(AgentMcpResult {
@@ -367,23 +525,70 @@ pub fn register(agent: WorkerAgent, tako_binary: &str) -> Result<AgentMcpResult,
     })
 }
 
-/// いま登録されている command を返す（`tako setup` のプラン表示・診断用）。
-/// CLI が無い / 未登録 / 読めないときは None
-pub fn current_registration(agent: WorkerAgent) -> Option<String> {
-    if !handled_here(agent) {
-        return None;
-    }
-    let bin = tako_core::platform::exe::find(agent.as_str())?;
-    read_registration(agent, &bin)
+/// いまの登録状態（`tako setup` のプラン表示・`--check` の診断用）。
+///
+/// **`EnvMissing` を分けているのが要点**: 登録行があっても env の転送が欠けていれば
+/// `tako mcp serve` は 0 ツールを返すので、「未登録」とも「使える」とも言えない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpState {
+    /// この経路の対象でない（claude）/ CLI 未導入 / 読み取れない
+    Unknown,
+    /// tako の登録が無い
+    NotRegistered,
+    /// 登録はあるが command のパスが実在しない
+    Dead { command: String },
+    /// 登録はあるが env の転送指定が足りない（= ツールが 0 個になる）
+    EnvMissing { command: String },
+    /// そのまま使える
+    Ready { command: String },
 }
 
-/// この環境に導入済みで、この経路で登録できるエージェントを列挙する
-pub fn detected_agents() -> Vec<WorkerAgent> {
-    WorkerAgent::ALL
-        .into_iter()
-        .filter(|a| handled_here(*a))
-        .filter(|a| tako_core::platform::exe::find(a.as_str()).is_some())
-        .collect()
+impl McpState {
+    /// 登録行に書かれている command（あれば）
+    pub fn command(&self) -> Option<&str> {
+        match self {
+            Self::Dead { command } | Self::EnvMissing { command } | Self::Ready { command } => {
+                Some(command)
+            }
+            Self::Unknown | Self::NotRegistered => None,
+        }
+    }
+
+    /// このままツールが見える状態か
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// 「なぜ使えないか」の短い説明（`tako setup` のプラン表示用。None = 説明不要）
+    pub fn describe_gap(&self) -> Option<&'static str> {
+        match self {
+            Self::NotRegistered => Some("未登録"),
+            Self::Dead { .. } => Some("登録パス消失"),
+            Self::EnvMissing { .. } => Some("env 転送なし"),
+            Self::Unknown | Self::Ready { .. } => None,
+        }
+    }
+}
+
+/// いまの登録状態を読む（CLI を 1 回だけ起こす）
+pub fn state(agent: WorkerAgent) -> McpState {
+    if !handled_here(agent) {
+        return McpState::Unknown;
+    }
+    let Some(bin) = tako_core::platform::exe::find(agent.as_str()) else {
+        return McpState::Unknown;
+    };
+    let reg = read_registration(agent, &bin);
+    let Some(command) = reg.command.filter(|c| !c.is_empty()) else {
+        return McpState::NotRegistered;
+    };
+    if !registration_is_alive(Some(&command)) {
+        return McpState::Dead { command };
+    }
+    if needs_env_allowlist(agent) && !env_allowlist_covers(&reg.env_vars, CODEX_FORWARD_ENV) {
+        return McpState::EnvMissing { command };
+    }
+    McpState::Ready { command }
 }
 
 #[cfg(test)]
@@ -529,6 +734,143 @@ mod tests {
             .any(|p| p.ends_with("mcp_config.json") && p.to_string_lossy().contains(".gemini")));
         assert!(paths.iter().any(|p| p.ends_with("config.toml")));
         assert!(paths.iter().any(|p| p.ends_with(".claude.json")));
+    }
+
+    #[test]
+    fn 転送するenvはmcpブリッジが読むものだけ() {
+        // `tako mcp serve` が読むのは SOCKET / TOKEN / PANE_ID / ORCHESTRATOR_ROLE。
+        // 値ではなく名前を並べるので、設定ファイルへトークンが残らない
+        assert_eq!(
+            CODEX_FORWARD_ENV,
+            &[
+                "TAKO_SOCKET",
+                "TAKO_TOKEN",
+                "TAKO_PANE_ID",
+                "TAKO_ORCHESTRATOR_ROLE"
+            ]
+        );
+        assert!(CODEX_FORWARD_ENV.iter().all(|v| !v.contains('=')));
+        // codex だけが許可リストを要る（agy は親 env をそのまま渡す = 実測）
+        assert!(needs_env_allowlist(WorkerAgent::Codex));
+        assert!(!needs_env_allowlist(WorkerAgent::Agy));
+        assert!(!needs_env_allowlist(WorkerAgent::Claude));
+    }
+
+    #[test]
+    fn codexの一覧jsonからenv_varsを読む() {
+        let listing = r#"[{"name":"tako","transport":{"type":"stdio","command":"/x/tako","args":["mcp","serve"],"env":null,"env_vars":["TAKO_SOCKET","TAKO_TOKEN"],"cwd":null}}]"#;
+        assert_eq!(
+            codex_registered_env_vars(listing),
+            vec!["TAKO_SOCKET".to_string(), "TAKO_TOKEN".to_string()]
+        );
+        // 実測どおり `env_vars: []` が既定
+        let empty = r#"[{"name":"tako","transport":{"command":"/x/tako","env_vars":[]}}]"#;
+        assert!(codex_registered_env_vars(empty).is_empty());
+        assert!(codex_registered_env_vars("[]").is_empty());
+        assert!(codex_registered_env_vars("not json").is_empty());
+    }
+
+    #[test]
+    fn 許可リストの被覆判定は部分集合では通らない() {
+        let full: Vec<String> = CODEX_FORWARD_ENV.iter().map(|s| s.to_string()).collect();
+        assert!(env_allowlist_covers(&full, CODEX_FORWARD_ENV));
+        // 余計なものが混ざっていても通る（ユーザーが足したものを消さない）
+        let mut extra = full.clone();
+        extra.push("MY_OWN".into());
+        assert!(env_allowlist_covers(&extra, CODEX_FORWARD_ENV));
+        // 1 つ欠けたら通さない = 0 ツールになる登録を「登録済み」と言わない
+        let short: Vec<String> = full[..full.len() - 1].to_vec();
+        assert!(!env_allowlist_covers(&short, CODEX_FORWARD_ENV));
+        assert!(!env_allowlist_covers(&[], CODEX_FORWARD_ENV));
+    }
+
+    #[test]
+    fn env_varsの挿入は他の行をバイト単位で保つ() {
+        // 実測の形（codex mcp add 直後）+ ユーザーのコメントと別サーバー
+        let text = "# 大事なコメント\nmodel = \"gpt-5.6\"\n\n[mcp_servers.other]\ncommand = \"/bin/true\"\n\n[mcp_servers.tako]\ncommand = \"/x/tako\"\nargs = [\"mcp\", \"serve\"]\n";
+        let out = upsert_env_vars_toml(text, "tako", &["A", "B"]).expect("tako セクションがある");
+        assert!(out.contains("env_vars = [\"A\", \"B\"]"), "{out}");
+        // 対象セクション以外は 1 文字も変わらない
+        assert!(out.starts_with("# 大事なコメント\nmodel = \"gpt-5.6\"\n\n[mcp_servers.other]\ncommand = \"/bin/true\"\n"), "{out}");
+        assert!(out.contains("args = [\"mcp\", \"serve\"]"));
+        assert!(out.ends_with('\n'), "末尾改行を保つ");
+        // 2 回目は同じ結果（冪等）= 行が増えない
+        let again = upsert_env_vars_toml(&out, "tako", &["A", "B"]).unwrap();
+        assert_eq!(again, out);
+        assert_eq!(again.matches("env_vars").count(), 1);
+    }
+
+    #[test]
+    fn env_varsの挿入は既存の値を差し替える() {
+        let text = "[mcp_servers.tako]\nenv_vars = [\"OLD\"]\ncommand = \"/x/tako\"\n";
+        let out = upsert_env_vars_toml(text, "tako", &["NEW"]).unwrap();
+        assert!(out.contains("env_vars = [\"NEW\"]"), "{out}");
+        assert!(!out.contains("OLD"), "{out}");
+        assert_eq!(out.matches("env_vars").count(), 1);
+    }
+
+    #[test]
+    fn 対象セクションが無ければnoneで反映失敗を伝える() {
+        let text = "[mcp_servers.other]\ncommand = \"/bin/true\"\n";
+        assert!(upsert_env_vars_toml(text, "tako", &["A"]).is_none());
+        assert!(upsert_env_vars_toml("", "tako", &["A"]).is_none());
+        // 隣のセクションの env_vars は消さない
+        let text =
+            "[mcp_servers.other]\nenv_vars = [\"KEEP\"]\n\n[mcp_servers.tako]\ncommand = \"/x\"\n";
+        let out = upsert_env_vars_toml(text, "tako", &["A"]).unwrap();
+        assert!(out.contains("env_vars = [\"KEEP\"]"), "{out}");
+        assert!(out.contains("env_vars = [\"A\"]"), "{out}");
+    }
+
+    #[test]
+    fn 使えるかの判定はcommandとenv転送の両方を見る() {
+        let me = std::env::current_exe().unwrap().display().to_string();
+        let full: Vec<String> = CODEX_FORWARD_ENV.iter().map(|s| s.to_string()).collect();
+
+        // codex: env の転送が揃って初めて「使える」
+        let ok = Registration {
+            command: Some(me.clone()),
+            env_vars: full.clone(),
+        };
+        assert!(ok.is_usable(WorkerAgent::Codex, &me));
+        let no_env = Registration {
+            command: Some(me.clone()),
+            env_vars: Vec::new(),
+        };
+        assert!(!no_env.is_usable(WorkerAgent::Codex, &me));
+        // agy は env を要らない
+        assert!(no_env.is_usable(WorkerAgent::Agy, &me));
+        // 死んだパス・別のパスは使えない
+        let dead = Registration {
+            command: Some("/gone/tako".into()),
+            env_vars: full,
+        };
+        assert!(!dead.is_usable(WorkerAgent::Codex, &me));
+        assert!(!Registration::default().is_usable(WorkerAgent::Agy, &me));
+    }
+
+    #[test]
+    fn 登録状態はenv転送の欠落を未登録と混ぜない() {
+        assert_eq!(McpState::Unknown.command(), None);
+        assert_eq!(McpState::NotRegistered.describe_gap(), Some("未登録"));
+        let dead = McpState::Dead {
+            command: "/gone".into(),
+        };
+        assert_eq!(dead.command(), Some("/gone"));
+        assert_eq!(dead.describe_gap(), Some("登録パス消失"));
+        let env_missing = McpState::EnvMissing {
+            command: "/x/tako".into(),
+        };
+        // 「登録はあるが 0 ツール」を「未登録」と言わない
+        assert_eq!(env_missing.describe_gap(), Some("env 転送なし"));
+        assert!(!env_missing.is_ready());
+        let ready = McpState::Ready {
+            command: "/x/tako".into(),
+        };
+        assert!(ready.is_ready());
+        assert_eq!(ready.describe_gap(), None);
+        // claude はこの経路の対象外
+        assert_eq!(state(WorkerAgent::Claude), McpState::Unknown);
     }
 
     #[test]

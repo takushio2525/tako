@@ -19,13 +19,15 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 
 ## 対応エージェントと登録先
 
-| エージェント | 書き込み先 | 手段 | 呼び出し元ペインの自動特定 |
+| エージェント | 書き込み先 | 手段 | 環境変数の渡し方 |
 |---|---|---|---|
-| claude | `~/.claude.json` / `<cwd>/.mcp.json` | `claude mcp add` | ○（環境変数を継承する） |
-| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` | ×（許可リスト外の環境変数を渡さない） |
-| agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | ×（静的な指定のみ） |
+| claude | `~/.claude.json` / `<cwd>/.mcp.json` | `claude mcp add` | そのまま継承する |
+| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 | 転送する変数名を書いたものだけ |
+| agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | そのまま継承する |
 
-codex / agy でペインの自動特定が効かないのは、両 CLI が MCP 子プロセスへ per-pane の環境変数（`TAKO_PANE_ID` 等）を素通しできないためです。`tako mcp serve` は接続情報が無ければ稼働中の tako を自力で見つけるので**ツール呼び出しそのものは通り**、`pane` を明示すればすべての操作ができます。
+tako の MCP サーバーは、**tako の中から起動されたこと**を環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してから 128 個のツールを公開します。tako の外で立ち上がったエージェントに画面操作をさせないための線引きです（後述の[アクセス制御](#アクセス制御)）。
+
+そのため codex の登録には、転送する変数名の一覧（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE`）も一緒に書き込みます。**書くのは変数名だけで、トークンは設定ファイルに残りません。**ペインごとに違う値がそのまま届くので、「どのペインから呼ばれたか」もこれまでどおり解決されます。
 
 ## 128 個の MCP ツール
 

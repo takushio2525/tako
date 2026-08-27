@@ -274,7 +274,7 @@ claude と、この環境に導入済みの codex / agy へ tako の MCP サー�
 
 1 つに絞りたいときは `tako setup-mcp --agent codex` のように指定します（未導入の CLI を明示すると、理由と次の一手つきのエラーになります）。`tako setup-mcp --project` は claude のみ対応で、現在のディレクトリの `.mcp.json` だけに登録します。
 
-なお codex / agy では、MCP ツールでペインを省略したときの「呼び出し元ペイン」が解決されません（両 CLI が MCP 子プロセスへ環境変数を素通しできないため）。ツール呼び出し自体は通るので、`pane` を明示すればすべての操作ができます。
+codex には、tako と通信するための環境変数を MCP サーバーへ渡す設定（変数名の一覧）も一緒に書き込まれます。トークンそのものは書き込まれません。
 
 ## 4. 動作確認
 
@@ -329,7 +329,7 @@ claude / codex / agy のいずれも PATH にありません。使う CLI を導
 1. `tako setup --check` でエージェント別の MCP 状態を確認
 2. 未登録のものがあれば `tako setup-mcp` を実行（claude / codex / agy をまとめて登録します）
 3. エージェントを一度終了し、**tako の中のターミナルで**起動し直す（tako の外からは安全のため tako を操作できません）
-4. codex はツールが見えていてもペインの自動特定が効きません。`pane` を明示するか、`tako master` から起動してください
+4. codex で見えないままなら `codex mcp list` を確認してください。`tako` の `env_vars` に `TAKO_SOCKET` / `TAKO_TOKEN` が並んでいないと 0 ツールになります（`tako setup-mcp --agent codex` で入れ直せます）
 
 ### tako 起動時にクラッシュする / 開けない
 

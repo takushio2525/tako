@@ -189,13 +189,19 @@ tako setup-mcp --project         # 現在のディレクトリだけに登録（
 | エージェント | 書き込み先 | 手段 |
 |---|---|---|
 | claude | `~/.claude.json`（`--project` 時は `<cwd>/.mcp.json`） | `claude mcp add`（無ければ JSON を直接マージ） |
-| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` |
+| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 |
 | agy | `~/.gemini/config/mcp_config.json` の `mcpServers.tako` | `agy mcp add` |
 
 codex / agy は各 CLI の `mcp add` に書き込みを任せています。自分で TOML / JSON を書くと CLI 側の正規化と二重にずれるため、利用者が手で `codex mcp add` を打ったのと同じ結果になる経路へ寄せてあります。何度実行しても設定は同じ内容に収束します（`--project` は codex / agy が対応していないので、明示指定すると理由を出して止まります）。
 
-:::note[codex / agy では呼び出し元ペインの自動特定が効きません]
-tako の MCP ツールでペインを省略したときの「呼び出し元ペイン」は環境変数（`TAKO_PANE_ID`）で決まります。codex は MCP 子プロセスへ渡す環境変数を許可リストで絞り、agy は静的な指定しか持たないため、この 2 つでは省略時の既定ペインが解決されません。`tako mcp serve` は接続情報が無ければ稼働中の tako を自力で見つけるので**ツール呼び出し自体は通ります**。`pane` を明示すればすべての操作ができます。
+:::note[codex は環境変数の転送設定も一緒に入ります]
+tako の MCP サーバーは、tako の中から起動されたことを環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してからツールを公開します。agy は MCP サーバーへ環境変数をそのまま渡すので登録だけで足りますが、codex は既定で 1 つも渡しません。そのため codex の登録には転送する変数名の一覧（`env_vars`）も一緒に書き込みます。**変数名だけを書くので、トークンが設定ファイルに残ることはありません。**
+
+`codex mcp add` はこの一覧を上書きで消してしまうため、`tako setup-mcp` は登録のあとに書き足し、`codex mcp list` で反映を確認します。確認できなければ理由つきのエラーになります。
+:::
+
+:::caution[各 CLI が設定ファイル全体を書き直します]
+`codex mcp add` / `agy mcp add` は設定ファイルを自分の書式で書き戻します。コメントや項目の並びは保たれますが、`args = []` のような空の項目が消えたり、数値の書き方（`120` → `120.0`）や環境変数の並び順が変わることがあります。意味は変わりません（各 CLI を手で叩いたときと同じ結果です）。
 :::
 
 ### tako update

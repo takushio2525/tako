@@ -1277,7 +1277,9 @@ pub fn tools() -> Vec<Value> {
                 登録する（未導入は理由つきで skip）。agent を明示したときだけ、\
                 その CLI が未導入・非対応スコープなら分類済みエラーで止まる。\
                 書き込み先は claude = ~/.claude.json、codex = codex mcp add\
-                （~/.codex/config.toml）、agy = agy mcp add（~/.gemini/config/mcp_config.json）。\
+                （~/.codex/config.toml。tako と通信する env の転送設定 env_vars も一緒に書く。\
+                値ではなく変数名だけなのでトークンは残らない）、\
+                agy = agy mcp add（~/.gemini/config/mcp_config.json。env はそのまま継承される）。\
                 scope=global（既定）はユーザーグローバル、scope=project は\
                 呼び出し元ペインの cwd の .mcp.json に書き込む（claude のみ対応）。\
                 旧バージョンが ~/.claude/settings.json に書いた無効な設定は自動で掃除する。\

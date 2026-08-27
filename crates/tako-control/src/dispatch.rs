@@ -8558,11 +8558,9 @@ pub fn setup_mcp_agents(
     };
     let targets: Vec<WorkerAgent> = match explicit {
         Some(a) => vec![a],
-        None => {
-            let mut v = vec![WorkerAgent::Claude];
-            v.extend(agent_mcp::detected_agents());
-            v
-        }
+        // 未導入の CLI も列挙して「なぜ登録されていないか」を応答に残す
+        // （黙って消すと AI / 利用者が原因を追えない。#979 スコープ 3）
+        None => WorkerAgent::ALL.to_vec(),
     };
 
     let tako_bin = resolve_tako_binary();
