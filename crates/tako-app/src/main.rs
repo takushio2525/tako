@@ -9895,7 +9895,11 @@ impl TakoApp {
         // `push_preview_remote_sync` / `push_preview_remote_async` が SFTP で書き戻す。
         // どちらも通らない経路を作ると「キャッシュを編集して保存できた気になる」
         // （リモートには何も書かれない）事故に戻る
-        if enabled && self.preview_remote_read_only.contains(&pane_id) {
+        if enabled
+            && (self.preview_remote_read_only.contains(&pane_id)
+                || (Self::remote_edit_legacy()
+                    && self.preview_remote_origins.contains_key(&pane_id)))
+        {
             return Err(crate::ui_text::remote_folder::preview_read_only().into());
         }
         if enabled && !self.preview_edits.contains_key(&pane_id) {
@@ -9954,6 +9958,13 @@ impl TakoApp {
     }
 
     // --- リモートファイルの書き戻し（#966） ---------------------------------
+
+    /// `TAKO_966_LEGACY=1` で **#919 段階 1 の挙動**（リモートは読み取り専用・
+    /// 書き戻しをしない）へ戻す。同一バイナリで A/B を取るための入口で、
+    /// セルフテスト項目 123 (g) の検出力の実証にも使う
+    fn remote_edit_legacy() -> bool {
+        std::env::var_os("TAKO_966_LEGACY").is_some()
+    }
 
     /// このペインのプレビューがリモート由来ならその位置
     fn preview_remote_ref(&self, pane_id: PaneId) -> Option<tako_core::remote_fs::RemoteRef> {
@@ -10036,6 +10047,9 @@ impl TakoApp {
     /// なので同じ扱いにしてある。**AI が応答だけで「リモートへ書けたか」を判断できる**
     /// ことのほうが重要（GUI 側は `push_preview_remote_async` で待たない）
     fn push_preview_remote_sync(&mut self, pane_id: PaneId, force: bool) -> Result<(), String> {
+        if Self::remote_edit_legacy() {
+            return Ok(());
+        }
         let Some(remote) = self.preview_remote_ref(pane_id) else {
             return Ok(());
         };
@@ -10054,6 +10068,9 @@ impl TakoApp {
     /// 1 バッチ 1〜2 秒。⌘S ごとに固まると #212 / #772 と同じ体感の悪化になる）。
     /// 進行中にもう一度保存されたら、終わってから 1 回だけ押し直す（積み上げない）
     fn push_preview_remote_async(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if Self::remote_edit_legacy() {
+            return;
+        }
         let Some(remote) = self.preview_remote_ref(pane_id) else {
             return;
         };
