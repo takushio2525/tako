@@ -64,7 +64,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_collapse_tab` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |
 | `tako_pin_tab_title` | 対応 | — | 実機セルフテスト: 項目 51b（自動命名直後の「この名前を固定」） |
 | `tako_confirm_close` | 対応 | — | 実機セルフテスト: 項目 73a〜73f（確認ダイアログの表示・Esc・Enter・即 close） |
-| `tako_auto_rename` | 一部対応 | タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#722） | 実機セルフテスト: 項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#722） |
+| `tako_auto_rename` | 一部対応 | AI 命名は動くが、シェル統合が無い（#525）ためタブの素材（cwd / タイトル / 実行状態）が起動後に変化せず、命名はタブごとに 1 回だけになる。claude を導入していない環境ではタブ名が PowerShell の実行ファイルパスになる（#760） | 実機実測: #722 の Windows 11 実測: 隔離 GUI で AI 経路が走りタブ名が AI 由来（同素材のヒューリスティックは PowerShell のパス由来で別物）。セルフテスト項目 51 / 52（適用・手動優先・ON/OFF）も緑。残る縮退は #760 の実測（素材が不変なので 2 回目以降が発火しない） |
 | `tako_autosuggest` | 対象外 | Windows の PowerShell は PSReadLine の予測入力を標準搭載しているため、tako 側の注入は要らない | OS の仕様: PowerShell が PSReadLine の予測入力を標準搭載しているので注入する対象が無い（セルフテスト項目 41c / 41c-2 は zsh 不在で自動スキップ） |
 | `tako_window` | 対応 | — | 実機セルフテスト: 項目 77（window new → move-tab）+ #872 で 0 枚化の寿命を Windows 向けに実装（項目 79b） |
 | `tako_menu` | 対応 | — | 実機セルフテスト: 項目 118（in-window メニューバー #657 の open / invoke / close） |
