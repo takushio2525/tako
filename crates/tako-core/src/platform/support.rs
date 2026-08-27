@@ -1388,7 +1388,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: `tako setup-mcp` が claude の設定へ tako を登録（旧内容は backups へ退避）し、`claude mcp list` が tako … `tako.exe mcp serve` を Connected と健康判定する",
+            "#937 の Windows 11 実測: `tako setup-mcp` が claude の設定（スクラッチ HOME 側）へ tako を登録し旧内容を backups へ退避する。別途、実 HOME の登録に対して `claude mcp list` が `tako.exe mcp serve` を Connected と健康判定したので、stdio ブリッジ自体も Windows で通る",
         ),
     },
     Feature {
