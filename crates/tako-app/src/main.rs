@@ -5729,7 +5729,18 @@ impl TakoApp {
     /// worker が素のプロンプトのまま何時間も止まる
     fn drive_command_flows(&mut self) {
         let mut remaining = Vec::new();
+        // 同一ペインへ複数フローが重なると本文と Enter が混線するため、先行フローが
+        // 完了するまで後続は待たせる（Vec の順序 = 送信順。`drive_prompt_flows` と同型）。
+        // #1006 で「ssh の行 → 接続後の cd」を同じペインへ 2 本積むようになった
+        let mut active_panes: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+        let now = std::time::Instant::now();
         for mut entry in std::mem::take(&mut self.command_flows) {
+            if active_panes.contains(&entry.pane) {
+                // 待っている間は時計も止める（フロー自体はまだ始まっていない）
+                entry.created_at = now;
+                remaining.push(entry);
+                continue;
+            }
             if entry.created_at.elapsed() > COMMAND_FLOW_TIMEOUT {
                 eprintln!(
                     "warning: 起動コマンドの送達フローがタイムアウト（pane={}, {}）",
@@ -5747,6 +5758,7 @@ impl TakoApp {
             }
             // セッションがまだ起動していない / 既に閉じた場合は次 tick へ持ち越す
             let Some(session) = self.terminals.get(&entry.pane) else {
+                active_panes.insert(entry.pane);
                 remaining.push(entry);
                 continue;
             };
@@ -5778,6 +5790,7 @@ impl TakoApp {
                     entry.flow.command_len()
                 ));
             }
+            active_panes.insert(entry.pane);
             remaining.push(entry);
         }
         self.command_flows = remaining;
@@ -8511,6 +8524,14 @@ impl TakoApp {
     }
 
     fn open_ssh_palette(&mut self, cx: &mut Context<Self>) {
+        self.open_ssh_palette_for(None, cx);
+    }
+
+    /// SSH ホスト選択を開く（#1006）。
+    ///
+    /// `into_pane` を渡すと、選んだホストで**そのペイン自体を SSH 化する**
+    /// （ペインの右クリックメニュー経由）。`None` は現在タブへ新ペインで開く
+    fn open_ssh_palette_for(&mut self, into_pane: Option<PaneId>, cx: &mut Context<Self>) {
         let hosts = match tako_core::ssh_config::default_ssh_config_path() {
             Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
             None => Vec::new(),
@@ -8518,7 +8539,7 @@ impl TakoApp {
         self.command_palette = Some(CommandPalette {
             query: String::new(),
             selected: 0,
-            mode: PaletteMode::SshHost(hosts),
+            mode: PaletteMode::SshHost { hosts, into_pane },
         });
         cx.notify();
     }
@@ -8540,10 +8561,10 @@ impl TakoApp {
         // SSH ホスト選択モード
         if let Some(ref palette) = self.command_palette {
             match &palette.mode {
-                PaletteMode::SshHost(hosts) => {
+                PaletteMode::SshHost { hosts, into_pane } => {
                     let items: Vec<PaletteItem> = hosts
                         .iter()
-                        .map(|h| PaletteItem::SshHost(h.clone()))
+                        .map(|h| PaletteItem::SshHost(h.clone(), *into_pane))
                         .collect();
                     return if q.is_empty() {
                         items
@@ -8775,8 +8796,8 @@ impl TakoApp {
                 }
                 _ => {}
             },
-            PaletteItem::SshHost(host) => {
-                self.open_ssh_host(host, cx);
+            PaletteItem::SshHost(host, into_pane) => {
+                self.open_ssh_host(host, into_pane, cx);
             }
             PaletteItem::Recent(entry) => {
                 self.open_recent_entry(entry, cx);
@@ -8906,31 +8927,45 @@ impl TakoApp {
         cx.notify();
     }
 
-    fn open_ssh_host(&mut self, host: tako_core::ssh_config::SshHost, cx: &mut Context<Self>) {
-        let cmd = host.ssh_command();
-        let tab_title = format!("ssh:{}", host.name);
-        let pane = tako_core::Pane::new(tako_core::PaneOrigin::User);
-        let pane_id = pane.id();
-        let tab_id = self.workspace.create_tab(tab_title.clone(), pane);
-        if let Some(tab) = self.workspace.get_tab_mut(tab_id) {
-            tab.set_title_manual(tab_title);
-        }
-        self.attach_session(
-            pane_id,
-            tako_core::SpawnOptions {
-                command: Some(tako_core::SpawnCommand {
-                    program: cmd[0].clone(),
-                    args: cmd[1..].to_vec(),
-                }),
-                ..Default::default()
+    /// SSH ホストへ接続する（#20 / #919 / #1006）。
+    ///
+    /// **dispatch を通す**のが要点（#1006 で直した）。以前はここが独自に `ssh` を
+    /// ペインのプログラムとして spawn していたため、GUI 経路だけ #919 の契約
+    /// （接続前バナー・ConnectTimeout・失敗の理由を画面に残す）が効かず、
+    /// 到達不能なホストではタブごと消えていた。CLI / MCP と同じ 1 本を通せば
+    /// 開き先の既定（現在タブへ新ペイン）も自動的に揃う
+    fn open_ssh_host(
+        &mut self,
+        host: tako_core::ssh_config::SshHost,
+        into_pane: Option<PaneId>,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match into_pane {
+            Some(_) => tako_core::remote_open::RemoteOpenTarget::Pane,
+            None => tako_core::remote_open::RemoteOpenTarget::Split,
+        };
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::OpenRemote {
+                host: host.name.clone(),
+                focus: Some(true),
+                remote_dir: None,
+                target: Some(target),
+                pane: into_pane.map(|p| p.as_u64()),
+                tab: None,
+                direction: None,
             },
+            PaneOrigin::User,
         );
+        // 断られた理由（素のシェルでないペイン等）はユーザーに見せる。
+        // 黙って何も起きないのが #1006 で一番避けたい挙動
+        if let Err(e) = result {
+            // 断られた理由（素のシェルでないペイン等）はユーザーに見せる。
+            // 黙って何も起きないのが #1006 で一番避けたい挙動。
+            // 置き場はサイドバー上部の通知（#919 が接続失敗に使っているのと同じ面）
+            self.set_remote_notice(format!("{e}"), true);
+        }
         self.scroll_active_tab_into_view();
-
-        let mut recent = tako_core::recent::RecentList::load();
-        recent.push(tako_core::recent::RecentEntry::Ssh { host: host.name });
-        recent.save();
-
         cx.notify();
     }
 
@@ -8973,7 +9008,8 @@ impl TakoApp {
                         port: None,
                     },
                 );
-                self.open_ssh_host(ssh_host, cx);
+                // Recent から開く経路も既定の開き先（現在タブへ新ペイン）に従う
+                self.open_ssh_host(ssh_host, None, cx);
             }
         }
     }
@@ -19646,30 +19682,33 @@ impl TakoApp {
             .flat_map(|t| t.tree().panes())
             .find(|p| p.id() == pane_id)
             .map(|p| p.limit_autoresume());
+        // #1006: このペインをそのまま SSH にできるか（dispatch と同じ判定を通す）
+        let can_ssh_this_pane = !is_preview
+            && tako_core::remote_open::can_ssh_pane(
+                self.terminals.contains_key(&pane_id),
+                // 器つきペインの外側 alt screen は常に true なので中身を見る（#694 / #1006）
+                self.pane_inner_alt_screen(pane_id),
+                self.terminals
+                    .get(&pane_id)
+                    .map(|s| s.command_state())
+                    .unwrap_or_default(),
+                self.workspace
+                    .tabs()
+                    .iter()
+                    .flat_map(|t| t.tree().panes())
+                    .find(|p| p.id() == pane_id)
+                    .and_then(|p| p.role()),
+            )
+            .is_ok();
         // ファイルマネージャの呼び名は OS で変わる（#617）
         let fm = tako_control::platform::os_integration::file_manager();
-        let mut items: Vec<(&str, &str)> = Vec::new();
-        if is_preview {
-            items.push(("copy-path", ui_text::pane_menu::copy_path()));
-            items.push(("reveal", ui_text::pane_menu::reveal(fm)));
-            items.push(("open-default", ui_text::pane_menu::open_default()));
-            items.push(("sep1", ""));
-        } else if cwd.is_some() {
-            items.push(("copy-cwd", ui_text::pane_menu::copy_cwd()));
-            items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd(fm)));
-            items.push(("sep1", ""));
-        }
-        items.push(("split-right", ui_text::pane_menu::split_right()));
-        items.push(("split-down", ui_text::pane_menu::split_down()));
-        // 上限後の自動復帰トグル（#813。ターミナルペインのみ = プレビューには上限が無い）
-        if let Some(on) = limit_resume_on.filter(|_| !is_preview) {
-            items.push(("sep-limit", ""));
-            items.push(("limit-resume", ui_text::pane_menu::limit_resume_toggle(on)));
-        }
-        items.push(("sep2", ""));
-        items.push(("bg", ui_text::pane_menu::background()));
-        items.push(("close", ui_text::pane_menu::close()));
-
+        let items = pane_context_menu_items(PaneMenuFacts {
+            is_preview,
+            has_cwd: cwd.is_some(),
+            limit_resume: limit_resume_on,
+            can_ssh: can_ssh_this_pane,
+            file_manager: fm,
+        });
         let pctx_menu_width: f32 = 200.0;
         let pctx_item_height: f32 = 20.0;
         let pctx_sep_height: f32 = 5.0;
@@ -19767,6 +19806,10 @@ impl TakoApp {
                                 // 属性は layout.json へ載るので、ここで保存して再起動に備える
                                 this.save_layout();
                             }
+                            // #1006: ホスト選択へ進み、選んだらこのペイン自体を SSH 化する
+                            "connect-remote" => {
+                                this.open_ssh_palette_for(Some(pane_id), cx);
+                            }
                             "split-right" => {
                                 this.split_pane_button(pane_id, SplitDirection::Right, cx);
                             }
@@ -19810,6 +19853,57 @@ impl TakoApp {
             .child(menu);
         Some(backdrop.into_any_element())
     }
+}
+
+/// ペインの右クリックメニューを組む材料（#1006 で純粋関数へ切り出した）。
+///
+/// 項目の出し分けは「このペインで何ができるか」で決まるので、**GUI を立てずに
+/// 検査できる形**にしてある（メニューに出た項目が実際には断られる、という食い違いを
+/// テストで止めるのが目的）
+pub(crate) struct PaneMenuFacts {
+    /// プレビューペイン（ターミナルではない）
+    pub is_preview: bool,
+    /// cwd が分かっている（OSC 7 を受け取っている）
+    pub has_cwd: bool,
+    /// 上限後の自動復帰の現在値（ターミナルペインのみ Some。#813）
+    pub limit_resume: Option<bool>,
+    /// このペインをそのまま SSH にできる（`remote_open::can_ssh_pane` の結果。#1006）
+    pub can_ssh: bool,
+    /// ファイルマネージャの呼び名（#617）
+    pub file_manager: tako_control::platform::os_integration::FileManager,
+}
+
+/// ペインの右クリックメニューの項目（id, 表示名）。`sep*` は区切り線
+pub(crate) fn pane_context_menu_items(facts: PaneMenuFacts) -> Vec<(&'static str, &'static str)> {
+    let fm = facts.file_manager;
+    let mut items: Vec<(&'static str, &'static str)> = Vec::new();
+    if facts.is_preview {
+        items.push(("copy-path", ui_text::pane_menu::copy_path()));
+        items.push(("reveal", ui_text::pane_menu::reveal(fm)));
+        items.push(("open-default", ui_text::pane_menu::open_default()));
+        items.push(("sep1", ""));
+    } else if facts.has_cwd {
+        items.push(("copy-cwd", ui_text::pane_menu::copy_cwd()));
+        items.push(("reveal-cwd", ui_text::pane_menu::reveal_cwd(fm)));
+        items.push(("sep1", ""));
+    }
+    items.push(("split-right", ui_text::pane_menu::split_right()));
+    items.push(("split-down", ui_text::pane_menu::split_down()));
+    // #1006: このペインを SSH にする。**素のシェルのペインだけ**に出す
+    // （判定は dispatch と同じ純粋関数 = メニューに出た項目は必ず通る）。
+    // 全画面 TUI・実行中・AI エージェント・プレビューでは出さない
+    if facts.can_ssh {
+        items.push(("connect-remote", ui_text::pane_menu::connect_remote()));
+    }
+    // 上限後の自動復帰トグル（#813。ターミナルペインのみ = プレビューには上限が無い）
+    if let Some(on) = facts.limit_resume.filter(|_| !facts.is_preview) {
+        items.push(("sep-limit", ""));
+        items.push(("limit-resume", ui_text::pane_menu::limit_resume_toggle(on)));
+    }
+    items.push(("sep2", ""));
+    items.push(("bg", ui_text::pane_menu::background()));
+    items.push(("close", ui_text::pane_menu::close()));
+    items
 }
 
 /// 文字数ベースの単純な切り詰め（タブ表示名用）
@@ -19924,7 +20018,13 @@ struct CommandPalette {
 enum PaletteMode {
     #[default]
     Normal,
-    SshHost(Vec<tako_core::ssh_config::SshHost>),
+    /// SSH ホスト選択。`into_pane` があるとき、選んだホストで**そのペイン自体を
+    /// SSH 化する**（#1006。ペインの右クリック「このペインでリモート接続…」）。
+    /// `None` はファイルメニュー / パレット経由 = 現在タブへ新ペインで開く
+    SshHost {
+        hosts: Vec<tako_core::ssh_config::SshHost>,
+        into_pane: Option<PaneId>,
+    },
     RecentItems(Vec<tako_core::recent::RecentEntry>),
     /// 「リモートからフォルダを開く」のホスト選択（#919）。
     /// `SshHost` と分けるのは、選んだあとの遷移先が違うため（SSH ペインではなくフォルダ選択へ）
@@ -19943,8 +20043,8 @@ enum PaletteItem {
     Pane(PaneId, String, String),
     /// 固定コマンド（表示名, 実行内容の識別子）
     Command(&'static str, &'static str),
-    /// SSH ホスト
-    SshHost(tako_core::ssh_config::SshHost),
+    /// SSH ホスト（`Option<PaneId>` = SSH 化する既存ペイン。#1006）
+    SshHost(tako_core::ssh_config::SshHost, Option<PaneId>),
     /// Recent エントリ
     Recent(tako_core::recent::RecentEntry),
     /// 「リモートからフォルダを開く」のホスト（#919）
@@ -19960,7 +20060,7 @@ impl PaletteItem {
         match self {
             PaletteItem::Pane(_, tab, name) => format!("{tab} \u{203A} {name}"),
             PaletteItem::Command(label, _) => (*label).to_string(),
-            PaletteItem::SshHost(h) => {
+            PaletteItem::SshHost(h, _) => {
                 let mut s = h.name.clone();
                 if let Some(ref hostname) = h.hostname {
                     s.push_str(&format!(" ({hostname})"));
@@ -55077,6 +55177,227 @@ mod self_test {
                 notify_and_draw(any, window, cx);
             }
 
+            // 131. SSH の開き方 2 点（#1006）。
+            //
+            // 実 SSH 先には依存させない（宛先は解決できないホスト固定）。ここで守るのは
+            // **構造**だけ: ①ファイルメニュー経路が「新タブ」ではなく**いまのタブの
+            // 新ペイン**で開く ②ペインメニュー経路は**同じペイン**へ ssh を打つ
+            //（pane ID が変わらない = 受け入れ条件）。実際に繋がるかは
+            // `remote_fs_e2e -- --ignored` と実機確認が受け持つ
+            {
+                let host1006 = "selftest-nonexistent-1006";
+                let mk_host = || tako_core::ssh_config::SshHost {
+                    name: host1006.to_string(),
+                    hostname: None,
+                    user: None,
+                    port: None,
+                };
+
+                // (a) 既定の開き先 = 現在タブへ新ペイン（#1006 受け入れ条件 3）
+                let (tabs_before, panes_before, tab_before) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let tab = app.workspace.active_tab_id();
+                        (
+                            app.workspace.tabs().len(),
+                            app.workspace
+                                .get_tab(tab)
+                                .map(|t| t.tree().panes().len())
+                                .unwrap_or(0),
+                            tab.as_u64(),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
+                let (tabs_after, panes_after, tab_after, new_pane) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.open_ssh_host(mk_host(), None, cx);
+                        let tab = app.workspace.active_tab_id();
+                        let panes = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().panes().len())
+                            .unwrap_or(0);
+                        let focused = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().focused().as_u64())
+                            .unwrap_or(0);
+                        (app.workspace.tabs().len(), panes, tab.as_u64(), focused)
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+                check(
+                    tabs_after == tabs_before
+                        && tab_after == tab_before
+                        && panes_after == panes_before + 1,
+                    &format!(
+                        "131: ファイルメニュー経路は現在タブへ新ペインで開く \
+                         (#1006。tabs={tabs_before}->{tabs_after} tab={tab_before}->{tab_after} \
+                         panes={panes_before}->{panes_after})"
+                    ),
+                );
+                // 検証で作ったペインは畳む（ssh が失敗して入力待ちで止まるため）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(PaneId::from_raw(new_pane), CloseOrigin::Internal, cx);
+                });
+                notify_and_draw(any, window, cx);
+
+                // (b) ペインメニュー経路は**そのペイン自体**を SSH にする（受け入れ条件 2）。
+                //     ペインも増えず、pane ID も変わらず、送るのは送達確認つきの 1 行。
+                //     対象は**この項目で作った素のシェル**にする（他の項目の影響で
+                //     フォーカス中ペインが TUI・実行中になっていると結果が揺れるため）
+                let probe_pane = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        // 分割元は明示する（dispatch は呼び出し元ペインが無いと
+                        // `Request::Split` を NoTargetPane で断る）
+                        let base = app
+                            .workspace
+                            .get_tab(app.workspace.active_tab_id())
+                            .map(|t| t.tree().focused().as_u64());
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: base,
+                                tab: None,
+                                direction: None,
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64());
+                        // PTY を**この場で**立てる（項目 99 と同じ作法。
+                        // `attach_session` は pending_attach へ積むだけなので、
+                        // 待ち時間に頼るとフレーム都合で結果が揺れる）
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane.unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                // シェルがプロンプトを出すまで少し待つ（判定材料がセッション由来）
+                wait(cx, 800).await;
+                // なぜ対象になる / ならないのかを診断に残す（#796 の作法。
+                // 「送られなかった」だけでは原因が TUI か実行中か role か分からない）
+                let probe_facts = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let pane = PaneId::from_raw(probe_pane);
+                        let has = app.terminals.contains_key(&pane);
+                        // 外側（器の alt screen = 常に true）と中身を**両方**出す。
+                        // 判定に使うのは中身（#694 / #1006 の罠）
+                        let outer = app.terminals.get(&pane).is_some_and(|s| s.is_alt_screen());
+                        let inner = app.pane_inner_alt_screen(pane);
+                        let backend = app.backend_sessions.contains_key(&pane);
+                        let state = app
+                            .terminals
+                            .get(&pane)
+                            .map(|s| s.command_state())
+                            .unwrap_or_default();
+                        format!(
+                            "has_session={has} backend={backend} outer_alt={outer} \
+                             inner_alt={inner} state={state:?}"
+                        )
+                    })
+                    .unwrap_or_default();
+                let (same_pane, panes_kept, tabs_kept, flow_line) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let tab = app.workspace.active_tab_id();
+                        let pane = PaneId::from_raw(probe_pane);
+                        let panes = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().panes().len())
+                            .unwrap_or(0);
+                        let tabs = app.workspace.tabs().len();
+                        app.open_ssh_host(mk_host(), Some(pane), cx);
+                        let after_panes = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().panes().len())
+                            .unwrap_or(0);
+                        let still_here = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().panes().iter().any(|p| p.id() == pane))
+                            .unwrap_or(false);
+                        let line = app
+                            .command_flows
+                            .iter()
+                            .find(|f| f.pane == pane)
+                            .map(|f| f.flow.command_len())
+                            .unwrap_or(0);
+                        // 実際に ssh へ繋ぎ始めないよう、積んだフローは落とす
+                        app.command_flows.retain(|f| f.pane != pane);
+                        (
+                            still_here,
+                            after_panes == panes,
+                            app.workspace.tabs().len() == tabs,
+                            line,
+                        )
+                    })
+                    .unwrap_or((false, false, false, 0));
+                // 検証用ペインを閉じる
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(PaneId::from_raw(probe_pane), CloseOrigin::Internal, cx);
+                });
+                let probe_notice = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.remote_notice.as_ref().map(|n| n.text.clone())
+                    })
+                    .unwrap_or_default();
+                check(
+                    same_pane && panes_kept && tabs_kept && flow_line > 0,
+                    &format!(
+                        "131: ペインメニュー経路は同じペインを SSH にする \
+                         (#1006。same_pane={same_pane} panes_kept={panes_kept} \
+                         tabs_kept={tabs_kept} queued_len={flow_line} \
+                         pane={probe_pane} {probe_facts} notice={probe_notice:?})"
+                    ),
+                );
+
+                // (c) 素のシェルでないペインは断る（メニューにも出さないが、
+                //     選択中に状態が変わる競合のための最後の砦）。理由が通知へ出る
+                let (refused, notice) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let ghost = PaneId::from_raw(999_131);
+                        app.remote_notice = None;
+                        app.open_ssh_host(mk_host(), Some(ghost), cx);
+                        let notice = app.remote_notice.as_ref().map(|n| n.text.clone());
+                        let flows = app.command_flows.iter().any(|f| f.pane == ghost);
+                        app.remote_notice = None;
+                        (!flows, notice)
+                    })
+                    .unwrap_or((false, None));
+                check(
+                    refused && notice.is_some(),
+                    &format!(
+                        "131: 対象にできないペインは理由を出して何も送らない \
+                         (#1006。sent_nothing={refused} notice={notice:?})"
+                    ),
+                );
+
+                // (d) CLI / MCP と 1:1（開き先の語彙が同じ表から来ている）
+                let vocab_ok = tako_core::remote_open::RemoteOpenTarget::VALUES
+                    == ["split", "tab", "pane"]
+                    && tako_core::remote_open::RemoteOpenTarget::default()
+                        == tako_core::remote_open::RemoteOpenTarget::Split;
+                check(
+                    vocab_ok,
+                    &format!("131: 開き先の語彙と既定が正本と一致する (#1006。ok={vocab_ok})"),
+                );
+
+                // 診断（#796 の作法。合格時も測った値を残す）
+                println!(
+                    "TAKO_SELF_TEST_1006: tabs={tabs_before}->{tabs_after} \
+                     panes={panes_before}->{panes_after} same_pane={same_pane} \
+                     queued_len={flow_line} refused={refused}"
+                );
+                notify_and_draw(any, window, cx);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -57808,5 +58129,87 @@ mod chat_fixture_pin_watchdog {
         assert!(body_of(&pinned, "collect_chat_targets").contains("chat_fixture_panes"));
         // 番犬モジュール自身は走査から外れている（自分の文字列で素通りしない）
         assert!(!scanned(include_str!("main.rs")).contains("mod chat_fixture_pin_watchdog"));
+    }
+}
+
+#[cfg(test)]
+mod pane_menu_items_tests {
+    //! ペインの右クリックメニューの出し分け（#1006）。
+    //!
+    //! **メニューに出た項目が実際には断られる**（またはその逆で、できるのに出ない）という
+    //! 食い違いをここで止める。判定そのものは `tako_core::remote_open::can_ssh_pane` の
+    //! 単体が持つので、ここは「その結果がメニューへ正しく反映されるか」だけを見る
+    use super::{pane_context_menu_items, PaneMenuFacts};
+    use tako_control::platform::os_integration::FileManager;
+
+    fn facts(is_preview: bool, can_ssh: bool) -> PaneMenuFacts {
+        PaneMenuFacts {
+            is_preview,
+            has_cwd: true,
+            limit_resume: Some(false),
+            can_ssh,
+            file_manager: FileManager::Finder,
+        }
+    }
+
+    fn ids(facts: PaneMenuFacts) -> Vec<&'static str> {
+        pane_context_menu_items(facts)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn 素のシェルのペインにはリモート接続が出る() {
+        let items = ids(facts(false, true));
+        assert!(
+            items.contains(&"connect-remote"),
+            "#1006 の受け入れ条件 1: 通常ターミナルペインに出る（{items:?}）"
+        );
+        // 分割の直後 = 「このペインをどうするか」の並びに置く（近い操作を隣に）
+        let split = items.iter().position(|i| *i == "split-down").unwrap();
+        let remote = items.iter().position(|i| *i == "connect-remote").unwrap();
+        assert_eq!(remote, split + 1);
+    }
+
+    #[test]
+    fn ssh_化できないペインには出さない() {
+        // プレビュー・全画面 TUI・実行中・AI エージェントはすべて can_ssh=false で来る
+        assert!(!ids(facts(true, false)).contains(&"connect-remote"));
+        assert!(!ids(facts(false, false)).contains(&"connect-remote"));
+    }
+
+    #[test]
+    fn 既存項目の構成は変えていない() {
+        // #1006 は 1 項目の追加。既存メニューの並びを崩していないことを固定する
+        assert_eq!(
+            ids(facts(false, false)),
+            vec![
+                "copy-cwd",
+                "reveal-cwd",
+                "sep1",
+                "split-right",
+                "split-down",
+                "sep-limit",
+                "limit-resume",
+                "sep2",
+                "bg",
+                "close",
+            ]
+        );
+        assert_eq!(
+            ids(facts(true, false)),
+            vec![
+                "copy-path",
+                "reveal",
+                "open-default",
+                "sep1",
+                "split-right",
+                "split-down",
+                "sep2",
+                "bg",
+                "close",
+            ]
+        );
     }
 }

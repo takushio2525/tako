@@ -864,6 +864,21 @@ pub(super) fn build_request(
             host: str_arg(args, "host")?.ok_or("host を指定する")?.to_string(),
             focus: bool_arg(args, "focus")?,
             remote_dir: str_arg(args, "remote_dir")?.map(|s| s.to_string()),
+            // #1006: 語彙の正本は `tako_core::remote_open`（CLI / GUI と同じ表）
+            target: match str_arg(args, "target")? {
+                Some(t) => Some(
+                    tako_core::remote_open::RemoteOpenTarget::parse(&t).ok_or_else(|| {
+                        format!(
+                            "target は {} のいずれか",
+                            tako_core::remote_open::RemoteOpenTarget::values_hint()
+                        )
+                    })?,
+                ),
+                None => None,
+            },
+            pane: u64_arg(args, "pane")?,
+            tab: u64_arg(args, "tab")?,
+            direction: direction_arg(args)?,
         },
         "tako_ssh_hosts" => Request::SshHosts,
         "tako_remote_folder" => Request::RemoteFolder {

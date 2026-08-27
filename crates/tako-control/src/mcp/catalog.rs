@@ -2908,12 +2908,16 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_open_remote",
-            "description": "SSH ホストに接続する新タブを開く（#20 / #919）。~/.ssh/config の Host 名を\
+            "description": "SSH ホストに接続するペインを開く（#20 / #919 / #1006）。~/.ssh/config の Host 名を\
                 指定すると、HostName / User / Port 等の設定を尊重して ssh コマンドを実行する。\
                 未定義ホストでも ssh <host> として実行できる。\
                 接続に失敗した場合はペインを閉じずに理由と次の一手を表示する（#919）。\
                 ツリー側（tako_remote_folder）と同じ接続を共有するので、ここで一度ログインすれば\
-                パスワード認証しか無い相手でもリモートツリーが追加認証なしで開く。",
+                パスワード認証しか無い相手でもリモートツリーが追加認証なしで開く。\
+                開き先は target で選ぶ（既定 split = いま開いているタブへ新ペイン。#1006）。\
+                target=pane は**すでにあるペインをそのまま SSH にする**（ペイン ID は変わらず、\
+                接続に失敗してもそのペインのシェルへ戻る）。素のシェルでないペイン\
+                （全画面 TUI・実行中・AI エージェント・プレビュー）は理由つきで断る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2923,11 +2927,31 @@ pub fn tools() -> Vec<Value> {
                     },
                     "focus": {
                         "type": "boolean",
-                        "description": "新タブにフォーカスを移すか（省略時 true）",
+                        "description": "接続したペインへフォーカスを移すか（省略時 true）",
                     },
                     "remote_dir": {
                         "type": "string",
                         "description": "接続後に cd するリモートのパス（省略時はログイン時の cwd）",
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["split", "tab", "pane"],
+                        "description": "開き先（#1006。省略時 split = いまのタブへ新ペイン / \
+                            tab = 新しいタブ / pane = 既存ペインをそのまま SSH 化）",
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "description": "対象ペイン ID（target=pane は SSH 化するペイン / \
+                            target=split は分割元。省略時は呼び出し元ペイン）",
+                    },
+                    "tab": {
+                        "type": "integer",
+                        "description": "対象タブ ID（target=split のとき。省略時はアクティブタブ）",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["right", "down", "left", "up"],
+                        "description": "分割方向（target=split のとき。省略時 right）",
                     },
                 },
                 "required": ["host"],

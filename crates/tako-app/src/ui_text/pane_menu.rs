@@ -34,6 +34,13 @@ pub fn split_right() -> &'static str {
 pub fn split_down() -> &'static str {
     tr!("下に分割", "Split down")
 }
+/// このペインを SSH 接続にする（#1006）。
+///
+/// ファイルメニューの「リモート接続…」（新しいペインを開く）とは動作が違うので、
+/// **「このペインで」を文言に入れて**取り違えを防ぐ
+pub fn connect_remote() -> &'static str {
+    tr!("このペインでリモート接続…", "Connect this pane via SSH…")
+}
 pub fn background() -> &'static str {
     tr!("バックグラウンドへ", "Send to background")
 }
@@ -82,6 +89,7 @@ mod tests {
                 reveal_cwd(FileManager::Explorer).to_string(),
                 split_right().to_string(),
                 split_down().to_string(),
+                connect_remote().to_string(),
                 background().to_string(),
                 close().to_string(),
                 limit_resume_toggle(false).to_string(),
