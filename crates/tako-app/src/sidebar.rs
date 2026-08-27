@@ -1168,10 +1168,12 @@ impl TakoApp {
         let is_dir = ctx.is_dir;
         let is_pinned_root = ctx.is_pinned_root;
         let pos = ctx.position;
+        // ファイルマネージャ / ごみ箱の呼び名は OS で変わる（#617）
+        let fm = tako_control::platform::os_integration::file_manager();
         let mut items: Vec<(&str, &str)> = vec![
             ("copy-rel", crate::ui_text::sidebar::menu_copy_rel()),
             ("copy-abs", crate::ui_text::sidebar::menu_copy_abs()),
-            ("reveal", crate::ui_text::sidebar::menu_reveal()),
+            ("reveal", crate::ui_text::sidebar::menu_reveal(fm)),
             ("open-term", crate::ui_text::sidebar::menu_open_term()),
         ];
         if !is_dir {
@@ -1193,7 +1195,7 @@ impl TakoApp {
             },
         ));
         items.push(("sep3", ""));
-        items.push(("trash", crate::ui_text::sidebar::menu_trash()));
+        items.push(("trash", crate::ui_text::sidebar::menu_trash(fm)));
         if is_pinned_root {
             items.push(("sep4", ""));
             items.push(("remove-root", crate::ui_text::sidebar::menu_remove_root()));
@@ -2144,12 +2146,11 @@ impl TakoApp {
     }
 }
 
-/// OS のアプリ選択ダイアログでアプリを選び、指定ファイルをそのアプリで開く。
-/// プラットフォーム差は境界 B8（`platform::os_integration`）の内側にある
+/// OS のアプリ選択 UI でアプリを選び、指定ファイルをそのアプリで開く。
+/// プラットフォーム差（macOS = 選択ダイアログ + `open -a` / Windows = `openas` verb）は
+/// 境界 B8（`platform::os_integration`）の内側にある（#617）
 fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
-    use tako_control::platform::os_integration as os;
-    let app = os::pick_application()?;
-    os::open_with(&app.to_string_lossy(), path)
+    tako_control::platform::os_integration::open_with_dialog(path)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use crate::settings_sleep::{Device, IdleStatus, LidStatus};
+use tako_control::platform::os_integration::FileManager;
 
 pub fn window_title() -> &'static str {
     tr!("tako 設定", "tako Settings")
@@ -881,8 +882,12 @@ pub fn advanced_reload() -> &'static str {
     tr!("再読み込み", "Reload")
 }
 
-pub fn advanced_open_finder() -> &'static str {
-    tr!("Finder で表示", "Reveal in Finder")
+/// ファイルマネージャの呼び名は OS ごとに違う（#617。`sidebar::menu_reveal` と同じ理由）
+pub fn advanced_reveal(fm: FileManager) -> &'static str {
+    match fm {
+        FileManager::Finder => tr!("Finder で表示", "Reveal in Finder"),
+        FileManager::Explorer => tr!("エクスプローラーで表示", "Reveal in Explorer"),
+    }
 }
 
 pub fn advanced_open_editor() -> &'static str {
@@ -1437,7 +1442,8 @@ mod tests {
                 advanced_edit_help().into(),
                 advanced_save().into(),
                 advanced_reload().into(),
-                advanced_open_finder().into(),
+                advanced_reveal(FileManager::Finder).into(),
+                advanced_reveal(FileManager::Explorer).into(),
                 advanced_open_editor().into(),
                 advanced_related_header().into(),
                 advanced_parse_error().into(),

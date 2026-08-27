@@ -306,14 +306,20 @@ impl DaemonCtx {
     }
 }
 
-/// macOS 通知を表示する（接続開始終了・操作セッション開始。#283）。
-/// osascript 経由（依存追加なし）。`TAKO_REMOTE_NO_NOTIFY=1` で抑止（テスト・検証用）。
+/// デスクトップ通知を表示する（接続開始終了・操作セッション開始。#283）。
+/// 経路は境界 B8（`os_integration::notify`）で、macOS は osascript（依存追加なし）。
+/// `TAKO_REMOTE_NO_NOTIFY=1` で抑止（テスト・検証用）。
 /// 通知文にはデバイス名・イベントのみを載せ、ペイン内容は含めない
-fn notify_macos(message: &str) {
+///
+/// 戻り値は**通知を出せたか**（#617）。抑止したときと、通知の実装が無い
+/// プラットフォーム（Windows）では `false`。remote デーモンは自前の UI を持たないので
+/// 代替表示の当てが無く、ここでは呼び出し側へそのまま返すだけにしてある
+/// （**通知文はログに出さない** = デバイス名が診断ログへ漏れないため）
+fn notify_desktop(message: &str) -> bool {
     if std::env::var("TAKO_REMOTE_NO_NOTIFY").is_ok_and(|v| v == "1") {
-        return;
+        return false;
     }
-    crate::platform::os_integration::notify("tako remote", message);
+    crate::platform::os_integration::notify("tako remote", message)
 }
 
 /// 認可判定の結果
@@ -3284,7 +3290,7 @@ fn handle_admin_api(
             let result = ctx.registry.lock().unwrap().approve(device_id, role);
             match result {
                 Ok(device) => {
-                    notify_macos(&format!(
+                    notify_desktop(&format!(
                         "{} を {} として登録しました",
                         device.name,
                         device.role.as_str()
@@ -3492,7 +3498,7 @@ fn handle_api_v2_routes(
                 );
                 drop(reg);
                 if session_started {
-                    notify_macos(&format!("{} が操作を開始しました", device.name));
+                    notify_desktop(&format!("{} が操作を開始しました", device.name));
                 }
             }
             // dispatch Send へは PaneId（数値）を渡して GUI 側の resolve_pane に解決させる
@@ -4095,7 +4101,7 @@ fn handle_ws_v2(
             &device.name,
             json!({ "route": "/ws" }),
         );
-        notify_macos(&format!("{} が接続しました", device.name));
+        notify_desktop(&format!("{} が接続しました", device.name));
     }
 
     let ctx_fwd = ctx.clone();
@@ -4148,7 +4154,7 @@ fn handle_ws_v2(
                                     json!({ "route": "/ws" }),
                                 );
                             }
-                            notify_macos(&format!("{device_name} が切断しました"));
+                            notify_desktop(&format!("{device_name} が切断しました"));
                         }
                     })
                     .ok();
