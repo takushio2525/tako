@@ -53824,6 +53824,54 @@ mod self_test {
                                 f32::from(want)
                             ),
                         );
+                        // 症状そのもの（「増えたタブが埋もれて**アクセスできない**」）が
+                        // 直っているかを、最後のタブの実描画矩形で見る。
+                        // 端まで転がして、スクロール領域の中に入ってくること
+                        let last_ix = made.len().saturating_sub(1);
+                        let hidden_before = window961
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let area = app.tab_scroll_handle.bounds();
+                                app.tab_scroll_handle
+                                    .bounds_for_item(last_ix)
+                                    .map(|b| b.right() > area.right())
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false);
+                        for _ in 0..30 {
+                            let _ = any961.update(cx, |_, win, cx| {
+                                win.dispatch_event(
+                                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                        position: at,
+                                        delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                                        ..ScrollWheelEvent::default()
+                                    }),
+                                    cx,
+                                )
+                            });
+                        }
+                        notify_and_draw(any961, window961, cx);
+                        let reachable = window961
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let area = app.tab_scroll_handle.bounds();
+                                app.tab_scroll_handle
+                                    .bounds_for_item(last_ix)
+                                    .map(|b| b.right() <= area.right() + px(1.0))
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false);
+                        println!(
+                            "TAKO_SELF_TEST_961_REACH: last_ix={last_ix} \
+                             hidden_before={hidden_before} reachable_after={reachable}"
+                        );
+                        check(
+                            hidden_before && reachable,
+                            &format!(
+                                "129: 埋もれていた最後のタブがスクロールで見えるところまで来る \
+                                 (#961。hidden_before={hidden_before} reachable={reachable})"
+                            ),
+                        );
                     }
                 }
                 // 後片付け: 作った検証用タブを閉じる
