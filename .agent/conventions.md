@@ -374,7 +374,12 @@ echo "        ${registered}（${note}）"  # ○
 `bash -n` では検出できず、その行が実行されるまで潜伏する（`build-app.sh` の
 「不明な引数」案内は #837 まで気付かれずに壊れていた）。**日本語を出す行は必ず一度
 実行して確かめる**か、`scripts/test-launch-services.sh` のようなモックテストで
-その分岐を通す。機械的な洗い出しは:
+その分岐を通す。
+
+**番犬（#965 で常設）**: `crates/tako-control/tests/shell_scripts.rs` が `scripts/` 配下の
+`.sh` を全部走査して、この形を file:line で名指しして落とす（CI の macOS ジョブで走る）。
+行コメントは展開されないので対象外、`$1（` のような位置パラメータも対象外
+（bash は数字を 1 桁しか読まないので全角を取り込まない）。手元での洗い出しは:
 
 ```sh
 grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]' scripts/*.sh scripts/lib/*.sh

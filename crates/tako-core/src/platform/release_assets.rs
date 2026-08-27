@@ -24,7 +24,7 @@
 //!
 //! タグ自身が `-` と `.` を含む（`v0.6.0-test.1`）ため、**解析は必ず右から行う**。
 
-use super::support::Platform;
+use super::support::{Note, Platform};
 
 /// アセット名の接頭辞
 pub const PREFIX: &str = "tako-";
@@ -90,6 +90,78 @@ pub fn display_label(platform: Platform) -> &'static str {
         Platform::MacOs => "macOS",
         Platform::Windows => "Windows",
     }
+}
+
+/// リリースが配布対象とするプラットフォーム（リリースノートの表の行順）。
+///
+/// **リリースは全部が揃って初めて成立する**（#965）。片方だけ出ると、欠けた OS の
+/// 利用者には「更新が無い」ように見えたまま（#595 の判定は自 OS 用アセットの有無で決まる）
+/// バージョンだけが進む。`missing_platforms` がその状態を機械検出する。
+pub const PLATFORMS: [Platform; 2] = [Platform::MacOs, Platform::Windows];
+
+/// macOS 版が動く最低 OS バージョン。
+/// 正は `scripts/build-app.sh` が Info.plist へ書く `LSMinimumSystemVersion`
+/// （食い違いは `os_requirements_match_build_declarations` が落とす）
+pub const MACOS_MIN_VERSION: &str = "11.0";
+
+/// Windows 版が動く最低 OS ビルド。
+/// 正は `installer/windows/tako.iss` の `MinVersion`（インストーラーが自分で弾く値）
+pub const WINDOWS_MIN_BUILD: &str = "10.0.17763";
+
+/// リリースノートに出す動作要件（#965）。
+///
+/// 配布物を落とす前に「自分の環境で動くのか」が分かる必要がある。文言は日英併記の
+/// `Note` 1 箇所で定義し、シェル側の写し（`scripts/lib/release-assets.sh`）は
+/// 同期テストで拘束する（#435 準拠 = 表示言語ごとに別実装を作らない）。
+///
+/// **arch は現在の配布実態を書いている**（macOS = Apple Silicon 1 本 /
+/// Windows = x64 1 本）。universal 版や Intel 版を配り始めるときはここも直す
+/// （ダウンロード表の方は実アセット名から組むので自動で追随する）。
+pub fn os_requirement(platform: Platform) -> Note {
+    match platform {
+        Platform::MacOs => Note::new(
+            "macOS 11.0 以降 / Apple Silicon（arm64）",
+            "macOS 11.0 or later / Apple Silicon (arm64)",
+        ),
+        Platform::Windows => Note::new(
+            "Windows 10 バージョン 1809（ビルド 10.0.17763）以降 / x64",
+            "Windows 10 version 1809 (build 10.0.17763) or later / x64",
+        ),
+    }
+}
+
+/// アセット名の一覧から、**配布物が 1 つも無いプラットフォーム**を返す（#965）。
+///
+/// arch は問わない（リリース側が判りたいのは「どの OS の利用者が取り残されるか」で、
+/// 現在の配布は macOS = arm64 / Windows = x86_64 の 1 本ずつ）。
+/// 規則外のファイル名（チェックサム等）は `ReleaseAsset::parse` が無視する。
+pub fn missing_platforms<'a, I>(names: I) -> Vec<Platform>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut present = [false; PLATFORMS.len()];
+    for name in names {
+        let Some(asset) = ReleaseAsset::parse(name) else {
+            continue;
+        };
+        if let Some(i) = PLATFORMS.iter().position(|p| *p == asset.platform) {
+            present[i] = true;
+        }
+    }
+    PLATFORMS
+        .iter()
+        .zip(present)
+        .filter(|(_, seen)| !*seen)
+        .map(|(platform, _)| *platform)
+        .collect()
+}
+
+/// 両 OS の配布物が揃っているか（片肺リリースの検出）。#965
+pub fn is_complete<'a, I>(names: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    missing_platforms(names).is_empty()
 }
 
 /// 主形式のアセット名を組み立てる
@@ -316,6 +388,87 @@ mod tests {
         );
     }
 
+    // --- リリースの完全性 / 動作要件（#965）---
+
+    #[test]
+    fn missing_platforms_detects_one_sided_release() {
+        // 両 OS 揃っている = 完全
+        let both = [
+            "tako-v0.7.9-macos-arm64.zip",
+            "tako-v0.7.9-windows-x86_64.exe",
+            "tako-v0.7.9-windows-x86_64.zip",
+        ];
+        assert!(missing_platforms(both).is_empty());
+        assert!(is_complete(both));
+
+        // macOS だけ = Windows の利用者が取り残される（v0.7.8 までの実状）
+        let mac_only = ["tako-v0.7.8-macos-arm64.zip"];
+        assert_eq!(missing_platforms(mac_only), vec![Platform::Windows]);
+        assert!(!is_complete(mac_only));
+
+        // Windows だけ
+        let win_only = ["tako-v0.7.9-windows-x86_64.exe"];
+        assert_eq!(missing_platforms(win_only), vec![Platform::MacOs]);
+        assert!(!is_complete(win_only));
+
+        // 規則外のファイルは配布物として数えない（添付資料を「揃っている」と誤判定しない）
+        let decoys = ["checksums.txt", "tako-v0.7.9-linux-x86_64.zip", "tako.zip"];
+        assert_eq!(
+            missing_platforms(decoys),
+            vec![Platform::MacOs, Platform::Windows]
+        );
+        // アセットが 1 つも無いリリースも当然「揃っていない」
+        assert!(!is_complete(std::iter::empty::<&str>()));
+    }
+
+    #[test]
+    fn platforms_covers_every_supported_target() {
+        // extensions() / display_label() を持つ OS が PLATFORMS から漏れていないこと。
+        // 漏れると「その OS のアセットが無くても完全」と判定してしまう
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert!(
+                PLATFORMS.contains(&platform),
+                "{platform:?} が PLATFORMS に無い（片肺検出の網から漏れる）"
+            );
+        }
+        assert_eq!(PLATFORMS.len(), 2);
+    }
+
+    /// 動作要件の数値が**実際にビルドへ埋まっている宣言**と一致していること。
+    ///
+    /// ノートに書いた要件が配布物の実際の下限とズレると、動かない環境の利用者に
+    /// ダウンロードさせる（甘い側）か、動く環境の利用者を諦めさせる（厳しい側）。
+    #[test]
+    fn os_requirements_match_build_declarations() {
+        // Windows: インストーラー自身が弾く下限
+        let iss = std::fs::read_to_string(repo_path("installer/windows/tako.iss"))
+            .expect("installer/windows/tako.iss");
+        assert!(
+            iss.contains(&format!("MinVersion={WINDOWS_MIN_BUILD}")),
+            "tako.iss の MinVersion が WINDOWS_MIN_BUILD ({WINDOWS_MIN_BUILD}) と一致しない"
+        );
+        // macOS: .app の Info.plist へ書かれる下限
+        let build_app = std::fs::read_to_string(repo_path("scripts/build-app.sh"))
+            .expect("scripts/build-app.sh");
+        assert!(
+            build_app.contains("LSMinimumSystemVersion"),
+            "build-app.sh が LSMinimumSystemVersion を書いていない"
+        );
+        assert!(
+            build_app.contains(&format!("<string>{MACOS_MIN_VERSION}</string>")),
+            "build-app.sh の LSMinimumSystemVersion が MACOS_MIN_VERSION ({MACOS_MIN_VERSION}) と一致しない"
+        );
+
+        // 文言（日英とも）にその数値が入っていること
+        let mac = os_requirement(Platform::MacOs);
+        assert!(mac.ja().contains(MACOS_MIN_VERSION) && mac.en().contains(MACOS_MIN_VERSION));
+        let win = os_requirement(Platform::Windows);
+        assert!(win.ja().contains(WINDOWS_MIN_BUILD) && win.en().contains(WINDOWS_MIN_BUILD));
+        // arch も明示する（macOS 版は arm64 のみ = Intel Mac では動かない）
+        assert!(mac.ja().contains(Arch::Arm64.as_str()));
+        assert!(win.ja().contains(Arch::X86_64.as_str()) || win.ja().contains("x64"));
+    }
+
     // --- 写し（sh / PowerShell）との同期検証 ---
     //
     // 命名規則を 3 言語に写すことになるので、**ズレたら落ちるテスト**で縛る。
@@ -431,6 +584,70 @@ mod tests {
             }
         }
     }
+    /// 片肺検出（#965）と動作要件の写しが Rust と一致していること。
+    ///
+    /// `scripts/release.sh` は**シェル側の関数で**リリースの完全性を判定するので、
+    /// ここがズレると「揃っていないのに揃ったと報告する」= 検査が空振りする。
+    #[cfg(unix)]
+    #[test]
+    fn shell_mirror_detects_same_missing_platforms() {
+        let lib = shell_lib_path();
+        let cases: [&[&str]; 6] = [
+            &[
+                "tako-v0.7.9-macos-arm64.zip",
+                "tako-v0.7.9-windows-x86_64.exe",
+            ],
+            &["tako-v0.7.9-macos-arm64.zip"],
+            &["tako-v0.7.9-windows-x86_64.exe"],
+            &["tako-v0.7.9-windows-x86_64.zip"],
+            &["checksums.txt"],
+            &[],
+        ];
+        for names in cases {
+            let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+            let script = format!(
+                ". '{}'; tako_asset_missing_platforms {}",
+                lib.display(),
+                quoted.join(" ")
+            );
+            let out = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .expect("sh の実行に失敗");
+            assert!(
+                out.status.success(),
+                "シェル関数が失敗: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            let want: Vec<String> = missing_platforms(names.iter().copied())
+                .into_iter()
+                .map(|p| p.as_str().to_string())
+                .collect();
+            assert_eq!(got, want, "片肺判定がシェルと Rust で食い違う（{names:?}）");
+        }
+    }
+
+    #[test]
+    fn shell_mirror_declares_same_requirements() {
+        let src = std::fs::read_to_string(shell_lib_path()).expect("scripts/lib/release-assets.sh");
+        for platform in PLATFORMS {
+            let suffix = platform.as_str().to_uppercase();
+            let note = os_requirement(platform);
+            for (lang, want_text) in [("JA", note.ja()), ("EN", note.en())] {
+                let want = format!("TAKO_ASSET_REQ_{suffix}_{lang}=\"{want_text}\"");
+                assert!(
+                    src.contains(&want),
+                    "シェル側の TAKO_ASSET_REQ_{suffix}_{lang} が Rust の os_requirement() と一致しない（期待: {want}）"
+                );
+            }
+        }
+    }
+
     // --- PowerShell 側（installer/windows/lib/release-assets.ps1）との同期検証 ---
     //
     // Windows のリリースは GitHub Actions ではなく実機の PowerShell で回す（#587）ので、

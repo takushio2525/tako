@@ -15,6 +15,10 @@
 # 命名規則:
 #   tako-<tag>-<platform>-<arch>.<ext>
 #   例) tako-v0.5.13-macos-arm64.zip / tako-v0.6.0-windows-x86_64.exe
+#
+# **bash 専用**（`source` するのは bash スクリプトだけ）。`tako_asset_is_for` の
+# `[[ == ]]` パターンは zsh では同じ結果にならない（zsh で手検証すると「macOS の
+# 配布物が無い」と誤って出るので、確認は `bash -c 'source …'` で行う）
 
 # アセット名の接頭辞
 TAKO_ASSET_PREFIX="tako-"
@@ -84,4 +88,53 @@ tako_asset_is_for() {
     fi
   done
   return $matched
+}
+
+# --- リリースの完全性（#965）------------------------------------------------
+#
+# リリースは macOS / Windows の配布物が**揃って初めて成立する**。片方だけ出ると、
+# 欠けた OS の利用者には「更新が無い」ように見えたままバージョンだけが進む
+# （更新判定は自 OS 用アセットの有無で決まる = #595）。
+# 判定の正は release_assets.rs の missing_platforms / is_complete。
+
+# tako_asset_missing_platforms <file-name...> — 配布物が 1 つも無い OS を 1 行ずつ返す
+tako_asset_missing_platforms() {
+  local platform name found
+  for platform in $TAKO_ASSET_PLATFORMS; do
+    found=1
+    for name in "$@"; do
+      [[ -n "$name" ]] || continue
+      if tako_asset_is_for "$name" "$platform"; then
+        found=0
+        break
+      fi
+    done
+    [[ $found -eq 0 ]] || echo "$platform"
+  done
+  return 0
+}
+
+# tako_asset_is_complete <file-name...> — 両 OS が揃っていれば 0
+tako_asset_is_complete() {
+  [[ -z "$(tako_asset_missing_platforms "$@")" ]]
+}
+
+# --- 動作要件（#965）--------------------------------------------------------
+# リリースノートに載せる最低要件。文言の正は release_assets.rs の os_requirement()
+# （日英ともに同期テストで拘束する）
+
+TAKO_ASSET_REQ_MACOS_JA="macOS 11.0 以降 / Apple Silicon（arm64）"
+TAKO_ASSET_REQ_MACOS_EN="macOS 11.0 or later / Apple Silicon (arm64)"
+TAKO_ASSET_REQ_WINDOWS_JA="Windows 10 バージョン 1809（ビルド 10.0.17763）以降 / x64"
+TAKO_ASSET_REQ_WINDOWS_EN="Windows 10 version 1809 (build 10.0.17763) or later / x64"
+
+# tako_asset_requirement <platform> [ja|en] — 動作要件の文言（既定は ja）
+tako_asset_requirement() {
+  case "$1:${2:-ja}" in
+    macos:ja)   printf '%s' "$TAKO_ASSET_REQ_MACOS_JA" ;;
+    macos:en)   printf '%s' "$TAKO_ASSET_REQ_MACOS_EN" ;;
+    windows:ja) printf '%s' "$TAKO_ASSET_REQ_WINDOWS_JA" ;;
+    windows:en) printf '%s' "$TAKO_ASSET_REQ_WINDOWS_EN" ;;
+    *)          return 1 ;;
+  esac
 }

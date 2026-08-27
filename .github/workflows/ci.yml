@@ -55,6 +55,11 @@ jobs:
         run: node scripts/gen-windows-support-docs.mjs --check
       - name: エージェント対応状況ページがマトリクスと同期している
         run: node scripts/gen-agent-support-docs.mjs --check
+      # リリース経路（gh release create のリトライ / 両 OS の待ち合わせ / 片肺の検出）の
+      # モックテスト。ダミー gh を PATH に挿すので本番の Release には触らない。
+      # **片肺リリースの検出が壊れたらここで落ちる**（#256 / #965）
+      - name: リリース経路のモックテスト
+        run: bash scripts/test-release-retry.sh
 
   windows:
     name: Windows（build + test スモーク）

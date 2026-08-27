@@ -20,8 +20,16 @@
 #      （≠ は手動リリース進行中とみなしてスキップ。夜間ジョブは人間の作業に割り込まない）
 #   5. origin/main へ detach → version bump + CHANGELOG 自動節 + Cargo.lock 同期をコミット
 #   6. release.sh（ビルド + zip）→ 成功後にはじめて push（main → annotated tag）
-#      → release.sh --skip-build --publish（GitHub Release + Pages デプロイ）
+#      → release.sh --skip-build --test（GitHub Release + Pages デプロイ）
 #   7. ビルド失敗時はローカルコミットを破棄してロールバック（リモートは無傷）
+#
+# 両 OS 同時リリース（#965）:
+#   タグ push が GitHub Actions（.github/workflows/release-windows.yml）を起こし、
+#   windows ランナーが installer exe / ポータブル zip を同じ Release へ添付する。
+#   release.sh はその添付を待ってからノートを作り直すので、夜間ジョブは
+#   **両 OS が揃うまで（既定で最大 75 分）待って**から完了する。
+#   片肺で終わった場合は release.sh が exit 3 を返し、ここで警告として通知する
+#   （Release 自体は macOS 版で成立しているので、ロールバックはしない）。
 #
 # ログ: ~/.claude-orchestrator/logs/tako-nightly-release.log
 # 注意: Homebrew cask（homebrew-tako）の更新は対象外（手動リリース時のみ）
@@ -303,12 +311,31 @@ $LATEST_TAG 以降の変更:
 $(git log --format='- %s' "$LATEST_TAG..HEAD~1")"
 git push origin "$NEW_TAG" --quiet
 
-# 夜間リリースはテスト版（prerelease）として配布する（#403）
-if ! "$REPO_ROOT/scripts/release.sh" --skip-build --test >> "$LOG_FILE" 2>&1; then
-  log "ERROR: GitHub Release 作成に失敗（tag $NEW_TAG は push 済み）。手動リカバリ: scripts/release.sh --skip-build --test"
-  notify "失敗: Release 作成（tag は push 済み、要手動リカバリ）"
-  exit 1
-fi
+# 夜間リリースはテスト版（prerelease）として配布する（#403）。
+# release.sh は Windows 配布物（tag push で起動する GitHub Actions）を待ってから
+# ノートを作り直す。終了コードは 0 = 両 OS 揃った / 3 = 片肺 / それ以外 = 作成失敗（#965）
+RELEASE_RC=0
+"$REPO_ROOT/scripts/release.sh" --skip-build --test >> "$LOG_FILE" 2>&1 || RELEASE_RC=$?
 
-log "完了: ${NEW_TAG}（テスト版、$COMMITS 件、https://github.com/takushio2525/tako/releases/tag/${NEW_TAG}）"
-notify "テスト版リリース完了: ${NEW_TAG}（$COMMITS 件の変更）"
+RELEASE_URL="https://github.com/takushio2525/tako/releases/tag/${NEW_TAG}"
+case "$RELEASE_RC" in
+  0)
+    log "完了: ${NEW_TAG}（テスト版・両 OS の配布物あり、$COMMITS 件、${RELEASE_URL}）"
+    notify "テスト版リリース完了: ${NEW_TAG}（$COMMITS 件、mac/win 両方）"
+    ;;
+  3)
+    # Release 自体は macOS 版で成立している。ロールバックはしない（tag も push 済み）
+    log "WARN: ${NEW_TAG} は片肺リリース（Windows 配布物が未添付）。${RELEASE_URL}"
+    log "  確認: gh run list --workflow release-windows.yml"
+    log "  回収: gh run download <run-id> → gh release upload ${NEW_TAG} <file> --clobber"
+    log "  実機で作る場合: pwsh -File installer/windows/release-windows.ps1 -Tag ${NEW_TAG} -Upload"
+    log "  添付後: scripts/release.sh --update-notes ${NEW_TAG}"
+    notify "片肺リリース: ${NEW_TAG}（Windows 版が未添付・要対応）"
+    exit 1
+    ;;
+  *)
+    log "ERROR: GitHub Release 作成に失敗（exit ${RELEASE_RC}、tag $NEW_TAG は push 済み）。手動リカバリ: scripts/release.sh --skip-build --test"
+    notify "失敗: Release 作成（tag は push 済み、要手動リカバリ）"
+    exit 1
+    ;;
+esac
