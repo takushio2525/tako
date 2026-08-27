@@ -226,6 +226,36 @@ GPUI の `AnimationElement` は、**アニメーションが終わっていな�
   検出力が消える。「時間を空けて描き直しても値が動かない」= `done` = 要求も止まっている、
   と言い切れる（セルフテスト項目 128）
 
+## `occlude()` はスクロールも止める（Issue #576 / #961）
+
+GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavior::BlockMouse`
+（= `InteractiveElement::occlude`）に当たった時点で **break** する。積まれなかった祖先は
+`mouse_hit_test.ids` に入らないので、
+
+- `hitbox.is_hovered()` → false（これが `occlude()` の狙い）
+- **`hitbox.should_handle_scroll()` → false**（こちらは巻き添え）
+
+の両方が false になる。`overflow_x_scroll` / `overflow_y_scroll` の既定ハンドラも
+`InteractiveElement::on_scroll_wheel` も発火条件が `should_handle_scroll()` なので、
+**スクロール領域の中で `occlude()` する子を置くと、その子の上ではホイールが死ぬ**。
+
+実例（#961）: #576 がタブピルへ `occlude()` を付けたことで、#208 のタブバー横スクロールが
+**丸ごと効かなくなった**（ピルは領域のほぼ全面を覆うため、事実上どこでも効かない）。
+`occlude()` を外す修正は Windows の `on_hit_test_window_control` が
+祖先の `WindowControlArea::Drag` を拾って #576 を再発させるので採れない
+（`block_mouse_except_scroll()` も `ids` には積まれたままなので同じく再発する）。
+
+したがって:
+
+- **スクロール領域の中で `occlude()` するなら、その要素自身が `on_scroll_wheel` で
+  スクロールを中継する**。実装の正は `tab_bar.rs` の `TabScrollOcclude::occlude_scrolling`
+- 中継の計算は **GPUI 既定と同じ意味論**にする（横 delta があればそれ、無ければ縦 delta を
+  横へ回す / offset は足すだけでクランプは prepaint に任せる）。ずれると
+  「子の上」と「隙間の上」で挙動が食い違う
+- 回帰は**実 `PlatformInput` のホイール**で押さえる（ハンドラ直呼びでは hit test を通らず
+  この型のバグを検出できない）。**動かしてから 1 フレーム描いてから**流すこと
+  （`should_handle_scroll` はフレーム構築時の hit test を見る）
+
 ## セルフテストの待ち条件の書き方（Issue #796）
 
 隔離セルフテスト（`TAKO_ISOLATED=1 TAKO_SELF_TEST=1`）は worker の完了判定に使うので、

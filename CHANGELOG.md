@@ -28,6 +28,25 @@ Nightly patch release (automated). Changes since v0.7.7:
 
 ## [Unreleased]
 
+### Fixed
+
+- [修正] タブバーの横スクロールが効かず、タブが増えると画面外に埋もれてアクセスできない
+  問題を根治 (#961)。原因は #576（`0880c26` で main へ）がタブピルへ付けた `occlude()`。
+  GPUI の `hit_test` は `occlude()` で走査を **break** するため、祖先である
+  `tab-scroll-area` の hitbox が hit test から落ち、`overflow_x_scroll` の発火条件
+  （`should_handle_scroll()`）が **タブピルの上では常に false** になっていた
+  （ピルが領域のほぼ全面を覆うので事実上どこでも効かない）。`occlude()` は
+  Windows のボタン死（#576）を防ぐために必要なので外さず、**スクロール領域の中で
+  occlude する要素がホイールを自分で中継する**形にした。中継の計算は GPUI 既定と
+  同じ意味論なので、ピルの上と隙間の上で挙動が一致する
+- [Fixed] The tab bar can be scrolled again; tabs beyond the visible width are no longer
+  unreachable (#961). #576 added `occlude()` to each tab pill so Windows would stop
+  swallowing clicks, but GPUI's hit test *breaks* at an occluding hitbox, so the
+  scroll container behind the pills never satisfied `should_handle_scroll()` — and the
+  pills cover almost the whole strip. The pills keep `occlude()` (removing it brings
+  #576 back) and now relay wheel events to the scroll container themselves, using the
+  same delta rules GPUI applies, so scrolling over a pill and over a gap behave alike.
+
 ### Changed
 
 - [改善] 実行中タブのドット脈動を「走り始めの合図」に限り、フレーム要求の恒久化を

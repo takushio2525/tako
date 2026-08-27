@@ -23,6 +23,18 @@
 //! 逆に `tab-scroll-area` には付けない —— `flex_1` で空き領域の大半を占めるため、
 //! 付けるとタブバー空き領域でのウィンドウドラッグ移動（#312）が死ぬ。
 //!
+//! # スクロール領域の中で occlude するときの追加規約（Issue #961）
+//!
+//! `occlude()` は hit test を **break** させるので、祖先である `tab-scroll-area` の
+//! hitbox が `mouse_hit_test.ids` から落ちる。GPUI の `overflow_x_scroll` は
+//! `hitbox.should_handle_scroll()`（= `ids.contains`）で発火を決めるため、
+//! **タブピルの上ではホイールがスクロール領域へ一切届かない**。#576 でピルへ
+//! `occlude()` を付けた結果、#208 の横スクロールが丸ごと死んでいた（#961）。
+//!
+//! そこで **スクロール領域の中で occlude する要素は
+//! [`TabScrollOcclude::occlude_scrolling`] を使い、ホイールを自分で中継する**こと。
+//! 素の `.occlude()` を使うと同じ穴が開く（番犬テストが名指しで落とす）。
+//!
 //! # ウィンドウコントロール（Issue #584 → #657 でこの行から移設）
 //!
 //! Windows は `hide_title_bar` でネイティブのキャプションボタンが生成されないため
@@ -34,8 +46,9 @@
 use std::time::Duration;
 
 use gpui::{
-    div, point, prelude::*, px, svg, Animation, AnimationExt, BoxShadow, Context, DragMoveEvent,
-    FontWeight, SharedString, WindowControlArea,
+    div, point, prelude::*, px, svg, Animation, AnimationExt, BoxShadow, Context, Div,
+    DragMoveEvent, FontWeight, Pixels, ScrollDelta, ScrollWheelEvent, SharedString, Stateful,
+    WindowControlArea,
 };
 use tako_core::{CommandState, TitleSource};
 
@@ -118,6 +131,49 @@ fn dot_pulse_legacy() -> bool {
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_945_LEGACY").is_some())
 }
 
+/// タブバーの横スクロール量をホイールの delta から決める（Issue #961）。
+///
+/// GPUI の `overflow_x_scroll` と**同じ意味論**にする: 横 delta があればそれを使い、
+/// 無ければ縦 delta を横へ回す（`restrict_scroll_to_axis` 既定 false・縦は非スクロール）。
+/// ここがずれると「ピルの上」と「タブの隙間」でスクロール量が食い違う
+fn tab_scroll_dx(delta: &ScrollDelta, line_height: Pixels) -> Pixels {
+    let d = delta.pixel_delta(line_height);
+    if d.x == Pixels::ZERO {
+        d.y
+    } else {
+        d.x
+    }
+}
+
+/// ホイール中継を #961 前（素の `occlude()`）へ戻す逃げ道（`TAKO_961_LEGACY=1`）。
+///
+/// 同じバイナリで「タブピルの上でスクロールできるか」を A/B するために使う
+fn tab_scroll_relay_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TAKO_961_LEGACY").is_some())
+}
+
+/// スクロール領域（`tab-scroll-area`）の**中**で `occlude()` する要素に付ける（#576 + #961）。
+///
+/// `occlude()` だけだと祖先のスクロール領域が hit test から落ちてホイールが死ぬので、
+/// 自分で受けて [`TakoApp::scroll_tab_bar_by`] へ中継する。
+/// スクロール領域の**外**（⌘K / ベル / 表示モード / テーマ）は素の `occlude()` でよい
+pub(crate) trait TabScrollOcclude: Sized {
+    fn occlude_scrolling(self, cx: &Context<TakoApp>) -> Self;
+}
+
+impl TabScrollOcclude for Stateful<Div> {
+    fn occlude_scrolling(self, cx: &Context<TakoApp>) -> Self {
+        let el = self.occlude();
+        if tab_scroll_relay_disabled() {
+            return el;
+        }
+        el.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+            this.scroll_tab_bar_by(&event.delta, window.line_height(), cx);
+        }))
+    }
+}
+
 /// 右端コントロール群の概算幅
 /// （⌘K(210+px) + bell(30) + ui-mode(30) + theme(30) + gap + margin。#694 で +30）
 const RIGHT_CONTROLS_PX: f32 = 330.0;
@@ -176,6 +232,28 @@ impl TakoApp {
         if let Some(idx) = self.workspace.tabs().iter().position(|t| t.id() == active) {
             self.tab_scroll_handle.scroll_to_item(idx);
         }
+    }
+
+    /// タブバーを横スクロールする（Issue #961）。
+    ///
+    /// `overflow_x_scroll` の hitbox が `occlude()` で落ちる位置（= タブピルの上）から
+    /// 中継されてくる。GPUI の既定ハンドラと**同じことをする**: offset を足すだけで
+    /// クランプはしない（次の prepaint が `-max_offset..=0` へ丸める）ので、
+    /// ピルの上と隙間の上で挙動が一致する
+    pub(crate) fn scroll_tab_bar_by(
+        &mut self,
+        delta: &ScrollDelta,
+        line_height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let dx = tab_scroll_dx(delta, line_height);
+        if dx == Pixels::ZERO {
+            return;
+        }
+        let offset = self.tab_scroll_handle.offset();
+        self.tab_scroll_handle
+            .set_offset(point(offset.x + dx, offset.y));
+        cx.notify();
     }
 
     /// タブバーの + ボタン: クリックされたウィンドウに新規タブを作る（Issue #339。
@@ -460,8 +538,9 @@ impl TakoApp {
                                         .flex_shrink_0()
                                         .rounded(px(8.0))
                                         .cursor_pointer()
-                                        // 根 div の Drag ヒットテストに勝たせる（#576）
-                                        .occlude()
+                                        // 根 div の Drag ヒットテストに勝たせる（#576）+
+                                        // ホイールをスクロール領域へ中継する（#961）
+                                        .occlude_scrolling(cx)
                                         .when(is_drag_source, |d| {
                                             d.opacity(0.4)
                                                 .border_1()
@@ -647,8 +726,9 @@ impl TakoApp {
                                                     .justify_center()
                                                     .rounded(px(5.0))
                                                     .cursor_pointer()
-                                                    // 根 div の Drag ヒットテストに勝たせる（#576）
-                                                    .occlude()
+                                                    // 根 div の Drag ヒットテストに勝たせる（#576）+
+                                                    // ホイールをスクロール領域へ中継する（#961）
+                                                    .occlude_scrolling(cx)
                                                     .text_color(hsla(theme.text_muted))
                                                     .hover(|d| {
                                                         d.bg(rgba(theme.surface_highlight))
@@ -679,8 +759,9 @@ impl TakoApp {
                                                 .justify_center()
                                                 .rounded(px(5.0))
                                                 .cursor_pointer()
-                                                // 根 div の Drag ヒットテストに勝たせる（#576）
-                                                .occlude()
+                                                // 根 div の Drag ヒットテストに勝たせる（#576）+
+                                                // ホイールをスクロール領域へ中継する（#961）
+                                                .occlude_scrolling(cx)
                                                 .hover(|d| d.bg(rgba(theme.surface_highlight)))
                                                 .on_click(cx.listener(
                                                     move |this, event: &gpui::ClickEvent, _, cx| {
@@ -734,8 +815,9 @@ impl TakoApp {
                             .justify_center()
                             .rounded(px(8.0))
                             .cursor_pointer()
-                            // 根 div の Drag ヒットテストに勝たせる（#576）
-                            .occlude()
+                            // 根 div の Drag ヒットテストに勝たせる（#576）+
+                            // ホイールをスクロール領域へ中継する（#961）
+                            .occlude_scrolling(cx)
                             .hover(|d| d.bg(rgba(theme.surface_hover)))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.new_tab_in_viewport(window, cx)
@@ -994,6 +1076,76 @@ mod tests {
             let t = i as f32 / 1000.0;
             let o = tab_dot_opacity(t);
             assert!((0.0..=1.0).contains(&o), "t={t} で {o}");
+        }
+    }
+
+    /// 横 delta があればそれ、無ければ縦 delta を横へ回す（GPUI の
+    /// `overflow_x_scroll` と同じ規則。#961）
+    #[test]
+    fn ホイールの縦回転は横スクロールへ回る() {
+        let lh = px(20.0);
+        // 縦だけ → 横へ回る
+        assert_eq!(
+            tab_scroll_dx(&ScrollDelta::Pixels(point(px(0.0), px(-30.0))), lh),
+            px(-30.0)
+        );
+        // 横があれば横が勝つ（縦は捨てる = GPUI と同じ）
+        assert_eq!(
+            tab_scroll_dx(&ScrollDelta::Pixels(point(px(12.0), px(-30.0))), lh),
+            px(12.0)
+        );
+        // 行単位は line_height 倍
+        assert_eq!(
+            tab_scroll_dx(&ScrollDelta::Lines(point(0.0, 2.0)), lh),
+            px(40.0)
+        );
+        // 完全にゼロなら何もしない
+        assert_eq!(
+            tab_scroll_dx(&ScrollDelta::Pixels(point(px(0.0), px(0.0))), lh),
+            Pixels::ZERO
+        );
+    }
+
+    /// スクロール領域の中で `occlude()` する要素は、必ずホイールを中継する（#961 の番犬）。
+    ///
+    /// 素の `.occlude()` に戻すと GPUI の hit test が break してスクロール領域の
+    /// hitbox が落ち、**タブピルの上でホイールが一切効かなくなる**（#576 が
+    /// #208 のスクロールを壊した機序そのもの）。ソース走査なので macOS からも
+    /// Windows CI からも走る
+    #[test]
+    fn スクロール領域の中のoccludeはホイールを中継する() {
+        let src = include_str!("tab_bar.rs");
+        // `tab-scroll-area` の中にあり、かつ occlude する要素の id
+        let inside = [
+            r#".id(("tab", "#,
+            r#".id(("tab-bg", "#,
+            r#".id(("tab-close", "#,
+            r#".id("tab-new")"#,
+        ];
+        let lines: Vec<&str> = src.lines().collect();
+        for id in inside {
+            let at = lines
+                .iter()
+                .position(|l| l.contains(id))
+                .unwrap_or_else(|| panic!("{id} が見つからない（id を変えたら番犬も直すこと）"));
+            // その要素のビルダ連鎖（次の `.id(` の手前まで）に occlude 系が 1 つある
+            let end = lines[at + 1..]
+                .iter()
+                .position(|l| l.contains(".id("))
+                .map(|i| at + 1 + i)
+                .unwrap_or(lines.len());
+            let chain = &lines[at..end];
+            let relays = chain
+                .iter()
+                .filter(|l| l.contains(".occlude_scrolling(cx)"))
+                .count();
+            let bare = chain.iter().filter(|l| l.trim() == ".occlude()").count();
+            assert_eq!(
+                (relays, bare),
+                (1, 0),
+                "{id}: スクロール領域の中では occlude_scrolling(cx) を使うこと \
+                 (#961。relays={relays} bare={bare})"
+            );
         }
     }
 

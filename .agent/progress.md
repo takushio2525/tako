@@ -3326,3 +3326,28 @@
   `run-arms.ps1` は cp932 で壊れていて使えない / ログ読みは `-Encoding Default`）
 - **A/B の意味が 8/24 から変わっている**（`87feff8` で LF legacy を撤去したため、
   `TAKO_899_LEGACY=1` はクォートだけを戻す = 落ちるのは (d1) ではなく **(d2)**）
+
+## 2026-08-27（#961: タブバーの横スクロールが効かない問題を根治）
+- 原因は **`0880c26`（#576 / スライス 5。2026-08-21 に main へ）がタブピルへ付けた
+  `occlude()`**。GPUI の `Window::hit_test` は `HitboxBehavior::BlockMouse` で**走査を
+  break** するので祖先の `tab-scroll-area` の hitbox が `mouse_hit_test.ids` から落ち、
+  `overflow_x_scroll` と `on_scroll_wheel` の発火条件（`should_handle_scroll()` =
+  `ids.contains`）が**ピルの上で常に false** になる。ピルは領域のほぼ全面を覆うので
+  #208 の横スクロールが丸ごと死んでいた（ユーザー報告の「8/21 main ビルド」と一致）
+- **`occlude()` は外せない**（#576 が再発する）。`block_mouse_except_scroll()` も
+  緩めるのは `is_hovered` だけで `ids` には祖先が積まれたままなので、Windows の
+  `on_hit_test_window_control` が `WindowControlArea::Drag` を拾って同じく再発する。
+  そこで**スクロール領域の中で occlude する要素が自分でホイールを中継する**形にした
+  （`TabScrollOcclude::occlude_scrolling`。対象は `("tab",…)` / `("tab-bg",…)` /
+  `("tab-close",…)` / `tab-new` の 4 つ）。中継の計算は GPUI 既定と同じ意味論なので
+  ピルの上と隙間の上で挙動が一致する
+- 実測（同一バイナリ A/B。`TAKO_961_LEGACY=1` が #961 前）: ピル中心へ実 `PlatformInput` の
+  ホイールを流すと **旧 `-0.0 → -0.0`（まったく動かない）/ 新 `-0.0 → -120.0`**。
+  さらに端まで転がすと**埋もれていた最後のタブ**が `right 766 → 570`（領域右端 603）で
+  visible になる = 症状そのものの回復
+- **`ScrollHandle::bounds_for_item` はスクロール量を含まないレイアウト座標**を返す
+  （offset を -196 まで転がしても `right` は 766.0 のまま）。可視判定は `right + offset.x` で見る
+- 検証: 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 129 新設）+ `TAKO_961_LEGACY=1` で
+  項目 129 が FAILED（検出力）+ 番犬ユニット（領域の中の 4 要素が `occlude_scrolling` を使う）+
+  delta 規則のユニット + fmt / clippy / `cargo test --workspace` 全緑 + CI 全 pass
+- 関連コミット: PR #968（`Refs #961`）

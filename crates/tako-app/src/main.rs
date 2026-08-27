@@ -53696,6 +53696,212 @@ mod self_test {
                 }
             }
 
+            // 129. タブバーの横スクロールが「タブピルの上」でも効く（#961）。
+            //
+            // #576 がタブピルへ `occlude()`（= `HitboxBehavior::BlockMouse`）を付けた結果、
+            // GPUI の `Window::hit_test` がピルで **break** して祖先の
+            // `tab-scroll-area` の hitbox が `mouse_hit_test.ids` から落ちる。
+            // `overflow_x_scroll` の発火条件は `hitbox.should_handle_scroll()`
+            //（= `ids.contains`）なので、**ピルの上ではホイールがスクロール領域へ
+            // 一切届かない** = #208 の横スクロールが丸ごと死んでいた。
+            //
+            // タブを表示幅超過まで増やし（PTY は起こさない）、ピルの実描画矩形の中心へ
+            // 実 `PlatformInput` のホイールを流して offset が動くことを見る。
+            // `TAKO_961_LEGACY=1`（= 中継なしの素の occlude）では動かない
+            {
+                let any961 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window961 = any961.downcast::<TakoApp>().unwrap_or(window);
+                // タブを 4 枚ずつ足して、はみ出す（max_offset.x > 0）まで増やす。
+                // PTY は起こさない = `pending_attach` を捨てるので、シェルは 1 つも増えない
+                let mut made: Vec<TabId> = Vec::new();
+                let mut overflow = false;
+                for _ in 0..10 {
+                    let _ = window961.update(cx, |app: &mut TakoApp, _, cx| {
+                        for _ in 0..4 {
+                            let r = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::TabNew {
+                                    title: Some("961-スクロール検証".into()),
+                                    focus: Some(false),
+                                    cwd: None,
+                                },
+                                PaneOrigin::Cli,
+                            );
+                            // セッション起動依頼は捨てる（タブバーの描画に PTY は要らない）
+                            app.pending_attach.clear();
+                            if let Ok(v) = r {
+                                if let Some(pane) = v["pane"].as_u64().map(PaneId::from_raw) {
+                                    if let Some(tab) = app.workspace.find_tab_of_pane(pane) {
+                                        made.push(tab);
+                                    }
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                    notify_and_draw(any961, window961, cx);
+                    overflow = window961
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.tab_scroll_handle.max_offset().x > px(0.0)
+                        })
+                        .unwrap_or(false);
+                    if overflow {
+                        break;
+                    }
+                }
+                check(
+                    overflow,
+                    "129: タブを増やせばタブバーがはみ出す（スクロールの前提。#961）",
+                );
+                // 症状（「増えたタブが埋もれて**アクセスできない**」）の前提を
+                // スクロールする前に採っておく。索引は**全タブ**の最後（作った分だけでなく
+                // セルフテストが元から持っているタブも scroll area の子に並ぶ）
+                let (last_ix, hidden_before) = window961
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let ix = app.workspace.tabs().len().saturating_sub(1);
+                        let area = app.tab_scroll_handle.bounds();
+                        // `bounds_for_item` は**スクロール量を含まない**レイアウト座標を返す
+                        //（実測: offset を -196 まで転がしても right は 766.0 のまま）ので、
+                        // 見えているかは offset を足して判定する
+                        let off = app.tab_scroll_handle.offset().x;
+                        let hidden = app
+                            .tab_scroll_handle
+                            .bounds_for_item(ix)
+                            .map(|b| b.right() + off > area.right())
+                            .unwrap_or(false);
+                        (ix, hidden)
+                    })
+                    .unwrap_or((0, false));
+                // 実描画されたタブピルの矩形（= スクロール領域の子）。
+                // 先頭は端に寄っているので 2 枚目の中心を使う
+                let pill = window961
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.tab_scroll_handle.bounds_for_item(1)
+                    })
+                    .ok()
+                    .flatten();
+                match pill {
+                    None => println!("TAKO_SELF_TEST_SKIPPED: 129（タブピルの矩形を採れない）"),
+                    Some(pill) => {
+                        let at = pill.center();
+                        let before = window961
+                            .update(cx, |app: &mut TakoApp, _, _| app.tab_scroll_handle.offset().x)
+                            .unwrap_or(px(0.0));
+                        // `hitbox.should_handle_scroll` は**フレーム構築時の hit test**を見るので、
+                        // 動かしてから 1 フレーム描き、そのあとホイールを流す（#496 と同じ作法）
+                        let _ = any961.update(cx, |_, win, cx| {
+                            win.dispatch_event(
+                                gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                                    position: at,
+                                    pressed_button: None,
+                                    modifiers: Modifiers::default(),
+                                }),
+                                cx,
+                            )
+                        });
+                        notify_and_draw(any961, window961, cx);
+                        let _ = any961.update(cx, |_, win, cx| {
+                            win.dispatch_event(
+                                gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                    position: at,
+                                    delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                                    ..ScrollWheelEvent::default()
+                                }),
+                                cx,
+                            )
+                        });
+                        notify_and_draw(any961, window961, cx);
+                        let (after, max) = window961
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                (
+                                    app.tab_scroll_handle.offset().x,
+                                    app.tab_scroll_handle.max_offset().x,
+                                )
+                            })
+                            .unwrap_or((px(0.0), px(0.0)));
+                        // 期待値: -120px（はみ出し量がそれ未満ならクランプされた値）
+                        let want = px(-120.0).max(-max);
+                        println!(
+                            "TAKO_SELF_TEST_961: legacy={} tabs={} pill=({:.1},{:.1}) \
+                             offset {:.1}->{:.1} want={:.1} max={:.1}",
+                            std::env::var_os("TAKO_961_LEGACY").is_some(),
+                            made.len(),
+                            f32::from(at.x),
+                            f32::from(at.y),
+                            f32::from(before),
+                            f32::from(after),
+                            f32::from(want),
+                            f32::from(max),
+                        );
+                        check(
+                            (f32::from(after) - f32::from(want)).abs() < 1.0,
+                            &format!(
+                                "129: タブピルの上のホイールでタブバーが横スクロールする \
+                                 (#961。{:.1}->{:.1} / want {:.1})",
+                                f32::from(before),
+                                f32::from(after),
+                                f32::from(want)
+                            ),
+                        );
+                        // 症状そのもの（「増えたタブが埋もれて**アクセスできない**」）が
+                        // 直っているかを、最後のタブの実描画矩形で見る。
+                        // 端まで転がして、スクロール領域の中に入ってくること
+                        // 1 回ずつ描きながら端まで転がす（クランプは prepaint で効くので、
+                        // 描かずに撃ち込むと未クランプの値が積み上がるだけで実態とずれる）
+                        for _ in 0..30 {
+                            let _ = any961.update(cx, |_, win, cx| {
+                                win.dispatch_event(
+                                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                        position: at,
+                                        delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                                        ..ScrollWheelEvent::default()
+                                    }),
+                                    cx,
+                                )
+                            });
+                            notify_and_draw(any961, window961, cx);
+                        }
+                        let (reachable, rolled, area_r, last_r) = window961
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                let area = app.tab_scroll_handle.bounds();
+                                let last = app.tab_scroll_handle.bounds_for_item(last_ix);
+                                let off = app.tab_scroll_handle.offset().x;
+                                (
+                                    last.map(|b| b.right() + off <= area.right() + px(1.0))
+                                        .unwrap_or(false),
+                                    off,
+                                    area.right(),
+                                    last.map(|b| b.right() + off).unwrap_or(px(0.0)),
+                                )
+                            })
+                            .unwrap_or((false, px(0.0), px(0.0), px(0.0)));
+                        println!(
+                            "TAKO_SELF_TEST_961_REACH: last_ix={last_ix} \
+                             hidden_before={hidden_before} reachable_after={reachable} \
+                             rolled={:.1} area_right={:.1} last_right={:.1}",
+                            f32::from(rolled),
+                            f32::from(area_r),
+                            f32::from(last_r),
+                        );
+                        check(
+                            hidden_before && reachable,
+                            &format!(
+                                "129: 埋もれていた最後のタブがスクロールで見えるところまで来る \
+                                 (#961。hidden_before={hidden_before} reachable={reachable})"
+                            ),
+                        );
+                    }
+                }
+                // 後片付け: 作った検証用タブを閉じる
+                let _ = window961.update(cx, |app: &mut TakoApp, _, cx| {
+                    for tab in made {
+                        app.remove_tab(tab, cx);
+                    }
+                    cx.notify();
+                });
+                notify_and_draw(any961, window961, cx);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
