@@ -153,10 +153,10 @@ pub mod notes {
         "psmux ignores the session size options (-x / -y), so the size cannot be changed",
     );
 
-    /// #722。名前は付くので気づきにくい縮退
-    pub const WIN_AUTORENAME_HEURISTIC: Note = Note::new(
-        "タブ名は付くが、AI 命名に使う claude の検出が POSIX のログインシェル決め打ちなので常にヒューリスティック命名になる（#722）",
-        "Tabs still get named, but claude detection for AI naming assumes a POSIX login shell, so naming always falls back to the heuristic path (#722)",
+    /// #760。#722 で AI 経路は走るようになったが、命名の**質**の縮退は残る
+    pub const WIN_AUTORENAME_ONCE: Note = Note::new(
+        "AI 命名は動くが、シェル統合が無い（#525）ためタブの素材（cwd / タイトル / 実行状態）が起動後に変化せず、命名はタブごとに 1 回だけになる。claude を導入していない環境ではタブ名が PowerShell の実行ファイルパスになる（#760）",
+        "AI naming works, but without shell integration (#525) a tab's inputs (cwd, title, command state) never change after startup, so each tab is named only once. Without claude installed the tab name becomes the PowerShell executable path (#760)",
     );
 
     /// #935。登録と表示は動き、実行だけが落ちる
@@ -421,10 +421,10 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_auto_rename",
         macos: Support::Supported,
         windows: Support::Degraded {
-            note: notes::WIN_AUTORENAME_HEURISTIC,
+            note: notes::WIN_AUTORENAME_ONCE,
         },
-        windows_evidence: Evidence::SelfTest(
-            "項目 51 / 52（適用・手動優先・ON/OFF は緑）。AI 命名側は detect_claude が $SHELL -l -c 決め打ちで常に None（#722）",
+        windows_evidence: Evidence::Measured(
+            "#722 の Windows 11 実測: 隔離 GUI で AI 経路が走りタブ名が AI 由来（同素材のヒューリスティックは PowerShell のパス由来で別物）。セルフテスト項目 51 / 52（適用・手動優先・ON/OFF）も緑。残る縮退は #760 の実測（素材が不変なので 2 回目以降が発火しない）",
         ),
     },
     Feature {

@@ -3235,3 +3235,34 @@
   （検出力）+ unit 4 本 + CI macOS / Windows / Pages 全 pass
 - 関連コミット: PR #960（`Refs #945`）
 - 次: `chat_view.rs` の busy ドット 2 個（生成中だけなので恒久化はしないが同型）を別 Issue へ
+## 2026-08-27（#722: Windows でタブの AI 自動命名が走らない問題を main へ移植）
+- #617 と同じ型で、**実装は main に 1 行も入っていなかった**（win467 の `609615f` /
+  PR #762 は open のまま）。main の `autorename::detect_claude()` は今日まで
+  `$SHELL -l -c "command -v claude"` の直呼びで、Windows には `SHELL` も `/bin/sh` も
+  無いため `CreateProcess` が失敗 → `.ok()?` で `None` → `claude_bin()` は `OnceLock` なので
+  **プロセスが生きている限り AI 命名が永久に無効**。ログにも UI にも何も出ない
+- main の `autorename.rs` は #552 で大きく変わっていた（`RENAME_MIN_INTERVAL` /
+  `sanitize_title` / `lang` 引数）ので、パッチ当てではなく**該当箇所だけ手で移植**した
+- 中身 3 つ: 探索を **B16（`platform::exe::find`）へ委譲**（判断部分は純粋関数
+  `resolve_claude` に切り出し、探索と実ファイル判定を注入して**両プラットフォームぶんを
+  macOS から検査**）/ `CLAUDE_TIMEOUT` 30s → 120s（#722 の実測でアイドルでも
+  19.8 / 25.2 / 31.0 秒、隔離 GUI で 80.2 秒。30s のままだと解決できても打ち切られ
+  #722 と見分けが付かない）/ `TAKO_AUTORENAME_DIAG=1`（**メタ情報だけ**。プロンプト・
+  応答・画面末尾は出さない = AGENTS.md の絶対ルール）
+- 番犬 `実行ファイルの探索がログインシェル経由で境界の外に残っていない` を新設。
+  **`"-l", "-c"` と `command -v` の AND** で拾うので、ペインへ打ち込む文字列
+  （セルフテストの `type_text(.., "command -v tako", ..)`）や doc コメントを巻き込まない。
+  #898 の番犬（`which` / `where` の直起動 = 「Windows に無いコマンド」）とは形が違うので別に置いた
+- **マトリクスは `Supported` へ倒さなかった**（#617 と同じ基準 = 実態に合わせる）。
+  #760 の実測どおり、シェル統合が無い（#525）ので cwd / タイトル / 実行状態が起動後に
+  変化せず**命名はタブごとに 1 回だけ**。`Degraded` のまま理由文を
+  `WIN_AUTORENAME_HEURISTIC`（「常にヒューリスティックになる」= もう嘘）から
+  `WIN_AUTORENAME_ONCE` へ差し替え、evidence を #722 の実測 + セルフテスト項目 51 / 52 に
+- 検証: fmt / clippy(--all-targets -D warnings) / test --workspace / Windows クロスチェック /
+  docs 再生成。検出力は旧実装（ログインシェル直呼び）を注入して番犬が
+  `autorename.rs:278` を名指して FAILED することを実測
+- **実機未検証**（Windows offline）: AI 命名が実際に走ってタブ名が AI 由来になること /
+  claude 不在時のヒューリスティック落ち / `#[ignore]` の実 claude e2e。#722 は open 維持
+- 副産物 **#962 起票**: `daemon_stop_implはゾンビpidを終了済みとして扱う` が負荷次第で落ちる
+  （2 秒アサートに対し実測 2.27 / 5.10 / 10.07 秒）。#617 では `origin/main` の remote.rs へ
+  差し替えても落ち、#722 では remote.rs の差分が **0 行**なのに落ちたので main 由来で確定
