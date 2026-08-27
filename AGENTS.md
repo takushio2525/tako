@@ -70,6 +70,13 @@ tako/
   1 実装が担保する。**永続構造体のフィールドを増減・改名した PR は
   `migration_registry` テスト（指紋スナップショット）が落ちる**ので、
   「serde の default / alias で旧ファイルがそのまま読める」か「移行を足した」かを明示する
+- **agent 系統ごとの能力差はマトリクスへ書く（#982）**: claude 以外で落ちる / まだ使えない機能を
+  作った・見つけたら、判断を `if agent == claude` で散らさず
+  **`tako-core::agent_support::MATRIX` の 1 マス**として宣言する（正本 1 箇所・根拠必須・日英の理由文）。
+  能力を問う側は `agent_support::supports(agent, keys::…)` を通す。
+  この宣言は診断・docs・将来の system prompt がすべて引くので、**過大にも過小にも申告しない**。
+  agent 種別の enum は現状 5 つ並存している（統合しない理由と対応表は `.agent/agent-enums.md`）ので、
+  **値を増減させた PR は `agent_parity` テストが落ちる** = マトリクスの列と docs も直すこと
 - **「最も簡単なコマンドを提案する」原則（#322）**: ユーザーへ提示するコマンドは常に最簡形
   （既定値で済む引数を付けない。`tako master -default` ではなく `tako master`）。機能追加は
   新しい `--オプション` ではなく既定動作を賢くする方向で設計する。CLI 出力・system prompt・
@@ -142,6 +149,7 @@ tako/
 | UI 表示モード切替（GUI ライク表示。#691/#694/#702/#715/#716/#720/#725/#737/#739） | `tako ui-mode [gui\|terminal\|toggle]`（引数なしで現在値。既定 terminal = 従来の表示。gui ではアイドルなシェルのペインが「AI チームに任せる / AI と 1 対 1 で話す / コマンド入力へ」の 3 ボタン + 下部に「初期設定をやり直す（`tako setup`）」の控えめなリンクになり、**claude 対話ペインは会話ビュー**になる。**起動カードの右端の ▾ でプロファイルを選べる**（#739。選択肢が 2 つ以上のときだけ出て、選ぶと `tako master -<名前>` が入る。カード本体は既定起動のまま = #322 の最簡形。各項目に担当プロジェクト / 起動フォルダ / モデルの手がかりが付く）。settings.json 永続化・全ウィンドウ即時反映。タブバーのテーマボタン左隣 / ⌘K パレット / MCP `tako_ui_mode` と 1:1）<br>**ペインを作った直後・エージェントを起動した直後は「準備中…」で覆う**（#720。direnv のロードログや起動途中の画面を見せない。上限つきなので確定しなければ通常表示へ落ちる。ヘッダの「ターミナルを表示」でいつでも中身へ抜けられる。`tako run` のようにコマンド付きで作るペインは覆わない）。`tako ui-mode` の応答 `pane_display` が**いま各ペインに何が出ているか**（`terminal` / `starter` / `chat` / `preparing`）を返すので、AI は画面の状態をそのまま確認できる<br>会話ビューの中身: モデル名・状態・コンテキスト残量バー（**80% 超で警告色 + 「/compact で会話を軽くする」の押せるヒント**。#739）・md 描画・ツール / 思考の折りたたみ・下端追従 + **user / assistant とも枠付きブロック**（#737。発話の境界とコピー対象が一目で分かる）+ **生成中は会話末尾の AI 側に作業中インジケータ**（#737。TUI のスピナー行 = 作業内容 + 経過時間 + 受信トークン数。終わると本文に置き換わる）+ **生成中に送った指示もすぐ自分の吹き出しで見える**（#737。transcript の `queue-operation` を読むので配送前から出て、配送後も二重化しない）+ **入力欄** + **スラッシュボタン 3 つ**（/compact・/clear（確認つき）・/help）+ **承認カード**（画面に permission ダイアログが実在するときだけ。押下は `tako orchestrator respond` と同経路）+ **コマンド提案カード（#666）のインライン表示**（md コードブロック風 = 背景パネル + 等幅 + コピー / 新規ペイン実行。ターミナル表示では従来の帯 #703）。画像添付・システム通知は正規化層で分類され生 XML は出ない（#715）<br>**入力欄は claude TUI の入力行のミラー（#718/#719）**: ローカル下書きを持たず打鍵は PTY へ素通しなので、Enter / Shift+Enter・IME・画像ペースト（⌘V = Ctrl+V 素通しで TUI が `[Image #N]` を挿入）・ゴースト提案が TUI と完全に一致し、表示モードを往復してもズレない。箱の高さは TUI の入力行数に追従し（1 行なら 1 行ぶん）8 行で頭打ち。**worker ペインにも入力欄が出る**（直接指示可）<br>**入力欄に見える文字列は常にミラー 1 本（#737）**: TUI が箱の中に自前の案内文（空欄時の `Try "…"` / キュー滞留時の `Press up to edit queued messages`）を描いているときは tako のプレースホルダを重ねない（重なって読めなくなっていた回帰の根治）。**IME の未確定文字列と変換候補ウィンドウは入力欄のキャレット位置**に出る（チャット表示はターミナルグリッドを描かないので、セル座標のアンカーは画面上のどこも指していなかった）<br>**会話本文はドラッグで選択でき ⌘C / ⌘A が効く（#725）**: 選択はプレビューと同じ実 shaping 座標系で、**複数の発話にまたがって**掃ける。発話の右にはコピーボタン（画面と同じプレーンテキストで全文。折りたたみ中でも全文）、md コードブロックには #680 と同じコピーボタンが出る<br>`tako ui-mode release [--pane N]` = そのペインだけターミナル表示へ（揮発。`restore` で戻す）。**表示レイヤだけの切替なので PTY・tmux セッション・実行中プロセスには影響しない** |
 | チャット本文のコピー（#725） | `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]`（UI のコピーボタンと同じ経路。`--message` 省略で**最後の assistant 発話**、`--list` で添字・role・文字数・コードブロック数の下見、`--code` でその発話のコードブロックだけ、`--markdown` で md ソースをそのまま。既定は画面と同じプレーンテキスト。MCP `tako_chat_copy` と 1:1） |
 | プラットフォーム対応マトリクス（#515 / #591） | `tako platform [--platform macos\|windows] [--status pending] [--known-limitations] [--json]`（この環境でどの機能が使える / 縮退 / 未実装かを表示。`--known-limitations` はリリースノート用の日英併記 markdown を出力（#594）。GUI 不要のローカル処理。MCP `tako_platform` と 1:1）。<br>**Windows の判定には実測根拠が必須（#591）**: `Feature::windows_evidence` に「実機セルフテストの項目 / 実機で緑のテスト名 / 実測の記録」のどれかを書く。書かずに `Supported` / `Degraded` / `Unsupported` へ倒すと **T7 が落ちる**（未実測なら `Pending` + `notes::WIN_UNVERIFIED` + 追跡 #937 のまま置く）。宣言は `PlatformFacts` 経由で master / solo / setup の system prompt へ流れる（#516）ので、**過大申告はエージェントを誤らせ、過小申告は使える機能を回避させる** |
+| **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude\|codex\|agy\|local] [--status supported\|degraded\|pending\|unsupported] [--json]`（**どのエージェント CLI でどこまで claude と同じことができるか**を表示。引数なしで全系統の表、`--agent` で理由と根拠つきの一覧。GUI 不要のローカル処理。MCP `tako_agent_support` と 1:1）。<br>**判定には根拠が必須（#982）**: `AgentEvidence` に「コード本文の引用 / 上流 CLI の仕様 / 実測の記録 / 緑のテスト名」のどれかを書く。書かずに claude 以外を `Supported` / `Degraded` / `Unsupported` へ倒すと **`t7_claude以外の判定には根拠が要る` が落ちる**（未調査なら `Pending` + 追跡 Issue のまま置く）。**「上流に手段が無い（`Unsupported`）」と 「まだ調べていない（`Pending`）」を混ぜない** = 未調査を `Unsupported` へ倒すと、宣言を読むエージェントが open な道を永久に避ける。docs は生成物（`node scripts/gen-agent-support-docs.mjs`。CI が `--check`）|
 | Windows 対応状況ページの生成（#591） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs`（`docs/src/content/docs/windows-support.md` は**生成物**。`--check` で同期検査し CI の macOS ジョブが実行する。カテゴリ未分類の機能があると生成が失敗するので、機能追加時の分類漏れもここで落ちる） |
 | 右パネルのビュー切替 | `tako panel --show --view <fleet\|orch\|git>`（値は GUI のタブ表示名と同じ。orch = master + ワーカーツリーの俯瞰。`tmux` は fleet の旧称で後方互換のみ受理。#217/#553） |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]`（ファイル内 `tako:run:` 宣言 or 拡張子既定で新ペイン分割実行。`--list` でプロファイル一覧、`--wait` で完了待ち。MCP `tako_run` / `tako_run_resolve` / `tako_run_defaults` と 1:1） |
@@ -160,6 +168,7 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 - 機能要件（FR / NFR）: `.agent/requirements.md`
 - 技術設計・リスク・3 層制御プレーン: `.agent/architecture.md`
 - 規約（命名・エラー・ログ）: `.agent/conventions.md`
+- agent 種別 enum の対応表（統合しない理由・寄せ先一覧）: `.agent/agent-enums.md`
 - 手動確認チェックリスト（IME・.app 等、機械検証できない項目）: `.agent/manual-checks.md`
 - オーケストレーター使い方ガイド: `.agent/orchestrator.md`
 

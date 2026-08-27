@@ -11,6 +11,8 @@ use std::path::Path;
 
 use serde_json::json;
 
+use tako_core::agent_support;
+
 use super::{EnvPlan, EMPTY_ENV_PLAN};
 
 /// worker として起動できるエージェント CLI の種別
@@ -51,9 +53,19 @@ impl WorkerAgent {
     }
 
     /// `claude agents --json` による一次 status シグナルを持つか。
-    /// 持たない種別（codex / agy）の worker_status は画面推定にフォールバックする
+    /// 持たない種別（codex / agy）の worker_status は画面推定にフォールバックする。
+    ///
+    /// **判定の正本は `tako_core::agent_support`**（#982）。ここは同じ問いを
+    /// 型の近いところから引けるようにする薄い入口で、能力の増減はマトリクス側で行う。
+    /// `TAKO_982_LEGACY=1` で吸収前（この場所の直書き）へ戻せる
     pub fn has_agents_api(&self) -> bool {
-        matches!(self, Self::Claude)
+        if legacy_capability_check() {
+            return matches!(self, Self::Claude);
+        }
+        agent_support::supports(
+            agent_support::Agent::from(*self),
+            agent_support::keys::WORKER_STATUS_STRUCTURED,
+        )
     }
 
     /// この CLI が受け付ける effort の既知の値（選択式 UI 用。#721）。
@@ -84,6 +96,47 @@ impl WorkerAgent {
             Self::Codex | Self::Agy => true,
         }
     }
+}
+
+/// 能力マトリクス（#982）の正本 enum への写し。
+///
+/// **`WorkerAgent` は「tako が TUI をキー操作で駆動できる系統」**の enum なので
+/// ローカル LLM（`Agent::Local`。#991 で TUI 前提を外す）に対応する値を持たない。
+/// 逆向き（`Agent` → `WorkerAgent`）は `Local` を落とす部分写像になるため
+/// `TryFrom` で表す。対応関係の一覧は `.agent/agent-enums.md`、
+/// 機械検証は `crates/tako-control/tests/agent_parity.rs`
+impl From<WorkerAgent> for agent_support::Agent {
+    fn from(v: WorkerAgent) -> Self {
+        match v {
+            WorkerAgent::Claude => Self::Claude,
+            WorkerAgent::Codex => Self::Codex,
+            WorkerAgent::Agy => Self::Agy,
+        }
+    }
+}
+
+impl TryFrom<agent_support::Agent> for WorkerAgent {
+    type Error = String;
+
+    fn try_from(v: agent_support::Agent) -> Result<Self, Self::Error> {
+        match v {
+            agent_support::Agent::Claude => Ok(Self::Claude),
+            agent_support::Agent::Codex => Ok(Self::Codex),
+            agent_support::Agent::Agy => Ok(Self::Agy),
+            // TUI をキー操作で駆動する前提が無いので worker として起動できない（#991）
+            agent_support::Agent::Local => Err(
+                "ローカル LLM はまだ worker として起動できない（TUI 前提を外す経路は #991）"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// 能力の判定を吸収前（各所での直書き）へ戻す逃げ道（#982 の A/B）。
+/// 一度だけ読んでキャッシュする
+fn legacy_capability_check() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_982_LEGACY").is_some())
 }
 
 /// worker 起動コマンドの組み立てパラメータ
@@ -315,6 +368,27 @@ fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    /// 能力判定をマトリクスへ吸収した（#982）が、**判定結果は 1 ビットも変わっていない**こと。
+    ///
+    /// `TAKO_982_LEGACY=1` は同一バイナリから吸収前の直書きへ戻す逃げ道だが、
+    /// 環境変数は `OnceLock` でキャッシュするのでテストから切り替えられない。
+    /// 代わりに**両者が同じ答えを返す**ことを静的に固定する
+    /// （これが崩れたときだけ A/B の env が意味を持つ）
+    #[test]
+    fn 構造化シグナルの判定は吸収前と一致する() {
+        for a in WorkerAgent::ALL {
+            let legacy = matches!(a, WorkerAgent::Claude);
+            assert_eq!(
+                a.has_agents_api(),
+                legacy,
+                "{} で吸収前後の判定が食い違う。マトリクス側を変えたなら \
+                 crates/tako-core/src/agent_support.rs の worker_status_structured 行と \
+                 ここの期待値を同時に見直すこと",
+                a.as_str()
+            );
+        }
+    }
+
     /// POSIX 形式を固定するスナップショット群なので構文を明示する（#867。
     /// 既定版は動いているシェルを見るので、Windows では PowerShell を返す）
     const POSIX: crate::launch_cmd::ShellDialect = crate::launch_cmd::ShellDialect::Posix;

@@ -427,6 +427,16 @@ pub fn gate_in(platform: Platform, key: &str, lang: crate::i18n::Lang) -> Result
 /// 全機能の対応状況。**キーは昇順**（T4 が検証する）
 pub const MATRIX: &[Feature] = &[
     Feature {
+        key: "tako_agent_support",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        // 静的な表を引くだけの純粋処理で、OS 依存の口を 1 つも通らない
+        // （`tako_platform` と同じ性質）
+        windows_evidence: Evidence::UnitTest(
+            "agent_parity 5 本と agent_support の単体 15 本が緑（判定は純粋関数で OS を見ない）",
+        ),
+    },
+    Feature {
         key: "tako_agents_sync_rules",
         macos: Support::Supported,
         windows: Support::Supported,

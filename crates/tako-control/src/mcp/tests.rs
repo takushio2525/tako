@@ -501,7 +501,7 @@ mod tests {
         // #915 の tako_orchestrator_handoffs（引き継ぎファイルの管理）を追加して 138
         // #916 の tako_migrate（設定の自動マイグレーション）を追加して 139
         // #919 の tako_remote_folder（リモートからフォルダを開く）を追加して 140
-        assert_eq!(tools.len(), 140);
+        assert_eq!(tools.len(), 141);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

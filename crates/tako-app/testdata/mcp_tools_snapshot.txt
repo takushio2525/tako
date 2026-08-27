@@ -1,3 +1,4 @@
+tako_agent_support
 tako_agents_sync_rules
 tako_auto_rename
 tako_autosuggest

@@ -3429,3 +3429,35 @@
   行末バッジ（`SSH <host>`・切断で赤）へ。実ピクセルで `order_ok=true` / `badge_live=547`
 - 関連: PR #998（`Refs #976`）。セルフテスト項目 130 新設で `TAKO_APP_SELF_TEST_OK`。A/B は `TAKO_976_LEGACY=1`
 - 次: ユーザー体感の確認（close は master 判断）。Windows は argv が採れず自動検知は未対応（明示経路のみ）
+
+## 2026-08-27（#982: agent 能力マトリクスの新設 — agent 軸の正本 + 根拠必須テスト + docs --check）
+- OS 軸の `platform::support`（#515 / #591）と**同じ設計**で `tako-core::agent_support` を新設。
+  40 能力 × claude / codex / agy / ローカル LLM を `AgentSupport` 4 値 + `AgentEvidence` で宣言し、
+  `WorkerAgent::has_agents_api()` を吸収（`TAKO_982_LEGACY=1` で吸収前へ戻せる。判定が
+  1 ビットも変わっていないことは等価性テストで固定）。初期値は棚卸しレポート §1 / §9 由来
+- **`Source`（コード本文の引用）を根拠の種別に足した**: OS 軸の能力は実機を動かさないと
+  分からないが、agent 軸の能力は大半が **tako 自身の配線の有無**で決まるので grep で確定できる。
+  上流に手段が無い（`ByDesign`）のとは別種
+- **「上流に手段が無い（`Unsupported`）」と「まだ調べていない（`Pending`）」を混ぜない**のを
+  テストで縛った。未調査を `Unsupported` へ倒すと、宣言を読むエージェントが open な道を
+  永久に避ける（#985 が agy の limit について警告しているのと同じ罠）
+- **5 enum は統合せず対応を機械検証**（`agent_parity.rs`）。値の集合が本当に違う
+  （`Local` は `WorkerAgent` に無いのが正しい）ため。判定は**ソース走査**でそろえた =
+  `SetupAgent` が非公開 enum で型として見えないので、5 つを 1 つの規則で見張るにはこれが要る。
+  型が見える 4 つは網羅 match の変換で二重化（`LimitService` へ値を足すと**コンパイルが通らない**）
+- 1:1 公開は `tako agent-support`（ローカル処理 = GUI 無しでも引ける）+ MCP
+  `tako_agent_support`（141 ツール）。docs は生成物 `docs/.../agent-support.md` で CI が `--check`
+- 判定の内訳（supported + degraded）: claude 40 / codex 19+7 / agy 9+6 / local 0。
+  **自己レビューで local 列の過大申告 4 件を是正**（ダイアログ系と事前信頼を `Unsupported` から
+  `Pending` へ）: #990 が codex を借りるなら画面は codex の TUI なのでダイアログは在る =
+  「上流に手段が無い」ではなく「ハーネスが決まっていない」が正しい。自分で入れた
+  「未調査を Unsupported へ倒さない」規則を自分が破っていた
+- 検証: fmt / clippy（両 feature）/ `test --workspace` **2666 passed 0 failed** /
+  クロスチェック エラー 0・警告 9 が**全件 未変更ファイル由来**（main と同一）/
+  隔離セルフテスト `TAKO_APP_SELF_TEST_OK` / docs build 26 ページ。
+  検出力 5 通り（根拠なし Supported / 未調査 Unsupported / 非公開 enum の値追加 /
+  MATRIX 行の欠落 / docs のカテゴリ未分類）を実際に壊して FAILED を実測
+- 高負荷（load 27.85）で**項目 108（#786）が落ちた**が、tako-app の製品コードは main と
+  バイト同一（差分は testdata 1 行のみ）で、load 14 では `output=(panes +1 chrome +0)` で通る。
+  #858 が項目 110 に入れた「窓が汚れたら測り直す」ガードが 108 には無い = main 由来（別途起票）
+- 次: S1 以降は「マトリクスの 1 マスを動かして根拠を書く」粒度。寄せ先一覧は `.agent/agent-enums.md`
