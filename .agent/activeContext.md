@@ -17,6 +17,60 @@
   CI と実機が共有する ③版数の比較は**数値部分**（`--promote` は Cargo.toml=`0.8.0-test.1` /
   タグ=`v0.8.0` で同一 commit になるため厳密一致にすると落ちる）④片肺の検査は
   `scripts/release.sh --check-assets [tag]`、モックテストは `scripts/test-release-retry.sh`
+- **#975（agent parity エピック）の緊急 2 件**（別ラインの作業。Windows 系とは独立）:
+  **#981 は完了**（codex のサンドボックス解除を明示 opt-in へ。`bypass_sandbox` 既定 false +
+  既存プロファイルは移行で `true` = 挙動不変。A/B は `TAKO_981_LEGACY=1`）/
+  **#983 は変更 1 のみ**（agent CLI の実在をペイン作成前に確かめる。A/B は `TAKO_983_LEGACY=1`。
+  変更 2 / 3 = 送達観測手段の無い agent を `NotApplicable` のまま黙らせない・系統の網羅は
+  **#982 の merge 後**）
+- **codex の実測（#981 の根拠。再調査を避ける）**: 承認スキップとサンドボックス解除は
+  同一フラグしか無い。既定（read-only）は cwd 内への書き込みすら不可 / `workspace-write` は
+  ネットワークと cwd 外が不可 / `danger-full-access` で両方可 → worker の実務
+  （cargo・gh・data dir 書込）が成立しないので中間状態は作らず 2 択にした
+- **`tako master` / `tako solo` は表示言語を初期化していなかった**（`i18n::CURRENT` の静的既定が
+  En）。#983 で 1 行足して揃えたが、**他にも `Note` 由来の文言を出す CLI 経路があれば同じ穴**
+
+- **#932（ちらつき）第 2 ラウンド: タブ切り替えの「遅れリサイズ」を突き止めて根治した**。
+  裏タブのペインは `render_pane` を通らないので、#647 が入ったあとも**幾何の変更**
+  （ウィンドウ寸法・サイドバー幅・バナー）が届かず、表に出した瞬間に初めて
+  リサイズ = SIGWINCH が飛んでいた（実測 裏 116x37 / 表 88x33 → 表に出した瞬間 88x33）。
+  割り出しを表示中と同じ 1 本（`pane_text_area_of` → `grid_cells`）へ寄せて解消。
+  A/B は `TAKO_932_NO_OFFSCREEN_GEOMETRY=1`。**実機で症状が消えたかはユーザー確認待ち**
+- **#932 で潰した仮説（実測で否定。再調査の周回を避ける）**: 器（tmux）はリサイズで
+  画面を消さない（`ED 2` 0 回・再描画は 0.1〜0.4ms で完了）/ 実 claude の TUI は
+  SIGWINCH で消えない（4.7ms 刻みで一度も半分未満にならない）/ タブ切り替え・分割比変更・
+  ウィンドウ寸法変更でグリッドが空になることは無い（1〜5ms 刻みで `grid_blackouts=0`）。
+  詳細は `.agent/architecture.md`「裏タブのペインは「表に出たときの寸法」へ合わせる」
+- **#467 Windows 移植はスライス 1〜9 がすべて main へ入り、最後の 8（棚卸し）も完了**。
+  残りは「実機バグの消し込み」と「未実測項目の消し込み（#937）」だけ
+- **#591（対応マトリクスの棚卸し + docs ページ）を完了**。判定は
+  **supported 69 / degraded 13 / pending 56 / unsupported 2**（棚卸し前は 4 / 2 / 132 / 2）。
+  `Feature::windows_evidence` を新設し **T7 が根拠なしの Supported を落とす**。
+  docs は `docs/src/content/docs/windows-support.md`（生成物・CI で `--check`）
+- **Issue の「完了（`cf7c9a4`）」は main に入っていなかった**（#658 と同じ型）。
+  `windows/467-*` ブランチのコミットを「入っている」と読まないこと
+- **#617（ゴミ箱が完全削除）は main へ移植して解消**（実装は win467 の `d528058` /
+  `4752eee` に在り main には 1 行も入っていなかった = #658 / #591 と同じ型）。
+  `SHFileOperationW` + `FOF_ALLOWUNDO` へ差し替え、その他 unix は**削除へ劣化させずエラー**。
+  表記は `os_integration::file_manager()` 1 か所で決めて `FileManager` を値で配る。
+  **実機は offline なので #617 は open 維持**（実機確認項目は Issue コメント）
+- **#722（AI タブ命名が Windows で一度も走らない）も main へ移植して解消**。
+  `autorename::detect_claude()` だけが B16（`platform::exe::find`）へ寄せられておらず、
+  `$SHELL -l -c "command -v claude"` が Windows で必ず失敗 → `.ok()?` で `None` →
+  `OnceLock` なので永久に無効、という**黙って死ぬ**形だった。判断部分を純粋関数
+  `resolve_claude` に切り出し、`TAKO_AUTORENAME_DIAG=1` で理由を出せるようにした。
+  マトリクスは **`Supported` へは倒さず `Degraded` のまま**理由文を #760 の実態
+  （素材が不変なので命名はタブごとに 1 回だけ）へ差し替えた
+- **棚卸しで確認した残りの製品バグ（未着手）**: **#935**（受け入れゲートが `sh -c`）/
+  **#936**（古い claude の警告が出ない。#726 の続き）
+- **#937 の消し込みで見つけた製品バグ（未着手）**: **#970**（`open-in dir` の cwd が
+  `///?/C:/…` へ壊れ、そのタブの git 操作が全滅）/ **#971**（remote の tailscale serve が
+  unix ソケット target で Windows 非対応 = デーモンを起動できない）/ **#972**（remote
+  scrollback が器の境界を通らない）/ **#973**（autosave が CLI / MCP 編集で不発。macOS も同じ）/
+  **#974**（psmux が持たないオプションを tako が conf へ書いていて毎回警告）
+- **実機の claude は OAuth 期限切れ**（`Failed to authenticate: OAuth session expired`）。
+  会話が要る検証（#722 の AI 命名 / report の transcript 層 / run の完遂 / setup の対話の通し）は
+  ログインし直すまで測れない
 - **#937（消し込み完了）**: 未実測 47 件を Windows 実機で実測し **未実測 0 件**へ。
   判定は **supported 110 / degraded 13 / pending 15 / unsupported 2**。残る pending 15 は
   「実装が無い / 動かないと分かっている」もので未実測ではない
