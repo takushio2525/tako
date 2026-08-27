@@ -95,10 +95,10 @@ tako/
 | **MCP セットアップ（claude / codex / agy。#979）** | `tako setup-mcp`（引数なしで **claude + 導入済みの codex / agy へまとめて登録**。未導入は理由つき skip。`--agent <claude\|codex\|agy>` で 1 つに絞ると、その CLI が未導入・非対応スコープのときだけ分類済みエラーで止まる。`--project` は claude のみ = `<cwd>/.mcp.json`）。<br>書き先は claude = `~/.claude.json` / codex = `~/.codex/config.toml` の `[mcp_servers.tako]` / agy = `~/.gemini/config/mcp_config.json`。**codex / agy は各 CLI の `mcp add` に書かせる**（自分で TOML / JSON を書くと CLI 側の正規化と二重にずれる。実測: `codex mcp add` は書き戻しで env のキー順・`120` → `120.0`・`args = []` を正規化する）。冪等（再実行でバイト一致）。正本は `tako-control::agent_mcp`（argv・置き場・分類済みエラーの純粋関数）で、MCP `tako_setup_mcp` の `agent` と 1:1。<br>**成否を分けるのは env の引き継ぎ**（`tako mcp serve` は `TAKO_SOCKET` + `TAKO_TOKEN` が無いと **0 ツール**を返す = FR-2.3.2）。偽 MCP サーバーで実測した結果、**agy は親 env をそのまま渡す**ので登録だけでよく、**codex は既定で 1 つも渡さない**ので `env_vars` 許可リスト（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE`）が要る。`env_vars` は**値ではなく名前**なのでペインごとに正しい値が届き、**トークンを設定ファイルへ残さない**。`codex mcp add` にこれを書くフラグは無く、しかも**再 add で消える**ので、順序は `codex mcp add` → `env_vars` を 1 行足す → `codex mcp list --json` で反映確認（欠けていたら `not_reflected`）。**登録があっても env 転送が欠けていれば「登録済み」と言わない**（0 ツールになるため付け替える）。<br>**副作用**: `codex mcp add` / `agy mcp add` は自分の正規化で設定ファイル全体を書き直す（実測: codex は env のキー順・`120` → `120.0`・`args = []` の消去、agy は空 `args` の消去。コメントとトップレベルの並びは保たれる） |
 | `tako` CLI ビルド | `cargo build -p tako-cli`（バイナリは `target/debug/tako`） |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]`（`dist/tako.app`。tako CLI 同梱。**`--install` は配置後にビルド出力を消して Launch Services の登録も外す** = Finder の「このアプリケーションで開く」に tako が 2 つ並ばない。#837） |
-| リリース | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト。ノートは実アセットから生成 = ダウンロード表 + OS 別手順 + Known limitations。`--notes-only` で生成物のドライラン、`--update-notes [tag]` でアセット後付け後のノート作り直し。#594） |
-| 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166） |
-| **Windows 配布物生成（実機で実行。#587）** | `pwsh -File installer/windows/build-installer.ps1 [-Version v0.7.0]`（`dist/windows/` に `tako-<tag>-windows-x86_64.exe`（インストーラー = 主形式）+ `tako-<tag>-windows-x86_64.zip`（ポータブル）。Inno Setup 6 の ISCC が要る。**アセット名の正は `tako-core::platform::release_assets`** で、PowerShell 側の写し `installer/windows/lib/release-assets.ps1` を経由して組む = リリース側と `tako update` の判定が食い違わない（#594/#595）） |
-| **Windows リリース（実機で実行。#587）** | `pwsh -File installer/windows/release-windows.ps1`（前検査 → ビルド → 配布物検査まで。**既定は dry-run**、`-Upload` で GitHub Release へ添付、`-CreateRelease` で prerelease 新規作成。タグ省略時は Cargo.toml から `v<version>`。macOS の `scripts/release.sh` とは独立で、同じタグに両 OS のアセットが並ぶ） |
+| リリース（**両 OS 同時が既定**。#594/#965） | `scripts/release.sh`（Cargo.toml バージョン自動読み取り + CHANGELOG.md 連携。`--publish` でタグ + GitHub Release 作成、`--draft` でドラフト。ノートは実アセットから生成 = ダウンロード表 + **動作要件** + OS 別手順 + Known limitations。`--notes-only` で生成物のドライラン、`--update-notes [tag]` でアセット後付け後のノート作り直し）。<br>**リリースは macOS / Windows の配布物が揃って初めて成立する（#965）**: タグ push が `.github/workflows/release-windows.yml` を起こして windows ランナーが installer exe / zip を同じ Release へ添付し、`release.sh` は**その添付を待ってから**ノートを作り直す。揃わなければ **exit 3**（= Release は作られたが片肺）で回収手順を出す。緊急の macOS 先行公開は `--no-wait-windows`。公開済みリリースの検査は `--check-assets [tag]`（揃っていなければ exit 1） |
+| 夜間パッチリリース（自動） | `scripts/nightly-release.sh`（launchd から毎日 5:00 実行。`--dry-run` で判定のみ、`--install-launchd` でジョブ登録。#166）。**両 OS 対応（#965）**: タグ push で Windows 配布物のワークフローが走り、`release.sh` の待ち合わせを通るので夜間も両 OS が揃う。片肺で終わったら通知 + ログに回収手順（Release 自体は成立しているのでロールバックはしない） |
+| **Windows 配布物生成（既定は CI。#587/#965）** | 通常はタグ push で `.github/workflows/release-windows.yml`（windows ランナー）が自動生成・自動添付するので**手で叩く必要はない**。実機で作るなら `pwsh -File installer/windows/build-installer.ps1 [-Version v0.7.0]`（`dist/windows/` に `tako-<tag>-windows-x86_64.exe`（インストーラー = 主形式）+ `tako-<tag>-windows-x86_64.zip`（ポータブル）。Inno Setup 6 の ISCC が要る。**アセット名の正は `tako-core::platform::release_assets`** で、PowerShell 側の写し `installer/windows/lib/release-assets.ps1` を経由して組む = リリース側と `tako update` の判定が食い違わない（#594/#595）） |
+| **Windows リリース（CI が使えないときの実機経路。#587/#965）** | `pwsh -File installer/windows/release-windows.ps1`（前検査 → ビルド → 配布物検査まで。**既定は dry-run**、`-Upload` で GitHub Release へ添付、`-CreateRelease` で prerelease 新規作成。タグ省略時は Cargo.toml から `v<version>`）。配布物の検査は CI と同じ 1 実装（`installer/windows/lib/verify-assets.ps1`）を通るので、生成場所で基準が変わらない |
 | Windows アプリアイコン再生成 | `pwsh -File installer/windows/make-icon.ps1`（A 案 PNG → `assets/icon/tako.ico`。System.Drawing だけで動く = Windows 専用。`.ico` はコミット済みなので通常は不要） |
 | マスターオーケストレーター起動 | `tako master [-profile]`（master system prompt 付きでエージェント CLI を起動。プロファイルの `master_agent` で claude（既定）/ codex を選択。#127） |
 | **SSH ペイン（ファイルメニュー「リモート接続…」/ `tako open-in remote <host>`。#20 / #919）** | ホストを選ぶと新しいタブで `ssh <host>` を実行する。**接続に失敗してもタブは閉じない**（#919 で根治）: 接続前に「〜へ接続しています…」を出し、`ConnectTimeout` を 10 秒に切り、ssh 自身の失敗（exit 255）だけ**理由 + 次の一手**を出して入力待ちで止まる。`--remote-dir <path>` を付けると接続後にそのフォルダへ `cd` する（両方言で通る `cd "<path>"` を送達確認つき経路で打つ） |
@@ -120,6 +120,7 @@ tako/
 | build | `cargo build --workspace` |
 | lint | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` |
 | test | `cargo test --workspace` |
+| リリース経路のモックテスト（#256 / #965） | `bash scripts/test-release-retry.sh`（ダミー gh を PATH に挿して `release.sh` を実走させる。リトライ・冪等・**両 OS の待ち合わせと片肺リリースの検出**を検証。本番の Release / タグには触らない。**CI の macOS ジョブで毎 PR 走る**） |
 | ファイルツリーフォルダ操作 | `tako tree add <path>` / `tako tree remove <path>` / `tako tree list`（AI がプロジェクトフォルダを明示追加。#134） |
 | **Finder の「このアプリケーションで開く」（#708 / #835）** | Finder でファイルを右クリック → tako を選ぶと**新しいタブ**で開く。**ファイル = そのファイルだけが載ったタブ 1 枚**（タブ名 = ファイル名・プレビューのみで PTY なし）、**フォルダ = そのフォルダでシェルを起動したタブ**、存在しないパスは読み飛ばし。**複数選択は 1 ファイル = 1 タブ**で最後に開いたものが前に出る。既存のタブ・ペインには触らない。AI からの同等操作は `tako open <file> --new-tab` / MCP `tako_open_file` の `new_tab`（`--right` 等の分割方向とは排他）と `tako tab new --cwd <dir>` / MCP `tako_create_tab` の `cwd`。**既定アプリは奪わない**（`LSHandlerRank` は全宣言 `Alternate` 固定 = 候補に出るだけ。番犬テストが `build-app.sh` を読んで機械検証）。`.rs` / `.toml` 等は macOS が UTI を持たないため候補には出ない（`open -a tako <file>` なら開ける） |
 | **リモートからフォルダを開く（SSH 先のワークスペース化。#919 / #65 / #976）** | **ペインで `ssh <host>` に入るだけで、そのホストのフォルダがツリーへ並ぶ**（#976。明示操作は要らない。初期パスは sftp の初期 cwd）。ルートは**ローカルフォルダと同じ形**（フォルダ名 + フォルダアイコン）で**ローカルの後ろに**並び、SSH であることと相手は行末のバッジ（`SSH <host>`）が示す。**切断してもフォルダは消さず**バッジが「切断」へ変わる（右クリックの「再読み込み」で復帰）。取り違えの危険がある形（`-p` / `-J` / `-o Hostname=` / `ssh host <コマンド>` / `-N` 等）は**見送って理由を残す**。鍵・agent で入れない相手はパスワードを聞かずに見送る（「リモート接続…」で一度ログインすれば ControlMaster を共有して次から開く）。**走査はアイドル時に走らない**（材料は OSC 133 の状態とペインの子 pid で、指紋が動いたときと 60 秒の保険だけ。採取は #772 / #779 の ProcessSnapshot へ相乗り）。切替は 設定画面 → リモート / `tako remote-folder auto [on\|off]` / MCP の `action: "auto"`（既定 ON。**無効化すると走査対象が空になる**）。Windows はプロセスのコマンド行を採れないので自動検知は働かない（明示経路だけ）。<br>明示的に開くときは ファイルメニュー「リモートからフォルダを開く…」/ ⌘K パレット → ホスト選択 → フォルダ選択 → **ファイルツリーに SSH 先の構造が並ぶ**（ファイルはプレビューで開いて**編集・保存できる** = #966）。右クリックから パスコピー / このフォルダで SSH ペイン / 再読み込み / 閉じる。<br>AI からは `tako remote-folder open <host> [path]` / `close [host] [path] [--all] [--tab N]`（既定は全タブ横断）/ `list` / `ls <host> [path]`（**ツリーを開かずに覗ける** = リモート構造の把握用）/ `open-file <host> <path>` / `ssh-pane <host> [path]` / `pending` / `push [host] [path] [--force]` / `auto [on|off]`（自動追加の状態・切替。検知した接続の生死と見送った理由も返る）。MCP `tako_remote_folder` と 1:1。<br>**バックエンドはシステムの `ssh` / `sftp` + ControlMaster**（`~/.ssh/config`・鍵・agent・known_hosts・2FA をそのまま使う。russh / ssh2 は ControlMaster に相乗りできないので採っていない）。`sftp -b -` なので**相手のログインシェルに依存しない**（PowerShell の Windows 相手でも動く）。対話 SSH ペインも**同じ ControlPath** を通るので、パスワード認証しか無い相手は「リモート接続」で一度ログインすれば以後ツリーが追加認証なしで開く。<br>失敗は 14 種別へ分類し**理由 + 次の一手 + 生の詳細**を出す（ツリーは行として / 接続はサイドバー上部の通知。**失敗は自動で消さない**）。状態は `list` の `state` で読める（`loaded` / `loading` / `pending` / `sidebar_closed` = ツリーが閉じている / `not_displayed` = 裏タブ / `error: <理由>`）。開いたフォルダは layout.json へ永続化し、残っていれば起動時にツリーが開く。キャッシュは `<data_dir>/remote-cache/`、接続は `<data_dir>/ssh/`（どちらも #513 では共有しない） |
@@ -194,6 +195,28 @@ push 運用: リポジトリ公開（Phase 7）までは main 直 push 可。公
 - `Cargo.toml`（ワークスペースルート）の `[workspace.package] version` を bump
 - `scripts/release.sh --publish` でタグ + GitHub Release 作成（CHANGELOG から自動抽出）
 - リリースノートは日英併記
+
+### 両 OS 同時リリース（#965）
+
+**リリース 1 回で macOS / Windows の配布物が揃うのが正常な状態**。片方だけ出ると、
+欠けた OS の利用者には「更新が無い」ように見えたままバージョンだけが進む
+（更新チェックは自 OS 向けアセットの有無で判定する = #595）。
+
+- 生成場所: macOS = ローカル（`scripts/release.sh`）/ Windows = **CI の windows ランナー**
+  （`.github/workflows/release-windows.yml`。タグ push で起動し、同じ Release へ添付する）。
+  実機依存を避けるためこの順で、実機経路（`installer/windows/release-windows.ps1`）は
+  CI が使えないときの代替として残す。配布物の検査は
+  `installer/windows/lib/verify-assets.ps1` の 1 実装を両経路が共有する
+- 待ち合わせ: `release.sh` は Windows の添付を待ってから、実アセットを読み直して
+  ノートを作り直す（ダウンロード表 / 動作要件 / Windows 手順 / Known limitations が揃う）
+- 片肺の検出: `release.sh` の終了コード **3**（= Release は作られたが揃っていない）。
+  公開済みリリースは `scripts/release.sh --check-assets [tag]` でいつでも検査できる。
+  判定の正は `tako-core::platform::release_assets`（`missing_platforms` / `is_complete`）で、
+  シェル側の写しは同期テストが拘束する。モックテスト `scripts/test-release-retry.sh` は
+  **CI の macOS ジョブで毎 PR 走る**（片肺の検出が壊れたらそこで落ちる）
+- 動作要件の数値（macOS 11.0 / Windows 10.0.17763）も `release_assets` が正で、
+  `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
+  テストが検証する（ノートの要件と配布物の実際の下限がズレない）
 
 ### 夜間パッチリリース（自動。#166）
 

@@ -313,7 +313,7 @@ print(sum(len(t["panes"]) for t in d["tabs"]))' 2>/dev/null || echo 0)
     done
     echo "   ペイン数: $n"
     if [ "${n:-0}" -lt 3 ]; then
-        echo "!! master が worker を並べなかった（ペイン $n）。収録を中止します" >&2
+        echo "!! master が worker を並べなかった（ペイン ${n}）。収録を中止します" >&2
         promo_stop_isolated "$socket"; trap - EXIT
         return 1
     fi

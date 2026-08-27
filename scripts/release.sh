@@ -10,6 +10,8 @@
 #   scripts/release.sh --promote <test-tag>  # テスト版を安定版に昇格（#403）
 #   scripts/release.sh --notes-only # リリースノートを生成して表示するだけ（ビルド・公開しない）
 #   scripts/release.sh --update-notes [tag]  # 公開済みリリースのノートを実アセットから作り直す
+#   scripts/release.sh --check-assets [tag]  # 両 OS の配布物が揃っているかを検査（#965）
+#   scripts/release.sh --publish --no-wait-windows  # Windows 版を待たずに macOS 版だけ出す
 #
 # 前提:
 #   - macOS（build-app.sh と同じ）
@@ -19,20 +21,26 @@
 # バージョンは Cargo.toml [workspace.package] から自動読み取り。
 # リリースノートは CHANGELOG.md から該当バージョンのセクションを自動抽出。
 #
-# --- プラットフォーム対応（Issue #594）---
+# --- プラットフォーム対応（Issue #594 / #965）---
 #
 # リリースノートは Mac / Windows で分けず、単一ノート + プラットフォーム明示で運用する。
-# ノートには実アセットから組み立てた**ダウンロード表**が入り、Windows 版の配布物が
-# 含まれるときだけ Windows のインストール手順と Known limitations 節が付く
+# ノートには実アセットから組み立てた**ダウンロード表**と**動作要件**が入り、Windows 版の
+# 配布物が含まれるときだけ Windows のインストール手順と Known limitations 節が付く
 # （Known limitations は #515 のサポートマトリクスから `tako platform` 経由で自動生成）。
 #
-# macOS 先行リリース → 後から Windows 版を同じタグに足す運用:
+# **リリースは両 OS の配布物が揃って初めて成立する（#965）**。
+# 段取りはこうなっている:
 #
-#   1. Windows 版をビルドし、命名規則どおりの名前で dist/ に置く
-#      （例: dist/tako-v0.6.0-windows-x86_64.exe。規則は scripts/lib/release-assets.sh）
-#   2. gh release upload v0.6.0 dist/tako-v0.6.0-windows-x86_64.exe --clobber
-#   3. scripts/release.sh --update-notes v0.6.0
-#      （実アセットを読み直してノートを作り直し、gh release edit --notes で差し替える）
+#   1. タグを push する → GitHub Actions（.github/workflows/release-windows.yml）が
+#      windows ランナーで installer exe / ポータブル zip を作り、同じ Release へ添付する
+#   2. このスクリプトが macOS の zip を作って Release を作成し、
+#      **Windows 側の添付が終わるまで待って**からノートを実アセットで作り直す
+#   3. 最後に両 OS が揃ったかを検査する。揃っていなければ exit 3（片肺リリースの検出）
+#
+# 待ちを省く（緊急の macOS 先行公開）: --no-wait-windows。あとから揃えるには
+#   installer/windows/release-windows.ps1 -Tag <tag> -Upload   # 実機でビルドする場合
+#   gh run list --workflow release-windows.yml                  # CI の状態を見る
+#   scripts/release.sh --update-notes <tag>                     # ノートを作り直す
 #
 # アセットを足した時点で Windows クライアントの更新チェックにも初めて見えるようになる
 # （#595。自 OS 用アセットが無いリリースは更新候補にならない）。
@@ -65,6 +73,9 @@ TEST_RELEASE=0
 PROMOTE_TAG=""
 NOTES_ONLY=0
 UPDATE_NOTES_TAG=""
+CHECK_ASSETS_TAG=""
+# Windows 配布物を待つのが既定（#965。リリース = 両 OS が揃って出るのが正常）
+WAIT_WINDOWS=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --publish)    PUBLISH=1; shift ;;
@@ -72,6 +83,15 @@ while [[ $# -gt 0 ]]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --test)       TEST_RELEASE=1; PUBLISH=1; shift ;;
     --notes-only) NOTES_ONLY=1; shift ;;
+    --no-wait-windows) WAIT_WINDOWS=0; shift ;;
+    --check-assets)
+      shift
+      # タグ省略時は Cargo.toml のバージョン
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        CHECK_ASSETS_TAG="$1"; shift
+      else
+        CHECK_ASSETS_TAG="$TAG"
+      fi ;;
     --update-notes)
       shift
       # タグ省略時は Cargo.toml のバージョン
@@ -87,7 +107,7 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       PROMOTE_TAG="$1"; shift ;;
-    *) echo "不明な引数: $1（--publish / --draft / --skip-build / --test / --notes-only / --update-notes [tag] / --promote <tag>）" >&2; exit 2 ;;
+    *) echo "不明な引数: $1（--publish / --draft / --skip-build / --test / --notes-only / --update-notes [tag] / --check-assets [tag] / --no-wait-windows / --promote <tag>）" >&2; exit 2 ;;
   esac
 done
 
@@ -156,6 +176,20 @@ build_download_table() {
   printf '### ダウンロード / Download\n\n| OS | ファイル / File |\n|---|---|\n%s\n' "$rows"
 }
 
+# build_requirements_section <name...> — 動作要件（アセットがある OS の行だけ。#965）
+# 文言の正は crates/tako-core/src/platform/release_assets.rs の os_requirement()
+build_requirements_section() {
+  local platform rows=""
+  for platform in $TAKO_ASSET_PLATFORMS; do
+    [[ -n "$(assets_for_platform "$platform" "$@")" ]] || continue
+    rows+="- **$(tako_asset_label "$platform")**: $(tako_asset_requirement "$platform" ja)
+  $(tako_asset_requirement "$platform" en)
+"
+  done
+  [[ -n "$rows" ]] || return 0
+  printf '### 動作要件 / Requirements\n\n%s' "$rows"
+}
+
 # build_release_notes <tag> <version> <asset-name...>
 # ダウンロード表・OS 別インストール手順・Known limitations を実アセットに応じて出し分ける
 build_release_notes() {
@@ -179,6 +213,15 @@ ${body}
     # $(...) は末尾改行を落とすので、次の節との間の空行はここで足す
     notes+="
 ${table}
+"
+  fi
+
+  # 動作要件（#965。配布物を落とす前に自分の環境で動くか判るように）
+  local requirements
+  requirements=$(build_requirements_section "${names[@]+"${names[@]}"}")
+  if [[ -n "$requirements" ]]; then
+    notes+="
+${requirements}
 "
   fi
 
@@ -247,6 +290,173 @@ collect_dist_asset_names() {
   return 0
 }
 
+# --- リリースの完全性と Windows 配布物の待ち合わせ（#965）-------------------
+#
+# リリースは macOS / Windows の配布物が**揃って初めて成立する**。macOS 側は
+# このスクリプトが作り、Windows 側は tag push で起動する GitHub Actions
+# （.github/workflows/release-windows.yml）が同じ Release へ添付する。
+# ここはその待ち合わせと、揃ったかどうかの機械検査を担う。
+
+# Windows 配布物を作るワークフローのファイル名（Actions 側の識別子）
+WINDOWS_WORKFLOW="release-windows.yml"
+# 待ち時間の上限と間隔（テストから短縮できるように env で上書き可）
+WINDOWS_WAIT_MINUTES=${TAKO_WINDOWS_WAIT_MINUTES:-75}
+WINDOWS_POLL_SECONDS=${TAKO_WINDOWS_POLL_SECONDS:-30}
+
+require_gh() {
+  if ! command -v gh >/dev/null; then
+    echo "エラー: gh CLI が必要（brew install gh）" >&2
+    exit 1
+  fi
+}
+
+# gh_release_asset_names <tag> — 公開済みリリースのアセット名を 1 行ずつ
+gh_release_asset_names() {
+  gh release view "$1" --json assets -q '.assets[].name' 2>/dev/null || true
+}
+
+# report_release_completeness <tag> — 両 OS のアセットが揃っているかを表示。
+# 揃っていなければ非 0（= 片肺リリースの検出。#965 受け入れ条件 3）
+report_release_completeness() {
+  local tag="$1" names=() platform missing found label n f
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && names+=("$n")
+  done < <(gh_release_asset_names "$tag")
+
+  echo "==> リリース完全性の検査: $tag"
+  for platform in $TAKO_ASSET_PLATFORMS; do
+    label=$(tako_asset_label "$platform")
+    found=$(assets_for_platform "$platform" "${names[@]+"${names[@]}"}")
+    if [[ -n "$found" ]]; then
+      while IFS= read -r f; do
+        [[ -n "$f" ]] && echo "    [OK] ${label}: $f"
+      done <<< "$found"
+    else
+      echo "    [NG] ${label}: 配布物が無い"
+    fi
+  done
+
+  missing=$(tako_asset_missing_platforms "${names[@]+"${names[@]}"}")
+  if [[ -z "$missing" ]]; then
+    echo "    両 OS の配布物が揃っている"
+    return 0
+  fi
+  echo "" >&2
+  echo "警告: 片肺リリース（${tag}）— 配布物が無い OS: $(echo "$missing" | tr '\n' ' ')" >&2
+  echo "  欠けた OS の利用者には更新が見えないままバージョンだけが進む（#595 / #965）" >&2
+  local platform_missing
+  for platform_missing in $missing; do
+    case "$platform_missing" in
+      windows)
+        echo "  Windows: gh run list --workflow $WINDOWS_WORKFLOW でビルドの状態を確認し、" >&2
+        echo "           成功していれば scripts/release.sh --check-assets $tag で再確認する。" >&2
+        echo "           CI が使えないときは実機で installer/windows/release-windows.ps1 -Tag $tag -Upload" >&2
+        ;;
+      macos)
+        echo "  macOS: scripts/release.sh --skip-build --publish（または --update-notes ${tag}）" >&2
+        ;;
+    esac
+  done
+  return 1
+}
+
+# refresh_release_notes <tag> — 実アセットを読み直してノートを作り直す
+refresh_release_notes() {
+  local tag="$1" version="${1#v}" names=() notes n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && names+=("$n")
+  done < <(gh_release_asset_names "$tag")
+  notes=$(build_release_notes "$tag" "$version" "${names[@]+"${names[@]}"}")
+  gh release edit "$tag" --notes "$notes"
+}
+
+# windows_run_id <tag> — そのタグ向け Windows 配布物ワークフローの実行 ID（無ければ空）
+# tag push 起動でも workflow_dispatch（--ref <tag>）起動でも headBranch はタグ名になる
+windows_run_id() {
+  local tag="$1"
+  gh run list --workflow "$WINDOWS_WORKFLOW" --limit 50 \
+    --json databaseId,headBranch \
+    -q "[.[] | select(.headBranch == \"$tag\")] | first | .databaseId" 2>/dev/null || true
+}
+
+# wait_for_windows_assets <tag> — Windows 配布物が Release へ載るのを待つ。
+# 既にあれば即成功。ワークフローが走っていなければ workflow_dispatch で起こす
+wait_for_windows_assets() {
+  local tag="$1" run_id="" status conclusion deadline now names=() n
+
+  if tako_asset_is_complete $(gh_release_asset_names "$tag"); then
+    echo "==> Windows 配布物は既に添付済み"
+    return 0
+  fi
+
+  echo "==> Windows 配布物を待つ（$WINDOWS_WORKFLOW / 上限 ${WINDOWS_WAIT_MINUTES} 分）"
+  run_id=$(windows_run_id "$tag")
+  if [[ -z "$run_id" || "$run_id" == "null" ]]; then
+    echo "    タグ $tag のワークフロー実行が見つからない → workflow_dispatch で起動"
+    if ! gh workflow run "$WINDOWS_WORKFLOW" --ref "$tag" >/dev/null 2>&1; then
+      echo "警告: $WINDOWS_WORKFLOW の起動に失敗（タグ $tag はリモートにある？）" >&2
+      return 1
+    fi
+    # 起動直後は run 一覧に出るまで数秒かかる
+    local tries=0
+    while [[ -z "$run_id" || "$run_id" == "null" ]] && [[ $tries -lt 10 ]]; do
+      sleep 5
+      run_id=$(windows_run_id "$tag")
+      tries=$((tries + 1))
+    done
+  fi
+  if [[ -z "$run_id" || "$run_id" == "null" ]]; then
+    echo "警告: $WINDOWS_WORKFLOW の実行を特定できなかった" >&2
+    return 1
+  fi
+  echo "    実行 ID: ${run_id}（https://github.com/takushio2525/tako/actions/runs/${run_id}）"
+
+  deadline=$(( $(date +%s) + WINDOWS_WAIT_MINUTES * 60 ))
+  while :; do
+    status=$(gh run view "$run_id" --json status -q '.status' 2>/dev/null || echo "")
+    conclusion=$(gh run view "$run_id" --json conclusion -q '.conclusion' 2>/dev/null || echo "")
+    if [[ "$status" == "completed" ]]; then
+      echo "    ワークフロー完了: ${conclusion:-unknown}"
+      break
+    fi
+    now=$(date +%s)
+    if [[ $now -ge $deadline ]]; then
+      echo "警告: ${WINDOWS_WAIT_MINUTES} 分待っても完了しなかった（status=${status:-unknown}）" >&2
+      return 1
+    fi
+    echo "    ${status:-unknown}... （$(( (deadline - now) / 60 )) 分まで待つ）"
+    sleep "$WINDOWS_POLL_SECONDS"
+  done
+
+  if [[ "$conclusion" != "success" ]]; then
+    echo "警告: Windows 配布物のビルドが success ではない（${conclusion}）" >&2
+    echo "  ログ: gh run view $run_id --log-failed" >&2
+    return 1
+  fi
+
+  # 成功していればワークフローが添付済み。念のため実アセットで確認する
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && names+=("$n")
+  done < <(gh_release_asset_names "$tag")
+  if [[ -z "$(assets_for_platform windows "${names[@]+"${names[@]}"}")" ]]; then
+    echo "警告: ワークフローは成功したが Windows アセットが Release に無い" >&2
+    echo "  gh run download $run_id で成果物を取り、gh release upload $tag <file> --clobber で添付する" >&2
+    return 1
+  fi
+  return 0
+}
+
+# --- 公開済みリリースのアセットが両 OS 揃っているかの検査（--check-assets）---
+if [[ -n "$CHECK_ASSETS_TAG" ]]; then
+  require_gh
+  if ! gh release view "$CHECK_ASSETS_TAG" >/dev/null 2>&1; then
+    echo "エラー: リリース $CHECK_ASSETS_TAG が見つからない" >&2
+    exit 1
+  fi
+  report_release_completeness "$CHECK_ASSETS_TAG"
+  exit $?
+fi
+
 # --- 公開済みリリースのノートを実アセットから作り直す（--update-notes）---
 if [[ -n "$UPDATE_NOTES_TAG" ]]; then
   if ! command -v gh >/dev/null; then
@@ -257,7 +467,6 @@ if [[ -n "$UPDATE_NOTES_TAG" ]]; then
     echo "エラー: リリース $UPDATE_NOTES_TAG が見つからない" >&2
     exit 1
   fi
-  UPDATE_VERSION="${UPDATE_NOTES_TAG#v}"
   echo "==> $UPDATE_NOTES_TAG のノートを実アセットから再生成"
   UPLOADED_NAMES=()
   while IFS= read -r n; do
@@ -268,9 +477,10 @@ if [[ -n "$UPDATE_NOTES_TAG" ]]; then
   else
     printf '    アセット: %s\n' "${UPLOADED_NAMES[@]}"
   fi
-  NEW_NOTES=$(build_release_notes "$UPDATE_NOTES_TAG" "$UPDATE_VERSION" "${UPLOADED_NAMES[@]+"${UPLOADED_NAMES[@]}"}")
-  gh release edit "$UPDATE_NOTES_TAG" --notes "$NEW_NOTES"
+  refresh_release_notes "$UPDATE_NOTES_TAG"
   echo "==> ノートを更新した: $UPDATE_NOTES_TAG"
+  # 片肺のまま気付かず終わらないよう、更新のついでに完全性も報告する（#965。exit は変えない）
+  report_release_completeness "$UPDATE_NOTES_TAG" || true
   exit 0
 fi
 
@@ -372,6 +582,8 @@ $(build_release_notes "$STABLE_TAG" "$STABLE_VERSION" "${ASSET_NAMES[@]+"${ASSET
 
   # テスト版リリースの prerelease フラグ維持（昇格しても消さない。履歴として残す）
   echo "==> 昇格完了: $PROMOTE_TAG → $STABLE_TAG"
+  # 昇格元が片肺なら昇格先も片肺になる。気付けるように報告する（#965。exit は変えない）
+  report_release_completeness "$STABLE_TAG" || true
   exit 0
 fi
 
@@ -518,7 +730,38 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
     fi
   fi
 
+  # --- Windows 配布物の待ち合わせ（#965）---
+  # Windows 版は tag push で起動する GitHub Actions
+  # （.github/workflows/release-windows.yml）が同じ Release へ添付する。
+  # 揃ってからノートを作り直す（ダウンロード表・Windows 手順・動作要件・
+  # Known limitations はどれも実アセットから組み立てるため）
+  if [[ $DRAFT -eq 1 ]]; then
+    echo "==> ドラフトのため Windows 配布物の待ち合わせは省略"
+  elif [[ $WAIT_WINDOWS -eq 0 ]]; then
+    echo "==> --no-wait-windows: Windows 配布物を待たない（片肺のまま公開される）"
+  elif wait_for_windows_assets "$TAG"; then
+    echo "==> ノートを実アセットから作り直す（Windows の手順・要件・Known limitations を反映）"
+    refresh_release_notes "$TAG"
+  else
+    echo "警告: Windows 配布物が揃わなかった。macOS 版のみのリリースになっている" >&2
+  fi
+
   echo "==> リリース完了"
+
+  # 片肺リリースの検出（#965 受け入れ条件 3）。ドラフトと明示的な --no-wait-windows は
+  # 「今は揃っていない」ことを承知の上なので報告だけにする
+  RELEASE_INCOMPLETE=0
+  if [[ $DRAFT -eq 0 ]]; then
+    report_release_completeness "$TAG" || RELEASE_INCOMPLETE=1
+  fi
+  if [[ $RELEASE_INCOMPLETE -eq 1 && $WAIT_WINDOWS -eq 1 ]]; then
+    echo "" >&2
+    echo "ERROR: リリース $TAG は片肺（macOS 版のみ）。上の手順で Windows 版を添付してから" >&2
+    echo "       scripts/release.sh --update-notes $TAG でノートを作り直す" >&2
+    # 3 = 「Release は作られたが両 OS が揃っていない」。1（Release 作成そのものの失敗）と
+    # 区別できるようにする（nightly-release.sh がこの値で通知を出し分ける）
+    exit 3
+  fi
 
   # リリースが成立した時点で、展開済みの tako.app（zip の材料）は用済み。
   # 置いたままにすると LS が拾って Finder の候補に tako が 2 つ並ぶ（#837）。

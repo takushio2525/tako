@@ -8,6 +8,73 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.7.9] - 2026-08-27
+
+テスト版。**初めて macOS と Windows の配布物が同じリリースに揃う**節目のリリース。
+これまで Windows 版の配布物は実機でしか作れず、実機が落ちていると macOS 版だけが出る
+「片肺リリース」になっていた（v0.7.8 までが実際にそう）。配布物の生成を GitHub Actions の
+windows ランナーへ寄せ、リリースは両 OS が揃って初めて成立する形にした。
+
+Test release. The first release where **macOS and Windows binaries ship together**. Until
+now the Windows artifacts could only be produced on physical hardware, so whenever that
+machine was offline the release went out macOS-only (which is what actually happened through
+v0.7.8). Artifact generation now runs on a GitHub Actions windows runner, and a release is
+only considered complete when both platforms are attached.
+
+### Added / 追加
+
+- [機能追加] リリースの macOS / Windows 同時化 (#965)
+  タグを push すると windows ランナーがインストーラー exe とポータブル zip を作り、
+  同じ Release へ添付する。`scripts/release.sh` はその添付を待ってからリリースノートを
+  実アセットで作り直すので、ダウンロード表・**動作要件**・Windows 手順・Known limitations が
+  揃った状態で公開される。片方の OS しか無いリリースは終了コード 3 で検出し、
+  `scripts/release.sh --check-assets [tag]` でいつでも検査できる。夜間パッチリリースも
+  同じ経路を通る。
+  Pushing a tag now builds the Windows installer and portable zip on a windows runner and
+  attaches them to the same Release. `scripts/release.sh` waits for that attachment before
+  regenerating the release notes from the real assets, so the download table, **system
+  requirements**, Windows install steps, and known limitations are all present when the
+  release goes public. A release with only one platform's assets is reported as exit code 3,
+  and `scripts/release.sh --check-assets [tag]` can audit any published release. The nightly
+  patch release takes the same path.
+- [機能追加] リモートファイルの編集・保存を SFTP の書き戻しで開放 (#966)
+  Opened up editing and saving remote files through SFTP write-back.
+- [機能追加] `tako setup` / `setup-mcp` が codex・agy にも tako の MCP を登録する (#979)
+  `tako setup` and `setup-mcp` now register tako's MCP server with codex and agy as well.
+- [機能追加] ペインの ssh を検知してリモートフォルダを自動追加し、ツリーの見た目を統合 (#976)
+  Panes running ssh are detected so the remote folder is added automatically, and the tree
+  now looks the same as a local one.
+
+### Fixed / 修正
+
+- [修正] タブバーのスクロールが効かない問題を根治（occlude した要素からホイールを中継する） (#961)
+  Fixed the tab bar refusing to scroll horizontally (wheel events are now relayed from
+  elements that occlude the scroll area).
+- [修正] [Windows] スターター / welcome のコマンド投入を方言と送達確認つき経路へ寄せる (#899)
+  The starter and welcome buttons did nothing on Windows; the command is now written through
+  the shell-dialect and delivery-confirmed path.
+- [修正] [Windows] タブの AI 自動命名が走らない問題を根治（claude の解決を実行ファイル探索の境界へ） (#722)
+  AI tab naming never ran on Windows because the claude lookup went through a login shell.
+- [修正] [Windows] ファイル操作を是正: 完全削除をごみ箱移動へ + エクスプローラー表示・既定アプリ (#617)
+  "Move to trash" permanently deleted files on Windows; it now goes to the Recycle Bin, and
+  reveal-in-Explorer / open-with-default-app are wired up.
+- [改善] 実行中タブのドット脈動を有限回にしてフレーム要求の恒久化を止める (#945)
+  The running-tab dot animation kept requesting animation frames forever, holding CPU.
+- [修正] シェルスクリプトで変数の直後に全角文字が続く箇所を機械検出する番犬を追加 (#965)
+  `$var（` は bash が全角のバイトを変数名へ取り込んで `set -u` で即死するが `bash -n` では
+  見つからない。`scripts/` 配下の .sh を走査するテストを常設し、潜在していた 1 件も直した。
+  Added a watchdog test that scans every `.sh` under `scripts/` for `$var` immediately
+  followed by a multi-byte character (bash absorbs those bytes into the variable name and
+  dies under `set -u`, and `bash -n` cannot see it). One latent occurrence was fixed.
+
+### Changed / 変更
+
+- [修正] codex のサンドボックス解除を明示 opt-in へ（既定でバイパスしない） (#981)
+  Sandbox bypass for codex is now explicit opt-in instead of always-on.
+
+- [ドキュメント] [Windows] 対応マトリクスの未実測 47 件を実機で消し込み、未実測 0 件へ (#937)
+  Cleared all 47 unverified entries in the platform support matrix on real Windows hardware.
+
 ## [0.7.8] - 2026-08-25
 
 Nightly patch release (automated). Changes since v0.7.7:

@@ -3461,3 +3461,28 @@
   バイト同一（差分は testdata 1 行のみ）で、load 14 では `output=(panes +1 chrome +0)` で通る。
   #858 が項目 110 に入れた「窓が汚れたら測り直す」ガードが 108 には無い = main 由来（別途起票）
 - 次: S1 以降は「マトリクスの 1 マスを動かして根拠を書く」粒度。寄せ先一覧は `.agent/agent-enums.md`
+
+
+## 2026-08-27（#965: リリースの macOS / Windows 同時化 + 片肺リリースの検出）
+- Windows の配布物は実機（`release-windows.ps1`）でしか作れず、実機が落ちていると macOS 版
+  だけが出ていた。**v0.7.1〜v0.7.8 の 8 リリースが実際に macOS のみ**で、その間 Windows の
+  利用者には更新が 1 つも見えていない（更新判定は自 OS 向けアセットの有無 = #595）。
+  生成を `.github/workflows/release-windows.yml`（タグ push → windows ランナー → installer exe
+  + ポータブル zip を同じ Release へ添付）へ寄せ、実機経路は CI が使えないときの代替に降格
+- `scripts/release.sh` は**添付を待ってから**ノートを実アセットで作り直す（ダウンロード表 /
+  **動作要件** / Windows 手順 / Known limitations）。揃わなければ **exit 3**（Release 作成
+  そのものの失敗 = 1 と区別）。公開済みは `--check-assets [tag]`。夜間も同経路で、片肺なら
+  通知 + 回収手順（Release は成立しているのでロールバックしない）
+- 判定の正は `release_assets`（`missing_platforms` / `is_complete` / `os_requirement`）。
+  動作要件の数値は `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion`
+  との一致をテストが見る。配布物の検査は `installer/windows/lib/verify-assets.ps1` の 1 実装を
+  CI と実機が共有する。版数比較は**数値部分**（厳密一致だと `--promote` が落ちる）
+- 実装中に `$tag）` で `set -u` 即死を踏んだ（#837 と同型）。規約はあったが機械検査が無かった
+  ので番犬を常設（`crates/tako-control/tests/shell_scripts.rs`）。潜在していた 1 件
+  （`record-scenes.sh`）も修正。`test-release-retry.sh` の `assert_contains` が `--` 始まりの
+  期待値を grep のオプションと解釈して空振りしていたのも直した
+- 検証: fmt / clippy(-D warnings) / test --workspace 全緑 / `test-release-retry.sh` 37 pass 0 fail
+  （Test 5〜9 が #965）/ docs build 25 ページ / クロスチェック エラー 0。**実データでの検出力** =
+  `--check-assets v0.7.8` が `[NG] Windows: 配布物が無い` + exit 1。番犬も revert で FAILED を実測
+- 次: PR merge → **v0.7.9 として初回の両 OS 同時リリースを実行**（タグ push で Windows の
+  ワークフローが走る → `scripts/release.sh --test`）

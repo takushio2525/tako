@@ -1,0 +1,185 @@
+# Windows リリース配布物 — タグを打つと windows ランナーで配布物を作り、同じ Release へ添付する
+#
+# 背景（#965）:
+#   リリースは macOS / Windows の配布物が**揃って初めて成立する**。
+#   macOS 側はローカルの scripts/release.sh（+ 夜間の launchd ジョブ #166）が作るが、
+#   Windows 側はこれまで実機の installer/windows/release-windows.ps1 しか経路が無く、
+#   実機が落ちていると片肺リリースになっていた（v0.7.8 までが実際にそう）。
+#   そこで配布物の生成をこのワークフローへ寄せ、実機依存を無くす。
+#
+# 段取り:
+#   1. タグ push で起動（scripts/release.sh の待ち合わせが workflow_dispatch でも起こせる）
+#   2. installer/windows/build-installer.ps1 で installer exe + ポータブル zip を作る
+#   3. installer/windows/lib/verify-assets.ps1 で検査（実機リリースと同じ 1 実装）
+#   4. 成果物を artifact へ上げてから Release へ添付する
+#      （artifact を先に上げるので、添付に失敗しても作り直さずに回収できる）
+#
+# リリースノート（ダウンロード表 / Windows 手順 / 動作要件 / Known limitations）は
+# macOS 側の scripts/release.sh が実アセットを読み直して作る。このワークフローは触らない
+# （ノート組み立ての実装を 2 つ持たない）。手で直すなら:
+#   scripts/release.sh --update-notes <tag>
+name: Windows リリース配布物
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # 同じタグの二重ビルドは無駄なので 1 本に絞る。走っている方は殺さない
+  # （添付の途中で切ると片肺のまま残る）
+  group: release-windows-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Windows 配布物のビルドと添付
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: タグと Cargo.toml の版数が噛み合っていることを確認
+        shell: pwsh
+        run: |
+          . installer/windows/lib/verify-assets.ps1
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$') {
+            # ブランチから dispatch された場合はここで止める（版数が滅茶苦茶になる）
+            Write-Error "タグ形式ではない: $tag（このワークフローは v* タグから実行する）"
+            exit 1
+          }
+          $inWorkspacePackage = $false
+          $cargoVersion = $null
+          foreach ($line in Get-Content -LiteralPath Cargo.toml) {
+            if ($line -match '^\s*\[') { $inWorkspacePackage = $line -match '^\s*\[workspace\.package\]'; continue }
+            if ($inWorkspacePackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $cargoVersion = $Matches[1]; break }
+          }
+          # 比べるのは**数値部分**だけ。exe に埋まる FileVersion は数値しか持てないので、
+          # 実際に守らせたい不変条件は「埋まる版数がタグの数値部分と一致する」こと。
+          # ここを厳密一致（文字列そのまま）にすると、テスト版から安定版へ昇格したタグ
+          # （scripts/release.sh --promote。Cargo.toml=0.8.0-test.1 / タグ=v0.8.0 で同一 commit）
+          # が通らなくなる。判定関数は verify-assets.ps1 と共有する
+          $tagNumeric = Get-TakoNumericVersion $tag
+          $cargoNumeric = Get-TakoNumericVersion $cargoVersion
+          if (-not (Test-TakoSameVersion $tagNumeric $cargoNumeric)) {
+            Write-Error "Cargo.toml の版数 ($cargoVersion) がタグ ($tag) と噛み合わない（タグの commit を確認する）"
+            exit 1
+          }
+          Write-Host "tag=$tag / Cargo.toml=$cargoVersion（数値部分 $tagNumeric）"
+
+      # gpui の Windows ビルドは Spectre-mitigated libs が前提（無いとリンクエラー）。
+      # ランナーの VS には既定で入っていないため VS インストーラーで追加する（ci.yml と同じ）
+      - name: Spectre-mitigated libs をインストール
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Write-Host "VS installation: $vsPath"
+          $process = Start-Process -FilePath "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" `
+            -ArgumentList "modify", "--installPath", "`"$vsPath`"", `
+              "--add", "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", `
+              "--quiet", "--norestart", "--nocache" `
+            -Wait -PassThru
+          # 3010 = 成功（要再起動）。ランナーでは再起動不要
+          if (($process.ExitCode -ne 0) -and ($process.ExitCode -ne 3010)) {
+            Write-Error "VS インストーラーが終了コード $($process.ExitCode) で失敗"
+            exit 1
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+
+      # rust_embed が web/tako-remote/dist/ をコンパイル時に埋め込むため、cargo より前に必要。
+      # dist/ は .gitignore 対象なのでクリーンチェックアウトには存在しない（#574）
+      - name: PWA をビルド（rust_embed が dist/ を要求する）
+        shell: bash
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # ci.yml（debug）とは別のキャッシュ。release は lto=thin / codegen-units=1 で
+          # 成果物が全く違うため、混ぜると毎回フルビルドになる
+          key: release-dist
+
+      # ランナーイメージには Inno Setup 6 が入っているが、イメージ更新で消えても
+      # リリースを止めないよう「無ければ入れる」形にしておく
+      - name: Inno Setup（ISCC）を用意
+        shell: pwsh
+        run: |
+          $iscc = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $candidates = @(
+              (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+              (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+              (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+            )
+            $found = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+            if (-not $found) {
+              Write-Host 'ISCC が無いので choco で導入する'
+              choco install innosetup -y --no-progress
+              if ($LASTEXITCODE -ne 0) { Write-Error "choco install innosetup が失敗 (exit $LASTEXITCODE)"; exit 1 }
+            }
+          }
+          # build-installer.ps1 の Resolve-Iscc が PATH と既定の導入先を探すので、ここでは所在確認まで
+          $iscc = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue
+          if ($iscc) { Write-Host "ISCC: $($iscc.Source)" } else { Write-Host 'ISCC は既定の導入先から解決させる' }
+
+      - name: 配布物をビルド（installer exe + ポータブル zip）
+        shell: pwsh
+        run: |
+          pwsh -File installer/windows/build-installer.ps1 -Version '${{ github.ref_name }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 実機リリース（release-windows.ps1）と同じ検査を通す。
+      # 壊れた / 版数を詐称した配布物を Release へ上げないための関門
+      - name: 配布物を検査（実機リリースと同じ 1 実装）
+        shell: pwsh
+        run: |
+          . installer/windows/lib/verify-assets.ps1
+          Test-TakoWindowsAssets -Tag '${{ github.ref_name }}' -OutDir 'dist/windows' | Out-Null
+
+      # 添付より先に artifact へ上げる。Release への添付が失敗しても
+      # gh run download で回収できるので、ビルドをやり直さずに済む
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tako-windows-${{ github.ref_name }}
+          path: dist/windows/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Release へ添付（macOS 側が Release を作るのを待つ）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # macOS 側（scripts/release.sh / 夜間ジョブ）が同じタグの Release を作る。
+          # タグ push 直後はまだ無いことがあるので、現れるまで待つ
+          deadline=$(( $(date +%s) + 25 * 60 ))
+          until gh release view "$TAG" >/dev/null 2>&1; do
+            if [[ $(date +%s) -ge $deadline ]]; then
+              echo "::error::Release $TAG が 25 分待っても作られなかった。" \
+                   "artifact から回収して 'gh release upload $TAG <file> --clobber' で添付する"
+              exit 1
+            fi
+            echo "Release $TAG を待っている..."
+            sleep 30
+          done
+          gh release upload "$TAG" dist/windows/* --clobber
+          echo "添付したアセット:"
+          gh release view "$TAG" --json assets -q '.assets[].name'

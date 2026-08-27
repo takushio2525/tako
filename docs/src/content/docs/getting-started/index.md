@@ -98,6 +98,28 @@ source ~/.zshrc
 tako --version
 ```
 
+### 方法 C: Windows（インストーラー / ポータブル zip）
+
+Windows 版の配布物は **v0.7.9 から macOS 版と同じリリースに載ります**。
+[GitHub Releases](https://github.com/takushio2525/tako/releases/latest) の
+ダウンロード表から、次のどちらかを選んでください。
+
+| ファイル | 向いている人 |
+|---|---|
+| `tako-vX.X.X-windows-x86_64.exe` | **こちらが標準**。インストーラー。スタートメニュー登録と `tako` コマンドの PATH 追加までやってくれます |
+| `tako-vX.X.X-windows-x86_64.zip` | 展開して置くだけのポータブル版。インストールしたくないとき |
+
+- 動作要件は **Windows 10 バージョン 1809（ビルド 10.0.17763）以降 / x64**
+- インストーラーは**管理者権限を要求しません**（`%LOCALAPPDATA%\Programs\tako` に入ります）
+- ポータブル版は `tako-app.exe`（本体）と `tako.exe`（CLI）を**必ず同じフォルダに置いたまま**使ってください（離すと AI 経由の CLI 操作が動きません）
+
+:::caution[SmartScreen の警告が出たら]
+署名していない配布物なので、初回実行時に「WindowsによってPCが保護されました」と出ることがあります。**詳細情報 → 実行** で進めてください。
+:::
+
+Windows 版はまだ移植の途中です。どの機能が使えて、どれが縮退・未実装かは
+[Windows 対応状況](/windows-support/)にまとめてあります（リリースノートにも要約が載ります）。
+
 ### つまずきポイント: Gatekeeper の警告
 
 初回起動時に「開発元を確認できないため開けません」という警告が出ることがあります。これは macOS のセキュリティ機能（Gatekeeper）によるもので、以下のいずれかで解除できます。

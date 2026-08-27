@@ -66,13 +66,13 @@ $ErrorActionPreference = 'Stop'
 # 外部コマンドの非ゼロ終了は $LASTEXITCODE で明示的に見る（gh の「無い」は例外にしたくない）
 $PSNativeCommandUseErrorActionPreference = $false
 
-# アセット命名規則の写し（正は crates/tako-core/src/platform/release_assets.rs）
+# アセット命名規則の写し（正は crates/tako-core/src/platform/release_assets.rs）と
+# 配布物のスモーク検査（CI と共通の 1 実装。#965）
 . (Join-Path $PSScriptRoot 'lib/release-assets.ps1')
+. (Join-Path $PSScriptRoot 'lib/verify-assets.ps1')
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $outDir = Join-Path $repoRoot 'dist/windows'
-# 配布物が壊れて（切り詰められて）いないことの下限。実測は installer 約 15MB / zip 約 20MB
-$minAssetBytes = 5MB
 
 $problems = [System.Collections.Generic.List[string]]::new()
 function Add-Problem([string]$message) { $problems.Add($message) }
@@ -90,22 +90,6 @@ function Get-CargoVersion {
     throw "Cargo.toml から workspace.package.version を読めなかった"
 }
 
-# タグ形式（v0.6.0 / v0.6.0-rc1）から数値部分だけを取り出す。
-# 埋め込みリソースの FileVersion は数値しか持てないのでこちらと突き合わせる
-function Get-NumericVersion([string]$version) { (($version -replace '^v', '') -split '-', 2)[0] }
-
-# FileVersion は "0.5.12" とも "0.5.12.0" とも読め、さらに空白詰めで返ることがある
-# （Inno Setup が作る setup exe が実際にそう: "0.5.12              "）。
-# 空白を落として 4 桁へ揃えてから比べる
-function Get-NormalizedVersion([string]$version) {
-    $parts = @(($version -replace '\s', '') -split '\.')
-    while ($parts.Count -lt 4) { $parts += '0' }
-    ($parts[0..3] -join '.')
-}
-function Test-SameVersion([string]$a, [string]$b) {
-    (Get-NormalizedVersion $a) -eq (Get-NormalizedVersion $b)
-}
-
 # --- タグの決定 ----------------------------------------------------------------
 
 $cargoVersion = Get-CargoVersion
@@ -117,7 +101,6 @@ if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$') {
     throw "タグの形式が不正: $Tag（期待: v0.6.0 / v0.6.0-rc1）"
 }
 $tagVersion = $Tag -replace '^v', ''
-$numericVersion = Get-NumericVersion $Tag
 
 $mode = if ($Upload) { 'UPLOAD' } else { 'DRY RUN（-Upload 未指定。アップロードはしない）' }
 Write-Host ''
@@ -221,43 +204,8 @@ if ($IsccPath) { $buildArgs['IsccPath'] = $IsccPath }
 # ここは -Force でも緩めない。壊れた / 版数を詐称した配布物を上げないための最後の関門
 
 Write-Host ''
-Write-Host '-- 配布物を検査'
-$assets = @($setupExe, $zipPath)
-
-foreach ($asset in $assets) {
-    $name = Split-Path -Leaf $asset
-    if (-not (Test-Path -LiteralPath $asset)) { throw "生成されていない: $name" }
-    $size = (Get-Item -LiteralPath $asset).Length
-    if ($size -lt $minAssetBytes) {
-        throw "$name が小さすぎる（$size bytes < $minAssetBytes bytes）。ビルドが途中で壊れている可能性がある"
-    }
-    Write-Host ("   [OK] {0,-40} {1,12:N0} bytes" -f $name, $size)
-}
-
-# インストーラー自身の版数（.iss の VersionInfoVersion 由来）
-$setupVersion = Get-NormalizedVersion (Get-Item -LiteralPath $setupExe).VersionInfo.FileVersion
-if (-not (Test-SameVersion $setupVersion $numericVersion)) {
-    throw "インストーラーの FileVersion がタグと違う: $setupVersion（期待 $numericVersion）"
-}
-Write-Host "   [OK] インストーラーの FileVersion = $setupVersion"
-
-# zip を展開して、実際に配る exe の中身を見る（zip が開けることの確認も兼ねる）
-$inspect = Join-Path ([System.IO.Path]::GetTempPath()) "tako-release-check-$([System.IO.Path]::GetRandomFileName())"
-try {
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $inspect -Force
-    foreach ($exe in 'tako-app.exe', 'tako.exe') {
-        # zip の中は tako/ 直下（build-installer.ps1 の staging 構成）
-        $p = Join-Path $inspect (Join-Path 'tako' $exe)
-        if (-not (Test-Path -LiteralPath $p)) { throw "zip に $exe が入っていない" }
-        $exeVersion = Get-NormalizedVersion (Get-Item -LiteralPath $p).VersionInfo.FileVersion
-        if (-not (Test-SameVersion $exeVersion $numericVersion)) {
-            throw "zip 内 $exe の FileVersion がタグと違う: $exeVersion（期待 $numericVersion）。Windows ホストでビルドしたか確認する"
-        }
-        Write-Host "   [OK] zip 内 $exe の FileVersion = $exeVersion"
-    }
-} finally {
-    Remove-Item -LiteralPath $inspect -Recurse -Force -ErrorAction SilentlyContinue
-}
+Write-Host '-- 配布物を検査（lib/verify-assets.ps1。CI と同じ 1 実装）'
+Test-TakoWindowsAssets -Tag $Tag -OutDir $outDir | Out-Null
 
 # --- アップロード ---------------------------------------------------------------
 

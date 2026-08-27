@@ -3,58 +3,37 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-24）
+## 現在の対象（2026-08-27）
 
-- **#932（ちらつき）第 2 ラウンド: タブ切り替えの「遅れリサイズ」を突き止めて根治した**。
-  裏タブのペインは `render_pane` を通らないので、#647 が入ったあとも**幾何の変更**
-  （ウィンドウ寸法・サイドバー幅・バナー）が届かず、表に出した瞬間に初めて
-  リサイズ = SIGWINCH が飛んでいた（実測 裏 116x37 / 表 88x33 → 表に出した瞬間 88x33）。
-  割り出しを表示中と同じ 1 本（`pane_text_area_of` → `grid_cells`）へ寄せて解消。
-  A/B は `TAKO_932_NO_OFFSCREEN_GEOMETRY=1`。**実機で症状が消えたかはユーザー確認待ち**
-- **#932 で潰した仮説（実測で否定。再調査の周回を避ける）**: 器（tmux）はリサイズで
-  画面を消さない（`ED 2` 0 回・再描画は 0.1〜0.4ms で完了）/ 実 claude の TUI は
-  SIGWINCH で消えない（4.7ms 刻みで一度も半分未満にならない）/ タブ切り替え・分割比変更・
-  ウィンドウ寸法変更でグリッドが空になることは無い（1〜5ms 刻みで `grid_blackouts=0`）。
-  詳細は `.agent/architecture.md`「裏タブのペインは「表に出たときの寸法」へ合わせる」
-- **#467 Windows 移植はスライス 1〜9 がすべて main へ入り、最後の 8（棚卸し）も完了**。
-  残りは「実機バグの消し込み」と「未実測項目の消し込み（#937）」だけ
-- **#591（対応マトリクスの棚卸し + docs ページ）を完了**。判定は
-  **supported 69 / degraded 13 / pending 56 / unsupported 2**（棚卸し前は 4 / 2 / 132 / 2）。
-  `Feature::windows_evidence` を新設し **T7 が根拠なしの Supported を落とす**。
-  docs は `docs/src/content/docs/windows-support.md`（生成物・CI で `--check`）
-- **Issue の「完了（`cf7c9a4`）」は main に入っていなかった**（#658 と同じ型）。
-  `windows/467-*` ブランチのコミットを「入っている」と読まないこと
-- **#617（ゴミ箱が完全削除）は main へ移植して解消**（実装は win467 の `d528058` /
-  `4752eee` に在り main には 1 行も入っていなかった = #658 / #591 と同じ型）。
-  `SHFileOperationW` + `FOF_ALLOWUNDO` へ差し替え、その他 unix は**削除へ劣化させずエラー**。
-  表記は `os_integration::file_manager()` 1 か所で決めて `FileManager` を値で配る。
-  **実機は offline なので #617 は open 維持**（実機確認項目は Issue コメント）
-- **#722（AI タブ命名が Windows で一度も走らない）も main へ移植して解消**。
-  `autorename::detect_claude()` だけが B16（`platform::exe::find`）へ寄せられておらず、
-  `$SHELL -l -c "command -v claude"` が Windows で必ず失敗 → `.ok()?` で `None` →
-  `OnceLock` なので永久に無効、という**黙って死ぬ**形だった。判断部分を純粋関数
-  `resolve_claude` に切り出し、`TAKO_AUTORENAME_DIAG=1` で理由を出せるようにした。
-  マトリクスは **`Supported` へは倒さず `Degraded` のまま**理由文を #760 の実態
-  （素材が不変なので命名はタブごとに 1 回だけ）へ差し替えた
-- **棚卸しで確認した残りの製品バグ（未着手）**: **#935**（受け入れゲートが `sh -c`）/
-  **#936**（古い claude の警告が出ない。#726 の続き）
-- **#937 の消し込みで見つけた製品バグ（未着手）**: **#970**（`open-in dir` の cwd が
-  `///?/C:/…` へ壊れ、そのタブの git 操作が全滅）/ **#971**（remote の tailscale serve が
-  unix ソケット target で Windows 非対応 = デーモンを起動できない）/ **#972**（remote
-  scrollback が器の境界を通らない）/ **#973**（autosave が CLI / MCP 編集で不発。macOS も同じ）/
-  **#974**（psmux が持たないオプションを tako が conf へ書いていて毎回警告）
-- **実機の claude は OAuth 期限切れ**（`Failed to authenticate: OAuth session expired`）。
-  会話が要る検証（#722 の AI 命名 / report の transcript 層 / run の完遂 / setup の対話の通し）は
-  ログインし直すまで測れない
+- **#965（リリースの両 OS 同時化）を実装。初回の同時リリースは v0.7.9 で実行する**。
+  Windows の配布物はこれまで実機でしか作れず、実機が落ちていると macOS 版だけが出ていた
+  （**v0.7.1〜v0.7.8 の 8 リリースが実際に macOS のみ** = その間 Windows の利用者には
+  更新が 1 つも見えていない。更新判定は自 OS 向けアセットの有無 = #595）。
+  生成を `.github/workflows/release-windows.yml`（タグ push → windows ランナー）へ寄せ、
+  `scripts/release.sh` が添付を待ってノートを作り直し、揃わなければ **exit 3** を返す形にした
+- **リリースを触るときの不変条件**: ①判定の正は `tako-core::platform::release_assets`
+  （`missing_platforms` / `is_complete` / `os_requirement`）で、sh / PowerShell の写しは
+  同期テストが拘束する ②配布物の検査は `installer/windows/lib/verify-assets.ps1` の 1 実装を
+  CI と実機が共有する ③版数の比較は**数値部分**（`--promote` は Cargo.toml=`0.8.0-test.1` /
+  タグ=`v0.8.0` で同一 commit になるため厳密一致にすると落ちる）④片肺の検査は
+  `scripts/release.sh --check-assets [tag]`、モックテストは `scripts/test-release-retry.sh`
 - **#937（消し込み完了）**: 未実測 47 件を Windows 実機で実測し **未実測 0 件**へ。
-  判定は **supported 110 / degraded 13 / pending 15 / unsupported 2**（棚卸し時は 69 / 12 / 56 / 2）。
-  測り方は plan の「#937 の記録」節（隔離 GUI を `schtasks /it` で session 1 へ + CLI は
-  SSH から named pipe 越し + MCP は同じ token で `mcp_url` へ POST）。
-  **残った pending 15 は「実装が無い / 動かないと分かっている」もの**で、未実測ではない
-- **解消済み（詳細は plan の各記録節と progress.md）**: #898 / #927 / #920 / #913 / #907 /
-  #906 / #903 / #866 / #897 / #889 / #872 / #727 / #905 / #766 / #870 / #884 / #881 / #877 / #875 / #873
+  判定は **supported 110 / degraded 13 / pending 15 / unsupported 2**。残る pending 15 は
+  「実装が無い / 動かないと分かっている」もので未実測ではない
+- **#467 Windows 移植はスライス 1〜9 が全部 main へ入り、棚卸し（8）も完了**。
+  残るのは実機バグの消し込みだけ（下記）
+- **未着手の製品バグ**: **#935**（受け入れゲートが `sh -c`）/ **#936**（古い claude の
+  警告が出ない。#726 の続き）/ **#970**（`open-in dir` の cwd が `///?/C:/…` へ壊れ git 全滅）/
+  **#971**（remote の tailscale serve が unix ソケット target で Windows 非対応）/
+  **#972**（remote scrollback が器の境界を通らない）/ **#973**（autosave が CLI / MCP 編集で
+  不発。macOS も同じ）/ **#974**（psmux が持たないオプションを conf へ書いて毎回警告）/
+  **#967**（セルフテスト項目 97 (d) が `tako.exe` を見ておらず 98 以降が走らない。製品は正しい）
+- **実機の claude は OAuth 期限切れ**（`Failed to authenticate: OAuth session expired`）。
+  会話が要る検証（#722 の AI 命名 / report の transcript 層 / run の完遂 / setup の対話）は
+  ログインし直すまで測れない
 - **A/B の env（同一バイナリで旧挙動へ戻せる）**: `TAKO_920_LEGACY` / `TAKO_913_LEGACY` /
-  `TAKO_906_NO_PAD` / `TAKO_907_NO_INJECT` / `TAKO_903_LEGACY` / `TAKO_866_KEEP_EXACT_TARGET`
+  `TAKO_906_NO_PAD` / `TAKO_907_NO_INJECT` / `TAKO_903_LEGACY` / `TAKO_866_KEEP_EXACT_TARGET` /
+  `TAKO_932_NO_OFFSCREEN_GEOMETRY` / `TAKO_961_LEGACY` / `TAKO_966_LEGACY`
 
 - **#982（agent 能力マトリクス）完了 = #975 エピックの土台**。`tako-core::agent_support` が
   「どの agent がどこまで使えるか」の正本（40 能力 × claude / codex / agy / ローカル LLM）。
@@ -117,15 +96,18 @@ remote 2）と**テスト側の POSIX 前提**（`/tmp` 直書き・区切り決
 
 ## 次の一手
 
+- **v0.7.9 の初回同時リリース**（#965。PR merge 後）: main を pull → `git tag -a v0.7.9` を
+  push（ここで Windows のワークフローが走る）→ `scripts/release.sh --test`。
+  release.sh が Windows の添付を待ってノートを作り直し、揃わなければ exit 3 を返す
 - **#935 / #936**: どちらも「境界へ寄せる」既存の型がある（#875 = B1 / #898 = B16 /
-  スライス 9 = procinfo）ので、寄せ先は決まっている
-- **#937**: 実機が戻ったら未実測 46 件を消し込む。GUI が要るものは `schtasks /it` で
-  セルフテストを回し、CLI で足りるものは `ssh win` から直接叩く
-- **#967（新規）**: セルフテスト項目 97 (d) が Windows で必ず止まる。判定が画面のリテラル
-  `"tako setup"` を見ているが、実行ファイル名が `tako.exe` なので `…\tako.exe setup` になる。
-  **#898 が実体パスを返すようにした時点**で壊れており 98 以降が一切走らない（製品は正しい）
-- **#467 のエピック完了判断**: スライスは全部入った。残るのは上の実機バグと未実測の消し込みなので、
-  「移植は完了・品質の詰めが残る」という状態
+  スライス 9 = procinfo）ので寄せ先は決まっている
+- **#970〜#974**: #937 の消し込みで見つけた実機バグ。#971 が片付くまで remote 系は測れない
+- **シェルスクリプトを書くときは変数の直後の全角に注意**（#837）。番犬は
+  `crates/tako-control/tests/shell_scripts.rs`（`scripts/` 配下の .sh を全部走査する）
+- **PR がコンフリクトしていると GitHub は `pull_request` の CI を作らない**（#965 で 20 分
+  溶かした）。`gh api .../actions/runs?head_sha=<sha>` が **0 件**で、同時刻に他ブランチの run は
+  作られている、という形で現れる。ワークフローの yaml を疑う前に
+  `gh pr view <N> --json mergeable,mergeStateStatus`（`CONFLICTING` / `DIRTY`）を見る
 
 ## 現フェーズで Read すべき設計書
 
