@@ -56046,6 +56046,162 @@ mod self_test {
                 notify_and_draw(any, window, cx);
             }
 
+            // 134. チャットの生成中ドット2件が生成中ずっと脈動し続けない（#1012）。
+            //
+            // 項目 128（#945）と同じく、実際のチャット描画でヘッダと会話末尾の
+            // AnimationElement を作る。①開始直後はどちらも脈動する ②全長を過ぎて
+            // 時間を空けて描き直しても両方の不透明度が 1.0 から動かない、を観測する。
+            // GPUI は完了していない AnimationElement だけ
+            // `request_animation_frame()` を呼ぶため、②はフレーム要求停止の機械的な証拠になる。
+            // `TAKO_1012_LEGACY=1` では2件とも無限 repeat へ戻り、②が FAILED になる
+            {
+                let any1012 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window1012 = any1012.downcast::<TakoApp>().unwrap_or(window);
+                let pane1012 = window1012
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("1012-chat-busy".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        let pane = r["pane"].as_u64().map(PaneId::from_raw)?;
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("set".into()),
+                                mode: Some("gui".into()),
+                                pane: Some(pane.as_u64()),
+                            },
+                            PaneOrigin::User,
+                        );
+                        app.pin_chat_fixture(pane);
+                        app.chat_panes.insert(
+                            pane,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-1012".into(),
+                                messages: chat_view::messages_from_json(&[
+                                    serde_json::json!({
+                                        "role": "assistant",
+                                        "text": "生成中ドットの検証",
+                                    }),
+                                ]),
+                                model: Some("claude-opus-5".into()),
+                                busy: true,
+                                ..Default::default()
+                            }),
+                        );
+                        let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                        cx.notify();
+                        Some(pane)
+                    })
+                    .ok()
+                    .flatten();
+                match pane1012 {
+                    None => fail("134: 生成中のチャットペインを用意できない (#1012)"),
+                    Some(pane) => {
+                        let started = std::time::Instant::now();
+                        let sample = |cx: &mut gpui::AsyncApp| {
+                            notify_and_draw(any1012, window1012, cx);
+                            chat_view::chat_pulse_probes()
+                        };
+                        let spread = |values: &[f32]| {
+                            let hi = values.iter().cloned().fold(f32::MIN, f32::max);
+                            let lo = values.iter().cloned().fold(f32::MAX, f32::min);
+                            hi - lo
+                        };
+
+                        // ① 生成開始直後はヘッダ・会話末尾の両方が脈動する
+                        let before = chat_view::chat_pulse_probes();
+                        let mut early: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                        for _ in 0..5 {
+                            let probes = sample(cx);
+                            for ix in 0..2 {
+                                early[ix].push(probes[ix].1);
+                            }
+                            wait(cx, 200).await;
+                        }
+                        let after_early = chat_view::chat_pulse_probes();
+                        let animated = [
+                            after_early[0].0 > before[0].0 && spread(&early[0]) > 0.1,
+                            after_early[1].0 > before[1].0 && spread(&early[1]) > 0.1,
+                        ];
+
+                        // ② 全長を過ぎたら完了値 1.0 に貼り付き、描き直しても動かない
+                        let total =
+                            chat_view::chat_pulse_total() + Duration::from_millis(700);
+                        let remain = total.saturating_sub(started.elapsed());
+                        if remain > Duration::ZERO {
+                            wait(cx, remain.as_millis() as u64).await;
+                        }
+                        let idle_before = window1012
+                            .update(cx, |app: &mut TakoApp, _, _| app.root_renders)
+                            .unwrap_or(0);
+                        wait(cx, 1200).await;
+                        let idle_after = window1012
+                            .update(cx, |app: &mut TakoApp, _, _| app.root_renders)
+                            .unwrap_or(0);
+                        let mut late: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                        for _ in 0..5 {
+                            let probes = sample(cx);
+                            for ix in 0..2 {
+                                late[ix].push(probes[ix].1);
+                            }
+                            wait(cx, 250).await;
+                        }
+                        let stopped = [0, 1].map(|ix| {
+                            spread(&late[ix]) < 0.01
+                                && late[ix]
+                                    .iter()
+                                    .all(|opacity| (opacity - 1.0).abs() < 0.01)
+                        });
+                        println!(
+                            "TAKO_SELF_TEST_1012: legacy={} busy early_spread={:.3} \
+                             late_spread={:.3} late_last={:.3} activity early_spread={:.3} \
+                             late_spread={:.3} late_last={:.3} idle_frames={}",
+                            std::env::var_os("TAKO_1012_LEGACY").is_some(),
+                            spread(&early[0]),
+                            spread(&late[0]),
+                            late[0].last().copied().unwrap_or(f32::NAN),
+                            spread(&early[1]),
+                            spread(&late[1]),
+                            late[1].last().copied().unwrap_or(f32::NAN),
+                            idle_after.saturating_sub(idle_before),
+                        );
+                        check(
+                            animated.into_iter().all(|value| value),
+                            &format!(
+                                "134: 生成開始直後はヘッダと会話末尾のドットが脈動する \
+                                 (#1012。animated={animated:?})"
+                            ),
+                        );
+                        check(
+                            stopped.into_iter().all(|value| value),
+                            &format!(
+                                "134: 全長を過ぎたら2件とも静止する = フレーム要求も止まる \
+                                 (#1012。stopped={stopped:?})"
+                            ),
+                        );
+
+                        // 後片付け: 検証用タブを閉じ、fixture 保護も集約経路で落とす
+                        let _ = window1012.update(cx, |app: &mut TakoApp, _, cx| {
+                            if let Some(tab) = app.workspace.find_tab_of_pane(pane) {
+                                app.remove_tab(tab, cx);
+                            }
+                            cx.notify();
+                        });
+                        notify_and_draw(any1012, window1012, cx);
+                    }
+                }
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
