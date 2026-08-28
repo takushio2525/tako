@@ -182,6 +182,36 @@ pub fn preview_origin(label: &str) -> String {
     tr!(format!("リモート: {label}"), format!("Remote: {label}"))
 }
 
+// --- 進行状況の可視化（#1010） ---------------------------------------------
+
+/// ツリーで読み込み中のファイル行に添える説明（アイコンだけだと意味が伝わらない）
+pub fn file_loading() -> &'static str {
+    tr!("読み込み中", "Loading")
+}
+
+/// ペインが SSH の接続待ちのあいだ出す文言。**ホスト名を必ず入れる**
+/// （どこへ繋ごうとしているのか分からないまま待たせない）
+pub fn pane_connecting(host: &str) -> String {
+    tr!(
+        format!("{host} へ接続中…"),
+        format!("Connecting to {host}…")
+    )
+}
+
+/// 接続に失敗したときに**接続中の文言と置き換える**もの（黙って消さない）。
+/// `reason` は ssh 自身が出した行（読めなければ画面を見るよう促す）
+pub fn pane_connect_failed(host: &str, reason: &str) -> String {
+    tr!(
+        format!("{host} へ接続できません: {reason}"),
+        format!("Cannot connect to {host}: {reason}")
+    )
+}
+
+/// 失敗表示のクリックで閉じられることの案内（ツールチップ）
+pub fn pane_connect_dismiss() -> &'static str {
+    tr!("クリックで閉じる", "Click to dismiss")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +246,11 @@ mod tests {
                 preview_pushed("host:/srv/app"),
                 preview_push_pending().into(),
                 preview_origin("host:/srv/app"),
+                // #1010: 進行状況の可視化
+                file_loading().into(),
+                pane_connecting("host"),
+                pane_connect_failed("host", "ssh: connect to host host port 22: timed out"),
+                pane_connect_dismiss().into(),
             ]
         });
     }

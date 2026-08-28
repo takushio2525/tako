@@ -136,40 +136,36 @@ fn ui経路のdispatchはpty起動を消化している() {
     );
 }
 
+/// PTY 起動を伴う Request の表（[`ATTACHING`]）が古びていないか。
+///
+/// 「どの Request が `attach_session` を呼ぶか」をソースから機械的に割り出すのは
+/// できない: `Request::X { .. }` は **match のアーム**と**呼び出しのための組み立て**で
+/// 見分けが付かず、しかもアームが**補助関数へ委譲**してその中で起動を頼む形もある
+/// （`Welcome` がそれ）。誤検知で番犬が落ちると本来の検査まで無視されるので、
+/// ここは 2 つの弱い（が確実な）不変条件で守る。
 #[test]
-fn pty起動を伴うrequestの表がdispatchの実装と一致する() {
-    // `ATTACHING` が古びると番犬が空振りする。dispatch.rs の
-    // `Request::<名前> =>` アームの中に `attach_session(` があるものを実測で拾い、
-    // 表と突き合わせる（増えたらここが落ちる = 表を足すきっかけになる）
+fn pty起動を伴うrequestの表が古びていない() {
     let root = workspace_root();
     let src = std::fs::read_to_string(root.join("crates/tako-control/src/dispatch.rs"))
         .expect("dispatch.rs が読める");
-    let mut current: Option<String> = None;
-    let mut found: Vec<String> = Vec::new();
-    for line in src.lines() {
-        // dispatch 本体の match アームだけを見る（インデント 8 桁）
-        if let Some(rest) = line.strip_prefix("        Request::") {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                current = Some(name);
-            }
-        }
-        if line.contains("attach_session(") {
-            if let Some(name) = &current {
-                if !found.contains(name) {
-                    found.push(name.clone());
-                }
-            }
-        }
-    }
-    found.sort();
-    let mut expected: Vec<String> = ATTACHING.iter().map(|s| s.to_string()).collect();
-    expected.sort();
+
+    // ① 起動を頼む箇所の数を固定する。増減したら表を見直すきっかけになる
+    //    （新しい Request が PTY を作るようになったのに表へ足し忘れる、を止める）
+    let sites = src.matches("attach_session(").count();
     assert_eq!(
-        found, expected,
-        "PTY 起動を伴う Request が変わった。番犬の ATTACHING 表を更新すること（#1023）"
+        sites, 12,
+        "`attach_session(` の箇所が変わった（#1023）。増えたのが新しい Request なら \
+         番犬の ATTACHING 表へ足し、UI 経路が `attach_pending_sessions` を呼んでいるか \
+         確かめること"
     );
+
+    // ② 表に載っている名前が実在のアームであること（消えた Request が残らない）
+    for name in ATTACHING {
+        assert!(
+            src.contains(&format!("        Request::{name} "))
+                || src.contains(&format!("        Request::{name} {{"))
+                || src.contains(&format!("        Request::{name} =>")),
+            "ATTACHING に載っている Request::{name} が dispatch に無い（#1023）"
+        );
+    }
 }
