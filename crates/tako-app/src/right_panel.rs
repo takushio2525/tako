@@ -1992,7 +1992,7 @@ impl TakoApp {
                                 .hover(|d| d.bg(rgba_alpha(theme.accent, 0.25)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    let _ = tako_control::dispatch(
+                                    let opened = tako_control::dispatch(
                                         this,
                                         tako_control::protocol::Request::TmuxOpen {
                                             socket: open_socket.clone(),
@@ -2003,6 +2003,13 @@ impl TakoApp {
                                         },
                                         PaneOrigin::User,
                                     );
+                                    // #1023: 取り込みペインの PTY をこの場で立てる
+                                    // （dispatch は `pending_attach` へ積むだけ）
+                                    if opened.is_ok() && !Self::attach_drain_legacy() {
+                                        if let Err(e) = this.attach_pending_sessions(cx) {
+                                            eprintln!("warning: {e}");
+                                        }
+                                    }
                                     cx.notify();
                                 }))
                                 .child(crate::ui_text::common::restore()),

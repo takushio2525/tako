@@ -3689,3 +3689,28 @@
   `WorkerAgent::parse("")` が Err → **取得ボタンが無反応**。`model_agent_of` で
   未設定・不正値を claude 既定へ寄せた（`effort_row` と同じ規則）。セルフテストで固定
 - 関連: PR #1014（`Refs #1002`）。FR-2.32 を新設
+
+## 2026-08-28（#1023: ファイルメニュー経路の SSH ペインでターミナルが立たない問題を根治）
+- 根因は **UI 経路が `pending_attach` を消化していなかった**こと。dispatch はペインを作る
+  ところまでで、PTY 起動は `SessionHost::attach_session` がキューへ積むだけ（GPUI の
+  `Context` が要る）。IPC / MCP のループは毎回消化しているので、**次に来た CLI / MCP の
+  リクエストで初めて PTY が立つ**（エージェントが動いていなければ立たないまま）。
+  右クリック経路（target=pane）は既存シェルへ 1 行打つだけで PTY を作らないため即出る、
+  という非対称の正体。**#1006 の回帰ではない**（旧実装も `attach_session` のまま
+  消化していなかった）が、既定が「現在タブの新ペイン」になって目立つようになった
+- **CLI / MCP で覗くと観測自身が消化してしまう**（IPC ループが消化する）ので、手で試すと
+  直って見える。実測は window 直更新だけで行う隔離セルフテスト項目 132 で取った
+- A/B（同一バイナリ・`TAKO_1023_LEGACY=1` が before）: **before = `queued_after_open=1` /
+  `has_session=false`、3 秒待っても `has_session=false` のまま**（誰も消化しない） /
+  **after = `queued=0` / `has_session=true`（137ms）**。after のフル走行は
+  `TAKO_APP_SELF_TEST_OK` / exit 0（skip 3 = 蓋閉じで未描画の既知項目）
+- 同じ穴が開いていた 2 か所も直した: ツリー右クリックの「このフォルダで SSH ペインを開く」
+  （`ssh-pane` は内部で `OpenRemote` を通る）と tmux パネルの「復帰」ボタン（`TmuxOpen`）。
+  production の UI 経路で消化漏れがあったのはこの 3 か所だけ（走査で確認）
+- 再発防止に番犬 `crates/tako-control/tests/ui_dispatch_attach_watchdog.rs`。
+  **コメント行を落としてから近傍を見る**のが要点（「pending_attach の後処理は不要」という
+  近くの doc コメントを消化と誤認して空振りした。実際に踏んだ）。PTY 起動を伴う Request の
+  表が dispatch.rs の実装と一致することも同時に検査する
+- 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 2832 passed 0 failed /
+  Windows クロスチェック エラー 0・警告 12（**全件が未変更ファイル由来**）
+
