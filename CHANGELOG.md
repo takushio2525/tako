@@ -8,6 +8,17 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.1] - 2026-08-29
+
+Nightly patch release (automated). Changes since v0.8.0:
+夜間パッチリリース（自動）。v0.8.0 以降の変更:
+
+- [修正] 送達の観測手段をマトリクスから引き、起動失敗の系統を網羅する (#983) (#1029)
+- [改善] チャットの生成中ドットを有限回化する (#1012) (#1020)
+- [修正] docs トップのヒーロー背景装飾が画面途中で矩形に切れる問題を根治 (#1026) (#1028)
+- [改善] SSH の進行状況を可視化: 読み込み中のスピナーと接続待ちの表示 (#1010) (#1025)
+- [修正] ファイルメニュー経路の SSH ペインでターミナルが立たない問題を根治 (#1023) (#1024)
+
 ## [0.8.0] - 2026-08-28
 
 Nightly minor release (automated). Changes since v0.7.10:
