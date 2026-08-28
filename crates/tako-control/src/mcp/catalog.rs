@@ -1560,11 +1560,20 @@ pub fn tools() -> Vec<Value> {
                 #390: spawn 済み worker はレジストリに登録済みのため、pane_id 指定でも \
                 tmux_session / session_id が自動補完され、ペイン消失後も追跡が切れない。\
                 worker（レジストリ ID）指定なら pane_id 省略可。\
-                応答の prompt_delivery（delivered / pending / undelivered）と \
+                応答の prompt_delivery（delivered / pending / undelivered / unverified）と \
                 events の prompt_undelivered イベントで spawn プロンプトの未達を検知できる \
                 （undelivered なら tako_send_input でプロンプトを再送する）。\
                 #530: 送達フローがプロンプトの到達を確認できなかった場合は、claude が起動して \
                 session が観測できていても undelivered になる（起動 ≠ プロンプト到達）。\
+                #983: unverified は「猶予を過ぎたが、この系統には送達を裏づける一次シグナルが無い」\
+                （agy 等）という意味で、未達とは断定していない。events には prompt_undelivered ではなく \
+                prompt_delivery_unverified（recommended_action=verify_then_resend）が載るので、\
+                画面を見て届いているか確かめてから再送すること（そのまま再送すると二重指示になる）。\
+                #983: エージェント CLI の起動そのものが失敗している（CLI 不在で command not found / \
+                未認証）ときは status が error になり、error.kind=launch_failed / \
+                error.launch_problem（cli_not_found / not_authenticated / …）/ \
+                error.detail に「理由 + 次の一手」が入る（recommended_action=fix_launch）。\
+                続行指示や再送では直らないので、detail の手順を先に実施する。\
                 events の agent_dead はエージェント CLI プロセスの突然死（SIGSEGV 等）の疑い: \
                 応答の resume_command（レジストリの session ID から組み立てた claude --resume）を \
                 ペインのシェルへ tako_send_input すれば文脈ごと復旧できる（自動 resume はしない）。\

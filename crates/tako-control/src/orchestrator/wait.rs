@@ -96,6 +96,11 @@ pub enum WorkerErrorKind {
     UsageLimit,
     /// rate limit 起因の選択ダイアログ（codex のモデル切替提案等）で停止。選択肢への応答で復帰できる
     LimitDialog,
+    /// **エージェント CLI の起動そのものが失敗している**（#983 の変更 3）。
+    /// 未認証・起動直後の異常終了・ローカル runtime 不在など。
+    /// 分類済みの理由と次の一手は `detail` に入る（組み立ては
+    /// `orchestrator::agent_cli::AgentCliError::message_in`）
+    LaunchFailed,
 }
 
 impl WorkerErrorKind {
@@ -105,6 +110,7 @@ impl WorkerErrorKind {
             Self::ApiError => "api_error",
             Self::UsageLimit => "usage_limit",
             Self::LimitDialog => "limit_dialog",
+            Self::LaunchFailed => "launch_failed",
         }
     }
 
@@ -114,6 +120,7 @@ impl WorkerErrorKind {
             "api_error" => Some(Self::ApiError),
             "usage_limit" => Some(Self::UsageLimit),
             "limit_dialog" => Some(Self::LimitDialog),
+            "launch_failed" => Some(Self::LaunchFailed),
             _ => None,
         }
     }
@@ -127,6 +134,9 @@ impl WorkerErrorKind {
             Self::UsageLimit => "wait_reset",
             // ダイアログの選択肢に応答する（send_input でキー送信）
             Self::LimitDialog => "respond_dialog",
+            // 起動が成立していないので、続行指示も待機も効かない。
+            // detail の次の一手（導入 / ログイン / runtime 起動）を先にやる
+            Self::LaunchFailed => "fix_launch",
         }
     }
 }
@@ -1298,6 +1308,17 @@ pub enum WorkerEventKind {
     /// レジストリ登録済み claude worker で transcript（session_id）未観測のまま
     /// 猶予時間を超過し、かつ画面が busy でない・実行中子プロセスも無い場合に発火
     PromptUndelivered { seconds_since_spawn: i64 },
+    /// spawn 後の猶予を過ぎたが、**この系統には送達を裏づける一次シグナルが無い**（#983）。
+    ///
+    /// `PromptUndelivered` と分けてあるのは、未達だと断定できないから。
+    /// supervisor の自動再送（`recover_prompt_undelivered`）は `prompt_undelivered`
+    /// だけを見るので、こちらでは撃たれない = 二重指示事故にならない。
+    /// **黙る代わりに「確かめてから再送する」次の一手を出す**のがこのイベントの役目
+    PromptDeliveryUnverified {
+        seconds_since_spawn: i64,
+        /// 一次シグナルを持たない系統の名前（claude / codex / agy / …）
+        agent: String,
+    },
     /// エージェント CLI プロセスの死亡疑い（#390。SIGSEGV 等の突然死）。
     /// レジストリ登録済み worker で session_id 検出済み（= 一度は起動した）なのに
     /// tmux セッション配下の実行中子プロセスが消えた場合に発火。
@@ -1342,6 +1363,19 @@ impl WorkerEvent {
                     "kind": "prompt_undelivered",
                     "seconds_since_spawn": seconds_since_spawn,
                     "recommended_action": "resend_prompt",
+                })
+            }
+            WorkerEventKind::PromptDeliveryUnverified {
+                seconds_since_spawn,
+                agent,
+            } => {
+                json!({
+                    "kind": "prompt_delivery_unverified",
+                    "seconds_since_spawn": seconds_since_spawn,
+                    "agent": agent,
+                    // **resend_prompt にしない**: 未達と確定していないので、
+                    // 自動で撃つと同じ依頼を二度渡すことになる（#1015 の事故）
+                    "recommended_action": "verify_then_resend",
                 })
             }
             WorkerEventKind::AgentDead { resume_command } => {

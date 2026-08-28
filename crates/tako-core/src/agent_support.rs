@@ -383,6 +383,12 @@ pub mod notes {
 
     // ─── 実測で分かっている縮退 ─────────────────────────────────
 
+    /// #983 の変更 2。一次シグナルが無い系統は「未達」と断定できない
+    pub const SCREEN_ONLY_DELIVERY: Note = Note::new(
+        "送達を裏づける一次シグナルが無いので、猶予を過ぎても「未達」と断定せず「未確認」を返す（自動再送を撃つと二重指示になる）",
+        "There is no primary signal that confirms delivery, so after the grace period tako reports \"unverified\" rather than asserting non-delivery (auto-resending here would duplicate the instruction)",
+    );
+
     /// `wait.rs` の `need_streak`。構造化シグナルが無いぶん確定までの往復が増える
     pub const SCREEN_ONLY_STATUS: Note = Note::new(
         "状態が画面推定のみなので完了の確定が遅い（同じ判定を 8 回続けて見る必要がある。claude は 3 回）",
@@ -455,6 +461,34 @@ pub fn support_for(agent: Agent, key: &str) -> Option<AgentSupport> {
 /// （`platform::support::gate_in` の `None => Ok(())` と同じ判断）
 pub fn supports(agent: Agent, key: &str) -> bool {
     support_for(agent, key).is_none_or(|s| s.is_usable())
+}
+
+/// 初期プロンプトが届いたかを**何で観測できるか**（#983 の変更 2）。
+///
+/// 旧実装は `registry::prompt_delivery_assessment` が `agent != "claude"` を
+/// `NotApplicable` で即返していた。誤検知を避ける判断としては妥当だったが、
+/// **結果として「観測手段が無い = 何も言わない」**になっていた（#983 の無言死）。
+///
+/// どちらの手が使えるかは**マトリクスの 1 マス**（[`keys::WORKER_STATUS_STRUCTURED`]）が
+/// 決める。系統が増えても、この関数ではなくマトリクスを直せば追従する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryObservation {
+    /// 画面に依らない一次シグナルがある（claude の transcript / codex の rollout）。
+    /// 「猶予を過ぎても一次シグナルが無い」は**未達と断定してよい**
+    Structured,
+    /// 画面の送達確認（#32 / #640 の PromptFlow の結果）しか手が無い。
+    /// 記録が残っていなければ「届いていない」のか「観測できなかった」のか区別できないので、
+    /// **未達と断定せず「未確認」を返す**（自動再送を撃たせない = 二重指示事故を作らない）
+    ScreenOnly,
+}
+
+/// 指定 agent の送達観測手段。判断は [`keys::WORKER_STATUS_STRUCTURED`] のマスから引く
+pub fn delivery_observation(agent: Agent) -> DeliveryObservation {
+    if supports(agent, keys::WORKER_STATUS_STRUCTURED) {
+        DeliveryObservation::Structured
+    } else {
+        DeliveryObservation::ScreenOnly
+    }
 }
 
 /// 指定 agent の能力一覧。`status` を渡すとその状態だけに絞る
@@ -1135,12 +1169,17 @@ pub const MATRIX: &[AgentFeature] = &[
             "A prompt that never arrived is detected and a resend path is offered (#390 / #530)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 983),
-        agy: pending(notes::NOT_WIRED, 983),
+        codex: S::Supported,
+        agy: degraded(notes::SCREEN_ONLY_DELIVERY),
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
-            "orchestrator/registry.rs の prompt_delivery_assessment は agent が claude でなければ \
-             NotApplicable で即返るので、非 claude の未達は観測されない",
+        evidence: AgentEvidence::UnitTest(
+            "#983 の変更 2 で prompt_delivery_assessment の判断を delivery_observation \
+             （このマトリクスの WORKER_STATUS_STRUCTURED）から引く形にした。codex は rollout の \
+             task_started を送達の証拠にできるので claude と同じく未達を断定し、agy は画面確認しか \
+             無いので未達ではなく unverified（+ verify_then_resend）を返す。緑のテスト: \
+             registry の「一次シグナルの無い系統は未達と断定せず未確認を返す」\
+             「送達の観測手段はマトリクスから引く」「ターンが走った証拠は画面検証の失敗より強い」/ \
+             dispatch の「issue983_観測手段の無い系統でも送達判定が黙らない」",
         ),
     },
     AgentFeature {

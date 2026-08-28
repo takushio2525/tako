@@ -208,6 +208,20 @@ impl TurnState {
         }
         Some(if self.busy { "busy" } else { "idle" })
     }
+
+    /// **プロンプトが届いた証拠があるか**（#983 の変更 2）。
+    ///
+    /// ターン（`task_started`）は**投入されたプロンプトでしか始まらない**ので、
+    /// 1 件でも観測できれば「入力が届いて codex が受け取った」と言い切れる。
+    /// これは画面の送達確認（#32 / #640）より強い証拠なので、
+    /// 画面検証が失敗と記録していてもこちらを優先してよい（#1015 の誤検知対策）。
+    ///
+    /// **`response_item` の `role: "user"` は数えない**: rollout の先頭には
+    /// 指示文（AGENTS.md 等）が同じ形で載りうるので、起動直後に「届いた」と
+    /// 誤って言う側へ倒れる。`task_started` にはその曖昧さが無い
+    pub fn prompt_arrived(&self) -> bool {
+        self.events > 0
+    }
 }
 
 /// rollout の 1 行から `payload.type` を取り出す（`type` が `event_msg` のときだけ）
