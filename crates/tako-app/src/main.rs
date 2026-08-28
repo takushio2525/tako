@@ -2910,8 +2910,9 @@ struct SshConnect {
     started: std::time::Instant,
     /// tako が印字したものしか載っていないペインか（`split` / `tab` = true）
     fresh_pane: bool,
-    /// 覚え始めたときの画面の行数（`pane` 経路で「増えた行」を切り出すため）
-    baseline_lines: usize,
+    /// 覚え始めたときの「新しく出た行」の起点（`pane` 経路で切り出すため）。
+    /// 画面は端末の行数ぶん常に返るので**行数では切り出せない**（`ssh_progress` 参照）
+    baseline_index: usize,
     /// 覚え始めたときの画面の指紋（動いたかどうかだけ見る）
     baseline_fingerprint: u64,
     phase: tako_core::ssh_progress::ConnectPhase,
@@ -4299,12 +4300,9 @@ impl TakoApp {
                     // 変わったらヘッダだけ汚す（本体は触らない = 無関係な再描画を作らない）
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:ssh_connect");
-                        if app.drive_ssh_connect() {
-                            let panes: Vec<PaneId> = app.pane_headers.keys().copied().collect();
-                            for pane_id in panes {
-                                if let Some(view) = app.pane_headers.get(&pane_id).cloned() {
-                                    view.update(wcx, |_, cx| cx.notify());
-                                }
+                        for pane_id in app.drive_ssh_connect() {
+                            if let Some(view) = app.pane_headers.get(&pane_id).cloned() {
+                                view.update(wcx, |_, cx| cx.notify());
                             }
                         }
                     }
@@ -8980,19 +8978,22 @@ impl TakoApp {
     /// 何も起きない（NFR-8）。材料は「ペインの画面」「ControlMaster のソケットの有無」
     /// の 2 つで、どちらもプロセスを起こさない（`visible_lines` はメモリ、
     /// ソケットは stat 1 回）。判定は `tako_core::ssh_progress` の純粋関数
-    fn drive_ssh_connect(&mut self) -> bool {
+    fn drive_ssh_connect(&mut self) -> Vec<PaneId> {
         use tako_core::ssh_progress::{self, ConnectPhase};
 
         if self.ssh_connect.is_empty() {
-            return false;
+            return Vec::new();
         }
+        // 追っているペインのヘッダは**毎 tick 描き直す**。dispatch は `Context` を
+        // 持たないので `begin_ssh_connect` から notify できず、これが無いと
+        // 「他の何かが画面を汚すまでチップが出ない」形になる（出たり出なかったりする）。
+        // 追い終われば空になるので、通常運転では 1 回も走らない
         let panes: Vec<PaneId> = self.ssh_connect.keys().copied().collect();
-        let mut changed = false;
+        let mut touched = panes.clone();
         for pane in panes {
             // ペインが消えた = 見せる相手が居ない
             if !self.pane_exists(pane) {
                 self.ssh_connect.remove(&pane);
-                changed = true;
                 continue;
             }
             let Some(st) = self.ssh_connect.get(&pane) else {
@@ -9006,7 +9007,6 @@ impl TakoApp {
             // いつまでも居座らせない。**失敗を騙らず**畳むだけ
             if ssh_progress::give_up(st.elapsed_secs()) {
                 self.ssh_connect.remove(&pane);
-                changed = true;
                 continue;
             }
             let lines = self
@@ -9015,12 +9015,12 @@ impl TakoApp {
                 .map(|s| s.visible_lines())
                 .unwrap_or_default();
             let fingerprint = tako_control::limit_stop::screen_fingerprint(&lines);
-            // `pane` 経路は既存の出力が載っているので、増えた側だけを見る。
-            // 打った行はプロンプトの続きに載るので最後の 1 行も含める
+            // `pane` 経路は既存の出力が載っているので、増えた側だけを見る
+            // （起点 = 覚え始めた時点のプロンプト行）
             let from = if st.fresh_pane {
                 0
             } else {
-                st.baseline_lines.saturating_sub(1).min(lines.len())
+                st.baseline_index.min(lines.len())
             };
             let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                 new_lines: &lines[from..],
@@ -9033,19 +9033,16 @@ impl TakoApp {
             match phase {
                 ConnectPhase::Opened => {
                     self.ssh_connect.remove(&pane);
-                    changed = true;
                 }
                 other => {
                     if let Some(st) = self.ssh_connect.get_mut(&pane) {
-                        if st.phase != other {
-                            st.phase = other;
-                            changed = true;
-                        }
+                        st.phase = other;
                     }
                 }
             }
         }
-        changed
+        touched.retain(|p| self.pane_exists(*p));
+        touched
     }
 
     /// そのペインがどこかのタブに居るか（#1010 の後始末用）
@@ -18455,8 +18452,8 @@ impl UiStateHost for TakoApp {
 
     fn begin_ssh_connect(&mut self, pane: PaneId, host: &str, fresh_pane: bool) {
         // 覚え始めた時点の画面を控える。`pane` 経路（既存シェル）は
-        // **打った行がプロンプトの続きに載る**ので、最後の 1 行も「増えた側」として
-        // 見るために行数から 1 引いて切り出す（切り出しは driver 側）
+        // **打った行がプロンプトの続きに載る**ので、起点はプロンプト行
+        // （= 最後の非空行）。行数で切り出せない理由は `ssh_progress::baseline_index`
         let lines = self
             .terminals
             .get(&pane)
@@ -18468,7 +18465,7 @@ impl UiStateHost for TakoApp {
                 host: host.to_string(),
                 started: std::time::Instant::now(),
                 fresh_pane,
-                baseline_lines: lines.len(),
+                baseline_index: tako_core::ssh_progress::baseline_index(&lines),
                 baseline_fingerprint: tako_control::limit_stop::screen_fingerprint(&lines),
                 phase: tako_core::ssh_progress::ConnectPhase::Connecting,
             },

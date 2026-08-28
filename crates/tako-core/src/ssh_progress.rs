@@ -165,6 +165,20 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
     ConnectPhase::Connecting
 }
 
+/// 覚え始めた時点の「新しく出た行」の起点（`pane` 経路用）。
+///
+/// 画面は**端末の行数ぶん常に返ってくる**（空行込みなので行数は変わらない）ので、
+/// 行数の差では切り出せない。打った行はプロンプト（= 最後の非空行）の**続き**に
+/// 載るので、そこを起点にすると「打った行 + そのあとに出たもの」だけを見られる。
+///
+/// 全部空なら 0（= 画面全体を見る）
+pub fn baseline_index(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .unwrap_or(0)
+}
+
 /// これ以上待っても意味が無い秒数。ここを越えたら**失敗を騙らず**表示を畳む
 /// （ssh が黙ったまま生き続ける形はあり得るので、居座るチップを作らない）
 pub const SILENT_CAP_SECS: u64 = 120;
@@ -331,6 +345,25 @@ mod tests {
             classify(&inputs(&l, true)),
             ConnectPhase::Failed { reason: None }
         );
+    }
+
+    #[test]
+    fn 起点はプロンプト行になる() {
+        // 画面は端末の行数ぶん返る（後ろは空行）。行数では切り出せないので
+        // 「最後の非空行」を起点にする
+        let l = lines(&["$ ls", "a.txt  b.txt", "$", "", "", ""]);
+        assert_eq!(baseline_index(&l), 2);
+        // 打った行が載るのはその行なので、そこから見れば自分の行も新しい行も入る
+        assert_eq!(
+            &l[baseline_index(&l)..],
+            &["$".to_string(), String::new(), String::new(), String::new()]
+        );
+    }
+
+    #[test]
+    fn まっさらな画面の起点は先頭() {
+        let l = lines(&["", "", ""]);
+        assert_eq!(baseline_index(&l), 0);
     }
 
     #[test]
