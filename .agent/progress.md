@@ -3753,3 +3753,36 @@
   `late_spread=0.599〜0.600` / `late_last=0.366〜0.367` / `stopped=false` で項目132が FAILED（exit 1）
 - `starter.rs` の準備中ドットは表示自体が4秒 / 25秒で上限つきのため、設計正本どおり任意対象として
   今回は変更しなかった
+
+## 2026-08-28（#983 変更 2 / 3: 送達観測手段のマトリクス化 + 起動失敗の系統網羅）
+- **変更 2**: `prompt_delivery_assessment` の `agent != "claude" → NotApplicable`（= 黙る）を
+  **#982 のマトリクスから引く**形へ（`agent_support::delivery_observation` が
+  `WORKER_STATUS_STRUCTURED` を読む純粋関数）。一次シグナルを持つ系統（claude の transcript /
+  codex の rollout）だけが未達を断定し、持たない agy は **`unverified`（未確認）+
+  `prompt_delivery_unverified` イベント（`verify_then_resend`）**を返す。
+  **`prompt_undelivered` にしない**ので supervisor の自動再送は撃たれない（= 二重指示を作らない）
+- **#1015 の半分を同時に潰した**: rollout の `task_started` を送達の証拠（`DeliveryEvidence`）として
+  渡し、**画面検証の失敗（`prompt_delivery_failed_at`）より優先**する。ターンは投入された
+  プロンプトでしか始まらないため。`response_item` の `role: "user"` は数えない（rollout の先頭に
+  指示文が同じ形で載りうるので「届いた」と誤る側へ倒れる）。**idle 誤検知の半分は #1015 に残る**
+- **変更 3**: 失敗の種別を 6 つへ（`cli_not_found` / `not_authenticated` / `trust_write_failed` /
+  `exited_immediately` / `local_runtime_down` / `local_model_missing`）。**4 系統 × 起こりうる
+  組み合わせ**の日英文言をテストが総当たりで固定し、起こりえない組み合わせは `applies_to` で
+  宣言して外す。**`exited_immediately` / `local_*` は語彙と文言だけで検知の配線は無い**
+  （ローカル LLM の起動経路そのものが #990 / #991 待ち = 過大申告しない）
+- 検知の配線: ①画面からの起動失敗分類（`detect_launch_failure`。**送達の証拠がまだ無い worker に
+  限る** = 仕事が始まった worker の scrollback の `command not found` を誤検知しない）→
+  `status = "error"` / `error.kind = launch_failed` / `error.launch_problem` ②事前信頼の書き込み
+  失敗を spawn 応答の `warnings[]` へ（致命ではないが黙って遅くなるのを止める）。supervisor は
+  `launch_failed` を**自動復旧しない**（同じ失敗を繰り返すだけなので未復旧として上げる）
+- ログインのコマンドは `agent_cli::auth_command` が正本（#1002 の `agent_models` が引く形へ寄せた）
+- **測り方で踏んだ穴**: `ensure_trusted_in` は **旧 `~/.claude.json`（実 HOME）も書く**ので、
+  経路ごと通す統合テストはユーザーの実ファイルへ書き込む（1 度踏んだ）。権限を落とした
+  ディレクトリでの実測は `ensure_codex_trusted_at` を直に叩く unit テストへ移した
+- 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 全緑 / Windows クロスチェック
+  警告 12（**全件が未変更ファイル由来** = main と同数）/ MCP 142 ツール（不変）/ docs 再生成 +
+  `--check`。**検出力は `TAKO_983_LEGACY=1` の A/B で実証**（新テスト 4 本が
+  `prompt_delivery="n/a"`・`status="unknown"` = 報告どおりの無言死で FAILED）
+- 関連: PR（`Refs #983`）。**GUI が要る実測（spawn の通し・受け入れ条件 3）は未実施**
+  （プレゼンのため画面に出る検証を停止中）
+||||||| 99987b0

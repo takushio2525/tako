@@ -1379,7 +1379,10 @@ fn missing_agents(detected: &[DetectedAgent]) -> Vec<SetupAgent> {
 fn print_missing_agents(detected: &[DetectedAgent]) {
     use tako_control::orchestrator::agent_cli;
     for (offset, kind) in missing_agents(detected).iter().enumerate() {
-        let guidance = agent_cli::guidance(worker_agent_of(*kind));
+        // #983: 案内の正本はマトリクスの系統（`agent_support::Agent`）で引く
+        let guidance = tako_core::agent_support::Agent::parse(worker_agent_of(*kind).as_str())
+            .map(agent_cli::guidance)
+            .unwrap_or_else(|| agent_cli::guidance(tako_core::agent_support::Agent::Claude));
         let hint = guidance
             .command
             .map(|cmd| format!("導入: {cmd}"))

@@ -623,6 +623,49 @@ mod tests {
     }
 
     #[test]
+    fn 事前信頼が書けないときは分類済みの理由と次の一手が出る() {
+        // #983 の受け入れ条件 1（書き込み不能な設定ディレクトリ）。
+        // **実際に権限を落としたディレクトリ**へ本番の書き込み関数を通す。
+        // 実 HOME は触らない（`ensure_trusted_in` は旧 `~/.claude.json` も書くため、
+        // 経路ごと通すとユーザーの実ファイルへ書いてしまう）
+        use crate::orchestrator::agent_cli::{AgentCliError, AgentCliProblem};
+        use std::os::unix::fs::PermissionsExt;
+        use tako_core::i18n::Lang;
+
+        let dir = std::env::temp_dir().join(format!("tako-983-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 書き込みだけ落とす（読み・実行は残す = 「設定は読めるが書けない」状態）
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let result = ensure_codex_trusted_at(&dir.join("config.toml"), "/work/proj");
+
+        // 判定の前に権限を戻す（失敗しても後始末が残らないように）
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(&dir, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let raw = result.expect_err("書き込めないディレクトリでは失敗する");
+        assert!(!raw.is_empty(), "生の詳細が残ること");
+
+        // 呼び出し側（spawn）はこれを分類済みの警告へ変換する
+        let msg = AgentCliError {
+            agent: WorkerAgent::Codex,
+            problem: AgentCliProblem::TrustWriteFailed,
+        }
+        .message_in(Lang::Ja);
+        assert!(msg.contains("codex"), "どの CLI の話か: {msg}");
+        assert!(msg.contains("次の一手"), "次の一手が要る: {msg}");
+        assert!(
+            msg.contains("ダイアログ"),
+            "致命でないこと（tako が承諾する）が分かること: {msg}"
+        );
+    }
+
+    #[test]
     fn codex_trust_creates_file_when_missing() {
         let dir = std::env::temp_dir().join(format!("tako-codex-trust-new-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

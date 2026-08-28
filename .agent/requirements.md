@@ -1071,7 +1071,7 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 根拠は原則としてコード本文の引用と既存 Issue の実測記録に限り、実機で確かめるべきものは
 `Pending` + 追跡 Issue のまま置いている（過大申告しない。#591 / #617 と同じ基準）。
 
-### FR-2.30 エージェント起動の失敗は必ず分類して返す（▶ 2026-08-27 に変更 1、#983）
+### FR-2.30 エージェント起動の失敗は必ず分類して返す（✅ 2026-08-28、#983）
 
 | ID | 要件 | 優先度 |
 |---|---|---|
@@ -1081,14 +1081,30 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 | FR-2.30.4 | 対象は agent CLI を起動するすべての経路: worker spawn（`orchestrator run` / checkpoint resume も同じ経路）/ `tako master` / `tako solo` / 引き継ぎの後任 master（#193）/ コンフリクト解消エージェント（#496）。**後任 master が黙って死ぬと前任を閉じる主体が居なくなる**ので、引き継ぎは特に起動前に落とす | M |
 | FR-2.30.5 | 解決した実行ファイルを応答（`agent_path`）に出す。「どの binary を起動したか」が読めれば、PATH の食い違い（#498 / #772 の stale claude）と CLI 不在を利用者が切り分けられる | S |
 
-実装メモ（2026-08-27）: `tako_control::orchestrator::agent_cli`（`AgentCliProblem` / `guidance` /
-`locate` / `preflight`）。文言は `Note`（日英）で、`message_in(lang)` が純粋関数なので
-**表示言語グローバルに触らず検査できる**（#608 / #807 の競合対策と同じ作法）。claude の導入手順は
-境界 B17（`platform::agent_install`）の正本から引く（#868 と二重管理しない）。
+| FR-2.30.6 | **送達の観測手段は系統ごとに違うので、マトリクス（FR-2.29）から引く**。旧実装は `registry::prompt_delivery_assessment` が `agent != "claude"` を `NotApplicable` で即返しており、**観測手段が無い = 何も言わない**になっていた。一次シグナルを持つ系統（claude の transcript / codex の rollout）だけが未達を断定し、持たない系統（agy）は `unverified`（未確認）+ `verify_then_resend` を返す。**未達と断定しないので supervisor の自動再送は撃たれない**（撃つと同じ依頼を二度渡す = #1015 の事故） | M |
+| FR-2.30.7 | **ターンが走った証拠は画面検証の失敗より強い**。codex の rollout に `task_started` があれば、画面の送達確認が失敗と記録していても `delivered` へ覆す（ターンは投入されたプロンプトでしか始まらない）。`response_item` の `role: "user"` は数えない（rollout の先頭に指示文が同じ形で載りうるため、起動直後に「届いた」と誤る側へ倒れる） | M |
+| FR-2.30.8 | **起動失敗は画面からも分類する**。CLI 不在（`command not found` に agent 自身の名前が同居）・未認証（実採取の文言のみ）を `status = "error"` / `error.kind = launch_failed` / `error.launch_problem` として返す。**送達の証拠がまだ無い worker に限る**（仕事が始まった worker の scrollback には agent 自身が実行したコマンドの `command not found` が普通に流れる）。supervisor は自動復旧を試みない（同じ失敗を繰り返すだけなので未復旧として上げる） | M |
+| FR-2.30.9 | **spawn を止めない失敗も黙らない**。事前信頼の書き込み失敗は致命ではない（tako が信頼ダイアログを検出して承諾する）が、そのぶん最初の指示が届くまで遅くなるので、応答の `warnings[]` に「分類 + 理由 + 次の一手 + 生の詳細」を載せる | S |
+
+実装メモ（2026-08-27 → 2026-08-28 に変更 2 / 3 を追加）:
+`tako_control::orchestrator::agent_cli`（`AgentCliProblem` / `guidance` / `locate` / `preflight` /
+`detect_launch_failure` / `problem_message_in`）。文言は `Note`（日英）で、`message_in(lang)` が
+純粋関数なので**表示言語グローバルに触らず検査できる**（#608 / #807 の競合対策と同じ作法）。
+claude の導入手順は境界 B17（`platform::agent_install`）の正本から引き、ログインのコマンドは
+`agent_cli::auth_command` が正本（#1002 の `agent_models` もここを引く = 二重管理しない）。
 `cfg(test)` では実探索をしない（unix の実探索はログインシェルを起動するので、テストごとに
-子プロセスが増えて `ipc::連続接続でfdが漏れない` を落とす）。A/B は `TAKO_983_LEGACY=1`。
-**変更 2（送達観測手段が無い agent の `NotApplicable` を FR-2.29 のマトリクスから引く）と
-変更 3（系統の網羅）は未実装**（#982 が入ったので着手可能になった。Issue #983 に残タスクとして記録）。
+子プロセスが増えて `ipc::連続接続でfdが漏れない` を落とす）。
+
+失敗の種別は **6 つ**（`cli_not_found` / `not_authenticated` / `trust_write_failed` /
+`exited_immediately` / `local_runtime_down` / `local_model_missing`）で、**4 系統 × 起こりうる
+組み合わせ**の文言をテストが総当たりで固定する。起こりえない組み合わせは `applies_to` で宣言して
+外す（claude に「`ollama serve` を確認」と言わない / ローカルモデルに「ログイン」と言わない）。
+**`exited_immediately` / `local_*` は語彙と文言だけがあり、検知の配線はまだ無い**
+（ローカル LLM の起動経路そのものが #990 / #991 待ち）。
+
+送達の観測手段は `tako_core::agent_support::delivery_observation`（マトリクスの
+`WORKER_STATUS_STRUCTURED` を引く純粋関数）。A/B は `TAKO_983_LEGACY=1` で
+**変更 1 / 2 / 3 がまとめて旧挙動へ戻る**。
 
 ### FR-2.31 codex worker の状態監視を claude 同等へ（✅ 2026-08-27、#984。エピック #975）
 

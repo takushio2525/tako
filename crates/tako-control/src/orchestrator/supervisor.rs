@@ -743,6 +743,30 @@ pub fn recover_dead(
     verified
 }
 
+/// 起動失敗（#983）は**自動復旧しない**。監査ログと履歴へ理由を残して未復旧を返す。
+///
+/// 自動で直せる種類の失敗ではない（CLI の導入・ログイン・runtime の起動が要る）ので、
+/// ここで再送やナッジを撃つと同じ失敗を max_retries 回繰り返すだけになる
+fn report_launch_failed(
+    ctx: &mut SupervisorContext,
+    detail: &str,
+    state: &mut SupervisorState,
+) -> bool {
+    let action = "launch_failed_report";
+    audit_log(&ctx.worker_id, ctx.pane_id, action, detail);
+    state.record(RecoveryEntry {
+        timestamp: crate::sessions::now_iso(),
+        worker_id: ctx.worker_id.clone(),
+        pane: ctx.pane_id,
+        trigger: "launch_failed".into(),
+        action: action.into(),
+        success: false,
+        detail: detail.to_string(),
+    });
+    state.failure_count += 1;
+    false
+}
+
 /// prompt_undelivered の自動再送
 pub fn recover_prompt_undelivered(
     ctx: &mut SupervisorContext,
@@ -972,6 +996,11 @@ pub fn supervisor_loop(
                 WorkerErrorKind::UsageLimit => recover_usage_limit(&mut ctx, detail, &mut state),
                 WorkerErrorKind::ApiError => recover_api_error(&mut ctx, detail, &mut state),
                 WorkerErrorKind::LimitDialog => recover_limit_dialog(&mut ctx, detail, &mut state),
+                // #983: 起動そのものが失敗している（未認証・CLI 不在・即時終了）。
+                // 続行ナッジも待機も再送も効かない —— **同じ失敗を繰り返すだけ**なので
+                // 自動復旧を試みず、未復旧としてエスカレーションへ回す
+                // （detail に「理由 + 次の一手」が入っているので、人が読めば直せる）
+                WorkerErrorKind::LaunchFailed => report_launch_failed(&mut ctx, detail, &mut state),
             },
             WatchOutcome::AgentDead { resume_command } => {
                 recover_dead(&mut ctx, resume_command.as_deref(), &mut state)

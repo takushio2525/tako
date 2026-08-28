@@ -7444,7 +7444,12 @@ fn dispatch_git_resolve_agent(
     let pre_trusted =
         orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
             .unwrap_or_else(|e| {
-                eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+                // #983: 分類済みの理由 + 次の一手で残す（無言の劣化を作らない）
+                let _ = launch_warning(
+                    worker_agent,
+                    crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
+                    &e,
+                );
                 false
             });
     if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
@@ -7681,10 +7686,18 @@ fn dispatch_orchestrator_spawn(
     // config dir 配下でなければ効かない（#558。アカウント指定で変わる）。
     // 失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
     let claude_config_dir = profile_env.claude_config_dir();
+    // #983 の変更 3: 事前信頼の書き込み失敗を**黙って握りつぶさない**。
+    // 致命ではない（tako がダイアログを検出して承諾する）が、そのぶん最初の指示が
+    // 届くまで遅くなる。理由と次の一手を応答の warnings へ載せる
+    let mut launch_warnings: Vec<Value> = Vec::new();
     let pre_trusted =
         orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
             .unwrap_or_else(|e| {
-                eprintln!("warning: 事前信頼の書き込みに失敗（ダイアログ検出で継続）: {e}");
+                launch_warnings.push(launch_warning(
+                    worker_agent,
+                    crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
+                    &e,
+                ));
                 false
             });
 
@@ -7857,7 +7870,28 @@ fn dispatch_orchestrator_spawn(
         // #822: この worker に適用された利用上限後の自動復帰（FR-2.27）。
         // true なら `tako limit-resume --pane <id>` で切らない限り自動復帰の対象
         "limit_resume": limit_resume_applied,
+        // #983: spawn は成立したが完全ではなかったもの（分類 + 理由 + 次の一手）。
+        // 空配列 = 何も問題が無かった
+        "warnings": launch_warnings,
     }))
+}
+
+/// 起動時の非致命な失敗を「分類 + 理由 + 次の一手 + 生の詳細」で返す（#983 の変更 3）。
+/// **spawn を止めない失敗でも黙らない**ための 1 箇所
+fn launch_warning(
+    agent: crate::orchestrator::agent::WorkerAgent,
+    problem: crate::orchestrator::agent_cli::AgentCliProblem,
+    detail: &str,
+) -> Value {
+    let err = crate::orchestrator::agent_cli::AgentCliError { agent, problem };
+    let message = err.message();
+    eprintln!("warning: {message}（{detail}）");
+    json!({
+        "kind": problem.kind(),
+        "agent": agent.as_str(),
+        "message": message,
+        "detail": detail,
+    })
 }
 
 /// OrchestratorWorkerStatus の UI スレッド必須部分（workspace / ライブ画面の読み取り）の
@@ -8024,6 +8058,9 @@ fn finish_worker_status(
     // 正規化しないと watch ループの unknown フォールバック（スクリーン末尾 5 行判定）に
     // 落ち、長時間ツール出力で busy パターンが流れた瞬間に偽 IDLE が出る
     let mut codex_rate_limits: Option<crate::codex_session::RateLimits> = None;
+    // #983 の変更 2: 「ターンが走った」= プロンプトが届いた、という**送達の一次シグナル**。
+    // 画面の送達確認より強い証拠なので、送達判定へ渡して未達の誤検知を潰す（#1015）
+    let mut codex_turn_observed = false;
     let (status, ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
@@ -8037,6 +8074,7 @@ fn finish_worker_status(
             Some(st) => {
                 // #985: 同じ読み取りにレート制限も載っている（追加の I/O ゼロ）
                 codex_rate_limits = st.rate_limits.clone();
+                codex_turn_observed = st.prompt_arrived();
                 match st.status() {
                     Some(s) => (s.to_string(), st.ctx_percent),
                     None => ("unknown".to_string(), st.ctx_percent),
@@ -8100,7 +8138,13 @@ fn finish_worker_status(
         let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
         let spawned_epoch = crate::sessions::parse_iso(&effective.spawned_at).unwrap_or(now_epoch);
         (
-            orchestrator::registry::prompt_delivery_assessment(&effective, now_epoch),
+            orchestrator::registry::prompt_delivery_assessment_with(
+                &effective,
+                now_epoch,
+                orchestrator::registry::DeliveryEvidence {
+                    turn_observed: codex_turn_observed,
+                },
+            ),
             now_epoch - spawned_epoch,
         )
     });
@@ -8115,6 +8159,7 @@ fn finish_worker_status(
         recent_output,
         full_screen,
         tmux_session: tmux_session.map(String::from),
+        registry_agent: registry_worker.as_ref().map(|(_, e)| e.agent.clone()),
         registry_worker_id: registry_worker.map(|(id, _)| id),
         prompt_delivery,
         registry_session_detected,
@@ -8139,6 +8184,9 @@ struct ResolvedWorkerStatus {
     tmux_session: Option<String>,
     /// #390: レジストリ上の worker ID（登録済み worker のみ）
     registry_worker_id: Option<String>,
+    /// #983: レジストリ上の agent 系統（claude / codex / agy）。
+    /// 起動失敗の分類と、送達の観測手段の解決に使う
+    registry_agent: Option<String>,
     /// #390: prompt 送達判定（レジストリ登録済み worker のみ）と spawn からの経過秒
     prompt_delivery: Option<(crate::orchestrator::registry::PromptDelivery, i64)>,
     /// #390: レジストリに session_id が記録済み（= エージェントは一度起動して走った）
@@ -8169,6 +8217,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         full_screen,
         tmux_session,
         registry_worker_id,
+        registry_agent,
         prompt_delivery,
         registry_session_detected,
         registry_resume_command,
@@ -8293,7 +8342,47 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // rate limit ダイアログ）があれば error へ細分類する（#157）。busy 中は判定しない
     // （自動リトライ・ツール実行ログへの誤検知防止。busy が明ければ idle 経由で判定される）
     let mut error_info: Option<Value> = None;
-    if status == "idle" {
+
+    // #983: **エージェント CLI の起動そのものが失敗している**画面（CLI 不在で
+    // `command not found` が出た / 未認証で止まっている）。旧実装ではこの状態が
+    // 「idle = 完了」に見えていた = 無言死。既存のエラー検知より先に見る。
+    //
+    // **送達の証拠がまだ無い worker に限る**のが誤検知しないための鍵:
+    // 一度でも仕事が始まった worker の scrollback には、agent 自身が実行した
+    // コマンドの `command not found` が普通に流れる
+    use crate::orchestrator::registry::PromptDelivery;
+    let never_delivered = !registry_session_detected
+        && !matches!(
+            prompt_delivery.map(|(a, _)| a),
+            Some(PromptDelivery::Delivered)
+        );
+    if never_delivered
+        && (status == "idle" || status == "unknown")
+        && !crate::orchestrator::agent_cli::legacy_mode()
+    {
+        if let (Some(agent_name), Some(out)) = (registry_agent.as_deref(), recent_output.as_deref())
+        {
+            if let Ok(agent) = crate::orchestrator::agent::WorkerAgent::parse(agent_name) {
+                if let Some(problem) =
+                    crate::orchestrator::agent_cli::detect_launch_failure(agent, out)
+                {
+                    let kind = crate::orchestrator::wait::WorkerErrorKind::LaunchFailed;
+                    let err = crate::orchestrator::agent_cli::AgentCliError { agent, problem };
+                    status = "error".to_string();
+                    error_info = Some(json!({
+                        "kind": kind.as_str(),
+                        // 「理由 + 次の一手」をそのまま載せる（watch は detail を出す）
+                        "detail": err.message(),
+                        "recommended_action": kind.recommended_action(),
+                        // 機械が分岐できる細分類（cli_not_found / not_authenticated / …）
+                        "launch_problem": problem.kind(),
+                    }));
+                }
+            }
+        }
+    }
+
+    if status == "idle" && error_info.is_none() {
         if let Some((kind, detail)) = recent_output
             .as_ref()
             .and_then(|out| crate::orchestrator::wait::detect_worker_error(out))
@@ -8343,9 +8432,14 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // has_children は抑制条件にしない: プロンプト未達の claude は welcome 画面の
     // まま「プロセスとしては生存」しているため（当日の実害 2 件目 = ペイン健在の
     // 未達がまさにこの状態）、子プロセスの有無は未達かどうかの判別に使えない
+    //
+    // #983: `Unverified`（一次シグナルを持たない系統の猶予超過）も**同じ画面で裏取りする**。
+    // 動いているものを「届いていないかも」と言わないための、これが代替判定の実体
     let prompt_delivery_final = prompt_delivery.map(|(assessment, since_spawn)| {
-        use crate::orchestrator::registry::PromptDelivery;
-        if assessment == PromptDelivery::OverdueSuspect {
+        if matches!(
+            assessment,
+            PromptDelivery::OverdueSuspect | PromptDelivery::Unverified
+        ) {
             let screen_busy = recent_output
                 .as_ref()
                 .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
@@ -8365,6 +8459,19 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
             crate::orchestrator::wait::WorkerEvent {
                 kind: crate::orchestrator::wait::WorkerEventKind::PromptUndelivered {
                     seconds_since_spawn: since_spawn,
+                },
+            }
+            .to_json(),
+        );
+    }
+    // #983 の受け入れ条件 5: 送達を裏づける一次シグナルが無い系統でも**黙らない**。
+    // 未達と断定せず「未確認 + 確かめてから再送」を出す（自動再送は撃たれない）
+    if let Some((PromptDelivery::Unverified, since_spawn)) = prompt_delivery_final {
+        events.push(
+            crate::orchestrator::wait::WorkerEvent {
+                kind: crate::orchestrator::wait::WorkerEventKind::PromptDeliveryUnverified {
+                    seconds_since_spawn: since_spawn,
+                    agent: registry_agent.clone().unwrap_or_default(),
                 },
             }
             .to_json(),
@@ -18615,6 +18722,182 @@ mod tests {
             "解決済み session_id がレジストリへ書き戻される"
         );
         assert!(entry.prompt_delivered_at.is_some());
+    }
+
+    #[test]
+    fn issue983_観測手段の無い系統でも送達判定が黙らない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        // 猶予（240 秒）を大きく超えた agy worker。agy は送達の一次シグナルを持たない
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q9831".into(),
+                WorkerEntry {
+                    pane: 9831,
+                    agent: "agy".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // 入力待ちの画面 → 「未確認」を言う（旧実装は n/a = 何も言わなかった）
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 9831,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("agy\n> ".into()),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            v["prompt_delivery"], "unverified",
+            "黙らない（n/a にしない）"
+        );
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"prompt_delivery_unverified"),
+            "未確認イベントが出ること: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "未達とは断定しないこと（supervisor に自動再送を撃たせない）: {kinds:?}"
+        );
+        // 次の一手は「確かめてから再送」（そのまま再送させない）
+        let ev = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "prompt_delivery_unverified")
+            .unwrap()
+            .clone();
+        assert_eq!(ev["recommended_action"], "verify_then_resend");
+        assert_eq!(ev["agent"], "agy");
+
+        // 画面が busy なら「未確認」も言わない（動いているものを疑わない）
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 9831,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("Thinking…\nesc to interrupt".into()),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["prompt_delivery"], "pending");
+    }
+
+    #[test]
+    fn issue983_起動失敗を分類してerrorにする() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q9832".into(),
+                WorkerEntry {
+                    pane: 9832,
+                    agent: "codex".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        // CLI が無い環境で起動コマンドが流れた画面（#983 の無言死そのもの）
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 9832,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some(
+                    "testuser@host tmp % TAKO_ORCHESTRATOR_ROLE='worker:p983' codex\n\
+                     zsh: command not found: codex\n\
+                     testuser@host tmp % "
+                        .into(),
+                ),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "error", "idle（= 完了）に見せない");
+        assert_eq!(v["error"]["kind"], "launch_failed");
+        assert_eq!(v["error"]["launch_problem"], "cli_not_found");
+        assert_eq!(v["error"]["recommended_action"], "fix_launch");
+        let detail = v["error"]["detail"].as_str().unwrap();
+        assert!(detail.contains("codex"), "どの CLI の話か: {detail}");
+        assert!(
+            detail.contains("tako setup"),
+            "次の一手が入っていること: {detail}"
+        );
+
+        // 未認証の画面も分類される
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 9832,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("Not logged in\n".into()),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["error"]["launch_problem"], "not_authenticated");
+        assert!(v["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("codex login"));
+
+        // 作業が始まっている worker の scrollback にある command not found は
+        // 起動失敗ではない（session 検出済み = 一度は走った）
+        WorkerRegistry::mutate_at(&path, |reg| {
+            if let Some(e) = reg.workers.get_mut("q9832") {
+                e.prompt_delivered_at = Some(crate::sessions::now_iso());
+            }
+        })
+        .unwrap();
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 9832,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("zsh: command not found: codex\n".into()),
+                full_screen: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(v["status"], "error", "動いている worker を落とさない");
     }
 
     #[test]

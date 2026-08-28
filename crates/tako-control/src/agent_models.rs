@@ -230,14 +230,13 @@ fn join3(head: &str, next: &str, detail: &str, lang: Lang) -> String {
 }
 
 /// 各 CLI のログイン手順（実物で確認した形）
+/// ログインのコマンド。**正本は #983 の `agent_cli::auth_command`**（未認証の案内を
+/// モデル一覧側と起動側で二重管理しない）
 fn auth_command(agent: WorkerAgent) -> String {
-    match agent {
-        WorkerAgent::Claude => "claude auth login".into(),
-        WorkerAgent::Codex => "codex login".into(),
-        // agy は専用のログインサブコマンドが無く、引数なし起動でサインインへ入る
-        // （実測のエラー文: `Launch the CLI without arguments to sign in.`）
-        WorkerAgent::Agy => "agy".into(),
-    }
+    tako_core::agent_support::Agent::parse(agent.as_str())
+        .and_then(agent_cli::auth_command)
+        .unwrap_or(agent.as_str())
+        .to_string()
 }
 
 /// 一覧取得コマンドの argv（**正本**。表示・実行・テストがここだけを見る）。

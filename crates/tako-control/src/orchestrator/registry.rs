@@ -157,7 +157,14 @@ pub enum PromptDelivery {
     /// 猶予時間を超えても未観測 = プロンプト未達の疑い。
     /// 最終判定は画面状態（busy でない等）と併せて呼び出し側が行う
     OverdueSuspect,
-    /// 判定対象外（claude 以外の agent、closed、時刻パース不能）
+    /// 猶予時間を超えたが、**この系統には送達を裏づける一次シグナルが無い**（#983）。
+    ///
+    /// 「届いていない」のか「届いたが観測できていない」のかを区別できないので、
+    /// 未達と断定しない = 自動再送（supervisor の `recover_prompt_undelivered`）を
+    /// 撃たせない。**黙る（`NotApplicable`）のではなく「未確認」と言う**のが要点で、
+    /// master には「画面を見て確かめてから再送する」次の一手が出る
+    Unverified,
+    /// 判定対象外（closed、時刻パース不能）
     NotApplicable,
 }
 
@@ -176,6 +183,7 @@ impl PromptDelivery {
             Self::Delivered => "delivered",
             Self::Pending => "pending",
             Self::OverdueSuspect => "undelivered",
+            Self::Unverified => "unverified",
             Self::NotApplicable => "n/a",
         }
     }
@@ -681,11 +689,49 @@ pub fn sweep_dead(
     sweep_dead_at(&path, live_backends, live_panes)
 }
 
-/// prompt 送達状態を判定する（Issue #390 要件 4）。
+/// レジストリだけでは分からない「送達の一次シグナル」の観測結果（#983 の変更 2）。
+///
+/// レジストリはファイルなので I/O を伴う観測（codex の rollout を読む等）はできない。
+/// **観測は呼び出し側（dispatch の `worker_status`）が行い、結果をここへ渡す**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeliveryEvidence {
+    /// この系統の一次シグナルが「プロンプトが届いてターンが走った」と示している。
+    ///
+    /// **claude の session_id はここに入れてはいけない**: セッションの存在は
+    /// 「claude が起動した」証拠であって「プロンプトが届いた」証拠ではない（#530）。
+    /// 入るのは codex の `task_started` のように**投入されてはじめて起きる**事象だけ
+    pub turn_observed: bool,
+}
+
+/// prompt 送達状態を判定する（Issue #390 要件 4 / #983 の変更 2）。
 /// OverdueSuspect は「疑い」であり、最終的な未達イベントの発火は呼び出し側が
 /// 画面状態（busy でない・実行中子プロセスなし）と組み合わせて決める
 pub fn prompt_delivery_assessment(entry: &WorkerEntry, now_epoch: i64) -> PromptDelivery {
-    // 送達フローが未達を確定させていれば、それを最優先する（Issue #530）。
+    prompt_delivery_assessment_with(entry, now_epoch, DeliveryEvidence::default())
+}
+
+/// 一次シグナルの観測結果つきの判定（#983 の変更 2）。
+///
+/// 旧実装は `entry.agent != "claude"` を `NotApplicable` で即返していた。
+/// 誤検知を避ける判断としては妥当だったが、**結果として「観測手段が無い =
+/// 何も言わない」**になっていた（#983 の無言死）。ここでは
+/// [`tako_core::agent_support::delivery_observation`] を引いて、
+/// 一次シグナルのある系統だけが未達を断定し、無い系統は
+/// [`PromptDelivery::Unverified`]（= 未確認）を返す
+pub fn prompt_delivery_assessment_with(
+    entry: &WorkerEntry,
+    now_epoch: i64,
+    evidence: DeliveryEvidence,
+) -> PromptDelivery {
+    use tako_core::agent_support::{self, Agent, DeliveryObservation};
+
+    // ターンが走った = プロンプトが届いた。**画面検証の失敗より強い証拠**なので
+    // 最優先する（#1015: 画面確認が失敗と記録した codex worker が、実際には
+    // 依頼を読んで作業していたのに永久に undelivered のままだった）
+    if evidence.turn_observed && !super::agent_cli::legacy_mode() {
+        return PromptDelivery::Delivered;
+    }
+    // 送達フローが未達を確定させていれば、それを次に優先する（Issue #530）。
     // session 検出は「claude が起動した」証拠であって「プロンプトが届いた」証拠ではない
     // （初回のテーマ選択・ログイン方法選択ダイアログにプロンプトが食われても
     // claude 自体は起動するため session_id は付く = 旧実装の delivered 偽陽性）
@@ -695,18 +741,24 @@ pub fn prompt_delivery_assessment(entry: &WorkerEntry, now_epoch: i64) -> Prompt
     if entry.session_id.is_some() || entry.prompt_delivered_at.is_some() {
         return PromptDelivery::Delivered;
     }
-    // transcript（session_id）の観測経路があるのは claude のみ。
-    // codex / agy を undelivered と誤検知しないため対象外にする
-    if entry.agent != "claude" || !entry.is_active() {
+    if !entry.is_active() {
         return PromptDelivery::NotApplicable;
     }
     let Some(spawned) = crate::sessions::parse_iso(&entry.spawned_at) else {
         return PromptDelivery::NotApplicable;
     };
-    if now_epoch - spawned > PROMPT_DELIVERY_GRACE_SECS {
-        PromptDelivery::OverdueSuspect
-    } else {
-        PromptDelivery::Pending
+    // #983 の A/B: 旧挙動は「claude 以外は何も言わない」
+    if super::agent_cli::legacy_mode() && entry.agent != "claude" {
+        return PromptDelivery::NotApplicable;
+    }
+    if now_epoch - spawned <= PROMPT_DELIVERY_GRACE_SECS {
+        return PromptDelivery::Pending;
+    }
+    // 猶予超過。**何をもって未達と言えるか**は系統ごとに違う（マトリクスが正本）。
+    // 知らない agent 名は「観測手段が無い」側へ倒す（黙らず、断定もしない）
+    match Agent::parse(&entry.agent).map(agent_support::delivery_observation) {
+        Some(DeliveryObservation::Structured) => PromptDelivery::OverdueSuspect,
+        _ => PromptDelivery::Unverified,
     }
 }
 
@@ -978,7 +1030,8 @@ mod tests {
             prompt_delivery_assessment(&entry, now_epoch + 10_000),
             PromptDelivery::Delivered
         );
-        // claude 以外は対象外
+        // #983: claude 以外も黙らない。codex は一次シグナル（rollout）を持つので
+        // claude と同じく未達を断定する
         let codex = WorkerEntry {
             agent: "codex".into(),
             status: "active".into(),
@@ -987,7 +1040,7 @@ mod tests {
         };
         assert_eq!(
             prompt_delivery_assessment(&codex, now_epoch + 10_000),
-            PromptDelivery::NotApplicable
+            PromptDelivery::OverdueSuspect
         );
         // closed は対象外
         let closed = WorkerEntry {
@@ -999,6 +1052,98 @@ mod tests {
         assert_eq!(
             prompt_delivery_assessment(&closed, now_epoch + 10_000),
             PromptDelivery::NotApplicable
+        );
+    }
+
+    #[test]
+    fn 一次シグナルの無い系統は未達と断定せず未確認を返す() {
+        // #983 の受け入れ条件 5。旧実装は agent != "claude" を NotApplicable で
+        // 即返していた = **何も言わない**。agy は送達の一次シグナルを持たないので、
+        // 「未達」と断定はしないが「未確認」とは言う
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        let agy = WorkerEntry {
+            agent: "agy".into(),
+            status: "active".into(),
+            spawned_at: crate::sessions::now_iso(),
+            ..Default::default()
+        };
+        assert_eq!(
+            prompt_delivery_assessment(&agy, now_epoch),
+            PromptDelivery::Pending,
+            "猶予内は claude と同じ"
+        );
+        let after = prompt_delivery_assessment(&agy, now_epoch + PROMPT_DELIVERY_GRACE_SECS + 10);
+        assert_eq!(after, PromptDelivery::Unverified);
+        assert_ne!(after, PromptDelivery::NotApplicable, "黙らないこと");
+        assert_ne!(
+            after,
+            PromptDelivery::OverdueSuspect,
+            "断定もしないこと（自動再送を撃たせない）"
+        );
+        assert_eq!(after.as_str(), "unverified");
+
+        // 知らない agent 名も「観測手段が無い」側へ倒す（黙らず、断定もしない）
+        let unknown = WorkerEntry {
+            agent: "someagent".into(),
+            ..agy.clone()
+        };
+        assert_eq!(
+            prompt_delivery_assessment(&unknown, now_epoch + PROMPT_DELIVERY_GRACE_SECS + 10),
+            PromptDelivery::Unverified
+        );
+    }
+
+    #[test]
+    fn ターンが走った証拠は画面検証の失敗より強い() {
+        // #1015: 画面の送達確認が失敗と記録した codex worker が、実際には依頼を
+        // 読んで作業していたのに永久に undelivered のままだった。
+        // rollout の task_started は「投入されたプロンプトでしか起きない」ので、
+        // これが観測できたら delivered と言い切ってよい
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        let entry = WorkerEntry {
+            agent: "codex".into(),
+            status: "active".into(),
+            spawned_at: crate::sessions::now_iso(),
+            prompt_delivery_failed_at: Some(crate::sessions::now_iso()),
+            prompt_delivery_failure: Some("flow_timeout".into()),
+            ..Default::default()
+        };
+        // 一次シグナルが無ければ従来どおり未達（#530 の判断は変えない）
+        assert_eq!(
+            prompt_delivery_assessment(&entry, now_epoch + 10_000),
+            PromptDelivery::OverdueSuspect
+        );
+        // ターンを観測できたら delivered へ覆る
+        assert_eq!(
+            prompt_delivery_assessment_with(
+                &entry,
+                now_epoch + 10_000,
+                DeliveryEvidence {
+                    turn_observed: true
+                }
+            ),
+            PromptDelivery::Delivered
+        );
+    }
+
+    #[test]
+    fn 送達の観測手段はマトリクスから引く() {
+        // 判断をこのファイルへ焼き込まない（#982 のマトリクスが正本）。
+        // 系統が増えたらマトリクスを直せば追従する、という構造の検査
+        use tako_core::agent_support::{delivery_observation, Agent, DeliveryObservation};
+        assert_eq!(
+            delivery_observation(Agent::Claude),
+            DeliveryObservation::Structured
+        );
+        assert_eq!(
+            delivery_observation(Agent::Codex),
+            DeliveryObservation::Structured,
+            "#984 で rollout を読めるようになった"
+        );
+        assert_eq!(
+            delivery_observation(Agent::Agy),
+            DeliveryObservation::ScreenOnly,
+            "会話が SQLite で一次シグナルが無い"
         );
     }
 

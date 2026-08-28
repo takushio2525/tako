@@ -21,8 +21,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
 | Claude Code（基準） | 41 / 41 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 26 / 41 | 5 | 9 | 1 |
-| Antigravity CLI | 12 / 41 | 6 | 17 | 6 |
+| OpenAI Codex CLI | 27 / 41 | 5 | 8 | 1 |
+| Antigravity CLI | 12 / 41 | 7 | 16 | 6 |
 | Local LLM | 0 / 41 | 0 | 36 | 5 |
 
 ### 状態の意味
@@ -97,7 +97,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | --- | --- | --- | --- | --- | --- |
 | **作業中か終わったかを判定する**<br />`worker_status_detect` | 対応 | 対応 | 一部対応<br />状態が画面推定のみなので完了の確定が遅い（同じ判定を 8 回続けて見る必要がある。claude は 3 回） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #984: codex は構造化ソース（codex-session）を得たので need_streak が 8 → 3 に なり claude と同じ確定速度になる。同一タスクの A/B 実測（primes 25 個）で before = source=screen / ctx=None / **開始前の t=3s・6s に idle を出す**、after = t=9s から source=codex-session で busy を 2 標本とも捉え t=15s から idle + ctx=8。agy は画面推定のままだが、弱マーカーを agent 別に分離したので (Thinking) 型の誤爆は構造的に起こらない（残る差は確定までの回数だけ） |
 | **画面に依らない一次シグナルで状態を取れる（`claude agents --json` 相当）**<br />`worker_status_structured` | 対応 | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />agy は会話を SQLite で持つため（~/.gemini/antigravity-cli/conversations/）読むには新しい依存が要る。生存は presence のロックで分かるがターンの開始・完了は取れない | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #984 で codex-cli 0.150.1 を実物調査: $CODEX_HOME/sessions/ の rollout JSONL に task_started / task_complete が**逐次**書かれる（250 語生成を 1 秒刻みで観測: t=1s 開始 → t=27s 完了）。tako は status_source=codex-session として読む。agy は会話が SQLite（~/.gemini/antigravity-cli/conversations/<id>.db）で、生存は presence/<id>.lock で分かるがターンの開始・完了は取れない |
-| **プロンプトが届かなかったことを検知して再送手段を出す（#390 / #530）**<br />`worker_prompt_undelivered` | 対応 | 未対応 [#983](https://github.com/takushio2525/tako/issues/983)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#983](https://github.com/takushio2525/tako/issues/983)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: orchestrator/registry.rs の prompt_delivery_assessment は agent が claude でなければ NotApplicable で即返るので、非 claude の未達は観測されない |
+| **プロンプトが届かなかったことを検知して再送手段を出す（#390 / #530）**<br />`worker_prompt_undelivered` | 対応 | 対応 | 一部対応<br />送達を裏づける一次シグナルが無いので、猶予を過ぎても「未達」と断定せず「未確認」を返す（自動再送を撃つと二重指示になる） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | テスト: #983 の変更 2 で prompt_delivery_assessment の判断を delivery_observation （このマトリクスの WORKER_STATUS_STRUCTURED）から引く形にした。codex は rollout の task_started を送達の証拠にできるので claude と同じく未達を断定し、agy は画面確認しか 無いので未達ではなく unverified（+ verify_then_resend）を返す。緑のテスト: registry の「一次シグナルの無い系統は未達と断定せず未確認を返す」「送達の観測手段はマトリクスから引く」「ターンが走った証拠は画面検証の失敗より強い」/ dispatch の「issue983_観測手段の無い系統でも送達判定が黙らない」 |
 | **突然死を検知して復旧コマンドを提示する（#390）**<br />`worker_death_resume` | 対応 | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#984](https://github.com/takushio2525/tako/issues/984)<br />tako の実装が claude 専用で、この系統への配線がまだ無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | コード本文: dispatch.rs のレジストリの resume_command はコメントどおり claude のみ （session ID から claude --resume を組む） |
 
 ## worker への指示と応答
