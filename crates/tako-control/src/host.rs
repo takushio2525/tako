@@ -266,6 +266,30 @@ pub trait UiStateHost {
     /// リモートフォルダの内容を捨てて取り直す（#919 の「再読み込み」）
     fn invalidate_remote_dir(&mut self, _remote: &tako_core::remote_fs::RemoteRef) {}
 
+    /// ペインの SSH 接続待ちを覚え始める（#1010）。
+    ///
+    /// GUI は**この時点から**「<ホスト> へ接続中…」を出す。開き方が 3 通りある
+    /// （#1006）ので `fresh_pane`（tako が印字したものしか載っていないペインか）を
+    /// 併せて渡す: 判定材料が経路で違う（`tako_core::ssh_progress` を参照）。
+    ///
+    /// 既定は**何もしない**。実体は GUI が持つ（画面と時計が要るため）ので、
+    /// GUI が居ない host では状態が `None` のまま = 騙らない
+    fn begin_ssh_connect(&mut self, _pane: PaneId, _host: &str, _fresh_pane: bool) {}
+
+    /// ペインの SSH 接続の進行状況（#1010）。接続待ちでも失敗表示中でもなければ None。
+    ///
+    /// **AI が「まだ繋がっていないのか / 失敗したのか」を応答だけで判断できる**ように
+    /// `list` / `read` に載せる（GUI はヘッダに同じ状態を出す）
+    fn ssh_connect_state(&self, _pane: PaneId) -> Option<Value> {
+        None
+    }
+
+    /// 読み込み中のリモートファイル（#1010）。ツリーがスピナーを出しているもの。
+    /// `remote-folder list` の応答に載せて CLI / MCP からも「いま読み込み中」が読める
+    fn remote_files_loading(&self) -> Vec<tako_core::remote_fs::RemoteRef> {
+        Vec::new()
+    }
+
     /// ペインの `ssh` 検知によるリモートフォルダの自動追加が有効か（#976。既定 ON）
     fn ssh_auto_folders_enabled(&self) -> bool {
         crate::settings::load().ssh_auto_folders

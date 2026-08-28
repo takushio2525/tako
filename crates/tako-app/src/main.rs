@@ -49,6 +49,7 @@ mod right_panel;
 mod settings_sleep;
 mod settings_window;
 mod sidebar;
+mod spinner;
 mod ssh_folders;
 mod starter;
 mod status_bar;
@@ -1557,6 +1558,12 @@ struct TakoApp {
     /// リモート操作の通知（#919）。サイドバー上部に出す。
     /// **失敗は自動で消さない**（静かな失敗を作らないため）
     remote_notice: Option<RemoteNotice>,
+    /// いま SFTP で取得中のリモートファイル（#1010）。ツリーの行にスピナーを出す。
+    /// GUI の「開く」は取得を背景へ出すので、**押した瞬間から終わるまで**ここに居る
+    /// （CLI / MCP は同期のまま = #966 の切り分けと同じ）
+    remote_file_loading: HashMap<tako_core::remote_fs::RemoteRef, std::time::Instant>,
+    /// SSH の接続待ち / 失敗（#1010）。ペインヘッダに出し、`list` / `read` にも載せる
+    ssh_connect: HashMap<PaneId, SshConnect>,
     /// ペインヘッダ / タブの右クリックメニュー（#185）
     pane_context_menu: Option<PaneContextMenu>,
     /// ファイルツリーのインライン編集
@@ -2892,6 +2899,32 @@ impl RemotePush {
     }
 }
 
+/// ペインの SSH 接続の進行（#1010）。
+///
+/// 「操作したのに何も起きない」時間を覆うのが目的なので、**dispatch の時点から**
+/// 覚え始める（#640 の送達フローはシェルの準備を待つので、打たれるまでの沈黙も
+/// ユーザーから見れば同じ「何も起きない」）。判定そのものは
+/// `tako_core::ssh_progress`（純粋関数）で、ここは材料と時計を持つだけ
+struct SshConnect {
+    host: String,
+    started: std::time::Instant,
+    /// tako が印字したものしか載っていないペインか（`split` / `tab` = true）
+    fresh_pane: bool,
+    /// 覚え始めたときの「新しく出た行」の起点（`pane` 経路で切り出すため）。
+    /// 画面は端末の行数ぶん常に返るので**行数では切り出せない**（`ssh_progress` 参照）
+    baseline_index: usize,
+    /// 覚え始めたときの画面の指紋（動いたかどうかだけ見る）
+    baseline_fingerprint: u64,
+    phase: tako_core::ssh_progress::ConnectPhase,
+}
+
+impl SshConnect {
+    /// 経過秒
+    fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
 /// リモート（SSH 先）ツリー行の右クリックメニュー（#919）
 struct RemoteContextMenu {
     remote: tako_core::remote_fs::RemoteRef,
@@ -3313,6 +3346,8 @@ impl TakoApp {
             preview_remote_push: HashMap::new(),
             remote_push_again: std::collections::HashSet::new(),
             remote_notice: None,
+            remote_file_loading: HashMap::new(),
+            ssh_connect: HashMap::new(),
             pane_context_menu: None,
             inline_edit: None,
             sidebar_width: {
@@ -4261,6 +4296,16 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:limit_autoresume");
                         app.drive_limit_autoresume()
                     };
+                    // #1010: SSH の接続待ちを進める（待っているペインが無ければ即 return）。
+                    // 変わったらヘッダだけ汚す（本体は触らない = 無関係な再描画を作らない）
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:ssh_connect");
+                        for pane_id in app.drive_ssh_connect() {
+                            if let Some(view) = app.pane_headers.get(&pane_id).cloned() {
+                                view.update(wcx, |_, cx| cx.notify());
+                            }
+                        }
+                    }
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
                         app.poll_webview_state();
@@ -8927,6 +8972,134 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// SSH の接続待ちを進める（#1010。2 秒 tick から呼ぶ）。
+    ///
+    /// **接続待ちのペインが 1 枚も無ければ即 return** するので、通常運転では
+    /// 何も起きない（NFR-8）。材料は「ペインの画面」「ControlMaster のソケットの有無」
+    /// の 2 つで、どちらもプロセスを起こさない（`visible_lines` はメモリ、
+    /// ソケットは stat 1 回）。判定は `tako_core::ssh_progress` の純粋関数
+    fn drive_ssh_connect(&mut self) -> Vec<PaneId> {
+        use tako_core::ssh_progress::{self, ConnectPhase};
+
+        if self.ssh_connect.is_empty() {
+            return Vec::new();
+        }
+        // 追っているペインのヘッダは**毎 tick 描き直す**。dispatch は `Context` を
+        // 持たないので `begin_ssh_connect` から notify できず、これが無いと
+        // 「他の何かが画面を汚すまでチップが出ない」形になる（出たり出なかったりする）。
+        // 追い終われば空になるので、通常運転では 1 回も走らない
+        let panes: Vec<PaneId> = self.ssh_connect.keys().copied().collect();
+        let mut touched = panes.clone();
+        for pane in panes {
+            // ペインが消えた = 見せる相手が居ない
+            if !self.pane_exists(pane) {
+                self.ssh_connect.remove(&pane);
+                continue;
+            }
+            let Some(st) = self.ssh_connect.get(&pane) else {
+                continue;
+            };
+            // 失敗表示は**自動で消さない**（#919 の「静かな失敗を作らない」と同じ）。
+            // 消えるのはクリック・ペインを閉じたときだけ
+            if matches!(st.phase, ConnectPhase::Failed { .. }) {
+                continue;
+            }
+            // いつまでも居座らせない。**失敗を騙らず**畳むだけ
+            if ssh_progress::give_up(st.elapsed_secs()) {
+                self.ssh_connect.remove(&pane);
+                continue;
+            }
+            let lines = self
+                .terminals
+                .get(&pane)
+                .map(|s| s.visible_lines())
+                .unwrap_or_default();
+            let fingerprint = tako_control::limit_stop::screen_fingerprint(&lines);
+            // `pane` 経路は既存の出力が載っているので、増えた側だけを見る
+            // （起点 = 覚え始めた時点のプロンプト行）
+            let from = if st.fresh_pane {
+                0
+            } else {
+                st.baseline_index.min(lines.len())
+            };
+            let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
+                new_lines: &lines[from..],
+                master_socket: tako_core::remote_fs::control_path(&st.host)
+                    .map(|p| p.exists())
+                    .unwrap_or(false),
+                screen_changed: fingerprint != st.baseline_fingerprint,
+                fresh_pane: st.fresh_pane,
+            });
+            match phase {
+                ConnectPhase::Opened => {
+                    self.ssh_connect.remove(&pane);
+                }
+                other => {
+                    if let Some(st) = self.ssh_connect.get_mut(&pane) {
+                        st.phase = other;
+                    }
+                }
+            }
+        }
+        touched.retain(|p| self.pane_exists(*p));
+        touched
+    }
+
+    /// そのペインがどこかのタブに居るか（#1010 の後始末用）
+    fn pane_exists(&self, pane: PaneId) -> bool {
+        self.workspace
+            .tabs()
+            .iter()
+            .any(|t| t.tree().panes().iter().any(|p| p.id() == pane))
+    }
+
+    /// SSH の接続表示を閉じる（#1010。失敗表示のクリック / ペインを閉じたとき）
+    pub(crate) fn dismiss_ssh_connect(&mut self, pane: PaneId) {
+        self.ssh_connect.remove(&pane);
+    }
+
+    /// UI から `tako_control::dispatch` を直接呼んだあとの後始末（#1023）。
+    ///
+    /// dispatch は PTY の起動を `pending_attach` へ積むだけで、実際の起動には GPUI の
+    /// `Context` が要る（`SessionHost::attach_session` の実装がキューへ積む形）。
+    /// IPC / MCP のリクエストループは毎回これを消化しているが、**UI 経路は
+    /// 呼び出しごとに手で書いていた**ため `open_ssh_host` だけ抜けていた:
+    /// ペインは即座に生えるのに PTY が立たず、**次に来た IPC まで真っ黒**になる
+    /// （= #1023 の「ファイル→リモート接続はターミナルが出るまで待つ」。
+    /// 既存シェルへ打つ右クリック経路は PTY を作らないので即出る、の非対称の正体）。
+    ///
+    /// PTY 起動に失敗したペインは巻き戻す（空ペインを残さない = #153 と同じ扱い）。
+    /// 戻り値は最初の失敗の理由（呼び出し側が画面へ出す）
+    pub(crate) fn attach_pending_sessions(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let mut failure = None;
+        for (pane, options) in std::mem::take(&mut self.pending_attach) {
+            if let Err(e) = self.spawn_session(pane, options, cx) {
+                self.remove_pane(pane, cx);
+                if failure.is_none() {
+                    failure = Some(format!("PTY を起動できなかった: {e}"));
+                }
+            }
+        }
+        // セッション起動後の遅延書き込み（IPC ループと同じ順序）
+        for (pane, data) in std::mem::take(&mut self.pending_writes) {
+            if let Some(session) = self.terminals.get(&pane) {
+                session.write(data);
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// #1023 の修正を入れる前（後始末をしない）へ戻す逃げ道（`TAKO_1023_LEGACY=1`）。
+    ///
+    /// 同じバイナリで「操作してすぐ PTY が立つか」を A/B するために使う
+    pub(crate) fn attach_drain_legacy() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var_os("TAKO_1023_LEGACY").is_some())
+    }
+
     /// SSH ホストへ接続する（#20 / #919 / #1006）。
     ///
     /// **dispatch を通す**のが要点（#1006 で直した）。以前はここが独自に `ssh` を
@@ -8957,13 +9130,18 @@ impl TakoApp {
             },
             PaneOrigin::User,
         );
-        // 断られた理由（素のシェルでないペイン等）はユーザーに見せる。
-        // 黙って何も起きないのが #1006 で一番避けたい挙動
         if let Err(e) = result {
             // 断られた理由（素のシェルでないペイン等）はユーザーに見せる。
             // 黙って何も起きないのが #1006 で一番避けたい挙動。
             // 置き場はサイドバー上部の通知（#919 が接続失敗に使っているのと同じ面）
             self.set_remote_notice(format!("{e}"), true);
+        } else if !Self::attach_drain_legacy() {
+            // #1023: dispatch が積んだ PTY 起動をこの場で消化する。
+            // これを欠くと新ペイン経路（target = split / tab）はペインだけが生えて
+            // ターミナルが立たず、次に来た IPC まで真っ黒のまま待つ
+            if let Err(e) = self.attach_pending_sessions(cx) {
+                self.set_remote_notice(e, true);
+            }
         }
         self.scroll_active_tab_into_view();
         cx.notify();
@@ -16044,6 +16222,29 @@ impl TakoApp {
                 (short, full)
             }),
         };
+        // #1010: SSH の接続待ち / 失敗。**ペインがまだ真っ黒な時間を覆う**のが目的なので
+        // cwd チップより早い段階から出す（`HeaderVisibility::ssh_connect`）。
+        // 失敗は理由に置き換わり、**自動では消えない**（クリックで閉じる）
+        let ssh_chip: Option<(String, bool)> = self.ssh_connect.get(&pane_id).and_then(|st| {
+            match &st.phase {
+                tako_core::ssh_progress::ConnectPhase::Connecting => Some((
+                    crate::ui_text::remote_folder::pane_connecting(&st.host),
+                    false,
+                )),
+                tako_core::ssh_progress::ConnectPhase::Failed { reason } => {
+                    let reason = reason.clone().unwrap_or_else(|| {
+                        tako_core::ssh_progress::reason_fallback(tako_core::i18n::lang())
+                            .to_string()
+                    });
+                    Some((
+                        crate::ui_text::remote_folder::pane_connect_failed(&st.host, &reason),
+                        true,
+                    ))
+                }
+                // 畳む段階は driver がエントリごと落とすので、ここには来ない
+                tako_core::ssh_progress::ConnectPhase::Opened => None,
+            }
+        });
         // #966: リモートへの書き戻しの状態チップ。cwd チップは 28 文字で切るので、
         // 「ローカルへは書けたがリモートはまだ」を**別のチップ**として出す
         // （ここを出さないと、切断中の保存がユーザーから見て「保存できた」になる）
@@ -16453,6 +16654,66 @@ impl TakoApp {
                                         .text_color(hsla(theme.text_muted)),
                                 )
                                 .child(SharedString::from(truncate(&short, 28)))
+                        }))
+                    })
+                    // #1010: SSH の接続待ち / 失敗。回る弧 + 文言。
+                    // 失敗はクリックで閉じられる（自動では消さない）
+                    .when(hv.ssh_connect, |d| {
+                        d.children(ssh_chip.map(|(text, is_error)| {
+                            let color = if is_error { theme.red } else { theme.accent };
+                            div()
+                                .id(("ssh-connect-chip", pane_id.as_u64()))
+                                .flex()
+                                .flex_none()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(rgba(theme.chip_surface))
+                                .border_1()
+                                .border_color(hsla(color))
+                                .font_family(theme.font_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(hsla(color))
+                                .when(is_error, |d| {
+                                    // 閉じられることが分からないと居座って見えるので添える
+                                    let tip_theme = theme.clone();
+                                    d.cursor_pointer()
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| {
+                                                crate::tab_bar::HintTooltip::new(
+                                                    crate::ui_text::remote_folder::
+                                                        pane_connect_dismiss()
+                                                        .to_string(),
+                                                    tip_theme.clone(),
+                                                )
+                                            })
+                                            .into()
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.dismiss_ssh_connect(pane_id);
+                                            cx.notify();
+                                        }))
+                                })
+                                .child(if is_error {
+                                    svg()
+                                        .path(crate::file_icons::ui_icon::WARNING)
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .flex_none()
+                                        .text_color(hsla(color))
+                                        .into_any_element()
+                                } else {
+                                    crate::spinner::spinner(
+                                        ("ssh-connect-spin", pane_id.as_u64()),
+                                        px(10.0),
+                                        hsla(color),
+                                    )
+                                })
+                                .child(SharedString::from(truncate(&text, 72)))
                         }))
                     })
                     // #966: リモートへの書き戻しの状態（読み取り専用 / 送信中 /
@@ -18185,6 +18446,52 @@ impl UiStateHost for TakoApp {
 
     fn invalidate_remote_dir(&mut self, remote: &tako_core::remote_fs::RemoteRef) {
         self.filetree.invalidate_remote(remote);
+    }
+
+    // --- 進行状況の可視化（#1010） -------------------------------------------
+
+    fn begin_ssh_connect(&mut self, pane: PaneId, host: &str, fresh_pane: bool) {
+        // 覚え始めた時点の画面を控える。`pane` 経路（既存シェル）は
+        // **打った行がプロンプトの続きに載る**ので、起点はプロンプト行
+        // （= 最後の非空行）。行数で切り出せない理由は `ssh_progress::baseline_index`
+        let lines = self
+            .terminals
+            .get(&pane)
+            .map(|s| s.visible_lines())
+            .unwrap_or_default();
+        self.ssh_connect.insert(
+            pane,
+            SshConnect {
+                host: host.to_string(),
+                started: std::time::Instant::now(),
+                fresh_pane,
+                baseline_index: tako_core::ssh_progress::baseline_index(&lines),
+                baseline_fingerprint: tako_control::limit_stop::screen_fingerprint(&lines),
+                phase: tako_core::ssh_progress::ConnectPhase::Connecting,
+            },
+        );
+    }
+
+    fn ssh_connect_state(&self, pane: PaneId) -> Option<serde_json::Value> {
+        let st = self.ssh_connect.get(&pane)?;
+        let reason = match &st.phase {
+            tako_core::ssh_progress::ConnectPhase::Failed { reason } => reason.clone(),
+            _ => None,
+        };
+        Some(serde_json::json!({
+            "host": st.host,
+            "phase": st.phase.as_str(),
+            "elapsed_secs": st.elapsed_secs(),
+            "reason": reason,
+            // 判定材料が経路で違うので、どちらで見ているかを出す（#1006 の 3 経路）
+            "fresh_pane": st.fresh_pane,
+        }))
+    }
+
+    fn remote_files_loading(&self) -> Vec<tako_core::remote_fs::RemoteRef> {
+        let mut v: Vec<_> = self.remote_file_loading.keys().cloned().collect();
+        v.sort_by(|a, b| (&a.host, &a.path).cmp(&(&b.host, &b.path)));
+        v
     }
 
     fn set_preview_remote_origin(
@@ -55458,6 +55765,441 @@ mod self_test {
                      queued_len={flow_line} refused={refused}"
                 );
                 notify_and_draw(any, window, cx);
+            }
+
+            // 132. 新ペイン経路の SSH は「操作してすぐ」ターミナルが立つ（#1023）。
+            //
+            // dispatch はペインを作るだけで、PTY 起動は `pending_attach` へ積まれる。
+            // UI 経路がそれを消化しないと**ペインだけ生えて真っ黒**のまま、
+            // 次に来た IPC（= CLI / MCP の任意のリクエスト）まで待つ。
+            // ユーザーには「ファイル→リモート接続はターミナルが出るまでめっちゃ待つ /
+            // 右クリックの SSH 化は即出る」に見えていた（右クリックは既存シェルへ
+            // 打つだけで PTY を作らないため）。
+            //
+            // **CLI / MCP で覗くと観測自身が消化してしまう**（IPC ループが消化する）
+            // ので、ここは window 直更新だけで測る。A/B は `TAKO_1023_LEGACY=1`
+            {
+                let host1023 = "selftest-nonexistent-1023";
+                let mk_host = || tako_core::ssh_config::SshHost {
+                    name: host1023.to_string(),
+                    hostname: None,
+                    user: None,
+                    port: None,
+                };
+                let legacy = TakoApp::attach_drain_legacy();
+                let t0 = std::time::Instant::now();
+                let (new_pane, queued) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.open_ssh_host(mk_host(), None, cx);
+                        let tab = app.workspace.active_tab_id();
+                        let pane = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().focused().as_u64())
+                            .unwrap_or(0);
+                        // 消化されていれば空。**ここが #1023 の不変条件**
+                        (pane, app.pending_attach.len())
+                    })
+                    .unwrap_or((0, 0));
+                // 「操作してすぐ」= 追加の待ちも IPC も無しで PTY が在ること
+                let (has_session, elapsed_ms) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.terminals.contains_key(&PaneId::from_raw(new_pane)),
+                            t0.elapsed().as_millis(),
+                        )
+                    })
+                    .unwrap_or((false, 0));
+                // 旧挙動でも「待てば立つ」わけではないことを見せる（誰も消化しない）。
+                // 3 秒あけて測り直す = 体感の「めっちゃ待つ」の実体
+                wait(cx, 3000).await;
+                let still = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.terminals.contains_key(&PaneId::from_raw(new_pane)),
+                            app.pending_attach.len(),
+                        )
+                    })
+                    .unwrap_or((false, 0));
+                println!(
+                    "TAKO_SELF_TEST_1023: legacy={legacy} pane={new_pane} \
+                     queued_after_open={queued} has_session={has_session} \
+                     elapsed_ms={elapsed_ms} after_3s=(has_session={} queued={})",
+                    still.0, still.1
+                );
+                check(
+                    queued == 0 && has_session,
+                    &format!(
+                        "132: 新ペイン経路の SSH は操作直後に PTY が立つ \
+                         (#1023。queued={queued} has_session={has_session} \
+                         elapsed_ms={elapsed_ms} after_3s={still:?} legacy={legacy})"
+                    ),
+                );
+                // 検証で作ったペインは畳む（ssh が失敗して入力待ちで止まるため）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(PaneId::from_raw(new_pane), CloseOrigin::Internal, cx);
+                });
+                notify_and_draw(any, window, cx);
+            }
+
+            // 133. SSH の進行状況が見える（#1010）。
+            //
+            // ①リモートファイルの取得は**背景**なので、押した直後に「読み込み中」が
+            //   立っていて（= UI スレッドが固まっていない）、終わると消える
+            // ②ペインの SSH は接続開始から「<ホスト> へ接続中…」が出て、
+            //   失敗したら**消えずに理由へ置き換わる**
+            // ③どちらの状態も CLI / MCP から読める（開発不変条件）
+            //
+            // 実 SSH 先には依存させない（宛先は解決できないホスト固定）。
+            // A/B は `TAKO_1010_LEGACY=1`（= 取得を UI スレッドで同期実行する旧挙動）
+            {
+                let host1010 = "selftest-nonexistent-1010";
+                let remote1010 = tako_core::remote_fs::RemoteRef::new(
+                    host1010.to_string(),
+                    "/tmp/selftest-1010.txt".to_string(),
+                );
+
+                // (a) 押した直後に「読み込み中」が立っている = UI スレッドで待っていない
+                let (loading_now, listed_now) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.remote_notice = None;
+                        app.open_remote_file_row(&remote1010, cx);
+                        (
+                            app.remote_file_loading.contains_key(&remote1010),
+                            // CLI / MCP から見える面（`remote-folder list` の loading_files）
+                            <TakoApp as UiStateHost>::remote_files_loading(app).len(),
+                        )
+                    })
+                    .unwrap_or((false, 0));
+                check(
+                    loading_now && listed_now == 1,
+                    &format!(
+                        "133: リモートファイルの取得は背景で走り読み込み中が立つ \
+                         (#1010。loading={loading_now} listed={listed_now})"
+                    ),
+                );
+
+                // (b) 取得が終われば消え、失敗の理由が通知に出る（黙って消えない）
+                let mut cleared = false;
+                let mut notice = None;
+                for _ in 0..60 {
+                    wait(cx, 500).await;
+                    let (done, text) = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            (
+                                !app.remote_file_loading.contains_key(&remote1010),
+                                app.remote_notice.as_ref().map(|n| n.text.clone()),
+                            )
+                        })
+                        .unwrap_or((false, None));
+                    if done {
+                        cleared = true;
+                        notice = text;
+                        break;
+                    }
+                }
+                check(
+                    cleared && notice.is_some(),
+                    &format!(
+                        "133: 取得が終わると読み込み中が消えて理由が出る \
+                         (#1010。cleared={cleared} notice={notice:?})"
+                    ),
+                );
+
+                // (c) SSH ペインは接続開始から「接続中…」が出る（まだ真っ黒な時間を覆う）
+                let ssh_pane = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.open_ssh_host(
+                            tako_core::ssh_config::SshHost {
+                                name: host1010.to_string(),
+                                hostname: None,
+                                user: None,
+                                port: None,
+                            },
+                            None,
+                            cx,
+                        );
+                        app.workspace
+                            .get_tab(app.workspace.active_tab_id())
+                            .map(|t| t.tree().focused().as_u64())
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let connecting = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        <TakoApp as UiStateHost>::ssh_connect_state(app, PaneId::from_raw(ssh_pane))
+                    })
+                    .unwrap_or(None);
+                let connecting_ok = connecting
+                    .as_ref()
+                    .map(|v| v["phase"] == "connecting" && v["host"] == host1010)
+                    .unwrap_or(false);
+                check(
+                    connecting_ok,
+                    &format!("133: SSH ペインは接続開始から接続中が出る (#1010。{connecting:?})"),
+                );
+
+                // (d) 失敗すると**消えずに理由へ置き換わる**（無言にしない）
+                let mut failed = None;
+                for _ in 0..40 {
+                    wait(cx, 500).await;
+                    let st = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.drive_ssh_connect();
+                            <TakoApp as UiStateHost>::ssh_connect_state(app, PaneId::from_raw(ssh_pane))
+                        })
+                        .unwrap_or(None);
+                    if st.as_ref().map(|v| v["phase"] == "failed").unwrap_or(false) {
+                        failed = st;
+                        break;
+                    }
+                }
+                let failed_ok = failed
+                    .as_ref()
+                    .map(|v| v["phase"] == "failed" && !v["reason"].is_null())
+                    .unwrap_or(false);
+                check(
+                    failed_ok,
+                    &format!("133: 接続失敗は消えずに理由へ置き換わる (#1010。{failed:?})"),
+                );
+
+                // (e) 同じ状態が `read` からも読める（CLI / MCP と 1:1）
+                let read_state = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Read {
+                                pane: Some(ssh_pane),
+                                lines: Some(5),
+                                tmux_session: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .map(|v| v["ssh_connect"].clone())
+                    })
+                    .unwrap_or(None);
+                let read_ok = read_state
+                    .as_ref()
+                    .map(|v| v["host"] == host1010)
+                    .unwrap_or(false);
+                check(
+                    read_ok,
+                    &format!("133: 接続の状態は read からも読める (#1010。{read_state:?})"),
+                );
+
+                // (f) スピナーは**回ったうえで有限**（無限アニメーションを作らない）。
+                //
+                // 判定を「描かれたフレーム数」だけに置かない（#945 の教訓: 蓋閉じだと
+                // ディスプレイリンクが止まって両アームとも 0 になる）。ここでは
+                // インジケータが出る状態を作って描き、**描けた場合だけ**角度を見る
+                let (before_frames, _) = crate::spinner::spin_probe();
+                let probe_ref = tako_core::remote_fs::RemoteRef::new(
+                    host1010.to_string(),
+                    "/tmp/selftest-1010-spin.txt".to_string(),
+                );
+                let _ = window.update(cx, |app: &mut TakoApp, _, _| {
+                    app.remote_file_loading
+                        .insert(probe_ref.clone(), std::time::Instant::now());
+                    app.filetree.visible = true;
+                });
+                notify_and_draw(any, window, cx);
+                wait(cx, 300).await;
+                notify_and_draw(any, window, cx);
+                let (spin_frames, spin_turns) = crate::spinner::spin_probe();
+                let _ = window.update(cx, |app: &mut TakoApp, _, _| {
+                    app.remote_file_loading.remove(&probe_ref);
+                });
+                let total = crate::spinner::spin_total();
+                if spin_frames > before_frames {
+                    check(
+                        // 回転数が上限を超えない = `repeat()` ではない（有限で止まる）
+                        (0.0..=12.0).contains(&spin_turns) && total.as_secs() <= 60,
+                        &format!(
+                            "133: 読み込み中インジケータは有限回で終わる \
+                             (#1010 / #945。frames={spin_frames} turns={spin_turns} \
+                             total={total:?})"
+                        ),
+                    );
+                } else {
+                    // 描画そのものが止まっている環境（蓋閉じ等）。構造の担保は
+                    // `spinner::tests::回転に無限リピートを使っていない` が受け持つ
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 133(f) の回転検査（インジケータが未描画 = \
+                         ウィンドウが完全に隠れて描画が止まった。前面にして再実行すると \
+                         検証できる） {}",
+                        env_line()
+                    );
+                }
+
+                // 検証で作ったペインは畳む（ssh が失敗して入力待ちで止まるため）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.dismiss_ssh_connect(PaneId::from_raw(ssh_pane));
+                    app.close_pane_button(PaneId::from_raw(ssh_pane), CloseOrigin::Internal, cx);
+                });
+                println!(
+                    "TAKO_SELF_TEST_1010: loading={loading_now} cleared={cleared} \
+                     connecting={connecting_ok} failed={failed_ok} read={read_ok} \
+                     spin_frames={spin_frames} legacy={}",
+                    TakoApp::remote_open_sync_legacy()
+                );
+                notify_and_draw(any, window, cx);
+            }
+
+            // 134. チャットの生成中ドット2件が生成中ずっと脈動し続けない（#1012）。
+            //
+            // 項目 128（#945）と同じく、実際のチャット描画でヘッダと会話末尾の
+            // AnimationElement を作る。①開始直後はどちらも脈動する ②全長を過ぎて
+            // 時間を空けて描き直しても両方の不透明度が 1.0 から動かない、を観測する。
+            // GPUI は完了していない AnimationElement だけ
+            // `request_animation_frame()` を呼ぶため、②はフレーム要求停止の機械的な証拠になる。
+            // `TAKO_1012_LEGACY=1` では2件とも無限 repeat へ戻り、②が FAILED になる
+            {
+                let any1012 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
+                let window1012 = any1012.downcast::<TakoApp>().unwrap_or(window);
+                let pane1012 = window1012
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("1012-chat-busy".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()?;
+                        for (pane, options) in std::mem::take(&mut app.pending_attach) {
+                            let _ = app.spawn_session(pane, options, cx);
+                        }
+                        let pane = r["pane"].as_u64().map(PaneId::from_raw)?;
+                        let _ = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("set".into()),
+                                mode: Some("gui".into()),
+                                pane: Some(pane.as_u64()),
+                            },
+                            PaneOrigin::User,
+                        );
+                        app.pin_chat_fixture(pane);
+                        app.chat_panes.insert(
+                            pane,
+                            std::rc::Rc::new(chat_view::ChatPaneState {
+                                session_id: "selftest-1012".into(),
+                                messages: chat_view::messages_from_json(&[
+                                    serde_json::json!({
+                                        "role": "assistant",
+                                        "text": "生成中ドットの検証",
+                                    }),
+                                ]),
+                                model: Some("claude-opus-5".into()),
+                                busy: true,
+                                ..Default::default()
+                            }),
+                        );
+                        let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                        cx.notify();
+                        Some(pane)
+                    })
+                    .ok()
+                    .flatten();
+                match pane1012 {
+                    None => fail("134: 生成中のチャットペインを用意できない (#1012)"),
+                    Some(pane) => {
+                        let started = std::time::Instant::now();
+                        let sample = |cx: &mut gpui::AsyncApp| {
+                            notify_and_draw(any1012, window1012, cx);
+                            chat_view::chat_pulse_probes()
+                        };
+                        let spread = |values: &[f32]| {
+                            let hi = values.iter().cloned().fold(f32::MIN, f32::max);
+                            let lo = values.iter().cloned().fold(f32::MAX, f32::min);
+                            hi - lo
+                        };
+
+                        // ① 生成開始直後はヘッダ・会話末尾の両方が脈動する
+                        let before = chat_view::chat_pulse_probes();
+                        let mut early: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                        for _ in 0..5 {
+                            let probes = sample(cx);
+                            for ix in 0..2 {
+                                early[ix].push(probes[ix].1);
+                            }
+                            wait(cx, 200).await;
+                        }
+                        let after_early = chat_view::chat_pulse_probes();
+                        let animated = [
+                            after_early[0].0 > before[0].0 && spread(&early[0]) > 0.1,
+                            after_early[1].0 > before[1].0 && spread(&early[1]) > 0.1,
+                        ];
+
+                        // ② 全長を過ぎたら完了値 1.0 に貼り付き、描き直しても動かない
+                        let total =
+                            chat_view::chat_pulse_total() + Duration::from_millis(700);
+                        let remain = total.saturating_sub(started.elapsed());
+                        if remain > Duration::ZERO {
+                            wait(cx, remain.as_millis() as u64).await;
+                        }
+                        let idle_before = window1012
+                            .update(cx, |app: &mut TakoApp, _, _| app.root_renders)
+                            .unwrap_or(0);
+                        wait(cx, 1200).await;
+                        let idle_after = window1012
+                            .update(cx, |app: &mut TakoApp, _, _| app.root_renders)
+                            .unwrap_or(0);
+                        let mut late: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                        for _ in 0..5 {
+                            let probes = sample(cx);
+                            for ix in 0..2 {
+                                late[ix].push(probes[ix].1);
+                            }
+                            wait(cx, 250).await;
+                        }
+                        let stopped = [0, 1].map(|ix| {
+                            spread(&late[ix]) < 0.01
+                                && late[ix]
+                                    .iter()
+                                    .all(|opacity| (opacity - 1.0).abs() < 0.01)
+                        });
+                        println!(
+                            "TAKO_SELF_TEST_1012: legacy={} busy early_spread={:.3} \
+                             late_spread={:.3} late_last={:.3} activity early_spread={:.3} \
+                             late_spread={:.3} late_last={:.3} idle_frames={}",
+                            std::env::var_os("TAKO_1012_LEGACY").is_some(),
+                            spread(&early[0]),
+                            spread(&late[0]),
+                            late[0].last().copied().unwrap_or(f32::NAN),
+                            spread(&early[1]),
+                            spread(&late[1]),
+                            late[1].last().copied().unwrap_or(f32::NAN),
+                            idle_after.saturating_sub(idle_before),
+                        );
+                        check(
+                            animated.into_iter().all(|value| value),
+                            &format!(
+                                "134: 生成開始直後はヘッダと会話末尾のドットが脈動する \
+                                 (#1012。animated={animated:?})"
+                            ),
+                        );
+                        check(
+                            stopped.into_iter().all(|value| value),
+                            &format!(
+                                "134: 全長を過ぎたら2件とも静止する = フレーム要求も止まる \
+                                 (#1012。stopped={stopped:?})"
+                            ),
+                        );
+
+                        // 後片付け: 検証用タブを閉じ、fixture 保護も集約経路で落とす
+                        let _ = window1012.update(cx, |app: &mut TakoApp, _, cx| {
+                            if let Some(tab) = app.workspace.find_tab_of_pane(pane) {
+                                app.remove_tab(tab, cx);
+                            }
+                            cx.notify();
+                        });
+                        notify_and_draw(any1012, window1012, cx);
+                    }
+                }
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

@@ -47,6 +47,7 @@ pub mod sidebar;
 pub mod spawn_layout;
 pub mod ssh_config;
 pub mod ssh_detect;
+pub mod ssh_progress;
 pub mod tab;
 pub mod task_checkpoint;
 pub mod terminal;

@@ -22,6 +22,58 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ## [Unreleased]
 
+### Added / 追加
+
+- [改善] SSH の進行状況を可視化した (#1010)
+  ① **リモートファイルの読み込み中はツリーの行に回る弧が出る**。GUI の「開く」は
+  SFTP の取得を**背景**へ出すようにしたので（従来は UI スレッドで同期実行 =
+  実測 1〜2 秒画面が固まり、そもそもスピナーを出す余地が無かった）、押した瞬間から
+  終わるまでインジケータが出て、終わると消える。取得の失敗はこれまでどおり
+  理由 + 次の一手 + 生の詳細で出る。CLI / MCP は従来どおり同期（#966 の切り分けと同じ）。
+  ② **SSH ペインは接続開始から「<ホスト> へ接続中…」がヘッダに出る**。#1006 の 3 経路
+  （現在タブの新ペイン / 新タブ / このペインを SSH 化）すべてに出て、**接続に失敗したら
+  消えずに理由へ置き換わる**（クリックで閉じる）。判定は `tako_core::ssh_progress` の
+  純粋関数で、材料はペインの画面と ControlMaster のソケットの有無だけ
+  （プロセスは起こさない）。パスワードを聞かれた時点でも表示は畳む
+  （沈黙が破れて画面に指示が出ているため）。
+  どちらの状態も CLI / MCP から読める: `tako list` / `tako read` の `ssh_connect`、
+  `tako remote-folder list` の `loading_files`。**絵文字は使わず**、
+  回転は有限回で終わる（#945 / #1012 の「無限アニメーションを作らない」に従う）。
+
+  ① The file tree now shows a spinning arc next to a remote file while it is being fetched.
+  The GUI fetch moved to the background (it used to run synchronously on the UI thread —
+  measured 1–2 s of frozen UI, which left no room to show progress at all), so the
+  indicator appears the moment you click and disappears when the fetch finishes. CLI/MCP
+  stay synchronous. ② SSH panes now show "Connecting to &lt;host&gt;…" in the pane header from
+  the moment the connection starts, for all three open targets, and on failure the chip is
+  **replaced by the reason** instead of vanishing (click to dismiss). Both states are
+  readable from the CLI/MCP (`ssh_connect` in `tako list` / `tako read`, `loading_files` in
+  `tako remote-folder list`). No emoji, and the rotation is finite (per #945 / #1012).
+
+### Fixed / 修正
+
+- [修正] ファイルメニュー / パレットから開いた SSH ペインでターミナルが立たない (#1023)
+  「ファイル→リモート接続」で出したペインは**ターミナルが出るまで待たされる**のに、
+  ペイン右クリックの SSH 化は即出る、という非対称があった。原因は GUI 経路が
+  `pending_attach`（dispatch が積む PTY 起動の依頼）を消化していなかったこと。
+  IPC / MCP のループは毎回消化しているので、**次に来た CLI / MCP のリクエストで
+  初めて PTY が立つ**（エージェントが動いていなければ立たないまま）。右クリック経路は
+  既存シェルへ 1 行打つだけで PTY を作らないため、この待ちが無かった。
+  隔離セルフテストで実測: 修正前は操作 3 秒後も `has_session=false`（起動依頼は積まれたまま）、
+  修正後は操作直後に `has_session=true`（137ms）。同じ穴が開いていたツリー右クリックの
+  「このフォルダで SSH ペインを開く」と、tmux パネルの「復帰」ボタンも直した。
+  再発防止に番犬テスト（UI から dispatch を直接呼ぶ経路が PTY 起動を消化しているか）を追加。
+
+  SSH panes opened from the File menu / palette showed no terminal for a long time, while
+  the pane right-click ("Connect this pane via SSH…") was instant. The GUI path never
+  drained `pending_attach` — the queue dispatch uses to ask for a PTY — so the terminal
+  only started when the next unrelated CLI/MCP request happened to drain it (and never at
+  all with no agent running). The right-click path types one line into the existing shell
+  and creates no PTY, which is why it felt instant. Measured in the isolated self-test:
+  before the fix `has_session=false` even 3 seconds after the action; after the fix the PTY
+  is up immediately (137ms). The same missing drain in the file tree's "Open SSH pane here"
+  and the tmux panel's "restore" button is fixed too, and a watchdog test now guards it.
+
 ### Changed / 変更
 
 - [改善] SSH 接続の開き方を 2 点変えた (#1006)

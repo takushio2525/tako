@@ -40,6 +40,80 @@ const CTX_WARN_PERCENT: f64 = 80.0;
 /// カーソル側へスクロールする（Web 版 Claude の入力欄と同じ感覚）
 pub(crate) const CHAT_INPUT_MAX_ROWS: usize = 8;
 
+/// 生成中ドットの脈動を「生成開始の合図」に限る回数（Issue #1012）。
+///
+/// 1 回 = [`CHAT_PULSE_PERIOD`]（不透明度 1.0 → 0.35 → 1.0 の 1 往復）。
+/// 3 回 = 6 秒で、そのあとは色だけの静的表示になる
+const CHAT_PULSE_COUNT: u32 = 3;
+/// 脈動 1 往復ぶんの長さ（従来の見た目から不変）
+const CHAT_PULSE_PERIOD: Duration = Duration::from_secs(2);
+
+/// 生成中ドットの不透明度（`t` は脈動全体の進捗 0.0〜1.0）。
+///
+/// [`CHAT_PULSE_COUNT`] 回ぶんの正弦の山を並べ、両端を 1.0 にする。
+/// oneshot の完了時に不透明度が飛ばず、そのまま静的表示へ移れる
+fn chat_pulse_opacity(t: f32) -> f32 {
+    let phase = std::f32::consts::PI * t * CHAT_PULSE_COUNT as f32;
+    1.0 - 0.65 * phase.sin().abs()
+}
+
+/// ヘッダ側の脈動が最後に計算した不透明度（#1012 の検証用。初期値 = 1.0）
+static CHAT_BUSY_PULSE_LAST_OPACITY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000);
+/// ヘッダ側の脈動フレーム数（同上。単調増加）
+static CHAT_BUSY_PULSE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 会話末尾側の脈動が最後に計算した不透明度（#1012 の検証用。初期値 = 1.0）
+static CHAT_ACTIVITY_PULSE_LAST_OPACITY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000);
+/// 会話末尾側の脈動フレーム数（同上。単調増加）
+static CHAT_ACTIVITY_PULSE_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// ヘッダ側の脈動が 1 フレーム計算されたことを記録する（引数はそのまま返す）。
+fn record_chat_busy_opacity(opacity: f32) -> f32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    CHAT_BUSY_PULSE_LAST_OPACITY.store(opacity.to_bits(), Relaxed);
+    CHAT_BUSY_PULSE_FRAMES.fetch_add(1, Relaxed);
+    opacity
+}
+
+/// 会話末尾側の脈動が 1 フレーム計算されたことを記録する（引数はそのまま返す）。
+fn record_chat_activity_opacity(opacity: f32) -> f32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    CHAT_ACTIVITY_PULSE_LAST_OPACITY.store(opacity.to_bits(), Relaxed);
+    CHAT_ACTIVITY_PULSE_FRAMES.fetch_add(1, Relaxed);
+    opacity
+}
+
+/// 生成中ドット2件の観測値（計算フレーム数, 最後の不透明度）。
+/// セルフテスト項目 132（#1012）用
+pub(crate) fn chat_pulse_probes() -> [(u64, f32); 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (
+            CHAT_BUSY_PULSE_FRAMES.load(Relaxed),
+            f32::from_bits(CHAT_BUSY_PULSE_LAST_OPACITY.load(Relaxed)),
+        ),
+        (
+            CHAT_ACTIVITY_PULSE_FRAMES.load(Relaxed),
+            f32::from_bits(CHAT_ACTIVITY_PULSE_LAST_OPACITY.load(Relaxed)),
+        ),
+    ]
+}
+
+/// 脈動の全長（セルフテストが待ち時間をここから作るための公開。#1012）
+pub(crate) fn chat_pulse_total() -> Duration {
+    CHAT_PULSE_PERIOD * CHAT_PULSE_COUNT
+}
+
+/// 脈動を #1012 前（2 秒周期の無限 repeat）へ戻す A/B 用の逃げ道。
+///
+/// 同じバイナリで `TAKO_1012_LEGACY=1` の有無だけを変えて検出力を測る
+fn chat_pulse_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1012_LEGACY").is_some())
+}
+
 /// 発話者
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChatRole {
@@ -2789,15 +2863,32 @@ impl TakoApp {
             .flex_none()
             .rounded_full()
             .bg(hsla(dot_color));
-        // 生成中は明滅させる（タブバーの実行中ドットと同じ表現。新しい UI 表現を増やさない）
+        // 生成開始の合図として有限回だけ明滅させる（#1012）。
+        // GPUI は Animation が終わっていないフレームごとに
+        // `request_animation_frame()` を呼ぶため、repeat では生成中ずっと固定費が復活する。
+        // 完了後も色つきの静的表示が残るので、生成中であることは引き続き分かる
         let status_dot = if state.busy {
-            status_dot
-                .with_animation(
-                    ("chat-busy-pulse", pane_id.as_u64()),
-                    Animation::new(Duration::from_secs(2)).repeat(),
-                    |el, t| el.opacity(1.0 - 0.65 * (std::f32::consts::PI * t).sin()),
-                )
-                .into_any_element()
+            if chat_pulse_legacy() {
+                status_dot
+                    .with_animation(
+                        ("chat-busy-pulse", pane_id.as_u64()),
+                        Animation::new(CHAT_PULSE_PERIOD).repeat(),
+                        |el, t| {
+                            el.opacity(record_chat_busy_opacity(
+                                1.0 - 0.65 * (std::f32::consts::PI * t).sin(),
+                            ))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                status_dot
+                    .with_animation(
+                        ("chat-busy-pulse", pane_id.as_u64()),
+                        Animation::new(chat_pulse_total()),
+                        |el, t| el.opacity(record_chat_busy_opacity(chat_pulse_opacity(t))),
+                    )
+                    .into_any_element()
+            }
         } else {
             status_dot.into_any_element()
         };
@@ -2991,18 +3082,32 @@ impl TakoApp {
         let theme = &self.theme;
         use crate::ui_text::ui_mode as txt;
         let label = activity.unwrap_or_else(|| txt::chat_status_busy().to_string());
-        // 明滅する点（タブバー・ヘッダの実行中ドットと同じ表現。新しい表現を増やさない）
+        // ヘッダと同じく生成開始の合図として有限回だけ明滅し、以後は静止する（#1012）
         let dot = div()
             .w(px(7.0))
             .h(px(7.0))
             .flex_none()
             .rounded_full()
-            .bg(hsla(theme.accent))
-            .with_animation(
+            .bg(hsla(theme.accent));
+        let dot = if chat_pulse_legacy() {
+            dot.with_animation(
                 ("chat-activity-pulse", pane_id.as_u64()),
-                Animation::new(Duration::from_secs(2)).repeat(),
-                |el, t| el.opacity(1.0 - 0.65 * (std::f32::consts::PI * t).sin()),
-            );
+                Animation::new(CHAT_PULSE_PERIOD).repeat(),
+                |el, t| {
+                    el.opacity(record_chat_activity_opacity(
+                        1.0 - 0.65 * (std::f32::consts::PI * t).sin(),
+                    ))
+                },
+            )
+            .into_any_element()
+        } else {
+            dot.with_animation(
+                ("chat-activity-pulse", pane_id.as_u64()),
+                Animation::new(chat_pulse_total()),
+                |el, t| el.opacity(record_chat_activity_opacity(chat_pulse_opacity(t))),
+            )
+            .into_any_element()
+        };
         div()
             .flex_shrink_0()
             .flex()
@@ -3974,6 +4079,35 @@ fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// oneshot の完了前後で不透明度が飛ばない（#1012）。
+    #[test]
+    fn 生成中ドットの脈動は両端が不透明度_1_0() {
+        assert!((chat_pulse_opacity(0.0) - 1.0).abs() < 1e-4);
+        assert!((chat_pulse_opacity(1.0) - 1.0).abs() < 1e-4);
+    }
+
+    /// 3 回とも従来と同じ 0.35 まで薄くなり、山の境目で 1.0 へ戻る
+    #[test]
+    fn 生成中ドットは指定回数ぶん同じ脈動をする() {
+        for k in 0..CHAT_PULSE_COUNT {
+            let bottom = (k as f32 + 0.5) / CHAT_PULSE_COUNT as f32;
+            assert!(
+                (chat_pulse_opacity(bottom) - 0.35).abs() < 1e-4,
+                "山 {k} の底が 0.35 でない: {}",
+                chat_pulse_opacity(bottom)
+            );
+            let edge = k as f32 / CHAT_PULSE_COUNT as f32;
+            assert!((chat_pulse_opacity(edge) - 1.0).abs() < 1e-4);
+        }
+    }
+
+    /// セルフテスト項目 132 の待ち時間と実装の回数を同じ正本から引く
+    #[test]
+    fn 生成中ドットの脈動全長は往復の整数倍() {
+        assert_eq!(chat_pulse_total(), CHAT_PULSE_PERIOD * CHAT_PULSE_COUNT);
+        assert_eq!(chat_pulse_total(), Duration::from_secs(6));
+    }
 
     fn echo_of(raw: &str) -> ChatEcho {
         let (text, images) = normalize_echo(raw);

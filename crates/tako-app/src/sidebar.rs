@@ -928,23 +928,37 @@ impl TakoApp {
                 ),
                 filetree::RowNote::Error(report) => (report.clone(), theme.red),
             };
+            // #1010: 読み込み中は回る弧を添える（「止まっている」と区別が付く）
+            let loading = matches!(note, filetree::RowNote::Loading);
             // #919: 失敗の理由は 3 行（要約 / 次の一手 / 生の詳細）。サイドバーは狭いので
             // **折り返す**（`whitespace_nowrap` + `text_ellipsis` だと理由が読めない =
             // 静かな失敗に戻ってしまう）。`min_w(0)` は flex の自動最小サイズを外して
             // 折り返し幅を親に合わせるため（#745 と同じ理由で縦積みには効かないので
             // 行方向のここだけに置く）
-            return base.py(px(2.0)).gap(px(4.0)).child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .pr(px(8.0))
-                    .text_size(px(11.0))
-                    .text_color(hsla(color))
-                    .child(SharedString::from(text)),
-            );
+            return base
+                .py(px(2.0))
+                .gap(px(4.0))
+                .when(loading, |d| {
+                    d.child(crate::spinner::spinner(
+                        ("remote-dir-spin", index as u64),
+                        px(11.0),
+                        hsla(color),
+                    ))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .pr(px(8.0))
+                        .text_size(px(11.0))
+                        .text_color(hsla(color))
+                        .child(SharedString::from(text)),
+                );
         }
 
         let is_dir = row.entry.is_dir;
+        // #1010: このファイルをいま SFTP で取得中か
+        let loading_file = !is_dir && self.remote_file_loading.contains_key(&remote);
         let is_open = !is_dir
             && self
                 .previews
@@ -1063,13 +1077,22 @@ impl TakoApp {
             el = el
                 .text_color(hsla(theme.text_tertiary))
                 .child(div().w(px(14.0)).flex_none())
-                .child(
+                // #1010: 取得中はファイルアイコンを回る弧へ差し替える。
+                // **行の位置も幅も変えない**ので、終わったときに並びが動かない
+                .child(if loading_file {
+                    crate::spinner::spinner(
+                        ("remote-file-spin", index as u64),
+                        px(16.0),
+                        hsla(theme.accent),
+                    )
+                } else {
                     svg()
                         .path(icon_kind.svg_path())
                         .size(px(16.0))
                         .flex_none()
-                        .text_color(hsla(theme.tab_inactive_foreground)),
-                );
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .into_any_element()
+                });
         }
         el.child(
             div()
@@ -1079,6 +1102,19 @@ impl TakoApp {
                 .text_ellipsis()
                 .child(SharedString::from(truncate(&row.entry.name, 24))),
         )
+        // アイコンだけだと「何が起きているか」が伝わらないので短い語を添える
+        .when(loading_file, |d| {
+            d.child(
+                div()
+                    .flex_none()
+                    .pr(px(8.0))
+                    .text_size(px(10.0))
+                    .text_color(hsla(theme.text_muted))
+                    .child(SharedString::from(
+                        crate::ui_text::remote_folder::file_loading(),
+                    )),
+            )
+        })
     }
 
     /// リモートルート行の SSH バッジ（#976）。
@@ -1676,33 +1712,96 @@ impl TakoApp {
             .map(|(_, r)| r.clone())
     }
 
-    /// リモートのファイル行をクリックしたときのプレビュー（#919）。
-    /// **dispatch 経由**なので CLI / MCP の `remote-folder open-file` と同じ経路
+    /// リモートのファイル行をクリックしたときのプレビュー（#919 / #1010）。
+    ///
+    /// **SFTP の取得だけを背景へ出す**（#1010）。同期で取ると UI スレッドが
+    /// 実測 1〜2 秒止まるので、「読み込み中」を出す間もなく画面が固まっていた
+    /// （= スピナーを出す余地が構造的に無かった）。取れたあとの扱い
+    /// （読み取り専用の判定・プレビューの割り当て・応答）は
+    /// `tako_control::remote_open_file_fetched` の 1 実装で、CLI / MCP と共通。
+    /// CLI / MCP は従来どおり同期（#966 の切り分けと同じ）
     pub(crate) fn open_remote_file_row(
         &mut self,
         remote: &tako_core::remote_fs::RemoteRef,
         cx: &mut Context<Self>,
     ) {
-        let result = tako_control::dispatch(
-            self,
-            tako_control::protocol::Request::RemoteFolder {
-                action: "open-file".into(),
-                host: Some(remote.host.clone()),
-                path: Some(remote.path.clone()),
-                tab: None,
-                focus: Some(true),
-                all: false,
-                force: false,
-                enabled: None,
-            },
-            PaneOrigin::User,
-        );
-        match result {
-            Ok(_) => self.drain_pending_highlights(cx),
-            // #919: 静かに失敗させない。理由をトーストで出す
-            Err(e) => self.set_remote_notice(e.to_string(), true),
+        if Self::remote_open_sync_legacy() {
+            let result = tako_control::dispatch(
+                self,
+                tako_control::protocol::Request::RemoteFolder {
+                    action: "open-file".into(),
+                    host: Some(remote.host.clone()),
+                    path: Some(remote.path.clone()),
+                    tab: None,
+                    focus: Some(true),
+                    all: false,
+                    force: false,
+                    enabled: None,
+                },
+                PaneOrigin::User,
+            );
+            match result {
+                Ok(_) => self.drain_pending_highlights(cx),
+                Err(e) => self.set_remote_notice(e.to_string(), true),
+            }
+            cx.notify();
+            return;
         }
+        // 同じファイルを 2 回押しても取得は 1 本（スピナーが出ている間は無視）
+        if self.remote_file_loading.contains_key(remote) {
+            return;
+        }
+        self.remote_file_loading
+            .insert(remote.clone(), std::time::Instant::now());
+        let target = remote.clone();
+        cx.spawn(async move |this, cx| {
+            let host = target.host.clone();
+            let path = target.path.clone();
+            let fetched = cx
+                .background_spawn(async move {
+                    tako_core::remote_fs::fetch_file(
+                        &host,
+                        &path,
+                        tako_core::remote_fs::MAX_PREVIEW_BYTES,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.remote_file_loading.remove(&target);
+                match fetched {
+                    Ok(fetched) => {
+                        let opened = tako_control::remote_open_file_fetched(
+                            this,
+                            PaneOrigin::User,
+                            &target.host,
+                            &target.path,
+                            fetched,
+                            Some(true),
+                        );
+                        match opened {
+                            Ok(_) => this.drain_pending_highlights(cx),
+                            Err(e) => this.set_remote_notice(e.to_string(), true),
+                        }
+                    }
+                    // #919: 静かに失敗させない。理由 + 次の一手 + 生の詳細を出す
+                    Err(e) => this.set_remote_notice(
+                        format!("{} / {} / {}", e.summary(), e.next_step(), e.detail),
+                        true,
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// リモートファイルの取得を #1010 前（UI スレッドで同期）へ戻す逃げ道
+    /// （`TAKO_1010_LEGACY=1`）。同じバイナリでスピナーの有無を A/B するために使う
+    pub(crate) fn remote_open_sync_legacy() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var_os("TAKO_1010_LEGACY").is_some())
     }
 
     /// リモート操作の通知を出す（#919）。失敗は自動で消さない
@@ -1749,6 +1848,13 @@ impl TakoApp {
                 );
                 if let Err(e) = result {
                     self.set_remote_notice(e.to_string(), true);
+                } else if !Self::attach_drain_legacy() {
+                    // #1023: `ssh-pane` は内部で `OpenRemote` を通るので PTY 起動が
+                    // `pending_attach` へ積まれる。UI 経路はここで消化しないと
+                    // ペインだけ生えてターミナルが立たない
+                    if let Err(e) = self.attach_pending_sessions(cx) {
+                        self.set_remote_notice(e, true);
+                    }
                 }
             }
             "close-root" => {

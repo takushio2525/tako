@@ -3690,6 +3690,70 @@
   未設定・不正値を claude 既定へ寄せた（`effort_row` と同じ規則）。セルフテストで固定
 - 関連: PR #1014（`Refs #1002`）。FR-2.32 を新設
 
+## 2026-08-28（#1023: ファイルメニュー経路の SSH ペインでターミナルが立たない問題を根治）
+- 根因は **UI 経路が `pending_attach` を消化していなかった**こと。dispatch はペインを作る
+  ところまでで、PTY 起動は `SessionHost::attach_session` がキューへ積むだけ（GPUI の
+  `Context` が要る）。IPC / MCP のループは毎回消化しているので、**次に来た CLI / MCP の
+  リクエストで初めて PTY が立つ**（エージェントが動いていなければ立たないまま）。
+  右クリック経路（target=pane）は既存シェルへ 1 行打つだけで PTY を作らないため即出る、
+  という非対称の正体。**#1006 の回帰ではない**（旧実装も `attach_session` のまま
+  消化していなかった）が、既定が「現在タブの新ペイン」になって目立つようになった
+- **CLI / MCP で覗くと観測自身が消化してしまう**（IPC ループが消化する）ので、手で試すと
+  直って見える。実測は window 直更新だけで行う隔離セルフテスト項目 132 で取った
+- A/B（同一バイナリ・`TAKO_1023_LEGACY=1` が before）: **before = `queued_after_open=1` /
+  `has_session=false`、3 秒待っても `has_session=false` のまま**（誰も消化しない） /
+  **after = `queued=0` / `has_session=true`（137ms）**。after のフル走行は
+  `TAKO_APP_SELF_TEST_OK` / exit 0（skip 3 = 蓋閉じで未描画の既知項目）
+- 同じ穴が開いていた 2 か所も直した: ツリー右クリックの「このフォルダで SSH ペインを開く」
+  （`ssh-pane` は内部で `OpenRemote` を通る）と tmux パネルの「復帰」ボタン（`TmuxOpen`）。
+  production の UI 経路で消化漏れがあったのはこの 3 か所だけ（走査で確認）
+- 再発防止に番犬 `crates/tako-control/tests/ui_dispatch_attach_watchdog.rs`。
+  **コメント行を落としてから近傍を見る**のが要点（「pending_attach の後処理は不要」という
+  近くの doc コメントを消化と誤認して空振りした。実際に踏んだ）。PTY 起動を伴う Request の
+  表が dispatch.rs の実装と一致することも同時に検査する
+- 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 2832 passed 0 failed /
+  Windows クロスチェック エラー 0・警告 12（**全件が未変更ファイル由来**）
+
+## 2026-08-28（#1010: SSH の進行状況を可視化）
+- ①**リモートファイルの取得を背景へ出した**（GUI のみ。CLI / MCP は同期のまま = #966 の
+  切り分け）。従来は UI スレッドで同期実行していたので**スピナーを出す余地が構造的に無かった**
+  （実測 1〜2 秒画面が固まる）。取得後の扱い（読み取り専用の判定・プレビュー割り当て・応答）は
+  `tako_control::remote_open_file_fetched` の 1 実装で CLI / MCP と共通
+- ②**ペインの SSH 接続待ちをヘッダのチップに出した**。#1006 の 3 経路すべてで、dispatch の
+  時点（= 打ち始める前）から出る。判定は `tako_core::ssh_progress`（純粋関数）で、材料は
+  ペインの画面と ControlMaster のソケットの有無だけ（プロセスを起こさない）。
+  **失敗は消えずに理由へ置き換わる**（クリックで閉じる）。パスワード等の入力待ちも
+  「沈黙が破れた」として畳む
+- 1:1 公開: `list` / `read` の `ssh_connect`、`remote-folder list` の `loading_files`
+- **実機で踏んだ致命傷**: `gpui::percentage()` は **0.0〜1.0 の外で panic**（`debug_assert!`）し、
+  初回描画で**アプリごと abort** した。回転数をそのまま渡していたのが原因で、端数
+  （`fract()`）を渡す形へ。**セルフテストでは捕まらない**（ウィンドウが隠れていると
+  スピナーが 1 フレームも描かれない）ので、隔離 GUI を前面にして実際に描かせる検証が要る
+- A/B（`TAKO_1010_LEGACY=1` = 取得を UI スレッドで同期）: before は
+  `loading=false listed=0` で項目 133(a) が FAILED / after は
+  `loading=true cleared=true connecting=true failed=true read=true` で
+  `TAKO_APP_SELF_TEST_OK`
+- 実機（隔離 GUI + 実 SSH）: 到達不能ホストで**接続中チップ（回る弧つき）**→ 10 秒後に
+  **赤い失敗チップ（理由 = `ssh: connect to host … Operation timed out`）**をスクショで確認。
+  `list` の `ssh_connect` も `connecting` → `failed` + `reason` と一致
+- **合成クリック（System Events の `click at`）は GPUI に届かない**ので、ツリー行の
+  クリックが要る検証（ファイル行のスピナーの目視）は自動化できなかった。
+  状態そのものはセルフテスト項目 133 が機械検証している
+- 番犬: `spinner::tests`（`repeat()` 禁止 / 回転角が `percentage()` の範囲 / 有限の長さ）。
+  #1023 の `ui_dispatch_attach_watchdog` の 2 本目は `Request::X {}` を
+  「アーム」と「組み立て」で見分けられず誤検知したので、**箇所数の固定 + 表の実在確認**へ置き換えた
+
+## 2026-08-28（#1012: チャットの無限 repeat を有限回へ）
+- GUI チャットの生成中ドット2件（ヘッダ / 会話末尾）は、2秒周期の `repeat()` で busy 中ずっと
+  フレームを要求していた。#945 の実装をそのまま踏襲し、3往復 = 6秒の oneshot に変更した。
+  完了後は色つきの静的表示が残るため、生成中であることは引き続き分かる
+- ヘッダ / 会話末尾を別々に観測する不透明度プローブとセルフテスト項目132を新設。
+  通常系は両方とも `early_spread=0.634` → `late_spread=0.000` / `late_last=1.000` で
+  `TAKO_APP_SELF_TEST_OK`。`TAKO_1012_LEGACY=1` では旧 `repeat()` へ戻り、両方とも
+  `late_spread=0.599〜0.600` / `late_last=0.366〜0.367` / `stopped=false` で項目132が FAILED（exit 1）
+- `starter.rs` の準備中ドットは表示自体が4秒 / 25秒で上限つきのため、設計正本どおり任意対象として
+  今回は変更しなかった
+
 ## 2026-08-28（#983 変更 2 / 3: 送達観測手段のマトリクス化 + 起動失敗の系統網羅）
 - **変更 2**: `prompt_delivery_assessment` の `agent != "claude" → NotApplicable`（= 黙る）を
   **#982 のマトリクスから引く**形へ（`agent_support::delivery_observation` が
@@ -3721,3 +3785,4 @@
   `prompt_delivery="n/a"`・`status="unknown"` = 報告どおりの無言死で FAILED）
 - 関連: PR（`Refs #983`）。**GUI が要る実測（spawn の通し・受け入れ条件 3）は未実施**
   （プレゼンのため画面に出る検証を停止中）
+||||||| 99987b0

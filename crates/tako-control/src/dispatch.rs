@@ -964,6 +964,9 @@ fn dispatch_inner(
                 // #813: 利用上限後の自動復帰。enabled = ペインのオプトイン、
                 // state = いま上限で止まっているか・いつ復帰するか（GUI 稼働時のみ）
                 "limit_resume": limit_resume_entry(host, PaneId::from_raw(pane_id)),
+                // #1010: SSH の接続待ち / 失敗（null = どちらでもない）。
+                // 画面がまだ空でも「何を待っているか」が応答から分かる
+                "ssh_connect": host.ssh_connect_state(PaneId::from_raw(pane_id)),
             }))
         }
 
@@ -4060,6 +4063,10 @@ fn dispatch_inner(
                     .join(" ");
                 // 器（psmux）は起動直後だけでなく高負荷時も入力を落とすので、
                 // 送達確認つきの経路（#640）へ載せる
+                // #1010: 打ち始める前から「接続中…」を出す。#640 の送達フローは
+                // シェルの準備を待つので、ここを起点にしないと**打たれるまでの沈黙**が
+                // そのまま「何も起きない」に見える
+                host.begin_ssh_connect(pane_id, &ssh_host, false);
                 host.queue_command_flow(pane_id, line.clone());
                 if let Some(d) = &dir {
                     // 接続後にリモートで `cd`。相手のシェルが不明なので両方言で通る形
@@ -4149,6 +4156,9 @@ fn dispatch_inner(
                     ..Default::default()
                 },
             );
+            // #1010: 新しいペインは tako が印字したバナーしか載っていない
+            // （= `fresh_pane`）ので、判定は「tako 以外の行が出たか」で足りる
+            host.begin_ssh_connect(pane_id, &ssh_host, true);
 
             // フォルダ指定つきは接続後に `cd` を打つ。相手のシェルが不明（POSIX とも
             // PowerShell とも限らない）なので、**両方で通る `cd "<path>"`** を
@@ -5946,6 +5956,66 @@ fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
     argv
 }
 
+/// リモートファイルを**取得したあと**の共通経路（#966 / #1010）。
+///
+/// SFTP の取得（ネットワーク I/O）だけを分離してあるので、CLI / MCP は同期で、
+/// GUI は背景で取ってからここへ入る。**開いたあとの扱い（読み取り専用の判定・
+/// プレビューの割り当て・応答の形）は 1 実装**なので経路で食い違わない。
+///
+/// `fetched` は [`tako_core::remote_fs::fetch_file`] の戻り値
+/// （ローカルの写しと、読めた場合の stat）
+pub fn remote_open_file_fetched(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    ssh_host: &str,
+    file: &str,
+    fetched: (std::path::PathBuf, Option<tako_core::remote_fs::RemoteStat>),
+    focus: Option<bool>,
+) -> Result<Value, DispatchError> {
+    use tako_core::remote_fs::{self, RemoteRef};
+
+    let (local, stat) = fetched;
+    // #966: 編集は開放したが、**確実に書けないものは読み取り専用のまま**にする
+    // （mode のどこにも `w` が無いときだけ。Windows は権限欄が `*` 埋めで
+    // 判定材料が無いので「書けるかもしれない」側 = 編集できる）
+    let read_only = stat
+        .as_ref()
+        .and_then(|s| s.writable_hint())
+        .map(|writable| !writable)
+        .unwrap_or(false);
+    let result = dispatch(
+        host,
+        Request::OpenFile {
+            pane: None,
+            path: local.display().to_string(),
+            mode: None,
+            direction: None,
+            focus,
+            new_tab: false,
+        },
+        origin,
+    )?;
+    if let Some(pane) = result["pane"].as_u64() {
+        host.set_preview_remote_origin(
+            PaneId::from_raw(pane),
+            RemoteRef::new(ssh_host.to_string(), file.to_string()),
+            read_only,
+        );
+    }
+    let mut out = result;
+    out["host"] = json!(ssh_host);
+    out["remote_path"] = json!(file);
+    out["cached_path"] = json!(local.display().to_string());
+    out["read_only"] = json!(read_only);
+    if let Some(stat) = &stat {
+        out["size"] = json!(stat.size);
+        out["mode"] = json!(stat.mode);
+        out["mtime"] = json!(stat.mtime);
+    }
+    out["pending_write"] = json!(remote_fs::has_pending(ssh_host, file));
+    Ok(out)
+}
+
 /// リモート（SSH 先）フォルダの操作（#919 / #65）。
 ///
 /// GUI の「リモートからフォルダを開く」・CLI `tako remote-folder`・MCP
@@ -6150,7 +6220,15 @@ fn dispatch_remote_folder(
                         .unwrap_or(true)
                 })
                 .collect();
-            Ok(json!({ "tabs": tabs }))
+            // #1010: いま読み込み中のリモートファイル（ツリーがスピナーを出しているもの）。
+            // **GUI で回っているものが応答からも読める**ので、AI は「まだ来ていない」と
+            // 「開けなかった」を取り違えない
+            let loading: Vec<Value> = host
+                .remote_files_loading()
+                .iter()
+                .map(|r| json!({ "host": r.host, "path": r.path, "label": r.label() }))
+                .collect();
+            Ok(json!({ "tabs": tabs, "loading_files": loading }))
         }
 
         // ツリーを開かずに覗く（#65 要件 5: AI がリモートの構造を把握する経路）
@@ -6185,48 +6263,12 @@ fn dispatch_remote_folder(
         "open-file" => {
             let ssh_host = need_host(&ssh_host)?;
             let file = need_path(&path)?;
-            let (local, stat) =
-                remote_fs::fetch_file(&ssh_host, &file, remote_fs::MAX_PREVIEW_BYTES)
-                    .map_err(to_err)?;
-            // #966: 編集は開放したが、**確実に書けないものは読み取り専用のまま**にする
-            // （mode のどこにも `w` が無いときだけ。Windows は権限欄が `*` 埋めで
-            // 判定材料が無いので「書けるかもしれない」側 = 編集できる）
-            let read_only = stat
-                .as_ref()
-                .and_then(|s| s.writable_hint())
-                .map(|writable| !writable)
-                .unwrap_or(false);
-            let result = dispatch(
-                host,
-                Request::OpenFile {
-                    pane: None,
-                    path: local.display().to_string(),
-                    mode: None,
-                    direction: None,
-                    focus,
-                    new_tab: false,
-                },
-                origin,
-            )?;
-            if let Some(pane) = result["pane"].as_u64() {
-                host.set_preview_remote_origin(
-                    PaneId::from_raw(pane),
-                    RemoteRef::new(ssh_host.clone(), file.clone()),
-                    read_only,
-                );
-            }
-            let mut out = result;
-            out["host"] = json!(ssh_host);
-            out["remote_path"] = json!(file);
-            out["cached_path"] = json!(local.display().to_string());
-            out["read_only"] = json!(read_only);
-            if let Some(stat) = &stat {
-                out["size"] = json!(stat.size);
-                out["mode"] = json!(stat.mode);
-                out["mtime"] = json!(stat.mtime);
-            }
-            out["pending_write"] = json!(remote_fs::has_pending(&ssh_host, &file));
-            Ok(out)
+            // CLI / MCP は**同期**（#966 の切り分けと同じ。AI が応答だけで
+            // 「読めたのか」を判断できることのほうが重要）。GUI は取得だけを背景へ出し、
+            // 取れたところで下の `remote_open_file_fetched` を呼ぶ（#1010）
+            let fetched = remote_fs::fetch_file(&ssh_host, &file, remote_fs::MAX_PREVIEW_BYTES)
+                .map_err(to_err)?;
+            remote_open_file_fetched(host, origin, &ssh_host, &file, fetched, focus)
         }
 
         // 押し出せていない保存の一覧（#966 受け入れ条件 3）。
@@ -10035,6 +10077,8 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         }),
                         // 利用上限後の自動復帰のオプトイン（#813。既定 false）
                         "limit_autoresume": p.limit_autoresume(),
+                        // SSH の接続待ち / 失敗（#1010。null = どちらでもない）
+                        "ssh_connect": host.ssh_connect_state(p.id()),
                         "tmux_session": host.backend_session(p.id()),
                         "backend_windows": host.backend_windows(p.id()).map(|ws| ws.iter().map(|w| json!({
                             "index": w.index,
