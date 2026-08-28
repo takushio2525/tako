@@ -8927,6 +8927,48 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// UI から `tako_control::dispatch` を直接呼んだあとの後始末（#1023）。
+    ///
+    /// dispatch は PTY の起動を `pending_attach` へ積むだけで、実際の起動には GPUI の
+    /// `Context` が要る（`SessionHost::attach_session` の実装がキューへ積む形）。
+    /// IPC / MCP のリクエストループは毎回これを消化しているが、**UI 経路は
+    /// 呼び出しごとに手で書いていた**ため `open_ssh_host` だけ抜けていた:
+    /// ペインは即座に生えるのに PTY が立たず、**次に来た IPC まで真っ黒**になる
+    /// （= #1023 の「ファイル→リモート接続はターミナルが出るまで待つ」。
+    /// 既存シェルへ打つ右クリック経路は PTY を作らないので即出る、の非対称の正体）。
+    ///
+    /// PTY 起動に失敗したペインは巻き戻す（空ペインを残さない = #153 と同じ扱い）。
+    /// 戻り値は最初の失敗の理由（呼び出し側が画面へ出す）
+    pub(crate) fn attach_pending_sessions(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let mut failure = None;
+        for (pane, options) in std::mem::take(&mut self.pending_attach) {
+            if let Err(e) = self.spawn_session(pane, options, cx) {
+                self.remove_pane(pane, cx);
+                if failure.is_none() {
+                    failure = Some(format!("PTY を起動できなかった: {e}"));
+                }
+            }
+        }
+        // セッション起動後の遅延書き込み（IPC ループと同じ順序）
+        for (pane, data) in std::mem::take(&mut self.pending_writes) {
+            if let Some(session) = self.terminals.get(&pane) {
+                session.write(data);
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// #1023 の修正を入れる前（後始末をしない）へ戻す逃げ道（`TAKO_1023_LEGACY=1`）。
+    ///
+    /// 同じバイナリで「操作してすぐ PTY が立つか」を A/B するために使う
+    pub(crate) fn attach_drain_legacy() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var_os("TAKO_1023_LEGACY").is_some())
+    }
+
     /// SSH ホストへ接続する（#20 / #919 / #1006）。
     ///
     /// **dispatch を通す**のが要点（#1006 で直した）。以前はここが独自に `ssh` を
@@ -8957,13 +8999,18 @@ impl TakoApp {
             },
             PaneOrigin::User,
         );
-        // 断られた理由（素のシェルでないペイン等）はユーザーに見せる。
-        // 黙って何も起きないのが #1006 で一番避けたい挙動
         if let Err(e) = result {
             // 断られた理由（素のシェルでないペイン等）はユーザーに見せる。
             // 黙って何も起きないのが #1006 で一番避けたい挙動。
             // 置き場はサイドバー上部の通知（#919 が接続失敗に使っているのと同じ面）
             self.set_remote_notice(format!("{e}"), true);
+        } else if !Self::attach_drain_legacy() {
+            // #1023: dispatch が積んだ PTY 起動をこの場で消化する。
+            // これを欠くと新ペイン経路（target = split / tab）はペインだけが生えて
+            // ターミナルが立たず、次に来た IPC まで真っ黒のまま待つ
+            if let Err(e) = self.attach_pending_sessions(cx) {
+                self.set_remote_notice(e, true);
+            }
         }
         self.scroll_active_tab_into_view();
         cx.notify();
@@ -55457,6 +55504,81 @@ mod self_test {
                      panes={panes_before}->{panes_after} same_pane={same_pane} \
                      queued_len={flow_line} refused={refused}"
                 );
+                notify_and_draw(any, window, cx);
+            }
+
+            // 132. 新ペイン経路の SSH は「操作してすぐ」ターミナルが立つ（#1023）。
+            //
+            // dispatch はペインを作るだけで、PTY 起動は `pending_attach` へ積まれる。
+            // UI 経路がそれを消化しないと**ペインだけ生えて真っ黒**のまま、
+            // 次に来た IPC（= CLI / MCP の任意のリクエスト）まで待つ。
+            // ユーザーには「ファイル→リモート接続はターミナルが出るまでめっちゃ待つ /
+            // 右クリックの SSH 化は即出る」に見えていた（右クリックは既存シェルへ
+            // 打つだけで PTY を作らないため）。
+            //
+            // **CLI / MCP で覗くと観測自身が消化してしまう**（IPC ループが消化する）
+            // ので、ここは window 直更新だけで測る。A/B は `TAKO_1023_LEGACY=1`
+            {
+                let host1023 = "selftest-nonexistent-1023";
+                let mk_host = || tako_core::ssh_config::SshHost {
+                    name: host1023.to_string(),
+                    hostname: None,
+                    user: None,
+                    port: None,
+                };
+                let legacy = TakoApp::attach_drain_legacy();
+                let t0 = std::time::Instant::now();
+                let (new_pane, queued) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.open_ssh_host(mk_host(), None, cx);
+                        let tab = app.workspace.active_tab_id();
+                        let pane = app
+                            .workspace
+                            .get_tab(tab)
+                            .map(|t| t.tree().focused().as_u64())
+                            .unwrap_or(0);
+                        // 消化されていれば空。**ここが #1023 の不変条件**
+                        (pane, app.pending_attach.len())
+                    })
+                    .unwrap_or((0, 0));
+                // 「操作してすぐ」= 追加の待ちも IPC も無しで PTY が在ること
+                let (has_session, elapsed_ms) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.terminals.contains_key(&PaneId::from_raw(new_pane)),
+                            t0.elapsed().as_millis(),
+                        )
+                    })
+                    .unwrap_or((false, 0));
+                // 旧挙動でも「待てば立つ」わけではないことを見せる（誰も消化しない）。
+                // 3 秒あけて測り直す = 体感の「めっちゃ待つ」の実体
+                wait(cx, 3000).await;
+                let still = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (
+                            app.terminals.contains_key(&PaneId::from_raw(new_pane)),
+                            app.pending_attach.len(),
+                        )
+                    })
+                    .unwrap_or((false, 0));
+                println!(
+                    "TAKO_SELF_TEST_1023: legacy={legacy} pane={new_pane} \
+                     queued_after_open={queued} has_session={has_session} \
+                     elapsed_ms={elapsed_ms} after_3s=(has_session={} queued={})",
+                    still.0, still.1
+                );
+                check(
+                    queued == 0 && has_session,
+                    &format!(
+                        "132: 新ペイン経路の SSH は操作直後に PTY が立つ \
+                         (#1023。queued={queued} has_session={has_session} \
+                         elapsed_ms={elapsed_ms} after_3s={still:?} legacy={legacy})"
+                    ),
+                );
+                // 検証で作ったペインは畳む（ssh が失敗して入力待ちで止まるため）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(PaneId::from_raw(new_pane), CloseOrigin::Internal, cx);
+                });
                 notify_and_draw(any, window, cx);
             }
 

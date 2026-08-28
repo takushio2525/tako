@@ -22,6 +22,30 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ## [Unreleased]
 
+### Fixed / 修正
+
+- [修正] ファイルメニュー / パレットから開いた SSH ペインでターミナルが立たない (#1023)
+  「ファイル→リモート接続」で出したペインは**ターミナルが出るまで待たされる**のに、
+  ペイン右クリックの SSH 化は即出る、という非対称があった。原因は GUI 経路が
+  `pending_attach`（dispatch が積む PTY 起動の依頼）を消化していなかったこと。
+  IPC / MCP のループは毎回消化しているので、**次に来た CLI / MCP のリクエストで
+  初めて PTY が立つ**（エージェントが動いていなければ立たないまま）。右クリック経路は
+  既存シェルへ 1 行打つだけで PTY を作らないため、この待ちが無かった。
+  隔離セルフテストで実測: 修正前は操作 3 秒後も `has_session=false`（起動依頼は積まれたまま）、
+  修正後は操作直後に `has_session=true`（137ms）。同じ穴が開いていたツリー右クリックの
+  「このフォルダで SSH ペインを開く」と、tmux パネルの「復帰」ボタンも直した。
+  再発防止に番犬テスト（UI から dispatch を直接呼ぶ経路が PTY 起動を消化しているか）を追加。
+
+  SSH panes opened from the File menu / palette showed no terminal for a long time, while
+  the pane right-click ("Connect this pane via SSH…") was instant. The GUI path never
+  drained `pending_attach` — the queue dispatch uses to ask for a PTY — so the terminal
+  only started when the next unrelated CLI/MCP request happened to drain it (and never at
+  all with no agent running). The right-click path types one line into the existing shell
+  and creates no PTY, which is why it felt instant. Measured in the isolated self-test:
+  before the fix `has_session=false` even 3 seconds after the action; after the fix the PTY
+  is up immediately (137ms). The same missing drain in the file tree's "Open SSH pane here"
+  and the tmux panel's "restore" button is fixed too, and a watchdog test now guards it.
+
 ### Changed / 変更
 
 - [改善] SSH 接続の開き方を 2 点変えた (#1006)

@@ -1749,6 +1749,13 @@ impl TakoApp {
                 );
                 if let Err(e) = result {
                     self.set_remote_notice(e.to_string(), true);
+                } else if !Self::attach_drain_legacy() {
+                    // #1023: `ssh-pane` は内部で `OpenRemote` を通るので PTY 起動が
+                    // `pending_attach` へ積まれる。UI 経路はここで消化しないと
+                    // ペインだけ生えてターミナルが立たない
+                    if let Err(e) = self.attach_pending_sessions(cx) {
+                        self.set_remote_notice(e, true);
+                    }
                 }
             }
             "close-root" => {
