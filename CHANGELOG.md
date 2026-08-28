@@ -22,6 +22,34 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ## [Unreleased]
 
+### Added / 追加
+
+- [改善] SSH の進行状況を可視化した (#1010)
+  ① **リモートファイルの読み込み中はツリーの行に回る弧が出る**。GUI の「開く」は
+  SFTP の取得を**背景**へ出すようにしたので（従来は UI スレッドで同期実行 =
+  実測 1〜2 秒画面が固まり、そもそもスピナーを出す余地が無かった）、押した瞬間から
+  終わるまでインジケータが出て、終わると消える。取得の失敗はこれまでどおり
+  理由 + 次の一手 + 生の詳細で出る。CLI / MCP は従来どおり同期（#966 の切り分けと同じ）。
+  ② **SSH ペインは接続開始から「<ホスト> へ接続中…」がヘッダに出る**。#1006 の 3 経路
+  （現在タブの新ペイン / 新タブ / このペインを SSH 化）すべてに出て、**接続に失敗したら
+  消えずに理由へ置き換わる**（クリックで閉じる）。判定は `tako_core::ssh_progress` の
+  純粋関数で、材料はペインの画面と ControlMaster のソケットの有無だけ
+  （プロセスは起こさない）。パスワードを聞かれた時点でも表示は畳む
+  （沈黙が破れて画面に指示が出ているため）。
+  どちらの状態も CLI / MCP から読める: `tako list` / `tako read` の `ssh_connect`、
+  `tako remote-folder list` の `loading_files`。**絵文字は使わず**、
+  回転は有限回で終わる（#945 / #1012 の「無限アニメーションを作らない」に従う）。
+
+  ① The file tree now shows a spinning arc next to a remote file while it is being fetched.
+  The GUI fetch moved to the background (it used to run synchronously on the UI thread —
+  measured 1–2 s of frozen UI, which left no room to show progress at all), so the
+  indicator appears the moment you click and disappears when the fetch finishes. CLI/MCP
+  stay synchronous. ② SSH panes now show "Connecting to &lt;host&gt;…" in the pane header from
+  the moment the connection starts, for all three open targets, and on failure the chip is
+  **replaced by the reason** instead of vanishing (click to dismiss). Both states are
+  readable from the CLI/MCP (`ssh_connect` in `tako list` / `tako read`, `loading_files` in
+  `tako remote-folder list`). No emoji, and the rotation is finite (per #945 / #1012).
+
 ### Fixed / 修正
 
 - [修正] ファイルメニュー / パレットから開いた SSH ペインでターミナルが立たない (#1023)

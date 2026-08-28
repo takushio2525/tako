@@ -16,6 +16,9 @@ pub struct HeaderVisibility {
     pub workers_dropdown: bool,
     pub parent_link: bool,
     pub cwd_chip: bool,
+    /// SSH の接続待ち / 失敗の表示（#1010）。**一時的だが伝わらないと困る**ので
+    /// cwd チップよりずっと早い段階から出す（狭い分割でも消えない）
+    pub ssh_connect: bool,
     pub shell_info: bool,
     pub split_button: bool,
     pub bg_button: bool,
@@ -29,6 +32,7 @@ impl HeaderVisibility {
     /// 省略順序（優先度低→高）:
     ///   shell_info → cwd_chip → workers/parent → state_elapsed →
     ///   state → role → split → bg/close (→ more_menu に集約)
+    /// ssh_connect（#1010）だけは一時表示なので早くから出す（badge の次に残る）
     /// 幅 < 140 では bg_button/close_button の代わりに more_menu = true となり、
     /// UI 側で「...」ボタン 1 個にまとめる。
     pub fn from_width(width: f32) -> Self {
@@ -39,6 +43,7 @@ impl HeaderVisibility {
             bg_button: width >= 140.0,
             badge: width >= 80.0,
             title: width >= 100.0,
+            ssh_connect: width >= 120.0,
             split_button: width >= 180.0,
             role: width >= 220.0,
             state: width >= 260.0,

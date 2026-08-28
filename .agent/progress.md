@@ -3714,3 +3714,32 @@
 - 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 2832 passed 0 failed /
   Windows クロスチェック エラー 0・警告 12（**全件が未変更ファイル由来**）
 
+## 2026-08-28（#1010: SSH の進行状況を可視化）
+- ①**リモートファイルの取得を背景へ出した**（GUI のみ。CLI / MCP は同期のまま = #966 の
+  切り分け）。従来は UI スレッドで同期実行していたので**スピナーを出す余地が構造的に無かった**
+  （実測 1〜2 秒画面が固まる）。取得後の扱い（読み取り専用の判定・プレビュー割り当て・応答）は
+  `tako_control::remote_open_file_fetched` の 1 実装で CLI / MCP と共通
+- ②**ペインの SSH 接続待ちをヘッダのチップに出した**。#1006 の 3 経路すべてで、dispatch の
+  時点（= 打ち始める前）から出る。判定は `tako_core::ssh_progress`（純粋関数）で、材料は
+  ペインの画面と ControlMaster のソケットの有無だけ（プロセスを起こさない）。
+  **失敗は消えずに理由へ置き換わる**（クリックで閉じる）。パスワード等の入力待ちも
+  「沈黙が破れた」として畳む
+- 1:1 公開: `list` / `read` の `ssh_connect`、`remote-folder list` の `loading_files`
+- **実機で踏んだ致命傷**: `gpui::percentage()` は **0.0〜1.0 の外で panic**（`debug_assert!`）し、
+  初回描画で**アプリごと abort** した。回転数をそのまま渡していたのが原因で、端数
+  （`fract()`）を渡す形へ。**セルフテストでは捕まらない**（ウィンドウが隠れていると
+  スピナーが 1 フレームも描かれない）ので、隔離 GUI を前面にして実際に描かせる検証が要る
+- A/B（`TAKO_1010_LEGACY=1` = 取得を UI スレッドで同期）: before は
+  `loading=false listed=0` で項目 133(a) が FAILED / after は
+  `loading=true cleared=true connecting=true failed=true read=true` で
+  `TAKO_APP_SELF_TEST_OK`
+- 実機（隔離 GUI + 実 SSH）: 到達不能ホストで**接続中チップ（回る弧つき）**→ 10 秒後に
+  **赤い失敗チップ（理由 = `ssh: connect to host … Operation timed out`）**をスクショで確認。
+  `list` の `ssh_connect` も `connecting` → `failed` + `reason` と一致
+- **合成クリック（System Events の `click at`）は GPUI に届かない**ので、ツリー行の
+  クリックが要る検証（ファイル行のスピナーの目視）は自動化できなかった。
+  状態そのものはセルフテスト項目 133 が機械検証している
+- 番犬: `spinner::tests`（`repeat()` 禁止 / 回転角が `percentage()` の範囲 / 有限の長さ）。
+  #1023 の `ui_dispatch_attach_watchdog` の 2 本目は `Request::X {}` を
+  「アーム」と「組み立て」で見分けられず誤検知したので、**箇所数の固定 + 表の実在確認**へ置き換えた
+

@@ -150,6 +150,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("play"),
     ui_asset!("plus"),
     ui_asset!("refresh"),
+    // 読み込み中インジケータ（#1010。回して使う 270 度の弧）
+    ui_asset!("spinner"),
     ui_asset!("search"),
     ui_asset!("split"),
     ui_asset!("stop"),
@@ -208,6 +210,9 @@ pub mod ui_icon {
     pub const PAUSE: &str = "icons/ui/pause.svg";
     pub const PLUS: &str = "icons/ui/plus.svg";
     pub const REFRESH: &str = "icons/ui/refresh.svg";
+    /// 読み込み中インジケータ（#1010）。**絵文字は使わない**（#217）ので
+    /// 270 度の弧を回して見せる。中心は viewBox の中央なので回転が偏らない
+    pub const SPINNER: &str = "icons/ui/spinner.svg";
     pub const REMOTE: &str = "icons/ui/remote.svg";
     pub const SEARCH: &str = "icons/ui/search.svg";
     pub const SPLIT: &str = "icons/ui/split.svg";
