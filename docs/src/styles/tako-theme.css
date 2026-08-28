@@ -1413,3 +1413,60 @@ kbd,
     display: none !important;
   }
 }
+
+/* ============================================================
+ * スクリーンショット（#1027）
+ * ============================================================ */
+/* 本文中の画像は必ず横幅に収める。モバイルではみ出させない */
+.sl-markdown-content img {
+  max-width: 100%;
+  height: auto;
+}
+
+.tako-shot {
+  margin: var(--tako-space-6) 0;
+}
+
+.tako-shot img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--tako-border);
+  border-radius: var(--tako-radius-lg);
+  /* 実画面はダーク背景なので、明るいテーマでも浮いて見えるよう影を控えめに置く */
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 8px 24px rgb(0 0 0 / 0.08);
+  background: var(--tako-surface);
+}
+
+.tako-shot figcaption {
+  margin-top: var(--tako-space-2);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--sl-color-gray-3);
+  text-align: left;
+}
+
+/* 幅の狭い図（サイドバー単体など）は中央に寄せて間延びさせない */
+.tako-shot-narrow img {
+  max-width: 22rem;
+  margin-inline: auto;
+}
+
+@media (max-width: 640px) {
+  .tako-shot {
+    /* スマホでは本文の左右パディングぶん外へ広げて、画面の文字を読めるようにする */
+    margin-inline: calc(var(--tako-space-4) * -1);
+  }
+  .tako-shot img {
+    border-radius: var(--tako-radius-sm);
+  }
+}
+
+/* 画面いっぱいのスクショは本文列（768px）だと文字が潰れる。
+ * 余白のある広い画面でだけ、左右へ少しはみ出させて読めるようにする。
+ * 右目次と衝突しない範囲に留めること（欲張ると本文の可読性を壊す） */
+@media (min-width: 1500px) {
+  .sl-markdown-content .tako-shot:not(.tako-shot-narrow) {
+    width: 54rem;
+    margin-inline: calc((100% - 54rem) / 2);
+  }
+}

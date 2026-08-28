@@ -39,6 +39,11 @@ tako panel --show-hidden off
 - **ターミナルペイン**にドロップ → ファイルパスをテキストとして入力
 - **プレビューペイン**にドロップ → そのファイルをプレビュー表示
 
+<figure class="tako-shot">
+<img src="/img/preview-code.webp" alt="左のファイルツリーでファイルを選び、右のペインに TypeScript がシンタックスハイライト付きで表示されている画面" />
+<figcaption>ファイルツリーから選ぶと、隣のペインにシンタックスハイライト付きで開く</figcaption>
+</figure>
+
 ## コードプレビュー
 
 ファイルをクリックまたは `tako open <ファイルパス>` で、ペイン内にファイル内容を表示します。
@@ -69,6 +74,11 @@ tako panel --show-hidden off
 - タイトルバーの目アイコンで **コード表示 ⇔ Markdown 表示**を切替可能
 - 切替モードは CLI / MCP からも操作可
 
+<figure class="tako-shot">
+<img src="/img/preview-markdown.webp" alt="README.md が見出し・コードブロック・表つきでレンダリング表示されている画面" />
+<figcaption>`.md` は既定でレンダリング表示。コードブロックにはコピーボタンが付く</figcaption>
+</figure>
+
 ## 画像・PDF・動画プレビュー
 
 コードと Markdown 以外のファイルも開けます。表示モードは拡張子から自動判定されます。
@@ -82,6 +92,11 @@ tako preview                  # 現在のズーム・ページ状態
 tako preview-outline          # Markdown 見出し / PDF 目次の一覧
 tako preview-outline --item 4 # 4 番目の項目へジャンプ
 ```
+
+<figure class="tako-shot">
+<img src="/img/preview-markdown-table.webp" alt="Markdown の表が罫線つきの表として描画されている画面" />
+<figcaption>GFM の表は罫線・ヘッダ帯つきで描画され、列幅も内容に合わせて配分される</figcaption>
+</figure>
 
 ## 編集と自動反映
 

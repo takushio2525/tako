@@ -35,6 +35,11 @@ tako ui-mode toggle
 
 判定は保守的です。**Claude だとはっきり分かるときだけ**チャットにするので、知らないプログラムが動いているペインを勝手に隠すことはありません。
 
+<figure class="tako-shot">
+<img src="/img/gui-mode-starter.webp" alt="空のペインが「AI チームに任せる」「AI と 1 対 1 で話す」「コマンド入力へ」の 3 つのボタンに置き換わっている画面" />
+<figcaption>コマンド待ちの空のペインは 3 つのボタンになる。黒い画面を直視せずに始められる</figcaption>
+</figure>
+
 ## スターター（空のペイン）
 
 空のペインには次の 3 つのボタンが並びます。
@@ -104,3 +109,8 @@ tako chat copy --message 3 --code 0
 :::tip[コマンドを提案するときは]
 かんたん表示では会話の中にコマンドを書いても、そのままコピーすると折り返しで壊れることがあります。AI にコマンドの実行を頼まれたときは `tako show-command` で提案カードを出してもらうと、コピー・実行ボタンつきで表示されます。
 :::
+
+<figure class="tako-shot">
+<img src="/img/command-card.webp" alt="「テストを実行する」という説明つきで npm run test が表示され、コピーと新規ペインで実行のボタンが付いたカード" />
+<figcaption>コマンド提案カード。折り返しで壊れない全文がそのままコピーでき、その場で新しいペインへ流せる</figcaption>
+</figure>

@@ -45,6 +45,11 @@ tako persist on
 
 MCP ツール `tako_persist` からも同じ操作が可能です。
 
+<figure class="tako-shot">
+<img src="/img/fleet-panel.webp" alt="fleet ビューにワークスペースとペインの一覧が表示され、稼働中・アイドルの件数が出ている画面" />
+<figcaption>fleet ビューでは、tako が管理しているセッションと、その中のペインをまとめて確認できる</figcaption>
+</figure>
+
 ## サイドバーの fleet ビュー
 
 右サイドバーの **fleet ビュー**（`tako panel --view fleet`）では、全 tmux セッションの状態を一覧できます。

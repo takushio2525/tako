@@ -14,6 +14,11 @@ tako settings
 tako settings --tab 外観
 ```
 
+<figure class="tako-shot">
+<img src="/img/settings-general.webp" alt="tako の設定画面。一般タブに表示言語・AI 自動リネーム・ポート検知などのトグルが並んでいる" />
+<figcaption>設定画面（<kbd>Cmd</kbd>+<kbd>,</kbd>）。左のタブで分類を切り替える</figcaption>
+</figure>
+
 ## 見た目
 
 ### テーマ
