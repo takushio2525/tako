@@ -245,6 +245,11 @@ main:has(.tako-landing) ~ aside {
 /* [修正 b] ランディングは本文の字数制限を外し、独自の最大幅で中央に置く */
 :has(.tako-landing) .main-pane {
   max-width: 100%;
+  /* ヒーローの背景装飾は本文列（.sl-container = 768px）より広く敷くので、
+   * はみ出しの受け止めはここで行う。本文列側で受けると装飾が列幅で切られ、
+   * 画面の途中に矩形の境目が出る（#1026）。
+   * clip はスクロールコンテナを作らないので sticky 等に影響しない */
+  overflow-x: clip;
 }
 :has(.tako-landing) .sl-markdown-content {
   max-width: 100%;
@@ -252,9 +257,6 @@ main:has(.tako-landing) ~ aside {
 .tako-landing {
   max-width: 62rem;
   margin-inline: auto;
-  /* 装飾のはみ出しでページが横スクロールしないための保険。
-   * clip はスクロールコンテナを作らないので sticky 等に影響しない */
-  overflow-x: clip;
 }
 
 .tako-landing h1,
@@ -276,15 +278,31 @@ main:has(.tako-landing) ~ aside {
 }
 
 /* 背景のやわらかい光。マスコットの後ろに置いて主役を引き立てる。
- * 左右へはみ出させない（はみ出すとページ全体が横スクロールしてしまう）。
- * 画面外へ滲む見え方はグラデーションの広がりで作る */
+ *
+ * 幅: 本文列（768px）で塗ると画面の途中で色が途切れて矩形に見えるので、
+ *   calc(50% - 50vw) で左右へ広げて本文ペイン全体を覆う。行き先の
+ *   .main-pane が overflow-x: clip で受けるため横スクロールは発生しない。
+ *   本文列はペインの中央にあるので、この箱もペインに対して左右対称になる。
+ * 高さ: グラデーションが箱の上下端に達する前に透明へ落ちきるよう
+ *   「中心 ± 半径」を 0〜100% に収めてある（はみ出すと横一文字の境目が出る）。
+ *   下の数値を触るときはこの不変条件を必ず保つこと。 */
 .tako-hero::before {
   content: '';
   position: absolute;
-  inset: -12% 0 0 0;
+  inset: -5rem calc(50% - 50vw) -3rem;
   background:
-    radial-gradient(70% 74% at 84% 30%, var(--tako-hero-glow-1), transparent 70%),
-    radial-gradient(58% 64% at 6% 6%, var(--tako-hero-glow-2), transparent 72%);
+    radial-gradient(
+      44% 46% at 74% 52%,
+      var(--tako-hero-glow-1) 0%,
+      var(--tako-hero-glow-1) 12%,
+      transparent 100%
+    ),
+    radial-gradient(
+      40% 40% at 24% 40%,
+      var(--tako-hero-glow-2) 0%,
+      var(--tako-hero-glow-2) 12%,
+      transparent 100%
+    );
   pointer-events: none;
   z-index: 0;
 }
