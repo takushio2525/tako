@@ -197,6 +197,16 @@ impl TreeGitStatus {
     }
 }
 
+/// `base` に相対パスを足す。相対部分が空ならそのまま返す
+/// （`Path::join("")` は末尾に区切りを足すので、表示が `/x/` になるのを避ける）
+fn join_rest(base: &Path, rest: &Path) -> PathBuf {
+    if rest.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(rest)
+    }
+}
+
 /// リポジトリ 1 件の要約（CLI / MCP の応答に載せる）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSummary {
@@ -215,6 +225,10 @@ pub struct TreeGitMap {
     /// 丸ごと無視されたディレクトリ（配下は祖先照合で無視と判定する）
     ignored_dirs: HashSet<PathBuf>,
     repos: Vec<RepoSummary>,
+    /// `scan` に渡されたワークスペースフォルダ（**呼び出し側が使っている綴り**）。
+    /// symlink の読み替え（`add_alias`）で表が 2 つの綴りを持つので、一覧を出すときは
+    /// これで絞って**同じ行が 2 回出ないよう**にする。空なら絞らない
+    display_roots: Vec<PathBuf>,
 }
 
 impl TreeGitMap {
@@ -265,22 +279,33 @@ impl TreeGitMap {
             .iter()
             .filter_map(|(path, status)| {
                 let rest = path.strip_prefix(canonical).ok()?;
-                Some((display.join(rest), *status))
+                // ルート自身は `rest` が空。`join("")` は末尾に区切りを足して
+                // 表示が `/link/` になるので、そのときは display をそのまま使う
+                Some((join_rest(display, rest), *status))
             })
             .collect();
         self.entries.extend(rewritten);
         let ignored: Vec<PathBuf> = self
             .ignored_dirs
             .iter()
-            .filter_map(|path| Some(display.join(path.strip_prefix(canonical).ok()?)))
+            .filter_map(|path| Some(join_rest(display, path.strip_prefix(canonical).ok()?)))
             .collect();
         self.ignored_dirs.extend(ignored);
     }
 
-    /// 完全一致で登録されている行（パス順にソート済み）。CLI / MCP の出力用
+    /// 完全一致で登録されている行（パス順にソート済み）。CLI / MCP の出力用。
+    /// `scan` の起点が分かっているときはその配下だけを返す（symlink の読み替えで
+    /// 増えたもう一方の綴りを二重に出さない）
     pub fn sorted_entries(&self) -> Vec<(PathBuf, TreeGitStatus)> {
-        let mut out: Vec<(PathBuf, TreeGitStatus)> =
-            self.entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut out: Vec<(PathBuf, TreeGitStatus)> = self
+            .entries
+            .iter()
+            .filter(|(path, _)| {
+                self.display_roots.is_empty()
+                    || self.display_roots.iter().any(|root| path.starts_with(root))
+            })
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -379,6 +404,7 @@ pub fn scan(roots: &[PathBuf]) -> TreeGitMap {
     for (canonical, display) in &aliases {
         map.add_alias(canonical, display);
     }
+    map.display_roots = roots.to_vec();
     map
 }
 
@@ -606,6 +632,25 @@ mod tests {
         );
         // 無関係なパスは相変わらず何も返さない
         assert!(map.get(Path::new("/other/src/main.rs")).is_none());
+    }
+
+    #[test]
+    fn 一覧は起点の配下だけを返して綴りを二重に出さない() {
+        let mut map = build(vec![entry("src/main.rs", '.', 'M')]);
+        map.add_alias(Path::new("/repo"), Path::new("/link"));
+        // 表は両方の綴りを持つ（UI がどちらでも引ける）
+        assert!(map.get(Path::new("/repo/src/main.rs")).is_some());
+        assert!(map.get(Path::new("/link/src/main.rs")).is_some());
+        // 起点が分かっていない（`merge_repo` 直呼び）なら絞らない
+        assert_eq!(map.sorted_entries().len(), 6);
+        // 起点が `/link` なら `/link` 配下だけ（`/repo` 側は出さない）
+        map.display_roots = vec![PathBuf::from("/link")];
+        let listed: Vec<String> = map
+            .sorted_entries()
+            .into_iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+        assert_eq!(listed, ["/link", "/link/src", "/link/src/main.rs"]);
     }
 
     #[test]
