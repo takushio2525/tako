@@ -1045,7 +1045,10 @@ pub fn classify_self_check(result: Result<u16, String>) -> ServeReachability {
 /// 名前解決の問題で、スマホ側は Tailscale の DNS を使うため到達できることが多い
 pub fn unknown_self_check_note(reason: &str) -> String {
     if reason.contains("lookup address") || reason.contains("dns") || reason.contains("DNS") {
-        "この Mac から ts.net 名を解決できなかったため疎通は未確認（MagicDNS が         この端末に適用されていない可能性。スマホ側は Tailscale の DNS を使うので         到達できることが多い）。確かめるには `tailscale status` の DNS 設定を見る"
+        "この Mac から ts.net 名を解決できなかったため疎通は未確認\
+         （MagicDNS がこの端末に適用されていない可能性。スマホ側は Tailscale の DNS を\
+         使うので到達できることが多い）。\
+         確かめるには `tailscale status` の DNS 設定を見る"
             .to_string()
     } else {
         "疎通を確認できなかったが、502（中継先へ届かない）ではないため起動は続行した".to_string()

@@ -402,12 +402,20 @@ pub fn serve_stop(cli: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// serve 設定が tako の管理形式であれば解除する。解除したら true。
-/// `ours` は自分がいま使っている target（None = 自分の target が分からない状況でも
-/// tako 形状の残骸だけは回収する）。ユーザーの独自設定には触れない
+/// **自分がいま張っている** serve 設定だけを解除する（解除したら true）。
+///
+/// 後始末（daemon の終了 / `tako remote stop`）専用。判定を完全一致に閉じているのは、
+/// #1038 でプロキシ先がループバック TCP になったため「tako 形状かどうか」では
+/// **世代違いの daemon の設定まで巻き込んで消してしまう**から
+/// （古い daemon が遅れて終了すると、新しい daemon の :443 設定が消えて
+/// 「running を名乗るのに見れない」を自作してしまう）。
+/// 起動時の張り替え判断は `is_reclaimable_target`（意図的に広い）を使う
 pub fn serve_stop_if_ours(cli: &str, ours: Option<&str>) -> Result<bool, String> {
+    let Some(ours) = ours else {
+        return Ok(false);
+    };
     match serve_state(cli)? {
-        ServeState::Proxy(ref target) if is_reclaimable_target(target, ours) => {
+        ServeState::Proxy(ref target) if target == ours => {
             serve_stop(cli)?;
             Ok(true)
         }
@@ -1073,6 +1081,20 @@ mod tests {
     }
 
     // --- #1038: 系統の検出・選択 -------------------------------------------
+
+    #[test]
+    fn 後始末は自分がいま張っている設定だけを解除する() {
+        // #1038: 判定を「tako 形状か」に広げると、世代違いの daemon が終了したときに
+        // **稼働中の daemon の設定まで消してしまう**（= 自分で 502 を作る）。
+        // ここは完全一致に閉じる。実際の解除は serve_state を叩くので、
+        // 純関数の側（is_reclaimable_target）と役割が違うことを固定しておく
+        assert!(is_reclaimable_target(
+            "http://127.0.0.1:1",
+            Some("http://127.0.0.1:2")
+        ));
+        // ↑ 起動時の張り替えでは「他世代のループバック設定」も掴んでよい。
+        // ↓ 後始末では掴んではいけない（この差が #1038 の肝）
+    }
 
     #[test]
     fn tako形状のserve設定だけを張り替え対象と見なす() {
