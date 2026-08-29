@@ -210,6 +210,25 @@ pub fn endpoint_from_state(
     None
 }
 
+/// serve の target 表現から到達先を復元する（純関数。#1049 の生死判定に使う）。
+/// `proxy_target_for` の逆写像で、解釈できない形は None（= 生死を問わない）
+pub fn endpoint_from_target(target: &str) -> Option<local_endpoint::Endpoint> {
+    if let Some(port) = target.strip_prefix("http://127.0.0.1:") {
+        return port
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .map(local_endpoint::Endpoint::Loopback);
+    }
+    if let Some(path) = target.strip_prefix("unix:") {
+        if path.is_empty() {
+            return None;
+        }
+        return Some(local_endpoint::Endpoint::Unix(path.into()));
+    }
+    None
+}
+
 /// `tailscale serve` のプロキシ先表現（エンドポイントの種別で決まる）
 pub fn proxy_target_for(endpoint: &local_endpoint::Endpoint) -> String {
     match endpoint {
@@ -221,6 +240,205 @@ pub fn proxy_target_for(endpoint: &local_endpoint::Endpoint) -> String {
 /// デーモンが serve 確立時に書き、`daemon_status` が接続リンクの再構成に使う
 pub fn url_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.url")
+}
+
+/// serve 設定の自己検査結果を残すファイル（#1049）。
+/// daemon が書き `daemon_status`（別プロセス）が読む。**pid / port / url と同じ
+/// 短命な稼働状態**なので #916 の移行台帳には載せない（次の起動で必ず作り直され、
+/// 読めなければ「自己検査の結果が無い」として扱えばよいだけ）
+pub fn serve_health_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.serve")
+}
+
+/// 自己検査の結果を読む（無い・壊れている = None）
+pub fn read_serve_health() -> Option<crate::remote_serve::ServeHealth> {
+    let raw = std::fs::read_to_string(serve_health_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// 自己検査の結果を書き出す（0600。中身に秘密は無いが state の他ファイルと揃える）
+fn write_serve_health(health: &crate::remote_serve::ServeHealth) {
+    if let Ok(json) = serde_json::to_string(health) {
+        let _ = write_secret_file(&serve_health_path(), &json);
+    }
+}
+
+/// serve の増減を audit.log へ残す（#1049: 「何が消したか」を後から追えるように）。
+/// pid と実行ファイルが載るので、世代違いの tako が犯人なら名指しできる
+fn audit_serve(event: &str, extra: serde_json::Value) {
+    crate::remote_auth::append_audit(
+        &crate::remote_auth::audit_log_path(&state_dir()),
+        event,
+        extra,
+    );
+}
+
+/// 実 tailscale を叩く [`crate::remote_serve::ServeOps`]。
+/// **どの tailscaled へ話すかを handle に固定する**のが #1049 の要点。
+/// 固定した相手が公開したノードのままかは毎周期確かめる（[`Self::refresh_handle`]）
+struct TailscaleServeOps {
+    handle: crate::tailscale::ServeHandle,
+    /// 公開中の ts.net ホスト名（handle の解決先の照合に使う）
+    host: String,
+}
+
+impl TailscaleServeOps {
+    /// 相手が公開したノードのままかを毎回確かめ、ずれていたら解決し直す。
+    ///
+    /// `--socket` で名指していても**その先のノード名が変わる**ことがある
+    /// （tailscaled のログインし直し・ノードの二重登録での改名。#1049 の実測では
+    /// `mac` と `mac-1` が入れ替わっていた）ので、固定済みでも確認を省かない。
+    /// 費用は 30 秒に `tailscale status --json` 1 回ぶん
+    fn refresh_handle(&mut self) -> Result<(), String> {
+        let st = crate::tailscale::setup_status_on(
+            Some(self.handle.cli.clone()),
+            self.handle.socket_arg(),
+        );
+        if st.daemon_running
+            && st
+                .dns_name
+                .as_deref()
+                .is_some_and(|n| crate::tailscale::host_eq(n, &self.host))
+        {
+            self.handle.node = st.dns_name;
+            return Ok(());
+        }
+        match crate::tailscale::resolve_serve_handle(Some(&self.host)) {
+            Ok(h) => {
+                if h != self.handle {
+                    audit_serve(
+                        "serve_node_switch",
+                        serde_json::json!({ "from": self.handle.describe(), "to": h.describe() }),
+                    );
+                    self.handle = h;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.describe()),
+        }
+    }
+}
+
+impl crate::remote_serve::ServeOps for TailscaleServeOps {
+    fn read_state(&mut self) -> Result<crate::tailscale::ServeState, String> {
+        crate::tailscale::serve_state_on(&self.handle.cli, self.handle.socket_arg())
+    }
+    fn assert_target(&mut self, target: &str) -> Result<(), String> {
+        crate::tailscale::serve_start_target_on(&self.handle.cli, self.handle.socket_arg(), target)
+    }
+    fn target_alive(&mut self, target: &str) -> bool {
+        endpoint_from_target(target).is_some_and(|ep| local_endpoint::probe_alive(&ep))
+    }
+    fn describe(&self) -> String {
+        self.handle.describe()
+    }
+    fn node(&self) -> Option<String> {
+        self.handle.node.clone()
+    }
+}
+
+/// unix epoch 秒（自己検査の時刻記録用）
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// serve 設定の自己検査ループ（#1049）。daemon の生存中だけ回る。
+/// 1 周期でやるのは「相手を確かめる → serve を読む → 必要なら張り直す →
+/// 結果を state と audit.log に残す」だけ
+fn serve_watch_loop(
+    shutdown: Arc<AtomicBool>,
+    handle: Arc<Mutex<crate::tailscale::ServeHandle>>,
+    target: String,
+    host: String,
+) {
+    use crate::remote_serve::{ServeWatch, WatchEvent};
+    let interval = crate::remote_serve::watch_interval();
+    let mut watch = ServeWatch::new(target.clone(), host.clone());
+    let step = std::time::Duration::from_millis(200);
+    // ノードを見失っている状態が続いているか（監査を毎周期積まないため）
+    let mut node_missing = false;
+    loop {
+        // 中断へ素早く反応するため細かく刻んで眠る
+        let mut slept = std::time::Duration::ZERO;
+        while slept < interval {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(step);
+            slept += step;
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let current = handle.lock().unwrap().clone();
+        let mut ops = TailscaleServeOps {
+            handle: current,
+            host: host.clone(),
+        };
+        // 相手が公開したノードのままか（ずれていれば解決し直す）
+        if let Err(reason) = ops.refresh_handle() {
+            write_serve_health(&crate::remote_serve::health_for_handle_error(
+                now_epoch_secs(),
+                &target,
+                &host,
+                &reason,
+            ));
+            // 状態は health ファイルが持つので、監査へは**落ちた瞬間だけ**書く
+            // （30 秒ごとに同じ行を積むと audit.log がローテートで流れてしまう）
+            if !node_missing {
+                node_missing = true;
+                audit_serve(
+                    "serve_node_missing",
+                    serde_json::json!({ "host": host, "reason": reason }),
+                );
+            }
+            continue;
+        }
+        node_missing = false;
+        let (health, event) = watch.tick(&mut ops, now_epoch_secs());
+        // 張り替わった相手を共有側へ反映する（終了時の後始末が同じ相手を見る）
+        *handle.lock().unwrap() = ops.handle.clone();
+        write_serve_health(&health);
+        let who = ops.handle.describe();
+        match event {
+            WatchEvent::Healthy => {}
+            WatchEvent::BudgetReset => audit_serve(
+                "serve_reassert_budget_reset",
+                serde_json::json!({ "handle": who }),
+            ),
+            WatchEvent::Reasserted { was } => {
+                eprintln!(
+                    "tailscale serve の設定が失われていたので張り直しました（{was} → {target}）"
+                );
+                audit_serve(
+                    "serve_reasserted",
+                    serde_json::json!({ "was": was, "target": target, "handle": who }),
+                );
+            }
+            WatchEvent::ReassertFailed { was, error } => audit_serve(
+                "serve_reassert_failed",
+                serde_json::json!({ "was": was, "target": target, "handle": who, "error": error }),
+            ),
+            WatchEvent::GaveUp { was } => audit_serve(
+                "serve_reassert_gave_up",
+                serde_json::json!({ "was": was, "target": target, "handle": who }),
+            ),
+            WatchEvent::LeftForeign { target: foreign } => audit_serve(
+                "serve_foreign",
+                serde_json::json!({ "actual": foreign, "handle": who }),
+            ),
+            WatchEvent::TakenOver { by } => audit_serve(
+                "serve_taken_over",
+                serde_json::json!({ "by": by, "target": target, "handle": who }),
+            ),
+            WatchEvent::CheckFailed { error } => {
+                audit_serve("serve_check_failed", serde_json::json!({ "error": error }))
+            }
+        }
+    }
 }
 
 /// 秘密を含むファイルを作成時から 0600 で書き込む。
@@ -282,6 +500,7 @@ fn cleanup_state_files() {
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(url_path());
     let _ = std::fs::remove_file(port_path());
+    let _ = std::fs::remove_file(serve_health_path());
     // QR ファイル（ランダム名）を掃除する
     let dir = state_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -969,7 +1188,9 @@ fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
 /// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自 socket を
 /// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する。
 /// 旧 TCP 形式（`http://127.0.0.1:*`）は tako の残骸と判定して自動移行する
-fn establish_tailscale_serve(endpoint: &local_endpoint::Endpoint) -> io::Result<(String, String)> {
+fn establish_tailscale_serve(
+    endpoint: &local_endpoint::Endpoint,
+) -> io::Result<(crate::tailscale::ServeHandle, String)> {
     let status = crate::tailscale::setup_status();
     if !status.ready() {
         return Err(setup_incomplete_error(&status));
@@ -982,10 +1203,22 @@ fn establish_tailscale_serve(endpoint: &local_endpoint::Endpoint) -> io::Result<
         .ts_net_url()
         .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
 
+    // どのノードで公開するかは #1038 の選択のまま。ここで**その相手を固定する**
+    // （#1049: 既定探索は tailscaled 側の都合で応答するノードが変わるので、
+    //  同じノードへ `--socket` で名指せるならそちらへ寄せる）
+    let handle = serve_handle_for(&host_of(&base_url), &cli, status.dns_name.clone());
+    let socket = handle.socket_arg().map(str::to_string);
+    let socket = socket.as_deref();
+
     let our_target = proxy_target_for(endpoint);
-    match crate::tailscale::serve_state(&cli).map_err(io::Error::other)? {
+    match crate::tailscale::serve_state_on(&cli, socket).map_err(io::Error::other)? {
         crate::tailscale::ServeState::NotConfigured => {
-            crate::tailscale::serve_start_target(&cli, &our_target).map_err(io::Error::other)?;
+            crate::tailscale::serve_start_target_on(&cli, socket, &our_target)
+                .map_err(io::Error::other)?;
+            audit_serve(
+                "serve_set",
+                serde_json::json!({ "target": our_target, "handle": handle.describe() }),
+            );
         }
         crate::tailscale::ServeState::Proxy(target) if target == our_target => {
             // 前回の設定が残っている（強制終了等）。同じ到達先なのでそのまま再利用する
@@ -997,8 +1230,17 @@ fn establish_tailscale_serve(endpoint: &local_endpoint::Endpoint) -> io::Result<
             eprintln!(
                 "以前の tako の serve 設定を検出しました（{target}）。{our_target} へ張り替えます…"
             );
-            crate::tailscale::serve_stop(&cli).map_err(io::Error::other)?;
-            crate::tailscale::serve_start_target(&cli, &our_target).map_err(io::Error::other)?;
+            crate::tailscale::serve_stop_on(&cli, socket).map_err(io::Error::other)?;
+            crate::tailscale::serve_start_target_on(&cli, socket, &our_target)
+                .map_err(io::Error::other)?;
+            audit_serve(
+                "serve_set",
+                serde_json::json!({
+                    "target": our_target,
+                    "replaced": target,
+                    "handle": handle.describe(),
+                }),
+            );
         }
         crate::tailscale::ServeState::Proxy(target) => {
             return Err(io::Error::other(format!(
@@ -1014,7 +1256,38 @@ fn establish_tailscale_serve(endpoint: &local_endpoint::Endpoint) -> io::Result<
             ));
         }
     }
-    Ok((cli, base_url))
+    Ok((handle, base_url))
+}
+
+/// `https://<host>` から host 部分を取り出す
+fn host_of(base_url: &str) -> String {
+    base_url
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .unwrap_or(base_url)
+        .to_string()
+}
+
+/// 公開したノードへ話しかける handle を解決する（#1049）。
+/// 解決できないときは**従来どおり選択中の系統**へ落として先へ進む
+/// （固定できないだけで、これまでと同じ動きになる = 悪化させない）
+fn serve_handle_for(host: &str, cli: &str, node: Option<String>) -> crate::tailscale::ServeHandle {
+    let fallback = || {
+        let selected = crate::tailscale::selected_variant();
+        crate::tailscale::ServeHandle {
+            cli: cli.to_string(),
+            socket: selected.socket_arg().map(str::to_string),
+            variant_key: selected.key(),
+            node: node.clone(),
+        }
+    };
+    if crate::remote_serve::legacy_mode() {
+        return fallback();
+    }
+    crate::tailscale::resolve_serve_handle(Some(host)).unwrap_or_else(|e| {
+        eprintln!("serve の相手を固定できませんでした（{}）", e.describe());
+        fallback()
+    })
 }
 
 /// serve 越しの自己疎通の結果（#1038: 「running を名乗るのに見れない」を無くす）
@@ -1167,12 +1440,23 @@ pub fn run_daemon() -> io::Result<()> {
     // ts CLI パスと fake base URL だけを用意する（本番 tailnet の serve 設定を壊さず、
     // UDS 直叩き + fake identity 注入で認証層を実測するため。#283 の実測方針）
     let test_mode = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1");
-    let (ts_cli, base_url) = if test_mode {
+    let (serve_handle, base_url) = if test_mode {
         let cli = crate::tailscale::find_tailscale().unwrap_or_else(|| "tailscale".to_string());
-        (cli, "http://tako-remote.test".to_string())
+        (
+            crate::tailscale::ServeHandle {
+                cli,
+                socket: None,
+                variant_key: "auto",
+                node: None,
+            },
+            "http://tako-remote.test".to_string(),
+        )
     } else {
         establish_tailscale_serve(&endpoint)?
     };
+    let ts_cli = serve_handle.cli.clone();
+    // 自己検査・後始末はこの handle を通す（#1049: 話しかける相手を固定する）
+    let serve_handle = Arc::new(Mutex::new(serve_handle));
 
     // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
     let token = crate::generate_token()?;
@@ -1240,8 +1524,12 @@ pub fn run_daemon() -> io::Result<()> {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
         // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
         if !test_mode {
-            let _ =
-                crate::tailscale::serve_stop_if_ours(&ts_cli, Some(&proxy_target_for(&endpoint)));
+            let handle = serve_handle.lock().unwrap().clone();
+            let _ = crate::tailscale::serve_stop_if_ours_on(
+                &handle.cli,
+                handle.socket_arg(),
+                Some(&proxy_target_for(&endpoint)),
+            );
         }
         cleanup_state_files();
         return Err(io::Error::other(format!(
@@ -1348,9 +1636,41 @@ pub fn run_daemon() -> io::Result<()> {
         // 起動を続けても全リクエストが 502 になるだけなので、理由と次の一手を出して止める
         let target = proxy_target_for(&endpoint);
         let advice = unreachable_advice(&endpoint, &target);
-        let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, Some(&target));
+        let handle = serve_handle.lock().unwrap().clone();
+        let _ = crate::tailscale::serve_stop_if_ours_on(
+            &handle.cli,
+            handle.socket_arg(),
+            Some(&target),
+        );
         cleanup_state_files();
         return Err(io::Error::other(advice));
+    }
+
+    // serve 設定の自己検査（#1049）: 起動後に消えても気づけるようにする。
+    // 起動時点の結果をまず書いてから、定期検査のスレッドを立てる
+    if !test_mode && !crate::remote_serve::legacy_mode() {
+        let target = proxy_target_for(&endpoint);
+        let host = host_of(&base_url);
+        let snapshot = serve_handle.lock().unwrap().clone();
+        write_serve_health(&crate::remote_serve::ServeHealth {
+            ok: true,
+            checked_at: now_epoch_secs(),
+            state: "ok".to_string(),
+            target: target.clone(),
+            actual: Some(target.clone()),
+            host: Some(host.clone()),
+            node: snapshot.node.clone(),
+            handle: Some(snapshot.describe()),
+            reasserts: 0,
+            reason: None,
+            next_step: None,
+        });
+        let shutdown_watch = shutdown.clone();
+        let handle_watch = serve_handle.clone();
+        std::thread::Builder::new()
+            .name("remote-serve-watch".into())
+            .spawn(move || serve_watch_loop(shutdown_watch, handle_watch, target, host))
+            .ok();
     }
 
     // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
@@ -1395,10 +1715,26 @@ pub fn run_daemon() -> io::Result<()> {
     // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
     // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
     if !test_mode {
-        if let Err(e) =
-            crate::tailscale::serve_stop_if_ours(&ts_cli, Some(&proxy_target_for(&endpoint)))
-        {
-            eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
+        // #1049: 後始末も**張った相手へ**話す。既定探索のまま解除すると、
+        // 相手が入れ替わっていたときに本物の設定が消し残る
+        let handle = serve_handle.lock().unwrap().clone();
+        match crate::tailscale::serve_stop_if_ours_on(
+            &handle.cli,
+            handle.socket_arg(),
+            Some(&proxy_target_for(&endpoint)),
+        ) {
+            Ok(true) => audit_serve(
+                "serve_off",
+                serde_json::json!({
+                    "target": proxy_target_for(&endpoint),
+                    "handle": handle.describe(),
+                    "cause": "daemon_exit",
+                }),
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
+            }
         }
     }
     cleanup_state_files();
@@ -1522,6 +1858,22 @@ pub fn daemon_status() -> Value {
     // 「動いているのに見れない」の一因になるので状態に出す
     let mut warnings: Vec<String> = Vec::new();
     if let Some(w) = crate::tailscale::coexistence_warning(&crate::tailscale::survey_variants()) {
+        warnings.push(w);
+    }
+    // serve 設定の自己検査の結果（#1049）。**`running: true` だけを名乗らせない**:
+    // プロセスが生きていることと、tailnet から見えることは別物
+    let health = read_serve_health();
+    let fields = crate::remote_serve::status_fields(
+        health.as_ref(),
+        now_epoch_secs(),
+        crate::remote_serve::watch_interval().as_secs(),
+    );
+    if let Some(obj) = fields.as_object() {
+        for (k, v) in obj {
+            status[k.clone()] = v.clone();
+        }
+    }
+    if let Some(w) = crate::remote_serve::degraded_warning(&fields) {
         warnings.push(w);
     }
     if !warnings.is_empty() {
@@ -1699,8 +2051,38 @@ fn cleanup_serve_leftover() {
     let Some(cli) = crate::tailscale::find_tailscale() else {
         return;
     };
-    let ours = current_endpoint().map(|e| proxy_target_for(&e));
-    let _ = crate::tailscale::serve_stop_if_ours(&cli, ours.as_deref());
+    let Some(ours) = current_endpoint().map(|e| proxy_target_for(&e)) else {
+        return;
+    };
+    // #1049: 公開していたノードへ話す。既定探索のまま解除すると、相手が
+    // 入れ替わっていたときに**本物の設定が消し残る**（そして次回起動の残骸になる）
+    let host = std::fs::read_to_string(url_path())
+        .ok()
+        .map(|u| host_of(u.trim()))
+        .filter(|h| !h.is_empty());
+    let handle = match host.as_deref() {
+        Some(h) => serve_handle_for(h, &cli, None),
+        None => crate::tailscale::ServeHandle {
+            cli: cli.clone(),
+            socket: crate::tailscale::selected_variant()
+                .socket_arg()
+                .map(str::to_string),
+            variant_key: crate::tailscale::selected_variant().key(),
+            node: None,
+        },
+    };
+    if let Ok(true) =
+        crate::tailscale::serve_stop_if_ours_on(&handle.cli, handle.socket_arg(), Some(&ours))
+    {
+        audit_serve(
+            "serve_off",
+            serde_json::json!({
+                "target": ours,
+                "handle": handle.describe(),
+                "cause": "stop_cleanup",
+            }),
+        );
+    }
 }
 
 fn daemon_stop_impl(force: bool) -> Result<Value, String> {
@@ -5101,6 +5483,44 @@ mod tests {
         assert_eq!((snap.cols, snap.rows), (93, 50));
         assert_eq!(snap.history(), ["hist1".to_string(), "hist2".to_string()]);
         assert_eq!(snap.screen(), ["line1".to_string(), "line2".to_string()]);
+    }
+
+    #[test]
+    fn endpoint_from_targetはserveのtargetを到達先へ戻す() {
+        use local_endpoint::Endpoint;
+        assert_eq!(
+            endpoint_from_target("http://127.0.0.1:51047"),
+            Some(Endpoint::Loopback(51047))
+        );
+        assert_eq!(
+            endpoint_from_target("unix:/tmp/tako-remote.sock"),
+            Some(Endpoint::Unix("/tmp/tako-remote.sock".into()))
+        );
+        // 生死を問えない形は None（= 張り合いの判定では「応答なし」に倒れない）
+        assert_eq!(endpoint_from_target("http://192.168.1.5:8080"), None);
+        assert_eq!(endpoint_from_target("http://127.0.0.1:0"), None);
+        assert_eq!(endpoint_from_target("unix:"), None);
+        assert_eq!(endpoint_from_target(""), None);
+        // proxy_target_for の逆写像であること
+        for ep in [
+            Endpoint::Loopback(1234),
+            Endpoint::Unix("/x/tako-remote.sock".into()),
+        ] {
+            assert_eq!(endpoint_from_target(&proxy_target_for(&ep)), Some(ep));
+        }
+    }
+
+    #[test]
+    fn host_ofはスキームと末尾スラッシュを落とす() {
+        assert_eq!(
+            host_of("https://mac.tail1234.ts.net"),
+            "mac.tail1234.ts.net"
+        );
+        assert_eq!(
+            host_of("https://mac.tail1234.ts.net/"),
+            "mac.tail1234.ts.net"
+        );
+        assert_eq!(host_of("mac.tail1234.ts.net"), "mac.tail1234.ts.net");
     }
 
     #[test]

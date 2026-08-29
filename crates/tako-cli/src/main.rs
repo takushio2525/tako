@@ -4158,6 +4158,18 @@ fn remote_stop(force: bool) -> Result<(), String> {
 /// 応答にトークンは含まれない（#283 で長寿命 bearer token を全廃）
 fn remote_status() -> Result<(), String> {
     let status = tako_control::remote::daemon_status();
+    // 劣化は JSON の中に埋もれさせない（#1049: 「running なのに見れない」を一目で分かる形に）
+    if let Some(d) = status.get("degraded") {
+        eprintln!(
+            "リモート公開が機能していません: {}",
+            d.get("reason").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        if let Some(next) = d.get("next_step").and_then(|v| v.as_str()) {
+            if !next.is_empty() {
+                eprintln!("  次の一手: {next}");
+            }
+        }
+    }
     println!("{}", pretty_json(&status));
     Ok(())
 }

@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -433,8 +433,6 @@ impl DeviceRegistry {
     /// AUDIT_LOG_MAX_BYTES を超えたら .1 へローテート（1 世代）
     pub fn audit(&self, event: &str, device_id: &str, device_name: &str, extra: Value) {
         let mut entry = json!({
-            "ts": now_epoch(),
-            "event": event,
             "device_id": device_id,
             "device_name": device_name,
         });
@@ -443,15 +441,40 @@ impl DeviceRegistry {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        rotate_if_needed(&self.audit_path);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.audit_path)
-        {
-            let _ = writeln!(f, "{entry}");
+        append_audit(&self.audit_path, event, entry);
+    }
+}
+
+/// 端末に紐づかない監査行を追記する（#1049: serve 設定の増減の記録）。
+///
+/// `DeviceRegistry` を開けない文脈（`tako remote stop` を打った CLI・GUI）からも
+/// 書けるように自由関数にしてある。**「誰が」を必ず載せる**のが目的:
+/// serve を消した犯人が世代違いの tako なのかを後から追えるようにする
+pub fn append_audit(path: &Path, event: &str, extra: Value) {
+    let mut entry = json!({
+        "ts": now_epoch(),
+        "event": event,
+        "pid": std::process::id(),
+        "exe": std::env::current_exe().unwrap_or_default().display().to_string(),
+    });
+    if let (Some(obj), Some(ex)) = (entry.as_object_mut(), extra.as_object()) {
+        for (k, v) in ex {
+            obj.insert(k.clone(), v.clone());
         }
     }
+    rotate_if_needed(path);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+/// state ディレクトリの audit.log のパス（`DeviceRegistry` と同じ場所）
+pub fn audit_log_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("audit.log")
 }
 
 /// audit.log が閾値を超えていたら .1 へ退避する

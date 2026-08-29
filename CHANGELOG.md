@@ -12,6 +12,22 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ### Fixed / 修正
 
+- **[修正] `tako remote` が「起動中」を名乗ったまま tailnet から見えなくなる問題を根治 (#1049)**
+  根因は serve 設定の消失ではなく、**tako が話しかける tailscaled（= ノード）が起動後に
+  入れ替わる**ことだった（実測: GUI 版 Tailscale の LocalAPI 発見ファイル
+  `/Library/Tailscale/ipnport` が作り直された瞬間に、CLI の既定探索の相手が standalone から
+  GUI 版へ切り替わり、serve を張ったノードとは**別のノード**を読んで `No serve config` に
+  見えていた。公開 URL 側が入れ替わると本当に到達不能になる）。daemon は serve を張った
+  相手を固定し、公開した URL のノード名と毎回照合して追従するようにした。後始末
+  （daemon 終了 / `tako remote stop`）も同じ相手を通るので、**本物の serve 設定を
+  消し残さない**。
+  Fixed `tako remote` reporting `running` while being unreachable from the tailnet. The
+  root cause was not a vanishing serve config but tako talking to a *different*
+  tailscaled: on macOS the CLI's default discovery switches between the sandboxed GUI
+  Tailscale and a standalone `tailscaled` whenever the GUI's LocalAPI discovery file is
+  recreated, so tako read (and cleaned up) serve on the wrong node. The daemon now pins
+  the tailscaled it published through and re-resolves it by node name.
+
 - **[修正] `tako remote` が全リクエスト 502 になる問題を根治: serve の中継先を
   ループバック TCP へ (#1038) (#971)**
   daemon の待ち受けを `127.0.0.1:<エフェメラルポート>` にし、`tailscale serve` の
@@ -28,6 +44,20 @@ change-type tag. Entries without a platform tag apply to every platform.
   `TAKO_REMOTE_ENDPOINT=unix` to keep the previous Unix-socket listener.
 
 ### Added / 追加
+
+- **[機能追加] serve 設定の定期自己検査と自動復旧 (#1049)**
+  daemon が 30 秒ごとに「serve が自分の到達先を向いているか」を確かめ、消えていれば
+  張り直す（上限 5 回。連続 10 回健全なら予算が戻る）。**生きている別プロセスが :443 を
+  持っていれば奪い返さず譲り**、ユーザーが自分で張った設定は触らない。直せないときは
+  `tako remote status` / MCP `tako_remote_status` が `serve_ok: false` と
+  `degraded`（理由 + 次の一手）を返す（`running` だけを名乗らない）。serve の増減は
+  `<state_dir>/audit.log` へ **pid と実行ファイルつき**で記録されるので、次に消えたときに
+  何が消したかを追える。A/B は `TAKO_1049_LEGACY=1`。
+  The remote daemon now re-checks its Tailscale Serve configuration every 30 seconds and
+  re-asserts it (bounded) when it disappears, never fighting a live peer and never
+  touching a user-owned serve config. `tako remote status` / `tako_remote_status` report
+  `serve_ok`, `serve_state` and a `degraded` reason with a next step, and every serve
+  change is recorded in `<state_dir>/audit.log` with the pid and executable that made it.
 
 - **[機能追加] `tako remote start` に起動時の自己疎通チェックを追加 (#1038)**
   serve を張った直後に ts.net URL へ 1 回だけ GET し、502（= 中継先へ届いていない）を

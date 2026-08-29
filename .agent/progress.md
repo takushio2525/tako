@@ -3837,3 +3837,35 @@
   （ts.net 経由で `/api/health` 200・PWA 200）+ 検出力 3 通りの回帰注入。**GUI 版構成での 200 とスマホ実機は未確認**
   （作業中に GUI 版アプリが終了され standalone のみの構成へ変わったため。修正前の 502 は記録済み）
 - 関連コミット: `301625f`（PR #1044）。#971 は実機未測のため open 維持でコメント、マトリクスは `Pending` 据え置き
+
+## 2026-08-29（#1049: remote が「起動中」を名乗ったまま tailnet から見えない問題を根治）
+- **根因は serve 設定の消失ではなく「話しかける tailscaled（= ノード）の入れ替わり」**。本番機で
+  現在進行形の再現を採取して確定した: GUI 版 Tailscale（システム拡張・`<host>-1` / 1.102.2）と
+  standalone `tailscaled`（`<host>` / 1.98.8）が同居し、**`/Library/Tailscale/ipnport` が
+  作り直された瞬間に CLI の既定探索の相手が standalone → GUI 版へ切り替わる**
+  （daemon 起動 19:45:38 → 発見ファイル再作成 20:14:56）。serve は standalone に**生きていた**
+  （`curl --resolve` で HTTP 200）のに、既定探索は GUI ノードを見るので `No serve config` に見え、
+  逆向きに振れると URL 側が別ノードになって**本当に到達不能**（`-1` 側は HTTP 000 を実測）。
+  Issue の観測（:443 だけ消える / 8443 は残る / UDS でも TCP でも起きる / ノード名が 2 回変わった）と全整合
+- 直したのは 4 つ: ①**ノードの固定** = `tailscale::resolve_serve_handle(公開ホスト)` で解決した
+  handle を通して読み書きし、`--socket` で名指せるならそちらへ寄せる。**固定済みでも毎周期
+  ノード名を照合**する（ログインし直しでノード名が変わるため）②**定期自己検査 + 自動 re-assert**
+  （既定 30 秒 / 上限 5 回 / 連続 10 回健全で予算回復）。**応答している相手からは奪い返さない**
+  （生きた別 daemon との :443 の奪い合いを構造的に作らない）/ ユーザー設定は触らない
+  ③**status / MCP に劣化を出す**（`serve_ok` / `serve_state` / `degraded{reason,next_step}`。
+  古い検査結果は `stale` として健全と言わない。`warnings` 経由で GUI カードにも届く）
+  ④**audit.log へ serve の増減を pid + 実行ファイルつきで記録**（`serve_set` / `serve_off` /
+  `serve_reasserted` / `serve_reassert_gave_up` / `serve_taken_over` / `serve_node_switch` /
+  `serve_node_missing`）= 次に消えたときに何が消したかを追える
+- 後始末（daemon 終了 / `tako remote stop`）も同じ handle を通すので**本物の設定を消し残さない**
+  （A/B で実測: 旧挙動は入れ替わり後の停止でノード A の設定が残る）
+- 検証: モックテスト `bash scripts/test-serve-watch.sh` **33 件全緑**（偽 tailscale CLI + 隔離 state で
+  実 daemon を走らせ、消える → **2 秒で検知・張り直し** / A/B `TAKO_1049_LEGACY=1` では復帰しない /
+  ユーザー設定は不可侵 / 生きた相手とは張り合わない / 上限 5 回で断念 / 系統の入れ替わり /
+  公開ノード消失。**本番の tailscale・serve・デーモンには触らない**）+ 単体 24 本 +
+  fmt / clippy(-D warnings) / `cargo test --workspace` 全緑 + Windows クロスチェック
+  エラー 0・**警告 12（2 件は remote.rs だが行はどちらも既存**: `shutdown_for_signal` / `start_time`）
+- **whois は系統をまたいでも解決する**（実測）ので認証経路は無関係 = 触っていない。
+  `verify_pid_identity` は実行ファイルの inode ではなく `ps -o args=` + etime を見るので
+  **バイナリ差し替え後の stop は落ちない**（Issue の原因候補 2 は成立しにくい）
+- 次: 本番 daemon を新バイナリで立て直しての実測（serve を手で消す → 復帰 → 200）
