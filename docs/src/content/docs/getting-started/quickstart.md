@@ -35,6 +35,11 @@ tako master
 
 **今いるペインで**、setup が生成した profile に応じて claude または codex が立ち上がります。これで準備完了です（専用タブで動かしたいときは `tako master --tab`）。
 
+<figure class="tako-shot">
+<img src="/img/gui-mode-starter.webp" alt="空のペインが「AI チームに任せる」「AI と 1 対 1 で話す」「コマンド入力へ」の 3 つのボタンに置き換わっている画面" />
+<figcaption>コマンドを覚えていなくても、かんたん表示（`tako ui-mode gui`）ならボタンから始められる</figcaption>
+</figure>
+
 ## ステップ 3: 日本語で頼む
 
 マスターに、やってほしいことをそのまま話しかけます。まずはプロジェクトを覚えてもらいましょう。
@@ -56,6 +61,11 @@ tako master
 │ └──────────────┴──────────────────────┘ │
 └─────────────────────────────────────────┘
 ```
+
+<figure class="tako-shot">
+<img src="/img/orchestration.webp" alt="master と worker 2 体が同じタブに並び、それぞれの進捗がヘッダに表示されている画面" />
+<figcaption>頼んだあとはこうなる。master が担当 AI を並べ、進み具合がそのまま画面に出る</figcaption>
+</figure>
 
 ## 次に読む
 

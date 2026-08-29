@@ -47,6 +47,11 @@ master が worker を起動すると、**同じタブの中でペインが分割
 
 気になる worker があれば、そのペインをクリックして直接会話に割り込むこともできます。「あ、その方針じゃなくてこっちで」と、現場に降りて口を出せるのは、画面がそこにあるからこそです。
 
+<figure class="tako-shot">
+<img src="/img/orchestration.webp" alt="左に master、右上下に worker 2 体が並び、master が各 worker への依頼内容と現状を説明している画面" />
+<figcaption>左が司令塔の master、右が担当の worker 2 体。誰が何をしているかが 1 画面で分かる</figcaption>
+</figure>
+
 ### 監視と回収まで自動で起きる
 
 worker を起動しっぱなしで放置しない、が tako の設計です。あなたが依頼を出すと、裏ではこんなことが自動で起きています。
@@ -56,6 +61,11 @@ worker を起動しっぱなしで放置しない、が tako の設計です。�
 - master は worker の**完了・入力待ち・消滅を自動で検知**し、結果を確認してあなたに報告、役目を終えたペインを片付ける
 
 あなたは最初の依頼と、最後の報告の確認だけ。途中経過は「見たければ見える」状態で流れていきます。
+
+<figure class="tako-shot tako-shot-narrow">
+<img src="/img/orch-panel-detail.webp" alt="右パネルの orch ビューに、master 1 体とその配下の worker 2 体がツリー表示されている" />
+<figcaption>右パネルの orch ビュー。master と worker の親子関係・稼働時間・コンテキスト使用率を俯瞰できる</figcaption>
+</figure>
 
 ### 品質は仕組みで作り込まれる
 

@@ -14,6 +14,11 @@ tako を使い始めるまでの手順を、前提知識がない方でも上か
 
 AI 連携を使わず「ただのターミナル」として使う場合は、手順 1〜2 だけで完了です。
 
+<figure class="tako-shot">
+<img src="/img/welcome-banner.webp" alt="tako の初回起動時に表示されるバナー。1. tako setup、2. tako master の 2 ステップと、それぞれの実行ボタンが並んでいる" />
+<figcaption>初回起動時のバナー。ここのボタンからそのまま `tako setup` と `tako master` を実行できる</figcaption>
+</figure>
+
 ## 事前に必要なもの
 
 | もの | 必須？ | 説明 |

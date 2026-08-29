@@ -29,6 +29,11 @@ tako の MCP サーバーは、**tako の中から起動されたこと**を環�
 
 そのため codex の登録には、転送する変数名の一覧（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE`）も一緒に書き込みます。**書くのは変数名だけで、トークンは設定ファイルに残りません。**ペインごとに違う値がそのまま届くので、「どのペインから呼ばれたか」もこれまでどおり解決されます。
 
+<figure class="tako-shot">
+<img src="/img/orchestration.webp" alt="AI がペインを分割して担当エージェントを並べ、それぞれの状態がヘッダに表示されている画面" />
+<figcaption>MCP 経由で AI がペインを分割し、担当エージェントを並べたところ。人がキーボードでできることは AI も同じ経路でできる</figcaption>
+</figure>
+
 ## 128 個の MCP ツール
 
 tako は **128 個**の MCP ツールを公開しています。全リストは [MCP ツール一覧](/guides/mcp-tools/)にあります。主なカテゴリ:

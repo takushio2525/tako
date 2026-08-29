@@ -27,6 +27,11 @@ tako 内のターミナルで `tako master` を実行すると、次のことが
 `tako master` は実行時のディレクトリに縛られません。ホームディレクトリからでも、どこか別のリポジトリの中からでも、master は登録済みの全プロジェクトにアクセスできます。
 :::
 
+<figure class="tako-shot">
+<img src="/img/orch-panel.webp" alt="master ペインと 2 つの worker ペイン、右パネルの orch ビューが同時に表示されている画面" />
+<figcaption>`tako master` を起動すると、あとは会話するだけ。worker の追加も監視も master がやる</figcaption>
+</figure>
+
 ## 話しかけ方 — 会話例
 
 ### まずはプロジェクトを覚えてもらう
@@ -58,6 +63,11 @@ master は worker を隣のペインに起動し、指示を渡し、完了を�
 > **master**: worker 1（バグ修正）は実行中、worker 2（誤字直し）は完了しています。結果は……
 
 worker が質問待ちで止まったときも master が気づいて伝えてくれます。worker のペインを直接クリックして、自分で答えても構いません。
+
+<figure class="tako-shot">
+<img src="/img/settings-profiles.webp" alt="設定画面のプロファイルタブ。master / solo の切り替え、エージェント・モデル・思考の深さ・アカウントの設定項目が並んでいる" />
+<figcaption>会話で頼めば master が設定してくれるが、画面（<kbd>Cmd</kbd>+<kbd>,</kbd> → プロファイル）から直接編集することもできる</figcaption>
+</figure>
 
 ### 設定も会話で変える
 
