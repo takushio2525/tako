@@ -3813,3 +3813,27 @@
 - 同根の位置ずれがあった `links::find_url_scheme`（ターミナルの URL 検出）も同時に修正
 - 検出力: 修正前は新テスト **10 本が FAILED**（text_edit 9 + links 1）+ ハイライト層 1 本
 - 関連コミット: PR（`Refs #1016`）
+
+## 2026-08-29（#1038 / #971: remote の中継先をループバック TCP へ寄せて全リクエスト 502 を根治）
+- `tailscale serve` の中継先を UDS 決め打ち → `127.0.0.1:<エフェメラルポート>` へ。**GUI 版 Tailscale
+  （システム拡張）はサンドボックスでどの unix socket も dial できない**（/tmp の 0777 でも 502 = 対照実験）。
+  同じ変更で Windows の unix target 非対応（#971）も原因が消える。`TAKO_REMOTE_ENDPOINT=unix` で互換 opt-in
+- 起動時の**自己疎通チェック**を追加（**502 だけ**を「中継先へ届かない」と断定し理由 + 次の一手を出して止める。
+  401 / 403 は「届いている」証拠 / ネットワーク不達では断定しない）。A/B は `TAKO_1038_LEGACY=1`、
+  502 経路の故障注入は `TAKO_1038_INJECT_UNREACHABLE=1`
+- **Tailscale 系統（GUI 版 / standalone）を決め打ちしない**: `tailscale --socket <path>` で指定できることを実測し、
+  1 つならそれ / 2 つあれば `tako remote setup` で選択 / 非対話は「現にノード実体として応答している方」+ 根拠を応答へ。
+  識別子は **`auto`**（`gui` は別名。tako が名指しできるのは standalone 側だけなので、standalone しか居ない機で
+  `gui` と報告すると嘘になる）。保存は `<state_dir>/tailscale-variant` に 1 語 = **#916 の指紋は動かない**。
+  CLI `--tailscale`・MCP は既存 `tako_remote_setup` の `answers.tailscale`（ツール数 142 のまま）
+- **副産物の実バグ**: 後始末が「tako 形状の target なら消す」判定だったため、TCP 化の結果
+  **古い daemon が遅れて終了すると稼働中 daemon の :443 設定まで消える**（= 自分で 502 を作る）状態だった。
+  後始末は完全一致だけに閉じた（起動時の張り替え判断は意図的に広いまま。役割の差をテストで固定）
+- **セキュリティ**: UDS がカーネルで強制していた「別 OS ユーザーは接続不能」は TCP では失われる（#841 の露出が
+  macOS にも及ぶ）。`.agent/threat-model-remote.md` にトレードオフ節を新設し、緩和（127.0.0.1 限定 /
+  エフェメラルポート / 管理 API は XFF 付きを常に拒否）と #841 への申し送りを明記。
+  **認証の回帰ゼロは実 HTTP 経路のテストで固定**（identity 無し 401 / evil Origin 403 / XFF 付き管理 API 401）
+- 検証: 全ゲート緑 + Windows クロスチェック **警告 12（全件が未変更ファイル由来）** + 実機 e2e
+  （ts.net 経由で `/api/health` 200・PWA 200）+ 検出力 3 通りの回帰注入。**GUI 版構成での 200 とスマホ実機は未確認**
+  （作業中に GUI 版アプリが終了され standalone のみの構成へ変わったため。修正前の 502 は記録済み）
+- 関連コミット: `301625f`（PR #1044）。#971 は実機未測のため open 維持でコメント、マトリクスは `Pending` 据え置き
