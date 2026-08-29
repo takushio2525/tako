@@ -421,10 +421,17 @@ pub fn is_reclaimable_target(target: &str, ours: Option<&str>) -> bool {
     if ours == Some(target) {
         return true;
     }
-    // tako が張る形は 2 つだけ: ループバック TCP と state_dir 配下の UDS。
-    // どちらも「自分の残骸」として回収してよい（#1038 の TCP 移行を含む）
-    target.starts_with("http://127.0.0.1:") || target.starts_with("unix:")
+    // tako が張る形は 2 つだけ:
+    // ① ループバック TCP（ポートは毎回変わるので前回のポートは自分の残骸）
+    // ② tako の socket ファイルを指す UDS（#1038 前の形。置き場が変わっていても拾う）
+    // **ユーザーが自分で張った unix: 設定は掴まない**（socket 名で絞る）
+    target.starts_with("http://127.0.0.1:")
+        || (target.starts_with("unix:") && target.ends_with(TAKO_SOCKET_FILE_NAME))
 }
+
+/// tako の remote デーモンが使う socket のファイル名（`remote::socket_path` の末尾）。
+/// serve 設定が「tako の残骸か」を名前で判定するために持つ
+const TAKO_SOCKET_FILE_NAME: &str = "tako-remote.sock";
 
 // --- Tailscale 系統（GUI 版 / standalone）の検出と選択（#1038）---------------
 //
@@ -445,7 +452,12 @@ const STANDALONE_SOCKET_CANDIDATES: &[&str] = &[
     "/var/run/tailscale/tailscaled.sock",
 ];
 
-/// どの tailscaled に話しかけるか
+/// どの tailscaled に話しかけるか。
+///
+/// **tako が明示的に指定できるのは standalone 側だけ**（`--socket <path>`）。
+/// GUI 版へ話しかける手段は「CLI の既定探索に任せる」ことなので、
+/// `Default` は「GUI 版があればそれ / 無ければ standalone」を意味する。
+/// 未選択を `gui` と名乗ると standalone しか無い機で嘘になるため、識別子は `auto`
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TailscaleVariant {
     /// CLI の既定探索に任せる。GUI 版が入っていればそれが応答する
@@ -467,7 +479,7 @@ impl TailscaleVariant {
     /// 設定ファイル / CLI 引数で使う短い識別子
     pub fn key(&self) -> &'static str {
         match self {
-            Self::Default => "gui",
+            Self::Default => "auto",
             Self::Standalone(_) => "standalone",
         }
     }
@@ -476,7 +488,7 @@ impl TailscaleVariant {
     pub fn describe(&self) -> String {
         match self {
             Self::Default => {
-                "GUI 版 / 既定探索（tailscale CLI が自動で見つける tailscaled）".into()
+                "既定探索（GUI 版アプリが入っていればそれ / 無ければ standalone）".into()
             }
             Self::Standalone(path) => format!("standalone tailscaled（--socket {path}）"),
         }
@@ -485,7 +497,7 @@ impl TailscaleVariant {
     /// 識別子から復元する。`standalone` は実在する socket を探して解決する
     pub fn parse(key: &str) -> Option<Self> {
         match key.trim().to_ascii_lowercase().as_str() {
-            "gui" | "default" | "app" => Some(Self::Default),
+            "auto" | "gui" | "default" | "app" => Some(Self::Default),
             "standalone" | "daemon" | "cli" => {
                 Some(Self::Standalone(standalone_socket_path()?.to_string()))
             }
@@ -533,6 +545,18 @@ pub fn save_variant(variant: &TailscaleVariant) -> Result<(), String> {
 /// 保存済みの選択を消す（自動判定へ戻す）
 pub fn clear_variant() {
     let _ = std::fs::remove_file(selection_path());
+}
+
+/// 状態表示用のラベル。選択済みならその識別子、未選択なら `auto`、
+/// `TAKO_TAILSCALE_SOCKET` による直接指定なら `override`
+pub fn selection_label() -> &'static str {
+    if std::env::var("TAKO_TAILSCALE_SOCKET").is_ok() {
+        return "override";
+    }
+    match saved_variant() {
+        Some(v) => v.key(),
+        None => "auto",
+    }
 }
 
 /// いま使う系統。優先順は 環境変数 → 保存済みの選択 → 既定探索。
@@ -712,7 +736,7 @@ pub fn coexistence_warning(survey: &VariantSurvey) -> Option<String> {
     let selected = selected_variant();
     Some(format!(
         "Tailscale が 2 系統同時に動いています（別ノードとして二重登録されます）:\n  - {}\n\
-         いま使っているのは {}。`tako remote setup --tailscale <gui|standalone>` で切り替えられます。",
+         いま使っているのは {}。`tako remote setup --tailscale <auto|standalone>` で切り替えられます。",
         lines.join("\n  - "),
         selected.describe()
     ))
@@ -1064,12 +1088,30 @@ mod tests {
         assert!(!is_reclaimable_target("http://192.168.1.5:8080", None));
         assert!(!is_reclaimable_target("https://example.com", None));
         assert!(!is_reclaimable_target("http://localhost:3000", None));
+        // ユーザーが自分で張った unix: 設定も掴まない（socket 名で絞る）
+        assert!(!is_reclaimable_target("unix:/srv/my-app.sock", None));
     }
 
     #[test]
     fn unix_targetの失敗にだけ追加ヒントが付く() {
         assert!(unix_target_hint("unix:/x.sock").contains("TAKO_REMOTE_ENDPOINT"));
         assert_eq!(unix_target_hint("http://127.0.0.1:1"), "");
+    }
+
+    #[test]
+    fn 既定探索の識別子はauto_で_guiは別名() {
+        // 「既定探索」を gui と名乗ると standalone しか無い機で嘘になる。
+        // ただしユーザーは「GUI 版を使う」と言うので別名として受理する
+        assert_eq!(TailscaleVariant::Default.key(), "auto");
+        assert_eq!(
+            TailscaleVariant::parse("gui"),
+            Some(TailscaleVariant::Default)
+        );
+        assert_eq!(
+            TailscaleVariant::parse("auto"),
+            Some(TailscaleVariant::Default)
+        );
+        assert!(!TailscaleVariant::Default.describe().starts_with("GUI 版"));
     }
 
     #[test]
@@ -1082,7 +1124,7 @@ mod tests {
             TailscaleVariant::parse("Default"),
             Some(TailscaleVariant::Default)
         );
-        assert_eq!(TailscaleVariant::Default.key(), "gui");
+        assert_eq!(TailscaleVariant::Default.key(), "auto");
         assert_eq!(TailscaleVariant::Default.socket_arg(), None);
         assert_eq!(
             TailscaleVariant::Standalone("/var/run/x.sock".into()).socket_arg(),

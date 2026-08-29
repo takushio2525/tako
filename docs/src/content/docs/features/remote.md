@@ -106,8 +106,9 @@ macOS の GUI 版 Tailscale（アプリ版）はサンドボックスの制約�
 A: 2 つは**別デーモン・別ノード**として動き、tailnet には別々の端末として登録されます
 （ノード名の末尾に `-1` が付くのはこれが原因です）。tako はどちらを使うか決め打ちせず、
 `tako remote setup` で選べます。選び直すときは
-`tako remote setup --tailscale gui`（アプリ版）または
-`tako remote setup --tailscale standalone`（自分で動かしている `tailscaled`）を実行してください。
+`tako remote setup --tailscale auto`（= `tailscale` コマンドが自動で見つける方。アプリ版が
+入っていればそれ）または `tako remote setup --tailscale standalone`
+（自分で動かしている `tailscaled` を名指し）を実行してください。
 いまどちらを使っているかは `tako remote status` の `tailscale_variant` に出ます。
 
 **Q: CT log にホスト名が載るのが気になる**

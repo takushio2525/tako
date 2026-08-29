@@ -69,8 +69,8 @@ pub fn variant_step_message(decision: &VariantDecision) -> String {
             msg.push_str(&format!("\n    - {c}"));
         }
         msg.push_str(
-            "\n  変更するには: tako remote setup --tailscale <gui|standalone>\
-             （MCP は tako_remote_setup の answers.tailscale）",
+            "\n  変更するには: tako remote setup --tailscale <auto|standalone>\
+             （auto = 既定探索 = GUI 版があればそれ。MCP は tako_remote_setup の answers.tailscale）",
         );
     }
     msg
@@ -124,7 +124,7 @@ pub fn decide_variant(explicit: Option<&str>) -> Result<VariantDecision, String>
     if let Some(key) = explicit.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let variant = tailscale::TailscaleVariant::parse(key).ok_or_else(|| {
             format!(
-                "Tailscale 系統の指定が不正です: {key}（gui | standalone）。\
+                "Tailscale 系統の指定が不正です: {key}（auto | gui | standalone）。\
                  standalone を選ぶには tailscaled の LocalAPI socket が必要です"
             )
         })?;

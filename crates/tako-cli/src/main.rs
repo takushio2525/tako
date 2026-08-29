@@ -1054,9 +1054,10 @@ enum RemoteCommand {
         /// 非対話パラメータを JSON で渡す（MCP / dispatch と同じ形式）
         #[arg(long)]
         answers: Option<String>,
-        /// 使う Tailscale 系統（gui = GUI 版アプリ / standalone = 自前の tailscaled）。
+        /// 使う Tailscale 系統。auto / gui = CLI の既定探索に任せる（GUI 版アプリが
+        /// 入っていればそれ）、standalone = 自前の tailscaled を --socket で名指しする。
         /// 省略時は検出結果から決める（2 系統が同居しているときだけ選択を聞く）
-        #[arg(long, value_name = "gui|standalone")]
+        #[arg(long, value_name = "auto|gui|standalone")]
         tailscale: Option<String>,
     },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）

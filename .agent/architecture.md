@@ -1968,5 +1968,5 @@ tako は**決め打ちしない**: 検出できた系統が 1 つならそれ、
 `tako remote setup` で選ばせる。非対話（`--yes` / MCP）では
 ①使える系統が 1 つならそれ ②複数なら**既定探索が応答している系統**
 （= OS が実体として扱っている方）を選び、**根拠と変更手段を応答に載せる**。
-選択は `<state_dir>/tailscale-variant` に 1 語（`gui` / `standalone`）で保存する
+選択は `<state_dir>/tailscale-variant` に 1 語（`auto` / `standalone`。`gui` は `auto` の別名）で保存する
 （構造体を持たないので #916 のスキーマ移行の対象にならない）。

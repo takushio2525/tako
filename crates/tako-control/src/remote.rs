@@ -1040,6 +1040,18 @@ pub fn classify_self_check(result: Result<u16, String>) -> ServeReachability {
     }
 }
 
+/// 自己疎通を測れなかったときの補足（純関数）。**起動は止めない**ので、
+/// 「何が測れなかったのか」だけを 1 行で添える。DNS が引けないのはこの Mac の
+/// 名前解決の問題で、スマホ側は Tailscale の DNS を使うため到達できることが多い
+pub fn unknown_self_check_note(reason: &str) -> String {
+    if reason.contains("lookup address") || reason.contains("dns") || reason.contains("DNS") {
+        "この Mac から ts.net 名を解決できなかったため疎通は未確認（MagicDNS が         この端末に適用されていない可能性。スマホ側は Tailscale の DNS を使うので         到達できることが多い）。確かめるには `tailscale status` の DNS 設定を見る"
+            .to_string()
+    } else {
+        "疎通を確認できなかったが、502（中継先へ届かない）ではないため起動は続行した".to_string()
+    }
+}
+
 /// backend へ届かなかったときの「理由 + 次の一手」。
 /// UDS を選んでいるときは、サンドボックス版 tailscaled の制約を名指しで説明する
 pub fn unreachable_advice(endpoint: &local_endpoint::Endpoint, target: &str) -> String {
@@ -1358,7 +1370,11 @@ pub fn run_daemon() -> io::Result<()> {
             info["self_check"] = json!({ "ok": true, "status": code });
         }
         Some(ServeReachability::Unknown(reason)) => {
-            info["self_check"] = json!({ "ok": false, "unknown": reason });
+            info["self_check"] = json!({
+                "ok": false,
+                "unknown": reason,
+                "note": unknown_self_check_note(reason),
+            });
         }
         Some(ServeReachability::BackendUnreachable) | None => {}
     }
@@ -1508,7 +1524,8 @@ pub fn daemon_status() -> Value {
     if !warnings.is_empty() {
         status["warnings"] = json!(warnings);
     }
-    status["tailscale_variant"] = json!(crate::tailscale::selected_variant().key());
+    // 未選択を "gui" と言わない（既定探索は GUI 版が無ければ standalone に当たる）
+    status["tailscale_variant"] = json!(crate::tailscale::selection_label());
     // 稼働中 serve の実行バイナリを可視化する（#432: どの世代の serve が
     // 動いているかを ps なしで確認できるようにする）
     if let Some(exe) = pid_info.exe.as_deref().filter(|e| !e.is_empty()) {
@@ -4608,6 +4625,17 @@ mod tests {
             classify_self_check(Err("timeout".into())),
             ServeReachability::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn 疎通を測れなかったときは起動を止めず理由を添える() {
+        let dns = unknown_self_check_note(
+            "io: failed to lookup address information: nodename nor servname provided",
+        );
+        assert!(dns.contains("MagicDNS"), "{dns}");
+        let other = unknown_self_check_note("timed out");
+        assert!(other.contains("502"), "{other}");
+        assert!(other.contains("起動は続行"), "{other}");
     }
 
     #[test]

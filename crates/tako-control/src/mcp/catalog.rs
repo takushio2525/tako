@@ -2073,7 +2073,10 @@ pub fn tools() -> Vec<Value> {
                             選んだ理由を tailscale_reason に返す）",
                         "properties": {
                             "yes": { "type": "boolean" },
-                            "tailscale": { "type": "string", "enum": ["gui", "standalone"] },
+                            "tailscale": {
+                                "type": "string",
+                                "enum": ["auto", "gui", "standalone"],
+                            },
                         },
                     },
                 },

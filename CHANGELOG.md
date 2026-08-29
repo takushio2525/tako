@@ -42,7 +42,7 @@ change-type tag. Entries without a platform tag apply to every platform.
   tako はどちらを使うか決め打ちせず、`tako remote setup` で選ばせる
   （非対話では「現にノード実体として応答している方」を選び根拠を返す）。
   選択は保存され、以後の `start` で使われる。切り替えは
-  `tako remote setup --tailscale <gui|standalone>` / MCP `tako_remote_setup` の
+  `tako remote setup --tailscale <auto|standalone>` / MCP `tako_remote_setup` の
   `answers.tailscale`、いまの状態は `tako remote status` の `tailscale_variant` と
   `warnings` で分かる。
   tako no longer hard-codes which Tailscale daemon to use when both the GUI app and a
