@@ -241,14 +241,21 @@ mod tests {
 
     #[test]
     fn 待ち受けていないループバックポートはprobeでfalse() {
-        // バインドして即 drop したポートは（通常）閉じている
-        let port = {
-            let (server, ep) = bind(&EndpointSpec::Loopback).expect("bind できる");
-            let p = ep.port().unwrap();
-            drop(server);
-            p
-        };
-        assert!(!probe_alive(&Endpoint::Loopback(port)));
+        // **解放したてのエフェメラルポートを使わない**: OS がすぐ再利用するので
+        // 並列テストや混んだ CI では「別の誰かが listen 中」になりうる（実際 CI で落ちた）。
+        // 特権ポートの 1 番なら非 root では bind できず、接続は拒否（またはタイムアウト）
+        // に落ちるので、どちらの経路でも false が返る
+        assert!(!probe_alive(&Endpoint::Loopback(1)));
+    }
+
+    #[test]
+    fn 存在しないudsパスはprobeでfalse() {
+        let missing = std::env::temp_dir().join(format!(
+            "tako-local-endpoint-absent-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert!(!probe_alive(&Endpoint::Unix(missing)));
     }
 
     #[test]
