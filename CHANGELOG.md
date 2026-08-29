@@ -45,6 +45,16 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ### Added / 追加
 
+- **[改善] 自己検査を持たない daemon の `serve_ok: null` に理由を添えた (#1049)**
+  tako を更新しても remote デーモンは動き続けるので、新しい CLI から見ると
+  `serve_ok` が無説明の `null` になっていた。`serve_state: "unchecked"` と
+  `serve_note`（理由 + 世代の見分け方 + 次の一手）を返す。**検査が無いだけで
+  「壊れている」とは言わない**ので `degraded` は付かない。
+  `tako remote status` now explains a `null` `serve_ok` (`serve_state: "unchecked"` plus a
+  note) instead of leaving it unexplained: the running daemon predates the self-check, or
+  `TAKO_1049_LEGACY=1` disabled it. It is not reported as `degraded`, because "not checked"
+  is not "broken".
+
 - **[機能追加] serve 設定の定期自己検査と自動復旧 (#1049)**
   daemon が 30 秒ごとに「serve が自分の到達先を向いているか」を確かめ、消えていれば
   張り直す（上限 5 回。連続 10 回健全なら予算が戻る）。**生きている別プロセスが :443 を
