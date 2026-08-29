@@ -3891,3 +3891,46 @@
   （検査していない ≠ 壊れている）
 - 検証: 単体 16 本 + モック `scripts/test-serve-watch.sh` **37 件全緑**（Test 2 に 3 検査追加）+
   fmt / clippy / `cargo test --workspace` 全緑 + Windows クロスチェック エラー 0・警告 12
+
+## 2026-08-29（#1009: ファイルツリーの git ステータス色分け + バッジ）
+- `tako-core::git_tree` 新設（分類・伝播・無視・symlink 読み替えの正本）。8 状態を色 + 2 色バッジで
+  区別（ステージ済み=緑 / 未ステージ=黄）・ディレクトリ伝播・走査コスト 188.9→35.4ms（81% 減）。
+  CLI `tako tree git-status` / MCP `git-status` action。symlink 起因の実バグ 2 件（色が出ない / 一覧二重）も同梱根治
+- 関連コミット: `f9aad2a`（PR #1037 squash merge）。実機ピクセル照合 + 検出力 A/B（revert で 6 テスト FAILED）
+- 次: ユーザーの実機目視（Issue #1009 open 維持）
+
+## 2026-08-29（#1040: SSH のネット断でペイン・タブ・リモートフォルダを失わず自動再接続）
+- 根因 = 切断ではなく tako 自身の「Enter でこのペインを閉じます」案内が連鎖クローズを誘発。
+  `tako-core::ssh_reconnect` 新設（バックオフ・上限・純関数）+ 回線復帰からゼロタッチ 2〜6 秒で復帰 +
+  フォルダ自動 live 化 + #966 pending 自動 push + `ssh_connect` に reconnecting / gave_up。
+  初回接続が必ず落ちる bind バグ（control dir 不在）も同梱根治。A/B は `TAKO_1040_LEGACY=1`
+- 関連コミット: `374ecbe`（PR #1050 squash merge）。Issue #1040 close 済み（テスター体感は次リリース後に追送）
+
+## 2026-08-29（#1042: アプリ内アップデートで Dock のピン留めが外れる問題を根治）
+- 機序 = `update_via_zip` が置き場を一瞬空にし `.bak` 削除でブックマーク解決先が消える（Dock ピンは
+  file URL ブックマーク・CNID 優先）。境界 B22 `platform::bundle_install` 新設 = contents-swap
+  （.app の inode ごと不変）/ swap / fresh / move-aside（警告つき）。`build-app.sh --install` も同形へ。
+  A/B 実測: 置き場が空だった瞬間 1000 回超 → 0 回。A/B は `TAKO_1042_LEGACY=1`
+- 関連コミット: `326921c`（PR #1046 squash merge）。Issue #1042 は報告者の実 Dock 確認待ちで open
+
+## 2026-08-29（#1043: Finder からターミナルペインへの D&D でパスを挿入）
+- 受け口（quote + Send 経路）は #21 から存在。効かなかった根因 = ドロップ先オーバーレイの生成条件が
+  内部ドラッグ専用の `drag_kind` に依存し、外部ドラッグではリスナーが描画ツリーに 1 枚も無かった。
+  純関数 `drop_overlay_kind` へ切り出し。合成 FileDrop（実ドロップと同一経路）でセルフテスト項目 136。
+  A/B は `TAKO_1043_LEGACY=1`
+- 関連コミット: `13fd38f`（PR #1045 squash merge）。実マウスの目視待ちで Issue #1043 open
+
+## 2026-08-29（#1048: セルフテスト項目 111 が実 5h 使用率 10% のとき確定失敗する問題を根治）
+- 番兵 10 の値衝突。判定を「claude 側メーターが動いたか」（`claude_meter_untouched`）+ 実行時に
+  衝突しない番兵の選択へ。衝突を強制した決定的 A/B（旧 = FAILED / 新 = OK）を恒久ユニット化。
+  テスト経路のみの変更で製品挙動は不変
+- 関連コミット: `6abdc0c`（PR #1052 squash merge）。Issue #1048 close 済み
+
+## 2026-08-29（運用: v0.8.0 安定版昇格 + Tailscale 二重稼働の解体 + 本番 remote 復旧）
+- v0.8.0 を安定版へ昇格（`gh release edit --prerelease=false --latest`。**`--promote` は -test.N
+  タグ専用**と実測）。Tailscale の GUI 版 / standalone 二重稼働（別ノード分裂）が remote 全 502 の
+  環境要因と特定 → GUI アプリ終了 + standalone へ系統固定（#1038 の保存機構）で
+  `https://macbook-pro.tail5ed162.ts.net` = 200 へ復旧。**GUI 版 Tailscale アプリは #1038 の
+  GUI 構成通し検証まで起動しない**（起動すると既定探索が入れ替わる）
+- master の watch は GUI 再起動を生き延びる設計と実証（#665 に記録・偽 WORKER_GONE の穴も同所）。
+  worker → master の Cross-Session 連絡は誤配達 2 件 → 禁止を worker プロンプト定型へ（#663）
