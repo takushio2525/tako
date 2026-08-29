@@ -71,6 +71,10 @@ use crate::remote_auth::{DeviceRegistry, DeviceRole, Identity};
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// interact idle session の定期スイープ間隔
 const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// 起動時の自己疎通チェック（#1038）の HTTP タイムアウト
+const SELF_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// 自己疎通チェックの待ち合わせに足す猶予（HTTP のタイムアウトより必ず後に諦める）
+const SELF_CHECK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// #445: TAKO_ISOLATED が有効かどうか。隔離モードでは他インスタンスの
 /// state ファイルを cleanup しない二重防御に使う
 fn is_isolated() -> bool {
@@ -85,7 +89,7 @@ fn is_isolated() -> bool {
 
 /// state ファイルの置き場所。`TAKO_REMOTE_STATE_DIR` で差し替え可能
 /// （検証用デーモンを本番デーモンと衝突させず並走させるため）
-fn state_dir() -> std::path::PathBuf {
+pub(crate) fn state_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("TAKO_REMOTE_STATE_DIR") {
         return std::path::PathBuf::from(dir);
     }
@@ -113,10 +117,105 @@ pub fn pid_path() -> std::path::PathBuf {
 pub fn token_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.token")
 }
-/// UDS ソケットのパス。daemon は TCP を listen せず、この socket のみで待ち受ける。
-/// Tailscale Serve は `unix:<path>` をバックエンドとして中継する（#287 P1-2）
+/// UDS ソケットのパス。`TAKO_REMOTE_ENDPOINT=unix` を選んだときだけ使う
+/// （既定はループバック TCP。#1038）
 pub fn socket_path() -> std::path::PathBuf {
     state_dir().join("tako-remote.sock")
+}
+/// ループバック TCP の待ち受けポートを記録するファイル。
+/// デーモンが bind 直後に書き、CLI / status がここから到達先を再構成する
+pub fn port_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.port")
+}
+
+/// 待ち受けの形を決める環境変数。既定（未指定）は loopback TCP
+pub const ENDPOINT_ENV: &str = "TAKO_REMOTE_ENDPOINT";
+
+/// `TAKO_REMOTE_ENDPOINT` の解釈（純関数）。
+///
+/// 既定をループバック TCP にしているのは、**どの tailscaled 変種でも dial できる
+/// 唯一の形**だから（#1038: macOS の GUI 版 Tailscale はサンドボックスなので
+/// unix socket を一切 dial できず全リクエストが 502 になる / #971: Windows の
+/// tailscale には unix socket の serve target が無い）。
+/// `unix` は「standalone tailscaled しか使わない」と分かっている環境向けの
+/// 互換 opt-in で、別 OS ユーザーからの到達をカーネルが遮断する強い分離を保つ
+pub fn parse_endpoint_spec(raw: Option<&str>) -> Result<local_endpoint::EndpointSpec, String> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("tcp") | Some("loopback") | Some("loopback-tcp") | Some("auto") => {
+            Ok(local_endpoint::EndpointSpec::Loopback)
+        }
+        Some("unix") | Some("uds") | Some("socket") => {
+            if !local_endpoint::unix_supported() {
+                return Err(format!(
+                    "{ENDPOINT_ENV}=unix はこの OS では使えません（Unix domain socket の\
+                     serve target が無いため）。指定を外すとループバック TCP で待ち受けます"
+                ));
+            }
+            Ok(local_endpoint::EndpointSpec::Unix(socket_path()))
+        }
+        Some(other) => Err(format!(
+            "{ENDPOINT_ENV} の値が不正です: {other}（tcp | unix）"
+        )),
+    }
+}
+
+/// #1038 前の挙動へ戻す A/B スイッチ（同一バイナリで旧経路を再現する）。
+/// 有効にすると待ち受けは UDS 固定になり、起動時の自己疎通チェックも行わない
+pub const LEGACY_ENV: &str = "TAKO_1038_LEGACY";
+/// 自己疎通チェックの故障注入（検証用）。有効にすると HTTP を打たずに
+/// 「backend へ届かない」を返す = 502 検出の経路を決定的に踏める
+pub const INJECT_UNREACHABLE_ENV: &str = "TAKO_1038_INJECT_UNREACHABLE";
+
+fn env_on(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1" || v == "true" || v == "on")
+}
+
+/// #1038 前の挙動を再現するか
+pub fn legacy_mode() -> bool {
+    env_on(LEGACY_ENV)
+}
+
+/// この環境で使う待ち受けの形
+pub fn endpoint_spec() -> Result<local_endpoint::EndpointSpec, String> {
+    if legacy_mode() {
+        // 旧挙動: UDS 固定（#287 P1-2 の形）
+        return parse_endpoint_spec(Some("unix"));
+    }
+    parse_endpoint_spec(std::env::var(ENDPOINT_ENV).ok().as_deref())
+}
+
+/// state ファイルから「稼働中デーモンの到達先」を復元する（純関数部は `endpoint_from_state`）。
+/// ポートファイルがあればループバック TCP、無ければ UDS（旧形式との互換）
+pub fn current_endpoint() -> Option<local_endpoint::Endpoint> {
+    let port = std::fs::read_to_string(port_path()).ok();
+    let sock = socket_path();
+    endpoint_from_state(port.as_deref(), &sock, sock.exists())
+}
+
+/// 到達先の復元（テスト可能な純関数）。
+/// 旧バージョンの daemon は port ファイルを書かないので、socket ファイルの実在で UDS と判定する
+pub fn endpoint_from_state(
+    port_file: Option<&str>,
+    socket: &std::path::Path,
+    socket_exists: bool,
+) -> Option<local_endpoint::Endpoint> {
+    if let Some(port) = port_file.and_then(|s| s.trim().parse::<u16>().ok()) {
+        if port > 0 {
+            return Some(local_endpoint::Endpoint::Loopback(port));
+        }
+    }
+    if socket_exists {
+        return Some(local_endpoint::Endpoint::Unix(socket.to_path_buf()));
+    }
+    None
+}
+
+/// `tailscale serve` のプロキシ先表現（エンドポイントの種別で決まる）
+pub fn proxy_target_for(endpoint: &local_endpoint::Endpoint) -> String {
+    match endpoint {
+        local_endpoint::Endpoint::Loopback(port) => crate::tailscale::proxy_target_for_port(*port),
+        local_endpoint::Endpoint::Unix(path) => crate::tailscale::proxy_target_for_socket(path),
+    }
 }
 /// 公開中の固定 ts.net URL を記録するファイル。
 /// デーモンが serve 確立時に書き、`daemon_status` が接続リンクの再構成に使う
@@ -182,8 +281,7 @@ fn cleanup_state_files() {
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_file(socket_path());
     let _ = std::fs::remove_file(url_path());
-    // 旧 port ファイルの掃除（UDS 移行前からのアップグレード）
-    let _ = std::fs::remove_file(state_dir().join("tako-remote.port"));
+    let _ = std::fs::remove_file(port_path());
     // QR ファイル（ランダム名）を掃除する
     let dir = state_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -871,7 +969,7 @@ fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
 /// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自 socket を
 /// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する。
 /// 旧 TCP 形式（`http://127.0.0.1:*`）は tako の残骸と判定して自動移行する
-fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, String)> {
+fn establish_tailscale_serve(endpoint: &local_endpoint::Endpoint) -> io::Result<(String, String)> {
     let status = crate::tailscale::setup_status();
     if !status.ready() {
         return Err(setup_incomplete_error(&status));
@@ -884,21 +982,23 @@ fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, Stri
         .ts_net_url()
         .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
 
-    let our_target = crate::tailscale::proxy_target_for_socket(sock);
+    let our_target = proxy_target_for(endpoint);
     match crate::tailscale::serve_state(&cli).map_err(io::Error::other)? {
         crate::tailscale::ServeState::NotConfigured => {
-            crate::tailscale::serve_start_unix(&cli, sock).map_err(io::Error::other)?;
+            crate::tailscale::serve_start_target(&cli, &our_target).map_err(io::Error::other)?;
         }
         crate::tailscale::ServeState::Proxy(target) if target == our_target => {
-            // 前回の設定が残っている（強制終了等）。同一 socket なのでそのまま再利用する
+            // 前回の設定が残っている（強制終了等）。同じ到達先なのでそのまま再利用する
         }
         crate::tailscale::ServeState::Proxy(ref target)
-            if target.starts_with("http://127.0.0.1:") =>
+            if crate::tailscale::is_reclaimable_target(target, Some(&our_target)) =>
         {
-            // 旧 TCP 形式の残骸 → UDS 形式へ自動移行
-            eprintln!("旧 TCP 形式の serve 設定を検出しました（{target}）。UDS 形式へ移行します…");
+            // tako 形状の残骸（旧 UDS / 前回のポート）→ 今回の到達先へ張り替える
+            eprintln!(
+                "以前の tako の serve 設定を検出しました（{target}）。{our_target} へ張り替えます…"
+            );
             crate::tailscale::serve_stop(&cli).map_err(io::Error::other)?;
-            crate::tailscale::serve_start_unix(&cli, sock).map_err(io::Error::other)?;
+            crate::tailscale::serve_start_target(&cli, &our_target).map_err(io::Error::other)?;
         }
         crate::tailscale::ServeState::Proxy(target) => {
             return Err(io::Error::other(format!(
@@ -917,6 +1017,75 @@ fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, Stri
     Ok((cli, base_url))
 }
 
+/// serve 越しの自己疎通の結果（#1038: 「running を名乗るのに見れない」を無くす）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeReachability {
+    /// serve が backend へ到達できた（認証で 401 / 403 が返るのは正常）
+    Reachable(u16),
+    /// serve は動いているが backend を dial できない（502）。
+    /// tailscaled が待ち受け先へ接続できていない = tako 側の設定ミスか
+    /// tailscaled の制約（サンドボックス版は unix socket を dial できない）
+    BackendUnreachable,
+    /// 疎通そのものを確かめられなかった（DNS・ネットワーク・タイムアウト）
+    Unknown(String),
+}
+
+/// 自己疎通の判定（テスト可能な純関数）。**502 だけを「backend へ届いていない」と断定する**。
+/// 401 / 403 / 404 は「serve は backend へ届いている」証拠なので正常扱いにする
+pub fn classify_self_check(result: Result<u16, String>) -> ServeReachability {
+    match result {
+        Ok(502) => ServeReachability::BackendUnreachable,
+        Ok(code) => ServeReachability::Reachable(code),
+        Err(e) => ServeReachability::Unknown(e),
+    }
+}
+
+/// backend へ届かなかったときの「理由 + 次の一手」。
+/// UDS を選んでいるときは、サンドボックス版 tailscaled の制約を名指しで説明する
+pub fn unreachable_advice(endpoint: &local_endpoint::Endpoint, target: &str) -> String {
+    let common = format!(
+        "tailscale serve は HTTPS:443 → {target} を向いていますが、tailscaled が\
+         その待ち受け先へ接続できていません（HTTP 502）。"
+    );
+    match endpoint {
+        local_endpoint::Endpoint::Unix(_) => format!(
+            "{common}\n\
+             macOS の GUI 版 Tailscale（Tailscale.app のシステム拡張）はサンドボックスのため\
+             **どの Unix domain socket も dial できません**（実測 #1038）。\n\
+             次の一手: `{ENDPOINT_ENV}=unix` の指定を外して `tako remote stop && tako remote start` を\
+             実行してください（既定のループバック TCP なら GUI 版でも通ります）。"
+        ),
+        local_endpoint::Endpoint::Loopback(port) => format!(
+            "{common}\n\
+             次の一手: 127.0.0.1:{port} に別のプロセスが割り込んでいないか\
+             （`tako remote status` の endpoint と `tailscale serve status` の向き先が一致するか）、\
+             `tailscale serve --https=443 off` で設定を消してから `tako remote start` をやり直してください。"
+        ),
+    }
+}
+
+/// ts.net URL へ 1 回だけ HTTP GET し、serve が backend へ到達できているかを見る。
+/// 認証は通らなくてよい（401 でも「届いている」証拠になる）ので資格情報は送らない
+fn probe_serve(base_url: &str, timeout: std::time::Duration) -> ServeReachability {
+    if env_on(INJECT_UNREACHABLE_ENV) {
+        // 故障注入: サンドボックス版 tailscaled に当たった状況を決定的に再現する
+        return ServeReachability::BackendUnreachable;
+    }
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .new_agent();
+    let url = format!("{}/api/health", base_url.trim_end_matches('/'));
+    let result = agent
+        .get(&url)
+        .header("User-Agent", "tako-remote-selfcheck")
+        .call()
+        .map(|r| r.status().as_u16())
+        .map_err(|e| e.to_string());
+    classify_self_check(result)
+}
+
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
@@ -926,30 +1095,43 @@ fn establish_tailscale_serve(sock: &std::path::Path) -> io::Result<(String, Stri
 /// XFF/XFH 偽装の攻撃経路が構造的に消滅する。
 /// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
 pub fn run_daemon() -> io::Result<()> {
-    let sock = socket_path();
-    // エンドポイントのパス長チェック（unix の sun_path 制約に由来）
-    if let Some(limit) = local_endpoint::path_byte_limit() {
-        let sock_bytes = sock.as_os_str().as_encoded_bytes().len();
-        if sock_bytes > limit {
-            return Err(io::Error::other(format!(
-                "socket パスが長すぎます（{sock_bytes} バイト、上限 {limit}）。\
-                 TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {}",
-                sock.display()
-            )));
+    // P0-3: state ディレクトリを 0700 で確保する（UDS の bind 先にもなる）
+    ensure_state_dir()?;
+    let spec = endpoint_spec().map_err(io::Error::other)?;
+    if let local_endpoint::EndpointSpec::Unix(ref sock) = spec {
+        // エンドポイントのパス長チェック（unix の sun_path 制約に由来）
+        if let Some(limit) = local_endpoint::path_byte_limit() {
+            let sock_bytes = sock.as_os_str().as_encoded_bytes().len();
+            if sock_bytes > limit {
+                return Err(io::Error::other(format!(
+                    "socket パスが長すぎます（{sock_bytes} バイト、上限 {limit}）。\
+                     TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {}",
+                    sock.display()
+                )));
+            }
+        }
+        // stale socket の回収: 既存ファイルがあれば接続試行で生死判定
+        if sock.exists() {
+            if local_endpoint::probe_alive(&local_endpoint::Endpoint::Unix(sock.clone())) {
+                return Err(io::Error::other(format!(
+                    "別の daemon が既にこの socket で稼働中です: {}",
+                    sock.display()
+                )));
+            }
+            // stale socket — unlink して起動続行
+            let _ = std::fs::remove_file(sock);
         }
     }
-    // stale socket の回収: 既存ファイルがあれば接続試行で生死判定
-    if sock.exists() {
-        if local_endpoint::probe_alive(&sock) {
-            return Err(io::Error::other(format!(
-                "別の daemon が既にこの socket で稼働中です: {}",
-                sock.display()
-            )));
-        }
-        // stale socket — unlink して起動続行
-        let _ = std::fs::remove_file(&sock);
+    let (server, endpoint) = local_endpoint::bind(&spec)?;
+    // 到達先を state ファイルへ残す（CLI / status がここから再構成する）。
+    // ループバック TCP はポートが毎回変わるので、これが唯一の手がかりになる
+    if let Some(port) = endpoint.port() {
+        write_secret_file(&port_path(), &port.to_string())
+            .map_err(|e| io::Error::other(format!("ポートファイルの書き出しに失敗: {e}")))?;
+    } else {
+        // UDS で起動したときに前回の TCP のポートファイルが残っていると誤解決する
+        let _ = std::fs::remove_file(port_path());
     }
-    let server = local_endpoint::bind(&sock)?;
 
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
@@ -974,14 +1156,11 @@ pub fn run_daemon() -> io::Result<()> {
         let cli = crate::tailscale::find_tailscale().unwrap_or_else(|| "tailscale".to_string());
         (cli, "http://tako-remote.test".to_string())
     } else {
-        establish_tailscale_serve(&sock)?
+        establish_tailscale_serve(&endpoint)?
     };
 
     // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
     let token = crate::generate_token()?;
-
-    // P0-3: state ディレクトリを 0700 で確保し、各ファイルを 0600 で書き出す
-    ensure_state_dir()?;
 
     // デバイスレジストリを開く（devices.json 破損時は黙って全失効させず起動を拒否する）
     let registry = DeviceRegistry::open(&state_dir()).map_err(io::Error::other)?;
@@ -1046,24 +1225,14 @@ pub fn run_daemon() -> io::Result<()> {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
         // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
         if !test_mode {
-            let _ = crate::tailscale::serve_stop_if_ours_unix(&ts_cli, &sock);
+            let _ =
+                crate::tailscale::serve_stop_if_ours(&ts_cli, Some(&proxy_target_for(&endpoint)));
         }
         cleanup_state_files();
         return Err(io::Error::other(format!(
             "URL ファイルの書き出しに失敗: {e}"
         )));
     }
-
-    // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
-    // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）。
-    // #283: URL に token は載せない（接続時の認証は機器ペアリングが行う）
-    let info = json!({
-        "running": true,
-        "socket": sock.display().to_string(),
-        "url": base_url,
-        "transport": "tailscale-serve",
-    });
-    println!("{info}");
 
     // CORS 許可 origin を設定（#287 P1: `*` 廃止 → base_url のみエコー）
     CORS_ALLOWED_ORIGIN
@@ -1110,24 +1279,95 @@ pub fn run_daemon() -> io::Result<()> {
             .ok();
     }
 
+    // リクエスト 1 件の処理（自己疎通チェック中と本ループで同じ経路を通す）
+    let dispatch_one = |request: tiny_http::Request| {
+        let path = request.url().split('?').next().unwrap_or("");
+        if path == "/ws" && is_ws_upgrade(&request) {
+            handle_ws_v2(
+                request,
+                &ctx,
+                shutdown.clone(),
+                broadcasters.clone(),
+                &app_conn,
+                &pane_mapping,
+            );
+        } else {
+            handle_request_v2(request, &ctx, &app_conn, &pane_mapping, &broadcasters);
+        }
+    };
+
+    // 自己疎通チェック（#1038）: serve が本当に backend へ届いているかを実測する。
+    // 「running を名乗るのに 502 で見れない」を起動時に検出するのが目的。
+    // チェック中のリクエストは通常どおり処理する必要があるので、別スレッドから
+    // GET しつつこちらは accept ループを回す（daemon は既に応答可能な状態）
+    let self_check = if test_mode || legacy_mode() {
+        None
+    } else {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_url = base_url.clone();
+        std::thread::Builder::new()
+            .name("remote-self-check".into())
+            .spawn(move || {
+                let _ = tx.send(probe_serve(&probe_url, SELF_CHECK_TIMEOUT));
+            })?;
+        let deadline = std::time::Instant::now() + SELF_CHECK_TIMEOUT + SELF_CHECK_GRACE;
+        let outcome = loop {
+            match rx.try_recv() {
+                Ok(v) => break v,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break ServeReachability::Unknown("自己疎通チェックが中断された".into())
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break ServeReachability::Unknown("自己疎通チェックがタイムアウトした".into());
+            }
+            if let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_millis(50)) {
+                dispatch_one(request);
+            }
+        };
+        Some(outcome)
+    };
+
+    if let Some(ServeReachability::BackendUnreachable) = self_check {
+        // 起動を続けても全リクエストが 502 になるだけなので、理由と次の一手を出して止める
+        let target = proxy_target_for(&endpoint);
+        let advice = unreachable_advice(&endpoint, &target);
+        let _ = crate::tailscale::serve_stop_if_ours(&ts_cli, Some(&target));
+        cleanup_state_files();
+        return Err(io::Error::other(advice));
+    }
+
+    // 起動情報を JSON で stdout に出力（start コマンドが読み取る）。
+    // 接続リンクは恒久固定の ts.net URL（tailnet 内限定・WireGuard E2E 暗号化）。
+    // #283: URL に token は載せない（接続時の認証は機器ペアリングが行う）
+    let mut info = json!({
+        "running": true,
+        "endpoint": endpoint.describe(),
+        "endpoint_kind": endpoint.kind_str(),
+        "serve_target": proxy_target_for(&endpoint),
+        "url": base_url,
+        "transport": "tailscale-serve",
+    });
+    if let Some(path) = endpoint.socket_path() {
+        // 後方互換: 以前の起動情報は socket パスを載せていた
+        info["socket"] = json!(path.display().to_string());
+    }
+    match &self_check {
+        Some(ServeReachability::Reachable(code)) => {
+            info["self_check"] = json!({ "ok": true, "status": code });
+        }
+        Some(ServeReachability::Unknown(reason)) => {
+            info["self_check"] = json!({ "ok": false, "unknown": reason });
+        }
+        Some(ServeReachability::BackendUnreachable) | None => {}
+    }
+    println!("{info}");
+
     // HTTP サーバーループ
     while !shutdown.load(Ordering::Relaxed) {
         match server.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(Some(request)) => {
-                let path = request.url().split('?').next().unwrap_or("");
-                if path == "/ws" && is_ws_upgrade(&request) {
-                    handle_ws_v2(
-                        request,
-                        &ctx,
-                        shutdown.clone(),
-                        broadcasters.clone(),
-                        &app_conn,
-                        &pane_mapping,
-                    );
-                } else {
-                    handle_request_v2(request, &ctx, &app_conn, &pane_mapping, &broadcasters);
-                }
-            }
+            Ok(Some(request)) => dispatch_one(request),
             Ok(None) => {}
             Err(_) => break,
         }
@@ -1136,7 +1376,9 @@ pub fn run_daemon() -> io::Result<()> {
     // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
     // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
     if !test_mode {
-        if let Err(e) = crate::tailscale::serve_stop_if_ours_unix(&ts_cli, &sock) {
+        if let Err(e) =
+            crate::tailscale::serve_stop_if_ours(&ts_cli, Some(&proxy_target_for(&endpoint)))
+        {
             eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
         }
     }
@@ -1243,13 +1485,30 @@ pub fn daemon_status() -> Value {
     let devices = DeviceRegistry::open(&state_dir())
         .ok()
         .map(|reg| reg.devices().len());
+    let endpoint = current_endpoint();
     let mut status = json!({
         "running": true,
         "pid": pid_num,
-        "socket": socket_path().display().to_string(),
         "url": base_url,
         "transport": "tailscale-serve",
+        "endpoint": endpoint.as_ref().map(|e| e.describe()),
+        "endpoint_kind": endpoint.as_ref().map(|e| e.kind_str()),
+        "serve_target": endpoint.as_ref().map(proxy_target_for),
     });
+    // 後方互換: 以前の status は常に socket パスを載せていた（UDS のときだけ意味がある）
+    if let Some(path) = endpoint.as_ref().and_then(|e| e.socket_path()) {
+        status["socket"] = json!(path.display().to_string());
+    }
+    // Tailscale が 2 系統同時に動いていると別ノードとして二重登録される（#1038）。
+    // 「動いているのに見れない」の一因になるので状態に出す
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(w) = crate::tailscale::coexistence_warning(&crate::tailscale::survey_variants()) {
+        warnings.push(w);
+    }
+    if !warnings.is_empty() {
+        status["warnings"] = json!(warnings);
+    }
+    status["tailscale_variant"] = json!(crate::tailscale::selected_variant().key());
     // 稼働中 serve の実行バイナリを可視化する（#432: どの世代の serve が
     // 動いているかを ps なしで確認できるようにする）
     if let Some(exe) = pid_info.exe.as_deref().filter(|e| !e.is_empty()) {
@@ -1420,23 +1679,23 @@ fn cleanup_serve_leftover() {
     let Some(cli) = crate::tailscale::find_tailscale() else {
         return;
     };
-    let _ = crate::tailscale::serve_stop_if_ours_unix(&cli, &socket_path());
+    let ours = current_endpoint().map(|e| proxy_target_for(&e));
+    let _ = crate::tailscale::serve_stop_if_ours(&cli, ours.as_deref());
 }
 
 fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
         Err(_) => {
-            // PID ファイルが無い → socket 接続で stale daemon を探す
-            let sock = socket_path();
-            if sock.exists() {
+            // PID ファイルが無い → 記録された到達先へ繋いで stale daemon を探す
+            if let Some(ep) = current_endpoint() {
                 // 到達可能かどうかだけで stale を判定する。応答が返らない場合に
-                // socket を消すと、生きている daemon を到達不能にしてしまう
-                if local_endpoint::probe_alive(&sock) {
+                // state を消すと、生きている daemon を到達不能にしてしまう
+                if local_endpoint::probe_alive(&ep) {
                     // 生きた daemon がいる → health を叩いて pid を取得
                     let req =
                         "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                    if let Ok(resp) = local_endpoint::request_raw(&sock, req, None) {
+                    if let Ok(resp) = local_endpoint::request_raw(&ep, req, None) {
                         if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
                             if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
                                 if let Some(pid) = v["pid"].as_u64() {
@@ -1451,8 +1710,11 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
                         }
                     }
                 } else {
-                    // stale socket — unlink
-                    let _ = std::fs::remove_file(&sock);
+                    // stale な到達先 — 記録を消す（UDS はファイル、TCP はポート記録）
+                    if let Some(p) = ep.socket_path() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    let _ = std::fs::remove_file(port_path());
                 }
             }
             return Err("リモートサーバーが起動していない（PID ファイルが無い）".to_string());
@@ -1578,20 +1840,22 @@ pub fn spawn_daemon() -> Result<Value, String> {
         return Err("リモートサーバーは既に起動中".to_string());
     }
 
-    // stale socket の回収（PID ファイル消失 + プロセス死亡で socket だけ残るケース）
-    let sock = socket_path();
-    if sock.exists() {
-        if local_endpoint::probe_alive(&sock) {
+    // stale な待ち受けの回収（PID ファイル消失 + プロセス死亡で state だけ残るケース）
+    if let Some(ep) = current_endpoint() {
+        if local_endpoint::probe_alive(&ep) {
             return Err(format!(
-                "別の daemon が既にこの socket で稼働中です: {}",
-                sock.display()
+                "別の daemon が既にこの待ち受けで稼働中です: {}",
+                ep.describe()
             ));
         }
         eprintln!(
-            "stale socket を検出しました。自動回収します: {}",
-            sock.display()
+            "stale な待ち受けを検出しました。自動回収します: {}",
+            ep.describe()
         );
-        let _ = std::fs::remove_file(&sock);
+        if let Some(p) = ep.socket_path() {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(port_path());
     }
 
     let tako_bin = serve_binary();
@@ -1821,7 +2085,8 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
     if status["running"].as_bool() != Some(true) {
         return Err("リモートサーバーが起動していない".to_string());
     }
-    let sock = socket_path();
+    let endpoint = current_endpoint()
+        .ok_or("リモートサーバーの待ち受け先を特定できない（state ファイルが無い）")?;
     let token = std::fs::read_to_string(token_path())
         .map_err(|e| format!("管理トークンの読み取りに失敗: {e}"))?
         .trim()
@@ -1834,9 +2099,12 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
         body_str.len()
     );
 
-    let response =
-        local_endpoint::request_raw(&sock, &request, Some(std::time::Duration::from_secs(10)))
-            .map_err(|e| format!("daemon との通信に失敗 ({}): {e}", sock.display()))?;
+    let response = local_endpoint::request_raw(
+        &endpoint,
+        &request,
+        Some(std::time::Duration::from_secs(10)),
+    )
+    .map_err(|e| format!("daemon との通信に失敗 ({}): {e}", endpoint.describe()))?;
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
@@ -4246,6 +4514,206 @@ mod tests {
     /// ps 起動が失敗して検証素通り → daemon_stop_impl が自プロセスへ SIGTERM を送り
     /// テスト全体が死ぬ（実測）。env var を触るテストはこのロックで直列化する
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // --- #1038: ループバック TCP の待ち受けと自己疎通チェック -------------------
+
+    #[test]
+    fn 待ち受けの既定はループバックtcp() {
+        // 既定（未指定 / 空）はループバック TCP。どの tailscaled 変種でも dial できる形
+        for raw in [None, Some(""), Some("tcp"), Some("loopback"), Some("auto")] {
+            assert_eq!(
+                parse_endpoint_spec(raw).unwrap(),
+                local_endpoint::EndpointSpec::Loopback,
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unixは明示したときだけ選ばれる() {
+        let spec = parse_endpoint_spec(Some("unix"));
+        if local_endpoint::unix_supported() {
+            assert!(matches!(
+                spec.unwrap(),
+                local_endpoint::EndpointSpec::Unix(_)
+            ));
+        } else {
+            // unix socket を持たない OS では理由と次の一手を返す
+            let e = spec.unwrap_err();
+            assert!(e.contains("ループバック TCP"), "{e}");
+        }
+    }
+
+    #[test]
+    fn 待ち受け指定の不正値は理由つきで拒否される() {
+        let e = parse_endpoint_spec(Some("http")).unwrap_err();
+        assert!(e.contains("tcp"), "{e}");
+        assert!(e.contains("unix"), "{e}");
+    }
+
+    #[test]
+    fn 到達先はポートファイル優先で復元される() {
+        let sock = std::path::Path::new("/tmp/tako-test.sock");
+        // ポートファイルがあれば TCP
+        assert_eq!(
+            endpoint_from_state(Some("54321\n"), sock, true),
+            Some(local_endpoint::Endpoint::Loopback(54321))
+        );
+        // ポートファイルが無ければ UDS（旧バージョンの daemon との互換）
+        assert_eq!(
+            endpoint_from_state(None, sock, true),
+            Some(local_endpoint::Endpoint::Unix(sock.to_path_buf()))
+        );
+        // どちらも無ければ「稼働していない」
+        assert_eq!(endpoint_from_state(None, sock, false), None);
+        // 壊れたポートファイルは socket へフォールバックする
+        assert_eq!(
+            endpoint_from_state(Some("なにか"), sock, true),
+            Some(local_endpoint::Endpoint::Unix(sock.to_path_buf()))
+        );
+        assert_eq!(endpoint_from_state(Some("0"), sock, false), None);
+    }
+
+    #[test]
+    fn serveのプロキシ先は待ち受けの形で決まる() {
+        assert_eq!(
+            proxy_target_for(&local_endpoint::Endpoint::Loopback(18080)),
+            "http://127.0.0.1:18080"
+        );
+        assert_eq!(
+            proxy_target_for(&local_endpoint::Endpoint::Unix(std::path::PathBuf::from(
+                "/tmp/a.sock"
+            ))),
+            "unix:/tmp/a.sock"
+        );
+    }
+
+    #[test]
+    fn 自己疎通は502だけをbackend未到達と断定する() {
+        // 502 = serve は動いているが backend を dial できていない
+        assert_eq!(
+            classify_self_check(Ok(502)),
+            ServeReachability::BackendUnreachable
+        );
+        // 401 / 403 / 404 は「serve が backend へ届いている」証拠なので正常扱い
+        for code in [200, 401, 403, 404, 500] {
+            assert_eq!(
+                classify_self_check(Ok(code)),
+                ServeReachability::Reachable(code),
+                "code={code}"
+            );
+        }
+        // 疎通そのものが測れないときは断定しない（起動は止めない）
+        assert!(matches!(
+            classify_self_check(Err("timeout".into())),
+            ServeReachability::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn backend未到達の説明は理由と次の一手を持つ() {
+        // UDS を選んでいるときはサンドボックス版 tailscaled の制約を名指しする
+        let uds = unreachable_advice(
+            &local_endpoint::Endpoint::Unix(std::path::PathBuf::from("/tmp/a.sock")),
+            "unix:/tmp/a.sock",
+        );
+        assert!(uds.contains("502"), "{uds}");
+        assert!(uds.contains("Unix domain socket"), "{uds}");
+        assert!(uds.contains(ENDPOINT_ENV), "{uds}");
+        assert!(uds.contains("tako remote start"), "{uds}");
+        // TCP のときはポートの取り合いと serve の張り直しを案内する
+        let tcp = unreachable_advice(
+            &local_endpoint::Endpoint::Loopback(18080),
+            "http://127.0.0.1:18080",
+        );
+        assert!(tcp.contains("502"), "{tcp}");
+        assert!(tcp.contains("127.0.0.1:18080"), "{tcp}");
+        assert!(tcp.contains("tako remote start"), "{tcp}");
+    }
+
+    /// #1038: 待ち受けを TCP にしても認証層は同じに効くことを、**実際の HTTP 経路**で固定する。
+    /// UDS の「同一ユーザーしか繋げない」がカーネル任せでなくなるぶん、
+    /// ヘッダ由来の認証（層① identity / Origin / 管理トークン）が抜けないことが要になる
+    #[test]
+    fn ループバックtcpでも認証とorigin検証は同じに効く() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1038-auth-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let registry = DeviceRegistry::open(&dir).expect("レジストリ");
+        let ctx = Arc::new(DaemonCtx {
+            registry: Mutex::new(registry),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-1038".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+        });
+        let (server, endpoint) =
+            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
+        let app_conn = Arc::new(RwLock::new(AppConnection::new()));
+        let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
+        let broadcasters = new_broadcaster_map();
+
+        // 3 リクエストだけ捌くサーバースレッド
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                match server.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Some(req)) => {
+                        handle_request_v2(req, &ctx, &app_conn, &pane_mapping, &broadcasters)
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let status_of = |raw: &str| -> u16 {
+            let resp = local_endpoint::request_raw(
+                &endpoint,
+                raw,
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .expect("応答");
+            resp.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .expect("ステータス行")
+        };
+
+        // ① tailnet identity が無い（= serve を経由していない直結）→ 401
+        assert_eq!(
+            status_of("GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            401,
+            "identity 無しは 401 のまま（UDS でも TCP でも）"
+        );
+        // ② evil origin は認証より手前で 403（#287 P1）
+        assert_eq!(
+            status_of(
+                "GET /api/health HTTP/1.1\r\nHost: localhost\r\n\
+                 Origin: https://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+            403,
+            "cross-origin は 403 のまま"
+        );
+        // ③ 管理 API は serve 経由（XFF あり）だと管理トークンが正しくても拒否する。
+        //    ループバック TCP は同一マシンの別プロセスからも繋がるので、この拒否が要
+        assert_eq!(
+            status_of(
+                "GET /api/admin/state HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Tako-Admin: test-admin-token\r\nX-Forwarded-For: 100.64.0.9\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+            401,
+            "XFF が付いた管理 API は拒否する"
+        );
+
+        handle.join().expect("サーバースレッド");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn extract_pane_targetからidを取り出せる() {

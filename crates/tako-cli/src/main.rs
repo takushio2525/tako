@@ -1054,6 +1054,10 @@ enum RemoteCommand {
         /// 非対話パラメータを JSON で渡す（MCP / dispatch と同じ形式）
         #[arg(long)]
         answers: Option<String>,
+        /// 使う Tailscale 系統（gui = GUI 版アプリ / standalone = 自前の tailscaled）。
+        /// 省略時は検出結果から決める（2 系統が同居しているときだけ選択を聞く）
+        #[arg(long, value_name = "gui|standalone")]
+        tailscale: Option<String>,
     },
     /// [内部用] HTTP サーバーをフォアグラウンドで起動する（start から自動呼び出し）
     Serve,
@@ -3102,9 +3106,11 @@ fn cli_main() -> ExitCode {
             remote_scrollback(&pane_id, lines)
         }
         Command::Remote(RemoteCommand::Devices { command }) => remote_devices(command),
-        Command::Remote(RemoteCommand::Setup { yes, answers }) => {
-            remote_setup_cli(yes, answers.as_deref())
-        }
+        Command::Remote(RemoteCommand::Setup {
+            yes,
+            answers,
+            tailscale,
+        }) => remote_setup_cli(yes, answers.as_deref(), tailscale.as_deref()),
         // テレメトリもローカル処理（IPC 不要。設定ファイルの読み書きのみ）
         Command::Telemetry(ref sub) => telemetry_local(sub),
         // FDA チェックはローカル処理（IPC 不要。ファイルシステムのみ）
@@ -4153,18 +4159,25 @@ fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
 }
 
 /// `tako remote setup` — Tailscale リモートセットアップウィザード
-fn remote_setup_cli(yes: bool, answers_json: Option<&str>) -> Result<(), String> {
+fn remote_setup_cli(
+    yes: bool,
+    answers_json: Option<&str>,
+    tailscale: Option<&str>,
+) -> Result<(), String> {
     if let Some(json_str) = answers_json {
         let mut answers: tako_control::remote_setup::RemoteSetupAnswers =
             serde_json::from_str(json_str).map_err(|e| format!("answers JSON が不正: {e}"))?;
         if yes {
             answers.yes = Some(true);
         }
+        if let Some(v) = tailscale {
+            answers.tailscale = Some(v.to_string());
+        }
         let result = tako_control::remote_setup::run_noninteractive(&answers)?;
         println!("{}", pretty_json(&result));
     } else {
         let mut stdout = std::io::stdout();
-        tako_control::remote_setup::run_interactive(yes, &mut stdout)?;
+        tako_control::remote_setup::run_interactive(yes, tailscale, &mut stdout)?;
     }
     Ok(())
 }

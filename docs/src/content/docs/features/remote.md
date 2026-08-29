@@ -37,7 +37,7 @@ tako remote stop      # 停止
 
 ### 層① Tailscale identity
 
-tailnet にログインした端末だけがサーバーに到達できます。Tailscale が保証する identity をサーバー側で検証するため、tailnet の外からは届かず、偽装もできません。daemon 自身は Unix domain socket で待ち受けており、TCP ポートを外に開けていません。
+tailnet にログインした端末だけがサーバーに到達できます。Tailscale が保証する identity をサーバー側で検証するため、tailnet の外からは届かず、偽装もできません。daemon の待ち受けは**127.0.0.1（ループバック）だけ**にバインドされ、LAN や外部ネットワークからは接続できません。外部への入口は `tailscale serve` が張る tailnet 内限定の HTTPS だけです。
 
 ### 層② 機器ペアリング
 
@@ -92,6 +92,23 @@ A: いいえ。v0.6.0 でこれらの経路は完全に削除されました。�
 
 **Q: tmux は必要？**
 A: 必要です。リモートアクセスはバックエンドセッションへの到達手段を使うため、`brew install tmux` を済ませてください。
+
+**Q: スマホで開くと 502 になる**
+A: `tailscale serve` が tako の待ち受けへ接続できていない状態です。v0.8.2 以降は
+`tako remote start` の時点でこれを検出し、理由と次の一手を出して起動を止めます
+（黙って「起動中」を名乗りません）。原因の大半は Tailscale の導入形態です。
+macOS の GUI 版 Tailscale（アプリ版）はサンドボックスの制約で Unix domain socket へ
+接続できないため、tako は既定でループバック TCP を使うようにしました。
+`TAKO_REMOTE_ENDPOINT=unix` を自分で設定している場合は、その指定を外して
+`tako remote stop && tako remote start` をやり直してください。
+
+**Q: Mac に Tailscale が 2 つ入っている（アプリ版と `tailscaled`）**
+A: 2 つは**別デーモン・別ノード**として動き、tailnet には別々の端末として登録されます
+（ノード名の末尾に `-1` が付くのはこれが原因です）。tako はどちらを使うか決め打ちせず、
+`tako remote setup` で選べます。選び直すときは
+`tako remote setup --tailscale gui`（アプリ版）または
+`tako remote setup --tailscale standalone`（自分で動かしている `tailscaled`）を実行してください。
+いまどちらを使っているかは `tako remote status` の `tailscale_variant` に出ます。
 
 **Q: CT log にホスト名が載るのが気になる**
 A: Tailscale が TLS 証明書を取得する際に `<マシン名>.<tailnet>.ts.net` が公開ログに記録されます。これは Tailscale の仕様です。ホスト名にセンシティブな情報を含めないことを推奨します。

@@ -1931,3 +1931,42 @@ legacy = 8 本 / CPU 1.80 s、new = 4 本 / CPU 0.95 s。
 - リモート接続は Tailscale Serve 経由のみ（tailnet 内限定・WireGuard E2E 暗号化。
   daemon は 127.0.0.1 bind。認証は二層: ① Tailscale identity + ② 機器ペアリング。
   公開インターネットへの露出なし。脅威モデルは `.agent/threat-model-remote.md`）
+
+### remote デーモンのローカルエンドポイント（#1038 / #971）
+
+`tailscale serve` が中継する先（= daemon の待ち受け）は **127.0.0.1 のエフェメラル
+ポートが既定**。`TAKO_REMOTE_ENDPOINT=unix` を明示したときだけ Unix domain socket
+（0600）になる。境界は `tako-control::platform::local_endpoint`（`EndpointSpec` /
+`Endpoint`）で、`cfg` はその内側に閉じる。
+
+**なぜ UDS を既定にできないか（実測）**:
+
+- macOS の GUI 版 Tailscale（`Tailscale.app` のシステム拡張）は**サンドボックスのため
+  どの Unix domain socket も dial できない**。`/tmp` の 0777 socket でも 502 になる
+  ので、パス・権限の問題ではなく「unix dial が全面不可」が signature（#1038）
+- Windows の tailscale は `unix:` の serve target をそもそも持たない
+  （`unix socket serve target is not supported on Windows`。#971）
+- ループバック TCP はどちらの変種でも通ることを実測で確認した
+  （サンドボックス版でも 200 + `X-Forwarded-For` の付与あり）
+
+**起動時の自己疎通チェック**: serve を張った直後に ts.net URL へ 1 回だけ GET し、
+**502 だけを「backend へ届いていない」と断定**して理由 + 次の一手を出して起動を止める
+（401 / 403 / 404 は「届いている」証拠なので正常扱い、ネットワーク不達は断定しない）。
+「running を名乗るのに見れない」を起動時に潰すのが目的。チェック中のリクエストは
+本ループと同じ経路で処理する（daemon は既に応答可能な状態）。
+A/B は `TAKO_1038_LEGACY=1`（UDS 固定 + 自己疎通チェック無し = #1038 前）、
+502 の経路は `TAKO_1038_INJECT_UNREACHABLE=1` で決定的に踏める。
+
+### Tailscale 系統の同居（#1038）
+
+macOS では GUI 版（システム拡張）と standalone `tailscaled` が**同時に動きうる**。
+両者は**別デーモン・別ノード**で、tailnet には別ノードとして二重登録される
+（実測: ノード名に `-1` サフィックスが付く）。どちらへ話しかけるかは
+`tailscale --socket <path>` で選べる（`--socket` 無し = CLI の既定探索）。
+
+tako は**決め打ちしない**: 検出できた系統が 1 つならそれ、2 つあれば
+`tako remote setup` で選ばせる。非対話（`--yes` / MCP）では
+①使える系統が 1 つならそれ ②複数なら**既定探索が応答している系統**
+（= OS が実体として扱っている方）を選び、**根拠と変更手段を応答に載せる**。
+選択は `<state_dir>/tailscale-variant` に 1 語（`gui` / `standalone`）で保存する
+（構造体を持たないので #916 のスキーマ移行の対象にならない）。
