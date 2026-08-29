@@ -4493,6 +4493,30 @@ mod tests {
         assert_eq!(horizontal_gap(&bounds, px(40.0)), 10.0);
     }
 
+    /// Issue #1016: 小文字化でバイト長が変わる文字（`İ` = U+0130）を含む本文でも、
+    /// `find_all` のヒットは元テキスト基準なので、行内へ落とした位置が文字境界に載る。
+    /// 位置がずれていると、ここで切り出す本文が文字の途中を割って panic する
+    #[test]
+    fn 検索ハイライトが伸びる文字を含む行でも文字境界に載る() {
+        let text = "İstanbul needle\nneedle İ needle";
+        let buffer =
+            tako_core::TextBuffer::from_text(std::path::PathBuf::from("u1016"), text.into());
+        let hits = buffer.find_all("NEEDLE");
+        assert_eq!(hits.len(), 3);
+
+        let mut highlighted = Vec::new();
+        let mut line_start = 0;
+        for line in text.split('\n') {
+            let line_end = line_start + line.len();
+            for (s, e, _) in search_hits_for_line(&hits, 0, line_start, line_end) {
+                // ずれていれば slice がここで panic する
+                highlighted.push(line[s..e].to_string());
+            }
+            line_start = line_end + 1; // 改行ぶん
+        }
+        assert_eq!(highlighted, vec!["needle", "needle", "needle"]);
+    }
+
     #[test]
     fn search_hits_line_intersection() {
         use tako_core::SearchHit;

@@ -245,21 +245,46 @@ impl TextBuffer {
     // --- 検索・置換 ---
 
     /// 大文字小文字を区別しない全ヒットを返す
+    ///
+    /// 返す位置は**元テキストのバイト位置**。小文字化はバイト長を変えうる
+    /// （`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、
+    /// 小文字化した写しのバイト位置をそのまま元テキストの位置として使うとずれる（#1016）。
+    /// 本文全体のバイト長が一致していても安全ではない（`İ` と `ẞ` が両方あると
+    /// 伸縮が打ち消しあって総和だけ一致し、途中の位置は食い違う）。
+    ///
+    /// そこで探索そのものは小文字化した写しに対する高速な部分文字列探索のまま残し、
+    /// 見つかった位置を [`Lowered::to_original`] で元テキストへ戻す。
+    /// 戻せない位置（展開された文字の途中で始まる／終わる一致）はヒットにしない。
     pub fn find_all(&self, query: &str) -> Vec<SearchHit> {
-        if query.is_empty() {
+        let lower_query = lowercase_per_char(query);
+        if lower_query.is_empty() {
             return Vec::new();
         }
-        let lower_query = query.to_lowercase();
-        let lower_text = self.text.to_lowercase();
+        let lowered = Lowered::build(&self.text);
         let mut hits = Vec::new();
-        let mut start = 0;
-        while let Some(pos) = lower_text[start..].find(&lower_query) {
-            let abs = start + pos;
-            hits.push(SearchHit {
-                start: abs,
-                end: abs + query.len(),
-            });
-            start = abs + query.len();
+        let mut cursor = 0;
+        while let Some(pos) = lowered.text[cursor..].find(&lower_query) {
+            let lower_start = cursor + pos;
+            let lower_end = lower_start + lower_query.len();
+            match (
+                lowered.to_original(lower_start),
+                lowered.to_original(lower_end),
+            ) {
+                (Some(start), Some(end)) => {
+                    hits.push(SearchHit { start, end });
+                    cursor = lower_end;
+                }
+                // 元テキストに対応する位置が無い一致は返せない
+                // （返すと slice が文字境界を割って panic する）。次の文字境界から探し直す
+                _ => {
+                    let step = lowered.text[lower_start..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(1);
+                    cursor = lower_start + step;
+                }
+            }
         }
         hits
     }
@@ -419,6 +444,93 @@ impl TextBuffer {
             .map(|(i, _)| i)
             .unwrap_or(line_text.len());
         start + relative
+    }
+}
+
+/// 1 文字ずつ小文字化して連結する（#1016）
+///
+/// `str::to_lowercase` を使わないのは、あれが**文脈依存**だから。ギリシャ語の Σ は
+/// 語末だけ ς になるので、本文とクエリを別々に丸ごと小文字化すると
+/// 「本文にそのまま在る部分文字列を、それ自身で検索しても見つからない」ことが起きる
+/// （本文 `ΟΔΟΣΧ` → `οδοσχ` / クエリ `ΟΔΟΣ` → `οδος`）。
+/// 突き合わせる両側を同じ 1 文字単位の写像へ揃えることで、この食い違いを構造的に消す。
+fn lowercase_per_char(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// 小文字化でバイト長が変わった文字 1 個ぶんの記録
+struct Shift {
+    /// 小文字化した写しでのその文字の開始位置
+    lower_start: usize,
+    /// 元テキストでのその文字の開始位置
+    orig_start: usize,
+    /// 小文字化後のバイト長
+    lower_len: usize,
+    /// 元のバイト長
+    orig_len: usize,
+}
+
+/// 小文字化した本文の写しと、その位置を元テキストへ戻すための情報（#1016）
+///
+/// `shifts` は**バイト長が変わった文字だけ**を開始位置の昇順で持つ。
+/// ASCII・日本語・ほとんどのラテン文字では空なので、位置の変換は恒等になる。
+struct Lowered {
+    text: String,
+    shifts: Vec<Shift>,
+}
+
+impl Lowered {
+    fn build(text: &str) -> Self {
+        let mut lower = String::with_capacity(text.len());
+        let mut shifts = Vec::new();
+        for (orig_start, ch) in text.char_indices() {
+            // ASCII の小文字化は必ず 1 バイト → 1 バイトなのでずれない
+            if ch.is_ascii() {
+                lower.push(ch.to_ascii_lowercase());
+                continue;
+            }
+            let lower_start = lower.len();
+            for lc in ch.to_lowercase() {
+                lower.push(lc);
+            }
+            let lower_len = lower.len() - lower_start;
+            let orig_len = ch.len_utf8();
+            if lower_len != orig_len {
+                shifts.push(Shift {
+                    lower_start,
+                    orig_start,
+                    lower_len,
+                    orig_len,
+                });
+            }
+        }
+        Self {
+            text: lower,
+            shifts,
+        }
+    }
+
+    /// 写しのバイト位置 `pos` に対応する元テキストのバイト位置を返す。
+    ///
+    /// `pos` が「小文字化で複数文字へ展開された文字」の途中を指すときは `None`
+    /// （元テキストに対応するバイト位置が存在しない）。
+    fn to_original(&self, pos: usize) -> Option<usize> {
+        if self.shifts.is_empty() {
+            return Some(pos);
+        }
+        // `pos` 以下で始まる最後のずれを探す。それより後ろは 1:1 対応に戻る
+        let idx = self.shifts.partition_point(|s| s.lower_start <= pos);
+        let Some(shift) = idx.checked_sub(1).map(|i| &self.shifts[i]) else {
+            return Some(pos);
+        };
+        if pos == shift.lower_start {
+            return Some(shift.orig_start);
+        }
+        let lower_end = shift.lower_start + shift.lower_len;
+        if pos < lower_end {
+            return None;
+        }
+        Some(shift.orig_start + shift.orig_len + (pos - lower_end))
     }
 }
 
@@ -783,6 +895,183 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    // --- #1016: 小文字化でバイト長が変わる文字でも位置が元テキスト基準であること ---
+
+    #[test]
+    fn ascii高速路の前提が成り立つ() {
+        // `Lowered::build` は「ASCII の小文字化は必ず 1 バイト → 1 バイト」を前提に
+        // ずれの記録を省いている。前提が崩れたらここで落ちる
+        for byte in 0u8..=127 {
+            let ch = byte as char;
+            let unicode: String = ch.to_lowercase().collect();
+            assert_eq!(
+                unicode,
+                ch.to_ascii_lowercase().to_string(),
+                "ASCII {byte:#04x} の小文字化が ASCII 版と食い違う"
+            );
+        }
+    }
+
+    #[test]
+    fn 位置の変換が展開された文字の途中を弾く() {
+        // `İ`(2 バイト) → `i` + U+0307(3 バイト)。写しの 1 バイト目は展開の途中
+        let lowered = Lowered::build("aİb");
+        assert_eq!(lowered.text, "ai\u{307}b");
+        assert_eq!(lowered.to_original(0), Some(0)); // 'a'
+        assert_eq!(lowered.to_original(1), Some(1)); // 'İ' の先頭
+        assert_eq!(lowered.to_original(2), None); // U+0307 の途中 = 対応する位置が無い
+        assert_eq!(lowered.to_original(4), Some(3)); // 'b'
+        assert_eq!(lowered.to_original(5), Some(4)); // 末尾
+    }
+
+    #[test]
+    fn ずれが無い本文では位置の変換が恒等になる() {
+        let lowered = Lowered::build("Abc あいう");
+        assert!(lowered.shifts.is_empty());
+        for pos in 0..=lowered.text.len() {
+            assert_eq!(lowered.to_original(pos), Some(pos));
+        }
+    }
+
+    #[test]
+    fn 小文字化で伸びる文字があってもヒット位置が元テキスト基準になる() {
+        // `İ`（U+0130）は小文字化で 2 → 3 バイトに伸びる。小文字化した本文の
+        // バイト位置を元テキストの位置として流用すると、後続のヒットがずれる
+        let text = "İstanbul needle";
+        let buffer = TextBuffer::from_text(path("u1016-grow"), text.into());
+        let hits = buffer.find_all("needle");
+        assert_eq!(hits.len(), 1);
+        let expected = text.find("needle").unwrap();
+        assert_eq!(hits[0].start, expected);
+        assert_eq!(hits[0].end, expected + "needle".len());
+        assert_eq!(&text[hits[0].start..hits[0].end], "needle");
+    }
+
+    #[test]
+    fn 小文字化で縮む文字があってもヒット位置が元テキスト基準になる() {
+        // `ẞ`（U+1E9E）は小文字化で 3 → 2 バイトに縮む
+        let text = "ẞ needle";
+        let buffer = TextBuffer::from_text(path("u1016-shrink"), text.into());
+        let hits = buffer.find_all("needle");
+        assert_eq!(hits.len(), 1);
+        let expected = text.find("needle").unwrap();
+        assert_eq!(hits[0].start, expected);
+        assert_eq!(&text[hits[0].start..hits[0].end], "needle");
+    }
+
+    #[test]
+    fn 伸縮が打ち消しあって総バイト長が同じでも位置がずれない() {
+        // `İ` は +1 / `ẞ` は -1 なので本文全体のバイト長は変わらないが、
+        // 途中のバイト位置は食い違う（= 総バイト長の一致は健全性の根拠にならない）
+        let text = "İ needle ẞ";
+        assert_eq!(text.len(), text.to_lowercase().len());
+        let buffer = TextBuffer::from_text(path("u1016-cancel"), text.into());
+        let hits = buffer.find_all("needle");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start, text.find("needle").unwrap());
+    }
+
+    #[test]
+    fn 行頭と行末と複数ヒットでも位置が元テキスト基準になる() {
+        let text = "needle İ\nneedle İ needle";
+        let buffer = TextBuffer::from_text(path("u1016-multi"), text.into());
+        let hits = buffer.find_all("NEEDLE");
+        assert_eq!(hits.len(), 3);
+        let expected: Vec<usize> = text.match_indices("needle").map(|(i, _)| i).collect();
+        assert_eq!(
+            hits.iter().map(|h| h.start).collect::<Vec<_>>(),
+            expected,
+            "行頭・行中・行末のヒットがすべて元テキスト基準であること"
+        );
+        for hit in &hits {
+            assert_eq!(&text[hit.start..hit.end], "needle");
+        }
+    }
+
+    #[test]
+    fn ヒットの終端が本文の範囲を超えない() {
+        // 本文 `İ`（2 バイト）は小文字化すると `i` + U+0307（3 バイト）。
+        // 終端に「元クエリのバイト長」を足すと本文の範囲外を指し、置換が panic する
+        let text = "İ";
+        let mut buffer = TextBuffer::from_text(path("u1016-range"), text.into());
+        let hits = buffer.find_all("i\u{307}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start, 0);
+        assert_eq!(
+            hits[0].end,
+            text.len(),
+            "終端は元テキストのバイト長で決まる"
+        );
+        buffer.replace_range(hits[0].start..hits[0].end, "I");
+        assert_eq!(buffer.text(), "I");
+    }
+
+    #[test]
+    fn 小文字化した文字の途中から始まるクエリはヒットしない() {
+        // `İ` の小文字化は `i` + U+0307。U+0307 から始まるクエリは元テキストの
+        // 文字境界に対応しないので、返せる位置が存在しない（返すと slice が panic する）
+        let buffer = TextBuffer::from_text(path("u1016-mid"), "İstanbul".into());
+        assert!(buffer.find_all("\u{307}stanbul").is_empty());
+    }
+
+    #[test]
+    fn 本文の部分文字列はそれ自身をクエリにすれば必ず見つかる() {
+        // `str::to_lowercase` は文脈依存（語末の Σ だけ ς になる）なので、本文と
+        // クエリを別々に丸ごと小文字化すると同じ文字列同士が一致しないことがある
+        let text = "ΟΔΟΣΧ";
+        let buffer = TextBuffer::from_text(path("u1016-sigma"), text.into());
+        let hits = buffer.find_all("ΟΔΟΣ");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start, 0);
+        assert_eq!(&text[hits[0].start..hits[0].end], "ΟΔΟΣ");
+    }
+
+    #[test]
+    fn 小文字化で伸びる文字を含む本文を壊さずに全置換できる() {
+        let mut buffer =
+            TextBuffer::from_text(path("u1016-replace-all"), "İstanbul foo İzmir foo".into());
+        let count = buffer.replace_all("foo", "bar");
+        assert_eq!(count, 2);
+        assert_eq!(buffer.text(), "İstanbul bar İzmir bar");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "İstanbul foo İzmir foo");
+    }
+
+    #[test]
+    fn 伸びる文字そのものを全置換しても本文が壊れない() {
+        let mut buffer = TextBuffer::from_text(path("u1016-replace-char"), "aİbİc".into());
+        let count = buffer.replace_all("İ", "-");
+        assert_eq!(count, 2);
+        assert_eq!(buffer.text(), "a-b-c");
+    }
+
+    #[test]
+    fn asciiのみと日本語のみの検索置換は従来どおり動く() {
+        // 回帰確認: 小文字化でバイト長が変わらない文字だけの本文
+        let buffer = TextBuffer::from_text(path("u1016-ascii"), "Foo foo FOO".into());
+        let hits = buffer.find_all("foo");
+        assert_eq!(
+            hits.iter().map(|h| (h.start, h.end)).collect::<Vec<_>>(),
+            vec![(0, 3), (4, 7), (8, 11)]
+        );
+
+        let mut jp = TextBuffer::from_text(path("u1016-jp"), "あいうえお かきくけこ".into());
+        let hits = jp.find_all("うえ");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start, "あい".len());
+        assert_eq!(hits[0].end, "あいうえ".len());
+        assert_eq!(jp.replace_all("かき", "サシ"), 1);
+        assert_eq!(jp.text(), "あいうえお サシくけこ");
+    }
+
+    #[test]
+    fn 伸びる文字を含む本文でも空クエリは空を返す() {
+        let buffer = TextBuffer::from_text(path("u1016-empty"), "İstanbul".into());
+        assert!(buffer.find_all("").is_empty());
+        assert!(buffer.find_next("", 0).is_none());
+        assert!(buffer.find_prev("", 0).is_none());
     }
 
     #[test]
