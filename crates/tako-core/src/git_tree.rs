@@ -249,6 +249,34 @@ impl TreeGitMap {
         &self.repos
     }
 
+    /// symlink を解いた実体パスの行を、**画面に出ているパス**でも引けるようにする。
+    ///
+    /// `git rev-parse --show-toplevel` は symlink を解決した実体（macOS の
+    /// `/tmp/x` なら `/private/tmp/x`）を返すのに対し、ツリーの行はペインの cwd を
+    /// そのまま使う。片方だけで持つと**症状は「symlink 配下のプロジェクトだけ
+    /// 色が出ない」という静かな失敗**になるので、両方の綴りで引けるようにしておく。
+    /// 実体と表示が同じ（ほとんどの場合）ならこの関数は何もしない
+    fn add_alias(&mut self, canonical: &Path, display: &Path) {
+        if canonical == display {
+            return;
+        }
+        let rewritten: Vec<(PathBuf, TreeGitStatus)> = self
+            .entries
+            .iter()
+            .filter_map(|(path, status)| {
+                let rest = path.strip_prefix(canonical).ok()?;
+                Some((display.join(rest), *status))
+            })
+            .collect();
+        self.entries.extend(rewritten);
+        let ignored: Vec<PathBuf> = self
+            .ignored_dirs
+            .iter()
+            .filter_map(|path| Some(display.join(path.strip_prefix(canonical).ok()?)))
+            .collect();
+        self.ignored_dirs.extend(ignored);
+    }
+
     /// 完全一致で登録されている行（パス順にソート済み）。CLI / MCP の出力用
     pub fn sorted_entries(&self) -> Vec<(PathBuf, TreeGitStatus)> {
         let mut out: Vec<(PathBuf, TreeGitStatus)> =
@@ -330,7 +358,14 @@ impl TreeGitMap {
 pub fn scan(roots: &[PathBuf]) -> TreeGitMap {
     let mut map = TreeGitMap::default();
     let mut visited: HashSet<PathBuf> = HashSet::new();
+    // 表示に使うパスと symlink 解決後の実体がずれるルート（`add_alias` 参照）
+    let mut aliases: Vec<(PathBuf, PathBuf)> = Vec::new();
     for root in roots {
+        if let Ok(canonical) = root.canonicalize() {
+            if canonical != *root {
+                aliases.push((canonical, root.clone()));
+            }
+        }
         let Some(repo_root) = git::repo_root(root) else {
             // git 管理外のフォルダ: 何も出さない（誤検知しない）
             continue;
@@ -340,6 +375,9 @@ pub fn scan(roots: &[PathBuf]) -> TreeGitMap {
         }
         let status = git::status_tree(&repo_root);
         map.merge_repo(&repo_root, &status);
+    }
+    for (canonical, display) in &aliases {
+        map.add_alias(canonical, display);
     }
     map
 }
@@ -540,6 +578,42 @@ mod tests {
             .collect();
         let map = build(entries);
         assert_eq!(map.get(Path::new("/repo/src")).unwrap().badge(), "99+");
+    }
+
+    /// symlink 配下のプロジェクトで色が出ない静かな失敗を防ぐ（実測: macOS の
+    /// `/tmp/x` は `git rev-parse --show-toplevel` が `/private/tmp/x` を返す）
+    #[test]
+    fn symlink越しの綴りでも同じ行を引ける() {
+        let mut map = build(vec![
+            entry("src/main.rs", '.', 'M'),
+            entry("out/", '!', '!'),
+        ]);
+        map.add_alias(Path::new("/repo"), Path::new("/link"));
+        // 実体側は今までどおり引ける
+        assert!(map.get(Path::new("/repo/src/main.rs")).is_some());
+        // 表示側の綴りでも同じ状態が返る（ファイル・伝播したディレクトリ・無視の配下とも）
+        assert_eq!(
+            map.get(Path::new("/link/src/main.rs")).map(|s| s.state),
+            Some(TreeGitState::Modified)
+        );
+        assert_eq!(
+            map.get(Path::new("/link/src")).map(|s| s.from_children),
+            Some(true)
+        );
+        assert_eq!(
+            map.get(Path::new("/link/out/deep/x.o")).map(|s| s.state),
+            Some(TreeGitState::Ignored)
+        );
+        // 無関係なパスは相変わらず何も返さない
+        assert!(map.get(Path::new("/other/src/main.rs")).is_none());
+    }
+
+    #[test]
+    fn 実体と表示が同じなら読み替え表は増えない() {
+        let mut map = build(vec![entry("src/main.rs", '.', 'M')]);
+        let before = map.len();
+        map.add_alias(Path::new("/repo"), Path::new("/repo"));
+        assert_eq!(map.len(), before);
     }
 
     #[test]
