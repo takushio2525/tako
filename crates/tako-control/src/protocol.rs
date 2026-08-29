@@ -1352,17 +1352,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service: Option<String>,
     },
-    /// ファイルツリーへのフォルダ追加・削除・一覧（#134）。
+    /// ファイルツリーへのフォルダ追加・削除・一覧（#134）と git ステータスの取得（#1009）。
     /// AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。タブ単位スコープ
     TreeFolder {
-        /// "add" / "remove" / "list"
+        /// "add" / "remove" / "list" / "git-status"
         action: String,
-        /// 追加・削除するフォルダの絶対パス（list 時は省略可）
+        /// 追加・削除するフォルダの絶対パス（list 時は省略可。
+        /// git-status では対象を 1 フォルダへ絞る指定として使える）
         path: Option<String>,
         /// 対象タブ ID（省略時は pane の属するタブ）
         tab: Option<u64>,
         /// 呼び出し元ペイン（タブ解決用）
         pane: Option<u64>,
+        /// git-status: 返すエントリ数の上限（既定 500。超えたら `truncated` が true）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
     },
     /// セッションカタログの参照と復元（Issue #112 A）。
     /// `action`:

@@ -24,15 +24,9 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// git status の変更種別（`git status --porcelain` の 1 文字コードをマップ）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitChange {
-    Modified,
-    Added,
-    Deleted,
-    Renamed,
-    Untracked,
-}
+// git ステータスの分類・伝播・無視の判定は tako-core が正本（#1009）。
+// ここは表示のために引くだけで、UI 層に判定ロジックを持たない
+pub use tako_core::git_tree::{TreeGitMap, TreeGitState, TreeGitStatus};
 
 /// 表示用にフラット化した 1 行。`root` = ワークスペースフォルダの見出し行
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +35,8 @@ pub struct Row {
     pub depth: usize,
     pub expanded: bool,
     pub root: bool,
-    pub git_status: Option<GitChange>,
+    /// git の状態（#1009。ディレクトリ行・ルート行には配下からの伝播が入る）
+    pub git_status: Option<TreeGitStatus>,
     /// `Some` = リモート（SSH 先）の行（#919）。**ローカル FS の操作を一切通さない**
     /// ための目印で、クリック・右クリック・D&D はここを見て分岐する。
     /// `entry.path` は表示と行の同定にだけ使い、ファイルシステムへは渡さない
@@ -80,8 +75,8 @@ pub struct FileTree {
     /// 展開中ディレクトリ（ルート自身も含む。絶対パスがキーなのでルート間で共有できる）
     expanded: HashSet<PathBuf>,
     cache: HashMap<PathBuf, Vec<Entry>>,
-    /// git status キャッシュ: 絶対パス → 変更種別
-    git_cache: HashMap<PathBuf, GitChange>,
+    /// git status キャッシュ（#1009。絶対パス → 状態。ディレクトリ伝播込み）
+    git_cache: TreeGitMap,
     /// rows() の結果キャッシュ（状態変化時に無効化し、render での再構築を回避する）
     rows_cache: Option<Vec<Row>>,
     /// ドット始まりの項目を表示するか（#550。既定 false）。
@@ -194,13 +189,19 @@ impl FileTree {
     }
 
     /// git status キャッシュを更新する。変化があれば true
-    pub fn apply_git_status(&mut self, status: HashMap<PathBuf, GitChange>) -> bool {
+    pub fn apply_git_status(&mut self, status: TreeGitMap) -> bool {
         if self.git_cache == status {
             return false;
         }
         self.git_cache = status;
         self.rows_cache = None;
         true
+    }
+
+    /// 表示中のツリーが持つ git 状態（テストから行の状態を直接引くため）
+    #[cfg(test)]
+    pub fn git_status_of(&self, path: &Path) -> Option<TreeGitStatus> {
+        self.git_cache.get(path)
     }
 
     /// 表示行: ルート見出し行 + 展開状態に従った深さ優先の中身。
@@ -236,7 +237,9 @@ impl FileTree {
                 depth: 0,
                 expanded,
                 root: true,
-                git_status: None,
+                // #1009: ワークスペースフォルダにも配下の変更が伝播する
+                // （折りたたんでいても「このプロジェクトに変更がある」が分かる）
+                git_status: self.git_cache.get(root),
                 remote: None,
                 note: None,
             });
@@ -271,7 +274,8 @@ impl FileTree {
                 continue;
             }
             let expanded = entry.is_dir && self.expanded.contains(&entry.path);
-            let git_status = self.git_cache.get(&entry.path).copied();
+            // #1009: ディレクトリにも配下からの伝播が返る（`TreeGitMap::get` が面倒を見る）
+            let git_status = self.git_cache.get(&entry.path);
             rows.push(Row {
                 entry: entry.clone(),
                 depth,
@@ -564,56 +568,6 @@ pub fn scan_dirs(targets: &[PathBuf]) -> Vec<(PathBuf, Option<Vec<Entry>>)> {
         .collect()
 }
 
-/// ルートディレクトリ群の git status を取得する（background executor 向け）。
-/// 各ルートが git リポジトリ内にあれば `git status --porcelain` を叩き、
-/// 結果を絶対パスにマッピングして返す
-pub fn scan_git_status(roots: &[PathBuf]) -> HashMap<PathBuf, GitChange> {
-    let mut result = HashMap::new();
-    let mut visited_repos: HashSet<PathBuf> = HashSet::new();
-    for root in roots {
-        // git rev-parse --show-toplevel でリポジトリルートを取得
-        let repo_root = match tako_core::git::repo_root(root) {
-            Some(r) => r,
-            None => continue,
-        };
-        if !visited_repos.insert(repo_root.clone()) {
-            continue;
-        }
-        // #586: ファイルツリーの git マークも定期的に走るため、Windows で
-        // コンソールウィンドウを出させない
-        let Ok(output) = tako_core::platform::process::no_console_window(
-            &mut std::process::Command::new(tako_core::git::git_bin()),
-        )
-        .args(["status", "--porcelain", "-uall"])
-        .current_dir(&repo_root)
-        .output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.len() < 4 {
-                continue;
-            }
-            let xy = &line[..2];
-            let rel_path = line[3..].trim();
-            // リネーム（R_ / C_）は " -> new" の形。新ファイル名を取る
-            let rel_path = rel_path.split(" -> ").last().unwrap_or(rel_path);
-            let abs_path = repo_root.join(rel_path);
-            let change = match xy.as_bytes() {
-                [b'?', b'?'] => GitChange::Untracked,
-                [b'A', _] | [_, b'A'] => GitChange::Added,
-                [b'D', _] | [_, b'D'] => GitChange::Deleted,
-                [b'R', _] | [_, b'R'] => GitChange::Renamed,
-                _ => GitChange::Modified,
-            };
-            result.insert(abs_path, change);
-        }
-    }
-    result
-}
-
 /// 隠し項目の判定（#550）。Unix 慣習のドット始まりのみ（Windows の隠し属性は
 /// 境界 B1 側の関心事なのでここでは扱わない）
 pub fn is_hidden_name(name: &str) -> bool {
@@ -875,5 +829,80 @@ mod tests {
         let rows = tree.rows();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].root);
+    }
+
+    /// #1009: git の状態は**ファイル行だけでなくディレクトリ行とルート見出し行**にも載る。
+    /// 折りたたんだままのディレクトリにも件数が出る（中身を読まずに色を付けられる）
+    fn git_map(root: &Path, entries: &[(&str, char, char)]) -> TreeGitMap {
+        let mut map = TreeGitMap::default();
+        map.merge_repo(
+            root,
+            &tako_core::git::GitStatus {
+                branch: "main".into(),
+                upstream: String::new(),
+                entries: entries
+                    .iter()
+                    .map(|(path, index, worktree)| tako_core::git::GitStatusEntry {
+                        path: (*path).to_string(),
+                        index: *index,
+                        worktree: *worktree,
+                    })
+                    .collect(),
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn git状態はファイルとディレクトリとルート行に載る() {
+        let dir = fixture("t8");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        assert!(tree.apply_git_status(git_map(
+            &dir,
+            &[("README.md", '.', 'M'), ("src/main.rs", '?', '?')]
+        )));
+        // 同じ内容を入れ直しても「変化なし」= 無駄な再描画を起こさない
+        assert!(!tree.apply_git_status(git_map(
+            &dir,
+            &[("README.md", '.', 'M'), ("src/main.rs", '?', '?')]
+        )));
+
+        let rows = tree.rows();
+        let badge = |name: &str| {
+            rows.iter()
+                .find(|r| r.entry.name == name)
+                .and_then(|r| r.git_status)
+                .map(|s| s.badge())
+        };
+        assert_eq!(badge("README.md").as_deref(), Some("M"));
+        // 折りたたまれた src にも配下 1 件が出る
+        assert_eq!(badge("src").as_deref(), Some("1"));
+        // ルート見出し行は配下 2 件
+        let root_row = rows.iter().find(|r| r.root).unwrap();
+        assert_eq!(root_row.git_status.map(|s| s.badge()).as_deref(), Some("2"));
+        // 変更が無いファイルには何も付かない
+        assert!(rows
+            .iter()
+            .find(|r| r.entry.name == "docs")
+            .unwrap()
+            .git_status
+            .is_none());
+        assert_eq!(
+            tree.git_status_of(&dir.join("README.md")).map(|s| s.state),
+            Some(TreeGitState::Modified)
+        );
+        remove_temp_dir(&dir);
+    }
+
+    #[test]
+    fn git管理外のツリーには何も付かない() {
+        let dir = fixture("t9");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        // scan は git 管理外のルートを黙って飛ばす = 空の表になる
+        assert!(tako_core::git_tree::scan(std::slice::from_ref(&dir)).is_empty());
+        assert!(tree.rows().iter().all(|r| r.git_status.is_none()));
+        remove_temp_dir(&dir);
     }
 }

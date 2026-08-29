@@ -3847,7 +3847,8 @@ fn dispatch_inner(
             path,
             tab,
             pane,
-        } => dispatch_tree_folder(host, &action, path, tab, pane),
+            limit,
+        } => dispatch_tree_folder(host, &action, path, tab, pane, limit),
 
         Request::Sessions {
             action,
@@ -10327,12 +10328,17 @@ fn dispatch_tree_folder(
     path: Option<String>,
     tab: Option<u64>,
     pane: Option<u64>,
+    limit: Option<usize>,
 ) -> Result<Value, DispatchError> {
     use std::path::PathBuf;
 
     let tab_id = resolve_tab(host.workspace(), tab, pane)?;
 
     match action {
+        // #1009: ツリーに出ている git ステータスをそのまま返す。
+        // ルートの解決も分類も UI と同じ 1 実装（`tako_core::sidebar::workspace_roots` /
+        // `tako_core::git_tree`）を通るので、画面と応答がずれない
+        "git-status" => dispatch_tree_git_status(host, tab_id, path, limit),
         "add" => {
             let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
             let abs = PathBuf::from(&path_str);
@@ -10391,9 +10397,105 @@ fn dispatch_tree_folder(
             Ok(json!({ "folders": folders, "tab": tab_id.as_u64() }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
-            "action は add / remove / list のいずれか（受け取った値: {action}）"
+            "action は add / remove / list / git-status のいずれか（受け取った値: {action}）"
         ))),
     }
+}
+
+/// ファイルツリーの git ステータス（#1009）。
+///
+/// 走査の起点は**そのタブのワークスペースフォルダ**（各ペインの cwd + 明示追加フォルダ）で、
+/// サイドバーのルート行と同じ並び。`path` を渡すとそのフォルダ 1 件へ絞る。
+/// git 管理外のフォルダは黙って対象外（誤検知しない）
+fn dispatch_tree_git_status(
+    host: &mut dyn ControlHost,
+    tab_id: TabId,
+    path: Option<String>,
+    limit: Option<usize>,
+) -> Result<Value, DispatchError> {
+    use std::path::PathBuf;
+
+    /// 応答に載せるエントリ数の既定上限（巨大な差分でも応答が壊れない大きさ）
+    const DEFAULT_LIMIT: usize = 500;
+
+    let roots: Vec<PathBuf> = match path {
+        Some(p) => {
+            let dir = PathBuf::from(&p);
+            if !dir.is_dir() {
+                return Err(DispatchError::InvalidParams(format!(
+                    "ディレクトリが存在しない: {p}"
+                )));
+            }
+            vec![dir]
+        }
+        None => tree_roots_of_tab(host, tab_id),
+    };
+
+    let map = tako_core::git_tree::scan(&roots);
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let all = map.sorted_entries();
+    let total = all.len();
+    let truncated = total > limit;
+    let entries: Vec<Value> = all
+        .into_iter()
+        .take(limit)
+        .map(|(path, status)| {
+            json!({
+                "path": path.display().to_string(),
+                "state": status.state.code(),
+                "badge": status.badge(),
+                "staged": status.staged.map(|c| c.to_string()),
+                "unstaged": status.unstaged.map(|c| c.to_string()),
+                // 配下からの伝播 = ディレクトリ行（そのフォルダ自身の変更ではない）
+                "propagated": status.from_children,
+                "changed": status.changed,
+            })
+        })
+        .collect();
+    let repos: Vec<Value> = map
+        .repos()
+        .iter()
+        .map(|r| {
+            json!({
+                "root": r.root.display().to_string(),
+                "branch": r.branch,
+                "changed": r.changed,
+                "truncated": r.truncated,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "tab": tab_id.as_u64(),
+        "roots": roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "repos": repos,
+        "entries": entries,
+        "total": total,
+        "truncated": truncated,
+    }))
+}
+
+/// そのタブのファイルツリーのルート行（#1009）。UI の `sync_filetree_roots` と
+/// **同じ関数**（`tako_core::sidebar::workspace_roots`）を通す
+fn tree_roots_of_tab(host: &dyn ControlHost, tab_id: TabId) -> Vec<PathBuf> {
+    let mut pane_cwds: Vec<PathBuf> = Vec::new();
+    let mut pinned: Vec<PathBuf> = Vec::new();
+    if let Some(tab) = host.workspace().get_tab(tab_id) {
+        for pane in tab.tree().panes() {
+            if let Some(cwd) = host.session(pane.id()).and_then(|s| s.cwd()) {
+                pane_cwds.push(cwd.to_path_buf());
+            }
+        }
+        pinned = tab.pinned_folders().to_vec();
+    }
+    for bp in host.workspace().shelved_panes() {
+        if bp.origin_tab() != tab_id {
+            continue;
+        }
+        if let Some(cwd) = host.session(bp.id()).and_then(|s| s.cwd()) {
+            pane_cwds.push(cwd.to_path_buf());
+        }
+    }
+    tako_core::sidebar::workspace_roots(pane_cwds, pinned, tako_core::paths::home_dir())
 }
 
 /// タブ ID を解決する（tab 明示 > pane のタブ > アクティブタブ）
@@ -13806,6 +13908,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13820,6 +13923,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13834,6 +13938,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13848,6 +13953,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13862,6 +13968,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13876,6 +13983,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13894,6 +14002,7 @@ mod tests {
                 path: Some("/nonexistent_path_xyz_12345".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13912,6 +14021,7 @@ mod tests {
                 path: Some("/etc/hosts".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13929,6 +14039,7 @@ mod tests {
                 path: Some("relative/path".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13946,6 +14057,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13968,6 +14080,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13982,6 +14095,7 @@ mod tests {
                 path: Some("/private/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13996,6 +14110,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14024,6 +14139,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14037,6 +14153,7 @@ mod tests {
                 path: Some("/private/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14050,6 +14167,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14072,6 +14190,7 @@ mod tests {
                 path: Some(tmp.display().to_string()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14085,6 +14204,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14102,6 +14222,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )

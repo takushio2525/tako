@@ -4372,9 +4372,16 @@ impl TakoApp {
                         }
                     }
                     app.save_layout();
+                    // (read_dir し直す対象, git status を引くリポジトリの起点)。
+                    // #1009: git 側へ渡すのは**ワークスペースルートだけ**にする。
+                    // 以前は展開済みディレクトリを全部渡していたので
+                    // `git rev-parse --show-toplevel` が 2 秒ごとにその数だけ起動していた
                     let filetree_targets = if app.filetree.visible {
                         let _s = tako_control::diag::perf_span("periodic_prep:filetree_targets");
-                        Some(app.filetree.refresh_targets())
+                        Some((
+                            app.filetree.refresh_targets(),
+                            app.filetree.roots().to_vec(),
+                        ))
                     } else {
                         None
                     };
@@ -4746,15 +4753,13 @@ impl TakoApp {
                         }
                     }
                 }
-                if let Some(targets) = filetree_targets {
-                    let git_roots: Vec<std::path::PathBuf> =
-                        targets.iter().filter(|p| p.is_dir()).cloned().collect();
+                if let Some((targets, git_roots)) = filetree_targets {
                     let task = cx
                         .background_executor()
                         .spawn(async move { filetree::scan_dirs(&targets) });
                     let git_task = cx
                         .background_executor()
-                        .spawn(async move { filetree::scan_git_status(&git_roots) });
+                        .spawn(async move { tako_core::git_tree::scan(&git_roots) });
                     let results = task.await;
                     let git_status = git_task.await;
                     let ok = this.update(cx, |app: &mut TakoApp, cx| {
@@ -43030,6 +43035,7 @@ mod self_test {
                             path: Some(pin),
                             tab: None,
                             pane: None,
+                            limit: None,
                         },
                         PaneOrigin::User,
                     );
@@ -43075,6 +43081,7 @@ mod self_test {
                             path: Some(unpin),
                             tab: None,
                             pane: None,
+                            limit: None,
                         },
                         PaneOrigin::User,
                     );
@@ -56200,6 +56207,226 @@ mod self_test {
                         notify_and_draw(any1012, window1012, cx);
                     }
                 }
+            }
+
+            // 135. ファイルツリーの git ステータス（#1009）。
+            //
+            // 使い捨ての実リポジトリを作って、ツリーの行に付く状態を実経路で観測する:
+            //   (a) ステージ済み / 未ステージ / 新規 / 削除 / 無視 が別々の分類になる
+            //   (b) ディレクトリとワークスペースルートへ**配下の変更が伝播**する
+            //       （折りたたんだままでも件数が出る）
+            //   (c) 非 git フォルダでは 1 行も付かない（誤検知しない）
+            //   (d) 同じ表が CLI / MCP（`tree git-status`）からも読める（開発不変条件）
+            //   (e) git 側へ渡す走査の起点は**ルートだけ**（展開ディレクトリを全部
+            //       渡すと `git rev-parse` が 2 秒ごとにその数だけ起動する）
+            {
+                let base1009 = std::env::temp_dir().join(format!(
+                    "tako-selftest-1009-{}",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_dir_all(&base1009);
+                let repo1009 = base1009.join("repo");
+                let plain1009 = base1009.join("plain");
+                let _ = std::fs::create_dir_all(repo1009.join("src/deep"));
+                let _ = std::fs::create_dir_all(repo1009.join("build"));
+                let _ = std::fs::create_dir_all(&plain1009);
+                let git = tako_core::git::git_bin();
+                let run = |args: &[&str]| {
+                    // #586: Windows のセルフテストでもコンソール窓を出さない
+                    let mut cmd = std::process::Command::new(git);
+                    tako_core::platform::process::no_console_window(&mut cmd);
+                    let _ = cmd.args(args).current_dir(&repo1009).output();
+                };
+                let write = |rel: &str, body: &str| {
+                    let _ = std::fs::write(repo1009.join(rel), body);
+                };
+                write("tracked.txt", "one\n");
+                write("staged.txt", "one\n");
+                write("gone.txt", "one\n");
+                write("src/deep/nested.txt", "one\n");
+                let _ = std::fs::write(repo1009.join(".gitignore"), "build/\n");
+                let _ = std::fs::write(repo1009.join("build/out.bin"), "x");
+                let _ = std::fs::write(plain1009.join("free.txt"), "x");
+                run(&["init", "-q"]);
+                run(&["config", "user.email", "selftest@example.invalid"]);
+                run(&["config", "user.name", "tako selftest"]);
+                run(&["add", "-A"]);
+                run(&["commit", "-qm", "base"]);
+                // コミット後に 4 種類の状態を作る
+                write("tracked.txt", "two\n"); // 未ステージの変更
+                write("staged.txt", "two\n");
+                run(&["add", "staged.txt"]); // ステージ済みの変更
+                let _ = std::fs::remove_file(repo1009.join("gone.txt")); // 削除
+                write("fresh.txt", "new\n"); // 未追跡
+                write("src/deep/nested.txt", "two\n"); // 伝播の材料
+
+                // (a)(b)(c) 実経路: scan → apply → rows（UI が描くのと同じ表）
+                let roots1009 = vec![repo1009.clone(), plain1009.clone()];
+                let map1009 = tako_core::git_tree::scan(&roots1009);
+                let cell = |rel: &str| map1009.get(&repo1009.join(rel));
+                let modified = cell("tracked.txt");
+                let staged = cell("staged.txt");
+                let deleted = cell("gone.txt");
+                let untracked = cell("fresh.txt");
+                let ignored_dir = cell("build");
+                let ignored_child = cell("build/out.bin");
+                let kinds_ok = modified.map(|s| {
+                    s.state == tako_core::git_tree::TreeGitState::Modified
+                        && s.staged.is_none()
+                        && s.unstaged == Some('M')
+                }) == Some(true)
+                    && staged.map(|s| s.staged == Some('M') && s.unstaged.is_none())
+                        == Some(true)
+                    && deleted.map(|s| s.state == tako_core::git_tree::TreeGitState::Deleted)
+                        == Some(true)
+                    && untracked.map(|s| {
+                        s.state == tako_core::git_tree::TreeGitState::Untracked
+                            && s.badge() == "U"
+                    }) == Some(true)
+                    && ignored_dir.map(|s| s.state == tako_core::git_tree::TreeGitState::Ignored)
+                        == Some(true)
+                    && ignored_child
+                        .map(|s| s.state == tako_core::git_tree::TreeGitState::Ignored)
+                        == Some(true);
+                check(
+                    kinds_ok,
+                    &format!(
+                        "135: ステージ済み / 未ステージ / 新規 / 削除 / 無視を区別する \
+                         (#1009。modified={modified:?} staged={staged:?} deleted={deleted:?} \
+                         untracked={untracked:?} ignored={ignored_dir:?}/{ignored_child:?})"
+                    ),
+                );
+
+                let deep = map1009.get(&repo1009.join("src/deep"));
+                let src = map1009.get(&repo1009.join("src"));
+                let root_row = map1009.get(&repo1009);
+                let propagate_ok = deep.map(|s| s.from_children && s.changed == 1) == Some(true)
+                    && src.map(|s| s.from_children && s.changed == 1) == Some(true)
+                    // ルート行には全部（tracked / staged / gone / fresh / nested）が集まる
+                    && root_row.map(|s| s.from_children && s.changed == 5) == Some(true);
+                check(
+                    propagate_ok,
+                    &format!(
+                        "135: ディレクトリとルートへ配下の変更が伝播する \
+                         (#1009。deep={deep:?} src={src:?} root={root_row:?})"
+                    ),
+                );
+
+                let plain_ok = map1009.get(&plain1009).is_none()
+                    && map1009.get(&plain1009.join("free.txt")).is_none();
+                check(
+                    plain_ok,
+                    "135: 非 git フォルダには何も付かない (#1009)",
+                );
+
+                // ツリーの行へ実際に載ることまで見る（描画が引くのと同じ経路）
+                let (row_states, root_badge) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.filetree.visible = true;
+                        app.filetree.set_roots(roots1009.clone());
+                        app.filetree.toggle_dir(&repo1009);
+                        app.filetree.apply_git_status(map1009.clone());
+                        let rows = app.filetree.rows();
+                        let states: Vec<(String, String)> = rows
+                            .iter()
+                            .filter_map(|r| {
+                                let st = r.git_status?;
+                                Some((r.entry.name.clone(), st.badge()))
+                            })
+                            .collect();
+                        let root_badge = rows
+                            .iter()
+                            .find(|r| r.root && r.entry.path == repo1009)
+                            .and_then(|r| r.git_status)
+                            .map(|s| s.badge());
+                        (states, root_badge)
+                    })
+                    .unwrap_or_default();
+                let rows_ok = row_states
+                    .iter()
+                    .any(|(n, b)| n == "tracked.txt" && b == "M")
+                    && row_states.iter().any(|(n, b)| n == "fresh.txt" && b == "U")
+                    // 折りたたんだままの src に件数が出る = 中身を読まずに色が付く
+                    && row_states.iter().any(|(n, b)| n == "src" && b == "1")
+                    && root_badge.as_deref() == Some("5");
+                check(
+                    rows_ok,
+                    &format!(
+                        "135: ツリーの行に色分けの材料が載る \
+                         (#1009。rows={row_states:?} root_badge={root_badge:?})"
+                    ),
+                );
+
+                // (d) CLI / MCP から同じ表が読める
+                let payload1009 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TreeFolder {
+                                action: "git-status".into(),
+                                path: Some(repo1009.display().to_string()),
+                                tab: None,
+                                pane: None,
+                                limit: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(None);
+                let dispatch_ok = payload1009
+                    .as_ref()
+                    .map(|v| {
+                        let entries = v["entries"].as_array().cloned().unwrap_or_default();
+                        let find = |name: &str| {
+                            entries.iter().find(|e| {
+                                e["path"]
+                                    .as_str()
+                                    .map(|p| p.ends_with(name))
+                                    .unwrap_or(false)
+                            })
+                        };
+                        find("fresh.txt").map(|e| e["state"] == "untracked") == Some(true)
+                            && find("staged.txt").map(|e| e["staged"] == "M") == Some(true)
+                            && find("tracked.txt").map(|e| e["unstaged"] == "M") == Some(true)
+                            && find("/src").map(|e| e["propagated"] == true) == Some(true)
+                            && v["repos"].as_array().map(|r| r.len()) == Some(1)
+                    })
+                    .unwrap_or(false);
+                check(
+                    dispatch_ok,
+                    &format!("135: 同じ表が CLI / MCP からも読める (#1009。{payload1009:?})"),
+                );
+
+                // (e) git へ渡す起点はルートだけ（展開ディレクトリを混ぜない）。
+                // 混ぜると `git rev-parse --show-toplevel` が 2 秒ごとにその数だけ起動する
+                let (targets1009, git_roots1009) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (app.filetree.refresh_targets(), app.filetree.roots().to_vec())
+                    })
+                    .unwrap_or_default();
+                check(
+                    git_roots1009 == roots1009 && targets1009.len() > git_roots1009.len(),
+                    &format!(
+                        "135: git の走査起点はワークスペースルートだけ \
+                         (#1009。targets={} git_roots={})",
+                        targets1009.len(),
+                        git_roots1009.len()
+                    ),
+                );
+
+                let _ = window.update(cx, |app: &mut TakoApp, _, _| {
+                    app.filetree.apply_git_status(Default::default());
+                    app.filetree.set_roots(Vec::new());
+                });
+                let _ = std::fs::remove_dir_all(&base1009);
+                println!(
+                    "TAKO_SELF_TEST_1009: kinds={kinds_ok} propagate={propagate_ok} \
+                     plain={plain_ok} rows={rows_ok} dispatch={dispatch_ok} \
+                     entries={} repos={}",
+                    map1009.len(),
+                    map1009.repos().len()
+                );
             }
 
             // 後片付け: 隔離した接続情報ディレクトリを消す

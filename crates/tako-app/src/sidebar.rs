@@ -13,6 +13,87 @@ const INLINE_NEW_MARKER: &str = "__tako_inline_new__";
 /// 1 階層ぶんのインデント幅（カンプ: margin-left 17px）
 const INDENT_STEP: f32 = 17.0;
 
+// ─────────────── git ステータスの見せ方（#1009） ───────────────
+//
+// 「何色にするか」は分類 1 つだけで決める（`TreeGitState`）。分類そのもの
+// （伝播・無視・ステージ済み / 未ステージの切り分け）は `tako_core::git_tree` が正本で、
+// ここは色を当てるだけ。CLI / MCP も同じ分類を返すので、画面と応答がずれない。
+//
+// 色の割り当ては git 自身の `status --short` の読み方に合わせてある:
+//   - **バッジ 2 桁 = git の XY**（例: `MM` = ステージ済みの変更 + その後の未ステージ変更）
+//   - **左（index 側 = ステージ済み）は緑**、右（worktree 側 = 未ステージ）は種別の色
+//   - ディレクトリは文字ではなく**配下の変更件数**（VSCode と同じ）
+
+/// 分類 → 色。UI に出る色はここ 1 箇所でしか決めない
+pub(crate) fn git_state_color(state: filetree::TreeGitState, theme: &Theme) -> tako_core::Rgb {
+    match state {
+        // `.gitignore` 対象は「変更ではない」ので、いちばん薄い文字色へ落とす
+        filetree::TreeGitState::Ignored => theme.text_muted,
+        // 新規（未追跡 / index 追加済み）は緑
+        filetree::TreeGitState::Untracked | filetree::TreeGitState::Added => theme.green,
+        filetree::TreeGitState::Modified => theme.yellow,
+        // リネームは accent（選択色）と紛れるので mauve
+        filetree::TreeGitState::Renamed => theme.mauve,
+        // 削除と未解決は「止まって見てほしい」側なので赤
+        filetree::TreeGitState::Deleted | filetree::TreeGitState::Conflicted => theme.red,
+    }
+}
+
+/// 行の名前の色。git 情報が無い行は `base`（従来の色）のまま = 非 git フォルダで
+/// 見た目が変わらない
+pub(crate) fn git_name_color(
+    status: Option<filetree::TreeGitStatus>,
+    base: tako_core::Rgb,
+    theme: &Theme,
+) -> tako_core::Rgb {
+    match status {
+        None => base,
+        Some(s) => git_state_color(s.state, theme),
+    }
+}
+
+/// 行の右端に出すバッジ。無視・状態なしは何も出さない（`None`）
+fn git_badge_spans(status: Option<filetree::TreeGitStatus>, theme: &Theme) -> Option<gpui::Div> {
+    let status = status?;
+    if status.state == filetree::TreeGitState::Ignored {
+        return None;
+    }
+    let mut badge = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .text_size(px(10.5))
+        .font_family("Monaco")
+        .font_weight(FontWeight::BOLD)
+        .pr(px(8.0));
+    if status.from_children {
+        // ディレクトリ: 配下の変更ファイル数。自分自身の変更ではないので少し落とす
+        return Some(
+            badge.child(
+                div()
+                    .text_color(hsla_alpha(git_state_color(status.state, theme), 0.8))
+                    .child(SharedString::from(status.badge())),
+            ),
+        );
+    }
+    if let Some(c) = status.staged {
+        badge = badge.child(
+            div()
+                .text_color(hsla(theme.green))
+                .child(SharedString::from(c.to_string())),
+        );
+    }
+    if let Some(c) = status.unstaged {
+        badge = badge.child(
+            div()
+                .text_color(hsla(git_state_color(status.state, theme)))
+                .child(SharedString::from(c.to_string())),
+        );
+    }
+    Some(badge)
+}
+
 /// インデントガイド線（#589）。
 ///
 /// 旧実装は行ボックスの `border-left` 1 本だけを引いていたため、**その行の深さの線しか
@@ -106,53 +187,31 @@ impl TakoApp {
             tab.prune_dead_folders();
         }
 
-        // 正規パス（symlink 解決済み）でデデュープ（#171: cwd と pinned の重複排除）
-        let mut canonical_set: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-
         let active_tab_id = self.workspace.active_tab().id();
 
-        // フォアグラウンドペイン
+        // フォアグラウンドペイン → 同タブ由来のバックグラウンドペインの順に cwd を拾い、
+        // #134 の明示追加フォルダを後ろへ合流する。デデュープ（#171: cwd と pinned の
+        // 重複排除）と HOME フォールバックの規則は `tako_core::sidebar::workspace_roots`
+        // が正本で、**CLI / MCP の `tree git-status` も同じ関数を通る**（#1009）
+        let mut pane_cwds: Vec<std::path::PathBuf> = Vec::new();
         for pane in self.workspace.active_tab().tree().panes() {
-            let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) else {
-                continue;
-            };
-            let cwd = cwd.to_path_buf();
-            let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
-            if canonical_set.insert(canon) {
-                roots.push(cwd);
+            if let Some(cwd) = self.terminals.get(&pane.id()).and_then(|s| s.cwd()) {
+                pane_cwds.push(cwd.to_path_buf());
             }
         }
-
-        // バックグラウンドペイン（同タブ由来のみ）
         for bp in self.workspace.shelved_panes() {
             if bp.origin_tab() != active_tab_id {
                 continue;
             }
-            let Some(cwd) = self.terminals.get(&bp.id()).and_then(|s| s.cwd()) else {
-                continue;
-            };
-            let cwd = cwd.to_path_buf();
-            let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
-            if canonical_set.insert(canon) {
-                roots.push(cwd);
+            if let Some(cwd) = self.terminals.get(&bp.id()).and_then(|s| s.cwd()) {
+                pane_cwds.push(cwd.to_path_buf());
             }
         }
-
-        // #134: AI が明示追加したフォルダを合流（正規パスでデデュープ）
-        for folder in self.workspace.active_tab().pinned_folders() {
-            let canon = folder.canonicalize().unwrap_or_else(|_| folder.clone());
-            if canonical_set.insert(canon) {
-                roots.push(folder.clone());
-            }
-        }
-
-        if roots.is_empty() {
-            if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-                roots.push(home);
-            }
-        }
+        let roots = tako_core::sidebar::workspace_roots(
+            pane_cwds,
+            self.workspace.active_tab().pinned_folders().to_vec(),
+            tako_core::paths::home_dir(),
+        );
         self.filetree.set_roots(roots);
 
         // #919: リモート（SSH 先）のルートはアクティブタブが持つものに合わせる。
@@ -681,7 +740,11 @@ impl TakoApp {
                                 .py(px(2.0))
                                 .gap(px(4.0))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(hsla(theme.tab_active_foreground))
+                                .text_color(hsla(git_name_color(
+                                    row.git_status,
+                                    theme.tab_active_foreground,
+                                    &theme,
+                                )))
                                 // chevron (SVG)
                                 .child(
                                     svg()
@@ -706,16 +769,10 @@ impl TakoApp {
                                         .text_ellipsis()
                                         .child(SharedString::from(truncate(&row.entry.name, 22))),
                                 )
+                                // #1009: ワークスペースフォルダ配下の変更件数
+                                .children(git_badge_spans(row.git_status, &theme))
                             } else {
-                                let git_marker = row.git_status.map(|gs| match gs {
-                                    filetree::GitChange::Modified => ("M", theme.yellow),
-                                    filetree::GitChange::Added => ("A", theme.green),
-                                    filetree::GitChange::Deleted => ("D", theme.red),
-                                    filetree::GitChange::Renamed => ("R", theme.accent),
-                                    filetree::GitChange::Untracked => {
-                                        ("?", theme.tab_inactive_foreground)
-                                    }
-                                });
+                                let git_badge = git_badge_spans(row.git_status, &theme);
                                 // インデントガイド線（カンプ: margin-left 17px + 1px の縦線）。
                                 // 祖先の深さの線も一緒に描いて 1 本の連続線にする（#589）
                                 let mut row_el = base
@@ -731,7 +788,17 @@ impl TakoApp {
                                     .when(row.depth == 0, |d| d.pl(px(12.0)))
                                     .py(px(2.0))
                                     .gap(px(4.0))
-                                    .when(!is_dir, |d| d.text_color(hsla(theme.text_tertiary)))
+                                    // #1009: git の状態で名前を色分けする（未変更・
+                                    // git 管理外は従来どおりの色のまま）
+                                    .text_color(hsla(git_name_color(
+                                        row.git_status,
+                                        if is_dir {
+                                            theme.foreground
+                                        } else {
+                                            theme.text_tertiary
+                                        },
+                                        &theme,
+                                    )))
                                     .when(is_open, |d| {
                                         d.bg(rgba_alpha(theme.accent, 0.13))
                                             .text_color(hsla(theme.foreground))
@@ -796,17 +863,8 @@ impl TakoApp {
                                         .text_ellipsis()
                                         .child(SharedString::from(truncate(&row.entry.name, 24))),
                                 );
-                                // git status マーカー
-                                row_el = row_el.children(git_marker.map(|(label, color)| {
-                                    div()
-                                        .text_size(px(10.5))
-                                        .font_family("Monaco")
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(hsla(color))
-                                        .flex_none()
-                                        .pr(px(8.0))
-                                        .child(SharedString::from(label.to_string()))
-                                }));
+                                // git status バッジ（#1009）
+                                row_el = row_el.children(git_badge);
                                 row_el
                             }
                         })),
@@ -1684,6 +1742,7 @@ impl TakoApp {
                         path: Some(path_str),
                         tab: None,
                         pane: None,
+                        limit: None,
                     },
                     PaneOrigin::User,
                 );

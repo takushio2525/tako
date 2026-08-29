@@ -2791,26 +2791,42 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_tree_folder",
-            "description": "ファイルツリーへのフォルダの追加・削除・一覧（#134）。\
+            "description": "ファイルツリーへのフォルダの追加・削除・一覧（#134）と \
+                git ステータスの取得（#1009）。\
                 AI が作業対象プロジェクトのフォルダをファイルツリーに明示追加する。\
                 追加されたフォルダは cwd 由来のエントリと並んでツリーに表示される。\
                 プロジェクトの指示を受けたらそのルートフォルダを追加し、\
-                作業対象外になったら削除する。タブ単位スコープ（永続化される）。",
+                作業対象外になったら削除する。タブ単位スコープ（永続化される）。\
+                action=git-status: ツリーに色とバッジで出ている git の状態を\
+                そのまま返す（画面と同じ分類）。entries[] の state は \
+                modified / added / deleted / renamed / untracked / conflicted / ignored、\
+                staged / unstaged は git の XY（`git status --short` と同じ記号）で\
+                ステージ済みと未ステージを分けて持つ。propagated=true は\
+                ディレクトリ行（配下からの伝播で、changed が配下の変更ファイル数）。\
+                「未コミットのファイルは？」「どのフォルダに変更がある？」には \
+                git を叩き直さずここから答えられる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "remove", "list"],
-                        "description": "add: フォルダを追加, remove: フォルダを削除, list: 追加済み一覧"
+                        "enum": ["add", "remove", "list", "git-status"],
+                        "description": "add: フォルダを追加, remove: フォルダを削除, \
+                            list: 追加済み一覧, git-status: ツリーの git 状態を取得"
                     },
                     "path": {
                         "type": "string",
-                        "description": "追加・削除するフォルダの絶対パス（list 時は省略可）"
+                        "description": "追加・削除するフォルダの絶対パス（list 時は省略可）。\
+                            git-status では対象をこのフォルダ 1 件へ絞る（省略時はタブの\
+                            ワークスペースフォルダ全部 = 画面に出ている範囲）"
                     },
                     "tab": {
                         "type": "integer",
                         "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "git-status: 返すエントリ数の上限（既定 500）"
                     },
                 },
                 "required": ["action"],
