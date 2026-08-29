@@ -2051,7 +2051,9 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_remote_setup",
             "description": "リモートアクセスの Tailscale セットアップ状態を確認・実行する（#286）。\
                 action=check で Tailscale の導入・ログイン・HTTPS・serve の各項目を確認、\
-                action=run で serve 設定 + QR PNG 生成まで実行する。\
+                action=run で Tailscale 系統の決定 + serve 設定 + QR PNG 生成まで実行する\
+                （既定のループバック TCP では serve は `tako remote start` 時に張るので \
+                serve_config は deferred になる）。\
                 Tailscale が未導入・未ログインの場合は手順を案内して停止する。\
                 対話的なウィザード（brew install の実行等）は CLI `tako remote setup` で行い、\
                 このツールでは非対話実行のみ。",
@@ -2064,9 +2066,17 @@ pub fn tools() -> Vec<Value> {
                     },
                     "answers": {
                         "type": "object",
-                        "description": "run 時のオプション。yes=true で全質問を自動承認",
+                        "description": "run 時のオプション。yes=true で全質問を自動承認。\
+                            tailscale で使う Tailscale 系統を選ぶ（#1038: macOS では \
+                            GUI 版アプリと standalone tailscaled が同居し、\
+                            別ノードとして二重登録されることがある。省略時は検出結果から決め、\
+                            選んだ理由を tailscale_reason に返す）",
                         "properties": {
                             "yes": { "type": "boolean" },
+                            "tailscale": {
+                                "type": "string",
+                                "enum": ["auto", "gui", "standalone"],
+                            },
                         },
                     },
                 },

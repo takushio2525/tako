@@ -8,6 +8,48 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+### Fixed / 修正
+
+- **[修正] `tako remote` が全リクエスト 502 になる問題を根治: serve の中継先を
+  ループバック TCP へ (#1038) (#971)**
+  daemon の待ち受けを `127.0.0.1:<エフェメラルポート>` にし、`tailscale serve` の
+  中継先をそこへ向けた。macOS の GUI 版 Tailscale（システム拡張）はサンドボックスの
+  ため **どの Unix domain socket も dial できず**、従来の `unix:` 中継では
+  ts.net URL への全リクエストが 502 になっていた。Windows の tailscale は
+  `unix:` の serve target を持たないため、同じ変更で `tako remote setup` の
+  serve 設定（#971）も通るようになる。`TAKO_REMOTE_ENDPOINT=unix` で従来の
+  Unix domain socket へ戻せる（standalone tailscaled のみの環境向け）。
+  Fixed `tako remote` returning 502 for every request by proxying Tailscale Serve to a
+  loopback TCP listener instead of a Unix domain socket. The macOS GUI Tailscale
+  (system extension) is sandboxed and cannot dial any Unix socket, and Windows'
+  tailscale has no `unix:` serve target at all (#971). Set
+  `TAKO_REMOTE_ENDPOINT=unix` to keep the previous Unix-socket listener.
+
+### Added / 追加
+
+- **[機能追加] `tako remote start` に起動時の自己疎通チェックを追加 (#1038)**
+  serve を張った直後に ts.net URL へ 1 回だけ GET し、502（= 中継先へ届いていない）を
+  検出したら理由と次の一手を出して起動を止める。「起動中を名乗るのに開けない」状態を
+  作らない。401 / 403 は「届いている」証拠なので正常扱いにし、ネットワーク不達では
+  断定しない。
+  `tako remote start` now probes its own ts.net URL right after configuring serve and
+  refuses to report success when the proxy cannot reach the backend (HTTP 502),
+  printing the reason and the next step.
+- **[機能追加] Tailscale の系統（GUI 版 / standalone）を選べるようにした (#1038)**
+  macOS では 2 つの Tailscale が同時に動き、**別ノードとして二重登録**される。
+  tako はどちらを使うか決め打ちせず、`tako remote setup` で選ばせる
+  （非対話では「現にノード実体として応答している方」を選び根拠を返す）。
+  選択は保存され、以後の `start` で使われる。切り替えは
+  `tako remote setup --tailscale <auto|standalone>` / MCP `tako_remote_setup` の
+  `answers.tailscale`、いまの状態は `tako remote status` の `tailscale_variant` と
+  `warnings` で分かる。
+  tako no longer hard-codes which Tailscale daemon to use when both the GUI app and a
+  standalone `tailscaled` are running; it asks (or explains its non-interactive pick),
+  remembers the choice, and surfaces the duplicate-node situation in
+  `tako remote status`.
+
 ## [0.8.1] - 2026-08-29
 
 Nightly patch release (automated). Changes since v0.8.0:

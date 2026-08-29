@@ -37,6 +37,10 @@ pub struct RemoteSetupResult {
     pub qr_path: Option<String>,
     pub steps: Vec<SetupStepResult>,
     pub phone_instructions: Option<String>,
+    /// 使うことにした Tailscale 系統（`gui` / `standalone`。#1038）
+    pub tailscale_variant: Option<String>,
+    /// その系統を選んだ根拠（決め打ちしていないことを応答で示す）
+    pub tailscale_reason: Option<String>,
 }
 
 /// remote setup の非対話パラメータ（dispatch / MCP 経由）
@@ -45,6 +49,9 @@ pub struct RemoteSetupResult {
 pub struct RemoteSetupAnswers {
     /// true = 全質問に yes で回答（brew install 等）
     pub yes: Option<bool>,
+    /// 使う Tailscale 系統（`gui` = GUI 版 / 既定探索、`standalone` = 自前の tailscaled）。
+    /// 省略時は検出結果から決める（#1038: 2 系統が同居しうるので決め打ちしない）
+    pub tailscale: Option<String>,
 }
 
 impl RemoteSetupAnswers {
@@ -53,16 +60,165 @@ impl RemoteSetupAnswers {
     }
 }
 
+/// 系統決定ステップの表示文。同居しているときは選択肢と変更手段まで出す
+pub fn variant_step_message(decision: &VariantDecision) -> String {
+    let mut msg = format!("{}（{}）", decision.variant.describe(), decision.reason);
+    if decision.coexisting {
+        msg.push_str("\n  検出した系統:");
+        for c in &decision.candidates {
+            msg.push_str(&format!("\n    - {c}"));
+        }
+        msg.push_str(
+            "\n  変更するには: tako remote setup --tailscale <auto|standalone>\
+             （auto = 既定探索 = GUI 版があればそれ。MCP は tako_remote_setup の answers.tailscale）",
+        );
+    }
+    msg
+}
+
+/// serve ステップの表示文
+pub fn serve_step_message(step: &ServeStep) -> String {
+    match step {
+        ServeStep::Deferred => "`tako remote start` 時に設定します\
+             （ループバック TCP のポートは起動時に決まるため）"
+            .into(),
+        ServeStep::AlreadyConfigured(t) => format!("serve は設定済み（{t} へプロキシ）"),
+        ServeStep::Configured(t) => format!("serve を設定しました（{t} へプロキシ）"),
+    }
+}
+
+/// Tailscale 系統の決定結果（#1038）
+#[derive(Debug, Clone)]
+pub struct VariantDecision {
+    pub variant: tailscale::TailscaleVariant,
+    /// なぜこの系統を選んだか（応答・表示に必ず載せる）
+    pub reason: String,
+    /// 2 系統が別ノードとして同時に動いているか
+    pub coexisting: bool,
+    /// 検出した系統の 1 行要約（選択肢の提示・表示用）
+    pub candidates: Vec<String>,
+}
+
+/// 検出した系統から `choose_variant` の入力を作る（純関数側へ渡す要約）
+fn candidates_of(survey: &tailscale::VariantSurvey) -> Vec<tailscale::VariantCandidate> {
+    survey
+        .probes
+        .iter()
+        .map(|p| tailscale::VariantCandidate {
+            key: p.variant.key(),
+            ready: p.ready(),
+            is_default_discovery: matches!(p.variant, tailscale::TailscaleVariant::Default),
+            node: p.node().map(|s| s.to_string()),
+        })
+        .collect()
+}
+
+/// 非対話で系統を決めて保存する。`explicit` があればそれを最優先で使う。
+///
+/// **GUI 決め打ちはしない**: 使える系統が 1 つならそれ、複数なら「現にノード実体として
+/// 応答している方」を選び、根拠を返す（呼び出し側が応答・表示に載せる）
+pub fn decide_variant(explicit: Option<&str>) -> Result<VariantDecision, String> {
+    let survey = tailscale::survey_variants();
+    let candidates: Vec<String> = survey.probes.iter().map(|p| p.summary()).collect();
+
+    if let Some(key) = explicit.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let variant = tailscale::TailscaleVariant::parse(key).ok_or_else(|| {
+            format!(
+                "Tailscale 系統の指定が不正です: {key}（auto | gui | standalone）。\
+                 standalone を選ぶには tailscaled の LocalAPI socket が必要です"
+            )
+        })?;
+        tailscale::save_variant(&variant)?;
+        return Ok(VariantDecision {
+            reason: format!("指定により {} を使います", variant.describe()),
+            variant,
+            coexisting: survey.coexisting,
+            candidates,
+        });
+    }
+
+    // 保存済みの選択があればそれを尊重する（毎回聞かない）
+    if let Some(saved) = tailscale::saved_variant() {
+        return Ok(VariantDecision {
+            reason: format!("保存済みの選択（{}）を使います", saved.describe()),
+            variant: saved,
+            coexisting: survey.coexisting,
+            candidates,
+        });
+    }
+
+    let picks = candidates_of(&survey);
+    let Some((key, reason)) = tailscale::choose_variant(&picks) else {
+        // 使える系統が無い = 従来どおり不足項目を列挙して止める（呼び出し側の責務）
+        return Ok(VariantDecision {
+            variant: tailscale::TailscaleVariant::default(),
+            reason: "利用できる Tailscale が見つかりませんでした".into(),
+            coexisting: survey.coexisting,
+            candidates,
+        });
+    };
+    let variant = tailscale::TailscaleVariant::parse(key)
+        .ok_or_else(|| format!("Tailscale 系統を解決できない: {key}"))?;
+    tailscale::save_variant(&variant)?;
+    Ok(VariantDecision {
+        reason,
+        variant,
+        coexisting: survey.coexisting,
+        candidates,
+    })
+}
+
+/// serve 設定ステップの結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeStep {
+    /// ループバック TCP なので、ポートが決まる `tako remote start` 時に設定する
+    Deferred,
+    /// 既に自分の target を向いている
+    AlreadyConfigured(String),
+    /// いま設定した
+    Configured(String),
+}
+
+/// serve 設定ステップ（対話 / 非対話で共有）。
+/// 既定のループバック TCP はポートが起動時にしか決まらないので**ここでは張らない**
+/// （#1038: 固定 target を前提にできるのは UDS を明示したときだけ）
+pub fn configure_serve(cli: &str) -> Result<ServeStep, String> {
+    let spec = crate::remote::endpoint_spec()?;
+    let sock = match spec {
+        crate::platform::local_endpoint::EndpointSpec::Loopback => return Ok(ServeStep::Deferred),
+        crate::platform::local_endpoint::EndpointSpec::Unix(path) => path,
+    };
+    let target = tailscale::proxy_target_for_socket(&sock);
+    match tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))? {
+        ServeState::Proxy(ref existing) if *existing == target => {
+            Ok(ServeStep::AlreadyConfigured(target))
+        }
+        ServeState::NotConfigured => {
+            tailscale::serve_start_target(cli, &target)
+                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
+            Ok(ServeStep::Configured(target))
+        }
+        ServeState::Proxy(existing) => Err(format!(
+            "HTTPS:443 は別のプロキシ先に設定済みです（{existing}）。\
+             先に `tailscale serve --https=443 off` で解除してください。"
+        )),
+        ServeState::Other => Err("HTTPS:443 にカスタム serve 設定が存在します。\
+             tako はこの設定を上書きしません。先に手動で解除してください。"
+            .into()),
+    }
+}
+
 /// ウィザードの非対話実行（dispatch / MCP から呼ばれる。CLI の対話版は tako-cli 側）。
 /// 各ステップを順に実行し、結果を返す。失敗したステップで停止する。
-pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String> {
-    let sock = crate::remote::socket_path();
+pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String> {
     let mut result = RemoteSetupResult {
         success: false,
         ts_net_url: None,
         qr_path: None,
         steps: Vec::new(),
         phone_instructions: None,
+        tailscale_variant: None,
+        tailscale_reason: None,
     };
 
     // Step 1: Tailscale 検出
@@ -83,6 +239,23 @@ pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String
             status.cli_path.as_deref().unwrap_or("?")
         ),
     });
+
+    // Step 1.5: 使う Tailscale 系統を決める（#1038: GUI 版 / standalone が同居しうる）
+    let decision = decide_variant(answers.tailscale.as_deref())?;
+    result.steps.push(SetupStepResult {
+        step: "tailscale_variant",
+        status: if decision.coexisting {
+            "selected"
+        } else {
+            "ok"
+        },
+        message: variant_step_message(&decision),
+    });
+    result.tailscale_variant = Some(decision.variant.key().to_string());
+    result.tailscale_reason = Some(decision.reason.clone());
+
+    // 系統を決めた後の状態で判定し直す（standalone を選んだなら standalone の状態を見る）
+    let status = tailscale::setup_status();
 
     // Step 2: デーモン・ログイン・HTTPS の確認
     if !status.missing.is_empty() {
@@ -108,44 +281,22 @@ pub fn run_noninteractive(_answers: &RemoteSetupAnswers) -> Result<Value, String
         .ok_or_else(|| "MagicDNS 名を取得できません".to_string())?;
     let ts_url = format!("https://{dns_name}");
 
-    // Step 3: serve 設定
-    let serve = tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))?;
-    let target = tailscale::proxy_target_for_socket(&sock);
-    match serve {
-        ServeState::Proxy(ref existing) if *existing == target => {
-            result.steps.push(SetupStepResult {
-                step: "serve_config",
-                status: "ok",
-                message: format!("serve は設定済み（{target} へプロキシ）"),
-            });
-        }
-        ServeState::NotConfigured => {
-            tailscale::serve_start_unix(cli, &sock)
-                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
-            result.steps.push(SetupStepResult {
-                step: "serve_config",
-                status: "configured",
-                message: format!("serve を設定しました（{target} へプロキシ）"),
-            });
-        }
-        ServeState::Proxy(existing) => {
+    // Step 3: serve 設定（既定のループバック TCP はポートが起動時に決まるので後回し）
+    match configure_serve(cli) {
+        Ok(step) => result.steps.push(SetupStepResult {
+            step: "serve_config",
+            status: match step {
+                ServeStep::Deferred => "deferred",
+                ServeStep::AlreadyConfigured(_) => "ok",
+                ServeStep::Configured(_) => "configured",
+            },
+            message: serve_step_message(&step),
+        }),
+        Err(e) => {
             result.steps.push(SetupStepResult {
                 step: "serve_config",
                 status: "conflict",
-                message: format!(
-                    "HTTPS:443 は別のプロキシ先に設定済み（{existing}）。\n\
-                     tako の設定に変更するには、先に tailscale serve --https=443 off で解除してください。"
-                ),
-            });
-            return Ok(serde_json::to_value(&result).unwrap());
-        }
-        ServeState::Other => {
-            result.steps.push(SetupStepResult {
-                step: "serve_config",
-                status: "conflict",
-                message: "HTTPS:443 にカスタム serve 設定が存在します。\n\
-                     tako はこの設定を上書きしません。先に手動で解除してください。"
-                    .into(),
+                message: e,
             });
             return Ok(serde_json::to_value(&result).unwrap());
         }
@@ -210,9 +361,53 @@ pub fn phone_setup_instructions(ts_url: &str) -> String {
     )
 }
 
+/// 対話での系統選択。2 系統が同居しているときだけ聞く（1 つしか無ければ聞かない）。
+/// `--yes` / 明示指定のときは非対話の規則で決める
+fn choose_variant_interactive(
+    explicit: Option<&str>,
+    auto_yes: bool,
+    writer: &mut dyn io::Write,
+) -> Result<VariantDecision, String> {
+    if explicit.is_some() || auto_yes {
+        return decide_variant(explicit);
+    }
+    let survey = tailscale::survey_variants();
+    if !survey.coexisting || tailscale::saved_variant().is_some() {
+        // 同居していない or 既に選択済み = 聞く必要がない
+        return decide_variant(None);
+    }
+    writeln!(writer).map_err(|e| e.to_string())?;
+    writeln!(
+        writer,
+        "Tailscale が 2 系統同時に動いています（別ノードとして二重登録されます）。\
+         どちらを使いますか?"
+    )
+    .map_err(|e| e.to_string())?;
+    for (i, probe) in survey.probes.iter().enumerate() {
+        writeln!(writer, "  {}. {}", i + 1, probe.summary()).map_err(|e| e.to_string())?;
+    }
+    write!(writer, "番号を選んでください [1] ").map_err(|e| e.to_string())?;
+    let _ = writer.flush();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| e.to_string())?;
+    let idx = input.trim().parse::<usize>().unwrap_or(1);
+    let probe = survey
+        .probes
+        .get(idx.saturating_sub(1))
+        .or_else(|| survey.probes.first())
+        .ok_or("Tailscale が検出できませんでした")?;
+    decide_variant(Some(probe.variant.key()))
+}
+
 /// `tako remote setup` を対話的に実行する（CLI 専用。TTY 出力つき）。
 /// ステップごとに進捗を表示し、ユーザーの入力を求める場合がある
-pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Value, String> {
+pub fn run_interactive(
+    auto_yes: bool,
+    tailscale_choice: Option<&str>,
+    writer: &mut dyn io::Write,
+) -> Result<Value, String> {
     writeln!(writer, "tako remote setup").map_err(|e| e.to_string())?;
     writeln!(writer, "==================").map_err(|e| e.to_string())?;
     writeln!(writer).map_err(|e| e.to_string())?;
@@ -276,7 +471,15 @@ pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Val
             .map_err(|e| e.to_string())?;
     }
 
-    // 再取得（install 後の場合があるため）
+    // Step 1.5: 使う Tailscale 系統を決める（#1038）
+    let decision = choose_variant_interactive(tailscale_choice, auto_yes, writer)?;
+    writeln!(
+        writer,
+        "  Tailscale 系統: {}",
+        variant_step_message(&decision)
+    )
+    .map_err(|e| e.to_string())?;
+    // 系統を決めた後の状態で見直す（standalone を選んだならその状態を見る）
     let status = tailscale::setup_status();
     let cli = status
         .cli_path
@@ -359,44 +562,23 @@ pub fn run_interactive(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Val
     let ts_url = format!("https://{dns_name}");
     writeln!(writer, "OK ({dns_name})").map_err(|e| e.to_string())?;
 
-    // Step 4: serve 設定
+    // Step 4: serve 設定（既定のループバック TCP は `tako remote start` 時に張る）
     write!(writer, "[4/5] serve を設定中... ").map_err(|e| e.to_string())?;
     let _ = writer.flush();
 
-    let sock = crate::remote::socket_path();
-    let serve = tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))?;
-    let target = tailscale::proxy_target_for_socket(&sock);
-
-    match serve {
-        ServeState::Proxy(ref existing) if *existing == target => {
-            writeln!(writer, "設定済み").map_err(|e| e.to_string())?;
+    match configure_serve(cli) {
+        Ok(step) => {
+            let label = match step {
+                ServeStep::Deferred => "起動時に設定",
+                ServeStep::AlreadyConfigured(_) => "設定済み",
+                ServeStep::Configured(_) => "設定完了",
+            };
+            writeln!(writer, "{label}").map_err(|e| e.to_string())?;
+            writeln!(writer, "  {}", serve_step_message(&step)).map_err(|e| e.to_string())?;
         }
-        ServeState::NotConfigured => {
-            tailscale::serve_start_unix(cli, &sock)
-                .map_err(|e| format!("serve の設定に失敗: {e}"))?;
-            writeln!(writer, "設定完了 ({target})").map_err(|e| e.to_string())?;
-        }
-        ServeState::Proxy(existing) => {
+        Err(e) => {
             writeln!(writer, "競合").map_err(|e| e.to_string())?;
-            writeln!(
-                writer,
-                "  HTTPS:443 は別のプロキシ先に設定済みです: {existing}"
-            )
-            .map_err(|e| e.to_string())?;
-            writeln!(
-                writer,
-                "  先に `tailscale serve --https=443 off` で解除してください。"
-            )
-            .map_err(|e| e.to_string())?;
-            return Err("serve 設定が競合しています".into());
-        }
-        ServeState::Other => {
-            writeln!(writer, "競合").map_err(|e| e.to_string())?;
-            writeln!(
-                writer,
-                "  HTTPS:443 にカスタム serve 設定が存在します。手動で解除してください。"
-            )
-            .map_err(|e| e.to_string())?;
+            writeln!(writer, "  {e}").map_err(|e| e.to_string())?;
             return Err("serve 設定が競合しています".into());
         }
     }

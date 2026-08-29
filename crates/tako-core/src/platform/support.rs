@@ -207,10 +207,10 @@ pub mod notes {
         "The new tab opens, but the pane cwd becomes `///?/C:/...`, so git operations in that tab stop with \"not a git repository\" (`tab new --cwd` and `tree add` share this; #970)",
     );
 
-    /// #971。Windows の tailscale は unix ソケット target を持たない
+    /// #971 / #1038。unix ソケット target の決め打ちは #1038 で解消したが、Windows 実機は未実測
     pub const WIN_REMOTE_SERVE_UNIX: Note = Note::new(
-        "`tako remote setup` が serve の設定で失敗する（tailscale serve へ unix ソケットを渡しており Windows は非対応）ため、リモートアクセスのデーモンを起動できない。状態照会は動くが常に running=false（#971）",
-        "`tako remote setup` fails while configuring serve (it passes a unix socket target to tailscale serve, which Windows does not support), so the remote daemon cannot start. Status queries work but always report running=false (#971)",
+        "#1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971）",
+        "The hard-coded unix socket serve target was removed in #1038 (the daemon now listens on loopback TCP), so `unix socket serve target is not supported on Windows` no longer applies. The end-to-end run on real Windows hardware (setup step 4 -> daemon start -> phone access) is still unmeasured (#971)",
     );
 
     /// #972。器の境界（#519）を通らず `tako_core::tmux` を直に叩いている
@@ -1217,7 +1217,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 971,
         },
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: 1〜3 段（Tailscale 検出 / ログイン / HTTPS 証明書）は OK で、4 段目の serve 設定が `unix socket serve target is not supported on Windows` で失敗する（#971）",
+            "#937 の Windows 11 実測（#1038 の修正**前**）: 1〜3 段（Tailscale 検出 / ログイン / HTTPS 証明書）は OK で、4 段目の serve 設定が `unix socket serve target is not supported on Windows` で失敗した。#1038 でこの原因は取り除いたが、実機での再測はまだ（#971）",
         ),
     },
     Feature {
