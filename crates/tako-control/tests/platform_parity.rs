@@ -679,9 +679,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-app/src/update_checker.rs",
-            2,
-            "macOS 限定の `ditto`（zip 展開）2 箇所。Windows インストーラーの起動は \
-             GUI アプリなので窓を見せるのが正",
+            1,
+            "macOS 限定の `ditto`（zip 展開）1 箇所。Windows インストーラーの起動は \
+             GUI アプリなので窓を見せるのが正。バンドルの差し替え側は #1042 で \
+             `tako_core::platform::bundle_install` へ移り、そちらは境界を通している",
         ),
         (
             "crates/tako-cli/src/setup.rs",

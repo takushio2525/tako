@@ -40,6 +40,11 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// ここを直接使ってよいのは HTTP の User-Agent だけ（「どのビルドが叩いたか」を知りたいため）
 pub const CURRENT_VERSION: &str = env!("TAKO_FULL_VERSION");
 
+/// macOS で `.app` が入る正本の置き場。**Dock のピンが指しているのはこのパス**なので、
+/// 更新の途中でここが空になってはいけない（#1042。差し替えは
+/// `tako_core::platform::bundle_install::replace_bundle_in_place` を通す）
+pub const APP_INSTALL_PATH: &str = "/Applications/tako.app";
+
 /// 更新判定と画面表示に使う「いま入っている版数」。
 ///
 /// インストーラーが記録した版数（`DisplayVersion`）を最優先する。理由は #723:
@@ -376,7 +381,7 @@ fn detect_install_method_inner(app_in_caskroom: bool, exe_in_caskroom: bool) -> 
 
 /// `/Applications/tako.app` が存在するか（シンボリックリンクでも実体でも OK）
 fn applications_tako_app_exists() -> bool {
-    Path::new("/Applications/tako.app").exists()
+    Path::new(APP_INSTALL_PATH).exists()
 }
 
 /// brew コマンドが使えるか
@@ -407,7 +412,7 @@ pub fn diagnose_broken_brew() -> Option<BrokenBrewDiagnosis> {
         return None;
     }
     Some(BrokenBrewDiagnosis {
-        app_path: "/Applications/tako.app".into(),
+        app_path: APP_INSTALL_PATH.into(),
         brew_available: true,
         cask_registered: false,
         repair_command: "brew install --cask takushio2525/tako/tako --force".into(),
@@ -936,35 +941,30 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
     let extracted_app = find_app_bundle(&tmp_dir)
         .ok_or_else(|| "展開した ZIP に tako.app が見つかりません".to_string())?;
 
-    let dest = Path::new("/Applications/tako.app");
-    if dest.exists() {
-        let backup = Path::new("/Applications/tako.app.bak");
-        let _ = std::fs::remove_dir_all(backup);
-        std::fs::rename(dest, backup)
-            .map_err(|e| format!("/Applications/tako.app のバックアップに失敗: {e}"))?;
-    }
-    let output = std::process::Command::new("ditto")
-        .args([
-            &extracted_app.to_string_lossy().to_string(),
-            &dest.to_string_lossy().to_string(),
-        ])
-        .output()
-        .map_err(|e| format!("アプリのコピーに失敗: {e}"))?;
-    if !output.status.success() {
-        let backup = Path::new("/Applications/tako.app.bak");
-        if backup.exists() {
-            let _ = std::fs::rename(backup, dest);
-        }
-        return Err(format!(
-            "アプリのインストールに失敗: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
+    // 置き場のパスを一度も空けずに差し替える（#1042）。
+    // 「退避 → 新規コピー → 退避先を削除」にすると、Dock のピン（.app への file URL
+    // ブックマーク）が退避先へ追従したところでその実体を消してしまい、ピンが外れる
+    let dest = Path::new(APP_INSTALL_PATH);
+    let strategy =
+        tako_core::platform::bundle_install::replace_bundle_in_place(dest, &extracted_app)?;
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    // 旧実装が残した退避（更新の途中で落ちた世代）が在れば片付ける
     let _ = std::fs::remove_dir_all(Path::new("/Applications/tako.app.bak"));
 
-    Ok("ZIP で更新完了".into())
+    // 手段の語（contents-swap / swap / fresh / move-aside）を必ず載せる。
+    // dispatch の `message` からそのまま読めるので、CLI / MCP でも何が起きたか分かる（#1042）
+    if strategy.keeps_path_occupied() {
+        Ok(format!("ZIP で更新完了（差し替え: {}）", strategy.label()))
+    } else {
+        // swap が使えない環境。更新自体は済んでいるので成功だが、Dock のピンが
+        // 外れうることは伏せない（#1042）
+        Ok(format!(
+            "ZIP で更新完了（差し替え: {}。この環境ではアトミックな入れ替えが使えないため、\
+             Dock のピン留めが外れることがあります）",
+            strategy.label()
+        ))
+    }
 }
 
 /// ディレクトリ内の *.app バンドルを再帰的に探す

@@ -385,6 +385,26 @@ echo "        ${registered}（${note}）"  # ○
 grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]' scripts/*.sh scripts/lib/*.sh
 ```
 
+## `.app` の差し替えは置き場のパスを空けない（Issue #1042）
+
+**`/Applications/tako.app` を差し替えるときに、そのパスが空になる瞬間を作ってはいけない。**
+
+Dock のピン留めは `.app` への **file URL ブックマーク**（`com.apple.dock` の
+`persistent-apps[].tile-data.book`）で持たれ、CNID（inode）を優先して解決する。
+「退避 → 新規コピー → 退避先を削除」にすると、置き場が空いた瞬間に追跡側は
+「アプリが退避先へ移動した」としか読めず参照をそちらへ書き直し、最後の削除で
+その実体が消えてピンが外れる（#1042 で実測確定）。
+
+- 差し替えは **`tako_core::platform::bundle_install::replace_bundle_in_place` を通す**。
+  自前で `rename` / `rm -rf` → `cp -R` を書かない
+- 手段は 3 段: `Contents/` だけを `RENAME_SWAP`（`.app` の inode ごと不変 = 最良）→
+  バンドルごと `RENAME_SWAP` → 退避 → 設置（swap が使えない環境のみ。警告を出す）
+- シェル側は写し（`scripts/lib/bundle-install.sh` の `install_bundle_in_place`）。
+  検証は `bash scripts/test-bundle-install.sh`
+- 番犬は `crates/tako-control/tests/bundle_install_watchdog.rs`（Rust 側・シェル側の
+  両方が旧手順へ戻っていないことを file 単位で検査する）
+- A/B は `TAKO_1042_LEGACY=1`（修正前の手順をそのまま再現する。計測専用）
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**

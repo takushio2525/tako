@@ -26,6 +26,8 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 # scripts/lib/launch-services.sh の冒頭コメントが正）。release.sh も同じものを使う
 # shellcheck source=lib/launch-services.sh
 source "$REPO_ROOT/scripts/lib/launch-services.sh"
+# shellcheck source=lib/bundle-install.sh
+source "$REPO_ROOT/scripts/lib/bundle-install.sh"
 
 VERIFY=0
 INSTALL=0
@@ -249,8 +251,13 @@ fi
 
 if [[ $INSTALL -eq 1 ]]; then
   echo "==> $LS_CANONICAL_APP へ配置"
-  rm -rf "$LS_CANONICAL_APP"
-  cp -R "$APP" "$LS_CANONICAL_APP"
+  # 置き場のパスを一度も空けずに差し替える（#1042）。rm -rf → cp -R だと
+  # その窓を観測した Dock のピン留めが外れる
+  if ! install_strategy="$(install_bundle_in_place "$APP" "$LS_CANONICAL_APP")"; then
+    echo "エラー: ${LS_CANONICAL_APP} への配置に失敗" >&2
+    exit 1
+  fi
+  echo "    差し替えの手段: ${install_strategy}"
   ls_register "$LS_CANONICAL_APP"
   echo "==> Launch Services へ登録（CFBundleDocumentTypes の反映。#708）"
 

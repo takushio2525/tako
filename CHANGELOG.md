@@ -124,6 +124,29 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ### Fixed / 修正
 
+- [修正] [macOS] アプリ内アップデートのたびに Dock のピン留めが外れる問題を根治 (#1042)
+  Dock のピン留めは `.app` への **file URL ブックマーク**（`com.apple.dock` の
+  `persistent-apps[].tile-data.book`）で持たれ、CNID（inode）を優先して解決する。
+  更新の適用は `/Applications/tako.app` を `tako.app.bak` へ**退避してから**新版を
+  別 inode でコピーし、最後に退避先を削除していたので、**置き場が空いた瞬間**に
+  追跡している側は「アプリが退避先へ移動した」としか読めず参照をそちらへ書き直し、
+  最後の削除でその実体が消えてピンが外れていた。
+  差し替えを「隣へステージ → `renamex_np(RENAME_SWAP)` でアトミックに入れ替え →
+  旧版を捨てる」へ変更し、**置き場が一度も空かない**形にした。標準的なバンドルでは
+  `Contents/` だけを入れ替えるので **`.app` 自体の inode が変わらず**、ブックマークは
+  張り直しすら要らない（実測: 修正前は置き場が空になるサンプルを毎回 1300〜1600 件
+  観測し `isStale` が立つ / 修正後は 0 件で `isStale` は false のまま）。
+  副次的に、入れ替えの手前で失敗しても旧アプリが消えなくなった。
+  `scripts/build-app.sh --install` の `rm -rf` → `cp -R` も同じ形へ揃えた。
+  併せて `tako update apply` / `apply-zip` の応答に `message` を追加し、どの手段で
+  差し替えたか（`contents-swap` / `swap` / `fresh` / `move-aside`）を CLI / MCP から
+  読めるようにした（従来は dispatch がメッセージを捨てていた）。
+  Fixed the Dock pin being lost on every in-app update. The bundle is now staged next
+  to its destination and swapped in atomically (`RENAME_SWAP`), so
+  `/Applications/tako.app` is never momentarily absent; for standard bundles only
+  `Contents/` is swapped, leaving the `.app` inode — and therefore the Dock's
+  bookmark — untouched.
+
 - [修正] 検索のヒット位置が小文字化でバイト長が変わる文字でずれる問題を根治 (#1016)
   プレビューの検索・置換（⌘F / `tako preview-search` / `tako_preview_search`）が、
   **小文字化した写しのバイト位置を元テキストの位置として使っていた**。小文字化は
