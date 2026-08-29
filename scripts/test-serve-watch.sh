@@ -193,6 +193,10 @@ echo '{}' > "$TMP/serve.json"
 ELAPSED="$(wait_restore "$OURS" 12 || true)"
 if [ -z "$ELAPSED" ]; then pass "旧挙動では張り直されない（12 秒待って復帰なし）"; else fail "旧挙動なのに ${ELAPSED} 秒で張り直された"; fi
 check_eq "旧挙動では serve_ok を名乗らない" "null" "$(status_field serve_ok)"
+# **無説明の null にしない**（新 CLI × 自己検査なし daemon で「黙る」を残さない）
+check_eq "検査していないことが状態に出る" "unchecked" "$(status_field serve_state)"
+check_contains "理由と次の一手が出る" "$(status_field serve_note)" "tako remote stop"
+check_eq "検査が無いだけで劣化とは言わない" "null" "$(status_field degraded)"
 stop_daemon
 unset TAKO_1049_LEGACY
 

@@ -358,6 +358,12 @@ pub struct ServeHealth {
     pub next_step: Option<String>,
 }
 
+/// 自己検査の結果が無いときの説明（理由 + 次の一手）
+pub const UNCHECKED_NOTE: &str = "この daemon は serve の自己検査を行っていません\
+     （#1049 より前の世代の daemon が動き続けている / TAKO_1049_LEGACY=1）。\
+     稼働中 daemon の世代は status の serve_binary で確認できます。\
+     `tako remote stop && tako remote start` で作り直すと自己検査が付きます";
+
 /// 自己検査が止まっているとみなすまでの猶予（間隔の何倍か + 固定の余裕）
 pub const STALE_INTERVAL_FACTOR: u64 = 3;
 pub const STALE_GRACE_SECS: u64 = 30;
@@ -368,8 +374,17 @@ pub const STALE_GRACE_SECS: u64 = 30;
 /// 止まっていれば、最後の ok は現在の保証にならない
 pub fn status_fields(health: Option<&ServeHealth>, now: u64, interval_secs: u64) -> Value {
     let Some(h) = health else {
-        // 自己検査を持たない daemon（古い世代 / TAKO_1049_LEGACY=1）
-        return json!({ "serve_ok": Value::Null });
+        // 自己検査の結果が無い = **この daemon は検査していない**。
+        // 起きるのは 2 通り（どちらも「壊れている」ではないので `degraded` にはしない）:
+        //   ① #1049 より前の世代の daemon が動き続けている（tako を更新した直後に必ず起きる）
+        //   ② TAKO_1049_LEGACY=1 で自己検査を切っている
+        // **無説明の null を返さない**のが要点。理由が無いと「serve が見えないのか / 検査が
+        // 無いのか」を切り分けられず、#1049 が消したはずの「黙る」がここに残ってしまう
+        return json!({
+            "serve_ok": Value::Null,
+            "serve_state": "unchecked",
+            "serve_note": UNCHECKED_NOTE,
+        });
     };
     let age = now.saturating_sub(h.checked_at);
     let stale = age > interval_secs * STALE_INTERVAL_FACTOR + STALE_GRACE_SECS;
@@ -669,11 +684,23 @@ mod tests {
     }
 
     #[test]
-    fn 自己検査を持たない世代は判定を名乗らない() {
+    fn 自己検査を持たない世代は判定を名乗らず理由を出す() {
         let out = status_fields(None, 100, 30);
+        // 健全とも劣化とも言わない（検査していないのだから）
         assert_eq!(out["serve_ok"], Value::Null);
-        assert!(out.get("degraded").is_none());
+        assert!(
+            out.get("degraded").is_none(),
+            "検査が無い = 壊れている ではない"
+        );
         assert!(degraded_warning(&out).is_none());
+        // ただし**無説明にしない**（#1049: 黙る状態を残さない）
+        assert_eq!(out["serve_state"], json!("unchecked"));
+        let note = out["serve_note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("serve_binary"),
+            "世代の見分け方を出す: {note}"
+        );
+        assert!(note.contains("tako remote stop"), "次の一手を出す: {note}");
     }
 
     #[test]

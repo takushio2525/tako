@@ -3879,3 +3879,15 @@
   逃がしていた）ので、`remote start`（= `spawn_daemon`）へ寄せ「張り直した後も検査が回り続ける」
   検査を足した。注入 A/B で 2 通り（モックが 2 件 NG / 番犬が名指し）落ちることを実測
 - 次: 本番 daemon を新バイナリで立て直しての実測（serve を手で消す → 復帰 → 200）
+
+## 2026-08-29（#1049 追補: 自己検査を持たない daemon の無説明 null を塞ぐ）
+- master の検収差し戻し（「本番で serve_ok が None のまま」）は**測り方**だった。同一 daemon・
+  同一時刻の A/B で確定: PATH 先頭の `~/dev/tako/target/release/tako`（08/29 20:00 = merge 前）は
+  **`serve_ok` キーごと存在しない** / `/Applications` の 21:25 ビルドは `serve_ok=true state=ok`。
+  health ファイルは 18 秒前更新で健全、`setup --tailscale standalone --yes` も無害だった（#432 と同じ罠）
+- ただし「新 CLI × 自己検査を持たない daemon」（**tako を更新しても daemon は動き続けるので必ず起きる**）で
+  `serve_ok: null` が無説明になる穴は本物なので塞いだ: `serve_state: "unchecked"` +
+  `serve_note`（理由 + 世代の見分け方 = `serve_binary` + 次の一手）。**`degraded` にはしない**
+  （検査していない ≠ 壊れている）
+- 検証: 単体 16 本 + モック `scripts/test-serve-watch.sh` **37 件全緑**（Test 2 に 3 検査追加）+
+  fmt / clippy / `cargo test --workspace` 全緑 + Windows クロスチェック エラー 0・警告 12
