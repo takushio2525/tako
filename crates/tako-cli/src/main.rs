@@ -797,6 +797,22 @@ enum TreeCommand {
         #[arg(long)]
         tab: Option<u64>,
     },
+    /// ファイルツリーに出ている git の状態を取得する（#1009）。
+    /// サイドバーの色・バッジと同じ分類（modified / added / deleted / renamed /
+    /// untracked / conflicted / ignored）を、ステージ済み（staged）と
+    /// 未ステージ（unstaged）に分けて返す。
+    /// propagated=true の行はディレクトリで、changed が配下の変更ファイル数
+    #[command(name = "git-status")]
+    GitStatus {
+        /// 対象フォルダ（省略時はタブのワークスペースフォルダ全部 = 画面に出ている範囲）
+        path: Option<String>,
+        /// 対象タブ ID（省略時は呼び出し元ペインのタブ）
+        #[arg(long)]
+        tab: Option<u64>,
+        /// 返すエントリ数の上限（既定 500）
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3527,6 +3543,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             path: Some(folder.clone()),
             tab: None,
             pane: Some(pane_id),
+            limit: None,
         });
     }
     if !tree_folders.is_empty() {
@@ -6469,18 +6486,28 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 path: Some(resolve_cli_path(path)),
                 tab: *tab,
                 pane: caller_pane(),
+                limit: None,
             },
             TreeCommand::Remove { path, tab } => Request::TreeFolder {
                 action: "remove".to_string(),
                 path: Some(resolve_cli_path(path)),
                 tab: *tab,
                 pane: caller_pane(),
+                limit: None,
             },
             TreeCommand::List { tab } => Request::TreeFolder {
                 action: "list".to_string(),
                 path: None,
                 tab: *tab,
                 pane: caller_pane(),
+                limit: None,
+            },
+            TreeCommand::GitStatus { path, tab, limit } => Request::TreeFolder {
+                action: "git-status".to_string(),
+                path: path.as_deref().map(resolve_cli_path),
+                tab: *tab,
+                pane: caller_pane(),
+                limit: *limit,
             },
         },
         Command::Sessions(sub) => match sub {

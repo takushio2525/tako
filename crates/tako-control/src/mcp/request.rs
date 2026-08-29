@@ -824,6 +824,7 @@ pub(super) fn build_request(
             path: str_arg(args, "path")?.map(|s| s.to_string()),
             tab: u64_arg(args, "tab")?,
             pane: caller,
+            limit: u64_arg(args, "limit")?.map(|v| v as usize),
         },
         "tako_sessions" => {
             let action = str_arg(args, "action")?.ok_or("action を指定する")?;

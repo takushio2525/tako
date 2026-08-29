@@ -71,6 +71,11 @@ pub struct GitStatusEntry {
 /// 「ステージ済み」でも単純な「変更」でもない第 3 の状態なので専用の記号を使う。
 pub const CONFLICT_BADGE: char = '!';
 
+/// `.gitignore` で無視されているエントリの印（#1009）。
+/// `--ignored` を付けたときだけ現れる `!` レコードを表す内部マーカーで、
+/// 変更ではないので `is_staged` / `is_unstaged` のどちらにも数えない
+pub const IGNORED_MARK: char = '!';
+
 impl GitStatusEntry {
     /// マージ未解決（porcelain v2 の `u` レコード）か（#494）。
     /// コンフリクトは解決してステージするまでコミットできないので、
@@ -79,15 +84,30 @@ impl GitStatusEntry {
         self.index == 'u' || self.worktree == 'u'
     }
 
+    /// `.gitignore` で無視されているか（#1009。`status_tree` の `!` レコード由来）。
+    /// パスが `/` で終わるものは「ディレクトリごと無視」を意味する
+    pub fn is_ignored(&self) -> bool {
+        self.index == IGNORED_MARK && self.worktree == IGNORED_MARK
+    }
+
     /// index にステージ済みの変更があるか（#487。untracked '?' は未ステージ扱い、
-    /// #494: コンフリクトは「解決前」なのでステージ済みに含めない）
+    /// #494: コンフリクトは「解決前」なのでステージ済みに含めない、
+    /// #1009: 無視されたエントリはそもそも変更ではない）
     pub fn is_staged(&self) -> bool {
-        !self.is_conflicted() && self.index != '.' && self.index != '?' && self.index != ' '
+        !self.is_conflicted()
+            && !self.is_ignored()
+            && self.index != '.'
+            && self.index != '?'
+            && self.index != ' '
     }
 
     /// worktree 側に未ステージの変更があるか（#487。untracked も未ステージ側に出す。
-    /// #494: コンフリクトも「これから手を入れる側」として未ステージへ出す）
+    /// #494: コンフリクトも「これから手を入れる側」として未ステージへ出す、
+    /// #1009: 無視されたエントリは数えない）
     pub fn is_unstaged(&self) -> bool {
+        if self.is_ignored() {
+            return false;
+        }
         self.is_conflicted()
             || self.index == '?'
             || (self.worktree != '.' && self.worktree != '?' && self.worktree != ' ')
@@ -422,6 +442,25 @@ pub fn status(repo: &Path) -> GitStatus {
     parse_status(&out)
 }
 
+/// ファイルツリーの色付け用の status（#1009）。`status()` に `--ignored=matching` を足して
+/// **`.gitignore` 対象も返す**版。`matching` を選ぶのは、丸ごと無視されるディレクトリを
+/// `target/` の 1 行で返してくれる = 配下を列挙しないため（tako 自身の 39GB の `target/` でも
+/// 実測 10ms）。`traditional` は `-uall` と併せると中身を全部展開してしまう
+pub fn status_tree(repo: &Path) -> GitStatus {
+    let out = run_git(
+        repo,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-uall",
+            "--ignored=matching",
+        ],
+    )
+    .unwrap_or_default();
+    parse_status(&out)
+}
+
 fn parse_status(raw: &str) -> GitStatus {
     let mut result = GitStatus::default();
     for line in raw.lines() {
@@ -471,6 +510,17 @@ fn parse_status(raw: &str) -> GitStatus {
                 index: '?',
                 worktree: '?',
             });
+        } else if let Some(rest) = line.strip_prefix("! ") {
+            // #1009: `--ignored` を付けたときだけ出る無視エントリ。
+            // `status()` は `--ignored` を渡さないので既存の呼び出し側には現れない
+            let path = rest.to_string();
+            if !path.is_empty() {
+                result.entries.push(GitStatusEntry {
+                    path,
+                    index: IGNORED_MARK,
+                    worktree: IGNORED_MARK,
+                });
+            }
         }
     }
     result
@@ -1914,6 +1964,38 @@ mod tests {
         // 通常の変更は従来どおり
         assert!(!status.entries[1].is_conflicted());
         assert!(status.entries[1].is_unstaged());
+    }
+
+    /// #1009: `--ignored` を付けたときだけ出る `!` レコード。
+    /// 変更ではないので staged / unstaged のどちらにも数えない
+    #[test]
+    fn parse_statusは無視エントリを変更に数えない() {
+        let raw = "# branch.head main\n\
+                   ! target/\n\
+                   ! .envrc\n\
+                   1 .M N... 100644 100644 100644 abc def src/main.rs\n";
+        let status = parse_status(raw);
+        assert_eq!(status.entries.len(), 3);
+        let dir = &status.entries[0];
+        assert_eq!(dir.path, "target/");
+        assert!(dir.is_ignored());
+        assert!(!dir.is_staged());
+        assert!(!dir.is_unstaged());
+        assert!(!dir.is_conflicted());
+        assert!(status.entries[1].is_ignored());
+        // 通常の変更は従来どおり
+        assert!(!status.entries[2].is_ignored());
+        assert!(status.entries[2].is_unstaged());
+    }
+
+    /// `status()`（`--ignored` なし）の出力には `!` が現れない = 既存の呼び出し側は無傷
+    #[test]
+    fn 無視エントリはignoredを渡さなければ現れない() {
+        let raw = "# branch.head main\n\
+                   1 .M N... 100644 100644 100644 abc def src/main.rs\n\
+                   ? new.rs\n";
+        let status = parse_status(raw);
+        assert!(status.entries.iter().all(|e| !e.is_ignored()));
     }
 
     /// #494: 1 行入力欄向けの正規化。改行・タブ・制御文字は空白へ潰す

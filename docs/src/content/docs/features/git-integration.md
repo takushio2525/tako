@@ -101,7 +101,11 @@ tako git merge feature/x --yes
 
 MCP ツールは `tako_git_log` / `tako_git_diff` / `tako_git_show` / `tako_git_stage` / `tako_git_unstage` / `tako_git_commit` / `tako_git_push` / `tako_git_pull` / `tako_git_checkout` / `tako_git_branch_create` / `tako_git_merge` / `tako_git_merge_abort` / `tako_git_conflicts` / `tako_git_resolve_agent` の 14 個です。AI が「今の変更をレビューして、問題なければコミットして」といった作業を最後まで実行できます。
 
+## ファイルツリーの色分け
+
+サイドバーのファイルツリーでも、変更のあるファイルが色とバッジで分かります。フォルダには配下の変更件数が伝播するので、git ビューを開かなくても「どこに未コミットが残っているか」が見えます。詳しくは [ファイルツリー＆プレビュー](/features/file-preview/#git-の状態色とバッジ) を参照してください。
+
 ## 関連ページ
 
 - [CLI リファレンス](/guides/cli-reference/#git) — `tako git` の全コマンド
-- [ファイルツリー＆プレビュー](/features/file-preview/) — チェンジログビューで履歴を読む
+- [ファイルツリー＆プレビュー](/features/file-preview/) — ツリーの git 色分け・チェンジログビューで履歴を読む

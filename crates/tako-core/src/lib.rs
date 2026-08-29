@@ -11,6 +11,7 @@ pub mod command_card;
 pub mod dialog;
 pub mod file_uri;
 pub mod git;
+pub mod git_tree;
 pub mod handoff;
 pub mod header_layout;
 pub mod i18n;

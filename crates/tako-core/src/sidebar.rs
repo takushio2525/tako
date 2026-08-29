@@ -123,3 +123,81 @@ mod tests {
         }
     }
 }
+
+// ─────────── ワークスペースフォルダ（ツリーのルート行）の解決（#1009） ───────────
+//
+// 「タブ = ワークスペース」なので、ルート行はそのタブの各ペインの cwd + 明示追加
+// フォルダ（#134）を並べたもの。UI（サイドバー）と CLI / MCP（`tako tree git-status`）が
+// **この 1 実装**を共有するので、画面に出ている範囲と応答の範囲がずれない。
+
+use std::path::PathBuf;
+
+/// ルート行の並びを作る。symlink を解決したパスで重複を落とし、**渡された順**を保つ
+/// （表示順が呼び出しごとに揺れないため）。返すのは解決前のパス = 画面に出る表記のまま。
+///
+/// どちらも空なら `home` を 1 件だけ返す（初回起動で真っ白にしない）。
+pub fn workspace_roots(
+    pane_cwds: impl IntoIterator<Item = PathBuf>,
+    pinned: impl IntoIterator<Item = PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for path in pane_cwds.into_iter().chain(pinned) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.insert(canonical) {
+            roots.push(path);
+        }
+    }
+    if roots.is_empty() {
+        roots.extend(home);
+    }
+    roots
+}
+
+#[cfg(test)]
+mod workspace_roots_tests {
+    use super::*;
+
+    #[test]
+    fn 重複を落として渡された順を保つ() {
+        let roots = workspace_roots(
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+            ],
+            vec![PathBuf::from("/c"), PathBuf::from("/b")],
+            None,
+        );
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c")
+            ]
+        );
+    }
+
+    #[test]
+    fn 何も無ければホームだけを返す() {
+        assert_eq!(
+            workspace_roots(vec![], vec![], Some(PathBuf::from("/home/testuser"))),
+            vec![PathBuf::from("/home/testuser")]
+        );
+        assert!(workspace_roots(vec![], vec![], None).is_empty());
+    }
+
+    #[test]
+    fn ルートがあればホームは足さない() {
+        assert_eq!(
+            workspace_roots(
+                vec![PathBuf::from("/a")],
+                vec![],
+                Some(PathBuf::from("/home/testuser"))
+            ),
+            vec![PathBuf::from("/a")]
+        );
+    }
+}

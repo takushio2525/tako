@@ -462,6 +462,20 @@ tako tree remove ~/Documents/webapp
 tako tree list
 ```
 
+`git-status` で、ファイルツリーに色とバッジで出ている git の状態をそのまま取得できます（画面と同じ分類）。
+
+```bash
+tako tree git-status                     # タブのワークスペースフォルダ全部
+tako tree git-status ~/Documents/webapp  # フォルダを 1 つに絞る
+tako tree git-status --limit 50
+```
+
+応答の `entries[]` は 1 行ぶんの状態です。
+
+- `state` — `modified` / `added` / `deleted` / `renamed` / `untracked` / `conflicted` / `ignored`
+- `staged` / `unstaged` — git の XY（`git status --short` と同じ記号）。ステージ済みと未ステージを分けて持ちます
+- `propagated` — `true` ならディレクトリ行で、`changed` が配下の変更ファイル数です
+
 ### tako video
 
 プレビューペインで動画を開いているときの再生操作です。

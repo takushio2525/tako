@@ -53,7 +53,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 |---|---|
 | `tako_open_file` | ファイルをプレビューペインで開く（コード / Markdown / 画像 / PDF / 動画） |
 | `tako_file_op` | ファイル操作（パスコピー / Finder 表示 / cd / リネーム / 作成 / ゴミ箱 / 既定アプリで開く） |
-| `tako_tree_folder` | ファイルツリーへフォルダを追加・削除・一覧する |
+| `tako_tree_folder` | ファイルツリーへフォルダを追加・削除・一覧する / git ステータスを取得する（`action: "git-status"`） |
 | `tako_preview_view` | PDF・画像のズーム / ページ / パン操作 |
 | `tako_preview_outline` | Markdown 見出し・PDF 目次のアウトライン表示とジャンプ |
 | `tako_preview_link_list` | PDF 内のリンク一覧を取得する |

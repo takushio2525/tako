@@ -102,6 +102,13 @@ pub enum OffloadJob {
         hash: String,
         file: Option<String>,
     },
+    /// ファイルツリーの git ステータス（#1009）。
+    /// ルートの解決は UI スレッドで済ませ、`git` の実行だけをここへ出す
+    TreeGitStatus {
+        tab: u64,
+        roots: Vec<PathBuf>,
+        limit: Option<usize>,
+    },
 }
 
 /// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
@@ -163,6 +170,30 @@ pub fn prepare_offload(
                 file: file.clone(),
             }))
         }
+        // #1009: `git status` は巨大なリポジトリだと数百 ms かかりうるので、
+        // ルートの解決（workspace を読む = UI スレッド必須）だけをここで済ませて
+        // 実行は background へ出す（#168 の GitLog / GitDiff と同じ扱い）
+        Request::TreeFolder {
+            action,
+            path,
+            tab,
+            pane,
+            limit,
+        } if action == "git-status" => {
+            let tab_id = match resolve_tab(host.workspace(), *tab, *pane) {
+                Ok(id) => id,
+                Err(e) => return Some(Err(e)),
+            };
+            let roots = match tree_git_status_roots(host, tab_id, path.clone()) {
+                Ok(roots) => roots,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(Ok(OffloadJob::TreeGitStatus {
+                tab: tab_id.as_u64(),
+                roots,
+                limit: *limit,
+            }))
+        }
         _ => None,
     }
 }
@@ -185,6 +216,9 @@ impl OffloadJob {
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
+            OffloadJob::TreeGitStatus { tab, roots, limit } => {
+                Ok(tree_git_status_payload(tab, &roots, limit))
+            }
         }
     }
 }
@@ -3847,7 +3881,8 @@ fn dispatch_inner(
             path,
             tab,
             pane,
-        } => dispatch_tree_folder(host, &action, path, tab, pane),
+            limit,
+        } => dispatch_tree_folder(host, &action, path, tab, pane, limit),
 
         Request::Sessions {
             action,
@@ -10327,12 +10362,17 @@ fn dispatch_tree_folder(
     path: Option<String>,
     tab: Option<u64>,
     pane: Option<u64>,
+    limit: Option<usize>,
 ) -> Result<Value, DispatchError> {
     use std::path::PathBuf;
 
     let tab_id = resolve_tab(host.workspace(), tab, pane)?;
 
     match action {
+        // #1009: ツリーに出ている git ステータスをそのまま返す。
+        // ルートの解決も分類も UI と同じ 1 実装（`tako_core::sidebar::workspace_roots` /
+        // `tako_core::git_tree`）を通るので、画面と応答がずれない
+        "git-status" => dispatch_tree_git_status(host, tab_id, path, limit),
         "add" => {
             let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
             let abs = PathBuf::from(&path_str);
@@ -10391,9 +10431,118 @@ fn dispatch_tree_folder(
             Ok(json!({ "folders": folders, "tab": tab_id.as_u64() }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
-            "action は add / remove / list のいずれか（受け取った値: {action}）"
+            "action は add / remove / list / git-status のいずれか（受け取った値: {action}）"
         ))),
     }
+}
+
+/// ファイルツリーの git ステータス（#1009）。
+///
+/// 走査の起点は**そのタブのワークスペースフォルダ**（各ペインの cwd + 明示追加フォルダ）で、
+/// サイドバーのルート行と同じ並び。`path` を渡すとそのフォルダ 1 件へ絞る。
+/// git 管理外のフォルダは黙って対象外（誤検知しない）
+fn dispatch_tree_git_status(
+    host: &mut dyn ControlHost,
+    tab_id: TabId,
+    path: Option<String>,
+    limit: Option<usize>,
+) -> Result<Value, DispatchError> {
+    // 通常は `prepare_offload` が background で走らせる。ここへ来るのは
+    // offload を使わない呼び出し元（セルフテスト等）だけ
+    let roots = tree_git_status_roots(host, tab_id, path)?;
+    Ok(tree_git_status_payload(tab_id.as_u64(), &roots, limit))
+}
+
+/// 走査の起点（UI スレッド必須。workspace とペインの cwd を読む）
+fn tree_git_status_roots(
+    host: &dyn ControlHost,
+    tab_id: TabId,
+    path: Option<String>,
+) -> Result<Vec<PathBuf>, DispatchError> {
+    match path {
+        Some(p) => {
+            let dir = PathBuf::from(&p);
+            if !dir.is_dir() {
+                return Err(DispatchError::InvalidParams(format!(
+                    "ディレクトリが存在しない: {p}"
+                )));
+            }
+            Ok(vec![dir])
+        }
+        None => Ok(tree_roots_of_tab(host, tab_id)),
+    }
+}
+
+/// `git` を実行して応答を組む（**UI スレッドで呼ばないこと**）
+fn tree_git_status_payload(tab: u64, roots: &[PathBuf], limit: Option<usize>) -> Value {
+    /// 応答に載せるエントリ数の既定上限（巨大な差分でも応答が壊れない大きさ）
+    const DEFAULT_LIMIT: usize = 500;
+
+    let map = tako_core::git_tree::scan(roots);
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let all = map.sorted_entries();
+    let total = all.len();
+    let truncated = total > limit;
+    let entries: Vec<Value> = all
+        .into_iter()
+        .take(limit)
+        .map(|(path, status)| {
+            json!({
+                "path": path.display().to_string(),
+                "state": status.state.code(),
+                "badge": status.badge(),
+                "staged": status.staged.map(|c| c.to_string()),
+                "unstaged": status.unstaged.map(|c| c.to_string()),
+                // 配下からの伝播 = ディレクトリ行（そのフォルダ自身の変更ではない）
+                "propagated": status.from_children,
+                "changed": status.changed,
+            })
+        })
+        .collect();
+    let repos: Vec<Value> = map
+        .repos()
+        .iter()
+        .map(|r| {
+            json!({
+                "root": r.root.display().to_string(),
+                "branch": r.branch,
+                "changed": r.changed,
+                "truncated": r.truncated,
+            })
+        })
+        .collect();
+    json!({
+        "tab": tab,
+        "roots": roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "repos": repos,
+        "entries": entries,
+        "total": total,
+        "truncated": truncated,
+    })
+}
+
+/// そのタブのファイルツリーのルート行（#1009）。UI の `sync_filetree_roots` と
+/// **同じ関数**（`tako_core::sidebar::workspace_roots`）を通す
+fn tree_roots_of_tab(host: &dyn ControlHost, tab_id: TabId) -> Vec<PathBuf> {
+    let mut pane_cwds: Vec<PathBuf> = Vec::new();
+    let mut pinned: Vec<PathBuf> = Vec::new();
+    if let Some(tab) = host.workspace().get_tab(tab_id) {
+        for pane in tab.tree().panes() {
+            if let Some(cwd) = host.session(pane.id()).and_then(|s| s.cwd()) {
+                pane_cwds.push(cwd.to_path_buf());
+            }
+        }
+        pinned = tab.pinned_folders().to_vec();
+    }
+    for bp in host.workspace().shelved_panes() {
+        if bp.origin_tab() != tab_id {
+            continue;
+        }
+        if let Some(cwd) = host.session(bp.id()).and_then(|s| s.cwd()) {
+            pane_cwds.push(cwd.to_path_buf());
+        }
+    }
+    tako_core::sidebar::workspace_roots(pane_cwds, pinned, tako_core::paths::home_dir())
 }
 
 /// タブ ID を解決する（tab 明示 > pane のタブ > アクティブタブ）
@@ -13806,6 +13955,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13820,6 +13970,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13834,6 +13985,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13848,6 +14000,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13862,6 +14015,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13876,6 +14030,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13894,6 +14049,7 @@ mod tests {
                 path: Some("/nonexistent_path_xyz_12345".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13912,6 +14068,7 @@ mod tests {
                 path: Some("/etc/hosts".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13929,6 +14086,7 @@ mod tests {
                 path: Some("relative/path".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13946,6 +14104,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         );
@@ -13968,6 +14127,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13982,6 +14142,7 @@ mod tests {
                 path: Some("/private/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -13996,6 +14157,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14024,6 +14186,7 @@ mod tests {
                 path: Some("/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14037,6 +14200,7 @@ mod tests {
                 path: Some("/private/tmp".into()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14050,6 +14214,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14072,6 +14237,7 @@ mod tests {
                 path: Some(tmp.display().to_string()),
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14085,6 +14251,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
@@ -14102,6 +14269,7 @@ mod tests {
                 path: None,
                 tab: None,
                 pane: Some(pane),
+                limit: None,
             },
             PaneOrigin::Cli,
         )
