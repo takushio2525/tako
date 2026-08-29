@@ -102,6 +102,13 @@ pub enum OffloadJob {
         hash: String,
         file: Option<String>,
     },
+    /// ファイルツリーの git ステータス（#1009）。
+    /// ルートの解決は UI スレッドで済ませ、`git` の実行だけをここへ出す
+    TreeGitStatus {
+        tab: u64,
+        roots: Vec<PathBuf>,
+        limit: Option<usize>,
+    },
 }
 
 /// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
@@ -163,6 +170,30 @@ pub fn prepare_offload(
                 file: file.clone(),
             }))
         }
+        // #1009: `git status` は巨大なリポジトリだと数百 ms かかりうるので、
+        // ルートの解決（workspace を読む = UI スレッド必須）だけをここで済ませて
+        // 実行は background へ出す（#168 の GitLog / GitDiff と同じ扱い）
+        Request::TreeFolder {
+            action,
+            path,
+            tab,
+            pane,
+            limit,
+        } if action == "git-status" => {
+            let tab_id = match resolve_tab(host.workspace(), *tab, *pane) {
+                Ok(id) => id,
+                Err(e) => return Some(Err(e)),
+            };
+            let roots = match tree_git_status_roots(host, tab_id, path.clone()) {
+                Ok(roots) => roots,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(Ok(OffloadJob::TreeGitStatus {
+                tab: tab_id.as_u64(),
+                roots,
+                limit: *limit,
+            }))
+        }
         _ => None,
     }
 }
@@ -185,6 +216,9 @@ impl OffloadJob {
             OffloadJob::GitLog { cwd, max_count } => run_git_log(&cwd, max_count),
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
+            OffloadJob::TreeGitStatus { tab, roots, limit } => {
+                Ok(tree_git_status_payload(tab, &roots, limit))
+            }
         }
     }
 }
@@ -10413,12 +10447,19 @@ fn dispatch_tree_git_status(
     path: Option<String>,
     limit: Option<usize>,
 ) -> Result<Value, DispatchError> {
-    use std::path::PathBuf;
+    // 通常は `prepare_offload` が background で走らせる。ここへ来るのは
+    // offload を使わない呼び出し元（セルフテスト等）だけ
+    let roots = tree_git_status_roots(host, tab_id, path)?;
+    Ok(tree_git_status_payload(tab_id.as_u64(), &roots, limit))
+}
 
-    /// 応答に載せるエントリ数の既定上限（巨大な差分でも応答が壊れない大きさ）
-    const DEFAULT_LIMIT: usize = 500;
-
-    let roots: Vec<PathBuf> = match path {
+/// 走査の起点（UI スレッド必須。workspace とペインの cwd を読む）
+fn tree_git_status_roots(
+    host: &dyn ControlHost,
+    tab_id: TabId,
+    path: Option<String>,
+) -> Result<Vec<PathBuf>, DispatchError> {
+    match path {
         Some(p) => {
             let dir = PathBuf::from(&p);
             if !dir.is_dir() {
@@ -10426,12 +10467,18 @@ fn dispatch_tree_git_status(
                     "ディレクトリが存在しない: {p}"
                 )));
             }
-            vec![dir]
+            Ok(vec![dir])
         }
-        None => tree_roots_of_tab(host, tab_id),
-    };
+        None => Ok(tree_roots_of_tab(host, tab_id)),
+    }
+}
 
-    let map = tako_core::git_tree::scan(&roots);
+/// `git` を実行して応答を組む（**UI スレッドで呼ばないこと**）
+fn tree_git_status_payload(tab: u64, roots: &[PathBuf], limit: Option<usize>) -> Value {
+    /// 応答に載せるエントリ数の既定上限（巨大な差分でも応答が壊れない大きさ）
+    const DEFAULT_LIMIT: usize = 500;
+
+    let map = tako_core::git_tree::scan(roots);
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     let all = map.sorted_entries();
     let total = all.len();
@@ -10464,14 +10511,14 @@ fn dispatch_tree_git_status(
             })
         })
         .collect();
-    Ok(json!({
-        "tab": tab_id.as_u64(),
+    json!({
+        "tab": tab,
         "roots": roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "repos": repos,
         "entries": entries,
         "total": total,
         "truncated": truncated,
-    }))
+    })
 }
 
 /// そのタブのファイルツリーのルート行（#1009）。UI の `sync_filetree_roots` と

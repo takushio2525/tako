@@ -56324,7 +56324,9 @@ mod self_test {
                     .update(cx, |app: &mut TakoApp, _, _| {
                         app.filetree.visible = true;
                         app.filetree.set_roots(roots1009.clone());
-                        app.filetree.toggle_dir(&repo1009);
+                        // `set_roots` は増えたルートを自動展開する（#550）ので
+                        // `toggle_dir` だと畳んでしまう。冪等な `expand_dir` を使う
+                        app.filetree.expand_dir(&repo1009);
                         app.filetree.apply_git_status(map1009.clone());
                         let rows = app.filetree.rows();
                         let states: Vec<(String, String)> = rows
