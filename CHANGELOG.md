@@ -35,6 +35,25 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ### Added / 追加
 
+- [機能追加] **Finder からターミナルペインへファイルをドラッグ&ドロップするとパスが入る**
+  ようにした (#1043)。Terminal.app / iTerm2 と同じ体験で、複数選択は空白区切り、空白・
+  日本語・引用符を含むパスはシェル用にクォートされる（整形と送達はファイルツリーからの
+  D&D（FR-3.13）と**同じ 1 経路**なので、直接ペインでも器（tmux）つきペインでも効く）。
+  ドラッグ中はドロップ先のハイライトと結果ラベル（「パスを入力」「ここに分割して開く」）が
+  出て、ペイン中央 = パス挿入 / 外周 = その方向へ分割してプレビューで開く、と使い分けられる。
+  受け口自体は以前から在ったが、それを載せるオーバーレイの生成が**内部ドラッグでしか
+  立たない状態**に依存していたため、外部（Finder）からのドロップではリスナーがそもそも
+  描画ツリーに存在せず無反応だった。旧挙動へ戻す逃げ道は `TAKO_1043_LEGACY=1`
+- [Added] **Dropping files from Finder onto a terminal pane now inserts their paths**
+  (#1043), matching Terminal.app / iTerm2. Multiple files are separated by spaces, and
+  paths containing spaces, non-ASCII characters, or quotes are shell-quoted. Formatting
+  and delivery reuse the **same single path** as the file-tree drag & drop (FR-3.13), so it
+  works both for direct panes and for panes backed by a container (tmux). While dragging,
+  the drop target is highlighted with a result label, so you can choose between inserting
+  the path (pane center) and splitting the pane to open a preview (pane edges). The drop
+  handler itself already existed, but the overlay carrying it was only created for drags
+  that started **inside** tako, so a drop from Finder never reached any listener. Set
+  `TAKO_1043_LEGACY=1` to restore the previous behavior.
 - [改善] SSH の進行状況を可視化した (#1010)
   ① **リモートファイルの読み込み中はツリーの行に回る弧が出る**。GUI の「開く」は
   SFTP の取得を**背景**へ出すようにしたので（従来は UI スレッドで同期実行 =

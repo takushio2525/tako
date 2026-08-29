@@ -2998,6 +2998,37 @@ enum DropZone {
     Center,
 }
 
+/// #1043 の修正を入れる前（外部ドラッグではオーバーレイを作らない）へ戻す逃げ道
+/// （`TAKO_1043_LEGACY=1`）。同じバイナリで A/B するために使う
+fn external_drop_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1043_LEGACY").is_some())
+}
+
+/// D&D 中にペインへ重ねるドロップ先オーバーレイの種別（純関数。#1043）。
+///
+/// **外部（Finder 等）からのドラッグは `on_drag` を通らない**。gpui は
+/// `FileDropEvent::Entered` を受けたときに `active_drag` を自分で立てて MouseMove へ
+/// 変換するだけなので（`gpui/src/window.rs`）、内部ドラッグ開始フック
+/// （`drag_ghost_builder`）でしか書かれない `drag_kind` は `None` のまま残る。
+///
+/// この関数が無かった頃は `drag_kind` だけでオーバーレイの生成を決めていたため、
+/// Finder からのドロップでは**オーバーレイが 1 枚も作られず**、そこに載っている
+/// `on_drop::<ExternalPaths>` がツリーに存在しない = 何も起きなかった（#1043）。
+/// サイドバー（#219）だけ効いていたのは、あちらの配線が `drag_kind` に依存せず
+/// 常時ツリーに在るため。
+///
+/// `active_drag` の中身の型を gpui は公開しない（`App::active_drag` は `pub(crate)`）ので、
+/// 「ドラッグ中なのに種別が無い = 外部ファイル」と推論する。macOS の
+/// `dragging_entered` はペーストボードに `NSFilenamesPboardType` があるときだけ
+/// `Entered` を出すので、ファイル以外の外部ドラッグでこの状態にはならない
+fn drop_overlay_kind(drag_kind: Option<DragKind>, has_active_drag: bool) -> Option<DragKind> {
+    if !has_active_drag {
+        return None;
+    }
+    Some(drag_kind.unwrap_or(DragKind::ExternalFile))
+}
+
 /// カーソル位置 → ドロップゾーンの判定（純関数。fx / fy はペイン矩形内の正規化位置）。
 /// `center_allowed` 時は中央 40% 矩形を Center、外周は最も近い辺の象限にする
 fn drop_zone(fx: f32, fy: f32, center_allowed: bool) -> DropZone {
@@ -20735,10 +20766,22 @@ impl Render for TakoApp {
         // cmd 押下状態を描画フレームで同期（ドラッグ中に cmd を押し/離ししても反映。#415）
         if cx.has_active_drag() {
             self.drop_cmd_held = window.modifiers().platform;
+        } else if self.drop_target.take().is_some() {
+            // 外部ドラッグがウィンドウの外へ出たとき（`FileDropEvent::Exited`）は
+            // gpui が `active_drag` を落とすだけで mouse up が来ないため、
+            // ドロップ確定の後始末（`on_mouse_up`）が走らない。次のドラッグへ
+            // 前回の挿入位置を持ち越さないようここで畳む（#1043）
+            self.drop_cmd_held = false;
         }
-        let drop_overlays: Vec<_> = self
-            .drag_kind
-            .filter(|_| cx.has_active_drag())
+        // 外部（Finder 等）からのドラッグは `drag_kind` が立たないので、種別の決定は
+        // `drop_overlay_kind` に寄せる（#1043。ここで落とすと `on_drop::<ExternalPaths>` が
+        // ツリーに存在せず、Finder からのドロップが無反応になる）
+        let overlay_kind = if external_drop_legacy() {
+            self.drag_kind.filter(|_| cx.has_active_drag())
+        } else {
+            drop_overlay_kind(self.drag_kind, cx.has_active_drag())
+        };
+        let drop_overlays: Vec<_> = overlay_kind
             .map(|kind| {
                 drop_layout
                     .iter()
@@ -23906,6 +23949,22 @@ mod self_test {
     fn notify_and_draw(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
         let _ = window.update(cx, |_, _, cx| cx.notify());
         let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
+    }
+
+    /// 外部（Finder 等）からのファイル D&D を**実 OS と同じ経路**で流す（#1043）。
+    ///
+    /// gpui は `FileDropEvent` を `dispatch_event` の中で `active_drag` +
+    /// MouseMove / MouseUp へ変換する（`gpui/src/window.rs`）ので、ここを配送すれば
+    /// ヒットテストと `on_drag_move` / `on_drop` の配線まで通る。
+    /// ハンドラを直呼びするテストでは「オーバーレイが作られていない」型のバグ
+    /// （= #1043 の根因）を検出できない。
+    ///
+    /// 配送は `AnyWindowHandle` 経由で行うこと（`window.update` の中でやると
+    /// TakoApp が貸し出し中のまま `cx.listener` が二重に借りて panic する）
+    fn send_file_drop(any: AnyWindowHandle, cx: &mut AsyncApp, event: gpui::FileDropEvent) {
+        let _ = any.update(cx, |_, win, cx| {
+            win.dispatch_event(gpui::PlatformInput::FileDrop(event), cx);
+        });
     }
 
     /// PDF アウトラインジャンプの計測値（#232 / #796 の診断）。
@@ -56431,6 +56490,202 @@ mod self_test {
                 );
             }
 
+            // 136. Finder からのドロップでターミナルペインへパスが挿入される（#1043）。
+            //
+            // **合成 `PlatformInput::FileDrop` を実際に配送する**のが要点。gpui は
+            // `FileDropEvent::Entered` を受けたときに自分で `active_drag` を立てて
+            // MouseMove へ変換し、`Submit` を MouseUp へ変換する（`gpui/src/window.rs`）ので、
+            // ここを流せば Finder からの実ドロップと**同じ経路**（ヒットテスト →
+            // `on_drag_move::<ExternalPaths>` → `on_drop::<ExternalPaths>` → 送達）を通る。
+            //
+            // 受け口（`render_drop_target` の `on_drop::<ExternalPaths>`）自体は #21 から
+            // 在ったが、**それを載せるオーバーレイの生成が `drag_kind` に依存**していた。
+            // 外部ドラッグは `on_drag` を通らないので `drag_kind` は `None` のまま =
+            // オーバーレイが 1 枚も作られず、リスナーがツリーに存在しなかった。
+            // A/B は `TAKO_1043_LEGACY=1`（= 旧条件）で、そちらでは (a)(b) が落ちる。
+            // 未描画で飛ばすときのために名前付きブロックにする（`return` はセルフテスト
+            // 全体を打ち切ってしまい、最終項目の cmd-q へ到達しなくなる）
+            'item1043: {
+                let legacy1043 = external_drop_legacy();
+                // 挿入されるのは**文字列**だけ（実在しないパスでも成立する）ので、
+                // 画面が折り返さないよう短い合成パスを使う。空白 / 日本語 / 単引用符を
+                // 1 回のドロップに混ぜて、クォートの 3 形（素通し・包む・エスケープ）を通す
+                let paths1043: Vec<std::path::PathBuf> = vec![
+                    std::path::PathBuf::from("/t1043/plain.txt"),
+                    std::path::PathBuf::from("/t1043/a b/日本語.txt"),
+                    std::path::PathBuf::from("/t1043/q'x"),
+                ];
+                // 期待値は**書き下す**（`quote_paths_for_shell` で作ると同語反復になる）
+                let expect1043 = "/t1043/plain.txt '/t1043/a b/日本語.txt' '/t1043/q'\\''x'";
+
+                let pane1043 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let anchor = app.focused_pane();
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: None,
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane.unwrap_or(anchor)
+                    })
+                    .unwrap_or_else(|_| PaneId::from_raw(1));
+                // 打鍵を落とさないようシェルの準備を待つ（#903 / #640）
+                let ready1043 =
+                    wait_for_pane_ready(window, cx, pane1043, Duration::from_secs(20)).await;
+                notify_and_draw(any, window, cx);
+
+                // ドロップ位置はテキスト領域の中心（= オーバーレイ矩形の中央 40% の内側。
+                // Center に落ちることは (a) の `drop_target` で機械検証する）。
+                // ウィンドウが完全に隠れていると 1 フレームも描かれず矩形が採れない
+                // （項目 63 / 76d / 104 と同じ前提）。位置を捏造すると「オーバーレイの
+                // 外へドロップした」を測ることになるので、その場合は理由つきで飛ばす
+                let area1043 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.pane_last_text_areas.get(&pane1043).copied()
+                    })
+                    .ok()
+                    .flatten()
+                    .filter(|b| f32::from(b.size.width) > 1.0 && f32::from(b.size.height) > 1.0);
+                let Some(area1043) = area1043 else {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 136（新ペインが未描画 = ドロップ位置を \
+                         採れない。ウィンドウを前面にして再実行すると検証できる）"
+                    );
+                    let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.close_pane_button(pane1043, CloseOrigin::Internal, cx);
+                    });
+                    notify_and_draw(any, window, cx);
+                    break 'item1043;
+                };
+                let position1043 = area1043.center();
+
+                // (a) 外部ドラッグでドロップ先オーバーレイが立つ（= リスナーがツリーに在る）。
+                //     Entered の直後は**まだ旧フレーム**なので、1 フレーム描いてから
+                //     Pending（= draggingUpdated 相当）を流す
+                send_file_drop(any, cx, gpui::FileDropEvent::Entered {
+                    position: position1043,
+                    paths: ExternalPaths(paths1043.clone().into()),
+                });
+                notify_and_draw(any, window, cx);
+                send_file_drop(any, cx, gpui::FileDropEvent::Pending {
+                    position: position1043,
+                });
+                let target1043 = window
+                    .update(cx, |app: &mut TakoApp, _, _| app.drop_target)
+                    .unwrap_or(None);
+                check(
+                    target1043 == Some((pane1043, DropZone::Center)),
+                    &format!(
+                        "136: 外部ドラッグでターミナルペインのドロップ先が立つ \
+                         (#1043。target={target1043:?} pane={} ready={ready1043} \
+                         pos={position1043:?} legacy={legacy1043})",
+                        pane1043.as_u64()
+                    ),
+                );
+
+                // (b) ドロップでクォート済みのパスが 1 行で入る（複数は空白区切り）。
+                //     折り返しても拾えるよう可視行を連結して照合する
+                send_file_drop(any, cx, gpui::FileDropEvent::Submit {
+                    position: position1043,
+                });
+                let started1043 = std::time::Instant::now();
+                let mut inserted1043 = false;
+                let mut screen1043 = String::new();
+                while started1043.elapsed() < Duration::from_secs(15) {
+                    screen1043 = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.terminals
+                                .get(&pane1043)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .iter()
+                                        .map(|l| l.trim_end())
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    if screen1043.contains(expect1043) {
+                        inserted1043 = true;
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                let tail1043: String = screen1043.chars().rev().take(180).collect();
+                let tail1043: String = tail1043.chars().rev().collect();
+                check(
+                    inserted1043,
+                    &format!(
+                        "136: Finder からのドロップでクォート済みのパスが入る \
+                         (#1043。expect={expect1043:?} screen_tail={tail1043:?} \
+                         legacy={legacy1043})"
+                    ),
+                );
+
+                // (c) ドロップ確定でドラッグ状態が畳まれる（オーバーレイが出っぱなしにならない）
+                let (kind_after, target_after) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        (app.drag_kind, app.drop_target)
+                    })
+                    .unwrap_or((None, None));
+                check(
+                    kind_after.is_none() && target_after.is_none(),
+                    &format!(
+                        "136: ドロップ後にドラッグ状態が残らない \
+                         (#1043。kind={kind_after:?} target={target_after:?})"
+                    ),
+                );
+
+                // (d) ウィンドウの外へ抜けた（Exited）ら挿入位置を持ち越さない。
+                //     Exited は mouse up を伴わないので `on_mouse_up` の後始末が走らない
+                send_file_drop(any, cx, gpui::FileDropEvent::Entered {
+                    position: position1043,
+                    paths: ExternalPaths(paths1043.clone().into()),
+                });
+                notify_and_draw(any, window, cx);
+                send_file_drop(any, cx, gpui::FileDropEvent::Pending {
+                    position: position1043,
+                });
+                send_file_drop(any, cx, gpui::FileDropEvent::Exited);
+                notify_and_draw(any, window, cx);
+                let target_exit = window
+                    .update(cx, |app: &mut TakoApp, _, _| app.drop_target)
+                    .unwrap_or(None);
+                check(
+                    target_exit.is_none(),
+                    &format!("136: 外部ドラッグが外へ抜けたら挿入位置を畳む (#1043。{target_exit:?})"),
+                );
+
+                println!(
+                    "TAKO_SELF_TEST_1043: legacy={legacy1043} pane={} ready={ready1043} \
+                     target={target1043:?} inserted={inserted1043} \
+                     after=(kind={kind_after:?} target={target_after:?}) exit={target_exit:?}",
+                    pane1043.as_u64()
+                );
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(pane1043, CloseOrigin::Internal, cx);
+                });
+                notify_and_draw(any, window, cx);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -56893,7 +57148,39 @@ mod chunk_tests {
 
 #[cfg(test)]
 mod scroll_tests {
-    use super::{accumulate_scroll, drop_zone, zone_to_direction, DropZone};
+    use super::{
+        accumulate_scroll, drop_overlay_kind, drop_zone, zone_to_direction, DragKind, DropZone,
+    };
+
+    /// 外部（Finder）からのドラッグでもドロップ先オーバーレイが生成されること（#1043）。
+    ///
+    /// gpui は `FileDropEvent::Entered` で `active_drag` を自分で立てるだけなので、
+    /// 内部ドラッグ開始フックでしか書かれない `drag_kind` は `None` のまま。
+    /// ここで `None` を返すと `on_drop::<ExternalPaths>` がツリーに存在せず、
+    /// Finder からのドロップが無反応になる（= #1043 の症状そのもの）
+    #[test]
+    fn 外部ドラッグでもドロップ先オーバーレイの種別が決まる() {
+        // ドラッグしていないときは出さない（従来どおり）
+        assert_eq!(drop_overlay_kind(None, false), None);
+        assert_eq!(drop_overlay_kind(Some(DragKind::File), false), None);
+        // 外部ドラッグ = active_drag だけ立っている → 外部ファイル扱い
+        assert_eq!(
+            drop_overlay_kind(None, true),
+            Some(DragKind::ExternalFile),
+            "#1043: 外部ドラッグでオーバーレイが作られないと on_drop が配線されない"
+        );
+        // 内部ドラッグの種別は書き換えない（回帰ゼロの担保）
+        for kind in [
+            DragKind::TmuxSession,
+            DragKind::File,
+            DragKind::ExternalFile,
+            DragKind::Pane,
+            DragKind::BackgroundPane,
+            DragKind::Tab,
+        ] {
+            assert_eq!(drop_overlay_kind(Some(kind), true), Some(kind));
+        }
+    }
 
     #[test]
     fn ドロップゾーンは象限と中央を判定する() {
