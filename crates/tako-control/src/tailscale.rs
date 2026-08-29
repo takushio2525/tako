@@ -227,7 +227,14 @@ pub enum ServeState {
 /// `tailscale serve status --json` を読み、HTTPS:443 の serve 設定を判定する。
 /// 弾 0 項目 6: serve 未設定なら `{}`（exit 0）が返る
 pub fn serve_state(cli: &str) -> Result<ServeState, String> {
-    let output = run_tailscale(cli, &["serve", "status", "--json"])?;
+    serve_state_on(cli, selected_variant().socket_arg())
+}
+
+/// 話しかける tailscaled を明示した `serve_state`（#1049）。
+/// 既定探索は tailscaled 側の都合（GUI 版の LocalAPI 発見ファイルの作り直し）で
+/// 応答するノードが変わるので、**serve を張ったノードへ問い合わせ続ける**ために要る
+pub fn serve_state_on(cli: &str, socket: Option<&str>) -> Result<ServeState, String> {
+    let output = run_tailscale_on(cli, socket, &["serve", "status", "--json"])?;
     if !output.status.success() {
         return Err(format!(
             "tailscale serve status が失敗: {}",
@@ -365,7 +372,12 @@ fn parse_whois(json: &Value) -> Result<WhoisInfo, WhoisError> {
 /// off → 再設定でも URL は不変）。
 /// target は `proxy_target_for_port` / `proxy_target_for_socket` が組む文字列
 pub fn serve_start_target(cli: &str, target: &str) -> Result<(), String> {
-    let output = run_tailscale(cli, &["serve", "--bg", "--https=443", target])?;
+    serve_start_target_on(cli, selected_variant().socket_arg(), target)
+}
+
+/// 話しかける tailscaled を明示した `serve_start_target`（#1049）
+pub fn serve_start_target_on(cli: &str, socket: Option<&str>, target: &str) -> Result<(), String> {
+    let output = run_tailscale_on(cli, socket, &["serve", "--bg", "--https=443", target])?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -392,7 +404,12 @@ fn unix_target_hint(target: &str) -> &'static str {
 /// 呼び出し側の契約: serve_state で tako 自身の設定（Proxy が自ポート）で
 /// あることを確認してから呼ぶ（ユーザーの既存 serve 設定を壊さないため）
 pub fn serve_stop(cli: &str) -> Result<(), String> {
-    let output = run_tailscale(cli, &["serve", "--https=443", "off"])?;
+    serve_stop_on(cli, selected_variant().socket_arg())
+}
+
+/// 話しかける tailscaled を明示した `serve_stop`（#1049）
+pub fn serve_stop_on(cli: &str, socket: Option<&str>) -> Result<(), String> {
+    let output = run_tailscale_on(cli, socket, &["serve", "--https=443", "off"])?;
     if !output.status.success() {
         return Err(format!(
             "tailscale serve の解除に失敗: {}",
@@ -411,12 +428,23 @@ pub fn serve_stop(cli: &str) -> Result<(), String> {
 /// 「running を名乗るのに見れない」を自作してしまう）。
 /// 起動時の張り替え判断は `is_reclaimable_target`（意図的に広い）を使う
 pub fn serve_stop_if_ours(cli: &str, ours: Option<&str>) -> Result<bool, String> {
+    serve_stop_if_ours_on(cli, selected_variant().socket_arg(), ours)
+}
+
+/// 話しかける tailscaled を明示した `serve_stop_if_ours`（#1049）。
+/// **後始末が別ノードを見ていると本物の設定が残り続ける**ので、
+/// 呼び出し側は公開したノードへ解決した handle の socket を渡すこと
+pub fn serve_stop_if_ours_on(
+    cli: &str,
+    socket: Option<&str>,
+    ours: Option<&str>,
+) -> Result<bool, String> {
     let Some(ours) = ours else {
         return Ok(false);
     };
-    match serve_state(cli)? {
+    match serve_state_on(cli, socket)? {
         ServeState::Proxy(ref target) if target == ours => {
-            serve_stop(cli)?;
+            serve_stop_on(cli, socket)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -750,6 +778,170 @@ pub fn coexistence_warning(survey: &VariantSurvey) -> Option<String> {
     ))
 }
 
+// --- serve を読み書きする相手の固定（#1049）-----------------------------------
+//
+// 系統の**選択**（どのノードで公開するか）は #1038 の `selected_variant` が正。
+// ここが足すのは**固定**だけ: 一度公開したノードへ話しかけ続ける。
+// 既定探索（`--socket` 無し）は tailscaled 側の都合で応答するノードが変わる
+// （実測 #1049: GUI 版の LocalAPI 発見ファイル `/Library/Tailscale/ipnport` が
+// 作り直された瞬間に、既定探索の相手が standalone → GUI 版へ切り替わった）。
+// 固定しないと「serve を張ったノード」と「serve を読むノード」が食い違い、
+// 消えていないのに `No serve config` に見え、後始末は本物を消し残す。
+
+/// serve を読み書きする相手（どの tailscaled か）を固定した handle
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeHandle {
+    /// tailscale CLI のパス
+    pub cli: String,
+    /// `--socket` に渡す値。`None` = CLI の既定探索
+    /// （GUI 版のシステム拡張を名指す手段はこれしかないので `None` が残りうる）
+    pub socket: Option<String>,
+    /// 系統の識別子（`auto` / `standalone`）
+    pub variant_key: &'static str,
+    /// この handle が応答したノードの MagicDNS 名
+    pub node: Option<String>,
+}
+
+impl ServeHandle {
+    pub fn socket_arg(&self) -> Option<&str> {
+        self.socket.as_deref()
+    }
+    /// `--socket` で名指せている = 以後どんな発見ファイルの変化にも影響されない
+    pub fn is_pinned(&self) -> bool {
+        self.socket.is_some()
+    }
+    pub fn describe(&self) -> String {
+        match (&self.socket, &self.node) {
+            (Some(sock), Some(node)) => format!("{node}（--socket {sock}）"),
+            (Some(sock), None) => format!("--socket {sock}"),
+            (None, Some(node)) => format!("{node}（既定探索）"),
+            (None, None) => "既定探索".to_string(),
+        }
+    }
+}
+
+/// handle を解決できなかった理由
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeHandleError {
+    /// tailscale CLI が見つからない
+    CliNotFound,
+    /// どの系統の tailscaled も応答しない
+    NoDaemon,
+    /// 応答はあるが、公開したノードがこの Mac のどの tailscaled にも居ない
+    NodeNotFound { expected: String, seen: Vec<String> },
+}
+
+impl ServeHandleError {
+    /// 理由 + 次の一手（status の劣化表示にそのまま載せる）
+    pub fn describe(&self) -> String {
+        match self {
+            Self::CliNotFound => "tailscale CLI が見つかりません。                 次の一手: Tailscale を導入して `tako remote setup` を実行してください"
+                .to_string(),
+            Self::NoDaemon => "tailscaled が応答しません（Tailscale が停止している可能性）。                 次の一手: Tailscale を起動してから `tako remote stop && tako remote start`"
+                .to_string(),
+            Self::NodeNotFound { expected, seen } => {
+                let seen = if seen.is_empty() {
+                    "（応答したノードなし）".to_string()
+                } else {
+                    seen.join(" / ")
+                };
+                format!(
+                    "公開中の URL のノード（{expected}）が、この Mac のどの tailscaled にも                     見つかりません（応答したノード: {seen}）。Tailscale の系統が入れ替わったか、                     ノード名が変わっています。                     次の一手: `tako remote stop && tako remote start` で公開し直してください"
+                )
+            }
+        }
+    }
+}
+
+/// ホスト名の一致判定（純関数）。末尾ドットと大小文字の差を吸収する
+pub fn host_eq(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.')
+        .eq_ignore_ascii_case(b.trim_end_matches('.'))
+}
+
+/// 応答した系統の中から「公開 URL と同じノード」を選ぶ（純関数）。
+/// `expected_host` が `None` なら先頭（= 呼び出し側が並べた優先順）。
+/// **`--socket` で名指せる候補を先に並べて渡す**こと: 同じノードへ 2 通りで
+/// 到達できるなら、発見ファイルの変化に影響されない方を選ぶのが常に正しい
+pub fn pick_node_index(nodes: &[Option<&str>], expected_host: Option<&str>) -> Option<usize> {
+    match expected_host {
+        None => (!nodes.is_empty()).then_some(0),
+        Some(want) => nodes
+            .iter()
+            .position(|n| n.is_some_and(|n| host_eq(n, want))),
+    }
+}
+
+/// serve の読み書き相手を解決する。
+///
+/// `expected_host` = 公開中の ts.net ホスト名（`tako-remote.url` 由来）。
+/// これを渡すと**そのノードへ到達できる系統**を選ぶので、既定探索の相手が
+/// 入れ替わっても追従する。`None` のときは従来どおり `selected_variant()` に従う
+/// （= どのノードで公開するかの選択は #1038 のまま変えない）
+pub fn resolve_serve_handle(expected_host: Option<&str>) -> Result<ServeHandle, ServeHandleError> {
+    let Some(cli) = find_tailscale() else {
+        return Err(ServeHandleError::CliNotFound);
+    };
+    let selected = selected_variant();
+
+    // 公開ノードが分かっていないとき（起動時の初回設定）は選択に従うだけ
+    let Some(want) = expected_host else {
+        let st = setup_status_on(Some(cli.clone()), selected.socket_arg());
+        if !st.daemon_running {
+            return Err(ServeHandleError::NoDaemon);
+        }
+        return Ok(ServeHandle {
+            cli,
+            socket: selected.socket_arg().map(str::to_string),
+            variant_key: selected.key(),
+            node: st.dns_name,
+        });
+    };
+
+    // 候補は「名指しできる方」を先に並べる（固定できるなら固定する）。
+    // 明示指定（TAKO_TAILSCALE_SOCKET / 保存済み standalone）があればそれを最優先
+    let mut candidates: Vec<(&'static str, Option<String>)> = Vec::new();
+    let push = |key: &'static str, sock: Option<String>, out: &mut Vec<_>| {
+        if !out.iter().any(|(_, s): &(&str, Option<String>)| *s == sock) {
+            out.push((key, sock));
+        }
+    };
+    if let Some(sock) = selected.socket_arg() {
+        push(selected.key(), Some(sock.to_string()), &mut candidates);
+    }
+    if let Some(sock) = standalone_socket_path() {
+        push("standalone", Some(sock.to_string()), &mut candidates);
+    }
+    push("auto", None, &mut candidates);
+
+    let mut nodes: Vec<Option<String>> = Vec::with_capacity(candidates.len());
+    let mut any_daemon = false;
+    for (_, sock) in &candidates {
+        let st = setup_status_on(Some(cli.clone()), sock.as_deref());
+        any_daemon |= st.daemon_running;
+        nodes.push(st.dns_name);
+    }
+    let node_refs: Vec<Option<&str>> = nodes.iter().map(|n| n.as_deref()).collect();
+    match pick_node_index(&node_refs, Some(want)) {
+        Some(i) => Ok(ServeHandle {
+            cli,
+            socket: candidates[i].1.clone(),
+            variant_key: candidates[i].0,
+            node: nodes[i].clone(),
+        }),
+        None if !any_daemon => Err(ServeHandleError::NoDaemon),
+        None => {
+            let mut seen: Vec<String> = nodes.into_iter().flatten().collect();
+            seen.sort();
+            seen.dedup();
+            Err(ServeHandleError::NodeNotFound {
+                expected: want.to_string(),
+                seen,
+            })
+        }
+    }
+}
+
 /// tailscale コマンドをタイムアウト付きで実行する。
 /// stdout / stderr は別スレッドで drain し pipe deadlock を避ける（remote.rs H-5 と同型）
 fn run_tailscale(cli: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -1012,6 +1204,76 @@ mod tests {
             proxy_target_for_socket(space_path),
             "unix:/Users/test/Library/Application Support/tako/remote/tako-remote.sock"
         );
+    }
+
+    #[test]
+    fn host_eqは末尾ドットと大小文字を吸収する() {
+        assert!(host_eq("mac.tail1234.ts.net.", "mac.tail1234.ts.net"));
+        assert!(host_eq("MAC.tail1234.ts.net", "mac.tail1234.ts.net."));
+        // `-1` サフィックス付きの二重登録ノードは**別物**（#1049 の取り違えの正体）
+        assert!(!host_eq("mac-1.tail1234.ts.net", "mac.tail1234.ts.net"));
+    }
+
+    #[test]
+    fn pick_node_indexは公開ノードと同じ相手を選ぶ() {
+        let nodes = [Some("mac-1.tail1234.ts.net"), Some("mac.tail1234.ts.net")];
+        // 公開 URL が mac なら、既定探索が mac-1 を指していても standalone を選ぶ
+        assert_eq!(
+            pick_node_index(&nodes, Some("mac.tail1234.ts.net")),
+            Some(1)
+        );
+        assert_eq!(
+            pick_node_index(&nodes, Some("mac-1.tail1234.ts.net")),
+            Some(0)
+        );
+        // どちらでもないノード名 = この Mac には居ない
+        assert_eq!(pick_node_index(&nodes, Some("other.ts.net")), None);
+        // 期待ノードが無いとき（起動時の初回設定）は先頭 = 呼び出し側の優先順
+        assert_eq!(pick_node_index(&nodes, None), Some(0));
+        assert_eq!(pick_node_index(&[], None), None);
+        // 応答しなかった系統（None）は選ばれない
+        assert_eq!(
+            pick_node_index(&[None, Some("mac.ts.net")], Some("mac.ts.net")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ノードが見つからないときの説明に次の一手が入る() {
+        let err = ServeHandleError::NodeNotFound {
+            expected: "mac.ts.net".into(),
+            seen: vec!["mac-1.ts.net".into()],
+        };
+        let text = err.describe();
+        assert!(text.contains("mac.ts.net"));
+        assert!(text.contains("mac-1.ts.net"));
+        assert!(text.contains("tako remote stop"));
+        assert!(ServeHandleError::CliNotFound
+            .describe()
+            .contains("tako remote setup"));
+        assert!(ServeHandleError::NoDaemon.describe().contains("Tailscale"));
+    }
+
+    #[test]
+    fn serve_handleの説明は相手を名指しする() {
+        let pinned = ServeHandle {
+            cli: "tailscale".into(),
+            socket: Some("/var/run/tailscaled.socket".into()),
+            variant_key: "standalone",
+            node: Some("mac.ts.net".into()),
+        };
+        assert!(pinned.is_pinned());
+        assert!(pinned
+            .describe()
+            .contains("--socket /var/run/tailscaled.socket"));
+        let loose = ServeHandle {
+            cli: "tailscale".into(),
+            socket: None,
+            variant_key: "auto",
+            node: Some("mac-1.ts.net".into()),
+        };
+        assert!(!loose.is_pinned());
+        assert!(loose.describe().contains("既定探索"));
     }
 
     #[test]

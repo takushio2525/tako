@@ -3,6 +3,32 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
+## 現在の対象（2026-08-29 / #1049）
+
+- **#1049（remote が「起動中」なのに tailnet から見えない）の根因は serve の消失ではなく
+  「話しかける tailscaled が入れ替わる」ことだった**。本番機で現在進行形の再現を採取:
+  GUI 版 Tailscale（システム拡張）と standalone `tailscaled` が同居しており、
+  **`/Library/Tailscale/ipnport` が作り直された瞬間に CLI の既定探索の相手が
+  standalone → GUI 版へ切り替わる**（daemon 起動 19:45:38 / 発見ファイル再作成 20:14:56）。
+  serve は standalone ノード（`<host>`）に**生きていた**（curl 200）のに、
+  既定探索が GUI ノード（`<host>-1`）を見るので `No serve config` に見えていた
+- **#1049 を触るときの不変条件**: ①serve の読み書きは **公開した URL のノードへ解決した
+  handle**（`tailscale::resolve_serve_handle`）を通す。既定探索のまま
+  `serve_state` / `serve_stop` を呼ぶと**別ノードを読む / 本物を消し残す**
+  ②`--socket` で名指していても**毎周期ノード名を照合する**（tailscaled のログインし直しで
+  ノード名が変わる）③**応答している相手からは奪い返さない**（生きた別 daemon と :443 を
+  奪い合うと両方が上限まで暴れる）④張り直しは上限つき（5 回 / 連続 10 回健全で予算回復）
+- **whois は系統をまたいでも解決する**（実測: どちらの tailscaled も同じ tailnet の netmap を
+  持つので相互に peer を引ける）= 認証経路は入れ替わりの影響を受けない。だから #1049 では触っていない
+- **`verify_pid_identity` は実行ファイルの inode を見ない**（`ps -o args=` の文字列 + etime）ので、
+  **バイナリ差し替え後の `tako remote stop` は落ちない**（Issue の原因候補 2 は成立しにくい）
+- **daemon の中では起動情報 JSON を出したあと `println!` / `eprintln!` を使わない**（#1049 で実測）。
+  `spawn_daemon` が pipe を破棄するので EPIPE で **panic** し、そのスレッドが黙って死ぬ
+  （自己検査スレッドが 1 回で止まった）。記録は `audit_serve` か serve health ファイルへ。
+  番犬 = `crates/tako-control/tests/remote_daemon_output_watchdog.rs`
+- 検証は `bash scripts/test-serve-watch.sh`（偽 tailscale + 隔離 state で実 daemon を走らせる
+  モックテスト 33 件。**本番の tailscale / serve / デーモンに触らない**）。A/B は `TAKO_1049_LEGACY=1`
+
 ## 現在の対象（2026-08-28）
 
 - **#1023（新ペイン経路の SSH でターミナルが立たない）を根治して merge 済み**（`4405a12`）。
@@ -130,7 +156,7 @@
   `TAKO_906_NO_PAD` / `TAKO_907_NO_INJECT` / `TAKO_903_LEGACY` / `TAKO_866_KEEP_EXACT_TARGET` /
   `TAKO_932_NO_OFFSCREEN_GEOMETRY` / `TAKO_961_LEGACY` / `TAKO_966_LEGACY` /
   `TAKO_1011_LEGACY`（+ 故障注入 `TAKO_1011_INJECT_LEDGER_GAP`）/ `TAKO_1023_LEGACY` /
-  `TAKO_1010_LEGACY`
+  `TAKO_1010_LEGACY` / `TAKO_1049_LEGACY`（+ 間隔上書き `TAKO_1049_WATCH_SECS`）
 
 - **#982（agent 能力マトリクス）完了 = #975 エピックの土台**。`tako-core::agent_support` が
   「どの agent がどこまで使えるか」の正本（40 能力 × claude / codex / agy / ローカル LLM）。
