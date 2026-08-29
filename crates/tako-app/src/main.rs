@@ -347,6 +347,31 @@ const QUEUE_STRANDED_TICKS: u8 = 3;
 /// #572: 1 ペインあたりの救出試行の上限（滞留が解けないときに叩き続けない）
 const QUEUE_RECOVERY_MAX: u8 = 5;
 
+// --- セルフテスト項目 111（#985 / #1048）の番兵 ------------------------------
+
+/// codex 側へ注入する 5h の番兵（#1048）。
+///
+/// **claude 側の実データと一致していてはいけない**（同じ値だと、混線しても注入の前後で
+/// claude 側が変わらず検出できない）。呼び出し側は実測した `claude_before` と比べて
+/// 衝突していたら [`CODEX_METER_PCT_ALT`] へ逃がす
+const CODEX_METER_PCT: u32 = 41;
+/// `CODEX_METER_PCT` が実機由来の claude 側の値と衝突したときの逃げ場
+const CODEX_METER_PCT_ALT: u32 = 42;
+
+/// codex の値が claude 側のメーターへ流れ込んでいないか（#1048）。
+///
+/// **「注入した番兵と claude 側の値が違うこと」で判定してはいけない**。claude 側は
+/// 実データで埋まる（それが正しい）ので、実 claude の 5h 使用率がたまたま番兵と同じ
+/// 値になった瞬間に、混ざっていなくても落ちる。実測（2026-08-29）では同じ日の
+/// 09:2x が 11% で通り、10:0x が 10% で確定失敗し、以降の項目が丸ごと走らなくなった。
+///
+/// 見るのは**注入によって claude 側が動いたか**。呼び出し側は
+/// 「注入値 ≠ 注入前の claude 側の値」を保証すること（そうでないと混線が前後の差に
+/// 現れない）。`CODEX_METER_PCT` / `CODEX_METER_PCT_ALT` がその役目
+fn claude_meter_untouched(before: Option<u32>, after: Option<u32>) -> bool {
+    after == before
+}
+
 /// #749: master ペインごとの自動ハンドオフ通知の追跡状態。
 /// 判定そのものは `tako_core::handoff::nudge_decision` が持つ（ここは観測値の保管だけ）
 #[derive(Debug)]
@@ -51924,13 +51949,30 @@ mod self_test {
                 // フッターに `primary NN%` が無く、数値は `/status` のモーダルの中）。
                 // rollout の `rate_limits` が実データの出どころになったので、
                 // **そこからメーターの値まで通っている**ことをここで見る
+                //
+                // #1048: claude 側の値は**実データで埋まる**（それが正しい）ので、
+                // 番兵との一致では判定できない。注入の**前**の値を控えておき、
+                // 「注入で動いていないこと」を見る
+                let claude_before = window
+                    .update(cx, |app, _, _| {
+                        app.refresh_agent_metrics();
+                        app.agent_metrics.limit_5h
+                    })
+                    .unwrap_or(None);
+                // 注入値は **claude 側と必ず違う値**にする（同じだと、混線しても
+                // 前後が変わらず検出できない）
+                let codex_pct: u32 = if claude_before == Some(CODEX_METER_PCT) {
+                    CODEX_METER_PCT_ALT
+                } else {
+                    CODEX_METER_PCT
+                };
                 let metrics985 = window
                     .update(cx, |app, _, _| {
                         app.codex_limits.insert(
                             codex_pane,
                             tako_control::codex_session::RateLimits {
                                 primary: Some(tako_control::codex_session::RateWindow {
-                                    used_percent: 10,
+                                    used_percent: codex_pct,
                                     window_minutes: 300,
                                     resets_at: Some(1_787_840_583),
                                 }),
@@ -51953,20 +51995,38 @@ mod self_test {
                     })
                     .unwrap_or((None, None, tako_core::MetricsSource::Unknown, None));
                 println!(
-                    "TAKO_SELF_TEST_985_METRICS: 5h={:?} week={:?} source={:?} claude_5h={:?}",
+                    "TAKO_SELF_TEST_985_METRICS: 5h={:?} week={:?} source={:?} \
+                     claude_5h={:?} claude_before={claude_before:?} injected={codex_pct}",
                     metrics985.0, metrics985.1, metrics985.2, metrics985.3
                 );
                 check(
-                    metrics985.0 == Some(10)
+                    metrics985.0 == Some(codex_pct)
                         && metrics985.1 == Some(2)
                         && metrics985.2 == tako_core::MetricsSource::Codex,
                     "111: codex の構造化レート制限がステータスバーの値になる (#985)",
                 );
                 // claude 側のメーターは別のペイン由来で埋まりうる（それが正しい）。
-                // 見たいのは「codex の値が claude 側へ流れ込まないこと」
+                // 見たいのは「codex の値が claude 側へ流れ込まないこと」。
+                //
+                // **番兵と実データの一致で判定してはいけない**（#1048）: 旧実装は
+                // 「注入した番兵と claude 側の値が違うこと」を見ていたので、
+                // **実 claude の 5h 使用率がたまたま番兵と同じ値になった瞬間に、
+                // 混ざっていなくても確定失敗**していた（実測: 同じ日の 09:2x は 11% で
+                // 通り、10:0x は 10% で落ちた。以降の項目 112〜137 が丸ごと走らなくなる）。
+                // 見るのは「**注入によって claude 側が動いたか**」（`claude_meter_untouched`）
                 check(
-                    metrics985.3 != Some(10),
-                    "111: codex の値を claude 側のメーターへ混ぜない (#985)",
+                    claude_meter_untouched(claude_before, metrics985.3),
+                    "111: codex の値を claude 側のメーターへ混ぜない (#985 / #1048)",
+                );
+                // 検出力の陰性対照: **混線したことにして**同じ規則へ通し、
+                // ちゃんと落とせることをこの場で見る（規則が骨抜きになったら気づける）
+                let bleed_detected = !claude_meter_untouched(claude_before, Some(codex_pct));
+                check(
+                    bleed_detected && claude_before != Some(codex_pct),
+                    &format!(
+                        "111: 混線したら検出できる規則になっている \
+                         (#1048。before={claude_before:?} injected={codex_pct})"
+                    ),
                 );
                 let _ = window.update(cx, |app, _, _| app.codex_limits.clear());
 
@@ -57477,6 +57537,60 @@ fn accumulate_scroll(carry: f32, delta_lines: f32) -> (i32, f32) {
     let total = carry + delta_lines;
     let lines = total.trunc() as i32;
     (lines, total - lines as f32)
+}
+
+#[cfg(test)]
+mod selftest_111_rule_tests {
+    use super::{claude_meter_untouched, CODEX_METER_PCT, CODEX_METER_PCT_ALT};
+
+    #[test]
+    fn 実claudeが番兵と同じ値でも混線とは言わない() {
+        // #1048 の壊れ方そのもの。旧規則（`after != Some(番兵)`）だとここが偽になり、
+        // 混ざっていないのに確定失敗していた
+        let injected = 10;
+        assert!(claude_meter_untouched(Some(injected), Some(injected)));
+    }
+
+    #[test]
+    fn 旧規則との_ab_この状況で旧規則だけが誤検出する() {
+        // #1048 の A/B を**決定的に**固定する。実 claude の 5h 使用率が番兵と同じ値に
+        // なった状況（実測 2026-08-29 10:0x = 10%）を作り、
+        //   旧規則「claude 側 != 番兵」 → 混ざっていないのに「混線」と言う（= 確定失敗）
+        //   新規則「注入の前後で動いていない」 → 正しく「混ざっていない」と言う
+        // を並べて見る。旧規則へ戻したらこのテストが落ちるので、静かには戻せない
+        let injected = 10;
+        let before = Some(injected);
+        let after = Some(injected); // 注入しても動いていない = 混ざっていない
+                                    // 旧規則をそのまま書き起こす（この `!=` の形が #1048 の原因そのもの）
+        let old_rule = |after: Option<u32>| after != Some(injected);
+        assert!(
+            !old_rule(after),
+            "旧規則はこの状況を混線と誤検出する（これが #1048）"
+        );
+        assert!(
+            claude_meter_untouched(before, after),
+            "新規則は誤検出しない"
+        );
+    }
+
+    #[test]
+    fn 注入で動いたら混線として検出する() {
+        // claude 側が codex の注入値へ変わった = 流れ込んでいる
+        assert!(!claude_meter_untouched(Some(37), Some(CODEX_METER_PCT)));
+        // 空だったところへ現れるのも同じ
+        assert!(!claude_meter_untouched(None, Some(CODEX_METER_PCT)));
+    }
+
+    #[test]
+    fn 値が無いまま動かないのは正常() {
+        assert!(claude_meter_untouched(None, None));
+    }
+
+    #[test]
+    fn 逃げ場は番兵と必ず違う値である() {
+        // 衝突したときに同じ値へ逃げたら意味が無い
+        assert_ne!(CODEX_METER_PCT, CODEX_METER_PCT_ALT);
+    }
 }
 
 #[cfg(test)]
