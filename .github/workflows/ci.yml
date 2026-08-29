@@ -60,6 +60,11 @@ jobs:
       # **片肺リリースの検出が壊れたらここで落ちる**（#256 / #965）
       - name: リリース経路のモックテスト
         run: bash scripts/test-release-retry.sh
+      # .app の差し替え（置き場のパスを一度も空けない）のモックテスト。一時ディレクトリの
+      # dummy .app だけを相手にするので本番の /Applications には触らない。
+      # **Dock のピンが逃げる形へ戻ったらここで落ちる**（#1042）
+      - name: バンドル差し替えのモックテスト
+        run: bash scripts/test-bundle-install.sh
 
   windows:
     name: Windows（build + test スモーク）

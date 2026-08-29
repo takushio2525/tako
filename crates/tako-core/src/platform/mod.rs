@@ -8,6 +8,7 @@
 //! ここに境界を追加する。
 
 pub mod agent_install;
+pub mod bundle_install;
 pub mod child_cmd;
 pub mod clock;
 pub mod console;

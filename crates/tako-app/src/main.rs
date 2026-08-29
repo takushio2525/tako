@@ -19556,12 +19556,15 @@ impl SystemHost for TakoApp {
                     ch.display_label()
                 )
             })?;
-        update_checker::perform_update(&info)?;
+        // 差し替えの手段（#1042）や brew の結果は message に載る。dispatch が捨てると
+        // CLI / MCP からは「何が起きたか」が一切見えないので通す
+        let message = update_checker::perform_update(&info)?;
         Ok(serde_json::json!({
             "updated": true,
             "version": info.version,
             "channel": info.channel.label(),
             "install_method": update_checker::detect_install_method().label(),
+            "message": message,
         }))
     }
     fn update_apply_zip(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
@@ -19575,12 +19578,13 @@ impl SystemHost for TakoApp {
                     ch.display_label()
                 )
             })?;
-        update_checker::perform_update_zip(&info)?;
+        let message = update_checker::perform_update_zip(&info)?;
         Ok(serde_json::json!({
             "updated": true,
             "version": info.version,
             "channel": info.channel.label(),
             "install_method": "zip (fallback)",
+            "message": message,
         }))
     }
     fn update_repair(&mut self) -> Result<serde_json::Value, String> {
