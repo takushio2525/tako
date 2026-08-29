@@ -337,6 +337,13 @@ impl crate::remote_serve::ServeOps for TailscaleServeOps {
     }
 }
 
+/// 共有 handle のロック。**poison しても諦めない**（自己検査を止めないため）
+fn lock_handle(
+    handle: &Arc<Mutex<crate::tailscale::ServeHandle>>,
+) -> std::sync::MutexGuard<'_, crate::tailscale::ServeHandle> {
+    handle.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// unix epoch 秒（自己検査の時刻記録用）
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -373,7 +380,7 @@ fn serve_watch_loop(
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let current = handle.lock().unwrap().clone();
+        let current = lock_handle(&handle).clone();
         let mut ops = TailscaleServeOps {
             handle: current,
             host: host.clone(),
@@ -400,7 +407,7 @@ fn serve_watch_loop(
         node_missing = false;
         let (health, event) = watch.tick(&mut ops, now_epoch_secs());
         // 張り替わった相手を共有側へ反映する（終了時の後始末が同じ相手を見る）
-        *handle.lock().unwrap() = ops.handle.clone();
+        *lock_handle(&handle) = ops.handle.clone();
         write_serve_health(&health);
         let who = ops.handle.describe();
         match event {
@@ -409,15 +416,13 @@ fn serve_watch_loop(
                 "serve_reassert_budget_reset",
                 serde_json::json!({ "handle": who }),
             ),
-            WatchEvent::Reasserted { was } => {
-                eprintln!(
-                    "tailscale serve の設定が失われていたので張り直しました（{was} → {target}）"
-                );
-                audit_serve(
-                    "serve_reasserted",
-                    serde_json::json!({ "was": was, "target": target, "handle": who }),
-                );
-            }
+            // **stdout / stderr へ書かない**: `spawn_daemon` は起動情報 JSON を読んだあと
+            // pipe を破棄するので、以後の `println!` / `eprintln!` は EPIPE で **panic** し
+            // このスレッドが黙って死ぬ（実測 #1049）。記録先は audit.log 一本にする
+            WatchEvent::Reasserted { was } => audit_serve(
+                "serve_reasserted",
+                serde_json::json!({ "was": was, "target": target, "handle": who }),
+            ),
             WatchEvent::ReassertFailed { was, error } => audit_serve(
                 "serve_reassert_failed",
                 serde_json::json!({ "was": was, "target": target, "handle": who, "error": error }),
@@ -1651,7 +1656,7 @@ pub fn run_daemon() -> io::Result<()> {
     if !test_mode && !crate::remote_serve::legacy_mode() {
         let target = proxy_target_for(&endpoint);
         let host = host_of(&base_url);
-        let snapshot = serve_handle.lock().unwrap().clone();
+        let snapshot = lock_handle(&serve_handle).clone();
         write_serve_health(&crate::remote_serve::ServeHealth {
             ok: true,
             checked_at: now_epoch_secs(),
@@ -1717,7 +1722,7 @@ pub fn run_daemon() -> io::Result<()> {
     if !test_mode {
         // #1049: 後始末も**張った相手へ**話す。既定探索のまま解除すると、
         // 相手が入れ替わっていたときに本物の設定が消し残る
-        let handle = serve_handle.lock().unwrap().clone();
+        let handle = lock_handle(&serve_handle).clone();
         match crate::tailscale::serve_stop_if_ours_on(
             &handle.cli,
             handle.socket_arg(),
@@ -1732,9 +1737,16 @@ pub fn run_daemon() -> io::Result<()> {
                 }),
             ),
             Ok(false) => {}
-            Err(e) => {
-                eprintln!("tailscale serve の解除に失敗（tailscale serve --https=443 off で手動解除できます）: {e}");
-            }
+            // ここも stdout / stderr へ書かない（上と同じ理由で panic し、
+            // 直後の `cleanup_state_files` が飛んで state ファイルが残る）
+            Err(e) => audit_serve(
+                "serve_off_failed",
+                serde_json::json!({
+                    "target": proxy_target_for(&endpoint),
+                    "handle": handle.describe(),
+                    "error": e,
+                }),
+            ),
         }
     }
     cleanup_state_files();

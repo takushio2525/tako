@@ -104,7 +104,6 @@ case "$TAKO_REMOTE_STATE_DIR" in
   *) echo "state ディレクトリが隔離されていない: $TAKO_REMOTE_STATE_DIR"; exit 1 ;;
 esac
 
-DAEMON_PID=""
 DAEMON_LOG="$TMP/daemon.log"
 
 serve_target() { python3 -c 'import json,sys
@@ -129,26 +128,28 @@ start_daemon() {
   echo '{}' > "$TMP/serve-b.json"
   rm -f "$TMP/flip" "$TMP/gone"
   rm -f "$TAKO_REMOTE_STATE_DIR"/tako-remote.* 2>/dev/null || true
-  "$TAKO_BIN" remote serve > "$DAEMON_LOG" 2>&1 &
-  DAEMON_PID=$!
-  # 起動情報が出るまで待つ（自己疎通は DNS 解決できず Unknown で通過する）
+  # **本番と同じ起動経路**（`remote start` = spawn_daemon）を使う。
+  # spawn_daemon は起動情報 JSON を読んだあと子の stdout / stderr の pipe を閉じるので、
+  # 以後 daemon が println! / eprintln! を呼ぶと EPIPE で panic する（#1049 では実際に
+  # 自己検査スレッドが黙って死んだ）。`remote serve` を直接叩いてログをファイルへ
+  # 逃がすと**この条件が再現しない**ので、あえて本番経路を通す。
+  # TAKO_ISOLATED=1 は serve_binary の解決を検証対象の自世代に固定する（/Applications へ飛ばさない）
+  if ! TAKO_ISOLATED=1 "$TAKO_BIN" remote start > "$DAEMON_LOG" 2>&1; then
+    echo "daemon を起動できなかった:"; cat "$DAEMON_LOG"; return 1
+  fi
   for _ in $(seq 1 200); do
     if [ -s "$TAKO_REMOTE_STATE_DIR/tako-remote.url" ]; then
-      # 自己検査ありの世代は health ファイルが書かれるまで待つ
       if [ "${TAKO_1049_LEGACY:-}" = "1" ] || [ -s "$TAKO_REMOTE_STATE_DIR/tako-remote.serve" ]; then return 0; fi
     fi
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then echo "daemon が起動直後に落ちた:"; cat "$DAEMON_LOG"; return 1; fi
     sleep 0.1
   done
   echo "daemon の起動を待てなかった:"; cat "$DAEMON_LOG"; return 1
 }
 
 stop_daemon() {
-  if [ -n "${DAEMON_PID:-}" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-    kill "$DAEMON_PID" 2>/dev/null || true
-    wait "$DAEMON_PID" 2>/dev/null || true
+  if [ -n "${TAKO_REMOTE_STATE_DIR:-}" ] && [ -s "$TAKO_REMOTE_STATE_DIR/tako-remote.pid" ]; then
+    "$TAKO_BIN" remote stop > /dev/null 2>&1 || true
   fi
-  DAEMON_PID=""
 }
 
 # 期待する serve target に戻るまで待ち、かかった秒数を返す（戻らなければ空）
@@ -176,6 +177,11 @@ check_eq "張り直し回数が記録される" "1" "$(status_field serve_reasse
 AUDIT="$(cat "$TAKO_REMOTE_STATE_DIR/audit.log" 2>/dev/null || true)"
 check_contains "audit.log に serve_reasserted が残る" "$AUDIT" "serve_reasserted"
 check_contains "audit.log に誰が張り直したか（pid）が残る" "$AUDIT" '"pid"'
+# 張り直した**あとも**検査が回り続けること（#1049: 通知の 1 行で自己検査スレッドが
+# EPIPE panic して黙って死に、`stale` になるまで誰も気づけなかった）
+sleep 8
+AGE="$(status_field serve_checked_age_secs)"
+if [ "${AGE:-999}" -le 7 ]; then pass "張り直した後も自己検査が回り続ける（最終検査 ${AGE} 秒前）"; else fail "自己検査が止まっている（最終検査 ${AGE} 秒前）"; fi
 stop_daemon
 
 echo

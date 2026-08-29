@@ -22,6 +22,10 @@
   持つので相互に peer を引ける）= 認証経路は入れ替わりの影響を受けない。だから #1049 では触っていない
 - **`verify_pid_identity` は実行ファイルの inode を見ない**（`ps -o args=` の文字列 + etime）ので、
   **バイナリ差し替え後の `tako remote stop` は落ちない**（Issue の原因候補 2 は成立しにくい）
+- **daemon の中では起動情報 JSON を出したあと `println!` / `eprintln!` を使わない**（#1049 で実測）。
+  `spawn_daemon` が pipe を破棄するので EPIPE で **panic** し、そのスレッドが黙って死ぬ
+  （自己検査スレッドが 1 回で止まった）。記録は `audit_serve` か serve health ファイルへ。
+  番犬 = `crates/tako-control/tests/remote_daemon_output_watchdog.rs`
 - 検証は `bash scripts/test-serve-watch.sh`（偽 tailscale + 隔離 state で実 daemon を走らせる
   モックテスト 33 件。**本番の tailscale / serve / デーモンに触らない**）。A/B は `TAKO_1049_LEGACY=1`
 

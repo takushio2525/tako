@@ -3868,4 +3868,14 @@
 - **whois は系統をまたいでも解決する**（実測）ので認証経路は無関係 = 触っていない。
   `verify_pid_identity` は実行ファイルの inode ではなく `ps -o args=` + etime を見るので
   **バイナリ差し替え後の stop は落ちない**（Issue の原因候補 2 は成立しにくい）
+- **本番実測で自分のバグを 1 つ踏んで直した（重要な教訓）**: 張り直しの通知を `eprintln!` で
+  出していたところ、**`spawn_daemon` は起動情報 JSON を読んだあと子の stdout / stderr の pipe を
+  破棄する**ので、以後の `println!` / `eprintln!` は EPIPE で **panic** し**自己検査スレッドが
+  黙って死ぬ**（実測: 1 回張り直した直後に停止し、`serve_checked_age_secs` だけが伸び続けた）。
+  記録は audit.log 一本にし、終了時の後始末の `eprintln!` も撤去した（あれは panic すると
+  直後の `cleanup_state_files` が飛ぶ）。番犬 = `crates/tako-control/tests/remote_daemon_output_watchdog.rs`
+  （`serve_watch_loop` と「起動情報より後の `run_daemon`」にコンソール出力が無いことをソース走査）。
+  **モックテストが取り逃していたのは起動経路の違い**（`remote serve` を直接叩いてログをファイルへ
+  逃がしていた）ので、`remote start`（= `spawn_daemon`）へ寄せ「張り直した後も検査が回り続ける」
+  検査を足した。注入 A/B で 2 通り（モックが 2 件 NG / 番犬が名指し）落ちることを実測
 - 次: 本番 daemon を新バイナリで立て直しての実測（serve を手で消す → 復帰 → 200）
