@@ -49,6 +49,7 @@ pub mod spawn_layout;
 pub mod ssh_config;
 pub mod ssh_detect;
 pub mod ssh_progress;
+pub mod ssh_reconnect;
 pub mod tab;
 pub mod task_checkpoint;
 pub mod terminal;

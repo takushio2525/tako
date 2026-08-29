@@ -272,9 +272,20 @@ pub trait UiStateHost {
     /// （#1006）ので `fresh_pane`（tako が印字したものしか載っていないペインか）を
     /// 併せて渡す: 判定材料が経路で違う（`tako_core::ssh_progress` を参照）。
     ///
+    /// `reconnect_line` は**切れたときに打ち直す 1 行**（#1040）。3 経路とも、切断後の
+    /// ペインはローカルのシェルのプロンプトに居るので、同じ行を送り直すだけで戻せる
+    /// （`split` / `tab` はスクリプトがローカルシェルへ落ちる = `remote_fs::ssh_pane_script`）。
+    ///
     /// 既定は**何もしない**。実体は GUI が持つ（画面と時計が要るため）ので、
     /// GUI が居ない host では状態が `None` のまま = 騙らない
-    fn begin_ssh_connect(&mut self, _pane: PaneId, _host: &str, _fresh_pane: bool) {}
+    fn begin_ssh_connect(
+        &mut self,
+        _pane: PaneId,
+        _host: &str,
+        _fresh_pane: bool,
+        _reconnect_line: &str,
+    ) {
+    }
 
     /// ペインの SSH 接続の進行状況（#1010）。接続待ちでも失敗表示中でもなければ None。
     ///

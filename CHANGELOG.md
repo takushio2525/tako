@@ -96,6 +96,44 @@ Nightly minor release (automated). Changes since v0.7.10:
   handler itself already existed, but the overlay carrying it was only created for drags
   that started **inside** tako, so a drop from Finder never reached any listener. Set
   `TAKO_1043_LEGACY=1` to restore the previous behavior.
+- [修正] ネット断で SSH のペイン・タブ・リモートフォルダを失わないようにし、
+  回線復帰で自動的に繋ぎ直すようにした (#1040)
+
+  **切断でタブが閉じてリモートが消える**という報告の経路を確定して根治した。切断そのもの
+  ではペインは消えておらず、消していたのは tako が出していた案内のほうだった:
+  ssh が落ちたペインは「Enter でこのペインを閉じます」と出して入力待ちで止まっており、
+  **その案内どおり Enter を打つとペイン → タブ → そのタブに載っていたリモートフォルダが
+  一度に消えていた**（実測 `before tabs=2 panes=2` → `after tabs=1 panes=1`）。この文面は
+  「接続前の失敗」には正しいが「繋がったあとの切断」にも同じ画面が出るのが問題だった。
+
+  - **消さない**: ssh が終わったペインは理由を画面に残したまま**ローカルのシェルへ戻る**。
+    ペインもタブもフォルダも構造的に消えない
+  - **自動再接続**: 一度でも繋がったペインは、切断を検知すると `ssh …` を打ち直す
+    （バックオフ 2 / 5 / 10 / 20 / 30 / 30 秒・上限 6 回）。3 経路（split / tab / pane）
+    とも切断後は同じ形なので実装は 1 本。**そのペインで打ち始めたら黙って降りる**。
+    上限に達したら理由 + 次の一手（`ssh <host>` を実行）を出して静かに止まる
+  - **フォルダと保留中の保存も自動復帰**: 切断した SSH フォルダは回線が戻ると自動で live
+    へ戻り、切断中の保存（#966 の `pending`）も自動で押し出す
+  - **master にも keepalive を渡すようにした**: ツリーでフォルダを開いていると SSH ペイン
+    は ControlMaster に相乗りするが、その master に `ServerAlive*` が無く、**ブラックホール
+    型の切断を 66 秒観測しても検知できずペインが無言で凍っていた**（実測）
+  - **まっさらな環境での初回接続が必ず失敗していたのも直した**: `<data_dir>/ssh/` を作るのが
+    ツリー側の経路だけだったため、最初に「リモート接続…」を使うと
+    `unix_listener: cannot bind to path …: No such file or directory` で必ず落ちていた
+  - 再接続の状態は `tako list` / `tako read` の `ssh_connect`（`reconnecting` / `gave_up` +
+    `attempt` / `retry_in_secs` / `reason` / `next_step`）から読める
+
+  Fixed SSH panes, tabs and remote folders disappearing when the network drops, and made
+  tako reconnect on its own once the link is back. The panes were never closed by the
+  disconnect itself — tako told the user to "press Enter to close this pane", and following
+  that instruction closed the pane, its tab and the remote folders on it. Panes now fall back
+  to the local shell instead, keep the reason on screen, and a pane that was connected at
+  least once is retried automatically with backoff (6 tries) until the link returns; typing in
+  the pane silently cancels it. Disconnected remote folders come back to life on their own and
+  pending remote writes are pushed. Also added keepalive to the ControlMaster (a black-hole
+  outage went undetected for 66s before) and fixed the very first SSH connection failing on a
+  fresh install because `<data_dir>/ssh/` was never created.
+
 - [改善] SSH の進行状況を可視化した (#1010)
   ① **リモートファイルの読み込み中はツリーの行に回る弧が出る**。GUI の「開く」は
   SFTP の取得を**背景**へ出すようにしたので（従来は UI スレッドで同期実行 =

@@ -306,3 +306,203 @@ impl TakoApp {
         })
     }
 }
+
+// --- #1040: 切断したリモートフォルダの自動復帰 -------------------------------
+
+/// 1 ホストぶんの復帰待ち。**切断を観測している間だけ**存在する
+/// （= 平常時はネットワークへ 1 回も触らない）
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteRecovery {
+    /// 切断を観測した時刻（表示と診断用）
+    pub since: std::time::Instant,
+    /// 最後に繋ぎ直しを試した時刻
+    pub last_probe: Option<std::time::Instant>,
+    /// 試した回数
+    pub probes: u32,
+    /// background の試行が走っている最中か（二重起動を防ぐ）
+    pub in_flight: bool,
+}
+
+impl RemoteRecovery {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            last_probe: None,
+            probes: 0,
+            in_flight: false,
+        }
+    }
+
+    fn waited_secs(&self) -> u64 {
+        self.last_probe.unwrap_or(self.since).elapsed().as_secs()
+    }
+}
+
+/// background の試行の結果
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteRecoveryOutcome {
+    pub host: String,
+    /// 接続が戻ったか
+    pub connected: bool,
+    /// 戻らなかった理由（`connected == false` のとき）
+    pub reason: Option<String>,
+    /// 押し出せた保留中の保存の件数（#966 の pending）
+    pub pushed: usize,
+}
+
+/// background 専用。接続を試し、戻っていたら保留中の書き戻しも押し出す（#1040 要件 3）。
+///
+/// **ネットワーク I/O をここに閉じ込める**（UI スレッドで待たせない = #212 / #772 の教訓）。
+/// `push` は #966 の 1 実装をそのまま呼ぶので、競合の扱い（`conflict`）も同じ
+pub(crate) fn probe_and_push(host: &str) -> RemoteRecoveryOutcome {
+    if let Err(e) = tako_core::remote_fs::connect(host) {
+        return RemoteRecoveryOutcome {
+            host: host.to_string(),
+            connected: false,
+            reason: Some(format!("{} / {}", e.summary(), e.next_step())),
+            pushed: 0,
+        };
+    }
+    // 切断中の保存は消えていない（#966）。戻った合図で自分から押し出す。
+    // **force はしない**: 相手が変わっていたら `conflict` として残す（既存の分類に従う）
+    let mut pushed = 0usize;
+    for entry in tako_core::remote_fs::list_pending()
+        .into_iter()
+        .filter(|e| e.host == host)
+    {
+        match tako_core::remote_fs::push_pending(&entry.host, &entry.path, false) {
+            Ok(_) => pushed += 1,
+            Err(e) => tako_control::diag::persist_log(&format!(
+                "保留中の書き戻しを復帰時に押し出せない: {}:{} （{}）",
+                entry.host,
+                entry.path,
+                e.summary()
+            )),
+        }
+    }
+    RemoteRecoveryOutcome {
+        host: host.to_string(),
+        connected: true,
+        reason: None,
+        pushed,
+    }
+}
+
+impl TakoApp {
+    /// ツリーに出ているリモートホストの接続を見て、復帰待ちを進める（#1040）。
+    ///
+    /// 戻り値は**これから background で繋ぎ直しに行くホスト**。
+    /// 判定材料は `master_alive`（= ソケットの stat 1 回）だけなので、
+    /// 平常時はホスト数ぶんの stat しか起きない
+    pub(crate) fn drive_remote_recovery(&mut self) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        for tab in self.workspace.tabs() {
+            for r in tab.remote_folders() {
+                if !hosts.contains(&r.host) {
+                    hosts.push(r.host.clone());
+                }
+            }
+        }
+        // ツリーから消えたホストの待ちは畳む
+        self.remote_recovery.retain(|h, _| hosts.contains(h));
+
+        let mut jobs: Vec<String> = Vec::new();
+        let mut restored: Vec<String> = Vec::new();
+        for host in hosts {
+            let alive = tako_core::remote_fs::master_alive(&host);
+            if alive {
+                // 待っていたものが戻った（ペインの再接続で戻る場合もここを通る）
+                if self.remote_recovery.remove(&host).is_some() {
+                    restored.push(host);
+                }
+                continue;
+            }
+            let entry = self
+                .remote_recovery
+                .entry(host.clone())
+                .or_insert_with(RemoteRecovery::new);
+            if entry.in_flight {
+                continue;
+            }
+            if !tako_core::ssh_reconnect::folder_should_probe(entry.probes, entry.waited_secs()) {
+                continue;
+            }
+            entry.in_flight = true;
+            entry.probes += 1;
+            entry.last_probe = Some(std::time::Instant::now());
+            jobs.push(host);
+        }
+        for host in restored {
+            self.finish_remote_recovery(&host, 0);
+        }
+        jobs
+    }
+
+    /// ペインの再接続が通ったので、同じホストのツリーも起こす（#1040）。
+    ///
+    /// まだ切断を観測していなくても、**次の tick で必ず読み直す**ように待ちを作る
+    pub(crate) fn wake_remote_recovery(&mut self, host: &str) {
+        if !self.has_remote_host_anywhere(host) {
+            return;
+        }
+        self.remote_recovery
+            .entry(host.to_string())
+            .or_insert_with(RemoteRecovery::new)
+            .last_probe = None;
+    }
+
+    /// background の結果を反映する（#1040）
+    pub(crate) fn apply_remote_recovery(
+        &mut self,
+        outcome: RemoteRecoveryOutcome,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(entry) = self.remote_recovery.get_mut(&outcome.host) {
+            entry.in_flight = false;
+        }
+        if !outcome.connected {
+            if let Some(reason) = &outcome.reason {
+                tako_control::diag::persist_log(&format!(
+                    "リモートフォルダの自動復帰に失敗: {} （{reason}）",
+                    outcome.host
+                ));
+            }
+            // 上限まで試したら**静かに止まる**（行の「切断」バッジと
+            // 右クリックの「再読み込み」が残る = #976 の従来動作）
+            return;
+        }
+        self.remote_recovery.remove(&outcome.host);
+        self.finish_remote_recovery(&outcome.host, outcome.pushed);
+        cx.notify();
+    }
+
+    /// 接続が戻ったホストのツリーを読み直し、結果を通知する（#1040）
+    fn finish_remote_recovery(&mut self, host: &str, pushed: usize) {
+        let roots: Vec<tako_core::remote_fs::RemoteRef> = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.remote_folders().iter().cloned())
+            .filter(|r| r.host == host)
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        for root in &roots {
+            self.filetree.invalidate_remote(root);
+        }
+        tako_control::diag::persist_log(&format!(
+            "リモートフォルダを自動復帰: {host}（{} 件・保留 push {pushed} 件）",
+            roots.len()
+        ));
+        let lang = tako_core::i18n::lang();
+        let mut note = tako_core::ssh_reconnect::folder_restored(lang, host);
+        if pushed > 0 {
+            note.push_str(" / ");
+            note.push_str(&tako_core::ssh_reconnect::pending_pushed(
+                lang, host, pushed,
+            ));
+        }
+        self.set_remote_notice(note, false);
+    }
+}
