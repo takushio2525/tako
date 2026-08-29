@@ -113,16 +113,27 @@ fn detect_urls(screen: &Screen, out: &mut Vec<DetectedLink>) {
 }
 
 /// "http://" or "https://" の開始位置を返す
+///
+/// 小文字化した写しを作ってその位置を返すことはしない。小文字化はバイト長を
+/// 変えうる（`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、
+/// 該当文字が手前に 1 つあるだけで、返した位置が元テキストの別の場所を指す（#1016）。
+/// スキームは ASCII なので、元テキストを走査して ASCII 限定の大文字小文字無視で
+/// 突き合わせれば、位置は定義上つねに元テキスト基準になる。
 fn find_url_scheme(text: &str) -> Option<usize> {
-    let lower = text.to_lowercase();
-    let pos_http = lower.find("http://");
-    let pos_https = lower.find("https://");
-    match (pos_http, pos_https) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    let bytes = text.as_bytes();
+    text.char_indices().find_map(|(idx, ch)| {
+        // スキームは必ず h / H で始まる（安い足切り）
+        if ch != 'h' && ch != 'H' {
+            return None;
+        }
+        let rest = &bytes[idx..];
+        let hit = [b"http://".as_slice(), b"https://".as_slice()]
+            .iter()
+            .any(|scheme| {
+                rest.len() >= scheme.len() && rest[..scheme.len()].eq_ignore_ascii_case(scheme)
+            });
+        hit.then_some(idx)
+    })
 }
 
 /// URL の終端 byte offset を返す。
@@ -473,6 +484,25 @@ mod tests {
         assert_eq!(links[0].kind, LinkKind::Url);
         assert_eq!(links[0].target, "https://example.com");
         assert_eq!(links[0].spans, vec![(0, 6, 25)]);
+    }
+
+    #[test]
+    fn 小文字化で伸びる文字が手前にあってもurlを取り違えない() {
+        // `İ`(U+0130) は小文字化で 2 → 3 バイトに伸びる。小文字化した写しの
+        // バイト位置を元テキストの位置として流用すると、URL の切り出しがずれる（#1016）
+        let screen = make_screen(&["İstanbul https://example.com/x"], 80);
+        let links = detect_links(&screen);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "https://example.com/x");
+    }
+
+    #[test]
+    fn 小文字化で縮む文字が手前にあってもurlを取り違えない() {
+        // `ẞ`(U+1E9E) は小文字化で 3 → 2 バイトに縮む
+        let screen = make_screen(&["ẞ https://example.com/y"], 80);
+        let links = detect_links(&screen);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "https://example.com/y");
     }
 
     #[test]

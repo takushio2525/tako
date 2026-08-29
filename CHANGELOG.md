@@ -63,6 +63,25 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ### Fixed / 修正
 
+- [修正] 検索のヒット位置が小文字化でバイト長が変わる文字でずれる問題を根治 (#1016)
+  プレビューの検索・置換（⌘F / `tako preview-search` / `tako_preview_search`）が、
+  **小文字化した写しのバイト位置を元テキストの位置として使っていた**。小文字化は
+  バイト長を変えうる（`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、
+  該当文字がファイルに 1 つあるだけで以降のヒットがずれ、**置換すると本文が壊れる**。
+  実測では壊れるだけでなく**アプリごと落ちる**経路もあった（全置換で文字境界を割る
+  `not a char boundary` panic / 終端が本文の範囲を超える out of bounds panic）。
+  探索そのものは写しに対する高速な部分文字列探索のまま残し、見つかった位置を
+  元テキストへ戻す形にした（戻せない位置 = 展開された文字の途中で始まる一致は返さない）。
+  本文全体のバイト長が一致していても安全ではない（`İ` と `ẞ` が両方あると伸縮が
+  打ち消しあって総和だけ一致し、途中の位置は食い違う）ため、総和は判断材料にしていない。
+  同根の位置ずれがあったターミナルのリンク検出（`http://` / `https://` の走査）も同時に修正。
+  Preview search / replace used byte offsets taken from a lowercased copy as offsets into
+  the original text. Lowercasing can change byte length (`İ` U+0130 grows 2 → 3 bytes,
+  `ẞ` U+1E9E shrinks 3 → 2), so a single such character shifted every later hit and
+  corrupted the file on replace — and in some paths panicked the whole app. Matching now
+  maps hits back to original-text offsets, and the same drift in terminal link detection
+  is fixed too.
+
 - [修正] ファイルメニュー / パレットから開いた SSH ペインでターミナルが立たない (#1023)
   「ファイル→リモート接続」で出したペインは**ターミナルが出るまで待たされる**のに、
   ペイン右クリックの SSH 化は即出る、という非対称があった。原因は GUI 経路が
