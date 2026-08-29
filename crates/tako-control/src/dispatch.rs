@@ -4047,6 +4047,14 @@ fn dispatch_inner(
             // #1006: 開き先は 3 通り（既定 = 現在タブへ新ペイン）。語彙の正本は
             // `tako_core::remote_open`（CLI の値一覧・MCP の enum・GUI の分岐が同じ表を引く）
             let open_target = target.unwrap_or_default();
+            // #1040: `<data_dir>/ssh/` が無いと ssh が
+            // `unix_listener: cannot bind to path …: No such file or directory` で
+            // **必ず exit 255**（まっさらな data_dir での初回接続 = 実測）。
+            // 作っていたのは `ensure_master`（ツリー側）だけだったので、
+            // ペインを起こす 3 経路の手前にも同じ 1 実装を通す
+            if let Err(e) = tako_core::remote_fs::ensure_control_dir(&ssh_host) {
+                crate::diag::persist_log(&format!("ssh の ControlPath 置き場を作れない: {e}"));
+            }
             let argv = remote_ssh_argv(&ssh_host);
             let dir = remote_dir
                 .as_deref()
@@ -4101,7 +4109,7 @@ fn dispatch_inner(
                 // #1010: 打ち始める前から「接続中…」を出す。#640 の送達フローは
                 // シェルの準備を待つので、ここを起点にしないと**打たれるまでの沈黙**が
                 // そのまま「何も起きない」に見える
-                host.begin_ssh_connect(pane_id, &ssh_host, false);
+                host.begin_ssh_connect(pane_id, &ssh_host, false, &line);
                 host.queue_command_flow(pane_id, line.clone());
                 if let Some(d) = &dir {
                     // 接続後にリモートで `cd`。相手のシェルが不明なので両方言で通る形
@@ -4123,6 +4131,15 @@ fn dispatch_inner(
                     "command": line,
                 }));
             }
+
+            // #1040: 切れたときに打ち直す 1 行（`pane` 経路と同じ形・同じ引用規則）
+            let reconnect_line = {
+                let dialect = crate::launch_cmd::launch_dialect();
+                argv.iter()
+                    .map(|a| crate::launch_cmd::quote(dialect, a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
 
             let script = tako_core::remote_fs::ssh_pane_script(
                 tako_core::platform::shell::script_dialect(),
@@ -4192,8 +4209,10 @@ fn dispatch_inner(
                 },
             );
             // #1010: 新しいペインは tako が印字したバナーしか載っていない
-            // （= `fresh_pane`）ので、判定は「tako 以外の行が出たか」で足りる
-            host.begin_ssh_connect(pane_id, &ssh_host, true);
+            // （= `fresh_pane`）ので、判定は「tako 以外の行が出たか」で足りる。
+            // #1040: 打ち直す行は**スクリプトではなく素の ssh 1 行**。切断後のペインは
+            // ローカルシェルのプロンプトに居るので、`pane` 経路とまったく同じ形で戻せる
+            host.begin_ssh_connect(pane_id, &ssh_host, true, &reconnect_line);
 
             // フォルダ指定つきは接続後に `cd` を打つ。相手のシェルが不明（POSIX とも
             // PowerShell とも限らない）なので、**両方で通る `cd "<path>"`** を

@@ -771,6 +771,22 @@ pub fn control_path(host: &str) -> Option<PathBuf> {
     Some(control_path_in(crate::paths::data_dir().as_deref(), host))
 }
 
+/// ControlPath の置き場（`<data_dir>/ssh/`）を用意する（#1040）。
+///
+/// **ssh を起こす経路はすべてこれを先に通す**。作っていたのは `ensure_master`
+/// （= ツリー側）だけだったので、まっさらな data_dir で最初に「リモート接続…」を
+/// 使うと ssh が `unix_listener: cannot bind to path …: No such file or directory` で
+/// **必ず exit 255**（実測 #1040）。ツリーを先に開いていると隠れる形だった
+pub fn ensure_control_dir(host: &str) -> std::io::Result<()> {
+    let Some(cp) = control_path(host) else {
+        return Ok(());
+    };
+    match cp.parent() {
+        Some(parent) => std::fs::create_dir_all(parent),
+        None => Ok(()),
+    }
+}
+
 /// `-o ControlPath=…` の値。**空白を含むパスは二重引用符で包む**。
 ///
 /// OpenSSH の設定パーサは値を空白で切るので、素のまま渡すと
@@ -861,9 +877,21 @@ pub const SSH_ERROR_EXIT: i32 = 255;
 ///   接続待ちのあいだ画面が**完全に空**だった（実測: TCP ブラックホールで 25 秒間 1 文字も
 ///   出ない）。打っても何も起きないので「何も入力できない」に見える
 /// - **失敗しても消えない**: 旧実装は ssh が即死するとペインごと消え、タブまで閉じた
-///   （実測: 名前解決できないホストは 1 秒でタブが消滅）。`255` のときだけ理由を出して
-///   入力待ちで止まるので、**理由が画面に残る**
+///   （実測: 名前解決できないホストは 1 秒でタブが消滅）。`255` のときだけ理由を出す
 /// - 成功して普通に `exit` した場合は**従来どおり閉じる**（`255` 以外は素通し）
+///
+/// # #1040: 止まるのではなくローカルのシェルへ落ちる
+///
+/// 旧実装は `255` のとき「Enter でこのペインを閉じます」と出して入力待ちで止めていた。
+/// これは**接続前の失敗**には正しいが、**繋がったあとに回線が切れた**ときも同じ画面に
+/// なるため、案内どおり Enter を打ったユーザーがペイン → タブ → そのタブのリモート
+/// フォルダを一度に失っていた（実測: `before tabs=2 panes=2` → `after tabs=1 panes=1`。
+/// これが「ネットが切れたらタブ閉じてリモート消える」の正体）。
+///
+/// そこで**ローカルのログインシェルへ落ちる**形にした。ペインは構造的に消えず、理由は
+/// 画面に残り、ユーザーはそのまま何でも打てる。そして tako 側は
+/// [`crate::ssh_reconnect`] のマーカー（`ssh exit 255` の行）でこの状態を見分け、
+/// 一度でも繋がっていたペインなら**シェルのプロンプトへ ssh を打ち直す**
 pub fn ssh_pane_script(
     dialect: crate::platform::shell_dialect::ShellDialect,
     argv: &[String],
@@ -886,9 +914,12 @@ pub fn ssh_pane_script(
         }
     };
     let next = pane_failure_hint(lang);
+    // #1040: 「閉じます」ではなく「ローカルへ戻ります」。ここを閉じる案内にすると
+    // ユーザーがタブごと失う（モジュール doc の実測）。自動で繋ぎ直すかは tako 側が
+    // 決める（一度でも繋がったペインだけ）ので、スクリプトは事実だけを言う
     let hold = match lang {
-        Lang::Ja => "tako: Enter でこのペインを閉じます",
-        Lang::En => "tako: press Enter to close this pane",
+        Lang::Ja => "tako: このペインはローカルのシェルに戻ります",
+        Lang::En => "tako: this pane is returning to your local shell",
     };
 
     match dialect {
@@ -913,7 +944,7 @@ pub fn ssh_pane_script(
                 })
                 .unwrap_or_default();
             format!(
-                "printf '%s\\n' {banner};\n{cd}{cmd}\n                 __tako_code=$?;\n                 if [ \"$__tako_code\" -eq {SSH_ERROR_EXIT} ]; then\n                 printf '%s\\n%s\\n%s\\n' {failed} {next} {hold};\n                 read -r __TAKO_DUMMY__ 2>/dev/null || true;\n                 fi\n",
+                "printf '%s\\n' {banner};\n{cd}{cmd}\n                 __tako_code=$?;\n                 if [ \"$__tako_code\" -eq {SSH_ERROR_EXIT} ]; then\n                 printf '%s\\n%s\\n%s\\n' {failed} {next} {hold};\n                 exec \"${{SHELL:-/bin/sh}}\" -l;\n                 fi\n",
                 banner = crate::shell::quote_for_shell(&connecting),
                 failed = crate::shell::quote_for_shell(&failed),
                 next = crate::shell::quote_for_shell(next),
@@ -939,7 +970,7 @@ pub fn ssh_pane_script(
                 .unwrap_or_default();
             // 5.1 と 7 の両方で通る書き方だけを使う（`&&` は 5.1 に無い）
             format!(
-                "Write-Host {banner};\n{cd}& {cmd};\n                 $__tako_code = $LASTEXITCODE;\n                 if ($__tako_code -eq {SSH_ERROR_EXIT}) {{\n                 Write-Host {failed};\n                 Write-Host {next};\n                 Write-Host {hold};\n                 [void][System.Console]::ReadLine();\n                 }}\n",
+                "Write-Host {banner};\n{cd}& {cmd};\n                 $__tako_code = $LASTEXITCODE;\n                 if ($__tako_code -eq {SSH_ERROR_EXIT}) {{\n                 Write-Host {failed};\n                 Write-Host {next};\n                 Write-Host {hold};\n                 & (Get-Process -Id $PID).Path -NoLogo;\n                 }}\n",
                 banner = ShellDialect::PowerShell.quote_arg(&connecting),
                 failed = ShellDialect::PowerShell.quote_arg(&failed),
                 next = ShellDialect::PowerShell.quote_arg(next),
@@ -1082,14 +1113,12 @@ pub fn ensure_master(host: &str) -> Result<(), RemoteError> {
             "data_dir を解決できない",
         ));
     };
-    if let Some(parent) = cp.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(RemoteError::new(
-                RemoteErrorKind::Other,
-                host,
-                format!("{}: {e}", parent.display()),
-            ));
-        }
+    if let Err(e) = ensure_control_dir(host) {
+        return Err(RemoteError::new(
+            RemoteErrorKind::Other,
+            host,
+            format!("{}: {e}", cp.display()),
+        ));
     }
     // 残骸ソケット（マスターが死んでいるのにファイルだけ残る）は消してから張る
     if cp.exists() {
@@ -1104,6 +1133,14 @@ pub fn ensure_master(host: &str) -> Result<(), RemoteError> {
         format!("ControlPersist={CONTROL_PERSIST_SECS}"),
         "-o".to_string(),
         format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
+        // #1040: master にも keepalive を付ける。**これが無いと切断を誰も検知しない**。
+        // `ServerAlive*` は多重化の master 側の設定で、相乗りしている slave
+        // （= SSH ペインの ssh）は自分では送らない。実測（ブラックホール 66 秒）では
+        // master 有りのペインが最後まで切断に気づかず、無言で凍ったままだった
+        "-o".to_string(),
+        format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECS}"),
+        "-o".to_string(),
+        format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}"),
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         // 対話セッションは張らない（器だけ作る）
@@ -2116,15 +2153,31 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             assert!(posix.contains("win"), "{posix}");
             // ssh 自身の失敗（255）だけ拾う = リモートの `exit 1` を誤報しない
             assert!(posix.contains(&format!("-eq {SSH_ERROR_EXIT}")), "{posix}");
-            // 失敗時は入力待ちで止まる = 理由が画面に残る
-            assert!(posix.contains("read -r"), "{posix}");
+            // #1040: 失敗しても閉じずローカルのログインシェルへ落ちる
+            // （入力待ちで止めると、案内どおり Enter を打った人がタブごと失う）
+            assert!(
+                !posix.contains("read -r"),
+                "閉じる案内が残っている: {posix}"
+            );
+            assert!(posix.contains("exec \"${SHELL:-/bin/sh}\" -l"), "{posix}");
             assert!(posix.contains(pane_failure_hint(lang)), "{posix}");
+            // 切断の見分けに使うマーカー（`ssh_reconnect::detect_disconnect`）
+            assert!(
+                posix.contains(crate::ssh_progress::SCRIPT_FAILURE_MARK),
+                "{posix}"
+            );
 
             let ps = ssh_pane_script(ShellDialect::PowerShell, &argv, "win", None, lang);
             assert!(ps.contains("Write-Host"), "{ps}");
             assert!(ps.contains("$LASTEXITCODE"), "{ps}");
             assert!(ps.contains(&format!("-eq {SSH_ERROR_EXIT}")), "{ps}");
-            assert!(ps.contains("ReadLine"), "{ps}");
+            assert!(!ps.contains("ReadLine"), "閉じる案内が残っている: {ps}");
+            // 走っている PowerShell 自身を対話で立て直す（実行ファイルの場所を仮定しない）
+            assert!(ps.contains("Get-Process -Id $PID"), "{ps}");
+            assert!(
+                ps.contains(crate::ssh_progress::SCRIPT_FAILURE_MARK),
+                "{ps}"
+            );
             // 5.1 に無い `&&` は使わない（`default_shell()` が 5.1 へ落ちうる）
             assert!(!ps.contains("&&"), "{ps}");
         }

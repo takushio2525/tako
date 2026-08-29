@@ -34,6 +34,12 @@ pub enum ConnectPhase {
     Opened,
     /// ssh 自身が失敗した。**表示は消さず理由に置き換える**
     Failed { reason: Option<String> },
+    /// 接続が成立して使えている（#1040 でここから切断を見張る）。表示は畳む
+    Connected,
+    /// 切れたので自動で繋ぎ直している最中（#1040）。**表示は出し続ける**
+    Reconnecting { attempt: u32, waiting_secs: u64 },
+    /// 繋ぎ直せずに諦めた（#1040）。理由 + 次の一手を出したまま消さない
+    GaveUp,
 }
 
 impl ConnectPhase {
@@ -42,12 +48,15 @@ impl ConnectPhase {
             ConnectPhase::Connecting => "connecting",
             ConnectPhase::Opened => "opened",
             ConnectPhase::Failed { .. } => "failed",
+            ConnectPhase::Connected => "connected",
+            ConnectPhase::Reconnecting { .. } => "reconnecting",
+            ConnectPhase::GaveUp => "gave_up",
         }
     }
 
     /// まだ画面を覆う必要がある段階か（= 表示を出し続ける）
     pub fn is_visible(&self) -> bool {
-        !matches!(self, ConnectPhase::Opened)
+        !matches!(self, ConnectPhase::Opened | ConnectPhase::Connected)
     }
 }
 
@@ -104,6 +113,12 @@ const PROMPT_PATTERNS: &[&str] = &[
     "one-time password",
 ];
 
+/// ssh 自身が出す失敗行か（表は [`SSH_ERROR_PATTERNS`] の 1 本だけ）。
+/// #1040 の再接続判定が同じ表を引くために公開している
+pub fn is_ssh_error_line(line: &str) -> bool {
+    SSH_ERROR_PATTERNS.iter().any(|p| line.contains(p))
+}
+
 fn is_tako_line(line: &str) -> bool {
     line.trim_start().starts_with(TAKO_LINE_PREFIX)
 }
@@ -135,7 +150,7 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
 
     // ② ssh 自身の失敗行（`pane` 経路にはスクリプトが無いのでこちらで拾う）
     for line in &interesting {
-        if SSH_ERROR_PATTERNS.iter().any(|p| line.contains(p)) {
+        if is_ssh_error_line(line) {
             return ConnectPhase::Failed {
                 reason: Some(line.trim().to_string()),
             };
@@ -385,5 +400,35 @@ mod tests {
         assert!(ConnectPhase::Connecting.is_visible());
         assert!(ConnectPhase::Failed { reason: None }.is_visible());
         assert!(!ConnectPhase::Opened.is_visible());
+        // #1040: 使えている間は畳み、繋ぎ直している間と諦めたあとは出し続ける
+        assert!(!ConnectPhase::Connected.is_visible());
+        assert!(ConnectPhase::Reconnecting {
+            attempt: 1,
+            waiting_secs: 2
+        }
+        .is_visible());
+        assert!(ConnectPhase::GaveUp.is_visible());
+    }
+
+    #[test]
+    fn 段階の名前は重複しない() {
+        // `tako list` / `read` の `phase` はこの文字列がそのまま出るので、
+        // 増やしたときに被っていないことを機械で確かめる（AI が読む値）
+        let all = [
+            ConnectPhase::Connecting.as_str(),
+            ConnectPhase::Opened.as_str(),
+            ConnectPhase::Failed { reason: None }.as_str(),
+            ConnectPhase::Connected.as_str(),
+            ConnectPhase::Reconnecting {
+                attempt: 1,
+                waiting_secs: 0,
+            }
+            .as_str(),
+            ConnectPhase::GaveUp.as_str(),
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "phase の名前が被っている: {all:?}");
     }
 }
