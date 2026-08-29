@@ -3786,3 +3786,13 @@
 - 関連: PR（`Refs #983`）。**GUI が要る実測（spawn の通し・受け入れ条件 3）は未実施**
   （プレゼンのため画面に出る検証を停止中）
 ||||||| 99987b0
+
+## 2026-08-29（#983 / #975 北極星: 3 CLI の横断実測）
+- 同一タスク・同一プロンプトを claude / codex / agy の worker で計 10 ラウンド回し、①完了検知遅延
+  ②誤検知 ③送達 ④報告取得を実測。**codex は claude と体感差なし**（検知遅延 中央値 11.68s vs 15.40s /
+  transcript から報告取得可 / ctx% は codex だけ出る = #1021 の裏返し）。**agy は①④に差が残る**
+  （**39.38s = claude の 2.6 倍・+24 秒**。`(8-3)×5s` の理論値と一致 / report は scrollback のみ messages 0）
+- 差は `agent_support::MATRIX` の宣言（`degraded` / `pending(#984)`）と**完全に一致**し、未申告の隠れた差はゼロ
+- レポート: `.agent/investigations/issue-983-north-star-3cli.md`（測り方・全 10 ラウンドの生値・実ログ引用）
+- 起票: **#1033**（agy の検知遅延 + 報告）/ **#1034**（実行拒否で作業ゼロでも WORKER_IDLE + delivered）/
+  **#1035**（no_personal_data 番犬が gitignore 済み未追跡ファイルで落ちる = main 由来）
