@@ -7,6 +7,11 @@ description: 変更のステージング・コミット・ブランチ操作・�
 
 ステータスバーの git ボタン、または `tako panel --show --view git` で開きます。
 
+<figure class="tako-shot">
+<img src="/img/git-panel.webp" alt="右パネルに git ビューが開き、変更ファイル・コミット履歴・diff が表示されている画面" />
+<figcaption>右パネルの git ビュー。ステージングからコミット・ブランチ操作まで、ここで完結する</figcaption>
+</figure>
+
 ## 見えるもの・できること
 
 git ビューは上から順に並んだセクションで構成されます。
@@ -30,6 +35,11 @@ push / pull を実行します。
 ### コミット履歴と diff
 
 コミットの一覧を表示し、クリックするとその**直下**に詳細（メタ情報と変更ファイル一覧）が開きます。ファイルを選べば差分が読めます。追加行は緑、削除行は赤で表示されます。
+
+<figure class="tako-shot tako-shot-narrow">
+<img src="/img/git-panel-detail.webp" alt="git パネルの拡大。ブランチ名・コミットメッセージ入力欄・Pull / Push・変更ファイル・コミット履歴・diff が並んでいる" />
+<figcaption>上から順に、ブランチ / コミットメッセージ / 変更ファイル / コミット履歴 / diff</figcaption>
+</figure>
 
 ## 破壊的な操作は「予行演習」から
 

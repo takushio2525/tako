@@ -5,6 +5,11 @@ description: dev サーバーの起動を自動検知して「プレビューを
 
 tako はペイン内のプロセスが TCP ポートを listen し始めたことを自動で検知し、「プレビューを開きますか？」という提案チップを表示します。
 
+<figure class="tako-shot tako-shot-narrow">
+<img src="/img/port-detection-chip.webp" alt="「localhost:5173 (Python) が listen 中 ブラウザで開く」と書かれた提案チップ" />
+<figcaption>listen を検知するとペインの下端にチップが出る。押すとブラウザで開く</figcaption>
+</figure>
+
 ## 動作の流れ
 
 1. ペインで `npm run dev` などを実行

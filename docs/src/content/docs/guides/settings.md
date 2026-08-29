@@ -14,6 +14,11 @@ tako settings
 tako settings --tab 外観
 ```
 
+<figure class="tako-shot">
+<img src="/img/settings-general.webp" alt="tako の設定画面。一般タブに表示言語・AI 自動リネーム・ポート検知などのトグルが並んでいる" />
+<figcaption>設定画面（<kbd>Cmd</kbd>+<kbd>,</kbd>）。左のタブで分類を切り替える</figcaption>
+</figure>
+
 ## 見た目
 
 ### テーマ
@@ -53,6 +58,11 @@ tako panel --show --view git  # 右パネルを git ビューで開く
 tako panel --width 360
 tako panel --show-hidden on   # ツリーに .git などのドット項目も並べる（既定 off）
 ```
+
+<figure class="tako-shot">
+<img src="/img/settings-profiles.webp" alt="設定画面のプロファイルタブ。master / solo の切り替えとエージェント・モデル・思考の深さの設定が並んでいる" />
+<figcaption>プロファイルタブでは `tako master` / `tako solo` の起動設定をフォームで編集できる</figcaption>
+</figure>
 
 ## 入力まわり
 
