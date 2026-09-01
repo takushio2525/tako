@@ -522,7 +522,8 @@ mod tests {
         // #916 の tako_migrate（設定の自動マイグレーション）を追加して 139
         // #919 の tako_remote_folder（リモートからフォルダを開く）を追加して 140
         // #1002 の tako_setup_models（モデル一覧の実取得）を追加して 142
-        assert_eq!(tools.len(), 142);
+        // #1057 の tako_setup_deps（任意依存の検出とその場導入）を追加して 143
+        assert_eq!(tools.len(), 143);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -2648,10 +2648,16 @@ pub fn tools() -> Vec<Value> {
                 （install = 未導入 / path = PATH に無い / auth = 未ログイン / ready = 導入済み）。\
                 install_plan には「何をどこに入れるか」（公式コマンド・取得元・置き場所・\
                 自動更新の有無）が入るので、実行前に必ずユーザーへ提示すること。\
-                action=install で公式インストーラ（macOS は curl -fsSL https://claude.ai/install.sh | bash）を\
-                実行する。dry_run=true なら実行せず計画だけ返す。\
-                action=path でランチャーの置き場所をログインシェルの PATH へ通す（冪等）。\
+                action=install で公式インストーラ（macOS は curl -fsSL https://claude.ai/install.sh | bash、\
+                Windows は irm https://claude.ai/install.ps1 | iex 相当）を実行する。\
+                dry_run=true なら実行せず計画だけ返す。\
+                action=path でランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等。\
+                unix はログインシェルの profile、Windows はユーザー環境変数 Path）。\
                 action=undo-path で置いた設定を取り除く。\
+                action=handoff（読み取り専用）は**自動導入が通らなかったときの引き継ぎ計画**を返す（#1057）。\
+                導入済みの別系統 CLI（codex / agy）が居れば candidates と prompt が入るので、\
+                tako_orchestrator_spawn / tako_run でその CLI へ prompt を渡して代行させる。\
+                available=false なら fallback の案内（公式コマンド）をユーザーへ提示する。\
                 認証（auth）はブラウザ操作を伴うため自動化せず、ユーザーに \
                 `claude auth login` の実行を案内すること。",
             "inputSchema": {
@@ -2659,8 +2665,43 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "install", "path", "undo-path"],
+                        "enum": ["status", "install", "path", "undo-path", "handoff"],
                         "description": "操作種別（省略時は status）",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "action=install で実行せず計画だけ返す",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "action=handoff で「なぜ代行できなかったか」を指示文へ載せる",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "tako_setup_deps",
+            "description": "任意依存ツール（tmux / psmux / git / tailscale）の検出とその場導入（Issue #88 / #1057）。\
+                どれも**無くても tako 自体は動く**が、欠けるとリモート接続・セッション完全復元・\
+                git パネルが使えない。action=status（既定・読み取り専用）は各依存の found / \
+                install_command / can_run（tako が導入を代行できるか）/ hint を返す。\
+                action=install は未導入のものを導入する（dep で 1 件に絞れる。dry_run=true で計画だけ）。\
+                **導入済みのものは触らない**（冪等）。代行できない環境（Windows の winget）や \
+                導入手段が無いものは実行せず skipped に理由つきで載る。\
+                探す名前はプラットフォームで変わる（永続化の器は macOS = tmux / Windows = psmux）ので、\
+                名前を推測せず status の bin を使うこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "install"],
+                        "description": "操作種別（省略時は status）",
+                    },
+                    "dep": {
+                        "type": "string",
+                        "description": "対象の実行ファイル名（status の bin。省略で未導入のものすべて）",
                     },
                     "dry_run": {
                         "type": "boolean",

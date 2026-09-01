@@ -797,6 +797,12 @@ pub(super) fn build_request(
         "tako_setup_bootstrap" => Request::SetupBootstrap {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             dry_run: bool_arg(args, "dry_run")?,
+            reason: str_arg(args, "reason")?.map(|s| s.to_string()),
+        },
+        "tako_setup_deps" => Request::SetupDeps {
+            action: str_arg(args, "action")?.map(|s| s.to_string()),
+            dep: str_arg(args, "dep")?.map(|s| s.to_string()),
+            dry_run: bool_arg(args, "dry_run")?,
         },
         "tako_setup_models" => Request::SetupModels {
             agent: str_arg(args, "agent")?,

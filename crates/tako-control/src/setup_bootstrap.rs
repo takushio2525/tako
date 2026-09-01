@@ -22,9 +22,11 @@
 //!   sudo でパスワードを求める（実物で確認: 2026-08-21 時点の install.sh に
 //!   sudo 参照 49 箇所・`have_sudo_access`）。setup が黙って権限昇格を走らせない
 
+use crate::orchestrator::agent::WorkerAgent;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tako_core::platform::agent_install::{self, AgentKind, InstallRecipe};
+use tako_core::platform::user_path;
 use tako_core::shell_profile::{self, PathChange, ShellKind};
 
 /// 導入の進み具合。`status()` が「次に何をすべきか」として返す
@@ -271,12 +273,7 @@ pub fn status() -> Result<BootstrapState, String> {
     let binary = resolve_binary();
     let authenticated = binary.as_deref().is_some_and(is_authenticated);
     let launcher_dir = r.launcher_dir_in(&home);
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    // 現プロセスの PATH だけでは `.app` の痩せた PATH を誤判定するので、
-    // ログインシェルからも引けるかを併せて見る
-    let on_path = shell_profile::path_contains(&path_var, &launcher_dir)
-        || login_shell_sees(&launcher_dir)
-        || tako_core::platform::exe::find(r.agent.as_str()).is_some();
+    let on_path = launcher_dir_on_path(&launcher_dir);
     let (shell, profile) = shell_target();
     let profile_has_block = profile
         .as_deref()
@@ -304,6 +301,31 @@ pub fn status() -> Result<BootstrapState, String> {
         step,
         plan,
     })
+}
+
+/// ランチャーの置き場所が「**新しく開いたターミナルが見る PATH**」に入っているか。
+///
+/// ## Windows で `exe::find` を使わない理由（#1057）
+///
+/// [`tako_core::platform::exe::find`] は PATH の外（`~\.local\bin` 等）まで
+/// 走査する（「入れたのに再ログインしていない」を拾う保険。#525）。
+/// これを on_path の判定に使うと **「PATH に無いが tako からは見つかる」を
+/// 「PATH に在る」と誤って答える**ので、PATH を通す段が丸ごと飛ぶ。
+/// Windows は PATH をレジストリで持つので、そちらを直接見る（境界 B23）。
+///
+/// unix は `exe::find` がログインシェルの `command -v` なので PATH の実態を
+/// そのまま反映する（`.app` の痩せた PATH 対策として必要）＝従来のまま
+fn launcher_dir_on_path(dir: &Path) -> bool {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    if user_path::is_supported() {
+        return user_path::contains_entry(&path_var, dir)
+            || user_path::read()
+                .map(|value| user_path::contains_entry(&value.raw, dir))
+                .unwrap_or(false);
+    }
+    shell_profile::path_contains(&path_var, dir)
+        || login_shell_sees(dir)
+        || tako_core::platform::exe::find(recipe().agent.as_str()).is_some()
 }
 
 /// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）
@@ -412,25 +434,86 @@ pub fn install(opts: InstallOptions) -> Result<Value, String> {
     }))
 }
 
-/// インストーラを一時ファイルへ取得する。取得できた中身がシェルスクリプトかまで見る
+/// インストーラの取得手段。
+///
+/// curl / wget が無い環境でも詰まらないよう、最後の手段として PowerShell の
+/// `Invoke-WebRequest` を置く（Windows 10 1803 以降は `curl.exe` が同梱されるので
+/// 通常はそちらが選ばれる。実機実測では `C:\Windows\System32\curl.exe`）
+enum Downloader {
+    Curl(String),
+    Wget(String),
+    PowerShell(String),
+}
+
+impl Downloader {
+    /// この環境で使えるものを 1 つ選ぶ
+    fn detect() -> Option<Self> {
+        if let Some(bin) = tako_core::platform::exe::find("curl") {
+            return Some(Self::Curl(bin));
+        }
+        if let Some(bin) = tako_core::platform::exe::find("wget") {
+            return Some(Self::Wget(bin));
+        }
+        if !cfg!(windows) {
+            return None;
+        }
+        tako_core::platform::exe::find("powershell")
+            .or_else(|| tako_core::platform::exe::find("pwsh"))
+            .or_else(|| Some("powershell.exe".to_string()))
+            .map(Self::PowerShell)
+    }
+
+    fn program(&self) -> &str {
+        match self {
+            Self::Curl(bin) | Self::Wget(bin) | Self::PowerShell(bin) => bin,
+        }
+    }
+}
+
+/// PowerShell 経路の取得スクリプト。**URL と保存先は env で渡す**ので
+/// 引用符の入れ子もコードページも関与しない（`platform::user_path` と同じ作法）
+const POWERSHELL_FETCH_SCRIPT: &str = "\
+$ErrorActionPreference = 'Stop'\n\
+$ProgressPreference = 'SilentlyContinue'\n\
+Invoke-WebRequest -UseBasicParsing -Uri $env:TAKO_FETCH_URL -OutFile $env:TAKO_FETCH_DEST\n";
+
+/// インストーラを一時ファイルへ取得する。取得できた中身が本物かまで見る
 fn fetch_installer(plan: &InstallPlan) -> Result<PathBuf, String> {
-    let downloader = tako_core::platform::exe::find("curl")
-        .map(|p| (p, true))
-        .or_else(|| tako_core::platform::exe::find("wget").map(|p| (p, false)))
-        .ok_or_else(|| {
-            "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
-             （macOS なら通常 curl が標準で入っています）"
-                .to_string()
-        })?;
-    let dest = std::env::temp_dir().join(format!("tako-claude-install-{}.sh", std::process::id()));
-    let (bin, is_curl) = downloader;
+    let runner = recipe().runner;
+    let downloader = Downloader::detect().ok_or_else(|| {
+        "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
+         （macOS なら通常 curl が標準で入っています）"
+            .to_string()
+    })?;
+    // 拡張子はインタプリタが要求するもの（PowerShell は `.ps1` 以外を実行しない）
+    let dest = std::env::temp_dir().join(format!(
+        "tako-claude-install-{}.{}",
+        std::process::id(),
+        runner.script_ext
+    ));
+    let bin = downloader.program().to_string();
     let mut command = std::process::Command::new(&bin);
     // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
     tako_core::platform::process::no_console_window(&mut command);
-    if is_curl {
-        command.args(["-fsSL", &plan.source_url, "-o"]).arg(&dest);
-    } else {
-        command.args(["-q", &plan.source_url, "-O"]).arg(&dest);
+    match &downloader {
+        Downloader::Curl(_) => {
+            command.args(["-fsSL", &plan.source_url, "-o"]).arg(&dest);
+        }
+        Downloader::Wget(_) => {
+            command.args(["-q", &plan.source_url, "-O"]).arg(&dest);
+        }
+        Downloader::PowerShell(_) => {
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    &tako_core::platform::shell::encode_powershell_command(POWERSHELL_FETCH_SCRIPT),
+                ])
+                .env("TAKO_FETCH_URL", &plan.source_url)
+                .env("TAKO_FETCH_DEST", &dest);
+        }
     }
     let output = command
         .stdin(std::process::Stdio::null())
@@ -456,12 +539,14 @@ fn fetch_installer(plan: &InstallPlan) -> Result<PathBuf, String> {
         ));
     }
 
+    // 先頭だけ見る。`install.ps1` は `param(...)` → `Set-StrictMode` → …の順なので
+    // 512 バイトあればどちらの署名も判定できる（実物で確認）
     let head = std::fs::read(&dest)
         .map_err(|e| format!("取得したインストーラを読めません: {e}"))?
         .into_iter()
-        .take(256)
+        .take(512)
         .collect::<Vec<u8>>();
-    if !looks_like_shell_script(&head) {
+    if !agent_install::looks_like_installer(runner.signature, &head) {
         let _ = std::fs::remove_file(&dest);
         return Err(format!(
             "取得した内容がインストーラではありません（{} が HTML かエラーページを返しています）。\n\
@@ -471,13 +556,6 @@ fn fetch_installer(plan: &InstallPlan) -> Result<PathBuf, String> {
         ));
     }
     Ok(dest)
-}
-
-/// 先頭が shebang か（HTML エラーページを弾く）
-fn looks_like_shell_script(head: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(head);
-    let trimmed = text.trim_start();
-    trimmed.starts_with("#!")
 }
 
 /// インストール実行の指定
@@ -495,11 +573,18 @@ pub struct InstallOptions {
 /// 端末があるときは出力をそのまま流す（インストーラは進捗と TUI を出す）。
 /// GUI 内 dispatch から呼ばれたときは端末が無いので捕捉し、失敗時の診断へ回す
 fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
-    let shell = tako_core::platform::exe::find("bash").unwrap_or_else(|| "/bin/bash".to_string());
+    let runner = recipe().runner;
+    // インタプリタと引数はプラットフォーム境界（B17）が持つデータから組む。
+    // ここに `bash` / `powershell` を書かない = 経路の取り違えが起きない
+    let shell = runner
+        .candidates
+        .iter()
+        .find_map(|name| tako_core::platform::exe::find(name))
+        .unwrap_or_else(|| runner.fallback.to_string());
     let mut command = std::process::Command::new(&shell);
     // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
     tako_core::platform::process::no_console_window(&mut command);
-    command.arg(script);
+    command.args(runner.args_for(script));
     let (status, log) = if interactive {
         let status = command
             .stdin(std::process::Stdio::inherit())
@@ -551,11 +636,14 @@ fn run_installer(script: &Path, interactive: bool) -> Result<String, String> {
 
 // --- PATH 通し ---
 
-/// ランチャーの置き場所をログインシェルの PATH へ通す（冪等）
+/// ランチャーの置き場所を「新しく開いたターミナルが見る PATH」へ通す（冪等）
 pub fn ensure_path() -> Result<Value, String> {
     let home = home_dir()?;
     let r = recipe();
     let dir = r.launcher_dir_in(&home);
+    if user_path::is_supported() {
+        return ensure_user_path(&dir);
+    }
     let (shell, _) = shell_target();
     let Some(shell) = shell else {
         let current = std::env::var("SHELL").unwrap_or_default();
@@ -594,9 +682,60 @@ pub fn ensure_path() -> Result<Value, String> {
     }))
 }
 
+/// Windows のユーザー PATH（`HKCU\Environment\Path`）へ通す（冪等。境界 B23）。
+///
+/// **末尾へ足す**ので、ユーザーが自分で並べた優先順位は動かない。
+/// 書いたあと**読み直して確かめる**（「書いたはず」で終わらせない）
+fn ensure_user_path(dir: &Path) -> Result<Value, String> {
+    let current = user_path::read()?;
+    let process_has = user_path::contains_entry(&std::env::var("PATH").unwrap_or_default(), dir);
+    let change = match user_path::append_entry(&current.raw, dir) {
+        // レジストリに既に在る = 新しいターミナルからは引ける
+        None => PathChange::AlreadyOnPath,
+        Some(next) => {
+            user_path::write(&user_path::UserPathValue {
+                raw: next,
+                kind: current.kind.clone(),
+            })?;
+            let after = user_path::read()?;
+            if !user_path::contains_entry(&after.raw, dir) {
+                return Err(format!(
+                    "ユーザー PATH へ {} を追加できませんでした（書き込み後も反映されていません）。\n\
+                     設定 → システム → バージョン情報 → 環境変数 から手で追加してください",
+                    display_path(dir)
+                ));
+            }
+            PathChange::Installed
+        }
+    };
+    // レジストリへ入っていても**いまのプロセスには反映されない**（Windows は
+    // 再ログイン / 新しいプロセス起動まで伝播しない。#525 実測）
+    let verified = change == PathChange::AlreadyOnPath || process_has;
+    Ok(json!({
+        "shell": "windows-user-path",
+        // 書き先は「ファイル」ではないので、人へはレジストリのキーを見せる
+        "profile": "HKCU\\Environment\\Path",
+        "profile_display": "ユーザー環境変数 Path",
+        "dir": dir.display().to_string(),
+        "dir_display": display_path(dir),
+        "change": change.as_str(),
+        "wrote": change.wrote(),
+        "verified": verified,
+        "note": if verified {
+            "claude コマンドがどのターミナルからも使えます"
+        } else {
+            "ユーザー環境変数へ追加しました。いま開いているターミナルには反映されないので、\
+             新しいターミナルを開いてください"
+        },
+    }))
+}
+
 /// 置いた PATH ブロックを取り除く（元のバイト列へ戻す）
 pub fn undo_path() -> Result<Value, String> {
     let home = home_dir()?;
+    if user_path::is_supported() {
+        return undo_user_path(&recipe().launcher_dir_in(&home));
+    }
     let (shell, _) = shell_target();
     let shell = shell.ok_or("使っているシェルの設定ファイルが分かりません")?;
     let outcome = shell_profile::remove_from_profile_in(&home, shell)?;
@@ -607,24 +746,130 @@ pub fn undo_path() -> Result<Value, String> {
     }))
 }
 
+/// Windows のユーザー PATH から tako が足したエントリを取り除く。
+/// **他のエントリは 1 つも触らない**（純粋関数側のテストで固定してある）
+fn undo_user_path(dir: &Path) -> Result<Value, String> {
+    let current = user_path::read()?;
+    let change = match user_path::remove_entry(&current.raw, dir) {
+        None => PathChange::Absent,
+        Some(next) => {
+            user_path::write(&user_path::UserPathValue {
+                raw: next,
+                kind: current.kind.clone(),
+            })?;
+            PathChange::Removed
+        }
+    };
+    Ok(json!({
+        "shell": "windows-user-path",
+        "profile": "HKCU\\Environment\\Path",
+        "change": change.as_str(),
+    }))
+}
+
+// --- 自動導入が通らなかったときの引き継ぎ（#1057）---
+
+/// 引き継ぎ先の候補（**claude 以外**の導入済みエージェント CLI）。
+///
+/// claude を入れるための代行なので claude 自身は候補にしない。
+/// 順序は codex → agy（master を務められる系統を先に置く）
+const HANDOFF_AGENTS: &[WorkerAgent] = &[WorkerAgent::Codex, WorkerAgent::Agy];
+
+/// 引き継ぎ先 1 件
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffCandidate {
+    pub agent: &'static str,
+    pub path: String,
+}
+
+/// この環境で引き継げる相手
+pub fn handoff_candidates() -> Vec<HandoffCandidate> {
+    HANDOFF_AGENTS
+        .iter()
+        .filter_map(|agent| {
+            crate::orchestrator::agent_cli::locate(*agent)
+                .ok()
+                .map(|path| HandoffCandidate {
+                    agent: agent.as_str(),
+                    path,
+                })
+        })
+        .collect()
+}
+
+/// 代行を頼む指示文（**純粋関数**なので文面をテストで固定できる）。
+///
+/// 「何を・どこへ・どうやって入れるか」と「やってはいけないこと」を書く。
+/// 認証はブラウザ操作が要るので**代行させない**（ユーザーへ依頼させる）
+pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
+    let reason = reason.unwrap_or("tako の自動インストールが通らなかった");
+    format!(
+        "tako から引き継ぎ: Claude Code（claude CLI）の導入を代行してください。\n\
+         \n\
+         ## 状況\n\
+         \n\
+         - この環境で tako 自身の自動インストールが成立しませんでした（理由: {reason}）\n\
+         - 公式の導入コマンド: {command}\n\
+         - コマンドの置き場所: {launcher}\n\
+         - 本体の置き場所: {payload}\n\
+         - 管理者権限は不要です。ホームディレクトリの中だけで完結します\n\
+         \n\
+         ## やること（この順に）\n\
+         \n\
+         1. 上の公式コマンドを実行して claude を導入する。失敗したら出力のエラーを読み、\n\
+         \x20  ネットワーク・プロキシ・ディスク容量などの原因を切り分けて対処する\n\
+         2. `tako setup bootstrap status --json` で `next_step` を確認する\n\
+         \x20  （`install` のままなら導入できていない）\n\
+         3. `next_step` が `path` なら `tako setup bootstrap path` を実行する\n\
+         4. `next_step` が `auth` なら**ユーザーへ `claude auth login` の実行を依頼する**\n\
+         \x20  （ブラウザ操作が要るので代行しない）\n\
+         5. `next_step` が `ready` になったら `tako setup` を実行して設定を完了させる\n\
+         \n\
+         ## 守ること\n\
+         \n\
+         - 上の手順以外でユーザーの設定ファイル・PATH・レジストリを書き換えない\n\
+         - 別の入れ方（Homebrew・npm 等）へ勝手に切り替えない。公式の native インストーラを使う\n\
+         - うまくいかないときは、何がどこで失敗したかを日本語で報告して止まる\n",
+        command = plan.official_command,
+        launcher = display_path(&plan.launcher),
+        payload = display_path(&plan.payload),
+    )
+}
+
+/// 引き継ぎの計画。CLI・MCP が同じ内容を見る（`available` が false なら
+/// 従来どおり公式コマンドの案内へ落とす）
+pub fn handoff_plan(reason: Option<&str>) -> Result<Value, String> {
+    let plan = install_plan()?;
+    let candidates = handoff_candidates();
+    let prompt = handoff_prompt_text(&plan, reason);
+    let recommended = candidates.first();
+    Ok(json!({
+        "available": !candidates.is_empty(),
+        "reason": reason,
+        "candidates": candidates
+            .iter()
+            .map(|c| json!({ "agent": c.agent, "path": c.path }))
+            .collect::<Vec<_>>(),
+        "recommended": recommended.map(|c| c.agent),
+        "prompt": prompt,
+        // そのまま打てる形（#322 の最簡形）。引数の prompt はシェルのクォートが
+        // 要るので、CLI / GUI は argv で渡す。ここは「誰へ頼むか」を示す
+        "launch_command": recommended.map(|c| format!("{} \"<上の prompt>\"", c.agent)),
+        "install_plan": plan.to_json(),
+        "fallback": format!(
+            "引き継げる別のエージェント CLI がありません。\n\
+             次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}",
+            plan.official_command
+        ),
+    }))
+}
+
 // --- 依存ツールと Homebrew ---
 
-/// tako が実行時に使う外部コマンド。**すべて任意**（無くても tako 自体は動く）
-pub const OPTIONAL_DEPS: &[&str] = &["tmux", "git", "tailscale"];
-
+/// 依存の検出は [`crate::setup_deps`] が正本（CLI・MCP・`--review` が同じ実装を通る）。
+/// ここは `status()` の応答へ載せるだけ
 fn deps_json() -> Value {
-    Value::Array(
-        OPTIONAL_DEPS
-            .iter()
-            .map(|bin| {
-                json!({
-                    "bin": bin,
-                    "found": tako_core::platform::exe::find(bin),
-                    "required": false,
-                })
-            })
-            .collect(),
-    )
+    crate::setup_deps::status_json()
 }
 
 /// Homebrew の状態と、無い場合の案内。
@@ -647,13 +892,17 @@ fn homebrew_json() -> Value {
 mod tests {
     use super::*;
 
+    /// 取得物の見分け方は境界（B17）が持つ。ここではこの環境の署名で
+    /// **HTML エラーページを弾けること**だけを確かめる
+    /// （判定そのものの総当たりは `platform::agent_install` 側のテスト）
     #[test]
-    fn shebangでインストーラとhtmlを見分ける() {
-        assert!(looks_like_shell_script(b"#!/bin/bash\nset -e\n"));
-        assert!(looks_like_shell_script(b"\n#!/usr/bin/env bash\n"));
-        assert!(!looks_like_shell_script(b"<!DOCTYPE html>"));
-        assert!(!looks_like_shell_script(b"<html><body>403"));
-        assert!(!looks_like_shell_script(b""));
+    fn この環境の署名でhtmlエラーページを弾く() {
+        let signature = recipe().runner.signature;
+        assert!(!agent_install::looks_like_installer(
+            signature,
+            b"<!DOCTYPE html>"
+        ));
+        assert!(!agent_install::looks_like_installer(signature, b""));
     }
 
     #[test]
@@ -726,14 +975,14 @@ mod tests {
         }
     }
 
-    /// Windows では「代行しない」ことが計画に出て、実行は具体的な案内つきで断られる
+    /// Windows も PowerShell 経路で代行する（#1057。実機実測を経て倒した）
     #[test]
-    fn windowsの計画は代行しないと明示する() {
+    fn windowsもpowershell経路で代行する() {
         let r = agent_install::recipe(
             tako_core::platform::support::Platform::Windows,
             AgentKind::Claude,
         );
-        assert!(!r.tako_can_run);
+        assert!(r.tako_can_run);
         assert!(r.source.official_command.contains("install.ps1"));
     }
 
@@ -747,5 +996,90 @@ mod tests {
         for dep in deps_json().as_array().unwrap() {
             assert_eq!(dep["required"], false, "必須の依存を増やさない");
         }
+    }
+
+    /// 引き継ぎの指示文には「何を・どこへ・どうやって」と禁止事項が入る（#1057）。
+    /// **両プラットフォームぶんを macOS から検証する**
+    #[test]
+    fn 引き継ぎの指示文は導入計画から作られる() {
+        use tako_core::platform::support::Platform;
+        let home = Path::new("/tmp/h");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let r = agent_install::recipe(platform, AgentKind::Claude);
+            let plan = InstallPlan {
+                agent: r.agent.as_str(),
+                official_command: r.source.official_command.to_string(),
+                source_url: r.source.url.to_string(),
+                launcher: r.launcher_path_in(home),
+                payload: r.payload_dir_in(home),
+                auto_updates: r.auto_updates,
+                can_run: r.tako_can_run,
+            };
+            let prompt = handoff_prompt_text(&plan, Some("取得が 403 で失敗した"));
+            assert!(prompt.contains(r.source.official_command), "{prompt}");
+            assert!(prompt.contains("取得が 403 で失敗した"), "{prompt}");
+            // 認証は代行させない（ブラウザ操作が要る）
+            assert!(prompt.contains("claude auth login"), "{prompt}");
+            assert!(prompt.contains("代行しない"), "{prompt}");
+            // 次の一手が機械的に辿れる形で入っている
+            assert!(prompt.contains("tako setup bootstrap status"), "{prompt}");
+            assert!(prompt.contains("tako setup bootstrap path"), "{prompt}");
+            // 勝手な入れ方への切り替えを禁じる
+            assert!(prompt.contains("Homebrew"), "{prompt}");
+            // 他方の手順が混ざらない
+            let other = agent_install::recipe(
+                match platform {
+                    Platform::MacOs => Platform::Windows,
+                    Platform::Windows => Platform::MacOs,
+                },
+                AgentKind::Claude,
+            );
+            assert!(
+                !prompt.contains(other.source.official_command),
+                "{platform:?}: 別プラットフォームの手順が混ざっている: {prompt}"
+            );
+        }
+    }
+
+    /// 引き継ぎ先に claude 自身を選ばない（入れる対象なので候補になりえない）
+    #[test]
+    fn 引き継ぎ先にclaudeを選ばない() {
+        assert!(!HANDOFF_AGENTS.contains(&WorkerAgent::Claude));
+        // master を務められる系統を先に置く（codex → agy）
+        assert_eq!(HANDOFF_AGENTS.first(), Some(&WorkerAgent::Codex));
+        for candidate in handoff_candidates() {
+            assert_ne!(candidate.agent, "claude");
+        }
+    }
+
+    /// 候補が居なければ従来の案内（公式コマンド）へ落ちる
+    #[test]
+    fn 候補が居なければ公式コマンドの案内へ落ちる() {
+        let _guard = crate::orchestrator::agent_cli::test_force_missing(&[
+            WorkerAgent::Codex,
+            WorkerAgent::Agy,
+        ]);
+        let plan = handoff_plan(Some("テスト")).expect("計画は作れる");
+        assert_eq!(plan["available"], false);
+        assert!(plan["candidates"].as_array().is_some_and(|a| a.is_empty()));
+        assert_eq!(plan["recommended"], serde_json::Value::Null);
+        let fallback = plan["fallback"].as_str().unwrap_or_default();
+        assert!(
+            fallback.contains(recipe().source.official_command),
+            "{fallback}"
+        );
+    }
+
+    /// 候補が居れば「誰へ頼むか」が決まる
+    #[test]
+    fn 候補が居れば引き継ぎ先が決まる() {
+        let _guard = crate::orchestrator::agent_cli::test_force_found(&[(
+            WorkerAgent::Codex,
+            "/tmp/fake/codex",
+        )]);
+        let plan = handoff_plan(None).expect("計画は作れる");
+        assert_eq!(plan["available"], true);
+        assert_eq!(plan["recommended"], "codex");
+        assert!(plan["prompt"].as_str().is_some_and(|p| !p.is_empty()));
     }
 }

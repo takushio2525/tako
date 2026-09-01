@@ -53544,6 +53544,7 @@ mod self_test {
                                 tako_control::protocol::Request::SetupBootstrap {
                                     action: Some(action.into()),
                                     dry_run,
+                                    reason: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -53632,6 +53633,7 @@ mod self_test {
                             tako_control::protocol::Request::SetupBootstrap {
                                 action: Some("nope".into()),
                                 dry_run: None,
+                                reason: None,
                             },
                             PaneOrigin::Cli,
                         )

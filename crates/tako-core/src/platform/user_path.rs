@@ -129,7 +129,7 @@ pub fn contains_entry_in(raw: &str, dir: &Path, lookup: &dyn Fn(&str) -> Option<
 ///
 /// 先頭ではなく末尾へ足すのは、ユーザーが自分で並べた優先順位を動かさないため。
 /// tako が入れるのはランチャーの置き場所だけで、同名コマンドの奪い合いはしない
-pub fn append_entry(
+pub fn append_entry_in(
     raw: &str,
     dir: &Path,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -150,7 +150,7 @@ pub fn append_entry(
 /// `dir` のエントリを取り除いた値。**入っていなければ `None`**
 ///
 /// 区切りの見た目（末尾の `;` の有無）は元の値に合わせる
-pub fn remove_entry(
+pub fn remove_entry_in(
     raw: &str,
     dir: &Path,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -181,6 +181,16 @@ fn env_lookup(name: &str) -> Option<String> {
 /// 実環境で `dir` が入っているか
 pub fn contains_entry(raw: &str, dir: &Path) -> bool {
     contains_entry_in(raw, dir, &env_lookup)
+}
+
+/// 実環境で `dir` を末尾へ足した値（既に入っていれば `None`）
+pub fn append_entry(raw: &str, dir: &Path) -> Option<String> {
+    append_entry_in(raw, dir, &env_lookup)
+}
+
+/// 実環境で `dir` のエントリを取り除いた値（入っていなければ `None`）
+pub fn remove_entry(raw: &str, dir: &Path) -> Option<String> {
+    remove_entry_in(raw, dir, &env_lookup)
 }
 
 /// ユーザー PATH（`HKCU\Environment\Path`）の生の値を読む
@@ -361,7 +371,7 @@ C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
         let launcher = dir("C:\\Users\\winuser\\.local\\bin");
         assert!(contains_entry_in(REAL_RAW, &launcher, &lookup));
         // 追記は何もしない（**冪等**）
-        assert_eq!(append_entry(REAL_RAW, &launcher, &lookup), None);
+        assert_eq!(append_entry_in(REAL_RAW, &launcher, &lookup), None);
     }
 
     #[test]
@@ -391,16 +401,16 @@ C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
     fn 追記は末尾へ入り二重の区切りを作らない() {
         let launcher = dir("C:\\Users\\winuser\\.local\\bin");
         let raw = "C:\\WINDOWS\\system32;";
-        let appended = append_entry(raw, &launcher, &lookup).expect("追記される");
+        let appended = append_entry_in(raw, &launcher, &lookup).expect("追記される");
         assert_eq!(
             appended,
             "C:\\WINDOWS\\system32;C:\\Users\\winuser\\.local\\bin"
         );
         // 2 回目は None（冪等）
-        assert_eq!(append_entry(&appended, &launcher, &lookup), None);
+        assert_eq!(append_entry_in(&appended, &launcher, &lookup), None);
         // 空の値でも壊れない
         assert_eq!(
-            append_entry("", &launcher, &lookup).as_deref(),
+            append_entry_in("", &launcher, &lookup).as_deref(),
             Some("C:\\Users\\winuser\\.local\\bin")
         );
     }
@@ -408,7 +418,7 @@ C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
     #[test]
     fn 除去は元の見た目を保ちつつ該当エントリだけ落とす() {
         let launcher = dir("C:\\Users\\winuser\\.local\\bin");
-        let removed = remove_entry(REAL_RAW, &launcher, &lookup).expect("除去される");
+        let removed = remove_entry_in(REAL_RAW, &launcher, &lookup).expect("除去される");
         assert!(!contains_entry_in(&removed, &launcher, &lookup));
         // 他のエントリは 1 つも消えていない
         for entry in split_entries(REAL_RAW) {
@@ -423,15 +433,15 @@ C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
         // 末尾の `;` の有無は元に合わせる
         assert!(removed.ends_with(';'), "元の末尾 `;` を保つ: {removed}");
         // 入っていなければ None
-        assert_eq!(remove_entry(&removed, &launcher, &lookup), None);
+        assert_eq!(remove_entry_in(&removed, &launcher, &lookup), None);
     }
 
     #[test]
     fn 追記と除去の往復で元へ戻る() {
         let launcher = dir("C:\\Users\\winuser\\.local\\bin");
         let base = "C:\\WINDOWS\\system32;C:\\Program Files\\Git\\cmd";
-        let appended = append_entry(base, &launcher, &lookup).expect("追記される");
-        let back = remove_entry(&appended, &launcher, &lookup).expect("除去される");
+        let appended = append_entry_in(base, &launcher, &lookup).expect("追記される");
+        let back = remove_entry_in(&appended, &launcher, &lookup).expect("除去される");
         assert_eq!(back, base, "往復で元のバイト列へ戻る");
     }
 

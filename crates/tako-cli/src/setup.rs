@@ -583,10 +583,26 @@ pub fn run_bootstrap(action: Option<&str>, dry_run: bool, json: bool) -> Result<
         })?,
         "path" => setup_bootstrap::ensure_path()?,
         "undo-path" => setup_bootstrap::undo_path()?,
+        // 引き継ぎ（#1057）。**端末があれば計画を見せて起動まで**、
+        // 無ければ計画だけ返す（対話エージェントは端末なしでは意味がない）
+        "handoff" => {
+            let plan = setup_bootstrap::handoff_plan(None)?;
+            if !json
+                && plan["available"].as_bool() == Some(true)
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            {
+                print_handoff_plan(&plan);
+                if try_agent_handoff("tako setup bootstrap handoff から手動で依頼", false) {
+                    eprintln!("  [OK] Claude Code が導入されました");
+                }
+                return Ok(());
+            }
+            plan
+        }
         other => {
             return Err(format!(
-                "不明な action: {other:?}（status / install / path / undo-path のいずれか）"
-            ))
+            "不明な action: {other:?}（status / install / path / undo-path / handoff のいずれか）"
+        ))
         }
     };
     if json {
@@ -643,6 +659,14 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
                 print_install_plan(&value["install_plan"]);
             }
         }
+        "handoff" => {
+            if value["available"].as_bool() == Some(true) {
+                print_handoff_plan(value);
+                eprintln!("  端末が無いため起動はしていません（prompt を別のエージェントへ渡してください）");
+            } else if let Some(text) = value["fallback"].as_str() {
+                eprintln!("{text}");
+            }
+        }
         _ => {
             for key in ["profile_display", "dir_display", "change", "note"] {
                 if let Some(text) = value[key].as_str() {
@@ -651,6 +675,20 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
             }
         }
     }
+}
+
+/// 引き継ぎ計画の表示（誰へ・何を頼むか）
+fn print_handoff_plan(plan: &serde_json::Value) {
+    eprintln!("Claude Code の導入をエージェントへ引き継ぎます");
+    eprintln!("─────────────────────────────────────");
+    for c in plan["candidates"].as_array().into_iter().flatten() {
+        eprintln!(
+            "  候補: {} ({})",
+            c["agent"].as_str().unwrap_or("?"),
+            c["path"].as_str().unwrap_or("?")
+        );
+    }
+    print_install_plan(&plan["install_plan"]);
 }
 
 /// **何をどこに入れるか**（受け入れ条件 4）。実行前に必ず出す
@@ -684,6 +722,101 @@ fn confirm(prompt: &str, default_yes: bool, assume_yes: bool) -> bool {
     }
 }
 
+/// 自動導入が通らなかったときに別のエージェント CLI へ代行を頼む（#1057）。
+///
+/// **案内だけ出して人間へ丸投げしない**のが狙い。導入済みの別系統
+/// （codex / agy）が居れば、その CLI を起こして導入を代行させる。
+/// 1 つも居なければ従来どおりコマンドの案内へ落ちる。
+///
+/// 戻り値 = 代行の結果 claude が導入できたか。**「起動した」ではなく
+/// 「入った」を確かめてから true を返す**
+fn try_agent_handoff(reason: &str, assume_yes: bool) -> bool {
+    let Ok(plan) = setup_bootstrap::handoff_plan(Some(reason)) else {
+        return false;
+    };
+    if plan["available"].as_bool() != Some(true) {
+        return false;
+    }
+    let candidates: Vec<(&str, &str)> = plan["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["agent"].as_str()?, c["path"].as_str()?)))
+        .collect();
+    let Some((agent, path)) = candidates.first().copied() else {
+        return false;
+    };
+    eprintln!();
+    eprintln!("  導入済みの {agent} が見つかりました。{agent} へ導入の代行を頼めます");
+    for (name, found) in &candidates {
+        eprintln!("    - {name}: {}", display_home_relative(Path::new(found)));
+    }
+    // ブラウザ操作や対話が伴うので、端末が無い経路では起こさない
+    if assume_yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("  非対話モードのため代行は起動しません（下の案内を参照してください）");
+        return false;
+    }
+    if !confirm(
+        &format!("{agent} に Claude Code の導入を任せますか？"),
+        true,
+        false,
+    ) {
+        return false;
+    }
+    let Some(kind) = SetupAgent::parse(agent) else {
+        return false;
+    };
+    let prompt = plan["prompt"].as_str().unwrap_or_default();
+    let handoff = DetectedAgent {
+        kind,
+        path: path.to_string(),
+        authenticated: false,
+        plan: None,
+    };
+    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    eprintln!();
+    match launch_setup_agent(&handoff, &dir, prompt) {
+        Ok(status) if !status.success() => eprintln!(
+            "  {agent} が終了しました（exit code: {}）",
+            status.code().unwrap_or(-1)
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("  [警告] {agent} を起動できません: {e}");
+            return false;
+        }
+    }
+    // 代行のあと**本当に入ったか**を確かめる（報告を信じない）
+    setup_bootstrap::status().is_ok_and(|s| s.step != Step::Install)
+}
+
+/// 自動導入も代行も通らなかったときの最終案内。
+/// **次の一手が必ず 1 つ以上ある**形にする
+fn install_failure_message(reason: &str, assume_yes: bool) -> String {
+    let plan = setup_bootstrap::handoff_plan(Some(reason)).ok();
+    let official = plan
+        .as_ref()
+        .and_then(|p| p["install_plan"]["official_command"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut message = format!("[1/3] インストールに失敗しました。\n{reason}\n");
+    let handoff_available = plan
+        .as_ref()
+        .and_then(|p| p["available"].as_bool())
+        .unwrap_or(false);
+    if handoff_available && assume_yes {
+        // 非対話で代行を起こさなかった場合。AI からは MCP で同じ計画が引ける
+        message.push_str(
+            "\n導入済みの別のエージェント CLI へ代行を頼めます:\n  \
+             tako setup bootstrap handoff\n",
+        );
+    }
+    message.push_str(&format!(
+        "\n自分で入れる場合は次のコマンドを実行してから `tako setup` をやり直してください:\n  {official}\n"
+    ));
+    message
+}
+
 /// ゼロスタート導入の段（#868）。**導入済みなら何も出さずに素通りする**
 /// （検出型 setup の従来体験を変えないため）。
 ///
@@ -705,10 +838,11 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
         eprintln!("  [1/3] {}", Step::Install.describe());
         print_install_plan(&state.plan.to_json());
         if !state.plan.can_run {
-            return Err(format!(
-                "この環境では自動インストールに対応していません。\n\
-                 上のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}",
-                state.plan.official_command
+            // 代行できない環境（将来のプラットフォーム追加時）。案内で終わらせず、
+            // 別のエージェント CLI が居ればそちらへ引き継ぐ（#1057）
+            return Err(install_failure_message(
+                "この環境では tako が自動インストールを代行できません",
+                assume_yes,
             ));
         }
         if !confirm("この内容でインストールしますか？", true, assume_yes) {
@@ -719,12 +853,20 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
             ));
         }
         eprintln!();
-        setup_bootstrap::install(InstallOptions {
+        if let Err(e) = setup_bootstrap::install(InstallOptions {
             dry_run: false,
             interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        })
-        .map_err(|e| format!("[1/3] インストールに失敗しました。\n{e}"))?;
-        eprintln!("  [OK] Claude Code を導入しました");
+        }) {
+            // **案内だけで人間へ丸投げしない**（#1057）。導入済みの別系統 CLI が
+            // 居れば、その setup エージェントへ導入の代行を引き継ぐ
+            eprintln!("  [失敗] {e}");
+            if !try_agent_handoff(&e, assume_yes) {
+                return Err(install_failure_message(&e, assume_yes));
+            }
+            eprintln!("  [OK] 引き継ぎ先のエージェントが Claude Code を導入しました");
+        } else {
+            eprintln!("  [OK] Claude Code を導入しました");
+        }
     }
 
     // PATH（インストール直後は必ずここを通る）
@@ -804,46 +946,15 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
 
 // --- 依存ツールチェック ---
 
-/// tako が実行時に使う外部コマンドの定義
-struct ExternalDep {
-    /// コマンド名
-    bin: &'static str,
-    /// 必須依存か（false = 任意。無くても tako 自体は動く）
-    required: bool,
-    /// 影響する機能の説明
-    purpose: &'static str,
-    /// brew でインストールする場合のパッケージ名（None = brew 非対応）
-    brew_pkg: Option<&'static str>,
-    /// brew 以外の導入案内
-    install_hint: &'static str,
-}
-
-const EXTERNAL_DEPS: &[ExternalDep] = &[
-    ExternalDep {
-        bin: "tmux",
-        required: false,
-        purpose: "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
-        brew_pkg: Some("tmux"),
-        install_hint: "https://github.com/tmux/tmux/wiki/Installing",
-    },
-    ExternalDep {
-        bin: "git",
-        required: false,
-        purpose: "git パネル（ブランチ・コミットグラフ・diff 表示）",
-        brew_pkg: Some("git"),
-        install_hint: "xcode-select --install でも導入できます",
-    },
-    ExternalDep {
-        bin: "tailscale",
-        required: false,
-        purpose: "スマホからのリモート接続（tako remote。WireGuard E2E 暗号化）",
-        brew_pkg: Some("tailscale"),
-        install_hint: "App Store で「Tailscale」を検索、または brew install tailscale",
-    },
-];
+/// 依存表と導入の実行は `tako_control::setup_deps` が正本（#1057）。
+/// CLI・MCP・`--review` が同じ実装を通るので「UI からしか到達できない経路」を作らない
+use tako_control::setup_deps::{self, DepInstallOptions};
 
 /// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
-/// interactive = true なら未導入の依存をその場で brew インストールできる。
+/// interactive = true なら未導入の依存をその場で導入できる（`--review` 経路）。
+///
+/// **標準 `tako setup` は質問ゼロ**（#262）なので interactive = false で呼ばれ、
+/// 状態と最も簡単なコマンド 1 本（#322）だけを出す。
 /// 戻り値は検出したエージェントと、チェック後も欠けている必須依存の一覧。
 fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) {
     let agents = detect_agents();
@@ -871,8 +982,9 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
     } else {
         Vec::new()
     };
-    for dep in EXTERNAL_DEPS {
-        if let Some(path) = find_command(dep.bin) {
+    for state in setup_deps::status() {
+        let dep = state.dep;
+        if let Some(path) = &state.found {
             eprintln!("  [OK] {}: {path}", dep.bin);
             continue;
         }
@@ -886,24 +998,7 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
         if !dep.required {
             eprintln!("      無くても tako 自体は動きますが、上記の機能が使えません");
         }
-        let mut installed = false;
-        match (dep.brew_pkg, brew.as_deref()) {
-            (Some(pkg), Some(brew_bin)) => {
-                eprintln!("      導入方法: brew install {pkg}");
-                if interactive {
-                    installed = offer_brew_install(pkg, brew_bin);
-                }
-            }
-            (Some(pkg), None) => {
-                eprintln!(
-                    "      導入方法: brew install {pkg}（要 Homebrew）/ {}",
-                    dep.install_hint
-                );
-            }
-            (None, _) => {
-                eprintln!("      導入方法: {}", dep.install_hint);
-            }
-        }
+        let installed = offer_dep_install(&state, brew.is_some(), interactive);
         if installed {
             match find_command(dep.bin) {
                 Some(path) => eprintln!("  [OK] {}: {path}（インストール完了）", dep.bin),
@@ -931,31 +1026,154 @@ fn run_dependency_check(interactive: bool) -> (Vec<DetectedAgent>, Vec<String>) 
     (agents, missing_required)
 }
 
-/// 未導入の依存をその場で brew インストールするか確認して実行する。
-/// インストールが成功したら true
-fn offer_brew_install(pkg: &str, brew_bin: &str) -> bool {
-    eprint!("      今すぐ brew install {pkg} を実行しますか？ [y/N]: ");
+/// 未導入の依存に対する案内と、`--review` でのその場導入（#88 → #1057 で復活）。
+///
+/// - 標準 `tako setup`（interactive = false）: **質問しない**。状態と
+///   最も簡単なコマンド 1 本だけを出す（#262 / #322）
+/// - `--review`（interactive = true）: 1 件ずつ y/N で聞いて導入する
+///
+/// 導入の実行は `setup_deps::install` を通す（CLI・MCP で同じ実装）
+fn offer_dep_install(state: &setup_deps::DepStatus, has_brew: bool, interactive: bool) -> bool {
+    let dep = state.dep;
+    let Some(installer) = dep.installer else {
+        eprintln!("      導入方法: {}", dep.hint);
+        return false;
+    };
+    let command = installer.command_line();
+    let tool_present = find_command(installer.program()).is_some();
+    if !installer.tako_can_run() {
+        // 代行しない手段（Windows の winget）は打つべきコマンドだけを見せる
+        eprintln!("      導入方法: {command} / {}", dep.hint);
+        return false;
+    }
+    if !tool_present {
+        let missing = installer.program();
+        // brew が無いのは macOS で一番多い詰まり方。Homebrew は
+        // 管理者パスワードを求めるため tako は導入を代行しない（#868）
+        let brew_note = if missing == "brew" && !has_brew {
+            "（要 Homebrew: https://brew.sh）"
+        } else {
+            ""
+        };
+        eprintln!("      導入方法: {command}{brew_note} / {}", dep.hint);
+        return false;
+    }
+    if !interactive {
+        eprintln!("      いま入れる: tako setup deps install   （{command} 相当）");
+        return false;
+    }
+    eprint!("      今すぐ {command} を実行しますか？ [y/N]: ");
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
         return false;
     }
     let answer = input.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
-        eprintln!("      スキップしました（後から brew install {pkg} で導入できます）");
+        eprintln!("      スキップしました（後から `tako setup deps install` で導入できます）");
         return false;
     }
-    let status = std::process::Command::new(brew_bin)
-        .args(["install", pkg])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status();
-    match status {
-        Ok(s) if s.success() => true,
-        _ => {
-            eprintln!("      [警告] brew install {pkg} が失敗しました。手動で導入してください");
+    match setup_deps::install(
+        Some(dep.bin),
+        DepInstallOptions {
+            dry_run: false,
+            interactive: true,
+        },
+    ) {
+        Ok(value) => value["installed"].as_array().is_some_and(|a| !a.is_empty()),
+        Err(e) => {
+            eprintln!("      [警告] {e}");
             false
         }
+    }
+}
+
+/// `tako setup deps [install]`。MCP `tako_setup_deps` と 1:1（#88 / #1057）
+pub fn run_deps(
+    action: Option<&str>,
+    dep: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), String> {
+    let action = action.unwrap_or("status");
+    let value = match action {
+        "status" => serde_json::json!({
+            "deps": setup_deps::status_json(),
+            "install_command": "tako setup deps install",
+        }),
+        "install" => setup_deps::install(
+            dep,
+            DepInstallOptions {
+                dry_run,
+                // CLI は端末を持つので進捗をそのまま流す
+                interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            },
+        )?,
+        other => {
+            return Err(format!(
+                "不明な action: {other:?}（status / install のいずれか）"
+            ))
+        }
+    };
+    if json {
+        println!("{}", crate::pretty_json(&value));
+        return Ok(());
+    }
+    print_deps_human(action, &value);
+    Ok(())
+}
+
+fn print_deps_human(action: &str, value: &serde_json::Value) {
+    if action == "status" {
+        eprintln!("任意依存ツールの状態");
+        eprintln!("─────────────────");
+        for dep in value["deps"].as_array().into_iter().flatten() {
+            let bin = dep["bin"].as_str().unwrap_or("?");
+            match dep["found"].as_str() {
+                Some(path) => eprintln!("  [OK] {bin}: {path}"),
+                None => {
+                    eprintln!("  [任意] {bin}: 見つかりません");
+                    if let Some(purpose) = dep["purpose"].as_str() {
+                        eprintln!("      用途: {purpose}");
+                    }
+                    if let Some(command) = dep["install_command"].as_str() {
+                        if dep["can_run"].as_bool() == Some(true) {
+                            eprintln!(
+                                "      いま入れる: tako setup deps install   （{command} 相当）"
+                            );
+                        } else {
+                            eprintln!("      導入方法: {command}");
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if value["performed"].as_bool() != Some(true) {
+        eprintln!("実行はしていません（--dry-run）。実行される内容:");
+        for plan in value["planned"].as_array().into_iter().flatten() {
+            eprintln!(
+                "  - {}: {}",
+                plan["bin"].as_str().unwrap_or("?"),
+                plan["command"].as_str().unwrap_or("?")
+            );
+        }
+    } else {
+        for done in value["installed"].as_array().into_iter().flatten() {
+            eprintln!(
+                "  [OK] {}: {}（インストール完了）",
+                done["bin"].as_str().unwrap_or("?"),
+                done["path"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    // 飛ばしたものは理由つきで必ず出す（黙って何もしない、をしない）
+    for skip in value["skipped"].as_array().into_iter().flatten() {
+        eprintln!(
+            "  [skip] {}: {}",
+            skip["bin"].as_str().unwrap_or("?"),
+            skip["detail"].as_str().unwrap_or("?")
+        );
     }
 }
 
@@ -2804,9 +3022,11 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
     run_bootstrap_stage(assume_yes)?;
 
-    // setup 中は項目別 y/n を出さない。未導入依存・FDA・スリープ設定は状態と
-    // 専用コマンドだけを表示し、ユーザーが必要なときに個別操作できるようにする。
-    let (agents, missing) = run_dependency_check(false);
+    // 標準 setup では項目別 y/n を出さない（#262 の質問ゼロ）。未導入依存・FDA・
+    // スリープ設定は状態と専用コマンドだけを表示する。
+    // `--review` は「前回設定を個別に見直す」経路なので、そこでは
+    // その場導入を y/N で聞く（#88 の体験。#1057 で復活）
+    let (agents, missing) = run_dependency_check(review_mode);
     if !missing.is_empty() {
         return Err(format!(
             "必須の依存ツールが不足しています: {}。\n\
@@ -3284,29 +3504,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    use tako_control::setup_deps::DepInstaller;
+
+    /// 依存表の正本は `tako_control::setup_deps`（#1057）。ここでは
+    /// **CLI 側の前提**（エージェント CLI と混ざらない・件数）だけを固定する
     #[test]
     fn external_deps_table_is_consistent() {
-        // エージェント CLI は 3 者から別途検出するため、汎用依存表には含めない。
-        assert!(EXTERNAL_DEPS.iter().all(|dep| !SetupAgent::ALL
-            .iter()
-            .any(|agent| agent.as_str() == dep.bin)));
-        // tmux は任意依存（remote / 永続化 / オーケストレーターが対象機能）
-        let tmux = EXTERNAL_DEPS.iter().find(|d| d.bin == "tmux").unwrap();
+        use tako_core::platform::support::Platform;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let deps = setup_deps::deps(platform);
+            // エージェント CLI は 3 者から別途検出するため、汎用依存表には含めない
+            assert!(deps.iter().all(|dep| !SetupAgent::ALL
+                .iter()
+                .any(|agent| agent.as_str() == dep.bin)));
+            // 依存は 器 / git / tailscale の 3 つ（#282: 旧トンネル用依存は削除済み。
+            // #286: tailscale を弾 6 で追加）
+            assert_eq!(deps.len(), 3, "{platform:?}");
+        }
+        // 永続化の器は macOS では tmux（remote / 永続化 / worker 管理が対象機能）
+        let mac = setup_deps::deps(Platform::MacOs);
+        let tmux = mac.iter().find(|d| d.bin == "tmux").expect("tmux が要る");
         assert!(!tmux.required);
         assert!(tmux.purpose.contains("tako remote"));
-        assert_eq!(tmux.brew_pkg, Some("tmux"));
-        // 依存は tmux / git / tailscale の 3 つ（#282: 旧トンネル用依存は削除済み。
-        // #286: tailscale を弾 6 で追加）
-        assert_eq!(EXTERNAL_DEPS.len(), 3);
-        // 全依存に用途説明と導入案内がある
-        for dep in EXTERNAL_DEPS {
-            assert!(!dep.purpose.is_empty(), "{} の purpose が空", dep.bin);
-            assert!(
-                !dep.install_hint.is_empty(),
-                "{} の install_hint が空",
-                dep.bin
-            );
-        }
+        assert_eq!(
+            tmux.installer,
+            Some(DepInstaller::Brew { pkg: "tmux" }),
+            "macOS はその場導入できる"
+        );
+    }
+
+    /// `--review` のときだけ y/N を聞く（#262 の質問ゼロを壊さない）。
+    /// 呼び出しの引数がずれる退行を固定する
+    #[test]
+    fn 標準setupは依存の質問をしない() {
+        let src = include_str!("setup.rs");
+        assert!(
+            src.contains("run_dependency_check(review_mode)"),
+            "run_setup は review のときだけ対話にする"
+        );
+        assert!(
+            src.contains("run_dependency_check(false)"),
+            "--check は表示のみ"
+        );
+        // 標準経路で出す案内は最簡形 1 本（#322）
+        assert!(src.contains("いま入れる: tako setup deps install"));
     }
 
     fn detected(kind: SetupAgent, authenticated: bool, plan: Option<&str>) -> DetectedAgent {
