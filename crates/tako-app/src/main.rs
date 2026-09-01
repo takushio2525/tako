@@ -45675,12 +45675,13 @@ mod self_test {
                 // 常に見えるメニューからも切り替えられることを、
                 // **メニューバーが実際に使う経路**（`find_menu_action` →
                 // `invoke_menu_action` → `on_action`）で確認する
-                let menu_toggle = window
-                    .update(cx, |app, window, cx| {
-                        app.ui_mode = UiMode::Terminal;
+                let any: AnyWindowHandle = window.into();
+                let menu_label = crate::ui_text::menu::toggle_ui_mode().to_string();
+                let menu_path = format!("{}/{menu_label}", crate::ui_text::menu::view());
+                let (in_view_menu, invoked) = window
+                    .update(cx, |app, _, _| {
                         // 「表示」メニューに項目が在るか。**ラベルは言語で変わる**ので
                         // 突き合わせはアクション名（言語非依存）で行う
-                        let label = crate::ui_text::menu::toggle_ui_mode().to_string();
                         let in_view_menu = app
                             .build_menu_bar_snapshot()
                             .menus
@@ -45694,26 +45695,45 @@ mod self_test {
                                             label: l,
                                             action,
                                             ..
-                                        } if action == "tako::ToggleUiMode" && *l == label
+                                        } if action == "tako::ToggleUiMode" && *l == menu_label
                                     )
                                 })
                             });
-                        let Some(action) = app.find_menu_action("tako::ToggleUiMode") else {
-                            return (in_view_menu, false, false);
-                        };
-                        app.invoke_menu_action(action, window, cx);
-                        (in_view_menu, true, app.ui_mode == UiMode::Gui)
+                        app.ui_mode = UiMode::Terminal;
+                        // `tako menu` / MCP `tako_menu` と同じ経路（= AI からも同じ操作ができる）。
+                        // これは pending_menu_ops へ積むだけなので、消費は render 側
+                        let invoked = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::MenuInvoke {
+                                path: menu_path.clone(),
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .is_ok();
+                        (in_view_menu, invoked)
                     })
-                    .unwrap_or((false, false, false));
-                if menu_toggle != (true, true, true) {
+                    .unwrap_or((false, false));
+                // `drain_menu_ops`（render で消費）→ `cx.defer` → `dispatch_action` →
+                // `on_action` と非同期に進むので、**描画つきで**待つ（#796 の作法。
+                // セルフテストのウィンドウは前面とは限らず自然な描画が来ない）
+                let toggled = wait_for_preview_drawn(
+                    any,
+                    window,
+                    cx,
+                    Duration::from_secs(8),
+                    |app| app.ui_mode == UiMode::Gui,
+                )
+                .await
+                .is_some();
+                if !(in_view_menu && invoked && toggled) {
                     eprintln!(
-                        "TAKO_SELF_TEST_1058f: in_view_menu={} action_found={} toggled={}",
-                        menu_toggle.0, menu_toggle.1, menu_toggle.2
+                        "TAKO_SELF_TEST_1058f: in_view_menu={in_view_menu} invoked={invoked} \
+                         toggled={toggled} path={menu_path:?}"
                     );
                 }
                 check(
-                    menu_toggle == (true, true, true),
-                    "表示メニューから表示モードを切り替えられる (#1058)",
+                    in_view_menu && invoked && toggled,
+                    "表示メニュー（tako menu と同じ経路）から表示モードを切り替えられる (#1058)",
                 );
 
                 // (g) **黙って縮退しない**（#1058 の受け入れ条件）: ターミナル表示に
