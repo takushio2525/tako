@@ -789,7 +789,15 @@ fn undo_user_path(dir: &Path) -> Result<Value, String> {
 /// 引き継ぎ先の候補（**claude 以外**の導入済みエージェント CLI）。
 ///
 /// claude を入れるための代行なので claude 自身は候補にしない。
-/// 順序は codex → agy（master を務められる系統を先に置く）
+/// 順序は codex → agy（master を務められる系統を先に置く）。
+///
+/// # なぜ能力マトリクス（#982）の 1 マスにしないか
+///
+/// 「この CLI へ導入の代行を頼めるか」を [`crate::agent_support`] のキーにすると
+/// **claude が `Unsupported`** になる（claude を入れるための代行なので claude は
+/// 対象になりえない）。マトリクスは `claudeは基準系なので全て対応済み` で
+/// claude = 全 Supported を強制するため、これは表せない（#1002 が同じ壁に当たった）。
+/// なので候補の集合はここで宣言し、テスト（`引き継ぎ先にclaudeを選ばない`）で拘束する
 const HANDOFF_AGENTS: &[WorkerAgent] = &[WorkerAgent::Codex, WorkerAgent::Agy];
 
 /// 引き継ぎ先 1 件
