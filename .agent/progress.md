@@ -3930,7 +3930,7 @@
 - v0.8.0 を安定版へ昇格（`gh release edit --prerelease=false --latest`。**`--promote` は -test.N
   タグ専用**と実測）。Tailscale の GUI 版 / standalone 二重稼働（別ノード分裂）が remote 全 502 の
   環境要因と特定 → GUI アプリ終了 + standalone へ系統固定（#1038 の保存機構）で
-  `https://macbook-pro.tail5ed162.ts.net` = 200 へ復旧。**GUI 版 Tailscale アプリは #1038 の
+  `https://<hostname>.<tailnet>.ts.net` = 200 へ復旧。**GUI 版 Tailscale アプリは #1038 の
   GUI 構成通し検証まで起動しない**（起動すると既定探索が入れ替わる）
 - master の watch は GUI 再起動を生き延びる設計と実証（#665 に記録・偽 WORKER_GONE の穴も同所）。
   worker → master の Cross-Session 連絡は誤配達 2 件 → 禁止を worker プロンプト定型へ（#663）
