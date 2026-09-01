@@ -968,6 +968,10 @@ impl TakoApp {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
+                    // 根 div の Drag ヒットテストに勝たせる（#576）。
+                    // **これが無いと Windows ではクリックが OS の HTCAPTION に食われ、
+                    // 表示モードを切り替える唯一のボタンが無反応になる**（#1058）
+                    .occlude()
                     .hover(|d| d.bg(rgba(theme.surface_highlight)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_ui_mode(cx);
@@ -1145,6 +1149,96 @@ mod tests {
                 (1, 0),
                 "{id}: スクロール領域の中では occlude_scrolling(cx) を使うこと \
                  (#961。relays={relays} bare={bare})"
+            );
+        }
+    }
+
+    /// タブバーの**押せる要素はすべて occlude で覆われている**（#576 / #1058 の番犬）。
+    ///
+    /// タブバー根 div は `WindowControlArea::Drag` を張っているので、子が occlude して
+    /// いないと GPUI の hit test が根まで積み上がり、Windows では
+    /// `on_hit_test_window_control` が `HTCAPTION` を返して**クリックが OS に食われる**。
+    /// #1058 はこれで表示モード切替ボタンが無反応になっていた（macOS では
+    /// `on_hit_test_window_control` が空実装なので気づけない = CI で拘束する意味がある）。
+    ///
+    /// 新しいボタンを足したら、この分類のどれかに載せることを強制する（載せ忘れは FAILED）
+    #[test]
+    fn タブバーの押せる要素はoccludeで覆われている() {
+        // スクロール領域の中 = ホイールを中継する occlude（#961）
+        const RELAY: [&str; 4] = ["tab", "tab-bg", "tab-close", "tab-new"];
+        // スクロール領域の外 = 素の occlude でよい
+        const PLAIN: [&str; 4] = [
+            "cmdk-entry",
+            "attention-bell",
+            "ui-mode-toggle",
+            "theme-toggle",
+        ];
+        // 自分では occlude しないが理由がある要素
+        // - tab-bar: 根 div 自身が Drag 領域（occlude したらウインドウ移動が死ぬ）
+        // - tab-pin-title: occlude するタブピルの子孫なので hit test が根へ届かない
+        const COVERED: [&str; 2] = ["tab-bar", "tab-pin-title"];
+
+        let src = include_str!("tab_bar.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let body_end = lines
+            .iter()
+            .position(|l| l.trim() == "#[cfg(test)]")
+            .expect("テストモジュールの開始");
+        // `.id(` の行 → その要素のビルダ連鎖（次の `.id(` の手前まで）
+        let id_lines: Vec<usize> = (0..body_end)
+            .filter(|&i| lines[i].contains(".id(") && lines[i].contains('"'))
+            .collect();
+        assert!(id_lines.len() >= 10, "id の走査に失敗している");
+
+        let mut seen: Vec<String> = Vec::new();
+        for (n, &at) in id_lines.iter().enumerate() {
+            let id = lines[at]
+                .split('"')
+                .nth(1)
+                .expect("id の文字列リテラル")
+                .to_string();
+            let end = id_lines.get(n + 1).copied().unwrap_or(body_end);
+            let chain = &lines[at..end];
+            if !chain.iter().any(|l| l.contains("on_click(")) {
+                continue;
+            }
+            seen.push(id.clone());
+            let relays = chain
+                .iter()
+                .filter(|l| l.contains(".occlude_scrolling(cx)"))
+                .count();
+            let bare = chain.iter().filter(|l| l.trim() == ".occlude()").count();
+            if RELAY.contains(&id.as_str()) {
+                assert_eq!(
+                    (relays, bare),
+                    (1, 0),
+                    "{id}: スクロール領域の中は occlude_scrolling(cx)（#961）"
+                );
+            } else if PLAIN.contains(&id.as_str()) {
+                assert_eq!(
+                    (relays, bare),
+                    (0, 1),
+                    "{id}: タブバー上の押せる要素は occlude() が必要（#576 / #1058。\
+                     無いと Windows でクリックが HTCAPTION に食われる）"
+                );
+            } else if COVERED.contains(&id.as_str()) {
+                assert_eq!(
+                    (relays, bare),
+                    (0, 0),
+                    "{id}: 覆われている前提の要素が自分で occlude している（分類を見直すこと）"
+                );
+            } else {
+                panic!(
+                    "{id}: タブバーに押せる要素が増えている。occlude の分類 \
+                     （RELAY / PLAIN / COVERED）へ載せること（#1058）"
+                );
+            }
+        }
+        // 分類したものが実際に走査で見つかっていること（id を変えたら気づけるように）
+        for id in RELAY.iter().chain(PLAIN.iter()).chain(COVERED.iter()) {
+            assert!(
+                seen.iter().any(|s| s == id),
+                "{id} が走査で見つからない（id を変えたら番犬も直すこと）"
             );
         }
     }

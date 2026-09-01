@@ -6,6 +6,7 @@
 
 use serde_json::Value;
 use tako_core::pane_log::CloseOrigin;
+use tako_core::ui_mode::PaneDisplayStatus;
 use tako_core::{
     PaneId, PreviewOutline, PreviewOutlineTarget, PreviewViewState, PreviewViewUpdate,
     SpawnOptions, TabId, TerminalSession, Workspace,
@@ -376,8 +377,11 @@ pub trait UiStateHost {
     fn set_starter_released(&mut self, _pane: PaneId, _released: bool) {}
     /// いま各ペインが何として描かれているか（Issue #720）。
     /// terminal モードでは全部 `Terminal`。**AI が「画面に何が出ているか」を知る手段**で、
-    /// 準備中（過渡期）かどうかもここで分かる。揮発なので永続化しない
-    fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
+    /// 準備中（過渡期）かどうかもここで分かる。揮発なので永続化しない。
+    ///
+    /// #1058: `PaneDisplay` だけでなく**ターミナル表示へ倒れた理由**も返す
+    /// （「GUI モードにしたのにスターターが出ない」を材料つきで切り分けられるようにする）
+    fn pane_displays(&self) -> Vec<(PaneId, PaneDisplayStatus)> {
         Vec::new()
     }
     /// チャットビュー本文のコピー（Issue #725）。UI のコピーボタンと同じ経路。

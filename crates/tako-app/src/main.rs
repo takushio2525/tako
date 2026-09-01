@@ -8411,14 +8411,20 @@ impl TakoApp {
     /// 材料はすべて**すでに手元にある値**で、ここで新しいサブプロセスは起動しない
     /// （毎 render 呼ばれる。子プロセス判定は sleep_guard の 2 秒 tick の結果を流用）
     fn pane_display_for(&self, pane_id: PaneId) -> tako_core::ui_mode::PaneDisplay {
-        use tako_core::ui_mode::{pane_display, PaneDisplayInput};
         // terminal モードでは材料を一切見ずに即決する（既存経路への影響をゼロにする）
         if !self.ui_mode.is_gui() {
             return tako_core::ui_mode::PaneDisplay::Terminal;
         }
+        tako_core::ui_mode::pane_display(self.pane_display_input(pane_id))
+    }
+
+    /// 判定の材料の組み立て（#694 / #1058）。**判定（`pane_display_for`）と診断
+    /// （`pane_displays` の理由）が同じ入力を通る**ようにするため、ここに 1 本化してある。
+    /// 二重実装にすると「画面はターミナルなのに診断はスターターと言う」が起こりうる
+    fn pane_display_input(&self, pane_id: PaneId) -> tako_core::ui_mode::PaneDisplayInput {
         let session = self.terminals.get(&pane_id);
         let has_role = self.pane_has_role(pane_id);
-        pane_display(PaneDisplayInput {
+        tako_core::ui_mode::PaneDisplayInput {
             mode: self.ui_mode,
             released: self.starter_released.contains(&pane_id),
             alt_screen: self.pane_inner_alt_screen(pane_id),
@@ -8439,7 +8445,7 @@ impl TakoApp {
                 .pane_settle
                 .get(&pane_id)
                 .map(|settle| settle.state(has_role)),
-        })
+        }
     }
 
     /// 過渡期（#720）の開始。`spawn_session`（新規ペイン）と
@@ -18617,12 +18623,19 @@ impl UiStateHost for TakoApp {
     }
 
     // #720: 全ペインの表示種別。判定表そのものを通すので、GUI が描いているものと必ず一致する
-    fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplay)> {
+    fn pane_displays(&self) -> Vec<(PaneId, tako_core::ui_mode::PaneDisplayStatus)> {
         self.workspace
             .tabs()
             .iter()
             .flat_map(|t| t.tree().panes())
-            .map(|p| (p.id(), self.pane_display_for(p.id())))
+            .map(|p| {
+                (
+                    p.id(),
+                    tako_core::ui_mode::PaneDisplayStatus::from_input(
+                        self.pane_display_input(p.id()),
+                    ),
+                )
+            })
             .collect()
     }
 
@@ -21475,6 +21488,8 @@ impl Render for TakoApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
+            // #1058: 表示モード切替（メニュー / パレット / タブバーのボタンが同じ経路）
+            .on_action(cx.listener(|this, _: &ToggleUiMode, _, cx| this.toggle_ui_mode(cx)))
             .on_action(cx.listener(|this, _: &SwitchLanguage, _, cx| this.toggle_language(cx)))
             .on_action(cx.listener(|this, _: &ShowFleetPanel, _, cx| {
                 this.toggle_panel_view(PanelView::Fleet, cx)
@@ -21993,6 +22008,9 @@ fn view_menu() -> gpui::Menu {
         MenuItem::action(m::reset_zoom(), ResetZoom),
         MenuItem::separator(),
         MenuItem::action(m::toggle_theme(), ToggleTheme),
+        // #1058: タブバー右端のボタンだけが切替導線だと、ウインドウが狭い / 右端が
+        // 画面外に出る環境（Windows 実機で実測）で GUI モードへ到達できない
+        MenuItem::action(m::toggle_ui_mode(), ToggleUiMode),
         MenuItem::action(m::switch_language(), SwitchLanguage),
         MenuItem::separator(),
         MenuItem::action(m::toggle_fullscreen(), ToggleFullScreen),
@@ -45649,6 +45667,142 @@ mod self_test {
                 check(
                     released && restored_display,
                     "「コマンド入力へ」でそのペインだけ解除 → restore で戻る (#694)",
+                );
+
+                // (f) **#1058 の本体**: 表示モードの切替導線が「タブバー右端のボタン」
+                // 以外にもある。実機（Windows・125% 表示）ではタブバー右端の
+                // ⌘K / ベル / 表示モード / テーマがウインドウの外へ出て**押せなかった**ので、
+                // 常に見えるメニューからも切り替えられることを、
+                // **メニューバーが実際に使う経路**（`find_menu_action` →
+                // `invoke_menu_action` → `on_action`）で確認する
+                let menu_toggle = window
+                    .update(cx, |app, window, cx| {
+                        app.ui_mode = UiMode::Terminal;
+                        // 「表示」メニューに項目が在るか。**ラベルは言語で変わる**ので
+                        // 突き合わせはアクション名（言語非依存）で行う
+                        let label = crate::ui_text::menu::toggle_ui_mode().to_string();
+                        let in_view_menu = app
+                            .build_menu_bar_snapshot()
+                            .menus
+                            .iter()
+                            .filter(|m| m.name == crate::ui_text::menu::view())
+                            .any(|m| {
+                                m.items.iter().any(|i| {
+                                    matches!(
+                                        i,
+                                        tako_control::protocol::MenuItemSnapshot::Action {
+                                            label: l,
+                                            action,
+                                            ..
+                                        } if action == "tako::ToggleUiMode" && *l == label
+                                    )
+                                })
+                            });
+                        let Some(action) = app.find_menu_action("tako::ToggleUiMode") else {
+                            return (in_view_menu, false, false);
+                        };
+                        app.invoke_menu_action(action, window, cx);
+                        (in_view_menu, true, app.ui_mode == UiMode::Gui)
+                    })
+                    .unwrap_or((false, false, false));
+                if menu_toggle != (true, true, true) {
+                    eprintln!(
+                        "TAKO_SELF_TEST_1058f: in_view_menu={} action_found={} toggled={}",
+                        menu_toggle.0, menu_toggle.1, menu_toggle.2
+                    );
+                }
+                check(
+                    menu_toggle == (true, true, true),
+                    "表示メニューから表示モードを切り替えられる (#1058)",
+                );
+
+                // (g) **黙って縮退しない**（#1058 の受け入れ条件）: ターミナル表示に
+                // 倒れたペインには理由が付き、CLI / MCP からも読める。
+                // 「GUI モードにしたのにスターターが出ない」を、実機に GUI を立てて
+                // 画面を撮る前に切り分けられるようにするための診断
+                let reason_of = |app: &TakoApp, pane: PaneId| {
+                    <TakoApp as tako_control::host::UiStateHost>::pane_displays(app)
+                        .into_iter()
+                        .find(|(p, _)| *p == pane)
+                        .map(|(_, status)| status)
+                };
+                let reasons = window
+                    .update(cx, |app, _, _| {
+                        use tako_core::ui_mode::TerminalReason;
+                        // GUI モードなら素のアイドルシェルはスターター = 理由は付かない
+                        app.ui_mode = UiMode::Gui;
+                        let starter = reason_of(app, base)
+                            .map(|s| {
+                                s.display == PaneDisplay::Starter
+                                    && s.reason.is_none()
+                                    && s.materials.command_state == tako_core::CommandState::Idle
+                            })
+                            .unwrap_or(false);
+                        // 既定（terminal）のときは「切り替えていない」と次の一手が出る
+                        app.ui_mode = UiMode::Terminal;
+                        let mode_off = reason_of(app, base)
+                            .map(|s| {
+                                s.display == PaneDisplay::Terminal
+                                    && s.reason == Some(TerminalReason::ModeTerminal)
+                                    && s.reason.and_then(|r| r.next_step()).is_some()
+                            })
+                            .unwrap_or(false);
+                        // role 付き（= エージェント用途）にすると理由が変わる。
+                        // ここは**配線**（判定 → 理由 → 材料）の確認で、理由の網羅は
+                        // `tako_core::ui_mode` の単体テストが持つ
+                        app.ui_mode = UiMode::Gui;
+                        let role_set = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Title {
+                                pane: Some(base.as_u64()),
+                                title: None,
+                                role: Some("worker:st1058".into()),
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .is_ok();
+                        let role_reason = role_set
+                            && reason_of(app, base)
+                                .map(|s| {
+                                    s.display == PaneDisplay::Terminal
+                                        && s.reason == Some(TerminalReason::Role)
+                                        && s.materials.has_role
+                                })
+                                .unwrap_or(false);
+                        (starter, mode_off, role_reason)
+                    })
+                    .unwrap_or((false, false, false));
+                // dispatch（= CLI / MCP が読む形）にも載っていること
+                let reason_json = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::UiMode {
+                                action: Some("status".into()),
+                                mode: None,
+                                pane: None,
+                            },
+                            PaneOrigin::Mcp,
+                        )
+                        .ok()
+                        .map(|v| v["pane_display_reason"][base.as_u64().to_string()].clone())
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(serde_json::Value::Null);
+                let json_ok = reason_json["reason"] == "role"
+                    && reason_json["note"].is_string()
+                    && reason_json["display"] == "terminal"
+                    && reason_json["materials"]["has_role"] == true;
+                if reasons != (true, true, true) || !json_ok {
+                    eprintln!(
+                        "TAKO_SELF_TEST_1058g: starter={} mode_off={} role={} json={reason_json}",
+                        reasons.0, reasons.1, reasons.2
+                    );
+                }
+                check(
+                    reasons == (true, true, true) && json_ok,
+                    "ターミナル表示に倒れた理由が材料つきで CLI / MCP から読める (#1058)",
                 );
 
                 // 後片付け: 検証用ペインを閉じて terminal モードへ戻す
