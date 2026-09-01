@@ -17,6 +17,9 @@ use tako_control::setup::{
     SetupValueSource, CHANGES_YAML, INSTRUCTIONS_DEFAULT, RECOMMENDED_SECTIONS,
 };
 use tako_control::setup_bootstrap::{self, InstallOptions, Step};
+// 依存表と導入の実行は `tako_control::setup_deps` が正本（#1057）。
+// CLI・MCP・`--review` が同じ実装を通るので「UI からしか到達できない経路」を作らない
+use tako_control::setup_deps::{self, DepInstallOptions};
 
 // --- バイナリ埋め込みリソース ---
 // 推奨ルールのセクションと既定指示ファイルは tako_control::setup が正
@@ -949,10 +952,6 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
 }
 
 // --- 依存ツールチェック ---
-
-/// 依存表と導入の実行は `tako_control::setup_deps` が正本（#1057）。
-/// CLI・MCP・`--review` が同じ実装を通るので「UI からしか到達できない経路」を作らない
-use tako_control::setup_deps::{self, DepInstallOptions};
 
 /// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
 /// interactive = true なら未導入の依存をその場で導入できる（`--review` 経路）。
