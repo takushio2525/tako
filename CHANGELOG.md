@@ -8,6 +8,14 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.3] - 2026-09-02
+
+Nightly patch release (automated). Changes since v0.8.2:
+夜間パッチリリース（自動）。v0.8.2 以降の変更:
+
+- [修正] 追跡ドキュメントの本番機ホスト名・tailnet ID・IP をプレースホルダへ (#1060) (#1061)
+- [ドキュメント] リモート大刷新の先行調査: Claude 公式 Remote Control への委譲は成立する (#1059)
+
 ## [0.8.2] - 2026-08-30
 
 Nightly patch release (automated). Changes since v0.8.1:
