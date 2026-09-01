@@ -13,8 +13,8 @@
   → 次の GUI 再起動で全部反映（ユーザー案内待ち）。再起動後の目視項目: ツリー git 色（#1009）/
   Finder D&D（#1043）/ SSH 自動再接続（#1040）
 - **本番 remote は稼働中**: standalone tailscale に系統固定（#1038 の保存）・URL =
-  `https://macbook-pro.tail5ed162.ts.net`・`serve_ok=true`。**この機は MagicDNS 未適用 =
-  ローカル curl は `--resolve <host>:443:100.64.109.27` 必須**。**GUI 版 Tailscale アプリは
+  `https://<hostname>.<tailnet>.ts.net`・`serve_ok=true`。**この機は MagicDNS 未適用 =
+  ローカル curl は `--resolve <host>:443:<tailscale-ip>` 必須**。**GUI 版 Tailscale アプリは
   起動しないこと**（既定探索が入れ替わる環境要因。#1038 の GUI 構成通し検証のときに master が扱う）
 - **検収の status 読みは `/Applications/tako.app/Contents/MacOS/tako` で叩く**（PATH 先頭の
   `~/dev/tako/target` の stale ビルドだと新フィールドがキーごと無い = #432 と同じ罠を 8/29 に実演）
