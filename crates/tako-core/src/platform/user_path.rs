@@ -142,9 +142,16 @@ pub fn append_entry_in(
     if trimmed.is_empty() {
         return Some(dir);
     }
-    // 末尾の `;` は Windows の PATH では珍しくない。二重にしない
+    // 末尾の `;` は Windows の PATH では珍しくない（実機の値も付いている）。
+    // **二重にせず、かつ有無を保つ**: 保たないと `remove_entry_in` で戻したとき
+    // 元のバイト列と 1 文字違う（実機で踏んだ = `identical_to_before=false`）
+    let had_trailing = trimmed.ends_with(SEP);
     let base = trimmed.trim_end_matches(SEP);
-    Some(format!("{base}{SEP}{dir}"))
+    let mut next = format!("{base}{SEP}{dir}");
+    if had_trailing {
+        next.push(SEP);
+    }
+    Some(next)
 }
 
 /// `dir` のエントリを取り除いた値。**入っていなければ `None`**
@@ -355,6 +362,12 @@ mod tests {
 C:\\Program Files\\Git\\cmd;C:\\Users\\winuser\\AppData\\Roaming\\npm;\
 C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
 
+    /// 実機の値からランチャーの置き場所だけを抜いた形（末尾の `;` はそのまま）
+    const REAL_RAW_WITHOUT_LAUNCHER: &str =
+        "C:\\Users\\winuser\\.cargo\\bin;C:\\WINDOWS\\system32;\
+C:\\Program Files\\Git\\cmd;C:\\Users\\winuser\\AppData\\Roaming\\npm;\
+C:\\Users\\winuser\\dev\\tako\\target\\debug;";
+
     fn lookup(name: &str) -> Option<String> {
         match name {
             "USERPROFILE" => Some("C:\\Users\\winuser".to_string()),
@@ -400,11 +413,17 @@ C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
     #[test]
     fn 追記は末尾へ入り二重の区切りを作らない() {
         let launcher = dir("C:\\Users\\winuser\\.local\\bin");
+        // 末尾の `;` は二重にせず、**有無はそのまま保つ**（往復で元へ戻すため）
         let raw = "C:\\WINDOWS\\system32;";
         let appended = append_entry_in(raw, &launcher, &lookup).expect("追記される");
         assert_eq!(
             appended,
-            "C:\\WINDOWS\\system32;C:\\Users\\winuser\\.local\\bin"
+            "C:\\WINDOWS\\system32;C:\\Users\\winuser\\.local\\bin;"
+        );
+        // `;` で終わっていない値には付けない
+        assert_eq!(
+            append_entry_in("C:\\WINDOWS\\system32", &launcher, &lookup).as_deref(),
+            Some("C:\\WINDOWS\\system32;C:\\Users\\winuser\\.local\\bin")
         );
         // 2 回目は None（冪等）
         assert_eq!(append_entry_in(&appended, &launcher, &lookup), None);
@@ -436,13 +455,22 @@ C:\\Users\\winuser\\.local\\bin;C:\\Users\\winuser\\dev\\tako\\target\\debug;";
         assert_eq!(remove_entry_in(&removed, &launcher, &lookup), None);
     }
 
+    /// **往復で 1 バイトも変えない**。末尾の `;` の有無まで保つ
+    /// （実機の値は `;` で終わっており、保たないと `undo-path` の復帰が
+    /// `identical_to_before=false` になる = #1057 の実測で踏んだ）
     #[test]
-    fn 追記と除去の往復で元へ戻る() {
+    fn 追記と除去の往復で元のバイト列へ戻る() {
         let launcher = dir("C:\\Users\\winuser\\.local\\bin");
-        let base = "C:\\WINDOWS\\system32;C:\\Program Files\\Git\\cmd";
-        let appended = append_entry_in(base, &launcher, &lookup).expect("追記される");
-        let back = remove_entry_in(&appended, &launcher, &lookup).expect("除去される");
-        assert_eq!(back, base, "往復で元のバイト列へ戻る");
+        for base in [
+            "C:\\WINDOWS\\system32;C:\\Program Files\\Git\\cmd",
+            // 実機と同じ「末尾に `;` が付く」形
+            "C:\\WINDOWS\\system32;C:\\Program Files\\Git\\cmd;",
+            REAL_RAW_WITHOUT_LAUNCHER,
+        ] {
+            let appended = append_entry_in(base, &launcher, &lookup).expect("追記される");
+            let back = remove_entry_in(&appended, &launcher, &lookup).expect("除去される");
+            assert_eq!(back, base, "往復で元のバイト列へ戻る（base={base:?}）");
+        }
     }
 
     #[test]

@@ -185,16 +185,25 @@ fn resolve_container() -> Option<String> {
     }
 }
 
+/// 依存 1 件を解決する。**検出と導入後の確認が同じ規則を通る**
+/// （別々にすると「入れたのに見つかりません」と言い出す側が生まれる）。
+///
+/// 器は `exe::find` を先に見る: `backend::binary()` はプロセス内で 1 回だけ
+/// 解決してキャッシュするので、導入直後の再確認では答えが変わらない
+fn resolve(dep: &ExternalDep) -> Option<String> {
+    let found = tako_core::platform::exe::find(dep.bin);
+    if found.is_some() || !is_container(dep) {
+        return found;
+    }
+    resolve_container()
+}
+
 /// 依存の検出（読み取りだけ）
 pub fn status() -> Vec<DepStatus> {
     current_deps()
         .into_iter()
         .map(|dep| {
-            let found = if is_container(&dep) {
-                resolve_container()
-            } else {
-                tako_core::platform::exe::find(dep.bin)
-            };
+            let found = resolve(&dep);
             DepStatus { dep, found }
         })
         .collect()
@@ -292,7 +301,7 @@ pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, Stri
         }
         run_installer(&program, installer, opts.interactive)?;
         // 「実行した」ではなく「引けるようになった」を確かめてから成功と言う
-        match tako_core::platform::exe::find(state.dep.bin) {
+        match resolve(&state.dep) {
             Some(path) => installed.push(json!({ "bin": state.dep.bin, "path": path })),
             None => {
                 return Err(format!(

@@ -792,7 +792,7 @@ fn try_agent_handoff(reason: &str, assume_yes: bool) -> bool {
 
 /// 自動導入も代行も通らなかったときの最終案内。
 /// **次の一手が必ず 1 つ以上ある**形にする
-fn install_failure_message(reason: &str, assume_yes: bool) -> String {
+fn install_failure_message(reason: &str) -> String {
     let plan = setup_bootstrap::handoff_plan(Some(reason)).ok();
     let official = plan
         .as_ref()
@@ -804,8 +804,9 @@ fn install_failure_message(reason: &str, assume_yes: bool) -> String {
         .as_ref()
         .and_then(|p| p["available"].as_bool())
         .unwrap_or(false);
-    if handoff_available && assume_yes {
-        // 非対話で代行を起こさなかった場合。AI からは MCP で同じ計画が引ける
+    if handoff_available {
+        // 代行を起こさなかった / 断られた / 失敗した場合の次の一手。
+        // AI からは MCP `tako_setup_bootstrap` の `action: "handoff"` で同じ計画が引ける
         message.push_str(
             "\n導入済みの別のエージェント CLI へ代行を頼めます:\n  \
              tako setup bootstrap handoff\n",
@@ -838,34 +839,37 @@ fn run_bootstrap_stage(assume_yes: bool) -> Result<(), String> {
         eprintln!("  [1/3] {}", Step::Install.describe());
         print_install_plan(&state.plan.to_json());
         if !state.plan.can_run {
-            // 代行できない環境（将来のプラットフォーム追加時）。案内で終わらせず、
-            // 別のエージェント CLI が居ればそちらへ引き継ぐ（#1057）
-            return Err(install_failure_message(
-                "この環境では tako が自動インストールを代行できません",
-                assume_yes,
-            ));
-        }
-        if !confirm("この内容でインストールしますか？", true, assume_yes) {
-            return Err(format!(
-                "インストールを中止しました。\n\
-                 自分で入れる場合は次のコマンドを実行してから `tako setup` をやり直してください:\n  {}",
-                state.plan.official_command
-            ));
-        }
-        eprintln!();
-        if let Err(e) = setup_bootstrap::install(InstallOptions {
-            dry_run: false,
-            interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        }) {
-            // **案内だけで人間へ丸投げしない**（#1057）。導入済みの別系統 CLI が
-            // 居れば、その setup エージェントへ導入の代行を引き継ぐ
-            eprintln!("  [失敗] {e}");
-            if !try_agent_handoff(&e, assume_yes) {
-                return Err(install_failure_message(&e, assume_yes));
+            // 代行できない環境。**案内で終わらせず**、別のエージェント CLI が
+            // 居ればそちらへ引き継ぐ（#1057）
+            let reason = "この環境では tako が自動インストールを代行できません";
+            if try_agent_handoff(reason, assume_yes) {
+                eprintln!("  [OK] 引き継ぎ先のエージェントが Claude Code を導入しました");
+            } else {
+                return Err(install_failure_message(reason));
             }
-            eprintln!("  [OK] 引き継ぎ先のエージェントが Claude Code を導入しました");
         } else {
-            eprintln!("  [OK] Claude Code を導入しました");
+            if !confirm("この内容でインストールしますか？", true, assume_yes) {
+                return Err(format!(
+                    "インストールを中止しました。\n\
+                     自分で入れる場合は次のコマンドを実行してから `tako setup` をやり直してください:\n  {}",
+                    state.plan.official_command
+                ));
+            }
+            eprintln!();
+            if let Err(e) = setup_bootstrap::install(InstallOptions {
+                dry_run: false,
+                interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            }) {
+                // **案内だけで人間へ丸投げしない**（#1057）。導入済みの別系統 CLI が
+                // 居れば、その setup エージェントへ導入の代行を引き継ぐ
+                eprintln!("  [失敗] {e}");
+                if !try_agent_handoff(&e, assume_yes) {
+                    return Err(install_failure_message(&e));
+                }
+                eprintln!("  [OK] 引き継ぎ先のエージェントが Claude Code を導入しました");
+            } else {
+                eprintln!("  [OK] Claude Code を導入しました");
+            }
         }
     }
 
@@ -3026,7 +3030,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // スリープ設定は状態と専用コマンドだけを表示する。
     // `--review` は「前回設定を個別に見直す」経路なので、そこでは
     // その場導入を y/N で聞く（#88 の体験。#1057 で復活）
-    let (agents, missing) = run_dependency_check(review_mode);
+    let (agents, missing) = run_dependency_check(review_mode && !setup_bootstrap::legacy_mode());
     if !missing.is_empty() {
         return Err(format!(
             "必須の依存ツールが不足しています: {}。\n\
@@ -3539,8 +3543,8 @@ mod tests {
     fn 標準setupは依存の質問をしない() {
         let src = include_str!("setup.rs");
         assert!(
-            src.contains("run_dependency_check(review_mode)"),
-            "run_setup は review のときだけ対話にする"
+            src.contains("run_dependency_check(review_mode && !setup_bootstrap::legacy_mode())"),
+            "run_setup は review のときだけ対話にする（legacy env で旧挙動へ戻せる）"
         );
         assert!(
             src.contains("run_dependency_check(false)"),

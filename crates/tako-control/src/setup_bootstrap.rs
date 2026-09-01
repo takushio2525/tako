@@ -187,6 +187,14 @@ pub fn recipe() -> InstallRecipe {
     agent_install::current_recipe(AgentKind::Claude)
 }
 
+/// `TAKO_1057_LEGACY=1` で #1057 前の挙動へ戻す（**同一バイナリで A/B が取れる**）。
+///
+/// 戻るのは 3 点: ①Windows は自動インストールを代行しない ②PATH の判定に
+/// `exe::find`（PATH 外まで走査）を使う ③引き継ぎ先を探さない
+pub fn legacy_mode() -> bool {
+    std::env::var_os("TAKO_1057_LEGACY").is_some()
+}
+
 /// 「何をどこに入れるか」
 pub fn install_plan() -> Result<InstallPlan, String> {
     let home = home_dir()?;
@@ -317,7 +325,7 @@ pub fn status() -> Result<BootstrapState, String> {
 /// そのまま反映する（`.app` の痩せた PATH 対策として必要）＝従来のまま
 fn launcher_dir_on_path(dir: &Path) -> bool {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    if user_path::is_supported() {
+    if user_path::is_supported() && !legacy_mode() {
         return user_path::contains_entry(&path_var, dir)
             || user_path::read()
                 .map(|value| user_path::contains_entry(&value.raw, dir))
@@ -402,13 +410,12 @@ pub fn install(opts: InstallOptions) -> Result<Value, String> {
             "セルフテスト中は実インストールを行いません（dry_run でのみ呼べます）".to_string(),
         );
     }
-    if !plan.can_run {
+    if !plan.can_run || (legacy_mode() && cfg!(windows)) {
         return Err(format!(
-            "この環境では tako が自動インストールを代行できません。\n\
-             次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}\n\
-             （{} の自動化は Issue #525 で対応予定です）",
+            "この環境では tako が自動インストールを代行できません（{}）。\n\
+             次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}",
+            std::env::consts::OS,
             plan.official_command,
-            std::env::consts::OS
         ));
     }
     let script = fetch_installer(&plan)?;
@@ -746,8 +753,18 @@ pub fn undo_path() -> Result<Value, String> {
     }))
 }
 
-/// Windows のユーザー PATH から tako が足したエントリを取り除く。
-/// **他のエントリは 1 つも触らない**（純粋関数側のテストで固定してある）
+/// Windows のユーザー PATH からランチャーの置き場所のエントリを取り除く。
+/// **他のエントリは 1 つも触らない**（純粋関数側のテストで固定してある）。
+///
+/// ## unix との非対称（意図的）
+///
+/// unix はマーカーブロックを目印にするので「tako が置いた分」だけを外せる。
+/// レジストリの PATH は 1 本の文字列で目印を置ける場所が無いため、
+/// **誰が入れたかに関係なくランチャーの置き場所のエントリを外す**
+/// （公式インストーラが入れた分も対象）。`undo-path` は AI / 利用者が
+/// 明示的に叩くコマンドで、外した結果は `tako setup bootstrap path` で戻せるので
+/// この非対称は受け入れる。目印のための状態ファイルは作らない
+/// （#513 の共有カタログへ分類が要るものを、可逆な 1 操作のために増やさない）
 fn undo_user_path(dir: &Path) -> Result<Value, String> {
     let current = user_path::read()?;
     let change = match user_path::remove_entry(&current.raw, dir) {
@@ -784,6 +801,10 @@ pub struct HandoffCandidate {
 
 /// この環境で引き継げる相手
 pub fn handoff_candidates() -> Vec<HandoffCandidate> {
+    if legacy_mode() {
+        // #1057 前は「案内だけ」で引き継ぎ先を探さなかった
+        return Vec::new();
+    }
     HANDOFF_AGENTS
         .iter()
         .filter_map(|agent| {
