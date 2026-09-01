@@ -3355,3 +3355,83 @@ named pipe はセッションを跨げるので、GUI 操作を伴わない機�
 | #973 | プレビューの自動保存が CLI / MCP 編集で発火しない（**macOS も同じ**） | `schedule_autosave` がタイマーまで始める |
 | #974 | tako が書く `tmux-backend.conf` に psmux が持たない 4 オプション | 能力で出し分け |
 | #651 | 狭いペインで `--wait` が永久待機（既存 Issue に Windows 実測を追記） | マーカー検出を折り返し耐性へ |
+
+---
+
+## #1057 の記録（2026-09-01。setup の依存導入を案内止まりから実行代行へ）
+
+### 何が止まっていたか
+
+`tako setup` の `[1/3]` で `error: この環境では自動インストールに対応していません。` が出て
+Windows の利用者が詰まった（実機報告）。#868 は**レシピ（`platform::agent_install`）だけ**を
+両プラットフォームぶん持ち、`tako_can_run` を Windows で `false` に倒していた。
+つまり「手順は知っているが実行の配線が無い」状態で、AGENTS.md にも
+「実行代行は #525」と申し送りが残っていた。
+
+### 実物調査（推測しないための材料）
+
+`https://claude.ai/install.ps1` を落として読んだ（3,189 バイト）:
+
+- 形は `install.sh` と同じ（32bit 拒否 → arch 判定（ARM64 込み）→ `latest` 取得 →
+  `manifest.json` の SHA256 検証 → `%USERPROFILE%\.claude\downloads\` へ落として
+  `claude.exe install <target>` → 一時ファイル削除）。**署名検証はインストーラ自身が行う**
+- 先頭は `param(...)` で **shebang を持たない** → 取得物の見分け方をプラットフォーム別に
+  する必要がある（`ScriptSignature::{Shebang, PowerShell}`）
+- `param()` があるので `-File` で走らせても既定 `$Target = "latest"` が効く
+
+実機の状態（`ssh win`）:
+
+| 見たもの | 値 |
+|---|---|
+| `Get-ExecutionPolicy -List` | `CurrentUser = RemoteSigned` → **落としたファイルは `-File` で弾かれる** |
+| `curl.exe` | `C:\WINDOWS\system32\curl.exe`（`Get-Command curl` は**別名**で `.Source` が空。`curl.exe` と明示して確認する） |
+| `PATHEXT` | `.PS1` を含まない → `.ps1` は直接実行できない |
+| `HKCU\Environment\Path` | 種別 `ExpandString`・**末尾が `;`**・`~\.local\bin` を含む |
+| pwsh 7 / powershell 5.1 | どちらも在る（`candidates` は 5.1 を先に置いた = 必ず在る側を既定にする） |
+
+### 実測で覆った前提（重要）
+
+**「Claude 公式の Windows インストーラが PATH を通す」は間違い**。実機の隔離
+`USERPROFILE` で走らせると、インストーラ自身がこう出す:
+
+```
+Native installation exists but <...>\.local\bin is not in your PATH.
+Add it by opening: System Properties -> Environment Variables -> ...
+```
+
+つまり **PATH は人間に手作業を求めて終わる**。tako 側の PATH 段は「あってもよい」ではなく
+**無いと詰まる**。実機の user PATH に `~\.local\bin` が入っていたのは、過去に誰かが
+この案内どおり手で足したから（インストーラの副作用ではない）。
+
+### 実装の要点（次に触る人向け）
+
+1. **インタプリタと取得物の署名は境界（B17）のデータ**（`InterpreterSpec` / `ScriptSignature`）。
+   `setup_bootstrap` 側に `bash` / `powershell` を書かない = 経路の取り違えが起きない
+2. **PATH は境界 B23（`platform::user_path`）**。値の算術（追記 / 除去 / `%VAR%` 展開 /
+   大小・区切りを無視した突き合わせ）は**純粋関数**で、macOS の `cargo test` から
+   Windows の値の形を検証できる。レジストリの読み書きは `-EncodedCommand` で
+   PowerShell を 1 回起こし、**値と種別は env で渡す**（引用符もコードページも関与しない）
+3. **`exe::find` を on_path の判定に使わない**。B16 は PATH の外まで走査する保険なので、
+   これで判定すると「PATH に無いが見つかる」を「在る」と誤答して**段が飛ぶ**
+4. **末尾の `;` の有無を保つ**。実機の値は `;` で終わるので、`append_entry_in` が
+   落としてしまうと `undo-path` の復帰が 1 文字違う（`identical_to_before=false` を実測して発見）
+
+### 測り方で踏んだ罠（作法へ追加）
+
+- **`.ps1` を BOM なしで scp すると PowerShell 5.1 が CP932 で読む**（作法 11 の実例）。
+  日本語のコメント / `Write-Output` が化け、**文字列が閉じずにスクリプトのパースが壊れる**
+  （実行されず本文がそのまま出力された）。**測定スクリプトは ASCII だけで書く**のが確実
+- **`$ErrorActionPreference = 'Stop'` + git は相性が悪い**。`git checkout` の
+  `Previous HEAD position was …` は stderr なので `NativeCommandError` として
+  **終端エラーになりスクリプトがそこで止まる**（ビルドが始まっていないのに
+  「始めた」と報告しかけた）。git を含む測定は `'Continue'` にする
+- **`| Out-String` は完了までログへ出ない**。「A2 で止まっている」ように見えて実際は
+  C まで進んでいた。**進捗は `Get-CimInstance Win32_Process` で見る**（プロセスの親子が
+  そのまま出るので、どの段のどの子で待っているかが分かる）
+- **A/B の env は「その env を読むコードが入ったバイナリ」で測る**。実機の worktree が
+  1 コミット古く、`TAKO_1057_LEGACY` を読まない世代で測って**legacy アームが
+  install を完走した**（= 検出力ゼロの偽の結果）。実機で A/B を取る前に
+  `git log --oneline -1` を必ず突き合わせる
+- **レジストリを触る検証は前後のスナップショットで囲む**。`HKCU\Environment\Path` を
+  `DoNotExpandEnvironmentNames` で生のまま採り、`finally` で必ず戻して
+  `-ceq`（大小を区別する比較）で一致を確認する
