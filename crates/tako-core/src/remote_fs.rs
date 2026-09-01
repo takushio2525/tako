@@ -86,6 +86,90 @@ impl RemoteRef {
     }
 }
 
+/// リモートフォルダがツリーへ載った**経路**（#1041）。
+///
+/// # なぜ `RemoteRef` に混ぜないか
+///
+/// `RemoteRef` は同一性のキーで、ツリーの展開状態・取得キャッシュ・プレビューの
+/// 出どころ・layout.json の同定に使われる。ここへ経路を混ぜると「自動で開いた home」と
+/// 「明示で開いた同じ home」が**別のフォルダとして 2 行並ぶ**。経路は同一性ではなく
+/// 属性なので、器（[`RemoteFolder`]）の側に持たせる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum RemoteOrigin {
+    /// ユーザーが「リモートからフォルダを開く」で開いた（#919）= 主作業対象。
+    /// ツリーではローカルより**前**に出す（#1041）
+    Explicit,
+    /// ペインの `ssh` 検知による自動追加（#976）。ローカルの**後ろ**に並ぶ。
+    ///
+    /// **旧い layout.json の既定はこちら**: 経路を記録していなかった世代のファイルは
+    /// 明示 / 自動を区別できないので、`Auto` = 従来どおりの並び（全部ローカルの後ろ）
+    /// へ倒す。ここを `Explicit` にすると、更新後の初回起動で自動検知ぶんまで
+    /// 先頭へ跳ね上がる（#1041 受け入れ条件 5「自動検知の挙動に回帰ゼロ」に反する）
+    #[default]
+    Auto,
+}
+
+impl RemoteOrigin {
+    /// ワイヤ表記（応答 JSON・layout.json・CLI の表示）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteOrigin::Explicit => "explicit",
+            RemoteOrigin::Auto => "auto",
+        }
+    }
+
+    /// 文字列から解釈する。**知らない値は `Auto`**（未来の版が書いた値を読んでも
+    /// 並びが暴れないほうを既定にする）
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "explicit" => RemoteOrigin::Explicit,
+            _ => RemoteOrigin::Auto,
+        }
+    }
+}
+
+/// ツリーのルートとして開いているリモートフォルダ 1 本（#919 / #1041）。
+///
+/// 同一性は `remote` だけで決まる（`origin` は属性）。`PartialEq` を導出すると
+/// 「同じフォルダなのに経路が違うから別物」になってしまうので、**手で実装する**。
+#[derive(Debug, Clone, Eq)]
+pub struct RemoteFolder {
+    pub remote: RemoteRef,
+    pub origin: RemoteOrigin,
+}
+
+impl PartialEq for RemoteFolder {
+    fn eq(&self, other: &Self) -> bool {
+        self.remote == other.remote
+    }
+}
+
+impl std::hash::Hash for RemoteFolder {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.remote.hash(state);
+    }
+}
+
+impl RemoteFolder {
+    pub fn new(remote: RemoteRef, origin: RemoteOrigin) -> Self {
+        Self { remote, origin }
+    }
+
+    /// 明示的に開いたフォルダ（#919 / #1041）
+    pub fn explicit(remote: RemoteRef) -> Self {
+        Self::new(remote, RemoteOrigin::Explicit)
+    }
+
+    /// `ssh` 検知による自動追加（#976）
+    pub fn auto(remote: RemoteRef) -> Self {
+        Self::new(remote, RemoteOrigin::Auto)
+    }
+
+    pub fn is_explicit(&self) -> bool {
+        self.origin == RemoteOrigin::Explicit
+    }
+}
+
 /// リモートエントリの種別。SFTP の readdir は **lstat** 相当を返すので
 /// symlink はそのまま `Symlink` で来る（実体がディレクトリかは別に確かめる）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

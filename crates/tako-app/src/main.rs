@@ -9030,6 +9030,7 @@ impl TakoApp {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             PaneOrigin::User,
         );
@@ -9072,7 +9073,11 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// リモートフォルダをワークスペース（ファイルツリー）へ開く（#919）
+    /// リモートフォルダをワークスペース（ファイルツリー）へ開く（#919 / #1041）。
+    ///
+    /// #1041: dispatch 側が**ツリーの先頭へ出す + 同じタブへ SSH 済み・`cd` 済みの
+    /// ターミナルを用意する**（VSCode Remote 相当）。ここは結果を通知へ出すだけ =
+    /// CLI / MCP の `remote-folder open` とまったく同じ体験になる
     fn open_remote_folder(&mut self, host: &str, path: Option<&str>, cx: &mut Context<Self>) {
         let result = tako_control::dispatch(
             self,
@@ -9085,13 +9090,37 @@ impl TakoApp {
                 all: false,
                 force: false,
                 enabled: None,
+                // A/B（`TAKO_1041_LEGACY=1`）: 自動接続の前へ戻す
+                terminal: Some(!crate::ssh_folders::legacy_1041()),
             },
             PaneOrigin::User,
         );
         match result {
             Ok(v) => {
                 let label = v["label"].as_str().unwrap_or(host).to_string();
-                self.set_remote_notice(crate::ui_text::remote_folder::opened(&label), false);
+                // 繋いだ / 繋がなかった（理由つき）を必ず見せる。#1041 の
+                // 「黙って何もしない状態を作らない」
+                let notice = match v["terminal"]["connected"].as_bool() {
+                    Some(true) => crate::ui_text::remote_folder::opened_with_terminal(&label),
+                    Some(false) => {
+                        let note = v["terminal"]["note"].as_str().unwrap_or_default();
+                        if note.is_empty() {
+                            crate::ui_text::remote_folder::opened(&label)
+                        } else {
+                            crate::ui_text::remote_folder::opened_terminal_skipped(&label, note)
+                        }
+                    }
+                    None => crate::ui_text::remote_folder::opened(&label),
+                };
+                self.set_remote_notice(notice, false);
+                // #1023: dispatch が積んだ PTY 起動をこの場で消化する。#1041 で
+                // `open` がターミナルのペインも作るようになったので、これを欠くと
+                // **ペインだけ生えてターミナルが立たない**（次の IPC まで真っ黒）
+                if !Self::attach_drain_legacy() {
+                    if let Err(e) = self.attach_pending_sessions(cx) {
+                        self.set_remote_notice(e, true);
+                    }
+                }
             }
             Err(e) => self.set_remote_notice(e.to_string(), true),
         }
@@ -18789,11 +18818,11 @@ impl UiStateHost for TakoApp {
         // ネットワーク I/O を走らせない）。裏タブのフォルダを「pending」と呼ぶと
         // **読み込みに失敗しているように見える**ので、状態を言い分ける
         let active: Vec<tako_core::remote_fs::RemoteRef> =
-            self.workspace.active_tab().remote_folders().to_vec();
+            self.workspace.active_tab().remote_refs();
         self.workspace
             .tabs()
             .iter()
-            .flat_map(|t| t.remote_folders().iter().cloned())
+            .flat_map(|t| t.remote_refs())
             .map(|remote| {
                 if !self.filetree.visible {
                     // ツリーが閉じている = まだ何も読んでいない（異常ではない）。
@@ -18903,6 +18932,44 @@ impl UiStateHost for TakoApp {
             ));
         }
         Some(v)
+    }
+
+    fn remote_root_placement(&self) -> tako_core::sidebar::RemoteRootPlacement {
+        // 画面（`FileTree::build_rows`）と同じ 1 実装から引く（#1041）
+        crate::ssh_folders::remote_root_placement()
+    }
+
+    /// そのタブでそのホストへ繋がっている生きたペイン（#1041）。
+    ///
+    /// 材料は 2 つとも GUI 側にしかない:
+    ///   1. tako が開いた SSH ペインの接続状態（#1010 の `ssh_connect`）
+    ///   2. ユーザーが手で `ssh <host>` したペインの検知（#976 の `ssh_links`）
+    ///
+    /// 両方見るのが要点。1 だけだと「自分で ssh したペインの隣にもう 1 枚」ができ、
+    /// 2 だけだと「tako が開いた直後（まだ ps を走らせていない）」に二重に作る
+    fn live_ssh_pane(&self, tab: TabId, host: &str) -> Option<PaneId> {
+        let panes: Vec<PaneId> = self
+            .workspace
+            .get_tab(tab)?
+            .tree()
+            .panes()
+            .into_iter()
+            .map(|p| p.id())
+            .collect();
+        // 1: tako が開いた SSH ペイン（結果待ちも数える = 2 枚目を作らない）
+        if let Some(pane) = panes.iter().find(|p| {
+            self.ssh_connect
+                .get(p)
+                .is_some_and(|st| st.host == host && st.phase.occupies_host())
+        }) {
+            return Some(*pane);
+        }
+        // 2: ユーザーが手で ssh したペイン（生きているものだけ）
+        let link = self.ssh_links.get(host)?;
+        if !link.live {
+            return None;
+        }
+        panes.into_iter().find(|p| p.as_u64() == link.pane)
     }
 
     fn remote_files_loading(&self) -> Vec<tako_core::remote_fs::RemoteRef> {
@@ -54568,7 +54635,10 @@ mod self_test {
                     .update(cx, |app, _, cx| {
                         app.filetree.visible = true;
                         app.filetree.set_show_hidden(false);
-                        app.filetree.add_remote_root(root.clone());
+                        app.filetree
+                            .add_remote_root(tako_core::remote_fs::RemoteFolder::explicit(
+                                root.clone(),
+                            ));
                         cx.notify();
                         let rows = app.filetree.rows();
                         let root_row = rows
@@ -54934,6 +55004,7 @@ mod self_test {
                                 all: false,
                                 force: false,
                                 enabled: None,
+                                terminal: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -54962,6 +55033,7 @@ mod self_test {
                                 all: false,
                                 force: false,
                                 enabled: None,
+                                terminal: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -55984,6 +56056,7 @@ mod self_test {
                                 all: false,
                                 force: false,
                                 enabled,
+                                terminal: None,
                             }
                         };
                         let on = tako_control::dispatch(app, req(Some(true)), PaneOrigin::Cli)
@@ -57322,6 +57395,13 @@ mod self_test {
                 // (d) 認証系の理由では繰り返さない（相手のログを埋めない）
                 let permanent1040 = window
                     .update(cx, |app: &mut TakoApp, _, _| {
+                        // #1062: (b) が積んだ打ち直し（`echo TAKO_1040_RETRY`）の送達フローを
+                        // **先に畳む**。同じペインへ 2 系統が書くと、フローの書き直し
+                        // （Ctrl+C + 本文の再書き込み）が下の `printf` を壊し、
+                        // 「認証系の理由」が画面に出ないまま 12 秒の待ちを使い切る
+                        // （main でも同じ場所で落ちる = 負荷依存の競合）。
+                        // (b) は「積まれたこと」を見る検査なので、実行させる必要はない
+                        app.command_flows.retain(|f| f.pane != pid1040);
                         // 起点は**いまの画面**（前の段のマーカーを窓に入れない）
                         let now = app
                             .terminals
@@ -57357,9 +57437,35 @@ mod self_test {
                         break;
                     }
                 }
+                // #1062: 落ちたときに「何が見えていたのか」を残す（#796 の作法）
+                let permanent_diag = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let phase = app
+                            .ssh_connect
+                            .get(&pid1040)
+                            .map(|st| st.phase.as_str().to_string());
+                        let tail: Vec<String> = app
+                            .terminals
+                            .get(&pid1040)
+                            .map(|s| {
+                                s.visible_lines()
+                                    .into_iter()
+                                    .filter(|l| !l.trim().is_empty())
+                                    .rev()
+                                    .take(3)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (phase, tail)
+                    })
+                    .unwrap_or((None, Vec::new()));
                 check(
                     permanent1040 && permanent_ok,
-                    "137: 認証・ホスト鍵の失敗は繰り返さず理由だけ残す (#1040)",
+                    &format!(
+                        "137: 認証・ホスト鍵の失敗は繰り返さず理由だけ残す \
+                         (#1040。phase={:?} tail={:?})",
+                        permanent_diag.0, permanent_diag.1
+                    ),
                 );
 
                 // (e) 上限に達したら理由 + 次の一手を出して静かに止まる
@@ -57425,6 +57531,341 @@ mod self_test {
                      legacy={}",
                     std::env::var_os("TAKO_1040_LEGACY").is_some()
                 );
+                notify_and_draw(any, window, cx);
+            }
+
+            // 138. 「リモートからフォルダを開く」の VSCode Remote 化（#1041）。
+            //
+            // 実 SSH 先には依存させない（`open` は実 SFTP 接続が要るので通せない。
+            // そのぶんを `dispatch::auto_connect_terminal` = 製品の 1 実装で測る）。
+            // ここで守るのは **構造**:
+            //   (a) 明示 open で開いたルートが**ローカルより前**に出る
+            //       （自動検知ぶんは後ろのまま = #976 に回帰ゼロ）
+            //   (b) 同じ並びと経路が `remote-folder list` から読める
+            //   (c) 自動接続が**新しいペイン**を立て、そのフォルダへ `cd` を積む
+            //   (d) 同じホストの生きたペインがあれば**増やさない**（結果待ち・成立後とも）
+            //   (d2) 失敗して死んだペインは占有しない（開き直せる）
+            //   (e) `terminal=false` は繋がず理由を返す
+            //   (f) 自動接続したペインを #976 の検知が二重に並べない
+            // 実際に繋がるかは実 SSH 先での通しと `remote_fs_e2e -- --ignored` が受け持つ
+            {
+                use std::collections::HashMap as StdMap;
+                use tako_control::ssh_detect::SshScanState;
+                use tako_core::remote_fs::{RemoteFolder, RemoteRef};
+                use tako_core::ssh_progress::ConnectPhase;
+                let host1041 = "selftest-nonexistent-1041";
+                let explicit1041 = RemoteRef::new(host1041, "/srv/work");
+                let auto1041 = RemoteRef::new("selftest-auto-1041", "/srv/home");
+
+                // (a) 明示 open は先頭・自動検知はローカルの後ろ（#1041 受け入れ条件 1・5）
+                let (tab1041, lead_ok, auto_after_ok, rows_dump) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        app.filetree.visible = true;
+                        let tab_id = app.workspace.active_tab_id();
+                        // 順序を確かめたいので自動検知ぶんを**先に**載せる
+                        // （経路で決まる = 載せた順では決まらないことの検査）
+                        tako_control::dispatch::attach_remote_root(
+                            app,
+                            RemoteFolder::auto(auto1041.clone()),
+                            tab_id,
+                        );
+                        tako_control::dispatch::attach_remote_root(
+                            app,
+                            RemoteFolder::explicit(explicit1041.clone()),
+                            tab_id,
+                        );
+                        cx.notify();
+                        let rows = app.filetree.rows();
+                        let ix = |r: &RemoteRef| {
+                            rows.iter().position(|row| row.remote.as_ref() == Some(r))
+                        };
+                        let local = rows.iter().position(|r| r.root && r.remote.is_none());
+                        let dump: Vec<String> = rows
+                            .iter()
+                            .filter(|r| r.root)
+                            .map(|r| match &r.remote {
+                                Some(rr) => format!("remote:{}", rr.host),
+                                None => format!("local:{}", r.entry.name),
+                            })
+                            .collect();
+                        let lead = match (ix(&explicit1041), local) {
+                            (Some(e), Some(l)) => e < l,
+                            _ => false,
+                        };
+                        let after = match (ix(&auto1041), local) {
+                            (Some(a), Some(l)) => a > l,
+                            _ => false,
+                        };
+                        (tab_id, lead, after, dump)
+                    })
+                    .unwrap_or((TabId::from_raw(1), false, false, Vec::new()));
+                check(
+                    lead_ok && auto_after_ok,
+                    &format!(
+                        "138: 明示 open はツリー先頭・自動検知はローカルの後ろ \
+                         (#1041。explicit_first={lead_ok} auto_after_local={auto_after_ok} \
+                         roots={rows_dump:?})"
+                    ),
+                );
+
+                // (b) 同じ並びが CLI / MCP からも読める（#1041 受け入れ条件 4）
+                let (list_order, list_origins) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let v = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::RemoteFolder {
+                                action: "list".into(),
+                                host: None,
+                                path: None,
+                                tab: None,
+                                focus: None,
+                                all: false,
+                                force: false,
+                                enabled: None,
+                                terminal: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .unwrap_or_default();
+                        let mut order: Vec<String> = Vec::new();
+                        let mut origins: Vec<String> = Vec::new();
+                        for tab in v["tabs"].as_array().cloned().unwrap_or_default() {
+                            if tab["tab"].as_u64() != Some(tab1041.as_u64()) {
+                                continue;
+                            }
+                            for f in tab["remote_folders"].as_array().cloned().unwrap_or_default() {
+                                order.push(f["label"].as_str().unwrap_or_default().to_string());
+                                origins.push(format!(
+                                    "{}/{}",
+                                    f["origin"].as_str().unwrap_or("?"),
+                                    f["placement"].as_str().unwrap_or("?")
+                                ));
+                            }
+                        }
+                        (order, origins)
+                    })
+                    .unwrap_or_default();
+                let list_ok = list_order.first().map(|s| s.as_str())
+                    == Some(explicit1041.label().as_str())
+                    && list_origins.first().map(|s| s.as_str()) == Some("explicit/leading")
+                    && list_origins.last().map(|s| s.as_str()) == Some("auto/trailing");
+                check(
+                    list_ok,
+                    &format!(
+                        "138: 並びと経路が CLI / MCP からも読める \
+                         (#1041。order={list_order:?} origins={list_origins:?})"
+                    ),
+                );
+
+                // (c) 自動接続は**新しいペイン**を立て、そのフォルダへ cd を積む
+                //     （#1041 受け入れ条件 2）
+                let panes_before = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.workspace.active_tab().tree().panes().len()
+                    })
+                    .unwrap_or(0);
+                let (connect1041, panes_after, cd_queued) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let v = tako_control::dispatch::auto_connect_terminal(
+                            app,
+                            PaneOrigin::User,
+                            host1041,
+                            &explicit1041.path,
+                            tab1041,
+                            Some(false),
+                            true,
+                        );
+                        cx.notify();
+                        let panes = app.workspace.active_tab().tree().panes().len();
+                        // 接続後に打つ `cd` が送達確認つきの経路（#640）へ積まれている
+                        let pane = v["pane"].as_u64().unwrap_or(0);
+                        let cd = app.command_flows.iter().any(|f| {
+                            f.pane.as_u64() == pane && f.flow.command().contains("cd ")
+                        });
+                        (v, panes, cd)
+                    })
+                    .unwrap_or((serde_json::Value::Null, panes_before, false));
+                let connect_ok = connect1041["connected"].as_bool() == Some(true)
+                    && connect1041["target"].as_str() == Some("split")
+                    && panes_after == panes_before + 1
+                    && cd_queued;
+                check(
+                    connect_ok,
+                    &format!(
+                        "138: フォルダを開くと同じタブへ SSH + cd 済みのペインが立つ \
+                         (#1041。panes={panes_before}->{panes_after} cd={cd_queued} \
+                         {connect1041:?})"
+                    ),
+                );
+
+                // (d) 2 回目は増やさない（既存ペインを理由つきで返す）。
+                //     結果待ち（`Connecting`）と成立後（`Connected`）の**両方**で数える
+                let ssh_pane1041 = connect1041["pane"].as_u64().unwrap_or(0);
+                let retry1041 = |app: &mut TakoApp| {
+                    let v = tako_control::dispatch::auto_connect_terminal(
+                        app,
+                        PaneOrigin::User,
+                        host1041,
+                        &explicit1041.path,
+                        tab1041,
+                        Some(false),
+                        true,
+                    );
+                    let panes = app.workspace.active_tab().tree().panes().len();
+                    (v, panes)
+                };
+                let (dup1041, panes_dup, dup_connected, panes_connected) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let (waiting, panes_waiting) = retry1041(app);
+                        // 接続が成立した状態でも同じ答えになる（日常の開き直し）
+                        if let Some(st) = app.ssh_connect.get_mut(&PaneId::from_raw(ssh_pane1041)) {
+                            st.phase = ConnectPhase::Connected;
+                        }
+                        let (connected, panes_connected) = retry1041(app);
+                        (waiting, panes_waiting, connected, panes_connected)
+                    })
+                    .unwrap_or((
+                        serde_json::Value::Null,
+                        0,
+                        serde_json::Value::Null,
+                        0,
+                    ));
+                let dedup_of = |v: &serde_json::Value, panes: usize| {
+                    v["connected"].as_bool() == Some(false)
+                        && v["reason"].as_str() == Some("already_connected")
+                        && v["pane"].as_u64() == Some(ssh_pane1041)
+                        && !v["note"].as_str().unwrap_or_default().is_empty()
+                        && panes == panes_after
+                };
+                let dup_ok = dedup_of(&dup1041, panes_dup)
+                    && dedup_of(&dup_connected, panes_connected);
+                check(
+                    dup_ok,
+                    &format!(
+                        "138: 同じホストへ繋がったペインがあれば増やさず理由を返す \
+                         (#1041。panes={panes_after}->{panes_dup}/{panes_connected} \
+                         waiting={dup1041:?} connected={dup_connected:?})"
+                    ),
+                );
+
+                // (d2) **死んだ接続はホストを占有しない**（前の試行が失敗したペインを
+                //      理由に開き直しを断ると、ユーザーが開き直しても何も起きない）
+                let (dead1041, panes_dead) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        if let Some(st) = app.ssh_connect.get_mut(&PaneId::from_raw(ssh_pane1041)) {
+                            st.phase = ConnectPhase::Failed {
+                                reason: Some("selftest".into()),
+                            };
+                        }
+                        retry1041(app)
+                    })
+                    .unwrap_or((serde_json::Value::Null, 0));
+                let dead_ok = dead1041["connected"].as_bool() == Some(true)
+                    && panes_dead == panes_after + 1;
+                check(
+                    dead_ok,
+                    &format!(
+                        "138: 失敗したペインを理由に開き直しを断らない \
+                         (#1041。panes={panes_after}->{panes_dead} {dead1041:?})"
+                    ),
+                );
+
+                // (e) 明示的に切ったときも**理由**が返る（黙って何もしない、をしない）
+                let off1041 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        tako_control::dispatch::auto_connect_terminal(
+                            app,
+                            PaneOrigin::Cli,
+                            "selftest-other-1041",
+                            "/srv/x",
+                            tab1041,
+                            Some(false),
+                            false,
+                        )
+                    })
+                    .unwrap_or_default();
+                let off_ok = off1041["connected"].as_bool() == Some(false)
+                    && off1041["reason"].as_str() == Some("disabled")
+                    && !off1041["note"].as_str().unwrap_or_default().is_empty();
+                check(
+                    off_ok,
+                    &format!("138: terminal=false は繋がず理由を返す (#1041。{off1041:?})"),
+                );
+
+                // (f) 自動接続で立てたペインを **#976 の検知が二重に並べない**。
+                //     `remote_ssh_argv` は config の `User` を宛先へ反映するので、
+                //     検知側が argv から採る宛先は `user@host`。読み替えなしだと
+                //     明示 open のルート（`host`）と突き合わせられず 2 行並ぶ
+                //     （実 SSH 先で実測: `<remoteuser>@<host>` の行が増えた）
+                let dup_scan_jobs = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let shell_pid = 71041u32;
+                        let ssh_pid = 71042u32;
+                        let pane = ssh_pane1041;
+                        let targets = vec![tako_control::ssh_detect::SshScanTarget {
+                            pane,
+                            tab: tab1041.as_u64(),
+                            backend_session: None,
+                            child_pid: Some(shell_pid),
+                            state: tako_core::CommandState::Running,
+                        }];
+                        let argv: StdMap<u32, String> =
+                            [(ssh_pid, format!("ssh user@{host1041}"))]
+                                .into_iter()
+                                .collect();
+                        let snapshot = tako_control::agents::ProcessSnapshot::from_parts_for_test(
+                            Vec::new(),
+                            [(ssh_pid, shell_pid)].into_iter().collect(),
+                            argv,
+                        );
+                        let state = tako_control::ssh_detect::scan(
+                            &SshScanState::default(),
+                            targets,
+                            Some(&snapshot),
+                            std::time::Instant::now(),
+                        );
+                        app.ssh_links.clear();
+                        let jobs = app.apply_ssh_scan(state);
+                        app.ssh_links.clear();
+                        app.ssh_scan = SshScanState::default();
+                        jobs.len()
+                    })
+                    .unwrap_or(1);
+                check(
+                    dup_scan_jobs == 0,
+                    &format!(
+                        "138: 自動接続したペインを #976 が二重に並べない \
+                         (#1041。jobs={dup_scan_jobs})"
+                    ),
+                );
+
+                println!(
+                    "TAKO_SELF_TEST_1041: explicit_first={lead_ok} auto_after={auto_after_ok} \
+                     list={list_ok} connect={connect_ok} dedup={dup_ok} dead={dead_ok} \
+                     off={off_ok} dup_scan={dup_scan_jobs} \
+                     panes={panes_before}->{panes_after}->{panes_dead} legacy={}",
+                    std::env::var_os("TAKO_1041_LEGACY").is_some()
+                );
+
+                // 後片付け: 立てたペイン（(c) と (d2) の 2 枚）と開いたルートを落とす
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    for pane in [connect1041["pane"].as_u64(), dead1041["pane"].as_u64()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let pid = PaneId::from_raw(pane);
+                        app.dismiss_ssh_connect(pid);
+                        app.close_pane_button(pid, CloseOrigin::Internal, cx);
+                    }
+                    if let Some(tab) = app.workspace.get_tab_mut(tab1041) {
+                        tab.remove_remote_folder(&explicit1041);
+                        tab.remove_remote_folder(&auto1041);
+                    }
+                    app.filetree.remove_remote_root(&explicit1041);
+                    app.filetree.remove_remote_root(&auto1041);
+                    app.remote_notice = None;
+                    cx.notify();
+                });
                 notify_and_draw(any, window, cx);
             }
 
@@ -58806,6 +59247,44 @@ mod app_menu_tests {
             collect_actions(&menu.items, &mut out);
         }
         out
+    }
+
+    /// #1041 / #1023: GUI の「リモートからフォルダを開く」は dispatch が
+    /// **ターミナルのペインも作る**ようになったので、その場で PTY 起動を消化しないと
+    /// ペインだけ生えてターミナルが立たない。#1023 の番犬は main.rs を走査対象から
+    /// 外している（セルフテストが同居して区別できない）ので、ここで名指しで見る。
+    ///
+    /// `open_ssh_host` 側の同じ不変条件は隔離セルフテスト項目 132 が守る
+    #[test]
+    fn リモートフォルダを開く経路はpty起動を消化している() {
+        let source = include_str!("main.rs");
+        let at = source
+            .find("fn open_remote_folder(")
+            .expect("open_remote_folder が実在する");
+        // 関数 1 本ぶんを波括弧の釣り合いで切り出す（次の `fn` までではなく本文）
+        let open = source[at..].find('{').expect("本文が始まる") + at;
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &source[open..end];
+        assert!(
+            body.contains("attach_pending_sessions"),
+            "open_remote_folder が pending_attach を消化していない（#1041 / #1023）。\n\
+             dispatch の `open` は #1041 でターミナルのペインも作るので、\n\
+             `self.attach_pending_sessions(cx)` を呼ばないとターミナルが立たない"
+        );
     }
 
     #[test]

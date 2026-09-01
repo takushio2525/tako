@@ -239,3 +239,142 @@ mod tests {
         }
     }
 }
+
+// ─────────── フォルダを開いたらターミナルも繋ぐ（#1041） ───────────
+//
+// VSCode Remote / Zed の「リモートで開く」は、フォルダを開くと同時にそのホストの
+// ターミナルが用意される。tako も同じ体験にする（#1041 要望 2）。
+//
+// # なぜ `split`（新しいペイン）で固定するのか
+//
+// #1006 は「既存のペインをそのまま SSH 化する」（[`RemoteOpenTarget::Pane`]）を
+// 持っている。Issue #1041 の設計メモはアイドルな素のシェルペインがあればそれを
+// 優先する案を挙げていたが、**自動経路では採らない**:
+//
+//   1. 自動経路は「どのペインを使うか」のユーザーの意思を持たない。右クリックの
+//      「このペインでリモート接続…」は対象を指で選んでいるので事情が違う
+//   2. 素のシェルに**打ちかけの行**が残っていても、それを見分ける手段が無い
+//      （シェルのプロンプトの終端は OSC 133 の有無に依存し、器つきでは取れない）。
+//      #640 の送達フローは打ちかけの行へ続けて書くので、`ssh <host>` が
+//      `<打ちかけ> ssh <host>` として実行されうる
+//   3. 新しいペインなら失うものが無い（接続に失敗しても #919 のとおり理由が残る）
+//
+// ペインの SSH 化は右クリック / `--target pane` の**明示操作としてそのまま使える**。
+//
+// # 重複を作らない
+//
+// 同じタブに同じホストへ繋がった生きたペインがあれば作らない（#1041 受け入れ条件 2）。
+// 「生きている」の材料は呼び出し側（GUI）が集める: tako が開いた SSH ペイン
+// （#1010 の接続状態）と、ユーザーが手で `ssh` したペイン（#976 の検知）の両方。
+
+/// ターミナルを繋ぐかどうかの判断（#1041）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTerminal {
+    /// 新しいペインを作って接続する
+    Connect,
+    /// 繋がない（理由つき）
+    Skip(AutoTerminalSkip),
+}
+
+/// 繋がなかった理由（#1041。**黙って何もしない状態を作らない**）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTerminalSkip {
+    /// 呼び出し側が明示的に切った（`--no-terminal` / `terminal: false`）
+    Disabled,
+    /// 同じタブにそのホストへ繋がっている生きたペインがある
+    AlreadyConnected { pane: u64 },
+}
+
+impl AutoTerminalSkip {
+    /// 応答の `reason`（ワイヤ表記）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoTerminalSkip::Disabled => "disabled",
+            AutoTerminalSkip::AlreadyConnected { .. } => "already_connected",
+        }
+    }
+
+    /// 人が読む説明（規約どおり日本語。応答と通知に出す）
+    pub fn note(self) -> String {
+        match self {
+            AutoTerminalSkip::Disabled => "terminal=false が指定されたのでターミナルは繋がない\
+                 （繋ぐなら `tako remote-folder ssh-pane <host> <path>`）"
+                .to_string(),
+            AutoTerminalSkip::AlreadyConnected { pane } => format!(
+                "pane {pane} が同じホストへ繋がっているので新しいペインは作らない\
+                 （別に立てるなら `tako open-in remote <host> --remote-dir <path>`）"
+            ),
+        }
+    }
+}
+
+/// フォルダを開いたときにターミナルも繋ぐかを決める（純粋関数）。
+///
+/// `requested` = 呼び出し側の指定（既定 true = #322「既定を賢く」）。
+/// `existing_pane` = 同じタブでそのホストへ繋がっている生きたペイン（あれば）。
+pub fn decide_auto_terminal(requested: bool, existing_pane: Option<u64>) -> AutoTerminal {
+    if !requested {
+        return AutoTerminal::Skip(AutoTerminalSkip::Disabled);
+    }
+    match existing_pane {
+        Some(pane) => AutoTerminal::Skip(AutoTerminalSkip::AlreadyConnected { pane }),
+        None => AutoTerminal::Connect,
+    }
+}
+
+#[cfg(test)]
+mod auto_terminal_tests {
+    use super::*;
+
+    #[test]
+    fn 既定は繋ぐ() {
+        assert_eq!(decide_auto_terminal(true, None), AutoTerminal::Connect);
+    }
+
+    #[test]
+    fn 同じホストのペインがあれば繋がない() {
+        assert_eq!(
+            decide_auto_terminal(true, Some(7)),
+            AutoTerminal::Skip(AutoTerminalSkip::AlreadyConnected { pane: 7 })
+        );
+    }
+
+    #[test]
+    fn 明示的に切れば繋がない() {
+        assert_eq!(
+            decide_auto_terminal(false, None),
+            AutoTerminal::Skip(AutoTerminalSkip::Disabled)
+        );
+        // 切っているほうが強い（既存ペインの有無で理由が揺れない）
+        assert_eq!(
+            decide_auto_terminal(false, Some(7)),
+            AutoTerminal::Skip(AutoTerminalSkip::Disabled)
+        );
+    }
+
+    /// 理由は**必ず**ワイヤ表記と説明の両方を持つ（握り潰しても空にならない）
+    #[test]
+    fn 理由はどれも空でない() {
+        for skip in [
+            AutoTerminalSkip::Disabled,
+            AutoTerminalSkip::AlreadyConnected { pane: 3 },
+        ] {
+            assert!(!skip.as_str().is_empty());
+            assert!(!skip.note().trim().is_empty());
+            // 次の一手（別の繋ぎ方）を必ず添える
+            assert!(skip.note().contains("tako "), "{}", skip.note());
+        }
+    }
+
+    /// 自動経路が既存ペインを乗っ取らないこと（このモジュールの設計判断）を
+    /// 型として固定する: 判断の結果に `Pane` は出てこない
+    #[test]
+    fn 自動経路の開き先は常に新しいペイン() {
+        assert_eq!(auto_terminal_target(), RemoteOpenTarget::Split);
+    }
+}
+
+/// 自動接続の開き先（#1041）。**常に新しいペイン**（理由はモジュールの説明）
+pub fn auto_terminal_target() -> RemoteOpenTarget {
+    RemoteOpenTarget::Split
+}

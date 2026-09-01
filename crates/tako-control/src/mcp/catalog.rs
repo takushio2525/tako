@@ -3029,8 +3029,14 @@ pub fn tools() -> Vec<Value> {
                 read_only=true で返る）。\
                 認証は ~/.ssh/config・鍵・ControlMaster をそのまま使う（追加設定なし）。\
                 action: open = 接続してフォルダをツリーへ開く（path 省略でリモートのホーム。\
-                接続に失敗したら開かずに理由を返す）/ close = 閉じる（path 省略でそのホストの全部、\
-                all=true で全ホスト）/ list = 開いているリモートフォルダの一覧（読み込み状態つき）/\
+                接続に失敗したら開かずに理由を返す。#1041: ツリーの**先頭**（ローカルより前）に\
+                並び、同じタブへ SSH 済み + そのフォルダへ cd 済みのターミナルペインも用意する\
+                = VSCode Remote 相当。同じホストへ繋がった生きたペインがあれば作らない。\
+                terminal=false で開くだけにできる。応答の terminal.connected / reason / pane と\
+                origin / placement で結果が読める）/ close = 閉じる（path 省略でそのホストの全部、\
+                all=true で全ホスト）/ list = 開いているリモートフォルダの一覧（読み込み状態つき。\
+                **ツリーに出ている並び**で返り、各行の origin = explicit / auto と\
+                placement = leading / trailing でローカルの前後どちらに出ているかが分かる）/\
                 ls = ツリーを開かずにリモートのディレクトリを一覧する（構造の把握に使う）/\
                 open-file = リモートのファイルをプレビューで開く（応答の read_only / size /\
                 mode / mtime で書けるかが分かる。保存は tako_preview_save）/ ssh-pane = そのフォルダで\
@@ -3075,6 +3081,10 @@ pub fn tools() -> Vec<Value> {
                     "enabled": {
                         "type": "boolean",
                         "description": "auto で自動追加の有効・無効を切り替える（省略で現在値の照会だけ。#976）",
+                    },
+                    "terminal": {
+                        "type": "boolean",
+                        "description": "open でターミナルも同じホストへ繋ぐか（#1041。省略時 true。false にすると開くだけ = あとから action=ssh-pane で繋げる）",
                     },
                 },
                 "required": ["action"],

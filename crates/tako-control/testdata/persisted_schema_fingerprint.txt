@@ -19,6 +19,7 @@ ProjectEntry: cwd, description
 ProjectsConfig: projects
 RecentEntry: directory, repository, ssh
 RecentList: entries
+RemoteFolderLayout: host, path, origin
 SessionCatalog: entries, pending
 SessionEntry: kind, label, project, profile, agent, model, effort, issues, prompt_head, cwd, tab, pane, tmux_session, log_file, started_at, last_seen_at
 Settings: auto_rename, port_detect, ssh_auto_folders, autosuggest, autosuggest_hint, autosuggest_tab, preview_live_reload, preview_cache_max_mb, tmux_persist, sleep_guard_mode, sleep_guard_power, lid_sleep_mode, pane_logs, pane_log_max_mb, pane_log_total_max_mb, theme, ui_mode, sidebar_width, show_hidden_files, telemetry, welcome_dismissed, update_card_dismissed, limit_service, language, runner_defaults, theme_colors, theme_presets, font_family, font_size

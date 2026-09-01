@@ -58,6 +58,17 @@ impl ConnectPhase {
     pub fn is_visible(&self) -> bool {
         !matches!(self, ConnectPhase::Opened | ConnectPhase::Connected)
     }
+
+    /// このペインを**まだそのホストのターミナルとして数えるか**（#1041）。
+    ///
+    /// 「フォルダを開いたらターミナルも繋ぐ」が二重にペインを作らないための判定。
+    /// `Failed` / `GaveUp` は数えない: 前の試行が死んでいるペインを理由に
+    /// 新しい接続を断ると、**ユーザーが開き直しても何も起きない**
+    /// （`open` は SFTP で繋がったときにしか来ないので、相手は到達可能）。
+    /// 逆に `Connecting` は数える（結果待ちの最中に 2 枚目を作らない）
+    pub fn occupies_host(&self) -> bool {
+        !matches!(self, ConnectPhase::Failed { .. } | ConnectPhase::GaveUp)
+    }
 }
 
 /// [`classify`] の材料
@@ -430,5 +441,29 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "phase の名前が被っている: {all:?}");
+    }
+}
+
+#[cfg(test)]
+mod occupies_host_tests {
+    use super::*;
+
+    /// #1041: 生きている / 結果待ちのペインは数え、死んだものは数えない
+    #[test]
+    fn 死んだ接続はホストを占有しない() {
+        for live in [
+            ConnectPhase::Connecting,
+            ConnectPhase::Opened,
+            ConnectPhase::Connected,
+            ConnectPhase::Reconnecting {
+                attempt: 1,
+                waiting_secs: 2,
+            },
+        ] {
+            assert!(live.occupies_host(), "{}", live.as_str());
+        }
+        for dead in [ConnectPhase::Failed { reason: None }, ConnectPhase::GaveUp] {
+            assert!(!dead.occupies_host(), "{}", dead.as_str());
+        }
     }
 }

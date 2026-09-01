@@ -56,8 +56,12 @@ pub struct Tab {
     /// **`pinned_folders` と別に持つ**: `PathBuf` は OS 依存の区切りを持つので、
     /// リモートの POSIX パス（Windows の `/C:/...` を含む）を混ぜると Windows 側で
     /// `join` / `canonicalize` が `\\` を作って壊れるし、ローカル FS の存在検査
-    /// （`is_dir()`）を通してしまうと**必ず消える**
-    remote_folders: Vec<crate::remote_fs::RemoteRef>,
+    /// （`is_dir()`）を通してしまうと**必ず消える**。
+    ///
+    /// #1041: 要素は「どの経路で載ったか」（明示 open / `ssh` 検知）を持つ。
+    /// 並びは**新しく開いたものが先頭**（`insert(0)`）で、表示順への変換は
+    /// `tako_core::sidebar::remote_root_order` が正本
+    remote_folders: Vec<crate::remote_fs::RemoteFolder>,
 }
 
 impl Tab {
@@ -80,7 +84,7 @@ impl Tab {
         title_source: TitleSource,
         tree: PaneTree,
         pinned_folders: Vec<PathBuf>,
-        remote_folders: Vec<crate::remote_fs::RemoteRef>,
+        remote_folders: Vec<crate::remote_fs::RemoteFolder>,
     ) -> Self {
         TabId::reserve(id);
         Self {
@@ -157,31 +161,51 @@ impl Tab {
 
     // --- remote_folders（#919: リモートからフォルダを開く） ---
 
-    /// このタブで開いているリモートフォルダ
-    pub fn remote_folders(&self) -> &[crate::remote_fs::RemoteRef] {
+    /// このタブで開いているリモートフォルダ（経路つき。新しいものが先頭）
+    pub fn remote_folders(&self) -> &[crate::remote_fs::RemoteFolder] {
         &self.remote_folders
     }
 
-    /// リモートフォルダを開く（同じものは重ねない）。新規に追加したら true
-    pub fn add_remote_folder(&mut self, remote: crate::remote_fs::RemoteRef) -> bool {
-        if self.remote_folders.contains(&remote) {
+    /// 位置だけを取り出したもの（経路を見ない呼び出し側のため）
+    pub fn remote_refs(&self) -> Vec<crate::remote_fs::RemoteRef> {
+        self.remote_folders
+            .iter()
+            .map(|f| f.remote.clone())
+            .collect()
+    }
+
+    /// リモートフォルダを開く（同じものは重ねない）。新規に追加したら true。
+    ///
+    /// #1041: 既にあるフォルダを**明示的に**開き直したときは経路を
+    /// `Explicit` へ格上げする（自動検知で載っていた home をユーザーが
+    /// 「リモートからフォルダを開く」で選び直したら、それは主作業対象）。
+    /// 逆方向（明示 → 自動）へは落とさない
+    pub fn add_remote_folder(&mut self, folder: crate::remote_fs::RemoteFolder) -> bool {
+        if let Some(existing) = self
+            .remote_folders
+            .iter_mut()
+            .find(|f| f.remote == folder.remote)
+        {
+            if folder.is_explicit() {
+                existing.origin = crate::remote_fs::RemoteOrigin::Explicit;
+            }
             return false;
         }
-        self.remote_folders.insert(0, remote);
+        self.remote_folders.insert(0, folder);
         true
     }
 
     /// リモートフォルダを閉じる。閉じたら true
     pub fn remove_remote_folder(&mut self, remote: &crate::remote_fs::RemoteRef) -> bool {
         let before = self.remote_folders.len();
-        self.remote_folders.retain(|r| r != remote);
+        self.remote_folders.retain(|f| &f.remote != remote);
         self.remote_folders.len() != before
     }
 
     /// そのホストのフォルダをまとめて閉じる。閉じた件数を返す
     pub fn remove_remote_host(&mut self, host: &str) -> usize {
         let before = self.remote_folders.len();
-        self.remote_folders.retain(|r| r.host != host);
+        self.remote_folders.retain(|f| f.remote.host != host);
         before - self.remote_folders.len()
     }
 
@@ -232,6 +256,40 @@ impl Tab {
 mod tests {
     use super::*;
     use crate::pane::PaneOrigin;
+    use crate::remote_fs::{RemoteFolder, RemoteOrigin, RemoteRef};
+
+    /// #1041: 経路は同一性ではなく属性。同じフォルダを 2 行に増やさず、
+    /// **明示 open で開き直したときだけ**格上げする
+    #[test]
+    fn リモートフォルダの経路は明示openで格上げされ落ちない() {
+        let mut tab = Tab::new("1", Pane::new(PaneOrigin::User));
+        let home = RemoteRef::new("srv", "/srv/home");
+
+        // 自動検知で載る
+        assert!(tab.add_remote_folder(RemoteFolder::auto(home.clone())));
+        assert_eq!(tab.remote_folders().len(), 1);
+        assert_eq!(tab.remote_folders()[0].origin, RemoteOrigin::Auto);
+
+        // 同じフォルダを明示的に開き直す = **増えずに**格上げ
+        assert!(!tab.add_remote_folder(RemoteFolder::explicit(home.clone())));
+        assert_eq!(tab.remote_folders().len(), 1, "行が増えない");
+        assert_eq!(tab.remote_folders()[0].origin, RemoteOrigin::Explicit);
+
+        // 逆方向（自動での再追加）では落とさない
+        assert!(!tab.add_remote_folder(RemoteFolder::auto(home.clone())));
+        assert_eq!(tab.remote_folders()[0].origin, RemoteOrigin::Explicit);
+
+        // 新しく開いたものが先頭（表示順への変換は sidebar::remote_root_order）
+        let work = RemoteRef::new("srv", "/srv/work");
+        assert!(tab.add_remote_folder(RemoteFolder::explicit(work.clone())));
+        assert_eq!(tab.remote_refs(), vec![work.clone(), home.clone()]);
+
+        // 閉じるのは位置だけで決まる（経路を問わない）
+        assert!(tab.remove_remote_folder(&work));
+        assert_eq!(tab.remote_refs(), vec![home.clone()]);
+        assert_eq!(tab.remove_remote_host("srv"), 1);
+        assert!(tab.remote_folders().is_empty());
+    }
 
     #[test]
     fn 手動タイトルは自動に上書きされずクリアで再開する() {

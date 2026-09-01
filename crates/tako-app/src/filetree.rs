@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tako_core::remote_fs::{RemoteEntry, RemoteRef};
+use tako_core::remote_fs::{RemoteEntry, RemoteFolder, RemoteOrigin, RemoteRef};
 
 /// 1 ディレクトリの最大表示エントリ数（巨大ディレクトリの暴走防止）
 const MAX_ENTRIES: usize = 500;
@@ -92,8 +92,10 @@ pub struct FileTree {
     // リモートの POSIX パス（Windows の `/C:/...` を含む）を混ぜると
     // Windows 側で `join` / `parent` が `\\` を作って壊れる。
     // 読み込みはネットワーク I/O なので**展開したときだけ**背景で取る（ポーリングしない）
-    /// リモートルート（開いた順）
-    remote_roots: Vec<RemoteRef>,
+    /// リモートルート（開いた順・経路つき）。#1041: 経路（明示 open / `ssh` 検知）で
+    /// ローカルルートの前後どちらに出るかが決まる（規則は
+    /// `tako_core::sidebar::remote_root_order` が正本）
+    remote_roots: Vec<RemoteFolder>,
     /// 展開中のリモートディレクトリ（ルート自身も含む）
     remote_expanded: HashSet<RemoteRef>,
     /// リモートディレクトリの読み込み状態
@@ -217,11 +219,16 @@ impl FileTree {
 
     fn build_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        // A/B（`TAKO_976_LEGACY=1`）: #919 の「リモートを先頭へ hoist」へ戻す
-        if crate::ssh_folders::legacy_mode() {
-            for remote in &self.remote_roots {
-                self.collect_remote_rows(remote, 0, true, &mut rows);
-            }
+        // #1041: リモートルートをローカルの前後どちらへ出すかは
+        // `tako_core::sidebar::remote_root_order`（並び規則の正本）が決める。
+        // ここは分けてもらった 2 本を前後に並べるだけ = CLI / MCP の
+        // `remote-folder list` と必ず同じ並びになる
+        let order = tako_core::sidebar::remote_root_order(
+            &self.remote_roots,
+            crate::ssh_folders::remote_root_placement(),
+        );
+        for remote in &order.leading {
+            self.collect_remote_rows(remote, 0, true, &mut rows);
         }
         for root in &self.roots {
             let expanded = self.expanded.contains(root);
@@ -247,15 +254,13 @@ impl FileTree {
                 self.collect_rows(root, 1, &mut rows);
             }
         }
-        // #976: リモートルートは**ローカルの後ろに普通に並ぶ**。#919 は「開いた直後に
-        // 見えないと分からない」として先頭へ hoist していたが、ssh の自動検知
-        // （#976）で日常的に増えるものになったので、特別扱いをやめて
-        // 「ワークスペースフォルダが 1 つ増えた」と同じ見え方へ寄せる。
-        // 開けたことは行の SSH バッジと上部の通知で分かる
-        if !crate::ssh_folders::legacy_mode() {
-            for remote in &self.remote_roots {
-                self.collect_remote_rows(remote, 0, true, &mut rows);
-            }
+        // #976: 自動検知で増えたリモートルートは**ローカルの後ろに普通に並ぶ**。
+        // #919 は「開いた直後に見えないと分からない」として全部先頭へ hoist して
+        // いたが、ssh の自動検知（#976）で日常的に増えるものになったので、
+        // 特別扱いをやめて「ワークスペースフォルダが 1 つ増えた」と同じ見え方へ寄せた。
+        // #1041 で**明示的に開いた分だけ**先頭（上の `leading`）へ戻している
+        for remote in &order.trailing {
+            self.collect_remote_rows(remote, 0, true, &mut rows);
         }
         rows
     }
@@ -322,25 +327,48 @@ impl FileTree {
 
     // --- リモート（SSH 先）のワークスペースフォルダ（#919 / #65） -------------
 
-    /// 開いているリモートルート
-    pub fn remote_roots(&self) -> &[RemoteRef] {
+    /// 開いているリモートルート（経路つき・開いた順）
+    pub fn remote_roots(&self) -> &[RemoteFolder] {
         &self.remote_roots
     }
 
     /// リモートルートを追加する（既にあれば何もしない）。追加したら true。
     /// 追加時は展開して読み込み待ちにする = 開いた直後から中身を取りに行く
-    pub fn add_remote_root(&mut self, remote: RemoteRef) -> bool {
-        if self.remote_roots.contains(&remote) {
+    pub fn add_remote_root(&mut self, folder: RemoteFolder) -> bool {
+        if let Some(existing) = self
+            .remote_roots
+            .iter_mut()
+            .find(|f| f.remote == folder.remote)
+        {
+            // #1041: 開き直しで経路が明示へ上がることがある（自動検知で載っていた
+            // home をユーザーが選び直した = 主作業対象へ格上げ）
+            if folder.is_explicit() {
+                existing.origin = RemoteOrigin::Explicit;
+            }
             // 既に開いているものを開き直したら、内容だけ取り直す
-            self.remote_cache.remove(&remote);
-            self.remote_expanded.insert(remote);
+            self.remote_cache.remove(&folder.remote);
+            self.remote_expanded.insert(folder.remote);
             self.rows_cache = None;
             return false;
         }
-        self.remote_expanded.insert(remote.clone());
+        self.remote_expanded.insert(folder.remote.clone());
         // #976: 末尾へ積む（開いた順に並ぶ）。ローカルルートと同じ「並んだ順」の
-        // 規則にすると、リモートだけ最新が飛び込んでくる特別扱いが消える
-        self.remote_roots.push(remote);
+        // 規則にすると、リモートだけ最新が飛び込んでくる特別扱いが消える。
+        // #1041 の前後の振り分けは描画時（`build_rows`）に規則へ問う
+        self.remote_roots.push(folder);
+        self.rows_cache = None;
+        true
+    }
+
+    /// リモートルートの経路を差し替える（#1041。格上げ・格下げの反映）。変わったら true
+    pub fn set_remote_root_origin(&mut self, remote: &RemoteRef, origin: RemoteOrigin) -> bool {
+        let Some(existing) = self.remote_roots.iter_mut().find(|f| &f.remote == remote) else {
+            return false;
+        };
+        if existing.origin == origin {
+            return false;
+        }
+        existing.origin = origin;
         self.rows_cache = None;
         true
     }
@@ -348,7 +376,7 @@ impl FileTree {
     /// リモートルートを閉じる。配下の展開状態・キャッシュも落とす。閉じたら true
     pub fn remove_remote_root(&mut self, remote: &RemoteRef) -> bool {
         let before = self.remote_roots.len();
-        self.remote_roots.retain(|r| r != remote);
+        self.remote_roots.retain(|f| &f.remote != remote);
         if self.remote_roots.len() == before {
             return false;
         }

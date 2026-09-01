@@ -216,17 +216,24 @@ impl TakoApp {
 
         // #919: リモート（SSH 先）のルートはアクティブタブが持つものに合わせる。
         // ローカルの `roots` とは別の器（`PathBuf` に POSIX パスを混ぜない）
-        let want: Vec<tako_core::remote_fs::RemoteRef> =
+        let want: Vec<tako_core::remote_fs::RemoteFolder> =
             self.workspace.active_tab().remote_folders().to_vec();
         let have = self.filetree.remote_roots().to_vec();
-        for gone in have.iter().filter(|r| !want.contains(r)) {
-            self.filetree.remove_remote_root(gone);
+        for gone in have.iter().filter(|f| !want.contains(f)) {
+            self.filetree.remove_remote_root(&gone.remote);
         }
         // #976: タブは「最後に開いたものが先頭」で持つので、**逆順に足して**
         // ツリー側を「開いた順（古いものが上）」へ揃える。ローカルルートが
-        // ペインの並び順で出るのと同じ規則にするため
-        for remote in want.iter().rev().filter(|r| !have.contains(r)) {
-            self.filetree.add_remote_root(remote.clone());
+        // ペインの並び順で出るのと同じ規則にするため。
+        // #1041: 前後どちらへ出すかは描画時に経路から決まるので、ここは経路を
+        // そのまま運ぶだけ（既にあるものは経路の変化だけ反映する）
+        for folder in want.iter().rev() {
+            if have.contains(folder) {
+                self.filetree
+                    .set_remote_root_origin(&folder.remote, folder.origin);
+            } else {
+                self.filetree.add_remote_root(folder.clone());
+            }
         }
     }
     pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -1796,6 +1803,7 @@ impl TakoApp {
                     all: false,
                     force: false,
                     enabled: None,
+                    terminal: None,
                 },
                 PaneOrigin::User,
             );
@@ -1902,6 +1910,7 @@ impl TakoApp {
                         all: false,
                         force: false,
                         enabled: None,
+                        terminal: None,
                     },
                     PaneOrigin::User,
                 );
@@ -1928,6 +1937,7 @@ impl TakoApp {
                         all: false,
                         force: false,
                         enabled: None,
+                        terminal: None,
                     },
                     PaneOrigin::User,
                 );

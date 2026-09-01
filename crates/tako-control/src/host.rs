@@ -300,6 +300,26 @@ pub trait UiStateHost {
     fn remote_files_loading(&self) -> Vec<tako_core::remote_fs::RemoteRef> {
         Vec::new()
     }
+    /// リモートルートをローカルルートのどちら側に置くか（#1041）。
+    ///
+    /// 既定は #1041 の規則（明示 open は前・自動検知は後ろ）。GUI は A/B の env
+    /// （`TAKO_1041_LEGACY` / `TAKO_976_LEGACY`）でここを差し替えるので、
+    /// **`remote-folder list` の並びと画面の並びが必ず一致する**
+    fn remote_root_placement(&self) -> tako_core::sidebar::RemoteRootPlacement {
+        tako_core::sidebar::RemoteRootPlacement::default()
+    }
+
+    /// そのタブでそのホストへ**繋がっている生きたペイン**（#1041）。
+    ///
+    /// 「フォルダを開いたらターミナルも繋ぐ」が同じホストのペインを二重に作らない
+    /// ための材料。判定材料は GUI 側にしかない（tako が開いた SSH ペインの接続状態
+    /// = #1010 と、ユーザーが手で `ssh` したペインの検知 = #976 の両方を見る）。
+    ///
+    /// 既定は **None**（GUI が居なければ「無い」と答える = 繋ぎに行く側へ倒れる。
+    /// 誤って「ある」と答えると、頼まれたターミナルが黙って出てこない）
+    fn live_ssh_pane(&self, _tab: TabId, _host: &str) -> Option<PaneId> {
+        None
+    }
 
     /// ペインの `ssh` 検知によるリモートフォルダの自動追加が有効か（#976。既定 ON）
     fn ssh_auto_folders_enabled(&self) -> bool {

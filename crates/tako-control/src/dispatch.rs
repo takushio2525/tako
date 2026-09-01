@@ -4261,8 +4261,9 @@ fn dispatch_inner(
             all,
             force,
             enabled,
+            terminal,
         } => dispatch_remote_folder(
-            host, origin, &action, ssh_host, path, tab, focus, all, force, enabled,
+            host, origin, &action, ssh_host, path, tab, focus, all, force, enabled, terminal,
         ),
 
         Request::RecentItems { action } => match action.as_str() {
@@ -6096,6 +6097,7 @@ fn dispatch_remote_folder(
     all: bool,
     force: bool,
     enabled: Option<bool>,
+    terminal: Option<bool>,
 ) -> Result<Value, DispatchError> {
     use tako_core::remote_fs::{self, RemoteRef};
 
@@ -6156,7 +6158,26 @@ fn dispatch_remote_folder(
             let entries = remote_fs::list_dir(&ssh_host, &dir).map_err(to_err)?;
             let tab_id = target_tab(host, tab)?;
             let remote = RemoteRef::new(ssh_host.clone(), dir.clone());
-            let added = attach_remote_root(host, remote.clone(), tab_id);
+            // #1041: この経路（メニュー / パレット / CLI / MCP の `open`）は
+            // **明示 open** = ユーザーの主作業対象なのでツリーの先頭へ出す。
+            // `ssh` 検知の自動追加（#976）は `Auto` のまま後ろに並ぶ
+            let added = attach_remote_root(
+                host,
+                tako_core::remote_fs::RemoteFolder::explicit(remote.clone()),
+                tab_id,
+            );
+
+            // #1041: フォルダを開いたらターミナルも繋ぐ（VSCode Remote 相当）
+            let terminal_json = auto_connect_terminal(
+                host,
+                origin,
+                &ssh_host,
+                &dir,
+                tab_id,
+                focus,
+                terminal.unwrap_or(true),
+            );
+
             Ok(json!({
                 "opened": added,
                 "host": ssh_host,
@@ -6165,6 +6186,16 @@ fn dispatch_remote_folder(
                 "entries": entries.len(),
                 "tab": tab_id.as_u64(),
                 "label": remote.label(),
+                // #1041: この経路は常に明示 open。前後どちらに出るかは
+                // 並び規則（`remote_root_placement`）から出すので A/B の env でも
+                // 応答と画面が食い違わない
+                "origin": tako_core::remote_fs::RemoteOrigin::Explicit.as_str(),
+                "placement": tako_core::sidebar::remote_root_order(
+                    &[tako_core::remote_fs::RemoteFolder::explicit(remote.clone())],
+                    host.remote_root_placement(),
+                )
+                .placement_of(&remote),
+                "terminal": terminal_json,
             }))
         }
 
@@ -6197,6 +6228,7 @@ fn dispatch_remote_folder(
                 let targets: Vec<RemoteRef> = t
                     .remote_folders()
                     .iter()
+                    .map(|f| &f.remote)
                     .filter(|r| want_host.as_deref().map(|h| r.host == h).unwrap_or(true))
                     .filter(|r| want_path.as_deref().map(|p| r.path == p).unwrap_or(true))
                     .cloned()
@@ -6226,7 +6258,7 @@ fn dispatch_remote_folder(
                 .workspace()
                 .tabs()
                 .iter()
-                .flat_map(|t| t.remote_folders().iter().map(|r| r.host.clone()))
+                .flat_map(|t| t.remote_folders().iter().map(|f| f.remote.host.clone()))
                 .collect();
             for h in touched_hosts {
                 if !still_open.contains(&h) {
@@ -6239,14 +6271,30 @@ fn dispatch_remote_folder(
 
         "list" => {
             let states = host.remote_folder_states();
+            let placement = host.remote_root_placement();
             let tabs: Vec<Value> = host
                 .workspace()
                 .tabs()
                 .iter()
                 .map(|t| {
-                    let folders: Vec<Value> = t
-                        .remote_folders()
-                        .iter()
+                    // #1041: **ツリーに出ている並び**で返す（設計メモ「CLI
+                    // `remote-folder list` にも並び順が反映されること」）。
+                    // タブは新しく開いたものを先頭に持つので、表示順（開いた順）へ
+                    // 直してから `remote_root_order`（並び規則の正本）へ渡す
+                    let opened_order: Vec<tako_core::remote_fs::RemoteFolder> =
+                        t.remote_folders().iter().rev().cloned().collect();
+                    let order =
+                        tako_core::sidebar::remote_root_order(&opened_order, placement);
+                    let origin_of = |remote: &RemoteRef| {
+                        opened_order
+                            .iter()
+                            .find(|f| &f.remote == remote)
+                            .map(|f| f.origin)
+                            .unwrap_or_default()
+                    };
+                    let folders: Vec<Value> = order
+                        .display_order()
+                        .into_iter()
                         .map(|r| {
                             let found = states.iter().find(|(sr, _, _)| sr == r);
                             json!({
@@ -6258,6 +6306,9 @@ fn dispatch_remote_folder(
                                 "state": found.map(|(_, s, _)| s.clone()),
                                 "entries": found.map(|(_, _, n)| *n),
                                 "connected": remote_fs::master_alive(&r.host),
+                                // #1041: どの経路で載ったか / ローカルルートの前か後ろか
+                                "origin": origin_of(r).as_str(),
+                                "placement": order.placement_of(r),
                             })
                         })
                         .collect();
@@ -6452,21 +6503,96 @@ fn dispatch_remote_folder(
 /// #976 の自動追加は同じ確認を background で済ませてからここへ来る
 /// （UI スレッドでネットワークを待たせない = #212 / #772 の教訓）。
 /// 器づけを 1 実装にしておくのは、片方だけ `sync_filetree` を忘れると
-/// 「開いたのにツリーに出ない」形で壊れるため
+/// 「開いたのにツリーに出ない」形で壊れるため。
+///
+/// #1041: `folder` は経路（明示 open / `ssh` 検知）を持つ。ツリーの並びは
+/// `tako_core::sidebar::remote_root_order` がこの経路から決める
 pub fn attach_remote_root(
     host: &mut dyn ControlHost,
-    remote: tako_core::remote_fs::RemoteRef,
+    folder: tako_core::remote_fs::RemoteFolder,
     tab_id: TabId,
 ) -> bool {
+    let remote = folder.remote.clone();
     let added = host
         .workspace_mut()
         .get_tab_mut(tab_id)
-        .map(|t| t.add_remote_folder(remote.clone()))
+        .map(|t| t.add_remote_folder(folder))
         .unwrap_or(false);
     host.set_filetree(true);
     host.sync_filetree();
     host.request_remote_dir(&remote);
     added
+}
+
+/// フォルダを開いたときにターミナルも同じホストへ繋ぐ（#1041）。
+///
+/// VSCode Remote / Zed の「リモートで開く」と同じ体験（SSH 済み + そのフォルダへ
+/// `cd` 済みのペインが同じタブに用意される）。**既定 ON**（#322「既定を賢く」）で、
+/// 同じタブに同じホストへ繋がった生きたペインがあれば作らない。
+///
+/// 戻り値は `open` 応答の `terminal` オブジェクト。**繋げなかったときは必ず理由**を
+/// 載せる（黙って何もしない状態を作らない = #919 の原則）。ペインを作れなくても
+/// フォルダは開いたまま残す（#1041 受け入れ条件 3）。
+///
+/// `pub` にしているのは、GUI のセルフテストが**この 1 実装をそのまま**叩いて
+/// 「新しいペインが立つ / 2 回目は増えない」を機械検証するため
+/// （`open` そのものは実 SFTP 接続が要るのでセルフテストから通せない）。
+pub fn auto_connect_terminal(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    ssh_host: &str,
+    dir: &str,
+    tab_id: TabId,
+    focus: Option<bool>,
+    requested: bool,
+) -> Value {
+    use tako_core::remote_open::{AutoTerminal, AutoTerminalSkip};
+
+    let existing = host.live_ssh_pane(tab_id, ssh_host).map(|p| p.as_u64());
+    match tako_core::remote_open::decide_auto_terminal(requested, existing) {
+        AutoTerminal::Connect => {
+            let opened = dispatch(
+                host,
+                Request::OpenRemote {
+                    host: ssh_host.to_string(),
+                    focus,
+                    remote_dir: Some(dir.to_string()),
+                    // 自動経路は**常に新しいペイン**（既存ペインを乗っ取らない。
+                    // 理由は `tako_core::remote_open` の #1041 の節）
+                    target: Some(tako_core::remote_open::auto_terminal_target()),
+                    pane: None,
+                    tab: Some(tab_id.as_u64()),
+                    direction: None,
+                },
+                origin,
+            );
+            match opened {
+                Ok(v) => json!({
+                    "connected": true,
+                    "pane": v["pane"],
+                    "tab": v["tab"],
+                    "target": v["target"],
+                    "remote_dir": v["remote_dir"],
+                }),
+                Err(e) => json!({
+                    "connected": false,
+                    "reason": "failed",
+                    "note": e.to_string(),
+                }),
+            }
+        }
+        AutoTerminal::Skip(skip) => {
+            let mut v = json!({
+                "connected": false,
+                "reason": skip.as_str(),
+                "note": skip.note(),
+            });
+            if let AutoTerminalSkip::AlreadyConnected { pane } = skip {
+                v["pane"] = json!(pane);
+            }
+            v
+        }
+    }
 }
 
 /// アカウントレジストリの CRUD（Issue #504 / #512）。host 非依存

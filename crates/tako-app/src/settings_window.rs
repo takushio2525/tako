@@ -2699,6 +2699,7 @@ impl SettingsWindow {
                                 all: false,
                                 force: false,
                                 enabled: Some(!ssh_auto_folders),
+                                terminal: None,
                             },
                             cx,
                         );

@@ -72,6 +72,22 @@ pub fn opened(label: &str) -> String {
     )
 }
 
+/// フォルダを開いてターミナルも繋いだ（#1041）
+pub fn opened_with_terminal(label: &str) -> String {
+    tr!(
+        format!("リモートフォルダを開き、ターミナルを {label} へ繋いでいます"),
+        format!("Opened remote folder and connecting a terminal to {label}")
+    )
+}
+
+/// フォルダは開いたがターミナルは繋がなかった（#1041。理由つき）
+pub fn opened_terminal_skipped(label: &str, note: &str) -> String {
+    tr!(
+        format!("リモートフォルダを開きました: {label}（ターミナルは繋いでいません: {note}）"),
+        format!("Opened remote folder: {label} (no terminal: {note})")
+    )
+}
+
 /// フォルダを閉じた
 pub fn closed(label: &str) -> String {
     tr!(

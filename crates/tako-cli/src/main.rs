@@ -457,7 +457,8 @@ enum OpenInCommand {
 /// リモートフォルダの操作（#919 / #65）。MCP `tako_remote_folder` と 1:1
 #[derive(Subcommand)]
 enum RemoteFolderCommand {
-    /// SSH 先のフォルダをファイルツリーに開く（接続に失敗したら開かず理由を返す）
+    /// SSH 先のフォルダをファイルツリーに開く（接続に失敗したら開かず理由を返す）。
+    /// 既定でそのホストへ SSH 済み + そのフォルダへ cd 済みのターミナルも用意する（#1041）
     Open {
         /// ~/.ssh/config の Host 名
         host: String,
@@ -466,6 +467,9 @@ enum RemoteFolderCommand {
         /// 対象タブ ID（省略時はアクティブタブ）
         #[arg(long)]
         tab: Option<u64>,
+        /// ターミナルは繋がず、ファイルツリーへ開くだけにする（#1041）
+        #[arg(long)]
+        no_terminal: bool,
     },
     /// 開いているリモートフォルダを閉じる（既定は全タブ横断）
     Close {
@@ -6696,7 +6700,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::SshHosts => Request::SshHosts,
         Command::RemoteFolder(sub) => match sub {
-            RemoteFolderCommand::Open { host, path, tab } => Request::RemoteFolder {
+            RemoteFolderCommand::Open {
+                host,
+                path,
+                tab,
+                no_terminal,
+            } => Request::RemoteFolder {
                 action: "open".into(),
                 host: Some(host.clone()),
                 path: path.clone(),
@@ -6705,6 +6714,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: Some(!no_terminal),
             },
             RemoteFolderCommand::Close {
                 host,
@@ -6720,6 +6730,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: *all,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             RemoteFolderCommand::List => Request::RemoteFolder {
                 action: "list".into(),
@@ -6730,6 +6741,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             RemoteFolderCommand::Ls { host, path } => Request::RemoteFolder {
                 action: "ls".into(),
@@ -6740,6 +6752,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             RemoteFolderCommand::OpenFile {
                 host,
@@ -6754,6 +6767,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             RemoteFolderCommand::SshPane {
                 host,
@@ -6768,6 +6782,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             RemoteFolderCommand::Pending { host, path } => Request::RemoteFolder {
                 action: "pending".into(),
@@ -6778,6 +6793,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: None,
+                terminal: None,
             },
             RemoteFolderCommand::Auto { state } => Request::RemoteFolder {
                 action: "auto".into(),
@@ -6788,6 +6804,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: false,
                 enabled: state.as_deref().map(|s| s == "on"),
+                terminal: None,
             },
             RemoteFolderCommand::Push { host, path, force } => Request::RemoteFolder {
                 action: "push".into(),
@@ -6798,6 +6815,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 all: false,
                 force: *force,
                 enabled: None,
+                terminal: None,
             },
         },
         Command::Task(sub) => match sub {
