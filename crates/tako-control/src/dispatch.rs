@@ -2997,7 +2997,12 @@ fn dispatch_inner(
 
         // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
         Request::RemoteAgents => {
-            crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)
+            let mut result =
+                crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)?;
+            // #1069: 公式リンクは HTTP の /api/agents と同じ 1 実装で付ける
+            // （AI が見る値とスマホの一覧が食い違わない = 開発不変条件）
+            crate::claude_remote_link::attach_to_agents(&mut result);
+            Ok(result)
         }
 
         Request::RemoteMessages { session_id, tail } => {
@@ -3957,8 +3962,10 @@ fn dispatch_inner(
                     id.ok_or_else(|| DispatchError::InvalidParams("resume には id が必要".into()))?;
                 dispatch_sessions_resume(host, origin, &id, pane, tab, direction)
             }
+            // #1069: Claude 公式 Remote Control の session URL
+            "link" => dispatch_sessions_link(host, origin, id.as_deref(), pane),
             other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（list / show / resume のいずれか）"
+                "不明な action: {other:?}（list / show / resume / link のいずれか）"
             ))),
         },
 
@@ -5229,6 +5236,84 @@ fn dispatch_logs_read(
 /// セッションカタログからの会話復元（Issue #112 A）。
 /// 該当エントリの cwd でシェルペインを分割起動し、`claude --resume <session_id>` を
 /// 注入する（#30 の復元経路と同方式。Claude 終了後もシェルが残る）
+/// #1069: ペイン（または session id）の Claude 公式リンクを返す。
+///
+/// **`/api/agents` / `/api/v2/panes` と同じ 1 実装**（`link_for_agent_session`）を
+/// 通すので 3 経路の値が食い違わない。解決順は
+/// `id` 明示 → `pane` 明示 → 呼び出し元ペイン → アクティブタブのフォーカスペイン。
+///
+/// ペイン → セッションは live 解決（`claude agents --json` の pid 祖先辿り）→
+/// セッションカタログの順（`/api/v2/panes` と同じ規則）
+fn dispatch_sessions_link(
+    host: &mut dyn ControlHost,
+    _origin: PaneOrigin,
+    id_prefix: Option<&str>,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    // id 明示: カタログで前方一致を解いてから引く（agent 種別もカタログから取る）
+    if let Some(prefix) = id_prefix {
+        let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
+        let (session_id, entry) = catalog
+            .resolve_id(prefix)
+            .map_err(DispatchError::Operation)?;
+        let agent = entry.agent.as_deref().unwrap_or("claude");
+        let link = crate::claude_remote_link::link_for_agent_session(agent, Some(session_id));
+        return Ok(json!({
+            "session_id_resolved": session_id,
+            "agent": agent,
+            "pane": entry.pane,
+            "remote_link": link.to_json(),
+        }));
+    }
+
+    // ペイン解決（`sessions resume` と同じフォールバック = tako 外の CLI からも引ける）
+    let (_tab_id, pane_id) = match resolve_pane(host.workspace(), pane) {
+        Ok(resolved) => resolved,
+        Err(_) if pane.is_none() => {
+            let active = host.workspace().active_tab();
+            (active.id(), active.tree().focused())
+        }
+        Err(e) => return Err(e),
+    };
+
+    // agent 種別はペインの role から推定する（`list_to_api_v2` と同じ規則）。
+    // role が無いペインは claude 前提で引き、繋がっていなければ not_connected になる
+    let role = host
+        .workspace()
+        .get_tab(_tab_id)
+        .and_then(|tab| {
+            tab.tree()
+                .panes()
+                .into_iter()
+                .find(|p| p.id() == pane_id)
+                .and_then(|p| p.role().map(str::to_string))
+        })
+        .unwrap_or_default();
+    let agent = if role.contains("codex") {
+        "codex"
+    } else if role.contains("agy") {
+        "agy"
+    } else {
+        "claude"
+    };
+
+    // live 解決 → 器なしの pid 経路 → カタログ。
+    // 2 段目が要るのは、**器（tmux / psmux）を持たない構成**では
+    // `backend_session` が無く 1 段目が必ず空振りするから（#728 と同じ二段構え）。
+    // 器なしの手がかりは PTY 直下の子 pid で、`list_agents_for_scan` が
+    // 祖先辿りで `tako_pane` を付けてくれる（同じ 1 実装を通す）
+    let session_id = resolve_session_id_for_pane_via_host(host, pane_id)
+        .or_else(|| resolve_session_id_for_pane_via_pid(host, pane_id))
+        .or_else(|| crate::sessions::resolve_session_for_pane(&pane_id.as_u64().to_string()));
+    let link = crate::claude_remote_link::link_for_agent_session(agent, session_id.as_deref());
+    Ok(json!({
+        "pane": pane_id.as_u64(),
+        "agent": agent,
+        "session_id_resolved": session_id,
+        "remote_link": link.to_json(),
+    }))
+}
+
 fn dispatch_sessions_resume(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
@@ -7116,6 +7201,24 @@ fn resolve_spawn_pane_fallback(
 fn resolve_session_id_for_pane_via_host(host: &dyn ControlHost, pane_id: PaneId) -> Option<String> {
     let backend = host.backend_session(pane_id)?;
     crate::agents::resolve_session_id_for_backend(&backend)
+}
+
+/// 器を持たないペインの session_id を PTY 直下の子 pid から解決する（#728 の二段構え）。
+///
+/// `backend_session` が無い構成（Windows で psmux 未導入 / tmux 不在の macOS /
+/// `TAKO_PERSIST=0`）では器のセッション名で引けないので、
+/// `list_agents_for_scan` に「(tako のペイン ID, PTY 子 pid)」を渡して
+/// 祖先辿りで対応付けてもらう
+fn resolve_session_id_for_pane_via_pid(host: &dyn ControlHost, pane_id: PaneId) -> Option<String> {
+    let child = host.session(pane_id)?.child_pid()?;
+    let agents = crate::agents::list_agents_for_scan(&[(pane_id.as_u64(), child)]).ok()?;
+    agents["agents"]
+        .as_array()?
+        .iter()
+        .find(|a| a["tako_pane"].as_u64() == Some(pane_id.as_u64()))
+        // **正規化後のキー**（`agents::list_agents_*` が `sessionId` を `session_id` へ直す）
+        .and_then(|a| a["session_id"].as_str())
+        .map(str::to_string)
 }
 
 /// #364: worker の報告内容を取得する。

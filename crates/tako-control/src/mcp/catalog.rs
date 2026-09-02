@@ -2900,18 +2900,26 @@ pub fn tools() -> Vec<Value> {
                 action=resume: ペイン / タブ / 永続化の器（tmux / psmux）が全滅していても、記録された cwd で\
                 新しいペインを分割起動し `claude --resume <session_id>` で会話文脈ごと復元する。\
                 「昨日の #159 の子を呼び戻して」のような依頼は list で特定 → resume で復元する。\
-                制限: resume は claude セッションのみ（codex / agy は list に載るが復元不可）。",
+                action=link: そのペイン（または id）の会話を Claude 公式アプリ / claude.ai で開くための\
+                session URL を返す（#1069）。「スマホから続きを見たい」に答える経路。\
+                応答の remote_link.state は connected（url あり）/ not_connected（まだ繋いでいない）/\
+                ineligible: <理由>（この環境では繋げない）/ unknown（会話が特定できない）で、\
+                繋がっていないときは url を返さない（捏造しない）。繋ぐには\
+                tako_orchestrator_profiles で remote_control: true にしてから起動し直す。\
+                remote_link.account_label はどの tako アカウント配下のセッションかで、\
+                スマホが別アカウントでログインしていると一覧に出ないので切り分けに使う。\
+                制限: resume / link は claude セッションのみ（codex / agy は list に載るが復元・委譲不可）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "show", "resume"],
+                        "enum": ["list", "show", "resume", "link"],
                         "description": "操作種別",
                     },
                     "id": {
                         "type": "string",
-                        "description": "session_id（前方一致可。show / resume で必須）",
+                        "description": "session_id（前方一致可。show / resume で必須。link では pane と排他の任意指定）",
                     },
                     "role": {
                         "type": "string",
@@ -2928,7 +2936,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "pane": {
                         "type": "integer",
-                        "description": "resume の分割元ペイン ID（省略時は呼び出し元）",
+                        "description": "resume の分割元ペイン ID / link の対象ペイン ID（省略時は呼び出し元）",
                     },
                     "tab": {
                         "type": "integer",
