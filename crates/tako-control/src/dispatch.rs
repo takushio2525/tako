@@ -2710,6 +2710,7 @@ fn dispatch_inner(
             limit_resume,
             clear_limit_resume,
             bypass_sandbox,
+            remote_control,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2749,6 +2750,7 @@ fn dispatch_inner(
             limit_resume,
             clear_limit_resume,
             bypass_sandbox,
+            remote_control,
         }),
 
         // #504: アカウントレジストリの CRUD
@@ -5452,6 +5454,9 @@ pub struct ProfilesParams {
     /// codex の `--dangerously-bypass-approvals-and-sandbox` を許可するか（Issue #981）。
     /// bool 1 つで表せる方針なので clear は要らない（false が「既定へ戻す」）
     pub bypass_sandbox: Option<bool>,
+    /// claude の会話を Claude 公式の Remote Control へ繋ぐか（Issue #1068）。
+    /// bypass_sandbox と同じ理由で clear は要らない（false が「繋がない」= 既定）
+    pub remote_control: Option<bool>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -5571,6 +5576,41 @@ fn profile_to_json(
             "codex は承認スキップとサンドボックス解除が同じフラグ（--dangerously-bypass-approvals-and-sandbox）なので、bypass_sandbox が false のあいだ skip_permissions は効きません（コマンド実行に承認プロンプトが出ます）。\n  外す場合は `--bypass-sandbox true`（サンドボックスと承認が両方無効になります）"
         ));
         v["warnings"] = Value::Array(warnings);
+    }
+    // Remote Control の opt-in（#1068）。値そのものは常に返す（bypass_sandbox と同じ理由 =
+    // 会話が外へ同期されるかどうかは安全に関わるので隠さない）
+    v["remote_control"] = json!(profile.remote_control_enabled());
+    // **今 spawn したらどうなるか**も返す。opt-in していても環境が不適格なら
+    // フラグは付かないので、設定値だけを見せると「繋がっているはず」の誤解を作る
+    if profile.remote_control_enabled() {
+        let decision = orchestrator::master_remote_control_decision(profile);
+        match decision {
+            Ok(d) => {
+                v["remote_control_effective"] = json!(d.enabled());
+                if let Some(blocked) = d.blocked {
+                    v["remote_control_blocked"] = json!({
+                        "kind": blocked.kind(),
+                        "detail": blocked.detail(),
+                        "reason": blocked.reason().text(),
+                        "next_step": blocked.next_step().text(),
+                    });
+                    let mut warnings: Vec<Value> =
+                        v["warnings"].as_array().cloned().unwrap_or_default();
+                    warnings.push(json!(format!(
+                        "remote_control: true ですが、この環境では有効にできません（{}）。\n  {} / {}",
+                        blocked.detail(),
+                        blocked.reason().text(),
+                        blocked.next_step().text()
+                    )));
+                    v["warnings"] = Value::Array(warnings);
+                }
+            }
+            // アカウント / master_agent の解決に失敗する状態は既存の警告が出す領分。
+            // ここでは「判断できなかった」ことだけを残す（嘘の true を書かない）
+            Err(_) => v["remote_control_effective"] = Value::Null,
+        }
+    } else {
+        v["remote_control_effective"] = json!(false);
     }
     v
 }
@@ -5876,6 +5916,11 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 // codex のサンドボックス解除（#981）
                 if let Some(v) = params.bypass_sandbox {
                     profile.bypass_sandbox = v;
+                }
+                // Remote Control の opt-in（#1068）。false は「明示的に繋がない」なので
+                // None（未設定）と区別せず false を書く（既定と同じ挙動 = 冪等）
+                if let Some(v) = params.remote_control {
+                    profile.remote_control = Some(v);
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
@@ -7618,6 +7663,9 @@ fn dispatch_git_resolve_agent(
     let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
         .map_err(|e| DispatchError::Operation(e.message()))?;
     let launch = profile.resolve_agent_launch(worker_agent, None, None);
+    // Remote Control（#1068）。判定は起動コマンドの組み立てと同じ 1 実装を通す
+    let remote_control =
+        orchestrator::remote_control_decision(&profile, worker_agent, &profile_env);
 
     // 分割先タブの解決（tab 指定 > 呼び出し元ペインのタブ）。
     // Issue #496「押すと**同じタブ内に**エージェントのペインを立て」
@@ -7659,6 +7707,9 @@ fn dispatch_git_resolve_agent(
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
         allow_sandbox_bypass: launch.allow_sandbox_bypass,
+        // Remote Control（#1068）: opt-in かつ適格なときだけ付く。
+        // 不適格なら flag は None になり、理由は `remote_control` に残る
+        remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
         env: &profile_env,
     });
@@ -7850,6 +7901,11 @@ fn dispatch_orchestrator_spawn(
         .as_ref()
         .and_then(|a| a.default_effort.as_deref()));
     let launch = profile.resolve_agent_launch(worker_agent, effective_model, effective_effort);
+    // Remote Control（#1068）。opt-in が無ければ何も起きない。
+    // opt-in なのに不適格なら、フラグは付けずに理由を spawn 応答の warnings へ載せる
+    // （無言で「繋がっているはず」にしない）
+    let remote_control =
+        orchestrator::remote_control_decision(&profile, worker_agent, &profile_env);
     let window_title = match label {
         Some(l) => format!("{project}: {l}"),
         None => format!("{project}-worker"),
@@ -7899,6 +7955,9 @@ fn dispatch_orchestrator_spawn(
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
         allow_sandbox_bypass: launch.allow_sandbox_bypass,
+        // Remote Control（#1068）: opt-in かつ適格なときだけ付く。
+        // 不適格なら flag は None になり、理由は `remote_control` に残る
+        remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
         env: &profile_env,
     });
@@ -8063,6 +8122,25 @@ fn dispatch_orchestrator_spawn(
     // #368: spawn 完了 → claude session スキャンを即時トリガー
     crate::request_claude_scan();
 
+    // #1068: opt-in しているのに Remote Control が有効にならなかったときは理由を残す。
+    // ここで黙ると「スマホの一覧に出ない」の原因が辿れなくなる
+    if let Some(blocked) = &remote_control.blocked {
+        let message = format!(
+            "remote_control: true ですが有効にできませんでした（{}）。{} / {}",
+            blocked.detail(),
+            blocked.reason().text(),
+            blocked.next_step().text()
+        );
+        eprintln!("warning: {message}");
+        launch_warnings.push(json!({
+            "kind": format!("remote_control_{}", blocked.kind()),
+            "agent": worker_agent.as_str(),
+            "message": message,
+            "detail": blocked.detail(),
+            "next_step": blocked.next_step().text(),
+        }));
+    }
+
     // Part 4: env のキー一覧（値はマスク。Issue #500）
     let env_keys: Vec<&str> = profile_env.export_keys();
     // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める。
@@ -8095,6 +8173,9 @@ fn dispatch_orchestrator_spawn(
         // #822: この worker に適用された利用上限後の自動復帰（FR-2.27）。
         // true なら `tako limit-resume --pane <id>` で切らない限り自動復帰の対象
         "limit_resume": limit_resume_applied,
+        // #1068: この worker の会話が Claude 公式の Remote Control へ繋がるか。
+        // opt-in していても環境が不適格ならここは false（理由は warnings に入る）
+        "remote_control": remote_control.enabled(),
         // #983: spawn は成立したが完全ではなかったもの（分類 + 理由 + 次の一手）。
         // 空配列 = 何も問題が無かった
         "warnings": launch_warnings,

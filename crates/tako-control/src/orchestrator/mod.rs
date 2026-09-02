@@ -691,6 +691,9 @@ pub struct ResolvedWorkerLaunch {
     /// プロファイルの `bypass_sandbox`（Issue #981）。codex worker の
     /// `--dangerously-bypass-approvals-and-sandbox` はこれが true のときだけ付く
     pub allow_sandbox_bypass: bool,
+    /// プロファイルの `remote_control`（Issue #1068）。claude worker の
+    /// `--remote-control` はこれが true でかつ適格なときだけ付く
+    pub remote_control: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -804,6 +807,26 @@ pub struct Profile {
     /// 頃の挙動が保たれる。新規プロファイルは false = 安全側
     #[serde(default)]
     pub bypass_sandbox: bool,
+
+    /// このプロファイルで起動する claude セッションを Claude 公式の **Remote Control**
+    /// へ繋ぐか（Issue #1068 / エピック #1059。省略時 false = 繋がない）。
+    ///
+    /// true にすると master / solo / worker の claude 起動コマンドへ `--remote-control` が付き、
+    /// その会話を claude.ai と Claude モバイルアプリから操作できるようになる。
+    ///
+    /// **既定を false にしているのは挙動を静かに変えないため**: 委譲した会話は
+    /// Anthropic のサーバーにも transcript が保存され、認証は claude.ai アカウントへ移る
+    /// （tako の機器ペアリングと role 4 段はその会話には効かない）。
+    /// tako の現行モデルは「会話はローカルに閉じている」なので、明示 opt-in にする。
+    ///
+    /// claude 以外の系統（codex / agy）には相当する仕組みが無いため何も付かない
+    /// （`agent_support::keys::REMOTE_CONTROL` の宣言が正）。
+    ///
+    /// `skip_serializing_if` を付けている（= 未設定なら書き出さない）ので、
+    /// **既存の profiles/*.yaml はバイト単位で不変**。旧ファイルは serde の default で
+    /// false として読めるため移行の `Step` は要らない（#916 の規約に対する明示的な選択）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_control: Option<bool>,
 }
 
 /// master / claude worker の既定 effort
@@ -840,6 +863,7 @@ impl Default for Profile {
             auto_handoff: None,
             limit_resume: None,
             bypass_sandbox: false,
+            remote_control: None,
         }
     }
 }
@@ -1125,6 +1149,11 @@ impl Profile {
         Ok(self.resolved_env_plan_with_account(account.as_ref()))
     }
 
+    /// Remote Control の opt-in（Issue #1068）。**未設定は false**（既定で繋がない）
+    pub fn remote_control_enabled(&self) -> bool {
+        self.remote_control.unwrap_or(false)
+    }
+
     /// env のキー一覧を返す（値はマスクされた形。CLI/MCP 出力用。Issue #500）
     pub fn env_keys_masked(&self) -> Vec<(String, String)> {
         self.env
@@ -1173,6 +1202,7 @@ impl Profile {
                 .map(|c| c.skip_permissions)
                 .unwrap_or_else(|| agent.default_skip_permissions()),
             allow_sandbox_bypass: self.bypass_sandbox,
+            remote_control: self.remote_control_enabled(),
             extra_args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
         }
     }
@@ -1790,6 +1820,9 @@ pub fn build_master_cmd_in(
     // master_account があれば worker と同じ規則でアカウントの config dir を反映する
     // （未登録アカウントはここで Err = 起動前に落ちる。Issue #547）
     let plan = profile.resolved_env_plan_for_master()?;
+    // Remote Control（#1068）は claude だけ・opt-in だけ・適格なときだけ。
+    // 判定材料は「起動先が実際に見る env」なので plan を反映した後で集める
+    let remote_control = remote_control_decision(profile, agent, &plan);
     let mut cmd = String::new();
     for k in &plan.unsets {
         cmd.push_str(&lc::unset_prefix(dialect, k));
@@ -1815,6 +1848,11 @@ pub fn build_master_cmd_in(
                 " --append-system-prompt-file {}",
                 lc::quote_always(dialect, &prompt_path.display().to_string())
             ));
+            // Remote Control（#1068）。opt-in が無ければ 1 バイトも変わらない
+            if let Some(flag) = remote_control.flag {
+                cmd.push(' ');
+                cmd.push_str(flag);
+            }
         }
         WorkerAgent::Codex => {
             if let Some(model) = profile.model.as_deref() {
@@ -1861,6 +1899,36 @@ pub fn build_master_cmd_in(
         WorkerAgent::Agy => unreachable!("agy は resolve_master_agent で拒否される"),
     }
     Ok(cmd)
+}
+
+/// Remote Control（#1068）を付けるかどうかの決定。
+///
+/// **判定を 1 箇所に集める**ので、起動コマンドの組み立てと「画面に出す 1 行」と
+/// CLI / MCP の応答が同じ答えを返す（食い違うと「有効なのに見えない」の切り分けが
+/// できなくなる）。`plan` は起動時に注入される env 計画で、
+/// 起動先プロセスが実際に見る env を再現するために要る。
+///
+/// `TAKO_1068_LEGACY=1` のときは opt-in を無視して常に付けない（A/B の逃げ道）
+pub fn remote_control_decision(
+    profile: &Profile,
+    agent: WorkerAgent,
+    plan: &EnvPlan,
+) -> crate::claude_remote::RemoteControlDecision {
+    if crate::claude_remote::legacy_never_remote_control() {
+        return crate::claude_remote::RemoteControlDecision::off();
+    }
+    let facts = crate::claude_remote::collect_facts(agent.as_str(), plan);
+    crate::claude_remote::decide(profile.remote_control_enabled(), &facts)
+}
+
+/// master / solo 起動での決定（env 計画とエージェント種別を自分で解決する版）。
+/// `tako master` / `tako solo` が起動前の 1 行を出すために使う
+pub fn master_remote_control_decision(
+    profile: &Profile,
+) -> Result<crate::claude_remote::RemoteControlDecision, String> {
+    let agent = profile.resolve_master_agent()?;
+    let plan = profile.resolved_env_plan_for_master()?;
+    Ok(remote_control_decision(profile, agent, &plan))
 }
 
 /// worker 起動用のコマンドを組み立てる（エージェント種別対応は
@@ -3827,6 +3895,124 @@ prompt_blocks:
             "codex master/solo は opt-in すれば承認スキップ"
         );
         assert!(cmd.contains("mcp_servers.tako.command"));
+    }
+
+    // --- #1068: Remote Control は明示 opt-in（claude だけ） ---------------------
+
+    /// 受け入れ条件 2: opt-in していないと `--remote-control` が付かない
+    /// （**既定の挙動は 1 バイトも変わらない**）
+    #[test]
+    fn claude_masterは既定でremote_controlを付けない() {
+        let baseline = Profile::default();
+        let cmd = build_master_cmd_in("master:x", &baseline, Path::new("/tmp/p.md"), "tako", POSIX)
+            .unwrap();
+        assert!(
+            !cmd.contains("--remote-control"),
+            "既定で会話を外へ同期させてはいけない: {cmd}"
+        );
+        // 従来の要素は全部そのまま
+        assert!(cmd.contains("claude"));
+        assert!(cmd.contains("--effort max"));
+        assert!(cmd.contains("--append-system-prompt-file"));
+    }
+
+    /// 受け入れ条件 1: opt-in したら付く（判定は純粋関数なので env に触らず検証する）
+    #[test]
+    fn claude_masterはoptinでremote_controlを付ける() {
+        let p = Profile {
+            remote_control: Some(true),
+            ..Default::default()
+        };
+        // 素の環境（阻害 env 無し）で組み立てた形を直接確かめる
+        let facts = crate::claude_remote::EligibilityFacts {
+            env: vec![],
+            disabled_by_policy: None,
+            agent: "claude".into(),
+        };
+        let decision = crate::claude_remote::decide(p.remote_control_enabled(), &facts);
+        assert_eq!(
+            decision.flag,
+            Some(crate::claude_remote::REMOTE_CONTROL_FLAG),
+            "opt-in したのにフラグが決まらない"
+        );
+        // build_master_cmd_in はプロセス env を見るので、ここでは
+        // 「フラグが決まればコマンドの末尾に付く」ことを組み立て側で確かめる
+        let cmd =
+            build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
+        // この機の env に阻害要因が無ければ付く。阻害要因がある機でも
+        // 「付いていないなら理由がある」ことを同時に確かめる（CI 環境差で落ちない）
+        let live = remote_control_decision(&p, WorkerAgent::Claude, &EnvPlan::default());
+        assert_eq!(
+            cmd.contains("--remote-control"),
+            live.enabled(),
+            "組み立てと判定が食い違っている: {cmd}"
+        );
+        assert!(
+            live.enabled() || live.blocked.is_some(),
+            "付かないなら理由が要る（無言で落とさない）"
+        );
+    }
+
+    /// 受け入れ条件 3: 不適格な env では付かず、理由が残る（`DISABLE_TELEMETRY` 注入）。
+    /// プロファイルの env 経由で注入するので、**プロセス env を汚さずに**検証できる
+    #[test]
+    fn 不適格な環境ではremote_controlを付けず理由を残す() {
+        let mut p = Profile {
+            remote_control: Some(true),
+            ..Default::default()
+        };
+        p.env.insert("DISABLE_TELEMETRY".into(), "1".into());
+        let cmd =
+            build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
+        assert!(
+            !cmd.contains("--remote-control"),
+            "不適格な環境でフラグを付けると claude が起動時に落ちる: {cmd}"
+        );
+        // env の注入自体は従来どおり行われる（起動は成立する）
+        assert!(cmd.contains("DISABLE_TELEMETRY"), "{cmd}");
+        let decision = master_remote_control_decision(&p).unwrap();
+        let blocked = decision.blocked.expect("理由が要る");
+        assert_eq!(blocked.kind(), "feature_flags_disabled");
+        assert_eq!(blocked.detail(), "DISABLE_TELEMETRY");
+    }
+
+    /// codex master には `--remote-control` を渡さない（同名フラグが別物）
+    #[test]
+    fn codex_masterにはremote_controlを渡さない() {
+        for opt_in in [false, true] {
+            let p = Profile {
+                master_agent: Some("codex".into()),
+                remote_control: Some(opt_in),
+                ..Default::default()
+            };
+            let cmd =
+                build_master_cmd_in("master:x", &p, Path::new("/tmp/p.md"), "tako", POSIX).unwrap();
+            assert!(
+                !cmd.contains("--remote-control"),
+                "codex の remote-control は自前ホストの app-server 経路で別物: {cmd}"
+            );
+        }
+    }
+
+    /// solo も同じ組み立てを通るので同じ規則で効く（#1068 の対象 4 経路のうち 1 つ）
+    #[test]
+    fn soloもremote_controlの規則に従う() {
+        let off = Profile::default();
+        let cmd =
+            build_master_cmd_in("solo", &off, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
+        assert!(!cmd.contains("--remote-control"), "{cmd}");
+        let on = Profile {
+            remote_control: Some(true),
+            ..Default::default()
+        };
+        let live = remote_control_decision(&on, WorkerAgent::Claude, &EnvPlan::default());
+        let cmd_on =
+            build_master_cmd_in("solo", &on, Path::new("/tmp/solo.md"), "tako", POSIX).unwrap();
+        assert_eq!(
+            cmd_on.contains("--remote-control"),
+            live.enabled(),
+            "{cmd_on}"
+        );
     }
 
     // --- #981: codex のサンドボックス解除は明示 opt-in --------------------------

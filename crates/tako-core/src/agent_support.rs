@@ -267,6 +267,8 @@ pub mod keys {
     pub const MASTER_MCP: &str = "master_mcp";
     /// master への system prompt 注入
     pub const MASTER_SYSTEM_PROMPT: &str = "master_system_prompt";
+    /// ベンダー公式のリモート操作（スマホアプリ / Web）への会話の委譲
+    pub const REMOTE_CONTROL: &str = "remote_control";
     /// セッションカタログへの登録
     pub const SESSIONS_CATALOG: &str = "sessions_catalog";
     /// セッションの resume
@@ -441,6 +443,18 @@ pub mod notes {
     pub const LOCAL_HARNESS_UNDECIDED: Note = Note::new(
         "ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）",
         "The local-LLM harness is not decided yet, so this is undetermined (present if it borrows the codex TUI in #990, absent on the non-TUI path in #991)",
+    );
+
+    /// #1068 の実測（codex 0.150.1）。`remote-control` はあるが**別の形**
+    pub const CODEX_SELF_HOSTED_REMOTE: Note = Note::new(
+        "codex にも remote-control（experimental）はあるが、これは自前で app-server デーモンを立てて websocket + bearer トークンで TUI を繋ぐ形で、ベンダー側のスマホアプリへ会話を出すものではない。tako 側の配線も無い",
+        "codex does have an (experimental) remote-control, but it is a self-hosted app-server daemon that a TUI connects to over websocket with a bearer token: it does not surface the conversation in a vendor mobile app. tako has no plumbing for it either",
+    );
+
+    /// #1068 の実測（agy 1.1.23）。フラグ・サブコマンドの全件にリモート操作が無い
+    pub const AGY_NO_REMOTE_CONTROL: Note = Note::new(
+        "agy の `--help` 全件（フラグ 24 / サブコマンド 11）にリモート操作の口が無い（`mic-serve` はマイクを別ホストへ配るだけ）ので、会話を外の端末から操作する手段がそもそも無い",
+        "The full agy `--help` surface (24 flags, 11 subcommands) has no remote-control entry point at all (`mic-serve` only shares a microphone with another host), so there is no way to drive the conversation from another device",
     );
 
     /// ローカルで動かすモデルに利用上限という概念が無い
@@ -773,6 +787,25 @@ pub const MATRIX: &[AgentFeature] = &[
             "claude は --append-system-prompt-file、codex は developer_instructions で注入する \
              （orchestrator/mod.rs）。agy の注入手段（custom agent 定義の起動時選択）は \
              公式ドキュメントに記載が無く #987 で実機確認する",
+        ),
+    },
+    AgentFeature {
+        key: keys::REMOTE_CONTROL,
+        summary: Note::new(
+            "会話をベンダー公式のリモート操作（スマホアプリ / Web）へ委譲できる（#1068）",
+            "The conversation can be delegated to the vendor's official remote control (mobile app / web) (#1068)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::CODEX_SELF_HOSTED_REMOTE, 1059),
+        agy: unsupported(notes::AGY_NO_REMOTE_CONTROL),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1068 の実測（2026-09-02）: claude 2.1.232 の `--help` に \
+             `--remote-control [name]  Start an interactive session with Remote Control enabled` が在り、\
+             tako は build_master_cmd_in / build_worker_cmd_in の claude 分岐でこれを渡す。\
+             codex 0.150.1 の `--help` には `remote-control  [experimental] Manage the app-server daemon \
+             with remote control enabled` と `--remote <ADDR>` があるが自前ホストの app-server 経路で別物。\
+             agy 1.1.23 の `--help` 全件にはリモート操作の口が無い",
         ),
     },
     AgentFeature {

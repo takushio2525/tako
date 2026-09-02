@@ -516,6 +516,7 @@ impl SettingsWindow {
             limit_resume: None,
             clear_limit_resume: false,
             bypass_sandbox: None,
+            remote_control: None,
         };
         match self.dispatch(request, cx) {
             Ok(_) => {
@@ -997,6 +998,7 @@ impl SettingsWindow {
         let auto = detail["resolved_auto_handoff"].as_bool().unwrap_or(true);
         let limit_resume = detail["resolved_limit_resume"].as_bool().unwrap_or(false);
         let bypass_sandbox = detail["bypass_sandbox"].as_bool().unwrap_or(false);
+        let remote_control = detail["remote_control"].as_bool().unwrap_or(false);
         div()
             .flex()
             .flex_col()
@@ -1045,6 +1047,19 @@ impl SettingsWindow {
                     bypass_sandbox,
                     cx.listener(move |this, _, _, cx| {
                         this.set_profile(|p| p.bypass_sandbox = Some(!bypass_sandbox), cx);
+                    }),
+                ),
+            ))
+            // Remote Control の opt-in（#1068）。既定 OFF = 会話はローカルに閉じたまま。
+            // ON にしたときだけ claude の起動へ --remote-control が付く
+            .child(self.row(
+                txt::prof_label_remote_control(),
+                txt::desc_prof_remote_control(),
+                self.toggle(
+                    "prof-remote-control",
+                    remote_control,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_profile(|p| p.remote_control = Some(!remote_control), cx);
                     }),
                 ),
             ))
@@ -1707,6 +1722,7 @@ fn profiles_request(action: &str, kind: ProfileKind, name: Option<&str>) -> Requ
         limit_resume: None,
         clear_limit_resume: false,
         bypass_sandbox: None,
+        remote_control: None,
     }
 }
 
@@ -1748,6 +1764,7 @@ struct ProfilesSet {
     limit_resume: Option<bool>,
     clear_limit_resume: bool,
     bypass_sandbox: Option<bool>,
+    remote_control: Option<bool>,
 }
 
 impl ProfilesSet {
@@ -1791,6 +1808,7 @@ impl ProfilesSet {
             limit_resume: self.limit_resume,
             clear_limit_resume: self.clear_limit_resume,
             bypass_sandbox: self.bypass_sandbox,
+            remote_control: self.remote_control,
         }
     }
 }

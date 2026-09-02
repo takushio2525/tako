@@ -2001,6 +2001,12 @@ enum ProfilesCommand {
         /// 書き込み先もネットワークも制限されなくなる）
         #[arg(long)]
         bypass_sandbox: Option<bool>,
+        /// この会話を Claude 公式の Remote Control へ繋ぐ（既定 false。#1068。
+        /// true にすると claude.ai と Claude モバイルアプリからこの会話を操作できるが、
+        /// transcript は Anthropic のサーバーにも保存され、tako の機器ペアリングと
+        /// role はその会話には効かなくなる）
+        #[arg(long)]
+        remote_control: Option<bool>,
     },
 }
 
@@ -3366,6 +3372,38 @@ fn print_master_env(profile: &tako_control::orchestrator::Profile, profile_name:
         Err(e) => eprintln!("warning: {e}"),
     }
     print_sandbox_state(profile, profile_name);
+    print_remote_control_state(profile, profile_name);
+}
+
+/// Remote Control の状態を 1 行で出す（Issue #1068。#981 の
+/// `print_sandbox_state` と同じ思想 = **有効でも無効でも出す**）。
+///
+/// 無効のときに黙っていると「スマホから見えない」の切り分けができない。
+/// 逆に opt-in しているのに環境が不適格なときは、**なぜ付かなかったか**を出す
+/// （フラグを付けないことで claude の即死は避けているが、理由が要る）
+fn print_remote_control_state(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
+    use tako_control::{claude_remote, orchestrator};
+    // claude 以外には相当する仕組みが無い（マトリクスの宣言が正）。
+    // opt-in していない限り黙る = codex master の画面に無関係な行を増やさない
+    let is_claude = matches!(
+        profile.resolve_master_agent(),
+        Ok(orchestrator::WorkerAgent::Claude)
+    );
+    if !is_claude && !profile.remote_control_enabled() {
+        return;
+    }
+    let decision = match orchestrator::master_remote_control_decision(profile) {
+        Ok(d) => d,
+        // アカウント / master_agent の解決失敗は print_master_env が既に出している
+        Err(_) => return,
+    };
+    eprintln!("{}", claude_remote::status_line(&decision));
+    if decision.flag.is_none() && decision.blocked.is_none() && is_claude {
+        eprintln!(
+            "  有効にする場合: {}",
+            claude_remote::enable_hint_command(profile_name)
+        );
+    }
 }
 
 /// codex 系 master / solo のサンドボックス状態を 1 行で出す（Issue #981）。
@@ -4080,6 +4118,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             limit_resume,
             clear_limit_resume,
             bypass_sandbox,
+            remote_control,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -4119,6 +4158,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             limit_resume: *limit_resume,
             clear_limit_resume: *clear_limit_resume,
             bypass_sandbox: *bypass_sandbox,
+            remote_control: *remote_control,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;

@@ -146,6 +146,13 @@ fn detect_version_field(text: &str) -> u32 {
 ///   無条件だった頃に作られたファイル（Issue #981）
 /// - v3: 現在
 ///
+/// **#1068 で `remote_control` を足したが v4 は切っていない**。既定 false が
+/// 「Remote Control に繋がない」= 変更前とまったく同じ挙動で、`Option<bool>` の
+/// serde default（`None`）で旧ファイルがそのまま読めるため、書き換える理由が無い
+/// （`skip_serializing_if` も付いているので既存 YAML はバイト単位で不変）。
+/// #916 の規約が求める「default で読めるか / 移行を足したか」の明示的な選択はこちら。
+/// 回帰検査は `プロファイルの旧形式はremote_controlが無くても読める`
+///
 /// v2 の判定に「キーの有無」を使えるのは、`Profile::bypass_sandbox` に
 /// `skip_serializing_if` を付けていない（= 新しく書いたファイルには必ず載る）から。
 /// 外部の記録ではなく**内容だけ**で世代が決まるので冪等性が保てる
@@ -1392,6 +1399,58 @@ mod tests {
         assert!(
             std::env::var_os("TAKO_DATA_DIR").is_some() || run(Mode::Apply, None).files.is_empty(),
             "隔離されていないテストで本番を触ってはいけない"
+        );
+    }
+
+    /// #1068 の移行判断の回帰検査（#916 の規約に対する明示的な選択）。
+    ///
+    /// `remote_control` を足しても **v4 を切っていない**根拠を固定する:
+    /// ① `remote_control` の無い旧ファイルが読める ② 読めた値は false
+    /// （= Remote Control に繋がない = 変更前と同じ挙動）③ 世代判定は v3 のまま
+    /// ④ 書き戻しても `remote_control` の行が増えない（既存 YAML がバイト単位で不変）。
+    ///
+    /// どれか 1 つでも崩れたら移行が要るので、そのときはここが落ちる
+    #[test]
+    fn プロファイルの旧形式はremote_controlが無くても読める() {
+        // #981 の移行を通り終えた形（bypass_sandbox は在るが remote_control は無い）
+        let legacy = "effort: max\nbypass_sandbox: false\n";
+        let profile: crate::orchestrator::Profile =
+            serde_yaml::from_str(legacy).expect("旧形式が読めなければ移行が要る");
+        assert_eq!(profile.remote_control, None, "未設定は None で読める");
+        assert!(
+            !profile.remote_control_enabled(),
+            "未設定の実効値は false（変更前と同じ挙動）でなければならない"
+        );
+        assert_eq!(
+            detect_profile(legacy),
+            PROFILE_VERSION,
+            "remote_control が無いだけで旧世代扱いにしてはいけない（移行が空回りする）"
+        );
+        assert!(validate_profile(legacy).is_ok());
+
+        // 書き戻しでキーが増えない（skip_serializing_if の効果）
+        let rendered = serde_yaml::to_string(&profile).unwrap();
+        assert!(
+            !rendered.contains("remote_control"),
+            "未設定のまま書き戻すとキーが増えている: {rendered}"
+        );
+
+        // 明示 true / false は往復する。**`bypass_sandbox` も付ける**のは、
+        // 新しいコードが書くファイルには必ず載るから（#981 の世代判定がキーの有無を見る）
+        for value in [true, false] {
+            let text = format!("effort: max\nbypass_sandbox: false\nremote_control: {value}\n");
+            let p: crate::orchestrator::Profile = serde_yaml::from_str(&text).unwrap();
+            assert_eq!(p.remote_control, Some(value));
+            assert_eq!(p.remote_control_enabled(), value);
+            assert_eq!(detect_profile(&text), PROFILE_VERSION);
+        }
+
+        // 逆に `bypass_sandbox` が無いファイルは remote_control が在っても v2 のまま
+        // （#981 の手順を飛ばさない = 世代判定の独立性）
+        assert_eq!(
+            detect_profile("effort: max\nremote_control: true\n"),
+            2,
+            "#1068 のキーが #981 の世代判定を隠してはいけない"
         );
     }
 }

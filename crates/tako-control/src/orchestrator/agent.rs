@@ -171,6 +171,10 @@ pub struct WorkerLaunch<'a> {
     /// claude / agy の `--dangerously-skip-permissions` はサンドボックスを外さないので
     /// この項目の対象外
     pub allow_sandbox_bypass: bool,
+    /// この worker の会話を Claude 公式の Remote Control へ繋ぐか
+    /// （プロファイルの `remote_control`。既定 false = 繋がない。Issue #1068）。
+    /// claude 以外には相当するフラグが無いので何も付かない
+    pub remote_control: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],
     /// プロファイル + アカウント解決の env 計画（展開済み）。コマンド先頭で
@@ -188,6 +192,7 @@ impl Default for WorkerLaunch<'_> {
             effort: None,
             skip_permissions: false,
             allow_sandbox_bypass: false,
+            remote_control: false,
             extra_args: &[],
             env: &EMPTY_ENV_PLAN,
         }
@@ -282,6 +287,13 @@ pub fn build_worker_cmd_in(
                 }
             }
         }
+    }
+    // Remote Control（#1068）は claude 専用。判定は呼び出し側（dispatch）が
+    // `remote_control_decision` で済ませており、ここは付けるかどうかだけを見る。
+    // **claude 以外では絶対に付けない**（codex / agy に同名フラグが無く即死する）
+    if launch.remote_control && launch.agent == WorkerAgent::Claude {
+        cmd.push(' ');
+        cmd.push_str(crate::claude_remote::REMOTE_CONTROL_FLAG);
     }
     for arg in launch.extra_args {
         cmd.push(' ');
@@ -717,6 +729,75 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["trustedWorkspaces"][0], "/fresh");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1068: worker の `--remote-control` は claude だけ・opt-in だけ
+    #[test]
+    fn worker_のremote_controlはclaude限定のoptin() {
+        let plan = EnvPlan::default();
+        for agent in [WorkerAgent::Claude, WorkerAgent::Codex, WorkerAgent::Agy] {
+            for opt_in in [false, true] {
+                let cmd = build_worker_cmd_in(
+                    &WorkerLaunch {
+                        agent,
+                        role: "worker:p",
+                        remote_control: opt_in,
+                        env: &plan,
+                        ..Default::default()
+                    },
+                    crate::launch_cmd::ShellDialect::Posix,
+                );
+                let expected = opt_in && agent == WorkerAgent::Claude;
+                assert_eq!(
+                    cmd.contains("--remote-control"),
+                    expected,
+                    "{}: opt_in={opt_in} で contains={expected} を期待: {cmd}",
+                    agent.as_str()
+                );
+            }
+        }
+    }
+
+    /// 既定（opt-in なし）の worker 起動コマンドは**従来と 1 バイトも変わらない**
+    #[test]
+    fn remote_control無しのworkerコマンドは従来と同一() {
+        let plan = EnvPlan::default();
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:proj",
+                model: Some("opus"),
+                effort: Some("max"),
+                env: &plan,
+                ..Default::default()
+            },
+            crate::launch_cmd::ShellDialect::Posix,
+        );
+        assert_eq!(
+            cmd,
+            "TAKO_ORCHESTRATOR_ROLE='worker:proj' claude --model opus --effort max"
+        );
+    }
+
+    /// 追加引数（`worker_agents.<agent>.args`）より前に付く = 引数の並びが安定する
+    #[test]
+    fn remote_controlは追加引数より前に付く() {
+        let plan = EnvPlan::default();
+        let extra = vec!["--search".to_string()];
+        let cmd = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "w",
+                remote_control: true,
+                extra_args: &extra,
+                env: &plan,
+                ..Default::default()
+            },
+            crate::launch_cmd::ShellDialect::Posix,
+        );
+        let rc = cmd.find("--remote-control").expect("付いていない");
+        let ex = cmd.find("--search").expect("付いていない");
+        assert!(rc < ex, "並びが不安定: {cmd}");
     }
 
     #[test]

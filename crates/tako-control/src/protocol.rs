@@ -889,6 +889,9 @@ pub enum Request {
         /// codex の `--dangerously-bypass-approvals-and-sandbox` を許可するか（#981）
         #[serde(default)]
         bypass_sandbox: Option<bool>,
+        /// claude の会話を Claude 公式の Remote Control へ繋ぐか（#1068）
+        #[serde(default)]
+        remote_control: Option<bool>,
     },
     /// オーケストレーター: アカウントレジストリの CRUD（Issue #504）。
     /// action: list / show / add / remove

@@ -16,14 +16,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 41 件の内訳です。
+能力 42 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 41 / 41 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 27 / 41 | 5 | 8 | 1 |
-| Antigravity CLI | 12 / 41 | 7 | 16 | 6 |
-| Local LLM | 0 / 41 | 0 | 36 | 5 |
+| Claude Code（基準） | 42 / 42 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 27 / 42 | 5 | 9 | 1 |
+| Antigravity CLI | 12 / 42 | 7 | 16 | 7 |
+| Local LLM | 0 / 42 | 0 | 37 | 5 |
 
 ### 状態の意味
 
@@ -128,6 +128,12 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **利用上限の解除後に自分で再開する（#813）**<br />`worker_limit_autoresume` | 対応 | 一部対応<br />5h / 週の枠は解除を待って自分で再開するが、ワークスペースのクレジットが尽きた場合は「待つ」出口が無い（増枠申請・購入・獲得済みリセットの引き換えしか無いので、tako は何も選ばずに止まる） | 対象外<br />agy はクレジットを使い切っても「解除を待つ」出口が無い（買い足す導線しか無い）ので、待って再開するという動作が成立しない（#985） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | 実測: #985 実測（2026-08-27 / codex-cli 0.150.1）: codex の解除時刻は 2 つの経路で 取れる。① 画面の `Try again at Aug 28th, 2026 4:24 AM.`（バイナリ内書式 `" Try again at "` + `", %Y %-I:%M %p"`。日付を挟む形は #985 前は読めず、不明の猶予 900 秒で早撃ちして 3 回で諦めていた）② rollout の `rate_limits.<枠>.resets_at`（epoch 秒。書式にもタイムゾーンにも依存しない）。セルフテスト項目 111 の codex 節が解除前は撃たず解除後に再開するところまで見る （`TAKO_985_LEGACY=1` へ戻すと reset_at=None で FAILED になることを実測）。agy 1.1.22 は `/credits` に「待つ」出口が無く（Get More AI Credits / See Activity）、待って再開する動作そのものが成立しない |
 | **利用制限の残量（%）を取り出す（#357）**<br />`worker_limit_metrics` | 対応 | 対応 | 対象外<br />agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査） | 対象外<br />自分のマシンで動かすモデルなので利用上限という概念が無い | 実測: #985 実測（2026-08-27 / codex-cli 0.150.1 / plan_type = plus = **有料プラン**）: rollout の `token_count` に `rate_limits.primary`（`window_minutes: 300` = 5h）と `.secondary`（`10080` = 週）が数値で載る。**#357 の画面スクレイピングは 0.150.1 では成立しない**（実測: TUI のフッターはモデル名と cwd だけで、`5h limit: [██…] 90% left (resets 23:23)` は `/status` のモーダルの中にしか 出ない = 常時見えるところに `primary NN%` は無い）ので、構造化ソースが正になった。両者の解除時刻が一致することも確認（rollout の 1787840583 = 画面の 23:23）。agy 1.1.22 は前払いクレジットで枠が無い（`/credits` を実行して確認） |
 | **ステータスバーの利用制限表示をこの系統へ切り替えられる（#217 / #357）**<br />`limit_service_switch` | 対応 | 対応 | 対象外<br />agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査） | 未対応 [#990](https://github.com/takushio2525/tako/issues/990)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を 読む形になり、有料プランの実データが出る。agy は取得不能を再確認して unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持） |
+
+## リモートからの操作
+
+| 能力 | Claude Code | OpenAI Codex CLI | Antigravity CLI | Local LLM | 根拠 |
+| --- | --- | --- | --- | --- | --- |
+| **会話をベンダー公式のリモート操作（スマホアプリ / Web）へ委譲できる（#1068）**<br />`remote_control` | 対応 | 未対応 [#1059](https://github.com/takushio2525/tako/issues/1059)<br />codex にも remote-control（experimental）はあるが、これは自前で app-server デーモンを立てて websocket + bearer トークンで TUI を繋ぐ形で、ベンダー側のスマホアプリへ会話を出すものではない。tako 側の配線も無い | 対象外<br />agy の `--help` 全件（フラグ 24 / サブコマンド 11）にリモート操作の口が無い（`mic-serve` はマイクを別ホストへ配るだけ）ので、会話を外の端末から操作する手段がそもそも無い | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1068 の実測（2026-09-02）: claude 2.1.232 の `--help` に `--remote-control [name]  Start an interactive session with Remote Control enabled` が在り、tako は build_master_cmd_in / build_worker_cmd_in の claude 分岐でこれを渡す。codex 0.150.1 の `--help` には `remote-control  [experimental] Manage the app-server daemon with remote control enabled` と `--remote <ADDR>` があるが自前ホストの app-server 経路で別物。agy 1.1.23 の `--help` 全件にはリモート操作の口が無い |
 
 ## その他
 

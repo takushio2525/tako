@@ -1258,6 +1258,20 @@ pub fn desc_prof_bypass_sandbox() -> &'static str {
     )
 }
 
+pub fn prof_label_remote_control() -> &'static str {
+    tr!(
+        "スマホから会話を操作する（Remote Control）",
+        "Drive the conversation from your phone (Remote Control)"
+    )
+}
+
+pub fn desc_prof_remote_control() -> &'static str {
+    tr!(
+        "claude の会話を Claude 公式の Remote Control へ繋ぎ、claude.ai と Claude モバイルアプリから操作できるようにする。会話の記録は Anthropic のサーバーにも保存され、認証は claude.ai アカウントへ移る（tako の機器ペアリングと権限段はその会話には効かない）。OFF なら会話はローカルに閉じたまま",
+        "Connect the claude conversation to Claude's official Remote Control so it can be driven from claude.ai and the Claude mobile app. The transcript is then also stored on Anthropic's servers and access is governed by your claude.ai account (tako's device pairing and roles do not apply to that conversation). When off, the conversation stays local"
+    )
+}
+
 pub fn prof_ctx_threshold_range() -> &'static str {
     tr!(
         "引き継ぎ閾値は 50〜60 の数字で指定してください",
@@ -1560,6 +1574,8 @@ mod tests {
                 desc_prof_limit_resume().into(),
                 prof_label_bypass_sandbox().into(),
                 desc_prof_bypass_sandbox().into(),
+                prof_label_remote_control().into(),
+                desc_prof_remote_control().into(),
                 prof_ctx_threshold_range().into(),
                 prof_env_add().into(),
                 prof_env_masked().into(),

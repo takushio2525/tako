@@ -1421,6 +1421,7 @@ pub fn tools() -> Vec<Value> {
                     "limit_resume": { "type": "boolean", "description": "このプロファイルから spawn した worker ペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時。#822）。spawn 側の limit_resume が指定されていればそちらが勝つ" },
                     "clear_limit_resume": { "type": "boolean", "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）" },
                     "bypass_sandbox": { "type": "boolean", "description": "codex（master / worker）を --dangerously-bypass-approvals-and-sandbox で起動することを許可する（既定 false = 許可しない。set 時。#981）。true にすると承認プロンプトと codex のサンドボックスが両方無効になり、書き込み先もネットワークも制限されなくなる。false へ戻すと codex の既定（承認プロンプトが出る）に戻る" },
+                    "remote_control": { "type": "boolean", "description": "このプロファイルの claude セッション（master / solo / spawn した worker）を Claude 公式の Remote Control へ繋ぐ（既定 false = 繋がない。set 時。#1068）。true にすると claude 起動コマンドへ --remote-control が付き、claude.ai と Claude モバイルアプリからその会話を操作できるようになる。**委譲の代償**: 会話の transcript が Anthropic のサーバーにも保存され、認証は claude.ai アカウントへ移るので tako の機器ペアリングと role（observe / interact / manage / admin）はその会話には効かない。claude 以外の系統（codex / agy）には相当する仕組みが無いため何も起きない。環境が不適格（DISABLE_TELEMETRY 等・エンドポイント差し替え・API キー認証・組織ポリシー）なときはフラグを付けず、応答の remote_control_blocked に理由と次の一手が入る" },
                 },
                 "additionalProperties": false,
             },

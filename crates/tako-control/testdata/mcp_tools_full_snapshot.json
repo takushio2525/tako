@@ -1985,6 +1985,10 @@
           },
           "type": "array"
         },
+        "remote_control": {
+          "description": "このプロファイルの claude セッション（master / solo / spawn した worker）を Claude 公式の Remote Control へ繋ぐ（既定 false = 繋がない。set 時。#1068）。true にすると claude 起動コマンドへ --remote-control が付き、claude.ai と Claude モバイルアプリからその会話を操作できるようになる。**委譲の代償**: 会話の transcript が Anthropic のサーバーにも保存され、認証は claude.ai アカウントへ移るので tako の機器ペアリングと role（observe / interact / manage / admin）はその会話には効かない。claude 以外の系統（codex / agy）には相当する仕組みが無いため何も起きない。環境が不適格（DISABLE_TELEMETRY 等・エンドポイント差し替え・API キー認証・組織ポリシー）なときはフラグを付けず、応答の remote_control_blocked に理由と次の一手が入る",
+          "type": "boolean"
+        },
         "tab_naming_convention": {
           "description": "タブ名の命名規則（master プロンプトに注入される自由記述。空文字でクリア。set 時）",
           "type": "string"
