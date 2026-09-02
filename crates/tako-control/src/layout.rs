@@ -167,6 +167,19 @@ pub struct RemoteFolderLayout {
     pub host: String,
     /// リモート側の絶対パス（POSIX。Windows の相手なら `/C:/...`）
     pub path: String,
+    /// ツリーへ載った経路（#1041。`explicit` = 「リモートからフォルダを開く」/
+    /// `auto` = ペインの `ssh` 検知）。
+    ///
+    /// **旧ファイルは `auto` として読める**（`RemoteOrigin` の `Default`）ので
+    /// 移行 Step は要らない。旧ファイルの既定を `explicit` にしない理由は
+    /// `RemoteOrigin` の doc（自動検知ぶんが更新後の初回起動で先頭へ跳ねる）
+    #[serde(default, skip_serializing_if = "is_auto_origin")]
+    pub origin: String,
+}
+
+/// 既定（`auto`）なら書かない = 旧ファイルとバイト一致を保つ（#1041）
+fn is_auto_origin(origin: &str) -> bool {
+    tako_core::remote_fs::RemoteOrigin::parse(origin) == tako_core::remote_fs::RemoteOrigin::Auto
 }
 
 /// 分割ツリーのノード（dispatch の list が返す tree 表現と同じ語彙: axis は "x" / "y"）
@@ -294,9 +307,10 @@ pub fn capture(
                 remote_folders: tab
                     .remote_folders()
                     .iter()
-                    .map(|r| RemoteFolderLayout {
-                        host: r.host.clone(),
-                        path: r.path.clone(),
+                    .map(|f| RemoteFolderLayout {
+                        host: f.remote.host.clone(),
+                        path: f.remote.path.clone(),
+                        origin: f.origin.as_str().to_string(),
                     })
                     .collect(),
             })
@@ -449,14 +463,20 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
         };
         // リモートは**ローカル FS の存在検査を通さない**（`is_dir()` に掛けると必ず
         // 消える）。到達できるかは開いたあとにツリーが取りに行き、失敗は行として出る
-        let remote_folders: Vec<tako_core::remote_fs::RemoteRef> = {
+        let remote_folders: Vec<tako_core::remote_fs::RemoteFolder> = {
             let mut seen = std::collections::HashSet::new();
             tab_layout
                 .remote_folders
                 .iter()
                 .filter(|r| !r.host.trim().is_empty() && !r.path.trim().is_empty())
-                .map(|r| tako_core::remote_fs::RemoteRef::new(r.host.clone(), r.path.clone()))
-                .filter(|r| seen.insert(r.clone()))
+                .map(|r| {
+                    tako_core::remote_fs::RemoteFolder::new(
+                        tako_core::remote_fs::RemoteRef::new(r.host.clone(), r.path.clone()),
+                        // #1041: 経路を持たない旧ファイルは `auto`（従来の並び）
+                        tako_core::remote_fs::RemoteOrigin::parse(&r.origin),
+                    )
+                })
+                .filter(|f| seen.insert(f.remote.clone()))
                 .collect()
         };
         let tab = Tab::restore(
@@ -882,7 +902,7 @@ mod tests {
     /// （ローカルには存在しないので）**必ず全部消える**
     #[test]
     fn issue919_リモートフォルダが保存復元され旧ファイルと後方互換() {
-        use tako_core::remote_fs::RemoteRef;
+        use tako_core::remote_fs::{RemoteFolder, RemoteOrigin, RemoteRef};
         let mut ws = sample_workspace();
         // `sample_workspace` は最後に create_tab するのでアクティブは 2 枚目。
         // 「開いたタブにだけ載る」ことを見たいので**先頭のタブ**を明示して使う
@@ -892,10 +912,11 @@ mod tests {
         let linux = RemoteRef::new("srv", "/srv/app");
         {
             let t = ws.get_tab_mut(tab).unwrap();
-            assert!(t.add_remote_folder(linux.clone()));
-            assert!(t.add_remote_folder(win.clone()));
+            // #1041: 経路も保存・復元される（自動検知 / 明示 open を混ぜる）
+            assert!(t.add_remote_folder(RemoteFolder::auto(linux.clone())));
+            assert!(t.add_remote_folder(RemoteFolder::explicit(win.clone())));
             // 同じものは重ねない
-            assert!(!t.add_remote_folder(win.clone()));
+            assert!(!t.add_remote_folder(RemoteFolder::explicit(win.clone())));
         }
 
         let layout = capture(&ws, &|_| PaneMeta::default(), None);
@@ -906,16 +927,28 @@ mod tests {
             1,
             "リモートを持つタブのぶんだけ出力される: {json}"
         );
+        // #1041: `auto` は既定なので書かない = 旧ファイルとバイト一致を保つ
+        assert!(
+            !json.contains(r#""origin":"auto""#),
+            "既定の経路は書き出さない: {json}"
+        );
+        assert!(
+            json.contains(r#""origin":"explicit""#),
+            "明示 open は書き出す: {json}"
+        );
 
         let back: LayoutFile = serde_json::from_str(&json).unwrap();
         let (restored, _) = restore(&back).expect("復元できる");
         let folders = restored.tabs()[0].remote_folders();
         assert_eq!(folders.len(), 2, "{folders:?}");
         // 並び（最後に開いたものが先頭）も保たれる
-        assert_eq!(folders[0], win);
-        assert_eq!(folders[1], linux);
+        assert_eq!(folders[0].remote, win);
+        assert_eq!(folders[1].remote, linux);
+        // #1041: 経路も戻る（再起動してもツリーの先頭に居続ける）
+        assert_eq!(folders[0].origin, RemoteOrigin::Explicit);
+        assert_eq!(folders[1].origin, RemoteOrigin::Auto);
         // 空白入りの Windows パスがそのまま戻る
-        assert_eq!(folders[0].path, "/C:/Users/u/My Documents");
+        assert_eq!(folders[0].remote.path, "/C:/Users/u/My Documents");
         // 他のタブへ混ざらない
         assert!(restored.tabs()[1].remote_folders().is_empty());
 
@@ -925,6 +958,21 @@ mod tests {
         let (legacy_ws, _) = restore(&legacy).expect("旧ファイルも復元できる");
         assert!(legacy_ws.tabs()[0].remote_folders().is_empty());
 
+        // #1041: `origin` を持たない旧世代のエントリは `auto`（従来の並び）として読める。
+        // ここを `explicit` へ倒すと、更新後の初回起動で自動検知ぶんまで先頭へ跳ねる
+        let old_gen: LayoutFile =
+            serde_json::from_str(&json.replace(r#","origin":"explicit""#, ""))
+                .expect("origin なしでもパースできる");
+        let (old_ws, _) = restore(&old_gen).expect("復元できる");
+        assert!(
+            old_ws.tabs()[0]
+                .remote_folders()
+                .iter()
+                .all(|f| f.origin == RemoteOrigin::Auto),
+            "経路不明は自動扱い: {:?}",
+            old_ws.tabs()[0].remote_folders()
+        );
+
         // 壊れたエントリ（host / path が空）は落とす
         let broken: LayoutFile = serde_json::from_str(&json.replace(
             r#"{"host":"srv","path":"/srv/app"}"#,
@@ -933,7 +981,7 @@ mod tests {
         .expect("壊れたエントリでもパースできる");
         let (broken_ws, _) = restore(&broken).expect("復元できる");
         assert_eq!(
-            broken_ws.tabs()[0].remote_folders(),
+            broken_ws.tabs()[0].remote_refs(),
             std::slice::from_ref(&win),
             "空のエントリだけ落ちる"
         );

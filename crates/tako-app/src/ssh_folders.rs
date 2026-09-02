@@ -26,6 +26,7 @@ use tako_control::ssh_detect::{SshScanState, SshScanTarget};
 use tako_core::remote_fs::RemoteRef;
 
 use crate::TakoApp;
+use tako_core::PaneId;
 
 /// 同一バイナリで #976 の前の挙動へ戻す A/B（`TAKO_976_LEGACY=1`）。
 ///
@@ -35,6 +36,32 @@ use crate::TakoApp;
 pub(crate) fn legacy_mode() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_976_LEGACY").is_some())
+}
+
+/// 同一バイナリで #1041 の前の挙動へ戻す A/B（`TAKO_1041_LEGACY=1`）。
+///
+/// 戻るのは 2 つ: リモートルートを**経路を問わず全部ローカルの後ろ**へ並べる /
+/// フォルダを開いてもターミナルを自動で繋がない
+pub(crate) fn legacy_1041() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1041_LEGACY").is_some())
+}
+
+/// いま有効なリモートルートの並び規則（#1041）。
+///
+/// 3 世代の A/B をここ 1 か所で解く（規則そのものは
+/// `tako_core::sidebar::remote_root_order` が持つ）。**`remote-folder list` も
+/// `ControlHost::remote_root_placement` からこれを引く**ので、画面と応答が食い違わない。
+/// #976 の legacy が勝つのは、そちらが「自動検知そのものを止める」= より古い世代だから
+pub(crate) fn remote_root_placement() -> tako_core::sidebar::RemoteRootPlacement {
+    use tako_core::sidebar::RemoteRootPlacement;
+    if legacy_mode() {
+        RemoteRootPlacement::AllLeading
+    } else if legacy_1041() {
+        RemoteRootPlacement::AllTrailing
+    } else {
+        RemoteRootPlacement::ExplicitFirst
+    }
 }
 
 /// 検知した ssh セッション 1 件に対する自動追加の状態（キーは宛先文字列）
@@ -116,7 +143,29 @@ impl TakoApp {
     /// 走査結果を反映し、**これから接続を確かめるべき仕事**を返す。
     ///
     /// ここではネットワークへ触らない（UI スレッドで呼ばれる）
-    pub(crate) fn apply_ssh_scan(&mut self, state: SshScanState) -> Vec<SshAutoOpenJob> {
+    pub(crate) fn apply_ssh_scan(&mut self, mut state: SshScanState) -> Vec<SshAutoOpenJob> {
+        // #1041: **tako が開いた SSH ペイン**は、tako が知っているホスト名
+        // （`~/.ssh/config` の Host）へ読み替える。
+        //
+        // `remote_ssh_argv` は config の `User` を宛先へ反映する（`ssh -o … user@host`）
+        // ので、検知側が argv から採る宛先は `user@host`。明示 open で開いたルートは
+        // 別名（`host`）なので、そのままだと**同じホストが 2 行並ぶ**
+        // （実測: `<host>` を開くと `<remoteuser>@<host>` が自動追加された）。
+        // #1041 で「フォルダを開いたら必ず SSH ペインが立つ」になったので、
+        // これは日常的に起きる。
+        //
+        // 読み替えは**キーの正規化**であって検知の抑止ではない: ルートを持たない
+        // ペイン（`tako open-in remote <host>` で繋いだだけ）はこれまでどおり
+        // 自動追加され、名前が別名になるぶん明示経路と突き合わせられるようになる
+        for session in &mut state.sessions {
+            if let Some(known) = self
+                .ssh_connect
+                .get(&PaneId::from_raw(session.pane))
+                .map(|st| st.host.clone())
+            {
+                session.destination = known;
+            }
+        }
         let mut jobs: Vec<SshAutoOpenJob> = Vec::new();
         for session in &state.sessions {
             let entry = self
@@ -188,7 +237,7 @@ impl TakoApp {
         self.workspace
             .tabs()
             .iter()
-            .any(|t| t.remote_folders().iter().any(|r| r.host == host))
+            .any(|t| t.remote_folders().iter().any(|f| f.remote.host == host))
     }
 
     /// そのタブにこのホストのリモートルートが既にあるか
@@ -197,7 +246,7 @@ impl TakoApp {
             .tabs()
             .iter()
             .find(|t| t.id().as_u64() == tab)
-            .is_some_and(|t| t.remote_folders().iter().any(|r| r.host == host))
+            .is_some_and(|t| t.remote_folders().iter().any(|f| f.remote.host == host))
     }
 
     /// background の接続確認の結果を反映する。
@@ -223,8 +272,12 @@ impl TakoApp {
                     return; // 走査から反映までの間にタブが閉じられた
                 };
                 let remote = RemoteRef::new(job.destination.clone(), home.clone());
-                let added =
-                    tako_control::dispatch::attach_remote_root(self, remote.clone(), tab_id);
+                // #1041: 自動検知ぶんは `Auto` = ローカルルートの後ろのまま（#976 に回帰ゼロ）
+                let added = tako_control::dispatch::attach_remote_root(
+                    self,
+                    tako_core::remote_fs::RemoteFolder::auto(remote.clone()),
+                    tab_id,
+                );
                 if let Some(link) = self.ssh_links.get_mut(&job.destination) {
                     link.root = Some(remote.clone());
                     link.note = None;
@@ -397,9 +450,9 @@ impl TakoApp {
     pub(crate) fn drive_remote_recovery(&mut self) -> Vec<String> {
         let mut hosts: Vec<String> = Vec::new();
         for tab in self.workspace.tabs() {
-            for r in tab.remote_folders() {
-                if !hosts.contains(&r.host) {
-                    hosts.push(r.host.clone());
+            for f in tab.remote_folders() {
+                if !hosts.contains(&f.remote.host) {
+                    hosts.push(f.remote.host.clone());
                 }
             }
         }
@@ -482,7 +535,7 @@ impl TakoApp {
             .workspace
             .tabs()
             .iter()
-            .flat_map(|t| t.remote_folders().iter().cloned())
+            .flat_map(|t| t.remote_refs())
             .filter(|r| r.host == host)
             .collect();
         if roots.is_empty() {

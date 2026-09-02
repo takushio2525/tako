@@ -39,8 +39,9 @@ const ATTACHING: &[&str] = &[
     "WindowNew",
 ];
 
-/// `RemoteFolder` の action のうち、内部で `OpenRemote` へ委譲するもの
-const ATTACHING_REMOTE_ACTIONS: &[&str] = &["ssh-pane"];
+/// `RemoteFolder` の action のうち、内部で `OpenRemote` へ委譲するもの。
+/// #1041 で `open` も（フォルダを開いたらターミナルも繋ぐので）委譲するようになった
+const ATTACHING_REMOTE_ACTIONS: &[&str] = &["ssh-pane", "open"];
 
 /// 消化したと認めるしるし
 const DRAIN_MARKS: &[&str] = &["pending_attach", "attach_pending_sessions"];

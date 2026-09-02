@@ -492,3 +492,156 @@ TAKO_SELF_TEST_976: legacy=false targets(off/on)=0/6 jobs=1 live=true after_loca
 **もう 1 度踏んだ**: 見張り（`Connected`）で `fresh_pane` の「画面全体を見る」近道を使うと、
 **前回の切断マーカーが画面に残り続ける**ので繋ぎ直した直後に同じ行をもう一度「切断」と読む。
 見張り以降は必ず起点（`baseline_index`）から先だけを見る。
+
+---
+
+## 18. #1041: 「リモートからフォルダを開く」を VSCode Remote 風へ
+
+2026-09-01。`feat/1041-remote-open-vscode-like`。要望は 2 つ = ①明示的に開いた
+リモートフォルダをツリーの先頭へ ②そのホストへターミナルを自動接続。
+
+### 18.1 経路（origin）を同一性に混ぜない
+
+「明示 open だけ前に出す」には**どの経路で載ったか**が要る。`RemoteRef`
+（host + path）は**同一性のキー**で、ツリーの展開状態（`remote_expanded`）・
+取得キャッシュ（`remote_cache`）・プレビューの出どころ・layout.json の同定に
+使われている。ここへ経路を混ぜると「自動で開いた home」と「明示で開いた同じ home」が
+**別のフォルダとして 2 行並ぶ**。
+
+そこで器を 1 段足した:
+
+```rust
+pub struct RemoteFolder { pub remote: RemoteRef, pub origin: RemoteOrigin }
+// PartialEq / Hash は remote だけで決める（origin は属性）= 手で実装する
+```
+
+`Tab.remote_folders` / `FileTree.remote_roots` の要素型をこれに替えた。
+`add_remote_folder` は既存フォルダを**明示的に**開き直したときだけ
+`Auto → Explicit` へ格上げする（逆へは落とさない）。
+
+### 18.2 並び規則の正本は 1 実装
+
+3 世代あるので取り違えやすい:
+
+| 世代 | 並び |
+|---|---|
+| #919 | 全部ローカルより前へ hoist |
+| #976 | 全部ローカルの後ろ |
+| **#1041** | **明示 open は前・自動検知は後ろ** |
+
+`tako_core::sidebar::remote_root_order(&[RemoteFolder], RemoteRootPlacement)` が
+`{ leading, trailing }` を返す純関数で、**GUI（`FileTree::build_rows`）と
+CLI / MCP（`remote-folder list`）が同じ関数を通る**。A/B の env の解決は
+`ssh_folders::remote_root_placement()` の 1 か所（`ControlHost::remote_root_placement`
+もそこから引くので、`list` の並びと画面の並びが構造的に一致する）。
+
+**旧 layout.json の既定は `auto`**。経路を記録していない世代のファイルは明示 / 自動を
+区別できないので、`explicit` へ倒すと**更新後の初回起動で自動検知ぶんまで先頭へ跳ねる**
+（#1041 受け入れ条件 5「自動検知の挙動に回帰ゼロ」に反する）。移行 Step は不要
+（`#[serde(default)]` で読めて、既定値は書き出さないので旧ファイルとバイト一致）。
+
+**指紋の穴を 1 つ塞いだ**: `RemoteFolderLayout` は layout.json へ直に serde される
+永続構造体なのに `migration_registry` の TARGETS から漏れていた（`origin` を足しても
+指紋が動かず素通りする）。#728 が `PendingSpawn` を足したのと同じ穴。
+
+### 18.3 自動接続で既存ペインを乗っ取らない
+
+Issue の設計メモは「アイドルな素のシェルペインがあれば #1006 の pane モードを優先」を
+案として挙げていたが、**自動経路では採らなかった**（判断は実装者に委ねられていた）:
+
+1. 自動経路は「どのペインを使うか」のユーザーの意思を持たない。右クリックの
+   「このペインでリモート接続…」は対象を指で選んでいるので事情が違う
+2. 素のシェルに**打ちかけの行**が残っていても見分ける手段が無い。シェルのプロンプトの
+   終端は OSC 133 の有無に依存し、器（psmux）つきでは取れない（#766）。
+   #640 の送達フローは打ちかけの行へ続けて書くので `<打ちかけ> ssh <host>` が走りうる
+3. 新しいペインなら失うものが無い（接続に失敗しても #919 のとおり理由が残る）
+
+ペインの SSH 化は右クリック / `--target pane` の**明示操作としてそのまま使える**。
+`tako_core::remote_open::auto_terminal_target()` が `Split` を返すことを
+ユニットテストで固定してある。
+
+### 18.4 重複の判定材料は 2 つとも要る
+
+`ControlHost::live_ssh_pane(tab, host)` の実体（GUI）は次の 2 つを見る:
+
+- **tako が開いた SSH ペイン**（#1010 の `ssh_connect`。`ConnectPhase::occupies_host()`
+  が true のもの = `Failed` / `GaveUp` 以外）
+- **ユーザーが手で `ssh` したペイン**（#976 の `ssh_links`。`live` のもの）
+
+片方だけでは足りない: 1 だけだと「自分で ssh したペインの隣にもう 1 枚」ができ、
+2 だけだと「tako が開いた直後（まだ `ps` を走らせていない）」に二重に作る。
+`Failed` / `GaveUp` を数えないのは、**前の試行が死んでいるペインを理由に開き直しを
+断ると、ユーザーが開き直しても何も起きない**から（`open` は SFTP で繋がったときにしか
+来ないので、その時点で相手は到達可能）。
+
+### 18.5 自動接続は名前のある 1 実装にした
+
+`dispatch::auto_connect_terminal(host, origin, ssh_host, dir, tab, focus, requested)`
+が `open` 応答の `terminal` を返す。`pub` にしているのは、**`open` そのものは実 SFTP
+接続が要るのでセルフテストから通せない**ため（GUI のセルフテスト項目 138 がこの関数を
+直接叩いて「新しいペインが立つ / 2 回目は増えない / 切ったら理由が返る」を機械検証する）。
+
+### 18.6 実 SSH 先で見つけた副作用: 自動検知が二重に並べる
+
+実ホストで通したら、**同じホストが 2 行**並んだ:
+
+```
+<host>:/home/<remoteuser>             explicit  leading
+<remoteuser>@<host>:/home/<remoteuser>  auto    trailing   ← 増えた
+```
+
+`remote_ssh_argv` は `~/.ssh/config` の `User` を宛先へ反映する（`ssh -o … user@host`）ので、
+**#976 の検知が argv から採る宛先は `user@host`**。明示 open のルートは別名（`host`）なので
+`tab_has_remote_host` が突き合わせられず、自動追加が走っていた。
+
+`ssh-pane` / `open-in remote` でも起きる**前からある**形だが、#1041 は
+「フォルダを開いたら必ず SSH ペインが立つ」ので**毎回起きる**。
+
+直し方は**キーの正規化**（検知の抑止ではない）: `apply_ssh_scan` の入口で、
+その pane が `ssh_connect` に居れば（= tako が開いた SSH ペイン）宛先を
+**tako が知っているホスト名**へ読み替える。ルートを持たないペイン
+（`tako open-in remote <host>` で繋いだだけ）はこれまでどおり自動追加され、
+名前が別名になるぶん明示経路と突き合わせられるようになる。
+
+### 18.7 セルフテスト項目 137 (d)（#1040）が main で止まっていた
+
+#1041 の項目 138 は 137 の後ろなので、**137 で止まると 1 回も走らない**。
+同じマシンで HEAD だけ替えた A/B（`origin/main` = FAILED / 本ブランチ = FAILED、
+3 回とも同じ場所）で main 由来と確定させ **#1062** へ起票したうえで、
+検証を成立させるために test-only の 1 行を同梱した:
+
+(b) が `command_flows` へ積んだ打ち直し（`echo TAKO_1040_RETRY`）を (d) の前に畳む。
+同じペインへ 2 系統が書くと、送達フローの書き直し（Ctrl+C + 本文の再書き込み）が
+(d) の `printf` を壊し、12 秒の待ちを使い切る。(b) は「積まれたこと」を見る検査なので
+実行させる必要がない。併せて (d) の `check` へ診断（phase と画面末尾）を足した（#796 の作法）。
+
+### 18.8 検証
+
+- **セルフテスト項目 138**: (a) 並び (b) `list` の並びと `origin` / `placement`
+  (c) 自動接続でペイン +1 と `cd` の積み込み (d) 2 回目は増えない（結果待ち・成立後の
+  両方）(d2) 失敗したペインは占有しない (e) `terminal=false` (f) #976 が二重に並べない
+- 既存の項目 130 (c)（**自動検知ぶんがローカルの後ろ**）が緑のまま = #976 に回帰ゼロ
+- **実 SSH 先での通し 24/24**（`scripts` には置かない使い捨て検証。隔離インスタンス +
+  実ホスト 2 台 = Linux / Windows）: 開く → 先頭 + ペイン自動接続 + `cd` 実行 →
+  2 回目は増えない → `--no-terminal` → 到達不能でツリーは残る →
+  手で `ssh` した別ホストは後ろに並ぶ。最後の `list` の並びが要点:
+
+  ```
+  <linux>:/home/<remoteuser>   explicit  leading
+  <linux>:/tmp                 explicit  leading
+  <linux>:/var                 explicit  leading
+  <win>:/C:/Users/<winuser>    auto      trailing   ← 手で ssh した分は後ろ
+  ```
+- A/B: `TAKO_1041_LEGACY=1` で項目 138 (a) と (c) が FAILED になる
+
+### 18.9 実 SSH 検証の作法（次に測る人へ）
+
+- **隔離インスタンスの data_dir は短いパスにする**: IPC の Unix domain socket は
+  `SUN_LEN`（104 バイト）制限があり、長い scratchpad パスだと
+  `IPC サーバーを起動できない: path must be shorter than SUN_LEN` で **CLI が一切通らない**
+- 起動情報は `<discovery>/control.json`（`instances/control-<pid>.json` は併記のほう）。
+  `TAKO_DISCOVERY_DIR` は**先に作っておく**
+- `tako read` / `tako split` は**素のテキスト**を返す（JSON ではない）。
+  `tako send` に `--enter` は無い（改行が既定）
+- ペインの画面には `Last login: … from <IP>` が出る。**この機の公開 IP なので
+  貼る前に必ずマスクする**（#927）

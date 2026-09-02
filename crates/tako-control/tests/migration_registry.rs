@@ -146,6 +146,11 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
                 "NodeLayout",
                 "PaneLayout",
                 "PreviewLayout",
+                // #1041: `RemoteFolderLayout` は `TabLayout.remote_folders` として
+                // layout.json へ直に serde される永続構造体なのに、この表から漏れて
+                // いた（`origin` を足しても指紋が動かず素通りする）。#728 で
+                // `PendingSpawn` を足したのと同じ穴なので閉じる
+                "RemoteFolderLayout",
             ],
         ),
         (
