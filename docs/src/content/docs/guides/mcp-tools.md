@@ -205,6 +205,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_auto_rename` | タブ・ペイン名の AI 自動リネームの ON/OFF |
 | `tako_port_detect` | listen ポート検知と提案チップの ON/OFF |
 | `tako_confirm_close` | 閉じる確認ダイアログの ON/OFF |
+| `tako_session_restart` | エージェントを会話ごと引き継いで再起動（mode 省略で下見） |
 | `tako_limit_resume` | 利用上限後の自動復帰のペイン単位 ON/OFF・状態確認 |
 | `tako_limit_service` | ステータスバーに出す利用制限表示サービスの切替 |
 | `tako_sleep_guard` | スリープ防止の状態確認・設定変更 |

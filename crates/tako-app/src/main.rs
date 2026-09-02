@@ -58678,8 +58678,11 @@ mod self_test {
                 }
 
                 // (d) アイドルに戻したら、会話を解決できないので**終了させずに**断る
-                //     （resume 先が分からないまま殺すと会話を失う）
-                let needle = repaint("TAKO1067IDLE2", idle_footer, "TAKO1067IDLE2");
+                //     （resume 先が分からないまま殺すと会話を失う）。
+                //     **入力欄は空にする**: 印を箱の中へ置くと非 dim の実テキスト =
+                //     人間の下書きとして先に断られる（関門の順序どおり。実測で踏んだ）
+                let idle2_footer = format!("{idle_footer} TAKO1067IDLE2");
+                let needle = repaint("", &idle2_footer, "TAKO1067IDLE2");
                 if !wait_for_focused_text(window, cx, &needle, Duration::from_secs(15)).await {
                     fail("139: アイドル画面へ戻せない (#1067)")
                 }

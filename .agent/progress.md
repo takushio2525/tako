@@ -3948,3 +3948,42 @@
   `TAKO_1057_LEGACY=1` の A/B で legacy が install を拒否（`legacy_launcher_exists=False`）/
   macOS 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 119 拡張・137 新設）。証拠は `~/dev/tako-evidence/1057/`
 - 次: PR レビュー → merge → install（master 判断）
+
+## 2026-09-02（#1067: エージェントペインの右クリックへ「会話を引き継いだ再起動」2 種）
+- **#498 の張り直しは merge 以来一度も意図どおり動いていなかった**（調査で確定）: Ctrl+C 1 回
+  （claude の対話終了は 2 回）/ resume の行を `queue_write_on_alt_screen` で書いていたが**器つき
+  ペインの外側は常に代替画面**なので条件が即成立し**動いている claude の入力欄へ**流れ込む
+  （#694 / #1006 と同じ罠）/ コマンドが素の `claude --resume <id>` でアカウント・role・
+  モデル・effort が全部落ちる。#1067 でこの 3 点を潰し、判断と手順を 1 実装へ寄せた
+- 実装: `tako_core::session_restart`（モードの語彙・`is_eligible` / `can_restart`・`relaunch_step`・
+  `parse_resume_hint`。全部純関数）+ dispatch の材料集め 2 段（軽い `session_restart_menu_facts` /
+  重い `build_session_restart_plan`）+ `tako-app::drive_agent_relaunches`（500ms tick）。
+  1:1 は `tako session-restart [--mode harness|handoff]`（**引数なしで下見**）/ MCP
+  `tako_session_restart`（144 ツール）。#498 のボタンも同一実装へ寄せた
+- **実測（claude 2.1.258 / tmux 3.6・素の tmux で先に測った）**: SIGTERM で 1 秒以内に落ち
+  `alternate_on` が 1 → 0 でシェルのプロンプトも戻る / 終了時に claude 自身が
+  `Resume this session with: claude --resume <id>` を印字する（世代ずれの保険に採用）/
+  `--resume` で会話が続く（合言葉を答えた）/ **session_id は resume をまたいで変わらない**
+- **実機実測が設計バグを 1 つ潰した**: 生成中の判定に OSC 133 の `Running` を入れていたが、
+  エージェントは**ペインのシェルが起動した前景コマンド**なので立っている間ずっと `Running`。
+  アイドルな実 worker が `reason=busy` で断られた（隔離インスタンスで実測）→ 判断材料を
+  画面の中断ヒントだけにし、番犬（`osc133のコマンド状態を判断材料に戻していない`）で戻りを止めた。
+  `claude_tui::is_busy` も使えない（完了行 `✻ Brewed for 2s · done` を busy と読む = 実測）
+- 関門は 2 段（構造 = メニューの出し分け / 一時的 = 実行時に理由 + 次の一手）。順序は
+  「画面の状態 → 会話の解決」（生成中のペインに「`tako sessions list` で確認せよ」を出さない）
+- **実 claude の通し（隔離インスタンス + 実 claude。/tmp/tk1067 = 短いパス。SUN_LEN 制限）**:
+  ①worker へ合言葉を覚えさせる → `session-restart --mode harness` → **agent_pid 42746 → 58133**
+  （session_id は同一）→ 「合言葉は？」に **TAKO1067ZEBRA** と答えた = **会話継続を実測**。
+  送達は persist.log の `送達: peer（pid=58133 …）` で新プロセス宛だったことも残っている
+  ②`--no-newline` で下書きを置くと `input_status style=user` になり **理由 + 次の一手つきで拒否**
+  （プロセスは生きたまま）。claude のゴースト提案（`style=ghost`）では拒否しない = dim 判定が効いている
+  ③master ペインで `--mode handoff` → **実 claude が引き継ぎを書き直し**（1639 バイト・原本は
+  `.bak.1`）→ `tako_orchestrator_handoff` を呼んで **後任 master が同じタブに立ち（+54 秒）**→
+  **後任が前任のペインを閉じた（+72 秒）**。worker は生きたまま（kill されない）
+- 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 3045 passed 0 failed /
+  Windows クロスチェック エラー 0・警告 12（**全件が未変更ファイル由来** = 記録済みベースライン同数）/
+  隔離セルフテスト項目 139 新設（出し分け / 下見 / 関門 3 種 / 会話未解決での不実行 / 引き継ぎ依頼）
+- **環境由来のフレークを 2 件踏んだ**（どちらも #1067 の変更とは無関係で、走り直すと通る）:
+  load 15 で項目 94（#702。打った行が 6 秒以内に実行されない）/ load 5 で項目 113（#816。
+  2.5 秒の出力が `lines+=25 < 40`）。並行 worker のビルドで load が跳ねる時間帯は避けて測る
+- 次: PR → CI → merge / install は master 判断

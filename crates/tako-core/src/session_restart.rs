@@ -35,7 +35,6 @@
 //! [`menu_modes`]（構造だけ見る = 出し分け）で表してある。
 
 use crate::agent_support::{self, keys, Agent};
-use crate::terminal::CommandState;
 
 /// 再起動の種別（CLI の possible values / MCP の enum / GUI の分岐の正本）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -217,9 +216,14 @@ pub struct RestartFacts {
     /// **見つからないときに進めてはいけない**: 相手を終了させないまま resume の行を
     /// 打つと、動いているエージェントへの「指示」として入力される（#694 / #1006 と同じ罠）
     pub agent_process_found: bool,
-    /// OSC 133 由来のコマンド状態
-    pub command_state: CommandState,
-    /// エージェントが生成中（画面由来。`command_state` では取れない）
+    /// エージェントが生成中（画面の中断ヒント由来）。
+    ///
+    /// **OSC 133 の `Running` は使えない**（#1067 の実機実測）: エージェントは
+    /// ペインのシェルが起動した前景コマンドなので、**エージェントが立っている間は
+    /// ずっと `Running`** になる。これを busy と読むと、ハーネス更新の対象である
+    /// エージェントペインが**常に** `busy` で断られる（実測: アイドルな worker で
+    /// `reason=busy`）。「そのペインでコマンドが走っているか」は素のシェルを相手に
+    /// する判定（`remote_open::can_ssh_pane`）では正しいが、ここでは意味が逆になる
     pub agent_busy: bool,
     /// キューに未送信の指示がある（#572）
     pub queued_messages: bool,
@@ -238,7 +242,6 @@ impl Default for RestartFacts {
             agent: Agent::Claude,
             session_resolved: false,
             agent_process_found: false,
-            command_state: CommandState::Unknown,
             agent_busy: false,
             queued_messages: false,
             user_draft: false,
@@ -280,7 +283,7 @@ pub fn can_restart(mode: SessionRestartMode, facts: &RestartFacts) -> Result<(),
     // 「いま手を出すな」は待てば解ける第一の安全規則で、しかもここで断るときは
     // 会話 ID を引く必要すら無い。逆順にすると、生成中のペインに対して
     // 「`tako sessions list` で会話を確認せよ」という**その瞬間には無意味な**案内が出る
-    if facts.agent_busy || matches!(facts.command_state, CommandState::Running) {
+    if facts.agent_busy {
         return Err(RestartBlock::Busy);
     }
     if facts.queued_messages {
@@ -445,7 +448,6 @@ mod tests {
             agent: Agent::Claude,
             session_resolved: true,
             agent_process_found: true,
-            command_state: CommandState::Idle,
             ..RestartFacts::default()
         }
     }
@@ -479,12 +481,15 @@ mod tests {
             can_restart(SessionRestartMode::Harness, &agent_pane()),
             Ok(())
         );
-        // シェル統合が効かない構成（#766 の器）でも操作できる必要がある
-        let unknown = RestartFacts {
-            command_state: CommandState::Unknown,
+        // 生成中の判断材料は画面の中断ヒントだけ（下の番犬が OSC 133 の復活を止める）
+        let generating = RestartFacts {
+            agent_busy: true,
             ..agent_pane()
         };
-        assert_eq!(can_restart(SessionRestartMode::Harness, &unknown), Ok(()));
+        assert_eq!(
+            can_restart(SessionRestartMode::Harness, &generating),
+            Err(RestartBlock::Busy)
+        );
     }
 
     #[test]
@@ -574,13 +579,6 @@ mod tests {
             ),
             (
                 RestartFacts {
-                    command_state: CommandState::Running,
-                    ..agent_pane()
-                },
-                RestartBlock::Busy,
-            ),
-            (
-                RestartFacts {
                     queued_messages: true,
                     ..agent_pane()
                 },
@@ -622,6 +620,22 @@ mod tests {
     }
 
     /// 関門の順序は固定する（#1067）。生成中のペインに「会話を確認せよ」を出さない
+    /// **番犬**（#1067 の実機実測）: エージェントは「ペインのシェルが起動した前景
+    /// コマンド」なので、立っている間ペインの OSC 133 は**ずっと `Running`**。
+    /// これを busy の材料に戻すと、ハーネス更新の対象であるエージェントペインが
+    /// **常に** `busy` で断られる（実測: アイドルな worker で `reason=busy`）。
+    /// 判断材料を増やすときはこの理由を読んでから増やすこと
+    #[test]
+    fn osc133のコマンド状態を判断材料に戻していない() {
+        let src = include_str!("session_restart.rs");
+        // テストモジュールより前（= 実装本体）だけを見る
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !body.contains("CommandState"),
+            "OSC 133 のコマンド状態を判断材料へ戻してはいけない（理由はこのテストの doc）"
+        );
+    }
+
     #[test]
     fn 画面の状態を会話の解決より先に見る() {
         let busy_unresolved = RestartFacts {

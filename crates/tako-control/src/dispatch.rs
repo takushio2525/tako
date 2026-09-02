@@ -11117,8 +11117,9 @@ pub fn session_restart_menu_facts(
         // 会話の解決とプロセスの特定は重いのでここでは見ない（実行時に確かめる）
         session_resolved: false,
         agent_process_found: false,
-        command_state: session.map(|s| s.command_state()).unwrap_or_default(),
-        // `is_busy` は完了行（`Brewed for 2s · done`）も busy と読むので使えない（#1067 で実測）
+        // 生成中の材料は**画面の中断ヒントだけ**。`is_busy` は完了行
+        // （`Brewed for 2s · done`）も busy と読み、OSC 133 の `Running` は
+        // エージェントが立っている間ずっと真になる（どちらも #1067 で実測）
         agent_busy: crate::claude_tui::interrupt_hint_visible(&lines),
         queued_messages: crate::claude_tui::queued_messages_pending(&lines),
         // ダイアログの選択カーソルは入力欄と同じ字面なので、ダイアログ中は下書きと読まない（#748）
