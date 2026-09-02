@@ -37,6 +37,37 @@ Nightly patch release (automated). Changes since v0.8.1:
 
 ## [Unreleased]
 
+### Changed / 変更
+
+- **[改善] [Windows] PerMonitorV2 マニフェストを自己検査つきの不変条件にする (#1063)**
+  #1063「レイアウトがウインドウより 1.22 倍広く組まれ、タブバー右端・ウインドウ操作ボタン・
+  ステータスバーが画面外に出る / クリック位置が同じ倍率でずれる」を実機（Windows 11・
+  表示スケール 125%）で調べたところ、**製品側の欠陥は無かった**。症状は調査に使った
+  ヘルパースクリプトが DPI 非認識だったことによる錯覚で、DPI 非認識のプロセスでは
+  `GetWindowRect` / `SetCursorPos` が**物理 ÷ 表示倍率**を返すのに `CopyFromScreen` は
+  **物理のまま**返るため、保存された「スクリーンショット」が縮小ではなく**クロップ**になり
+  右 1/5 と下 1/5 が画像から消えていた（同じ瞬間の A/B で再現。crop 仮説 99.87% 画素一致 /
+  縮小仮説 75.42%）。PerMonitorV2 で測り直すと client 1920x1020・グリッド 198 桁 x 9.5253px
+  = 1886px で 34px 余っており、右端の 4 ボタンも下部ステータスバーも見えていて実クリックにも
+  反応する。ただし前提となる PerMonitorV2 マニフェストは tako のコードではなく **gpui の
+  既定フィーチャ**に乗っているだけで、落ちても「ぼやけるだけで一見動く」うえ macOS では
+  再現しない。そこで不変条件として明示した: 実測する境界
+  （`tako_core::platform::dpi`）+ 起動時の申告 + MCP `tako_check_health` の `dpi_awareness` +
+  セルフテスト項目 139（実機）+ 番犬（macOS でも走る）。計測の道具も
+  `scripts/windows/measure-window.ps1` として同梱し、**PerMonitorV2 を宣言できなければ
+  実行を拒否する**ようにした。
+  Investigated #1063 (Windows layout appearing ~1.22x wider than the window, clicks landing
+  off by the same factor) on real hardware at 125% scale and found **no product defect**: the
+  numbers came from DPI-unaware helper scripts, where `GetWindowRect` is virtualised but GDI
+  screen capture is not, so the saved screenshot was a *crop* of the real window rather than a
+  scaled copy. Re-measured per-monitor-aware, the terminal grid (198 cols x 9.5253 px = 1886 px)
+  fits the 1920 px client area, and the right-edge buttons and status bar are both visible and
+  clickable. The PerMonitorV2 manifest that makes this true comes from a gpui default feature
+  rather than tako's own code, so tako now asserts it explicitly: a `platform::dpi` boundary,
+  a startup diagnostic, `dpi_awareness` in the `tako_check_health` MCP tool, self-test item 139 on Windows,
+  and a watchdog that runs on macOS. `scripts/windows/measure-window.ps1` ships the correct
+  measurement tool and refuses to run if it cannot declare per-monitor awareness.
+
 ### Fixed / 修正
 
 - **[修正] `tako remote` が「起動中」を名乗ったまま tailnet から見えなくなる問題を根治 (#1049)**
