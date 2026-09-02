@@ -333,24 +333,82 @@ pub fn account_label_for_config_dir(config_dir: &std::path::Path) -> Option<Stri
     None
 }
 
+/// 解決結果の memo（**ペイン一覧は数秒ごとにポーリングされる**）。
+///
+/// `/api/v2/panes` と `/api/agents` はペインの数ぶん transcript を探して読む。
+/// 実測（この機・実 transcript）で **1 件 4.5ms / 20 件 91ms** かかったので、
+/// 所在（`read_dir` 100 プロジェクト分）と本文読みを毎回やらないようにする。
+///
+/// 無効化の鍵は **transcript の mtime**（claude が追記すれば必ず動く）。
+/// 繋ぎ直しで `bridge-session` が増えるときも mtime が動くので取りこぼさない。
+/// **daemon / GUI どちらの経路でも同じ物を通る**ので値が食い違わない
+type MemoKey = String;
+struct Memo {
+    path: std::path::PathBuf,
+    mtime: std::time::SystemTime,
+    link: RemoteLink,
+}
+
+fn memo() -> &'static std::sync::Mutex<std::collections::HashMap<MemoKey, Memo>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<MemoKey, Memo>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// memo に載っていて mtime が動いていなければそれを返す
+fn cached(session_id: &str) -> Option<RemoteLink> {
+    let guard = memo().lock().ok()?;
+    let entry = guard.get(session_id)?;
+    let mtime = std::fs::metadata(&entry.path).ok()?.modified().ok()?;
+    (mtime == entry.mtime).then(|| entry.link.clone())
+}
+
+fn remember(session_id: &str, path: &std::path::Path, link: &RemoteLink) {
+    let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return;
+    };
+    if let Ok(mut guard) = memo().lock() {
+        // 上限を置く（長寿命の daemon で無限に増えないように）。
+        // 超えたら丸ごと捨てる（LRU を持つほどの規模ではない）
+        if guard.len() >= 512 {
+            guard.clear();
+        }
+        guard.insert(
+            session_id.to_string(),
+            Memo {
+                path: path.to_path_buf(),
+                mtime,
+                link: link.clone(),
+            },
+        );
+    }
+}
+
 /// セッション id（claude の会話 UUID）から公式リンクを解決する。
 ///
 /// 見つからない / 読めないときは `Unknown`（**URL を捏造しない**）。
 /// 会話は読めたが繋がっていないときは `NotConnected`
 pub fn link_for_session(session_id: &str) -> RemoteLink {
+    if let Some(hit) = cached(session_id) {
+        return hit;
+    }
     let Some(location) = crate::transcript::locate_transcript(session_id) else {
+        // 所在が分からないものは memo しない（あとで現れうる）
         return RemoteLink::unknown();
     };
     let account_label = account_label_for_config_dir(&location.config_dir);
-    match read_link_at(&location.path) {
+    let link = match read_link_at(&location.path) {
         Ok(Some(mut link)) => {
             link.account_label = account_label;
             link
         }
         Ok(None) => RemoteLink::not_connected(account_label),
-        // 読めなかった = 判断材料が無い（繋がっていないとは言えない）
-        Err(_) => RemoteLink::unknown(),
-    }
+        // 読めなかった = 判断材料が無い（繋がっていないとは言えない）。
+        // 一時的な失敗を固定したくないので memo しない
+        Err(_) => return RemoteLink::unknown(),
+    };
+    remember(session_id, &location.path, &link);
+    link
 }
 
 /// **この機で Remote Control がそもそも成立しないか**を #1068 の判定で見る。
@@ -683,6 +741,40 @@ mod tests {
             camel["agents"][0]["remote_link"]["state"], "unknown",
             "正規化前のキーを読んでいる（実装が `sessionId` を見ている）"
         );
+    }
+
+    /// memo は **mtime が動いたら捨てる**（繋ぎ直しで id が変わるのを取りこぼさない）
+    #[test]
+    fn memoはmtimeで無効化される() {
+        let dir = std::env::temp_dir().join("tako-1069-memo-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.jsonl");
+        std::fs::write(&path, "x\n").unwrap();
+
+        let key = "memo-test-11111111-2222-3333-4444-555555555555";
+        let first = RemoteLink {
+            url: Some("https://claude.ai/code/session_01A".into()),
+            session_id: Some("session_01A".into()),
+            account_label: Some("default".into()),
+            state: LinkState::Connected,
+        };
+        remember(key, &path, &first);
+        assert_eq!(cached(key).as_ref(), Some(&first), "memo が効いていない");
+
+        // 追記して mtime を動かす（claude が書いた状況）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "x\ny\n").unwrap();
+        assert_eq!(
+            cached(key),
+            None,
+            "mtime が動いたのに古い値を返している（繋ぎ直しを取りこぼす）"
+        );
+
+        // ファイルが消えたら memo も使わない
+        remember(key, &path, &first);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(cached(key), None, "消えたファイルの memo を使っている");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

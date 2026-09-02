@@ -158,3 +158,47 @@ fn 見つからない会話はunknownになる() {
         LinkState::Unknown
     );
 }
+
+/// 一覧経路のコスト（`/api/v2/panes` は PWA がポーリングする）。
+/// **UI スレッドではない**（daemon 側）が、ペイン数ぶん transcript を探すので
+/// 桁を測っておく。閾値は緩め（環境差で落とさない）
+#[test]
+fn 一覧付与のコストが桁で問題ないこと() {
+    let (with_bridge, without_bridge) = sample_sessions();
+    let mut ids: Vec<String> = with_bridge;
+    ids.extend(without_bridge);
+    if ids.is_empty() {
+        eprintln!("skip: 材料が無い");
+        return;
+    }
+    // 20 ペイン相当（実運用の上限に近い）
+    let mut rows = Vec::new();
+    for i in 0..20 {
+        rows.push(serde_json::json!({ "session_id": ids[i % ids.len()] }));
+    }
+    // 1 回目（memo が空）
+    let mut first = serde_json::json!({ "agents": rows.clone() });
+    let t0 = std::time::Instant::now();
+    claude_remote_link::attach_to_agents(&mut first);
+    let cold = t0.elapsed();
+
+    // 2 回目以降（= PWA のポーリングの実態。mtime が動いていなければ memo が効く）
+    let mut second = serde_json::json!({ "agents": rows });
+    let t1 = std::time::Instant::now();
+    claude_remote_link::attach_to_agents(&mut second);
+    let warm = t1.elapsed();
+
+    eprintln!("20 件の付与: 初回 {cold:?} / 2 回目 {warm:?}");
+    // 結果は同じ（memo が値を変えていない）
+    assert_eq!(first, second, "memo が結果を変えている");
+    assert!(
+        cold < std::time::Duration::from_secs(3),
+        "20 件で 3 秒超は設計を見直す水準: {cold:?}"
+    );
+    // ポーリングの実態が初回より遅くなっていないこと（memo が効いている証拠）。
+    // 環境差で落とさないよう「初回以下」だけを要求する
+    assert!(
+        warm <= cold,
+        "2 回目が初回より遅い（memo が効いていない）: 初回 {cold:?} / 2 回目 {warm:?}"
+    );
+}
