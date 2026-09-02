@@ -174,6 +174,53 @@ tako setup --reset
 
 `--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
 
+### tako setup bootstrap
+
+Claude Code（`claude` コマンド）がまだ入っていない環境で、導入から認証までを案内・実行します。**`tako setup` が未導入を見つけたら自動でこの段を通る**ので、普段このコマンドを直接叩く必要はありません。AI から段ごとに操作したいときや、状態だけ確認したいときに使います。
+
+```bash
+tako setup bootstrap                      # 状態確認（既定。読み取り専用）
+tako setup bootstrap install --dry-run    # 何をどこに入れるかだけ表示
+tako setup bootstrap install              # 公式インストーラを実行
+tako setup bootstrap path                 # claude をどのターミナルからも使えるようにする
+tako setup bootstrap undo-path            # path で入れた設定を取り除く
+tako setup bootstrap handoff              # 別のエージェントへ導入を頼む
+```
+
+`次の一歩`（`next_step`）は 4 つのいずれかです。
+
+| 値 | 意味 |
+|---|---|
+| `install` | `claude` がまだ入っていない |
+| `path` | 入っているが、ターミナルから `claude` が呼べない |
+| `auth` | 入っているが、Claude アカウントにログインしていない |
+| `ready` | 導入は済んでいる |
+
+インストール前には必ず「実行するコマンド・取得元・置き場所・以後の更新」を表示します。管理者権限は使わず、ホームディレクトリの中だけで完結します。
+
+「どのターミナルからも使えるようにする」のやり方は OS で違います。macOS / Linux はログインシェルの設定ファイル（zsh なら `~/.zprofile`）へ 1 ブロック追記し、Windows は**ユーザー環境変数 `Path`** へ追記します（Windows 版の公式インストーラは PATH を自動では通さず、手作業を案内して終わるためです）。どちらも `undo-path` で元に戻せます。
+
+:::note[うまく入らないときは別のエージェントに頼めます]
+ネットワークやプロキシの都合でインストーラが動かないことがあります。そのとき codex / agy がすでに入っていれば、`tako setup` はそのエージェントへ「Claude Code を入れて」と頼むことを提案します（`tako setup bootstrap handoff` でも同じことができます）。1 つも入っていなければ、自分で実行するコマンドを表示して終わります。
+
+ログインだけはブラウザ操作が必要なので代行しません。`claude auth login` の実行をお願いする形になります。
+:::
+
+### tako setup deps
+
+tako が使う任意の外部ツール（ターミナルの永続化に使う tmux / psmux、git パネルの git、リモート接続の tailscale）の状態を確認し、その場で導入します。**どれも無くても tako 自体は動きます**が、欠けるとその機能が使えません。
+
+```bash
+tako setup deps                    # 状態確認（既定。読み取り専用）
+tako setup deps install            # 未導入のものを導入
+tako setup deps install --dep tmux # 1 つだけ導入
+tako setup deps install --dry-run  # 何を入れるかだけ表示
+```
+
+導入済みのものには触りません（何度実行しても同じ結果になります）。導入を代行できるのは macOS の Homebrew（`brew install`）で、Windows は打つべき `winget` のコマンドを表示します。
+
+標準の `tako setup` は質問をしないので、足りないツールがあっても状態と `tako setup deps install` の 1 行だけを表示します。1 つずつ「今すぐ入れますか？」と聞いてほしいときは `tako setup --review` を使ってください。
+
 ### tako setup-mcp
 
 エージェント CLI に tako の MCP サーバーを登録します。対話なしで登録だけしたいときに使います。

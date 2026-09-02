@@ -1197,12 +1197,28 @@ pub enum Request {
     /// 適用済みリビジョン・現在リビジョン・未適用の setup 関連変更の一覧を返す。
     /// 適用自体は `tako setup`（自動適用、個別見直しは --review）が行い、これは読み取り専用
     SetupChanges,
-    /// ゼロスタート導入の状態照会と実行（Issue #868）。
+    /// ゼロスタート導入の状態照会と実行（Issue #868 / #1057）。
     /// `action` = "status"（既定・読み取り専用）/ "install"（エージェント CLI の導入）/
-    /// "path"（ランチャーを PATH へ通す）/ "undo-path"（置いた PATH ブロックを取り除く）
+    /// "path"（ランチャーを PATH へ通す）/ "undo-path"（置いた PATH ブロックを取り除く）/
+    /// "handoff"（自動導入が通らないときの引き継ぎ計画。**読み取り専用**）
     SetupBootstrap {
         #[serde(default)]
         action: Option<String>,
+        /// install で実行せず計画だけ返す
+        #[serde(default)]
+        dry_run: Option<bool>,
+        /// handoff で「なぜ代行できなかったか」を指示文へ載せる（#1057）
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// 任意依存ツール（tmux / git / tailscale）の検出とその場導入（Issue #88 / #1057）。
+    /// `action` = "status"（既定・読み取り専用）/ "install"（未導入のものを導入）
+    SetupDeps {
+        #[serde(default)]
+        action: Option<String>,
+        /// 対象の実行ファイル名。省略で未導入のものすべて
+        #[serde(default)]
+        dep: Option<String>,
         /// install で実行せず計画だけ返す
         #[serde(default)]
         dry_run: Option<bool>,
@@ -1893,9 +1909,19 @@ mod tests {
             Request::SetupBootstrap {
                 action: None,
                 dry_run: None,
+                reason: None,
             }
             .kind_name(),
             "SetupBootstrap"
+        );
+        assert_eq!(
+            Request::SetupDeps {
+                action: None,
+                dep: None,
+                dry_run: None,
+            }
+            .kind_name(),
+            "SetupDeps"
         );
         assert_eq!(Request::TmuxList { socket: None }.kind_name(), "TmuxList");
     }

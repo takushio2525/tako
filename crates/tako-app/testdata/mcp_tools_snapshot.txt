@@ -109,6 +109,7 @@ tako_settings
 tako_setup
 tako_setup_bootstrap
 tako_setup_changes
+tako_setup_deps
 tako_setup_mcp
 tako_setup_models
 tako_shell_integration

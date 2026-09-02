@@ -340,7 +340,11 @@ fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
 ///
 /// 出力は必ず [`container_safe_script`] を通してから符号化する（#906）。
 /// `TAKO_906_NO_PAD=1` で修正前（素の符号化）へ戻せる = 同一バイナリで A/B が取れる
-pub(crate) fn encode_powershell_command(script: &str) -> String {
+///
+/// **`pub`**（#1057）: ユーザー PATH 境界（[`super::user_path`]）が
+/// レジストリ操作の PowerShell 片を同じ符号化で渡す。符号化の実装を
+/// 2 つ持たないためにここを公開している（新しい判定は増やさない）
+pub fn encode_powershell_command(script: &str) -> String {
     let script = if std::env::var_os("TAKO_906_NO_PAD").is_some() {
         std::borrow::Cow::Borrowed(script)
     } else {

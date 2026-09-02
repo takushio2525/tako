@@ -3934,3 +3934,17 @@
   GUI 構成通し検証まで起動しない**（起動すると既定探索が入れ替わる）
 - master の watch は GUI 再起動を生き延びる設計と実証（#665 に記録・偽 WORKER_GONE の穴も同所）。
   worker → master の Cross-Session 連絡は誤配達 2 件 → 禁止を worker プロンプト定型へ（#663）
+
+## 2026-09-01（#1057: setup の依存導入を案内止まりから実行代行へ）
+- Windows の Claude Code 自動インストール（`install.ps1` を `-ExecutionPolicy Bypass -File`）+
+  ユーザー環境変数 Path への PATH 通し（境界 B23 `platform::user_path`）+ 失敗時の codex / agy への
+  引き継ぎ + macOS の任意依存その場導入（#88 が #262 の質問ゼロ化以降**死んだコード**だったのを
+  `setup_deps` へ集約して復活）。`tako setup deps` / MCP `tako_setup_deps`（143 ツール）
+- **実測で覆った前提**: Windows 版の公式インストーラは **PATH を通さず手作業を案内して終わる**
+  （実機の出力で確認）ので tako の PATH 段は必須。`exe::find` は PATH 外まで走査するため
+  on_path 判定に使うと段が飛ぶ
+- 検証: Windows 11 実機で `tako setup --yes` 一発が install → PATH → 認証誘導まで到達 /
+  `undo-path` がレジストリを**バイト一致**で復帰（末尾 `;` の保持漏れを実機で発見・修正）/
+  `TAKO_1057_LEGACY=1` の A/B で legacy が install を拒否（`legacy_launcher_exists=False`）/
+  macOS 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 119 拡張・137 新設）。証拠は `~/dev/tako-evidence/1057/`
+- 次: PR レビュー → merge → install（master 判断）

@@ -195,10 +195,10 @@ pub mod notes {
         "Switching the display mode and the chat view work, but the command injection behind the starter cards hardcodes LF and POSIX quoting, so nothing runs on Windows (#899; PR #931 is awaiting verification on real hardware)",
     );
 
-    /// #868 / #525。状態照会と手順の提示はできるが、実行の代行は macOS だけ
-    pub const WIN_SETUP_BOOTSTRAP: Note = Note::new(
-        "状態の確認と公式手順の案内はできるが、インストールの実行代行は macOS だけ（Windows は PowerShell 版インストーラを案内する）",
-        "Status and official instructions work, but tako only runs the installer for you on macOS (on Windows it points to the PowerShell installer)",
+    /// #1057。検出は両 OS で動くが、パッケージ導入の代行は brew（macOS）だけ
+    pub const WIN_SETUP_DEPS: Note = Note::new(
+        "依存の検出はできるが、導入の実行代行は macOS（Homebrew）だけ。Windows は winget のコマンドを案内する",
+        "Dependency detection works, but tako only runs the installer for you on macOS (Homebrew); on Windows it prints the winget command instead",
     );
 
     /// #970。`canonicalize` の verbatim prefix が OSC 7 経路で `///?/…` へ壊れる
@@ -1378,11 +1378,10 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup_bootstrap",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_SETUP_BOOTSTRAP,
-        },
-        windows_evidence: Evidence::SelfTest(
-            "項目 119（status が next_step を返す・install --dry-run は実行しない・不明な action を拒否）",
+        // #1057 で実行代行（install / path）を Windows へ配線し実機で通した
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り",
         ),
     },
     Feature {
@@ -1391,6 +1390,18 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
         windows_evidence: Evidence::UnitTest(
             "changes.yaml の連番・platforms 絞り込みテストが実機で緑（#525 が platforms: を最初に使う）",
+        ),
+    },
+    Feature {
+        key: "tako_setup_deps",
+        macos: Support::Supported,
+        // 検出は両 OS で動くが、導入の代行は brew（macOS）だけ。
+        // Windows は winget のコマンドを案内する（実機実測を経てから代行する）
+        windows: Support::Degraded {
+            note: notes::WIN_SETUP_DEPS,
+        },
+        windows_evidence: Evidence::Measured(
+            "#1057 の Windows 11 実測: `tako setup deps` が器（psmux）/ git / tailscale を実際の解決結果つきで列挙し、install は winget を代行せず not_delegable で理由 + コマンドを返す",
         ),
     },
     Feature {

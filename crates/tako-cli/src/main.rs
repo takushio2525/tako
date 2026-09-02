@@ -2608,14 +2608,28 @@ enum SetupCommand {
         #[arg(long)]
         json: bool,
     },
-    /// エージェント CLI の導入状況を確認・実行する（#868）
+    /// エージェント CLI の導入状況を確認・実行する（#868 / #1057）
     Bootstrap {
-        /// status（既定・読み取り専用）/ install / path / undo-path
+        /// status（既定・読み取り専用）/ install / path / undo-path / handoff
         action: Option<String>,
         /// install で実行せず「何をどこに入れるか」だけ出す
         #[arg(long)]
         dry_run: bool,
         /// 出力を JSON にする（MCP tako_setup_bootstrap と同一ペイロード）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 任意依存ツール（tmux / git / tailscale）の状態確認とその場導入（#88 / #1057）
+    Deps {
+        /// status（既定・読み取り専用）/ install
+        action: Option<String>,
+        /// install の対象を 1 件に絞る（省略で未導入のものすべて）
+        #[arg(long)]
+        dep: Option<String>,
+        /// install で実行せず何を入れるかだけ出す
+        #[arg(long)]
+        dry_run: bool,
+        /// 出力を JSON にする（MCP tako_setup_deps と同一ペイロード）
         #[arg(long)]
         json: bool,
     },
@@ -2868,6 +2882,14 @@ fn cli_main() -> ExitCode {
             }) = args.command
             {
                 setup::run_bootstrap(action.as_deref(), dry_run, json)
+            } else if let Some(SetupCommand::Deps {
+                ref action,
+                ref dep,
+                dry_run,
+                json,
+            }) = args.command
+            {
+                setup::run_deps(action.as_deref(), dep.as_deref(), dry_run, json)
             } else if args.check {
                 setup::run_check()
             } else if args.changes {

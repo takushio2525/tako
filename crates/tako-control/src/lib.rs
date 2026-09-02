@@ -63,6 +63,7 @@ pub mod sessions;
 pub mod settings;
 pub mod setup;
 pub mod setup_bootstrap;
+pub mod setup_deps;
 pub mod shell_integration;
 pub mod sleep_guard;
 pub mod ssh_detect;

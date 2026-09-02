@@ -3249,7 +3249,11 @@ fn dispatch_inner(
             crate::setup::changes_status().map_err(DispatchError::Operation)
         }
 
-        Request::SetupBootstrap { action, dry_run } => {
+        Request::SetupBootstrap {
+            action,
+            dry_run,
+            reason,
+        } => {
             // 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）
             let action = action.as_deref().unwrap_or("status");
             match action {
@@ -3268,8 +3272,40 @@ fn dispatch_inner(
                 "undo-path" => {
                     crate::setup_bootstrap::undo_path().map_err(DispatchError::Operation)
                 }
+                // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
+                // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
+                // `tako_orchestrator_spawn` / `tako_run` の仕事
+                "handoff" => crate::setup_bootstrap::handoff_plan(reason.as_deref())
+                    .map_err(DispatchError::Operation),
                 other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / install / path / undo-path のいずれか）"
+                    "不明な action: {other:?}（status / install / path / undo-path / handoff のいずれか）"
+                ))),
+            }
+        }
+
+        Request::SetupDeps {
+            action,
+            dep,
+            dry_run,
+        } => {
+            // 依存の検出と brew / winget での導入。プロセス内で完結する（#88 / #1057）
+            let action = action.as_deref().unwrap_or("status");
+            match action {
+                "status" => Ok(serde_json::json!({
+                    "deps": crate::setup_deps::status_json(),
+                    "install_command": "tako setup deps install",
+                })),
+                "install" => crate::setup_deps::install(
+                    dep.as_deref(),
+                    crate::setup_deps::DepInstallOptions {
+                        dry_run: dry_run.unwrap_or(false),
+                        // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
+                        interactive: false,
+                    },
+                )
+                .map_err(DispatchError::Operation),
+                other => Err(DispatchError::InvalidParams(format!(
+                    "不明な action: {other:?}（status / install のいずれか）"
                 ))),
             }
         }

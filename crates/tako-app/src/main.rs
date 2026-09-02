@@ -53544,6 +53544,7 @@ mod self_test {
                                 tako_control::protocol::Request::SetupBootstrap {
                                     action: Some(action.into()),
                                     dry_run,
+                                    reason: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -53624,6 +53625,51 @@ mod self_test {
                     ),
                 );
 
+                // handoff（#1057）: **読み取り専用**で、代行を頼む指示文と
+                // 候補が無いときの案内を必ず持つ
+                let handoff = dispatch_bootstrap("handoff", None);
+                let available = handoff
+                    .as_ref()
+                    .and_then(|v| v["available"].as_bool())
+                    .unwrap_or(false);
+                let prompt = handoff
+                    .as_ref()
+                    .and_then(|v| v["prompt"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let fallback = handoff
+                    .as_ref()
+                    .and_then(|v| v["fallback"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // 期待値は**この環境の計画そのもの**から作る（#920 と同じ作法）
+                check(
+                    prompt.contains(recipe.source.official_command)
+                        && prompt.contains("claude auth login")
+                        && prompt.contains("tako setup bootstrap status")
+                        && fallback.contains(recipe.source.official_command),
+                    &format!(
+                        "119: handoff が指示文と案内を返す (#1057) available={available} \
+                         prompt_len={} fallback_len={}",
+                        prompt.len(),
+                        fallback.len()
+                    ),
+                );
+                // 候補に claude 自身は並ばない（入れる対象なので引き継ぎ先になりえない）
+                let candidate_agents: Vec<String> = handoff
+                    .as_ref()
+                    .and_then(|v| v["candidates"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c["agent"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                check(
+                    !candidate_agents.iter().any(|a| a == "claude"),
+                    &format!("119: 引き継ぎ先に claude を選ばない (#1057) {candidate_agents:?}"),
+                );
+
                 // 不明な action は選択肢つきで拒否される（黙って何かしない）
                 let bad = window
                     .update(cx, |app, _, _cx| {
@@ -53632,6 +53678,7 @@ mod self_test {
                             tako_control::protocol::Request::SetupBootstrap {
                                 action: Some("nope".into()),
                                 dry_run: None,
+                                reason: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -53643,17 +53690,159 @@ mod self_test {
                 check(
                     bad.as_deref().is_some_and(|m| m.contains("status")
                         && m.contains("install")
-                        && m.contains("path")),
+                        && m.contains("path")
+                        && m.contains("handoff")),
                     &format!("119: 不明な action を選択肢つきで拒否する (#868) err={bad:?}"),
+                );
+
+                // 段の不変条件: `path` は「入っているが PATH から引けない」だけ。
+                // Windows で PATH 判定に `exe::find`（PATH 外まで走査）を使うと
+                // ここが破れる（= 段が飛んで PATH を通さない。#1057）
+                let installed = status
+                    .as_ref()
+                    .and_then(|v| v["installed"].as_bool())
+                    .unwrap_or(false);
+                let on_path = status
+                    .as_ref()
+                    .and_then(|v| v["launcher_dir_on_path"].as_bool())
+                    .unwrap_or(false);
+                check(
+                    (step.as_deref() == Some("path")) == (installed && !on_path),
+                    &format!(
+                        "119: path の段は installed かつ PATH 未通しのときだけ (#1057) \
+                         step={step:?} installed={installed} on_path={on_path}"
+                    ),
                 );
 
                 // 「走ったこと」を観測可能にする（#796: 出るはずのものが出ないと
                 // 素通りしたのか通ったのか区別が付かない）
                 eprintln!(
-                    "TAKO_SELF_TEST_868: step={step:?} plan_lines={} dry_run_performed={:?} rejected={}",
+                    "TAKO_SELF_TEST_868: step={step:?} plan_lines={} dry_run_performed={:?} rejected={} \
+                     installed={installed} on_path={on_path} handoff_available={available} \
+                     candidates={candidate_agents:?}",
                     plan_lines.len(),
                     dry.as_ref().and_then(|v| v["performed"].as_bool()),
                     bad.is_some(),
+                );
+            }
+
+            // 137: 任意依存のその場導入 (#88 / #1057)。**実 dispatch 経路**で
+            // 検出・計画・冪等・拒否を固定する。この項目は決して実インストールを
+            // 行わない（`install` は必ず dry_run で呼ぶ）
+            {
+                let mut dispatch_deps = |action: &str, dep: Option<&str>, dry_run: Option<bool>| {
+                    let dep = dep.map(String::from);
+                    window
+                        .update(cx, |app, _, _cx| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::SetupDeps {
+                                    action: Some(action.into()),
+                                    dep: dep.clone(),
+                                    dry_run,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                        })
+                        .ok()
+                };
+
+                // status: 依存の一覧。名前はプラットフォームで変わるので
+                // **期待値は正本の表から作る**（macOS = tmux / Windows = psmux）
+                let status = dispatch_deps("status", None, None).and_then(Result::ok);
+                let bins: Vec<String> = status
+                    .as_ref()
+                    .and_then(|v| v["deps"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|d| d["bin"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let expected: Vec<String> = tako_control::setup_deps::current_deps()
+                    .iter()
+                    .map(|d| d.bin.to_string())
+                    .collect();
+                check(
+                    bins == expected && !bins.is_empty(),
+                    &format!("137: deps status が依存を列挙する (#1057) bins={bins:?}"),
+                );
+                // 用途と次の一手が必ず付く（黙って「見つかりません」で終わらせない）
+                let annotated = status
+                    .as_ref()
+                    .and_then(|v| v["deps"].as_array())
+                    .is_some_and(|a| {
+                        a.iter().all(|d| {
+                            d["purpose"].as_str().is_some_and(|p| !p.is_empty())
+                                && (d["found"].is_string()
+                                    || d["install_command"].as_str().is_some_and(|c| !c.is_empty())
+                                    || d["hint"].as_str().is_some_and(|h| !h.is_empty()))
+                        })
+                    });
+                check(
+                    annotated,
+                    "137: 未導入の依存に用途と次の一手が付く (#1057)",
+                );
+
+                // install --dry-run は 1 つも実行しない
+                let dry = dispatch_deps("install", None, Some(true)).and_then(Result::ok);
+                let planned: Vec<String> = dry
+                    .as_ref()
+                    .and_then(|v| v["planned"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p["bin"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                check(
+                    dry.as_ref().and_then(|v| v["performed"].as_bool()) == Some(false)
+                        && dry
+                            .as_ref()
+                            .and_then(|v| v["installed"].as_array())
+                            .is_some_and(|a| a.is_empty()),
+                    &format!(
+                        "137: deps install --dry-run は実行しない (#1057) performed={:?}",
+                        dry.as_ref().and_then(|v| v["performed"].as_bool())
+                    ),
+                );
+                // 冪等: 導入済みのものは計画に載らない
+                let installed_bins: Vec<String> = tako_control::setup_deps::status()
+                    .into_iter()
+                    .filter(|s| s.found.is_some())
+                    .map(|s| s.dep.bin.to_string())
+                    .collect();
+                check(
+                    !planned.iter().any(|p| installed_bins.contains(p)),
+                    &format!(
+                        "137: 導入済みの依存は計画に載らない (#1057) \
+                         planned={planned:?} installed={installed_bins:?}"
+                    ),
+                );
+
+                // 不明な dep / action は理由つきで拒否される（黙って何もしない、をしない）
+                let bad_dep = dispatch_deps("install", Some("nosuchtool"), Some(true))
+                    .and_then(Result::err)
+                    .map(|e| e.to_string());
+                let bad_action = dispatch_deps("nope", None, None)
+                    .and_then(Result::err)
+                    .map(|e| e.to_string());
+                check(
+                    bad_dep.as_deref().is_some_and(|m| m.contains("nosuchtool"))
+                        && bad_action
+                            .as_deref()
+                            .is_some_and(|m| m.contains("status") && m.contains("install")),
+                    &format!(
+                        "137: 不明な dep / action を理由つきで拒否する (#1057) \
+                         dep={bad_dep:?} action={bad_action:?}"
+                    ),
+                );
+
+                eprintln!(
+                    "TAKO_SELF_TEST_1057: bins={bins:?} planned={planned:?} \
+                     installed={installed_bins:?} rejected_dep={} rejected_action={}",
+                    bad_dep.is_some(),
+                    bad_action.is_some(),
                 );
             }
 
