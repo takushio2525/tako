@@ -28,6 +28,19 @@
 //! 計測する側は必ず PerMonitorV2 を宣言すること。道具は
 //! `scripts/windows/measure-window.ps1` に置いてある。
 //!
+//! ## どのプロセスの話か（実測で 1 回間違えた）
+//!
+//! マニフェストが焼かれるのは **`tako-app.exe`（GUI）だけ**。gpui のビルドスクリプトが
+//! 出す `cargo:rustc-link-lib` は最終バイナリのリンクに効くので、gpui に依存しない
+//! `tako.exe`（CLI）や `cargo test` のテストバイナリは **Windows でも DPI 非認識**で動く
+//! （実機で実測）。どちらもウィンドウを持たないのでそれで正しい。
+//!
+//! したがって `expected_here()` / `healthy_here()` / [`degraded_note_here`] が言う
+//! 「期待」は **GUI プロセスに対する期待**で、呼ぶのは tako-app（起動時の申告と
+//! `check_health`）だけにしてある。ここの単体テストは「OS へ問い合わせられるか」までしか
+//! 見ない（テストバイナリにマニフェストは無いため）。**GUI が本当に PerMonitorV2 かは
+//! セルフテスト項目 139 が実プロセスの中で見る**。
+//!
 //! 判定は純粋関数なので **macOS 上から Windows 側の期待値と文言を検証できる**
 //! （`support` / `window_lifecycle` と同じ作法）。
 
@@ -132,7 +145,8 @@ pub fn degraded_note(actual: DpiAwareness, platform: Platform) -> Option<Note> {
     })
 }
 
-/// この環境の期待値
+/// この環境の期待値。**GUI プロセス（tako-app）に対する期待**で、
+/// マニフェストを持たない CLI / テストバイナリへ当ててはいけない（モジュール doc 参照）
 pub fn expected_here() -> DpiAwareness {
     if cfg!(windows) {
         expected_for(Platform::Windows)
@@ -146,7 +160,7 @@ pub fn process_awareness() -> DpiAwareness {
     imp::process_awareness()
 }
 
-/// 実測が期待どおりか
+/// 実測が期待どおりか。**GUI プロセスから呼ぶこと**（モジュール doc 参照）
 pub fn healthy_here() -> bool {
     let platform = if cfg!(windows) {
         Platform::Windows
@@ -156,7 +170,8 @@ pub fn healthy_here() -> bool {
     is_expected(process_awareness(), platform)
 }
 
-/// 期待から外れているときの説明（日英）。期待どおりなら `None`
+/// 期待から外れているときの説明（日英）。期待どおりなら `None`。
+/// **GUI プロセスから呼ぶこと**（モジュール doc 参照）
 pub fn degraded_note_here() -> Option<Note> {
     let platform = if cfg!(windows) {
         Platform::Windows
@@ -287,17 +302,27 @@ mod tests {
     }
 
     #[test]
-    fn この環境の実測は期待どおり() {
-        // macOS: NotApplicable。Windows 実機: マニフェストが効いていれば PerMonitorV2。
-        // **落ちたらマニフェストが埋め込まれていない**（#1063 が本物になる条件）
+    fn この環境の実測は問い合わせに成功する() {
+        // **ここは「GUI が PerMonitorV2 か」を見る場所ではない**。マニフェストは
+        // tako-app.exe にだけ焼かれるので、このテストバイナリは Windows でも
+        // DPI 非認識で動く（実機で実測。窓を持たないのでそれで正しい）。
+        // GUI の水準はセルフテスト項目 139 が実プロセスの中で見る
         let actual = process_awareness();
-        assert_eq!(
-            actual,
-            expected_here(),
-            "DPI 認識レベルが期待と違う: {actual:?}（{:?}）",
-            degraded_note_here().map(|n| n.text_in(Lang::Ja))
-        );
-        assert!(healthy_here());
-        assert!(degraded_note_here().is_none());
+        if cfg!(windows) {
+            assert_ne!(
+                actual,
+                DpiAwareness::NotApplicable,
+                "Windows では OS へ問い合わせられるはず"
+            );
+            assert_ne!(
+                actual,
+                DpiAwareness::Unknown,
+                "DPI 認識レベルの問い合わせに失敗した（API が引けない）"
+            );
+        } else {
+            assert_eq!(actual, DpiAwareness::NotApplicable);
+            assert!(healthy_here());
+            assert!(degraded_note_here().is_none());
+        }
     }
 }
