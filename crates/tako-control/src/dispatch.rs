@@ -3774,21 +3774,30 @@ fn dispatch_inner(
                 // #720: いま各ペインが何として描かれているか（terminal / starter / chat /
                 // preparing）。揮発なので永続化しない。「チャットがまだ出ない」理由
                 // （= 過渡期の preparing なのか、判定がターミナルに倒れたのか）が分かる
-                let mut displays: Vec<(u64, &str)> = host
+                let mut displays: Vec<(u64, tako_core::ui_mode::PaneDisplayStatus)> = host
                     .pane_displays()
                     .into_iter()
-                    .map(|(pane, display)| (pane.as_u64(), display.as_str()))
+                    .map(|(pane, status)| (pane.as_u64(), status))
                     .collect();
-                displays.sort_unstable();
+                displays.sort_by_key(|(pane, _)| *pane);
                 let pane_display: serde_json::Map<String, Value> = displays
-                    .into_iter()
-                    .map(|(pane, display)| (pane.to_string(), serde_json::json!(display)))
+                    .iter()
+                    .map(|(pane, status)| {
+                        (pane.to_string(), serde_json::json!(status.display.as_str()))
+                    })
+                    .collect();
+                // #1058: 「なぜスターター / チャットにならないのか」を材料つきで出す。
+                // 黙ってターミナル表示へ落ちるのを止めるための診断で、判定は変えていない
+                let pane_display_reason: serde_json::Map<String, Value> = displays
+                    .iter()
+                    .map(|(pane, status)| (pane.to_string(), pane_display_reason_json(status)))
                     .collect();
                 serde_json::json!({
                     "ui_mode": host.ui_mode().as_str(),
                     "available": UiMode::VALUES,
                     "released_panes": released,
                     "pane_display": pane_display,
+                    "pane_display_reason": pane_display_reason,
                 })
             };
             let apply = |host: &mut dyn ControlHost,
@@ -10242,6 +10251,39 @@ fn pinned_json(host: &dyn ControlHost) -> Value {
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
 fn title_source_str(source: tako_core::TitleSource) -> &'static str {
     source.as_str()
+}
+
+/// ペイン表示の理由 + 材料の JSON（#1058）。**理由と次の一手を対で出す**規約に合わせ、
+/// 日英どちらも載せる（`note` は現在の表示言語で解決したもの）。
+///
+/// `reason` が null = スターター / チャット / 準備中が出ている = 説明する必要が無い状態
+fn pane_display_reason_json(status: &tako_core::ui_mode::PaneDisplayStatus) -> Value {
+    let m = status.materials;
+    let mut out = json!({
+        "display": status.display.as_str(),
+        "reason": status.reason.map(|r| r.as_str()),
+        "materials": {
+            "command_state": command_state_str(m.command_state),
+            "has_role": m.has_role,
+            "busy_children": m.busy_children,
+            "released": m.released,
+            "alt_screen": m.alt_screen,
+            "claude_chat": m.claude_chat,
+            "settling": m.settling,
+        },
+    });
+    if let Some(reason) = status.reason {
+        let note = reason.note();
+        out["note"] = json!(note.text());
+        out["note_ja"] = json!(note.ja());
+        out["note_en"] = json!(note.en());
+        if let Some(step) = reason.next_step() {
+            out["next_step"] = json!(step.text());
+            out["next_step_ja"] = json!(step.ja());
+            out["next_step_en"] = json!(step.en());
+        }
+    }
+    out
 }
 
 /// コマンド実行状態の文字列表現（list / MCP 公開用）

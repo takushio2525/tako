@@ -2551,7 +2551,11 @@ pub fn tools() -> Vec<Value> {
                 永続化され、全ウィンドウへ即時反映される。\
                 action=release: pane で指定したペインだけをターミナル表示に戻す（揮発。\
                 再起動すると gui 表示へ戻る）。action=restore: その解除を取り消す。\
-                表示レイヤだけの切替なので PTY・tmux セッション・実行中プロセスには影響しない。",
+                表示レイヤだけの切替なので PTY・tmux セッション・実行中プロセスには影響しない。\
+                応答の pane_display は各ペインにいま何が出ているか（terminal / starter / chat / \
+                preparing）で、pane_display_reason は**スターター / チャットにならない理由**\
+                （reason / note / next_step / materials）を返す（#1058。gui にしたのに \
+                スターターが出ないときは、まずここで欠けている材料を確かめる）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

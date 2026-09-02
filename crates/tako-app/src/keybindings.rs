@@ -58,6 +58,9 @@ actions!(
         ToggleFullScreen,
         ToggleDrawer,
         ToggleTheme,
+        // #1058: 表示モード切替。キーバインドは張らず（既存の打鍵を奪わない）
+        // メニュー / パレット / タブバーのボタンから発火する
+        ToggleUiMode,
         SwitchLanguage,
         ShowFleetPanel,
         ShowOrchPanel,

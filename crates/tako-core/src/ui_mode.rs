@@ -7,6 +7,7 @@
 //! 判定を純関数にしてあるのは、誤爆（チャット化・スターター化すべきでないペインを
 //! 置き換える）が実害の大きい失敗だから。GUI を起動せずに表の全行を unit test できる。
 
+use crate::platform::support::Note;
 use crate::terminal::CommandState;
 use std::time::Duration;
 
@@ -200,6 +201,179 @@ pub fn pane_display(input: PaneDisplayInput) -> PaneDisplay {
         return PaneDisplay::Preparing;
     }
     PaneDisplay::Terminal
+}
+
+/// GUI モードなのにスターター / チャットにならず**ターミナル表示へ倒れた理由**（#1058）。
+///
+/// 判定（[`pane_display`]）そのものは変えない。**黙って縮退しない**ための診断で、
+/// 「GUI モードにしたのにスターターが出ない」を人と AI が同じ材料で切り分けられるようにする。
+/// 実際に #1058 は「どの材料が欠けているのか外から見えない」ことが調査の壁になった。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalReason {
+    /// そもそも GUI モードになっていない（既定値のまま）= #1058 のユーザー実機の状態
+    ModeTerminal,
+    /// このペインだけ「コマンド入力へ」で解除されている（揮発）
+    Released,
+    /// 全画面 TUI（vim 等）が動いているので置き換えられない
+    AltScreen,
+    /// role 付き（エージェント用途）だが、まだチャットとして確定していない
+    Role,
+    /// ペインに実行中の子プロセスがある
+    BusyChildren,
+    /// コマンド実行中（OSC 133）
+    Running,
+    /// 直前のコマンドが失敗して画面にエラーが残っている（隠さない）
+    Failed,
+    /// OSC 133 が届いていないので判断できない = **前提（シェル統合）が欠けている疑い**
+    ShellStateUnknown,
+}
+
+impl TerminalReason {
+    /// CLI / MCP へ出す安定した識別子
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModeTerminal => "mode_terminal",
+            Self::Released => "released",
+            Self::AltScreen => "alt_screen",
+            Self::Role => "role",
+            Self::BusyChildren => "busy_children",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::ShellStateUnknown => "shell_state_unknown",
+        }
+    }
+
+    /// 理由の説明（日英併記。`conventions.md` の i18n 規約）
+    pub fn note(self) -> Note {
+        match self {
+            Self::ModeTerminal => Note::new(
+                "GUI ライク表示モードになっていない（既定はターミナル表示）",
+                "The GUI-like display mode is off (terminal display is the default)",
+            ),
+            Self::Released => Note::new(
+                "このペインは「コマンド入力へ」でターミナル表示に戻されている",
+                "This pane was switched back to terminal display by \"use the command line\"",
+            ),
+            Self::AltScreen => Note::new(
+                "全画面 TUI が動いているので置き換えられない",
+                "A full-screen TUI is running, so the pane cannot be replaced",
+            ),
+            Self::Role => Note::new(
+                "エージェント用途のペイン（role 付き）で、まだチャットとして確定していない",
+                "This pane has an agent role and has not been confirmed as a chat yet",
+            ),
+            Self::BusyChildren => Note::new(
+                "ペインで子プロセスが動いている",
+                "A child process is running in this pane",
+            ),
+            Self::Running => Note::new(
+                "コマンドを実行中",
+                "A command is running",
+            ),
+            Self::Failed => Note::new(
+                "直前のコマンドが失敗した（画面のエラーを隠さない）",
+                "The last command failed (the error on screen is not hidden)",
+            ),
+            Self::ShellStateUnknown => Note::new(
+                "シェルのコマンド状態（OSC 133）が届いていないので判断できない。シェル統合が効いていない可能性がある",
+                "The shell command state (OSC 133) is not arriving, so the pane cannot be judged. Shell integration may not be in effect",
+            ),
+        }
+    }
+
+    /// 次の一手（無いものは `None`）。**「理由 + 次の一手」を必ず対で出す**規約に合わせる
+    pub fn next_step(self) -> Option<Note> {
+        match self {
+            Self::ModeTerminal => Some(Note::new(
+                "`tako ui-mode gui` / 表示メニューの「表示モードを切り替え」/ ⌘K パレットのいずれかで切り替える",
+                "Switch it with `tako ui-mode gui`, View menu > \"Toggle display mode\", or the command palette",
+            )),
+            Self::Released => Some(Note::new(
+                "`tako ui-mode restore --pane <N>` でこのペインの解除を戻す",
+                "Undo it for this pane with `tako ui-mode restore --pane <N>`",
+            )),
+            Self::ShellStateUnknown => Some(Note::new(
+                "`tako shell-integration` で配置と実効を確認する（Windows は `install` が必要）",
+                "Check placement and effectiveness with `tako shell-integration` (Windows needs `install`)",
+            )),
+            // 残りは「そういう状態だから出さない」= 正常な判断なので次の一手は無い
+            Self::AltScreen | Self::Role | Self::BusyChildren | Self::Running | Self::Failed => None,
+        }
+    }
+}
+
+/// ターミナル表示に倒れた理由（[`PaneDisplay::Terminal`] 以外なら `None`）。
+///
+/// 評価順は [`pane_display`] の判定表と**同じ先勝ち**で、最後の「素の Terminal」だけは
+/// 欠けている材料を名指しする（`state` → `has_role` → `busy_children` の順。
+/// **一番効く手が要るものを先に出す**ため、判断不能（シェル統合の不在）を最優先にする）
+pub fn terminal_reason(input: PaneDisplayInput) -> Option<TerminalReason> {
+    if pane_display(input) != PaneDisplay::Terminal {
+        return None;
+    }
+    if !input.mode.is_gui() {
+        return Some(TerminalReason::ModeTerminal);
+    }
+    if input.released {
+        return Some(TerminalReason::Released);
+    }
+    if input.alt_screen {
+        return Some(TerminalReason::AltScreen);
+    }
+    Some(match input.state {
+        CommandState::Unknown => TerminalReason::ShellStateUnknown,
+        CommandState::Running => TerminalReason::Running,
+        CommandState::Failed(_) => TerminalReason::Failed,
+        CommandState::Idle if input.has_role => TerminalReason::Role,
+        // Idle + role なし で Terminal に来るのは子プロセスが動いているときだけ
+        _ => TerminalReason::BusyChildren,
+    })
+}
+
+/// 判定に使った材料そのもの（#1058 の診断）。**判定を変えずに「なぜ」を外へ出す**ための鏡。
+///
+/// #1058 の調査では「どの材料が欠けているのか」が外から見えず、実機に GUI を立てて
+/// 画面を撮るまで切り分けられなかった。ここを CLI / MCP へ出しておけば同じ調査が 1 往復で済む
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneDisplayMaterials {
+    pub command_state: CommandState,
+    pub has_role: bool,
+    pub busy_children: bool,
+    pub released: bool,
+    pub alt_screen: bool,
+    pub claude_chat: bool,
+    /// 過渡期（#720）の猶予がまだ生きているか
+    pub settling: bool,
+}
+
+/// 1 ペインの表示種別 + そうなった理由 + 材料（#720 / #1058）。
+///
+/// **必ず [`PaneDisplayInput`] から作る**ので、画面の判定（[`pane_display`]）と
+/// 診断が食い違わない（二重実装を作らないための型）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneDisplayStatus {
+    pub display: PaneDisplay,
+    /// ターミナル表示に倒れた理由（それ以外は `None`）
+    pub reason: Option<TerminalReason>,
+    pub materials: PaneDisplayMaterials,
+}
+
+impl PaneDisplayStatus {
+    pub fn from_input(input: PaneDisplayInput) -> Self {
+        Self {
+            display: pane_display(input),
+            reason: terminal_reason(input),
+            materials: PaneDisplayMaterials {
+                command_state: input.state,
+                has_role: input.has_role,
+                busy_children: input.busy_children,
+                released: input.released,
+                alt_screen: input.alt_screen,
+                claude_chat: input.claude_chat,
+                settling: input.settle.is_some_and(SettleState::active),
+            },
+        }
+    }
 }
 
 /// チャットビューにしてよいかの材料（判定表の「claude 対話 TUI 稼働」行。#702）。
@@ -405,6 +579,134 @@ mod tests {
             );
             assert!(!input.is_idle_shell());
         }
+    }
+
+    /// #1058: ターミナル表示に倒れた理由が**必ず 1 つ返る**（黙って縮退しない）
+    #[test]
+    fn ターミナル表示に倒れたら理由が付く() {
+        // GUI モードでない = 既定値のまま（#1058 のユーザー実機がこれ）
+        let mode_off = PaneDisplayInput {
+            mode: UiMode::Terminal,
+            state: CommandState::Idle,
+            ..PaneDisplayInput::terminal_mode()
+        };
+        assert_eq!(
+            terminal_reason(mode_off),
+            Some(TerminalReason::ModeTerminal)
+        );
+
+        let cases = [
+            (
+                PaneDisplayInput {
+                    released: true,
+                    ..gui_idle()
+                },
+                TerminalReason::Released,
+            ),
+            (
+                PaneDisplayInput {
+                    alt_screen: true,
+                    ..gui_idle()
+                },
+                TerminalReason::AltScreen,
+            ),
+            (
+                PaneDisplayInput {
+                    state: CommandState::Unknown,
+                    ..gui_idle()
+                },
+                TerminalReason::ShellStateUnknown,
+            ),
+            (
+                PaneDisplayInput {
+                    state: CommandState::Running,
+                    ..gui_idle()
+                },
+                TerminalReason::Running,
+            ),
+            (
+                PaneDisplayInput {
+                    state: CommandState::Failed(2),
+                    ..gui_idle()
+                },
+                TerminalReason::Failed,
+            ),
+            (
+                PaneDisplayInput {
+                    has_role: true,
+                    ..gui_idle()
+                },
+                TerminalReason::Role,
+            ),
+            (
+                PaneDisplayInput {
+                    busy_children: true,
+                    ..gui_idle()
+                },
+                TerminalReason::BusyChildren,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(pane_display(input), PaneDisplay::Terminal, "{input:?}");
+            assert_eq!(terminal_reason(input), Some(want), "{input:?}");
+        }
+    }
+
+    /// ターミナル表示以外では理由を返さない（「出ている」のに理由が付くと読み手が混乱する）
+    #[test]
+    fn スターターとチャットには理由が付かない() {
+        assert_eq!(pane_display(gui_idle()), PaneDisplay::Starter);
+        assert_eq!(terminal_reason(gui_idle()), None);
+        let chat = PaneDisplayInput {
+            claude_chat: true,
+            state: CommandState::Running,
+            busy_children: true,
+            has_role: true,
+            ..gui_idle()
+        };
+        assert_eq!(pane_display(chat), PaneDisplay::Chat);
+        assert_eq!(terminal_reason(chat), None);
+        let preparing = PaneDisplayInput {
+            state: CommandState::Unknown,
+            settle: Some(SettleState {
+                kind: SettleKind::Shell,
+                elapsed: Duration::ZERO,
+            }),
+            ..gui_idle()
+        };
+        assert_eq!(pane_display(preparing), PaneDisplay::Preparing);
+        assert_eq!(terminal_reason(preparing), None);
+    }
+
+    /// 理由は語彙が一意で、日英ともに空でない。**次の一手は「直せるもの」にだけ付く**
+    #[test]
+    fn 理由の語彙と文言が揃っている() {
+        let all = [
+            TerminalReason::ModeTerminal,
+            TerminalReason::Released,
+            TerminalReason::AltScreen,
+            TerminalReason::Role,
+            TerminalReason::BusyChildren,
+            TerminalReason::Running,
+            TerminalReason::Failed,
+            TerminalReason::ShellStateUnknown,
+        ];
+        let mut ids = std::collections::HashSet::new();
+        for r in all {
+            assert!(ids.insert(r.as_str()), "識別子が重複: {}", r.as_str());
+            assert!(!r.note().ja().trim().is_empty(), "{r:?} の ja が空");
+            assert!(!r.note().en().trim().is_empty(), "{r:?} の en が空");
+            if let Some(step) = r.next_step() {
+                assert!(!step.ja().trim().is_empty(), "{r:?} の次の一手 ja が空");
+                assert!(!step.en().trim().is_empty(), "{r:?} の次の一手 en が空");
+            }
+        }
+        // 「切り替えていないだけ」と「前提が欠けている」には必ず次の一手が付く（#1058 の要件）
+        assert!(TerminalReason::ModeTerminal.next_step().is_some());
+        assert!(TerminalReason::ShellStateUnknown.next_step().is_some());
+        // 正常な判断（TUI 稼働中など）には次の一手を付けない
+        assert!(TerminalReason::AltScreen.next_step().is_none());
+        assert!(TerminalReason::Running.next_step().is_none());
     }
 
     /// チャット判定の起点（3 つの証拠が揃った状態）

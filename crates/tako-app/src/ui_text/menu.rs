@@ -155,6 +155,14 @@ pub fn reset_zoom() -> &'static str {
 pub fn toggle_theme() -> &'static str {
     tr!("ライト / ダークを切替", "Toggle Light/Dark Theme")
 }
+/// 表示モード切替（#1058）。タブバー右端のボタンは狭い / 高 DPI のウインドウでは
+/// 画面外へ出ることがある（Windows 実機で実測）ので、**常に見えるメニューからも**切り替える。
+///
+/// **ラベルに `/` を入れない**こと: `tako menu` / MCP `tako_menu` のパス区切りが `/` なので、
+/// 含めるとその項目を AI から名指しできなくなる（`resolve_menu_item` が分割する）
+pub fn toggle_ui_mode() -> &'static str {
+    tr!("表示モードを切替", "Toggle Display Mode")
+}
 /// 言語切替は両言語でネイティブ表記を併記する（palette::cmd_label と同方針。
 /// 英語側に「日本語」を含む意図的な例外のため訳し漏れ検査の対象外）
 pub fn switch_language() -> &'static str {
@@ -261,6 +269,7 @@ mod tests {
                 zoom_out().to_string(),
                 reset_zoom().to_string(),
                 toggle_theme().to_string(),
+                toggle_ui_mode().to_string(),
                 toggle_fullscreen().to_string(),
                 minimize().to_string(),
                 zoom_window().to_string(),
