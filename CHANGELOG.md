@@ -8,6 +8,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.4] - 2026-09-03
+
+Nightly patch release (automated). Changes since v0.8.3:
+夜間パッチリリース（自動）。v0.8.3 以降の変更:
+
+- [ドキュメント] activeContext を 9/3 の 7 PR 着地後の現在状態へ更新 (#1075)
+- [機能追加] リモート刷新 柱1: Remote Control のプロファイル opt-in + session URL の 1:1 公開 (#1068) (#1069) (#1070)
+- [機能追加] エージェントペインの右クリックに「会話を引き継いだ再起動」2 種を追加 (#1067) (#1074)
+- [改善] Windows の PerMonitorV2 マニフェストを自己検査つきの不変条件にする（#1063 は計測の錯覚だった） (#1071)
+- [改善] 明示的に開いたリモートフォルダをツリー先頭へ + そのホストへターミナルを自動接続 (#1041) (#1066)
+- [修正] Windows で GUI モードのスターターへ到達できない問題（切替導線の 2 穴）を根治 (#1058) (#1065)
+- [機能追加] setup の依存導入を案内止まりから実行代行へ: Windows の Claude Code 自動インストール + 失敗時のエージェント引き継ぎ + macOS の任意依存その場導入 (#1057) (#1064)
+
 ## [0.8.3] - 2026-09-02
 
 Nightly patch release (automated). Changes since v0.8.2:
