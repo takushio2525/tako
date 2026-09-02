@@ -9684,6 +9684,18 @@ fn check_health(host: &dyn ControlHost) -> Value {
         }));
     }
 
+    // プロセスの DPI 認識レベル（#1063）。Windows はマニフェストで PerMonitorV2 を
+    // 宣言している前提で gpui のレイアウトが組まれているので、そこから落ちたら
+    // 「描画倍率とレイアウト寸法が食い違う」= 黙って縮退させない
+    let dpi_awareness = tako_core::platform::dpi::process_awareness();
+    if let Some(note) = tako_core::platform::dpi::degraded_note_here() {
+        issues.push(json!({
+            "level": "error",
+            "check": "dpi_awareness",
+            "message": note.text(),
+        }));
+    }
+
     // ワークスペースの状態サマリ
     let ws = host.workspace();
     let tab_count = ws.tabs().len();
@@ -9703,6 +9715,11 @@ fn check_health(host: &dyn ControlHost) -> Value {
         "tmux_available": tmux_available,
         "persist_enabled": persist_enabled,
         "persist_available": persist_available,
+        // #1063: 実測値（unaware / system / per_monitor / per_monitor_v2 /
+        // not_applicable = macOS / unknown）。「1.22 倍あふれている」の類の報告は
+        // まずここを読む。macOS は常に not_applicable
+        "dpi_awareness": dpi_awareness.as_str(),
+        "dpi_awareness_expected": tako_core::platform::dpi::expected_here().as_str(),
         "workspace": {
             "tabs": tab_count,
             "panes": pane_count,
