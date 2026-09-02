@@ -22950,6 +22950,19 @@ fn main() {
     if let Some(notice) = tako_control::migrations::ensure_migrated() {
         eprintln!("info: {notice}");
     }
+    // プロセスの DPI 認識レベルを起動時に 1 回だけ申告する（#1063）。
+    // Windows は gpui のマニフェスト（`windows-manifest` フィーチャ）で PerMonitorV2 を
+    // 宣言している前提でレイアウトを組む。宣言が落ちると OS が座標を仮想化して描画結果を
+    // 拡大するので、**画面はぼやけるだけで一見動く**（macOS では原理的に再現しない）。
+    // 黙って縮退させないために、期待から外れたときだけ理由を persist.log と stderr へ残す
+    if let Some(note) = tako_core::platform::dpi::degraded_note_here() {
+        persist_diag(&format!(
+            "DPI 認識レベルが期待と違う: {} （期待 {}）: {}",
+            tako_core::platform::dpi::process_awareness().as_str(),
+            tako_core::platform::dpi::expected_here().as_str(),
+            note.text(),
+        ));
+    }
     // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
     {
         let settings = tako_control::settings::load();
@@ -58438,7 +58451,77 @@ mod self_test {
                 notify_and_draw(any, window, cx);
             }
 
-            // 139: 会話を引き継いだセッション再起動（#1067）。
+            // 139: プロセスの DPI 認識レベル (#1063)。Windows のレイアウト寸法は
+            // 「マニフェストが PerMonitorV2 を宣言している」前提で組まれている。
+            // 宣言は gpui の既定フィーチャ（`windows-manifest`）に乗っていて tako の
+            // コードには現れないので、rev 追従や default-features = false で無言で
+            // 落ち得る。落ちると OS が座標を仮想化して描画結果を拡大するだけなので
+            // **一見動いてしまう**（macOS では原理的に再現しない）。ここで実測して固定する
+            {
+                use tako_core::platform::dpi;
+                let actual = dpi::process_awareness();
+                let expected = dpi::expected_here();
+                check(
+                    actual == expected,
+                    &format!(
+                        "139: プロセスの DPI 認識レベルが期待どおり (#1063。\
+                         actual={} expected={} note={:?})",
+                        actual.as_str(),
+                        expected.as_str(),
+                        dpi::degraded_note_here().map(|n| n.text()),
+                    ),
+                );
+                check(
+                    dpi::degraded_note_here().is_none() && dpi::healthy_here(),
+                    "139: 期待どおりなら縮退の説明は出ない (#1063)",
+                );
+                // 診断から読めること（「1.22 倍あふれている」の類の報告の入口）
+                let health = window
+                    .update(cx, |app, _, _cx| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::CheckHealth,
+                            PaneOrigin::Cli,
+                        )
+                    })
+                    .ok()
+                    .and_then(Result::ok);
+                let reported = health
+                    .as_ref()
+                    .and_then(|v| v["dpi_awareness"].as_str())
+                    .map(String::from);
+                let reported_expected = health
+                    .as_ref()
+                    .and_then(|v| v["dpi_awareness_expected"].as_str())
+                    .map(String::from);
+                check(
+                    reported.as_deref() == Some(actual.as_str())
+                        && reported_expected.as_deref() == Some(expected.as_str()),
+                    &format!(
+                        "139: check_health が DPI 認識レベルを申告する (#1063。\
+                         reported={reported:?} expected={reported_expected:?})"
+                    ),
+                );
+                // 期待どおりなら issues に載らない（載っていたら誤検知）
+                let flagged = health
+                    .as_ref()
+                    .and_then(|v| v["issues"].as_array())
+                    .is_some_and(|a| {
+                        a.iter().any(|i| i["check"].as_str() == Some("dpi_awareness"))
+                    });
+                check(
+                    !flagged,
+                    "139: 期待どおりのときは check_health の issues に載らない (#1063)",
+                );
+                println!(
+                    "TAKO_SELF_TEST_1063: awareness={} expected={} health={:?}",
+                    actual.as_str(),
+                    expected.as_str(),
+                    reported,
+                );
+            }
+
+            // 140: 会話を引き継いだセッション再起動（#1067）。
             //
             // 実 claude を起こさずに検証できるのは
             // 「出し分け」「下見」「関門（生成中 / キュー滞留 / 下書き / ダイアログ）」
@@ -58508,7 +58591,7 @@ mod self_test {
                 notify_and_draw(any, window, cx);
                 if !wait_for_focused_text(window, cx, "TAKO1067IDLE", Duration::from_secs(20)).await
                 {
-                    fail("139: 疑似 TUI の画面が出る (#1067)")
+                    fail("140: 疑似 TUI の画面が出る (#1067)")
                 }
 
                 // role を差し替えるヘルパー（worker / master / 無し）
@@ -58574,12 +58657,12 @@ mod self_test {
                             .as_ref()
                             .and_then(|v| v["available_modes"].as_array())
                             .is_some_and(|a| a.is_empty()),
-                    &format!("139: role が無いペインには再起動を出さない (#1067) {none_modes:?}"),
+                    &format!("140: role が無いペインには再起動を出さない (#1067) {none_modes:?}"),
                 );
                 // 下見は**何も起こさない**
                 check(
                     none_preview.as_ref().and_then(|v| v["applied"].as_bool()) == Some(false),
-                    "139: mode 省略の下見は何も起こさない (#1067)",
+                    "140: mode 省略の下見は何も起こさない (#1067)",
                 );
 
                 // (b) worker はハーネス更新だけ / master は両方（GUI と dispatch が一致）
@@ -58600,7 +58683,7 @@ mod self_test {
                     worker_modes == vec!["harness".to_string()]
                         && worker_available == worker_modes,
                     &format!(
-                        "139: worker はハーネス更新だけ・GUI と応答が一致する (#1067) \
+                        "140: worker はハーネス更新だけ・GUI と応答が一致する (#1067) \
                          menu={worker_modes:?} api={worker_available:?}"
                     ),
                 );
@@ -58609,7 +58692,7 @@ mod self_test {
                 let master_modes = menu_modes(cx);
                 check(
                     master_modes == vec!["harness".to_string(), "handoff".to_string()],
-                    &format!("139: master は 2 種とも出る (#1067) {master_modes:?}"),
+                    &format!("140: master は 2 種とも出る (#1067) {master_modes:?}"),
                 );
 
                 // (c) 関門: 生成中 / キュー滞留 / 下書き。**メニューからは消えない**
@@ -58638,7 +58721,7 @@ mod self_test {
                 for (want, body, footer, needle) in guards {
                     let needle = repaint(body, footer, needle);
                     if !wait_for_focused_text(window, cx, &needle, Duration::from_secs(15)).await {
-                        fail("139: 関門の画面を作れない (#1067)")
+                        fail("140: 関門の画面を作れない (#1067)")
                     }
                     notify_and_draw(any, window, cx);
                     let v = preview(cx);
@@ -58648,7 +58731,7 @@ mod self_test {
                     check(
                         reason.as_deref() == Some(want) && modes.len() == 2,
                         &format!(
-                            "139: {want} では実行を断るがメニューからは消さない (#1067) \
+                            "140: {want} では実行を断るがメニューからは消さない (#1067) \
                              reason={reason:?} menu={modes:?}"
                         ),
                     );
@@ -58673,7 +58756,7 @@ mod self_test {
                             m.contains(&format!("pane {}", pane1067.as_u64()))
                                 && m.contains("もう一度")
                         }),
-                        &format!("139: {want} の拒否に理由と次の一手が入る (#1067) {err:?}"),
+                        &format!("140: {want} の拒否に理由と次の一手が入る (#1067) {err:?}"),
                     );
                 }
 
@@ -58684,7 +58767,7 @@ mod self_test {
                 let idle2_footer = format!("{idle_footer} TAKO1067IDLE2");
                 let needle = repaint("", &idle2_footer, "TAKO1067IDLE2");
                 if !wait_for_focused_text(window, cx, &needle, Duration::from_secs(15)).await {
-                    fail("139: アイドル画面へ戻せない (#1067)")
+                    fail("140: アイドル画面へ戻せない (#1067)")
                 }
                 notify_and_draw(any, window, cx);
                 let idle_reason = preview(cx).as_ref().and_then(|v| reason_of(v, "harness"));
@@ -58715,7 +58798,7 @@ mod self_test {
                             .is_some_and(|m| m.contains("会話"))
                         && pane_alive,
                     &format!(
-                        "139: 会話を解決できないときは終了させずに断る (#1067) \
+                        "140: 会話を解決できないときは終了させずに断る (#1067) \
                          reason={idle_reason:?} err={unresolved_err:?} alive={pane_alive}"
                     ),
                 );
@@ -58753,7 +58836,7 @@ mod self_test {
                             p.contains("tako_orchestrator_handoff") && p.contains("session-restart")
                         }),
                     &format!(
-                        "139: 引き継ぎ再起動は master へ引き継ぎの書き直しを依頼する (#1067) \
+                        "140: 引き継ぎ再起動は master へ引き継ぎの書き直しを依頼する (#1067) \
                          applied={:?} prompt_len={:?}",
                         handoff_resp.as_ref().and_then(|v| v["applied"].as_bool()),
                         handoff_prompt.as_ref().map(|p| p.len())

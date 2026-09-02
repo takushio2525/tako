@@ -37,14 +37,21 @@
 - `TAKO_1002_LEGACY` / `TAKO_1010_LEGACY` / `TAKO_1011_LEGACY`（+ `TAKO_1011_INJECT_LEDGER_GAP`）/
   `TAKO_1023_LEGACY` / `TAKO_1038_LEGACY`（UDS へ）+ `TAKO_1038_INJECT_UNREACHABLE` /
   `TAKO_1040_LEGACY` / `TAKO_1042_LEGACY` / `TAKO_1043_LEGACY` / `TAKO_1049_LEGACY`
-  （+ `TAKO_1049_WATCH_SECS`）。それ以前の一覧は progress.md 8/24 以前の各エントリ
+  （+ `TAKO_1049_WATCH_SECS`）。それ以前の一覧は progress.md 8/24 以前の各エントリ。
+  **#1063 は env ではなく `__COMPAT_LAYER=DPIUNAWARE`** で非認識にして A/B する（OS の仕掛け）
 
 ## Windows 実機まわり（要点。全文は plan の各記録節）
 
 - 実機セルフテストは完走実績あり（skip 19 = 理由つき既知）。実機テストのベースラインは
-  22 件（失敗名まで照合。plan「#906 の記録」節）
-- **実機は SSH 不通**（Tailscale アカウント変更・8/28〜）。未着手の実機バグ: #935 / #936 / #970 /
+  **2026-09-02 に取り直して 21 件**（失敗名まで照合。plan「後続 worker への引き継ぎ」節の表。
+  それ以前の「22 件」は `tako-control` が未実行だった頃の値なので当てにしない）
+- **実機 SSH は 9/2 時点で疎通**（`ssh win`）。未着手の実機バグ: #935 / #936 / #970 /
   #972 / #973 / #974 / #967。#971 は #1038 で実装済み・実機実測待ち
+- **#1063（1.22 倍あふれる）は製品の欠陥ではなかった**: 素の `powershell.exe` は DPI 非認識で、
+  `GetWindowRect` は物理 ÷ 倍率・`CopyFromScreen` は物理のまま = スクショがクロップになる。
+  **実機を測るときは `scripts/windows/measure-window.ps1`**（PerMonitorV2 を宣言し検算する）
+- **Windows の `cargo test` は 9/2 まで `tako-control` が 1 件も走っていなかった**（#983 の
+  POSIX 決め打ち）。#1063 の PR で解消。以後スイートを回すときは件数が跳ねることに注意
 - 規約: マトリクスは根拠なしに倒さない（`windows_evidence`・T7 が落とす）/ テストに理由文を
   直書きしない / 生成 docs は `gen-windows-support-docs.mjs --check` が CI で見る
 

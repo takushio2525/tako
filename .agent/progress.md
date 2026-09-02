@@ -3949,6 +3949,25 @@
   macOS 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 119 拡張・137 新設）。証拠は `~/dev/tako-evidence/1057/`
 - 次: PR レビュー → merge → install（master 判断）
 
+## 2026-09-02（#1063: 「レイアウトが 1.22 倍あふれる」は計測の錯覚 + マニフェストを不変条件へ）
+- 実機（Windows 11・125%）で**製品側の欠陥は無い**ことを確定。素の `powershell.exe` は DPI 非認識で、
+  `GetWindowRect` / `SetCursorPos` は**物理 ÷ 1.25**なのに `CopyFromScreen` は**物理のまま**返るため、
+  「ウインドウ寸法で切ったスクショ」が縮小ではなく**クロップ**になり右 1/5・下 1/5 が消えていた
+  （crop 仮説 99.87% 画素一致 / 縮小仮説 75.42%。クリックずれも同じ倍率）。PerMonitorV2 で測り直すと
+  client 1920x1020・198 桁 x 9.5253px = 1886px で **34px 余り**、右端 4 ボタンもステータスバーも
+  実クリックで反応する（theme dark→light / Files false→true / ui-mode terminal→gui）
+- 前提（PerMonitorV2 マニフェスト）は gpui の既定フィーチャに乗るだけで無言で落ち得るので不変条件化:
+  境界 `platform::dpi`（B24）+ 起動時申告 + MCP `tako_check_health` の `dpi_awareness` +
+  セルフテスト項目 139 + 番犬（macOS で走る）+ 計測道具 `scripts/windows/measure-window.ps1`
+  （PerMonitorV2 を宣言できなければ実行を拒否）。A/B は `__COMPAT_LAYER=DPIUNAWARE` で
+  `unaware` + `[error] dpi_awareness` + persist.log を実測
+- 副産物 2 件: **#1058 の「取れていない」実クリック A/B が取れた**（画面外ではなかった。修正前は
+  無反応・修正後は gui へ）/ **Windows で `tako-control` のテストが 1 件も走っていなかった**
+  （#983 の POSIX 決め打ちでテストバイナリごとコンパイル不能 → `#[cfg(unix)]` で解消）
+- 関連コミット: PR（`Refs #1063, #1058`）。macOS test 3036 passed 0 failed / セルフテスト
+  `TAKO_APP_SELF_TEST_OK` / クロスチェック `--all-targets` エラー 3 → 0
+
+
 ## 2026-09-02（#1067: エージェントペインの右クリックへ「会話を引き継いだ再起動」2 種）
 - **#498 の張り直しは merge 以来一度も意図どおり動いていなかった**（調査で確定）: Ctrl+C 1 回
   （claude の対話終了は 2 回）/ resume の行を `queue_write_on_alt_screen` で書いていたが**器つき
@@ -3982,7 +4001,7 @@
   **後任が前任のペインを閉じた（+72 秒）**。worker は生きたまま（kill されない）
 - 検証: fmt / clippy(-D warnings) / `cargo test --workspace` 3045 passed 0 failed /
   Windows クロスチェック エラー 0・警告 12（**全件が未変更ファイル由来** = 記録済みベースライン同数）/
-  隔離セルフテスト項目 139 新設（出し分け / 下見 / 関門 3 種 / 会話未解決での不実行 / 引き継ぎ依頼）
+  隔離セルフテスト項目 140 新設（出し分け / 下見 / 関門 3 種 / 会話未解決での不実行 / 引き継ぎ依頼）
 - **環境由来のフレークを 2 件踏んだ**（どちらも #1067 の変更とは無関係で、走り直すと通る）:
   load 15 で項目 94（#702。打った行が 6 秒以内に実行されない）/ load 5 で項目 113（#816。
   2.5 秒の出力が `lines+=25 < 40`）。並行 worker のビルドで load が跳ねる時間帯は避けて測る
