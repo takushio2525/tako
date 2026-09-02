@@ -47,8 +47,8 @@ fn sample_sessions() -> (Vec<String>, Vec<String>) {
                 if !tako_control::transcript::is_valid_session_id(stem) {
                     continue;
                 }
-                let has_bridge = text.contains("\"bridge-session\"")
-                    || text.contains("\"bridge_status\"");
+                let has_bridge =
+                    text.contains("\"bridge-session\"") || text.contains("\"bridge_status\"");
                 if has_bridge {
                     if with_bridge.len() < 5 {
                         with_bridge.push(stem.to_string());
@@ -69,9 +69,7 @@ fn sample_sessions() -> (Vec<String>, Vec<String>) {
 fn 実transcriptで接続済みと未接続を言い分ける() {
     let (with_bridge, without_bridge) = sample_sessions();
     if with_bridge.is_empty() && without_bridge.is_empty() {
-        eprintln!(
-            "skip: この環境に claude の transcript が無い（材料が無いので実測できない）"
-        );
+        eprintln!("skip: この環境に claude の transcript が無い（材料が無いので実測できない）");
         return;
     }
 

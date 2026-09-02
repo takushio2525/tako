@@ -7889,6 +7889,16 @@ fn dispatch_git_resolve_agent(
             .map(|p| p.display().to_string()),
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
+        // #1068: この解消エージェントの会話が Remote Control へ繋がるか。
+        // opt-in していても環境が不適格なら false で、理由は `blocked` に入る
+        // （spawn と同じ扱い = 無言で「繋がっているはず」にしない）
+        "remote_control": remote_control.enabled(),
+        "remote_control_blocked": remote_control.blocked.as_ref().map(|b| json!({
+            "kind": b.kind(),
+            "detail": b.detail(),
+            "reason": b.reason().text(),
+            "next_step": b.next_step().text(),
+        })),
         "state": conflict_state_json(&repo, &state),
     }))
 }
