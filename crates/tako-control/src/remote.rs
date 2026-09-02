@@ -3360,6 +3360,27 @@ fn list_to_api_v2(list: &Value, live: &HashMap<String, crate::agents::LiveClaude
     json!({ "panes": panes, "api_version": 2 })
 }
 
+/// ペイン一覧の各エントリへ Remote Control の公式リンクを付ける（#1069）。
+///
+/// **`/api/v2/panes` の 2 経路（app 経由 / app 不在の tmux 直読み）と `/api/agents` が
+/// 同じ 1 実装を通る**ので、PWA がどの経路の応答を読んでも値が食い違わない。
+/// 判定は transcript の読み取りだけ（プロセスを起こさない）
+fn attach_remote_links(result: &mut Value) {
+    let Some(panes) = result["panes"].as_array_mut() else {
+        return;
+    };
+    for pane in panes {
+        let agent = pane["agent_type"].as_str().unwrap_or("plain");
+        // 素のシェルには会話が無いので何も付けない（`plain` に理由を出しても意味がない）
+        if agent == "plain" {
+            continue;
+        }
+        let session_id = pane["session_id"].as_str();
+        let link = crate::claude_remote_link::link_for_agent_session(agent, session_id);
+        pane["remote_link"] = link.to_json();
+    }
+}
+
 /// ペインの session_id と model を解決する（#284）。
 /// live 解決（agents pid 祖先の一括マップ）→ sessions カタログの順で探す
 fn resolve_pane_session_info(
@@ -3834,6 +3855,8 @@ fn handle_request_v2(
                 attach_card_summaries(&mut result, |target| {
                     capture_pane_for_card(tmux_socket, target)
                 });
+                // #1069: 公式リンク（claude.ai/code）。繋がっていなければ理由が入る
+                attach_remote_links(&mut result);
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
             None => {
@@ -3843,6 +3866,8 @@ fn handle_request_v2(
                 attach_card_summaries(&mut result, |target| {
                     capture_pane_for_card(tmux_socket, target)
                 });
+                // #1069: app 不在の経路でも同じ 1 実装を通す（値が食い違わない）
+                attach_remote_links(&mut result);
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
         }
@@ -4046,7 +4071,12 @@ fn handle_api_v2_routes(
         }
         (tiny_http::Method::Get, "/api/agents") => {
             match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
-                Ok(result) => respond_sensitive(request, 200, Some(result.to_string())),
+                Ok(mut result) => {
+                    // #1069: 公式リンク（claude.ai/code）。dispatch の RemoteAgents
+                    // （CLI / MCP）と**同じ 1 実装**を通す
+                    crate::claude_remote_link::attach_to_agents(&mut result);
+                    respond_sensitive(request, 200, Some(result.to_string()))
+                }
                 Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
             }
         }

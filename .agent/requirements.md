@@ -1173,6 +1173,37 @@ FR-2.8〜2.32 はいずれも設計原則 5（AI フルコントロール）の�
 A/B は `TAKO_1057_LEGACY=1`（Windows は代行しない / PATH 判定は `exe::find` / 引き継ぎ先を探さない /
 依存の質問をしない = #1057 前の挙動）。
 
+### FR-2.34 Claude 公式 Remote Control への会話の委譲は明示 opt-in（✅ 2026-09-02、#1068。エピック #1059）
+
+> tako が spawn する master / worker / solo は、既定では Remote Control に繋がらない
+> （実測: tako 管轄の 5 セッションすべて未接続。
+> `research/2026-09-01-remote-renewal-claude-official.md` §2.4）。
+> **繋げば会話をスマホから操作できる**が、その会話は Anthropic のサーバーにも保存され、
+> 認証は claude.ai アカウントへ移る（tako の機器ペアリング二層認証と role 4 段はその会話に効かない）。
+> **静かに外へ同期させ始めないため**、プロファイル単位の明示 opt-in にする。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.34.1 | **プロファイル `remote_control`（既定 false）で gate する**。true のときだけ claude の起動コマンドへ `--remote-control` が付く。対象は spawn 経路 4 本（`tako master` / `tako solo` / 引き継ぎの後任 master / worker spawn + コンフリクト解消）。CLI（`profiles set --remote-control`）/ MCP（`tako_orchestrator_profiles`）/ 設定画面の 3 経路 1:1 | M | ✅ |
+| FR-2.34.2 | **既定の挙動は 1 バイトも変わらない**。`Option<bool>` + `skip_serializing_if` なので既存 profiles/\*.yaml はバイト単位で不変、serde default で false として読める（= #916 の規約に対する「移行は要らない」の明示的な選択。回帰は `プロファイルの旧形式はremote_controlが無くても読める`） | M | ✅ |
+| FR-2.34.3 | **起動前に適格性を判定し、不適格ならフラグを付けない**。不適格な環境で渡すと claude 自身が起動時に落ちる（= ペインが即死する）ため。判定は**ローカルの読み取りだけで確定する事実**に限る: 阻害 env（`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` / `DISABLE_TELEMETRY` / `DO_NOT_TRACK` / `DISABLE_GROWTHBOOK`）・エンドポイント差し替え（`ANTHROPIC_BASE_URL` の host ≠ `api.anthropic.com` / Bedrock / Vertex / Foundry）・非サブスク認証（`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`）・組織ポリシー（managed settings の `disableRemoteControl`） | M | ✅ |
+| FR-2.34.4 | **証明できるときだけ断る**。プラン・組織のエントイトルメント・Trusted Devices・ZDR はローカルから分からないので**不適格と言わない**（フラグを付けて claude 自身に言わせる）。過剰に断ると「使えるのに使えない」を作る | M | ✅ |
+| FR-2.34.5 | **判定材料は「起動先プロセスが実際に見る env」**。プロファイルの env 計画（`export` は後勝ち・`unset` は届かない。#500 / #512）を反映してから評価する。真偽の解釈は上流と同じ（`DISABLE_TELEMETRY` は空でなければ効く / `DO_NOT_TRACK` は `1` / `true` / `yes` / `on` だけ）ので、`DO_NOT_TRACK=0` で誤って断らない | M | ✅ |
+| FR-2.34.6 | **状態は有効でも無効でも 1 行出す**（#981 の `sandbox_bypass_line` と同じ思想）。opt-in なのに付かなかったときは**理由 + 次の一手**を出す（CLI は起動前の行、spawn は応答の `warnings`、プロファイル照会は `remote_control_blocked`）。「スマホから見えない」の切り分けを可能にするため | M | ✅ |
+| FR-2.34.7 | **claude 以外には渡さない**。codex の `remote-control` は自前ホストの app-server デーモン経路で別物、agy には手段が無い（`agent_support::keys::REMOTE_CONTROL` の宣言が正。実測根拠つき） | M | ✅ |
+| FR-2.34.8 | **`remoteControlAtStartup` は tako が書かない**。ユーザー設定（#513 の共有分類にも関わる）なので案内だけにする | M | ✅ |
+
+A/B は `TAKO_1068_LEGACY=1`（opt-in を無視して `--remote-control` を一度も付けない = #1068 前の挙動）。
+
+### FR-2.35 Remote Control の session URL は 1 実装で 3 経路へ（✅ 2026-09-02、#1069。エピック #1059）
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.35.1 | **取得は 2 段**。正 = transcript の `bridge_status` 行の `url`（完成形）、予備 = `bridge-session` 行の `bridgeSessionId` を `cse_` → `session_` へ変換して `https://claude.ai/code/<id>` を組む。**実測（claude 2.1.232）では `bridge_status` は常に出ない**（`bridge-session` を持つ transcript 84 件に対し `bridge_status` は 0 件）ので、予備段が実質の主役 | M | ✅ |
+| FR-2.35.2 | **URL を捏造しない**。繋がっていなければ `not_connected`、判断材料が無ければ `unknown`、ローカルで不適格が確定していれば `ineligible: <理由>`。どの状態も `url` / `session_id` を持たない（型で強制） | M | ✅ |
+| FR-2.35.3 | **アカウント UUID を保持しない**。`bridge-session` 行の `ownerAccountUuid` / `ownerOrganizationUuid` は読まない。どのアカウント配下かは accounts.yaml の**名前**（`account_label`）で表す。スマホが別アカウントだとそのセッションは一覧に出ないので、この表示が無いと切り分け不能になる | M | ✅ |
+| FR-2.35.4 | **公開は 3 経路 1:1 で同じ 1 実装**（`RemoteLink::to_json`）。`GET /api/agents` / `GET /api/v2/panes` の `remote_link` / CLI `tako sessions link [--pane N]` / MCP `tako_sessions` の `action=link` | M | ✅ |
+| FR-2.35.5 | **URL を診断ログへ出さない**。開くには claude.ai ログインが要る（実測 403）ので秘密ではないが、セッション id は follow-up 送信の宛先になるためペイン内容と同基準で扱う（番犬 = `crates/tako-control/tests/remote_link_watchdog.rs`） | M | ✅ |
 ### FR-2.34 会話を引き継いだセッション再起動（✅ 2026-09-02、#1067。基盤は #498 / #390 / #112 / #640 / #749 / #915 / #982）
 
 > claude CLI は symlink の張り替えで更新されるので、長生きのセッションは**起動時の

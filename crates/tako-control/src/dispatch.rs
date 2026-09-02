@@ -2710,6 +2710,7 @@ fn dispatch_inner(
             limit_resume,
             clear_limit_resume,
             bypass_sandbox,
+            remote_control,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2749,6 +2750,7 @@ fn dispatch_inner(
             limit_resume,
             clear_limit_resume,
             bypass_sandbox,
+            remote_control,
         }),
 
         // #504: アカウントレジストリの CRUD
@@ -2995,7 +2997,12 @@ fn dispatch_inner(
 
         // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
         Request::RemoteAgents => {
-            crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)
+            let mut result =
+                crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)?;
+            // #1069: 公式リンクは HTTP の /api/agents と同じ 1 実装で付ける
+            // （AI が見る値とスマホの一覧が食い違わない = 開発不変条件）
+            crate::claude_remote_link::attach_to_agents(&mut result);
+            Ok(result)
         }
 
         Request::RemoteMessages { session_id, tail } => {
@@ -3955,8 +3962,10 @@ fn dispatch_inner(
                     id.ok_or_else(|| DispatchError::InvalidParams("resume には id が必要".into()))?;
                 dispatch_sessions_resume(host, origin, &id, pane, tab, direction)
             }
+            // #1069: Claude 公式 Remote Control の session URL
+            "link" => dispatch_sessions_link(host, origin, id.as_deref(), pane),
             other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（list / show / resume のいずれか）"
+                "不明な action: {other:?}（list / show / resume / link のいずれか）"
             ))),
         },
 
@@ -5233,6 +5242,84 @@ fn dispatch_logs_read(
 /// セッションカタログからの会話復元（Issue #112 A）。
 /// 該当エントリの cwd でシェルペインを分割起動し、`claude --resume <session_id>` を
 /// 注入する（#30 の復元経路と同方式。Claude 終了後もシェルが残る）
+/// #1069: ペイン（または session id）の Claude 公式リンクを返す。
+///
+/// **`/api/agents` / `/api/v2/panes` と同じ 1 実装**（`link_for_agent_session`）を
+/// 通すので 3 経路の値が食い違わない。解決順は
+/// `id` 明示 → `pane` 明示 → 呼び出し元ペイン → アクティブタブのフォーカスペイン。
+///
+/// ペイン → セッションは live 解決（`claude agents --json` の pid 祖先辿り）→
+/// セッションカタログの順（`/api/v2/panes` と同じ規則）
+fn dispatch_sessions_link(
+    host: &mut dyn ControlHost,
+    _origin: PaneOrigin,
+    id_prefix: Option<&str>,
+    pane: Option<u64>,
+) -> Result<Value, DispatchError> {
+    // id 明示: カタログで前方一致を解いてから引く（agent 種別もカタログから取る）
+    if let Some(prefix) = id_prefix {
+        let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
+        let (session_id, entry) = catalog
+            .resolve_id(prefix)
+            .map_err(DispatchError::Operation)?;
+        let agent = entry.agent.as_deref().unwrap_or("claude");
+        let link = crate::claude_remote_link::link_for_agent_session(agent, Some(session_id));
+        return Ok(json!({
+            "session_id_resolved": session_id,
+            "agent": agent,
+            "pane": entry.pane,
+            "remote_link": link.to_json(),
+        }));
+    }
+
+    // ペイン解決（`sessions resume` と同じフォールバック = tako 外の CLI からも引ける）
+    let (_tab_id, pane_id) = match resolve_pane(host.workspace(), pane) {
+        Ok(resolved) => resolved,
+        Err(_) if pane.is_none() => {
+            let active = host.workspace().active_tab();
+            (active.id(), active.tree().focused())
+        }
+        Err(e) => return Err(e),
+    };
+
+    // agent 種別はペインの role から推定する（`list_to_api_v2` と同じ規則）。
+    // role が無いペインは claude 前提で引き、繋がっていなければ not_connected になる
+    let role = host
+        .workspace()
+        .get_tab(_tab_id)
+        .and_then(|tab| {
+            tab.tree()
+                .panes()
+                .into_iter()
+                .find(|p| p.id() == pane_id)
+                .and_then(|p| p.role().map(str::to_string))
+        })
+        .unwrap_or_default();
+    let agent = if role.contains("codex") {
+        "codex"
+    } else if role.contains("agy") {
+        "agy"
+    } else {
+        "claude"
+    };
+
+    // live 解決 → 器なしの pid 経路 → カタログ。
+    // 2 段目が要るのは、**器（tmux / psmux）を持たない構成**では
+    // `backend_session` が無く 1 段目が必ず空振りするから（#728 と同じ二段構え）。
+    // 器なしの手がかりは PTY 直下の子 pid で、`list_agents_for_scan` が
+    // 祖先辿りで `tako_pane` を付けてくれる（同じ 1 実装を通す）
+    let session_id = resolve_session_id_for_pane_via_host(host, pane_id)
+        .or_else(|| resolve_session_id_for_pane_via_pid(host, pane_id))
+        .or_else(|| crate::sessions::resolve_session_for_pane(&pane_id.as_u64().to_string()));
+    let link = crate::claude_remote_link::link_for_agent_session(agent, session_id.as_deref());
+    Ok(json!({
+        "pane": pane_id.as_u64(),
+        "agent": agent,
+        "session_id_resolved": session_id,
+        "remote_link": link.to_json(),
+    }))
+}
+
 fn dispatch_sessions_resume(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
@@ -5458,6 +5545,9 @@ pub struct ProfilesParams {
     /// codex の `--dangerously-bypass-approvals-and-sandbox` を許可するか（Issue #981）。
     /// bool 1 つで表せる方針なので clear は要らない（false が「既定へ戻す」）
     pub bypass_sandbox: Option<bool>,
+    /// claude の会話を Claude 公式の Remote Control へ繋ぐか（Issue #1068）。
+    /// bypass_sandbox と同じ理由で clear は要らない（false が「繋がない」= 既定）
+    pub remote_control: Option<bool>,
 }
 
 /// プロファイルを JSON 化する（list / show / set の共通形）。
@@ -5577,6 +5667,41 @@ fn profile_to_json(
             "codex は承認スキップとサンドボックス解除が同じフラグ（--dangerously-bypass-approvals-and-sandbox）なので、bypass_sandbox が false のあいだ skip_permissions は効きません（コマンド実行に承認プロンプトが出ます）。\n  外す場合は `--bypass-sandbox true`（サンドボックスと承認が両方無効になります）"
         ));
         v["warnings"] = Value::Array(warnings);
+    }
+    // Remote Control の opt-in（#1068）。値そのものは常に返す（bypass_sandbox と同じ理由 =
+    // 会話が外へ同期されるかどうかは安全に関わるので隠さない）
+    v["remote_control"] = json!(profile.remote_control_enabled());
+    // **今 spawn したらどうなるか**も返す。opt-in していても環境が不適格なら
+    // フラグは付かないので、設定値だけを見せると「繋がっているはず」の誤解を作る
+    if profile.remote_control_enabled() {
+        let decision = orchestrator::master_remote_control_decision(profile);
+        match decision {
+            Ok(d) => {
+                v["remote_control_effective"] = json!(d.enabled());
+                if let Some(blocked) = d.blocked {
+                    v["remote_control_blocked"] = json!({
+                        "kind": blocked.kind(),
+                        "detail": blocked.detail(),
+                        "reason": blocked.reason().text(),
+                        "next_step": blocked.next_step().text(),
+                    });
+                    let mut warnings: Vec<Value> =
+                        v["warnings"].as_array().cloned().unwrap_or_default();
+                    warnings.push(json!(format!(
+                        "remote_control: true ですが、この環境では有効にできません（{}）。\n  {} / {}",
+                        blocked.detail(),
+                        blocked.reason().text(),
+                        blocked.next_step().text()
+                    )));
+                    v["warnings"] = Value::Array(warnings);
+                }
+            }
+            // アカウント / master_agent の解決に失敗する状態は既存の警告が出す領分。
+            // ここでは「判断できなかった」ことだけを残す（嘘の true を書かない）
+            Err(_) => v["remote_control_effective"] = Value::Null,
+        }
+    } else {
+        v["remote_control_effective"] = json!(false);
     }
     v
 }
@@ -5882,6 +6007,11 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 // codex のサンドボックス解除（#981）
                 if let Some(v) = params.bypass_sandbox {
                     profile.bypass_sandbox = v;
+                }
+                // Remote Control の opt-in（#1068）。false は「明示的に繋がない」なので
+                // None（未設定）と区別せず false を書く（既定と同じ挙動 = 冪等）
+                if let Some(v) = params.remote_control {
+                    profile.remote_control = Some(v);
                 }
                 // 既定値のみになったエントリは掃除する（YAML を汚さない）
                 profile
@@ -7079,6 +7209,24 @@ fn resolve_session_id_for_pane_via_host(host: &dyn ControlHost, pane_id: PaneId)
     crate::agents::resolve_session_id_for_backend(&backend)
 }
 
+/// 器を持たないペインの session_id を PTY 直下の子 pid から解決する（#728 の二段構え）。
+///
+/// `backend_session` が無い構成（Windows で psmux 未導入 / tmux 不在の macOS /
+/// `TAKO_PERSIST=0`）では器のセッション名で引けないので、
+/// `list_agents_for_scan` に「(tako のペイン ID, PTY 子 pid)」を渡して
+/// 祖先辿りで対応付けてもらう
+fn resolve_session_id_for_pane_via_pid(host: &dyn ControlHost, pane_id: PaneId) -> Option<String> {
+    let child = host.session(pane_id)?.child_pid()?;
+    let agents = crate::agents::list_agents_for_scan(&[(pane_id.as_u64(), child)]).ok()?;
+    agents["agents"]
+        .as_array()?
+        .iter()
+        .find(|a| a["tako_pane"].as_u64() == Some(pane_id.as_u64()))
+        // **正規化後のキー**（`agents::list_agents_*` が `sessionId` を `session_id` へ直す）
+        .and_then(|a| a["session_id"].as_str())
+        .map(str::to_string)
+}
+
 /// #364: worker の報告内容を取得する。
 /// 第 1 層: tmux scrollback（capture-pane -p -J -S。全 agent 共通）。
 /// 第 2 層: 構造化ソース（claude transcript。アダプタ拡張可能）。
@@ -7624,6 +7772,9 @@ fn dispatch_git_resolve_agent(
     let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
         .map_err(|e| DispatchError::Operation(e.message()))?;
     let launch = profile.resolve_agent_launch(worker_agent, None, None);
+    // Remote Control（#1068）。判定は起動コマンドの組み立てと同じ 1 実装を通す
+    let remote_control =
+        orchestrator::remote_control_decision(&profile, worker_agent, &profile_env);
 
     // 分割先タブの解決（tab 指定 > 呼び出し元ペインのタブ）。
     // Issue #496「押すと**同じタブ内に**エージェントのペインを立て」
@@ -7665,6 +7816,9 @@ fn dispatch_git_resolve_agent(
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
         allow_sandbox_bypass: launch.allow_sandbox_bypass,
+        // Remote Control（#1068）: opt-in かつ適格なときだけ付く。
+        // 不適格なら flag は None になり、理由は `remote_control` に残る
+        remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
         env: &profile_env,
     });
@@ -7741,6 +7895,16 @@ fn dispatch_git_resolve_agent(
             .map(|p| p.display().to_string()),
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
+        // #1068: この解消エージェントの会話が Remote Control へ繋がるか。
+        // opt-in していても環境が不適格なら false で、理由は `blocked` に入る
+        // （spawn と同じ扱い = 無言で「繋がっているはず」にしない）
+        "remote_control": remote_control.enabled(),
+        "remote_control_blocked": remote_control.blocked.as_ref().map(|b| json!({
+            "kind": b.kind(),
+            "detail": b.detail(),
+            "reason": b.reason().text(),
+            "next_step": b.next_step().text(),
+        })),
         "state": conflict_state_json(&repo, &state),
     }))
 }
@@ -7856,6 +8020,11 @@ fn dispatch_orchestrator_spawn(
         .as_ref()
         .and_then(|a| a.default_effort.as_deref()));
     let launch = profile.resolve_agent_launch(worker_agent, effective_model, effective_effort);
+    // Remote Control（#1068）。opt-in が無ければ何も起きない。
+    // opt-in なのに不適格なら、フラグは付けずに理由を spawn 応答の warnings へ載せる
+    // （無言で「繋がっているはず」にしない）
+    let remote_control =
+        orchestrator::remote_control_decision(&profile, worker_agent, &profile_env);
     let window_title = match label {
         Some(l) => format!("{project}: {l}"),
         None => format!("{project}-worker"),
@@ -7905,6 +8074,9 @@ fn dispatch_orchestrator_spawn(
         effort: launch.effort.as_deref(),
         skip_permissions: launch.skip_permissions,
         allow_sandbox_bypass: launch.allow_sandbox_bypass,
+        // Remote Control（#1068）: opt-in かつ適格なときだけ付く。
+        // 不適格なら flag は None になり、理由は `remote_control` に残る
+        remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
         env: &profile_env,
     });
@@ -8069,6 +8241,25 @@ fn dispatch_orchestrator_spawn(
     // #368: spawn 完了 → claude session スキャンを即時トリガー
     crate::request_claude_scan();
 
+    // #1068: opt-in しているのに Remote Control が有効にならなかったときは理由を残す。
+    // ここで黙ると「スマホの一覧に出ない」の原因が辿れなくなる
+    if let Some(blocked) = &remote_control.blocked {
+        let message = format!(
+            "remote_control: true ですが有効にできませんでした（{}）。{} / {}",
+            blocked.detail(),
+            blocked.reason().text(),
+            blocked.next_step().text()
+        );
+        eprintln!("warning: {message}");
+        launch_warnings.push(json!({
+            "kind": format!("remote_control_{}", blocked.kind()),
+            "agent": worker_agent.as_str(),
+            "message": message,
+            "detail": blocked.detail(),
+            "next_step": blocked.next_step().text(),
+        }));
+    }
+
     // Part 4: env のキー一覧（値はマスク。Issue #500）
     let env_keys: Vec<&str> = profile_env.export_keys();
     // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める。
@@ -8101,6 +8292,9 @@ fn dispatch_orchestrator_spawn(
         // #822: この worker に適用された利用上限後の自動復帰（FR-2.27）。
         // true なら `tako limit-resume --pane <id>` で切らない限り自動復帰の対象
         "limit_resume": limit_resume_applied,
+        // #1068: この worker の会話が Claude 公式の Remote Control へ繋がるか。
+        // opt-in していても環境が不適格ならここは false（理由は warnings に入る）
+        "remote_control": remote_control.enabled(),
         // #983: spawn は成立したが完全ではなかったもの（分類 + 理由 + 次の一手）。
         // 空配列 = 何も問題が無かった
         "warnings": launch_warnings,

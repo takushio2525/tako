@@ -62,6 +62,21 @@
   隔離インスタンスの kill は **ps でフルパス確認 → 明示 pid**（8/29 に pgrep 先頭撃ちで誤爆した）
 - 合成クリック（System Events）は GPUI に届かない。ドラッグは合成 PlatformInput なら届く（#725 / #1043）
 
+## リモート刷新（エピック #1059）柱 1 の土台
+
+- **#1068 / #1069 実装済み**（`b42abb8` / `ed69192`。ブランチ `feat/1068-1069-remote-control-optin`）。
+  プロファイル `remote_control`（既定 false）で `--remote-control` を渡し、
+  `tako sessions link` / MCP / `/api/agents` / `/api/v2/panes` が公式 URL を 1 実装で返す
+- **不変条件**: 不適格な環境ではフラグを付けない（付けると claude が起動時に落ちる）/
+  証明できるときだけ断る（プラン・ZDR はローカルから分からないので断らない）/
+  URL を捏造しない（connected 以外は url も id も持たない）/ アカウント UUID を保持しない
+- **実測で分かった前提**: `bridge_status` 行は `--remote-control` つきのセッションだけに出る
+  （アカウント既定の自動接続では出ない = `bridge-session` が予備段の主役）。
+  この機の既定アカウントは**自動接続が ON** なので、非 opt-in の worker も connected になりうる
+- 検証の作法: 隔離は `TAKO_ISOLATED=1` + `TAKO_PERSIST=1` + `TAKO_TMUX_SOCKET=<専用>`
+  （`TAKO_ISOLATED` 単独だと `TAKO_PERSIST=0` になり器が無く pane → session 解決が空振りする）。
+  実 URL はハッシュだけで扱う（リポ・ログへ実値を残さない）
+
 ## 次の一手
 
 - **GUI 再起動で全反映 → ユーザー目視**（#1009 / #1043 の close 判断・#1042 は報告者確認待ち）

@@ -56,6 +56,7 @@ const CATEGORIES = [
     'worker_limit_detect', 'worker_limit_autoresume', 'worker_limit_metrics',
     'limit_service_switch',
   ]],
+  ['リモートからの操作', ['remote_control']],
   ['その他', ['git_resolve_agent']],
 ];
 

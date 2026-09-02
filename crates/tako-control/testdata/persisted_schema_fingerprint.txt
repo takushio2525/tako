@@ -14,7 +14,7 @@ OrchestratorConfig: auto_close, auto_push
 PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume
 PendingSpawn: tmux_session, kind, label, project, agent, model, effort, issues, prompt_head, cwd, tab, pane, recorded_at
 PreviewLayout: path, mode
-Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox
+Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox, remote_control
 ProjectEntry: cwd, description
 ProjectsConfig: projects
 RecentEntry: directory, repository, ssh

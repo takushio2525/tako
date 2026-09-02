@@ -1421,6 +1421,7 @@ pub fn tools() -> Vec<Value> {
                     "limit_resume": { "type": "boolean", "description": "このプロファイルから spawn した worker ペインで利用上限後の自動復帰（5h / 週次上限のリセット後に tako が再開させる）を既定 ON にする（既定 false。set 時。#822）。spawn 側の limit_resume が指定されていればそちらが勝つ" },
                     "clear_limit_resume": { "type": "boolean", "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）" },
                     "bypass_sandbox": { "type": "boolean", "description": "codex（master / worker）を --dangerously-bypass-approvals-and-sandbox で起動することを許可する（既定 false = 許可しない。set 時。#981）。true にすると承認プロンプトと codex のサンドボックスが両方無効になり、書き込み先もネットワークも制限されなくなる。false へ戻すと codex の既定（承認プロンプトが出る）に戻る" },
+                    "remote_control": { "type": "boolean", "description": "このプロファイルの claude セッション（master / solo / spawn した worker）を Claude 公式の Remote Control へ繋ぐ（既定 false = 繋がない。set 時。#1068）。true にすると claude 起動コマンドへ --remote-control が付き、claude.ai と Claude モバイルアプリからその会話を操作できるようになる。**委譲の代償**: 会話の transcript が Anthropic のサーバーにも保存され、認証は claude.ai アカウントへ移るので tako の機器ペアリングと role（observe / interact / manage / admin）はその会話には効かない。claude 以外の系統（codex / agy）には相当する仕組みが無いため何も起きない。環境が不適格（DISABLE_TELEMETRY 等・エンドポイント差し替え・API キー認証・組織ポリシー）なときはフラグを付けず、応答の remote_control_blocked に理由と次の一手が入る" },
                 },
                 "additionalProperties": false,
             },
@@ -2929,18 +2930,26 @@ pub fn tools() -> Vec<Value> {
                 action=resume: ペイン / タブ / 永続化の器（tmux / psmux）が全滅していても、記録された cwd で\
                 新しいペインを分割起動し `claude --resume <session_id>` で会話文脈ごと復元する。\
                 「昨日の #159 の子を呼び戻して」のような依頼は list で特定 → resume で復元する。\
-                制限: resume は claude セッションのみ（codex / agy は list に載るが復元不可）。",
+                action=link: そのペイン（または id）の会話を Claude 公式アプリ / claude.ai で開くための\
+                session URL を返す（#1069）。「スマホから続きを見たい」に答える経路。\
+                応答の remote_link.state は connected（url あり）/ not_connected（まだ繋いでいない）/\
+                ineligible: <理由>（この環境では繋げない）/ unknown（会話が特定できない）で、\
+                繋がっていないときは url を返さない（捏造しない）。繋ぐには\
+                tako_orchestrator_profiles で remote_control: true にしてから起動し直す。\
+                remote_link.account_label はどの tako アカウント配下のセッションかで、\
+                スマホが別アカウントでログインしていると一覧に出ないので切り分けに使う。\
+                制限: resume / link は claude セッションのみ（codex / agy は list に載るが復元・委譲不可）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "show", "resume"],
+                        "enum": ["list", "show", "resume", "link"],
                         "description": "操作種別",
                     },
                     "id": {
                         "type": "string",
-                        "description": "session_id（前方一致可。show / resume で必須）",
+                        "description": "session_id（前方一致可。show / resume で必須。link では pane と排他の任意指定）",
                     },
                     "role": {
                         "type": "string",
@@ -2957,7 +2966,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "pane": {
                         "type": "integer",
-                        "description": "resume の分割元ペイン ID（省略時は呼び出し元）",
+                        "description": "resume の分割元ペイン ID / link の対象ペイン ID（省略時は呼び出し元）",
                     },
                     "tab": {
                         "type": "integer",

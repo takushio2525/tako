@@ -864,6 +864,18 @@ enum SessionsCommand {
         /// session_id（前方一致可）
         id: String,
     },
+    /// Claude 公式 Remote Control の session URL を表示する（#1069）
+    Link {
+        /// 対象ペイン ID（省略時は呼び出し元ペイン。--id と排他）
+        #[arg(long, conflicts_with = "id")]
+        pane: Option<u64>,
+        /// session_id で引く（前方一致可。--pane と排他）
+        #[arg(long)]
+        id: Option<String>,
+        /// JSON で出力する
+        #[arg(long)]
+        json: bool,
+    },
     /// 会話を新しいペインで復元する（記録された cwd で claude --resume を起動）
     Resume {
         /// session_id（前方一致可）
@@ -2024,6 +2036,12 @@ enum ProfilesCommand {
         /// 書き込み先もネットワークも制限されなくなる）
         #[arg(long)]
         bypass_sandbox: Option<bool>,
+        /// この会話を Claude 公式の Remote Control へ繋ぐ（既定 false。#1068。
+        /// true にすると claude.ai と Claude モバイルアプリからこの会話を操作できるが、
+        /// transcript は Anthropic のサーバーにも保存され、tako の機器ペアリングと
+        /// role はその会話には効かなくなる）
+        #[arg(long)]
+        remote_control: Option<bool>,
     },
 }
 
@@ -2954,6 +2972,10 @@ fn cli_main() -> ExitCode {
             orchestrator_projects_cli(sub)
         }
         Command::Orchestrator(OrchestratorCommand::Profiles(ref sub)) => {
+            // #1068: 応答に理由文（`Note`）が載るのでここで表示言語を決める。
+            // profiles はローカル処理（dispatch を直呼び）なので、GUI 側の初期化に
+            // 相乗りできない = 呼ぶ側が明示しないと静的既定の英語で凍る
+            tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
             orchestrator_profiles_cli(sub)
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { pane }) => {
@@ -3389,6 +3411,38 @@ fn print_master_env(profile: &tako_control::orchestrator::Profile, profile_name:
         Err(e) => eprintln!("warning: {e}"),
     }
     print_sandbox_state(profile, profile_name);
+    print_remote_control_state(profile, profile_name);
+}
+
+/// Remote Control の状態を 1 行で出す（Issue #1068。#981 の
+/// `print_sandbox_state` と同じ思想 = **有効でも無効でも出す**）。
+///
+/// 無効のときに黙っていると「スマホから見えない」の切り分けができない。
+/// 逆に opt-in しているのに環境が不適格なときは、**なぜ付かなかったか**を出す
+/// （フラグを付けないことで claude の即死は避けているが、理由が要る）
+fn print_remote_control_state(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
+    use tako_control::{claude_remote, orchestrator};
+    // claude 以外には相当する仕組みが無い（マトリクスの宣言が正）。
+    // opt-in していない限り黙る = codex master の画面に無関係な行を増やさない
+    let is_claude = matches!(
+        profile.resolve_master_agent(),
+        Ok(orchestrator::WorkerAgent::Claude)
+    );
+    if !is_claude && !profile.remote_control_enabled() {
+        return;
+    }
+    let decision = match orchestrator::master_remote_control_decision(profile) {
+        Ok(d) => d,
+        // アカウント / master_agent の解決失敗は print_master_env が既に出している
+        Err(_) => return,
+    };
+    eprintln!("{}", claude_remote::status_line(&decision));
+    if decision.flag.is_none() && decision.blocked.is_none() && is_claude {
+        eprintln!(
+            "  有効にする場合: {}",
+            claude_remote::enable_hint_command(profile_name)
+        );
+    }
 }
 
 /// codex 系 master / solo のサンドボックス状態を 1 行で出す（Issue #981）。
@@ -4103,6 +4157,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             limit_resume,
             clear_limit_resume,
             bypass_sandbox,
+            remote_control,
         } => ProfilesParams {
             action: "set".into(),
             name: Some(name.clone()),
@@ -4142,6 +4197,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             limit_resume: *limit_resume,
             clear_limit_resume: *clear_limit_resume,
             bypass_sandbox: *bypass_sandbox,
+            remote_control: *remote_control,
         },
     };
     let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
@@ -4268,7 +4324,10 @@ fn remote_serve() -> Result<(), String> {
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する
 fn remote_agents() -> Result<(), String> {
-    let result = tako_control::agents::list_agents_with_panes(None)?;
+    let mut result = tako_control::agents::list_agents_with_panes(None)?;
+    // #1069: 公式リンク（claude.ai/code）。HTTP の /api/agents と dispatch の
+    // RemoteAgents と**同じ 1 実装**を通す（CLI はローカル処理なので自分で呼ぶ）
+    tako_control::claude_remote_link::attach_to_agents(&mut result);
     println!("{}", pretty_json(&result));
     Ok(())
 }
@@ -6605,6 +6664,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: None,
                 direction: None,
             },
+            SessionsCommand::Link { pane, id, .. } => Request::Sessions {
+                action: "link".into(),
+                id: id.clone(),
+                role: None,
+                project: None,
+                limit: None,
+                pane: *pane,
+                tab: None,
+                direction: None,
+            },
             SessionsCommand::Show { id } => Request::Sessions {
                 action: "show".to_string(),
                 id: Some(id.clone()),
@@ -7589,6 +7658,32 @@ fn print_result(command: &Command, result: &Value) {
         }
         Command::Sessions(SessionsCommand::Show { .. }) => {
             println!("{}", pretty_json(result));
+        }
+        // #1069: 既定は「URL 1 行」（スマホへ渡すのが用途なのでコピーしやすい形）。
+        // 繋がっていなければ理由を出す（URL を捏造しない）
+        Command::Sessions(SessionsCommand::Link { json, .. }) => {
+            if *json {
+                println!("{}", pretty_json(result));
+            } else {
+                let link = &result["remote_link"];
+                match link["url"].as_str() {
+                    Some(url) => {
+                        println!("{url}");
+                        if let Some(account) = link["account_label"].as_str() {
+                            eprintln!("アカウント: {account}（このアカウントでログインした端末からだけ開けます）");
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "公式リンクはありません（state: {}）",
+                            link["state"].as_str().unwrap_or("unknown")
+                        );
+                        eprintln!(
+                            "  有効にする場合: tako orchestrator profiles set <名前> --remote-control true → 起動し直す"
+                        );
+                    }
+                }
+            }
         }
         Command::Sessions(SessionsCommand::Resume { .. }) => {
             if let (Some(pane), Some(sid)) =
