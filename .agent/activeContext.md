@@ -3,19 +3,24 @@
 > このファイルは AI が毎ターン上書きする現在状態のスナップショット。
 > 過去ログは `progress.md` を見ること。
 
-## 現在の対象（2026-08-29 夜 = 並行 8 本の一括着地が完了）
+## 現在の対象（2026-09-03 未明 = 9/1〜9/3 の 7 PR 一括着地・GUI 反映済み）
 
-- **8/29 に merge 済み**（詳細は progress.md の同日エントリと各 Issue）: #1009 ツリー git 色付け /
-  #1016 find_all 位置ずれ / #1038 remote ループバック TCP（#971 同根）/ #1040 SSH ネット断自動復帰 /
-  #1042 Dock ピン / #1043 Finder D&D / #1048 セルフテスト 111 / #1049 serve 消失（+#1053）。
-  main = `f7c18eb`
-- **/Applications は `f7c18eb` 世代へ install 済み・本番 GUI プロセスは 18:19 起動の `f9aad2a` 世代**
-  → 次の GUI 再起動で全部反映（ユーザー案内待ち）。再起動後の目視項目: ツリー git 色（#1009）/
-  Finder D&D（#1043）/ SSH 自動再接続（#1040）
-- **本番 remote は稼働中**: standalone tailscale に系統固定（#1038 の保存）・URL =
-  `https://<hostname>.<tailnet>.ts.net`・`serve_ok=true`。**この機は MagicDNS 未適用 =
-  ローカル curl は `--resolve <host>:443:<tailscale-ip>` 必須**。**GUI 版 Tailscale アプリは
-  起動しないこと**（既定探索が入れ替わる環境要因。#1038 の GUI 構成通し検証のときに master が扱う）
+- **9/1〜9/3 に merge 済み**（詳細は progress.md）: #1057 setup 導入実行代行（PR #1064）/
+  #1058 Win GUI モード導線（#1065）/ #1041 リモート VSCode 風（#1066）/ #1060 PII（#1061）/
+  #1063 は計測の錯覚 = PerMonitorV2 不変条件化（#1071）/ #1067 セッション再起動 2 種（#1074）/
+  **リモート刷新 柱 1 土台 = Remote Control opt-in + session URL 公開**（#1068/#1069 = PR #1070）。
+  main = `d6596ab`
+- **/Applications = `d6596ab` 世代・本番 GUI は 9/3 00:33 再起動済み（pid 51132）= 全反映済み**。
+  ユーザー目視待ち: ツリー git 色（#1009）/ Finder D&D（#1043）/ リモートフォルダ新挙動（#1041 の
+  ツリー先頭 + 自動 SSH）/ ペイン右クリックの再起動 2 項目（#1067）
+- **本番 remote は停止中（復旧作業の途中）**: 8/31 未明から GUI 版 Tailscale が稼働して standalone が
+  停止 → ユーザー選択は standalone へ戻す。brew tailscaled は **root 起動が必要**
+  （`sudo brew services start tailscale`）で、root 化により state が変わり**再ログインが必要**。
+  ペイン 1498 で `tailscale up` → `tako remote start` の sudo + ブラウザログイン待ち。
+  完了すれば従来 URL（standalone ノード）で復旧する
+- **リモート大刷新はエピック #1059**（調査レポート = research/2026-09-01-remote-renewal-claude-official.md。
+  分割 A〜H 中 A/B が着地済み。次 = 柱1-C「PWA に Claude で開く」/ 柱1-D「スマホから master 起動」）
+- **リポに PR 必須ルールが入った**: docs 含め main 直 push しない（PR 経由）
 - **検収の status 読みは `/Applications/tako.app/Contents/MacOS/tako` で叩く**（PATH 先頭の
   `~/dev/tako/target` の stale ビルドだと新フィールドがキーごと無い = #432 と同じ罠を 8/29 に実演）
 
