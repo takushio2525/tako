@@ -16,6 +16,42 @@
 
 use tako_control::claude_remote_link::{self, LinkState};
 
+/// 実 transcript のパスを数本返す（**読み直しのコスト測定用**）
+fn sample_paths() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for dir in tako_control::transcript::claude_config_dirs() {
+        let Ok(projects) = std::fs::read_dir(dir.join("projects")) else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let Ok(files) = std::fs::read_dir(project.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    continue;
+                }
+                if path.metadata().map(|m| m.len()).unwrap_or(0) < 64 * 1024 {
+                    continue; // 小さすぎるものは末尾優先の効果が測れない
+                }
+                out.push(path);
+                if out.len() >= 5 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `n` 件ぶんのダミー行（`session_id` は実在のものを使い回す）
+fn rows_for(ids: &[String], n: usize) -> Vec<serde_json::Value> {
+    (0..n)
+        .map(|i| serde_json::json!({ "session_id": ids[i % ids.len()] }))
+        .collect()
+}
+
 /// 実 transcript を (bridge 行あり, bridge 行なし) に分けて session id を返す。
 /// **中身は返さない**（呼び出し側が id を出さないようにするため件数だけ持たせる）
 fn sample_sessions() -> (Vec<String>, Vec<String>) {
@@ -172,10 +208,7 @@ fn 一覧付与のコストが桁で問題ないこと() {
         return;
     }
     // 20 ペイン相当（実運用の上限に近い）
-    let mut rows = Vec::new();
-    for i in 0..20 {
-        rows.push(serde_json::json!({ "session_id": ids[i % ids.len()] }));
-    }
+    let rows = rows_for(&ids, 20);
     // 1 回目（memo が空）
     let mut first = serde_json::json!({ "agents": rows.clone() });
     let t0 = std::time::Instant::now();
@@ -188,7 +221,21 @@ fn 一覧付与のコストが桁で問題ないこと() {
     claude_remote_link::attach_to_agents(&mut second);
     let warm = t1.elapsed();
 
-    eprintln!("20 件の付与: 初回 {cold:?} / 2 回目 {warm:?}");
+    // 初回の全走査 1 件ぶん（セッションごとに 1 回だけ通る経路）。
+    // **生きている会話のポーリングはここを通らない**（追記ぶんだけ読む形なので、
+    // その計測は `claude_remote_link` の `追記ぶんだけ読むと定常コストが増えない` にある）
+    let paths = sample_paths();
+    let full = if paths.is_empty() {
+        None
+    } else {
+        let t2 = std::time::Instant::now();
+        for path in &paths {
+            let _ = claude_remote_link::read_link_at(path);
+        }
+        Some(t2.elapsed() / paths.len() as u32)
+    };
+
+    eprintln!("20 件の付与: 初回 {cold:?} / 2 回目 {warm:?}｜初回の全走査 1 件: {full:?}");
     // 結果は同じ（memo が値を変えていない）
     assert_eq!(first, second, "memo が結果を変えている");
     assert!(

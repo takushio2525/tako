@@ -346,7 +346,11 @@ type MemoKey = String;
 struct Memo {
     path: std::path::PathBuf,
     mtime: std::time::SystemTime,
-    link: RemoteLink,
+    /// この時点までに走査したバイト数（**transcript は追記のみ**なので、
+    /// 次回はここから先だけ読めば足りる）
+    scanned_len: u64,
+    /// 走査した範囲で見つかった最後の手がかり（無ければ `None` = 未接続）
+    link: Option<RemoteLink>,
 }
 
 fn memo() -> &'static std::sync::Mutex<std::collections::HashMap<MemoKey, Memo>> {
@@ -355,18 +359,27 @@ fn memo() -> &'static std::sync::Mutex<std::collections::HashMap<MemoKey, Memo>>
     MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// memo に載っていて mtime が動いていなければそれを返す
-fn cached(session_id: &str) -> Option<RemoteLink> {
+/// memo の状態（`(path, mtime, scanned_len, link)`）を取り出す
+fn memo_state(
+    session_id: &str,
+) -> Option<(
+    std::path::PathBuf,
+    std::time::SystemTime,
+    u64,
+    Option<RemoteLink>,
+)> {
     let guard = memo().lock().ok()?;
-    let entry = guard.get(session_id)?;
-    let mtime = std::fs::metadata(&entry.path).ok()?.modified().ok()?;
-    (mtime == entry.mtime).then(|| entry.link.clone())
+    let e = guard.get(session_id)?;
+    Some((e.path.clone(), e.mtime, e.scanned_len, e.link.clone()))
 }
 
-fn remember(session_id: &str, path: &std::path::Path, link: &RemoteLink) {
-    let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
-        return;
-    };
+fn remember(
+    session_id: &str,
+    path: &std::path::Path,
+    mtime: std::time::SystemTime,
+    scanned_len: u64,
+    link: &Option<RemoteLink>,
+) {
     if let Ok(mut guard) = memo().lock() {
         // 上限を置く（長寿命の daemon で無限に増えないように）。
         // 超えたら丸ごと捨てる（LRU を持つほどの規模ではない）
@@ -378,10 +391,80 @@ fn remember(session_id: &str, path: &std::path::Path, link: &RemoteLink) {
             Memo {
                 path: path.to_path_buf(),
                 mtime,
+                scanned_len,
                 link: link.clone(),
             },
         );
     }
+}
+
+/// `from` バイト目から末尾までを行として走査する（**追記ぶんだけ読む**）。
+///
+/// `extract_link` は「最後の手がかり」を採るので、前回までに手がかりが無かった
+/// 範囲を読み直す必要はない。前回の手がかりより後ろに新しいものがあれば
+/// そちらが正（繋ぎ直し）なので、追記ぶんで見つかったらそれを採る。
+///
+/// 返す `consumed` は **`\n` で終わった行までのバイト位置**。
+/// claude が書いている途中の行（改行がまだ来ていない）は数えないので、
+/// 次回そこから読み直される = **境界で手がかりを取りこぼさない**
+fn scan_from(path: &std::path::Path, from: u64) -> Result<(Option<RemoteLink>, u64), String> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|e| format!("transcript を開けない: {e}"))?;
+    if from > 0 {
+        file.seek(SeekFrom::Start(from))
+            .map_err(|e| format!("transcript を seek できない: {e}"))?;
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut consumed = from;
+    let mut last: Option<RemoteLink> = None;
+    let mut buf = String::new();
+    for _ in 0..MAX_SCAN_LINES {
+        buf.clear();
+        let read = match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // 不正な UTF-8 等はそこで打ち切る（読めた範囲までを確定させる）
+            Err(_) => break,
+        };
+        if !buf.ends_with('\n') {
+            // 書き込み途中の行。**consumed へ含めない**（次回読み直す）
+            break;
+        }
+        consumed += read as u64;
+        if let Some(found) = extract_link(std::iter::once(buf.trim_end().to_string())) {
+            last = Some(found);
+        }
+    }
+    Ok((last, consumed))
+}
+
+/// 所在（`locate_transcript`）の memo。**生きている会話は mtime が動き続けるので
+/// リンクの memo が効かない**が、**所在は変わらない**ので分けて持つ。
+///
+/// `locate_transcript` は config dir ごとに `projects/` を `read_dir` し、
+/// その中の全プロジェクトへ `is_file()` を打つ（この機は 100 プロジェクト）。
+/// ポーリング経路ではこれが cold の支配項になる
+fn located(session_id: &str) -> Option<crate::transcript::TranscriptLocation> {
+    static PATHS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<MemoKey, crate::transcript::TranscriptLocation>>,
+    > = std::sync::OnceLock::new();
+    let paths = PATHS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // memo が指すファイルが今も在るなら使う（消えていれば探し直す）
+    if let Ok(guard) = paths.lock() {
+        if let Some(hit) = guard.get(session_id) {
+            if hit.path.is_file() {
+                return Some(hit.clone());
+            }
+        }
+    }
+    let found = crate::transcript::locate_transcript(session_id)?;
+    if let Ok(mut guard) = paths.lock() {
+        if guard.len() >= 512 {
+            guard.clear();
+        }
+        guard.insert(session_id.to_string(), found.clone());
+    }
+    Some(found)
 }
 
 /// セッション id（claude の会話 UUID）から公式リンクを解決する。
@@ -389,26 +472,56 @@ fn remember(session_id: &str, path: &std::path::Path, link: &RemoteLink) {
 /// 見つからない / 読めないときは `Unknown`（**URL を捏造しない**）。
 /// 会話は読めたが繋がっていないときは `NotConnected`
 pub fn link_for_session(session_id: &str) -> RemoteLink {
-    if let Some(hit) = cached(session_id) {
-        return hit;
-    }
-    let Some(location) = crate::transcript::locate_transcript(session_id) else {
+    let Some(location) = located(session_id) else {
         // 所在が分からないものは memo しない（あとで現れうる）
         return RemoteLink::unknown();
     };
+    let Ok(meta) = std::fs::metadata(&location.path) else {
+        return RemoteLink::unknown();
+    };
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+
     let account_label = account_label_for_config_dir(&location.config_dir);
-    let link = match read_link_at(&location.path) {
-        Ok(Some(mut link)) => {
-            link.account_label = account_label;
-            link
+
+    // memo の状態から「どこから読むか」と「前回の答え」を決める
+    let prior = memo_state(session_id).filter(|(p, ..)| p == &location.path);
+    let (from, prev_link) = match &prior {
+        // mtime が変わっていない = 何も起きていない。そのまま返す
+        Some((_, m, _, link)) if Some(*m) == mtime => {
+            return finish(link.clone(), account_label);
         }
-        Ok(None) => RemoteLink::not_connected(account_label),
+        // 追記されている（**transcript は追記のみ**）= 増えたぶんだけ読む
+        Some((_, _, scanned, link)) if len >= *scanned => (*scanned, link.clone()),
+        // 縮んだ・別物になった = 全部読み直す
+        _ => (0, None),
+    };
+
+    let (found, consumed) = match scan_from(&location.path, from) {
+        Ok(v) => v,
         // 読めなかった = 判断材料が無い（繋がっていないとは言えない）。
         // 一時的な失敗を固定したくないので memo しない
         Err(_) => return RemoteLink::unknown(),
     };
-    remember(session_id, &location.path, &link);
-    link
+    // 追記ぶんに手がかりが無ければ前回の答えを引き継ぐ
+    let link = found.or(prev_link);
+    if let Some(mtime) = mtime {
+        // **走査し終えたバイト位置**を覚える（ファイル長ではない。
+        // 書き込み途中の行を「読んだ」ことにすると手がかりを飛ばす）。
+        // mtime も一緒に持つので、追記が無い周期は読みに行かない
+        remember(session_id, &location.path, mtime, consumed, &link);
+    }
+    finish(link, account_label)
+}
+
+/// 抽出結果へアカウント名を載せて公開形へ落とす
+fn finish(link: Option<RemoteLink>, account_label: Option<String>) -> RemoteLink {
+    match link {
+        Some(mut link) => {
+            link.account_label = account_label;
+            link
+        }
+        None => RemoteLink::not_connected(account_label),
+    }
 }
 
 /// **この機で Remote Control がそもそも成立しないか**を #1068 の判定で見る。
@@ -468,14 +581,18 @@ pub fn attach_to_agents(result: &mut Value) {
     }
 }
 
-/// 所在が分かっている transcript から抽出する（`transcript::read_messages_at` と同じ形）
+/// 所在が分かっている transcript を**全部**走査する（`transcript::read_messages_at` と同じ形）。
+///
+/// 通常の解決経路（[`link_for_session`]）は **追記ぶんだけ**読む
+/// （[`scan_from`]）ので、ここを通るのはセッションごとの初回と、
+/// テストから直接呼ぶときだけ。
+///
+/// **末尾だけ読む近道は採らない**。実測（この機の実 transcript 25 本）で
+/// `bridge-session` は「先頭 2〜11 行目」と「末尾の 99% 地点」の両方に出るので、
+/// 窓を切ると「先頭にしか無い会話」を取りこぼす。追記ぶんだけ読む形なら
+/// 定常状態はどちらにしても最小コストになる
 pub fn read_link_at(path: &std::path::Path) -> Result<Option<RemoteLink>, String> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).map_err(|e| format!("transcript を開けない: {e}"))?;
-    let reader = std::io::BufReader::new(file);
-    Ok(extract_link(
-        reader.lines().map_while(Result::ok).take(MAX_SCAN_LINES),
-    ))
+    scan_from(path, 0).map(|(link, _)| link)
 }
 
 #[cfg(test)]
@@ -743,37 +860,106 @@ mod tests {
         );
     }
 
-    /// memo は **mtime が動いたら捨てる**（繋ぎ直しで id が変わるのを取りこぼさない）
+    /// 追記ぶんだけ読む走査（`scan_from`）の不変条件。
+    ///
+    /// ① `consumed` は **`\n` で終わった行までしか進まない**（書き込み途中の行を
+    /// 「読んだ」ことにすると、その行の手がかりを永久に飛ばす）
+    /// ② 追記ぶんに手がかりがあれば拾う ③ 追記ぶんに無ければ `None`（呼び出し側が
+    /// 前回の答えを引き継ぐ）
     #[test]
-    fn memoはmtimeで無効化される() {
-        let dir = std::env::temp_dir().join("tako-1069-memo-test");
+    fn 追記ぶんの走査は完結した行までしか進まない() {
+        let dir = std::env::temp_dir().join("tako-1069-scan-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("t.jsonl");
-        std::fs::write(&path, "x\n").unwrap();
 
-        let key = "memo-test-11111111-2222-3333-4444-555555555555";
-        let first = RemoteLink {
-            url: Some("https://claude.ai/code/session_01A".into()),
-            session_id: Some("session_01A".into()),
-            account_label: Some("default".into()),
-            state: LinkState::Connected,
-        };
-        remember(key, &path, &first);
-        assert_eq!(cached(key).as_ref(), Some(&first), "memo が効いていない");
+        // 完結した 1 行 + **改行の無い書き込み途中の行**
+        let complete = format!("{}\n", bridge_session_line(FAKE_INFRA_ID));
+        let partial = "{\"type\":\"bridge-session\",\"bridgeSessionId\":\"cse_01ZZ";
+        std::fs::write(&path, format!("{complete}{partial}")).unwrap();
 
-        // 追記して mtime を動かす（claude が書いた状況）
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&path, "x\ny\n").unwrap();
+        let (link, consumed) = scan_from(&path, 0).unwrap();
         assert_eq!(
-            cached(key),
-            None,
-            "mtime が動いたのに古い値を返している（繋ぎ直しを取りこぼす）"
+            link.as_ref().and_then(|l| l.session_id.as_deref()),
+            Some(FAKE_COMPAT_ID)
+        );
+        assert_eq!(
+            consumed,
+            complete.len() as u64,
+            "書き込み途中の行を consumed に含めている（次回その行を読み飛ばす）"
         );
 
-        // ファイルが消えたら memo も使わない
-        remember(key, &path, &first);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(cached(key), None, "消えたファイルの memo を使っている");
+        // 途中の行が完成した = 次回そこから読み直して拾える
+        let finished = format!(
+            "{}{}\n",
+            complete,
+            bridge_session_line("cse_01ZZZZZZZZZZZZZZZZZZZZZZ")
+        );
+        std::fs::write(&path, &finished).unwrap();
+        let (link2, consumed2) = scan_from(&path, consumed).unwrap();
+        assert_eq!(
+            link2.as_ref().and_then(|l| l.session_id.as_deref()),
+            Some("session_01ZZZZZZZZZZZZZZZZZZZZZZ"),
+            "追記ぶんの手がかりを拾えていない"
+        );
+        assert_eq!(consumed2, finished.len() as u64);
+
+        // 手がかりの無い追記は None（呼び出し側が前回の答えを引き継ぐ）
+        let grown = format!(
+            "{finished}{}\n",
+            json!({"type": "user", "message": {"role": "user", "content": "hi"}})
+        );
+        std::fs::write(&path, &grown).unwrap();
+        let (link3, consumed3) = scan_from(&path, consumed2).unwrap();
+        assert_eq!(link3, None, "手がかりが無いのに何か返している");
+        assert_eq!(consumed3, grown.len() as u64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **追記ぶんだけ読む形の効果**（`/api/v2/panes` は PWA がポーリングし、
+    /// 生きている会話は mtime が動き続けるので「毎回読む」経路になる）。
+    ///
+    /// 4 MB の会話へ 1 行追記された状況を作り、全走査と追記ぶんだけの走査を比べる
+    #[test]
+    fn 追記ぶんだけ読むと定常コストが増えない() {
+        let dir = std::env::temp_dir().join("tako-1069-incremental-bench");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.jsonl");
+        let one = json!({"type": "user", "message": {"role": "user", "content": "x".repeat(300)}})
+            .to_string();
+        let mut body = String::new();
+        while body.len() < 4 * 1024 * 1024 {
+            body.push_str(&one);
+            body.push('\n');
+        }
+        body.push_str(&bridge_session_line(FAKE_INFRA_ID));
+        body.push('\n');
+        std::fs::write(&path, &body).unwrap();
+
+        // 全走査（初回に 1 回だけ通る）
+        let t0 = std::time::Instant::now();
+        let (link, consumed) = scan_from(&path, 0).unwrap();
+        let full = t0.elapsed();
+        assert_eq!(
+            link.as_ref().and_then(|l| l.session_id.as_deref()),
+            Some(FAKE_COMPAT_ID)
+        );
+        assert_eq!(consumed, body.len() as u64);
+
+        // 1 行追記（= 会話が 1 ターン進んだ状況）→ 追記ぶんだけ読む
+        let appended = format!("{body}{one}\n");
+        std::fs::write(&path, &appended).unwrap();
+        let t1 = std::time::Instant::now();
+        let (found, consumed2) = scan_from(&path, consumed).unwrap();
+        let incremental = t1.elapsed();
+        assert_eq!(found, None, "追記ぶんに手がかりは無い");
+        assert_eq!(consumed2, appended.len() as u64);
+
+        eprintln!("4MB の会話: 全走査 {full:?} / 追記ぶんだけ {incremental:?}");
+        assert!(
+            incremental * 5 < full,
+            "追記ぶんだけ読んでいるはずが速くなっていない（全走査 {full:?} / 追記 {incremental:?}）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
