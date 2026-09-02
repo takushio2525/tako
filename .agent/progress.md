@@ -3948,3 +3948,25 @@
   `TAKO_1057_LEGACY=1` の A/B で legacy が install を拒否（`legacy_launcher_exists=False`）/
   macOS 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`（項目 119 拡張・137 新設）。証拠は `~/dev/tako-evidence/1057/`
 - 次: PR レビュー → merge → install（master 判断）
+
+## 2026-09-02（#1068 + #1069: Remote Control のプロファイル opt-in と session URL の 1:1 公開）
+- #1068: プロファイル `remote_control`（既定 false）で spawn 経路 4 本へ `--remote-control`。
+  不適格な環境（阻害 env / エンドポイント差し替え / 非サブスク認証 / 組織ポリシー）は**フラグを付けず
+  理由 + 次の一手**（付けると claude が起動時に落ちてペインが即死する）。**証明できるときだけ断る**ので
+  プラン・ZDR は不適格と言わない。`agent_support::MATRIX` に 1 マス（実測根拠つき: codex 0.150.1 の
+  `remote-control` は自前ホストの app-server 経路で別物 / agy 1.1.23 に手段なし）
+- #1069: `claude_remote_link` 新設。**実測で 2 段構えの主役が入れ替わった**（`--remote-control` つきの
+  セッションは `bridge_status` 1 行 / 自動接続の既存 84 件は 0 行 = 予備段の `bridge-session` が主役）。
+  URL を捏造しない 4 状態 + アカウント UUID 非保持 + 4 経路 1 実装（`/api/agents` / `/api/v2/panes` /
+  `tako remote agents` / `sessions link` / MCP）
+- 実測: 隔離インスタンスで opt-in spawn → 実 claude が Remote Control へ接続 → transcript の
+  `bridge_status.url`・CLI・agents 経路が**同一ハッシュ**。非 opt-in は `--remote-control` なし
+  （コマンド文字列が変更前とバイト一致）。`TAKO_1068_LEGACY=1` で `effective=false`。
+  実 transcript 10 件（connected 5 / not_connected 5）で言い分けも実測
+- **副産物の発見**: このマシンの既定アカウントは**サーバー側の自動接続が ON** なので、
+  非 opt-in の worker も `bridge-session` を持ち `connected` になる（`bridge_status` は 0 行）。
+  tako の opt-in が制御するのは **tako が渡すフラグ**で、アカウント既定は上書きしない（FR-2.34.8）
+- 併せて修正: `profiles` CLI が表示言語を初期化しておらず理由文が英語で凍っていた /
+  `sessions link` の pane → session 解決に器なし構成の pid 経路（#728 の二段構え）を追加
+- 関連コミット: `b42abb8`（#1068）/ `ed69192`（#1069）
+- 次: PR → master 検収。柱1-C（PWA の「Claude で開く」）は #1070 以降
