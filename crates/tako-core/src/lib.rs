@@ -40,6 +40,7 @@ pub mod runner;
 pub mod screen;
 pub mod scroll;
 pub mod scroll_mirror;
+pub mod session_restart;
 pub mod shell;
 pub mod shell_integration;
 pub mod shell_profile;

@@ -1173,6 +1173,40 @@ FR-2.8〜2.32 はいずれも設計原則 5（AI フルコントロール）の�
 A/B は `TAKO_1057_LEGACY=1`（Windows は代行しない / PATH 判定は `exe::find` / 引き継ぎ先を探さない /
 依存の質問をしない = #1057 前の挙動）。
 
+### FR-2.34 会話を引き継いだセッション再起動（✅ 2026-09-02、#1067。基盤は #498 / #390 / #112 / #640 / #749 / #915 / #982）
+
+> claude CLI は symlink の張り替えで更新されるので、長生きのセッションは**起動時の
+> 旧バイナリを握り続ける**（#498 の stale 警告）。直す手段が「ペインを閉じて立て直す」
+> しかないと会話を失うため、実際には放置される。#498 は張り直しの受け口まで作って
+> あったが実装が成立しておらず（Ctrl+C 1 回・器つきペインでは resume の行が動いている
+> TUI の入力欄へ流れ込む・アカウント / モデル / effort が落ちる）、**merge 以来一度も
+> 意図どおり動いていなかった**。併せて #749 の自動ハンドオフ（ctx% 高騰）を人の操作で
+> 起こせるようにする。
+
+| ID | 要件 | 優先度 | 状態 |
+|---|---|---|---|
+| FR-2.34.1 | **2 種を明確に分ける**。`harness` = エージェント CLI のプロセスだけを建て直し `--resume` で**同じ会話**を続ける（会話コンテキストを 1 文字も失わない）。`handoff` = 引き継ぎを書かせてから**新しいセッション**へ交代する（ctx をリセットできるが引き継ぎファイルに書いた分しか残らない）。語彙の正本は `tako_core::session_restart::SessionRestartMode` で、CLI の possible values / MCP の enum / GUI の分岐がすべてこの表から引く | M | ✅ |
+| FR-2.34.2 | **落ちたことを確かめてから打つ**。旧プロセスへ SIGTERM を送り、**終了を確認してから** resume の行を #640 の送達確認つき経路へ渡す。落ちる前に打つと動いている TUI の入力欄へ流れ込む（#694 / #1006 と同じ罠）。猶予（5 秒）を過ぎたら SIGKILL、上限（30 秒）で断念して**理由をペインのバナーへ出す**（黙って諦めない）。ゾンビは終了済みとして扱う（#619） | M | ✅ |
+| FR-2.34.3 | **resume コマンドは既存の 1 実装で組む**（`sessions::resume_command`）。アカウント（`CLAUDE_CONFIG_DIR`）・role（`TAKO_ORCHESTRATOR_ROLE`）・モデル・effort が元のまま復元される。カタログに無い会話でも role から最小のメタを合成して同じ関数を通す（コマンドの形を 2 系統に分けない） | M | ✅ |
+| FR-2.34.4 | **会話 ID を解決できないまま終了させない**。解決は 生きた claude（`agents` 経由）→ セッションカタログの逆引き（transcript の実在つき）の順。どちらでも決まらなければ**プロセスに触らずに**断る（resume 先が分からないまま殺すと会話を失う）。終了直後に claude 自身が画面へ印字する `Resume this session with: claude --resume <id>`（実測 2.1.258）を拾えたら、そちらを**権威**として ID を差し替える（同一ペイン番号に世代が堆積する = #466 の実測への保険） | M | ✅ |
+| FR-2.34.5 | **関門は 2 段で意味が違う**。**構造的**（セッションの有無・role・agent 系統・handoff は master のみ）は**メニューの出し分け**に使う（#1006 の「出た項目が断られない」）。**一時的**（会話 ID 未解決・生成中・キュー滞留・入力欄の下書き・選択肢ダイアログ）は**実行時に断って理由 + 次の一手を返す**（メニューから消すと機能そのものを見つけられず、右クリックした瞬間の状態で項目が出たり消えたりする）。判断は `is_eligible` / `can_restart` の 2 関数で、GUI・CLI・MCP が同じものを通る | M | ✅ |
+| FR-2.34.6 | **メニューの出し分けに重い処理を置かない**。会話 ID の解決は `claude agents --json`（Node 起動）とカタログ読みを伴うので、**右クリックした瞬間に 1 度だけ**軽い材料（画面・role・レジストリ / カタログの agent 種別）を集め、メニューの描画中には読み直さない（#772 の「メインスレッド専有」を作らない） | M | ✅ |
+| FR-2.34.7 | **生成中の判定に `is_busy` を使わない**。あれは advisory で経過秒トークンを拾うため、**生成が終わった後も画面に残る**完了行（実測 `✻ Brewed for 2s · done 9:22 PM`）を busy と読む = アイドルなペインを永久に busy と申告する。プロセスを終わらせてよいかの判断は中断ヒント（`esc to interrupt` / `esc to cancel` / `Generating`）だけを見る（`claude_tui::interrupt_hint_visible`） | M | ✅ |
+| FR-2.34.8 | **引き継ぎ再起動は tako が代行しない**。#749 の自動ナッジと**同じ 1 実装の文面**（見出しだけ差し替え）でエージェント自身へ「引き継ぎを書き直す → `tako_orchestrator_handoff` を呼ぶ」を依頼する。tako が直接 handoff を呼ぶと**更新されていない引き継ぎファイル**で後任を立てることになる。前任のペインを閉じるのは後任（#749 の順序をそのまま使う） | M | ✅ |
+| FR-2.34.9 | **AI フルコントロール**: `tako session-restart [--mode harness\|handoff] [--pane N]`（**引数なしで下見** = 何ができるか + できない理由を返すだけで何も起こさない。#748 の respond と同じ形・#322 の最簡形）と MCP `tako_session_restart` へ 1:1 公開する。ペインの右クリックの 2 項目も**同じ dispatch** を通る。#498 の張り直しボタン（`tako stale-binary restart`）も同一実装へ寄せ、**会話を保つ harness を優先**して会話 ID を解決できないときだけ handoff へ落ちる | M | ✅ |
+| FR-2.34.10 | **系統差はマトリクスの 1 マスで宣言する**（#982）。`session_restart_harness` / `session_restart_handoff` を新設し、claude 以外は `Pending`（手段は上流に在る = `codex resume` / `agy --conversation` ので `Unsupported` にはしない）。判定を `if agent == claude` で散らさず `agent_support::supports` を通す | M | ✅ |
+
+実装メモ（2026-09-02）: 判断は `tako_core::session_restart`（モードの語彙・`is_eligible` /
+`can_restart`・`relaunch_step`・`parse_resume_hint` / `apply_resume_hint`。すべて純関数）、
+材料集めと実行は `tako_control::dispatch`（`session_restart_menu_facts` = 軽い /
+`build_session_restart_plan` = 重い）、建て直しの駆動は `tako-app` の
+`drive_agent_relaunches`（500ms tick）。文面は `tako_core::handoff::restart_prompt`。
+Windows は**ハーネス更新だけ使えない**（境界 B5 の `platform::process::terminate` が
+未実装。引き継ぎ再起動は影響を受けない）ので対応マトリクスは `Degraded`。
+A/B は `TAKO_1067_LEGACY` を持たない（#498 の旧経路は意図どおり動いていなかったので
+戻す価値が無い）。機械検証は unit 16 本 + セルフテスト項目 140
+（出し分け / 下見 / 関門 3 種 / 会話未解決での不実行 / 引き継ぎ依頼）。
+
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 
 | ID | 要件 | 優先度 |

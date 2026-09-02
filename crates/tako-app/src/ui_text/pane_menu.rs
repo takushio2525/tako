@@ -41,6 +41,23 @@ pub fn split_down() -> &'static str {
 pub fn connect_remote() -> &'static str {
     tr!("このペインでリモート接続…", "Connect this pane via SSH…")
 }
+/// セッションを引き継いで再起動する 2 種（#1067）。
+///
+/// **どちらも「引き継ぐ」だが残るものが違う**ので、文言で差が分かるようにしてある:
+/// ハーネス更新は会話がそのまま残り、引き継ぎ再起動は引き継ぎファイルに書いた分だけ残る
+pub fn restart_harness() -> &'static str {
+    tr!(
+        "会話を保って再起動（CLI 更新）",
+        "Restart keeping the chat (CLI update)"
+    )
+}
+pub fn restart_handoff() -> &'static str {
+    tr!(
+        "引き継ぎを書かせて再起動",
+        "Restart after writing a handoff"
+    )
+}
+
 pub fn background() -> &'static str {
     tr!("バックグラウンドへ", "Send to background")
 }
@@ -90,6 +107,8 @@ mod tests {
                 split_right().to_string(),
                 split_down().to_string(),
                 connect_remote().to_string(),
+                restart_harness().to_string(),
+                restart_handoff().to_string(),
                 background().to_string(),
                 close().to_string(),
                 limit_resume_toggle(false).to_string(),

@@ -2140,6 +2140,8 @@ impl TakoApp {
                                 pane: pane_id,
                                 kind: PaneContextKind::Preview,
                                 position: event.position,
+                                // プレビューにエージェントは居ない（#1067 の再起動は対象外）
+                                restart_modes: Vec::new(),
                             });
                             cx.notify();
                         }),

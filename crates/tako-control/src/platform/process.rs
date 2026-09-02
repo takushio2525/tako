@@ -13,6 +13,40 @@ pub fn terminate(pid: u32, force: bool) -> Result<(), String> {
     imp::terminate(pid, force)
 }
 
+/// プロセスが**終了済み**か（ゾンビも終了済みとして扱う）。
+///
+/// `kill(pid, 0)`（= `tako_core::platform::process::pid_alive`）は**ゾンビにも成功する**ので、
+/// 停止の待ち合わせには生死だけでは足りない（#619 で踏んだ）。
+/// 刈り取れない別プロセスから停止したときに「終了しない」と誤判定するのを防ぐ。
+///
+/// 呼ぶのは停止の待ち合わせ中だけ（定常のポーリング経路へは入れない。#340 の方針）
+pub fn has_terminated(pid: u32) -> bool {
+    !tako_core::platform::process::pid_alive(pid) || is_zombie(pid)
+}
+
+/// ゾンビ（終了済みだが親が未刈り取り）か。
+/// 待ち合わせの前提をテストで固定するために公開している
+pub fn is_zombie(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let mut cmd = std::process::Command::new("/bin/ps");
+        cmd.args(["-p", &pid.to_string(), "-o", "stat="])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // この枝は unix 限定なので実質 no-op だが、境界 B14 を素通りしない形に揃えておく
+        // （#628 / #586 の番犬が「抑止していない起動」として数えないため）
+        tako_core::platform::process::no_console_window(&mut cmd)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     pub fn terminate(pid: u32, force: bool) -> Result<(), String> {

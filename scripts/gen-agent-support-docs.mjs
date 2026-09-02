@@ -50,6 +50,7 @@ const CATEGORIES = [
   ['報告と会話ログ', [
     'worker_report_scrollback', 'worker_report_transcript',
     'sessions_catalog', 'sessions_resume',
+    'session_restart_harness', 'session_restart_handoff',
   ]],
   ['利用制限', [
     'worker_limit_detect', 'worker_limit_autoresume', 'worker_limit_metrics',

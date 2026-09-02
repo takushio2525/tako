@@ -22,3 +22,22 @@ pub fn restarting() -> &'static str {
 pub fn restart_failed() -> &'static str {
     tr!("張り直し失敗", "Restart failed")
 }
+
+/// #1067: 旧プロセスが終わらず建て直しを断念したときの理由 + 次の一手。
+/// **黙って諦めない**（バナーに出して手動の逃げ道を示す）
+pub fn relaunch_gave_up(pid: Option<u32>) -> String {
+    let target = match pid {
+        Some(pid) => format!("pid {pid}"),
+        None => tr!("対象のプロセス", "the target process").to_string(),
+    };
+    tr!(
+        format!(
+            "{target} が終わらないのでセッション再起動を中止しました。\
+             ペインで直接終了させてから `tako session-restart --mode harness` をやり直してください"
+        ),
+        format!(
+            "{target} did not exit, so the session restart was aborted. \
+             Quit it in the pane, then run `tako session-restart --mode harness` again"
+        )
+    )
+}

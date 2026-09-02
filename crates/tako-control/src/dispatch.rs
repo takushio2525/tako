@@ -4820,6 +4820,12 @@ fn dispatch_inner(
             }
         }
 
+        // #1067: エージェントペインを「会話を引き継いで」建て直す。
+        // mode 省略 = 下見（何も起こさない）
+        Request::SessionRestart { pane, mode } => {
+            dispatch_session_restart(host, origin, pane, mode.as_deref())
+        }
+
         Request::StaleBinary { action, pane } => {
             let action = action.as_deref().unwrap_or("status");
             match action {
@@ -11063,6 +11069,355 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
 }
 
 // ---------------------------------------------------------------------------
+// SessionRestart — 会話を引き継いだままエージェントペインを建て直す（Issue #1067）
+// ---------------------------------------------------------------------------
+//
+// #498 の張り直し（`tako stale-binary restart`）は同じことをしようとしていたが、
+// 実装が 3 点で成立していなかった:
+//
+//   1. Ctrl+C を 1 回だけ送っていた（claude の対話終了は 2 回。1 回では入力行を捨てるだけ）
+//   2. resume の行を `queue_write_on_alt_screen` で書いていた。器（tmux）つきペインの
+//      **外側は常に代替画面**なので、条件が即座に成立して**動いている claude の入力欄へ**
+//      流れ込む（#694 / #1006 で踏んだのと同じ罠）
+//   3. resume コマンドが素の `claude --resume <id>` で、アカウント（`CLAUDE_CONFIG_DIR`）・
+//      role・モデル・effort が全部落ちていた
+//
+// ここでは「終了させたことを確かめてから、`sessions::resume_command` が組んだ行を
+// #640 の送達確認つき経路で送る」形にし、#498 のボタンもこの 1 実装へ寄せた。
+
+/// ペインの状態を集めて [`session_restart::RestartFacts`] を作る（#1067）。
+///
+/// 併せて、実行に要る材料（会話 ID・resume コマンド・終了させる pid）も返す。
+/// **同じ材料で下見と実行の両方を賄う**ので、下見で見えた可否と実行結果がずれない
+struct SessionRestartPlan {
+    facts: tako_core::session_restart::RestartFacts,
+    agent: crate::orchestrator::agent::WorkerAgent,
+    role: Option<String>,
+    /// claude の会話 ID（解決できたときだけ）
+    session_id: Option<String>,
+    /// 会話 ID の出どころ（`agents-live` / `catalog` / null）
+    session_source: Option<&'static str>,
+    /// `--resume` の起動コマンド（組めたときだけ）
+    resume_command: Option<String>,
+    /// 会話 ID を解決できたのに resume コマンドを組めなかった理由
+    resume_error: Option<String>,
+    /// 終了させるエージェント CLI のプロセス（見つからなければ None）
+    agent_pid: Option<u32>,
+    /// 引き継ぎ運用メモのパス（handoff モードの案内に使う）
+    handoff_path: Option<String>,
+}
+
+/// メニューの出し分けに使う**軽い**材料だけを集める（#1067）。
+///
+/// **重い解決（`claude agents --json` の起動・`ps` / 器の採取）を含めない**のが要点。
+/// これは右クリックのたびに呼ばれるので、そこに Node 起動を入れると #772 と同じ
+/// 「メインスレッド専有」を作る。会話 ID の解決は実行時（[`build_session_restart_plan`]）
+/// だけが行い、判断は `session_restart::is_eligible` が `session_resolved` を見ない形で
+/// 成立させてある
+pub fn session_restart_menu_facts(
+    host: &dyn ControlHost,
+    pane: PaneId,
+) -> tako_core::session_restart::RestartFacts {
+    use tako_core::session_restart::RestartFacts;
+
+    let role = pane_role_of(host, pane);
+    let parsed = parsed_role_of(role.as_deref());
+    let session = host.session(pane);
+    let lines: Vec<String> = session.map(|s| s.visible_lines()).unwrap_or_default();
+    let input = session.and_then(|s| s.analyze_input());
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines).is_some();
+    RestartFacts {
+        has_session: session.is_some(),
+        is_agent: role.is_some(),
+        is_master: parsed.kind == "master",
+        agent: pane_agent_kind(pane, None).into(),
+        // 会話の解決とプロセスの特定は重いのでここでは見ない（実行時に確かめる）
+        session_resolved: false,
+        agent_process_found: false,
+        // 生成中の材料は**画面の中断ヒントだけ**。`is_busy` は完了行
+        // （`Brewed for 2s · done`）も busy と読み、OSC 133 の `Running` は
+        // エージェントが立っている間ずっと真になる（どちらも #1067 で実測）
+        agent_busy: crate::claude_tui::interrupt_hint_visible(&lines),
+        queued_messages: crate::claude_tui::queued_messages_pending(&lines),
+        // ダイアログの選択カーソルは入力欄と同じ字面なので、ダイアログ中は下書きと読まない（#748）
+        user_draft: !dialog
+            && input.is_some_and(|s| {
+                matches!(
+                    s.style,
+                    tako_core::InputStyle::User | tako_core::InputStyle::Mixed
+                )
+            }),
+        dialog,
+    }
+}
+
+/// ペインに貼られている role（空文字は「無い」と同じ扱い）
+fn pane_role_of(host: &dyn ControlHost, pane: PaneId) -> Option<String> {
+    host.workspace()
+        .tabs()
+        .iter()
+        .flat_map(|t| t.tree().panes())
+        .find(|p| p.id() == pane)
+        .and_then(|p| p.role())
+        .filter(|r| !r.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn parsed_role_of(role: Option<&str>) -> crate::sessions::ParsedRole {
+    role.map(crate::sessions::parse_role)
+        .unwrap_or(crate::sessions::ParsedRole {
+            kind: "pane",
+            project: None,
+            label: None,
+            profile: None,
+        })
+}
+
+/// このペインで動いている agent 系統（#1067）。
+///
+/// worker レジストリ → セッションカタログ → 既定（claude）の順。
+/// **どちらも知らなければ claude として扱う**（会話 ID が解決できなければ結局
+/// `SessionUnresolved` で断るので、ここで誤って別系統を名乗らせない）
+fn pane_agent_kind(
+    pane: PaneId,
+    catalog_entry: Option<&crate::sessions::SessionEntry>,
+) -> crate::orchestrator::agent::WorkerAgent {
+    use crate::orchestrator::agent::WorkerAgent;
+    let registry_agent = crate::orchestrator::registry::WorkerRegistry::load()
+        .ok()
+        .and_then(|reg| {
+            reg.workers
+                .values()
+                .filter(|e| e.pane == pane.as_u64() && !e.agent.is_empty())
+                // 同一ペイン番号には世代が堆積するので最後に spawn したものを採る（#466 と同型）
+                .max_by_key(|e| e.spawned_at.clone())
+                .and_then(|e| WorkerAgent::parse(&e.agent).ok())
+        });
+    let entry_agent = catalog_entry
+        .and_then(|e| e.agent.as_deref())
+        .and_then(|a| WorkerAgent::parse(a).ok());
+    registry_agent
+        .or(entry_agent)
+        .unwrap_or(WorkerAgent::Claude)
+}
+
+fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> SessionRestartPlan {
+    let facts = session_restart_menu_facts(host, pane_id);
+    let role = pane_role_of(host, pane_id);
+    let parsed = parsed_role_of(role.as_deref());
+
+    // 会話 ID: 生きた claude（agents 経由）→ カタログの逆引き。
+    // 生きた側を優先するのは、同一ペイン番号に世代が堆積する（#466 の実測）ため
+    let backend = host.backend_session(pane_id);
+    let catalog = crate::sessions::SessionCatalog::load().ok();
+    let (session_id, session_source) = backend
+        .as_deref()
+        .and_then(crate::agents::resolve_session_id_for_backend)
+        .map(|id| (Some(id), Some("agents-live")))
+        .unwrap_or_else(|| {
+            let from_catalog = catalog
+                .as_ref()
+                .and_then(|c| {
+                    crate::sessions::resolve_session_for_pane_in(c, &pane_id.as_u64().to_string())
+                })
+                .filter(|id| crate::transcript::find_transcript(id).is_some());
+            match from_catalog {
+                Some(id) => (Some(id), Some("catalog")),
+                None => (None, None),
+            }
+        });
+
+    // カタログのメタ（モデル・effort・アカウント・role）で resume コマンドを組む。
+    // カタログに無い会話でも role から最小のメタを合成して**同じ 1 実装**を通す
+    // （コマンドの形が 2 系統に分かれると、片方だけモデルが落ちる事故になる）
+    let catalog_entry = session_id
+        .as_deref()
+        .and_then(|id| catalog.as_ref().and_then(|c| c.entries.get(id)).cloned());
+    let agent = pane_agent_kind(pane_id, catalog_entry.as_ref());
+
+    let entry = catalog_entry.unwrap_or_else(|| crate::sessions::SessionEntry {
+        kind: parsed.kind.to_string(),
+        label: parsed.label.clone(),
+        project: parsed.project.clone(),
+        profile: parsed.profile.clone(),
+        agent: Some(agent.as_str().to_string()),
+        ..Default::default()
+    });
+    let (resume_command, resume_error) = match session_id.as_deref() {
+        Some(id) => match crate::sessions::resume_command(id, &entry) {
+            Ok(cmd) => (Some(cmd), None),
+            Err(e) => (None, Some(e)),
+        },
+        None => (None, None),
+    };
+
+    // 終了させる相手。器があればそのセッション配下、無ければ PTY 直下から辿る（#728 と同じ二段）
+    let snapshot = crate::agents::ProcessSnapshot::capture();
+    let pids = match backend.as_deref() {
+        Some(b) => snapshot.descendant_pids(b),
+        None => host
+            .session(pane_id)
+            .and_then(|s| s.child_pid())
+            .map(|pid| snapshot.descendants_with_root(pid))
+            .unwrap_or_default(),
+    };
+    let agent_pid = crate::stale_binary::find_agent_pid_among(&snapshot, &pids, agent.as_str());
+
+    let handoff_path = parsed
+        .profile
+        .as_deref()
+        .and_then(crate::orchestrator::handoff_path)
+        .map(|p| p.display().to_string());
+
+    SessionRestartPlan {
+        facts: tako_core::session_restart::RestartFacts {
+            agent: agent.into(),
+            session_resolved: resume_command.is_some(),
+            agent_process_found: agent_pid.is_some(),
+            ..facts
+        },
+        agent,
+        role,
+        session_id,
+        session_source,
+        resume_command,
+        resume_error,
+        agent_pid,
+        handoff_path,
+    }
+}
+
+/// SessionRestart — `mode` 省略で下見、指定で実行（#1067）
+fn dispatch_session_restart(
+    host: &mut dyn ControlHost,
+    _origin: PaneOrigin,
+    pane: Option<u64>,
+    mode: Option<&str>,
+) -> Result<Value, DispatchError> {
+    use tako_core::session_restart::{self as sr, SessionRestartMode};
+
+    let mode = match mode {
+        None => None,
+        Some(raw) => Some(SessionRestartMode::parse(raw).ok_or_else(|| {
+            DispatchError::InvalidParams(format!(
+                "mode が不正: {raw:?}（{}。省略すると下見だけを返す）",
+                SessionRestartMode::values_hint()
+            ))
+        })?),
+    };
+    let (_tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
+    let plan = build_session_restart_plan(host, pane_id);
+    let pane_raw = pane_id.as_u64();
+
+    // 下見の共通部分（実行時の応答にも載せる。同じ材料から作る）
+    let available: Vec<&str> = sr::menu_modes(&plan.facts)
+        .into_iter()
+        .map(|m| m.as_str())
+        .collect();
+    let modes: Vec<Value> = [SessionRestartMode::Harness, SessionRestartMode::Handoff]
+        .into_iter()
+        .map(|m| {
+            let eligible = sr::is_eligible(m, &plan.facts);
+            let ready = sr::can_restart(m, &plan.facts);
+            json!({
+                "mode": m.as_str(),
+                // メニューに出るか（構造的な可否）
+                "eligible": eligible.is_ok(),
+                // 今この瞬間に実行できるか（一時的な状態も見る）
+                "ready": ready.is_ok(),
+                "reason": ready.err().map(|b| b.as_str()),
+                "message": ready.err().map(|b| b.message(pane_raw, m)),
+            })
+        })
+        .collect();
+    let mut resp = json!({
+        "pane": pane_raw,
+        "role": plan.role,
+        "agent": plan.agent.as_str(),
+        "session_id": plan.session_id,
+        "session_source": plan.session_source,
+        "resume_command": plan.resume_command,
+        "resume_error": plan.resume_error,
+        "agent_pid": plan.agent_pid,
+        "available_modes": available,
+        "modes": modes,
+    });
+
+    let Some(mode) = mode else {
+        // 下見: 何も起こさない（#748 の respond と同じ「引数を省いたら状態だけ」）
+        resp["applied"] = json!(false);
+        return Ok(resp);
+    };
+
+    sr::can_restart(mode, &plan.facts)
+        .map_err(|b| DispatchError::Operation(b.message(pane_raw, mode)))?;
+
+    match mode {
+        SessionRestartMode::Harness => {
+            let command = plan
+                .resume_command
+                .clone()
+                .ok_or_else(|| op_err("resume コマンドを組めなかった"))?;
+            // 終了要求はここで同期的に出す（応答へ結果を載せるため）。
+            // 落ちたかの確認と resume の送達は host 側の段取りが引き受ける
+            let mut terminate_error: Option<String> = None;
+            if let Some(pid) = plan.agent_pid {
+                if let Err(e) = crate::platform::process::terminate(pid, false) {
+                    terminate_error = Some(e);
+                }
+            }
+            if let Some(e) = &terminate_error {
+                return Err(DispatchError::Operation(format!(
+                    "エージェントのプロセス（pid {}）を終了できなかったので建て直さない: {e}",
+                    plan.agent_pid.unwrap_or(0)
+                )));
+            }
+            host.queue_agent_relaunch(pane_id, plan.agent_pid, command.clone());
+            crate::diag::flow_log(&format!(
+                "セッション再起動: pane={pane_raw} mode=harness agent={} pid={:?} 会話={}",
+                plan.agent.as_str(),
+                plan.agent_pid,
+                plan.session_id
+                    .as_deref()
+                    .map(crate::sessions::short_id)
+                    .unwrap_or_else(|| "?".into())
+            ));
+            resp["applied"] = json!(true);
+            resp["mode"] = json!(mode.as_str());
+            resp["command"] = json!(command);
+            resp["terminated_pid"] = json!(plan.agent_pid);
+            resp["note"] = json!(
+                "エージェントのプロセスを終了させ、落ちたことを確かめてから \
+                 --resume の行を送達確認つきで送る（会話はそのまま続く）。\
+                 進行は tako read / tako session-restart で確認できる"
+            );
+            Ok(resp)
+        }
+        SessionRestartMode::Handoff => {
+            // #749 の自動ナッジと同じ手順を、同じ 1 実装の文面で頼む。
+            // tako が引き継ぎファイルを勝手に読んで後任を立てるのではなく、
+            // **エージェント自身に書き直させてから** tako_orchestrator_handoff を呼ばせる
+            let prompt = tako_core::handoff::restart_prompt(plan.handoff_path.as_deref());
+            host.queue_prompt_flow(pane_id, prompt.clone());
+            crate::diag::flow_log(&format!(
+                "セッション再起動: pane={pane_raw} mode=handoff role={}",
+                plan.role.as_deref().unwrap_or("?")
+            ));
+            resp["applied"] = json!(true);
+            resp["mode"] = json!(mode.as_str());
+            resp["prompt_len"] = json!(prompt.len());
+            resp["handoff_path"] = json!(plan.handoff_path);
+            resp["note"] = json!(
+                "引き継ぎの書き直しと tako_orchestrator_handoff の呼び出しを master へ依頼した。\
+                 後任 master が同じタブに立ち、引き継ぎを確認してから前任のペインを閉じる \
+                 （前任を閉じるのは後任なので、後任の起動が失敗しても master を失わない）"
+            );
+            Ok(resp)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StaleBinary — stale claude バイナリの検知と張り直し（Issue #498）
 // ---------------------------------------------------------------------------
 
@@ -11132,71 +11487,43 @@ fn dispatch_stale_binary_status(
     }))
 }
 
-/// restart: stale ペインを張り直す。worker は resume、master は handoff
+/// restart: stale ペインを張り直す（#498）。
+///
+/// **中身は #1067 の [`dispatch_session_restart`] 1 実装へ寄せてある**。旧実装は
+/// ここに独自の手順（Ctrl+C 1 回 → `queue_write_on_alt_screen`）を持っていたが、
+/// 器つきペインの外側は常に代替画面なので resume の行が**動いている claude の
+/// 入力欄へ**流れ込み、しかも組んでいたコマンドが素の `claude --resume <id>` で
+/// アカウント・role・モデル・effort を全部落としていた（#1067 の調査）。
+///
+/// **ハーネス更新（会話を保つ）を優先**する: stale の解決に必要なのはプロセスの
+/// 建て直しだけで、引き継ぎは会話を要約に落としてしまう。会話を解決できない
+/// ペイン（カタログにも agents にも無い）だけ引き継ぎへ落とす
 fn dispatch_stale_binary_restart(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
     pane: Option<u64>,
 ) -> Result<Value, DispatchError> {
-    let (tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
-    let pane_obj = host
-        .workspace()
-        .get_tab(tab_id)
-        .and_then(|t| t.tree().get(pane_id))
-        .ok_or(DispatchError::PaneNotFound(pane_id.as_u64()))?;
+    use tako_core::session_restart::{self as sr, SessionRestartMode};
 
-    let role = pane_obj.role().unwrap_or("").to_string();
-    let is_master =
-        role.contains("orchestrator-master") || role == "master" || role.starts_with("master:");
-
-    // busy チェック: Running 状態なら拒否
-    let cmd_state = host
-        .session(pane_id)
-        .map(|s| s.command_state())
-        .unwrap_or(CommandState::Unknown);
-    if matches!(cmd_state, CommandState::Running) {
-        return Err(DispatchError::Operation(
-            "ペインが実行中です。アイドルになってから張り直してください".into(),
-        ));
-    }
-
-    if is_master {
-        // master: handoff 経由で新 master を spawn
-        dispatch_orchestrator_handoff(host, origin, pane, Some(&role), None, None, None)
-    } else {
-        // worker: session_id を解決して resume
-        let backend = host.backend_session(pane_id);
-        let backend_session = backend.as_deref().ok_or_else(|| {
-            DispatchError::Operation("バックエンドセッションが見つからない".into())
-        })?;
-
-        let session_id = crate::agents::resolve_session_id_for_backend(backend_session)
-            .ok_or_else(|| {
-                DispatchError::Operation(
-                    "claude の session_id を解決できません。プロセスが終了しているか、\
-                     claude agents --json で情報を取得できません"
-                        .into(),
-                )
-            })?;
-
-        // 旧プロセスを終了: Ctrl-C を送信
-        host.queue_write(pane_id, b"\x03".to_vec());
-
-        // 少し待ってから resume コマンドを送信（prompt_flow で送達確認）
-        let resume_cmd = format!("claude --resume {session_id}");
-        host.queue_prompt_flow(pane_id, String::new());
-        // prompt_flow の空文字列はプロンプト待ちのみ。その後にコマンドを書く
-        let mut cmd_bytes = resume_cmd.into_bytes();
-        cmd_bytes.push(b'\r');
-        host.queue_write_on_alt_screen(pane_id, cmd_bytes);
-
-        Ok(json!({
-            "restarted": true,
-            "pane": pane_id.as_u64(),
-            "method": "resume",
-            "session_id": session_id,
-        }))
-    }
+    let (_tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
+    let plan = build_session_restart_plan(host, pane_id);
+    // **いま実行できる方**を選ぶ（両方使えるなら会話を保つ側）。
+    // `menu_modes`（構造的な可否）で選ぶと、会話 ID を解決できない master でも
+    // harness を選んでしまい handoff への落ちが起きない
+    let mode = [SessionRestartMode::Harness, SessionRestartMode::Handoff]
+        .into_iter()
+        .find(|m| sr::can_restart(*m, &plan.facts).is_ok())
+        // どちらも駄目なら harness の理由を返す（会話を保つ側の理由の方が手掛かりになる）
+        .unwrap_or(SessionRestartMode::Harness);
+    let mut resp =
+        dispatch_session_restart(host, origin, Some(pane_id.as_u64()), Some(mode.as_str()))?;
+    // #498 の応答互換（`restarted` / `method` を見ている呼び出し側のため）
+    resp["restarted"] = json!(true);
+    resp["method"] = json!(match mode {
+        SessionRestartMode::Harness => "resume",
+        SessionRestartMode::Handoff => "handoff",
+    });
+    Ok(resp)
 }
 
 /// dismiss: バナーを閉じる（UI 側の状態を変更する指示。GUI 層で使用）
@@ -19514,10 +19841,15 @@ mod tests {
         );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
+        // #1067 で判断を session_restart へ寄せた。MockHost のペインは
+        // セッションも role も持たないので、構造的な理由で断られる
+        // （旧文面は「バックエンドが無い」だった）。**理由と次の一手が入っている**ことを見る
         assert!(
-            msg.contains("バックエンド") || msg.contains("session_id"),
+            msg.contains("ターミナルセッションが無い")
+                || msg.contains("エージェントのペインではない"),
             "エラーメッセージが想定と異なる: {msg}"
         );
+        assert!(msg.contains("pane"), "対象ペインを名指しする: {msg}");
     }
 
     // --- #549 ウェルカムバナー ---

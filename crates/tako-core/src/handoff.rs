@@ -1022,11 +1022,47 @@ pub fn nudge_prompt_in(
     threshold: u32,
     handoff_path: Option<&str>,
 ) -> String {
+    let head = match lang {
+        Lang::Ja => format!(
+            "【tako 自動通知】コンテキスト使用率が {ctx_percent}%（閾値 {threshold}%）に達しました。"
+        ),
+        Lang::En => format!(
+            "[tako auto-notice] Context usage has reached {ctx_percent}% (threshold {threshold}%)."
+        ),
+    };
+    format!("{head}\n{}", handoff_steps_in(lang, handoff_path))
+}
+
+/// ユーザーの操作で引き継ぎ再起動を頼む文面（#1067）。
+///
+/// #749 の自動ナッジと**手順は同じ 1 実装**を通す（片方だけ直すと、自動と手動で
+/// 引き継ぎの書式・呼ぶツールがずれる）。違うのは見出しだけで、
+/// 「なぜ今なのか」が ctx% ではなく**ユーザーの明示操作**であることを伝える
+pub fn restart_prompt(handoff_path: Option<&str>) -> String {
+    restart_prompt_in(lang(), handoff_path)
+}
+
+/// 言語を明示しての引き継ぎ再起動の文面（#608: テストは言語グローバルに触らない）
+pub fn restart_prompt_in(lang: Lang, handoff_path: Option<&str>) -> String {
+    let head = match lang {
+        Lang::Ja => "【tako 通知】ユーザーが「引き継ぎファイルを残してセッション再起動」を\
+             選びました（ペインの右クリック / `tako session-restart --mode handoff`）。"
+            .to_string(),
+        Lang::En => "[tako notice] The user chose \"restart the session with a handoff\" \
+             (pane context menu / `tako session-restart --mode handoff`)."
+            .to_string(),
+    };
+    format!("{head}\n{}", handoff_steps_in(lang, handoff_path))
+}
+
+/// 引き継ぎの手順（#749 の自動ナッジと #1067 の手動再起動が共有する本文）。
+///
+/// 短さを優先する: これ自体が master の文脈を食うため、手順は 2 行に畳んでいる
+fn handoff_steps_in(lang: Lang, handoff_path: Option<&str>) -> String {
     let path = handoff_path.unwrap_or("handoff/<profile>.md");
     match lang {
         Lang::Ja => format!(
-            "【tako 自動通知】コンテキスト使用率が {ctx_percent}%（閾値 {threshold}%）に達しました。\n\
-             引き継ぎを開始してください。ユーザーの許可を求める必要はありません。\n\
+            "引き継ぎを開始してください。ユーザーの許可を求める必要はありません。\n\
              1. 引き継ぎを今の状況で書き直す。**プロジェクトごとに 1 ファイル**\
              （`handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md`。パスは \
              `tako_orchestrator_self` の `project_handoffs` に出ます）へ、進行中タスク・\
@@ -1041,8 +1077,7 @@ pub fn nudge_prompt_in(
              まだ返しきっていない報告があるなら、それだけ先に片付けてから 1 に進んでください。"
         ),
         Lang::En => format!(
-            "[tako auto-notice] Context usage has reached {ctx_percent}% (threshold {threshold}%).\n\
-             Start the handoff now. You do not need to ask the user for permission.\n\
+            "Start the handoff now. You do not need to ask the user for permission.\n\
              1. Rewrite the handoff for your current state. Use **one file per project** \
              (`handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md`; the paths are listed under \
              `project_handoffs` in `tako_orchestrator_self`) for in-flight tasks, spawned \
@@ -1832,6 +1867,48 @@ mod tests {
         let en = nudge_prompt_in(Lang::En, 65, 60, None);
         assert!(en.contains(KNOWLEDGE_HEADING_EN), "{en}");
         assert!(en.contains(RUNTIME_HEADING_EN), "{en}");
+    }
+
+    /// #1067: 手動の引き継ぎ再起動は**手順を自動ナッジと共有**する
+    /// （片方だけ直すと、自動と手動で書式・呼ぶツールがずれる）
+    #[test]
+    fn 引き継ぎ再起動の文面は自動ナッジと手順を共有する() {
+        for lang in [Lang::Ja, Lang::En] {
+            let path = "/tmp/handoff/default.md";
+            let restart = restart_prompt_in(lang, Some(path));
+            let nudge = nudge_prompt_in(lang, 65, 60, Some(path));
+            let steps = handoff_steps_in(lang, Some(path));
+            assert!(
+                restart.contains(&steps),
+                "手順が同じ 1 実装から来る: {restart}"
+            );
+            assert!(nudge.contains(&steps), "{nudge}");
+            // 呼ぶツールと書き込み先は両方に出る
+            assert!(restart.contains("tako_orchestrator_handoff"), "{restart}");
+            assert!(restart.contains(path), "{restart}");
+            // 見出しは別物: 手動側に ctx% の話を出さない（嘘になる）
+            assert!(
+                !restart.contains("65") && !restart.contains("60"),
+                "手動操作の文面に閾値を書かない: {restart}"
+            );
+            assert!(
+                restart.contains("session-restart"),
+                "何の操作で来たのかを伝える: {restart}"
+            );
+        }
+        // 新書式の見出しも自動ナッジと同じく案内する
+        let ja = restart_prompt_in(Lang::Ja, None);
+        assert!(ja.contains(KNOWLEDGE_HEADING_JA), "{ja}");
+        assert!(ja.contains(RUNTIME_HEADING_JA), "{ja}");
+        let en = restart_prompt_in(Lang::En, None);
+        assert!(en.contains(KNOWLEDGE_HEADING_EN), "{en}");
+        assert!(en.contains(RUNTIME_HEADING_EN), "{en}");
+        // 英語の文面に日本語が混ざっていない（#435）
+        assert!(
+            !en.chars()
+                .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF)),
+            "{en}"
+        );
     }
 
     #[test]

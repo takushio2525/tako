@@ -714,8 +714,8 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/remote.rs",
-            7,
-            "`/bin/ps` / `/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト）",
+            6,
+            "`/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト）。ゾンビ判定の `/bin/ps` は              #1067 で境界（`platform::process::is_zombie`）へ移し、抑止を通している",
         ),
         (
             "crates/tako-control/src/remote_setup.rs",

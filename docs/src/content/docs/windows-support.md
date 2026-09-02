@@ -16,8 +16,8 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 112 / 143（78%） | macOS と同じように使えます |
-| 一部対応 | 13 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
+| 対応 | 112 / 144（78%） | macOS と同じように使えます |
+| 一部対応 | 14 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 1 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
@@ -119,7 +119,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 
 ## AI 連携（オーケストレーション）
 
-対応 25・一部対応 1
+対応 25・一部対応 2
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -143,6 +143,7 @@ AI エージェント（tako は対応状況を system prompt へ渡します）
 | `tako_limit_resume` | 対応 | — | 実機セルフテスト: 項目 111 / 117（オプトイン・ダイアログ型 / idle 型の出し分け・試行上限・プロファイル既定） |
 | `tako_limit_service` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako limit-service` が現在サービスを返し、claude → codex → claude の切替が反映される |
 | `tako_sessions` | 対応 | — | 実機実測: #877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ |
+| `tako_session_restart` | 一部対応 | 引き継ぎ再起動は使えるが、ハーネス更新（会話を保ったまま CLI を建て直す）はプロセスの終了要求が Windows 未対応のため使えない（#1067 / 境界 B5） | OS の仕様: tako_control::platform::process::terminate の Windows 実装は「プロセスの停止は Windows では未対応です」を返す（B5 の制御側が未実装）。handoff は queue_prompt_flow だけを使うので影響を受けない |
 | `tako_task_gate` | 対応 | — | 実機テスト: acceptance_gates のゲート登録テストが実機で緑（落ちているのは execute_command の 5 件だけ） |
 | `tako_task_gate_check` | 一部対応 | ゲートの登録と表示は動くが、コマンド型ゲートの実行が sh -c 決め打ちのため Windows では判定できない（#935） | 実機テスト: 実機の cargo test で execute_command 系 5 件が失敗（sh 不在）。PR / custom ゲートの判定は動く |
 | `tako_task_gate_show` | 対応 | — | 実機テスト: acceptance_gates の表示テストが実機で緑 |

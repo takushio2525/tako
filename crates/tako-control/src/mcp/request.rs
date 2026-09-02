@@ -731,6 +731,11 @@ pub(super) fn build_request(
             font_family: str_arg(args, "font_family")?.map(|s| s.to_string()),
             font_size: str_arg(args, "font_size")?.and_then(|s| s.parse::<f32>().ok()),
         },
+        // #1067: mode 省略 = 下見（何も起こさない）
+        "tako_session_restart" => Request::SessionRestart {
+            pane: Some(target_pane(args, caller)?),
+            mode: str_arg(args, "mode")?,
+        },
         "tako_stale_binary" => Request::StaleBinary {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             pane: u64_arg(args, "pane")?,

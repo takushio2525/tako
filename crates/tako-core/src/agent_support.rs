@@ -267,6 +267,10 @@ pub mod keys {
     pub const MASTER_MCP: &str = "master_mcp";
     /// master への system prompt 注入
     pub const MASTER_SYSTEM_PROMPT: &str = "master_system_prompt";
+    /// ハーネスだけ建て直して会話を続ける（#1067。ペインの右クリック / `tako session-restart`）
+    pub const SESSION_RESTART_HARNESS: &str = "session_restart_harness";
+    /// 引き継ぎを書かせてセッションを交代する（#1067。#749 の手動版）
+    pub const SESSION_RESTART_HANDOFF: &str = "session_restart_handoff";
     /// セッションカタログへの登録
     pub const SESSIONS_CATALOG: &str = "sessions_catalog";
     /// セッションの resume
@@ -344,6 +348,11 @@ pub mod notes {
 
     /// 上流に手段があるかどうかを**まだ調べていない**。
     /// **`Unsupported` へ倒すと open な道を永久に避けることになる**ので `Pending` に置く
+    /// 手段は在りそうだが実機で確かめていない（引き継ぎ再起動の codex 列）
+    pub const NOT_MEASURED_HANDOFF_RESTART: Note = Note::new(
+        "手段は揃っているが実機で確かめていない（claude で先行実装した）",
+        "The pieces are in place but this has not been measured on a real machine (claude went first)",
+    );
     pub const NOT_INVESTIGATED: Note = Note::new(
         "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
         "Whether this agent offers an equivalent mechanism has not been investigated yet (it is not established to be impossible)",
@@ -773,6 +782,34 @@ pub const MATRIX: &[AgentFeature] = &[
             "claude は --append-system-prompt-file、codex は developer_instructions で注入する \
              （orchestrator/mod.rs）。agy の注入手段（custom agent 定義の起動時選択）は \
              公式ドキュメントに記載が無く #987 で実機確認する",
+        ),
+    },
+    AgentFeature {
+        key: keys::SESSION_RESTART_HANDOFF,
+        summary: Note::new(
+            "引き継ぎを書かせてセッションを交代する（#1067。ペインの右クリック / `tako session-restart --mode handoff`）",
+            "The session is replaced after the agent writes a handoff (#1067; pane context menu / `tako session-restart --mode handoff`)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_MEASURED_HANDOFF_RESTART, 1067),
+        agy: pending(notes::AGY_NOT_ORCHESTRATOR, 987),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Source(
+            "引き継ぎ再起動は master ペインへ定型文を送り、エージェント自身が              tako_orchestrator_handoff を呼ぶ形（handoff.rs の restart_prompt）。             codex master は #979 で MCP が届くので成立しうるが未実測。             agy は master になれない（#987）ので対象そのものが無い",
+        ),
+    },
+    AgentFeature {
+        key: keys::SESSION_RESTART_HARNESS,
+        summary: Note::new(
+            "会話を保ったまま CLI プロセスだけ建て直す（#1067。CLI の自動更新に追いつく手段）",
+            "The CLI process is rebuilt while the conversation is kept (#1067; how a session catches up with a CLI auto-update)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_WIRED, 984),
+        agy: pending(notes::NOT_WIRED, 984),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Source(
+            "session_restart の harness は sessions::resume_command（claude --resume）を              組んで送るので、resume を配線していない系統では成立しない              （手段自体は上流にある: codex resume / agy --conversation）",
         ),
     },
     AgentFeature {
