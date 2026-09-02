@@ -12,6 +12,7 @@ pub mod bundle_install;
 pub mod child_cmd;
 pub mod clock;
 pub mod console;
+pub mod dpi;
 pub mod exe;
 pub mod font;
 pub mod ime;
