@@ -72,6 +72,22 @@ Nightly patch release (automated). Changes since v0.8.1:
 
 ### Added / 追加
 
+- **[機能追加] エージェントペインの右クリックに「会話を引き継いだ再起動」2 種を追加 (#1067)**
+  claude CLI は symlink の張り替えで更新されるので、長生きのセッションは起動時の旧バイナリを
+  握り続ける（#498 の stale 警告）。**会話を 1 文字も失わずにプロセスだけ建て直す**
+  「会話を保って再起動（CLI 更新）」と、#749 の自動ハンドオフを人の操作で起こせる
+  「引き継ぎを書かせて再起動」（master のみ）をペインの右クリックへ置いた。
+  AI からは `tako session-restart [--mode harness|handoff]` / MCP `tako_session_restart`
+  （**引数なしは下見**で、できること + できない理由を返すだけ）。旧プロセスは
+  **落ちたのを確かめてから** resume の行を送るので、動いている TUI の入力欄へ流れ込まない。
+  会話 ID を解決できないときは**プロセスに触らずに断る**。#498 の張り直しボタンも同一実装へ寄せた。
+  Agent panes now offer two "restart while keeping the session" actions in the context menu:
+  rebuilding just the CLI process and resuming the same conversation (the one-click fix for a
+  stale `claude` binary), and asking a master to write a handoff before a fresh session takes
+  over. Exposed as `tako session-restart` / `tako_session_restart`; with no arguments it only
+  reports what is possible and why. The old process is confirmed dead before the resume line is
+  typed, and the restart is refused outright when the conversation id cannot be resolved.
+
 - **[改善] 自己検査を持たない daemon の `serve_ok: null` に理由を添えた (#1049)**
   tako を更新しても remote デーモンは動き続けるので、新しい CLI から見ると
   `serve_ok` が無説明の `null` になっていた。`serve_state: "unchecked"` と

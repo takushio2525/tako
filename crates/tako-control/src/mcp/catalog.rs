@@ -2275,12 +2275,42 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "tako_session_restart",
+            "description": "エージェントペインを**会話を引き継いだまま**建て直す（Issue #1067）。\
+                mode を省略すると**下見**（何ができるか + できない理由）を返すだけで何も起こさない。\
+                mode=harness: エージェント CLI のプロセスだけを終了させ、落ちたことを確かめてから \
+                `claude --resume <session-id>` を送達確認つき経路（#640）で投入する。\
+                **会話コンテキストは 1 文字も失われない**ので、claude CLI の自動更新後に\
+                プロセスが旧版のまま残っている（#498 の stale 警告）ときの解決手段になる。\
+                アカウント（CLAUDE_CONFIG_DIR）・role・モデル・effort も元のまま復元する。\
+                mode=handoff: 引き継ぎの書き直しと tako_orchestrator_handoff の呼び出しを \
+                master 自身へ依頼する（#749 の自動ハンドオフの手動版）。ctx をリセットできるが、\
+                引き継ぎファイルに書いた分しか残らない。**master ペインのみ**。\
+                生成中・キュー滞留・入力欄に人間の下書き・選択肢ダイアログ表示中は実行せず\
+                理由 + 次の一手を返す。claude 以外の系統は tako 側の resume 未配線のため対象外\
+                （対応状況は tako_agent_support の session_restart_harness / _handoff を参照）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": pane_schema("対象ペイン（**省略すると呼び出し元 = 自分のペイン**。他人を建て直すときは必ず指定する）"),
+                    "mode": {
+                        "type": "string",
+                        "enum": ["harness", "handoff"],
+                        "description": "harness = 会話を保ったまま CLI プロセスを建て直す / handoff = 引き継ぎを書かせてセッション交代（master のみ）。省略すると下見だけを返す",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_stale_binary",
             "description": "稼働中 claude セッションのバイナリ鮮度を検知し、新版への張り直しを行う（Issue #498）。\
                 claude CLI は symlink 張り替えで更新されるが、長生きセッション（特に master）は起動時の旧バイナリを\
                 握り続ける。action=status（既定）で指定ペインの stale 判定（握っている版 / 最新版 / stale か）を返す。\
-                action=restart で張り直し（worker は claude --resume で会話復元、master は handoff で引き継ぎ）。\
-                busy（実行中）のペインでは restart は拒否される。action=dismiss でバナーを閉じる。",
+                action=restart で張り直し（中身は tako_session_restart と同一実装。\
+                会話を保つ harness を優先し、会話 ID を解決できないときだけ handoff へ落ちる）。\
+                生成中・キュー滞留・入力欄の下書き・ダイアログ表示中は理由つきで拒否される。\
+                action=dismiss でバナーを閉じる。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -232,6 +232,27 @@ pub fn find_claude_pid_for_backend(backend_session: &str) -> Option<u32> {
     find_claude_pid(&snapshot, backend_session)
 }
 
+/// 与えられた pid 集合の中から、実行ファイルが `needle` を含むものを探す（#1067）。
+///
+/// [`find_claude_pid`] の一般形（`needle = "claude"` が従来の挙動）。
+/// **判定材料は 2 通り**: macOS は `proc_pidpath`（`ProcessSnapshot` の argv は
+/// `platform::procinfo` 経路では空になる）、それが取れない環境ではコマンド行を見る
+pub fn find_agent_pid_among(
+    snapshot: &crate::agents::ProcessSnapshot,
+    pids: &[u32],
+    needle: &str,
+) -> Option<u32> {
+    pids.iter().copied().find(|&pid| {
+        pidpath(pid).is_some_and(|path| path.to_string_lossy().contains(needle))
+            || snapshot.argv(pid).is_some_and(|argv| {
+                // コマンド行は第 1 語（実行ファイル）だけを見る（引数の中の語で誤爆しない）
+                argv.split_whitespace()
+                    .next()
+                    .is_some_and(|prog| prog.contains(needle))
+            })
+    })
+}
+
 /// 共有スナップショットから backend session 配下の claude PID を探す。
 fn find_claude_pid(
     snapshot: &crate::agents::ProcessSnapshot,

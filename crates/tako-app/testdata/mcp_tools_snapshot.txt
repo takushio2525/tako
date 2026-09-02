@@ -103,6 +103,7 @@ tako_run_resolve
 tako_scroll_pane
 tako_select_tab
 tako_send_input
+tako_session_restart
 tako_sessions
 tako_set_title
 tako_settings

@@ -54,6 +54,7 @@ const CATEGORIES = [
     'tako_orchestrator_run_status', 'tako_orchestrator_run_result',
     'tako_orchestrator_supervisor', 'tako_orchestrator_ledger',
     'tako_limit_resume', 'tako_limit_service', 'tako_sessions',
+    'tako_session_restart',
     'tako_task_gate', 'tako_task_gate_check', 'tako_task_gate_show',
     'tako_task_checkpoint', 'tako_task_list', 'tako_task_resume',
   ]],

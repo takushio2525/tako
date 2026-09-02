@@ -82,6 +82,16 @@ pub trait SessionHost {
     /// 届かなければ書き直す（状態遷移は `tako_core::shell_send`）。
     /// 既定実装は何もしない（テスト用モック等）
     fn queue_command_flow(&mut self, _pane: PaneId, _command: String) {}
+    /// エージェント CLI のプロセスを建て直す（Issue #1067 のハーネス更新）。
+    ///
+    /// 「終了要求を出す」までは dispatch が同期で行う（応答へ結果を載せるため）。
+    /// ここへ積むのは**その後**の段取りで、`pid` が落ちたことを確かめてから
+    /// `command`（`claude --resume …`）を `queue_command_flow` へ渡す。
+    ///
+    /// 落ちる前に打つと、resume の行が**まだ動いている TUI の入力欄へ**流れ込む
+    /// （#694 / #1006 で踏んだ「代替画面のまま書く」と同じ事故）。判断は
+    /// `tako_core::session_restart::relaunch_step`。既定実装は何もしない（テスト用モック等）
+    fn queue_agent_relaunch(&mut self, _pane: PaneId, _pid: Option<u32>, _command: String) {}
 }
 
 // ---------------------------------------------------------------------------
