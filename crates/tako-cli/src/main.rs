@@ -246,6 +246,14 @@ enum Command {
     /// 引数なしで配布系統・現在バージョン・重複 CLI を表示する
     #[command(subcommand)]
     Update(UpdateCommand),
+    /// エージェントペインを会話ごと引き継いで再起動する（Issue #1067）。
+    ///
+    /// 引数なしで**下見**（このペインで何ができるか + できない理由）だけを返す。
+    /// `--mode harness` は CLI プロセスだけを建て直して `--resume` で同じ会話を続ける
+    /// （claude の自動更新に追いつく手段）。`--mode handoff` は引き継ぎを書かせてから
+    /// 新しいセッションへ交代する（master ペインのみ）
+    #[command(name = "session-restart")]
+    SessionRestart(SessionRestartArgs),
     /// stale claude バイナリの検知と張り直し（Issue #498）。
     /// 長生きセッションが古い claude バイナリのまま動いている場合に検知・張り直し
     #[command(subcommand, name = "stale-binary")]
@@ -690,6 +698,21 @@ enum UpdateCommand {
         #[arg(value_parser = ["dismiss", "show"])]
         action: Option<String>,
     },
+}
+
+/// セッション再起動の引数（Issue #1067）。
+///
+/// 素のコマンドが最短で済む形（#322）: `tako session-restart` = 下見、
+/// `--mode` を付けたときだけ実行する
+#[derive(Args)]
+struct SessionRestartArgs {
+    /// 種別（省略時は下見だけを返す）
+    #[arg(long, value_parser = ["harness", "handoff"])]
+    mode: Option<String>,
+    /// 対象ペイン ID（**省略時は呼び出し元** = TAKO_PANE_ID。
+    /// 他のペインを建て直すときは必ず指定する）
+    #[arg(long)]
+    pane: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -5819,6 +5842,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::ConfirmClose(args) => Request::ConfirmClose {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
+        Command::SessionRestart(args) => Request::SessionRestart {
+            pane: args.pane.or_else(caller_pane),
+            mode: args.mode.clone(),
+        },
         Command::LimitResume(args) => Request::LimitResume {
             pane: args.pane.or_else(caller_pane),
             enabled: args.state.as_deref().map(|s| s == "on"),
@@ -7617,6 +7644,7 @@ fn print_result(command: &Command, result: &Value) {
             println!("{}", pretty_json(result));
         }
         Command::Web(_) => println!("{}", pretty_json(result)),
+        Command::SessionRestart(_) => println!("{}", pretty_json(result)),
         Command::StaleBinary(_) => println!("{}", pretty_json(result)),
         Command::Update(_) => println!("{}", pretty_json(result)),
         Command::Chat(_) => println!("{}", pretty_json(result)),

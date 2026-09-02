@@ -514,6 +514,22 @@ pub fn is_busy(lines: &[String]) -> bool {
     })
 }
 
+/// 生成中の**強いシグナル**（中断ヒントが画面に出ている）。#1067
+///
+/// [`is_busy`] は経過秒トークン（`for 3s`）も拾う advisory なので、
+/// **生成が終わった後も画面に残る**完了行（実測: `✻ Brewed for 2s · done 9:22 PM`）を
+/// busy と読んでしまう。アイドルなペインを永久に busy と申告するので、
+/// **「人の操作でプロセスを終わらせてよいか」の判断には使えない**（#1067 で実測）。
+///
+/// ここでは中断の案内（= その瞬間に中断できる何かが走っている）だけを見る。
+/// 取りこぼしても他の関門（キュー滞留・入力欄の下書き）が残るので、
+/// 誤って「busy でない」と言う側より**誤って「busy」と言い続ける側**を避ける
+pub fn interrupt_hint_visible(lines: &[String]) -> bool {
+    lines.iter().any(|l| {
+        l.contains("esc to interrupt") || l.contains("esc to cancel") || l.contains("Generating")
+    })
+}
+
 /// 「3s」のような経過秒トークンを含むか（`for 3s` / `(2s · thinking)`）
 fn has_elapsed_marker(line: &str) -> bool {
     line.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
@@ -978,6 +994,46 @@ mod tests {
 
     fn screen(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    /// #1067: 「生成が終わった後も残る完了行」を busy と読まないこと。
+    /// 実採取（claude 2.1.258 を SIGTERM で終わらせる直前のアイドル画面）
+    #[test]
+    fn 完了行を生成中と読まない() {
+        let idle = screen(
+            "⏺ 了解しました。合言葉「TAKO1067ZEBRA」を覚えました。\n\
+             \n\
+             ✻ Brewed for 2s · done 9:22 PM\n\
+             ────────────────────────────────\n\
+             ❯ \n\
+             ────────────────────────────────\n\
+               [Opus 5 (1M context) · xH]  ▸ 2.1.258\n\
+               ctx   6% ░░░░░░░░░░\n\
+               ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+        );
+        // advisory な is_busy はここで true になる（経過秒 `2s` を拾う）
+        assert!(
+            is_busy(&idle),
+            "is_busy は advisory なので完了行でも true（この事実が #1067 の理由）"
+        );
+        // プロセスを終わらせてよいかの判断はこちらを使う
+        assert!(
+            !interrupt_hint_visible(&idle),
+            "アイドル画面を生成中と読んではいけない"
+        );
+
+        let generating = screen(
+            "✻ Manifesting… (5m 16s · ↓ 16.4k tokens)\n\
+             ────────────────────────────────\n\
+             ❯ \n\
+             ────────────────────────────────\n\
+               esc to interrupt",
+        );
+        assert!(interrupt_hint_visible(&generating));
+        // codex / agy の言い方も拾う
+        assert!(interrupt_hint_visible(&screen("  esc to cancel")));
+        assert!(interrupt_hint_visible(&screen("Generating...")));
+        assert!(!interrupt_hint_visible(&screen("$ ls\nCargo.toml")));
     }
 
     // 実 claude TUI（v2.1.198）の tmux capture-pane から採取（個人情報はサニタイズ済み）

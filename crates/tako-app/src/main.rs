@@ -479,6 +479,24 @@ struct ShellCommandFlow {
     created_at: std::time::Instant,
 }
 
+/// エージェント CLI の建て直し（#1067 のハーネス更新）の進行状態。
+///
+/// dispatch は終了要求までを同期で済ませ、**落ちたことの確認**と resume の投入を
+/// ここへ積む。落ちる前に打つと resume の行が動いている TUI の入力欄へ流れ込む
+#[derive(Debug)]
+struct AgentRelaunch {
+    pane: PaneId,
+    /// 終了させたエージェントのプロセス（不明なら None = 待たずに進む）
+    pid: Option<u32>,
+    /// `sessions::resume_command` が組んだ起動コマンド
+    command: String,
+    /// 差し替え検査に使う元の会話 ID（画面の案内と食い違ったら差し替える）
+    session_id: Option<String>,
+    /// SIGKILL を送ったか（二重送出しない）
+    forced: bool,
+    started_at: std::time::Instant,
+}
+
 /// 起動コマンド送達フローの打ち切り時間。
 /// シェルの起動待ち（最大 30 秒）+ 書き直し 10 回（約 35 秒）+ Enter 再送（約 12 秒）を
 /// 足しても収まる長さ。ここを過ぎたら諦めて痕跡だけ残す
@@ -1417,6 +1435,8 @@ struct TakoApp {
     prompt_flows: Vec<PromptFlow>,
     /// 新規ペインの素のシェルへ起動コマンドを送り届けるステートマシン（Issue #640）
     command_flows: Vec<ShellCommandFlow>,
+    /// エージェント CLI の建て直し待ち（#1067）。落ちたら resume を command_flows へ積む
+    agent_relaunches: Vec<AgentRelaunch>,
     /// #572: claude のメッセージキューに滞留した指示の救出状態（ペインごと）
     queued_recovery: std::collections::HashMap<PaneId, QueuedRecovery>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
@@ -3006,6 +3026,10 @@ struct PaneContextMenu {
     pane: PaneId,
     kind: PaneContextKind,
     position: Point<Pixels>,
+    /// #1067: 会話を引き継いだ再起動の出し分け。**開いた瞬間に 1 度だけ**集める
+    /// （メニューの描画は毎フレーム走るので、そこで役割・カタログを読み直すと
+    /// #772 と同じ「メインスレッド専有」を作る）
+    restart_modes: Vec<tako_core::session_restart::SessionRestartMode>,
 }
 
 #[derive(Clone, Copy)]
@@ -3415,6 +3439,7 @@ impl TakoApp {
             alt_screen_writes: Vec::new(),
             prompt_flows: Vec::new(),
             command_flows: Vec::new(),
+            agent_relaunches: Vec::new(),
             queued_recovery: std::collections::HashMap::new(),
             pending_highlights: Vec::new(),
             pending_preview_loads: Vec::new(),
@@ -4317,6 +4342,9 @@ impl TakoApp {
             let ok = this.update(cx, |app: &mut TakoApp, _| {
                 if !app.alt_screen_writes.is_empty() {
                     app.flush_alt_screen_writes();
+                }
+                if !app.agent_relaunches.is_empty() {
+                    app.drive_agent_relaunches();
                 }
                 if !app.command_flows.is_empty() {
                     app.drive_command_flows();
@@ -5893,6 +5921,102 @@ impl TakoApp {
         self.alt_screen_writes = remaining;
     }
 
+    /// エージェント CLI の建て直しを駆動する（Issue #1067 のハーネス更新）。
+    ///
+    /// 500ms tick で「落ちたか」を見て、落ちたら resume の行を #640 の送達確認つき
+    /// 経路へ渡す。**落ちる前に打たない**のが唯一の要点（動いている TUI の入力欄へ
+    /// 流れ込む）。判断は `tako_core::session_restart::relaunch_step`
+    fn drive_agent_relaunches(&mut self) {
+        use tako_core::session_restart::{self as sr, RelaunchStep};
+
+        let mut remaining = Vec::new();
+        for mut entry in std::mem::take(&mut self.agent_relaunches) {
+            // ペインが閉じられていたら建て直す先が無い
+            if !self.terminals.contains_key(&entry.pane) {
+                tako_control::diag::flow_log(&format!(
+                    "セッション再起動: pane={} ペインが無くなったので中止",
+                    entry.pane.as_u64()
+                ));
+                continue;
+            }
+            // ゾンビも終了済みとして扱う（#619 の教訓。`kill(pid,0)` はゾンビにも成功する）
+            let alive = entry
+                .pid
+                .is_some_and(|pid| !tako_control::platform::process::has_terminated(pid));
+            let elapsed = entry.started_at.elapsed().as_secs();
+            match sr::relaunch_step(alive, elapsed, entry.forced) {
+                RelaunchStep::Wait => remaining.push(entry),
+                RelaunchStep::Force => {
+                    if let Some(pid) = entry.pid {
+                        let _ = tako_control::platform::process::terminate(pid, true);
+                    }
+                    entry.forced = true;
+                    tako_control::diag::flow_log(&format!(
+                        "セッション再起動: pane={} 猶予切れで強制終了（pid={:?}）",
+                        entry.pane.as_u64(),
+                        entry.pid
+                    ));
+                    remaining.push(entry);
+                }
+                RelaunchStep::GiveUp => {
+                    let msg = crate::ui_text::stale::relaunch_gave_up(entry.pid);
+                    tako_control::diag::flow_log(&format!(
+                        "セッション再起動: pane={} 断念（プロセスが終わらない。pid={:?}）",
+                        entry.pane.as_u64(),
+                        entry.pid
+                    ));
+                    self.set_agent_restart_notice(entry.pane, Some(msg));
+                }
+                RelaunchStep::Launch => {
+                    // 終了した claude 自身が画面へ残した案内を優先する（世代ずれの保険）
+                    let screen = self
+                        .terminals
+                        .get(&entry.pane)
+                        .map(|s| s.visible_lines())
+                        .unwrap_or_default();
+                    let mut command = entry.command.clone();
+                    if let (Some(old), Some(hint)) =
+                        (entry.session_id.as_deref(), sr::parse_resume_hint(&screen))
+                    {
+                        let (next, changed) = sr::apply_resume_hint(&command, old, &hint);
+                        if changed {
+                            tako_control::diag::flow_log(&format!(
+                                "セッション再起動: pane={} 画面の案内で会話 ID を差し替えた",
+                                entry.pane.as_u64()
+                            ));
+                            command = next;
+                        }
+                    }
+                    self.queue_command_flow(entry.pane, command);
+                    self.stale_binary_banners.remove(&entry.pane);
+                }
+            }
+        }
+        self.agent_relaunches = remaining;
+    }
+
+    /// 建て直しの進行 / 失敗をペインの通知バナーへ出す（#1067）。
+    ///
+    /// #498 のバナー（「claude X が利用可能です」+ 張り直しボタン）を**通知面として
+    /// 共用する**。あちらは既に「張り直し中...」「張り直し失敗: 理由」の状態を持っていて、
+    /// ペインに貼り付く = サイドバーが閉じていても見える。`message` が `None` なら進行中
+    fn set_agent_restart_notice(&mut self, pane: PaneId, message: Option<String>) {
+        let entry = self
+            .stale_binary_banners
+            .entry(pane)
+            .or_insert_with(|| StaleBinaryBanner {
+                spawned_version: String::new(),
+                current_version: String::new(),
+                dismissed: false,
+                restarting: false,
+                error: None,
+                is_master: false,
+            });
+        entry.dismissed = false;
+        entry.restarting = message.is_none();
+        entry.error = message;
+    }
+
     /// 新規ペインへの起動コマンド送達フローを駆動する（Issue #640）。
     ///
     /// 500ms tick で画面を見ながら「準備待ち → 本文 → エコー確認 → 分離 Enter →
@@ -7285,6 +7409,40 @@ impl TakoApp {
         self.backend_sessions
             .get(&pane_id)
             .is_some_and(|session| self.busy_backend_sessions.contains(session))
+    }
+
+    /// 会話を引き継いだ再起動の出し分け（#1067）。**右クリックの瞬間に 1 度だけ**呼ぶ。
+    ///
+    /// 判断は CLI / MCP と同じ純粋関数（`session_restart::menu_modes`）を通るので、
+    /// 「画面に出ている項目」と「AI が引ける選択肢」がずれない
+    fn session_restart_menu_modes(
+        &self,
+        pane_id: PaneId,
+    ) -> Vec<tako_core::session_restart::SessionRestartMode> {
+        let facts = tako_control::dispatch::session_restart_menu_facts(self, pane_id);
+        tako_core::session_restart::menu_modes(&facts)
+    }
+
+    /// 会話を引き継いだ再起動のボタンハンドラ（#1067）。
+    ///
+    /// CLI / MCP と同じ dispatch を通す（3 経路で同じ判断・同じ手順）。
+    /// 断られたときは**理由をペインのバナーへ出す**（黙って何も起きない状態を作らない）
+    fn session_restart_button(&mut self, pane_id: PaneId, mode: &str, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::SessionRestart {
+                pane: Some(pane_id.as_u64()),
+                mode: Some(mode.to_string()),
+            },
+            tako_core::PaneOrigin::User,
+        );
+        match result {
+            // 押した手応えを必ず出す（数秒とはいえ黙って何も起きない状態を作らない）。
+            // 建て直しが済んだら `drive_agent_relaunches` がこのバナーを片付ける
+            Ok(_) => self.set_agent_restart_notice(pane_id, None),
+            Err(e) => self.set_agent_restart_notice(pane_id, Some(format!("{e}"))),
+        }
+        cx.notify();
     }
 
     /// stale claude バイナリの張り直しボタンハンドラ（Issue #498）
@@ -16768,10 +16926,12 @@ impl TakoApp {
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
+                    let restart_modes = this.session_restart_menu_modes(pane_id);
                     this.pane_context_menu = Some(PaneContextMenu {
                         pane: pane_id,
                         kind: PaneContextKind::Terminal,
                         position: event.position,
+                        restart_modes,
                     });
                     cx.notify();
                 }),
@@ -17285,10 +17445,13 @@ impl TakoApp {
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                         cx.stop_propagation();
+                                        let restart_modes =
+                                            this.session_restart_menu_modes(pane_id);
                                         this.pane_context_menu = Some(PaneContextMenu {
                                             pane: pane_id,
                                             kind: PaneContextKind::Terminal,
                                             position: event.position,
+                                            restart_modes,
                                         });
                                         cx.notify();
                                     }),
@@ -18264,6 +18427,20 @@ impl SessionHost for TakoApp {
             pane,
             flow: tako_core::shell_send::ShellSendFlow::new(command),
             created_at: std::time::Instant::now(),
+        });
+    }
+
+    fn queue_agent_relaunch(&mut self, pane: PaneId, pid: Option<u32>, command: String) {
+        // 同じペインへ重ねない（前の建て直しを捨てて最後の指示を通す）
+        self.agent_relaunches.retain(|r| r.pane != pane);
+        let session_id = tako_core::session_restart::resume_id_of(&command);
+        self.agent_relaunches.push(AgentRelaunch {
+            pane,
+            pid,
+            command,
+            session_id,
+            forced: false,
+            started_at: std::time::Instant::now(),
         });
     }
 
@@ -20510,11 +20687,14 @@ impl TakoApp {
             .is_ok();
         // ファイルマネージャの呼び名は OS で変わる（#617）
         let fm = tako_control::platform::os_integration::file_manager();
+        // #1067: メニューを開いた瞬間に決めた出し分けをそのまま使う（毎フレーム読み直さない）
+        let restart_modes = ctx.restart_modes.clone();
         let items = pane_context_menu_items(PaneMenuFacts {
             is_preview,
             has_cwd: cwd.is_some(),
             limit_resume: limit_resume_on,
             can_ssh: can_ssh_this_pane,
+            restart_modes,
             file_manager: fm,
         });
         let pctx_menu_width: f32 = 200.0;
@@ -20614,6 +20794,13 @@ impl TakoApp {
                                 // 属性は layout.json へ載るので、ここで保存して再起動に備える
                                 this.save_layout();
                             }
+                            // #1067: CLI / MCP と同じ dispatch を通す（3 経路で同じ判断・同じ手順）
+                            "restart-harness" => {
+                                this.session_restart_button(pane_id, "harness", cx);
+                            }
+                            "restart-handoff" => {
+                                this.session_restart_button(pane_id, "handoff", cx);
+                            }
                             // #1006: ホスト選択へ進み、選んだらこのペイン自体を SSH 化する
                             "connect-remote" => {
                                 this.open_ssh_palette_for(Some(pane_id), cx);
@@ -20677,12 +20864,16 @@ pub(crate) struct PaneMenuFacts {
     pub limit_resume: Option<bool>,
     /// このペインをそのまま SSH にできる（`remote_open::can_ssh_pane` の結果。#1006）
     pub can_ssh: bool,
+    /// 会話を引き継いで再起動できるモード（`session_restart::menu_modes` の結果。#1067）。
+    /// **構造的な可否だけ**で決まる（生成中のような一時的な状態では消さない = 実行時に理由を出す）
+    pub restart_modes: Vec<tako_core::session_restart::SessionRestartMode>,
     /// ファイルマネージャの呼び名（#617）
     pub file_manager: tako_control::platform::os_integration::FileManager,
 }
 
 /// ペインの右クリックメニューの項目（id, 表示名）。`sep*` は区切り線
 pub(crate) fn pane_context_menu_items(facts: PaneMenuFacts) -> Vec<(&'static str, &'static str)> {
+    use tako_core::session_restart::SessionRestartMode;
     let fm = facts.file_manager;
     let mut items: Vec<(&'static str, &'static str)> = Vec::new();
     if facts.is_preview {
@@ -20702,6 +20893,21 @@ pub(crate) fn pane_context_menu_items(facts: PaneMenuFacts) -> Vec<(&'static str
     // 全画面 TUI・実行中・AI エージェント・プレビューでは出さない
     if facts.can_ssh {
         items.push(("connect-remote", ui_text::pane_menu::connect_remote()));
+    }
+    // #1067: 会話を引き継いだ再起動。エージェントのペインにだけ出る
+    // （出し分けは dispatch と同じ純粋関数を通るので、出た項目は構造的に必ず受理される）
+    if !facts.restart_modes.is_empty() {
+        items.push(("sep-restart", ""));
+        for mode in &facts.restart_modes {
+            match mode {
+                SessionRestartMode::Harness => {
+                    items.push(("restart-harness", ui_text::pane_menu::restart_harness()))
+                }
+                SessionRestartMode::Handoff => {
+                    items.push(("restart-handoff", ui_text::pane_menu::restart_handoff()))
+                }
+            }
+        }
     }
     // 上限後の自動復帰トグル（#813。ターミナルペインのみ = プレビューには上限が無い）
     if let Some(on) = facts.limit_resume.filter(|_| !facts.is_preview) {
@@ -58321,6 +58527,348 @@ mod self_test {
                 );
             }
 
+            // 140: 会話を引き継いだセッション再起動（#1067）。
+            //
+            // 実 claude を起こさずに検証できるのは
+            // 「出し分け」「下見」「関門（生成中 / キュー滞留 / 下書き / ダイアログ）」
+            // 「会話を解決できないまま終了させない」「引き継ぎ再起動の依頼」の 5 つ。
+            // 会話が resume 後も続くこと自体は実 claude の e2e（Issue のコメント）で測る。
+            //
+            // 疑似 TUI は **#903 と同じファイル駆動**（打ち込まない・器の有無に依らない）。
+            // 器つきのままにするのは、本物のエージェントペインと同じ状況
+            // （外側 PTY が代替画面）で判定を通すため
+            {
+                let anchor = window.update(cx, |app, _, _| app.focused_pane()).ok();
+                let Some(anchor) = anchor else {
+                    fail("#1067: 基準ペインの取得")
+                };
+                let body_path = std::env::temp_dir()
+                    .join(format!("tako-selftest-1067-{}.txt", std::process::id()));
+                // claude TUI 風の箱（`❯` の後は NBSP = 実採取の形）。
+                // `footer` に生成中ヒントや上限行を差し替えて関門を作る
+                let tui = |body: &str, footer: &str| {
+                    let rule = "\u{2500}".repeat(30);
+                    format!(
+                        "\u{1b}[2J\u{1b}[H⏺ 直前の応答\n\n{rule}\n\u{276F}\u{a0}{body}\n{rule}\n  \
+                         [Opus 5 · xH]  ▸ 2.1.258\n  {footer}\n"
+                    )
+                };
+                let idle_footer = "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+                if std::fs::write(&body_path, tui("TAKO1067IDLE", idle_footer)).is_err() {
+                    fail("#1067: 疑似 TUI の本文ファイルを書けない")
+                }
+                let created = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: Some(
+                                    sh.shell_snippet_command(&sh.repaint_file_loop(&body_path)),
+                                ),
+                                cwd: None,
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        // PTY 起動の失敗理由を捨てない（#903）
+                        let mut spawn_error = None;
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if let Err(e) = app.spawn_session(p, options, cx) {
+                                spawn_error = Some(format!("{e}"));
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        (pane, spawn_error)
+                    })
+                    .ok();
+                let Some((Some(pane1067), spawn_error)) = created else {
+                    fail("#1067: 疑似 TUI ペインを作れない")
+                };
+                if let Some(err) = spawn_error {
+                    println!("TAKO_SELF_TEST_1067_SPAWN: spawn_error={err:?}");
+                }
+                notify_and_draw(any, window, cx);
+                if !wait_for_focused_text(window, cx, "TAKO1067IDLE", Duration::from_secs(20)).await
+                {
+                    fail("140: 疑似 TUI の画面が出る (#1067)")
+                }
+
+                // role を差し替えるヘルパー（worker / master / 無し）
+                let set_role = |cx: &mut AsyncApp, role: Option<&str>| {
+                    let role = role.map(String::from);
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::Title {
+                                    pane: Some(pane1067.as_u64()),
+                                    title: None,
+                                    role: Some(role.unwrap_or_default()),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .is_ok()
+                        })
+                        .unwrap_or(false)
+                };
+                // 下見（mode 省略）を実 dispatch で引く
+                let preview = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::SessionRestart {
+                                    pane: Some(pane1067.as_u64()),
+                                    mode: None,
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                // GUI のメニュー（右クリックで決まる出し分け）
+                let menu_modes = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.session_restart_menu_modes(pane1067)
+                                .into_iter()
+                                .map(|m| m.as_str().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                // 画面を差し替えて反映を待つ（ファイル 1 本の書き換えだけ）
+                let repaint = |body: &str, footer: &str, needle: &str| {
+                    let _ = std::fs::write(&body_path, tui(body, footer));
+                    needle.to_string()
+                };
+
+                // (a) role が無いペインには何も出ない（= エージェントのペインではない）
+                let _ = set_role(cx, None);
+                notify_and_draw(any, window, cx);
+                let none_modes = menu_modes(cx);
+                let none_preview = preview(cx);
+                check(
+                    none_modes.is_empty()
+                        && none_preview
+                            .as_ref()
+                            .and_then(|v| v["available_modes"].as_array())
+                            .is_some_and(|a| a.is_empty()),
+                    &format!("140: role が無いペインには再起動を出さない (#1067) {none_modes:?}"),
+                );
+                // 下見は**何も起こさない**
+                check(
+                    none_preview.as_ref().and_then(|v| v["applied"].as_bool()) == Some(false),
+                    "140: mode 省略の下見は何も起こさない (#1067)",
+                );
+
+                // (b) worker はハーネス更新だけ / master は両方（GUI と dispatch が一致）
+                let _ = set_role(cx, Some("orchestrator-worker:tako:st1067"));
+                notify_and_draw(any, window, cx);
+                let worker_modes = menu_modes(cx);
+                let worker_preview = preview(cx);
+                let worker_available: Vec<String> = worker_preview
+                    .as_ref()
+                    .and_then(|v| v["available_modes"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| m.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                check(
+                    worker_modes == vec!["harness".to_string()]
+                        && worker_available == worker_modes,
+                    &format!(
+                        "140: worker はハーネス更新だけ・GUI と応答が一致する (#1067) \
+                         menu={worker_modes:?} api={worker_available:?}"
+                    ),
+                );
+                let _ = set_role(cx, Some("orchestrator-master:default"));
+                notify_and_draw(any, window, cx);
+                let master_modes = menu_modes(cx);
+                check(
+                    master_modes == vec!["harness".to_string(), "handoff".to_string()],
+                    &format!("140: master は 2 種とも出る (#1067) {master_modes:?}"),
+                );
+
+                // (c) 関門: 生成中 / キュー滞留 / 下書き。**メニューからは消えない**
+                //     （消すと機能そのものを見つけられなくなる）が実行は断られる
+                let reason_of = |v: &serde_json::Value, mode: &str| -> Option<String> {
+                    v["modes"].as_array().and_then(|a| {
+                        a.iter()
+                            .find(|m| m["mode"].as_str() == Some(mode))
+                            .and_then(|m| m["reason"].as_str().map(String::from))
+                    })
+                };
+                let mut guard_results: Vec<(String, Option<String>, usize)> = Vec::new();
+                let guards: [(&str, &str, &str, &str); 3] = [
+                    // 生成中: 中断ヒントが出ている（完了行の `for 2s` は busy と読まない = #1067）
+                    ("busy", "TAKO1067BUSY", "esc to interrupt", "TAKO1067BUSY"),
+                    // キュー滞留: 入力欄に claude の案内が出ている（#572）
+                    (
+                        "queued_messages",
+                        tako_control::claude_tui::QUEUED_MESSAGES_HINT,
+                        "⏵⏵ auto mode on",
+                        "Press up to edit",
+                    ),
+                    // 人間の下書き（非 dim の実テキスト）
+                    ("user_draft", "TAKO1067DRAFT", "⏵⏵ auto mode on", "TAKO1067DRAFT"),
+                ];
+                for (want, body, footer, needle) in guards {
+                    let needle = repaint(body, footer, needle);
+                    if !wait_for_focused_text(window, cx, &needle, Duration::from_secs(15)).await {
+                        fail("140: 関門の画面を作れない (#1067)")
+                    }
+                    notify_and_draw(any, window, cx);
+                    let v = preview(cx);
+                    let reason = v.as_ref().and_then(|v| reason_of(v, "harness"));
+                    let modes = menu_modes(cx);
+                    guard_results.push((want.to_string(), reason.clone(), modes.len()));
+                    check(
+                        reason.as_deref() == Some(want) && modes.len() == 2,
+                        &format!(
+                            "140: {want} では実行を断るがメニューからは消さない (#1067) \
+                             reason={reason:?} menu={modes:?}"
+                        ),
+                    );
+                    // 実行しようとしても断られる（理由 + 次の一手つき）
+                    let err = window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::SessionRestart {
+                                    pane: Some(pane1067.as_u64()),
+                                    mode: Some("harness".into()),
+                                },
+                                PaneOrigin::Cli,
+                            )
+                            .err()
+                            .map(|e| e.to_string())
+                        })
+                        .ok()
+                        .flatten();
+                    check(
+                        err.as_deref().is_some_and(|m| {
+                            m.contains(&format!("pane {}", pane1067.as_u64()))
+                                && m.contains("もう一度")
+                        }),
+                        &format!("140: {want} の拒否に理由と次の一手が入る (#1067) {err:?}"),
+                    );
+                }
+
+                // (d) アイドルに戻したら、会話を解決できないので**終了させずに**断る
+                //     （resume 先が分からないまま殺すと会話を失う）。
+                //     **入力欄は空にする**: 印を箱の中へ置くと非 dim の実テキスト =
+                //     人間の下書きとして先に断られる（関門の順序どおり。実測で踏んだ）
+                let idle2_footer = format!("{idle_footer} TAKO1067IDLE2");
+                let needle = repaint("", &idle2_footer, "TAKO1067IDLE2");
+                if !wait_for_focused_text(window, cx, &needle, Duration::from_secs(15)).await {
+                    fail("140: アイドル画面へ戻せない (#1067)")
+                }
+                notify_and_draw(any, window, cx);
+                let idle_reason = preview(cx).as_ref().and_then(|v| reason_of(v, "harness"));
+                let unresolved_err = window
+                    .update(cx, |app, _, _| {
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::SessionRestart {
+                                pane: Some(pane1067.as_u64()),
+                                mode: Some("harness".into()),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .err()
+                        .map(|e| e.to_string())
+                    })
+                    .ok()
+                    .flatten();
+                let pane_alive = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.terminals.contains_key(&pane1067)
+                    })
+                    .unwrap_or(false);
+                check(
+                    idle_reason.as_deref() == Some("session_unresolved")
+                        && unresolved_err
+                            .as_deref()
+                            .is_some_and(|m| m.contains("会話"))
+                        && pane_alive,
+                    &format!(
+                        "140: 会話を解決できないときは終了させずに断る (#1067) \
+                         reason={idle_reason:?} err={unresolved_err:?} alive={pane_alive}"
+                    ),
+                );
+
+                // (e) 引き継ぎ再起動は master へ「書いてから handoff を呼べ」を依頼する
+                //     （tako が勝手に引き継ぎファイルを読んで後任を立てるのではない）
+                let handoff = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.prompt_flows.clear();
+                        let r = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::SessionRestart {
+                                pane: Some(pane1067.as_u64()),
+                                mode: Some("handoff".into()),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok();
+                        let queued = app
+                            .prompt_flows
+                            .iter()
+                            .find(|f| f.pane == pane1067)
+                            .map(|f| f.prompt.clone());
+                        app.prompt_flows.clear();
+                        (r, queued)
+                    })
+                    .ok();
+                let (handoff_resp, handoff_prompt) = handoff.unwrap_or((None, None));
+                check(
+                    handoff_resp
+                        .as_ref()
+                        .and_then(|v| v["applied"].as_bool())
+                        == Some(true)
+                        && handoff_prompt.as_deref().is_some_and(|p| {
+                            p.contains("tako_orchestrator_handoff") && p.contains("session-restart")
+                        }),
+                    &format!(
+                        "140: 引き継ぎ再起動は master へ引き継ぎの書き直しを依頼する (#1067) \
+                         applied={:?} prompt_len={:?}",
+                        handoff_resp.as_ref().and_then(|v| v["applied"].as_bool()),
+                        handoff_prompt.as_ref().map(|p| p.len())
+                    ),
+                );
+
+                println!(
+                    "TAKO_SELF_TEST_1067: none={none_modes:?} worker={worker_modes:?} \
+                     master={master_modes:?} guards={guard_results:?} idle={idle_reason:?} \
+                     handoff_prompt={:?}",
+                    handoff_prompt.as_ref().map(|p| p.len())
+                );
+
+                // 後片付け: 疑似 TUI のペインとファイルを落とす
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.agent_relaunches.clear();
+                    app.command_flows.clear();
+                    app.prompt_flows.clear();
+                    app.stale_binary_banners.remove(&pane1067);
+                    app.close_pane_button(pane1067, CloseOrigin::Internal, cx);
+                    cx.notify();
+                });
+                let _ = std::fs::remove_file(&body_path);
+                notify_and_draw(any, window, cx);
+            }
+
             // 後片付け: 隔離した接続情報ディレクトリを消す
             if let Some(dir) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
@@ -61188,6 +61736,7 @@ mod pane_menu_items_tests {
     //! 単体が持つので、ここは「その結果がメニューへ正しく反映されるか」だけを見る
     use super::{pane_context_menu_items, PaneMenuFacts};
     use tako_control::platform::os_integration::FileManager;
+    use tako_core::session_restart::SessionRestartMode;
 
     fn facts(is_preview: bool, can_ssh: bool) -> PaneMenuFacts {
         PaneMenuFacts {
@@ -61195,7 +61744,18 @@ mod pane_menu_items_tests {
             has_cwd: true,
             limit_resume: Some(false),
             can_ssh,
+            restart_modes: Vec::new(),
             file_manager: FileManager::Finder,
+        }
+    }
+
+    /// #1067: エージェントのペイン（再起動できるモードが決まっている状態）
+    fn agent_facts(modes: Vec<SessionRestartMode>) -> PaneMenuFacts {
+        PaneMenuFacts {
+            restart_modes: modes,
+            // エージェントのペインは SSH 化できない（#1006 の role 判定）
+            can_ssh: false,
+            ..facts(false, false)
         }
     }
 
@@ -61224,6 +61784,41 @@ mod pane_menu_items_tests {
         // プレビュー・全画面 TUI・実行中・AI エージェントはすべて can_ssh=false で来る
         assert!(!ids(facts(true, false)).contains(&"connect-remote"));
         assert!(!ids(facts(false, false)).contains(&"connect-remote"));
+    }
+
+    /// #1067: エージェントのペインには 2 種の再起動が出る（worker は 1 種）
+    #[test]
+    fn エージェントのペインには再起動が出る() {
+        let worker = ids(agent_facts(vec![SessionRestartMode::Harness]));
+        assert!(worker.contains(&"restart-harness"), "{worker:?}");
+        assert!(
+            !worker.contains(&"restart-handoff"),
+            "worker は引き継ぎ機構を持たない（{worker:?}）"
+        );
+        let master = ids(agent_facts(vec![
+            SessionRestartMode::Harness,
+            SessionRestartMode::Handoff,
+        ]));
+        assert!(master.contains(&"restart-harness"), "{master:?}");
+        assert!(master.contains(&"restart-handoff"), "{master:?}");
+        // 会話を保つ側が先（既定の期待に近い順）
+        let h = master.iter().position(|i| *i == "restart-harness").unwrap();
+        let o = master.iter().position(|i| *i == "restart-handoff").unwrap();
+        assert!(h < o, "{master:?}");
+        // 区切り線は 1 本だけ入る
+        assert_eq!(
+            master.iter().filter(|i| **i == "sep-restart").count(),
+            1,
+            "{master:?}"
+        );
+    }
+
+    #[test]
+    fn エージェントでないペインには再起動を出さない() {
+        // 素のシェル・プレビューはどちらもモードが空で来る
+        assert!(!ids(facts(false, true)).contains(&"restart-harness"));
+        assert!(!ids(facts(true, false)).contains(&"restart-handoff"));
+        assert!(!ids(facts(false, true)).contains(&"sep-restart"));
     }
 
     #[test]

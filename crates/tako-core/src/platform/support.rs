@@ -172,6 +172,12 @@ pub mod notes {
     );
 
     /// #766 / #525。側路（`TAKO_OSC_SINK`）で届くが、能力申告は素通し不可のまま
+    /// #1067。ハーネス更新は旧プロセスへの終了要求（境界 B5 の制御側）が要る。
+    /// Windows 実装は未着手（`platform::process::terminate` が明示的に Err を返す）
+    pub const WIN_SESSION_RESTART_TERMINATE: Note = Note::new(
+        "引き継ぎ再起動は使えるが、ハーネス更新（会話を保ったまま CLI を建て直す）はプロセスの終了要求が Windows 未対応のため使えない（#1067 / 境界 B5）",
+        "Restarting with a handoff works, but the harness update (rebuilding the CLI while keeping the conversation) is unavailable because process termination is not implemented on Windows (#1067 / boundary B5)",
+    );
     pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
         "cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766）",
         "cwd tracking and command state are delivered through a side channel even inside the psmux container, but because psmux does not pass OSC through, the status field effective stays false (#766)",
@@ -1339,6 +1345,21 @@ pub const MATRIX: &[Feature] = &[
         windows: Support::Supported,
         windows_evidence: Evidence::SelfTest(
             "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み",
+        ),
+    },
+    Feature {
+        // #1067: エージェントペインの「セッションを引き継いで再起動」2 種。
+        // 引き継ぎ再起動（handoff）は master ペインへ定型文を送るだけなので両 OS 共通だが、
+        // ハーネス更新（harness）は旧プロセスへ終了要求を出す必要があり、境界 B5 の
+        // Windows 実装が未着手（`platform::process::terminate` は明示 Err）。
+        // **未実測ではなく構造的に使えない**ので Pending ではなく Degraded
+        key: "tako_session_restart",
+        macos: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_SESSION_RESTART_TERMINATE,
+        },
+        windows_evidence: Evidence::ByDesign(
+            "tako_control::platform::process::terminate の Windows 実装は「プロセスの停止は Windows では未対応です」を返す（B5 の制御側が未実装）。handoff は queue_prompt_flow だけを使うので影響を受けない",
         ),
     },
     Feature {

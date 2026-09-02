@@ -1678,6 +1678,23 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
     },
+    /// エージェントペインを「会話を引き継いで」建て直す（Issue #1067）。
+    ///
+    /// `mode` 省略 = **下見**（何ができるか + できない理由を返すだけで、何も起こさない。
+    /// #748 の respond と同じ「引数を省いたら状態だけ返す」形）。
+    /// `mode` = "harness"（CLI プロセスだけ建て直して `--resume` で同じ会話を続ける。
+    /// claude の自動更新に追いつく手段 = #498）/ "handoff"（引き継ぎを書かせてから
+    /// 新しいセッションへ交代する = #749 の手動版。master ペインのみ）。
+    ///
+    /// 生成中・キュー滞留・入力欄の下書き・選択肢ダイアログ中は**実行せず理由を返す**
+    SessionRestart {
+        /// 対象ペイン（省略時はデフォルト解決）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 種別（省略 = 下見）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
     /// 設定・データファイルのスキーマ自動マイグレーション（Issue #916）。
     /// `action` = "status"（既定。見るだけ）/ "run"（当てる）。
     /// `schema` でファイル種別を絞る（`tako_core::migration::SchemaId` の識別子）

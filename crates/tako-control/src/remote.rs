@@ -2425,36 +2425,14 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// プロセスがゾンビ（終了済みだが親が未刈り取り）か。
-///
-/// `kill(pid, 0)` はゾンビにも成功するため、生死だけでは終了を判定できない。
-/// 呼ぶのは停止の待ち合わせ中だけなので、`ps` 起動のコストは問題にならない
-/// （定常のポーリング経路には入れない。#340 の常駐サブプロセス削減方針）
-fn is_zombie_process(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "stat="])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
 /// プロセスが**終了済み**か（ゾンビも終了済みとして扱う。#619）。
 ///
 /// 停止の待ち合わせはこれを使う。刈り取れない別プロセスから停止したとき
 /// （GUI が起動した daemon を CLI から止める等）に、親がまだ刈り取っていない
 /// ゾンビを「終了しない」と誤判定してタイムアウトするのを防ぐ
 fn has_terminated(pid: u32) -> bool {
-    !is_process_alive(pid) || is_zombie_process(pid)
+    // #1067 で境界（B5 の制御側）へ寄せた。判定は 1 実装
+    crate::platform::process::has_terminated(pid)
 }
 
 /// stale なデーモンプロセスを kill し、終了を確認して state ファイルを掃除する。
@@ -6147,7 +6125,7 @@ mod tests {
         let mut leaked = spawn_throwaway_child(&[]);
         let leaked_pid = leaked.id();
         assert!(
-            wait_until(10, || is_zombie_process(leaked_pid)),
+            wait_until(10, || crate::platform::process::is_zombie(leaked_pid)),
             "前提: wait しない子は終了後 defunct になる"
         );
         assert!(
@@ -6165,9 +6143,10 @@ mod tests {
         let pid = child.id();
         reap_daemon_child(child);
         assert!(
-            wait_until(10, || !is_process_alive(pid) && !is_zombie_process(pid)),
+            wait_until(10, || !is_process_alive(pid)
+                && !crate::platform::process::is_zombie(pid)),
             "reap_daemon_child 後は defunct が残らない（zombie={}）",
-            is_zombie_process(pid)
+            crate::platform::process::is_zombie(pid)
         );
     }
 
@@ -6213,7 +6192,7 @@ mod tests {
         let elapsed = started.elapsed();
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let pid_file_left = pid_file.exists();
-        let zombie_during_wait = is_zombie_process(pid);
+        let zombie_during_wait = crate::platform::process::is_zombie(pid);
         let _ = child.wait(); // 起動した本人として刈り取る（= spawn_daemon 側の役目）
         assert!(
             result.is_ok(),
@@ -6233,7 +6212,7 @@ mod tests {
         let mut leftover = spawn_throwaway_child(&["tako", "remote", "serve"]);
         let leftover_pid = leftover.id();
         assert!(
-            wait_until(10, || is_zombie_process(leftover_pid)),
+            wait_until(10, || crate::platform::process::is_zombie(leftover_pid)),
             "前提: 子が defunct になるまで待つ"
         );
         arm(leftover_pid);

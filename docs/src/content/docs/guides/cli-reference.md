@@ -114,6 +114,7 @@ tako orchestrator spawn --help
 | [`autorename`](#表示設定のトグル) | タブ・ペインの AI 自動リネーム |
 | [`portdetect`](#表示設定のトグル) | ポート検知と提案チップ |
 | [`confirm-close`](#表示設定のトグル) | 閉じる確認ダイアログ |
+| [`session-restart`](#tako-session-restart) | エージェントを会話ごと引き継いで再起動 |
 | [`limit-resume`](#tako-limit-resume) | 利用上限後の自動復帰（ペイン単位） |
 | [`limit-service`](#表示設定のトグル) | 利用制限表示のサービス切替 |
 | [`welcome`](#tako-welcome) | 初回起動バナーの状態・再表示 |
@@ -831,6 +832,35 @@ tako autosuggest hint off    # 確定キーの案内を今すぐ止める（既�
 
 :::note[外の zsh には影響しません]
 `~/.zshrc` を書き換えないので、tako の外のターミナルの挙動は変わりません。すでに自分で zsh-autosuggestions を導入している場合、tako は二重に読み込まず何もしません（あなたの設定がそのまま使われます）。
+:::
+
+### tako session-restart
+
+エージェントのペインを**会話を失わずに**建て直します。ペインを右クリックしても
+同じ 2 つを選べます。**引数なしで実行すると「いま何ができるか」だけを返し、何も起こしません**。
+
+```bash
+tako session-restart                       # 下見（できること + できない理由）
+tako session-restart --mode harness        # 会話を保ったまま CLI を建て直す
+tako session-restart --mode handoff        # 引き継ぎを書かせて交代（master のみ）
+tako session-restart --mode harness --pane 12   # 別のペインを指定
+```
+
+`--mode harness` は**エージェント CLI のプロセスだけ**を終わらせ、落ちたことを確かめてから
+`claude --resume <会話 ID>` を投入します。会話はそのまま続き、アカウント・モデル・
+思考の深さも元のまま戻ります。`claude` を自動更新したのに古い版のまま動いているペイン
+（ヘッダに「claude X が利用可能です」が出ているもの）を、会話を捨てずに新しい版へ
+載せ替えるための操作です。
+
+`--mode handoff` は master ペイン専用で、引き継ぎファイルを書き直してから後任へ交代させます
+（コンテキストの使用率が高くなったときに tako が自動でやることを、任意のタイミングで
+起こせるようにしたものです）。
+
+:::note[危ない瞬間には動きません]
+生成中・送っていない指示がキューに残っているとき・入力欄にあなたの打ちかけがあるとき・
+選択肢のダイアログが出ているときは実行せず、理由と次にすべきことを返します。
+会話 ID を特定できないときは**プロセスに触りません**（戻る先が分からないまま終了させると
+会話を失うため）。claude 以外のエージェントは対象外です（`tako agent-support` を参照）。
 :::
 
 ### tako limit-resume
