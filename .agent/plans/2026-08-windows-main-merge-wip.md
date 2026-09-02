@@ -3235,8 +3235,30 @@ Compare-Object $branchFails ($fails | Sort-Object -Unique)
 ```
 
 macOS 側のベースライン: `test --workspace` **2386 passed / 0 failed**（#877 時点。
-スライス 5 後は 2228、#873 時点は 2377）/ visual-test **98 checkpoint** /
-クロスチェック **エラー 0・警告 10**。
+スライス 5 後は 2228、#873 時点は 2377、**#1063 時点は 3036**）/ visual-test **98 checkpoint** /
+クロスチェック **エラー 0・警告 10**（#1063 時点は 12。`--all-targets` は #1063 で 3 → 0）。
+
+**2026-09-02（#1063）にベースラインを取り直した。** それまでの表は当てにならない:
+#983（PR #1029）が `std::os::unix::fs::PermissionsExt` を無条件で使うテストを足した時点から
+**`tako-control` のテストバイナリが Windows でコンパイルできず、`cargo test --workspace` が
+ビルド失敗で止まっていた**（そのクレートの 1000 件超が丸ごと未実行）。#1063 の PR で
+`#[cfg(unix)]` を付けて解消したので、以後はこの表と突き合わせる:
+
+| スイート | 結果（2026-09-02 / branch `fix/1063-win-scale-viewport`） |
+|---|---|
+| tako-app (bin) | 528 / 0 |
+| tako-cli (lib) | 58 / 0 |
+| tako-core (lib) | 1266 / **14 failed** |
+| tako-control (lib) | 1048 / **10 failed** |
+| `remote_fs_e2e` | 0 / **1 failed**（#930） |
+| `platform_parity` / `psmux_backend` / `shell_integration_powershell` / 他 | すべて 0 failed |
+
+**失敗の一意な名前は 21 件**で、内訳は POSIX 前提のテスト（symlink / mode ビット / `~` 展開 /
+`links` の絶対パス / `shell_profile`）と、既知の製品縮退（`acceptance_gates` = #935 /
+`stale_binary` / `remote` / `bundle_install` = macOS 専用）。#1063 の変更で増えたものはゼロ
+（同一ブランチの 2 回の run を `Compare-Object` で突き合わせ、差分は自分で直した
+`platform::dpi` の 1 件だけだった）。**`tako-control` ぶんは #1029 以降ずっと未実行だったので
+「新しく見えるようになった失敗」であり、回帰ではない**。個別の切り分けは別 Issue で。
 
 ### 持ち込まないもの（今回の裁定で確定）
 
