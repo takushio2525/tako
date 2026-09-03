@@ -167,8 +167,11 @@ const MIN_FRAGMENT_CHARS: usize = 2;
 
 /// 判定（詳細はモジュール doc）
 pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
-    // 「tako 以外が書いた中身のある行」だけを見る
+    // 「tako 以外が書いた中身のある行」だけを見る。
+    // #1090: **tako のバナーより前に出た行は別扱い**にするため、バナーを見たかを覚える
     let mut interesting: Vec<&str> = Vec::new();
+    let mut after_banner: Vec<&str> = Vec::new();
+    let mut saw_banner = false;
     for line in inputs.new_lines {
         let trimmed = line.trim_end();
         if trimmed.trim().is_empty() {
@@ -189,9 +192,13 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
             return ConnectPhase::Failed { reason };
         }
         if is_tako_line(trimmed) || is_tako_fragment(trimmed, inputs.tako_prints) {
+            saw_banner = true;
             continue;
         }
         interesting.push(trimmed);
+        if saw_banner {
+            after_banner.push(trimmed);
+        }
     }
 
     // #1090: **折り返しで割れたパターンを繋いでから**見る。物理行は端末幅で切られる
@@ -227,8 +234,22 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
         }
     }
 
-    // ④ まっさらなペインなら「tako 以外の行が出た」だけで十分
-    if inputs.fresh_pane && !interesting.is_empty() {
+    // ④ まっさらなペインなら「tako 以外の行が出た」だけで十分 —— ただし
+    //    **tako のバナーが出てからの行**に限る（#1090）。
+    //
+    //    この規則の前提は「載っているのは tako が印字したバナーだけ」だが、
+    //    器（psmux / tmux）つきのペインでは**器と下のシェルが先に描く**ので前提が崩れる。
+    //    実測（Windows 実機・セルフテスト項目 133 (d) の phase 履歴）:
+    //
+    //        connecting/0 -> <none>/1 -> <none>/0 -> <none>/2 -> reconnecting/11 -> …
+    //
+    //    バナーが出る前の**1 行**で `Opened` → `Connected` → `ever_connected = true` へ
+    //    進み、直後にスクリプトの失敗マーカーを「切断」と読んで #1040 の自動再接続が
+    //    armed になっていた（繋がったことが一度も無いホストへ ssh を打ち直す）。
+    //
+    //    バナーが見えないうちは畳まない。**失敗を騙るわけではない**ので、
+    //    最悪でも [`SILENT_CAP_SECS`] で表示が畳まれるだけ
+    if inputs.fresh_pane && !after_banner.is_empty() {
         return ConnectPhase::Opened;
     }
 
@@ -429,6 +450,32 @@ mod tests {
             classify(&inputs(&l, true)),
             ConnectPhase::Failed { reason: None }
         );
+    }
+
+    /// #1090: 器（psmux / tmux）や下のシェルが**バナーより前に**描く行で畳まない。
+    ///
+    /// 実測（Windows 実機の phase 履歴）: `connecting/0 -> <none>/1 -> …` =
+    /// バナーが出る前の 1 行で `Opened` になり、#1040 の自動再接続まで armed になっていた
+    #[test]
+    fn バナーより前の行では畳まない() {
+        // 器が先に何か描いた状態（tako はまだ何も印字していない）
+        let l = lines(&["[psmux] session created"]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Connecting);
+
+        // バナーが出た後の行なら従来どおり畳む
+        let l = lines(&[
+            "[psmux] session created",
+            "tako: win へ接続しています…（中止は Ctrl+C）",
+            "The authenticity of host 'win' can't be",
+        ]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Opened);
+
+        // ssh 自身の失敗はバナーの前後に関係なく拾う（規則 ②）
+        let l = lines(&["ssh: connect to host win port 22: Connection refused"]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { .. } => {}
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
     }
 
     /// #1090: **折り返しで割れた目印**を繋いでから見る。

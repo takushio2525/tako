@@ -57605,6 +57605,7 @@ mod self_test {
                 // 「どの順で何へ倒れたか」が分からないと原因を追えない（実測で 1 度踏んだ）
                 let mut failed = None;
                 let mut phase_trail: Vec<String> = Vec::new();
+                let mut first_line: Option<String> = None;
                 for _ in 0..40 {
                     wait(cx, 500).await;
                     let (st, screen_lines) = window
@@ -57633,6 +57634,23 @@ mod self_test {
                     if phase_trail.last() != Some(&entry) {
                         phase_trail.push(entry);
                     }
+                    // 何が「1 行」だったのかが分からないと原因を追えないので、
+                    // 序盤の数サンプルだけ先頭行の中身も控える（#1090）
+                    if phase_trail.len() <= 4 && first_line.is_none() && screen_lines > 0 {
+                        first_line = window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals
+                                    .get(&PaneId::from_raw(ssh_pane))
+                                    .and_then(|s| {
+                                        s.visible_lines()
+                                            .into_iter()
+                                            .find(|l| !l.trim().is_empty())
+                                    })
+                                    .map(|l| l.chars().take(40).collect::<String>())
+                            })
+                            .ok()
+                            .flatten();
+                    }
                     if st.as_ref().map(|v| v["phase"] == "failed").unwrap_or(false) {
                         failed = st;
                         break;
@@ -57642,6 +57660,10 @@ mod self_test {
                     .as_ref()
                     .map(|v| v["phase"] == "failed" && !v["reason"].is_null())
                     .unwrap_or(false);
+                println!(
+                    "TAKO_SELF_TEST_133D_TRAIL: {} first_line={first_line:?}",
+                    phase_trail.join(" -> ")
+                );
                 if !failed_ok {
                     // #1073: 「スクリプトが走っていない」と「走ったが分類できていない」を
                     // 言い分ける（実機で 20 秒待っても connecting のままだった）。
@@ -57665,7 +57687,6 @@ mod self_test {
                             (phase, backend, lines)
                         })
                         .unwrap_or((None, false, Vec::new()));
-                    println!("TAKO_SELF_TEST_133D_TRAIL: {}", phase_trail.join(" -> "));
                     println!(
                         "TAKO_SELF_TEST_133D: host={host1010:?} phase={phase:?} \
                          backend={backend} lines={lines:?}"
