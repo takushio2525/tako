@@ -365,11 +365,12 @@ pub fn is_limit_exhausted_line(line: &str) -> bool {
             || (line.contains("limit reached") && line.contains("reset"));
     }
     // テンプレート `You've hit your <限度の名前><理由や解除時刻>`。
-    // 限度の名前は `hit your` の**直後**にあり、理由や解除時刻は必ず
+    // 限度の名前は `hit your` の**直後**にあり、後ろに続く理由や解除時刻は必ず
     // `·` か `.` で始まる（`… session limit · resets 7:50pm` /
     // `… usage limit. Upgrade to Pro …`）。そこで**名前の区間だけ**を見る。
-    // 地の文（「… hit your head on this design, the rate limit docs …」）を
-    // 上限と読まないための境界で、句読点が来ない病的な行には文字数で歯止めをかける
+    // `,` は限度の名前には現れないので、地の文（「… hit your head on this design,
+    // the rate limit docs …」）を上限と読まないための追加の境界として足してある。
+    // 句読点が来ない病的な行には文字数で歯止めをかける
     if let Some((_, rest)) = line.split_once("hit your") {
         let name = rest.split(['·', '.', ',']).next().unwrap_or(rest);
         let name = name
