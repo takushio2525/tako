@@ -3660,10 +3660,15 @@ unix = load average / Windows = `GetSystemTimes` の差分から出す CPU 使�
 | 2 | 97 (d) / 99 | 画面の `tako <sub>` リテラル（#967） | **解消** |
 | 3 | 133 (d) | **製品側**: Windows の OpenSSH が ControlMaster 非対応（#1090） | 別 Issue へ |
 
-| 起動 | 項目 41 / 41b | 到達 |
-|---|---|---|
-| `TAKO_ISOLATED=1`（レシピ） | skip（理由 + `script` パスを出す） | 項目 133 まで |
-| 素の `TAKO_SELF_TEST=1` | **走って通る**（Windows で初めて OSC 7 / 133 が緑） | 項目 133 まで |
+| 起動 | head | 項目 41 / 41b | 停止位置 |
+|---|---|---|---|
+| 素の `TAKO_SELF_TEST=1` | `6574b07`（壁 1 のみ） | **走って通る**（Windows で初めて OSC 7 / 133 が緑） | 97 (d) |
+| `TAKO_ISOLATED=1` | `6574b07` | skip | 97 (d) |
+| `TAKO_ISOLATED=1`（レシピ） | `d2376ec` / `1d8a5b0` | skip（理由 + `script` パスを出す） | **133 (d)** |
+| 素の `TAKO_SELF_TEST=1` | `5d00106` | 走って通る | **133 (d)** |
+
+**両モードで同じ診断行**が出る（`getsockname failed: Not a socket` / `phase=None`）=
+モード差は項目 41 のゲートだけに閉じた。
 
 ### 壁 3 の正体（#1090 として起票。**製品側**で射程外）
 
