@@ -67,7 +67,8 @@ if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
   if [[ -n ${TMUX-} ]]; then
     _tako_sock=${${TMUX%%,*}:t}
     if [[ -n ${TAKO_BACKEND_SOCKET-} ]]; then
-      [[ $_tako_sock == ${TAKO_BACKEND_SOCKET} ]] && _tako_tmux=1
+      # 右辺はクォートする（zsh の `==` は右辺をパターンとして扱う）
+      [[ $_tako_sock == "${TAKO_BACKEND_SOCKET}" ]] && _tako_tmux=1
     elif [[ $_tako_sock == tako* ]]; then
       _tako_tmux=1
     fi

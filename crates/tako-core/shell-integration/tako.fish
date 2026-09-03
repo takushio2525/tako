@@ -14,7 +14,8 @@ set -g _tako_tmux ''
 if set -q TMUX
     set -l sock (string split ',' -- $TMUX)[1]
     set -l name (string replace -r '^.*/' '' -- $sock)
-    if set -q TAKO_BACKEND_SOCKET
+    # `set -q` は空文字でも真なので `-n` で見る（zsh / bash 版と同じ意味論）
+    if test -n "$TAKO_BACKEND_SOCKET"
         if test "$name" = "$TAKO_BACKEND_SOCKET"
             set -g _tako_tmux 1
         end
