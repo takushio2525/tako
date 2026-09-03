@@ -1506,6 +1506,12 @@ mod tests {
         let v = psmux.describe();
         assert_eq!(v["detached_capture"], true);
         assert_eq!(v["detached_access"], false);
+        // #974: 「器で止まるもの」も同じ 1 箇所から読める（`tako persist` / MCP の
+        // `backend` 応答がこれをそのまま返す）。psmux は CSI u を器へ渡せない
+        assert_eq!(v["extended_keys"], false);
+        assert_eq!(v["suppresses_copy_mode_indicator"], false);
+        assert_eq!(tmux.describe()["extended_keys"], true);
+        assert_eq!(tmux.describe()["suppresses_copy_mode_indicator"], true);
     }
 
     /// 案 B-1（器だけの ConPTY セッションホスト）の形をした偽 backend。
