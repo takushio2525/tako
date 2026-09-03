@@ -183,7 +183,6 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
             // 見分けられなければ従来どおり直前の非空行へ落ちる
             let reason = interesting
                 .iter()
-                .rev()
                 .find(|l| is_ssh_error_line(l))
                 .or_else(|| interesting.iter().rev().find(|l| !l.trim().is_empty()))
                 .map(|l| l.trim().to_string());
@@ -195,18 +194,34 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
         interesting.push(trimmed);
     }
 
+    // #1090: **折り返しで割れたパターンを繋いでから**見る。物理行は端末幅で切られる
+    // ので、狭いペインでは `ssh: Could not resolve hostname` のような目印が 2 行へ
+    // 割れて per-line の `contains` では当たらない。しかも tako がバナーを印字した
+    // 直後の行は「バナーの尻尾 + ssh の出力」が**同じ物理行に載る**（実測）ため、
+    // 残り幅ぶんしか目印が入らず必ず切れる。
+    //
+    // 当たらないと規則 ④（まっさら + tako 以外の行 = ssh が何か言った）へ落ちて
+    // `Opened` になり、繋がっていないのに #1040 の自動再接続まで armed になる
+    // （Windows 実機の 44 桁のペインで実測）。
+    //
+    // 連結は「tako 以外の行」だけなので、あいだに tako の行が挟まると本来隣り合って
+    // いない文字列が繋がる。目印はどれも具体的な英文なので偶然の一致は実質起きない
+    let joined: String = interesting.concat();
+
     // ② ssh 自身の失敗行（`pane` 経路にはスクリプトが無いのでこちらで拾う）
-    for line in &interesting {
-        if is_ssh_error_line(line) {
-            return ConnectPhase::Failed {
-                reason: Some(line.trim().to_string()),
-            };
-        }
+    if SSH_ERROR_PATTERNS.iter().any(|p| joined.contains(p)) {
+        // 理由は目印を含む行（割れていれば ssh の出力が始まった行）を出す
+        let reason = interesting
+            .iter()
+            .find(|l| is_ssh_error_line(l))
+            .or(interesting.first())
+            .map(|l| l.trim().to_string());
+        return ConnectPhase::Failed { reason };
     }
 
     // ③ 入力待ち = もう黙っていない
-    for line in &interesting {
-        let lower = line.to_lowercase();
+    {
+        let lower = joined.to_lowercase();
         if PROMPT_PATTERNS.iter().any(|p| lower.contains(p)) {
             return ConnectPhase::Opened;
         }
@@ -414,6 +429,31 @@ mod tests {
             classify(&inputs(&l, true)),
             ConnectPhase::Failed { reason: None }
         );
+    }
+
+    /// #1090: **折り返しで割れた目印**を繋いでから見る。
+    ///
+    /// 実測（Windows 実機・44 桁のペイン）: tako のバナーの尻尾と ssh の出力が
+    /// **同じ物理行**に載るので、残り幅ぶんしか目印が入らず per-line の `contains` が
+    /// 必ず外れ、規則 ④ で `Opened` へ倒れていた（→ #1040 の自動再接続が armed）
+    #[test]
+    fn 折り返しで割れた_ssh_の目印も失敗として読む() {
+        // `います…（中止は Ctrl+C）` の直後に ssh の出力が続き、目印が途中で切れる
+        let l = lines(&[
+            "tako: win へ接続して",
+            "います…（中止は Ctrl+C）ssh: Could not resol",
+            "ve hostname win: nodename nor servname",
+        ]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { reason } => {
+                assert!(reason.is_some(), "理由が空: {l:?}");
+            }
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+
+        // 入力待ちの目印も同じように割れる
+        let l = lines(&["testuser@win's pass", "word:"]);
+        assert_eq!(classify(&inputs(&l, false)), ConnectPhase::Opened);
     }
 
     /// #1090: 折り返された理由の**尻尾**ではなく ssh の失敗行を理由に出す
