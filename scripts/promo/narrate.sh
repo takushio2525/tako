@@ -12,6 +12,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 TSV=${1:-"$SCRIPT_DIR/explainer-timeline.tsv"}
 OUT=${2:-"${TAKO_PROMO_OUT:-$HOME/Desktop/tako-promo}/audio/narr"}
 VOICE=${TAKO_PROMO_VOICE:-Kyoko}
@@ -23,8 +25,7 @@ mkdir -p "$OUT"
 
 n=0
 while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle speech; do
-    [ -z "$id" ] && continue
-    case "$id" in \#*) continue ;; esac
+    speech=$(promo_tl_field "$speech")
     if [ -z "$speech" ]; then
         printf '%s\t0\n' "$id" >> "$OUT/durations.tsv"
         continue
@@ -38,7 +39,7 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
     dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$wav")
     printf '%s\t%s\n' "$id" "$dur" >> "$OUT/durations.tsv"
     n=$((n + 1))
-done < "$TSV"
+done < <(promo_timeline_rows "$TSV")
 
 total=$(awk -F'\t' '{s+=$2} END {printf "%.1f", s}' "$OUT/durations.tsv")
 echo "== ナレーション ${n} 区間 / 合計 ${total}s → $OUT"

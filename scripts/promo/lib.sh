@@ -480,6 +480,15 @@ promo_seed_window_frame() {
         "$x" "$y" "$w" "$h" > "$work/data/layout.json"
 }
 
+# タイムライン tsv（explainer-timeline.tsv）を bash の read で安全に読める形へ正規化する。
+# bash の `IFS=$'\t' read` はタブを空白類として扱い**連続タブを 1 つに潰す**ので、
+# 空欄（カードの source 等）があると列がずれる（実測: op_card の min_dur に "tako" が入った）。
+# 空欄を `-` で埋めて 9 列に揃え、コメント行と空行を落として出す。読む側は `-` を空欄として扱う
+promo_timeline_rows() {
+    awk -F'\t' 'BEGIN{OFS="\t"} /^#/ || NF<2 {next} {for (i=1;i<=9;i++) if ($i=="") $i="-"; NF=9; print}' "$1"
+}
+promo_tl_field() { [ "$1" = "-" ] && printf '' || printf '%s' "$1"; }
+
 # ── 隔離インスタンス ───────────────────────────────────────────────
 # $1 = 作業ディレクトリ, $2 = tmux ソケット名, $3 = persist（1 で永続化 ON）
 # 追加の環境変数は PROMO_EXTRA_ENV 配列（"KEY=VALUE" 形式）で渡す

@@ -146,7 +146,36 @@ scripts/promo/pii-scan.sh ~/Desktop/tako-promo/tako-explainer-v1.mp4
 ### 説明文（章立てタイムスタンプ付き）
 
 <!-- description:begin -->
-（合成後に `~/Desktop/tako-promo/tako-explainer-chapters.txt` の実測値で埋める）
+```
+tako は、Claude Code のような AI エージェントと、その子エージェント・dev サーバー・ログを
+「1 グループ = 1 タブ」で集約監視するための、オープンソース（GPL-3.0）の GUI ターミナルです。
+この動画では「tako とは何か」「どう使うか」「何がいいか」を、実際の画面だけで解説します。
+
+■ インストール（macOS / Apple Silicon）
+brew install --cask takushio2525/tako/tako
+Windows 版（インストーラー / ポータブル zip）と macOS の zip は GitHub Releases から:
+https://github.com/takushio2525/tako/releases
+
+■ リンク
+GitHub: https://github.com/takushio2525/tako
+ドキュメント: https://tako-docs.pages.dev/
+セットアップ: https://tako-docs.pages.dev/getting-started/
+クイックスタート: https://tako-docs.pages.dev/getting-started/quickstart/
+オーケストレーションとは: https://tako-docs.pages.dev/features/orchestration/
+tako master 実践ガイド: https://tako-docs.pages.dev/features/orchestrator/
+リモートアクセス: https://tako-docs.pages.dev/features/remote/
+Windows 対応状況: https://tako-docs.pages.dev/windows-support/
+
+■ 章
+CHAPTERS_PLACEHOLDER
+
+■ 注記
+・ナレーションは合成音声（macOS の日本語音声）です
+・7 章のスマホ画面は tako remote の実際の UI に、デモ用データを流し込んで撮影しています
+・収録は tako v0.8.3 / Claude Code 2.1.258（macOS）。機能や画面は今後のバージョンで変わることがあります
+
+#tako #ClaudeCode #AIエージェント #ターミナル #Rust #オープンソース
+```
 <!-- description:end -->
 
 ### サムネイル案
