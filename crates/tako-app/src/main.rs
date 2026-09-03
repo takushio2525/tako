@@ -48344,6 +48344,92 @@ mod self_test {
                     "プロファイルタブ: モデル一覧は押して初めて取り、チップから保存できる (#1002)",
                 );
 
+                // (b3) #1119: 起動フォルダ（cwd）の行。**検証は dispatch 側の 1 実装**
+                // （`~` 展開・存在確認・相対パスの拒否）に任せているので、ここで見るのは
+                // ①入力欄の確定が yaml へ届く ②空欄で解除される
+                // ③弾かれたときは保存されず、**CLI と同じ文言**が画面に出る、の 3 点
+                let cwd_dir = std::env::temp_dir().join(format!("tako-1119-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&cwd_dir);
+                let cwd_str = cwd_dir.display().to_string();
+                let bad_cwd = cwd_dir.join("この階層は存在しない").display().to_string();
+                let show_cwd = |cx: &mut AsyncApp| {
+                    fire(req("show", "master", Some(probe)), cx)
+                        .and_then(|v| v["cwd"].as_str().map(String::from))
+                };
+                // ① 設定する
+                {
+                    let v = cwd_str.clone();
+                    settings
+                        .update(cx, |view, _, cx| {
+                            view.st_profiles_commit(ProfileField::Cwd, &v, cx);
+                        })
+                        .ok();
+                }
+                let cwd_saved = show_cwd(cx);
+                let cwd_form = settings
+                    .update(cx, |view, _, _| {
+                        view.st_profiles_detail()
+                            .and_then(|d| d["cwd"].as_str().map(String::from))
+                    })
+                    .ok()
+                    .flatten();
+                // ② 空欄へ戻すと解除（未設定 = ホーム）
+                settings
+                    .update(cx, |view, _, cx| {
+                        view.st_profiles_commit(ProfileField::Cwd, "", cx);
+                    })
+                    .ok();
+                let cwd_cleared = show_cwd(cx);
+                // ③ 存在しないパスは保存されず、CLI / MCP と同じ理由が message に出る。
+                // 期待文言は**同じ dispatch を直接叩いて**作る（テストに文言を直書きしない）
+                let cli_error = {
+                    let mut r = req("set", "master", Some(probe));
+                    if let Req::OrchestratorProfiles { ref mut cwd, .. } = r {
+                        *cwd = Some(bad_cwd.clone());
+                    }
+                    window
+                        .update(cx, |app, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli)
+                                .err()
+                                .map(|e| e.to_string())
+                        })
+                        .ok()
+                        .flatten()
+                };
+                {
+                    let v = bad_cwd.clone();
+                    settings
+                        .update(cx, |view, _, cx| {
+                            view.st_profiles_commit(ProfileField::Cwd, &v, cx);
+                        })
+                        .ok();
+                }
+                let gui_message = settings
+                    .update(cx, |view, _, _| view.st_profiles_message())
+                    .ok()
+                    .flatten();
+                let cwd_after_bad = show_cwd(cx);
+                let cwd_ok = cwd_saved.as_deref() == Some(cwd_str.as_str())
+                    && cwd_form.as_deref() == Some(cwd_str.as_str())
+                    && cwd_cleared.is_none()
+                    && cwd_after_bad.is_none()
+                    && cli_error.is_some()
+                    && gui_message.as_ref().map(|(text, is_error)| {
+                        *is_error && Some(text.as_str()) == cli_error.as_deref()
+                    }) == Some(true);
+                if !cwd_ok {
+                    eprintln!(
+                        "[selftest 96] cwd saved={cwd_saved:?} form={cwd_form:?} \
+                         cleared={cwd_cleared:?} after_bad={cwd_after_bad:?} \
+                         cli_error={cli_error:?} gui_message={gui_message:?}"
+                    );
+                }
+                check(
+                    cwd_ok,
+                    "プロファイルタブ: 起動フォルダの往復と、弾かれた理由が CLI と同じ文言で出る (#1119)",
+                );
+                let _ = std::fs::remove_dir_all(&cwd_dir);
+
                 // (c) 外部変更（CLI / MCP 相当の dispatch）→ 再表示で反映される
                 let copied = {
                     let mut r = req("copy", "master", Some(copy));
