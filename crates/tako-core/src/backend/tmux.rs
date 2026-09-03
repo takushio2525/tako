@@ -372,7 +372,9 @@ mod tests {
     /// - `-f <conf>`: ユーザーの `~/.tmux.conf` を読まない（裏方に徹する）
     /// - `new-session -A -D`: 新規作成と再 attach が同一コマンドになる（FR-5 の復元）
     /// - `-e TAKO_PANE_ID` / `-e TAKO_TAB_ID`: サーバーのグローバル環境の stale 値を
-    ///   使わせない（#0156b9a の stale ID 問題）。**この 2 つ以外の env は `-e` に載せない**
+    ///   使わせない（#0156b9a の stale ID 問題）
+    /// - `-e` のシェル統合ぶん: 器のサーバーが**別インスタンスの置き場**を指すのを防ぐ
+    ///   （#1105。値は data dir 依存なので別途 `strip_integration_env` で突き合わせる）
     #[test]
     fn wrap_spawn_argv_スナップショット() {
         let b = backend();
@@ -403,6 +405,17 @@ mod tests {
             conf_at..=conf_at + 1,
             ["-f".to_string(), "<conf>".to_string()],
         );
+        // #1105: シェル統合の `-e` は値が data dir 依存なので外して別途見る
+        let integration = crate::backend::strip_integration_env(&mut args);
+        let mut expected_integration: Vec<String> = crate::shell_integration::env()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        expected_integration.sort();
+        assert_eq!(
+            integration, expected_integration,
+            "シェル統合の置き場がセッションへ固定されていない（#1105）"
+        );
 
         assert_eq!(
             args,
@@ -421,6 +434,9 @@ mod tests {
                 "TAKO_PANE_ID=7",
                 "-e",
                 "TAKO_TAB_ID=3",
+                // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
+                "-e",
+                "TAKO_BACKEND_SOCKET=tako-unit",
                 "-c",
                 "/tmp/work",
             ]
