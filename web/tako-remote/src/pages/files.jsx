@@ -9,7 +9,7 @@
 //
 // API は自前 fetch で叩く: 並行して `api.js` を改修している作業（#1077 / #1078）と
 // 衝突させないため、このビューが使う分はこのファイルに閉じてある。
-import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
+import { useState, useEffect, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
 
 const TIMEOUT_MS = 15000;
@@ -370,7 +370,6 @@ function FileView({ file, root, path, onReload }) {
   // { ok: true, remote } / { ok: false, message, kind, pending }
   const [result, setResult] = useState(null);
   const [pendingWrite, setPendingWrite] = useState(file.pending_write === true);
-  const areaRef = useRef(null);
 
   // 別のファイルへ移った / 読み直したら下書きと結果を捨てる
   // （依存は**読み込んだ応答そのもの**。値ではなく識別で見るので、
@@ -416,6 +415,9 @@ function FileView({ file, root, path, onReload }) {
       await sendJson('POST', filesUrl('/api/files/push', root, path), {});
       setPendingWrite(false);
       setResult({ ok: true, pushed: true });
+      // 送れたのは**退避してあった内容**なので、画面は真実へ揃え直す。
+      // ただし手元に未保存の編集が残っているときは捨てない（保存で送り直せる）
+      if (!dirty) onReload();
     } catch (e) {
       setResult({ ok: false, message: e.message, kind: e.kind, pending: e.pending });
     } finally {
@@ -476,7 +478,7 @@ function FileView({ file, root, path, onReload }) {
           {result.pushed
             ? 'リモートへ送りました'
             : result.remote
-              ? `保存してリモートへ書き戻しました（${result.remote.state || 'saved'}）`
+              ? 'リモートへ書き戻しました'
               : '保存しました'}
         </div>
       )}
@@ -497,7 +499,6 @@ function FileView({ file, root, path, onReload }) {
       ) : editing ? (
         <>
           <textarea
-            ref={areaRef}
             class="file-editor"
             value={draft}
             spellcheck={false}
