@@ -1006,6 +1006,21 @@ pub enum MetricsSource {
     Codex,
 }
 
+/// 画面行リストからメトリクスを抽出する（#1021）。
+///
+/// `TerminalSession::agent_metrics` は**生きたセッション**を要るので GUI 層しか呼べない。
+/// dispatch（CLI / MCP）も同じ判定を通せるように、行の列だけを受ける入口を公開する
+/// （ctx% の解決を 4 経路が同じ 1 実装で行うため）
+pub fn agent_metrics_from_lines(lines: &[String]) -> Option<AgentMetrics> {
+    parse_agent_metrics(lines)
+}
+
+/// 画面テキストからメトリクスを抽出する（#1021。dispatch は 1 本の文字列で持っている）
+pub fn agent_metrics_from_text(text: &str) -> Option<AgentMetrics> {
+    let lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    parse_agent_metrics(&lines)
+}
+
 /// 画面行リストから Claude / Codex TUI フッターのメトリクスをパースする（#357 拡張）
 fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
     // TUI のフッターは画面末尾 8 行以内にある（ステータスバー + ヒント行）
@@ -1039,6 +1054,14 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         }
         if codex_secondary.is_none() {
             codex_secondary = extract_labeled_percent(line, "secondary");
+        }
+
+        // claude の**組み込み**表示（#1021。ユーザーが statusLine を設定していない
+        // ときに出る 3 形式）。`ctx`/`context` の後ろから % を探す下の経路より**先**に
+        // 見る: `Context low (12% remaining)` を素直に読むと「12% 使用」= 残量と
+        // 使用率を取り違える（実際は 88% 使用）
+        if ctx_percent.is_none() {
+            ctx_percent = builtin_ctx_percent(line);
         }
 
         // `ctx NN%` / `context NN%` / `Context NN% used` / `Context NN% left`
@@ -1160,6 +1183,51 @@ fn exhausted_limit_window_in(lines: &[String]) -> Option<LimitWindow> {
 /// 実測の形: `  [Opus 5 (1M context) · xH]  user@example.com`。
 /// **既知のモデルファミリで始まるときだけ**採る — TUI の表示は版で変わるので、
 /// 知らない文字列をモデル名としてヘッダに出すより、何も出さないほうが良い
+/// claude の**組み込み**コンテキスト表示から使用率を読む（Issue #1021）。
+///
+/// 2.1.258 のバイナリで確認した 3 形式（ユーザーが statusLine を設定していないときの表示）:
+///
+/// ```text
+/// `${100 - pctLeft}% context used`        ← 使用率そのもの
+/// `${pctLeft}% until auto-compact`        ← 自動圧縮までの残量（使用率 = 100 - N）
+/// `Context low (${pctLeft}% remaining) …` ← 残量（使用率 = 100 - N）
+/// ```
+///
+/// いずれも **% が語の前**に来るので、`ctx`/`context` の**後ろ**から探す従来の経路では
+/// 取りこぼす（あるいは残量を使用率と誤読する）。
+///
+/// なお組み込み表示は `warn` 閾値（窓 − 33000 トークン）を超えるまで描かれないので、
+/// これが読めるのは既に文脈が切迫しているときだけ（普段は transcript 側が答える）
+fn builtin_ctx_percent(line: &str) -> Option<u32> {
+    let lower = line.to_ascii_lowercase();
+    if let Some(pct) = percent_before(&lower, "% context used") {
+        return Some(pct.min(100));
+    }
+    if let Some(pct) = percent_before(&lower, "% until auto-compact") {
+        return Some(100u32.saturating_sub(pct.min(100)));
+    }
+    if lower.contains("context low") {
+        if let Some(pct) = percent_before(&lower, "% remaining") {
+            return Some(100u32.saturating_sub(pct.min(100)));
+        }
+    }
+    None
+}
+
+/// `…NN% <語>` の NN を読む（`suffix` は `%` から始まる語で、その**直前**の数字列を採る）
+fn percent_before(lower: &str, suffix: &str) -> Option<u32> {
+    let pos = lower.find(suffix)?;
+    let digits: String = lower[..pos]
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().rev().collect::<String>().parse().ok()
+}
+
 fn extract_model_name(line: &str) -> Option<String> {
     let start = line.find('[')?;
     let rest = &line[start + 1..];
@@ -1894,6 +1962,58 @@ mod tests {
             default_locale_env(None, None, Some(OsString::from("UTF-8"))),
             None
         );
+    }
+
+    #[test]
+    fn claudeの組み込みコンテキスト表示3形式を読む() {
+        // #1021: 2.1.258 のバイナリから採った実文言。ユーザーが statusLine を
+        // 設定していないときはこの 3 形式しか出ない
+        // ① 使用率そのもの（% が "context" の**前**にあるので旧実装は取りこぼした）
+        let m = parse_agent_metrics(&["30% context used".to_string()]).unwrap();
+        assert_eq!(m.ctx_percent, Some(30));
+        // ② 自動圧縮までの残量 → 使用率は 100 - N
+        let m = parse_agent_metrics(&["15% until auto-compact".to_string()]).unwrap();
+        assert_eq!(m.ctx_percent, Some(85));
+        // ③ 残量表記（旧実装は 12% 使用と**誤読**していた。実際は 88% 使用）
+        let m = parse_agent_metrics(&[
+            "Context low (12% remaining) · Run /compact to compact & continue".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(m.ctx_percent, Some(88));
+        // ③ の区切りつき（`Context low (12% remaining) · <warning>`）
+        let m =
+            parse_agent_metrics(&["Context low (3% remaining) · Context limit reached".to_string()])
+                .unwrap();
+        assert_eq!(m.ctx_percent, Some(97));
+    }
+
+    #[test]
+    fn 組み込み表示の追加で既存のctx表記が壊れていない() {
+        // #1021 の追加が先に走るので、従来形式の回帰を明示的に固定する
+        // ユーザー statusline（この機の実物）
+        let m = parse_agent_metrics(&["  ctx  33% ███░░░░░░░".to_string()]).unwrap();
+        assert_eq!(m.ctx_percent, Some(33));
+        // codex の残量表記
+        let m = parse_agent_metrics(&["Context 40% left".to_string()]).unwrap();
+        assert_eq!(m.ctx_percent, Some(60));
+        // `Context NN% used`（% が後ろに来る形）
+        let m = parse_agent_metrics(&["Context 40% used".to_string()]).unwrap();
+        assert_eq!(m.ctx_percent, Some(40));
+        // 「remaining」を含むが `Context low` ではない行は組み込み判定に食われない
+        let m = parse_agent_metrics(&["ctx 20% · 80% remaining".to_string()]).unwrap();
+        assert_eq!(m.ctx_percent, Some(20));
+    }
+
+    #[test]
+    fn 行の列から公開の入口でも同じ結果になる() {
+        // #1021: dispatch は `agent_metrics_from_*` を通る。セッション経由と同値であること
+        let lines = vec!["  ctx  41% ████░░░░░░".to_string(), "  5h   76%".to_string()];
+        let via_lines = agent_metrics_from_lines(&lines).unwrap();
+        let via_text = agent_metrics_from_text(&lines.join("\n")).unwrap();
+        assert_eq!(via_lines.ctx_percent, Some(41));
+        assert_eq!(via_text.ctx_percent, via_lines.ctx_percent);
+        assert_eq!(via_text.limit_5h, via_lines.limit_5h);
+        assert!(agent_metrics_from_text("").is_none());
     }
 
     #[test]
