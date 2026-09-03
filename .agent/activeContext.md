@@ -47,10 +47,11 @@
 
 ## Windows 実機まわり（要点。全文は plan の各記録節）
 
-- **実機セルフテストは #1073 で完走を復旧**（`TAKO_APP_SELF_TEST_OK` / exit 0）。
-  **停止は世代差ではなく起動の仕方の差**で、`TAKO_ISOLATED=1` を落とすと data dir が
-  本番になり項目 41 / 41b（OSC 7 / 133）が走る = 隔離時は skip。A/B は env まで揃える
-  （どちらだったかは skip 行の `script=` が `tako-iso-data-<pid>` かで分かる）
+- **#1073 で壁 2 つを潰し両モードとも項目 133 まで到達**（41 = 固定待ち × 側路 2 秒 tick +
+  cwd の区切り / 97・99 = 画面の `tako <sub>` リテラル = #967）。**停止は世代差ではなく
+  起動の仕方の差**で、`TAKO_ISOLATED=1` を落とすと data dir が本番になり項目 41 / 41b
+  （OSC 7 / 133）が走る = 隔離時は skip。A/B は env まで揃える（どちらだったかは
+  skip 行の `script=` が `tako-iso-data-<pid>` かで分かる）。壁 3 = 133 (d) は調査中
 - **`load=unknown` は解消**（境界 `platform::sysload` = B25。Windows は `load=cpu14%/12cpu`）
 - 実機テストのベースラインは
   **2026-09-02 に取り直して 21 件**（失敗名まで照合。plan「後続 worker への引き継ぎ」節の表。
