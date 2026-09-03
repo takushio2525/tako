@@ -1,8 +1,25 @@
 //! stale_binary — 長生きセッションの claude バイナリ鮮度検知（Issue #498）
 //!
 //! ペイン生成時に解決した claude の実バイナリパスを記録し、稼働中プロセスは
-//! libproc `proc_pidpath` で取得、`~/.local/bin/claude` の現在の解決先と突き合わせる。
+//! 境界 B5（[`tako_core::platform::procinfo::image_path`]）で取得、
+//! `~/.local/bin/claude` の現在の解決先と突き合わせる。
 //! 差異があれば stale と判定し、UI バナー + CLI/MCP で通知・張り直しを提供する。
+//!
+//! ## 「差異」の形が OS で違う（#936）
+//!
+//! - macOS: ランチャは **symlink** で、`proc_pidpath` は実体（`versions/<版>`）を
+//!   返す。自己更新は symlink の張り替えなので、**解決先のパスが変わる**
+//! - Windows: ランチャは `…\.local\bin\claude.exe` の**実体のコピー**
+//!   （実測 2026-09-04: symlink でもハードリンクでもなく、`versions\<版>` と
+//!   バイト一致する別ファイル）。自己更新は
+//!   **旧 exe を `claude.exe.old.<ts>` へ改名 → 新 exe を同じ名前で設置**なので、
+//!   古いプロセスの実行ファイルパスが `…\claude.exe.old.<ts>` へ変わる
+//!   （`QueryFullProcessImageNameW` が改名を反映する = 実測）。**比較の形は
+//!   両 OS で同じ**（実行中のパス ≠ 現在のパス）まま成立する
+//!
+//! どちらも比較する 2 つのパスを**同じ正規化**で作らないと成り立たない。
+//! 現在側は [`tako_core::platform::path::canonicalize`]（verbatim prefix を
+//! 剥がす。#970）を通し、実行中側は境界が Win32 形式で返す
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -67,10 +84,15 @@ pub fn resolve_current_claude_binary() -> Option<PathBuf> {
     Some(path)
 }
 
-/// `claude` コマンドの symlink 先を実パスまで解決する
+/// `claude` コマンドの symlink 先を実パスまで解決する。
+///
+/// **境界（B26）を通す**: Windows の素の `canonicalize` は verbatim 形式
+/// （`\\?\C:\…`）を返すが、突き合わせ相手の
+/// [`tako_core::platform::procinfo::image_path`] は Win32 形式なので、
+/// 剥がさないと**どのペインも常に stale** になる（#970 / #936）
 fn resolve_claude_symlink() -> Option<PathBuf> {
     // canonicalize で symlink チェーンを完全解決
-    std::fs::canonicalize(launcher_path()?).ok()
+    tako_core::platform::path::canonicalize(&launcher_path()?).ok()
 }
 
 /// PATH 上の `claude` ランチャ（symlink は解決しない）を探す。
@@ -99,23 +121,13 @@ const CLAUDE_BIN: &str = "claude.exe";
 #[cfg(not(windows))]
 const CLAUDE_BIN: &str = "claude";
 
-/// 実行可能な通常ファイルか（symlink は追う = `which` と同じ判定）
+/// 実行可能な通常ファイルか（symlink は追う = `which` と同じ判定）。
+///
+/// #936: 旧実装は非 unix で**無条件 `true`** を返していた（実行ビットという概念が
+/// 無いので判定を書けなかった）。判定材料が OS で変わるので境界 B16 へ寄せた
+/// （Windows は拡張子が `PATHEXT` に在るか）
 fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    tako_core::platform::exe::is_executable_file(path)
 }
 
 /// 上の PATH 走査で見つからなかったときの保険。境界 B16
@@ -136,29 +148,67 @@ fn which_claude() -> Option<PathBuf> {
 /// バイナリパスからバージョンを推定する。
 /// Claude CLI は `~/.local/share/claude/versions/<version>`（新）または
 /// `~/.claude/local/claude-cli-<version>/claude`（旧）の構造。
-/// パスに version が含まれていなければ `claude --version` にフォールバック
+///
+/// パスに版が無ければ **実行ファイルの版リソース**（Windows の exe だけが持つ）→
+/// `claude --version` の順に落ちる。Windows のランチャは実体のコピーで
+/// パスに版が入らないので、版リソースが無いと 253MB の実行ファイルを
+/// 定期走査のたびに起こすことになる（#936）
 pub fn extract_version_from_path(path: &Path) -> String {
-    let path_str = path.to_string_lossy();
-    // 新形式: .../versions/2.1.220
-    if let Some(start) = path_str.find("/versions/") {
-        let rest = &path_str[start + "/versions/".len()..];
-        let ver = rest.split('/').next().unwrap_or("");
-        if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            return ver.to_string();
-        }
+    if let Some(version) = version_from_segments(&path_segments(path)) {
+        return version;
     }
-    // 旧形式: .../claude-cli-2.1.220/claude
-    if let Some(start) = path_str.find("claude-cli-") {
-        let rest = &path_str[start + "claude-cli-".len()..];
-        if let Some(end) = rest.find('/') {
-            let ver = &rest[..end];
-            if !ver.is_empty() {
-                return ver.to_string();
-            }
-        }
+    // Windows の exe は版をリソースとして持つ（`claude.exe` = `FileVersion 2.1.247.0`）。
+    // あちらのランチャは symlink ではなく実体のコピーなのでパスから版が読めず、
+    // これが無いと必ず `claude --version` の起動へ落ちる（#936）
+    if let Some(version) = tako_core::platform::exe::file_version(path) {
+        return version;
     }
     // フォールバック: claude --version（重いので最終手段）
     extract_version_via_cli(path)
+}
+
+/// パスを「区切りで割った成分」へ落とす。
+///
+/// **`/` と `\` の両方を区切りとして扱う**（`Path::components` は使わない）:
+/// Windows の実パスは `…\versions\2.1.220` なので、components だと macOS からは
+/// 1 成分に見えて **Windows 形の入力を macOS 上で検査できない**（#515 / #913 と
+/// 同じ「プラットフォームで分岐せず macOS から Windows 形を通す」方針）。
+/// unix のファイル名に `\` を含められる余地は残るが、影響は版の表示だけ
+fn path_segments(path: &Path) -> Vec<String> {
+    path.to_string_lossy()
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 成分列から版を読む（純粋関数）。読めなければ `None`
+fn version_from_segments(segments: &[String]) -> Option<String> {
+    // 新形式: .../versions/2.1.220（`versions` の**次の成分**が版。
+    // Windows は `versions\2.1.220` が実行ファイル自身 = 実測）
+    for (index, segment) in segments.iter().enumerate() {
+        if segment != "versions" {
+            continue;
+        }
+        // `versions` が末尾なら版は書かれていない（`?` で抜けると旧形式の判定まで飛ぶ）
+        let Some(next) = segments.get(index + 1) else {
+            continue;
+        };
+        if next.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return Some(next.clone());
+        }
+    }
+    // 旧形式: .../claude-cli-2.1.220/claude（版はディレクトリ名なので
+    // **末尾の成分では無い**ことまで見る = `claude-cli-wrapper` を版と読まない）
+    for (index, segment) in segments.iter().enumerate() {
+        let Some(version) = segment.strip_prefix("claude-cli-") else {
+            continue;
+        };
+        if !version.is_empty() && index + 1 < segments.len() {
+            return Some(version.to_string());
+        }
+    }
+    None
 }
 
 fn extract_version_via_cli(binary: &Path) -> String {
@@ -179,23 +229,13 @@ fn extract_version_via_cli(binary: &Path) -> String {
     .unwrap_or_default()
 }
 
-/// 稼働中プロセスのバイナリパスを `proc_pidpath` で取得する（macOS のみ）
-#[cfg(target_os = "macos")]
+/// 稼働中プロセスのバイナリパスを取得する。
+///
+/// #936: 旧実装は macOS の `proc_pidpath` と Linux の `/proc/<pid>/exe` だけで、
+/// **Windows は常に `None`** = 実行中の claude を特定できないので警告が出なかった。
+/// 判定材料が OS で変わるので境界 B5（[`tako_core::platform::procinfo::image_path`]）へ寄せた
 pub fn pidpath(pid: u32) -> Option<PathBuf> {
-    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    let ret = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    if ret <= 0 {
-        return None;
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(ret as usize);
-    let s = std::str::from_utf8(&buf[..len]).ok()?;
-    Some(PathBuf::from(s))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn pidpath(pid: u32) -> Option<PathBuf> {
-    // Linux: /proc/<pid>/exe
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    tako_core::platform::procinfo::image_path(pid)
 }
 
 /// ペインの stale 状態を判定する
@@ -235,8 +275,9 @@ pub fn find_claude_pid_for_backend(backend_session: &str) -> Option<u32> {
 /// 与えられた pid 集合の中から、実行ファイルが `needle` を含むものを探す（#1067）。
 ///
 /// [`find_claude_pid`] の一般形（`needle = "claude"` が従来の挙動）。
-/// **判定材料は 2 通り**: macOS は `proc_pidpath`（`ProcessSnapshot` の argv は
-/// `platform::procinfo` 経路では空になる）、それが取れない環境ではコマンド行を見る
+/// **判定材料は 2 通り**: まず実行ファイルのパス（`ProcessSnapshot` の argv は
+/// `platform::procinfo` 経路では空になるので Windows はこちらだけ）、
+/// それが取れない環境ではコマンド行を見る
 pub fn find_agent_pid_among(
     snapshot: &crate::agents::ProcessSnapshot,
     pids: &[u32],
@@ -312,7 +353,8 @@ pub fn current_binary_fingerprint() -> Option<BinaryFingerprint> {
 
 /// 指定したランチャの指紋を取る（テストで偽 claude を差し込むための入口）
 pub fn fingerprint_of(launcher: &Path) -> Option<BinaryFingerprint> {
-    let binary = std::fs::canonicalize(launcher).ok()?;
+    // 境界（B26）を通す = `pidpath` 側と同じ正規化。#970 / #936
+    let binary = tako_core::platform::path::canonicalize(launcher).ok()?;
     let meta = std::fs::metadata(&binary).ok();
     Some(BinaryFingerprint {
         mtime: meta.as_ref().and_then(|m| m.modified().ok()),
@@ -482,11 +524,76 @@ mod tests {
         let path_new = PathBuf::from("/Users/user/.local/share/claude/versions/2.1.220");
         assert_eq!(extract_version_from_path(&path_new), "2.1.220");
 
-        let path2 = PathBuf::from("/usr/local/bin/claude");
-        // PATH 上のバイナリではバージョン抽出できない（CLI フォールバック）
-        let ver = extract_version_from_path(&path2);
-        // 実行環境では claude が存在しないため空文字列
-        assert!(ver.is_empty() || !ver.is_empty());
+        // パスに版が無く、実体も無いので CLI フォールバックも空を返す
+        let unknown = std::env::temp_dir().join("tako-936-no-such-claude");
+        assert_eq!(extract_version_from_path(&unknown), "");
+    }
+
+    /// **#936: Windows 形のパスを macOS から検査する**。`Path::components` で
+    /// 割ると `C:\…\versions\2.1.220` は macOS 上で 1 成分に見えるため、
+    /// 区切りは `/` と `\` の両方を見る実装になっている
+    #[test]
+    fn windows形のパスからも版を読む() {
+        // 新形式（実測: Windows は `versions\<版>` が実行ファイル自身）
+        let new_form = [
+            r"C:\Users\winuser\.local\share\claude\versions\2.1.247",
+            r"C:\Users\winuser\.local\share\claude\versions\2.1.247\claude.exe",
+        ];
+        for path in new_form {
+            assert_eq!(
+                version_from_segments(&path_segments(Path::new(path))).as_deref(),
+                Some("2.1.247"),
+                "{path}"
+            );
+        }
+        // 旧形式
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new(
+                r"C:\Users\winuser\.claude\local\claude-cli-2.1.220\claude.exe"
+            )))
+            .as_deref(),
+            Some("2.1.220")
+        );
+        // Windows のランチャは実体のコピーなので版が書かれていない
+        // （版リソース → CLI の順で落ちる）
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new(
+                r"C:\Users\winuser\.local\bin\claude.exe"
+            ))),
+            None
+        );
+        // 自己更新で改名された旧 exe も同じ（実測の名前の形）
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new(
+                r"C:\Users\winuser\.local\bin\claude.exe.old.1787816114562"
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn 版と紛らわしい成分を版と読まない() {
+        // `versions` が末尾 = 版が書かれていない
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new("/opt/claude/versions"))),
+            None
+        );
+        // 数字始まりでない成分は版ではない（`current` 等の別名）
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new("/opt/claude/versions/current"))),
+            None
+        );
+        // `foo-versions` は `versions` ではない（旧実装は `/versions/` の
+        // 部分一致だったので、`/x/versions/…` 以外は同じ結果になる）
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new("/opt/old-versions/2.1.220"))),
+            None
+        );
+        // `claude-cli-` が末尾成分なら版ディレクトリではない
+        assert_eq!(
+            version_from_segments(&path_segments(Path::new("/opt/bin/claude-cli-wrapper"))),
+            None
+        );
     }
 
     #[test]
@@ -666,11 +773,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tako-stale-772-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("テスト用ディレクトリ");
-        // 実行ビット無し（拾わない）
+        // 実行できないファイル（拾わない）。**名前は両 OS で成立する形にする**:
+        // unix は実行ビットが無いから、Windows は拡張子が `PATHEXT` に無いから
+        // 落ちる（`claude.exe.old.<ts>` は claude の自己更新が残す実際の名前 = 実測）。
+        // `CLAUDE_BIN` そのままだと Windows では `.exe` = 実行できる判定になる（#936）
         let plain = root.join("bin-plain");
         std::fs::create_dir_all(&plain).unwrap();
-        std::fs::write(plain.join(CLAUDE_BIN), b"#!/bin/sh\n").unwrap();
-        assert!(!is_executable_file(&plain.join(CLAUDE_BIN)));
+        let stale = plain.join(format!("{CLAUDE_BIN}.old.1787816114562"));
+        std::fs::write(&stale, b"#!/bin/sh\n").unwrap();
+        assert!(!is_executable_file(&stale));
         // 実行ビットあり（拾う）
         let exec = root.join("bin-exec");
         std::fs::create_dir_all(&exec).unwrap();

@@ -24687,6 +24687,103 @@ mod self_test {
         let _ = any.update(cx, |_, w, cx| w.draw(cx).clear());
     }
 
+    /// **節が撮る場面を節の頭で自分で作る**（#1083 / #948）。
+    ///
+    /// 全節実行（`TAKO_VISUAL_ONLY` 未設定）は 1 プロセスで節を順に回すので、
+    /// 前の節が残したペイン・その出力・ツリーのルート（節の最後に削除された
+    /// fixture を指したまま）がそのまま次の節の画面へ載る。#1083 の実測では
+    /// ちらつき節の `idle-4pane` が単独 `terminals=4 distinct=1 changed=0` に対し
+    /// 全節 `terminals=7 distinct=67 changed=72` で**必ず**落ちていた。
+    ///
+    /// **節の並びでは直さない**（順序を変えても「前の節が汚す」構造は残り、
+    /// 節が増えるたび再発する）。新しいタブ（素のシェル 1 枚）へ移ってから残りの
+    /// タブを全部閉じるので、どの順で回しても同じ場面から始まる。
+    /// **最後のタブは閉じられない**（`close_tab` が `LastTab` を返し UI 層が
+    /// アプリを終了させる）ので、**新しいタブを作ってから**残りを閉じる。
+    ///
+    /// 返り値は素のシェルのペイン。用意した前提そのものも `check` で見る
+    /// （前提が崩れたときに「検査対象が壊れた」と読み違えないため）
+    #[cfg(feature = "visual-test")]
+    async fn ensure_fresh_scene(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+    ) -> PaneId {
+        let fresh = window
+            .update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::TabNew {
+                        title: None,
+                        focus: Some(true),
+                        cwd: None,
+                    },
+                    PaneOrigin::User,
+                );
+                // dispatch は PTY 起動を `pending_attach` へ積むだけなので、
+                // 製品経路（#1023 の `attach_pending_sessions`）と同じ後始末で起こす
+                let _ = app.attach_pending_sessions(cx);
+                let keep = app.workspace.active_tab().id();
+                let others: Vec<TabId> = app
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .map(|t| t.id())
+                    .filter(|id| *id != keep)
+                    .collect();
+                for tab in others {
+                    app.remove_tab(tab, cx);
+                }
+                // ツリーのルートは前の節の fixture（節の最後に削除済み）を指したままに
+                // なりうる。本番と同じ経路（ペインの cwd）で作り直す
+                app.sync_filetree_roots();
+                cx.notify();
+                app.workspace.active_tab().tree().focused()
+            })
+            .expect("visual-test 前提づくりの素のタブ");
+        // プロンプトが出るまでを**状態で**待つ（#796）。固定待ちだと負荷や
+        // `visual-test` の leak-detection で数割遅くなるだけで撮影窓へずれ込む
+        wait_for_pane_ready(window, cx, fresh, Duration::from_secs(15)).await;
+        let (tabs, terms) = window
+            .update(cx, |app, _, _| {
+                (app.workspace.tabs().len(), app.terminals.len())
+            })
+            .unwrap_or((0, 0));
+        let pane = fresh.as_u64();
+        println!("TAKO_VISUAL_PIXEL: {label} premise tabs={tabs} terminals={terms} pane={pane}");
+        // タブ枚数とペイン枚数は**別の `check`** にする: 積み上げると
+        // 「どちらが崩れたか」が出力から確定できない（conventions.md）
+        check(
+            tabs == 1,
+            &format!("visual-test {label}: 節の頭でタブが 1 枚だけになる (#1083)"),
+        );
+        check(
+            terms == 1,
+            &format!("visual-test {label}: 節の頭で端末が 1 枚だけになる (#1083)"),
+        );
+        fresh
+    }
+
+    /// **その節が全節実行の並びに本当に載っているか**を A/B で確かめる注入口（#948）。
+    ///
+    /// `TAKO_948_INJECT=<節名>`（`,` 区切りで複数可）を付けると、その節が入り口で
+    /// 必ず失敗する。全節実行がその名前で FAILED になれば「実行経路に載っている」証拠、
+    /// 何も起きなければ**呼ばれていない**（= #948 の症状そのもの）。
+    ///
+    /// 節を足したのに全節実行から呼び忘れる形は grep では気づきにくい
+    /// （`TAKO_VISUAL_ONLY` の腕にも同じ呼び出しがあるので件数では判別できない）
+    #[cfg(feature = "visual-test")]
+    fn inject_section_failure(label: &str) {
+        let Ok(want) = std::env::var("TAKO_948_INJECT") else {
+            return;
+        };
+        if want.split(',').any(|s| s.trim() == label) {
+            fail(&format!(
+                "visual-test {label}: 注入した失敗（TAKO_948_INJECT。#948）"
+            ));
+        }
+    }
+
     /// 外部（Finder 等）からのファイル D&D を**実 OS と同じ経路**で流す（#1043）。
     ///
     /// gpui は `FileDropEvent` を `dispatch_event` の中で `active_drag` +
@@ -28707,6 +28804,11 @@ mod self_test {
         window: WindowHandle<TakoApp>,
         cx: &mut AsyncApp,
     ) {
+        // #948: この節は `TAKO_VISUAL_ONLY` の腕からだけでなく**全節実行の並び**にも
+        // 載っている。測る前にペインへ fixture を打ち込むので、前の節の
+        // ペインが実行中だと打鍵が届かず `TAKO_VISUAL_SKIPPED` で素通りしていた
+        inject_section_failure("screen-lines");
+        ensure_fresh_scene(window, cx, "screen-lines").await;
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
 
@@ -29393,6 +29495,12 @@ mod self_test {
         cx: &mut AsyncApp,
     ) {
         use tako_core::remote_fs::{RemoteEntry, RemoteFolder, RemoteKind, RemoteRef};
+
+        // #948: この節は `TAKO_VISUAL_ONLY` の腕からだけでなく**全節実行の並び**にも
+        // 載っている。ローカルルートはペインの cwd から作られるので、前の節の
+        // ペインが増えているとリモートの行が画面外へ押し出され**バッジが 1 px も出ない**
+        inject_section_failure("remote-tree");
+        ensure_fresh_scene(window, cx, "remote-tree").await;
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
         let root = RemoteRef::new("visualhost", "/srv/app");
@@ -29770,6 +29878,11 @@ mod self_test {
         window: WindowHandle<TakoApp>,
         cx: &mut AsyncApp,
     ) {
+        // #948: この節は `TAKO_VISUAL_ONLY` の腕からだけでなく**全節実行の並び**にも
+        // 載っている。フォーカス中のペインを分割してプレビューを開くので、
+        // 前の節のペインが残っていると分割先が細くなり実ピクセルの測定が崩れる
+        inject_section_failure("preview-code");
+        ensure_fresh_scene(window, cx, "preview-code").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-code-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test code 一時ディレクトリ");
@@ -30691,71 +30804,11 @@ mod self_test {
             })
             .ok();
 
-        // #1083: **この節が撮る場面は自分で作る**。ラウンド 1〜2 は「素のシェル 1 枚」と
-        // 「そこから 3 分割した 4 ペイン」の静止画面を見るのに、全節実行では前の節
-        // （`terminal_grid` / `markdown_preview` / `chat_table` / `conflict_card` /
-        // `ime_preedit` / ツリーガイド）が残したペインと**その出力**が同じ画面に載る。
-        // 実測（#1083）: 単独実行の `terminals=4 distinct=1 changed=0` に対し、全節実行は
-        // `terminals=7 distinct=67 changed=72` で**必ず**落ちていた（= 節の実行順への依存。
-        // 節が増えるたび再発する）。新しいタブ（素のシェル 1 枚）へ移ってから残りのタブを
-        // 全部閉じ、どの順で回っても同じ場面から始める。旧挙動は `TAKO_1083_LEGACY=1`
+        // ラウンド 1〜2 は「素のシェル 1 枚」と「そこから 3 分割した 4 ペイン」の
+        // 静止画面を見るので、**撮る場面は自分で作る**（#1083。理由と実測は
+        // `ensure_fresh_scene` の doc）。旧挙動は `TAKO_1083_LEGACY=1`
         if std::env::var_os("TAKO_1083_LEGACY").is_none() {
-            let fresh = window
-                .update(cx, |app, _, cx| {
-                    let _ = tako_control::dispatch(
-                        app,
-                        tako_control::protocol::Request::TabNew {
-                            title: None,
-                            focus: Some(true),
-                            cwd: None,
-                        },
-                        PaneOrigin::User,
-                    );
-                    drain(app, cx);
-                    // **新しいタブを作ってから**閉じる。最後のタブを閉じると
-                    // `close_tab` が `LastTab` を返し、UI 層がアプリを終了させる
-                    let keep = app.workspace.active_tab().id();
-                    let others: Vec<TabId> = app
-                        .workspace
-                        .tabs()
-                        .iter()
-                        .map(|t| t.id())
-                        .filter(|id| *id != keep)
-                        .collect();
-                    for tab in others {
-                        app.remove_tab(tab, cx);
-                    }
-                    // ツリーのルートは前の節の fixture（節の最後に削除済み）を指したままに
-                    // なりうる。本番と同じ経路（ペインの cwd）で作り直す
-                    app.sync_filetree_roots();
-                    cx.notify();
-                    app.workspace.active_tab().tree().focused()
-                })
-                .expect("flicker: 前提づくりの素のタブ");
-            // プロンプトが出るまでを**状態で待つ**（#796）。固定待ちだと負荷や
-            // `visual-test` の leak-detection で数割遅くなるだけで撮影窓へずれ込む
-            wait_for_pane_ready(window, cx, fresh, Duration::from_secs(15)).await;
-            let (tabs0, terms0) = window
-                .update(cx, |app, _, _| {
-                    (app.workspace.tabs().len(), app.terminals.len())
-                })
-                .unwrap_or((0, 0));
-            println!(
-                "TAKO_VISUAL_PIXEL: flicker premise tabs={tabs0} terminals={terms0} \
-                 pane={}",
-                fresh.as_u64()
-            );
-            // 前提そのものを機械検証する（節の実行順に依らず素の 1 枚から始まる）。
-            // タブ枚数とペイン枚数は**別の check** にする: 積み上げると
-            // 「どちらが崩れたか」が出力から確定できない（conventions.md）
-            check(
-                tabs0 == 1,
-                "visual-test ちらつき: 節の頭でタブが 1 枚だけになる (#1083)",
-            );
-            check(
-                terms0 == 1,
-                "visual-test ちらつき: 節の頭で端末が 1 枚だけになる (#1083)",
-            );
+            ensure_fresh_scene(window, cx, "flicker").await;
         }
 
         // --- ラウンド 1: 起動直後の 1 ペイン（静止） ---
@@ -34284,6 +34337,26 @@ mod self_test {
             // 実データ規模（アカウント複数・プロジェクト複数・全項目表示）で開き、
             // **実際に描かれた矩形**（絶対配置 canvas で記録）から重なり・食み出しを数える
             profiles_form_visual(window, cx).await;
+
+            // ここから 3 節は #948 で全節実行の並びへ入れたもの（それまで
+            // `TAKO_VISUAL_ONLY` の腕からしか呼ばれておらず、節指定なしの「最終確認」で
+            // **一度も走っていなかった**。#1072 が全節実行をすり抜けた理由でもある）。
+            // **flicker の直前に固めて置く**: どれも `ensure_fresh_scene` で自分の場面を
+            // 作るので前の節には依らず、後ろは自分でも場面を作り直す flicker だけなので
+            // 「後続の節を汚す」経路が構造的に無い（#1083 の規約）。
+            // 個々の節が本当にここを通っているかは `TAKO_948_INJECT=<節名>` で確かめられる
+
+            // #821: コードプレビューの仮想化で見た目と操作が変わらないか
+            // （実ピクセル + 可視範囲をまたぐドラッグ選択とコピー）
+            preview_code_visual(any, window, cx).await;
+
+            // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
+            // 追従するか（タブツリーのホバープレビューで測る）
+            screen_lines_visual(any, window, cx).await;
+
+            // #919 / #976 / #1041: リモートフォルダがツリーへどう並ぶか
+            // （ローカルの後ろ / 明示は先頭 / 切断バッジ）を実ピクセルで見る
+            remote_tree_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
@@ -51428,6 +51501,16 @@ mod self_test {
                     let _ = std::fs::remove_dir_all(&root);
                 }
             }
+            // 何が無いから走らないかを残す（#865 の作法）。項目 103 の場面作りは
+            // symlink のランチャと POSIX シェルの器（`sh -c "… & wait"`）に依っている。
+            // Windows のランチャは実体のコピーで、symlink 作成には既定で特権が要る。
+            // 判定そのもの（`pidpath` / 版の読み取り / 実行ファイル判定）は #936 で
+            // 境界へ寄せ、`cargo test` の単体（両プラットフォームで走る）が見ている
+            #[cfg(not(unix))]
+            println!(
+                "TAKO_SELF_TEST_SKIPPED: 103（場面作りが symlink と POSIX シェルの器に依る。\
+                 判定は procinfo::image_path / exe::is_executable_file の単体で検証。#936）"
+            );
 
             // 104. タブ × close の発生源マーカー（#770）。
             // 実地では「プレビュー混在タブが再起動で消えた」と報告されたが、実体は
