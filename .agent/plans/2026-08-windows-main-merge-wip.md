@@ -3755,6 +3755,21 @@ Windows で `load` が採れることを実機が保証する / `file_uri` 2 本
 番犬 4 本）。tako-core の failed が 14 → 13 に減っているが、passed も 1266 → 1314 と
 増えている（main が 9/2 から進んでいる）ので**この PR に帰せられる差ではない**。
 
+### 次に実機を触る人への申し送り（#1090 / #1091 の着手用）
+
+- **証拠と道具は `<実機の dev>\tako-evidence-1073\` に残してある**（リポの外）:
+  `run-selftest.ps1` / `run-selftest.cmd`（arm 名と mode を `arm.txt` / `mode.txt` から
+  読む形にしてある = `schtasks /run` が引数を渡せないため）/ `build.cmd` / `test.cmd` /
+  各 run のログ（`st-<arm>-out.log`）/ ssh の A/B（`ssh-cm.log` / `ssh-timing.log`）
+- **scheduled task は消してある**。作り直すのは 1 行:
+  `schtasks /create /tn tako1073 /tr "<evidence>\run-selftest.cmd" /sc once /st 23:58 /it /f`
+- worktree `tako-wt-1073` は残してある（`git fetch` + `checkout` で任意の head へ切り替えて
+  `build.cmd` → `run-selftest` の 2 手で回せる）
+- **`Start-Process -RedirectStandardOutput` でも進捗は見える**（Issue の「4 行しか出ない」は
+  再現しなかった。ログはインクリメンタルに書かれた）
+- **対話 ssh を SSH セッションから直に叩くと固まる**（`-n` を付けないと stdin を読もうとする）。
+  ssh の挙動を測るときは `-n` を付け、`Invoke-CimMethod` で切り離してログへ書かせる
+
 ### macOS 側で観測した #1062 のフレーク（この変更とは無関係）
 
 同じバイナリ・同じレシピで 2 本取ったところ、1 本目だけ項目 137 (d)（#1040）で落ちた:
