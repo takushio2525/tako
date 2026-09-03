@@ -179,9 +179,12 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // ペイン固有の環境変数を tmux new-session -e で直接注入する（tmux 3.2+）。
     // tmux サーバーのグローバル環境は最初のクライアントから継承され、後続セッションも
     // その stale な値を使う。-e はセッション作成時に値を確定させるため、
-    // シェル起動後の set-environment（タイミング問題）やクライアント環境の継承に依存しない
+    // シェル起動後の set-environment（タイミング問題）やクライアント環境の継承に依存しない。
+    // **シェル統合の置き場（ZDOTDIR 等）もここに含める**（#1105）: 含めないと、同じ
+    // socket 名に別インスタンスのサーバーが残っているときに前のインスタンスの
+    // 置き場を指し、OSC 7 / 133 が一切届かなくなる（cwd 追従とコマンド状態が黙って死ぬ）
     for (key, val) in &options.env {
-        if crate::backend::PANE_SCOPED_ENV.contains(&key.as_str()) {
+        if crate::backend::session_pinned_env(key) {
             args.push("-e".to_string());
             args.push(format!("{key}={val}"));
         }

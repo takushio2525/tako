@@ -138,6 +138,20 @@ pub const PANE_SCOPED_ENV: &[&str] = &[
     crate::osc_sink::SINK_ENV,
 ];
 
+/// 器のセッションを作るときに `-e` で**値を確定させる**キーか。
+///
+/// 器のサーバーのグローバル環境は**最初のクライアントから継承**され、後続セッションも
+/// その stale な値を使う。だから「呼び出し元プロセスごとに違う値」は、継承に任せず
+/// セッション作成時に固定しないと**別インスタンスの値**が見えてしまう。該当は 2 種:
+///
+/// - **ペインごとに違う**（[`PANE_SCOPED_ENV`]）: pane / tab の ID と #766 の側路の書き先
+/// - **インスタンスごとに違う**（[`crate::shell_integration::INJECTED_KEYS`]）:
+///   シェル統合の置き場（data dir 配下）。#1105 まで継承任せだったので、同じ socket 名に
+///   別インスタンスのサーバーが残っていると OSC 7 / 133 が黙って届かなくなっていた
+pub fn session_pinned_env(key: &str) -> bool {
+    PANE_SCOPED_ENV.contains(&key) || crate::shell_integration::INJECTED_KEYS.contains(&key)
+}
+
 /// バックエンドの能力。
 ///
 /// **bool の集合であって `enum Backend { Tmux, None }` ではない**のが重要。
@@ -906,6 +920,25 @@ mod pane_scoped_env_tests {
         assert!(PANE_SCOPED_ENV.contains(&crate::osc_sink::SINK_ENV));
         assert!(PANE_SCOPED_ENV.contains(&"TAKO_PANE_ID"));
         assert!(PANE_SCOPED_ENV.contains(&"TAKO_TAB_ID"));
+        for key in PANE_SCOPED_ENV {
+            assert!(session_pinned_env(key), "{key} が固定対象から外れている");
+        }
+    }
+
+    /// #1105: シェル統合の置き場はインスタンスごとに違うので、継承に任せると
+    /// 同じ socket 名に残った**別インスタンスのサーバー**の値が見えて
+    /// OSC 7 / 133 が一切届かなくなる（cwd 追従とコマンド状態が黙って死ぬ）
+    #[test]
+    fn シェル統合の置き場もセッション作成時に固定される() {
+        for key in crate::shell_integration::INJECTED_KEYS {
+            assert!(
+                session_pinned_env(key),
+                "{key} が `-e` で固定されない（器のサーバーの stale な値を見る）"
+            );
+        }
+        // 無関係なキーは固定しない（ペインの環境を必要以上に汚さない）
+        assert!(!session_pinned_env("PATH"));
+        assert!(!session_pinned_env("HOME"));
     }
 
     /// 表を引く側が tmux / psmux の両方であること（片方だけ足すと
@@ -917,8 +950,8 @@ mod pane_scoped_env_tests {
             ("backend/psmux.rs", include_str!("psmux.rs")),
         ] {
             assert!(
-                src.contains("PANE_SCOPED_ENV.contains("),
-                "{name} が PANE_SCOPED_ENV を引いていない（キーの直書きへ戻っている）"
+                src.contains("session_pinned_env("),
+                "{name} が session_pinned_env を引いていない（キーの直書きへ戻っている）"
             );
             assert!(
                 !src.contains(r#"key == "TAKO_PANE_ID""#),

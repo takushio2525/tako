@@ -212,6 +212,29 @@ pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
 
 /// セッションの存在確認（`has-session`、1 コマンド）。
 /// `list_sessions`（3 コマンド）よりはるかに軽量
+/// 器のセッション / サーバーが持つ環境変数の値（診断用。#1105）。
+///
+/// `session` が `None` なら**サーバーのグローバル環境** = 最初のクライアントから
+/// 継承した値。`Some(name)` ならそのセッションに `-e` で固定された値。
+/// 「シェル統合が届いていない」を「何が無いか」で言えるようにするための窓口で、
+/// 判定には使わない（判定の正は `backend::session_pinned_env` 側の固定）
+pub fn show_environment(socket: Option<&str>, session: Option<&str>, name: &str) -> Option<String> {
+    let mut args = vec!["show-environment"];
+    match session {
+        Some(s) => {
+            args.push("-t");
+            args.push(s);
+        }
+        None => args.push("-g"),
+    }
+    args.push(name);
+    let out = run_tmux(socket, &args).ok()?;
+    // `NAME=value` / 未設定は `-NAME`（あるいは `unknown variable: NAME` で Err）
+    out.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        .map(|v| v.to_string())
+}
+
 pub fn has_session(socket: Option<&str>, name: &str) -> bool {
     run_tmux(socket, &["has-session", "-t", &exact_target(name)]).is_ok()
 }

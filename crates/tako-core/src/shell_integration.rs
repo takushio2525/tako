@@ -52,6 +52,30 @@ fn cli_file_name() -> String {
 }
 
 /// spawn する子シェルに注入する統合用環境変数。プロセス内で一度だけ書き出して使い回す
+/// 統合が spawn 時に撒く環境変数の**名前**（値は data dir 配下なのでインスタンスごとに
+/// 変わるが、名前は固定）。
+///
+/// #1105: 器（tmux / psmux）のサーバーは**最初のクライアントの環境を引き継ぎ**、後続の
+/// セッションもその stale な値を見る（実測: `ZDOTDIR=A` で起動したサーバー上に
+/// `ZDOTDIR=B` のプロセスからセッションを作ると、中のシェルは A を見る）。
+/// つまり同じ socket 名に**別インスタンスのサーバー**が残っていると、シェル統合は
+/// 前のインスタンスの（消えているかもしれない）置き場を指し、OSC 7 / 133 が
+/// 一切届かなくなる = cwd 追従とコマンド状態が黙って死ぬ。
+/// これを避けるため、器はこの名前のぶんを `-e` でセッション作成時に固定する
+/// （[`crate::backend::session_pinned_env`]）。
+///
+/// Windows は `$PROFILE` 経由で spawn 時の注入が無いので、この表は POSIX 側だけを指す
+/// （名前が載っていても `options.env` に無ければ何も起きない）
+pub const INJECTED_KEYS: &[&str] = &[
+    // zsh
+    "ZDOTDIR",
+    "TAKO_ORIG_ZDOTDIR",
+    // bash
+    "PROMPT_COMMAND",
+    // fish
+    "XDG_DATA_DIRS",
+];
+
 pub fn env() -> &'static [(String, String)] {
     static ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
     ENV.get_or_init(|| {
