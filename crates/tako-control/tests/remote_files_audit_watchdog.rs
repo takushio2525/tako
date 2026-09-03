@@ -72,7 +72,21 @@ fn 監査の呼び出しはaudit_payload経由だけ() {
 fn audit_payloadはどんなパスを渡しても漏らさない() {
     // 実パスに現れうる形を kind へ流し込んでも、パスらしき断片は出力に残らない。
     // kind は呼び出し側の固定文字列だが、将来ここへ変数が入る改変を検出する
-    for kind in ["roots", "list", "content", "download"] {
+    // #1084 / #1085 で増えた種別も含める（新しい呼び出し口が検査から漏れない）
+    for kind in [
+        "roots",
+        "list",
+        "content",
+        "download",
+        "ssh_list",
+        "ssh_content",
+        "ssh_download",
+        "pending",
+        "write",
+        "write_denied",
+        "push",
+        "push_failed",
+    ] {
         let payload = tako_control::remote_files::audit_payload(kind, 1024, 3);
         let text = payload.to_string();
         for forbidden in ['/', '\\', '~'] {
@@ -97,6 +111,38 @@ fn audit_payloadはどんなパスを渡しても漏らさない() {
 }
 
 #[test]
+fn 監査の種別は固定文字列だけ() {
+    // 上のテストのコメントが言っている「将来ここへ変数が入る改変」を**実際に**検出する。
+    // `audit_payload(kind, ...)` の第 1 引数が変数になると、パスやファイル名が
+    // 種別として監査ログへ流れうる（#287 P2-2 の規約が静かに崩れる）
+    let src = production_part(&without_comments(&remote_files_source()));
+    let mut offenders: Vec<String> = Vec::new();
+    for (pos, _) in src.match_indices("audit_payload(") {
+        // 定義そのもの（`pub fn audit_payload(kind: &str, ...)`）は呼び出しではない
+        if src[..pos].trim_end().ends_with("fn") {
+            continue;
+        }
+        let rest = &src[pos + "audit_payload(".len()..];
+        let arg = rest.split(',').next().unwrap_or("").trim();
+        // 文字列リテラル（`"..."`）だけを許す
+        if !(arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2) {
+            let line_no = src[..pos].matches('\n').count() + 1;
+            offenders.push(format!("remote_files.rs:{line_no} — 第 1 引数が {arg}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "監査の種別は固定文字列で書くこと:\n{}",
+        offenders.join("\n")
+    );
+    // 走査が空振りしていないこと
+    assert!(
+        src.matches("audit_payload(").count() >= 8,
+        "audit_payload の呼び出しが見つからない（走査が空振り）"
+    );
+}
+
+#[test]
 fn ファイルapiの応答はキャッシュさせない() {
     // ファイルの中身は機密。共有プロキシや PWA のキャッシュへ残さない
     let src = production_part(&without_comments(&remote_files_source()));
@@ -105,5 +151,62 @@ fn ファイルapiの応答はキャッシュさせない() {
     assert!(
         responders > 0 && no_store >= responders,
         "応答経路 {responders} 件に対して no-store の付与が {no_store} 件しかない"
+    );
+}
+
+#[test]
+fn ファイルapiは自分でsshやsftpを起こさない() {
+    // #1085 受け入れ条件 3「スマホは SSH 鍵に触らない」を**構造で**固定する。
+    //
+    // 2 ホップの後段（SFTP）は tako app 側が `<data_dir>/ssh/` の ControlMaster で
+    // 張るもので、daemon は IPC で proxy するだけ。daemon 側に接続を生やすと
+    // ①鍵・known_hosts・2FA の扱いが 2 箇所になる
+    // ②#966 のキャッシュ / 退避 / 競合検知の基準が app と食い違う
+    // のどちらも起きるので、**呼んでよいのは純粋な文字列関数だけ**に閉じる
+    let src = production_part(&without_comments(&remote_files_source()));
+
+    // 接続・取得・書き戻し・器の起動はどれも呼ばない
+    for forbidden in [
+        "remote_fs::connect",
+        "remote_fs::ensure_master",
+        "remote_fs::fetch_file",
+        "remote_fs::save_file",
+        "remote_fs::list_dir",
+        "remote_fs::stat_file",
+        "remote_fs::push_pending",
+        "remote_fs::sftp_bin",
+        "remote_fs::ssh_bin",
+        "Command::new",
+        "process::Command",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "ファイル API が {forbidden} を直接呼んでいる（SSH は app 側の 1 実装に閉じる）"
+        );
+    }
+
+    // 使ってよいのは純粋な文字列関数だけ（増やすときは理由をここへ）
+    const ALLOWED: &[&str] = &["base_name", "join_remote"];
+    let mut used: Vec<String> = Vec::new();
+    for (pos, _) in src.match_indices("remote_fs::") {
+        let rest = &src[pos + "remote_fs::".len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !ALLOWED.contains(&name.as_str()) {
+            let line_no = src[..pos].matches('\n').count() + 1;
+            used.push(format!("remote_files.rs:{line_no} — remote_fs::{name}"));
+        }
+    }
+    assert!(
+        used.is_empty(),
+        "純粋な文字列関数以外の remote_fs を使っている:\n{}",
+        used.join("\n")
+    );
+    // 走査が空振りしていないこと（`remote_fs::` の呼び出しが実際にある）
+    assert!(
+        src.matches("remote_fs::").count() >= 2,
+        "remote_fs の呼び出しが見つからない（走査が空振り）"
     );
 }

@@ -1,6 +1,7 @@
-// ファイルビュー（#1079。リモート刷新 柱 3-E）。
+// ファイルビュー（#1079。リモート刷新 柱 3-E / 編集は #1084 = 柱 3-F /
+// SSH 先は #1085 = 柱 3-G）。
 //
-// スマホから PC のファイルを「見る → 中身を確かめる → 保存する」までを 1 画面で。
+// スマホから PC のファイルを「見る → 中身を確かめる → 直す → 保存する」までを 1 画面で。
 // 出せるのは **Mac のファイルツリーに現に出ているルートの配下だけ**で、
 // 認可は daemon 側の純粋関数（`remote_files::resolve_in_root`）が正。
 // ここは見せ方だけを持ち、パスの妥当性を画面側で判断しない
@@ -32,6 +33,26 @@ async function getJson(path) {
     throw e;
   }
   return body;
+}
+
+// 書き込み（保存 / 送り直し）。読み出しと同じく失敗は status / kind を載せて投げる
+async function sendJson(method, path, body) {
+  const resp = await fetch(`${base()}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+    // 保存は SFTP の往復を含むことがあるので読み出しより長く待つ（#966 の実測 1〜2 秒）
+    signal: AbortSignal.timeout(TIMEOUT_MS * 2),
+  });
+  const out = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const e = new Error(out.error || `HTTP ${resp.status}`);
+    e.status = resp.status;
+    e.kind = out.kind;
+    e.pending = out.pending === true;
+    throw e;
+  }
+  return out;
 }
 
 function filesUrl(endpoint, root, path) {
@@ -153,6 +174,7 @@ export function FilesPage({ me, root, path, hint }) {
         rootName={
           (state.dir && state.dir.root_name) || (state.file && state.file.root_name) || ''
         }
+        sshHost={(state.dir && state.dir.host) || (state.file && state.file.host) || ''}
         onRefresh={load}
       />
 
@@ -176,13 +198,13 @@ export function FilesPage({ me, root, path, hint }) {
       ) : state.kind === 'dir' ? (
         <DirList dir={state.dir} root={root} path={path} />
       ) : (
-        <FileView file={state.file} root={root} path={path} />
+        <FileView file={state.file} root={root} path={path} onReload={load} />
       )}
     </div>
   );
 }
 
-function FilesHeader({ me, root, path, rootName, onRefresh }) {
+function FilesHeader({ me, root, path, rootName, sshHost, onRefresh }) {
   const parent = parentOf(path || '');
   const label = !root
     ? 'ファイル'
@@ -210,7 +232,10 @@ function FilesHeader({ me, root, path, rootName, onRefresh }) {
         </button>
       </div>
       {root ? (
-        <div class="file-crumb">{[rootName, path].filter(Boolean).join('/')}</div>
+        <div class="file-crumb">
+          {sshHost && <span class="file-badge">SSH {sshHost}</span>}
+          {[rootName, path].filter(Boolean).join('/')}
+        </div>
       ) : (
         <div class="file-crumb">{(me && me.host) || 'tako'} のファイルツリー</div>
       )}
@@ -226,6 +251,7 @@ function RootList({ roots }) {
         <p>
           Mac の tako でフォルダを開くと、ここに並びます。
           ツリーに出ているフォルダの中だけが参照できます。
+          SSH 先は Mac で「リモートからフォルダを開く」と並びます。
         </p>
       </div>
     );
@@ -237,7 +263,11 @@ function RootList({ roots }) {
           <span class="file-row-icon dir"><FolderIcon /></span>
           <span class="file-row-main">
             <span class="file-row-name">{r.name}</span>
-            <span class="file-row-meta">{r.tab_title || `タブ ${r.tab}`}</span>
+            <span class="file-row-meta">
+              {r.tab_title || `タブ ${r.tab}`}
+              {/* SSH 先は行末バッジで示す（Mac のツリーと同じ言い方。#976） */}
+              {r.ssh && <SshBadge host={r.host} connected={r.connected} />}
+            </span>
           </span>
           <span class="file-row-chevron">{'›'}</span>
         </button>
@@ -256,6 +286,11 @@ function DirList({ dir, root, path }) {
 
   return (
     <div class="card-list" style="padding-top: 12px;">
+      {dir.ssh && dir.connected === false && (
+        <div class="file-notice warn">
+          このホストとの接続が切れています。Mac 側でつながると読み直せます。
+        </div>
+      )}
       {dir.truncated && (
         <div class="file-notice">
           エントリが多いため一部だけ表示しています
@@ -283,8 +318,11 @@ function DirList({ dir, root, path }) {
             <span class="file-row-meta">
               {e.escapes_root
                 ? 'ツリーの外を指すリンク'
-                : [e.dir ? '' : formatSize(e.size), formatTime(e.modified)]
-                    .filter(Boolean).join(' · ')}
+                : [
+                    e.dir ? '' : formatSize(e.size),
+                    formatTime(e.modified),
+                    e.symlink ? 'リンク' : '',
+                  ].filter(Boolean).join(' · ')}
             </span>
           </span>
           {!e.escapes_root && <span class="file-row-chevron">{'›'}</span>}
@@ -299,24 +337,152 @@ function DirList({ dir, root, path }) {
   );
 }
 
-function FileView({ file, root, path }) {
+const EditIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+    <path d="M4 20h4l10-10-4-4L4 16z" /><path d="M14 6l4 4" />
+  </svg>
+);
+
+// SSH 先ルート / 切断のバッジ（ツリーの行末バッジ #976 と同じ言い方）
+function SshBadge({ host, connected }) {
+  return (
+    <span class={`file-badge${connected === false ? ' off' : ''}`}>
+      {connected === false ? `切断 ${host}` : `SSH ${host}`}
+    </span>
+  );
+}
+
+function FileView({ file, root, path, onReload }) {
   const name = (path || '').split('/').pop();
   const downloadUrl = `${base()}${filesUrl('/api/files/download', root, path)}`;
+  // 編集できるのは「本文が返っていて・書けて・検証子がある」ものだけ。
+  // 判断の材料はすべてサーバー側が付けたもので、画面側で拡張子を見たりしない
+  const canEdit = typeof file.text === 'string' && !file.read_only && !!file.etag;
+
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(file.text || '');
+  // 画面に出している本文。保存できたらここを差し替える（読み直しの往復を省く）。
+  // **`file` を書き換えない**のが要点: prop を触ると下の useEffect の依存が動き、
+  // 保存できた直後に状態がリセットされて「保存しました」が一瞬で消える
+  const [shown, setShown] = useState(file.text || '');
+  const [etag, setEtag] = useState(file.etag || '');
+  const [busy, setBusy] = useState(false);
+  // { ok: true, remote } / { ok: false, message, kind, pending }
+  const [result, setResult] = useState(null);
+  const [pendingWrite, setPendingWrite] = useState(file.pending_write === true);
+
+  // 別のファイルへ移った / 読み直したら下書きと結果を捨てる
+  // （依存は**読み込んだ応答そのもの**。値ではなく識別で見るので、
+  //   自分の保存で状態が巻き戻らない）
+  useEffect(() => {
+    setEditing(false);
+    setDraft(file.text || '');
+    setShown(file.text || '');
+    setEtag(file.etag || '');
+    setResult(null);
+    setPendingWrite(file.pending_write === true);
+  }, [root, path, file]);
+
+  const dirty = editing && draft !== shown;
+
+  async function save() {
+    setBusy(true);
+    setResult(null);
+    try {
+      const out = await sendJson('PUT', filesUrl('/api/files/content', root, path), {
+        text: draft,
+        etag,
+      });
+      // 応答の検証子で続けて保存できる（読み直さなくても 2 回目が通る）
+      setEtag(out.etag || '');
+      setPendingWrite(false);
+      setResult({ ok: true, remote: out.remote });
+      setEditing(false);
+      setShown(draft);
+    } catch (e) {
+      setResult({ ok: false, message: e.message, kind: e.kind, pending: e.pending });
+      if (e.pending) setPendingWrite(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function push() {
+    setBusy(true);
+    setResult(null);
+    try {
+      // `force` は送らない（競合は読み直して直す。#1085）
+      await sendJson('POST', filesUrl('/api/files/push', root, path), {});
+      setPendingWrite(false);
+      setResult({ ok: true, pushed: true });
+      // 送れたのは**退避してあった内容**なので、画面は真実へ揃え直す。
+      // ただし手元に未保存の編集が残っているときは捨てない（保存で送り直せる）
+      if (!dirty) onReload();
+    } catch (e) {
+      setResult({ ok: false, message: e.message, kind: e.kind, pending: e.pending });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <>
       <div class="file-actions">
         <div class="file-actions-info">
           <span class="file-actions-name">{name}</span>
-          <span class="file-actions-meta">{formatSize(file.size)}</span>
+          <span class="file-actions-meta">
+            {formatSize(file.size)}
+            {file.ssh && <SshBadge host={file.host} connected={file.connected} />}
+            {file.read_only && <span class="file-badge off">読み取り専用</span>}
+          </span>
         </div>
+        {canEdit && !editing && (
+          <button class="btn file-edit-btn" onClick={() => setEditing(true)}>
+            <EditIcon />
+            編集
+          </button>
+        )}
         {/* daemon が Content-Disposition: attachment を付けるので、
-            素の遷移で iOS / Android とも保存シートが開く */}
-        <a class="btn btn-primary file-download" href={downloadUrl}>
+            素の遷移で iOS / Android とも保存シートが開く。
+            **編集モードの「保存」（PC へ書き戻す）と言い分ける**ため、
+            こちらは「端末に保存」= 手元へ落とす操作だと分かる語にしてある */}
+        <a class="btn file-download" href={downloadUrl}>
           <DownloadIcon />
-          保存
+          端末に保存
         </a>
       </div>
+
+      {/* 前のセッションで押し出せていない保存が残っている（#966 / #1085） */}
+      {pendingWrite && (
+        <div class="file-notice warn">
+          リモートへ送れていない保存が残っています。
+          <button class="btn file-inline-btn" disabled={busy} onClick={push}>
+            送り直す
+          </button>
+        </div>
+      )}
+
+      {result && !result.ok && (
+        <div class="file-notice error">
+          <span>{result.message}</span>
+          {result.kind === 'conflict' && (
+            <button class="btn file-inline-btn" onClick={onReload}>読み直す</button>
+          )}
+          {result.pending && (
+            <button class="btn file-inline-btn" disabled={busy} onClick={push}>送り直す</button>
+          )}
+        </div>
+      )}
+      {result && result.ok && (
+        <div class="file-notice ok">
+          {result.pushed
+            ? 'リモートへ送りました'
+            : result.remote
+              ? 'リモートへ書き戻しました'
+              : '保存しました'}
+        </div>
+      )}
+
       {file.binary ? (
         <div class="empty-state">
           <h2>プレビューできません</h2>
@@ -330,8 +496,32 @@ function FileView({ file, root, path }) {
             保存してから開いてください。
           </p>
         </div>
+      ) : editing ? (
+        <>
+          <textarea
+            class="file-editor"
+            value={draft}
+            spellcheck={false}
+            autocapitalize="off"
+            autocorrect="off"
+            autocomplete="off"
+            onInput={e => setDraft(e.currentTarget.value)}
+          />
+          <div class="file-edit-actions">
+            <button
+              class="btn"
+              disabled={busy}
+              onClick={() => { setDraft(shown); setEditing(false); setResult(null); }}
+            >
+              取り消す
+            </button>
+            <button class="btn btn-primary" disabled={busy || !dirty} onClick={save}>
+              {busy ? '保存中...' : '保存'}
+            </button>
+          </div>
+        </>
       ) : (
-        <pre class="file-preview">{file.text}</pre>
+        <pre class="file-preview">{shown}</pre>
       )}
     </>
   );

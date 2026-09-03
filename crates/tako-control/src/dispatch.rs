@@ -10542,6 +10542,12 @@ fn list_json(host: &dyn ControlHost) -> Value {
                                 "mode": mode.as_str(),
                                 "editing": editing,
                                 "dirty": dirty,
+                                // #966 のリモート由来（SFTP で落とした写しを出している）なら
+                                // その位置と書き戻し状態。ローカルのファイルでは null。
+                                // **`path` は写しのローカルパスなので、これが無いと
+                                // 「このプレビューがどのリモートファイルか」を外から言えない**
+                                // （#1085: 切断中の保存を退避へ回すのにこれを使う）
+                                "remote": host.preview_remote_state(p.id()),
                             })
                         }),
                         // 利用上限後の自動復帰のオプトイン（#813。既定 false）
