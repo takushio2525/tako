@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod handoff_store;
 pub mod ledger;
+pub mod master_launch;
 pub mod registry;
 pub mod supervisor;
 pub mod wait;

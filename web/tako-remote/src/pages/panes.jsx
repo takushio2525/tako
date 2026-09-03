@@ -12,6 +12,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
 import { AgentIcon } from '../components/agent-icon';
 import { RemoteLinkRow, AccountChip } from '../components/remote-link';
+import { MasterLauncher } from '../components/master-launcher';
 
 const PREVIEW_LINES = 8;
 const PULL_THRESHOLD = 80;
@@ -260,6 +261,8 @@ export function PanesPage({ me }) {
   const [pulling, setPulling] = useState(false);
   const [pullY, setPullY] = useState(0);
   const [filter, setFilter] = useState('all');
+  // #1078: master ランチャー（新しいタブ + master 起動）のボトムシート
+  const [launcher, setLauncher] = useState(false);
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
   const listRef = useRef(null);
@@ -349,13 +352,25 @@ export function PanesPage({ me }) {
             <span class="dot online" style="width: 7px; height: 7px;" />
             <span class="chip-name">{(me && me.host) || 'tako'}</span>
           </div>
-          <button
-            class={`refresh-btn${pulling ? ' spinning' : ''}`}
-            aria-label="更新"
-            onClick={() => { setPulling(true); refresh().then(() => setPulling(false)); }}
-          >
-            <RefreshIcon />
-          </button>
+          <div class="panes-header-actions">
+            {/* #1078: スマホから master を立てる。role が足りない端末でも入口は出し、
+                シートを開いた時点で理由を出す（隠すと「機能が無い」と誤解させる） */}
+            <button
+              class="launch-btn"
+              aria-label="master を起動"
+              onClick={() => setLauncher(true)}
+            >
+              <PlusIcon />
+              <span>master</span>
+            </button>
+            <button
+              class={`refresh-btn${pulling ? ' spinning' : ''}`}
+              aria-label="更新"
+              onClick={() => { setPulling(true); refresh().then(() => setPulling(false)); }}
+            >
+              <RefreshIcon />
+            </button>
+          </div>
         </div>
         <div class="filter-row">
           {FILTERS.map(f => (
@@ -429,7 +444,23 @@ export function PanesPage({ me }) {
           ))}
         </div>
       )}
+
+      {launcher && (
+        <MasterLauncher
+          me={me}
+          onClose={() => setLauncher(false)}
+          onLaunched={() => refresh()}
+        />
+      )}
     </div>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+    </svg>
   );
 }
 

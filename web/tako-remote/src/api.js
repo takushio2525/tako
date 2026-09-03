@@ -75,6 +75,20 @@ export function createClient() {
     agents() {
       return request('GET', '/api/agents');
     },
+    // #1078: master を立てられるプロファイルの一覧（Observe で引ける）。
+    // 中身は `tako orchestrator profiles list` と同じ 1 実装が作る
+    masterProfiles() {
+      return request('GET', '/api/master/profiles');
+    },
+    // #1078: 新しいタブを作る（Manage role 必須）。cwd 未指定なら PC 側の既定
+    createTab(cwd) {
+      return request('POST', '/api/tabs', cwd ? { cwd } : {});
+    },
+    // #1078: そのタブで master を起動する（Manage role 必須）。
+    // 組み立て（プロファイル検証 / system prompt / 起動コマンド）は daemon 側が正
+    launchMaster(tabId, profile) {
+      return request('POST', `/api/tabs/${encodeURIComponent(tabId)}/master`, { profile });
+    },
     messages(sessionId, tail = 30) {
       return request('GET', `/api/sessions/${encodeURIComponent(sessionId)}/messages?tail=${tail}`);
     },

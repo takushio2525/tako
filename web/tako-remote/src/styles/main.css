@@ -196,6 +196,86 @@ body {
 .refresh-btn:active { background: var(--panel3); }
 .refresh-btn.spinning svg { animation: spin .8s linear infinite; }
 
+/* master ランチャーの入口（#1078） */
+.panes-header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.launch-btn {
+  height: 40px; flex-shrink: 0;
+  display: inline-flex; align-items: center; gap: 5px; padding: 0 12px;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 600;
+  color: var(--claude); background: rgba(214, 121, 92, .13);
+  border: 1px solid rgba(214, 121, 92, .34); border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.launch-btn:active { background: rgba(214, 121, 92, .22); }
+
+/* ボトムシート（#1078） */
+.sheet-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(0, 0, 0, .55);
+  display: flex; align-items: flex-end;
+}
+.sheet {
+  width: 100%; max-height: 82vh; overflow-y: auto;
+  background: var(--panel); border-top: 1px solid var(--line2);
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 14px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+}
+.sheet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.sheet-title { font-size: 15px; font-weight: 600; color: var(--fg); }
+.sheet-close {
+  width: 32px; height: 32px; font-size: 20px; line-height: 1;
+  color: var(--fg2); background: none; border: none; cursor: pointer;
+}
+.launch-note {
+  margin: 0 0 10px; font-size: 12px; line-height: 1.6; color: var(--fg2);
+  overflow-wrap: anywhere;
+}
+.launch-profile-list { display: flex; flex-direction: column; gap: 8px; }
+.launch-profile {
+  display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 11px 12px; cursor: pointer;
+}
+.launch-profile:disabled { opacity: .5; }
+.launch-profile:active { background: var(--panel3); }
+.launch-profile-main { display: flex; align-items: center; gap: 8px; }
+.launch-profile-name {
+  font-family: var(--mono); font-size: 13.5px; font-weight: 600; color: var(--fg);
+}
+.launch-profile-sub {
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg3);
+  overflow-wrap: anywhere;
+}
+.launch-profile-projects { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.launch-rc-badge {
+  font-family: var(--mono); font-size: 9.5px; font-weight: 600;
+  border: 1px solid transparent; border-radius: 5px; padding: 2px 6px;
+  white-space: nowrap;
+}
+.launch-rc-badge.rc-on {
+  color: var(--claude); background: rgba(214, 121, 92, .15); border-color: rgba(214, 121, 92, .32);
+}
+.launch-rc-badge.rc-off { color: var(--fg3); background: var(--panel3); border-color: var(--line2); }
+.launch-rc-badge.rc-blocked {
+  color: var(--amber); background: rgba(232, 178, 62, .12); border-color: rgba(232, 178, 62, .3);
+}
+
+.launch-waiting {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12.5px; color: var(--fg2); padding: 10px 0;
+}
+.launch-result-head { margin-bottom: 10px; }
+.launch-result-title { display: block; font-size: 14px; font-weight: 600; color: var(--fg); }
+.launch-result-sub {
+  display: block; margin-top: 3px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg3);
+}
+.launch-result-actions { display: flex; gap: 8px; margin-top: 12px; }
+.launch-result-actions .btn { flex: 1; }
+
 .filter-row {
   display: flex; gap: 7px; overflow-x: auto;
   scrollbar-width: none; -webkit-overflow-scrolling: touch;
