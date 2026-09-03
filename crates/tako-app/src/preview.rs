@@ -437,6 +437,34 @@ impl EditState {
     pub fn dirty(&self) -> bool {
         self.buffer.dirty()
     }
+
+    /// #973: このセッションを自動保存の保留へ入れるべきか（保留の重複は呼び出し側が見る）。
+    ///
+    /// **「編集した人がフラグを立てる」形をやめ、状態から必要性を導く**ための判定。
+    /// 旧実装は編集経路ごとに手で保留フラグを立てていたので、GUI の入力経路だけが
+    /// タイマーまで回し、dispatch（CLI / MCP）の編集は保留に入ったまま誰も保存しなかった
+    fn autosave_due(&self) -> bool {
+        self.autosave && self.editing && self.dirty()
+    }
+}
+
+/// #973: 自動保存を始めるペインを**編集セッションの状態から**割り出す唯一の判定。
+///
+/// `pending` に既に入っているペインは返さない（#195 のデバウンス = 保留に入れた
+/// 瞬間から 500ms 後に一度だけ保存し、その間の追加編集でタイマーを増やさない）。
+/// リモート由来のセッションは `autosave` が既定 OFF（#966）なので自然に外れる
+pub fn autosave_due<'a, K>(
+    edits: impl IntoIterator<Item = (&'a K, &'a EditState)>,
+    pending: &std::collections::HashSet<K>,
+) -> Vec<K>
+where
+    K: Copy + Eq + std::hash::Hash + 'a,
+{
+    edits
+        .into_iter()
+        .filter(|(pane, edit)| edit.autosave_due() && !pending.contains(pane))
+        .map(|(pane, _)| *pane)
+        .collect()
 }
 
 /// 編集中も既存の syntect ハイライト基盤を再利用して、読み取り時と同じ色分けで
@@ -2763,6 +2791,100 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&scratchpad).ok();
+    }
+    // --- #973: 自動保存の対象を状態から導く ---------------------------------
+
+    /// 実ファイルから編集セッションを作る（`EditState::open` は実 `TextBuffer` を要求する）
+    fn edit_session(dir: &Path, name: &str) -> EditState {
+        let path = dir.join(name);
+        std::fs::write(&path, "alpha bravo charlie\n").unwrap();
+        let state = load(&path, PreviewMode::Code);
+        EditState::open(&state).expect("テキストなら編集セッションを開ける")
+    }
+
+    fn autosave_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-autosave-973-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn 自動保存はautosaveと編集中とdirtyが揃ったときだけ対象になる() {
+        let dir = autosave_dir("gate");
+        let pending = std::collections::HashSet::new();
+
+        // 開いただけ = まだ dirty でない（`EditState::open` の既定は autosave: true）
+        let clean = edit_session(&dir, "clean.txt");
+        assert!(clean.autosave, "既定は自動保存 ON");
+        assert!(
+            autosave_due([(&1u64, &clean)], &pending).is_empty(),
+            "dirty でない"
+        );
+
+        // 編集した = 対象
+        let mut dirty = edit_session(&dir, "dirty.txt");
+        dirty.buffer.set_text("changed".into());
+        assert_eq!(autosave_due([(&1u64, &dirty)], &pending), vec![1]);
+
+        // 自動保存 OFF（#966 のリモート既定もこの形）= 対象外
+        let mut off = dirty.clone();
+        off.autosave = false;
+        assert!(
+            autosave_due([(&1u64, &off)], &pending).is_empty(),
+            "autosave OFF"
+        );
+
+        // 編集モードを抜けたセッション（未保存バッファは保持される）= 対象外
+        let mut viewing = dirty.clone();
+        viewing.editing = false;
+        assert!(
+            autosave_due([(&1u64, &viewing)], &pending).is_empty(),
+            "編集中でない"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 保留中のペインは重ねて対象にしない() {
+        // #195 のデバウンス: 保留に入れた瞬間から 500ms 後に一度だけ保存する。
+        // 保留中の追加編集でタイマーを増やすと 1 編集ごとに保存が走ってしまう
+        let dir = autosave_dir("debounce");
+        let mut edit = edit_session(&dir, "a.txt");
+        edit.buffer.set_text("changed".into());
+        let pending: std::collections::HashSet<u64> = [7u64].into_iter().collect();
+        assert!(autosave_due([(&7u64, &edit)], &pending).is_empty());
+        assert_eq!(autosave_due([(&8u64, &edit)], &pending), vec![8]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 複数ペインのうち条件を満たすものだけを返す() {
+        // 「誰が編集したか」ではなく状態から導くので、CLI が汚したペインと
+        // GUI が汚したペインを区別しない（#973 の構造的な直し方）
+        let dir = autosave_dir("multi");
+        let mut a = edit_session(&dir, "a.txt");
+        a.buffer.set_text("A".into());
+        let b = edit_session(&dir, "b.txt"); // dirty でない
+        let mut c = edit_session(&dir, "c.txt");
+        c.buffer.set_text("C".into());
+        c.autosave = false;
+        let mut d = edit_session(&dir, "d.txt");
+        d.buffer.set_text("D".into());
+
+        let pending = std::collections::HashSet::new();
+        let mut due = autosave_due(
+            [(&1u64, &a), (&2u64, &b), (&3u64, &c), (&4u64, &d)],
+            &pending,
+        );
+        due.sort();
+        assert_eq!(due, vec![1, 4]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

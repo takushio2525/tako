@@ -1318,9 +1318,21 @@ FR-3.5 実装メモ（2026-07-12、#126）:
   `tako_preview_redo` / `tako_preview_search` / `tako_preview_replace` /
   `tako_preview_autosave`（計 68 ツール）。個々の物理キーイベントは GUI/IME 固有で API 化せず、
   自然な操作境界である全文適用を公開する。list の `preview.editing` / `preview.dirty` で状態取得
-- **自動保存（#195）**: 既定 ON。テキスト変更後 500ms のデバウンスタイマーで `TextBuffer::save()`
-  を呼ぶ。保存競合（外部変更検知）時は上書きせずタイトルバーに「⚠ 競合」を表示。
-  `PreviewAutosave` で ON/OFF 切替。OFF 時は従来の ⌘S 手動保存に戻る
+- **自動保存（#195 / #973）**: 既定 ON。テキスト変更後 500ms のデバウンスタイマーで
+  `TextBuffer::save()` を呼ぶ。保存競合（外部変更検知）時は上書きせずタイトルバーに
+  「⚠ 競合」を表示。`PreviewAutosave` で ON/OFF 切替。OFF 時は従来の ⌘S 手動保存に戻る。
+  **対象は「誰が編集したか」ではなく編集セッションの状態（autosave が有効 + 編集中 +
+  dirty）から導く**（`preview::autosave_due`）ので、**GUI の入力経路と dispatch = CLI / MCP
+  の編集が同じ 1 本の入口（`drive_autosave`）を通る**。#973 まではフラグを立てる
+  `schedule_autosave` とタイマーを回す `start_autosave_timer` が 2 本に分かれており、
+  後者を呼ぶのは GUI の入力経路（キー / ペースト / IME）だけだったため、
+  `edit replace` / `apply` / `undo` / `redo` は**保留に入ったまま誰も保存しなかった**
+  （`EditState::open` の既定が `autosave: true` なので、AI にプレビュー編集を任せると
+  「自動保存 ON なのに保存されていない」= データを失いかねない見え方になっていた）。
+  dispatch はペインの状態を変えるところまでで 500ms のタイマーには GPUI の `Context` が
+  要るので、消化するのは**すべての dispatch が通る 1 箇所**（IPC の 1 ターンの後処理）。
+  リモートは `autosave` が既定 OFF（FR-3.24.2）なので状態から自然に外れる。同一バイナリで
+  #973 前へ戻す A/B は `TAKO_973_LEGACY=1`（✅ 2026-09-04、#973）
 - **undo/redo（#195）**: `TextBuffer` に操作スナップショットスタック（上限 1000）を実装。
   insert / delete / set_text の前に全状態を push。⌘Z / ⇧⌘Z で GUI 操作、dispatch 経由で
   CLI / MCP からも操作可能。自動保存と独立（保存済みでも undo 可）
