@@ -438,6 +438,40 @@ pub fn status_line(decision: &RemoteControlDecision) -> String {
     }
 }
 
+/// 不適格の種別（[`Ineligible::kind`] の slug）から理由と次の一手を引き直す。
+///
+/// **なぜ slug を経由するのか**: リンク解決（`claude_remote_link`）が持つのは
+/// `LinkState::Ineligible { reason: <slug> }` だけで、`Ineligible` の値そのものは
+/// 握っていない（transcript の読み取り結果と env の判定は別の層で起きる）。
+/// 型を持ち回す形にすると解決層が env 判定の詳細を抱えることになるので、
+/// **slug を語彙として共有し、文言はここ 1 か所で引く**形にした。
+///
+/// 網羅は [`tests::不適格の全種別がslugから文言を引ける`] が拘束する
+/// （新しい種別を足して分岐を忘れると落ちる）。
+pub fn notes_for_kind(kind: &str) -> Option<(Note, Note)> {
+    // 種別ごとに 1 個ずつ代表値を作って `reason` / `next_step` を引く。
+    // detail（env 名など）は文言に出さないので空で構わない
+    let sample = match kind {
+        "feature_flags_disabled" => Ineligible::FeatureFlagsDisabled {
+            env_key: String::new(),
+        },
+        "endpoint_redirected" => Ineligible::EndpointRedirected {
+            env_key: String::new(),
+        },
+        "non_subscription_auth" => Ineligible::NonSubscriptionAuth {
+            env_key: String::new(),
+        },
+        "disabled_by_policy" => Ineligible::DisabledByPolicy {
+            source: String::new(),
+        },
+        "agent_unsupported" => Ineligible::AgentUnsupported {
+            agent: String::new(),
+        },
+        _ => return None,
+    };
+    Some((sample.reason(), sample.next_step()))
+}
+
 /// `status_line` の OFF に添える「入れ方」の案内コマンド。
 /// 引数は最簡形（既定値で済む引数を付けない。#322）
 pub fn enable_hint_command(profile_name: &str) -> String {
@@ -736,5 +770,47 @@ mod tests {
             "true のときだけ断る"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不適格の種別を足したら文言も足す。**`kind()` の match 腕をソースから採る**ので、
+    /// enum に値を増やして [`notes_for_kind`] の分岐を忘れると落ちる
+    /// （型で縛れないのは slug を語彙として共有しているため。理由は関数の doc に書いた）
+    #[test]
+    fn 不適格の全種別がslugから文言を引ける() {
+        let src = include_str!("claude_remote.rs");
+        // `fn kind(&self) -> &'static str {` から次の `}` までの腕を採る
+        let start = src
+            .find("fn kind(&self) -> &'static str {")
+            .expect("kind() が在る");
+        let body = &src[start..];
+        let end = body.find("\n    }").expect("kind() の閉じ");
+        let arms = &body[..end];
+        let mut kinds: Vec<&str> = Vec::new();
+        for line in arms.lines() {
+            if let Some((_, rest)) = line.split_once("=> \"") {
+                if let Some((slug, _)) = rest.split_once('"') {
+                    kinds.push(slug);
+                }
+            }
+        }
+        assert!(
+            kinds.len() >= 5,
+            "kind() の腕を採れていない（採取ロジックの破損）: {kinds:?}"
+        );
+        for kind in &kinds {
+            let notes = notes_for_kind(kind);
+            assert!(
+                notes.is_some(),
+                "種別 {kind} の文言が引けない（notes_for_kind に分岐を足すこと）"
+            );
+            let (reason, next) = notes.unwrap();
+            // 日英どちらも空でない（#435: 新機能は日英必須）
+            for note in [reason, next] {
+                assert!(!note.ja().is_empty(), "{kind}: 日本語が空");
+                assert!(!note.en().is_empty(), "{kind}: 英語が空");
+            }
+        }
+        // 知らない slug は None（上流の書式変更で嘘の理由を出さない）
+        assert!(notes_for_kind("nope").is_none());
     }
 }

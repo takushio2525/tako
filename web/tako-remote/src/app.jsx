@@ -2,6 +2,7 @@ import { useState, useEffect } from 'preact/hooks';
 import { PairingPage } from './pages/pairing';
 import { PanesPage } from './pages/panes';
 import { TerminalPage } from './pages/terminal';
+import { FilesPage } from './pages/files';
 import { createClient } from './api';
 import { cleanupLegacyStore } from './store';
 
@@ -126,6 +127,16 @@ export function App() {
   let page;
   if (segments[0] === 'panes' && segments[1]) {
     page = <TerminalPage paneId={segments[1]} me={me} />;
+  } else if (segments[0] === 'files') {
+    // #1079: ファイルビュー（root / path はクエリで持つ）
+    page = (
+      <FilesPage
+        me={me}
+        root={route.params.get('root') || ''}
+        path={route.params.get('path') || ''}
+        hint={route.params.get('kind') || ''}
+      />
+    );
   } else {
     page = <PanesPage me={me} />;
   }

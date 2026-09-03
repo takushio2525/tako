@@ -4027,3 +4027,21 @@
   load 15 で項目 94（#702。打った行が 6 秒以内に実行されない）/ load 5 で項目 113（#816。
   2.5 秒の出力が `lines+=25 < 40`）。並行 worker のビルドで load が跳ねる時間帯は避けて測る
 - 次: PR → CI → merge / install は master 判断
+
+## 2026-09-03（#1077 + #1078: リモート PWA から Claude 公式へ送り出す + スマホから master 起動）
+- #1077: カードに「Claude で開く」（connected だけ・**PWA は URL を組み立てない**）/ 未接続は
+  理由 + PC 側の有効化コマンド（**環境阻害には opt-in コマンドを出さない**・master と solo で
+  `--solo` を出し分け）/ アカウント表示。文言は Rust が正（daemon が表示言語で解決）。
+  自前チャットはフォールバック維持
+- #1078: `GET /api/master/profiles`（Observe）+ `POST /api/tabs` / `POST /api/tabs/:id/master`
+  （**Manage**）。組み立ては新設 `orchestrator::master_launch` が正で CLI の `tako master` と
+  同じ順・同じ検証（**ペインに触る前**に落ちる）。起動できるのは PC 側に在るプロファイルだけ
+- 同梱: **daemon が表示言語を初期化しておらず #1077 の理由文が英語で凍っていた**（#983 と同型）/
+  **app が拒否した要求で IPC 接続を捨てていた**（A/B 実測 = 次の正当な操作が 503 になる）→
+  `AppCallError` で言い分け拒否は 400。ワイヤ処理は `roundtrip_detailed` の 1 実装へ
+- 検証: 実経路テスト `scripts/test-remote-master-launch.sh` **34 PASS / 0 FAIL**（偽 tailscale +
+  隔離 state/data/orchestrator で**実 daemon + 実 tako-app**。claude はスタブ）+ PWA e2e 15 件 +
+  品質ゲート全緑 + クロスチェック警告が main と一致 + 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`。
+  検出力は role を Observe へ落として**observe 端末が実際にタブを作れる**ことまで実測
+- 関連: PR #1088（`Refs #1077, #1078, #1059`）。**実機スマホは未検証**
+- 次: 実機での「タップ → Claude アプリ」確認。柱1 の残りは #1059 のエピック参照

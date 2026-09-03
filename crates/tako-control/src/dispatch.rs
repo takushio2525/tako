@@ -5312,11 +5312,14 @@ fn dispatch_sessions_link(
         .or_else(|| resolve_session_id_for_pane_via_pid(host, pane_id))
         .or_else(|| crate::sessions::resolve_session_for_pane(&pane_id.as_u64().to_string()));
     let link = crate::claude_remote_link::link_for_agent_session(agent, session_id.as_deref());
+    // #1077: 開けない理由に添える opt-in コマンドを具体形にする
+    // （PWA / CLI / MCP が同じ 1 実装から同じ値を得る）
+    let hint = crate::claude_remote_link::ProfileHint::from_role(&role);
     Ok(json!({
         "pane": pane_id.as_u64(),
         "agent": agent,
         "session_id_resolved": session_id,
-        "remote_link": link.to_json(),
+        "remote_link": link.to_json_with_profile(hint),
     }))
 }
 
@@ -10842,6 +10845,35 @@ fn dispatch_tree_folder(
 ) -> Result<Value, DispatchError> {
     use std::path::PathBuf;
 
+    // #1079: 全タブのツリールート（各ペインの cwd + ピン留めフォルダ）。
+    // リモートのファイル API はこれを**認可の正**として使うので、サイドバーと同じ
+    // 1 実装（`tree_roots_of_tab`）を通す = 画面に出ていないフォルダが読めることは
+    // 構造的に起きない。タブ横断なので `resolve_tab` より前で処理する
+    if action == "roots" {
+        let tab_ids: Vec<TabId> = host.workspace().tabs().iter().map(|t| t.id()).collect();
+        let mut tabs: Vec<Value> = Vec::new();
+        for tid in tab_ids {
+            if let Some(tab_mut) = host.workspace_mut().get_tab_mut(tid) {
+                tab_mut.prune_dead_folders();
+            }
+            let title = host
+                .workspace()
+                .get_tab(tid)
+                .map(|t| t.title().to_string())
+                .unwrap_or_default();
+            let roots: Vec<String> = tree_roots_of_tab(host, tid)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            tabs.push(json!({
+                "tab": tid.as_u64(),
+                "title": title,
+                "roots": roots,
+            }));
+        }
+        return Ok(json!({ "tabs": tabs }));
+    }
+
     let tab_id = resolve_tab(host.workspace(), tab, pane)?;
 
     match action {
@@ -10907,7 +10939,7 @@ fn dispatch_tree_folder(
             Ok(json!({ "folders": folders, "tab": tab_id.as_u64() }))
         }
         _ => Err(DispatchError::InvalidParams(format!(
-            "action は add / remove / list / git-status のいずれか（受け取った値: {action}）"
+            "action は add / remove / list / roots / git-status のいずれか（受け取った値: {action}）"
         ))),
     }
 }

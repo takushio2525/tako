@@ -57,6 +57,7 @@
 //! （番犬 = `crates/tako-control/tests/remote_link_watchdog.rs`）。
 
 use serde_json::{json, Value};
+use tako_core::platform::support::Note;
 
 /// claude.ai の本番ホスト。dev / staging の base は Anthropic 社内向けなので採らない
 const CLAUDE_AI_BASE: &str = "https://claude.ai";
@@ -144,16 +145,156 @@ impl RemoteLink {
         matches!(self.state, LinkState::Connected)
     }
 
+    /// なぜ開けないか・どうすれば開けるかを返す（#1077）。
+    ///
+    /// **繋がっているときは `None`**（説明することが無い）。
+    /// `hint` はペインの role から解いたプロファイルの所在で、
+    /// 分かっているときだけ案内コマンドを**具体形**にする（#322 の最簡形）。
+    /// 分からなければ `<名前>` のままにする（嘘の名前を書かない）
+    pub fn guidance(&self, hint: ProfileHint<'_>) -> Option<LinkGuidance> {
+        match &self.state {
+            LinkState::Connected => None,
+            LinkState::NotConnected => Some(LinkGuidance {
+                reason: NOT_CONNECTED_REASON.text().to_string(),
+                next_step: NOT_CONNECTED_NEXT_STEP.text().to_string(),
+                // opt-in はプロファイル単位なので、ここだけは押せる形で出せる
+                enable_command: Some(hint.enable_command()),
+            }),
+            LinkState::Ineligible { reason } => {
+                // 種別 → 文言は #1068 の判定層が正（`claude_remote::notes_for_kind`）。
+                // 知らない種別（上流の書式変更）では**理由を騙らず**種別だけを返す
+                let (why, next) = match crate::claude_remote::notes_for_kind(reason) {
+                    Some((why, next)) => (why.text().to_string(), next.text().to_string()),
+                    None => (
+                        UNKNOWN_BLOCKER_REASON.text().to_string(),
+                        UNKNOWN_BLOCKER_NEXT_STEP.text().to_string(),
+                    ),
+                };
+                Some(LinkGuidance {
+                    reason: why,
+                    next_step: next,
+                    // 環境側の阻害はプロファイルの opt-in では直らない
+                    enable_command: None,
+                })
+            }
+            LinkState::Unknown => Some(LinkGuidance {
+                reason: UNKNOWN_REASON.text().to_string(),
+                next_step: UNKNOWN_NEXT_STEP.text().to_string(),
+                enable_command: None,
+            }),
+        }
+    }
+
     /// API / CLI / MCP が返す形。**3 経路が同じ 1 実装を通る**ので値が食い違わない
     pub fn to_json(&self) -> Value {
+        self.to_json_with_profile(ProfileHint::Unknown)
+    }
+
+    /// [`Self::to_json`] にプロファイルの所在を添えた版（#1077）。
+    /// ペイン一覧は role からプロファイルが分かるので、案内コマンドを具体形で返せる
+    pub fn to_json_with_profile(&self, hint: ProfileHint<'_>) -> Value {
+        let guidance = self.guidance(hint);
         json!({
             "url": self.url,
             "session_id": self.session_id,
             "account_label": self.account_label,
             "state": self.state.as_wire(),
+            // 繋がっていれば null。**PWA はこの 3 つだけ読めば理由を出せる**
+            "reason": guidance.as_ref().map(|g| g.reason.clone()),
+            "next_step": guidance.as_ref().map(|g| g.next_step.clone()),
+            "enable_command": guidance.as_ref().and_then(|g| g.enable_command.clone()),
         })
     }
 }
+
+/// 開けない理由と次の一手（#1077）。**表示言語で解決済みの文字列**を持つ
+/// （PWA には i18n 機構が無いので、解決は Rust 側で終わらせる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkGuidance {
+    pub reason: String,
+    pub next_step: String,
+    /// PC 側で opt-in する案内コマンド。**環境側の阻害では `None`**
+    /// （プロファイルを触っても直らないものに押せる案内を出さない）
+    pub enable_command: Option<String>,
+}
+
+/// opt-in を書くプロファイルの所在（#1077）。
+///
+/// **なぜ master / solo を分けるのか**: 設定ファイルの置き場が別
+/// （`profiles/` と `solo-profiles/`）で、案内コマンドも `--solo` の有無で変わる。
+/// 一方を他方の形で案内すると**別のプロファイルを書き換えさせる**ことになる。
+///
+/// worker は master プロファイルから spawn されるので opt-in の所在は master 側だが、
+/// worker の role にはプロファイル名が入らない（`orchestrator-worker-claude:<タスク>`）ので
+/// 名前は解けない = [`Self::Unknown`] で穴埋めのまま案内する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileHint<'a> {
+    /// master プロファイル（`profiles/`）。`None` は名前が解けなかったとき
+    Master(Option<&'a str>),
+    /// solo プロファイル（`solo-profiles/`）
+    Solo(Option<&'a str>),
+    /// どちらとも決められない（worker / role なし）。master 形で穴埋め案内する
+    Unknown,
+}
+
+impl<'a> ProfileHint<'a> {
+    /// PC 側で opt-in する案内コマンド。名前が解けていれば具体形（#322 の最簡形）
+    pub fn enable_command(&self) -> String {
+        match self {
+            Self::Master(name) => {
+                crate::claude_remote::enable_hint_command(name.unwrap_or(PROFILE_PLACEHOLDER))
+            }
+            Self::Solo(name) => format!(
+                "{} --solo",
+                crate::claude_remote::enable_hint_command(name.unwrap_or(PROFILE_PLACEHOLDER))
+            ),
+            Self::Unknown => crate::claude_remote::enable_hint_command(PROFILE_PLACEHOLDER),
+        }
+    }
+
+    /// ペインの role から所在を解く。**判定はここ 1 か所**（daemon / dispatch が共有する）
+    pub fn from_role(role: &'a str) -> Self {
+        if let Some(name) = tako_core::handoff::master_profile_of_any_role(role) {
+            return Self::Master(Some(name));
+        }
+        // solo の role は `solo` / `solo:<名前>` の 1 語彙（`tako solo` が付ける）
+        if role == "solo" {
+            return Self::Solo(None);
+        }
+        if let Some(name) = role.strip_prefix("solo:").filter(|s| !s.is_empty()) {
+            return Self::Solo(Some(name));
+        }
+        Self::Unknown
+    }
+}
+
+/// プロファイル名が分からないときの案内コマンドの穴埋め
+const PROFILE_PLACEHOLDER: &str = "<名前>";
+
+const NOT_CONNECTED_REASON: Note = Note::new(
+    "この会話は Claude 公式の Remote Control に繋がっていません（tako の opt-in は既定 OFF です）",
+    "This conversation is not connected to Claude's official Remote Control (tako's opt-in is off by default)",
+);
+const NOT_CONNECTED_NEXT_STEP: Note = Note::new(
+    "PC 側でプロファイルを opt-in してから master / worker を立て直してください（すでに動いている会話は後から繋げられません）",
+    "Opt the profile in on your computer, then relaunch the master / worker (an already-running conversation cannot be connected afterwards)",
+);
+const UNKNOWN_REASON: Note = Note::new(
+    "会話をまだ特定できていません（起動直後か、claude 以外のプロセスです）",
+    "The conversation cannot be identified yet (it just started, or it is not a claude process)",
+);
+const UNKNOWN_NEXT_STEP: Note = Note::new(
+    "エージェントの起動が終わるまで待ってから開き直してください",
+    "Wait until the agent has finished starting, then open it again",
+);
+const UNKNOWN_BLOCKER_REASON: Note = Note::new(
+    "この環境では Remote Control を有効にできません",
+    "Remote Control cannot be enabled in this environment",
+);
+const UNKNOWN_BLOCKER_NEXT_STEP: Note = Note::new(
+    "PC 側で `tako orchestrator profiles show <名前>` を実行して理由を確認してください",
+    "Run `tako orchestrator profiles show <name>` on your computer to see the reason",
+);
 
 /// `cse_…` / `session_…` を互換形式（`session_…`）へそろえる
 /// （バイナリの `toCompatSessionId`）。**接頭辞が無い id はそのまま返す**
@@ -1001,5 +1142,142 @@ mod tests {
         .unwrap();
         assert_eq!(read_link_at(&plain).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #1077: 開けない理由を PWA へ渡す層 ---
+
+    #[test]
+    fn 繋がっていれば説明することが無い() {
+        let link = RemoteLink {
+            url: Some("https://claude.ai/code/session_01AAAAAAAAAAAAAAAAAAAAAA".into()),
+            session_id: Some("session_01AAAAAAAAAAAAAAAAAAAAAA".into()),
+            account_label: Some("univ".into()),
+            state: LinkState::Connected,
+        };
+        assert!(link.guidance(ProfileHint::Unknown).is_none());
+        let v = link.to_json();
+        assert!(v["reason"].is_null(), "繋がっているのに理由が出ている");
+        assert!(v["next_step"].is_null());
+        assert!(v["enable_command"].is_null());
+    }
+
+    #[test]
+    fn 未接続は理由と_opt_in_コマンドを返す() {
+        let link = RemoteLink::not_connected(Some("univ".into()));
+        let g = link
+            .guidance(ProfileHint::Master(Some("dev")))
+            .expect("未接続には説明が要る");
+        assert!(!g.reason.is_empty());
+        assert!(!g.next_step.is_empty());
+        assert_eq!(
+            g.enable_command.as_deref(),
+            Some("tako orchestrator profiles set dev --remote-control true"),
+            "案内コマンドが具体形になっていない（#322 の最簡形）"
+        );
+    }
+
+    #[test]
+    fn プロファイル名が解けなければ穴埋めのまま案内する() {
+        let link = RemoteLink::not_connected(None);
+        let g = link.guidance(ProfileHint::Unknown).unwrap();
+        // 嘘の名前（`default` 等）を書かない
+        assert_eq!(
+            g.enable_command.as_deref(),
+            Some("tako orchestrator profiles set <名前> --remote-control true")
+        );
+    }
+
+    #[test]
+    fn solo_は_solo_プロファイルへ案内する() {
+        let link = RemoteLink::not_connected(None);
+        let g = link.guidance(ProfileHint::Solo(Some("chat"))).unwrap();
+        assert_eq!(
+            g.enable_command.as_deref(),
+            Some("tako orchestrator profiles set chat --remote-control true --solo"),
+            "solo の設定ファイルは別の置き場（master 形で案内すると別のプロファイルを書き換えさせる）"
+        );
+    }
+
+    #[test]
+    fn role_からプロファイルの所在を解く() {
+        use ProfileHint::*;
+        assert_eq!(
+            ProfileHint::from_role("orchestrator-master"),
+            Master(Some("default"))
+        );
+        assert_eq!(
+            ProfileHint::from_role("orchestrator-master:dev"),
+            Master(Some("dev"))
+        );
+        // env 用語彙（`master:<名前>`）でも解ける（#761 の 2 語彙）
+        assert_eq!(ProfileHint::from_role("master:dev"), Master(Some("dev")));
+        assert_eq!(ProfileHint::from_role("solo"), Solo(None));
+        assert_eq!(ProfileHint::from_role("solo:chat"), Solo(Some("chat")));
+        // worker の role にはプロファイル名が入らない
+        assert_eq!(
+            ProfileHint::from_role("orchestrator-worker-claude:fix-auth"),
+            Unknown
+        );
+        assert_eq!(ProfileHint::from_role(""), Unknown);
+    }
+
+    #[test]
+    fn 環境側の阻害には_opt_in_コマンドを出さない() {
+        // #1068 の判定が返す slug（`Ineligible::kind()`）
+        let link = RemoteLink::ineligible("disabled_by_policy", None);
+        let g = link.guidance(ProfileHint::Master(Some("dev"))).unwrap();
+        assert!(
+            g.enable_command.is_none(),
+            "プロファイルを触っても直らないものに押せる案内を出している"
+        );
+        // 理由は #1068 の判定層の文言と同一（正本が 1 つ）
+        let (why, next) = crate::claude_remote::notes_for_kind("disabled_by_policy").unwrap();
+        assert_eq!(g.reason, why.text());
+        assert_eq!(g.next_step, next.text());
+    }
+
+    #[test]
+    fn 知らない阻害種別では理由を騙らない() {
+        // 上流の書式変更で未知の slug が来ても、それらしい理由をでっち上げない
+        let link = RemoteLink::ineligible("something_new_upstream", None);
+        let g = link.guidance(ProfileHint::Unknown).unwrap();
+        assert_eq!(g.reason, UNKNOWN_BLOCKER_REASON.text());
+        assert!(g.enable_command.is_none());
+        // 種別そのものは state に残るので切り分けできる
+        assert_eq!(
+            link.to_json()["state"],
+            "ineligible: something_new_upstream"
+        );
+    }
+
+    #[test]
+    fn 会話が特定できないときは待つよう案内する() {
+        let g = RemoteLink::unknown()
+            .guidance(ProfileHint::Unknown)
+            .unwrap();
+        assert_eq!(g.reason, UNKNOWN_REASON.text());
+        assert_eq!(g.next_step, UNKNOWN_NEXT_STEP.text());
+    }
+
+    #[test]
+    fn 応答の形はどの状態でも同じ_7_キー() {
+        for link in [
+            RemoteLink::unknown(),
+            RemoteLink::not_connected(Some("univ".into())),
+            RemoteLink::ineligible("agent_unsupported", None),
+        ] {
+            let v = link.to_json();
+            for key in [
+                "url",
+                "session_id",
+                "account_label",
+                "state",
+                "reason",
+                "next_step",
+                "enable_command",
+            ] {
+                assert!(v.get(key).is_some(), "{key} が無い: {v}");
+            }
+        }
     }
 }
