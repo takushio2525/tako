@@ -418,6 +418,14 @@ TAKO_SELF_TEST_976: legacy=false targets(off/on)=0/6 jobs=1 live=true after_loca
 #1083 の実測では `reverted_tiles=0`（単独 / 全節とも）で通っている。
 #945 でドット脈動が有限回になったのが効いているとみられる。
 
+**`remote_tree_visual` は #948 で全節実行の並びへ入った**（2026-09-04）。それまでは
+`TAKO_VISUAL_ONLY=remote-tree` の腕からしか呼ばれず、節指定なしの「最終確認」で
+**一度も走っていなかった**（#1072 が全節実行をすり抜けた理由でもある）。節の頭で
+`ensure_fresh_scene` を呼んで自分の場面を作るので、前の節が残したペインで
+ローカルルートが増えて**リモートの行が画面外へ押し出される**（バッジが 1 px も
+描かれない）ことは起きない。経路に載っているかは `TAKO_948_INJECT=remote-tree` で
+確かめられる。
+
 ## 17. 未検証・既知の限界
 
 - **Windows は自動検知が働かない**: 境界（`platform::procinfo`）が実行ファイル名しか
