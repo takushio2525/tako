@@ -30644,6 +30644,73 @@ mod self_test {
             })
             .ok();
 
+        // #1083: **この節が撮る場面は自分で作る**。ラウンド 1〜2 は「素のシェル 1 枚」と
+        // 「そこから 3 分割した 4 ペイン」の静止画面を見るのに、全節実行では前の節
+        // （`terminal_grid` / `markdown_preview` / `chat_table` / `conflict_card` /
+        // `ime_preedit` / ツリーガイド）が残したペインと**その出力**が同じ画面に載る。
+        // 実測（#1083）: 単独実行の `terminals=4 distinct=1 changed=0` に対し、全節実行は
+        // `terminals=7 distinct=67 changed=72` で**必ず**落ちていた（= 節の実行順への依存。
+        // 節が増えるたび再発する）。新しいタブ（素のシェル 1 枚）へ移ってから残りのタブを
+        // 全部閉じ、どの順で回っても同じ場面から始める。旧挙動は `TAKO_1083_LEGACY=1`
+        if std::env::var_os("TAKO_1083_LEGACY").is_none() {
+            let fresh = window
+                .update(cx, |app, _, cx| {
+                    let _ = tako_control::dispatch(
+                        app,
+                        tako_control::protocol::Request::TabNew {
+                            title: None,
+                            focus: Some(true),
+                            cwd: None,
+                        },
+                        PaneOrigin::User,
+                    );
+                    drain(app, cx);
+                    // **新しいタブを作ってから**閉じる。最後のタブを閉じると
+                    // `close_tab` が `LastTab` を返し、UI 層がアプリを終了させる
+                    let keep = app.workspace.active_tab().id();
+                    let others: Vec<TabId> = app
+                        .workspace
+                        .tabs()
+                        .iter()
+                        .map(|t| t.id())
+                        .filter(|id| *id != keep)
+                        .collect();
+                    for tab in others {
+                        app.remove_tab(tab, cx);
+                    }
+                    // ツリーのルートは前の節の fixture（節の最後に削除済み）を指したままに
+                    // なりうる。本番と同じ経路（ペインの cwd）で作り直す
+                    app.sync_filetree_roots();
+                    cx.notify();
+                    app.workspace.active_tab().tree().focused()
+                })
+                .expect("flicker: 前提づくりの素のタブ");
+            // プロンプトが出るまでを**状態で待つ**（#796）。固定待ちだと負荷や
+            // `visual-test` の leak-detection で数割遅くなるだけで撮影窓へずれ込む
+            wait_for_pane_ready(window, cx, fresh, Duration::from_secs(15)).await;
+            let (tabs0, terms0) = window
+                .update(cx, |app, _, _| {
+                    (app.workspace.tabs().len(), app.terminals.len())
+                })
+                .unwrap_or((0, 0));
+            println!(
+                "TAKO_VISUAL_PIXEL: flicker premise tabs={tabs0} terminals={terms0} \
+                 pane={}",
+                fresh.as_u64()
+            );
+            // 前提そのものを機械検証する（節の実行順に依らず素の 1 枚から始まる）。
+            // タブ枚数とペイン枚数は**別の check** にする: 積み上げると
+            // 「どちらが崩れたか」が出力から確定できない（conventions.md）
+            check(
+                tabs0 == 1,
+                "visual-test ちらつき: 節の頭でタブが 1 枚だけになる (#1083)",
+            );
+            check(
+                terms0 == 1,
+                "visual-test ちらつき: 節の頭で端末が 1 枚だけになる (#1083)",
+            );
+        }
+
         // --- ラウンド 1: 起動直後の 1 ペイン（静止） ---
         // 窓が落ち着くまで実フレームを重ねてから撮る（初回の全面描画を測らない）
         for _ in 0..10 {
@@ -31943,13 +32010,11 @@ mod self_test {
                 }
                 "ime-preedit" => {
                     ime_preedit_visual(any, window, cx).await;
-
-            // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
-            // 追従するか（ホバープレビューで測る）
-            screen_lines_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
+                // 追従するか（ホバープレビューで測る）
                 "screen-lines" => {
                     screen_lines_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");

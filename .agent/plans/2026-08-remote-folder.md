@@ -410,6 +410,14 @@ TAKO_SELF_TEST_976: legacy=false targets(off/on)=0/6 jobs=1 live=true after_loca
 （きれい）で、全節通しのときだけ汚れる: 前の節が残したペイン（7 枚）と出力が
 「静止画面」の前提を崩している。これも main と同じ形。
 
+**この 2 段落は #1083 で解消済み**（2026-09-03）。`flicker_visual` が節の頭で
+自分の前提を用意する（新しいタブへ移る → 残りのタブを閉じる → ツリーのルートを
+作り直す）ようにしたので、全節実行でも `idle-4pane terminals=4 distinct=1 changed=0`
+で通り、**全節実行が `TAKO_VISUAL_TEST_OK` で完走する**（3 回連続で実測）。
+上表の `output-running reverted_tiles=5 / 7`（反転タイルはタブバーの帯 = ドット脈動）は
+#1083 の実測では `reverted_tiles=0`（単独 / 全節とも）で通っている。
+#945 でドット脈動が有限回になったのが効いているとみられる。
+
 ## 17. 未検証・既知の限界
 
 - **Windows は自動検知が働かない**: 境界（`platform::procinfo`）が実行ファイル名しか
