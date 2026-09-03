@@ -92,6 +92,20 @@ export function createClient() {
     messages(sessionId, tail = 30) {
       return request('GET', `/api/sessions/${encodeURIComponent(sessionId)}/messages?tail=${tail}`);
     },
+    // --- SSH の切り替え / 新規接続（#1080。role は manage）---
+    // ~/.ssh/config の Host 一覧。押せる先が無い端末には配らない（manage 必須）
+    sshHosts() {
+      return request('GET', '/api/ssh-hosts');
+    },
+    // このペインをそのまま SSH にする（#1006 の target=pane。pane ID は変わらない）。
+    // target を渡せばそのペインを分割元にして新しいペイン / タブへも開ける
+    sshPane(id, host, opts = {}) {
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/ssh`, { host, ...opts });
+    },
+    // ペインを指定しない接続（既定 = いま開いているタブへ新ペイン = #1006 の既定）
+    sshOpen(host, opts = {}) {
+      return request('POST', '/api/ssh', { host, ...opts });
+    },
     // リサイズ要求は存在しない: リモート表示は PC 側のペインサイズに一切影響しない（#63）
     wsUrl(paneId) {
       const proto = base.startsWith('https') ? 'wss' : 'ws';
