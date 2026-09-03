@@ -491,11 +491,35 @@ fn format_evidence(exit_code: i32, stdout: &str, stderr: &str) -> String {
         }
     }
     let joined = parts.join("; ");
-    if joined.len() > 2000 {
-        format!("{}...(truncated)", &joined[..2000])
+    if joined.len() > EVIDENCE_MAX_BYTES {
+        format!(
+            "{}...(truncated)",
+            &joined[..floor_char_boundary(&joined, EVIDENCE_MAX_BYTES)]
+        )
     } else {
         joined
     }
+}
+
+/// evidence の上限（バイト）
+const EVIDENCE_MAX_BYTES: usize = 2000;
+
+/// `max` バイト以下で**文字境界**へ丸めた位置。
+///
+/// `&s[..max]` の素の切り出しは**マルチバイト文字の途中で panic する**。
+/// 述語の出力は任意なので日本語が来うるし、#935 で Windows の出力を UTF-8 へ
+/// 揃えたことで**正しい多バイト列が届くようになった**（それまでは CP932 が
+/// `from_utf8_lossy` で置換文字へ潰れていて偶然 3 バイト境界に乗っていた）。
+/// `str::floor_char_boundary` は unstable なので自前で持つ
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -714,6 +738,31 @@ mod tests {
         let evidence = format_evidence(0, &stdout, "");
         assert!(evidence.len() <= 2100);
         assert!(evidence.contains("truncated") || evidence.contains("last 5/"));
+    }
+
+    /// 上限での切り詰めが**マルチバイト文字の途中で panic しない**（#935）。
+    ///
+    /// 素の `&joined[..2000]` は境界を外れると panic する。述語の出力は任意なので
+    /// 日本語が来うるし、Windows の出力を UTF-8 へ揃えた（#935）ことで
+    /// **正しい多バイト列が届くようになった**ぶん現実的な経路になった
+    #[test]
+    fn format_evidence_は多バイト文字の途中で切らない() {
+        // 上限をまたぐ位置に 3 バイト文字が並ぶよう、境界を 1 バイトずつ動かして総当たり
+        for pad in 0..8 {
+            let stdout = format!("{}{}", "x".repeat(pad), "あ".repeat(1200));
+            let evidence = format_evidence(0, &stdout, "");
+            assert!(
+                evidence.ends_with("...(truncated)"),
+                "pad={pad} で切り詰めが起きていない"
+            );
+            // 切り詰めた本文が壊れていない（置換文字が混ざらない）
+            assert!(
+                !evidence.contains('\u{fffd}'),
+                "pad={pad} で文字が壊れた: {}",
+                &evidence[..40.min(evidence.len())]
+            );
+            assert!(evidence.len() <= EVIDENCE_MAX_BYTES + 32, "pad={pad}");
+        }
     }
 
     #[test]
