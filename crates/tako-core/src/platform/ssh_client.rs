@@ -80,8 +80,8 @@ pub fn legacy() -> bool {
 
 /// 多重化が無いプラットフォームの縮退。**文言はここ 1 箇所**（設計 §3・§4）
 pub const NO_MULTIPLEXING: Note = Note::new(
-    "Windows の OpenSSH は接続多重化（ControlMaster）に対応しないため、操作ごとに独立した SSH 接続になる。鍵・ssh-agent で入れる相手は変わらないが、パスワード認証しか無い相手はツリーの展開やファイルの取得のたびに認証が要る。接続が生きているかもソケットで判定できない（#1090）",
-    "The Windows OpenSSH client has no connection multiplexing (ControlMaster), so every operation opens its own SSH connection. Hosts reachable by key or ssh-agent behave the same, but a password-only host asks for credentials on every tree expansion or file fetch, and liveness cannot be determined from a control socket (#1090)",
+    "Windows の OpenSSH は接続多重化（ControlMaster）に対応しないため、操作ごとに独立した SSH 接続になる。鍵・ssh-agent で入れる相手は変わらないが、パスワード認証しか無い相手はツリーの展開やファイルの取得のたびに認証が要る。接続が生きているかもソケットで判定できないので、切断後の自動再接続（#1040）も armed にならない（#1090）",
+    "The Windows OpenSSH client has no connection multiplexing (ControlMaster), so every operation opens its own SSH connection. Hosts reachable by key or ssh-agent behave the same, but a password-only host asks for credentials on every tree expansion or file fetch. Liveness cannot be determined from a control socket, so automatic reconnection after a drop (#1040) does not arm either (#1090)",
 );
 
 #[cfg(test)]

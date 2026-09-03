@@ -2968,9 +2968,6 @@ struct SshConnect {
     reconnect_line: String,
     /// このペインで一度でも接続が成立したか。
     /// **これが false のペインは自動再接続しない**（届かない相手を延々と叩かない）
-    /// tako のバナーがこのペインに**一度でも**出たか（#1090。相手のログインで
-    /// 画面から流れて消えるので、窓の中だけでは「まだ出ていない」と区別できない）
-    banner_seen: bool,
     ever_connected: bool,
     /// 切断を観測した時刻（`Reconnecting` の間だけ Some）
     disconnected_at: Option<std::time::Instant>,
@@ -9366,29 +9363,24 @@ impl TakoApp {
                 st.baseline_index.min(lines.len())
             };
             let new_lines = &lines[from..];
-            // #1090: バナーは相手のログインで流れて消える。**一度でも見たか**を覚える
             let prints = tako_core::remote_fs::pane_prints(&st.host);
-            if !st.banner_seen && tako_core::ssh_progress::window_has_tako_print(new_lines, &prints)
-            {
-                if let Some(st) = self.ssh_connect.get_mut(&pane) {
-                    st.banner_seen = true;
-                }
-            }
-            let Some(st) = self.ssh_connect.get(&pane) else {
-                continue;
-            };
+            // #1090: **接続が成立した証拠**。多重化のソケットは接続が張れて初めて
+            // 作られるので、これだけが「一度でも繋がった」と言ってよい材料になる
+            // （#1040 の自動再接続の前提）。多重化が無いプラットフォームでは
+            // 常に false = **自動再接続は armed にならない**（宣言済みの縮退。
+            // `platform::ssh_client::NO_MULTIPLEXING`）
+            let master_socket = tako_core::remote_fs::control_path(&st.host)
+                .map(|p| p.exists())
+                .unwrap_or(false);
 
             match st.phase.clone() {
                 // --- 接続待ち（#1010 のまま）------------------------------------
                 ConnectPhase::Connecting => {
                     let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                         new_lines,
-                        master_socket: tako_core::remote_fs::control_path(&st.host)
-                            .map(|p| p.exists())
-                            .unwrap_or(false),
+                        master_socket,
                         screen_changed: fingerprint != st.baseline_fingerprint,
                         fresh_pane: st.fresh_pane,
-                        banner_seen: st.banner_seen,
                         // #1090: 折り返されたバナーの続き行を ssh の出力と読まない
                         tako_prints: &prints,
                     });
@@ -9396,7 +9388,10 @@ impl TakoApp {
                         // #1040: ここで捨てずに**見張りへ移る**。切断を拾うため
                         ConnectPhase::Opened => {
                             if let Some(st) = self.ssh_connect.get_mut(&pane) {
-                                st.ever_connected = true;
+                                // #1090: `Opened` は「沈黙が破れた」までしか言わない
+                                // （器や下のシェルが描いた行でもここへ来る）。
+                                // **一度でも繋がった**は多重化のソケットだけが証明する
+                                st.ever_connected |= master_socket;
                                 st.phase = ConnectPhase::Connected;
                                 st.rebase(&lines);
                             }
@@ -9410,6 +9405,15 @@ impl TakoApp {
                 }
                 // --- 使えている: 切れていないかだけを見る（#1040）----------------
                 ConnectPhase::Connected => {
+                    // 見張っている間にソケットが出てきたらそこで証拠が揃う（#1090）
+                    if master_socket && !st.ever_connected {
+                        if let Some(st) = self.ssh_connect.get_mut(&pane) {
+                            st.ever_connected = true;
+                        }
+                    }
+                    let Some(st) = self.ssh_connect.get(&pane) else {
+                        continue;
+                    };
                     let Some((_signal, reason)) =
                         reconnect::detect_disconnect(new_lines, exit_code)
                     else {
@@ -9452,13 +9456,10 @@ impl TakoApp {
                     if st.attempt_pending {
                         let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                             new_lines,
-                            master_socket: tako_core::remote_fs::control_path(&st.host)
-                                .map(|p| p.exists())
-                                .unwrap_or(false),
+                            master_socket,
                             screen_changed: fingerprint != st.baseline_fingerprint,
                             // 打ち直しは**必ず既存シェルへ 1 行**なので fresh ではない
                             fresh_pane: false,
-                            banner_seen: st.banner_seen,
                             tako_prints: &prints,
                         });
                         match phase {
@@ -19086,7 +19087,6 @@ impl UiStateHost for TakoApp {
                 baseline_fingerprint: tako_control::limit_stop::screen_fingerprint(&lines),
                 phase: tako_core::ssh_progress::ConnectPhase::Connecting,
                 reconnect_line: reconnect_line.to_string(),
-                banner_seen: false,
                 ever_connected: false,
                 disconnected_at: None,
                 attempts: 0,

@@ -120,7 +120,14 @@ pub fn is_recoverable_reason(reason: Option<&str>) -> bool {
 
 /// 自動再接続を仕掛けてよいか。
 ///
-/// `ever_connected` = このペインで一度でも接続が成立したか（モジュール doc 参照）
+/// `ever_connected` = このペインで一度でも接続が成立したか（モジュール doc 参照）。
+///
+/// **「画面が動いた」を証拠にしてはいけない**（#1090）: 器（psmux / tmux）や下のシェルも
+/// 描くので、[`crate::ssh_progress::ConnectPhase::Opened`] は「沈黙が破れた」までしか
+/// 言わない。繋がったことが一度も無いホストへ ssh を打ち直す事故を実機で踏んだ。
+/// 呼び出し側は多重化のソケット（接続が張れて初めて作られる）を証拠にする。
+/// 多重化を持たないプラットフォームでは証拠が無いので armed にならない
+/// （宣言済みの縮退。[`crate::platform::ssh_client::NO_MULTIPLEXING`]）
 pub fn should_arm(enabled: bool, ever_connected: bool) -> bool {
     enabled && ever_connected
 }
