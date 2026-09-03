@@ -1106,7 +1106,6 @@ pub fn ssh_pane_script(
             // （同値であることは `posix_の条件はis_client_failureと同値` が固定する）。
             // 逆に「0 以外」へ広げると、リモートのログインシェルが `exit 1` で
             // 抜けただけのペインに「接続に失敗しました」と出てしまう
-            let _ = rule;
             let cmd = argv
                 .iter()
                 .map(|a| crate::shell::quote_for_shell(a))
