@@ -18,6 +18,8 @@ pub mod os_integration;
 /// アイドルスリープ防止（境界 B9。macOS 以外。#524）
 pub mod power;
 pub mod process;
+/// マシンの混み具合（境界 B25。診断専用。#1073）
+pub mod sysload;
 
 /// テスト専用: **機械全体で 1 つしかない状態**を触るテストを直列化する錠。
 ///

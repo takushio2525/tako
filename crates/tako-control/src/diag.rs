@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+pub use crate::platform::sysload::MachineLoad;
+
 /// ローテート閾値（これを超えたら `.old` へ退避して新しいファイルを始める）
 const ROTATE_BYTES: u64 = 256 * 1024;
 
@@ -91,30 +93,28 @@ pub fn perf_log(msg: &str) {
     append_log(perf_log_path(), msg);
 }
 
-/// 1 / 5 / 15 分の load average。取得できない環境（Windows 等）では `None`（#796）。
+/// いまのマシンの混み具合。取得できなければ `None`（#796 / #1073）。
 ///
-/// セルフテストの失敗ログに残すためだけの観測値で、製品の判断には使わない。
-/// 「同じコードなのに回によって落ちる項目が変わる」の切り分けに、**そのときの
-/// マシンの混み具合**が必要だった（実測: load 6〜16 の帯で落ちる項目が入れ替わる）
-pub fn load_average() -> Option<[f64; 3]> {
-    #[cfg(unix)]
-    {
-        let mut out = [0f64; 3];
-        // getloadavg(3): 埋められた要素数を返す（負値は失敗）
-        let filled = unsafe { libc::getloadavg(out.as_mut_ptr(), 3) };
-        (filled == 3).then_some(out)
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+/// 実装は境界 [`crate::platform::sysload`]（unix = load average / Windows = 短い窓の
+/// CPU 使用率）。**Windows では約 120ms ブロックする**ので、診断 1 行を作るとき以外から
+/// 呼んではいけない
+pub fn machine_load() -> Option<MachineLoad> {
+    crate::platform::sysload::sample()
 }
 
-/// load average を診断 1 行用の表記へ（`load=6.17/5.79/5.47`）。
-/// 取得できなければ `load=unknown`。純粋関数なので単体テストで固定できる
-pub fn format_load_average(load: Option<[f64; 3]>) -> String {
+/// 混み具合を診断 1 行用の表記へ（unix は `load=6.17/5.79/5.47`、
+/// Windows は `load=cpu42%/12cpu`）。取得できなければ `load=unknown`。
+///
+/// unix の表記は**1 文字も変えていない**（過去のログ・記録と突き合わせられるように）。
+/// 純粋関数なので単体テストで両プラットフォームぶんを固定できる
+pub fn format_machine_load(load: Option<MachineLoad>) -> String {
     match load {
-        Some([one, five, fifteen]) => format!("load={one:.2}/{five:.2}/{fifteen:.2}"),
+        Some(MachineLoad::Average([one, five, fifteen])) => {
+            format!("load={one:.2}/{five:.2}/{fifteen:.2}")
+        }
+        Some(MachineLoad::CpuBusy { percent, cpus }) => {
+            format!("load=cpu{percent:.0}%/{cpus}cpu")
+        }
         None => "load=unknown".to_string(),
     }
 }
@@ -651,25 +651,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 表記は**両プラットフォームぶんを macOS からも固定する**（#1073）。
+    /// unix 側の書式は 1 文字も変えていない（過去のログと突き合わせられるように）
     #[test]
-    fn load_averageの表記は取得可否で決まる() {
+    fn 混み具合の表記は取得可否と指標の種類で決まる() {
         assert_eq!(
-            format_load_average(Some([6.171, 5.79, 5.4])),
+            format_machine_load(Some(MachineLoad::Average([6.171, 5.79, 5.4]))),
             "load=6.17/5.79/5.40"
         );
-        assert_eq!(format_load_average(None), "load=unknown");
+        assert_eq!(
+            format_machine_load(Some(MachineLoad::CpuBusy {
+                percent: 41.6,
+                cpus: 12
+            })),
+            "load=cpu42%/12cpu"
+        );
+        assert_eq!(format_machine_load(None), "load=unknown");
     }
 
-    #[cfg(unix)]
+    /// **どの OS でも `load=unknown` が既定にならない**こと（#1073 の主目的）。
+    /// Windows は境界が CPU 使用率を返すので、ここは cfg で分岐しない
     #[test]
-    fn unixではload_averageが取れて非負に収まる() {
-        let load = load_average().expect("unix では getloadavg が 3 要素返す");
-        for value in load {
-            assert!(
-                value.is_finite() && value >= 0.0,
-                "load average が異常: {load:?}"
-            );
-        }
+    fn この環境では混み具合が採れる() {
+        let shown = format_machine_load(machine_load());
+        assert_ne!(shown, "load=unknown", "この OS で混み具合が採れていない");
     }
 
     #[test]
