@@ -3905,3 +3905,99 @@ Windows に `sh` は無いので `CreateProcess` が失敗する。**登録（`g
   `tar` で送った**（`dist` は gitignore なので worktree を汚さない）
 - `git -C <repo> worktree add <相対パス>` は**リポジトリの中**に worktree を作る。
   絶対パスで渡すこと（1 回踏んで作り直した）
+#### #936 の記録（実行中プロセスのパス解決を境界へ。PR #1115・2026-09-04）
+
+**症状**: Windows で古い claude の警告バナーが出ない。`stale_binary::pidpath` が
+macOS の `proc_pidpath` と Linux の `/proc/<pid>/exe` だけで書かれており **Windows は
+常に `None`**。実行中の claude を特定できないので比較が成立せず、エラーも出ない
+（#722 / #525 と同じ「機能が黙って無効になる」形）。
+
+##### 実測で覆った前提（Issue の見立てとの差）
+
+Issue は「`pidpath` が `…\versions\<ver>\claude.exe` を返す」= macOS と同じ形を
+期待していたが、**Windows の claude はランチャが symlink ではない**:
+
+| 事実 | 実測（2026-09-04 / claude 2.1.247） |
+|---|---|
+| `%USERPROFILE%\.local\bin\claude.exe` | `LinkType` 空 / `fsutil hardlink list` は 1 件 = **実体のコピー**。`versions\2.1.247` と SHA256 一致 |
+| `versions\<版>` | **ディレクトリではなくファイル**（実行ファイル自身。macOS と同じ） |
+| 自己更新の形 | 旧 exe を `claude.exe.old.<ts>` へ**改名** → 新 exe を同じ名前で設置（実機に `.old.1787816114562` が残っていた） |
+| 版リソース | `claude.exe` は `FileVersion=2.1.247.0` を持つ（`versions\<版>` も同値） |
+
+つまり**パスから版は読めない**。にもかかわらず比較の形は両 OS で同じままになる:
+`QueryFullProcessImageNameW`（フラグ 0）が**改名を反映する**ので、古いプロセスのパスが
+`…\claude.exe.old.<ts>` へ変わり「実行中 ≠ 現在」で stale が立つ。
+
+##### API の選び方（決定的な対照実験）
+
+実行中の exe を改名して、3 つの取得手段を同じ pid に対して読んだ:
+
+```
+before/Win32   : …\rename-exp\fake.exe
+after /Win32   : …\rename-exp\fake.old.exe      ← 改名を反映（これを使う）
+after /Native  : \Device\HarddiskVolume3\…\fake.exe   ← PROCESS_NAME_NATIVE は反映しない
+after /GetProc : …\rename-exp\fake.exe          ← .NET Process.Path / GetModuleFileNameEx も反映しない
+dead  /Win32   : Query-failed:31                ← 死んだ pid は None
+```
+
+**`Get-Process` で見えているパスを根拠にしてはいけない**（改名前の名前が出る）。
+最初の棚卸しで「実行中の claude 35 本はすべて `.local\bin\claude.exe`」と読めたのは
+この API 差のせいで、古いプロセスが混ざっていても見分けられない。
+
+##### 直した形
+
+- 境界 B5 に `procinfo::image_path`（3 プラットフォームぶん）。`pidpath` は委譲だけ
+- `is_executable_file` を境界 B16 へ（Windows は `PATHEXT`）。旧実装は非 unix で無条件 `true`
+- `extract_version_from_path` の区切りを `/` と `\` の両対応へ（#726 の引き継ぎ分）。
+  **`Path::components` は使わない**: Windows 形が macOS 上で 1 成分に見えて検査できない
+- 版が読めないときの中間段に **Windows の版リソース**（`exe::file_version`）。
+  無いと 253MB の claude を定期走査のたびに `--version` で起こす（#772 に反する）
+- **比較の 2 辺を同じ正規化で作る**（B26 = `platform::path::canonicalize`）。
+  素の `canonicalize` は verbatim を返すので、剥がさないと**常に stale** になる（#970）
+
+##### 実測（Windows 11 / 隔離 GUI）
+
+同一マシン・同一場面での A/B（`stale_binary.rs` だけを `origin/main` へ戻して再ビルド）。
+偽 claude は `PING.EXE` のコピーで、パスに `claude` が入るので検知経路は本番と同じ形になる。
+
+| 場面 | before（main の `stale_binary.rs`） | after（この PR） |
+|---|---|---|
+| `versions\1.0.0\claude.exe` を走らせ PATH は `versions\1.0.1` | `stale=false` / `spawned_binary=null` / `pid=null` / `current_binary=\\?\C:\…`（**verbatim**） / 版はどちらも `""` | `stale=true` / `spawned_binary=…\versions\1.0.0\claude.exe` / `pid=58520` / 版 `1.0.0` → `1.0.1`（**パス由来 = CLI を起こさない**） |
+| GUI のバナー | **出ない**（同じレイアウトでバナー行が無い） | **「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」+「張り直す」** |
+
+**この 1 回の測定で 3 つの欠陥が同時に見える**（before の応答）:
+`spawned_binary=null` = #936 本体 / `current_binary` の verbatim prefix = 直さないと
+2 辺が必ず食い違い**常に stale**（偽バナー）になる / 版が `""` = `/versions/` 決め打ち（#726 の引き継ぎ分）。
+
+追加の場面（after のみ）:
+
+| 場面 | 結果 |
+|---|---|
+| 現在のランチャそのものを走らせる（陰性対照） | `stale=false` / 2 辺のパスがバイト一致（verbatim prefix 無し = B26 が効いている） |
+| **claude の自己更新と同じ形**（旧 exe を改名 → 新 exe を同名で設置） | 同じ pid のまま `stale=false → true` / `spawned_binary=…\claude.exe.old.1788459708936` |
+| パスに版が入らないランチャ（Windows の実配置と同じ形） | `spawned_version=10.0.26100.8115` = **版リソースから読めている**（CLI 起動なし） |
+| `stale-binary restart`（張り直しボタンの経路） | 会話 ID が無い偽 claude なので `session_unresolved` で止まる（**何も殺さない**）。`session-restart` の下見に `agent_pid` が載る = 境界の副産物 |
+
+**実機テスト**: `cargo test --workspace --no-fail-fast` の失敗の一意な名前が **24 → 22 件**。
+減ったのは `stale_binary::tests::test_pidpath_self` と
+`…::ランチャ探索は実行可能な通常ファイルだけを拾う` の **2 件だけ**で、**新規失敗はゼロ**
+（#1073 の記録の一覧と名前で突き合わせた）。stale_binary の単体は実機で 19/19 緑。
+**警告は 1 件も増えていない**（発生源は scroll / tmux_backend / remote / sleep_guard /
+video_player の既存分だけ = 触ったファイルは含まれない）。
+
+##### 作法として残すもの
+
+- **実行中プロセスのパスは 3 通りの取り方があり、改名の扱いが違う**。改名を反映するのは
+  `QueryFullProcessImageNameW(flags=0)` だけ。`Get-Process` / `GetModuleFileNameEx` /
+  `PROCESS_NAME_NATIVE` で「いま動いているのはどのファイルか」を判断しない
+- **claude の配置は OS で違う**（macOS = symlink / Windows = コピー + 改名）。
+  「macOS と同じ形のはず」で書いた期待値は Windows で必ず外れる（#920 / #898 と同型）
+
+##### セルフテスト項目 103（#772）を Windows へ移さなかった理由
+
+場面作りが **symlink のランチャ**と **POSIX シェルの器**（`sh -c "… & wait"`）に依っている。
+実測では `CreateSymbolicLinkW`（フラグ 0 / 2 とも）が **SSH セッションでは成功**したが、
+それはこのセッションが特権を持っているからで（`AllowDevelopmentWithoutDevLicense` は未設定 =
+開発者モードは OFF）、**素のユーザーで走る tako のセルフテストでは前提にできない**。
+判定そのもの（`image_path` / 版の読み取り / 実行ファイル判定）は境界の単体テストが
+**両プラットフォームで**見ているので、項目 103 は非 unix で理由つき SKIP にした。
