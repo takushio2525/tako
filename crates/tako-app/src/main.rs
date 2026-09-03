@@ -9372,6 +9372,19 @@ impl TakoApp {
             let master_socket = tako_core::remote_fs::control_path(&st.host)
                 .map(|p| p.exists())
                 .unwrap_or(false);
+            if std::env::var("TAKO_1090_DIAG").as_deref() == Ok("1") {
+                let nonempty: Vec<&String> =
+                    new_lines.iter().filter(|l| !l.trim().is_empty()).collect();
+                println!(
+                    "TAKO_1090_DIAG: pane={} phase={:?} fresh={} from={from} lines={} nonempty={} first={:?} sock={master_socket}",
+                    pane.as_u64(),
+                    st.phase.as_str(),
+                    st.fresh_pane,
+                    lines.len(),
+                    nonempty.len(),
+                    nonempty.first().map(|l| l.chars().take(40).collect::<String>()),
+                );
+            }
 
             match st.phase.clone() {
                 // --- 接続待ち（#1010 のまま）------------------------------------

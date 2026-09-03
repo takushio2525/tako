@@ -438,6 +438,34 @@ mod tests {
         );
     }
 
+    /// #1090: 実機で観測した「繋がったペインの画面」でちゃんと畳むか
+    /// （Windows OpenSSH のログインシェルが出すバナー）
+    #[test]
+    fn 実機の接続成功画面で畳む() {
+        let l = lines(&[
+            "tako: tako1090 へ接続しています…（中止は Ctrl+C）",
+            "Windows PowerShell",
+            "Copyright (C) Microsoft Corporation. All rights reserved.",
+            "",
+            "PS C:\\Users\\winuser>",
+        ]);
+        let mut i = inputs(&l, true);
+        i.tako_prints = std::slice::from_ref(Box::leak(Box::new(
+            "tako: tako1090 へ接続しています…（中止は Ctrl+C）".to_string(),
+        )));
+        assert_eq!(classify(&i), ConnectPhase::Opened);
+        // バナーが流れて消えたあとも同じ
+        let l2 = lines(&[
+            "Windows PowerShell",
+            "Copyright (C) Microsoft Corporation. All rights reserved.",
+            "",
+            "PS C:\\Users\\winuser>",
+        ]);
+        let mut i2 = inputs(&l2, true);
+        i2.tako_prints = i.tako_prints;
+        assert_eq!(classify(&i2), ConnectPhase::Opened);
+    }
+
     /// #1090: 規則 ④ は「沈黙が破れた」しか言っていない。
     ///
     /// 器（psmux / tmux）や下のシェルが先に描いた行でもここは `Opened` を返す。
