@@ -1139,8 +1139,8 @@ pub const MATRIX: &[AgentFeature] = &[
             "Detects that the agent has stopped at a block that time cannot clear (#1106)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_INVESTIGATED, 1107),
-        agy: pending(notes::NOT_INVESTIGATED, 1107),
+        codex: S::Supported,
+        agy: S::Supported,
         local: unsupported(notes::NO_LOCAL_ENTITLEMENT),
         evidence: AgentEvidence::Measured(
             "#1106: claude 2.1.258 のバイナリで阻害の前置き（`dCt` / `pCt` / `Par`）を読み、\
@@ -1148,11 +1148,34 @@ pub const MATRIX: &[AgentFeature] = &[
              管理者による無効化・グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・\
              組織でのサービス無効 —— を `tako_core::limit_resume::entitlement_block_line` \
              で受け、`WorkerErrorKind::EntitlementBlocked`（`needs_human`）として返す。\
-             実文言の fixture は `detect_worker_errorは時間で解けない阻害を別種として検知する`、\
-             上限停止（#1093 / #1096）と排他であることは \
-             `issue1106_時間で解けない阻害は上限停止と混ざらない` が固定している。\
-             codex / agy に同等の状態があるかは**まだ調べていない**（追跡 #1107）ので \
-             Pending。ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
+             #1107（2026-09-04 の実物調査）: codex 0.153.0 のバイナリに \
+             **6 実文言 / 3 分類**（クレジット残高の枯渇 = `You're out of credits.` / \
+             `Your workspace is out of credits. {Add credits to continue. | Ask your \
+             workspace owner to refill in order to continue. | Add credits to continue \
+             using Codex.}`、spend cap = `You hit your spend cap set {in your workspace | \
+             by the owner of your workspace}. …`、workspace のクレジット上限 = \
+             `You've reached your workspace credit limit` + `… Notify owner?`）、\
+             agy 1.1.25 に **2 実文言**（`AI: Out of credits` = 前払いクレジットが 0。\
+             変更履歴に「spurious \"Out of credits\" errors」の修正が 2 件あり実表示だと分かる / \
+             `No license available for this project and location. Contact your \
+             administrator to setup Gemini Enterprise for this project.`）が在ることを確認し、\
+             `out of credits` / `spend cap` / `workspace credit limit` / \
+             `no license available` の 4 語句として受ける。**この 4 語句は claude 2.1.258 の \
+             バイナリに 1 件も無い**（各 0 件。逆に claude の `out of usage credits` 12 件・\
+             `spend limit` 75 件は codex / agy に 0 件 = 語彙が系統ごとに分かれている）ので \
+             claude の判定は 1 ビットも変わらない。**座席種別・組織のサービス無効に相当する \
+             停止文言は codex / agy には無い**（`disabled for your` 0 件。`seat` は Seatbelt \
+             サンドボックスと SQL 予約語、`entitlement` は MCP の `openai/entitlementContext` \
+             = ツール権限の文脈で停止文言ではない）。**codex の構造化ソースでは区別できない** \
+             （rollout の `rate_limits` は `used_percent` / `resets_at` / `window_minutes` \
+             だけで、クレジット残高や権利の欠如を表すフィールドが無い = #985 の枠情報のみ）\
+             ので画面の文言が唯一の根拠になる。実文言の fixture は \
+             `detect_worker_errorはcodexとagyの阻害も別種として検知する` / \
+             `issue1107_codexとagyの阻害文言も別種として読む`、上限停止（#1093 / #1096 / #985）\
+             との排他は `issue1107_workspace_credit_limitはテンプレートより阻害が優先する` と \
+             `issue1107_codexの上限系は従来どおり時間で解ける扱い` が固定している。\
+             **残高を 0 にして実際に踏ませる再現はしていない**（課金・管理者権限が要る）。\
+             ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
         ),
     },
     AgentFeature {
