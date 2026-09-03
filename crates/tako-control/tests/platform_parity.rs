@@ -896,11 +896,6 @@ fn canonicalizeの直呼びが境界の外に残っていない() {
              突き合わせるだけで保存しない",
         ),
         (
-            "crates/tako-control/src/dispatch.rs",
-            1,
-            "tmux e2e テスト内",
-        ),
-        (
             "crates/tako-control/src/remote.rs",
             2,
             "アップロード先のトラバーサル防止（#287 の P2-4）。`canonicalize` の \

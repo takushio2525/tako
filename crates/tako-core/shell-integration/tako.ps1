@@ -115,10 +115,13 @@ if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {
     # Defence in depth for #970. A verbatim path (\\?\C:\dir) becomes //?/C:/dir once the
     # separators are replaced, and file:/// + that is a path nothing can open: the pane cwd
     # ends up as ///?/C:/dir and every git operation in that tab fails. tako strips the prefix
-    # where it resolves paths (tako_core::platform::path, boundary B26), but the location can
-    # also become verbatim from outside tako (Set-Location \\?\C:\dir), and only the emitter
-    # sees that. Stripping here is unconditional: unlike the Rust side, which keeps the prefix
-    # when removing it would change meaning, there is no usable URI form that keeps it.
+    # where it resolves paths (tako_core::platform::path, boundary B26), but a shell can still
+    # INHERIT a verbatim working directory: Set-Location rejects those (the FileSystem provider
+    # answers 'Cannot find path' - measured), so the only way in is the cwd handed to
+    # CreateProcess - tako itself started from one, or a pane reopened from a layout that a
+    # pre-#970 build wrote. Only the emitter sees that. Stripping here is unconditional: unlike
+    # the Rust side, which keeps the prefix when removing it would change meaning, there is no
+    # usable URI form that keeps it.
     function global:__takoStripVerbatim([string] $path) {
         $ic = [System.StringComparison]::OrdinalIgnoreCase
         if ($path.StartsWith('\\?\UNC\', $ic)) { return '\\' + $path.Substring(8) }

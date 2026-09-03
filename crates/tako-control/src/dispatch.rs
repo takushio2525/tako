@@ -13837,10 +13837,21 @@ mod tests {
             .attached_options
             .get(&pane)
             .expect("シェルが起動依頼される");
+        // 期待値は**境界から作る**（#970 / 作法 11）。素の `canonicalize` で書くと
+        // Windows では verbatim（`\\?\C:\…`）になり、製品が正しく prefix を落として
+        // いるのに落ちる = 決め打ちのテストが直った実装を咎める形になる
+        let expected = tako_core::platform::path::canonicalize(&dir).unwrap();
         assert_eq!(
             spawned.cwd.as_deref(),
-            Some(dir.canonicalize().unwrap().as_path()),
+            Some(expected.as_path()),
             "頼まれたフォルダでシェルが立つ"
+        );
+        // #970 の不変条件そのもの: シェルへ渡す cwd に verbatim prefix を残さない
+        // （残すと OSC 7 経路で `///?/C:/…` へ壊れて git 操作が全滅する）
+        assert!(
+            !expected.display().to_string().contains(r"\\?\"),
+            "起動 cwd に verbatim prefix が残っている: {}",
+            expected.display()
         );
         assert!(spawned.command.is_none(), "既定シェルを起動する");
 

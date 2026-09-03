@@ -205,11 +205,13 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
   意味が変わる形（`MAX_PATH` 超え / `/` を含む / `.` `..` や空の成分 / 末尾が `.` か
   空白の成分 / `NUL` などの予約デバイス名 / ボリューム GUID 形）は verbatim のまま返す。
   **剥がして別の場所を指すより、既知の不具合が残るほうが安全**という判断
-- 発信側（`shell-integration/tako.ps1` の `__takoStripVerbatim`）でも剥がす。
-  `Set-Location \\?\C:\…` のように **tako の外**から verbatim になる経路があり、
-  それを見られるのは OSC を出すスクリプトだけ。ただし**入口の代わりにはならない**
-  （prefix は cwd 以外にも漏れる）。順序（置換より前に剥がす）は番犬
-  `osc7を組む前にverbatimを剥がしている` が固定する
+- 発信側（`shell-integration/tako.ps1` の `__takoStripVerbatim`）でも剥がす。シェルが
+  verbatim な作業ディレクトリを**継承する**経路が残るため: `Set-Location` は verbatim を
+  拒否する（FileSystem プロバイダが `Cannot find path` を返す = 実測）ので、入り口は
+  **`CreateProcess` へ渡る cwd だけ** — tako 自身が verbatim な cwd で起動された場合と、
+  #970 より前の版が保存した layout の cwd で開き直した場合。それを見られるのは OSC を出す
+  スクリプトだけ。ただし**入口の代わりにはならない**（prefix は cwd 以外にも漏れる）。
+  順序（置換より前に剥がす）は番犬 `osc7を組む前にverbatimを剥がしている` が固定する
 
 ## 一括 dismiss に食われないクリック要素の作り方（Issue #496 / #503）
 
