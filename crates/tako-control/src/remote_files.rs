@@ -68,6 +68,8 @@ impl TreeRoot {
             "name": self.name,
             "tab": self.tab,
             "tab_title": self.tab_title,
+            // SSH 先ルート（#1085）と 1 本の一覧に並ぶので、どちら側かを明示する
+            "ssh": false,
         })
     }
 }
@@ -78,12 +80,19 @@ impl TreeRoot {
 /// 「その id が**今の**ルート一覧に在るか」の照合で行うため。
 /// 万一衝突しても `roots_from_payload` が接尾辞で分離するので取り違えは起きない
 pub fn root_id_of(path: &str) -> String {
+    format!("{:012x}", fnv1a64(path.as_bytes()))[..12].to_string()
+}
+
+/// FNV-1a 64bit。id（`root_id_of`）と検証子（`content_etag`）が同じ 1 実装を通る。
+///
+/// 暗号学的強度は**どちらの用途でも要らない**（理由はそれぞれの doc に書いた）
+fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in path.as_bytes() {
+    for b in bytes {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{hash:012x}")[..12].to_string()
+    hash
 }
 
 /// tako app の `TreeFolder { action: "roots" }` 応答からルート一覧を組む。
@@ -466,7 +475,10 @@ pub fn read_content(resolved: &Resolved) -> Result<FileContent, Denial> {
     }
 }
 
-/// content API の応答を組む
+/// content API の応答を組む。
+///
+/// `etag` は**書き込みで返してもらう検証子**（#1084）。本文を返せなかったとき
+/// （バイナリ・大きすぎる）は付けない = 検証子が無いものは書き込めない
 pub fn content_payload(resolved: &Resolved, content: &FileContent) -> Value {
     json!({
         "root": resolved.root_id,
@@ -476,6 +488,9 @@ pub fn content_payload(resolved: &Resolved, content: &FileContent) -> Value {
         "binary": content.binary,
         "truncated": content.text.is_none() && !content.binary,
         "text": content.text,
+        "etag": content.text.as_ref().map(|t| content_etag(t.as_bytes())),
+        // ローカルのファイルは SSH 先と違って「相手が落ちている」状態が無い
+        "ssh": false,
     })
 }
 
@@ -531,6 +546,200 @@ pub fn content_disposition(file_name: &str) -> String {
     format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
+// ============================================================================
+// 競合検知の検証子（#1084。リモート刷新 柱 3-F）
+// ============================================================================
+
+/// 内容から作る検証子（HTTP の ETag 相当）。読み出しの応答に載せ、
+/// 書き込みでは**それをそのまま返してもらう**ことで「スマホが読んだ時点から
+/// 中身が変わっていないか」を判定する。
+///
+/// # なぜスマホに計算させないか
+///
+/// 指紋をスマホ側で作る形にすると、同じ算法を JavaScript と Rust の両方へ
+/// 実装することになり、**片方だけ壊れたときに「競合を見落とす」側へ倒れる**。
+/// daemon が作った値を預けて返させるだけなら算法は Rust の中で完結し、
+/// 変えたいときも 1 箇所で済む。
+///
+/// # なぜ暗号学的ハッシュでないか
+///
+/// これが守るのは「他の誰かの変更を**うっかり**踏み潰さないこと」で、偽造への
+/// 耐性は要らない: 検証子を偽れる端末は Interact 以上なので、そもそも本文に
+/// 何を書いても通る（偽造で新たに得られる権限が無い）。必要なのは
+/// **偶然の一致が起きないこと**だけなので、長さと 64bit の内容ハッシュを併記する
+pub fn content_etag(bytes: &[u8]) -> String {
+    format!("{}-{:016x}", bytes.len(), fnv1a64(bytes))
+}
+
+// ============================================================================
+// SSH 先のルート（#1085。リモート刷新 柱 3-G）
+// ============================================================================
+
+/// SSH 先ルートの id 接頭辞。
+///
+/// ローカルのルート id は 16 進数（+ 衝突時の `-N`）なので `s` で始まることは無く、
+/// **id を見ただけでどちら側かが決まる**。取り違えて別の側の認可を使う形にしない
+pub const SSH_ID_PREFIX: &str = "s-";
+
+/// `remote-folder open` 済みの SSH 先フォルダ 1 件（ツリーに出ているリモートルート）。
+///
+/// ローカルの [`TreeRoot`] と対で、**どちらも「Mac の画面に現に出ているもの」**が
+/// 認可の正。SSH 側の一覧は `RemoteFolder { action: "list" }` を毎リクエスト引くので、
+/// Mac 側でフォルダを閉じればその瞬間に読めなくなる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshRoot {
+    pub id: String,
+    pub host: String,
+    /// リモート側の絶対パス（Windows の相手は `/C:/Users/...` の形で来る）
+    pub path: String,
+    /// 表示名（末尾のフォルダ名）
+    pub name: String,
+    pub tab: u64,
+    pub tab_title: String,
+    /// ControlMaster が生きているか（#919 の `connected`。false = 切断中）
+    pub connected: bool,
+    /// ツリー側の読み込み状態（loaded / loading / pending / error: … / なし）
+    pub state: Option<String>,
+    /// ローカルルートの前か後ろか（#1041。`leading` / `trailing`）。
+    /// **並び規則は app の答えをそのまま使う**（daemon 側で二重に決めない）
+    pub placement: Option<String>,
+}
+
+impl SshRoot {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "tab": self.tab,
+            "tab_title": self.tab_title,
+            // ここから下が SSH 先ルートだけに付く（PWA はこれでバッジを出す）
+            "ssh": true,
+            "host": self.host,
+            "connected": self.connected,
+            "state": self.state,
+        })
+    }
+}
+
+/// ホストとリモートパスから id を作る
+pub fn ssh_root_id_of(host: &str, path: &str) -> String {
+    let key = format!("{host}\u{0}{path}");
+    format!(
+        "{SSH_ID_PREFIX}{}",
+        &format!("{:012x}", fnv1a64(key.as_bytes()))[..12]
+    )
+}
+
+/// `RemoteFolder { action: "list" }` の応答から SSH 先ルート一覧を組む。
+///
+/// 同じ (host, path) が複数タブに出ていたら**先に出たものだけ**を残す
+/// （配下は同じなので二重に見せる意味がない。[`roots_from_payload`] と同じ方針）
+pub fn ssh_roots_from_payload(payload: &Value) -> Vec<SshRoot> {
+    let mut out: Vec<SshRoot> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(tabs) = payload["tabs"].as_array() else {
+        return out;
+    };
+    for tab in tabs {
+        let tab_id = tab["tab"].as_u64().unwrap_or(0);
+        let tab_title = tab["title"].as_str().unwrap_or_default().to_string();
+        let Some(folders) = tab["remote_folders"].as_array() else {
+            continue;
+        };
+        for folder in folders {
+            let (Some(host), Some(path)) = (folder["host"].as_str(), folder["path"].as_str())
+            else {
+                continue;
+            };
+            if host.is_empty() || path.is_empty() {
+                continue;
+            }
+            let key = format!("{host}\u{0}{path}");
+            if !seen.insert(key) {
+                continue;
+            }
+            let base = ssh_root_id_of(host, path);
+            let mut id = base.clone();
+            let mut n = 1;
+            while out.iter().any(|r| r.id == id) {
+                id = format!("{base}-{n}");
+                n += 1;
+            }
+            out.push(SshRoot {
+                id,
+                host: host.to_string(),
+                path: path.to_string(),
+                name: tako_core::remote_fs::base_name(path),
+                tab: tab_id,
+                tab_title: tab_title.clone(),
+                connected: folder["connected"].as_bool().unwrap_or(false),
+                state: folder["state"].as_str().map(str::to_string),
+                placement: folder["placement"].as_str().map(str::to_string),
+            });
+        }
+    }
+    out
+}
+
+/// SSH 先の解決済みパス（開いているリモートルートの配下であることが確認済み）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshResolved {
+    pub root_id: String,
+    pub root_name: String,
+    pub host: String,
+    /// リモート側の絶対パス（ルート + 相対パス）
+    pub path: String,
+    /// ルートからの相対パス（`/` 区切り）
+    pub rel: String,
+    pub connected: bool,
+}
+
+/// SSH 先ルートの配下として `rel` を解決する。
+///
+/// # 何で閉じているか（ローカルとの違い）
+///
+/// ローカル（[`resolve_in_root`]）は `canonicalize` で**実体**を見て配下判定できるが、
+/// リモートには安く実体を問う手段が無い（sftp の 1 往復が増える）。ここでは
+/// ①[`check_relative_shape`] が絶対パス・`..`・制御文字を落とし
+/// ②残った要素を 1 つずつ継ぐ、の 2 段で**文字列として**ルート配下に閉じる。
+///
+/// **相手側の symlink がルートの外を指している場合は追える**（追わない手段が無い）。
+/// これは Mac のツリー自身が同じホストに対して持っている権限と同じで、
+/// 受容するリスクとして `.agent/threat-model-remote.md` に明記してある。
+/// 書き込み側はさらに #966 が「開いた記録が無ければ書かない」で閉じている
+pub fn resolve_in_ssh_root(
+    roots: &[SshRoot],
+    root_id: &str,
+    rel: &str,
+) -> Result<SshResolved, Denial> {
+    let root = roots
+        .iter()
+        .find(|r| r.id == root_id)
+        .ok_or(Denial::UnknownRoot)?;
+    check_relative_shape(rel)?;
+    let parts: Vec<&str> = rel
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let mut path = root.path.clone();
+    for part in &parts {
+        path = tako_core::remote_fs::join_remote(&path, part);
+    }
+    Ok(SshResolved {
+        root_id: root.id.clone(),
+        root_name: root.name.clone(),
+        host: root.host.clone(),
+        path,
+        rel: parts.join("/"),
+        connected: root.connected,
+    })
+}
+
+/// 要求されたルートがローカルか SSH 先か（id の接頭辞で決まる）
+pub fn is_ssh_root_id(root_id: &str) -> bool {
+    root_id.starts_with(SSH_ID_PREFIX)
+}
+
 // --- role ---
 
 /// このモジュールが受け持つパスの必要 role を返す（担当外なら None）。
@@ -546,6 +755,181 @@ pub fn required_role_for(path: &str) -> Option<DeviceRole> {
         return Some(DeviceRole::Interact);
     }
     None
+}
+
+/// このモジュールが受け持つ**書き込み系**のパス（`PUT` / `POST`）。
+///
+/// `remote.rs` の `required_role` は「未知の POST は Manage」で安全側に倒しており、
+/// その規則を崩さないために**パスを明示列挙**する（`required_role_for` のような
+/// 接頭辞一致にすると、将来足した `/api/files/*` の POST が意図せず
+/// Interact へ緩む）。役割は保存も再送も同じ Interact = `/api/upload` と同じ基準:
+/// 「ファイルを書き換えられる端末」は Mac 側で明示的に昇格したものだけ
+pub const WRITE_PATHS: &[&str] = &["/api/files/content", "/api/files/push"];
+
+/// [`WRITE_PATHS`] に載っているか
+pub fn is_write_path(path: &str) -> bool {
+    WRITE_PATHS.contains(&path)
+}
+
+// ============================================================================
+// 書き込みが通らなかった理由（#1084 / #1085）
+// ============================================================================
+
+/// 書き込みの失敗。[`Denial`] と違って**動的な詳細**（リモートのエラー本文・
+/// 退避の有無）を持てる。
+///
+/// 応答のキーは読み出し側（[`Denial::to_json`]）と揃えてあるので、PWA は
+/// `kind` の分岐 1 本でどちらの失敗も扱える
+#[derive(Debug, Clone)]
+pub struct WriteFailure {
+    pub status: u16,
+    pub kind: String,
+    pub ja: String,
+    pub en: String,
+    /// 応答へ足す追加フィールド（`pending` など）
+    pub extra: Value,
+}
+
+impl WriteFailure {
+    fn new(status: u16, kind: &str, ja: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            status,
+            kind: kind.to_string(),
+            ja: ja.into(),
+            en: en.into(),
+            extra: Value::Null,
+        }
+    }
+
+    /// 読んだ時点から中身が変わっている。**上書きしない**
+    pub fn conflict(detail: &str) -> Self {
+        let mut ja = "このファイルは他で変更されています。読み直してから編集をやり直してください"
+            .to_string();
+        let mut en = "This file changed elsewhere; reload it and redo your edit".to_string();
+        if !detail.is_empty() {
+            ja.push_str(&format!("（{detail}）"));
+            en.push_str(&format!(" ({detail})"));
+        }
+        Self::new(409, "conflict", ja, en)
+    }
+
+    /// Mac 側に未保存の編集がある。**踏み潰さない**
+    pub fn busy_editing() -> Self {
+        Self::new(
+            409,
+            "busy_editing",
+            "Mac 側にこのファイルの未保存の編集があります。先に Mac で保存するか編集を取り消してください",
+            "The Mac has unsaved edits to this file; save or discard them there first",
+        )
+    }
+
+    /// テキストとして編集できない（バイナリ・画像・PDF・動画）
+    pub fn not_text() -> Self {
+        Self::new(
+            400,
+            "not_text",
+            "この形式はスマホから編集できません（テキストファイルだけが編集できます）",
+            "This format cannot be edited from the phone (text files only)",
+        )
+    }
+
+    /// リモート側が読み取り専用（#966 の `read_only`）
+    pub fn read_only() -> Self {
+        Self::new(
+            403,
+            "read_only",
+            "書き込みが許可されていないファイルです",
+            "This file is not writable",
+        )
+    }
+
+    /// 検証子が付いていない = 競合を判定できないので書かない
+    pub fn missing_etag() -> Self {
+        Self::new(
+            400,
+            "missing_etag",
+            "検証子（etag）が要ります。ファイルを読み直してから保存してください",
+            "An etag is required; reload the file before saving",
+        )
+    }
+
+    pub fn bad_body(detail: &str) -> Self {
+        Self::new(
+            400,
+            "bad_body",
+            format!("リクエストの本文が読めません（{detail}）"),
+            format!("Could not read the request body ({detail})"),
+        )
+    }
+
+    pub fn too_large(limit: u64) -> Self {
+        Self::new(
+            413,
+            "too_large",
+            format!("{limit} バイトを超える内容は保存できません"),
+            format!("Cannot save more than {limit} bytes"),
+        )
+    }
+
+    /// tako app 側が断った（プレビューにできない・編集を開始できない等）。
+    /// **理由をそのまま渡す**（daemon で言い換えると原因が消える）
+    pub fn app(detail: &str) -> Self {
+        Self::new(
+            409,
+            "app_rejected",
+            format!("Mac 側で保存できませんでした（{detail}）"),
+            format!("The Mac could not save it ({detail})"),
+        )
+    }
+
+    pub fn app_unreachable(detail: &str) -> Self {
+        Self::new(
+            503,
+            "app_unreachable",
+            format!("tako app に問い合わせできません: {detail}"),
+            format!("Could not reach the tako app: {detail}"),
+        )
+    }
+
+    /// リモートへ押し出せず**退避された**（#966）。切断中の保存が無言で消えない
+    pub fn remote_pending(kind: &str, detail: &str) -> Self {
+        let mut f = Self::new(
+            502,
+            "remote_pending",
+            format!(
+                "リモートへ送れませんでした。内容は退避したので、つながったら送り直せます（{detail}）"
+            ),
+            format!("Could not reach the host; the content is stashed and can be pushed again once connected ({detail})"),
+        );
+        f.extra = json!({ "pending": true, "remote_kind": kind });
+        f
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut out = json!({
+            "error": self.ja,
+            "error_en": self.en,
+            "kind": self.kind,
+        });
+        if let Some(extra) = self.extra.as_object() {
+            for (k, v) in extra {
+                out[k] = v.clone();
+            }
+        }
+        out
+    }
+}
+
+impl From<Denial> for WriteFailure {
+    fn from(d: Denial) -> Self {
+        Self {
+            status: d.status(),
+            kind: d.kind().to_string(),
+            ja: d.message_ja().to_string(),
+            en: d.message_en().to_string(),
+            extra: Value::Null,
+        }
+    }
 }
 
 // --- 監査 ---
@@ -621,103 +1005,459 @@ fn current_roots(deps: &FilesDeps) -> Result<Vec<TreeRoot>, String> {
     Ok(roots_from_payload(&payload))
 }
 
+/// 現在ツリーに出ている SSH 先フォルダを app から取り直す（#1085）。
+///
+/// ローカルと同じ理由で**毎リクエスト**引く: Mac 側でフォルダを閉じれば
+/// その瞬間に読めなくなる（daemon 側に許可リストを溜めない）
+fn current_ssh_roots(deps: &FilesDeps) -> Result<Vec<SshRoot>, String> {
+    let payload = (deps.send)(crate::protocol::Request::RemoteFolder {
+        action: "list".to_string(),
+        host: None,
+        path: None,
+        tab: None,
+        focus: None,
+        all: false,
+        force: false,
+        enabled: None,
+        terminal: None,
+    })?;
+    Ok(ssh_roots_from_payload(&payload))
+}
+
+// ============================================================================
+// 書き込み（#1084 / #1085）
+// ============================================================================
+//
+// # なぜ daemon が自分でファイルへ書かないか
+//
+// 書き戻しの難しいところ（アトミックな置き換え・**内容そのもの**での競合検知・
+// mode の復元・押し出せなかった保存の退避）は #966 が PC 側に実装してある。
+// daemon が自分で書くとその保証を 2 つ持つことになり、**片方だけ直る**形になる。
+// ここでは PC 側の編集経路（`PreviewEdit` → `PreviewApply` → `PreviewSave`）を
+// そのまま通し、daemon は「認可」と「スマホが読んだ時点との突き合わせ」だけを持つ。
+//
+// # 競合検知が 2 段あるのはなぜか（窓が違う）
+//
+// - **スマホが読んだ → 保存を送った**の窓: 検証子（[`content_etag`]）で見る。
+//   PC 側はこの窓を見られない（編集セッションの基準は「編集を始めた時点」なので、
+//   保存の直前に開くと必ず「変わっていない」に見える）
+// - **適用した → 書いた**の窓: PC 側の `TextBuffer::save`（ローカル）と
+//   `remote_fs::save_file`（リモート）が見る
+//
+// どちらか一方だと素通りする組み合わせが残るので、両方通す。
+
+/// 書き込み対象として用意できたプレビューペイン
+struct PreviewTarget {
+    pane: u64,
+    /// プレビューの種別（code / markdown / image / pdf / video）
+    mode: String,
+    /// 呼ぶ前から編集モードだったか（**後で戻すため**に覚えておく）
+    was_editing: bool,
+    dirty: bool,
+}
+
+/// そのパスを既にプレビューしているペインを探す。
+///
+/// 見つかれば `OpenFile` を呼ばずに済む = **Mac のレイアウトを触らない**
+/// （スマホからの保存でユーザーのプレビューペインが差し替わるのを避ける）
+fn find_preview_pane(deps: &FilesDeps, abs: &str) -> Result<Option<(u64, String)>, String> {
+    let list = (deps.send)(crate::protocol::Request::List)?;
+    let Some(tabs) = list["tabs"].as_array() else {
+        return Ok(None);
+    };
+    for tab in tabs {
+        let Some(panes) = tab["panes"].as_array() else {
+            continue;
+        };
+        for pane in panes {
+            if same_file(pane["preview"]["path"].as_str(), abs) {
+                if let Some(id) = pane["id"].as_u64() {
+                    let mode = pane["preview"]["mode"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    return Ok(Some((id, mode)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// app が言うプレビューのパスと、認可で解決した実体が**同じファイルか**。
+///
+/// 文字列の一致では取りこぼす: `OpenFile` 経由のペインは canonicalize 済みのパスを
+/// 持つが、他の経路（GUI のツリーから開いた等）は素のパスのことがあり、macOS では
+/// `/var/...` と `/private/var/...` のように**同じファイルが別の文字列**になる。
+/// 取りこぼすと既存のペインを見つけられず `OpenFile` を呼ぶので、
+/// **ユーザーが見ているプレビューを差し替えてしまう**
+fn same_file(reported: Option<&str>, abs: &str) -> bool {
+    let Some(reported) = reported else {
+        return false;
+    };
+    if reported == abs {
+        return true;
+    }
+    match (
+        std::path::Path::new(reported).canonicalize(),
+        std::path::Path::new(abs).canonicalize(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 編集モードの現在状態を読む（`enabled` 省略 = 状態取得だけ。
+/// **編集セッションを作らない**ので、これ自体は Mac 側の状態を変えない）
+fn preview_edit_state(deps: &FilesDeps, pane: u64) -> Result<(bool, bool), String> {
+    let v = (deps.send)(crate::protocol::Request::PreviewEdit {
+        pane: Some(pane),
+        enabled: None,
+    })?;
+    Ok((
+        v["editing"].as_bool().unwrap_or(false),
+        v["dirty"].as_bool().unwrap_or(false),
+    ))
+}
+
+/// ローカルのファイルを載せたプレビューペインを用意する
+fn ensure_local_preview(deps: &FilesDeps, abs: &str) -> Result<PreviewTarget, WriteFailure> {
+    let existing = find_preview_pane(deps, abs).map_err(|e| WriteFailure::app_unreachable(&e))?;
+    let (pane, mode) = match existing {
+        // 既にそのファイルを出しているペインがあれば**そのまま使う**
+        // （`OpenFile` を通すと、同じタブの他のプレビューを差し替えてしまう）
+        Some(found) => found,
+        None => {
+            let opened = (deps.send)(crate::protocol::Request::OpenFile {
+                pane: None,
+                path: abs.to_string(),
+                mode: None,
+                direction: None,
+                // **フォーカスは奪わない**（Mac で作業中のユーザーの入力先を変えない）
+                focus: Some(false),
+                new_tab: false,
+            })
+            .map_err(|e| WriteFailure::app(&e))?;
+            let pane = opened["pane"]
+                .as_u64()
+                .ok_or_else(|| WriteFailure::app("プレビューペインを用意できなかった"))?;
+            (
+                pane,
+                opened["mode"].as_str().unwrap_or_default().to_string(),
+            )
+        }
+    };
+    let (was_editing, dirty) = preview_edit_state(deps, pane).map_err(|e| WriteFailure::app(&e))?;
+    Ok(PreviewTarget {
+        pane,
+        mode,
+        was_editing,
+        dirty,
+    })
+}
+
+/// テキストとして編集していい種別か。
+///
+/// 拡張子の表を daemon 側に持たない（**app の分類をそのまま使う**）ので、
+/// 対応形式が増えても食い違わない
+fn mode_is_text(mode: &str) -> bool {
+    matches!(mode, "code" | "markdown")
+}
+
+/// PC 側の編集経路を通して保存する。
+///
+/// 呼ぶ前に編集モードでなかったときは**終わったら戻す**（スマホからの保存で
+/// Mac のプレビューが編集モードのまま残らない）。戻す失敗は無視する
+/// （保存自体は済んでいるので、そこで失敗と言うと再送を促してしまう）
+fn apply_and_save(
+    deps: &FilesDeps,
+    target: &PreviewTarget,
+    text: &str,
+) -> Result<Value, WriteFailure> {
+    (deps.send)(crate::protocol::Request::PreviewEdit {
+        pane: Some(target.pane),
+        enabled: Some(true),
+    })
+    .map_err(|e| WriteFailure::app(&e))?;
+    (deps.send)(crate::protocol::Request::PreviewApply {
+        pane: Some(target.pane),
+        text: text.to_string(),
+    })
+    .map_err(|e| WriteFailure::app(&e))?;
+    let saved = (deps.send)(crate::protocol::Request::PreviewSave {
+        pane: Some(target.pane),
+    });
+    if !target.was_editing {
+        let _ = (deps.send)(crate::protocol::Request::PreviewEdit {
+            pane: Some(target.pane),
+            enabled: Some(false),
+        });
+    }
+    saved.map_err(|e| WriteFailure::app(&e))
+}
+
+/// ローカルのファイルへ書く（#1084）
+fn write_local(
+    deps: &FilesDeps,
+    resolved: &Resolved,
+    text: &str,
+    etag: &str,
+) -> Result<Value, WriteFailure> {
+    if text.len() as u64 > MAX_TEXT_BYTES {
+        return Err(WriteFailure::too_large(MAX_TEXT_BYTES));
+    }
+    // (1) スマホが読んだ時点と同じか（**上書きの前に**見る）
+    let current = read_content(resolved)?;
+    let Some(current_text) = current.text.as_deref() else {
+        return Err(if current.binary {
+            WriteFailure::not_text()
+        } else {
+            WriteFailure::too_large(MAX_TEXT_BYTES)
+        });
+    };
+    if content_etag(current_text.as_bytes()) != etag {
+        return Err(WriteFailure::conflict(""));
+    }
+
+    // (2) 書き先のプレビューペインを用意する
+    let abs = resolved.path.display().to_string();
+    let target = ensure_local_preview(deps, &abs)?;
+    if !mode_is_text(&target.mode) {
+        return Err(WriteFailure::not_text());
+    }
+    if target.dirty {
+        return Err(WriteFailure::busy_editing());
+    }
+
+    // (3) PC 側の編集経路で保存する
+    let result = apply_and_save(deps, &target, text);
+    match result {
+        Ok(out) => Ok(json!({
+            "saved": true,
+            "pane": target.pane,
+            "path": resolved.rel,
+            "root": resolved.root_id,
+            "size": text.len(),
+            "etag": content_etag(text.as_bytes()),
+            "dirty": out["dirty"].as_bool().unwrap_or(false),
+        })),
+        // 適用してから書くまでの窓で変わっていた場合。**事実で分類する**
+        // （app のエラー文言に依存しない: 文言は i18n で変わりうる）
+        Err(failure) => Err(match read_content(resolved) {
+            Ok(after)
+                if after
+                    .text
+                    .as_deref()
+                    .map(|t| content_etag(t.as_bytes()) != etag)
+                    .unwrap_or(false) =>
+            {
+                WriteFailure::conflict("保存の直前に変わりました")
+            }
+            _ => failure,
+        }),
+    }
+}
+
+/// SSH 先のファイルを取得してプレビューへ載せる（#1085）。
+///
+/// **取得のたびに #966 の競合検知の基準が進む**（`fetch_file` が
+/// `write_baseline` する）ので、読み出しでも書き込みでもここを通す
+fn open_ssh_preview(deps: &FilesDeps, target: &SshResolved) -> Result<Value, WriteFailure> {
+    (deps.send)(crate::protocol::Request::RemoteFolder {
+        action: "open-file".to_string(),
+        host: Some(target.host.clone()),
+        path: Some(target.path.clone()),
+        tab: None,
+        // フォーカスは奪わない（ローカルの `OpenFile` と同じ）
+        focus: Some(false),
+        all: false,
+        force: false,
+        enabled: None,
+        terminal: None,
+    })
+    .map_err(|e| WriteFailure::app(&e))
+}
+
+/// 退避されている押し出しを引く（`host` / `path` で絞る）
+fn ssh_pending(deps: &FilesDeps, host: Option<&str>, path: Option<&str>) -> Result<Value, String> {
+    (deps.send)(crate::protocol::Request::RemoteFolder {
+        action: "pending".to_string(),
+        host: host.map(str::to_string),
+        path: path.map(str::to_string),
+        tab: None,
+        focus: None,
+        all: false,
+        force: false,
+        enabled: None,
+        terminal: None,
+    })
+}
+
+/// SSH 先のファイルへ書く（#1085）。
+///
+/// #966 の保証（アトミックな置き換え・内容での競合検知・mode 復元・退避）は
+/// `PreviewSave` の中で走る。ここが足すのは「スマホが読んだ時点との突き合わせ」だけで、
+/// **`force` は受け取らない**（スマホから競合を踏み潰す操作は出さない）
+fn write_ssh(
+    deps: &FilesDeps,
+    target: &SshResolved,
+    text: &str,
+    etag: &str,
+) -> Result<Value, WriteFailure> {
+    if text.len() as u64 > MAX_TEXT_BYTES {
+        return Err(WriteFailure::too_large(MAX_TEXT_BYTES));
+    }
+    // (1) いまのリモートの内容を取り直す（= キャッシュと競合検知の基準が進む）
+    let opened = open_ssh_preview(deps, target)?;
+    if opened["read_only"].as_bool().unwrap_or(false) {
+        return Err(WriteFailure::read_only());
+    }
+    let pane = opened["pane"]
+        .as_u64()
+        .ok_or_else(|| WriteFailure::app("プレビューペインを用意できなかった"))?;
+    let cached = opened["cached_path"]
+        .as_str()
+        .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
+    let current = read_cached_text(std::path::Path::new(cached))?;
+    if content_etag(current.as_bytes()) != etag {
+        return Err(WriteFailure::conflict(""));
+    }
+    let mode = opened["mode"].as_str().unwrap_or_default();
+    if !mode_is_text(mode) {
+        return Err(WriteFailure::not_text());
+    }
+    let (was_editing, dirty) = preview_edit_state(deps, pane).map_err(|e| WriteFailure::app(&e))?;
+    if dirty {
+        return Err(WriteFailure::busy_editing());
+    }
+
+    // (2) PC 側の編集経路で保存する（SFTP の書き戻しはこの中）
+    let target_pane = PreviewTarget {
+        pane,
+        mode: mode.to_string(),
+        was_editing,
+        dirty,
+    };
+    match apply_and_save(deps, &target_pane, text) {
+        Ok(out) => Ok(json!({
+            "saved": true,
+            "pane": pane,
+            "path": target.rel,
+            "root": target.root_id,
+            "size": text.len(),
+            "etag": content_etag(text.as_bytes()),
+            "dirty": out["dirty"].as_bool().unwrap_or(false),
+            // #966 の書き戻し状態（idle / uploading / saved / failed / pending）
+            "remote": out["remote"].clone(),
+        })),
+        // 押し出せなかったときは **内容が退避されている**（#966）。
+        // 種別は退避の記録から取る = app のエラー文言に依存しない
+        Err(failure) => Err(classify_ssh_write_failure(deps, target, failure)),
+    }
+}
+
+/// 押し出しの失敗を退避の記録から分類する。
+///
+/// `conflict` なら「読み直してやり直す」、それ以外は「つながったら送り直せる」。
+/// 記録が無ければ app の理由をそのまま返す（保存自体が始まっていない場合）
+fn classify_ssh_write_failure(
+    deps: &FilesDeps,
+    target: &SshResolved,
+    failure: WriteFailure,
+) -> WriteFailure {
+    let Ok(pending) = ssh_pending(deps, Some(&target.host), Some(&target.path)) else {
+        return failure;
+    };
+    let Some(entry) = pending["pending"].as_array().and_then(|a| a.first()) else {
+        return failure;
+    };
+    let kind = entry["kind"].as_str().unwrap_or_default();
+    let detail = entry["error"].as_str().unwrap_or_default();
+    if kind == "conflict" {
+        WriteFailure::conflict(detail)
+    } else {
+        WriteFailure::remote_pending(kind, detail)
+    }
+}
+
+/// SFTP で落ちてきた写しをテキストとして読む。
+///
+/// パスは**app が返したもの**（`cached_path`）なので、ここは認可の対象ではない
+/// （ユーザー入力から組んだパスは 1 バイトも混ざらない）。判定は読み出し側
+/// （[`read_content`]）と同じ規則にしてある
+fn read_cached_text(path: &std::path::Path) -> Result<String, WriteFailure> {
+    let bytes = std::fs::read(path).map_err(|e| WriteFailure::app(&format!("{e}")))?;
+    if bytes.contains(&0) {
+        return Err(WriteFailure::not_text());
+    }
+    String::from_utf8(bytes).map_err(|_| WriteFailure::not_text())
+}
+
 /// `/api/files*` の受け口。role の検査は呼び出し側（`remote.rs` の共通経路）が済ませている
 pub fn handle_files_request(
-    request: tiny_http::Request,
+    mut request: tiny_http::Request,
     path: &str,
     url_full: &str,
     deps: &FilesDeps,
 ) {
-    let roots = match current_roots(deps) {
-        Ok(r) => r,
-        Err(e) => {
-            return respond_json(
-                request,
-                deps,
-                503,
-                &json!({
-                    "error": format!("tako app に問い合わせできません: {e}"),
-                    "error_en": format!("Could not reach the tako app: {e}"),
-                    "kind": "app_unreachable",
-                }),
-            );
-        }
-    };
-
+    let method = request.method().clone();
     let root_param = query_value(url_full, "root");
-    let path_param = query_value(url_full, "path").unwrap_or_default();
+    let rel = query_value(url_full, "path").unwrap_or_default();
 
-    match path {
-        // ルート一覧（root 省略）またはディレクトリ一覧
-        "/api/files" => match root_param {
-            None => {
-                let body = json!({
-                    "roots": roots.iter().map(TreeRoot::to_json).collect::<Vec<_>>(),
-                });
-                (deps.audit)("files", audit_payload("roots", 0, roots.len()));
-                respond_json(request, deps, 200, &body)
-            }
-            Some(root) => match resolve_in_root(&roots, &root, &path_param)
-                .and_then(|r| list_directory(&r).map(|v| (r, v)))
-            {
-                Ok((_, body)) => {
-                    let entries = body["entries"].as_array().map(Vec::len).unwrap_or(0);
-                    (deps.audit)("files", audit_payload("list", 0, entries));
-                    respond_json(request, deps, 200, &body)
-                }
-                Err(d) => respond_denial(request, deps, d),
-            },
-        },
-
-        // プレビュー用の本文
-        "/api/files/content" => {
-            let Some(root) = root_param else {
-                return respond_denial(request, deps, Denial::UnknownRoot);
-            };
-            match resolve_in_root(&roots, &root, &path_param)
-                .and_then(|r| read_content(&r).map(|c| (r, c)))
-            {
-                Ok((resolved, content)) => {
-                    let sent = content.text.as_ref().map(|t| t.len() as u64).unwrap_or(0);
-                    (deps.audit)("files", audit_payload("content", sent, 0));
-                    respond_json(request, deps, 200, &content_payload(&resolved, &content))
-                }
-                Err(d) => respond_denial(request, deps, d),
-            }
+    match (&method, path) {
+        // --- 読み出し（#1079 / SSH 先は #1085） ---
+        (tiny_http::Method::Get, "/api/files") => {
+            let (status, body) = read_listing(deps, root_param.as_deref(), &rel);
+            respond_json(request, deps, status, &body)
+        }
+        (tiny_http::Method::Get, "/api/files/content") => {
+            let (status, body) = read_file_content(deps, root_param.as_deref(), &rel);
+            respond_json(request, deps, status, &body)
+        }
+        (tiny_http::Method::Get, "/api/files/download") => {
+            respond_download(request, deps, root_param.as_deref(), &rel)
+        }
+        // --- 押し出せていない保存（#1085 / #966） ---
+        (tiny_http::Method::Get, "/api/files/pending") => {
+            let (status, body) = read_pending(deps, root_param.as_deref());
+            respond_json(request, deps, status, &body)
         }
 
-        // ダウンロード（ストリーミング）
-        "/api/files/download" => {
-            let Some(root) = root_param else {
-                return respond_denial(request, deps, Denial::UnknownRoot);
-            };
-            match resolve_in_root(&roots, &root, &path_param)
-                .and_then(|r| open_for_download(&r).map(|f| (r, f)))
-            {
-                Ok((resolved, (file, size))) => {
-                    let name = resolved
-                        .path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "download".to_string());
-                    (deps.audit)("files", audit_payload("download", size, 0));
-                    let mut resp = tiny_http::Response::from_file(file)
-                        .with_header(header(b"Content-Type", b"application/octet-stream"))
-                        .with_header(header_or(
-                            b"Content-Disposition",
-                            &content_disposition(&name),
-                            b"attachment",
-                        ));
-                    for h in deps.cors.clone() {
-                        resp = resp.with_header(h);
-                    }
-                    resp = resp.with_header(header(b"Cache-Control", b"no-store, private"));
-                    let _ = request.respond(resp);
+        // --- 書き込み（#1084 / SSH 先は #1085） ---
+        (tiny_http::Method::Put, "/api/files/content") => {
+            let body = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    let f = WriteFailure::bad_body(&e);
+                    return respond_json(request, deps, f.status, &f.to_json());
                 }
-                Err(d) => respond_denial(request, deps, d),
-            }
+            };
+            let (status, out) = write_file_content(deps, root_param.as_deref(), &rel, &body);
+            respond_json(request, deps, status, &out)
+        }
+        (tiny_http::Method::Post, "/api/files/push") => {
+            let body = match read_json_body(&mut request) {
+                Ok(v) => v,
+                Err(e) => {
+                    let f = WriteFailure::bad_body(&e);
+                    return respond_json(request, deps, f.status, &f.to_json());
+                }
+            };
+            let (status, out) = push_pending(deps, root_param.as_deref(), &rel, &body);
+            respond_json(request, deps, status, &out)
         }
 
+        // 受け持つパスだがメソッドが違う（405）と、そもそも無いパス（404）を分ける
+        (_, p) if is_write_path(p) || required_role_for(p).is_some() => respond_json(
+            request,
+            deps,
+            405,
+            &json!({
+                "error": "このメソッドには対応していない",
+                "error_en": "Method not allowed",
+                "kind": "method_not_allowed",
+            }),
+        ),
         _ => respond_json(
             request,
             deps,
@@ -726,6 +1466,438 @@ pub fn handle_files_request(
         ),
     }
 }
+
+/// ルート一覧（`root` 省略）またはディレクトリ一覧
+fn read_listing(deps: &FilesDeps, root: Option<&str>, rel: &str) -> (u16, Value) {
+    match root {
+        // ローカルと SSH 先を**ツリーに出ている並び**で 1 本の一覧にする（#1041）
+        None => {
+            let local = match current_roots(deps) {
+                Ok(r) => r,
+                Err(e) => return app_unreachable(&e),
+            };
+            // SSH 先が引けない（app が古い等）ときはローカルだけ返す
+            // = ファイルビューごと開けなくならない
+            let ssh = current_ssh_roots(deps).unwrap_or_default();
+            let mut roots: Vec<Value> = Vec::with_capacity(local.len() + ssh.len());
+            roots.extend(
+                ssh.iter()
+                    .filter(|r| r.placement.as_deref() != Some("trailing"))
+                    .map(SshRoot::to_json),
+            );
+            roots.extend(local.iter().map(TreeRoot::to_json));
+            roots.extend(
+                ssh.iter()
+                    .filter(|r| r.placement.as_deref() == Some("trailing"))
+                    .map(SshRoot::to_json),
+            );
+            (deps.audit)("files", audit_payload("roots", 0, roots.len()));
+            (200, json!({ "roots": roots }))
+        }
+        Some(root) if is_ssh_root_id(root) => {
+            let roots = match current_ssh_roots(deps) {
+                Ok(r) => r,
+                Err(e) => return app_unreachable(&e),
+            };
+            let target = match resolve_in_ssh_root(&roots, root, rel) {
+                Ok(t) => t,
+                Err(d) => return (d.status(), d.to_json()),
+            };
+            match ssh_list_directory(deps, &target) {
+                Ok(body) => {
+                    let entries = body["entries"].as_array().map(Vec::len).unwrap_or(0);
+                    (deps.audit)("files", audit_payload("ssh_list", 0, entries));
+                    (200, body)
+                }
+                Err(f) => (f.status, f.to_json()),
+            }
+        }
+        Some(root) => {
+            let roots = match current_roots(deps) {
+                Ok(r) => r,
+                Err(e) => return app_unreachable(&e),
+            };
+            match resolve_in_root(&roots, root, rel).and_then(|r| list_directory(&r)) {
+                Ok(body) => {
+                    let entries = body["entries"].as_array().map(Vec::len).unwrap_or(0);
+                    (deps.audit)("files", audit_payload("list", 0, entries));
+                    (200, body)
+                }
+                Err(d) => (d.status(), d.to_json()),
+            }
+        }
+    }
+}
+
+/// プレビュー用の本文
+fn read_file_content(deps: &FilesDeps, root: Option<&str>, rel: &str) -> (u16, Value) {
+    let Some(root) = root else {
+        return (Denial::UnknownRoot.status(), Denial::UnknownRoot.to_json());
+    };
+    if is_ssh_root_id(root) {
+        let roots = match current_ssh_roots(deps) {
+            Ok(r) => r,
+            Err(e) => return app_unreachable(&e),
+        };
+        let target = match resolve_in_ssh_root(&roots, root, rel) {
+            Ok(t) => t,
+            Err(d) => return (d.status(), d.to_json()),
+        };
+        return match ssh_content_payload(deps, &target) {
+            Ok(body) => {
+                let sent = body["size"].as_u64().unwrap_or(0);
+                (deps.audit)("files", audit_payload("ssh_content", sent, 0));
+                (200, body)
+            }
+            Err(f) => (f.status, f.to_json()),
+        };
+    }
+    let roots = match current_roots(deps) {
+        Ok(r) => r,
+        Err(e) => return app_unreachable(&e),
+    };
+    match resolve_in_root(&roots, root, rel).and_then(|r| read_content(&r).map(|c| (r, c))) {
+        Ok((resolved, content)) => {
+            let sent = content.text.as_ref().map(|t| t.len() as u64).unwrap_or(0);
+            (deps.audit)("files", audit_payload("content", sent, 0));
+            (200, content_payload(&resolved, &content))
+        }
+        Err(d) => (d.status(), d.to_json()),
+    }
+}
+
+/// 押し出せていない保存の一覧（#966 の `pending` をそのまま見せる）
+fn read_pending(deps: &FilesDeps, root: Option<&str>) -> (u16, Value) {
+    // `root` 指定があればそのホストだけに絞る（省略で全件）
+    let host = match root {
+        Some(root) if is_ssh_root_id(root) => match current_ssh_roots(deps) {
+            Ok(roots) => match roots.iter().find(|r| r.id == root) {
+                Some(r) => Some(r.host.clone()),
+                None => return (Denial::UnknownRoot.status(), Denial::UnknownRoot.to_json()),
+            },
+            Err(e) => return app_unreachable(&e),
+        },
+        _ => None,
+    };
+    match ssh_pending(deps, host.as_deref(), None) {
+        Ok(body) => {
+            let n = body["pending"].as_array().map(Vec::len).unwrap_or(0);
+            (deps.audit)("files", audit_payload("pending", 0, n));
+            (200, body)
+        }
+        Err(e) => app_unreachable(&e),
+    }
+}
+
+/// 書き込み（ローカル / SSH 先の両方）
+fn write_file_content(
+    deps: &FilesDeps,
+    root: Option<&str>,
+    rel: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let Some(root) = root else {
+        return (Denial::UnknownRoot.status(), Denial::UnknownRoot.to_json());
+    };
+    let Some(text) = body["text"].as_str() else {
+        let f = WriteFailure::bad_body("text が要ります");
+        return (f.status, f.to_json());
+    };
+    // 検証子が無ければ**書かない**（競合を判定できないまま上書きしない）
+    let Some(etag) = body["etag"].as_str().filter(|e| !e.is_empty()) else {
+        let f = WriteFailure::missing_etag();
+        return (f.status, f.to_json());
+    };
+
+    let result = if is_ssh_root_id(root) {
+        match current_ssh_roots(deps) {
+            Ok(roots) => match resolve_in_ssh_root(&roots, root, rel) {
+                Ok(target) => write_ssh(deps, &target, text, etag),
+                Err(d) => Err(d.into()),
+            },
+            Err(e) => Err(WriteFailure::app_unreachable(&e)),
+        }
+    } else {
+        match current_roots(deps) {
+            Ok(roots) => match resolve_in_root(&roots, root, rel) {
+                Ok(resolved) => write_local(deps, &resolved, text, etag),
+                Err(d) => Err(d.into()),
+            },
+            Err(e) => Err(WriteFailure::app_unreachable(&e)),
+        }
+    };
+    match result {
+        Ok(out) => {
+            (deps.audit)("files", audit_payload("write", text.len() as u64, 0));
+            (200, out)
+        }
+        Err(f) => {
+            // 書けなかったことも残す（何をどれだけ**書こうとしたか**だけ。パスは載せない）
+            (deps.audit)("files", audit_payload("write_denied", text.len() as u64, 0));
+            (f.status, f.to_json())
+        }
+    }
+}
+
+/// 退避されている保存を送り直す（#966 の `push`）。
+///
+/// **`force` は受け取らない**: 競合を承知で踏み潰す操作をスマホから出さない
+/// （読み直して編集をやり直す導線だけを残す）
+fn push_pending(deps: &FilesDeps, root: Option<&str>, rel: &str, body: &Value) -> (u16, Value) {
+    // 対象は root + path（省略で全件）。root は SSH 先ルートだけ
+    let root = root.or_else(|| body["root"].as_str());
+    let rel = if rel.is_empty() {
+        body["path"].as_str().unwrap_or_default()
+    } else {
+        rel
+    };
+    let target = match root {
+        Some(root) if is_ssh_root_id(root) => {
+            let roots = match current_ssh_roots(deps) {
+                Ok(r) => r,
+                Err(e) => return app_unreachable(&e),
+            };
+            match resolve_in_ssh_root(&roots, root, rel) {
+                Ok(t) => Some(t),
+                Err(d) => return (d.status(), d.to_json()),
+            }
+        }
+        Some(_) => {
+            let f = WriteFailure::bad_body("SSH 先のフォルダを指定してください");
+            return (f.status, f.to_json());
+        }
+        None => None,
+    };
+    // path 省略のときはホストだけで絞る（そのフォルダの分をまとめて送り直す）
+    let (host, path) = match &target {
+        Some(t) if t.rel.is_empty() => (Some(t.host.as_str()), None),
+        Some(t) => (Some(t.host.as_str()), Some(t.path.as_str())),
+        None => (None, None),
+    };
+    let sent = (deps.send)(crate::protocol::Request::RemoteFolder {
+        action: "push".to_string(),
+        host: host.map(str::to_string),
+        path: path.map(str::to_string),
+        tab: None,
+        focus: None,
+        all: false,
+        force: false,
+        enabled: None,
+        terminal: None,
+    });
+    match sent {
+        Ok(out) => {
+            (deps.audit)("files", audit_payload("push", 0, 0));
+            (200, out)
+        }
+        Err(e) => {
+            (deps.audit)("files", audit_payload("push_failed", 0, 0));
+            // 送り直しの失敗は「なぜ送れないか」がそのまま次の一手になる
+            let f = WriteFailure::remote_pending("", &e);
+            (f.status, f.to_json())
+        }
+    }
+}
+
+/// SSH 先のディレクトリ一覧（`RemoteFolder { action: "ls" }` を proxy して、
+/// ローカルの一覧と**同じ形**へ揃える）
+fn ssh_list_directory(deps: &FilesDeps, target: &SshResolved) -> Result<Value, WriteFailure> {
+    let listed = (deps.send)(crate::protocol::Request::RemoteFolder {
+        action: "ls".to_string(),
+        host: Some(target.host.clone()),
+        path: Some(target.path.clone()),
+        tab: None,
+        focus: None,
+        all: false,
+        force: false,
+        enabled: None,
+        terminal: None,
+    })
+    .map_err(|e| WriteFailure::app(&e))?;
+    let mut entries: Vec<Value> = listed["entries"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| {
+            let name = e["name"].as_str()?;
+            let kind = e["kind"].as_str().unwrap_or("unknown");
+            let is_dir = kind == "dir";
+            Some(json!({
+                "name": name,
+                "dir": is_dir,
+                "size": if is_dir { Value::Null } else { e["size"].clone() },
+                // `ls -la` の日時は分の分解能しかないので出さない（#966 の教訓）
+                "modified": Value::Null,
+                "symlink": kind == "symlink",
+                // リモート側の実体は安く辿れないので印は付けない（脅威モデル参照）
+                "escapes_root": false,
+                "hidden": name.starts_with('.'),
+            }))
+        })
+        .collect();
+    let truncated = entries.len() > MAX_ENTRIES;
+    entries.truncate(MAX_ENTRIES);
+    Ok(json!({
+        "root": target.root_id,
+        "root_name": target.root_name,
+        "path": target.rel,
+        "ssh": true,
+        "host": target.host,
+        "connected": target.connected,
+        "entries": entries,
+        "truncated": truncated,
+    }))
+}
+
+/// SSH 先のファイル本文（`open-file` で取得 → 写しを読む）。
+///
+/// 読み出しでも `open-file` を通すのは #966 の設計に合わせるため:
+/// 取得のたびに競合検知の基準が進むので、**読み直せば競合が解ける**
+/// （「読み直してやり直す」の導線がそのまま効く）
+fn ssh_content_payload(deps: &FilesDeps, target: &SshResolved) -> Result<Value, WriteFailure> {
+    let opened = open_ssh_preview(deps, target)?;
+    let cached = opened["cached_path"]
+        .as_str()
+        .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
+    let size = opened["size"].as_u64();
+    let mode = opened["mode"].as_str().unwrap_or_default();
+    let read_only = opened["read_only"].as_bool().unwrap_or(false);
+    let pending = opened["pending_write"].as_bool().unwrap_or(false);
+    let text = read_cached_text(std::path::Path::new(cached)).ok();
+    let size = size
+        .or_else(|| text.as_ref().map(|t| t.len() as u64))
+        .unwrap_or(0);
+    Ok(json!({
+        "root": target.root_id,
+        "root_name": target.root_name,
+        "path": target.rel,
+        "ssh": true,
+        "host": target.host,
+        "size": size,
+        "binary": text.is_none(),
+        "truncated": false,
+        "text": text,
+        "etag": text.as_ref().map(|t| content_etag(t.as_bytes())),
+        // 書けないものは編集させない（#966。mode のどこにも `w` が無いとき）
+        "read_only": read_only || !mode_is_text(mode),
+        // 前のセッションで押し出せていない保存が残っている（#966）
+        "pending_write": pending,
+        "pane": opened["pane"].clone(),
+    }))
+}
+
+/// ダウンロード（ローカル / SSH 先の両方。ストリーミング）
+fn respond_download(request: tiny_http::Request, deps: &FilesDeps, root: Option<&str>, rel: &str) {
+    let Some(root) = root else {
+        return respond_denial(request, deps, Denial::UnknownRoot);
+    };
+    if is_ssh_root_id(root) {
+        let roots = match current_ssh_roots(deps) {
+            Ok(r) => r,
+            Err(e) => {
+                let (status, body) = app_unreachable(&e);
+                return respond_json(request, deps, status, &body);
+            }
+        };
+        let target = match resolve_in_ssh_root(&roots, root, rel) {
+            Ok(t) => t,
+            Err(d) => return respond_denial(request, deps, d),
+        };
+        match prepare_ssh_download(deps, &target) {
+            Ok((file, name, size)) => {
+                (deps.audit)("files", audit_payload("ssh_download", size, 0));
+                respond_file(request, deps, file, &name)
+            }
+            Err(f) => respond_json(request, deps, f.status, &f.to_json()),
+        }
+        return;
+    }
+    let roots = match current_roots(deps) {
+        Ok(r) => r,
+        Err(e) => {
+            let (status, body) = app_unreachable(&e);
+            return respond_json(request, deps, status, &body);
+        }
+    };
+    match resolve_in_root(&roots, root, rel).and_then(|r| open_for_download(&r).map(|f| (r, f))) {
+        Ok((resolved, (file, size))) => {
+            let name = resolved
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "download".to_string());
+            (deps.audit)("files", audit_payload("download", size, 0));
+            respond_file(request, deps, file, &name)
+        }
+        Err(d) => respond_denial(request, deps, d),
+    }
+}
+
+/// SSH 先のファイルをダウンロード用に開く（**応答は組まない**）。
+///
+/// `tiny_http::Request` は応答で消費されるので、失敗しうる処理はここで
+/// 先に終わらせてから 1 回だけ応答する（request を Result に載せて持ち回すと
+/// エラー型が大きくなり、呼び出し側の分岐も追いにくい）
+fn prepare_ssh_download(
+    deps: &FilesDeps,
+    target: &SshResolved,
+) -> Result<(std::fs::File, String, u64), WriteFailure> {
+    let opened = open_ssh_preview(deps, target)?;
+    let cached = opened["cached_path"]
+        .as_str()
+        .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
+    let file = std::fs::File::open(cached).map_err(|e| WriteFailure::app(&format!("{e}")))?;
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    Ok((file, tako_core::remote_fs::base_name(&target.path), size))
+}
+
+/// ファイルを添付としてストリーミングする（ローカルと SSH 先で 1 実装）
+fn respond_file(request: tiny_http::Request, deps: &FilesDeps, file: std::fs::File, name: &str) {
+    let mut resp = tiny_http::Response::from_file(file)
+        .with_header(header(b"Content-Type", b"application/octet-stream"))
+        .with_header(header_or(
+            b"Content-Disposition",
+            &content_disposition(name),
+            b"attachment",
+        ));
+    for h in deps.cors.clone() {
+        resp = resp.with_header(h);
+    }
+    resp = resp.with_header(header(b"Cache-Control", b"no-store, private"));
+    let _ = request.respond(resp);
+}
+
+/// tako app へ届かなかった（両方の読み出し経路で共有する応答）
+fn app_unreachable(detail: &str) -> (u16, Value) {
+    let f = WriteFailure::app_unreachable(detail);
+    (f.status, f.to_json())
+}
+
+/// リクエストボディを JSON として読む（上限つき）。
+///
+/// `remote.rs` にも同名の関数があるが、このモジュールを**単体でテストできる**形に
+/// 保つため写しを持つ（`query_value` / `percent_decode` と同じ方針）
+fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
+    use std::io::Read as _;
+    let mut body = String::new();
+    request
+        .as_reader()
+        .take(MAX_BODY_BYTES)
+        .read_to_string(&mut body)
+        .map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("JSON パースエラー: {e}"))
+}
+
+/// 書き込みのボディ上限。
+///
+/// 保存 1 回で運ぶのは本文だけ（読んだ時点の内容は**検証子**で預けるので
+/// 往復で 2 倍にならない）。本文の上限 `MAX_TEXT_BYTES` に JSON の
+/// 符号化ぶんの余裕を足した値にしてある
+pub const MAX_BODY_BYTES: u64 = 4 * MAX_TEXT_BYTES;
 
 /// クエリ 1 個を取り出す（`remote.rs` の `query_param` と同じ意味論。
 /// このモジュールを単体でテストできるよう写しを持つ）
@@ -1226,5 +2398,268 @@ mod tests {
         assert_ne!(a, root_id_of("/w/project2"));
         // パスの断片が id から復元できない（URL に絶対パスを載せない目的）
         assert!(!a.contains("project"));
+    }
+
+    // --- 検証子（#1084） ---
+
+    #[test]
+    fn 検証子は内容が変われば変わる() {
+        let a = content_etag(b"hello\n");
+        assert_eq!(a, content_etag(b"hello\n"), "同じ内容なら同じ");
+        assert_ne!(a, content_etag(b"hello!\n"), "1 文字違えば変わる");
+        // 長さが同じでも内容が違えば変わる（長さだけの比較へ退化していない）
+        assert_ne!(content_etag(b"abcdef"), content_etag(b"abcdeg"));
+        // 内容が同じでも長さが違えば変わる（ハッシュ衝突の保険として長さを併記している）
+        assert!(a.starts_with("6-"), "長さが先頭に出る: {a}");
+        assert_eq!(content_etag(b""), format!("0-{:016x}", fnv1a64(b"")));
+    }
+
+    #[test]
+    fn 検証子は日本語でも決定的() {
+        let text = "日本語の本文\nと 2 行目\n";
+        assert_eq!(content_etag(text.as_bytes()), content_etag(text.as_bytes()));
+        assert_ne!(
+            content_etag(text.as_bytes()),
+            content_etag("日本語の本文\nと 3 行目\n".as_bytes())
+        );
+    }
+
+    // --- SSH 先のルート（#1085） ---
+
+    fn ssh_payload() -> Value {
+        json!({
+            "tabs": [
+                {
+                    "tab": 1,
+                    "title": "作業",
+                    "remote_folders": [
+                        {
+                            "host": "linuxbox",
+                            "path": "/home/testuser/proj",
+                            "label": "linuxbox:/home/testuser/proj",
+                            "state": "loaded",
+                            "connected": true,
+                            "placement": "leading",
+                        },
+                        {
+                            "host": "winbox",
+                            "path": "/C:/Users/winuser/dev",
+                            "label": "winbox:/C:/Users/winuser/dev",
+                            "state": "loaded",
+                            "connected": false,
+                            "placement": "trailing",
+                        }
+                    ],
+                },
+                {
+                    // 同じ (host, path) が別タブにも出ている = 1 件に畳む
+                    "tab": 2,
+                    "title": "別タブ",
+                    "remote_folders": [{
+                        "host": "linuxbox",
+                        "path": "/home/testuser/proj",
+                        "connected": true,
+                    }],
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn ssh先ルートは重複を畳んで並ぶ() {
+        let roots = ssh_roots_from_payload(&ssh_payload());
+        assert_eq!(roots.len(), 2, "同じ (host, path) は 1 件: {roots:?}");
+        assert_eq!(roots[0].host, "linuxbox");
+        assert_eq!(roots[0].name, "proj");
+        assert!(roots[0].connected);
+        assert_eq!(roots[0].placement.as_deref(), Some("leading"));
+        // Windows の相手は `/C:/...` で来る（表示名は末尾だけ）
+        assert_eq!(roots[1].name, "dev");
+        assert!(!roots[1].connected, "切断中も一覧には出る");
+    }
+
+    #[test]
+    fn ssh先ルートのidはローカルと取り違えない() {
+        let roots = ssh_roots_from_payload(&ssh_payload());
+        for r in &roots {
+            assert!(is_ssh_root_id(&r.id), "SSH 先の id: {}", r.id);
+        }
+        // ローカルの id は 16 進数なので `s` で始まることが構造的に無い
+        for path in ["/w/a", "/w/b", "/Users/testuser/dev/tako", "/"] {
+            let id = root_id_of(path);
+            assert!(!is_ssh_root_id(&id), "ローカルの id が SSH に見える: {id}");
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit()),
+                "ローカルの id は 16 進数: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh先の相対パスは配下に閉じる() {
+        let roots = ssh_roots_from_payload(&ssh_payload());
+        let id = roots[0].id.clone();
+
+        // 配下は解決できる
+        let ok = resolve_in_ssh_root(&roots, &id, "src/main.rs").expect("配下");
+        assert_eq!(ok.path, "/home/testuser/proj/src/main.rs");
+        assert_eq!(ok.rel, "src/main.rs");
+        assert_eq!(ok.host, "linuxbox");
+        // ルート自身
+        let root_self = resolve_in_ssh_root(&roots, &id, "").expect("ルート自身");
+        assert_eq!(root_self.path, "/home/testuser/proj");
+        assert_eq!(root_self.rel, "");
+
+        // 外へ出る形はすべて落ちる（ローカルと同じ純粋関数を通っている）
+        for bad in [
+            "..",
+            "../secret",
+            "src/../../secret",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "C:/Windows",
+            "src/C:/Windows",
+            "src\\..\\..\\secret",
+            "src/\u{0}etc",
+        ] {
+            let denied = resolve_in_ssh_root(&roots, &id, bad).expect_err(bad);
+            assert_eq!(denied.status(), 403, "{bad} は 403: {denied:?}");
+        }
+
+        // ツリーに出ていないルートは拒否
+        let unknown = resolve_in_ssh_root(&roots, "s-000000000000", "x").expect_err("未知");
+        assert_eq!(unknown, Denial::UnknownRoot);
+    }
+
+    #[test]
+    fn ssh先のルートが閉じられれば読めなくなる() {
+        let roots = ssh_roots_from_payload(&ssh_payload());
+        let id = roots[0].id.clone();
+        assert!(resolve_in_ssh_root(&roots, &id, "src").is_ok());
+        // Mac 側でフォルダを閉じた = 一覧から消えた状態
+        let closed = ssh_roots_from_payload(&json!({ "tabs": [] }));
+        assert_eq!(
+            resolve_in_ssh_root(&closed, &id, "src"),
+            Err(Denial::UnknownRoot),
+            "一覧から消えたら同じ id でも読めない"
+        );
+    }
+
+    // --- 書き込みの role と失敗の形（#1084 / #1085） ---
+
+    #[test]
+    fn 書き込みパスは明示列挙されている() {
+        assert!(is_write_path("/api/files/content"));
+        assert!(is_write_path("/api/files/push"));
+        // 列挙外は書き込み扱いにしない（`remote.rs` 側で Manage のまま残る）
+        for p in [
+            "/api/files",
+            "/api/files/download",
+            "/api/files/pending",
+            "/api/files/wipe",
+            "/api/files/content/x",
+        ] {
+            assert!(!is_write_path(p), "{p} が書き込み扱いになっている");
+        }
+        // 受け持ちは読み出しと同じ Interact 以上
+        for p in WRITE_PATHS {
+            assert_eq!(required_role_for(p), Some(DeviceRole::Interact), "{p}");
+        }
+    }
+
+    #[test]
+    fn 書き込みの失敗は理由と次の一手を日英で返す() {
+        let cases = vec![
+            (WriteFailure::conflict(""), 409, "conflict"),
+            (WriteFailure::busy_editing(), 409, "busy_editing"),
+            (WriteFailure::not_text(), 400, "not_text"),
+            (WriteFailure::read_only(), 403, "read_only"),
+            (WriteFailure::missing_etag(), 400, "missing_etag"),
+            (WriteFailure::too_large(MAX_TEXT_BYTES), 413, "too_large"),
+            // 詳細（app / remote 側の理由）は**そのまま通す**ので、
+            // 日英の検査には ASCII の詳細を使う（下で通し方を別に固定する）
+            (
+                WriteFailure::remote_pending("unreachable", "no route to host"),
+                502,
+                "remote_pending",
+            ),
+        ];
+        for (f, status, kind) in cases {
+            assert_eq!(f.status, status, "{kind}");
+            let body = f.to_json();
+            assert_eq!(body["kind"].as_str(), Some(kind));
+            let ja = body["error"].as_str().unwrap_or_default();
+            let en = body["error_en"].as_str().unwrap_or_default();
+            assert!(!ja.is_empty() && !en.is_empty(), "{kind} は日英とも要る");
+            assert!(
+                ja.chars().any(|c| c as u32 > 0x3000),
+                "{kind} の日本語が英語のまま: {ja}"
+            );
+            assert!(en.is_ascii(), "{kind} の英語に日本語が混ざる: {en}");
+        }
+        // 退避されたことは機械可読に載る（PWA が「送り直す」を出す材料）
+        let pending = WriteFailure::remote_pending("unreachable", "x").to_json();
+        assert_eq!(pending["pending"].as_bool(), Some(true));
+        assert_eq!(pending["remote_kind"].as_str(), Some("unreachable"));
+
+        // remote / app 側の理由は**言い換えず**日英どちらにもそのまま入る
+        // （daemon で書き直すと「なぜ送れないか」が消える）
+        let detail = "ssh: connect to host … port 22: Operation timed out";
+        for body in [
+            WriteFailure::remote_pending("unreachable", detail).to_json(),
+            WriteFailure::conflict(detail).to_json(),
+            WriteFailure::app(detail).to_json(),
+        ] {
+            for key in ["error", "error_en"] {
+                assert!(
+                    body[key].as_str().unwrap_or_default().contains(detail),
+                    "{key} に理由が入っていない: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn パスの拒否はそのまま書き込みの失敗になる() {
+        // 読み出しの拒否種別が書き込み側で消えない（403 が 500 に化けない等）
+        for d in [
+            Denial::UnknownRoot,
+            Denial::Traversal,
+            Denial::AbsolutePath,
+            Denial::EscapesRoot,
+            Denial::NotFound,
+        ] {
+            let f: WriteFailure = d.into();
+            assert_eq!(f.status, d.status(), "{d:?}");
+            assert_eq!(f.kind, d.kind(), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn テキストとして編集できる種別だけを通す() {
+        assert!(mode_is_text("code"));
+        assert!(mode_is_text("markdown"));
+        for mode in ["image", "pdf", "video", "changelog", ""] {
+            assert!(!mode_is_text(mode), "{mode} を編集可にしている");
+        }
+    }
+
+    #[test]
+    fn 本文の応答に検証子が載る() {
+        let fx = Fixture::new("etag");
+        let resolved = resolve_in_root(&fx.roots, fx.root_id(), "hello.txt").expect("解決");
+        let content = read_content(&resolved).expect("読める");
+        let body = content_payload(&resolved, &content);
+        let etag = body["etag"].as_str().expect("検証子が載る");
+        assert_eq!(etag, content_etag("こんにちは\n".as_bytes()));
+        assert_eq!(body["ssh"].as_bool(), Some(false));
+
+        // バイナリ・大きすぎるものには検証子を付けない = 書き込めない
+        let bin = fx.dir.join("root").join("bin.dat");
+        std::fs::write(&bin, [0u8, 1, 2]).expect("bin");
+        let resolved = resolve_in_root(&fx.roots, fx.root_id(), "bin.dat").expect("解決");
+        let content = read_content(&resolved).expect("読める");
+        let body = content_payload(&resolved, &content);
+        assert!(body["etag"].is_null(), "バイナリに検証子を付けない");
     }
 }

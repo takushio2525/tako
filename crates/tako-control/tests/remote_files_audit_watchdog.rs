@@ -72,7 +72,21 @@ fn 監査の呼び出しはaudit_payload経由だけ() {
 fn audit_payloadはどんなパスを渡しても漏らさない() {
     // 実パスに現れうる形を kind へ流し込んでも、パスらしき断片は出力に残らない。
     // kind は呼び出し側の固定文字列だが、将来ここへ変数が入る改変を検出する
-    for kind in ["roots", "list", "content", "download"] {
+    // #1084 / #1085 で増えた種別も含める（新しい呼び出し口が検査から漏れない）
+    for kind in [
+        "roots",
+        "list",
+        "content",
+        "download",
+        "ssh_list",
+        "ssh_content",
+        "ssh_download",
+        "pending",
+        "write",
+        "write_denied",
+        "push",
+        "push_failed",
+    ] {
         let payload = tako_control::remote_files::audit_payload(kind, 1024, 3);
         let text = payload.to_string();
         for forbidden in ['/', '\\', '~'] {
@@ -94,6 +108,38 @@ fn audit_payloadはどんなパスを渡しても漏らさない() {
             );
         }
     }
+}
+
+#[test]
+fn 監査の種別は固定文字列だけ() {
+    // 上のテストのコメントが言っている「将来ここへ変数が入る改変」を**実際に**検出する。
+    // `audit_payload(kind, ...)` の第 1 引数が変数になると、パスやファイル名が
+    // 種別として監査ログへ流れうる（#287 P2-2 の規約が静かに崩れる）
+    let src = production_part(&without_comments(&remote_files_source()));
+    let mut offenders: Vec<String> = Vec::new();
+    for (pos, _) in src.match_indices("audit_payload(") {
+        // 定義そのもの（`pub fn audit_payload(kind: &str, ...)`）は呼び出しではない
+        if src[..pos].trim_end().ends_with("fn") {
+            continue;
+        }
+        let rest = &src[pos + "audit_payload(".len()..];
+        let arg = rest.split(',').next().unwrap_or("").trim();
+        // 文字列リテラル（`"..."`）だけを許す
+        if !(arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2) {
+            let line_no = src[..pos].matches('\n').count() + 1;
+            offenders.push(format!("remote_files.rs:{line_no} — 第 1 引数が {arg}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "監査の種別は固定文字列で書くこと:\n{}",
+        offenders.join("\n")
+    );
+    // 走査が空振りしていないこと
+    assert!(
+        src.matches("audit_payload(").count() >= 8,
+        "audit_payload の呼び出しが見つからない（走査が空振り）"
+    );
 }
 
 #[test]

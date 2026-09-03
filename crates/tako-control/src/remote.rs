@@ -3915,6 +3915,12 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
         if path.ends_with("/close") || path.ends_with("/resize") {
             return DeviceRole::Manage;
         }
+        // #1084 / #1085: ファイル API の書き込み（保存 / 送り直し）は `/api/upload` と
+        // 同じ Interact。**パスを明示列挙**しているので、未知の `/api/files/*` の
+        // POST は下の Manage のまま安全側に残る（判定の正は remote_files 側）
+        if crate::remote_files::is_write_path(path) {
+            return DeviceRole::Interact;
+        }
         // 未知の POST は安全側（Manage）
         return DeviceRole::Manage;
     }
@@ -4402,9 +4408,12 @@ fn handle_api_v2_routes(
         (tiny_http::Method::Post, "/api/upload") => {
             handle_upload(request, ctx, device, pane_mapping)
         }
-        // #1079: ファイル API（一覧 / プレビュー / ダウンロード）。
-        // 実装は `remote_files` に閉じてあり、ここは受け渡しだけ
-        (tiny_http::Method::Get, p) if crate::remote_files::required_role_for(p).is_some() => {
+        // #1079: ファイル API（一覧 / プレビュー / ダウンロード）と
+        // #1084 / #1085 の書き込み（保存 / 送り直し）。実装は `remote_files` に
+        // 閉じてあり、ここは受け渡しだけ（メソッドの振り分けも向こう側）
+        (tiny_http::Method::Get | tiny_http::Method::Put | tiny_http::Method::Post, p)
+            if crate::remote_files::required_role_for(p).is_some() =>
+        {
             let deps = crate::remote_files::FilesDeps {
                 send: &|req| app_request(app_conn, req),
                 audit: &|event, extra| {
@@ -5287,6 +5296,20 @@ mod tests {
         // 未知の POST は従来どおり安全側（Manage）。ファイル API のパスでも変わらない
         assert_eq!(
             required_role(&Method::Post, "/api/files"),
+            DeviceRole::Manage
+        );
+        // #1084 / #1085: 書き込み（保存 / 送り直し）は `/api/upload` と同じ Interact
+        assert_eq!(
+            required_role(&Method::Put, "/api/files/content"),
+            DeviceRole::Interact
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/files/push"),
+            DeviceRole::Interact
+        );
+        // 明示列挙なので、未知の `/api/files/*` の POST は Manage のまま残る
+        assert_eq!(
+            required_role(&Method::Post, "/api/files/wipe"),
             DeviceRole::Manage
         );
         assert_eq!(
