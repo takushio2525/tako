@@ -181,6 +181,38 @@ CLI が**本物の tmux とは限らない**（Windows は winget の `marlocarl
   （版数文字列の判定を 2 か所に持たない）。attach / send-keys まで tmux 決め打ちの
   検証（セルフテスト 59〜62 / 68 / 73）だけがこの条件を使ってよい
 
+## `canonicalize` の結果を持ち回らない（Issue #970）
+
+`Path::canonicalize` は Windows で **verbatim 形式**（`\\?\C:\Users\…`）を返す。これは
+Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**であって、他のプログラムへ
+渡したり画面へ出したりする形ではない。
+
+- **解決結果を保存する / 子プロセスへ渡す / 応答へ出すなら
+  `tako_core::platform::path::canonicalize`（境界 B26）を通す**。比較キーを作るだけなら
+  `canonicalize_or_self`（`unwrap_or_else(|_| path.clone())` の置き換え）を使う
+- 番犬テスト `canonicalizeの直呼びが境界の外に残っていない`
+  （`crates/tako-control/tests/platform_parity.rs`）が**ファイルごとの件数**で見張る。
+  トラバーサル判定（`remote_files` / `remote` のアップロード）と比較キー専用の解決、
+  テスト内の直呼びは表に理由つきで載っている。**増やすときは理由を書く**
+- **なぜ macOS では気づけないか**: unix の `canonicalize` は prefix を付けないので、
+  テストも含めて全部緑になる。Windows では `tako open-in dir <repo>` したタブの cwd が
+  シェル統合の `\` → `/` 置換で **`///?/C:/…`（実在しないパス）**になり、
+  `git rev-parse --show-toplevel` を回す `Command::current_dir` が起動に失敗して
+  **そのタブの git 操作が全滅**していた（`tako list` / `recent` / `pane_current_path` の
+  表示にも `\\?\` が漏れる）。git 自身は verbatim を扱えるので、壊れているのは
+  prefix そのものではなく**潰した後の形**
+- **剥がさない場合がある**: verbatim を外すと Win32 の正規化が復活するので、
+  意味が変わる形（`MAX_PATH` 超え / `/` を含む / `.` `..` や空の成分 / 末尾が `.` か
+  空白の成分 / `NUL` などの予約デバイス名 / ボリューム GUID 形）は verbatim のまま返す。
+  **剥がして別の場所を指すより、既知の不具合が残るほうが安全**という判断
+- 発信側（`shell-integration/tako.ps1` の `__takoStripVerbatim`）でも剥がす。シェルが
+  verbatim な作業ディレクトリを**継承する**経路が残るため: `Set-Location` は verbatim を
+  拒否する（FileSystem プロバイダが `Cannot find path` を返す = 実測）ので、入り口は
+  **`CreateProcess` へ渡る cwd だけ** — tako 自身が verbatim な cwd で起動された場合と、
+  #970 より前の版が保存した layout の cwd で開き直した場合。それを見られるのは OSC を出す
+  スクリプトだけ。ただし**入口の代わりにはならない**（prefix は cwd 以外にも漏れる）。
+  順序（置換より前に剥がす）は番犬 `osc7を組む前にverbatimを剥がしている` が固定する
+
 ## 一括 dismiss に食われないクリック要素の作り方（Issue #496 / #503）
 
 ルート div の `on_mouse_down` は `clear_text_input_focus()` を呼び、テキスト入力フラグと
@@ -225,6 +257,33 @@ GPUI の `AnimationElement` は、**アニメーションが終わっていな�
   ディスプレイリンクが動かない環境（蓋閉じ・ヘッドレス）で両アームとも 0 になり、
   検出力が消える。「時間を空けて描き直しても値が動かない」= `done` = 要求も止まっている、
   と言い切れる（セルフテスト項目 128）
+
+## 「保留フラグ」と「それを回す人」を分けない（Issue #973）
+
+`Context` が要る後処理（タイマー・PTY 起動・背景ジョブ）を dispatch から始めたいとき、
+**「フラグを立てる関数」と「それを見て回す関数」を分けて呼び出し側に両方書かせる形**を
+作らないこと。片方を呼び忘れた経路が**無音で死ぬ**（フラグは立つので状態は「保留中」に
+見え、失敗もエラーも出ない）。
+
+- #973 の実物: プレビュー編集の自動保存が `schedule_autosave`（保留フラグ）と
+  `start_autosave_timer`（500ms 後に保存）に分かれており、後者を呼ぶのは GUI の入力経路
+  （キー / ペースト / IME）だけだった。dispatch 経路（`edit replace` / `apply` / `undo` /
+  `redo` = CLI / MCP）は保留に入ったまま誰も保存せず、`EditState::open` の既定が
+  `autosave: true` なのに**一度も自動保存されなかった**（利用者からは「自動保存 ON なのに
+  保存されていない」= データを失いかねない見え方）
+- **入口は 1 本にする**。フラグとタイマーを同じ関数の中で始めれば呼び忘れが起きない
+  （`drive_autosave`）
+- できるなら**フラグそのものをやめて状態から導く**。「編集した人が申告する」のではなく
+  「autosave が有効 + 編集中 + dirty なセッション」を毎回数えれば、**新しい編集経路は
+  何もしなくてよい**（判定の正は `preview::autosave_due`。#966 のリモート既定 OFF のような
+  例外も 1 箇所で効く）。判定を呼び出し側で書き直すと規則が 2 つ並ぶので番犬で止める
+- 消化するのは**すべての経路が通る 1 箇所**へ置く。dispatch なら IPC の 1 ターンの後処理
+  （`pending_attach` / `pending_writes` / `pending_highlights` と同じ場所）。番犬
+  `crates/tako-control/tests/preview_autosave_watchdog.rs` が「フラグを立てる箇所が 1 つ」
+  「それは入口の中」「IPC の 1 ターンが消化する」「旧 2 本立てが復活していない」を見る
+- 検証は**フラグではなく結果**で押さえる。「保留に入った」ことを見るテストは旧実装でも
+  通ってしまうので、**実 CLI でディスクの中身が変わるところまで**見る（セルフテスト項目 141。
+  dispatch を直接叩くと消化する側を検証できない）
 
 ## `occlude()` はスクロールも止める（Issue #576 / #961）
 

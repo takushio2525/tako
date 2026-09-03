@@ -3628,7 +3628,8 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     // Part 6: master 起動後にファイルツリーへ cwd と projects のフォルダを自動追加
     let mut tree_folders: Vec<String> = Vec::new();
     if let Some(ref cwd) = resolved_cwd {
-        if let Ok(canonical) = cwd.canonicalize() {
+        // 解決は境界（B26）を通す（TreeFolder へ渡って保存される値。#970）
+        if let Ok(canonical) = tako_core::platform::path::canonicalize(cwd) {
             tree_folders.push(canonical.display().to_string());
         }
     }
@@ -3637,7 +3638,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             for key in project_keys {
                 if let Ok(cwd) = config.resolve_cwd(key) {
                     let path = std::path::PathBuf::from(&cwd);
-                    if let Ok(canonical) = path.canonicalize() {
+                    if let Ok(canonical) = tako_core::platform::path::canonicalize(&path) {
                         let s = canonical.display().to_string();
                         if !tree_folders.contains(&s) {
                             tree_folders.push(s);

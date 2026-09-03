@@ -4140,6 +4140,14 @@ impl TakoApp {
                     for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
                         app.spawn_highlight(pane, path, text, cx);
                     }
+                    // #973: プレビュー編集の自動保存を回す。dispatch はペインの状態を
+                    // 変えるところまでで、500ms のタイマーには Context が要るので、
+                    // ここが **すべての dispatch が必ず通る 1 箇所**として消化する
+                    // （旧実装は GUI の入力経路だけがタイマーを始めていたため、
+                    // CLI / MCP の編集は autosave: true でも永久に保存されなかった）
+                    if !TakoApp::autosave_dispatch_legacy() {
+                        app.drive_autosave(cx);
+                    }
                     // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
                     app.drain_pending_preview_loads(cx);
                     // CLI / MCP の再生・シークでもフレーム取得ティッカーを回す。
@@ -4711,7 +4719,7 @@ impl TakoApp {
                         })
                         .detach();
                     }
-                    // #1040: 切断したリモートフォルダの自動復帰。判定（`master_alive` =
+                    // #1040: 切断したリモートフォルダの自動復帰。判定（`remote_fs::liveness` =
                     // ソケットの stat）は UI で、**繋ぎ直しと保留の押し出しは background**。
                     // 待ちが 1 件も無ければジョブは出ない = 平常時のコストはゼロ
                     let Ok(recovery_jobs) =
@@ -9363,23 +9371,48 @@ impl TakoApp {
                 st.baseline_index.min(lines.len())
             };
             let new_lines = &lines[from..];
+            let prints = tako_core::remote_fs::pane_prints(&st.host);
+            // #1090: **接続が成立した証拠**。多重化のソケットは接続が張れて初めて
+            // 作られるので、これだけが「一度でも繋がった」と言ってよい材料になる
+            // （#1040 の自動再接続の前提）。多重化が無いプラットフォームでは
+            // 常に false = **自動再接続は armed にならない**（宣言済みの縮退。
+            // `platform::ssh_client::NO_MULTIPLEXING`）
+            let master_socket = tako_core::remote_fs::control_path(&st.host)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if std::env::var("TAKO_1090_DIAG").as_deref() == Ok("1") {
+                let nonempty: Vec<&String> =
+                    new_lines.iter().filter(|l| !l.trim().is_empty()).collect();
+                println!(
+                    "TAKO_1090_DIAG: pane={} phase={:?} fresh={} from={from} lines={} nonempty={} first={:?} sock={master_socket}",
+                    pane.as_u64(),
+                    st.phase.as_str(),
+                    st.fresh_pane,
+                    lines.len(),
+                    nonempty.len(),
+                    nonempty.first().map(|l| l.chars().take(40).collect::<String>()),
+                );
+            }
 
             match st.phase.clone() {
                 // --- 接続待ち（#1010 のまま）------------------------------------
                 ConnectPhase::Connecting => {
                     let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                         new_lines,
-                        master_socket: tako_core::remote_fs::control_path(&st.host)
-                            .map(|p| p.exists())
-                            .unwrap_or(false),
+                        master_socket,
                         screen_changed: fingerprint != st.baseline_fingerprint,
                         fresh_pane: st.fresh_pane,
+                        // #1090: 折り返されたバナーの続き行を ssh の出力と読まない
+                        tako_prints: &prints,
                     });
                     match phase {
                         // #1040: ここで捨てずに**見張りへ移る**。切断を拾うため
                         ConnectPhase::Opened => {
                             if let Some(st) = self.ssh_connect.get_mut(&pane) {
-                                st.ever_connected = true;
+                                // #1090: `Opened` は「沈黙が破れた」までしか言わない
+                                // （器や下のシェルが描いた行でもここへ来る）。
+                                // **一度でも繋がった**は多重化のソケットだけが証明する
+                                st.ever_connected |= master_socket;
                                 st.phase = ConnectPhase::Connected;
                                 st.rebase(&lines);
                             }
@@ -9393,6 +9426,15 @@ impl TakoApp {
                 }
                 // --- 使えている: 切れていないかだけを見る（#1040）----------------
                 ConnectPhase::Connected => {
+                    // 見張っている間にソケットが出てきたらそこで証拠が揃う（#1090）
+                    if master_socket && !st.ever_connected {
+                        if let Some(st) = self.ssh_connect.get_mut(&pane) {
+                            st.ever_connected = true;
+                        }
+                    }
+                    let Some(st) = self.ssh_connect.get(&pane) else {
+                        continue;
+                    };
                     let Some((_signal, reason)) =
                         reconnect::detect_disconnect(new_lines, exit_code)
                     else {
@@ -9435,12 +9477,11 @@ impl TakoApp {
                     if st.attempt_pending {
                         let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                             new_lines,
-                            master_socket: tako_core::remote_fs::control_path(&st.host)
-                                .map(|p| p.exists())
-                                .unwrap_or(false),
+                            master_socket,
                             screen_changed: fingerprint != st.baseline_fingerprint,
                             // 打ち直しは**必ず既存シェルへ 1 行**なので fresh ではない
                             fresh_pane: false,
+                            tako_prints: &prints,
                         });
                         match phase {
                             ConnectPhase::Opened => {
@@ -9788,7 +9829,8 @@ impl TakoApp {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(dir) = paths.into_iter().next() {
                     let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                        let dir = dir.canonicalize().unwrap_or(dir);
+                        // 解決は境界（B26）を通す（ツリーへ保存される値。#970）
+                        let dir = tako_core::platform::path::canonicalize_or_self(&dir);
                         let tab_id = app.workspace.active_tab().id();
                         if let Some(tab) = app.workspace.get_tab_mut(tab_id) {
                             tab.add_pinned_folder(dir);
@@ -9836,7 +9878,9 @@ impl TakoApp {
     ) {
         use tako_core::recent::{RecentEntry, RecentList};
 
-        let dir = dir.canonicalize().unwrap_or(dir);
+        // 解決は境界（B26）を通す。ここは GUI の「フォルダ / リポジトリを開く」と
+        // 最近使った項目の入口で、値はペインの起動 cwd・タブ名・recent.json へ入る（#970）
+        let dir = tako_core::platform::path::canonicalize_or_self(&dir);
         let label = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -11130,7 +11174,6 @@ impl TakoApp {
             let count = edit.buffer.replace_all(query, replacement);
             edit.search_hits = edit.buffer.find_all(&edit.search_query);
             self.refresh_preview_from_editor(pane_id);
-            self.schedule_autosave(pane_id);
             Ok(serde_json::json!({ "replaced": count }))
         } else {
             let hits = edit.buffer.find_all(query);
@@ -11138,13 +11181,11 @@ impl TakoApp {
                 edit.buffer.replace_range(hit.start..hit.end, replacement);
                 edit.search_hits = edit.buffer.find_all(&edit.search_query);
                 self.refresh_preview_from_editor(pane_id);
-                self.schedule_autosave(pane_id);
                 Ok(serde_json::json!({ "replaced": 1 }))
             } else if let Some(hit) = edit.buffer.find_all(query).into_iter().next() {
                 edit.buffer.replace_range(hit.start..hit.end, replacement);
                 edit.search_hits = edit.buffer.find_all(&edit.search_query);
                 self.refresh_preview_from_editor(pane_id);
-                self.schedule_autosave(pane_id);
                 Ok(serde_json::json!({ "replaced": 1 }))
             } else {
                 Ok(serde_json::json!({ "replaced": 0 }))
@@ -11152,35 +11193,45 @@ impl TakoApp {
         }
     }
 
-    fn schedule_autosave(&mut self, pane_id: PaneId) {
-        if !self
-            .preview_edits
-            .get(&pane_id)
-            .is_some_and(|edit| edit.autosave && edit.editing && edit.dirty())
-        {
-            return;
-        }
-        if self.autosave_pending.contains(&pane_id) {
-            return;
-        }
-        self.autosave_pending.insert(pane_id);
+    /// `TAKO_973_LEGACY=1` で **#973 前の挙動**（dispatch = CLI / MCP の編集では
+    /// 自動保存のタイマーが始まらない）へ戻す。同一バイナリで A/B を取る入口で、
+    /// 隔離セルフテスト項目 141 の検出力の実証にも使う
+    fn autosave_dispatch_legacy() -> bool {
+        std::env::var_os("TAKO_973_LEGACY").is_some()
     }
 
-    fn start_autosave_timer(&self, pane_id: PaneId, cx: &mut Context<Self>) {
-        if !self.autosave_pending.contains(&pane_id) {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-            this.update(cx, |this, cx| {
-                this.run_autosave(pane_id, cx);
-                cx.notify();
+    /// #973: 自動保存の**唯一の入口**。保留フラグとタイマーを分けない。
+    ///
+    /// 旧実装は `schedule_autosave`（フラグを立てるだけ）と `start_autosave_timer`
+    /// （500ms 後に回す）が別だったため、タイマーを始めるのは GUI の入力経路
+    /// （キー / ペースト / IME）だけで、dispatch 経路（`edit replace` / `apply` /
+    /// `undo` / `redo`）は**保留に入ったまま誰も保存しなかった**（#973）。
+    /// しかも `EditState::open` の既定は `autosave: true` なので、CLI / MCP に
+    /// プレビュー編集を任せると「自動保存 ON なのに保存されていない」に見えていた。
+    ///
+    /// 対象は「誰が編集したか」ではなく**編集セッションの状態**から導く
+    /// （[`preview::autosave_due`]）ので、新しい編集経路を足しても
+    /// 「フラグを立てたのに誰も回さない」を作れない。呼ぶのは GUI の入力経路と
+    /// IPC の 1 ターンの後処理（= すべての dispatch が必ず通る 1 箇所）。
+    ///
+    /// デバウンスは #195 のまま（保留に入れた瞬間から 500ms 後に一度だけ保存し、
+    /// その間の追加編集ではタイマーを増やさない）。#126 の外部変更拒否と
+    /// #966 のリモート既定 OFF も [`Self::run_autosave`] / `EditState` 側のままで不変
+    fn drive_autosave(&mut self, cx: &mut Context<Self>) {
+        for pane_id in preview::autosave_due(self.preview_edits.iter(), &self.autosave_pending) {
+            self.autosave_pending.insert(pane_id);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.run_autosave(pane_id, cx);
+                    cx.notify();
+                })
+                .ok();
             })
-            .ok();
-        })
-        .detach();
+            .detach();
+        }
     }
 
     fn run_autosave(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
@@ -11301,8 +11352,7 @@ impl TakoApp {
             edit.message = None;
             self.refresh_preview_from_editor(pane_id);
             if is_text_change {
-                self.schedule_autosave(pane_id);
-                self.start_autosave_timer(pane_id, cx);
+                self.drive_autosave(cx);
             }
             cx.notify();
         }
@@ -11555,8 +11605,7 @@ impl TakoApp {
                 edit.message = None;
             }
             self.refresh_preview_from_editor(pane_id);
-            self.schedule_autosave(pane_id);
-            self.start_autosave_timer(pane_id, cx);
+            self.drive_autosave(cx);
         } else if let Some(session) = self.focused_session() {
             session.paste(&text);
         }
@@ -20384,8 +20433,7 @@ impl EntityInputHandler for TakoApp {
                 edit.buffer.insert(&ime.text);
                 edit.message = None;
                 self.refresh_preview_from_editor(pane);
-                self.schedule_autosave(pane);
-                self.start_autosave_timer(pane, cx);
+                self.drive_autosave(cx);
             } else if let Some(session) = self.terminals.get(&pane) {
                 session.write(ime.text.into_bytes());
             }
@@ -20479,8 +20527,7 @@ impl EntityInputHandler for TakoApp {
             edit.message = None;
             self.ime = None;
             self.refresh_preview_from_editor(pane);
-            self.schedule_autosave(pane);
-            self.start_autosave_timer(pane, cx);
+            self.drive_autosave(cx);
             window.invalidate_character_coordinates();
             cx.notify();
             return;
@@ -57904,15 +57951,59 @@ mod self_test {
                 );
 
                 // (d) 失敗すると**消えずに理由へ置き換わる**（無言にしない）
+                //
+                // #1090: **観測した phase の履歴も残す**。ここは 500ms ごとに
+                // `drive_ssh_connect` を回すので、途中の状態（まだ何も出ていない /
+                // バナーだけ）で誤分類されるとその瞬間しか痕跡が無い。失敗したときに
+                // 「どの順で何へ倒れたか」が分からないと原因を追えない（実測で 1 度踏んだ）
                 let mut failed = None;
+                let mut phase_trail: Vec<String> = Vec::new();
+                let mut first_line: Option<String> = None;
                 for _ in 0..40 {
                     wait(cx, 500).await;
-                    let st = window
+                    let (st, screen_lines) = window
                         .update(cx, |app: &mut TakoApp, _, _| {
                             app.drive_ssh_connect();
-                            <TakoApp as UiStateHost>::ssh_connect_state(app, PaneId::from_raw(ssh_pane))
+                            let pid = PaneId::from_raw(ssh_pane);
+                            let st = <TakoApp as UiStateHost>::ssh_connect_state(app, pid);
+                            let n = app
+                                .terminals
+                                .get(&pid)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .into_iter()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            (st, n)
                         })
-                        .unwrap_or(None);
+                        .unwrap_or((None, 0));
+                    let label = st
+                        .as_ref()
+                        .map(|v| v["phase"].as_str().unwrap_or("?").to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    let entry = format!("{label}/{screen_lines}");
+                    if phase_trail.last() != Some(&entry) {
+                        phase_trail.push(entry);
+                    }
+                    // 何が「1 行」だったのかが分からないと原因を追えないので、
+                    // 序盤の数サンプルだけ先頭行の中身も控える（#1090）
+                    if phase_trail.len() <= 4 && first_line.is_none() && screen_lines > 0 {
+                        first_line = window
+                            .update(cx, |app: &mut TakoApp, _, _| {
+                                app.terminals
+                                    .get(&PaneId::from_raw(ssh_pane))
+                                    .and_then(|s| {
+                                        s.visible_lines()
+                                            .into_iter()
+                                            .find(|l| !l.trim().is_empty())
+                                    })
+                                    .map(|l| l.chars().take(40).collect::<String>())
+                            })
+                            .ok()
+                            .flatten();
+                    }
                     if st.as_ref().map(|v| v["phase"] == "failed").unwrap_or(false) {
                         failed = st;
                         break;
@@ -57922,6 +58013,10 @@ mod self_test {
                     .as_ref()
                     .map(|v| v["phase"] == "failed" && !v["reason"].is_null())
                     .unwrap_or(false);
+                println!(
+                    "TAKO_SELF_TEST_133D_TRAIL: {} first_line={first_line:?}",
+                    phase_trail.join(" -> ")
+                );
                 if !failed_ok {
                     // #1073: 「スクリプトが走っていない」と「走ったが分類できていない」を
                     // 言い分ける（実機で 20 秒待っても connecting のままだった）。
@@ -59711,6 +59806,305 @@ mod self_test {
                     cx.notify();
                 });
                 let _ = std::fs::remove_file(&body_path);
+                notify_and_draw(any, window, cx);
+            }
+
+            // 141. プレビュー編集の自動保存が **dispatch = CLI / MCP の編集でも**回る
+            //      （#973）。旧実装は保留フラグを立てる `schedule_autosave` と 500ms 後に
+            //      回す `start_autosave_timer` が別で、後者を呼ぶのは GUI の入力経路だけ
+            //      だったので、`edit replace` / `apply` / `undo` / `redo` は
+            //      autosave: true でも永久に保存されなかった。
+            //
+            //      実 CLI を使うので**本物の IPC ループの後処理**を通る（dispatch を
+            //      直接叩くと消化する側を検証できない）。`TAKO_973_LEGACY=1` で
+            //      (a) が落ちる = 検出力
+            {
+                let dir141 = std::env::temp_dir().join(format!("tako-973-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir141);
+                std::fs::create_dir_all(&dir141).expect("973: 一時ディレクトリを作れる");
+                let file141 = dir141.join("note.txt");
+                let original141 = "alpha bravo charlie\n";
+                std::fs::write(&file141, original141).expect("973: 対象ファイルを書ける");
+
+                // 前の項目が閉じたペインの残り方に依存しないよう、**この項目専用のタブ**を
+                // 1 枚立てて中で完結させる（#889 が項目 93 で使った手）
+                let setup141 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let made = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("st973".into()),
+                                focus: Some(true),
+                                cwd: Some(dir141.display().to_string()),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        // dispatch を直接呼ぶので PTY 起動依頼もここで消化する（#1023）
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        let made = match made {
+                            Ok(v) => v,
+                            Err(e) => return Err(format!("tab new: {e}")),
+                        };
+                        let (Some(term), Some(tab)) =
+                            (made["pane"].as_u64(), made["tab"].as_u64())
+                        else {
+                            return Err(format!("tab new の応答: {made}"));
+                        };
+                        let term = PaneId::from_raw(term);
+                        let opened = match tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::OpenFile {
+                                pane: Some(term.as_u64()),
+                                path: file141.display().to_string(),
+                                mode: None,
+                                direction: None,
+                                focus: None,
+                                new_tab: false,
+                            },
+                            PaneOrigin::Cli,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return Err(format!("open: {e}")),
+                        };
+                        app.drain_pending_preview_loads(cx);
+                        let Some(pane) = opened["pane"].as_u64() else {
+                            return Err(format!("open の応答: {opened}"));
+                        };
+                        // CLI の呼び出し元はターミナルペインへ戻す（`--pane` で明示するが
+                        // 既定解決が preview を指さないようにしておく）
+                        let _ = app.workspace.active_tab_mut().tree_mut().focus(term);
+                        cx.notify();
+                        Ok((pane, term, TabId::from_raw(tab)))
+                    })
+                    .unwrap_or_else(|e| Err(format!("window.update: {e}")));
+                let (pane141, term141, tab141) = match setup141 {
+                    Ok(v) => v,
+                    Err(why) => fail(&format!(
+                        "141: 自動保存の検証用プレビューを開けない (#973。{why})"
+                    )),
+                };
+
+                // 実 CLI を 1 本走らせる（応答 JSON を返す）
+                let edit_cli = async |cx: &mut AsyncApp, args: Vec<String>| -> Option<serde_json::Value> {
+                    let out = cli_output_bg(
+                        cx, &cli_path, &ipc_endpoint, &token, term141, tab141, args,
+                    )
+                    .await?;
+                    serde_json::from_slice(&out.stdout).ok()
+                };
+                // ディスクの中身が期待どおりになるまで待つ（自動保存は 500ms 後）
+                let disk_becomes = async |cx: &mut AsyncApp, want: &str| -> bool {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+                    loop {
+                        if std::fs::read_to_string(&file141).is_ok_and(|t| t == want) {
+                            return true;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                        wait(cx, 100).await;
+                    }
+                };
+
+                let started = edit_cli(
+                    cx,
+                    vec!["edit".into(), "start".into(), "--pane".into(), pane141.to_string()],
+                )
+                .await;
+                let autosave_on = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "autosave".into(),
+                        "true".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                    ],
+                )
+                .await;
+                check(
+                    started.as_ref().and_then(|v| v["editing"].as_bool()) == Some(true)
+                        && autosave_on.as_ref().and_then(|v| v["autosave"].as_bool()) == Some(true),
+                    &format!(
+                        "141: 実 CLI で編集開始と自動保存 ON ができる (#973) \
+                         start={started:?} autosave={autosave_on:?}"
+                    ),
+                );
+
+                // (a) replace: Issue の再現手順そのまま
+                let replaced = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "replace".into(),
+                        "charlie".into(),
+                        "CHARLIE".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                    ],
+                )
+                .await;
+                let replace_written = disk_becomes(cx, "alpha bravo CHARLIE\n").await;
+                let status_after = edit_cli(
+                    cx,
+                    vec!["edit".into(), "status".into(), "--pane".into(), pane141.to_string()],
+                )
+                .await;
+                check(
+                    replace_written,
+                    &format!(
+                        "141 (a): CLI の edit replace が自動保存でディスクへ書かれる (#973) \
+                         replaced={:?} disk={:?}",
+                        replaced.as_ref().map(|v| v["replace"].clone()),
+                        std::fs::read_to_string(&file141).ok()
+                    ),
+                );
+                check(
+                    status_after.as_ref().and_then(|v| v["dirty"].as_bool()) == Some(false),
+                    &format!("141 (a): 自動保存の後は dirty が下りる (#973) {status_after:?}"),
+                );
+
+                // (b) undo / redo / apply も同じ経路で回る
+                let _ = edit_cli(
+                    cx,
+                    vec!["edit".into(), "undo".into(), "--pane".into(), pane141.to_string()],
+                )
+                .await;
+                let undo_written = disk_becomes(cx, original141).await;
+                let _ = edit_cli(
+                    cx,
+                    vec!["edit".into(), "redo".into(), "--pane".into(), pane141.to_string()],
+                )
+                .await;
+                let redo_written = disk_becomes(cx, "alpha bravo CHARLIE\n").await;
+                let _ = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "apply".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                        "applied-日本語\n".into(),
+                    ],
+                )
+                .await;
+                let apply_written = disk_becomes(cx, "applied-日本語\n").await;
+                check(
+                    undo_written && redo_written && apply_written,
+                    &format!(
+                        "141 (b): undo / redo / apply も自動保存で書かれる (#973) \
+                         undo={undo_written} redo={redo_written} apply={apply_written} \
+                         disk={:?}",
+                        std::fs::read_to_string(&file141).ok()
+                    ),
+                );
+
+                // (c) 自動保存 OFF では書かない（#973 で「常に保存する」へ倒していない）
+                let autosave_off = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "autosave".into(),
+                        "false".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                    ],
+                )
+                .await;
+                let _ = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "replace".into(),
+                        "applied".into(),
+                        "NOT-SAVED".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                    ],
+                )
+                .await;
+                wait(cx, 1500).await;
+                let off_status = edit_cli(
+                    cx,
+                    vec!["edit".into(), "status".into(), "--pane".into(), pane141.to_string()],
+                )
+                .await;
+                let off_disk = std::fs::read_to_string(&file141).ok();
+                check(
+                    autosave_off.as_ref().and_then(|v| v["autosave"].as_bool()) == Some(false)
+                        && off_disk.as_deref() == Some("applied-日本語\n")
+                        && off_status.as_ref().and_then(|v| v["dirty"].as_bool()) == Some(true),
+                    &format!(
+                        "141 (c): 自動保存 OFF なら書かない (#973) off={autosave_off:?} \
+                         status={off_status:?} disk={off_disk:?}"
+                    ),
+                );
+
+                // (d) #126 の外部変更拒否は不変: 外で書き換えられていたら上書きしない
+                let _ = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "autosave".into(),
+                        "true".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                    ],
+                )
+                .await;
+                std::fs::write(&file141, "外部が書き換えた\n").expect("973: 外部変更を作れる");
+                let _ = edit_cli(
+                    cx,
+                    vec![
+                        "edit".into(),
+                        "replace".into(),
+                        "NOT-SAVED".into(),
+                        "AGAIN".into(),
+                        "--pane".into(),
+                        pane141.to_string(),
+                    ],
+                )
+                .await;
+                wait(cx, 1500).await;
+                let conflict_disk = std::fs::read_to_string(&file141).ok();
+                let conflict_status = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.preview_edits
+                            .get(&PaneId::from_raw(pane141))
+                            .map(|edit| format!("{:?}", edit.save_status))
+                    })
+                    .ok()
+                    .flatten();
+                check(
+                    conflict_disk.as_deref() == Some("外部が書き換えた\n")
+                        && conflict_status.as_deref() == Some("Some(Conflict)"),
+                    &format!(
+                        "141 (d): 外部変更されたファイルは自動保存で上書きしない (#126 不変) \
+                         disk={conflict_disk:?} status={conflict_status:?}"
+                    ),
+                );
+
+                println!(
+                    "TAKO_SELF_TEST_973: pane={pane141} replace={replace_written} \
+                     undo={undo_written} redo={redo_written} apply={apply_written} \
+                     off_disk={off_disk:?} conflict={conflict_status:?} legacy={}",
+                    TakoApp::autosave_dispatch_legacy()
+                );
+
+                // 後片付け: 未保存バッファを捨てて専用タブごと畳む
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    let pane = PaneId::from_raw(pane141);
+                    app.preview_edits.remove(&pane);
+                    app.autosave_pending.remove(&pane);
+                    app.close_pane_button(pane, CloseOrigin::Internal, cx);
+                    app.close_pane_button(term141, CloseOrigin::Internal, cx);
+                    cx.notify();
+                });
+                let _ = std::fs::remove_dir_all(&dir141);
                 notify_and_draw(any, window, cx);
             }
 
