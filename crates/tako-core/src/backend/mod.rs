@@ -184,6 +184,16 @@ pub fn session_pinned_pairs(
     options_env: &[(String, String)],
     socket: &str,
 ) -> Vec<(String, String)> {
+    // `TAKO_1105_LEGACY=1` で **#1105 前の挙動**（`options.env` に載っているぶんだけを
+    // 固定する = シェル統合の置き場も器の同一性も伝えない）へ戻す。
+    // 同一バイナリで A/B を取る入口で、診断行の検出力の実証にも使う
+    if std::env::var_os("TAKO_1105_LEGACY").is_some() {
+        return options_env
+            .iter()
+            .filter(|(key, _)| PANE_SCOPED_ENV.contains(&key.as_str()))
+            .cloned()
+            .collect();
+    }
     let mut out: Vec<(String, String)> = options_env
         .iter()
         .filter(|(key, _)| session_pinned_env(key))

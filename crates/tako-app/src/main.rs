@@ -38099,6 +38099,14 @@ mod self_test {
                     let osc60_zshenv = osc60_expected
                         .as_deref()
                         .map(|d| std::path::Path::new(d).join(".zshenv").exists());
+                    // 器の同一性が中のシェルへ伝わっているか（#1105）。無いと統合は
+                    // ソケット名の接頭辞 `tako*` で推測するので、`tako` で始まらない
+                    // 名前のときだけ OSC を包まず黙って無効化される
+                    let osc60_sock_env = tako_core::tmux::show_environment(
+                        Some(&backend_sock),
+                        Some(&backend_name),
+                        tako_core::backend::BACKEND_SOCKET_ENV,
+                    );
                     let caps60 = tako_core::backend::capabilities();
                     println!(
                         "TAKO_SELF_TEST_60: {}",
@@ -38115,6 +38123,7 @@ mod self_test {
                             format!("zdotdir_expected={osc60_expected:?}"),
                             format!("zdotdir_session={osc60_session:?}"),
                             format!("zdotdir_server={osc60_server:?}"),
+                            format!("backend_socket_env={osc60_sock_env:?}"),
                             format!("server_stale={osc60_stale}"),
                             format!("waited_ms={}", 20 * 500),
                             format!("pane_cwd={osc60_pane_cwd:?}"),
@@ -38125,7 +38134,12 @@ mod self_test {
                     if !cwd_ok {
                         // 原因を名指しする（後から log を読んだ人が「環境の残骸」と
                         // 「製品の回帰」を混ぜないように）。順序は「確定できるものから」
-                        let why = if osc60_server_pt.as_deref() == Some("off") {
+                        let why = if osc60_sock_env.is_none() {
+                            format!(
+                                "器の同一性が中のシェルへ伝わっていない（{} が固定されていない）。                                 統合はソケット名の接頭辞 `tako*` で推測するので、socket={backend_sock} が                                  `tako` で始まらないとき OSC を包まず黙って無効化される = #1105 の回帰",
+                                tako_core::backend::BACKEND_SOCKET_ENV
+                            )
+                        } else if osc60_server_pt.as_deref() == Some("off") {
                             format!(
                                 "器のサーバーが tako の conf を読んでいない（allow-passthrough off）。\
                                  conf は `-f` = サーバー起動時にしか読まれないので、tako が立てて\
