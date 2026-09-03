@@ -132,6 +132,15 @@ impl FakeApp {
                         "mode": p.mode,
                         "editing": p.editing,
                         "dirty": p.dirty(),
+                        // #966 のリモート由来の紐付け（実 dispatch と同じ形）
+                        "remote": p.remote.as_ref().map(|(h, rp)| json!({
+                            "host": h,
+                            "path": rp,
+                            "label": format!("{h}:{rp}"),
+                            "state": "idle",
+                            "read_only": p.read_only,
+                            "pending_write": false,
+                        })),
                     },
                 })
             })
@@ -359,6 +368,13 @@ impl FakeApp {
                     "open-file" => {
                         let host = host.clone().ok_or("host が要る")?;
                         let rpath = path.clone().ok_or("path が要る")?;
+                        // 相手へ届かなければ**取得も失敗する**（実 SFTP と同じ。
+                        // ここを成功させると「切断中の保存」の経路がテストされない）
+                        if self.state.lock().unwrap().disconnected {
+                            return Err(
+                                "ssh: connect to host port 22: Operation timed out".to_string()
+                            );
+                        }
                         let key = format!("{host}:{rpath}");
                         let bytes = {
                             let st = self.state.lock().unwrap();
@@ -379,15 +395,25 @@ impl FakeApp {
                         let read_only = rpath.ends_with(".ro");
                         let mut out =
                             self.open_file(&local, Some((host.clone(), rpath.clone())), read_only);
-                        // 種別はリモートの名前で決める（写しの名前は id なので拡張子が無い）
-                        out["mode"] = json!(FakeApp::mode_for(Path::new(&rpath)));
+                        // ペインのプレビュー種別はリモートの名前で決まる
+                        // （写しの名前は `<hash>-<元の名前>` なので拡張子が残る）
                         if let Some(pane) = out["pane"].as_u64() {
                             let mut st = self.state.lock().unwrap();
                             if let Some(p) = st.panes.iter_mut().find(|p| p.id == pane) {
-                                p.mode = out["mode"].as_str().unwrap_or("code").to_string();
+                                p.mode = FakeApp::mode_for(Path::new(&rpath));
                                 p.read_only = read_only;
                             }
                         }
+                        // **実装と同じ罠を再現する**: `remote_open_file_fetched` は
+                        // 応答の `mode` を `ls -la` の権限欄で**上書きする**ので、
+                        // これをプレビュー種別として読むと必ず「テキストではない」に
+                        // なる（#1085 の実 SSH 検証で踏んだ。スタブが素直な値を
+                        // 返していたぶんテストが素通りしていた）
+                        out["mode"] = json!(if read_only {
+                            "-r--r--r--"
+                        } else {
+                            "-rw-r--r--"
+                        });
                         out["host"] = json!(host);
                         out["remote_path"] = json!(rpath);
                         out["cached_path"] = json!(local.display().to_string());

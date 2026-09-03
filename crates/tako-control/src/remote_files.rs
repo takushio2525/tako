@@ -783,21 +783,25 @@ pub fn is_write_path(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct WriteFailure {
     pub status: u16,
-    pub kind: String,
+    /// 機械可読な種別。**呼び出し側の固定文字列だけ**（監査の種別と同じ規約で、
+    /// パスやファイル名が種別として応答へ混ざる形を型で禁じる）
+    pub kind: &'static str,
     pub ja: String,
     pub en: String,
-    /// 応答へ足す追加フィールド（`pending` など）
-    pub extra: Value,
+    /// 応答へ足す追加フィールド（`pending` など）。
+    /// `Option` にしてあるのは **`Result` の Err 側を小さく保つため**
+    /// （`Result<Value, WriteFailure>` を返す関数が多く、大きいと clippy が咎める）
+    pub extra: Option<Box<Value>>,
 }
 
 impl WriteFailure {
-    fn new(status: u16, kind: &str, ja: impl Into<String>, en: impl Into<String>) -> Self {
+    fn new(status: u16, kind: &'static str, ja: impl Into<String>, en: impl Into<String>) -> Self {
         Self {
             status,
-            kind: kind.to_string(),
+            kind,
             ja: ja.into(),
             en: en.into(),
-            extra: Value::Null,
+            extra: None,
         }
     }
 
@@ -892,7 +896,7 @@ impl WriteFailure {
     }
 
     /// リモートへ押し出せず**退避された**（#966）。切断中の保存が無言で消えない
-    pub fn remote_pending(kind: &str, detail: &str) -> Self {
+    pub fn remote_pending(remote_kind: &str, detail: &str) -> Self {
         let mut f = Self::new(
             502,
             "remote_pending",
@@ -901,7 +905,9 @@ impl WriteFailure {
             ),
             format!("Could not reach the host; the content is stashed and can be pushed again once connected ({detail})"),
         );
-        f.extra = json!({ "pending": true, "remote_kind": kind });
+        f.extra = Some(Box::new(
+            json!({ "pending": true, "remote_kind": remote_kind }),
+        ));
         f
     }
 
@@ -911,7 +917,7 @@ impl WriteFailure {
             "error_en": self.en,
             "kind": self.kind,
         });
-        if let Some(extra) = self.extra.as_object() {
+        if let Some(extra) = self.extra.as_deref().and_then(Value::as_object) {
             for (k, v) in extra {
                 out[k] = v.clone();
             }
@@ -924,10 +930,10 @@ impl From<Denial> for WriteFailure {
     fn from(d: Denial) -> Self {
         Self {
             status: d.status(),
-            kind: d.kind().to_string(),
+            kind: d.kind(),
             ja: d.message_ja().to_string(),
             en: d.message_en().to_string(),
-            extra: Value::Null,
+            extra: None,
         }
     }
 }
@@ -1105,6 +1111,23 @@ fn same_file(reported: Option<&str>, abs: &str) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+/// そのペインのプレビュー種別（`List` の `preview.mode`）。
+///
+/// **`open-file` の応答の `mode` は使えない**: あれは `ls -la` の権限欄
+/// （`-rw-r--r--`）で上書きされているので、プレビュー種別として読むと
+/// 「テキストではない」と誤判定して編集を断ってしまう（#1085 の実 SSH 検証で実測）
+fn preview_mode_of_pane(deps: &FilesDeps, pane: u64) -> Option<String> {
+    let list = (deps.send)(crate::protocol::Request::List).ok()?;
+    for tab in list["tabs"].as_array()? {
+        for p in tab["panes"].as_array()? {
+            if p["id"].as_u64() == Some(pane) {
+                return p["preview"]["mode"].as_str().map(str::to_string);
+            }
+        }
+    }
+    None
 }
 
 /// 編集モードの現在状態を読む（`enabled` 省略 = 状態取得だけ。
@@ -1307,8 +1330,16 @@ fn write_ssh(
     if text.len() as u64 > MAX_TEXT_BYTES {
         return Err(WriteFailure::too_large(MAX_TEXT_BYTES));
     }
-    // (1) いまのリモートの内容を取り直す（= キャッシュと競合検知の基準が進む）
-    let opened = open_ssh_preview(deps, target)?;
+    // (1) いまのリモートの内容を取り直す（= キャッシュと競合検知の基準が進む）。
+    //
+    // **相手へ届かないとここで落ちる**。そのときは「読んだときのペイン」が
+    // まだ在れば、そこへ適用して保存し **#966 の退避へ回す**（切断中の保存を
+    // 無言で捨てない = #1085 受け入れ 2）。ペインが無ければ書き先が分からないので
+    // 理由を返して断る（写しへ書くだけの「保存できた気になる」は作らない）
+    let opened = match open_ssh_preview(deps, target) {
+        Ok(v) => v,
+        Err(fetch_failure) => return stash_offline_write(deps, target, text, etag, fetch_failure),
+    };
     if opened["read_only"].as_bool().unwrap_or(false) {
         return Err(WriteFailure::read_only());
     }
@@ -1322,8 +1353,8 @@ fn write_ssh(
     if content_etag(current.as_bytes()) != etag {
         return Err(WriteFailure::conflict(""));
     }
-    let mode = opened["mode"].as_str().unwrap_or_default();
-    if !mode_is_text(mode) {
+    let mode = preview_mode_of_pane(deps, pane).unwrap_or_default();
+    if !mode_is_text(&mode) {
         return Err(WriteFailure::not_text());
     }
     let (was_editing, dirty) = preview_edit_state(deps, pane).map_err(|e| WriteFailure::app(&e))?;
@@ -1334,7 +1365,7 @@ fn write_ssh(
     // (2) PC 側の編集経路で保存する（SFTP の書き戻しはこの中）
     let target_pane = PreviewTarget {
         pane,
-        mode: mode.to_string(),
+        mode: mode.clone(),
         was_editing,
         dirty,
     };
@@ -1354,6 +1385,80 @@ fn write_ssh(
         // 種別は退避の記録から取る = app のエラー文言に依存しない
         Err(failure) => Err(classify_ssh_write_failure(deps, target, failure)),
     }
+}
+
+/// 相手へ届かないときの保存を **#966 の退避へ回す**（#1085 受け入れ 2）。
+///
+/// 再取得できないので「いまのリモートの内容」とは突き合わせられない。代わりに
+/// **前回取得できた内容**（写し）と検証子を突き合わせる: これは #966 が押し出しの
+/// ときに使う基準（baseline）と同じものなので、`push` の時点で改めて
+/// リモートと突き合わされる = 競合の判定が緩まない。
+///
+/// 書き先は「そのリモートファイルを出しているペイン」だけ。**新しく開かない**
+/// （リモート由来の紐付けが無いペインへ書くと、写しへ書けただけで
+/// 「保存できた」と言う #966 が禁じた事故に戻る）
+fn stash_offline_write(
+    deps: &FilesDeps,
+    target: &SshResolved,
+    text: &str,
+    etag: &str,
+    fetch_failure: WriteFailure,
+) -> Result<Value, WriteFailure> {
+    let Some((pane, cached, mode)) = find_remote_preview_pane(deps, &target.host, &target.path)
+    else {
+        return Err(fetch_failure);
+    };
+    // 前回取得できた内容と突き合わせる（スマホが読んだのはこれ）
+    let current = read_cached_text(std::path::Path::new(&cached))?;
+    if content_etag(current.as_bytes()) != etag {
+        return Err(WriteFailure::conflict(""));
+    }
+    if !mode_is_text(&mode) {
+        return Err(WriteFailure::not_text());
+    }
+    let (was_editing, dirty) = preview_edit_state(deps, pane).map_err(|e| WriteFailure::app(&e))?;
+    if dirty {
+        return Err(WriteFailure::busy_editing());
+    }
+    let pane_target = PreviewTarget {
+        pane,
+        mode,
+        was_editing,
+        dirty,
+    };
+    match apply_and_save(deps, &pane_target, text) {
+        // 相手へ届かないのに成功した = 押し出しが走っていない（あってはならない）
+        Ok(_) => Err(fetch_failure),
+        Err(failure) => Err(classify_ssh_write_failure(deps, target, failure)),
+    }
+}
+
+/// そのリモートファイルを出しているペインを探す（`List` の `preview.remote`）。
+///
+/// 返すのは (ペイン, 写しのローカルパス, プレビュー種別)。
+/// **写しのパスで照合しない**のが要点: 写しのパスはキャッシュの実装詳細なので、
+/// リモートの位置（host + path）で突き合わせる
+fn find_remote_preview_pane(
+    deps: &FilesDeps,
+    host: &str,
+    path: &str,
+) -> Option<(u64, String, String)> {
+    let list = (deps.send)(crate::protocol::Request::List).ok()?;
+    for tab in list["tabs"].as_array()? {
+        for p in tab["panes"].as_array()? {
+            let preview = &p["preview"];
+            if preview["remote"]["host"].as_str() == Some(host)
+                && preview["remote"]["path"].as_str() == Some(path)
+            {
+                return Some((
+                    p["id"].as_u64()?,
+                    preview["path"].as_str()?.to_string(),
+                    preview["mode"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// 押し出しの失敗を退避の記録から分類する。
@@ -1761,7 +1866,11 @@ fn ssh_content_payload(deps: &FilesDeps, target: &SshResolved) -> Result<Value, 
         .as_str()
         .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
     let size = opened["size"].as_u64();
-    let mode = opened["mode"].as_str().unwrap_or_default();
+    let pane = opened["pane"].as_u64();
+    // 種別は**ペインから**引く（`opened["mode"]` は `ls -la` の権限欄なので使えない）
+    let mode = pane
+        .and_then(|p| preview_mode_of_pane(deps, p))
+        .unwrap_or_default();
     let read_only = opened["read_only"].as_bool().unwrap_or(false);
     let pending = opened["pending_write"].as_bool().unwrap_or(false);
     let text = read_cached_text(std::path::Path::new(cached)).ok();
@@ -1780,10 +1889,10 @@ fn ssh_content_payload(deps: &FilesDeps, target: &SshResolved) -> Result<Value, 
         "text": text,
         "etag": text.as_ref().map(|t| content_etag(t.as_bytes())),
         // 書けないものは編集させない（#966。mode のどこにも `w` が無いとき）
-        "read_only": read_only || !mode_is_text(mode),
+        "read_only": read_only || !mode_is_text(&mode),
         // 前のセッションで押し出せていない保存が残っている（#966）
         "pending_write": pending,
-        "pane": opened["pane"].clone(),
+        "pane": pane,
     }))
 }
 

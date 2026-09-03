@@ -773,6 +773,14 @@ impl AppIpcClient {
 
     /// IPC に Request を送り、結果を返す
     fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
+        Self::roundtrip_raw(&self.socket, &self.token, request).map_err(|e| e.into_message())
+    }
+
+    /// 失敗の**種別つき**で送る（#1084）。
+    ///
+    /// 業務エラー（dispatch が理由つきで断った）と伝送エラー（app へ届かない）を
+    /// 区別したい呼び出し口だけが使う。既存の呼び出しは `request` のまま
+    fn request_typed(&self, request: crate::protocol::Request) -> Result<Value, AppCallError> {
         Self::roundtrip_raw(&self.socket, &self.token, request)
     }
 
@@ -781,34 +789,37 @@ impl AppIpcClient {
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, AppCallError> {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixStream;
 
-        let stream = UnixStream::connect(socket)
-            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        let stream = UnixStream::connect(socket).map_err(|e| {
+            AppCallError::transport(format!("tako app へ接続できない ({socket}): {e}"))
+        })?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .ok();
         let mut writer = stream
             .try_clone()
-            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+            .map_err(|e| AppCallError::transport(format!("接続の複製に失敗: {e}")))?;
         let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
-        let json =
-            serde_json::to_string(&envelope).map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
-        writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+        let json = serde_json::to_string(&envelope)
+            .map_err(|e| AppCallError::transport(format!("リクエストの構築に失敗: {e}")))?;
+        writeln!(writer, "{json}")
+            .map_err(|e| AppCallError::transport(format!("送信に失敗: {e}")))?;
 
         let mut line = String::new();
         BufReader::new(stream)
             .read_line(&mut line)
-            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+            .map_err(|e| AppCallError::transport(format!("応答の受信に失敗: {e}")))?;
         if line.is_empty() {
-            return Err("tako app から応答が返らなかった".into());
+            return Err(AppCallError::transport("tako app から応答が返らなかった"));
         }
-        let response: crate::protocol::ResponseEnvelope =
-            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        let response: crate::protocol::ResponseEnvelope = serde_json::from_str(&line)
+            .map_err(|e| AppCallError::transport(format!("応答を解釈できない: {e}")))?;
         if let Some(error) = response.error {
-            return Err(error.message);
+            // **ここは伝送の失敗ではない**（app は生きていて理由つきで断った）
+            return Err(AppCallError::Dispatch(error.message));
         }
         Ok(response.result.unwrap_or(Value::Null))
     }
@@ -818,8 +829,40 @@ impl AppIpcClient {
         _socket: &str,
         _token: &str,
         _request: crate::protocol::Request,
-    ) -> Result<Value, String> {
-        Err("Windows の IPC は未実装".into())
+    ) -> Result<Value, AppCallError> {
+        Err(AppCallError::transport("Windows の IPC は未実装"))
+    }
+}
+
+/// app 呼び出しの失敗の種別（#1084）。
+///
+/// **業務エラーで IPC 接続を捨てると次の 5 秒間 file API が 503 になる**
+/// （`IPC_RECONNECT_INTERVAL`）。dispatch は競合・プレビューでない・保存できない等を
+/// 理由つきで断るので、書き込み経路ではこれが日常的に起きる（#1084 の実 SSH 検証で実測）。
+/// 種別を分けて「届かなかったときだけ」接続を捨てる
+#[derive(Debug)]
+enum AppCallError {
+    /// app へ届かなかった（接続・送受信・応答の解釈）
+    Transport(String),
+    /// app は答えたが dispatch が断った（理由つき）。
+    ///
+    /// **非 unix では作られない**: daemon → app の IPC（`roundtrip_raw`）が
+    /// unix だけの実装で、Windows では「未実装」を伝送エラーとして返すため
+    /// （= remote daemon から app へ届く経路そのものが無い）。
+    /// 実装が入れば自然に使われるので、種別ごと消さずに残す
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Dispatch(String),
+}
+
+impl AppCallError {
+    fn transport(message: impl Into<String>) -> Self {
+        Self::Transport(message.into())
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Transport(m) | Self::Dispatch(m) => m,
+        }
     }
 }
 
@@ -3232,12 +3275,16 @@ fn app_request(
 ) -> Result<Value, String> {
     let mut conn = app_conn.write().map_err(|_| "内部エラー".to_string())?;
     let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
-    match client.request(req) {
+    match client.request_typed(req) {
         Ok(v) => Ok(v),
-        Err(e) => {
+        // **届かなかったときだけ**接続を捨てる（#1084）。dispatch が理由つきで断った
+        // だけで捨てると、`IPC_RECONNECT_INTERVAL`（5 秒）のあいだ file API が
+        // まるごと 503 になる（保存の競合 1 回で読み出しまで死ぬ）
+        Err(AppCallError::Transport(e)) => {
             conn.invalidate();
             Err(e)
         }
+        Err(AppCallError::Dispatch(e)) => Err(e),
     }
 }
 
@@ -5225,6 +5272,86 @@ mod tests {
         assert_eq!(window_target_of("tako-abc123:2.0"), "tako-abc123:2");
         // ペイン部が無い場合はそのまま
         assert_eq!(window_target_of("sess:0"), "sess:0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatchが断っただけでipc接続を捨てない() {
+        // #1084 の実 SSH 検証で踏んだ回帰: 業務エラー（競合・プレビューでない・
+        // 保存できない）で `invalidate()` すると `IPC_RECONNECT_INTERVAL`（5 秒）の
+        // あいだ file API がまるごと 503 になる。**保存の競合 1 回で読み出しまで死ぬ**
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1084-ipc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let sock = dir.join("app.sock");
+        // 前回の残骸があると bind が AlreadyExists で落ちる（UDS はファイル）
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("UDS");
+        // dispatch が理由つきで断る app を模す（2 回受ける）
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let body = serde_json::to_string(&crate::protocol::ResponseEnvelope::err(
+                    1,
+                    -32000,
+                    "ファイルが外部で変更されたため保存しなかった",
+                ))
+                .expect("JSON");
+                let mut w = stream;
+                let _ = writeln!(w, "{body}");
+            }
+        });
+
+        let client = AppIpcClient {
+            socket: sock.display().to_string(),
+            token: "t".into(),
+        };
+        match client.request_typed(crate::protocol::Request::List) {
+            Err(AppCallError::Dispatch(m)) => {
+                assert!(m.contains("外部で変更"), "理由がそのまま届く: {m}");
+            }
+            other => panic!("dispatch エラーとして分類されない: {:?}", other.is_ok()),
+        }
+        // 同じ接続情報でもう一度通る（= 捨てる理由が無い）
+        assert!(
+            matches!(
+                client.request_typed(crate::protocol::Request::List),
+                Err(AppCallError::Dispatch(_))
+            ),
+            "2 回目も dispatch エラーとして届く"
+        );
+        let _ = server.join();
+
+        // 届かない相手は Transport（こちらは捨ててよい）
+        let dead = AppIpcClient {
+            socket: dir.join("nope.sock").display().to_string(),
+            token: "t".into(),
+        };
+        assert!(
+            matches!(
+                dead.request_typed(crate::protocol::Request::List),
+                Err(AppCallError::Transport(_))
+            ),
+            "接続できない相手は伝送エラー"
+        );
+
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ配下以外は消さない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
