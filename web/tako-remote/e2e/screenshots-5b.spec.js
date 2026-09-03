@@ -23,6 +23,22 @@ const FAKE_ME_OBSERVE = {
   role: 'observe',
 };
 
+// #425 / #444: 承認待ちの正は「ペイン画面に permission ダイアログが実在すること」。
+// daemon は `/api/v2/panes` の各ペインへ `permission_dialog {command, options, highlighted}`
+// を付けて返す（`crates/tako-control/src/remote.rs` の `attach_card_summaries`。
+// 中身は `claude_tui::detect_permission_dialog` → `PermissionDialog`）。
+// 下の値は claude v2.x 実採取相当の画面をその実装へ通して得た出力そのまま:
+//   command: String / options: Vec<String> / highlighted: Option<usize>
+const FAKE_PERMISSION_DIALOG = {
+  command: 'Bash command rm -rf dist/ && npm run build Remove build output and rebuild Do you want to proceed?',
+  options: [
+    'Yes',
+    "Yes, and don't ask again for rm commands",
+    'No, and tell Claude what to do differently (esc)',
+  ],
+  highlighted: 0,
+};
+
 const FAKE_PANES = {
   panes: [
     {
@@ -38,6 +54,9 @@ const FAKE_PANES = {
       surface: 'foreground', position: '3/4', tab_id: 1, tab_title: 'work',
       cols: 120, rows: 40, focused: false, session_id: 'codex-session',
       model: 'gpt-5.6', effort: 'medium',
+      // ダイアログが画面に在るペイン。daemon は同時に activity も permission にする
+      permission_dialog: FAKE_PERMISSION_DIALOG,
+      activity: 'permission',
     },
     {
       id: 3, title: 'docs-site', role: 'orchestrator-worker-agy',
@@ -66,10 +85,10 @@ const FAKE_MESSAGES_1B = {
         { name: 'Read', summary: 'src/routes/*.ts 6 files' },
         { name: 'Edit', summary: 'users.ts / orders.ts +4 +61 -58' },
       ],
-      approval: {
-        tool: 'Bash',
-        command: 'rm -rf dist/ && npm run build',
-      },
+      // 旧実装は transcript の `approval` から承認カードを推定していたが、
+      // #425 で廃止した（auto mode の実行中と承認待ちを区別できず誤表示していた）。
+      // いま card を出すのは上の FAKE_PERMISSION_DIALOG だけなので、
+      // ここに置き直すと「効いている」と誤解される
       timestamp: '2026-07-17T21:16:00Z',
     },
   ],
@@ -163,7 +182,9 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     );
     await page.goto(`${BASE}/#/panes/2`);
     await page.waitForSelector('.chat-scroll', { timeout: 10000 });
-    await page.waitForTimeout(1000);
+    // 承認カードが実際に出るまで待つ。固定時間で撮ると #1089 のように
+    // 「カードの無い承認カードのスクショ」が無言で撮れ続ける（#796 の作法）
+    await page.waitForSelector('.approval-card', { timeout: 10000 });
     await page.screenshot({ path: `${EVIDENCE_DIR}/1b-approval-card.png`, fullPage: false });
     expect(external).toEqual([]);
   });
@@ -239,83 +260,94 @@ test.describe('弾5b: UI 高度機能スクショ — iPhone viewport', () => {
     expect(external).toEqual([]);
   });
 
-  // --- 受け入れ条件①: 承認カード通し実測 ---
-  // 承認カード表示 → 許可(y)タップ → dispatch Send (POST /api/panes/:id/input) へ
-  // text="y" newline=true が送信されることを Playwright でキャプチャして検証する
-  test('承認カード通し: 許可(y)タップ → input API に y が送信される', async ({ page }) => {
+  // --- 承認カード通し実測（#425 で経路が変わった。#1089 で追従）---
+  // 表示: `/api/v2/panes` の `permission_dialog` 実在（transcript の推定は廃止）
+  // 応答: `POST /api/panes/:id/respond` `{choice: "<1 始まりの番号>"}`
+  //       （`src/api.js` の `respond()`。旧経路の input へ "y"/"n" 直送ではない）
+
+  // 承認カード 3 件の共通モック。respond（現行）と input（旧経路）の両方を
+  // キャプチャして、押した先が respond であることまで固定する
+  async function setupApprovalMocks(page, meData = FAKE_ME) {
+    const respondRequests = [];
     const inputRequests = [];
-    await setupMocks(page);
+    await setupMocks(page, meData);
     await page.route('**/api/sessions/codex-session/messages*', route =>
       route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_MESSAGES_1B) })
     );
-    // input API をキャプチャ（dispatch Send への入口）
-    await page.route('**/api/panes/*/input', async route => {
-      const body = route.request().postDataJSON();
-      inputRequests.push(body);
+    await page.route('**/api/panes/*/respond', async route => {
+      respondRequests.push({ url: route.request().url(), body: route.request().postDataJSON() });
+      // PWA は応答本文を読まない（respondToDialog は結果を捨てる）ので最小形で足りる
       await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
     });
+    await page.route('**/api/panes/*/input', async route => {
+      inputRequests.push(route.request().postDataJSON());
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+    });
+    return { respondRequests, inputRequests };
+  }
+
+  test('承認カード通し: 許可（1 番目の選択肢）タップ → respond API へ choice=1 が送信される', async ({ page }) => {
+    const { respondRequests, inputRequests } = await setupApprovalMocks(page);
     await page.goto(`${BASE}/#/panes/2`);
     await page.waitForSelector('.approval-card', { timeout: 10000 });
+
+    // ボタンは dialog.options そのもの（= どこから来た選択肢かを縛る）
+    const buttons = page.locator('.approval-card button');
+    await expect(buttons).toHaveCount(FAKE_PERMISSION_DIALOG.options.length);
+    await expect(buttons.nth(0)).toHaveText(`1. ${FAKE_PERMISSION_DIALOG.options[0]}`);
     await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-approval-before.png`, fullPage: false });
 
-    // 許可(y)ボタンをタップ
-    await page.click('.approval-btn-allow');
-    await page.waitForTimeout(500);
+    // 許可 = 最後以外の選択肢（approval-btn-allow）。3 択なので 1 番目を押す
+    await page.locator('.approval-btn-allow').first().click();
+
+    // 固定時間ではなくリクエスト到達を待つ（#796）
+    await expect.poll(() => respondRequests.length, { timeout: 5000 }).toBeGreaterThan(0);
     await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-approval-after.png`, fullPage: false });
 
-    // input API に "y" が送信されたことを検証
-    expect(inputRequests.length).toBeGreaterThan(0);
-    const lastInput = inputRequests[inputRequests.length - 1];
-    expect(lastInput.text).toBe('y');
-    expect(lastInput.newline).toBe(true);
+    const last = respondRequests[respondRequests.length - 1];
+    expect(last.url).toContain('/api/panes/2/respond');
+    expect(last.body).toEqual({ choice: '1' });
+    // 旧経路（input へ "y" 直送）は通らない = サーバーがダイアログ実在を再検証する契約
+    expect(inputRequests).toEqual([]);
   });
 
-  test('承認カード通し: 拒否(n)タップ → input API に n が送信される', async ({ page }) => {
-    const inputRequests = [];
-    await setupMocks(page);
-    await page.route('**/api/sessions/codex-session/messages*', route =>
-      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_MESSAGES_1B) })
-    );
-    await page.route('**/api/panes/*/input', async route => {
-      const body = route.request().postDataJSON();
-      inputRequests.push(body);
-      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
-    });
+  test('承認カード通し: 拒否（最後の選択肢）タップ → respond API へ choice=3 が送信される', async ({ page }) => {
+    const { respondRequests, inputRequests } = await setupApprovalMocks(page);
     await page.goto(`${BASE}/#/panes/2`);
     await page.waitForSelector('.approval-card', { timeout: 10000 });
 
-    // 拒否(n)ボタンをタップ
-    await page.click('.approval-btn-deny');
-    await page.waitForTimeout(500);
+    // 拒否 = 最後の選択肢（approval-btn-deny）。1 枚だけ
+    const denyBtn = page.locator('.approval-btn-deny');
+    await expect(denyBtn).toHaveCount(1);
+    const denyIndex = FAKE_PERMISSION_DIALOG.options.length - 1;
+    await expect(denyBtn).toHaveText(`${denyIndex + 1}. ${FAKE_PERMISSION_DIALOG.options[denyIndex]}`);
+    await denyBtn.click();
 
-    expect(inputRequests.length).toBeGreaterThan(0);
-    const lastInput = inputRequests[inputRequests.length - 1];
-    expect(lastInput.text).toBe('n');
-    expect(lastInput.newline).toBe(true);
+    await expect.poll(() => respondRequests.length, { timeout: 5000 }).toBeGreaterThan(0);
+    const last = respondRequests[respondRequests.length - 1];
+    expect(last.url).toContain('/api/panes/2/respond');
+    expect(last.body).toEqual({ choice: String(denyIndex + 1) });
+    expect(inputRequests).toEqual([]);
   });
 
-  // 承認カードで Observe role の場合ボタンが disabled で送信されないことの検証
   test('承認カード: Observe role ではボタンが disabled', async ({ page }) => {
-    const inputRequests = [];
-    await setupMocks(page, FAKE_ME_OBSERVE);
-    await page.route('**/api/sessions/codex-session/messages*', route =>
-      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(FAKE_MESSAGES_1B) })
-    );
-    await page.route('**/api/panes/*/input', async route => {
-      const body = route.request().postDataJSON();
-      inputRequests.push(body);
-      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
-    });
+    const { respondRequests, inputRequests } = await setupApprovalMocks(page, FAKE_ME_OBSERVE);
     await page.goto(`${BASE}/#/panes/2`);
     await page.waitForSelector('.approval-card', { timeout: 10000 });
 
-    // ボタンが disabled であること
-    const allowBtn = page.locator('.approval-btn-allow');
-    await expect(allowBtn).toBeDisabled();
+    // 全ボタンが disabled（respond は Interact 以上。サーバー側も 403 で断る）
+    await expect(page.locator('.approval-btn-allow').first()).toBeDisabled();
+    await expect(page.locator('.approval-btn-deny')).toBeDisabled();
 
-    // クリックしても input は呼ばれない
-    await allowBtn.click({ force: true });
-    await page.waitForTimeout(500);
-    expect(inputRequests.length).toBe(0);
+    // クリックしても送信されない。固定時間待ちの代わりに「次の messages ポーリング」を
+    // 関門にする（respond は onClick から同期で飛ぶので、ポーリングが 1 周してなお
+    // 0 件なら飛んでいない）。#796
+    await page.locator('.approval-btn-allow').first().click({ force: true });
+    await page.waitForRequest(
+      req => req.url().includes('/api/sessions/codex-session/messages'),
+      { timeout: 10000 }
+    );
+    expect(respondRequests).toEqual([]);
+    expect(inputRequests).toEqual([]);
   });
 });

@@ -705,16 +705,19 @@ impl TakoApp {
                                         move |this, e: &MouseDownEvent, _, cx| {
                                             cx.stop_propagation();
                                             let is_pinned_root = is_root && {
-                                                let canon = ctx_path
-                                                    .canonicalize()
-                                                    .unwrap_or_else(|_| ctx_path.clone());
+                                                // 保存側（B26 経由）と同じ形で比べる。
+                                                // 素の canonicalize だと Windows では
+                                                // verbatim になり一致しない（#970）
+                                                let canon =
+                                                    tako_core::platform::path::canonicalize_or_self(
+                                                        &ctx_path,
+                                                    );
                                                 this.workspace
                                                     .active_tab()
                                                     .pinned_folders()
                                                     .iter()
                                                     .any(|f| {
-                                                        f.canonicalize()
-                                                            .unwrap_or_else(|_| f.clone())
+                                                        tako_core::platform::path::canonicalize_or_self(f)
                                                             == canon
                                                     })
                                             };

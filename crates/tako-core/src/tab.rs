@@ -215,13 +215,16 @@ impl Tab {
         &self.pinned_folders
     }
 
-    /// フォルダを追加する。正規パス（symlink 解決済み）でデデュープし、既存なら false
+    /// フォルダを追加する。正規パス（symlink 解決済み）でデデュープし、既存なら false。
+    ///
+    /// 解決は `platform::path`（B26）を通す: **保存する値**なので、Windows の
+    /// verbatim prefix を持ち回ると OSC 7 経路で cwd が壊れる（#970）
     pub fn add_pinned_folder(&mut self, path: PathBuf) -> bool {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let canonical = crate::platform::path::canonicalize_or_self(&path);
         if self
             .pinned_folders
             .iter()
-            .any(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == canonical)
+            .any(|p| crate::platform::path::canonicalize_or_self(p) == canonical)
         {
             return false;
         }
@@ -231,11 +234,11 @@ impl Tab {
 
     /// フォルダを削除する。正規パスで比較し、含まれていなければ false
     pub fn remove_pinned_folder(&mut self, path: &std::path::Path) -> bool {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical = crate::platform::path::canonicalize_or_self(path);
         if let Some(pos) = self
             .pinned_folders
             .iter()
-            .position(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == canonical)
+            .position(|p| crate::platform::path::canonicalize_or_self(p) == canonical)
         {
             self.pinned_folders.remove(pos);
             true
