@@ -84,6 +84,13 @@ impl SessionBackend for TmuxBackend {
             // tmux の client は打鍵をバイト等価で内側へ渡す（macOS で実測。#907）
             keystrokes_ascii_only: false,
             quotes_program: true,
+            // conf の `extended-keys always` + `extended-keys-format csi-u` +
+            // `terminal-features … :extkeys` が CSI u を内側へ届ける（#28 の両輪の片方。
+            // ネスト tmux 用の同じ設定は `NESTED_TMUX_SNIPPET`）
+            extended_keys: true,
+            // conf の `copy-mode-position-format ''` で消せる（tmux 3.6 の既定書式は
+            // 先頭行のタイムスタンプを出す。2026-06-12 実機バグ (2)）
+            suppresses_copy_mode_indicator: true,
             label: "tmux",
         }
     }

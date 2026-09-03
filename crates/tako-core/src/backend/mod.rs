@@ -264,6 +264,24 @@ pub struct BackendCapabilities {
     /// true の器へは打鍵ではなく [`inject_text`] で入れる。
     /// tmux は打鍵経路がバイト等価なので false（macOS の経路は据え置き）
     pub keystrokes_ascii_only: bool,
+    /// **拡張キー（CSI u / kitty keyboard protocol）の要求を器へ渡せるか**（#974 / #28）。
+    ///
+    /// tako は Shift+Enter などの修飾キーを CSI u で送る（#28）。器が間に入る構成では、
+    /// 器自身が拡張キーを解釈して内側へ届ける設定（tmux の `extended-keys` /
+    /// `extended-keys-format` / `terminal-features … :extkeys`）が要る。
+    /// **psmux 3.3.7 はこの語彙を 1 つも持たない**（実測 #974: 書いても効かず
+    /// `unknown option` の警告がペインへ出るだけ）ので、CSI u の要求は器で止まる。
+    /// 器が無いときは間に何も挟まらず外側の tako がそのまま扱うので true
+    pub extended_keys: bool,
+    /// **器の copy mode（ホイールで入るスクロール表示）の位置インジケータを
+    /// 出さずに済むか**。
+    ///
+    /// tmux 3.6 の既定フォーマットは先頭行のタイムスタンプを含み、通常ペインの
+    /// スクロール中に謎の時刻として見える（2026-06-12 実機バグ (2)）。tmux は
+    /// `copy-mode-position-format ''` で消せるので true。**psmux 3.3.7 は
+    /// このオプションを持たない**（実測 #974）ので消す手段が無い。
+    /// 器が無いときは copy mode 自体が無い（スクロールは tako 側）ので true
+    pub suppresses_copy_mode_indicator: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -302,6 +320,9 @@ impl BackendCapabilities {
                 ScrollbackAuthority::InProcess => "in_process",
             },
             "osc_passthrough": self.osc_passthrough,
+            // #974: 器で止まるものを 1:1 で見えるようにする（`tako persist` / MCP）
+            "extended_keys": self.extended_keys,
+            "suppresses_copy_mode_indicator": self.suppresses_copy_mode_indicator,
             "note": self.degraded_note(),
         })
     }
@@ -1418,6 +1439,8 @@ mod tests {
             osc_passthrough: true,
             quotes_program: true,
             keystrokes_ascii_only: false,
+            extended_keys: true,
+            suppresses_copy_mode_indicator: true,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -1431,6 +1454,8 @@ mod tests {
             osc_passthrough: true,
             quotes_program: true,
             keystrokes_ascii_only: false,
+            extended_keys: true,
+            suppresses_copy_mode_indicator: true,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -1450,6 +1475,8 @@ mod tests {
             osc_passthrough: true,
             quotes_program: true,
             keystrokes_ascii_only: false,
+            extended_keys: true,
+            suppresses_copy_mode_indicator: true,
             label: "none",
         };
         let v = caps.describe();
@@ -1468,6 +1495,8 @@ mod tests {
             osc_passthrough: true,
             quotes_program: true,
             keystrokes_ascii_only: false,
+            extended_keys: true,
+            suppresses_copy_mode_indicator: true,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -1487,11 +1516,19 @@ mod tests {
             osc_passthrough: false,
             quotes_program: false,
             keystrokes_ascii_only: true,
+            extended_keys: false,
+            suppresses_copy_mode_indicator: false,
             label: "psmux",
         };
         let v = psmux.describe();
         assert_eq!(v["detached_capture"], true);
         assert_eq!(v["detached_access"], false);
+        // #974: 「器で止まるもの」も同じ 1 箇所から読める（`tako persist` / MCP の
+        // `backend` 応答がこれをそのまま返す）。psmux は CSI u を器へ渡せない
+        assert_eq!(v["extended_keys"], false);
+        assert_eq!(v["suppresses_copy_mode_indicator"], false);
+        assert_eq!(tmux.describe()["extended_keys"], true);
+        assert_eq!(tmux.describe()["suppresses_copy_mode_indicator"], true);
     }
 
     /// 案 B-1（器だけの ConPTY セッションホスト）の形をした偽 backend。
@@ -1526,6 +1563,8 @@ mod tests {
                 osc_passthrough: true,
                 quotes_program: true,
                 keystrokes_ascii_only: false,
+                extended_keys: true,
+                suppresses_copy_mode_indicator: true,
                 label: "session-host",
             }
         }
@@ -1726,6 +1765,8 @@ mod tests {
             osc_passthrough: true,
             quotes_program: true,
             keystrokes_ascii_only: false,
+            extended_keys: true,
+            suppresses_copy_mode_indicator: true,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -1796,6 +1837,8 @@ mod tests {
                 osc_passthrough: true,
                 quotes_program: true,
                 keystrokes_ascii_only: false,
+                extended_keys: true,
+                suppresses_copy_mode_indicator: true,
                 label: "capture-only",
             }
         }
