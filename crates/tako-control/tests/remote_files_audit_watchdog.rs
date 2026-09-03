@@ -153,3 +153,60 @@ fn ファイルapiの応答はキャッシュさせない() {
         "応答経路 {responders} 件に対して no-store の付与が {no_store} 件しかない"
     );
 }
+
+#[test]
+fn ファイルapiは自分でsshやsftpを起こさない() {
+    // #1085 受け入れ条件 3「スマホは SSH 鍵に触らない」を**構造で**固定する。
+    //
+    // 2 ホップの後段（SFTP）は tako app 側が `<data_dir>/ssh/` の ControlMaster で
+    // 張るもので、daemon は IPC で proxy するだけ。daemon 側に接続を生やすと
+    // ①鍵・known_hosts・2FA の扱いが 2 箇所になる
+    // ②#966 のキャッシュ / 退避 / 競合検知の基準が app と食い違う
+    // のどちらも起きるので、**呼んでよいのは純粋な文字列関数だけ**に閉じる
+    let src = production_part(&without_comments(&remote_files_source()));
+
+    // 接続・取得・書き戻し・器の起動はどれも呼ばない
+    for forbidden in [
+        "remote_fs::connect",
+        "remote_fs::ensure_master",
+        "remote_fs::fetch_file",
+        "remote_fs::save_file",
+        "remote_fs::list_dir",
+        "remote_fs::stat_file",
+        "remote_fs::push_pending",
+        "remote_fs::sftp_bin",
+        "remote_fs::ssh_bin",
+        "Command::new",
+        "process::Command",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "ファイル API が {forbidden} を直接呼んでいる（SSH は app 側の 1 実装に閉じる）"
+        );
+    }
+
+    // 使ってよいのは純粋な文字列関数だけ（増やすときは理由をここへ）
+    const ALLOWED: &[&str] = &["base_name", "join_remote"];
+    let mut used: Vec<String> = Vec::new();
+    for (pos, _) in src.match_indices("remote_fs::") {
+        let rest = &src[pos + "remote_fs::".len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !ALLOWED.contains(&name.as_str()) {
+            let line_no = src[..pos].matches('\n').count() + 1;
+            used.push(format!("remote_files.rs:{line_no} — remote_fs::{name}"));
+        }
+    }
+    assert!(
+        used.is_empty(),
+        "純粋な文字列関数以外の remote_fs を使っている:\n{}",
+        used.join("\n")
+    );
+    // 走査が空振りしていないこと（`remote_fs::` の呼び出しが実際にある）
+    assert!(
+        src.matches("remote_fs::").count() >= 2,
+        "remote_fs の呼び出しが見つからない（走査が空振り）"
+    );
+}
