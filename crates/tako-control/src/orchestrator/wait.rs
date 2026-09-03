@@ -2209,6 +2209,54 @@ mod tests {
         }
     }
 
+    /// codex 0.153.0 / agy 1.1.25 のバイナリから採った実文言（#1107）
+    const ENTITLEMENT_SCREENS_CODEX_AGY: [(&str, &str); 5] = [
+        ("codex_out_of_credits", "You're out of credits."),
+        (
+            "codex_workspace_refill",
+            "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+        ),
+        (
+            "codex_spend_cap",
+            "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+        ),
+        ("agy_out_of_credits", "AI: Out of credits"),
+        (
+            "agy_no_license",
+            "No license available for this project and location. Contact your administrator to setup Gemini Enterprise for this project.",
+        ),
+    ];
+
+    #[test]
+    fn detect_worker_errorはcodexとagyの阻害も別種として検知する() {
+        for (name, headline) in ENTITLEMENT_SCREENS_CODEX_AGY {
+            // codex / agy の入力欄プロンプト（`›` / `>`）を含む実画面の形
+            let screen =
+                format!("• 実装を進めます\n\n{headline}\n\n› \n  gpt-5.2-codex · /work/dir");
+            let (kind, detail) = detect_worker_error(&screen)
+                .unwrap_or_else(|| panic!("{name}: 検知されない（idle = 作業完了に見える）"));
+            assert_eq!(
+                kind,
+                WorkerErrorKind::EntitlementBlocked,
+                "{name}: 種別が違う（detail={detail}）"
+            );
+            assert_eq!(kind.recommended_action(), "needs_human", "{name}");
+        }
+    }
+
+    #[test]
+    fn detect_worker_errorはcodexのworkspace_credit_limitを阻害へ倒す() {
+        // 見出しは `reached your <名前>limit` のテンプレートにも当たるが、
+        // 対処の選択肢に「待つ」出口が無い（`Notify owner?` だけ）ので
+        // `usage_limit`（解除まで待つ）ではなく阻害として返す（#1107）
+        let screen = "  Approaching rate limits\n  You've reached your workspace credit limit\n  Your workspace is out of credits. Ask your workspace owner to add more. Notify owner?\n\n› ";
+        let (kind, _) = detect_worker_error(screen).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::EntitlementBlocked);
+        // codex の通常の上限画面（#985 の実採取）は従来どおり usage_limit のまま
+        let (kind, _) = detect_worker_error(CODEX_LIMIT_SCREEN).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::UsageLimit);
+    }
+
     #[test]
     fn worker_error_kindのslugは往復し全種別が推奨アクションを持つ() {
         for kind in WorkerErrorKind::ALL {
