@@ -7509,6 +7509,12 @@ fn worker_projects_in_tab(host: &dyn ControlHost, tab_id: TabId) -> Vec<String> 
     out
 }
 
+/// #1055 の修正を入れる前（後任の起動フォルダをホーム決め打ち）へ戻す逃げ道
+/// （`TAKO_1055_LEGACY=1`）。A/B 計測専用
+fn handoff_cwd_legacy() -> bool {
+    std::env::var_os("TAKO_1055_LEGACY").is_some()
+}
+
 /// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
 /// handoff 内容を含むプロンプトを注入する。
@@ -7568,6 +7574,16 @@ fn dispatch_orchestrator_handoff(
     let (profile_owned, profile_source) =
         tako_core::handoff::resolve_master_profile(caller_role, pane_role.as_deref());
     let profile_name = profile_owned.as_str();
+
+    // #1055: 前任 master が実際に居るフォルダ。`pane_role` と同じ「前任 or 呼び出し元」から
+    // 採る（role ラベルを失った master でも呼び出し元は前任そのものなので取り違えない）。
+    // `TerminalSession::cwd` は起動時 cwd で初期化され OSC 7 で追従するので、
+    // シェル統合が無い環境でも GUI 再起動後（= 保存 cwd で復元した直後）でも読める。
+    // 消えたフォルダを引き継いでペインを殺さないよう、実在するものだけ採用する
+    let previous_cwd = previous_pane
+        .or(caller.map(|(_, p)| p))
+        .and_then(|p| host.session(p).and_then(|s| s.cwd()).map(Path::to_path_buf))
+        .filter(|p| p.is_dir());
 
     // #915 / #916: 読む前に旧形式を自動移行する（実行時の差分検出。冪等）
     let migration = orchestrator::handoff_store::ensure_migrated(profile_name);
@@ -7639,8 +7655,37 @@ fn dispatch_orchestrator_handoff(
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
         .map_err(DispatchError::Operation)?;
 
-    // cwd はホームディレクトリ
-    let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    // #1055: 起動フォルダは **プロファイルの cwd → 前任 master の cwd → ホーム** の順。
+    // 以前はホーム決め打ちで、プロファイルの `cwd` すら読んでいなかった。master の動作環境は
+    // cwd に依存しうる（PreToolUse フック・direnv・リポジトリローカルの設定）ので、
+    // 「同プロファイル / 同アカウント / 同モデル / 同 effort で立て直す」という引き継ぎの
+    // 約束に cwd も含める。プロファイルの cwd が壊れていたら**ペインを分割する前に**落とす
+    // （存在しないフォルダで spawn すると後任が起動できず、前任を閉じる主体が居なくなる）
+    let profile_cwd = profile.resolve_cwd().map_err(|e| {
+        op_err(format!(
+            "{e}\n  直すには: tako orchestrator profiles set {profile_name} --cwd <path>（解除は --clear-cwd）"
+        ))
+    })?;
+    let home = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let resolved_cwd = if handoff_cwd_legacy() {
+        // A/B 用（#1055 前のホーム決め打ちへ戻す）
+        tako_core::handoff::SuccessorCwd {
+            path: home,
+            source: tako_core::handoff::SuccessorCwdSource::Home,
+        }
+    } else {
+        tako_core::handoff::resolve_successor_cwd(profile_cwd, previous_cwd.clone(), home)
+    };
+    let cwd_warning = if handoff_cwd_legacy() {
+        None
+    } else {
+        tako_core::handoff::successor_cwd_warning(
+            &resolved_cwd,
+            previous_cwd.as_deref(),
+            profile_name,
+        )
+    };
+    let cwd = resolved_cwd.path.clone();
 
     // 新ペインを分割。#917: 退役する master が同じタブに居るなら**その master のペインを
     // 分割する**。旧ペインが閉じられた時点で残った後任が旧ペインの矩形をそのまま継ぐので、
@@ -7707,10 +7752,17 @@ fn dispatch_orchestrator_handoff(
     let handoff_path = orchestrator::handoff_path(profile_name);
     let mut warnings: Vec<String> = migration.warnings.clone();
     warnings.extend(bundle.memo_warning.clone());
+    // #1055: 起動フォルダの食い違いは黙らない（後任だけツールが全部拒否される、のような
+    // 理由の分からない停止を作らないため）
+    warnings.extend(cwd_warning);
     Ok(json!({
         "new_master_pane_id": new_id.as_u64(),
         "new_master_tab_id": tab_id.as_u64(),
         "profile": profile_name,
+        // #1055: 後任を**どのフォルダで**起動したか（前任と食い違ったら warnings にも出る）
+        "cwd": cwd.display().to_string(),
+        "cwd_source": resolved_cwd.source.as_str(),
+        "previous_master_cwd": previous_cwd.as_ref().map(|p| p.display().to_string()),
         // #854: プロファイルをどこから決めたか（caller_role / pane_role / default）。
         // pane_role が出たら呼び出し元の env が失われていたということ
         "profile_source": profile_source.as_str(),
