@@ -3809,6 +3809,10 @@ pub(crate) struct ChatRefreshData {
     permission: Option<tako_control::claude_tui::PermissionDialog>,
     screen_model: Option<String>,
     screen_ctx_percent: Option<f64>,
+    /// #1021: transcript から算出した ctx% / モデル id（`agents --json` が
+    /// `contextPercentUsed` / `model` を返さなくなった版のための代替ソース）
+    transcript_ctx_percent: Option<f64>,
+    transcript_model: Option<String>,
 }
 
 impl TakoApp {
@@ -3902,9 +3906,14 @@ impl TakoApp {
                 transcript: data.transcript,
                 stamp: data.stamp,
                 messages,
-                // agents が返せば優先（将来版）、返さなければ画面採取（現行版）
-                model: data.model.or(data.screen_model),
-                ctx_percent: data.ctx_percent.or(data.screen_ctx_percent),
+                // agents が返せば優先（将来版）→ 画面採取 → transcript（#1021）。
+                // 画面を transcript より先に見るのは、画面の数値が claude 自身の
+                // 計算結果で文脈窓の推定を要らないため（`tako_core::ctx_usage`）
+                model: data.model.or(data.screen_model).or(data.transcript_model),
+                ctx_percent: data
+                    .ctx_percent
+                    .or(data.screen_ctx_percent)
+                    .or(data.transcript_ctx_percent),
                 busy,
                 queued: data.queued,
                 read_only: data.read_only,
@@ -4046,6 +4055,14 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
                     Some(crate::ui_text::ui_mode::chat_transcript_pending().to_string()),
                 ),
             };
+            // #1021: 画面が ctx% を出していないとき（statusLine 未設定 = claude の
+            // 組み込み表示は文脈が切迫するまで出ない）の代替。**解決済みのパスを
+            // そのまま使う**ので transcript の所在解決は増えない
+            let transcript_ctx = match (&path, target.screen_ctx_percent.is_none()) {
+                (Some(path), true) => tako_control::transcript::last_context_usage_at(path)
+                    .map(|usage| tako_core::ctx_usage::resolve(None, Some(&usage))),
+                _ => None,
+            };
             ChatRefreshResult {
                 pane: target.pane,
                 chat: Some(ChatRefreshData {
@@ -4063,6 +4080,11 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
                     permission: target.permission,
                     screen_model: target.screen_model,
                     screen_ctx_percent: target.screen_ctx_percent,
+                    transcript_ctx_percent: transcript_ctx
+                        .as_ref()
+                        .and_then(|c| c.percent)
+                        .map(f64::from),
+                    transcript_model: transcript_ctx.and_then(|c| c.model),
                 }),
             }
         })

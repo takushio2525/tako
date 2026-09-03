@@ -163,10 +163,10 @@ pub fn used_percent(total_input_tokens: u64, window: u64) -> Option<u32> {
     if window == 0 {
         return None;
     }
-    // round(t / w * 100) を整数演算で（f64 の丸めに依存しない）
+    // round(t / w * 100) を整数演算で（f64 の丸めに依存しない）。
+    // 2 倍した商を切り上げ半分にするので 0.5 は上へ丸まる（上流の `Math.round` と同じ）
     let scaled = total_input_tokens.checked_mul(200)? / window;
-    let pct = (scaled + 1) / 2;
-    Some(pct.min(100) as u32)
+    Some(scaled.div_ceil(2).min(100) as u32)
 }
 
 /// 画面の使用率と実トークン数から文脈窓を逆算する（自己検証用）。
@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(used_percent(5_000, 1_000_000), Some(1)); // 0.5 → 1
         assert_eq!(used_percent(4_999, 1_000_000), Some(0)); // 0.4999 → 0
         assert_eq!(used_percent(335_000, 1_000_000), Some(34)); // 33.5 → 34
-        // clamp（窓を超えても 100 で止まる）
+                                                                // clamp（窓を超えても 100 で止まる）
         assert_eq!(used_percent(2_000_000, 1_000_000), Some(100));
         assert_eq!(used_percent(0, 1_000_000), Some(0));
         // 窓 0 は答えを出さない（0 除算を作らない）

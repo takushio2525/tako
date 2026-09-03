@@ -34,6 +34,7 @@ mod filetree;
 /// テストと visual-test ビルドにだけ載せる
 #[cfg(any(test, feature = "visual-test"))]
 mod form_layout;
+mod handoff_ctx;
 mod keybindings;
 mod limit_autoresume;
 mod md_view;
@@ -1722,6 +1723,11 @@ struct TakoApp {
     /// 出さなくなった（実測: フッターはモデル名と cwd だけ / 数値は `/status` の
     /// モーダルの中）ため成立しない。ここが実データの出どころになる
     codex_limits: HashMap<PaneId, tako_control::codex_session::RateLimits>,
+    /// #1021: transcript から算出した ctx%（画面が黙っている master ペインぶん）。
+    /// #749 の閾値判定が画面の値を補えるように background で控えておく
+    transcript_ctx: HashMap<PaneId, u32>,
+    /// #1021: 上の読み直しの間引き
+    transcript_ctx_scan: handoff_ctx::TranscriptCtxScan,
     /// 上の更新を間引くための状態（background で 60 秒に 1 回だけ読む）
     codex_limits_scan: limit_autoresume::CodexLimitsScan,
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321。settings.json 永続化）
@@ -3575,6 +3581,8 @@ impl TakoApp {
             handoff_policy_cache: HashMap::new(),
             limit_resume: HashMap::new(),
             codex_limits: HashMap::new(),
+            transcript_ctx: HashMap::new(),
+            transcript_ctx_scan: handoff_ctx::TranscriptCtxScan::default(),
             codex_limits_scan: limit_autoresume::CodexLimitsScan::default(),
             codex_metrics: AgentMetrics::default(),
             limit_service: tako_control::settings::load().limit_service(),
@@ -4421,11 +4429,17 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:queued_recovery");
                         app.drive_queued_message_recovery();
                     }
-                    {
-                        // #749: master の ctx% が閾値を超えていたら引き継ぎを促す
+                    // #749: master の ctx% が閾値を超えていたら引き継ぎを促す。
+                    // #1021: 画面が ctx% を出していない master は transcript で補う
+                    // （読むのは background。間隔も空ける）
+                    let transcript_ctx_scan = {
                         let _s = tako_control::diag::perf_span("periodic_prep:handoff_nudge");
-                        app.drive_handoff_nudge();
-                    }
+                        let targets = app.drive_handoff_nudge();
+                        let due = app
+                            .transcript_ctx_scan
+                            .due(targets.len(), std::time::Instant::now());
+                        due.then_some(targets)
+                    };
                     // #813: 上限で止まっているオプトイン済みペインを、リセット後に再開させる
                     // （有効なペインが無ければ即 return するので通常運転のコストはゼロ）
                     let limit_resume_jobs = {
@@ -4551,6 +4565,7 @@ impl TakoApp {
                         stale_binary_scan,
                         ssh_scan,
                         codex_limits_scan,
+                        transcript_ctx_scan,
                         limit_resume_jobs,
                     )
                 });
@@ -4574,6 +4589,7 @@ impl TakoApp {
                     stale_binary_scan,
                     ssh_scan,
                     codex_limits_scan,
+                    transcript_ctx_scan,
                     limit_resume_jobs,
                 )) = prep
                 else {
@@ -4602,86 +4618,103 @@ impl TakoApp {
                 // 初回 / 対象・role・OSC 状態変化 / 60 秒保険でだけ tmux + ps を起動し、
                 // 両方が同じ tick で必要なら 1 個の ProcessSnapshot を共有する。
                 {
-                    let (settings, running_children_scan, stale_outcome, ssh_state, codex_limits) =
-                        cx.background_executor()
-                            .spawn(async move {
-                                let settings = tako_control::settings::load();
-                                let sleep_guard_active = settings.sleep_guard_mode
+                    let (
+                        settings,
+                        running_children_scan,
+                        stale_outcome,
+                        ssh_state,
+                        codex_limits,
+                        transcript_ctx,
+                    ) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let settings = tako_control::settings::load();
+                            let sleep_guard_active = settings.sleep_guard_mode
                                 == tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
-                                let (running_targets, running_prev) = running_children_scan;
-                                let (ssh_targets, ssh_prev, ssh_tracked) = ssh_scan;
-                                let now = std::time::Instant::now();
-                                let rescan_running =
-                                    tako_control::agents::should_rescan_running_children(
-                                        &running_prev,
-                                        &running_targets,
-                                        sleep_guard_active,
-                                        now,
-                                    );
-                                // #976: ssh 検知も同じ判断で間引く。両方が要るときは
-                                // **1 個の ProcessSnapshot を共有**するので、子プロセスの
-                                // 起動回数は増えない（#772 / #779 の枠組みをそのまま使う）
-                                let rescan_ssh = tako_control::ssh_detect::should_rescan(
-                                    &ssh_prev,
-                                    &ssh_targets,
-                                    ssh_tracked,
+                            let (running_targets, running_prev) = running_children_scan;
+                            let (ssh_targets, ssh_prev, ssh_tracked) = ssh_scan;
+                            let now = std::time::Instant::now();
+                            let rescan_running =
+                                tako_control::agents::should_rescan_running_children(
+                                    &running_prev,
+                                    &running_targets,
+                                    sleep_guard_active,
                                     now,
                                 );
-                                // #985 も同じ 1 枚のスナップショットに相乗りする
-                                let want_codex = codex_limits_scan.is_some();
-                                let snapshot = if (rescan_running && !running_targets.is_empty())
-                                    || rescan_ssh
-                                    || want_codex
-                                {
-                                    Some(tako_control::agents::ProcessSnapshot::capture())
-                                } else {
-                                    None
-                                };
-                                let codex_limits = match (&codex_limits_scan, snapshot.as_ref()) {
-                                    (Some(targets), Some(snap)) => {
-                                        Some(limit_autoresume::scan_codex_limits(targets, snap))
-                                    }
-                                    _ => None,
-                                };
-                                let ssh_state = tako_control::ssh_detect::scan(
-                                    &ssh_prev,
-                                    ssh_targets,
-                                    snapshot.as_ref().filter(|_| rescan_ssh),
+                            // #976: ssh 検知も同じ判断で間引く。両方が要るときは
+                            // **1 個の ProcessSnapshot を共有**するので、子プロセスの
+                            // 起動回数は増えない（#772 / #779 の枠組みをそのまま使う）
+                            let rescan_ssh = tako_control::ssh_detect::should_rescan(
+                                &ssh_prev,
+                                &ssh_targets,
+                                ssh_tracked,
+                                now,
+                            );
+                            // #985 も同じ 1 枚のスナップショットに相乗りする
+                            let want_codex = codex_limits_scan.is_some();
+                            let snapshot = if (rescan_running && !running_targets.is_empty())
+                                || rescan_ssh
+                                || want_codex
+                            {
+                                Some(tako_control::agents::ProcessSnapshot::capture())
+                            } else {
+                                None
+                            };
+                            let codex_limits = match (&codex_limits_scan, snapshot.as_ref()) {
+                                (Some(targets), Some(snap)) => {
+                                    Some(limit_autoresume::scan_codex_limits(targets, snap))
+                                }
+                                _ => None,
+                            };
+                            // #1021: セッションカタログと transcript のファイル読みだけ
+                            // （プロセスは起こさないので ProcessSnapshot は要らない）
+                            let transcript_ctx =
+                                transcript_ctx_scan.as_deref().map(crate::handoff_ctx::scan);
+                            let ssh_state = tako_control::ssh_detect::scan(
+                                &ssh_prev,
+                                ssh_targets,
+                                snapshot.as_ref().filter(|_| rescan_ssh),
+                                now,
+                            );
+                            let running_state = if rescan_running {
+                                tako_control::agents::scan_running_children(
+                                    running_targets,
+                                    sleep_guard_active,
                                     now,
-                                );
-                                let running_state = if rescan_running {
-                                    tako_control::agents::scan_running_children(
-                                        running_targets,
-                                        sleep_guard_active,
-                                        now,
-                                        snapshot.as_ref(),
-                                    )
-                                } else {
-                                    let mut state = running_prev;
-                                    state.sleep_guard_active = sleep_guard_active;
-                                    state
-                                };
-                                let stale_outcome = stale_binary_scan.map(|(targets, prev)| {
-                                    tako_control::stale_binary::poll_with_snapshot(
-                                        targets,
-                                        &prev,
-                                        snapshot.as_ref(),
-                                    )
-                                });
-                                (
-                                    settings,
-                                    running_state,
-                                    stale_outcome,
-                                    ssh_state,
-                                    codex_limits,
+                                    snapshot.as_ref(),
                                 )
-                            })
-                            .await;
+                            } else {
+                                let mut state = running_prev;
+                                state.sleep_guard_active = sleep_guard_active;
+                                state
+                            };
+                            let stale_outcome = stale_binary_scan.map(|(targets, prev)| {
+                                tako_control::stale_binary::poll_with_snapshot(
+                                    targets,
+                                    &prev,
+                                    snapshot.as_ref(),
+                                )
+                            });
+                            (
+                                settings,
+                                running_state,
+                                stale_outcome,
+                                ssh_state,
+                                codex_limits,
+                                transcript_ctx,
+                            )
+                        })
+                        .await;
                     let ok = this.update(cx, |app: &mut TakoApp, cx| {
                         // #985: 反映はメモリ操作だけ
                         if let Some(limits) = codex_limits {
                             app.codex_limits = limits;
                             app.codex_limits_scan.mark(std::time::Instant::now());
+                        }
+                        // #1021: 反映はメモリ操作だけ（次の tick から #749 が使う）
+                        if let Some(ctx) = transcript_ctx {
+                            app.transcript_ctx = ctx;
+                            app.transcript_ctx_scan.mark(std::time::Instant::now());
                         }
                         let busy_sessions = running_children_scan.busy_sessions.clone();
                         app.running_children_scan = running_children_scan;
@@ -12404,7 +12437,10 @@ impl TakoApp {
     /// 閾値超過を master が「気づく」ことに任せず、tako が気づいて促す。
     /// ctx% は画面（TUI フッター）由来なので `claude agents --json` を叩かずに済み、
     /// 追加のポーリングコストはゼロ。判定は tako-core の純粋関数が持つ
-    fn drive_handoff_nudge(&mut self) {
+    ///
+    /// 戻り値は **#1021 の transcript 補完が要る master ペイン**（画面が ctx% を
+    /// 出していないもの）。呼び出し側が background の走査対象へ回す
+    fn drive_handoff_nudge(&mut self) -> Vec<PaneId> {
         use tako_core::handoff;
 
         // 対象 master ペインの収集（role が orchestrator-master のもの）。
@@ -12429,15 +12465,24 @@ impl TakoApp {
         self.handoff_nudges.retain(|id, _| alive.contains(id));
 
         let now = std::time::Instant::now();
+        let mut needs_transcript: Vec<PaneId> = Vec::new();
         for (pane_id, role) in masters {
             let profile = handoff::master_profile_of_role(&role)
                 .expect("収集時に master だけを残している")
                 .to_string();
+            // #1021: 画面 → transcript の順。画面だけに頼ると ①statusLine 未設定
+            // （claude の組み込み表示は窓 − 33000 トークンを超えるまで出ない）
+            // ②statusline が worker 一覧で伸びて ctx 行が走査窓から押し出される、
+            // のどちらでも閾値超過に気づけない。transcript ぶんは background が控える
             let ctx_percent = self
                 .terminals
                 .get(&pane_id)
                 .and_then(|s| s.agent_metrics())
                 .and_then(|m| m.ctx_percent);
+            if ctx_percent.is_none() {
+                needs_transcript.push(pane_id);
+            }
+            let ctx_percent = ctx_percent.or_else(|| self.transcript_ctx.get(&pane_id).copied());
             let tracker = self
                 .handoff_nudges
                 .entry(pane_id)
@@ -12482,6 +12527,11 @@ impl TakoApp {
                 &format!("ctx={pct}% threshold={threshold}% count={}", sent_count + 1),
             );
         }
+        // #1021: 画面が黙っている master だけを transcript 補完の対象にする
+        // （画面から読めているならファイルを読む必要が無い）。消えたペインの
+        // 控えは捨てる（ペイン ID 再利用で他人の ctx% を使わないため）
+        self.transcript_ctx.retain(|id, _| alive.contains(id));
+        needs_transcript
     }
 
     /// stale 検知の対象ペイン（master / worker かつバックエンドセッションを持つもの）。
@@ -60321,6 +60371,225 @@ mod self_test {
                     cx.notify();
                 });
                 let _ = std::fs::remove_dir_all(&dir141);
+                notify_and_draw(any, window, cx);
+            }
+
+
+            // 142. ctx% の取得元が「画面 → transcript → none」の 3 層になっている
+            //      （#1021）。`claude agents --json` は 2.1.258 で
+            //      `contextPercentUsed` を返さなくなったので、この経路だけに頼っていた
+            //      `orchestrator self` / `worker_status` は **常に null** だった
+            //      （= #749 の閾値判定も残量バーも材料を失う）。
+            //
+            //      画面の状態は**ファイルの書き換え**で切り替える（#903 の
+            //      `repaint_file_loop`。打鍵も割り込みも要らず器の有無にも依らない）。
+            //      `TAKO_1021_LEGACY=1` を置くと (a) が落ちる = 検出力
+            {
+                let body142 = std::env::temp_dir()
+                    .join(format!("tako-selftest-1021-{}.txt", std::process::id()));
+                // claude TUI のフッターの形。`agent_metrics` は末尾 8 行だけ見るので
+                // 先に改行でグリッドを流して最下部へ置く
+                let footer = |body: &str| format!("{}{body}\n", "\n".repeat(60));
+                let screen_ctx = footer("  [Opus 5 · MAX]\n  ctx  55% █████░░░░░\n  5h   12%");
+                if std::fs::write(&body142, &screen_ctx).is_err() {
+                    fail("142: 疑似フッターの本文ファイルを書けない (#1021)")
+                }
+                // この位置には `fire` が無い（セルフテストは複数関数に割れている）ので
+                // 読み取り専用リクエストを投げる口をここで作る
+                let fire142 = |r: tako_control::protocol::Request, cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            tako_control::dispatch(app, r, PaneOrigin::Cli).ok()
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let made142 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let made = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::TabNew {
+                                title: Some("st1021".into()),
+                                focus: Some(true),
+                                cwd: None,
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        let made = match made {
+                            Ok(v) => v,
+                            Err(e) => return Err(format!("tab new: {e}")),
+                        };
+                        let (Some(term), Some(tab)) =
+                            (made["pane"].as_u64(), made["tab"].as_u64())
+                        else {
+                            return Err(format!("tab new の応答: {made}"));
+                        };
+                        let term = PaneId::from_raw(term);
+                        let split = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(term.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: Some(
+                                    sh.shell_snippet_command(&sh.repaint_file_loop(&body142)),
+                                ),
+                                cwd: None,
+                                focus: Some(false),
+                            },
+                            PaneOrigin::Cli,
+                        );
+                        // **PTY 起動の失敗理由を捨てない**（#903 と同じ理由）
+                        let mut spawn_error = None;
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if let Err(e) = app.spawn_session(p, options, cx) {
+                                spawn_error = Some(format!("{e}"));
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        if let Some(e) = spawn_error {
+                            return Err(format!("split の PTY 起動: {e}"));
+                        }
+                        let pane = match split {
+                            Ok(v) => v["pane"].as_u64(),
+                            Err(e) => return Err(format!("split: {e}")),
+                        };
+                        let Some(pane) = pane.map(PaneId::from_raw) else {
+                            return Err("split の応答に pane が無い".to_string());
+                        };
+                        cx.notify();
+                        Ok((pane, term, TabId::from_raw(tab)))
+                    })
+                    .unwrap_or_else(|e| Err(format!("window.update: {e}")));
+                let (pane142, term142, tab142) = match made142 {
+                    Ok(v) => v,
+                    Err(e) => fail(&format!("142: 検証用ペインの作成: {e} (#1021)")),
+                };
+                notify_and_draw(any, window, cx);
+
+                // 画面の書き換えを待って ctx% を読む（固定待ちにしない。#796）
+                let ctx_of = |cx: &mut AsyncApp| -> Option<u32> {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            app.terminals
+                                .get(&pane142)
+                                .and_then(|s| s.agent_metrics())
+                                .and_then(|m| m.ctx_percent)
+                        })
+                        .ok()
+                        .flatten()
+                };
+                let repaint = |body: &str| {
+                    let _ = std::fs::write(&body142, body);
+                };
+                let wait_ctx = |cx: &mut AsyncApp, want: Option<u32>, label: &str| -> bool {
+                    let started = std::time::Instant::now();
+                    loop {
+                        notify_and_draw(any, window, cx);
+                        if ctx_of(cx) == want {
+                            return true;
+                        }
+                        if started.elapsed() >= Duration::from_secs(20) {
+                            println!(
+                                "TAKO_SELF_TEST_1021_TIMEOUT: label={label:?} want={want:?} \
+                                 got={:?} {}",
+                                ctx_of(cx),
+                                env_line()
+                            );
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(120));
+                    }
+                };
+                // (a) 画面が数値を出していれば画面から採る
+                if !wait_ctx(cx, Some(55), "screen") {
+                    fail("142: 疑似フッターの ctx% が画面から読めない (#1021)")
+                }
+                let status_a = fire142(
+                    tako_control::protocol::Request::OrchestratorWorkerStatus {
+                        pane_id: Some(pane142.as_u64()),
+                        session_id: None,
+                        tmux_session: None,
+                        worker: None,
+                    },
+                    cx,
+                )
+                .unwrap_or_else(|| fail("142: worker_status の取得に失敗 (#1021)"));
+                let a_ok = status_a["ctx_percent"].as_u64() == Some(55)
+                    && status_a["ctx_source"].as_str() == Some("screen")
+                    && status_a["ctx_model"].as_str() == Some("Opus 5");
+                check(a_ok, "142: 画面の ctx% とモデル名が worker_status に載る (#1021)");
+
+                // (b) claude の**組み込み**表示（残量表記）。旧実装は 12% を使用率と
+                //     誤読していた（実際は 88% 使用）
+                repaint(&footer(
+                    "  Context low (12% remaining) · Run /compact to compact & continue",
+                ));
+                let b_seen = wait_ctx(cx, Some(88), "builtin_remaining");
+                let status_b = fire142(
+                    tako_control::protocol::Request::OrchestratorWorkerStatus {
+                        pane_id: Some(pane142.as_u64()),
+                        session_id: None,
+                        tmux_session: None,
+                        worker: None,
+                    },
+                    cx,
+                );
+                let b_ok = b_seen
+                    && status_b
+                        .as_ref()
+                        .is_some_and(|s| s["ctx_percent"].as_u64() == Some(88));
+                check(
+                    b_ok,
+                    "142: 組み込みの残量表記を使用率へ直して読む (#1021)",
+                );
+
+                // (c) 画面に材料が無く session も特定できないときは **理由つきの null**
+                repaint(&footer("  ただの出力（ctx 表記なし）"));
+                let c_seen = wait_ctx(cx, None, "no_material");
+                let status_c = fire142(
+                    tako_control::protocol::Request::OrchestratorWorkerStatus {
+                        pane_id: Some(pane142.as_u64()),
+                        session_id: None,
+                        tmux_session: None,
+                        worker: None,
+                    },
+                    cx,
+                );
+                let c_ok = c_seen
+                    && status_c.as_ref().is_some_and(|s| {
+                        s["ctx_percent"].is_null()
+                            && s["ctx_source"].as_str() == Some("none")
+                            && s["ctx_reason"].as_str() == Some("no_session")
+                    });
+                check(c_ok, "142: 採れないときは理由が読める (#1021)");
+
+                println!(
+                    "TAKO_SELF_TEST_1021: pane={pane142} screen={:?}/{:?}/{:?} \
+                     builtin={:?} none={:?}/{:?} legacy={}",
+                    status_a["ctx_percent"],
+                    status_a["ctx_source"],
+                    status_a["ctx_model"],
+                    status_b.as_ref().map(|s| s["ctx_percent"].clone()),
+                    status_c.as_ref().map(|s| s["ctx_source"].clone()),
+                    status_c.as_ref().map(|s| s["ctx_reason"].clone()),
+                    tako_core::ctx_usage::legacy_env(),
+                );
+
+                // 後片付け: 専用タブごと畳む
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.close_pane_button(pane142, CloseOrigin::Internal, cx);
+                    app.close_pane_button(term142, CloseOrigin::Internal, cx);
+                    let _ = tab142;
+                    cx.notify();
+                });
+                let _ = std::fs::remove_file(&body142);
                 notify_and_draw(any, window, cx);
             }
 

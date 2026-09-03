@@ -6977,12 +6977,19 @@ fn dispatch_orchestrator_self(
     // session_id の自動解決（バックエンドセッション → pid 祖先辿り）
     let session_id = resolve_session_id_for_pane_via_host(host, pane_id);
 
-    let (status, ctx_percent) = if let Some(sid) = &session_id {
-        let agent_status = orchestrator::query_agent_status(sid);
-        (agent_status.status, agent_status.ctx_percent)
-    } else {
-        ("unknown".to_string(), None)
+    let status = match &session_id {
+        Some(sid) => orchestrator::query_agent_status(sid).status,
+        None => "unknown".to_string(),
     };
+
+    // #1021: ctx% は `agents --json` からは採れなくなった（2.1.258 で
+    // `contextPercentUsed` が消えた）ので、画面 → transcript の順で解決する。
+    // ペインが GUI に居れば画面（= claude 自身の答え）を、居なければ transcript を使う
+    let screen_ctx = host
+        .session(pane_id)
+        .and_then(|s| crate::claude_ctx::screen_ctx_from_lines(&s.visible_lines()));
+    let ctx = crate::claude_ctx::resolve(session_id.as_deref(), screen_ctx.as_ref());
+    let ctx_percent = ctx.percent;
 
     // #749: 閾値はプロファイル → config.yaml → 既定 60 の順で解決し 50〜60 へ丸める
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
@@ -7038,6 +7045,13 @@ fn dispatch_orchestrator_self(
         "ctx_threshold": ctx_threshold,
         "ctx_threshold_source": threshold.source.as_str(),
         "ctx_over_threshold": ctx_percent.map(|c| c >= ctx_threshold),
+        // #1021: ctx% の取得元（screen / transcript / none）。null のときは
+        // `ctx_reason` に理由が入る。`ctx_model` / `ctx_window` も同じ解決から
+        "ctx_source": ctx.source.as_str(),
+        "ctx_reason": ctx.reason.map(|x| x.as_str()),
+        "ctx_model": ctx.model,
+        "ctx_window": ctx.window,
+        "ctx_screen_delta": ctx.screen_delta,
         "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
         // #915: `handoff_path` は**プロファイル運用メモ**（共通置き場）のパス。
         // プロジェクト固有の引き継ぎは `project_handoffs` の各 path へ書く
@@ -7059,6 +7073,8 @@ fn dispatch_orchestrator_self(
             .as_deref()
             .and_then(|m| tako_core::handoff::profile_memo_warning(profile_name, m)),
     );
+    // #1021 の自己検証: 画面と transcript がずれていたら窓の宣言が実態と食い違っている
+    warnings.extend(crate::claude_ctx::window_warning(&ctx));
     // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
     if threshold.clamped() {
         result["ctx_threshold_raw"] = json!(threshold.raw);
@@ -8489,7 +8505,7 @@ fn finish_worker_status(
     // #983 の変更 2: 「ターンが走った」= プロンプトが届いた、という**送達の一次シグナル**。
     // 画面の送達確認より強い証拠なので、送達判定へ渡して未達の誤検知を潰す（#1015）
     let mut codex_turn_observed = false;
-    let (status, ctx_percent) = if let Some(ref sid) = resolved_sid {
+    let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
             normalize_agent_status(&agent.status).to_string(),
@@ -8515,6 +8531,19 @@ fn finish_worker_status(
     } else {
         ("gone".to_string(), None)
     };
+
+    // #1021: claude の ctx% は `agents --json` からは採れない（2.1.258 で
+    // `contextPercentUsed` が消えた）。codex は #984 の rollout が既に実数を返すので
+    // **埋まっていないときだけ**画面 → transcript で解決する
+    let mut ctx = None;
+    if ctx_percent.is_none() {
+        let screen = full_screen
+            .as_deref()
+            .and_then(crate::claude_ctx::screen_ctx_from_text);
+        let resolved = crate::claude_ctx::resolve(resolved_sid.as_deref(), screen.as_ref());
+        ctx_percent = resolved.percent;
+        ctx = Some(resolved);
+    }
 
     // ペインの最近の出力（pane のライブ画面 → tmux session フォールバック）
     let recent_output = live_tail.or_else(|| {
@@ -8581,6 +8610,7 @@ fn finish_worker_status(
         status,
         status_source: status_source.to_string(),
         ctx_percent,
+        ctx,
         resolved_sid,
         pane_exists,
         has_children,
@@ -8604,6 +8634,8 @@ struct ResolvedWorkerStatus {
     status: String,
     status_source: String,
     ctx_percent: Option<u32>,
+    /// #1021: ctx% をどこから採ったか（claude 経路で解決したときだけ Some）
+    ctx: Option<tako_core::ctx_usage::CtxResolution>,
     resolved_sid: Option<String>,
     pane_exists: bool,
     has_children: bool,
@@ -8638,6 +8670,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         status_source,
         codex_rate_limits,
         ctx_percent,
+        ctx,
         resolved_sid,
         pane_exists,
         has_children,
@@ -8959,6 +8992,13 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     Ok(json!({
         "status": status,
         "ctx_percent": ctx_percent,
+        // #1021: ctx% の取得元（screen / transcript / none）。claude 経路で解決した
+        // ときだけ入る（codex は #984 の rollout が実数を返すので null）。
+        // null のときの理由は `ctx_reason`
+        "ctx_source": ctx.as_ref().map(|c| c.source.as_str()),
+        "ctx_reason": ctx.as_ref().and_then(|c| c.reason).map(|x| x.as_str()),
+        "ctx_model": ctx.as_ref().and_then(|c| c.model.clone()),
+        "ctx_window": ctx.as_ref().and_then(|c| c.window),
         "recent_output": recent_output,
         "status_source": status_source,
         // #985: codex の**構造化された**利用制限（rollout の `rate_limits`）。

@@ -1982,8 +1982,10 @@ mod tests {
         assert_eq!(m.ctx_percent, Some(88));
         // ③ の区切りつき（`Context low (12% remaining) · <warning>`）
         let m =
-            parse_agent_metrics(&["Context low (3% remaining) · Context limit reached".to_string()])
-                .unwrap();
+            parse_agent_metrics(
+                &["Context low (3% remaining) · Context limit reached".to_string()],
+            )
+            .unwrap();
         assert_eq!(m.ctx_percent, Some(97));
     }
 
@@ -2007,7 +2009,10 @@ mod tests {
     #[test]
     fn 行の列から公開の入口でも同じ結果になる() {
         // #1021: dispatch は `agent_metrics_from_*` を通る。セッション経由と同値であること
-        let lines = vec!["  ctx  41% ████░░░░░░".to_string(), "  5h   76%".to_string()];
+        let lines = vec![
+            "  ctx  41% ████░░░░░░".to_string(),
+            "  5h   76%".to_string(),
+        ];
         let via_lines = agent_metrics_from_lines(&lines).unwrap();
         let via_text = agent_metrics_from_text(&lines.join("\n")).unwrap();
         assert_eq!(via_lines.ctx_percent, Some(41));
