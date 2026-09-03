@@ -1090,7 +1090,7 @@ enum RemoteCommand {
     },
     /// ペインのスクロールバック履歴をプレーンテキストで表示する
     Scrollback {
-        /// 対象ペイン ID（session:window.pane）
+        /// 対象（tako のペイン ID / 器のセッション名 / `session:window.pane`）
         pane_id: String,
         /// 取得する履歴行数（省略時は 1000）
         #[arg(long, default_value_t = 1000)]

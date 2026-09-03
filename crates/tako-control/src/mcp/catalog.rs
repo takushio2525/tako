@@ -2015,14 +2015,14 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_remote_scrollback",
-            "description": "ペインのスクロールバック履歴をプレーンテキストで取得する。\
-                tmux capture-pane で指定行数の履歴を取得し、ANSI なしのテキストとして返す。\
+            "description": "ペインのスクロールバック（履歴 + 現画面）をプレーンテキストで取得する。\
+                永続化の器（tmux / psmux）から指定行数を遡り、ANSI なしのテキストとして返す。\
                 リモートからの画面履歴確認やログ検索に使う。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "対象ペイン ID（必須。session:window.pane）" },
-                    "lines": { "type": "integer", "minimum": 1, "default": 1000, "description": "取得する履歴行数（省略時は 1000）" },
+                    "pane_id": { "type": "string", "description": "対象（必須。tako のペイン ID / 器のセッション名 / session:window.pane）" },
+                    "lines": { "type": "integer", "minimum": 1, "default": 1000, "description": "遡る履歴行数（省略時は 1000）" },
                 },
                 "required": ["pane_id"],
                 "additionalProperties": false,
