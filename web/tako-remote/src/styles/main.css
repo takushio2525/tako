@@ -1105,3 +1105,72 @@ body {
   font-size: 13px; display: flex; align-items: center;
   justify-content: space-between; gap: 10px;
 }
+
+/* ============================================================
+   SSH の切り替え / 新規接続（#1080）
+   ============================================================ */
+
+/* ヘッダの入口。chat/term トグルと同じ高さ・同じ字面に揃える */
+.pane-header-ssh {
+  font-family: var(--mono); font-size: 11px;
+  padding: 6px 11px; border-radius: 9px;
+  background: var(--panel2); border: 1px solid var(--line);
+  color: var(--fg3); cursor: pointer; flex-shrink: 0;
+  transition: background .12s, color .12s;
+}
+.pane-header-ssh:active { background: var(--panel3); color: var(--fg); }
+
+/* 接続状態バー。失敗しても消えないので、読める色で置き続ける（#919 / #1040） */
+.ssh-bar {
+  flex: none;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 12px;
+}
+.ssh-bar-head {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+}
+.ssh-bar-label { font-weight: 600; flex-shrink: 0; }
+.ssh-bar-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--fg3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ssh-bar-reason,
+.ssh-bar-next {
+  margin-top: 5px; font-size: 11px;
+  color: var(--fg2); word-break: break-word;
+}
+.ssh-bar-next { color: var(--fg3); }
+.ssh-bar-wait { border-left: 3px solid var(--amber); }
+.ssh-bar-wait .ssh-bar-label { color: var(--amber); }
+.ssh-bar-bad { border-left: 3px solid var(--red); }
+.ssh-bar-bad .ssh-bar-label { color: var(--red); }
+.ssh-bar-spinner {
+  width: 13px; height: 13px; flex: none;
+  border: 2px solid var(--line2);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+/* シート内 */
+.ssh-target-desc {
+  font-size: 11px; color: var(--fg3); margin-top: 8px;
+}
+.ssh-target-blocked {
+  margin-top: 8px; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 11px;
+  background: var(--panel2);
+  font-size: 11px; color: var(--fg2); line-height: 1.5;
+}
+.ssh-host-list { max-height: 46vh; overflow-y: auto; }
+.ssh-sheet-empty {
+  display: flex; align-items: center; justify-content: center;
+  padding: 22px 0; color: var(--fg3); font-size: 12px;
+}
+.ssh-sheet-error {
+  padding: 9px 11px; margin-bottom: 9px;
+  border: 1px solid var(--red); border-radius: 11px;
+  color: var(--red); font-size: 11px; line-height: 1.5;
+}

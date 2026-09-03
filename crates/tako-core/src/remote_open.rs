@@ -80,6 +80,20 @@ pub enum PaneSshBlock {
 }
 
 impl PaneSshBlock {
+    /// ワイヤ表記（応答 JSON の `reason`。#1080 でリモート UI が読む）。
+    ///
+    /// **文言ではなく slug で分岐させる**ため。`message` は人が読む日本語で、
+    /// 表示の都合で変わりうる。リモート UI は「このペインを SSH 化できるか」を
+    /// 判定するのに `ok` を、理由の出し分けにこの slug を使う
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneSshBlock::NoSession => "no_session",
+            PaneSshBlock::AltScreen => "alt_screen",
+            PaneSshBlock::Running => "running",
+            PaneSshBlock::AgentRole => "agent_role",
+        }
+    }
+
     /// 理由 + 次の一手（dispatch / CLI / MCP のエラー文。規約どおり日本語）
     pub fn message(self, pane: u64) -> String {
         match self {
@@ -220,6 +234,28 @@ mod tests {
             can_ssh_pane(true, false, CommandState::Idle, Some("")),
             Ok(())
         );
+    }
+
+    /// ワイヤ表記は**理由ごとに違う 1 語**でなければならない
+    /// （リモート UI が slug で分岐するので、重複すると別の理由が同じに見える）
+    #[test]
+    fn 断る理由のワイヤ表記は一意で空でない() {
+        let all = [
+            PaneSshBlock::NoSession,
+            PaneSshBlock::AltScreen,
+            PaneSshBlock::Running,
+            PaneSshBlock::AgentRole,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for block in all {
+            let slug = block.as_str();
+            assert!(!slug.is_empty(), "{block:?} のワイヤ表記が空");
+            assert!(
+                slug.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "ワイヤ表記は snake_case の ASCII に限る: {slug}"
+            );
+            assert!(seen.insert(slug), "ワイヤ表記が重複している: {slug}");
+        }
     }
 
     #[test]

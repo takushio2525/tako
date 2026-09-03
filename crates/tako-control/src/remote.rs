@@ -747,7 +747,7 @@ fn check_admin(ctx: &DaemonCtx, request: &tiny_http::Request) -> bool {
 
 /// daemon から tako-app の IPC ソケットへ接続し、Request を dispatch 経由で実行する。
 /// discovery::read_candidates で接続情報を自動発見する
-struct AppIpcClient {
+pub(crate) struct AppIpcClient {
     socket: String,
     token: String,
 }
@@ -772,7 +772,7 @@ impl AppIpcClient {
     }
 
     /// IPC に Request を送り、結果を返す
-    fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
+    pub(crate) fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
         Self::roundtrip_raw(&self.socket, &self.token, request)
     }
 
@@ -823,8 +823,11 @@ impl AppIpcClient {
     }
 }
 
-/// daemon 起動中に保持する IPC 接続状態。定期的に再接続を試みる
-struct AppConnection {
+/// daemon 起動中に保持する IPC 接続状態。定期的に再接続を試みる。
+///
+/// `pub(crate)`: 柱ごとのルート実装を別モジュールへ切り出している（#1080 の
+/// `remote_ssh` 等）ので、そこから同じ接続を通せる必要がある
+pub(crate) struct AppConnection {
     client: Option<AppIpcClient>,
     last_attempt: std::time::Instant,
 }
@@ -840,7 +843,7 @@ impl AppConnection {
     }
 
     /// 接続中の IPC クライアントを返す。未接続なら定期的に再接続を試みる
-    fn get(&mut self) -> Option<&AppIpcClient> {
+    pub(crate) fn get(&mut self) -> Option<&AppIpcClient> {
         if self.client.is_none() && self.last_attempt.elapsed() >= IPC_RECONNECT_INTERVAL {
             self.client = AppIpcClient::connect();
             self.last_attempt = std::time::Instant::now();
@@ -849,7 +852,7 @@ impl AppConnection {
     }
 
     /// IPC 接続に失敗したら切断状態にする（次の get() で再接続を試みる）
-    fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.client = None;
         self.last_attempt = std::time::Instant::now();
     }
@@ -3857,6 +3860,9 @@ fn handle_request_v2(
                 });
                 // #1069: 公式リンク（claude.ai/code）。繋がっていなければ理由が入る
                 attach_remote_links(&mut result);
+                // #1080: SSH の接続状態（#1010 / #1040）と「このペインを SSH 化できるか」
+                // （#1006 の判定）。判定は list の答えをそのまま運ぶ（作り直さない）
+                crate::remote_ssh::attach_ssh_state(&mut result, &list);
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
             None => {
@@ -3868,6 +3874,8 @@ fn handle_request_v2(
                 });
                 // #1069: app 不在の経路でも同じ 1 実装を通す（値が食い違わない）
                 attach_remote_links(&mut result);
+                // #1080: 接続は app 経由でしかできないので、押せない理由を先に出す
+                crate::remote_ssh::attach_app_unavailable(&mut result);
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
         }
@@ -3890,6 +3898,13 @@ fn handle_request_v2(
 fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
     if path.starts_with("/api/devices") {
         return DeviceRole::Admin;
+    }
+    // SSH 系（#1080）は読み書きとも Manage。一覧が GET なのに Observe でないのは、
+    // ①`~/.ssh/config` の Host 名・user・port は画面に映らない**別の在庫情報**で、
+    // 画面を見るだけの端末へ配る理由が無い ②一覧の用途は接続（= Manage）だけなので、
+    // 押せない端末に見せても操作できない選択肢が並ぶだけ
+    if path == "/api/ssh-hosts" || path == "/api/ssh" || path.ends_with("/ssh") {
+        return DeviceRole::Manage;
     }
     if *method == tiny_http::Method::Post {
         if path.ends_with("/input") || path.ends_with("/respond") || path == "/api/upload" {
@@ -4050,6 +4065,53 @@ fn handle_admin_api(
     }
 }
 
+/// SSH 接続を開くルートの共通処理（#1080）。
+///
+/// `path_pane` = `POST /api/panes/:id/ssh` の :id（`POST /api/ssh` なら None）。
+/// 判断は `remote_ssh` の純粋関数、実行は dispatch の `OpenRemote`（#1006）で、
+/// ここは**読み取り・監査・応答の接着だけ**
+fn handle_ssh_open(
+    mut request: tiny_http::Request,
+    path_pane: Option<u64>,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    app_conn: &Arc<RwLock<AppConnection>>,
+) {
+    // ボディ無し（`POST /api/panes/:id/ssh` にホストだけ URL で渡す形は無い）は 400
+    let parsed = match read_json_body(&mut request) {
+        Ok(v) => v,
+        Err(e) => {
+            return respond(request, 400, Some(json!({ "error": e }).to_string()));
+        }
+    };
+    let open = match crate::remote_ssh::parse_open_request(&parsed, path_pane) {
+        Ok(v) => v,
+        Err(e) => {
+            return respond(
+                request,
+                e.status,
+                Some(json!({ "error": e.message }).to_string()),
+            );
+        }
+    };
+    // 監査には**何をどこへ開こうとしたか**を残す。ホスト名は接続先そのものなので
+    // 記録する（ペインの中身・送信テキストとは別種の情報）
+    ctx.registry.lock().unwrap().audit(
+        "ssh_open",
+        &device.id,
+        &device.name,
+        json!({
+            "host": open.host,
+            "target": open.target.as_str(),
+            "pane": open.pane,
+        }),
+    );
+    match crate::remote_ssh::open_remote(app_conn, &open) {
+        Ok(v) => respond(request, 200, Some(v.to_string())),
+        Err((status, e)) => respond(request, status, Some(json!({ "error": e }).to_string())),
+    }
+}
+
 /// 認可済みリクエストの API ルーティング（従来の handle_request_v2 後段）
 #[allow(clippy::too_many_arguments)]
 fn handle_api_v2_routes(
@@ -4068,6 +4130,38 @@ fn handle_api_v2_routes(
             // v1: 従来の tmux 直接一覧（後方互換）
             let result = tmux_list_panes(tmux_socket);
             respond(request, 200, Some(result.to_string()))
+        }
+        // --- SSH の切り替え / 新規接続（#1080。実装は remote_ssh.rs）---
+        (tiny_http::Method::Get, "/api/ssh-hosts") => {
+            match crate::remote_ssh::list_hosts(app_conn) {
+                Ok(v) => respond_sensitive(request, 200, Some(v.to_string())),
+                Err((status, e)) => {
+                    respond(request, status, Some(json!({ "error": e }).to_string()))
+                }
+            }
+        }
+        (tiny_http::Method::Post, "/api/ssh") => {
+            handle_ssh_open(request, None, ctx, device, app_conn)
+        }
+        (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/ssh") => {
+            let Some(pane_param) = extract_pane_target(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
+                );
+            };
+            let Ok(pane_id) = pane_param.parse::<u64>() else {
+                return respond(
+                    request,
+                    400,
+                    Some(
+                        json!({ "error": "SSH の対象は数値ペイン ID のみ（一覧の id を渡す）" })
+                            .to_string(),
+                    ),
+                );
+            };
+            handle_ssh_open(request, Some(pane_id), ctx, device, app_conn)
         }
         (tiny_http::Method::Get, "/api/agents") => {
             match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
@@ -5222,6 +5316,17 @@ mod tests {
         );
         assert_eq!(
             required_role(&Method::Post, "/api/panes/s:0.0/resize"),
+            DeviceRole::Manage
+        );
+        // SSH の一覧・接続は Manage（#1080）。一覧が GET でも Observe に落とさない:
+        // `~/.ssh/config` の在庫は画面に映らない別種の情報で、押せない端末に見せる理由も無い
+        assert_eq!(
+            required_role(&Method::Get, "/api/ssh-hosts"),
+            DeviceRole::Manage
+        );
+        assert_eq!(required_role(&Method::Post, "/api/ssh"), DeviceRole::Manage);
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/648/ssh"),
             DeviceRole::Manage
         );
         // 端末管理は Admin
