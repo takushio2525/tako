@@ -2433,6 +2433,36 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
         assert!(argv.contains("-t"), "{argv}");
     }
 
+    /// #1090: **配線の検査**。実行時の `common_opts` / `ssh_pane_argv` が
+    /// 宣言（`multiplexing(Platform::current())`）どおりの形を組むか。
+    /// これが無いと「宣言は直したが呼び出し側が能力を見ていない」を取り逃がす。
+    /// **macOS で走らせれば ControlMaster が渡ることの実行時確認**にもなる
+    #[test]
+    fn 実行時の_argv_は現在のプラットフォームの宣言に従う() {
+        use crate::platform::ssh_client::multiplexing;
+        use crate::platform::support::Platform;
+        let expected = multiplexing(Platform::current());
+        for batch in [false, true] {
+            assert_eq!(
+                common_opts("win", batch),
+                common_opts_with("win", batch, expected),
+                "platform={:?} batch={batch}",
+                Platform::current()
+            );
+        }
+        let extra = vec!["-t".to_string()];
+        assert_eq!(
+            ssh_pane_argv("win", &extra),
+            ssh_pane_argv_with("win", &extra, expected)
+        );
+        assert_eq!(
+            ssh_pane_argv("win", &extra)
+                .join(" ")
+                .contains("ControlMaster=auto"),
+            expected
+        );
+    }
+
     /// 能力の宣言と実際に組む argv がずれていないこと（両プラットフォームぶん）
     #[test]
     fn 多重化の宣言と組む_argv_が一致する() {
