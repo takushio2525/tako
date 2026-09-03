@@ -41,12 +41,18 @@ fn production_part(src: &str) -> String {
 fn 監査の呼び出しはaudit_payload経由だけ() {
     let src = production_part(&without_comments(&remote_files_source()));
     let mut offenders: Vec<String> = Vec::new();
-    for (i, line) in src.lines().enumerate() {
-        if !line.contains("deps.audit)(") {
-            continue;
-        }
-        if !line.contains("audit_payload(") {
-            offenders.push(format!("remote_files.rs:{} — {}", i + 1, line.trim()));
+    // **行ではなく文**を見る: `cargo fmt` が引数を改行へ折ると
+    // 「同じ行に audit_payload( があるか」では偽の違反になる（#1023 の番犬の教訓）
+    for (pos, _) in src.match_indices("deps.audit)(") {
+        let stmt_end = src[pos..].find(';').map(|i| pos + i).unwrap_or(src.len());
+        let stmt = &src[pos..stmt_end];
+        if !stmt.contains("audit_payload(") {
+            let line_no = src[..pos].matches('\n').count() + 1;
+            offenders.push(format!(
+                "remote_files.rs:{} — {}",
+                line_no,
+                stmt.replace('\n', " ").trim()
+            ));
         }
     }
     assert!(
