@@ -494,7 +494,19 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   既定書式は先頭行タイムスタンプ = **時刻表示**を含み、スクロール中に謎の時計として
   見える実機バグ (2) の正体だった。位置は tako 側スクロールバーが示す）。
   **conf はサーバー起動時にしか読まれない**ため、稼働中サーバーへは起動時に
-  `tmux_backend::sync_conf`（`source-file`）で再適用する（下記の罠）
+  `tmux_backend::sync_conf`（`source-file`）で再適用する（下記の罠）。
+  **中身は器の能力で出し分ける**（#974）: 行ごとに `Directive::needs` で
+  「書くために器へ求める能力」を宣言し、`tmux_backend::backend_conf(caps)` が
+  `BackendCapabilities` を見て組む（器の実装名で分岐しない）。psmux 3.3.7 は
+  `extended-keys` / `extended-keys-format` / `terminal-features` /
+  `copy-mode-position-format` を知らず、書くと 1 行につき 1 件の
+  `psmux: N config warning(s):` が**ペインの出力へ**混ざって画面解析と `tako read` を
+  汚す（実機実測）。警告が出る = その行は元から効いていないので、落としても器の挙動は
+  変わらない。対応する能力は `extended_keys`（CSI u / kitty の要求を器へ渡せるか。
+  #28 の前提）と `suppresses_copy_mode_indicator` で、どちらも `tako persist` /
+  MCP の `backend` 応答に出る。拒否される設定の正本は
+  `backend::psmux::UNKNOWN_OPTIONS`（実測で拒否されたものだけ。psmux 版 conf に
+  無いだけの `default-terminal` / `escape-time` は psmux が受理するので含めない）
 - **シェル統合の共存**: tmux は OSC 7 / 133 を外へ転送しないため、統合スクリプトが
   バックエンド配下（`$TMUX` のソケット basename が `tako*`）では OSC を
   `\ePtmux;…\e\\` パススルーで包む。同時に **TMUX / TMUX_PANE を unset** し、

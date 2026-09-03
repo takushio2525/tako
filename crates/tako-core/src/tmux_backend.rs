@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::backend::BackendCapabilities;
 use crate::paths::data_dir;
 use crate::terminal::{SpawnCommand, SpawnOptions};
 
@@ -64,23 +65,142 @@ pub fn tmux_binary_present() -> bool {
 ///   （`15:13 [10/77]` のような時刻表示）を含み、通常ペインのスクロール中に
 ///   謎の時刻として見えてしまう（2026-06-12 実機バグ (2)）。
 ///   スクロール位置は tako 側のスクロールバー（FR-2.5.13）が示す
-const BACKEND_CONF: &str = "\
-# tako tmux バックエンド設定（自動生成。手で編集しない。tako-core::tmux_backend）
-set -g status off
-set -g prefix None
-set -g mouse on
-set -g history-limit 10000
-set -g allow-passthrough on
-set -g focus-events on
-set -g set-clipboard on
-set -g default-terminal tmux-256color
-set -s escape-time 10
-set -s extended-keys always
-set -sq extended-keys-format csi-u
-set -as terminal-features 'xterm*:extkeys:RGB'
-set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'
-set -gq copy-mode-position-format ''
-";
+///
+/// **語彙は器によって違う**（#974）。行ごとに「書くために器へ求める能力」を
+/// [`Directive::needs`] で宣言し、[`backend_conf`] が能力に合わせて組む。
+/// 器の実装名で分岐しないので、将来の器を足しても各行の判断は変わらない
+const CONF_HEADER: &str =
+    "# tako tmux バックエンド設定（自動生成。手で編集しない。tako-core::tmux_backend）\n";
+
+/// バックエンド設定の 1 行と、それを書くために器へ求める能力（#974）。
+///
+/// **器は tmux 互換の CLI を名乗っても設定の語彙まで同じではない**。psmux 3.3.7 は
+/// `extended-keys` / `extended-keys-format` / `terminal-features` /
+/// `copy-mode-position-format` を知らず、書くと 1 行につき 1 件の
+/// `psmux: N config warning(s):` が**ペインの出力へ**混ざる（#974 の実機実測）。
+/// 画面解析と `tako read` の中身を汚すので、器が解さない行は最初から書かない。
+///
+/// 落としても器の挙動は変わらない。**警告が出る = その行は元から効いていない**からで、
+/// 変わるのはノイズの有無だけである（#974 の安全性の根拠）
+struct Directive {
+    /// この行を書くために器へ求める能力。`None` はどの器へも書く
+    needs: Option<Need>,
+    line: &'static str,
+}
+
+/// [`Directive`] が求める能力。[`BackendCapabilities`] の 1 マスへ 1:1 で対応する
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Need {
+    /// 拡張キー（CSI u / kitty keyboard protocol）の要求を器へ渡せること
+    ExtendedKeys,
+    /// copy mode の位置インジケータを出さずに済むこと
+    SuppressesCopyModeIndicator,
+}
+
+impl Need {
+    fn met_by(self, caps: &BackendCapabilities) -> bool {
+        match self {
+            Need::ExtendedKeys => caps.extended_keys,
+            Need::SuppressesCopyModeIndicator => caps.suppresses_copy_mode_indicator,
+        }
+    }
+}
+
+const DIRECTIVES: &[Directive] = &[
+    Directive {
+        needs: None,
+        line: "set -g status off",
+    },
+    Directive {
+        needs: None,
+        line: "set -g prefix None",
+    },
+    Directive {
+        needs: None,
+        line: "set -g mouse on",
+    },
+    Directive {
+        needs: None,
+        line: "set -g history-limit 10000",
+    },
+    Directive {
+        needs: None,
+        line: "set -g allow-passthrough on",
+    },
+    Directive {
+        needs: None,
+        line: "set -g focus-events on",
+    },
+    Directive {
+        needs: None,
+        line: "set -g set-clipboard on",
+    },
+    Directive {
+        needs: None,
+        line: "set -g default-terminal tmux-256color",
+    },
+    Directive {
+        needs: None,
+        line: "set -s escape-time 10",
+    },
+    Directive {
+        needs: Some(Need::ExtendedKeys),
+        line: "set -s extended-keys always",
+    },
+    Directive {
+        needs: Some(Need::ExtendedKeys),
+        line: "set -sq extended-keys-format csi-u",
+    },
+    // extkeys の申告が主目的で、RGB（truecolor）が同じ行へ相乗りしている。
+    // 器が `terminal-features` を持たないなら申告手段そのものが無いので、
+    // 分割しても書けるようにはならない
+    Directive {
+        needs: Some(Need::ExtendedKeys),
+        line: "set -as terminal-features 'xterm*:extkeys:RGB'",
+    },
+    Directive {
+        needs: None,
+        line: "set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'",
+    },
+    Directive {
+        needs: Some(Need::SuppressesCopyModeIndicator),
+        line: "set -gq copy-mode-position-format ''",
+    },
+];
+
+/// 器の能力に合わせてバックエンド設定を組む（**純関数**）。
+///
+/// 能力を引数で受けるので、**macOS 上から psmux 向けの出力も検査できる**
+/// （実機を出さずに #974 の回帰を止められる）。`pub` なのは統合テストが
+/// 「本番がその器へ実際に書く中身」を実バイナリに食わせて確かめるため
+pub fn backend_conf(caps: &BackendCapabilities) -> String {
+    let mut out = String::from(CONF_HEADER);
+    for directive in DIRECTIVES {
+        if directive.needs.is_none_or(|need| need.met_by(caps)) {
+            out.push_str(directive.line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// いまの器へ書く設定の中身。
+///
+/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）
+fn conf_body() -> String {
+    let legacy = std::env::var("TAKO_974_LEGACY").is_ok_and(|v| v == "1");
+    backend_conf(&apply_legacy(crate::backend::capabilities(), legacy))
+}
+
+/// A/B の適用（**純関数**）。`TAKO_974_LEGACY=1` は器の能力を無視して全部書く
+/// = #974 前の挙動へ戻す。環境変数を読まないのでテストが直列化を要らない
+fn apply_legacy(mut caps: BackendCapabilities, legacy: bool) -> BackendCapabilities {
+    if legacy {
+        caps.extended_keys = true;
+        caps.suppresses_copy_mode_indicator = true;
+    }
+    caps
+}
 
 /// ユーザー自前 tmux サーバー（ネスト tmux）向けの推奨設定スニペット（FR-2.17.5）。
 /// tako ペイン内で `tmux attach` するユーザーサーバーが既定値のままだと、
@@ -115,13 +235,14 @@ set -gq copy-mode-position-format ''
 /// 素の Enter に劣化する（#28 / #167 と同じ症状クラス）。rename は同一ディレクトリ内で
 /// 原子的なので、読み手は常に完全な conf を見る
 fn ensure_conf() -> PathBuf {
+    let body = conf_body();
     data_dir()
-        .and_then(|dir| write_conf_in(&dir).ok())
+        .and_then(|dir| write_conf_in(&dir, &body).ok())
         .unwrap_or_else(|| PathBuf::from("/dev/null"))
 }
 
 /// conf を `dir` へ原子的に置き、そのパスを返す
-fn write_conf_in(dir: &Path) -> std::io::Result<PathBuf> {
+fn write_conf_in(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -136,7 +257,7 @@ fn write_conf_in(dir: &Path) -> std::io::Result<PathBuf> {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, BACKEND_CONF)?;
+    std::fs::write(&tmp, body)?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -587,6 +708,135 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    /// #974 の判定に使う器の能力は、**器の実装そのものから採る**
+    /// （テスト側でハードコードすると本体と無言でずれ、検出力が消える）
+    fn tmux_caps() -> BackendCapabilities {
+        use crate::backend::SessionBackend;
+        crate::backend::TmuxBackend::new().capabilities()
+    }
+
+    fn psmux_caps() -> BackendCapabilities {
+        use crate::backend::SessionBackend;
+        crate::backend::PsmuxBackend::new("psmux".into(), "3.3.7".into()).capabilities()
+    }
+
+    /// #974 **前**に tmux の器へ書いていた conf のバイト列（凍結）。
+    ///
+    /// 能力で出し分ける形へ変えても **macOS の器（tmux）向けの出力は 1 バイトも
+    /// 変わらない**ことを固定する。ここが動いたら、tmux サーバーの設定が変わって
+    /// ステータスバー・ホイール・Shift+Enter（#28）の前提が崩れているということ
+    const TMUX_CONF_BEFORE_974: &str = "\
+# tako tmux バックエンド設定（自動生成。手で編集しない。tako-core::tmux_backend）
+set -g status off
+set -g prefix None
+set -g mouse on
+set -g history-limit 10000
+set -g allow-passthrough on
+set -g focus-events on
+set -g set-clipboard on
+set -g default-terminal tmux-256color
+set -s escape-time 10
+set -s extended-keys always
+set -sq extended-keys-format csi-u
+set -as terminal-features 'xterm*:extkeys:RGB'
+set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'
+set -gq copy-mode-position-format ''
+";
+
+    /// psmux が知らない設定（#974 の実機実測。1 行につき 1 件の警告がペインへ出る）。
+    /// 正本は `backend::psmux::UNKNOWN_OPTIONS` で、一致は下のテストが固定する
+    const PSMUX_UNKNOWN_OPTIONS: &[&str] = &[
+        "extended-keys",
+        "extended-keys-format",
+        "terminal-features",
+        "copy-mode-position-format",
+    ];
+
+    /// **受け入れ 2**: tmux の器向けの conf は #974 の前後でバイト等価
+    #[test]
+    fn tmuxの器へ書くconfは974前とバイト等価() {
+        assert_eq!(backend_conf(&tmux_caps()), TMUX_CONF_BEFORE_974);
+    }
+
+    /// **受け入れ 1**: psmux の器向けの conf に psmux が知らない設定が 1 つも無い。
+    /// 4 行だけが落ち、それ以外は tmux 向けと同じであることも同時に固定する
+    #[test]
+    fn psmuxの器へ書くconfは知らないオプションを含まない() {
+        let conf = backend_conf(&psmux_caps());
+        for unknown in PSMUX_UNKNOWN_OPTIONS {
+            assert!(
+                !conf.contains(unknown),
+                "psmux が知らない設定 {unknown} が残っている（ペインへ警告が出る）:\n{conf}"
+            );
+        }
+        let dropped: Vec<&str> = TMUX_CONF_BEFORE_974
+            .lines()
+            .filter(|line| !conf.lines().any(|kept| kept == *line))
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![
+                "set -s extended-keys always",
+                "set -sq extended-keys-format csi-u",
+                "set -as terminal-features 'xterm*:extkeys:RGB'",
+                "set -gq copy-mode-position-format ''",
+            ],
+            "落ちる行は #974 が実測した 4 行だけのはず"
+        );
+    }
+
+    /// 拒否される設定の列挙は **器の実装側が 1 つだけ持つ**
+    /// （`backend::psmux::UNKNOWN_OPTIONS`）。生成側とテスト側が別々に列挙を抱えると、
+    /// 器の実装が変わったときに片方だけ直って無言でずれる。
+    ///
+    /// 2 つの conf が別々に育つのが #974 の温床だった（psmux 版 conf は正しかったのに、
+    /// 本番の spawn 経路は tmux 版の conf を書いていた = #885）
+    #[test]
+    fn 拒否される設定の列挙は器の実装側が正本() {
+        assert_eq!(
+            PSMUX_UNKNOWN_OPTIONS,
+            crate::backend::psmux::UNKNOWN_OPTIONS,
+            "psmux が拒否する設定の列挙が生成側とずれている"
+        );
+        // 実バイナリで受理を確かめてある conf にも当然入っていない
+        for unknown in crate::backend::psmux::UNKNOWN_OPTIONS {
+            assert!(!crate::backend::psmux::verified_conf().contains(unknown));
+        }
+    }
+
+    /// A/B（`TAKO_974_LEGACY=1`）は器の能力を無視して #974 前の全部書きへ戻る。
+    /// **環境変数を読まない純関数**として検査するのでテストの直列化が要らない
+    #[test]
+    fn legacyフラグは能力を無視して全部書く() {
+        assert_eq!(
+            backend_conf(&apply_legacy(psmux_caps(), true)),
+            TMUX_CONF_BEFORE_974
+        );
+        // 既定（legacy でない）は能力どおり削る
+        assert_ne!(
+            backend_conf(&apply_legacy(psmux_caps(), false)),
+            TMUX_CONF_BEFORE_974
+        );
+    }
+
+    /// 器が無いとき（`NullBackend`）は conf を書かないが、能力の申告は
+    /// 「器で止まるものが無い」= 全部書ける側でなければならない
+    /// （器の縮退と混同すると `tako persist` の読み手が誤る）
+    #[test]
+    fn 器が無いときは拡張キーが器で止まらない() {
+        use crate::backend::SessionBackend;
+        let none = crate::backend::NullBackend.capabilities();
+        assert!(
+            none.extended_keys,
+            "器が無い = CSI u は tako がそのまま扱う"
+        );
+        assert!(
+            none.suppresses_copy_mode_indicator,
+            "器が無い = copy mode が無い"
+        );
+        assert_eq!(backend_conf(&none), TMUX_CONF_BEFORE_974);
+    }
+
     #[test]
     fn 単語のクォートはシェル安全() {
         use crate::shell::quote_for_shell;
@@ -619,27 +869,35 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("tako-conf-625-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = write_conf_in(&dir).expect("conf を置ける");
+        // 器に依らず決定的にするため、中身は 1 回だけ組んで全スレッドで共有する（#974）
+        let body = Arc::new(backend_conf(&tmux_caps()));
+        let path = write_conf_in(&dir, &body).expect("conf を置ける");
 
         let stop = Arc::new(AtomicBool::new(false));
         let partial = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
         let mut threads = Vec::new();
         for _ in 0..4 {
-            let (d, s) = (dir.clone(), stop.clone());
+            let (d, s, b) = (dir.clone(), stop.clone(), body.clone());
             threads.push(std::thread::spawn(move || {
                 while !s.load(Ordering::Relaxed) {
-                    let _ = write_conf_in(&d);
+                    let _ = write_conf_in(&d, &b);
                 }
             }));
         }
         for _ in 0..2 {
-            let (p, s, bad, n) = (path.clone(), stop.clone(), partial.clone(), reads.clone());
+            let (p, s, bad, n, b) = (
+                path.clone(),
+                stop.clone(),
+                partial.clone(),
+                reads.clone(),
+                body.clone(),
+            );
             threads.push(std::thread::spawn(move || {
                 while !s.load(Ordering::Relaxed) {
-                    if let Ok(body) = std::fs::read_to_string(&p) {
+                    if let Ok(read) = std::fs::read_to_string(&p) {
                         n.fetch_add(1, Ordering::Relaxed);
-                        if body != BACKEND_CONF {
+                        if read != *b {
                             bad.fetch_add(1, Ordering::Relaxed);
                         }
                     }

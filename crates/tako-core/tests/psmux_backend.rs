@@ -285,6 +285,47 @@ fn confは警告なしで受理されwarm_offが効く() {
     );
 }
 
+/// #974: **本番の spawn 経路が実際に書く conf**（`tmux_backend::backend_conf` が
+/// 器の能力で組むもの）を実 psmux に食わせて、警告が 1 行も出ないことを確かめる。
+///
+/// 上の `confは警告なしで受理されwarm_offが効く` は psmux 版 conf
+/// （`backend::psmux::ensure_conf`）を見ているが、**tako-app のペイン spawn は今も
+/// `tmux_backend::wrap_options` を直接呼んでいる**（#885）ので、そちらの中身を
+/// 確かめないと #974 の再発を実機で検出できない
+#[test]
+fn 本番が書くconfも警告なしで受理される() {
+    use tako_core::backend::SessionBackend;
+
+    let f = fixture!("conf974");
+    let conf_body = tako_core::tmux_backend::backend_conf(&f.backend.capabilities());
+    let path = std::env::temp_dir().join(format!("tako-974-{}.conf", std::process::id()));
+    std::fs::write(&path, &conf_body).expect("conf を書ける");
+
+    let out = Command::new(&f.bin)
+        .args(["-L", &f.socket, "-f"])
+        .arg(&path)
+        .args(["new-session", "-d", "-s", "tako-m2conf974x"])
+        .output()
+        .expect("psmux を実行できる");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !text.contains("warning") && !text.contains("unknown option"),
+        "本番が書く conf に psmux が知らないオプションがある\n出力: {text}\nconf:\n{conf_body}"
+    );
+    // 落としたのは 4 行だけで、器が解する設定はちゃんと届いている
+    let (ok, limit) = f.raw(&["show-options", "-g", "history-limit"]);
+    assert!(ok, "show-options が動く: {limit}");
+    assert!(
+        limit.contains("10000"),
+        "history-limit が反映されない（削りすぎ）: {limit}"
+    );
+}
+
 /// **要件 2**: `show-environment` が名前指定を無視して全変数を返しても、
 /// 目的の 1 本を取り出せる（`-e` で注入した TAKO_PANE_ID が読める）
 #[test]
