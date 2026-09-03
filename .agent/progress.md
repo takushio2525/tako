@@ -4027,3 +4027,78 @@
   load 15 で項目 94（#702。打った行が 6 秒以内に実行されない）/ load 5 で項目 113（#816。
   2.5 秒の出力が `lines+=25 < 40`）。並行 worker のビルドで load が跳ねる時間帯は避けて測る
 - 次: PR → CI → merge / install は master 判断
+
+## 2026-09-03（#1073: Windows 実機の GUI セルフテスト完走を復旧 + #967 も解消）
+- **停止位置が 2 つあったのは世代差ではなく起動の仕方の差**（#920 の完走ログの
+  `tako-iso-data-<pid>` が決定的）。`TAKO_ISOLATED=1` を付けない起動だと data dir が本番に
+  なり `$PROFILE` の配置が「効いている」判定になるので、#920 では skip されていた項目 41 /
+  41b（OSC 7 / 133）が**初めて走り、そこで落ちていた**
+- 落ちる理由は 2 つ: ①cwd を固定待ち 1 秒の直後に 1 回読む形が側路（#766）の **2 秒 tick** を
+  跨げない = コイン投げ（9/2 は落ち・9/3 の main は通った）→ `wait_for_app_state` で状態待ちへ
+  ②`list` の `cwd` が Windows だけ `/` 区切り（`file://` URI 由来）で文字列比較が食い違う →
+  `file_uri::native_separators` を `osc_tap::parse_cwd` へ通して製品側を直した
+- 41 を通した先の壁は **#967**（項目 97 / 99 が画面の `tako setup` リテラルを期待。#898 で
+  実体パスになった時点から落ちていた。macOS は basename が `tako` なので**通ってしまう**）。
+  期待値を `welcome::launch_command_line` から作り折り返しに強い形へ
+- 副目標: `load=unknown` を解消（境界 `platform::sysload` = B25 新設。Windows は
+  `GetSystemTimes` の差分から `load=cpu14%/12cpu`。3 つ組はでっち上げない）
+- 番犬 2 本（`シェル統合由来の状態を固定待ちで読んでいない` /
+  `ペイン画面の検査はtakoコマンドをリテラルで期待しない`）は **origin/main の実ファイルで
+  pre-fix の 4 行を名指しし、このブランチで 0 件**を実測
+- 関連: PR（`Refs #1073` / `Closes #967`）。記録は plan の「#1073 の記録」節
+- **壁は順に 3 つ**（前を通すまで次は見えない）。41 と 97/99 を潰して**両モードとも項目 133
+  まで到達**。壁 3 = 133 (d) は**製品側**で、診断（`TAKO_SELF_TEST_133D`）+ オプションだけを
+  変えた実機 A/B で確定 → **#1090 起票**: Windows の OpenSSH は ControlMaster 非対応で、
+  tako が渡す `ControlPath` / `ControlMaster=auto` により **exit が 255 にならず**
+  （`ssh_pane_script` が理由を出さない）**`getsockname failed: Not a socket` が
+  `SSH_ERROR_PATTERNS` に無い**ので `classify` が `Opened` へ畳む。影響は SSH 系の全経路
+- 次: 項目 41 の実行がモードで変わること自体の根治は **#1091**（#889 の
+  `integration_shell_command` を 41 にも使って専用ペインで閉じる）
+
+## 2026-09-03（#1077 + #1078: リモート PWA から Claude 公式へ送り出す + スマホから master 起動）
+- #1077: カードに「Claude で開く」（connected だけ・**PWA は URL を組み立てない**）/ 未接続は
+  理由 + PC 側の有効化コマンド（**環境阻害には opt-in コマンドを出さない**・master と solo で
+  `--solo` を出し分け）/ アカウント表示。文言は Rust が正（daemon が表示言語で解決）。
+  自前チャットはフォールバック維持
+- #1078: `GET /api/master/profiles`（Observe）+ `POST /api/tabs` / `POST /api/tabs/:id/master`
+  （**Manage**）。組み立ては新設 `orchestrator::master_launch` が正で CLI の `tako master` と
+  同じ順・同じ検証（**ペインに触る前**に落ちる）。起動できるのは PC 側に在るプロファイルだけ
+- 同梱: **daemon が表示言語を初期化しておらず #1077 の理由文が英語で凍っていた**（#983 と同型）/
+  **app が拒否した要求で IPC 接続を捨てていた**（A/B 実測 = 次の正当な操作が 503 になる）→
+  `AppCallError` で言い分け拒否は 400。ワイヤ処理は `roundtrip_detailed` の 1 実装へ
+- 検証: 実経路テスト `scripts/test-remote-master-launch.sh` **34 PASS / 0 FAIL**（偽 tailscale +
+  隔離 state/data/orchestrator で**実 daemon + 実 tako-app**。claude はスタブ）+ PWA e2e 15 件 +
+  品質ゲート全緑 + クロスチェック警告が main と一致 + 隔離セルフテスト `TAKO_APP_SELF_TEST_OK`。
+  検出力は role を Observe へ落として**observe 端末が実際にタブを作れる**ことまで実測
+- 関連: PR #1088（`Refs #1077, #1078, #1059`）。**実機スマホは未検証**
+- 次: 実機での「タップ → Claude アプリ」確認。柱1 の残りは #1059 のエピック参照
+
+## 2026-09-03（#1093: 組織クレジット上限の見出しを検知できず自動復帰が発火しない問題を根治）
+- 症状は「解除後 1 時間以上 worker 3 体が止まったまま `supervisor.log` に記録ゼロ」。原因は
+  **停止判定の文言が `hit your usage limit` 決め打ち**で、実際の見出し
+  `You've hit your session limit · resets 7:50pm (Asia/Tokyo)` に 1 文字も当たらないこと。
+  **Issue の推定と違い解除時刻パースは無罪**（既存の `resets ` アンカーで 19:50 を正しく読む =
+  診断テストで実測）。壊れていたのは検知だけ
+- 直し方は 1 文言の追加ではなく**テンプレートを規則にした**: claude 2.1.258 のバイナリから
+  見出しの組み立て（`` `You've hit your ${限度の名前}${理由}` ``）と限度名の表（`nF` =
+  `session limit` / `weekly limit` / `Opus limit` / `Sonnet limit` / `Fable limit` /
+  `usage credit limit` + 各種 spend limit + `usage limit` / `limit`）を採り、
+  **すべて `limit` で終わる**ことを使って `hit your` の直後（句読点の手前）に `limit` が
+  在るかで判定する。版で名前が増えても追従する。正本は
+  `tako_core::limit_resume::is_limit_exhausted_line` の 1 箇所で、`detect_worker_error` と
+  ステータスバーの両方がここを通る（判定が散ると「復帰は動いたのにメーターは `--`」が再発する）
+- **ステータスバーの `--` も同時に解消**: 上限中はフッターが `5h NN%` を出さないので、
+  見出しから枠を読んで（`session limit` → 5h / `weekly` ・ `Opus` ・ `Sonnet` → 7d）
+  100% を埋める。**フッターに数値があれば実データが勝ち**、枠へ対応づけられない上限
+  （`usage credit limit` / spend limit）は `--` のまま（メーターに嘘を書かない）。
+  走査窓を別に持つ理由は実測の幾何（フッター 6 行 + 入力欄 3 行 + 空行 = 見出しは 10〜15 行上。
+  本体の 8 行窓では届かない）
+- 検証: fmt / clippy（両 feature）/ `cargo test --workspace` 全緑 / Windows クロスチェック
+  エラー 0・警告 12（**全件が未変更ファイル由来** = ベースライン同数）/ 隔離セルフテスト
+  `TAKO_APP_SELF_TEST_OK`（項目 111 に正例 ④ を新設 = 検知・解除時刻・**メーター 100%**・
+  解除前は撃たない・解除後の復帰・**`supervisor.log` への記録**を実測: `audit=0->1`)。
+  **検出力は `TAKO_1093_LEGACY=1` の A/B**（unit 7 本 + 項目 111 が FAILED / 旧文言の
+  回帰テスト 4 本は両アームで緑）
+- 範囲外として申し送り: `You're out of usage credits · resets …` / `Your org is out of usage`
+  は**別テンプレート**なので今回は受けていない（同じ穴が残る）。`paint_and_hold` の POSIX 経路は
+  本文を素の単引用符で囲むので fixture に `'` を入れられない（実バイトの fixture は unit 側が持つ）

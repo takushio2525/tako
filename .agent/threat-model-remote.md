@@ -104,6 +104,48 @@ v0.6.0〜v0.8.1 は UDS（socket 0600 + 親ディレクトリ 0700）のみで�
 - 監査ログにファイル名を含めない（バイト数のみ。ペイン内容と同基準。#287 P2-2）
 - シンボリックリンクの follow を拒否（リンク先への意図しない書き込み防止。#287 P2-4）
 
+### タブ作成 / master 起動 API（#1078）
+
+スマホから**新しいタブとエージェントプロセスを作れる**ようになったので、
+`POST /api/tabs` と `POST /api/tabs/:id/master` は close / resize と同じ **Manage role** を要求する
+（observe / interact は 403。判定は `required_role` の 1 か所で、未知の POST も安全側 Manage へ落ちる）。
+
+- 起動できるのは **PC 側に既に在る master プロファイル**だけ（プロファイル名以外の
+  起動パラメータを HTTP から受けない）。コマンド・モデル・system prompt・env は
+  すべて PC 側の設定から `orchestrator::master_launch` が組み立てる =
+  **スマホから任意コマンドを実行する経路にはならない**
+- 組み立てに失敗する指定（未登録プロファイル / CLI 不在 / 存在しないフォルダ）は
+  **ペインに触る前**に 400 で落ちる（空のタブや `command not found` を残さない）
+- 監査ログ（`<state_dir>/audit.log`）には `tab_new` / `master_launch` と
+  タブ / ペイン / プロファイル名だけを書く。**cwd のパスと起動コマンド本文は書かない**
+  （#287 P2-2 と同基準。起動コマンドには env の並びが載るため）
+- 応答にも起動コマンド本文を入れない（同じ理由）
+- app が「その要求は通らない」と答えたときは **IPC 接続を捨てない**（400 を返す）。
+  捨てると利用者の入力ミスで健全な接続が落ち、次の正当な操作が 503 になる
+
+### Claude 公式 Remote Control への委譲（#1068 / #1069 / #1077）
+
+プロファイルで **opt-in したときだけ** claude の会話が Claude 公式の Remote Control へ繋がる
+（既定 OFF）。委譲した会話は**この脅威モデルの外**へ出る:
+
+| 観点 | tako 自前（この文書の範囲） | 委譲後（その会話だけ） |
+|---|---|---|
+| 経路 | tailnet 内 HTTPS（`tailscale serve` → 127.0.0.1） | Anthropic API 経由（ローカルからの outbound のみ） |
+| 認証 | Tailscale identity + Mac 画面で承認した機器 | claude.ai アカウント |
+| 権限粒度 | role 4 段（observe / interact / manage / admin） | **無い**（そのアカウントでログインした端末は会話を steer できる） |
+| 会話の保存先 | ローカル transcript のみ | **Anthropic サーバーにも保存される** |
+| 無効化 | `tako remote stop` | `disableRemoteControl` 設定 / 組織ポリシー |
+
+- **受容リスク**: 委譲した会話には tako の role が効かない。だから既定 OFF・
+  プロファイル単位の明示 opt-in にしてある（静かに外へ同期させない）
+- tako が出す**ディープリンクは秘密ではない**（開くには claude.ai ログインが必要 = 実測 403）。
+  ただしセッション id は `claude -p --cloud <id>` の宛先になるので、
+  **診断ログ・監査ログに URL と id を書かない**（ペイン内容と同基準。番犬 =
+  `crates/tako-control/tests/remote_link_watchdog.rs`）
+- **委譲するのは会話だけ**。ターミナル画面（柱 2）とファイル（柱 3）は
+  tako の二層認証 + role の中に残す
+- PWA は opt-in を**書き換えない**（有効化はコマンドの提示だけ）。
+  ユーザー設定（`remoteControlAtStartup`）も tako は書かない
 ### ファイル API（柱 3-E。#1079）
 
 `GET /api/files` / `/api/files/content` / `/api/files/download` は、**ペインの画面よりも

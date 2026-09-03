@@ -196,6 +196,86 @@ body {
 .refresh-btn:active { background: var(--panel3); }
 .refresh-btn.spinning svg { animation: spin .8s linear infinite; }
 
+/* master ランチャーの入口（#1078） */
+.panes-header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.launch-btn {
+  height: 40px; flex-shrink: 0;
+  display: inline-flex; align-items: center; gap: 5px; padding: 0 12px;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 600;
+  color: var(--claude); background: rgba(214, 121, 92, .13);
+  border: 1px solid rgba(214, 121, 92, .34); border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.launch-btn:active { background: rgba(214, 121, 92, .22); }
+
+/* ボトムシート（#1078） */
+.sheet-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(0, 0, 0, .55);
+  display: flex; align-items: flex-end;
+}
+.sheet {
+  width: 100%; max-height: 82vh; overflow-y: auto;
+  background: var(--panel); border-top: 1px solid var(--line2);
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 14px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+}
+.sheet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.sheet-title { font-size: 15px; font-weight: 600; color: var(--fg); }
+.sheet-close {
+  width: 32px; height: 32px; font-size: 20px; line-height: 1;
+  color: var(--fg2); background: none; border: none; cursor: pointer;
+}
+.launch-note {
+  margin: 0 0 10px; font-size: 12px; line-height: 1.6; color: var(--fg2);
+  overflow-wrap: anywhere;
+}
+.launch-profile-list { display: flex; flex-direction: column; gap: 8px; }
+.launch-profile {
+  display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 11px 12px; cursor: pointer;
+}
+.launch-profile:disabled { opacity: .5; }
+.launch-profile:active { background: var(--panel3); }
+.launch-profile-main { display: flex; align-items: center; gap: 8px; }
+.launch-profile-name {
+  font-family: var(--mono); font-size: 13.5px; font-weight: 600; color: var(--fg);
+}
+.launch-profile-sub {
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg3);
+  overflow-wrap: anywhere;
+}
+.launch-profile-projects { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.launch-rc-badge {
+  font-family: var(--mono); font-size: 9.5px; font-weight: 600;
+  border: 1px solid transparent; border-radius: 5px; padding: 2px 6px;
+  white-space: nowrap;
+}
+.launch-rc-badge.rc-on {
+  color: var(--claude); background: rgba(214, 121, 92, .15); border-color: rgba(214, 121, 92, .32);
+}
+.launch-rc-badge.rc-off { color: var(--fg3); background: var(--panel3); border-color: var(--line2); }
+.launch-rc-badge.rc-blocked {
+  color: var(--amber); background: rgba(232, 178, 62, .12); border-color: rgba(232, 178, 62, .3);
+}
+
+.launch-waiting {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12.5px; color: var(--fg2); padding: 10px 0;
+}
+.launch-result-head { margin-bottom: 10px; }
+.launch-result-title { display: block; font-size: 14px; font-weight: 600; color: var(--fg); }
+.launch-result-sub {
+  display: block; margin-top: 3px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg3);
+}
+.launch-result-actions { display: flex; gap: 8px; margin-top: 12px; }
+.launch-result-actions .btn { flex: 1; }
+
 .filter-row {
   display: flex; gap: 7px; overflow-x: auto;
   scrollbar-width: none; -webkit-overflow-scrolling: touch;
@@ -372,6 +452,60 @@ body {
   font-size: 11px;
   background: var(--panel2); border: 1px dashed var(--line2);
   border-radius: 9px; padding: 14px 12px;
+}
+
+/* Claude 公式 Remote Control への送り出し（#1077） */
+.card-chip-account { color: var(--claude); border-color: rgba(214, 121, 92, .3); }
+
+.remote-link-row { padding: 0 13px 10px 17px; }
+.remote-link-row.connected { padding-bottom: 12px; }
+
+/* 「Claude で開く」— 繋がっているときだけ出る唯一の押せる操作 */
+.claude-open {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 600;
+  color: var(--claude); text-decoration: none;
+  background: rgba(214, 121, 92, .13);
+  border: 1px solid rgba(214, 121, 92, .34);
+  border-radius: 9px; padding: 9px 12px;
+}
+.claude-open-block { width: 100%; }
+.claude-open:active { background: rgba(214, 121, 92, .22); }
+
+/* 未接続のたたんだ 1 行（タップで理由を開く） */
+.remote-link-toggle {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; text-align: left;
+  background: var(--panel2); border: 1px dashed var(--line2);
+  border-radius: 9px; padding: 7px 10px;
+  font-family: var(--sans); font-size: 11.5px; color: var(--fg2);
+}
+.remote-link-state { display: inline-flex; align-items: center; gap: 6px; }
+.remote-link-more { font-size: 11px; color: var(--fg3); flex-shrink: 0; }
+
+.remote-link-reason {
+  margin-top: 7px; padding: 9px 11px;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.remote-link-why, .remote-link-next {
+  margin: 0; font-size: 11.5px; line-height: 1.55; color: var(--fg2);
+  overflow-wrap: anywhere;
+}
+.remote-link-next { margin-top: 6px; color: var(--fg3); }
+.remote-link-cmd {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 8px; padding: 7px 9px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+}
+.remote-link-cmd code {
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--fg);
+  white-space: pre-wrap; word-break: break-all; min-width: 0; flex: 1;
+}
+.remote-link-copy {
+  flex-shrink: 0; font-family: var(--sans); font-size: 10.5px; font-weight: 600;
+  color: var(--fg2); background: var(--panel3);
+  border: 1px solid var(--line2); border-radius: 6px; padding: 4px 8px;
 }
 
 .pane-card-footer {
@@ -1104,6 +1238,75 @@ body {
   background: #92400e; color: #fff; padding: 8px 14px;
   font-size: 13px; display: flex; align-items: center;
   justify-content: space-between; gap: 10px;
+}
+
+/* ============================================================
+   SSH の切り替え / 新規接続（#1080）
+   ============================================================ */
+
+/* ヘッダの入口。chat/term トグルと同じ高さ・同じ字面に揃える */
+.pane-header-ssh {
+  font-family: var(--mono); font-size: 11px;
+  padding: 6px 11px; border-radius: 9px;
+  background: var(--panel2); border: 1px solid var(--line);
+  color: var(--fg3); cursor: pointer; flex-shrink: 0;
+  transition: background .12s, color .12s;
+}
+.pane-header-ssh:active { background: var(--panel3); color: var(--fg); }
+
+/* 接続状態バー。失敗しても消えないので、読める色で置き続ける（#919 / #1040） */
+.ssh-bar {
+  flex: none;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 12px;
+}
+.ssh-bar-head {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+}
+.ssh-bar-label { font-weight: 600; flex-shrink: 0; }
+.ssh-bar-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--fg3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ssh-bar-reason,
+.ssh-bar-next {
+  margin-top: 5px; font-size: 11px;
+  color: var(--fg2); word-break: break-word;
+}
+.ssh-bar-next { color: var(--fg3); }
+.ssh-bar-wait { border-left: 3px solid var(--amber); }
+.ssh-bar-wait .ssh-bar-label { color: var(--amber); }
+.ssh-bar-bad { border-left: 3px solid var(--red); }
+.ssh-bar-bad .ssh-bar-label { color: var(--red); }
+.ssh-bar-spinner {
+  width: 13px; height: 13px; flex: none;
+  border: 2px solid var(--line2);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+/* シート内 */
+.ssh-target-desc {
+  font-size: 11px; color: var(--fg3); margin-top: 8px;
+}
+.ssh-target-blocked {
+  margin-top: 8px; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 11px;
+  background: var(--panel2);
+  font-size: 11px; color: var(--fg2); line-height: 1.5;
+}
+.ssh-host-list { max-height: 46vh; overflow-y: auto; }
+.ssh-sheet-empty {
+  display: flex; align-items: center; justify-content: center;
+  padding: 22px 0; color: var(--fg3); font-size: 12px;
+}
+.ssh-sheet-error {
+  padding: 9px 11px; margin-bottom: 9px;
+  border: 1px solid var(--red); border-radius: 11px;
+  color: var(--red); font-size: 11px; line-height: 1.5;
 }
 
 /* ============================================================

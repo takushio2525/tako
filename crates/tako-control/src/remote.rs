@@ -747,7 +747,7 @@ fn check_admin(ctx: &DaemonCtx, request: &tiny_http::Request) -> bool {
 
 /// daemon から tako-app の IPC ソケットへ接続し、Request を dispatch 経由で実行する。
 /// discovery::read_candidates で接続情報を自動発見する
-struct AppIpcClient {
+pub(crate) struct AppIpcClient {
     socket: String,
     token: String,
 }
@@ -772,102 +772,110 @@ impl AppIpcClient {
     }
 
     /// IPC に Request を送り、結果を返す
-    fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
-        Self::roundtrip_raw(&self.socket, &self.token, request).map_err(|e| e.into_message())
-    }
-
-    /// 失敗の**種別つき**で送る（#1084）。
-    ///
-    /// 業務エラー（dispatch が理由つきで断った）と伝送エラー（app へ届かない）を
-    /// 区別したい呼び出し口だけが使う。既存の呼び出しは `request` のまま
-    fn request_typed(&self, request: crate::protocol::Request) -> Result<Value, AppCallError> {
+    pub(crate) fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
         Self::roundtrip_raw(&self.socket, &self.token, request)
     }
 
-    #[cfg(unix)]
-    fn roundtrip_raw(
+    /// 失敗の**種別つき**で送る（#1078）。
+    ///
+    /// app が「その要求は通らない」と答えた（存在しないフォルダ・消えたペイン等）のと、
+    /// 通信そのものが失敗したのを区別する。前者で接続を捨てると
+    /// **健全な IPC 接続を利用者の入力ミスで落とす**ことになる
+    fn request_checked(&self, request: crate::protocol::Request) -> Result<Value, AppCallError> {
+        Self::roundtrip_checked(&self.socket, &self.token, request)
+    }
+
+    /// [`Self::roundtrip_raw`] の種別つき版。**同じワイヤ経路**を通す
+    /// （`roundtrip_raw` は業務エラーも文字列へ潰すので、そこだけ分けて持つ）
+    fn roundtrip_checked(
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
     ) -> Result<Value, AppCallError> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-
-        let stream = UnixStream::connect(socket).map_err(|e| {
-            AppCallError::transport(format!("tako app へ接続できない ({socket}): {e}"))
-        })?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .ok();
-        let mut writer = stream
-            .try_clone()
-            .map_err(|e| AppCallError::transport(format!("接続の複製に失敗: {e}")))?;
-        let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
-        let json = serde_json::to_string(&envelope)
-            .map_err(|e| AppCallError::transport(format!("リクエストの構築に失敗: {e}")))?;
-        writeln!(writer, "{json}")
-            .map_err(|e| AppCallError::transport(format!("送信に失敗: {e}")))?;
-
-        let mut line = String::new();
-        BufReader::new(stream)
-            .read_line(&mut line)
-            .map_err(|e| AppCallError::transport(format!("応答の受信に失敗: {e}")))?;
-        if line.is_empty() {
-            return Err(AppCallError::transport("tako app から応答が返らなかった"));
+        match Self::roundtrip_detailed(socket, token, request) {
+            Ok(Ok(v)) => Ok(v),
+            // app が答えた = 接続は健全
+            Ok(Err(e)) => Err(AppCallError::Rejected {
+                code: e.code,
+                message: e.message,
+            }),
+            Err(e) => Err(AppCallError::Transport(e)),
         }
-        let response: crate::protocol::ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|e| AppCallError::transport(format!("応答を解釈できない: {e}")))?;
-        if let Some(error) = response.error {
-            // **ここは伝送の失敗ではない**（app は生きていて理由つきで断った）
-            return Err(AppCallError::Dispatch(error.message));
-        }
-        Ok(response.result.unwrap_or(Value::Null))
     }
 
-    #[cfg(not(unix))]
+    /// 業務エラーも文字列へ潰す版（既存の呼び出し元はこちら。挙動は不変）。
+    /// **ワイヤ処理は [`Self::roundtrip_detailed`] の 1 実装**（2 つ持つと片方だけ直る）
     fn roundtrip_raw(
-        _socket: &str,
-        _token: &str,
-        _request: crate::protocol::Request,
-    ) -> Result<Value, AppCallError> {
-        Err(AppCallError::transport("Windows の IPC は未実装"))
-    }
-}
-
-/// app 呼び出しの失敗の種別（#1084）。
-///
-/// **業務エラーで IPC 接続を捨てると次の 5 秒間 file API が 503 になる**
-/// （`IPC_RECONNECT_INTERVAL`）。dispatch は競合・プレビューでない・保存できない等を
-/// 理由つきで断るので、書き込み経路ではこれが日常的に起きる（#1084 の実 SSH 検証で実測）。
-/// 種別を分けて「届かなかったときだけ」接続を捨てる
-#[derive(Debug)]
-enum AppCallError {
-    /// app へ届かなかった（接続・送受信・応答の解釈）
-    Transport(String),
-    /// app は答えたが dispatch が断った（理由つき）。
-    ///
-    /// **非 unix では作られない**: daemon → app の IPC（`roundtrip_raw`）が
-    /// unix だけの実装で、Windows では「未実装」を伝送エラーとして返すため
-    /// （= remote daemon から app へ届く経路そのものが無い）。
-    /// 実装が入れば自然に使われるので、種別ごと消さずに残す
-    #[cfg_attr(not(unix), allow(dead_code))]
-    Dispatch(String),
-}
-
-impl AppCallError {
-    fn transport(message: impl Into<String>) -> Self {
-        Self::Transport(message.into())
+        socket: &str,
+        token: &str,
+        request: crate::protocol::Request,
+    ) -> Result<Value, String> {
+        match Self::roundtrip_detailed(socket, token, request) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e.message),
+            Err(e) => Err(e),
+        }
     }
 
-    fn into_message(self) -> String {
-        match self {
-            Self::Transport(m) | Self::Dispatch(m) => m,
+    /// 外側 `Result` = 通信、内側 = app の応答（#1078）
+    fn roundtrip_detailed(
+        socket: &str,
+        token: &str,
+        request: crate::protocol::Request,
+    ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
+        #[cfg(unix)]
+        {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixStream;
+
+            let stream = UnixStream::connect(socket)
+                .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
+            let mut writer = stream
+                .try_clone()
+                .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+            let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
+            let json = serde_json::to_string(&envelope)
+                .map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
+            writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+            if line.is_empty() {
+                return Err("tako app から応答が返らなかった".into());
+            }
+            let response: crate::protocol::ResponseEnvelope =
+                serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+            match response.error {
+                Some(error) => Ok(Err(error)),
+                None => Ok(Ok(response.result.unwrap_or(Value::Null))),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (socket, token, request);
+            Err("Windows の IPC は未実装".into())
         }
     }
 }
 
-/// daemon 起動中に保持する IPC 接続状態。定期的に再接続を試みる
-struct AppConnection {
+/// daemon → app の呼び出しが失敗した理由（#1078）
+enum AppCallError {
+    /// app が「その要求は通らない」と答えた（**接続は健全なので捨てない**）
+    Rejected { code: i64, message: String },
+    /// 通信そのものの失敗（接続を捨てて次回張り直す）
+    Transport(String),
+}
+
+/// daemon 起動中に保持する IPC 接続状態。定期的に再接続を試みる。
+///
+/// `pub(crate)`: 柱ごとのルート実装を別モジュールへ切り出している（#1080 の
+/// `remote_ssh` 等）ので、そこから同じ接続を通せる必要がある
+pub(crate) struct AppConnection {
     client: Option<AppIpcClient>,
     last_attempt: std::time::Instant,
 }
@@ -883,7 +891,7 @@ impl AppConnection {
     }
 
     /// 接続中の IPC クライアントを返す。未接続なら定期的に再接続を試みる
-    fn get(&mut self) -> Option<&AppIpcClient> {
+    pub(crate) fn get(&mut self) -> Option<&AppIpcClient> {
         if self.client.is_none() && self.last_attempt.elapsed() >= IPC_RECONNECT_INTERVAL {
             self.client = AppIpcClient::connect();
             self.last_attempt = std::time::Instant::now();
@@ -892,7 +900,7 @@ impl AppConnection {
     }
 
     /// IPC 接続に失敗したら切断状態にする（次の get() で再接続を試みる）
-    fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.client = None;
         self.last_attempt = std::time::Instant::now();
     }
@@ -1431,6 +1439,11 @@ fn probe_serve(base_url: &str, timeout: std::time::Duration) -> ServeReachabilit
 /// XFF/XFH 偽装の攻撃経路が構造的に消滅する。
 /// Tailscale が未セットアップなら不足項目を列挙して起動を拒否する
 pub fn run_daemon() -> io::Result<()> {
+    // #1077: daemon は表示言語を初期化していなかったため、応答に載る `Note` 由来の文言
+    // （Remote Control の理由・次の一手）が設定と無関係に英語で凍っていた
+    // （`CURRENT` の静的既定が En。#983 で CLI 側が踏んだのと同じ形）。
+    // 他の経路が使っている 1 行と同じ形で揃える
+    tako_core::i18n::set_lang(crate::settings::load().lang_setting().resolve());
     // P0-3: state ディレクトリを 0700 で確保する（UDS の bind 先にもなる）
     ensure_state_dir()?;
     let spec = endpoint_spec().map_err(io::Error::other)?;
@@ -3267,24 +3280,28 @@ fn extract_pane_target(path: &str) -> Option<String> {
 
 // --- dispatch 統合版ハンドラ（#281 H-7）---
 
-/// tako app へ IPC で 1 往復する（#1079: ファイル API がツリールートを問い合わせる経路）。
-/// 失敗したら接続を落として次回の再接続に任せる
+/// tako app へ IPC で 1 往復する（#1079: ファイル API が app へ問い合わせる経路）。
+///
+/// **届かなかったときだけ**接続を落として次回の再接続に任せる（#1084）。
+/// app が理由つきで断っただけで捨てると、`IPC_RECONNECT_INTERVAL`（5 秒）のあいだ
+/// ファイル API がまるごと 503 になる = **保存の競合 1 回で読み出しまで死ぬ**
+/// （実 SSH の通し検証で 7 連続 503 を実測）。書き込み経路では dispatch が
+/// 「競合」「プレビューでない」「保存できない」を日常的に返すので、
+/// #1078 が用意した種別つきの経路（`request_checked`）を通す
 fn app_request(
     app_conn: &Arc<RwLock<AppConnection>>,
     req: crate::protocol::Request,
 ) -> Result<Value, String> {
     let mut conn = app_conn.write().map_err(|_| "内部エラー".to_string())?;
     let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
-    match client.request_typed(req) {
+    match client.request_checked(req) {
         Ok(v) => Ok(v),
-        // **届かなかったときだけ**接続を捨てる（#1084）。dispatch が理由つきで断った
-        // だけで捨てると、`IPC_RECONNECT_INTERVAL`（5 秒）のあいだ file API が
-        // まるごと 503 になる（保存の競合 1 回で読み出しまで死ぬ）
+        // app が答えた = 接続は健全。理由だけ返す
+        Err(AppCallError::Rejected { message, .. }) => Err(message),
         Err(AppCallError::Transport(e)) => {
             conn.invalidate();
             Err(e)
         }
-        Err(AppCallError::Dispatch(e)) => Err(e),
     }
 }
 
@@ -3441,7 +3458,12 @@ fn attach_remote_links(result: &mut Value) {
         }
         let session_id = pane["session_id"].as_str();
         let link = crate::claude_remote_link::link_for_agent_session(agent, session_id);
-        pane["remote_link"] = link.to_json();
+        // #1077: 案内コマンドを具体形で出すために opt-in の所在を role から解く
+        // （master / solo は設定ファイルの置き場が別なので混ぜられない）
+        let hint = crate::claude_remote_link::ProfileHint::from_role(
+            pane["role"].as_str().unwrap_or_default(),
+        );
+        pane["remote_link"] = link.to_json_with_profile(hint);
     }
 }
 
@@ -3921,6 +3943,9 @@ fn handle_request_v2(
                 });
                 // #1069: 公式リンク（claude.ai/code）。繋がっていなければ理由が入る
                 attach_remote_links(&mut result);
+                // #1080: SSH の接続状態（#1010 / #1040）と「このペインを SSH 化できるか」
+                // （#1006 の判定）。判定は list の答えをそのまま運ぶ（作り直さない）
+                crate::remote_ssh::attach_ssh_state(&mut result, &list);
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
             None => {
@@ -3932,6 +3957,8 @@ fn handle_request_v2(
                 });
                 // #1069: app 不在の経路でも同じ 1 実装を通す（値が食い違わない）
                 attach_remote_links(&mut result);
+                // #1080: 接続は app 経由でしかできないので、押せない理由を先に出す
+                crate::remote_ssh::attach_app_unavailable(&mut result);
                 return respond_sensitive(request, 200, Some(result.to_string()));
             }
         }
@@ -3955,11 +3982,24 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
     if path.starts_with("/api/devices") {
         return DeviceRole::Admin;
     }
+    // SSH 系（#1080）は読み書きとも Manage。一覧が GET なのに Observe でないのは、
+    // ①`~/.ssh/config` の Host 名・user・port は画面に映らない**別の在庫情報**で、
+    // 画面を見るだけの端末へ配る理由が無い ②一覧の用途は接続（= Manage）だけなので、
+    // 押せない端末に見せても操作できない選択肢が並ぶだけ
+    if path == "/api/ssh-hosts" || path == "/api/ssh" || path.ends_with("/ssh") {
+        return DeviceRole::Manage;
+    }
     if *method == tiny_http::Method::Post {
         if path.ends_with("/input") || path.ends_with("/respond") || path == "/api/upload" {
             return DeviceRole::Interact;
         }
         if path.ends_with("/close") || path.ends_with("/resize") {
+            return DeviceRole::Manage;
+        }
+        // #1078: タブとプロセスを作る = close / resize より強い操作なので Manage。
+        // 未知の POST も安全側で Manage に落ちるが、**意図であることを明示**しておく
+        // （後から Interact へ緩めるときに、うっかりではなく判断として行われるように）
+        if path == "/api/tabs" || (path.starts_with("/api/tabs/") && path.ends_with("/master")) {
             return DeviceRole::Manage;
         }
         // #1084 / #1085: ファイル API の書き込み（保存 / 送り直し）は `/api/upload` と
@@ -4125,6 +4165,53 @@ fn handle_admin_api(
     }
 }
 
+/// SSH 接続を開くルートの共通処理（#1080）。
+///
+/// `path_pane` = `POST /api/panes/:id/ssh` の :id（`POST /api/ssh` なら None）。
+/// 判断は `remote_ssh` の純粋関数、実行は dispatch の `OpenRemote`（#1006）で、
+/// ここは**読み取り・監査・応答の接着だけ**
+fn handle_ssh_open(
+    mut request: tiny_http::Request,
+    path_pane: Option<u64>,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    app_conn: &Arc<RwLock<AppConnection>>,
+) {
+    // ボディ無し（`POST /api/panes/:id/ssh` にホストだけ URL で渡す形は無い）は 400
+    let parsed = match read_json_body(&mut request) {
+        Ok(v) => v,
+        Err(e) => {
+            return respond(request, 400, Some(json!({ "error": e }).to_string()));
+        }
+    };
+    let open = match crate::remote_ssh::parse_open_request(&parsed, path_pane) {
+        Ok(v) => v,
+        Err(e) => {
+            return respond(
+                request,
+                e.status,
+                Some(json!({ "error": e.message }).to_string()),
+            );
+        }
+    };
+    // 監査には**何をどこへ開こうとしたか**を残す。ホスト名は接続先そのものなので
+    // 記録する（ペインの中身・送信テキストとは別種の情報）
+    ctx.registry.lock().unwrap().audit(
+        "ssh_open",
+        &device.id,
+        &device.name,
+        json!({
+            "host": open.host,
+            "target": open.target.as_str(),
+            "pane": open.pane,
+        }),
+    );
+    match crate::remote_ssh::open_remote(app_conn, &open) {
+        Ok(v) => respond(request, 200, Some(v.to_string())),
+        Err((status, e)) => respond(request, status, Some(json!({ "error": e }).to_string())),
+    }
+}
+
 /// 認可済みリクエストの API ルーティング（従来の handle_request_v2 後段）
 #[allow(clippy::too_many_arguments)]
 fn handle_api_v2_routes(
@@ -4143,6 +4230,38 @@ fn handle_api_v2_routes(
             // v1: 従来の tmux 直接一覧（後方互換）
             let result = tmux_list_panes(tmux_socket);
             respond(request, 200, Some(result.to_string()))
+        }
+        // --- SSH の切り替え / 新規接続（#1080。実装は remote_ssh.rs）---
+        (tiny_http::Method::Get, "/api/ssh-hosts") => {
+            match crate::remote_ssh::list_hosts(app_conn) {
+                Ok(v) => respond_sensitive(request, 200, Some(v.to_string())),
+                Err((status, e)) => {
+                    respond(request, status, Some(json!({ "error": e }).to_string()))
+                }
+            }
+        }
+        (tiny_http::Method::Post, "/api/ssh") => {
+            handle_ssh_open(request, None, ctx, device, app_conn)
+        }
+        (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/ssh") => {
+            let Some(pane_param) = extract_pane_target(p) else {
+                return respond(
+                    request,
+                    400,
+                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
+                );
+            };
+            let Ok(pane_id) = pane_param.parse::<u64>() else {
+                return respond(
+                    request,
+                    400,
+                    Some(
+                        json!({ "error": "SSH の対象は数値ペイン ID のみ（一覧の id を渡す）" })
+                            .to_string(),
+                    ),
+                );
+            };
+            handle_ssh_open(request, Some(pane_id), ctx, device, app_conn)
         }
         (tiny_http::Method::Get, "/api/agents") => {
             match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
@@ -4455,6 +4574,15 @@ fn handle_api_v2_routes(
         (tiny_http::Method::Post, "/api/upload") => {
             handle_upload(request, ctx, device, pane_mapping)
         }
+        // --- #1078: スマホから「新しいタブ + master 起動」---
+        // 一覧（Observe）: どのプロファイルで立てられるか + Remote Control の opt-in 状態
+        (tiny_http::Method::Get, "/api/master/profiles") => handle_master_profiles(request),
+        // タブ作成（Manage）: `TabNew` を dispatch する
+        (tiny_http::Method::Post, "/api/tabs") => handle_tab_new(request, ctx, device, app_conn),
+        // そのタブで master を起動（Manage）
+        (tiny_http::Method::Post, p) if p.starts_with("/api/tabs/") && p.ends_with("/master") => {
+            handle_tab_master(request, ctx, device, app_conn, p)
+        }
         // #1079: ファイル API（一覧 / プレビュー / ダウンロード）と
         // #1084 / #1085 の書き込み（保存 / 送り直し）。実装は `remote_files` に
         // 閉じてあり、ここは受け渡しだけ（メソッドの振り分けも向こう側）
@@ -4478,6 +4606,236 @@ fn handle_api_v2_routes(
             404,
             Some(json!({ "error": "API エンドポイントが見つからない" }).to_string()),
         ),
+    }
+}
+
+/// `/api/tabs/<id>/master` から タブ id を取り出す
+fn extract_tab_id(path: &str) -> Option<u64> {
+    path.strip_prefix("/api/tabs/")?
+        .strip_suffix("/master")?
+        .parse::<u64>()
+        .ok()
+}
+
+/// GET /api/master/profiles: master プロファイルの一覧（#1078）
+///
+/// **`tako orchestrator profiles list` と同じ 1 実装**（`dispatch_orchestrator_profiles`）を
+/// 通すので、スマホが見る選択肢と AI / GUI が見る値が食い違わない。
+/// ファイル直読みなので tako app が起動していなくても引ける（Observe role）
+fn handle_master_profiles(request: tiny_http::Request) {
+    let params = crate::dispatch::ProfilesParams {
+        action: "list".into(),
+        kind: Some("master".into()),
+        ..Default::default()
+    };
+    match crate::dispatch::dispatch_orchestrator_profiles(params) {
+        Ok(v) => respond(request, 200, Some(v.to_string())),
+        Err(e) => respond(
+            request,
+            500,
+            Some(json!({ "error": e.to_string() }).to_string()),
+        ),
+    }
+}
+
+/// POST /api/tabs: 新しいタブを作る（#1078。Manage role）
+///
+/// ボディは `{ "cwd": "<パス>" }`（省略可）。cwd の検査は `TabNew` の dispatch 側が正
+/// （存在しない / フォルダでないは 400 相当で返る）。
+/// **タブを作るだけ**で、master を立てるのは `/api/tabs/:id/master`
+fn handle_tab_new(
+    mut request: tiny_http::Request,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    app_conn: &Arc<RwLock<AppConnection>>,
+) {
+    let parsed = match read_json_body(&mut request) {
+        Ok(v) => v,
+        Err(e) => return respond(request, 400, Some(json!({ "error": e }).to_string())),
+    };
+    let cwd = parsed["cwd"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    ctx.registry.lock().unwrap().audit(
+        "tab_new",
+        &device.id,
+        &device.name,
+        // パスは監査ログへ書かない（#287 P2-2 と同基準）。指定の有無だけ残す
+        json!({ "cwd_given": cwd.is_some() }),
+    );
+    let req = crate::protocol::Request::TabNew {
+        title: None,
+        // スマホから作ったタブは Mac 画面でも前に出す（受け入れ条件 ④ の「Mac 画面にも出る」を
+        // 見つけやすくする。close / resize と同じ Manage 権限の範囲）
+        focus: Some(true),
+        cwd,
+    };
+    match app_dispatch(app_conn, req, "リモートからのタブ作成") {
+        Ok(v) => respond(request, 200, Some(v.to_string())),
+        Err((status, e)) => respond(request, status, Some(json!({ "error": e }).to_string())),
+    }
+}
+
+/// POST /api/tabs/:id/master: そのタブで master を起動する（#1078。Manage role）
+///
+/// ボディは `{ "profile": "<名前>" }`（省略時 `default`）。
+///
+/// **組み立て（プロファイル検証 / system prompt / 起動コマンド / role）は
+/// `orchestrator::master_launch` が正**で、CLI の `tako master` と同じ順・同じ検証を通る。
+/// ここがやるのは「どのペインへ流すか」と流し込みだけ。
+/// 組み立てに失敗したらペインには何もしない（`command not found` を出さない = #983）
+fn handle_tab_master(
+    mut request: tiny_http::Request,
+    ctx: &Arc<DaemonCtx>,
+    device: &crate::remote_auth::Device,
+    app_conn: &Arc<RwLock<AppConnection>>,
+    path: &str,
+) {
+    let Some(tab_id) = extract_tab_id(path) else {
+        return respond(
+            request,
+            400,
+            Some(json!({ "error": "無効なタブ ID" }).to_string()),
+        );
+    };
+    let parsed = match read_json_body(&mut request) {
+        Ok(v) => v,
+        Err(e) => return respond(request, 400, Some(json!({ "error": e }).to_string())),
+    };
+    let profile = parsed["profile"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string();
+
+    // 組み立て（ペインに触る前）。プロファイル不正・CLI 不在はここで 400 になる
+    let plan = match crate::orchestrator::master_launch::plan(&profile) {
+        Ok(p) => p,
+        Err(e) => return respond(request, 400, Some(json!({ "error": e }).to_string())),
+    };
+
+    // 流し先のペイン = そのタブのフォーカスペイン（新しいタブなら初期ペイン 1 枚）
+    let list = match app_dispatch(
+        app_conn,
+        crate::protocol::Request::List,
+        "リモートからの master 起動",
+    ) {
+        Ok(v) => v,
+        Err((status, e)) => {
+            return respond(request, status, Some(json!({ "error": e }).to_string()))
+        }
+    };
+    let Some(pane_id) = focused_pane_of_tab(&list, tab_id) else {
+        return respond(
+            request,
+            404,
+            Some(json!({ "error": format!("タブ {tab_id} が見つからない") }).to_string()),
+        );
+    };
+
+    ctx.registry.lock().unwrap().audit(
+        "master_launch",
+        &device.id,
+        &device.name,
+        json!({ "tab": tab_id, "pane": pane_id, "profile": plan.profile_name }),
+    );
+
+    // role を貼る（先に貼るので、コマンドが走り出した時点で master として見える）
+    if let Err((status, e)) = app_dispatch(
+        app_conn,
+        crate::protocol::Request::Title {
+            pane: Some(pane_id),
+            title: None,
+            role: Some(plan.pane_role.clone()),
+        },
+        "リモートからの master 起動",
+    ) {
+        return respond(request, status, Some(json!({ "error": e }).to_string()));
+    }
+    // タブ名も CLI と同じ形にする（`master` / `master-<名前>`）
+    let _ = app_dispatch(
+        app_conn,
+        crate::protocol::Request::TabRename {
+            tab: Some(tab_id),
+            pane: None,
+            title: plan.tab_title.clone(),
+            source: None,
+        },
+        "リモートからの master 起動",
+    );
+    // 起動コマンドを流す（CLI の `tako master` と同じ `Send`）
+    if let Err((status, e)) = app_dispatch(
+        app_conn,
+        crate::protocol::Request::Send {
+            pane: Some(pane_id),
+            text: plan.command.clone(),
+            newline: true,
+            tmux_session: None,
+            await_prompt: false,
+        },
+        "リモートからの master 起動",
+    ) {
+        return respond(request, status, Some(json!({ "error": e }).to_string()));
+    }
+
+    let mut body = plan.to_json();
+    body["tab"] = json!(tab_id);
+    body["pane"] = json!(pane_id);
+    body["ok"] = json!(true);
+    respond(request, 200, Some(body.to_string()))
+}
+
+/// タブ id からそのタブのフォーカスペインを解く（`List` の応答を読むだけ）。
+/// フォーカス情報が無いタブでは先頭ペインへ落とす（新しいタブは 1 枚しかない）
+fn focused_pane_of_tab(list: &Value, tab_id: u64) -> Option<u64> {
+    let tab = list["tabs"]
+        .as_array()?
+        .iter()
+        .find(|t| t["id"].as_u64() == Some(tab_id))?;
+    let panes = tab["panes"].as_array()?;
+    panes
+        .iter()
+        .find(|p| p["focused"].as_bool() == Some(true))
+        .or_else(|| panes.first())
+        .and_then(|p| p["id"].as_u64())
+}
+
+/// IPC 経由で任意の dispatch を呼ぶ（#1078）。
+///
+/// 失敗の対応は 3 通り: app 不在 = 503 / **app が拒否 = 400（接続は捨てない）** /
+/// 通信失敗 = 502 + 接続を捨てる。`what` は 503 のエラー文に混ぜる用途。
+/// 既存の `dispatch_input` / `dispatch_respond` / `dispatch_close` は
+/// 拒否と通信失敗をまとめて 502 にするが（#425 が「ダイアログ不在」だけ 409 へ分けた形）、
+/// ここは新規経路なので最初から分けている
+fn app_dispatch(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    request: crate::protocol::Request,
+    what: &str,
+) -> Result<Value, (u16, String)> {
+    let mut conn = app_conn
+        .write()
+        .map_err(|_| (500u16, "内部エラー".to_string()))?;
+    let client = conn.get().ok_or((
+        503u16,
+        format!("tako app が稼働していない（{what}は app 経由のみ）"),
+    ))?;
+    match client.request_checked(request) {
+        Ok(v) => Ok(v),
+        // app が拒否した = 頼み方が悪い（存在しないフォルダ等）。
+        // **接続は健全なので捨てない**（利用者の入力ミスで IPC を落とさない）
+        Err(AppCallError::Rejected { code, message }) => {
+            let status = if code == crate::protocol::error_code::INTERNAL {
+                500
+            } else {
+                400
+            };
+            Err((status, message))
+        }
+        Err(AppCallError::Transport(e)) => {
+            conn.invalidate();
+            Err((502, e))
+        }
     }
 }
 
@@ -5279,7 +5637,8 @@ mod tests {
     fn dispatchが断っただけでipc接続を捨てない() {
         // #1084 の実 SSH 検証で踏んだ回帰: 業務エラー（競合・プレビューでない・
         // 保存できない）で `invalidate()` すると `IPC_RECONNECT_INTERVAL`（5 秒）の
-        // あいだ file API がまるごと 503 になる。**保存の競合 1 回で読み出しまで死ぬ**
+        // あいだファイル API がまるごと 503 になる。**保存の競合 1 回で読み出しまで死ぬ**。
+        // 種別つきの経路（#1078 の `request_checked`）を通していることを固定する
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
@@ -5318,19 +5677,22 @@ mod tests {
             socket: sock.display().to_string(),
             token: "t".into(),
         };
-        match client.request_typed(crate::protocol::Request::List) {
-            Err(AppCallError::Dispatch(m)) => {
-                assert!(m.contains("外部で変更"), "理由がそのまま届く: {m}");
+        match client.request_checked(crate::protocol::Request::List) {
+            Err(AppCallError::Rejected { message, .. }) => {
+                assert!(
+                    message.contains("外部で変更"),
+                    "理由がそのまま届く: {message}"
+                );
             }
-            other => panic!("dispatch エラーとして分類されない: {:?}", other.is_ok()),
+            _ => panic!("app が答えた失敗として分類されない"),
         }
         // 同じ接続情報でもう一度通る（= 捨てる理由が無い）
         assert!(
             matches!(
-                client.request_typed(crate::protocol::Request::List),
-                Err(AppCallError::Dispatch(_))
+                client.request_checked(crate::protocol::Request::List),
+                Err(AppCallError::Rejected { .. })
             ),
-            "2 回目も dispatch エラーとして届く"
+            "2 回目も app の応答として届く"
         );
         let _ = server.join();
 
@@ -5341,7 +5703,7 @@ mod tests {
         };
         assert!(
             matches!(
-                dead.request_typed(crate::protocol::Request::List),
+                dead.request_checked(crate::protocol::Request::List),
                 Err(AppCallError::Transport(_))
             ),
             "接続できない相手は伝送エラー"
@@ -5397,6 +5759,17 @@ mod tests {
             required_role(&Method::Post, "/api/panes/s:0.0/resize"),
             DeviceRole::Manage
         );
+        // SSH の一覧・接続は Manage（#1080）。一覧が GET でも Observe に落とさない:
+        // `~/.ssh/config` の在庫は画面に映らない別種の情報で、押せない端末に見せる理由も無い
+        assert_eq!(
+            required_role(&Method::Get, "/api/ssh-hosts"),
+            DeviceRole::Manage
+        );
+        assert_eq!(required_role(&Method::Post, "/api/ssh"), DeviceRole::Manage);
+        assert_eq!(
+            required_role(&Method::Post, "/api/panes/648/ssh"),
+            DeviceRole::Manage
+        );
         // 端末管理は Admin
         assert_eq!(
             required_role(&Method::Get, "/api/devices"),
@@ -5410,6 +5783,20 @@ mod tests {
         assert_eq!(
             required_role(&Method::Post, "/api/upload"),
             DeviceRole::Interact
+        );
+        // #1078: タブとプロセスを作る操作は Manage（observe / interact では 403）
+        assert_eq!(
+            required_role(&Method::Post, "/api/tabs"),
+            DeviceRole::Manage
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/tabs/7/master"),
+            DeviceRole::Manage
+        );
+        // プロファイルの一覧は読み取りだけなので Observe
+        assert_eq!(
+            required_role(&Method::Get, "/api/master/profiles"),
+            DeviceRole::Observe
         );
         // 未知の POST は安全側（Manage）
         // #1079: ファイル API は GET でも Interact（読み出し = 持ち出し）
@@ -6527,5 +6914,41 @@ mod tests {
         assert!(!protocols
             .split(',')
             .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL)));
+    }
+
+    // --- #1078: スマホから「新しいタブ + master 起動」---
+
+    #[test]
+    fn タブ_id_を経路から取り出す() {
+        assert_eq!(extract_tab_id("/api/tabs/7/master"), Some(7));
+        assert_eq!(extract_tab_id("/api/tabs/12/master"), Some(12));
+        // 形が違うものは受けない（誤ったタブへ master を立てない）
+        assert_eq!(extract_tab_id("/api/tabs//master"), None);
+        assert_eq!(extract_tab_id("/api/tabs/abc/master"), None);
+        assert_eq!(extract_tab_id("/api/tabs/7"), None);
+        assert_eq!(extract_tab_id("/api/tabs"), None);
+        assert_eq!(extract_tab_id("/api/panes/7/master"), None);
+    }
+
+    #[test]
+    fn タブのフォーカスペインを解く() {
+        let list = json!({
+            "tabs": [
+                { "id": 1, "panes": [
+                    { "id": 10, "focused": false },
+                    { "id": 11, "focused": true },
+                ]},
+                // 新しいタブは 1 枚だけ（focused が付かない場合もある）
+                { "id": 2, "panes": [{ "id": 20, "focused": false }]},
+                { "id": 3, "panes": []},
+            ]
+        });
+        assert_eq!(focused_pane_of_tab(&list, 1), Some(11));
+        // フォーカス情報が無ければ先頭ペイン
+        assert_eq!(focused_pane_of_tab(&list, 2), Some(20));
+        // ペインが無いタブ・存在しないタブは None（404 になる）
+        assert_eq!(focused_pane_of_tab(&list, 3), None);
+        assert_eq!(focused_pane_of_tab(&list, 99), None);
+        assert_eq!(focused_pane_of_tab(&json!({}), 1), None);
     }
 }

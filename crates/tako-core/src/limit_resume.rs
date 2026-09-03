@@ -314,6 +314,123 @@ pub fn safe_choice(options: &[(Option<u32>, String)]) -> Option<(u32, &str)> {
         .map(|(i, (n, label))| (numbered(i, *n), label.as_str()))
 }
 
+// --- 上限に達した見出し行の判定（文言の正本。Issue #1093） ---
+
+/// 上限が尽きたことを告げる見出し行か（claude / codex 共通）。
+///
+/// **文言の正本はここ 1 箇所**にする。停止判定（`tako-control::orchestrator::wait`）と
+/// ステータスバーのメーター（`crate::terminal`）が同じ規則を通るので、
+/// 「自動復帰は発動したのにメーターは `--`」のような食い違いが構造的に起きない。
+///
+/// # なぜ「`hit your` + `limit`」で足りるのか（claude 2.1.258 のバイナリ実測）
+///
+/// claude の見出しは**1 つのテンプレート**から作られる:
+///
+/// ```text
+/// function oO(e,n,r,o){ … return `You've hit your ${e}${n}${d}` }
+/// ```
+///
+/// `${e}` に入る限度の名前は同バイナリの表と呼び出し側から次のとおりで、
+/// **すべて `limit` で終わる**（テンプレートを規則にすれば版の追加に自動で追従する）:
+///
+/// - `nF` の表: `session limit`（5h）/ `weekly limit`（週）/ `Opus limit` /
+///   `Sonnet limit` / `Fable limit` / `usage credit limit`
+/// - 支出上限の呼び出し: `individual spend limit` / `monthly spend limit` /
+///   `org's monthly spend limit` / `org's monthly usage limit`
+/// - 総称の呼び出し: `usage limit` / `limit`
+///
+/// `${n}` は解除時刻や対処の案内（` · resets 7:50pm (Asia/Tokyo)` /
+/// ` · contact your admin to increase it` 等）で、時刻は [`parse_reset_at`] が読む。
+/// codex も同じ形（`You've hit your usage limit.`）なので 1 つの規則で両方に効く。
+///
+/// アポストロフィは**判定に使わない**。同じバイナリの中で ASCII の `'`
+/// （`You've hit your …`）と U+2019（`you’re working on …`）が混在しているので、
+/// どちらかに寄せた判定は片方を取りこぼす。
+///
+/// # 旧来の文言も同じ規則の下に置く
+///
+/// `Claude usage limit reached. Your limit will reset at 3am.`（#157 で実採取）と
+/// `5-hour limit reached ∙ resets 3am` も上限の告知なのでここで受ける。
+/// ただし **`limit reached, now using …` は除く** —— これは自動モデル切替の告知で、
+/// worker は止まらない（#157 の実採取由来の除外条件）。
+pub fn is_limit_exhausted_line(line: &str) -> bool {
+    // 自動モデル切替の告知は上限「到達」ではあるが停止しない
+    if line.contains("limit reached, now using") {
+        return false;
+    }
+    if legacy_session_limit() {
+        // #1093 前の規則（`hit your usage limit` 決め打ち）へ戻す A/B 用
+        return line.contains("hit your usage limit")
+            || line.contains("usage limit reached")
+            || (line.contains("limit reached") && line.contains("reset"));
+    }
+    // テンプレート `You've hit your <限度の名前><理由や解除時刻>`。
+    // 限度の名前は `hit your` の**直後**にあり、後ろに続く理由や解除時刻は必ず
+    // `·` か `.` で始まる（`… session limit · resets 7:50pm` /
+    // `… usage limit. Upgrade to Pro …`）。そこで**名前の区間だけ**を見る。
+    // `,` は限度の名前には現れないので、地の文（「… hit your head on this design,
+    // the rate limit docs …」）を上限と読まないための追加の境界として足してある。
+    // 句読点が来ない病的な行には文字数で歯止めをかける
+    if let Some((_, rest)) = line.split_once("hit your") {
+        let name = rest.split(['·', '.', ',']).next().unwrap_or(rest);
+        let name = name
+            .char_indices()
+            .nth(LIMIT_NAME_MAX_CHARS)
+            .map_or(name, |(i, _)| &name[..i]);
+        if name.contains("limit") {
+            return true;
+        }
+    }
+    // 旧来の文言
+    line.contains("usage limit reached")
+        || (line.contains("limit reached") && line.contains("reset"))
+}
+
+/// 使用量メーターの枠（ステータスバーの `5h` / `7d`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitWindow {
+    /// 5 時間のセッション枠（claude の `five_hour`）
+    FiveHour,
+    /// 週枠（claude の `seven_day` / `seven_day_opus` / `seven_day_sonnet`）
+    Week,
+}
+
+/// 上限に達した見出し行から「どの枠が尽きたか」を読む（読めたときだけ `Some`）。
+///
+/// ステータスバーのメーターを 100% にする判断に使う。**枠の名前が分かるときだけ**返す
+/// のが要点で、`usage credit limit` や支出上限のように 5h / 週へ対応づけられない
+/// ものは `None`（= メーターに嘘を書かない。`--` のままにする）。
+///
+/// 対応は claude 2.1.258 の `nF` 表（`rateLimitType` → 表示名）どおり:
+/// `five_hour` = `session limit` / `seven_day` = `weekly limit` /
+/// `seven_day_opus` = `Opus limit` / `seven_day_sonnet` = `Sonnet limit`
+pub fn exhausted_limit_window(line: &str) -> Option<LimitWindow> {
+    if !is_limit_exhausted_line(line) {
+        return None;
+    }
+    let lower = line.to_lowercase();
+    if lower.contains("session limit") || lower.contains("5-hour limit") {
+        return Some(LimitWindow::FiveHour);
+    }
+    if lower.contains("weekly limit")
+        || lower.contains("opus limit")
+        || lower.contains("sonnet limit")
+    {
+        return Some(LimitWindow::Week);
+    }
+    None
+}
+
+/// `hit your` の直後で限度の名前を探す文字数の歯止め（句読点が来ない行のため）。
+/// 実測で最も長い名前は `org's monthly spend limit`（25 文字）
+const LIMIT_NAME_MAX_CHARS: usize = 40;
+
+/// `TAKO_1093_LEGACY=1` で #1093 前の文言判定（`hit your usage limit` 決め打ち）へ戻す（A/B 用）
+fn legacy_session_limit() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1093_LEGACY").is_some())
+}
+
 // --- リセット時刻のパース ---
 
 /// リセット時刻が書かれている箇所の目印（小文字で検索。実採取の文言由来）。
@@ -764,6 +881,132 @@ mod tests {
             (None, "Wait for limit to reset".to_string()),
         ];
         assert_eq!(safe_choice(&o2), Some((2, "Wait for limit to reset")));
+    }
+
+    // --- #1093: 上限に達した見出し行の判定 ---
+
+    /// 実採取（2026-09-03。univ アカウントの worker 3 体が止まっていた画面）。
+    /// **組織のクレジット上限**なので 2 行目が `/usage-credits …` になる
+    /// （claude 2.1.258 のバイナリ内文字列と一致）
+    const SESSION_LIMIT_HEADLINE: &str =
+        "  ⎿  You've hit your session limit · resets 7:50pm (Asia/Tokyo)";
+
+    #[test]
+    fn issue1093_組織クレジット上限の見出しを上限として読む() {
+        assert!(
+            is_limit_exhausted_line(SESSION_LIMIT_HEADLINE),
+            "#1093 の実採取見出しが上限として読めていない"
+        );
+        assert_eq!(
+            exhausted_limit_window(SESSION_LIMIT_HEADLINE),
+            Some(LimitWindow::FiveHour),
+            "`session limit` は 5h 枠（claude の five_hour）"
+        );
+    }
+
+    #[test]
+    fn issue1093_見出しテンプレートの限度名を網羅する() {
+        // claude 2.1.258 の `nF` 表 + 支出上限 + 総称。テンプレートは
+        // `You've hit your ${名前}${理由}` の 1 本なので、名前が増えても規則で追従する
+        for (name, want) in [
+            ("session limit", Some(LimitWindow::FiveHour)),
+            ("weekly limit", Some(LimitWindow::Week)),
+            ("Opus limit", Some(LimitWindow::Week)),
+            ("Sonnet limit", Some(LimitWindow::Week)),
+            // 枠へ対応づけられないものは**メーターに嘘を書かない**（None）が、
+            // 停止としては読む（自動復帰の対象になる）
+            ("Fable limit", None),
+            ("usage credit limit", None),
+            ("individual spend limit", None),
+            ("monthly spend limit", None),
+            ("org's monthly spend limit", None),
+            ("org's monthly usage limit", None),
+            ("usage limit", None),
+            ("limit", None),
+        ] {
+            let line = format!("You've hit your {name} · resets 7:50pm (Asia/Tokyo)");
+            assert!(
+                is_limit_exhausted_line(&line),
+                "「{name}」の見出しが上限として読めていない"
+            );
+            assert_eq!(
+                exhausted_limit_window(&line),
+                want,
+                "「{name}」の枠の読みが想定と違う"
+            );
+            // 解除時刻は同じアンカー（`resets `）で読める
+            let reference = 1_786_752_000 - 9 * 3600 + 30 * 60;
+            assert_eq!(
+                parse_reset_at(&line, reference, 9 * 3600),
+                Some(1_786_752_000 - 9 * 3600 + 19 * 3600 + 50 * 60),
+                "「{name}」の見出しから解除時刻が読めていない"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1093_解除時刻の無い見出しも上限として読む() {
+        // 組織上限は「解除時刻ではなく管理者へ依頼」の案内になることがある
+        // （バイナリ内: ` · contact your admin to increase it` / `Tet()`）。
+        // 停止としては読み、時刻は不明（core 側の猶予に落ちる）
+        for suffix in [
+            " · contact your admin to increase it",
+            " · ask your admin for a higher limit",
+            " · run /usage-credits to ask your admin for a higher limit",
+            " · progress saved",
+        ] {
+            let line = format!("You've hit your session limit{suffix}");
+            assert!(is_limit_exhausted_line(&line), "{suffix} で読めていない");
+            let reference = 1_786_752_000;
+            assert_eq!(
+                parse_reset_at(&line, reference, 9 * 3600),
+                None,
+                "{suffix} に時刻は書かれていない"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1093_旧来の文言も同じ関数で読める() {
+        // #157 / #748 / #985 の実採取。ここが回帰すると既存の自動復帰が丸ごと死ぬ
+        for line in [
+            "  ⎿  Claude usage limit reached. Your limit will reset at 3am.",
+            "5-hour limit reached ∙ resets 3am",
+            "■ You've hit your usage limit. Upgrade to Pro or try again at 4:24 AM.",
+        ] {
+            assert!(
+                is_limit_exhausted_line(line),
+                "既存の検知が壊れている: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1093_停止しない告知や警告を上限と読まない() {
+        for line in [
+            // 自動モデル切替の告知（worker は止まらない。#157 の除外条件）
+            "⎿ Claude Opus 4.6 limit reached, now using Claude Sonnet 4.5",
+            "5-hour limit reached, now using Claude Sonnet 4.5",
+            // 接近の警告（まだ止まっていない。バイナリ内 `You're close to your …`）
+            "You're close to your usage limit",
+            "You're close to your usage credit limit",
+            // 上限を上げる案内（到達していない）
+            "/upgrade to increase your usage limit.",
+            "Your admin can enable extra usage at claude.ai/admin-settings/usage.",
+            // 上限ダイアログの選択肢（「session limit」を含むが到達の見出しではない）
+            "     2. Upgrade to Max 20x for higher session limits every month",
+            "Continue now at lower priority after reaching your session limit; run again to stop",
+            // 地の文での遠い共起（`hit your` の直後に限度の名前が無い）
+            "If you hit your head on this design, the rate limit docs explain why",
+            // 通常の出力
+            "⏺ 実装が完了しました。テストは全て緑です。",
+        ] {
+            assert!(
+                !is_limit_exhausted_line(line),
+                "上限ではない行を上限と読んでいる: {line}"
+            );
+            assert_eq!(exhausted_limit_window(line), None, "{line}");
+        }
     }
 
     // --- リセット時刻のパース ---

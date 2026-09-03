@@ -1154,6 +1154,12 @@ schtasks /run /tn tako865
 
 1 反復は**実機の増分ビルド 1.2〜2.4 分 + セルフテスト 1.5 分**。32 反復回した。
 
+**`TAKO_ISOLATED=1` を落とさないこと（#1073）**: 落とすと data dir が本番になり、
+`$PROFILE` の配置が「効いている」判定になって**項目 41 / 41b が走る**（本番の
+settings.json / layout.json へも書く）。同じコード・同じ機でも起動の仕方で
+skip / 実行が入れ替わるので、**A/B は env まで揃えて記録する**。
+どちらだったかは skip 行の `script=` のパス（`tako-iso-data-<pid>` かどうか）で分かる。
+
 #### 次の一手（スライス 8 へ）
 
 - 項目 93 以降（GUI モード / チャット / 設定画面 / limit-resume）は
@@ -3557,3 +3563,221 @@ cols=198 x 9.5253           1886 px  <= client 1920 px（0.982 = 収まってい
   変えたくないので行っていない。倍率非依存の側は `__COMPAT_LAYER=DPIUNAWARE`
   （= アプリから見て 96 DPI・倍率 1.0・論理 1536x816）で代替した
 - マルチモニタでの `WM_DPICHANGED`（モニタ 1 枚の実機なので発火させられない）
+
+---
+
+## #1073 の記録（実機セルフテストが完走しなくなっていた。2026-09-03）
+
+**症状**: #920（8/24）で完走していた実機の GUI セルフテストが、9/2 の 2 本の A/B では
+序盤で止まった（main 相当 = 項目 17 `tako list` / #1063 ブランチ = 項目 41
+`シェル統合の OSC 7 で cwd 検知`）。
+
+### 停止位置が 2 つあったのは「ビルド世代の差」ではなく「起動の仕方の差」
+
+Issue の見立て（世代差）は外れていた。9/2 の A/B スクリプト（`t1063-selftest*.ps1`）は
+**`TAKO_ISOLATED=1` を立てていない**。#920 の完走ログには
+`script=Some("…\Temp\tako-iso-data-16328\shell-integration\tako.ps1")` があり、
+**あちらは隔離モードだった**（ログの `tako-iso-data-<pid>` が決定的な証拠）。
+
+`shell_integration::status()` の Windows 実装は「`$PROFILE` のブロックが**いまの
+data dir の** `tako.ps1` を指しているか」で `installed` を決める。`TAKO_ISOLATED=1` は
+data dir を pid ごとに変えるので:
+
+| 起動 | data dir | `effective()` | 項目 41 / 41b |
+|---|---|---|---|
+| `TAKO_ISOLATED=1`（#920・plan のレシピ） | `%TEMP%\tako-iso-data-<pid>` | **false** | skip |
+| 素の `TAKO_SELF_TEST=1`（9/2 の A/B） | `%APPDATA%\tako` | **true** | **走る**（そして落ちる） |
+
+`blocked_by_backend` は Windows では常に `None`（#766 の側路があるので
+`backend_block()` が器を理由に止めない）ので、`effective()` = `installed()`。
+**器（psmux）の有無は関係ない**。項目 1d の skip 文言に「器は psmux」と書いてあるのは
+`sh.is_posix()` のゲートで、モードの手がかりにはならない（1 回誤読した）。
+
+この機の `$PROFILE` は **8/21 23:46** に配置されていて以後変わっていない。つまり
+**項目 41 は「実機に配置がある × 隔離しない起動」の組でしか走らず、その組は 9/2 に
+初めて使われた**。だから「9/2 に壊れた」のではなく「9/2 に初めて走った」。
+
+### 項目 41 が落ちる本当の理由（2 つ・どちらも実測）
+
+1. **cwd を固定待ち 1 秒の直後に 1 回だけ読んでいた**。器が OSC を素通ししない環境では
+   側路（#766）から **2 秒 tick**（`periodic_prep:osc_sink`）で取り込むので、1 秒待って
+   1 回読む形は tick を跨げない = **コイン投げ**。実際 9/2 は落ち（elapsed 206s）、
+   9/3 の最新 main では同じ形で**通った**（elapsed 188s で次の判定へ進んだ）。
+   `wait_for_app_state` で状態を待つ形へ替えて決定的にした
+2. **`list` の `cwd` が Windows だけ `/` 区切りだった**。`file://` URI のパスは常に
+   `/` 区切りなので `PathBuf::from` すると `display()` が `C:/Users/…` になる。
+   `Path` の比較は成分単位なので**動作は元から同じ**だが、`tako list` / MCP の応答と
+   ペインヘッダの cwd チップに出るので、**同じ機に 2 通りの表記が混ざる**。
+   項目 41 の `list_exposes` は文字列比較なのでここで落ちた（`state` / `exit_code` は
+   一致していて cwd だけが違う、という切り分けが効いた）。
+   `file_uri::native_separators`（区切りを引数で受ける純粋関数）を通す形で製品側を直した
+
+### 41 を通した先の壁は #967（テスト側のリテラル）で、**両モード共通**
+
+項目 97 (d) と項目 99 は画面に `tako setup` / `tako master -<name>` の**リテラル**が
+出ることを見ていたが、製品が書くのは `welcome::launch_command_line` の実体パス
+（`…\tako.exe setup`）。**macOS は basename が `tako` なので通ってしまう**ので CI では
+永久に気づけない。#898 が `resolve_tako_binary` を実体パスへ替えた時点から落ちていた
+（#920 の完走はその前）。期待値を製品と同じ関数から作り、折り返しに強い形
+（空白を落として突き合わせ = 項目 93(d2) の作法）へ直した。
+
+### `load=unknown` の解消（副目標）
+
+`diag::load_average` が `#[cfg(unix)]` の `getloadavg` 決め打ちで、Windows は 1 か月ぶん
+`load=unknown` しか残っていなかった（**負荷依存のフレークを切り分ける材料が無い**）。
+境界 `platform::sysload`（B25）を新設し、**OS が実際に持っている指標だけ**を返す:
+unix = load average / Windows = `GetSystemTimes` の差分から出す CPU 使用率。
+1/5/15 分の 3 つ組はでっち上げない（`load=cpu14%/12cpu`）。unix の表記は 1 文字も
+変えていない（過去のログと突き合わせられるように）。実機で `load=cpu14%/12cpu` を実測。
+
+### 番犬（どちらも origin/main の実ファイルで「壊して落ちる」ことを実測）
+
+- `シェル統合由来の状態を固定待ちで読んでいない` — pre-fix の main.rs で
+  **35720 行（項目 41）と 35810 行（項目 41b）を名指し**、このブランチでは 0 件。
+  リトライループと自己注入（`feed_osc_bytes`）は許す
+- `ペイン画面の検査はtakoコマンドをリテラルで期待しない` — pre-fix で
+  **47871 行（97 d）と 48917 行（99）を名指し**、このブランチでは 0 件。
+  案内文の最簡形リテラル（#322）は `visible_lines()` 近傍だけを見るので対象外
+
+### 踏んだ罠（次に同じ直し方をする人向け）
+
+- **固定待ちを状態待ちへ替えると「待つ前から成立している」条件が偽 PASS になる**。
+  項目 41b は分割元の cwd が既に期待値なので、「フォーカス中ペインの cwd」だけで待つと
+  split が起きる前に true になる。**分割元の pane ID を先に取り、フォーカスが移った
+  ことも条件に入れる**
+- 「その OS に無い指標」を 3 つ組ででっち上げない。`MachineLoad` を enum にして
+  表記を分けたので、Windows のログを見た人が「load average が 42 なのか」と誤読しない
+- 実機の A/B は**起動スクリプトの env まで**記録する。今回は
+  `t1063-selftest.ps1` を読み直して初めて `TAKO_ISOLATED` の不在が分かった
+
+### 到達範囲（このブランチ。実機実測）
+
+壁は**順に 3 つ**あり、前を通すまで次は見えない。2 つ潰して 3 つめの位置まで進んだ:
+
+| 壁 | 停止項目 | 正体 | 状態 |
+|---|---|---|---|
+| 1 | 41（OSC 7 の cwd） | 固定待ち 1 秒 × 側路の 2 秒 tick + `cwd` の区切り | **解消** |
+| 2 | 97 (d) / 99 | 画面の `tako <sub>` リテラル（#967） | **解消** |
+| 3 | 133 (d) | **製品側**: Windows の OpenSSH が ControlMaster 非対応（#1090） | 別 Issue へ |
+
+| 起動 | head | 項目 41 / 41b | 停止位置 |
+|---|---|---|---|
+| 素の `TAKO_SELF_TEST=1` | `6574b07`（壁 1 のみ） | **走って通る**（Windows で初めて OSC 7 / 133 が緑） | 97 (d) |
+| `TAKO_ISOLATED=1` | `6574b07` | skip | 97 (d) |
+| `TAKO_ISOLATED=1`（レシピ） | `d2376ec` / `1d8a5b0` | skip（理由 + `script` パスを出す） | **133 (d)** |
+| 素の `TAKO_SELF_TEST=1` | `5d00106` | 走って通る | **133 (d)** |
+
+**両モードで同じ診断行**が出る（`getsockname failed: Not a socket` / `phase=None`）=
+モード差は項目 41 のゲートだけに閉じた。
+
+### 壁 3 の正体（#1090 として起票。**製品側**で射程外）
+
+診断（`TAKO_SELF_TEST_133D`）を足して 1 発で確定した:
+
+```
+TAKO_SELF_TEST_133D: host="selftest-nonexistent-1010" phase=None backend=true
+  lines=["tako: … へ接続してい", "ます…（中止は Ctrl+C）", "getsockname failed: Not a socket"]
+```
+
+**同じホスト・オプションだけを変えた A/B**（実機。`C:\Program Files\OpenSSH\ssh.exe`）:
+
+| arm | 渡したオプション | exit | 所要 | 出力 |
+|---|---|---|---|---|
+| A | ControlMaster 系**なし** | **255** | 1305ms | `ssh: Could not resolve hostname …` |
+| B | `ControlPath` + `ControlMaster=auto` + `ControlPersist`（= tako が渡す形） | **-1** | 43ms | `getsockname failed: Not a socket` |
+
+**Windows の OpenSSH は接続多重化（ControlMaster）に対応していない**。`common_opts` は
+`control_path` が取れると必ずこれを渡す（#65 の設計）ので、Windows では
+
+1. **exit が 255 でない** → `ssh_pane_script` の `if ($LASTEXITCODE -eq 255)` に入らず
+   理由も次の一手も 1 行も出ない（#919 / #1040 の契約が破れる）
+2. `getsockname failed: Not a socket` が `SSH_ERROR_PATTERNS` に無い →
+   `classify` の規則 ④（まっさらなペイン + tako 以外の行）が先に当たり **`Opened`**。
+   接続中チップが失敗へ置き換わらず**消える**（#1010 の契約が破れる）
+
+待ち不足ではない（名前解決は単一ラベル 1305ms / `.invalid` 44ms でどちらも exit 255）。
+影響は SSH 系の全経路（ペイン #20/#919/#1006/#1010/#1040・ツリー #65/#919/#976・
+SFTP の読み書き #966）で、直すには「#65 のソケット共有を Windows で諦めるか」の
+設計判断が要るので #1090 へ分離した。
+
+**項目 41 の実行がモードで変わること自体は残っている**（`$PROFILE` の配置に依存する）。
+skip の行に `script` のパスを出したので後から言い分けられるが、根治するなら #889 の
+`integration_shell_command` を 41 にも使って**専用ペインで閉じる**のが筋 → **#1091** へ起票。
+
+### 実機テストスイート（`cargo test --workspace --no-fail-fast`。head `1d8a5b0`）
+
+**どのクレートも増えていない**（TEST_EXITCODE=101 = 既知失敗があるので非ゼロ）:
+
+| スイート | 2026-09-02 のベースライン | このブランチ |
+|---|---|---|
+| tako-app (bin) | 528 / 0 | **534** / 0 |
+| tako-cli (lib) | 58 / 0 | 58 / 0 |
+| tako-core (lib) | 1266 / **14 failed** | 1314 / **13 failed** |
+| tako-control (lib) | 1048 / **10 failed** | 1068 / **10 failed** |
+| `remote_fs_e2e` | 0 / **1 failed**（#930） | 0 / **1 failed** |
+| その他（platform_parity / psmux_backend / shell_integration_powershell 等） | 0 failed | 0 failed |
+
+**2026-09-02 のベースラインは件数だけで名前を残していない**ので厳密な集合差は取れない。
+以後のために**失敗名の一覧をここへ残す**（24 件。内訳は POSIX 前提のテスト = symlink /
+mode ビット / `~` 展開 / `links` の絶対パス / `shell_profile`、と既知の製品縮退 =
+`acceptance_gates`（#935）/ `stale_binary` / `remote` / `bundle_install`（macOS 専用）/
+`remote_fs_e2e`（#930））:
+
+```
+acceptance_gates::tests::execute_command_true_false
+acceptance_gates::tests::execute_command_with_cwd
+acceptance_gates::tests::execute_command_with_output
+acceptance_gates::tests::gate_check_skips_custom
+acceptance_gates::tests::gate_check_with_command
+config_share::env::tests::リポジトリ配下の実体も外部管理として検出する
+dispatch::tests::tree_folder_symlink経由でも削除できる
+dispatch::tests::tree_folder_symlink経由の重複追加は1エントリに畳まれる
+dispatch::tests::tree_folder_追加と一覧と削除
+git_tree::tests::一覧は起点の配下だけを返して綴りを二重に出さない
+links::tests::cwd不明でも絶対パスとホーム起点は検出する
+links::tests::detect_absolute_path
+links::tests::tuiの装飾付きsoft_wrapをまたぐパスを検出する
+orchestrator::tests::resolved_env_expands_tilde
+platform::bundle_install::tests::既存を差し替えても置き場のパスは空にならない
+platform::bundle_install::tests::標準的でないバンドルはバンドルごと入れ替える
+remote::tests::is_process_aliveは現在のプロセスをtrueで返す
+shell_profile::tests::path判定は完全一致で行う
+shell_profile::tests::既にpathにあるならファイルを触らない
+stale_binary::tests::test_pidpath_self
+stale_binary::tests::ランチャ探索は実行可能な通常ファイルだけを拾う
+tab::tests::pinned_folder_symlink経由でも削除できる
+tab::tests::pinned_folder_symlink経由の重複は畳まれる
+解決できないホストは接続前に分類される
+```
+
+**この PR が足したテストは実機でも緑**（`diag::tests::この環境では混み具合が採れる` =
+Windows で `load` が採れることを実機が保証する / `file_uri` 2 本 / `osc_tap` 1 本 /
+番犬 4 本）。tako-core の failed が 14 → 13 に減っているが、passed も 1266 → 1314 と
+増えている（main が 9/2 から進んでいる）ので**この PR に帰せられる差ではない**。
+
+### 次に実機を触る人への申し送り（#1090 / #1091 の着手用）
+
+- **証拠と道具は `<実機の dev>\tako-evidence-1073\` に残してある**（リポの外）:
+  `run-selftest.ps1` / `run-selftest.cmd`（arm 名と mode を `arm.txt` / `mode.txt` から
+  読む形にしてある = `schtasks /run` が引数を渡せないため）/ `build.cmd` / `test.cmd` /
+  各 run のログ（`st-<arm>-out.log`）/ ssh の A/B（`ssh-cm.log` / `ssh-timing.log`）
+- **scheduled task は消してある**。作り直すのは 1 行:
+  `schtasks /create /tn tako1073 /tr "<evidence>\run-selftest.cmd" /sc once /st 23:58 /it /f`
+- worktree `tako-wt-1073` は残してある（`git fetch` + `checkout` で任意の head へ切り替えて
+  `build.cmd` → `run-selftest` の 2 手で回せる）
+- **`Start-Process -RedirectStandardOutput` でも進捗は見える**（Issue の「4 行しか出ない」は
+  再現しなかった。ログはインクリメンタルに書かれた）
+- **対話 ssh を SSH セッションから直に叩くと固まる**（`-n` を付けないと stdin を読もうとする）。
+  ssh の挙動を測るときは `-n` を付け、`Invoke-CimMethod` で切り離してログへ書かせる
+
+### macOS 側で観測した #1062 のフレーク（この変更とは無関係）
+
+同じバイナリ・同じレシピで 2 本取ったところ、1 本目だけ項目 137 (d)（#1040）で落ちた:
+
+| run | 開始時の load | 結果 |
+|---|---|---|
+| 1 | 15.19/16.28/20.68 | `FAILED: 137: 認証・ホスト鍵の失敗は繰り返さず理由だけ残す`（`phase=Some("connected")`） |
+| 2 | 17.96/15.50/15.55 | **`TAKO_APP_SELF_TEST_OK`**（skip 3 = 未描画の既知） |
+
+**#1062 は「main で止まる」と書かれているが実際は間欠**（負荷だけでも決まらない）。
+SSH 経路はこの PR の差分に 1 行も含まれないので回帰ではない。観測は #1062 へコメント済み。

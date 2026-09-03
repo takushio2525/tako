@@ -8,6 +8,8 @@ import { createClient } from '../api';
 import { parseAnsiLine, defaultSgrState, colorToCss } from '../ansi';
 import { AgentIcon, agentColor } from '../components/agent-icon';
 import { ChatView } from '../components/chat-view';
+import { SshSheet, SshConnectBar } from '../components/ssh';
+import { RemoteLinkRow } from '../components/remote-link';
 
 const QUICK_KEYS = [
   { label: 'esc',    seq: 'Escape' },
@@ -120,6 +122,8 @@ export function TerminalPage({ paneId, me }) {
   const [connected, setConnected] = useState(false);
   const [input, setInput] = useState('');
   const [ctrlMode, setCtrlMode] = useState(false);
+  // #1080: SSH の切り替え / 新規接続シート
+  const [sshOpen, setSshOpen] = useState(false);
   const [hasNew, setHasNew] = useState(false);
   const [fontSize, setFontSize] = useState(() => {
     const saved = parseInt(localStorage.getItem(FONT_KEY) || '', 10);
@@ -439,6 +443,14 @@ export function TerminalPage({ paneId, me }) {
             </span>
           </div>
         </div>
+        {/* #1080: SSH の切り替え / 新規接続。端末を見ている状態からだけ辿れる */}
+        {view === 'term' && hasTerminal && (
+          <button
+            class="pane-header-ssh"
+            data-testid="ssh-open-btn"
+            onClick={() => setSshOpen(true)}
+          >ssh</button>
+        )}
         {/* chat/term トグル */}
         {hasChatSupport ? (
           <div class="view-toggle">
@@ -455,6 +467,10 @@ export function TerminalPage({ paneId, me }) {
         ) : null}
       </div>
 
+      {/* #1077: Claude 公式へ送り出す 1 行。繋がっていれば「Claude で開く」、
+          繋がっていなければ理由をたたんで出す（自前チャットはフォールバックとして残す） */}
+      <RemoteLinkRow link={info?.remote_link} />
+
       {/* chat ビュー */}
       {view === 'chat' && hasChatSupport && (
         <ChatView
@@ -469,6 +485,8 @@ export function TerminalPage({ paneId, me }) {
       {/* term ビュー */}
       {view === 'term' && hasTerminal && (
         <>
+          {/* #1080: 接続待ち / 失敗 / 再接続中（#1010 / #1040）。成功したら消える */}
+          <SshConnectBar state={info?.ssh_connect} />
           <div class="reader-wrap">
             <div
               class="reader"
@@ -523,6 +541,27 @@ export function TerminalPage({ paneId, me }) {
             </button>
           </div>
         </>
+      )}
+
+      {/* #1080: ホスト選択 → 接続。開き先は #1006 の語彙をそのまま送る */}
+      {sshOpen && (
+        <SshSheet
+          client={clientRef.current}
+          paneId={paneId}
+          canSsh={info?.can_ssh}
+          onClose={() => setSshOpen(false)}
+          onOpened={(result, target) => {
+            setSshOpen(false);
+            // split / tab は新しいペインができるのでそちらへ移る。
+            // pane はいま見ているペインがそのまま SSH になるので動かない
+            if (target !== 'pane' && result && result.pane != null &&
+                String(result.pane) !== String(paneId)) {
+              window.location.hash = `#/panes/${result.pane}`;
+            } else {
+              refreshPanes();
+            }
+          }}
+        />
       )}
 
       {/* terminal-less ペイン（プレビュー等） */}

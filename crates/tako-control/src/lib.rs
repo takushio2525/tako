@@ -62,6 +62,7 @@ pub mod remote_files;
 pub mod remote_preview;
 pub mod remote_serve;
 pub mod remote_setup;
+pub mod remote_ssh;
 pub mod sessions;
 pub mod settings;
 pub mod setup;
