@@ -1197,26 +1197,30 @@ fn apply_and_save(
     target: &PreviewTarget,
     text: &str,
 ) -> Result<Value, WriteFailure> {
-    (deps.send)(crate::protocol::Request::PreviewEdit {
-        pane: Some(target.pane),
-        enabled: Some(true),
-    })
-    .map_err(|e| WriteFailure::app(&e))?;
-    (deps.send)(crate::protocol::Request::PreviewApply {
-        pane: Some(target.pane),
-        text: text.to_string(),
-    })
-    .map_err(|e| WriteFailure::app(&e))?;
-    let saved = (deps.send)(crate::protocol::Request::PreviewSave {
-        pane: Some(target.pane),
-    });
+    // 途中で失敗しても**必ず**戻す（`?` で抜けると編集モードのまま残る）
+    let result = (|| {
+        (deps.send)(crate::protocol::Request::PreviewEdit {
+            pane: Some(target.pane),
+            enabled: Some(true),
+        })
+        .map_err(|e| WriteFailure::app(&e))?;
+        (deps.send)(crate::protocol::Request::PreviewApply {
+            pane: Some(target.pane),
+            text: text.to_string(),
+        })
+        .map_err(|e| WriteFailure::app(&e))?;
+        (deps.send)(crate::protocol::Request::PreviewSave {
+            pane: Some(target.pane),
+        })
+        .map_err(|e| WriteFailure::app(&e))
+    })();
     if !target.was_editing {
         let _ = (deps.send)(crate::protocol::Request::PreviewEdit {
             pane: Some(target.pane),
             enabled: Some(false),
         });
     }
-    saved.map_err(|e| WriteFailure::app(&e))
+    result
 }
 
 /// ローカルのファイルへ書く（#1084）
@@ -1370,17 +1374,7 @@ fn write_ssh(
         dirty,
     };
     match apply_and_save(deps, &target_pane, text) {
-        Ok(out) => Ok(json!({
-            "saved": true,
-            "pane": pane,
-            "path": target.rel,
-            "root": target.root_id,
-            "size": text.len(),
-            "etag": content_etag(text.as_bytes()),
-            "dirty": out["dirty"].as_bool().unwrap_or(false),
-            // #966 の書き戻し状態（idle / uploading / saved / failed / pending）
-            "remote": out["remote"].clone(),
-        })),
+        Ok(out) => Ok(write_success(target, text, pane, &out)),
         // 押し出せなかったときは **内容が退避されている**（#966）。
         // 種別は退避の記録から取る = app のエラー文言に依存しない
         Err(failure) => Err(classify_ssh_write_failure(deps, target, failure)),
@@ -1427,10 +1421,27 @@ fn stash_offline_write(
         dirty,
     };
     match apply_and_save(deps, &pane_target, text) {
-        // 相手へ届かないのに成功した = 押し出しが走っていない（あってはならない）
-        Ok(_) => Err(fetch_failure),
+        // 取り直しには失敗したが押し出しは通った（その隙に回線が戻った）。
+        // #966 の `save_file` が baseline とリモートを突き合わせた上で書いているので、
+        // **これは本物の成功**。失敗と言うと利用者に再送させてしまう
+        Ok(out) => Ok(write_success(target, text, pane, &out)),
         Err(failure) => Err(classify_ssh_write_failure(deps, target, failure)),
     }
+}
+
+/// SSH 先への書き込みが通ったときの応答（`write_ssh` と `stash_offline_write` で共用）
+fn write_success(target: &SshResolved, text: &str, pane: u64, out: &Value) -> Value {
+    json!({
+        "saved": true,
+        "pane": pane,
+        "path": target.rel,
+        "root": target.root_id,
+        "size": text.len(),
+        "etag": content_etag(text.as_bytes()),
+        "dirty": out["dirty"].as_bool().unwrap_or(false),
+        // #966 の書き戻し状態（idle / uploading / saved / failed / pending）
+        "remote": out["remote"].clone(),
+    })
 }
 
 /// そのリモートファイルを出しているペインを探す（`List` の `preview.remote`）。

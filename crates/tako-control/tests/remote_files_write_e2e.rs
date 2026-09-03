@@ -65,6 +65,8 @@ struct FakeAppState {
     pending: Vec<(String, String, String, String, Vec<u8>)>,
     /// SSH 先が落ちている（押し出しが失敗して退避される）
     disconnected: bool,
+    /// 取得だけが失敗する（取り直しの直後に回線が戻った状況を作る）
+    fetch_down: bool,
     /// リモート側の内容を横から書き換えた分（競合の実測用）
     remote_files: std::collections::HashMap<String, Vec<u8>>,
     /// `open-file` で取り込んだ時点の内容（#966 の baseline）
@@ -370,7 +372,10 @@ impl FakeApp {
                         let rpath = path.clone().ok_or("path が要る")?;
                         // 相手へ届かなければ**取得も失敗する**（実 SFTP と同じ。
                         // ここを成功させると「切断中の保存」の経路がテストされない）
-                        if self.state.lock().unwrap().disconnected {
+                        let st = self.state.lock().unwrap();
+                        let down = st.disconnected || st.fetch_down;
+                        drop(st);
+                        if down {
                             return Err(
                                 "ssh: connect to host port 22: Operation timed out".to_string()
                             );
@@ -1220,5 +1225,46 @@ fn 押し出しにforceは渡らない() {
             .map(|b| String::from_utf8_lossy(b).to_string()),
         Some("remote changed\n".to_string()),
         "リモートの変更が残っている"
+    );
+}
+
+#[test]
+fn 取得に失敗しても押し出しが通れば成功と言う() {
+    // #1085: 取り直しには失敗したが、その隙に回線が戻って押し出しは通った場合。
+    // #966 の `save_file` が baseline とリモートを突き合わせた上で書いているので
+    // **本物の成功**。失敗と言うと利用者に再送させてしまう
+    let h = Harness::new("recovered");
+    let id = h.ssh_root_id("linuxbox");
+    let (_, read) = h.get(&format!("/api/files/content?root={id}&path=notes.md"));
+    let etag = read["etag"].as_str().expect("検証子").to_string();
+
+    // 取得だけが落ちる（押し出しは通る）
+    h.app.state.lock().unwrap().fetch_down = true;
+    let (status, body) = h.json(
+        "PUT",
+        &format!("/api/files/content?root={id}&path=notes.md"),
+        Some(&json!({ "text": "# 取り直しは落ちたが届いた\n", "etag": etag }).to_string()),
+    );
+    assert_eq!(status, 200, "押し出せたなら成功: {body}");
+    assert_eq!(body["remote"]["state"].as_str(), Some("saved"));
+    assert_eq!(
+        h.app
+            .state
+            .lock()
+            .unwrap()
+            .remote_files
+            .get("linuxbox:/srv/app/notes.md")
+            .map(|b| String::from_utf8_lossy(b).to_string()),
+        Some("# 取り直しは落ちたが届いた\n".to_string()),
+        "リモートへ届いている"
+    );
+    // 退避は作られない
+    let (_, pending) = h.get("/api/files/pending");
+    assert!(
+        pending["pending"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(false),
+        "成功したので退避しない: {pending}"
     );
 }
