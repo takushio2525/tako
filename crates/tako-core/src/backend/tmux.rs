@@ -35,6 +35,13 @@ impl TmuxBackend {
         }
     }
 
+    /// ソケットを明示しての構築（**隔離検証・統合テスト用**。
+    /// `PsmuxBackend::with_parts` と同じ狙いで、プロセス全体の環境変数を
+    /// 触らずに器を隔離できる）
+    pub fn with_socket(socket: String) -> Self {
+        Self { socket }
+    }
+
     pub fn socket(&self) -> &str {
         &self.socket
     }
@@ -267,6 +274,15 @@ impl DetachedCapture for TmuxBackend {
         } else {
             Some(text)
         }
+    }
+
+    fn capture_scrollback(
+        &self,
+        session: &SessionRef,
+        lines: usize,
+    ) -> Result<Vec<String>, BackendError> {
+        crate::tmux::capture_scrollback_plain(self.sock(), session.as_str(), lines)
+            .map_err(BackendError::Operation)
     }
 
     fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe> {

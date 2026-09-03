@@ -958,6 +958,16 @@ impl PaneMapping {
         self.updated_at = std::time::Instant::now();
     }
 
+    /// tako PaneId（数値）→ 器のセッション名。
+    /// **ターゲット式を組む前の 1 段**で、scrollback（#972）と `resolve_tmux_target` が共有する
+    fn backend_session_of(&self, id: u64) -> Option<String> {
+        let info = self.pane_info.get(&id)?;
+        info["tmux_session"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// tako PaneId（数値文字列）を tmux ターゲット（`session:0.0`）に解決する。
     /// 既に tmux ターゲット形式（`:` を含む）ならそのまま返す
     fn resolve_tmux_target(&self, pane_param: &str) -> Option<String> {
@@ -965,8 +975,7 @@ impl PaneMapping {
             return Some(pane_param.to_string());
         }
         let id: u64 = pane_param.parse().ok()?;
-        let info = self.pane_info.get(&id)?;
-        let session = info["tmux_session"].as_str().filter(|s| !s.is_empty())?;
+        let session = self.backend_session_of(id)?;
         Some(format!("{session}:0.0"))
     }
 }
@@ -1810,9 +1819,101 @@ pub fn run_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// ペインのスクロールバック履歴をプレーンテキストで取得する。
-/// CLI (`tako remote scrollback`) から使う
+/// `tako remote scrollback` が受け取る対象指定の解釈（純関数。#972）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScrollbackTarget {
+    /// 数値の tako PaneId。器のセッション名は別途解決する
+    Pane(u64),
+    /// 器のセッション名
+    Session(String),
+}
+
+/// 対象指定を分類する。
+///
+/// - `:` を含む形（`session:0.0` のような tmux ターゲット式）は**セッション部だけ**を採る。
+///   器のセッション名はターゲット式ではない（`SessionRef` が構造で弾く）ので、
+///   ここで剥がしておかないと到達解決の時点で `InvalidSession` になる
+/// - 全桁が数字なら tako PaneId（MCP / CLI が渡す既定の形）
+/// - それ以外は器のセッション名
+pub(crate) fn parse_scrollback_target(spec: &str) -> Result<ScrollbackTarget, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("ペイン ID / セッション名が空".to_string());
+    }
+    let head = spec.split(':').next().unwrap_or("").trim();
+    if head.is_empty() {
+        return Err(format!("対象指定 '{spec}' からセッション名を取り出せない"));
+    }
+    if head.len() == spec.len() {
+        if let Ok(id) = head.parse::<u64>() {
+            return Ok(ScrollbackTarget::Pane(id));
+        }
+    }
+    Ok(ScrollbackTarget::Session(head.to_string()))
+}
+
+/// ペインのスクロールバック（履歴 + 現画面）をプレーンテキストで取得する。
+/// CLI (`tako remote scrollback`) / MCP (`tako_remote_scrollback`) から使う。
+///
+/// **器の境界（#519 の `DetachedCapture`）を通す**（#972）。直に
+/// `tmux::tmux_command` を叩いていた旧実装は 2 つの理由で壊れていた:
+///
+/// 1. 器が psmux の Windows では、tmux 決め打ちの呼び方が `no server running` になる
+/// 2. ターゲットが裸の `=<session>` で、**tmux 3.6 は target-pane として解決できない**
+///    （実測 3.6b: `can't find pane: =<name>`）= macOS でも同じく失敗していた
+///
+/// 数値の PaneId は器のセッション名へ解決してから渡す。dispatch 経路は呼ぶ前に
+/// app 自身の workspace で解決済みなので、ここで IPC を張るのは CLI 経路だけ
 pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
+    if legacy_scrollback_enabled() {
+        return scrollback_legacy(pane_id, lines);
+    }
+    let session = resolve_scrollback_session(pane_id)?;
+    let (session_ref, capture) = crate::reach::detached_capture(&session).ok_or_else(|| {
+        format!(
+            "セッション {session} の履歴を読めない: {}",
+            crate::reach::no_detached_capture_note()
+        )
+    })?;
+    capture
+        .capture_scrollback(&session_ref, lines as usize)
+        .map_err(|e| format!("セッション {session} の履歴を読めない: {e}"))
+}
+
+/// 対象指定 → 器のセッション名
+fn resolve_scrollback_session(spec: &str) -> Result<String, String> {
+    match parse_scrollback_target(spec)? {
+        ScrollbackTarget::Session(name) => Ok(name),
+        ScrollbackTarget::Pane(id) => backend_session_of_pane(id).ok_or_else(|| {
+            format!(
+                "ペイン {id} の器のセッションを解決できない\
+                 （tako-app が起動していて、そのペインが器を持っているかを確認する。\
+                 セッション名を直接渡すこともできる）"
+            )
+        }),
+    }
+}
+
+/// 稼働中の tako-app へ IPC で問い合わせて tako PaneId → 器のセッション名を解決する。
+///
+/// **app の内側（dispatch）からは呼ばない**（自分自身への入れ子 IPC になる）。
+/// dispatch は `host.backend_session` で解決してからこのモジュールへ来る
+fn backend_session_of_pane(pane: u64) -> Option<String> {
+    let client = AppIpcClient::connect()?;
+    let list = client.request(crate::protocol::Request::List).ok()?;
+    let mut mapping = PaneMapping::new();
+    mapping.update_from_list(&list);
+    mapping.backend_session_of(pane)
+}
+
+/// #972 の A/B: `TAKO_972_LEGACY=1` で旧経路（tmux 決め打ち + 裸の `=session`）へ戻す
+fn legacy_scrollback_enabled() -> bool {
+    std::env::var("TAKO_972_LEGACY").as_deref() == Ok("1")
+}
+
+/// #972 以前の実装そのまま。**A/B 専用**で、production の既定経路ではない
+/// （境界の番犬はこの関数だけを名指しで許可している）
+fn scrollback_legacy(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
     let tmux_socket = tako_core::tmux_backend::socket_name();
     let target = tako_core::tmux::exact_target(pane_id);
     let output = tako_core::tmux::tmux_command(Some(&tmux_socket))
@@ -5387,6 +5488,70 @@ mod tests {
     /// ps 起動が失敗して検証素通り → daemon_stop_impl が自プロセスへ SIGTERM を送り
     /// テスト全体が死ぬ（実測）。env var を触るテストはこのロックで直列化する
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // --- #972: scrollback の対象指定の解釈 -------------------------------------
+
+    /// **#972 の回帰**: 数値の PaneId を器のセッション名として扱わない。
+    ///
+    /// 旧実装は指定をそのまま tmux ターゲットにしていたので、`1` は
+    /// `=1` になり Windows では `no server running on session '<socket>__1'` になった
+    #[test]
+    fn 数値の対象指定はペインidとして解釈する() {
+        assert_eq!(
+            parse_scrollback_target("1").unwrap(),
+            ScrollbackTarget::Pane(1)
+        );
+        assert_eq!(
+            parse_scrollback_target("  42\t").unwrap(),
+            ScrollbackTarget::Pane(42)
+        );
+        assert_eq!(
+            parse_scrollback_target("0").unwrap(),
+            ScrollbackTarget::Pane(0)
+        );
+    }
+
+    #[test]
+    fn 器のセッション名はそのまま通る() {
+        assert_eq!(
+            parse_scrollback_target("tako-abc123def456").unwrap(),
+            ScrollbackTarget::Session("tako-abc123def456".into())
+        );
+    }
+
+    /// ターゲット式で来たらセッション部だけを採る。`SessionRef` はターゲット式を
+    /// 構造で弾く（#428）ので、剥がさないと到達解決の時点で InvalidSession になる
+    #[test]
+    fn ターゲット式はセッション部だけを採る() {
+        for spec in ["tako-abc:0.0", "tako-abc:", "tako-abc:1.2"] {
+            assert_eq!(
+                parse_scrollback_target(spec).unwrap(),
+                ScrollbackTarget::Session("tako-abc".into()),
+                "spec={spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn 空の対象指定は理由つきで断る() {
+        for spec in ["", "   ", ":0.0"] {
+            assert!(parse_scrollback_target(spec).is_err(), "spec={spec:?}");
+        }
+    }
+
+    /// 解釈した結果は必ず `SessionRef` として通る形であること
+    /// （ここで通らない形を作ると到達解決が InvalidSession で落ちる）
+    #[test]
+    fn 解釈済みのセッション名は到達解決を通る形になる() {
+        let ScrollbackTarget::Session(name) = parse_scrollback_target("tako-abc:0.0").unwrap()
+        else {
+            panic!("セッション名として解釈されなかった");
+        };
+        assert!(
+            tako_core::backend::SessionRef::new(&name).is_ok(),
+            "SessionRef が受け付けない形: {name}"
+        );
+    }
 
     // --- #1038: ループバック TCP の待ち受けと自己疎通チェック -------------------
 

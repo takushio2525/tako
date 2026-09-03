@@ -583,6 +583,19 @@ impl DetachedCapture for PsmuxCapture {
         (!text.is_empty()).then(|| text.to_string())
     }
 
+    /// 履歴 + 現画面。ターゲットは psmux の規則（`=` を付けない = [`PsmuxBackend::target`]）
+    /// に従い素の名前で渡す。`-E` を付けないので現画面が入る
+    fn capture_scrollback(
+        &self,
+        session: &SessionRef,
+        lines: usize,
+    ) -> Result<Vec<String>, BackendError> {
+        let start = format!("-{lines}");
+        self.run(&["capture-pane", "-p", "-t", session.as_str(), "-S", &start])
+            .map(|out| out.lines().map(str::to_string).collect())
+            .map_err(BackendError::Operation)
+    }
+
     /// `#{history_bytes}` は psmux では空なので **0 を返す**。
     /// これは「バイト数 0」ではなく「観測できない」の意味で、
     /// 履歴飽和時のバイト差分検知（pane_log）はこの器では働かない

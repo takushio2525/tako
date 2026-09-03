@@ -476,6 +476,23 @@ pub trait DetachedCapture: Send + Sync {
     /// [`Self::capture_history`] との差は「1 本のテキストか行の列か」
     fn capture_history_joined(&self, session: &SessionRef, lines: usize) -> Option<String>;
 
+    /// 履歴末尾 `lines` 行 **+ 現画面**の平文採取（`tako remote scrollback` /
+    /// `GET /api/panes/:id/scrollback` の「遡って読む」形）。
+    ///
+    /// [`Self::capture_history`] との違いは**現画面を含む**こと。履歴だけを
+    /// `#{history_size}` の行数と 1:1 で数えたいペインログは向こうを使う。
+    /// [`Self::capture_history_joined`] との違いは折り返しを結合しない
+    /// （`-J` を付けない）ことと、行の列で返すこと。
+    ///
+    /// **`Option` ではなく `Result`** にしてあるのは、この経路の出口が
+    /// 人間の端末（CLI）だからで、「読めなかった」だけでなく**器が何と言ったか**を
+    /// そのまま見せる必要がある（#972 の `no server running` はまさにそれだった）
+    fn capture_scrollback(
+        &self,
+        session: &SessionRef,
+        lines: usize,
+    ) -> Result<Vec<String>, BackendError>;
+
     fn history_probe(&self, session: &SessionRef) -> Option<HistoryProbe>;
 
     /// 全セッションの履歴観測を 1 コマンドで（#369 の probe 一括化）
@@ -1536,6 +1553,13 @@ mod tests {
         }
         fn capture_history_joined(&self, _s: &SessionRef, _lines: usize) -> Option<String> {
             Some("old".into())
+        }
+        fn capture_scrollback(
+            &self,
+            _s: &SessionRef,
+            _lines: usize,
+        ) -> Result<Vec<String>, BackendError> {
+            Ok(vec!["old".into(), "live".into()])
         }
         fn history_probe(&self, _s: &SessionRef) -> Option<HistoryProbe> {
             Some(HistoryProbe {

@@ -561,6 +561,37 @@ pub fn capture_history_plain(
     Some(output.lines().map(|l| l.trim_end().to_string()).collect())
 }
 
+/// 履歴末尾 `count` 行 **+ 現画面**を平文で取得する（`tako remote scrollback` 用）。
+///
+/// [`capture_history_plain`] との違いは `-E` を付けないこと = **現画面を含む**。
+/// 履歴だけを `#{history_size}` と 1:1 で数えたいペインログは向こうを使う。
+///
+/// ターゲットは [`session_pane_target`] を通す。**裸の `=session` では駄目**で、
+/// tmux 3.6b の実測では `can't find pane: =<name>` になる（#32 で判明した罠を
+/// #972 の scrollback が踏んでいた）
+pub fn capture_scrollback_plain(
+    socket: Option<&str>,
+    session: &str,
+    count: usize,
+) -> Result<Vec<String>, String> {
+    let args = capture_scrollback_args(session, count);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_tmux(socket, &arg_refs)?;
+    Ok(output.lines().map(|l| l.to_string()).collect())
+}
+
+/// [`capture_scrollback_plain`] の argv（純関数。実行しないので単体テストで固定できる）
+pub fn capture_scrollback_args(session: &str, count: usize) -> Vec<String> {
+    vec![
+        "capture-pane".into(),
+        "-p".into(),
+        "-t".into(),
+        session_pane_target(session),
+        "-S".into(),
+        format!("-{count}"),
+    ]
+}
+
 /// セッションが生きているか確認する（`has-session`）
 pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
     tmux_command(socket)
@@ -953,5 +984,35 @@ mod tests {
             m
         };
         assert!(map.is_empty());
+    }
+
+    /// **#972 の回帰**: scrollback の argv が
+    ///
+    /// - ターゲットを [`session_pane_target`]（末尾コロン）で組む
+    ///   = 裸の `=session` へ戻すと tmux 3.6 が `can't find pane` を返す（実測 3.6b）
+    /// - `-E` を付けない = **現画面を含む**（`capture_history_plain` との違い）
+    ///
+    /// を満たすこと
+    #[test]
+    fn scrollbackのargvはセッションペインターゲットで現画面を含む() {
+        let args = capture_scrollback_args("tako-abc123", 500);
+        let target_idx = args.iter().position(|a| a == "-t").expect("-t が無い") + 1;
+        assert_eq!(args[target_idx], session_pane_target("tako-abc123"));
+        // #32 / #972: 裸のセッション名では target-pane として解決できない
+        assert!(
+            args[target_idx].ends_with(':'),
+            "ターゲットにセッション部の明示（末尾コロン）が無い: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "-E"), "現画面が落ちる: {args:?}");
+        assert!(args.contains(&"-S".to_string()) && args.contains(&"-500".to_string()));
+    }
+
+    /// 履歴だけを読む [`capture_history_plain`] とは**別物**であることを固定する
+    /// （scrollback を履歴のみへ寄せると現画面が消えて挙動が変わる）
+    #[test]
+    fn scrollbackと履歴採取は引数が異なる() {
+        let scrollback = capture_scrollback_args("tako-abc123", 10);
+        assert!(!scrollback.iter().any(|a| a == "-E"));
+        assert!(!scrollback.iter().any(|a| a == "-J"));
     }
 }
