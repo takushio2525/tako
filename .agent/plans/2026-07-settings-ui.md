@@ -85,7 +85,7 @@ tako setup 相当の確認・変更。読み取りは既存 dispatch の status 
 | 項目 | UI | dispatch |
 |---|---|---|
 | エージェント CLI 検出状態 | claude / codex / agy の導入・認証・プラン表示 + 再検出 | `SetupRun` の検出ロジック（setup.rs）を read-only で呼ぶ status API（§5.3 の拡張参照） |
-| プロファイル（profiles/default.yaml 等） | 一覧 + 選択プロファイルの主要フィールド編集（master_agent / model / effort / worker_agent / skip_permissions / tab_naming_convention） | `OrchestratorProfiles { list / show / set }`（protocol.rs:489） |
+| プロファイル（profiles/default.yaml 等） | 一覧 + 選択プロファイルの主要フィールド編集（master_agent / model / effort / **cwd**（#1119）/ worker_agent / skip_permissions / tab_naming_convention） | `OrchestratorProfiles { list / show / set }`（protocol.rs:489） |
 | MCP 登録状態 | 登録済み判定表示 + 「登録する」ボタン | `SetupMcp`（protocol.rs:464） |
 | フルディスクアクセス（FDA） | 状態表示 + 「システム設定を開く」 | `Fda { action:"status" / "open" }`（protocol.rs:795、fda.rs） |
 | エージェント共通ルール同期 | 状態表示 + 「同期する」 | `AgentsSyncRules { action:"status" / "sync" }`（protocol.rs:810） |
@@ -551,7 +551,7 @@ Settings {
 | ファイル | 内容 | 設定画面での扱い |
 |---|---|---|
 | config.yaml（orchestrator） | confirm_close / agents_sync / spawn_layout / auto_close / auto_push / ctx_threshold 等（setup.rs:249-360） | セットアップタブで主要のみ。残りはパス案内 |
-| profiles/*.yaml | Profile: master_agent / model / effort / worker_model_policy / worker_agent(s) / prompt_blocks / tab_naming_convention（orchestrator/mod.rs:292-332） | セットアップタブで主要のみ（OrchestratorProfiles set 経由） |
+| profiles/*.yaml | Profile: master_agent / model / effort / **cwd** / worker_model_policy / worker_agent(s) / prompt_blocks / tab_naming_convention（orchestrator/mod.rs:292-332） | セットアップタブで主要のみ（OrchestratorProfiles set 経由） |
 | projects.yaml | orchestrator プロジェクト | 対象外（`tako orchestrator projects` へ案内のみ） |
 | layout.json | タブ・ペイン・ウィンドウ復元 | 対象外（設定ではない） |
 
