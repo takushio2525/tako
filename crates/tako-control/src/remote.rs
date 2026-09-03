@@ -58,6 +58,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -817,48 +818,75 @@ impl AppIpcClient {
         }
     }
 
-    /// 外側 `Result` = 通信、内側 = app の応答（#1078）
+    /// 外側 `Result` = 通信、内側 = app の応答（#1078）。
+    ///
+    /// **ワイヤ処理（1 行 1 JSON）はトランスポート非依存**で、接続の確立だけが
+    /// プラットフォームで異なる（unix = Unix domain socket / windows = 名前付き
+    /// パイプ = 抽象境界 B3）。tako-cli の `transport` と同じ形（#519 段取り ③ / #467）。
+    ///
+    /// **Windows 側は #972 まで `Err("Windows の IPC は未実装")` だった**ので、
+    /// daemon / CLI から app へ問い合わせる経路（数値ペイン ID → 器のセッションの
+    /// 解決を含む）が丸ごと成立していなかった
     fn roundtrip_detailed(
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
     ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
-        #[cfg(unix)]
-        {
-            use std::io::{BufRead, BufReader, Write};
-            use std::os::unix::net::UnixStream;
+        let (read_half, write_half) = Self::connect_stream(socket)?;
+        Self::roundtrip_on(read_half, write_half, token, request)
+    }
 
-            let stream = UnixStream::connect(socket)
-                .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .ok();
-            let mut writer = stream
-                .try_clone()
-                .map_err(|e| format!("接続の複製に失敗: {e}"))?;
-            let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
-            let json = serde_json::to_string(&envelope)
-                .map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
-            writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+    #[cfg(unix)]
+    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), String> {
+        use std::os::unix::net::UnixStream;
 
-            let mut line = String::new();
-            BufReader::new(stream)
-                .read_line(&mut line)
-                .map_err(|e| format!("応答の受信に失敗: {e}"))?;
-            if line.is_empty() {
-                return Err("tako app から応答が返らなかった".into());
-            }
-            let response: crate::protocol::ResponseEnvelope =
-                serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
-            match response.error {
-                Some(error) => Ok(Err(error)),
-                None => Ok(Ok(response.result.unwrap_or(Value::Null))),
-            }
+        let stream = UnixStream::connect(socket)
+            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+        Ok((read_half, stream))
+    }
+
+    #[cfg(windows)]
+    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), String> {
+        let stream = crate::platform::named_pipe::connect_client(socket, 3_000)
+            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+        Ok((read_half, stream))
+    }
+
+    /// 1 往復ぶんのワイヤ処理（両プラットフォームが通る 1 実装）
+    fn roundtrip_on<R: Read, W: Write>(
+        read_half: R,
+        mut write_half: W,
+        token: &str,
+        request: crate::protocol::Request,
+    ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
+        use std::io::{BufRead, BufReader};
+
+        let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
+        let json =
+            serde_json::to_string(&envelope).map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
+        writeln!(write_half, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+
+        let mut line = String::new();
+        BufReader::new(read_half)
+            .read_line(&mut line)
+            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+        if line.is_empty() {
+            return Err("tako app から応答が返らなかった".into());
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (socket, token, request);
-            Err("Windows の IPC は未実装".into())
+        let response: crate::protocol::ResponseEnvelope =
+            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        match response.error {
+            Some(error) => Ok(Err(error)),
+            None => Ok(Ok(response.result.unwrap_or(Value::Null))),
         }
     }
 }
@@ -958,6 +986,16 @@ impl PaneMapping {
         self.updated_at = std::time::Instant::now();
     }
 
+    /// tako PaneId（数値）→ 器のセッション名。
+    /// **ターゲット式を組む前の 1 段**で、scrollback（#972）と `resolve_tmux_target` が共有する
+    fn backend_session_of(&self, id: u64) -> Option<String> {
+        let info = self.pane_info.get(&id)?;
+        info["tmux_session"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// tako PaneId（数値文字列）を tmux ターゲット（`session:0.0`）に解決する。
     /// 既に tmux ターゲット形式（`:` を含む）ならそのまま返す
     fn resolve_tmux_target(&self, pane_param: &str) -> Option<String> {
@@ -965,8 +1003,7 @@ impl PaneMapping {
             return Some(pane_param.to_string());
         }
         let id: u64 = pane_param.parse().ok()?;
-        let info = self.pane_info.get(&id)?;
-        let session = info["tmux_session"].as_str().filter(|s| !s.is_empty())?;
+        let session = self.backend_session_of(id)?;
         Some(format!("{session}:0.0"))
     }
 }
@@ -1810,9 +1847,114 @@ pub fn run_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// ペインのスクロールバック履歴をプレーンテキストで取得する。
-/// CLI (`tako remote scrollback`) から使う
+/// `tako remote scrollback` が受け取る対象指定の解釈（純関数。#972）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScrollbackTarget {
+    /// 数値の tako PaneId。器のセッション名は別途解決する
+    Pane(u64),
+    /// 器のセッション名
+    Session(String),
+}
+
+/// 対象指定を分類する。
+///
+/// - `:` を含む形（`session:0.0` のような tmux ターゲット式）は**セッション部だけ**を採る。
+///   器のセッション名はターゲット式ではない（`SessionRef` が構造で弾く）ので、
+///   ここで剥がしておかないと到達解決の時点で `InvalidSession` になる
+/// - 全桁が数字なら tako PaneId（MCP / CLI が渡す既定の形）
+/// - それ以外は器のセッション名
+pub(crate) fn parse_scrollback_target(spec: &str) -> Result<ScrollbackTarget, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("ペイン ID / セッション名が空".to_string());
+    }
+    let head = spec.split(':').next().unwrap_or("").trim();
+    if head.is_empty() {
+        return Err(format!("対象指定 '{spec}' からセッション名を取り出せない"));
+    }
+    if head.len() == spec.len() {
+        if let Ok(id) = head.parse::<u64>() {
+            return Ok(ScrollbackTarget::Pane(id));
+        }
+    }
+    Ok(ScrollbackTarget::Session(head.to_string()))
+}
+
+/// ペインのスクロールバック（履歴 + 現画面）をプレーンテキストで取得する。
+/// CLI (`tako remote scrollback`) / MCP (`tako_remote_scrollback`) から使う。
+///
+/// **器の境界（#519 の `DetachedCapture`）を通す**（#972）。直に
+/// `tmux::tmux_command` を叩いていた旧実装は 2 つの理由で壊れていた:
+///
+/// 1. 器が psmux の Windows では、tmux 決め打ちの呼び方が `no server running` になる
+/// 2. ターゲットが裸の `=<session>` で、**tmux 3.6 は target-pane として解決できない**
+///    （実測 3.6b: `can't find pane: =<name>`）= macOS でも同じく失敗していた
+///
+/// **CLI 用の入口**。数値の PaneId は稼働中の tako-app へ IPC で問い合わせて
+/// 器のセッション名へ解決する。app の内側（dispatch）は解決を自分で済ませて
+/// [`scrollback_session`] を呼ぶので、この関数を通らない
 pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
+    if legacy_scrollback_enabled() {
+        return scrollback_legacy(pane_id, lines);
+    }
+    let session = resolve_scrollback_session(pane_id)?;
+    scrollback_session(&session, lines)
+}
+
+/// **解決済みの器のセッション名**で採取する（dispatch 用）。
+///
+/// [`scrollback`] と違い**この関数は IPC を張らない**。dispatch は tako-app の
+/// 内側で走るので、そこから `AppIpcClient` を使うと**自分自身への入れ子 IPC**になり、
+/// 要求を捌く側（UI スレッド）が自分の応答を待つ形になりうる
+pub fn scrollback_session(session: &str, lines: u32) -> Result<Vec<String>, String> {
+    if legacy_scrollback_enabled() {
+        return scrollback_legacy(session, lines);
+    }
+    let (session_ref, capture) = crate::reach::detached_capture(session).ok_or_else(|| {
+        format!(
+            "セッション {session} の履歴を読めない: {}",
+            crate::reach::no_detached_capture_note()
+        )
+    })?;
+    capture
+        .capture_scrollback(&session_ref, lines as usize)
+        .map_err(|e| format!("セッション {session} の履歴を読めない: {e}"))
+}
+
+/// 対象指定 → 器のセッション名（**CLI 経路だけ**が通る。数値 ID は IPC で解決する）
+fn resolve_scrollback_session(spec: &str) -> Result<String, String> {
+    match parse_scrollback_target(spec)? {
+        ScrollbackTarget::Session(name) => Ok(name),
+        ScrollbackTarget::Pane(id) => backend_session_of_pane(id).ok_or_else(|| {
+            format!(
+                "ペイン {id} の器のセッションを解決できない\
+                 （tako-app が起動していて、そのペインが器を持っているかを確認する。\
+                 セッション名を直接渡すこともできる）"
+            )
+        }),
+    }
+}
+
+/// 稼働中の tako-app へ IPC で問い合わせて tako PaneId → 器のセッション名を解決する。
+///
+/// **app の内側（dispatch）からは呼ばない**（自分自身への入れ子 IPC になる）。
+/// dispatch は `host.backend_session` で解決してからこのモジュールへ来る
+fn backend_session_of_pane(pane: u64) -> Option<String> {
+    let client = AppIpcClient::connect()?;
+    let list = client.request(crate::protocol::Request::List).ok()?;
+    let mut mapping = PaneMapping::new();
+    mapping.update_from_list(&list);
+    mapping.backend_session_of(pane)
+}
+
+/// #972 の A/B: `TAKO_972_LEGACY=1` で旧経路（tmux 決め打ち + 裸の `=session`）へ戻す
+fn legacy_scrollback_enabled() -> bool {
+    std::env::var("TAKO_972_LEGACY").as_deref() == Ok("1")
+}
+
+/// #972 以前の実装そのまま。**A/B 専用**で、production の既定経路ではない
+/// （境界の番犬はこの関数だけを名指しで許可している）
+fn scrollback_legacy(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
     let tmux_socket = tako_core::tmux_backend::socket_name();
     let target = tako_core::tmux::exact_target(pane_id);
     let output = tako_core::tmux::tmux_command(Some(&tmux_socket))
@@ -5387,6 +5529,70 @@ mod tests {
     /// ps 起動が失敗して検証素通り → daemon_stop_impl が自プロセスへ SIGTERM を送り
     /// テスト全体が死ぬ（実測）。env var を触るテストはこのロックで直列化する
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // --- #972: scrollback の対象指定の解釈 -------------------------------------
+
+    /// **#972 の回帰**: 数値の PaneId を器のセッション名として扱わない。
+    ///
+    /// 旧実装は指定をそのまま tmux ターゲットにしていたので、`1` は
+    /// `=1` になり Windows では `no server running on session '<socket>__1'` になった
+    #[test]
+    fn 数値の対象指定はペインidとして解釈する() {
+        assert_eq!(
+            parse_scrollback_target("1").unwrap(),
+            ScrollbackTarget::Pane(1)
+        );
+        assert_eq!(
+            parse_scrollback_target("  42\t").unwrap(),
+            ScrollbackTarget::Pane(42)
+        );
+        assert_eq!(
+            parse_scrollback_target("0").unwrap(),
+            ScrollbackTarget::Pane(0)
+        );
+    }
+
+    #[test]
+    fn 器のセッション名はそのまま通る() {
+        assert_eq!(
+            parse_scrollback_target("tako-abc123def456").unwrap(),
+            ScrollbackTarget::Session("tako-abc123def456".into())
+        );
+    }
+
+    /// ターゲット式で来たらセッション部だけを採る。`SessionRef` はターゲット式を
+    /// 構造で弾く（#428）ので、剥がさないと到達解決の時点で InvalidSession になる
+    #[test]
+    fn ターゲット式はセッション部だけを採る() {
+        for spec in ["tako-abc:0.0", "tako-abc:", "tako-abc:1.2"] {
+            assert_eq!(
+                parse_scrollback_target(spec).unwrap(),
+                ScrollbackTarget::Session("tako-abc".into()),
+                "spec={spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn 空の対象指定は理由つきで断る() {
+        for spec in ["", "   ", ":0.0"] {
+            assert!(parse_scrollback_target(spec).is_err(), "spec={spec:?}");
+        }
+    }
+
+    /// 解釈した結果は必ず `SessionRef` として通る形であること
+    /// （ここで通らない形を作ると到達解決が InvalidSession で落ちる）
+    #[test]
+    fn 解釈済みのセッション名は到達解決を通る形になる() {
+        let ScrollbackTarget::Session(name) = parse_scrollback_target("tako-abc:0.0").unwrap()
+        else {
+            panic!("セッション名として解釈されなかった");
+        };
+        assert!(
+            tako_core::backend::SessionRef::new(&name).is_ok(),
+            "SessionRef が受け付けない形: {name}"
+        );
+    }
 
     // --- #1038: ループバック TCP の待ち受けと自己疎通チェック -------------------
 
