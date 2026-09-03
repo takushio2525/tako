@@ -48417,13 +48417,16 @@ mod self_test {
                     && gui_message.as_ref().map(|(text, is_error)| {
                         *is_error && Some(text.as_str()) == cli_error.as_deref()
                     }) == Some(true);
-                if !cwd_ok {
-                    eprintln!(
-                        "[selftest 96] cwd saved={cwd_saved:?} form={cwd_form:?} \
-                         cleared={cwd_cleared:?} after_bad={cwd_after_bad:?} \
-                         cli_error={cli_error:?} gui_message={gui_message:?}"
-                    );
-                }
+                // 何を見て通ったのかを**成功時にも**残す（#796 の測り方: 判定の材料が
+                // 後から読めないと、通ったのか素通りしたのか区別できない）
+                println!(
+                    "TAKO_SELF_TEST_1119: saved={cwd_saved:?} form={cwd_form:?} \
+                     cleared={cwd_cleared:?} after_bad={cwd_after_bad:?} \
+                     message_matches_cli={} error_len={}",
+                    gui_message.as_ref().map(|(t, _)| Some(t.as_str()) == cli_error.as_deref())
+                        == Some(true),
+                    cli_error.as_deref().map(str::len).unwrap_or(0),
+                );
                 check(
                     cwd_ok,
                     "プロファイルタブ: 起動フォルダの往復と、弾かれた理由が CLI と同じ文言で出る (#1119)",
