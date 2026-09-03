@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 ///
 /// これが設定されているときだけ統合スクリプトは側路へ書く（未設定なら従来どおり
 /// コンソールへ OSC を出す）。器へは**ペイン固有の値**として渡す必要がある
-/// （[`crate::backend::PANE_SCOPED_ENV`]）
+/// （[`crate::backend::PANE_SCOPED_ENV`] / [`crate::backend::session_pinned_env`]）
 pub const SINK_ENV: &str = "TAKO_OSC_SINK";
 
 /// 側路のファイルを置くディレクトリ名（`<data_dir>/<この名前>/`）

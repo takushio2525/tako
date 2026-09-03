@@ -212,6 +212,42 @@ pub fn list_sessions(socket: Option<&str>) -> Vec<TmuxSession> {
 
 /// セッションの存在確認（`has-session`、1 コマンド）。
 /// `list_sessions`（3 コマンド）よりはるかに軽量
+/// 器のセッション / サーバーが持つ環境変数の値（診断用。#1105）。
+///
+/// `session` が `None` なら**サーバーのグローバル環境** = 最初のクライアントから
+/// 継承した値。`Some(name)` ならそのセッションに `-e` で固定された値。
+/// 「シェル統合が届いていない」を「何が無いか」で言えるようにするための窓口で、
+/// 判定には使わない（判定の正は `backend::session_pinned_env` 側の固定）
+pub fn show_environment(socket: Option<&str>, session: Option<&str>, name: &str) -> Option<String> {
+    let mut args = vec!["show-environment"];
+    match session {
+        Some(s) => {
+            args.push("-t");
+            args.push(s);
+        }
+        None => args.push("-g"),
+    }
+    args.push(name);
+    let out = run_tmux(socket, &args).ok()?;
+    // `NAME=value` / 未設定は `-NAME`（あるいは `unknown variable: NAME` で Err）
+    out.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        .map(|v| v.to_string())
+}
+
+/// 器のサーバーが持つグローバルオプションの値（診断用。#1105）。
+///
+/// tako の conf は `-f` = **サーバー起動時にしか読まれない**ので、tako が立てて
+/// いないサーバー（ユーザーが手で立てた / 古い tako が残した / 検証用のもの）へ
+/// `new-session -A` で相乗りすると `allow-passthrough` 等が既定のままになり、
+/// OSC 7 / 133 が黙って捨てられる。「何が無いか」を言うための窓口
+pub fn show_option(socket: Option<&str>, name: &str) -> Option<String> {
+    let out = run_tmux(socket, &["show-options", "-g", name]).ok()?;
+    out.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .map(|v| v.trim().to_string())
+}
+
 pub fn has_session(socket: Option<&str>, name: &str) -> bool {
     run_tmux(socket, &["has-session", "-t", &exact_target(name)]).is_ok()
 }

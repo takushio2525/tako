@@ -55,14 +55,25 @@ if [[ ! -o interactive && -n ${TAKO_PANE_ID-} ]]; then
 fi
 
 if [[ -o interactive && -n ${TAKO_PANE_ID-} ]]; then
-  # tako の tmux バックエンド（Phase 5.5 / FR-5。ソケット名 tako*）配下なら:
+  # tako の tmux バックエンド（Phase 5.5 / FR-5）配下なら:
   # 1) OSC をパススルー（DCS tmux; … ST。allow-passthrough）で包み、外の tako へ届かせる
   # 2) TMUX / TMUX_PANE を unset し、ユーザー自身の tmux 利用（ネスト）を素通しにする
   #    （バックエンドは見えない裏方。素の `tmux` が今まで通り既定サーバーに繋がる）
+  # 器かどうかは **tako が明示したソケット名**（TAKO_BACKEND_SOCKET）で判定する（#1105）。
+  # 名前の接頭辞 `tako*` は、この env を渡さない古い tako が立てたセッション用の
+  # フォールバック。接頭辞だけに頼っていたので、TAKO_TMUX_SOCKET に `tako` で
+  # 始まらない名前を与えると統合が黙って無効化されていた（cwd 追従とコマンド状態が死ぬ）
   _tako_tmux=
-  if [[ -n ${TMUX-} && ${${TMUX%%,*}:t} == tako* ]]; then
-    _tako_tmux=1
-    unset TMUX TMUX_PANE
+  if [[ -n ${TMUX-} ]]; then
+    _tako_sock=${${TMUX%%,*}:t}
+    if [[ -n ${TAKO_BACKEND_SOCKET-} ]]; then
+      # 右辺はクォートする（zsh の `==` は右辺をパターンとして扱う）
+      [[ $_tako_sock == "${TAKO_BACKEND_SOCKET}" ]] && _tako_tmux=1
+    elif [[ $_tako_sock == tako* ]]; then
+      _tako_tmux=1
+    fi
+    unset _tako_sock
+    [[ -n $_tako_tmux ]] && unset TMUX TMUX_PANE
   fi
   _tako_emit() {
     if [[ -n $_tako_tmux ]]; then

@@ -136,7 +136,87 @@ pub const PANE_SCOPED_ENV: &[&str] = &[
     "TAKO_TAB_ID",
     // #766: 器が OSC を素通ししないときのシェル統合の書き先（`osc_sink::SINK_ENV`）
     crate::osc_sink::SINK_ENV,
+    // #1105: 器のソケット名（シェル統合が「自分は tako の器の中か」を判定する材料）
+    BACKEND_SOCKET_ENV,
 ];
+
+/// 器のソケット名を器の中のシェルへ伝える環境変数（#1105）。
+///
+/// シェル統合は「自分が tako の器の中に居るか」で挙動を変える（OSC を DCS
+/// パススルーで包む / `TMUX` を unset してユーザーのネスト tmux を素通しにする）。
+/// **判定材料をソケット名の接頭辞 `tako*` に頼っていた**ので、`TAKO_TMUX_SOCKET` に
+/// `tako` で始まらない名前を与えると統合が黙って無効化され、cwd 追従（OSC 7）と
+/// コマンド状態（OSC 133）が両方死んでいた（#1105 の実測。検証用のソケット名で踏んだ）。
+///
+/// tako が名前を明示すれば推測が要らない。統合スクリプトは
+/// **この値があればそれを使い、無ければ従来の接頭辞へ落ちる**
+/// （この env を渡さない古い tako が立てたセッションでも動く）
+pub const BACKEND_SOCKET_ENV: &str = "TAKO_BACKEND_SOCKET";
+
+/// 器のセッションを作るときに `-e` で**値を確定させる**キーか。
+///
+/// 器のサーバーのグローバル環境は**最初のクライアントから継承**され、後続セッションも
+/// その stale な値を使う。だから「呼び出し元プロセスごとに違う値」は、継承に任せず
+/// セッション作成時に固定しないと**別インスタンスの値**が見えてしまう。該当は 2 種:
+///
+/// - **ペインごとに違う**（[`PANE_SCOPED_ENV`]）: pane / tab の ID と #766 の側路の書き先
+/// - **インスタンスごとに違う**（[`crate::shell_integration::INJECTED_KEYS`]）:
+///   シェル統合の置き場（data dir 配下）。#1105 まで継承任せだったので、同じ socket 名に
+///   別インスタンスのサーバーが残っていると OSC 7 / 133 が黙って届かなくなっていた
+pub fn session_pinned_env(key: &str) -> bool {
+    PANE_SCOPED_ENV.contains(&key) || crate::shell_integration::INJECTED_KEYS.contains(&key)
+}
+
+/// 器のセッション作成時に `-e` で固定する `(key, value)` の一覧。
+///
+/// 材料は 2 つある:
+///
+/// 1. `options.env` のうち [`session_pinned_env`] に載っているぶん（pane / tab の ID と
+///    #766 の側路の書き先）
+/// 2. **シェル統合が撒く env**（`ZDOTDIR` 等）。これは `options.env` には載らない:
+///    [`crate::TerminalSession::spawn`] が**外側 PTY**（= 器のクライアントプロセス）の
+///    env へ足す形なので、器の中のシェルへはサーバー継承でしか届いていなかった。
+///    サーバーの環境は最初のクライアントからの継承なので、同じ socket 名に別
+///    インスタンスのサーバーが残っていると前のインスタンスの置き場を指す（#1105）
+///
+/// 衝突したら `options.env`（呼び出し側の明示）が勝つ
+pub fn session_pinned_pairs(
+    options_env: &[(String, String)],
+    socket: &str,
+) -> Vec<(String, String)> {
+    // `TAKO_1105_LEGACY=1` で **#1105 前の挙動**（`options.env` に載っているぶんだけを
+    // 固定する = シェル統合の置き場も器の同一性も伝えない）へ戻す。
+    // 同一バイナリで A/B を取る入口で、診断行の検出力の実証にも使う
+    if std::env::var_os("TAKO_1105_LEGACY").is_some() {
+        return options_env
+            .iter()
+            .filter(|(key, _)| PANE_SCOPED_ENV.contains(&key.as_str()))
+            .cloned()
+            .collect();
+    }
+    let mut out: Vec<(String, String)> = options_env
+        .iter()
+        .filter(|(key, _)| session_pinned_env(key))
+        .cloned()
+        .collect();
+    for (key, val) in crate::shell_integration::env() {
+        if out.iter().any(|(k, _)| k == key) {
+            continue;
+        }
+        out.push((key.clone(), val.clone()));
+    }
+    // #1105: 器の同一性は**名前を明示して**伝える（接頭辞の推測に頼らない）。
+    // 値はソケットの basename（`$TMUX` が持つのもパスの basename なので揃う）
+    if !out.iter().any(|(k, _)| k == BACKEND_SOCKET_ENV) {
+        let name = socket
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(socket);
+        out.push((BACKEND_SOCKET_ENV.to_string(), name.to_string()));
+    }
+    out
+}
 
 /// バックエンドの能力。
 ///
@@ -916,6 +996,28 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// #1105: シェル統合の `-e` は data dir 依存（インスタンスごとに変わる）ので
+/// argv のスナップショットへ literal で書けない。**位置と有無だけ固定**し、
+/// 値そのものは統合の正本と突き合わせる（`統合の値が固定される`）。
+/// 統合が env を撒かない環境（Windows）では何も除かない
+#[cfg(test)]
+pub(crate) fn strip_integration_env(args: &mut Vec<String>) -> Vec<String> {
+    let mut removed = Vec::new();
+    for (key, _) in crate::shell_integration::env() {
+        let Some(at) = args
+            .iter()
+            .position(|a| a.starts_with(&format!("{key}=")))
+            .filter(|at| *at > 0 && args[at - 1] == "-e")
+        else {
+            continue;
+        };
+        removed.push(args.remove(at));
+        args.remove(at - 1);
+    }
+    removed.sort();
+    removed
+}
+
 #[cfg(test)]
 mod pane_scoped_env_tests {
     use super::*;
@@ -927,6 +1029,107 @@ mod pane_scoped_env_tests {
         assert!(PANE_SCOPED_ENV.contains(&crate::osc_sink::SINK_ENV));
         assert!(PANE_SCOPED_ENV.contains(&"TAKO_PANE_ID"));
         assert!(PANE_SCOPED_ENV.contains(&"TAKO_TAB_ID"));
+        for key in PANE_SCOPED_ENV {
+            assert!(session_pinned_env(key), "{key} が固定対象から外れている");
+        }
+    }
+
+    /// #1105: シェル統合の置き場はインスタンスごとに違うので、継承に任せると
+    /// 同じ socket 名に残った**別インスタンスのサーバー**の値が見えて
+    /// OSC 7 / 133 が一切届かなくなる（cwd 追従とコマンド状態が黙って死ぬ）
+    #[test]
+    fn シェル統合の置き場もセッション作成時に固定される() {
+        for key in crate::shell_integration::INJECTED_KEYS {
+            assert!(
+                session_pinned_env(key),
+                "{key} が `-e` で固定されない（器のサーバーの stale な値を見る）"
+            );
+        }
+        // 無関係なキーは固定しない（ペインの環境を必要以上に汚さない）
+        assert!(!session_pinned_env("PATH"));
+        assert!(!session_pinned_env("HOME"));
+    }
+
+    /// #1105 の要点は**キー名の表**ではなく「実際に値が `-e` へ載るか」。
+    /// 統合の env は `options.env` に載らない（外側 PTY の env へ足される）ので、
+    /// 表だけ足して `options.env` を舐めるだけの実装では 1 つも固定されない
+    /// （実測: `zdotdir_session=None` のまま項目 60 が落ちた）
+    #[test]
+    fn 固定する値は統合の正本から取る() {
+        let options_env = vec![
+            ("TAKO_PANE_ID".to_string(), "7".to_string()),
+            ("PATH".to_string(), "/nope".to_string()),
+        ];
+        let pinned = session_pinned_pairs(&options_env, "tako-unit");
+        assert!(pinned.iter().any(|(k, v)| k == "TAKO_PANE_ID" && v == "7"));
+        assert!(
+            !pinned.iter().any(|(k, _)| k == "PATH"),
+            "無関係なキーは固定しない"
+        );
+        // 統合が env を撒く環境（POSIX）では、その値が options.env 抜きでも載る
+        for (key, val) in crate::shell_integration::env() {
+            assert!(
+                pinned.iter().any(|(k, v)| k == key && v == val),
+                "{key} が統合の正本から固定されていない（#1105）"
+            );
+        }
+        // 器の同一性も名前で伝わる（統合が接頭辞 `tako*` を推測しなくて済む）
+        assert!(
+            pinned
+                .iter()
+                .any(|(k, v)| k == BACKEND_SOCKET_ENV && v == "tako-unit"),
+            "{BACKEND_SOCKET_ENV} が固定されていない（#1105）"
+        );
+    }
+
+    /// #1105: `$TMUX` が持つのはソケット**パス**なので、値は basename へ揃える
+    /// （そうしないとシェル側の比較が絶対パス指定のソケットで必ず外れる）
+    #[test]
+    fn 器のソケット名はbasenameで渡る() {
+        for (socket, want) in [
+            ("tako", "tako"),
+            ("/private/tmp/tmux-501/tako-iso-1", "tako-iso-1"),
+            ("C:\\pipe\\tako-win", "tako-win"),
+        ] {
+            let pinned = session_pinned_pairs(&[], socket);
+            let got = pinned
+                .iter()
+                .find(|(k, _)| k == BACKEND_SOCKET_ENV)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(got, Some(want), "socket={socket}");
+        }
+    }
+
+    /// #1105: [`crate::shell_integration::INJECTED_KEYS`] が実態から drift しない。
+    ///
+    /// `session_pinned_pairs` は値を正本（`shell_integration::env()`）から引くので
+    /// 機能は表に依らないが、表は**呼び出し側が `options.env` で明示した統合キーを
+    /// 残すか**の判定に使う。統合が撒くキーが増えたのに表へ足し忘れると、
+    /// その明示だけが黙って落ちる（#1105 と同じ「黙って壊れる」形）
+    #[test]
+    fn 統合が撒くキーは表に載っている() {
+        for (key, _) in crate::shell_integration::env() {
+            assert!(
+                crate::shell_integration::INJECTED_KEYS.contains(&key.as_str()),
+                "{key} が INJECTED_KEYS に無い（統合が撒くキーを増やしたら表も足す）"
+            );
+        }
+    }
+
+    /// 呼び出し側の明示（`options.env`）が統合の既定に勝つ
+    #[test]
+    fn options_envの明示が統合の値に勝つ() {
+        let Some((key, _)) = crate::shell_integration::env().first().cloned() else {
+            return; // 統合が env を撒かない環境（Windows）
+        };
+        let options_env = vec![(key.clone(), "明示".to_string())];
+        let pinned = session_pinned_pairs(&options_env, "tako-unit");
+        assert_eq!(
+            pinned.iter().filter(|(k, _)| *k == key).count(),
+            1,
+            "同じキーが二重に載らない"
+        );
+        assert!(pinned.iter().any(|(k, v)| *k == key && v == "明示"));
     }
 
     /// 表を引く側が tmux / psmux の両方であること（片方だけ足すと
@@ -938,8 +1141,9 @@ mod pane_scoped_env_tests {
             ("backend/psmux.rs", include_str!("psmux.rs")),
         ] {
             assert!(
-                src.contains("PANE_SCOPED_ENV.contains("),
-                "{name} が PANE_SCOPED_ENV を引いていない（キーの直書きへ戻っている）"
+                src.contains("session_pinned_pairs("),
+                "{name} が session_pinned_pairs を引いていない（キーの直書き、または \
+                 `options.env` だけを舐める形へ戻っている = #1105 が再発する）"
             );
             assert!(
                 !src.contains(r#"key == "TAKO_PANE_ID""#),
