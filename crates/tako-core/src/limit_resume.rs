@@ -366,7 +366,8 @@ pub fn safe_choice(options: &[(Option<u32>, String)]) -> Option<(u32, &str)> {
 /// `out of usage credits` / `org is out of usage`。座席種別・組織の無効化・
 /// `group's usage limit is set to $0` のように**時間では解けない**ものは入れない
 /// —— 受けると `WorkerErrorKind::UsageLimit` の助言（`wait_reset` = 解除まで待つ）が
-/// 嘘になる。別種として扱う必要があるので Issue に切り出してある。
+/// 嘘になる。そちらは [`entitlement_block_line`] が受け持ち、**この関数は
+/// そちらに当たる行を必ず false にする**（#1107。排他を構造で保証する）。
 ///
 /// # 旧来の文言も同じ規則の下に置く
 ///
@@ -377,6 +378,14 @@ pub fn safe_choice(options: &[(Option<u32>, String)]) -> Option<(u32, &str)> {
 pub fn is_limit_exhausted_line(line: &str) -> bool {
     // 自動モデル切替の告知は上限「到達」ではあるが停止しない
     if line.contains("limit reached, now using") {
+        return false;
+    }
+    // **時間では解けない阻害はここでは受けない**（#1107）。2 つの規則を排他にしておくと
+    // 種別が検査順に依らず一意に決まり、メーター（`exhausted_limit_window`）も
+    // 自動的に `--` のままになる。codex の `You've reached your workspace credit limit`
+    // は見出しだけ見るとテンプレート（`reached your <名前>limit`）にも当たるので、
+    // **偶然の排他ではなく構造で**分けておく必要がある
+    if entitlement_block_line(line) {
         return false;
     }
     if legacy_session_limit() {
@@ -513,10 +522,10 @@ const EXHAUSTED_HEADLINE_VERBS: [&str; 2] = ["hit your", "reached your"];
 /// アポストロフィ（`You're` / `Your org`）は判定に使わない
 const EXHAUSTED_PHRASES: [&str; 2] = ["out of usage credits", "org is out of usage"];
 
-/// 時間では解けない利用阻害の語句（#1106）。各要素は**すべて含まれていること**を
+/// 時間では解けない利用阻害の語句（#1106 / #1107）。各要素は**すべて含まれていること**を
 /// 求める必須語の組（アポストロフィを避けて分割してある。[`entitlement_block_line`]）。
-/// 並びは Issue #1106 の分類表 A〜F の順
-const ENTITLEMENT_BLOCK_PHRASES: [&[&str]; 7] = [
+/// 並びは A〜F = claude（Issue #1106 の分類表）/ G〜J = codex・agy（#1107 の実物調査）
+const ENTITLEMENT_BLOCK_PHRASES: [&[&str]; 11] = [
     // A. 座席種別（`Your seat type doesn't include usage credits` /
     //    `… doesn't include usage` / `… doesn't include extra usage`）。
     //    アポストロフィの前後で割る（`doesn't` / `doesn\u{2019}t` の両方に効き、
@@ -537,6 +546,30 @@ const ENTITLEMENT_BLOCK_PHRASES: [&[&str]; 7] = [
     &["out of extra usage"],
     // F. 組織でサービス無効（`pCt` = `This service is disabled for your org`）
     &["service is disabled for your org"],
+    // --- ここから codex / agy（#1107 の実物調査）---
+    // G. クレジット残高の枯渇。**owner / 本人が買い足すまで解けない**
+    //    codex 0.153.0: `You're out of credits.` /
+    //      `Your workspace is out of credits. Add credits to continue.` /
+    //      `… Ask your workspace owner to refill in order to continue.` /
+    //      `… Add credits to continue using Codex.`
+    //    agy 1.1.25: `AI: Out of credits`（TUI のエラー表示。前払いクレジットが 0）
+    //    claude のバイナリには 1 件も無い（`out of usage credits` = 時間で解ける別文言）
+    &["out of credits"],
+    // H. spend cap（codex 0.153.0）。**上限を上げるまで解けない**
+    //    `You hit your spend cap set in your workspace. Increase your spend cap to continue.` /
+    //    `You hit your spend cap set by the owner of your workspace. Ask an owner to …`
+    //    claude の `spend limit`（75 件）とは別語で、こちらは claude に 1 件も無い
+    &["spend cap"],
+    // I. workspace のクレジット上限（codex 0.153.0 のダイアログ見出し）。
+    //    `You've reached your workspace credit limit` +
+    //    `Your workspace is out of credits. Ask your workspace owner to add more. Notify owner?`
+    //    **見出しだけは `reached your … limit` のテンプレートにも当たる**が、
+    //    対処の選択肢に「待つ」出口が無い（`Notify owner?` だけ）ので時間では解けない
+    &["workspace credit limit"],
+    // J. ライセンス不足（agy 1.1.25）。**管理者が付与するまで解けない**
+    //    `No license available for this project and location. Contact your administrator
+    //     to setup Gemini Enterprise for this project.`
+    &["no license available"],
 ];
 
 /// 動詞の直後で限度の名前を探す文字数の歯止め（句読点が来ない行のため）。
@@ -1474,6 +1507,96 @@ mod tests {
         // F. 組織でサービス無効（`pCt`）
         "This service is disabled for your org",
     ];
+
+    /// codex 0.153.0 / agy 1.1.25 のバイナリから採った実文言（#1107 の実物調査）。
+    /// **claude のバイナリには 1 件も無い**（`out of credits` 0 件 / `spend cap` 0 件 /
+    /// `workspace credit limit` 0 件 / `no license available` 0 件 = 実測）ので、
+    /// claude の判定は 1 ビットも変わらない
+    const ENTITLEMENT_LINES_CODEX_AGY: [&str; 8] = [
+        // G. クレジット残高の枯渇（codex）
+        "You're out of credits.",
+        "Your workspace is out of credits. Add credits to continue.",
+        "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+        "Your workspace is out of credits. Add credits to continue using Codex.",
+        // G. 同（agy 1.1.25 の TUI エラー表示。前払いクレジットが 0）
+        "AI: Out of credits",
+        // H. spend cap（codex）
+        "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+        "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.",
+        // J. ライセンス不足（agy）
+        "No license available for this project and location. Contact your administrator to setup Gemini Enterprise for this project.",
+    ];
+
+    #[test]
+    fn issue1107_codexとagyの阻害文言も別種として読む() {
+        for line in ENTITLEMENT_LINES_CODEX_AGY {
+            assert!(
+                entitlement_block_line(line),
+                "時間で解けない阻害として読めていない: {line}"
+            );
+            // 上限停止（`wait_reset`）とは排他 = 自動復帰が撃たない
+            assert!(
+                !is_limit_exhausted_line(line),
+                "時間で解けない阻害を上限停止と読んでいる: {line}"
+            );
+            assert_eq!(exhausted_limit_window(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn issue1107_workspace_credit_limitはテンプレートより阻害が優先する() {
+        // codex 0.153.0 のダイアログ見出し。**`reached your <名前>limit` の
+        // テンプレートにも当たる**ので、排他を構造で保証していないと
+        // `usage_limit`（= 解除まで待つ）に倒れて助言が嘘になる。
+        // 対処の選択肢は `Ask your workspace owner to add more. Notify owner?` だけで
+        // 「待つ」出口が無い（= 時間では解けない）
+        let line = "You've reached your workspace credit limit";
+        assert!(entitlement_block_line(line));
+        assert!(
+            !is_limit_exhausted_line(line),
+            "テンプレート側が勝っている（排他が構造で保証されていない）"
+        );
+        // 語句を外した形（= 素のテンプレート）は従来どおり上限として読む。
+        // ここは **`TAKO_1093_LEGACY` / `TAKO_1096_LEGACY` のどのアームでも成立する形**
+        // を選ぶ（legacy アームの失敗集合を #1107 で増やさないため）
+        assert!(is_limit_exhausted_line("You've hit your usage limit"));
+    }
+
+    #[test]
+    fn issue1107_codexの上限系は従来どおり時間で解ける扱い() {
+        // codex 0.153.0 の実文言。こちらは「上限」なので待てば解ける
+        // （#985 の分類を変えない。`Request a limit increase from your owner` は
+        // 境界事例だが、文言が `Usage limit reached` なので上限側に残す）。
+        //
+        // **`is_limit_exhausted_line` を assert するのは全アームで成立する形だけ**に絞る
+        // （`Usage limit reached. You've reached your usage limit. …` は #1096 の動詞
+        // `reached your` 経由でしか当たらない —— 旧来の後方互換規則は
+        // `usage limit reached` を**小文字のまま**探すので大文字始まりの codex の
+        // 文言には当たらない = `TAKO_1096_LEGACY=1` では読めない）
+        let codex_limit_lines = [
+            "You've hit your usage limit.",
+            "You've hit your usage limit. To get more access now, send a request to your admin",
+            "Usage limit reached. You've reached your usage limit. Increase your limits to continue using codex.",
+            "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits",
+        ];
+        // #1107 が守るべき不変条件（env に依らない）: 上限を阻害へ倒さない
+        for line in codex_limit_lines {
+            assert!(
+                !entitlement_block_line(line),
+                "上限を阻害へ倒している: {line}"
+            );
+        }
+        // 現行規則では 4 本とも上限として読める
+        for line in codex_limit_lines {
+            if legacy_session_limit() || legacy_out_of_usage() {
+                continue; // legacy アームは #1093 / #1096 の A/B が担保する
+            }
+            assert!(
+                is_limit_exhausted_line(line),
+                "上限として読めていない: {line}"
+            );
+        }
+    }
 
     #[test]
     fn issue1106_時間で解けない阻害の8文言を別種として読む() {

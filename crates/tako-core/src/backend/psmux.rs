@@ -252,11 +252,9 @@ impl SessionBackend for PsmuxBackend {
         ]);
         // ペイン固有の環境変数はセッション作成時に確定させる（tmux 版と同じ理由。
         // サーバーのグローバル環境から stale な値を拾わせない）
-        for (key, val) in &options.env {
-            if crate::backend::PANE_SCOPED_ENV.contains(&key.as_str()) {
-                args.push("-e".to_string());
-                args.push(format!("{key}={val}"));
-            }
+        for (key, val) in crate::backend::session_pinned_pairs(&options.env, &self.socket) {
+            args.push("-e".to_string());
+            args.push(format!("{key}={val}"));
         }
         if let Some(cwd) = &options.cwd {
             args.push("-c".to_string());
@@ -1117,6 +1115,18 @@ mod tests {
         } else {
             args.splice(3..3, ["-f".to_string(), "<conf>".to_string()]);
         }
+        // #1105: シェル統合の `-e` は値が data dir 依存なので外して別途見る
+        // （Windows は統合が env を撒かないので空になる）
+        let integration = crate::backend::strip_integration_env(&mut args);
+        let mut expected_integration: Vec<String> = crate::shell_integration::env()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        expected_integration.sort();
+        assert_eq!(
+            integration, expected_integration,
+            "シェル統合の置き場がセッションへ固定されていない（#1105）"
+        );
         assert_eq!(
             args,
             vec![
@@ -1134,6 +1144,9 @@ mod tests {
                 "TAKO_PANE_ID=7",
                 "-e",
                 "TAKO_TAB_ID=3",
+                // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
+                "-e",
+                "TAKO_BACKEND_SOCKET=tako-unit",
                 "-c",
                 "C:\\work",
             ]

@@ -496,9 +496,24 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   **conf はサーバー起動時にしか読まれない**ため、稼働中サーバーへは起動時に
   `tmux_backend::sync_conf`（`source-file`）で再適用する（下記の罠）
 - **シェル統合の共存**: tmux は OSC 7 / 133 を外へ転送しないため、統合スクリプトが
-  バックエンド配下（`$TMUX` のソケット basename が `tako*`）では OSC を
-  `\ePtmux;…\e\\` パススルーで包む。同時に **TMUX / TMUX_PANE を unset** し、
-  ユーザー自身の `tmux` 利用（ネスト）を素通しにする（バックエンドは見えない裏方）
+  バックエンド配下では OSC を `\ePtmux;…\e\\` パススルーで包む。同時に
+  **TMUX / TMUX_PANE を unset** し、ユーザー自身の `tmux` 利用（ネスト）を
+  素通しにする（バックエンドは見えない裏方）。
+  **「バックエンド配下か」は tako が明示したソケット名で判定する**
+  （`backend::BACKEND_SOCKET_ENV` = `TAKO_BACKEND_SOCKET` を `-e` で固定し、
+  スクリプトは `$TMUX` のソケット basename と突き合わせる）。#1105 まで判定材料が
+  **名前の接頭辞 `tako*` だった**ので、`TAKO_TMUX_SOCKET` に `tako` で始まらない
+  名前を与えると統合が黙って無効化され、cwd 追従とコマンド状態が両方死んでいた。
+  接頭辞は「この env を渡さない古い tako が立てたセッション」用のフォールバックとして残す
+- **器のセッションへ固定する env（#1105）**: 器のサーバーのグローバル環境は
+  **最初のクライアントから継承**され、後続セッションもその stale な値を使う
+  （実測: `ZDOTDIR=A` で起動したサーバー上に `ZDOTDIR=B` のプロセスから
+  セッションを作ると中のシェルは A を見る）。だから「呼び出し元プロセスごとに違う値」は
+  `new-session -e` で作成時に固定する。正本は `backend::session_pinned_pairs` で、
+  ペインごとに違うぶん（pane / tab の ID・#766 の側路の書き先・器のソケット名）と
+  **インスタンスごとに違うぶん**（シェル統合の置き場 = `shell_integration::INJECTED_KEYS`）を
+  合わせて返す。統合の置き場は `options.env` には載らない（`TerminalSession::spawn` が
+  **外側 PTY** の env へ足す）ので、正本から直接引くのが要点
 - **tty 突き合わせの維持**: ペイン配下プロセスの制御端末はバックエンドサーバー側の
   ペイン tty になるため、spawn 後に `list-panes -t =<session> -F '#{pane_tty}'` で解決して
   `TerminalSession::set_tty_name` で差し替える（listen ポート検知 FR-2.4.2 と

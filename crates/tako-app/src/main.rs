@@ -38070,6 +38070,130 @@ mod self_test {
                             break;
                         }
                     }
+                    // #1105: 落ちたときに「何が無いか」を名指しする（#796 の作法）。
+                    //
+                    // この項目は「器の中のシェルがシェル統合を読み込んで OSC 7 を出し、
+                    // それが器のパススルーで外の tako へ届く」の全段が要る。落ちる原因は
+                    // 段ごとに違うので、材料をそのまま出す。
+                    // **行は `join` で組む**: 文字列リテラルの行継続は `cargo fmt` が
+                    // 1 行へ潰して空白の塊にするので、log が読めなくなる
+                    let osc60_expected = tako_core::shell_integration::env()
+                        .iter()
+                        .find(|(k, _)| k == "ZDOTDIR")
+                        .map(|(_, v)| v.clone());
+                    let osc60_session = tako_core::tmux::show_environment(
+                        Some(&backend_sock),
+                        Some(&backend_name),
+                        "ZDOTDIR",
+                    );
+                    let osc60_server =
+                        tako_core::tmux::show_environment(Some(&backend_sock), None, "ZDOTDIR");
+                    // 器のサーバーが実際に持っている素通し設定。tako の conf は `-f` =
+                    // **サーバー起動時にしか読まれない**ので、tako が立てていない
+                    // サーバーへ `new-session -A` で相乗りすると既定（off）のままになる
+                    let osc60_server_pt =
+                        tako_core::tmux::show_option(Some(&backend_sock), "allow-passthrough");
+                    // サーバーが**別インスタンスのシェル統合**を指しているか
+                    // （= 同じ socket 名を使い回した残骸。#1105 が起きる条件そのもの）
+                    let osc60_stale = osc60_server.is_some() && osc60_server != osc60_expected;
+                    let osc60_pane_cwd = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&backend_pane)
+                                .and_then(|s| s.cwd())
+                                .map(|p| p.display().to_string())
+                        })
+                        .ok()
+                        .flatten();
+                    // ペインの末尾（打った行が実際に走ったか。走っていないなら
+                    // 原因は OSC ではなく打鍵・シェルの準備側）
+                    let osc60_tail = window
+                        .update(cx, |app, _, _| {
+                            app.terminals.get(&backend_pane).map(|s| {
+                                s.visible_lines()
+                                    .into_iter()
+                                    .map(|l| l.trim_end().to_string())
+                                    .filter(|l| !l.is_empty())
+                                    .rev()
+                                    .take(3)
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    // 統合が**そもそも読み込まれたか**（OSC 133 が来ていれば Idle 等に
+                    // なる。Unknown なら OSC 7 だけの問題ではなく統合が動いていない）
+                    let osc60_state = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&backend_pane)
+                                .map(|s| format!("{:?}", s.command_state()))
+                        })
+                        .ok()
+                        .flatten();
+                    // 固定した置き場に実体（`.zshenv`）があるか
+                    let osc60_zshenv = osc60_expected
+                        .as_deref()
+                        .map(|d| std::path::Path::new(d).join(".zshenv").exists());
+                    // 器の同一性が中のシェルへ伝わっているか（#1105）。無いと統合は
+                    // ソケット名の接頭辞 `tako*` で推測するので、`tako` で始まらない
+                    // 名前のときだけ OSC を包まず黙って無効化される
+                    let osc60_sock_env = tako_core::tmux::show_environment(
+                        Some(&backend_sock),
+                        Some(&backend_name),
+                        tako_core::backend::BACKEND_SOCKET_ENV,
+                    );
+                    let caps60 = tako_core::backend::capabilities();
+                    println!(
+                        "TAKO_SELF_TEST_60: {}",
+                        [
+                            format!("cwd_ok={cwd_ok}"),
+                            format!("osc133_state={osc60_state:?}"),
+                            format!("zshenv_exists={osc60_zshenv:?}"),
+                            format!("pane_tail={osc60_tail:?}"),
+                            format!("backend={}", caps60.label),
+                            format!("declares_passthrough={}", caps60.osc_passthrough),
+                            format!("server_passthrough={osc60_server_pt:?}"),
+                            format!("socket={backend_sock}"),
+                            format!("session={backend_name}"),
+                            format!("zdotdir_expected={osc60_expected:?}"),
+                            format!("zdotdir_session={osc60_session:?}"),
+                            format!("zdotdir_server={osc60_server:?}"),
+                            format!("backend_socket_env={osc60_sock_env:?}"),
+                            format!("server_stale={osc60_stale}"),
+                            format!("waited_ms={}", 20 * 500),
+                            format!("pane_cwd={osc60_pane_cwd:?}"),
+                            env_line(),
+                        ]
+                        .join(" ")
+                    );
+                    if !cwd_ok {
+                        // 原因を名指しする（後から log を読んだ人が「環境の残骸」と
+                        // 「製品の回帰」を混ぜないように）。順序は「確定できるものから」
+                        // 文言は 1 行の literal で持つ（`\` 継続は `cargo fmt` が
+                        // インデントごと畳んで空白の塊になり log が読めなくなる）
+                        let why = if osc60_sock_env.is_none() {
+                            format!(
+                                "器の同一性が中のシェルへ伝わっていない（{} が固定されていない）。統合はソケット名の接頭辞 `tako*` で推測するので、socket={backend_sock} が `tako` で始まらないとき OSC を包まず黙って無効化される = #1105 の回帰",
+                                tako_core::backend::BACKEND_SOCKET_ENV
+                            )
+                        } else if osc60_server_pt.as_deref() == Some("off") {
+                            format!(
+                                "器のサーバーが tako の conf を読んでいない（allow-passthrough off）。conf は `-f` = サーバー起動時にしか読まれないので、稼働中サーバーへの再適用（`sync_conf`）が効いていない疑い。`tmux -L {backend_sock} kill-server` してから測り直すと切り分けられる"
+                            )
+                        } else if osc60_session.is_none() {
+                            "シェル統合の置き場がセッションへ 1 つも固定されていない（器が `session_pinned_pairs` を引いていない = #1105 の回帰）".to_string()
+                        } else if osc60_session != osc60_expected {
+                            "シェル統合の置き場がセッションへ正しく固定されていない（`session_pinned_pairs` が別の値を載せている = #1105 の回帰）".to_string()
+                        } else if osc60_stale {
+                            format!(
+                                "置き場も同一性も固定できているのに届かない。サーバーは別インスタンスの統合を指している（socket={backend_sock} の使い回し）ので、残骸を消して測り直すと切り分けられる"
+                            )
+                        } else {
+                            "統合の置き場・同一性・素通し設定はすべて正しい。疑うのはシェル側の OSC 7 送出かパススルーの包み直し（`zshenv.zsh`）".to_string()
+                        };
+                        println!("TAKO_SELF_TEST_60_WHY: {why}");
+                    }
                     check(cwd_ok, "OSC 7 が器のパススルーで届く（cwd 検知維持）");
                 } else {
                     println!(
@@ -38291,13 +38415,20 @@ mod self_test {
                 //      tako ペインで attach して見ている構成が管理外扱いされた
                 //      2026-06-13 実機バグの回帰検知）
                 let tmux_bin = tako_core::tmux::tmux_bin();
+                // #1105: セッション名は **run ごとに変える**。固定名（旧 `att-e2e`）だと、
+                // 同じ socket 名に前の run の残骸が居るとき `new-session -d` が
+                // `duplicate session` で失敗し、`&&` が短絡して **attach が走らない**。
+                // すると「セッションは在るが誰も attach していない」= タブ枠へ紐付かず
+                // この項目が落ちる。落ち方が #1105（統合が届かない）と同じ「環境の残骸」
+                // なので、テスト側の前提はテスト側で外しておく
+                let att_name = format!("att-e2e-{}", std::process::id());
                 press(any, cx, sh.clear_line_key());
                 type_text(
                     any,
                     cx,
                     &format!(
-                        "{tmux_bin} -L {backend_sock} new-session -d -s att-e2e && \
-                         {tmux_bin} -L {backend_sock} attach -t att-e2e"
+                        "{tmux_bin} -L {backend_sock} new-session -d -s {att_name} && \
+                         {tmux_bin} -L {backend_sock} attach -t {att_name}"
                     ),
                     true,
                 );
@@ -38312,7 +38443,7 @@ mod self_test {
                             let in_group = groups.iter().any(|g| {
                                 g.rows.iter().any(|r| r.pane == backend_pane)
                                     && g.sessions.iter().any(|s| {
-                                        s.name == "att-e2e"
+                                        s.name == att_name
                                             && s.pane == backend_pane.as_u64()
                                             && !s.windows.is_empty()
                                     })
@@ -38320,13 +38451,59 @@ mod self_test {
                             let not_unlisted = !app
                                 .tmux_unlisted_sessions()
                                 .iter()
-                                .any(|s| s.name == "att-e2e");
+                                .any(|s| s.name == att_name);
                             in_group && not_unlisted
                         })
                         .unwrap_or(false);
                     if attached_ok {
                         break;
                     }
+                }
+                // #1105: 落ちたときに「何が無いか」を名指しする（#796 の作法）。
+                // この項目は ①外部セッションが作れた ②そのセッションへ attach できた
+                // ③tako が tty 突き合わせでタブ枠へ紐付けた の 3 段で、段ごとに原因が違う
+                let att_sessions = tako_core::tmux::list_sessions(Some(&backend_sock));
+                let att_present = att_sessions.iter().find(|s| s.name == att_name);
+                let att_unlisted = window
+                    .update(cx, |app, _, _| {
+                        app.tmux_unlisted_sessions()
+                            .iter()
+                            .map(|s| s.name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_61F: {}",
+                    [
+                        format!("attached_ok={attached_ok}"),
+                        format!("session={att_name}"),
+                        format!("created={}", att_present.is_some()),
+                        format!("attached={:?}", att_present.map(|s| s.attached)),
+                        format!(
+                            "client_ttys={:?}",
+                            att_present.map(|s| s.client_ttys.clone())
+                        ),
+                        format!(
+                            "sessions_on_socket={:?}",
+                            att_sessions.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+                        ),
+                        format!("unlisted={att_unlisted:?}"),
+                        format!("waited_ms={}", 20 * 500),
+                        env_line(),
+                    ]
+                    .join(" ")
+                );
+                if !attached_ok {
+                    let why = match att_present {
+                        None => "外部セッションが作れていない（`new-session -d` が失敗。同名の残骸があると `duplicate session` で短絡し attach まで届かない）",
+                        Some(s) if !s.attached => {
+                            "セッションは在るが attach されていない（`&&` の後段が走っていない）"
+                        }
+                        Some(_) => {
+                            "attach 済みだが tako がタブ枠へ紐付けていない（tty 突き合わせ = FR-2.16.9 の回帰の疑い）"
+                        }
+                    };
+                    println!("TAKO_SELF_TEST_61F_WHY: {why}");
                 }
                 check(
                     attached_ok,
@@ -38340,7 +38517,7 @@ mod self_test {
                             app,
                             tako_control::protocol::Request::TmuxKill {
                                 socket: Some(backend_sock.clone()),
-                                session: "att-e2e".into(),
+                                session: att_name.clone(),
                                 window: None,
                             },
                             PaneOrigin::Cli,
@@ -51251,6 +51428,16 @@ mod self_test {
                     let _ = std::fs::remove_dir_all(&root);
                 }
             }
+            // 何が無いから走らないかを残す（#865 の作法）。項目 103 の場面作りは
+            // symlink のランチャと POSIX シェルの器（`sh -c "… & wait"`）に依っている。
+            // Windows のランチャは実体のコピーで、symlink 作成には既定で特権が要る。
+            // 判定そのもの（`pidpath` / 版の読み取り / 実行ファイル判定）は #936 で
+            // 境界へ寄せ、`cargo test` の単体（両プラットフォームで走る）が見ている
+            #[cfg(not(unix))]
+            println!(
+                "TAKO_SELF_TEST_SKIPPED: 103（場面作りが symlink と POSIX シェルの器に依る。\
+                 判定は procinfo::image_path / exe::is_executable_file の単体で検証。#936）"
+            );
 
             // 104. タブ × close の発生源マーカー（#770）。
             // 実地では「プレビュー混在タブが再起動で消えた」と報告されたが、実体は

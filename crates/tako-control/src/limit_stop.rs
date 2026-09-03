@@ -458,6 +458,37 @@ mod tests {
     }
 
     #[test]
+    fn issue1107_codexとagyの阻害でも自動復帰を発動させない() {
+        // **`You've reached your workspace credit limit` は #1107 前は
+        // `is_limit_exhausted_line` に当たっていた** = 自動復帰が「解除まで待つ」で
+        // 撃ち始め、解けない上限に対して試行上限まで空撃ちしていた
+        for line in [
+            "You're out of credits.",
+            "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+            "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+            "You've reached your workspace credit limit",
+            "AI: Out of credits",
+            "No license available for this project and location. Contact your administrator to setup Gemini Enterprise for this project.",
+        ] {
+            let src = OUT_OF_CREDITS_IDLE.replace(
+                "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+                line,
+            );
+            assert!(
+                detect_limit_stop(&screen(&src), OBSERVED, JST).is_none(),
+                "時間で解けない阻害で自動復帰が発動しうる状態になっている: {line}"
+            );
+            let (kind, detail) = detect_worker_error(&screen(&src).join("\n"))
+                .unwrap_or_else(|| panic!("停止として検知されない: {line}"));
+            assert_eq!(kind, WorkerErrorKind::EntitlementBlocked, "{line}");
+            assert!(
+                detail.contains(line),
+                "検知の根拠が見出し行になっていない: {detail}"
+            );
+        }
+    }
+
+    #[test]
     fn issue1096_接近の警告では自動復帰を発動させない() {
         // claude 自身が別リスト（`fCt`）に分けている警告。まだ止まっていない
         for line in [
