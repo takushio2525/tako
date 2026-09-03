@@ -453,7 +453,8 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
                 .iter()
                 .map(PathBuf::from)
                 .filter_map(|p| {
-                    let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    // 解決は境界（B26）を通す（復元後もタブへ保存される値。#970）
+                    let canon = tako_core::platform::path::canonicalize_or_self(&p);
                     if !canon.is_dir() || !seen.insert(canon.clone()) {
                         return None;
                     }

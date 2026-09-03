@@ -1393,7 +1393,9 @@ fn dispatch_inner(
             let cwd = match cwd {
                 Some(raw) => {
                     let path = std::path::PathBuf::from(&raw);
-                    let path = path.canonicalize().map_err(|e| {
+                    // 解決は境界（B26）を通す。verbatim prefix をシェルの cwd にすると
+                    // OSC 7 が `///?/C:/…` へ壊れて git 操作が全滅する（#970）
+                    let path = tako_core::platform::path::canonicalize(&path).map_err(|e| {
                         DispatchError::Operation(format!("フォルダを開けない（{raw}: {e}）"))
                     })?;
                     if !path.is_dir() {
@@ -1825,7 +1827,8 @@ fn dispatch_inner(
                     resolved = cwd.join(resolved);
                 }
             }
-            let resolved = resolved.canonicalize().map_err(|e| {
+            // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
+            let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
                 DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
             })?;
             if !resolved.is_file() {
@@ -4040,7 +4043,8 @@ fn dispatch_inner(
                     "ディレクトリが存在しない: {path}"
                 )));
             }
-            let dir = dir.canonicalize().unwrap_or(dir);
+            // 解決は境界（B26）を通す。ここが #970 の入口（起動 cwd + recent + タブ名）
+            let dir = tako_core::platform::path::canonicalize_or_self(&dir);
             let label = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -4608,7 +4612,8 @@ fn dispatch_inner(
                     resolved = cwd.join(resolved);
                 }
             }
-            let resolved = resolved.canonicalize().map_err(|e| {
+            // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
+            let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
                 DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
             })?;
             if !resolved.is_file() {
@@ -4704,7 +4709,8 @@ fn dispatch_inner(
                     resolved = cwd.join(resolved);
                 }
             }
-            let resolved = resolved.canonicalize().map_err(|e| {
+            // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
+            let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
                 DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
             })?;
             if !resolved.is_file() {
@@ -10898,7 +10904,8 @@ fn dispatch_tree_folder(
                     "ディレクトリが存在しない: {path_str}"
                 )));
             }
-            let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+            // 解決は境界（B26）を通す（ツリーへ保存 + 応答に出る値。#970）
+            let canonical = tako_core::platform::path::canonicalize_or_self(&abs);
             let tab_mut = host
                 .workspace_mut()
                 .get_tab_mut(tab_id)
@@ -10914,7 +10921,9 @@ fn dispatch_tree_folder(
         "remove" => {
             let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
             let abs = PathBuf::from(&path_str);
-            let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+            // 追加側（B26 経由）と同じ形にする。素の canonicalize だと Windows では
+            // verbatim になり、保存済みの非 verbatim と一致せず外せない（#970）
+            let canonical = tako_core::platform::path::canonicalize_or_self(&abs);
             let tab_mut = host
                 .workspace_mut()
                 .get_tab_mut(tab_id)

@@ -1399,4 +1399,36 @@ mod powershell_tests {
             "tako.ps1 に非 ASCII が混ざっている"
         );
     }
+
+    /// **#970 の番犬**（macOS でも走る）: OSC 7 を組む前に verbatim prefix を落として
+    /// いること。落とさないと `\` → `/` の置換で `//?/C:/…` になり、ペインの cwd が
+    /// `///?/C:/…`（実在しないパス）へ壊れて git 操作が全滅する。
+    ///
+    /// 実機（Windows）の回帰は
+    /// `tests/shell_integration_powershell.rs::verbatimな場所へ移ってもcwdが壊れない`
+    /// が実シェルで測る。こちらは**置換より前に通っているか**という順序を固定する
+    /// （関数はあるのに呼んでいない、を検出するため）
+    #[test]
+    fn osc7を組む前にverbatimを剥がしている() {
+        let cwd_fn = POWERSHELL_SCRIPT
+            .split("function global:__takoCwdSequence")
+            .nth(1)
+            .expect("__takoCwdSequence が無い");
+        let body = cwd_fn.split("\n    }").next().unwrap_or(cwd_fn);
+        let strip_at = body
+            .find("__takoStripVerbatim")
+            .expect("__takoCwdSequence が __takoStripVerbatim を呼んでいない（#970）");
+        let replace_at = body
+            .find(".Replace(")
+            .expect("__takoCwdSequence が区切りを置換していない");
+        assert!(
+            strip_at < replace_at,
+            "verbatim を剥がすのは `\\` → `/` の置換より前でなければならない（#970）:\n{body}"
+        );
+        // 剥がす側の実装（prefix 2 種）も残っていること
+        assert!(
+            POWERSHELL_SCRIPT.contains(r"'\\?\UNC\'") && POWERSHELL_SCRIPT.contains(r"'\\?\'"),
+            "__takoStripVerbatim が verbatim / verbatim UNC の両方を見ていない（#970）"
+        );
+    }
 }

@@ -825,6 +825,194 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
     );
 }
 
+/// **#970 の番犬**: `canonicalize` の直呼びが、パス解決の境界
+/// （B26 = `tako_core::platform::path`）の外で**増えていない**こと。
+///
+/// ## なぜ直呼びが危険か
+///
+/// `Path::canonicalize` は Windows で **verbatim 形式**（`\\?\C:\Users\…`）を返す。
+/// これを保存したり子プロセスへ渡したりすると、シェル統合が `\` → `/` へ置換した
+/// 段階で `//?/C:/…` になり、ペインの cwd が **`///?/C:/…`（実在しないパス）**へ壊れる。
+/// `tako open-in dir` した Windows のタブでは git 操作が全滅していた（#970 の実測）。
+/// **macOS では `canonicalize` の戻りに prefix が付かないので、テストも含めて全部緑になる**
+/// 種類の差なのでソース走査で塞ぐ。
+///
+/// ## なぜ「件数」で見るのか
+///
+/// `canonicalize` には**正しい直呼び**が残る:
+///
+/// - パストラバーサルの防止（`remote_files` / `remote` のアップロード）は
+///   「実体を見て配下か判定する」という `canonicalize` の意味そのものが要件で、
+///   両辺を同じように解決するので prefix は打ち消し合う
+/// - 比較キー専用の解決（両辺とも素の `canonicalize` を通すもの）
+/// - テスト・セルフテスト・visual-test の中でリポジトリや一時ディレクトリを指すもの
+///
+/// ファイル単位の許可リストにすると「そのファイルなら何個でも増やせる」穴になるので、
+/// **件数を固定**して新しい直呼びが 1 つでも増えたら落ちるようにしている
+/// （#628 の `コンソール窓を抑止していない子プロセス起動が増えていない` と同じ形）。
+///
+/// 落ちたときの直し方:
+/// - 解決結果を**保存する / 子プロセスへ渡す / 応答へ出す**なら
+///   `tako_core::platform::path::canonicalize`（または `canonicalize_or_self`）を通す
+///   （= 件数は増えない）
+/// - 比較キー・トラバーサル判定・テストなら、この表の件数を**理由つきで**更新する
+#[test]
+fn canonicalizeの直呼びが境界の外に残っていない() {
+    // (パス, 直呼びの件数, 理由)
+    const BASELINE: &[(&str, usize, &str)] = &[
+        (
+            "crates/tako-app/src/filetree.rs",
+            1,
+            "性能計測テストがリポジトリルートを指す 1 箇所",
+        ),
+        (
+            "crates/tako-app/src/main.rs",
+            3,
+            "セルフテスト内（git セクションの pinned フォルダ 1 / #772 の偽 claude の \
+             置き場 1 / 一時ディレクトリ配下であることの確認 1）。製品側の入口 \
+             （`add_tree_root` / `open_dir_in_new_tab`）は #970 で境界へ寄せた",
+        ),
+        (
+            "crates/tako-app/src/open_files.rs",
+            3,
+            "番犬テストが `scripts/` 配下のシェルスクリプトを指す 3 箇所（#708 / #837）",
+        ),
+        (
+            "crates/tako-app/src/preview_watch.rs",
+            1,
+            "OS 監視の結合テストが一時ファイルを指す 1 箇所",
+        ),
+        (
+            "crates/tako-app/src/update_checker.rs",
+            5,
+            "配布系統の判別（`/Caskroom/` / `/Cellar/` を含むかの macOS 限定判定）と、\
+             PATH 上の tako CLI 重複検知の比較。一覧へ積むのは解決前のパスなので \
+             解決結果は外へ出ない",
+        ),
+        (
+            "crates/tako-control/src/config_share/env.rs",
+            2,
+            "共有対象が外部 git 管理下かの比較（#513）。`git rev-parse` の戻りと \
+             突き合わせるだけで保存しない",
+        ),
+        (
+            "crates/tako-control/src/dispatch.rs",
+            1,
+            "tmux e2e テスト内",
+        ),
+        (
+            "crates/tako-control/src/remote.rs",
+            2,
+            "アップロード先のトラバーサル防止（#287 の P2-4）。`canonicalize` の \
+             「実体を見る」意味が要件そのもの",
+        ),
+        (
+            "crates/tako-control/src/remote_files.rs",
+            6,
+            "リモートファイル操作の認可（ルート配下かをコンポーネント単位で判定 = \
+             #1085 の脅威モデル）とプレビューの同一ファイル判定。両辺を同じように \
+             解決するので prefix は打ち消し合う",
+        ),
+        (
+            "crates/tako-control/src/stale_binary.rs",
+            2,
+            "claude バイナリの symlink チェーン解決（#498 / #772）。指紋の中で \
+             自分自身とだけ比較する",
+        ),
+    ];
+
+    let root = repo_root();
+    let mut actual: std::collections::BTreeMap<String, usize> = Default::default();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        collect_raw_canonicalize(
+            &root.join("crates").join(crate_dir).join("src"),
+            &root,
+            &mut actual,
+        );
+    }
+
+    let expected: std::collections::BTreeMap<String, usize> = BASELINE
+        .iter()
+        .map(|(p, n, _)| ((*p).to_string(), *n))
+        .collect();
+
+    let mut diffs = Vec::new();
+    for (path, count) in &actual {
+        let want = expected.get(path).copied().unwrap_or(0);
+        if *count > want {
+            diffs.push(format!(
+                "{path}: {want} 件のはずが {count} 件（増えている）"
+            ));
+        }
+    }
+    for (path, want) in &expected {
+        let got = actual.get(path).copied().unwrap_or(0);
+        if got < *want {
+            diffs.push(format!(
+                "{path}: {want} 件の想定だが {got} 件（減ったので表を更新してよい）"
+            ));
+        }
+    }
+
+    let actual_table = actual
+        .iter()
+        .map(|(p, n)| format!("        (\"{p}\", {n}, \"理由を書く\"),"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        diffs.is_empty(),
+        "`canonicalize` の直呼びの件数が想定と違う:\n  {}\n\
+         → 解決結果を保存する / 子プロセスへ渡す / 応答へ出すなら \
+         tako_core::platform::path::canonicalize を通してください（#970 / 設計 §2 の B26）\n\
+         \n現在の実測値:\n{}",
+        diffs.join("\n  "),
+        actual_table
+    );
+}
+
+/// ファイルごとの「境界を通らない `canonicalize`」の件数を数える。
+///
+/// コメント行と `watchdog-allow` を書いた行は除く（境界の実装本体と、旧挙動を
+/// 再現する対照はそこに置く）
+fn collect_raw_canonicalize(
+    dir: &Path,
+    root: &Path,
+    out: &mut std::collections::BTreeMap<String, usize>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_raw_canonicalize(&path, root, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") || line.contains("watchdog-allow") {
+                continue;
+            }
+            if line.contains(".canonicalize()") || line.contains("fs::canonicalize(") {
+                *out.entry(rel.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
 /// **#586 の番犬**: `tako-app` が release で GUI サブシステムへリンクされること。
 ///
 /// Rust 既定の console サブシステムのままだと、コンソールを持たない親

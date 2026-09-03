@@ -144,7 +144,9 @@ pub fn workspace_roots(
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut roots: Vec<PathBuf> = Vec::new();
     for path in pane_cwds.into_iter().chain(pinned) {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // 解決は境界（B26）を通す。ピン留めフォルダは非 verbatim で保存されるので、
+        // ここで verbatim のキーを作ると同じフォルダを 2 行出す（#970）
+        let canonical = crate::platform::path::canonicalize_or_self(&path);
         if seen.insert(canonical) {
             roots.push(path);
         }

@@ -9788,7 +9788,8 @@ impl TakoApp {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(dir) = paths.into_iter().next() {
                     let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                        let dir = dir.canonicalize().unwrap_or(dir);
+                        // 解決は境界（B26）を通す（ツリーへ保存される値。#970）
+                        let dir = tako_core::platform::path::canonicalize_or_self(&dir);
                         let tab_id = app.workspace.active_tab().id();
                         if let Some(tab) = app.workspace.get_tab_mut(tab_id) {
                             tab.add_pinned_folder(dir);
@@ -9836,7 +9837,9 @@ impl TakoApp {
     ) {
         use tako_core::recent::{RecentEntry, RecentList};
 
-        let dir = dir.canonicalize().unwrap_or(dir);
+        // 解決は境界（B26）を通す。ここは GUI の「フォルダ / リポジトリを開く」と
+        // 最近使った項目の入口で、値はペインの起動 cwd・タブ名・recent.json へ入る（#970）
+        let dir = tako_core::platform::path::canonicalize_or_self(&dir);
         let label = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

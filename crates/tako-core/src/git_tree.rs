@@ -386,7 +386,9 @@ pub fn scan(roots: &[PathBuf]) -> TreeGitMap {
     // 表示に使うパスと symlink 解決後の実体がずれるルート（`add_alias` 参照）
     let mut aliases: Vec<(PathBuf, PathBuf)> = Vec::new();
     for root in roots {
-        if let Ok(canonical) = root.canonicalize() {
+        // 解決は境界（B26）を通す。素の `canonicalize` だと Windows では
+        // **全ルートで** verbatim prefix ぶんの差が出て、無意味な alias を毎回積む（#970）
+        if let Ok(canonical) = crate::platform::path::canonicalize(root) {
             if canonical != *root {
                 aliases.push((canonical, root.clone()));
             }
