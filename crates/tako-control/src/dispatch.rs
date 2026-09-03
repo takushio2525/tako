@@ -5876,10 +5876,18 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "cwd と clear_cwd は同時に指定できない".into(),
                 ));
             }
-            // #1056: 存在しないフォルダは**設定時点で**弾く（起動時のエラーと同じ判定を
-            // 同じ 1 実装で通す）。ここで通さないと `tako master` / 引き継ぎが
-            // 起動できないプロファイルを黙って書けてしまう
+            // #1056: 起動時に解釈できない形は**設定時点で**弾く（`tako master` /
+            // 引き継ぎが起動できないプロファイルを黙って書かせない）。
+            // `Profile::resolve_cwd` が展開するのは `~/` だけなので、
+            // **相対パスと `~` 単体は起動時に必ず失敗する**（相対パスは
+            // 「set したときのプロセスの cwd」でだけ実在するので、set は通るのに
+            // 起動だけ落ちるという一番たちの悪い形になる）
             if let Some(raw) = params.cwd.as_deref().filter(|c| !c.is_empty()) {
+                if !raw.starts_with("~/") && !Path::new(raw).is_absolute() {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "cwd は絶対パスか `~/` から始まる形で指定する（相対パスは起動時に解決できない）: {raw}"
+                    )));
+                }
                 let probe = orchestrator::Profile {
                     cwd: Some(raw.to_string()),
                     ..Default::default()
@@ -17271,6 +17279,22 @@ mod tests {
             })
             .expect("show");
             assert_eq!(after["cwd"].as_str(), Some(dir.to_string_lossy().as_ref()));
+
+            // 相対パスと `~` 単体は起動時に解決できないので設定時点で断る
+            // （set は通るのに起動だけ落ちる、という一番たちの悪い形を作らない）
+            for bad in ["./prev", "prev", "~"] {
+                let err = set(ProfilesParams {
+                    action: "set".into(),
+                    name: Some(profile.into()),
+                    cwd: Some(bad.into()),
+                    ..Default::default()
+                })
+                .expect_err(&format!("{bad} を拒否しなかった"));
+                assert!(
+                    format!("{err}").contains("絶対パス"),
+                    "{bad}: 理由が不親切: {err}"
+                );
+            }
 
             // 排他
             let err = set(ProfilesParams {

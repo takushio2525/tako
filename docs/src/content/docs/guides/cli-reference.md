@@ -1021,7 +1021,7 @@ tako orchestrator profiles set takodev --cwd ~/dev/tako      # master をこの�
 | `--worker-effort` | 子 worker の思考量 |
 | `--worker-agent` / `--clear-worker-agent` | worker の既定エージェント CLI（claude / codex / agy） |
 | `--worker-model-policy` | `inherit` / `fixed` / `delegate` |
-| `--cwd` / `--clear-cwd` | master・solo を起動するフォルダ / 解除（`~` 展開。存在しないパスはエラー） |
+| `--cwd` / `--clear-cwd` | master・solo を起動するフォルダ / 解除（絶対パスか `~/` 始まり。存在しないパスはエラー） |
 | `--ctx-threshold` / `--clear-ctx-threshold` | 自動ハンドオフを始めるコンテキスト使用率（%。50〜60。既定 60） |
 | `--auto-handoff` | 閾値を超えたら tako が引き継ぎを促すか（既定 true） |
 

@@ -2008,7 +2008,7 @@ enum ProfilesCommand {
         /// worker_account を解除する
         #[arg(long)]
         clear_worker_account: bool,
-        /// master / solo をこのフォルダで起動する（~ 展開。空文字でクリア。#500 / #1056）
+        /// master / solo をこのフォルダで起動する（絶対パスか ~/ 始まり。空文字でクリア。#500 / #1056）
         #[arg(long, conflicts_with = "clear_cwd")]
         cwd: Option<String>,
         /// cwd の指定を解除する（#1056）

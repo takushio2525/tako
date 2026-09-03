@@ -1410,7 +1410,7 @@ pub fn tools() -> Vec<Value> {
                         "type": "array", "items": { "type": "string" },
                         "description": "環境変数を削除する（キー名の配列。set 時。Issue #500）",
                     },
-                    "cwd": { "type": "string", "description": "master / solo をこのフォルダで起動する（`~` 展開。存在しないパスはエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）" },
+                    "cwd": { "type": "string", "description": "master / solo をこのフォルダで起動する（**絶対パスか `~/` から始まる形**。相対パスは起動時に解決できないので拒否する。存在しないパスもエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）" },
                     "clear_cwd": { "type": "boolean", "description": "cwd の指定を解除する（set 時。#1056）" },
                     "master_account": { "type": "string", "description": "master の既定アカウント名（accounts.yaml のキー。空文字でクリア。set 時。#504）" },
                     "clear_master_account": { "type": "boolean", "description": "master_account を解除する（set 時。#504）" },

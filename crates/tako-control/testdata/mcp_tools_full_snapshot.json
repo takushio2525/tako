@@ -1929,7 +1929,7 @@
           "type": "integer"
         },
         "cwd": {
-          "description": "master / solo をこのフォルダで起動する（`~` 展開。存在しないパスはエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）",
+          "description": "master / solo をこのフォルダで起動する（**絶対パスか `~/` から始まる形**。相対パスは起動時に解決できないので拒否する。存在しないパスもエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）",
           "type": "string"
         },
         "effort": {
