@@ -23185,7 +23185,7 @@ mod self_test {
         format!(
             "{} {} elapsed={elapsed}s",
             build_flavor(),
-            tako_control::diag::format_load_average(tako_control::diag::load_average())
+            tako_control::diag::format_machine_load(tako_control::diag::machine_load())
         )
     }
 
@@ -24802,6 +24802,48 @@ mod self_test {
             return false;
         }
         !focused_contains(window, cx, forbidden)
+    }
+
+    /// **アプリの状態を時間ではなく状態で待つ**（#796 の作法を状態読みへ拡張。#1073）。
+    ///
+    /// なぜ要るか: シェル統合由来の状態（cwd / コマンド実行状態）は、**器が OSC を
+    /// 素通ししない環境では側路（`osc_sink`。#766）から 2 秒 tick で取り込まれる**。
+    /// PTY からインラインで届く POSIX と違い、`wait(cx, 1000)` の直後に 1 回読む形は
+    /// tick を跨げず**構造的に落ちる**（実機で項目 41 が 9/2 に落ちた原因）。
+    ///
+    /// 上限まで待って駄目なら偽なので、検出力は固定待ちより強い
+    /// （成立しない条件はいくら待っても成立しない）。諦めたときは
+    /// 「何を待って何秒待ったか + 実行環境」を出す
+    async fn wait_for_app_state<F>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        timeout: Duration,
+        predicate: F,
+    ) -> bool
+    where
+        F: Fn(&TakoApp) -> bool,
+    {
+        let started = std::time::Instant::now();
+        loop {
+            if window
+                .update(cx, |app, _, _| predicate(app))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                println!(
+                    "TAKO_SELF_TEST_STATE_TIMEOUT: label={label:?} waited={:.1}s {}",
+                    started.elapsed().as_secs_f32(),
+                    env_line()
+                );
+                return false;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
     }
 
     /// ファイルツリーのインデントガイド線（#589）の実ピクセル検証。
@@ -35766,16 +35808,37 @@ mod self_test {
                 //     list で公開される（FR-2.4.1 + FR-2.1.4 の e2e。実コマンドで検証する）
                 press(any, cx, sh.clear_line_key());
                 type_text(any, cx, &sh.cd(&osc_dir), true);
-                wait(cx, 1000).await;
-                let osc_cwd_ok = window
-                    .update(cx, |app, _, _| {
+                // 側路経由（#766）は 2 秒 tick で取り込むので**状態で待つ**（#1073）
+                let osc_cwd_ok = wait_for_app_state(
+                    window,
+                    cx,
+                    "OSC 7 の cwd",
+                    Duration::from_secs(20),
+                    |app| {
                         app.terminals
                             .get(&app.focused_pane())
                             .and_then(|s| s.cwd())
                             .map(|p| p == osc_expected.as_path())
                             .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
+                    },
+                )
+                .await;
+                if !osc_cwd_ok {
+                    // 「届いていない」と「別のパスとして届いた」を言い分ける（#1073）
+                    let seen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&app.focused_pane())
+                                .and_then(|s| s.cwd())
+                                .map(|p| p.display().to_string())
+                        })
+                        .unwrap_or(None);
+                    println!(
+                        "TAKO_SELF_TEST_41: expected={:?} seen={seen:?} typed={:?}",
+                        osc_expected.display().to_string(),
+                        sh.cd(&osc_dir)
+                    );
+                }
                 check(osc_cwd_ok, "シェル統合の OSC 7 で cwd 検知");
                 // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
                 // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
@@ -35851,21 +35914,85 @@ mod self_test {
                             })
                     })
                     .unwrap_or(false);
+                if !list_exposes {
+                    // 応答のどのフィールドが食い違ったかを出す（#1073: cwd の表記で落ちた）
+                    let row = window
+                        .update(cx, |app, _, _| {
+                            let focused = app.focused_pane().as_u64();
+                            let value = tako_control::dispatch(
+                                app,
+                                tako_control::protocol::Request::List,
+                                PaneOrigin::Cli,
+                            )
+                            .expect("list は常に成功する");
+                            value["tabs"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .flat_map(|t| t["panes"].as_array().into_iter().flatten())
+                                .find(|p| p["id"].as_u64() == Some(focused))
+                                .map(|p| {
+                                    format!(
+                                        "state={:?} exit_code={:?} cwd={:?}",
+                                        p["state"].as_str(),
+                                        p["exit_code"].as_i64(),
+                                        p["cwd"].as_str()
+                                    )
+                                })
+                        })
+                        .unwrap_or(None);
+                    println!(
+                        "TAKO_SELF_TEST_41_LIST: want cwd={osc_dir:?} got {}",
+                        row.unwrap_or_else(|| "（対象ペインが list に無い）".to_string())
+                    );
+                }
                 check(list_exposes, "list が state / exit_code / cwd を公開");
 
                 // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）。
                 //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）
+                // **分割元のペイン ID を先に取る**: 分割元の cwd は既に osc_expected な
+                // ので、「フォーカス中ペインの cwd」だけで待つと split が起きる前に
+                // 成立してしまう（固定待ちを状態待ちへ替えるときに踏む罠。#1073）。
+                // 「フォーカスが別のペインへ移り、そのペインの cwd が継承されている」を待つ
+                let split_from = window.update(cx, |app, _, _| app.focused_pane()).ok();
                 type_text(any, cx, &format!("{cli} split --right --focus"), true);
-                wait(cx, 2000).await;
-                let inherited = window
-                    .update(cx, |app, _, _| {
-                        app.terminals
-                            .get(&app.focused_pane())
-                            .and_then(|s| s.cwd())
-                            .map(|p| p == osc_expected.as_path())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
+                // 新ペインの cwd も側路経由だと 2 秒 tick に乗る（#1073）
+                let inherited = wait_for_app_state(
+                    window,
+                    cx,
+                    "split 後の cwd 継承",
+                    Duration::from_secs(20),
+                    |app| {
+                        let focused = app.focused_pane();
+                        split_from != Some(focused)
+                            && app
+                                .terminals
+                                .get(&focused)
+                                .and_then(|s| s.cwd())
+                                .map(|p| p == osc_expected.as_path())
+                                .unwrap_or(false)
+                    },
+                )
+                .await;
+                if !inherited {
+                    let (focused, seen) = window
+                        .update(cx, |app, _, _| {
+                            let focused = app.focused_pane();
+                            (
+                                focused.as_u64(),
+                                app.terminals
+                                    .get(&focused)
+                                    .and_then(|s| s.cwd())
+                                    .map(|p| p.display().to_string()),
+                            )
+                        })
+                        .unwrap_or((0, None));
+                    println!(
+                        "TAKO_SELF_TEST_41B: from={:?} focused={focused} seen={seen:?} expected={:?}",
+                        split_from.map(|p| p.as_u64()),
+                        osc_expected.display().to_string()
+                    );
+                }
                 check(inherited, "split が分割元の cwd を継承");
                 // 片付け: 新ペインを閉じ、状態を idle へ戻す
                 type_text(any, cx, &format!("{cli} close"), true);
@@ -35873,11 +36000,20 @@ mod self_test {
                 type_text(any, cx, &sh.exit_status(0), true);
                 wait(cx, 500).await;
             } else {
+                // #1073: Windows の配置は `$PROFILE` のブロックが**いまの data dir の
+                // スクリプト**を指しているかで決まる。`TAKO_ISOLATED=1` は data dir を
+                // pid ごとに変えるので、同じ機・同じコードでも起動の仕方で
+                // 「skip される回」と「走る回」が入れ替わる。どちらだったかを
+                // 後から言えるように script のパスまで出す
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 41 / 41b（シェル統合がこの環境では効かない: \
-                     installed={} blocked_by_backend={:?}）",
+                     installed={} blocked_by_backend={:?} script={:?}）",
                     shell_integration.installed(),
-                    shell_integration.blocked_by_backend
+                    shell_integration.blocked_by_backend,
+                    shell_integration
+                        .script
+                        .as_ref()
+                        .map(|p| p.display().to_string())
                 );
             }
 
@@ -47910,25 +48046,52 @@ mod self_test {
                         done && !app.pane_settle.contains_key(&fresh)
                     })
                     .unwrap_or(false);
+                // #967: 期待値は**製品が組む行**から作る。リテラル `"tako setup"` は
+                // Windows で成立しない（実体は `…\tako.exe setup` なので部分文字列が
+                // 無い）。#898 が `resolve_tako_binary` を実体パスへ替えた時点から
+                // 落ちており、macOS は basename が `tako` なので**通ってしまう** =
+                // CI でも気づけなかった。画面は折り返すので、空白を落として
+                // 突き合わせる（項目 93(d2) と同じ作法）
+                let setup_line = tako_control::welcome::launch_command_line("setup");
+                let squash =
+                    |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+                let setup_needle = squash(&setup_line);
+                println!("selftest 97d: setup_line={setup_line:?}");
                 let mut setup_delivered = false;
                 for _ in 0..40 {
                     wait(cx, 100).await;
                     setup_delivered = window
                         .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&fresh)
-                                .map(|s| s.visible_lines().join(""))
-                                .unwrap_or_default()
-                                .contains("tako setup")
+                            squash(
+                                &app.terminals
+                                    .get(&fresh)
+                                    .map(|s| s.visible_lines().join(""))
+                                    .unwrap_or_default(),
+                            )
+                            .contains(&setup_needle)
                         })
                         .unwrap_or(false);
                     if setup_delivered {
                         break;
                     }
                 }
+                if !setup_delivered {
+                    let screen = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&fresh)
+                                .map(|s| s.visible_lines().join("|"))
+                                .unwrap_or_else(|| "<ペインなし>".to_string())
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "TAKO_SELF_TEST_97D: needle={setup_needle:?} clicked={setup_clicked} \
+                         screen={screen:?}"
+                    );
+                }
                 check(
                     setup_clicked && setup_delivered,
-                    "スターターの setup リンクで tako setup が届く（覆わない）(#720)",
+                    "スターターの setup リンクで tako setup が届く（覆わない）(#720 / #967)",
                 );
 
                 // (e) 「AI チームに任せる」押下 = エージェント待ちの過渡期が張られ、
@@ -48956,18 +49119,33 @@ mod self_test {
                         )
                     })
                     .unwrap_or(false);
+                // #967 と同型: 期待値は**製品が組む行**から作る（`tako master -<name>` の
+                // リテラルは Windows で成立しない。実体は `…\tako.exe master -<name>`）。
+                // 画面は折り返すので空白を落として突き合わせる
+                let master_needle = starter::starter_subcommand(StarterAction::Master, Some(probe))
+                    .map(|sub| tako_control::welcome::launch_command_line(&sub))
+                    .map(|line| {
+                        line.chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
                 let mut delivered = false;
                 for _ in 0..40 {
                     wait(cx, 100).await;
-                    delivered = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&starter_pane)
-                                .map(|s| s.visible_lines().join(""))
-                                .unwrap_or_default()
-                                .contains(&format!("tako master -{probe}"))
-                        })
-                        .unwrap_or(false);
+                    delivered = !master_needle.is_empty()
+                        && window
+                            .update(cx, |app, _, _| {
+                                app.terminals
+                                    .get(&starter_pane)
+                                    .map(|s| s.visible_lines().join(""))
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .filter(|c| !c.is_whitespace())
+                                    .collect::<String>()
+                                    .contains(&master_needle)
+                            })
+                            .unwrap_or(false);
                     if delivered {
                         break;
                     }
@@ -48978,7 +49156,7 @@ mod self_test {
                     .unwrap_or(false);
                 println!(
                     "TAKO_SELF_TEST_739_LAUNCH: opened={opened} selected={selected} \
-                     delivered={delivered} closed={closed} line={:?}",
+                     delivered={delivered} closed={closed} line={:?} needle={master_needle:?}",
                     starter::starter_subcommand(StarterAction::Master, Some(probe)),
                 );
                 check(
@@ -52359,6 +52537,121 @@ mod self_test {
                     "111: 解除後に codex ペインの作業が再開される (#985)",
                 );
 
+                // --- 正例 ④ 組織クレジット上限（#1093） ---
+                // 2026-09-03 に worker 3 体が 17:1x に止まり、19:50 のリセットを
+                // 1 時間以上過ぎても復帰せず `supervisor.log` に 1 件も記録が無かった。
+                // 見出しは claude 2.1.258 のテンプレート `You've hit your <名前>limit…` で
+                // 限度の名前が `session limit`（= 5h 枠）。**旧実装の判定は
+                // `hit your usage limit` 決め打ちだったので 1 文字も引っかからなかった**
+                //
+                // 見出しのアポストロフィだけは落としてある: `paint_and_hold` の POSIX 経路は
+                // 本文を素の単引用符で囲むので `'` を含むと起動コマンドが壊れる
+                // （codex の正例 ③ も同じ理由で `You have hit …`）。**実バイトそのままの
+                // fixture は `limit_stop.rs` の `SESSION_LIMIT_IDLE` が持っている**ので、
+                // ここで見たいのは「実ペイン → 検知 → ナッジ → 監査ログ」の通し
+                let session_body = format!(
+                    "{filler813}実装を進めます\n  \
+                     You have hit your session limit · resets 7:50pm (Asia/Tokyo)\n     \
+                     /usage-credits to request more usage from your admin.\n"
+                );
+                let Some(session_pane) = make_fixture_pane(cx, &session_body).await else {
+                    fail("#1093: 組織クレジット上限ペインの作成")
+                };
+                if !wait_screen(cx, session_pane, "hit your session limit").await {
+                    fail("#1093: 組織クレジット上限 fixture が画面に出ない");
+                }
+                settle813(cx, session_pane).await;
+                let _ = set_enabled(cx, session_pane, true);
+                let (_, kind_session, _) = drive(cx, session_pane);
+                let reset_session = window
+                    .update(cx, |app, _, _| {
+                        app.limit_resume.get(&session_pane).and_then(|t| t.reset_at)
+                    })
+                    .ok()
+                    .flatten();
+                println!(
+                    "TAKO_SELF_TEST_1093_DETECT: kind={kind_session:?} \
+                     reset_at={reset_session:?} state=({})",
+                    state813(cx, session_pane),
+                );
+                check(
+                    kind_session.as_deref() == Some("idle"),
+                    "111: 組織クレジット上限の画面を上限停止として検知する (#1093)",
+                );
+                check(
+                    reset_session.is_some(),
+                    "111: `resets 7:50pm (Asia/Tokyo)` から解除時刻を解決する (#1093)",
+                );
+                // ステータスバーのメーターが `--`（データ無し）にならない。
+                // 上限中はフッターが数値を出さないので、見出しから 100% を埋める
+                let meter1093 = window
+                    .update(cx, |app, _, _| {
+                        let pane_level = app
+                            .terminals
+                            .get(&session_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .and_then(|m| m.limit_5h);
+                        app.refresh_agent_metrics();
+                        (pane_level, app.agent_metrics.limit_5h)
+                    })
+                    .unwrap_or((None, None));
+                println!(
+                    "TAKO_SELF_TEST_1093_METER: pane={:?} statusbar={:?}",
+                    meter1093.0, meter1093.1
+                );
+                check(
+                    meter1093.0 == Some(100) && meter1093.1 == Some(100),
+                    "111: 上限中はステータスバーの 5h メーターが 100% になる (#1093)",
+                );
+                // 解除前は撃たない
+                let (sent_before1093, _, _) = drive(cx, session_pane);
+                check(
+                    sent_before1093.is_empty(),
+                    "111: 解除時刻より前は継続ナッジを送らない (#1093)",
+                );
+                // 解除後は撃つ。**監査ログ（supervisor.log）に発火が残る**ことまで見る
+                // （#1093 の症状は「1 件も記録が無い」だった = 記録の有無が受け入れ条件）
+                let audit_before = tako_control::orchestrator::supervisor::read_audit_log(200)
+                    .iter()
+                    .filter(|l| {
+                        l.contains("action=limit_autoresume")
+                            && l.contains(&format!("pane={}", session_pane.as_u64()))
+                    })
+                    .count();
+                backdate(cx, session_pane);
+                let (sent_1093, _, attempts_1093) = drive(cx, session_pane);
+                let audit_after: Vec<String> =
+                    tako_control::orchestrator::supervisor::read_audit_log(200)
+                        .into_iter()
+                        .filter(|l| {
+                            l.contains("action=limit_autoresume")
+                                && l.contains(&format!("pane={}", session_pane.as_u64()))
+                        })
+                        .collect();
+                println!(
+                    "TAKO_SELF_TEST_1093_RESUME: sent={} attempts={attempts_1093} \
+                     audit={}->{} last={:?}",
+                    sent_1093.len(),
+                    audit_before,
+                    audit_after.len(),
+                    audit_after.last().map(|l| l
+                        .split("action=")
+                        .nth(1)
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect::<String>()),
+                );
+                check(
+                    sent_1093.len() == 1 && attempts_1093 == 1,
+                    "111: 解除後に組織クレジット上限のペインが再開される (#1093)",
+                );
+                check(
+                    audit_after.len() == audit_before + 1
+                        && audit_after.last().is_some_and(|l| l.contains("nudge queued")),
+                    "111: 自動復帰の発火が supervisor.log に記録される (#1093)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -52451,10 +52744,10 @@ mod self_test {
                     .flatten();
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
-                    // 有効にしたのは idle / dialog / codex / permission / api の 5 ペインだけ
-                    // （codex は #985 で追加）。OFF のペインはフィールドごと出ない
-                    // （旧 tako でも読める JSON を保つ）
-                    persisted == Some((5, 5)),
+                    // 有効にしたのは idle / dialog / codex / session / permission / api の
+                    // 6 ペインだけ（codex は #985、session は #1093 で追加）。
+                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
+                    persisted == Some((6, 6)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 
@@ -57154,6 +57447,34 @@ mod self_test {
                     .as_ref()
                     .map(|v| v["phase"] == "failed" && !v["reason"].is_null())
                     .unwrap_or(false);
+                if !failed_ok {
+                    // #1073: 「スクリプトが走っていない」と「走ったが分類できていない」を
+                    // 言い分ける（実機で 20 秒待っても connecting のままだった）。
+                    // ペインの中身・いまの phase・器の有無を全部出す
+                    let (phase, backend, lines) = window
+                        .update(cx, |app: &mut TakoApp, _, _| {
+                            let pid = PaneId::from_raw(ssh_pane);
+                            let phase = <TakoApp as UiStateHost>::ssh_connect_state(app, pid)
+                                .map(|v| v["phase"].to_string());
+                            let backend = app.backend_sessions.contains_key(&pid);
+                            let lines: Vec<String> = app
+                                .terminals
+                                .get(&pid)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .into_iter()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (phase, backend, lines)
+                        })
+                        .unwrap_or((None, false, Vec::new()));
+                    println!(
+                        "TAKO_SELF_TEST_133D: host={host1010:?} phase={phase:?} \
+                         backend={backend} lines={lines:?}"
+                    );
+                }
                 check(
                     failed_ok,
                     &format!("133: 接続失敗は消えずに理由へ置き換わる (#1010。{failed:?})"),
@@ -59733,6 +60054,81 @@ mod selftest_pane_command_watchdog {
         );
     }
 
+    /// **ペインの画面を `tako <サブコマンド>` のリテラルで検査している形**（#967）。
+    ///
+    /// スターター / バナーがシェルへ書く行は `welcome::launch_command_line` が
+    /// **実体パス**で組む（#549 の zip 配布で PATH に無くても動くようにするため）。
+    /// Windows の実行ファイル名は `tako.exe` なので行は `…\tako.exe setup` になり、
+    /// `tako setup` という部分文字列はどこにも現れない。macOS は basename が `tako`
+    /// なので**通ってしまう** = CI では永久に気づけず、実機だけが止まる（#898 が
+    /// `resolve_tako_binary` を実体パスへ替えた時点から項目 97 / 99 が落ちていた）。
+    ///
+    /// 正しい形は「期待値を製品と同じ関数から作り、折り返しに強い形で突き合わせる」。
+    /// 検査は `visible_lines()`（= ペインの画面を読んでいる証拠）の近傍だけを見るので、
+    /// 案内文（プロンプト本文）の最簡形リテラル（#322）は対象外
+    fn literal_tako_command_on_screen(src: &str) -> Vec<usize> {
+        let screen = concat!("visible", "_lines()");
+        let literal = concat!("contains(\"", "tako ");
+        let formatted = concat!("contains(&format!(\"", "tako ");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(screen) {
+                continue;
+            }
+            let around = lines[index..(index + 7).min(lines.len())]
+                .iter()
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if around.contains(literal) || around.contains(formatted) {
+                hits.push(index + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn ペイン画面の検査はtakoコマンドをリテラルで期待しない() {
+        let hits = literal_tako_command_on_screen(include_str!("main.rs"));
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} がペインの画面を `tako <サブコマンド>` のリテラルで\
+             検査している。製品が書くのは `welcome::launch_command_line` の実体パス\
+             （Windows は `…\\tako.exe <sub>`）なので実機だけが落ちる。\
+             期待値を同じ関数から作ること（#967）"
+        );
+    }
+
+    /// 検出力の担保: #967 で直した 2 か所の形を見つけ、案内文の最簡形は許す
+    #[test]
+    fn 番犬は画面のリテラル期待を見つけ案内文は許す() {
+        let bad = format!(
+            "            .map(|s| s.{})\n            .{}setup\"),",
+            concat!("visible", "_lines().join(\"\")"),
+            concat!("contains(\"", "tako ")
+        );
+        assert_eq!(literal_tako_command_on_screen(&bad), vec![1]);
+        let bad2 = format!(
+            "            .map(|s| s.{})\n            .{}master -{{probe}}\")),",
+            concat!("visible", "_lines().join(\"\")"),
+            concat!("contains(&format!(\"", "tako ")
+        );
+        assert_eq!(literal_tako_command_on_screen(&bad2), vec![1]);
+        // 期待値を製品の関数から作る形は許す
+        let good = format!(
+            "            .map(|s| s.{})\n            .contains(&setup_needle),",
+            concat!("visible", "_lines().join(\"\")")
+        );
+        assert!(literal_tako_command_on_screen(&good).is_empty());
+        // 案内文（プロンプト本文）の最簡形リテラルは画面検査ではない（#322）
+        let prompt = format!(
+            "            prompt.{}setup bootstrap status\")",
+            concat!("contains(\"", "tako ")
+        );
+        assert!(literal_tako_command_on_screen(&prompt).is_empty());
+    }
+
     /// 検出力の担保: 番犬自身が空振りしないこと
     #[test]
     fn 番犬はargvリテラルを見つけ境界経由は許す() {
@@ -61411,6 +61807,92 @@ mod selftest_wait_watchdog {
             hits.push(index + 1);
         }
         hits
+    }
+
+    /// **シェル統合由来の状態を固定待ちの直後に 1 回だけ読んでいない**（#1073）。
+    ///
+    /// cwd（OSC 7）とコマンド実行状態（OSC 133）は、器が OSC を素通ししない環境では
+    /// 側路（#766）から **2 秒 tick** で取り込まれる。PTY からインラインで届く POSIX と
+    /// 違い、`wait(cx, 1000)` の直後に 1 回読む形は tick を跨げず**構造的に落ちる**
+    /// （実機の項目 41 が 9/2 に落ちた原因。macOS では 1 秒あれば届くので出ない）。
+    ///
+    /// 正しい形はリトライループか `wait_for_app_state`。**自分で状態を注入している**
+    /// ケース（`feed_osc_bytes`）は待つ相手が居ないので対象外にする。
+    /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+    fn fixed_wait_then_shell_integration_state(src: &str) -> Vec<usize> {
+        let state_reads = [concat!(".cwd", "()"), concat!(".command_state", "()")];
+        let injects = concat!("feed_osc", "_bytes");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !(trimmed.starts_with(concat!("wait(cx", ", ")) && trimmed.ends_with(").await;")) {
+                continue;
+            }
+            // リトライループの先頭の待ちは正しい形（上限まで何度も読み直す）
+            let before = lines[index.saturating_sub(4)..index]
+                .iter()
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if before.contains("for ") || before.contains("loop {") {
+                continue;
+            }
+            let after = lines
+                .iter()
+                .skip(index + 1)
+                .take(8)
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if after.contains(injects) {
+                continue;
+            }
+            if state_reads.iter().any(|needle| after.contains(needle)) {
+                hits.push(index + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn シェル統合由来の状態を固定待ちで読んでいない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_wait_then_shell_integration_state(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs:{hits:?} が「シェル統合由来の状態（cwd / コマンド実行状態）を\
+             固定待ちの直後に 1 回だけ読む」形で書かれている。器が OSC を素通ししない\
+             環境では側路から 2 秒 tick で届くので、`wait_for_app_state` か\
+             リトライループで**状態を待つ**こと（#1073）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと
+    #[test]
+    fn 番犬は固定待ちの状態読みを見逃さずループと注入は許す() {
+        // #1073 で直した形そのもの（固定待ち → 1 回だけ cwd を読む）
+        let bad = format!(
+            "                {}\n                let ok = session{};",
+            concat!("wait(cx", ", 1000).await;"),
+            concat!(".cwd", "()")
+        );
+        assert_eq!(fixed_wait_then_shell_integration_state(&bad), vec![1]);
+        // リトライループの中は正しい形
+        let looped = format!(
+            "                for _ in 0..8 {{\n                    {}\n                    ok = session{};",
+            concat!("wait(cx", ", 800).await;"),
+            concat!(".command_state", "()")
+        );
+        assert!(fixed_wait_then_shell_integration_state(&looped).is_empty());
+        // 自分で注入するケースは待つ相手が居ない
+        let injected = format!(
+            "                {}\n                session.{}(b\"\");\n                let s = session{};",
+            concat!("wait(cx", ", 1500).await;"),
+            concat!("feed_osc", "_bytes"),
+            concat!(".command_state", "()")
+        );
+        assert!(fixed_wait_then_shell_integration_state(&injected).is_empty());
     }
 
     #[test]

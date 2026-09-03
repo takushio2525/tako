@@ -40,6 +40,33 @@ pub fn strip_drive_slash(path: &str) -> &str {
     }
 }
 
+/// URI 由来の `/` 区切りのローカルパスを、そのプラットフォームの区切りへ寄せる（#1073）。
+///
+/// なぜ要るか: `file://` URI のパスは常に `/` 区切りなので、Windows でそのまま
+/// `PathBuf` にすると**表示だけが `C:/Users/…` になる**。`Path` の比較は
+/// 成分単位なので動作は変わらないが、`display()` の結果が `tako list` / MCP の
+/// 応答・ペインヘッダの cwd チップへそのまま出るため、**同じ機に同じパスの
+/// 2 通りの表記が混ざる**（他の経路は OS の区切りで出る）。
+///
+/// unix では `\` はファイル名に使える普通の文字なので**触らない**。判定は
+/// `MAIN_SEPARATOR` を引数で受けるので、macOS 上から Windows の挙動を検証できる
+/// （#515 の方針）
+pub fn native_separators(path: &str) -> std::borrow::Cow<'_, str> {
+    native_separators_with(path, std::path::MAIN_SEPARATOR)
+}
+
+/// [`native_separators`] の区切り明示版（テスト用に両プラットフォームぶんを回す）
+pub fn native_separators_with(path: &str, main_separator: char) -> std::borrow::Cow<'_, str> {
+    if main_separator == '/' || !path.contains('/') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        out.push(if ch == '/' { main_separator } else { ch });
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +102,36 @@ mod tests {
         assert_eq!(strip_drive_slash("/1:/x"), "/1:/x");
         // 先頭が `/` でない（パス部は必ず `/` 始まり = 想定外の入力）
         assert_eq!(strip_drive_slash("C:/x"), "C:/x");
+    }
+
+    #[test]
+    fn uri由来のパスはプラットフォームの区切りへ寄せる() {
+        // Windows: URI の `/` を `\` へ（表示が他の経路と揃う）
+        assert_eq!(
+            native_separators_with("C:/Users/x/dev", '\\'),
+            "C:\\Users\\x\\dev"
+        );
+        assert_eq!(native_separators_with("C:/", '\\'), "C:\\");
+        // 区切りが `/` のプラットフォームでは 1 文字も触らない（`\` は普通の文字）
+        assert_eq!(
+            native_separators_with("/Users/me/a\\b", '/'),
+            "/Users/me/a\\b"
+        );
+        // 区切りを含まない入力はそのまま借用で返る（無駄な確保をしない）
+        assert!(matches!(
+            native_separators_with("C:", '\\'),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn 区切りを寄せてもpathとしての同一性は変わらない() {
+        // 動作（Path の比較）は元から同じで、変わるのは表示だけ
+        // = この変換で「別のパスを指す」ことは起きない
+        let native = native_separators_with("C:/Users/x/dev", std::path::MAIN_SEPARATOR);
+        assert_eq!(
+            std::path::Path::new(native.as_ref()),
+            std::path::Path::new("C:/Users/x/dev")
+        );
     }
 }

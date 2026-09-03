@@ -21,6 +21,7 @@ use alacritty_terminal::term::{test::TermSize, viewport_to_point, Config, Term, 
 use alacritty_terminal::tty;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 
+use crate::limit_resume::{exhausted_limit_window, LimitWindow};
 use crate::osc_tap::{OscEvent, PromptMark, TapPty};
 use crate::pty_loop::{Msg, Notifier, PtyLoop};
 use crate::screen::{self, Screen};
@@ -1084,6 +1085,32 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         }
     }
 
+    // #1093: 上限に達した見出しが画面に出ていて、**フッターが数値を出していない**なら、
+    // その枠は使い切っている（= 100%）。旧実装はフッターの `5h NN%` だけを見ていたので、
+    // 上限で止まった瞬間にメーターが `--`（データ無し）へ落ちていた
+    // ——「いま上限中」であることが画面に書いてあるのに UI からは分からない状態だった。
+    //
+    // 誤って 100% に貼り付かないための二重の条件:
+    //  ① フッターが数値を出しているときは触らない（実データが正）。実測した稼働中の
+    //     claude ペイン 3 枚はいずれも末尾 6 行に `ctx NN%` / `5h NN%` / `7d NN%` を
+    //     そろえて出していたので、ここへ落ちてくるのは通常**フッターが黙っている =
+    //     上限中**のときだけになる。復帰してフッターが数値を出し始めれば実データが勝つ
+    //  ② 枠の名前が読めた見出しだけを採る（`exhausted_limit_window`）。
+    //     `usage credit limit` のように 5h / 週へ対応づけられないものは `--` のまま
+    //
+    // **未検証**: 「上限中はフッターが `5h NN%` を出さなくなる」ことは上限を実際に
+    // 踏まないと確かめられない。根拠は #1093 の実地報告（3 worker が止まっている
+    // あいだステータスバーが `--` = 全ペインで `limit_5h` が None だった）で、
+    // フッターが数値を出す構成なら ① によりこの分岐は素通りする
+    if limit_5h.is_none() || limit_week.is_none() {
+        if let Some(window) = exhausted_limit_window_in(lines) {
+            match window {
+                LimitWindow::FiveHour => limit_5h = limit_5h.or(Some(100)),
+                LimitWindow::Week => limit_week = limit_week.or(Some(100)),
+            }
+        }
+    }
+
     // ソース判定: codex primary/secondary があれば Codex、5h/7d があれば Claude
     if codex_primary.is_some() || codex_secondary.is_some() {
         source = MetricsSource::Codex;
@@ -1107,6 +1134,25 @@ fn parse_agent_metrics(lines: &[String]) -> Option<AgentMetrics> {
         source,
         model,
     })
+}
+
+/// 上限に達した見出しを探す走査範囲（画面末尾からの行数。#1093）。
+///
+/// 見出しは会話の最後の出力なので、**入力欄とフッターのぶんだけ上**にある。
+/// 実測（claude 2.1.258 の稼働中ペイン）ではフッターが 6 行・入力欄が 3 行・
+/// あいだの空行が 1 行で少なくとも 10 行、生成中のスピナー行が残っていれば 13〜15 行。
+/// フッターだけを見る 8 行の窓（`parse_agent_metrics` 本体）では届かないので
+/// これだけ別の窓を持つ。実測の 15 行に余裕を足した値で、走査対象は可視画面
+/// （`visible_lines`）なので深いスクロールバックまでは遡らない
+const EXHAUSTED_SCAN_LINES: usize = 24;
+
+/// 画面末尾から上限の見出しを探す（下の行ほど新しいので末尾から見る。#1093）
+fn exhausted_limit_window_in(lines: &[String]) -> Option<LimitWindow> {
+    lines
+        .iter()
+        .rev()
+        .take(EXHAUSTED_SCAN_LINES)
+        .find_map(|l| exhausted_limit_window(l))
 }
 
 /// フッターの角括弧からモデル表示名を取り出す（#702）。
@@ -1936,6 +1982,87 @@ mod tests {
         let lines = vec!["uptime 15h 99%  ctx 10%".into()];
         let m = parse_agent_metrics(&lines).unwrap();
         assert_eq!(m.limit_5h, None);
+    }
+
+    /// #1093: 上限で止まったペインの実画面（見出し + 入力欄 + `5h` の無いフッター）。
+    /// 幾何は稼働中の実ペインから採った形（フッター 6 行 / 入力欄 3 行 / あいだの空行）
+    fn limit_stopped_screen(headline: &str) -> Vec<String> {
+        let mut lines: Vec<String> = vec!["⏺ 実装を進めます".into(), String::new()];
+        lines.push(format!("  ⎿  {headline}"));
+        lines.push("     /usage-credits to request more usage from your admin.".into());
+        lines.push(String::new());
+        lines.push("─".repeat(72));
+        lines.push("❯".into());
+        lines.push("─".repeat(72));
+        // フッター 6 行。**`5h NN%` / `7d NN%` は出ていない**（= 症状どおり）
+        for l in [
+            "  ⏵⏵ accept edits on",
+            "  tako",
+            "  main",
+            "  ~/dev/tako",
+            "  ⏸ 待機中 · ? for shortcuts",
+            "",
+        ] {
+            lines.push(l.into());
+        }
+        lines
+    }
+
+    #[test]
+    fn issue1093_上限で止まった画面はメーターを100パーセントで埋める() {
+        // 旧実装はフッターの `5h NN%` だけを見ていたので、上限で止まった瞬間に
+        // メトリクスごと None（ステータスバーは `--`）になっていた
+        let m = parse_agent_metrics(&limit_stopped_screen(
+            "You've hit your session limit · resets 7:50pm (Asia/Tokyo)",
+        ))
+        .expect("上限中はメトリクスが取れる（`--` にしない）");
+        assert_eq!(
+            m.limit_5h,
+            Some(100),
+            "session limit = 5h 枠を使い切っている"
+        );
+        assert_eq!(m.limit_week, None, "週枠については何も言っていない");
+        assert_eq!(m.source, MetricsSource::Claude);
+
+        // 週枠なら 7d 側が埋まる
+        let m = parse_agent_metrics(&limit_stopped_screen(
+            "You've hit your weekly limit · resets 7:50pm (Asia/Tokyo)",
+        ))
+        .expect("取れる");
+        assert_eq!(m.limit_5h, None);
+        assert_eq!(m.limit_week, Some(100));
+    }
+
+    #[test]
+    fn issue1093_フッターの実データは上限の見出しに上書きされない() {
+        // 復帰してフッターが数値を出し始めたら、そちらが正（100% に貼り付かない）
+        let mut lines =
+            limit_stopped_screen("You've hit your session limit · resets 7:50pm (Asia/Tokyo)");
+        lines.push("  ctx 21%  5h 12%  7d 46%".into());
+        let m = parse_agent_metrics(&lines).expect("取れる");
+        assert_eq!(
+            m.limit_5h,
+            Some(12),
+            "実データを 100% で塗り潰してはいけない"
+        );
+        assert_eq!(m.limit_week, Some(46));
+    }
+
+    #[test]
+    fn issue1093_枠の分からない上限ではメーターを埋めない() {
+        // `usage credit limit` は 5h / 週へ対応づけられない = メーターに嘘を書かない
+        assert!(
+            parse_agent_metrics(&limit_stopped_screen(
+                "You've hit your usage credit limit · contact your admin to increase it",
+            ))
+            .is_none(),
+            "枠が分からないのにメーターを埋めている"
+        );
+        // 上限ではない通常の idle でも埋めない
+        assert!(parse_agent_metrics(&limit_stopped_screen(
+            "実装が完了しました。テストは全て緑です。"
+        ))
+        .is_none());
     }
 
     #[test]
