@@ -4711,7 +4711,7 @@ impl TakoApp {
                         })
                         .detach();
                     }
-                    // #1040: 切断したリモートフォルダの自動復帰。判定（`master_alive` =
+                    // #1040: 切断したリモートフォルダの自動復帰。判定（`remote_fs::liveness` =
                     // ソケットの stat）は UI で、**繋ぎ直しと保留の押し出しは background**。
                     // 待ちが 1 件も無ければジョブは出ない = 平常時のコストはゼロ
                     let Ok(recovery_jobs) =

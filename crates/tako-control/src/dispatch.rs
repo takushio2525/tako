@@ -4201,6 +4201,7 @@ fn dispatch_inner(
                 &ssh_host,
                 dir.as_deref(),
                 tako_core::i18n::lang(),
+                tako_core::remote_fs::pane_failure_rule(),
             );
             let command = tako_core::platform::shell::script_pane_command(&script);
 
@@ -6489,7 +6490,9 @@ fn dispatch_remote_folder(
                                 // （not_displayed = 裏タブなのでまだ読んでいない。異常ではない）
                                 "state": found.map(|(_, s, _)| s.clone()),
                                 "entries": found.map(|(_, _, n)| *n),
-                                "connected": remote_fs::master_alive(&r.host),
+                                // #1090: 多重化が無いプラットフォームでは
+                                // 「繋がっているか」を安く判定できないので null
+                                "connected": remote_fs::liveness(&r.host).as_bool(),
                                 // #1041: どの経路で載ったか / ローカルルートの前か後ろか
                                 "origin": origin_of(r).as_str(),
                                 "placement": order.placement_of(r),

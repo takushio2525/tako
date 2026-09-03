@@ -89,8 +89,12 @@ pub struct ConnectInputs<'a> {
 /// 日英どちらの文面でも共通なので、これで「tako の行」を言語に依らず見分けられる
 pub const TAKO_LINE_PREFIX: &str = "tako: ";
 
-/// スクリプトが出す失敗行に必ず入る文字列（日英どちらの文面にも入っている）
-pub const SCRIPT_FAILURE_MARK: &str = "ssh exit 255";
+/// スクリプトが出す失敗行に必ず入る文字列（日英どちらの文面にも入っている）。
+///
+/// #1090 で文面が**実際の終了コード**を載せる形になったので、末尾の数字は含めない
+/// （`ssh exit 255` / `ssh exit -1` のどちらも拾う。古いペインが印字する
+/// `ssh exit 255` もそのまま前方一致で拾えるので、世代をまたいでも壊れない）
+pub const SCRIPT_FAILURE_MARK: &str = "ssh exit ";
 
 /// ssh 自身が出す失敗行の見分け。**OpenSSH が印字する英語のまま**並べる
 /// （ssh の出力はロケールに依らない）。ここに無い理由でも、スクリプト経路なら
@@ -111,6 +115,12 @@ const SSH_ERROR_PATTERNS: &[&str] = &[
     "REMOTE HOST IDENTIFICATION HAS CHANGED",
     "Bad configuration option",
     "Bad owner or permissions",
+    // #1090: Windows の OpenSSH に ControlMaster を渡すと接続の前にこれで落ちる。
+    // exit も 255 ではない（`-1`）ので、**行を見分けられないと失敗が畳まれる**
+    "getsockname failed",
+    // 握手の途中で相手との読み書きが壊れた（上と同時に出るほか、
+    // 接続が張れずに終わったときにも出る）
+    "Read from remote host",
 ];
 
 /// 相手が入力を待っている行の見分け（小文字化して比べる）。
@@ -371,6 +381,50 @@ mod tests {
             classify(&inputs(&l, true)),
             ConnectPhase::Failed { reason: None }
         );
+    }
+
+    /// #1090: Windows の OpenSSH に ControlMaster を渡すと出る行。
+    /// **これを知らないと規則 ④ が先に当たって `Opened` へ畳まれる**
+    /// （= 接続中チップが失敗へ置き換わらずに消える。実機で観測した症状そのもの）
+    #[test]
+    fn windows_の多重化非対応の失敗行を失敗として読む() {
+        let l = lines(&[
+            "tako: win へ接続しています…（中止は Ctrl+C）",
+            "getsockname failed: Not a socket",
+            "Read from remote host win: Unknown error",
+        ]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { reason } => {
+                assert_eq!(reason.as_deref(), Some("getsockname failed: Not a socket"));
+            }
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+        // `pane` 経路（まっさらでない画面）でも同じ
+        assert!(is_ssh_error_line("getsockname failed: Not a socket"));
+        assert!(is_ssh_error_line(
+            "Read from remote host win: Unknown error"
+        ));
+    }
+
+    /// #1090: スクリプトの文面が実際の終了コードを載せる形になっても
+    /// マーカーで拾える（新旧どちらの文面も）
+    #[test]
+    fn マーカーは終了コードが何であっても拾える() {
+        for line in [
+            // #1090 以降（実際のコード）
+            "tako: win への接続に失敗しました（ssh exit -1）。理由は上の行です",
+            // #1090 以前に作られたペインが印字する形
+            "tako: win への接続に失敗しました（ssh exit 255）。理由は上の行です",
+            "tako: could not connect to win (ssh exit -1). The reason is printed above",
+        ] {
+            let l = lines(&["ssh: connect to host win port 22: Connection refused", line]);
+            match classify(&inputs(&l, true)) {
+                ConnectPhase::Failed { reason } => {
+                    assert!(reason.unwrap().contains("Connection refused"), "{line}");
+                }
+                other => panic!("{line}: 失敗として読めていない: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -862,6 +862,10 @@ pub fn control_path(host: &str) -> Option<PathBuf> {
 /// 使うと ssh が `unix_listener: cannot bind to path …: No such file or directory` で
 /// **必ず exit 255**（実測 #1040）。ツリーを先に開いていると隠れる形だった
 pub fn ensure_control_dir(host: &str) -> std::io::Result<()> {
+    // 多重化を使わないプラットフォームでは束ねるソケットそのものが無い（#1090）
+    if !crate::platform::ssh_client::multiplexing_available() {
+        return Ok(());
+    }
     let Some(cp) = control_path(host) else {
         return Ok(());
     };
@@ -898,9 +902,35 @@ pub fn short_hash(s: &str) -> String {
 }
 
 /// 共通の `-o` オプション（ControlMaster への相乗り + 待ち上限）
+///
+/// # 多重化は能力でゲートする（#1090）
+///
+/// `ControlPath` / `ControlMaster` / `ControlPersist` は
+/// [`crate::platform::ssh_client::multiplexing_available`] が真のときだけ渡す。
+/// Windows の OpenSSH はこれを実装しておらず、渡すと**接続が成立する前に**
+/// `getsockname failed: Not a socket` で死ぬ（しかも `exit -1` = ssh 自身の失敗を
+/// 表す 255 ですらない）。ここは SSH 系の**全経路**（対話ペイン・sftp のツリー・
+/// ファイルの取得と書き戻し・自動再接続）が通るので、1 箇所で塞げば全部に効く
 fn common_opts(host: &str, batch: bool) -> Vec<String> {
+    common_opts_with(
+        host,
+        batch,
+        crate::platform::ssh_client::multiplexing_available(),
+    )
+}
+
+/// [`common_opts`] の中身（多重化の可否を引数で受ける**純粋関数**）。
+///
+/// 能力を引数にしてあるので **macOS 上から Windows 側の形を検証できる**
+/// （`platform::support` / `platform::dpi` と同じ作法）
+pub(crate) fn common_opts_with(host: &str, batch: bool, multiplexing: bool) -> Vec<String> {
     let mut opts = Vec::new();
-    if let Some(cp) = control_path(host) {
+    let control = if multiplexing {
+        control_path(host)
+    } else {
+        None
+    };
+    if let Some(cp) = control {
         opts.push("-o".into());
         opts.push(control_path_option(&cp));
         opts.push("-o".into());
@@ -926,11 +956,22 @@ fn common_opts(host: &str, batch: bool) -> Vec<String> {
 ///
 /// ツリー側と**同じ ControlPath** を使うのが要点: 相手がパスワード認証しか持たなくても、
 /// ここで一度ログインすればソケットが共有され、以後ツリーが追加認証なしで開く（#65）。
+/// ただし**多重化を持たないプラットフォームではその共有が起きない**（#1090。
+/// 縮退の説明は [`crate::platform::ssh_client::NO_MULTIPLEXING`]）。
 /// `ConnectTimeout` を明示するのは、既定（約 75 秒）だと真っ黒な画面のまま
 /// 「何も入力できない」に見えるため（#919 の実測）
 pub fn ssh_pane_argv(host: &str, extra: &[String]) -> Vec<String> {
+    ssh_pane_argv_with(
+        host,
+        extra,
+        crate::platform::ssh_client::multiplexing_available(),
+    )
+}
+
+/// [`ssh_pane_argv`] の中身（多重化の可否を引数で受ける**純粋関数**）
+pub(crate) fn ssh_pane_argv_with(host: &str, extra: &[String], multiplexing: bool) -> Vec<String> {
     let mut argv = vec![ssh_bin().unwrap_or_else(|| "ssh".into())];
-    argv.extend(common_opts(host, false));
+    argv.extend(common_opts_with(host, false, multiplexing));
     argv.extend(extra.iter().cloned());
     argv.push(host.to_string());
     argv
@@ -953,6 +994,41 @@ pub fn pane_failure_hint(lang: Lang) -> &'static str {
 /// error occurred"）。リモートシェルが `exit 1` で終わったのを接続失敗と誤報しない
 pub const SSH_ERROR_EXIT: i32 = 255;
 
+/// その終了コードは **ssh クライアント自身の失敗**か（純粋関数。#1090）。
+///
+/// OpenSSH の約束は「リモートコマンド（対話なら**リモートのログインシェル**）の
+/// 終了状態、エラーなら 255」。したがって
+///
+/// - `255` … ssh 自身の失敗
+/// - `0..=255` の**それ以外** … 相手のシェルの終了状態かもしれないので**断定しない**
+///   （リモートで `exit 1` して抜けた人に「接続に失敗しました」と言わない）
+/// - `0..=255` の**外** … POSIX の待機状態としてあり得ない値 = クライアント側の異常。
+///   Windows の `ssh.exe` は ControlMaster を渡されると `-1` で落ちる（#1090 の実測）
+///
+/// **POSIX シェルの `$?` は常に 0..=255** なので、あちらでは `-eq 255` と厳密に
+/// 同値になる（`ssh_pane_script` の POSIX 分岐が従来のままでよい根拠。テストで固定）
+pub const fn is_client_failure(code: i32) -> bool {
+    code == SSH_ERROR_EXIT || code < 0 || code > 255
+}
+
+/// SSH ペインのスクリプトが「失敗」と見なす規則（#1090 の A/B のために型で持つ）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFailureRule {
+    /// [`is_client_failure`] に従う（既定）
+    ClientFailure,
+    /// `255` だけを失敗と見なす（#1090 以前。`TAKO_1090_LEGACY=1`）
+    ExitCode255,
+}
+
+/// 実行時の規則（A/B の env をここで吸収する。スクリプトの組み立ては純粋なまま）
+pub fn pane_failure_rule() -> SshFailureRule {
+    if crate::platform::ssh_client::legacy() {
+        SshFailureRule::ExitCode255
+    } else {
+        SshFailureRule::ClientFailure
+    }
+}
+
 /// SSH ペインで走らせるスクリプト（純粋関数。**macOS 上でも両方言をテストできる**）。
 ///
 /// #919 の無言失敗を潰すのがこの関数の全目的:
@@ -974,14 +1050,24 @@ pub const SSH_ERROR_EXIT: i32 = 255;
 ///
 /// そこで**ローカルのログインシェルへ落ちる**形にした。ペインは構造的に消えず、理由は
 /// 画面に残り、ユーザーはそのまま何でも打てる。そして tako 側は
-/// [`crate::ssh_reconnect`] のマーカー（`ssh exit 255` の行）でこの状態を見分け、
+/// [`crate::ssh_reconnect`] のマーカー（`ssh exit ` で始まる行）でこの状態を見分け、
 /// 一度でも繋がっていたペインなら**シェルのプロンプトへ ssh を打ち直す**
+///
+/// # #1090: 255 以外の失敗で無言にならない
+///
+/// 「ssh 自身の失敗 = 255」は OpenSSH の約束だが、**Windows の `ssh.exe` は
+/// ControlMaster を渡されると `-1` で落ちる**（実測）。`-eq 255` だけを見ていると
+/// 理由も次の一手も 1 行も出ないまま、ペインが黙って死ぬ。判定は
+/// [`is_client_failure`] へ寄せ、文面には**実際の終了コード**を載せる。
+/// どこまでを失敗と見なすかは [`SshFailureRule`] で受け取るので、
+/// **この関数は純粋なまま**（A/B の env は [`pane_failure_rule`] が吸収する）
 pub fn ssh_pane_script(
     dialect: crate::platform::shell_dialect::ShellDialect,
     argv: &[String],
     host: &str,
     cd_to: Option<&str>,
     lang: Lang,
+    rule: SshFailureRule,
 ) -> String {
     use crate::platform::shell_dialect::ShellDialect;
 
@@ -989,14 +1075,20 @@ pub fn ssh_pane_script(
         Lang::Ja => format!("tako: {host} へ接続しています…（中止は Ctrl+C）"),
         Lang::En => format!("tako: connecting to {host}… (Ctrl+C to cancel)"),
     };
-    let failed = match lang {
-        Lang::Ja => {
-            format!("tako: {host} への接続に失敗しました（ssh exit 255）。理由は上の行です")
-        }
-        Lang::En => {
-            format!("tako: could not connect to {host} (ssh exit 255). The reason is printed above")
-        }
+    // 失敗行は**実際の終了コード**を挟んで組む（#1090）。
+    // マーカー（`ssh exit `）は前半に入るので、コードが何であれ
+    // [`crate::ssh_progress::SCRIPT_FAILURE_MARK`] が拾える
+    let (failed_head, failed_tail) = match lang {
+        Lang::Ja => (
+            format!("tako: {host} への接続に失敗しました（ssh exit "),
+            "）。理由は上の行です".to_string(),
+        ),
+        Lang::En => (
+            format!("tako: could not connect to {host} (ssh exit "),
+            "). The reason is printed above".to_string(),
+        ),
     };
+    let failed = format!("{failed_head}{SSH_ERROR_EXIT}{failed_tail}");
     let next = pane_failure_hint(lang);
     // #1040: 「閉じます」ではなく「ローカルへ戻ります」。ここを閉じる案内にすると
     // ユーザーがタブごと失う（モジュール doc の実測）。自動で繋ぎ直すかは tako 側が
@@ -1008,6 +1100,13 @@ pub fn ssh_pane_script(
 
     match dialect {
         ShellDialect::Posix => {
+            // #1090: POSIX シェルの `$?` は**常に 0..=255**（`wait(2)` の下位 8 bit）なので、
+            // [`is_client_failure`] はこの定義域の上で `-eq 255` と厳密に同値になる。
+            // つまり広げる余地が無い = **macOS の挙動は 1 バイトも変わらない**
+            // （同値であることは `posix_の条件はis_client_failureと同値` が固定する）。
+            // 逆に「0 以外」へ広げると、リモートのログインシェルが `exit 1` で
+            // 抜けただけのペインに「接続に失敗しました」と出てしまう
+            let _ = rule;
             let cmd = argv
                 .iter()
                 .map(|a| crate::shell::quote_for_shell(a))
@@ -1052,11 +1151,34 @@ pub fn ssh_pane_script(
                     )
                 })
                 .unwrap_or_default();
-            // 5.1 と 7 の両方で通る書き方だけを使う（`&&` は 5.1 に無い）
+            // 5.1 と 7 の両方で通る書き方だけを使う（`&&` は 5.1 に無い）。
+            //
+            // #1090: `$LASTEXITCODE` は i32 で、**255 以外の ssh 自身の失敗が実在する**
+            // （ControlMaster を渡した Windows の ssh.exe は `-1` で落ちる）。
+            // 判定は [`is_client_failure`] と同じ規則で、加えて `$null`
+            // （= ネイティブコマンドが 1 度も走らなかった = 起動できなかった）も失敗とみなす。
+            // **0..=255 の中の 0 以外は失敗と断定しない**: 相手のログインシェルが
+            // `exit 1` で抜けただけかもしれないため（従来からの不変条件）
+            let cond = match rule {
+                SshFailureRule::ClientFailure => format!(
+                    "$null -eq $__tako_code -or $__tako_code -eq {SSH_ERROR_EXIT} -or $__tako_code -lt 0 -or $__tako_code -gt 255"
+                ),
+                SshFailureRule::ExitCode255 => {
+                    format!("$__tako_code -eq {SSH_ERROR_EXIT}")
+                }
+            };
+            // 文面に実際のコードを載せる（legacy は従来どおり 255 決め打ち）
+            let failed_expr = match rule {
+                SshFailureRule::ClientFailure => format!(
+                    "({head} + $__tako_code + {tail})",
+                    head = ShellDialect::PowerShell.quote_arg(&failed_head),
+                    tail = ShellDialect::PowerShell.quote_arg(&failed_tail),
+                ),
+                SshFailureRule::ExitCode255 => ShellDialect::PowerShell.quote_arg(&failed),
+            };
             format!(
-                "Write-Host {banner};\n{cd}& {cmd};\n                 $__tako_code = $LASTEXITCODE;\n                 if ($__tako_code -eq {SSH_ERROR_EXIT}) {{\n                 Write-Host {failed};\n                 Write-Host {next};\n                 Write-Host {hold};\n                 & (Get-Process -Id $PID).Path -NoLogo;\n                 }}\n",
+                "Write-Host {banner};\n{cd}& {cmd};\n                 $__tako_code = $LASTEXITCODE;\n                 if ({cond}) {{\n                 Write-Host {failed_expr};\n                 Write-Host {next};\n                 Write-Host {hold};\n                 & (Get-Process -Id $PID).Path -NoLogo;\n                 }}\n",
                 banner = ShellDialect::PowerShell.quote_arg(&connecting),
-                failed = ShellDialect::PowerShell.quote_arg(&failed),
                 next = ShellDialect::PowerShell.quote_arg(next),
                 hold = ShellDialect::PowerShell.quote_arg(hold),
             )
@@ -1137,8 +1259,16 @@ fn first_lines(text: &str, n: usize) -> String {
         .join("\n")
 }
 
-/// ControlMaster が生きているか（`ssh -O check`）
+/// ControlMaster が生きているか（`ssh -O check`）。
+///
+/// **多重化が無いプラットフォームでは常に false**（ソケットが存在しないので
+/// 「生きている master」という状態自体が無い）。接続の可否を知りたい呼び出し側は
+/// [`liveness`] を使うこと: そちらは「判定できない」を `Unknown` として返すので、
+/// 切断と取り違えて再接続を撃ち続ける形にならない（#1090）
 pub fn master_alive(host: &str) -> bool {
+    if !crate::platform::ssh_client::multiplexing_available() {
+        return false;
+    }
     let Some(ssh) = ssh_bin() else { return false };
     let Some(cp) = control_path(host) else {
         return false;
@@ -1158,8 +1288,52 @@ pub fn master_alive(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// ControlMaster を落とす（`ssh -O exit`）。閉じるときに呼ぶ
+/// ホストへの接続が「いま使えるか」（#1090）。
+///
+/// 多重化が使えるプラットフォームでは ControlMaster のソケットが答えになるが、
+/// **多重化が無いプラットフォームには持続する接続そのものが無い**ので、
+/// 「繋がっている / 切れている」を安く判定する材料が存在しない。
+/// そこを `false` で埋めると「常に切断」と読まれ、ツリーの状態表示が嘘になり
+/// 自動再接続（#1040）が延々と走る。**判定できないことを型で言う**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// 接続が生きている（ControlMaster が応答した）
+    Live,
+    /// 接続が死んでいる（ソケットが無い / 応答しない）
+    Dead,
+    /// 判定できない（多重化が無いので見るべきソケットが無い）
+    Unknown,
+}
+
+impl Liveness {
+    /// JSON へ載せる形（`Unknown` は `null`）
+    pub fn as_bool(self) -> Option<bool> {
+        match self {
+            Self::Live => Some(true),
+            Self::Dead => Some(false),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// ホストへの接続の生死（[`Liveness`] の doc を参照）
+pub fn liveness(host: &str) -> Liveness {
+    if !crate::platform::ssh_client::multiplexing_available() {
+        return Liveness::Unknown;
+    }
+    if master_alive(host) {
+        Liveness::Live
+    } else {
+        Liveness::Dead
+    }
+}
+
+/// ControlMaster を落とす（`ssh -O exit`）。閉じるときに呼ぶ。
+/// 多重化が無いプラットフォームでは落とす器が無いので何もしない（#1090）
 pub fn close_master(host: &str) {
+    if !crate::platform::ssh_client::multiplexing_available() {
+        return;
+    }
     let Some(ssh) = ssh_bin() else { return };
     let Some(cp) = control_path(host) else { return };
     if !cp.exists() {
@@ -1180,6 +1354,13 @@ pub fn close_master(host: &str) {
 /// `BatchMode=yes` なのでパスワードを聞かれる相手では失敗する。その場合の次の一手は
 /// [`RemoteErrorKind::AuthFailed`] の `next_step`（対話 SSH ペインで先にログイン）が持つ
 pub fn ensure_master(host: &str) -> Result<(), RemoteError> {
+    // 多重化が無いプラットフォームでは束ねる器を作らない（#1090）。
+    // **失敗検知が消えるわけではない**: 直後に走る sftp / ssh 自身が同じ分類済み
+    // エラー（[`RemoteError`]）を返すので、「フォルダを開く前に失敗を捕まえる」
+    // という #919 の契約はそのまま成立する。違うのは「認証が 1 回で済むか」だけ
+    if !crate::platform::ssh_client::multiplexing_available() {
+        return Ok(());
+    }
     if master_alive(host) {
         return Ok(());
     }
@@ -2208,8 +2389,9 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
 
     #[test]
     fn ssh_ペインの_argv_はツリーと同じ_controlpath_を通る() {
-        // 追加認証なしの共有（#65 / #919 要件 6）はここが一致していることが前提
-        let argv = ssh_pane_argv("win", &["-t".to_string()]);
+        // 追加認証なしの共有（#65 / #919 要件 6）はここが一致していることが前提。
+        // **多重化が使えるプラットフォームの形**（= macOS。#1090 で明示化した）
+        let argv = ssh_pane_argv_with("win", &["-t".to_string()], true);
         assert_eq!(argv.last().unwrap(), "win");
         let joined = argv.join(" ");
         assert!(joined.contains("ControlMaster=auto"), "{joined}");
@@ -2226,12 +2408,61 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
         assert!(!joined.contains("BatchMode"), "{joined}");
     }
 
+    /// #1090: 多重化を持たないプラットフォーム（Windows）へは
+    /// ControlMaster 系を **1 つも** 渡さない。渡すと接続が成立する前に
+    /// `getsockname failed: Not a socket` で死ぬ（実測）
+    #[test]
+    fn 多重化が無いプラットフォームへは_controlmaster_を渡さない() {
+        for batch in [false, true] {
+            let opts = common_opts_with("win", batch, false).join(" ");
+            assert!(!opts.contains("ControlMaster"), "{opts}");
+            assert!(!opts.contains("ControlPath"), "{opts}");
+            assert!(!opts.contains("ControlPersist"), "{opts}");
+            // 待ち上限と keepalive は多重化とは無関係なので残る
+            assert!(
+                opts.contains(&format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}")),
+                "{opts}"
+            );
+            assert!(
+                opts.contains(&format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECS}")),
+                "{opts}"
+            );
+            assert_eq!(opts.contains("BatchMode=yes"), batch, "{opts}");
+        }
+        let argv = ssh_pane_argv_with("win", &["-t".to_string()], false).join(" ");
+        assert!(!argv.contains("Control"), "{argv}");
+        assert!(argv.contains("-t"), "{argv}");
+    }
+
+    /// 能力の宣言と実際に組む argv がずれていないこと（両プラットフォームぶん）
+    #[test]
+    fn 多重化の宣言と組む_argv_が一致する() {
+        use crate::platform::ssh_client::multiplexing;
+        use crate::platform::support::Platform;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let mux = multiplexing(platform);
+            let opts = common_opts_with("win", true, mux).join(" ");
+            assert_eq!(
+                opts.contains("ControlMaster=auto"),
+                mux,
+                "{platform:?}: {opts}"
+            );
+        }
+    }
+
     #[test]
     fn ssh_ペインのスクリプトは接続前にバナーを出し失敗時だけ残る() {
         use crate::platform::shell_dialect::ShellDialect;
         let argv = vec!["/usr/bin/ssh".to_string(), "win".to_string()];
         for lang in [Lang::Ja, Lang::En] {
-            let posix = ssh_pane_script(ShellDialect::Posix, &argv, "win", None, lang);
+            let posix = ssh_pane_script(
+                ShellDialect::Posix,
+                &argv,
+                "win",
+                None,
+                lang,
+                SshFailureRule::ClientFailure,
+            );
             // 接続前のバナー（旧実装は完全な空画面だった。#919 の実測）
             assert!(posix.contains("printf"), "{posix}");
             assert!(posix.contains("win"), "{posix}");
@@ -2251,7 +2482,14 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
                 "{posix}"
             );
 
-            let ps = ssh_pane_script(ShellDialect::PowerShell, &argv, "win", None, lang);
+            let ps = ssh_pane_script(
+                ShellDialect::PowerShell,
+                &argv,
+                "win",
+                None,
+                lang,
+                SshFailureRule::ClientFailure,
+            );
             assert!(ps.contains("Write-Host"), "{ps}");
             assert!(ps.contains("$LASTEXITCODE"), "{ps}");
             assert!(ps.contains(&format!("-eq {SSH_ERROR_EXIT}")), "{ps}");
@@ -2267,6 +2505,107 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
         }
     }
 
+    /// #1090: 「ssh 自身の失敗」の定義。**POSIX の定義域では従来と厳密に同値**
+    #[test]
+    fn posix_の条件は_is_client_failure_と同値() {
+        // POSIX シェルの `$?` が取りうる全域
+        for code in 0..=255 {
+            assert_eq!(
+                is_client_failure(code),
+                code == SSH_ERROR_EXIT,
+                "code={code}"
+            );
+        }
+        // 定義域の外はクライアント側の異常（Windows の ssh.exe は -1 で落ちる）
+        assert!(is_client_failure(-1));
+        assert!(is_client_failure(256));
+        assert!(is_client_failure(i32::MIN));
+        // リモートのシェルが返しうる値は失敗と断定しない
+        assert!(!is_client_failure(0));
+        assert!(!is_client_failure(1));
+        assert!(!is_client_failure(130)); // Ctrl+C
+    }
+
+    /// #1090: PowerShell 分岐は 255 以外の ssh 自身の失敗（`-1`）も拾う。
+    /// **legacy へ戻すと拾わなくなる**（検出力）
+    #[test]
+    fn powershell_の失敗判定は_255_以外も拾う() {
+        use crate::platform::shell_dialect::ShellDialect;
+        let argv = vec!["ssh.exe".to_string(), "win".to_string()];
+        let now = ssh_pane_script(
+            ShellDialect::PowerShell,
+            &argv,
+            "win",
+            None,
+            Lang::Ja,
+            SshFailureRule::ClientFailure,
+        );
+        assert!(now.contains("$__tako_code -lt 0"), "{now}");
+        assert!(now.contains("$__tako_code -gt 255"), "{now}");
+        // 起動できず `$LASTEXITCODE` が付かなかった場合も失敗として扱う
+        assert!(now.contains("$null -eq $__tako_code"), "{now}");
+        // 文面には**実際の**終了コードが載る（255 決め打ちにしない）
+        assert!(now.contains("+ $__tako_code +"), "{now}");
+        assert!(
+            now.contains(crate::ssh_progress::SCRIPT_FAILURE_MARK),
+            "{now}"
+        );
+
+        let legacy = ssh_pane_script(
+            ShellDialect::PowerShell,
+            &argv,
+            "win",
+            None,
+            Lang::Ja,
+            SshFailureRule::ExitCode255,
+        );
+        assert!(!legacy.contains("-lt 0"), "{legacy}");
+        assert!(!legacy.contains("$null -eq"), "{legacy}");
+        assert!(
+            legacy.contains(&format!("-eq {SSH_ERROR_EXIT}")),
+            "{legacy}"
+        );
+        // legacy は #1090 以前の文面のまま（255 決め打ち）
+        assert!(legacy.contains("ssh exit 255"), "{legacy}");
+    }
+
+    /// #1090: POSIX 側は 1 バイトも変えない（macOS の挙動不変を固定する）
+    #[test]
+    fn posix_のスクリプトは規則を変えても同じ文字列() {
+        use crate::platform::shell_dialect::ShellDialect;
+        let argv = vec!["/usr/bin/ssh".to_string(), "win".to_string()];
+        for lang in [Lang::Ja, Lang::En] {
+            let a = ssh_pane_script(
+                ShellDialect::Posix,
+                &argv,
+                "win",
+                None,
+                lang,
+                SshFailureRule::ClientFailure,
+            );
+            let b = ssh_pane_script(
+                ShellDialect::Posix,
+                &argv,
+                "win",
+                None,
+                lang,
+                SshFailureRule::ExitCode255,
+            );
+            assert_eq!(a, b);
+            assert!(a.contains(&format!("-eq {SSH_ERROR_EXIT}")), "{a}");
+            assert!(a.contains("ssh exit 255"), "{a}");
+        }
+    }
+
+    /// #1090: 多重化が無いプラットフォームでは生死を「判定できない」と言う
+    #[test]
+    fn liveness_は判定できないときに_unknown_を返す() {
+        assert_eq!(Liveness::Live.as_bool(), Some(true));
+        assert_eq!(Liveness::Dead.as_bool(), Some(false));
+        // `null` として JSON へ出る = 「切断」と読まれない
+        assert_eq!(Liveness::Unknown.as_bool(), None);
+    }
+
     #[test]
     fn ssh_ペインのスクリプトは開くフォルダを見せる() {
         use crate::platform::shell_dialect::ShellDialect;
@@ -2277,9 +2616,17 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             "win",
             Some("/srv/app"),
             Lang::Ja,
+            SshFailureRule::ClientFailure,
         );
         assert!(with.contains("/srv/app"), "{with}");
-        let without = ssh_pane_script(ShellDialect::Posix, &argv, "win", None, Lang::Ja);
+        let without = ssh_pane_script(
+            ShellDialect::Posix,
+            &argv,
+            "win",
+            None,
+            Lang::Ja,
+            SshFailureRule::ClientFailure,
+        );
         assert!(!without.contains("/srv/app"), "{without}");
     }
 
@@ -2293,7 +2640,14 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             "ControlPath=\"/a b/c.sock\"".to_string(),
             "win".to_string(),
         ];
-        let posix = ssh_pane_script(ShellDialect::Posix, &argv, "win", None, Lang::Ja);
+        let posix = ssh_pane_script(
+            ShellDialect::Posix,
+            &argv,
+            "win",
+            None,
+            Lang::Ja,
+            SshFailureRule::ClientFailure,
+        );
         // 単引用符で 1 語に括られている（`/a b/c.sock` が 2 語へ割れない）
         assert!(posix.contains("'-o'") || posix.contains("-o"), "{posix}");
         assert!(posix.contains("'ControlPath=\"/a b/c.sock\"'"), "{posix}");
