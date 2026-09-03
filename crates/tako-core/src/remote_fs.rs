@@ -977,6 +977,30 @@ pub(crate) fn ssh_pane_argv_with(host: &str, extra: &[String], multiplexing: boo
     argv
 }
 
+/// 接続前に印字するバナー（#919）。
+///
+/// **文面の正本はここ 1 箇所**。[`crate::ssh_progress`] が
+/// 「端末幅で折り返された続き行」を「ssh が何か言った」と読み違えないために
+/// 同じ文面を引く（#1090。`tako: ` の前置きは折り返しの先頭行にしか付かないので、
+/// 行の頭だけを見る判定では続き行を tako のものだと分からない）
+pub fn pane_connecting_banner(host: &str, lang: Lang) -> String {
+    match lang {
+        Lang::Ja => format!("tako: {host} へ接続しています…（中止は Ctrl+C）"),
+        Lang::En => format!("tako: connecting to {host}… (Ctrl+C to cancel)"),
+    }
+}
+
+/// tako がこのペインへ印字した文面（**両方の表示言語ぶん**）。
+///
+/// 両言語を返すのは、ペインを開いたあとに `tako lang` で切り替えられても
+/// 折り返しの続き行を見分けられるようにするため（#1090）
+pub fn pane_prints(host: &str) -> Vec<String> {
+    vec![
+        pane_connecting_banner(host, Lang::Ja),
+        pane_connecting_banner(host, Lang::En),
+    ]
+}
+
 /// SSH ペインの失敗行に添えるヒント（種別が分からない場所で使う汎用版）。
 ///
 /// スクリプトの中では ssh の stderr を分類できない（理由は**その上の行に生で出ている**）。
@@ -1071,10 +1095,7 @@ pub fn ssh_pane_script(
 ) -> String {
     use crate::platform::shell_dialect::ShellDialect;
 
-    let connecting = match lang {
-        Lang::Ja => format!("tako: {host} へ接続しています…（中止は Ctrl+C）"),
-        Lang::En => format!("tako: connecting to {host}… (Ctrl+C to cancel)"),
-    };
+    let connecting = pane_connecting_banner(host, lang);
     // 失敗行は**実際の終了コード**を挟んで組む（#1090）。
     // マーカー（`ssh exit `）は前半に入るので、コードが何であれ
     // [`crate::ssh_progress::SCRIPT_FAILURE_MARK`] が拾える

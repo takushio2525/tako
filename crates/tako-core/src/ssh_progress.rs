@@ -83,6 +83,15 @@ pub struct ConnectInputs<'a> {
     pub screen_changed: bool,
     /// tako が印字したものしか載っていないペインか（`split` / `tab` = true）
     pub fresh_pane: bool,
+    /// tako がこのペインへ印字した文面（[`crate::remote_fs::pane_prints`]）。
+    ///
+    /// **折り返しの続き行を見分けるために要る**（#1090）。物理行は端末幅で折り返され、
+    /// `tako: ` の前置きは**先頭行にしか付かない**ので、行の頭だけを見る
+    /// [`is_tako_line`] では続き行が tako のものだと分からない。すると規則 ④
+    /// （まっさらなペイン + tako 以外の行 = ssh が何か言った）が**バナーの続き行**で
+    /// 当たり、繋がっていないのに `Opened` になる（実測: 44 桁のペインで日本語の
+    /// バナーが 2 行へ折り返され、#1040 の自動再接続まで armed になった）
+    pub tako_prints: &'a [String],
 }
 
 /// tako が [`crate::remote_fs::ssh_pane_script`] で印字する行の頭。
@@ -144,6 +153,18 @@ fn is_tako_line(line: &str) -> bool {
     line.trim_start().starts_with(TAKO_LINE_PREFIX)
 }
 
+/// tako が印字した文面の**一部**か（= 折り返しの続き行。#1090）。
+///
+/// 物理行は論理行の連続した切れ端なので、tako の文面の**部分文字列**かどうかで見分く。
+/// 1 文字の切れ端はどんな文面にも当たってしまうので下限を置く
+fn is_tako_fragment(line: &str, prints: &[String]) -> bool {
+    let t = line.trim();
+    t.chars().count() >= MIN_FRAGMENT_CHARS && prints.iter().any(|p| p.contains(t))
+}
+
+/// 続き行と見なす最短の長さ（これ未満は偶然一致しうるので見ない）
+const MIN_FRAGMENT_CHARS: usize = 2;
+
 /// 判定（詳細はモジュール doc）
 pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
     // 「tako 以外が書いた中身のある行」だけを見る
@@ -156,14 +177,19 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
         // ① tako のスクリプトが出した失敗行 = ssh が exit 255 で落ちた。
         //    理由は**その直前の行**（スクリプトの文面がそう言っている）
         if trimmed.contains(SCRIPT_FAILURE_MARK) {
+            // #1090: **ssh が出した失敗行を優先して拾う**。素の「直前の非空行」だと、
+            // 端末幅で折り返された理由の**尻尾**（`…\202\305\202\267\201B` のような
+            // 途中の切れ端）が理由として出てしまう（実測: 44 桁のペイン）。
+            // 見分けられなければ従来どおり直前の非空行へ落ちる
             let reason = interesting
                 .iter()
                 .rev()
-                .find(|l| !l.trim().is_empty())
+                .find(|l| is_ssh_error_line(l))
+                .or_else(|| interesting.iter().rev().find(|l| !l.trim().is_empty()))
                 .map(|l| l.trim().to_string());
             return ConnectPhase::Failed { reason };
         }
-        if is_tako_line(trimmed) {
+        if is_tako_line(trimmed) || is_tako_fragment(trimmed, inputs.tako_prints) {
             continue;
         }
         interesting.push(trimmed);
@@ -250,13 +276,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// テスト用の既定（`tako_prints` は「win 宛のバナー」= 実際に印字される文面）
     fn inputs<'a>(new_lines: &'a [String], fresh: bool) -> ConnectInputs<'a> {
         ConnectInputs {
             new_lines,
             master_socket: false,
             screen_changed: false,
             fresh_pane: fresh,
+            tako_prints: prints(),
         }
+    }
+
+    fn prints() -> &'static [String] {
+        static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        P.get_or_init(|| crate::remote_fs::pane_prints("win"))
     }
 
     #[test]
@@ -381,6 +414,50 @@ mod tests {
             classify(&inputs(&l, true)),
             ConnectPhase::Failed { reason: None }
         );
+    }
+
+    /// #1090: 折り返された理由の**尻尾**ではなく ssh の失敗行を理由に出す
+    #[test]
+    fn 折り返された理由は先頭の_ssh_の失敗行を拾う() {
+        let l = lines(&[
+            "tako: win へ接続してい",
+            "ます…（中止は Ctrl+C）",
+            "ssh: Could not resolve hostname selftest-non",
+            "existent-1010: unknown host",
+            "tako: win への接続に失敗しました（ssh exit 255）。理由は上の行です",
+        ]);
+        match classify(&inputs(&l, true)) {
+            ConnectPhase::Failed { reason } => assert_eq!(
+                reason.as_deref(),
+                Some("ssh: Could not resolve hostname selftest-non")
+            ),
+            other => panic!("失敗として読めていない: {other:?}"),
+        }
+    }
+
+    /// #1090: **折り返されたバナーの続き行を「ssh が何か言った」と読まない**。
+    ///
+    /// 実測（Windows 実機・44 桁のペイン）: 日本語のバナーが 2 行へ折り返され、
+    /// 続き行（`ます…（中止は Ctrl+C）`）が規則 ④ に当たって `Opened` になり、
+    /// そのまま `Connected` へ進んで #1040 の自動再接続が armed になっていた
+    /// （繋がったことが一度も無いホストなのに ssh を打ち直す）
+    #[test]
+    fn 折り返されたバナーの続き行を_ssh_の出力と読まない() {
+        // `visible_lines()` が返す物理行（44 桁で折り返した形）
+        let l = lines(&["tako: win へ接続してい", "ます…（中止は Ctrl+C）"]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Connecting);
+
+        // 英語のバナーでも同じ（表示言語を切り替えても見分けられる）
+        let l = lines(&["tako: connecting to win… (Ctrl+C", " to cancel)"]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Connecting);
+
+        // ssh が本当に何か言ったら従来どおり畳む（検出力を殺していない）
+        let l = lines(&[
+            "tako: win へ接続してい",
+            "ます…（中止は Ctrl+C）",
+            "The authenticity of host 'win' can't be",
+        ]);
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Opened);
     }
 
     /// #1090: Windows の OpenSSH に ControlMaster を渡すと出る行。

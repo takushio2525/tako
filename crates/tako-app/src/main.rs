@@ -9367,6 +9367,7 @@ impl TakoApp {
             match st.phase.clone() {
                 // --- 接続待ち（#1010 のまま）------------------------------------
                 ConnectPhase::Connecting => {
+                    let prints = tako_core::remote_fs::pane_prints(&st.host);
                     let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                         new_lines,
                         master_socket: tako_core::remote_fs::control_path(&st.host)
@@ -9374,6 +9375,8 @@ impl TakoApp {
                             .unwrap_or(false),
                         screen_changed: fingerprint != st.baseline_fingerprint,
                         fresh_pane: st.fresh_pane,
+                        // #1090: 折り返されたバナーの続き行を ssh の出力と読まない
+                        tako_prints: &prints,
                     });
                     match phase {
                         // #1040: ここで捨てずに**見張りへ移る**。切断を拾うため
@@ -9433,6 +9436,7 @@ impl TakoApp {
                 ConnectPhase::Reconnecting { .. } => {
                     // ① 打ち直した結果を待っている最中か
                     if st.attempt_pending {
+                        let prints = tako_core::remote_fs::pane_prints(&st.host);
                         let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                             new_lines,
                             master_socket: tako_core::remote_fs::control_path(&st.host)
@@ -9441,6 +9445,7 @@ impl TakoApp {
                             screen_changed: fingerprint != st.baseline_fingerprint,
                             // 打ち直しは**必ず既存シェルへ 1 行**なので fresh ではない
                             fresh_pane: false,
+                            tako_prints: &prints,
                         });
                         match phase {
                             ConnectPhase::Opened => {
