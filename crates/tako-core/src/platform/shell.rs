@@ -71,8 +71,16 @@ pub fn script_dialect() -> ShellDialect {
 ///   `CreateProcess` が失敗し、コマンド型ゲートが一切判定できなかった（#935）
 ///
 /// コンソールウィンドウの抑止（#586）は**ここで済ませる**。GUI プロセスから到達する
-/// 経路なので呼び出し側に思い出させない
+/// 経路なので呼び出し側に思い出させない。
+///
+/// `TAKO_935_LEGACY=1` で #935 前の挙動（**プラットフォームに依らず POSIX シェルを
+/// 直起動する**）へ戻せる = 同一バイナリで A/B が取れる。Windows では `sh` が
+/// 無いので `CreateProcess` が失敗し、当時の症状（どの述語も「コマンド実行に失敗」）が
+/// そのまま再現する。macOS では新旧が同じ argv になるので挙動は変わらない
 pub fn output_command(script: &str) -> std::process::Command {
+    if std::env::var_os("TAKO_935_LEGACY").is_some() {
+        return build_output_command(&posix_output_argv(script));
+    }
     imp::output_command(script)
 }
 
@@ -380,8 +388,9 @@ fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
 /// **`sh` を素の名前で起こす形は #935 以前の `acceptance_gates` から 1 バイトも変えない**
 /// （境界へ寄せたことで macOS の挙動が動いていないことをスナップショットで固定する）。
 /// `run_pane_command` 側の `/bin/sh` と違って素の名前なのは従来どおりで、
-/// PATH 上の `sh` を使う = ユーザーが差し替えていればそれに従う
-#[cfg_attr(windows, allow(dead_code))]
+/// PATH 上の `sh` を使う = ユーザーが差し替えていればそれに従う。
+///
+/// **Windows でも使う**（`TAKO_935_LEGACY=1` の A/B が #935 前の形を再現するため）
 fn posix_output_argv(script: &str) -> SpawnCommand {
     SpawnCommand {
         program: "sh".to_string(),

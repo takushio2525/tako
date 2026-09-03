@@ -228,6 +228,23 @@ enum CriterionKind {
 `gate check` は Command 種別の述語を worker の cwd で実行し、結果を記録する。
 master の acceptance セクションに「gate check を使え」と追記する。
 
+**述語を走らせるシェルは抽象境界 B1 が決める（#935）**。述語はシェル構文を含む
+「1 本の文字列」なので、`tako_core::platform::shell::output_command` へ渡して
+**macOS = `sh -c` / Windows = PowerShell（`-EncodedCommand`）**で走らせる。
+述語を書く側から見た方言は `script_dialect()` が正で、`true` / `false` / `pwd` の
+ような POSIX 固有の語は Windows では通らない（PowerShell に `true` / `false` は
+無く、`pwd` は表として整形されてパスが切られる = 実測）。
+
+Windows 固有の要件が 2 つある（どちらも実機実測）:
+
+- **終了コードは明示 `exit` で親へ返す**。`-EncodedCommand` は `$LASTEXITCODE` を
+  素通ししない（`cmd /c exit 7` が親から見て 1 になる）。確定の規則は実行ペイン
+  （#875）と共有の 1 実装なので、「ペインでは失敗が見えるのにゲートでは成功に
+  見える」形の食い違いが起きない
+- **出力を UTF-8 で書かせる**。PowerShell 5.1 はパイプ相手へ既定のコードページ
+  （日本語環境では CP932）で書くため、`evidence` が置換文字へ潰れる。
+  失敗したゲートの理由を読むのが `evidence` の目的なのでここは機能の一部
+
 #### タスク状態機械との統合
 
 概念 1 の `TaskCheckpoint.phase` と連動:
