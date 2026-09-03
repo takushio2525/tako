@@ -101,7 +101,7 @@ while IFS=$'\t' read -r id kind source anchor offset min_dur caption subtitle sp
             echo "   !! $id: 素材の末尾を超えている（${start}s + ${dur}s > ${avail}s）。末尾フレームで補う" >&2
         fi
         ;;
-    *) echo "ERROR: 不明な kind: $kind（$id）" >&2; exit 1 ;;
+    *) echo "ERROR: 不明な kind: ${kind}（${id}）" >&2; exit 1 ;;
     esac
     # 実際にエンコードされた長さを採用する（フレーム丸めで台本値と 1/30 秒ずれうる）
     real=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$seg")
@@ -148,7 +148,7 @@ if [ -f "$BGM" ]; then
         -filter_complex "[2:a]atrim=0:${VDUR},asetpts=PTS-STARTPTS,volume=0.20,afade=t=in:st=0:d=2,afade=t=out:st=${fade_start}:d=3[bgm];[bgm][1:a]sidechaincompress=threshold=0.015:ratio=8:attack=40:release=700:makeup=1[duck];[1:a][duck]amix=inputs=2:normalize=0:dropout_transition=0[a]" \
         -map 0:v -map "[a]" -c:v copy -c:a aac -ar 48000 -b:a 192k -movflags +faststart -shortest "$OUT"
 else
-    echo "!! BGM が無い（$BGM）。ナレーションのみで書き出す" >&2
+    echo "!! BGM が無い（${BGM}）。ナレーションのみで書き出す" >&2
     ffmpeg -nostdin -v error -y -i "$video" -i "$narr_only" -map 0:v -map 1:a -c:v copy -c:a aac -ar 48000 -b:a 192k -movflags +faststart -shortest "$OUT"
 fi
 
