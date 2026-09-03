@@ -58,6 +58,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -817,48 +818,75 @@ impl AppIpcClient {
         }
     }
 
-    /// 外側 `Result` = 通信、内側 = app の応答（#1078）
+    /// 外側 `Result` = 通信、内側 = app の応答（#1078）。
+    ///
+    /// **ワイヤ処理（1 行 1 JSON）はトランスポート非依存**で、接続の確立だけが
+    /// プラットフォームで異なる（unix = Unix domain socket / windows = 名前付き
+    /// パイプ = 抽象境界 B3）。tako-cli の `transport` と同じ形（#519 段取り ③ / #467）。
+    ///
+    /// **Windows 側は #972 まで `Err("Windows の IPC は未実装")` だった**ので、
+    /// daemon / CLI から app へ問い合わせる経路（数値ペイン ID → 器のセッションの
+    /// 解決を含む）が丸ごと成立していなかった
     fn roundtrip_detailed(
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
     ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
-        #[cfg(unix)]
-        {
-            use std::io::{BufRead, BufReader, Write};
-            use std::os::unix::net::UnixStream;
+        let (read_half, write_half) = Self::connect_stream(socket)?;
+        Self::roundtrip_on(read_half, write_half, token, request)
+    }
 
-            let stream = UnixStream::connect(socket)
-                .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .ok();
-            let mut writer = stream
-                .try_clone()
-                .map_err(|e| format!("接続の複製に失敗: {e}"))?;
-            let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
-            let json = serde_json::to_string(&envelope)
-                .map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
-            writeln!(writer, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+    #[cfg(unix)]
+    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), String> {
+        use std::os::unix::net::UnixStream;
 
-            let mut line = String::new();
-            BufReader::new(stream)
-                .read_line(&mut line)
-                .map_err(|e| format!("応答の受信に失敗: {e}"))?;
-            if line.is_empty() {
-                return Err("tako app から応答が返らなかった".into());
-            }
-            let response: crate::protocol::ResponseEnvelope =
-                serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
-            match response.error {
-                Some(error) => Ok(Err(error)),
-                None => Ok(Ok(response.result.unwrap_or(Value::Null))),
-            }
+        let stream = UnixStream::connect(socket)
+            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+        Ok((read_half, stream))
+    }
+
+    #[cfg(windows)]
+    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), String> {
+        let stream = crate::platform::named_pipe::connect_client(socket, 3_000)
+            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        let read_half = stream
+            .try_clone()
+            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+        Ok((read_half, stream))
+    }
+
+    /// 1 往復ぶんのワイヤ処理（両プラットフォームが通る 1 実装）
+    fn roundtrip_on<R: Read, W: Write>(
+        read_half: R,
+        mut write_half: W,
+        token: &str,
+        request: crate::protocol::Request,
+    ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
+        use std::io::{BufRead, BufReader};
+
+        let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
+        let json =
+            serde_json::to_string(&envelope).map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
+        writeln!(write_half, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+
+        let mut line = String::new();
+        BufReader::new(read_half)
+            .read_line(&mut line)
+            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+        if line.is_empty() {
+            return Err("tako app から応答が返らなかった".into());
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (socket, token, request);
-            Err("Windows の IPC は未実装".into())
+        let response: crate::protocol::ResponseEnvelope =
+            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        match response.error {
+            Some(error) => Ok(Err(error)),
+            None => Ok(Ok(response.result.unwrap_or(Value::Null))),
         }
     }
 }
