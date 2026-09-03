@@ -120,7 +120,14 @@ pub fn is_recoverable_reason(reason: Option<&str>) -> bool {
 
 /// 自動再接続を仕掛けてよいか。
 ///
-/// `ever_connected` = このペインで一度でも接続が成立したか（モジュール doc 参照）
+/// `ever_connected` = このペインで一度でも接続が成立したか（モジュール doc 参照）。
+///
+/// **「画面が動いた」を証拠にしてはいけない**（#1090）: 器（psmux / tmux）や下のシェルも
+/// 描くので、[`crate::ssh_progress::ConnectPhase::Opened`] は「沈黙が破れた」までしか
+/// 言わない。繋がったことが一度も無いホストへ ssh を打ち直す事故を実機で踏んだ。
+/// 呼び出し側は多重化のソケット（接続が張れて初めて作られる）を証拠にする。
+/// 多重化を持たないプラットフォームでは証拠が無いので armed にならない
+/// （宣言済みの縮退。[`crate::platform::ssh_client::NO_MULTIPLEXING`]）
 pub fn should_arm(enabled: bool, ever_connected: bool) -> bool {
     enabled && ever_connected
 }
@@ -184,8 +191,10 @@ pub fn detect_disconnect(
             .map(str::to_string);
         return Some((DisconnectSignal::ScriptMarker, reason));
     }
-    // ② 既存シェル経路: ssh 自身の失敗だけが 255。理由は画面の ssh の行から拾う
-    if exit_code == Some(crate::remote_fs::SSH_ERROR_EXIT) {
+    // ② 既存シェル経路: ssh 自身の失敗だけを見る（#1090 で「255 だけ」から
+    //    `is_client_failure` へ。POSIX の `$?` は 0..=255 なので macOS では同値）。
+    //    理由は画面の ssh の行から拾う
+    if exit_code.is_some_and(crate::remote_fs::is_client_failure) {
         let reason = new_lines
             .iter()
             .rev()

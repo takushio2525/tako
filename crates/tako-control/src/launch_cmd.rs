@@ -103,6 +103,30 @@ pub fn quote_always(dialect: ShellDialect, s: &str) -> String {
     }
 }
 
+/// argv を「そのシェルのプロンプトへそのまま打てる 1 行」へ組む（#1090）。
+///
+/// PowerShell は**引用符で始まる語をコマンド名として解釈しない**ので、
+/// 呼び出し演算子 `&` を前に置く必要がある。[`ps_quote`] は常に引用するので
+/// この経路の第 1 語は必ず引用符で始まり、`&` が無いと
+/// `Unexpected token ''-o'' in expression or statement.` で**必ず**落ちる。
+///
+/// 実測（Windows 11 / #1090）: `tako open-in remote <host> --target pane` が
+/// この形で ParserError になり、**ssh を 1 度も起こせていなかった**
+/// （画面にはエラーが出るが `ssh_connect` は `connecting` のまま 120 秒で畳まれる）。
+///
+/// POSIX 側は `sh_quote` が安全な語を素通しするので演算子は要らない（従来と同じ文字列）
+pub fn command_line(dialect: ShellDialect, argv: &[String]) -> String {
+    let joined = argv
+        .iter()
+        .map(|a| quote(dialect, a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match dialect {
+        ShellDialect::Posix => joined,
+        ShellDialect::PowerShell => format!("& {joined}"),
+    }
+}
+
 /// PowerShell の単引用符リテラル。中の `'` は `''` で表す（バックスラッシュは効かない）
 fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -374,5 +398,32 @@ mod tests {
         // Unicode の扱いは逆（sh_quote は素通し / quote_for_shell は引用）
         assert_eq!(quote(SH, "検証"), "検証");
         assert_eq!(SH.quote_arg("検証"), "'検証'");
+    }
+
+    /// #1090: PowerShell は引用符で始まる語をコマンド名にできない。
+    /// **付け忘れると `--target pane` の ssh が 1 度も起きない**（実機実測）
+    #[test]
+    fn powershell_のコマンド行は呼び出し演算子で始まる() {
+        let argv = vec![
+            "C:\\Program Files\\OpenSSH\\ssh.exe".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            "win".to_string(),
+        ];
+        let ps = command_line(ShellDialect::PowerShell, &argv);
+        assert!(ps.starts_with("& '"), "{ps}");
+        assert!(ps.contains("'-o'"), "{ps}");
+        assert!(ps.ends_with("'win'"), "{ps}");
+
+        // POSIX は従来どおり（演算子を足さない = 人が打つ形のまま）
+        let posix = command_line(ShellDialect::Posix, &argv);
+        assert!(!posix.starts_with('&'), "{posix}");
+        assert_eq!(
+            posix,
+            argv.iter()
+                .map(|a| quote(ShellDialect::Posix, a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
 }
