@@ -38134,37 +38134,27 @@ mod self_test {
                     if !cwd_ok {
                         // 原因を名指しする（後から log を読んだ人が「環境の残骸」と
                         // 「製品の回帰」を混ぜないように）。順序は「確定できるものから」
+                        // 文言は 1 行の literal で持つ（`\` 継続は `cargo fmt` が
+                        // インデントごと畳んで空白の塊になり log が読めなくなる）
                         let why = if osc60_sock_env.is_none() {
                             format!(
-                                "器の同一性が中のシェルへ伝わっていない（{} が固定されていない）。                                 統合はソケット名の接頭辞 `tako*` で推測するので、socket={backend_sock} が                                  `tako` で始まらないとき OSC を包まず黙って無効化される = #1105 の回帰",
+                                "器の同一性が中のシェルへ伝わっていない（{} が固定されていない）。統合はソケット名の接頭辞 `tako*` で推測するので、socket={backend_sock} が `tako` で始まらないとき OSC を包まず黙って無効化される = #1105 の回帰",
                                 tako_core::backend::BACKEND_SOCKET_ENV
                             )
                         } else if osc60_server_pt.as_deref() == Some("off") {
                             format!(
-                                "器のサーバーが tako の conf を読んでいない（allow-passthrough off）。\
-                                 conf は `-f` = サーバー起動時にしか読まれないので、tako が立てて\
-                                 いないサーバー（手で立てた / 検証用 / 古い tako の残骸）へ相乗りすると\
-                                 OSC が捨てられる。`tmux -L {backend_sock} kill-server` してから\
-                                 測り直すこと（製品の回帰ではない）"
+                                "器のサーバーが tako の conf を読んでいない（allow-passthrough off）。conf は `-f` = サーバー起動時にしか読まれないので、稼働中サーバーへの再適用（`sync_conf`）が効いていない疑い。`tmux -L {backend_sock} kill-server` してから測り直すと切り分けられる"
                             )
-                        } else if osc60_session.is_some() && osc60_session != osc60_expected {
-                            "シェル統合の置き場がセッションへ固定されていない\
-                             （`backend::session_pinned_pairs` が ZDOTDIR を落としている = #1105 の回帰）"
-                                .to_string()
                         } else if osc60_session.is_none() {
-                            "シェル統合の置き場がセッションへ 1 つも固定されていない\
-                             （器が `session_pinned_pairs` を引いていない = #1105 の回帰）"
-                                .to_string()
+                            "シェル統合の置き場がセッションへ 1 つも固定されていない（器が `session_pinned_pairs` を引いていない = #1105 の回帰）".to_string()
+                        } else if osc60_session != osc60_expected {
+                            "シェル統合の置き場がセッションへ正しく固定されていない（`session_pinned_pairs` が別の値を載せている = #1105 の回帰）".to_string()
                         } else if osc60_stale {
                             format!(
-                                "置き場は固定できているのに届かない。サーバーは別インスタンスの\
-                                 統合を指している（socket={backend_sock} の使い回し）ので、\
-                                 残骸を消して測り直すと切り分けられる"
+                                "置き場も同一性も固定できているのに届かない。サーバーは別インスタンスの統合を指している（socket={backend_sock} の使い回し）ので、残骸を消して測り直すと切り分けられる"
                             )
                         } else {
-                            "統合の置き場も素通し設定も正しい。疑うのはシェル側の OSC 7 送出か\
-                             パススルーの包み直し（`zshenv.zsh`）"
-                                .to_string()
+                            "統合の置き場・同一性・素通し設定はすべて正しい。疑うのはシェル側の OSC 7 送出かパススルーの包み直し（`zshenv.zsh`）".to_string()
                         };
                         println!("TAKO_SELF_TEST_60_WHY: {why}");
                     }
@@ -38469,12 +38459,12 @@ mod self_test {
                 );
                 if !attached_ok {
                     let why = match att_present {
-                        None => "外部セッションが作れていない（`new-session -d` が失敗。                                 同名の残骸があると `duplicate session` で短絡し attach まで届かない）",
+                        None => "外部セッションが作れていない（`new-session -d` が失敗。同名の残骸があると `duplicate session` で短絡し attach まで届かない）",
                         Some(s) if !s.attached => {
                             "セッションは在るが attach されていない（`&&` の後段が走っていない）"
                         }
                         Some(_) => {
-                            "attach 済みだが tako がタブ枠へ紐付けていない                             （tty 突き合わせ = FR-2.16.9 の回帰の疑い）"
+                            "attach 済みだが tako がタブ枠へ紐付けていない（tty 突き合わせ = FR-2.16.9 の回帰の疑い）"
                         }
                     };
                     println!("TAKO_SELF_TEST_61F_WHY: {why}");
