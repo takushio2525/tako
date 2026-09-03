@@ -825,6 +825,100 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
     );
 }
 
+/// **#936 の番犬**: 実行中プロセスの実行ファイルパスの解決が、プロセス検査の境界
+/// （B5 = `tako_core::platform::procinfo::image_path`）の外に無いこと。
+///
+/// ## なぜ直呼びが危険か
+///
+/// 旧実装は `stale_binary` が `#[cfg(target_os = "macos")]` で `proc_pidpath`、
+/// それ以外で `/proc/<pid>/exe` を読んでいた。**Windows には `/proc` が無い**ので
+/// 常に `None` へ落ち、「いま動いている claude」を特定できず
+/// **古い claude の警告バナーが一度も出なかった**（#936）。エラーは 1 つも出ない。
+/// #722 / #525 と同じ「機能が黙って無効になる」形で、**macOS のゲートは全部緑**。
+///
+/// ## コメント行は見ない
+///
+/// 解説の中で API 名に触れるのは正しい（どのフラグで呼ぶか・なぜ 0 なのかは
+/// 実測の記録なので消せない）。**実際に呼んでいる行だけ**を落とす
+#[test]
+fn 実行中プロセスのパス解決が境界の外に残っていない() {
+    // 呼ぶ形（macOS の libproc / Windows の Win32 / Linux の procfs）
+    const PATTERNS: &[&str] = &[
+        "proc_pidpath",
+        "QueryFullProcessImageNameW",
+        "/proc/{pid}/exe",
+    ];
+    const ALLOWED: &[(&str, &str)] = &[(
+        "crates/tako-core/src/platform/procinfo.rs",
+        "境界 B5 の実装本体（3 プラットフォームぶん）",
+    )];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        collect_code_lines(
+            &root.join("crates").join(crate_dir).join("src"),
+            &root,
+            PATTERNS,
+            ALLOWED,
+            &mut offenders,
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "実行中プロセスのパス解決が境界の外にある:\n  {}\n\
+         → tako_core::platform::procinfo::image_path へ寄せてください\
+         （#936 / 設計 §2 の B5）",
+        offenders.join("\n  ")
+    );
+}
+
+/// `collect_os_shell_calls` と同じ走査だが、**コメント行を飛ばす**。
+/// 解説の中で API 名に触れている行を違反として報告しないため
+fn collect_code_lines(
+    dir: &Path,
+    root: &Path,
+    patterns: &[&str],
+    allowed: &[(&str, &str)],
+    out: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_code_lines(&path, root, patterns, allowed, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        // 報告文と ALLOWED はどちらも `/` 区切りで書く（Windows の strip_prefix は `\`）
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        if allowed.iter().any(|(p, _)| rel == *p) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if patterns.iter().any(|p| line.contains(p)) {
+                out.push(format!("{rel}:{}", idx + 1));
+            }
+        }
+    }
+}
+
 /// **#970 の番犬**: `canonicalize` の直呼びが、パス解決の境界
 /// （B26 = `tako_core::platform::path`）の外で**増えていない**こと。
 ///
@@ -907,12 +1001,6 @@ fn canonicalizeの直呼びが境界の外に残っていない() {
             "リモートファイル操作の認可（ルート配下かをコンポーネント単位で判定 = \
              #1085 の脅威モデル）とプレビューの同一ファイル判定。両辺を同じように \
              解決するので prefix は打ち消し合う",
-        ),
-        (
-            "crates/tako-control/src/stale_binary.rs",
-            2,
-            "claude バイナリの symlink チェーン解決（#498 / #772）。指紋の中で \
-             自分自身とだけ比較する",
         ),
     ];
 

@@ -51218,6 +51218,16 @@ mod self_test {
                     let _ = std::fs::remove_dir_all(&root);
                 }
             }
+            // 何が無いから走らないかを残す（#865 の作法）。項目 103 の場面作りは
+            // symlink のランチャと POSIX シェルの器（`sh -c "… & wait"`）に依っている。
+            // Windows のランチャは実体のコピーで、symlink 作成には既定で特権が要る。
+            // 判定そのもの（`pidpath` / 版の読み取り / 実行ファイル判定）は #936 で
+            // 境界へ寄せ、`cargo test` の単体（両プラットフォームで走る）が見ている
+            #[cfg(not(unix))]
+            println!(
+                "TAKO_SELF_TEST_SKIPPED: 103（場面作りが symlink と POSIX シェルの器に依る。\
+                 判定は procinfo::image_path / exe::is_executable_file の単体で検証。#936）"
+            );
 
             // 104. タブ × close の発生源マーカー（#770）。
             // 実地では「プレビュー混在タブが再起動で消えた」と報告されたが、実体は
