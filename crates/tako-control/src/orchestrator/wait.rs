@@ -101,9 +101,24 @@ pub enum WorkerErrorKind {
     /// 分類済みの理由と次の一手は `detail` に入る（組み立ては
     /// `orchestrator::agent_cli::AgentCliError::message_in`）
     LaunchFailed,
+    /// **時間では解けない利用阻害**で停止（#1106）。座席種別・管理者による無効化・
+    /// グループ枠 $0・クレジットの要求・追加利用ぶんの枯渇・組織でのサービス無効。
+    /// `UsageLimit` と分けてあるのは助言が正反対になるため —— 待っても解けないので、
+    /// 管理者 / プラン / クレジットの対処（= 人）が要る。
+    /// 文言の正本は `tako_core::limit_resume::entitlement_block_line`
+    EntitlementBlocked,
 }
 
 impl WorkerErrorKind {
+    /// 全種別（往復・prompt の記載漏れを網羅検査するため）
+    pub const ALL: [Self; 5] = [
+        Self::ApiError,
+        Self::UsageLimit,
+        Self::LimitDialog,
+        Self::LaunchFailed,
+        Self::EntitlementBlocked,
+    ];
+
     /// JSON / イベント行に載せる機械可読 slug
     pub fn as_str(self) -> &'static str {
         match self {
@@ -111,6 +126,7 @@ impl WorkerErrorKind {
             Self::UsageLimit => "usage_limit",
             Self::LimitDialog => "limit_dialog",
             Self::LaunchFailed => "launch_failed",
+            Self::EntitlementBlocked => "entitlement_blocked",
         }
     }
 
@@ -121,6 +137,7 @@ impl WorkerErrorKind {
             "usage_limit" => Some(Self::UsageLimit),
             "limit_dialog" => Some(Self::LimitDialog),
             "launch_failed" => Some(Self::LaunchFailed),
+            "entitlement_blocked" => Some(Self::EntitlementBlocked),
             _ => None,
         }
     }
@@ -137,6 +154,9 @@ impl WorkerErrorKind {
             // 起動が成立していないので、続行指示も待機も効かない。
             // detail の次の一手（導入 / ログイン / runtime 起動）を先にやる
             Self::LaunchFailed => "fix_launch",
+            // **時間では解けない**（#1106）。ナッジも待機も respawn も効かないので、
+            // 管理者 / プラン / クレジットの対処をユーザーへ伝えるのが唯一の前進
+            Self::EntitlementBlocked => "needs_human",
         }
     }
 }
@@ -1217,9 +1237,11 @@ pub fn screen_is_collapsed(output: &str) -> bool {
 /// 自動リトライやツール実行ログへの誤検知を招く。パターンはすべて
 /// 実採取画面由来（claude / codex。2026-07-12〜13 の夜間バッチ等）。
 ///
-/// 検知の優先順位は復帰コストの高い順: usage_limit > limit_dialog > api_error
+/// 検知の優先順位は復帰コストの高い順:
+/// usage_limit > entitlement_blocked > limit_dialog > api_error
 /// （codex は limit 到達時に limit メッセージとモデル切替ダイアログが同時に出るため、
-/// 本質である limit 到達を優先する）。
+/// 本質である limit 到達を優先する。usage_limit と entitlement_blocked の文言は
+/// 排他なので、この 2 つの間では順序が結果に出ない = #1106）。
 ///
 /// **種別は変えない**（#748 で一度 limit ダイアログを `limit_dialog` へ寄せる案を試したが、
 /// codex の limit 画面が supervisor の「解除まで待つ」復旧から外れて即再発するため戻した）。
@@ -1251,6 +1273,20 @@ pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
     for l in &lines {
         if tako_core::limit_resume::is_limit_exhausted_line(l) {
             return Some((WorkerErrorKind::UsageLimit, l.trim().to_string()));
+        }
+    }
+
+    // 1b. **時間では解けない**利用阻害（#1106）。座席種別・管理者による無効化・
+    //    グループ枠 $0・クレジットの要求・追加利用ぶんの枯渇・組織でのサービス無効。
+    //    文言の正本は `tako_core::limit_resume::entitlement_block_line` で、
+    //    **`is_limit_exhausted_line` とは排他**（core 側のテストが固定している）。
+    //    受けないと `None` = idle = 「作業完了」に見えてしまい、しかも待っても
+    //    直らないので人が気づくまで永久に止まったままになる（#1093 と同じ形の実害）。
+    //    上限（1.）より後に見るのは #1093 / #1096 の判定へ 1 ビットも影響させないため
+    //    （排他なので順序は結果に出ない）
+    for l in &lines {
+        if tako_core::limit_resume::entitlement_block_line(l) {
+            return Some((WorkerErrorKind::EntitlementBlocked, l.trim().to_string()));
         }
     }
 
@@ -2102,6 +2138,164 @@ mod tests {
         let (kind, _) = detect_worker_error(dialog_only).expect("検知される");
         assert_eq!(kind, WorkerErrorKind::LimitDialog);
         assert_eq!(kind.recommended_action(), "respond_dialog");
+    }
+
+    // --- #1106: 時間では解けない利用阻害（entitlement_blocked） ---
+
+    /// claude 2.1.258 の `dCt` / `pCt` / `Par` から採った実文言（6 分類 / 8 文言）を、
+    /// 実採取どおりのペイン画面の形（前置きの罫線 + 入力欄）に載せたもの
+    const ENTITLEMENT_SCREENS: [(&str, &str); 8] = [
+        (
+            "seat_type_credits",
+            "  ⎿  Your seat type doesn't include usage credits",
+        ),
+        (
+            "seat_type_usage",
+            "  ⎿  Your seat type doesn't include usage",
+        ),
+        (
+            "seat_type_extra",
+            "  ⎿  Your seat type doesn't include extra usage",
+        ),
+        (
+            "admin_disabled",
+            "  ⎿  Your usage allocation has been disabled by your admin",
+        ),
+        ("group_zero", "  ⎿  Your group's usage limit is set to $0"),
+        (
+            "fable_credits",
+            "  ⎿  Fable 5 requires usage credits. Run /usage-credits to continue.",
+        ),
+        ("extra_usage", "  ⎿  You're out of extra usage"),
+        (
+            "service_disabled",
+            "  ⎿  This service is disabled for your org",
+        ),
+    ];
+
+    #[test]
+    fn detect_worker_errorは時間で解けない阻害を別種として検知する() {
+        for (name, headline) in ENTITLEMENT_SCREENS {
+            let screen = format!("⏺ 実装を進めます\n\n{headline}\n\n──────\n❯ \n──────\n  ctx 42%");
+            let (kind, detail) = detect_worker_error(&screen)
+                .unwrap_or_else(|| panic!("{name}: 検知されない（idle = 作業完了に見える）"));
+            assert_eq!(
+                kind,
+                WorkerErrorKind::EntitlementBlocked,
+                "{name}: 種別が違う（detail={detail}）"
+            );
+            // 助言は「解除まで待つ」ではなく「人の対処が要る」
+            assert_eq!(kind.recommended_action(), "needs_human", "{name}");
+            assert_eq!(kind.as_str(), "entitlement_blocked", "{name}");
+            // detail は実文言（master がそのままユーザーへ見せられること）
+            assert_eq!(detail, headline.trim(), "{name}");
+        }
+    }
+
+    #[test]
+    fn detect_worker_errorは時間で解ける上限を阻害へ倒さない() {
+        // #1093 / #1096 の回帰。ここが entitlement_blocked へ倒れると
+        // 自動復帰（#813）が丸ごと死ぬ
+        for screen in [
+            CODEX_LIMIT_SCREEN,
+            CLAUDE_LIMIT_SCREEN,
+            "You've hit your session limit · resets 7:50pm (Asia/Tokyo)\n\n❯ \n──────",
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo)\n\n❯ \n──────",
+            // `out of usage credits` を含むので #1096 の規則で受ける（#1106 の対象外）
+            "Your organization is out of usage credits. Contact your admin to add more.\n❯ ",
+        ] {
+            let (kind, _) = detect_worker_error(screen).expect("検知される");
+            assert_eq!(kind, WorkerErrorKind::UsageLimit, "{screen}");
+        }
+    }
+
+    /// codex 0.153.0 / agy 1.1.25 のバイナリから採った実文言（#1107）
+    const ENTITLEMENT_SCREENS_CODEX_AGY: [(&str, &str); 5] = [
+        ("codex_out_of_credits", "You're out of credits."),
+        (
+            "codex_workspace_refill",
+            "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+        ),
+        (
+            "codex_spend_cap",
+            "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+        ),
+        ("agy_out_of_credits", "AI: Out of credits"),
+        (
+            "agy_no_license",
+            "No license available for this project and location. Contact your administrator to setup Gemini Enterprise for this project.",
+        ),
+    ];
+
+    #[test]
+    fn detect_worker_errorはcodexとagyの阻害も別種として検知する() {
+        for (name, headline) in ENTITLEMENT_SCREENS_CODEX_AGY {
+            // codex / agy の入力欄プロンプト（`›` / `>`）を含む実画面の形
+            let screen =
+                format!("• 実装を進めます\n\n{headline}\n\n› \n  gpt-5.2-codex · /work/dir");
+            let (kind, detail) = detect_worker_error(&screen)
+                .unwrap_or_else(|| panic!("{name}: 検知されない（idle = 作業完了に見える）"));
+            assert_eq!(
+                kind,
+                WorkerErrorKind::EntitlementBlocked,
+                "{name}: 種別が違う（detail={detail}）"
+            );
+            assert_eq!(kind.recommended_action(), "needs_human", "{name}");
+        }
+    }
+
+    #[test]
+    fn detect_worker_errorはcodexのworkspace_credit_limitを阻害へ倒す() {
+        // 見出しは `reached your <名前>limit` のテンプレートにも当たるが、
+        // 対処の選択肢に「待つ」出口が無い（`Notify owner?` だけ）ので
+        // `usage_limit`（解除まで待つ）ではなく阻害として返す（#1107）
+        let screen = "  Approaching rate limits\n  You've reached your workspace credit limit\n  Your workspace is out of credits. Ask your workspace owner to add more. Notify owner?\n\n› ";
+        let (kind, _) = detect_worker_error(screen).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::EntitlementBlocked);
+        // codex の通常の上限画面（#985 の実採取）は従来どおり usage_limit のまま
+        let (kind, _) = detect_worker_error(CODEX_LIMIT_SCREEN).expect("検知される");
+        assert_eq!(kind, WorkerErrorKind::UsageLimit);
+    }
+
+    #[test]
+    fn worker_error_kindのslugは往復し全種別が推奨アクションを持つ() {
+        for kind in WorkerErrorKind::ALL {
+            assert_eq!(
+                WorkerErrorKind::from_slug(kind.as_str()),
+                Some(kind),
+                "{} の往復が壊れている",
+                kind.as_str()
+            );
+            assert!(!kind.recommended_action().is_empty(), "{:?}", kind);
+        }
+        // slug は種別ごとに一意（`from_slug` の分岐が重なっていない）
+        let mut slugs: Vec<&str> = WorkerErrorKind::ALL.iter().map(|k| k.as_str()).collect();
+        slugs.sort_unstable();
+        let count = slugs.len();
+        slugs.dedup();
+        assert_eq!(slugs.len(), count, "slug が重複している");
+        assert_eq!(WorkerErrorKind::from_slug("unknown_kind"), None);
+    }
+
+    /// master の system prompt が**全種別**の対処を書いていること（#1106）。
+    /// 種別を増やしたのに prompt を直さないと、master は未知の kind を受けて
+    /// 対処を推測する（= #748 で「usage_limit なら待つ」と食い違い続けた形）
+    #[test]
+    fn master_promptは全ての異常種別の対処を書いている() {
+        let prompt = crate::orchestrator::DEFAULT_SYSTEM_PROMPT;
+        for kind in WorkerErrorKind::ALL {
+            assert!(
+                prompt.contains(kind.as_str()),
+                "master prompt に種別 `{}` の記載が無い",
+                kind.as_str()
+            );
+            assert!(
+                prompt.contains(kind.recommended_action()),
+                "master prompt に `{}` の推奨アクション `{}` の記載が無い",
+                kind.as_str(),
+                kind.recommended_action()
+            );
+        }
     }
 
     #[test]

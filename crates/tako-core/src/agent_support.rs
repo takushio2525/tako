@@ -307,6 +307,8 @@ pub mod keys {
     pub const WORKER_DEATH_RESUME: &str = "worker_death_resume";
     /// 送達の第 1 層（画面を介さない直送）
     pub const WORKER_DELIVERY_PEER: &str = "worker_delivery_peer";
+    /// 時間では解けない利用阻害（座席種別・管理者による無効化・組織ポリシー等）の検知
+    pub const WORKER_ENTITLEMENT_DETECT: &str = "worker_entitlement_detect";
     /// 利用上限からの自動復帰
     pub const WORKER_LIMIT_AUTORESUME: &str = "worker_limit_autoresume";
     /// 利用上限で止まったことの検知
@@ -464,6 +466,12 @@ pub mod notes {
     pub const AGY_NO_REMOTE_CONTROL: Note = Note::new(
         "agy の `--help` 全件（フラグ 24 / サブコマンド 11）にリモート操作の口が無い（`mic-serve` はマイクを別ホストへ配るだけ）ので、会話を外の端末から操作する手段がそもそも無い",
         "The full agy `--help` surface (24 flags, 11 subcommands) has no remote-control entry point at all (`mic-serve` only shares a microphone with another host), so there is no way to drive the conversation from another device",
+    );
+
+    /// ローカルで動かすモデルにベンダーの権利（座席 / クレジット / 組織ポリシー）が無い
+    pub const NO_LOCAL_ENTITLEMENT: Note = Note::new(
+        "自分のマシンで動かすモデルなので、座席種別・クレジット・組織ポリシーという概念が無い（阻害される権利がそもそも存在しない）",
+        "The model runs on your own machine, so there is no seat type, credit balance, or org policy to be blocked by",
     );
 
     /// ローカルで動かすモデルに利用上限という概念が無い
@@ -1122,6 +1130,52 @@ pub const MATRIX: &[AgentFeature] = &[
             "第 1 層は claude の Cross-Session Messaging（受信箱の socket へ直送）に固有。\
              AGENTS.md「worker への指示送達（#790）」も codex / agy / Windows は常に \
              第 2 層と明記している",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_ENTITLEMENT_DETECT,
+        summary: Note::new(
+            "時間では解けない利用阻害で止まったことを検知する（#1106）",
+            "Detects that the agent has stopped at a block that time cannot clear (#1106)",
+        ),
+        claude: S::Supported,
+        codex: S::Supported,
+        agy: S::Supported,
+        local: unsupported(notes::NO_LOCAL_ENTITLEMENT),
+        evidence: AgentEvidence::Measured(
+            "#1106: claude 2.1.258 のバイナリで阻害の前置き（`dCt` / `pCt` / `Par`）を読み、\
+             時間で解ける 4 条件（#1096）を除いた 6 分類 / 8 文言 —— 座席種別 3 種・\
+             管理者による無効化・グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・\
+             組織でのサービス無効 —— を `tako_core::limit_resume::entitlement_block_line` \
+             で受け、`WorkerErrorKind::EntitlementBlocked`（`needs_human`）として返す。\
+             #1107（2026-09-04 の実物調査）: codex 0.153.0 のバイナリに \
+             **6 実文言 / 3 分類**（クレジット残高の枯渇 = `You're out of credits.` / \
+             `Your workspace is out of credits. {Add credits to continue. | Ask your \
+             workspace owner to refill in order to continue. | Add credits to continue \
+             using Codex.}`、spend cap = `You hit your spend cap set {in your workspace | \
+             by the owner of your workspace}. …`、workspace のクレジット上限 = \
+             `You've reached your workspace credit limit` + `… Notify owner?`）、\
+             agy 1.1.25 に **2 実文言**（`AI: Out of credits` = 前払いクレジットが 0。\
+             変更履歴に「spurious \"Out of credits\" errors」の修正が 2 件あり実表示だと分かる / \
+             `No license available for this project and location. Contact your \
+             administrator to setup Gemini Enterprise for this project.`）が在ることを確認し、\
+             `out of credits` / `spend cap` / `workspace credit limit` / \
+             `no license available` の 4 語句として受ける。**この 4 語句は claude 2.1.258 の \
+             バイナリに 1 件も無い**（各 0 件。逆に claude の `out of usage credits` 12 件・\
+             `spend limit` 75 件は codex / agy に 0 件 = 語彙が系統ごとに分かれている）ので \
+             claude の判定は 1 ビットも変わらない。**座席種別・組織のサービス無効に相当する \
+             停止文言は codex / agy には無い**（`disabled for your` 0 件。`seat` は Seatbelt \
+             サンドボックスと SQL 予約語、`entitlement` は MCP の `openai/entitlementContext` \
+             = ツール権限の文脈で停止文言ではない）。**codex の構造化ソースでは区別できない** \
+             （rollout の `rate_limits` は `used_percent` / `resets_at` / `window_minutes` \
+             だけで、クレジット残高や権利の欠如を表すフィールドが無い = #985 の枠情報のみ）\
+             ので画面の文言が唯一の根拠になる。実文言の fixture は \
+             `detect_worker_errorはcodexとagyの阻害も別種として検知する` / \
+             `issue1107_codexとagyの阻害文言も別種として読む`、上限停止（#1093 / #1096 / #985）\
+             との排他は `issue1107_workspace_credit_limitはテンプレートより阻害が優先する` と \
+             `issue1107_codexの上限系は従来どおり時間で解ける扱い` が固定している。\
+             **残高を 0 にして実際に踏ませる再現はしていない**（課金・管理者権限が要る）。\
+             ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
         ),
     },
     AgentFeature {

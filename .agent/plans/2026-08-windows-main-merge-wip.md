@@ -3723,12 +3723,16 @@ mode ビット / `~` 展開 / `links` の絶対パス / `shell_profile`、と既
 `acceptance_gates`（#935）/ `stale_binary` / `remote` / `bundle_install`（macOS 専用）/
 `remote_fs_e2e`（#930））:
 
+> **2026-09-04 更新: ベースラインは 24 → 19 件**。#935 が `acceptance_gates` の
+> 5 件（下の最初の 5 行）を解消した（実測: `UNIQUE_FAILS=19` で残りの名前は完全一致・
+> 新規ゼロ）。以後の照合は**この 5 行を除いた 19 件**と突き合わせること。
+
 ```
-acceptance_gates::tests::execute_command_true_false
-acceptance_gates::tests::execute_command_with_cwd
-acceptance_gates::tests::execute_command_with_output
-acceptance_gates::tests::gate_check_skips_custom
-acceptance_gates::tests::gate_check_with_command
+acceptance_gates::tests::execute_command_true_false   ← #935 で解消（2026-09-04）
+acceptance_gates::tests::execute_command_with_cwd     ← #935 で解消
+acceptance_gates::tests::execute_command_with_output  ← #935 で解消
+acceptance_gates::tests::gate_check_skips_custom      ← #935 で解消
+acceptance_gates::tests::gate_check_with_command      ← #935 で解消
 config_share::env::tests::リポジトリ配下の実体も外部管理として検出する
 dispatch::tests::tree_folder_symlink経由でも削除できる
 dispatch::tests::tree_folder_symlink経由の重複追加は1エントリに畳まれる
@@ -3850,6 +3854,57 @@ TAKO_APP_SELF_TEST_FAILED: split が分割元の cwd を継承
   この機には他 worker の `tako-iso-12868` / `tako-st-23928` と本番 tako が居るので、
   名前一致の一括 kill は禁止。今回は 12 サーバーを解放（tmux 34→22 / pwsh 100→77）
 
+## #935 の記録（2026-09-04。コマンド型の受け入れゲートが `sh -c` 決め打ちだった）
+
+### 症状と機序
+
+`tako task gate check` のコマンド型述語が `Command::new("sh").args(["-c", cmd])` で、
+Windows に `sh` は無いので `CreateProcess` が失敗する。**登録（`gate set`）と表示
+（`gate show`）は設定 I/O だけなので動く**ため、「ゲートが無い」ではなく
+**「ゲートが常に失敗する」**形で現れる（実機 A/B: `TAKO_935_LEGACY=1` で
+4 形すべてが `コマンド実行に失敗: program not found` / `overall: failed`）。
+
+直し方は抽象境界 B1（`platform::shell::output_command`）へ寄せる #875 と同じ手だが、
+**PTY 無し（`Command::output()`）版**なので終了コードと符号化の扱いが別に要る。
+
+### 実物調査で設計が変わった 4 点（すべて Windows 11 / PowerShell 5.1 実測）
+
+| 測ったこと | 結果 | 設計への反映 |
+|---|---|---|
+| `-EncodedCommand` の終了コード | **`cmd /c exit 7` が親から見て 1** に化ける（`exit 7` を明示すれば 7） | 確定した値を**明示 `exit` で返す**。規則は実行ペインと共有の 1 実装 |
+| パイプ相手の出力の符号化 | 既定は **CP932**（`日本語` = `93fa967b8cea` = UTF-8 として不正） | `[Console]::OutputEncoding` を UTF-8 へ。**stderr とネイティブの子にも効く** |
+| stderr の CLIXML | **成功しただけで進捗レコードが 400 バイト**出る | `$ProgressPreference = 'SilentlyContinue'` でネイティブ述語は **0 バイト** |
+| `pwd` / `Write-Host` | `pwd` は表整形で**コンソール幅で切れる** / `Write-Host` は情報レコード 1078 バイト | `ShellDialect::print_cwd` は **`Write-Output $PWD.Path`** |
+
+**`-NoProfile` は実行ペインと逆に付ける**。この経路の POSIX 側は `sh -c`
+（ログインシェルではない）なので揃える先が違う。実測で `cargo` は `-NoProfile` でも
+`%USERPROFILE%\.cargo\bin` から解決できた。
+
+### 5.1 に手段が無くて残した限界
+
+**cmdlet のエラーレコード**（`Get-Item` の失敗 = CLIXML 632 バイト）と `Write-Host` の
+情報レコードは消せない。判定は終了コードで決まるので**合否は正しい**が evidence が
+読みにくい → 述語は**ネイティブコマンド（`cargo` / `git` / `gh`）で書く**のが望ましい、
+と AGENTS.md と `.agent/orchestrator-design.md` へ書いた。
+
+### 副産物: evidence の切り詰めが panic しうる（同 PR で修正）
+
+`format_evidence` の `&joined[..2000]` は**2000 バイト目が文字境界でないと panic** する
+（実測: `end byte index 2000 is not a char boundary; it is inside 'あ'`）。
+**#935 が出力を UTF-8 へ揃えたことでこの経路が現実的になった**（それまでは CP932 が
+`from_utf8_lossy` で置換文字 = 3 バイトへ潰れて偶然境界に乗っていた）。
+
+### 測り方の罠（次に実機を触る人向け）
+
+- **計測ハーネス自身が同じ CP932 の罠を踏む**。`cargo` は UTF-8 を書くので、
+  PowerShell 側で `[Console]::OutputEncoding = [Text.Encoding]::UTF8` を
+  先に立てないと**ログが二重に化けて失敗名が読めない**（1 回踏んだ）
+- `.ps1` は **UTF-8 BOM 付き**で送る（BOM 無しは 5.1 が CP932 で読んでパースが壊れる）
+- 新しい worktree は `web/tako-remote/dist` が無いと `PwaAssets` でビルドできない。
+  実機の `npm ci` が通らなかったので **macOS で同一コミットからビルドした dist を
+  `tar` で送った**（`dist` は gitignore なので worktree を汚さない）
+- `git -C <repo> worktree add <相対パス>` は**リポジトリの中**に worktree を作る。
+  絶対パスで渡すこと（1 回踏んで作り直した）
 #### #936 の記録（実行中プロセスのパス解決を境界へ。PR #1115・2026-09-04）
 
 **症状**: Windows で古い claude の警告バナーが出ない。`stale_binary::pidpath` が

@@ -134,11 +134,16 @@ pub mod notes {
         "Starting and stopping the remote daemon still relies on unix-only handling, and no end-to-end run has been measured on Windows",
     );
 
-    /// #919 / #65 / #930。バックエンドは同梱の OpenSSH なので移植は要らない設計だが、
-    /// 実機テストではホスト解決の分類がまだ落ちている
+    /// #1090。SSH クライアントの能力そのものの縮退（多重化が無い）。
+    /// **文言の正本は境界側**（[`crate::platform::ssh_client::NO_MULTIPLEXING`]）で、
+    /// マトリクスはそれを参照するだけにする（説明が 2 つに分かれない）
+    pub const WIN_SSH_NO_MULTIPLEXING: Note = crate::platform::ssh_client::NO_MULTIPLEXING;
+
+    /// #1090 / #976 / #930。リモートフォルダは Windows でも開けるが、
+    /// 多重化が無いぶんの縮退と、自動検知が働かないぶんの縮退が重なる
     pub const WIN_REMOTE_FOLDER: Note = Note::new(
-        "同梱の OpenSSH クライアントで動く設計だが Windows 実機で未実測（ホスト解決の分類は実機テストで失敗中。#930）。ペインの ssh を検知した自動追加（#976）は、プロセスのコマンド行を採れないので働かない（明示的に開く経路だけが使える）",
-        "Designed to work with the bundled OpenSSH client, but not measured on Windows yet (host resolution classification still fails in the real-hardware test suite, #930). Auto-adding folders by detecting ssh in a pane (#976) does not work because process command lines are unavailable; only the explicit open path is usable",
+        "同梱の OpenSSH クライアントで開けるが、接続多重化（ControlMaster）が無いので操作ごとに認証が起きる（パスワード認証しか無い相手は展開のたびに聞かれる。接続が生きているかも判定できない。#1090）。ペインの ssh を検知した自動追加（#976）は、プロセスのコマンド行を採れないので働かない（明示的に開く経路だけが使える）",
+        "Folders open with the bundled OpenSSH client, but without connection multiplexing (ControlMaster) every operation authenticates on its own (a password-only host asks on every expansion, and liveness cannot be determined, #1090). Auto-adding folders by detecting ssh in a pane (#976) does not work because process command lines are unavailable; only the explicit open path is usable",
     );
 
     /// #519。器は psmux。一覧と kill は通るが attach 系は通らない
@@ -157,12 +162,6 @@ pub mod notes {
     pub const WIN_AUTORENAME_ONCE: Note = Note::new(
         "AI 命名は動くが、シェル統合が無い（#525）ためタブの素材（cwd / タイトル / 実行状態）が起動後に変化せず、命名はタブごとに 1 回だけになる。claude を導入していない環境ではタブ名が PowerShell の実行ファイルパスになる（#760）",
         "AI naming works, but without shell integration (#525) a tab's inputs (cwd, title, command state) never change after startup, so each tab is named only once. Without claude installed the tab name becomes the PowerShell executable path (#760)",
-    );
-
-    /// #935。登録と表示は動き、実行だけが落ちる
-    pub const WIN_GATE_CHECK_SH: Note = Note::new(
-        "ゲートの登録と表示は動くが、コマンド型ゲートの実行が sh -c 決め打ちのため Windows では判定できない（#935）",
-        "Registering and showing gates works, but command gates run through a hardcoded sh -c, so they cannot be evaluated on Windows (#935)",
     );
 
     /// #936 で検知と警告は動くようになった。残るのはバナーの「張り直す」で、
@@ -806,9 +805,14 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_open_remote",
         macos: Support::Supported,
-        windows: Support::Supported,
+        // #1090: 接続そのものは成立するが、対話ペインでログインしても
+        // その接続をツリー（sftp）と共有できない（Windows の OpenSSH に
+        // 接続多重化が無い）。#65 の「一度入れば以後追加認証なし」が成立しない
+        windows: Support::Degraded {
+            note: notes::WIN_SSH_NO_MULTIPLEXING,
+        },
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: `tako open-in remote <host>` が新タブで接続前バナーを出し、到達不能なホストでもタブを閉じず ssh exit 255 の理由 + 次の一手 + 入力待ちまで出す（#919 の契約）",
+            "#1090 の Windows 11 実測（OpenSSH_for_Windows_10.0p2）: ControlMaster 系を渡すと接続の前に `getsockname failed: Not a socket` / exit -1 で死に、渡さないと同じ相手へ exit 255（`Could not resolve hostname` / `Host key verification failed`）まで進む。渡さない形にしたうえで到達不能ホストの 3 経路（split / tab / pane）が理由 + 次の一手を出してローカルのシェルへ戻ることを実測",
         ),
     },
     Feature {
@@ -1178,12 +1182,13 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_remote_folder",
         macos: Support::Supported,
-        windows: Support::Pending {
+        // #1090: 多重化を外したので sftp が通るようになった。残る縮退は
+        // 「操作ごとの認証」と「#976 の自動検知が働かない」の 2 つ
+        windows: Support::Degraded {
             note: notes::WIN_REMOTE_FOLDER,
-            issue: 919,
         },
-        windows_evidence: Evidence::UnitTest(
-            "セルフテスト項目 124 はバックエンドを呼ばない（器だけの検証）。実 SSH の remote_fs_e2e は実機で 1 件失敗中（#930）",
+        windows_evidence: Evidence::Measured(
+            "#1090 の Windows 11 実測: ControlMaster 系を渡した sftp は `getsockname failed: Not a socket` で握手にすら進まないが、渡さないと同じ相手へ SSH の握手が進む（`Host key verification failed` まで到達）。渡さない形で `tako remote-folder open` / `ls` が実 SSH 先の一覧を返すことを実測",
         ),
     },
     Feature {
@@ -1507,17 +1512,15 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::UnitTest(
-            "acceptance_gates のゲート登録テストが実機で緑（落ちているのは execute_command の 5 件だけ）",
+            "acceptance_gates の 14 テストが実機で緑（#935 でコマンド型述語の実行も通るようになった）",
         ),
     },
     Feature {
         key: "tako_task_gate_check",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_GATE_CHECK_SH,
-        },
-        windows_evidence: Evidence::UnitTest(
-            "実機の cargo test で execute_command 系 5 件が失敗（sh 不在）。PR / custom ゲートの判定は動く",
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#935 の Windows 11 実測: `tako task gate check` が 4 形（exit 0 / exit 1 / cwd 指定 / 出力取得）とも判定し、`cmd /c exit 7` は evidence が `exit 7`（値が丸まらない）・非 ASCII の出力も化けない。`TAKO_935_LEGACY=1` では 4 形すべてが「コマンド実行に失敗: program not found」",
         ),
     },
     Feature {

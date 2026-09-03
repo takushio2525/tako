@@ -43,18 +43,45 @@ pub fn run_pane_command(command: &str, marker_prefix: &str) -> SpawnCommand {
 /// （SSH ペインの接続前バナー + 失敗時の理由表示）で使う。
 ///
 /// スクリプトの方言（POSIX / PowerShell）は呼び出し側が
-/// [`ShellDialect::for_scripts`] を見て組む
+/// [`script_dialect`] を見て組む
 pub fn script_pane_command(script: &str) -> SpawnCommand {
     imp::script_pane_command(script)
 }
 
-/// このプラットフォームでペインへ流すスクリプトの方言（#919）。
+/// このプラットフォームで tako がシェルへ流すスクリプトの方言（#919 / #935）。
 ///
-/// 実行するシェルは [`script_pane_command`] が決めるので、**OS ではなくそのシェル**に
-/// 合わせた文法で組む必要がある。方言 enum は #873 で一本化した
+/// 実行するシェルは [`script_pane_command`]（ペイン）と [`output_command`]
+/// （PTY 無し）が決めるので、**OS ではなくそのシェル**に合わせた文法で組む必要がある。
+/// どちらも同じシェル系統（unix = POSIX / Windows = PowerShell）を起こすので
+/// 方言の判定はこの 1 本で足りる。enum は #873 で一本化した
 /// [`ShellDialect`] を使う（新しい判定を作らない）
 pub fn script_dialect() -> ShellDialect {
     imp::script_dialect()
+}
+
+/// 「1 本の文字列としてのシェル片」を **PTY 無し**で走らせる `Command`（境界 B1。#935）。
+///
+/// [`run_pane_command`] / [`script_pane_command`] との違いは**ペインを持たない**こと。
+/// 出力をその場で読み取って判定に使う用途（受け入れゲートのコマンド型述語 =
+/// `tako task gate check`）向けで、返した `Command` に呼び出し側が
+/// `current_dir` 等を足して `output()` する。
+///
+/// - **unix は `sh -c <片>`**（#935 以前の `acceptance_gates` と 1 バイトも変えない）
+/// - **Windows は PowerShell へ `-EncodedCommand`**。`sh` は無いので
+///   `CreateProcess` が失敗し、コマンド型ゲートが一切判定できなかった（#935）
+///
+/// コンソールウィンドウの抑止（#586）は**ここで済ませる**。GUI プロセスから到達する
+/// 経路なので呼び出し側に思い出させない。
+///
+/// `TAKO_935_LEGACY=1` で #935 前の挙動（**プラットフォームに依らず POSIX シェルを
+/// 直起動する**）へ戻せる = 同一バイナリで A/B が取れる。Windows では `sh` が
+/// 無いので `CreateProcess` が失敗し、当時の症状（どの述語も「コマンド実行に失敗」）が
+/// そのまま再現する。macOS では新旧が同じ argv になるので挙動は変わらない
+pub fn output_command(script: &str) -> std::process::Command {
+    if std::env::var_os("TAKO_935_LEGACY").is_some() {
+        return build_output_command(&posix_output_argv(script));
+    }
+    imp::output_command(script)
 }
 
 /// `tako:shell` 宣言（`# tako:shell: pwsh`）で指定されたシェルへコマンドを包む。
@@ -154,6 +181,10 @@ mod imp {
         super::ShellDialect::Posix
     }
 
+    pub(crate) fn output_command(script: &str) -> std::process::Command {
+        super::build_output_command(&super::posix_output_argv(script))
+    }
+
     fn user_shell() -> String {
         std::env::var("SHELL")
             .ok()
@@ -214,6 +245,11 @@ mod imp {
     pub(crate) fn script_dialect() -> super::ShellDialect {
         // 起こすのは必ず PowerShell（`run_pane_shell` は cmd.exe へ倒さない）
         super::ShellDialect::PowerShell
+    }
+
+    pub(crate) fn output_command(script: &str) -> std::process::Command {
+        // ペインと同じシェルを起こす（`script_dialect` の答えと食い違わせない）
+        super::build_output_command(&super::powershell_output_argv(&run_pane_shell(), script))
     }
 
     /// 実行ペインを起こす PowerShell の実行ファイル。
@@ -291,7 +327,7 @@ fn powershell_run_pane_command(program: &str, command: &str, marker_prefix: &str
     }
 }
 
-/// 実行ペインで走らせる PowerShell スクリプト（純粋関数）。
+/// コマンド本体を走らせて**終了コードを `$__tako_code` へ確定させる**までの片（純粋関数）。
 ///
 /// 終了コードの決め方が POSIX の `$?` そのままにならないのが肝:
 ///
@@ -310,13 +346,11 @@ fn powershell_run_pane_command(program: &str, command: &str, marker_prefix: &str
 /// | exe 失敗 → cmdlet 成功 | `sh -c 'false; true'` = 0 | 0 |
 /// | exe 成功 → cmdlet 失敗 | `sh -c 'true; false'` = 1 | 1 |
 ///
-/// `-NoProfile` を付けないのは、POSIX 側が `login_shell_command` の `-l` で
-/// プロファイルを読んでいるのと揃えるため。conda / nvm が `$PROFILE` で通す PATH が
-/// 効かないと「コマンドが見つからない」になる
+/// **確定した後どう伝えるかは呼び出し側**が決める（実行ペインはマーカー行として画面へ
+/// 出し、PTY 無しの実行は `exit` で親プロセスへ返す）。規則を 1 実装に閉じてあるので、
+/// 「ペインでは正しく判定できるのにゲートでは失敗が成功に見える」形の食い違いが起きない
 #[cfg_attr(not(windows), allow(dead_code))]
-fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
-    // マーカーの引用は PowerShell 方言の `quote_arg`（単引用符 + `''` 二重化）へ委ねる
-    let marker = ShellDialect::PowerShell.quote_arg(marker_prefix);
+fn powershell_exit_code_script(command: &str) -> String {
     format!(
         // プロファイルが走らせたネイティブ exe の値が残っていると誤検知するので先に消す
         "$global:LASTEXITCODE = $null\n\
@@ -324,10 +358,117 @@ fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
          $__tako_ok = $?\n\
          if ($__tako_ok) {{ $__tako_code = 0 }}\n\
          elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ $__tako_code = $LASTEXITCODE }}\n\
-         else {{ $__tako_code = 1 }}\n\
-         Write-Host ({marker} + $__tako_code)\n\
-         try {{ $null = [Console]::ReadLine() }} catch {{ }}\n"
+         else {{ $__tako_code = 1 }}\n"
     )
+}
+
+/// 実行ペインで走らせる PowerShell スクリプト（純粋関数）。
+///
+/// 終了コードの決め方は [`powershell_exit_code_script`] の doc を参照。ここは
+/// 確定した値を**マーカー行として画面へ出し、入力待ちで止める**部分だけを足す。
+///
+/// `-NoProfile` を付けないのは、POSIX 側が `login_shell_command` の `-l` で
+/// プロファイルを読んでいるのと揃えるため。conda / nvm が `$PROFILE` で通す PATH が
+/// 効かないと「コマンドが見つからない」になる
+/// （**PTY 無しの [`powershell_output_script`] は逆に `-NoProfile`**。あちらの
+/// POSIX 側は `sh -c` = プロファイルを読まないので、揃える先が違う）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
+    // マーカーの引用は PowerShell 方言の `quote_arg`（単引用符 + `''` 二重化）へ委ねる
+    let marker = ShellDialect::PowerShell.quote_arg(marker_prefix);
+    format!(
+        "{}Write-Host ({marker} + $__tako_code)\n\
+         try {{ $null = [Console]::ReadLine() }} catch {{ }}\n",
+        powershell_exit_code_script(command)
+    )
+}
+
+/// POSIX の「シェル片を PTY 無しで走らせる」argv（純粋関数）。
+///
+/// **`sh` を素の名前で起こす形は #935 以前の `acceptance_gates` から 1 バイトも変えない**
+/// （境界へ寄せたことで macOS の挙動が動いていないことをスナップショットで固定する）。
+/// `run_pane_command` 側の `/bin/sh` と違って素の名前なのは従来どおりで、
+/// PATH 上の `sh` を使う = ユーザーが差し替えていればそれに従う。
+///
+/// **Windows でも使う**（`TAKO_935_LEGACY=1` の A/B が #935 前の形を再現するため）
+fn posix_output_argv(script: &str) -> SpawnCommand {
+    SpawnCommand {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+    }
+}
+
+/// Windows の「シェル片を PTY 無しで走らせる」argv（純粋関数。**macOS 上でもテストできる**）。
+///
+/// `-EncodedCommand` を使う理由は [`powershell_run_pane_command`] と同じ
+/// （引用符を解釈する層をどれも書き換えなしに通す）。器を経由しない経路でも
+/// 符号化の実装を 2 つ持たないため同じ出口を通す。
+///
+/// **`-NoProfile` を付ける**のが実行ペインとの違い。この経路の POSIX 側は
+/// `sh -c`（ログインシェルではない = プロファイルを読まない）なので、揃える先が
+/// 「ユーザーの対話環境」ではなく「素の非対話シェル」になる。判定用のコマンドを
+/// 走らせる経路なので、プロファイルの副作用が混ざらないほうが再現性も高い
+/// （実機実測: `cargo` は `-NoProfile` でも `%USERPROFILE%\.cargo\bin` から解決できた）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_output_argv(program: &str, script: &str) -> SpawnCommand {
+    SpawnCommand {
+        program: program.to_string(),
+        args: vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-EncodedCommand".to_string(),
+            encode_powershell_command(&powershell_output_script(script)),
+        ],
+    }
+}
+
+/// PTY 無しで走らせる PowerShell スクリプト（純粋関数）。
+///
+/// 実行ペイン（[`powershell_run_script`]）との違いは 2 つ:
+///
+/// 1. **確定した終了コードを `exit` で親へ返す**。`-EncodedCommand` の終了コードは
+///    `$LASTEXITCODE` を素通しせず、実機実測では `cmd /c exit 7` が親から見て
+///    **1** に化けた（`exit 7` を明示すれば 7 で届く）。`exit` を省くと
+///    「7 で落ちたコマンド」と「1 で落ちたコマンド」を区別できないうえ、
+///    非終端エラーの後に成功コマンドが続くと**失敗が 0 に見える**
+/// 2. **出力を UTF-8 で書かせる**。パイプ相手の PowerShell 5.1 は
+///    `[Console]::OutputEncoding` の既定（日本語 Windows では CP932）で書くため、
+///    ゲートの evidence が `from_utf8_lossy` で置換文字だらけになる
+///    （実機実測: `日本語` が `93fa 967b 8cea` = UTF-8 として不正）。
+///    設定できない環境（コンソールを持たない等）では黙って既定のままにする。
+///    **stdout / stderr の両方**に効き、`cmd` / `cargo` のような**ネイティブの子**の
+///    出力も UTF-8 になる（実機実測: 前置きなしの stderr は `8c9f 8fd8` = CP932、
+///    前置きありは `e6a49c e8a8bc` = 正しい UTF-8）
+/// 3. **進捗レコードを黙らせる**。stderr がリダイレクトされていると PowerShell 5.1 は
+///    進捗・情報・エラーの各レコードを **CLIXML でシリアライズして stderr へ書く**。
+///    既定では成功しただけで「モジュールを初めて使用するための準備」の進捗レコードが
+///    出るので、**どのゲートの evidence にも数百バイトの XML が混ざる**
+///    （実機実測: `$ProgressPreference` 未指定で stderr 400 バイト → 指定すると **0 バイト**）
+///
+/// **既知の限界**: 上の 3 でも消えないのは **cmdlet のエラーレコード**（実機実測:
+/// `Get-Item` の失敗が CLIXML 632 バイト）と `Write-Host` の情報レコード（1078 バイト）。
+/// 5.1 にこの直列化を止める手段は無い。判定そのものは終了コードで決まるので**合否は
+/// 正しい**が、evidence は読みにくくなる。ネイティブコマンド（`cargo` / `git` / `gh`）は
+/// 失敗時も stderr が素のテキストなので（実機実測: `cmd /c exit 7` で stderr 0 バイト・
+/// exit 7）、ゲートの述語は**ネイティブコマンドで書くのが望ましい**
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_output_script(command: &str) -> String {
+    format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ }}\n\
+         $ProgressPreference = 'SilentlyContinue'\n\
+         {}exit $__tako_code\n",
+        powershell_exit_code_script(command)
+    )
+}
+
+/// [`output_command`] の共通部分（argv を `Command` へ移して副作用の抑止を掛ける）
+fn build_output_command(spawn: &SpawnCommand) -> std::process::Command {
+    let mut command = std::process::Command::new(&spawn.program);
+    command.args(&spawn.args);
+    // #586: GUI プロセス（release は GUI サブシステム）から到達するので
+    // コンソールウィンドウを出させない。呼び出し側に思い出させず境界で済ませる
+    crate::platform::process::no_console_window(&mut command);
+    command
 }
 
 /// `-EncodedCommand` が要求する UTF-16LE + base64。
@@ -617,6 +758,131 @@ mod tests {
                 .any(|a| a.eq_ignore_ascii_case("-noprofile")),
             "{:?}",
             got.args
+        );
+    }
+
+    // --- PTY 無しの実行（受け入れゲートのコマンド型述語。#935）---
+
+    /// **macOS の挙動を 1 バイトも変えていない**ことの固定（#935 の受け入れ条件）。
+    ///
+    /// 境界へ寄せる前の `acceptance_gates::execute_command` は
+    /// `Command::new("sh").args(["-c", cmd])` だった。ここが変わると
+    /// 「Windows を直したついでに macOS のゲートの意味が変わった」ことになる
+    #[test]
+    fn posixのpty無し実行はshマイナスcのまま() {
+        let got = posix_output_argv("cargo test --workspace && git diff --quiet");
+        assert_eq!(got.program, "sh");
+        assert_eq!(
+            got.args,
+            vec!["-c", "cargo test --workspace && git diff --quiet"]
+        );
+
+        // シェル構文・引用符・非 ASCII をそのまま 1 引数で渡す（加工しない）
+        for script in ["echo it's", "echo \"a b\"; false", "echo 検証", ""] {
+            let got = posix_output_argv(script);
+            assert_eq!(got.program, "sh");
+            assert_eq!(got.args, vec!["-c", script], "script={script:?}");
+        }
+    }
+
+    #[test]
+    fn windowsのpty無し実行はpowershellをencodedcommandで起こす() {
+        let got = powershell_output_argv(PWSH, "cargo test --workspace");
+        assert_eq!(got.program, PWSH);
+        assert_eq!(got.args[0], "-NoLogo");
+        assert_eq!(got.args[1], "-NoProfile");
+        assert_eq!(got.args[2], "-EncodedCommand");
+
+        let script = decode(&got.args[3]);
+        assert!(script.contains("cargo test --workspace"), "{script}");
+        // 終了コードの確定と、それを親へ返す `exit` が揃っている
+        assert!(script.contains("$__tako_ok = $?"), "{script}");
+        assert!(script.contains("$LASTEXITCODE"), "{script}");
+        assert!(script.contains("exit $__tako_code"), "{script}");
+        // 出力を UTF-8 で書かせる（CP932 だと evidence が置換文字へ潰れる）
+        assert!(
+            script.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"),
+            "{script}"
+        );
+        // 進捗レコードを黙らせる（既定では成功しただけで stderr へ CLIXML が出る）
+        assert!(
+            script.contains("$ProgressPreference = 'SilentlyContinue'"),
+            "{script}"
+        );
+        // ペイン用の要素（マーカー行・入力待ち）は入らない
+        assert!(!script.contains("ReadLine"), "{script}");
+        assert!(!script.contains("Write-Host ("), "{script}");
+    }
+
+    /// **実行ペインとは逆に `-NoProfile` を付ける**（揃える先が違う）。
+    ///
+    /// あちらの POSIX 側は `login_shell_command` の `-l`（ログインプロファイルを読む）だが、
+    /// こちらの POSIX 側は `sh -c`（読まない）。判定用のコマンドを走らせる経路なので
+    /// プロファイルの副作用を混ぜないほうが再現性も高い
+    #[test]
+    fn windowsのpty無し実行はプロファイルを読まない() {
+        let got = powershell_output_argv(PWSH, "cargo test");
+        assert!(
+            got.args
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("-noprofile")),
+            "{:?}",
+            got.args
+        );
+        // POSIX 側もログインシェルではない（対称性の明示）
+        assert!(!posix_output_argv("cargo test").args.contains(&"-l".into()));
+    }
+
+    /// 終了コードの決め方は**実行ペインと同じ 1 実装**（#935）。
+    ///
+    /// 別々に書くと「ペインでは失敗が見えるのにゲートでは成功に見える」形の
+    /// 食い違いが起きる。片方だけ直す変更をここで落とす
+    #[test]
+    fn 終了コードの決め方はペインとpty無しで共有する() {
+        let shared = powershell_exit_code_script("cargo test");
+        assert!(
+            powershell_run_script("cargo test", "__TAKO_EXIT=").starts_with(&shared),
+            "実行ペインが共有の片から始まっていない"
+        );
+        assert!(
+            powershell_output_script("cargo test").contains(&shared),
+            "PTY 無しの実行が共有の片を含んでいない"
+        );
+    }
+
+    #[test]
+    fn pty無し実行のencodedcommandも空白も引用符も含まない() {
+        for command in [
+            "echo \"hello world\"",
+            "cargo test --workspace && git diff --quiet",
+            "echo 検証テスト",
+            "echo it's",
+        ] {
+            let encoded = &powershell_output_argv(PWSH, command).args[3];
+            assert!(
+                encoded
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)),
+                "base64 の外の文字が混ざった: {encoded}"
+            );
+            // #906: 器を経由しない経路でも符号化の出口は 1 つなので `==` は出ない
+            assert!(!encoded.ends_with("=="), "{encoded}");
+            assert!(decode(encoded).contains(command), "{command}");
+        }
+    }
+
+    /// 起こすシェルと [`script_dialect`] の答えが食い違わない（**両プラットフォームで走る**）。
+    ///
+    /// 述語を書く側は `script_dialect()` を見て方言を決めるので、ここがずれると
+    /// 「PowerShell 用に書いた述語が POSIX シェルへ渡る」形の取り違えになる
+    #[test]
+    fn pty無し実行のシェルは方言の申告と一致する() {
+        let command = output_command("echo probe");
+        let program = command.get_program().to_string_lossy().to_string();
+        assert_eq!(
+            ShellDialect::from_program(&program),
+            Some(script_dialect()),
+            "program={program}"
         );
     }
 
