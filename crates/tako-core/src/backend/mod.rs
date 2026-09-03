@@ -136,7 +136,22 @@ pub const PANE_SCOPED_ENV: &[&str] = &[
     "TAKO_TAB_ID",
     // #766: 器が OSC を素通ししないときのシェル統合の書き先（`osc_sink::SINK_ENV`）
     crate::osc_sink::SINK_ENV,
+    // #1105: 器のソケット名（シェル統合が「自分は tako の器の中か」を判定する材料）
+    BACKEND_SOCKET_ENV,
 ];
+
+/// 器のソケット名を器の中のシェルへ伝える環境変数（#1105）。
+///
+/// シェル統合は「自分が tako の器の中に居るか」で挙動を変える（OSC を DCS
+/// パススルーで包む / `TMUX` を unset してユーザーのネスト tmux を素通しにする）。
+/// **判定材料をソケット名の接頭辞 `tako*` に頼っていた**ので、`TAKO_TMUX_SOCKET` に
+/// `tako` で始まらない名前を与えると統合が黙って無効化され、cwd 追従（OSC 7）と
+/// コマンド状態（OSC 133）が両方死んでいた（#1105 の実測。検証用のソケット名で踏んだ）。
+///
+/// tako が名前を明示すれば推測が要らない。統合スクリプトは
+/// **この値があればそれを使い、無ければ従来の接頭辞へ落ちる**
+/// （この env を渡さない古い tako が立てたセッションでも動く）
+pub const BACKEND_SOCKET_ENV: &str = "TAKO_BACKEND_SOCKET";
 
 /// 器のセッションを作るときに `-e` で**値を確定させる**キーか。
 ///
@@ -165,7 +180,10 @@ pub fn session_pinned_env(key: &str) -> bool {
 ///    インスタンスのサーバーが残っていると前のインスタンスの置き場を指す（#1105）
 ///
 /// 衝突したら `options.env`（呼び出し側の明示）が勝つ
-pub fn session_pinned_pairs(options_env: &[(String, String)]) -> Vec<(String, String)> {
+pub fn session_pinned_pairs(
+    options_env: &[(String, String)],
+    socket: &str,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = options_env
         .iter()
         .filter(|(key, _)| session_pinned_env(key))
@@ -176,6 +194,16 @@ pub fn session_pinned_pairs(options_env: &[(String, String)]) -> Vec<(String, St
             continue;
         }
         out.push((key.clone(), val.clone()));
+    }
+    // #1105: 器の同一性は**名前を明示して**伝える（接頭辞の推測に頼らない）。
+    // 値はソケットの basename（`$TMUX` が持つのもパスの basename なので揃う）
+    if !out.iter().any(|(k, _)| k == BACKEND_SOCKET_ENV) {
+        let name = socket
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(socket);
+        out.push((BACKEND_SOCKET_ENV.to_string(), name.to_string()));
     }
     out
 }
@@ -1001,7 +1029,7 @@ mod pane_scoped_env_tests {
             ("TAKO_PANE_ID".to_string(), "7".to_string()),
             ("PATH".to_string(), "/nope".to_string()),
         ];
-        let pinned = session_pinned_pairs(&options_env);
+        let pinned = session_pinned_pairs(&options_env, "tako-unit");
         assert!(pinned.iter().any(|(k, v)| k == "TAKO_PANE_ID" && v == "7"));
         assert!(
             !pinned.iter().any(|(k, _)| k == "PATH"),
@@ -1014,6 +1042,31 @@ mod pane_scoped_env_tests {
                 "{key} が統合の正本から固定されていない（#1105）"
             );
         }
+        // 器の同一性も名前で伝わる（統合が接頭辞 `tako*` を推測しなくて済む）
+        assert!(
+            pinned
+                .iter()
+                .any(|(k, v)| k == BACKEND_SOCKET_ENV && v == "tako-unit"),
+            "{BACKEND_SOCKET_ENV} が固定されていない（#1105）"
+        );
+    }
+
+    /// #1105: `$TMUX` が持つのはソケット**パス**なので、値は basename へ揃える
+    /// （そうしないとシェル側の比較が絶対パス指定のソケットで必ず外れる）
+    #[test]
+    fn 器のソケット名はbasenameで渡る() {
+        for (socket, want) in [
+            ("tako", "tako"),
+            ("/private/tmp/tmux-501/tako-iso-1", "tako-iso-1"),
+            ("C:\\pipe\\tako-win", "tako-win"),
+        ] {
+            let pinned = session_pinned_pairs(&[], socket);
+            let got = pinned
+                .iter()
+                .find(|(k, _)| k == BACKEND_SOCKET_ENV)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(got, Some(want), "socket={socket}");
+        }
     }
 
     /// 呼び出し側の明示（`options.env`）が統合の既定に勝つ
@@ -1023,7 +1076,7 @@ mod pane_scoped_env_tests {
             return; // 統合が env を撒かない環境（Windows）
         };
         let options_env = vec![(key.clone(), "明示".to_string())];
-        let pinned = session_pinned_pairs(&options_env);
+        let pinned = session_pinned_pairs(&options_env, "tako-unit");
         assert_eq!(
             pinned.iter().filter(|(k, _)| *k == key).count(),
             1,

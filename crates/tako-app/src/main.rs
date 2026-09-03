@@ -38069,11 +38069,44 @@ mod self_test {
                         })
                         .ok()
                         .flatten();
+                    // ペインの末尾（打った行が実際に走ったか。走っていないなら
+                    // 原因は OSC ではなく打鍵・シェルの準備側）
+                    let osc60_tail = window
+                        .update(cx, |app, _, _| {
+                            app.terminals.get(&backend_pane).map(|s| {
+                                s.visible_lines()
+                                    .into_iter()
+                                    .map(|l| l.trim_end().to_string())
+                                    .filter(|l| !l.is_empty())
+                                    .rev()
+                                    .take(3)
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    // 統合が**そもそも読み込まれたか**（OSC 133 が来ていれば Idle 等に
+                    // なる。Unknown なら OSC 7 だけの問題ではなく統合が動いていない）
+                    let osc60_state = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
+                                .get(&backend_pane)
+                                .map(|s| format!("{:?}", s.command_state()))
+                        })
+                        .ok()
+                        .flatten();
+                    // 固定した置き場に実体（`.zshenv`）があるか
+                    let osc60_zshenv = osc60_expected
+                        .as_deref()
+                        .map(|d| std::path::Path::new(d).join(".zshenv").exists());
                     let caps60 = tako_core::backend::capabilities();
                     println!(
                         "TAKO_SELF_TEST_60: {}",
                         [
                             format!("cwd_ok={cwd_ok}"),
+                            format!("osc133_state={osc60_state:?}"),
+                            format!("zshenv_exists={osc60_zshenv:?}"),
+                            format!("pane_tail={osc60_tail:?}"),
                             format!("backend={}", caps60.label),
                             format!("declares_passthrough={}", caps60.osc_passthrough),
                             format!("server_passthrough={osc60_server_pt:?}"),

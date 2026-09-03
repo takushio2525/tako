@@ -8,11 +8,20 @@ set -q TAKO_PANE_ID; or exit
 
 # tako の tmux バックエンド（Phase 5.5 / FR-5）配下なら OSC をパススルーで包み、
 # TMUX を unset してユーザー自身の tmux 利用（ネスト）を素通しにする（zsh 版と同じ）
+# 器の判定は tako が明示したソケット名（TAKO_BACKEND_SOCKET）を優先。
+# 接頭辞 `tako*` は古い tako 用のフォールバック（#1105。zsh 版と同じ）
 set -g _tako_tmux ''
 if set -q TMUX
     set -l sock (string split ',' -- $TMUX)[1]
-    if string match -qr '/tako[^/]*$' -- $sock
+    set -l name (string replace -r '^.*/' '' -- $sock)
+    if set -q TAKO_BACKEND_SOCKET
+        if test "$name" = "$TAKO_BACKEND_SOCKET"
+            set -g _tako_tmux 1
+        end
+    else if string match -q 'tako*' -- $name
         set -g _tako_tmux 1
+    end
+    if test -n "$_tako_tmux"
         set -e TMUX
         set -e TMUX_PANE
     end

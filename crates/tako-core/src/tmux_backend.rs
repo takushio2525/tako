@@ -183,7 +183,7 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // **シェル統合の置き場（ZDOTDIR 等）もここに含める**（#1105）: 含めないと、同じ
     // socket 名に別インスタンスのサーバーが残っているときに前のインスタンスの
     // 置き場を指し、OSC 7 / 133 が一切届かなくなる（cwd 追従とコマンド状態が黙って死ぬ）
-    for (key, val) in crate::backend::session_pinned_pairs(&options.env) {
+    for (key, val) in crate::backend::session_pinned_pairs(&options.env, socket) {
         args.push("-e".to_string());
         args.push(format!("{key}={val}"));
     }
@@ -986,6 +986,140 @@ mod tests {
         }
         panic!(
             "OSC 7 が届かない。画面: {:?}",
+            session.visible_lines().join("\n")
+        );
+    }
+
+    /// #1105 回帰: **器のサーバーが別インスタンスのシェル統合を指している**状態でも
+    /// OSC 7 が届く。
+    ///
+    /// tmux サーバーのグローバル環境は最初のクライアントから継承されるので、同じ
+    /// socket 名に前のインスタンスのサーバーが残っていると `ZDOTDIR` が前の（消えて
+    /// いるかもしれない）置き場を指す。`wrap_options` が統合の置き場を `-e` で
+    /// セッションへ固定しないと、統合が読み込まれず cwd 追従が黙って死ぬ。
+    ///
+    /// **`options.env` には統合を入れない**のが要点: production では
+    /// [`crate::TerminalSession::spawn`] が**外側 PTY** の env へ足すので
+    /// `wrap_options` からは見えない（既存の `osc7はtmuxパススルーで外へ届く` は
+    /// テストが自分で `options.env` へ入れているため、この穴を踏まない）
+    #[test]
+    #[cfg(unix)]
+    fn 器のサーバーが別インスタンスを指していてもosc7が届く() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        if !std::path::Path::new("/bin/zsh").exists() {
+            eprintln!("skip: zsh が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-stale-{}", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        // 前のインスタンス相当のサーバーを先に立てる。**tako の conf を読ませる**
+        // （素通し設定は on = 原因を ZDOTDIR の継承だけに絞る）。
+        // 置き場は空ディレクトリ = 統合が読み込めない値
+        let stale = std::env::temp_dir().join(format!("tako-stale-zdotdir-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&stale);
+        let conf = ensure_conf();
+        let started = crate::tmux::tmux_command(Some(&socket))
+            .args([
+                "-f",
+                &conf.display().to_string(),
+                "new-session",
+                "-d",
+                "-s",
+                "stale-pre",
+                "sleep",
+                "120",
+            ])
+            .env("ZDOTDIR", &stale)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !started {
+            eprintln!("skip: 先行サーバーを立てられない");
+            let _ = std::fs::remove_dir_all(&stale);
+            return;
+        }
+        // production と同じ形: 統合は options.env に入れない
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some("/".into()),
+            env: vec![
+                ("TAKO_PANE_ID".into(), "1".into()),
+                ("SHELL".into(), "/bin/zsh".into()),
+            ],
+        };
+        let (mut session, mut rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-stale"))
+                .expect("tmux クライアントを spawn できる");
+        session.write(b"cd /private/tmp\r".to_vec());
+        for _ in 0..100 {
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+            if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
+                let _ = std::fs::remove_dir_all(&stale);
+                return; // OSC 7 が届いた
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let screen = session.visible_lines().join("\n");
+        let server_zdotdir = crate::tmux::show_environment(Some(&socket), None, "ZDOTDIR");
+        let session_zdotdir =
+            crate::tmux::show_environment(Some(&socket), Some("tako-e2e-stale"), "ZDOTDIR");
+        let _ = std::fs::remove_dir_all(&stale);
+        panic!(
+            "OSC 7 が届かない（#1105）。server_zdotdir={server_zdotdir:?} \
+             session_zdotdir={session_zdotdir:?} 画面: {screen:?}"
+        );
+    }
+
+    /// #1105 回帰: **ソケット名が `tako` で始まらなくても** OSC 7 が届く。
+    ///
+    /// シェル統合は「自分が tako の器の中か」で OSC を DCS パススルーで包むかを
+    /// 決める。判定材料がソケット名の接頭辞 `tako*` だったので、`TAKO_TMUX_SOCKET` に
+    /// 別の名前を与えると包まずに素の OSC を出し、tmux がそれを飲んで
+    /// **cwd 追従（OSC 7）とコマンド状態（OSC 133）が両方黙って死んでいた**
+    /// （検証用のソケット名で踏んだ。#1105）。
+    /// 器が名前を明示（`BACKEND_SOCKET_ENV`）すれば推測が要らない
+    #[test]
+    #[cfg(unix)]
+    fn ソケット名がtakoで始まらなくてもosc7が届く() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        if !std::path::Path::new("/bin/zsh").exists() {
+            eprintln!("skip: zsh が無い環境");
+            return;
+        }
+        // **接頭辞をわざと外す**（`tako` で始まらない名前）
+        let socket = format!("ct1105-{}", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some("/".into()),
+            env: vec![
+                ("TAKO_PANE_ID".into(), "1".into()),
+                ("SHELL".into(), "/bin/zsh".into()),
+            ],
+        };
+        let (mut session, mut rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-name"))
+                .expect("tmux クライアントを spawn できる");
+        session.write(b"cd /private/tmp\r".to_vec());
+        for _ in 0..100 {
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+            if session.cwd() == Some(std::path::Path::new("/private/tmp")) {
+                return; // OSC 7 が届いた
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "OSC 7 が届かない（#1105。socket={socket} = tako で始まらない名前）。画面: {:?}",
             session.visible_lines().join("\n")
         );
     }

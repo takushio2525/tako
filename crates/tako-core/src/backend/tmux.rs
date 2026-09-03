@@ -434,6 +434,9 @@ mod tests {
                 "TAKO_PANE_ID=7",
                 "-e",
                 "TAKO_TAB_ID=3",
+                // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
+                "-e",
+                "TAKO_BACKEND_SOCKET=tako-unit",
                 "-c",
                 "/tmp/work",
             ]

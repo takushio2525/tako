@@ -9,13 +9,18 @@ if [[ -n ${TAKO_PANE_ID-} && $- == *i* && -z ${_TAKO_BASH_DONE-} ]]; then
 
   # tako の tmux バックエンド（Phase 5.5 / FR-5）配下なら OSC をパススルーで包み、
   # TMUX を unset してユーザー自身の tmux 利用（ネスト）を素通しにする（zsh 版と同じ）
+  # 器の判定は tako が明示したソケット名（TAKO_BACKEND_SOCKET）を優先。
+  # 接頭辞 `tako*` は古い tako 用のフォールバック（#1105。zsh 版と同じ）
   _tako_tmux=
   if [[ -n ${TMUX-} ]]; then
     _tako_sock=${TMUX%%,*}
-    if [[ ${_tako_sock##*/} == tako* ]]; then
+    _tako_sock=${_tako_sock##*/}
+    if [[ -n ${TAKO_BACKEND_SOCKET-} ]]; then
+      [[ ${_tako_sock} == "${TAKO_BACKEND_SOCKET}" ]] && _tako_tmux=1
+    elif [[ ${_tako_sock} == tako* ]]; then
       _tako_tmux=1
-      unset TMUX TMUX_PANE
     fi
+    [[ -n ${_tako_tmux} ]] && unset TMUX TMUX_PANE
     unset _tako_sock
   fi
   _tako_emit() {

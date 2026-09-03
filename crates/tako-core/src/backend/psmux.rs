@@ -252,7 +252,7 @@ impl SessionBackend for PsmuxBackend {
         ]);
         // ペイン固有の環境変数はセッション作成時に確定させる（tmux 版と同じ理由。
         // サーバーのグローバル環境から stale な値を拾わせない）
-        for (key, val) in crate::backend::session_pinned_pairs(&options.env) {
+        for (key, val) in crate::backend::session_pinned_pairs(&options.env, &self.socket) {
             args.push("-e".to_string());
             args.push(format!("{key}={val}"));
         }
@@ -1131,6 +1131,9 @@ mod tests {
                 "TAKO_PANE_ID=7",
                 "-e",
                 "TAKO_TAB_ID=3",
+                // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
+                "-e",
+                "TAKO_BACKEND_SOCKET=tako-unit",
                 "-c",
                 "C:\\work",
             ]
