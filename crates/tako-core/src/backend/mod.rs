@@ -1079,6 +1079,22 @@ mod pane_scoped_env_tests {
         }
     }
 
+    /// #1105: [`crate::shell_integration::INJECTED_KEYS`] が実態から drift しない。
+    ///
+    /// `session_pinned_pairs` は値を正本（`shell_integration::env()`）から引くので
+    /// 機能は表に依らないが、表は**呼び出し側が `options.env` で明示した統合キーを
+    /// 残すか**の判定に使う。統合が撒くキーが増えたのに表へ足し忘れると、
+    /// その明示だけが黙って落ちる（#1105 と同じ「黙って壊れる」形）
+    #[test]
+    fn 統合が撒くキーは表に載っている() {
+        for (key, _) in crate::shell_integration::env() {
+            assert!(
+                crate::shell_integration::INJECTED_KEYS.contains(&key.as_str()),
+                "{key} が INJECTED_KEYS に無い（統合が撒くキーを増やしたら表も足す）"
+            );
+        }
+    }
+
     /// 呼び出し側の明示（`options.env`）が統合の既定に勝つ
     #[test]
     fn options_envの明示が統合の値に勝つ() {
