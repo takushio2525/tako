@@ -2968,6 +2968,9 @@ struct SshConnect {
     reconnect_line: String,
     /// このペインで一度でも接続が成立したか。
     /// **これが false のペインは自動再接続しない**（届かない相手を延々と叩かない）
+    /// tako のバナーがこのペインに**一度でも**出たか（#1090。相手のログインで
+    /// 画面から流れて消えるので、窓の中だけでは「まだ出ていない」と区別できない）
+    banner_seen: bool,
     ever_connected: bool,
     /// 切断を観測した時刻（`Reconnecting` の間だけ Some）
     disconnected_at: Option<std::time::Instant>,
@@ -9363,11 +9366,21 @@ impl TakoApp {
                 st.baseline_index.min(lines.len())
             };
             let new_lines = &lines[from..];
+            // #1090: バナーは相手のログインで流れて消える。**一度でも見たか**を覚える
+            let prints = tako_core::remote_fs::pane_prints(&st.host);
+            if !st.banner_seen && tako_core::ssh_progress::window_has_tako_print(new_lines, &prints)
+            {
+                if let Some(st) = self.ssh_connect.get_mut(&pane) {
+                    st.banner_seen = true;
+                }
+            }
+            let Some(st) = self.ssh_connect.get(&pane) else {
+                continue;
+            };
 
             match st.phase.clone() {
                 // --- 接続待ち（#1010 のまま）------------------------------------
                 ConnectPhase::Connecting => {
-                    let prints = tako_core::remote_fs::pane_prints(&st.host);
                     let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                         new_lines,
                         master_socket: tako_core::remote_fs::control_path(&st.host)
@@ -9375,6 +9388,7 @@ impl TakoApp {
                             .unwrap_or(false),
                         screen_changed: fingerprint != st.baseline_fingerprint,
                         fresh_pane: st.fresh_pane,
+                        banner_seen: st.banner_seen,
                         // #1090: 折り返されたバナーの続き行を ssh の出力と読まない
                         tako_prints: &prints,
                     });
@@ -9436,7 +9450,6 @@ impl TakoApp {
                 ConnectPhase::Reconnecting { .. } => {
                     // ① 打ち直した結果を待っている最中か
                     if st.attempt_pending {
-                        let prints = tako_core::remote_fs::pane_prints(&st.host);
                         let phase = ssh_progress::classify(&ssh_progress::ConnectInputs {
                             new_lines,
                             master_socket: tako_core::remote_fs::control_path(&st.host)
@@ -9445,6 +9458,7 @@ impl TakoApp {
                             screen_changed: fingerprint != st.baseline_fingerprint,
                             // 打ち直しは**必ず既存シェルへ 1 行**なので fresh ではない
                             fresh_pane: false,
+                            banner_seen: st.banner_seen,
                             tako_prints: &prints,
                         });
                         match phase {
@@ -19072,6 +19086,7 @@ impl UiStateHost for TakoApp {
                 baseline_fingerprint: tako_control::limit_stop::screen_fingerprint(&lines),
                 phase: tako_core::ssh_progress::ConnectPhase::Connecting,
                 reconnect_line: reconnect_line.to_string(),
+                banner_seen: false,
                 ever_connected: false,
                 disconnected_at: None,
                 attempts: 0,

@@ -83,6 +83,12 @@ pub struct ConnectInputs<'a> {
     pub screen_changed: bool,
     /// tako が印字したものしか載っていないペインか（`split` / `tab` = true）
     pub fresh_pane: bool,
+    /// **これまでに** tako のバナーがこのペインに出たか（呼び出し側が覚えておく）。
+    ///
+    /// バナーは相手のログインで画面から流れて消える（実測: リモートのシェルが
+    /// 自分のバナーを出すと tako の行が窓の外へ出る）。窓の中だけを見ると
+    /// 「バナーがまだ出ていない」と区別できないので、**一度でも見たか**を渡す（#1090）
+    pub banner_seen: bool,
     /// tako がこのペインへ印字した文面（[`crate::remote_fs::pane_prints`]）。
     ///
     /// **折り返しの続き行を見分けるために要る**（#1090）。物理行は端末幅で折り返され、
@@ -164,6 +170,17 @@ fn is_tako_fragment(line: &str, prints: &[String]) -> bool {
 
 /// 続き行と見なす最短の長さ（これ未満は偶然一致しうるので見ない）
 const MIN_FRAGMENT_CHARS: usize = 2;
+
+/// この窓に tako 自身の印字（バナー・その折り返しの続き行）が載っているか。
+///
+/// 呼び出し側が [`ConnectInputs::banner_seen`] を**一度でも見たら true のまま**
+/// 覚えておくために公開している（#1090。バナーは相手のログインで流れて消える）
+pub fn window_has_tako_print(lines: &[String], prints: &[String]) -> bool {
+    lines.iter().any(|l| {
+        let t = l.trim_end();
+        !t.trim().is_empty() && (is_tako_line(t) || is_tako_fragment(t, prints))
+    })
+}
 
 /// 判定（詳細はモジュール doc）
 pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
@@ -249,7 +266,15 @@ pub fn classify(inputs: &ConnectInputs) -> ConnectPhase {
     //
     //    バナーが見えないうちは畳まない。**失敗を騙るわけではない**ので、
     //    最悪でも [`SILENT_CAP_SECS`] で表示が畳まれるだけ
-    if inputs.fresh_pane && !after_banner.is_empty() {
+    //
+    //    バナーが**窓から流れて消えた**あとは、載っている行はすべてその後のもの。
+    //    そこは呼び出し側が覚えている [`ConnectInputs::banner_seen`] で見分ける
+    let opened_by_output = if saw_banner {
+        !after_banner.is_empty()
+    } else {
+        inputs.banner_seen && !interesting.is_empty()
+    };
+    if inputs.fresh_pane && opened_by_output {
         return ConnectPhase::Opened;
     }
 
@@ -319,6 +344,7 @@ mod tests {
             master_socket: false,
             screen_changed: false,
             fresh_pane: fresh,
+            banner_seen: false,
             tako_prints: prints(),
         }
     }
@@ -476,6 +502,44 @@ mod tests {
             ConnectPhase::Failed { .. } => {}
             other => panic!("失敗として読めていない: {other:?}"),
         }
+    }
+
+    /// #1090: バナーが**流れて消えた**あとも、繋がったら畳む。
+    ///
+    /// 実測: 相手（Windows OpenSSH）のログインシェルが自分のバナーを出すと
+    /// tako の行が窓の外へ出る。窓だけを見ていると「まだバナーが出ていない」と
+    /// 区別できず、接続できているのに「接続中…」が居座る
+    #[test]
+    fn バナーが流れて消えたあとも繋がったら畳む() {
+        let l = lines(&[
+            "Windows PowerShell",
+            "Copyright (C) Microsoft Corporation. All rights reserved.",
+            "PS C:\\Users\\winuser>",
+        ]);
+        // 一度も見ていなければ畳まない（器が先に描いた行と区別できない）
+        assert_eq!(classify(&inputs(&l, true)), ConnectPhase::Connecting);
+        // 一度でもバナーを見ていれば、いま載っている行はその後のもの
+        let mut i = inputs(&l, true);
+        i.banner_seen = true;
+        assert_eq!(classify(&i), ConnectPhase::Opened);
+    }
+
+    #[test]
+    fn 窓に_tako_の印字が載っているかを見分ける() {
+        let p = prints();
+        assert!(window_has_tako_print(
+            &lines(&["tako: win へ接続しています…（中止は Ctrl+C）"]),
+            p
+        ));
+        // 折り返しの続き行も tako のもの
+        assert!(window_has_tako_print(
+            &lines(&["ます…（中止は Ctrl+C）"]),
+            p
+        ));
+        assert!(!window_has_tako_print(
+            &lines(&["Windows PowerShell", ""]),
+            p
+        ));
     }
 
     /// #1090: **折り返しで割れた目印**を繋いでから見る。
