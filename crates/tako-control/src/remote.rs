@@ -3277,6 +3277,23 @@ fn extract_pane_target(path: &str) -> Option<String> {
 
 // --- dispatch 統合版ハンドラ（#281 H-7）---
 
+/// tako app へ IPC で 1 往復する（#1079: ファイル API がツリールートを問い合わせる経路）。
+/// 失敗したら接続を落として次回の再接続に任せる
+fn app_request(
+    app_conn: &Arc<RwLock<AppConnection>>,
+    req: crate::protocol::Request,
+) -> Result<Value, String> {
+    let mut conn = app_conn.write().map_err(|_| "内部エラー".to_string())?;
+    let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
+    match client.request(req) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            conn.invalidate();
+            Err(e)
+        }
+    }
+}
+
 /// IPC 経由でペイン一覧を取得し、マッピングを更新する。
 /// 成功時は List 応答全体を返す
 fn refresh_pane_mapping(
@@ -3965,6 +3982,11 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
         // 未知の POST は安全側（Manage）
         return DeviceRole::Manage;
     }
+    // #1079: ファイル API は**読み出しでも** Interact 以上（判定の正は remote_files 側）。
+    // POST の分岐より後に置くのは意図的: 未知の POST は Manage のまま安全側に倒す
+    if let Some(role) = crate::remote_files::required_role_for(path) {
+        return role;
+    }
     DeviceRole::Observe
 }
 
@@ -4452,6 +4474,21 @@ fn handle_api_v2_routes(
         // そのタブで master を起動（Manage）
         (tiny_http::Method::Post, p) if p.starts_with("/api/tabs/") && p.ends_with("/master") => {
             handle_tab_master(request, ctx, device, app_conn, p)
+        }
+        // #1079: ファイル API（一覧 / プレビュー / ダウンロード）。
+        // 実装は `remote_files` に閉じてあり、ここは受け渡しだけ
+        (tiny_http::Method::Get, p) if crate::remote_files::required_role_for(p).is_some() => {
+            let deps = crate::remote_files::FilesDeps {
+                send: &|req| app_request(app_conn, req),
+                audit: &|event, extra| {
+                    ctx.registry
+                        .lock()
+                        .unwrap()
+                        .audit(event, &device.id, &device.name, extra)
+                },
+                cors: cors_headers(),
+            };
+            crate::remote_files::handle_files_request(request, p, url_full, &deps)
         }
         _ => respond(
             request,
@@ -5556,6 +5593,19 @@ mod tests {
             DeviceRole::Observe
         );
         // 未知の POST は安全側（Manage）
+        // #1079: ファイル API は GET でも Interact（読み出し = 持ち出し）
+        for p in ["/api/files", "/api/files/content", "/api/files/download"] {
+            assert_eq!(
+                required_role(&Method::Get, p),
+                DeviceRole::Interact,
+                "path={p}"
+            );
+        }
+        // 未知の POST は従来どおり安全側（Manage）。ファイル API のパスでも変わらない
+        assert_eq!(
+            required_role(&Method::Post, "/api/files"),
+            DeviceRole::Manage
+        );
         assert_eq!(
             required_role(&Method::Post, "/api/unknown"),
             DeviceRole::Manage

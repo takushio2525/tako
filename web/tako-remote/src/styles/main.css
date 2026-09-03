@@ -1239,3 +1239,75 @@ body {
   font-size: 13px; display: flex; align-items: center;
   justify-content: space-between; gap: 10px;
 }
+
+/* ============================================================
+   ファイルビュー（#1079: ツリーに出ているルート配下のブラウズ）
+   ============================================================ */
+
+/* 末尾（ファイル名）はヘッダのタイトルに出るので、あふれたら末尾を省略する。
+   `direction: rtl` で先頭を省略する手は bidi の並べ替えで括弧・記号が動くので使わない */
+.file-crumb {
+  font-family: var(--mono); font-size: 12px; color: var(--fg2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.file-row {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  padding: 13px 14px; margin-bottom: 6px;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); color: var(--fg);
+  text-align: left; cursor: pointer; min-height: 56px;
+  transition: background .12s;
+}
+.file-row:active { background: var(--panel3); }
+.file-row.disabled { opacity: .45; cursor: not-allowed; }
+.file-row.disabled:active { background: var(--panel2); }
+
+.file-row-icon { flex-shrink: 0; color: var(--fg3); display: flex; }
+.file-row-icon.dir { color: var(--blue); }
+
+.file-row-main { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 2px; }
+.file-row-name {
+  font-family: var(--mono); font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.file-row-meta { font-size: 11px; color: var(--fg3); }
+.file-row-chevron { color: var(--fg3); font-size: 18px; flex-shrink: 0; }
+
+.file-notice {
+  padding: 9px 12px; margin-bottom: 8px;
+  background: var(--panel2); border: 1px solid var(--line2);
+  border-radius: var(--radius-xs); color: var(--fg2); font-size: 12px;
+}
+
+.file-actions {
+  flex: none; display: flex; align-items: center; gap: 12px;
+  padding: 12px 18px; border-bottom: 1px solid var(--line);
+}
+.file-actions-info { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 2px; }
+.file-actions-name {
+  font-family: var(--mono); font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.file-actions-meta { font-size: 11px; color: var(--fg3); }
+.file-download {
+  display: inline-flex; align-items: center; gap: 7px;
+  text-decoration: none; flex-shrink: 0; padding: 11px 18px; min-height: 44px;
+}
+
+.file-preview {
+  flex: 1; overflow: auto; -webkit-overflow-scrolling: touch;
+  margin: 0; padding: 14px 16px calc(24px + env(safe-area-inset-bottom, 0px));
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+  color: var(--t-fg); background: var(--t-bg);
+  white-space: pre; tab-size: 4;
+}
+
+/* ホーム（ペイン一覧）からファイルへの導線 */
+.files-entry-btn {
+  width: 40px; height: 40px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 1px solid var(--line); border-radius: var(--radius-xs);
+  color: var(--fg2); cursor: pointer; transition: background .12s;
+}
+.files-entry-btn:active { background: var(--panel3); }
