@@ -52711,14 +52711,28 @@ mod self_test {
                     "111: 実画面のダイアログから「待つ」選択肢をラベルで選ぶ (#813)",
                 );
 
-                // --- 正例 ③ codex の日付つき上限画面（#985） ---
+                // --- 正例 ③ codex の日付つき上限画面（#985 / #1096） ---
                 // codex 0.150.1 は日をまたぐと `Try again at Aug 28th, 2026 4:24 AM.` と
                 // 出す（バイナリ内の書式文字列 `" Try again at "` + `", %Y %-I:%M %p"`）。
                 // #985 前はここが読めず reset_at=None → 900 秒の猶予で**上限が解ける
                 // ずっと前に**撃ち始め、3 回で諦めていた（= 朝まで止まったまま）
+                //
+                // #1096: 日付は**実行時に未来から組む**（`format_dated_reset`）。
+                // 元は `Aug 28th, 2026` を焼き込んでいたので、日付を実際に読むように
+                // した途端「6 日前 = 範囲外」で解決できなくなった —— fixture に日付を
+                // 焼き込むとその日が過ぎた瞬間に壊れる（時限爆弾）ことがここで露見した。
+                // #985 前は日付を無視して「次に来る 4:24」へ丸めていたので通っていた
+                // 書式は**分までしか持たない**（`h:mm AM`）ので、期待値も分へ丸める。
+                // 丸めないと「秒が 0 の瞬間に走った回だけ通る」偽の待ち条件になる
+                let codex_reset_at =
+                    (tako_core::limit_resume::now_unix() + 3 * 86_400) / 60 * 60;
+                let codex_reset_text = tako_core::limit_resume::format_dated_reset(
+                    codex_reset_at,
+                    tako_core::limit_resume::local_utc_offset(),
+                );
                 let codex_body = format!(
                     "{filler813}You have hit your usage limit. Upgrade to Pro or\n\
-                     try again at Aug 28th, 2026 4:24 AM.\n"
+                     try again at {codex_reset_text}.\n"
                 );
                 let Some(codex_pane) = make_fixture_pane(cx, &codex_body).await else {
                     fail("#985: codex 型ペインの作成")
@@ -52747,6 +52761,16 @@ mod self_test {
                 check(
                     reset_codex.is_some(),
                     "111: codex の日付つき `try again at` から解除時刻を解決する (#985)",
+                );
+                // #1096: 書かれた日付をそのまま採る（24 時間以内へ丸めない）。
+                // 丸めると解除の数日前からナッジを撃ち始め 3 回で諦める
+                println!(
+                    "TAKO_SELF_TEST_1096_DATED: text={codex_reset_text:?} \
+                     want={codex_reset_at} got={reset_codex:?}"
+                );
+                check(
+                    reset_codex == Some(codex_reset_at),
+                    "111: 日付つきの解除時刻を 24 時間以内へ丸めない (#1096)",
                 );
                 // 解除前は撃たない（不明に落ちていると 900 秒の猶予で撃ってしまう）
                 let (sent_early, _, _) = drive(cx, codex_pane);
@@ -52881,6 +52905,134 @@ mod self_test {
                     "111: 自動復帰の発火が supervisor.log に記録される (#1093)",
                 );
 
+                // --- 正例 ⑤ クレジット枯渇（#1096。`You're out of …` の別テンプレート） ---
+                // #1093 で受けたのは `You've hit your <名前>limit…` のテンプレートだが、
+                // claude は同じ「もう進めない」状態を別の書き出しでも出す
+                // （`dCt` = 阻害の前置き一覧より）。**`limit` という語すら無い**ので
+                // #1093 の規則では原理的に当たらず、同じ穴が別文言で残っていた。
+                //
+                // 見出しのアポストロフィは落としてある（`paint_and_hold` の POSIX 経路は
+                // 本文を素の単引用符で囲む。正例 ③ / ④ と同じ理由）。**実バイトそのままの
+                // fixture は `limit_stop.rs` の `OUT_OF_CREDITS_IDLE`** が持つので、
+                // ここで見たいのは「実ペイン → 検知 → ナッジ → 監査ログ」の通し。
+                // 日付つき解除時刻（`resets Aug 22, 9:15am`）の算術は純関数側と
+                // `limit_stop` の単体テストが担保する
+                let credits_body = format!(
+                    "{filler813}実装を進めます\n  \
+                     You are out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved\n"
+                );
+                let Some(credits_pane) = make_fixture_pane(cx, &credits_body).await else {
+                    fail("#1096: クレジット枯渇ペインの作成")
+                };
+                if !wait_screen(cx, credits_pane, "out of usage credits").await {
+                    fail("#1096: クレジット枯渇 fixture が画面に出ない");
+                }
+                settle813(cx, credits_pane).await;
+                let _ = set_enabled(cx, credits_pane, true);
+                let (_, kind_credits, _) = drive(cx, credits_pane);
+                let reset_credits = window
+                    .update(cx, |app, _, _| {
+                        app.limit_resume.get(&credits_pane).and_then(|t| t.reset_at)
+                    })
+                    .ok()
+                    .flatten();
+                println!(
+                    "TAKO_SELF_TEST_1096_DETECT: kind={kind_credits:?} \
+                     reset_at={reset_credits:?} state=({})",
+                    state813(cx, credits_pane),
+                );
+                check(
+                    kind_credits.as_deref() == Some("idle"),
+                    "111: クレジット枯渇の画面を上限停止として検知する (#1096)",
+                );
+                check(
+                    reset_credits.is_some(),
+                    "111: `· resets 7:50pm (Asia/Tokyo)` から解除時刻を解決する (#1096)",
+                );
+                // クレジット系は 5h / 週へ対応づけられないのでメーターは埋めない
+                // （`--` のまま = 嘘を書かない。#1093 の 5h 100% とは意図的に別扱い）
+                let meter1096 = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&credits_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .and_then(|m| m.limit_5h)
+                    })
+                    .ok()
+                    .flatten();
+                println!("TAKO_SELF_TEST_1096_METER: pane={meter1096:?}");
+                check(
+                    meter1096.is_none(),
+                    "111: 枠の分からないクレジット上限ではメーターを埋めない (#1096)",
+                );
+                // 解除前は撃たない → 解除後に撃つ → 監査ログに残る
+                let (sent_before1096, _, _) = drive(cx, credits_pane);
+                check(
+                    sent_before1096.is_empty(),
+                    "111: 解除時刻より前は継続ナッジを送らない (#1096)",
+                );
+                let audit_before1096 = tako_control::orchestrator::supervisor::read_audit_log(200)
+                    .iter()
+                    .filter(|l| {
+                        l.contains("action=limit_autoresume")
+                            && l.contains(&format!("pane={}", credits_pane.as_u64()))
+                    })
+                    .count();
+                backdate(cx, credits_pane);
+                let (sent_1096, _, attempts_1096) = drive(cx, credits_pane);
+                let audit_after1096: Vec<String> =
+                    tako_control::orchestrator::supervisor::read_audit_log(200)
+                        .into_iter()
+                        .filter(|l| {
+                            l.contains("action=limit_autoresume")
+                                && l.contains(&format!("pane={}", credits_pane.as_u64()))
+                        })
+                        .collect();
+                println!(
+                    "TAKO_SELF_TEST_1096_RESUME: sent={} attempts={attempts_1096} audit={}->{}",
+                    sent_1096.len(),
+                    audit_before1096,
+                    audit_after1096.len(),
+                );
+                check(
+                    sent_1096.len() == 1 && attempts_1096 == 1,
+                    "111: 解除後にクレジット枯渇のペインが再開される (#1096)",
+                );
+                check(
+                    audit_after1096.len() == audit_before1096 + 1
+                        && audit_after1096
+                            .last()
+                            .is_some_and(|l| l.contains("nudge queued")),
+                    "111: 自動復帰の発火が supervisor.log に記録される (#1096)",
+                );
+
+                // --- 負例 ④ 接近の警告では発動しない（#1096） ---
+                // claude 自身が別リスト（`fCt` = 警告 / `mCt` = 情報）に分けているもの。
+                // 「もう止まった」と「もうすぐ尽きる」を混ぜると、まだ動けるペインへ
+                // ナッジを撃つことになる
+                let warn_body = format!(
+                    "{filler813}実装を進めます\n  \
+                     You are close to your usage credit limit\n  \
+                     Now using usage credits for Opus\n"
+                );
+                let Some(warn_pane) = make_fixture_pane(cx, &warn_body).await else {
+                    fail("#1096: 接近警告ペインの作成")
+                };
+                if !wait_screen(cx, warn_pane, "close to your usage credit limit").await {
+                    fail("#1096: 接近警告 fixture が画面に出ない");
+                }
+                settle813(cx, warn_pane).await;
+                let _ = set_enabled(cx, warn_pane, true);
+                let (sent_warn, kind_warn, _) = drive(cx, warn_pane);
+                println!(
+                    "TAKO_SELF_TEST_1096_WARN: kind={kind_warn:?} sent={}",
+                    sent_warn.len()
+                );
+                check(
+                    sent_warn.is_empty() && kind_warn.is_none(),
+                    "111: 接近の警告 / 情報では自動復帰が発動しない (#1096)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -52973,10 +53125,11 @@ mod self_test {
                     .flatten();
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
-                    // 有効にしたのは idle / dialog / codex / session / permission / api の
-                    // 6 ペインだけ（codex は #985、session は #1093 で追加）。
-                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
-                    persisted == Some((6, 6)),
+                    // 有効にしたのは idle / dialog / codex / session / credits / warn /
+                    // permission / api の 8 ペインだけ（codex = #985、session = #1093、
+                    // credits と warn = #1096 で追加）。OFF のペインはフィールドごと
+                    // 出ない（旧 tako でも読める JSON を保つ）
+                    persisted == Some((8, 8)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 
@@ -54993,8 +55146,17 @@ mod self_test {
                         break;
                     }
                 }
+                // 判定は 2 本へ割る（`&&` 連鎖だと「dispatch が失敗した」と
+                // 「タブが増えなかった」を出力から区別できない。conventions.md）
+                let tabs_after = window
+                    .update(cx, |app, _, _| app.workspace.tabs().len())
+                    .unwrap_or(0);
+                println!(
+                    "TAKO_SELF_TEST_657: invoked={invoked} tabs={tabs_before}->{tabs_after}"
+                );
+                check(invoked, "メニューバー: invoke の dispatch が成功する (#657)");
                 check(
-                    invoked && grew,
+                    grew,
                     "メニューバー: invoke が実際にアクションを発火する (#657)",
                 );
             }
@@ -56916,6 +57078,17 @@ mod self_test {
                     None => println!("TAKO_SELF_TEST_SKIPPED: 129（タブピルの矩形を採れない）"),
                     Some(pill) => {
                         let at = pill.center();
+                        // **測る前に窓を掃除する**（conventions.md）。この項目の期待値は
+                        // 「-120px へ動く」= 開始オフセットが 0 である前提だが、
+                        // ここまでの項目でタブが増えているとタブバーがはみ出して
+                        // オフセットが 0 でなくなる（実測: 項目 111 の fixture タブが
+                        // 増えた分だけ `before` が -119 になり、delta は正しく -120 なのに
+                        // 「-239 ≠ -120」で落ちた）。**製品の欠陥ではなく測り方**なので、
+                        // 開始点を 0 に戻してから流す
+                        let _ = window961.update(cx, |app: &mut TakoApp, _, _| {
+                            app.tab_scroll_handle.set_offset(point(px(0.0), px(0.0)));
+                        });
+                        notify_and_draw(any961, window961, cx);
                         let before = window961
                             .update(cx, |app: &mut TakoApp, _, _| app.tab_scroll_handle.offset().x)
                             .unwrap_or(px(0.0));
