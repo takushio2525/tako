@@ -1890,14 +1890,27 @@ pub(crate) fn parse_scrollback_target(spec: &str) -> Result<ScrollbackTarget, St
 /// 2. ターゲットが裸の `=<session>` で、**tmux 3.6 は target-pane として解決できない**
 ///    （実測 3.6b: `can't find pane: =<name>`）= macOS でも同じく失敗していた
 ///
-/// 数値の PaneId は器のセッション名へ解決してから渡す。dispatch 経路は呼ぶ前に
-/// app 自身の workspace で解決済みなので、ここで IPC を張るのは CLI 経路だけ
+/// **CLI 用の入口**。数値の PaneId は稼働中の tako-app へ IPC で問い合わせて
+/// 器のセッション名へ解決する。app の内側（dispatch）は解決を自分で済ませて
+/// [`scrollback_session`] を呼ぶので、この関数を通らない
 pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
     if legacy_scrollback_enabled() {
         return scrollback_legacy(pane_id, lines);
     }
     let session = resolve_scrollback_session(pane_id)?;
-    let (session_ref, capture) = crate::reach::detached_capture(&session).ok_or_else(|| {
+    scrollback_session(&session, lines)
+}
+
+/// **解決済みの器のセッション名**で採取する（dispatch 用）。
+///
+/// [`scrollback`] と違い**この関数は IPC を張らない**。dispatch は tako-app の
+/// 内側で走るので、そこから `AppIpcClient` を使うと**自分自身への入れ子 IPC**になり、
+/// 要求を捌く側（UI スレッド）が自分の応答を待つ形になりうる
+pub fn scrollback_session(session: &str, lines: u32) -> Result<Vec<String>, String> {
+    if legacy_scrollback_enabled() {
+        return scrollback_legacy(session, lines);
+    }
+    let (session_ref, capture) = crate::reach::detached_capture(session).ok_or_else(|| {
         format!(
             "セッション {session} の履歴を読めない: {}",
             crate::reach::no_detached_capture_note()
@@ -1908,7 +1921,7 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
         .map_err(|e| format!("セッション {session} の履歴を読めない: {e}"))
 }
 
-/// 対象指定 → 器のセッション名
+/// 対象指定 → 器のセッション名（**CLI 経路だけ**が通る。数値 ID は IPC で解決する）
 fn resolve_scrollback_session(spec: &str) -> Result<String, String> {
     match parse_scrollback_target(spec)? {
         ScrollbackTarget::Session(name) => Ok(name),

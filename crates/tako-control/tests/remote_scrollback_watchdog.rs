@@ -100,7 +100,7 @@ fn remoteのtmux直呼びは既知の関数だけに閉じている() {
 #[test]
 fn scrollbackは器の境界を通って採取する() {
     let src = std::fs::read_to_string(remote_rs()).expect("remote.rs を読めない");
-    let body = function_body(&src, "pub fn scrollback(pane_id: &str, lines: u32)");
+    let body = function_body(&src, "pub fn scrollback_session(session: &str, lines: u32)");
     let body = without_comments(&body);
     for needed in ["reach::detached_capture", "capture_scrollback"] {
         assert!(
@@ -108,6 +108,44 @@ fn scrollbackは器の境界を通って採取する() {
             "scrollback が {needed} を通っていない（#972）:\n{body}"
         );
     }
+}
+
+/// **入れ子 IPC を作らない**: dispatch（tako-app の内側）が通る経路は
+/// `scrollback_session` で、そちらは対象指定の解決（= IPC）を含まないこと。
+///
+/// dispatch から IPC 解決つきの `scrollback` を呼ぶと、要求を捌いている当の
+/// tako-app が自分自身へ接続する形になる
+#[test]
+fn dispatchはipc解決を含まない入口を使う() {
+    let dispatch =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dispatch.rs"))
+            .expect("dispatch.rs を読めない");
+    let arm = function_body(&dispatch, "fn scrollback_target_session(");
+    assert!(
+        !without_comments(&arm).contains("AppIpcClient"),
+        "dispatch の解決が IPC を張っている（#972）"
+    );
+    assert!(
+        dispatch.contains("remote::scrollback_session(&session"),
+        "dispatch が IPC 解決なしの入口（scrollback_session）を通っていない（#972）"
+    );
+    assert!(
+        !dispatch.contains("remote::scrollback(&"),
+        "dispatch が CLI 用（IPC 解決つき）の scrollback を呼んでいる（#972）"
+    );
+
+    // CLI 用の入口だけが IPC 解決を持つ
+    let remote = std::fs::read_to_string(remote_rs()).expect("remote.rs を読めない");
+    let cli = function_body(&remote, "pub fn scrollback(pane_id: &str, lines: u32)");
+    assert!(
+        without_comments(&cli).contains("resolve_scrollback_session"),
+        "CLI 用の入口が対象指定の解決を通っていない（#972）"
+    );
+    let dispatch_entry = function_body(&remote, "pub fn scrollback_session(session: &str");
+    assert!(
+        !without_comments(&dispatch_entry).contains("resolve_scrollback_session"),
+        "dispatch 用の入口が IPC 解決を含んでいる（#972）"
+    );
 }
 
 /// 関数本文を波括弧の釣り合いで切り出す

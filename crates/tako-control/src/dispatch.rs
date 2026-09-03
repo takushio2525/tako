@@ -3032,8 +3032,8 @@ fn dispatch_inner(
             // 数値の PaneId は **app 自身の workspace** で器のセッションへ解決する（#972）。
             // remote 側にも IPC 経由の解決があるが、それは CLI（別プロセス）用で、
             // ここから使うと自分自身への入れ子 IPC になる
-            let spec = scrollback_target_spec(host, &pane_id)?;
-            let result = crate::remote::scrollback(&spec, lines.unwrap_or(1000))
+            let session = scrollback_target_session(host, &pane_id)?;
+            let result = crate::remote::scrollback_session(&session, lines.unwrap_or(1000))
                 .map_err(DispatchError::Operation)?;
             Ok(json!({ "lines": result }))
         }
@@ -10019,20 +10019,26 @@ fn limit_resume_panes(host: &dyn ControlHost) -> Vec<Value> {
         .collect()
 }
 
-/// `tako_remote_scrollback` の対象指定を、器のセッション名（または元の指定）へ解決する（#972）。
+/// `tako_remote_scrollback` の対象指定を器のセッション名へ解決する（#972）。
 ///
-/// 数値の PaneId だけをここで解決し、セッション名・ターゲット式はそのまま通す
-/// （解釈は `remote::parse_scrollback_target` の 1 実装に任せる）。
-/// ペインが器を持たない構成では**元の指定を返す**ので、
-/// 「届かない」理由は remote 側の到達解決が答える（二重管理を作らない）
-fn scrollback_target_spec(host: &dyn ControlHost, spec: &str) -> Result<String, DispatchError> {
-    let Ok(id) = spec.trim().parse::<u64>() else {
-        return Ok(spec.to_string());
-    };
-    let (_, target) = resolve_pane(host.workspace(), Some(id))?;
-    Ok(host
-        .backend_session(target)
-        .unwrap_or_else(|| spec.to_string()))
+/// 解釈（数値ペイン ID / セッション名 / ターゲット式）は
+/// `remote::parse_scrollback_target` の 1 実装に任せ、**数値 ID だけ**を
+/// app 自身の workspace で解決する。**ここで元の指定へ落とさない**のが要点で、
+/// 落とすと remote 側の CLI 用フォールバック（IPC で app へ問い合わせる）へ流れ、
+/// tako-app が自分自身へ接続する形になる
+fn scrollback_target_session(host: &dyn ControlHost, spec: &str) -> Result<String, DispatchError> {
+    match crate::remote::parse_scrollback_target(spec).map_err(DispatchError::InvalidParams)? {
+        crate::remote::ScrollbackTarget::Session(name) => Ok(name),
+        crate::remote::ScrollbackTarget::Pane(id) => {
+            let (_, target) = resolve_pane(host.workspace(), Some(id))?;
+            host.backend_session(target).ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "ペイン {id} は器（永続化バックエンド）を持たないので履歴を読めない: {}",
+                    crate::reach::no_detached_capture_note()
+                ))
+            })
+        }
+    }
 }
 
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
