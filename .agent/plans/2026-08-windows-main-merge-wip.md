@@ -3658,21 +3658,46 @@ unix = load average / Windows = `GetSystemTimes` の差分から出す CPU 使�
 |---|---|---|---|
 | 1 | 41（OSC 7 の cwd） | 固定待ち 1 秒 × 側路の 2 秒 tick + `cwd` の区切り | **解消** |
 | 2 | 97 (d) / 99 | 画面の `tako <sub>` リテラル（#967） | **解消** |
-| 3 | 133 (d) | SSH ペインの失敗が 20 秒経っても `connecting` のまま | **未解消**（調査中） |
+| 3 | 133 (d) | **製品側**: Windows の OpenSSH が ControlMaster 非対応（#1090） | 別 Issue へ |
 
 | 起動 | 項目 41 / 41b | 到達 |
 |---|---|---|
 | `TAKO_ISOLATED=1`（レシピ） | skip（理由 + `script` パスを出す） | 項目 133 まで |
 | 素の `TAKO_SELF_TEST=1` | **走って通る**（Windows で初めて OSC 7 / 133 が緑） | 項目 133 まで |
 
-**壁 3 は待ち不足ではない**（実機実測: `ssh selftest-nonexistent-1010` は **1319ms**、
-`…​.invalid` は **44ms** でどちらも exit 255。20 秒の予算には十分収まる）。
-「スクリプトが走っていない」のか「走ったが分類できていない」のかを言い分ける診断
-（`TAKO_SELF_TEST_133D` = ペインの中身 + phase + 器の有無）を足して再測する。
+### 壁 3 の正体（#1090 として起票。**製品側**で射程外）
+
+診断（`TAKO_SELF_TEST_133D`）を足して 1 発で確定した:
+
+```
+TAKO_SELF_TEST_133D: host="selftest-nonexistent-1010" phase=None backend=true
+  lines=["tako: … へ接続してい", "ます…（中止は Ctrl+C）", "getsockname failed: Not a socket"]
+```
+
+**同じホスト・オプションだけを変えた A/B**（実機。`C:\Program Files\OpenSSH\ssh.exe`）:
+
+| arm | 渡したオプション | exit | 所要 | 出力 |
+|---|---|---|---|---|
+| A | ControlMaster 系**なし** | **255** | 1305ms | `ssh: Could not resolve hostname …` |
+| B | `ControlPath` + `ControlMaster=auto` + `ControlPersist`（= tako が渡す形） | **-1** | 43ms | `getsockname failed: Not a socket` |
+
+**Windows の OpenSSH は接続多重化（ControlMaster）に対応していない**。`common_opts` は
+`control_path` が取れると必ずこれを渡す（#65 の設計）ので、Windows では
+
+1. **exit が 255 でない** → `ssh_pane_script` の `if ($LASTEXITCODE -eq 255)` に入らず
+   理由も次の一手も 1 行も出ない（#919 / #1040 の契約が破れる）
+2. `getsockname failed: Not a socket` が `SSH_ERROR_PATTERNS` に無い →
+   `classify` の規則 ④（まっさらなペイン + tako 以外の行）が先に当たり **`Opened`**。
+   接続中チップが失敗へ置き換わらず**消える**（#1010 の契約が破れる）
+
+待ち不足ではない（名前解決は単一ラベル 1305ms / `.invalid` 44ms でどちらも exit 255）。
+影響は SSH 系の全経路（ペイン #20/#919/#1006/#1010/#1040・ツリー #65/#919/#976・
+SFTP の読み書き #966）で、直すには「#65 のソケット共有を Windows で諦めるか」の
+設計判断が要るので #1090 へ分離した。
 
 **項目 41 の実行がモードで変わること自体は残っている**（`$PROFILE` の配置に依存する）。
 skip の行に `script` のパスを出したので後から言い分けられるが、根治するなら #889 の
-`integration_shell_command` を 41 にも使って**専用ペインで閉じる**のが筋 → 別 Issue。
+`integration_shell_command` を 41 にも使って**専用ペインで閉じる**のが筋 → **#1091** へ起票。
 
 ### macOS 側で観測した #1062 のフレーク（この変更とは無関係）
 

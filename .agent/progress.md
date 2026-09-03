@@ -4047,7 +4047,10 @@
   pre-fix の 4 行を名指しし、このブランチで 0 件**を実測
 - 関連: PR（`Refs #1073` / `Closes #967`）。記録は plan の「#1073 の記録」節
 - **壁は順に 3 つ**（前を通すまで次は見えない）。41 と 97/99 を潰して**両モードとも項目 133
-  まで到達**。壁 3 = 133 (d)（SSH ペインの失敗が 20 秒経っても `connecting`。名前解決は
-  1319ms / 44ms で exit 255 = 待ち不足ではない）は診断を足して再測中
-- 次: 項目 41 の実行がモードで変わること自体の根治（#889 の `integration_shell_command` を
-  41 にも使って専用ペインで閉じる）は別 Issue へ
+  まで到達**。壁 3 = 133 (d) は**製品側**で、診断（`TAKO_SELF_TEST_133D`）+ オプションだけを
+  変えた実機 A/B で確定 → **#1090 起票**: Windows の OpenSSH は ControlMaster 非対応で、
+  tako が渡す `ControlPath` / `ControlMaster=auto` により **exit が 255 にならず**
+  （`ssh_pane_script` が理由を出さない）**`getsockname failed: Not a socket` が
+  `SSH_ERROR_PATTERNS` に無い**ので `classify` が `Opened` へ畳む。影響は SSH 系の全経路
+- 次: 項目 41 の実行がモードで変わること自体の根治は **#1091**（#889 の
+  `integration_shell_command` を 41 にも使って専用ペインで閉じる）
