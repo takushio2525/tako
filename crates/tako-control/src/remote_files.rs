@@ -583,6 +583,15 @@ fn header(name: &[u8], value: &[u8]) -> tiny_http::Header {
     tiny_http::Header::from_bytes(name, value).expect("固定ヘッダ")
 }
 
+/// **ファイル名から組んだ値**のように、コード側で固定でないヘッダ。
+/// `content_disposition` は安全文字だけへ落とすので実際には失敗しないが、
+/// そこが将来壊れたときに daemon のリクエストスレッドを panic させない
+/// （落とし込みが効いていることは
+/// `content_dispositionはどんな名前でもヘッダとして組める` が別途固定する）
+fn header_or(name: &[u8], value: &str, fallback: &[u8]) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(name, value.as_bytes()).unwrap_or_else(|_| header(name, fallback))
+}
+
 /// JSON 応答。ファイルの中身はすべて機密扱いなので `no-store, private` を必ず付ける
 fn respond_json(request: tiny_http::Request, deps: &FilesDeps, status: u16, body: &Value) {
     let mut resp = tiny_http::Response::from_string(body.to_string())
@@ -694,9 +703,10 @@ pub fn handle_files_request(
                     (deps.audit)("files", audit_payload("download", size, 0));
                     let mut resp = tiny_http::Response::from_file(file)
                         .with_header(header(b"Content-Type", b"application/octet-stream"))
-                        .with_header(header(
+                        .with_header(header_or(
                             b"Content-Disposition",
-                            content_disposition(&name).as_bytes(),
+                            &content_disposition(&name),
+                            b"attachment",
                         ));
                     for h in deps.cors.clone() {
                         resp = resp.with_header(h);
@@ -1152,6 +1162,29 @@ mod tests {
         assert!(jp.contains("%E5%A0%B1"), "jp={jp}");
         // 安全文字が 1 つも無い名前でも空にならない
         assert!(content_disposition("///").contains("\"download\""));
+    }
+
+    #[test]
+    fn content_dispositionはどんな名前でもヘッダとして組める() {
+        // 落とし込みが効いていれば tiny_http が必ず受理する = fallback へ落ちない
+        let long = "x".repeat(300);
+        for name in [
+            "ok.txt",
+            "報告書.pdf",
+            "a\"; X-Evil: 1\r\n\r\n.txt",
+            "\u{0}\u{1}\u{7f}",
+            "///",
+            "スペース あり.txt",
+            "emoji-\u{1F600}.png",
+            long.as_str(),
+        ] {
+            let value = content_disposition(name);
+            assert!(
+                tiny_http::Header::from_bytes(&b"Content-Disposition"[..], value.as_bytes())
+                    .is_ok(),
+                "ヘッダとして組めない: name={name:?} value={value}"
+            );
+        }
     }
 
     #[test]
