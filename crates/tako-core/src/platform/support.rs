@@ -213,12 +213,6 @@ pub mod notes {
         "The hard-coded unix socket serve target was removed in #1038 (the daemon now listens on loopback TCP), so `unix socket serve target is not supported on Windows` no longer applies. The end-to-end run on real Windows hardware (setup step 4 -> daemon start -> phone access) is still unmeasured (#971)",
     );
 
-    /// #972。器の境界（#519）を通らず `tako_core::tmux` を直に叩いている
-    pub const WIN_REMOTE_SCROLLBACK_BACKEND: Note = Note::new(
-        "スクロールバックの取得が器の境界を通らず psmux で解決できない（セッション名でもペイン ID でも `no server running` になる。#972）",
-        "Scrollback capture bypasses the container boundary and psmux cannot resolve it (both a session name and a pane id return `no server running`; #972)",
-    );
-
     // ─── そもそも要らない / 概念が無い ─────────────────────────────
 
     /// OS が同等機能を標準で持っていて、tako 側の実装が不要なもの（#600）
@@ -1205,12 +1199,9 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_remote_scrollback",
         macos: Support::Supported,
-        windows: Support::Pending {
-            note: notes::WIN_REMOTE_SCROLLBACK_BACKEND,
-            issue: 972,
-        },
+        windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: セッション名でもペイン ID でも `psmux: no server running on session '<socket>__<target>'` になる。同じソケットへ境界経由で叩く `tako tmux list` は成功する（#972）",
+            "#972 の Windows 11 実測（psmux 3.3.7・同一バイナリの A/B）: 既定では実経路テスト `remote_scrollback_e2e`（実 psmux + 偽 IPC サーバー）がセッション名と数値ペイン ID の両方で緑、`TAKO_972_LEGACY=1` では `psmux: no server running on session '<socket>__<pane id>'` で落ちる（#937 が報告した症状そのもの）。数値 ID の解決に要る IPC クライアントの Windows 実装も #972 で入れた（それまでは `Windows の IPC は未実装` の 1 行だった）",
         ),
     },
     Feature {

@@ -2714,6 +2714,8 @@ fn dispatch_inner(
             clear_limit_resume,
             bypass_sandbox,
             remote_control,
+            cwd,
+            clear_cwd,
         } => dispatch_orchestrator_profiles(ProfilesParams {
             action,
             name,
@@ -2721,6 +2723,8 @@ fn dispatch_inner(
             from,
             projects,
             clear_projects,
+            cwd,
+            clear_cwd,
             master_agent,
             clear_master_agent,
             model,
@@ -3029,7 +3033,11 @@ fn dispatch_inner(
         },
 
         Request::RemoteScrollback { pane_id, lines } => {
-            let result = crate::remote::scrollback(&pane_id, lines.unwrap_or(1000))
+            // 数値の PaneId は **app 自身の workspace** で器のセッションへ解決する（#972）。
+            // remote 側にも IPC 経由の解決があるが、それは CLI（別プロセス）用で、
+            // ここから使うと自分自身への入れ子 IPC になる
+            let session = scrollback_target_session(host, &pane_id)?;
+            let result = crate::remote::scrollback_session(&session, lines.unwrap_or(1000))
                 .map_err(DispatchError::Operation)?;
             Ok(json!({ "lines": result }))
         }
@@ -5500,6 +5508,9 @@ pub struct ProfilesParams {
     pub projects: Option<Vec<String>>,
     /// projects の指定を解除する（#721）
     pub clear_projects: bool,
+    /// master / solo をこのフォルダで起動する（#500 Part 5 / #1056）
+    pub cwd: Option<String>,
+    pub clear_cwd: bool,
     /// master のエージェント種別（claude / codex。agy は master 非対応。#127）
     pub master_agent: Option<String>,
     pub clear_master_agent: bool,
@@ -5864,6 +5875,29 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     "projects と clear_projects は同時に指定できない".into(),
                 ));
             }
+            if params.cwd.is_some() && params.clear_cwd {
+                return Err(DispatchError::InvalidParams(
+                    "cwd と clear_cwd は同時に指定できない".into(),
+                ));
+            }
+            // #1056: 起動時に解釈できない形は**設定時点で**弾く（`tako master` /
+            // 引き継ぎが起動できないプロファイルを黙って書かせない）。
+            // `Profile::resolve_cwd` が展開するのは `~/` だけなので、
+            // **相対パスと `~` 単体は起動時に必ず失敗する**（相対パスは
+            // 「set したときのプロセスの cwd」でだけ実在するので、set は通るのに
+            // 起動だけ落ちるという一番たちの悪い形になる）
+            if let Some(raw) = params.cwd.as_deref().filter(|c| !c.is_empty()) {
+                if !raw.starts_with("~/") && !Path::new(raw).is_absolute() {
+                    return Err(DispatchError::InvalidParams(format!(
+                        "cwd は絶対パスか `~/` から始まる形で指定する（相対パスは起動時に解決できない）: {raw}"
+                    )));
+                }
+                let probe = orchestrator::Profile {
+                    cwd: Some(raw.to_string()),
+                    ..Default::default()
+                };
+                probe.resolve_cwd().map_err(DispatchError::InvalidParams)?;
+            }
             // #749: 閾値は範囲外を黙って丸めず、設定時点でエラーにする
             if let Some(v) = params.ctx_threshold {
                 tako_core::handoff::parse_ctx_threshold(v).map_err(DispatchError::InvalidParams)?;
@@ -5891,6 +5925,8 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             let clear_worker_account = params.clear_worker_account;
             let projects_clone = params.projects.clone();
             let clear_projects = params.clear_projects;
+            let cwd_clone = params.cwd.clone();
+            let clear_cwd = params.clear_cwd;
             // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
             // default に丸めて上書き保存すると設定が消えるため、Err で中断する
             let (path, profile) = orchestrator::mutate_profile_of(kind, &name, |profile| {
@@ -5981,6 +6017,16 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     }
                 } else if clear_worker_account {
                     profile.worker_account = None;
+                }
+                // 起動フォルダ（空文字はクリアと同義。#500 Part 5 / #1056）
+                if let Some(c) = cwd_clone.as_deref() {
+                    if c.is_empty() {
+                        profile.cwd = None;
+                    } else {
+                        profile.cwd = Some(c.to_string());
+                    }
+                } else if clear_cwd {
+                    profile.cwd = None;
                 }
                 // プロジェクト割り当て（丸ごと置き換え。空配列はクリアと同義。#721）
                 if let Some(keys) = projects_clone {
@@ -7509,6 +7555,12 @@ fn worker_projects_in_tab(host: &dyn ControlHost, tab_id: TabId) -> Vec<String> 
     out
 }
 
+/// #1055 の修正を入れる前（後任の起動フォルダをホーム決め打ち）へ戻す逃げ道
+/// （`TAKO_1055_LEGACY=1`）。A/B 計測専用
+fn handoff_cwd_legacy() -> bool {
+    std::env::var_os("TAKO_1055_LEGACY").is_some()
+}
+
 /// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
 /// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
 /// handoff 内容を含むプロンプトを注入する。
@@ -7568,6 +7620,16 @@ fn dispatch_orchestrator_handoff(
     let (profile_owned, profile_source) =
         tako_core::handoff::resolve_master_profile(caller_role, pane_role.as_deref());
     let profile_name = profile_owned.as_str();
+
+    // #1055: 前任 master が実際に居るフォルダ。`pane_role` と同じ「前任 or 呼び出し元」から
+    // 採る（role ラベルを失った master でも呼び出し元は前任そのものなので取り違えない）。
+    // `TerminalSession::cwd` は起動時 cwd で初期化され OSC 7 で追従するので、
+    // シェル統合が無い環境でも GUI 再起動後（= 保存 cwd で復元した直後）でも読める。
+    // 消えたフォルダを引き継いでペインを殺さないよう、実在するものだけ採用する
+    let previous_cwd = previous_pane
+        .or(caller.map(|(_, p)| p))
+        .and_then(|p| host.session(p).and_then(|s| s.cwd()).map(Path::to_path_buf))
+        .filter(|p| p.is_dir());
 
     // #915 / #916: 読む前に旧形式を自動移行する（実行時の差分検出。冪等）
     let migration = orchestrator::handoff_store::ensure_migrated(profile_name);
@@ -7639,8 +7701,37 @@ fn dispatch_orchestrator_handoff(
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
         .map_err(DispatchError::Operation)?;
 
-    // cwd はホームディレクトリ
-    let cwd = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    // #1055: 起動フォルダは **プロファイルの cwd → 前任 master の cwd → ホーム** の順。
+    // 以前はホーム決め打ちで、プロファイルの `cwd` すら読んでいなかった。master の動作環境は
+    // cwd に依存しうる（PreToolUse フック・direnv・リポジトリローカルの設定）ので、
+    // 「同プロファイル / 同アカウント / 同モデル / 同 effort で立て直す」という引き継ぎの
+    // 約束に cwd も含める。プロファイルの cwd が壊れていたら**ペインを分割する前に**落とす
+    // （存在しないフォルダで spawn すると後任が起動できず、前任を閉じる主体が居なくなる）
+    let profile_cwd = profile.resolve_cwd().map_err(|e| {
+        op_err(format!(
+            "{e}\n  直すには: tako orchestrator profiles set {profile_name} --cwd <path>（解除は --clear-cwd）"
+        ))
+    })?;
+    let home = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let resolved_cwd = if handoff_cwd_legacy() {
+        // A/B 用（#1055 前のホーム決め打ちへ戻す）
+        tako_core::handoff::SuccessorCwd {
+            path: home,
+            source: tako_core::handoff::SuccessorCwdSource::Home,
+        }
+    } else {
+        tako_core::handoff::resolve_successor_cwd(profile_cwd, previous_cwd.clone(), home)
+    };
+    let cwd_warning = if handoff_cwd_legacy() {
+        None
+    } else {
+        tako_core::handoff::successor_cwd_warning(
+            &resolved_cwd,
+            previous_cwd.as_deref(),
+            profile_name,
+        )
+    };
+    let cwd = resolved_cwd.path.clone();
 
     // 新ペインを分割。#917: 退役する master が同じタブに居るなら**その master のペインを
     // 分割する**。旧ペインが閉じられた時点で残った後任が旧ペインの矩形をそのまま継ぐので、
@@ -7707,10 +7798,17 @@ fn dispatch_orchestrator_handoff(
     let handoff_path = orchestrator::handoff_path(profile_name);
     let mut warnings: Vec<String> = migration.warnings.clone();
     warnings.extend(bundle.memo_warning.clone());
+    // #1055: 起動フォルダの食い違いは黙らない（後任だけツールが全部拒否される、のような
+    // 理由の分からない停止を作らないため）
+    warnings.extend(cwd_warning);
     Ok(json!({
         "new_master_pane_id": new_id.as_u64(),
         "new_master_tab_id": tab_id.as_u64(),
         "profile": profile_name,
+        // #1055: 後任を**どのフォルダで**起動したか（前任と食い違ったら warnings にも出る）
+        "cwd": cwd.display().to_string(),
+        "cwd_source": resolved_cwd.source.as_str(),
+        "previous_master_cwd": previous_cwd.as_ref().map(|p| p.display().to_string()),
         // #854: プロファイルをどこから決めたか（caller_role / pane_role / default）。
         // pane_role が出たら呼び出し元の env が失われていたということ
         "profile_source": profile_source.as_str(),
@@ -10013,6 +10111,28 @@ fn limit_resume_panes(host: &dyn ControlHost) -> Vec<Value> {
         .into_iter()
         .map(|id| limit_resume_entry(host, id))
         .collect()
+}
+
+/// `tako_remote_scrollback` の対象指定を器のセッション名へ解決する（#972）。
+///
+/// 解釈（数値ペイン ID / セッション名 / ターゲット式）は
+/// `remote::parse_scrollback_target` の 1 実装に任せ、**数値 ID だけ**を
+/// app 自身の workspace で解決する。**ここで元の指定へ落とさない**のが要点で、
+/// 落とすと remote 側の CLI 用フォールバック（IPC で app へ問い合わせる）へ流れ、
+/// tako-app が自分自身へ接続する形になる
+fn scrollback_target_session(host: &dyn ControlHost, spec: &str) -> Result<String, DispatchError> {
+    match crate::remote::parse_scrollback_target(spec).map_err(DispatchError::InvalidParams)? {
+        crate::remote::ScrollbackTarget::Session(name) => Ok(name),
+        crate::remote::ScrollbackTarget::Pane(id) => {
+            let (_, target) = resolve_pane(host.workspace(), Some(id))?;
+            host.backend_session(target).ok_or_else(|| {
+                DispatchError::Operation(format!(
+                    "ペイン {id} は器（永続化バックエンド）を持たないので履歴を読めない: {}",
+                    crate::reach::no_detached_capture_note()
+                ))
+            })
+        }
+    }
 }
 
 /// `pane` 省略はエラー（呼び出し元解決はクライアント側の責務。FR-2.2.7）
@@ -16978,6 +17098,257 @@ mod tests {
             )
             .expect("handoff は成功する");
             assert_eq!(result["profile"].as_str(), Some(profile), "{result}");
+        });
+    }
+
+    // --- #1055: 後任 master の起動フォルダ ---
+
+    /// 前任 master のペインへ実 PTY のセッションを張る（cwd の出どころを作る）
+    fn seed_session_cwd(host: &mut MockHost, pane: u64, cwd: &std::path::Path) {
+        let (session, _rx) = TerminalSession::spawn(
+            80,
+            24,
+            SpawnOptions {
+                cwd: Some(cwd.to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .expect("PTY を張れる");
+        assert_eq!(
+            session.cwd(),
+            Some(cwd),
+            "起動時 cwd がセッションへ入っていない（前提が崩れている）"
+        );
+        host.sessions.insert(pane, session);
+    }
+
+    /// プロファイルに cwd が無くても、後任は前任 master と同じフォルダで立つ（#1055 の主症状）。
+    /// **`TAKO_1055_LEGACY=1` を立てて走らせるとこのテストは落ちる**（検出力の A/B）
+    #[test]
+    fn handoffの後任は前任と同じフォルダで起動する() {
+        let profile = "_tako_1055_prev_";
+        with_handoff_file(
+            profile,
+            "## 知識（マシン非依存）\n方針: 継続",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                // 前任は「ホームではないどこか」に居る（ホーム落ちと見分けるため）
+                let prev_cwd =
+                    std::env::temp_dir().join(format!("tako-1055-prev-{}", std::process::id()));
+                std::fs::create_dir_all(&prev_cwd).expect("前任の cwd");
+                seed_session_cwd(&mut host, pane, &prev_cwd);
+
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorHandoff {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        tab: None,
+                        caller_pid: None,
+                        projects: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .expect("handoff は成功する");
+
+                assert_eq!(
+                    result["cwd"].as_str(),
+                    Some(prev_cwd.to_string_lossy().as_ref()),
+                    "後任が前任と別のフォルダで立った: {result}"
+                );
+                assert_eq!(result["cwd_source"].as_str(), Some("previous_master"));
+                assert_eq!(
+                    result["previous_master_cwd"].as_str(),
+                    Some(prev_cwd.to_string_lossy().as_ref())
+                );
+                // 一致したなら警告は出さない（毎回の引き継ぎで警告を出さない）
+                let warnings = result["warnings"].as_array().cloned().unwrap_or_default();
+                assert!(
+                    !warnings
+                        .iter()
+                        .any(|w| w.as_str().is_some_and(|t| t.contains("起動フォルダ"))),
+                    "一致しているのに警告が出た: {warnings:?}"
+                );
+                // 応答だけでなく**実際に起動したペイン**が同じフォルダを受け取っている
+                let new_pane = result["new_master_pane_id"].as_u64().expect("後任 pane");
+                let opts = host
+                    .attached_options
+                    .get(&new_pane)
+                    .expect("後任のセッション起動オプション");
+                assert_eq!(opts.cwd.as_deref(), Some(prev_cwd.as_path()));
+
+                let _ = std::fs::remove_dir_all(&prev_cwd);
+            },
+        );
+    }
+
+    /// プロファイルの cwd はユーザーの明示指定なので前任より優先し、
+    /// 前任と食い違うときは理由 + 次の一手を warnings に出す
+    #[test]
+    fn handoffはプロファイルのcwdを前任より優先する() {
+        let profile = "_tako_1055_prof_";
+        with_handoff_file(
+            profile,
+            "## 知識（マシン非依存）\n方針: 継続",
+            || {
+                let base =
+                    std::env::temp_dir().join(format!("tako-1055-prof-{}", std::process::id()));
+                let prev_cwd = base.join("prev");
+                let want_cwd = base.join("want");
+                std::fs::create_dir_all(&prev_cwd).expect("前任の cwd");
+                std::fs::create_dir_all(&want_cwd).expect("プロファイルの cwd");
+
+                dispatch_orchestrator_profiles(ProfilesParams {
+                    action: "set".into(),
+                    name: Some(profile.into()),
+                    cwd: Some(want_cwd.to_string_lossy().to_string()),
+                    ..Default::default()
+                })
+                .expect("cwd を設定できる");
+
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                seed_session_cwd(&mut host, pane, &prev_cwd);
+                let result = dispatch(
+                    &mut host,
+                    Request::OrchestratorHandoff {
+                        pane: Some(pane),
+                        caller_role: Some(format!("master:{profile}")),
+                        tab: None,
+                        caller_pid: None,
+                        projects: None,
+                    },
+                    PaneOrigin::Mcp,
+                )
+                .expect("handoff は成功する");
+
+                assert_eq!(
+                    result["cwd"].as_str(),
+                    Some(want_cwd.to_string_lossy().as_ref()),
+                    "プロファイルの cwd が効いていない: {result}"
+                );
+                assert_eq!(result["cwd_source"].as_str(), Some("profile"));
+                let warnings = result["warnings"].as_array().cloned().unwrap_or_default();
+                assert!(
+                    warnings.iter().any(|w| w
+                        .as_str()
+                        .is_some_and(|t| t.contains("起動フォルダが前任と違います"))),
+                    "食い違いを黙った: {warnings:?}"
+                );
+
+                let _ = dispatch_orchestrator_profiles(ProfilesParams {
+                    action: "delete".into(),
+                    name: Some(profile.into()),
+                    ..Default::default()
+                });
+                let _ = std::fs::remove_dir_all(&base);
+            },
+        );
+    }
+
+    /// #1056: `--cwd` / `--clear-cwd` が効き、存在しないパスは設定時点で弾かれる
+    #[test]
+    fn プロファイルのcwdはsetで設定と解除ができる() {
+        let profile = "_tako_1056_";
+        with_handoff_file(profile, "state", || {
+            let dir = std::env::temp_dir().join(format!("tako-1056-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("cwd");
+            let set = |params: ProfilesParams| dispatch_orchestrator_profiles(params);
+
+            let v = set(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                cwd: Some(dir.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .expect("設定できる");
+            assert_eq!(v["cwd"].as_str(), Some(dir.to_string_lossy().as_ref()));
+            // show / list にも出る（受け入れ条件）
+            let shown = set(ProfilesParams {
+                action: "show".into(),
+                name: Some(profile.into()),
+                ..Default::default()
+            })
+            .expect("show");
+            assert_eq!(shown["cwd"].as_str(), Some(dir.to_string_lossy().as_ref()));
+            let listed = set(ProfilesParams {
+                action: "list".into(),
+                ..Default::default()
+            })
+            .expect("list");
+            let row = listed["profiles"]
+                .as_array()
+                .expect("配列")
+                .iter()
+                .find(|p| p["name"].as_str() == Some(profile))
+                .expect("一覧に居る")
+                .clone();
+            assert_eq!(row["cwd"].as_str(), Some(dir.to_string_lossy().as_ref()));
+
+            // 存在しないパスは書かせない（起動できないプロファイルを黙って作らない）
+            let err = set(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                cwd: Some(
+                    dir.join("この階層は存在しない")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ..Default::default()
+            })
+            .expect_err("存在しないパスは拒否する");
+            assert!(format!("{err}").contains("cwd"), "{err}");
+            // 拒否されても既存の値は壊れない
+            let after = set(ProfilesParams {
+                action: "show".into(),
+                name: Some(profile.into()),
+                ..Default::default()
+            })
+            .expect("show");
+            assert_eq!(after["cwd"].as_str(), Some(dir.to_string_lossy().as_ref()));
+
+            // 相対パスと `~` 単体は起動時に解決できないので設定時点で断る
+            // （set は通るのに起動だけ落ちる、という一番たちの悪い形を作らない）
+            for bad in ["./prev", "prev", "~"] {
+                let err = set(ProfilesParams {
+                    action: "set".into(),
+                    name: Some(profile.into()),
+                    cwd: Some(bad.into()),
+                    ..Default::default()
+                })
+                .expect_err(&format!("{bad} を拒否しなかった"));
+                assert!(
+                    format!("{err}").contains("絶対パス"),
+                    "{bad}: 理由が不親切: {err}"
+                );
+            }
+
+            // 排他
+            let err = set(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                cwd: Some(dir.to_string_lossy().to_string()),
+                clear_cwd: true,
+                ..Default::default()
+            })
+            .expect_err("同時指定は拒否する");
+            assert!(format!("{err}").contains("同時に指定できない"), "{err}");
+
+            // 解除
+            let v = set(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                clear_cwd: true,
+                ..Default::default()
+            })
+            .expect("解除できる");
+            assert!(v.get("cwd").is_none(), "解除後も cwd が残っている: {v}");
+
+            let _ = set(ProfilesParams {
+                action: "delete".into(),
+                name: Some(profile.into()),
+                ..Default::default()
+            });
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 

@@ -521,6 +521,8 @@ pub(super) fn build_request(
             from: str_arg(args, "from")?,
             projects: str_vec_arg(args, "projects")?,
             clear_projects: bool_arg(args, "clear_projects")?.unwrap_or(false),
+            cwd: str_arg(args, "cwd")?,
+            clear_cwd: bool_arg(args, "clear_cwd")?.unwrap_or(false),
             model: str_arg(args, "model")?,
             master_agent: str_arg(args, "master_agent")?,
             clear_master_agent: bool_arg(args, "clear_master_agent")?.unwrap_or(false),
