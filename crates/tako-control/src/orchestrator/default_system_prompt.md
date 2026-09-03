@@ -362,6 +362,19 @@ Recover by `kind` (also in `tako_orchestrator_worker_status` as
   (look first with no `choice`), **not** with `tako_send_input`: a bare Enter
   confirms whatever is highlighted, which on codex is "switch to a cheaper
   model". Prefer the option that keeps the current model / waits for the reset.
+- `entitlement_blocked` (action: needs_human) — the account itself is blocked:
+  seat type without usage credits, usage allocation disabled by an admin, a
+  group limit set to $0, a model that requires credits, extra usage exhausted,
+  or the service disabled for the org. **Time does not fix this**, so do NOT
+  wait for a reset, do NOT send a continue nudge, and do NOT close → respawn:
+  every retry hits the same wall. Report the `detail` line to the user verbatim
+  and tell them what has to change (admin action, plan/seat change, buying
+  credits, or `/model` to a model their plan covers). Then park the worker —
+  re-arm the watch only after the user says the account side is fixed.
+- `launch_failed` (action: fix_launch) — the agent CLI never started (missing
+  CLI, not logged in, immediate exit, local runtime down). The `detail` already
+  carries the reason and the next step; do that first (install / log in / start
+  the runtime). Nudges and waiting cannot help, and respawning repeats it.
 
 ### When you receive WORKER_STALLED
 

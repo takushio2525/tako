@@ -307,6 +307,8 @@ pub mod keys {
     pub const WORKER_DEATH_RESUME: &str = "worker_death_resume";
     /// 送達の第 1 層（画面を介さない直送）
     pub const WORKER_DELIVERY_PEER: &str = "worker_delivery_peer";
+    /// 時間では解けない利用阻害（座席種別・管理者による無効化・組織ポリシー等）の検知
+    pub const WORKER_ENTITLEMENT_DETECT: &str = "worker_entitlement_detect";
     /// 利用上限からの自動復帰
     pub const WORKER_LIMIT_AUTORESUME: &str = "worker_limit_autoresume";
     /// 利用上限で止まったことの検知
@@ -464,6 +466,12 @@ pub mod notes {
     pub const AGY_NO_REMOTE_CONTROL: Note = Note::new(
         "agy の `--help` 全件（フラグ 24 / サブコマンド 11）にリモート操作の口が無い（`mic-serve` はマイクを別ホストへ配るだけ）ので、会話を外の端末から操作する手段がそもそも無い",
         "The full agy `--help` surface (24 flags, 11 subcommands) has no remote-control entry point at all (`mic-serve` only shares a microphone with another host), so there is no way to drive the conversation from another device",
+    );
+
+    /// ローカルで動かすモデルにベンダーの権利（座席 / クレジット / 組織ポリシー）が無い
+    pub const NO_LOCAL_ENTITLEMENT: Note = Note::new(
+        "自分のマシンで動かすモデルなので、座席種別・クレジット・組織ポリシーという概念が無い（阻害される権利がそもそも存在しない）",
+        "The model runs on your own machine, so there is no seat type, credit balance, or org policy to be blocked by",
     );
 
     /// ローカルで動かすモデルに利用上限という概念が無い
@@ -1122,6 +1130,29 @@ pub const MATRIX: &[AgentFeature] = &[
             "第 1 層は claude の Cross-Session Messaging（受信箱の socket へ直送）に固有。\
              AGENTS.md「worker への指示送達（#790）」も codex / agy / Windows は常に \
              第 2 層と明記している",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_ENTITLEMENT_DETECT,
+        summary: Note::new(
+            "時間では解けない利用阻害で止まったことを検知する（#1106）",
+            "Detects that the agent has stopped at a block that time cannot clear (#1106)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1107),
+        agy: pending(notes::NOT_INVESTIGATED, 1107),
+        local: unsupported(notes::NO_LOCAL_ENTITLEMENT),
+        evidence: AgentEvidence::Measured(
+            "#1106: claude 2.1.258 のバイナリで阻害の前置き（`dCt` / `pCt` / `Par`）を読み、\
+             時間で解ける 4 条件（#1096）を除いた 6 分類 / 8 文言 —— 座席種別 3 種・\
+             管理者による無効化・グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・\
+             組織でのサービス無効 —— を `tako_core::limit_resume::entitlement_block_line` \
+             で受け、`WorkerErrorKind::EntitlementBlocked`（`needs_human`）として返す。\
+             実文言の fixture は `detect_worker_errorは時間で解けない阻害を別種として検知する`、\
+             上限停止（#1093 / #1096）と排他であることは \
+             `issue1106_時間で解けない阻害は上限停止と混ざらない` が固定している。\
+             codex / agy に同等の状態があるかは**まだ調べていない**（追跡 #1107）ので \
+             Pending。ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
         ),
     },
     AgentFeature {

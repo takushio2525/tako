@@ -743,23 +743,29 @@ pub fn recover_dead(
     verified
 }
 
-/// 起動失敗（#983）は**自動復旧しない**。監査ログと履歴へ理由を残して未復旧を返す。
+/// **人の対処が要る停止は自動復旧しない**。監査ログと履歴へ理由を残して未復旧を返す。
 ///
-/// 自動で直せる種類の失敗ではない（CLI の導入・ログイン・runtime の起動が要る）ので、
-/// ここで再送やナッジを撃つと同じ失敗を max_retries 回繰り返すだけになる
-fn report_launch_failed(
+/// 対象は 2 種:
+/// - 起動失敗（#983。CLI の導入・ログイン・runtime の起動が要る）
+/// - 時間では解けない利用阻害（#1106。管理者 / プラン / クレジットの対処が要る）
+///
+/// どちらも自動で直せる種類ではないので、ここで再送やナッジを撃つと
+/// **同じ失敗を max_retries 回繰り返すだけ**になる。記録は残す —— #1093 / #1106 の
+/// 実害は「止まったのに supervisor.log に何も無く、あとから理由を追えない」ことだった
+fn report_needs_human(
     ctx: &mut SupervisorContext,
+    trigger: &str,
     detail: &str,
     state: &mut SupervisorState,
 ) -> bool {
-    let action = "launch_failed_report";
-    audit_log(&ctx.worker_id, ctx.pane_id, action, detail);
+    let action = format!("{trigger}_report");
+    audit_log(&ctx.worker_id, ctx.pane_id, &action, detail);
     state.record(RecoveryEntry {
         timestamp: crate::sessions::now_iso(),
         worker_id: ctx.worker_id.clone(),
         pane: ctx.pane_id,
-        trigger: "launch_failed".into(),
-        action: action.into(),
+        trigger: trigger.to_string(),
+        action,
         success: false,
         detail: detail.to_string(),
     });
@@ -1000,7 +1006,15 @@ pub fn supervisor_loop(
                 // 続行ナッジも待機も再送も効かない —— **同じ失敗を繰り返すだけ**なので
                 // 自動復旧を試みず、未復旧としてエスカレーションへ回す
                 // （detail に「理由 + 次の一手」が入っているので、人が読めば直せる）
-                WorkerErrorKind::LaunchFailed => report_launch_failed(&mut ctx, detail, &mut state),
+                WorkerErrorKind::LaunchFailed => {
+                    report_needs_human(&mut ctx, "launch_failed", detail, &mut state)
+                }
+                // #1106: 時間では解けない利用阻害（座席種別・管理者による無効化・
+                // グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・組織でのサービス無効）。
+                // 待っても解けないので `recover_usage_limit` の「解除まで待つ」は通さない
+                WorkerErrorKind::EntitlementBlocked => {
+                    report_needs_human(&mut ctx, "entitlement_blocked", detail, &mut state)
+                }
             },
             WatchOutcome::AgentDead { resume_command } => {
                 recover_dead(&mut ctx, resume_command.as_deref(), &mut state)

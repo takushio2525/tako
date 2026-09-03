@@ -454,6 +454,56 @@ pub fn exhausted_limit_window(line: &str) -> Option<LimitWindow> {
     None
 }
 
+/// 「時間では解けない」利用阻害を告げる行か（Issue #1106）。
+///
+/// **[`is_limit_exhausted_line`] とは意図的に別の関数**にしてある。混ぜると自動復帰
+/// （#813）が「解除まで待つ」で撃ち始めてしまうが、ここで受けるものは待っても解けない
+/// —— 座席種別・管理者による無効化・グループ枠 $0・クレジットの要求・追加利用ぶんの
+/// 枯渇・組織でのサービス無効はいずれも**人（管理者 / プラン / クレジット）の対処**が要る。
+/// 呼び出し側（`tako-control::orchestrator::wait::detect_worker_error`）は
+/// `WorkerErrorKind::EntitlementBlocked`（推奨アクション `needs_human`）として返す。
+///
+/// # 根拠（claude 2.1.258 のバイナリ実測。#1096 と同じ表）
+///
+/// claude は前置きを自分で 3 分類している。受けるのは**阻害**（`dCt` / `pCt` / `Par`）の
+/// うち、#1096 が時間で解けるものとして取った 4 条件（`hit your` / `reached your` /
+/// `out of usage credits` / `org is out of usage`）を除いた残り:
+///
+/// ```text
+/// dCt = [… "Your seat type doesn't include usage credits",
+///           "Your seat type doesn't include usage",
+///           "Your seat type doesn't include extra usage",
+///           "Your usage allocation has been disabled by your admin",
+///           "Your group's usage limit is set to $0",
+///           "Fable 5 requires usage credits",
+///           "You're out of extra usage"]
+/// Par = [/^Fable(?: [^·\n]{1,40})? requires usage credits\./]  // Fable の総称形
+/// pCt = ["This service is disabled for your org"]
+/// ```
+///
+/// = 6 分類 / 8 文言。`fCt`（`You've used` / `You're close to` = 警告）と
+/// `mCt`（`You're now using usage credits` = 情報）は**受けない**（#1096 で確定した
+/// とおり、まだ動けるペインを止まったと読まないため）。
+///
+/// # なぜ部分一致の組で判定するのか
+///
+/// アポストロフィは**判定に使わない**（#1093 / #1096 と同じ方針）。同じバイナリの中で
+/// ASCII の `'` と U+2019 が混在しており、どちらかに寄せると片方を取りこぼす。
+/// そこで `doesn't` / `group's` / `You're` のようにアポストロフィを含む語は
+/// **その手前と後ろに分けた必須語の組**（AND）で表す。
+///
+/// 版が上がって文言が増えたら `dCt` / `pCt` / `Par` を読み直すのが正しい採り方
+/// （#748 / #985 / #1093 / #1096 と同じ作法）。
+pub fn entitlement_block_line(line: &str) -> bool {
+    if legacy_entitlement_block() {
+        return false; // #1106 前（8 文言をどこでも受けなかった）へ戻す A/B 用
+    }
+    let lower = line.to_lowercase();
+    ENTITLEMENT_BLOCK_PHRASES
+        .iter()
+        .any(|needles| needles.iter().all(|n| lower.contains(n)))
+}
+
 /// 上限の見出しが使う動詞（claude 2.1.258 の `dCt` の先頭 2 件。#1096）。
 /// `You've reached your Fable limit.` は `hit` ではないので #1093 の規則では
 /// 当たらなかった（#1093 とまったく同じ機序の取りこぼし）
@@ -462,6 +512,32 @@ const EXHAUSTED_HEADLINE_VERBS: [&str; 2] = ["hit your", "reached your"];
 /// テンプレートに載らない「尽きた」告知のうち**時間で解ける**ぶん（#1096）。
 /// アポストロフィ（`You're` / `Your org`）は判定に使わない
 const EXHAUSTED_PHRASES: [&str; 2] = ["out of usage credits", "org is out of usage"];
+
+/// 時間では解けない利用阻害の語句（#1106）。各要素は**すべて含まれていること**を
+/// 求める必須語の組（アポストロフィを避けて分割してある。[`entitlement_block_line`]）。
+/// 並びは Issue #1106 の分類表 A〜F の順
+const ENTITLEMENT_BLOCK_PHRASES: [&[&str]; 7] = [
+    // A. 座席種別（`Your seat type doesn't include usage credits` /
+    //    `… doesn't include usage` / `… doesn't include extra usage`）。
+    //    アポストロフィの前後で割る（`doesn't` / `doesn\u{2019}t` の両方に効き、
+    //    「The seat type field does not include usage …」のような地の文には当たらない）。
+    //    `extra usage` は `include usage` を含まないので別の組にする
+    &["seat type doesn", "t include usage"],
+    &["seat type doesn", "t include extra usage"],
+    // B. 管理者による無効化（`Your usage allocation has been disabled by your admin`）
+    &["usage allocation has been disabled"],
+    // C. グループ枠 $0（`Your group's usage limit is set to $0`）。
+    //    `limit` という語はあるが動詞が無いので #1096 の規則では当たらない
+    &["usage limit is set to $0"],
+    // D. クレジットの要求（`Fable 5 requires usage credits` + `Par` の総称形。
+    //    モデル名を判定に入れないので版でモデルが増えても追従する）
+    &["requires usage credits"],
+    // E. 追加利用ぶんの枯渇（`You're out of extra usage`）。
+    //    #1096 の `out of usage credits` とは別の文言
+    &["out of extra usage"],
+    // F. 組織でサービス無効（`pCt` = `This service is disabled for your org`）
+    &["service is disabled for your org"],
+];
 
 /// 動詞の直後で限度の名前を探す文字数の歯止め（句読点が来ない行のため）。
 /// 実測で最も長い名前は `org's monthly spend limit`（25 文字）
@@ -478,6 +554,13 @@ fn legacy_session_limit() -> bool {
 fn legacy_out_of_usage() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1096_LEGACY").is_some())
+}
+
+/// `TAKO_1106_LEGACY=1` で #1106 前へ戻す（A/B 用）。
+/// 時間では解けない阻害の 8 文言をどこでも受けない = worker が idle（作業完了）に見える
+fn legacy_entitlement_block() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1106_LEGACY").is_some())
 }
 
 // --- リセット時刻のパース ---
@@ -1364,6 +1447,89 @@ mod tests {
             assert!(
                 !is_limit_exhausted_line(line),
                 "警告 / 情報を上限（停止）と読んでいる: {line}"
+            );
+        }
+    }
+
+    // --- #1106: 時間では解けない利用阻害（`UsageLimit` とは別種） ---
+
+    /// claude 2.1.258 の `dCt` / `pCt` / `Par` から採った実文言（6 分類 / 8 文言）。
+    /// アポストロフィは ASCII の `'` と U+2019 の両方を並べる（判定に使っていないことの固定）
+    const ENTITLEMENT_LINES: [&str; 11] = [
+        // A. 座席種別（3 文言）
+        "Your seat type doesn't include usage credits",
+        "Your seat type doesn't include usage",
+        "Your seat type doesn't include extra usage",
+        "Your seat type doesn\u{2019}t include usage credits",
+        // B. 管理者による無効化
+        "Your usage allocation has been disabled by your admin",
+        // C. グループ枠 $0
+        "Your group's usage limit is set to $0",
+        "Your group\u{2019}s usage limit is set to $0",
+        // D. クレジットの要求（実文言 + `Par` の総称形）
+        "Fable 5 requires usage credits",
+        "Fable 5.1 Sonnet requires usage credits. Run /usage-credits to continue.",
+        // E. 追加利用ぶんの枯渇
+        "You're out of extra usage",
+        // F. 組織でサービス無効（`pCt`）
+        "This service is disabled for your org",
+    ];
+
+    #[test]
+    fn issue1106_時間で解けない阻害の8文言を別種として読む() {
+        for line in ENTITLEMENT_LINES {
+            assert!(
+                entitlement_block_line(line),
+                "時間で解けない阻害として読めていない: {line}"
+            );
+        }
+        // 画面では前置きに罫線やインデントが付く（実採取の形）
+        assert!(entitlement_block_line(
+            "  ⎿  Your usage allocation has been disabled by your admin"
+        ));
+    }
+
+    #[test]
+    fn issue1106_時間で解けない阻害は上限停止と混ざらない() {
+        // **混ぜると自動復帰（#813）が「解除まで待つ」で撃ち始める**。
+        // 判定が排他であることを固定しておけば `detect_worker_error` の
+        // 検査順に依らず種別が一意に決まる
+        for line in ENTITLEMENT_LINES {
+            assert!(
+                !is_limit_exhausted_line(line),
+                "時間で解けない阻害を上限停止（wait_reset）と読んでいる: {line}"
+            );
+            // 枠の使用率とは無関係なのでメーターは `--` のまま
+            assert_eq!(exhausted_limit_window(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn issue1106_時間で解ける上限や警告を阻害と読まない() {
+        for line in [
+            // #1093 / #1096 で受けているぶん（時間で解ける = wait_reset が正しい）
+            "You've hit your session limit · resets 7:50pm (Asia/Tokyo)",
+            "You've reached your weekly limit · resets 7:50pm (Asia/Tokyo)",
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo)",
+            "Your org is out of usage · contact your admin",
+            // `out of usage credits` を含むので #1096 の規則で既に受けている
+            // （Issue #1106 の対象外。ここで二重に受けない）
+            "Your organization is out of usage credits. Contact your admin to add more.",
+            "Claude usage limit reached. Your limit will reset at 3am.",
+            // 警告 / 情報（`fCt` / `mCt`）
+            "You've used 75% of your weekly limit",
+            "You're close to your usage credit limit",
+            "You're now using usage credits · Your weekly limit resets 7:50pm",
+            "Now using your usage allocation",
+            // 上限を上げる案内（阻害されていない）
+            "Your admin can enable extra usage at claude.ai/admin-settings/usage.",
+            // 通常の出力・地の文
+            "⏺ 実装が完了しました。テストは全て緑です。",
+            "The seat type field does not include usage in this schema",
+        ] {
+            assert!(
+                !entitlement_block_line(line),
+                "阻害ではない行を阻害と読んでいる: {line}"
             );
         }
     }
