@@ -1009,6 +1009,7 @@ tako orchestrator profiles set default --model claude-opus-4-6 --effort max
 tako orchestrator profiles set default --clear-model   # claude 既定モデルに戻す
 tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
 tako orchestrator profiles set default --ctx-threshold 55   # 自動ハンドオフの閾値（50〜60）
+tako orchestrator profiles set takodev --cwd ~/dev/tako      # master をこのフォルダで起動する
 ```
 
 | `set` の主なオプション | 説明 |
@@ -1020,8 +1021,11 @@ tako orchestrator profiles set default --ctx-threshold 55   # 自動ハンドオ
 | `--worker-effort` | 子 worker の思考量 |
 | `--worker-agent` / `--clear-worker-agent` | worker の既定エージェント CLI（claude / codex / agy） |
 | `--worker-model-policy` | `inherit` / `fixed` / `delegate` |
+| `--cwd` / `--clear-cwd` | master・solo を起動するフォルダ / 解除（`~` 展開。存在しないパスはエラー） |
 | `--ctx-threshold` / `--clear-ctx-threshold` | 自動ハンドオフを始めるコンテキスト使用率（%。50〜60。既定 60） |
 | `--auto-handoff` | 閾値を超えたら tako が引き継ぎを促すか（既定 true） |
+
+`--cwd` を設定すると、引き継ぎ（`tako orchestrator handoff`）で立つ後任 master もそのフォルダで起動します。未設定なら**前任 master と同じフォルダ**を引き継ぎます（フックや direnv のようにフォルダに依存する設定が後任だけ効かなくなるのを防ぐため）。引き継ぎの応答には実際に使ったフォルダ（`cwd`）と決め手（`cwd_source`）が載ります。
 
 master のエージェント CLI を codex にすると、`tako master -<プロファイル名>` で codex が tako の MCP ツールに接続された状態で立ち上がります。master が claude 以外のとき、プロファイルの `model` / `effort` は claude worker へ継承されません。
 

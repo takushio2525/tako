@@ -1886,6 +1886,10 @@
           "description": "ctx_threshold の指定を解除する（config.yaml → 既定 60 へ戻る。set 時。#749）",
           "type": "boolean"
         },
+        "clear_cwd": {
+          "description": "cwd の指定を解除する（set 時。#1056）",
+          "type": "boolean"
+        },
         "clear_limit_resume": {
           "description": "limit_resume の指定を解除して既定（無効）へ戻す（set 時。#822）",
           "type": "boolean"
@@ -1923,6 +1927,10 @@
           "maximum": 60,
           "minimum": 50,
           "type": "integer"
+        },
+        "cwd": {
+          "description": "master / solo をこのフォルダで起動する（`~` 展開。存在しないパスはエラー。空文字でクリア。set 時。#500 / #1056）。引き継ぎ（tako_orchestrator_handoff）の後任もここで起動する（未設定なら前任 master と同じフォルダ。#1055）",
+          "type": "string"
         },
         "effort": {
           "description": "master の thinking effort（set 時。省略で現状維持）",
