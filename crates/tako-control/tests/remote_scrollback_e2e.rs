@@ -31,10 +31,15 @@ fn container_bin() -> Option<String> {
     }
 }
 
-/// 器のセッションを作り、既知の行を流し込む
-fn start_session(bin: &str, socket: &str) -> bool {
-    let created = Command::new(bin)
-        .args([
+/// 器のセッションを作り、既知の行を流し込む。
+///
+/// **器があるのに作れなかったら黙って skip しない**（skip は「測っていない」を
+/// 「緑」に見せる。#796 の作法）。`-x` / `-y` は器によっては受けないので、
+/// 落ちたらサイズ指定なしで作り直す
+fn start_session(bin: &str, socket: &str) -> Result<(), String> {
+    let sized = run(
+        bin,
+        &[
             "-L",
             socket,
             "new-session",
@@ -45,15 +50,15 @@ fn start_session(bin: &str, socket: &str) -> bool {
             "24",
             "-s",
             SESSION,
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !created {
-        return false;
+        ],
+    );
+    if sized.is_err() {
+        run(bin, &["-L", socket, "new-session", "-d", "-s", SESSION])
+            .map_err(|e| format!("器のセッションを作れない（サイズ指定あり / なしとも）: {e}"))?;
     }
-    let _ = Command::new(bin)
-        .args([
+    run(
+        bin,
+        &[
             "-L",
             socket,
             "send-keys",
@@ -61,9 +66,23 @@ fn start_session(bin: &str, socket: &str) -> bool {
             SESSION,
             "echo TAKO972_MARKER",
             "Enter",
-        ])
-        .status();
-    true
+        ],
+    )
+    .map_err(|e| format!("器へ送れない: {e}"))?;
+    Ok(())
+}
+
+/// 器の CLI を 1 回叩く。失敗は stderr つきで返す
+fn run(bin: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{bin} を実行できない: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 fn kill_session(bin: &str, socket: &str) {
@@ -129,9 +148,8 @@ fn ペインidとセッション名の両方でscrollbackが返る() {
         eprintln!("SKIP: 器になれるバイナリが無い（tmux / psmux）");
         return;
     };
-    if !start_session(&bin, &socket) {
-        eprintln!("SKIP: 器のセッションを作れない（bin={bin}）");
-        return;
+    if let Err(e) = start_session(&bin, &socket) {
+        panic!("器（{bin}）があるのにセッションを用意できない: {e}");
     }
     let _guard = SessionGuard {
         bin: bin.clone(),
