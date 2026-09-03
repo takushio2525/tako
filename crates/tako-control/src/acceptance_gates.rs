@@ -355,17 +355,22 @@ fn result_to_json(id: &str, result: &CheckResult) -> Value {
     })
 }
 
-/// Command 述語の実行
+/// Command 述語の実行。
+///
+/// **述語はシェル構文を含む「1 本の文字列」**（`cargo test --workspace && git diff --quiet`
+/// のような形）なので、どのシェルに渡すかは抽象境界 B1
+/// （[`tako_core::platform::shell::output_command`]）が決める。ここで `sh -c` を
+/// 直書きしていたため Windows では `CreateProcess` が失敗し、コマンド型ゲートが
+/// **一切判定できなかった**（#935）。述語を書く側から見た方言（POSIX / PowerShell）は
+/// `tako_core::platform::shell::script_dialect()` で分かる
 fn execute_command(cmd: &str, expect_exit_0: bool, cwd: Option<&str>) -> CheckResult {
     eprintln!("[gate check] command: {cmd}");
     if let Some(d) = cwd {
         eprintln!("[gate check] cwd: {d}");
     }
 
-    let mut command = std::process::Command::new("sh");
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(&mut command);
-    command.args(["-c", cmd]);
+    // コンソールウィンドウの抑止（#586）は境界の内側で掛かる
+    let mut command = tako_core::platform::shell::output_command(cmd);
     if let Some(d) = cwd {
         command.current_dir(d);
     }
@@ -486,11 +491,35 @@ fn format_evidence(exit_code: i32, stdout: &str, stderr: &str) -> String {
         }
     }
     let joined = parts.join("; ");
-    if joined.len() > 2000 {
-        format!("{}...(truncated)", &joined[..2000])
+    if joined.len() > EVIDENCE_MAX_BYTES {
+        format!(
+            "{}...(truncated)",
+            &joined[..floor_char_boundary(&joined, EVIDENCE_MAX_BYTES)]
+        )
     } else {
         joined
     }
+}
+
+/// evidence の上限（バイト）
+const EVIDENCE_MAX_BYTES: usize = 2000;
+
+/// `max` バイト以下で**文字境界**へ丸めた位置。
+///
+/// `&s[..max]` の素の切り出しは**マルチバイト文字の途中で panic する**。
+/// 述語の出力は任意なので日本語が来うるし、#935 で Windows の出力を UTF-8 へ
+/// 揃えたことで**正しい多バイト列が届くようになった**（それまでは CP932 が
+/// `from_utf8_lossy` で置換文字へ潰れていて偶然 3 バイト境界に乗っていた）。
+/// `str::floor_char_boundary` は unstable なので自前で持つ
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -502,6 +531,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 述語を走らせるシェルの方言（#935）。
+    ///
+    /// **`true` / `false` / `pwd` をリテラルで書かない**: PowerShell に `true` /
+    /// `false` は無く（実機実測: `The term 'true' is not recognized` で exit 1）、
+    /// `pwd` は表として整形されてパスが切られる。境界が実際に起こすシェルへ
+    /// 合わせた形を `ShellDialect` から作れば、判定の意図（0 で終わる / 非 0 で
+    /// 終わる / cwd を出す）だけをテストに残せる
+    fn dialect() -> tako_core::platform::shell_dialect::ShellDialect {
+        tako_core::platform::shell::script_dialect()
+    }
+
+    /// 述語 1 本ぶんの JSON（コマンド文字列は引用符を含むので必ず serde で符号化する）
+    fn command_criterion(id: &str, cmd: &str) -> serde_json::Value {
+        json!({ "id": id, "kind": { "type": "command", "cmd": cmd } })
     }
 
     #[test]
@@ -549,29 +594,75 @@ mod tests {
 
     #[test]
     fn execute_command_true_false() {
-        let r = execute_command("true", true, None);
-        assert!(r.passed);
-        assert!(r.evidence.contains("exit 0"));
+        let d = dialect();
+        let r = execute_command(&d.exit_status(0), true, None);
+        assert!(r.passed, "evidence: {}", r.evidence);
+        assert!(r.evidence.contains("exit 0"), "evidence: {}", r.evidence);
 
-        let r = execute_command("false", true, None);
-        assert!(!r.passed);
-        assert!(r.evidence.contains("exit 1"));
+        let r = execute_command(&d.exit_status(1), true, None);
+        assert!(!r.passed, "evidence: {}", r.evidence);
+        assert!(r.evidence.contains("exit 1"), "evidence: {}", r.evidence);
+    }
+
+    /// 非 0 の終了コードが**そのまま**取れる（1 へ丸められない）。
+    ///
+    /// Windows は `-EncodedCommand` の終了コードが `$LASTEXITCODE` を素通ししない
+    /// （実機実測: `cmd /c exit 7` が親から見て 1）ので、明示 `exit` を外すと
+    /// 「どの値で落ちたか」が evidence から消える（#935）
+    #[test]
+    fn execute_command_は実際の終了コードをevidenceへ残す() {
+        let r = execute_command(&dialect().exit_status(7), true, None);
+        assert!(!r.passed, "evidence: {}", r.evidence);
+        assert!(r.evidence.contains("exit 7"), "evidence: {}", r.evidence);
     }
 
     #[test]
     fn execute_command_with_output() {
-        let r = execute_command("echo hello", true, None);
-        assert!(r.passed);
-        assert!(r.evidence.contains("hello"));
+        let r = execute_command(&dialect().echo("hello"), true, None);
+        assert!(r.passed, "evidence: {}", r.evidence);
+        assert!(r.evidence.contains("hello"), "evidence: {}", r.evidence);
     }
 
     #[test]
     fn execute_command_with_cwd() {
-        let r = execute_command("pwd", true, Some("/tmp"));
-        assert!(r.passed);
+        // 実在する一時ディレクトリで測る（`/tmp` は Windows に無い）。突き合わせは
+        // **末尾の要素**で行う: macOS の `/var/folders/…` は `/private` 付きへ
+        // 解決されうるので、フルパスの一致は経路によって崩れる
+        let dir = temp_dir("cwd");
+        let leaf = dir
+            .file_name()
+            .expect("一時ディレクトリ名")
+            .to_string_lossy()
+            .to_string();
+
+        let r = execute_command(&dialect().print_cwd(), true, dir.to_str());
+        assert!(r.passed, "evidence: {}", r.evidence);
         assert!(
-            r.evidence.contains("/tmp") || r.evidence.contains("/private/tmp"),
+            r.evidence.contains(&leaf),
+            "cwd が反映されていない（leaf={leaf}）: {}",
+            r.evidence
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非 ASCII の出力が evidence で読める形で返る（#935）。
+    ///
+    /// Windows の PowerShell 5.1 はパイプ相手へ既定のコードページ（日本語環境では
+    /// CP932）で書くため、UTF-8 として不正なバイト列になり `from_utf8_lossy` が
+    /// 置換文字へ潰す。**失敗したゲートの理由を読むのが evidence の目的**なので、
+    /// ここが化けると機能の半分が死ぬ
+    #[test]
+    fn execute_command_は非asciiの出力を化けさせない() {
+        let r = execute_command(&dialect().echo("検証テスト"), true, None);
+        assert!(r.passed, "evidence: {}", r.evidence);
+        assert!(
+            r.evidence.contains("検証テスト"),
             "evidence: {}",
+            r.evidence
+        );
+        assert!(
+            !r.evidence.contains('\u{fffd}'),
+            "置換文字が混ざった（符号化が合っていない）: {}",
             r.evidence
         );
     }
@@ -581,15 +672,17 @@ mod tests {
         let dir = temp_dir("check-cmd");
         let path = dir.join("acceptance_gates.yaml");
 
-        let criteria = r#"[
-            {"id": "pass", "kind": {"type": "command", "cmd": "echo ok"}},
-            {"id": "fail", "kind": {"type": "command", "cmd": "false"}}
-        ]"#;
-        set_gate_payload_at(&path, "task-1", criteria, None).unwrap();
+        let d = dialect();
+        let criteria = json!([
+            command_criterion("pass", &d.echo("ok")),
+            command_criterion("fail", &d.exit_status(1)),
+        ])
+        .to_string();
+        set_gate_payload_at(&path, "task-1", &criteria, None).unwrap();
 
         let result = execute_gate_check_at(&path, "task-1", false).unwrap();
-        assert_eq!(result["criteria"][0]["status"], "passed");
-        assert_eq!(result["criteria"][1]["status"], "failed");
+        assert_eq!(result["criteria"][0]["status"], "passed", "{result:#}");
+        assert_eq!(result["criteria"][1]["status"], "failed", "{result:#}");
         assert_eq!(result["overall"], "failed");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -599,15 +692,16 @@ mod tests {
         let dir = temp_dir("check-custom");
         let path = dir.join("acceptance_gates.yaml");
 
-        let criteria = r#"[
-            {"id": "auto", "kind": {"type": "command", "cmd": "true"}},
-            {"id": "manual", "kind": {"type": "custom", "description": "check manually"}}
-        ]"#;
-        set_gate_payload_at(&path, "task-1", criteria, None).unwrap();
+        let criteria = json!([
+            command_criterion("auto", &dialect().exit_status(0)),
+            {"id": "manual", "kind": {"type": "custom", "description": "check manually"}},
+        ])
+        .to_string();
+        set_gate_payload_at(&path, "task-1", &criteria, None).unwrap();
 
         let result = execute_gate_check_at(&path, "task-1", false).unwrap();
-        assert_eq!(result["criteria"][0]["status"], "passed");
-        assert_eq!(result["criteria"][1]["status"], "pending");
+        assert_eq!(result["criteria"][0]["status"], "passed", "{result:#}");
+        assert_eq!(result["criteria"][1]["status"], "pending", "{result:#}");
         assert_eq!(result["overall"], "pending");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -644,6 +738,31 @@ mod tests {
         let evidence = format_evidence(0, &stdout, "");
         assert!(evidence.len() <= 2100);
         assert!(evidence.contains("truncated") || evidence.contains("last 5/"));
+    }
+
+    /// 上限での切り詰めが**マルチバイト文字の途中で panic しない**（#935）。
+    ///
+    /// 素の `&joined[..2000]` は境界を外れると panic する。述語の出力は任意なので
+    /// 日本語が来うるし、Windows の出力を UTF-8 へ揃えた（#935）ことで
+    /// **正しい多バイト列が届くようになった**ぶん現実的な経路になった
+    #[test]
+    fn format_evidence_は多バイト文字の途中で切らない() {
+        // 上限をまたぐ位置に 3 バイト文字が並ぶよう、境界を 1 バイトずつ動かして総当たり
+        for pad in 0..8 {
+            let stdout = format!("{}{}", "x".repeat(pad), "あ".repeat(1200));
+            let evidence = format_evidence(0, &stdout, "");
+            assert!(
+                evidence.ends_with("...(truncated)"),
+                "pad={pad} で切り詰めが起きていない"
+            );
+            // 切り詰めた本文が壊れていない（置換文字が混ざらない）
+            assert!(
+                !evidence.contains('\u{fffd}'),
+                "pad={pad} で文字が壊れた: {}",
+                &evidence[..40.min(evidence.len())]
+            );
+            assert!(evidence.len() <= EVIDENCE_MAX_BYTES + 32, "pad={pad}");
+        }
     }
 
     #[test]

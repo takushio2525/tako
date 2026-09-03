@@ -164,12 +164,6 @@ pub mod notes {
         "AI naming works, but without shell integration (#525) a tab's inputs (cwd, title, command state) never change after startup, so each tab is named only once. Without claude installed the tab name becomes the PowerShell executable path (#760)",
     );
 
-    /// #935。登録と表示は動き、実行だけが落ちる
-    pub const WIN_GATE_CHECK_SH: Note = Note::new(
-        "ゲートの登録と表示は動くが、コマンド型ゲートの実行が sh -c 決め打ちのため Windows では判定できない（#935）",
-        "Registering and showing gates works, but command gates run through a hardcoded sh -c, so they cannot be evaluated on Windows (#935)",
-    );
-
     /// #936。PATH 上の探索（#898 で境界へ寄せた）は動くが、実行中プロセスを特定できない
     pub const WIN_STALE_BINARY_PID: Note = Note::new(
         "PATH 上の claude の実在確認は動くが、実行中の claude のパスを解決できないため古いバイナリの警告が出ない（#936 / #726）",
@@ -1513,17 +1507,15 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::UnitTest(
-            "acceptance_gates のゲート登録テストが実機で緑（落ちているのは execute_command の 5 件だけ）",
+            "acceptance_gates の 14 テストが実機で緑（#935 でコマンド型述語の実行も通るようになった）",
         ),
     },
     Feature {
         key: "tako_task_gate_check",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_GATE_CHECK_SH,
-        },
-        windows_evidence: Evidence::UnitTest(
-            "実機の cargo test で execute_command 系 5 件が失敗（sh 不在）。PR / custom ゲートの判定は動く",
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#935 の Windows 11 実測: `tako task gate check` が 4 形（exit 0 / exit 1 / cwd 指定 / 出力取得）とも判定し、`cmd /c exit 7` は evidence が `exit 7`（値が丸まらない）・非 ASCII の出力も化けない。`TAKO_935_LEGACY=1` では 4 形すべてが「コマンド実行に失敗: program not found」",
         ),
     },
     Feature {

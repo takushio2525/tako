@@ -637,6 +637,113 @@ fn コマンド解決のwhich直起動が境界の外に残っていない() {
     );
 }
 
+/// **#935 の番犬**: 「1 本の文字列としてのシェル片」を子プロセスで走らせる形が、
+/// 抽象境界 B1（`tako_core::platform::shell::output_command`）の外で
+/// **POSIX シェルを直起動する形**に戻っていないこと。
+///
+/// この直呼びは Windows で `CreateProcess` が失敗するだけなので、「機能が無い」ではなく
+/// **「常に失敗する」**形で現れる。受け入れゲート（#244）のコマンド型述語は
+/// `Command::new("sh").args(["-c", cmd])` だったため、Windows ではどの述語も
+/// 「コマンド実行に失敗」で判定不能だった（#935）。
+///
+/// #898 の番犬（`which` / `where` = **Windows に無いコマンド**を起こす形）や
+/// #722 の番犬（`$SHELL -l -c` = **Windows に無いシェルへ問い合わせる**形）とは
+/// 形が違うので別に見る。こちらは「シェル片を走らせたい」意図そのもので、
+/// 直し方が「境界に方言を選ばせる」になる。
+///
+/// 許可リストは**空**。境界の実装は argv（`SpawnCommand`）の program 変数から
+/// `Command` を組むので、POSIX シェルの名前をリテラルで書く場所は production に無い
+#[test]
+fn シェル片の子プロセス実行がposixシェルの直起動へ戻っていない() {
+    const PATTERNS: &[&str] = &[
+        "Command::new(\"sh\")",
+        "Command::new(\"/bin/sh\")",
+        "Command::new(\"bash\")",
+        "Command::new(\"/bin/bash\")",
+        "Command::new(\"zsh\")",
+        "Command::new(\"/bin/zsh\")",
+    ];
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for crate_dir in ["tako-core", "tako-control", "tako-app", "tako-cli"] {
+        collect_production_calls(
+            &root.join("crates").join(crate_dir).join("src"),
+            &root,
+            PATTERNS,
+            &mut offenders,
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "POSIX シェルの直起動が境界の外にある:\n  {}\n\
+         → tako_core::platform::shell::output_command を通してください（#935 / 設計 §2 の B1）",
+        offenders.join("\n  ")
+    );
+
+    // 走査範囲が空になっていないこと（#935 が対象にしていた 2 ファイルが production 側に
+    // 残っているか）。ファイル移動・改名で黙って空振りするのを防ぐ
+    for (rel, needle) in [
+        (
+            "crates/tako-control/src/acceptance_gates.rs",
+            "fn execute_command",
+        ),
+        (
+            "crates/tako-core/src/platform/shell.rs",
+            "fn output_command",
+        ),
+    ] {
+        let src = std::fs::read_to_string(root.join(rel)).expect("走査対象を読める");
+        assert!(
+            production_region(&src).contains(needle),
+            "{rel} の production 側に {needle} が無い: 走査先が間違っている"
+        );
+    }
+}
+
+/// ソースの「テストより前」= production 部分。
+///
+/// `#[cfg(test)]` より後ろは対象外にする（テストは意図的に POSIX 限定のシェルを
+/// 起こすものがある: シェル関数との一致検査・macOS 専用のモックテスト・tmux の e2e）
+fn production_region(src: &str) -> &str {
+    src.split_once("#[cfg(test)]").map_or(src, |(head, _)| head)
+}
+
+/// production 部分だけを走査してパターンに当たる行を集める（コメント行は無視）
+fn collect_production_calls(dir: &Path, root: &Path, patterns: &[&str], out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_production_calls(&path, root, patterns, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // 報告文は `/` 区切りへ正規化する（Windows の `strip_prefix` は `\` を返す）
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        for (idx, line) in production_region(&text).lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if patterns.iter().any(|p| line.contains(p)) {
+                out.push(format!("{rel}:{}: {}", idx + 1, line.trim()));
+            }
+        }
+    }
+}
+
 /// **#628 の番犬**: コンソールウィンドウ抑止（`platform::process::no_console_window`）を
 /// 通していない子プロセス起動が、いま把握している数より増えていないこと。
 ///
