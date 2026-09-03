@@ -250,7 +250,9 @@ function DirList({ dir, root, path }) {
   const [showHidden, setShowHidden] = useState(false);
   const all = dir.entries || [];
   const entries = showHidden ? all : all.filter(e => !e.hidden);
-  const hiddenCount = all.length - entries.length;
+  // 表示状態と無関係に数える（`all.length - entries.length` だと表示 ON のとき 0 になり、
+  // トグルのボタンごと消えて**元に戻せなくなる**）
+  const hiddenCount = all.filter(e => e.hidden).length;
 
   return (
     <div class="card-list" style="padding-top: 12px;">
