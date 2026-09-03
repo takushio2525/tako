@@ -183,11 +183,9 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // **シェル統合の置き場（ZDOTDIR 等）もここに含める**（#1105）: 含めないと、同じ
     // socket 名に別インスタンスのサーバーが残っているときに前のインスタンスの
     // 置き場を指し、OSC 7 / 133 が一切届かなくなる（cwd 追従とコマンド状態が黙って死ぬ）
-    for (key, val) in &options.env {
-        if crate::backend::session_pinned_env(key) {
-            args.push("-e".to_string());
-            args.push(format!("{key}={val}"));
-        }
+    for (key, val) in crate::backend::session_pinned_pairs(&options.env) {
+        args.push("-e".to_string());
+        args.push(format!("{key}={val}"));
     }
     if let Some(cwd) = &options.cwd {
         args.push("-c".to_string());
@@ -742,8 +740,20 @@ mod tests {
         let wrapped = wrap_options(SpawnOptions::default(), "tako-test", "tako-x");
         let command = wrapped.command.unwrap();
         // コマンドを渡さない（zsh -c ラッパーがシェル統合の ZDOTDIR を消費するのを
-        // 避け、tmux がログインシェルを直接 spawn する経路に乗せる）
-        assert_eq!(command.args.last().unwrap(), "tako-x");
+        // 避け、tmux がログインシェルを直接 spawn する経路に乗せる）。
+        // #1105 でセッション名の後ろに `-e` 対が並ぶようになったので、
+        // 「最後の語」ではなく「セッション名の後は `-e` 対だけ」を見る
+        let s_at = command
+            .args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("-s が要る");
+        assert_eq!(command.args[s_at + 1], "tako-x");
+        let tail = &command.args[s_at + 2..];
+        assert!(
+            tail.chunks(2).all(|c| c.len() == 2 && c[0] == "-e"),
+            "セッション名の後に内側コマンドが足されている: {tail:?}"
+        );
     }
 
     /// Issue #113 回帰: 「detached だが直近までアクティブ」なセッション（多重起動事故で

@@ -152,6 +152,34 @@ pub fn session_pinned_env(key: &str) -> bool {
     PANE_SCOPED_ENV.contains(&key) || crate::shell_integration::INJECTED_KEYS.contains(&key)
 }
 
+/// 器のセッション作成時に `-e` で固定する `(key, value)` の一覧。
+///
+/// 材料は 2 つある:
+///
+/// 1. `options.env` のうち [`session_pinned_env`] に載っているぶん（pane / tab の ID と
+///    #766 の側路の書き先）
+/// 2. **シェル統合が撒く env**（`ZDOTDIR` 等）。これは `options.env` には載らない:
+///    [`crate::TerminalSession::spawn`] が**外側 PTY**（= 器のクライアントプロセス）の
+///    env へ足す形なので、器の中のシェルへはサーバー継承でしか届いていなかった。
+///    サーバーの環境は最初のクライアントからの継承なので、同じ socket 名に別
+///    インスタンスのサーバーが残っていると前のインスタンスの置き場を指す（#1105）
+///
+/// 衝突したら `options.env`（呼び出し側の明示）が勝つ
+pub fn session_pinned_pairs(options_env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = options_env
+        .iter()
+        .filter(|(key, _)| session_pinned_env(key))
+        .cloned()
+        .collect();
+    for (key, val) in crate::shell_integration::env() {
+        if out.iter().any(|(k, _)| k == key) {
+            continue;
+        }
+        out.push((key.clone(), val.clone()));
+    }
+    out
+}
+
 /// バックエンドの能力。
 ///
 /// **bool の集合であって `enum Backend { Tmux, None }` ではない**のが重要。
@@ -909,6 +937,28 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// #1105: シェル統合の `-e` は data dir 依存（インスタンスごとに変わる）ので
+/// argv のスナップショットへ literal で書けない。**位置と有無だけ固定**し、
+/// 値そのものは統合の正本と突き合わせる（`統合の値が固定される`）。
+/// 統合が env を撒かない環境（Windows）では何も除かない
+#[cfg(test)]
+pub(crate) fn strip_integration_env(args: &mut Vec<String>) -> Vec<String> {
+    let mut removed = Vec::new();
+    for (key, _) in crate::shell_integration::env() {
+        let Some(at) = args
+            .iter()
+            .position(|a| a.starts_with(&format!("{key}=")))
+            .filter(|at| *at > 0 && args[at - 1] == "-e")
+        else {
+            continue;
+        };
+        removed.push(args.remove(at));
+        args.remove(at - 1);
+    }
+    removed.sort();
+    removed
+}
+
 #[cfg(test)]
 mod pane_scoped_env_tests {
     use super::*;
@@ -941,6 +991,47 @@ mod pane_scoped_env_tests {
         assert!(!session_pinned_env("HOME"));
     }
 
+    /// #1105 の要点は**キー名の表**ではなく「実際に値が `-e` へ載るか」。
+    /// 統合の env は `options.env` に載らない（外側 PTY の env へ足される）ので、
+    /// 表だけ足して `options.env` を舐めるだけの実装では 1 つも固定されない
+    /// （実測: `zdotdir_session=None` のまま項目 60 が落ちた）
+    #[test]
+    fn 固定する値は統合の正本から取る() {
+        let options_env = vec![
+            ("TAKO_PANE_ID".to_string(), "7".to_string()),
+            ("PATH".to_string(), "/nope".to_string()),
+        ];
+        let pinned = session_pinned_pairs(&options_env);
+        assert!(pinned.iter().any(|(k, v)| k == "TAKO_PANE_ID" && v == "7"));
+        assert!(
+            !pinned.iter().any(|(k, _)| k == "PATH"),
+            "無関係なキーは固定しない"
+        );
+        // 統合が env を撒く環境（POSIX）では、その値が options.env 抜きでも載る
+        for (key, val) in crate::shell_integration::env() {
+            assert!(
+                pinned.iter().any(|(k, v)| k == key && v == val),
+                "{key} が統合の正本から固定されていない（#1105）"
+            );
+        }
+    }
+
+    /// 呼び出し側の明示（`options.env`）が統合の既定に勝つ
+    #[test]
+    fn options_envの明示が統合の値に勝つ() {
+        let Some((key, _)) = crate::shell_integration::env().first().cloned() else {
+            return; // 統合が env を撒かない環境（Windows）
+        };
+        let options_env = vec![(key.clone(), "明示".to_string())];
+        let pinned = session_pinned_pairs(&options_env);
+        assert_eq!(
+            pinned.iter().filter(|(k, _)| *k == key).count(),
+            1,
+            "同じキーが二重に載らない"
+        );
+        assert!(pinned.iter().any(|(k, v)| *k == key && v == "明示"));
+    }
+
     /// 表を引く側が tmux / psmux の両方であること（片方だけ足すと
     /// 「tmux では効くが psmux では効かない」という追いにくい差になる）
     #[test]
@@ -950,8 +1041,9 @@ mod pane_scoped_env_tests {
             ("backend/psmux.rs", include_str!("psmux.rs")),
         ] {
             assert!(
-                src.contains("session_pinned_env("),
-                "{name} が session_pinned_env を引いていない（キーの直書きへ戻っている）"
+                src.contains("session_pinned_pairs("),
+                "{name} が session_pinned_pairs を引いていない（キーの直書き、または \
+                 `options.env` だけを舐める形へ戻っている = #1105 が再発する）"
             );
             assert!(
                 !src.contains(r#"key == "TAKO_PANE_ID""#),

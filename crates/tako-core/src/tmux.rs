@@ -235,6 +235,19 @@ pub fn show_environment(socket: Option<&str>, session: Option<&str>, name: &str)
         .map(|v| v.to_string())
 }
 
+/// 器のサーバーが持つグローバルオプションの値（診断用。#1105）。
+///
+/// tako の conf は `-f` = **サーバー起動時にしか読まれない**ので、tako が立てて
+/// いないサーバー（ユーザーが手で立てた / 古い tako が残した / 検証用のもの）へ
+/// `new-session -A` で相乗りすると `allow-passthrough` 等が既定のままになり、
+/// OSC 7 / 133 が黙って捨てられる。「何が無いか」を言うための窓口
+pub fn show_option(socket: Option<&str>, name: &str) -> Option<String> {
+    let out = run_tmux(socket, &["show-options", "-g", name]).ok()?;
+    out.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .map(|v| v.trim().to_string())
+}
+
 pub fn has_session(socket: Option<&str>, name: &str) -> bool {
     run_tmux(socket, &["has-session", "-t", &exact_target(name)]).is_ok()
 }

@@ -38038,14 +38038,9 @@ mod self_test {
                     //
                     // この項目は「器の中のシェルがシェル統合を読み込んで OSC 7 を出し、
                     // それが器のパススルーで外の tako へ届く」の全段が要る。落ちる原因は
-                    // 段ごとに違うので、材料をそのまま出す:
-                    //   - 器の label / `osc_passthrough`: そもそも素通しする器か
-                    //   - `zdotdir_session`: `-e` でセッションへ固定できた値（#1105 の対策）
-                    //   - `zdotdir_server`: 器のサーバーが**最初のクライアントから継承**した値。
-                    //     これが `expected` と違うのは「同じ socket 名に別インスタンスの
-                    //     サーバーが残っている」= #1105 が起きる条件そのもの
-                    //   - `server_preexisting`: この run がサーバーを立てたのか相乗りしたのか
-                    //   - socket 名 / 待った時間 / load: 環境要因の切り分け（#796）
+                    // 段ごとに違うので、材料をそのまま出す。
+                    // **行は `join` で組む**: 文字列リテラルの行継続は `cargo fmt` が
+                    // 1 行へ潰して空白の塊にするので、log が読めなくなる
                     let osc60_expected = tako_core::shell_integration::env()
                         .iter()
                         .find(|(k, _)| k == "ZDOTDIR")
@@ -38057,38 +38052,74 @@ mod self_test {
                     );
                     let osc60_server =
                         tako_core::tmux::show_environment(Some(&backend_sock), None, "ZDOTDIR");
+                    // 器のサーバーが実際に持っている素通し設定。tako の conf は `-f` =
+                    // **サーバー起動時にしか読まれない**ので、tako が立てていない
+                    // サーバーへ `new-session -A` で相乗りすると既定（off）のままになる
+                    let osc60_server_pt =
+                        tako_core::tmux::show_option(Some(&backend_sock), "allow-passthrough");
+                    // サーバーが**別インスタンスのシェル統合**を指しているか
+                    // （= 同じ socket 名を使い回した残骸。#1105 が起きる条件そのもの）
                     let osc60_stale = osc60_server.is_some() && osc60_server != osc60_expected;
-                    println!(
-                        "TAKO_SELF_TEST_60: cwd_ok={cwd_ok} backend={} passthrough={}                          socket={backend_sock} session={backend_name}                          zdotdir_expected={osc60_expected:?} zdotdir_session={osc60_session:?}                          zdotdir_server={osc60_server:?} server_stale={osc60_stale}                          waited_ms={} pane_cwd={:?} {}",
-                        tako_core::backend::capabilities().label,
-                        tako_core::backend::capabilities().osc_passthrough,
-                        20 * 500,
-                        window
-                            .update(cx, |app, _, _| app
-                                .terminals
+                    let osc60_pane_cwd = window
+                        .update(cx, |app, _, _| {
+                            app.terminals
                                 .get(&backend_pane)
                                 .and_then(|s| s.cwd())
-                                .map(|p| p.display().to_string()))
-                            .ok()
-                            .flatten(),
-                        env_line(),
+                                .map(|p| p.display().to_string())
+                        })
+                        .ok()
+                        .flatten();
+                    let caps60 = tako_core::backend::capabilities();
+                    println!(
+                        "TAKO_SELF_TEST_60: {}",
+                        [
+                            format!("cwd_ok={cwd_ok}"),
+                            format!("backend={}", caps60.label),
+                            format!("declares_passthrough={}", caps60.osc_passthrough),
+                            format!("server_passthrough={osc60_server_pt:?}"),
+                            format!("socket={backend_sock}"),
+                            format!("session={backend_name}"),
+                            format!("zdotdir_expected={osc60_expected:?}"),
+                            format!("zdotdir_session={osc60_session:?}"),
+                            format!("zdotdir_server={osc60_server:?}"),
+                            format!("server_stale={osc60_stale}"),
+                            format!("waited_ms={}", 20 * 500),
+                            format!("pane_cwd={osc60_pane_cwd:?}"),
+                            env_line(),
+                        ]
+                        .join(" ")
                     );
                     if !cwd_ok {
-                        // 原因を名指しできるときは check 名の前に出す（後から log を
-                        // 読んだ人が「環境の残骸」と「製品の回帰」を混ぜないように）
-                        if osc60_stale {
-                            println!(
-                                "TAKO_SELF_TEST_60_WHY: 器のサーバーが別インスタンスの                                  シェル統合を指している（socket={backend_sock} を使い回した                                  残骸。`tmux -L {backend_sock} kill-server` で消えるが、                                 セッションへの固定が効いていれば本来これでも通る = #1105 の回帰）"
-                            );
-                        } else if osc60_session.as_deref() != osc60_expected.as_deref() {
-                            println!(
-                                "TAKO_SELF_TEST_60_WHY: シェル統合の置き場がセッションへ                                  固定されていない（`backend::session_pinned_env` が                                  ZDOTDIR を落としている = #1105 の回帰）"
-                            );
+                        // 原因を名指しする（後から log を読んだ人が「環境の残骸」と
+                        // 「製品の回帰」を混ぜないように）。順序は「確定できるものから」
+                        let why = if osc60_server_pt.as_deref() == Some("off") {
+                            format!(
+                                "器のサーバーが tako の conf を読んでいない（allow-passthrough off）。\
+                                 conf は `-f` = サーバー起動時にしか読まれないので、tako が立てて\
+                                 いないサーバー（手で立てた / 検証用 / 古い tako の残骸）へ相乗りすると\
+                                 OSC が捨てられる。`tmux -L {backend_sock} kill-server` してから\
+                                 測り直すこと（製品の回帰ではない）"
+                            )
+                        } else if osc60_session.is_some() && osc60_session != osc60_expected {
+                            "シェル統合の置き場がセッションへ固定されていない\
+                             （`backend::session_pinned_pairs` が ZDOTDIR を落としている = #1105 の回帰）"
+                                .to_string()
+                        } else if osc60_session.is_none() {
+                            "シェル統合の置き場がセッションへ 1 つも固定されていない\
+                             （器が `session_pinned_pairs` を引いていない = #1105 の回帰）"
+                                .to_string()
+                        } else if osc60_stale {
+                            format!(
+                                "置き場は固定できているのに届かない。サーバーは別インスタンスの\
+                                 統合を指している（socket={backend_sock} の使い回し）ので、\
+                                 残骸を消して測り直すと切り分けられる"
+                            )
                         } else {
-                            println!(
-                                "TAKO_SELF_TEST_60_WHY: 統合の置き場は正しく固定されている。                                 疑うのは器のパススルー設定（allow-passthrough）か                                  シェル側の OSC 7 送出"
-                            );
-                        }
+                            "統合の置き場も素通し設定も正しい。疑うのはシェル側の OSC 7 送出か\
+                             パススルーの包み直し（`zshenv.zsh`）"
+                                .to_string()
+                        };
+                        println!("TAKO_SELF_TEST_60_WHY: {why}");
                     }
                     check(cwd_ok, "OSC 7 が器のパススルーで届く（cwd 検知維持）");
                 } else {
@@ -38360,33 +38391,44 @@ mod self_test {
                 // ③tako が tty 突き合わせでタブ枠へ紐付けた の 3 段で、段ごとに原因が違う
                 let att_sessions = tako_core::tmux::list_sessions(Some(&backend_sock));
                 let att_present = att_sessions.iter().find(|s| s.name == att_name);
-                println!(
-                    "TAKO_SELF_TEST_61F: attached_ok={attached_ok} session={att_name} \
-                     created={} attached={:?} client_ttys={:?} \
-                     sessions_on_socket={:?} unlisted={:?} waited_ms={} {}",
-                    att_present.is_some(),
-                    att_present.map(|s| s.attached),
-                    att_present.map(|s| s.client_ttys.clone()),
-                    att_sessions.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-                    window
-                        .update(cx, |app, _, _| app
-                            .tmux_unlisted_sessions()
+                let att_unlisted = window
+                    .update(cx, |app, _, _| {
+                        app.tmux_unlisted_sessions()
                             .iter()
                             .map(|s| s.name.clone())
-                            .collect::<Vec<_>>())
-                        .unwrap_or_default(),
-                    20 * 500,
-                    env_line(),
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_61F: {}",
+                    [
+                        format!("attached_ok={attached_ok}"),
+                        format!("session={att_name}"),
+                        format!("created={}", att_present.is_some()),
+                        format!("attached={:?}", att_present.map(|s| s.attached)),
+                        format!(
+                            "client_ttys={:?}",
+                            att_present.map(|s| s.client_ttys.clone())
+                        ),
+                        format!(
+                            "sessions_on_socket={:?}",
+                            att_sessions.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+                        ),
+                        format!("unlisted={att_unlisted:?}"),
+                        format!("waited_ms={}", 20 * 500),
+                        env_line(),
+                    ]
+                    .join(" ")
                 );
                 if !attached_ok {
                     let why = match att_present {
-                        None => "外部セッションが作れていない（`new-session -d` が失敗。\
-                                 同名の残骸があると `duplicate session` で短絡する）",
+                        None => "外部セッションが作れていない（`new-session -d` が失敗。                                 同名の残骸があると `duplicate session` で短絡し attach まで届かない）",
                         Some(s) if !s.attached => {
                             "セッションは在るが attach されていない（`&&` の後段が走っていない）"
                         }
-                        Some(_) => "attach 済みだが tako がタブ枠へ紐付けていない\
-                                    （tty 突き合わせ = FR-2.16.9 の回帰の疑い）",
+                        Some(_) => {
+                            "attach 済みだが tako がタブ枠へ紐付けていない                             （tty 突き合わせ = FR-2.16.9 の回帰の疑い）"
+                        }
                     };
                     println!("TAKO_SELF_TEST_61F_WHY: {why}");
                 }

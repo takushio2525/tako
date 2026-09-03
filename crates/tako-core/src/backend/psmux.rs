@@ -252,11 +252,9 @@ impl SessionBackend for PsmuxBackend {
         ]);
         // ペイン固有の環境変数はセッション作成時に確定させる（tmux 版と同じ理由。
         // サーバーのグローバル環境から stale な値を拾わせない）
-        for (key, val) in &options.env {
-            if crate::backend::session_pinned_env(key) {
-                args.push("-e".to_string());
-                args.push(format!("{key}={val}"));
-            }
+        for (key, val) in crate::backend::session_pinned_pairs(&options.env) {
+            args.push("-e".to_string());
+            args.push(format!("{key}={val}"));
         }
         if let Some(cwd) = &options.cwd {
             args.push("-c".to_string());
@@ -1104,6 +1102,18 @@ mod tests {
         } else {
             args.splice(3..3, ["-f".to_string(), "<conf>".to_string()]);
         }
+        // #1105: シェル統合の `-e` は値が data dir 依存なので外して別途見る
+        // （Windows は統合が env を撒かないので空になる）
+        let integration = crate::backend::strip_integration_env(&mut args);
+        let mut expected_integration: Vec<String> = crate::shell_integration::env()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        expected_integration.sort();
+        assert_eq!(
+            integration, expected_integration,
+            "シェル統合の置き場がセッションへ固定されていない（#1105）"
+        );
         assert_eq!(
             args,
             vec![
