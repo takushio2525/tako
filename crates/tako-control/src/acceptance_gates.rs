@@ -514,7 +514,7 @@ mod tests {
     /// **`true` / `false` / `pwd` をリテラルで書かない**: PowerShell に `true` /
     /// `false` は無く（実機実測: `The term 'true' is not recognized` で exit 1）、
     /// `pwd` は表として整形されてパスが切られる。境界が実際に起こすシェルへ
-    /// 合わせた形を [`ShellDialect`] から作れば、判定の意図（0 で終わる / 非 0 で
+    /// 合わせた形を `ShellDialect` から作れば、判定の意図（0 で終わる / 非 0 で
     /// 終わる / cwd を出す）だけをテストに残せる
     fn dialect() -> tako_core::platform::shell_dialect::ShellDialect {
         tako_core::platform::shell::script_dialect()

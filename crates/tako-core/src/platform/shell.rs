@@ -435,11 +435,27 @@ fn powershell_output_argv(program: &str, script: &str) -> SpawnCommand {
 ///    `[Console]::OutputEncoding` の既定（日本語 Windows では CP932）で書くため、
 ///    ゲートの evidence が `from_utf8_lossy` で置換文字だらけになる
 ///    （実機実測: `日本語` が `93fa 967b 8cea` = UTF-8 として不正）。
-///    設定できない環境（コンソールを持たない等）では黙って既定のままにする
+///    設定できない環境（コンソールを持たない等）では黙って既定のままにする。
+///    **stdout / stderr の両方**に効き、`cmd` / `cargo` のような**ネイティブの子**の
+///    出力も UTF-8 になる（実機実測: 前置きなしの stderr は `8c9f 8fd8` = CP932、
+///    前置きありは `e6a49c e8a8bc` = 正しい UTF-8）
+/// 3. **進捗レコードを黙らせる**。stderr がリダイレクトされていると PowerShell 5.1 は
+///    進捗・情報・エラーの各レコードを **CLIXML でシリアライズして stderr へ書く**。
+///    既定では成功しただけで「モジュールを初めて使用するための準備」の進捗レコードが
+///    出るので、**どのゲートの evidence にも数百バイトの XML が混ざる**
+///    （実機実測: `$ProgressPreference` 未指定で stderr 400 バイト → 指定すると **0 バイト**）
+///
+/// **既知の限界**: 上の 3 でも消えないのは **cmdlet のエラーレコード**（実機実測:
+/// `Get-Item` の失敗が CLIXML 632 バイト）と `Write-Host` の情報レコード（1078 バイト）。
+/// 5.1 にこの直列化を止める手段は無い。判定そのものは終了コードで決まるので**合否は
+/// 正しい**が、evidence は読みにくくなる。ネイティブコマンド（`cargo` / `git` / `gh`）は
+/// 失敗時も stderr が素のテキストなので（実機実測: `cmd /c exit 7` で stderr 0 バイト・
+/// exit 7）、ゲートの述語は**ネイティブコマンドで書くのが望ましい**
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_output_script(command: &str) -> String {
     format!(
         "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ }}\n\
+         $ProgressPreference = 'SilentlyContinue'\n\
          {}exit $__tako_code\n",
         powershell_exit_code_script(command)
     )
@@ -786,6 +802,11 @@ mod tests {
         // 出力を UTF-8 で書かせる（CP932 だと evidence が置換文字へ潰れる）
         assert!(
             script.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"),
+            "{script}"
+        );
+        // 進捗レコードを黙らせる（既定では成功しただけで stderr へ CLIXML が出る）
+        assert!(
+            script.contains("$ProgressPreference = 'SilentlyContinue'"),
             "{script}"
         );
         // ペイン用の要素（マーカー行・入力待ち）は入らない

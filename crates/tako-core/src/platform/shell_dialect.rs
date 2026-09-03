@@ -244,14 +244,19 @@ impl ShellDialect {
 
     /// 現在のディレクトリを**そのまま 1 行**で出力する（#935）。
     ///
-    /// PowerShell の `pwd` は `Get-Location` のエイリアスで、返るのは文字列ではなく
-    /// `PathInfo` オブジェクトなので**表として整形され、パスがコンソール幅で切られる**
-    /// （実機実測: 15 バイトのはずのパスが表のヘッダ付きで途中まで出た）。
-    /// `$PWD.Path` を `Write-Host` で出せば素の 1 行になる
+    /// PowerShell 側で `pwd` を使わない理由が 2 つある（どちらも実機実測）:
+    ///
+    /// - `pwd` は `Get-Location` のエイリアスで、返るのは文字列ではなく `PathInfo`
+    ///   オブジェクトなので**表として整形され、パスがコンソール幅で切られる**
+    ///   （幅の狭い環境で 51 バイトのパスが `C:\Users\...` の 14 文字で途切れた）
+    /// - `Write-Host` ではなく `Write-Output` を使うのは、**stderr がリダイレクト
+    ///   されていると `Write-Host` の情報レコードが CLIXML で stderr へ出る**ため
+    ///   （実機実測: `Write-Output` は stderr 0 バイト / `Write-Host` は 1078 バイト）。
+    ///   `$PWD.Path` は `String` なので `Write-Output` でも素の 1 行になる
     pub fn print_cwd(self) -> String {
         match self {
             Self::Posix => "pwd".to_string(),
-            Self::PowerShell => "Write-Host $PWD.Path".to_string(),
+            Self::PowerShell => "Write-Output $PWD.Path".to_string(),
         }
     }
 
@@ -821,10 +826,15 @@ mod tests {
     #[test]
     fn 現在のディレクトリを1行で出す() {
         assert_eq!(POSIX.print_cwd(), "pwd");
-        assert_eq!(PS.print_cwd(), "Write-Host $PWD.Path");
+        assert_eq!(PS.print_cwd(), "Write-Output $PWD.Path");
         assert!(
             !PS.print_cwd().split_whitespace().any(|w| w == "pwd"),
             "PowerShell 側が pwd エイリアスへ戻っている"
+        );
+        // `Write-Host` は情報レコードが CLIXML で stderr へ出る（実機実測 1078 バイト）
+        assert!(
+            !PS.print_cwd().contains("Write-Host"),
+            "Write-Host へ戻っている（stderr が CLIXML で汚れる）"
         );
     }
 
