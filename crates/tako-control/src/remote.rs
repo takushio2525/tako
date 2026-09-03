@@ -3280,17 +3280,25 @@ fn extract_pane_target(path: &str) -> Option<String> {
 
 // --- dispatch 統合版ハンドラ（#281 H-7）---
 
-/// tako app へ IPC で 1 往復する（#1079: ファイル API がツリールートを問い合わせる経路）。
-/// 失敗したら接続を落として次回の再接続に任せる
+/// tako app へ IPC で 1 往復する（#1079: ファイル API が app へ問い合わせる経路）。
+///
+/// **届かなかったときだけ**接続を落として次回の再接続に任せる（#1084）。
+/// app が理由つきで断っただけで捨てると、`IPC_RECONNECT_INTERVAL`（5 秒）のあいだ
+/// ファイル API がまるごと 503 になる = **保存の競合 1 回で読み出しまで死ぬ**
+/// （実 SSH の通し検証で 7 連続 503 を実測）。書き込み経路では dispatch が
+/// 「競合」「プレビューでない」「保存できない」を日常的に返すので、
+/// #1078 が用意した種別つきの経路（`request_checked`）を通す
 fn app_request(
     app_conn: &Arc<RwLock<AppConnection>>,
     req: crate::protocol::Request,
 ) -> Result<Value, String> {
     let mut conn = app_conn.write().map_err(|_| "内部エラー".to_string())?;
     let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
-    match client.request(req) {
+    match client.request_checked(req) {
         Ok(v) => Ok(v),
-        Err(e) => {
+        // app が答えた = 接続は健全。理由だけ返す
+        Err(AppCallError::Rejected { message, .. }) => Err(message),
+        Err(AppCallError::Transport(e)) => {
             conn.invalidate();
             Err(e)
         }
@@ -3994,6 +4002,12 @@ fn required_role(method: &tiny_http::Method, path: &str) -> DeviceRole {
         if path == "/api/tabs" || (path.starts_with("/api/tabs/") && path.ends_with("/master")) {
             return DeviceRole::Manage;
         }
+        // #1084 / #1085: ファイル API の書き込み（保存 / 送り直し）は `/api/upload` と
+        // 同じ Interact。**パスを明示列挙**しているので、未知の `/api/files/*` の
+        // POST は下の Manage のまま安全側に残る（判定の正は remote_files 側）
+        if crate::remote_files::is_write_path(path) {
+            return DeviceRole::Interact;
+        }
         // 未知の POST は安全側（Manage）
         return DeviceRole::Manage;
     }
@@ -4569,9 +4583,12 @@ fn handle_api_v2_routes(
         (tiny_http::Method::Post, p) if p.starts_with("/api/tabs/") && p.ends_with("/master") => {
             handle_tab_master(request, ctx, device, app_conn, p)
         }
-        // #1079: ファイル API（一覧 / プレビュー / ダウンロード）。
-        // 実装は `remote_files` に閉じてあり、ここは受け渡しだけ
-        (tiny_http::Method::Get, p) if crate::remote_files::required_role_for(p).is_some() => {
+        // #1079: ファイル API（一覧 / プレビュー / ダウンロード）と
+        // #1084 / #1085 の書き込み（保存 / 送り直し）。実装は `remote_files` に
+        // 閉じてあり、ここは受け渡しだけ（メソッドの振り分けも向こう側）
+        (tiny_http::Method::Get | tiny_http::Method::Put | tiny_http::Method::Post, p)
+            if crate::remote_files::required_role_for(p).is_some() =>
+        {
             let deps = crate::remote_files::FilesDeps {
                 send: &|req| app_request(app_conn, req),
                 audit: &|event, extra| {
@@ -5615,6 +5632,90 @@ mod tests {
         assert_eq!(window_target_of("sess:0"), "sess:0");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dispatchが断っただけでipc接続を捨てない() {
+        // #1084 の実 SSH 検証で踏んだ回帰: 業務エラー（競合・プレビューでない・
+        // 保存できない）で `invalidate()` すると `IPC_RECONNECT_INTERVAL`（5 秒）の
+        // あいだファイル API がまるごと 503 になる。**保存の競合 1 回で読み出しまで死ぬ**。
+        // 種別つきの経路（#1078 の `request_checked`）を通していることを固定する
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1084-ipc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let sock = dir.join("app.sock");
+        // 前回の残骸があると bind が AlreadyExists で落ちる（UDS はファイル）
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("UDS");
+        // dispatch が理由つきで断る app を模す（2 回受ける）
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let body = serde_json::to_string(&crate::protocol::ResponseEnvelope::err(
+                    1,
+                    -32000,
+                    "ファイルが外部で変更されたため保存しなかった",
+                ))
+                .expect("JSON");
+                let mut w = stream;
+                let _ = writeln!(w, "{body}");
+            }
+        });
+
+        let client = AppIpcClient {
+            socket: sock.display().to_string(),
+            token: "t".into(),
+        };
+        match client.request_checked(crate::protocol::Request::List) {
+            Err(AppCallError::Rejected { message, .. }) => {
+                assert!(
+                    message.contains("外部で変更"),
+                    "理由がそのまま届く: {message}"
+                );
+            }
+            _ => panic!("app が答えた失敗として分類されない"),
+        }
+        // 同じ接続情報でもう一度通る（= 捨てる理由が無い）
+        assert!(
+            matches!(
+                client.request_checked(crate::protocol::Request::List),
+                Err(AppCallError::Rejected { .. })
+            ),
+            "2 回目も app の応答として届く"
+        );
+        let _ = server.join();
+
+        // 届かない相手は Transport（こちらは捨ててよい）
+        let dead = AppIpcClient {
+            socket: dir.join("nope.sock").display().to_string(),
+            token: "t".into(),
+        };
+        assert!(
+            matches!(
+                dead.request_checked(crate::protocol::Request::List),
+                Err(AppCallError::Transport(_))
+            ),
+            "接続できない相手は伝送エラー"
+        );
+
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ配下以外は消さない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn required_roleは操作種別ごとに正しいroleを要求する() {
         use tiny_http::Method;
@@ -5709,6 +5810,20 @@ mod tests {
         // 未知の POST は従来どおり安全側（Manage）。ファイル API のパスでも変わらない
         assert_eq!(
             required_role(&Method::Post, "/api/files"),
+            DeviceRole::Manage
+        );
+        // #1084 / #1085: 書き込み（保存 / 送り直し）は `/api/upload` と同じ Interact
+        assert_eq!(
+            required_role(&Method::Put, "/api/files/content"),
+            DeviceRole::Interact
+        );
+        assert_eq!(
+            required_role(&Method::Post, "/api/files/push"),
+            DeviceRole::Interact
+        );
+        // 明示列挙なので、未知の `/api/files/*` の POST は Manage のまま残る
+        assert_eq!(
+            required_role(&Method::Post, "/api/files/wipe"),
             DeviceRole::Manage
         );
         assert_eq!(

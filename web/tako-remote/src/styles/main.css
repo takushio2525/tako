@@ -1380,3 +1380,52 @@ body {
   color: var(--fg2); cursor: pointer; transition: background .12s;
 }
 .files-entry-btn:active { background: var(--panel3); }
+
+/* --- 編集モードと SSH 先の見せ方（#1084 / #1085） --- */
+
+/* 注意 / 失敗 / 成功の色分け（理由と次の一手を並べて出す） */
+.file-notice {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.file-notice.warn { border-color: var(--amber); color: var(--fg); }
+.file-notice.error { border-color: var(--red); color: var(--fg); }
+.file-notice.ok { border-color: var(--green); color: var(--fg2); }
+
+/* 注意の中に置く小さな操作（送り直す / 読み直す） */
+.file-inline-btn {
+  margin-left: auto; flex: none;
+  font-size: 12px; padding: 6px 12px; min-height: 32px;
+}
+
+/* SSH 先 / 読み取り専用のバッジ（Mac のツリーの行末バッジと同じ言い方） */
+.file-badge {
+  display: inline-flex; align-items: center;
+  margin-left: 6px; padding: 1px 6px;
+  border: 1px solid var(--line2); border-radius: 999px;
+  font-size: 10px; color: var(--fg3); white-space: nowrap;
+}
+.file-badge.off { border-color: var(--red); color: var(--red); }
+
+.file-edit-btn { flex: none; padding: 11px 16px; min-height: 44px; }
+
+/* 本文の編集欄。字面はプレビューと同じにして「見ていたものを直している」感を保つが、
+   **編集中だと分かる印**は付ける（枠と左のアクセント。付けないと読み取り表示と
+   見分けが付かず、スマホでは「触れるのか」が分からない） */
+.file-editor {
+  flex: 1; width: 100%; box-sizing: border-box; resize: none;
+  margin: 0; padding: 14px 16px;
+  border: none; border-top: 1px solid var(--line);
+  border-left: 3px solid var(--green);
+  outline: none;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+  color: var(--t-fg); background: var(--panel);
+  caret-color: var(--green);
+  tab-size: 4; -webkit-overflow-scrolling: touch;
+}
+
+.file-edit-actions {
+  flex: none; display: flex; gap: 10px;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--line); background: var(--panel);
+}
+.file-edit-actions .btn { flex: 1; min-height: 46px; }
