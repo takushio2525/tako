@@ -3377,7 +3377,12 @@ fn attach_remote_links(result: &mut Value) {
         }
         let session_id = pane["session_id"].as_str();
         let link = crate::claude_remote_link::link_for_agent_session(agent, session_id);
-        pane["remote_link"] = link.to_json();
+        // #1077: 案内コマンドを具体形で出すために opt-in の所在を role から解く
+        // （master / solo は設定ファイルの置き場が別なので混ぜられない）
+        let hint = crate::claude_remote_link::ProfileHint::from_role(
+            pane["role"].as_str().unwrap_or_default(),
+        );
+        pane["remote_link"] = link.to_json_with_profile(hint);
     }
 }
 

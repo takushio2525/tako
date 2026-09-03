@@ -11,6 +11,7 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { createClient } from '../api';
 import { AgentIcon } from '../components/agent-icon';
+import { RemoteLinkRow, AccountChip } from '../components/remote-link';
 
 const PREVIEW_LINES = 8;
 const PULL_THRESHOLD = 80;
@@ -214,6 +215,8 @@ function PaneCard({ pane, fallback, onOpen }) {
         )}
         {pane.model && <span class="card-chip">{pane.model}</span>}
         {label && <span class="card-chip card-chip-task">{label}</span>}
+        {/* #1077: 会話がどの tako アカウント配下か（スマホが別アカウントだと出ない） */}
+        <AccountChip link={pane.remote_link} />
       </div>
 
       {pane.permission_dialog && (
@@ -232,6 +235,9 @@ function PaneCard({ pane, fallback, onOpen }) {
       <div class="pane-card-preview">
         <PreviewBox pane={pane} fallback={fallback} />
       </div>
+
+      {/* #1077: Claude 公式へ送り出す（繋がっていなければ理由をたたんで出す） */}
+      <RemoteLinkRow link={pane.remote_link} />
 
       <div class="pane-card-footer">
         <span class="footer-meta">{pane.position ? `pane ${pane.position}` : ''}</span>

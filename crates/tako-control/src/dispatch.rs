@@ -5312,11 +5312,14 @@ fn dispatch_sessions_link(
         .or_else(|| resolve_session_id_for_pane_via_pid(host, pane_id))
         .or_else(|| crate::sessions::resolve_session_for_pane(&pane_id.as_u64().to_string()));
     let link = crate::claude_remote_link::link_for_agent_session(agent, session_id.as_deref());
+    // #1077: 開けない理由に添える opt-in コマンドを具体形にする
+    // （PWA / CLI / MCP が同じ 1 実装から同じ値を得る）
+    let hint = crate::claude_remote_link::ProfileHint::from_role(&role);
     Ok(json!({
         "pane": pane_id.as_u64(),
         "agent": agent,
         "session_id_resolved": session_id,
-        "remote_link": link.to_json(),
+        "remote_link": link.to_json_with_profile(hint),
     }))
 }
 

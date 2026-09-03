@@ -8,6 +8,7 @@ import { createClient } from '../api';
 import { parseAnsiLine, defaultSgrState, colorToCss } from '../ansi';
 import { AgentIcon, agentColor } from '../components/agent-icon';
 import { ChatView } from '../components/chat-view';
+import { RemoteLinkRow } from '../components/remote-link';
 
 const QUICK_KEYS = [
   { label: 'esc',    seq: 'Escape' },
@@ -454,6 +455,10 @@ export function TerminalPage({ paneId, me }) {
           </div>
         ) : null}
       </div>
+
+      {/* #1077: Claude 公式へ送り出す 1 行。繋がっていれば「Claude で開く」、
+          繋がっていなければ理由をたたんで出す（自前チャットはフォールバックとして残す） */}
+      <RemoteLinkRow link={info?.remote_link} />
 
       {/* chat ビュー */}
       {view === 'chat' && hasChatSupport && (
