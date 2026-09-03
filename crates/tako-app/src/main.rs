@@ -52701,6 +52701,121 @@ mod self_test {
                     "111: 解除後に codex ペインの作業が再開される (#985)",
                 );
 
+                // --- 正例 ④ 組織クレジット上限（#1093） ---
+                // 2026-09-03 に worker 3 体が 17:1x に止まり、19:50 のリセットを
+                // 1 時間以上過ぎても復帰せず `supervisor.log` に 1 件も記録が無かった。
+                // 見出しは claude 2.1.258 のテンプレート `You've hit your <名前>limit…` で
+                // 限度の名前が `session limit`（= 5h 枠）。**旧実装の判定は
+                // `hit your usage limit` 決め打ちだったので 1 文字も引っかからなかった**
+                //
+                // 見出しのアポストロフィだけは落としてある: `paint_and_hold` の POSIX 経路は
+                // 本文を素の単引用符で囲むので `'` を含むと起動コマンドが壊れる
+                // （codex の正例 ③ も同じ理由で `You have hit …`）。**実バイトそのままの
+                // fixture は `limit_stop.rs` の `SESSION_LIMIT_IDLE` が持っている**ので、
+                // ここで見たいのは「実ペイン → 検知 → ナッジ → 監査ログ」の通し
+                let session_body = format!(
+                    "{filler813}実装を進めます\n  \
+                     You have hit your session limit · resets 7:50pm (Asia/Tokyo)\n     \
+                     /usage-credits to request more usage from your admin.\n"
+                );
+                let Some(session_pane) = make_fixture_pane(cx, &session_body).await else {
+                    fail("#1093: 組織クレジット上限ペインの作成")
+                };
+                if !wait_screen(cx, session_pane, "hit your session limit").await {
+                    fail("#1093: 組織クレジット上限 fixture が画面に出ない");
+                }
+                settle813(cx, session_pane).await;
+                let _ = set_enabled(cx, session_pane, true);
+                let (_, kind_session, _) = drive(cx, session_pane);
+                let reset_session = window
+                    .update(cx, |app, _, _| {
+                        app.limit_resume.get(&session_pane).and_then(|t| t.reset_at)
+                    })
+                    .ok()
+                    .flatten();
+                println!(
+                    "TAKO_SELF_TEST_1093_DETECT: kind={kind_session:?} \
+                     reset_at={reset_session:?} state=({})",
+                    state813(cx, session_pane),
+                );
+                check(
+                    kind_session.as_deref() == Some("idle"),
+                    "111: 組織クレジット上限の画面を上限停止として検知する (#1093)",
+                );
+                check(
+                    reset_session.is_some(),
+                    "111: `resets 7:50pm (Asia/Tokyo)` から解除時刻を解決する (#1093)",
+                );
+                // ステータスバーのメーターが `--`（データ無し）にならない。
+                // 上限中はフッターが数値を出さないので、見出しから 100% を埋める
+                let meter1093 = window
+                    .update(cx, |app, _, _| {
+                        let pane_level = app
+                            .terminals
+                            .get(&session_pane)
+                            .and_then(|s| s.agent_metrics())
+                            .and_then(|m| m.limit_5h);
+                        app.refresh_agent_metrics();
+                        (pane_level, app.agent_metrics.limit_5h)
+                    })
+                    .unwrap_or((None, None));
+                println!(
+                    "TAKO_SELF_TEST_1093_METER: pane={:?} statusbar={:?}",
+                    meter1093.0, meter1093.1
+                );
+                check(
+                    meter1093.0 == Some(100) && meter1093.1 == Some(100),
+                    "111: 上限中はステータスバーの 5h メーターが 100% になる (#1093)",
+                );
+                // 解除前は撃たない
+                let (sent_before1093, _, _) = drive(cx, session_pane);
+                check(
+                    sent_before1093.is_empty(),
+                    "111: 解除時刻より前は継続ナッジを送らない (#1093)",
+                );
+                // 解除後は撃つ。**監査ログ（supervisor.log）に発火が残る**ことまで見る
+                // （#1093 の症状は「1 件も記録が無い」だった = 記録の有無が受け入れ条件）
+                let audit_before = tako_control::orchestrator::supervisor::read_audit_log(200)
+                    .iter()
+                    .filter(|l| {
+                        l.contains("action=limit_autoresume")
+                            && l.contains(&format!("pane={}", session_pane.as_u64()))
+                    })
+                    .count();
+                backdate(cx, session_pane);
+                let (sent_1093, _, attempts_1093) = drive(cx, session_pane);
+                let audit_after: Vec<String> =
+                    tako_control::orchestrator::supervisor::read_audit_log(200)
+                        .into_iter()
+                        .filter(|l| {
+                            l.contains("action=limit_autoresume")
+                                && l.contains(&format!("pane={}", session_pane.as_u64()))
+                        })
+                        .collect();
+                println!(
+                    "TAKO_SELF_TEST_1093_RESUME: sent={} attempts={attempts_1093} \
+                     audit={}->{} last={:?}",
+                    sent_1093.len(),
+                    audit_before,
+                    audit_after.len(),
+                    audit_after.last().map(|l| l
+                        .split("action=")
+                        .nth(1)
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect::<String>()),
+                );
+                check(
+                    sent_1093.len() == 1 && attempts_1093 == 1,
+                    "111: 解除後に組織クレジット上限のペインが再開される (#1093)",
+                );
+                check(
+                    audit_after.len() == audit_before + 1
+                        && audit_after.last().is_some_and(|l| l.contains("nudge queued")),
+                    "111: 自動復帰の発火が supervisor.log に記録される (#1093)",
+                );
+
                 // --- 負例 ② permission ダイアログでは発動しない ---
                 let perm_body = format!(
                     "{filler813}   Bash command\n   npm test\n   \
@@ -52793,10 +52908,10 @@ mod self_test {
                     .flatten();
                 println!("TAKO_SELF_TEST_813_PERSIST: {persisted:?}");
                 check(
-                    // 有効にしたのは idle / dialog / codex / permission / api の 5 ペインだけ
-                    // （codex は #985 で追加）。OFF のペインはフィールドごと出ない
-                    // （旧 tako でも読める JSON を保つ）
-                    persisted == Some((5, 5)),
+                    // 有効にしたのは idle / dialog / codex / session / permission / api の
+                    // 6 ペインだけ（codex は #985、session は #1093 で追加）。
+                    // OFF のペインはフィールドごと出ない（旧 tako でも読める JSON を保つ）
+                    persisted == Some((6, 6)),
                     "111: 有効にしたペインだけが保存表現へ載る (#813)",
                 );
 

@@ -263,6 +263,77 @@ mod tests {
         );
     }
 
+    // --- #1093: 組織クレジット上限（session limit） ---
+
+    /// **実採取**（2026-09-03。univ アカウントの worker 3 体が 17:1x に止まっていた画面）。
+    ///
+    /// 上限の見出しは claude 2.1.258 のテンプレート
+    /// `` `You've hit your ${限度の名前}${理由}` `` から作られ、限度の名前は
+    /// `session limit`（= 5h 枠）、2 行目は組織で管理者へ依頼する場合の案内
+    /// （どちらも同バイナリ内の文字列と一致）。
+    ///
+    /// **フッターに `5h NN%` / `7d NN%` が無い**のも実際の症状どおり
+    /// （ステータスバーのメーターが `--` になっていた）。入力欄・区切り線の形は
+    /// 稼働中の実ペインから採った幾何（フッター 6 行 / 入力欄 3 行）に合わせてある
+    const SESSION_LIMIT_IDLE: &str = r#"⏺ 実装を進めます
+
+  ⎿  You've hit your session limit · resets 7:50pm (Asia/Tokyo)
+     /usage-credits to request more usage from your admin.
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on
+  tako
+  main
+  ~/dev/tako
+  ⏸ 待機中 · ? for shortcuts"#;
+
+    #[test]
+    fn issue1093_組織クレジット上限で止まった画面を解除時刻つきで検知する() {
+        let stop =
+            detect_limit_stop(&screen(SESSION_LIMIT_IDLE), OBSERVED, JST).expect("検知される");
+        assert_eq!(
+            stop.kind,
+            LimitStopKind::Idle,
+            "ダイアログは出ていないので idle 型"
+        );
+        assert!(
+            stop.message.contains("hit your session limit"),
+            "検知の根拠が見出し行になっていない: {}",
+            stop.message
+        );
+        assert_eq!(
+            stop.reset_at,
+            Some(1_786_752_000 - 9 * 3600 + 19 * 3600 + 50 * 60),
+            "`resets 7:50pm (Asia/Tokyo)` から解除時刻が読めていない"
+        );
+    }
+
+    #[test]
+    fn issue1093_解除時刻の無い組織上限でも停止としては検知する() {
+        // 管理者へ依頼する案内だけで解除時刻が出ない形（バイナリ内 `Tet()` 系）。
+        // 時刻不明は core 側の猶予（`UNKNOWN_RESET_FALLBACK_SECS`）に落ちる
+        let src = SESSION_LIMIT_IDLE.replace(
+            "· resets 7:50pm (Asia/Tokyo)",
+            "· run /usage-credits to ask your admin for a higher limit",
+        );
+        let stop = detect_limit_stop(&screen(&src), OBSERVED, JST).expect("検知される");
+        assert_eq!(stop.kind, LimitStopKind::Idle);
+        assert_eq!(stop.reset_at, None);
+    }
+
+    #[test]
+    fn issue1093_週枠の上限も同じ経路で検知する() {
+        // `nF` 表の `seven_day` = `weekly limit`。同日中の解除なら日付が付かない
+        let src = SESSION_LIMIT_IDLE.replace("session limit", "weekly limit");
+        let stop = detect_limit_stop(&screen(&src), OBSERVED, JST).expect("検知される");
+        assert_eq!(
+            stop.reset_at,
+            Some(1_786_752_000 - 9 * 3600 + 19 * 3600 + 50 * 60)
+        );
+    }
+
     // --- #985: codex ---
 
     /// codex 0.150.1 の上限停止画面（**日付つきの `Try again at`**）。
