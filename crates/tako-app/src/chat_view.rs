@@ -180,6 +180,20 @@ pub(crate) struct ChatPaneState {
     pub permission: Option<tako_control::claude_tui::PermissionDialog>,
 }
 
+/// モデル名 / ctx% の取得元の優先順（#1021）: `agents --json` → 画面 → transcript。
+///
+/// **画面を transcript より先に見る**のは、画面の数値が claude 自身の計算結果で
+/// 文脈窓の推定を一切要らないため（理由の全文は `tako_core::ctx_usage`）。
+/// `agents --json` を先頭に残すのは、上流が将来また返すようになったらそれが最も
+/// 権威だから（2.1.258 では返さない = だからこの関数がある）
+pub(crate) fn prefer_source<T>(
+    agents: Option<T>,
+    screen: Option<T>,
+    transcript: Option<T>,
+) -> Option<T> {
+    agents.or(screen).or(transcript)
+}
+
 impl ChatPaneState {
     /// ヘッダに出すモデル名（無ければ「Claude」）
     pub(crate) fn model_label(&self) -> String {
@@ -3909,11 +3923,12 @@ impl TakoApp {
                 // agents が返せば優先（将来版）→ 画面採取 → transcript（#1021）。
                 // 画面を transcript より先に見るのは、画面の数値が claude 自身の
                 // 計算結果で文脈窓の推定を要らないため（`tako_core::ctx_usage`）
-                model: data.model.or(data.screen_model).or(data.transcript_model),
-                ctx_percent: data
-                    .ctx_percent
-                    .or(data.screen_ctx_percent)
-                    .or(data.transcript_ctx_percent),
+                model: prefer_source(data.model, data.screen_model, data.transcript_model),
+                ctx_percent: prefer_source(
+                    data.ctx_percent,
+                    data.screen_ctx_percent,
+                    data.transcript_ctx_percent,
+                ),
                 busy,
                 queued: data.queued,
                 read_only: data.read_only,
@@ -4366,6 +4381,39 @@ mod tests {
             short_model_name("claude-opus-4-6[1m]"),
             "claude-opus-4-6[1m]"
         );
+    }
+
+    #[test]
+    fn 取得元の優先順はagents_画面_transcript() {
+        // #1021: 3 段の優先順。画面が transcript より先（画面は claude 自身の答え）
+        assert_eq!(prefer_source(Some(1), Some(2), Some(3)), Some(1));
+        assert_eq!(prefer_source(None, Some(2), Some(3)), Some(2));
+        assert_eq!(prefer_source(None, None, Some(3)), Some(3));
+        assert_eq!(prefer_source::<i32>(None, None, None), None);
+    }
+
+    #[test]
+    fn transcript由来の値でもヘッダが読める形になる() {
+        // #1021: 画面は表示名（`Fable 5.1`）を返すが transcript はモデル **id** を
+        // 返す。ヘッダは id でも短い名前へ落ちること（= 生の id が並ばない）
+        let state = ChatPaneState {
+            model: Some("claude-fable-5-1".into()),
+            ctx_percent: Some(54.0),
+            ..Default::default()
+        };
+        assert_eq!(state.model_label(), "Fable 5.1");
+        let (remaining, warn) = state.ctx_gauge().expect("残量バーが出る");
+        assert!((remaining - 0.46).abs() < 1e-6, "remaining={remaining}");
+        assert!(!warn, "54% は警告域ではない");
+        // 警告域（#739 の /compact ヒントと同じ根拠）でも transcript 由来で成立する
+        let hot = ChatPaneState {
+            model: Some("claude-opus-5".into()),
+            ctx_percent: Some(85.0),
+            ..Default::default()
+        };
+        assert_eq!(hot.model_label(), "Opus 5");
+        assert!(hot.ctx_gauge().expect("残量バー").1, "85% は警告域");
+        assert!(hot.ctx_hint(), "警告域ならヒントも出る");
     }
 
     #[test]
