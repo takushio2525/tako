@@ -46,8 +46,18 @@ const VERBATIM: &str = r"\\?\";
 /// verbatim UNC prefix（`\\?\UNC\server\share` = `\\server\share`）
 const VERBATIM_UNC: &str = r"\\?\UNC\";
 
-/// Win32 の `MAX_PATH`。終端 NUL を含む値なので、使えるパス長は 259 文字まで
+/// Win32 の `MAX_PATH`。終端 NUL を含む値なので、使えるパス長は 259 文字まで。
+///
+/// **数えるのは UTF-16 の単位**（Win32 のパス長はワイド文字数）。Rust の
+/// `str::len()` はバイト数なので、そのまま使うと日本語のパスを過大に見積もり、
+/// 剥がせるものを verbatim のまま残してしまう（`…\プロジェクト\…` は
+/// 1 文字 = 3 バイト / 1 単位）
 const MAX_PATH: usize = 260;
+
+/// Win32 が数えるパス長（UTF-16 の単位数）
+fn utf16_len(path: &str) -> usize {
+    path.chars().map(char::len_utf16).sum()
+}
 
 /// Win32 が「デバイス」として解釈する予約名。`C:\dir\NUL` は**実ファイルではなく
 /// NUL デバイス**を指すので、そういう成分を含むパスから verbatim を外すと別物になる
@@ -78,7 +88,11 @@ pub fn canonicalize_or_self(path: &Path) -> PathBuf {
 
 /// verbatim prefix を落とす（[`strip_verbatim_str`] の `Path` 版）。
 ///
-/// 非 UTF-8 のパス（Windows の不対サロゲート等）は触らない
+/// 非 UTF-8 のパス（Windows の不対サロゲート等）は触らない。
+///
+/// **`Cow::Borrowed` は「変えていない」を意味しない**: ドライブ形は入力の
+/// 部分スライス（prefix を除いた残り）を借用で返すので、変わったかを知りたい
+/// なら入力と比べること
 pub fn strip_verbatim(path: &Path) -> Cow<'_, Path> {
     let Some(text) = path.to_str() else {
         return Cow::Borrowed(path);
@@ -144,7 +158,7 @@ fn is_safe_to_simplify(rest: &str, extra_len: usize) -> bool {
     if rest.is_empty() || rest.contains('/') {
         return false;
     }
-    if rest.len() + extra_len >= MAX_PATH {
+    if utf16_len(rest) + extra_len >= MAX_PATH {
         return false;
     }
     // 末尾の区切り 1 個は成分ではない（`C:\` を「空の成分つき」と読まない）
@@ -289,6 +303,31 @@ mod tests {
         assert_eq!(strip_verbatim_str(&unc_ok).len(), 259);
         let unc_ng = format!(r"\\?\UNC\{unc_body}a");
         assert_eq!(strip_verbatim_str(&unc_ng), unc_ng);
+    }
+
+    #[test]
+    fn 長さはutf16の単位で数える() {
+        // 日本語のパスはバイト数で数えると 3 倍に見える。バイトで判定すると
+        // 「剥がせるのに verbatim のまま」= #970 が日本語のフォルダで直らない
+        let head = r"C:\Users\testuser\";
+        // 87 文字（UTF-16 単位）× … で 259 単位ちょうどに収まる形
+        let body = "プ".repeat(259 - utf16_len(head));
+        let simplified = format!("{head}{body}");
+        assert_eq!(utf16_len(&simplified), 259);
+        assert!(
+            simplified.len() > MAX_PATH,
+            "バイト数では 260 を超えている前提のテスト（len={}）",
+            simplified.len()
+        );
+        assert_eq!(
+            strip_verbatim_str(&format!(r"\\?\{simplified}")),
+            simplified,
+            "UTF-16 で 259 単位なら剥がす"
+        );
+        // 1 単位増えると剥がさない
+        let over = format!("{simplified}プ");
+        let verbatim = format!(r"\\?\{over}");
+        assert_eq!(strip_verbatim_str(&verbatim), verbatim);
     }
 
     #[test]
