@@ -715,6 +715,52 @@ OpenSSH_for_Windows_10.0p2 / LibreSSL 4.2.0）:
 「入力待ちで止まる」時代のもので、内容自体が stale だった）。`tako_remote_folder` は
 `Pending(#919)` → **`Degraded`**（多重化が無いぶん + #976 の自動検知が働かないぶん）。
 
+### 19.5 実機実測で出てきた別口 2 件（#1090 の PR に同梱）
+
+無言死を直した**あと**でしか見えない欠陥が 2 つ出た。どちらも #1090 の原因とは別物で、
+「ペインが即死していたので誰も踏めなかった」だけ。
+
+#### (a) `--target pane` の 1 行が PowerShell で必ず構文エラー（#1006）
+
+`launch_cmd::ps_quote` は**常に**引用するので第 1 語が
+`'C:\Program Files\OpenSSH\ssh.exe'` になり、PowerShell は引用符で始まる語を
+コマンド名として解釈しない:
+
+```
+PS C:\Users\<winuser> 'C:\Program Files\OpenSSH\ssh.exe' '-o' 'ConnectTimeout=10' …
+ParserError: Unexpected token ''-o'' in expression or statement.
+```
+
+つまり **Windows では `--target pane` の ssh が 1 度も起きていなかった**。
+呼び出し演算子 `&` を付ける組み立てを `launch_cmd::command_line` へ 1 本化した
+（POSIX 側は演算子を足さない = 文字列は従来と同一）。
+
+#### (b) 折り返されたバナーの続き行が「ssh が何か言った」と読まれる（#1010）
+
+`is_tako_line` は行の頭（`tako: `）だけを見るが、物理行は端末幅で折り返されるので
+**続き行には前置きが付かない**。44 桁のペインでは日本語のバナーが
+
+```
+tako: selftest-nonexistent-1010 へ接続してい
+ます…（中止は Ctrl+C）
+```
+
+の 2 行になり、2 行目が `classify` の規則 ④（まっさら + tako 以外の行 = ssh が
+何か言った）に当たって `Opened` → `Connected` → `ever_connected = true` へ進む。
+直後にスクリプトの失敗マーカーを「切断」と読み、**#1040 の自動再接続が armed** になる
+（`persist.log`: `ssh 切断を検知: pane=114 host=selftest-nonexistent-1010 自動再接続=する`。
+画面には tako が打ち直した ssh が 2 回並ぶ）。項目 133 (d) は `phase=failed` を待つので
+`reconnecting` で落ちる。
+
+**macOS では踏まない**（ペインが広くバナーが 1 行に収まる + `/bin/sh` が何も印字しない）。
+直し方はバナーの文面を `remote_fs::pane_connecting_banner` へ切り出して正本を 1 本にし、
+`pane_prints`（日英）を `ssh_progress` が引いて**部分文字列で続き行を見分ける**。
+併せて理由の切り出しを「直前の非空行」から「ssh の失敗行を優先」へ変えた
+（折り返された理由の尻尾 `…\202\305\202\267\201B` が理由として出ていた）。
+
+**教訓**: 「ペインが死ぬ」バグを直すと、その後ろに隠れていた層が初めて動く。
+1 回の実機実測で終わらせず、**直したあとに同じ経路をもう一度測る**こと。
+
 ### 19.4 実機で SSH の相手を用意する（次に測る人へ）
 
 Windows 実機には `~/.ssh` そのものが無く（鍵・known_hosts・config が 1 つも無い）、
