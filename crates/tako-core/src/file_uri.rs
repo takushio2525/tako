@@ -103,6 +103,7 @@ mod tests {
         // 先頭が `/` でない（パス部は必ず `/` 始まり = 想定外の入力）
         assert_eq!(strip_drive_slash("C:/x"), "C:/x");
     }
+
     #[test]
     fn uri由来のパスはプラットフォームの区切りへ寄せる() {
         // Windows: URI の `/` を `\` へ（表示が他の経路と揃う）
