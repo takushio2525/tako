@@ -57434,15 +57434,41 @@ mod self_test {
                 );
 
                 // (d) 失敗すると**消えずに理由へ置き換わる**（無言にしない）
+                //
+                // #1090: **観測した phase の履歴も残す**。ここは 500ms ごとに
+                // `drive_ssh_connect` を回すので、途中の状態（まだ何も出ていない /
+                // バナーだけ）で誤分類されるとその瞬間しか痕跡が無い。失敗したときに
+                // 「どの順で何へ倒れたか」が分からないと原因を追えない（実測で 1 度踏んだ）
                 let mut failed = None;
+                let mut phase_trail: Vec<String> = Vec::new();
                 for _ in 0..40 {
                     wait(cx, 500).await;
-                    let st = window
+                    let (st, screen_lines) = window
                         .update(cx, |app: &mut TakoApp, _, _| {
                             app.drive_ssh_connect();
-                            <TakoApp as UiStateHost>::ssh_connect_state(app, PaneId::from_raw(ssh_pane))
+                            let pid = PaneId::from_raw(ssh_pane);
+                            let st = <TakoApp as UiStateHost>::ssh_connect_state(app, pid);
+                            let n = app
+                                .terminals
+                                .get(&pid)
+                                .map(|s| {
+                                    s.visible_lines()
+                                        .into_iter()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            (st, n)
                         })
-                        .unwrap_or(None);
+                        .unwrap_or((None, 0));
+                    let label = st
+                        .as_ref()
+                        .map(|v| v["phase"].as_str().unwrap_or("?").to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    let entry = format!("{label}/{screen_lines}");
+                    if phase_trail.last() != Some(&entry) {
+                        phase_trail.push(entry);
+                    }
                     if st.as_ref().map(|v| v["phase"] == "failed").unwrap_or(false) {
                         failed = st;
                         break;
@@ -57475,6 +57501,7 @@ mod self_test {
                             (phase, backend, lines)
                         })
                         .unwrap_or((None, false, Vec::new()));
+                    println!("TAKO_SELF_TEST_133D_TRAIL: {}", phase_trail.join(" -> "));
                     println!(
                         "TAKO_SELF_TEST_133D: host={host1010:?} phase={phase:?} \
                          backend={backend} lines={lines:?}"
