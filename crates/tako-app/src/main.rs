@@ -24846,6 +24846,48 @@ mod self_test {
         }
     }
 
+    /// 項目 41 / 41b（OSC 7 / 133）を**この環境で回せるか**（純粋関数。#1091）。
+    ///
+    /// **引数に「配置されているか」を取らないのが肝**。Windows の
+    /// `shell_integration::status().installed()` は「`$PROFILE` のブロックが
+    /// *いまの data dir の* `tako.ps1` を指しているか」で決まるので、
+    /// `TAKO_ISOLATED=1` が data dir を pid ごとに変える隔離セルフテストからは
+    /// 配置が見えない。そこをゲートにしていたため、**同じ機・同じコードでも
+    /// 起動の仕方で「skip される回」と「走る回」が入れ替わっていた**
+    /// （= レシピどおりに回すと Windows の OSC 7 / 133 が永久に未検証。#1073 の症状の半分）。
+    ///
+    /// 代わりに問うのは「統合を読ませたシェルを起こせるか」:
+    ///
+    /// - `is_posix` = 統合は spawn 時の env 注入で完結する（`integration_shell_command` が
+    ///   `None` を返すのが正しい）ので、既定シェルをそのまま起こせばよい
+    /// - それ以外の方言 = 統合スクリプトを自分でドットソースした対話シェルを組めること
+    ///   （#889 が項目 93 で使った手）
+    /// - `backend_blocked` = 器が OSC を素通しせず側路（#766）も無い環境（#525）。
+    ///   機能が正しくても外側へ届かないので、ここだけは従来どおり対象外
+    pub(crate) fn osc_selftest_runnable(
+        is_posix: bool,
+        backend_blocked: bool,
+        integration_shell_available: bool,
+    ) -> bool {
+        !backend_blocked && (is_posix || integration_shell_available)
+    }
+
+    /// 項目 41b（split が分割元の cwd を継承する）の判定（純粋関数。#1073 / #1091）。
+    ///
+    /// **フォーカスが分割元とは別のペインへ移ったことを条件に含めるのが肝**。
+    /// 分割元の cwd は 41 で既に期待値になっているので、これを外すと
+    /// **split が起きる前に成立する偽 PASS** になる（`tako split` が届かなくても
+    /// 「継承できた」と報告してしまう）。実測は `TAKO_1091_INJECT_NO_SPLIT=1`
+    /// （split を打たない注入）で取れる
+    pub(crate) fn split_inherited_cwd_ok(
+        split_from: PaneId,
+        focused: PaneId,
+        focused_cwd: Option<&std::path::Path>,
+        expected: &std::path::Path,
+    ) -> bool {
+        split_from != focused && focused_cwd == Some(expected)
+    }
+
     /// ファイルツリーのインデントガイド線（#589）の実ピクセル検証。
     ///
     /// 縦線は「その深さに子が続くあいだ切れ目なく 1 本」でなければならない。
@@ -35799,12 +35841,121 @@ mod self_test {
                     .to_string()
             };
             let osc_expected = std::path::PathBuf::from(&osc_dir);
-            // 41 / 41b は「シェルが出した OSC が**外側の tako まで届く**」ことが前提。
-            // 器が素通ししない（psmux。#525 の実測）/ 配置が済んでいない環境では
-            // 機能が正しくても届かないので、能力を見て対象外にする
             let shell_integration = tako_core::shell_integration::status();
-            if shell_integration.effective() {
-                // 41. シェル統合（zsh 自動注入）→ OSC 7 / 133 タップ → cwd / state が反映され
+            // 41 / 41b は「シェルが出した OSC が**外側の tako まで届く**」ことが前提。
+            //
+            // **ゲートは「配置されているか」ではなく「統合を読ませたシェルを起こせるか」**
+            // （#1091。判定は `osc_selftest_runnable`）。理由はあちらの doc に書いた。
+            // 前提を実機の `$PROFILE` の状態から切り離すため、**この項目専用のペイン**を
+            // 1 枚立てて中で完結させる（#889 が項目 93 で使った手）。
+            // 使い回しのペインを使わないのは、項目 40 までの履歴（role / 実行中 /
+            // alt screen）を持つうえ、Windows では配置状態に依存してしまうから
+            let osc_shell_program = tako_core::platform::shell::default_shell().map(|s| s.program);
+            let osc_script = shell_integration.script.clone().filter(|s| s.exists());
+            let osc_shell = match (&osc_shell_program, &osc_script) {
+                (Some(program), Some(script)) => sh.integration_shell_command(program, script),
+                _ => None,
+            };
+            // 検証用ペインを起こす場所は**期待値とは別のディレクトリ**にする。
+            // 同じ場所で起こすと、spawn 時の cwd がそのままセッションへ入るので
+            // `cd` が 1 文字も届かなくても「OSC 7 で cwd 検知」が成立してしまう
+            // （専用ペインにしたことで新しく生える偽 PASS の穴）
+            let osc_start_dir = osc_expected
+                .parent()
+                .filter(|p| p.is_dir())
+                .map(|p| p.display().to_string());
+            let osc_runnable = osc_selftest_runnable(
+                sh.is_posix(),
+                shell_integration.blocked_by_backend.is_some(),
+                osc_shell.is_some(),
+            );
+            // どちらのモードで回したか（隔離 data dir かどうか）を後から言えるように、
+            // 判定の材料をそのまま出す。`script` のパスに `tako-iso-data-<pid>` が
+            // 出ていれば隔離レシピで走ったことが読める（#1073 / #1091）
+            println!(
+                "TAKO_SELF_TEST_41_ENV: runnable={osc_runnable} posix={} installed={} \
+                 blocked_by_backend={:?} script={:?} shell={:?} integration_shell={:?} \
+                 start_dir={osc_start_dir:?} expected={:?}",
+                sh.is_posix(),
+                shell_integration.installed(),
+                shell_integration.blocked_by_backend,
+                osc_script.as_ref().map(|p| p.display().to_string()),
+                osc_shell_program,
+                osc_shell,
+                osc_dir,
+            );
+            if osc_runnable {
+                let osc_anchor = match window.update(cx, |app, _, _| app.focused_pane()) {
+                    Ok(pane) => pane,
+                    Err(_) => fail("41: 基準ペインの取得"),
+                };
+                let osc_pane = window
+                    .update(cx, |app, _, cx| {
+                        let pane = tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Split {
+                                pane: Some(osc_anchor.as_u64()),
+                                tab: None,
+                                direction: Some(tako_control::protocol::Direction::Down),
+                                ratio: None,
+                                command: osc_shell.clone(),
+                                cwd: osc_start_dir.clone(),
+                                focus: Some(true),
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw);
+                        // dispatch を直接呼ぶので、セッション起動依頼（pending_attach）も
+                        // ここで消化する（IPC ループ相当。残すと PTY が立たない。#1023）
+                        for (p, options) in std::mem::take(&mut app.pending_attach) {
+                            if app.spawn_session(p, options, cx).is_err() {
+                                app.remove_pane(p, cx);
+                            }
+                        }
+                        pane
+                    })
+                    .ok()
+                    .flatten();
+                let Some(osc_pane) = osc_pane else {
+                    fail("41: 検証用ペインの作成")
+                };
+                // 打鍵はフォーカス中ペインへ行くので、`focus: Some(true)` が効いたことを先に見る
+                check(
+                    window
+                        .update(cx, |app, _, _| app.focused_pane() == osc_pane)
+                        .unwrap_or(false),
+                    "41: 検証用ペインへフォーカスが移る",
+                );
+                // 器（tmux / psmux）を挟むと「器の client」と「内側のシェル」の二段起動に
+                // なる。起動途中の PTY へ書いた打鍵は落ちるので**状態で待つ**（#903）
+                if !wait_for_pane_ready(window, cx, osc_pane, Duration::from_secs(30)).await {
+                    fail("41: 検証用ペインのシェル起動")
+                }
+                // 上の `osc_start_dir` の前提そのものを見る（`cd` の前に期待値だと
+                // 偽 PASS になるので、そのときは黙って通さず落とす）。
+                // spawn 時に決まる値なので側路の tick は関係ない（#1073 の対象外）
+                let osc_pre_cwd = window
+                    .update(cx, |app, _, _| {
+                        app.terminals
+                            .get(&osc_pane)
+                            .and_then(|s| s.cwd())
+                            .map(|p| p.to_path_buf())
+                    })
+                    .unwrap_or(None);
+                if osc_pre_cwd.as_deref() == Some(osc_expected.as_path()) {
+                    println!(
+                        "TAKO_SELF_TEST_41_PRE: start_dir={osc_start_dir:?} pre_cwd={:?}",
+                        osc_pre_cwd.as_ref().map(|p| p.display().to_string())
+                    );
+                }
+                check(
+                    osc_pre_cwd.as_deref() != Some(osc_expected.as_path()),
+                    "41: 検証用ペインは期待値とは別の cwd で起きる",
+                );
+
+                // 41. シェル統合 → OSC 7 / 133 タップ → cwd / state が反映され
                 //     list で公開される（FR-2.4.1 + FR-2.1.4 の e2e。実コマンドで検証する）
                 press(any, cx, sh.clear_line_key());
                 type_text(any, cx, &sh.cd(&osc_dir), true);
@@ -35816,7 +35967,7 @@ mod self_test {
                     Duration::from_secs(20),
                     |app| {
                         app.terminals
-                            .get(&app.focused_pane())
+                            .get(&osc_pane)
                             .and_then(|s| s.cwd())
                             .map(|p| p == osc_expected.as_path())
                             .unwrap_or(false)
@@ -35828,7 +35979,7 @@ mod self_test {
                     let seen = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&app.focused_pane())
+                                .get(&osc_pane)
                                 .and_then(|s| s.cwd())
                                 .map(|p| p.display().to_string())
                         })
@@ -35849,7 +36000,7 @@ mod self_test {
                     osc_running = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&app.focused_pane())
+                                .get(&osc_pane)
                                 .map(|s| s.command_state() == CommandState::Running)
                                 == Some(true)
                         })
@@ -35865,7 +36016,7 @@ mod self_test {
                     let done = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&app.focused_pane())
+                                .get(&osc_pane)
                                 .map(|s| s.command_state() != CommandState::Running)
                                 == Some(true)
                         })
@@ -35881,7 +36032,7 @@ mod self_test {
                     osc_failed = window
                         .update(cx, |app, _, _| {
                             app.terminals
-                                .get(&app.focused_pane())
+                                .get(&osc_pane)
                                 .map(|s| s.command_state() == CommandState::Failed(1))
                                 == Some(true)
                         })
@@ -35894,7 +36045,7 @@ mod self_test {
                 // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
                 let list_exposes = window
                     .update(cx, |app, _, _| {
-                        let focused = app.focused_pane().as_u64();
+                        let target = osc_pane.as_u64();
                         let value = tako_control::dispatch(
                             app,
                             tako_control::protocol::Request::List,
@@ -35907,7 +36058,7 @@ mod self_test {
                             .flatten()
                             .flat_map(|t| t["panes"].as_array().into_iter().flatten())
                             .any(|p| {
-                                p["id"].as_u64() == Some(focused)
+                                p["id"].as_u64() == Some(target)
                                     && p["state"].as_str() == Some("failed")
                                     && p["exit_code"].as_i64() == Some(1)
                                     && p["cwd"].as_str() == Some(osc_dir.as_str())
@@ -35918,7 +36069,7 @@ mod self_test {
                     // 応答のどのフィールドが食い違ったかを出す（#1073: cwd の表記で落ちた）
                     let row = window
                         .update(cx, |app, _, _| {
-                            let focused = app.focused_pane().as_u64();
+                            let target = osc_pane.as_u64();
                             let value = tako_control::dispatch(
                                 app,
                                 tako_control::protocol::Request::List,
@@ -35930,7 +36081,7 @@ mod self_test {
                                 .into_iter()
                                 .flatten()
                                 .flat_map(|t| t["panes"].as_array().into_iter().flatten())
-                                .find(|p| p["id"].as_u64() == Some(focused))
+                                .find(|p| p["id"].as_u64() == Some(target))
                                 .map(|p| {
                                     format!(
                                         "state={:?} exit_code={:?} cwd={:?}",
@@ -35949,13 +36100,14 @@ mod self_test {
                 check(list_exposes, "list が state / exit_code / cwd を公開");
 
                 // 41b. split が分割元の cwd を継承する（OSC 7 連携。FR-2.4.1）。
-                //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）
-                // **分割元のペイン ID を先に取る**: 分割元の cwd は既に osc_expected な
-                // ので、「フォーカス中ペインの cwd」だけで待つと split が起きる前に
-                // 成立してしまう（固定待ちを状態待ちへ替えるときに踏む罠。#1073）。
-                // 「フォーカスが別のペインへ移り、そのペインの cwd が継承されている」を待つ
-                let split_from = window.update(cx, |app, _, _| app.focused_pane()).ok();
-                type_text(any, cx, &format!("{cli} split --right --focus"), true);
+                //     --focus で新ペインへ移り、新ペイン側の cwd 継承を検証する（3c9d363 追従）。
+                // 判定は `split_inherited_cwd_ok`（**フォーカスが別のペインへ移ったことも
+                // 条件**。分割元の cwd は既に期待値なので、外すと split の前に成立する
+                // 偽 PASS になる。#1073 / #1091）
+                // 検出力の実測用: split を打たない注入。フォーカスが移らないので必ず落ちる
+                if std::env::var_os("TAKO_1091_INJECT_NO_SPLIT").is_none() {
+                    type_text(any, cx, &format!("{cli} split --right --focus"), true);
+                }
                 // 新ペインの cwd も側路経由だと 2 秒 tick に乗る（#1073）
                 let inherited = wait_for_app_state(
                     window,
@@ -35964,13 +36116,12 @@ mod self_test {
                     Duration::from_secs(20),
                     |app| {
                         let focused = app.focused_pane();
-                        split_from != Some(focused)
-                            && app
-                                .terminals
-                                .get(&focused)
-                                .and_then(|s| s.cwd())
-                                .map(|p| p == osc_expected.as_path())
-                                .unwrap_or(false)
+                        split_inherited_cwd_ok(
+                            osc_pane,
+                            focused,
+                            app.terminals.get(&focused).and_then(|s| s.cwd()),
+                            osc_expected.as_path(),
+                        )
                     },
                 )
                 .await;
@@ -35988,27 +36139,40 @@ mod self_test {
                         })
                         .unwrap_or((0, None));
                     println!(
-                        "TAKO_SELF_TEST_41B: from={:?} focused={focused} seen={seen:?} expected={:?}",
-                        split_from.map(|p| p.as_u64()),
+                        "TAKO_SELF_TEST_41B: from={} focused={focused} seen={seen:?} expected={:?}",
+                        osc_pane.as_u64(),
                         osc_expected.display().to_string()
                     );
                 }
                 check(inherited, "split が分割元の cwd を継承");
-                // 片付け: 新ペインを閉じ、状態を idle へ戻す
+                // 片付け: 41b の新ペイン → 検証用ペインを閉じ、元のペインへ戻す。
+                // 失敗状態（Failed(1)）は検証用ペインごと消えるので、後続の項目に残らない
                 type_text(any, cx, &format!("{cli} close"), true);
                 wait(cx, 800).await;
-                type_text(any, cx, &sh.exit_status(0), true);
+                let restored = window
+                    .update(cx, |app, _, cx| {
+                        app.remove_pane(osc_pane, cx);
+                        tako_control::dispatch(
+                            app,
+                            tako_control::protocol::Request::Focus {
+                                pane: Some(osc_anchor.as_u64()),
+                                direction: None,
+                            },
+                            PaneOrigin::Cli,
+                        )
+                        .is_ok()
+                            && app.focused_pane() == osc_anchor
+                    })
+                    .unwrap_or(false);
+                check(restored, "41: 検証用ペインを片付けて元のペインへ戻る");
                 wait(cx, 500).await;
             } else {
-                // #1073: Windows の配置は `$PROFILE` のブロックが**いまの data dir の
-                // スクリプト**を指しているかで決まる。`TAKO_ISOLATED=1` は data dir を
-                // pid ごとに変えるので、同じ機・同じコードでも起動の仕方で
-                // 「skip される回」と「走る回」が入れ替わる。どちらだったかを
-                // 後から言えるように script のパスまで出す
+                // 器が OSC を素通ししない環境（#525）だけがここへ来る。
+                // 配置状態（`$PROFILE`）はゲートに使っていないので、
+                // 「起動の仕方で skip / 実行が入れ替わる」ことはもう無い（#1091）
                 println!(
-                    "TAKO_SELF_TEST_SKIPPED: 41 / 41b（シェル統合がこの環境では効かない: \
-                     installed={} blocked_by_backend={:?} script={:?}）",
-                    shell_integration.installed(),
+                    "TAKO_SELF_TEST_SKIPPED: 41 / 41b（OSC が外側へ届かない環境: \
+                     blocked_by_backend={:?} script={:?}）",
                     shell_integration.blocked_by_backend,
                     shell_integration
                         .script
@@ -60259,6 +60423,76 @@ mod selftest_pty_enter_watchdog {
         assert!(lf_pty_writes(good_paren).is_empty());
         // 逃げ道そのものの検査: マーカーがある行は見逃す
         assert!(lf_pty_writes(&format!("{bad} // {ALLOW_MARKER}")).is_empty());
+    }
+}
+
+/// 項目 41 / 41b のゲートと判定（#1091）。
+///
+/// どちらも純粋関数なので、**macOS 上から Windows 側の答えも検査できる**
+/// （実機の `$PROFILE` の状態にも器の種類にも依存しない）
+#[cfg(test)]
+mod self_test_osc_gate_tests {
+    use super::self_test::{osc_selftest_runnable, split_inherited_cwd_ok};
+    use tako_core::PaneId;
+
+    /// 隔離レシピ（`TAKO_ISOLATED=1`）で `$PROFILE` から配置が見えない Windows でも、
+    /// 統合を読ませたシェルを組めるなら回せる。**配置状態は引数に無い**ので、
+    /// ゲートが `installed()` / `effective()` へ戻ることは構造的に起こらない
+    #[test]
+    fn windowsは配置が見えなくても統合シェルを組めれば回せる() {
+        assert!(osc_selftest_runnable(false, false, true));
+    }
+
+    /// POSIX は spawn 時の env 注入で統合が効く（`integration_shell_command` は `None`）
+    #[test]
+    fn posixは統合シェルを組めなくても回せる() {
+        assert!(osc_selftest_runnable(true, false, false));
+    }
+
+    /// 統合シェルを組めない非 POSIX（統合スクリプトが無い等）は前提が崩れているので回さない
+    #[test]
+    fn 非posixで統合シェルを組めなければ回さない() {
+        assert!(!osc_selftest_runnable(false, false, false));
+    }
+
+    /// 器が OSC を素通しせず側路も無い環境（#525）は、機能が正しくても外側へ届かない
+    #[test]
+    fn 器がoscを落とす環境はどちらの方言でも回さない() {
+        assert!(!osc_selftest_runnable(true, true, false));
+        assert!(!osc_selftest_runnable(false, true, true));
+    }
+
+    /// 41b の肝: **分割元と同じペインのままでは成立しない**。
+    /// 分割元の cwd は 41 で既に期待値になっているので、フォーカス移動を条件から
+    /// 外すと `tako split` が届かなくても「継承できた」と報告する偽 PASS になる
+    #[test]
+    fn 分割元のままでは継承と認めない() {
+        let from = PaneId::from_raw(7);
+        let want = std::path::Path::new("/private/tmp");
+        assert!(!split_inherited_cwd_ok(from, from, Some(want), want));
+    }
+
+    #[test]
+    fn 別ペインへ移って同じcwdなら継承と認める() {
+        let from = PaneId::from_raw(7);
+        let to = PaneId::from_raw(8);
+        let want = std::path::Path::new("/private/tmp");
+        assert!(split_inherited_cwd_ok(from, to, Some(want), want));
+    }
+
+    /// 移ったが cwd が違う / まだ届いていない、は成立させない
+    #[test]
+    fn cwdが違うか未着なら継承と認めない() {
+        let from = PaneId::from_raw(7);
+        let to = PaneId::from_raw(8);
+        let want = std::path::Path::new("/private/tmp");
+        assert!(!split_inherited_cwd_ok(
+            from,
+            to,
+            Some(std::path::Path::new("/private/var")),
+            want
+        ));
+        assert!(!split_inherited_cwd_ok(from, to, None, want));
     }
 }
 
