@@ -29261,7 +29261,7 @@ mod self_test {
         window: WindowHandle<TakoApp>,
         cx: &mut AsyncApp,
     ) {
-        use tako_core::remote_fs::{RemoteEntry, RemoteKind, RemoteRef};
+        use tako_core::remote_fs::{RemoteEntry, RemoteFolder, RemoteKind, RemoteRef};
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
         let root = RemoteRef::new("visualhost", "/srv/app");
@@ -29299,7 +29299,11 @@ mod self_test {
         let _ = window.update(cx, |app, _, cx| {
             let tab = app.workspace.active_tab_id();
             if let Some(t) = app.workspace.get_tab_mut(tab) {
-                t.add_remote_folder(root.clone());
+                // 経路は **Auto**（#976 の自動検知）。この節がここで測るのは
+                // 「リモートルートがローカルの**後ろ**に並ぶ」なので、Explicit に
+                // すると #1041 の先頭 hoist が効いて検査が裏返る。明示の並びは
+                // 下の #1041 節で経路を格上げして別に撮る
+                t.add_remote_folder(RemoteFolder::auto(root.clone()));
             }
             app.sync_filetree_roots();
             app.filetree.apply_remote_dir(
@@ -29534,6 +29538,51 @@ mod self_test {
             &format!(
                 "visual-test remote-tree: 切断でバッジが赤へ変わり行は消えない \
                  (#976。red={badge_lost_red} rows {rows}->{rows_after_lost})"
+            ),
+        );
+
+        // --- #1041: 明示的に開いたリモートルートは**ローカルより前**へ出る -----
+        //
+        // 上の #976（自動検知 = ローカルの後ろ）と裏返しの規則。同じフォルダを
+        // 「リモートからフォルダを開く」で開き直したときの経路
+        // （`Tab::add_remote_folder` の経路格上げ）をそのまま通し、実描画の矩形で
+        // 前後が入れ替わることを見る。ここが無いと #1041 の並びは実描画で
+        // 一度も検査されない（#1072 の「片方へ倒すと検査が意味を失う」）
+        let _ = window.update(cx, |app, _, cx| {
+            let tab = app.workspace.active_tab_id();
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.add_remote_folder(RemoteFolder::explicit(root.clone()));
+            }
+            app.sync_filetree_roots();
+            cx.notify();
+        });
+        wait(cx, 300).await;
+        let (explicit_ok, explicit_local_y, explicit_remote_y, rows_explicit) = window
+            .update(cx, |app, _, _| {
+                let rows = app.filetree.rows();
+                let remote_ix = rows.iter().position(|r| r.root && r.remote.is_some());
+                let local_ix = rows.iter().rposition(|r| r.root && r.remote.is_none());
+                let remote_top = remote_ix.and_then(|i| row_rect(app, i)).map(|b| b.top());
+                let local_top = local_ix.and_then(|i| row_rect(app, i)).map(|b| b.top());
+                (
+                    matches!((local_top, remote_top), (Some(l), Some(r)) if r < l),
+                    local_top.map(f32::from).unwrap_or(-1.0),
+                    remote_top.map(f32::from).unwrap_or(-1.0),
+                    rows.len(),
+                )
+            })
+            .unwrap_or((false, -1.0, -1.0, 0));
+        println!(
+            "TAKO_VISUAL_PIXEL: remote-explicit explicit_ok={explicit_ok} \
+             local_y={explicit_local_y:.1} remote_y={explicit_remote_y:.1} \
+             rows={rows_explicit}"
+        );
+        check(
+            explicit_ok && rows_explicit == rows,
+            &format!(
+                "visual-test remote-tree: 明示的に開いたリモートルートがローカルの前へ出る \
+                 (#1041。local_y={explicit_local_y:.1} remote_y={explicit_remote_y:.1} \
+                 rows {rows}->{rows_explicit})"
             ),
         );
 

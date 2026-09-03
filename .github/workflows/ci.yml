@@ -44,6 +44,14 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy（warning をエラー扱い）
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # visual-test（実ピクセル検査）は品質ゲートの 1 本だが、feature の内側は
+      # 上の `--all-targets` には出てこない。#1041 の API 変更へ visual-test 節が
+      # 追従せず **main が `--features visual-test` でビルドできない**状態のまま
+      # 素通りした（#1072）ので、feature を有効にした型検査もここで 1 回通す。
+      # 増える単位は gpui_platform / gpui_macos / tako-app の 3 つだけ
+      # （feature が違うのはこの経路だけで、残りの依存はそのまま再利用される）
+      - name: Clippy（visual-test feature。#1072）
+        run: cargo clippy -p tako-app --features visual-test --all-targets -- -D warnings
       - name: ビルド
         run: cargo build --workspace
       - name: テスト
