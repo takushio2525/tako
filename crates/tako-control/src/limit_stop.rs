@@ -334,6 +334,110 @@ mod tests {
         );
     }
 
+    // --- #1096: `You're out of …` テンプレートと日付つき解除時刻 ---
+
+    /// **実採取**（claude 2.1.258 のバイナリ内の組み立て）。
+    /// 組織のクレジットが尽きた形で、`overageStatus === "rejected"` +
+    /// `overageDisabledReason === "out_of_credits"` の分岐が作る:
+    /// `` `You're out of usage credits${j}${W}` ``（`j` = ` · resets <時刻>`、
+    /// `W` = ` · progress saved`）。**`limit` という語が無い**ので #1093 の規則
+    /// （`hit your` + `limit`）では原理的に当たらなかった
+    const OUT_OF_CREDITS_IDLE: &str = r#"⏺ 実装を進めます
+
+  ⎿  You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on
+  tako
+  main
+  ~/dev/tako
+  ⏸ 待機中 · ? for shortcuts"#;
+
+    #[test]
+    fn issue1096_クレジット枯渇の画面を解除時刻つきで検知する() {
+        let stop =
+            detect_limit_stop(&screen(OUT_OF_CREDITS_IDLE), OBSERVED, JST).expect("検知される");
+        assert_eq!(stop.kind, LimitStopKind::Idle);
+        assert!(
+            stop.message.contains("out of usage credits"),
+            "検知の根拠が見出し行になっていない: {}",
+            stop.message
+        );
+        assert_eq!(
+            stop.reset_at,
+            Some(1_786_752_000 - 9 * 3600 + 19 * 3600 + 50 * 60),
+            "`· resets 7:50pm (Asia/Tokyo)` から解除時刻が読めていない"
+        );
+    }
+
+    #[test]
+    fn issue1096_組織のクレジット枯渇も停止として検知する() {
+        // 解除時刻を持たない形（管理者へ依頼 / 入金の案内）。時刻不明は core 側の猶予へ
+        for line in [
+            "Your org is out of usage · add funds to continue",
+            "Your org is out of usage · contact your admin",
+        ] {
+            let src = OUT_OF_CREDITS_IDLE.replace(
+                "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+                line,
+            );
+            let stop = detect_limit_stop(&screen(&src), OBSERVED, JST)
+                .unwrap_or_else(|| panic!("検知されない: {line}"));
+            assert_eq!(stop.kind, LimitStopKind::Idle);
+            assert_eq!(stop.reset_at, None, "{line} に時刻は書かれていない");
+        }
+    }
+
+    #[test]
+    fn issue1096_動詞がreachedの見出しも検知する() {
+        // `dCt` の 2 番目 = `You've reached your`。#1093 は `hit` 決め打ちだった
+        let src = OUT_OF_CREDITS_IDLE.replace(
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+            "You've reached your Fable limit. Switch to another model to continue.",
+        );
+        let stop = detect_limit_stop(&screen(&src), OBSERVED, JST).expect("検知される");
+        assert_eq!(stop.kind, LimitStopKind::Idle);
+    }
+
+    #[test]
+    fn issue1096_週枠の日付つき解除時刻を丸めない() {
+        // 週枠は最大 7 日先なので日付つきが通常形。#1096 前は「次に来る同じ時刻」へ
+        // 丸まって、解除の数日前からナッジを撃ち始めていた
+        let src = OUT_OF_CREDITS_IDLE.replace(
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+            "You've hit your weekly limit · resets Aug 22, 9:15am (Asia/Tokyo)",
+        );
+        let stop = detect_limit_stop(&screen(&src), OBSERVED, JST).expect("検知される");
+        let reset = stop.reset_at.expect("解除時刻が読める");
+        // 観測は 2026-08-15 00:30 JST。7 日後の 09:15 になっているか
+        assert_eq!(
+            (reset - OBSERVED) / 86_400,
+            7,
+            "日付つきの解除時刻が 24 時間以内へ丸まっている"
+        );
+    }
+
+    #[test]
+    fn issue1096_接近の警告では自動復帰を発動させない() {
+        // claude 自身が別リスト（`fCt`）に分けている警告。まだ止まっていない
+        for line in [
+            "You're close to your usage credit limit",
+            "You've used 75% of your weekly limit",
+            "You're now using usage credits · Your weekly limit resets 7:50pm",
+        ] {
+            let src = OUT_OF_CREDITS_IDLE.replace(
+                "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+                line,
+            );
+            assert!(
+                detect_limit_stop(&screen(&src), OBSERVED, JST).is_none(),
+                "警告 / 情報で自動復帰が発動しうる状態になっている: {line}"
+            );
+        }
+    }
+
     // --- #985: codex ---
 
     /// codex 0.150.1 の上限停止画面（**日付つきの `Try again at`**）。
@@ -367,6 +471,15 @@ try again at Aug 28th, 2026 4:24 AM.
 
   Press enter to confirm or esc to go back"#;
 
+    /// fixture の `Try again at Aug 28th, 2026 4:24 AM` を JST で解いた絶対時刻。
+    ///
+    /// **#1096 前の期待値は `OBSERVED` と同じ日（2026-08-15）の 04:24 だった** ——
+    /// つまり #985 のテストが「日付を読まず次に来る 4:24 へ丸める」実装を
+    /// **13 日早い値のまま固定していた**（`MAX_PARSED_WAIT_SECS` = 24 時間で
+    /// 打ち切る設計だったので、日付つきの表記は構造的に丸まっていた）。
+    /// 早撃ちの直接証拠なので、直した値との差をテスト側でも検算する
+    const CODEX_RESET_AT: i64 = 1_787_858_640;
+
     fn codex_limits(reset_at: Option<i64>) -> crate::codex_session::RateLimits {
         crate::codex_session::RateLimits {
             primary: Some(crate::codex_session::RateWindow {
@@ -391,8 +504,14 @@ try again at Aug 28th, 2026 4:24 AM.
         );
         assert_eq!(
             stop.reset_at,
-            Some(1_786_752_000 - 9 * 3600 + 4 * 3600 + 24 * 60),
+            Some(CODEX_RESET_AT),
             "日付を挟んだ `Try again at Aug 28th, 2026 4:24 AM` が読めていない"
+        );
+        // 検算: fixture の日付は観測日（2026-08-15）の 13 日後
+        assert_eq!(
+            (CODEX_RESET_AT - (1_786_752_000 - 9 * 3600)) / 86_400,
+            13,
+            "期待値が fixture の日付と合っていない"
         );
     }
 
@@ -436,7 +555,7 @@ try again at Aug 28th, 2026 4:24 AM.
             .expect("検知される");
         assert_eq!(
             stop.reset_at,
-            Some(1_786_752_000 - 9 * 3600 + 4 * 3600 + 24 * 60),
+            Some(CODEX_RESET_AT),
             "上限でない枠の resets_at で復帰予定を書き換えてはいけない"
         );
     }

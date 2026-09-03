@@ -44,8 +44,9 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// 「生成中ではない」ことを文言ではなく**画面が動いていないこと**で確かめる
 pub const STABLE_SECS: i64 = 10;
 
-/// パースしたリセット時刻として受け入れる最大の待ち時間。
-/// これを超える値は誤パースとみなして「不明」に落とす（時刻表記は 24 時間で 1 周する）
+/// **日付を持たない**時刻表記から解決したリセット時刻として受け入れる最大の待ち時間。
+/// これを超える値は誤パースとみなして「不明」に落とす（時刻表記は 24 時間で 1 周する）。
+/// 日付つきの表記は別の上限（[`MAX_DATED_WAIT_SECS`]）で受ける（#1096）
 pub const MAX_PARSED_WAIT_SECS: i64 = 24 * 3600;
 
 // --- 上限による停止 ---
@@ -347,6 +348,26 @@ pub fn safe_choice(options: &[(Option<u32>, String)]) -> Option<(u32, &str)> {
 /// （`You've hit your …`）と U+2019（`you’re working on …`）が混在しているので、
 /// どちらかに寄せた判定は片方を取りこぼす。
 ///
+/// # テンプレートに載らない「尽きた」告知（#1096）
+///
+/// claude は同じ「もう進めない」状態を**別の書き出し**でも出す。同バイナリはその前置きを
+/// 自分で列挙している（`dCt`。並びは阻害 → 警告 → 情報の 3 つに分かれていて、
+/// `fCt = ["You've used", "You're close to"]` は**警告**・
+/// `mCt = ["You're now using usage credits", …]` は**情報**なので受けない）:
+///
+/// ```text
+/// dCt = ["You've hit your", "You've reached your", "You're out of usage credits",
+///        "Your org is out of usage · add funds to continue",
+///        "Your org is out of usage · contact your admin",
+///        "Your seat type doesn't include usage credits", …]
+/// ```
+///
+/// このうち**時間で解ける枠**だけを受ける = 動詞 2 種（`hit your` / `reached your`）と
+/// `out of usage credits` / `org is out of usage`。座席種別・組織の無効化・
+/// `group's usage limit is set to $0` のように**時間では解けない**ものは入れない
+/// —— 受けると `WorkerErrorKind::UsageLimit` の助言（`wait_reset` = 解除まで待つ）が
+/// 嘘になる。別種として扱う必要があるので Issue に切り出してある。
+///
 /// # 旧来の文言も同じ規則の下に置く
 ///
 /// `Claude usage limit reached. Your limit will reset at 3am.`（#157 で実採取）と
@@ -364,14 +385,26 @@ pub fn is_limit_exhausted_line(line: &str) -> bool {
             || line.contains("usage limit reached")
             || (line.contains("limit reached") && line.contains("reset"));
     }
-    // テンプレート `You've hit your <限度の名前><理由や解除時刻>`。
-    // 限度の名前は `hit your` の**直後**にあり、後ろに続く理由や解除時刻は必ず
+    // テンプレートに載らない書き出し（#1096）。前置きそのものが「尽きた」を意味するので
+    // 限度の名前を探す必要が無い（`Your org is out of usage · contact your admin` には
+    // `limit` という語すら無い）
+    if !legacy_out_of_usage() && EXHAUSTED_PHRASES.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    // テンプレート `You've hit your <限度の名前><理由や解除時刻>`（動詞は #1096 で 2 種）。
+    // 限度の名前は動詞の**直後**にあり、後ろに続く理由や解除時刻は必ず
     // `·` か `.` で始まる（`… session limit · resets 7:50pm` /
     // `… usage limit. Upgrade to Pro …`）。そこで**名前の区間だけ**を見る。
     // `,` は限度の名前には現れないので、地の文（「… hit your head on this design,
     // the rate limit docs …」）を上限と読まないための追加の境界として足してある。
     // 句読点が来ない病的な行には文字数で歯止めをかける
-    if let Some((_, rest)) = line.split_once("hit your") {
+    for verb in EXHAUSTED_HEADLINE_VERBS {
+        if legacy_out_of_usage() && verb != "hit your" {
+            continue; // #1096 前は `hit your` だけを見ていた
+        }
+        let Some((_, rest)) = line.split_once(verb) else {
+            continue;
+        };
         let name = rest.split(['·', '.', ',']).next().unwrap_or(rest);
         let name = name
             .char_indices()
@@ -421,7 +454,16 @@ pub fn exhausted_limit_window(line: &str) -> Option<LimitWindow> {
     None
 }
 
-/// `hit your` の直後で限度の名前を探す文字数の歯止め（句読点が来ない行のため）。
+/// 上限の見出しが使う動詞（claude 2.1.258 の `dCt` の先頭 2 件。#1096）。
+/// `You've reached your Fable limit.` は `hit` ではないので #1093 の規則では
+/// 当たらなかった（#1093 とまったく同じ機序の取りこぼし）
+const EXHAUSTED_HEADLINE_VERBS: [&str; 2] = ["hit your", "reached your"];
+
+/// テンプレートに載らない「尽きた」告知のうち**時間で解ける**ぶん（#1096）。
+/// アポストロフィ（`You're` / `Your org`）は判定に使わない
+const EXHAUSTED_PHRASES: [&str; 2] = ["out of usage credits", "org is out of usage"];
+
+/// 動詞の直後で限度の名前を探す文字数の歯止め（句読点が来ない行のため）。
 /// 実測で最も長い名前は `org's monthly spend limit`（25 文字）
 const LIMIT_NAME_MAX_CHARS: usize = 40;
 
@@ -429,6 +471,13 @@ const LIMIT_NAME_MAX_CHARS: usize = 40;
 fn legacy_session_limit() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1093_LEGACY").is_some())
+}
+
+/// `TAKO_1096_LEGACY=1` で #1096 前へ戻す（A/B 用）。
+/// 動詞は `hit your` だけ・`You're out of …` 系は受けない・解除時刻の日付も読まない
+fn legacy_out_of_usage() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1096_LEGACY").is_some())
 }
 
 // --- リセット時刻のパース ---
@@ -447,10 +496,43 @@ const RESET_ANCHORS: [&str; 4] = ["will reset at ", "try again at ", "resets at 
 /// ローカルタイムの UTC からのずれ（秒。日本なら +32400）
 pub fn parse_reset_at(text: &str, reference: i64, tz_offset: i32) -> Option<i64> {
     let lower = text.to_lowercase();
-    let tod = RESET_ANCHORS.iter().find_map(|anchor| {
-        let pos = lower.find(anchor)?;
-        find_time_of_day(&lower[pos + anchor.len()..])
-    })?;
+    // アンカーは前から順に試す。**「日付は在るが読めない」を見つけた時点で打ち切る**のが要点:
+    // `resets at ` は `resets ` を含むので、素通りさせると同じ 1 箇所を別のアンカーで
+    // 読み直してしまい（`resets at Feb 31, 3pm` → `at feb 31, 3pm`）、
+    // 前方走査が `3pm` を拾って「不明へ落とす」判断が骨抜きになる
+    for anchor in RESET_ANCHORS {
+        let Some(pos) = lower.find(anchor) else {
+            continue;
+        };
+        let rest = &lower[pos + anchor.len()..];
+        // 日付が書かれていればそちらが正（#1096）。24 時間より先の解除は必ず日付つきで
+        // 出るので、時刻だけを読むと「明日の同じ時刻」へ丸まって早撃ちになる
+        if !legacy_out_of_usage() {
+            match parse_dated_reset(rest, reference, tz_offset) {
+                DatedReset::Parsed(at) => return Some(at),
+                // **日付が書いてあるのに読めなかったときは時刻だけの解釈へ落とさない**。
+                // 日付が前置きされている = 解除は 24 時間より先なので、時刻だけを読んだ
+                // 値は「次に来る同じ時刻」= 高々 24 時間以内で**確実に間違っている**。
+                // 自信のある間違った時刻を返すより「不明」を返すほうが、状態照会
+                // （`reset_at: null`）と監査ログから書式の変化に気づける。
+                // なお「不明」の猶予（`UNKNOWN_RESET_FALLBACK_SECS`）は 15 分なので
+                // **初回の試行は早まる**（遅らせるには「読めない」を表す状態が要り、
+                // それは `LimitStop` の形を変えるので別の話）
+                DatedReset::Unreadable => return None,
+                DatedReset::NotDated => {}
+            }
+        }
+        if let Some(tod) = find_time_of_day(rest) {
+            if let Some(at) = resolve_time_of_day(tod, reference, tz_offset) {
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
+/// 日付を持たない時刻表記を「観測時刻から見て次に来る同じ時刻」として解決する
+fn resolve_time_of_day(tod: i64, reference: i64, tz_offset: i32) -> Option<i64> {
     let local_ref = reference + i64::from(tz_offset);
     let day_start = local_ref - local_ref.rem_euclid(86_400);
     let mut target = day_start + tod;
@@ -462,6 +544,214 @@ pub fn parse_reset_at(text: &str, reference: i64, tz_offset: i32) -> Option<i64>
         return None;
     }
     Some(target - i64::from(tz_offset))
+}
+
+/// 日付つきの解除時刻を読める最大の先（#1096）。週枠は 7 日先まで、codex の
+/// クレジットは月単位まで出るので余裕を持たせる。日付なしの表記（[`MAX_PARSED_WAIT_SECS`]）
+/// とは別の上限にしてある —— あちらは「次に来る同じ時刻」への丸めが安全である範囲
+const MAX_DATED_WAIT_SECS: i64 = 60 * 86_400;
+
+/// 日付つきの解除時刻が過去でも受け入れる幅（#1096）。
+/// 「もう解けている」を正しく読むために少しだけ過去を許す
+const DATED_PAST_TOLERANCE_SECS: i64 = 86_400;
+
+/// 月名の先頭 3 文字（`toLocaleString("en-US", {month:"short"})` の出力。小文字で比較）
+const MONTH_PREFIXES: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+/// アンカー直後の**日付つき**解除時刻を絶対時刻（unix 秒）として読む（#1096）。
+///
+/// claude の時刻整形（`Rd`）は解除が 24 時間より先だと日付を前置きする（実測 = バイナリ内の
+/// `{month:"short", day:"numeric", hour:"numeric", minute:…, hour12:true}` + 年が違えば
+/// `year:"numeric"`）。**週枠（`weekly limit` / `Opus limit`）は最大 7 日先なので
+/// 日付つきが通常形**で、時刻だけ読むと「明日」へ丸まって解除の数日前から撃ってしまう。
+///
+/// 読める形（すべて実測）:
+///
+/// | 出どころ | 形 |
+/// |---|---|
+/// | claude（24h 超） | `Sep 8, 3pm (Asia/Tokyo)` / `Sep 8, 3:05pm (Asia/Tokyo)` |
+/// | claude（年が違う） | `Sep 8, 2027, 3:05pm (Asia/Tokyo)` |
+/// | codex | `Aug 28th, 2026 4:24 AM`（序数 + 年・年と時刻のあいだにカンマ無し） |
+///
+/// 年が書かれていないときは**観測時刻から見て最も近い年**を採る（12 月 → 1 月の
+/// 年またぎをここで吸収する）。範囲外（60 日より先 / 1 日より前）は誤パースとみなす
+fn parse_dated_reset(rest: &str, reference: i64, tz_offset: i32) -> DatedReset {
+    let b = rest.as_bytes();
+    let mut i = skip_spaces(b, 0);
+    // 月名（先頭 3 文字で判定し、`sept` のような綴りは英字が続くぶんだけ読み飛ばす）
+    let Some(month) = MONTH_PREFIXES
+        .iter()
+        .position(|m| rest[i..].starts_with(m))
+        .map(|p| p + 1)
+    else {
+        return DatedReset::NotDated;
+    };
+    while i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    i = skip_spaces(b, i);
+    // 日
+    let Some((day, next)) = read_number(b, i, 2) else {
+        return DatedReset::Unreadable;
+    };
+    i = next;
+    // 序数の接尾辞（`28th`）
+    for suffix in ["st", "nd", "rd", "th"] {
+        if rest[i..].starts_with(suffix) {
+            i += suffix.len();
+            break;
+        }
+    }
+    i = skip_separators(b, i);
+    // 年（4 桁。無ければ観測時刻から推定する）
+    let mut year = None;
+    if let Some((y, next)) = read_number(b, i, 4) {
+        if next - i == 4 {
+            year = Some(y);
+            i = skip_separators(b, next);
+        }
+    }
+    let Some(tod) = parse_time_of_day(&rest[i..]) else {
+        return DatedReset::Unreadable;
+    };
+    let local_ref = reference + i64::from(tz_offset);
+    let (ref_year, _, _) = civil_from_days(local_ref.div_euclid(86_400));
+    // 年が書かれていればそれだけ、無ければ前後 1 年を候補にして最も近いものを採る
+    let candidates: Vec<i64> = match year {
+        Some(y) => vec![y],
+        None => vec![ref_year, ref_year + 1, ref_year - 1],
+    };
+    let mut best: Option<i64> = None;
+    for y in candidates {
+        let days = days_from_civil(y, month as i64, day);
+        // `Feb 31` のような実在しない日付を弾く（往復して一致するかで見る）
+        if civil_from_days(days) != (y, month as i64, day) {
+            continue;
+        }
+        let target_local = days * 86_400 + tod;
+        let wait = target_local - local_ref;
+        if !(-DATED_PAST_TOLERANCE_SECS..=MAX_DATED_WAIT_SECS).contains(&wait) {
+            continue;
+        }
+        // 未来を優先し、同じなら近いほうを採る
+        let better = best.is_none_or(|b| {
+            let cur = b - local_ref;
+            (wait >= 0, -wait.abs()) > (cur >= 0, -cur.abs())
+        });
+        if better {
+            best = Some(target_local);
+        }
+    }
+    match best {
+        Some(target_local) => DatedReset::Parsed(target_local - i64::from(tz_offset)),
+        None => DatedReset::Unreadable,
+    }
+}
+
+/// 月名（`toLocaleString("en-US", {month:"short"})` の出力そのまま）
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// **日付つき**解除時刻の表記を組む（[`parse_dated_reset`] の逆。#1096）。
+///
+/// 検証用の fixture のために置いてある。日付を fixture へ焼き込むとその日が過ぎた瞬間に
+/// 壊れる（#985 のセルフテストは `Aug 28th, 2026` を焼き込んでいたので 2026-09-03 には
+/// **6 日前**を指しており、日付を読むようにした途端「範囲外」で解決できなくなった）ので、
+/// 実行時に未来の日付から作れるようにする。逆関数を同じモジュールに置くことで、
+/// 書式の理解が fixture とパーサでずれない
+///
+/// 出力は codex の実測形（`Aug 28th, 2026 4:24 AM`）。claude の形（`Sep 8, 3:05pm`）とは
+/// 序数・年・AM/PM の大小が違うが、どちらも [`parse_dated_reset`] が読む。
+///
+/// **精度は分まで**（書式が `h:mm` なので秒は落ちる）。読み直した値と比べるときは
+/// 期待値も分へ丸めること
+pub fn format_dated_reset(at: i64, tz_offset: i32) -> String {
+    let local = at + i64::from(tz_offset);
+    let (y, m, d) = civil_from_days(local.div_euclid(86_400));
+    let tod = local.rem_euclid(86_400);
+    let (h24, minute) = (tod / 3_600, (tod % 3_600) / 60);
+    let (h12, ampm) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
+    let ord = match (d % 10, d % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    let mon = MONTH_NAMES[(m - 1).clamp(0, 11) as usize];
+    format!("{mon} {d}{ord}, {y} {h12}:{minute:02} {ampm}")
+}
+
+/// アンカー直後に日付が書かれていたかと、読めたか（#1096）
+enum DatedReset {
+    /// 日付は書かれていない（時刻だけの従来解釈へ進む）
+    NotDated,
+    /// 日付つきで読めた（絶対時刻）
+    Parsed(i64),
+    /// 日付は書かれているが読めない / 範囲外。**時刻だけの解釈へ落とさない**
+    Unreadable,
+}
+
+fn skip_spaces(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i] == b' ' {
+        i += 1;
+    }
+    i
+}
+
+/// 空白とカンマを読み飛ばす（`Sep 8, 2027, 3:05pm` の区切り）
+fn skip_separators(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] == b' ' || b[i] == b',') {
+        i += 1;
+    }
+    i
+}
+
+/// 最大 `max_digits` 桁の 10 進数を読む（読めた値と次の位置）
+fn read_number(b: &[u8], start: usize, max_digits: usize) -> Option<(i64, usize)> {
+    let mut i = start;
+    let mut v: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() && i - start < max_digits {
+        v = v * 10 + i64::from(b[i] - b'0');
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some((v, i))
+}
+
+/// グレゴリオ暦 → 1970-01-01 からの日数（Howard Hinnant の `days_from_civil`）。
+/// 外部クレートを増やさない自前変換（`pane_log::civil_utc` の逆変換）
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// 1970-01-01 からの日数 → グレゴリオ暦（`days_from_civil` の逆）
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 /// アンカー直後から時刻表記を探す（**日付が挟まっていても読む**。#985）。
@@ -1009,6 +1299,236 @@ mod tests {
         }
     }
 
+    // --- #1096: `You're out of …` テンプレートと日付つき解除時刻 ---
+
+    #[test]
+    fn issue1096_outofusage系の別テンプレートを上限として読む() {
+        // claude 2.1.258 の `dCt`（阻害の前置き）から、**時間で解ける**ぶんの実文言。
+        // `Your org is out of usage · contact your admin` には `limit` という語すら無く、
+        // #1093 の規則（`hit your` + `limit`）では原理的に当たらない
+        for line in [
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo)",
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo) · progress saved",
+            "You're out of usage credits. Switch to another model to continue.",
+            "You're out of usage credits. Run /usage-credits to keep using Opus or /model to switch models.",
+            "You're out of usage credits. /model to switch models.",
+            "Your org is out of usage · add funds to continue",
+            "Your org is out of usage · contact your admin",
+            // 動詞が `reached`（`dCt` の 2 番目）。#1093 は `hit` 決め打ちだった
+            "You've reached your Fable limit. Switch to another model to continue.",
+            "You've reached your weekly limit · resets 7:50pm (Asia/Tokyo)",
+        ] {
+            assert!(
+                is_limit_exhausted_line(line),
+                "上限として読めていない: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1096_クレジット系は枠へ対応づけずメーターに嘘を書かない() {
+        // `usage credits` は 5h / 週のどちらでもないので `--` のまま
+        for line in [
+            "You're out of usage credits · resets 7:50pm (Asia/Tokyo)",
+            "Your org is out of usage · contact your admin",
+            "You've reached your Fable limit. Switch to another model to continue.",
+        ] {
+            assert!(is_limit_exhausted_line(line));
+            assert_eq!(
+                exhausted_limit_window(line),
+                None,
+                "枠が分からないのに対応づけている: {line}"
+            );
+        }
+        // 枠の名前が書いてあるものは従来どおり読む（動詞が `reached` でも）
+        assert_eq!(
+            exhausted_limit_window("You've reached your weekly limit · resets 7:50pm"),
+            Some(LimitWindow::Week)
+        );
+    }
+
+    #[test]
+    fn issue1096_警告と情報の前置きは上限と読まない() {
+        // claude 自身が別リストに分けているもの:
+        // `fCt = ["You've used", "You're close to"]`（警告）
+        // `mCt = ["You're now using usage credits", …]`（情報）
+        for line in [
+            "You've used 75% of your weekly limit",
+            "You're close to your usage credit limit",
+            "You're close to your weekly limit · resets 7:50pm",
+            "You're now using usage credits · Your weekly limit resets 7:50pm",
+            "You're now using your usage allocation",
+            "Now using usage credits for Opus",
+            "Now using your usage allocation",
+        ] {
+            assert!(
+                !is_limit_exhausted_line(line),
+                "警告 / 情報を上限（停止）と読んでいる: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1096_日付つきの解除時刻を絶対時刻として読む() {
+        // 観測は 2026-08-15 00:30 JST（`OBSERVED_LOCAL_MIDNIGHT` の 30 分後）
+        let reference = REF_MIDNIGHT_JST + 30 * 60;
+        let at = |y: i64, m: i64, d: i64, tod: i64| -> Option<i64> {
+            Some(days_from_civil(y, m, d) * 86_400 + tod - i64::from(JST))
+        };
+        for (text, want) in [
+            // claude（24 時間より先 = 日付が前置きされる。分が 0 なら省かれる）
+            ("resets Sep 8, 3pm (Asia/Tokyo)", at(2026, 9, 8, 15 * 3600)),
+            (
+                "resets Sep 8, 3:05pm (Asia/Tokyo)",
+                at(2026, 9, 8, 15 * 3600 + 5 * 60),
+            ),
+            // codex（序数 + 年・年と時刻のあいだにカンマ無し）
+            (
+                "try again at Aug 28th, 2026 4:24 AM",
+                at(2026, 8, 28, 4 * 3600 + 24 * 60),
+            ),
+            // 週枠の実運用形（7 日先）
+            (
+                "You've hit your weekly limit · resets Aug 22, 9:15am (Asia/Tokyo)",
+                at(2026, 8, 22, 9 * 3600 + 15 * 60),
+            ),
+        ] {
+            assert_eq!(
+                parse_reset_at(text, reference, JST),
+                want,
+                "日付つきの解除時刻が読めていない: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1096_日付つきは24時間より先でも丸めない() {
+        let reference = REF_MIDNIGHT_JST + 30 * 60;
+        let got = parse_reset_at("resets Sep 8, 3pm (Asia/Tokyo)", reference, JST).expect("読める");
+        // #1096 前は「次に来る 15:00」= 観測日の 15:00 へ丸まっていた（24 日早い）
+        let rounded = REF_MIDNIGHT_JST + 15 * 3600;
+        assert_ne!(got, rounded, "24 時間以内へ丸めてしまっている");
+        assert_eq!(
+            (got - reference) / 86_400,
+            24,
+            "8/15 00:30 から 9/8 15:00 まで 24 日と少しあるはず"
+        );
+    }
+
+    #[test]
+    fn issue1096_日付なしの表記は従来どおり次に来る同じ時刻() {
+        // 回帰: 日付が無い形の解釈は 1 ビットも変えない（24 時間上限も維持）
+        let reference = REF_MIDNIGHT_JST + 30 * 60;
+        assert_eq!(
+            parse_reset_at("resets 7:50pm (Asia/Tokyo)", reference, JST),
+            Some(REF_MIDNIGHT_JST + 19 * 3600 + 50 * 60)
+        );
+        // 観測より前の時刻は翌日
+        assert_eq!(
+            parse_reset_at("Your limit will reset at 12:10am", reference, JST),
+            Some(REF_MIDNIGHT_JST + 86_400 + 10 * 60)
+        );
+    }
+
+    #[test]
+    fn issue1096_実在しない日付や範囲外は不明として扱う() {
+        let reference = REF_MIDNIGHT_JST + 30 * 60;
+        for text in [
+            // 実在しない日（往復検算で弾く）
+            "resets Feb 31, 3pm",
+            // `resets at ` は `resets ` を含む。別のアンカーで読み直して
+            // 前方走査に `3pm` を拾わせてはいけない（判断が骨抜きになる）
+            "resets at Feb 31, 3pm",
+            // 60 日より先（誤パースとみなす）
+            "resets Dec 31, 2028, 3pm",
+            // 月名があっても時刻が無い
+            "Try again at Aug 28th, 2026.",
+            // 月名も時刻も無い
+            "Try again at some point next week.",
+        ] {
+            assert_eq!(
+                parse_reset_at(text, reference, JST),
+                None,
+                "不明に落ちていない: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1096_年をまたぐ日付は最も近い年を採る() {
+        // 12/28 に観測して `resets Jan 3, 9am` なら**翌年**の 1/3（前年ではない）
+        let dec28 = days_from_civil(2026, 12, 28) * 86_400 - i64::from(JST) + 10 * 3600;
+        assert_eq!(
+            parse_reset_at("resets Jan 3, 9am", dec28, JST),
+            Some(days_from_civil(2027, 1, 3) * 86_400 + 9 * 3600 - i64::from(JST))
+        );
+        // 年が変わるときは claude が `year` を入れる（`{year:"numeric"}`）ので、
+        // 明示された年をそのまま採る
+        assert_eq!(
+            parse_reset_at("resets Jan 3, 2027, 9:15am (Asia/Tokyo)", dec28, JST),
+            Some(days_from_civil(2027, 1, 3) * 86_400 + 9 * 3600 + 15 * 60 - i64::from(JST))
+        );
+    }
+
+    #[test]
+    fn issue1096_日付つき表記は組んで読み直せる() {
+        // fixture 生成（`format_dated_reset`）とパーサが同じ書式理解を共有していることを
+        // 往復で固定する。ずれると「未来の日付を作ったのに読めない」形の fixture ができる
+        let base = REF_MIDNIGHT_JST;
+        for (delta_days, tod) in [
+            (2, 4 * 3600 + 24 * 60),
+            (7, 9 * 3600 + 15 * 60),
+            (21, 0),         // 00:00 = 12 AM
+            (31, 12 * 3600), // 12:00 = 12 PM
+            (3, 23 * 3600 + 59 * 60),
+        ] {
+            let at = base + delta_days * 86_400 + tod;
+            let text = format_dated_reset(at, JST);
+            let parsed = parse_reset_at(&format!("try again at {text}"), base, JST);
+            assert_eq!(parsed, Some(at), "往復しない: {text}");
+        }
+        // **精度は分まで**（書式に秒が無い）。秒を含む値は分へ丸めて戻る
+        let with_secs = base + 5 * 86_400 + 4 * 3600 + 24 * 60 + 37;
+        let text = format_dated_reset(with_secs, JST);
+        assert_eq!(
+            parse_reset_at(&format!("try again at {text}"), base, JST),
+            Some(with_secs - 37),
+            "秒は落ちる（期待値も分へ丸める必要がある）: {text}"
+        );
+        // 序数の綴り（11th / 21st / 22nd / 23rd / 13th）
+        for (d, want) in [
+            (1, "1st"),
+            (2, "2nd"),
+            (3, "3rd"),
+            (11, "11th"),
+            (21, "21st"),
+        ] {
+            let at = days_from_civil(2026, 12, d) * 86_400 - i64::from(JST) + 9 * 3600;
+            assert!(
+                format_dated_reset(at, JST).starts_with(&format!("Dec {want},")),
+                "序数が違う: {}",
+                format_dated_reset(at, JST)
+            );
+        }
+    }
+
+    #[test]
+    fn issue1096_暦の変換は往復する() {
+        // 自前の `days_from_civil` / `civil_from_days`（外部クレートを増やさない）
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (2000, 2, 29),
+            (2026, 8, 15),
+            (2026, 12, 31),
+            (2027, 1, 1),
+            (2100, 3, 1),
+        ] {
+            let days = days_from_civil(y, m, d);
+            assert_eq!(civil_from_days(days), (y, m, d), "{y}-{m}-{d}");
+        }
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+    }
+
     // --- リセット時刻のパース ---
 
     /// JST（+9h）。テストは実機のタイムゾーンに依存しない
@@ -1109,19 +1629,46 @@ mod tests {
 
     /// codex 0.150.1 のバイナリ内書式（`" Try again at "` + `", %Y %-I:%M %p"`）が作る
     /// **日付つき**の形。#985 前はここが読めず「不明」に落ち、900 秒の猶予で
-    /// 早すぎる再開を 3 回撃って諦めていた（= 上限が解けても朝まで止まったまま）
+    /// 早すぎる再開を 3 回撃って諦めていた（= 上限が解けても朝まで止まったまま）。
+    ///
+    /// **#1096 で期待値を直した**: #985 は時刻だけを前方走査で拾って
+    /// 「次に来る同じ時刻」へ丸めていたので、この 3 例の期待値は観測日（2026-08-15）の
+    /// 04:24 —— fixture が書いている日付より **13 / 13 / 19 日早い値**を固定していた。
+    /// つまり #985 のテスト自体が早撃ちを正としていた。いまは書かれた日付を採る
     #[test]
     fn issue985_codexの日付つきリセット時刻を読む() {
         let reference = REF_MIDNIGHT_JST + 30 * 60; // 00:30 JST に観測
-        for text in [
-            "■ You've hit your usage limit. ... try again at Aug 28th, 2026 4:24 AM.",
-            "You've hit your usage limit. Try again at Aug 28, 2026 4:24 AM.",
-            "Try again at Sep 3rd, 2026 4:24 AM or try again later.",
+        let at = |y: i64, m: i64, d: i64| -> Option<i64> {
+            Some(days_from_civil(y, m, d) * 86_400 + 4 * 3600 + 24 * 60 - i64::from(JST))
+        };
+        for (text, want, days_early_before) in [
+            (
+                "■ You've hit your usage limit. ... try again at Aug 28th, 2026 4:24 AM.",
+                at(2026, 8, 28),
+                13,
+            ),
+            (
+                "You've hit your usage limit. Try again at Aug 28, 2026 4:24 AM.",
+                at(2026, 8, 28),
+                13,
+            ),
+            (
+                "Try again at Sep 3rd, 2026 4:24 AM or try again later.",
+                at(2026, 9, 3),
+                19,
+            ),
         ] {
             assert_eq!(
                 parse_reset_at(text, reference, JST),
-                Some(REF_MIDNIGHT_JST + 4 * 3600 + 24 * 60),
+                want,
                 "日付を挟んだ時刻が読めない: {text}"
+            );
+            // 検算: #1096 前の期待値（観測日の 04:24）からどれだけ早かったか
+            let before = REF_MIDNIGHT_JST + 4 * 3600 + 24 * 60;
+            assert_eq!(
+                (want.expect("上で検査済み") - before) / 86_400,
+                days_early_before,
+                "fixture の日付と期待値が合っていない: {text}"
             );
         }
     }
