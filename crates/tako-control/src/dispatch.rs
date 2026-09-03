@@ -4153,11 +4153,7 @@ fn dispatch_inner(
                 // 引用は「必要なときだけ」（#322 = 人が打つ形と同じにする。
                 // 方言の解決は `launch_cmd` の 1 本 = #873）
                 let dialect = crate::launch_cmd::launch_dialect();
-                let line = argv
-                    .iter()
-                    .map(|a| crate::launch_cmd::quote(dialect, a))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let line = crate::launch_cmd::command_line(dialect, &argv);
                 // 器（psmux）は起動直後だけでなく高負荷時も入力を落とすので、
                 // 送達確認つきの経路（#640）へ載せる
                 // #1010: 打ち始める前から「接続中…」を出す。#640 の送達フローは
@@ -4187,13 +4183,8 @@ fn dispatch_inner(
             }
 
             // #1040: 切れたときに打ち直す 1 行（`pane` 経路と同じ形・同じ引用規則）
-            let reconnect_line = {
-                let dialect = crate::launch_cmd::launch_dialect();
-                argv.iter()
-                    .map(|a| crate::launch_cmd::quote(dialect, a))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
+            let reconnect_line =
+                crate::launch_cmd::command_line(crate::launch_cmd::launch_dialect(), &argv);
 
             let script = tako_core::remote_fs::ssh_pane_script(
                 tako_core::platform::shell::script_dialect(),

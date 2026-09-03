@@ -645,3 +645,92 @@ Issue の設計メモは「アイドルな素のシェルペインがあれば #
   `tako send` に `--enter` は無い（改行が既定）
 - ペインの画面には `Last login: … from <IP>` が出る。**この機の公開 IP なので
   貼る前に必ずマスクする**（#927）
+
+---
+
+## 19. #1090: Windows の OpenSSH には接続多重化が無い（2026-09-03）
+
+### 19.1 症状と機序
+
+Windows 実機で SSH ペインが**無言で死ぬ**（バナーの直後に 1 行だけ
+`getsockname failed: Not a socket` が出て、理由も次の一手も出ないままペインが消える。
+接続中チップ（#1010）も失敗へ置き換わらず消える）。#1073 の worker が
+セルフテスト項目 133 (d) の確定失敗として見つけ、#1090 として分離した。
+
+原因は **#65 の設計そのもの**。`remote_fs::common_opts` は `control_path(host)` が
+取れれば **必ず** `-o ControlPath / ControlMaster=auto / ControlPersist` を渡す。
+これは「ツリー（sftp）と対話ペインが同じソケットを共有し、パスワード認証しか無い相手でも
+一度ログインすれば以後追加認証が要らない」ための設計だが、**Windows の OpenSSH は
+接続多重化を実装していない**。
+
+同じ機・同じ相手でオプションだけを変えた実測（`C:\Program Files\OpenSSH\ssh.exe`、
+OpenSSH_for_Windows_10.0p2 / LibreSSL 4.2.0）:
+
+| 相手 | 多重化 | exit | 所要 | 出力 |
+|---|---|---|---|---|
+| 名前解決できない `.invalid` | なし | **255** | 79ms | `ssh: Could not resolve hostname …` |
+| 同上 | あり | **-1** | 49ms | `getsockname failed: Not a socket` / `Read from remote host …` |
+| 単一ラベルの不在ホスト | なし | **255** | 1329ms | `ssh: Could not resolve hostname …` |
+| 同上 | あり | **-1** | 70ms | 同上 |
+| **到達できる `localhost`（ssh）** | なし | **255** | 168ms | `Host key verification failed.`（= 相手まで届いている） |
+| 同上 | あり | **-1** | 41ms | `getsockname failed: Not a socket` |
+| **到達できる `localhost`（sftp）** | なし | **255** | 169ms | `Host key verification failed.` |
+| 同上 | あり | **255** | 62ms | `getsockname failed: Not a socket` |
+
+**多重化を渡すと相手に届く前に死ぬ**（ホスト鍵の検証にすら進まない）ことがここで確定する。
+`sftp` は `ssh` を包むので終了コードが 255 になり、対話 `ssh` だけが `-1` になる。
+
+この `-1` が 2 つの層を同時に壊していた:
+
+1. `remote_fs::ssh_pane_script` の失敗判定が `-eq 255` なので、理由 + 次の一手 +
+   「ローカルへ戻ります」が **1 行も出ない**（#919 / #1040 の契約が成立しない）
+2. `getsockname failed` が `ssh_progress::SSH_ERROR_PATTERNS` に無いので、`classify` の
+   規則 ④（まっさらなペインに tako 以外の行が出たら畳む）が先に当たって **`Opened`**
+   を返す（#1010 の接続中チップが失敗へ置き換わらない）
+
+### 19.2 直し方（候補 1 + 2 の併用。3 = 相手ごとの実測記憶は不採用）
+
+- **能力を境界で宣言する**: `tako_core::platform::ssh_client`（B26）。
+  `multiplexing(Platform)` は純粋関数なので **macOS 上から Windows 側の形を検証できる**。
+  縮退の文言 `NO_MULTIPLEXING` もここが正本で、対応マトリクスは参照するだけ
+- `common_opts` / `ssh_pane_argv` を `*_with(.., multiplexing)` の純粋関数へ割り、
+  能力が偽なら ControlMaster 系を 1 つも渡さない。`ensure_master` / `close_master` /
+  `ensure_control_dir` も器を作らない。**失敗検知は消えない**（直後の sftp / ssh が
+  同じ分類済みエラーを返す = #919 の「開く前に捕まえる」はそのまま）
+- **生死は 3 値にした**: `remote_fs::Liveness`（Live / Dead / Unknown）。多重化が無いと
+  「繋がっているか」を安く判定する材料が無いので `false` で埋めない。埋めると
+  ツリーが常に「切断」になり、#1040 の自動再接続が平常時に延々と probe を撃つ
+- **失敗判定は 255 だけでなくする**（1 とは独立）: `is_client_failure(code)` =
+  `255` または `0..=255` の外。**POSIX の `$?` は常に 0..=255 なので macOS では
+  `-eq 255` と厳密に同値** = 挙動不変（`posix_の条件はis_client_failureと同値` が固定）。
+  「0 以外」へ広げると**リモートのログインシェルが `exit 1` で抜けただけ**のペインに
+  「接続に失敗しました」が出るので、そこまでは広げない
+- スクリプトの失敗行は**実際の終了コード**を載せる。マーカーは `ssh exit ` へ短縮したので
+  新旧どちらの文面も拾える（世代をまたいだペインでも壊れない）
+- `SSH_ERROR_PATTERNS` に `getsockname failed` / `Read from remote host` を追加
+
+### 19.3 マトリクス
+
+`tako_open_remote` は `Supported` → **`Degraded`**（#937 の根拠は #1040 より前の
+「入力待ちで止まる」時代のもので、内容自体が stale だった）。`tako_remote_folder` は
+`Pending(#919)` → **`Degraded`**（多重化が無いぶん + #976 の自動検知が働かないぶん）。
+
+### 19.4 実機で SSH の相手を用意する（次に測る人へ）
+
+Windows 実機には `~/.ssh` そのものが無く（鍵・known_hosts・config が 1 つも無い）、
+Mac からのログインは `%ProgramData%\ssh\administrators_authorized_keys` が受けている。
+実機のユーザー（`<winuser>`）は Administrators なので **`~/.ssh/authorized_keys` は sshd_config の
+`Match Group administrators` に上書きされて読まれない**。
+
+検証用に localhost を SSH の相手にするなら:
+
+1. `administrators_authorized_keys` を**バックアップしてから `Add-Content` で 1 行追記**
+   （ACL は触らない = 追記は ACL を変えない）。追記後に**元のバイト列が前方一致で
+   残っているか**を同じスクリプトの中で確かめ、崩れていたらその場で復元する
+   （リモートから直すと間に合わない = ロックアウト）
+2. `ssh-keygen -t ed25519 -N '""'`（PowerShell から空パスフレーズを渡す形はこれ）
+3. `icacls <key> /inheritance:r /grant:r "$env:USERNAME:(R)"`（緩い ACL は OpenSSH が拒む）
+4. `ssh-keyscan -H localhost >> ~/.ssh/known_hosts`（`BatchMode=yes` はホスト鍵を聞けない）
+5. `~/.ssh/config` に `Host <名前> / HostName localhost / IdentityFile … / IdentitiesOnly yes`
+
+**検証が終わったら追記した 1 行と鍵・config・known_hosts を消す**。
